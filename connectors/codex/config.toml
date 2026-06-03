@@ -1,0 +1,11 @@
+# Codex ── mupot MCP server (EXAMPLE)
+# Merge into ~/.codex/config.toml. Replace the host with your pot, and the token
+# with the raw member token your pot minted (channel: workspace). Never commit the
+# filled-in file — this placeholder version is the only one that belongs in git.
+
+[mcp_servers.mupot]
+type = "sse"
+url = "https://YOUR-POT.example.workers.dev/mcp"
+
+[mcp_servers.mupot.headers]
+Authorization = "Bearer <MUPOT_MEMBER_TOKEN>"

@@ -1,0 +1,35 @@
+# Hermes ── mupot relay config (EXAMPLE)
+#
+# Copy to your Hermes deployment's config and fill in your pot's host. The real
+# gateway token is read from a secret/env at runtime — NEVER paste a real token
+# into a committed file. This is a public-repo template; placeholders only.
+
+mupot:
+  # Your pot's base URL (the domain you deployed mupot to).
+  url: "https://YOUR-POT.example.workers.dev"
+
+  # The IM seam Hermes POSTs each Telegram update to.
+  # Hermes sends the RAW update: { message: { chat: { id }, text } }.
+  webhook_path: "/im/webhook"
+
+  # Gateway member token (channel: im). Hermes holds this to authenticate the
+  # relay hop if your perimeter requires it. Resolved from env at runtime — the
+  # literal "${MUPOT_GATEWAY_TOKEN}" is a placeholder, not a secret.
+  gateway_token: "${MUPOT_GATEWAY_TOKEN}"
+
+telegram:
+  # Your Telegram bot token, read from env at runtime (never committed).
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+
+  # Only relay messages from these chats. Each chat_id must already be mapped to
+  # a mupot Member (members.telegram_chat_id) in the pot dashboard — the pot
+  # resolves identity from this mapping, NOT from anything in the message text.
+  allowed_chats:
+    - 123456789   # placeholder — replace with the real numeric chat_id
+    - 987654321
+
+# What the pot does with a relayed message (for reference — enforced in the pot):
+#   - chat.id  → members.telegram_chat_id → Member + capabilities (identity)
+#   - text     → intent only ("task: ...", "status", "wake <agent>")
+#   - reply    → { ok, reply }; Hermes echoes `reply` back into the chat
+# An unmapped chat_id is politely refused and NO action is taken.

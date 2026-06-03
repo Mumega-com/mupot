@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mupot": {
+      "type": "sse",
+      "url": "https://YOUR-POT.example.workers.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer <MUPOT_MEMBER_TOKEN>"
+      }
+    }
+  }
+}

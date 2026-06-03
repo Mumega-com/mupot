@@ -11,9 +11,10 @@
 // so a stale/cross-tenant id can never drive a cycle.
 
 import { DurableObject } from 'cloudflare:workers'
-import type { Env, Agent, BusEvent, MemoryPort } from '../types'
+import type { Env, Agent, BusEvent, MemoryPort, ModelMessage } from '../types'
 import { createMemory } from '../memory'
 import { createBus } from '../bus'
+import { createModel } from '../model'
 
 // Wake request body — who/why woke this agent, and how hard it may work.
 interface WakeInput {
@@ -155,31 +156,23 @@ export class AgentDO extends DurableObject<Env> {
     }
   }
 
-  // ── think: the model call, kept small + swappable ──
-  // Uses the Workers AI binding. The model id comes from the agent row.
+  // ── think: the model call, routed through the ModelPort ──
+  // Goes through createModel(env), which routes by the org's chosen provider
+  // (AI Gateway: anthropic|openai|google) or falls back to Workers AI. The agent
+  // row's model id is passed as the preferred model; the port decides how to use
+  // it (Workers AI model id, or provider model override). Behavior is unchanged.
   private async think(model: string, prompt: string): Promise<string> {
-    // env.AI.run is typed against a model union; agent.model is tenant data, so we
-    // pass it through a narrowing cast at the single boundary. Documented here.
-    const ai = this.env.AI
-    const resp = (await ai.run(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      model as Parameters<typeof ai.run>[0], // tenant-supplied model id; validated upstream by org component
+    const messages: ModelMessage[] = [
       {
-        messages: [
-          {
-            role: 'system',
-            content:
-              'You are an autonomous org agent. Respond ONLY with a compact JSON object: ' +
-              '{"summary": string, "tasks": [{"title": string, "body": string}]}. ' +
-              'Propose at most 3 concrete tasks. If nothing is warranted, return an empty tasks array.',
-          },
-          { role: 'user', content: prompt },
-        ],
-      } as Parameters<typeof ai.run>[1],
-    )) as { response?: string } | string
-
-    if (typeof resp === 'string') return resp
-    return resp.response ?? ''
+        role: 'system',
+        content:
+          'You are an autonomous org agent. Respond ONLY with a compact JSON object: ' +
+          '{"summary": string, "tasks": [{"title": string, "body": string}]}. ' +
+          'Propose at most 3 concrete tasks. If nothing is warranted, return an empty tasks array.',
+      },
+      { role: 'user', content: prompt },
+    ]
+    return createModel(this.env).chat(messages, { model })
   }
 
   private buildPrompt(agent: Agent, input: WakeInput, recalled: string): string {

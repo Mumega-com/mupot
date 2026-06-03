@@ -40,6 +40,11 @@ import type {
 
 import { requireAuth } from '../auth'
 
+// First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
+// on this same dashboard app, so it inherits the auth + tenant guard below.
+import { wizardApp } from './wizard'
+import { isOnboardingComplete } from './settings'
+
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
 export const dashboardApp = new Hono<AppEnv>()
@@ -66,11 +71,22 @@ dashboardApp.use('*', async (c, next) => {
   await next()
 })
 
+// ── setup wizard ─────────────────────────────────────────────────────────────
+// Mounted on the authenticated, tenant-guarded dashboard app. The wizard enforces
+// its own owner-only gate (org role 'owner' OR org-capability 'owner') internally.
+dashboardApp.route('/setup', wizardApp)
+
 // ── routes ───────────────────────────────────────────────────────────────────
 
 // GET / — org overview: departments → squads → agents.
 dashboardApp.get('/', async (c) => {
   const auth = c.get('auth')
+  // First-run nudge: an owner landing on an un-onboarded pot goes straight to the
+  // wizard. Non-owners (and completed pots) see the normal overview. The wizard
+  // itself re-checks owner + completion, so this is a convenience redirect only.
+  if ((auth.role === 'owner' || hasOrgOwnerCapability(auth)) && !(await isOnboardingComplete(c.env))) {
+    return c.redirect('/setup')
+  }
   const tree = await loadTree(c.env)
   return c.html(shell(c.env.BRAND, 'Overview', overviewBody(c.env.BRAND, tree, auth)))
 })
@@ -242,6 +258,16 @@ function isAdmin(auth: AuthContext): boolean {
   return auth.role === 'owner' || auth.role === 'admin'
 }
 
+/** Synchronous owner check for the first-run nudge ONLY — reads the org 'owner'
+ *  grant already resolved onto the AuthContext (no DB hit). The wizard does the
+ *  authoritative async check (resolveCapabilities); this is a convenience so a
+ *  member-authn owner is nudged too without an extra query on every overview load. */
+function hasOrgOwnerCapability(auth: AuthContext): boolean {
+  return (auth.capabilities ?? []).some(
+    (g) => g.scope_type === 'org' && g.scope_id === null && g.capability === 'owner',
+  )
+}
+
 async function loadMembers(env: Env): Promise<Member[]> {
   const rows = await env.DB.prepare(
     'SELECT id, email, display_name, telegram_chat_id, status, created_at FROM members ORDER BY created_at ASC, display_name ASC',
@@ -409,6 +435,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         <a href="/">Overview</a>
         <a href="/admin/members">Members</a>
         <a href="/admin/divisions">Divisions</a>
+        <a href="/setup">Setup</a>
         <a href="/auth/logout">Sign out</a>
       </nav>
     </header>
