@@ -31,6 +31,7 @@ export interface Env {
   GITHUB_TOKEN?: string
   AI_GATEWAY_TOKEN?: string
   IM_WEBHOOK_SECRET?: string // shared secret for the IM webhook (Telegram secret_token)
+  HERMES_RELAY_SECRET?: string // shared secret for the Hermes → mupot channel relay
 }
 
 // ── Org domain (mirrors migrations/0001_init.sql) ──
@@ -225,6 +226,11 @@ export interface ChannelAdapter {
     externalChannelId: string,
     externalUserId: string,
   ): Promise<Capability | null> // platform role → capability (optional)
+  // optional: own the HTTP response for platforms that reply INLINE (Discord
+  // interactions: PING→PONG, slash command → {type:4}). When present, the core
+  // delegates the response to the adapter; when absent, the out-of-band post()
+  // path is used (Telegram, Google Chat, the Hermes relay).
+  respond?(req: Request, env: Env): Promise<Response | null>
 }
 
 // ── Component routers register onto the root Hono app under these prefixes ──

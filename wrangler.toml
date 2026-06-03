@@ -7,8 +7,8 @@ compatibility_flags = ["nodejs_compat"]
 
 # ── tenant config (non-secret; secrets via `wrangler secret put`) ──
 [vars]
-TENANT_SLUG = "changeme"          # your org slug
-BRAND = "mupot"                   # dashboard brand
+TENANT_SLUG = "mumega"          # your org slug
+BRAND = "Mumega"                   # dashboard brand
 OAUTH_PROVIDER = "google"         # google | telegram
 # secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN
 
@@ -16,7 +16,7 @@ OAUTH_PROVIDER = "google"         # google | telegram
 [[d1_databases]]
 binding = "DB"
 database_name = "mupot"
-database_id = "REPLACE_WITH_YOUR_D1_ID"
+database_id = "b78f4ca0-1d09-4e9a-a3db-96df238af6ce"
 migrations_dir = "migrations"
 
 # ── memory: Vectorize (semantic recall) ──
@@ -38,7 +38,7 @@ dead_letter_queue = "mupot-events-dlq"
 # ── sessions / config cache ──
 [[kv_namespaces]]
 binding = "SESSIONS"
-id = "REPLACE_WITH_YOUR_KV_ID"
+id = "e23beb9039474803b993f5032aa0ac07"
 
 # ── blobs ──
 [[r2_buckets]]
