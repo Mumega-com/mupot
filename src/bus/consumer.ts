@@ -1,0 +1,117 @@
+// mupot — bus Queue consumer. Owns the queue handler exported as default.queue
+// from src/index.ts. Routes each BusEvent to the right Durable Object (agent or
+// squad) and acks on success / retries on throw.
+//
+// Routing:
+//   agent.wake     → AgentDO(agent_id).fetch(/wake)
+//   squad.dispatch → SquadCoordinatorDO(squad_id).fetch(/dispatch)
+//   task.created   → wake the owning squad (if squad_id present), else log
+//   lead.new       → wake the owning squad (if squad_id present), else log
+//   task.updated   → log (terminal observation; no DO wake by default)
+//
+// Per-message ack/retry: ack on success, retry() on throw, so a single poison
+// message does not block a healthy batch. After max_retries (wrangler.toml) the
+// message lands in the DLQ.
+
+import type { MessageBatch, Message } from '@cloudflare/workers-types'
+import type { Env, BusEvent } from '../types'
+
+// Internal origin for DO fetch routing. DO fetch ignores host; the path carries
+// the intent. The agents component routes these paths inside its DO classes.
+const DO_ORIGIN = 'https://do.mupot.internal'
+
+async function wakeAgent(env: Env, agentId: string, event: BusEvent): Promise<void> {
+  const id = env.AGENT.idFromName(agentId)
+  const stub = env.AGENT.get(id)
+  const res = await stub.fetch(`${DO_ORIGIN}/wake`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(event),
+  })
+  if (!res.ok) {
+    throw new Error(`AgentDO ${agentId} wake failed: ${res.status}`)
+  }
+}
+
+async function dispatchSquad(env: Env, squadId: string, event: BusEvent): Promise<void> {
+  const id = env.SQUAD.idFromName(squadId)
+  const stub = env.SQUAD.get(id)
+  const res = await stub.fetch(`${DO_ORIGIN}/dispatch`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(event),
+  })
+  if (!res.ok) {
+    throw new Error(`SquadCoordinatorDO ${squadId} dispatch failed: ${res.status}`)
+  }
+}
+
+async function routeEvent(env: Env, event: BusEvent): Promise<void> {
+  switch (event.type) {
+    case 'agent.wake': {
+      if (!event.agent_id) {
+        // Nothing to wake — drop quietly (ack) rather than retry forever.
+        console.error('bus: agent.wake missing agent_id', { tenant: event.tenant })
+        return
+      }
+      await wakeAgent(env, event.agent_id, event)
+      return
+    }
+    case 'squad.dispatch': {
+      if (!event.squad_id) {
+        console.error('bus: squad.dispatch missing squad_id', { tenant: event.tenant })
+        return
+      }
+      await dispatchSquad(env, event.squad_id, event)
+      return
+    }
+    case 'task.created':
+    case 'lead.new': {
+      // Wake the owning squad so it can triage/assign. If no squad is named,
+      // this is an org-level signal — log it and ack.
+      if (event.squad_id) {
+        await dispatchSquad(env, event.squad_id, event)
+      } else {
+        console.error(`bus: ${event.type} with no squad_id (org-level)`, {
+          tenant: event.tenant,
+        })
+      }
+      return
+    }
+    case 'task.updated': {
+      // Terminal observation; no DO wake by default. Log for the activity feed.
+      console.error('bus: task.updated', {
+        tenant: event.tenant,
+        squad_id: event.squad_id,
+      })
+      return
+    }
+    default: {
+      // Exhaustiveness guard. Unknown types are acked (not retried) to avoid
+      // poisoning the queue with events we will never understand.
+      const _exhaustive: never = event.type
+      console.error('bus: unknown event type', { type: _exhaustive, tenant: event.tenant })
+      return
+    }
+  }
+}
+
+/**
+ * handleQueue — the CF Queue consumer entrypoint. Mounted as default.queue.
+ * Processes each message independently: ack on success, retry on throw.
+ */
+export async function handleQueue(batch: MessageBatch<BusEvent>, env: Env): Promise<void> {
+  for (const message of batch.messages as Message<BusEvent>[]) {
+    try {
+      await routeEvent(env, message.body)
+      message.ack()
+    } catch (err) {
+      console.error('bus: message failed, will retry', {
+        id: message.id,
+        attempts: message.attempts,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      message.retry()
+    }
+  }
+}
