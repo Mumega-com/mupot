@@ -29,12 +29,57 @@ import type {
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
+// Fine-grained RBAC. Org mutations target a SPECIFIC scope: creating a department
+// is org admin; creating a squad in a department is admin+ on THAT department;
+// creating an agent / attaching a membership in a squad is lead+ on THAT squad.
+// The scope is data-derived (URL param), so we check inline with the pure API.
+import { resolveCapabilities, hasCapability } from '../auth/capability'
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 // admin+ means org role 'owner' or 'admin'. Members may read but not mutate.
 function isAdminPlus(auth: AuthContext): boolean {
   return auth.role === 'owner' || auth.role === 'admin'
+}
+
+// isAdminPlus doubles as the legacy-role escape: a pure web-login owner/admin (no
+// fine-grained capabilities) keeps full admin reach over the org chart — owner/admin
+// org role satisfies any scoped check. Mirrors requireCapability's legacy escape.
+
+// Resolve a squad's department for department→squad capability inheritance.
+async function squadDepartment(env: Env, squadId: string): Promise<string | null> {
+  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
+    .bind(squadId)
+    .first<{ department_id: string }>()
+  return r?.department_id ?? null
+}
+
+// Capability gate on a department scope (e.g. creating a squad → admin on the dept).
+async function canOnDepartment(
+  env: Env,
+  auth: AuthContext,
+  departmentId: string,
+  min: Capability,
+): Promise<boolean> {
+  if (isAdminPlus(auth)) return true
+  if (!auth.memberId) return false
+  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
+  return hasCapability(grants, 'department', departmentId, min)
+}
+
+// Capability gate on a squad scope (e.g. creating an agent / membership → lead on
+// the squad), with department→squad inheritance resolved from D1.
+async function canOnSquad(
+  env: Env,
+  auth: AuthContext,
+  squadId: string,
+  min: Capability,
+): Promise<boolean> {
+  if (isAdminPlus(auth)) return true
+  if (!auth.memberId) return false
+  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
+  const deptId = await squadDepartment(env, squadId)
+  return hasCapability(grants, 'squad', squadId, min, deptId)
 }
 
 // Hard tenant guard. The DB is per-tenant, but a stolen/misrouted token must not
@@ -81,11 +126,6 @@ orgApp.use('*', async (c, next) => {
   await next()
 })
 
-// Shared admin+ gate for mutating routes.
-function requireAdmin(c: { get: (k: 'auth') => AuthContext }): boolean {
-  return isAdminPlus(c.get('auth'))
-}
-
 // ── departments ──────────────────────────────────────────────────────────────
 
 orgApp.get('/departments', async (c) => {
@@ -101,7 +141,15 @@ interface CreateDepartmentBody {
 }
 
 orgApp.post('/departments', async (c) => {
-  if (!requireAdmin(c)) return c.json({ error: 'forbidden', need: 'admin+' }, 403)
+  // Creating a department is an org-wide admin action.
+  const auth = c.get('auth')
+  if (!isAdminPlus(auth)) {
+    if (!auth.memberId) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+    const grants = auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId))
+    if (!hasCapability(grants, 'org', null, 'admin')) {
+      return c.json({ error: 'forbidden', need: 'admin' }, 403)
+    }
+  }
 
   let body: CreateDepartmentBody
   try {
@@ -157,11 +205,14 @@ interface CreateSquadBody {
 }
 
 orgApp.post('/departments/:id/squads', async (c) => {
-  if (!requireAdmin(c)) return c.json({ error: 'forbidden', need: 'admin+' }, 403)
-
   const departmentId = c.req.param('id')
   const dept = await getById<Department>(c.env, 'departments', departmentId)
   if (!dept) return c.json({ error: 'department_not_found' }, 404)
+
+  // Creating a squad in a department requires admin+ on THAT department.
+  if (!(await canOnDepartment(c.env, c.get('auth'), departmentId, 'admin'))) {
+    return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  }
 
   let body: CreateSquadBody
   try {
@@ -228,11 +279,14 @@ interface CreateAgentBody {
 }
 
 orgApp.post('/squads/:id/agents', async (c) => {
-  if (!requireAdmin(c)) return c.json({ error: 'forbidden', need: 'admin+' }, 403)
-
   const squadId = c.req.param('id')
   const squad = await getById<Squad>(c.env, 'squads', squadId)
   if (!squad) return c.json({ error: 'squad_not_found' }, 404)
+
+  // Creating an agent in a squad requires lead+ on THAT squad (dept grants inherit).
+  if (!(await canOnSquad(c.env, c.get('auth'), squadId, 'lead'))) {
+    return c.json({ error: 'forbidden', need: 'lead' }, 403)
+  }
 
   let body: CreateAgentBody
   try {
@@ -297,8 +351,6 @@ interface CreateMembershipBody {
 }
 
 orgApp.post('/agents/:id/memberships', async (c) => {
-  if (!requireAdmin(c)) return c.json({ error: 'forbidden', need: 'admin+' }, 403)
-
   const agentId = c.req.param('id')
   const agent = await getById<Agent>(c.env, 'agents', agentId)
   if (!agent) return c.json({ error: 'agent_not_found' }, 404)
@@ -313,6 +365,12 @@ orgApp.post('/agents/:id/memberships', async (c) => {
   if (!isNonEmptyString(body.squad_id)) return c.json({ error: 'invalid_squad_id' }, 400)
   const squad = await getById<Squad>(c.env, 'squads', body.squad_id)
   if (!squad) return c.json({ error: 'squad_not_found' }, 404)
+
+  // Attaching an agent to a squad (an RBAC edge into that squad) requires lead+ on
+  // the TARGET squad (dept grants inherit). Gated after the target squad resolves.
+  if (!(await canOnSquad(c.env, c.get('auth'), squad.id, 'lead'))) {
+    return c.json({ error: 'forbidden', need: 'lead' }, 403)
+  }
 
   const capability: Capability =
     body.capability === undefined ? 'member' : (body.capability as Capability)

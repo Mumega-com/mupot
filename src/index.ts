@@ -16,6 +16,9 @@ import { orgApp } from './org'
 import { agentsApp } from './agents'
 import { tasksApp } from './tasks'
 import { busApp } from './bus'
+import { membersApp } from './members'
+import { mcpApp } from './mcp'
+import { imApp } from './im'
 import { dashboardApp } from './dashboard'
 
 // Durable Object classes — implemented in src/agents/.
@@ -31,6 +34,9 @@ app.route(ROUTES.org, orgApp)
 app.route(ROUTES.agents, agentsApp)
 app.route(ROUTES.tasks, tasksApp)
 app.route(ROUTES.bus, busApp)
+app.route(ROUTES.members, membersApp)
+app.route(ROUTES.mcp, mcpApp)
+app.route(ROUTES.im, imApp)
 app.route(ROUTES.dashboard, dashboardApp)
 
 // Queue consumer — the bus component owns the handler.

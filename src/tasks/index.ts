@@ -20,6 +20,10 @@ import type { Env, AuthContext, Task, Agent, Squad } from '../types'
 import { requireAuth } from '../auth'
 // createBus is owned by the bus component; emit() publishes BusEvents.
 import { createBus } from '../bus'
+// Fine-grained RBAC. Creating/mutating/assigning a task requires member+ on the
+// task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
+// row on PATCH), so we check inline rather than as static route middleware.
+import { resolveCapabilities, hasCapability } from '../auth/capability'
 
 // ── validation helpers ───────────────────────────────────────────────────────
 
@@ -33,11 +37,39 @@ function isNonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.trim().length > 0
 }
 
-// member+ means any authenticated org user may create/mutate work. observer-only
-// callers do not exist at the org-role level (that capability is squad-scoped via
-// memberships); org role 'member' is the floor for mutating tasks.
 function inTenantScope(auth: AuthContext, env: Env): boolean {
   return auth.tenant === env.TENANT_SLUG
+}
+
+// A pure web-login owner/admin (no fine-grained capabilities) keeps full reach over
+// the pot's work — owner/admin org role satisfies any squad-scope member+ check.
+// Mirrors the legacy-role escape in requireCapability, applied at squad scope here.
+function legacyOwnerAdmin(auth: AuthContext): boolean {
+  return auth.role === 'owner' || auth.role === 'admin'
+}
+
+// Resolve a squad's department for department→squad capability inheritance.
+async function squadDepartment(env: Env, squadId: string): Promise<string | null> {
+  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
+    .bind(squadId)
+    .first<{ department_id: string }>()
+  return r?.department_id ?? null
+}
+
+// member+ gate on a specific squad. Returns true when the caller may create/mutate
+// work in that squad: a web-login owner/admin, OR a member holding member+ on the
+// squad (directly or via a department grant). This is the single chokepoint both
+// the task-squad gate and the assignee-squad gate call.
+async function canActOnSquad(
+  env: Env,
+  auth: AuthContext,
+  squadId: string,
+): Promise<boolean> {
+  if (legacyOwnerAdmin(auth)) return true
+  if (!auth.memberId) return false
+  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
+  const deptId = await squadDepartment(env, squadId)
+  return hasCapability(grants, 'squad', squadId, 'member', deptId)
 }
 
 // ── app ──────────────────────────────────────────────────────────────────────
@@ -113,6 +145,13 @@ tasksApp.post('/', async (c) => {
   const squad = await getById<Squad>(c.env, 'squads', body.squad_id)
   if (!squad) return c.json({ error: 'squad_not_found' }, 404)
 
+  // RBAC: creating work in a squad requires member+ on that squad. (Fixes: any
+  // member tasking any squad.) The assignee is constrained to this same squad by
+  // resolveAssignee below, so this one check also covers the assignment.
+  if (!(await canActOnSquad(c.env, c.get('auth'), squad.id))) {
+    return c.json({ error: 'forbidden', need: 'member' }, 403)
+  }
+
   const taskBody =
     body.body === undefined || body.body === null
       ? ''
@@ -181,6 +220,13 @@ tasksApp.patch('/:id', async (c) => {
   const id = c.req.param('id')
   const existing = await getById<Task>(c.env, 'tasks', id)
   if (!existing) return c.json({ error: 'task_not_found' }, 404)
+
+  // RBAC: mutating a task (status/assignee/title/body) requires member+ on the
+  // task's squad. Reassignment stays within this squad (resolveAssignee enforces
+  // assignee_not_in_squad), so this single check also gates the assignment.
+  if (!(await canActOnSquad(c.env, c.get('auth'), existing.squad_id))) {
+    return c.json({ error: 'forbidden', need: 'member' }, 403)
+  }
 
   let body: UpdateTaskBody
   try {

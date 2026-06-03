@@ -31,6 +31,11 @@ import type {
   Agent,
   Membership,
   Task,
+  Member,
+  CapabilityGrant,
+  Capability,
+  CapabilityScopeType,
+  ConnectionChannel,
 } from '../types'
 
 import { requireAuth } from '../auth'
@@ -114,6 +119,61 @@ dashboardApp.get('/agents/:id', async (c) => {
   )
 })
 
+// ── members + divisions admin (humans as first-class network nodes) ───────────
+//
+// These two views are ADMIN-only (org role owner|admin). The mutating actions are
+// NOT performed here — every button POSTs to the RBAC-gated member-admin API
+// (/api/members/*), which re-checks fine-grained capability server-side. The
+// dashboard only renders structure (read directly from this pot's D1) and the
+// forms; it never trusts client-supplied identity or duplicates the API's writes.
+
+// GET /admin/members — roster: each member, their capability grants, their live
+// connection channels, suspend/reactivate, grant-capability + invite forms.
+dashboardApp.get('/admin/members', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(
+      shell(c.env.BRAND, 'Members', errorBody('Members admin requires owner or admin.')),
+      403,
+    )
+  }
+  const [members, grants, channels, depts] = await Promise.all([
+    loadMembers(c.env),
+    loadGrants(c.env),
+    loadChannels(c.env),
+    loadDepartments(c.env),
+  ])
+  const scopeNames = await loadScopeNames(c.env)
+  return c.html(
+    shell(
+      c.env.BRAND,
+      'Members',
+      membersAdminBody(members, grants, channels, depts, scopeNames, auth),
+    ),
+  )
+})
+
+// GET /admin/divisions — departments → squads, each with its head(s): the
+// member(s) holding lead+ capability on that scope.
+dashboardApp.get('/admin/divisions', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(
+      shell(c.env.BRAND, 'Divisions', errorBody('Divisions admin requires owner or admin.')),
+      403,
+    )
+  }
+  const [depts, squads, grants, members] = await Promise.all([
+    loadDepartments(c.env),
+    loadSquads(c.env),
+    loadGrants(c.env),
+    loadMembers(c.env),
+  ])
+  return c.html(
+    shell(c.env.BRAND, 'Divisions', divisionsAdminBody(depts, squads, grants, members, auth)),
+  )
+})
+
 // ── data ───────────────────────────────────────────────────────────────────
 
 interface AgentNode extends Agent {
@@ -169,6 +229,67 @@ async function getById<T>(env: Env, table: DashTable, id: string): Promise<T | n
     .bind(id)
     .first<T>()
   return row ?? null
+}
+
+// ── members / divisions data ──────────────────────────────────────────────────
+//
+// All reads are direct against this pot's D1 (one DB per tenant). The dashboard
+// renders STRUCTURE only — the member-admin API owns every write.
+
+/** admin+ means org role owner or admin. The coarse gate available server-side
+ *  for HTML rendering; the API re-checks fine-grained capability on each write. */
+function isAdmin(auth: AuthContext): boolean {
+  return auth.role === 'owner' || auth.role === 'admin'
+}
+
+async function loadMembers(env: Env): Promise<Member[]> {
+  const rows = await env.DB.prepare(
+    'SELECT id, email, display_name, telegram_chat_id, status, created_at FROM members ORDER BY created_at ASC, display_name ASC',
+  ).all<Member>()
+  return rows.results ?? []
+}
+
+async function loadGrants(env: Env): Promise<CapabilityGrant[]> {
+  const rows = await env.DB.prepare(
+    'SELECT member_id, scope_type, scope_id, capability FROM capabilities',
+  ).all<CapabilityGrant>()
+  return rows.results ?? []
+}
+
+interface MemberChannel {
+  member_id: string
+  channel: ConnectionChannel
+}
+
+/** Live (non-revoked) connection channels per member, derived from member_tokens. */
+async function loadChannels(env: Env): Promise<MemberChannel[]> {
+  const rows = await env.DB.prepare(
+    'SELECT DISTINCT member_id, channel FROM member_tokens WHERE revoked_at IS NULL',
+  ).all<MemberChannel>()
+  return rows.results ?? []
+}
+
+async function loadDepartments(env: Env): Promise<Department[]> {
+  const rows = await env.DB.prepare(
+    'SELECT id, slug, name, created_at FROM departments ORDER BY created_at ASC, name ASC',
+  ).all<Department>()
+  return rows.results ?? []
+}
+
+async function loadSquads(env: Env): Promise<Squad[]> {
+  const rows = await env.DB.prepare(
+    'SELECT id, department_id, slug, name, charter, created_at FROM squads ORDER BY created_at ASC, name ASC',
+  ).all<Squad>()
+  return rows.results ?? []
+}
+
+/** id → display name for department & squad scopes, so grants read as names not uuids. */
+async function loadScopeNames(env: Env): Promise<Map<string, string>> {
+  const [depts, squads] = await Promise.all([loadDepartments(env), loadSquads(env)])
+  const m = new Map<string, string>()
+  for (const d of depts) m.set(d.id, d.name)
+  for (const s of squads) m.set(s.id, s.name)
+  return m
 }
 
 // ── views ────────────────────────────────────────────────────────────────────
@@ -254,6 +375,30 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       .status-line { margin-top: 12px; font-size: 13px; color: var(--muted); min-height: 18px; }
       .empty { color: var(--dim); font-size: 14px; padding: 8px 0; }
       .tag { font-size: 11px; padding: 1px 7px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); }
+      .tag.cap { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+      .tag.chan { color: var(--accent2); border-color: color-mix(in srgb, var(--accent2) 40%, var(--border)); }
+      table.grid { width: 100%; border-collapse: collapse; font-size: 14px; }
+      table.grid th, table.grid td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+      table.grid th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }
+      table.grid tr:last-child td { border-bottom: none; }
+      table.grid td.actions { white-space: nowrap; }
+      .adminform { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: end; }
+      .adminform label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: var(--muted); }
+      .adminform input, .adminform select {
+        font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+        background: var(--bg); color: var(--text); min-width: 180px;
+      }
+      .btn.sm { padding: 5px 11px; font-size: 12px; margin-right: 6px; }
+      .modal {
+        position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex;
+        align-items: center; justify-content: center; z-index: 20; padding: 20px;
+      }
+      .modal[hidden] { display: none; }
+      .modal-card {
+        background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+        padding: 20px 22px; max-width: 460px; width: 100%;
+      }
+      .modal-actions { display: flex; gap: 10px; margin-top: 4px; width: 100%; }
       @media (max-width: 720px) { .board { grid-template-columns: 1fr 1fr; } }
     </style>
   </head>
@@ -262,6 +407,8 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       <div class="brand"><b>${brand}</b> · substrate console</div>
       <nav>
         <a href="/">Overview</a>
+        <a href="/admin/members">Members</a>
+        <a href="/admin/divisions">Divisions</a>
         <a href="/auth/logout">Sign out</a>
       </nav>
     </header>
@@ -439,4 +586,430 @@ function agentConsoleBody(agent: Agent, squad: Squad | null, canWake: boolean) {
       ${canWake ? html`` : html`<p class="empty">You can view this agent but only admin/owner may wake it.</p>`}
     </div>
     ${wakeScript}`
+}
+
+// ── members + divisions views ─────────────────────────────────────────────────
+
+// Ladder high→low — used to order capability chips and populate <select>s.
+const CAPABILITY_ORDER: ReadonlyArray<Capability> = [
+  'owner',
+  'admin',
+  'lead',
+  'member',
+  'observer',
+]
+
+const SCOPE_TYPES: ReadonlyArray<CapabilityScopeType> = ['org', 'department', 'squad']
+
+const CHANNEL_LABEL: Record<ConnectionChannel, string> = {
+  workspace: 'workspace',
+  im: 'IM',
+  dashboard: 'dashboard',
+}
+
+/** Render one capability grant as a human label: "admin · Engineering" / "owner · org". */
+function grantLabel(g: CapabilityGrant, scopeNames: Map<string, string>): string {
+  if (g.scope_type === 'org') return `${g.capability} · org`
+  const name = g.scope_id ? (scopeNames.get(g.scope_id) ?? g.scope_id) : g.scope_id
+  return `${g.capability} · ${g.scope_type} ${name ?? ''}`.trim()
+}
+
+function capabilityRank(cap: Capability): number {
+  const i = CAPABILITY_ORDER.indexOf(cap)
+  return i === -1 ? CAPABILITY_ORDER.length : i
+}
+
+function membersAdminBody(
+  members: Member[],
+  grants: CapabilityGrant[],
+  channels: { member_id: string; channel: ConnectionChannel }[],
+  depts: Department[],
+  scopeNames: Map<string, string>,
+  auth: AuthContext,
+) {
+  const grantsByMember = new Map<string, CapabilityGrant[]>()
+  for (const g of grants) {
+    const list = grantsByMember.get(g.member_id) ?? []
+    list.push(g)
+    grantsByMember.set(g.member_id, list)
+  }
+  const channelsByMember = new Map<string, Set<ConnectionChannel>>()
+  for (const ch of channels) {
+    const set = channelsByMember.get(ch.member_id) ?? new Set<ConnectionChannel>()
+    set.add(ch.channel)
+    channelsByMember.set(ch.member_id, set)
+  }
+
+  const deptOptions = depts
+    .map((d) => `<option value="${escAttr(d.id)}">${escHtml(d.name)}</option>`)
+    .join('')
+  const capOptions = CAPABILITY_ORDER.map(
+    (cap) => `<option value="${cap}">${cap}</option>`,
+  ).join('')
+
+  const rows =
+    members.length === 0
+      ? '<p class="empty">No members yet. Invite someone below — first connect mints their member + token.</p>'
+      : members
+          .map((m) => memberRow(m, grantsByMember.get(m.id) ?? [], channelsByMember.get(m.id), scopeNames))
+          .map((x) => x.toString())
+          .join('')
+
+  return html`
+    <p class="crumbs"><a href="/">Overview</a> / Members</p>
+    <h1>Members</h1>
+    <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role} ·
+      ${members.length} member${members.length === 1 ? '' : 's'} · humans are
+      first-class network nodes (one person = one member, many channels).</p>
+
+    <h2>Invite a member</h2>
+    <div class="card">
+      <p class="empty" style="margin-top:0">An invite is redeemed once: first connect mints the
+        member, capability and a workspace token. The capability applies org-wide unless you scope it
+        to a department.</p>
+      <form id="invite-form" class="adminform" autocomplete="off">
+        <label>Email
+          <input name="email" type="email" required placeholder="person@example.com" />
+        </label>
+        <label>Department
+          <select name="department_id">
+            <option value="">— org-wide —</option>
+            ${raw(deptOptions)}
+          </select>
+        </label>
+        <label>Capability
+          <select name="capability">${raw(capOptions)}</select>
+        </label>
+        <button type="submit" class="btn">Create invite</button>
+      </form>
+      <div id="invite-status" class="status-line"></div>
+    </div>
+
+    <h2>Roster</h2>
+    <div class="card" style="padding:0">
+      <table class="grid">
+        <thead>
+          <tr><th>Member</th><th>Channels</th><th>Capabilities</th><th>Status</th><th>Actions</th></tr>
+        </thead>
+        <tbody>${raw(rows)}</tbody>
+      </table>
+    </div>
+
+    ${membersAdminScript(scopeNamesToOptions(scopeNames, depts))}`
+}
+
+function memberRow(
+  m: Member,
+  grants: CapabilityGrant[],
+  channels: Set<ConnectionChannel> | undefined,
+  scopeNames: Map<string, string>,
+) {
+  const sorted = [...grants].sort((a, b) => capabilityRank(a.capability) - capabilityRank(b.capability))
+  const capChips =
+    sorted.length === 0
+      ? html`<span class="empty">none</span>`
+      : raw(
+          sorted
+            .map((g) => `<span class="tag cap">${escHtml(grantLabel(g, scopeNames))}</span>`)
+            .join(' '),
+        )
+
+  // Channels: tokens give workspace/im/dashboard reachability; a telegram_chat_id
+  // also makes the member IM-reachable even before a Hermes token is minted.
+  const chSet = new Set<ConnectionChannel>(channels ?? [])
+  if (m.telegram_chat_id) chSet.add('im')
+  const chChips =
+    chSet.size === 0
+      ? html`<span class="empty">—</span>`
+      : raw(
+          [...chSet]
+            .map((ch) => `<span class="tag chan">${escHtml(CHANNEL_LABEL[ch])}</span>`)
+            .join(' '),
+        )
+
+  const suspended = m.status === 'suspended'
+  return html`
+    <tr data-member="${m.id}">
+      <td>
+        <strong>${m.display_name}</strong>
+        <div class="t-meta">${m.email ?? html`<span class="empty">no email</span>`}</div>
+        <div class="t-meta"><code>${m.id}</code></div>
+      </td>
+      <td>${chChips}</td>
+      <td>${capChips}</td>
+      <td>
+        <span class="dot ${suspended ? 'paused' : 'active'}"></span>
+        ${m.status}
+      </td>
+      <td class="actions">
+        <button class="btn secondary sm js-suspend" data-member="${m.id}"
+          data-next="${suspended ? 'active' : 'suspended'}">
+          ${suspended ? 'Reactivate' : 'Suspend'}
+        </button>
+        <button class="btn secondary sm js-grant" data-member="${m.id}"
+          data-name="${escAttr(m.display_name)}">Grant capability</button>
+      </td>
+    </tr>`
+}
+
+function divisionsAdminBody(
+  depts: Department[],
+  squads: Squad[],
+  grants: CapabilityGrant[],
+  members: Member[],
+  auth: AuthContext,
+) {
+  const memberName = new Map<string, string>()
+  for (const m of members) memberName.set(m.id, m.display_name)
+
+  // Heads of a scope = members holding lead+ capability on that exact scope.
+  // (org > admin > lead > member > observer; 'head' = lead or stronger.)
+  const headRank = capabilityRank('lead')
+  const headsByScope = new Map<string, { name: string; cap: Capability }[]>()
+  for (const g of grants) {
+    if (g.scope_type === 'org' || g.scope_id === null) continue
+    if (capabilityRank(g.capability) > headRank) continue // weaker than lead → not a head
+    const list = headsByScope.get(g.scope_id) ?? []
+    list.push({ name: memberName.get(g.member_id) ?? g.member_id, cap: g.capability })
+    headsByScope.set(g.scope_id, list)
+  }
+
+  const squadsByDept = new Map<string, Squad[]>()
+  for (const s of squads) {
+    const list = squadsByDept.get(s.department_id) ?? []
+    list.push(s)
+    squadsByDept.set(s.department_id, list)
+  }
+
+  const heads = (scopeId: string) => {
+    const list = headsByScope.get(scopeId) ?? []
+    if (list.length === 0) return html`<span class="empty">no head assigned</span>`
+    return raw(
+      list
+        .sort((a, b) => capabilityRank(a.cap) - capabilityRank(b.cap))
+        .map((h) => `<span class="tag cap">${escHtml(h.cap)} · ${escHtml(h.name)}</span>`)
+        .join(' '),
+    )
+  }
+
+  if (depts.length === 0) {
+    return html`
+      <p class="crumbs"><a href="/">Overview</a> / Divisions</p>
+      <h1>Divisions</h1>
+      <div class="card"><p class="empty">No departments yet. Seed the org via
+        <code>POST /api/org/departments</code> and they'll appear here.</p></div>`
+  }
+
+  const cards = depts
+    .map((d) => {
+      const ds = squadsByDept.get(d.id) ?? []
+      const squadRows =
+        ds.length === 0
+          ? '<p class="empty">No squads.</p>'
+          : ds
+              .map(
+                (s) => html`
+                  <div class="squad-row">
+                    <div>
+                      <a href="/squads/${s.id}"><strong>${s.name}</strong></a>
+                      <span class="meta"> · squad</span>
+                    </div>
+                    <div class="meta">${heads(s.id)}</div>
+                  </div>`.toString(),
+              )
+              .join('')
+      return html`
+        <div class="card dept">
+          <div class="dept-name">${d.name}</div>
+          <div class="t-meta" style="margin-bottom:8px">Department head: ${heads(d.id)}</div>
+          ${raw(squadRows)}
+        </div>`.toString()
+    })
+    .join('')
+
+  return html`
+    <p class="crumbs"><a href="/">Overview</a> / Divisions</p>
+    <h1>Divisions</h1>
+    <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role} ·
+      ${depts.length} department${depts.length === 1 ? '' : 's'} ·
+      ${squads.length} squad${squads.length === 1 ? '' : 's'}. A head is any member holding
+      <strong>lead</strong> or stronger capability on that scope.</p>
+    ${raw(cards)}
+    <p class="empty">Assign a head from the <a href="/admin/members">Members</a> page — grant a member
+      <code>lead</code> (or higher) on the department or squad scope.</p>`
+}
+
+// ── client scripts (POST to the RBAC-gated /api/members/* — never write here) ──
+
+/** Department/squad <option>s for the grant dialog's scope selector. */
+function scopeNamesToOptions(scopeNames: Map<string, string>, depts: Department[]): string {
+  const deptIds = new Set(depts.map((d) => d.id))
+  const opts: string[] = []
+  for (const [id, name] of scopeNames) {
+    const kind = deptIds.has(id) ? 'department' : 'squad'
+    opts.push(`<option value="${escAttr(id)}" data-kind="${kind}">${escHtml(name)} (${kind})</option>`)
+  }
+  return opts.join('')
+}
+
+function membersAdminScript(scopeOptions: string) {
+  const capOptions = CAPABILITY_ORDER.map((c) => `<option value="${c}">${c}</option>`).join('')
+  const scopeTypeOptions = SCOPE_TYPES.map((s) => `<option value="${s}">${s}</option>`).join('')
+  // The member-admin API base. The Integrate phase mounts membersApp under this
+  // prefix; buttons call it (we never duplicate the API's writes here).
+  const api = '/api/members'
+  return raw(`
+    <div id="grant-modal" class="modal" hidden>
+      <div class="modal-card">
+        <h3 style="margin-top:0">Grant capability — <span id="grant-who"></span></h3>
+        <form id="grant-form" class="adminform">
+          <label>Scope type
+            <select name="scope_type" id="grant-scope-type">${scopeTypeOptions}</select>
+          </label>
+          <label id="grant-scope-wrap">Scope
+            <select name="scope_id" id="grant-scope-id">${scopeOptions}</select>
+          </label>
+          <label>Capability
+            <select name="capability">${capOptions}</select>
+          </label>
+          <div class="modal-actions">
+            <button type="button" class="btn secondary" id="grant-cancel">Cancel</button>
+            <button type="submit" class="btn">Grant</button>
+          </div>
+        </form>
+        <div id="grant-status" class="status-line"></div>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var API = ${JSON.stringify(api)};
+        async function postJSON(url, method, body) {
+          return fetch(url, {
+            method: method,
+            headers: { 'content-type': 'application/json' },
+            credentials: 'same-origin',
+            body: body == null ? undefined : JSON.stringify(body)
+          });
+        }
+        function reloadSoon() { setTimeout(function () { location.reload(); }, 900); }
+
+        // ── invite ──
+        var inviteForm = document.getElementById('invite-form');
+        var inviteStatus = document.getElementById('invite-status');
+        if (inviteForm) {
+          inviteForm.addEventListener('submit', async function (e) {
+            e.preventDefault();
+            var fd = new FormData(inviteForm);
+            var payload = {
+              email: String(fd.get('email') || ''),
+              capability: String(fd.get('capability') || 'member')
+            };
+            var dep = String(fd.get('department_id') || '');
+            if (dep) payload.department_id = dep;
+            inviteStatus.textContent = 'Creating invite…';
+            try {
+              var res = await postJSON(API + '/invites', 'POST', payload);
+              var data = await res.json().catch(function () { return {}; });
+              if (res.ok) {
+                inviteStatus.textContent =
+                  'Invite created. Redemption id: ' + (data.invite && data.invite.id) +
+                  ' — share the accept link; first connect mints the member + token (shown once).';
+                inviteForm.reset();
+              } else if (res.status === 403) {
+                inviteStatus.textContent = 'Forbidden — you need admin on this scope to invite.';
+              } else {
+                inviteStatus.textContent = 'Invite failed: ' + (data.error || res.status);
+              }
+            } catch (err) { inviteStatus.textContent = 'Invite request errored.'; }
+          });
+        }
+
+        // ── suspend / reactivate ──
+        document.querySelectorAll('.js-suspend').forEach(function (btn) {
+          btn.addEventListener('click', async function () {
+            var id = btn.getAttribute('data-member');
+            var next = btn.getAttribute('data-next');
+            btn.disabled = true;
+            try {
+              var res = await postJSON(API + '/members/' + encodeURIComponent(id), 'PATCH', { status: next });
+              if (res.ok) { reloadSoon(); }
+              else if (res.status === 403) { btn.disabled = false; alert('Forbidden — admin required.'); }
+              else { btn.disabled = false; alert('Update failed (' + res.status + ').'); }
+            } catch (e) { btn.disabled = false; alert('Request errored.'); }
+          });
+        });
+
+        // ── grant capability (modal) ──
+        var modal = document.getElementById('grant-modal');
+        var grantForm = document.getElementById('grant-form');
+        var grantWho = document.getElementById('grant-who');
+        var grantStatus = document.getElementById('grant-status');
+        var scopeType = document.getElementById('grant-scope-type');
+        var scopeWrap = document.getElementById('grant-scope-wrap');
+        var scopeId = document.getElementById('grant-scope-id');
+        var currentMember = null;
+
+        function syncScopeVisibility() {
+          var t = scopeType.value;
+          if (t === 'org') { scopeWrap.setAttribute('hidden', ''); }
+          else {
+            scopeWrap.removeAttribute('hidden');
+            // filter scope options to the chosen kind
+            Array.prototype.forEach.call(scopeId.options, function (opt) {
+              if (!opt.getAttribute('data-kind')) return;
+              opt.hidden = opt.getAttribute('data-kind') !== t;
+            });
+            var firstVisible = Array.prototype.find.call(scopeId.options, function (o) { return !o.hidden; });
+            if (firstVisible) scopeId.value = firstVisible.value;
+          }
+        }
+        if (scopeType) scopeType.addEventListener('change', syncScopeVisibility);
+
+        document.querySelectorAll('.js-grant').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            currentMember = btn.getAttribute('data-member');
+            grantWho.textContent = btn.getAttribute('data-name') || currentMember;
+            grantStatus.textContent = '';
+            modal.removeAttribute('hidden');
+            syncScopeVisibility();
+          });
+        });
+        var cancel = document.getElementById('grant-cancel');
+        if (cancel) cancel.addEventListener('click', function () { modal.setAttribute('hidden', ''); });
+
+        if (grantForm) {
+          grantForm.addEventListener('submit', async function (e) {
+            e.preventDefault();
+            if (!currentMember) return;
+            var fd = new FormData(grantForm);
+            var st = String(fd.get('scope_type') || 'org');
+            var payload = { action: 'grant', scope_type: st, capability: String(fd.get('capability') || 'member') };
+            if (st !== 'org') payload.scope_id = String(fd.get('scope_id') || '');
+            grantStatus.textContent = 'Granting…';
+            try {
+              var res = await postJSON(API + '/members/' + encodeURIComponent(currentMember) + '/capabilities', 'POST', payload);
+              var data = await res.json().catch(function () { return {}; });
+              if (res.ok) { grantStatus.textContent = 'Granted.'; reloadSoon(); }
+              else if (res.status === 403) { grantStatus.textContent = 'Forbidden — admin required on this scope.'; }
+              else { grantStatus.textContent = 'Grant failed: ' + (data.error || res.status); }
+            } catch (err) { grantStatus.textContent = 'Grant request errored.'; }
+          });
+        }
+      })();
+    </script>`)
+}
+
+// ── small HTML escapers (for raw-interpolated attribute/text values) ──────────
+// hono's html`` template auto-escapes interpolations, but raw() strings we build
+// by hand (table rows, <option>s, modal markup) must be escaped explicitly.
+function escHtml(v: string): string {
+  return v
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+function escAttr(v: string): string {
+  return escHtml(v)
 }

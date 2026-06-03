@@ -9,6 +9,26 @@ import { Hono } from 'hono'
 import type { Env, Agent, AuthContext, BusEvent } from '../types'
 import { requireAuth } from '../auth'
 import { createBus } from '../bus'
+// Fine-grained RBAC. /wake targets the agent's SQUAD scope (lead+). The squad id
+// is only known after the agent row loads, so we check inline rather than as
+// route middleware (the scope is data-derived, not static).
+import { resolveCapabilities, hasCapability } from '../auth/capability'
+
+// A pure web-login owner/admin (no fine-grained capabilities) is not locked out of
+// org administration: owner/admin org role satisfies any squad-scope lead+ check.
+// This mirrors the legacy-role escape in requireCapability, applied at the squad
+// scope here because the gate is inline (not the org-only middleware path).
+function legacyOwnerAdmin(auth: AuthContext): boolean {
+  return auth.role === 'owner' || auth.role === 'admin'
+}
+
+// Resolve a squad's department for department→squad capability inheritance.
+async function squadDepartment(env: Env, squadId: string): Promise<string | null> {
+  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
+    .bind(squadId)
+    .first<{ department_id: string }>()
+  return r?.department_id ?? null
+}
 
 export const agentsApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
 
@@ -38,13 +58,23 @@ async function loadAgent(env: Env, agentId: string): Promise<Agent | null> {
 // spends model + bus quota and emits org-mutating actions).
 agentsApp.post('/:agentId/wake', async (c) => {
   const auth = c.get('auth')
-  if (auth.role !== 'owner' && auth.role !== 'admin') {
-    return c.json({ error: 'forbidden', need: 'admin' }, 403)
-  }
 
   const agentId = c.req.param('agentId')
   const agent = await loadAgent(c.env, agentId)
   if (!agent) return c.json({ error: 'agent_not_found' }, 404)
+
+  // RBAC: waking an agent requires lead+ on that agent's squad (it spends model +
+  // bus quota and emits org-mutating actions). A pure web-login owner/admin is
+  // allowed via the legacy-role escape; member principals must hold a grant.
+  if (!legacyOwnerAdmin(auth)) {
+    if (!auth.memberId) return c.json({ error: 'forbidden', need: 'lead' }, 403)
+    const grants = auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId))
+    const deptId = await squadDepartment(c.env, agent.squad_id)
+    if (!hasCapability(grants, 'squad', agent.squad_id, 'lead', deptId)) {
+      return c.json({ error: 'forbidden', need: 'lead' }, 403)
+    }
+  }
+
   if (agent.status !== 'active') return c.json({ error: 'agent_paused' }, 409)
 
   // optional wake body (reason/context/maxActions)

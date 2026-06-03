@@ -171,5 +171,8 @@ export const ROUTES = {
   agents: '/api/agents',
   tasks: '/api/tasks',
   bus: '/api/bus',
+  members: '/api/members',
+  mcp: '/mcp',
+  im: '/im',
   dashboard: '/',
 } as const

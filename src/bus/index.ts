@@ -43,11 +43,13 @@ export function createBus(env: Env): BusPort {
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
+// requireCapability is the fine-grained RBAC gate (capability.ts). Publishing to
+// the bus is an org-wide effect → admin on org scope. A pure web-login owner/admin
+// satisfies the org-scope check via the legacy-role escape inside requireCapability.
+import { requireCapability } from '../auth/capability'
 
-// admin+ means org role 'owner' or 'admin'. Members cannot publish bus events.
-function isAdminPlus(auth: AuthContext): boolean {
-  return auth.role === 'owner' || auth.role === 'admin'
-}
+// The org scope — bus emit is an org-wide capability.
+const orgScope = (): { type: 'org'; id: null } => ({ type: 'org', id: null })
 
 // Shape we accept from clients. tenant/ts are NOT trusted from the body —
 // tenant is forced to the caller's scope; ts is stamped by createBus.
@@ -62,11 +64,8 @@ export const busApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext }
 
 busApp.get('/health', (c) => c.json({ ok: true, component: 'bus', tenant: c.env.TENANT_SLUG }))
 
-busApp.post('/emit', requireAuth, async (c) => {
+busApp.post('/emit', requireAuth, requireCapability(orgScope, 'admin'), async (c) => {
   const auth = c.get('auth')
-  if (!isAdminPlus(auth)) {
-    return c.json({ error: 'forbidden', need: 'admin+' }, 403)
-  }
 
   let body: EmitBody
   try {
