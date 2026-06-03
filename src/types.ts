@@ -30,6 +30,7 @@ export interface Env {
   OAUTH_CLIENT_SECRET?: string
   GITHUB_TOKEN?: string
   AI_GATEWAY_TOKEN?: string
+  IM_WEBHOOK_SECRET?: string // shared secret for the IM webhook (Telegram secret_token)
 }
 
 // ── Org domain (mirrors migrations/0001_init.sql) ──

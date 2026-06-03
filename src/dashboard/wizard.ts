@@ -104,6 +104,16 @@ const requireOwner: MiddlewareHandler<AppEnv> = async (c, next) => {
   await next()
 }
 
+// The wizard is a ONE-TIME first-run flow. Once onboarding is complete, its
+// mutating steps are sealed (F1 fix: no replay/rewind of substrate config).
+// Post-onboarding edits go through the admin pages, not the wizard.
+const blockIfComplete: MiddlewareHandler<AppEnv> = async (c, next) => {
+  if (await isOnboardingComplete(c.env)) {
+    return c.json({ error: 'onboarding_complete', hint: 'edit via the admin pages' }, 409)
+  }
+  await next()
+}
+
 /** Clamp a step number into [1, TOTAL_STEPS + 1] (the +1 = the final commit). */
 function clampStep(n: number): number {
   if (!Number.isFinite(n)) return 1
@@ -175,7 +185,7 @@ interface BrandBody {
   org_name?: unknown
   brand?: unknown
 }
-wizardApp.post('/brand', requireOwner, async (c) => {
+wizardApp.post('/brand', requireOwner, blockIfComplete, async (c) => {
   let body: BrandBody
   try {
     body = (await c.req.json()) as BrandBody
@@ -204,7 +214,7 @@ interface ModelBody {
   provider?: unknown
   model?: unknown
 }
-wizardApp.post('/model', requireOwner, async (c) => {
+wizardApp.post('/model', requireOwner, blockIfComplete, async (c) => {
   let body: ModelBody
   try {
     body = (await c.req.json()) as ModelBody
@@ -246,7 +256,7 @@ interface ImBody {
   provider?: unknown
   channel?: unknown
 }
-wizardApp.post('/im', requireOwner, async (c) => {
+wizardApp.post('/im', requireOwner, blockIfComplete, async (c) => {
   let body: ImBody
   try {
     body = (await c.req.json()) as ImBody
@@ -285,7 +295,7 @@ wizardApp.post('/im', requireOwner, async (c) => {
 interface StepBody {
   step?: unknown
 }
-wizardApp.post('/step', requireOwner, async (c) => {
+wizardApp.post('/step', requireOwner, blockIfComplete, async (c) => {
   let body: StepBody
   try {
     body = (await c.req.json()) as StepBody
@@ -304,7 +314,7 @@ wizardApp.post('/step', requireOwner, async (c) => {
 })
 
 // POST /setup/complete — final step. Mark onboarding done (idempotent).
-wizardApp.post('/complete', requireOwner, async (c) => {
+wizardApp.post('/complete', requireOwner, blockIfComplete, async (c) => {
   await setSettings(c.env, {
     [SETTINGS_KEYS.onboardingComplete]: 'true',
     [SETTINGS_KEYS.onboardingStep]: String(TOTAL_STEPS + 1),

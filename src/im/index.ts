@@ -406,6 +406,17 @@ interface TelegramUpdate {
 // We always answer 200 with a reply string (even for refusals) so the relay has
 // a clear message to deliver; transport-level problems are the only non-200s.
 imApp.post('/webhook', async (c) => {
+  // Auth (fail-closed): the webhook must carry the shared secret. Telegram sends
+  // the secret_token you registered via setWebhook in this header. Without a
+  // configured secret the webhook is sealed — an unauthenticated POST could forge
+  // a chat_id and impersonate that member's capabilities over IM.
+  if (!c.env.IM_WEBHOOK_SECRET) {
+    return c.json({ error: 'webhook_not_configured' }, 503)
+  }
+  if (c.req.header('X-Telegram-Bot-Api-Secret-Token') !== c.env.IM_WEBHOOK_SECRET) {
+    return c.json({ error: 'unauthorized' }, 401)
+  }
+
   let update: TelegramUpdate
   try {
     update = (await c.req.json()) as TelegramUpdate
