@@ -99,37 +99,12 @@ async function memberForIdentity(
   return { memberId: row.member_id, status: row.status }
 }
 
-// Google auto-bind: the externalUserId IS the email. If no identity row exists
-// yet, bind on first message by matching members.email — Google's OAuth perimeter
-// already proved the email, so it is a trusted identity claim (unlike Discord /
-// Telegram numeric ids, which require a '/link <code>' to bind). Returns the
-// member id when an auto-bind happened (or already existed), else null.
-async function autoBindByEmail(
-  env: Env,
-  platform: string,
-  email: string,
-): Promise<{ memberId: string; status: string } | null> {
-  const member = await env.DB.prepare(
-    `SELECT id, status FROM members WHERE lower(email) = lower(?1) AND status = 'active' LIMIT 1`,
-  )
-    .bind(email)
-    .first<{ id: string; status: string }>()
-  if (!member) return null
-
-  // Insert the identity row (idempotent on the UNIQUE(platform, external_user_id)
-  // constraint — a concurrent first-message race resolves to the same member).
-  try {
-    await env.DB.prepare(
-      `INSERT INTO member_identities (id, member_id, platform, external_user_id)
-         VALUES (?1, ?2, ?3, ?4)`,
-    )
-      .bind(crypto.randomUUID(), member.id, platform, email)
-      .run()
-  } catch {
-    // UNIQUE collision = already bound (race). Fall through; the row exists now.
-  }
-  return { memberId: member.id, status: member.status }
-}
+// SECURITY: email auto-bind was REMOVED. The shared-token webhook verify does not
+// cryptographically prove the payload's sender email, so auto-binding from it let a
+// holder of the verify token forge any member's email and act as them (P0). All
+// platforms — Google included — now require an explicit, single-use '/link <code>'.
+// Re-enable Google email auto-bind ONLY behind a verified Google-signed JWT
+// (audience = the app's project) so the email is cryptographically authenticated.
 
 // ── scope helpers (frozen hasCapability + explicit department inheritance) ─────
 // Mirrors src/im: a SQUAD action is allowed by a squad grant, an inherited
@@ -421,12 +396,9 @@ async function runInbound(
     return redeemLink(env, platform, externalUserId, intent.code)
   }
 
-  // 3) Identity: platform user → member. Google auto-binds by email on first msg;
-  // other platforms require a prior '/link'. An unmapped user is refused safely.
-  let identity = await memberForIdentity(env, platform, externalUserId)
-  if (!identity && platform === googleEmailPlatform) {
-    identity = await autoBindByEmail(env, platform, externalUserId)
-  }
+  // 3) Identity: platform user → member, ALWAYS via an explicit prior '/link'
+  // (no payload-email auto-bind — see the SECURITY note above). Unmapped = refused.
+  const identity = await memberForIdentity(env, platform, externalUserId)
   if (!identity) {
     return "You're not connected to this workspace yet. Send \"/link <code>\" with the code an admin gave you."
   }
@@ -452,11 +424,6 @@ async function runInbound(
       return taskReply(env, identity.memberId, grants, squad, intent.title)
   }
 }
-
-// Google is the email-keyed platform whose externalUserId is the verified email,
-// so it auto-binds. Named here (the ONE platform-string the core references) to
-// keep the auto-bind branch explicit; it still equals the adapter's own key.
-const googleEmailPlatform = 'google-chat'
 
 // ── postAgentActivity — the live agent-activity feed ──────────────────────────
 // For an agent-authored BusEvent, post a short attributed line into every channel

@@ -10,6 +10,7 @@ import { Hono, type MiddlewareHandler } from 'hono'
 import type { Env, AuthContext, Capability, ChannelBinding } from '../types'
 import { requireAuth } from '../auth'
 import { requireOrgCapability, actorMaxRankOnScope } from '../auth/capability'
+import { getAdapter } from './registry'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -49,6 +50,10 @@ channelsAdminApp.post('/bindings', requireOrgCapability('admin'), async (c) => {
   }
   if (!isNonEmpty(body.platform) || !isNonEmpty(body.external_channel_id) || !isNonEmpty(body.squad_id)) {
     return c.json({ error: 'platform, external_channel_id, squad_id required' }, 400)
+  }
+  // platform must be a registered adapter — no dead bindings for unknown platforms.
+  if (!getAdapter(body.platform.trim())) {
+    return c.json({ error: 'unknown_platform', hint: 'discord | google-chat | telegram' }, 400)
   }
   // max_capability ceiling for sync grants — default 'member'; never above 'lead'
   // from a binding (channel membership must not mint admins/owners).
@@ -104,6 +109,9 @@ channelsAdminApp.post('/link-codes', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
   if (!isNonEmpty(body.platform)) return c.json({ error: 'platform required' }, 400)
+  if (!getAdapter(body.platform.trim())) {
+    return c.json({ error: 'unknown_platform', hint: 'discord | google-chat | telegram' }, 400)
+  }
   const memberId = isNonEmpty(body.member_id) ? body.member_id.trim() : auth.memberId
   if (!memberId) return c.json({ error: 'member_id required' }, 400)
 
