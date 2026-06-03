@@ -67,7 +67,7 @@ export interface Membership {
   capability: Capability // RBAC: what this agent may do in this squad
 }
 
-export type Capability = 'owner' | 'lead' | 'member' | 'observer'
+export type Capability = 'owner' | 'admin' | 'lead' | 'member' | 'observer'
 
 export interface Task {
   id: string
@@ -85,8 +85,49 @@ export interface Task {
 export interface AuthContext {
   userId: string
   email: string | null
-  role: 'owner' | 'admin' | 'member' // org-level role
+  role: 'owner' | 'admin' | 'member' // org-level role (coarse; capabilities are the fine grain)
   tenant: string // TENANT_SLUG — every request is scoped to it
+  memberId?: string // set when the principal is a network member (MCP/IM), not just a web login
+  channel?: ConnectionChannel // how this principal connected
+  capabilities?: CapabilityGrant[] // fine-grained, per-scope; the real RBAC
+}
+
+// ── Members & capabilities — humans are first-class network nodes ──
+// One person = one Member. They may connect via several channels (their own
+// workspace over MCP, IM/Telegram via Hermes, or the web dashboard) — all resolve
+// to the same member_id + capabilities. "Having effect" = acting through any
+// channel, gated by capability.
+export interface Member {
+  id: string
+  email: string | null
+  display_name: string
+  telegram_chat_id: string | null // IM-only members reach mupot through Hermes
+  status: 'active' | 'suspended'
+  created_at: string
+}
+
+export type ConnectionChannel = 'workspace' | 'im' | 'dashboard'
+
+// A scoped, revocable token a member puts in their workspace .mcp.json (or that
+// Hermes holds to act for IM members). Stored hashed, like the SOS bus model.
+export interface MemberToken {
+  id: string
+  member_id: string
+  token_hash: string
+  label: string // "laptop", "hermes-gateway", ...
+  channel: ConnectionChannel
+  created_at: string
+  revoked_at: string | null
+}
+
+export type CapabilityScopeType = 'org' | 'department' | 'squad'
+
+// member × scope → capability. Enforced on every write path (humans AND agents).
+export interface CapabilityGrant {
+  member_id: string
+  scope_type: CapabilityScopeType
+  scope_id: string | null // null for org-wide
+  capability: Capability
 }
 
 // ── Bus ──
@@ -102,6 +143,7 @@ export interface BusEvent<T = unknown> {
   tenant: string
   squad_id?: string
   agent_id?: string
+  actor?: { kind: 'member' | 'agent'; id: string } // attribution — who caused this
   payload: T
   ts: string // ISO; set by the producer
 }
