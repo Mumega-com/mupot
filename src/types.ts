@@ -227,10 +227,15 @@ export interface ChannelAdapter {
     externalUserId: string,
   ): Promise<Capability | null> // platform role → capability (optional)
   // optional: own the HTTP response for platforms that reply INLINE (Discord
-  // interactions: PING→PONG, slash command → {type:4}). When present, the core
-  // delegates the response to the adapter; when absent, the out-of-band post()
-  // path is used (Telegram, Google Chat, the Hermes relay).
-  respond?(req: Request, env: Env): Promise<Response | null>
+  // interactions: PING→PONG, slash command → {type:4}). The core passes `run` —
+  // the resolve→gate→act pipeline — so the adapter can act and shape the inline
+  // reply without importing the core (microkernel intact). Return null to fall
+  // through to the out-of-band post() path (Telegram, Google Chat, Hermes relay).
+  respond?(
+    req: Request,
+    env: Env,
+    run: (inbound: InboundMessage) => Promise<string>,
+  ): Promise<Response | null>
 }
 
 // ── Component routers register onto the root Hono app under these prefixes ──

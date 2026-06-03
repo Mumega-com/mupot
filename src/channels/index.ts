@@ -543,6 +543,18 @@ channelsApp.post('/:platform/webhook', async (c) => {
     return c.json({ error: 'unknown_platform', platform }, 503)
   }
 
+  // 0) Inline-response platforms (Discord interactions: PING→PONG, slash command →
+  // {type:4}). The adapter owns its own verify + the HTTP response; the core only
+  // hands it the resolve→gate→act pipeline via `run`. A non-null Response is returned
+  // verbatim. Adapters without respond() (Telegram, Google Chat) fall through to the
+  // standard verify → parseInbound → post() path below.
+  if (adapter.respond) {
+    const r = await adapter.respond(c.req.raw, c.env, (inb) =>
+      runInbound(c.env, inb.platform, inb.externalChannelId, inb.externalUserId, inb.text),
+    )
+    if (r) return r
+  }
+
   // 1) Authenticity (fail-closed). A false/throwing verify is a hard 401 — we do
   // NOT parse or act on an unverified webhook (it could forge a channel + user).
   let verified: boolean

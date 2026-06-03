@@ -115,6 +115,14 @@ async function verify(req: Request, env: Env): Promise<boolean> {
 
 // Discord interaction type 1 = PING. 2 = APPLICATION_COMMAND. 3 = MESSAGE_COMPONENT.
 const INTERACTION_PING = 1
+const INTERACTION_APPLICATION_COMMAND = 2
+
+// Interaction response types. 1 = PONG (answers a PING handshake). 4 =
+// CHANNEL_MESSAGE_WITH_SOURCE (an inline reply Discord renders in the channel).
+const RESPONSE_PONG = 1
+const RESPONSE_CHANNEL_MESSAGE = 4
+// Message flag 1<<6 = EPHEMERAL — the reply is visible only to the invoking user.
+const FLAG_EPHEMERAL = 64
 
 interface DiscordUser {
   id?: unknown
@@ -212,6 +220,153 @@ async function parseInbound(req: Request, _env: Env): Promise<InboundMessage | n
   if (!uid) return null
   const content = asString(m.content) ?? ''
   return { platform: 'discord', externalChannelId: channelId, externalUserId: uid, text: content }
+}
+
+// ── inline interactions response (respond) ────────────────────────────────────
+// Discord delivers slash commands over an HTTP interactions endpoint and expects an
+// INLINE JSON response (no out-of-band post()). respond() owns that response:
+//   - It re-verifies the Ed25519 signature itself (the core's webhook verify gate
+//     does not run on the respond() seam) and fails closed → 401.
+//   - PING (type 1) → PONG (type 1). Discord sends this to validate the endpoint URL.
+//   - APPLICATION_COMMAND (type 2) → map the command to the normalized inbound `text`
+//     the core's parseIntent understands, run the resolve→gate→act pipeline via the
+//     passed `run` callback, and return the reply as a type-4 EPHEMERAL message.
+//   - Anything else → a benign type-4 "unsupported" ephemeral (we own the response
+//     once Discord routes here; returning null would drop the interaction).
+// No core import: the only bridge to the pipeline is the `run` callback.
+
+// A slash-command option: { name, value }. value is unknown until narrowed.
+interface DiscordCommandOption {
+  name?: unknown
+  value?: unknown
+}
+
+// Read a named string option's value from an interaction's data.options.
+function optionValue(
+  options: DiscordCommandOption[] | null | undefined,
+  name: string,
+): string | null {
+  if (!Array.isArray(options)) return null
+  for (const opt of options) {
+    if (asString(opt?.name) === name) return asString(opt?.value)
+  }
+  return null
+}
+
+// Map a Discord slash command + its options to the normalized inbound `text` the
+// core's parseIntent grammar understands. Returns null for an unknown command (the
+// caller then renders an "unsupported" ephemeral). The produced strings MUST stay in
+// lockstep with parseIntent in ../index:
+//   /task   title=<t> → "task: <t>"   (matches /^\/?task\s*[:|-]?\s+(.+)$/i)
+//   /status            → "status"      (matches lower === 'status')
+//   /link   code=<c>   → "/link <c>"   (matches /^\/?link\s+(.+)$/i)
+function commandToText(name: string, options: DiscordCommandOption[] | null | undefined): string | null {
+  switch (name) {
+    case 'task': {
+      const title = optionValue(options, 'title')
+      return title ? `task: ${title}` : null
+    }
+    case 'status':
+      return 'status'
+    case 'link': {
+      const code = optionValue(options, 'code')
+      return code ? `/link ${code}` : null
+    }
+    default:
+      return null
+  }
+}
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    headers: { 'content-type': 'application/json' },
+  })
+}
+
+// An ephemeral (flags 64) inline reply — visible only to the invoking user.
+function ephemeralReply(content: string): Response {
+  return jsonResponse({
+    type: RESPONSE_CHANNEL_MESSAGE,
+    data: { content, flags: FLAG_EPHEMERAL },
+  })
+}
+
+/**
+ * respond — own the inline HTTP response for Discord interactions.
+ * Verifies the signature (fail-closed → 401), answers a PING with a PONG, and turns
+ * an APPLICATION_COMMAND into a normalized inbound message run through the core's
+ * `run` pipeline, returning the reply as an ephemeral type-4 response. The bot token
+ * and public key are never logged. Returns a Response in every Discord-routed case
+ * (never null) so a verified interaction is always answered.
+ */
+async function respond(
+  req: Request,
+  env: Env,
+  run: (inbound: InboundMessage) => Promise<string>,
+): Promise<Response | null> {
+  // Re-verify here: respond() is invoked BEFORE the core's webhook verify gate, so it
+  // must enforce authenticity itself. A bad/absent signature → 401, no parse, no act.
+  let verified: boolean
+  try {
+    verified = await verify(req, env)
+  } catch {
+    verified = false
+  }
+  if (!verified) {
+    return new Response(JSON.stringify({ error: 'unauthorized' }), {
+      status: 401,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+
+  let payload: unknown
+  try {
+    payload = await req.clone().json()
+  } catch {
+    return jsonResponse({ error: 'invalid_payload' })
+  }
+  if (!payload || typeof payload !== 'object') {
+    return jsonResponse({ error: 'invalid_payload' })
+  }
+
+  const i = payload as DiscordInteraction
+  const type = i.type
+
+  // PING handshake → PONG. Discord sends this to validate the endpoint URL.
+  if (type === INTERACTION_PING) {
+    return jsonResponse({ type: RESPONSE_PONG })
+  }
+
+  // Slash command → resolve → gate → act, then reply ephemerally.
+  if (type === INTERACTION_APPLICATION_COMMAND) {
+    const channelId = asString(i.channel_id)
+    // Identity is the platform mapping, returned raw for the core to resolve — guild
+    // interactions nest the user under member.user; DMs put it top-level.
+    const uid = userId(i.member?.user ?? i.user ?? null)
+    const name = asString(i.data?.name)
+    if (!channelId || !uid || !name) {
+      return ephemeralReply("Sorry, I couldn't read that command. Try /task, /status, or /link.")
+    }
+
+    const text = commandToText(name, i.data?.options ?? null)
+    if (text === null) {
+      return ephemeralReply(`Unsupported command: /${name}. Try /task, /status, or /link.`)
+    }
+
+    const inbound: InboundMessage = {
+      platform: 'discord',
+      externalChannelId: channelId,
+      externalUserId: uid,
+      text,
+    }
+    const reply = await run(inbound)
+    return ephemeralReply(reply)
+  }
+
+  // Any other interaction type (message-component, modal, autocomplete, …): we own
+  // the response once Discord routes here, so answer with a benign ephemeral rather
+  // than falling through (a null here would leave the interaction unanswered).
+  return ephemeralReply("That interaction isn't supported here. Try /task, /status, or /link.")
 }
 
 // ── outbound post ─────────────────────────────────────────────────────────────
@@ -399,4 +554,5 @@ export const discordAdapter: ChannelAdapter = {
   post,
   listChannelMembers,
   roleCapability,
+  respond,
 }
