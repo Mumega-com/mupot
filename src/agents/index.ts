@@ -12,6 +12,16 @@ import { createBus } from '../bus'
 
 export const agentsApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
 
+// Every route requires auth AND tenant scope — the same explicit guard org/tasks
+// enforce. Don't rely on per-tenant D1 alone as the boundary (P1 fix): a session
+// minted for another tenant must never wake/read this tenant's agents.
+agentsApp.use('*', requireAuth, async (c, next) => {
+  if (c.get('auth').tenant !== c.env.TENANT_SLUG) {
+    return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
+  }
+  await next()
+})
+
 // Resolve an agent row (tenant-scoped: D1 is the tenant's DB). Returns null if the
 // id does not name a real agent in this tenant.
 async function loadAgent(env: Env, agentId: string): Promise<Agent | null> {
@@ -26,7 +36,7 @@ async function loadAgent(env: Env, agentId: string): Promise<Agent | null> {
 // POST /:agentId/wake — drive one cortex cycle. Mutating → requireAuth + role gate.
 // org 'member' may read status but only 'admin'/'owner' may wake an agent (it
 // spends model + bus quota and emits org-mutating actions).
-agentsApp.post('/:agentId/wake', requireAuth, async (c) => {
+agentsApp.post('/:agentId/wake', async (c) => {
   const auth = c.get('auth')
   if (auth.role !== 'owner' && auth.role !== 'admin') {
     return c.json({ error: 'forbidden', need: 'admin' }, 403)
@@ -70,7 +80,7 @@ agentsApp.post('/:agentId/wake', requireAuth, async (c) => {
 })
 
 // GET /:agentId/status — runtime telemetry for an agent. Read-only; requireAuth.
-agentsApp.get('/:agentId/status', requireAuth, async (c) => {
+agentsApp.get('/:agentId/status', async (c) => {
   const agentId = c.req.param('agentId')
   const agent = await loadAgent(c.env, agentId)
   if (!agent) return c.json({ error: 'agent_not_found' }, 404)

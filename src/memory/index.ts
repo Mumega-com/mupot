@@ -48,7 +48,9 @@ export function createMemory(env: Env): MemoryPort {
         {
           id,
           values,
-          metadata: { agentId, engramId: id },
+          // tenant scopes the vector even on a SHARED Vectorize index (the
+          // multi-tenant-operator model) — agentId alone is not a tenant boundary.
+          metadata: { agentId, engramId: id, tenant: env.TENANT_SLUG },
         },
       ])
 
@@ -59,8 +61,9 @@ export function createMemory(env: Env): MemoryPort {
       const values = await embed(env, query)
       const result = await env.VEC.query(values, {
         topK: limit,
-        // Scope to this agent's engrams only — cross-agent recall is not allowed.
-        filter: { agentId },
+        // Scope to this agent's engrams AND this tenant — cross-agent AND
+        // cross-tenant recall are both prevented at the vector query.
+        filter: { agentId, tenant: env.TENANT_SLUG },
         returnMetadata: 'none',
       })
 
