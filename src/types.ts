@@ -164,6 +164,25 @@ export interface BusPort {
   emit(event: BusEvent): Promise<void>
 }
 
+// ── Model port — connect-your-model (the brain/agents think through this) ──
+// CF profile routes through AI Gateway (Anthropic/OpenAI/Google) or Workers AI,
+// or a tenant-supplied key. The agent never hardcodes a provider.
+export interface ModelMessage {
+  role: 'system' | 'user' | 'assistant'
+  content: string
+}
+
+export interface ModelPort {
+  chat(messages: ModelMessage[], opts?: { model?: string; maxTokens?: number }): Promise<string>
+}
+
+// key/value org settings (onboarding state, chosen model provider, brand, …).
+export interface OrgSetting {
+  key: string
+  value: string
+  updated_at: string
+}
+
 // ── Component routers register onto the root Hono app under these prefixes ──
 export const ROUTES = {
   auth: '/auth',
