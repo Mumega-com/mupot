@@ -184,6 +184,49 @@ export interface OrgSetting {
   updated_at: string
 }
 
+// ── Channels (microkernel: a tiny core + swappable platform adapters) ──
+// The platform's scoped channel IS the squad. The CORE knows zero platform
+// specifics — it only speaks this interface; each platform is a leaf adapter
+// registered by key. channel↔squad and platformUser↔member live in D1.
+export interface ChannelBinding {
+  id: string
+  platform: string // 'discord' | 'google-chat' | 'telegram'
+  external_channel_id: string
+  squad_id: string
+  max_capability: Capability // ceiling for membership-sync grants (default 'member')
+  created_at: string
+}
+
+export interface MemberIdentity {
+  id: string
+  member_id: string
+  platform: string
+  external_user_id: string // Google: email; Discord/Telegram: platform user id
+}
+
+// Normalized inbound message — what every adapter's parseInbound returns.
+export interface InboundMessage {
+  platform: string
+  externalChannelId: string
+  externalUserId: string
+  text: string
+}
+
+// The microkernel seam. A platform adapter is a leaf plugin; the core depends
+// ONLY on this interface, never on a concrete platform.
+export interface ChannelAdapter {
+  platform: string
+  verify(req: Request, env: Env): Promise<boolean> // webhook authenticity, fail-closed
+  parseInbound(req: Request, env: Env): Promise<InboundMessage | null>
+  post(env: Env, externalChannelId: string, text: string): Promise<void>
+  listChannelMembers(env: Env, externalChannelId: string): Promise<string[]> // external user ids
+  roleCapability?(
+    env: Env,
+    externalChannelId: string,
+    externalUserId: string,
+  ): Promise<Capability | null> // platform role → capability (optional)
+}
+
 // ── Component routers register onto the root Hono app under these prefixes ──
 export const ROUTES = {
   auth: '/auth',
