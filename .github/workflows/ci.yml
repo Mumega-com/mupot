@@ -1,0 +1,32 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test --if-present
+
+  no-secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard — no secrets in this public template
+        run: |
+          # fail if a real token-shaped string or a filled-in id leaked in
+          if grep -rnE '(sk-[A-Za-z0-9_-]{20,})|(ghp_[A-Za-z0-9]{20,})|BEGIN (RSA|EC|OPENSSH) PRIVATE KEY' \
+               --include='*.ts' --include='*.toml' --include='*.json' --include='*.sql' . ; then
+            echo "::error::possible secret committed to the public template"; exit 1
+          fi
+          echo "no secrets found"

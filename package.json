@@ -1,0 +1,25 @@
+{
+  "name": "mupot",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Installable Cloudflare-native sovereign agent substrate (the pot).",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "migrate:local": "wrangler d1 migrations apply mupot --local",
+    "migrate:remote": "wrangler d1 migrations apply mupot --remote"
+  },
+  "dependencies": {
+    "agents": "^0.2.0",
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260601.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "wrangler": "^4.0.0"
+  }
+}

@@ -1,0 +1,63 @@
+# mupot — Cloudflare bindings. Fork this, set your account_id + a few vars, `wrangler deploy`.
+# This file is the BINDING CONTRACT every component builds against (see src/types.ts Env).
+name = "mupot"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ── tenant config (non-secret; secrets via `wrangler secret put`) ──
+[vars]
+TENANT_SLUG = "changeme"          # your org slug
+BRAND = "mupot"                   # dashboard brand
+OAUTH_PROVIDER = "google"         # google | telegram
+# secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN
+
+# ── memory: D1 (relational org + engram metadata) ──
+[[d1_databases]]
+binding = "DB"
+database_name = "mupot"
+database_id = "REPLACE_WITH_YOUR_D1_ID"
+migrations_dir = "migrations"
+
+# ── memory: Vectorize (semantic recall) ──
+[[vectorize]]
+binding = "VEC"
+index_name = "mupot-memory"
+
+# ── bus: Queues (async events / leads) ──
+[[queues.producers]]
+binding = "BUS"
+queue = "mupot-events"
+
+[[queues.consumers]]
+queue = "mupot-events"
+max_batch_size = 10
+max_retries = 3
+dead_letter_queue = "mupot-events-dlq"
+
+# ── sessions / config cache ──
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "REPLACE_WITH_YOUR_KV_ID"
+
+# ── blobs ──
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "mupot-blobs"
+
+# ── Workers AI (embeddings + cheap inference) ──
+[ai]
+binding = "AI"
+
+# ── agent runtime: one Durable Object per agent; one per squad ──
+[[durable_objects.bindings]]
+name = "AGENT"
+class_name = "AgentDO"
+
+[[durable_objects.bindings]]
+name = "SQUAD"
+class_name = "SquadCoordinatorDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AgentDO", "SquadCoordinatorDO"]
