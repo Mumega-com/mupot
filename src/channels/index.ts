@@ -501,6 +501,40 @@ channelsApp.get('/health', (c) =>
   c.json({ ok: true, component: 'channels', tenant: c.env.TENANT_SLUG }),
 )
 
+// ── Hermes relay ──────────────────────────────────────────────────────────────
+// Hermes is the always-on gateway (it holds the Discord/Telegram connections a CF
+// Worker can't). It POSTs already-normalized, platform-verified messages here; mupot
+// runs the SAME resolve→gate→act pipeline and returns the reply for Hermes to post
+// back into the channel. Auth = a shared secret header (fail-closed). Hermes vouches
+// for the platform identity; mupot still capability-gates every action.
+interface RelayBody {
+  platform?: unknown
+  externalChannelId?: unknown
+  externalUserId?: unknown
+  text?: unknown
+}
+channelsApp.post('/relay', async (c) => {
+  if (!c.env.HERMES_RELAY_SECRET) return c.json({ error: 'relay_not_configured' }, 503)
+  if (c.req.header('X-Relay-Secret') !== c.env.HERMES_RELAY_SECRET) {
+    return c.json({ error: 'unauthorized' }, 401)
+  }
+  let body: RelayBody
+  try {
+    body = (await c.req.json()) as RelayBody
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+  const platform = typeof body.platform === 'string' ? body.platform : ''
+  const channel = typeof body.externalChannelId === 'string' ? body.externalChannelId : ''
+  const user = typeof body.externalUserId === 'string' ? body.externalUserId : ''
+  const text = typeof body.text === 'string' ? body.text : ''
+  if (!platform || !channel || !user) {
+    return c.json({ error: 'platform, externalChannelId, externalUserId required' }, 400)
+  }
+  const reply = await runInbound(c.env, platform, channel, user, text)
+  return c.json({ ok: true, reply })
+})
+
 channelsApp.post('/:platform/webhook', async (c) => {
   const platform = c.req.param('platform')
   const adapter = getAdapter(platform)
