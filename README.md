@@ -1,10 +1,11 @@
 # mupot
 
-> **The pot, not the plant.** mupot is an installable, Cloudflare-native substrate for running a
-> sovereign **agent organization** — departments, squads, agents, and human members — on **your own
-> Cloudflare account**. Fork it, deploy it, log in, run your org. We give you the soil; what grows in it
-> (your agents, your business) is yours. mupot ships no business logic and holds no data of ours. You
-> hold the keys; you can revoke us at any time.
+> **The pot, not the plant.** mupot is a **zero-ops sovereign** agent organization — departments,
+> squads, agents, and human members — that you fork and deploy to **your own Cloudflare account in
+> minutes**: scale-to-zero, near-free, no servers, no per-seat tax. Governed by capability RBAC, run
+> through the chat channels your team already lives in (channels = squads). We give you the soil; what
+> grows in it (your agents, your business) is yours. It ships no business logic, holds no data of ours,
+> and you can revoke us at any time.
 
 Built in a single multi-agent session, deployed live, and proven end-to-end: a slash command in a
 Discord channel created a capability-gated task in a squad. **The channel is the squad.**
