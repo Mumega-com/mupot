@@ -40,7 +40,7 @@ import type {
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
 // The FROZEN capability API — everyone codes against these exact signatures.
-import { requireCapability } from '../auth/capability'
+import { requireCapability, capabilityRank, actorMaxRankOnScope } from '../auth/capability'
 
 // The validated invite payload, stashed by the parse middleware so the scope
 // extractor (which runs inside requireCapability) can read the target department.
@@ -341,6 +341,15 @@ membersApp.post(
     if (!body) return c.json({ error: 'invalid_json' }, 400)
     const auth = c.get('auth')
 
+    // CEILING: cannot invite at a capability above your own rank on this scope
+    // (a dept-admin must not mint an 'owner' on their department). P0 fix.
+    {
+      const { type: scopeType, id: scopeId } = inviteScope(c)
+      if (capabilityRank(body.capability) > (await actorMaxRankOnScope(c, scopeType, scopeId))) {
+        return c.json({ error: 'forbidden', reason: 'cannot_grant_above_own_rank' }, 403)
+      }
+    }
+
     const id = crypto.randomUUID()
     const createdAt = new Date().toISOString()
     // invited_by = the acting principal (member if present, else the web user id).
@@ -579,6 +588,12 @@ membersApp.post('/members/:id/capabilities', requireCapability(orgScope, 'admin'
   // grant
   if (!isCapability(body.capability)) return c.json({ error: 'invalid_capability' }, 400)
   const capability: Capability = body.capability
+
+  // CEILING: cannot grant above your own rank on the target scope (an org-admin
+  // must not grant org 'owner'). P1 fix.
+  if (capabilityRank(capability) > (await actorMaxRankOnScope(c, scopeType, scopeId))) {
+    return c.json({ error: 'forbidden', reason: 'cannot_grant_above_own_rank' }, 403)
+  }
 
   const grant: CapabilityGrant = {
     member_id: memberId,

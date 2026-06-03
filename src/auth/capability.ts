@@ -195,3 +195,37 @@ function legacyRoleSatisfies(role: AuthContext['role'], min: Capability): boolea
   if (role === 'admin') return meets('admin', min)
   return false
 }
+
+// ── grant ceiling ─────────────────────────────────────────────────────────────
+// You cannot grant (or invite at) a capability ABOVE your own effective level on
+// the target scope. Without this, a department-admin could invite an 'owner' on
+// their own department, or an org-admin could grant org 'owner' — vertical
+// privilege escalation (P0/P1 from the member-network review).
+
+export function capabilityRank(cap: Capability): number {
+  return RANK[cap]
+}
+
+/** The acting principal's highest effective capability rank on a scope — their
+ *  grants OR their coarse org role (owner=5, admin=4). 0 = no standing. */
+export async function actorMaxRankOnScope(
+  c: Context<AppEnv>,
+  scopeType: CapabilityScopeType,
+  scopeId: string | null,
+): Promise<number> {
+  const auth = c.get('auth')
+  let max = auth.role === 'owner' ? RANK.owner : auth.role === 'admin' ? RANK.admin : 0
+  if (auth.memberId) {
+    const grants = auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId))
+    const squadDept =
+      scopeType === 'squad' && scopeId ? await resolveSquadDepartment(c.env, scopeId) : null
+    // highest capability that resolves true on this scope = the actor's ceiling
+    for (const cap of ['owner', 'admin', 'lead', 'member', 'observer'] as Capability[]) {
+      if (hasCapability(grants, scopeType, scopeId, cap, squadDept ?? undefined)) {
+        max = Math.max(max, RANK[cap])
+        break
+      }
+    }
+  }
+  return max
+}
