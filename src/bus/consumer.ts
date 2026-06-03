@@ -15,6 +15,7 @@
 
 import type { MessageBatch, Message } from '@cloudflare/workers-types'
 import type { Env, BusEvent } from '../types'
+import { postAgentActivity } from '../channels'
 
 // Internal origin for DO fetch routing. DO fetch ignores host; the path carries
 // the intent. The agents component routes these paths inside its DO classes.
@@ -104,6 +105,19 @@ export async function handleQueue(batch: MessageBatch<BusEvent>, env: Env): Prom
   for (const message of batch.messages as Message<BusEvent>[]) {
     try {
       await routeEvent(env, message.body)
+      // Best-effort live activity feed: surface agent actions into the squad's
+      // bound channel. A feed-post failure must NOT retry the message (the work
+      // already routed) — it is observability, not the action itself.
+      if (message.body.actor?.kind === 'agent') {
+        try {
+          await postAgentActivity(env, message.body)
+        } catch (e) {
+          console.error('bus: activity-feed post failed (non-fatal)', {
+            id: message.id,
+            error: e instanceof Error ? e.message : String(e),
+          })
+        }
+      }
       message.ack()
     } catch (err) {
       console.error('bus: message failed, will retry', {

@@ -61,3 +61,7 @@ class_name = "SquadCoordinatorDO"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AgentDO", "SquadCoordinatorDO"]
+
+# membership sync: reconcile channel membership → squad capabilities every 15 min
+[triggers]
+crons = ["*/15 * * * *"]

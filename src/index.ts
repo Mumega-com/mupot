@@ -20,6 +20,8 @@ import { membersApp } from './members'
 import { mcpApp } from './mcp'
 import { imApp } from './im'
 import { dashboardApp } from './dashboard'
+import { channelsApp, reconcileMembership } from './channels'
+import { channelsAdminApp } from './channels/admin'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -37,6 +39,10 @@ app.route(ROUTES.bus, busApp)
 app.route(ROUTES.members, membersApp)
 app.route(ROUTES.mcp, mcpApp)
 app.route(ROUTES.im, imApp)
+// channel adapters: the scoped webhook (/channels/:platform/webhook) + binding admin.
+// Mounted BEFORE the dashboard '/' catch-all so the specific prefixes win.
+app.route('/channels', channelsApp)
+app.route('/api/channels', channelsAdminApp)
 app.route(ROUTES.dashboard, dashboardApp)
 
 // Queue consumer — the bus component owns the handler.
@@ -45,4 +51,8 @@ import { handleQueue } from './bus/consumer'
 export default {
   fetch: app.fetch,
   queue: handleQueue,
+  // membership sync: reconcile channel membership → squad capabilities on a schedule.
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(reconcileMembership(env))
+  },
 }
