@@ -12,31 +12,44 @@
 //   - Identity is the PLATFORM MAPPING, never message text. parseInbound returns the
 //     raw space name + the sender's email; the core resolves those to a binding/member.
 //     We never read a self-claimed identity field as proof of "who" for authorization.
-//   - Webhook authenticity is verified fail-closed: Google Chat sends a Bearer token in
-//     the Authorization header (the verification token configured on the app, or the
-//     bearer audience token issued to the app). No configured secret → verify() returns
-//     false and the core rejects the request.
-//   - Secrets (GOOGLE_CHAT_VERIFY_TOKEN, GOOGLE_CHAT_TOKEN) are runtime-only and are
-//     NEVER logged, echoed, or returned. The service token leaves this file only inside
-//     an Authorization header on an outbound fetch to Google.
+//   - Webhook authenticity is verified fail-closed by cryptographically verifying the
+//     Google-signed Bearer JWT (issuer chat@system.gserviceaccount.com, audience = the
+//     app's project number) against Google's published x509 certs. No project number
+//     configured / missing / invalid / unverifiable token → verify() returns false and
+//     the core rejects the request.
+//   - Outbound calls authenticate with a short-lived OAuth2 access token MINTED in-process
+//     from a service-account key (GOOGLE_CHAT_SA_KEY) via the JWT-bearer grant, cached
+//     until shortly before expiry. The service-account key and the minted token are
+//     NEVER logged, echoed, or returned — the token leaves this file only inside an
+//     Authorization header on an outbound fetch to Google.
+//
+// Runs in the Cloudflare Workers runtime: ALL crypto is Web Crypto (crypto.subtle);
+// NO Node APIs (no Buffer, no node:crypto).
 //
 // Exports: `googleChatAdapter: ChannelAdapter` (platform 'google-chat').
 
 import type { ChannelAdapter, Env, InboundMessage, Capability } from '../../types'
 
 // ── env secret access ─────────────────────────────────────────────────────────
-// GOOGLE_CHAT_VERIFY_TOKEN / GOOGLE_CHAT_TOKEN are platform-specific secrets. They are
-// runtime-only (wrangler secrets) and intentionally NOT on the shared Env interface in
-// types.ts (which this part must not edit). We read them through a narrow, per-adapter
-// view of env. The cast is the documented seam for adapter-local secrets; it widens
-// nothing for the core and never escapes this module.
+// These are platform-specific secrets/vars. They are runtime-only (wrangler secrets /
+// vars) and intentionally NOT on the shared Env interface in types.ts (which this part
+// must not edit). We read them through a narrow, per-adapter view of env. The cast is
+// the documented seam for adapter-local secrets; it widens nothing for the core and
+// never escapes this module.
 interface GoogleChatSecrets {
-  // Shared verification token configured on the Chat app's webhook (Google sends it
-  // back as the Authorization bearer on each event) — OR the bearer issued to the app.
+  // Full service-account JSON key (the file Google hands you): { client_email,
+  // private_key (PEM PKCS8), ... }. Used to MINT OAuth2 access tokens in-process for the
+  // outbound Chat REST API. Never logged.
+  GOOGLE_CHAT_SA_KEY?: string
+  // The app's Google Cloud PROJECT NUMBER — the audience Google Chat signs inbound
+  // request JWTs for. Required for inbound verify; unset → verify fails closed.
+  GOOGLE_CHAT_PROJECT_NUMBER?: string
+  // OPTIONAL, WEAKER fallback. A fixed shared verification token Google echoes back as the
+  // inbound Authorization bearer. Only consulted when SA-based JWT verify cannot run
+  // because GOOGLE_CHAT_PROJECT_NUMBER is unset. A shared bearer does NOT cryptographically
+  // prove the payload's sender, so it is strictly weaker than JWT verify and exists only
+  // as a transitional escape hatch. Prefer GOOGLE_CHAT_PROJECT_NUMBER.
   GOOGLE_CHAT_VERIFY_TOKEN?: string
-  // OAuth2 access token / service-auth bearer used to call the Chat REST API (post,
-  // members.list). Service-account based; minted out of band, supplied as a secret.
-  GOOGLE_CHAT_TOKEN?: string
 }
 
 function googleChatSecrets(env: Env): GoogleChatSecrets {
@@ -46,6 +59,11 @@ function googleChatSecrets(env: Env): GoogleChatSecrets {
 }
 
 const CHAT_API = 'https://chat.googleapis.com/v1'
+const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token'
+const CHAT_SCOPE = 'https://www.googleapis.com/auth/chat.bot'
+const CHAT_SYSTEM_ISSUER = 'chat@system.gserviceaccount.com'
+const GOOGLE_CHAT_CERTS_URL =
+  'https://www.googleapis.com/service_accounts/v1/metadata/x509/chat@system.gserviceaccount.com'
 
 // ── small helpers ───────────────────────────────────────────────────────────────
 function asString(v: unknown): string | null {
@@ -79,24 +97,441 @@ function spacePath(externalChannelId: string): string {
   return trimmed.startsWith('spaces/') ? trimmed : `spaces/${trimmed}`
 }
 
-// ── verify (fail-closed) ──────────────────────────────────────────────────────
-// Google Chat authenticates webhook deliveries with a Bearer token in the
-// Authorization header. In the simplest (and recommended-for-self-host) setup that is
-// a fixed verification token you configure on the app; Google echoes it back on every
-// event. We compare it against GOOGLE_CHAT_VERIFY_TOKEN in constant time. No configured
-// token → sealed (return false): an unauthenticated POST could otherwise forge a space
-// + sender email and impersonate that member's capabilities.
+// ── base64 / base64url codecs (Web APIs only; no Buffer) ──────────────────────────
+// Standard base64 → bytes. `atob` yields a binary string; copy char codes to a Uint8Array.
+function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64)
+  const out = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i)
+  return out
+}
+
+// base64url (JWT segments) → bytes. Restore standard alphabet + padding, then decode.
+function base64UrlToBytes(b64url: string): Uint8Array {
+  let s = b64url.replace(/-/g, '+').replace(/_/g, '/')
+  const pad = s.length % 4
+  if (pad === 2) s += '=='
+  else if (pad === 3) s += '='
+  else if (pad === 1) throw new Error('invalid base64url length')
+  return base64ToBytes(s)
+}
+
+// Copy a Uint8Array (which may be a view over a larger / Shared buffer) into a fresh,
+// tightly-sized ArrayBuffer. crypto.subtle wants a plain ArrayBuffer; `.buffer` is typed
+// ArrayBufferLike (may be SharedArrayBuffer) so we always copy to be type- and intent-safe.
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const out = new ArrayBuffer(bytes.byteLength)
+  new Uint8Array(out).set(bytes)
+  return out
+}
+
+// bytes → base64url (no padding) for the JWT segments we sign.
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = ''
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+}
+
+// UTF-8 string → base64url, for JWT header/claim JSON.
+function strToBase64Url(s: string): string {
+  return bytesToBase64Url(new TextEncoder().encode(s))
+}
+
+// base64url → UTF-8 string, for reading a JWT header/payload segment.
+function base64UrlToStr(b64url: string): string {
+  return new TextDecoder().decode(base64UrlToBytes(b64url))
+}
+
+// ── PEM (PKCS8) → ArrayBuffer DER ─────────────────────────────────────────────────
+// Strip the BEGIN/END armor + ALL whitespace, then base64-decode the body to DER. Works
+// for "PRIVATE KEY" (PKCS8) bodies as Google supplies in the SA key's private_key field.
+function pemToDer(pem: string): ArrayBuffer {
+  const body = pem
+    .replace(/-----BEGIN [^-]+-----/g, '')
+    .replace(/-----END [^-]+-----/g, '')
+    .replace(/\s+/g, '')
+  if (!body) throw new Error('empty PEM body')
+  return toArrayBuffer(base64ToBytes(body))
+}
+
+// ── outbound OAuth2 token minting (service-account JWT-bearer grant) ───────────────
+// We mint a short-lived access token from the service-account key and cache it
+// module-level until ~60s before expiry, then re-mint. The key and token are never
+// logged. Cache is keyed by the SA client_email so a key rotation (different SA) does
+// not serve a stale token for the wrong identity.
+
+interface ServiceAccountKey {
+  client_email: string
+  private_key: string // PEM PKCS8
+}
+
+interface TokenResponse {
+  access_token?: unknown
+  expires_in?: unknown
+}
+
+interface CachedToken {
+  accessToken: string
+  expiresAtMs: number
+  clientEmail: string
+}
+
+// Module-level token cache. Survives across requests within a Worker isolate; a cold
+// isolate simply re-mints. No secret is persisted here beyond the short-lived token.
+let cachedToken: CachedToken | null = null
+
+function parseServiceAccountKey(raw: string): ServiceAccountKey {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error('google-chat: GOOGLE_CHAT_SA_KEY is not valid JSON')
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('google-chat: GOOGLE_CHAT_SA_KEY is not an object')
+  }
+  const obj = parsed as Record<string, unknown>
+  const clientEmail = asString(obj.client_email)
+  const privateKey = asString(obj.private_key)
+  if (!clientEmail || !privateKey) {
+    throw new Error('google-chat: GOOGLE_CHAT_SA_KEY missing client_email or private_key')
+  }
+  return { client_email: clientEmail, private_key: privateKey }
+}
+
+// Build + RS256-sign the assertion JWT, exchange it for an access token at Google's token
+// endpoint. Returns the access token and its absolute expiry. Throws on any failure; the
+// thrown message never contains the key or token.
+async function mintAccessToken(sa: ServiceAccountKey): Promise<CachedToken> {
+  const iat = Math.floor(Date.now() / 1000)
+  const exp = iat + 3600
+
+  const header = { alg: 'RS256', typ: 'JWT' }
+  const claims = {
+    iss: sa.client_email,
+    scope: CHAT_SCOPE,
+    aud: TOKEN_ENDPOINT,
+    iat,
+    exp,
+  }
+
+  const signingInput = `${strToBase64Url(JSON.stringify(header))}.${strToBase64Url(
+    JSON.stringify(claims),
+  )}`
+
+  const der = pemToDer(sa.private_key)
+  const key = await crypto.subtle.importKey(
+    'pkcs8',
+    der,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  )
+  const sigBuf = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5',
+    key,
+    new TextEncoder().encode(signingInput),
+  )
+  const assertion = `${signingInput}.${bytesToBase64Url(new Uint8Array(sigBuf))}`
+
+  const body = new URLSearchParams({
+    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+    assertion,
+  })
+
+  const res = await fetch(TOKEN_ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  })
+  if (!res.ok) {
+    // Status only — the request carried the SA-signed assertion; do not echo headers.
+    // Google's error body names the OAuth error (no secret echoed).
+    const detail = await res.text().catch(() => '')
+    throw new Error(`google-chat: token mint failed (${res.status}) ${detail.slice(0, 256)}`)
+  }
+  const json = (await res.json().catch(() => null)) as TokenResponse | null
+  const accessToken = asString(json?.access_token)
+  const expiresIn = typeof json?.expires_in === 'number' ? json.expires_in : 3600
+  if (!accessToken) {
+    throw new Error('google-chat: token mint response missing access_token')
+  }
+
+  return {
+    accessToken,
+    // Refresh ~60s early so an in-flight request never races the hard expiry.
+    expiresAtMs: Date.now() + Math.max(0, expiresIn - 60) * 1000,
+    clientEmail: sa.client_email,
+  }
+}
+
+// Return a valid access token, minting (and caching) on demand. Reuses the cached token
+// until ~60s before expiry. Throws if GOOGLE_CHAT_SA_KEY is absent/invalid.
+async function getAccessToken(env: Env): Promise<string> {
+  const raw = googleChatSecrets(env).GOOGLE_CHAT_SA_KEY
+  if (!raw) {
+    throw new Error('google-chat: GOOGLE_CHAT_SA_KEY not configured')
+  }
+  const sa = parseServiceAccountKey(raw)
+
+  const now = Date.now()
+  if (
+    cachedToken &&
+    cachedToken.clientEmail === sa.client_email &&
+    cachedToken.expiresAtMs > now
+  ) {
+    return cachedToken.accessToken
+  }
+
+  const minted = await mintAccessToken(sa)
+  cachedToken = minted
+  return minted.accessToken
+}
+
+// ── inbound JWT verify (fail-closed, cryptographic) ───────────────────────────────
+// Google Chat signs each request with a Bearer JWT in the Authorization header, issued by
+// chat@system.gserviceaccount.com with audience = the app's PROJECT NUMBER. We:
+//   1) read the bearer, split header.payload.signature,
+//   2) fetch Google's x509 certs (cached briefly) keyed by `kid`,
+//   3) verify the RS256 signature over `header.payload`,
+//   4) check iss === chat@system.gserviceaccount.com and aud === expected project number,
+//      and that the token is within iat/exp.
+// Anything missing/invalid/throwing → false. If GOOGLE_CHAT_PROJECT_NUMBER is unset we
+// CANNOT validate the audience, so we fail closed (unless the weaker shared-token
+// fallback is configured — see GOOGLE_CHAT_VERIFY_TOKEN).
+
+// Google publishes certs as { kid: "-----BEGIN CERTIFICATE-----..." }. Cache them
+// module-level for a short TTL to avoid a fetch per inbound event without going stale.
+interface CertCache {
+  certs: Record<string, string>
+  expiresAtMs: number
+}
+let certCache: CertCache | null = null
+const CERT_TTL_MS = 60 * 60 * 1000 // 1h; Google rotates infrequently and sets cache headers
+
+async function fetchGoogleChatCerts(): Promise<Record<string, string>> {
+  const now = Date.now()
+  if (certCache && certCache.expiresAtMs > now) return certCache.certs
+
+  const res = await fetch(GOOGLE_CHAT_CERTS_URL)
+  if (!res.ok) throw new Error(`google-chat: cert fetch failed (${res.status})`)
+  const json = (await res.json().catch(() => null)) as unknown
+  if (!json || typeof json !== 'object') throw new Error('google-chat: malformed cert response')
+
+  const certs: Record<string, string> = {}
+  for (const [kid, pem] of Object.entries(json as Record<string, unknown>)) {
+    if (typeof pem === 'string') certs[kid] = pem
+  }
+  if (Object.keys(certs).length === 0) throw new Error('google-chat: empty cert set')
+
+  certCache = { certs, expiresAtMs: now + CERT_TTL_MS }
+  return certs
+}
+
+// Import a PEM X.509 CERTIFICATE as an RSASSA-PKCS1-v1_5 verification key. Web Crypto
+// importKey('spki', ...) expects a SubjectPublicKeyInfo, which is the certificate's
+// embedded public key — but it does NOT parse a full X.509 cert. We extract the SPKI from
+// the certificate's DER below.
+async function importCertPublicKey(certPem: string): Promise<CryptoKey> {
+  const certDer = pemToDer(certPem)
+  const spki = extractSpkiFromCertificate(new Uint8Array(certDer))
+  return crypto.subtle.importKey(
+    'spki',
+    toArrayBuffer(spki),
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['verify'],
+  )
+}
+
+// Minimal DER walker to pull the SubjectPublicKeyInfo out of an X.509 Certificate.
 //
-// (A production deployment may instead verify a Google-signed JWT audience bearer; that
-// upgrade lives entirely in this function and changes nothing in the core.)
+// Certificate ::= SEQUENCE { tbsCertificate SEQUENCE { ... subjectPublicKeyInfo SPKI ... }
+//                            signatureAlgorithm, signatureValue }
+// The SPKI is itself a SEQUENCE whose first element is an AlgorithmIdentifier SEQUENCE
+// containing the rsaEncryption OID (1.2.840.113549.1.1.1 → DER 06 09 2A 86 48 86 F7 0D 01 01 01).
+// We locate that OID and back up to the enclosing SEQUENCE header to recover the SPKI bytes.
+// This avoids pulling in a full ASN.1 library while staying within Web-only APIs.
+function extractSpkiFromCertificate(der: Uint8Array): Uint8Array {
+  const rsaOid = [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]
+
+  // Find the rsaEncryption OID inside the certificate.
+  let oidPos = -1
+  for (let i = 0; i + rsaOid.length <= der.length; i++) {
+    let match = true
+    for (let j = 0; j < rsaOid.length; j++) {
+      if (der[i + j] !== rsaOid[j]) {
+        match = false
+        break
+      }
+    }
+    if (match) {
+      oidPos = i
+      break
+    }
+  }
+  if (oidPos < 0) throw new Error('google-chat: rsaEncryption OID not found in certificate')
+
+  // Walk backwards to find the SEQUENCE (0x30) header of the AlgorithmIdentifier that
+  // contains this OID, then the SEQUENCE header of the enclosing SPKI. We scan for a 0x30
+  // tag whose declared length encloses the OID; the SPKI is the OUTER such SEQUENCE.
+  // Strategy: try each 0x30 before the OID as a candidate SPKI start and verify its
+  // length spans past the OID, picking the nearest enclosing one (the AlgorithmIdentifier),
+  // then step out one more SEQUENCE to the SPKI.
+
+  // Read a DER length at position p (p points at the length byte). Returns [length, headerLen].
+  const readLen = (p: number): [number, number] => {
+    const first = der[p]
+    if (first < 0x80) return [first, 1]
+    const numBytes = first & 0x7f
+    if (numBytes === 0 || numBytes > 4) throw new Error('google-chat: bad DER length')
+    let len = 0
+    for (let k = 0; k < numBytes; k++) len = (len << 8) | der[p + 1 + k]
+    return [len, 1 + numBytes]
+  }
+
+  // Find the AlgorithmIdentifier SEQUENCE: the nearest 0x30 before the OID whose contents
+  // begin at the OID (an AlgorithmIdentifier is SEQUENCE { OID, params }).
+  let algSeqStart = -1
+  for (let p = oidPos - 1; p >= 0; p--) {
+    if (der[p] !== 0x30) continue
+    try {
+      const [, hdr] = readLen(p + 1)
+      if (p + 1 + hdr === oidPos) {
+        algSeqStart = p
+        break
+      }
+    } catch {
+      // not a valid length here; keep scanning
+    }
+  }
+  if (algSeqStart < 0) throw new Error('google-chat: AlgorithmIdentifier SEQUENCE not found')
+
+  // The SPKI SEQUENCE is the nearest 0x30 before algSeqStart whose contents START at
+  // algSeqStart (SPKI is SEQUENCE { AlgorithmIdentifier, BIT STRING }).
+  let spkiStart = -1
+  for (let p = algSeqStart - 1; p >= 0; p--) {
+    if (der[p] !== 0x30) continue
+    try {
+      const [, hdr] = readLen(p + 1)
+      if (p + 1 + hdr === algSeqStart) {
+        spkiStart = p
+        break
+      }
+    } catch {
+      // keep scanning
+    }
+  }
+  if (spkiStart < 0) throw new Error('google-chat: SPKI SEQUENCE not found')
+
+  const [spkiLen, spkiHdr] = readLen(spkiStart + 1)
+  const end = spkiStart + 1 + spkiHdr + spkiLen
+  if (end > der.length) throw new Error('google-chat: SPKI length exceeds certificate')
+  return der.slice(spkiStart, end)
+}
+
+interface JwtHeader {
+  alg?: unknown
+  kid?: unknown
+}
+
+interface JwtClaims {
+  iss?: unknown
+  aud?: unknown
+  iat?: unknown
+  exp?: unknown
+}
+
+// Cryptographically verify a Google Chat inbound JWT. Returns true ONLY on a fully valid
+// token (good signature, correct issuer, correct audience, within iat/exp). Any failure
+// returns false. `expectedAud` is the configured project number.
+async function verifyGoogleChatJwt(jwt: string, expectedAud: string): Promise<boolean> {
+  const parts = jwt.split('.')
+  if (parts.length !== 3) return false
+  const [headerB64, payloadB64, sigB64] = parts
+
+  let header: JwtHeader
+  let claims: JwtClaims
+  try {
+    header = JSON.parse(base64UrlToStr(headerB64)) as JwtHeader
+    claims = JSON.parse(base64UrlToStr(payloadB64)) as JwtClaims
+  } catch {
+    return false
+  }
+
+  if (asString(header.alg) !== 'RS256') return false
+  const kid = asString(header.kid)
+  if (!kid) return false
+
+  // Claim checks BEFORE the (more expensive) signature verify.
+  if (asString(claims.iss) !== CHAT_SYSTEM_ISSUER) return false
+  if (asString(claims.aud) !== expectedAud) return false
+
+  const nowSec = Math.floor(Date.now() / 1000)
+  const skew = 60 // tolerate 60s clock skew
+  const exp = typeof claims.exp === 'number' ? claims.exp : null
+  const iat = typeof claims.iat === 'number' ? claims.iat : null
+  if (exp === null || nowSec > exp + skew) return false
+  if (iat !== null && nowSec < iat - skew) return false
+
+  let certs: Record<string, string>
+  try {
+    certs = await fetchGoogleChatCerts()
+  } catch {
+    return false
+  }
+  const certPem = certs[kid]
+  if (!certPem) return false
+
+  let key: CryptoKey
+  try {
+    key = await importCertPublicKey(certPem)
+  } catch {
+    return false
+  }
+
+  let signature: Uint8Array
+  try {
+    signature = base64UrlToBytes(sigB64)
+  } catch {
+    return false
+  }
+
+  const signed = new TextEncoder().encode(`${headerB64}.${payloadB64}`)
+  try {
+    return await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, toArrayBuffer(signature), signed)
+  } catch {
+    return false
+  }
+}
+
+// ── verify (fail-closed) ──────────────────────────────────────────────────────
+// Cryptographically verify the Google-signed inbound JWT. The expected audience is the
+// app's project number (GOOGLE_CHAT_PROJECT_NUMBER). If that is unset we cannot validate
+// the audience, so we fall back to the WEAKER fixed-shared-token compare ONLY if
+// GOOGLE_CHAT_VERIFY_TOKEN is configured; otherwise fail closed (return false). A shared
+// bearer does not prove the payload's sender — see the secret-doc above — so it is a
+// transitional escape hatch, not the recommended posture.
 async function verify(req: Request, env: Env): Promise<boolean> {
-  const expected = googleChatSecrets(env).GOOGLE_CHAT_VERIFY_TOKEN
-  if (!expected) return false // no token configured → fail closed
-
+  const secrets = googleChatSecrets(env)
   const presented = bearerToken(req.headers.get('authorization'))
-  if (!presented) return false
+  if (!presented) return false // no bearer → fail closed
 
-  return safeEqual(presented, expected)
+  const projectNumber = asString(secrets.GOOGLE_CHAT_PROJECT_NUMBER)
+  if (projectNumber) {
+    try {
+      return await verifyGoogleChatJwt(presented, projectNumber)
+    } catch {
+      return false // anything throwing → fail closed
+    }
+  }
+
+  // Weaker fallback: fixed shared-token compare (constant-time). Only when no project
+  // number is configured AND a verify token is explicitly set. Otherwise sealed.
+  const fallback = asString(secrets.GOOGLE_CHAT_VERIFY_TOKEN)
+  if (fallback) return safeEqual(presented, fallback)
+
+  return false
 }
 
 // ── inbound parsing ───────────────────────────────────────────────────────────
@@ -186,16 +621,13 @@ async function parseInbound(req: Request, _env: Env): Promise<InboundMessage | n
 }
 
 // ── outbound post ─────────────────────────────────────────────────────────────
-// POST https://chat.googleapis.com/v1/{space}/messages with the service bearer token.
-// The token never appears in a log line or an error message — on failure we surface
-// only the HTTP status (+ Google's body, which carries no secret), never the headers.
+// POST https://chat.googleapis.com/v1/{space}/messages with a freshly-minted (cached)
+// OAuth2 access token. The token never appears in a log line or an error message — on
+// failure we surface only the HTTP status (+ Google's body, which carries no secret),
+// never the headers.
 
 async function post(env: Env, externalChannelId: string, text: string): Promise<void> {
-  const token = googleChatSecrets(env).GOOGLE_CHAT_TOKEN
-  if (!token) {
-    // Fail-closed and token-safe: no secret, no send. Never log the (absent) token.
-    throw new Error('google-chat: GOOGLE_CHAT_TOKEN not configured')
-  }
+  const token = await getAccessToken(env) // throws (token-safe) if SA key is absent/invalid
 
   const space = spacePath(externalChannelId)
   const res = await fetch(`${CHAT_API}/${space}/messages`, {
@@ -216,14 +648,15 @@ async function post(env: Env, externalChannelId: string, text: string): Promise<
 }
 
 // ── channel members ───────────────────────────────────────────────────────────
-// spaces.members.list → the space's memberships. Each membership nests the human
-// under `member.email` (type 'HUMAN'). We page via nextPageToken and return the
-// external user ids = EMAILS (so they line up with parseInbound + members.email).
-// Bots are excluded so sync never grants capabilities to a bot account. Best-effort +
-// fail-soft: any error → [] so a transient Google outage can't wedge reconciliation.
+// spaces.members.list → the space's memberships. Each membership nests the principal
+// under `member` (type 'HUMAN'); for a human, member.name resolves to a user. We return
+// the external user ids = EMAILS where present (so they line up with parseInbound +
+// members.email), else the user id from member.name. Bots are excluded so sync never
+// grants capabilities to a bot account. Best-effort + fail-soft: any error → [] so a
+// transient Google outage can't wedge reconciliation.
 
 interface GoogleChatMembership {
-  member?: GoogleChatUser | null // the human/bot principal
+  member?: GoogleChatUser | null // the human/bot principal (member.name = "users/<id>")
   state?: unknown // 'JOINED' | 'INVITED' | ...
 }
 
@@ -233,8 +666,12 @@ interface GoogleChatMembersList {
 }
 
 async function chatGet(env: Env, path: string): Promise<unknown | null> {
-  const token = googleChatSecrets(env).GOOGLE_CHAT_TOKEN
-  if (!token) return null
+  let token: string
+  try {
+    token = await getAccessToken(env)
+  } catch {
+    return null // no/invalid SA key → fail-soft (caller returns [])
+  }
   const res = await fetch(`${CHAT_API}${path}`, {
     headers: { authorization: `Bearer ${token}` },
   })
@@ -243,15 +680,16 @@ async function chatGet(env: Env, path: string): Promise<unknown | null> {
 }
 
 /**
- * listChannelMembers — the EMAILS of the human members of a Google Chat space.
- * Pages spaces.members.list via nextPageToken (we request the max page size and follow
- * the cursor). Excludes bots and de-dupes (case-insensitively). Fail-soft: returns []
- * on any error so a transient outage can't wedge reconciliation. Emails feed the core's
- * membership sync, which binds them to members.email under the per-binding ceiling.
+ * listChannelMembers — the human members of a Google Chat space as external user ids
+ * (EMAILS where Google provides them, else the user id from member.name). Pages
+ * spaces.members.list via nextPageToken (we request the max page size and follow the
+ * cursor). Excludes bots and de-dupes (case-insensitively). Fail-soft: returns [] on any
+ * error so a transient outage can't wedge reconciliation. These ids feed the core's
+ * membership sync, which binds them under the per-binding ceiling.
  */
 async function listChannelMembers(env: Env, externalChannelId: string): Promise<string[]> {
   const space = spacePath(externalChannelId)
-  const emails: string[] = []
+  const ids: string[] = []
   const seen = new Set<string>()
   let pageToken = ''
 
@@ -267,12 +705,14 @@ async function listChannelMembers(env: Env, externalChannelId: string): Promise<
     for (const m of memberships) {
       const principal = m?.member ?? null
       if (isBotUser(principal)) continue
-      const email = asString(principal?.email)
-      if (!email) continue
-      const key = email.toLowerCase()
+      // Prefer the email (auto-binds to members.email); fall back to the user resource
+      // id (member.name = "users/<id>") so a member without a visible email still syncs.
+      const id = asString(principal?.email) ?? asString(principal?.name)
+      if (!id) continue
+      const key = id.toLowerCase()
       if (seen.has(key)) continue
       seen.add(key)
-      emails.push(email)
+      ids.push(id)
     }
 
     const next = asString(list.nextPageToken)
@@ -280,7 +720,7 @@ async function listChannelMembers(env: Env, externalChannelId: string): Promise<
     pageToken = next
   }
 
-  return emails
+  return ids
 }
 
 // ── role → capability (optional) ──────────────────────────────────────────────
