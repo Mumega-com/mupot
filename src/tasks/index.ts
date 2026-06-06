@@ -14,6 +14,7 @@
 // gated. The GitHub token is read from env only — it is never echoed or logged.
 
 import { Hono } from 'hono'
+import { csrf } from 'hono/csrf'
 import type { Env, AuthContext, Task, Agent, Squad } from '../types'
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
@@ -78,6 +79,13 @@ async function canActOnSquad(
 export const tasksApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
 
 tasksApp.get('/health', (c) => c.json({ ok: true, component: 'tasks', tenant: c.env.TENANT_SLUG }))
+
+// CSRF: the dashboard /send page drives these mutations with the SameSite=Lax
+// session cookie (requireAuth is cookie-only). SameSite=Lax must NOT be the single
+// line of defense on a state-changing route, so add an explicit Origin/Host check
+// (hono/csrf guards only unsafe methods — GET reads are unaffected). Adversarial
+// finding 2026-06-06.
+tasksApp.use('*', csrf())
 
 // Every route is authenticated and hard-scoped to this pot's tenant.
 tasksApp.use('*', requireAuth)

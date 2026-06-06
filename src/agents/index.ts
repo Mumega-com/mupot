@@ -6,6 +6,7 @@
 // caller cannot poke an arbitrary DO id from another tenant.
 
 import { Hono } from 'hono'
+import { csrf } from 'hono/csrf'
 import type { Env, Agent, AuthContext, BusEvent } from '../types'
 import { requireAuth } from '../auth'
 import { createBus } from '../bus'
@@ -35,6 +36,12 @@ export const agentsApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContex
 // Every route requires auth AND tenant scope — the same explicit guard org/tasks
 // enforce. Don't rely on per-tenant D1 alone as the boundary (P1 fix): a session
 // minted for another tenant must never wake/read this tenant's agents.
+// CSRF: /wake is a cookie-authenticated state-changing POST (the dashboard agent
+// console drives it). SameSite=Lax must not be the only defense — add an explicit
+// Origin/Host check. GET /status (read-only) is unaffected (csrf guards only unsafe
+// methods). Adversarial finding 2026-06-06.
+agentsApp.use('*', csrf())
+
 agentsApp.use('*', requireAuth, async (c, next) => {
   if (c.get('auth').tenant !== c.env.TENANT_SLUG) {
     return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
