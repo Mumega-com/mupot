@@ -20,6 +20,11 @@ interface DispatchInput {
   context?: string
   // restrict dispatch to a subset; default = all active members of the squad
   agent_ids?: string[]
+  // EXECUTE MODE: a task_id forwarded to each woken agent so it does the task
+  // (the AgentDO scopes it to its own squad, fail-closed). May arrive either as a
+  // top-level field or in a BusEvent payload (the Queue posts the raw event).
+  task_id?: string
+  payload?: unknown
 }
 
 interface DispatchResult {
@@ -113,6 +118,9 @@ export class SquadCoordinatorDO extends DurableObject<Env> {
       targets = await this.activeMemberIds()
     }
 
+    // A task_id may arrive top-level or inside a BusEvent payload (Queue path).
+    const taskId = this.resolveTaskId(input)
+
     const dispatched: DispatchResult['dispatched'] = []
     for (const agentId of targets) {
       try {
@@ -120,7 +128,12 @@ export class SquadCoordinatorDO extends DurableObject<Env> {
         const res = await stub.fetch('https://agent/wake', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ reason: input.reason ?? 'squad.dispatch', squad_id: squadId, context: input.context }),
+          body: JSON.stringify({
+            reason: input.reason ?? 'squad.dispatch',
+            squad_id: squadId,
+            context: input.context,
+            task_id: taskId ?? undefined,
+          }),
         })
         dispatched.push({ agent_id: agentId, ok: res.ok })
       } catch (err) {
@@ -128,6 +141,18 @@ export class SquadCoordinatorDO extends DurableObject<Env> {
       }
     }
     return { ok: true, squad_id: squadId, dispatched }
+  }
+
+  // Read a task id from a plain DispatchInput (top-level) or a raw BusEvent body
+  // (payload.task_id). Returns null when neither carries one.
+  private resolveTaskId(input: DispatchInput): string | null {
+    if (typeof input.task_id === 'string' && input.task_id.length > 0) return input.task_id
+    const payload = input.payload
+    if (payload && typeof payload === 'object' && 'task_id' in payload) {
+      const v = (payload as Record<string, unknown>).task_id
+      if (typeof v === 'string' && v.length > 0) return v
+    }
+    return null
   }
 
   private async activeMemberIds(): Promise<string[]> {

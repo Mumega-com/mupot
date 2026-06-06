@@ -77,8 +77,9 @@ agentsApp.post('/:agentId/wake', async (c) => {
 
   if (agent.status !== 'active') return c.json({ error: 'agent_paused' }, 409)
 
-  // optional wake body (reason/context/maxActions)
-  type WakeBody = { reason?: string; context?: string; maxActions?: number }
+  // optional wake body (reason/context/maxActions/task_id). A task_id puts the
+  // cortex cycle into EXECUTE MODE (do that task) instead of proposing tasks.
+  type WakeBody = { reason?: string; context?: string; maxActions?: number; task_id?: string }
   const body = await c.req.json<WakeBody>().catch((): WakeBody => ({}))
 
   // Announce the wake on the bus (observability + lets the consumer react), then
@@ -103,6 +104,7 @@ agentsApp.post('/:agentId/wake', async (c) => {
       squad_id: agent.squad_id,
       context: body.context,
       maxActions: body.maxActions,
+      task_id: body.task_id,
     }),
   })
   const result = await res.json<unknown>()

@@ -11,12 +11,18 @@
 // so a stale/cross-tenant id can never drive a cycle.
 
 import { DurableObject } from 'cloudflare:workers'
-import type { Env, Agent, MemoryPort, ModelMessage } from '../types'
+import type { Env, Agent, Task, MemoryPort, ModelMessage, BusEvent } from '../types'
 import { createMemory } from '../memory'
 import { createModel } from '../model'
 import { createTask } from '../tasks/service'
+import { createBus } from '../bus'
 
 // Wake request body — who/why woke this agent, and how hard it may work.
+//
+// Two shapes arrive at /wake: a plain WakeInput (from the agents API and the
+// squad coordinator) and a full BusEvent (from the Queue consumer, which posts
+// the raw event). We read the structured fields we know from either: a top-level
+// `task_id` (execute mode) OR `payload.task_id` (when woken by a task.* event).
 interface WakeInput {
   reason?: string
   squad_id?: string
@@ -24,7 +30,21 @@ interface WakeInput {
   context?: string
   // safety cap on actions emitted in one cycle
   maxActions?: number
+  // EXECUTE MODE: when set, the cycle DOES this task (load → think → persist the
+  // result) instead of proposing new tasks. The task must belong to this agent's
+  // squad (fail-closed) or the cycle is a no-op.
+  task_id?: string
+  // present only when the body is a raw BusEvent (Queue path). We read task_id
+  // out of it so a task.* dispatch can drive execute mode.
+  payload?: unknown
 }
+
+// Hard ceiling on a persisted result (chars). Keeps a runaway model answer from
+// bloating the row / GitHub mirror. ~16KB.
+const MAX_RESULT_CHARS = 16 * 1024
+// Tokens the execute call may spend. Conservative cap; the org's provider/model
+// choice still applies (createModel routes by org settings).
+const EXECUTE_MAX_TOKENS = 2048
 
 interface WakeResult {
   ok: boolean
@@ -33,6 +53,9 @@ interface WakeResult {
   decided: string
   actions: number
   error?: string
+  // execute-mode telemetry (present only when the wake carried a task_id)
+  task_id?: string
+  task_status?: Task['status']
 }
 
 interface AgentStatus {
@@ -110,6 +133,14 @@ export class AgentDO extends DurableObject<Env> {
       return { ok: false, agent_id: agent.id, cycle: this.getCycles(), decided: '', actions: 0, error: 'agent_paused' }
     }
 
+    // EXECUTE MODE — a wake carrying a task_id (top-level or in a BusEvent payload)
+    // means "do this task", not "propose tasks". Branch here so the standard
+    // cortex cycle never runs alongside execution.
+    const taskId = this.resolveTaskId(input)
+    if (taskId) {
+      return this.executeTask(agent, taskId)
+    }
+
     const cycle = this.getCycles() + 1
     const memory = createMemory(this.env)
 
@@ -150,6 +181,190 @@ export class AgentDO extends DurableObject<Env> {
       const msg = err instanceof Error ? err.message : 'cycle_failed'
       this.recordCycle(cycle, `error: ${msg}`)
       return { ok: false, agent_id: agent.id, cycle, decided: '', actions: 0, error: msg }
+    }
+  }
+
+  // ── EXECUTE MODE: do one task, persist the result ──────────────────────────
+  //
+  // Contract (spec §2):
+  //  - load the task tenant + squad-scoped (must belong to THIS agent's squad);
+  //  - idempotent: a task already 'done' is left alone (no re-run, no clobber);
+  //  - mark in_progress + claim assignee (if unset) BEFORE the model call;
+  //  - SUCCESS → status='done', result=<output>, completed_at=now, emit task.completed;
+  //  - FAILURE → status='blocked', result=<short note>, completed_at=now, emit
+  //    task.blocked. NEVER leave the task stuck in_progress — the model call is
+  //    wrapped so any throw lands the task in 'blocked'.
+  private async executeTask(agent: Agent, taskId: string): Promise<WakeResult> {
+    const cycle = this.getCycles() + 1
+
+    // Fail-closed scope: the task must exist AND live in this agent's squad. A
+    // cross-squad / cross-tenant id (env.DB is already this tenant's DB) is a no-op.
+    const task = await this.loadTaskForSquad(taskId, agent.squad_id)
+    if (!task) {
+      this.recordCycle(cycle, `execute: task ${taskId} not found in squad`)
+      return { ok: false, agent_id: agent.id, cycle, decided: '', actions: 0, error: 'task_not_found', task_id: taskId }
+    }
+
+    // Idempotency: a finished task is never re-executed (the bus may redeliver).
+    if (task.status === 'done') {
+      this.recordCycle(cycle, `execute: task ${taskId} already done (skip)`)
+      return { ok: true, agent_id: agent.id, cycle, decided: 'already_done', actions: 0, task_id: taskId, task_status: 'done' }
+    }
+
+    const now = new Date().toISOString()
+    const assignee = task.assignee_agent_id ?? agent.id
+    // Claim + mark working before spending the model budget, so a concurrent
+    // reader/poller sees 'in_progress' and the assignee is attributed.
+    await this.setTaskProgress(task.id, assignee, now)
+
+    try {
+      const charter = await this.loadSquadCharter(agent.squad_id)
+      const system = this.buildExecuteSystem(agent, charter)
+      const prompt = this.buildExecutePrompt(task)
+      const output = await this.executeModelCall(agent.model, system, prompt)
+      const result = this.capResult(output)
+      const finishedAt = new Date().toISOString()
+      await this.finishTask(task.id, 'done', result, finishedAt)
+      await this.emitExecution('task.completed', agent, task, 'done')
+      // best-effort memory so the agent's future recalls compound on what it did.
+      await this.rememberExecution(agent.id, task, 'done')
+      this.recordCycle(cycle, `execute: completed "${task.title}"`)
+      return { ok: true, agent_id: agent.id, cycle, decided: `completed: ${task.title}`, actions: 1, task_id: task.id, task_status: 'done' }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'execution_failed'
+      const note = this.capResult(`Execution failed: ${msg}`)
+      const finishedAt = new Date().toISOString()
+      // NEVER leave in_progress stuck — land it in blocked with the error note.
+      await this.finishTask(task.id, 'blocked', note, finishedAt)
+      await this.emitExecution('task.blocked', agent, task, 'blocked')
+      this.recordCycle(cycle, `execute: blocked "${task.title}" — ${msg}`)
+      return { ok: false, agent_id: agent.id, cycle, decided: '', actions: 0, error: msg, task_id: task.id, task_status: 'blocked' }
+    }
+  }
+
+  // Resolve a task id from either a plain WakeInput (top-level task_id) or a raw
+  // BusEvent body (payload.task_id). Returns null when neither carries one.
+  private resolveTaskId(input: WakeInput): string | null {
+    if (typeof input.task_id === 'string' && input.task_id.length > 0) return input.task_id
+    const payload = input.payload
+    if (payload && typeof payload === 'object' && 'task_id' in payload) {
+      const v = (payload as Record<string, unknown>).task_id
+      if (typeof v === 'string' && v.length > 0) return v
+    }
+    return null
+  }
+
+  // Tenant scope is implicit (env.DB is this tenant's DB); we still constrain to
+  // the agent's own squad so a wake can't drive this agent against another squad's
+  // task. Returns null on miss / wrong squad.
+  private async loadTaskForSquad(taskId: string, squadId: string): Promise<Task | null> {
+    const row = await this.env.DB.prepare(
+      `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
+         FROM tasks WHERE id = ? AND squad_id = ? LIMIT 1`,
+    )
+      .bind(taskId, squadId)
+      .first<Task>()
+    return row ?? null
+  }
+
+  private async loadSquadCharter(squadId: string): Promise<string | null> {
+    const row = await this.env.DB.prepare('SELECT charter FROM squads WHERE id = ? LIMIT 1')
+      .bind(squadId)
+      .first<{ charter: string | null }>()
+    return row?.charter ?? null
+  }
+
+  private async setTaskProgress(taskId: string, assignee: string, updatedAt: string): Promise<void> {
+    await this.env.DB.prepare(
+      `UPDATE tasks SET status = 'in_progress', assignee_agent_id = ?, updated_at = ? WHERE id = ?`,
+    )
+      .bind(assignee, updatedAt, taskId)
+      .run()
+  }
+
+  private async finishTask(
+    taskId: string,
+    status: 'done' | 'blocked',
+    result: string,
+    completedAt: string,
+  ): Promise<void> {
+    await this.env.DB.prepare(
+      `UPDATE tasks SET status = ?, result = ?, completed_at = ?, updated_at = ? WHERE id = ?`,
+    )
+      .bind(status, result, completedAt, completedAt, taskId)
+      .run()
+  }
+
+  // System turn: grounds the agent in its identity, role, and the squad charter
+  // (the tenant-authored culture/mandate) so the work reflects this org.
+  private buildExecuteSystem(agent: Agent, charter: string | null): string {
+    const lines = [
+      `You are ${agent.name}, a ${agent.role} agent in this organization.`,
+      'You have been assigned a task. Do it now and respond with the completed work',
+      'itself — the answer, the draft, the analysis, the plan — not a description of',
+      'how you would do it. Be direct and useful.',
+    ]
+    if (charter && charter.trim().length > 0) {
+      lines.push('', `Your squad's charter (its mandate and culture):`, charter.trim())
+    }
+    return lines.join('\n')
+  }
+
+  // The user turn: the task itself. Prose answer, not the cortex JSON schema.
+  private buildExecutePrompt(task: Task): string {
+    const lines = [
+      `Task: ${task.title}`,
+      task.body ? `Details:\n${task.body}` : 'Details: (none provided)',
+    ]
+    return lines.join('\n\n')
+  }
+
+  // Run the model for execute mode: system (identity + charter) then the task.
+  // Routed through ModelPort so the org's provider/model choice + the gateway
+  // key-brokering all apply.
+  private async executeModelCall(model: string, system: string, taskPrompt: string): Promise<string> {
+    const messages: ModelMessage[] = [
+      { role: 'system', content: system },
+      { role: 'user', content: taskPrompt },
+    ]
+    const out = await createModel(this.env).chat(messages, { model, maxTokens: EXECUTE_MAX_TOKENS })
+    return typeof out === 'string' ? out : ''
+  }
+
+  private capResult(text: string): string {
+    if (text.length <= MAX_RESULT_CHARS) return text
+    return `${text.slice(0, MAX_RESULT_CHARS - 1)}…`
+  }
+
+  private async emitExecution(
+    type: 'task.completed' | 'task.blocked',
+    agent: Agent,
+    task: Task,
+    status: Task['status'],
+  ): Promise<void> {
+    const event: BusEvent<{ task_id: string; agent_id: string; status: Task['status']; title: string }> = {
+      type,
+      tenant: this.env.TENANT_SLUG,
+      squad_id: task.squad_id,
+      agent_id: agent.id,
+      actor: { kind: 'agent', id: agent.id },
+      payload: { task_id: task.id, agent_id: agent.id, status, title: task.title },
+      ts: new Date().toISOString(),
+    }
+    try {
+      await createBus(this.env).emit(event)
+    } catch {
+      // bus emit is observability for the execution; a failed emit must not undo
+      // the persisted result. Swallow (the row is the source of truth).
+    }
+  }
+
+  private async rememberExecution(agentId: string, task: Task, status: Task['status']): Promise<void> {
+    try {
+      const memory = createMemory(this.env)
+      await memory.remember(agentId, `Executed task "${task.title}" → ${status}.`, ['task', 'execution'])
+    } catch {
+      // best-effort
     }
   }
 
