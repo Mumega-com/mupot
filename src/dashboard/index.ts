@@ -21,6 +21,7 @@
 // RBAC-gated /api/agents/:id/wake endpoint owned by the agents component.
 
 import { Hono } from 'hono'
+import { csrf } from 'hono/csrf'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import type {
@@ -39,6 +40,19 @@ import type {
 } from '../types'
 
 import { requireAuth } from '../auth'
+// Fine-grained RBAC — the dashboard's mutating handlers reuse the SAME gates the
+// JSON API uses (admin on org for tokens / departments; admin on the department for
+// a squad; lead on the squad for an agent). Identity is always server-derived.
+import { resolveCapabilities, hasCapability } from '../auth/capability'
+
+// Shared creation paths — the dashboard handlers call the SAME service functions
+// the /api routes call, never re-implementing the write/validation logic.
+import { createDepartment, createSquad, createAgent } from '../org/service'
+import { mintMemberToken, revokeMemberToken, loadLiveTokens, isChannel } from '../members/service'
+import type { MintedToken, PublicMemberToken } from '../members/service'
+
+// Connect-config builders (pure) for the Connect card.
+import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
@@ -48,6 +62,20 @@ import { isOnboardingComplete } from './settings'
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
 export const dashboardApp = new Hono<AppEnv>()
+
+// ── browser-surface hardening ─────────────────────────────────────────────────
+// CSRF: every mutating dashboard route is a cookie-authenticated HTML-form POST.
+// SameSite=Lax already blocks cross-site POSTs; hono/csrf adds an Origin check so
+// Lax is never the single line of defense on token minting (adversarial WARN-1).
+dashboardApp.use('*', csrf())
+
+// Authenticated UI: never cache (the show-once token page especially must not
+// survive in any shared/proxy/back-button cache), never leak Referer off-origin.
+dashboardApp.use('*', async (c, next) => {
+  await next()
+  c.header('Cache-Control', 'no-store')
+  c.header('Referrer-Policy', 'no-referrer')
+})
 
 // ── auth gate (redirect HTML callers to login instead of 401 JSON) ───────────
 
@@ -88,7 +116,10 @@ dashboardApp.get('/', async (c) => {
     return c.redirect('/setup')
   }
   const tree = await loadTree(c.env)
-  return c.html(shell(c.env.BRAND, 'Overview', overviewBody(c.env.BRAND, tree, auth)))
+  const origin = new URL(c.req.url).origin
+  return c.html(
+    shell(c.env.BRAND, 'Overview', overviewBody(c.env.BRAND, c.env.TENANT_SLUG, origin, tree, auth)),
+  )
 })
 
 // GET /squads/:id — squad board: charter, agents, tasks by lane.
@@ -111,11 +142,13 @@ dashboardApp.get('/squads/:id', async (c) => {
       .bind(squadId)
       .all<Task>(),
   ])
+  const auth = c.get('auth')
+  const canAddAgent = await canOnSquad(c.env, auth, squadId)
   return c.html(
     shell(
       c.env.BRAND,
       `Squad · ${squad.name}`,
-      squadBoardBody(squad, agents.results ?? [], tasks.results ?? []),
+      squadBoardBody(squad, agents.results ?? [], tasks.results ?? [], canAddAgent),
     ),
   )
 })
@@ -129,7 +162,9 @@ dashboardApp.get('/agents/:id', async (c) => {
   }
   const squad = await getById<Squad>(c.env, 'squads', agent.squad_id)
   const auth = c.get('auth')
-  const canWake = auth.role === 'owner' || auth.role === 'admin'
+  // Mirror the wake API's real gate (lead+ on the agent's squad) so squad leads
+  // see a working button — the API re-checks server-side either way.
+  const canWake = await canOnSquad(c.env, auth, agent.squad_id)
   return c.html(
     shell(c.env.BRAND, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake)),
   )
@@ -188,6 +223,159 @@ dashboardApp.get('/admin/divisions', async (c) => {
   return c.html(
     shell(c.env.BRAND, 'Divisions', divisionsAdminBody(depts, squads, grants, members, auth)),
   )
+})
+
+// ── members page (GET) + token mint/revoke (POST-redirect-GET) ────────────────
+//
+// A focused roster: each member, their live channels, their live tokens, and
+// (admin+) a mint form + per-token revoke. The Connect card on the overview shows
+// the config snippet with a <MEMBER_TOKEN> placeholder; here a raw token is shown
+// EXACTLY ONCE on the mint result page and never persisted/redirected. Mint + revoke
+// reuse the shared members service AND the SAME org-admin gate the JSON API uses.
+
+// GET /members — roster with mint + revoke (forms hidden for non-admins).
+dashboardApp.get('/members', async (c) => {
+  const auth = c.get('auth')
+  const canManage = await canOnOrg(c.env, auth, 'admin')
+  const [members, channels, tokens] = await Promise.all([
+    loadMembers(c.env),
+    loadChannels(c.env),
+    loadLiveTokens(c.env),
+  ])
+  return c.html(
+    shell(c.env.BRAND, 'Members', membersPageBody(members, channels, tokens, canManage, auth)),
+  )
+})
+
+// POST /members/:id/tokens — mint a scoped token, then render the SHOW-ONCE page.
+// We do NOT redirect (the raw token must not survive past this one response).
+dashboardApp.post('/members/:id/tokens', async (c) => {
+  const auth = c.get('auth')
+  if (!(await canOnOrg(c.env, auth, 'admin'))) {
+    return c.html(shell(c.env.BRAND, 'Members', errorBody('Minting a token requires admin.')), 403)
+  }
+  const memberId = c.req.param('id')
+  const member = await c.env.DB.prepare('SELECT id, display_name FROM members WHERE id = ? LIMIT 1')
+    .bind(memberId)
+    .first<{ id: string; display_name: string }>()
+  if (!member) {
+    return c.html(shell(c.env.BRAND, 'Members', errorBody('Member not found.')), 404)
+  }
+
+  const form = await c.req.parseBody()
+  const labelRaw = typeof form.label === 'string' ? form.label : ''
+  if (labelRaw.length > 64) {
+    return c.html(shell(c.env.BRAND, 'Members', errorBody('Label too long (max 64 chars).')), 400)
+  }
+  const channelRaw = typeof form.channel === 'string' ? form.channel : 'workspace'
+  if (!isChannel(channelRaw)) {
+    return c.html(shell(c.env.BRAND, 'Members', errorBody('Invalid channel.')), 400)
+  }
+
+  // Shared mint path — raw returned once, only the hash persisted.
+  const minted = await mintMemberToken(c.env, memberId, labelRaw, channelRaw)
+  const origin = new URL(c.req.url).origin
+  return c.html(
+    shell(c.env.BRAND, 'Token minted', tokenShowOnceBody(c.env.TENANT_SLUG, origin, member.display_name, minted)),
+  )
+})
+
+// POST /members/:id/tokens/:tid/revoke — revoke a token (HTML forms can't DELETE).
+dashboardApp.post('/members/:id/tokens/:tid/revoke', async (c) => {
+  const auth = c.get('auth')
+  if (!(await canOnOrg(c.env, auth, 'admin'))) {
+    return c.html(shell(c.env.BRAND, 'Members', errorBody('Revoking a token requires admin.')), 403)
+  }
+  await revokeMemberToken(c.env, c.req.param('id'), c.req.param('tid'))
+  // Idempotent — whether or not a live token matched, land back on the roster.
+  return c.redirect('/members')
+})
+
+// ── org management (POST-redirect-GET) — create department / squad / agent ────
+// Each handler runs the SAME fine-grained gate the JSON API uses, then calls the
+// SAME shared service. On error we re-render the relevant page with a message.
+
+// POST /departments — create a department (org admin+).
+dashboardApp.post('/departments', async (c) => {
+  const auth = c.get('auth')
+  if (!(await canOnOrg(c.env, auth, 'admin'))) {
+    return c.html(shell(c.env.BRAND, 'Overview', errorBody('Creating a department requires admin.')), 403)
+  }
+  const form = await c.req.parseBody()
+  const result = await createDepartment(c.env, { slug: form.slug, name: form.name })
+  if (!result.ok) {
+    return c.html(
+      shell(c.env.BRAND, 'Overview', errorBody(`Could not create department: ${result.error}.`)),
+      result.error === 'slug_taken' ? 409 : 400,
+    )
+  }
+  return c.redirect('/')
+})
+
+// POST /squads — create a squad in a department (admin on THAT department).
+dashboardApp.post('/squads', async (c) => {
+  const auth = c.get('auth')
+  const form = await c.req.parseBody()
+  const departmentId = typeof form.department_id === 'string' ? form.department_id : ''
+  if (!departmentId) {
+    return c.html(shell(c.env.BRAND, 'Overview', errorBody('Pick a department for the squad.')), 400)
+  }
+  const dept = await getById<Department>(c.env, 'departments', departmentId)
+  if (!dept) {
+    return c.html(shell(c.env.BRAND, 'Overview', errorBody('Department not found.')), 404)
+  }
+  if (!(await canOnDepartment(c.env, auth, departmentId))) {
+    return c.html(
+      shell(c.env.BRAND, 'Overview', errorBody('Creating a squad requires admin on that department.')),
+      403,
+    )
+  }
+  const result = await createSquad(c.env, departmentId, {
+    slug: form.slug,
+    name: form.name,
+    charter: form.charter,
+  })
+  if (!result.ok) {
+    return c.html(
+      shell(c.env.BRAND, 'Overview', errorBody(`Could not create squad: ${result.error}.`)),
+      result.error === 'slug_taken' ? 409 : 400,
+    )
+  }
+  return c.redirect('/')
+})
+
+// POST /squads/:id/agents — add an agent to a squad (lead+ on THAT squad).
+dashboardApp.post('/squads/:id/agents', async (c) => {
+  const auth = c.get('auth')
+  const squadId = c.req.param('id')
+  const squad = await getById<Squad>(c.env, 'squads', squadId)
+  if (!squad) {
+    return c.html(shell(c.env.BRAND, 'Squad', errorBody('Squad not found.')), 404)
+  }
+  if (!(await canOnSquad(c.env, auth, squadId))) {
+    return c.html(
+      shell(c.env.BRAND, `Squad · ${squad.name}`, errorBody('Adding an agent requires lead on this squad.')),
+      403,
+    )
+  }
+  const form = await c.req.parseBody()
+  const result = await createAgent(c.env, squadId, {
+    slug: form.slug,
+    name: form.name,
+    role: form.role,
+    model: form.model,
+  })
+  if (!result.ok) {
+    return c.html(
+      shell(
+        c.env.BRAND,
+        `Squad · ${squad.name}`,
+        errorBody(`Could not add agent: ${result.error}.`),
+      ),
+      result.error === 'slug_taken' ? 409 : 400,
+    )
+  }
+  return c.redirect(`/squads/${squadId}`)
 })
 
 // ── data ───────────────────────────────────────────────────────────────────
@@ -266,6 +454,50 @@ function hasOrgOwnerCapability(auth: AuthContext): boolean {
   return (auth.capabilities ?? []).some(
     (g) => g.scope_type === 'org' && g.scope_id === null && g.capability === 'owner',
   )
+}
+
+// ── write-gates (mirror src/org exactly so the dashboard never WIDENS the API) ──
+// These are the authoritative, async, fine-grained checks the dashboard's POST
+// handlers run before any mutation. They replicate the org API's gate logic 1:1:
+// org-admin → departments + tokens; admin-on-department → squads; lead-on-squad →
+// agents (with department→squad inheritance). isAdmin() doubles as the legacy
+// owner/admin escape, identical to requireCapability's.
+
+/** Resolve a squad's department for department→squad capability inheritance. */
+async function squadDepartment(env: Env, squadId: string): Promise<string | null> {
+  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
+    .bind(squadId)
+    .first<{ department_id: string }>()
+  return r?.department_id ?? null
+}
+
+/** org-scope capability gate (e.g. minting a token / creating a department → admin). */
+async function canOnOrg(env: Env, auth: AuthContext, min: 'admin' | 'owner'): Promise<boolean> {
+  if (isAdmin(auth)) return true
+  if (!auth.memberId) return false
+  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
+  return hasCapability(grants, 'org', null, min)
+}
+
+/** department-scope gate (creating a squad → admin on THAT department). */
+async function canOnDepartment(
+  env: Env,
+  auth: AuthContext,
+  departmentId: string,
+): Promise<boolean> {
+  if (isAdmin(auth)) return true
+  if (!auth.memberId) return false
+  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
+  return hasCapability(grants, 'department', departmentId, 'admin')
+}
+
+/** squad-scope gate (creating an agent → lead on THAT squad, dept grants inherit). */
+async function canOnSquad(env: Env, auth: AuthContext, squadId: string): Promise<boolean> {
+  if (isAdmin(auth)) return true
+  if (!auth.memberId) return false
+  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
+  const deptId = await squadDepartment(env, squadId)
+  return hasCapability(grants, 'squad', squadId, 'lead', deptId)
 }
 
 async function loadMembers(env: Env): Promise<Member[]> {
@@ -429,6 +661,28 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         padding: 20px 22px; max-width: 460px; width: 100%;
       }
       .modal-actions { display: flex; gap: 10px; margin-top: 4px; width: 100%; }
+      pre.snippet {
+        background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+        padding: 12px 14px; overflow-x: auto; font-size: 12.5px; line-height: 1.5;
+        color: var(--text); margin: 6px 0 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      code.inline { background: var(--surface2); border: 1px solid var(--border);
+        border-radius: 6px; padding: 1px 6px; font-size: 13px; color: var(--text); }
+      code.token {
+        display: block; word-break: break-all; background: var(--bg);
+        border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+        border-radius: 8px; padding: 12px 14px; font-size: 13px; color: var(--accent);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      .warn-box {
+        border: 1px solid color-mix(in srgb, #f85149 50%, var(--border));
+        background: color-mix(in srgb, #f85149 10%, var(--surface));
+        color: #ffb4ab; border-radius: 8px; padding: 12px 14px; font-size: 13px; margin: 12px 0;
+      }
+      .warn-box strong { color: #ff7b72; }
+      .tokenline { display: flex; align-items: center; gap: 8px; margin: 4px 0; flex-wrap: wrap; }
+      .tokenline .lbl { font-size: 13px; }
       @media (max-width: 720px) { .board { grid-template-columns: 1fr 1fr; } }
     </style>
   </head>
@@ -437,7 +691,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       <div class="brand"><b>${brand}</b> · substrate console</div>
       <nav>
         <a href="/">Overview</a>
-        <a href="/admin/members">Members</a>
+        <a href="/members">Members</a>
         <a href="/admin/divisions">Divisions</a>
         <a href="/setup">Setup</a>
         <a href="/auth/logout">Sign out</a>
@@ -460,18 +714,94 @@ function agentChip(a: Agent) {
   return html`<a class="chip" href="/agents/${a.id}">${statusDot(a.status)}${a.name}<span class="tag">${a.role}</span></a>`
 }
 
-function overviewBody(brand: string, tree: DepartmentNode[], auth: AuthContext) {
+// The Connect card — how a member points their own workspace at this pot. Shown to
+// EVERY authenticated user. The snippets carry a `<MEMBER_TOKEN>` placeholder only;
+// a real token comes from the Members → Mint flow (show-once). The endpoint is
+// derived from the request origin, never hardcoded.
+function connectCard(slug: string, origin: string) {
+  return html`
+    <div class="card">
+      <h2 style="margin-top:0">Connect your workspace</h2>
+      <p class="empty" style="margin-top:0">Point Claude Code or Codex at this pot over MCP. The
+        endpoint is <code class="inline">${mcpEndpoint(origin)}</code>. Get a token from
+        <a href="/members">Members → Mint token</a>, then paste it where you see
+        <code class="inline">&lt;MEMBER_TOKEN&gt;</code>.</p>
+      <h3 style="font-size:13px;color:var(--muted);margin:14px 0 0">Claude Code · <code class="inline">.mcp.json</code></h3>
+      <pre class="snippet">${claudeCodeSnippet(slug, origin)}</pre>
+      <h3 style="font-size:13px;color:var(--muted);margin:14px 0 0">Codex · <code class="inline">~/.codex/config.toml</code></h3>
+      <pre class="snippet">${codexSnippet(slug, origin)}</pre>
+    </div>`
+}
+
+// Inline create-department + create-squad forms (admin+). Plain HTML POST →
+// /departments and /squads (POST-redirect-GET) — no client framework. The squad
+// form's department <select> is built server-side from the current tree.
+function orgCreateForms(tree: DepartmentNode[]) {
+  const deptOptions = tree
+    .map((d) => `<option value="${escAttr(d.id)}">${escHtml(d.name)}</option>`)
+    .join('')
+  const squadForm =
+    tree.length === 0
+      ? html`<p class="empty">Create a department first, then you can add squads to it.</p>`
+      : html`
+          <form class="adminform" method="post" action="/squads" autocomplete="off">
+            <label>Department
+              <select name="department_id" required>${raw(deptOptions)}</select>
+            </label>
+            <label>Squad name
+              <input name="name" required placeholder="Dispatch" />
+            </label>
+            <label>Slug
+              <input name="slug" required placeholder="dispatch" />
+            </label>
+            <label>Charter (optional)
+              <input name="charter" placeholder="What this squad owns" />
+            </label>
+            <button type="submit" class="btn">Add squad</button>
+          </form>`
+  return html`
+    <h2>Build the org</h2>
+    <div class="card">
+      <h3 style="font-size:13px;color:var(--muted);margin:0 0 8px">New department</h3>
+      <form class="adminform" method="post" action="/departments" autocomplete="off">
+        <label>Name
+          <input name="name" required placeholder="Operations" />
+        </label>
+        <label>Slug (lowercase, hyphens)
+          <input name="slug" required placeholder="operations" />
+        </label>
+        <button type="submit" class="btn">Add department</button>
+      </form>
+      <h3 style="font-size:13px;color:var(--muted);margin:18px 0 8px">New squad</h3>
+      ${squadForm}
+    </div>`
+}
+
+function overviewBody(
+  brand: string,
+  slug: string,
+  origin: string,
+  tree: DepartmentNode[],
+  auth: AuthContext,
+) {
+  const canManage = isAdmin(auth)
   if (tree.length === 0) {
     return html`
       <h1>${brand} org</h1>
       <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role}</p>
-      <div class="card"><p class="empty">No departments yet. Seed the org via the API
-        (<code>POST /api/org/departments</code>) and they'll appear here.</p></div>`
+      ${connectCard(slug, origin)}
+      ${
+        canManage
+          ? orgCreateForms(tree)
+          : html`<div class="card"><p class="empty">No departments yet. An admin can create them
+              from this page; ask whoever owns this pot.</p></div>`
+      }`
   }
   return html`
     <h1>${brand} org</h1>
     <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role} ·
       ${tree.length} department${tree.length === 1 ? '' : 's'}</p>
+    ${connectCard(slug, origin)}
     ${raw(
       tree
         .map(
@@ -508,16 +838,38 @@ function overviewBody(brand: string, tree: DepartmentNode[], auth: AuthContext) 
         )
         .map((x) => x.toString())
         .join(''),
-    )}`
+    )}
+    ${canManage ? orgCreateForms(tree) : html``}`
 }
 
-function squadBoardBody(squad: Squad, agents: Agent[], tasks: Task[]) {
+function squadBoardBody(squad: Squad, agents: Agent[], tasks: Task[], canAddAgent: boolean) {
   const byLane = new Map<Task['status'], Task[]>()
   for (const t of tasks) {
     const list = byLane.get(t.status) ?? []
     list.push(t)
     byLane.set(t.status, list)
   }
+  // Add-agent form (lead+ on this squad). Plain HTML POST → /squads/:id/agents
+  // (POST-redirect-GET); the model defaults to the Workers-AI llama as the API does.
+  const addAgentForm = canAddAgent
+    ? html`
+        <form class="adminform" method="post" action="/squads/${squad.id}/agents" autocomplete="off"
+          style="margin-top:14px">
+          <label>Slug
+            <input name="slug" required placeholder="dispatcher" />
+          </label>
+          <label>Name
+            <input name="name" required placeholder="Dispatcher" />
+          </label>
+          <label>Role
+            <input name="role" placeholder="member" />
+          </label>
+          <label>Model
+            <input name="model" value="@cf/meta/llama-3.3" />
+          </label>
+          <button type="submit" class="btn">Add agent</button>
+        </form>`
+    : html``
   return html`
     <p class="crumbs"><a href="/">Overview</a> / ${squad.name}</p>
     <h1>${squad.name}</h1>
@@ -533,6 +885,7 @@ function squadBoardBody(squad: Squad, agents: Agent[], tasks: Task[]) {
           ? html`<p class="empty">No agents in this squad yet.</p>`
           : html`<div class="agents">${raw(agents.map((a) => agentChip(a).toString()).join(''))}</div>`
       }
+      ${addAgentForm}
     </div>
     <h2>Board</h2>
     <div class="board">
@@ -636,6 +989,166 @@ const CHANNEL_LABEL: Record<ConnectionChannel, string> = {
   workspace: 'workspace',
   im: 'IM',
   dashboard: 'dashboard',
+}
+
+// ── members PAGE (GET /members) — roster + mint/revoke + show-once token ────────
+// Distinct from membersAdminBody (the /admin/members grant/invite console). This is
+// the connect-oriented surface: each member's live channels + live tokens, with a
+// mint form and per-token revoke for admins. Forms are hidden for non-admins.
+
+function membersPageBody(
+  members: Member[],
+  channels: { member_id: string; channel: ConnectionChannel }[],
+  tokens: PublicMemberToken[],
+  canManage: boolean,
+  auth: AuthContext,
+) {
+  const channelsByMember = new Map<string, Set<ConnectionChannel>>()
+  for (const ch of channels) {
+    const set = channelsByMember.get(ch.member_id) ?? new Set<ConnectionChannel>()
+    set.add(ch.channel)
+    channelsByMember.set(ch.member_id, set)
+  }
+  const tokensByMember = new Map<string, PublicMemberToken[]>()
+  for (const t of tokens) {
+    const list = tokensByMember.get(t.member_id) ?? []
+    list.push(t)
+    tokensByMember.set(t.member_id, list)
+  }
+
+  const rows =
+    members.length === 0
+      ? '<p class="empty">No members yet. Invite someone from the Divisions / admin console — first connect mints their member + token.</p>'
+      : members
+          .map((m) =>
+            memberConnectRow(
+              m,
+              channelsByMember.get(m.id),
+              tokensByMember.get(m.id) ?? [],
+              canManage,
+            ),
+          )
+          .map((x) => x.toString())
+          .join('')
+
+  return html`
+    <p class="crumbs"><a href="/">Overview</a> / Members</p>
+    <h1>Members</h1>
+    <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role} ·
+      ${members.length} member${members.length === 1 ? '' : 's'}. A token is what a member pastes into
+      their workspace config (see the <a href="/">Connect card</a>). Mint one below — it is shown
+      exactly once.</p>
+    <div class="card" style="padding:0">
+      <table class="grid">
+        <thead>
+          <tr><th>Member</th><th>Channels</th><th>Tokens</th>${
+            canManage ? raw('<th>Mint</th>') : raw('')
+          }</tr>
+        </thead>
+        <tbody>${raw(rows)}</tbody>
+      </table>
+    </div>`
+}
+
+function memberConnectRow(
+  m: Member,
+  channels: Set<ConnectionChannel> | undefined,
+  tokens: PublicMemberToken[],
+  canManage: boolean,
+) {
+  const chSet = new Set<ConnectionChannel>(channels ?? [])
+  if (m.telegram_chat_id) chSet.add('im')
+  const chChips =
+    chSet.size === 0
+      ? html`<span class="empty">—</span>`
+      : raw(
+          [...chSet]
+            .map((ch) => `<span class="tag chan">${escHtml(CHANNEL_LABEL[ch])}</span>`)
+            .join(' '),
+        )
+
+  const tokenList =
+    tokens.length === 0
+      ? html`<span class="empty">no live tokens</span>`
+      : raw(
+          tokens
+            .map((t) => {
+              const label = t.label.length > 0 ? t.label : '(unlabeled)'
+              const revokeBtn = canManage
+                ? `<form method="post" action="/members/${escAttr(t.member_id)}/tokens/${escAttr(
+                    t.id,
+                  )}/revoke" style="display:inline">` +
+                  `<button type="submit" class="btn secondary sm">Revoke</button></form>`
+                : ''
+              return (
+                `<div class="tokenline"><span class="tag chan">${escHtml(
+                  CHANNEL_LABEL[t.channel],
+                )}</span>` +
+                `<span class="lbl">${escHtml(label)}</span>${revokeBtn}</div>`
+              )
+            })
+            .join(''),
+        )
+
+  // Per-row mint form (admin+). A plain HTML POST → the show-once page.
+  const mintCell = canManage
+    ? html`<td>
+        <form method="post" action="/members/${m.id}/tokens" class="adminform" autocomplete="off">
+          <label>Label
+            <input name="label" placeholder="laptop" style="min-width:120px" />
+          </label>
+          <label>Channel
+            <select name="channel">
+              <option value="workspace">workspace</option>
+              <option value="im">IM</option>
+              <option value="dashboard">dashboard</option>
+            </select>
+          </label>
+          <button type="submit" class="btn sm">Mint token</button>
+        </form>
+      </td>`
+    : html``
+
+  return html`
+    <tr data-member="${m.id}">
+      <td>
+        <strong>${m.display_name}</strong>
+        <div class="t-meta">${m.email ?? html`<span class="empty">no email</span>`}</div>
+      </td>
+      <td>${chChips}</td>
+      <td>${tokenList}</td>
+      ${mintCell}
+    </tr>`
+}
+
+// The SHOW-ONCE page. The raw token is rendered here and NOWHERE else — never
+// persisted, never logged, never reachable by a redirect. Reloading this page will
+// not show the token again (it does not exist server-side in raw form).
+function tokenShowOnceBody(slug: string, origin: string, memberName: string, minted: MintedToken) {
+  return html`
+    <p class="crumbs"><a href="/">Overview</a> / <a href="/members">Members</a> / Token minted</p>
+    <h1>Token minted for ${memberName}</h1>
+    <div class="warn-box">
+      <strong>Copy this token now — it is shown exactly once.</strong> We store only a hash, so it
+      can never be displayed again. If it is lost, revoke it and mint a new one.
+    </div>
+    <div class="card">
+      <p class="empty" style="margin-top:0">Label
+        <strong>${minted.label.length > 0 ? minted.label : '(unlabeled)'}</strong> ·
+        channel <span class="tag chan">${CHANNEL_LABEL[minted.channel]}</span></p>
+      <code class="token">${minted.raw}</code>
+    </div>
+    <div class="card">
+      <h2 style="margin-top:0">Paste it into your workspace</h2>
+      <p class="empty" style="margin-top:0">Replace <code class="inline">&lt;MEMBER_TOKEN&gt;</code>
+        in the snippet with the token above. Endpoint:
+        <code class="inline">${mcpEndpoint(origin)}</code>.</p>
+      <h3 style="font-size:13px;color:var(--muted);margin:14px 0 0">Claude Code · <code class="inline">.mcp.json</code></h3>
+      <pre class="snippet">${claudeCodeSnippet(slug, origin)}</pre>
+      <h3 style="font-size:13px;color:var(--muted);margin:14px 0 0">Codex · <code class="inline">~/.codex/config.toml</code></h3>
+      <pre class="snippet">${codexSnippet(slug, origin)}</pre>
+    </div>
+    <p><a href="/members">← Back to members</a></p>`
 }
 
 /** Render one capability grant as a human label: "admin · Engineering" / "owner · org". */
