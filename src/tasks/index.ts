@@ -110,7 +110,7 @@ tasksApp.get('/', async (c) => {
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
 
   const rows = await c.env.DB.prepare(
-    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, created_at, updated_at
+    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
        FROM tasks ${where}
        ORDER BY created_at DESC`,
   )

@@ -144,6 +144,8 @@ export async function createTask(
     status: input.status ?? 'open',
     assignee_agent_id: input.assignee_agent_id ?? null,
     github_issue_url: null,
+    result: null,
+    completed_at: null,
     created_at: now,
     updated_at: now,
   }
@@ -151,8 +153,8 @@ export async function createTask(
   task.github_issue_url = await mirrorTaskCreate(env, task)
 
   await env.DB.prepare(
-    `INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, github_issue_url, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       task.id,
@@ -162,6 +164,8 @@ export async function createTask(
       task.status,
       task.assignee_agent_id,
       task.github_issue_url,
+      task.result,
+      task.completed_at,
       task.created_at,
       task.updated_at,
     )

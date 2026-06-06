@@ -79,9 +79,13 @@ async function routeEvent(env: Env, event: BusEvent): Promise<void> {
       }
       return
     }
-    case 'task.updated': {
-      // Terminal observation; no DO wake by default. Log for the activity feed.
-      console.error('bus: task.updated', {
+    case 'task.updated':
+    case 'task.completed':
+    case 'task.blocked': {
+      // Terminal observations of the execution loop; no DO wake by default. Log
+      // for the activity feed (the agent-actor branch in handleQueue surfaces
+      // task.completed/blocked into the squad's bound channel).
+      console.error(`bus: ${event.type}`, {
         tenant: event.tenant,
         squad_id: event.squad_id,
       })
