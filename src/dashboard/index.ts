@@ -21,6 +21,7 @@
 // RBAC-gated /api/agents/:id/wake endpoint owned by the agents component.
 
 import { Hono } from 'hono'
+import { csrf } from 'hono/csrf'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import type {
@@ -61,6 +62,20 @@ import { isOnboardingComplete } from './settings'
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
 export const dashboardApp = new Hono<AppEnv>()
+
+// ── browser-surface hardening ─────────────────────────────────────────────────
+// CSRF: every mutating dashboard route is a cookie-authenticated HTML-form POST.
+// SameSite=Lax already blocks cross-site POSTs; hono/csrf adds an Origin check so
+// Lax is never the single line of defense on token minting (adversarial WARN-1).
+dashboardApp.use('*', csrf())
+
+// Authenticated UI: never cache (the show-once token page especially must not
+// survive in any shared/proxy/back-button cache), never leak Referer off-origin.
+dashboardApp.use('*', async (c, next) => {
+  await next()
+  c.header('Cache-Control', 'no-store')
+  c.header('Referrer-Policy', 'no-referrer')
+})
 
 // ── auth gate (redirect HTML callers to login instead of 401 JSON) ───────────
 
@@ -147,7 +162,9 @@ dashboardApp.get('/agents/:id', async (c) => {
   }
   const squad = await getById<Squad>(c.env, 'squads', agent.squad_id)
   const auth = c.get('auth')
-  const canWake = auth.role === 'owner' || auth.role === 'admin'
+  // Mirror the wake API's real gate (lead+ on the agent's squad) so squad leads
+  // see a working button — the API re-checks server-side either way.
+  const canWake = await canOnSquad(c.env, auth, agent.squad_id)
   return c.html(
     shell(c.env.BRAND, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake)),
   )

@@ -13,8 +13,10 @@ export function isChannel(v: unknown): v is ConnectionChannel {
   return typeof v === 'string' && (CHANNELS as readonly string[]).includes(v)
 }
 
-/** SHA-256 hex of a raw token. Stored value; the raw is never persisted. */
-async function sha256Hex(raw: string): Promise<string> {
+/** SHA-256 hex of a raw token. Stored value; the raw is never persisted.
+ *  Exported for the one flow that mints inside a larger atomic D1 batch
+ *  (invite accept) — everything else goes through mintMemberToken(). */
+export async function sha256Hex(raw: string): Promise<string> {
   const data = new TextEncoder().encode(raw)
   const digest = await crypto.subtle.digest('SHA-256', data)
   const bytes = new Uint8Array(digest)
@@ -23,8 +25,9 @@ async function sha256Hex(raw: string): Promise<string> {
   return s
 }
 
-/** Cryptographically-random opaque token (URL-safe hex). Shown once, never stored raw. */
-function mintRawToken(bytes = 32): string {
+/** Cryptographically-random opaque token (URL-safe hex). Shown once, never stored raw.
+ *  Exported for the invite-accept atomic batch; everything else uses mintMemberToken(). */
+export function mintRawToken(bytes = 32): string {
   const buf = new Uint8Array(bytes)
   crypto.getRandomValues(buf)
   let s = ''

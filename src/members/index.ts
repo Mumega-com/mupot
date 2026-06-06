@@ -41,7 +41,14 @@ import { requireAuth } from '../auth'
 // The FROZEN capability API — everyone codes against these exact signatures.
 import { requireCapability, capabilityRank, actorMaxRankOnScope } from '../auth/capability'
 // Shared token lifecycle — the single mint/revoke path (also used by the dashboard).
-import { mintMemberToken, revokeMemberToken, isChannel as isChannelService } from './service'
+// sha256Hex/mintRawToken are imported ONLY for the invite-accept atomic batch.
+import {
+  mintMemberToken,
+  revokeMemberToken,
+  isChannel as isChannelService,
+  sha256Hex,
+  mintRawToken,
+} from './service'
 
 // The validated invite payload, stashed by the parse middleware so the scope
 // extractor (which runs inside requireCapability) can read the target department.
@@ -80,25 +87,6 @@ function isCapability(v: unknown): v is Capability {
 const SCOPE_TYPES: readonly CapabilityScopeType[] = ['org', 'department', 'squad']
 function isScopeType(v: unknown): v is CapabilityScopeType {
   return typeof v === 'string' && (SCOPE_TYPES as readonly string[]).includes(v)
-}
-
-/** SHA-256 hex of a raw token. Stored value; the raw is never persisted. */
-async function sha256Hex(raw: string): Promise<string> {
-  const data = new TextEncoder().encode(raw)
-  const digest = await crypto.subtle.digest('SHA-256', data)
-  const bytes = new Uint8Array(digest)
-  let s = ''
-  for (const b of bytes) s += b.toString(16).padStart(2, '0')
-  return s
-}
-
-/** Cryptographically-random opaque token (URL-safe hex). Shown once, never stored raw. */
-function mintRawToken(bytes = 32): string {
-  const buf = new Uint8Array(bytes)
-  crypto.getRandomValues(buf)
-  let s = ''
-  for (const b of buf) s += b.toString(16).padStart(2, '0')
-  return `mupot_${s}`
 }
 
 // D1 surfaces UNIQUE constraint failures as an Error whose message contains
