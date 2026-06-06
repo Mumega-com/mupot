@@ -15,17 +15,15 @@
 //   - CEILING: a sync grant NEVER exceeds binding.max_capability. The default
 //     ceiling is 'member'; an admin may raise it per binding. roleCapability (when
 //     the adapter maps platform roles) is still clamped to the ceiling.
-//   - We ONLY manage the 'member'-tier sync grant on the squad. A MANUAL grant
-//     above member (lead/admin/owner) — set by an admin via the members API — is
-//     left untouched on both grant and revoke. Sync owns the floor, not the
-//     hand-curated leadership.
+//   - We ONLY manage rows in channel_capability_grants. Manual grants in
+//     capabilities are never mutated by sync; resolveCapabilities unions both.
 
 import type { Env, Capability, ChannelBinding } from '../types'
 import { capabilityRank } from '../auth/capability'
 import { getAdapter } from './registry'
 
-// The capability sync grants/revokes by default. Channel membership ⇒ squad
-// membership. Anything ABOVE this on a squad is a manual grant we never disturb.
+// The base capability sync grants. Platform role mapping may raise it, but the
+// result is always clamped by the binding ceiling.
 const SYNC_BASE: Capability = 'member'
 
 // ── reconcile one binding ─────────────────────────────────────────────────────
@@ -34,9 +32,9 @@ const SYNC_BASE: Capability = 'member'
 //   2. Map each to a member via member_identities (this platform).
 //   3. Ensure every mapped member has >= the target capability on the squad, where
 //      target = min(ceiling, roleCapability ?? SYNC_BASE). Grant if missing/lower.
-//   4. Revoke the squad sync grant for any member who holds a sync-tier squad
-//      grant but is NO LONGER in the channel — but ONLY at the sync tier; a manual
-//      higher grant (lead+) is preserved.
+//   4. Revoke only this binding's channel-derived grant for any member who is no
+//      longer in the channel. Manual grants and other channel bindings are left
+//      untouched.
 async function reconcileBinding(env: Env, binding: ChannelBinding): Promise<void> {
   const adapter = getAdapter(binding.platform)
   if (!adapter) return // unknown platform → nothing this core can reconcile
@@ -80,14 +78,12 @@ async function reconcileBinding(env: Env, binding: ChannelBinding): Promise<void
     // CEILING: never above max_capability for this binding.
     targetRank = Math.min(targetRank, ceilingRank)
 
-    await ensureSquadGrant(env, memberId, binding.squad_id, targetRank)
+    await ensureSquadGrant(env, binding.id, memberId, binding.squad_id, targetRank)
   }
 
-  // 3) Revoke the sync-tier grant for members who left the channel. We only ever
-  // remove a grant whose capability is AT OR BELOW the ceiling AND at/below the
-  // sync base+ceiling band — i.e. a grant this sync loop itself could have made.
-  // Manual grants above the ceiling are preserved (sync owns the floor only).
-  await revokeDepartedMembers(env, binding, presentMemberIds, ceilingRank)
+  // 3) Revoke this binding's channel-derived grant for members who left the
+  // channel. Other bindings and manual grants are not touched.
+  await revokeDepartedMembers(env, binding, presentMemberIds)
 }
 
 // member_identities: platform user id → member id (or null when unbound).
@@ -106,74 +102,68 @@ async function memberIdForExternal(
   return row?.member_id ?? null
 }
 
-// Ensure the member holds AT LEAST `targetRank` capability on the squad. If they
-// already hold an equal-or-higher squad grant, leave it (never downgrade a manual
-// higher grant). Otherwise upsert the grant at exactly the target capability. The
-// target is always already clamped to the binding ceiling by the caller.
+// Ensure this binding grants exactly `targetRank` capability on the squad. Manual
+// grants live in `capabilities`; channel sync owns only
+// `channel_capability_grants`, so it may safely raise or lower its own row.
 async function ensureSquadGrant(
   env: Env,
+  bindingId: string,
   memberId: string,
   squadId: string,
   targetRank: number,
 ): Promise<void> {
   const existing = await env.DB.prepare(
-    `SELECT capability FROM capabilities
-      WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2
+    `SELECT capability FROM channel_capability_grants
+      WHERE binding_id = ?1 AND member_id = ?2 AND squad_id = ?3
       LIMIT 1`,
   )
-    .bind(memberId, squadId)
+    .bind(bindingId, memberId, squadId)
     .first<{ capability: Capability }>()
 
-  if (existing && capabilityRank(existing.capability) >= targetRank) {
-    return // already at/above target — preserve (could be a manual higher grant)
+  if (existing && capabilityRank(existing.capability) === targetRank) {
+    return // already at target for this binding
   }
 
   const targetCap = capabilityForRank(targetRank)
 
-  // Upsert: delete any lower squad grant for this member, insert the target. The
-  // schema's UNIQUE(member_id, scope_type, scope_id) makes (squad, id) unique, but
-  // SQLite treats two NULLs as distinct — scope_id here is a real squad id, so the
-  // delete-then-insert is exact. D1 is single-writer per DB → serialized.
+  // Upsert: delete any lower grant for this binding/member/squad, insert target.
+  // D1 is single-writer per DB, so this batch is serialized.
   await env.DB.batch([
     env.DB.prepare(
-      `DELETE FROM capabilities WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2`,
-    ).bind(memberId, squadId),
+      `DELETE FROM channel_capability_grants
+        WHERE binding_id = ?1 AND member_id = ?2 AND squad_id = ?3`,
+    ).bind(bindingId, memberId, squadId),
     env.DB.prepare(
-      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         VALUES (?1, ?2, 'squad', ?3, ?4)`,
-    ).bind(crypto.randomUUID(), memberId, squadId, targetCap),
+      `INSERT INTO channel_capability_grants
+         (id, binding_id, member_id, squad_id, capability, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+    ).bind(crypto.randomUUID(), bindingId, memberId, squadId, targetCap, new Date().toISOString()),
   ])
 }
 
-// Revoke the squad grant for members who hold a sync-tier squad grant but are no
-// longer present in the channel. We DELETE only when the existing grant's rank is
-// AT OR BELOW the binding ceiling — i.e. a grant sync could have produced. A
-// manual grant ABOVE the ceiling (admin-curated leadership) is left intact.
+// Revoke this binding's channel-derived squad grants for members who are no longer
+// present in the channel. Manual capabilities and other bindings are untouched.
 async function revokeDepartedMembers(
   env: Env,
   binding: ChannelBinding,
   presentMemberIds: Set<string>,
-  ceilingRank: number,
 ): Promise<void> {
-  // All members currently holding a squad-scoped grant on this binding's squad.
+  // All members currently holding a channel-derived grant from this binding.
   const rows = await env.DB.prepare(
-    `SELECT member_id, capability FROM capabilities
-      WHERE scope_type = 'squad' AND scope_id = ?1`,
+    `SELECT member_id, capability FROM channel_capability_grants
+      WHERE binding_id = ?1 AND squad_id = ?2`,
   )
-    .bind(binding.squad_id)
+    .bind(binding.id, binding.squad_id)
     .all<{ member_id: string; capability: Capability }>()
 
   for (const row of rows.results ?? []) {
     if (presentMemberIds.has(row.member_id)) continue // still in the channel
 
-    // Only revoke grants at/below the ceiling — never strip a manual higher grant.
-    if (capabilityRank(row.capability) > ceilingRank) continue
-
     await env.DB.prepare(
-      `DELETE FROM capabilities
-        WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2`,
+      `DELETE FROM channel_capability_grants
+        WHERE binding_id = ?1 AND member_id = ?2 AND squad_id = ?3`,
     )
-      .bind(row.member_id, binding.squad_id)
+      .bind(binding.id, row.member_id, binding.squad_id)
       .run()
   }
 }

@@ -43,7 +43,13 @@ function meets(have: Capability, min: Capability): boolean {
  */
 export async function resolveCapabilities(env: Env, memberId: string): Promise<CapabilityGrant[]> {
   const rows = await env.DB.prepare(
-    'SELECT member_id, scope_type, scope_id, capability FROM capabilities WHERE member_id = ?1',
+    `SELECT member_id, scope_type, scope_id, capability
+       FROM capabilities
+      WHERE member_id = ?1
+     UNION ALL
+     SELECT member_id, 'squad' AS scope_type, squad_id AS scope_id, capability
+       FROM channel_capability_grants
+      WHERE member_id = ?1`,
   )
     .bind(memberId)
     .all<CapabilityGrant>()

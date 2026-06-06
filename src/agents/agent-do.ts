@@ -11,10 +11,10 @@
 // so a stale/cross-tenant id can never drive a cycle.
 
 import { DurableObject } from 'cloudflare:workers'
-import type { Env, Agent, BusEvent, MemoryPort, ModelMessage } from '../types'
+import type { Env, Agent, MemoryPort, ModelMessage } from '../types'
 import { createMemory } from '../memory'
-import { createBus } from '../bus'
 import { createModel } from '../model'
+import { createTask } from '../tasks/service'
 
 // Wake request body — who/why woke this agent, and how hard it may work.
 interface WakeInput {
@@ -112,7 +112,6 @@ export class AgentDO extends DurableObject<Env> {
 
     const cycle = this.getCycles() + 1
     const memory = createMemory(this.env)
-    const bus = createBus(this.env)
 
     try {
       // 1. Load context — semantic recall around the wake reason/context.
@@ -130,15 +129,13 @@ export class AgentDO extends DurableObject<Env> {
       const cap = input.maxActions ?? DEFAULT_MAX_ACTIONS
       const toEmit = decision.tasks.slice(0, Math.max(0, cap))
       for (const t of toEmit) {
-        const event: BusEvent<{ title: string; body: string; squad_id: string; by_agent_id: string }> = {
-          type: 'task.created',
-          tenant: this.env.TENANT_SLUG,
+        await createTask(this.env, {
           squad_id: squadId,
-          agent_id: agent.id,
-          payload: { title: t.title, body: t.body, squad_id: squadId, by_agent_id: agent.id },
-          ts: new Date().toISOString(),
-        }
-        await bus.emit(event)
+          title: t.title,
+          body: t.body,
+        }, {
+          actor: { kind: 'agent', id: agent.id },
+        })
       }
 
       // 5. Remember — persist the cycle outcome so future recalls compound.

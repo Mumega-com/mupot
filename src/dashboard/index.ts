@@ -277,7 +277,11 @@ async function loadMembers(env: Env): Promise<Member[]> {
 
 async function loadGrants(env: Env): Promise<CapabilityGrant[]> {
   const rows = await env.DB.prepare(
-    'SELECT member_id, scope_type, scope_id, capability FROM capabilities',
+    `SELECT member_id, scope_type, scope_id, capability
+       FROM capabilities
+     UNION ALL
+     SELECT member_id, 'squad' AS scope_type, squad_id AS scope_id, capability
+       FROM channel_capability_grants`,
   ).all<CapabilityGrant>()
   return rows.results ?? []
 }

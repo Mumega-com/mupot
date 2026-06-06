@@ -32,10 +32,10 @@ import type {
   BusEvent,
   Agent,
   Squad,
-  Task,
 } from '../types'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
+import { createTask } from '../tasks/service'
 
 type AppEnv = { Bindings: Env }
 
@@ -338,48 +338,15 @@ async function taskReply(
     return `You don't have permission to add tasks to ${squad.name} (need member on it).`
   }
 
-  const now = new Date().toISOString()
-  const task: Task = {
-    id: crypto.randomUUID(),
-    squad_id: squad.id,
-    title: title.trim(),
-    body: '',
-    status: 'open',
-    assignee_agent_id: null,
-    github_issue_url: null,
-    created_at: now,
-    updated_at: now,
-  }
-
-  // Persist to this tenant's pot (same row shape the tasks/mcp components write).
-  // The bus event lets the consumer/feed (and GitHub mirror) pick it up; we do
-  // not mirror to GitHub here — that side-effect path is owned by the tasks comp.
-  await env.DB.prepare(
-    `INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, github_issue_url, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  const task = await createTask(
+    env,
+    {
+      squad_id: squad.id,
+      title: title.trim(),
+      body: '',
+    },
+    { actor: memberActor(member.id) },
   )
-    .bind(
-      task.id,
-      task.squad_id,
-      task.title,
-      task.body,
-      task.status,
-      task.assignee_agent_id,
-      task.github_issue_url,
-      task.created_at,
-      task.updated_at,
-    )
-    .run()
-
-  const event: BusEvent<{ task_id: string; title: string; status: string }> = {
-    type: 'task.created',
-    tenant: env.TENANT_SLUG,
-    squad_id: task.squad_id,
-    actor: memberActor(member.id),
-    payload: { task_id: task.id, title: task.title, status: task.status },
-    ts: now,
-  }
-  await createBus(env).emit(event)
 
   return `Added to ${squad.name}: "${task.title}".`
 }

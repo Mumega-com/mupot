@@ -32,11 +32,11 @@ import type {
   BusEvent,
   Agent,
   Squad,
-  Task,
 } from '../types'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
+import { createTask } from '../tasks/service'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -239,48 +239,15 @@ const toolTaskCreate: ToolSpec = {
           : null
     if (body === null) return fail(400, 'invalid_args', 'body must be a string')
 
-    const now = new Date().toISOString()
-    const task: Task = {
-      id: crypto.randomUUID(),
-      squad_id: squad.id,
-      title: title.trim(),
-      body,
-      status: 'open',
-      assignee_agent_id: null,
-      github_issue_url: null,
-      created_at: now,
-      updated_at: now,
-    }
-
-    // Persist to this tenant's pot (same shape the tasks component writes). We do
-    // NOT mirror to GitHub here — the tasks component owns that side-effect path;
-    // the bus event lets the consumer/feed pick the task up.
-    await env.DB.prepare(
-      `INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, github_issue_url, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    const task = await createTask(
+      env,
+      {
+        squad_id: squad.id,
+        title: title.trim(),
+        body,
+      },
+      { actor: memberActor(auth.memberId as string) },
     )
-      .bind(
-        task.id,
-        task.squad_id,
-        task.title,
-        task.body,
-        task.status,
-        task.assignee_agent_id,
-        task.github_issue_url,
-        task.created_at,
-        task.updated_at,
-      )
-      .run()
-
-    const event: BusEvent<{ task_id: string; title: string; status: string }> = {
-      type: 'task.created',
-      tenant: env.TENANT_SLUG,
-      squad_id: task.squad_id,
-      actor: memberActor(auth.memberId as string),
-      payload: { task_id: task.id, title: task.title, status: task.status },
-      ts: now,
-    }
-    await createBus(env).emit(event)
 
     return done({ task })
   },

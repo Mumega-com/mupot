@@ -205,6 +205,16 @@ export interface MemberIdentity {
   external_user_id: string // Google: email; Discord/Telegram: platform user id
 }
 
+export interface ChannelCapabilityGrant {
+  id: string
+  binding_id: string
+  member_id: string
+  squad_id: string
+  capability: Capability
+  created_at: string
+  updated_at: string
+}
+
 // Normalized inbound message — what every adapter's parseInbound returns.
 export interface InboundMessage {
   platform: string
