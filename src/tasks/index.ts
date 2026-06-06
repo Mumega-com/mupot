@@ -23,6 +23,8 @@ import { requireAuth } from '../auth'
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createTask, emitTaskEvent, mirrorTaskUpdate } from './service'
+import { createBus } from '../bus'
+import type { BusEvent } from '../types'
 
 // ── validation helpers ───────────────────────────────────────────────────────
 
@@ -120,7 +122,29 @@ tasksApp.get('/', async (c) => {
   return c.json({ tasks: rows.results ?? [] })
 })
 
-// ── POST / — create a task ───────────────────────────────────────────────────
+// ── GET /:id — single task read (for the /send poller) ───────────────────────
+// member+ on the task's squad. Includes result + completed_at so the dashboard
+// can render the live status and the finished output.
+tasksApp.get('/:id', async (c) => {
+  const id = c.req.param('id')
+  const task = await c.env.DB.prepare(
+    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
+       FROM tasks WHERE id = ? LIMIT 1`,
+  )
+    .bind(id)
+    .first<Task>()
+  if (!task) return c.json({ error: 'task_not_found' }, 404)
+
+  // RBAC: reading a task requires member+ on its squad. (A token scoped to this
+  // tenant but holding no grant on the squad must not read its work.)
+  if (!(await canActOnSquad(c.env, c.get('auth'), task.squad_id))) {
+    return c.json({ error: 'forbidden', need: 'member' }, 403)
+  }
+
+  return c.json({ task })
+})
+
+// ── POST / — create a task (optionally dispatch it for execution) ─────────────
 
 interface CreateTaskBody {
   squad_id?: unknown
@@ -128,6 +152,9 @@ interface CreateTaskBody {
   body?: unknown
   status?: unknown
   assignee_agent_id?: unknown
+  // when dispatch === true AND an assignee resolves, wake that agent in execute
+  // mode (agent.wake carrying payload.task_id) right after the task persists.
+  dispatch?: unknown
 }
 
 tasksApp.post('/', async (c) => {
@@ -178,7 +205,29 @@ tasksApp.post('/', async (c) => {
     actor: auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
   })
 
-  return c.json({ task }, 201)
+  // Dispatch: wake the assignee in execute mode. We require an assignee — there is
+  // no "wake the whole squad to fight over one task". The assignee was already
+  // validated to belong to THIS squad (resolveAssignee → assignee_not_in_squad), so
+  // this fails closed: dispatch without a (valid, in-squad) assignee is rejected.
+  let dispatched = false
+  if (body.dispatch === true) {
+    if (!assigneeAgentId) {
+      return c.json({ error: 'dispatch_requires_assignee' }, 400)
+    }
+    const wake: BusEvent<{ task_id: string; by: string }> = {
+      type: 'agent.wake',
+      tenant: c.env.TENANT_SLUG,
+      squad_id: squad.id,
+      agent_id: assigneeAgentId,
+      actor: auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
+      payload: { task_id: task.id, by: auth.userId },
+      ts: new Date().toISOString(),
+    }
+    await createBus(c.env).emit(wake)
+    dispatched = true
+  }
+
+  return c.json({ task, dispatched }, 201)
 })
 
 // ── PATCH /:id — update status / assignee / title / body ─────────────────────
