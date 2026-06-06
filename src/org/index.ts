@@ -34,6 +34,9 @@ import { requireAuth } from '../auth'
 // creating an agent / attaching a membership in a squad is lead+ on THAT squad.
 // The scope is data-derived (URL param), so we check inline with the pure API.
 import { resolveCapabilities, hasCapability } from '../auth/capability'
+// Shared org-chart creation path (also used by the dashboard). Validation + the
+// UNIQUE conflict mapping live here so both surfaces stay in lockstep.
+import { createDepartment, createSquad, createAgent } from './service'
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -88,13 +91,8 @@ function inTenantScope(auth: AuthContext, env: Env): boolean {
   return auth.tenant === env.TENANT_SLUG
 }
 
-// slugs are URL-safe identifiers: lowercase alphanumeric + single hyphens,
-// 1–48 chars, no leading/trailing/double hyphen.
-const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
-function isValidSlug(v: unknown): v is string {
-  return typeof v === 'string' && v.length >= 1 && v.length <= 48 && SLUG_RE.test(v)
-}
-
+// Squad-id and capability validators for the membership edge (the agent/dept/squad
+// creation validators now live in ./service, shared with the dashboard).
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.trim().length > 0
 }
@@ -102,12 +100,6 @@ function isNonEmptyString(v: unknown): v is string {
 const CAPABILITIES: readonly Capability[] = ['owner', 'lead', 'member', 'observer']
 function isCapability(v: unknown): v is Capability {
   return typeof v === 'string' && (CAPABILITIES as readonly string[]).includes(v)
-}
-
-const AGENT_STATUSES = ['active', 'paused'] as const
-type AgentStatus = (typeof AGENT_STATUSES)[number]
-function isAgentStatus(v: unknown): v is AgentStatus {
-  return typeof v === 'string' && (AGENT_STATUSES as readonly string[]).includes(v)
 }
 
 // ── app ──────────────────────────────────────────────────────────────────────
@@ -158,29 +150,11 @@ orgApp.post('/departments', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
-  if (!isValidSlug(body.slug)) return c.json({ error: 'invalid_slug' }, 400)
-  if (!isNonEmptyString(body.name)) return c.json({ error: 'invalid_name' }, 400)
-
-  const dept: Department = {
-    id: crypto.randomUUID(),
-    slug: body.slug,
-    name: body.name.trim(),
-    created_at: new Date().toISOString(),
+  const result = await createDepartment(c.env, body)
+  if (!result.ok) {
+    return c.json({ error: result.error }, result.error === 'slug_taken' ? 409 : 400)
   }
-
-  try {
-    await c.env.DB.prepare(
-      'INSERT INTO departments (id, slug, name, created_at) VALUES (?, ?, ?, ?)',
-    )
-      .bind(dept.id, dept.slug, dept.name, dept.created_at)
-      .run()
-  } catch (err) {
-    // UNIQUE(slug) violation is the expected conflict here.
-    if (isUniqueViolation(err)) return c.json({ error: 'slug_taken' }, 409)
-    throw err
-  }
-
-  return c.json({ department: dept }, 201)
+  return c.json({ department: result.value }, 201)
 })
 
 // ── squads (under a department) ──────────────────────────────────────────────
@@ -221,38 +195,11 @@ orgApp.post('/departments/:id/squads', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
-  if (!isValidSlug(body.slug)) return c.json({ error: 'invalid_slug' }, 400)
-  if (!isNonEmptyString(body.name)) return c.json({ error: 'invalid_name' }, 400)
-  const charter =
-    body.charter === undefined || body.charter === null
-      ? null
-      : typeof body.charter === 'string'
-        ? body.charter
-        : undefined
-  if (charter === undefined) return c.json({ error: 'invalid_charter' }, 400)
-
-  const squad: Squad = {
-    id: crypto.randomUUID(),
-    department_id: departmentId,
-    slug: body.slug,
-    name: body.name.trim(),
-    charter,
-    created_at: new Date().toISOString(),
+  const result = await createSquad(c.env, departmentId, body)
+  if (!result.ok) {
+    return c.json({ error: result.error }, result.error === 'slug_taken' ? 409 : 400)
   }
-
-  try {
-    await c.env.DB.prepare(
-      'INSERT INTO squads (id, department_id, slug, name, charter, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-    )
-      .bind(squad.id, squad.department_id, squad.slug, squad.name, squad.charter, squad.created_at)
-      .run()
-  } catch (err) {
-    // UNIQUE(department_id, slug)
-    if (isUniqueViolation(err)) return c.json({ error: 'slug_taken' }, 409)
-    throw err
-  }
-
-  return c.json({ squad }, 201)
+  return c.json({ squad: result.value }, 201)
 })
 
 // ── agents (under a squad) ───────────────────────────────────────────────────
@@ -295,52 +242,11 @@ orgApp.post('/squads/:id/agents', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
-  if (!isValidSlug(body.slug)) return c.json({ error: 'invalid_slug' }, 400)
-  if (!isNonEmptyString(body.name)) return c.json({ error: 'invalid_name' }, 400)
-
-  // role/model fall back to the schema defaults when omitted.
-  const role = body.role === undefined ? 'member' : body.role
-  if (!isNonEmptyString(role)) return c.json({ error: 'invalid_role' }, 400)
-  const model = body.model === undefined ? '@cf/meta/llama-3.3' : body.model
-  if (!isNonEmptyString(model)) return c.json({ error: 'invalid_model' }, 400)
-  const status: AgentStatus = body.status === undefined ? 'active' : (body.status as AgentStatus)
-  if (!isAgentStatus(status)) return c.json({ error: 'invalid_status' }, 400)
-
-  // The AgentDO is lazy — provisioned on first wake. Here we only insert the row;
-  // the agent's id doubles as the DurableObject id name.
-  const agent: Agent = {
-    id: crypto.randomUUID(),
-    squad_id: squadId,
-    slug: body.slug,
-    name: body.name.trim(),
-    role: role.trim(),
-    model: model.trim(),
-    status,
-    created_at: new Date().toISOString(),
+  const result = await createAgent(c.env, squadId, body)
+  if (!result.ok) {
+    return c.json({ error: result.error }, result.error === 'slug_taken' ? 409 : 400)
   }
-
-  try {
-    await c.env.DB.prepare(
-      'INSERT INTO agents (id, squad_id, slug, name, role, model, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    )
-      .bind(
-        agent.id,
-        agent.squad_id,
-        agent.slug,
-        agent.name,
-        agent.role,
-        agent.model,
-        agent.status,
-        agent.created_at,
-      )
-      .run()
-  } catch (err) {
-    // UNIQUE(squad_id, slug)
-    if (isUniqueViolation(err)) return c.json({ error: 'slug_taken' }, 409)
-    throw err
-  }
-
-  return c.json({ agent }, 201)
+  return c.json({ agent: result.value }, 201)
 })
 
 // ── memberships (agent ↔ squad RBAC edge) ────────────────────────────────────

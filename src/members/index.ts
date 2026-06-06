@@ -30,7 +30,6 @@ import type {
   Env,
   AuthContext,
   Member,
-  MemberToken,
   CapabilityGrant,
   Capability,
   CapabilityScopeType,
@@ -41,6 +40,8 @@ import type {
 import { requireAuth } from '../auth'
 // The FROZEN capability API — everyone codes against these exact signatures.
 import { requireCapability, capabilityRank, actorMaxRankOnScope } from '../auth/capability'
+// Shared token lifecycle — the single mint/revoke path (also used by the dashboard).
+import { mintMemberToken, revokeMemberToken, isChannel as isChannelService } from './service'
 
 // The validated invite payload, stashed by the parse middleware so the scope
 // extractor (which runs inside requireCapability) can read the target department.
@@ -74,11 +75,6 @@ function isEmail(v: unknown): v is string {
 const CAPABILITIES: readonly Capability[] = ['owner', 'admin', 'lead', 'member', 'observer']
 function isCapability(v: unknown): v is Capability {
   return typeof v === 'string' && (CAPABILITIES as readonly string[]).includes(v)
-}
-
-const CHANNELS: readonly ConnectionChannel[] = ['workspace', 'im', 'dashboard']
-function isChannel(v: unknown): v is ConnectionChannel {
-  return typeof v === 'string' && (CHANNELS as readonly string[]).includes(v)
 }
 
 const SCOPE_TYPES: readonly CapabilityScopeType[] = ['org', 'department', 'squad']
@@ -458,39 +454,11 @@ membersApp.post('/members/:id/tokens', requireCapability(orgScope, 'admin'), asy
   if (typeof label !== 'string' || label.length > 64) return c.json({ error: 'invalid_label' }, 400)
 
   const channel: ConnectionChannel = body.channel === undefined ? 'workspace' : (body.channel as ConnectionChannel)
-  if (!isChannel(channel)) return c.json({ error: 'invalid_channel' }, 400)
+  if (!isChannelService(channel)) return c.json({ error: 'invalid_channel' }, 400)
 
-  const rawToken = mintRawToken()
-  const tokenHash = await sha256Hex(rawToken)
-  const token: Omit<MemberToken, 'token_hash'> = {
-    id: crypto.randomUUID(),
-    member_id: memberId,
-    label: label.trim(),
-    channel,
-    created_at: new Date().toISOString(),
-    revoked_at: null,
-  }
-
-  await c.env.DB.prepare(
-    'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-  )
-    .bind(token.id, token.member_id, tokenHash, token.label, token.channel, token.created_at)
-    .run()
-
-  // Raw token returned EXACTLY ONCE; only the hash is persisted.
-  return c.json(
-    {
-      token: {
-        id: token.id,
-        member_id: token.member_id,
-        label: token.label,
-        channel: token.channel,
-        created_at: token.created_at,
-        raw: rawToken,
-      },
-    },
-    201,
-  )
+  // Shared mint path — raw token returned EXACTLY ONCE; only the hash is persisted.
+  const token = await mintMemberToken(c.env, memberId, label, channel)
+  return c.json({ token }, 201)
 })
 
 membersApp.delete(
@@ -501,13 +469,8 @@ membersApp.delete(
     const tokenId = c.req.param('tid')
 
     // Revoke only if the token belongs to this member AND is not already revoked.
-    const res = await c.env.DB.prepare(
-      'UPDATE member_tokens SET revoked_at = ? WHERE id = ? AND member_id = ? AND revoked_at IS NULL',
-    )
-      .bind(new Date().toISOString(), tokenId, memberId)
-      .run()
-
-    if (!res.meta || res.meta.changes === 0) {
+    const revoked = await revokeMemberToken(c.env, memberId, tokenId)
+    if (!revoked) {
       // Either no such token under this member, or already revoked.
       return c.json({ error: 'token_not_found_or_already_revoked' }, 404)
     }
