@@ -23,16 +23,44 @@ import { requireAuth } from '../auth'
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability } from '../auth/capability'
-import { createTask, emitTaskEvent, mirrorTaskUpdate } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError } from './service'
+import type { TaskStatus } from './service'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
 
 // ── validation helpers ───────────────────────────────────────────────────────
 
-const TASK_STATUSES = ['open', 'in_progress', 'blocked', 'done'] as const
-type TaskStatus = (typeof TASK_STATUSES)[number]
+// Gate statuses (review/approved/rejected) extend the base set. PATCH is
+// constrained to a safe subset: review→approved|rejected is forbidden via PATCH
+// (must go through the verdict endpoint). See PATCH handler for details.
+const TASK_STATUSES = ['open', 'in_progress', 'blocked', 'done', 'review', 'approved', 'rejected'] as const
+
+// Statuses the PATCH endpoint may set directly. The gate-transition statuses
+// (approved, rejected) require the verdict endpoint.
+const PATCH_ALLOWED_STATUSES: ReadonlySet<string> = new Set([
+  'open',
+  'in_progress',
+  'blocked',
+  'done',
+  'review',
+])
+
+// K7: statuses allowed on task CREATE. Only {open, in_progress} are valid.
+// Allowing approved/rejected/review/done on create would forge terminal gate
+// state without a verdict receipt (no audit trail). blocked on create is
+// semantically odd (blocked by what?), so we exclude it too. Document clearly
+// so callers know the intentional restriction.
+//
+// Rationale: tasks are born open or immediately in_progress (e.g., dispatch:true).
+// Any other status is a lifecycle state reachable only through proper transitions.
+const CREATE_ALLOWED_STATUSES: ReadonlySet<string> = new Set(['open', 'in_progress'])
+
 function isTaskStatus(v: unknown): v is TaskStatus {
   return typeof v === 'string' && (TASK_STATUSES as readonly string[]).includes(v)
+}
+
+function isPatchableStatus(v: unknown): v is TaskStatus {
+  return typeof v === 'string' && PATCH_ALLOWED_STATUSES.has(v)
 }
 
 function isNonEmptyString(v: unknown): v is string {
@@ -120,7 +148,7 @@ tasksApp.get('/', async (c) => {
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
 
   const rows = await c.env.DB.prepare(
-    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
+    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
        FROM tasks ${where}
        ORDER BY created_at DESC`,
   )
@@ -136,7 +164,7 @@ tasksApp.get('/', async (c) => {
 tasksApp.get('/:id', async (c) => {
   const id = c.req.param('id')
   const task = await c.env.DB.prepare(
-    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
+    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
        FROM tasks WHERE id = ? LIMIT 1`,
   )
     .bind(id)
@@ -160,6 +188,7 @@ interface CreateTaskBody {
   body?: unknown
   status?: unknown
   assignee_agent_id?: unknown
+  gate_owner?: unknown
   // when dispatch === true AND an assignee resolves, wake that agent in execute
   // mode (agent.wake carrying payload.task_id) right after the task persists.
   dispatch?: unknown
@@ -194,13 +223,35 @@ tasksApp.post('/', async (c) => {
         : undefined
   if (taskBody === undefined) return c.json({ error: 'invalid_body' }, 400)
 
-  const status: TaskStatus = body.status === undefined ? 'open' : (body.status as TaskStatus)
-  if (!isTaskStatus(status)) return c.json({ error: 'invalid_status' }, 400)
+  // K7: restrict create-status to {open, in_progress}. approved/rejected/done/review
+  // are lifecycle states reachable only via transitions — forging them on create
+  // would bypass the audit trail (no verdict receipt, no transition record).
+  const rawStatus = body.status === undefined ? 'open' : body.status
+  if (!isTaskStatus(rawStatus) || !CREATE_ALLOWED_STATUSES.has(rawStatus as string)) {
+    return c.json({ error: 'invalid_status', allowed_on_create: ['open', 'in_progress'] }, 400)
+  }
+  const status: TaskStatus = rawStatus
 
   // assignee, if provided, must resolve to an agent in this same squad.
   const assigneeCheck = await resolveAssignee(c.env, body.assignee_agent_id, squad.id)
   if (assigneeCheck.error) return c.json({ error: assigneeCheck.error }, 400)
   const assigneeAgentId = assigneeCheck.value
+
+  // gate_owner: optional capability string (e.g. 'gate:outreach'). Must be a
+  // non-empty string or absent/null. Validated here; stored on the task row.
+  const gateOwner: string | null =
+    body.gate_owner === undefined || body.gate_owner === null
+      ? null
+      : typeof body.gate_owner === 'string' && body.gate_owner.trim().length > 0
+        ? body.gate_owner.trim()
+        : undefined as never // caught below
+  if (
+    body.gate_owner !== undefined &&
+    body.gate_owner !== null &&
+    (typeof body.gate_owner !== 'string' || body.gate_owner.trim().length === 0)
+  ) {
+    return c.json({ error: 'invalid_gate_owner' }, 400)
+  }
 
   const auth = c.get('auth')
   const task = await createTask(c.env, {
@@ -209,6 +260,7 @@ tasksApp.post('/', async (c) => {
     body: taskBody,
     status,
     assignee_agent_id: assigneeAgentId,
+    gate_owner: gateOwner,
   }, {
     actor: auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
   })
@@ -245,6 +297,7 @@ interface UpdateTaskBody {
   body?: unknown
   status?: unknown
   assignee_agent_id?: unknown
+  gate_owner?: unknown
 }
 
 tasksApp.patch('/:id', async (c) => {
@@ -278,7 +331,11 @@ tasksApp.patch('/:id', async (c) => {
     next.body = body.body
   }
   if (body.status !== undefined) {
-    if (!isTaskStatus(body.status)) return c.json({ error: 'invalid_status' }, 400)
+    // PATCH may only set patchable statuses; approved|rejected require the verdict endpoint.
+    if (!isPatchableStatus(body.status)) return c.json({ error: 'invalid_status' }, 400)
+    // Enforce the transition matrix.
+    const transitionErr = checkTransition(existing.status, body.status)
+    if (transitionErr) return c.json(transitionErr, 400)
     next.status = body.status
   }
   if (body.assignee_agent_id !== undefined) {
@@ -291,6 +348,21 @@ tasksApp.patch('/:id', async (c) => {
       next.assignee_agent_id = check.value
     }
   }
+  // gate_owner may only be set/changed while status is open or in_progress.
+  // Once a task enters review/approved/rejected/done the gate is locked.
+  if (body.gate_owner !== undefined) {
+    const lockStatuses: ReadonlySet<TaskStatus> = new Set(['review', 'approved', 'rejected', 'done'])
+    if (lockStatuses.has(existing.status)) {
+      return c.json({ error: 'gate_owner_locked', status: existing.status }, 409)
+    }
+    if (body.gate_owner === null) {
+      next.gate_owner = null
+    } else if (typeof body.gate_owner === 'string' && body.gate_owner.trim().length > 0) {
+      next.gate_owner = body.gate_owner.trim()
+    } else {
+      return c.json({ error: 'invalid_gate_owner' }, 400)
+    }
+  }
 
   next.updated_at = new Date().toISOString()
 
@@ -300,7 +372,7 @@ tasksApp.patch('/:id', async (c) => {
 
   await c.env.DB.prepare(
     `UPDATE tasks
-        SET title = ?, body = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, updated_at = ?
+        SET title = ?, body = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, updated_at = ?
       WHERE id = ?`,
   )
     .bind(
@@ -309,6 +381,7 @@ tasksApp.patch('/:id', async (c) => {
       next.status,
       next.assignee_agent_id,
       next.github_issue_url,
+      next.gate_owner,
       next.updated_at,
       next.id,
     )
@@ -325,6 +398,168 @@ tasksApp.patch('/:id', async (c) => {
   }
 
   return c.json({ task: next })
+})
+
+// ── POST /:id/verdict — approve or reject a task in review ───────────────────
+//
+// RBAC: the caller must hold the task's gate_owner capability (e.g. 'gate:outreach').
+// Pre-checks (in order):
+//  1. Task exists (404)
+//  2. Caller has squad member+ (403) — same base guard as all task mutations
+//  3. Task has gate_owner set (409 no_gate) — unguarded tasks cannot be verdicted
+//  4. Task is in 'review' status (409 not_in_review)
+//  5. Caller holds the gate_owner capability at the squad (or department/org) scope (403)
+// On success: D1 batch (insert verdict + flip status) then emit task.verdict.
+
+interface VerdictBody {
+  verdict?: unknown
+  note?: unknown
+  // K4: explicit body flag to allow a self-verdict override.
+  // Only honoured when the decider holds org owner role. Must be deliberate —
+  // a caller cannot accidentally pass this; it must be an intentional opt-in.
+  override_self_verdict?: unknown
+}
+
+// K3 fix: check that the caller holds a SPECIFIC gate capability (e.g. 'gate:outreach').
+//
+// Previously this queried the `capabilities` table, whose CHECK constraint only
+// allows ('owner','admin','lead','member','observer') — making 'gate:*' strings
+// un-insertable and this gate structurally inert.
+//
+// Fix: gate capability grants live in `gate_grants` (migration 0008). A grant row
+// for (capability=<gateOwner>, principal_type='member', principal_id=<memberId>)
+// authorises verdicting. The legacy owner/admin bypass is retained so pre-existing
+// org owners never lose the ability to gate-override.
+//
+// Agent principals: if the caller is an agent token rather than a member, we check
+// principal_type='agent' using auth.userId as the principal_id (agent tokens carry
+// the agent id as userId).
+async function callerHoldsGateCapability(
+  env: Env,
+  auth: AuthContext,
+  _squadId: string,
+  gateOwner: string,
+): Promise<boolean> {
+  // Org owners/admins always pass (same escape used throughout tasks).
+  if (legacyOwnerAdmin(auth)) return true
+
+  // Determine what principal id + type to check.
+  // Member tokens: auth.memberId is set.
+  // Agent tokens: auth.memberId is absent; auth.userId carries the agent id.
+  const principalId = auth.memberId ?? auth.userId
+  const principalType: 'member' | 'agent' = auth.memberId ? 'member' : 'agent'
+
+  if (!principalId) return false
+
+  // Query gate_grants for an explicit grant.
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM gate_grants
+      WHERE capability     = ?1
+        AND principal_type = ?2
+        AND principal_id   = ?3
+      LIMIT 1`,
+  )
+    .bind(gateOwner, principalType, principalId)
+    .first<{ 1: number }>()
+  return row !== null
+}
+
+tasksApp.post('/:id/verdict', async (c) => {
+  const id = c.req.param('id')
+  const task = await getById<import('../types').Task>(c.env, 'tasks', id)
+  if (!task) return c.json({ error: 'task_not_found' }, 404)
+
+  // Base guard: caller must have squad member+ (same as all task mutations).
+  if (!(await canActOnSquad(c.env, c.get('auth'), task.squad_id))) {
+    return c.json({ error: 'forbidden', need: 'member' }, 403)
+  }
+
+  // Pre-check: task must have a gate_owner set.
+  if (!task.gate_owner) {
+    return c.json({ error: 'no_gate' }, 409)
+  }
+
+  // Pre-check: task must be in 'review'.
+  if (task.status !== 'review') {
+    return c.json({ error: 'not_in_review', status: task.status }, 409)
+  }
+
+  let body: VerdictBody
+  try {
+    body = (await c.req.json()) as VerdictBody
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+
+  if (body.verdict !== 'approved' && body.verdict !== 'rejected') {
+    return c.json({ error: 'invalid_verdict', accepted: ['approved', 'rejected'] }, 400)
+  }
+
+  // K4: note must be mutable so the self-verdict override can prepend an audit tag.
+  let note: string | null =
+    body.note === undefined || body.note === null
+      ? null
+      : typeof body.note === 'string'
+        ? body.note
+        : null
+
+  // RBAC: caller must hold the gate capability.
+  const auth = c.get('auth')
+  const hasGate = await callerHoldsGateCapability(c.env, auth, task.squad_id, task.gate_owner)
+  if (!hasGate) {
+    return c.json({ error: 'forbidden', need: task.gate_owner }, 403)
+  }
+
+  // K4: self-verdict prevention.
+  //
+  // Policy: a principal may not approve or reject their own work.
+  // "Own work" = the principal IS the task assignee (agent-token callers use
+  // auth.userId which is the agent id; member-token callers use auth.memberId).
+  //
+  // Comparison logic:
+  //  - agent token (no memberId): decider = auth.userId = agent id → compare to
+  //    task.assignee_agent_id directly.
+  //  - member token (has memberId): decider = auth.memberId. The assignee is an
+  //    agent id, not a member id — a direct equality check here is safe (they are
+  //    different id spaces and can never collide). Future: when tasks carry a
+  //    created_by member_id column, extend this check to also compare memberId
+  //    against the creator.
+  //
+  // Override: org owner may self-verdict by passing { override_self_verdict: true }
+  // in the body. The override is logged in the verdict note for auditability.
+  const deciderPrincipalId = auth.memberId ?? auth.userId
+  const isSelfVerdict = deciderPrincipalId === task.assignee_agent_id
+  if (isSelfVerdict) {
+    const isOrgOwner = auth.role === 'owner'
+    const overrideRequested = body.override_self_verdict === true
+    if (!isOrgOwner || !overrideRequested) {
+      return c.json({
+        error: 'self_verdict',
+        reason: 'decider is the task assignee; self-approval is forbidden',
+        hint: overrideRequested ? 'override requires org owner role' : 'pass override_self_verdict:true as org owner to force',
+      }, 409)
+    }
+    // Org owner explicit override: audit note is prepended to any caller-provided note.
+    const overrideNote = `[self_verdict_override by org owner ${deciderPrincipalId}]`
+    note = note ? `${overrideNote} ${note}` : overrideNote
+  }
+
+  // Write verdict with conditional UPDATE guard (K5 race protection).
+  const decidedBy = auth.memberId ?? auth.userId
+  try {
+    const result = await writeVerdict(
+      c.env,
+      { task, verdict: body.verdict, note, decidedBy },
+      auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
+    )
+    return c.json(result, 201)
+  } catch (err) {
+    if (err instanceof VerdictRaceError) {
+      // K5: concurrent verdict won the race — task is no longer in 'review'.
+      return c.json({ error: 'verdict_conflict', reason: 'task status changed concurrently; reload and retry' }, 409)
+    }
+    throw err // propagate unexpected errors (5xx)
+  }
 })
 
 // ── assignee resolution ──────────────────────────────────────────────────────
@@ -351,6 +586,109 @@ export async function resolveAssignee(
   if (agent.squad_id !== squadId) return { value: null, error: 'assignee_not_in_squad' }
   return { value: agent.id }
 }
+
+// ── POST /api/gates/grants — grant a gate capability to a principal (K3) ─────
+// ── DELETE /api/gates/grants — revoke a gate grant ───────────────────────────
+//
+// Only org owner/admin may manage gate grants.
+// Grant rows live in gate_grants (migration 0008); they are administrable so
+// operators can delegate verdict authority without giving org-admin access.
+//
+// POST body: { capability: string, principal_type: 'member'|'agent', principal_id: string }
+// DELETE body: same shape — revoke = hard delete (the verdict receipt IS the audit trail)
+
+export const gatesApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
+
+gatesApp.use('*', csrf())
+gatesApp.use('*', requireAuth)
+gatesApp.use('*', async (c, next) => {
+  if (!inTenantScope(c.get('auth'), c.env)) {
+    return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
+  }
+  await next()
+})
+
+// Only org owner/admin may touch gate grants.
+function requireOwnerAdmin(auth: AuthContext): boolean {
+  return auth.role === 'owner' || auth.role === 'admin'
+}
+
+interface GrantBody {
+  capability?: unknown
+  principal_type?: unknown
+  principal_id?: unknown
+}
+
+gatesApp.post('/grants', async (c) => {
+  const auth = c.get('auth')
+  if (!requireOwnerAdmin(auth)) {
+    return c.json({ error: 'forbidden', need: 'owner_or_admin' }, 403)
+  }
+
+  let body: GrantBody
+  try {
+    body = (await c.req.json()) as GrantBody
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+
+  if (!isNonEmptyString(body.capability)) return c.json({ error: 'invalid_capability' }, 400)
+  if (body.principal_type !== 'member' && body.principal_type !== 'agent') {
+    return c.json({ error: 'invalid_principal_type', accepted: ['member', 'agent'] }, 400)
+  }
+  if (!isNonEmptyString(body.principal_id)) return c.json({ error: 'invalid_principal_id' }, 400)
+
+  const grantedBy = auth.memberId ?? auth.userId
+  const now = new Date().toISOString()
+  const id = crypto.randomUUID()
+
+  // INSERT OR IGNORE: idempotent — granting twice is not an error.
+  await c.env.DB.prepare(
+    `INSERT OR IGNORE INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(id, body.capability.trim(), body.principal_type, body.principal_id.trim(), grantedBy, now)
+    .run()
+
+  return c.json({
+    ok: true,
+    grant: {
+      capability: body.capability.trim(),
+      principal_type: body.principal_type,
+      principal_id: body.principal_id.trim(),
+      granted_by: grantedBy,
+      created_at: now,
+    },
+  }, 201)
+})
+
+gatesApp.delete('/grants', async (c) => {
+  const auth = c.get('auth')
+  if (!requireOwnerAdmin(auth)) {
+    return c.json({ error: 'forbidden', need: 'owner_or_admin' }, 403)
+  }
+
+  let body: GrantBody
+  try {
+    body = (await c.req.json()) as GrantBody
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+
+  if (!isNonEmptyString(body.capability)) return c.json({ error: 'invalid_capability' }, 400)
+  if (body.principal_type !== 'member' && body.principal_type !== 'agent') {
+    return c.json({ error: 'invalid_principal_type', accepted: ['member', 'agent'] }, 400)
+  }
+  if (!isNonEmptyString(body.principal_id)) return c.json({ error: 'invalid_principal_id' }, 400)
+
+  await c.env.DB.prepare(
+    `DELETE FROM gate_grants WHERE capability = ? AND principal_type = ? AND principal_id = ?`,
+  )
+    .bind(body.capability.trim(), body.principal_type, body.principal_id.trim())
+    .run()
+
+  return c.json({ ok: true })
+})
 
 // ── d1 helpers ───────────────────────────────────────────────────────────────
 

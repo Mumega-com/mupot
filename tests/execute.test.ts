@@ -26,6 +26,7 @@ function makeTask(over: Partial<Task> = {}): Task {
     github_issue_url: null,
     result: null,
     completed_at: null,
+    gate_owner: null,  // K1: default ungated; override in tests for gated behaviour
     created_at: '2026-06-06T00:00:00.000Z',
     updated_at: '2026-06-06T00:00:00.000Z',
     ...over,
@@ -169,6 +170,50 @@ describe('runTaskExecution — failure (NEVER stuck in_progress)', () => {
   })
 })
 
+// K1: gated execution success lands 'review', not 'done'
+describe('runTaskExecution — K1 gated task lands review', () => {
+  it('success on a task with gate_owner lands status=review + emits task.review', async () => {
+    const gatedTask = makeTask({ gate_owner: 'gate:outreach' })
+    const { env, updates } = makeEnv({ task: gatedTask, charter: 'Ship safely.' })
+    const events: BusEvent[] = []
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', {
+      model: okModel('Work product here.'),
+      emit: async (e) => { events.push(e) },
+      remember: async () => 'engram-1',
+    })
+
+    expect(r.ok).toBe(true)
+    // K1: gated success lands 'review', not 'done'
+    expect(r.task_status).toBe('review')
+
+    // The terminal UPDATE must write 'review'
+    const terminal = updates[updates.length - 1]
+    expect(terminal.args[0]).toBe('review')
+
+    // Event type must be 'task.review' for gated task
+    expect(events).toHaveLength(1)
+    expect(events[0].type).toBe('task.review')
+  })
+
+  it('success on an ungated task still lands done (regression guard)', async () => {
+    const ungatedTask = makeTask({ gate_owner: null })
+    const { env, updates } = makeEnv({ task: ungatedTask })
+    const events: BusEvent[] = []
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', {
+      model: okModel('Done.'),
+      emit: async (e) => { events.push(e) },
+      remember: async () => 'x',
+    })
+
+    expect(r.ok).toBe(true)
+    expect(r.task_status).toBe('done')
+    expect(updates[updates.length - 1].args[0]).toBe('done')
+    expect(events[0].type).toBe('task.completed')
+  })
+})
+
 describe('runTaskExecution — fail-closed scope (RBAC boundary)', () => {
   it('returns task_not_found when the task is missing / not in this squad, with NO writes', async () => {
     const { env, updates } = makeEnv({ task: null })
@@ -183,16 +228,39 @@ describe('runTaskExecution — fail-closed scope (RBAC boundary)', () => {
   })
 })
 
-describe('runTaskExecution — idempotency', () => {
-  it('leaves an already-done task untouched (the bus may redeliver)', async () => {
-    const { env, updates } = makeEnv({ task: makeTask({ status: 'done', result: 'prior' }) })
-    const model = okModel('would clobber')
+describe('runTaskExecution — idempotency / K6 no-op gate statuses', () => {
+  // K6: execute no-ops for statuses outside {open, in_progress, blocked, rejected}.
+  // 'done', 'review', 'approved' must never re-enter the execution loop.
+  const noOpStatuses: Task['status'][] = ['done', 'review', 'approved']
 
-    const r = await runTaskExecution(env, AGENT, 'task-1', { model, emit: async () => {}, remember: async () => 'x' })
+  for (const status of noOpStatuses) {
+    it(`no-ops on status=${status} without any writes`, async () => {
+      const { env, updates } = makeEnv({ task: makeTask({ status }) })
+      const model = okModel('would clobber')
 
+      const r = await runTaskExecution(env, AGENT, 'task-1', {
+        model,
+        emit: async () => {},
+        remember: async () => 'x',
+      })
+
+      expect(r.ok).toBe(true)
+      expect(r.decided).toBe(`no_op:${status}`)
+      expect(r.task_status).toBe(status)
+      expect(model.chat).not.toHaveBeenCalled()
+      expect(updates).toHaveLength(0)
+    })
+  }
+
+  it('executes normally on rejected (rework authorised)', async () => {
+    const { env, updates } = makeEnv({ task: makeTask({ status: 'rejected' }) })
+    const r = await runTaskExecution(env, AGENT, 'task-1', {
+      model: okModel('rework done'),
+      emit: async () => {},
+      remember: async () => 'x',
+    })
+    // rejected is workable — it should execute and land done (ungated task)
     expect(r.ok).toBe(true)
-    expect(r.decided).toBe('already_done')
-    expect(model.chat).not.toHaveBeenCalled()
-    expect(updates).toHaveLength(0) // no re-run, no clobber
+    expect(updates.length).toBeGreaterThan(0)
   })
 })

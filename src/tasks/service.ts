@@ -4,11 +4,53 @@
 // (dashboard/API, MCP, IM, channels, agents) should call createTask() instead of
 // hand-writing rows. `task.created` is a post-persistence notification event.
 
-import type { Env, Task, BusEvent } from '../types'
+import type { Env, Task, TaskVerdict, BusEvent } from '../types'
 import { createBus } from '../bus'
 
-type TaskStatus = Task['status']
+export type TaskStatus = Task['status']
 type TaskActor = NonNullable<BusEvent['actor']>
+
+// ── Status transition matrix ────────────────────────────────────────────────
+//
+// Allowed transitions (enforced by assertValidTransition; invalid → 400):
+//   open        → in_progress
+//   in_progress → review | blocked | done
+//   review      → approved | rejected   (ONLY via verdict endpoint, not PATCH)
+//   approved    → done
+//   rejected    → in_progress | done
+//   blocked     → in_progress           (retry after unblocking)
+//   done        → (terminal — no outbound transitions)
+//
+// The PATCH route additionally guards that review→approved|rejected never flows
+// through a plain PATCH (those transitions require the verdict endpoint).
+// The verdict endpoint enforces: task must be in 'review', transition goes to
+// approved|rejected only.
+
+const TRANSITIONS: Readonly<Partial<Record<TaskStatus, readonly TaskStatus[]>>> = {
+  open: ['in_progress'],
+  in_progress: ['review', 'blocked', 'done'],
+  review: ['approved', 'rejected'],
+  approved: ['done'],
+  rejected: ['in_progress', 'done'],
+  blocked: ['in_progress'],
+  // 'done' has no outbound transitions (terminal)
+}
+
+/**
+ * Validate a from→to transition. Returns an error object when invalid, or null
+ * when valid. The verdict endpoint pre-checks its own preconditions before calling
+ * this; this function is the single source of truth for what moves are legal.
+ */
+export function checkTransition(
+  from: TaskStatus,
+  to: TaskStatus,
+): { error: 'invalid_transition'; from: TaskStatus; to: TaskStatus } | null {
+  const allowed = TRANSITIONS[from]
+  if (!allowed || !(allowed as readonly string[]).includes(to)) {
+    return { error: 'invalid_transition', from, to }
+  }
+  return null
+}
 
 export interface CreateTaskInput {
   squad_id: string
@@ -16,6 +58,7 @@ export interface CreateTaskInput {
   body?: string
   status?: TaskStatus
   assignee_agent_id?: string | null
+  gate_owner?: string | null
 }
 
 export interface CreateTaskOptions {
@@ -146,6 +189,7 @@ export async function createTask(
     github_issue_url: null,
     result: null,
     completed_at: null,
+    gate_owner: input.gate_owner ?? null,
     created_at: now,
     updated_at: now,
   }
@@ -153,8 +197,8 @@ export async function createTask(
   task.github_issue_url = await mirrorTaskCreate(env, task)
 
   await env.DB.prepare(
-    `INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       task.id,
@@ -166,6 +210,7 @@ export async function createTask(
       task.github_issue_url,
       task.result,
       task.completed_at,
+      task.gate_owner,
       task.created_at,
       task.updated_at,
     )
@@ -173,4 +218,147 @@ export async function createTask(
 
   await emitTaskEvent(env, 'task.created', task, options.actor)
   return task
+}
+
+// ── Verdict write ─────────────────────────────────────────────────────────────
+//
+// Flips the task status and appends a verdict receipt.
+//
+// K5 TOCTOU fix — chosen pattern: conditional UPDATE first, then INSERT verdict.
+//
+// Why not a D1 batch?
+// D1 batch is transactional (all-or-neither) but it cannot *conditionally* abort
+// in the middle: `UPDATE ... WHERE status='review'` inside a batch with 0 changes
+// still "succeeds" as a statement — D1 cannot abort-on-zero-changes mid-batch.
+// So we cannot use batch for the race-guard.
+//
+// Chosen pattern:
+//   1. Standalone `UPDATE tasks SET status=? WHERE id=? AND status='review'`
+//      → check meta.changes. If 0 → 409 (race lost: another verdict already
+//      flipped the row). The 409 is surfaced to the caller.
+//   2. On changes=1: INSERT task_verdicts.
+//      If INSERT fails (DB error), the status flip stands but the audit receipt
+//      is missing. We emit a `task.verdict_orphan` bus event and re-throw so the
+//      caller gets a 500. Operators can reconcile from the bus event log.
+//      This is a narrow window (step-2 failure after step-1 success) that requires
+//      a DB write error on a simple INSERT — acceptable given D1's durability model.
+//
+// Multiple verdicts per task ARE legitimate (rework loop: rejected → in_progress →
+// review → approved). No UNIQUE constraint on task_verdicts(task_id).
+//
+// Called exclusively from POST /api/tasks/:id/verdict after all pre-checks pass.
+
+export interface WriteVerdictInput {
+  task: Task
+  verdict: 'approved' | 'rejected'
+  note: string | null
+  decidedBy: string // principal id (memberId or userId)
+}
+
+export class VerdictRaceError extends Error {
+  constructor(taskId: string) {
+    super(`verdict_race: task ${taskId} is no longer in review (concurrent verdict won)`)
+    this.name = 'VerdictRaceError'
+  }
+}
+
+export async function writeVerdict(
+  env: Env,
+  input: WriteVerdictInput,
+  actor?: TaskActor,
+): Promise<{ task: Task; verdict: TaskVerdict }> {
+  const now = new Date().toISOString()
+  const newStatus: TaskStatus = input.verdict === 'approved' ? 'approved' : 'rejected'
+
+  // K5 step 1: conditional UPDATE — only succeeds while the task is still 'review'.
+  // meta.changes === 0 means another concurrent verdict already won the race.
+  const flipResult = await env.DB.prepare(
+    `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review'`,
+  )
+    .bind(newStatus, now, input.task.id)
+    .run()
+
+  if (!flipResult.meta.changes || flipResult.meta.changes === 0) {
+    // Race lost: the task is no longer in 'review'. Surface as a typed error so
+    // the route can return 409 with a clear message.
+    throw new VerdictRaceError(input.task.id)
+  }
+
+  // K5 step 2: status flipped — now insert the receipt. If this fails, the status
+  // flip stands but we have no receipt. Emit an orphan event for reconciliation.
+  const verdictRow: TaskVerdict = {
+    id: crypto.randomUUID(),
+    task_id: input.task.id,
+    verdict: input.verdict,
+    note: input.note,
+    decided_by: input.decidedBy,
+    decided_at: now,
+  }
+
+  try {
+    await env.DB.prepare(
+      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        verdictRow.id,
+        verdictRow.task_id,
+        verdictRow.verdict,
+        verdictRow.note,
+        verdictRow.decided_by,
+        verdictRow.decided_at,
+      )
+      .run()
+  } catch (insertErr) {
+    // Status is already flipped — there is no safe rollback path in D1 without a
+    // transaction API. Emit an orphan event so operators can detect and reconcile.
+    try {
+      await createBus(env).emit({
+        type: 'task.verdict_orphan' as 'task.verdict', // narrow cast for bus compat
+        tenant: env.TENANT_SLUG,
+        squad_id: input.task.squad_id,
+        agent_id: input.task.assignee_agent_id ?? undefined,
+        actor,
+        payload: {
+          task_id: input.task.id,
+          verdict: input.verdict,
+          new_status: newStatus,
+          decided_by: input.decidedBy,
+          error: insertErr instanceof Error ? insertErr.message : 'insert_failed',
+        },
+        ts: now,
+      })
+    } catch {
+      // bus emit is best-effort
+    }
+    throw insertErr // propagate so the route returns 500
+  }
+
+  const updatedTask: Task = {
+    ...input.task,
+    status: newStatus,
+    updated_at: now,
+  }
+
+  // Emit verdict event (non-fatal — the verdict is already written).
+  try {
+    await createBus(env).emit({
+      type: 'task.verdict',
+      tenant: env.TENANT_SLUG,
+      squad_id: input.task.squad_id,
+      agent_id: input.task.assignee_agent_id ?? undefined,
+      actor,
+      payload: {
+        task_id: input.task.id,
+        verdict: input.verdict,
+        new_status: newStatus,
+        decided_by: input.decidedBy,
+      },
+      ts: now,
+    })
+  } catch {
+    // Bus emit failures must never roll back an already-written verdict.
+  }
+
+  return { task: updatedTask, verdict: verdictRow }
 }

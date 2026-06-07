@@ -76,13 +76,25 @@ export interface Task {
   squad_id: string
   title: string
   body: string
-  status: 'open' | 'in_progress' | 'blocked' | 'done'
+  status: 'open' | 'in_progress' | 'blocked' | 'done' | 'review' | 'approved' | 'rejected'
   assignee_agent_id: string | null
   github_issue_url: string | null // tasks are mirrored to GitHub (source of truth)
   result: string | null // execution output (model answer) or a short failure note
   completed_at: string | null // ISO; set when execution finishes (done OR blocked)
+  gate_owner: string | null // capability string gating the review→approved|rejected transition
   created_at: string
   updated_at: string
+}
+
+// Append-only verdict receipt — written by POST /api/tasks/:id/verdict.
+// No UPDATE or DELETE path exists (enforced in the route layer).
+export interface TaskVerdict {
+  id: string
+  task_id: string
+  verdict: 'approved' | 'rejected'
+  note: string | null
+  decided_by: string // agent id or member id of the principal
+  decided_at: string // ISO-8601
 }
 
 // ── Auth (app-layer RBAC; AuthN delegated to the perimeter/OAuth) ──
@@ -139,8 +151,10 @@ export type BusEventType =
   | 'lead.new'
   | 'task.created'
   | 'task.updated'
-  | 'task.completed' // execution succeeded — result persisted on the task row
+  | 'task.completed' // execution succeeded (ungated) — result persisted on the task row
+  | 'task.review'   // execution succeeded on a gated task — task now awaits verdict
   | 'task.blocked' // execution failed (model error/timeout) — short note persisted
+  | 'task.verdict' // gate decision written — verdict + new task status in payload
   | 'agent.wake'
   | 'squad.dispatch'
 
