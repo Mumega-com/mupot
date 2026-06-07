@@ -23,16 +23,34 @@ import { requireAuth } from '../auth'
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability } from '../auth/capability'
-import { createTask, emitTaskEvent, mirrorTaskUpdate } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict } from './service'
+import type { TaskStatus } from './service'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
 
 // ── validation helpers ───────────────────────────────────────────────────────
 
-const TASK_STATUSES = ['open', 'in_progress', 'blocked', 'done'] as const
-type TaskStatus = (typeof TASK_STATUSES)[number]
+// Gate statuses (review/approved/rejected) extend the base set. PATCH is
+// constrained to a safe subset: review→approved|rejected is forbidden via PATCH
+// (must go through the verdict endpoint). See PATCH handler for details.
+const TASK_STATUSES = ['open', 'in_progress', 'blocked', 'done', 'review', 'approved', 'rejected'] as const
+
+// Statuses the PATCH endpoint may set directly. The gate-transition statuses
+// (approved, rejected) require the verdict endpoint.
+const PATCH_ALLOWED_STATUSES: ReadonlySet<string> = new Set([
+  'open',
+  'in_progress',
+  'blocked',
+  'done',
+  'review',
+])
+
 function isTaskStatus(v: unknown): v is TaskStatus {
   return typeof v === 'string' && (TASK_STATUSES as readonly string[]).includes(v)
+}
+
+function isPatchableStatus(v: unknown): v is TaskStatus {
+  return typeof v === 'string' && PATCH_ALLOWED_STATUSES.has(v)
 }
 
 function isNonEmptyString(v: unknown): v is string {
@@ -120,7 +138,7 @@ tasksApp.get('/', async (c) => {
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
 
   const rows = await c.env.DB.prepare(
-    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
+    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
        FROM tasks ${where}
        ORDER BY created_at DESC`,
   )
@@ -136,7 +154,7 @@ tasksApp.get('/', async (c) => {
 tasksApp.get('/:id', async (c) => {
   const id = c.req.param('id')
   const task = await c.env.DB.prepare(
-    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
+    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
        FROM tasks WHERE id = ? LIMIT 1`,
   )
     .bind(id)
@@ -160,6 +178,7 @@ interface CreateTaskBody {
   body?: unknown
   status?: unknown
   assignee_agent_id?: unknown
+  gate_owner?: unknown
   // when dispatch === true AND an assignee resolves, wake that agent in execute
   // mode (agent.wake carrying payload.task_id) right after the task persists.
   dispatch?: unknown
@@ -202,6 +221,22 @@ tasksApp.post('/', async (c) => {
   if (assigneeCheck.error) return c.json({ error: assigneeCheck.error }, 400)
   const assigneeAgentId = assigneeCheck.value
 
+  // gate_owner: optional capability string (e.g. 'gate:outreach'). Must be a
+  // non-empty string or absent/null. Validated here; stored on the task row.
+  const gateOwner: string | null =
+    body.gate_owner === undefined || body.gate_owner === null
+      ? null
+      : typeof body.gate_owner === 'string' && body.gate_owner.trim().length > 0
+        ? body.gate_owner.trim()
+        : undefined as never // caught below
+  if (
+    body.gate_owner !== undefined &&
+    body.gate_owner !== null &&
+    (typeof body.gate_owner !== 'string' || body.gate_owner.trim().length === 0)
+  ) {
+    return c.json({ error: 'invalid_gate_owner' }, 400)
+  }
+
   const auth = c.get('auth')
   const task = await createTask(c.env, {
     squad_id: squad.id,
@@ -209,6 +244,7 @@ tasksApp.post('/', async (c) => {
     body: taskBody,
     status,
     assignee_agent_id: assigneeAgentId,
+    gate_owner: gateOwner,
   }, {
     actor: auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
   })
@@ -245,6 +281,7 @@ interface UpdateTaskBody {
   body?: unknown
   status?: unknown
   assignee_agent_id?: unknown
+  gate_owner?: unknown
 }
 
 tasksApp.patch('/:id', async (c) => {
@@ -278,7 +315,11 @@ tasksApp.patch('/:id', async (c) => {
     next.body = body.body
   }
   if (body.status !== undefined) {
-    if (!isTaskStatus(body.status)) return c.json({ error: 'invalid_status' }, 400)
+    // PATCH may only set patchable statuses; approved|rejected require the verdict endpoint.
+    if (!isPatchableStatus(body.status)) return c.json({ error: 'invalid_status' }, 400)
+    // Enforce the transition matrix.
+    const transitionErr = checkTransition(existing.status, body.status)
+    if (transitionErr) return c.json(transitionErr, 400)
     next.status = body.status
   }
   if (body.assignee_agent_id !== undefined) {
@@ -291,6 +332,21 @@ tasksApp.patch('/:id', async (c) => {
       next.assignee_agent_id = check.value
     }
   }
+  // gate_owner may only be set/changed while status is open or in_progress.
+  // Once a task enters review/approved/rejected/done the gate is locked.
+  if (body.gate_owner !== undefined) {
+    const lockStatuses: ReadonlySet<TaskStatus> = new Set(['review', 'approved', 'rejected', 'done'])
+    if (lockStatuses.has(existing.status)) {
+      return c.json({ error: 'gate_owner_locked', status: existing.status }, 409)
+    }
+    if (body.gate_owner === null) {
+      next.gate_owner = null
+    } else if (typeof body.gate_owner === 'string' && body.gate_owner.trim().length > 0) {
+      next.gate_owner = body.gate_owner.trim()
+    } else {
+      return c.json({ error: 'invalid_gate_owner' }, 400)
+    }
+  }
 
   next.updated_at = new Date().toISOString()
 
@@ -300,7 +356,7 @@ tasksApp.patch('/:id', async (c) => {
 
   await c.env.DB.prepare(
     `UPDATE tasks
-        SET title = ?, body = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, updated_at = ?
+        SET title = ?, body = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, updated_at = ?
       WHERE id = ?`,
   )
     .bind(
@@ -309,6 +365,7 @@ tasksApp.patch('/:id', async (c) => {
       next.status,
       next.assignee_agent_id,
       next.github_issue_url,
+      next.gate_owner,
       next.updated_at,
       next.id,
     )
@@ -325,6 +382,114 @@ tasksApp.patch('/:id', async (c) => {
   }
 
   return c.json({ task: next })
+})
+
+// ── POST /:id/verdict — approve or reject a task in review ───────────────────
+//
+// RBAC: the caller must hold the task's gate_owner capability (e.g. 'gate:outreach').
+// Pre-checks (in order):
+//  1. Task exists (404)
+//  2. Caller has squad member+ (403) — same base guard as all task mutations
+//  3. Task has gate_owner set (409 no_gate) — unguarded tasks cannot be verdicted
+//  4. Task is in 'review' status (409 not_in_review)
+//  5. Caller holds the gate_owner capability at the squad (or department/org) scope (403)
+// On success: D1 batch (insert verdict + flip status) then emit task.verdict.
+
+interface VerdictBody {
+  verdict?: unknown
+  note?: unknown
+}
+
+// Check that the caller holds a SPECIFIC capability string (gate_owner) on the
+// task's squad. gate_owner is a non-Capability string like 'gate:outreach'; we
+// look it up in the capabilities table directly as a string column match.
+// Org-level owner/admin bypass is intentional: they can always gate-override.
+async function callerHoldsGateCapability(
+  env: Env,
+  auth: AuthContext,
+  squadId: string,
+  gateOwner: string,
+): Promise<boolean> {
+  // Org owners/admins always pass (same escape used throughout tasks).
+  if (legacyOwnerAdmin(auth)) return true
+  if (!auth.memberId) return false
+
+  // Load the member's grants and check for an exact capability string match.
+  // resolveCapabilities returns CapabilityGrant[] where capability is 'owner'|'admin'|…
+  // gate_owner is a free string (e.g. 'gate:outreach') stored in tasks.gate_owner.
+  // We need to look up the capabilities table directly for the gate string.
+  // The existing Capability type covers the ladder; gate strings live as a separate
+  // row type. We query the raw capabilities table for the gate string.
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM capabilities
+      WHERE member_id = ?1
+        AND capability = ?2
+        AND (
+          scope_type = 'org'
+          OR (scope_type = 'squad'      AND scope_id = ?3)
+          OR (scope_type = 'department' AND scope_id = (SELECT department_id FROM squads WHERE id = ?3 LIMIT 1))
+        )
+      LIMIT 1`,
+  )
+    .bind(auth.memberId, gateOwner, squadId)
+    .first<{ 1: number }>()
+  return row !== null
+}
+
+tasksApp.post('/:id/verdict', async (c) => {
+  const id = c.req.param('id')
+  const task = await getById<import('../types').Task>(c.env, 'tasks', id)
+  if (!task) return c.json({ error: 'task_not_found' }, 404)
+
+  // Base guard: caller must have squad member+ (same as all task mutations).
+  if (!(await canActOnSquad(c.env, c.get('auth'), task.squad_id))) {
+    return c.json({ error: 'forbidden', need: 'member' }, 403)
+  }
+
+  // Pre-check: task must have a gate_owner set.
+  if (!task.gate_owner) {
+    return c.json({ error: 'no_gate' }, 409)
+  }
+
+  // Pre-check: task must be in 'review'.
+  if (task.status !== 'review') {
+    return c.json({ error: 'not_in_review', status: task.status }, 409)
+  }
+
+  let body: VerdictBody
+  try {
+    body = (await c.req.json()) as VerdictBody
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+
+  if (body.verdict !== 'approved' && body.verdict !== 'rejected') {
+    return c.json({ error: 'invalid_verdict', accepted: ['approved', 'rejected'] }, 400)
+  }
+
+  const note: string | null =
+    body.note === undefined || body.note === null
+      ? null
+      : typeof body.note === 'string'
+        ? body.note
+        : null
+
+  // RBAC: caller must hold the gate capability.
+  const auth = c.get('auth')
+  const hasGate = await callerHoldsGateCapability(c.env, auth, task.squad_id, task.gate_owner)
+  if (!hasGate) {
+    return c.json({ error: 'forbidden', need: task.gate_owner }, 403)
+  }
+
+  // Write verdict + flip status atomically via D1 batch.
+  const decidedBy = auth.memberId ?? auth.userId
+  const result = await writeVerdict(
+    c.env,
+    { task, verdict: body.verdict, note, decidedBy },
+    auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
+  )
+
+  return c.json(result, 201)
 })
 
 // ── assignee resolution ──────────────────────────────────────────────────────
