@@ -46,7 +46,8 @@ import { resolveCapabilities, hasCapability } from '../auth/capability'
 
 // Shared creation paths — the dashboard handlers call the SAME service functions
 // the /api routes call, never re-implementing the write/validation logic.
-import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent } from '../org/service'
+import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent, updateUnitConfig } from '../org/service'
+import type { UnitConfigPatch } from '../org/service'
 import { mintMemberToken, revokeMemberToken, loadLiveTokens, isChannel } from '../members/service'
 import type { MintedToken, PublicMemberToken } from '../members/service'
 
@@ -290,6 +291,41 @@ dashboardApp.delete('/agents/:id', async (c) => {
   return c.json({ ok: true })
 })
 
+// POST /agents/:id/config — patch work-unit knobs on an agent (owner/admin only).
+// Calls the shared updateUnitConfig from org/service — no new write logic here.
+dashboardApp.post('/agents/:id/config', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const agentId = c.req.param('id')
+  if (!agentId || agentId.length > 64) return c.json({ error: 'invalid_agent_id' }, 400)
+
+  const form = await c.req.parseBody()
+  const patch = parseUnitConfigPatch(form)
+  const result = await updateUnitConfig(c.env, 'agent', agentId, patch)
+  if (!result.ok) {
+    const status = result.error === 'not_found' ? 404 : 400
+    return c.json({ error: result.error }, status)
+  }
+  return c.redirect('/agents')
+})
+
+// POST /squads/:id/config — patch work-unit knobs on a squad (owner/admin only).
+dashboardApp.post('/squads/:id/config', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const squadId = c.req.param('id')
+  if (!squadId || squadId.length > 64) return c.json({ error: 'invalid_squad_id' }, 400)
+
+  const form = await c.req.parseBody()
+  const patch = parseUnitConfigPatch(form)
+  const result = await updateUnitConfig(c.env, 'squad', squadId, patch)
+  if (!result.ok) {
+    const status = result.error === 'not_found' ? 404 : 400
+    return c.json({ error: result.error }, status)
+  }
+  return c.redirect(`/squads/${squadId}`)
+})
+
 // GET /squads/:id — squad board: charter, agents, tasks by lane.
 dashboardApp.get('/squads/:id', async (c) => {
   const squadId = c.req.param('id')
@@ -312,11 +348,12 @@ dashboardApp.get('/squads/:id', async (c) => {
   ])
   const auth = c.get('auth')
   const canAddAgent = await canOnSquad(c.env, auth, squadId)
+  const canManage = isAdmin(auth)
   return c.html(
     shell(
       c.env.BRAND,
       `Squad · ${squad.name}`,
-      squadBoardBody(squad, agents.results ?? [], tasks.results ?? [], canAddAgent),
+      squadBoardBody(squad, agents.results ?? [], tasks.results ?? [], canAddAgent, canManage),
     ),
   )
 })
@@ -545,6 +582,35 @@ dashboardApp.post('/squads/:id/agents', async (c) => {
   }
   return c.redirect(`/squads/${squadId}`)
 })
+
+// ── config patch helper ───────────────────────────────────────────────────────
+//
+// Parse a multipart form body into a UnitConfigPatch. Only fields present in the
+// form are included in the patch — absent fields are not sent to updateUnitConfig,
+// so they remain untouched in D1. Budget cap arrives as a dollar amount from the
+// form (input type=number, step=0.01) and is converted to integer cents here.
+
+function parseUnitConfigPatch(form: Record<string, string | File>): UnitConfigPatch {
+  const patch: UnitConfigPatch = {}
+  if ('okr' in form)           patch.okr = typeof form.okr === 'string' ? form.okr.trim() || null : null
+  if ('kpi_target' in form)    patch.kpi_target = typeof form.kpi_target === 'string' ? form.kpi_target.trim() || null : null
+  if ('effort' in form)        patch.effort = form.effort
+  if ('autonomy' in form)      patch.autonomy = form.autonomy
+  if ('budget_window' in form) patch.budget_window = form.budget_window
+  if ('budget_cap_dollars' in form) {
+    const raw = typeof form.budget_cap_dollars === 'string' ? form.budget_cap_dollars.trim() : ''
+    if (raw === '' || raw === '0') {
+      patch.budget_cap_cents = null
+    } else {
+      const dollars = parseFloat(raw)
+      // Clamp to integer cents; reject NaN/negative
+      patch.budget_cap_cents = Number.isFinite(dollars) && dollars >= 0
+        ? Math.round(dollars * 100)
+        : null
+    }
+  }
+  return patch
+}
 
 // ── data (squad board page helpers) ─────────────────────────────────────────
 
@@ -1031,6 +1097,129 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         .tile-stats { display: none; }
         .recent-tasks th:nth-child(n+4), .recent-tasks td:nth-child(n+4) { display: none; }
       }
+
+      /* ── Unit cards (#26) — employee-performance panel style ─────────────────── */
+      /* The card grid wraps at 1280px: each card is min 300px, max 380px.
+         No horizontal overflow: the knobs form uses a max-width constraint and
+         budget/window inputs never overflow at 1280px. */
+      .unit-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+        gap: 16px;
+        margin: 16px 0;
+      }
+      .unit-card {
+        background: var(--surface); border: 1px solid var(--border);
+        border-radius: var(--radius); overflow: hidden;
+        display: flex; flex-direction: column;
+      }
+      .unit-card-head {
+        display: flex; align-items: center; gap: 10px;
+        padding: 14px 16px 10px;
+        border-bottom: 1px solid var(--border);
+      }
+      .unit-av {
+        width: 36px; height: 36px; border-radius: 10px;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 15px; font-weight: 700; color: #fff;
+        text-shadow: 0 1px 2px rgba(0,0,0,.3); flex-shrink: 0;
+      }
+      .unit-head-body { flex: 1; min-width: 0; }
+      .unit-name {
+        font-weight: 700; font-size: 14px;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .unit-role { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; margin-top: 2px; }
+      .unit-status-dot {
+        width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+        margin-left: auto;
+      }
+      .unit-status-dot--active { background: var(--ok); }
+      .unit-status-dot--paused { background: var(--dim); }
+
+      .unit-body { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; flex: 1; }
+
+      .unit-field { display: flex; flex-direction: column; gap: 3px; }
+      .unit-field-label {
+        font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); font-weight: 600;
+      }
+      .unit-field-value { font-size: 13px; color: var(--text); line-height: 1.4; }
+      .unit-field-value.muted { color: var(--muted); }
+      .unit-field-value.dim { color: var(--dim); font-style: italic; }
+
+      /* KPI progress bar */
+      .kpi-bar-wrap {
+        height: 4px; background: color-mix(in srgb, var(--text) 10%, var(--surface));
+        border-radius: 2px; overflow: hidden; margin-top: 4px;
+      }
+      .kpi-bar-fill { height: 100%; border-radius: 2px; transition: width .3s; background: var(--ok); }
+
+      /* Effort dial — rendered as a badge with accent colour per level */
+      .effort-badge {
+        display: inline-block; font-size: 11px; font-weight: 700;
+        padding: 2px 8px; border-radius: 999px; border: 1px solid;
+      }
+      .effort-low      { color: var(--ok);     border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
+      .effort-standard { color: var(--accent2); border-color: color-mix(in srgb, var(--accent2) 40%, var(--border)); }
+      .effort-high     { color: var(--accent);  border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+      .effort-sprint   { color: var(--danger);  border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); }
+
+      /* Autonomy badge */
+      .autonomy-badge {
+        display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+        border: 1px solid var(--border); color: var(--muted);
+      }
+      .autonomy-execute_with_approval { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+      .autonomy-execute { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
+
+      /* Budget row */
+      .unit-budget { display: flex; align-items: baseline; gap: 6px; font-size: 13px; }
+      .unit-budget .cap { font-weight: 600; color: var(--text); }
+      .unit-budget .window { color: var(--dim); font-size: 11px; }
+
+      /* Task title chips */
+      .unit-task-chip {
+        font-size: 12px; padding: 3px 8px;
+        background: var(--surface2); border: 1px solid var(--border);
+        border-radius: 6px; color: var(--text);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        max-width: 100%;
+        display: block;
+      }
+
+      /* Knobs form — collapsible via <details> */
+      .unit-knobs { border-top: 1px solid var(--border); }
+      .unit-knobs summary {
+        padding: 8px 16px; font-size: 12px; color: var(--muted); cursor: pointer;
+        user-select: none; list-style: none; display: flex; align-items: center; gap: 6px;
+      }
+      .unit-knobs summary::-webkit-details-marker { display: none; }
+      .unit-knobs summary::before { content: '▸'; font-size: 10px; }
+      .unit-knobs[open] summary::before { content: '▾'; }
+      .unit-knobs-body {
+        padding: 12px 16px 14px;
+        display: flex; flex-direction: column; gap: 10px;
+      }
+      .knob-row { display: flex; flex-direction: column; gap: 4px; }
+      .knob-label { font-size: 11px; color: var(--muted); }
+      .knob-input, .knob-select {
+        font: inherit; font-size: 13px; padding: 6px 8px; border-radius: 7px;
+        border: 1px solid var(--border); background: var(--bg); color: var(--text);
+        width: 100%;
+      }
+      .knob-row-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .knob-submit { margin-top: 4px; }
+
+      /* Squad rollup header on /squads/:id */
+      .squad-unit-header {
+        background: var(--surface); border: 1px solid var(--border);
+        border-radius: var(--radius); padding: 16px 18px; margin-bottom: 18px;
+      }
+      .squad-unit-header h2 { margin: 0 0 12px; }
+      .squad-unit-meta { display: flex; flex-wrap: wrap; gap: 10px 20px; font-size: 13px; }
+      .squad-unit-meta .suf-item { display: flex; flex-direction: column; gap: 2px; }
+      .squad-unit-meta .suf-label { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
+
       /* ── /approvals page styles (kept here to avoid duplication) ── */
     </style>
   </head>
@@ -1373,7 +1562,7 @@ function obsQueueScript(): string {
 }
 
 
-function squadBoardBody(squad: Squad, agents: Agent[], tasks: Task[], canAddAgent: boolean) {
+function squadBoardBody(squad: Squad, agents: Agent[], tasks: Task[], canAddAgent: boolean, canManage = false) {
   const byLane = new Map<Task['status'], Task[]>()
   for (const t of tasks) {
     const list = byLane.get(t.status) ?? []
@@ -1401,9 +1590,53 @@ function squadBoardBody(squad: Squad, agents: Agent[], tasks: Task[], canAddAgen
           <button type="submit" class="btn">Add agent</button>
         </form>`
     : html``
+
+  // Squad rollup header — shows the squad's own OKR/KPI/effort/autonomy if set,
+  // plus a compact Configure form for admins (fractal: same knob shape as agents).
+  const squadKnobs = canManage
+    ? raw(unitKnobsForm(squad.id, 'squad', {
+        okr: squad.okr,
+        kpi_target: squad.kpi_target,
+        effort: squad.effort,
+        autonomy: squad.autonomy,
+        budget_cap_cents: squad.budget_cap_cents,
+        budget_window: squad.budget_window,
+      }))
+    : html``
+
+  const kpiPct = Math.min(Math.max(squad.kpi_progress ?? 0, 0), 100)
+  const squadHeader = html`
+    <div class="squad-unit-header">
+      <h2 style="margin-top:0;margin-bottom:10px">${squad.name} · work unit</h2>
+      <div class="squad-unit-meta">
+        <div class="suf-item">
+          <span class="suf-label">Objective</span>
+          <span style="font-size:13px">${squad.okr ? squad.okr : raw('<em style="color:var(--dim)">not set</em>')}</span>
+        </div>
+        <div class="suf-item">
+          <span class="suf-label">KPI</span>
+          <span style="font-size:13px">${squad.kpi_target ? squad.kpi_target : raw('<em style="color:var(--dim)">not set</em>')} · ${kpiPct}%</span>
+        </div>
+        <div class="suf-item">
+          <span class="suf-label">Effort</span>
+          ${raw(effortBadge(squad.effort))}
+        </div>
+        <div class="suf-item">
+          <span class="suf-label">Autonomy</span>
+          ${raw(autonomyBadge(squad.autonomy))}
+        </div>
+        <div class="suf-item">
+          <span class="suf-label">Budget</span>
+          ${raw(budgetLine(squad.budget_cap_cents, squad.budget_window))}
+        </div>
+      </div>
+      ${squadKnobs}
+    </div>`
+
   return html`
     <p class="crumbs"><a href="/">Overview</a> / ${squad.name}</p>
     <h1>${squad.name}</h1>
+    ${squadHeader}
     ${
       squad.charter
         ? html`<div class="card"><h2 style="margin-top:0">Charter</h2><div class="charter">${squad.charter}</div></div>`
@@ -2401,11 +2634,189 @@ function membersAdminScript(scopeOptions: string) {
     </script>`)
 }
 
+// ── Unit card renderer (#26) ───────────────────────────────────────────────────
+//
+// unitCard(u, canManage) — the employee-performance panel. One card per agent.
+// Layout: avatar + name/role header, then body sections: Objective (OKR), KPI +
+// progress bar, Effort dial, Autonomy badge, Burn placeholder (—, #15), Budget cap
+// + window, Current Work (most-recent in_progress/open task), Next Approval (task
+// in 'review'). Followed by a collapsed Knobs form for admins.
+//
+// All strings are manually escaped (escHtml/escAttr) because the card is built
+// as a raw string for injection into a grid container via raw().
+//
+// Burn ($X/hr) is rendered '—' until issue #15 (cost metering) lands. The budget
+// cap + window fields give the concrete configured number in the interim.
+
+function agentGradientLocal(name: string): string {
+  // Same deterministic gradient as observatory — kept local to avoid a cross-module
+  // import of agentGradient from observatory.ts (that module pulls in loadObservatory).
+  let h = 0
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360
+  const h2 = (h + 48) % 360
+  return `linear-gradient(135deg,hsl(${h} 58% 46%),hsl(${h2} 62% 38%))`
+}
+
+function effortBadge(effort: string): string {
+  const label = effort.charAt(0).toUpperCase() + effort.slice(1)
+  return `<span class="effort-badge effort-${escAttr(effort)}">${escHtml(label)}</span>`
+}
+
+function autonomyBadge(autonomy: string): string {
+  const label = autonomy.replace(/_/g, ' ')
+  return `<span class="autonomy-badge autonomy-${escAttr(autonomy)}">${escHtml(label)}</span>`
+}
+
+function budgetLine(capCents: number | null, window: string): string {
+  if (capCents === null) return `<span class="unit-field-value dim">no cap set</span>`
+  const dollars = (capCents / 100).toFixed(2)
+  return (
+    `<div class="unit-budget">` +
+    `<span class="cap">$${escHtml(dollars)}</span>` +
+    `<span class="window">/ ${escHtml(window)}</span>` +
+    `</div>`
+  )
+}
+
+function unitKnobsForm(id: string, kind: 'agent' | 'squad', u: {
+  okr: string | null
+  kpi_target: string | null
+  effort: string
+  autonomy: string
+  budget_cap_cents: number | null
+  budget_window: string
+}): string {
+  const action = kind === 'agent' ? `/agents/${escAttr(id)}/config` : `/squads/${escAttr(id)}/config`
+  const budgetDollars = u.budget_cap_cents !== null ? (u.budget_cap_cents / 100).toFixed(2) : ''
+  const effortOptions = ['low', 'standard', 'high', 'sprint']
+    .map((e) => `<option value="${e}"${u.effort === e ? ' selected' : ''}>${e}</option>`)
+    .join('')
+  const autonomyOptions = ['suggest', 'draft', 'execute', 'execute_with_approval']
+    .map((a) => `<option value="${a}"${u.autonomy === a ? ' selected' : ''}>${a.replace(/_/g, ' ')}</option>`)
+    .join('')
+  const windowOptions = ['day', 'week']
+    .map((w) => `<option value="${w}"${u.budget_window === w ? ' selected' : ''}>${w}</option>`)
+    .join('')
+
+  return (
+    `<details class="unit-knobs">` +
+    `<summary>Configure</summary>` +
+    `<form class="unit-knobs-body" method="post" action="${action}" autocomplete="off">` +
+    `<div class="knob-row"><label class="knob-label">Objective (OKR)` +
+    `<input class="knob-input" name="okr" value="${escAttr(u.okr ?? '')}" placeholder="Drive Q3 pipeline to 50 leads" /></label></div>` +
+    `<div class="knob-row"><label class="knob-label">KPI target` +
+    `<input class="knob-input" name="kpi_target" value="${escAttr(u.kpi_target ?? '')}" placeholder="50 leads" /></label></div>` +
+    `<div class="knob-row-2col">` +
+    `<div class="knob-row"><label class="knob-label">Effort` +
+    `<select class="knob-select" name="effort">${effortOptions}</select></label></div>` +
+    `<div class="knob-row"><label class="knob-label">Autonomy` +
+    `<select class="knob-select" name="autonomy">${autonomyOptions}</select></label></div>` +
+    `</div>` +
+    `<div class="knob-row-2col">` +
+    `<div class="knob-row"><label class="knob-label">Budget cap ($)` +
+    `<input class="knob-input" name="budget_cap_dollars" type="number" min="0" step="0.01" ` +
+    `value="${escAttr(budgetDollars)}" placeholder="50.00" /></label></div>` +
+    `<div class="knob-row"><label class="knob-label">Window` +
+    `<select class="knob-select" name="budget_window">${windowOptions}</select></label></div>` +
+    `</div>` +
+    `<button type="submit" class="btn sm knob-submit">Save</button>` +
+    `</form>` +
+    `</details>`
+  )
+}
+
+/** Render one agent as an employee-performance unit card. */
+function unitCard(u: AgentAdminRow, canManage: boolean): string {
+  const grad = agentGradientLocal(u.name)
+  const initial = escHtml(u.name.slice(0, 1).toUpperCase())
+  const dotClass = u.status === 'active' ? 'active' : 'paused'
+
+  // OKR / Objective
+  const okrLine = u.okr
+    ? `<span class="unit-field-value">${escHtml(u.okr)}</span>`
+    : `<span class="unit-field-value dim">not set</span>`
+
+  // KPI + progress bar
+  const kpiLabel = u.kpi_target ? escHtml(u.kpi_target) : '<em style="color:var(--dim)">not set</em>'
+  const kpiPct = Math.min(Math.max(u.kpi_progress ?? 0, 0), 100)
+  const kpiSection =
+    `<div class="unit-field">` +
+    `<span class="unit-field-label">KPI</span>` +
+    `<span class="unit-field-value">${kpiLabel}</span>` +
+    `<div class="kpi-bar-wrap"><div class="kpi-bar-fill" style="width:${kpiPct}%"></div></div>` +
+    `<span style="font-size:11px;color:var(--dim)">${kpiPct}%</span>` +
+    `</div>`
+
+  // Burn — placeholder until #15 (cost metering lands)
+  const burnLine = `<span class="unit-field-value dim" title="Per-task cost metering lands in #15">—</span>`
+
+  // Budget cap + window (the concrete configured number)
+  const budgetSection =
+    `<div class="unit-field">` +
+    `<span class="unit-field-label">Budget</span>` +
+    budgetLine(u.budget_cap_cents, u.budget_window) +
+    `</div>`
+
+  // Current work
+  const currentWork = u.current_task_title
+    ? `<span class="unit-task-chip" title="${escAttr(u.current_task_title)}">${escHtml(u.current_task_title)}</span>`
+    : `<span class="unit-field-value dim">idle</span>`
+
+  // Next approval
+  const nextApproval = u.review_task_title
+    ? `<span class="unit-task-chip" title="${escAttr(u.review_task_title)}">${escHtml(u.review_task_title)}</span>`
+    : `<span class="unit-field-value dim">—</span>`
+
+  // Admin action buttons (pause/resume + delete) keep the existing pattern
+  const actions = canManage
+    ? `<div style="display:flex;gap:6px;padding:10px 16px;border-top:1px solid var(--border)">` +
+      `<button class="btn sm ag-status-btn" data-agent="${escAttr(u.id)}" data-status="${escAttr(u.status)}" ` +
+      `data-name="${escAttr(u.name)}">${u.status === 'active' ? 'Pause' : 'Resume'}</button>` +
+      `<button class="btn sm ag-delete-btn" style="background:transparent;color:#e5534b;border-color:#e5534b" ` +
+      `data-agent="${escAttr(u.id)}" data-name="${escAttr(u.name)}">Delete</button>` +
+      `<span class="ag-row-status" data-agent-row="${escAttr(u.id)}" style="font-size:12px;color:var(--dim);margin-left:4px"></span>` +
+      `</div>`
+    : ''
+
+  const knobsForm = canManage ? unitKnobsForm(u.id, 'agent', u) : ''
+
+  return (
+    `<div class="unit-card" data-agent-row="${escAttr(u.id)}">` +
+    // Header
+    `<div class="unit-card-head">` +
+    `<div class="unit-av" style="background:${grad}">${initial}</div>` +
+    `<div class="unit-head-body">` +
+    `<a href="/agents/${escAttr(u.id)}" class="unit-name">${escHtml(u.name)}</a>` +
+    `<div class="unit-role">${escHtml(u.role)}</div>` +
+    `</div>` +
+    `<span class="unit-status-dot unit-status-dot--${dotClass}" title="${escAttr(u.status)}"></span>` +
+    `</div>` +
+    // Body
+    `<div class="unit-body">` +
+    `<div class="unit-field"><span class="unit-field-label">Objective</span>${okrLine}</div>` +
+    kpiSection +
+    `<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">` +
+    `<div class="unit-field"><span class="unit-field-label">Effort</span><div>${effortBadge(u.effort)}</div></div>` +
+    `<div class="unit-field"><span class="unit-field-label">Autonomy</span><div>${autonomyBadge(u.autonomy)}</div></div>` +
+    `</div>` +
+    `<div class="unit-field"><span class="unit-field-label">Burn</span>${burnLine}</div>` +
+    budgetSection +
+    `<div class="unit-field"><span class="unit-field-label">Current Work</span>${currentWork}</div>` +
+    `<div class="unit-field"><span class="unit-field-label">Next Approval</span>${nextApproval}</div>` +
+    `</div>` +
+    // Knobs + admin actions
+    knobsForm +
+    actions +
+    `</div>`
+  )
+}
+
 // ── /agents view ─────────────────────────────────────────────────────────────
 //
 // agentsBody — renders the full agent management page:
-//   - Table of all agents (name, slug, squad/dept, role, model, status, tasks)
-//   - Per-row Pause/Resume + Delete buttons (owner/admin only, JS fetch)
+//   - Grid of unit cards (employee-performance panel, one per agent)
+//   - Per-card Pause/Resume + Delete buttons (owner/admin only, JS fetch)
+//   - Per-card Knobs form (admin only): set OKR/KPI/effort/autonomy/budget
 //   - Add-agent form (name, slug, role, model, squad picker)
 //
 // All user-supplied strings are escaped via escHtml/escAttr.
@@ -2434,41 +2845,10 @@ function agentsBody(
         })
         .join('')
 
-  // Agent table rows.
-  const tableBody = agents.length === 0
-    ? `<tr><td colspan="${canManage ? 8 : 7}" class="empty" style="padding:18px 14px">No agents yet. Add one below.</td></tr>`
-    : agents.map((a) => {
-        const statusBadge = a.status === 'active'
-          ? `<span class="dot active" title="active"></span> active`
-          : `<span class="dot paused" title="paused"></span> paused`
-        const taskSummary = a.task_count > 0
-          ? `${escHtml(String(a.task_count))} (${escHtml(String(a.open_count))} open)`
-          : '—'
-        const actionBtns = canManage
-          ? `<td class="actions">` +
-            `<button class="btn sm ag-status-btn" data-agent="${escAttr(a.id)}" data-status="${escAttr(a.status)}" ` +
-            `data-name="${escAttr(a.name)}" style="margin-right:4px">` +
-            (a.status === 'active' ? 'Pause' : 'Resume') +
-            `</button>` +
-            `<button class="btn sm ag-delete-btn" ` +
-            `style="background:transparent;color:#e5534b;border-color:#e5534b" ` +
-            `data-agent="${escAttr(a.id)}" data-name="${escAttr(a.name)}">Delete</button>` +
-            `<span class="ag-row-status" style="font-size:12px;color:var(--dim);margin-left:8px"></span>` +
-            `</td>`
-          : ''
-        return (
-          `<tr data-agent-row="${escAttr(a.id)}">` +
-          `<td><a href="/agents/${escAttr(a.id)}">${escHtml(a.name)}</a></td>` +
-          `<td><code style="font-size:12px">${escHtml(a.slug)}</code></td>` +
-          `<td>${escHtml(a.squad_name)}${a.dept_name ? ` <span class="ag-dept">${escHtml(a.dept_name)}</span>` : ''}</td>` +
-          `<td>${escHtml(a.role)}</td>` +
-          `<td><code style="font-size:12px;word-break:break-all">${escHtml(a.model)}</code></td>` +
-          `<td>${statusBadge}</td>` +
-          `<td style="font-variant-numeric:tabular-nums">${taskSummary}</td>` +
-          actionBtns +
-          `</tr>`
-        )
-      }).join('')
+  // Unit card grid — employee performance panels, one per agent.
+  const cardsHtml = agents.length === 0
+    ? `<div class="card"><p class="empty">No agents yet. Add one below.</p></div>`
+    : `<div class="unit-grid">${agents.map((a) => unitCard(a, canManage)).join('')}</div>`
 
   const addForm = canManage && squadOptions.length > 0
     ? `<div class="card" style="margin-top:20px">
@@ -2496,28 +2876,15 @@ function agentsBody(
       ? `<div class="card" style="margin-top:20px"><p class="empty">Create a squad first, then add agents.</p></div>`
       : ''
 
-  const tableHtml =
-    `<div class="card" style="padding:0;overflow-x:auto">
-      <table class="grid">
-        <thead><tr>
-          <th>Name</th><th>Slug</th><th>Squad</th><th>Role</th>
-          <th>Model</th><th>Status</th><th>Tasks</th>
-          ${canManage ? '<th>Actions</th>' : ''}
-        </tr></thead>
-        <tbody>${tableBody}</tbody>
-      </table>
-    </div>`
-
   return html`
     <p class="crumbs"><a href="/">Overview</a> / Agents</p>
     <h1>Agents</h1>
     <p class="empty" style="margin-top:0;max-width:680px">
-      All agents across this pot. Owner / admin can pause, resume, or delete agents and add new ones.</p>
-    <style>
-      .ag-dept { font-size: 11px; color: var(--dim); margin-left: 4px; }
-    </style>
+      All agents across this pot. Each card shows the unit's objective, KPI, effort level, autonomy, and current work.
+      ${canManage ? raw('Use the Configure panel on each card to set OKR, effort, autonomy, and budget.') : html``}
+    </p>
     ${raw(errorBanner)}
-    ${raw(tableHtml)}
+    ${raw(cardsHtml)}
     ${raw(addForm)}
     ${canManage && agents.length > 0 ? agentsScript() : html``}`
 }
