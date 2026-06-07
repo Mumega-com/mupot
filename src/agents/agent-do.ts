@@ -16,6 +16,7 @@ import { createMemory } from '../memory'
 import { createModel } from '../model'
 import { createTask } from '../tasks/service'
 import { runTaskExecution, resolveTaskId } from './execute'
+import { runGoalCycle } from './loop'
 
 // Wake request body — who/why woke this agent, and how hard it may work.
 //
@@ -148,6 +149,32 @@ export class AgentDO extends DurableObject<Env> {
     }
 
     const cycle = this.getCycles() + 1
+
+    // GOAL-SEEKING PATH: when the agent has an OKR, run the goal cycle instead
+    // of (not alongside) the generic cortex propose-cycle. Goal-less agents
+    // continue to run the original cortex propose-cycle below unchanged.
+    if (agent.okr && agent.okr.trim().length > 0) {
+      try {
+        const goalResult = await runGoalCycle(this.env, agent)
+        const decided = goalResult.decided + (goalResult.error ? `: ${goalResult.error}` : '')
+        this.recordCycle(cycle, `goal: ${decided}`)
+        await this.ensureAlarm()
+        return {
+          ok: goalResult.ok,
+          agent_id: agent.id,
+          cycle,
+          decided: `goal:${decided}`,
+          actions: goalResult.spawned,
+          error: goalResult.error,
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'goal_cycle_failed'
+        this.recordCycle(cycle, `goal-error: ${msg}`)
+        return { ok: false, agent_id: agent.id, cycle, decided: '', actions: 0, error: msg }
+      }
+    }
+
+    // GENERIC CORTEX PATH: agent has no goal — propose tasks from context (unchanged).
     const memory = createMemory(this.env)
 
     try {
