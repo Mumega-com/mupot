@@ -53,6 +53,8 @@ import type { MintedToken, PublicMemberToken } from '../members/service'
 
 // Connect-config builders (pure) for the Connect card.
 import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
+import { loadApprovals, resultPreview } from './approvals'
+import type { ApprovalItem } from './approvals'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
@@ -129,6 +131,15 @@ dashboardApp.get('/', async (c) => {
 dashboardApp.get('/send', async (c) => {
   const agents = await loadActiveAgentsWithSquad(c.env)
   return c.html(shell(c.env.BRAND, 'Send a task', sendPageBody(agents)))
+})
+
+// GET /approvals — the gate queue (#6). Tasks in 'review' the caller may
+// verdict (owner/admin: all; others: gate_grants visibility == authority).
+// Buttons POST to the existing RBAC'd /api/tasks/:id/verdict — this page adds
+// no new write path.
+dashboardApp.get('/approvals', async (c) => {
+  const items = await loadApprovals(c.env, c.get('auth'))
+  return c.html(shell(c.env.BRAND, 'Approvals', approvalsBody(items)))
 })
 
 // GET /squads/:id — squad board: charter, agents, tasks by lane.
@@ -720,6 +731,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       <nav>
         <a href="/">Overview</a>
         <a href="/send">Send a task</a>
+        <a href="/approvals">Approvals</a>
         <a href="/members">Members</a>
         <a href="/admin/divisions">Divisions</a>
         <a href="/setup">Setup</a>
@@ -1160,6 +1172,115 @@ function sendScript() {
           } finally {
             btn.disabled = false;
           }
+        });
+      })();
+    </script>`)
+}
+
+// ── approvals (gate queue) ────────────────────────────────────────────────────
+
+function approvalsBody(items: ApprovalItem[]) {
+  const cards = items
+    .map((t) => {
+      const preview = resultPreview(t)
+      return `
+        <div class="card approval" data-task="${escAttr(t.id)}">
+          <div class="appr-head">
+            <div>
+              <div class="appr-title">${escHtml(t.title)}</div>
+              <div class="appr-meta">
+                ${escHtml(t.agent_name ?? t.assignee_agent_id ?? 'unassigned')}
+                · ${escHtml(t.squad_name ?? t.squad_id)}
+                ${t.gate_owner ? `· <span class="gate-chip">${escHtml(t.gate_owner)}</span>` : ''}
+              </div>
+            </div>
+            <div class="appr-when">${escHtml((t.completed_at ?? t.created_at).slice(0, 16).replace('T', ' '))}</div>
+          </div>
+          <div class="appr-body">${escHtml(t.body)}</div>
+          ${preview ? `<div class="appr-result"><div class="lbl">Result</div>${escHtml(preview)}</div>` : ''}
+          <div class="appr-actions">
+            <input type="text" class="appr-note" placeholder="note (optional; required to reject)" />
+            <button class="btn appr-approve">Approve</button>
+            <button class="btn btn-reject appr-reject">Reject</button>
+            <span class="appr-status"></span>
+          </div>
+        </div>`
+    })
+    .join('')
+
+  return html`
+    <p class="crumbs"><a href="/">Overview</a> / Approvals</p>
+    <h1>Approvals</h1>
+    <p class="empty" style="margin-top:0;max-width:640px">
+      Work waiting at your gate. Approve to release it; reject sends it back with your note.
+    </p>
+    <style>
+      .appr-head { display: flex; justify-content: space-between; gap: 12px; }
+      .appr-title { font-weight: 600; }
+      .appr-meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+      .appr-when { color: var(--dim); font-size: 12px; white-space: nowrap; }
+      .gate-chip {
+        border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
+        font-size: 12px; color: var(--accent);
+      }
+      .appr-body { margin-top: 10px; font-size: 14px; white-space: pre-wrap; }
+      .appr-result {
+        margin-top: 10px; background: var(--surface2); border: 1px solid var(--border);
+        border-radius: 8px; padding: 10px 12px; font-size: 13px; white-space: pre-wrap;
+      }
+      .appr-result .lbl { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
+      .appr-actions { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+      .appr-note {
+        flex: 1; min-width: 200px; font: inherit; font-size: 13px; padding: 7px 10px;
+        border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
+      }
+      .btn-reject { background: transparent; color: var(--warn); border: 1px solid var(--warn); }
+      .appr-status { font-size: 13px; color: var(--dim); }
+      .approval.decided { opacity: .55; }
+    </style>
+    ${items.length ? raw(cards) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
+    ${items.length ? approvalsScript() : html``}`
+}
+
+function approvalsScript() {
+  // Same-origin, credentialed. POSTs to the existing RBAC'd verdict endpoint;
+  // CSRF Origin check + no-store come from the dashboard middleware.
+  return raw(`
+    <script>
+      (function () {
+        document.querySelectorAll('.approval').forEach(function (card) {
+          var id = card.getAttribute('data-task');
+          var note = card.querySelector('.appr-note');
+          var status = card.querySelector('.appr-status');
+          function decide(verdict) {
+            if (verdict === 'rejected' && !note.value.trim()) {
+              status.textContent = 'a note is required to reject';
+              note.focus();
+              return;
+            }
+            card.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+            status.textContent = '…';
+            fetch('/api/tasks/' + encodeURIComponent(id) + '/verdict', {
+              method: 'POST', credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ verdict: verdict, note: note.value.trim() || undefined })
+            }).then(function (res) {
+              return res.json().then(function (data) { return { ok: res.ok, data: data }; });
+            }).then(function (r) {
+              if (r.ok) {
+                status.textContent = verdict === 'approved' ? 'approved ✓' : 'rejected ✗';
+                card.classList.add('decided');
+              } else {
+                status.textContent = (r.data && r.data.error) || 'failed';
+                card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+              }
+            }).catch(function () {
+              status.textContent = 'network error — try again';
+              card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+            });
+          }
+          card.querySelector('.appr-approve').addEventListener('click', function () { decide('approved'); });
+          card.querySelector('.appr-reject').addEventListener('click', function () { decide('rejected'); });
         });
       })();
     </script>`)
