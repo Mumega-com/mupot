@@ -335,8 +335,9 @@ interface AssigneeResult {
 }
 
 // An assignee must be an existing agent whose squad matches the task's squad.
-// undefined/null -> unassigned.
-async function resolveAssignee(
+// undefined/null -> unassigned. Exported for unit tests of the dispatch boundary
+// (dispatch requires a valid in-squad assignee; a cross-squad id is rejected).
+export async function resolveAssignee(
   env: Env,
   raw: unknown,
   squadId: string,
