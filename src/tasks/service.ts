@@ -4,11 +4,53 @@
 // (dashboard/API, MCP, IM, channels, agents) should call createTask() instead of
 // hand-writing rows. `task.created` is a post-persistence notification event.
 
-import type { Env, Task, BusEvent } from '../types'
+import type { Env, Task, TaskVerdict, BusEvent } from '../types'
 import { createBus } from '../bus'
 
-type TaskStatus = Task['status']
+export type TaskStatus = Task['status']
 type TaskActor = NonNullable<BusEvent['actor']>
+
+// ── Status transition matrix ────────────────────────────────────────────────
+//
+// Allowed transitions (enforced by assertValidTransition; invalid → 400):
+//   open        → in_progress
+//   in_progress → review | blocked | done
+//   review      → approved | rejected   (ONLY via verdict endpoint, not PATCH)
+//   approved    → done
+//   rejected    → in_progress | done
+//   blocked     → in_progress           (retry after unblocking)
+//   done        → (terminal — no outbound transitions)
+//
+// The PATCH route additionally guards that review→approved|rejected never flows
+// through a plain PATCH (those transitions require the verdict endpoint).
+// The verdict endpoint enforces: task must be in 'review', transition goes to
+// approved|rejected only.
+
+const TRANSITIONS: Readonly<Partial<Record<TaskStatus, readonly TaskStatus[]>>> = {
+  open: ['in_progress'],
+  in_progress: ['review', 'blocked', 'done'],
+  review: ['approved', 'rejected'],
+  approved: ['done'],
+  rejected: ['in_progress', 'done'],
+  blocked: ['in_progress'],
+  // 'done' has no outbound transitions (terminal)
+}
+
+/**
+ * Validate a from→to transition. Returns an error object when invalid, or null
+ * when valid. The verdict endpoint pre-checks its own preconditions before calling
+ * this; this function is the single source of truth for what moves are legal.
+ */
+export function checkTransition(
+  from: TaskStatus,
+  to: TaskStatus,
+): { error: 'invalid_transition'; from: TaskStatus; to: TaskStatus } | null {
+  const allowed = TRANSITIONS[from]
+  if (!allowed || !(allowed as readonly string[]).includes(to)) {
+    return { error: 'invalid_transition', from, to }
+  }
+  return null
+}
 
 export interface CreateTaskInput {
   squad_id: string
@@ -16,6 +58,7 @@ export interface CreateTaskInput {
   body?: string
   status?: TaskStatus
   assignee_agent_id?: string | null
+  gate_owner?: string | null
 }
 
 export interface CreateTaskOptions {
@@ -146,6 +189,7 @@ export async function createTask(
     github_issue_url: null,
     result: null,
     completed_at: null,
+    gate_owner: input.gate_owner ?? null,
     created_at: now,
     updated_at: now,
   }
@@ -153,8 +197,8 @@ export async function createTask(
   task.github_issue_url = await mirrorTaskCreate(env, task)
 
   await env.DB.prepare(
-    `INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       task.id,
@@ -166,6 +210,7 @@ export async function createTask(
       task.github_issue_url,
       task.result,
       task.completed_at,
+      task.gate_owner,
       task.created_at,
       task.updated_at,
     )
@@ -173,4 +218,80 @@ export async function createTask(
 
   await emitTaskEvent(env, 'task.created', task, options.actor)
   return task
+}
+
+// ── Verdict write ─────────────────────────────────────────────────────────────
+//
+// Appends a verdict row and flips the task status in the same D1 batch so the
+// receipt and the state change are atomic (either both land or neither does).
+// Called exclusively from POST /api/tasks/:id/verdict after all pre-checks pass.
+
+export interface WriteVerdictInput {
+  task: Task
+  verdict: 'approved' | 'rejected'
+  note: string | null
+  decidedBy: string // principal id (memberId or userId)
+}
+
+export async function writeVerdict(
+  env: Env,
+  input: WriteVerdictInput,
+  actor?: TaskActor,
+): Promise<{ task: Task; verdict: TaskVerdict }> {
+  const now = new Date().toISOString()
+  const verdictRow: TaskVerdict = {
+    id: crypto.randomUUID(),
+    task_id: input.task.id,
+    verdict: input.verdict,
+    note: input.note,
+    decided_by: input.decidedBy,
+    decided_at: now,
+  }
+
+  const newStatus: TaskStatus = input.verdict === 'approved' ? 'approved' : 'rejected'
+  const updatedTask: Task = {
+    ...input.task,
+    status: newStatus,
+    updated_at: now,
+  }
+
+  // D1 batch: insert verdict + update task status atomically.
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      verdictRow.id,
+      verdictRow.task_id,
+      verdictRow.verdict,
+      verdictRow.note,
+      verdictRow.decided_by,
+      verdictRow.decided_at,
+    ),
+    env.DB.prepare(
+      `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?`,
+    ).bind(newStatus, now, input.task.id),
+  ])
+
+  // Emit verdict event (non-fatal — the verdict is already written).
+  try {
+    await createBus(env).emit({
+      type: 'task.verdict',
+      tenant: env.TENANT_SLUG,
+      squad_id: input.task.squad_id,
+      agent_id: input.task.assignee_agent_id ?? undefined,
+      actor,
+      payload: {
+        task_id: input.task.id,
+        verdict: input.verdict,
+        new_status: newStatus,
+        decided_by: input.decidedBy,
+      },
+      ts: now,
+    })
+  } catch {
+    // Bus emit failures must never roll back an already-written verdict.
+  }
+
+  return { task: updatedTask, verdict: verdictRow }
 }
