@@ -137,7 +137,10 @@ export async function createAgent(
   // role/model fall back to the schema defaults when omitted.
   const role = input.role === undefined ? 'member' : input.role
   if (!isNonEmptyString(role)) return { ok: false, error: 'invalid_role' }
-  const model = input.model === undefined ? '@cf/meta/llama-3.3' : input.model
+  // '@cf/meta/llama-3.3' is NOT a valid Workers AI model id — the real one is
+  // '@cf/meta/llama-3.3-70b-instruct-fp8-fast'. Using the wrong id yields a 5007
+  // error from Workers AI on first wake. (Bug introduced in initial scaffold, fixed here.)
+  const model = input.model === undefined ? '@cf/meta/llama-3.3-70b-instruct-fp8-fast' : input.model
   if (!isNonEmptyString(model)) return { ok: false, error: 'invalid_model' }
   const status: AgentStatus = input.status === undefined ? 'active' : (input.status as AgentStatus)
   if (!isAgentStatus(status)) return { ok: false, error: 'invalid_status' }
@@ -175,4 +178,53 @@ export async function createAgent(
     throw err
   }
   return { ok: true, value: agent }
+}
+
+// ── agent mutations ───────────────────────────────────────────────────────────
+
+export type SetStatusResult = { ok: true } | { ok: false; error: 'not_found' }
+
+/**
+ * Pause or resume an agent by updating its status column.
+ * Returns ok:true on success or ok:false + 'not_found' when the id does not exist.
+ */
+export async function setAgentStatus(
+  env: Env,
+  agentId: string,
+  status: AgentStatus,
+): Promise<SetStatusResult> {
+  const result = await env.DB.prepare('UPDATE agents SET status = ? WHERE id = ?')
+    .bind(status, agentId)
+    .run()
+  if (!result.meta.changes) return { ok: false, error: 'not_found' }
+  return { ok: true }
+}
+
+export type DeleteAgentResult = { ok: true } | { ok: false; error: 'not_found' }
+
+/**
+ * Delete an agent row and null out any task assignee references.
+ *
+ * The AgentDO is lazy — it is only provisioned on first wake. A deleted agent
+ * id is simply never woken again, so no explicit DurableObject teardown is
+ * required (the stub exists but no calls reach it once the row is gone from D1).
+ *
+ * We also null out tasks.assignee_agent_id where it references this agent to
+ * avoid orphaned assignee ids that would otherwise render as '—' in the UI.
+ */
+export async function deleteAgent(
+  env: Env,
+  agentId: string,
+): Promise<DeleteAgentResult> {
+  // Null out task assignee references first to keep FK-cleanliness (D1 does not
+  // enforce FKs by default, but orphan assignee ids produce confusing UI gaps).
+  await env.DB.prepare('UPDATE tasks SET assignee_agent_id = NULL WHERE assignee_agent_id = ?')
+    .bind(agentId)
+    .run()
+
+  const result = await env.DB.prepare('DELETE FROM agents WHERE id = ?')
+    .bind(agentId)
+    .run()
+  if (!result.meta.changes) return { ok: false, error: 'not_found' }
+  return { ok: true }
 }
