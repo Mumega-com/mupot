@@ -62,6 +62,8 @@ import type { ObservatoryData, SwimlaneBar, AgentStat } from './observatory'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
+import { loadFleet, wakeFleetAgent, requestFleetControl, busConfigured } from './fleet'
+import type { FleetRow } from './fleet'
 import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
 
@@ -150,6 +152,54 @@ dashboardApp.get('/send', async (c) => {
 dashboardApp.get('/approvals', async (c) => {
   const items = await loadApprovals(c.env, c.get('auth'))
   return c.html(shell(c.env.BRAND, 'Approvals', approvalsBody(items)))
+})
+
+// ── fleet (company-wide agent roster over the SOS bus) ───────────────────────
+// GET /fleet — see every company agent: liveness, last active, role/label.
+// Window only: data comes from the bus bridge; the pot runs none of them.
+dashboardApp.get('/fleet', async (c) => {
+  if (!busConfigured(c.env)) {
+    return c.html(shell(c.env.BRAND, 'Fleet', fleetUnconfiguredBody()))
+  }
+  let rows: FleetRow[] = []
+  let error: string | null = null
+  try {
+    rows = await loadFleet(c.env, Date.now())
+  } catch (e) {
+    error = e instanceof Error ? e.message : 'bus_unreachable'
+  }
+  return c.html(shell(c.env.BRAND, 'Fleet', fleetBody(rows, error)))
+})
+
+// POST /fleet/wake — direct bus ping to the agent (any signed-in member).
+dashboardApp.post('/fleet/wake', async (c) => {
+  if (!busConfigured(c.env)) return c.json({ error: 'bus_not_configured' }, 503)
+  const body = (await c.req.json().catch(() => ({}))) as { agent?: unknown }
+  const agent = typeof body.agent === 'string' ? body.agent.trim() : ''
+  if (!agent || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(agent)) {
+    return c.json({ error: 'invalid_agent' }, 400)
+  }
+  const ok = await wakeFleetAgent(c.env, agent, c.get('auth').email ?? 'member')
+  return c.json(ok ? { ok: true } : { error: 'bus_send_failed' }, ok ? 200 : 502)
+})
+
+// POST /fleet/control — pause/resume/deactivate/delete REQUEST (owner/admin
+// only). Never a direct host action: emits a receipted control-request on the
+// bus to the operations agent, which executes server-side and acks.
+dashboardApp.post('/fleet/control', async (c) => {
+  if (!busConfigured(c.env)) return c.json({ error: 'bus_not_configured' }, 503)
+  const auth = c.get('auth')
+  if (auth.role !== 'owner' && auth.role !== 'admin') {
+    return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  }
+  const body = (await c.req.json().catch(() => ({}))) as { agent?: unknown; action?: unknown }
+  const agent = typeof body.agent === 'string' ? body.agent.trim() : ''
+  const action = typeof body.action === 'string' ? body.action : ''
+  if (!agent || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(agent)) {
+    return c.json({ error: 'invalid_agent' }, 400)
+  }
+  const r = await requestFleetControl(c.env, agent, action, auth.email ?? 'admin')
+  return c.json(r, r.ok ? 200 : 400)
 })
 
 // GET /squads/:id — squad board: charter, agents, tasks by lane.
@@ -903,6 +953,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         <a href="/">Overview</a>
         <a href="/send">Send</a>
         <a href="/approvals">Approvals</a>
+        <a href="/fleet">Fleet</a>
         <a href="/members">Members</a>
         <a href="/admin/divisions">Divisions</a>
         <a href="/setup">Setup</a>
@@ -1589,6 +1640,102 @@ function approvalsScript() {
           }
           card.querySelector('.appr-approve').addEventListener('click', function () { decide('approved'); });
           card.querySelector('.appr-reject').addEventListener('click', function () { decide('rejected'); });
+        });
+      })();
+    </script>`)
+}
+
+// ── fleet views ───────────────────────────────────────────────────────────────
+
+function fleetUnconfiguredBody() {
+  return html`
+    <p class="crumbs"><a href="/">Overview</a> / Fleet</p>
+    <h1>Fleet</h1>
+    <div class="card"><p class="empty">This pot has no bus connection configured
+    (BUS_TOKEN). The fleet view lives on HQ pots wired to the company bus.</p></div>`
+}
+
+function fleetBody(rows: FleetRow[], error: string | null) {
+  const dot = (l: string) =>
+    l === 'active' ? 'var(--ok)' : l === 'idle' ? 'var(--warn)' : l === 'dead' ? '#e5534b' : 'var(--dim)'
+  const tr = (r: FleetRow) => `
+    <tr data-agent="${escAttr(r.agent)}" class="fl-row ${r.liveness === 'dead' || r.liveness === 'never' ? 'fl-dim' : ''}">
+      <td><span class="fl-dot" style="background:${dot(r.liveness)}"></span>${escHtml(r.agent)}</td>
+      <td class="fl-label">${escHtml(r.label || '—')}</td>
+      <td><span class="fl-badge fl-${escAttr(r.liveness)}">${escHtml(r.liveness)}</span></td>
+      <td>${escHtml(r.last_seen_human)}</td>
+      <td class="fl-num">${r.messages}</td>
+      <td>${r.active_token ? 'yes' : '<span style="color:var(--dim)">no</span>'}</td>
+      <td class="fl-actions">
+        <button class="fl-btn" data-act="wake">Run</button>
+        <button class="fl-btn" data-act="pause">Pause</button>
+        <button class="fl-btn" data-act="deactivate">Deactivate</button>
+        <button class="fl-btn fl-danger" data-act="delete">Delete</button>
+        <span class="fl-status"></span>
+      </td>
+    </tr>`
+  const table = rows.length
+    ? `<table class="fl-table">
+        <thead><tr><th>Agent</th><th>Role / label</th><th>Status</th><th>Last active</th><th>Msgs</th><th>Token</th><th>Actions</th></tr></thead>
+        <tbody>${rows.map(tr).join('')}</tbody>
+      </table>`
+    : '<p class="empty">No agents visible on the bus.</p>'
+  return html`
+    <p class="crumbs"><a href="/">Overview</a> / Fleet</p>
+    <h1>Fleet</h1>
+    <p class="empty" style="margin-top:0;max-width:680px">
+      Every company agent on the bus. <b>Run</b> pings the agent directly.
+      Pause / Deactivate / Delete send a receipted control request to operations
+      (owner/admin only) — nothing here kills a process silently.</p>
+    <style>
+      .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+      .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;
+        letter-spacing: .5px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+      .fl-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+      .fl-dim td { opacity: .6; }
+      .fl-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; }
+      .fl-label { color: var(--muted); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .fl-badge { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
+      .fl-active { color: var(--ok); } .fl-idle { color: var(--warn); }
+      .fl-dead { color: #e5534b; } .fl-never { color: var(--dim); }
+      .fl-num { text-align: right; font-variant-numeric: tabular-nums; }
+      .fl-actions { white-space: nowrap; }
+      .fl-btn { font: inherit; font-size: 12px; padding: 3px 9px; margin-right: 4px; border-radius: 6px;
+        border: 1px solid var(--border); background: var(--surface2); color: var(--text); cursor: pointer; }
+      .fl-btn:hover { border-color: var(--accent); }
+      .fl-danger { color: #e5534b; }
+      .fl-status { font-size: 12px; color: var(--dim); margin-left: 6px; }
+    </style>
+    ${error ? html`<div class="card"><p class="empty">Bus error: ${error} — showing nothing rather than stale data.</p></div>` : raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}
+    ${rows.length ? fleetScript() : html``}`
+}
+
+function fleetScript() {
+  return raw(`
+    <script>
+      (function () {
+        document.querySelectorAll('.fl-row').forEach(function (row) {
+          var agent = row.getAttribute('data-agent');
+          var status = row.querySelector('.fl-status');
+          row.querySelectorAll('.fl-btn').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+              var act = btn.getAttribute('data-act');
+              if (act === 'delete' && !confirm('Request DELETE of agent "' + agent + '"? Operations executes and acks.')) return;
+              var url = act === 'wake' ? '/dashboard/fleet/wake' : '/dashboard/fleet/control';
+              var payload = act === 'wake' ? { agent: agent } : { agent: agent, action: act };
+              btn.disabled = true; status.textContent = '…';
+              fetch(url, { method: 'POST', credentials: 'same-origin',
+                headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) })
+                .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+                .then(function (r) {
+                  status.textContent = r.ok
+                    ? (act === 'wake' ? 'pinged ✓' : 'requested ✓ (' + (r.d.request_id || '').slice(0, 8) + ')')
+                    : (r.d.error || 'failed');
+                  btn.disabled = false;
+                })
+                .catch(function () { status.textContent = 'network error'; btn.disabled = false; });
+            });
+          });
         });
       })();
     </script>`)

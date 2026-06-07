@@ -25,9 +25,12 @@ export interface Env {
   TENANT_SLUG: string
   BRAND: string
   OAUTH_PROVIDER: 'google' | 'telegram'
+  // company-fleet window (HQ pots only): SOS bus bridge REST
+  BUS_URL?: string
   // secrets (present at runtime only)
   OAUTH_CLIENT_ID?: string
   OAUTH_CLIENT_SECRET?: string
+  BUS_TOKEN?: string
   GITHUB_TOKEN?: string
   AI_GATEWAY_TOKEN?: string
   IM_WEBHOOK_SECRET?: string // shared secret for the IM webhook (Telegram secret_token)
