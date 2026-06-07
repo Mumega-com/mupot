@@ -222,8 +222,30 @@ export async function createTask(
 
 // ── Verdict write ─────────────────────────────────────────────────────────────
 //
-// Appends a verdict row and flips the task status in the same D1 batch so the
-// receipt and the state change are atomic (either both land or neither does).
+// Flips the task status and appends a verdict receipt.
+//
+// K5 TOCTOU fix — chosen pattern: conditional UPDATE first, then INSERT verdict.
+//
+// Why not a D1 batch?
+// D1 batch is transactional (all-or-neither) but it cannot *conditionally* abort
+// in the middle: `UPDATE ... WHERE status='review'` inside a batch with 0 changes
+// still "succeeds" as a statement — D1 cannot abort-on-zero-changes mid-batch.
+// So we cannot use batch for the race-guard.
+//
+// Chosen pattern:
+//   1. Standalone `UPDATE tasks SET status=? WHERE id=? AND status='review'`
+//      → check meta.changes. If 0 → 409 (race lost: another verdict already
+//      flipped the row). The 409 is surfaced to the caller.
+//   2. On changes=1: INSERT task_verdicts.
+//      If INSERT fails (DB error), the status flip stands but the audit receipt
+//      is missing. We emit a `task.verdict_orphan` bus event and re-throw so the
+//      caller gets a 500. Operators can reconcile from the bus event log.
+//      This is a narrow window (step-2 failure after step-1 success) that requires
+//      a DB write error on a simple INSERT — acceptable given D1's durability model.
+//
+// Multiple verdicts per task ARE legitimate (rework loop: rejected → in_progress →
+// review → approved). No UNIQUE constraint on task_verdicts(task_id).
+//
 // Called exclusively from POST /api/tasks/:id/verdict after all pre-checks pass.
 
 export interface WriteVerdictInput {
@@ -233,12 +255,37 @@ export interface WriteVerdictInput {
   decidedBy: string // principal id (memberId or userId)
 }
 
+export class VerdictRaceError extends Error {
+  constructor(taskId: string) {
+    super(`verdict_race: task ${taskId} is no longer in review (concurrent verdict won)`)
+    this.name = 'VerdictRaceError'
+  }
+}
+
 export async function writeVerdict(
   env: Env,
   input: WriteVerdictInput,
   actor?: TaskActor,
 ): Promise<{ task: Task; verdict: TaskVerdict }> {
   const now = new Date().toISOString()
+  const newStatus: TaskStatus = input.verdict === 'approved' ? 'approved' : 'rejected'
+
+  // K5 step 1: conditional UPDATE — only succeeds while the task is still 'review'.
+  // meta.changes === 0 means another concurrent verdict already won the race.
+  const flipResult = await env.DB.prepare(
+    `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review'`,
+  )
+    .bind(newStatus, now, input.task.id)
+    .run()
+
+  if (!flipResult.meta.changes || flipResult.meta.changes === 0) {
+    // Race lost: the task is no longer in 'review'. Surface as a typed error so
+    // the route can return 409 with a clear message.
+    throw new VerdictRaceError(input.task.id)
+  }
+
+  // K5 step 2: status flipped — now insert the receipt. If this fails, the status
+  // flip stands but we have no receipt. Emit an orphan event for reconciliation.
   const verdictRow: TaskVerdict = {
     id: crypto.randomUUID(),
     task_id: input.task.id,
@@ -248,30 +295,50 @@ export async function writeVerdict(
     decided_at: now,
   }
 
-  const newStatus: TaskStatus = input.verdict === 'approved' ? 'approved' : 'rejected'
+  try {
+    await env.DB.prepare(
+      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        verdictRow.id,
+        verdictRow.task_id,
+        verdictRow.verdict,
+        verdictRow.note,
+        verdictRow.decided_by,
+        verdictRow.decided_at,
+      )
+      .run()
+  } catch (insertErr) {
+    // Status is already flipped — there is no safe rollback path in D1 without a
+    // transaction API. Emit an orphan event so operators can detect and reconcile.
+    try {
+      await createBus(env).emit({
+        type: 'task.verdict_orphan' as 'task.verdict', // narrow cast for bus compat
+        tenant: env.TENANT_SLUG,
+        squad_id: input.task.squad_id,
+        agent_id: input.task.assignee_agent_id ?? undefined,
+        actor,
+        payload: {
+          task_id: input.task.id,
+          verdict: input.verdict,
+          new_status: newStatus,
+          decided_by: input.decidedBy,
+          error: insertErr instanceof Error ? insertErr.message : 'insert_failed',
+        },
+        ts: now,
+      })
+    } catch {
+      // bus emit is best-effort
+    }
+    throw insertErr // propagate so the route returns 500
+  }
+
   const updatedTask: Task = {
     ...input.task,
     status: newStatus,
     updated_at: now,
   }
-
-  // D1 batch: insert verdict + update task status atomically.
-  await env.DB.batch([
-    env.DB.prepare(
-      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-    ).bind(
-      verdictRow.id,
-      verdictRow.task_id,
-      verdictRow.verdict,
-      verdictRow.note,
-      verdictRow.decided_by,
-      verdictRow.decided_at,
-    ),
-    env.DB.prepare(
-      `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?`,
-    ).bind(newStatus, now, input.task.id),
-  ])
 
   // Emit verdict event (non-fatal — the verdict is already written).
   try {

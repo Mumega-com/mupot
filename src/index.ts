@@ -14,7 +14,7 @@ import { ROUTES } from './types'
 import { authApp } from './auth'
 import { orgApp } from './org'
 import { agentsApp } from './agents'
-import { tasksApp } from './tasks'
+import { tasksApp, gatesApp } from './tasks'
 import { busApp } from './bus'
 import { membersApp } from './members'
 import { mcpApp } from './mcp'
@@ -35,6 +35,8 @@ app.route(ROUTES.auth, authApp)
 app.route(ROUTES.org, orgApp)
 app.route(ROUTES.agents, agentsApp)
 app.route(ROUTES.tasks, tasksApp)
+// K3: gate grant management (owner/admin only)
+app.route('/api/gates', gatesApp)
 app.route(ROUTES.bus, busApp)
 app.route(ROUTES.members, membersApp)
 app.route(ROUTES.mcp, mcpApp)
