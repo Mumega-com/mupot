@@ -75,6 +75,7 @@ describe('createTask', () => {
       'https://github.com/acme/widgets/issues/7',
       null, // result — unset on create
       null, // completed_at — unset on create
+      null, // gate_owner — unset on create
       task.created_at,
       task.updated_at,
     ])
