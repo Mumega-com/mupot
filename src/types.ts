@@ -79,6 +79,8 @@ export interface Task {
   status: 'open' | 'in_progress' | 'blocked' | 'done'
   assignee_agent_id: string | null
   github_issue_url: string | null // tasks are mirrored to GitHub (source of truth)
+  result: string | null // execution output (model answer) or a short failure note
+  completed_at: string | null // ISO; set when execution finishes (done OR blocked)
   created_at: string
   updated_at: string
 }
@@ -137,6 +139,8 @@ export type BusEventType =
   | 'lead.new'
   | 'task.created'
   | 'task.updated'
+  | 'task.completed' // execution succeeded — result persisted on the task row
+  | 'task.blocked' // execution failed (model error/timeout) — short note persisted
   | 'agent.wake'
   | 'squad.dispatch'
 

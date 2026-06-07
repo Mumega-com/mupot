@@ -73,6 +73,8 @@ describe('createTask', () => {
       'open',
       null,
       'https://github.com/acme/widgets/issues/7',
+      null, // result — unset on create
+      null, // completed_at — unset on create
       task.created_at,
       task.updated_at,
     ])
@@ -108,6 +110,8 @@ describe('mirrorTaskUpdate', () => {
       status: 'open',
       assignee_agent_id: null,
       github_issue_url: null,
+      result: null,
+      completed_at: null,
       created_at: '2026-06-06T00:00:00.000Z',
       updated_at: '2026-06-06T00:00:00.000Z',
     })

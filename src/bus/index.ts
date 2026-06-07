@@ -16,6 +16,8 @@ const EVENT_TYPES: readonly BusEventType[] = [
   'lead.new',
   'task.created',
   'task.updated',
+  'task.completed',
+  'task.blocked',
   'agent.wake',
   'squad.dispatch',
 ]

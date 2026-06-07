@@ -122,6 +122,15 @@ dashboardApp.get('/', async (c) => {
   )
 })
 
+// GET /send — the "Send a task" page. The last mile: a person writes a task,
+// picks one of their agents, submits, and watches it get done. The form POSTs to
+// the RBAC-gated /api/tasks (dispatch:true) and polls GET /api/tasks/:id. All auth
+// + CSRF + no-store/Referrer-Policy come from the dashboard middleware above.
+dashboardApp.get('/send', async (c) => {
+  const agents = await loadActiveAgentsWithSquad(c.env)
+  return c.html(shell(c.env.BRAND, 'Send a task', sendPageBody(agents)))
+})
+
 // GET /squads/:id — squad board: charter, agents, tasks by lane.
 dashboardApp.get('/squads/:id', async (c) => {
   const squadId = c.req.param('id')
@@ -136,7 +145,7 @@ dashboardApp.get('/squads/:id', async (c) => {
       .bind(squadId)
       .all<Agent>(),
     c.env.DB.prepare(
-      `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, created_at, updated_at
+      `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
          FROM tasks WHERE squad_id = ? ORDER BY updated_at DESC`,
     )
       .bind(squadId)
@@ -545,6 +554,25 @@ async function loadSquads(env: Env): Promise<Squad[]> {
   return rows.results ?? []
 }
 
+/** Active agents joined to their squad name — the /send agent picker. One pot is
+ *  small, so a single join is fine. Returns a flat list with a squad label. */
+interface PickerAgent {
+  id: string
+  name: string
+  role: string
+  squad_id: string
+  squad_name: string
+}
+async function loadActiveAgentsWithSquad(env: Env): Promise<PickerAgent[]> {
+  const rows = await env.DB.prepare(
+    `SELECT a.id AS id, a.name AS name, a.role AS role, a.squad_id AS squad_id, s.name AS squad_name
+       FROM agents a JOIN squads s ON s.id = a.squad_id
+      WHERE a.status = 'active'
+      ORDER BY s.name ASC, a.name ASC`,
+  ).all<PickerAgent>()
+  return rows.results ?? []
+}
+
 /** id → display name for department & squad scopes, so grants read as names not uuids. */
 async function loadScopeNames(env: Env): Promise<Map<string, string>> {
   const [depts, squads] = await Promise.all([loadDepartments(env), loadSquads(env)])
@@ -691,6 +719,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       <div class="brand"><b>${brand}</b> · substrate console</div>
       <nav>
         <a href="/">Overview</a>
+        <a href="/send">Send a task</a>
         <a href="/members">Members</a>
         <a href="/admin/divisions">Divisions</a>
         <a href="/setup">Setup</a>
@@ -801,6 +830,7 @@ function overviewBody(
     <h1>${brand} org</h1>
     <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role} ·
       ${tree.length} department${tree.length === 1 ? '' : 's'}</p>
+    <p style="margin:4px 0 16px"><a class="btn" href="/send" style="display:inline-block;text-decoration:none">Send a task →</a></p>
     ${connectCard(slug, origin)}
     ${raw(
       tree
@@ -970,6 +1000,169 @@ function agentConsoleBody(agent: Agent, squad: Squad | null, canWake: boolean) {
       ${canWake ? html`` : html`<p class="empty">You can view this agent but only admin/owner may wake it.</p>`}
     </div>
     ${wakeScript}`
+}
+
+// ── /send — write a task, pick an agent, watch it get done ─────────────────────
+//
+// The picker is a flat <select> of active agents, each option labelled with its
+// squad. The option VALUE carries "agentId|squadId" so the client can post both
+// without a second lookup. The client posts to /api/tasks (dispatch:true) and then
+// polls /api/tasks/:id every 2s (cap 120s), rendering sent → working → done.
+function sendPageBody(agents: PickerAgent[]) {
+  const hasAgents = agents.length > 0
+  const options = agents
+    .map(
+      (a) =>
+        `<option value="${escAttr(`${a.id}|${a.squad_id}`)}">${escHtml(a.name)} — ${escHtml(a.role)} · ${escHtml(a.squad_name)}</option>`,
+    )
+    .join('')
+
+  const form = hasAgents
+    ? html`
+        <div class="card">
+          <label class="block">
+            <span class="lbl">Your agents</span>
+            <select id="send-agent">${raw(options)}</select>
+          </label>
+          <label class="block" style="margin-top:14px">
+            <span class="lbl">What do you need done?</span>
+            <textarea id="send-body" rows="6" placeholder="Describe the task in your own words…"></textarea>
+          </label>
+          <div style="margin-top:14px">
+            <button id="send-btn" class="btn">Send a task</button>
+            <span id="send-hint" style="margin-left:12px;color:var(--dim);font-size:13px;">your agent does it and the result lands here</span>
+          </div>
+          <div id="send-status" class="status-line"></div>
+          <div id="send-result" class="result-box" hidden></div>
+        </div>`
+    : html`<div class="card"><p class="empty">No active agents yet. Add one from a
+        <a href="/">squad board</a> first, then come back to send it a task.</p></div>`
+
+  return html`
+    <p class="crumbs"><a href="/">Overview</a> / Send a task</p>
+    <h1>Send a task</h1>
+    <p class="empty" style="margin-top:0;max-width:640px">
+      Write what you need in plain language and pick one of your agents. It does the
+      work and the result appears below — no jargon, no setup.</p>
+    <style>
+      .block { display: flex; flex-direction: column; gap: 6px; }
+      .block .lbl { font-size: 13px; color: var(--muted); }
+      #send-agent, #send-body {
+        font: inherit; padding: 9px 11px; border-radius: 8px; border: 1px solid var(--border);
+        background: var(--bg); color: var(--text); width: 100%; resize: vertical;
+      }
+      .result-box {
+        margin-top: 16px; background: var(--surface2); border: 1px solid var(--border);
+        border-radius: 8px; padding: 14px 16px; font-size: 14px; white-space: pre-wrap;
+        line-height: 1.55;
+      }
+      .result-box .done-meta { color: var(--dim); font-size: 12px; margin-bottom: 10px; }
+    </style>
+    ${form}
+    ${hasAgents ? sendScript() : html``}`
+}
+
+function sendScript() {
+  // Vanilla, same-origin, credentialed. Title = first ~60 chars of the body. Polls
+  // GET /api/tasks/:id every 2s up to 120s. CSRF + no-store handled by middleware.
+  return raw(`
+    <script>
+      (function () {
+        var btn = document.getElementById('send-btn');
+        var bodyEl = document.getElementById('send-body');
+        var agentEl = document.getElementById('send-agent');
+        var status = document.getElementById('send-status');
+        var resultBox = document.getElementById('send-result');
+        if (!btn) return;
+
+        var POLL_MS = 2000;
+        var MAX_MS = 120000;
+
+        function esc(s) {
+          return String(s).replace(/[&<>"']/g, function (c) {
+            return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c];
+          });
+        }
+        function fmtSecs(ms) { return Math.max(0, Math.round(ms / 1000)) + 's'; }
+
+        async function poll(taskId, startedAt) {
+          var deadline = startedAt + MAX_MS;
+          while (Date.now() < deadline) {
+            await new Promise(function (r) { setTimeout(r, POLL_MS); });
+            var res;
+            try {
+              res = await fetch('/api/tasks/' + encodeURIComponent(taskId), {
+                method: 'GET', credentials: 'same-origin', headers: { accept: 'application/json' }
+              });
+            } catch (e) { continue; }
+            if (!res.ok) { continue; }
+            var data = await res.json();
+            var t = data.task;
+            if (!t) { continue; }
+            if (t.status === 'in_progress') { status.textContent = 'Working… (' + fmtSecs(Date.now() - startedAt) + ')'; continue; }
+            if (t.status === 'done' || t.status === 'blocked') {
+              return render(t, startedAt);
+            }
+            // still 'open' (dispatch in flight) — keep waiting.
+            status.textContent = 'Sent. Waiting for your agent to pick it up…';
+          }
+          status.textContent = 'Still working after ' + fmtSecs(MAX_MS) + '. It will keep running — refresh later to see the result.';
+        }
+
+        function render(t, startedAt) {
+          var took = fmtSecs(Date.now() - startedAt);
+          if (t.status === 'done') {
+            status.textContent = 'Done in ' + took + '.';
+          } else {
+            status.textContent = 'Blocked — see the note below.';
+          }
+          var when = t.completed_at || '';
+          var who = t.assignee_agent_id || 'your agent';
+          var meta = (t.status === 'done' ? 'Completed by ' : 'Blocked · ') + esc(who) + (when ? ' at ' + esc(when) : '');
+          resultBox.hidden = false;
+          resultBox.innerHTML = '<div class="done-meta">' + meta + '</div>' + esc(t.result || '(no output)');
+        }
+
+        btn.addEventListener('click', async function () {
+          var text = (bodyEl.value || '').trim();
+          if (!text) { status.textContent = 'Write what you need first.'; return; }
+          var val = agentEl.value || '';
+          var parts = val.split('|');
+          var agentId = parts[0];
+          var squadId = parts[1];
+          if (!agentId || !squadId) { status.textContent = 'Pick an agent first.'; return; }
+
+          btn.disabled = true;
+          resultBox.hidden = true;
+          resultBox.innerHTML = '';
+          status.textContent = 'Sending…';
+          var title = text.slice(0, 60);
+          try {
+            var res = await fetch('/api/tasks', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              credentials: 'same-origin',
+              body: JSON.stringify({ squad_id: squadId, title: title, body: text, assignee_agent_id: agentId, dispatch: true })
+            });
+            if (res.status === 403) { status.textContent = 'You do not have permission to task that agent.'; return; }
+            if (!res.ok) {
+              var err = await res.json().catch(function () { return {}; });
+              status.textContent = 'Could not send (' + res.status + ')' + (err.error ? ': ' + err.error : '') + '.';
+              return;
+            }
+            var created = await res.json();
+            var taskId = created.task && created.task.id;
+            if (!taskId) { status.textContent = 'Sent, but no task id came back.'; return; }
+            status.textContent = 'Sent. Waiting for your agent to pick it up…';
+            await poll(taskId, Date.now());
+          } catch (e) {
+            status.textContent = 'Send failed — try again.';
+          } finally {
+            btn.disabled = false;
+          }
+        });
+      })();
+    </script>`)
 }
 
 // ── members + divisions views ─────────────────────────────────────────────────

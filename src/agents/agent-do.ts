@@ -11,12 +11,18 @@
 // so a stale/cross-tenant id can never drive a cycle.
 
 import { DurableObject } from 'cloudflare:workers'
-import type { Env, Agent, MemoryPort, ModelMessage } from '../types'
+import type { Env, Agent, Task, MemoryPort, ModelMessage } from '../types'
 import { createMemory } from '../memory'
 import { createModel } from '../model'
 import { createTask } from '../tasks/service'
+import { runTaskExecution, resolveTaskId } from './execute'
 
 // Wake request body — who/why woke this agent, and how hard it may work.
+//
+// Two shapes arrive at /wake: a plain WakeInput (from the agents API and the
+// squad coordinator) and a full BusEvent (from the Queue consumer, which posts
+// the raw event). We read the structured fields we know from either: a top-level
+// `task_id` (execute mode) OR `payload.task_id` (when woken by a task.* event).
 interface WakeInput {
   reason?: string
   squad_id?: string
@@ -24,6 +30,13 @@ interface WakeInput {
   context?: string
   // safety cap on actions emitted in one cycle
   maxActions?: number
+  // EXECUTE MODE: when set, the cycle DOES this task (load → think → persist the
+  // result) instead of proposing new tasks. The task must belong to this agent's
+  // squad (fail-closed) or the cycle is a no-op.
+  task_id?: string
+  // present only when the body is a raw BusEvent (Queue path). We read task_id
+  // out of it so a task.* dispatch can drive execute mode.
+  payload?: unknown
 }
 
 interface WakeResult {
@@ -33,6 +46,9 @@ interface WakeResult {
   decided: string
   actions: number
   error?: string
+  // execute-mode telemetry (present only when the wake carried a task_id)
+  task_id?: string
+  task_status?: Task['status']
 }
 
 interface AgentStatus {
@@ -108,6 +124,27 @@ export class AgentDO extends DurableObject<Env> {
     }
     if (agent.status !== 'active') {
       return { ok: false, agent_id: agent.id, cycle: this.getCycles(), decided: '', actions: 0, error: 'agent_paused' }
+    }
+
+    // EXECUTE MODE — a wake carrying a task_id (top-level or in a BusEvent payload)
+    // means "do this task", not "propose tasks". Delegate to the execution core
+    // (testable, DO-independent) and record the cycle. The standard cortex cycle
+    // never runs alongside execution.
+    const taskId = resolveTaskId(input)
+    if (taskId) {
+      const cycle = this.getCycles() + 1
+      const r = await runTaskExecution(this.env, agent, taskId)
+      this.recordCycle(cycle, `execute: ${r.decided || r.error || 'no-op'}`)
+      return {
+        ok: r.ok,
+        agent_id: agent.id,
+        cycle,
+        decided: r.decided,
+        actions: r.task_status === 'done' ? 1 : 0,
+        error: r.error,
+        task_id: r.task_id,
+        task_status: r.task_status,
+      }
     }
 
     const cycle = this.getCycles() + 1

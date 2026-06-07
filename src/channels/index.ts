@@ -438,6 +438,14 @@ function summarizeAgentEvent(event: BusEvent): string {
       return readField(event.payload, 'title')
         ? `updated task "${readField(event.payload, 'title')}".`
         : 'updated a task.'
+    case 'task.completed':
+      return readField(event.payload, 'title')
+        ? `completed task "${readField(event.payload, 'title')}".`
+        : 'completed a task.'
+    case 'task.blocked':
+      return readField(event.payload, 'title')
+        ? `got blocked on task "${readField(event.payload, 'title')}".`
+        : 'got blocked on a task.'
     case 'agent.wake':
       return 'woke up and is working.'
     case 'squad.dispatch':

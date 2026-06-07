@@ -6,6 +6,7 @@
 // caller cannot poke an arbitrary DO id from another tenant.
 
 import { Hono } from 'hono'
+import { csrf } from 'hono/csrf'
 import type { Env, Agent, AuthContext, BusEvent } from '../types'
 import { requireAuth } from '../auth'
 import { createBus } from '../bus'
@@ -35,6 +36,12 @@ export const agentsApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContex
 // Every route requires auth AND tenant scope — the same explicit guard org/tasks
 // enforce. Don't rely on per-tenant D1 alone as the boundary (P1 fix): a session
 // minted for another tenant must never wake/read this tenant's agents.
+// CSRF: /wake is a cookie-authenticated state-changing POST (the dashboard agent
+// console drives it). SameSite=Lax must not be the only defense — add an explicit
+// Origin/Host check. GET /status (read-only) is unaffected (csrf guards only unsafe
+// methods). Adversarial finding 2026-06-06.
+agentsApp.use('*', csrf())
+
 agentsApp.use('*', requireAuth, async (c, next) => {
   if (c.get('auth').tenant !== c.env.TENANT_SLUG) {
     return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
@@ -56,6 +63,12 @@ async function loadAgent(env: Env, agentId: string): Promise<Agent | null> {
 // POST /:agentId/wake — drive one cortex cycle. Mutating → requireAuth + role gate.
 // org 'member' may read status but only 'admin'/'owner' may wake an agent (it
 // spends model + bus quota and emits org-mutating actions).
+//
+// DELIBERATE ASYMMETRY (adv-gate 2026-06-07, Kasra): members CANNOT free-wake an
+// agent here, but CAN trigger a model spend via POST /api/tasks {dispatch:true} —
+// that is the product ("a member sends their agent a task"). Execute-mode wakes are
+// bounded (opaque-result, no action parsing, no wake loops) which is why the cheaper
+// gate is acceptable there and not here. Rate-limit before self-serve tenants.
 agentsApp.post('/:agentId/wake', async (c) => {
   const auth = c.get('auth')
 
@@ -77,8 +90,9 @@ agentsApp.post('/:agentId/wake', async (c) => {
 
   if (agent.status !== 'active') return c.json({ error: 'agent_paused' }, 409)
 
-  // optional wake body (reason/context/maxActions)
-  type WakeBody = { reason?: string; context?: string; maxActions?: number }
+  // optional wake body (reason/context/maxActions/task_id). A task_id puts the
+  // cortex cycle into EXECUTE MODE (do that task) instead of proposing tasks.
+  type WakeBody = { reason?: string; context?: string; maxActions?: number; task_id?: string }
   const body = await c.req.json<WakeBody>().catch((): WakeBody => ({}))
 
   // Announce the wake on the bus (observability + lets the consumer react), then
@@ -103,6 +117,7 @@ agentsApp.post('/:agentId/wake', async (c) => {
       squad_id: agent.squad_id,
       context: body.context,
       maxActions: body.maxActions,
+      task_id: body.task_id,
     }),
   })
   const result = await res.json<unknown>()

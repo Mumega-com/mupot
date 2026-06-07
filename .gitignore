@@ -7,3 +7,4 @@ dist/
 # never commit secrets — this is a public template
 .env
 *.token
+wrangler.digid.toml
