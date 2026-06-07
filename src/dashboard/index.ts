@@ -30,7 +30,6 @@ import type {
   Department,
   Squad,
   Agent,
-  Membership,
   Task,
   Member,
   CapabilityGrant,
@@ -55,6 +54,11 @@ import type { MintedToken, PublicMemberToken } from '../members/service'
 import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
 import { loadApprovals, resultPreview } from './approvals'
 import type { ApprovalItem } from './approvals'
+import {
+  loadObservatory,
+  agentGradient,
+} from './observatory'
+import type { ObservatoryData, SwimlaneBar, AgentStat } from './observatory'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
@@ -108,7 +112,8 @@ dashboardApp.route('/setup', wizardApp)
 
 // ── routes ───────────────────────────────────────────────────────────────────
 
-// GET / — org overview: departments → squads → agents.
+// GET / — Observatory home (#13): swimlane of agents over time, operator queue,
+// recent tasks. First-run onboarding redirect is retained at the top.
 dashboardApp.get('/', async (c) => {
   const auth = c.get('auth')
   // First-run nudge: an owner landing on an un-onboarded pot goes straight to the
@@ -117,10 +122,15 @@ dashboardApp.get('/', async (c) => {
   if ((auth.role === 'owner' || hasOrgOwnerCapability(auth)) && !(await isOnboardingComplete(c.env))) {
     return c.redirect('/setup')
   }
-  const tree = await loadTree(c.env)
-  const origin = new URL(c.req.url).origin
+  // Load observatory data (agents, stats, bars, ticks, recentTasks) and the
+  // operator queue (existing loadApprovals, same RBAC as the /approvals page)
+  // in parallel — they hit independent D1 tables.
+  const [obsData, approvals] = await Promise.all([
+    loadObservatory(c.env),
+    loadApprovals(c.env, auth),
+  ])
   return c.html(
-    shell(c.env.BRAND, 'Overview', overviewBody(c.env.BRAND, c.env.TENANT_SLUG, origin, tree, auth)),
+    shell(c.env.BRAND, 'Overview', observatoryBody(c.env.BRAND, obsData, approvals, auth)),
   )
 })
 
@@ -398,53 +408,7 @@ dashboardApp.post('/squads/:id/agents', async (c) => {
   return c.redirect(`/squads/${squadId}`)
 })
 
-// ── data ───────────────────────────────────────────────────────────────────
-
-interface AgentNode extends Agent {
-  memberships: Membership[]
-}
-interface SquadNode extends Squad {
-  agents: AgentNode[]
-}
-interface DepartmentNode extends Department {
-  squads: SquadNode[]
-}
-
-/** Assemble the full org chart in-memory from four scans (one small pot). */
-async function loadTree(env: Env): Promise<DepartmentNode[]> {
-  const [depts, squads, agents, memberships] = await Promise.all([
-    env.DB.prepare('SELECT id, slug, name, created_at FROM departments').all<Department>(),
-    env.DB.prepare(
-      'SELECT id, department_id, slug, name, charter, created_at FROM squads',
-    ).all<Squad>(),
-    env.DB.prepare(
-      'SELECT id, squad_id, slug, name, role, model, status, created_at FROM agents',
-    ).all<Agent>(),
-    env.DB.prepare('SELECT id, agent_id, squad_id, capability FROM memberships').all<Membership>(),
-  ])
-
-  const membershipsByAgent = new Map<string, Membership[]>()
-  for (const m of memberships.results ?? []) {
-    const list = membershipsByAgent.get(m.agent_id) ?? []
-    list.push(m)
-    membershipsByAgent.set(m.agent_id, list)
-  }
-  const agentsBySquad = new Map<string, AgentNode[]>()
-  for (const a of agents.results ?? []) {
-    const node: AgentNode = { ...a, memberships: membershipsByAgent.get(a.id) ?? [] }
-    const list = agentsBySquad.get(a.squad_id) ?? []
-    list.push(node)
-    agentsBySquad.set(a.squad_id, list)
-  }
-  const squadsByDept = new Map<string, SquadNode[]>()
-  for (const s of squads.results ?? []) {
-    const node: SquadNode = { ...s, agents: agentsBySquad.get(s.id) ?? [] }
-    const list = squadsByDept.get(s.department_id) ?? []
-    list.push(node)
-    squadsByDept.set(s.department_id, list)
-  }
-  return (depts.results ?? []).map((d) => ({ ...d, squads: squadsByDept.get(d.id) ?? [] }))
-}
+// ── data (squad board page helpers) ─────────────────────────────────────────
 
 type DashTable = 'departments' | 'squads' | 'agents'
 async function getById<T>(env: Env, table: DashTable, id: string): Promise<T | null> {
@@ -723,6 +687,213 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       .tokenline { display: flex; align-items: center; gap: 8px; margin: 4px 0; flex-wrap: wrap; }
       .tokenline .lbl { font-size: 13px; }
       @media (max-width: 720px) { .board { grid-template-columns: 1fr 1fr; } }
+
+      /* ── Observatory (#13) ─────────────────────────────────────────────────── */
+      /* Danger token not in original shell; define inline for bars */
+      :root { --danger: #f85149; --warn2: #d29922; }
+
+      .obs { display: flex; flex-direction: column; gap: 14px; }
+      .panel {
+        background: var(--surface); border: 1px solid var(--border);
+        border-radius: var(--radius); overflow: hidden;
+      }
+      .panel-head {
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--border);
+      }
+      .panel-head h2 {
+        font-size: 15px; font-weight: 700; margin: 0; color: var(--text);
+        display: flex; align-items: center; gap: 8px;
+      }
+      .ph-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+      .legend { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
+      .sw { width: 10px; height: 10px; border-radius: 2px; }
+      .sw--done { background: var(--ok); }
+      .sw--in-progress { background: var(--accent2); }
+      .sw--blocked { background: var(--warn2); }
+      .sw--review { background: var(--accent); }
+      .count-badge {
+        font-size: 11px; font-weight: 700; color: #1b1402;
+        background: var(--accent); padding: 1px 6px; border-radius: 999px;
+      }
+      .jump-now-btn {
+        font-size: 11px; color: var(--accent); background: transparent;
+        border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+        border-radius: 999px; padding: 3px 9px; cursor: pointer;
+      }
+      .jump-now-btn:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+
+      /* swimlane layout */
+      .swimlane { display: flex; overflow-x: auto; }
+      .lane-col {
+        position: sticky; left: 0; z-index: 4;
+        flex: 0 0 280px; min-width: 0;
+        background: var(--surface); border-right: 1px solid var(--border);
+      }
+      .lane-col-head, .grid-head {
+        height: 28px; display: flex; align-items: center;
+        border-bottom: 1px solid var(--border); padding: 0 12px;
+      }
+      .axis-label { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
+
+      .tile {
+        height: 68px; display: flex; align-items: center; gap: 10px;
+        padding: 0 12px; border-bottom: 1px solid var(--border);
+      }
+      .tile:last-child { border-bottom: none; }
+      .tile-av {
+        width: 32px; height: 32px; border-radius: 9px; font-size: 13px; font-weight: 700;
+        display: flex; align-items: center; justify-content: center;
+        color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.35); flex-shrink: 0;
+      }
+      .tile-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+      .tile-top { display: flex; align-items: center; gap: 6px; }
+      .tile-name { font-weight: 700; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .tile-role { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; margin-left: auto; white-space: nowrap; }
+      .tile-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+      .tile-dot--active { background: var(--ok); }
+      .tile-dot--paused { background: var(--dim); }
+      .press { height: 3px; border-radius: 2px; background: color-mix(in srgb, var(--text) 10%, var(--surface)); overflow: hidden; }
+      .press-fill { height: 100%; border-radius: 2px; transition: width .3s; }
+      .press-fill--green { background: var(--ok); }
+      .press-fill--amber { background: var(--warn2); }
+      .press-fill--red { background: var(--danger); }
+      .tile-stats { font-size: 10px; color: var(--muted); display: flex; gap: 5px; flex-wrap: wrap; }
+      .tile-stats .sep { color: var(--border); }
+
+      /* time grid */
+      .time-grid { position: relative; flex: 1; min-width: 520px; }
+      .grid-head { position: relative; padding: 0; }
+      .tick {
+        position: absolute; top: 50%; transform: translate(-50%, -50%);
+        font-size: 10px; color: var(--dim); white-space: nowrap;
+      }
+      .tick:last-child { color: var(--accent); transform: translate(-100%, -50%); }
+      .grid-body { position: relative; }
+      .grid-row { position: relative; height: 68px; border-bottom: 1px solid var(--border); }
+      .grid-row:last-child { border-bottom: none; }
+      .gridline { position: absolute; top: 0; bottom: 0; width: 1px; background: color-mix(in srgb, var(--border) 60%, transparent); }
+      .now-line { position: absolute; top: 0; bottom: 0; right: 0; width: 2px; background: var(--accent); z-index: 3; }
+      .now-tag {
+        position: absolute; top: -1px; right: 0;
+        font-size: 9px; font-weight: 700; color: #1b1402;
+        background: var(--accent); padding: 1px 4px; border-radius: 0 0 0 3px;
+      }
+
+      /* bars */
+      .bar {
+        position: absolute; top: 20px; height: 28px;
+        border-radius: 5px; cursor: default;
+        border: 1px solid transparent;
+        transition: transform 100ms ease, filter 100ms ease;
+      }
+      .bar:hover { transform: translateY(-1px); filter: brightness(1.12); z-index: 6; }
+      .bar--done     { background: color-mix(in srgb, var(--ok) 70%, var(--surface)); border-color: var(--ok); }
+      .bar--in_progress { background: color-mix(in srgb, var(--accent2) 70%, var(--surface)); border-color: var(--accent2); }
+      .bar--open     { background: color-mix(in srgb, var(--dim) 50%, var(--surface)); border-color: var(--dim); }
+      .bar--blocked  { background: color-mix(in srgb, var(--warn2) 65%, var(--surface)); border-color: var(--warn2); }
+      .bar--review   { background: color-mix(in srgb, var(--accent) 70%, var(--surface)); border-color: var(--accent); }
+      .bar--approved { background: color-mix(in srgb, var(--ok) 70%, var(--surface)); border-color: var(--ok); }
+      .bar--rejected { background: color-mix(in srgb, var(--danger) 65%, var(--surface)); border-color: var(--danger); }
+      .bar--growing::after {
+        content: ''; position: absolute; right: -1px; top: -1px; bottom: -1px; width: 4px;
+        border-radius: 0 5px 5px 0; background: currentColor; opacity: .5;
+        animation: obs-pulse 1.4s ease-in-out infinite;
+      }
+      @keyframes obs-pulse {
+        0%, 100% { opacity: .5; }
+        50% { opacity: 1; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .bar--growing::after { animation: none; }
+        .tile-dot--active { animation: none; }
+      }
+
+      /* bar tooltip */
+      .bar-tip {
+        display: none; position: absolute; bottom: calc(100% + 8px); left: 50%;
+        transform: translateX(-50%); min-width: 170px; max-width: 230px;
+        background: var(--bg); border: 1px solid var(--border);
+        border-radius: var(--radius); padding: 8px 10px;
+        flex-direction: column; gap: 4px;
+        box-shadow: 0 8px 24px rgba(0,0,0,.15); z-index: 10; pointer-events: none;
+      }
+      .bar:hover .bar-tip { display: flex; }
+      .bar-tip strong { font-size: 12px; font-weight: 600; color: var(--text); line-height: 1.35; }
+      .bar-tip-meta { font-size: 10px; color: var(--muted); }
+      .bar-tip-st { font-weight: 700; }
+      .bar-tip-st--done, .bar-tip-st--approved { color: var(--ok); }
+      .bar-tip-st--in_progress { color: var(--accent2); }
+      .bar-tip-st--blocked { color: var(--warn2); }
+      .bar-tip-st--review { color: var(--accent); }
+      .bar-tip-st--rejected { color: var(--danger); }
+      .bar-tip-st--open { color: var(--dim); }
+
+      /* operator queue (reuses .appr-* classes already defined for /approvals) */
+      .queue-section .appr-head { display: flex; justify-content: space-between; gap: 12px; }
+      .queue-section .appr-title { font-weight: 600; }
+      .queue-section .appr-meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+      .queue-section .appr-when { color: var(--dim); font-size: 12px; white-space: nowrap; }
+      .gate-chip {
+        border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
+        font-size: 12px; color: var(--accent);
+      }
+      .appr-body { margin-top: 10px; font-size: 14px; white-space: pre-wrap; }
+      .appr-result {
+        margin-top: 10px; background: var(--surface2); border: 1px solid var(--border);
+        border-radius: 8px; padding: 10px 12px; font-size: 13px; white-space: pre-wrap;
+      }
+      .appr-result .lbl { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
+      .appr-actions { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+      .appr-note {
+        flex: 1; min-width: 180px; font: inherit; font-size: 13px; padding: 7px 10px;
+        border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
+      }
+      .btn-reject { background: transparent; color: var(--warn2); border: 1px solid var(--warn2); }
+      .appr-status { font-size: 13px; color: var(--dim); }
+      .approval.decided { opacity: .55; }
+
+      /* recent tasks table */
+      .recent-tasks { width: 100%; border-collapse: collapse; font-size: 13px; }
+      .recent-tasks th, .recent-tasks td {
+        text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--border); vertical-align: middle;
+      }
+      .recent-tasks th { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; font-weight: 600; }
+      .recent-tasks tr:last-child td { border-bottom: none; }
+      .recent-tasks .task-title { max-width: 320px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .agent-chip {
+        display: inline-flex; align-items: center; gap: 6px;
+        font-size: 12px; background: var(--bg); border: 1px solid var(--border);
+        padding: 2px 8px 2px 4px; border-radius: 999px; white-space: nowrap;
+      }
+      .agent-chip-av {
+        width: 14px; height: 14px; border-radius: 3px;
+        display: inline-block; flex-shrink: 0;
+      }
+      .st-badge {
+        font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px;
+      }
+      .st-badge--done { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, var(--surface)); }
+      .st-badge--in_progress { color: var(--accent2); background: color-mix(in srgb, var(--accent2) 14%, var(--surface)); }
+      .st-badge--open { color: var(--dim); background: color-mix(in srgb, var(--dim) 14%, var(--surface)); }
+      .st-badge--blocked { color: var(--warn2); background: color-mix(in srgb, var(--warn2) 14%, var(--surface)); }
+      .st-badge--review { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--surface)); }
+      .st-badge--approved { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, var(--surface)); }
+      .st-badge--rejected { color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, var(--surface)); }
+
+      /* cost chip — placeholder until #15 */
+      .cost-chip { font-size: 11px; color: var(--dim); }
+
+      @media (max-width: 900px) {
+        .lane-col { flex: 0 0 220px; }
+        .recent-tasks .cost-chip { display: none; }
+      }
+      @media (max-width: 720px) {
+        .lane-col { flex: 0 0 180px; }
+        .tile-stats { display: none; }
+        .recent-tasks th:nth-child(n+4), .recent-tasks td:nth-child(n+4) { display: none; }
+      }
+      /* ── /approvals page styles (kept here to avoid duplication) ── */
     </style>
   </head>
   <body>
@@ -730,7 +901,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       <div class="brand"><b>${brand}</b> · substrate console</div>
       <nav>
         <a href="/">Overview</a>
-        <a href="/send">Send a task</a>
+        <a href="/send">Send</a>
         <a href="/approvals">Approvals</a>
         <a href="/members">Members</a>
         <a href="/admin/divisions">Divisions</a>
@@ -755,134 +926,312 @@ function agentChip(a: Agent) {
   return html`<a class="chip" href="/agents/${a.id}">${statusDot(a.status)}${a.name}<span class="tag">${a.role}</span></a>`
 }
 
-// The Connect card — how a member points their own workspace at this pot. Shown to
-// EVERY authenticated user. The snippets carry a `<MEMBER_TOKEN>` placeholder only;
-// a real token comes from the Members → Mint flow (show-once). The endpoint is
-// derived from the request origin, never hardcoded.
-function connectCard(slug: string, origin: string) {
-  return html`
-    <div class="card">
-      <h2 style="margin-top:0">Connect your workspace</h2>
-      <p class="empty" style="margin-top:0">Point Claude Code or Codex at this pot over MCP. The
-        endpoint is <code class="inline">${mcpEndpoint(origin)}</code>. Get a token from
-        <a href="/members">Members → Mint token</a>, then paste it where you see
-        <code class="inline">&lt;MEMBER_TOKEN&gt;</code>.</p>
-      <h3 style="font-size:13px;color:var(--muted);margin:14px 0 0">Claude Code · <code class="inline">.mcp.json</code></h3>
-      <pre class="snippet">${claudeCodeSnippet(slug, origin)}</pre>
-      <h3 style="font-size:13px;color:var(--muted);margin:14px 0 0">Codex · <code class="inline">~/.codex/config.toml</code></h3>
-      <pre class="snippet">${codexSnippet(slug, origin)}</pre>
-    </div>`
-}
 
-// Inline create-department + create-squad forms (admin+). Plain HTML POST →
-// /departments and /squads (POST-redirect-GET) — no client framework. The squad
-// form's department <select> is built server-side from the current tree.
-function orgCreateForms(tree: DepartmentNode[]) {
-  const deptOptions = tree
-    .map((d) => `<option value="${escAttr(d.id)}">${escHtml(d.name)}</option>`)
-    .join('')
-  const squadForm =
-    tree.length === 0
-      ? html`<p class="empty">Create a department first, then you can add squads to it.</p>`
-      : html`
-          <form class="adminform" method="post" action="/squads" autocomplete="off">
-            <label>Department
-              <select name="department_id" required>${raw(deptOptions)}</select>
-            </label>
-            <label>Squad name
-              <input name="name" required placeholder="Dispatch" />
-            </label>
-            <label>Slug
-              <input name="slug" required placeholder="dispatch" />
-            </label>
-            <label>Charter (optional)
-              <input name="charter" placeholder="What this squad owns" />
-            </label>
-            <button type="submit" class="btn">Add squad</button>
-          </form>`
-  return html`
-    <h2>Build the org</h2>
-    <div class="card">
-      <h3 style="font-size:13px;color:var(--muted);margin:0 0 8px">New department</h3>
-      <form class="adminform" method="post" action="/departments" autocomplete="off">
-        <label>Name
-          <input name="name" required placeholder="Operations" />
-        </label>
-        <label>Slug (lowercase, hyphens)
-          <input name="slug" required placeholder="operations" />
-        </label>
-        <button type="submit" class="btn">Add department</button>
-      </form>
-      <h3 style="font-size:13px;color:var(--muted);margin:18px 0 8px">New squad</h3>
-      ${squadForm}
-    </div>`
-}
+// ── Observatory (#13) — the new GET / home ────────────────────────────────────
+//
+// Three sections:
+//   1. Swimlane — all agents × 24h time grid with task bars.
+//   2. Operator queue — tasks in 'review' the caller may verdict (reuses
+//      loadApprovals + the shared verdict POST wiring from /approvals).
+//   3. Recent tasks — last 10 tasks, most recent first.
+//
+// Read-only except the operator-queue verdict buttons (existing endpoint).
+// Cost column renders '—' until #15 (metered spend) lands.
 
-function overviewBody(
+function observatoryBody(
   brand: string,
-  slug: string,
-  origin: string,
-  tree: DepartmentNode[],
+  data: ObservatoryData,
+  approvals: ApprovalItem[],
   auth: AuthContext,
 ) {
-  const canManage = isAdmin(auth)
-  if (tree.length === 0) {
-    return html`
-      <h1>${brand} org</h1>
-      <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role}</p>
-      ${connectCard(slug, origin)}
-      ${
-        canManage
-          ? orgCreateForms(tree)
-          : html`<div class="card"><p class="empty">No departments yet. An admin can create them
-              from this page; ask whoever owns this pot.</p></div>`
-      }`
+  const { agents, stats, bars, ticks, recentTasks } = data
+
+  // ── swimlane ──────────────────────────────────────────────────────────────
+  // Bars grouped by agent_id for O(1) row render.
+  const barsByAgent = new Map<string, SwimlaneBar[]>()
+  for (const b of bars) {
+    const list = barsByAgent.get(b.agent_id) ?? []
+    list.push(b)
+    barsByAgent.set(b.agent_id, list)
   }
-  return html`
-    <h1>${brand} org</h1>
-    <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role} ·
-      ${tree.length} department${tree.length === 1 ? '' : 's'}</p>
-    <p style="margin:4px 0 16px"><a class="btn" href="/send" style="display:inline-block;text-decoration:none">Send a task →</a></p>
-    ${connectCard(slug, origin)}
-    ${raw(
-      tree
-        .map(
-          (d) => html`
-            <div class="card dept">
-              <div class="dept-name">${d.name}</div>
-              ${
-                d.squads.length === 0
-                  ? html`<p class="empty">No squads.</p>`
-                  : raw(
-                      d.squads
-                        .map(
-                          (s) => html`
-                            <div class="squad-row">
-                              <div>
-                                <a href="/squads/${s.id}"><strong>${s.name}</strong></a>
-                                <span class="meta"> · ${s.agents.length} agent${s.agents.length === 1 ? '' : 's'}</span>
-                              </div>
-                              <a class="meta" href="/squads/${s.id}">board →</a>
-                            </div>
-                            ${
-                              s.agents.length > 0
-                                ? html`<div class="agents">${raw(s.agents.map((a) => agentChip(a).toString()).join(''))}</div>`
-                                : html``
-                            }
-                          `,
-                        )
-                        .map((x) => x.toString())
-                        .join(''),
-                    )
-              }
-            </div>
-          `,
+
+  // Tick <span>s — 7 items. Last is 'now', positioned right-aligned.
+  const tickSpans = ticks
+    .map((t, i) => {
+      const pct = (i / (ticks.length - 1)) * 100
+      return `<span class="tick" style="left:${pct.toFixed(2)}%">${escHtml(t)}</span>`
+    })
+    .join('')
+
+  // Gridline <span>s — same positions as ticks (except last = right edge = now-line).
+  const gridlines = ticks
+    .slice(0, -1)
+    .map((_, i) => {
+      const pct = (i / (ticks.length - 1)) * 100
+      return `<span class="gridline" style="left:${pct.toFixed(2)}%"></span>`
+    })
+    .join('')
+
+  // Agent tiles (left sticky column)
+  const agentTiles = agents.length === 0
+    ? '<div class="tile"><span class="empty">No agents yet.</span></div>'
+    : agents.map((a) => {
+        const stat: AgentStat = stats.get(a.id) ?? {
+          agent_id: a.id,
+          task_count: 0,
+          done_count: 0,
+          success_pct: 0,
+          in_flight: 0,
+        }
+        const pressure = stat.in_flight > 0 ? Math.min(stat.in_flight * 25, 100) : 0
+        const pressClass = pressure > 85 ? 'red' : pressure > 65 ? 'amber' : 'green'
+        const grad = agentGradient(a.name)
+        const initial = escHtml(a.name.slice(0, 1).toUpperCase())
+        const dotClass = a.status === 'active' ? 'active' : 'paused'
+        return (
+          `<div class="tile">` +
+          `<span class="tile-av" style="background:${grad}">${initial}</span>` +
+          `<div class="tile-body">` +
+          `<div class="tile-top">` +
+          `<a href="/agents/${escAttr(a.id)}" class="tile-name">${escHtml(a.name)}</a>` +
+          `<span class="tile-dot tile-dot--${dotClass}" title="${escAttr(a.status)}"></span>` +
+          `<span class="tile-role">${escHtml(a.role)}</span>` +
+          `</div>` +
+          `<div class="press"><div class="press-fill press-fill--${pressClass}" style="width:${pressure}%"></div></div>` +
+          `<div class="tile-stats">` +
+          `<span>${escHtml(String(stat.task_count))} tasks</span><span class="sep">·</span>` +
+          `<span>${escHtml(String(stat.success_pct))}%</span><span class="sep">·</span>` +
+          // Cost: not yet metered (#15) — render placeholder
+          `<span class="cost-chip" title="Per-task spend coming in #15">—</span>` +
+          `</div>` +
+          `</div>` +
+          `</div>`
         )
-        .map((x) => x.toString())
-        .join(''),
-    )}
-    ${canManage ? orgCreateForms(tree) : html``}`
+      }).join('')
+
+  // Grid rows (one per agent)
+  const gridRows = agents.length === 0
+    ? '<div class="grid-row"></div>'
+    : agents.map((a) => {
+        const agentBars = barsByAgent.get(a.id) ?? []
+        const barHtml = agentBars
+          .map((b) => {
+            const growingClass = b.growing ? ' bar--growing' : ''
+            const statusClass = `bar--${b.status}`
+            const tipStatus = `<span class="bar-tip-st bar-tip-st--${b.status}">${escHtml(b.status.replace('_', ' '))}</span>`
+            const when = b.completed_at
+              ? escHtml(b.completed_at.slice(0, 16).replace('T', ' '))
+              : 'in progress'
+            return (
+              `<div class="bar ${statusClass}${growingClass}"` +
+              ` style="left:${b.left_pct.toFixed(2)}%;width:${b.width_pct.toFixed(2)}%"` +
+              ` title="${escAttr(b.title)}">` +
+              `<div class="bar-tip">` +
+              `<strong>${escHtml(b.title)}</strong>` +
+              `<span class="bar-tip-meta">${tipStatus} · ${when}</span>` +
+              `</div>` +
+              `</div>`
+            )
+          })
+          .join('')
+        return `<div class="grid-row">${barHtml}</div>`
+      }).join('')
+
+  const swimlaneSection = `
+  <section class="panel swimlane-panel">
+    <div class="panel-head">
+      <h2>Fleet activity · last 24h</h2>
+      <div class="ph-right">
+        <span class="legend"><i class="sw sw--done"></i>done</span>
+        <span class="legend"><i class="sw sw--in-progress"></i>in progress</span>
+        <span class="legend"><i class="sw sw--blocked"></i>blocked</span>
+        <span class="legend"><i class="sw sw--review"></i>review</span>
+        <button class="jump-now-btn" id="jumpNow">Jump to now →</button>
+      </div>
+    </div>
+    <div class="swimlane" id="swimlane">
+      <div class="lane-col">
+        <div class="lane-col-head"><span class="axis-label">Agents</span></div>
+        ${agentTiles}
+      </div>
+      <div class="time-grid">
+        <div class="grid-head">${tickSpans}</div>
+        <div class="grid-body">
+          ${gridlines}
+          <span class="now-line"><span class="now-tag">NOW</span></span>
+          ${gridRows}
+        </div>
+      </div>
+    </div>
+  </section>`
+
+  // ── operator queue ────────────────────────────────────────────────────────
+  const queueCount = approvals.length
+  const queueCards = approvals.map((t) => approvalCardHtml(t)).join('')
+
+  const operatorSection = `
+  <section class="panel queue-section">
+    <div class="panel-head">
+      <h2>Needs your decision${queueCount > 0 ? ` <span class="count-badge">${queueCount}</span>` : ''}</h2>
+      <a href="/approvals" style="font-size:13px;color:var(--muted)">All approvals →</a>
+    </div>
+    ${queueCount > 0
+      ? `<div id="obs-queue">${queueCards}</div>`
+      : `<div style="padding:14px 18px"><p class="empty" style="margin:0">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`
+    }
+  </section>`
+
+  // ── recent tasks ──────────────────────────────────────────────────────────
+  const taskRows = recentTasks.map((t) => {
+    const agentName = t.agent_name ?? t.agent_id ?? '—'
+    const grad = t.agent_name ? agentGradient(t.agent_name) : 'var(--dim)'
+    const initial = agentName.slice(0, 1).toUpperCase()
+    const when = (t.completed_at ?? t.created_at).slice(0, 16).replace('T', ' ')
+    return (
+      `<tr>` +
+      `<td class="task-title">${escHtml(t.title)}</td>` +
+      `<td>` +
+      `<span class="agent-chip">` +
+      `<span class="agent-chip-av" style="background:${grad}" title="${escAttr(agentName)}">${escHtml(initial)}</span>` +
+      `${escHtml(agentName)}` +
+      `</span>` +
+      `</td>` +
+      `<td><span class="st-badge st-badge--${t.status}">${escHtml(t.status.replace('_', ' '))}</span></td>` +
+      // Cost: not yet metered (#15)
+      `<td class="cost-chip" title="Per-task spend coming in #15">—</td>` +
+      `<td style="color:var(--dim);font-size:12px">${escHtml(when)}</td>` +
+      `</tr>`
+    )
+  }).join('')
+
+  const recentSection = `
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Recent tasks</h2>
+    </div>
+    ${recentTasks.length === 0
+      ? `<div style="padding:14px 18px"><p class="empty" style="margin:0">No tasks yet.</p></div>`
+      : `<div style="overflow-x:auto"><table class="recent-tasks">
+           <thead><tr>
+             <th>Task</th><th>Agent</th><th>Status</th>
+             <th class="cost-chip">Cost</th><th>When</th>
+           </tr></thead>
+           <tbody>${taskRows}</tbody>
+         </table></div>`
+    }
+  </section>`
+
+  const hasData = agents.length > 0
+  const hint = hasData
+    ? ''
+    : `<div class="card" style="margin-bottom:14px">
+         <p class="empty" style="margin:0">No agents yet. <a href="/">Add departments and squads</a> from the org tree, then add agents to see them here.</p>
+       </div>`
+
+  return html`
+    <h1>${brand}</h1>
+    <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role}</p>
+    <p style="margin:4px 0 14px"><a class="btn" href="/send" style="display:inline-block;text-decoration:none">Send a task →</a></p>
+    ${raw(hint)}
+    <div class="obs">
+      ${raw(swimlaneSection)}
+      ${raw(operatorSection)}
+      ${raw(recentSection)}
+    </div>
+    ${queueCount > 0 ? raw(obsQueueScript()) : html``}`
 }
+
+/**
+ * Render one approval item as an HTML card string.
+ * Shared between observatoryBody (operator queue) and approvalsBody (/approvals page).
+ * The verdict buttons call the existing RBAC-gated POST /api/tasks/:id/verdict endpoint.
+ * NO new write path is introduced here (adversarial review point from #12).
+ */
+function approvalCardHtml(t: ApprovalItem): string {
+  const preview = resultPreview(t)
+  const agentLabel = escHtml(t.agent_name ?? t.assignee_agent_id ?? 'unassigned')
+  const squadLabel = escHtml(t.squad_name ?? t.squad_id)
+  const gateChip = t.gate_owner
+    ? `· <span class="gate-chip">${escHtml(t.gate_owner)}</span>`
+    : ''
+  const when = escHtml((t.completed_at ?? t.created_at).slice(0, 16).replace('T', ' '))
+  const previewHtml = preview
+    ? `<div class="appr-result"><div class="lbl">Result</div>${escHtml(preview)}</div>`
+    : ''
+  return `
+    <div class="card approval" data-task="${escAttr(t.id)}" style="border-left:3px solid var(--accent)">
+      <div class="appr-head">
+        <div>
+          <div class="appr-title">${escHtml(t.title)}</div>
+          <div class="appr-meta">${agentLabel} · ${squadLabel} ${gateChip}</div>
+        </div>
+        <div class="appr-when">${when}</div>
+      </div>
+      <div class="appr-body">${escHtml(t.body)}</div>
+      ${previewHtml}
+      <div class="appr-actions">
+        <input type="text" class="appr-note" placeholder="note (optional; required to reject)" />
+        <button class="btn appr-approve">Approve</button>
+        <button class="btn btn-reject appr-reject">Reject</button>
+        <span class="appr-status"></span>
+      </div>
+    </div>`
+}
+
+/** Vanilla JS that wires the verdict buttons in the observatory operator queue.
+ *  Identical logic to approvalsScript() — same endpoint, same pattern. */
+function obsQueueScript(): string {
+  // Escape JSON.stringify output is safe for raw() injection.
+  return `
+    <script>
+      (function () {
+        document.querySelectorAll('#obs-queue .approval').forEach(function (card) {
+          var id = card.getAttribute('data-task');
+          var note = card.querySelector('.appr-note');
+          var status = card.querySelector('.appr-status');
+          function decide(verdict) {
+            if (verdict === 'rejected' && !note.value.trim()) {
+              status.textContent = 'a note is required to reject';
+              note.focus();
+              return;
+            }
+            card.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+            status.textContent = '…';
+            fetch('/api/tasks/' + encodeURIComponent(id) + '/verdict', {
+              method: 'POST', credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ verdict: verdict, note: note.value.trim() || undefined })
+            }).then(function (res) {
+              return res.json().then(function (data) { return { ok: res.ok, data: data }; });
+            }).then(function (r) {
+              if (r.ok) {
+                status.textContent = verdict === 'approved' ? 'approved' : 'rejected';
+                card.classList.add('decided');
+              } else {
+                status.textContent = (r.data && r.data.error) || 'failed';
+                card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+              }
+            }).catch(function () {
+              status.textContent = 'network error — try again';
+              card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+            });
+          }
+          card.querySelector('.appr-approve').addEventListener('click', function () { decide('approved'); });
+          card.querySelector('.appr-reject').addEventListener('click', function () { decide('rejected'); });
+        });
+
+        // Jump-to-now: scroll the swimlane grid all the way right.
+        var jumpBtn = document.getElementById('jumpNow');
+        if (jumpBtn) {
+          jumpBtn.addEventListener('click', function () {
+            var sl = document.getElementById('swimlane');
+            if (sl) sl.scrollTo({ left: sl.scrollWidth, behavior: 'smooth' });
+          });
+        }
+      })();
+    </script>`
+}
+
 
 function squadBoardBody(squad: Squad, agents: Agent[], tasks: Task[], canAddAgent: boolean) {
   const byLane = new Map<Task['status'], Task[]>()
@@ -1177,36 +1526,17 @@ function sendScript() {
     </script>`)
 }
 
-// ── approvals (gate queue) ────────────────────────────────────────────────────
+// ── approvals page (/approvals) ───────────────────────────────────────────────
+//
+// Card HTML is now factored into approvalCardHtml() which is shared with the
+// observatory operator queue. The verdict script is also shared via approvalsScript().
+// The inline <style> block for .appr-* classes was moved into shell() to avoid
+// duplication across pages.
 
 function approvalsBody(items: ApprovalItem[]) {
-  const cards = items
-    .map((t) => {
-      const preview = resultPreview(t)
-      return `
-        <div class="card approval" data-task="${escAttr(t.id)}">
-          <div class="appr-head">
-            <div>
-              <div class="appr-title">${escHtml(t.title)}</div>
-              <div class="appr-meta">
-                ${escHtml(t.agent_name ?? t.assignee_agent_id ?? 'unassigned')}
-                · ${escHtml(t.squad_name ?? t.squad_id)}
-                ${t.gate_owner ? `· <span class="gate-chip">${escHtml(t.gate_owner)}</span>` : ''}
-              </div>
-            </div>
-            <div class="appr-when">${escHtml((t.completed_at ?? t.created_at).slice(0, 16).replace('T', ' '))}</div>
-          </div>
-          <div class="appr-body">${escHtml(t.body)}</div>
-          ${preview ? `<div class="appr-result"><div class="lbl">Result</div>${escHtml(preview)}</div>` : ''}
-          <div class="appr-actions">
-            <input type="text" class="appr-note" placeholder="note (optional; required to reject)" />
-            <button class="btn appr-approve">Approve</button>
-            <button class="btn btn-reject appr-reject">Reject</button>
-            <span class="appr-status"></span>
-          </div>
-        </div>`
-    })
-    .join('')
+  // Re-use the shared card renderer. Wrap in a named container so the script can
+  // scope its querySelectorAll without touching #obs-queue on the home page.
+  const cards = items.map((t) => approvalCardHtml(t)).join('')
 
   return html`
     <p class="crumbs"><a href="/">Overview</a> / Approvals</p>
@@ -1214,31 +1544,7 @@ function approvalsBody(items: ApprovalItem[]) {
     <p class="empty" style="margin-top:0;max-width:640px">
       Work waiting at your gate. Approve to release it; reject sends it back with your note.
     </p>
-    <style>
-      .appr-head { display: flex; justify-content: space-between; gap: 12px; }
-      .appr-title { font-weight: 600; }
-      .appr-meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
-      .appr-when { color: var(--dim); font-size: 12px; white-space: nowrap; }
-      .gate-chip {
-        border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
-        font-size: 12px; color: var(--accent);
-      }
-      .appr-body { margin-top: 10px; font-size: 14px; white-space: pre-wrap; }
-      .appr-result {
-        margin-top: 10px; background: var(--surface2); border: 1px solid var(--border);
-        border-radius: 8px; padding: 10px 12px; font-size: 13px; white-space: pre-wrap;
-      }
-      .appr-result .lbl { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
-      .appr-actions { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
-      .appr-note {
-        flex: 1; min-width: 200px; font: inherit; font-size: 13px; padding: 7px 10px;
-        border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
-      }
-      .btn-reject { background: transparent; color: var(--warn); border: 1px solid var(--warn); }
-      .appr-status { font-size: 13px; color: var(--dim); }
-      .approval.decided { opacity: .55; }
-    </style>
-    ${items.length ? raw(cards) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
+    ${items.length ? raw(`<div id="approvals-list">${cards}</div>`) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
     ${items.length ? approvalsScript() : html``}`
 }
 
@@ -1248,7 +1554,9 @@ function approvalsScript() {
   return raw(`
     <script>
       (function () {
-        document.querySelectorAll('.approval').forEach(function (card) {
+        var list = document.getElementById('approvals-list');
+        if (!list) return;
+        list.querySelectorAll('.approval').forEach(function (card) {
           var id = card.getAttribute('data-task');
           var note = card.querySelector('.appr-note');
           var status = card.querySelector('.appr-status');
