@@ -35,9 +35,37 @@ export interface Env {
   AI_GATEWAY_TOKEN?: string
   IM_WEBHOOK_SECRET?: string // shared secret for the IM webhook (Telegram secret_token)
   HERMES_RELAY_SECRET?: string // shared secret for the Hermes → mupot channel relay
+  // execution meter caps (env override; meter.ts defaults apply when absent)
+  EXEC_MAX_DISPATCH_DAY?: string // max execute-mode dispatches per agent per UTC day
+  EXEC_MAX_TOKENS_DAY?: string   // max tokens an agent may spend per UTC day
 }
 
-// ── Org domain (mirrors migrations/0001_init.sql) ──
+// ── Org domain (mirrors migrations/0001_init.sql + 0009_work_unit.sql) ──
+
+// Work-unit enums — shared by Agent and Squad (fractal: same shape at every level).
+// effort: ceiling on spend / tool-calls when the unit is in execute mode.
+export type Effort = 'low' | 'standard' | 'high' | 'sprint'
+// autonomy: maps to gate level — execute_with_approval auto-sets gate_owner on tasks.
+export type Autonomy = 'suggest' | 'draft' | 'execute' | 'execute_with_approval'
+// budget_window: rolling window for budget_cap_cents accounting.
+export type BudgetWindow = 'day' | 'week'
+
+const EFFORTS: readonly Effort[] = ['low', 'standard', 'high', 'sprint']
+const AUTONOMIES: readonly Autonomy[] = ['suggest', 'draft', 'execute', 'execute_with_approval']
+const BUDGET_WINDOWS: readonly BudgetWindow[] = ['day', 'week']
+
+export function isEffort(v: unknown): v is Effort {
+  return typeof v === 'string' && (EFFORTS as readonly string[]).includes(v)
+}
+
+export function isAutonomy(v: unknown): v is Autonomy {
+  return typeof v === 'string' && (AUTONOMIES as readonly string[]).includes(v)
+}
+
+export function isBudgetWindow(v: unknown): v is BudgetWindow {
+  return typeof v === 'string' && (BUDGET_WINDOWS as readonly string[]).includes(v)
+}
+
 export interface Department {
   id: string
   slug: string
@@ -51,6 +79,15 @@ export interface Squad {
   slug: string
   name: string
   charter: string | null // the squad's culture/mandate — tenant-authored
+  // work-unit fields (0009_work_unit.sql)
+  role: string | null           // accountability line for the squad
+  okr: string | null
+  kpi_target: string | null
+  kpi_progress: number
+  effort: Effort
+  autonomy: Autonomy
+  budget_cap_cents: number | null
+  budget_window: BudgetWindow
   created_at: string
 }
 
@@ -62,6 +99,14 @@ export interface Agent {
   role: string // tenant-defined role label
   model: string // e.g. "@cf/meta/llama-3.3" | "gemini-2.5-flash"
   status: 'active' | 'paused'
+  // work-unit fields (0009_work_unit.sql)
+  okr: string | null
+  kpi_target: string | null
+  kpi_progress: number
+  effort: Effort
+  autonomy: Autonomy
+  budget_cap_cents: number | null
+  budget_window: BudgetWindow
   created_at: string
 }
 

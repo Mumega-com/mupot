@@ -7,7 +7,8 @@
 // the same capability helpers. They return a discriminated result so each surface
 // can shape its own response (JSON error vs re-rendered form).
 
-import type { Env, Department, Squad, Agent } from '../types'
+import type { Env, Department, Squad, Agent, Effort, Autonomy, BudgetWindow } from '../types'
+import { isEffort, isAutonomy, isBudgetWindow } from '../types'
 
 // slugs are URL-safe identifiers: lowercase alphanumeric + single hyphens,
 // 1–48 chars, no leading/trailing/double hyphen.
@@ -76,6 +77,14 @@ export interface SquadInput {
   slug?: unknown
   name?: unknown
   charter?: unknown
+  // work-unit fields (optional; defaults applied when omitted)
+  role?: unknown
+  okr?: unknown
+  kpi_target?: unknown
+  effort?: unknown
+  autonomy?: unknown
+  budget_cap_cents?: unknown
+  budget_window?: unknown
 }
 
 export async function createSquad(
@@ -94,20 +103,90 @@ export async function createSquad(
         : undefined
   if (charter === undefined) return { ok: false, error: 'invalid_charter' }
 
+  // work-unit field validation + defaults
+  const role =
+    input.role === undefined || input.role === null
+      ? null
+      : typeof input.role === 'string'
+        ? input.role.trim() || null
+        : undefined
+  if (role === undefined) return { ok: false, error: 'invalid_role' }
+
+  const okr =
+    input.okr === undefined || input.okr === null
+      ? null
+      : typeof input.okr === 'string'
+        ? input.okr
+        : undefined
+  if (okr === undefined) return { ok: false, error: 'invalid_okr' }
+
+  const kpi_target =
+    input.kpi_target === undefined || input.kpi_target === null
+      ? null
+      : typeof input.kpi_target === 'string'
+        ? input.kpi_target
+        : undefined
+  if (kpi_target === undefined) return { ok: false, error: 'invalid_kpi_target' }
+
+  const effort: Effort = input.effort === undefined ? 'standard' : (input.effort as Effort)
+  if (!isEffort(effort)) return { ok: false, error: 'invalid_effort' }
+
+  const autonomy: Autonomy = input.autonomy === undefined ? 'draft' : (input.autonomy as Autonomy)
+  if (!isAutonomy(autonomy)) return { ok: false, error: 'invalid_autonomy' }
+
+  const budget_cap_cents =
+    input.budget_cap_cents === undefined || input.budget_cap_cents === null
+      ? null
+      : typeof input.budget_cap_cents === 'number' && Number.isInteger(input.budget_cap_cents)
+        ? input.budget_cap_cents
+        : undefined
+  if (budget_cap_cents === undefined) return { ok: false, error: 'invalid_budget_cap_cents' }
+
+  const budget_window: BudgetWindow =
+    input.budget_window === undefined ? 'week' : (input.budget_window as BudgetWindow)
+  if (!isBudgetWindow(budget_window)) return { ok: false, error: 'invalid_budget_window' }
+
   const squad: Squad = {
     id: crypto.randomUUID(),
     department_id: departmentId,
     slug: input.slug,
     name: input.name.trim(),
     charter,
+    role,
+    okr,
+    kpi_target,
+    kpi_progress: 0,
+    effort,
+    autonomy,
+    budget_cap_cents,
+    budget_window,
     created_at: new Date().toISOString(),
   }
 
   try {
     await env.DB.prepare(
-      'INSERT INTO squads (id, department_id, slug, name, charter, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      `INSERT INTO squads
+        (id, department_id, slug, name, charter,
+         role, okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
+         created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-      .bind(squad.id, squad.department_id, squad.slug, squad.name, squad.charter, squad.created_at)
+      .bind(
+        squad.id,
+        squad.department_id,
+        squad.slug,
+        squad.name,
+        squad.charter,
+        squad.role,
+        squad.okr,
+        squad.kpi_target,
+        squad.kpi_progress,
+        squad.effort,
+        squad.autonomy,
+        squad.budget_cap_cents,
+        squad.budget_window,
+        squad.created_at,
+      )
       .run()
   } catch (err) {
     if (isUniqueViolation(err)) return { ok: false, error: 'slug_taken' }
@@ -124,6 +203,13 @@ export interface AgentInput {
   role?: unknown
   model?: unknown
   status?: unknown
+  // work-unit fields (optional; defaults applied when omitted)
+  okr?: unknown
+  kpi_target?: unknown
+  effort?: unknown
+  autonomy?: unknown
+  budget_cap_cents?: unknown
+  budget_window?: unknown
 }
 
 export async function createAgent(
@@ -145,6 +231,41 @@ export async function createAgent(
   const status: AgentStatus = input.status === undefined ? 'active' : (input.status as AgentStatus)
   if (!isAgentStatus(status)) return { ok: false, error: 'invalid_status' }
 
+  // work-unit field validation + defaults
+  const okr =
+    input.okr === undefined || input.okr === null
+      ? null
+      : typeof input.okr === 'string'
+        ? input.okr
+        : undefined
+  if (okr === undefined) return { ok: false, error: 'invalid_okr' }
+
+  const kpi_target =
+    input.kpi_target === undefined || input.kpi_target === null
+      ? null
+      : typeof input.kpi_target === 'string'
+        ? input.kpi_target
+        : undefined
+  if (kpi_target === undefined) return { ok: false, error: 'invalid_kpi_target' }
+
+  const effort: Effort = input.effort === undefined ? 'standard' : (input.effort as Effort)
+  if (!isEffort(effort)) return { ok: false, error: 'invalid_effort' }
+
+  const autonomy: Autonomy = input.autonomy === undefined ? 'draft' : (input.autonomy as Autonomy)
+  if (!isAutonomy(autonomy)) return { ok: false, error: 'invalid_autonomy' }
+
+  const budget_cap_cents =
+    input.budget_cap_cents === undefined || input.budget_cap_cents === null
+      ? null
+      : typeof input.budget_cap_cents === 'number' && Number.isInteger(input.budget_cap_cents)
+        ? input.budget_cap_cents
+        : undefined
+  if (budget_cap_cents === undefined) return { ok: false, error: 'invalid_budget_cap_cents' }
+
+  const budget_window: BudgetWindow =
+    input.budget_window === undefined ? 'week' : (input.budget_window as BudgetWindow)
+  if (!isBudgetWindow(budget_window)) return { ok: false, error: 'invalid_budget_window' }
+
   // The AgentDO is lazy — provisioned on first wake. Here we only insert the row;
   // the agent's id doubles as the DurableObject id name.
   const agent: Agent = {
@@ -152,15 +273,26 @@ export async function createAgent(
     squad_id: squadId,
     slug: input.slug,
     name: input.name.trim(),
-    role: role.trim(),
-    model: model.trim(),
+    role: (role as string).trim(),
+    model: (model as string).trim(),
     status,
+    okr,
+    kpi_target,
+    kpi_progress: 0,
+    effort,
+    autonomy,
+    budget_cap_cents,
+    budget_window,
     created_at: new Date().toISOString(),
   }
 
   try {
     await env.DB.prepare(
-      'INSERT INTO agents (id, squad_id, slug, name, role, model, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      `INSERT INTO agents
+        (id, squad_id, slug, name, role, model, status,
+         okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
+         created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         agent.id,
@@ -170,6 +302,13 @@ export async function createAgent(
         agent.role,
         agent.model,
         agent.status,
+        agent.okr,
+        agent.kpi_target,
+        agent.kpi_progress,
+        agent.effort,
+        agent.autonomy,
+        agent.budget_cap_cents,
+        agent.budget_window,
         agent.created_at,
       )
       .run()
@@ -178,6 +317,142 @@ export async function createAgent(
     throw err
   }
   return { ok: true, value: agent }
+}
+
+// ── work-unit helpers ─────────────────────────────────────────────────────────
+
+/**
+ * autonomyImpliesGate returns true when the autonomy level requires that tasks
+ * produced by this unit are automatically gated (gate_owner will be auto-set
+ * when the loop builds tasks — that wiring lands in #27).
+ */
+export function autonomyImpliesGate(autonomy: Autonomy): boolean {
+  return autonomy === 'execute_with_approval'
+}
+
+// The set of fields updateUnitConfig may patch (any subset is valid).
+export interface UnitConfigPatch {
+  okr?: unknown
+  kpi_target?: unknown
+  effort?: unknown
+  autonomy?: unknown
+  budget_cap_cents?: unknown
+  budget_window?: unknown
+  // role is patchable on squads (and on agents, though agents already have role
+  // in the core shape — it is included here for uniform patch surface).
+  role?: unknown
+}
+
+export type UpdateUnitConfigResult =
+  | { ok: true }
+  | { ok: false; error: 'not_found' | 'invalid_role' | 'invalid_okr' | 'invalid_kpi_target' | 'invalid_effort' | 'invalid_autonomy' | 'invalid_budget_cap_cents' | 'invalid_budget_window' }
+
+/**
+ * Patch any subset of the work-unit config fields on an agent or squad.
+ * Validates every supplied field before touching D1. Returns not_found when
+ * the row does not exist (zero changes). Returns invalid_* for bad values.
+ * Fields absent from the patch are left untouched.
+ */
+export async function updateUnitConfig(
+  env: Env,
+  kind: 'agent' | 'squad',
+  id: string,
+  patch: UnitConfigPatch,
+): Promise<UpdateUnitConfigResult> {
+  const setClauses: string[] = []
+  const binds: (string | number | null)[] = []
+
+  // role (optional field on both agents and squads)
+  if ('role' in patch) {
+    const v = patch.role
+    if (v === null || v === undefined) {
+      if (kind === 'squad') {
+        // squads allow null role
+        setClauses.push('role = ?')
+        binds.push(null)
+      } else {
+        return { ok: false, error: 'invalid_role' }
+      }
+    } else if (typeof v === 'string' && v.trim().length > 0) {
+      setClauses.push('role = ?')
+      binds.push(v.trim())
+    } else {
+      return { ok: false, error: 'invalid_role' }
+    }
+  }
+
+  if ('okr' in patch) {
+    const v = patch.okr
+    if (v === null || v === undefined) {
+      setClauses.push('okr = ?')
+      binds.push(null)
+    } else if (typeof v === 'string') {
+      setClauses.push('okr = ?')
+      binds.push(v)
+    } else {
+      return { ok: false, error: 'invalid_okr' }
+    }
+  }
+
+  if ('kpi_target' in patch) {
+    const v = patch.kpi_target
+    if (v === null || v === undefined) {
+      setClauses.push('kpi_target = ?')
+      binds.push(null)
+    } else if (typeof v === 'string') {
+      setClauses.push('kpi_target = ?')
+      binds.push(v)
+    } else {
+      return { ok: false, error: 'invalid_kpi_target' }
+    }
+  }
+
+  if ('effort' in patch) {
+    if (!isEffort(patch.effort)) return { ok: false, error: 'invalid_effort' }
+    setClauses.push('effort = ?')
+    binds.push(patch.effort)
+  }
+
+  if ('autonomy' in patch) {
+    if (!isAutonomy(patch.autonomy)) return { ok: false, error: 'invalid_autonomy' }
+    setClauses.push('autonomy = ?')
+    binds.push(patch.autonomy)
+  }
+
+  if ('budget_cap_cents' in patch) {
+    const v = patch.budget_cap_cents
+    if (v === null || v === undefined) {
+      setClauses.push('budget_cap_cents = ?')
+      binds.push(null)
+    } else if (typeof v === 'number' && Number.isInteger(v)) {
+      setClauses.push('budget_cap_cents = ?')
+      binds.push(v)
+    } else {
+      return { ok: false, error: 'invalid_budget_cap_cents' }
+    }
+  }
+
+  if ('budget_window' in patch) {
+    if (!isBudgetWindow(patch.budget_window)) return { ok: false, error: 'invalid_budget_window' }
+    setClauses.push('budget_window = ?')
+    binds.push(patch.budget_window)
+  }
+
+  // Nothing to patch — treat as a no-op success (caller is responsible for sending
+  // a non-empty patch; we do not 400 here because a partial update with unknown
+  // keys simply elides those keys and the result is consistent).
+  if (setClauses.length === 0) return { ok: true }
+
+  const table = kind === 'agent' ? 'agents' : 'squads'
+  const sql = `UPDATE ${table} SET ${setClauses.join(', ')} WHERE id = ?`
+  binds.push(id)
+
+  const result = await env.DB.prepare(sql)
+    .bind(...binds)
+    .run()
+
+  if (!result.meta.changes) return { ok: false, error: 'not_found' }
+  return { ok: true }
 }
 
 // ── agent mutations ───────────────────────────────────────────────────────────
