@@ -63,6 +63,12 @@ async function loadAgent(env: Env, agentId: string): Promise<Agent | null> {
 // POST /:agentId/wake — drive one cortex cycle. Mutating → requireAuth + role gate.
 // org 'member' may read status but only 'admin'/'owner' may wake an agent (it
 // spends model + bus quota and emits org-mutating actions).
+//
+// DELIBERATE ASYMMETRY (adv-gate 2026-06-07, Kasra): members CANNOT free-wake an
+// agent here, but CAN trigger a model spend via POST /api/tasks {dispatch:true} —
+// that is the product ("a member sends their agent a task"). Execute-mode wakes are
+// bounded (opaque-result, no action parsing, no wake loops) which is why the cheaper
+// gate is acceptable there and not here. Rate-limit before self-serve tenants.
 agentsApp.post('/:agentId/wake', async (c) => {
   const auth = c.get('auth')
 
