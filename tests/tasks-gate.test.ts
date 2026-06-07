@@ -313,7 +313,6 @@ describe('gate_owner lock — cannot change after review entered', () => {
 // rows un-insertable and the gate structurally inert.
 // The fix queries gate_grants for explicit grants + retains owner/admin bypass.
 
-import type { AuthContext } from '../src/types'
 
 // Minimal Env that controls what gate_grants returns for a lookup.
 function makeGateGrantsEnv(hasGrant: boolean) {
