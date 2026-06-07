@@ -499,3 +499,33 @@ describe('K2 — dispatch+gate_owner: gated dispatch lands review (via K1)', () 
     expect(successStatus).toBe('done')
   })
 })
+
+// ── P0 regression: PATCH gate-bypass (adversarial 2026-06-07) ────────────────
+// A gated task must not reach 'done' via PATCH from a pre-/non-verdict status.
+import { patchToDoneBypassesGate } from '../src/tasks/service'
+
+describe('patchToDoneBypassesGate — P0 gate-bypass guard', () => {
+  it('BLOCKS in_progress → done on a gated task', () => {
+    expect(patchToDoneBypassesGate('in_progress', 'gate:outreach', 'done')).toBe(true)
+  })
+  it('BLOCKS open → done on a gated task', () => {
+    expect(patchToDoneBypassesGate('open', 'gate:outreach', 'done')).toBe(true)
+  })
+  it('BLOCKS blocked → done on a gated task', () => {
+    expect(patchToDoneBypassesGate('blocked', 'gate:outreach', 'done')).toBe(true)
+  })
+  it('ALLOWS approved → done (post-verdict completion)', () => {
+    expect(patchToDoneBypassesGate('approved', 'gate:outreach', 'done')).toBe(false)
+  })
+  it('ALLOWS rejected → done (abandon a rejected gated task)', () => {
+    expect(patchToDoneBypassesGate('rejected', 'gate:outreach', 'done')).toBe(false)
+  })
+  it('does not touch NON-gated tasks (in_progress → done allowed)', () => {
+    expect(patchToDoneBypassesGate('in_progress', null, 'done')).toBe(false)
+    expect(patchToDoneBypassesGate('in_progress', undefined, 'done')).toBe(false)
+  })
+  it('only guards the done target — review/in_progress PATCHes pass', () => {
+    expect(patchToDoneBypassesGate('in_progress', 'gate:x', 'review')).toBe(false)
+    expect(patchToDoneBypassesGate('open', 'gate:x', 'in_progress')).toBe(false)
+  })
+})

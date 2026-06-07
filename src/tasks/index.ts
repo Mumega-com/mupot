@@ -23,7 +23,7 @@ import { requireAuth } from '../auth'
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability } from '../auth/capability'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate } from './service'
 import type { TaskStatus } from './service'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
@@ -336,6 +336,19 @@ tasksApp.patch('/:id', async (c) => {
     // Enforce the transition matrix.
     const transitionErr = checkTransition(existing.status, body.status)
     if (transitionErr) return c.json(transitionErr, 400)
+    // GATE BYPASS GUARD (adversarial P0, 2026-06-07): the gate guards the
+    // verdict endpoint, but PATCH is a second write path to 'done'. A gated
+    // task (gate_owner set) must NOT reach 'done' from a pre-/non-verdict
+    // status via PATCH — that skips the entire gate_grants/verdict/receipt
+    // apparatus. Legitimate completion of a gated task only comes AFTER the
+    // verdict endpoint set it 'approved' (or 'rejected' → abandon). PATCH may
+    // still drive review and rework transitions; it just can't forge 'done'.
+    if (patchToDoneBypassesGate(existing.status, existing.gate_owner, body.status)) {
+      return c.json(
+        { error: 'gate_open', detail: 'gated task must be approved via /verdict before it can be marked done' },
+        409,
+      )
+    }
     next.status = body.status
   }
   if (body.assignee_agent_id !== undefined) {

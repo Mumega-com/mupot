@@ -58,6 +58,9 @@ export function busConfigured(env: Env): boolean {
 }
 
 const DEFAULT_BUS_URL = 'https://bus.mumega.com'
+// Pin fleet bus traffic to one project so an admin-scoped HQ token cannot
+// fan out across tenants (adversarial P2). The company fleet lives on `sos`.
+const FLEET_PROJECT = 'sos'
 
 function busUrl(env: Env): string {
   return (env.BUS_URL || DEFAULT_BUS_URL).replace(/\/$/, '')
@@ -84,6 +87,7 @@ export async function wakeFleetAgent(env: Env, agent: string, by: string): Promi
     body: JSON.stringify({
       to: agent,
       from: 'mupot-hq',
+      project: FLEET_PROJECT,
       text: `[fleet-dashboard] wake requested by ${by} — report status on the bus.`,
     }),
   })
@@ -108,6 +112,7 @@ export async function requestFleetControl(
     body: JSON.stringify({
       to: 'kasra',
       from: 'mupot-hq',
+      project: FLEET_PROJECT,
       text: `[request_id:${requestId}] FLEET CONTROL from ${by} via dashboard: ${action.toUpperCase()} agent "${agent}". Execute server-side (token flag / service / tmux as appropriate) and ack with result.`,
     }),
   })

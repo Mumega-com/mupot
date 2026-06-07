@@ -52,6 +52,21 @@ export function checkTransition(
   return null
 }
 
+// Gate-bypass guard (adversarial P0, 2026-06-07): PATCH is a second write path
+// to 'done' that the verdict endpoint does not own. A task carrying a gate_owner
+// may only reach 'done' AFTER the verdict endpoint set it 'approved' (or
+// 'rejected' → abandon). From any pre-/non-verdict status, PATCH-to-done forges
+// completion past the entire gate. Returns true when the PATCH must be refused.
+export function patchToDoneBypassesGate(
+  existingStatus: TaskStatus,
+  gateOwner: string | null | undefined,
+  targetStatus: TaskStatus,
+): boolean {
+  if (targetStatus !== 'done') return false
+  if (!gateOwner) return false
+  return existingStatus !== 'approved' && existingStatus !== 'rejected'
+}
+
 export interface CreateTaskInput {
   squad_id: string
   title: string

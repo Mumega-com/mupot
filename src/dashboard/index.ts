@@ -171,15 +171,23 @@ dashboardApp.get('/fleet', async (c) => {
   return c.html(shell(c.env.BRAND, 'Fleet', fleetBody(rows, error)))
 })
 
-// POST /fleet/wake — direct bus ping to the agent (any signed-in member).
+// POST /fleet/wake — direct bus ping to the agent. Owner/admin only
+// (adversarial P2 2026-06-07): the HQ BUS_TOKEN is admin-scoped, so an
+// un-gated wake let any pot member ping any agent in any project by name.
+// Gated to owner/admin to match /fleet/control; wakeFleetAgent also pins
+// the project so the ping cannot fan out cross-tenant.
 dashboardApp.post('/fleet/wake', async (c) => {
   if (!busConfigured(c.env)) return c.json({ error: 'bus_not_configured' }, 503)
+  const auth = c.get('auth')
+  if (auth.role !== 'owner' && auth.role !== 'admin') {
+    return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  }
   const body = (await c.req.json().catch(() => ({}))) as { agent?: unknown }
   const agent = typeof body.agent === 'string' ? body.agent.trim() : ''
   if (!agent || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(agent)) {
     return c.json({ error: 'invalid_agent' }, 400)
   }
-  const ok = await wakeFleetAgent(c.env, agent, c.get('auth').email ?? 'member')
+  const ok = await wakeFleetAgent(c.env, agent, auth.email ?? 'admin')
   return c.json(ok ? { ok: true } : { error: 'bus_send_failed' }, ok ? 200 : 502)
 })
 
