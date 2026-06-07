@@ -46,7 +46,7 @@ import { resolveCapabilities, hasCapability } from '../auth/capability'
 
 // Shared creation paths — the dashboard handlers call the SAME service functions
 // the /api routes call, never re-implementing the write/validation logic.
-import { createDepartment, createSquad, createAgent } from '../org/service'
+import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent } from '../org/service'
 import { mintMemberToken, revokeMemberToken, loadLiveTokens, isChannel } from '../members/service'
 import type { MintedToken, PublicMemberToken } from '../members/service'
 
@@ -59,6 +59,8 @@ import {
   agentGradient,
 } from './observatory'
 import type { ObservatoryData, SwimlaneBar, AgentStat } from './observatory'
+import { loadAllAgents, loadSquadOptions } from './agents-admin'
+import type { AgentAdminRow, SquadOption } from './agents-admin'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
@@ -208,6 +210,84 @@ dashboardApp.post('/fleet/control', async (c) => {
   }
   const r = await requestFleetControl(c.env, agent, action, auth.email ?? 'admin')
   return c.json(r, r.ok ? 200 : 400)
+})
+
+// ── /agents — unified agent management ───────────────────────────────────────
+//
+// Owner/admin gated on every mutating path (create, status, delete).
+// Read (GET /agents) is open to any authenticated pot member.
+
+// GET /agents — the management table: all agents across squads, plus an Add form.
+dashboardApp.get('/agents', async (c) => {
+  const [agents, squadOptions] = await Promise.all([
+    loadAllAgents(c.env),
+    loadSquadOptions(c.env),
+  ])
+  const auth = c.get('auth')
+  const canManage = isAdmin(auth)
+  return c.html(shell(c.env.BRAND, 'Agents', agentsBody(agents, squadOptions, canManage)))
+})
+
+// POST /agents — create an agent (owner/admin only).
+dashboardApp.post('/agents', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(shell(c.env.BRAND, 'Agents', errorBody('Creating an agent requires owner or admin.')), 403)
+  }
+  const form = await c.req.parseBody()
+  const squadId = typeof form.squad_id === 'string' ? form.squad_id.trim() : ''
+  if (!squadId) {
+    return c.html(shell(c.env.BRAND, 'Agents', errorBody('Pick a squad for the agent.')), 400)
+  }
+  // Validate the squad exists in this pot before writing.
+  const squad = await getById<Squad>(c.env, 'squads', squadId)
+  if (!squad) {
+    return c.html(shell(c.env.BRAND, 'Agents', errorBody('Squad not found.')), 404)
+  }
+  const result = await createAgent(c.env, squadId, {
+    slug: form.slug,
+    name: form.name,
+    role: form.role,
+    model: form.model,
+  })
+  if (!result.ok) {
+    const [agents, squadOptions] = await Promise.all([loadAllAgents(c.env), loadSquadOptions(c.env)])
+    return c.html(
+      shell(c.env.BRAND, 'Agents', agentsBody(agents, squadOptions, true, `Could not add agent: ${result.error}.`)),
+      result.error === 'slug_taken' ? 409 : 400,
+    )
+  }
+  return c.redirect('/agents')
+})
+
+// POST /agents/:id/status — pause or resume an agent (owner/admin only).
+dashboardApp.post('/agents/:id/status', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const agentId = c.req.param('id')
+  // Validate agentId is a non-empty string (UUID format); we don't need to parse
+  // the body format strictly since we validate the status value via isAgentStatus.
+  if (!agentId || agentId.length > 64) return c.json({ error: 'invalid_agent_id' }, 400)
+  const body = (await c.req.json().catch(() => ({}))) as { status?: unknown }
+  const status = body.status
+  if (status !== 'active' && status !== 'paused') {
+    return c.json({ error: 'invalid_status', allowed: ['active', 'paused'] }, 400)
+  }
+  const result = await setAgentStatus(c.env, agentId, status)
+  if (!result.ok) return c.json({ error: result.error }, 404)
+  return c.json({ ok: true })
+})
+
+// DELETE /agents/:id — delete an agent row (owner/admin only).
+// Note: HTML forms cannot DELETE; the client sends via fetch() with method:DELETE.
+dashboardApp.delete('/agents/:id', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const agentId = c.req.param('id')
+  if (!agentId || agentId.length > 64) return c.json({ error: 'invalid_agent_id' }, 400)
+  const result = await deleteAgent(c.env, agentId)
+  if (!result.ok) return c.json({ error: result.error }, 404)
+  return c.json({ ok: true })
 })
 
 // GET /squads/:id — squad board: charter, agents, tasks by lane.
@@ -961,6 +1041,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         <a href="/">Overview</a>
         <a href="/send">Send</a>
         <a href="/approvals">Approvals</a>
+        <a href="/agents">Agents</a>
         <a href="/fleet">Fleet</a>
         <a href="/members">Members</a>
         <a href="/admin/divisions">Divisions</a>
@@ -1315,7 +1396,7 @@ function squadBoardBody(squad: Squad, agents: Agent[], tasks: Task[], canAddAgen
             <input name="role" placeholder="member" />
           </label>
           <label>Model
-            <input name="model" value="@cf/meta/llama-3.3" />
+            <input name="model" value="@cf/meta/llama-3.3-70b-instruct-fp8-fast" />
           </label>
           <button type="submit" class="btn">Add agent</button>
         </form>`
@@ -2316,6 +2397,199 @@ function membersAdminScript(scopeOptions: string) {
             } catch (err) { grantStatus.textContent = 'Grant request errored.'; }
           });
         }
+      })();
+    </script>`)
+}
+
+// ── /agents view ─────────────────────────────────────────────────────────────
+//
+// agentsBody — renders the full agent management page:
+//   - Table of all agents (name, slug, squad/dept, role, model, status, tasks)
+//   - Per-row Pause/Resume + Delete buttons (owner/admin only, JS fetch)
+//   - Add-agent form (name, slug, role, model, squad picker)
+//
+// All user-supplied strings are escaped via escHtml/escAttr.
+// Status mutations call POST /agents/:id/status (JSON body {status}).
+// Delete calls DELETE /agents/:id (fetch with method:DELETE + confirm()).
+
+function agentsBody(
+  agents: AgentAdminRow[],
+  squadOptions: SquadOption[],
+  canManage: boolean,
+  errorMsg: string | null = null,
+) {
+  const errorBanner = errorMsg
+    ? `<div class="warn-box" style="margin-bottom:14px"><strong>Error:</strong> ${escHtml(errorMsg)}</div>`
+    : ''
+
+  // Squad <option>s for the add-agent form.
+  const squadOptHtml = squadOptions.length === 0
+    ? '<option disabled value="">No squads — create a squad first</option>'
+    : squadOptions
+        .map((s) => {
+          const label = s.dept_name
+            ? `${s.dept_name} / ${s.name}`
+            : s.name
+          return `<option value="${escAttr(s.id)}">${escHtml(label)}</option>`
+        })
+        .join('')
+
+  // Agent table rows.
+  const tableBody = agents.length === 0
+    ? `<tr><td colspan="${canManage ? 8 : 7}" class="empty" style="padding:18px 14px">No agents yet. Add one below.</td></tr>`
+    : agents.map((a) => {
+        const statusBadge = a.status === 'active'
+          ? `<span class="dot active" title="active"></span> active`
+          : `<span class="dot paused" title="paused"></span> paused`
+        const taskSummary = a.task_count > 0
+          ? `${escHtml(String(a.task_count))} (${escHtml(String(a.open_count))} open)`
+          : '—'
+        const actionBtns = canManage
+          ? `<td class="actions">` +
+            `<button class="btn sm ag-status-btn" data-agent="${escAttr(a.id)}" data-status="${escAttr(a.status)}" ` +
+            `data-name="${escAttr(a.name)}" style="margin-right:4px">` +
+            (a.status === 'active' ? 'Pause' : 'Resume') +
+            `</button>` +
+            `<button class="btn sm ag-delete-btn" ` +
+            `style="background:transparent;color:#e5534b;border-color:#e5534b" ` +
+            `data-agent="${escAttr(a.id)}" data-name="${escAttr(a.name)}">Delete</button>` +
+            `<span class="ag-row-status" style="font-size:12px;color:var(--dim);margin-left:8px"></span>` +
+            `</td>`
+          : ''
+        return (
+          `<tr data-agent-row="${escAttr(a.id)}">` +
+          `<td><a href="/agents/${escAttr(a.id)}">${escHtml(a.name)}</a></td>` +
+          `<td><code style="font-size:12px">${escHtml(a.slug)}</code></td>` +
+          `<td>${escHtml(a.squad_name)}${a.dept_name ? ` <span class="ag-dept">${escHtml(a.dept_name)}</span>` : ''}</td>` +
+          `<td>${escHtml(a.role)}</td>` +
+          `<td><code style="font-size:12px;word-break:break-all">${escHtml(a.model)}</code></td>` +
+          `<td>${statusBadge}</td>` +
+          `<td style="font-variant-numeric:tabular-nums">${taskSummary}</td>` +
+          actionBtns +
+          `</tr>`
+        )
+      }).join('')
+
+  const addForm = canManage && squadOptions.length > 0
+    ? `<div class="card" style="margin-top:20px">
+        <h2 style="margin-top:0">Add agent</h2>
+        <form class="adminform" method="post" action="/agents" autocomplete="off">
+          <label>Name
+            <input name="name" required placeholder="Dispatcher" />
+          </label>
+          <label>Slug
+            <input name="slug" required placeholder="dispatcher" />
+          </label>
+          <label>Role
+            <input name="role" placeholder="member" />
+          </label>
+          <label>Model
+            <input name="model" value="@cf/meta/llama-3.3-70b-instruct-fp8-fast" />
+          </label>
+          <label>Squad
+            <select name="squad_id" required>${squadOptHtml}</select>
+          </label>
+          <button type="submit" class="btn">Add agent</button>
+        </form>
+      </div>`
+    : canManage
+      ? `<div class="card" style="margin-top:20px"><p class="empty">Create a squad first, then add agents.</p></div>`
+      : ''
+
+  const tableHtml =
+    `<div class="card" style="padding:0;overflow-x:auto">
+      <table class="grid">
+        <thead><tr>
+          <th>Name</th><th>Slug</th><th>Squad</th><th>Role</th>
+          <th>Model</th><th>Status</th><th>Tasks</th>
+          ${canManage ? '<th>Actions</th>' : ''}
+        </tr></thead>
+        <tbody>${tableBody}</tbody>
+      </table>
+    </div>`
+
+  return html`
+    <p class="crumbs"><a href="/">Overview</a> / Agents</p>
+    <h1>Agents</h1>
+    <p class="empty" style="margin-top:0;max-width:680px">
+      All agents across this pot. Owner / admin can pause, resume, or delete agents and add new ones.</p>
+    <style>
+      .ag-dept { font-size: 11px; color: var(--dim); margin-left: 4px; }
+    </style>
+    ${raw(errorBanner)}
+    ${raw(tableHtml)}
+    ${raw(addForm)}
+    ${canManage && agents.length > 0 ? agentsScript() : html``}`
+}
+
+function agentsScript(): HtmlEscapedString {
+  return raw(`
+    <script>
+      (function () {
+        // Pause / Resume — POST /agents/:id/status {status:'active'|'paused'}
+        document.querySelectorAll('.ag-status-btn').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            var agentId = btn.getAttribute('data-agent');
+            var current = btn.getAttribute('data-status');
+            var next = current === 'active' ? 'paused' : 'active';
+            var row = document.querySelector('[data-agent-row="' + agentId + '"]');
+            var rowStatus = row && row.querySelector('.ag-row-status');
+            btn.disabled = true;
+            if (rowStatus) rowStatus.textContent = '…';
+            fetch('/agents/' + encodeURIComponent(agentId) + '/status', {
+              method: 'POST', credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ status: next })
+            }).then(function (r) {
+              return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+            }).then(function (r) {
+              if (r.ok) {
+                if (rowStatus) rowStatus.textContent = next === 'paused' ? 'paused' : 'resumed';
+                btn.textContent = next === 'active' ? 'Pause' : 'Resume';
+                btn.setAttribute('data-status', next);
+              } else {
+                if (rowStatus) rowStatus.textContent = (r.d && r.d.error) || 'failed';
+              }
+              btn.disabled = false;
+            }).catch(function () {
+              if (rowStatus) rowStatus.textContent = 'network error';
+              btn.disabled = false;
+            });
+          });
+        });
+
+        // Delete — DELETE /agents/:id (confirm first)
+        document.querySelectorAll('.ag-delete-btn').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            var agentId = btn.getAttribute('data-agent');
+            var name = btn.getAttribute('data-name');
+            if (!confirm('Delete agent "' + name + '"? This cannot be undone.')) return;
+            var row = document.querySelector('[data-agent-row="' + agentId + '"]');
+            var rowStatus = row && row.querySelector('.ag-row-status');
+            btn.disabled = true;
+            if (rowStatus) rowStatus.textContent = '…';
+            fetch('/agents/' + encodeURIComponent(agentId), {
+              method: 'DELETE', credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' }
+            }).then(function (r) {
+              return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+            }).then(function (r) {
+              if (r.ok) {
+                if (row) {
+                  row.style.opacity = '0.4';
+                  row.style.transition = 'opacity .3s';
+                  setTimeout(function () { row.remove(); }, 320);
+                }
+              } else {
+                if (rowStatus) rowStatus.textContent = (r.d && r.d.error) || 'failed';
+                btn.disabled = false;
+              }
+            }).catch(function () {
+              if (rowStatus) rowStatus.textContent = 'network error';
+              btn.disabled = false;
+            });
+          });
+        });
       })();
     </script>`)
 }
