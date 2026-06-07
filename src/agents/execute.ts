@@ -20,6 +20,9 @@
 //  - FAILURE → status=blocked, result=<short note>, completed_at=now, emit
 //    task.blocked. The model call is wrapped so a throw can NEVER leave the task
 //    stuck in_progress.
+//  - Rate-limit (issue #4): checkAndReserve runs AFTER claiming the task but
+//    BEFORE the model call. On block: task lands 'blocked' with a rate_limited
+//    note; no tokens are spent.
 
 import type { Env, Agent, Task, ModelMessage, ModelPort, BusEvent } from '../types'
 import { checkTransition } from '../tasks/service'
@@ -69,10 +72,7 @@ export async function runTaskExecution(
   const emit = deps.emit ?? ((e: BusEvent) => createBus(env).emit(e))
   const remember =
     deps.remember ?? ((id: string, text: string, concepts?: string[]) => createMemory(env).remember(id, text, concepts))
-  // meter will be wired into the execution path in #27 (the loop sprint). Resolved
-  // here so the import survives bundling and is injectable in tests. The void cast
-  // is the tsc-approved pattern for intentionally unused locals (noUnusedLocals=true).
-  void (deps.meter ?? { checkAndReserve, recordTokens })
+  const meter = deps.meter ?? { checkAndReserve, recordTokens }
 
   // Fail-closed scope: must exist AND be in this agent's squad.
   const task = await loadTaskForSquad(env, taskId, agent.squad_id)
@@ -99,6 +99,31 @@ export async function runTaskExecution(
   const startedAt = new Date().toISOString()
   const assignee = task.assignee_agent_id ?? agent.id
   await setTaskProgress(env, task.id, assignee, startedAt)
+
+  // ── Rate-limit check (issue #4): enforce per-agent daily dispatch + token caps ──
+  // Runs AFTER claiming the task (so status is never left as stale 'open') but
+  // BEFORE the model call (so no tokens are spent when blocked).
+  // On block: mark the task 'blocked' with a clear note so it is not stuck
+  // in_progress and the caller knows why it did not execute.
+  // This is the chokepoint: ALL execute paths converge on runTaskExecution
+  // (HTTP POST dispatch, bus consumer, and DO alarm), so one check covers all.
+  const meterResult = await meter.checkAndReserve(env, agent.id)
+  if (!meterResult.ok) {
+    const note = capResult(
+      `rate_limited: ${meterResult.reason} — daily cap reached (window ${meterResult.windowKey}). ` +
+      `Retry after ${meterResult.retryAfterSec}s (next UTC day resets the window).`,
+    )
+    const finishedAt = new Date().toISOString()
+    await finishTask(env, task.id, 'blocked', note, finishedAt)
+    await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
+    return {
+      ok: false,
+      task_id: task.id,
+      decided: '',
+      task_status: 'blocked',
+      error: meterResult.reason,
+    }
+  }
 
   try {
     const charter = await loadSquadCharter(env, agent.squad_id)
@@ -128,6 +153,9 @@ export async function runTaskExecution(
     await emitSafe(emit, executionEvent(eventType, env, agent, task, successStatus))
     // best-effort memory so the agent's future recalls compound on what it did.
     await rememberSafe(remember, agent.id, `Executed task "${task.title}" → ${successStatus}.`)
+    // Best-effort token accounting: record EXECUTE_MAX_TOKENS as a conservative
+    // estimate. When the model port surfaces actual usage, replace with real count.
+    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS)
     return { ok: true, task_id: task.id, decided: `completed: ${task.title}`, task_status: successStatus }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'execution_failed'
@@ -136,6 +164,8 @@ export async function runTaskExecution(
     // NEVER leave in_progress stuck — land it in blocked with the error note.
     await finishTask(env, task.id, 'blocked', note, finishedAt)
     await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
+    // Still count tokens on model failure: the call was attempted.
+    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS)
     return { ok: false, task_id: task.id, decided: '', task_status: 'blocked', error: msg }
   }
 }
@@ -254,6 +284,20 @@ async function rememberSafe(
 ): Promise<void> {
   try {
     await remember(agentId, text, ['task', 'execution'])
+  } catch {
+    // best-effort
+  }
+}
+
+// A failed token-record write must not undo the persisted result. Swallow.
+async function recordTokensSafe(
+  record: typeof recordTokens,
+  env: Env,
+  agentId: string,
+  tokens: number,
+): Promise<void> {
+  try {
+    await record(env, agentId, tokens)
   } catch {
     // best-effort
   }
