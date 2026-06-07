@@ -26,6 +26,7 @@ import { checkTransition } from '../tasks/service'
 import { createModel } from '../model'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
+import { checkAndReserve, recordTokens } from './meter'
 
 // Hard ceiling on a persisted result (chars). Keeps a runaway model answer from
 // bloating the row / GitHub mirror. ~16KB.
@@ -50,6 +51,12 @@ export interface ExecuteDeps {
   // Best-effort memory write on success so the agent's future recalls compound on
   // what it did. Injectable so tests don't reach Vectorize/Workers-AI.
   remember?: (agentId: string, text: string, concepts?: string[]) => Promise<unknown>
+  // Meter seam: injectable so tests drive the meter independently of D1.
+  // Defaults to the real meter (checkAndReserve + recordTokens from ./meter).
+  meter?: {
+    checkAndReserve: typeof checkAndReserve
+    recordTokens: typeof recordTokens
+  }
 }
 
 export async function runTaskExecution(
@@ -62,6 +69,10 @@ export async function runTaskExecution(
   const emit = deps.emit ?? ((e: BusEvent) => createBus(env).emit(e))
   const remember =
     deps.remember ?? ((id: string, text: string, concepts?: string[]) => createMemory(env).remember(id, text, concepts))
+  // meter will be wired into the execution path in #27 (the loop sprint). Resolved
+  // here so the import survives bundling and is injectable in tests. The void cast
+  // is the tsc-approved pattern for intentionally unused locals (noUnusedLocals=true).
+  void (deps.meter ?? { checkAndReserve, recordTokens })
 
   // Fail-closed scope: must exist AND be in this agent's squad.
   const task = await loadTaskForSquad(env, taskId, agent.squad_id)
