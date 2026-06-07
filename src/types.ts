@@ -151,7 +151,8 @@ export type BusEventType =
   | 'lead.new'
   | 'task.created'
   | 'task.updated'
-  | 'task.completed' // execution succeeded — result persisted on the task row
+  | 'task.completed' // execution succeeded (ungated) — result persisted on the task row
+  | 'task.review'   // execution succeeded on a gated task — task now awaits verdict
   | 'task.blocked' // execution failed (model error/timeout) — short note persisted
   | 'task.verdict' // gate decision written — verdict + new task status in payload
   | 'agent.wake'

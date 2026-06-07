@@ -81,6 +81,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<void> {
     }
     case 'task.updated':
     case 'task.completed':
+    case 'task.review':   // K1: gated execution success — task awaits verdict; no DO wake
     case 'task.blocked':
     case 'task.verdict': {
       // Terminal observations and gate decisions; no DO wake by default. Log

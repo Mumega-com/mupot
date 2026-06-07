@@ -9,14 +9,20 @@
 //  - load the task fail-closed: it must exist AND belong to THIS agent's squad
 //    (env.DB is already this tenant's DB, so squad-scoping is the boundary);
 //  - idempotent: a task already 'done' is left untouched (the bus may redeliver);
+//  - K6: execute no-ops for gate-terminal statuses (approved, review) and
+//    already-terminal statuses (done). Only {open, in_progress, blocked, rejected}
+//    proceed to execution. This prevents a re-wake from resurrecting an approved or
+//    under-review task back to in_progress.
 //  - mark in_progress + claim the assignee (if unset) BEFORE the model call;
-//  - SUCCESS → status=done, result=<output capped>, completed_at=now, emit
-//    task.completed {task_id, agent_id};
+//  - K1: SUCCESS on a gated task (gate_owner set) lands status='review', not 'done'.
+//    The task waits for a human/agent verdict before completing. SUCCESS on an
+//    ungated task lands status='done' as before.
 //  - FAILURE → status=blocked, result=<short note>, completed_at=now, emit
 //    task.blocked. The model call is wrapped so a throw can NEVER leave the task
 //    stuck in_progress.
 
 import type { Env, Agent, Task, ModelMessage, ModelPort, BusEvent } from '../types'
+import { checkTransition } from '../tasks/service'
 import { createModel } from '../model'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
@@ -63,9 +69,19 @@ export async function runTaskExecution(
     return { ok: false, task_id: taskId, decided: `task ${taskId} not found in squad`, error: 'task_not_found' }
   }
 
-  // Idempotency: a finished task is never re-executed.
-  if (task.status === 'done') {
-    return { ok: true, task_id: taskId, decided: 'already_done', task_status: 'done' }
+  // K6: execute only drives tasks in workable statuses. Gate-terminal statuses
+  // (review, approved) and done are no-ops. A re-wake must NOT resurrect an
+  // approved or under-review task back to in_progress.
+  //
+  // Workable: open | in_progress | blocked | rejected
+  // No-op:    done | review | approved
+  //
+  // 'rejected' is workable — it means rework is authorised; the agent should
+  // re-attempt the task. 'blocked' is workable — the caller may retry after
+  // resolving the blocker.
+  const WORKABLE: ReadonlySet<Task['status']> = new Set(['open', 'in_progress', 'blocked', 'rejected'])
+  if (!WORKABLE.has(task.status)) {
+    return { ok: true, task_id: taskId, decided: `no_op:${task.status}`, task_status: task.status }
   }
 
   // Claim + mark working before spending the model budget.
@@ -82,11 +98,26 @@ export async function runTaskExecution(
     const raw = await model.chat(messages, { model: agent.model, maxTokens: EXECUTE_MAX_TOKENS })
     const result = capResult(typeof raw === 'string' ? raw : '')
     const finishedAt = new Date().toISOString()
-    await finishTask(env, task.id, 'done', result, finishedAt)
-    await emitSafe(emit, executionEvent('task.completed', env, agent, task, 'done'))
+
+    // K1: if a gate_owner is set, execution success lands 'review' — the task
+    // waits for a gated verdict before completing. Only an ungated task goes
+    // directly to 'done'. The transition matrix allows in_progress → review and
+    // in_progress → done, so both are legal here.
+    const successStatus: 'done' | 'review' = task.gate_owner ? 'review' : 'done'
+    // Enforce the transition at the service write layer (catches future misuse).
+    const transitionErr = checkTransition('in_progress', successStatus)
+    if (transitionErr) {
+      // This branch should never fire given the matrix; log and fall through to blocked.
+      throw new Error(`gate_transition_invariant_violated: in_progress → ${successStatus}`)
+    }
+
+    await finishTask(env, task.id, successStatus, result, finishedAt)
+    // Emit task.completed for ungated (terminal); task.review for gated (awaiting verdict).
+    const eventType = successStatus === 'done' ? 'task.completed' : 'task.review'
+    await emitSafe(emit, executionEvent(eventType, env, agent, task, successStatus))
     // best-effort memory so the agent's future recalls compound on what it did.
-    await rememberSafe(remember, agent.id, `Executed task "${task.title}" → done.`)
-    return { ok: true, task_id: task.id, decided: `completed: ${task.title}`, task_status: 'done' }
+    await rememberSafe(remember, agent.id, `Executed task "${task.title}" → ${successStatus}.`)
+    return { ok: true, task_id: task.id, decided: `completed: ${task.title}`, task_status: successStatus }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'execution_failed'
     const note = capResult(`Execution failed: ${msg}`)
@@ -101,8 +132,10 @@ export async function runTaskExecution(
 // ── DB helpers (tenant DB is env.DB; squad-scoping is the boundary) ────────────
 
 async function loadTaskForSquad(env: Env, taskId: string, squadId: string): Promise<Task | null> {
+  // K1: gate_owner is selected so execute knows whether to land 'review' or 'done'
+  // on success. K6: status is used to no-op on gate-terminal statuses.
   const row = await env.DB.prepare(
-    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
+    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
        FROM tasks WHERE id = ? AND squad_id = ? LIMIT 1`,
   )
     .bind(taskId, squadId)
@@ -128,7 +161,8 @@ async function setTaskProgress(env: Env, taskId: string, assignee: string, updat
 async function finishTask(
   env: Env,
   taskId: string,
-  status: 'done' | 'blocked',
+  // K1: 'review' is a valid success-landing for gated tasks (awaits verdict).
+  status: 'done' | 'blocked' | 'review',
   result: string,
   completedAt: string,
 ): Promise<void> {
@@ -173,7 +207,8 @@ export function capResult(text: string): string {
 // ── bus ──────────────────────────────────────────────────────────────────────
 
 function executionEvent(
-  type: 'task.completed' | 'task.blocked',
+  // K1: 'task.review' is emitted when gated execution succeeds (task awaits verdict).
+  type: 'task.completed' | 'task.blocked' | 'task.review',
   env: Env,
   agent: Agent,
   task: Task,
