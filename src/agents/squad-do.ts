@@ -9,6 +9,7 @@
 
 import { DurableObject } from 'cloudflare:workers'
 import type { Env } from '../types'
+import { resolveTaskId } from './execute'
 
 interface Presence {
   agent_id: string
@@ -119,7 +120,7 @@ export class SquadCoordinatorDO extends DurableObject<Env> {
     }
 
     // A task_id may arrive top-level or inside a BusEvent payload (Queue path).
-    const taskId = this.resolveTaskId(input)
+    const taskId = resolveTaskId(input)
 
     const dispatched: DispatchResult['dispatched'] = []
     for (const agentId of targets) {
@@ -141,18 +142,6 @@ export class SquadCoordinatorDO extends DurableObject<Env> {
       }
     }
     return { ok: true, squad_id: squadId, dispatched }
-  }
-
-  // Read a task id from a plain DispatchInput (top-level) or a raw BusEvent body
-  // (payload.task_id). Returns null when neither carries one.
-  private resolveTaskId(input: DispatchInput): string | null {
-    if (typeof input.task_id === 'string' && input.task_id.length > 0) return input.task_id
-    const payload = input.payload
-    if (payload && typeof payload === 'object' && 'task_id' in payload) {
-      const v = (payload as Record<string, unknown>).task_id
-      if (typeof v === 'string' && v.length > 0) return v
-    }
-    return null
   }
 
   private async activeMemberIds(): Promise<string[]> {
