@@ -51,7 +51,7 @@ export interface MeterCheckResult {
 
 export interface MeterBlockResult {
   ok: false
-  reason: 'rate_limited' | 'budget_exhausted'
+  reason: 'rate_limited' | 'budget_exhausted' | 'budget_cap_exceeded'
   windowKey: string
   count: number
   tokens: number
@@ -59,6 +59,21 @@ export interface MeterBlockResult {
 }
 
 export type MeterResult = MeterCheckResult | MeterBlockResult
+
+/** 1 cent = $0.01 = 10,000 micro-USD. Used to convert budget_cap_cents → micro-USD. */
+export const MICRO_USD_PER_CENT = 10_000
+
+/**
+ * Options for the dollar-cap enforcement (issue #4). Both are supplied by the
+ * trusted caller from the already-loaded agent row:
+ *   estimateMicroUsd — a CONSERVATIVE upper bound on this cycle's spend (cost.ts).
+ *   budgetCapCents   — agents.budget_cap_cents; null/≤0 ⇒ no dollar cap (unlimited).
+ * Omitting opts entirely preserves the pre-#4 behaviour (count + token caps only).
+ */
+export interface ReserveOpts {
+  estimateMicroUsd?: number
+  budgetCapCents?: number | null
+}
 
 /**
  * checkAndReserve — call BEFORE the model call.
@@ -73,6 +88,7 @@ export type MeterResult = MeterCheckResult | MeterBlockResult
 export async function checkAndReserve(
   env: Env,
   agentId: string,
+  opts: ReserveOpts = {},
 ): Promise<MeterResult> {
   const windowKey = buildWindowKey(env.TENANT_SLUG, agentId)
   const now = new Date().toISOString()
@@ -80,13 +96,14 @@ export async function checkAndReserve(
   // Read current state before the increment to check caps. We read first so
   // we can block before spending the write round-trip budget.
   const existing = await env.DB.prepare(
-    `SELECT count, tokens FROM execution_meter WHERE window_key = ? LIMIT 1`,
+    `SELECT count, tokens, cost_micro_usd FROM execution_meter WHERE window_key = ? LIMIT 1`,
   )
     .bind(windowKey)
-    .first<{ count: number; tokens: number }>()
+    .first<{ count: number; tokens: number; cost_micro_usd: number }>()
 
   const currentCount = existing?.count ?? 0
   const currentTokens = existing?.tokens ?? 0
+  const currentCost = existing?.cost_micro_usd ?? 0
 
   const maxDispatches = parseCap(env, 'EXEC_MAX_DISPATCH_DAY', MAX_DISPATCHES_PER_DAY)
   const maxTokens = parseCap(env, 'EXEC_MAX_TOKENS_DAY', MAX_TOKENS_PER_DAY)
@@ -110,6 +127,28 @@ export async function checkAndReserve(
       count: currentCount,
       tokens: currentTokens,
       retryAfterSec: secondsUntilNextUtcMidnight(),
+    }
+  }
+
+  // ── Dollar cap (issue #4): enforcement-layer HARD stop, BEFORE any spend. ──
+  // The cap is the agent's budget_cap_cents (null/≤0 ⇒ unlimited). The estimate is a
+  // CONSERVATIVE upper bound (cost.ts over-estimates unknown models, #15), so we never
+  // under-count. Block if already at/over the cap, or if the next cycle could breach it.
+  // The cap may be REACHED but not EXCEEDED.
+  const capCents = opts.budgetCapCents
+  if (typeof capCents === 'number' && capCents > 0) {
+    const capMicroUsd = capCents * MICRO_USD_PER_CENT
+    const estimate =
+      opts.estimateMicroUsd && opts.estimateMicroUsd > 0 ? Math.round(opts.estimateMicroUsd) : 0
+    if (currentCost >= capMicroUsd || currentCost + estimate > capMicroUsd) {
+      return {
+        ok: false,
+        reason: 'budget_cap_exceeded',
+        windowKey,
+        count: currentCount,
+        tokens: currentTokens,
+        retryAfterSec: secondsUntilNextUtcMidnight(),
+      }
     }
   }
 

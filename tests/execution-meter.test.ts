@@ -11,6 +11,7 @@ import {
   recordTokens,
   MAX_DISPATCHES_PER_DAY,
   MAX_TOKENS_PER_DAY,
+  MICRO_USD_PER_CENT,
 } from '../src/agents/meter'
 import type { Env } from '../src/types'
 
@@ -45,7 +46,11 @@ function makeMockDB(initial: Map<string, WindowState> = new Map()) {
                 const key = args[0] as string
                 const row = state.get(key)
                 if (!row) return null as unknown as T
-                return { count: row.count, tokens: row.tokens } as unknown as T
+                return {
+                  count: row.count,
+                  tokens: row.tokens,
+                  cost_micro_usd: row.cost_micro_usd ?? 0,
+                } as unknown as T
               }
               return null as unknown as T
             },
@@ -399,5 +404,59 @@ describe('meter integration with runTaskExecution', () => {
     const terminal = updates[updates.length - 1]
     expect(terminal.args[0]).toBe('blocked')
     expect(String(terminal.args[1])).toContain('rate_limited')
+  })
+})
+
+describe('dollar-cap constants', () => {
+  it('1 cent = 10_000 micro-USD', () => {
+    expect(MICRO_USD_PER_CENT).toBe(10_000)
+  })
+})
+
+describe('checkAndReserve — dollar cap (#4)', () => {
+  const AGENT = 'a'
+
+  function envWithCost(costMicroUsd: number, count = 0): Env {
+    const key = todayWindowKey('test-tenant', AGENT)
+    return makeEnv({}, new Map([[key, { count, tokens: 0, cost_micro_usd: costMicroUsd }]]))
+  }
+
+  it('no cap (budgetCapCents null) → not enforced, reserves normally', async () => {
+    const env = envWithCost(9_999_999)
+    const r = await checkAndReserve(env, AGENT, { estimateMicroUsd: 1_000_000, budgetCapCents: null })
+    expect(r.ok).toBe(true)
+  })
+
+  it('under cap → reserves', async () => {
+    // cap 100¢ = 1_000_000 micro-USD; spent 200_000; estimate 100_000 → 300_000 ≤ cap
+    const env = envWithCost(200_000)
+    const r = await checkAndReserve(env, AGENT, { estimateMicroUsd: 100_000, budgetCapCents: 100 })
+    expect(r.ok).toBe(true)
+  })
+
+  it('estimate would breach → blocks budget_cap_exceeded, no reserve', async () => {
+    // cap 1_000_000; spent 950_000; estimate 100_000 → 1_050_000 > cap → block
+    const key = todayWindowKey('test-tenant', AGENT)
+    const state = new Map([[key, { count: 5, tokens: 0, cost_micro_usd: 950_000 }]])
+    const env = makeEnv({}, state)
+    const r = await checkAndReserve(env, AGENT, { estimateMicroUsd: 100_000, budgetCapCents: 100 })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('budget_cap_exceeded')
+    // count unchanged — reservation did NOT happen
+    expect(state.get(key)!.count).toBe(5)
+  })
+
+  it('already at/over cap with zero estimate → still blocks', async () => {
+    const env = envWithCost(1_000_000)
+    const r = await checkAndReserve(env, AGENT, { estimateMicroUsd: 0, budgetCapCents: 100 })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('budget_cap_exceeded')
+  })
+
+  it('exactly reaching the cap is allowed (reach but not exceed)', async () => {
+    // spent 900_000 + estimate 100_000 = 1_000_000 == cap → allowed
+    const env = envWithCost(900_000)
+    const r = await checkAndReserve(env, AGENT, { estimateMicroUsd: 100_000, budgetCapCents: 100 })
+    expect(r.ok).toBe(true)
   })
 })
