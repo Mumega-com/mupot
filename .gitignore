@@ -7,4 +7,6 @@ dist/
 # never commit secrets — this is a public template
 .env
 *.token
-wrangler.digid.toml
+# Per-pot wrangler manifests (wrangler.<pot>.toml) ARE tracked — they carry no
+# secrets (D1 ids / binding names only; all secrets go through `wrangler secret`),
+# so keeping them in git makes every pot reproducible. Do NOT add a pot toml here.

@@ -2,6 +2,31 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+## [0.5.0] — 2026-06-08
+
+Durable pipelines: a task can run as a Cloudflare Workflow, and the gate is now
+a zero-idle-cost durable wait.
+
+### Added
+- **Durable task pipeline on CF Workflows** (#7). `POST /api/tasks/:id/pipeline`
+  starts a Workflow instance from a task. `step.do` runs the execute engine and
+  writes a durable receipt; a gated task parks on `step.waitForEvent('gate-verdict')`
+  (up to 7 days, zero idle cost) until the verdict endpoint resumes it via
+  `sendEvent`. migration 0012: `tasks.workflow_instance_id` + `workflow_receipts`.
+  - `src/workflows/pipeline.ts` is the pure, fully-unit-tested orchestrator;
+    `task-workflow.ts` is the thin `WorkflowEntrypoint` adapter.
+  - **The verdict endpoint stays the single authoritative gate** — the pipeline
+    only WAITS and RECORDS; it never flips status or writes `task_verdicts`.
+  - **D1 is authoritative over the (droppable) resume event**: `sendEvent` to a
+    non-parked instance is silently lost, so the pipeline re-reads the verdict from
+    `task_verdicts` on both resume and timeout and never trusts the event payload.
+  - Adversarial-gated (GREEN after one P1 fix): timeout vs resolved receipts use
+    distinct step names so the receipt log can never disagree with the verdict.
+
+### Changed
+- Per-pot `wrangler.<pot>.toml` manifests are now all tracked in git (no secrets;
+  D1 ids + binding names only) so every pot is reproducible.
+
 ## [0.4.0] — 2026-06-08
 
 The pot is no longer empty out of the box, and the Burn gauge is real.
