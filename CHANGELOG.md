@@ -2,6 +2,35 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+## [0.11.0] — 2026-06-09
+
+The Loop Container runs: a manifest is now executable, governed end to end.
+(Toward v1.0 — P2/#33.)
+
+### Added
+- **Manifest-driven runtime** (`src/loops/runtime.ts`). `runLoopCycle` is the
+  source/channel-agnostic cycle — perceive → reason → act (through the gate) →
+  observe → stop — that makes a `LoopManifest` actually run. It perceives via the
+  MCP seam over bound sources (a failing source is skipped, not fatal), reasons via a
+  thin SWAPPABLE seam (the reasoning loop is commoditized — we don't differentiate on
+  it), and routes acts through the gate. Reuses the enforcement $cap before any spend.
+- **The human gate is STRUCTURAL.** A gated loop is branched inside `runLoopCycle`
+  itself — it can only ever reach `queueGatedAct` (pending approval), never the
+  channel-fire path — so the gate cannot be bypassed by an injected act handler.
+  A `gated`/`gated_pending` signal makes queued-but-unfired acts observable.
+
+### Fixed
+- **Sub-cent budget cap could read as unlimited.** A manifest cap below one cent was
+  floored to 0 cents and skipped — the most cost-conscious loop got *unlimited* spend.
+  The meter now accepts a verbatim micro-USD cap (`ReserveOpts.budgetCapMicroUsd`); a
+  positive cap can never collapse to unlimited. The cents path (agents) is unchanged.
+
+### Notes
+- Adversarial-gated (kasra-review) RED→GREEN twice: the sub-cent-cap P0 and the
+  structural-gate hardening were both caught and closed before merge.
+- No route drives `runLoopCycle` from the cron yet — that driver + the declarative
+  `waitForEvent` gate + the outcome-KPI signal are P3 (#34, next).
+
 ## [0.10.0] — 2026-06-08
 
 Loop Container foundation: a loop is now a declarative, MCP-native resource.
