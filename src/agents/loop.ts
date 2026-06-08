@@ -54,6 +54,7 @@ import { createTask } from '../tasks/service'
 import { createModel } from '../model'
 import { createMemory } from '../memory'
 import { checkAndReserve } from './meter'
+import { costMicroUsd } from './cost'
 
 // ── Effort → max tasks spawned per tick ──────────────────────────────────────
 
@@ -64,14 +65,18 @@ export const EFFORT_TASK_BUDGET: Record<Effort, number> = {
   sprint: 3,
 }
 
+/** Conservative token bound for pricing ONE planning (proposal) model call (#4). */
+export const LOOP_PLANNING_MAX_TOKENS = 8_000
+
 // ── Result shapes ─────────────────────────────────────────────────────────────
 
 export type GoalCycleDecided =
-  | 'no-goal'       // agent has no okr/kpi_target — loop is a no-op
-  | 'kpi-met'       // kpi_progress >= 100 — goal reached, nothing to do
-  | 'rate_limited'  // meter blocked the cycle — no spend
-  | 'observe-only'  // effort=low — progress updated, no tasks spawned
-  | 'spawned'       // at least one task was created
+  | 'no-goal'          // agent has no okr/kpi_target — loop is a no-op
+  | 'kpi-met'          // kpi_progress >= 100 — goal reached, nothing to do
+  | 'rate_limited'     // meter blocked the cycle (count/token cap) — no spend
+  | 'budget_exhausted' // dollar cap reached — loop paused, zero spend (#4)
+  | 'observe-only'     // effort=low — progress updated, no tasks spawned
+  | 'spawned'          // at least one task was created
 
 export interface GoalCycleResult {
   ok: boolean
@@ -151,11 +156,17 @@ export async function runGoalCycle(
 
   // ── Guard 5: meter check (economic governor) ─────────────────────────────────
   const meterCheck = deps.meterCheck ?? checkAndReserve
-  const meterResult = await meterCheck(env, agent.id)
+  const estimateMicroUsd = costMicroUsd(agent.model, LOOP_PLANNING_MAX_TOKENS)
+  const meterResult = await meterCheck(env, agent.id, {
+    estimateMicroUsd,
+    budgetCapCents: agent.budget_cap_cents,
+  })
   if (!meterResult.ok) {
+    const decided: GoalCycleDecided =
+      meterResult.reason === 'budget_cap_exceeded' ? 'budget_exhausted' : 'rate_limited'
     return {
       ok: false,
-      decided: 'rate_limited',
+      decided,
       spawned: 0,
       autonomy,
       effort,

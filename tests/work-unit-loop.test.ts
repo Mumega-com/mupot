@@ -219,6 +219,28 @@ describe('runGoalCycle — rate_limited path', () => {
     expect(result.error).toBe('rate_limited')
   })
 
+  it('budget cap block → decided budget_exhausted, no spawn (#4)', async () => {
+    const agent = makeAgent({ budget_cap_cents: 50 })
+    const { env } = makeEnv()
+    const ct = makeCreateTask()
+    const meterCheck = vi.fn().mockResolvedValue({
+      ok: false,
+      reason: 'budget_cap_exceeded' as const,
+      windowKey: 'test:agent-1:2026-06-07',
+      count: 1,
+      tokens: 0,
+      retryAfterSec: 3600,
+    })
+    const result = await runGoalCycle(env, agent, {
+      meterCheck,
+      model: makeModel([{ title: 'Proposal', body: 'body' }]),
+      createTask: ct,
+    })
+    expect(result).toMatchObject({ ok: false, decided: 'budget_exhausted', spawned: 0 })
+    expect(result.error).toBe('budget_cap_exceeded')
+    expect(ct).not.toHaveBeenCalled()
+  })
+
   it('does NOT create any tasks when rate_limited', async () => {
     const agent = makeAgent()
     const { env } = makeEnv()
