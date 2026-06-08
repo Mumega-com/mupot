@@ -284,8 +284,15 @@ export class AgentDO extends DurableObject<Env> {
   // ── DB: resolve the agent row (tenant-scoped re-verification on every wake) ──
   private async loadAgent(): Promise<Agent | null> {
     const id = this.ctx.id.toString()
+    // Load the FULL work-unit row (0009): the goal loop reads okr/kpi/effort/autonomy
+    // and the spend gate reads budget_cap_cents/budget_window. Omitting these columns
+    // silently disables the goal loop (no okr → falls through to cortex) AND the
+    // dollar cap (undefined cap → branch skipped). They MUST be selected here.
     const row = await this.env.DB.prepare(
-      `SELECT id, squad_id, slug, name, role, model, status, created_at FROM agents WHERE id = ?`,
+      `SELECT id, squad_id, slug, name, role, model, status,
+              okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
+              created_at
+         FROM agents WHERE id = ?`,
     )
       .bind(id)
       .first<Agent>()

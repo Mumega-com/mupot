@@ -41,6 +41,16 @@ function makeMockDB(initial: Map<string, WindowState> = new Map()) {
         bind(...args: unknown[]) {
           return {
             async first<T>(): Promise<T | null> {
+              // SELECT COALESCE(SUM(cost_micro_usd),0) ... WHERE window_key BETWEEN ? AND ?
+              if (sql.includes('SUM(cost_micro_usd)')) {
+                const lo = args[0] as string
+                const hi = args[1] as string
+                let sum = 0
+                for (const [k, v] of state) {
+                  if (k >= lo && k <= hi) sum += v.cost_micro_usd ?? 0
+                }
+                return { c: sum } as unknown as T
+              }
               // SELECT count, tokens FROM execution_meter WHERE window_key = ?
               if (sql.includes('SELECT count, tokens')) {
                 const key = args[0] as string
@@ -458,5 +468,42 @@ describe('checkAndReserve — dollar cap (#4)', () => {
     const env = envWithCost(900_000)
     const r = await checkAndReserve(env, AGENT, { estimateMicroUsd: 100_000, budgetCapCents: 100 })
     expect(r.ok).toBe(true)
+  })
+})
+
+describe('checkAndReserve — weekly budget window (#4, WARN-3 fix)', () => {
+  const T = 'test-tenant'
+  const A = 'a'
+  const dayKey = (off: number): string => {
+    const x = new Date()
+    x.setUTCDate(x.getUTCDate() - off)
+    const iso = `${x.getUTCFullYear()}-${String(x.getUTCMonth() + 1).padStart(2, '0')}-${String(x.getUTCDate()).padStart(2, '0')}`
+    return `${T}:${A}:${iso}`
+  }
+
+  it('sums the trailing 7 days; under weekly cap → reserves', async () => {
+    // two prior days each 300_000 = 600_000; cap 100¢ = 1_000_000; estimate 100_000 → 700_000 ≤ cap
+    const state = new Map([
+      [dayKey(0), { count: 0, tokens: 0, cost_micro_usd: 300_000 }],
+      [dayKey(1), { count: 0, tokens: 0, cost_micro_usd: 300_000 }],
+    ])
+    const env = makeEnv({}, state)
+    const r = await checkAndReserve(env, A, { estimateMicroUsd: 100_000, budgetCapCents: 100, budgetWindow: 'week' })
+    expect(r.ok).toBe(true)
+  })
+
+  it('weekly sum breaches cap even when TODAY is 0 → blocks (a daily cap would wrongly allow)', async () => {
+    // 4 prior days * 250_000 = 1_000_000 == cap; today 0. Daily would allow; weekly blocks.
+    const state = new Map([
+      [dayKey(0), { count: 0, tokens: 0, cost_micro_usd: 0 }],
+      [dayKey(1), { count: 0, tokens: 0, cost_micro_usd: 250_000 }],
+      [dayKey(2), { count: 0, tokens: 0, cost_micro_usd: 250_000 }],
+      [dayKey(3), { count: 0, tokens: 0, cost_micro_usd: 250_000 }],
+      [dayKey(4), { count: 0, tokens: 0, cost_micro_usd: 250_000 }],
+    ])
+    const env = makeEnv({}, state)
+    const r = await checkAndReserve(env, A, { estimateMicroUsd: 1, budgetCapCents: 100, budgetWindow: 'week' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('budget_cap_exceeded')
   })
 })

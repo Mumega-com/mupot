@@ -53,7 +53,7 @@ import { autonomyImpliesGate } from '../org/service'
 import { createTask } from '../tasks/service'
 import { createModel } from '../model'
 import { createMemory } from '../memory'
-import { checkAndReserve } from './meter'
+import { checkAndReserve, recordTokens } from './meter'
 import { costMicroUsd } from './cost'
 
 // ── Effort → max tasks spawned per tick ──────────────────────────────────────
@@ -98,9 +98,11 @@ export interface KpiUpdateResult {
 
 export interface LoopDeps {
   model?: ModelPort
-  // Meter seam: checkAndReserve only (we do not record tokens for planning calls
-  // — they are cheap and coarse; execution tokens are recorded per execute.ts).
+  // Meter seam: checkAndReserve gates the cycle pre-call; recordTokens accumulates
+  // the planning call's (conservative) spend AFTER it so the dollar cap (#4) sees the
+  // loop's OWN burn, not just execute-mode spend. Both injectable for tests.
   meterCheck?: typeof checkAndReserve
+  recordTokens?: typeof recordTokens
   // Memory: recall recent task results to seed the prompt. Injectable to keep
   // tests off Vectorize.
   recall?: (agentId: string, query: string, limit?: number) => Promise<Array<{ text: string; score: number; id: string }>>
@@ -160,6 +162,7 @@ export async function runGoalCycle(
   const meterResult = await meterCheck(env, agent.id, {
     estimateMicroUsd,
     budgetCapCents: agent.budget_cap_cents,
+    budgetWindow: agent.budget_window,
   })
   if (!meterResult.ok) {
     const decided: GoalCycleDecided =
@@ -208,6 +211,17 @@ export async function runGoalCycle(
     ]
 
     const raw = await model.chat(messages, { model: agent.model })
+
+    // Record this planning call's (conservative) spend so the dollar cap (#4) sees
+    // the loop's OWN burn, not just execute-mode spend. Best-effort — a failed
+    // accounting write must never abort the cycle.
+    const recordSpend = deps.recordTokens ?? recordTokens
+    try {
+      await recordSpend(env, agent.id, LOOP_PLANNING_MAX_TOKENS, estimateMicroUsd)
+    } catch {
+      // best-effort accounting
+    }
+
     const proposals = parseProposals(raw, taskBudget)
 
     // ── Dispatch: create tasks + apply autonomy disposition ─────────────────

@@ -21,14 +21,16 @@
 // Cap sources (precedence: env var → default const):
 //   dispatch count : env.EXEC_MAX_DISPATCH_DAY ?? MAX_DISPATCHES_PER_DAY (200)
 //   token spend    : env.EXEC_MAX_TOKENS_DAY   ?? MAX_TOKENS_PER_DAY     (200_000)
-//   dollar budget  : agents.budget_cap_cents (from migration 0009) — read
-//                    defensively; column may be absent on older rows.
+//   dollar budget  : agents.budget_cap_cents (from migration 0009), passed by the
+//                    caller as ReserveOpts.budgetCapCents; enforced over the
+//                    agent's budget_window ('day' → today's cost row; 'week' →
+//                    trailing-7-day sum of cost_micro_usd). null/≤0 ⇒ unlimited.
 //
-// The dollar cap is intentionally NOT implemented here — issue #25 (budget_cap_cents
-// schema) landed in 0009 but the billing/cost-tracking layer is not wired yet.
-// A future sprint wires cost → recordTokens and unlocks the dollar gate. Until then
-// only count + token caps are enforced. Do NOT add billing logic here without a
-// matching adversarial gate pass.
+// The dollar cap (issue #4) IS enforced here as an ENFORCEMENT-LAYER pre-call gate:
+// checkAndReserve blocks BEFORE any model spend once the window's recorded
+// cost_micro_usd plus a conservative estimate would breach the cap. The cap may be
+// REACHED but not EXCEEDED. This is a sensitive surface (eligibility/veto) — do NOT
+// change the cap logic without a matching adversarial gate pass.
 
 import type { Env } from '../types'
 
@@ -73,6 +75,8 @@ export const MICRO_USD_PER_CENT = 10_000
 export interface ReserveOpts {
   estimateMicroUsd?: number
   budgetCapCents?: number | null
+  /** agents.budget_window — the span the dollar cap covers. Default 'day'. */
+  budgetWindow?: 'day' | 'week'
 }
 
 /**
@@ -140,7 +144,13 @@ export async function checkAndReserve(
     const capMicroUsd = capCents * MICRO_USD_PER_CENT
     const estimate =
       opts.estimateMicroUsd && opts.estimateMicroUsd > 0 ? Math.round(opts.estimateMicroUsd) : 0
-    if (currentCost >= capMicroUsd || currentCost + estimate > capMicroUsd) {
+    // Enforce over the agent's budget_window: 'day' → today's cost row; 'week' →
+    // trailing-7-day sum (so a weekly cap is not silently enforced as ~7 daily caps).
+    const spanCost =
+      opts.budgetWindow === 'week'
+        ? await sumWeekCostMicroUsd(env, env.TENANT_SLUG, agentId)
+        : currentCost
+    if (spanCost >= capMicroUsd || spanCost + estimate > capMicroUsd) {
       return {
         ok: false,
         reason: 'budget_cap_exceeded',
@@ -219,11 +229,37 @@ export async function recordTokens(
 
 /** '<tenant>:<agent_id>:<YYYY-MM-DD>' UTC. */
 function buildWindowKey(tenant: string, agentId: string): string {
-  const d = new Date()
+  return `${tenant}:${agentId}:${isoDateUtc(new Date())}`
+}
+
+/** YYYY-MM-DD (UTC) for a Date. */
+function isoDateUtc(d: Date): string {
   const y = d.getUTCFullYear()
   const m = String(d.getUTCMonth() + 1).padStart(2, '0')
   const day = String(d.getUTCDate()).padStart(2, '0')
-  return `${tenant}:${agentId}:${y}-${m}-${day}`
+  return `${y}-${m}-${day}`
+}
+
+/**
+ * Sum cost_micro_usd over the trailing 7 UTC days (today inclusive) for one agent.
+ * Used for the 'week' budget_window. The per-day window rows share the fixed
+ * '<tenant>:<agentId>:' prefix and a zero-padded ISO-date suffix, so a lexical
+ * BETWEEN range over the date suffix selects exactly this agent's last-7-days rows
+ * (ISO dates sort lexically across month/year boundaries).
+ */
+async function sumWeekCostMicroUsd(env: Env, tenant: string, agentId: string): Promise<number> {
+  const today = new Date()
+  const start = new Date(today)
+  start.setUTCDate(start.getUTCDate() - 6)
+  const lo = `${tenant}:${agentId}:${isoDateUtc(start)}`
+  const hi = `${tenant}:${agentId}:${isoDateUtc(today)}`
+  const row = await env.DB.prepare(
+    `SELECT COALESCE(SUM(cost_micro_usd), 0) AS c FROM execution_meter
+       WHERE window_key >= ? AND window_key <= ?`,
+  )
+    .bind(lo, hi)
+    .first<{ c: number }>()
+  return row?.c ?? 0
 }
 
 /** Seconds until the next UTC midnight — how long until the window resets. */

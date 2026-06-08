@@ -117,6 +117,7 @@ export async function runTaskExecution(
   const meterResult = await meter.checkAndReserve(env, agent.id, {
     estimateMicroUsd: cycleCostMicroUsd,
     budgetCapCents: agent.budget_cap_cents,
+    budgetWindow: agent.budget_window,
   })
   if (!meterResult.ok) {
     const note = capResult(
