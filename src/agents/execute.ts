@@ -108,7 +108,16 @@ export async function runTaskExecution(
   // in_progress and the caller knows why it did not execute.
   // This is the chokepoint: ALL execute paths converge on runTaskExecution
   // (HTTP POST dispatch, bus consumer, and DO alarm), so one check covers all.
-  const meterResult = await meter.checkAndReserve(env, agent.id)
+  // Cost of one execute cycle (issue #15): the conservative token bound priced at
+  // the agent's model rate, in micro-USD. Computed once; used as the pre-call
+  // estimate for the dollar-cap gate (#4), stamped on the task row, and accumulated
+  // in the meter on every path that actually calls the model.
+  const cycleCostMicroUsd = costMicroUsd(agent.model, EXECUTE_MAX_TOKENS)
+
+  const meterResult = await meter.checkAndReserve(env, agent.id, {
+    estimateMicroUsd: cycleCostMicroUsd,
+    budgetCapCents: agent.budget_cap_cents,
+  })
   if (!meterResult.ok) {
     const note = capResult(
       `rate_limited: ${meterResult.reason} — daily cap reached (window ${meterResult.windowKey}). ` +
@@ -125,11 +134,6 @@ export async function runTaskExecution(
       error: meterResult.reason,
     }
   }
-
-  // Cost of one execute cycle (issue #15): the conservative token bound priced at
-  // the agent's model rate, in micro-USD. Computed once; stamped on the task row
-  // and accumulated in the meter on every path that actually calls the model.
-  const cycleCostMicroUsd = costMicroUsd(agent.model, EXECUTE_MAX_TOKENS)
 
   try {
     const charter = await loadSquadCharter(env, agent.squad_id)

@@ -264,3 +264,32 @@ describe('runTaskExecution — idempotency / K6 no-op gate statuses', () => {
     expect(updates.length).toBeGreaterThan(0)
   })
 })
+
+describe('runTaskExecution — budget cap (#4)', () => {
+  it('hard-blocks before any model call when the dollar cap is breached', async () => {
+    const { env, updates } = makeEnv({ task: makeTask() })
+    const model = okModel('should not run')
+    const checkAndReserve = vi.fn(async () => ({
+      ok: false as const,
+      reason: 'budget_cap_exceeded' as const,
+      windowKey: 'w',
+      count: 0,
+      tokens: 0,
+      retryAfterSec: 100,
+    }))
+    const agent: Agent = { ...AGENT, budget_cap_cents: 10 } as Agent
+    const r = await runTaskExecution(env, agent, 'task-1', {
+      model,
+      meter: { checkAndReserve, recordTokens: vi.fn() },
+      emit: async () => {},
+      remember: async () => 'x',
+    })
+    // The whole point: no spend happens when over budget.
+    expect(model.chat).not.toHaveBeenCalled()
+    expect(r.ok).toBe(false)
+    expect(r.task_status).toBe('blocked')
+    expect(r.error).toBe('budget_cap_exceeded')
+    // task row was transitioned to blocked, never left in_progress.
+    expect(updates.some((u) => String(u.args[0]) === 'blocked')).toBe(true)
+  })
+})
