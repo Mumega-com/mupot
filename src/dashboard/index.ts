@@ -62,6 +62,7 @@ import {
 import type { ObservatoryData, SwimlaneBar, AgentStat } from './observatory'
 import { loadAllAgents, loadSquadOptions } from './agents-admin'
 import type { AgentAdminRow, SquadOption } from './agents-admin'
+import { formatBurn, formatUsd } from '../agents/cost'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
@@ -1311,6 +1312,7 @@ function observatoryBody(
           done_count: 0,
           success_pct: 0,
           in_flight: 0,
+          spend_micro_usd: 0,
         }
         const pressure = stat.in_flight > 0 ? Math.min(stat.in_flight * 25, 100) : 0
         const pressClass = pressure > 85 ? 'red' : pressure > 65 ? 'amber' : 'green'
@@ -1330,8 +1332,8 @@ function observatoryBody(
           `<div class="tile-stats">` +
           `<span>${escHtml(String(stat.task_count))} tasks</span><span class="sep">·</span>` +
           `<span>${escHtml(String(stat.success_pct))}%</span><span class="sep">·</span>` +
-          // Cost: not yet metered (#15) — render placeholder
-          `<span class="cost-chip" title="Per-task spend coming in #15">—</span>` +
+          // Cost (#15): summed task spend over the 24h window (estimated).
+          `<span class="cost-chip" title="Estimated spend, last 24h">${escHtml(formatUsd(stat.spend_micro_usd))}</span>` +
           `</div>` +
           `</div>` +
           `</div>`
@@ -1426,8 +1428,8 @@ function observatoryBody(
       `</span>` +
       `</td>` +
       `<td><span class="st-badge st-badge--${t.status}">${escHtml(t.status.replace('_', ' '))}</span></td>` +
-      // Cost: not yet metered (#15)
-      `<td class="cost-chip" title="Per-task spend coming in #15">—</td>` +
+      // Cost (#15): per-task spend stamped at execution (estimated; '—' if never run).
+      `<td class="cost-chip" title="Estimated spend for this task">${t.cost_micro_usd > 0 ? escHtml(formatUsd(t.cost_micro_usd)) : '—'}</td>` +
       `<td style="color:var(--dim);font-size:12px">${escHtml(when)}</td>` +
       `</tr>`
     )
@@ -2638,15 +2640,16 @@ function membersAdminScript(scopeOptions: string) {
 //
 // unitCard(u, canManage) — the employee-performance panel. One card per agent.
 // Layout: avatar + name/role header, then body sections: Objective (OKR), KPI +
-// progress bar, Effort dial, Autonomy badge, Burn placeholder (—, #15), Budget cap
+// progress bar, Effort dial, Autonomy badge, Burn gauge ($X/hr, #15), Budget cap
 // + window, Current Work (most-recent in_progress/open task), Next Approval (task
 // in 'review'). Followed by a collapsed Knobs form for admins.
 //
 // All strings are manually escaped (escHtml/escAttr) because the card is built
 // as a raw string for injection into a grid container via raw().
 //
-// Burn ($X/hr) is rendered '—' until issue #15 (cost metering) lands. The budget
-// cap + window fields give the concrete configured number in the interim.
+// Burn ($X/hr) is derived from today's metered spend (#15): the agent's current-day
+// execution_meter window, priced via src/agents/cost.ts. The budget cap + window
+// fields give the configured ceiling alongside the live rate.
 
 function agentGradientLocal(name: string): string {
   // Same deterministic gradient as observatory — kept local to avoid a cross-module
@@ -2747,8 +2750,15 @@ function unitCard(u: AgentAdminRow, canManage: boolean): string {
     `<span style="font-size:11px;color:var(--dim)">${kpiPct}%</span>` +
     `</div>`
 
-  // Burn — placeholder until #15 (cost metering lands)
-  const burnLine = `<span class="unit-field-value dim" title="Per-task cost metering lands in #15">—</span>`
+  // Burn ($/hr) — derived from today's spend (#15). Shows the rate plus today's
+  // running total in the tooltip. $0.00/hr when the unit has not spent today.
+  const burn = formatBurn(u.spend_today_micro_usd, Date.now())
+  const spentToday = formatUsd(u.spend_today_micro_usd)
+  const burnLine =
+    `<span class="unit-field-value" title="${escAttr(`${spentToday} spent today (UTC) · estimated from token usage`)}">` +
+    `${escHtml(burn)}` +
+    (u.spend_today_micro_usd > 0 ? ` <span class="dim" style="font-size:11px">· ${escHtml(spentToday)} today</span>` : '') +
+    `</span>`
 
   // Budget cap + window (the concrete configured number)
   const budgetSection =

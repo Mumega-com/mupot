@@ -27,6 +27,7 @@ import type { Env } from '../src/types'
 interface WindowState {
   count: number
   tokens: number
+  cost_micro_usd?: number // #15 — optional so pre-cost fixtures stay valid
 }
 
 function makeMockDB(initial: Map<string, WindowState> = new Map()) {
@@ -50,26 +51,33 @@ function makeMockDB(initial: Map<string, WindowState> = new Map()) {
             },
             async run(): Promise<{ meta: { changes: number } }> {
               upserts.push({ sql, args })
-              // Simulate the UPSERT behaviour for count increment
+              // Simulate the UPSERT behaviour for count increment (checkAndReserve).
               if (sql.includes('DO UPDATE SET count = count + 1')) {
                 const key = args[1] as string
                 const existing = state.get(key)
                 if (existing) {
                   state.set(key, { ...existing, count: existing.count + 1 })
                 } else {
-                  state.set(key, { count: 1, tokens: 0 })
+                  state.set(key, { count: 1, tokens: 0, cost_micro_usd: 0 })
                 }
               }
-              // Simulate the UPSERT behaviour for token accumulation
-              if (sql.includes('DO UPDATE SET tokens = tokens +')) {
+              // Simulate the UPSERT for token + cost accumulation (recordTokens, #15).
+              // The match is on a substring that survives the multi-line SET clause.
+              if (sql.includes('tokens = tokens +')) {
                 const key = args[1] as string
-                // args order: id, window_key, tokens (insert), window_start, tokens (update)
-                const tokensToAdd = args[4] as number
+                // args order: id, window_key, tokens(insert), cost(insert),
+                //             window_start, tokens(update), cost(update)
+                const tokensToAdd = args[5] as number
+                const costToAdd = args[6] as number
                 const existing = state.get(key)
                 if (existing) {
-                  state.set(key, { ...existing, tokens: existing.tokens + tokensToAdd })
+                  state.set(key, {
+                    ...existing,
+                    tokens: existing.tokens + tokensToAdd,
+                    cost_micro_usd: (existing.cost_micro_usd ?? 0) + costToAdd,
+                  })
                 } else {
-                  state.set(key, { count: 0, tokens: tokensToAdd })
+                  state.set(key, { count: 0, tokens: tokensToAdd, cost_micro_usd: costToAdd })
                 }
               }
               return { meta: { changes: 1 } }
@@ -248,6 +256,46 @@ describe('recordTokens — accumulates', () => {
     await recordTokens(env, 'agent-1', 500)
     await recordTokens(env, 'agent-1', 250)
     expect(state.get(key)?.tokens).toBe(1750)
+  })
+
+  // ── #15: cost accumulation alongside tokens ─────────────────────────────────
+  it('accumulates cost_micro_usd when a cost is passed', async () => {
+    const key = todayWindowKey('test-tenant', 'agent-1')
+    const { db, state } = makeMockDB()
+    const env = { TENANT_SLUG: 'test-tenant', DB: db } as unknown as Env
+
+    await recordTokens(env, 'agent-1', 2048, 1024)
+    await recordTokens(env, 'agent-1', 2048, 1024)
+    expect(state.get(key)?.tokens).toBe(4096)
+    expect(state.get(key)?.cost_micro_usd).toBe(2048)
+  })
+
+  it('records cost even when tokens is 0 (cost-only write)', async () => {
+    const key = todayWindowKey('test-tenant', 'agent-3')
+    const { db, state } = makeMockDB()
+    const env = { TENANT_SLUG: 'test-tenant', DB: db } as unknown as Env
+
+    await recordTokens(env, 'agent-3', 0, 500)
+    expect(state.get(key)?.cost_micro_usd).toBe(500)
+  })
+
+  it('is a no-op when both tokens and cost are <= 0', async () => {
+    const { db, state } = makeMockDB()
+    const env = { TENANT_SLUG: 'test-tenant', DB: db } as unknown as Env
+
+    await recordTokens(env, 'agent-1', 0, 0)
+    await recordTokens(env, 'agent-1', -100, -50)
+    expect(state.size).toBe(0)
+  })
+
+  it('defaults cost to 0 when omitted (back-compat with token-only callers)', async () => {
+    const key = todayWindowKey('test-tenant', 'agent-1')
+    const { db, state } = makeMockDB()
+    const env = { TENANT_SLUG: 'test-tenant', DB: db } as unknown as Env
+
+    await recordTokens(env, 'agent-1', 1000)
+    expect(state.get(key)?.tokens).toBe(1000)
+    expect(state.get(key)?.cost_micro_usd).toBe(0)
   })
 })
 
