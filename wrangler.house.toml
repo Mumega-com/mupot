@@ -58,5 +58,10 @@ class_name = "SquadCoordinatorDO"
 tag = "v1"
 new_sqlite_classes = ["AgentDO", "SquadCoordinatorDO"]
 
+[[workflows]]
+name = "mupot-house-task-workflow"
+binding = "TASK_WORKFLOW"
+class_name = "TaskWorkflow"
+
 [triggers]
 crons = ["*/15 * * * *"]
