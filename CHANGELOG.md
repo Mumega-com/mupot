@@ -2,7 +2,41 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
-## [0.8.0] — 2026-06-08
+## [0.9.0] — 2026-06-08
+
+The governance primitive: a HARD dollar brake on autonomous spend — and the goal
+loop actually runs in production.
+
+### Added
+- **Enforcement-layer budget cap** (#4). `checkAndReserve` (the pre-call meter
+  gate) now blocks BEFORE any model spend once the agent's recorded cost plus a
+  conservative estimate would breach its `budget_cap_cents`. The cap may be
+  REACHED but not EXCEEDED. Wired into both the goal loop and execute mode; a
+  blocked goal cycle returns `decided: 'budget_exhausted'` (zero spend). Honors
+  `budget_window`: `'day'` → today's cost, `'week'` → trailing-7-day sum (a weekly
+  cap is no longer silently enforced as ~7 daily caps). This is *enforcement*, not
+  the alert-only pattern the market ships — the loop cannot run past its budget.
+  Foundation for the Loop Container (docs/superpowers/specs/2026-06-08-loop-container-design.md §6.1).
+
+### Fixed
+- **The goal loop was inert in production.** `AgentDO.loadAgent` selected only the
+  8 base agent columns, omitting the work-unit fields (`okr`, `kpi_*`, `effort`,
+  `autonomy`, `budget_cap_cents`, `budget_window`). On the DO alarm / metabolism /
+  bus-wake path `agent.okr` was therefore `undefined`, so every goal-bearing agent
+  fell through to the generic cortex cycle and `runGoalCycle` never executed; the
+  dollar cap was likewise skipped (undefined cap). `loadAgent` now selects the full
+  work-unit row — the metabolism heartbeat (0.7.0) now actually drives the loop.
+- The loop's own planning model call is now metered (`recordTokens` post-call), so
+  `cost_micro_usd` reflects loop burn and the cap sees the loop's own spend.
+
+### Notes
+- Adversarial-gated (kasra-review): caught that the cap, though arithmetically
+  correct, was wired to columns `loadAgent` never loaded (cap + loop both dead on
+  the autonomous path) and that a weekly cap was enforced as daily. All fixed +
+  re-reviewed GREEN before merge.
+- **Operator note:** this release makes goal-bearing agents actually run their loop.
+  Agents with no `budget_cap_cents` are bounded only by the daily token cap
+  (200k) + dispatch cap (200); set a dollar cap on any live goal agent.
 
 Starter squad packs — branded HQs you seed in one owner click.
 
