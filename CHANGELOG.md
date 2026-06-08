@@ -2,6 +2,21 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+## [0.8.0] — 2026-06-08
+
+Starter squad packs — branded HQs you seed in one owner click.
+
+### Added
+- **Squad packs** (#11). `src/org/squad-packs.ts`: a reproducible "starter org unit"
+  = one squad + its work-units (each with OKR/KPI/effort/autonomy), defined as repo
+  config and instantiated through the product. `seedSquadPack` calls the SAME
+  `createSquad`/`createAgent` services the dashboard uses (full validation, no SQL
+  bypass — dogfood-correct). Admin-only `POST /squads/packs/:key` + a "Starter packs"
+  card on /agents seed it in one click.
+  - First pack: **Shabrang** — the Persian-mythology media brand as a squad inside
+    the house pot (book-as-charter; units: Oracle Keeper, Story Weaver, Media Smith,
+    Community Scout). Seed it on the house pot as owner; dial each unit's knobs after.
+
 ## [0.7.0] — 2026-06-08
 
 The pot breathes. Goal-bearing work-units now run on their own.

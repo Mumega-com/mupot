@@ -48,6 +48,7 @@ import { resolveCapabilities, hasCapability } from '../auth/capability'
 // the /api routes call, never re-implementing the write/validation logic.
 import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent, updateUnitConfig } from '../org/service'
 import type { UnitConfigPatch } from '../org/service'
+import { SQUAD_PACKS, seedSquadPack } from '../org/squad-packs'
 import { mintMemberToken, revokeMemberToken, loadLiveTokens, isChannel } from '../members/service'
 import type { MintedToken, PublicMemberToken } from '../members/service'
 
@@ -548,6 +549,52 @@ dashboardApp.post('/squads', async (c) => {
     )
   }
   return c.redirect('/')
+})
+
+// POST /squads/packs/:key — seed a starter squad pack (#11): one squad + its
+// work-units in a single owner action. Admin on the target department, mirroring
+// POST /squads. Uses the shared seedSquadPack → createSquad/createAgent (no D1
+// bypass; full validation). The department is the form's department_id, or the
+// first department when omitted (single-department pots are the common case).
+dashboardApp.post('/squads/packs/:key', async (c) => {
+  const auth = c.get('auth')
+  const key = c.req.param('key')
+  if (!SQUAD_PACKS.some((p) => p.key === key)) {
+    return c.html(shell(c.env.BRAND, 'Overview', errorBody('Unknown squad pack.')), 404)
+  }
+
+  const form = await c.req.parseBody()
+  let departmentId = typeof form.department_id === 'string' ? form.department_id : ''
+  if (!departmentId) {
+    // Fall back to the first department so a single-department pot needs no picker.
+    const first = await c.env.DB.prepare(
+      'SELECT id FROM departments ORDER BY created_at ASC LIMIT 1',
+    ).first<{ id: string }>()
+    departmentId = first?.id ?? ''
+  }
+  if (!departmentId) {
+    return c.html(shell(c.env.BRAND, 'Overview', errorBody('Create a department first.')), 400)
+  }
+  const dept = await getById<Department>(c.env, 'departments', departmentId)
+  if (!dept) {
+    return c.html(shell(c.env.BRAND, 'Overview', errorBody('Department not found.')), 404)
+  }
+  if (!(await canOnDepartment(c.env, auth, departmentId))) {
+    return c.html(
+      shell(c.env.BRAND, 'Overview', errorBody('Seeding a squad pack requires admin on that department.')),
+      403,
+    )
+  }
+
+  const result = await seedSquadPack(c.env, departmentId, key)
+  if (!result.ok) {
+    return c.html(
+      shell(c.env.BRAND, 'Overview', errorBody(`Could not seed pack: ${result.error}.`)),
+      result.error === 'slug_taken' ? 409 : 400,
+    )
+  }
+  // Land on the new squad's board.
+  return c.redirect(result.squad ? `/squads/${result.squad.id}` : '/')
 })
 
 // POST /squads/:id/agents — add an agent to a squad (lead+ on THAT squad).
@@ -2886,6 +2933,22 @@ function agentsBody(
       ? `<div class="card" style="margin-top:20px"><p class="empty">Create a squad first, then add agents.</p></div>`
       : ''
 
+  // Starter packs (#11): one-click seed of a branded squad + its work-units.
+  // Admin-only; each button POSTs to the RBAC'd /squads/packs/:key seeder.
+  const packsCard = canManage && SQUAD_PACKS.length > 0
+    ? `<div class="card" style="margin-top:20px">
+        <h2 style="margin-top:0">Starter packs</h2>
+        <p class="empty" style="margin-top:0">Seed a ready-made squad and its work-units in one click. You can dial each unit's knobs afterwards.</p>
+        ${SQUAD_PACKS.map((p) => (
+          `<form method="post" action="/squads/packs/${escAttr(p.key)}" style="display:flex;align-items:center;gap:12px;margin-top:10px">` +
+          `<div style="flex:1"><strong>${escHtml(p.name)}</strong> · <span style="color:var(--dim);font-size:13px">${escHtml(p.description)}</span> ` +
+          `<span style="color:var(--dim);font-size:12px">(${p.agents.length} units)</span></div>` +
+          `<button type="submit" class="btn secondary sm">Seed ${escHtml(p.name)}</button>` +
+          `</form>`
+        )).join('')}
+      </div>`
+    : ''
+
   return html`
     <p class="crumbs"><a href="/">Overview</a> / Agents</p>
     <h1>Agents</h1>
@@ -2896,6 +2959,7 @@ function agentsBody(
     ${raw(errorBanner)}
     ${raw(cardsHtml)}
     ${raw(addForm)}
+    ${raw(packsCard)}
     ${canManage && agents.length > 0 ? agentsScript() : html``}`
 }
 
