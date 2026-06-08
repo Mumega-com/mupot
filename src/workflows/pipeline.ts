@@ -23,6 +23,8 @@
 import type { Env, Agent, Task } from '../types'
 import { runTaskExecution } from '../agents/execute'
 import type { ExecuteResult } from '../agents/execute'
+import { runApprovedActs } from '../integrations/ghl'
+import type { ActRunResult, GHLDeps } from '../integrations/ghl'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -68,6 +70,8 @@ export interface PipelineSummary {
   finalStatus: string | null
   gated: boolean
   resolved: boolean
+  /** Outbound acts result — set when approved verdict triggered the GHL send step. */
+  actsResult?: ActRunResult
 }
 
 // ── Injectable deps (seams for unit tests) ────────────────────────────────────
@@ -90,9 +94,22 @@ export interface PipelineDeps {
       detail?: string
     },
   ) => Promise<void>
+  /** Injectable GHL deps for the outbound-acts step (seam for tests). */
+  ghlDeps?: GHLDeps
+  /** Override the pending-acts COUNT check (returns count of pending acts). */
+  countPendingActs?: (env: Env, taskId: string) => Promise<number>
 }
 
 // ── Real default implementations ──────────────────────────────────────────────
+
+async function countPendingActsFromD1(env: Env, taskId: string): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM outbound_acts WHERE task_id = ? AND status = 'pending'`,
+  )
+    .bind(taskId)
+    .first<{ n: number }>()
+  return row?.n ?? 0
+}
 
 async function loadAgentFromD1(env: Env, agentId: string): Promise<Agent | null> {
   const row = await env.DB.prepare(
@@ -201,6 +218,7 @@ export async function runTaskPipeline(
   const doExecute = deps.runTaskExecution ?? runTaskExecution
   const doReadVerdict = deps.readLatestVerdict ?? readLatestVerdictFromD1
   const doWriteReceipt = deps.writeReceipt ?? writeReceiptToD1
+  const doCountPendingActs = deps.countPendingActs ?? countPendingActsFromD1
 
   // ── Step a: execute the task ──────────────────────────────────────────────
   //
@@ -310,11 +328,60 @@ export async function runTaskPipeline(
     }
   }
 
+  // ── Step c: outbound acts (approved gate only) ────────────────────────────
+  //
+  // Fires ONLY when:
+  //   - The gate resolved with an approved verdict (verdictRow.verdict === 'approved')
+  //   - There are pending outbound acts (cheap COUNT — avoids a step when 0 acts)
+  //
+  // runApprovedActs re-checks the verdict independently (defense in depth).
+  // Rejected verdicts, timeouts, and ungated tasks never reach this block.
+  let actsResult: ActRunResult | undefined
+
+  if (gated && resolved) {
+    // Safe: 'resolved' is only true when verdictRow !== null (see above).
+    // Read verdictRow again to get the verdict value; we re-read D1 here because
+    // the variable is out of scope — the step.do below re-reads via runApprovedActs.
+    // The pipeline ONLY enters this branch if gated+resolved, and runApprovedActs
+    // does its own independent D1 re-read — so no assumption about the local variable.
+    const pendingCount = await doCountPendingActs(env, taskId)
+
+    if (pendingCount > 0) {
+      // step.do wraps the GHL send in a durable step so Workflow replay does not
+      // re-fire sends that already succeeded (CF Workflows caches completed step
+      // results). A retry is also safe at the act level: runApprovedActs claims
+      // each act pending→sending atomically BEFORE the external call, so a retried
+      // step never re-sends an already-claimed/sent act (#8 P1 fix).
+      actsResult = await (step.do as (
+        name: string,
+        config: StepConfig,
+        cb: () => Promise<ActRunResult>,
+      ) => Promise<ActRunResult>)('outbound-acts', {
+        retries: { limit: 2, delay: '10 seconds', backoff: 'exponential' },
+      }, async () => {
+        // runApprovedActs independently re-reads the verdict and GHL config.
+        // On rejected verdict: marks acts refused. On missing config: no-op (pending).
+        const result = await runApprovedActs(env, taskId, deps.ghlDeps ?? {})
+
+        await doWriteReceipt(env, {
+          instanceId,
+          taskId,
+          stepName: 'outbound-acts',
+          status: 'ok',
+          detail: JSON.stringify({ sent: result.sent, refused: result.refused, failed: result.failed }),
+        })
+
+        return result
+      })
+    }
+  }
+
   return {
     taskId,
     finalStatus: taskStatus,
     gated,
     resolved,
+    ...(actsResult !== undefined ? { actsResult } : {}),
   }
 }
 

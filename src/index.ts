@@ -22,6 +22,7 @@ import { imApp } from './im'
 import { dashboardApp } from './dashboard'
 import { channelsApp, reconcileMembership } from './channels'
 import { channelsAdminApp } from './channels/admin'
+import { ghlInboundApp } from './integrations/ghl-routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -48,6 +49,9 @@ app.route(ROUTES.im, imApp)
 // Mounted BEFORE the dashboard '/' catch-all so the specific prefixes win.
 app.route('/channels', channelsApp)
 app.route('/api/channels', channelsAdminApp)
+// GHL act-channel: inbound webhook (unauthenticated by session; verified by HMAC secret).
+// Mounted BEFORE the dashboard '/' catch-all so /api/integrations/ghl/* wins.
+app.route('/api/integrations/ghl', ghlInboundApp)
 app.route(ROUTES.dashboard, dashboardApp)
 
 // Queue consumer — the bus component owns the handler.
