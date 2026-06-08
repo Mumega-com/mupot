@@ -9,9 +9,10 @@
 // swimlane bars are derived from tasks.created_at → completed_at (or now for
 // in-flight tasks). Agents with zero activity in the window still get a lane.
 //
-// Cost: task-level spend is not yet metered (#15). All cost fields render as
-// '—'. The placeholder constant is here so the next implementor knows exactly
-// where to hook in.
+// Cost (#15): task-level spend is now metered. tasks.cost_micro_usd is stamped at
+// execution time; AgentStat.spend_micro_usd sums it over the 24h window and
+// RecentTask.cost_micro_usd carries the per-task figure. Both are estimates priced
+// from token usage via src/agents/cost.ts (see that module for the caveats).
 
 import type { Env, Agent } from '../types'
 
@@ -31,6 +32,8 @@ export interface AgentStat {
   // success_pct = done / task_count × 100; 0 when task_count = 0
   success_pct: number
   in_flight: number    // open | in_progress tasks right now
+  // #15: summed task cost over the 24h window, in micro-USD (0 when unmetered).
+  spend_micro_usd: number
 }
 
 /**
@@ -46,7 +49,8 @@ export async function loadAgentStats(env: Env): Promise<Map<string, AgentStat>> 
        a.id                                                      AS agent_id,
        COUNT(t.id)                                               AS task_count,
        COALESCE(SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END), 0) AS done_count,
-       COALESCE(SUM(CASE WHEN t.status IN ('open','in_progress') THEN 1 ELSE 0 END), 0) AS in_flight
+       COALESCE(SUM(CASE WHEN t.status IN ('open','in_progress') THEN 1 ELSE 0 END), 0) AS in_flight,
+       COALESCE(SUM(t.cost_micro_usd), 0)                             AS spend_micro_usd
      FROM agents a
      LEFT JOIN tasks t
             ON t.assignee_agent_id = a.id
@@ -54,7 +58,7 @@ export async function loadAgentStats(env: Env): Promise<Map<string, AgentStat>> 
      GROUP BY a.id`,
   )
     .bind(since)
-    .all<{ agent_id: string; task_count: number; done_count: number; in_flight: number }>()
+    .all<{ agent_id: string; task_count: number; done_count: number; in_flight: number; spend_micro_usd: number }>()
 
   const map = new Map<string, AgentStat>()
   for (const r of rows.results ?? []) {
@@ -66,6 +70,7 @@ export async function loadAgentStats(env: Env): Promise<Map<string, AgentStat>> 
       done_count,
       success_pct: task_count > 0 ? Math.round((done_count / task_count) * 100) : 0,
       in_flight: r.in_flight ?? 0,
+      spend_micro_usd: r.spend_micro_usd ?? 0,
     })
   }
   return map
@@ -204,6 +209,8 @@ export interface RecentTask {
   squad_name: string | null
   completed_at: string | null
   created_at: string
+  // #15: cost stamped at execution time, in micro-USD (0 when never executed).
+  cost_micro_usd: number
 }
 
 /** Last 10 tasks across all squads, ordered by most recent update first. */
@@ -212,7 +219,8 @@ export async function loadRecentTasks(env: Env): Promise<RecentTask[]> {
     `SELECT t.id, t.title, t.status,
             t.assignee_agent_id AS agent_id, a.name AS agent_name,
             s.name AS squad_name,
-            t.completed_at, t.created_at
+            t.completed_at, t.created_at,
+            COALESCE(t.cost_micro_usd, 0) AS cost_micro_usd
        FROM tasks t
        LEFT JOIN agents a ON a.id = t.assignee_agent_id
        LEFT JOIN squads s ON s.id = t.squad_id

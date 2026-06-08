@@ -143,24 +143,36 @@ export async function checkAndReserve(
 /**
  * recordTokens — call AFTER the model call (best-effort; never blocks the result).
  *
- * Accumulates the actual tokens spent by the cycle into the window row.
+ * Accumulates the tokens spent by the cycle into the window row, and (issue #15)
+ * the dollar cost of those tokens in micro-USD. costMicroUsd defaults to 0 so
+ * existing callers/tests that only track tokens keep working unchanged.
+ *
  * If the window row does not exist (e.g., checkAndReserve was bypassed in tests),
- * creates it with count=0 so token tracking still works.
+ * creates it with count=0 so token + cost tracking still work.
+ *
+ * NOTE: this records spend — it does NOT enforce a dollar cap. The dollar GATE
+ * (blocking on budget_cap_cents) is intentionally deferred and must land with its
+ * own adversarial gate pass (see the module header). Tracking ≠ enforcing.
  */
 export async function recordTokens(
   env: Env,
   agentId: string,
   tokens: number,
+  costMicroUsd = 0,
 ): Promise<void> {
-  if (tokens <= 0) return
+  const tok = tokens > 0 ? tokens : 0
+  const cost = costMicroUsd > 0 ? Math.round(costMicroUsd) : 0
+  if (tok === 0 && cost === 0) return
   const windowKey = buildWindowKey(env.TENANT_SLUG, agentId)
   const now = new Date().toISOString()
   await env.DB.prepare(
-    `INSERT INTO execution_meter (id, window_key, count, tokens, window_start)
-       VALUES (?, ?, 0, ?, ?)
-       ON CONFLICT(window_key) DO UPDATE SET tokens = tokens + ?`,
+    `INSERT INTO execution_meter (id, window_key, count, tokens, cost_micro_usd, window_start)
+       VALUES (?, ?, 0, ?, ?, ?)
+       ON CONFLICT(window_key) DO UPDATE SET
+         tokens = tokens + ?,
+         cost_micro_usd = cost_micro_usd + ?`,
   )
-    .bind(crypto.randomUUID(), windowKey, tokens, now, tokens)
+    .bind(crypto.randomUUID(), windowKey, tok, cost, now, tok, cost)
     .run()
 }
 

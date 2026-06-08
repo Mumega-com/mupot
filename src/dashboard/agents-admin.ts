@@ -34,6 +34,10 @@ export interface AgentAdminRow {
   autonomy: string // Autonomy — same
   budget_cap_cents: number | null
   budget_window: string // BudgetWindow
+  // #15 cost metering — today's spend for this agent, in micro-USD (millionths of
+  // a dollar). Read from execution_meter's current-day window; 0 when the agent
+  // has not run today. The card derives the Burn gauge ($/hr) from this.
+  spend_today_micro_usd: number
   // current-work: most recent in_progress or open task assigned to this agent.
   // LEFT JOIN pulls one row (MIN id tiebreak); null when the agent has no tasks.
   current_task_title: string | null
@@ -63,6 +67,11 @@ export interface SquadOption {
  * JOINs so the GROUP BY stays simple and the whole load remains a single round-trip.
  */
 export async function loadAllAgents(env: Env): Promise<AgentAdminRow[]> {
+  // #15: today's spend is read via a correlated subquery against the agent's
+  // current-day execution_meter window. The window key is '<tenant>:<agent>:<date>'
+  // (UTC) — we bind the tenant slug + today's UTC date and reconstruct the key in
+  // SQL so the read stays a single round-trip with the rest of the agent load.
+  const today = utcDateKey()
   const rows = await env.DB.prepare(
     `SELECT
        a.id               AS id,
@@ -82,6 +91,8 @@ export async function loadAllAgents(env: Env): Promise<AgentAdminRow[]> {
        a.autonomy         AS autonomy,
        a.budget_cap_cents AS budget_cap_cents,
        a.budget_window    AS budget_window,
+       COALESCE((SELECT em.cost_micro_usd FROM execution_meter em
+                   WHERE em.window_key = ?1 || ':' || a.id || ':' || ?2), 0) AS spend_today_micro_usd,
        COUNT(t.id)        AS task_count,
        COALESCE(SUM(CASE WHEN t.status IN ('open','in_progress') THEN 1 ELSE 0 END), 0) AS open_count,
        COALESCE(SUM(CASE WHEN t.status IN ('open','in_progress') THEN 1 ELSE 0 END), 0) AS in_flight_count,
@@ -104,8 +115,19 @@ export async function loadAllAgents(env: Env): Promise<AgentAdminRow[]> {
               a.okr, a.kpi_target, a.kpi_progress, a.effort, a.autonomy,
               a.budget_cap_cents, a.budget_window
      ORDER BY s.name ASC, a.name ASC`,
-  ).all<AgentAdminRow>()
+  )
+    .bind(env.TENANT_SLUG, today)
+    .all<AgentAdminRow>()
   return rows.results ?? []
+}
+
+/** Current UTC date as 'YYYY-MM-DD' — matches the meter's window-key date part. */
+function utcDateKey(): string {
+  const d = new Date()
+  const y = d.getUTCFullYear()
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0')
+  const day = String(d.getUTCDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
 }
 
 // ── loadSquadOptions ──────────────────────────────────────────────────────────

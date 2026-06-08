@@ -30,6 +30,7 @@ import { createModel } from '../model'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import { checkAndReserve, recordTokens } from './meter'
+import { costMicroUsd } from './cost'
 
 // Hard ceiling on a persisted result (chars). Keeps a runaway model answer from
 // bloating the row / GitHub mirror. ~16KB.
@@ -125,6 +126,11 @@ export async function runTaskExecution(
     }
   }
 
+  // Cost of one execute cycle (issue #15): the conservative token bound priced at
+  // the agent's model rate, in micro-USD. Computed once; stamped on the task row
+  // and accumulated in the meter on every path that actually calls the model.
+  const cycleCostMicroUsd = costMicroUsd(agent.model, EXECUTE_MAX_TOKENS)
+
   try {
     const charter = await loadSquadCharter(env, agent.squad_id)
     const messages: ModelMessage[] = [
@@ -147,25 +153,26 @@ export async function runTaskExecution(
       throw new Error(`gate_transition_invariant_violated: in_progress → ${successStatus}`)
     }
 
-    await finishTask(env, task.id, successStatus, result, finishedAt)
+    await finishTask(env, task.id, successStatus, result, finishedAt, cycleCostMicroUsd)
     // Emit task.completed for ungated (terminal); task.review for gated (awaiting verdict).
     const eventType = successStatus === 'done' ? 'task.completed' : 'task.review'
     await emitSafe(emit, executionEvent(eventType, env, agent, task, successStatus))
     // best-effort memory so the agent's future recalls compound on what it did.
     await rememberSafe(remember, agent.id, `Executed task "${task.title}" → ${successStatus}.`)
-    // Best-effort token accounting: record EXECUTE_MAX_TOKENS as a conservative
-    // estimate. When the model port surfaces actual usage, replace with real count.
-    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS)
+    // Best-effort token + cost accounting: record EXECUTE_MAX_TOKENS as a conservative
+    // estimate, priced at the model rate (#15). When the model port surfaces actual
+    // usage, replace EXECUTE_MAX_TOKENS with the real count (cost follows automatically).
+    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd)
     return { ok: true, task_id: task.id, decided: `completed: ${task.title}`, task_status: successStatus }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'execution_failed'
     const note = capResult(`Execution failed: ${msg}`)
     const finishedAt = new Date().toISOString()
     // NEVER leave in_progress stuck — land it in blocked with the error note.
-    await finishTask(env, task.id, 'blocked', note, finishedAt)
+    await finishTask(env, task.id, 'blocked', note, finishedAt, cycleCostMicroUsd)
     await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
-    // Still count tokens on model failure: the call was attempted.
-    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS)
+    // Still count tokens + cost on model failure: the call was attempted.
+    await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd)
     return { ok: false, task_id: task.id, decided: '', task_status: 'blocked', error: msg }
   }
 }
@@ -206,11 +213,14 @@ async function finishTask(
   status: 'done' | 'blocked' | 'review',
   result: string,
   completedAt: string,
+  // #15: cost of the cycle in micro-USD, stamped on the task for the per-task
+  // cost chip. Defaults to 0 so non-execute callers stay unchanged.
+  costMicroUsd = 0,
 ): Promise<void> {
   await env.DB.prepare(
-    `UPDATE tasks SET status = ?, result = ?, completed_at = ?, updated_at = ? WHERE id = ?`,
+    `UPDATE tasks SET status = ?, result = ?, completed_at = ?, updated_at = ?, cost_micro_usd = ? WHERE id = ?`,
   )
-    .bind(status, result, completedAt, completedAt, taskId)
+    .bind(status, result, completedAt, completedAt, Math.max(0, Math.round(costMicroUsd)), taskId)
     .run()
 }
 
@@ -295,9 +305,10 @@ async function recordTokensSafe(
   env: Env,
   agentId: string,
   tokens: number,
+  costMicroUsd = 0,
 ): Promise<void> {
   try {
-    await record(env, agentId, tokens)
+    await record(env, agentId, tokens, costMicroUsd)
   } catch {
     // best-effort
   }
