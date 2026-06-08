@@ -221,6 +221,8 @@ describe('gated task — waitForEvent resume', () => {
       // D1 says 'approved' — this is the authoritative verdict, not the event payload
       readLatestVerdict: vi.fn(async (): Promise<VerdictRow | null> => ({ verdict: 'approved' })),
       writeReceipt: vi.fn(async (_e, row) => { receipts.push(row) }),
+      // No pending acts — outbound-acts step is skipped (zero-act guard)
+      countPendingActs: vi.fn(async () => 0),
     }
 
     const summary = await runTaskPipeline(env, PARAMS, step, 'inst-3', deps)
@@ -259,6 +261,7 @@ describe('gated task — waitForEvent resume', () => {
       })),
       readLatestVerdict: vi.fn(async (): Promise<VerdictRow | null> => ({ verdict: 'approved' })),
       writeReceipt: vi.fn(async (_e, row) => { receipts.push(row) }),
+      countPendingActs: vi.fn(async () => 0),
     }
 
     await runTaskPipeline(env, PARAMS, step, 'inst-4', deps)
@@ -290,6 +293,7 @@ describe('gated task — waitForEvent timeout', () => {
       })),
       readLatestVerdict,
       writeReceipt: vi.fn(async () => {}),
+      countPendingActs: vi.fn(async () => 0),
     }
 
     // Must not throw
@@ -314,6 +318,7 @@ describe('gated task — waitForEvent timeout', () => {
       })),
       readLatestVerdict: vi.fn(async (): Promise<VerdictRow | null> => ({ verdict: 'approved' })),
       writeReceipt: vi.fn(async (_e, row) => { receipts.push(row) }),
+      countPendingActs: vi.fn(async () => 0),
     }
 
     const summary = await runTaskPipeline(env, PARAMS, step, 'inst-6', deps)
@@ -602,6 +607,7 @@ describe('pipeline summary shape', () => {
       })),
       readLatestVerdict: vi.fn(async (): Promise<VerdictRow | null> => ({ verdict: 'rejected' })),
       writeReceipt: vi.fn(async () => {}),
+      countPendingActs: vi.fn(async () => 0),
     }
 
     const summary = await runTaskPipeline(env, PARAMS, step, 'inst-summary-2', deps)

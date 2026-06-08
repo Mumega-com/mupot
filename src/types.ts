@@ -71,6 +71,12 @@ export interface Env {
   // execution meter caps (env override; meter.ts defaults apply when absent)
   EXEC_MAX_DISPATCH_DAY?: string // max execute-mode dispatches per agent per UTC day
   EXEC_MAX_TOKENS_DAY?: string   // max tokens an agent may spend per UTC day
+  // GHL act-channel secrets (issue #8) — set via `wrangler secret put`, NEVER in .toml.
+  // All optional: absent = not_configured (fails closed, no send path opens).
+  // See wrangler.toml for the operator `wrangler secret put` command block.
+  GHL_API_KEY?: string           // GoHighLevel location API key (outbound send)
+  GHL_LOCATION_ID?: string       // GHL location id (scopes all API calls)
+  GHL_WEBHOOK_SECRET?: string    // HMAC-SHA256 secret for inbound webhook verification
 }
 
 // ── Org domain (mirrors migrations/0001_init.sql + 0009_work_unit.sql) ──

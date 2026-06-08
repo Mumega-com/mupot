@@ -74,3 +74,18 @@ class_name = "TaskWorkflow"
 # membership sync: reconcile channel membership → squad capabilities every 15 min
 [triggers]
 crons = ["*/15 * * * *"]
+
+# ── GHL act-channel secrets (issue #8) ──
+# These are secrets — do NOT add them under [vars]. Set via wrangler secret put:
+#
+#   npx wrangler secret put GHL_API_KEY          # GHL location API key (outbound sends)
+#   npx wrangler secret put GHL_LOCATION_ID      # GHL location id (scopes all API calls)
+#   npx wrangler secret put GHL_WEBHOOK_SECRET   # HMAC-SHA256 secret for inbound webhook
+#
+# Optional var (non-secret; may go in [vars]):
+#   GHL_INBOUND_SQUAD_ID = "<squad-uuid>"  # route inbound webhooks to this squad
+#                                           # (falls back to the pot's first squad if unset)
+#
+# Until these secrets are set the GHL channel is inert (fails closed):
+#   - Outbound sends return { ok: false, reason: 'not_configured' }
+#   - Inbound webhook returns 503 { error: 'not_configured' }
