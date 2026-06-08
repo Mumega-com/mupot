@@ -162,19 +162,45 @@ describe('runLoopCycle — reason + act', () => {
   })
 })
 
-describe('runLoopCycle — default act router', () => {
-  it('REFUSES to fire a gated act from the runtime (gate must not be bypassed)', async () => {
-    // default performAct used (not injected). gate.require_approval = true.
+describe('runLoopCycle — structural gate (cannot be bypassed)', () => {
+  const oneAct: ProposedAct = { channel_index: 0, tool: 't', args: {}, summary: 's' }
+
+  it('a gated loop NEVER reaches performAct even when one is injected', async () => {
+    // The guarantee is structural in runLoopCycle, NOT in the seam: inject a performAct
+    // that WOULD fire — it must never be called for a gated loop.
+    const performAct = vi.fn(async () => {})
     const r = await runLoopCycle(ENV, makeLoop({ gate: { require_approval: true } }), {
       meterCheck: meterOk,
       resolve: resolveReturning([{ id: 'p1' }]),
-      reason: async () => [{ channel_index: 0, tool: 't', args: {}, summary: 's' }],
+      reason: async () => [oneAct],
+      performAct, // would fire — must be bypassed
       recordTokens: noRecord,
       observeKpi: async () => 0,
     })
-    // the gated act throws inside performAct → caught → acted 0 → dry
+    expect(performAct).not.toHaveBeenCalled() // gate held structurally
+    // default queueGatedAct throws (pipeline unwired) → gated stays 0 → dry
     expect(r.acted).toBe(0)
+    expect(r.gated).toBe(0)
     expect(r.decided).toBe('dry')
+  })
+
+  it('a gated loop with a wired queue → gated_pending, nothing fires', async () => {
+    const performAct = vi.fn(async () => {})
+    const queueGatedAct = vi.fn(async () => {})
+    const r = await runLoopCycle(ENV, makeLoop({ gate: { require_approval: true } }), {
+      meterCheck: meterOk,
+      resolve: resolveReturning([{ id: 'p1' }]),
+      reason: async () => [oneAct],
+      performAct,
+      queueGatedAct,
+      recordTokens: noRecord,
+      observeKpi: async () => 0,
+    })
+    expect(queueGatedAct).toHaveBeenCalledTimes(1)
+    expect(performAct).not.toHaveBeenCalled()
+    expect(r.gated).toBe(1)
+    expect(r.acted).toBe(0)
+    expect(r.decided).toBe('gated_pending')
   })
 
   it('fires an ungated act on the resolved channel', async () => {

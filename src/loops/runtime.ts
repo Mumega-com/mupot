@@ -17,7 +17,7 @@ import type { Env, ModelPort } from '../types'
 import type { LoopManifest, ResourceRef } from './manifest'
 import { resolveResource } from './resources'
 import type { ResolvedResource, ResourceItem } from './resources'
-import { checkAndReserve, recordTokens, MICRO_USD_PER_CENT } from '../agents/meter'
+import { checkAndReserve, recordTokens } from '../agents/meter'
 import { costMicroUsd } from '../agents/cost'
 import { LOOP_PLANNING_MAX_TOKENS } from '../agents/loop'
 
@@ -29,13 +29,15 @@ export type LoopDecided =
   | 'budget_exhausted' // dollar cap reached — zero spend
   | 'rate_limited' // count/token cap — zero spend
   | 'dry' // perceive produced nothing actionable
-  | 'acted' // at least one act produced/queued
+  | 'acted' // at least one ungated act fired on a channel
+  | 'gated_pending' // acts were queued for human approval (nothing fired)
 
 export interface LoopCycleResult {
   ok: boolean
   decided: LoopDecided
   perceived: number
-  acted: number
+  acted: number // ungated acts that fired on a channel
+  gated: number // acts routed to the approval gate (queued, NOT fired)
   kpi: number // observed KPI (0..100) after the cycle
   error?: string
 }
@@ -64,8 +66,10 @@ export interface RuntimeDeps {
   recordTokens?: typeof recordTokens
   /** Swappable reasoning seam. Default proposes nothing (the container is reasoning-agnostic). */
   reason?: (env: Env, input: ReasonInput) => Promise<ProposedAct[]>
-  /** Routes one proposed act: gated → queue for approval; ungated → channel.act(). */
+  /** Fires ONE ungated act on its bound channel. Only ever called for an ungated loop. */
   performAct?: (env: Env, loop: LoopManifest, act: ProposedAct, deps: PerformActDeps) => Promise<void>
+  /** Queues ONE act for human approval (gated loops). Default: throws until P4 wires the pipeline. */
+  queueGatedAct?: (env: Env, loop: LoopManifest, act: ProposedAct) => Promise<void>
   /** Observe the outcome KPI (0..100). Default = 0 (a real signal lands in P3). */
   observeKpi?: (env: Env, loop: LoopManifest) => Promise<number>
   model?: ModelPort
@@ -94,49 +98,47 @@ export async function runLoopCycle(
   const meterCheck = deps.meterCheck ?? checkAndReserve
   const reason = deps.reason ?? (async () => [])
   const performAct = deps.performAct ?? defaultPerformAct
+  const queueGatedAct = deps.queueGatedAct ?? defaultQueueGatedAct
   const observeKpi = deps.observeKpi ?? (async () => 0)
 
   // 1. inactive guard
   if (loop.status !== 'active') {
-    return { ok: true, decided: 'inactive', perceived: 0, acted: 0, kpi: 0 }
+    return { ok: true, decided: 'inactive', perceived: 0, acted: 0, gated: 0, kpi: 0 }
   }
 
   // 2. kpi-met guard
   const kpiBefore = clampKpi(await observeKpi(env, loop))
   if (kpiBefore >= 100) {
-    return { ok: true, decided: 'kpi-met', perceived: 0, acted: 0, kpi: kpiBefore }
+    return { ok: true, decided: 'kpi-met', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore }
   }
 
   // The meter is per-subject; a loop is owned by exactly one work-unit.
   const subjectId = loop.agent_id ?? loop.squad_id
   if (!subjectId) {
-    return { ok: false, decided: 'inactive', perceived: 0, acted: 0, kpi: kpiBefore, error: 'loop_has_no_owner' }
+    return { ok: false, decided: 'inactive', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore, error: 'loop_has_no_owner' }
   }
 
   const effort = loop.budget.effort ?? 'standard'
   const actBudget = EFFORT_ACT_BUDGET[effort] ?? 1
 
-  // 3. budget gate — reuse the enforcement meter. cap is micro-USD in the manifest;
-  // the meter takes cents (floor = slightly stricter, conservative).
-  const capCents =
-    typeof loop.budget.cap_micro_usd === 'number'
-      ? Math.floor(loop.budget.cap_micro_usd / MICRO_USD_PER_CENT)
-      : null
+  // 3. budget gate — reuse the enforcement meter. The manifest cap is micro-USD; pass
+  // it VERBATIM (budgetCapMicroUsd) so an intentful sub-cent cap can never round to
+  // unlimited (the meter takes a precise micro cap; no lossy cents conversion here).
   const estimateMicroUsd = costMicroUsd(loopModel(loop), LOOP_PLANNING_MAX_TOKENS)
   const meterResult = await meterCheck(env, subjectId, {
     estimateMicroUsd,
-    budgetCapCents: capCents,
+    budgetCapMicroUsd: loop.budget.cap_micro_usd ?? null,
     budgetWindow: loop.budget.window ?? 'day',
   })
   if (!meterResult.ok) {
     const decided: LoopDecided =
       meterResult.reason === 'budget_cap_exceeded' ? 'budget_exhausted' : 'rate_limited'
-    return { ok: false, decided, perceived: 0, acted: 0, kpi: kpiBefore, error: meterResult.reason }
+    return { ok: false, decided, perceived: 0, acted: 0, gated: 0, kpi: kpiBefore, error: meterResult.reason }
   }
 
   // effort=low ⇒ observe-only: no perceive/reason/act, just KPI tracking.
   if (actBudget === 0) {
-    return { ok: true, decided: 'dry', perceived: 0, acted: 0, kpi: kpiBefore }
+    return { ok: true, decided: 'dry', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore }
   }
 
   // 4. perceive — read every bound source; tolerate a failing source (skip it).
@@ -151,7 +153,7 @@ export async function runLoopCycle(
     }
   }
   if (context.length === 0) {
-    return { ok: true, decided: 'dry', perceived: 0, acted: 0, kpi: kpiBefore }
+    return { ok: true, decided: 'dry', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore }
   }
 
   // 5. reason — propose acts (bounded by effort).
@@ -160,15 +162,25 @@ export async function runLoopCycle(
     proposed = (await reason(env, { loop, context, budget: actBudget })).slice(0, actBudget)
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'reason_failed'
-    return { ok: false, decided: 'dry', perceived: context.length, acted: 0, kpi: kpiBefore, error: msg }
+    return { ok: false, decided: 'dry', perceived: context.length, acted: 0, gated: 0, kpi: kpiBefore, error: msg }
   }
 
-  // 6. act — route each through the gate policy.
+  // 6. act — the GATE DECISION IS STRUCTURAL HERE, not delegated to a seam: a gated
+  // loop NEVER reaches performAct (channel fire); its acts are queued for approval.
+  // This is the load-bearing guarantee — the human gate cannot be bypassed by an
+  // injected performAct.
+  const gatePending = loop.gate.require_approval === true
   let acted = 0
+  let gated = 0
   for (const act of proposed) {
     try {
-      await performAct(env, loop, act, { resolve })
-      acted++
+      if (gatePending) {
+        await queueGatedAct(env, loop, act) // pending approval; nothing fires
+        gated++
+      } else {
+        await performAct(env, loop, act, { resolve })
+        acted++
+      }
     } catch {
       // one failed act must not abort the rest
     }
@@ -183,13 +195,8 @@ export async function runLoopCycle(
   }
   const kpiAfter = clampKpi(await observeKpi(env, loop))
 
-  return {
-    ok: true,
-    decided: acted > 0 ? 'acted' : 'dry',
-    perceived: context.length,
-    acted,
-    kpi: kpiAfter,
-  }
+  const decided: LoopDecided = acted > 0 ? 'acted' : gated > 0 ? 'gated_pending' : 'dry'
+  return { ok: true, decided, perceived: context.length, acted, gated, kpi: kpiAfter }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -209,10 +216,9 @@ function loopModel(_loop: LoopManifest): string {
 }
 
 /**
- * Default act router. Gated loops are NOT auto-fired here: a gated act becomes the
- * caller's responsibility to persist as a pending approval (wired in P3/P4 to the
- * verdict + GHL act-channel). Ungated acts resolve the target channel and call it.
- * Kept intentionally minimal — the concrete outreach wiring is P4.
+ * Default channel fire (ungated acts only — runLoopCycle never calls this for a gated
+ * loop). Resolves the bound channel and calls the tool. Defense in depth: refuse if the
+ * loop is somehow gated.
  */
 async function defaultPerformAct(
   env: Env,
@@ -221,13 +227,20 @@ async function defaultPerformAct(
   deps: PerformActDeps,
 ): Promise<void> {
   if (loop.gate.require_approval) {
-    // A gated act must never fire from the runtime. The approval pipeline (P3/P4)
-    // owns the pending record + post-verdict send. Surfacing here would bypass the gate.
-    throw new Error('gated_act_requires_approval_pipeline')
+    throw new Error('gated_act_must_not_fire') // belt-and-suspenders; the cycle already branched
   }
   if (act.channel_index < 0 || act.channel_index >= loop.channels.length) {
     throw new Error('act_channel_out_of_range')
   }
   const channel = deps.resolve(env, loop.channels[act.channel_index])
   await channel.act(act.tool, act.args)
+}
+
+/**
+ * Default gated-act handler. The approval pipeline (verdict + GHL act-channel) is wired
+ * in P4 (#35). Until then a gated act throws here — so a gated loop visibly errors per
+ * act (decided stays 'dry', gated stays 0) rather than silently appearing to have acted.
+ */
+async function defaultQueueGatedAct(_env: Env, _loop: LoopManifest, _act: ProposedAct): Promise<void> {
+  throw new Error('gated_approval_pipeline_unwired')
 }

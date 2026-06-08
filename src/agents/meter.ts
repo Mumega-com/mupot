@@ -74,7 +74,14 @@ export const MICRO_USD_PER_CENT = 10_000
  */
 export interface ReserveOpts {
   estimateMicroUsd?: number
+  /** Dollar cap in CENTS (agents.budget_cap_cents). Converted to micro-USD internally. */
   budgetCapCents?: number | null
+  /**
+   * Dollar cap in MICRO-USD, taken VERBATIM (no lossy cents rounding). Preferred when
+   * the caller already has a micro-USD cap (the Loop manifest). When both are given,
+   * this wins. A positive value here can never collapse to "unlimited".
+   */
+  budgetCapMicroUsd?: number | null
   /** agents.budget_window — the span the dollar cap covers. Default 'day'. */
   budgetWindow?: 'day' | 'week'
 }
@@ -135,13 +142,19 @@ export async function checkAndReserve(
   }
 
   // ── Dollar cap (issue #4): enforcement-layer HARD stop, BEFORE any spend. ──
-  // The cap is the agent's budget_cap_cents (null/≤0 ⇒ unlimited). The estimate is a
-  // CONSERVATIVE upper bound (cost.ts over-estimates unknown models, #15), so we never
-  // under-count. Block if already at/over the cap, or if the next cycle could breach it.
-  // The cap may be REACHED but not EXCEEDED.
-  const capCents = opts.budgetCapCents
-  if (typeof capCents === 'number' && capCents > 0) {
-    const capMicroUsd = capCents * MICRO_USD_PER_CENT
+  // The estimate is a CONSERVATIVE upper bound (cost.ts over-estimates unknown models,
+  // #15), so we never under-count. Block if already at/over the cap, or if the next
+  // cycle could breach it. The cap may be REACHED but not EXCEEDED.
+  // Resolve the cap to micro-USD. A verbatim micro cap (the Loop manifest) is used as
+  // given — never rounded — so an intentful sub-cent cap can never collapse to unlimited.
+  // Otherwise fall back to the cents cap (agents.budget_cap_cents).
+  const capMicroUsd =
+    typeof opts.budgetCapMicroUsd === 'number' && opts.budgetCapMicroUsd > 0
+      ? opts.budgetCapMicroUsd
+      : typeof opts.budgetCapCents === 'number' && opts.budgetCapCents > 0
+        ? opts.budgetCapCents * MICRO_USD_PER_CENT
+        : null
+  if (capMicroUsd !== null) {
     const estimate =
       opts.estimateMicroUsd && opts.estimateMicroUsd > 0 ? Math.round(opts.estimateMicroUsd) : 0
     // Enforce over the agent's budget_window: 'day' → today's cost row; 'week' →

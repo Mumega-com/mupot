@@ -507,3 +507,27 @@ describe('checkAndReserve — weekly budget window (#4, WARN-3 fix)', () => {
     if (!r.ok) expect(r.reason).toBe('budget_cap_exceeded')
   })
 })
+
+describe('checkAndReserve — verbatim micro-USD cap (P0 sub-cent fix)', () => {
+  it('a sub-cent cap (cap_micro_usd < 10_000) STILL enforces — never collapses to unlimited', async () => {
+    // cap 5_000 micro = $0.005. Spent 6_000 → already over. With the old floor-to-cents
+    // this became 0 cents → unlimited; now it blocks.
+    const env = makeEnv({}, new Map([[todayWindowKey('test-tenant', 'a'), { count: 0, tokens: 0, cost_micro_usd: 6_000 }]]))
+    const r = await checkAndReserve(env, 'a', { estimateMicroUsd: 0, budgetCapMicroUsd: 5_000 })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('budget_cap_exceeded')
+  })
+
+  it('a verbatim micro cap allows spend under it', async () => {
+    const env = makeEnv({}, new Map([[todayWindowKey('test-tenant', 'a'), { count: 0, tokens: 0, cost_micro_usd: 1_000 }]]))
+    const r = await checkAndReserve(env, 'a', { estimateMicroUsd: 1_000, budgetCapMicroUsd: 5_000 })
+    expect(r.ok).toBe(true)
+  })
+
+  it('budgetCapMicroUsd takes precedence over budgetCapCents', async () => {
+    // micro cap 5_000 (tight) wins over a loose 100¢ cents cap → blocks at 6_000 spent.
+    const env = makeEnv({}, new Map([[todayWindowKey('test-tenant', 'a'), { count: 0, tokens: 0, cost_micro_usd: 6_000 }]]))
+    const r = await checkAndReserve(env, 'a', { estimateMicroUsd: 0, budgetCapMicroUsd: 5_000, budgetCapCents: 100 })
+    expect(r.ok).toBe(false)
+  })
+})
