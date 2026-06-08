@@ -45,6 +45,9 @@ describe('validateResourceRef', () => {
       'https://192.168.1.1/mcp',
       'https://169.254.169.254/mcp',
       'https://foo.internal/mcp',
+      'https://localhost./mcp',
+      'https://[::ffff:127.0.0.1]/mcp',
+      'https://[::ffff:a9fe:a9fe]/mcp',
     ]) {
       expect(validateResourceRef({ kind: 'mcp', url }).ok).toBe(false)
     }

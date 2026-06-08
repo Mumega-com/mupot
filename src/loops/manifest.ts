@@ -123,7 +123,8 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  * is defense-in-depth for the unauthenticated read case.
  */
 export function isBlockedHost(host: string): boolean {
-  const h = host.toLowerCase().replace(/^\[|\]$/g, '')
+  // Normalize: lowercase, strip [ ] brackets, strip a trailing dot (localhost. == localhost).
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '')
   if (h === 'localhost' || h === '0.0.0.0' || h.endsWith('.internal') || h.endsWith('.local')) return true
   if (h === '169.254.169.254') return true // cloud metadata endpoint
   if (/^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h)) return true
@@ -132,6 +133,7 @@ export function isBlockedHost(host: string): boolean {
   if (h === '::1') return true
   if (h.startsWith('fe80:')) return true // IPv6 link-local
   if (h.startsWith('fc') || h.startsWith('fd')) return true // IPv6 ULA
+  if (h.includes('::ffff:')) return true // IPv4-mapped IPv6 (e.g. ::ffff:7f00:1 = 127.0.0.1)
   return false
 }
 
