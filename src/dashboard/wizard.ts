@@ -3,16 +3,17 @@
 // GOAL (round 3): fork → `wrangler deploy` → log in → wizard → live, with NO
 // bespoke surgery. This is the owner's guided path from an empty pot to a running
 // org. It is SUBSTRATE only — it seeds STRUCTURE (org name/brand, departments,
-// squads, invites, model provider, IM channel). It never touches a tenant's
-// business content.
+// squads, invites, model provider, IM channel, first agent). It never touches a
+// tenant's business content.
 //
 // wizardApp — mounted by src/dashboard/index.ts at '/setup' (under the '/' mount):
 //   GET  /setup            the wizard (resumes at the saved step) OR a done-summary
 //   POST /setup/brand      step 1 → write org_settings org_name + brand        (owner)
 //   POST /setup/model      step 5 → write org_settings model_provider/name     (owner)
 //   POST /setup/im         step 6 → write org_settings im_provider/channel      (owner)
+//   POST /setup/seed-agent step 7 → create first agent from a template          (owner)
 //   POST /setup/step       persist furthest-reached step (resume on refresh)    (owner)
-//   POST /setup/complete   step 7 → set org_settings.onboarding_complete=true   (owner)
+//   POST /setup/complete   step 8 → set org_settings.onboarding_complete=true   (owner)
 //
 // The structural steps (2 departments, 3 squads, 4 invites) do NOT get new
 // endpoints — the browser POSTs straight to the EXISTING RBAC-gated APIs
@@ -46,6 +47,8 @@ import {
   isOnboardingComplete,
   getOnboardingStep,
 } from './settings'
+import { AGENT_TEMPLATES, getTemplate } from '../org/templates'
+import { createAgent } from '../org/service'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -71,7 +74,7 @@ function isImProvider(v: unknown): v is ImProvider {
   return typeof v === 'string' && (IM_PROVIDERS as readonly string[]).includes(v)
 }
 
-const TOTAL_STEPS = 6
+const TOTAL_STEPS = 7
 
 // Stored brand/org shape (step 1). Small JSON blob in org_settings.
 interface BrandSetting {
@@ -291,6 +294,91 @@ wizardApp.post('/im', requireOwner, blockIfComplete, async (c) => {
   })
 })
 
+// POST /setup/seed-agent — step 7. Create the first agent from a chosen template.
+//
+// The owner picks a template key (or sends { skip: true } to skip). On a
+// non-skip request we:
+//   1. Resolve the first available squad from D1 (the wizard's structural steps
+//      already created at least one, but we handle the empty case gracefully).
+//   2. Derive a slug from the template name (lowercase, hyphens).
+//   3. Call createAgent from ./service (the same path the org API uses).
+//   4. A UNIQUE conflict (slug_taken) means the agent already exists — we treat
+//      that as idempotent success so re-running the wizard step does not crash.
+//
+// Identity is server-derived; the owner cannot supply a different role in the body.
+interface SeedAgentBody {
+  template_key?: unknown
+  skip?: unknown
+}
+
+// slugify mirrors the client-side helper in the wizard script — same logic.
+function slugifyName(s: string): string {
+  return s
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48)
+}
+
+wizardApp.post('/seed-agent', requireOwner, blockIfComplete, async (c) => {
+  let body: SeedAgentBody
+  try {
+    body = (await c.req.json()) as SeedAgentBody
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+
+  // Skip path — owner explicitly chose to skip; nothing is created.
+  if (body.skip === true) {
+    return c.json({ ok: true, skipped: true })
+  }
+
+  if (typeof body.template_key !== 'string' || body.template_key.trim().length === 0) {
+    return c.json({ error: 'invalid_template_key' }, 400)
+  }
+
+  const template = getTemplate(body.template_key.trim())
+  if (!template) {
+    return c.json({ error: 'unknown_template' }, 400)
+  }
+
+  // Resolve the first squad — created during the structural steps. If none exist
+  // yet (owner skipped steps 2–3), return a clear error rather than crashing.
+  const squadRow = await c.env.DB.prepare(
+    'SELECT id FROM squads ORDER BY created_at ASC LIMIT 1',
+  ).first<{ id: string }>()
+
+  if (!squadRow) {
+    return c.json({ error: 'no_squad', hint: 'Create at least one squad in step 3 first.' }, 422)
+  }
+
+  const squadId = squadRow.id
+  const slug = slugifyName(template.name)
+
+  const result = await createAgent(c.env, squadId, {
+    slug,
+    name: template.name,
+    role: template.role,
+    okr: template.okr,
+    kpi_target: template.kpi_target,
+    effort: template.effort,
+    autonomy: template.autonomy,
+  })
+
+  // Idempotency: a slug conflict means the agent was already seeded (e.g. the
+  // owner clicked Save twice). Surface a friendly message, not a 5xx.
+  if (!result.ok && result.error === 'slug_taken') {
+    return c.json({ ok: true, already_exists: true, template_key: template.key })
+  }
+
+  if (!result.ok) {
+    return c.json({ error: result.error }, 400)
+  }
+
+  return c.json({ ok: true, agent: result.value, template_key: template.key }, 201)
+})
+
 // POST /setup/step — persist the furthest-reached step so a refresh resumes there.
 interface StepBody {
   step?: unknown
@@ -501,6 +589,7 @@ function stepper(current: number) {
     'Invite team',
     'Model',
     'IM',
+    'First agent',
   ]
   const items = labels
     .map((label, i) => {
@@ -529,6 +618,7 @@ function wizardBody(brand: string, auth: AuthContext, step: number, prefill: Pre
     ${stepInvitePanel()}
     ${stepModelPanel(prefill)}
     ${stepImPanel(prefill)}
+    ${stepSeedAgentPanel()}
 
     ${wizardScript(startStep)}`
 }
@@ -746,7 +836,44 @@ function stepImPanel(p: Prefill) {
         </form>
         <div class="actions" style="margin-top:14px">
           <button type="button" class="btn ghost" data-back="5">← Back</button>
-          <button type="button" class="btn" id="finish-btn">Finish setup →</button>
+          <button type="button" class="btn" id="im-next">Continue →</button>
+        </div>
+      </div>
+    </section>`
+}
+
+// Step 7 — seed the first agent from a template (or skip). The browser POSTs to
+// the wizard's /seed-agent endpoint which calls createAgent via service.ts.
+function stepSeedAgentPanel() {
+  // Build the option list from AGENT_TEMPLATES (server-side — zero client dep).
+  const opts = AGENT_TEMPLATES.map(
+    (t) =>
+      `<option value="${t.key}">${t.name} — ${t.description}</option>`,
+  ).join('')
+
+  return html`
+    <section class="step-panel" data-step="7" hidden>
+      <div class="card">
+        <h2>7 · Seed your first work unit</h2>
+        <p class="empty">Pick a starter agent so your pot is never empty out of the box. You can
+          edit every field from the agent admin panel after setup. Skip if you'd prefer to add agents
+          manually.</p>
+        <form class="wz" id="form-seed-agent" autocomplete="off">
+          <label class="fld">Template
+            <select name="template_key" id="seed-template">${raw(opts)}</select>
+          </label>
+          <div class="actions">
+            <button type="submit" class="btn secondary" id="seed-btn">Create agent</button>
+            <span class="status-line" data-status></span>
+          </div>
+        </form>
+        <div class="callout" id="seed-done" hidden>
+          Agent created — visible on your <a href="/">overview</a> right away. Ready to finish?
+        </div>
+        <div class="actions" style="margin-top:14px">
+          <button type="button" class="btn ghost" data-back="6">← Back</button>
+          <button type="button" class="btn ghost" id="seed-skip">Skip →</button>
+          <button type="button" class="btn" id="finish-btn" disabled>Finish setup →</button>
           <span class="status-line" id="finish-status"></span>
         </div>
       </div>
@@ -989,7 +1116,7 @@ function wizardScript(startStep: number) {
           });
         }
 
-        // ── step 6: IM + finish ──
+        // ── step 6: IM ──
         var imForm = document.getElementById('form-im');
         var imProvider = document.getElementById('im-provider');
         var imChannelWrap = document.getElementById('im-channel-wrap');
@@ -1020,23 +1147,78 @@ function wizardScript(startStep: number) {
           });
         }
 
+        // ── step 7: seed agent + finish ──
+        // When the owner navigates to step 7 (via im-next or resume), ensure the
+        // IM setting is persisted (if they clicked Continue without saving it first).
+        var imNextBtn = document.getElementById('im-next');
+        if (imNextBtn) {
+          imNextBtn.addEventListener('click', async function () {
+            if (!imSaved && imForm) {
+              var prov = imProvider ? imProvider.value : 'none';
+              var b = { provider: prov };
+              if (prov === 'telegram') {
+                var ch = String(new FormData(imForm).get('channel') || '').trim();
+                if (ch) b.channel = ch; else b.provider = 'none';
+              }
+              await postJSON(SETUP_API + '/im', 'POST', b).catch(function(){});
+            }
+            showStep(7);
+          });
+        }
+
+        var seedForm = document.getElementById('form-seed-agent');
+        var seedDone = document.getElementById('seed-done');
         var finishBtn = document.getElementById('finish-btn');
         var finishStatus = document.getElementById('finish-status');
+        var seedSkip = document.getElementById('seed-skip');
+
+        // Un-gate the Finish button once either seed or skip has been actioned.
+        function unlockFinish() {
+          if (finishBtn) finishBtn.disabled = false;
+        }
+
+        if (seedForm) {
+          seedForm.addEventListener('submit', async function (e) {
+            e.preventDefault();
+            var st = statusOf(seedForm);
+            var fd = new FormData(seedForm);
+            var templateKey = String(fd.get('template_key') || '').trim();
+            if (!templateKey) { setStatus(st, 'Pick a template first.', 'err'); return; }
+            setStatus(st, 'Creating agent…');
+            var seedBtn = document.getElementById('seed-btn');
+            if (seedBtn) seedBtn.disabled = true;
+            try {
+              var res = await postJSON(SETUP_API + '/seed-agent', 'POST', { template_key: templateKey });
+              var data = await res.json().catch(function(){return{};});
+              if (res.ok) {
+                setStatus(st, data.already_exists ? 'Agent already exists — good to go.' : 'Agent created.', 'ok');
+                if (seedDone) seedDone.removeAttribute('hidden');
+                unlockFinish();
+              } else if (res.status === 422) {
+                // no squad yet — let the owner skip and add agents manually.
+                setStatus(st, 'No squad found — skip and add agents manually after setup.', 'err');
+                if (seedBtn) seedBtn.disabled = false;
+              } else {
+                setStatus(st, 'Failed: ' + (data.error || res.status), 'err');
+                if (seedBtn) seedBtn.disabled = false;
+              }
+            } catch (err) { setStatus(st, 'Request errored.', 'err'); if (seedBtn) seedBtn.disabled = false; }
+          });
+        }
+
+        if (seedSkip) {
+          seedSkip.addEventListener('click', async function () {
+            seedSkip.disabled = true;
+            await postJSON(SETUP_API + '/seed-agent', 'POST', { skip: true }).catch(function(){});
+            unlockFinish();
+          });
+        }
+
         if (finishBtn) {
           finishBtn.addEventListener('click', async function () {
             finishBtn.disabled = true;
             setStatus(finishStatus, 'Finishing…');
             try {
-              // If the owner picked an IM provider but never saved it, persist a safe default first.
-              if (!imSaved && imForm) {
-                var prov = imProvider ? imProvider.value : 'none';
-                var b = { provider: prov };
-                if (prov === 'telegram') {
-                  var ch = String(new FormData(imForm).get('channel') || '').trim();
-                  if (ch) b.channel = ch; else b.provider = 'none';
-                }
-                await postJSON(SETUP_API + '/im', 'POST', b).catch(function(){});
-              }
               var res = await postJSON(SETUP_API + '/complete', 'POST', {});
               if (res.ok) { setStatus(finishStatus, 'Done — your pot is live.', 'ok'); setTimeout(function () { location.href = '/'; }, 700); }
               else { finishBtn.disabled = false; setStatus(finishStatus, 'Could not finish (' + res.status + ').', 'err'); }
