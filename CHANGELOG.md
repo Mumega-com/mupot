@@ -2,6 +2,35 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+## [0.10.0] — 2026-06-08
+
+Loop Container foundation: a loop is now a declarative, MCP-native resource.
+(Toward v1.0 — milestone "v1.0 — Loop Container GA", P1/#32.)
+
+### Added
+- **Loop manifest** (`src/loops/manifest.ts`) — the declarative resource the
+  container runs: a `LoopSpec` binding okr + outcome-KPI + sources + channels + gate
+  + budget + cadence + stop to one work-unit (squad XOR agent). Pure manual validators
+  (repo convention, dependency-free). The shape v1.0 will freeze as a public contract.
+- **Loop storage** (`src/loops/service.ts`, migration 0014) — create/get/list/setStatus,
+  spec stored as JSON and re-validated on read. Every read/write tenant-scoped.
+- **ResourceRef resolver / MCP seam** (`src/loops/resources.ts`) — the critical-path
+  unlock: sources & channels are MCP-native, so any MCP server (our pot MCP, a ChatGPT
+  connector, Google Drive, the ~17k public servers) binds with zero adapter code. A
+  minimal in-Worker JSON-RPC client keeps the bundle tiny. Built-in `memory`; `queue`
+  lands in P4.
+  - **Security (adversarial-gated, RED→GREEN):** a loop manifest is tenant data, so the
+    resolver treats it as untrusted. Secrets are NEVER taken from the manifest — `auth_ref`
+    names a NAMESPACED `LOOP_SECRET_<name>` binding (platform secrets are unreachable) and
+    each secret is HOST-PINNED (only sent to `LOOP_SECRET_<name>_HOST`; missing/mismatch →
+    fail closed). SSRF block on private/loopback/link-local/metadata + IPv4-mapped-IPv6
+    hosts. `tool_filter` allowlist on read + act. fetch timeout + 1 MB response cap.
+    The review caught a url×auth_ref secret-exfil P0; closed before merge.
+
+### Notes
+- Additive infrastructure — no route wires a tenant-authored manifest yet (that arrives
+  with the runtime, P2). When it does, bind the loop owner to the authenticated principal.
+
 ## [0.9.0] — 2026-06-08
 
 The governance primitive: a HARD dollar brake on autonomous spend — and the goal
