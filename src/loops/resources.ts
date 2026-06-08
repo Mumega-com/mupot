@@ -17,7 +17,17 @@
 
 import type { Env } from '../types'
 import type { ResourceRef, ResourceKind } from './manifest'
+import { isBlockedHost } from './manifest'
 import { createMemory } from '../memory'
+
+// Secrets a loop may name are NAMESPACED: auth_ref 'ghl' resolves env.LOOP_SECRET_ghl,
+// and the secret only travels to the host pinned in env.LOOP_SECRET_ghl_HOST. Platform
+// secrets (GITHUB_TOKEN, BUS_TOKEN, OAUTH_*, …) are NOT under this prefix, so a manifest
+// can never name them. This is the fix for the P1 adversarial BLOCK (url×auth_ref exfil).
+const SECRET_PREFIX = 'LOOP_SECRET_'
+const HOST_SUFFIX = '_HOST'
+const MCP_TIMEOUT_MS = 15_000
+const MCP_MAX_RESPONSE_BYTES = 1_000_000 // 1 MB cap on an MCP response body
 
 export interface ResourceItem {
   id: string
@@ -101,9 +111,15 @@ async function mcpRpc(
     method: 'POST',
     headers,
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    signal: AbortSignal.timeout(MCP_TIMEOUT_MS),
   })
   if (!res.ok) throw new Error(`mcp_http_${res.status}`)
-  const json = (await res.json()) as { result?: unknown; error?: { message?: string } }
+  // Size cap: reject an oversized body before parsing (a bound server may be hostile).
+  const declared = res.headers.get('content-length')
+  if (declared && Number(declared) > MCP_MAX_RESPONSE_BYTES) throw new Error('mcp_response_too_large')
+  const text = await res.text()
+  if (text.length > MCP_MAX_RESPONSE_BYTES) throw new Error('mcp_response_too_large')
+  const json = JSON.parse(text) as { result?: unknown; error?: { message?: string } }
   if (json.error) throw new Error(`mcp_error: ${json.error.message ?? 'unknown'}`)
   return json.result
 }
@@ -128,14 +144,40 @@ function coerceItems(result: unknown): ResourceItem[] {
 
 function mcpResource(env: Env, ref: ResourceRef, deps: ResolveDeps): ResolvedResource {
   const fetchFn = deps.fetchFn ?? fetch
-  const url = ref.url as string // validator guarantees an https url for kind='mcp'
-  // Secret is resolved SERVER-SIDE from the env by the opaque auth_ref name. It is
-  // never taken from the manifest. A missing binding → undefined → unauthenticated
-  // call (the server decides). We index env defensively.
-  const secret =
-    ref.auth_ref && typeof (env as unknown as Record<string, unknown>)[ref.auth_ref] === 'string'
-      ? ((env as unknown as Record<string, unknown>)[ref.auth_ref] as string)
-      : undefined
+  const url = ref.url as string // validator guarantees a safe https url for kind='mcp'
+
+  // Defense in depth: re-check the host at resolve time (the validator already
+  // rejected blocked hosts, but a caller could bypass validation).
+  let host: string
+  try {
+    host = new URL(url).hostname
+  } catch {
+    throw new Error('mcp_url_invalid')
+  }
+  if (isBlockedHost(host)) throw new Error('mcp_url_blocked_host')
+
+  // ── Secret resolution (the P0 fix) ────────────────────────────────────────────
+  // auth_ref names a NAMESPACED secret: env.LOOP_SECRET_<auth_ref>. Platform secrets
+  // (GITHUB_TOKEN, BUS_TOKEN, OAUTH_*) live OUTSIDE this prefix → unreachable by a
+  // manifest. AND the secret is HOST-PINNED: it is only ever sent to the host named
+  // in env.LOOP_SECRET_<auth_ref>_HOST. If the pin is missing or mismatched we refuse
+  // to send the secret (fail closed) — a secret can never travel to an unpinned host.
+  let secret: string | undefined
+  if (ref.auth_ref) {
+    const bag = env as unknown as Record<string, unknown>
+    const rawSecret = bag[SECRET_PREFIX + ref.auth_ref]
+    const pinnedHost = bag[SECRET_PREFIX + ref.auth_ref + HOST_SUFFIX]
+    if (typeof rawSecret === 'string' && rawSecret.length > 0) {
+      if (typeof pinnedHost !== 'string' || pinnedHost.length === 0) {
+        throw new Error('mcp_secret_host_not_pinned')
+      }
+      if (pinnedHost.toLowerCase() !== host.toLowerCase()) {
+        throw new Error('mcp_secret_host_mismatch')
+      }
+      secret = rawSecret
+    }
+    // auth_ref named but no LOOP_SECRET_* binding → no secret (unauthenticated call).
+  }
   const filter = ref.tool_filter
 
   function assertAllowed(tool: string): void {

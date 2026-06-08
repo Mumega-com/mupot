@@ -30,11 +30,29 @@ describe('enum guards', () => {
 })
 
 describe('validateResourceRef', () => {
-  it('mcp requires an https url', () => {
+  it('mcp requires a public https url', () => {
     expect(validateResourceRef({ kind: 'mcp', url: 'https://x.example/mcp' }).ok).toBe(true)
     const bad = validateResourceRef({ kind: 'mcp', url: 'http://x.example/mcp' })
     expect(bad.ok).toBe(false)
-    if (!bad.ok) expect(bad.error).toBe('mcp_url_must_be_https')
+    if (!bad.ok) expect(bad.error).toBe('mcp_url_must_be_https_public')
+  })
+
+  it('rejects private/loopback/metadata hosts (SSRF)', () => {
+    for (const url of [
+      'https://localhost/mcp',
+      'https://127.0.0.1/mcp',
+      'https://10.0.0.5/mcp',
+      'https://192.168.1.1/mcp',
+      'https://169.254.169.254/mcp',
+      'https://foo.internal/mcp',
+    ]) {
+      expect(validateResourceRef({ kind: 'mcp', url }).ok).toBe(false)
+    }
+  })
+
+  it('rejects an auth_ref with unsafe characters', () => {
+    expect(validateResourceRef({ kind: 'mcp', url: 'https://x/mcp', auth_ref: 'a b' }).ok).toBe(false)
+    expect(validateResourceRef({ kind: 'mcp', url: 'https://x/mcp', auth_ref: 'GHL_API_KEY' }).ok).toBe(true)
   })
 
   it('mcp without url fails', () => {
@@ -133,7 +151,7 @@ describe('validateLoopSpec', () => {
   it('propagates a bad nested resource error with the list label', () => {
     const r = validateLoopSpec({ ...base, channels: [{ kind: 'mcp', url: 'http://insecure' }] })
     expect(r.ok).toBe(false)
-    if (!r.ok) expect(r.error).toBe('channels: mcp_url_must_be_https')
+    if (!r.ok) expect(r.error).toBe('channels: mcp_url_must_be_https_public')
   })
 
   it('rejects a negative budget cap', () => {

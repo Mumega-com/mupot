@@ -115,13 +115,40 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
 }
 
-function isHttpsUrl(v: unknown): v is string {
+/**
+ * Block private / loopback / link-local / cloud-metadata hosts (SSRF defense).
+ * Hostname-literal based — does NOT resolve DNS, so it cannot stop DNS-rebinding
+ * (a public name pointing at 169.254.x). The real protection against secret exfil
+ * is host-pinning in the resolver (a secret only travels to its pinned host); this
+ * is defense-in-depth for the unauthenticated read case.
+ */
+export function isBlockedHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '')
+  if (h === 'localhost' || h === '0.0.0.0' || h.endsWith('.internal') || h.endsWith('.local')) return true
+  if (h === '169.254.169.254') return true // cloud metadata endpoint
+  if (/^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h)) return true
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return true
+  if (/^169\.254\./.test(h)) return true
+  if (h === '::1') return true
+  if (h.startsWith('fe80:')) return true // IPv6 link-local
+  if (h.startsWith('fc') || h.startsWith('fd')) return true // IPv6 ULA
+  return false
+}
+
+/** https + a non-blocked host. Used for any mcp ResourceRef url. */
+function isSafeHttpsUrl(v: unknown): v is string {
   if (typeof v !== 'string' || v.length === 0) return false
   try {
-    return new URL(v).protocol === 'https:'
+    const u = new URL(v)
+    return u.protocol === 'https:' && !isBlockedHost(u.hostname)
   } catch {
     return false
   }
+}
+
+/** auth_ref is an opaque logical name → must be a safe identifier (no env-key smuggling). */
+function isSafeAuthRef(v: unknown): v is string {
+  return typeof v === 'string' && /^[A-Za-z0-9_]+$/.test(v) && v.length <= 64
 }
 
 /** Validate a single ResourceRef. mcp ⇒ https url required; secrets never inline. */
@@ -132,7 +159,7 @@ export function validateResourceRef(input: unknown): Validate<ResourceRef> {
   const ref: ResourceRef = { kind: input.kind }
 
   if (input.kind === 'mcp') {
-    if (!isHttpsUrl(input.url)) return { ok: false, error: 'mcp_url_must_be_https' }
+    if (!isSafeHttpsUrl(input.url)) return { ok: false, error: 'mcp_url_must_be_https_public' }
     ref.url = input.url
   } else {
     // built-in: a name selects the queue/memory scope
@@ -143,7 +170,7 @@ export function validateResourceRef(input: unknown): Validate<ResourceRef> {
   }
 
   if (input.auth_ref !== undefined) {
-    if (typeof input.auth_ref !== 'string') return { ok: false, error: 'invalid_auth_ref' }
+    if (!isSafeAuthRef(input.auth_ref)) return { ok: false, error: 'invalid_auth_ref' }
     ref.auth_ref = input.auth_ref
   }
   if (input.tool_filter !== undefined) {
