@@ -27,6 +27,7 @@ import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerd
 import type { TaskStatus } from './service'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
+import { startTaskPipeline } from '../workflows/pipeline'
 
 // ── validation helpers ───────────────────────────────────────────────────────
 
@@ -565,6 +566,24 @@ tasksApp.post('/:id/verdict', async (c) => {
       { task, verdict: body.verdict, note, decidedBy },
       auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
     )
+
+    // Best-effort Workflow resume: if a pipeline instance is parked on
+    // waitForEvent for this task, nudge it to re-read D1.  A dropped or
+    // failed sendEvent must NEVER fail the verdict response — D1 is the
+    // authoritative source of the verdict; the Workflow re-reads D1 on resume
+    // regardless of the event payload.
+    if (task.workflow_instance_id && c.env.TASK_WORKFLOW) {
+      try {
+        const inst = await c.env.TASK_WORKFLOW.get(task.workflow_instance_id)
+        await inst.sendEvent({ type: 'gate-verdict', payload: { verdict: body.verdict } })
+      } catch {
+        // sendEvent failure is non-fatal: the Workflow instance may not be
+        // parked yet (event is silently dropped by CF) or may have already
+        // completed.  Either way the verdict is already in D1 — the pipeline
+        // will read the correct state on any future resume.
+      }
+    }
+
     return c.json(result, 201)
   } catch (err) {
     if (err instanceof VerdictRaceError) {
@@ -572,6 +591,54 @@ tasksApp.post('/:id/verdict', async (c) => {
       return c.json({ error: 'verdict_conflict', reason: 'task status changed concurrently; reload and retry' }, 409)
     }
     throw err // propagate unexpected errors (5xx)
+  }
+})
+
+// ── POST /:id/pipeline — start a durable CF Workflows pipeline for a task ────
+//
+// Creates a TaskWorkflow instance wrapping runTaskExecution + optional
+// waitForEvent gate pause.  OPT-IN: tasks run via the legacy direct-execute
+// path (AgentDO, bus consumer, PATCH dispatch) are unaffected.
+//
+// RBAC: same member+ guard as all task mutations (canActOnSquad).
+// Guard: only allowed when workflow_instance_id is null AND task is runnable.
+// Returns { instanceId } so the caller can poll or log the pipeline state.
+
+tasksApp.post('/:id/pipeline', async (c) => {
+  const taskId = c.req.param('id')
+
+  if (!c.env.TASK_WORKFLOW) {
+    return c.json({ error: 'workflow_not_configured', detail: 'TASK_WORKFLOW binding is absent in this pot' }, 503)
+  }
+
+  const task = await getById<Task>(c.env, 'tasks', taskId)
+  if (!task) return c.json({ error: 'task_not_found' }, 404)
+
+  // RBAC: same member+ gate as all task mutations.
+  if (!(await canActOnSquad(c.env, c.get('auth'), task.squad_id))) {
+    return c.json({ error: 'forbidden', need: 'member' }, 403)
+  }
+
+  try {
+    const { instanceId } = await startTaskPipeline(c.env, taskId, task.squad_id)
+    return c.json({ instanceId }, 201)
+  } catch (err) {
+    if (err instanceof Error) {
+      const code = (err as Error & { code?: string }).code
+      if (code === 'task_not_found') return c.json({ error: 'task_not_found' }, 404)
+      if (code === 'pipeline_already_started') {
+        const instanceId = (err as Error & { instanceId?: string }).instanceId
+        return c.json({ error: 'pipeline_already_started', instanceId }, 409)
+      }
+      if (code === 'task_not_runnable') {
+        const status = (err as Error & { status?: string }).status
+        return c.json({ error: 'task_not_runnable', status }, 409)
+      }
+      if (code === 'task_has_no_assignee') {
+        return c.json({ error: 'task_has_no_assignee', detail: 'assign an agent before starting the pipeline' }, 409)
+      }
+    }
+    throw err
   }
 })
 

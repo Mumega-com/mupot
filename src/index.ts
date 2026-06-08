@@ -26,6 +26,9 @@ import { channelsAdminApp } from './channels/admin'
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
 export { SquadCoordinatorDO } from './agents/squad-do'
+// Workflow class — the CF Workflows runtime discovers it via this named export.
+// The class_name in [[workflows]] must match: "TaskWorkflow".
+export { TaskWorkflow } from './workflows/task-workflow'
 
 const app = new Hono<{ Bindings: Env }>()
 

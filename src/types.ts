@@ -11,6 +11,34 @@ import type {
   DurableObjectNamespace,
 } from '@cloudflare/workers-types'
 
+// ── Workflow binding type ──────────────────────────────────────────────────────
+//
+// @cloudflare/workers-types exports `Workflow` as a global abstract class (not
+// as a named export from the module), so it cannot be used directly in an
+// interface import.  We define a minimal local structural type that matches the
+// subset of the Workflow<PARAMS> API this codebase uses.  This avoids importing
+// 'cloudflare:workers' (unavailable in Vitest) into types.ts, and keeps the
+// binding testable via a plain mock object in tests.
+//
+// The real binding (Workflow<TaskPipelineParams>) is structurally assignable to
+// this interface — TypeScript will verify that in task-workflow.ts where it is
+// consumed.
+export interface WorkflowBinding<PARAMS = unknown> {
+  /**
+   * Create a new Workflow instance.  Returns a handle; we only need the id.
+   * The full CF type also accepts `id?` and `retention?` in opts — we surface
+   * only `params` because that is what the pipeline uses.
+   */
+  create(opts: { params: PARAMS }): Promise<{ id: string }>
+  /**
+   * Get a handle to an existing instance by id, for sendEvent on resume.
+   */
+  get(id: string): Promise<{
+    sendEvent(e: { type: string; payload: unknown }): Promise<void>
+    status(): Promise<unknown>
+  }>
+}
+
 // ── Cloudflare bindings (must match wrangler.toml) ──
 export interface Env {
   DB: D1Database
@@ -21,6 +49,11 @@ export interface Env {
   AI: Ai
   AGENT: DurableObjectNamespace
   SQUAD: DurableObjectNamespace
+  // Durable task pipeline (issue #7, migration 0012).  Optional: only present
+  // when the [[workflows]] binding is declared in wrangler.toml.  Code that
+  // calls the binding should guard `if (env.TASK_WORKFLOW)` or use the
+  // startTaskPipeline helper which handles the absent-binding case gracefully.
+  TASK_WORKFLOW?: WorkflowBinding<import('./workflows/pipeline').TaskPipelineParams>
   // vars
   TENANT_SLUG: string
   BRAND: string
@@ -130,6 +163,10 @@ export interface Task {
   result: string | null // execution output (model answer) or a short failure note
   completed_at: string | null // ISO; set when execution finishes (done OR blocked)
   gate_owner: string | null // capability string gating the review→approved|rejected transition
+  // Durable pipeline (issue #7): set when this task was started via
+  // POST /api/tasks/:id/pipeline.  Null on the legacy direct-execute path.
+  // Used by the verdict endpoint to best-effort resume the waiting instance.
+  workflow_instance_id?: string | null
   created_at: string
   updated_at: string
 }

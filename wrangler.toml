@@ -62,6 +62,15 @@ class_name = "SquadCoordinatorDO"
 tag = "v1"
 new_sqlite_classes = ["AgentDO", "SquadCoordinatorDO"]
 
+# ── durable task pipeline (issue #7) ──
+# Opt-in: start via POST /api/tasks/:id/pipeline.  The legacy direct-execute
+# path (runTaskExecution) is unaffected.  step.waitForEvent pauses the instance
+# at zero idle cost until the verdict endpoint resumes it.
+[[workflows]]
+name = "mupot-task-workflow"
+binding = "TASK_WORKFLOW"
+class_name = "TaskWorkflow"
+
 # membership sync: reconcile channel membership → squad capabilities every 15 min
 [triggers]
 crons = ["*/15 * * * *"]
