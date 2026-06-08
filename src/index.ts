@@ -58,16 +58,20 @@ app.route(ROUTES.dashboard, dashboardApp)
 import { handleQueue } from './bus/consumer'
 // Metabolism — the pot heartbeat that pulses goal-bearing work-units (#27 loop, made autonomous).
 import { runMetabolism } from './agents/metabolism'
+import { runLoopsTick } from './loops/driver'
 
 export default {
   fetch: app.fetch,
   queue: handleQueue,
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Two independent heartbeats on the same cron:
+    // Three independent heartbeats on the same cron:
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
     //     ("design loops, not prompts"; without this the v0.3.0 loop never fires).
+    //  3. loop driver — run one cycle of each active Loop manifest (the container
+    //     heartbeat; without this runLoopCycle has no scheduled caller).
     ctx.waitUntil(reconcileMembership(env))
     ctx.waitUntil(runMetabolism(env))
+    ctx.waitUntil(runLoopsTick(env))
   },
 }
