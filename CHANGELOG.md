@@ -2,6 +2,24 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+## [0.7.0] — 2026-06-08
+
+The pot breathes. Goal-bearing work-units now run on their own.
+
+### Added
+- **Metabolism — the pot heartbeat** (`src/agents/metabolism.ts`). The v0.3.0
+  goal loop (`runGoalCycle`) only fired once an agent's DO alarm was set — a
+  hibernating or never-woken unit never started, so "set a unit's knobs and walk
+  away" was inert. The cron `scheduled` handler now also runs `runMetabolism`: each
+  tick it kicks every active, goal-bearing, not-yet-complete agent's DO `/wake`,
+  which runs one metered goal cycle and re-arms its self-perpetuating alarm. This
+  is the "constant small movement" — what makes the unit actually move toward its
+  KPI without anyone messaging it. **"Design loops, not prompts" is now live.**
+  - Economic safety: each kick goes through the per-agent daily meter (rate_limited
+    → zero spend) and the effort budget (low → observe-only); the metabolism caps
+    kicks at `MAX_AGENTS_PER_TICK` (25), rotating least-recently-updated first.
+  - Goal-less agents are never kicked (no autonomous loop; explicit dispatch only).
+
 ## [0.6.0] — 2026-06-08
 
 The customer-side body, gated. Agents can now act on a CRM — but only after a human

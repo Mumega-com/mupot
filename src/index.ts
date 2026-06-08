@@ -56,12 +56,18 @@ app.route(ROUTES.dashboard, dashboardApp)
 
 // Queue consumer — the bus component owns the handler.
 import { handleQueue } from './bus/consumer'
+// Metabolism — the pot heartbeat that pulses goal-bearing work-units (#27 loop, made autonomous).
+import { runMetabolism } from './agents/metabolism'
 
 export default {
   fetch: app.fetch,
   queue: handleQueue,
-  // membership sync: reconcile channel membership → squad capabilities on a schedule.
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    // Two independent heartbeats on the same cron:
+    //  1. membership sync — reconcile channel membership → squad capabilities.
+    //  2. metabolism — kick goal-bearing agents so their goal loops actually run
+    //     ("design loops, not prompts"; without this the v0.3.0 loop never fires).
     ctx.waitUntil(reconcileMembership(env))
+    ctx.waitUntil(runMetabolism(env))
   },
 }
