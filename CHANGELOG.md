@@ -2,6 +2,32 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+## [0.6.0] — 2026-06-08
+
+The customer-side body, gated. Agents can now act on a CRM — but only after a human
+approves at the gate, and never holding the keys.
+
+### Added
+- **GHL gated act-channel** (#8). Outbound acts (send email / add contact / move CRM
+  stage) are queued `pending` (`outbound_acts`, migration 0013) and fire ONLY through
+  `runApprovedActs`, which independently re-reads `task_verdicts` and refuses unless
+  the task's verdict is `approved`. Wired as a post-gate `step.do('outbound-acts')` in
+  the durable pipeline. Inbound GHL webhooks (`POST /api/integrations/ghl/inbound`,
+  HMAC-verified, constant-time, 503 when unconfigured) create a task — the loop closes,
+  the task stays the document.
+  - **Fails closed**: with no `GHL_API_KEY`/`GHL_LOCATION_ID` secret the send path is
+    inert (acts stay pending); the inbound webhook 503s. Verified live.
+  - **No keys in agents**: the API key is a Worker secret, read only at the send
+    boundary, never logged / returned / persisted.
+  - Adversarial-gated. P1 (double-send a customer email on a CF Workflows step retry)
+    closed with a claim-before-send state machine (atomic `pending→sending` before the
+    external call) + a deterministic per-act Idempotency-Key. P2 (in-API path traversal
+    via act ids) closed with charset validation.
+
+### To go live (operator)
+`wrangler secret put GHL_API_KEY | GHL_LOCATION_ID | GHL_WEBHOOK_SECRET`, optional
+`GHL_INBOUND_SQUAD_ID` var. The human owns the GHL account + the relationship.
+
 ## [0.5.0] — 2026-06-08
 
 Durable pipelines: a task can run as a Cloudflare Workflow, and the gate is now
