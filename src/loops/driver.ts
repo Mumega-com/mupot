@@ -15,6 +15,7 @@ import { runLoopCycle } from './runtime'
 import type { RuntimeDeps } from './runtime'
 import type { LoopManifest } from './manifest'
 import { wireGatedAct } from './gate'
+import { makeOutreachReason, makeOutreachObserveKpi } from './outreach'
 
 /** Max loops driven per cron tick. Large tenants rotate across ticks (oldest-first via listLoops order). */
 export const MAX_LOOPS_PER_TICK = 25
@@ -67,9 +68,16 @@ export async function runLoopsTick(env: Env, deps: DriverDeps = {}): Promise<Loo
   let paused = 0
   let errors = 0
 
-  // Production runtime seams: gated acts route to the verdict/approvals pipeline
-  // (wireGatedAct). A caller's runtimeDeps override these (tests, future reason/KPI).
-  const runtimeDeps: RuntimeDeps = { queueGatedAct: wireGatedAct, ...deps.runtimeDeps }
+  // Production runtime seams: gated acts → verdict/approvals (wireGatedAct); the outreach
+  // reasoner drafts to queued prospects (consuming each = dedup); the KPI is positive
+  // replies. These are the first loop CONFIG; non-outreach loops simply propose nothing
+  // (items without an email are skipped). A caller's runtimeDeps override any of these.
+  const runtimeDeps: RuntimeDeps = {
+    queueGatedAct: wireGatedAct,
+    reason: makeOutreachReason(),
+    observeKpi: makeOutreachObserveKpi(),
+    ...deps.runtimeDeps,
+  }
 
   for (const loop of batch) {
     try {
