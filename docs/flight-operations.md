@@ -40,6 +40,49 @@ the agent is **sleeping** (next departure on the board), not dead.
 This *simplifies*: one coherent ops model over five scattered concerns — cost, readiness,
 crew, audit, scheduling.
 
+## The control law — one score + two checks
+
+The preflight gate is not a vibe. It's a **coherence score** plus **two go/no-go checks**,
+all computed from signals the pot already logs. Plain numbers, no new machinery.
+
+**Coherence score (0–1)** — how healthy a flight is, combined from factors we already have:
+
+| Factor | Signal | Healthy |
+|---|---|---|
+| cache readiness | is the context cached / will it stay cached | warm |
+| context complete | the flight plan is fully loaded (goal, data, prior state) | nothing missing |
+| tools reachable | every tool/MCP the flight needs answers | all up |
+| budget headroom | enough budget allocated for the whole flight | yes |
+| progress signal | recent useful progress, low retry/error rate | trending up |
+
+Combine the factors into one 0–1 score. A flight launches only when the score is above a
+set threshold **and both checks below pass**.
+
+**Check 1 — progress beats waste.** Estimate useful progress per step vs tokens burned per
+step. If a flight burns more than it advances, it will **wander** (drift around the problem,
+spending without closing it). Wandering flight → don't launch; a flight that starts
+wandering mid-air → land it. *(This is the single most common expensive-agent failure: busy,
+not progressing.)*
+
+**Check 2 — cache stays warm.** Each planned step must land inside the cache window (~5 min)
+so the cache stays hot. If steps are too slow or too gappy, the cache cools and the next call
+roughly **doubles** in cost. Too-cold a plan → restructure (shorter steps, pre-fetch
+everything in preflight) or don't launch.
+
+**In flight, watch two things:**
+- **Score trend** — if the coherence score is *dropping*, that's an early warning: land
+  before it collapses (cheaper than a failed landing).
+- **The two checks** — progress stalls (waste > progress) or cache goes cold → abort/land.
+
+**Selection rule:** when choosing between flights or paths, prefer the one with the higher
+**sustained progress**, not the one with more activity/tokens. Busywork is not coherence.
+
+**Honest guard (don't trust the score blind).** Only rely on the coherence score where it
+actually predicts flight cost/outcome **better than a dumb baseline** — e.g. "cache cold +
+no progress in N steps → abort." Pre-pick the factors *before* measuring, then check on held-
+out flights whether the score beats the dumb rule. If the dumb rule does just as well, use
+the dumb rule. Measure before you trust; keep it simple where simple wins.
+
 ## Vocabulary (adopted)
 
 `loop` (the think→act→observe cycle) · `routine` (a saved config + trigger that fires
@@ -58,8 +101,10 @@ Two presence sources, by agent tier:
 ## What is this version vs future
 
 **v0.19 (now):**
-- **#60** preflight checklist gate — the core money-saver.
-- **#61** flight board — Fleet shows running/sleeping + per-flight cost.
+- **#60** preflight checklist gate — the coherence score + the two checks (progress-beats-waste,
+  cache-stays-warm). GREEN before the expensive meter starts. The core money-saver.
+- **#61** flight board — Fleet shows running/sleeping + per-flight cost + the coherence score and
+  its trend (the early-warning).
 - **#62** sleeping / schedule-aware presence + vocab adoption.
 
 **Future (post-0.19):**
