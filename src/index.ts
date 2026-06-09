@@ -17,7 +17,7 @@ import { agentsApp } from './agents'
 import { tasksApp, gatesApp } from './tasks'
 import { busApp } from './bus'
 import { membersApp } from './members'
-import { mcpApp } from './mcp'
+import { mcpActionsApp, mcpApp } from './mcp'
 import { imApp } from './im'
 import { dashboardApp } from './dashboard'
 import { channelsApp, reconcileMembership } from './channels'
@@ -50,6 +50,7 @@ app.route('/api/gates', gatesApp)
 app.route(ROUTES.bus, busApp)
 app.route(ROUTES.members, membersApp)
 app.route(ROUTES.mcp, mcpApp)
+app.route('/', mcpActionsApp)
 app.route(ROUTES.im, imApp)
 // channel adapters: the scoped webhook (/channels/:platform/webhook) + binding admin.
 // Mounted BEFORE the dashboard '/' catch-all so the specific prefixes win.
