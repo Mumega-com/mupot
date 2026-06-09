@@ -2,6 +2,42 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+## [0.18.0] — 2026-06-09
+
+Flock — a tenant pot becomes the live home + window for its own agents, across any
+runtime, with zero coupling to our internal bus. Milestone #2.
+
+### Added
+- **Pot-native flock check-in** (#45, PR #57). Agents check **in** to the pot
+  (`POST /api/fleet/checkin`, authenticated by their pot member-token) so the Fleet shows
+  a live inventory — who has access + who is in now — with **no SOS-bus coupling and no
+  egress** (the pot stays sealed; agents call inbound). `/fleet` renders the pot-native
+  roster (active → idle → dead by last check-in) when the pot has no company bus.
+  `migrations/0016_presence.sql`; deployed + proven live on the Digid pot.
+- **Harness pack system** (#53, PRs #54/#55). `docs/flock-harness-pack-contract.md` (the
+  spec every runtime pack satisfies: scoped identity, presence/heartbeat, work skills,
+  onboarding) + the **Claude Code reference pack** (`packs/claude-code/flock-agent/`:
+  `.mcp.json` template, `SKILL.md`, `heartbeat.sh`, README). Per-harness approach
+  researched for Codex / Hermes (Nous) / Claude Cowork / openclaw.
+- **Fleet bus-wire runbook** (#44, PR #56) — `docs/flock-go-live.md`, the operator path to
+  wire a pot's Fleet to the company SOS bus (the alternative to pot-native).
+
+### Changed
+- **Tenant-scoped Fleet** (#43, PR #52). The Fleet window now addresses the pot's **own**
+  bus project + ops agent (`FLEET_PROJECT` / `FLEET_OPS_AGENT`), not the hardwired company
+  `sos`/`kasra`. A tenant pot can no longer show or steer the company roster.
+
+### Security
+- **Fail-closed Fleet scoping** (#43, adversarial-gated). The project/sender/ops resolvers
+  return null (refuse) instead of defaulting to the company `sos`/`kasra`; routes gate on
+  `fleetScoped()`. A misconfigured tenant pot cannot silently address our roster. Recorded
+  the real isolation invariant: a pot's `BUS_TOKEN` must be project-scoped + agent-bound,
+  never admin/null.
+- **Check-in is auth + write hardened** (#45, adversarial-gated GREEN). Identity is taken
+  only from the token (never the body); generic 401 (no oracle); `source` allowlisted,
+  `label` capped, all Fleet fields HTML-escaped; a 30s KV debounce bounds D1 writes per
+  agent. Follow-up #58 filed to bind member-tokens to their tenant (defense-in-depth).
+
 ## [0.17.0] — 2026-06-09
 
 Go-live readiness — de-risk the path to the first live send.
