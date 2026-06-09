@@ -25,6 +25,7 @@ import { channelsAdminApp } from './channels/admin'
 import { ghlInboundApp } from './integrations/ghl-routes'
 import { prospectsApp } from './loops/prospects-routes'
 import { loopsApp } from './loops/routes'
+import { fleetCheckinApp } from './fleet/checkin-routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -56,6 +57,9 @@ app.route('/api/channels', channelsAdminApp)
 app.route('/api/integrations/ghl', ghlInboundApp)
 app.route('/api/prospects', prospectsApp)
 app.route('/api/loops', loopsApp)
+// Flock check-in (Flock #45): agents POST presence with their member-token (bearer).
+// Inbound only — the pot needs no egress. Mounted before the dashboard '/' catch-all.
+app.route('/api/fleet', fleetCheckinApp)
 app.route(ROUTES.dashboard, dashboardApp)
 
 // Queue consumer — the bus component owns the handler.

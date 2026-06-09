@@ -1,0 +1,52 @@
+// member-bearer — resolve a pot member-token (bearer) to its identity.
+//
+// Shared agent/member bearer resolution for non-MCP surfaces (e.g. fleet check-in).
+// Mirrors the MCP auth path in src/mcp/index.ts (sha256 the token → look up a live,
+// non-revoked member_token joined to an ACTIVE member). Tenant is environment-
+// derived, never client-supplied.
+//
+// NOTE: src/mcp/index.ts has its own inline copy of this lookup. Once the in-flight
+// #41 work lands, dedupe MCP's authenticateMember onto this helper. Kept separate
+// for now to avoid editing that file mid-change.
+
+import type { Env } from '../types'
+
+export interface AgentIdentity {
+  memberId: string
+  displayName: string
+  email: string | null
+}
+
+async function sha256Hex(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s))
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+// Parse "Bearer <token>" → raw token, or null. Same shape as the MCP extractor.
+export function bearerToken(header: string | undefined | null): string | null {
+  if (!header) return null
+  const m = header.match(/^Bearer\s+(.+)$/i)
+  if (!m) return null
+  const tok = m[1].trim()
+  return tok.length > 0 ? tok : null
+}
+
+// Resolve a raw bearer token to an identity, or null on any failure (no oracle —
+// a missing token and a bad token are indistinguishable to the caller).
+export async function resolveMemberByToken(env: Env, raw: string | null): Promise<AgentIdentity | null> {
+  if (!raw) return null
+  const tokenHash = await sha256Hex(raw)
+  const row = await env.DB.prepare(
+    `SELECT m.id AS member_id, m.display_name AS display_name, m.email AS email, m.status AS status
+       FROM member_tokens t
+       JOIN members m ON m.id = t.member_id
+      WHERE t.token_hash = ?1 AND t.revoked_at IS NULL
+      LIMIT 1`,
+  )
+    .bind(tokenHash)
+    .first<{ member_id: string; display_name: string; email: string | null; status: string }>()
+  if (!row || row.status !== 'active') return null
+  return { memberId: row.member_id, displayName: row.display_name, email: row.email }
+}
