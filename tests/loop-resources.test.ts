@@ -144,8 +144,15 @@ describe('resolveResource — memory built-in', () => {
   })
 })
 
-describe('resolveResource — queue not yet', () => {
-  it('throws a loud not-yet error (P4) rather than silently returning empty', () => {
-    expect(() => resolveResource(ENV, { kind: 'queue', name: 'prospects' })).toThrow('resource_queue_lands_in_p4')
+describe('resolveResource — queue built-in (P4)', () => {
+  it('read() maps queued prospects to items (org/email/consent carried for the reasoner + CASL)', async () => {
+    const listQueued = vi.fn(async () => [
+      { id: 'p1', tenant: 't', loop_id: null, org: 'Acme', contact_name: 'Sam', email: 'sam@acme.com', source: 'seed' as const, consent_basis: 'consent' as const, status: 'queued' as const, notes: null, created_at: 'x' },
+    ])
+    const r = resolveResource(ENV, { kind: 'queue', name: 'loop-1' }, { listQueued })
+    const items = await r.read('', { limit: 5 })
+    expect(items[0]).toMatchObject({ id: 'p1', title: 'Acme', email: 'sam@acme.com', consent_basis: 'consent' })
+    expect(listQueued).toHaveBeenCalledWith(ENV, { loopId: 'loop-1', limit: 5 })
+    await expect(r.act('x', {})).rejects.toThrow('queue_resource_is_read_only')
   })
 })

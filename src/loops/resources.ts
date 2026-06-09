@@ -19,6 +19,8 @@ import type { Env } from '../types'
 import type { ResourceRef, ResourceKind } from './manifest'
 import { isBlockedHost } from './manifest'
 import { createMemory } from '../memory'
+import { listQueued } from './prospects'
+import type { Prospect } from './prospects'
 
 // Secrets a loop may name are NAMESPACED: auth_ref 'ghl' resolves env.LOOP_SECRET_ghl,
 // and the secret only travels to the host pinned in env.LOOP_SECRET_ghl_HOST. Platform
@@ -50,6 +52,8 @@ export interface ResolveDeps {
   fetchFn?: typeof fetch
   /** Memory recall seam (built-in 'memory'). Defaults to createMemory(env).recall. */
   recall?: (scope: string, query: string, limit?: number) => Promise<Array<{ id: string; text: string; score: number }>>
+  /** Prospect queue read seam (built-in 'queue'). Defaults to listQueued. */
+  listQueued?: (env: Env, opts: { loopId?: string | null; limit?: number }) => Promise<Prospect[]>
 }
 
 const DEFAULT_READ_TOOL = 'search'
@@ -62,9 +66,7 @@ export function resolveResource(env: Env, ref: ResourceRef, deps: ResolveDeps = 
     case 'memory':
       return memoryResource(env, ref, deps)
     case 'queue':
-      // The concrete prospect/work queue lands in P4 (#35). Recognised by the
-      // manifest validator, not yet resolvable — fail loud, never silently empty.
-      throw new Error('resource_queue_lands_in_p4')
+      return queueResource(env, ref, deps)
     default:
       throw new Error('unsupported_resource_kind')
   }
@@ -84,6 +86,32 @@ function memoryResource(env: Env, ref: ResourceRef, deps: ResolveDeps): Resolved
     async act() {
       // Memory is a read source; it has no act surface.
       throw new Error('memory_resource_is_read_only')
+    },
+  }
+}
+
+// ── built-in: prospect queue (P4) ──────────────────────────────────────────────
+
+function queueResource(env: Env, ref: ResourceRef, deps: ResolveDeps): ResolvedResource {
+  // ref.name optionally scopes to one loop's queue; otherwise the tenant's queue.
+  const loopId = ref.name && ref.name.length > 0 ? ref.name : null
+  const read = deps.listQueued ?? listQueued
+  return {
+    kind: 'queue',
+    async read(_query, opts) {
+      const rows = await read(env, { loopId, limit: opts?.limit ?? 5 })
+      return rows.map((p) => ({
+        id: p.id,
+        title: p.org ?? p.contact_name ?? p.email ?? p.id,
+        text: [p.contact_name, p.email, p.notes].filter(Boolean).join(' · '),
+        // carry the fields the reasoner + CASL gate need (consent basis, email)
+        email: p.email ?? undefined,
+        consent_basis: p.consent_basis,
+        org: p.org ?? undefined,
+      }))
+    },
+    async act() {
+      throw new Error('queue_resource_is_read_only')
     },
   }
 }
