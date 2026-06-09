@@ -159,6 +159,21 @@ ghlInboundApp.post('/inbound', async (c) => {
     return c.json({ error: 'unauthorized' }, 401)
   }
 
+  // Replay / idempotency guard: a verified webhook is processed at most once within the
+  // TTL window. GHL retries on a non-200 with the SAME body → the SAME HMAC signature; a
+  // replayed event likewise reuses its signature. We record the signature in KV and treat
+  // a repeat as a no-op success, so a retry/replay cannot double-process (re-create a
+  // task, re-flip a prospect's status). Best-effort: a KV outage falls through to process.
+  const nonceKey = `ghlnonce:${signatureHeader}`
+  try {
+    if (await c.env.SESSIONS.get(nonceKey)) {
+      return c.json({ ok: true, duplicate: true })
+    }
+    await c.env.SESSIONS.put(nonceKey, '1', { expirationTtl: 86400 })
+  } catch {
+    // KV unavailable — do not block a legitimate inbound on a cache miss.
+  }
+
   // Verified — parse the event body.
   let event: Record<string, unknown>
   try {
