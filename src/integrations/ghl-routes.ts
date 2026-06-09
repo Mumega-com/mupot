@@ -23,6 +23,8 @@
 import { Hono } from 'hono'
 import type { Env } from '../types'
 import { createTask } from '../tasks/service'
+import { findByEmail, setProspectStatus } from '../loops/prospects'
+import type { ProspectStatus } from '../loops/prospects'
 
 // ── Env extension for GHL route-specific bindings ─────────────────────────────
 //
@@ -186,6 +188,42 @@ ghlInboundApp.post('/inbound', async (c) => {
     status: 'open',
   })
 
+  // Outreach reply tracking: if this inbound maps to a known prospect, move it so the
+  // outcome KPI (replied) reflects it and the loop stops re-contacting. Best-effort —
+  // never affects the webhook response (GHL retries on non-200).
+  try {
+    const update = prospectUpdateFromEvent(event)
+    if (update) {
+      const p = await findByEmail(c.env, update.email)
+      // opted_out is terminal — never overwrite an unsubscribe with a 'replied'.
+      if (p && p.status !== 'opted_out') await setProspectStatus(c.env, p.id, update.status)
+    }
+  } catch {
+    // best-effort; reply tracking must not break inbound processing
+  }
+
   // Return 200 immediately — GHL retries on anything else.
   return c.json({ ok: true })
 })
+
+// ── Outreach reply mapping ──────────────────────────────────────────────────────
+
+/** Map a verified inbound event to a prospect status change, or null if it isn't one. */
+export function prospectUpdateFromEvent(event: Record<string, unknown>): { email: string; status: ProspectStatus } | null {
+  const email = pickEmail(event)
+  if (!email) return null
+  const t = (typeof event.type === 'string' ? event.type : '').toLowerCase()
+  const optOut = ['unsub', 'opt_out', 'optout', 'complaint', 'bounce'].some((k) => t.includes(k))
+  if (t.includes('bounce')) return { email, status: 'bounced' }
+  return { email, status: optOut ? 'opted_out' : 'replied' }
+}
+
+function pickEmail(event: Record<string, unknown>): string | null {
+  if (typeof event.email === 'string' && event.email.includes('@')) return event.email
+  const contact = event.contact
+  if (contact && typeof contact === 'object') {
+    const e = (contact as Record<string, unknown>).email
+    if (typeof e === 'string' && e.includes('@')) return e
+  }
+  return null
+}
