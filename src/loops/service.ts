@@ -109,6 +109,30 @@ export async function listLoops(env: Env, opts: { status?: LoopStatus } = {}): P
   return out
 }
 
+/** bumpDryRounds — increment the consecutive-empty-tick counter; returns the new value. */
+export async function bumpDryRounds(env: Env, id: string): Promise<number> {
+  const now = new Date().toISOString()
+  await env.DB.prepare(
+    `UPDATE loops SET dry_rounds = dry_rounds + 1, updated_at = ? WHERE id = ? AND tenant = ?`,
+  )
+    .bind(now, id, env.TENANT_SLUG)
+    .run()
+  const row = await env.DB.prepare(`SELECT dry_rounds FROM loops WHERE id = ? AND tenant = ? LIMIT 1`)
+    .bind(id, env.TENANT_SLUG)
+    .first<{ dry_rounds: number }>()
+  return row?.dry_rounds ?? 0
+}
+
+/** resetDryRounds — clear the counter after a productive tick (no-op if already 0). */
+export async function resetDryRounds(env: Env, id: string): Promise<void> {
+  const now = new Date().toISOString()
+  await env.DB.prepare(
+    `UPDATE loops SET dry_rounds = 0, updated_at = ? WHERE id = ? AND tenant = ? AND dry_rounds != 0`,
+  )
+    .bind(now, id, env.TENANT_SLUG)
+    .run()
+}
+
 /** setLoopStatus — tenant-scoped lifecycle transition. Returns false if no row changed. */
 export async function setLoopStatus(env: Env, id: string, status: LoopStatus): Promise<boolean> {
   const now = new Date().toISOString()

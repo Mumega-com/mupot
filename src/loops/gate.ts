@@ -17,8 +17,11 @@ import { createOutboundAct } from '../integrations/ghl'
 
 // Act tools that map to a customer-side outbound act (the GHL act-channel kinds).
 const GHL_ACT_KINDS = new Set(['send_email', 'add_contact', 'move_stage'])
-// Capability that owns a loop-queued gate. Mirrors the goal loop's gate owner.
-const LOOP_GATE_OWNER = 'lead'
+// The gate capability a loop-queued task requires. This is a `gate:*` string (the
+// gate_grants namespace the verdict endpoint + approvals queue check), NOT a
+// membership capability — owner/admin verdict it directly; a delegated reviewer needs
+// a gate_grants row for 'gate:loops'.
+const LOOP_GATE_OWNER = 'gate:loops'
 
 export interface WireGateDeps {
   createTask?: typeof createTask
@@ -44,12 +47,17 @@ export async function wireGatedAct(
   const squadId = await resolveSquadId(env, loop)
   if (!squadId) throw new Error('loop_squad_unresolved')
 
+  // status:'review' is REQUIRED — the verdict endpoint (409 not_in_review) and the
+  // /approvals queue both act ONLY on review tasks. A loop-queued act is a finished
+  // proposal awaiting human approval (not work awaiting execution), so it enters at
+  // 'review' directly. Without this the task strands at 'open', invisible + un-verdictable.
   const task = await doCreateTask(
     env,
     {
       squad_id: squadId,
       title: (act.summary || `loop act: ${act.tool}`).slice(0, 200),
       body: JSON.stringify({ loop_id: loop.id, tool: act.tool, args: act.args }),
+      status: 'review',
       gate_owner: LOOP_GATE_OWNER,
     },
     { actor: { kind: 'agent', id: loop.agent_id ?? loop.id } },

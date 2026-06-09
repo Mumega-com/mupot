@@ -10,7 +10,7 @@
 // D1 or model.
 
 import type { Env } from '../types'
-import { listLoops } from './service'
+import { listLoops, bumpDryRounds, resetDryRounds, setLoopStatus } from './service'
 import { runLoopCycle } from './runtime'
 import type { RuntimeDeps } from './runtime'
 import type { LoopManifest } from './manifest'
@@ -24,6 +24,7 @@ export interface LoopsTickResult {
   ran: number // cycles executed
   acted: number // ungated acts fired across all loops
   gated: number // acts queued for approval across all loops
+  paused: number // loops paused this tick for hitting dry_rounds_max
   errors: number // cycles that errored (counted, never fatal)
 }
 
@@ -32,6 +33,10 @@ export interface DriverDeps {
   list?: (env: Env) => Promise<LoopManifest[]>
   /** Run one cycle. Default: runLoopCycle. */
   runCycle?: typeof runLoopCycle
+  /** Dry-round bookkeeping seams (injectable for tests). */
+  bumpDry?: (env: Env, id: string) => Promise<number>
+  resetDry?: (env: Env, id: string) => Promise<void>
+  pause?: (env: Env, id: string) => Promise<boolean>
   /** Seams forwarded into each cycle (resolve/reason/performAct/observeKpi/…). */
   runtimeDeps?: RuntimeDeps
 }
@@ -44,18 +49,22 @@ export interface DriverDeps {
 export async function runLoopsTick(env: Env, deps: DriverDeps = {}): Promise<LoopsTickResult> {
   const list = deps.list ?? ((e) => listLoops(e, { status: 'active' }))
   const runCycle = deps.runCycle ?? runLoopCycle
+  const bumpDry = deps.bumpDry ?? bumpDryRounds
+  const resetDry = deps.resetDry ?? resetDryRounds
+  const pause = deps.pause ?? ((e, id) => setLoopStatus(e, id, 'paused'))
 
   let loops: LoopManifest[]
   try {
     loops = await list(env)
   } catch {
-    return { ok: false, ran: 0, acted: 0, gated: 0, errors: 0 }
+    return { ok: false, ran: 0, acted: 0, gated: 0, paused: 0, errors: 0 }
   }
 
   const batch = loops.slice(0, MAX_LOOPS_PER_TICK)
   let ran = 0
   let acted = 0
   let gated = 0
+  let paused = 0
   let errors = 0
 
   // Production runtime seams: gated acts route to the verdict/approvals pipeline
@@ -69,10 +78,26 @@ export async function runLoopsTick(env: Env, deps: DriverDeps = {}): Promise<Loo
       acted += r.acted
       gated += r.gated
       if (!r.ok) errors++
+
+      // Stop-condition bookkeeping: a 'dry' tick advances the empty-round counter and
+      // pauses the loop at dry_rounds_max (bounds idle loops); any productive tick resets it.
+      try {
+        const max = loop.stop.dry_rounds_max
+        if (r.decided === 'dry') {
+          if (typeof max === 'number' && max > 0) {
+            const n = await bumpDry(env, loop.id)
+            if (n >= max && (await pause(env, loop.id))) paused++
+          }
+        } else if (r.ok) {
+          await resetDry(env, loop.id)
+        }
+      } catch {
+        // bookkeeping is best-effort; never abort the sweep
+      }
     } catch {
       errors++ // one bad cycle must not stop the rest
     }
   }
 
-  return { ok: true, ran, acted, gated, errors }
+  return { ok: true, ran, acted, gated, paused, errors }
 }

@@ -26,13 +26,14 @@ function deps() {
 }
 
 describe('wireGatedAct', () => {
-  it('creates a GATED task (gate_owner set) for a squad-owned loop', async () => {
+  it('creates a REVIEW task with a gate:* capability for a squad-owned loop', async () => {
     const d = deps()
     await wireGatedAct(ENV, makeLoop(), emailAct, d)
     expect(d.createTask).toHaveBeenCalledTimes(1)
     const [, input] = d.createTask.mock.calls[0]
     expect(input.squad_id).toBe('sq-1')
-    expect(input.gate_owner).toBe('lead') // gated → shows in /approvals
+    expect(input.status).toBe('review') // REQUIRED — else invisible to /approvals + un-verdictable
+    expect(input.gate_owner).toBe('gate:loops') // a gate_grants capability, not a membership role
     expect(input.title).toBe('first touch')
   })
 

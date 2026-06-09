@@ -18,6 +18,9 @@ function makeLoop(id: string): LoopManifest {
 
 const cycleResult = (over = {}) => ({ ok: true, decided: 'acted' as const, perceived: 1, acted: 1, gated: 0, kpi: 0, ...over })
 
+// no-op dry-round seams so tests don't hit D1; overridden where the pause path is tested.
+const dryNoop = { bumpDry: vi.fn(async () => 1), resetDry: vi.fn(async () => {}), pause: vi.fn(async () => true) }
+
 describe('runLoopsTick', () => {
   it('runs a cycle for each active loop and aggregates acted/gated', async () => {
     const list = vi.fn(async () => [makeLoop('1'), makeLoop('2')])
@@ -65,7 +68,28 @@ describe('runLoopsTick', () => {
   it('counts a cycle that returns ok:false as an error', async () => {
     const list = vi.fn(async () => [makeLoop('1')])
     const runCycle = vi.fn(async () => cycleResult({ ok: false, decided: 'budget_exhausted', acted: 0 }))
-    const r = await runLoopsTick(ENV, { list, runCycle })
+    const r = await runLoopsTick(ENV, { list, runCycle, ...dryNoop })
     expect(r.errors).toBe(1)
+  })
+
+  it('pauses an idle loop at dry_rounds_max', async () => {
+    const loop = makeLoop('1')
+    loop.stop = { dry_rounds_max: 3 }
+    const list = vi.fn(async () => [loop])
+    const runCycle = vi.fn(async () => cycleResult({ decided: 'dry', acted: 0 }))
+    const bumpDry = vi.fn(async () => 3) // counter reaches the cap
+    const pause = vi.fn(async () => true)
+    const r = await runLoopsTick(ENV, { list, runCycle, bumpDry, resetDry: dryNoop.resetDry, pause })
+    expect(bumpDry).toHaveBeenCalledWith(ENV, '1')
+    expect(pause).toHaveBeenCalledWith(ENV, '1')
+    expect(r.paused).toBe(1)
+  })
+
+  it('resets the dry counter on a productive tick', async () => {
+    const list = vi.fn(async () => [makeLoop('1')])
+    const runCycle = vi.fn(async () => cycleResult({ decided: 'acted' }))
+    const resetDry = vi.fn(async () => {})
+    await runLoopsTick(ENV, { list, runCycle, bumpDry: dryNoop.bumpDry, resetDry, pause: dryNoop.pause })
+    expect(resetDry).toHaveBeenCalledWith(ENV, '1')
   })
 })
