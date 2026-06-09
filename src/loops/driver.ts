@@ -14,6 +14,7 @@ import { listLoops } from './service'
 import { runLoopCycle } from './runtime'
 import type { RuntimeDeps } from './runtime'
 import type { LoopManifest } from './manifest'
+import { wireGatedAct } from './gate'
 
 /** Max loops driven per cron tick. Large tenants rotate across ticks (oldest-first via listLoops order). */
 export const MAX_LOOPS_PER_TICK = 25
@@ -57,9 +58,13 @@ export async function runLoopsTick(env: Env, deps: DriverDeps = {}): Promise<Loo
   let gated = 0
   let errors = 0
 
+  // Production runtime seams: gated acts route to the verdict/approvals pipeline
+  // (wireGatedAct). A caller's runtimeDeps override these (tests, future reason/KPI).
+  const runtimeDeps: RuntimeDeps = { queueGatedAct: wireGatedAct, ...deps.runtimeDeps }
+
   for (const loop of batch) {
     try {
-      const r = await runCycle(env, loop, deps.runtimeDeps ?? {})
+      const r = await runCycle(env, loop, runtimeDeps)
       ran++
       acted += r.acted
       gated += r.gated
