@@ -2,6 +2,32 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+## [0.12.0] — 2026-06-09
+
+Loops run on the heartbeat, and a gated loop queues real work to /approvals.
+(Toward v1.0 — P3/#34.)
+
+### Added
+- **Loop driver** (`src/loops/driver.ts`). `runLoopsTick` lists the tenant's active
+  loops and runs one `runLoopCycle` each (capped at 25/tick, best-effort), wired into
+  the Worker `scheduled()` handler as a third heartbeat. A Loop manifest now fires
+  unattended — the runtime had no scheduled caller before.
+- **Declarative gate wiring** (`src/loops/gate.ts`). A gated loop's proposed act becomes
+  a `status='review'` task (capability `gate:loops`) that lands in `/approvals`, plus —
+  for CRM kinds — a PENDING `outbound_act` that can only ever fire post-approved-verdict
+  via `runApprovedActs` (#8). Nothing sends from the loop/driver/cron path; a gated loop
+  proposes and queues, never sends.
+- **Stop-condition** — the driver advances each loop's `dry_rounds` on an empty tick and
+  PAUSES it at `stop.dry_rounds_max` (bounds idle loops); a productive tick resets it.
+
+### Notes
+- Adversarial-gated (kasra-review) RED→GREEN: the first cut created the gated task at
+  `status='open'`, which is invisible to `/approvals` and un-verdictable — a dead gate;
+  and used a membership capability instead of a `gate:*` one. Both fixed and re-verified
+  (an owner can now see + approve the task; external callers cannot forge `review`).
+- No `reason` seam ships yet (runtime default proposes nothing), so loops are inert until
+  P4 wires the outreach config + prospect queue + the real reasoner + outcome KPI.
+
 ## [0.11.0] — 2026-06-09
 
 The Loop Container runs: a manifest is now executable, governed end to end.
