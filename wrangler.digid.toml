@@ -22,8 +22,14 @@ OAUTH_PROVIDER = "google"
 # posture decision #44); these vars only scope, they do not open egress.
 FLEET_PROJECT = "digid"
 FLEET_OPS_AGENT = "digid"
-# secrets deliberately NOT set (pre-live egress-gate requirement, dossier 2026-06-05):
-# no OAUTH_*, GITHUB_TOKEN, AI_GATEWAY_TOKEN, channel tokens — pot is inbound-only.
+# GitHub weave (Digidinc/Digid). GITHUB_REPO is non-secret (which repo). The inbound
+# webhook (PR/CI → work units) needs GITHUB_WEBHOOK_SECRET; the outbound tasks↔issues
+# mirror needs GITHUB_TOKEN (a fine-grained PAT or GitHub App install token) — both are
+# secrets set via `wrangler secret put`, the egress decision for this pot.
+GITHUB_REPO = "Digidinc/Digid"
+# secrets deliberately NOT set yet (egress-gate, dossier 2026-06-05):
+# no OAUTH_*, AI_GATEWAY_TOKEN, channel tokens. GITHUB_TOKEN/GITHUB_WEBHOOK_SECRET to be
+# set when the weave goes live — pot is otherwise inbound-only.
 
 [[d1_databases]]
 binding = "DB"

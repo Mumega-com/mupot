@@ -70,7 +70,10 @@ export interface Env {
   OAUTH_CLIENT_ID?: string
   OAUTH_CLIENT_SECRET?: string
   BUS_TOKEN?: string
-  GITHUB_TOKEN?: string
+  GITHUB_TOKEN?: string // outbound: tasks↔issues mirror (fine-grained PAT or App install token)
+  GITHUB_REPO?: string // "owner/repo" the pot weaves to (e.g. "Digidinc/Digid")
+  GITHUB_WEBHOOK_SECRET?: string // inbound: verifies GitHub webhook (x-hub-signature-256)
+  GITHUB_INBOUND_SQUAD_ID?: string // optional: squad that GitHub work-units land on
   AI_GATEWAY_TOKEN?: string
   IM_WEBHOOK_SECRET?: string // shared secret for the IM webhook (Telegram secret_token)
   HERMES_RELAY_SECRET?: string // shared secret for the Hermes → mupot channel relay
