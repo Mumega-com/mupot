@@ -52,6 +52,7 @@ export async function mintMemberToken(
   memberId: string,
   label: string,
   channel: ConnectionChannel,
+  agentId: string | null = null,
 ): Promise<MintedToken> {
   const rawToken = mintRawToken()
   const tokenHash = await sha256Hex(rawToken)
@@ -64,10 +65,11 @@ export async function mintMemberToken(
     revoked_at: null,
   }
 
+  // agent_id binds this token to an agent (the weld). NULL = a human/operator principal.
   await env.DB.prepare(
-    'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
   )
-    .bind(token.id, token.member_id, tokenHash, token.label, token.channel, token.created_at)
+    .bind(token.id, token.member_id, tokenHash, token.label, token.channel, token.created_at, agentId)
     .run()
 
   return {

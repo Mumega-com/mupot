@@ -32,12 +32,22 @@ describe('resolveMemberByToken', () => {
     const env = makeEnv({ member_id: 'm1', display_name: 'A', email: null, status: 'suspended' })
     expect(await resolveMemberByToken(env, 'sk-x')).toBeNull()
   })
-  it('resolves an active member to its identity', async () => {
+  it('resolves an active member to its identity (unbound token → boundAgentId null)', async () => {
     const env = makeEnv({ member_id: 'm1', display_name: 'Kasra', email: 'k@x', status: 'active' })
     expect(await resolveMemberByToken(env, 'sk-x')).toEqual({
       memberId: 'm1',
       displayName: 'Kasra',
       email: 'k@x',
+      boundAgentId: null,
+    })
+  })
+  it('returns boundAgentId for an agent-scoped token (the weld)', async () => {
+    const env = makeEnv({ member_id: 'm1', display_name: 'content-writer', email: null, status: 'active', bound_agent_id: 'agent-7' })
+    expect(await resolveMemberByToken(env, 'sk-x')).toEqual({
+      memberId: 'm1',
+      displayName: 'content-writer',
+      email: null,
+      boundAgentId: 'agent-7',
     })
   })
 })

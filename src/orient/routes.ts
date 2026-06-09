@@ -32,7 +32,9 @@ orientApp.get('/', async (c) => {
   const member = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
   if (!member) return c.json({ error: 'unauthorized' }, 401)
 
-  const ref = c.req.query('agent')
+  // An agent-scoped token orients ITSELF by default — no ?agent= needed (the weld).
+  // A human/operator token (no binding) must name the agent it wants.
+  const ref = c.req.query('agent') ?? member.boundAgentId
   if (!ref) return c.json({ error: 'agent_required' }, 400)
   const agentRef = await resolveAgentRef(c.env, ref)
   if (!agentRef) return c.json({ error: 'not_found' }, 404)

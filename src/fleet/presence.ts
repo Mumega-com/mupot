@@ -25,6 +25,9 @@ export interface PresenceRow {
   label: string
   last_seen_at: string
   first_seen_at: string
+  // The bound agent (member_tokens.agent_id), when the checking-in token is agent-scoped.
+  // The weld: this is the REAL agent identity, not a name guess. null = operator principal.
+  agent_id: string | null
 }
 
 export interface PresenceView extends PresenceRow {
@@ -52,22 +55,23 @@ export async function recordCheckin(
   const source = normalizeSource(opts.source)
   const label = typeof opts.label === 'string' ? opts.label.slice(0, 120) : ''
   await env.DB.prepare(
-    `INSERT INTO presence (tenant, member_id, display_name, source, label, first_seen_at, last_seen_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now'))
+    `INSERT INTO presence (tenant, member_id, display_name, source, label, agent_id, first_seen_at, last_seen_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))
      ON CONFLICT(tenant, member_id) DO UPDATE SET
        display_name = excluded.display_name,
        source       = excluded.source,
        label        = excluded.label,
+       agent_id     = excluded.agent_id,
        last_seen_at = datetime('now')`,
   )
-    .bind(env.TENANT_SLUG, id.memberId, id.displayName, source, label)
+    .bind(env.TENANT_SLUG, id.memberId, id.displayName, source, label, id.boundAgentId)
     .run()
 }
 
 // List the flock for this tenant with derived liveness. Tenant-scoped.
 export async function listPresence(env: Env, nowMs: number): Promise<PresenceView[]> {
   const res = await env.DB.prepare(
-    `SELECT member_id, display_name, source, label, last_seen_at, first_seen_at
+    `SELECT member_id, display_name, source, label, agent_id, last_seen_at, first_seen_at
        FROM presence WHERE tenant = ?1 ORDER BY last_seen_at DESC LIMIT 200`,
   )
     .bind(env.TENANT_SLUG)
