@@ -55,6 +55,7 @@ import type { MintedToken, PublicMemberToken } from '../members/service'
 // Connect-config builders (pure) for the Connect card.
 import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
 import { loadApprovals, resultPreview } from './approvals'
+import { loadLoopsView, loopsBody } from './loops'
 import type { ApprovalItem } from './approvals'
 import {
   loadObservatory,
@@ -157,6 +158,12 @@ dashboardApp.get('/send', async (c) => {
 dashboardApp.get('/approvals', async (c) => {
   const items = await loadApprovals(c.env, c.get('auth'))
   return c.html(shell(c.env.BRAND, 'Approvals', approvalsBody(items)))
+})
+
+// ── loops (watch goal-seeking work-units + the outreach funnel) ──────────────
+dashboardApp.get('/loops', async (c) => {
+  const view = await loadLoopsView(c.env)
+  return c.html(shell(c.env.BRAND, 'Loops', loopsBody(view)))
 })
 
 // ── fleet (company-wide agent roster over the SOS bus) ───────────────────────
@@ -1278,6 +1285,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         <a href="/">Overview</a>
         <a href="/send">Send</a>
         <a href="/approvals">Approvals</a>
+        <a href="/loops">Loops</a>
         <a href="/agents">Agents</a>
         <a href="/fleet">Fleet</a>
         <a href="/members">Members</a>
