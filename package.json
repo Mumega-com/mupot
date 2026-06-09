@@ -1,6 +1,6 @@
 {
   "name": "mupot",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "private": false,
   "description": "Installable Cloudflare-native sovereign agent substrate (the pot).",
   "type": "module",

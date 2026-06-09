@@ -2,6 +2,31 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+## [0.14.0] — 2026-06-09
+
+A loop can be created and run through the product. (Toward v1.0 — P5/#36.)
+
+### Added
+- **Loop HTTP surface** (`src/loops/routes.ts`, `/api/loops`, owner/admin + CSRF):
+  create a loop from a manifest spec (full validation incl. the CASL backstop), list,
+  get, and pause/resume/kill via `/:id/status`. The dogfood loop-create path — a loop
+  is declared through the product, never raw SQL.
+- **One-click outreach seeder** — `POST /api/loops/seed-outreach` creates the Outreach
+  squad + a gated outreach loop (prospect-queue source, sends via the gated GHL act
+  pipeline, $5/wk cap, dry-pause at 5) in a single owner action.
+
+### Changed
+- `killed` and `done` are now terminal loop states — `setLoopStatus` will not transition
+  a loop out of them (a killed loop cannot be revived).
+
+### Notes
+- Adversarial-gated GREEN (authz, tenant isolation, and the CASL invariant all hold
+  through the HTTP create path — an admin cannot create an ungated send-capable loop).
+- The machine is now complete end to end and seedable. The remaining step to a LIVE
+  outcome is the operator's: set the GHL secrets on the pot, import real prospects
+  (`POST /api/prospects/import`), seed the outreach loop, and approve the first send in
+  `/approvals`. That first reply moving the KPI is the v1.0 stamp.
+
 ## [0.13.0] — 2026-06-09
 
 The first loop CONFIG: an outreach loop runs end to end. (Toward v1.0 — P4/#35.)
