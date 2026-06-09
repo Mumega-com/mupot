@@ -27,6 +27,7 @@ import { githubInboundApp } from './integrations/github-routes'
 import { prospectsApp } from './loops/prospects-routes'
 import { loopsApp } from './loops/routes'
 import { fleetCheckinApp } from './fleet/checkin-routes'
+import { flightsApp } from './flight/routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -63,6 +64,9 @@ app.route('/api/loops', loopsApp)
 // Flock check-in (Flock #45): agents POST presence with their member-token (bearer).
 // Inbound only — the pot needs no egress. Mounted before the dashboard '/' catch-all.
 app.route('/api/fleet', fleetCheckinApp)
+// Coherence-loop connector (#70): the brain dispatches gated flights + pulls outcomes,
+// inbound (the pot stays sealed). Org-admin via member-token. Before the '/' catch-all.
+app.route('/api/flights', flightsApp)
 app.route(ROUTES.dashboard, dashboardApp)
 
 // Queue consumer — the bus component owns the handler.
