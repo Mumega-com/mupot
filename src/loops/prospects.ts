@@ -103,6 +103,22 @@ export async function listQueued(env: Env, opts: { loopId?: string | null; limit
   return rows.results ?? []
 }
 
+/**
+ * claimProspect — ATOMICALLY move a prospect queued→drafted, only if still 'queued'.
+ * Returns true iff this call won the claim (changes===1). This is the structural dedup:
+ * the reasoner proposes a send only on a won claim, so the same prospect can never be
+ * drafted twice (concurrent ticks → exactly one wins).
+ */
+export async function claimProspect(env: Env, id: string): Promise<boolean> {
+  const now = new Date().toISOString()
+  const res = await env.DB.prepare(
+    `UPDATE prospects SET status = 'drafted', updated_at = ? WHERE id = ? AND tenant = ? AND status = 'queued'`,
+  )
+    .bind(now, id, env.TENANT_SLUG)
+    .run()
+  return (res.meta?.changes ?? 0) === 1
+}
+
 /** setProspectStatus — tenant-scoped status transition. Returns false if no row changed. */
 export async function setProspectStatus(env: Env, id: string, status: ProspectStatus): Promise<boolean> {
   if (!STATUSES.has(status)) return false

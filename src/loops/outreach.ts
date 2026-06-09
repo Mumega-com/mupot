@@ -9,10 +9,11 @@
 import type { Env, ModelPort, ModelMessage } from '../types'
 import type { ProposedAct, RuntimeDeps } from './runtime'
 import { createModel } from '../model'
-import { setProspectStatus, countByStatus } from './prospects'
+import { claimProspect, countByStatus } from './prospects'
 
 export interface OutreachReasonDeps {
   model?: ModelPort
+  /** Atomically claim a prospect (queued→drafted); returns true iff this call won it. */
   markDrafted?: (env: Env, prospectId: string) => Promise<boolean>
 }
 
@@ -25,7 +26,7 @@ export interface OutreachReasonDeps {
 export function makeOutreachReason(deps: OutreachReasonDeps = {}): NonNullable<RuntimeDeps['reason']> {
   return async (env, input) => {
     const model = deps.model ?? createModel(env)
-    const mark = deps.markDrafted ?? ((e, id) => setProspectStatus(e, id, 'drafted'))
+    const claim = deps.markDrafted ?? claimProspect
     const acts: ProposedAct[] = []
 
     for (const item of input.context.slice(0, input.budget)) {
@@ -34,6 +35,17 @@ export function makeOutreachReason(deps: OutreachReasonDeps = {}): NonNullable<R
 
       const draft = await draftMessage(model, input.loop.okr, item)
       if (!draft) continue
+
+      // CLAIM FIRST (structural dedup): only propose a send if we atomically won the
+      // prospect (queued→drafted). A lost/failed claim → skip, so the same prospect can
+      // never yield a duplicate act across ticks or concurrent runs.
+      let won = false
+      try {
+        won = await claim(env, item.id)
+      } catch {
+        won = false
+      }
+      if (!won) continue
 
       acts.push({
         channel_index: 0,
@@ -47,14 +59,6 @@ export function makeOutreachReason(deps: OutreachReasonDeps = {}): NonNullable<R
         },
         summary: `Outreach: ${String(item.title ?? email).slice(0, 80)}`,
       })
-
-      // Consume the prospect so the next tick drafts a DIFFERENT one (dedup).
-      try {
-        await mark(env, item.id)
-      } catch {
-        // best-effort; if the mark fails the prospect re-appears next tick (no double-send,
-        // since the gate + outbound_act claim guard still apply downstream)
-      }
     }
 
     return acts

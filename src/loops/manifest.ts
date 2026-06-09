@@ -313,6 +313,14 @@ export function validateLoopSpec(input: unknown): Validate<LoopSpec> {
   const channels = validateRefList(input.channels, 'channels')
   if (!channels.ok) return channels
 
+  // CASL / no-auto-send backstop (STRUCTURAL): a loop with ANY output channel can
+  // produce an external side-effect (a send/write), so it MUST be human-gated. An
+  // ungated loop may only perceive + observe (sources only, no channels). This makes
+  // "nothing sends without a human verdict" a manifest invariant, not a per-config hope.
+  if (channels.value.length > 0 && gate.value.require_approval !== true) {
+    return { ok: false, error: 'channel_loop_must_be_gated' }
+  }
+
   return {
     ok: true,
     value: {

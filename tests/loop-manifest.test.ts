@@ -160,4 +160,15 @@ describe('validateLoopSpec', () => {
   it('rejects a negative budget cap', () => {
     expect(validateLoopSpec({ ...base, budget: { cap_micro_usd: -1 } }).ok).toBe(false)
   })
+
+  it('a loop with an output channel MUST be gated (CASL/no-auto-send backstop)', () => {
+    const r = validateLoopSpec({ ...base, gate: { require_approval: false } })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toBe('channel_loop_must_be_gated')
+  })
+
+  it('an ungated loop is allowed only with NO channels (read-only)', () => {
+    const r = validateLoopSpec({ ...base, channels: [], gate: { require_approval: false } })
+    expect(r.ok).toBe(true)
+  })
 })

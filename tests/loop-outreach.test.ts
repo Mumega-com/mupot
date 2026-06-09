@@ -51,12 +51,20 @@ describe('makeOutreachReason', () => {
     expect(acts).toHaveLength(0)
   })
 
-  it('skips a prospect when the model returns unparseable output (no act, no consume)', async () => {
+  it('skips a prospect when the model returns unparseable output (no act, no claim)', async () => {
     const markDrafted = vi.fn(async () => true)
     const reason = makeOutreachReason({ model: okModel('sorry I cannot'), markDrafted })
     const acts = await reason(ENV, input())
     expect(acts).toHaveLength(0)
     expect(markDrafted).not.toHaveBeenCalled()
+  })
+
+  it('does NOT propose an act when the claim is LOST (structural dedup)', async () => {
+    const markDrafted = vi.fn(async () => false) // another tick already claimed it
+    const reason = makeOutreachReason({ model: okModel('{"subject":"s","body":"b"}'), markDrafted })
+    const acts = await reason(ENV, input())
+    expect(acts).toHaveLength(0)
+    expect(markDrafted).toHaveBeenCalledWith(ENV, 'p1')
   })
 })
 
