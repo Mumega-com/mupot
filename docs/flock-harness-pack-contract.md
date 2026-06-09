@@ -59,14 +59,22 @@ install pack → mint scoped token → inject into connect config → start agen
    → stop → ages out of Fleet ("not there")
 ```
 
-## Per-harness notes
+## Per-harness notes (researched 2026-06-09)
 
-| Harness | Identity config | Status |
-|---------|-----------------|--------|
-| Claude Code | `.mcp.json` SSE entry + token | reference (build first) |
-| Codex | `.mcp.json` (Codex MCP) + token | after CC |
-| Hermes (Nous) | Nous harness bus config + token | after CC |
-| openclaw | TBD — confirm exact harness/name | blocked on name |
+| Harness | What it is | Identity config | Persistent? | Pack approach |
+|---------|-----------|-----------------|-------------|---------------|
+| **Claude Code** | local CLI | `.mcp.json` `type:sse` + `Authorization: Bearer` | no (interactive) | reference pack — `packs/claude-code/flock-agent/` (this pack). Presence via hook + cron `heartbeat.sh`. |
+| **Codex** | OpenAI CLI + IDE ext | `~/.codex/config.toml` `[mcp_servers.x]` `url` + `bearer_token_env_var` | no | plugin bundle (`SKILL.md` + `agents/openai.yaml`); heartbeat = wrapper script. |
+| **Hermes (Nous)** | self-hosted daemon + Desktop | `~/.hermes/config.yaml` `mcp_servers.x` + `headers.Authorization` | **yes (gateway daemon)** | Python plugin `register(ctx)` — wires MCP, native heartbeat lifecycle hook, slash cmds. Richest target. |
+| **Claude Cowork** | desktop app (+ Managed Agents API) | org plugin `.claude-plugin/` + bundled `.mcp.json`, or Agent SDK `.mcp.json` | no (desktop) | org plugin for desktop; `.mcp.json` + `SKILL.md` template for SDK builders. |
+| **openclaw** | self-hosted daemon (npm, systemd) | `~/.openclaw/openclaw.json` `mcp.servers.x` + `headers.Authorization` | **yes (daemon)** | config fragment + `SOUL.md` + `SKILL.md`; heartbeat = shell-hook skill. OAuth not yet shipped — bearer only. |
+
+**Transport caveat:** MCP deprecated SSE (2026-04). Codex + openclaw configs now prefer
+`streamable-http`; Hermes + Claude SDK still accept `type:sse`. Our bus serves `/sse`.
+Before shipping the Codex/openclaw packs, confirm the bus also accepts `streamable-http`
+on the same URL (standard) and point those two at `http` to future-proof.
+Only Hermes + openclaw get native always-on heartbeat; Codex + Cowork + Claude Code need
+a cron/hook wrapper to hold Fleet presence.
 
 ## Verification (acceptance for each pack)
 
