@@ -78,6 +78,11 @@ export interface CreateTaskInput {
 
 export interface CreateTaskOptions {
   actor?: TaskActor
+  // Skip the outbound GitHub-issue mirror. Set for tasks that ORIGINATE from a GitHub
+  // event (the inbound webhook) — mirroring a GitHub event back into a GitHub issue is
+  // redundant AND reflects attacker-influenced PR/CI fields out under our token (a loop
+  // + mention/ref injection). Webhook-origin tasks are inbound-only.
+  skipMirror?: boolean
 }
 
 function isNonEmptyString(v: unknown): v is string {
@@ -137,7 +142,11 @@ export async function mirrorTaskUpdate(env: Env, task: Task): Promise<string | n
 
   const issueNumber = parseIssueNumber(task.github_issue_url)
   if (issueNumber === null) {
-    return (await mirrorTaskCreate(env, task)) ?? task.github_issue_url
+    // Update NEVER creates. A null issue here means the task was never mirrored — either
+    // no token at create, or skipMirror (a GitHub-origin/webhook task). Creating on a
+    // later status PATCH would reflect attacker-influenced webhook fields out under our
+    // token (the P1 side-door). Creation is createTask's job alone, which honors skipMirror.
+    return task.github_issue_url
   }
 
   try {
@@ -209,7 +218,7 @@ export async function createTask(
     updated_at: now,
   }
 
-  task.github_issue_url = await mirrorTaskCreate(env, task)
+  task.github_issue_url = options.skipMirror ? null : await mirrorTaskCreate(env, task)
 
   await env.DB.prepare(
     `INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
