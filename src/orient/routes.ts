@@ -14,19 +14,10 @@ import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken, resolveOrgAdmin } from '../auth/member-bearer'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { mcpEndpoint } from '../dashboard/connect'
+import { resolveAgentRef } from '../org/resolve'
 import { buildOrient, renderBrief, parseFieldPush, upsertAgentField } from './service'
 
 export const orientApp = new Hono<{ Bindings: Env }>()
-
-// Resolve an agent by id first, then slug (within this tenant's single org). Returns the
-// canonical id + squad_id for the capability check, or null.
-async function resolveAgentRef(env: Env, ref: string): Promise<{ id: string; squad_id: string } | null> {
-  const byId = await env.DB.prepare(`SELECT id, squad_id FROM agents WHERE id = ?1 LIMIT 1`).bind(ref).first<{ id: string; squad_id: string }>()
-  if (byId) return byId
-  return (
-    (await env.DB.prepare(`SELECT id, squad_id FROM agents WHERE slug = ?1 LIMIT 1`).bind(ref).first<{ id: string; squad_id: string }>()) ?? null
-  )
-}
 
 orientApp.get('/', async (c) => {
   const member = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
@@ -36,8 +27,13 @@ orientApp.get('/', async (c) => {
   // A human/operator token (no binding) must name the agent it wants.
   const ref = c.req.query('agent') ?? member.boundAgentId
   if (!ref) return c.json({ error: 'agent_required' }, 400)
-  const agentRef = await resolveAgentRef(c.env, ref)
-  if (!agentRef) return c.json({ error: 'not_found' }, 404)
+  // id-first, slug-with-ambiguity-refusal: a bare slug can match agents in different
+  // squads (UNIQUE(squad_id, slug)); refuse rather than gate against an arbitrary row.
+  const resolved = await resolveAgentRef(c.env, ref)
+  if (!resolved.ok) {
+    return c.json({ error: resolved.reason === 'ambiguous' ? 'ambiguous_slug' : 'not_found' }, resolved.reason === 'ambiguous' ? 409 : 404)
+  }
+  const agentRef = resolved.value
 
   // Authorize: the caller must have ≥observer on the agent's squad (or be org-admin).
   const caps = await resolveCapabilities(c.env, member.memberId)
