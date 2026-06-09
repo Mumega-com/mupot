@@ -72,6 +72,9 @@ import { loadFleet, wakeFleetAgent, requestFleetControl, fleetScoped } from './f
 import type { FleetRow } from './fleet'
 import { listPresence } from '../fleet/presence'
 import type { PresenceView } from '../fleet/presence'
+import { listFlights } from '../flight/service'
+import { buildBoard } from '../flight/board'
+import type { FlightCard } from '../flight/board'
 import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
 
@@ -166,6 +169,14 @@ dashboardApp.get('/approvals', async (c) => {
 dashboardApp.get('/loops', async (c) => {
   const view = await loadLoopsView(c.env)
   return c.html(shell(c.env.BRAND, 'Loops', loopsBody(view)))
+})
+
+// ── flights (the flight board — what is flying/sleeping + each flight's cost) ─
+// GET /flights — read the flights table (#61). Read-only; control stays on Fleet.
+dashboardApp.get('/flights', async (c) => {
+  const rows = await listFlights(c.env)
+  const cards = buildBoard(rows, Date.now())
+  return c.html(shell(c.env.BRAND, 'Flights', flightsBody(cards)))
 })
 
 // ── fleet (company-wide agent roster over the SOS bus) ───────────────────────
@@ -1293,6 +1304,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         <a href="/send">Send</a>
         <a href="/approvals">Approvals</a>
         <a href="/loops">Loops</a>
+        <a href="/flights">Flights</a>
         <a href="/agents">Agents</a>
         <a href="/fleet">Fleet</a>
         <a href="/members">Members</a>
@@ -2036,6 +2048,52 @@ function approvalsScript() {
 // Pot-native flock: agents that checked in to THIS pot (no company bus). Read-only
 // inventory — who has access + who is in now. Control (wake/pause) is the bus path;
 // pot-native control is a later objective (#46).
+function flightsBody(cards: FlightCard[]) {
+  const phaseColor = (p: string) =>
+    p === 'flying' ? 'var(--ok)' : p === 'sleeping' ? 'var(--warn)' : p === 'holding' || p === 'preflight' ? 'var(--accent)' : p === 'failed' || p === 'held' ? '#e5534b' : 'var(--dim)'
+  const arrow = (t: string | null) => (t === 'up' ? '▲' : t === 'down' ? '▼' : t === 'flat' ? '▬' : '')
+  const arrowColor = (t: string | null) => (t === 'up' ? 'var(--ok)' : t === 'down' ? '#e5534b' : 'var(--dim)')
+  const tr = (c: FlightCard) => `
+    <tr class="fl-row ${c.live ? '' : 'fl-dim'}">
+      <td><span class="fl-dot" style="background:${phaseColor(c.phase)}"></span>${escHtml(c.agent)}</td>
+      <td class="fl-label">${escHtml(c.goal)}</td>
+      <td><span class="fl-badge" style="color:${phaseColor(c.phase)}">${escHtml(c.phase)}</span></td>
+      <td class="fl-num">${c.score_pct ? `${escHtml(c.score_pct)} <span style="color:${arrowColor(c.trend)}">${arrow(c.trend)}</span>` : '<span style="color:var(--dim)">—</span>'}</td>
+      <td class="fl-num ${c.over_budget ? 'fl-over' : ''}">${escHtml(c.cost_usd)}${c.budget_usd ? `<span style="color:var(--dim)"> / ${escHtml(c.budget_usd)}</span>` : ''}</td>
+      <td>${c.next_departure ? escHtml(c.next_departure) : escHtml(c.age)}</td>
+    </tr>`
+  const flying = cards.filter((c) => c.phase === 'flying').length
+  const sleeping = cards.filter((c) => c.phase === 'sleeping').length
+  const table = cards.length
+    ? `<table class="fl-table">
+        <thead><tr><th>Agent</th><th>Goal</th><th>Phase</th><th>Score</th><th>Cost / budget</th><th>Departure / age</th></tr></thead>
+        <tbody>${cards.map(tr).join('')}</tbody>
+      </table>`
+    : `<p class="empty">No flights yet. A flight = one bounded run of an agent toward a goal —
+       it appears here when a flight is created (preflight), and shows its accounted cost on land.</p>`
+  return html`
+    <p class="crumbs"><a href="/">Overview</a> / Flights</p>
+    <h1>Flights</h1>
+    <p class="empty" style="margin-top:0;max-width:680px">
+      Each flight is one bounded agent run toward a goal. <b>${flying}</b> flying,
+      <b>${sleeping}</b> sleeping. Score is readiness at preflight / coherence on land,
+      with its trend vs that agent's last flight. Cost is metered (the black box).
+      Read-only — control lives on <a href="/fleet">Fleet</a>.</p>
+    <style>
+      .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+      .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;
+        letter-spacing: .5px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+      .fl-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+      .fl-dim td { opacity: .55; }
+      .fl-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; }
+      .fl-label { color: var(--muted); max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .fl-badge { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
+      .fl-num { text-align: right; font-variant-numeric: tabular-nums; }
+      .fl-over { color: #e5534b; }
+    </style>
+    ${raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}`
+}
+
 function potFleetBody(rows: PresenceView[]) {
   const dot = (l: string) =>
     l === 'active' ? 'var(--ok)' : l === 'idle' ? 'var(--warn)' : l === 'dead' ? '#e5534b' : 'var(--dim)'
