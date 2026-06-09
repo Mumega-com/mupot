@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS flights (
   -- the preflight gate (#60) outcome
   gate_verdict    TEXT,                        -- 'go' | 'no_go' | NULL (pending)
   gate_reason     TEXT NOT NULL DEFAULT '',    -- comma-joined reasons when held
-  score           REAL,                        -- coherence score 0..1 (preflight; or evaluator at land)
+  score           REAL,                        -- readiness 0..1 at preflight; runtime coherence (brain C(t)/regime) at land
   -- cost / budget (micro-USD, matches the execution meter)
   budget_micro_usd  INTEGER,                   -- pre-declared budget for the flight
   cost_micro_usd    INTEGER NOT NULL DEFAULT 0,-- actual, updated on land

@@ -2,8 +2,14 @@
 //
 // Before an expensive flight (session) launches, a cheap check decides GO/NO-GO so
 // zero expensive tokens burn on a flight that would wander or run cold. It is a
-// coherence score (0–1) + two hard checks, from signals the pot already has. Plain
-// numbers, no new machinery. See docs/flight-operations.md → "The control law".
+// READINESS score (0–1) + two hard checks, from signals the pot already has.
+//
+// NOTE on vocabulary (coherence with the brain): this is READINESS — admission to
+// launch — NOT coherence. "Coherence" is the brain's organ: C(t) = EMA(success-
+// fraction), R = 1/(1+backlog), ARF = R·Psi·C, regime (SOS/sovereign/coherence.py).
+// The brain owns coherence + whether-to-fly (chaos/stall+ARF = fly; flow+ARF≈0 = rest).
+// The pot owns readiness + the flight record. One vocabulary, two layers — don't
+// conflate them. See docs/flight-operations.md → "Relation to the brain".
 
 export interface FlightSignals {
   // Hard prerequisites.
@@ -34,7 +40,7 @@ export interface PreflightChecks {
 
 export interface PreflightResult {
   go: boolean
-  score: number // 0..1 coherence score
+  score: number // 0..1 readiness score (admission to launch — NOT the brain's C(t))
   checks: PreflightChecks
   reasons: string[] // why NO-GO (empty when go)
 }
@@ -42,10 +48,10 @@ export interface PreflightResult {
 const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x)
 const FLOOR = 1e-3 // keep factors > 0 so a single missing one tanks (not breaks) the score
 
-// Combine the factors into one 0–1 coherence score via a weighted geometric mean:
+// Combine the factors into one 0–1 readiness score via a weighted geometric mean:
 // any critical factor near zero (no context, tools down) drags the whole score toward
 // zero — fail-closed by construction, no factor can be "averaged away".
-export function coherenceScore(s: FlightSignals, opts: PreflightOptions = {}): number {
+export function readinessScore(s: FlightSignals, opts: PreflightOptions = {}): number {
   const window = opts.cacheWindowSeconds ?? 300
   const factors: Array<{ v: number; w: number }> = [
     { v: s.contextComplete ? 1 : FLOOR, w: 2 },
@@ -60,7 +66,7 @@ export function coherenceScore(s: FlightSignals, opts: PreflightOptions = {}): n
   return clamp01(Math.exp(lnsum / wsum))
 }
 
-// The full gate: coherence score + the two checks + hard prerequisites.
+// The full gate: readiness score + the two checks + hard prerequisites.
 export function preflightCheck(s: FlightSignals, opts: PreflightOptions = {}): PreflightResult {
   const scoreThreshold = opts.scoreThreshold ?? 0.5
   const cacheWindowSeconds = opts.cacheWindowSeconds ?? 300
@@ -77,14 +83,14 @@ export function preflightCheck(s: FlightSignals, opts: PreflightOptions = {}): P
     cacheStaysWarm: s.stepSeconds <= cacheWindowSeconds,
   }
 
-  const score = coherenceScore(s, opts)
+  const score = readinessScore(s, opts)
   const reasons: string[] = []
   if (!checks.contextComplete) reasons.push('context_incomplete')
   if (!checks.toolsReachable) reasons.push('tools_unreachable')
   if (!checks.budgetHeadroom) reasons.push('insufficient_budget')
   if (!checks.progressBeatsWaste) reasons.push('would_wander')
   if (!checks.cacheStaysWarm) reasons.push('cache_would_cool')
-  if (score < scoreThreshold) reasons.push('low_coherence')
+  if (score < scoreThreshold) reasons.push('low_readiness')
 
   return { go: reasons.length === 0, score, checks, reasons }
 }

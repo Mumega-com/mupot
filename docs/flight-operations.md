@@ -42,10 +42,13 @@ crew, audit, scheduling.
 
 ## The control law — one score + two checks
 
-The preflight gate is not a vibe. It's a **coherence score** plus **two go/no-go checks**,
+The preflight gate is not a vibe. It's a **readiness score** plus **two go/no-go checks**,
 all computed from signals the pot already logs. Plain numbers, no new machinery.
 
-**Coherence score (0–1)** — how healthy a flight is, combined from factors we already have:
+(Readiness ≠ coherence — see "Relation to the brain" below. Readiness = is this flight
+ready to launch. Coherence = how well work is actually going, which the brain owns.)
+
+**Readiness score (0–1)** — how ready a flight is to launch, combined from factors we have:
 
 | Factor | Signal | Healthy |
 |---|---|---|
@@ -70,18 +73,40 @@ roughly **doubles** in cost. Too-cold a plan → restructure (shorter steps, pre
 everything in preflight) or don't launch.
 
 **In flight, watch two things:**
-- **Score trend** — if the coherence score is *dropping*, that's an early warning: land
+- **Readiness trend** — if readiness is *dropping*, that's an early warning: land
   before it collapses (cheaper than a failed landing).
 - **The two checks** — progress stalls (waste > progress) or cache goes cold → abort/land.
 
 **Selection rule:** when choosing between flights or paths, prefer the one with the higher
 **sustained progress**, not the one with more activity/tokens. Busywork is not coherence.
 
-**Honest guard (don't trust the score blind).** Only rely on the coherence score where it
+**Honest guard (don't trust the score blind).** Only rely on the readiness score where it
 actually predicts flight cost/outcome **better than a dumb baseline** — e.g. "cache cold +
 no progress in N steps → abort." Pre-pick the factors *before* measuring, then check on held-
 out flights whether the score beats the dumb rule. If the dumb rule does just as well, use
 the dumb rule. Measure before you trust; keep it simple where simple wins.
+
+## Relation to the brain (don't duplicate it)
+
+The brain (`SOS/sovereign/brain.py` + `coherence.py`) already owns the loop and the
+coherence math. Flight Ops is the **pot-side**, CF-native layer that *extends* it — it does
+not re-invent it. Clean split:
+
+| Concern | Owner | What |
+|---|---|---|
+| **Coherence** (how well work is going) | the **brain** | `C(t)` = EMA(success-fraction), `R` = 1/(1+backlog), `Psi` = \|dC\|, `ARF` = R·Psi·C, `regime` (flow/chaos/coercion/stall) — `coherence.py` |
+| **Whether to fly** | the **brain** | high `ARF` + chaos/stall regime = a defect worth an expensive flight; flow + `ARF`≈0 = **rest** |
+| **The cycle** | the **brain** | perceive → think → act → remember → sleep; a flight = one teed-up expensive THINK |
+| **Model tiering** | the **brain** | prefrontal vs motor vs `fallback_think(allow_paid)`, `route_by_fuel()` |
+| **Budget gate** | the **brain** | `_llm_budget_check` / `_budget_reserve` / `begin_cycle` |
+| **Readiness** (ready to launch) | the **pot** | the preflight score + two checks (this doc) |
+| **The flight record** | the **pot** | `flights` table — status, cost, schedule, the run log (CF-native) |
+
+So the pot does NOT compute its own coherence — `score` at preflight is *readiness*; a
+running/landed flight's coherence is the brain's `C(t)`/`regime`. "I am the prefrontal, not
+the brain": the brain is ground crew (perceives cheap, decides whether to fly, tees up the
+flight); the pot records + readies the expensive prefrontal burst. Open: whether the pot's
+layer becomes the CF-native PORT of `coherence.py` or defers to a forked brain beside it.
 
 ## Vocabulary (adopted)
 
@@ -101,9 +126,9 @@ Two presence sources, by agent tier:
 ## What is this version vs future
 
 **v0.19 (now):**
-- **#60** preflight checklist gate — the coherence score + the two checks (progress-beats-waste,
+- **#60** preflight checklist gate — the readiness score + the two checks (progress-beats-waste,
   cache-stays-warm). GREEN before the expensive meter starts. The core money-saver.
-- **#61** flight board — Fleet shows running/sleeping + per-flight cost + the coherence score and
+- **#61** flight board — Fleet shows running/sleeping + per-flight cost + the readiness score and
   its trend (the early-warning).
 - **#62** sleeping / schedule-aware presence + vocab adoption.
 
