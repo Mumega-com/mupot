@@ -1,0 +1,13 @@
+{
+  "//": "Flock agent pack — Claude Code. Connects this agent to a mupot flock over the SOS bus.",
+  "//token": "Replace <SCOPED_BUS_TOKEN> with the project-scoped, agent-bound token your operator minted (project=<slug>, agent=<your-agent-name>). NEVER commit this file with a real token — it is gitignored.",
+  "mcpServers": {
+    "mumega-bus": {
+      "type": "sse",
+      "url": "https://mcp.mumega.com/sse",
+      "headers": {
+        "Authorization": "Bearer <SCOPED_BUS_TOKEN>"
+      }
+    }
+  }
+}
