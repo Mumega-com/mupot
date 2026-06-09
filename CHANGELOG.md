@@ -2,6 +2,39 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+## [0.13.0] — 2026-06-09
+
+The first loop CONFIG: an outreach loop runs end to end. (Toward v1.0 — P4/#35.)
+
+### Added
+- **Prospect queue** (`src/loops/prospects.ts`, migration 0015) — the outreach work
+  queue: published B2B contacts with `source`, `consent_basis`, and a
+  queued→drafted→sent→replied lifecycle. Dedup by an active-unique `(tenant,email)`
+  index. The `queue` resolver kind now reads it (was a P4 stub).
+- **Outreach reasoner + outcome KPI** (`src/loops/outreach.ts`) — the runtime `reason`
+  seam drafts a CASL-compliant first-touch email per queued prospect → a gated
+  `send_email` act, atomically CLAIMING the prospect (queued→drafted) so it's drafted
+  exactly once. The KPI is positive replies ÷ target (outcome, not activity).
+- **Reply tracking** — the GHL inbound webhook maps a verified event to a prospect
+  status (replied / opted_out / bounced); `opted_out` is terminal. This is the KPI
+  signal source — a real reply advances the loop.
+- **Seed-import** — `POST /api/prospects/import` (owner/admin, CSRF + session gated)
+  bulk-queues contacts.
+
+### Security
+- **Structural CASL backstop.** A loop with ANY output channel MUST be human-gated —
+  `validateLoopSpec` rejects `require_approval:false` with channels, enforced at write
+  AND on read (`hydrateLoop` re-validates, so a hand-edited row won't even load). With
+  the structural gate branch in `runLoopCycle`, "nothing sends without a human verdict"
+  is now a manifest + read + cycle invariant, not a per-config hope. Adversarial-gated
+  (kasra-review) RED→GREEN: caught that an ungated send-capable loop could bypass the
+  gate; closed structurally (4 bypass attacks refused on re-review).
+
+### Notes
+- The loop is end to end — queue → draft → gate → (approve) → send → reply → KPI — but
+  not yet live: needs the Digid pot promoted + an outreach loop seeded + the operator
+  to approve the first send (P5).
+
 ## [0.12.0] — 2026-06-09
 
 Loops run on the heartbeat, and a gated loop queues real work to /approvals.
