@@ -7,6 +7,8 @@
 import type { Env } from '../types'
 import { classify, humanAge, type FleetLiveness } from '../dashboard/fleet'
 import type { AgentIdentity } from '../auth/member-bearer'
+import { listFlights } from '../flight/service'
+import { scheduleStates, attachSchedule, type ScheduleStatus } from './schedule-state'
 
 // Allowed runtime sources — an unknown/invalid value normalizes to 'unknown'
 // (never trusts the client's raw string into storage unbounded).
@@ -28,6 +30,9 @@ export interface PresenceRow {
 export interface PresenceView extends PresenceRow {
   liveness: FleetLiveness
   last_seen_human: string
+  // The second axis (#62): schedule-state for session agents that have flights.
+  // null = a cheap always-on agent — read its heartbeat `liveness` instead.
+  schedule: ScheduleStatus | null
 }
 
 // SQLite datetime('now') → "YYYY-MM-DD HH:MM:SS" (UTC, no tz). Convert to epoch ms.
@@ -67,7 +72,7 @@ export async function listPresence(env: Env, nowMs: number): Promise<PresenceVie
   )
     .bind(env.TENANT_SLUG)
     .all<PresenceRow>()
-  return (res.results ?? []).map((r) => {
+  const rows = (res.results ?? []).map((r) => {
     const ms = sqliteUtcToMs(r.last_seen_at)
     return {
       ...r,
@@ -75,6 +80,10 @@ export async function listPresence(env: Env, nowMs: number): Promise<PresenceVie
       last_seen_human: humanAge(ms, nowMs),
     }
   })
+  // Second axis (#62): overlay schedule-state from this tenant's flights so a
+  // resting session agent reads "sleeping · next 14:00" instead of a false "dead".
+  const states = scheduleStates(await listFlights(env))
+  return attachSchedule(rows, states)
 }
 
 // Count currently-present agents (active within the stale window) for a quick stat.

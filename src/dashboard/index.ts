@@ -2095,17 +2095,36 @@ function flightsBody(cards: FlightCard[]) {
 }
 
 function potFleetBody(rows: PresenceView[]) {
+  // Heartbeat axis (cheap always-on agents): active/idle/dead/never.
   const dot = (l: string) =>
     l === 'active' ? 'var(--ok)' : l === 'idle' ? 'var(--warn)' : l === 'dead' ? '#e5534b' : 'var(--dim)'
-  const active = rows.filter((r) => r.liveness === 'active').length
-  const tr = (r: PresenceView) => `
-    <tr class="fl-row ${r.liveness === 'dead' || r.liveness === 'never' ? 'fl-dim' : ''}">
-      <td><span class="fl-dot" style="background:${dot(r.liveness)}"></span>${escHtml(r.display_name || '—')}</td>
+  // Schedule axis (#62, session agents with flights): flying/sleeping/done.
+  const schedDot = (s: string) => (s === 'flying' ? 'var(--ok)' : s === 'sleeping' ? 'var(--warn)' : 'var(--dim)')
+  // "Present" = heartbeat active OR mid/between flights (flying or sleeping).
+  const present = rows.filter(
+    (r) => r.liveness === 'active' || r.schedule?.state === 'flying' || r.schedule?.state === 'sleeping',
+  ).length
+  const tr = (r: PresenceView) => {
+    // Session agent (has flights) → read schedule-state; a resting one is sleeping,
+    // never "dead". Cheap always-on agent → read heartbeat liveness as before.
+    const useSched = r.schedule != null
+    const dimmed = useSched ? r.schedule!.state === 'done' : r.liveness === 'dead' || r.liveness === 'never'
+    const dotColor = useSched ? schedDot(r.schedule!.state) : dot(r.liveness)
+    const statusLabel = useSched
+      ? r.schedule!.state === 'sleeping' && r.schedule!.next_label
+        ? `${r.schedule!.state} · ${r.schedule!.next_label}`
+        : r.schedule!.state
+      : r.liveness
+    const badgeClass = useSched ? `fl-sched-${escAttr(r.schedule!.state)}` : `fl-${escAttr(r.liveness)}`
+    return `
+    <tr class="fl-row ${dimmed ? 'fl-dim' : ''}">
+      <td><span class="fl-dot" style="background:${dotColor}"></span>${escHtml(r.display_name || '—')}</td>
       <td class="fl-label">${escHtml(r.source)}</td>
       <td class="fl-label">${escHtml(r.label || '—')}</td>
-      <td><span class="fl-badge fl-${escAttr(r.liveness)}">${escHtml(r.liveness)}</span></td>
+      <td><span class="fl-badge ${badgeClass}">${escHtml(statusLabel)}</span></td>
       <td>${escHtml(r.last_seen_human)}</td>
     </tr>`
+  }
   const table = rows.length
     ? `<table class="fl-table">
         <thead><tr><th>Agent</th><th>Runtime</th><th>Role / label</th><th>Status</th><th>Last check-in</th></tr></thead>
@@ -2119,8 +2138,10 @@ function potFleetBody(rows: PresenceView[]) {
     <h1>Fleet</h1>
     <p class="empty" style="margin-top:0;max-width:680px">
       Your flock — agents that check in to this pot, on any runtime (Claude Code,
-      Codex, Hermes, openclaw…). <b>${active}</b> active now. Presence only here;
-      control arrives with the bus/ops wiring.</p>
+      Codex, Hermes, openclaw…). <b>${present}</b> present now. Always-on agents read
+      their heartbeat (active/idle/dead); session agents read their schedule
+      (flying / sleeping · next run / done) — a resting agent is sleeping, not dead.
+      Times UTC. Control arrives with the bus/ops wiring.</p>
     <style>
       .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
       .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;
@@ -2132,6 +2153,7 @@ function potFleetBody(rows: PresenceView[]) {
       .fl-badge { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
       .fl-active { color: var(--ok); } .fl-idle { color: var(--warn); }
       .fl-dead { color: #e5534b; } .fl-never { color: var(--dim); }
+      .fl-sched-flying { color: var(--ok); } .fl-sched-sleeping { color: var(--warn); } .fl-sched-done { color: var(--dim); }
     </style>
     ${raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}`
 }
