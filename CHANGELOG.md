@@ -2,6 +2,10 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+**What ships next:** see [ROADMAP.md](ROADMAP.md). The roadmap (planned, by version) and
+this changelog (shipped, dated) share version numbers and feed each other — a roadmap
+block collapses into a changelog entry when it ships.
+
 ## [0.18.0] — 2026-06-09
 
 Flock — a tenant pot becomes the live home + window for its own agents, across any
