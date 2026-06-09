@@ -2,6 +2,17 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+## [0.16.0] — 2026-06-09
+
+Operator visibility — watch a loop run toward the live test.
+
+### Added
+- **/dashboard/loops** — a read-only view of the goal-seeking loops: each loop's status,
+  goal (OKR), KPI + target, budget, effort, and owner, plus the outreach funnel
+  (queued → drafted → sent → replied, where `replied` is the KPI signal). Nav link added;
+  pairs with /approvals where the gated sends wait. This is the polish that makes the
+  first live send observable — it does not fake it.
+
 ## [0.15.0] — 2026-06-09
 
 The v1.0 release candidate: the manifest is frozen and a pot is self-hostable.
