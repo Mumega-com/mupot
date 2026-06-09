@@ -70,6 +70,8 @@ import { formatBurn, formatUsd } from '../agents/cost'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
 import { loadFleet, wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
 import type { FleetRow } from './fleet'
+import { listPresence } from '../fleet/presence'
+import type { PresenceView } from '../fleet/presence'
 import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
 
@@ -170,10 +172,12 @@ dashboardApp.get('/loops', async (c) => {
 // GET /fleet — see every company agent: liveness, last active, role/label.
 // Window only: data comes from the bus bridge; the pot runs none of them.
 dashboardApp.get('/fleet', async (c) => {
-  // fleetScoped, not just busConfigured: an unscoped pot must not render/operate
-  // a fleet that would fall back to the company project (fail closed).
+  // No company-bus connection → show the POT-NATIVE flock instead of an empty
+  // notice: agents that checked in to THIS pot (inbound, no egress). This is the
+  // tenant-pot path (Digid); the bus path below is the company/HQ window.
   if (!fleetScoped(c.env)) {
-    return c.html(shell(c.env.BRAND, 'Fleet', fleetUnconfiguredBody()))
+    const presence = await listPresence(c.env, Date.now())
+    return c.html(shell(c.env.BRAND, 'Fleet', potFleetBody(presence)))
   }
   let rows: FleetRow[] = []
   let error: string | null = null
@@ -2029,12 +2033,49 @@ function approvalsScript() {
 
 // ── fleet views ───────────────────────────────────────────────────────────────
 
-function fleetUnconfiguredBody() {
+// Pot-native flock: agents that checked in to THIS pot (no company bus). Read-only
+// inventory — who has access + who is in now. Control (wake/pause) is the bus path;
+// pot-native control is a later objective (#46).
+function potFleetBody(rows: PresenceView[]) {
+  const dot = (l: string) =>
+    l === 'active' ? 'var(--ok)' : l === 'idle' ? 'var(--warn)' : l === 'dead' ? '#e5534b' : 'var(--dim)'
+  const active = rows.filter((r) => r.liveness === 'active').length
+  const tr = (r: PresenceView) => `
+    <tr class="fl-row ${r.liveness === 'dead' || r.liveness === 'never' ? 'fl-dim' : ''}">
+      <td><span class="fl-dot" style="background:${dot(r.liveness)}"></span>${escHtml(r.display_name || '—')}</td>
+      <td class="fl-label">${escHtml(r.source)}</td>
+      <td class="fl-label">${escHtml(r.label || '—')}</td>
+      <td><span class="fl-badge fl-${escAttr(r.liveness)}">${escHtml(r.liveness)}</span></td>
+      <td>${escHtml(r.last_seen_human)}</td>
+    </tr>`
+  const table = rows.length
+    ? `<table class="fl-table">
+        <thead><tr><th>Agent</th><th>Runtime</th><th>Role / label</th><th>Status</th><th>Last check-in</th></tr></thead>
+        <tbody>${rows.map(tr).join('')}</tbody>
+      </table>`
+    : `<p class="empty">No agents have checked in yet. Give an agent this pot's flock
+       pack + a member token; it checks in at <code>POST /api/fleet/checkin</code> and
+       appears here (active when in, fades to dead when out).</p>`
   return html`
     <p class="crumbs"><a href="/">Overview</a> / Fleet</p>
     <h1>Fleet</h1>
-    <div class="card"><p class="empty">This pot has no bus connection configured
-    (BUS_TOKEN). The fleet view lives on HQ pots wired to the company bus.</p></div>`
+    <p class="empty" style="margin-top:0;max-width:680px">
+      Your flock — agents that check in to this pot, on any runtime (Claude Code,
+      Codex, Hermes, openclaw…). <b>${active}</b> active now. Presence only here;
+      control arrives with the bus/ops wiring.</p>
+    <style>
+      .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+      .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;
+        letter-spacing: .5px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+      .fl-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+      .fl-dim td { opacity: .6; }
+      .fl-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; }
+      .fl-label { color: var(--muted); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .fl-badge { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
+      .fl-active { color: var(--ok); } .fl-idle { color: var(--warn); }
+      .fl-dead { color: #e5534b; } .fl-never { color: var(--dim); }
+    </style>
+    ${raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}`
 }
 
 function fleetBody(rows: FleetRow[], error: string | null) {
