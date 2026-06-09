@@ -6,6 +6,48 @@ All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 this changelog (shipped, dated) share version numbers and feed each other — a roadmap
 block collapses into a changelog entry when it ships.
 
+## [0.19.0] — 2026-06-09
+
+Flight Operations — the **unit of correction**. Expensive (Opus) agents run as disciplined
+**flights**: pre-staged cheap, flown as one continuous warm-cache burst, landed with cost
+recorded (the 5-min cache TTL forces it). Milestone #3. Design:
+[docs/flight-operations.md](docs/flight-operations.md).
+
+### Added
+- **Preflight gate** (#60, PR #66). `readinessScore(s, opts)` (weighted geometric mean,
+  fail-closed) + `preflightCheck` → `{go, score, checks, reasons}`. Two checks before any
+  Opus spend: `would_wander` (no clear goal) and `cache_would_cool` (warm-cache window
+  gone). Stage cheap, then launch. `src/flight/preflight.ts`.
+- **The flight spine** (PR #67). `flights` table (`migrations/0017_flights.sql`) + service
+  (`createFlight`/`applyPreflight`/`landFlight`/`failFlight`/`sleepFlight`/`listFlights`) +
+  `dispatchFlight`. Lifecycle: preflight → held | running → waiting | sleeping → landed |
+  failed. Tenant-scoped, terminal-state guarded.
+- **The flight board** (#61, PR #75). `GET /flights` reads the flights table into a board:
+  phase (flying / sleeping / holding / preflight / held / landed / failed), metered cost
+  (micro-USD → $, over-budget flagged), readiness/coherence score + per-agent trend (▲▼▬
+  vs that agent's last scored flight), next departure for sleeping flights. Pure view model
+  `src/flight/board.ts`. Read-only; control stays on Fleet.
+- **Schedule-aware presence** (#62, PR #76). A second presence axis: session agents (those
+  with flights) read **flying / sleeping · next 14:00 / done** from the schedule, while
+  cheap always-on agents keep heartbeat liveness. A resting Opus reads `sleeping · next
+  14:00`, never `dead` — so `dead` regains meaning (should be alive, isn't). Pure view model
+  `src/fleet/schedule-state.ts`; overlaid in `listPresence`, rendered on `/fleet`.
+
+### Changed
+- **Brain reconciliation** (PR #68). The pot owns **readiness** (admission-to-launch); the
+  brain (`SOS/sovereign/coherence.py`) owns **coherence** (C(t)/regime). Renamed the pot's
+  score coherence→readiness so the two organs don't duplicate. Plain mupot vocabulary
+  throughout (loop · routine · session · sleeping · heartbeat · model-routing) — no
+  System1/2 · DMN · prefrontal in user-facing surfaces.
+- **Roadmap ↔ changelog feed** (PRs #64/#69). Added
+  [docs/coherence-model.md](docs/coherence-model.md) (the north star: measure → correct
+  across the four rails) + `docs/pot-operating-context.md`.
+
+### Notes
+- The **GitHub weave** (#71) inbound webhook is live + fail-closed; its changelog block
+  lands with v0.22 when the outbound mirror goes on. See #73 (GitHub App) / #74 (Digid
+  go-live operator step).
+
 ## [0.18.0] — 2026-06-09
 
 Flock — a tenant pot becomes the live home + window for its own agents, across any

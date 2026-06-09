@@ -23,15 +23,15 @@ backlog, one state, one gate, one memory). See [docs/coherence-model.md](docs/co
 The **state rail**: tenant-scoped Fleet, pot-native check-in (live on Digid), harness pack
 contract + Claude Code pack. Milestone #2.
 
-## ▶ v0.19.0 — Flight Operations *(in progress — milestone #3)*
+## ✅ v0.19.0 — Flight Operations *(shipped — see CHANGELOG)*
 The **unit of correction**: run expensive (Opus) agents as disciplined **flights** —
 pre-stage cheap, fly one continuous warm-cache burst, land + record cost (the 5-min cache
-TTL forces it). Design: [docs/flight-operations.md](docs/flight-operations.md).
+TTL forces it). Design: [docs/flight-operations.md](docs/flight-operations.md). Milestone #3.
 - **#60** preflight gate — readiness score + two checks. ✅
 - the **flight spine** — flights table + service + dispatch. ✅
 - **brain reconciliation** — pot owns readiness, brain owns coherence (C(t)/regime). ✅
-- **#61** flight board — Fleet shows flying / sleeping / per-flight cost + readiness.
-- **#62** sleeping / schedule-aware presence + vocab adoption.
+- **#61** flight board — Fleet shows flying / sleeping / per-flight cost + readiness. ✅
+- **#62** schedule-aware presence (sleeping ≠ dead) + vocab adoption. ✅
 
 ## v0.20.0 — Close the coherence loop  ← keystone
 Make the brain + pot + flight ONE circuit instead of three good organs. The wire:
