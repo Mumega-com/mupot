@@ -2,6 +2,31 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+## [0.15.0] — 2026-06-09
+
+The v1.0 release candidate: the manifest is frozen and a pot is self-hostable.
+(Toward v1.0 — #37 self-host, #38 freeze. The only remaining 1.0 gate is the operator's
+first live gated send.)
+
+### Added
+- **Frozen Loop manifest contract** (#38). `docs/loop-manifest-contract.md` documents the
+  manifest as a stable public contract (the shapes, the BYO-MCP secret model, the v1
+  invariants). `tests/loop-manifest-contract.test.ts` PINS it — a change that breaks the
+  canonical v1 manifest, its validated key set, or any invariant (exactly-one-owner, the
+  CASL channel-gate, MCP-native refs, the gate enum, positive KPI target) fails the test
+  and signals a breaking (2.0) change. The contract is no longer free to drift.
+- **Self-host** (#37). `scripts/provision-pot.sh <slug>` creates the Cloudflare resources
+  for a pot on a tenant's OWN account (D1/Vectorize/Queues/KV/R2), and `docs/SELF-HOST.md`
+  documents the full bring-up + stay-in-sync flow. The sovereign moat: the tenant owns the
+  data and the bill; the pot stays upstream-compatible. No new app code — tooling + docs.
+
+### Status
+The engineering for v1.0 is complete: a governed, MCP-native loop container; an outreach
+config that runs end to end; a frozen contract; and a self-host path. **v1.0.0 itself is
+gated on one thing that is not code** — the operator setting the GHL secrets, seeding the
+outreach loop, importing real prospects, and approving the first send so a real reply
+moves the KPI. When that live outcome occurs, the version is v1.0.0.
+
 ## [0.14.0] — 2026-06-09
 
 A loop can be created and run through the product. (Toward v1.0 — P5/#36.)
