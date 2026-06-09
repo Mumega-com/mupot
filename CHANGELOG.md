@@ -2,6 +2,21 @@
 
 All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 
+## [0.17.0] — 2026-06-09
+
+Go-live readiness — de-risk the path to the first live send.
+
+### Added
+- **docs/GO-LIVE.md** — the exact operator runbook to cross the last v1.0 gate (set GHL
+  secrets → seed the outreach loop → import prospects → approve the first send → a reply
+  moves the KPI → tag v1.0.0).
+
+### Security
+- **Inbound webhook replay/idempotency guard.** A verified GHL inbound event is now
+  processed at most once per TTL window (a KV nonce keyed by the HMAC signature). A GHL
+  retry or a replayed event returns a no-op success, so it cannot double-create a task or
+  re-flip a prospect's status. Best-effort (a KV outage falls through to process).
+
 ## [0.16.0] — 2026-06-09
 
 Operator visibility — watch a loop run toward the live test.
