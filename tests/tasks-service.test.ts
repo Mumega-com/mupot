@@ -94,30 +94,46 @@ describe('createTask', () => {
 })
 
 describe('mirrorTaskUpdate', () => {
-  it('creates a GitHub issue for a previously-unmirrored task', async () => {
+  const baseTask = {
+    id: 'task-1',
+    squad_id: 'squad-1',
+    title: 'A task',
+    body: '',
+    status: 'open' as const,
+    assignee_agent_id: null,
+    result: null,
+    completed_at: null,
+    created_at: '2026-06-06T00:00:00.000Z',
+    updated_at: '2026-06-06T00:00:00.000Z',
+  }
+
+  it('does NOT create an issue for a never-mirrored task (closes the reflection side-door)', async () => {
+    // Security: update must never create. A null issue = never mirrored (no token at
+    // create, or skipMirror for a webhook-origin task). Creating here would reflect
+    // attacker-influenced webhook fields out under our token (P1).
+    const { env } = makeTaskEnv()
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const url = await mirrorTaskUpdate(env, { ...baseTask, github_issue_url: null })
+
+    expect(url).toBeNull()
+    expect(fetchMock).not.toHaveBeenCalled() // never creates on update
+  })
+
+  it('PATCHes an already-mirrored task', async () => {
     const { env } = makeTaskEnv()
     const fetchMock = vi.fn(async () =>
-      new Response(JSON.stringify({ html_url: 'https://github.com/acme/widgets/issues/8' }), {
-        status: 201,
-      }),
+      new Response(JSON.stringify({ html_url: 'https://github.com/acme/widgets/issues/8' }), { status: 200 }),
     )
     vi.stubGlobal('fetch', fetchMock)
 
     const url = await mirrorTaskUpdate(env, {
-      id: 'task-1',
-      squad_id: 'squad-1',
-      title: 'Backfill mirror',
-      body: '',
-      status: 'open',
-      assignee_agent_id: null,
-      github_issue_url: null,
-      result: null,
-      completed_at: null,
-      created_at: '2026-06-06T00:00:00.000Z',
-      updated_at: '2026-06-06T00:00:00.000Z',
+      ...baseTask,
+      github_issue_url: 'https://github.com/acme/widgets/issues/8',
     })
 
     expect(url).toBe('https://github.com/acme/widgets/issues/8')
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(1) // PATCH, not create
   })
 })

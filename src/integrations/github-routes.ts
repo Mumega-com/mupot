@@ -78,32 +78,42 @@ async function resolveInboundSquad(env: Env): Promise<string | null> {
  * to ignore the event. Exported for unit testing. v1 records the events that matter to
  * an ops work unit: pull requests and CI runs.
  */
+// Neutralize attacker-influenced PR/CI text before it lands in a task: a PR author is
+// untrusted, and the field is reflected into the dashboard + (potentially) GitHub. Strip
+// GitHub-special chars (@mentions, #refs, backticks) + break markdown links, and cap
+// length. Defense-in-depth — the outbound mirror is also skipped for these tasks.
+function safeField(s: unknown, max = 120): string {
+  if (typeof s !== 'string') return ''
+  return s.replace(/[@#`]/g, ' ').replace(/]\(/g, '] (').slice(0, max).trim()
+}
+
+const TITLE_MAX = 200
+
 export function taskFromGitHubEvent(
   eventType: string,
   payload: Record<string, unknown>,
 ): { title: string; body: string } | null {
-  const repo = typeof (payload.repository as { full_name?: string })?.full_name === 'string'
-    ? (payload.repository as { full_name: string }).full_name
-    : ''
+  const repo = safeField((payload.repository as { full_name?: string })?.full_name, 80)
   const prefix = repo ? `[GH ${repo}]` : '[GH]'
 
   if (eventType === 'pull_request') {
-    const action = typeof payload.action === 'string' ? payload.action : 'updated'
+    const action = typeof payload.action === 'string' ? payload.action.replace(/[^a-z_]/gi, '').slice(0, 20) : 'updated'
     const pr = (payload.pull_request ?? {}) as { number?: number; title?: string; html_url?: string; merged?: boolean }
+    const num = Number.isInteger(pr.number) ? pr.number : '?'
     const state = pr.merged && action === 'closed' ? 'merged' : action
     return {
-      title: `${prefix} PR #${pr.number ?? '?'} ${state}: ${pr.title ?? ''}`.trim(),
-      body: [pr.html_url ?? '', `event: pull_request.${action}`].filter(Boolean).join('\n'),
+      title: `${prefix} PR #${num} ${state}: ${safeField(pr.title)}`.slice(0, TITLE_MAX).trim(),
+      body: [safeField(pr.html_url, 300), `event: pull_request.${action}`].filter(Boolean).join('\n'),
     }
   }
 
   if (eventType === 'workflow_run') {
     const wr = (payload.workflow_run ?? {}) as { name?: string; conclusion?: string; head_branch?: string; html_url?: string; status?: string }
-    // record completed runs (a CI failure is a defect = a work unit); ignore in-progress noise
-    if (wr.status && wr.status !== 'completed') return null
+    if (wr.status && wr.status !== 'completed') return null // ignore in-progress noise
+    const concl = safeField(wr.conclusion, 20) || 'completed'
     return {
-      title: `${prefix} CI ${wr.conclusion ?? 'completed'}: ${wr.name ?? 'workflow'} (${wr.head_branch ?? ''})`.trim(),
-      body: [wr.html_url ?? '', `event: workflow_run · conclusion: ${wr.conclusion ?? ''}`].filter(Boolean).join('\n'),
+      title: `${prefix} CI ${concl}: ${safeField(wr.name, 60)} (${safeField(wr.head_branch, 60)})`.slice(0, TITLE_MAX).trim(),
+      body: [safeField(wr.html_url, 300), `event: workflow_run · conclusion: ${concl}`].filter(Boolean).join('\n'),
     }
   }
 
@@ -120,14 +130,17 @@ githubInboundApp.post('/', async (c) => {
   } catch {
     return c.json({ error: 'invalid_body' }, 400)
   }
+  // Size cap BEFORE HMAC/parse — bound work + avoid hashing a huge body (DoS guard).
+  if (rawBody.length > 256 * 1024) return c.json({ error: 'payload_too_large' }, 413)
 
   const signatureHeader = c.req.header('x-hub-signature-256') ?? null
   const verify = await verifyGitHubWebhook(c.env, rawBody, signatureHeader)
   if (verify === 'not_configured') return c.json({ error: 'not_configured' }, 503)
   if (verify === 'invalid') return c.json({ error: 'unauthorized' }, 401)
 
-  // Replay / idempotency guard: GitHub stamps each delivery with a unique x-github-delivery
-  // UUID; a redelivery of the SAME delivery reuses it. Record it in KV; a repeat is a no-op.
+  // Replay / idempotency guard: dedups GitHub REDELIVERIES (manual re-send reuses the same
+  // x-github-delivery UUID) — NOT duplicate-content events (distinct real events get distinct
+  // delivery ids, which is correct: they're distinct work). Best-effort; KV outage → process.
   const delivery = c.req.header('x-github-delivery') ?? signatureHeader
   const nonceKey = `ghnonce:${delivery}`
   try {
@@ -151,6 +164,8 @@ githubInboundApp.post('/', async (c) => {
   const squadId = await resolveInboundSquad(c.env)
   if (!squadId) return c.json({ ok: true, skipped: true, reason: 'no_squad' })
 
-  await createTask(c.env, { squad_id: squadId, title: mapped.title, body: mapped.body, status: 'open' })
+  // skipMirror: a GitHub-origin task must NOT be mirrored back out to a GitHub issue —
+  // that reflects untrusted PR fields under our token + risks a feedback loop (P1).
+  await createTask(c.env, { squad_id: squadId, title: mapped.title, body: mapped.body, status: 'open' }, { skipMirror: true })
   return c.json({ ok: true })
 })

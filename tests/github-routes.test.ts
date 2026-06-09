@@ -56,4 +56,26 @@ describe('taskFromGitHubEvent', () => {
   it('ping (and other events) → ignored', () => {
     expect(taskFromGitHubEvent('ping', { ...repo, zen: 'hi' })).toBeNull()
   })
+  it('neutralizes mention/ref/markdown in a malicious PR title (reflection defense)', () => {
+    const t = taskFromGitHubEvent('pull_request', {
+      ...repo,
+      action: 'opened',
+      pull_request: { number: 1, title: '@org/team ping #123 [x](javascript:alert)' },
+    })
+    expect(t?.title).not.toContain('@')
+    expect(t?.title).not.toContain('#123')
+    expect(t?.title).not.toContain('](')
+  })
+  it('caps an overlong title', () => {
+    const t = taskFromGitHubEvent('pull_request', {
+      ...repo,
+      action: 'opened',
+      pull_request: { number: 1, title: 'x'.repeat(500) },
+    })
+    expect((t?.title.length ?? 0)).toBeLessThanOrEqual(200)
+  })
+  it('sanitizes a non-numeric PR number', () => {
+    const t = taskFromGitHubEvent('pull_request', { ...repo, action: 'opened', pull_request: { number: 'evil' as unknown as number, title: 'Y' } })
+    expect(t?.title).toContain('PR #?')
+  })
 })
