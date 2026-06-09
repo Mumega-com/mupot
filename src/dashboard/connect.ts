@@ -15,13 +15,16 @@ export function mcpEndpoint(origin: string): string {
   return `${origin.replace(/\/+$/, '')}/mcp`
 }
 
-/** Claude Code `.mcp.json` snippet — SSE transport, Bearer placeholder. */
+/** Claude Code `.mcp.json` snippet — streamable-HTTP, Bearer placeholder.
+ *  The pot's /mcp is POST JSON-RPC (streamable-http), NOT an SSE GET stream — so the
+ *  client transport MUST be `http`. `type:"sse"` does a GET that the dashboard catch-all
+ *  302s to /auth/login. Keep the token on ONE line (header values reject newlines). */
 export function claudeCodeSnippet(slug: string, origin: string): string {
   const key = mcpServerKey(slug)
   const config = {
     mcpServers: {
       [key]: {
-        type: 'sse',
+        type: 'http',
         url: mcpEndpoint(origin),
         headers: {
           Authorization: 'Bearer <MEMBER_TOKEN>',
@@ -32,17 +35,18 @@ export function claudeCodeSnippet(slug: string, origin: string): string {
   return JSON.stringify(config, null, 2)
 }
 
-/** Codex `~/.codex/config.toml` snippet — `[mcp_servers.<slug>]` block. */
+/** Codex `~/.codex/config.toml` snippet — `[mcp_servers.<slug>]` block.
+ *  Codex uses streamable-http (the default for a `url`) — do NOT set transport="sse".
+ *  The bearer comes from an env var (bearer_token_env_var) so the raw token is never
+ *  in the file and can't pick up a paste-wrap newline inside the config. */
 export function codexSnippet(slug: string, origin: string): string {
   const key = mcpServerKey(slug)
-  // TOML: a table header plus url + a bearer header. The header value carries the
-  // placeholder only — the member swaps in their real token locally, never here.
+  const envVar = `${key.toUpperCase().replace(/-/g, '_')}_MCP_TOKEN`
   return [
     `[mcp_servers.${key}]`,
     `url = "${mcpEndpoint(origin)}"`,
-    `transport = "sse"`,
-    `[mcp_servers.${key}.headers]`,
-    `Authorization = "Bearer <MEMBER_TOKEN>"`,
+    `bearer_token_env_var = "${envVar}"`,
+    `# then: export ${envVar}=<MEMBER_TOKEN>   (one line, no quotes/newline)`,
   ].join('\n')
 }
 
