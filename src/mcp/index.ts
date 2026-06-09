@@ -37,6 +37,8 @@ import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import { createTask } from '../tasks/service'
+import { buildOrient, renderBrief } from '../orient/service'
+import { mcpEndpoint } from '../dashboard/connect'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -92,7 +94,8 @@ async function authenticateMember(c: {
             m.telegram_chat_id AS telegram_chat_id,
             m.status        AS status,
             m.created_at    AS created_at,
-            t.channel       AS channel
+            t.channel       AS channel,
+            t.agent_id      AS bound_agent_id
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
       WHERE t.token_hash = ?1 AND t.revoked_at IS NULL
@@ -107,6 +110,7 @@ async function authenticateMember(c: {
       status: Member['status']
       created_at: string
       channel: AuthContext['channel']
+      bound_agent_id: string | null
     }>()
 
   if (!row) return null
@@ -124,6 +128,7 @@ async function authenticateMember(c: {
     memberId: row.member_id,
     channel: row.channel ?? 'workspace',
     capabilities,
+    boundAgentId: row.bound_agent_id ?? null, // the weld: an agent-scoped token orients ITSELF
   }
   return auth
 }
@@ -202,6 +207,11 @@ function str(v: unknown): string | null {
 // Each tool: (auth, env, args) → ToolOutcome. The actor is ALWAYS auth.memberId,
 // never anything in args. Capability is checked against the tool's target scope.
 
+// Per-call context a tool may need beyond auth/args. `origin` is the public scheme+host
+// the caller reached us on (e.g. https://agents.digid.ca) — orient needs it to render the
+// pot's own MCP endpoint into the brief. Derived from the request URL at each call site.
+type ToolCtx = { origin: string }
+
 interface ToolSpec {
   name: string
   // human-facing description of scope + minimum capability for /mcp/tools
@@ -209,7 +219,9 @@ interface ToolSpec {
   min: Capability | 'authenticated'
   args: string // documented arg shape
   inputSchema: JsonSchema
-  run: (auth: AuthContext, env: Env, args: Record<string, unknown>) => Promise<ToolOutcome>
+  // ctx is the 4th param; tools that don't need it simply omit it from their signature
+  // (a function of fewer params is assignable here — TS structural typing).
+  run: (auth: AuthContext, env: Env, args: Record<string, unknown>, ctx: ToolCtx) => Promise<ToolOutcome>
 }
 
 type JsonSchema = {
@@ -480,6 +492,58 @@ const toolStatus: ToolSpec = {
   },
 }
 
+// orient — the basin-drop. Any agent on any harness reads "who am I, my squad, my scope,
+// my tasks, my tools, my field state" in-band. This is the harness-agnostic onboarding:
+// the agent's identity is the token, the packet is grounded in THIS pot's D1 only.
+//
+// Self-default (the weld): an agent-scoped token (auth.boundAgentId set) orients ITSELF
+// with no args. A human/operator token must name `agent` (id or slug). Gate mirrors the
+// HTTP route exactly: org-admin OR ≥observer on the target agent's squad.
+const toolOrient: ToolSpec = {
+  name: 'orient',
+  scope: 'self / agent-on-squad (read-only)',
+  min: 'authenticated',
+  args: '{ agent?: string }  // id or slug; omit to orient your own bound agent',
+  inputSchema: {
+    type: 'object',
+    properties: { agent: STRING_SCHEMA },
+    additionalProperties: false,
+  },
+  async run(auth, env, args, ctx) {
+    // ref: explicit arg wins; else the token's bound agent (the weld). No identity from args
+    // is ever TRUSTED — `agent` only NAMES a target; the capability check below authorizes it.
+    const ref = str(args.agent) ?? auth.boundAgentId ?? null
+    if (!ref) return fail(400, 'invalid_args', 'agent required (token is not agent-bound)')
+
+    // Resolve id-first then slug → canonical id + squad for the capability check.
+    let agentRef = await env.DB.prepare(`SELECT id, squad_id FROM agents WHERE id = ?1 LIMIT 1`)
+      .bind(ref)
+      .first<{ id: string; squad_id: string }>()
+    if (!agentRef) {
+      agentRef = await env.DB.prepare(`SELECT id, squad_id FROM agents WHERE slug = ?1 LIMIT 1`)
+        .bind(ref)
+        .first<{ id: string; squad_id: string }>()
+    }
+    if (!agentRef) return fail(404, 'agent_not_found')
+
+    const grants = auth.capabilities ?? []
+    const orgAdmin = hasCapability(grants, 'org', null, 'admin')
+    const onSquad = await memberCanOnSquad(env, grants, agentRef.squad_id, 'observer')
+    if (!orgAdmin && !onSquad) return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
+    const callerCapability = orgAdmin ? 'admin' : 'observer+'
+
+    const { data, notFound } = await buildOrient(
+      env,
+      agentRef.id,
+      callerCapability,
+      mcpEndpoint(ctx.origin),
+      Date.now(),
+    )
+    if (notFound || !data) return fail(404, 'agent_not_found')
+    return done({ packet: data, brief: renderBrief(data) })
+  },
+}
+
 const TOOLS: ToolSpec[] = [
   toolTaskCreate,
   toolRemember,
@@ -487,6 +551,7 @@ const TOOLS: ToolSpec[] = [
   toolWakeAgent,
   toolSquadMessage,
   toolStatus,
+  toolOrient,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
@@ -535,6 +600,7 @@ async function invokeTool(
   env: Env,
   toolName: unknown,
   argsValue: unknown,
+  origin: string,
 ): Promise<ToolOutcome & { tool?: string }> {
   if (typeof toolName !== 'string' || toolName.length === 0) {
     return { ...fail(400, 'invalid_request', 'tool required'), tool: undefined }
@@ -552,7 +618,7 @@ async function invokeTool(
     return { ...fail(400, 'invalid_args', 'args must be an object'), tool: spec.name }
   }
 
-  const outcome = await spec.run(auth, env, args)
+  const outcome = await spec.run(auth, env, args, { origin })
   return { ...outcome, tool: spec.name }
 }
 
@@ -583,7 +649,7 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
     }
 
     const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
-    const outcome = await invokeTool(auth, c.env, params.name, params.arguments)
+    const outcome = await invokeTool(auth, c.env, params.name, params.arguments, new URL(c.req.url).origin)
     if (outcome.ok) return rpcResult(id, mcpCallResult(outcome.tool as string, outcome.result))
 
     return rpcError(
@@ -648,7 +714,7 @@ mcpApp.post('/', async (c) => {
     return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
   }
 
-  const outcome = await invokeTool(auth, c.env, body.tool, body.args)
+  const outcome = await invokeTool(auth, c.env, body.tool, body.args, new URL(c.req.url).origin)
 
   if (outcome.ok) {
     return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
@@ -743,7 +809,7 @@ mcpActionsApp.post('/actions/:tool', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
-  const outcome = await invokeTool(auth, c.env, c.req.param('tool'), args)
+  const outcome = await invokeTool(auth, c.env, c.req.param('tool'), args, new URL(c.req.url).origin)
   if (outcome.ok) return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
   return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail }, outcome.status)
 })
