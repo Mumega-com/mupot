@@ -17,6 +17,11 @@ routes = [
 TENANT_SLUG = "digid"
 BRAND = "Digid"
 OAUTH_PROVIDER = "google"
+# Flock #43: the Digid fleet window addresses its OWN bus project + ops agent —
+# never the company `sos`/`kasra`. Inert until a scoped BUS_TOKEN is set (egress
+# posture decision #44); these vars only scope, they do not open egress.
+FLEET_PROJECT = "digid"
+FLEET_OPS_AGENT = "digid"
 # secrets deliberately NOT set (pre-live egress-gate requirement, dossier 2026-06-05):
 # no OAUTH_*, GITHUB_TOKEN, AI_GATEWAY_TOKEN, channel tokens — pot is inbound-only.
 

@@ -68,7 +68,7 @@ import { formatBurn, formatUsd } from '../agents/cost'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
-import { loadFleet, wakeFleetAgent, requestFleetControl, busConfigured } from './fleet'
+import { loadFleet, wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
 import type { FleetRow } from './fleet'
 import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
@@ -170,7 +170,9 @@ dashboardApp.get('/loops', async (c) => {
 // GET /fleet — see every company agent: liveness, last active, role/label.
 // Window only: data comes from the bus bridge; the pot runs none of them.
 dashboardApp.get('/fleet', async (c) => {
-  if (!busConfigured(c.env)) {
+  // fleetScoped, not just busConfigured: an unscoped pot must not render/operate
+  // a fleet that would fall back to the company project (fail closed).
+  if (!fleetScoped(c.env)) {
     return c.html(shell(c.env.BRAND, 'Fleet', fleetUnconfiguredBody()))
   }
   let rows: FleetRow[] = []
@@ -184,12 +186,13 @@ dashboardApp.get('/fleet', async (c) => {
 })
 
 // POST /fleet/wake — direct bus ping to the agent. Owner/admin only
-// (adversarial P2 2026-06-07): the HQ BUS_TOKEN is admin-scoped, so an
-// un-gated wake let any pot member ping any agent in any project by name.
-// Gated to owner/admin to match /fleet/control; wakeFleetAgent also pins
-// the project so the ping cannot fan out cross-tenant.
+// (adversarial P2 2026-06-07): un-gated wake let any pot member ping any agent
+// by name. Gated to owner/admin to match /fleet/control. Isolation note: the
+// project pin in wakeFleetAgent is defense-in-depth — the real cross-tenant
+// boundary is the BUS_TOKEN scope (project-scoped + agent-bound per #44); the
+// resolvers fail closed so an unscoped pot cannot fall back to the company project.
 dashboardApp.post('/fleet/wake', async (c) => {
-  if (!busConfigured(c.env)) return c.json({ error: 'bus_not_configured' }, 503)
+  if (!fleetScoped(c.env)) return c.json({ error: 'bus_not_configured' }, 503)
   const auth = c.get('auth')
   if (auth.role !== 'owner' && auth.role !== 'admin') {
     return c.json({ error: 'forbidden', need: 'admin' }, 403)
@@ -207,7 +210,7 @@ dashboardApp.post('/fleet/wake', async (c) => {
 // only). Never a direct host action: emits a receipted control-request on the
 // bus to the operations agent, which executes server-side and acks.
 dashboardApp.post('/fleet/control', async (c) => {
-  if (!busConfigured(c.env)) return c.json({ error: 'bus_not_configured' }, 503)
+  if (!fleetScoped(c.env)) return c.json({ error: 'bus_not_configured' }, 503)
   const auth = c.get('auth')
   if (auth.role !== 'owner' && auth.role !== 'admin') {
     return c.json({ error: 'forbidden', need: 'admin' }, 403)

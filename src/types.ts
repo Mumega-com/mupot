@@ -58,8 +58,14 @@ export interface Env {
   TENANT_SLUG: string
   BRAND: string
   OAUTH_PROVIDER: 'google' | 'telegram'
-  // company-fleet window (HQ pots only): SOS bus bridge REST
+  // fleet window: SOS bus bridge REST
   BUS_URL?: string
+  // fleet scoping (Flock #43): which bus project this pot's fleet addresses, and
+  // which ops agent executes control requests. NO code default — the resolvers
+  // fail closed (null → refuse). Each pot sets these explicitly in its wrangler
+  // vars (company: sos/kasra; tenant: its own project + operator agent).
+  FLEET_PROJECT?: string
+  FLEET_OPS_AGENT?: string
   // secrets (present at runtime only)
   OAUTH_CLIENT_ID?: string
   OAUTH_CLIENT_SECRET?: string
