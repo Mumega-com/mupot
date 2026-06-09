@@ -208,8 +208,20 @@ interface ToolSpec {
   scope: string
   min: Capability | 'authenticated'
   args: string // documented arg shape
+  inputSchema: JsonSchema
   run: (auth: AuthContext, env: Env, args: Record<string, unknown>) => Promise<ToolOutcome>
 }
+
+type JsonSchema = {
+  type: 'object'
+  properties: Record<string, unknown>
+  required?: string[]
+  additionalProperties: boolean
+}
+
+const STRING_SCHEMA = { type: 'string' }
+const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
+const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
 
 // task_create — create a task on a squad. cap: member+ on the TARGET squad.
 const toolTaskCreate: ToolSpec = {
@@ -217,6 +229,12 @@ const toolTaskCreate: ToolSpec = {
   scope: 'squad',
   min: 'member',
   args: '{ squad_id: string, title: string, body?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { squad_id: STRING_SCHEMA, title: STRING_SCHEMA, body: STRING_SCHEMA },
+    required: ['squad_id', 'title'],
+    additionalProperties: false,
+  },
   async run(auth, env, args) {
     const squadId = str(args.squad_id)
     const title = str(args.title)
@@ -259,6 +277,12 @@ const toolRemember: ToolSpec = {
   scope: 'self',
   min: 'authenticated',
   args: '{ text: string, concepts?: string[] }',
+  inputSchema: {
+    type: 'object',
+    properties: { text: STRING_SCHEMA, concepts: OPTIONAL_STRING_ARRAY_SCHEMA },
+    required: ['text'],
+    additionalProperties: false,
+  },
   async run(auth, env, args) {
     const text = str(args.text)
     if (!text) return fail(400, 'invalid_args', 'text required')
@@ -282,6 +306,12 @@ const toolRecall: ToolSpec = {
   scope: 'self',
   min: 'authenticated',
   args: '{ query: string, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: { query: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA },
+    required: ['query'],
+    additionalProperties: false,
+  },
   async run(auth, env, args) {
     const query = str(args.query)
     if (!query) return fail(400, 'invalid_args', 'query required')
@@ -305,6 +335,17 @@ const toolWakeAgent: ToolSpec = {
   scope: 'squad (of the agent)',
   min: 'lead',
   args: '{ agent_id: string, reason?: string, context?: string, maxActions?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      agent_id: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
+      context: STRING_SCHEMA,
+      maxActions: OPTIONAL_NUMBER_SCHEMA,
+    },
+    required: ['agent_id'],
+    additionalProperties: false,
+  },
   async run(auth, env, args) {
     const agentId = str(args.agent_id)
     if (!agentId) return fail(400, 'invalid_args', 'agent_id required')
@@ -346,7 +387,9 @@ const toolWakeAgent: ToolSpec = {
       body: JSON.stringify({ reason, squad_id: agent.squad_id, context, maxActions }),
     })
     const runtime = await res.json<unknown>()
-    if (!res.ok) return fail(409, 'wake_failed', runtime)
+    // Do NOT reflect the raw Durable Object error body (WARN-4) — it may carry internal
+    // runtime detail into the caller / ChatGPT connector. Fixed reason on failure.
+    if (!res.ok) return fail(409, 'wake_failed')
     return done({ agent_id: agent.id, runtime })
   },
 }
@@ -358,6 +401,12 @@ const toolSquadMessage: ToolSpec = {
   scope: 'squad',
   min: 'member',
   args: '{ squad_id: string, message: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { squad_id: STRING_SCHEMA, message: STRING_SCHEMA },
+    required: ['squad_id', 'message'],
+    additionalProperties: false,
+  },
   async run(auth, env, args) {
     const squadId = str(args.squad_id)
     const message = str(args.message)
@@ -393,6 +442,11 @@ const toolStatus: ToolSpec = {
   scope: 'self/agent (read-only)',
   min: 'authenticated',
   args: '{ agent_id?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent_id: STRING_SCHEMA },
+    additionalProperties: false,
+  },
   async run(auth, env, args) {
     const agentId = str(args.agent_id)
     if (!agentId) {
@@ -437,8 +491,116 @@ const TOOLS: ToolSpec[] = [
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
 
+interface JsonRpcRequest {
+  jsonrpc?: unknown
+  id?: unknown
+  method?: unknown
+  params?: unknown
+}
+
+function isJsonRpcRequest(body: unknown): body is JsonRpcRequest {
+  return typeof body === 'object' && body !== null && 'method' in body
+}
+
+function rpcResult(id: unknown, result: unknown): Response {
+  return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, result }), {
+    headers: { 'content-type': 'application/json' },
+  })
+}
+
+function rpcError(id: unknown, code: number, message: string, data?: unknown, status = 200): Response {
+  return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, error: { code, message, data } }), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  })
+}
+
+function mcpTool(spec: ToolSpec): Record<string, unknown> {
+  return {
+    name: spec.name,
+    description: `${spec.scope}; minimum capability: ${spec.min}. Args: ${spec.args}`,
+    inputSchema: spec.inputSchema,
+  }
+}
+
+function mcpCallResult(tool: string, result: unknown): Record<string, unknown> {
+  return {
+    content: [{ type: 'text', text: JSON.stringify({ ok: true, tool, result }) }],
+    structuredContent: result,
+  }
+}
+
+async function invokeTool(
+  auth: AuthContext,
+  env: Env,
+  toolName: unknown,
+  argsValue: unknown,
+): Promise<ToolOutcome & { tool?: string }> {
+  if (typeof toolName !== 'string' || toolName.length === 0) {
+    return { ...fail(400, 'invalid_request', 'tool required'), tool: undefined }
+  }
+
+  const spec = TOOL_BY_NAME.get(toolName)
+  if (!spec) return { ...fail(400, 'unknown_tool', toolName), tool: toolName }
+
+  let args: Record<string, unknown>
+  if (argsValue === undefined || argsValue === null) {
+    args = {}
+  } else if (typeof argsValue === 'object' && !Array.isArray(argsValue)) {
+    args = argsValue as Record<string, unknown>
+  } else {
+    return { ...fail(400, 'invalid_args', 'args must be an object'), tool: spec.name }
+  }
+
+  const outcome = await spec.run(auth, env, args)
+  return { ...outcome, tool: spec.name }
+}
+
+async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcRequest): Promise<Response> {
+  const id = body.id ?? null
+  const method = typeof body.method === 'string' ? body.method : ''
+
+  if (method === 'initialize') {
+    return rpcResult(id, {
+      protocolVersion: '2025-06-18',
+      capabilities: { tools: {} },
+      serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: '0.16.0' },
+    })
+  }
+
+  if (method === 'notifications/initialized') {
+    return new Response(null, { status: 204 })
+  }
+
+  if (method === 'tools/list') {
+    return rpcResult(id, { tools: TOOLS.map(mcpTool) })
+  }
+
+  if (method === 'tools/call') {
+    const auth = await authenticateMember(c)
+    if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
+      return rpcError(id, -32001, 'unauthenticated', undefined, 401)
+    }
+
+    const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
+    const outcome = await invokeTool(auth, c.env, params.name, params.arguments)
+    if (outcome.ok) return rpcResult(id, mcpCallResult(outcome.tool as string, outcome.result))
+
+    return rpcError(
+      id,
+      outcome.status === 404 ? -32602 : -32000,
+      outcome.error,
+      outcome.detail,
+      outcome.status,
+    )
+  }
+
+  return rpcError(id, -32601, 'method_not_found', method)
+}
+
 // ── app ───────────────────────────────────────────────────────────────────────
 export const mcpApp = new Hono<AppEnv>()
+export const mcpActionsApp = new Hono<AppEnv>()
 
 mcpApp.get('/health', (c) => c.json({ ok: true, component: 'mcp', tenant: c.env.TENANT_SLUG }))
 
@@ -457,58 +619,131 @@ mcpApp.get('/tools', (c) =>
   }),
 )
 
-// Authenticate every invocation path. Identity is derived from the bearer token
-// ONLY; we set the resolved Principal on c so tools read it (never the body).
-mcpApp.use('/', async (c, next) => {
-  const auth = await authenticateMember(c)
-  if (!auth) return c.json({ error: 'unauthenticated' }, 401)
-  // Hard tenant guard: a token is minted per-pot; the resolved tenant is forced
-  // to env.TENANT_SLUG above, so this is belt-and-suspenders against drift.
-  if (auth.tenant !== c.env.TENANT_SLUG) {
-    return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
-  }
-  c.set('auth', auth)
-  await next()
-})
-
 interface InvokeBody {
   tool?: unknown
   args?: unknown
 }
 
-// POST /mcp — invoke a tool. Body: {tool, args}. The actor is the authenticated
-// member; we NEVER read an identity field from args.
+// POST /mcp — either:
+//   - JSON-RPC MCP: initialize, tools/list, tools/call
+//   - legacy pragmatic JSON: {tool, args}
+// The actor is the authenticated member; we NEVER read an identity field from args.
 mcpApp.post('/', async (c) => {
-  let body: InvokeBody
+  // Pre-auth body-size cap (WARN-1): initialize/tools/list are bearerless, so bound the
+  // body BEFORE buffering to deny an unauthenticated memory/CPU-exhaustion POST.
+  const len = Number(c.req.header('content-length') ?? '0')
+  if (Number.isFinite(len) && len > 64 * 1024) return c.json({ error: 'payload_too_large' }, 413)
+  let body: InvokeBody | JsonRpcRequest
   try {
-    body = (await c.req.json()) as InvokeBody
+    body = (await c.req.json()) as InvokeBody | JsonRpcRequest
   } catch {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
-  const toolName = typeof body.tool === 'string' ? body.tool : null
-  if (!toolName) return c.json({ error: 'invalid_request', detail: 'tool required' }, 400)
+  if (isJsonRpcRequest(body)) return handleJsonRpc(c, body)
 
-  const spec = TOOL_BY_NAME.get(toolName)
-  if (!spec) {
-    return c.json({ error: 'unknown_tool', tool: toolName }, 400)
+  const auth = await authenticateMember(c)
+  if (!auth) return c.json({ error: 'unauthenticated' }, 401)
+  if (auth.tenant !== c.env.TENANT_SLUG) {
+    return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
   }
 
-  // args must be an object (or omitted → {}). Never an array/scalar.
-  let args: Record<string, unknown>
-  if (body.args === undefined || body.args === null) {
-    args = {}
-  } else if (typeof body.args === 'object' && !Array.isArray(body.args)) {
-    args = body.args as Record<string, unknown>
-  } else {
-    return c.json({ error: 'invalid_args', detail: 'args must be an object' }, 400)
-  }
-
-  const auth = c.get('auth')
-  const outcome = await spec.run(auth, c.env, args)
+  const outcome = await invokeTool(auth, c.env, body.tool, body.args)
 
   if (outcome.ok) {
-    return c.json({ ok: true, tool: spec.name, result: outcome.result })
+    return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
   }
-  return c.json({ ok: false, tool: spec.name, error: outcome.error, detail: outcome.detail }, outcome.status)
+  return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail }, outcome.status)
+})
+
+function openApiSpec(origin: string): Record<string, unknown> {
+  const paths: Record<string, unknown> = {}
+  for (const spec of TOOLS) {
+    paths[`/actions/${spec.name}`] = {
+      post: {
+        operationId: spec.name,
+        summary: spec.name,
+        description: `${spec.scope}; minimum capability: ${spec.min}.`,
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: false,
+          content: {
+            'application/json': {
+              schema: spec.inputSchema,
+            },
+          },
+        },
+        responses: {
+          '200': {
+            description: 'Tool result',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    ok: { type: 'boolean' },
+                    tool: { type: 'string' },
+                    result: { type: 'object' },
+                  },
+                  required: ['ok', 'tool', 'result'],
+                  additionalProperties: true,
+                },
+              },
+            },
+          },
+          '400': { description: 'Invalid request' },
+          '401': { description: 'Unauthenticated' },
+          '403': { description: 'Forbidden' },
+          '404': { description: 'Not found' },
+          '409': { description: 'Conflict' },
+        },
+      },
+    }
+  }
+
+  return {
+    openapi: '3.0.3',
+    info: {
+      title: 'Mupot Digid Actions',
+      version: '0.16.0',
+      description: 'Custom GPT Actions facade for the Digid Mupot tool surface.',
+    },
+    servers: [{ url: origin }],
+    components: {
+      securitySchemes: {
+        bearerAuth: {
+          type: 'http',
+          scheme: 'bearer',
+        },
+      },
+    },
+    paths,
+  }
+}
+
+mcpActionsApp.get('/openapi.json', (c) => {
+  const url = new URL(c.req.url)
+  return c.json(openApiSpec(url.origin))
+})
+
+mcpActionsApp.post('/actions/:tool', async (c) => {
+  const len = Number(c.req.header('content-length') ?? '0')
+  if (Number.isFinite(len) && len > 64 * 1024) return c.json({ error: 'payload_too_large' }, 413)
+  const auth = await authenticateMember(c)
+  if (!auth) return c.json({ error: 'unauthenticated' }, 401)
+  if (auth.tenant !== c.env.TENANT_SLUG) {
+    return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
+  }
+
+  let args: unknown = {}
+  try {
+    const raw = await c.req.text()
+    args = raw.trim().length > 0 ? JSON.parse(raw) : {}
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+
+  const outcome = await invokeTool(auth, c.env, c.req.param('tool'), args)
+  if (outcome.ok) return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
+  return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail }, outcome.status)
 })
