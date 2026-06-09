@@ -69,7 +69,8 @@ function makeEnv(tenant = 'test-tenant', seed: Row[] = []) {
                 if (sql.startsWith('UPDATE loops SET status')) {
                   const [status, updated_at, id, t] = args as [string, string, string, string]
                   const r = rows.get(id)
-                  if (r && r.tenant === t) {
+                  // mirror the WHERE: tenant-scoped + killed/done are terminal
+                  if (r && r.tenant === t && r.status !== 'killed' && r.status !== 'done') {
                     rows.set(id, { ...r, status, updated_at })
                     return { meta: { changes: 1 } }
                   }
@@ -171,5 +172,13 @@ describe('listLoops + setLoopStatus', () => {
     // other tenant cannot transition it
     const { env: envB } = makeEnv('tenant-b', [...rows.values()])
     expect(await setLoopStatus(envB, created.value.id, 'active')).toBe(false)
+  })
+
+  it('killed is terminal — a killed loop cannot be revived', async () => {
+    const { env } = makeEnv()
+    const created = await createLoop(env, VALID_SPEC)
+    if (!created.ok) throw new Error('setup')
+    expect(await setLoopStatus(env, created.value.id, 'killed')).toBe(true)
+    expect(await setLoopStatus(env, created.value.id, 'active')).toBe(false) // cannot revive
   })
 })

@@ -133,11 +133,15 @@ export async function resetDryRounds(env: Env, id: string): Promise<void> {
     .run()
 }
 
-/** setLoopStatus — tenant-scoped lifecycle transition. Returns false if no row changed. */
+/**
+ * setLoopStatus — tenant-scoped lifecycle transition. Returns false if no row changed.
+ * 'killed' and 'done' are TERMINAL: a loop in either state is never transitioned out
+ * (the WHERE excludes them), so a killed loop cannot be revived.
+ */
 export async function setLoopStatus(env: Env, id: string, status: LoopStatus): Promise<boolean> {
   const now = new Date().toISOString()
   const res = await env.DB.prepare(
-    `UPDATE loops SET status = ?, updated_at = ? WHERE id = ? AND tenant = ?`,
+    `UPDATE loops SET status = ?, updated_at = ? WHERE id = ? AND tenant = ? AND status NOT IN ('killed', 'done')`,
   )
     .bind(status, now, id, env.TENANT_SLUG)
     .run()
