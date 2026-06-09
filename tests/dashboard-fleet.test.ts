@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest'
-import { classify, humanAge, busConfigured } from '../src/dashboard/fleet'
+import {
+  classify,
+  humanAge,
+  busConfigured,
+  resolveFleetProject,
+  resolveFleetSender,
+  resolveFleetOpsAgent,
+  fleetScoped,
+} from '../src/dashboard/fleet'
 import type { Env } from '../src/types'
 
 const NOW = 1_780_000_000_000
@@ -26,5 +34,72 @@ describe('busConfigured', () => {
   })
   it('true with token (default URL)', () => {
     expect(busConfigured({ BUS_TOKEN: 'x' } as Env)).toBe(true)
+  })
+})
+
+// ── tenant-scoping (Flock #43) ────────────────────────────────────────────────
+// The fleet window must scope to the pot's OWN bus project + ops agent. A tenant
+// pot must never address the company `sos` fleet or route control to our `kasra`.
+// The project string is env-derived (never request-derived) so a worker cannot be
+// tricked into cross-tenant fan-out.
+
+describe('resolveFleetProject', () => {
+  it('explicit FLEET_PROJECT wins', () => {
+    expect(resolveFleetProject({ FLEET_PROJECT: 'sos', TENANT_SLUG: 'mumega' } as Env)).toBe('sos')
+  })
+  it('falls back to TENANT_SLUG for a tenant pot', () => {
+    expect(resolveFleetProject({ TENANT_SLUG: 'digid' } as Env)).toBe('digid')
+  })
+  // FAIL CLOSED (adversarial P1): an unscoped pot must NOT default to the
+  // company `sos` project — it returns null so the send is refused.
+  it('null when nothing set (fail closed, never sos)', () => {
+    expect(resolveFleetProject({} as Env)).toBeNull()
+  })
+  it('null on blank/whitespace env (no silent company fallback)', () => {
+    expect(resolveFleetProject({ FLEET_PROJECT: '   ', TENANT_SLUG: '  ' } as Env)).toBeNull()
+  })
+  it('trims whitespace', () => {
+    expect(resolveFleetProject({ FLEET_PROJECT: '  digid ' } as Env)).toBe('digid')
+  })
+  it('digid pot never resolves to the company sos project', () => {
+    expect(resolveFleetProject({ TENANT_SLUG: 'digid', FLEET_PROJECT: 'digid' } as Env)).not.toBe('sos')
+  })
+})
+
+describe('resolveFleetSender', () => {
+  it('tenant-specific HQ id', () => {
+    expect(resolveFleetSender({ TENANT_SLUG: 'digid' } as Env)).toBe('mupot-digid-hq')
+  })
+  it('company id from mumega slug', () => {
+    expect(resolveFleetSender({ TENANT_SLUG: 'mumega' } as Env)).toBe('mupot-mumega-hq')
+  })
+  it('null when slug missing (fail closed)', () => {
+    expect(resolveFleetSender({} as Env)).toBeNull()
+  })
+})
+
+describe('resolveFleetOpsAgent', () => {
+  it('explicit FLEET_OPS_AGENT wins', () => {
+    expect(resolveFleetOpsAgent({ FLEET_OPS_AGENT: 'digid' } as Env)).toBe('digid')
+  })
+  // FAIL CLOSED (adversarial P1): no fallback to our `kasra` — an unscoped pot
+  // must not route control to the company ops agent.
+  it('null when unset (never falls back to kasra)', () => {
+    expect(resolveFleetOpsAgent({} as Env)).toBeNull()
+  })
+  it('digid pot routes control to its own ops agent, never kasra', () => {
+    expect(resolveFleetOpsAgent({ FLEET_OPS_AGENT: 'digid' } as Env)).not.toBe('kasra')
+  })
+})
+
+describe('fleetScoped', () => {
+  it('false without bus token even if project set', () => {
+    expect(fleetScoped({ FLEET_PROJECT: 'digid', TENANT_SLUG: 'digid' } as Env)).toBe(false)
+  })
+  it('false when bus configured but pot unscoped (no project/slug)', () => {
+    expect(fleetScoped({ BUS_TOKEN: 'x' } as Env)).toBe(false)
+  })
+  it('true when bus configured AND scoped', () => {
+    expect(fleetScoped({ BUS_TOKEN: 'x', TENANT_SLUG: 'digid' } as Env)).toBe(true)
   })
 })
