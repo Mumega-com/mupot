@@ -22,6 +22,8 @@ your Cloudflare account
   ├─ tasks      → your GitHub (source of truth)
   ├─ channels   microkernel ChannelAdapter — Discord / Google Chat / Telegram,
   │             where the platform's scoped channel IS a squad
+  ├─ fleet      agents of ANY runtime (Claude Code / Codex / Hermes / openclaw)
+  │             check IN to the pot → a live inventory: who's in, who's out
   └─ dashboard  Pages + a first-run onboarding wizard
 ```
 
