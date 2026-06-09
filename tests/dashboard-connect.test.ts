@@ -28,13 +28,14 @@ describe('mcpServerKey', () => {
 })
 
 describe('claudeCodeSnippet', () => {
-  it('produces valid JSON with the SSE transport and a placeholder token (never a real one)', () => {
+  it('produces valid JSON with streamable-http transport and a placeholder token (never a real one)', () => {
     const snippet = claudeCodeSnippet('acme', 'https://pot.example.com')
     const parsed = JSON.parse(snippet) as {
       mcpServers: Record<string, { type: string; url: string; headers: Record<string, string> }>
     }
     const server = parsed.mcpServers.acme
-    expect(server.type).toBe('sse')
+    // MUST be 'http' — the pot is POST/streamable-http; 'sse' does a GET that 302s to login.
+    expect(server.type).toBe('http')
     expect(server.url).toBe('https://pot.example.com/mcp')
     expect(server.headers.Authorization).toBe('Bearer <MEMBER_TOKEN>')
     // Defense-in-depth: no `mupot_`-prefixed real token ever leaks into a snippet.
@@ -43,11 +44,12 @@ describe('claudeCodeSnippet', () => {
 })
 
 describe('codexSnippet', () => {
-  it('emits the [mcp_servers.<slug>] block with a placeholder token', () => {
+  it('emits the [mcp_servers.<slug>] block with an env-var bearer (no transport=sse, no inline token)', () => {
     const snippet = codexSnippet('acme', 'https://pot.example.com')
     expect(snippet).toContain('[mcp_servers.acme]')
     expect(snippet).toContain('url = "https://pot.example.com/mcp"')
-    expect(snippet).toContain('Authorization = "Bearer <MEMBER_TOKEN>"')
+    expect(snippet).toContain('bearer_token_env_var = "ACME_MCP_TOKEN"')
+    expect(snippet).not.toContain('transport = "sse"') // Codex uses streamable-http
     expect(snippet).not.toContain('mupot_')
   })
 })
