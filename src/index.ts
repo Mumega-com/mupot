@@ -24,6 +24,7 @@ import { channelsApp, reconcileMembership } from './channels'
 import { channelsAdminApp } from './channels/admin'
 import { ghlInboundApp } from './integrations/ghl-routes'
 import { prospectsApp } from './loops/prospects-routes'
+import { loopsApp } from './loops/routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -54,6 +55,7 @@ app.route('/api/channels', channelsAdminApp)
 // Mounted BEFORE the dashboard '/' catch-all so /api/integrations/ghl/* wins.
 app.route('/api/integrations/ghl', ghlInboundApp)
 app.route('/api/prospects', prospectsApp)
+app.route('/api/loops', loopsApp)
 app.route(ROUTES.dashboard, dashboardApp)
 
 // Queue consumer — the bus component owns the handler.
