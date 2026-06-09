@@ -28,6 +28,7 @@ import { prospectsApp } from './loops/prospects-routes'
 import { loopsApp } from './loops/routes'
 import { fleetCheckinApp } from './fleet/checkin-routes'
 import { flightsApp } from './flight/routes'
+import { orientApp } from './orient/routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -67,6 +68,9 @@ app.route('/api/fleet', fleetCheckinApp)
 // Coherence-loop connector (#70): the brain dispatches gated flights + pulls outcomes,
 // inbound (the pot stays sealed). Org-admin via member-token. Before the '/' catch-all.
 app.route('/api/flights', flightsApp)
+// Orient seam (#digid-hybrid S1): an agent reads its basin-drop packet; the mind pushes
+// per-agent field state inbound. Before the '/' catch-all. See docs/superpowers/specs.
+app.route('/api/orient', orientApp)
 app.route(ROUTES.dashboard, dashboardApp)
 
 // Queue consumer — the bus component owns the handler.
