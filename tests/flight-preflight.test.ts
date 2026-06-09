@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { coherenceScore, preflightCheck } from '../src/flight/preflight'
+import { readinessScore, preflightCheck } from '../src/flight/preflight'
 import type { FlightSignals } from '../src/flight/preflight'
 
 // A healthy flight: context loaded, tools up, budget ample, progress beats waste,
@@ -15,24 +15,24 @@ const HEALTHY: FlightSignals = {
   stepSeconds: 60,
 }
 
-describe('coherenceScore', () => {
-  it('healthy flight scores high', () => {
-    expect(coherenceScore(HEALTHY)).toBeGreaterThan(0.7)
+describe('readinessScore', () => {
+  it('healthy flight scores high (readiness)', () => {
+    expect(readinessScore(HEALTHY)).toBeGreaterThan(0.7)
   })
   it('missing context tanks the score toward zero', () => {
-    expect(coherenceScore({ ...HEALTHY, contextComplete: false })).toBeLessThan(0.2)
+    expect(readinessScore({ ...HEALTHY, contextComplete: false })).toBeLessThan(0.2)
   })
   it('unreachable tools tanks the score toward zero', () => {
-    expect(coherenceScore({ ...HEALTHY, toolsReachable: false })).toBeLessThan(0.2)
+    expect(readinessScore({ ...HEALTHY, toolsReachable: false })).toBeLessThan(0.2)
   })
   it('is bounded to [0,1]', () => {
-    const s = coherenceScore(HEALTHY)
+    const s = readinessScore(HEALTHY)
     expect(s).toBeGreaterThanOrEqual(0)
     expect(s).toBeLessThanOrEqual(1)
   })
   it('a half-funded flight scores lower than a fully funded one', () => {
-    const poor = coherenceScore({ ...HEALTHY, budgetRemainingMicroUsd: 500_000 }) // < estimate
-    expect(poor).toBeLessThan(coherenceScore(HEALTHY))
+    const poor = readinessScore({ ...HEALTHY, budgetRemainingMicroUsd: 500_000 }) // < estimate
+    expect(poor).toBeLessThan(readinessScore(HEALTHY))
   })
 })
 
@@ -91,6 +91,6 @@ describe('preflightCheck — score threshold', () => {
     // raise the threshold above a healthy score to isolate the threshold gate
     const r = preflightCheck(HEALTHY, { scoreThreshold: 0.99 })
     expect(r.go).toBe(false)
-    expect(r.reasons).toContain('low_coherence')
+    expect(r.reasons).toContain('low_readiness')
   })
 })
