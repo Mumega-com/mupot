@@ -10,6 +10,7 @@
 // for now to avoid editing that file mid-change.
 
 import type { Env } from '../types'
+import { resolveCapabilities, hasCapability } from './capability'
 
 export interface AgentIdentity {
   memberId: string
@@ -49,4 +50,19 @@ export async function resolveMemberByToken(env: Env, raw: string | null): Promis
     .first<{ member_id: string; display_name: string; email: string | null; status: string }>()
   if (!row || row.status !== 'active') return null
   return { memberId: row.member_id, displayName: row.display_name, email: row.email }
+}
+
+// Resolve a bearer token to an ORG-ADMIN identity, or a refusal. Shared by the
+// money/field-spending inbound surfaces (the #70 flight connector + the orient
+// field-push) — the mind calls these as an org-admin service principal. 401 =
+// missing/bad token (no auth oracle); 403 = valid token, not org-admin.
+export async function resolveOrgAdmin(
+  env: Env,
+  authHeader: string | null | undefined,
+): Promise<{ ok: true; id: AgentIdentity } | { ok: false; status: 401 | 403 }> {
+  const id = await resolveMemberByToken(env, bearerToken(authHeader))
+  if (!id) return { ok: false, status: 401 }
+  const caps = await resolveCapabilities(env, id.memberId)
+  if (!hasCapability(caps, 'org', null, 'admin')) return { ok: false, status: 403 }
+  return { ok: true, id }
 }

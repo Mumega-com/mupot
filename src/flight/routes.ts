@@ -17,8 +17,7 @@
 
 import { Hono } from 'hono'
 import type { Env } from '../types'
-import { bearerToken, resolveMemberByToken, type AgentIdentity } from '../auth/member-bearer'
-import { resolveCapabilities, hasCapability } from '../auth/capability'
+import { resolveOrgAdmin } from '../auth/member-bearer'
 import { dispatchFlight } from './dispatch'
 import { landFlight, failFlight, getFlight, listFlights, type FlightStatus, type TriggerSource } from './service'
 import type { FlightSignals, PreflightOptions } from './preflight'
@@ -109,18 +108,9 @@ export function parseOutcomeQuery(q: URLSearchParams): OutcomeQuery {
   return { statuses: statuses && statuses.length > 0 ? statuses : null, sinceMs, limit }
 }
 
-// ── auth: org-admin via member-token bearer (no session; dispatch spends money) ─
-
-async function requireOrgAdmin(
-  env: Env,
-  authHeader: string | null | undefined,
-): Promise<{ ok: true; id: AgentIdentity } | { ok: false; status: 401 | 403 }> {
-  const id = await resolveMemberByToken(env, bearerToken(authHeader))
-  if (!id) return { ok: false, status: 401 } // generic — no auth oracle
-  const caps = await resolveCapabilities(env, id.memberId)
-  if (!hasCapability(caps, 'org', null, 'admin')) return { ok: false, status: 403 }
-  return { ok: true, id }
-}
+// auth: org-admin via member-token bearer — shared with the orient field-push
+// (resolveOrgAdmin in auth/member-bearer). No session; dispatch spends money.
+const requireOrgAdmin = resolveOrgAdmin
 
 // ── the connector app ──────────────────────────────────────────────────────────
 
