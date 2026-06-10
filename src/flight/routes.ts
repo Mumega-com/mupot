@@ -19,8 +19,18 @@ import { Hono } from 'hono'
 import type { Env } from '../types'
 import { resolveOrgAdmin } from '../auth/member-bearer'
 import { dispatchFlight } from './dispatch'
-import { landFlight, failFlight, getFlight, listFlights, type FlightStatus, type TriggerSource } from './service'
+import {
+  landFlight,
+  failFlight,
+  getFlight,
+  listFlights,
+  countFlightsCreatedSince,
+  type FlightStatus,
+  type TriggerSource,
+} from './service'
 import type { FlightSignals, PreflightOptions } from './preflight'
+import { sumCostMicroUsdSince } from '../agents/meter'
+import { reconcileCost, parseMeterTakeoff, metaWithReconciliation } from './reconcile'
 
 // ── input parsing (pure, exported for tests) ──────────────────────────────────
 
@@ -45,10 +55,26 @@ export interface DispatchBody {
   opts: PreflightOptions
 }
 
+// Every signal the brain must supply, by name. A signal that is merely ABSENT is not
+// the same as one measured at zero — silently defaulting absences to 0 would let a
+// misconfigured caller tank (or, for booleans, pass) the gate without anyone noticing.
+// Absent ⇒ reject and name the holes; present-but-mistyped still coerces fail-closed.
+const REQUIRED_SIGNALS = [
+  'contextComplete',
+  'toolsReachable',
+  'budgetRemainingMicroUsd',
+  'budgetEstimateMicroUsd',
+  'recentProgress',
+  'progressPerStep',
+  'wastePerStep',
+  'stepSeconds',
+] as const
+
 /**
  * Parse + validate a dispatch request body. Returns the typed dispatch inputs, or an
  * error string. The brain MUST supply the full signal set (it owns context/budget);
- * a missing signal block is rejected rather than defaulted to a launch.
+ * a missing signal block — or any missing individual signal — is rejected rather than
+ * defaulted to a launch.
  */
 export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody } | { ok: false; error: string } {
   if (typeof raw !== 'object' || raw === null) return { ok: false, error: 'body_required' }
@@ -59,6 +85,8 @@ export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody
   if (!goal) return { ok: false, error: 'goal_required' }
   if (typeof b.signals !== 'object' || b.signals === null) return { ok: false, error: 'signals_required' }
   const s = b.signals as Record<string, unknown>
+  const missing = REQUIRED_SIGNALS.filter((k) => s[k] === undefined)
+  if (missing.length > 0) return { ok: false, error: `signals_incomplete:${missing.join(',')}` }
 
   const trigger = typeof b.trigger_source === 'string' && TRIGGERS.has(b.trigger_source) ? (b.trigger_source as TriggerSource) : 'api'
   const budget = b.budget_micro_usd == null ? undefined : asNum(b.budget_micro_usd, 0, 0)
@@ -112,6 +140,24 @@ export function parseOutcomeQuery(q: URLSearchParams): OutcomeQuery {
 // (resolveOrgAdmin in auth/member-bearer). No session; dispatch spends money.
 const requireOrgAdmin = resolveOrgAdmin
 
+// ── dispatch throttle ──────────────────────────────────────────────────────────
+// The coarse per-tenant brake on the money path (the gap named in
+// docs/coherence-loop-brain-caller.md): a runaway or looping caller cannot create
+// more than this many flights per hour, regardless of the gate's verdicts. The
+// readiness gate + budget cap remain the fine-grained guards; this is the fuse.
+
+export const DEFAULT_FLIGHT_MAX_DISPATCH_HOUR = 30
+
+/** The per-tenant hourly dispatch cap (env FLIGHT_MAX_DISPATCH_HOUR override). */
+export function hourlyDispatchCap(env: Env): number {
+  const raw = env.FLIGHT_MAX_DISPATCH_HOUR
+  if (typeof raw === 'string') {
+    const n = Number(raw)
+    if (Number.isFinite(n) && n > 0) return Math.floor(n)
+  }
+  return DEFAULT_FLIGHT_MAX_DISPATCH_HOUR
+}
+
 // ── the connector app ──────────────────────────────────────────────────────────
 
 export const flightsApp = new Hono<{ Bindings: Env }>()
@@ -124,6 +170,14 @@ flightsApp.post('/', async (c) => {
   const raw = await c.req.json().catch(() => null)
   const parsed = parseDispatchBody(raw)
   if (!parsed.ok) return c.json({ error: parsed.error }, 400)
+
+  // The fuse: cap flight creation per tenant-hour before any row is written.
+  const cap = hourlyDispatchCap(c.env)
+  const recent = await countFlightsCreatedSince(c.env, Date.now() - 3_600_000)
+  if (recent >= cap) {
+    c.header('Retry-After', '3600')
+    return c.json({ error: 'dispatch_throttled', cap_per_hour: cap }, 429)
+  }
 
   const { flight, signals, opts } = parsed.value
   const result = await dispatchFlight(c.env, flight, signals, opts)
@@ -143,9 +197,17 @@ flightsApp.post('/:id/land', async (c) => {
   const b = (await c.req.json().catch(() => ({}))) as Record<string, unknown>
   const cost_micro_usd = b.cost_micro_usd == null ? undefined : asNum(b.cost_micro_usd, 0, 0)
   const score = b.score == null ? undefined : asNum(b.score, 0, 0, 1)
-  await landFlight(c.env, id, { cost_micro_usd, score })
+
+  // Reconcile the reported cost against the pot's own meter (reconcile.ts): metered
+  // delta = the agent's metered cost now minus the takeoff snapshot. Flag, never block.
+  const takeoff = parseMeterTakeoff(existing.meta)
+  const metered = takeoff
+    ? Math.max(0, (await sumCostMicroUsdSince(c.env, existing.agent, takeoff.at)) - takeoff.cost_micro_usd)
+    : null
+  const reconciliation = reconcileCost(cost_micro_usd ?? 0, metered)
+  await landFlight(c.env, id, { cost_micro_usd, score, meta: metaWithReconciliation(existing.meta, reconciliation) })
   const after = await getFlight(c.env, id)
-  return c.json({ ok: true, id, status: after?.status ?? 'landed' })
+  return c.json({ ok: true, id, status: after?.status ?? 'landed', cost_reconciliation: reconciliation })
 })
 
 // Fail — executor reports a failed outcome.

@@ -65,18 +65,26 @@ runs on a teed-up defect. The pot does NOT compute its own coherence — it read
 Built (this is the parts list, mapped to the loop):
 - **State rail** — pot-native Fleet + check-in (v0.18, live on digid).
 - **Unit of correction** — the flight spine + preflight/readiness gate (v0.19).
-- **Coherence organ** — the brain's C(t)/regime, live in `SOS/sovereign` (measure-only today).
+- **Coherence organ** — the brain's C(t)/regime, live in `SOS/sovereign`; plus (v0.20) the
+  pot's **fallback brain** (`src/brain/`) — a minimal local measure (C/EMA + backlog →
+  flow|chaos|stall) that runs ONLY while no mind is connected and yields to a fresh mind
+  push (field provenance: `agent_field.source`).
 - **Work rail / Gate** — GitHub issues + PR approval + `/approvals`.
 - **Memory rail** — pot memory + brand-crystal.
+- **The verified seam** (v0.20) — the #70 wire is no longer trust-only: landed cost is
+  reconciled against the pot's own meter, individual absent signals are rejected, dispatch
+  has an hourly fuse, and the gate reads the pot's OWN outcome history (`agent_unreliable`).
 
-**The gap (v0.20, the keystone):** the loop is **not closed end-to-end**. The brain measures
-(Python/Redis), the pot records flights (CF/D1), but the wire **brain detects defect →
-dispatches a flight → pot updates state → brain re-measures** is not connected. Today they are
-three good organs, not one circuit. Closing that wire is what makes "keep everything coherent"
-real — see [ROADMAP.md](../ROADMAP.md) v0.20.
+**The wire decision (was the v0.20 open question): resolved as HYBRID.** The pot does not
+port the full physics and does not stay brain-blind: it ships the smallest honest local
+measure so a sovereign fork closes the loop alone (zero-ops promise holds), and the moment a
+real mind pushes field state the fallback stands down — mumega pots run on `SOS/sovereign`.
+Extending `src/brain/` toward the full field physics (Psi, ARF, coercion, trust, spin) is
+forking the brain — don't; wire the mind instead.
 
-Open decision for that wire: the pot's coherence layer becomes the **CF-native port of
-`coherence.py`**, or the pot **defers to a forked brain** beside it.
+**The remaining gap:** the forked SOS brain as the LIVE caller on a tenant pot (dispatching
+flights + pushing field state in production) — rides v0.22 digid go-live. See
+[ROADMAP.md](../ROADMAP.md).
 
 ## The one rule for every agent
 

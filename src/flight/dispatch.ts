@@ -9,8 +9,10 @@
 import type { Env } from '../types'
 import { preflightCheck } from './preflight'
 import type { FlightSignals, PreflightOptions } from './preflight'
-import { createFlight, applyPreflight } from './service'
+import { createFlight, applyPreflight, recentOutcomeStats } from './service'
 import type { NewFlight } from './service'
+import { sumCostMicroUsdSince } from '../agents/meter'
+import type { MeterTakeoff } from './reconcile'
 
 export interface DispatchResult {
   id: string
@@ -26,8 +28,20 @@ export async function dispatchFlight(
   signals: FlightSignals,
   opts: PreflightOptions = {},
 ): Promise<DispatchResult> {
-  const id = await createFlight(env, flight)
-  const r = preflightCheck(signals, opts)
+  // Snapshot the agent's pot-metered cost at takeoff so landing can compute the
+  // metered delta and reconcile it against the caller-reported cost (reconcile.ts).
+  const now = Date.now()
+  const takeoff: MeterTakeoff = { at: now, cost_micro_usd: await sumCostMicroUsdSince(env, flight.agent, now) }
+  const id = await createFlight(env, { ...flight, meta: { ...(flight.meta ?? {}), meter_takeoff: takeoff } })
+  // Merge the POT-OWNED history signals over whatever the caller sent: the agent's
+  // recent failure rate comes from the flights table, never from the request body.
+  const stats = await recentOutcomeStats(env, flight.agent)
+  const gateSignals: FlightSignals = {
+    ...signals,
+    recentFailureRate: stats.failureRate ?? undefined,
+    endedFlightSample: stats.ended,
+  }
+  const r = preflightCheck(gateSignals, opts)
   const status = await applyPreflight(env, id, r)
   return { id, go: r.go, status: status as 'running' | 'held', reasons: r.reasons, score: r.score }
 }

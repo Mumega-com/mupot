@@ -6,6 +6,51 @@ All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 this changelog (shipped, dated) share version numbers and feed each other — a roadmap
 block collapses into a changelog entry when it ships.
 
+## [0.20.0] — 2026-06-10
+
+Close the coherence loop — the **keystone**. The open v0.20 decision resolved as
+**hybrid**: the pot ships a deliberately minimal **fallback brain** that closes
+measure→correct locally when no mind is connected and yields to a fresh mind push;
+the #70 seam itself went from trusted to **verified**. The brain + pot + flight are
+one circuit, not three good organs.
+
+### Added
+- **The fallback brain** (`src/brain/`). Pure measure (`measure.ts`): C = EMA of
+  success fraction over ended flights, R = 1/(1+backlog), regime = flow | chaos |
+  stall (coercion needs Psi — only the mind may claim it). The tick (`fallback.ts`,
+  on the existing cron): sweep its own in-air flights from their linked task —
+  done → **landed with pot-METERED cost** (the meter delta since takeoff, no
+  self-report), blocked/overdue/missing → failed — defer if a fresh `'mind'` field
+  push exists, mirror each active agent into `agent_field` with
+  `source='pot_fallback'` (`0020`, guarded: never overwrites a fresh mind row), and
+  on a defect dispatch ONE gated flight whose goal is the agent's oldest open task.
+  Opt-in (`BRAIN_FALLBACK="on"` — it tees up spend), ≤3 corrections/tick, one in-air
+  correction per agent. Orient briefs carry field **provenance** (a fallback measure
+  announces itself; the mind's push reclaims `source='mind'`).
+- **Cost reconciliation at land** (`src/flight/reconcile.ts`). Dispatch snapshots
+  the agent's pot-metered cost at takeoff; `/land` compares the metered delta with
+  the caller-reported cost and FLAGS divergence past a 2× ratio + $0.01 floor
+  (`cost_reconciliation` in flight meta + response) — never blocks. The land
+  endpoint stops being trust-only. Pass `agents.id` as the flight `agent` so the
+  meter identity lines up.
+- **Trust friction on the gate**. Preflight check 3, `agentReliable`: dispatch
+  merges the agent's recent outcome record (`recentOutcomeStats` — POT-owned, never
+  parsed from the request body) over the caller's signals; ≥3 ended flights with a
+  failure rate past 0.5 → held (`agent_unreliable`). A sub-bar rate drags the
+  readiness score smoothly; no history leaves scores bit-identical to the old gate.
+- **The dispatch fuse**. Per-tenant hourly cap on flight creation
+  (`FLIGHT_MAX_DISPATCH_HOUR`, default 30) → 429 + Retry-After before any row is
+  written — the coarse throttle the brain-caller doc tracked as missing.
+- **The circuit test** (`tests/coherence-loop.test.ts`). The brain↔pot wire
+  exercised as ONE LOOP over HTTP against the real routes: dispatch → land
+  (reconciled) → outcome feed → cursor drains; dishonest landing flagged; crashing
+  agent grounded; the fuse fires. Plus the fallback-brain tick suite (25 tests).
+
+### Changed
+- **Strict dispatch signals**: individually ABSENT signals are rejected
+  (`signals_incomplete:<names>`) instead of silently defaulting to 0 — absent is
+  not measured-zero on a gate input.
+
 ## [0.19.0] — 2026-06-09
 
 Flight Operations — the **unit of correction**. Expensive (Opus) agents run as disciplined

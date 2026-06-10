@@ -94,3 +94,39 @@ describe('preflightCheck — score threshold', () => {
     expect(r.reasons).toContain('low_readiness')
   })
 })
+
+describe('agent reliability (pot-owned history friction)', () => {
+  it('no history → neutral: same score, gate unaffected', () => {
+    const withHistory = readinessScore({ ...HEALTHY, endedFlightSample: 0 })
+    expect(withHistory).toBeCloseTo(readinessScore(HEALTHY), 10)
+    const r = preflightCheck({ ...HEALTHY, endedFlightSample: 0 })
+    expect(r.checks.agentReliable).toBe(true)
+  })
+  it('below the sample bar → neutral even with a bad rate (2 crashes prove nothing)', () => {
+    const r = preflightCheck({ ...HEALTHY, recentFailureRate: 1, endedFlightSample: 2 })
+    expect(r.checks.agentReliable).toBe(true)
+    expect(r.go).toBe(true)
+  })
+  it('enough sample + rate past the bar → grounded with agent_unreliable', () => {
+    const r = preflightCheck({ ...HEALTHY, recentFailureRate: 0.7, endedFlightSample: 5 })
+    expect(r.checks.agentReliable).toBe(false)
+    expect(r.go).toBe(false)
+    expect(r.reasons).toContain('agent_unreliable')
+  })
+  it('rate at the bar exactly → still flies (bar is exclusive)', () => {
+    const r = preflightCheck({ ...HEALTHY, recentFailureRate: 0.5, endedFlightSample: 4 })
+    expect(r.checks.agentReliable).toBe(true)
+  })
+  it('a sub-bar rate still drags the score smoothly (friction before the wall)', () => {
+    const clean = readinessScore({ ...HEALTHY, recentFailureRate: 0, endedFlightSample: 5 })
+    const shaky = readinessScore({ ...HEALTHY, recentFailureRate: 0.4, endedFlightSample: 5 })
+    expect(shaky).toBeLessThan(clean)
+  })
+  it('opts tune both the bar and the sample size', () => {
+    const strict = preflightCheck(
+      { ...HEALTHY, recentFailureRate: 0.2, endedFlightSample: 2 },
+      { maxFailureRate: 0.1, minFailureSample: 2 },
+    )
+    expect(strict.reasons).toContain('agent_unreliable')
+  })
+})
