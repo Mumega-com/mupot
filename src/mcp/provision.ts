@@ -58,7 +58,18 @@ async function emitProvisioned(
     payload: { kind, id, by: memberId },
     ts: new Date().toISOString(),
   }
-  await createBus(env).emit(event)
+  // The row is already committed; a bus failure must NOT 500 the caller and orphan a
+  // successful create/mint (esp. the show-once token, which cannot be re-fetched).
+  // Emit is best-effort: swallow + log, never throw.
+  try {
+    await createBus(env).emit(event)
+  } catch {
+    console.error('provision: org.provisioned emit failed (non-fatal)', {
+      tenant: env.TENANT_SLUG,
+      kind,
+      id,
+    })
+  }
 }
 
 // Ref resolvers (id-first, slug-with-ambiguity-refusal) are shared in ../org/resolve
@@ -260,7 +271,7 @@ const toolMintAgentToken: ToolSpec = {
 
     // Cap the label length (parity with the HTTP mint path, members/index.ts) — a
     // member-supplied free field on a credential write; bound it to 64 chars.
-    const label = (str(args.label) ?? agent.slug).slice(0, 64)
+    const label = (str(args.label) ?? agent.slug).trim().slice(0, 64)
 
     // ATOMIC mint (kasra-review: was 3 sequential writes → orphan-on-partial-failure).
     // member + capability + token go in ONE D1 batch (a transaction): either all three

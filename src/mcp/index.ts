@@ -612,11 +612,16 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
   }
   for (const [key, value] of Object.entries(args)) {
     if (value === undefined) continue
-    const prop = schema.properties[key] as { type?: string; items?: { type?: string } } | undefined
-    if (!prop) {
+    // hasOwnProperty, NOT bracket access: `args.constructor`/`__proto__` would
+    // otherwise resolve to an INHERITED Object.prototype member and be treated as a
+    // known field, bypassing additionalProperties:false (prototype-key bypass, P2).
+    const known = Object.prototype.hasOwnProperty.call(schema.properties, key)
+    if (!known) {
       if (schema.additionalProperties === false) return `unknown field: ${key}`
       continue
     }
+    const prop = schema.properties[key] as { type?: string; items?: { type?: string } } | undefined
+    if (!prop) continue
     if (value === null) continue // optional-null is fine; tools coerce null themselves
     if (prop.type === 'string' && typeof value !== 'string') return `field ${key} must be a string`
     if (prop.type === 'number' && !(typeof value === 'number' && Number.isFinite(value))) {

@@ -210,6 +210,16 @@ describe('create_squad', () => {
     expect(((await res.json()) as { error: { message: string } }).error.message).toBe('invalid_args')
   })
 
+  it('400s a prototype-chain key (constructor) — no additionalProperties bypass (P2)', async () => {
+    const res = await call(
+      'create_squad',
+      { department: 'dept-1', slug: 'growth', name: 'Growth', constructor: 'x' },
+      makeEnv(),
+    )
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe('invalid_args')
+  })
+
   it('400s a negative budget_cap_cents (W4)', async () => {
     const res = await call(
       'create_squad',
