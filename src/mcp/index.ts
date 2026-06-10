@@ -38,7 +38,7 @@ import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import { createTask } from '../tasks/service'
 import { buildOrient, renderBrief } from '../orient/service'
-import { mcpEndpoint } from '../dashboard/connect'
+import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
 import { resolveAgentRef } from '../org/resolve'
 import { PROVISION_TOOLS } from './provision'
 
@@ -534,11 +534,19 @@ const toolOrient: ToolSpec = {
     if (!orgAdmin && !onSquad) return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
     const callerCapability = orgAdmin ? 'admin' : 'observer+'
 
+    // viewSensitive (#88): budget + field/trust are visible only to the agent ITSELF
+    // (the weld), its squad leads, or admins — never a bare observer viewing a peer.
+    // || short-circuits, so the lead query only runs when not already self/admin.
+    const isSelf = auth.boundAgentId === agentRef.id
+    const viewSensitive =
+      orgAdmin || isSelf || (await memberCanOnSquad(env, grants, agentRef.squad_id, 'lead'))
+
     const { data, notFound } = await buildOrient(
       env,
       agentRef.id,
       callerCapability,
-      mcpEndpoint(ctx.origin),
+      mcpEndpoint(canonicalOrigin(env, ctx.origin)),
+      viewSensitive,
       Date.now(),
     )
     if (notFound || !data) return fail(404, 'agent_not_found')

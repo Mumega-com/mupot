@@ -58,6 +58,10 @@ export interface Env {
   TENANT_SLUG: string
   BRAND: string
   OAUTH_PROVIDER: 'google' | 'telegram'
+  // The pot's canonical public origin (e.g. https://agents.digid.ca). When set, the
+  // orient brief pins its MCP endpoint to THIS instead of echoing the request Host
+  // header (which is client-influenceable and renders into a DIRECTIVE surface). #88.
+  PUBLIC_ORIGIN?: string
   // fleet window: SOS bus bridge REST
   BUS_URL?: string
   // fleet scoping (Flock #43): which bus project this pot's fleet addresses, and
