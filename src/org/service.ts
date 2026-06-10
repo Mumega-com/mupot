@@ -137,7 +137,9 @@ export async function createSquad(
   const budget_cap_cents =
     input.budget_cap_cents === undefined || input.budget_cap_cents === null
       ? null
-      : typeof input.budget_cap_cents === 'number' && Number.isInteger(input.budget_cap_cents)
+      : typeof input.budget_cap_cents === 'number' &&
+          Number.isInteger(input.budget_cap_cents) &&
+          input.budget_cap_cents >= 0
         ? input.budget_cap_cents
         : undefined
   if (budget_cap_cents === undefined) return { ok: false, error: 'invalid_budget_cap_cents' }
@@ -257,7 +259,9 @@ export async function createAgent(
   const budget_cap_cents =
     input.budget_cap_cents === undefined || input.budget_cap_cents === null
       ? null
-      : typeof input.budget_cap_cents === 'number' && Number.isInteger(input.budget_cap_cents)
+      : typeof input.budget_cap_cents === 'number' &&
+          Number.isInteger(input.budget_cap_cents) &&
+          input.budget_cap_cents >= 0
         ? input.budget_cap_cents
         : undefined
   if (budget_cap_cents === undefined) return { ok: false, error: 'invalid_budget_cap_cents' }

@@ -598,6 +598,45 @@ function mcpCallResult(tool: string, result: unknown): Record<string, unknown> {
   }
 }
 
+// ── runtime schema enforcement (defense-in-depth at the seam) ─────────────────
+// The per-tool inputSchema was previously DECORATIVE — only documentation. Every
+// security-relevant field is still hand-validated inside each tool, but a future
+// tool author who trusts the schema could leave a hole (kasra-review W1). So we
+// enforce the schema's hard contract HERE, before any tool runs: required keys must
+// be present, unknown keys are rejected (additionalProperties:false), and each known
+// key must match its declared scalar/array type. This is the SUPPORTED subset of JSON
+// Schema the tools actually use; it never widens what a tool accepts.
+function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string | null {
+  for (const req of schema.required ?? []) {
+    if (args[req] === undefined || args[req] === null) return `missing required field: ${req}`
+  }
+  for (const [key, value] of Object.entries(args)) {
+    if (value === undefined) continue
+    // hasOwnProperty, NOT bracket access: `args.constructor`/`__proto__` would
+    // otherwise resolve to an INHERITED Object.prototype member and be treated as a
+    // known field, bypassing additionalProperties:false (prototype-key bypass, P2).
+    const known = Object.prototype.hasOwnProperty.call(schema.properties, key)
+    if (!known) {
+      if (schema.additionalProperties === false) return `unknown field: ${key}`
+      continue
+    }
+    const prop = schema.properties[key] as { type?: string; items?: { type?: string } } | undefined
+    if (!prop) continue
+    if (value === null) continue // optional-null is fine; tools coerce null themselves
+    if (prop.type === 'string' && typeof value !== 'string') return `field ${key} must be a string`
+    if (prop.type === 'number' && !(typeof value === 'number' && Number.isFinite(value))) {
+      return `field ${key} must be a number`
+    }
+    if (prop.type === 'array') {
+      if (!Array.isArray(value)) return `field ${key} must be an array`
+      if (prop.items?.type === 'string' && !value.every((v) => typeof v === 'string')) {
+        return `field ${key} must be an array of strings`
+      }
+    }
+  }
+  return null
+}
+
 async function invokeTool(
   auth: AuthContext,
   env: Env,
@@ -620,6 +659,9 @@ async function invokeTool(
   } else {
     return { ...fail(400, 'invalid_args', 'args must be an object'), tool: spec.name }
   }
+
+  const schemaError = validateArgs(spec.inputSchema, args)
+  if (schemaError) return { ...fail(400, 'invalid_args', schemaError), tool: spec.name }
 
   const outcome = await spec.run(auth, env, args, { origin })
   return { ...outcome, tool: spec.name }

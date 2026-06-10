@@ -21,10 +21,12 @@
 //   create_agent      — lead on the squad (org/department inherit)
 //   mint_agent_token  — admin on the agent's squad (org/department inherit) → show-once raw
 
+import type { Env, BusEvent } from '../types'
 import { hasCapability } from '../auth/capability'
-import { createSquad, createAgent } from '../org/service'
-import { mintMemberToken } from '../members/service'
+import { createDepartment, createSquad, createAgent } from '../org/service'
+import { mintRawToken, sha256Hex } from '../members/service'
 import { mcpEndpoint } from '../dashboard/connect'
+import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
 import {
   type ToolSpec,
@@ -36,6 +38,39 @@ import {
 
 const STRING_SCHEMA = { type: 'string' }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
+
+// Emit an attributed provision event so the activity feed/consumer knows a member
+// caused a structural change (kasra-review W2 — the mint was previously unattributed
+// on the bus). One event type carries the kind; payload names what was created.
+async function emitProvisioned(
+  env: Env,
+  memberId: string,
+  kind: 'department' | 'squad' | 'agent' | 'token',
+  id: string,
+  extra: { squad_id?: string; agent_id?: string } = {},
+): Promise<void> {
+  const event: BusEvent<{ kind: string; id: string; by: string }> = {
+    type: 'org.provisioned',
+    tenant: env.TENANT_SLUG,
+    squad_id: extra.squad_id,
+    agent_id: extra.agent_id,
+    actor: { kind: 'member', id: memberId },
+    payload: { kind, id, by: memberId },
+    ts: new Date().toISOString(),
+  }
+  // The row is already committed; a bus failure must NOT 500 the caller and orphan a
+  // successful create/mint (esp. the show-once token, which cannot be re-fetched).
+  // Emit is best-effort: swallow + log, never throw.
+  try {
+    await createBus(env).emit(event)
+  } catch {
+    console.error('provision: org.provisioned emit failed (non-fatal)', {
+      tenant: env.TENANT_SLUG,
+      kind,
+      id,
+    })
+  }
+}
 
 // Ref resolvers (id-first, slug-with-ambiguity-refusal) are shared in ../org/resolve
 // so the mint path, the orient HTTP route, and the orient tool converge on ONE
@@ -55,6 +90,34 @@ function resolveFail(reason: 'not_found' | 'ambiguous', notFoundCode: string) {
 function createErrorToFail(error: string) {
   const status = error === 'slug_taken' ? 409 : 400
   return fail(status, error)
+}
+
+// ── create_department ───────────────────────────────────────────────────────────
+// The zero-state root: lets an org-admin build the org from nothing in-band (a
+// department is the parent scope create_squad needs). Gate: admin on org scope.
+const toolCreateDepartment: ToolSpec = {
+  name: 'create_department',
+  scope: 'org',
+  min: 'admin',
+  args: '{ slug: string, name: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { slug: STRING_SCHEMA, name: STRING_SCHEMA },
+    required: ['slug', 'name'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    // Gate: org admin (a department is org-structure; only org-admin creates one).
+    const grants = auth.capabilities ?? []
+    if (!hasCapability(grants, 'org', null, 'admin')) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
+    }
+
+    const result = await createDepartment(env, { slug: args.slug, name: args.name })
+    if (!result.ok) return createErrorToFail(result.error)
+    await emitProvisioned(env, auth.memberId as string, 'department', result.value.id)
+    return done({ department: result.value })
+  },
 }
 
 // ── create_squad ──────────────────────────────────────────────────────────────
@@ -109,6 +172,9 @@ const toolCreateSquad: ToolSpec = {
       budget_window: args.budget_window,
     })
     if (!result.ok) return createErrorToFail(result.error)
+    await emitProvisioned(env, auth.memberId as string, 'squad', result.value.id, {
+      squad_id: result.value.id,
+    })
     return done({ squad: result.value })
   },
 }
@@ -165,6 +231,10 @@ const toolCreateAgent: ToolSpec = {
       budget_window: args.budget_window,
     })
     if (!result.ok) return createErrorToFail(result.error)
+    await emitProvisioned(env, auth.memberId as string, 'agent', result.value.id, {
+      squad_id: squad.id,
+      agent_id: result.value.id,
+    })
     return done({ agent: result.value })
   },
 }
@@ -201,42 +271,57 @@ const toolMintAgentToken: ToolSpec = {
 
     // Cap the label length (parity with the HTTP mint path, members/index.ts) — a
     // member-supplied free field on a credential write; bound it to 64 chars.
-    const label = (str(args.label) ?? agent.slug).slice(0, 64)
+    const label = (str(args.label) ?? agent.slug).trim().slice(0, 64)
 
-    // 1) dedicated member envelope for the agent (no email, no IM — it is not a human).
+    // ATOMIC mint (kasra-review: was 3 sequential writes → orphan-on-partial-failure).
+    // member + capability + token go in ONE D1 batch (a transaction): either all three
+    // land or none do — no member without a grant, no grant without a token. We compose
+    // the token row inline using the SAME security primitives as the single mint path
+    // (mintRawToken + sha256Hex from members/service) so the discipline is preserved:
+    // only the hash is stored, the raw is returned exactly once.
     const memberId = crypto.randomUUID()
-    await env.DB.prepare(
-      `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    )
-      .bind(memberId, null, agent.name, null, 'active', new Date().toISOString())
-      .run()
+    const tokenId = crypto.randomUUID()
+    const rawToken = mintRawToken()
+    const tokenHash = await sha256Hex(rawToken)
+    const createdAt = new Date().toISOString()
 
-    // 2) THE ESCALATION GUARD: squad-scoped 'member' on the agent's OWN squad only.
-    //    Hard-coded scope + capability — never widened from args, never inherits the
-    //    operator's standing. The agent token's authority is exactly this one row.
-    await env.DB.prepare(
-      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-       VALUES (?, ?, 'squad', ?, 'member')`,
-    )
-      .bind(crypto.randomUUID(), memberId, agent.squad_id)
-      .run()
+    await env.DB.batch([
+      // 1) dedicated member envelope for the agent (no email, no IM — it is not a human).
+      env.DB.prepare(
+        `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).bind(memberId, null, agent.name, null, 'active', createdAt),
+      // 2) THE ESCALATION GUARD: squad-scoped 'member' on the agent's OWN squad only.
+      //    Hard-coded scope + capability — never widened from args, never inherits the
+      //    operator's standing. The agent token's authority is exactly this one row.
+      env.DB.prepare(
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+         VALUES (?, ?, 'squad', ?, 'member')`,
+      ).bind(crypto.randomUUID(), memberId, agent.squad_id),
+      // 3) the weld: bind the token to the agent (agent_id set). Only the hash is stored.
+      env.DB.prepare(
+        `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id)
+         VALUES (?, ?, ?, ?, 'workspace', ?, ?)`,
+      ).bind(tokenId, memberId, tokenHash, label, createdAt, agent.id),
+    ])
 
-    // 3) the weld: bind the token to the agent (agent_id set) via the single mint path.
-    const minted = await mintMemberToken(env, memberId, label, 'workspace', agent.id)
+    await emitProvisioned(env, auth.memberId as string, 'token', tokenId, {
+      squad_id: agent.squad_id,
+      agent_id: agent.id,
+    })
 
     // SECURITY: `raw` is the show-once token — returned as a BARE field, never woven
     // into a reusable config snippet (see src/dashboard/connect security note). The
     // caller renders its own client config from raw + mcp_endpoint.
     return done({
       token: {
-        id: minted.id,
-        member_id: minted.member_id,
+        id: tokenId,
+        member_id: memberId,
         agent_id: agent.id,
-        label: minted.label,
-        channel: minted.channel,
-        created_at: minted.created_at,
-        raw: minted.raw,
+        label,
+        channel: 'workspace',
+        created_at: createdAt,
+        raw: rawToken,
       },
       agent: { id: agent.id, slug: agent.slug, name: agent.name },
       mcp_endpoint: mcpEndpoint(ctx.origin),
@@ -245,4 +330,9 @@ const toolMintAgentToken: ToolSpec = {
   },
 }
 
-export const PROVISION_TOOLS: ToolSpec[] = [toolCreateSquad, toolCreateAgent, toolMintAgentToken]
+export const PROVISION_TOOLS: ToolSpec[] = [
+  toolCreateDepartment,
+  toolCreateSquad,
+  toolCreateAgent,
+  toolMintAgentToken,
+]
