@@ -14,6 +14,7 @@ import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken, resolveOrgAdmin } from '../auth/member-bearer'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
+import { memberCanOnSquad } from '../mcp'
 import { resolveAgentRef } from '../org/resolve'
 import { buildOrient, renderBrief, parseFieldPush, upsertAgentField } from './service'
 
@@ -36,16 +37,20 @@ orientApp.get('/', async (c) => {
   const agentRef = resolved.value
 
   // Authorize: the caller must have ≥observer on the agent's squad (or be org-admin).
+  // Authorize via memberCanOnSquad (resolves the squad's department so a dept-level
+  // grant inherits down) — PARITY with the MCP orient tool; a pure hasCapability here
+  // would drop department→squad inheritance and 403 a legitimate dept-admin.
   const caps = await resolveCapabilities(c.env, member.memberId)
   const orgAdmin = hasCapability(caps, 'org', null, 'admin')
-  const onSquad = hasCapability(caps, 'squad', agentRef.squad_id, 'observer')
+  const onSquad = await memberCanOnSquad(c.env, caps, agentRef.squad_id, 'observer')
   if (!orgAdmin && !onSquad) return c.json({ error: 'forbidden' }, 403)
   const callerCapability = orgAdmin ? 'admin' : 'observer+'
 
   // viewSensitive (#88): budget + field/trust only for the agent itself, squad leads,
   // or admins — a bare observer viewing a peer gets them redacted.
   const isSelf = member.boundAgentId === agentRef.id
-  const viewSensitive = orgAdmin || isSelf || hasCapability(caps, 'squad', agentRef.squad_id, 'lead')
+  const viewSensitive =
+    orgAdmin || isSelf || (await memberCanOnSquad(c.env, caps, agentRef.squad_id, 'lead'))
 
   // Pin the brief's MCP endpoint to the env-canonical origin (Host header is client-
   // influenceable and this renders into a directive surface).

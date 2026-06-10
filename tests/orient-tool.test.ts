@@ -140,6 +140,13 @@ describe('orient MCP tool', () => {
     expect(body.result.structuredContent.brief).toContain('Growth Lead')
     // the brief grounds the agent in THIS pot's MCP endpoint, derived from the request origin
     expect(body.result.structuredContent.brief).toContain('https://agents.digid.ca/mcp')
+    // self/weld → viewSensitive: the agent sees its OWN budget + field (NOT redacted)
+    const selfPacket = body.result.structuredContent.packet as unknown as {
+      agent: { budget_cap_cents: number | null }
+      field_restricted?: boolean
+    }
+    expect(selfPacket.agent.budget_cap_cents).toBe(5000)
+    expect(selfPacket.field_restricted).toBe(false)
   })
 
   it('orients an explicitly named agent (operator path)', async () => {

@@ -23,7 +23,11 @@ export function canonicalOrigin(env: { PUBLIC_ORIGIN?: string }, requestOrigin: 
   const pinned = env.PUBLIC_ORIGIN?.trim()
   if (pinned) {
     try {
-      return new URL(pinned).origin
+      const u = new URL(pinned)
+      // Only an http(s) origin is valid here. A non-special scheme (e.g. javascript:)
+      // parses without throwing and serializes .origin to the literal "null" — reject
+      // it and fall back rather than render "null/mcp" into the brief.
+      if (u.protocol === 'https:' || u.protocol === 'http:') return u.origin
     } catch {
       // misconfigured PUBLIC_ORIGIN → fall back to the request origin (never throw)
     }
