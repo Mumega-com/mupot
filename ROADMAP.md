@@ -33,12 +33,15 @@ TTL forces it). Design: [docs/flight-operations.md](docs/flight-operations.md). 
 - **#61** flight board — Fleet shows flying / sleeping / per-flight cost + readiness. ✅
 - **#62** schedule-aware presence (sleeping ≠ dead) + vocab adoption. ✅
 
-## v0.20.0 — Close the coherence loop  ← keystone
-Make the brain + pot + flight ONE circuit instead of three good organs. The wire:
-**brain detects a defect (ARF/regime) → dispatches a flight → pot records state → brain
-re-measures.** Plus `docs/coherence-model.md` as the north star every agent reads.
-- the brain→dispatch→state→brain wire (decide: CF-native port of `coherence.py` vs defer to a forked brain).
-- coherence-model doc — the four rails + the loop.
+## ✅ v0.20.0 — Close the coherence loop *(shipped — see CHANGELOG)* ← keystone
+The open decision resolved as **HYBRID**: the pot ships a minimal **fallback brain**
+(`src/brain/` — C/EMA + backlog + regime, defect → one gated flight on the agent's
+oldest open task) that closes measure→correct locally and **defers to a fresh mind
+push** (field provenance, `0020`). The #70 seam went trusted→verified: cost
+reconciliation at land (pot-metered delta vs reported), the hourly dispatch fuse,
+strict signal presence, trust friction (`agent_unreliable` from the pot's own books),
+and the brain↔pot circuit test. Remaining mind-side work (the forked SOS brain as the
+live caller, superseding the fallback) rides v0.22 digid go-live.
 
 ## v0.21.0 — Flock complete
 Any runtime onboards + operates a pot, gated — including your DevOps agent.

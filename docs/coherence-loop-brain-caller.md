@@ -88,9 +88,14 @@ secret store. Rotate on the standard cadence.
 
 ## Known follow-ups (pot-side, non-blocking)
 
-- **Dispatch rate-limit** (tracked issue): the money path has no coarse throttle yet (unlike
-  check-in's 30s KV debounce). Today the brain self-throttles by resting at equilibrium + the
-  readiness gate + the budget cap (#4) bound spend. Add a per-tenant fail-open dispatch
-  debounce before running the brain fully unattended at scale.
+- ~~**Dispatch rate-limit**~~ ✅ shipped (v0.20): `POST /api/flights` now carries a
+  per-tenant hourly fuse — `FLIGHT_MAX_DISPATCH_HOUR` (default 30) → 429 + Retry-After
+  before any row is written. The readiness gate + budget cap remain the fine guards.
+  Also shipped on the same seam: individual ABSENT signals are rejected
+  (`signals_incomplete:<names>` — absent ≠ measured-zero), and `/land` reconciles the
+  reported cost against the pot's own meter (flag `cost_reconciliation` in the flight
+  meta + response; pass the agents.id as `agent` at dispatch so the meter identity
+  lines up). The pot also merges its OWN history into the gate: `agent_unreliable`
+  grounds an agent whose recent flights mostly failed, whatever the caller claims.
 - **401-vs-403**: a valid-but-non-admin token gets 403, a bad token 401 — a minor
   token-validity oracle, acceptable for a single-tenant pot.
