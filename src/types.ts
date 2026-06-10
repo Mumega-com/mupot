@@ -84,6 +84,8 @@ export interface Env {
   // execution meter caps (env override; meter.ts defaults apply when absent)
   EXEC_MAX_DISPATCH_DAY?: string // max execute-mode dispatches per agent per UTC day
   EXEC_MAX_TOKENS_DAY?: string   // max tokens an agent may spend per UTC day
+  // flight connector — per-tenant hourly dispatch fuse (flight/routes.ts, default 30)
+  FLIGHT_MAX_DISPATCH_HOUR?: string
   // GHL act-channel secrets (issue #8) — set via `wrangler secret put`, NEVER in .toml.
   // All optional: absent = not_configured (fails closed, no send path opens).
   // See wrangler.toml for the operator `wrangler secret put` command block.

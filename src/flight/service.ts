@@ -88,17 +88,19 @@ export async function applyPreflight(env: Env, id: string, r: PreflightResult): 
   return 'held'
 }
 
-// Land a flight (completed OK). Only from an in-air state.
+// Land a flight (completed OK). Only from an in-air state. `meta` (a full JSON string,
+// e.g. with the cost reconciliation merged in by the land route) replaces the row's
+// meta when provided; absent ⇒ meta untouched.
 export async function landFlight(
   env: Env,
   id: string,
-  opts: { cost_micro_usd?: number; score?: number } = {},
+  opts: { cost_micro_usd?: number; score?: number; meta?: string } = {},
 ): Promise<void> {
   await env.DB.prepare(
-    `UPDATE flights SET status='landed', cost_micro_usd=?3, score=COALESCE(?4, score), ended_at=?5
+    `UPDATE flights SET status='landed', cost_micro_usd=?3, score=COALESCE(?4, score), ended_at=?5, meta=COALESCE(?6, meta)
      WHERE id=?1 AND tenant=?2 AND status IN ('running','waiting','sleeping')`,
   )
-    .bind(id, env.TENANT_SLUG, opts.cost_micro_usd ?? 0, opts.score ?? null, Date.now())
+    .bind(id, env.TENANT_SLUG, opts.cost_micro_usd ?? 0, opts.score ?? null, Date.now(), opts.meta ?? null)
     .run()
 }
 
@@ -128,6 +130,16 @@ export async function getFlight(env: Env, id: string): Promise<FlightRow | null>
       .bind(id, env.TENANT_SLUG)
       .first<FlightRow>()) ?? null
   )
+}
+
+// How many flights this tenant created since `sinceMs` — the dispatch-throttle input.
+export async function countFlightsCreatedSince(env: Env, sinceMs: number): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM flights WHERE tenant=?1 AND created_at >= ?2`,
+  )
+    .bind(env.TENANT_SLUG, sinceMs)
+    .first<{ n: number }>()
+  return row?.n ?? 0
 }
 
 export async function listFlights(env: Env, limit = 100): Promise<FlightRow[]> {

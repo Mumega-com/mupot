@@ -48,8 +48,8 @@ function makeEnv(tenant = 'digid'): { env: Env; rows: Map<string, FlightRow> } {
                   const [id, t, reason, score, ended] = a as [string, string, string, number, number]
                   guarded(id, t, ['preflight'], (r) => { r.status = 'held'; r.gate_verdict = 'no_go'; r.gate_reason = reason; r.score = score; r.ended_at = ended })
                 } else if (sql.includes("status='landed'")) {
-                  const [id, t, cost, score, ended] = a as [string, string, number, number | null, number]
-                  guarded(id, t, ['running', 'waiting', 'sleeping'], (r) => { r.status = 'landed'; r.cost_micro_usd = cost; if (score != null) r.score = score; r.ended_at = ended })
+                  const [id, t, cost, score, ended, meta] = a as [string, string, number, number | null, number, string | null]
+                  guarded(id, t, ['running', 'waiting', 'sleeping'], (r) => { r.status = 'landed'; r.cost_micro_usd = cost; if (score != null) r.score = score; r.ended_at = ended; if (meta != null) r.meta = meta })
                 } else if (sql.includes("status='failed'")) {
                   const [id, t, reason, ended] = a as [string, string, string, number]
                   guarded(id, t, ['preflight', 'running', 'waiting', 'sleeping'], (r) => { r.status = 'failed'; r.gate_reason = reason; r.ended_at = ended })

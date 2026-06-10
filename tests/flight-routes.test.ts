@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { parseDispatchBody, parseOutcomeQuery } from '../src/flight/routes'
+import { parseDispatchBody, parseOutcomeQuery, hourlyDispatchCap, DEFAULT_FLIGHT_MAX_DISPATCH_HOUR } from '../src/flight/routes'
 
 const goodSignals = {
   contextComplete: true,
@@ -85,5 +85,40 @@ describe('parseOutcomeQuery', () => {
     const q = parseOutcomeQuery(new URLSearchParams('since=-5'))
     expect(q.sinceMs).toBeNull()
     expect(q.limit).toBe(200)
+  })
+})
+
+describe('parseDispatchBody — strict signal presence (absent ≠ zero)', () => {
+  it('rejects when an individual signal is absent, naming the holes', () => {
+    const { recentProgress: _drop, ...partial } = goodSignals
+    const r = parseDispatchBody({ agent: 'a', goal: 'g', signals: partial })
+    expect(r).toEqual({ ok: false, error: 'signals_incomplete:recentProgress' })
+  })
+  it('names every missing signal', () => {
+    const r = parseDispatchBody({ agent: 'a', goal: 'g', signals: { contextComplete: true } })
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error).toContain('signals_incomplete:')
+    expect(r.error).toContain('toolsReachable')
+    expect(r.error).toContain('stepSeconds')
+    expect(r.error).not.toContain('contextComplete')
+  })
+  it('present-but-mistyped still coerces fail-closed (presence is the contract)', () => {
+    const r = parseDispatchBody({ agent: 'a', goal: 'g', signals: { ...goodSignals, stepSeconds: 'fast' } })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value.signals.stepSeconds).toBe(0)
+  })
+})
+
+describe('hourlyDispatchCap — the per-tenant dispatch fuse', () => {
+  it('defaults to 30 and honors a positive env override', () => {
+    expect(hourlyDispatchCap({} as never)).toBe(DEFAULT_FLIGHT_MAX_DISPATCH_HOUR)
+    expect(hourlyDispatchCap({ FLIGHT_MAX_DISPATCH_HOUR: '5' } as never)).toBe(5)
+  })
+  it('falls back on garbage / non-positive overrides (fail-closed to the default)', () => {
+    expect(hourlyDispatchCap({ FLIGHT_MAX_DISPATCH_HOUR: 'lots' } as never)).toBe(DEFAULT_FLIGHT_MAX_DISPATCH_HOUR)
+    expect(hourlyDispatchCap({ FLIGHT_MAX_DISPATCH_HOUR: '0' } as never)).toBe(DEFAULT_FLIGHT_MAX_DISPATCH_HOUR)
+    expect(hourlyDispatchCap({ FLIGHT_MAX_DISPATCH_HOUR: '-3' } as never)).toBe(DEFAULT_FLIGHT_MAX_DISPATCH_HOUR)
   })
 })

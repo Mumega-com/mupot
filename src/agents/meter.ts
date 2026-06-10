@@ -161,7 +161,7 @@ export async function checkAndReserve(
     // trailing-7-day sum (so a weekly cap is not silently enforced as ~7 daily caps).
     const spanCost =
       opts.budgetWindow === 'week'
-        ? await sumWeekCostMicroUsd(env, env.TENANT_SLUG, agentId)
+        ? await sumWeekCostMicroUsd(env, agentId)
         : currentCost
     if (spanCost >= capMicroUsd || spanCost + estimate > capMicroUsd) {
       return {
@@ -260,12 +260,21 @@ function isoDateUtc(d: Date): string {
  * BETWEEN range over the date suffix selects exactly this agent's last-7-days rows
  * (ISO dates sort lexically across month/year boundaries).
  */
-async function sumWeekCostMicroUsd(env: Env, tenant: string, agentId: string): Promise<number> {
-  const today = new Date()
-  const start = new Date(today)
+async function sumWeekCostMicroUsd(env: Env, agentId: string): Promise<number> {
+  const start = new Date()
   start.setUTCDate(start.getUTCDate() - 6)
-  const lo = `${tenant}:${agentId}:${isoDateUtc(start)}`
-  const hi = `${tenant}:${agentId}:${isoDateUtc(today)}`
+  return sumCostMicroUsdSince(env, agentId, start.getTime())
+}
+
+/**
+ * Sum cost_micro_usd over the UTC days from `sinceMs`'s day through today (inclusive)
+ * for one agent. Day-granular (the meter has per-day rows, not per-call rows): the
+ * flight cost-reconciliation seam pairs this with a takeoff snapshot of the same range
+ * so the delta isolates spend after takeoff. Same lexical-range trick as the week cap.
+ */
+export async function sumCostMicroUsdSince(env: Env, agentId: string, sinceMs: number): Promise<number> {
+  const lo = `${env.TENANT_SLUG}:${agentId}:${isoDateUtc(new Date(sinceMs))}`
+  const hi = `${env.TENANT_SLUG}:${agentId}:${isoDateUtc(new Date())}`
   const row = await env.DB.prepare(
     `SELECT COALESCE(SUM(cost_micro_usd), 0) AS c FROM execution_meter
        WHERE window_key >= ? AND window_key <= ?`,
