@@ -90,3 +90,29 @@ Mint the gateway token as a member token with `channel: im` (see the top-level
 hop** if your perimeter requires it. It is not an identity for the chat users —
 each chat user's identity is their own `chat_id` mapping. Revoke it to cut Hermes
 off entirely.
+
+## Trust boundary: the channel relay (`POST /channels/relay`)
+
+Besides the IM webhook above, Hermes can relay **channel-layer** free-text (for
+platforms whose scoped channel is a squad) to `POST /channels/relay`, authenticated
+by the `X-Relay-Secret` header against the pot's `HERMES_RELAY_SECRET`. Be precise
+about what that secret buys, because it is a real trust boundary:
+
+- **What the pot trusts Hermes for:** the *platform identity claim*. The relay body
+  carries `platform` + `externalChannelId` + `externalUserId`, and the pot accepts
+  them as verified — Hermes holds the live platform connection a Worker can't, so it
+  is the only party that *can* verify them. The per-platform webhook signature checks
+  (Ed25519 / JWT / secret token) do **not** run on this path; the relay secret stands
+  in for them.
+- **What the pot does NOT delegate:** authorization. A relayed message still resolves
+  identity through the pot's own `externalUserId → member` mapping, still runs the
+  same resolve→gate→act pipeline, and every action is still capability-gated. An
+  unmapped user gets a refusal; a mapped user can never exceed their own grants.
+- **Blast radius of a leaked `HERMES_RELAY_SECRET`:** the holder can impersonate any
+  *already-mapped* platform user on bound channels — i.e. act with the capabilities of
+  the most-privileged mapped member. It cannot mint members, escalate grants, or touch
+  unbound channels. Treat the secret accordingly: per-pot value (never shared across
+  pots), rotate on operator changes, and if your perimeter allows it, restrict the
+  relay route to Hermes's egress IPs.
+- **Fail-closed by default:** the route returns 503 when `HERMES_RELAY_SECRET` is
+  unset — a pot that doesn't use Hermes has no relay surface at all.
