@@ -86,6 +86,9 @@ export interface Env {
   EXEC_MAX_TOKENS_DAY?: string   // max tokens an agent may spend per UTC day
   // flight connector — per-tenant hourly dispatch fuse (flight/routes.ts, default 30)
   FLIGHT_MAX_DISPATCH_HOUR?: string
+  // fallback brain (brain/fallback.ts) — "on" enables the pot-side coherence tick
+  // (it tees up gated spend, so it is OPT-IN; it always defers to a fresh mind push)
+  BRAIN_FALLBACK?: string
   // GHL act-channel secrets (issue #8) — set via `wrangler secret put`, NEVER in .toml.
   // All optional: absent = not_configured (fails closed, no send path opens).
   // See wrangler.toml for the operator `wrangler secret put` command block.

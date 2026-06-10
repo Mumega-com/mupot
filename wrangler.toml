@@ -12,6 +12,8 @@ BRAND = "Mumega"                   # dashboard brand
 OAUTH_PROVIDER = "google"         # google | telegram
 FLEET_PROJECT = "sos"             # bus project the fleet window addresses (company fleet = sos, not the mumega slug)
 FLEET_OPS_AGENT = "kasra"         # ops agent that executes control requests (explicit — resolvers fail closed, no code default)
+BRAIN_FALLBACK = "off"            # "on" = pot-side coherence tick (brain/fallback.ts) when no mind is connected — tees up gated spend, so opt-in
+# FLIGHT_MAX_DISPATCH_HOUR = "30" # per-tenant hourly flight-dispatch fuse (default 30)
 # secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN
 
 # ── memory: D1 (relational org + engram metadata) ──

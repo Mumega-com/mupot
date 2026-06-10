@@ -79,19 +79,24 @@ import { handleQueue } from './bus/consumer'
 // Metabolism — the pot heartbeat that pulses goal-bearing work-units (#27 loop, made autonomous).
 import { runMetabolism } from './agents/metabolism'
 import { runLoopsTick } from './loops/driver'
+// Fallback brain — the pot-side coherence tick (hybrid v0.20; no-op unless BRAIN_FALLBACK="on",
+// and defers whenever the external mind has pushed fresh field state).
+import { runFallbackBrainTick } from './brain/fallback'
 
 export default {
   fetch: app.fetch,
   queue: handleQueue,
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Three independent heartbeats on the same cron:
+    // Four independent heartbeats on the same cron:
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
     //     ("design loops, not prompts"; without this the v0.3.0 loop never fires).
     //  3. loop driver — run one cycle of each active Loop manifest (the container
     //     heartbeat; without this runLoopCycle has no scheduled caller).
+    //  4. fallback brain — measure → defect → gated flight when no mind is connected.
     ctx.waitUntil(reconcileMembership(env))
     ctx.waitUntil(runMetabolism(env))
     ctx.waitUntil(runLoopsTick(env))
+    ctx.waitUntil(runFallbackBrainTick(env))
   },
 }

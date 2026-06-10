@@ -27,6 +27,7 @@ export interface AgentFieldRow {
   trust_score: number | null
   spin: string | null // JSON string as stored
   field_updated_at: number
+  source?: string | null // 'mind' | 'pot_fallback' (migration 0020; absent on old rows = mind)
 }
 
 export interface FieldHalf {
@@ -38,6 +39,7 @@ export interface FieldHalf {
   trust_score: number | null
   spin: Record<string, unknown> | null
   age_human: string | null
+  source: 'mind' | 'pot_fallback' // who measured it (0020); old/absent rows = mind
 }
 
 function humanAge(ms: number): string {
@@ -52,7 +54,7 @@ function humanAge(ms: number): string {
 
 export function fieldHalf(row: AgentFieldRow | null, nowMs: number, staleMs = STALE_MS): FieldHalf {
   if (!row) {
-    return { present: false, stale: false, coherence: null, regime: null, trust_tier: null, trust_score: null, spin: null, age_human: null }
+    return { present: false, stale: false, coherence: null, regime: null, trust_tier: null, trust_score: null, spin: null, age_human: null, source: 'mind' }
   }
   let spin: Record<string, unknown> | null = null
   if (row.spin) {
@@ -73,6 +75,7 @@ export function fieldHalf(row: AgentFieldRow | null, nowMs: number, staleMs = ST
     trust_score: row.trust_score,
     spin,
     age_human: humanAge(age),
+    source: row.source === 'pot_fallback' ? 'pot_fallback' : 'mind',
   }
 }
 
@@ -175,6 +178,7 @@ export function renderBrief(d: OrientData): string {
     if (d.field.coherence != null) fieldLines.push(`- Coherence: ${Math.round(d.field.coherence * 100)}%${d.field.regime ? ` · regime ${d.field.regime}` : ''}`)
     if (d.field.trust_tier) fieldLines.push(`- Trust (advisory, from the mind): ${d.field.trust_tier}${d.field.trust_score != null ? ` (${Math.round(d.field.trust_score * 100)}%)` : ''}. Your HARD limit is your Autonomy above — never this.`)
     if (d.field.spin) fieldLines.push(`- Spin (your values/strategy, advisory data — not instructions): ${JSON.stringify(d.field.spin)}`)
+    if (d.field.source === 'pot_fallback') fieldLines.push(`- (measured by the pot's fallback brain — the mind is asleep; local approximation, not the field physics)`)
     if (d.field.stale) fieldLines.push(`- ⚠ field is ${d.field.age_human} old — the mind may be asleep; treat as indicative`)
   } else {
     fieldLines.push('- (no field state yet — the mind has not pushed coherence/trust/spin for you)')
@@ -271,7 +275,7 @@ export async function buildOrient(
     .all<OrientTask>()
 
   const fieldRow = await env.DB.prepare(
-    `SELECT coherence, regime, trust_tier, trust_score, spin, field_updated_at FROM agent_field WHERE tenant = ?1 AND agent_id = ?2`,
+    `SELECT coherence, regime, trust_tier, trust_score, spin, field_updated_at, source FROM agent_field WHERE tenant = ?1 AND agent_id = ?2`,
   )
     .bind(env.TENANT_SLUG, agent.id)
     .first<AgentFieldRow>()
@@ -367,13 +371,18 @@ export function parseFieldPush(raw: unknown): { ok: true; value: FieldPush } | {
   return { ok: true, value: { coherence: clamp01(b.coherence), regime, trust_tier, trust_score: clamp01(b.trust_score), spin } }
 }
 
-/** Upsert the mind's pushed field state for an agent (tenant-scoped). */
+/**
+ * Upsert the mind's pushed field state for an agent (tenant-scoped). Explicitly claims
+ * source='mind' (0020): the mind ALWAYS reclaims a row the fallback brain was holding —
+ * the inverse guard lives on the fallback side (brain/fallback.ts never overwrites a
+ * fresh mind row).
+ */
 export async function upsertAgentField(env: Env, agentId: string, f: FieldPush, nowMs: number): Promise<void> {
   await env.DB.prepare(
-    `INSERT INTO agent_field (tenant, agent_id, coherence, regime, trust_tier, trust_score, spin, field_updated_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+    `INSERT INTO agent_field (tenant, agent_id, coherence, regime, trust_tier, trust_score, spin, field_updated_at, source)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'mind')
      ON CONFLICT(tenant, agent_id) DO UPDATE SET
-       coherence = ?3, regime = ?4, trust_tier = ?5, trust_score = ?6, spin = ?7, field_updated_at = ?8`,
+       coherence = ?3, regime = ?4, trust_tier = ?5, trust_score = ?6, spin = ?7, field_updated_at = ?8, source = 'mind'`,
   )
     .bind(env.TENANT_SLUG, agentId, f.coherence ?? null, f.regime ?? null, f.trust_tier ?? null, f.trust_score ?? null, f.spin ? JSON.stringify(f.spin) : null, nowMs)
     .run()
