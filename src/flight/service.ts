@@ -132,6 +132,30 @@ export async function getFlight(env: Env, id: string): Promise<FlightRow | null>
   )
 }
 
+// How an agent's recent flights actually ended, from the pot's own books — the
+// trust-friction input to preflight (dispatch.ts merges it into the gate signals,
+// overriding anything the caller claims). Counts only landed/failed: a held flight
+// never flew, so it is not evidence about the agent.
+export interface OutcomeStats {
+  ended: number
+  failed: number
+  failureRate: number | null // null until at least one ended flight exists
+}
+
+export async function recentOutcomeStats(env: Env, agent: string, limit = 10): Promise<OutcomeStats> {
+  const res = await env.DB.prepare(
+    `SELECT status FROM flights WHERE tenant=?1 AND agent=?2 AND status IN ('landed','failed')
+     ORDER BY ended_at DESC LIMIT ?3`,
+  )
+    .bind(env.TENANT_SLUG, agent, Math.min(Math.max(limit, 1), 100))
+    .all<{ status: string }>()
+  // Re-filter in TS (defense-in-depth; also keeps loose test mocks honest).
+  const rows = (res.results ?? []).filter((r) => r.status === 'landed' || r.status === 'failed')
+  const ended = rows.length
+  const failed = rows.filter((r) => r.status === 'failed').length
+  return { ended, failed, failureRate: ended > 0 ? failed / ended : null }
+}
+
 // How many flights this tenant created since `sinceMs` — the dispatch-throttle input.
 export async function countFlightsCreatedSince(env: Env, sinceMs: number): Promise<number> {
   const row = await env.DB.prepare(

@@ -262,3 +262,29 @@ describe('the brain↔pot circuit (mock brain, real routes)', () => {
     expect(pot.flights.size).toBe(2) // the fuse fired before any row was written
   })
 })
+
+describe('trust friction: the pot grounds an agent that keeps crashing', () => {
+  it('three failed flights on the books → next dispatch is held with agent_unreliable, despite glowing caller signals', async () => {
+    const pot = await makePot('digid', { FLIGHT_MAX_DISPATCH_HOUR: '100' } as Partial<Env>)
+    for (let i = 0; i < 3; i++) {
+      const d = (await (await post(pot, '/api/flights', dispatchBody(`try ${i}`))).json()) as { id: string }
+      await post(pot, `/api/flights/${d.id}/fail`, JSON.stringify({ reason: 'crashed' }))
+    }
+    // The caller (brain) sends perfect signals — the pot's own books override them.
+    const r = await post(pot, '/api/flights', dispatchBody('try again'))
+    expect(r.status).toBe(200) // recorded hold
+    const d = (await r.json()) as { go: boolean; reasons: string[] }
+    expect(d.go).toBe(false)
+    expect(d.reasons).toContain('agent_unreliable')
+  })
+
+  it('a clean record keeps flying: landings do not ground the agent', async () => {
+    const pot = await makePot('digid', { FLIGHT_MAX_DISPATCH_HOUR: '100' } as Partial<Env>)
+    for (let i = 0; i < 3; i++) {
+      const d = (await (await post(pot, '/api/flights', dispatchBody(`ok ${i}`))).json()) as { id: string }
+      await post(pot, `/api/flights/${d.id}/land`, JSON.stringify({ cost_micro_usd: 0 }))
+    }
+    const r = await post(pot, '/api/flights', dispatchBody('next'))
+    expect(r.status).toBe(201)
+  })
+})
