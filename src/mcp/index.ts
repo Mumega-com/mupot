@@ -39,6 +39,8 @@ import { createMemory } from '../memory'
 import { createTask } from '../tasks/service'
 import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint } from '../dashboard/connect'
+import { resolveAgentRef } from '../org/resolve'
+import { PROVISION_TOOLS } from './provision'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -144,7 +146,7 @@ async function resolveSquadDepartment(env: Env, squadId: string): Promise<string
   return r?.department_id ?? null
 }
 
-async function memberCanOnSquad(
+export async function memberCanOnSquad(
   env: Env,
   grants: CapabilityGrant[],
   squadId: string,
@@ -189,17 +191,17 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // A tool returns either a value (→ 200 {ok:true, result}) or a typed error with
 // an HTTP status (→ that status, {ok:false, error}).
 type ToolError = { status: 400 | 403 | 404 | 409; error: string; detail?: unknown }
-type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
+export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
 
-function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
+export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
   return { ok: false, status, error, detail }
 }
-function done(result: unknown): ToolOutcome {
+export function done(result: unknown): ToolOutcome {
   return { ok: true, result }
 }
 
 // ── arg readers (NEVER trust an identity field from args) ─────────────────────
-function str(v: unknown): string | null {
+export function str(v: unknown): string | null {
   return typeof v === 'string' && v.trim().length > 0 ? v : null
 }
 
@@ -210,9 +212,9 @@ function str(v: unknown): string | null {
 // Per-call context a tool may need beyond auth/args. `origin` is the public scheme+host
 // the caller reached us on (e.g. https://agents.digid.ca) — orient needs it to render the
 // pot's own MCP endpoint into the brief. Derived from the request URL at each call site.
-type ToolCtx = { origin: string }
+export type ToolCtx = { origin: string }
 
-interface ToolSpec {
+export interface ToolSpec {
   name: string
   // human-facing description of scope + minimum capability for /mcp/tools
   scope: string
@@ -515,16 +517,16 @@ const toolOrient: ToolSpec = {
     const ref = str(args.agent) ?? auth.boundAgentId ?? null
     if (!ref) return fail(400, 'invalid_args', 'agent required (token is not agent-bound)')
 
-    // Resolve id-first then slug → canonical id + squad for the capability check.
-    let agentRef = await env.DB.prepare(`SELECT id, squad_id FROM agents WHERE id = ?1 LIMIT 1`)
-      .bind(ref)
-      .first<{ id: string; squad_id: string }>()
-    if (!agentRef) {
-      agentRef = await env.DB.prepare(`SELECT id, squad_id FROM agents WHERE slug = ?1 LIMIT 1`)
-        .bind(ref)
-        .first<{ id: string; squad_id: string }>()
+    // Resolve id-first, slug-with-ambiguity-refusal (shared ../org/resolve). A bare slug
+    // can match agents in different squads (UNIQUE(squad_id, slug)); refusing an ambiguous
+    // slug keeps the capability check below from gating against an arbitrary row.
+    const resolved = await resolveAgentRef(env, ref)
+    if (!resolved.ok) {
+      return resolved.reason === 'ambiguous'
+        ? fail(409, 'ambiguous_slug', 'slug matches multiple agents — use the id instead')
+        : fail(404, 'agent_not_found')
     }
-    if (!agentRef) return fail(404, 'agent_not_found')
+    const agentRef = resolved.value
 
     const grants = auth.capabilities ?? []
     const orgAdmin = hasCapability(grants, 'org', null, 'admin')
@@ -552,6 +554,7 @@ const TOOLS: ToolSpec[] = [
   toolSquadMessage,
   toolStatus,
   toolOrient,
+  ...PROVISION_TOOLS,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
