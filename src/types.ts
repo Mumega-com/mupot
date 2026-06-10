@@ -258,6 +258,7 @@ export type BusEventType =
   | 'task.verdict' // gate decision written — verdict + new task status in payload
   | 'agent.wake'
   | 'squad.dispatch'
+  | 'org.provisioned' // a department/squad/agent/token was created in-band (payload.kind)
 
 export interface BusEvent<T = unknown> {
   type: BusEventType

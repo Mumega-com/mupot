@@ -41,6 +41,9 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
       const ref = args[0]
       const byId = sql.includes('WHERE id')
       return {
+        // carried so DB.batch() can record the composed INSERTs (atomic mint path)
+        sql,
+        args,
         // .first() serves the member_tokens authn lookup and every WHERE-id resolve
         // (ids are globally unique). Slug resolves go through .all() (count matches).
         async first() {
@@ -100,7 +103,15 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
     TENANT_SLUG: 'digid',
     BRAND: 'Digid',
     OAUTH_PROVIDER: 'google',
-    DB: { prepare: (sql: string) => handler(sql) },
+    DB: {
+      prepare: (sql: string) => handler(sql),
+      // atomic mint runs member+capability+token as one batch; record each INSERT.
+      async batch(stmts: { sql: string; args: unknown[] }[]) {
+        for (const s of stmts) if (s.sql.includes('INSERT INTO')) captured.push({ sql: s.sql, args: s.args })
+        return stmts.map(() => ({ meta: { changes: 1 } }))
+      },
+    },
+    BUS: { send: async () => {} },
   } as unknown as Env
 }
 
@@ -132,9 +143,29 @@ describe('provision tools — advertised', () => {
     )
     const body = (await res.json()) as { result: { tools: { name: string }[] } }
     const names = body.result.tools.map((t) => t.name)
+    expect(names).toContain('create_department')
     expect(names).toContain('create_squad')
     expect(names).toContain('create_agent')
     expect(names).toContain('mint_agent_token')
+  })
+})
+
+describe('create_department', () => {
+  it('org-admin creates a department (zero-state root)', async () => {
+    const cap = [] as Captured[]
+    const res = await call('create_department', { slug: 'revenue', name: 'Revenue' }, makeEnv({}, cap))
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { result: { structuredContent: { department: { slug: string } } } }
+    expect(body.result.structuredContent.department.slug).toBe('revenue')
+    expect(cap.some((c) => c.sql.includes('INSERT INTO departments'))).toBe(true)
+  })
+
+  it('403s a non-org-admin (department is org-structure)', async () => {
+    const grants: CapabilityGrant[] = [
+      { member_id: 'member-operator', scope_type: 'department', scope_id: 'dept-1', capability: 'admin' },
+    ]
+    const res = await call('create_department', { slug: 'revenue', name: 'Revenue' }, makeEnv({ grants }))
+    expect(res.status).toBe(403)
   })
 })
 
@@ -167,6 +198,26 @@ describe('create_squad', () => {
     const res = await call('create_squad', { department: 'dept-1', slug: 'Bad Slug!', name: 'Growth' }, makeEnv())
     expect(res.status).toBe(400)
     expect(((await res.json()) as { error: { message: string } }).error.message).toBe('invalid_slug')
+  })
+
+  it('400s an unknown field at the seam (W1 runtime schema enforcement)', async () => {
+    const res = await call(
+      'create_squad',
+      { department: 'dept-1', slug: 'growth', name: 'Growth', evil: 'x' },
+      makeEnv(),
+    )
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe('invalid_args')
+  })
+
+  it('400s a negative budget_cap_cents (W4)', async () => {
+    const res = await call(
+      'create_squad',
+      { department: 'dept-1', slug: 'growth', name: 'Growth', budget_cap_cents: -1 },
+      makeEnv(),
+    )
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe('invalid_budget_cap_cents')
   })
 })
 
@@ -213,10 +264,11 @@ describe('mint_agent_token', () => {
     expect(sc.agent.id).toBe('agent-1')
     expect(sc.mcp_endpoint).toBe('https://agents.digid.ca/mcp')
 
-    // THE WELD: member_tokens insert carries the agent id in the agent_id column (7th bind).
+    // THE WELD: member_tokens insert carries the agent id in agent_id (6th bind;
+    // channel is a hard-coded literal, so binds are id,member,hash,label,created_at,agent_id).
     const tokenInsert = cap.find((c) => c.sql.includes('INSERT INTO member_tokens'))
     expect(tokenInsert).toBeDefined()
-    expect(tokenInsert!.args[6]).toBe('agent-1')
+    expect(tokenInsert!.args[5]).toBe('agent-1')
 
     // THE ESCALATION GUARD: the agent's only capability is squad-scoped 'member'
     // on its OWN squad — never org/department, never above member.

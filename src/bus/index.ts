@@ -20,6 +20,7 @@ const EVENT_TYPES: readonly BusEventType[] = [
   'task.blocked',
   'agent.wake',
   'squad.dispatch',
+  'org.provisioned',
 ]
 
 function isBusEventType(v: unknown): v is BusEventType {
