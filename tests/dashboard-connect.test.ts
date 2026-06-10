@@ -1,10 +1,27 @@
 import { describe, expect, it } from 'vitest'
 import {
   mcpEndpoint,
+  canonicalOrigin,
   claudeCodeSnippet,
   codexSnippet,
   mcpServerKey,
 } from '../src/dashboard/connect'
+
+describe('canonicalOrigin', () => {
+  it('prefers the env-pinned PUBLIC_ORIGIN over the request origin', () => {
+    expect(canonicalOrigin({ PUBLIC_ORIGIN: 'https://agents.digid.ca' }, 'https://evil.example')).toBe(
+      'https://agents.digid.ca',
+    )
+  })
+  it('falls back to the request origin when PUBLIC_ORIGIN is unset', () => {
+    expect(canonicalOrigin({}, 'https://pot.example.com')).toBe('https://pot.example.com')
+  })
+  it('falls back (never throws) when PUBLIC_ORIGIN is malformed', () => {
+    expect(canonicalOrigin({ PUBLIC_ORIGIN: 'not a url' }, 'https://pot.example.com')).toBe(
+      'https://pot.example.com',
+    )
+  })
+})
 
 describe('mcpEndpoint', () => {
   it('appends /mcp to the origin', () => {

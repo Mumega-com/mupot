@@ -67,7 +67,8 @@ function makeEnv(opts: Opts = {}): Env {
           }
           if (sql.includes('FROM departments')) return { id: 'dept-1', name: 'Revenue' }
           if (sql.includes('FROM agent_field')) return null
-          if (sql.includes('first_inducted_at FROM agent_orientation')) return null // induction = true
+          // atomic induction upsert: INSERT ... RETURNING orient_count (1 = first induction)
+          if (sql.includes('agent_orientation')) return { orient_count: 1 }
           return null
         },
         async all() {
@@ -146,6 +147,22 @@ describe('orient MCP tool', () => {
     expect(res.status).toBe(200)
     const body = (await res.json()) as { result: { structuredContent: { packet: { agent: { id: string } } } } }
     expect(body.result.structuredContent.packet.agent.id).toBe(AGENT.id)
+  })
+
+  it('a bare observer viewing a PEER gets budget/field redacted (#88)', async () => {
+    // observer on the squad, not the agent itself, not admin → viewSensitive=false
+    const grants: CapabilityGrant[] = [
+      { member_id: 'member-1', scope_type: 'squad', scope_id: 'squad-1', capability: 'observer' },
+    ]
+    const res = await orient({ agent: 'growth-lead' }, makeEnv({ boundAgentId: null, grants }))
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      result: { structuredContent: { packet: { agent: { budget_cap_cents: number | null }; field_restricted?: boolean }; brief: string } }
+    }
+    const packet = body.result.structuredContent.packet
+    expect(packet.agent.budget_cap_cents).toBeNull() // peer budget hidden
+    expect(packet.field_restricted).toBe(true)
+    expect(body.result.structuredContent.brief).toMatch(/field state restricted/)
   })
 
   it('400s when an unbound token names no agent', async () => {

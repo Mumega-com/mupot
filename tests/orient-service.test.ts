@@ -157,4 +157,10 @@ describe('renderBrief', () => {
     const b = renderBrief({ ...base, tasks: [] })
     expect(b).toMatch(/do not invent work/)
   })
+
+  it('field_restricted → shows the restricted line, never the peer field values (#88)', () => {
+    const b = renderBrief({ ...base, field_restricted: true, field: fieldHalf(null, NOW) })
+    expect(b).toMatch(/field state restricted/)
+    expect(b).not.toContain('Coherence') // peer coherence/trust not rendered
+  })
 })

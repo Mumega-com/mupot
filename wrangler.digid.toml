@@ -17,6 +17,7 @@ routes = [
 TENANT_SLUG = "digid"
 BRAND = "Digid"
 OAUTH_PROVIDER = "google"
+PUBLIC_ORIGIN = "https://agents.digid.ca"   # pin the orient brief's MCP endpoint (#88)
 # Flock #43: the Digid fleet window addresses its OWN bus project + ops agent —
 # never the company `sos`/`kasra`. Inert until a scoped BUS_TOKEN is set (egress
 # posture decision #44); these vars only scope, they do not open egress.

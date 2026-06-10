@@ -13,7 +13,7 @@ import { Hono } from 'hono'
 import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken, resolveOrgAdmin } from '../auth/member-bearer'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
-import { mcpEndpoint } from '../dashboard/connect'
+import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
 import { resolveAgentRef } from '../org/resolve'
 import { buildOrient, renderBrief, parseFieldPush, upsertAgentField } from './service'
 
@@ -42,8 +42,15 @@ orientApp.get('/', async (c) => {
   if (!orgAdmin && !onSquad) return c.json({ error: 'forbidden' }, 403)
   const callerCapability = orgAdmin ? 'admin' : 'observer+'
 
-  const origin = new URL(c.req.url).origin
-  const { data, notFound } = await buildOrient(c.env, agentRef.id, callerCapability, mcpEndpoint(origin), Date.now())
+  // viewSensitive (#88): budget + field/trust only for the agent itself, squad leads,
+  // or admins — a bare observer viewing a peer gets them redacted.
+  const isSelf = member.boundAgentId === agentRef.id
+  const viewSensitive = orgAdmin || isSelf || hasCapability(caps, 'squad', agentRef.squad_id, 'lead')
+
+  // Pin the brief's MCP endpoint to the env-canonical origin (Host header is client-
+  // influenceable and this renders into a directive surface).
+  const origin = canonicalOrigin(c.env, new URL(c.req.url).origin)
+  const { data, notFound } = await buildOrient(c.env, agentRef.id, callerCapability, mcpEndpoint(origin), viewSensitive, Date.now())
   if (notFound || !data) return c.json({ error: 'not_found' }, 404)
   return c.json({ packet: data, brief: renderBrief(data) })
 })

@@ -15,6 +15,22 @@ export function mcpEndpoint(origin: string): string {
   return `${origin.replace(/\/+$/, '')}/mcp`
 }
 
+/** The canonical origin for a brief/directive surface: the env-pinned PUBLIC_ORIGIN
+ *  when configured (and parseable), else the request origin. The Host header is
+ *  client-influenceable, so any value rendered INTO a directive (the orient brief's
+ *  MCP endpoint) must prefer the operator-pinned origin. #88. */
+export function canonicalOrigin(env: { PUBLIC_ORIGIN?: string }, requestOrigin: string): string {
+  const pinned = env.PUBLIC_ORIGIN?.trim()
+  if (pinned) {
+    try {
+      return new URL(pinned).origin
+    } catch {
+      // misconfigured PUBLIC_ORIGIN → fall back to the request origin (never throw)
+    }
+  }
+  return requestOrigin
+}
+
 /** Claude Code `.mcp.json` snippet — streamable-HTTP, Bearer placeholder.
  *  The pot's /mcp is POST JSON-RPC (streamable-http), NOT an SSE GET stream — so the
  *  client transport MUST be `http`. `type:"sse"` does a GET that the dashboard catch-all

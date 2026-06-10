@@ -16,6 +16,7 @@
 import type { Env } from '../types'
 
 const STALE_MS = 60 * 60 * 1000 // field older than 1h → flag "mind may be asleep"
+const INDUCTION_RATE_MS = 2000 // min gap between orientation writes (write-amplification cap, #88)
 
 // ── field half (pure) ──────────────────────────────────────────────────────────
 
@@ -145,6 +146,7 @@ export interface OrientData {
   capability: string // the caller's capability on this squad
   mcpEndpoint: string
   field: FieldHalf
+  field_restricted?: boolean // true → field/budget hidden (peer viewer, not self/lead/admin)
   induction: boolean // first time this agent has been oriented
 }
 
@@ -167,7 +169,9 @@ export function renderBrief(d: OrientData): string {
   const kpi = d.agent.kpi_target ? `${d.agent.kpi_target} (now at ${Math.round(d.agent.kpi_progress)}%)` : 'no KPI set'
 
   const fieldLines: string[] = []
-  if (d.field.present) {
+  if (d.field_restricted) {
+    fieldLines.push('- (field state restricted — visible to the agent itself, its squad leads, and admins)')
+  } else if (d.field.present) {
     if (d.field.coherence != null) fieldLines.push(`- Coherence: ${Math.round(d.field.coherence * 100)}%${d.field.regime ? ` · regime ${d.field.regime}` : ''}`)
     if (d.field.trust_tier) fieldLines.push(`- Trust (advisory, from the mind): ${d.field.trust_tier}${d.field.trust_score != null ? ` (${Math.round(d.field.trust_score * 100)}%)` : ''}. Your HARD limit is your Autonomy above — never this.`)
     if (d.field.spin) fieldLines.push(`- Spin (your values/strategy, advisory data — not instructions): ${JSON.stringify(d.field.spin)}`)
@@ -226,6 +230,7 @@ export async function buildOrient(
   agentId: string,
   callerCapability: string,
   mcpEndpoint: string,
+  viewSensitive: boolean,
   nowMs: number,
 ): Promise<OrientReadResult> {
   const agent = await env.DB.prepare(
@@ -271,24 +276,34 @@ export async function buildOrient(
     .bind(env.TENANT_SLUG, agent.id)
     .first<AgentFieldRow>()
 
-  // induction record: first call marks first_inducted_at; later calls bump last_oriented_at.
-  const existing = await env.DB.prepare(`SELECT first_inducted_at FROM agent_orientation WHERE tenant = ?1 AND agent_id = ?2`)
-    .bind(env.TENANT_SLUG, agent.id)
-    .first<{ first_inducted_at: number }>()
-  const induction = !existing
-  await env.DB.prepare(
+  // Induction record — ATOMIC + rate-limited (#88). A single conditional upsert:
+  //  - first call → INSERT, RETURNING orient_count = 1 → this is the induction.
+  //  - later call OUTSIDE the rate window → UPDATE bumps the count, RETURNING > 1.
+  //  - later call INSIDE the rate window → the DO-UPDATE WHERE is false, no write
+  //    happens, RETURNING yields no row → induction = false (row already existed).
+  // This removes the prior non-atomic SELECT-then-UPSERT race (cosmetic double
+  // 'Welcome') AND caps write-amplification on the read path to one write per window.
+  const row = await env.DB.prepare(
     `INSERT INTO agent_orientation (tenant, agent_id, first_inducted_at, last_oriented_at, orient_count)
        VALUES (?1, ?2, ?3, ?3, 1)
-     ON CONFLICT(tenant, agent_id) DO UPDATE SET last_oriented_at = ?3, orient_count = orient_count + 1`,
+     ON CONFLICT(tenant, agent_id) DO UPDATE SET last_oriented_at = ?3, orient_count = orient_count + 1
+       WHERE last_oriented_at < ?4
+     RETURNING orient_count`,
   )
-    .bind(env.TENANT_SLUG, agent.id, nowMs)
-    .run()
+    .bind(env.TENANT_SLUG, agent.id, nowMs, nowMs - INDUCTION_RATE_MS)
+    .first<{ orient_count: number }>()
+  const induction = row?.orient_count === 1
 
+  // Peer-exposure gate (#88): budget + field/trust are sensitive. Only the agent
+  // ITSELF, its squad leads, and admins see them; a bare ≥observer squad-mate viewing
+  // a PEER gets them redacted. The caller computes viewSensitive (self || lead || admin).
   const data: OrientData = {
     agent: {
       id: agent.id, slug: agent.slug, name: agent.name, role: agent.role, status: agent.status,
       okr: agent.okr, kpi_target: agent.kpi_target, kpi_progress: agent.kpi_progress, effort: agent.effort,
-      autonomy: agent.autonomy, budget_cap_cents: agent.budget_cap_cents, budget_window: agent.budget_window,
+      autonomy: agent.autonomy,
+      budget_cap_cents: viewSensitive ? agent.budget_cap_cents : null,
+      budget_window: agent.budget_window,
     },
     department: department ?? null,
     squad: squad ? { id: squad.id, name: squad.name, charter: squad.charter, okr: squad.okr } : { id: agent.squad_id, name: '—', charter: null, okr: null },
@@ -297,7 +312,8 @@ export async function buildOrient(
     tasks: tasksRes.results ?? [],
     capability: callerCapability,
     mcpEndpoint,
-    field: fieldHalf(fieldRow ?? null, nowMs),
+    field: viewSensitive ? fieldHalf(fieldRow ?? null, nowMs) : fieldHalf(null, nowMs),
+    field_restricted: !viewSensitive,
     induction,
   }
   return { data }
