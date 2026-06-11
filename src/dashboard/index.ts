@@ -84,6 +84,14 @@ import { isOnboardingComplete } from './settings'
 import { loadBrainView, brainBody } from './brain'
 import { setLoopControl, isLoopControlAction } from '../loops/decisions'
 import { getLoop } from '../loops/service'
+import {
+  addConnector,
+  rotateConnector,
+  revokeConnector,
+  listConnectors,
+} from '../connectors/service'
+import { isConnectorType, isConnectorScopeType } from '../connectors/crypto'
+import { connectorsPageBody, connectorAddedBody, connectorRotatedBody } from '../connectors/dashboard'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -637,6 +645,167 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
       keysMintedBody(memberName, result.label, preset.label, result.raw, result.grantUnchanged),
     ),
   )
+})
+
+// ── connector credential vault ───────────────────────────────────────────────
+//
+// Admin-only routes for managing encrypted third-party tool credentials.
+//
+// Security:
+//   - All routes require isAdmin (owner or admin org role).
+//   - encrypted_secret is NEVER read in these routes — listConnectors() SQL
+//     explicitly excludes it. Only resolveConnector() (service layer) may decrypt.
+//   - CSRF middleware covers all POSTs (applied dashboard-wide above).
+//   - Tenant-scope: the tenant = env.TENANT_SLUG is injected by the service layer;
+//     the admin of pot A cannot see or write pot B's connectors.
+//   - Add/rotate: the raw secret is discarded after encryption; a hint (last-4)
+//     is returned once in the show-once confirmation page and not persisted.
+
+// GET /admin/connectors — list active connectors (masked)
+dashboardApp.get('/admin/connectors', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(
+      shell(c.env.BRAND, 'Connectors', errorBody('Connector management requires owner or admin.')),
+      403,
+    )
+  }
+  const rows = await listConnectors(c.env)
+  return c.html(shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows)))
+})
+
+// POST /admin/connectors — add a new connector (encrypt + store)
+dashboardApp.post('/admin/connectors', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(
+      shell(c.env.BRAND, 'Connectors', errorBody('Adding a connector requires owner or admin.')),
+      403,
+    )
+  }
+
+  const form = await c.req.parseBody()
+  const type      = typeof form.type       === 'string' ? form.type.trim()       : ''
+  const label     = typeof form.label      === 'string' ? form.label.trim()      : ''
+  const secret    = typeof form.secret     === 'string' ? form.secret            : ''
+  const scopeType = typeof form.scope_type === 'string' ? form.scope_type.trim() : 'pot'
+  const scopeId   = typeof form.scope_id   === 'string' && form.scope_id.trim()
+    ? form.scope_id.trim()
+    : null
+  const meta      = typeof form.meta       === 'string' && form.meta.trim()
+    ? form.meta.trim()
+    : null
+
+  if (!isConnectorType(type)) {
+    const rows = await listConnectors(c.env)
+    return c.html(
+      shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows, 'Unknown connector type.')),
+      400,
+    )
+  }
+  if (!isConnectorScopeType(scopeType)) {
+    const rows = await listConnectors(c.env)
+    return c.html(
+      shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows, 'Invalid scope type.')),
+      400,
+    )
+  }
+
+  const result = await addConnector(c.env, {
+    type,
+    label,
+    secret,
+    meta,
+    scope_type: scopeType,
+    scope_id: scopeId,
+    created_by: auth.memberId ?? auth.userId,
+  })
+
+  if (!result.ok) {
+    const rows = await listConnectors(c.env)
+    const msg =
+      result.error === 'secret_required'   ? 'Secret cannot be empty.' :
+      result.error === 'label_required'    ? 'Label cannot be empty.' :
+      result.error === 'scope_id_required' ? 'Scope ID is required for squad/agent scope.' :
+      result.error === 'squad_not_found'   ? 'Squad not found in this pot.' :
+      result.error === 'agent_not_found'   ? 'Agent not found in this pot.' :
+      `Add failed: ${result.error}`
+    return c.html(
+      shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows, msg)),
+      400,
+    )
+  }
+
+  // Show-once confirmation. Raw secret is NOT echoed — only the hint (last-4).
+  // Cache-Control: no-store is set by the dashboard-wide middleware.
+  return c.html(
+    shell(
+      c.env.BRAND,
+      'Connector added',
+      connectorAddedBody(result.connector.type, result.connector.label, result.connector.hint, result.connector.id),
+    ),
+  )
+})
+
+// POST /admin/connectors/:id/rotate — re-encrypt with a new secret
+dashboardApp.post('/admin/connectors/:id/rotate', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  }
+
+  const connectorId = c.req.param('id')
+  const form = await c.req.parseBody()
+  const newSecret = typeof form.new_secret === 'string' ? form.new_secret : ''
+
+  if (!newSecret.trim()) {
+    const rows = await listConnectors(c.env)
+    return c.html(
+      shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows, 'New secret cannot be empty.')),
+      400,
+    )
+  }
+
+  const result = await rotateConnector(c.env, connectorId, newSecret, auth.memberId ?? auth.userId)
+  if (!result.ok) {
+    const rows = await listConnectors(c.env)
+    const msg =
+      result.error === 'not_found'       ? 'Connector not found.' :
+      result.error === 'already_revoked' ? 'Cannot rotate a revoked connector.' :
+      `Rotate failed: ${result.error}`
+    return c.html(
+      shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows, msg)),
+      result.error === 'not_found' ? 404 : 400,
+    )
+  }
+
+  return c.html(
+    shell(
+      c.env.BRAND,
+      'Secret rotated',
+      connectorRotatedBody(result.connector.type, result.connector.label, result.connector.hint, result.connector.id),
+    ),
+  )
+})
+
+// POST /admin/connectors/:id/revoke — permanently disable a connector
+dashboardApp.post('/admin/connectors/:id/revoke', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  }
+
+  const connectorId = c.req.param('id')
+  const revoked = await revokeConnector(c.env, connectorId, auth.memberId ?? auth.userId)
+  if (!revoked) {
+    const rows = await listConnectors(c.env)
+    return c.html(
+      shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows, 'Connector not found or already revoked.')),
+      404,
+    )
+  }
+
+  return c.redirect('/admin/connectors')
 })
 
 // ── members page (GET) + token mint/revoke (POST-redirect-GET) ────────────────
