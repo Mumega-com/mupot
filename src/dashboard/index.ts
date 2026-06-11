@@ -52,6 +52,10 @@ import { SQUAD_PACKS, seedSquadPack } from '../org/squad-packs'
 import { mintMemberToken, revokeMemberToken, loadLiveTokens, isChannel } from '../members/service'
 import type { MintedToken, PublicMemberToken } from '../members/service'
 
+// Scoped-key mint UI (#deliverable-2).
+import { loadKeysView, mintScopedKey, keysPageBody, keysMintedBody } from './keys'
+import { findPreset, isValidPresetId } from '../auth/role-presets'
+
 // Connect-config builders (pure) for the Connect card.
 import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
 import { loadApprovals, resultPreview } from './approvals'
@@ -519,6 +523,105 @@ dashboardApp.get('/admin/divisions', async (c) => {
   ])
   return c.html(
     shell(c.env.BRAND, 'Divisions', divisionsAdminBody(depts, squads, grants, members, auth)),
+  )
+})
+
+// ── /admin/keys — scoped-key mint UI (deliverable 2) ─────────────────────────
+//
+// GET /admin/keys — landing page: preset picker + guide panel + active scoped keys.
+// POST /admin/keys/mint — isAdmin-gated; mints a capability grant + member_token
+//   using the named preset; shows the raw key EXACTLY ONCE (no redirect).
+//
+// Security:
+//   - Both routes check isAdmin before any DB access.
+//   - The CSRF middleware covers the POST (applied to all dashboard routes above).
+//   - The raw token is rendered once and never persisted or logged.
+//   - mintScopedKey validates that the scope_id belongs to THIS pot's D1 —
+//     a caller cannot claim another tenant's squad/department uuid.
+
+// GET /admin/keys
+dashboardApp.get('/admin/keys', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(
+      shell(c.env.BRAND, 'Scoped Keys', errorBody('Scoped key management requires owner or admin.')),
+      403,
+    )
+  }
+  const view = await loadKeysView(c.env)
+  return c.html(shell(c.env.BRAND, 'Scoped API Keys', keysPageBody(view)))
+})
+
+// POST /admin/keys/mint — mint + show-once
+dashboardApp.post('/admin/keys/mint', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(
+      shell(c.env.BRAND, 'Scoped Keys', errorBody('Minting a scoped key requires owner or admin.')),
+      403,
+    )
+  }
+
+  const form = await c.req.parseBody()
+  const presetIdRaw = typeof form.preset_id === 'string' ? form.preset_id.trim() : ''
+  const memberIdRaw = typeof form.member_id === 'string' ? form.member_id.trim() : ''
+  const scopeIdRaw  = typeof form.scope_id  === 'string' ? form.scope_id.trim()  : null
+
+  // Basic input validation before hitting the DB.
+  if (!isValidPresetId(presetIdRaw)) {
+    const view = await loadKeysView(c.env)
+    return c.html(
+      shell(c.env.BRAND, 'Scoped API Keys', keysPageBody(view, undefined, undefined, 'Unknown preset.')),
+      400,
+    )
+  }
+  if (!memberIdRaw) {
+    const view = await loadKeysView(c.env)
+    return c.html(
+      shell(c.env.BRAND, 'Scoped API Keys', keysPageBody(view, presetIdRaw, scopeIdRaw ?? undefined, 'Pick a member.')),
+      400,
+    )
+  }
+
+  const result = await mintScopedKey(c.env, {
+    memberId: memberIdRaw,
+    presetId: presetIdRaw,
+    scopeId: scopeIdRaw || null,
+  })
+
+  if (!result.ok) {
+    const view = await loadKeysView(c.env)
+    const msg = result.error === 'member_not_found'
+      ? 'Member not found or inactive.'
+      : result.error === 'squad_not_found'
+      ? 'Squad not found.'
+      : result.error === 'department_not_found'
+      ? 'Department not found.'
+      : result.error === 'scope_id_required_for_squad_preset'
+      ? 'This preset requires a squad. Pick one from the scope picker.'
+      : result.error === 'scope_id_required_for_department_preset'
+      ? 'This preset requires a department. Pick one from the scope picker.'
+      : `Mint failed: ${result.error}`
+    return c.html(
+      shell(c.env.BRAND, 'Scoped API Keys', keysPageBody(view, presetIdRaw, scopeIdRaw ?? undefined, msg)),
+      400,
+    )
+  }
+
+  // Find preset label for the show-once page.
+  const preset = findPreset(presetIdRaw)! // validated above
+  const member = await c.env.DB.prepare(
+    'SELECT display_name FROM members WHERE id = ?1 LIMIT 1',
+  )
+    .bind(memberIdRaw)
+    .first<{ display_name: string }>()
+  const memberName = member?.display_name ?? memberIdRaw
+
+  // Render the raw key ONCE — do NOT redirect (prevents back-button retrieval).
+  // Cache-Control: no-store and Referrer-Policy: no-referrer are set by the
+  // dashboard-wide middleware above.
+  return c.html(
+    shell(c.env.BRAND, 'Key minted', keysMintedBody(memberName, result.label, preset.label, result.raw)),
   )
 })
 
@@ -1375,6 +1478,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         <a href="/fleet">Fleet</a>
         <a href="/members">Members</a>
         <a href="/admin/divisions">Divisions</a>
+        <a href="/admin/keys">Scoped Keys</a>
         <a href="/setup">Setup</a>
         <a href="/auth/logout">Sign out</a>
       </nav>
