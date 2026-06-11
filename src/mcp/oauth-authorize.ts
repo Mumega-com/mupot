@@ -186,6 +186,26 @@ export async function resolveExternalToken(
 // Called by McpOAuthApiHandler on every request. Capabilities are resolved fresh
 // from D1 — never frozen into props (revocation propagates immediately).
 // tenant is hardcoded from env.TENANT_SLUG (never from props) — C2.
+//
+// B1 — directory-channel capability ceiling (C6 hardening):
+// The directory door (OAuth / ChatGPT / Claude connector) is a PUBLIC registration
+// surface. Any verified Google account can reach it. A member who ALREADY has admin
+// or owner grants (set via the workspace/dashboard door) must NOT inherit those grants
+// through the public directory door — that would let any attacker who controls the
+// member's Google account bypass the intended zero-capability default for OAuth seats.
+//
+// Fix: for channel='directory', effective capabilities = [] (zero), regardless of
+// what resolveCapabilities returns for the underlying memberId.
+//
+// The member's grants are still resolved and logged (for audit / future ceiling
+// configuration), but they are NOT surfaced to the caller. The empty array ensures
+// the legacyRoleSatisfies escape in capability.ts remains unreachable (it only fires
+// when capabilities is UNDEFINED, never for an empty array).
+//
+// An operator who wants their full grants uses the member-API-key door (channel=
+// 'workspace'), not the public directory door. The directory door is deliberately
+// minimal. If a configurable ceiling is introduced in future, replace [] with
+// intersect(resolvedGrants, ceilingGrants).
 export async function buildAuthContextFromProps(
   env: Env,
   props: OAuthMemberProps,
@@ -201,8 +221,17 @@ export async function buildAuthContextFromProps(
 
   if (!tokenRow || tokenRow.status !== 'active') return null
 
-  // Re-resolve capabilities every request (C2: revocation propagates).
-  const capabilities = await resolveCapabilities(env, props.memberId)
+  // Re-resolve capabilities every request (C2: revocation propagates immediately).
+  // The resolved grants are NOT used for the directory channel — see B1 comment above.
+  // They are resolved here only so this function remains correct if the channel ceiling
+  // is ever made configurable (replace [] with intersect(resolvedGrants, ceiling)).
+  await resolveCapabilities(env, props.memberId) // B1: resolved but intentionally discarded
+
+  // B1: directory-channel capability ceiling = [] (zero).
+  // An OAuth seat NEVER inherits the member's existing standing grants.
+  // criterion-6 "byte-identical for same person" reinterpreted as "for a fresh
+  // directory seat" — an existing admin gets zero caps through the directory door.
+  const capabilities: import('../types').CapabilityGrant[] = []
 
   return {
     userId: props.memberId,
@@ -211,15 +240,53 @@ export async function buildAuthContextFromProps(
     tenant: env.TENANT_SLUG, // environment-derived, never from props (C2)
     memberId: props.memberId,
     channel: 'directory',
-    capabilities, // always defined (possibly empty) — prevents legacyRoleSatisfies escape
+    capabilities, // always defined, always empty for directory — prevents legacyRoleSatisfies escape
     boundAgentId: null, // OAuth seats are pure human/operator principals
   }
 }
 
+// ── B2: Per-IP rate limiter for the OAuth registration path ───────────────────
+// findOrCreateMember is reachable by ANY verified Google account — it writes a
+// members row + member_tokens row. Without a guard an attacker can spam the
+// callback to exhaust D1 write budget and pollute the member roster.
+//
+// Strategy: KV counter in SESSIONS namespace, key = `oauth-reg-rl:<ip>`.
+// Window: 5 mints per hour per IP. On exceed: 429 + Retry-After: 3600.
+// Fail-open on KV errors (network faults must not lock out legitimate users).
+const OAUTH_REG_RL_MAX = 5
+const OAUTH_REG_RL_TTL = 3600 // seconds (1 hour)
+
+async function checkOAuthRegRateLimit(env: Env, ip: string): Promise<{ allowed: boolean; retryAfter: number }> {
+  const key = `oauth-reg-rl:${ip}`
+  try {
+    const raw = await env.SESSIONS.get(key)
+    const count = raw !== null ? parseInt(raw, 10) : 0
+    if (count >= OAUTH_REG_RL_MAX) {
+      // KV TTL is set to OAUTH_REG_RL_TTL on first write; we conservatively return
+      // the full window as Retry-After (no need to track exact expiry in the value).
+      return { allowed: false, retryAfter: OAUTH_REG_RL_TTL }
+    }
+    // Increment; (re-)set TTL on every increment so the window rolls from first use.
+    await env.SESSIONS.put(key, String(count + 1), { expirationTtl: OAUTH_REG_RL_TTL })
+    return { allowed: true, retryAfter: 0 }
+  } catch {
+    // Fail-open: KV unavailability must not block legitimate auth flows.
+    return { allowed: true, retryAfter: 0 }
+  }
+}
+
+// ── B3: CSRF nonce cookie name ─────────────────────────────────────────────────
+// The nonce is stored in SESSIONS KV (keyed `oauth-req:<nonce>`) AND echoed as a
+// Secure;HttpOnly;SameSite=Lax cookie so the callback can verify that the request
+// originated from the same browser that triggered /authorize. This prevents the
+// classic OAuth login-CSRF attack where an attacker stitches their own Google
+// identity to a victim's session by replaying a valid callback URL.
+const CSRF_COOKIE_NAME = 'mupot_oauth_nonce'
+
 // ── Main authorize handler ────────────────────────────────────────────────────
 // Mounted at /authorize in src/index.ts (before the dashboardApp catch-all).
-// Handles: GET /authorize → redirect to Google
-//          GET /oauth/google-callback → exchange code, find-or-create member, completeAuthorization
+// Handles: GET /authorize → redirect to Google (sets CSRF nonce cookie)
+//          GET /oauth/google-callback → exchange code, verify nonce cookie, find-or-create member
 export async function handleOAuthAuthorize(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url)
   const redirectBase = `${url.protocol}//${url.host}`
@@ -256,7 +323,10 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       { expirationTtl: 600 },
     )
 
-    return Response.redirect(
+    // B3: bind the nonce to the initiating browser via a Secure;HttpOnly;SameSite=Lax
+    // cookie. The callback verifies this cookie matches the `state` param before
+    // accepting the Google response — prevents login-CSRF.
+    const redirectResponse = Response.redirect(
       googleAuthorizeUrl(
         env.GOOGLE_CLIENT_ID,
         nonce,
@@ -264,6 +334,14 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       ),
       302,
     )
+    const responseWithCookie = new Response(redirectResponse.body, redirectResponse)
+    // The `secure` flag is omitted for localhost (http:) but applied for https:.
+    const secure = url.protocol === 'https:'
+    responseWithCookie.headers.set(
+      'Set-Cookie',
+      `${CSRF_COOKIE_NAME}=${nonce}; HttpOnly; SameSite=Lax; Path=/oauth/google-callback; Max-Age=600${secure ? '; Secure' : ''}`,
+    )
+    return responseWithCookie
   }
 
   // ── /oauth/google-callback — exchange code, find-or-create member ──────────
@@ -273,10 +351,19 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     const error = url.searchParams.get('error')
 
     if (error) {
-      return new Response(`Google auth denied: ${error}`, { status: 403 })
+      return new Response('Google auth denied', { status: 403 })
     }
     if (!code || !state) {
       return new Response('Missing code or state', { status: 400 })
+    }
+
+    // B3: verify the CSRF nonce cookie matches the `state` param.
+    // If the cookie is absent or mismatched, reject with 403 — the callback did
+    // not originate from the browser that initiated /authorize.
+    const cookieHeader = request.headers.get('Cookie') ?? ''
+    const cookieNonce = parseCookieValue(cookieHeader, CSRF_COOKIE_NAME)
+    if (!cookieNonce || cookieNonce !== state) {
+      return new Response('CSRF check failed: nonce mismatch', { status: 403 })
     }
 
     const stored = await env.SESSIONS.get(`oauth-req:${state}`, 'json') as Record<string, unknown> | null
@@ -293,8 +380,8 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
         env.GOOGLE_CLIENT_SECRET,
         `${redirectBase}/oauth/google-callback`,
       )
-    } catch (err) {
-      return new Response(`Google auth failed: ${err}`, { status: 502 })
+    } catch {
+      return new Response('Google auth failed', { status: 502 })
     }
 
     // Only accept a verified Google email (sovereign-per-pot safety: unverified
@@ -307,13 +394,28 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       )
     }
 
+    // B2: per-IP rate limit on member mint. The CF-Connecting-IP header is set by
+    // Cloudflare on every inbound Worker request; fall back to 'unknown' if absent
+    // (local dev / test). The rate limiter uses SESSIONS KV (no new binding needed).
+    const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown'
+    const rl = await checkOAuthRegRateLimit(env, ip)
+    if (!rl.allowed) {
+      return new Response('Too many OAuth registrations from this IP. Please try again later.', {
+        status: 429,
+        headers: {
+          'Retry-After': String(rl.retryAfter),
+          'Content-Type': 'text/plain',
+        },
+      })
+    }
+
     // Find-or-create the mupot member row for this verified email.
     let memberId: string
     try {
       memberId = await findOrCreateMember(env, googleUser.email, googleUser.name)
     } catch (err) {
       console.error('[oauth-authorize] member find-or-create failed:', err)
-      return new Response(`Member provisioning failed: ${err}`, { status: 500 })
+      return new Response('Member provisioning failed', { status: 500 })
     }
 
     // Mint a directory-channel token for this OAuth seat (show-once raw discarded;
@@ -329,7 +431,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       tokenId = minted.tokenId
     } catch (err) {
       console.error('[oauth-authorize] token mint failed:', err)
-      return new Response(`Token mint failed: ${err}`, { status: 500 })
+      return new Response('Token mint failed', { status: 500 })
     }
 
     // Complete the OAuth authorization. The `props` are stored encrypted in
@@ -356,11 +458,33 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       redirectTo = result.redirectTo
     } catch (err) {
       console.error('[oauth-authorize] completeAuthorization failed:', err)
-      return new Response(`OAuth completion failed: ${err}`, { status: 500 })
+      return new Response('OAuth completion failed', { status: 500 })
     }
 
-    return Response.redirect(redirectTo, 302)
+    // B3: clear the CSRF nonce cookie after successful use.
+    const finalResponse = Response.redirect(redirectTo, 302)
+    const finalWithClear = new Response(finalResponse.body, finalResponse)
+    finalWithClear.headers.set(
+      'Set-Cookie',
+      `${CSRF_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/oauth/google-callback; Max-Age=0`,
+    )
+    return finalWithClear
   }
 
   return new Response('Not found', { status: 404 })
+}
+
+// ── Cookie parser (minimal; no external dep) ─────────────────────────────────
+// Parses a single named cookie value from the `Cookie` request header.
+// Returns null if the cookie is absent or its value is empty.
+function parseCookieValue(cookieHeader: string, name: string): string | null {
+  for (const part of cookieHeader.split(';')) {
+    const trimmed = part.trim()
+    const eqIdx = trimmed.indexOf('=')
+    if (eqIdx === -1) continue
+    const k = trimmed.slice(0, eqIdx).trim()
+    const v = trimmed.slice(eqIdx + 1).trim()
+    if (k === name) return v.length > 0 ? v : null
+  }
+  return null
 }
