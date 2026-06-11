@@ -6,6 +6,40 @@ All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 this changelog (shipped, dated) share version numbers and feed each other — a roadmap
 block collapses into a changelog entry when it ships.
 
+## [0.20.0] — 2026-06-11
+
+Security, identity, and the operable surface. A long multi-agent session: shipped the
+governance dashboard's hard half, wired the first real lead funnel (mumega.com), and
+resolved the identity/connection model into a three-tier security posture.
+
+### Added
+- **Connector credential vault** (#117). AES-GCM at-rest, write-only, tenant-isolated;
+  add Telegram/Instantly/GHL keys to a pot, injected at call-time (agent never holds raw).
+- **Scoped-key mint UI + RBAC** (#99, #114). Role presets + scope guide, show-once;
+  rank-ceiling enforced (an admin cannot mint admin).
+- **Granular `requireCapability` gates** (#119). outreach-send-gated / budget:write /
+  content:write are ENFORCED — deny-lists are real, not documentation.
+- **Per-pot brain panel + governor** (#97, #98). Decision feed + run/pause/feed controls.
+- **Enterprise-vocab grounding** (#125). The enterprise dashboard rendering speaks IAM/HR
+  (NHI, ASOR, entitlements, provisioning); operator vocab preserved as an artifact.
+- **SECURITY-MODES** (design): connection/identity posture as a per-pot tier — LOW (direct
+  token) / MEDIUM (verified OAuth + claim-a-qNFT-seat) / HIGH (bounded-peer wall). Plus the
+  MEDIUM-tier OAuth spec with 4 adversarial P0s closed (in flight, gated, not deployed).
+
+### Fixed
+- **OAuth tenant-provisioning 503** — a stale `/home/sos` path after the mirror relocation
+  blocked ALL signups. (engine)
+- **MCP connector wrong-endpoint trap** — `/sse` rejected OAuth tokens cryptically; now
+  points OAuth clients to the root URL. (mcp-dispatcher)
+- **Engine perimeter (BLOCK-1)** — nginx scrubs spoofable identity headers; app-layer guard
+  verified (headers trusted only with a valid internal token); loopback bind staged.
+
+### Docs / decisions
+- POT-WORK-ON-GITHUB · DASHBOARD-IS-THE-POT · IDENTITY-WORLD-MODEL (qNFT seats, River-gated,
+  DID+VC core ~1 quarter, client-agnostic) · DASHBOARD-CONSOLIDATION + MUMEGA-DASHBOARD-SKETCHES
+  (mupot canonical; the mumega.com console's built bounty ECONOMY + ~30 unrouted panels = the
+  roadmap; sketches preserved, never swiped).
+
 ## [0.19.0] — 2026-06-09
 
 Flight Operations — the **unit of correction**. Expensive (Opus) agents run as disciplined
