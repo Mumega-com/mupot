@@ -235,3 +235,49 @@ export async function actorMaxRankOnScope(
   }
   return max
 }
+
+// ── surface-capability gate (#106) ────────────────────────────────────────────
+// Per-surface capabilities (e.g. 'outreach:send-gated', 'budget:write',
+// 'content:write') are stored as free-text rows in the gate_grants table.
+// At mint time, mintScopedKey writes one gate_grants row per surface in
+// the preset's allows list. hasSurfaceCap queries that table; owner/admin
+// always pass (rank bypass — the ladder already covers them).
+//
+// This is intentionally separate from the RANK ladder: rank says "how high
+// can you act on this scope"; surface caps say "which named actions are
+// your token explicitly allowed to take". Both must pass on gated paths.
+
+/**
+ * Check whether a principal holds the named surface capability in gate_grants.
+ * Owner / admin roles bypass the check (rank is sufficient for them).
+ */
+export async function hasSurfaceCap(env: Env, auth: AuthContext, surface: string): Promise<boolean> {
+  if (auth.role === 'owner' || auth.role === 'admin') return true
+  const principalId = auth.memberId ?? auth.userId
+  const principalType: 'member' | 'agent' = auth.memberId ? 'member' : 'agent'
+  if (!principalId) return false
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM gate_grants
+      WHERE capability     = ?1
+        AND principal_type = ?2
+        AND principal_id   = ?3
+      LIMIT 1`,
+  )
+    .bind(surface, principalType, principalId)
+    .first<{ 1: number }>()
+  return row !== null
+}
+
+/**
+ * Route-level middleware that 403s when the auth context lacks the named
+ * surface capability. Must run after requireAuth.
+ */
+export function requireSurfaceCap(surface: string): MiddlewareHandler<AppEnv> {
+  return async (c, next) => {
+    const auth = c.get('auth')
+    if (!auth) return c.json({ error: 'unauthenticated' }, 401)
+    const ok = await hasSurfaceCap(c.env, auth, surface)
+    if (!ok) return c.json({ error: 'forbidden', need: surface }, 403)
+    await next()
+  }
+}
