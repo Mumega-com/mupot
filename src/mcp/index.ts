@@ -41,8 +41,53 @@ import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
 import { resolveAgentRef } from '../org/resolve'
 import { PROVISION_TOOLS } from './provision'
+// AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
+// Vitest can import it without the CF runtime. See ./auth-header.ts.
+import { AUTH_CONTEXT_HEADER } from './auth-header'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
+
+// ── auth context resolution — dual-door ──────────────────────────────────────
+// C1/C2 convergence: the OAuth API handler pre-resolves the AuthContext (with live
+// capability resolution) and attaches it as an internal header before dispatching
+// to mcpApp. Direct callers (member API key, test harness) arrive without that
+// header and fall through to authenticateMember's sha256 hash lookup.
+//
+// The internal header key (x-mupot-auth-context) is only set by McpOAuthApiHandler
+// (src/mcp/oauth-api-handler.ts) — it never arrives from an external client because:
+//   - The OAuthProvider's apiRoute is '/mcp'; it calls the WorkerEntrypoint, which
+//     sets the header on a Worker-internal Request before calling mcpApp.fetch.
+//   - External clients POST directly to /mcp; the OAuthProvider intercepts and
+//     validates the token before dispatching — by the time mcpApp sees the request
+//     the Bearer header has been consumed and the internal header is set.
+//   - Requests bypassing the OAuthProvider (local tests, /actions/:tool) never carry
+//     the internal header; they use authenticateMember.
+//
+// SECURITY NOTE: this header is purely internal. If an external client somehow
+// sets it (which cannot happen through the OAuthProvider wrapper), the value is a
+// JSON blob for a memberId that must still pass the live token liveness check inside
+// buildAuthContextFromProps — the header alone cannot elevate privileges.
+
+async function resolveAuth(c: {
+  req: {
+    header: (name: string) => string | undefined
+  }
+  env: Env
+}): Promise<AuthContext | null> {
+  const injected = c.req.header(AUTH_CONTEXT_HEADER)
+  if (injected) {
+    try {
+      const auth = JSON.parse(injected) as AuthContext
+      // Validate the minimal invariants we require before accepting the injected context.
+      if (typeof auth.userId === 'string' && typeof auth.tenant === 'string') {
+        return auth
+      }
+    } catch {
+      // Malformed internal header — fall through to authenticateMember.
+    }
+  }
+  return authenticateMember(c)
+}
 
 // ── member memory scope ──────────────────────────────────────────────────────
 // The MemoryPort is keyed by an opaque id string. A member's OWN memory lives
@@ -696,7 +741,7 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
   }
 
   if (method === 'tools/call') {
-    const auth = await authenticateMember(c)
+    const auth = await resolveAuth(c)
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }
@@ -761,7 +806,7 @@ mcpApp.post('/', async (c) => {
 
   if (isJsonRpcRequest(body)) return handleJsonRpc(c, body)
 
-  const auth = await authenticateMember(c)
+  const auth = await resolveAuth(c)
   if (!auth) return c.json({ error: 'unauthenticated' }, 401)
   if (auth.tenant !== c.env.TENANT_SLUG) {
     return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)

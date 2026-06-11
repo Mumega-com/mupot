@@ -2261,6 +2261,7 @@ const CHANNEL_LABEL: Record<ConnectionChannel, string> = {
   workspace: 'workspace',
   im: 'IM',
   dashboard: 'dashboard',
+  directory: 'directory (OAuth)',
 }
 
 // ── members PAGE (GET /members) — roster + mint/revoke + show-once token ────────
