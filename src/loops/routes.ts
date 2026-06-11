@@ -62,7 +62,8 @@ loopsApp.post('/', async (c) => {
 })
 
 // GET /api/loops/:id/decisions — persisted cycle-outcome feed (S-BRAIN-CTRL-MUPOT-1 AC#3).
-// Tenant-scoped; requireAuth (read) only — no admin gate. The /brain panel calls this.
+// Admin-gated (loopsApp.use('*', requireRole('admin')) covers all routes in this app).
+// Member reads of the decision feed go through the /brain dashboard page, not this API.
 // ?limit= (max 200, default 50) ?offset= (for pagination).
 loopsApp.get('/:id/decisions', async (c) => {
   const loopId = c.req.param('id')

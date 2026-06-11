@@ -123,9 +123,21 @@ export async function runLoopCycle(
     return result
   }
 
-  // 1. inactive guard
+  // 1. inactive guard — skip appendDecision for terminal loops (done/killed).
+  // Writing an `inactive` decision row for a terminal loop every cycle creates
+  // unbounded loop_decisions growth. The driver already filters active loops, but
+  // standalone callers (tests, future batch paths) may pass a terminal manifest.
+  // Paused loops are a transient lifecycle state: they still record so the admin
+  // can see the loop is being held, but done/killed are permanent — no new rows.
+  // NOTE: a future retention sweep should purge stale rows for active loops too.
   if (loop.status !== 'active') {
-    return finish({ ok: true, decided: 'inactive', perceived: 0, acted: 0, gated: 0, kpi: 0 })
+    const isTerminal = loop.status === 'done' || loop.status === 'killed'
+    if (!isTerminal) {
+      // Paused (or unknown) — record the inactive outcome so the feed shows the hold.
+      return finish({ ok: true, decided: 'inactive', perceived: 0, acted: 0, gated: 0, kpi: 0 })
+    }
+    // Terminal: return without persisting — the loop is dead, not just quiet.
+    return { ok: true, decided: 'inactive', perceived: 0, acted: 0, gated: 0, kpi: 0 }
   }
 
   // 2. kpi-met guard

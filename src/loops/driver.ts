@@ -127,15 +127,25 @@ export async function runLoopsTick(env: Env, deps: DriverDeps = {}): Promise<Loo
             await clearControl(env, loop.id)
             errors++ // skipped cycle counts as an error
             continue
-          } else if (ctrl.action === 'budget_override' && ctrl.value !== null) {
-            const capOverride = parseInt(ctrl.value, 10)
-            if (Number.isFinite(capOverride) && capOverride >= 0) {
-              // Patch the manifest's budget cap for THIS cycle only (not persisted).
-              controlledLoop = {
-                ...loop,
-                budget: { ...loop.budget, cap_micro_usd: capOverride },
+          } else if (ctrl.action === 'budget_override') {
+            // Always clear the control row for budget_override — valid OR invalid —
+            // so a malformed value never causes the row to replay every tick.
+            // A valid positive value patches the cap for this cycle only (not persisted).
+            pendingBudgetOverride = true
+            if (ctrl.value !== null) {
+              const capOverride = parseInt(ctrl.value, 10)
+              if (Number.isFinite(capOverride) && capOverride > 0) {
+                // Patch the manifest's budget cap for THIS cycle only (not persisted).
+                controlledLoop = {
+                  ...loop,
+                  budget: { ...loop.budget, cap_micro_usd: capOverride },
+                }
+              } else {
+                // Invalid / non-positive value: clear the row and log, do not apply.
+                console.error(
+                  `[loops/driver] budget_override on loop ${loop.id} has invalid value (${JSON.stringify(ctrl.value)}); cleared without applying.`,
+                )
               }
-              pendingBudgetOverride = true
             }
           }
         }
