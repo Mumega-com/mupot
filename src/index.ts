@@ -2,10 +2,20 @@
 // the prefixes in ROUTES (src/types.ts). Components are built independently and
 // register here. The Durable Object classes are re-exported for the runtime.
 //
+// S-MUPOT-OAUTH: The root Hono app is wrapped with OAuthProvider. The provider:
+//   - Serves /.well-known/oauth-authorization-server and /.well-known/oauth-protected-resource
+//     automatically (ahead of the dashboardApp '/' catch-all).
+//   - Handles /token and /register automatically.
+//   - Intercepts POST /mcp with a valid OAuth token → McpOAuthApiHandler.
+//   - Intercepts POST /mcp with a non-OAuth bearer → resolveExternalToken (member API key).
+//   - Falls through everything else to the root Hono app (defaultHandler).
+// /authorize is mounted EXPLICITLY before the dashboardApp catch-all (line ~75).
+//
 // Subagents: implement your component as a Hono sub-app exported from its folder,
 // then mount it below. Do NOT change other components' mounts.
 
 import { Hono } from 'hono'
+import { OAuthProvider } from '@cloudflare/workers-oauth-provider'
 import type { Env } from './types'
 import { ROUTES } from './types'
 
@@ -29,6 +39,8 @@ import { loopsApp } from './loops/routes'
 import { fleetCheckinApp } from './fleet/checkin-routes'
 import { flightsApp } from './flight/routes'
 import { orientApp } from './orient/routes'
+import { handleOAuthAuthorize, resolveExternalToken as memberKeyResolver } from './mcp/oauth-authorize'
+import { McpOAuthApiHandler } from './mcp/oauth-api-handler'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -36,6 +48,8 @@ export { SquadCoordinatorDO } from './agents/squad-do'
 // Workflow class — the CF Workflows runtime discovers it via this named export.
 // The class_name in [[workflows]] must match: "TaskWorkflow".
 export { TaskWorkflow } from './workflows/task-workflow'
+// OAuth API handler WorkerEntrypoint — referenced by the OAuthProvider's apiHandler.
+export { McpOAuthApiHandler }
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -72,7 +86,63 @@ app.route('/api/flights', flightsApp)
 // Orient seam (#digid-hybrid S1): an agent reads its basin-drop packet; the mind pushes
 // per-agent field state inbound. Before the '/' catch-all. See docs/superpowers/specs.
 app.route('/api/orient', orientApp)
+
+// ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
+// /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp
+// '/' catch-all so they are not shadowed by the Coming-Soon page.
+// /token, /register, /.well-known/* are auto-served by the OAuthProvider wrapper —
+// they never reach this Hono app (the OAuthProvider intercepts them first).
+app.all('/authorize', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
+app.all('/oauth/google-callback', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
+
 app.route(ROUTES.dashboard, dashboardApp)
+
+// ── OAuthProvider wrapper (S-MUPOT-OAUTH) ────────────────────────────────────
+// The provider wraps the root Hono app as the defaultHandler. Paths it auto-handles:
+//   /.well-known/oauth-authorization-server  (auto-synthesized from config)
+//   /.well-known/oauth-protected-resource    (auto-synthesized from config)
+//   /token                                   (auto-handled: code exchange, refresh)
+//   /register                                (auto-handled: DCR RFC 7591)
+//
+// apiRoute: ['/mcp'] — only the MCP endpoint is OAuth-protected. All other paths
+// fall through to defaultHandler (the Hono app above). This ensures:
+//   - /health, /api/fleet, /actions/:tool, /openapi.json all bypass OAuth.
+//   - POST /mcp with a valid OAuth token → McpOAuthApiHandler.
+//   - POST /mcp with a non-OAuth bearer → resolveExternalToken (member API key path).
+//
+// C8: OAUTH_KV binding declared in wrangler.toml [[kv_namespaces]] binding="OAUTH_KV"
+const oauthProvider = new OAuthProvider<Env>({
+  apiRoute: ['/mcp'],
+  apiHandler: McpOAuthApiHandler,
+
+  // All non-OAuth paths fall through to the root Hono app.
+  defaultHandler: {
+    fetch: (req: Request, env: Env, ctx: ExecutionContext) => app.fetch(req, env, ctx),
+  },
+
+  // PKCE: S256 only (LOCK-OAuth-A parity with mumega).
+  allowPlainPKCE: false,
+  allowImplicitFlow: false,
+
+  // Path-only specs so origin auto-resolves from the request URL.
+  authorizeEndpoint: '/authorize',
+  tokenEndpoint: '/token',
+  clientRegistrationEndpoint: '/register',
+
+  scopesSupported: ['mcp:read', 'mcp:write'],
+
+  // Token TTLs (matching mumega).
+  refreshTokenTTL: 2592000,  // 30 days
+  accessTokenTTL: 3600,      // 1 hour
+
+  // C1: resolveExternalToken — for a bearer the OAuthProvider doesn't own (member
+  // API key), run the authenticateMember-equivalent lookup (sha256 → member_tokens
+  // WHERE revoked_at IS NULL → active member check) and return {props} on success.
+  // The OAuthProvider calls this only when its internal KV lookup returns nothing.
+  resolveExternalToken: async ({ token, env }) => {
+    return memberKeyResolver(env as Env, token)
+  },
+})
 
 // Queue consumer — the bus component owns the handler.
 import { handleQueue } from './bus/consumer'
@@ -81,7 +151,13 @@ import { runMetabolism } from './agents/metabolism'
 import { runLoopsTick } from './loops/driver'
 
 export default {
-  fetch: app.fetch,
+  // The OAuth provider is the outer entry point. It handles OAuth paths and
+  // dispatches authenticated /mcp requests to McpOAuthApiHandler. Everything
+  // else falls through to the root Hono app via defaultHandler.
+  fetch: (req: Request, env: Env, ctx: ExecutionContext) =>
+    oauthProvider.fetch(req, env, ctx),
+
+  // Queue and scheduled handlers are preserved unchanged (spec §A.2).
   queue: handleQueue,
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     // Three independent heartbeats on the same cron:

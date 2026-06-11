@@ -13,6 +13,10 @@ OAUTH_PROVIDER = "google"         # google | telegram
 FLEET_PROJECT = "sos"             # bus project the fleet window addresses (company fleet = sos, not the mumega slug)
 FLEET_OPS_AGENT = "kasra"         # ops agent that executes control requests (explicit — resolvers fail closed, no code default)
 # secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN
+# OAuth 2.1 Google IdP secrets (deploy prerequisites — set before live-flip, Hadi approval required):
+#   npx wrangler secret put GOOGLE_CLIENT_ID          # Google OAuth app client ID
+#   npx wrangler secret put GOOGLE_CLIENT_SECRET      # Google OAuth app client secret
+# Register redirect URI in Google Cloud Console: https://mupot.mumega.com/oauth/google-callback
 
 # ── memory: D1 (relational org + engram metadata) ──
 [[d1_databases]]
@@ -41,6 +45,16 @@ dead_letter_queue = "mupot-events-dlq"
 [[kv_namespaces]]
 binding = "SESSIONS"
 id = "e23beb9039474803b993f5032aa0ac07"
+
+# ── OAuth 2.1 state (clients, grants, tokens) ──
+# Dedicated namespace so OAuth token lifecycle (TTL, rotation, revocation)
+# is isolated from sessions. Used by @cloudflare/workers-oauth-provider.
+# Deploy prerequisite (C8):
+#   npx wrangler kv namespace create OAUTH_KV --account-id e39eaf94
+#   then replace the id placeholder below with the output namespace id.
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "c801989183744579bb61283b002cadee"
 
 # ── blobs ──
 [[r2_buckets]]

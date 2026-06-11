@@ -45,6 +45,10 @@ export interface Env {
   VEC: VectorizeIndex
   BUS: Queue<BusEvent>
   SESSIONS: KVNamespace
+  // OAuth 2.1 state (clients, grants, tokens) — separate lifecycle from sessions.
+  // The @cloudflare/workers-oauth-provider library reads/writes this KV namespace.
+  // Declared in [[kv_namespaces]] binding="OAUTH_KV" in wrangler.toml.
+  OAUTH_KV: KVNamespace
   BLOBS: R2Bucket
   AI: Ai
   AGENT: DurableObjectNamespace
@@ -73,6 +77,11 @@ export interface Env {
   // secrets (present at runtime only)
   OAUTH_CLIENT_ID?: string
   OAUTH_CLIENT_SECRET?: string
+  // OAuth 2.1 Google IdP secrets — set via `wrangler secret put`, never in .toml.
+  // Deploy prerequisites: npx wrangler secret put GOOGLE_CLIENT_ID
+  //                       npx wrangler secret put GOOGLE_CLIENT_SECRET
+  GOOGLE_CLIENT_ID?: string
+  GOOGLE_CLIENT_SECRET?: string
   BUS_TOKEN?: string
   GITHUB_TOKEN?: string // outbound: tasks↔issues mirror (fine-grained PAT or App install token)
   GITHUB_REPO?: string // "owner/repo" the pot weaves to (e.g. "Digidinc/Digid")
@@ -227,7 +236,11 @@ export interface Member {
   created_at: string
 }
 
-export type ConnectionChannel = 'workspace' | 'im' | 'dashboard'
+// 'directory' is the OAuth 2.1 door — a seat that connected via the /authorize
+// flow (ChatGPT, Claude, directory listings). Kept distinct from 'dashboard' (web
+// login) and 'workspace' (API key) so the operator roster and revocation-by-channel
+// paths stay legible. Added in migration 0020_oauth_channel.sql.
+export type ConnectionChannel = 'workspace' | 'im' | 'dashboard' | 'directory'
 
 // A scoped, revocable token a member puts in their workspace .mcp.json (or that
 // Hermes holds to act for IM members). Stored hashed, like the SOS bus model.

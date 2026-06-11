@@ -13,6 +13,7 @@
     "migrate:remote": "wrangler d1 migrations apply mupot --remote"
   },
   "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.4.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "agents": "^0.14.5",
     "hono": "^4.6.0"
