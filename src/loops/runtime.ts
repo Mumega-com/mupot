@@ -20,6 +20,7 @@ import type { ResolvedResource, ResourceItem } from './resources'
 import { checkAndReserve, recordTokens } from '../agents/meter'
 import { costMicroUsd } from '../agents/cost'
 import { LOOP_PLANNING_MAX_TOKENS } from '../agents/loop'
+import { appendLoopDecision } from './decisions'
 
 // ── results ─────────────────────────────────────────────────────────────────────
 
@@ -73,6 +74,13 @@ export interface RuntimeDeps {
   /** Observe the outcome KPI (0..100). Default = 0 (a real signal lands in P3). */
   observeKpi?: (env: Env, loop: LoopManifest) => Promise<number>
   model?: ModelPort
+  /**
+   * Persist the cycle outcome (S-BRAIN-CTRL-MUPOT-1 AC#2). Default: appendLoopDecision.
+   * cycleNum is passed in from the caller (driver tracks it). Injectable for tests.
+   */
+  appendDecision?: (env: Env, loopId: string, cycleNum: number, result: LoopCycleResult) => Promise<void>
+  /** Cycle number for this call — used by appendDecision. Default: 0 (driver sets this). */
+  cycleNum?: number
 }
 
 // effort → how many acts the loop may produce per cycle (mirrors agents/loop.ts).
@@ -101,21 +109,35 @@ export async function runLoopCycle(
   const queueGatedAct = deps.queueGatedAct ?? defaultQueueGatedAct
   const observeKpi = deps.observeKpi ?? (async () => 0)
 
+  // AC#2 (S-BRAIN-CTRL-MUPOT-1): every exit path persists the cycle outcome.
+  // appendDecision is injectable so tests can verify writes without a real D1.
+  // cycleNum comes from the driver; defaults to 0 when called standalone.
+  const appendDecision = deps.appendDecision ?? appendLoopDecision
+  const cycleNum = deps.cycleNum ?? 0
+  async function finish(result: LoopCycleResult): Promise<LoopCycleResult> {
+    try {
+      await appendDecision(env, loop.id, cycleNum, result)
+    } catch {
+      // persistence is best-effort; never fail the cycle result
+    }
+    return result
+  }
+
   // 1. inactive guard
   if (loop.status !== 'active') {
-    return { ok: true, decided: 'inactive', perceived: 0, acted: 0, gated: 0, kpi: 0 }
+    return finish({ ok: true, decided: 'inactive', perceived: 0, acted: 0, gated: 0, kpi: 0 })
   }
 
   // 2. kpi-met guard
   const kpiBefore = clampKpi(await observeKpi(env, loop))
   if (kpiBefore >= 100) {
-    return { ok: true, decided: 'kpi-met', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore }
+    return finish({ ok: true, decided: 'kpi-met', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore })
   }
 
   // The meter is per-subject; a loop is owned by exactly one work-unit.
   const subjectId = loop.agent_id ?? loop.squad_id
   if (!subjectId) {
-    return { ok: false, decided: 'inactive', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore, error: 'loop_has_no_owner' }
+    return finish({ ok: false, decided: 'inactive', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore, error: 'loop_has_no_owner' })
   }
 
   const effort = loop.budget.effort ?? 'standard'
@@ -133,12 +155,12 @@ export async function runLoopCycle(
   if (!meterResult.ok) {
     const decided: LoopDecided =
       meterResult.reason === 'budget_cap_exceeded' ? 'budget_exhausted' : 'rate_limited'
-    return { ok: false, decided, perceived: 0, acted: 0, gated: 0, kpi: kpiBefore, error: meterResult.reason }
+    return finish({ ok: false, decided, perceived: 0, acted: 0, gated: 0, kpi: kpiBefore, error: meterResult.reason })
   }
 
   // effort=low ⇒ observe-only: no perceive/reason/act, just KPI tracking.
   if (actBudget === 0) {
-    return { ok: true, decided: 'dry', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore }
+    return finish({ ok: true, decided: 'dry', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore })
   }
 
   // 4. perceive — read every bound source; tolerate a failing source (skip it).
@@ -153,7 +175,7 @@ export async function runLoopCycle(
     }
   }
   if (context.length === 0) {
-    return { ok: true, decided: 'dry', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore }
+    return finish({ ok: true, decided: 'dry', perceived: 0, acted: 0, gated: 0, kpi: kpiBefore })
   }
 
   // 5. reason — propose acts (bounded by effort).
@@ -162,7 +184,7 @@ export async function runLoopCycle(
     proposed = (await reason(env, { loop, context, budget: actBudget })).slice(0, actBudget)
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'reason_failed'
-    return { ok: false, decided: 'dry', perceived: context.length, acted: 0, gated: 0, kpi: kpiBefore, error: msg }
+    return finish({ ok: false, decided: 'dry', perceived: context.length, acted: 0, gated: 0, kpi: kpiBefore, error: msg })
   }
 
   // 6. act — the GATE DECISION IS STRUCTURAL HERE, not delegated to a seam: a gated
@@ -196,7 +218,7 @@ export async function runLoopCycle(
   const kpiAfter = clampKpi(await observeKpi(env, loop))
 
   const decided: LoopDecided = acted > 0 ? 'acted' : gated > 0 ? 'gated_pending' : 'dry'
-  return { ok: true, decided, perceived: context.length, acted, gated, kpi: kpiAfter }
+  return finish({ ok: true, decided, perceived: context.length, acted, gated, kpi: kpiAfter })
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
