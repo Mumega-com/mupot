@@ -211,14 +211,26 @@ dashboardApp.post('/brain/loops/:id/control', async (c) => {
     return c.json({ error: 'invalid_action', accepted: ['pause', 'kill', 'budget_override'] }, 400)
   }
 
+  // budget_override validation (fix: value<=0 inverts to UNLIMITED in the meter,
+  // because meter.ts only applies the cap when budgetCapMicroUsd > 0). Reject
+  // non-numeric, NaN, and any value <= 0 — the caller intends a cap, not a removal.
+  // Use pause/kill to stop a loop; budget_override is strictly a positive cap clamp.
+  if (body.action === 'budget_override') {
+    if (typeof body.value !== 'string') {
+      return c.json({ error: 'budget_override requires value (micro-USD integer string)' }, 400)
+    }
+    const parsed = parseInt(body.value, 10)
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return c.json({
+        error: 'budget_override value must be a positive integer (micro-USD). Use pause or kill to stop a loop.',
+      }, 400)
+    }
+  }
+
   const value =
     body.action === 'budget_override' && typeof body.value === 'string'
       ? body.value
       : null
-
-  if (body.action === 'budget_override' && value === null) {
-    return c.json({ error: 'budget_override requires value (micro-USD integer string)' }, 400)
-  }
 
   await setLoopControl(c.env, loopId, body.action, auth.email ?? auth.userId, value)
   return c.json({ ok: true, action: body.action, loop_id: loopId })

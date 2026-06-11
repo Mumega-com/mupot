@@ -405,3 +405,164 @@ describe('(d) non-admin governor write 403s', () => {
     expect(body.action).toBe('pause')
   })
 })
+
+// ── (e) budget_override ≤ 0 → 400 ───────────────────────────────────────────
+// Fix 1: a budget_override value of 0 (or any non-positive integer) must be
+// REJECTED at the route with a 400. Passing 0 through would remove the cap in
+// meter.ts (it only enforces when budgetCapMicroUsd > 0), opposite of intent.
+
+describe('(e) budget_override <= 0 → 400', () => {
+  function envForAdmin() {
+    const loopRow = {
+      id: 'testloop', tenant: 't', squad_id: null, agent_id: 'a1', status: 'active',
+      spec: JSON.stringify({
+        agent_id: 'a1', squad_id: null,
+        okr: 'grow', kpi: { signal: 'x', target: 5 },
+        sources: [], channels: [], gate: { require_approval: false },
+        budget: {}, cadence: {}, stop: {},
+      }),
+      dry_rounds: 0, created_at: 'x', updated_at: 'x',
+    }
+    const firstResponses = [loopRow]
+    let firstIdx = 0
+    const stmt = {
+      bind: (..._args: unknown[]) => stmt,
+      first: vi.fn(async () => firstResponses[firstIdx++] ?? null),
+      all: vi.fn(async () => ({ results: [] })),
+      run: vi.fn(async () => ({ meta: { changes: 1 } })),
+    }
+    return {
+      TENANT_SLUG: 't',
+      BRAND: 'Test',
+      DB: { prepare: vi.fn(() => stmt) },
+      SESSIONS: {
+        get: vi.fn(async () => JSON.stringify({
+          userId: 'u1', email: 'admin@test.com', role: 'admin', createdAt: '2026-01-01T00:00:00Z',
+        })),
+      },
+      OAUTH_KV: { get: vi.fn(), put: vi.fn() },
+    } as unknown as Env & { TENANT_SLUG: string; BRAND: string }
+  }
+
+  async function postControl(env: Env & { TENANT_SLUG: string; BRAND: string }, body: unknown) {
+    return dashboardApp.fetch(
+      new Request('https://pot.test/brain/loops/testloop/control', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: 'mupot_session=sess1',
+          Origin: 'https://pot.test',
+        },
+        body: JSON.stringify(body),
+      }),
+      env,
+    )
+  }
+
+  it('budget_override with value "0" → 400', async () => {
+    const res = await postControl(envForAdmin(), { action: 'budget_override', value: '0' })
+    expect(res.status).toBe(400)
+    const body = await res.json() as { error: string }
+    expect(body.error).toMatch(/positive/)
+  })
+
+  it('budget_override with negative value → 400', async () => {
+    const res = await postControl(envForAdmin(), { action: 'budget_override', value: '-1000' })
+    expect(res.status).toBe(400)
+    const body = await res.json() as { error: string }
+    expect(body.error).toMatch(/positive/)
+  })
+
+  it('budget_override with non-numeric string → 400', async () => {
+    const res = await postControl(envForAdmin(), { action: 'budget_override', value: 'unlimited' })
+    expect(res.status).toBe(400)
+    const body = await res.json() as { error: string }
+    expect(body.error).toMatch(/positive/)
+  })
+
+  it('budget_override with valid positive value → 200', async () => {
+    const res = await postControl(envForAdmin(), { action: 'budget_override', value: '500000' })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { ok: boolean }
+    expect(body.ok).toBe(true)
+  })
+})
+
+// ── (f) invalid budget_override clears the control row ───────────────────────
+// Fix 2: a non-numeric/NaN budget_override value in the loop_controls table must
+// always trigger clearControl (to drain the stuck row) and must NOT apply any cap.
+
+describe('(f) invalid budget_override clears control row without applying cap', () => {
+  const ENV_F = { TENANT_SLUG: 't' } as unknown as Env
+
+  function makeDriverLoop(id: string): LoopManifest {
+    return {
+      id, tenant: 't', squad_id: null, agent_id: 'a-' + id, status: 'active',
+      okr: 'grow', kpi: { signal: 'x', target: 5 },
+      sources: [], channels: [], gate: { require_approval: true },
+      budget: { cap_micro_usd: 1_000_000 }, cadence: { heartbeat: true }, stop: {}, created_at: 'x',
+    }
+  }
+
+  it('invalid (NaN) budget_override value: clearControl is called, cycle runs with original cap', async () => {
+    const loop = makeDriverLoop('loop-f1')
+    const list = vi.fn(async () => [loop])
+
+    let capturedLoop: LoopManifest | null = null
+    const runCycle = vi.fn(async (_, l: LoopManifest) => {
+      capturedLoop = l
+      return { ok: true, decided: 'acted' as const, perceived: 1, acted: 1, gated: 0, kpi: 0 }
+    })
+
+    const clearControl = vi.fn(async () => {})
+    const ctrlRow: LoopControlRow = {
+      loop_id: 'loop-f1', tenant: 't', action: 'budget_override',
+      value: 'NaN-invalid', issued_by: 'admin1', issued_at: '2026-06-11T00:00:00Z',
+    }
+    const readControl = vi.fn(async () => ctrlRow)
+
+    const r = await runLoopsTick(ENV_F, {
+      list, runCycle, readControl, clearControl,
+      bumpDry: vi.fn(async () => 0),
+      resetDry: vi.fn(async () => {}),
+      pause: vi.fn(async () => true),
+    })
+
+    // clearControl must have been called even though the value was invalid.
+    expect(clearControl).toHaveBeenCalledWith(ENV_F, 'loop-f1')
+    // The cycle must still have run.
+    expect(runCycle).toHaveBeenCalledTimes(1)
+    expect(r.ran).toBe(1)
+    // The loop's original cap must be intact (not patched to NaN).
+    expect(capturedLoop?.budget.cap_micro_usd).toBe(1_000_000)
+  })
+
+  it('zero budget_override: clearControl is called, cap is NOT applied (0 would remove it)', async () => {
+    const loop = makeDriverLoop('loop-f2')
+    const list = vi.fn(async () => [loop])
+
+    let capturedLoop: LoopManifest | null = null
+    const runCycle = vi.fn(async (_, l: LoopManifest) => {
+      capturedLoop = l
+      return { ok: true, decided: 'acted' as const, perceived: 1, acted: 1, gated: 0, kpi: 0 }
+    })
+
+    const clearControl = vi.fn(async () => {})
+    const ctrlRow: LoopControlRow = {
+      loop_id: 'loop-f2', tenant: 't', action: 'budget_override',
+      value: '0', issued_by: 'admin1', issued_at: '2026-06-11T00:00:00Z',
+    }
+    const readControl = vi.fn(async () => ctrlRow)
+
+    await runLoopsTick(ENV_F, {
+      list, runCycle, readControl, clearControl,
+      bumpDry: vi.fn(async () => 0),
+      resetDry: vi.fn(async () => {}),
+      pause: vi.fn(async () => true),
+    })
+
+    expect(clearControl).toHaveBeenCalledWith(ENV_F, 'loop-f2')
+    // Original cap preserved — 0 was NOT applied.
+    expect(capturedLoop?.budget.cap_micro_usd).toBe(1_000_000)
+  })
+})
