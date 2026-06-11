@@ -217,3 +217,35 @@ describe('runLoopCycle — structural gate (cannot be bypassed)', () => {
     expect(channelAct).toHaveBeenCalledWith('send_email', { to: 'x' })
   })
 })
+
+// ── Fix 3: terminal loops do NOT write a loop_decisions row ──────────────────
+// runLoopCycle on a 'done' or 'killed' loop must return inactive WITHOUT calling
+// appendDecision. Otherwise every driver tick (or standalone call) on a terminal
+// loop writes an unbounded stream of `inactive` decision rows.
+
+describe('runLoopCycle — terminal loops do not persist inactive decisions', () => {
+  it('done loop: decided=inactive, appendDecision NOT called', async () => {
+    const appendDecision = vi.fn(async () => {})
+    const r = await runLoopCycle(ENV, makeLoop({ status: 'done' }), { appendDecision })
+    expect(r.decided).toBe('inactive')
+    expect(r.ok).toBe(true)
+    expect(appendDecision).not.toHaveBeenCalled()
+  })
+
+  it('killed loop: decided=inactive, appendDecision NOT called', async () => {
+    const appendDecision = vi.fn(async () => {})
+    const r = await runLoopCycle(ENV, makeLoop({ status: 'killed' }), { appendDecision })
+    expect(r.decided).toBe('inactive')
+    expect(r.ok).toBe(true)
+    expect(appendDecision).not.toHaveBeenCalled()
+  })
+
+  it('paused loop (transient, not terminal): appendDecision IS called', async () => {
+    const appendDecision = vi.fn(async () => {})
+    const r = await runLoopCycle(ENV, makeLoop({ status: 'paused' }), { appendDecision, cycleNum: 1 })
+    expect(r.decided).toBe('inactive')
+    // Paused is a transient hold — the admin can see the loop is waiting.
+    expect(appendDecision).toHaveBeenCalledTimes(1)
+    expect(appendDecision.mock.calls[0][3].decided).toBe('inactive')
+  })
+})
