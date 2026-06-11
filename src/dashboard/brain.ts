@@ -3,7 +3,10 @@
 // Renders:
 //   1. Decision feed — cycle outcomes from loop_decisions (newest-first).
 //   2. Governor controls — pause / resume / kill per loop + budget override.
-//      Writes are isAdmin-gated (AC#7). Reads are requireAuth only.
+//      Writes are isAdmin-gated (AC#7).
+//      The /brain dashboard page is requireAuth-gated (any authenticated pot member
+//      can view the feed). The API route GET /api/loops/:id/decisions is admin-gated
+//      via loopsApp.use('*', requireRole('admin')) — member reads go through this page.
 //
 // This module is the data layer + HTML body only. The route wiring and admin
 // gate live in dashboard/index.ts. All writes go through EXISTING endpoints:
