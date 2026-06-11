@@ -1,0 +1,27 @@
+-- mupot — surface-capability enforcement (#106).
+--
+-- No new tables are required. The gate_grants table (migration 0008) stores
+-- (capability, principal_type, principal_id) rows where `capability` is a
+-- free-text string. Migration 0008 created this table for gate strings like
+-- 'gate:loops'. This migration documents that the SAME table now stores surface
+-- capability grants written at preset-mint time (e.g. 'outreach:send-gated',
+-- 'budget:write', 'content:write').
+--
+-- At mint time, mintScopedKey (src/dashboard/keys.ts) writes one gate_grants row
+-- per entry in the preset's allows list. requireSurfaceCap (src/auth/capability.ts)
+-- checks those rows at the route level. No schema change is needed — the existing
+-- UNIQUE(capability, principal_type, principal_id) constraint and the
+-- idx_gate_grants_principal index already cover this use case efficiently.
+--
+-- Surface caps enforced as of this migration:
+--   outreach:send-gated  POST /api/tasks/:id/verdict (when gate_owner='gate:loops', verdict=approved)
+--   content:write        POST /brain/loops/:id/control (all actions for non-admin tokens)
+--   budget:write         POST /brain/loops/:id/control (budget_override action only)
+--
+-- Surface cap documented but not yet wired to a route (no HTTP handler exists yet):
+--   mcpwp:write          future /api/integrations/mcpwp/* write routes
+
+-- No DDL needed — gate_grants already supports arbitrary capability strings.
+-- This file exists as a migration record so wrangler d1 migrations apply/list
+-- tracks the feature introduction date and this PR's enforcement contract.
+SELECT 1; -- intentional no-op DDL so wrangler accepts this as a valid migration.

@@ -8,23 +8,25 @@
 //   - denylist: capabilities explicitly NOT granted (blast-radius documentation
 //     for the admin minting the key).
 //
-// ENFORCEMENT STATUS (read this before shipping a key):
+// ENFORCEMENT STATUS (updated #106):
 //
-//   The current capability system is RANK-ONLY on the 5-level ladder
-//   (owner/admin/lead/member/observer). The `capabilities` table stores (scope,
-//   rank) pairs — NOT a list of surface names like "outreach:send-gated". A
-//   token minted from these presets IS correctly scoped (e.g. squad-scoped
-//   member cannot touch org-level paths) and IS correctly ranked, BUT the
-//   per-surface deny list below (e.g. "no mcpwp:write") is DOCUMENTATION ONLY
-//   today — there is no route-level gate that reads the allowlist/denylist.
-//   A sales-rep token is rank=member + scope=squad:sales; any route that checks
-//   `hasCapability(grants, 'org', null, 'admin')` will correctly deny it.
-//   Routes that do NOT call `requireCapability` at all (non-gated surfaces) are
-//   accessible to any authenticated member regardless of preset.
+//   Rank ladder (observer/member/lead/admin/owner) is enforced server-side via
+//   requireCapability and requireOrgCapability middlewares.
 //
-//   Follow-up required (note this PR): add `requireCapability` gates on
-//   outreach:send, mcpwp:write, budget:write, and provision paths so the
-//   ALLOW/DENY lists below become real enforcement, not policy comments.
+//   Per-surface caps (the allows/denies lists below) are now ENFORCED (#106):
+//   - At mint time, mintScopedKey writes one gate_grants row per entry in
+//     preset.allows (INSERT OR IGNORE — idempotent on re-mint).
+//   - hasSurfaceCap/requireSurfaceCap read those rows at route-level gates.
+//   - Owner/admin tokens bypass hasSurfaceCap (rank is sufficient for them).
+//
+//   Surfaces enforced as of PR #106:
+//     outreach:send-gated  → POST /api/tasks/:id/verdict (gate:loops, approve)
+//     content:write        → POST /brain/loops/:id/control (all actions)
+//     budget:write         → POST /brain/loops/:id/control (budget_override only)
+//
+//   Gap (no route exists yet):
+//     mcpwp:write          → no mcpwp write route in this codebase; requireSurfaceCap
+//                            ready to wire when the route lands.
 //
 // Adding a preset: add a new entry below; pick the tightest rank + scope.
 // Removing a preset: mark deprecated; do not delete (existing tokens reference

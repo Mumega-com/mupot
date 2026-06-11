@@ -22,7 +22,7 @@ import { requireAuth } from '../auth'
 // Fine-grained RBAC. Creating/mutating/assigning a task requires member+ on the
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
-import { resolveCapabilities, hasCapability } from '../auth/capability'
+import { resolveCapabilities, hasCapability, hasSurfaceCap } from '../auth/capability'
 import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate } from './service'
 import type { TaskStatus } from './service'
 import { createBus } from '../bus'
@@ -522,6 +522,17 @@ tasksApp.post('/:id/verdict', async (c) => {
   const hasGate = await callerHoldsGateCapability(c.env, auth, task.squad_id, task.gate_owner)
   if (!hasGate) {
     return c.json({ error: 'forbidden', need: task.gate_owner }, 403)
+  }
+
+  // Surface-cap gate (#106): approving a gate:loops task (outreach queue) requires
+  // outreach:send-gated. A member token without this surface grant cannot fire a
+  // GHL send even if they hold gate:loops. Reject path is not gated — rejections
+  // do not send anything.
+  if (task.gate_owner === 'gate:loops' && body.verdict === 'approved') {
+    const hasSend = await hasSurfaceCap(c.env, auth, 'outreach:send-gated')
+    if (!hasSend) {
+      return c.json({ error: 'forbidden', need: 'outreach:send-gated' }, 403)
+    }
   }
 
   // K4: self-verdict prevention.

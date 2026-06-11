@@ -217,6 +217,23 @@ export async function mintScopedKey(env: Env, params: MintParams): Promise<MintR
       .run()
   }
 
+  // 4b. Write gate_grants rows for every surface in preset.allows (#106).
+  //     These are what hasSurfaceCap checks at route-level gates (e.g. the
+  //     outreach:send-gated check on the verdict endpoint for gate:loops tasks).
+  //     INSERT OR IGNORE ensures idempotency on re-mint — re-issuing a key for
+  //     the same member does not duplicate rows (UNIQUE constraint on capability +
+  //     principal_type + principal_id in gate_grants).
+  const grantedAt = new Date().toISOString()
+  for (const surface of preset.allows) {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO gate_grants
+         (id, capability, principal_type, principal_id, granted_by, created_at)
+       VALUES (?1, ?2, 'member', ?3, 'preset-mint', ?4)`,
+    )
+      .bind(crypto.randomUUID(), surface, memberId, grantedAt)
+      .run()
+  }
+
   // 5. Mint a member_token. Label encodes the preset + scope for the audit trail.
   //    The `[preset:<id>]` prefix is what loadKeysView uses to list scoped keys.
   const scopeLabel = resolvedScopeId ? `:${resolvedScopeId}` : ''

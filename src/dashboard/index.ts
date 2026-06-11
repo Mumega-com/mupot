@@ -42,7 +42,7 @@ import { requireAuth } from '../auth'
 // Fine-grained RBAC — the dashboard's mutating handlers reuse the SAME gates the
 // JSON API uses (admin on org for tokens / departments; admin on the department for
 // a squad; lead on the squad for an agent). Identity is always server-derived.
-import { resolveCapabilities, hasCapability, actorMaxRankOnScope } from '../auth/capability'
+import { resolveCapabilities, hasCapability, actorMaxRankOnScope, hasSurfaceCap } from '../auth/capability'
 
 // Shared creation paths — the dashboard handlers call the SAME service functions
 // the /api routes call, never re-implementing the write/validation logic.
@@ -196,14 +196,23 @@ dashboardApp.get('/brain', async (c) => {
   return c.html(shell(c.env.BRAND, 'Brain', brainBody(view, isAdmin(auth))))
 })
 
-// POST /brain/loops/:id/control — governor control signal (isAdmin-gated, AC#7).
+// POST /brain/loops/:id/control — governor control signal.
+// Surface-cap gated (#106): non-admin callers need content:write for any action,
+// plus budget:write for budget_override. Admin/owner bypass via hasSurfaceCap.
 // Writes a loop_controls row; the driver picks it up on the next heartbeat cycle.
 // Accepted actions: pause | kill | budget_override
 // For budget_override: body must include value (micro-USD integer as string).
 // For pause/kill: value is ignored.
 dashboardApp.post('/brain/loops/:id/control', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+
+  // Surface-cap gate (#106): any loop control action requires content:write.
+  // Admin/owner tokens pass via hasSurfaceCap bypass (rank is sufficient).
+  // Non-admin members must hold an explicit content:write grant in gate_grants.
+  if (!isAdmin(auth)) {
+    const hasContentWrite = await hasSurfaceCap(c.env, auth, 'content:write')
+    if (!hasContentWrite) return c.json({ error: 'forbidden', need: 'content:write' }, 403)
+  }
 
   const loopId = c.req.param('id')
   if (!loopId || loopId.length > 64) return c.json({ error: 'invalid_loop_id' }, 400)
@@ -223,11 +232,17 @@ dashboardApp.post('/brain/loops/:id/control', async (c) => {
     return c.json({ error: 'invalid_action', accepted: ['pause', 'kill', 'budget_override'] }, 400)
   }
 
-  // budget_override validation (fix: value<=0 inverts to UNLIMITED in the meter,
-  // because meter.ts only applies the cap when budgetCapMicroUsd > 0). Reject
-  // non-numeric, NaN, and any value <= 0 — the caller intends a cap, not a removal.
-  // Use pause/kill to stop a loop; budget_override is strictly a positive cap clamp.
+  // budget_override requires budget:write in addition to content:write.
+  // Admin/owner bypass again via hasSurfaceCap.
   if (body.action === 'budget_override') {
+    if (!isAdmin(auth)) {
+      const hasBudgetWrite = await hasSurfaceCap(c.env, auth, 'budget:write')
+      if (!hasBudgetWrite) return c.json({ error: 'forbidden', need: 'budget:write' }, 403)
+    }
+    // budget_override validation (fix: value<=0 inverts to UNLIMITED in the meter,
+    // because meter.ts only applies the cap when budgetCapMicroUsd > 0). Reject
+    // non-numeric, NaN, and any value <= 0 — the caller intends a cap, not a removal.
+    // Use pause/kill to stop a loop; budget_override is strictly a positive cap clamp.
     if (typeof body.value !== 'string') {
       return c.json({ error: 'budget_override requires value (micro-USD integer string)' }, 400)
     }
