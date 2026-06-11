@@ -42,7 +42,7 @@ import { requireAuth } from '../auth'
 // Fine-grained RBAC — the dashboard's mutating handlers reuse the SAME gates the
 // JSON API uses (admin on org for tokens / departments; admin on the department for
 // a squad; lead on the squad for an agent). Identity is always server-derived.
-import { resolveCapabilities, hasCapability } from '../auth/capability'
+import { resolveCapabilities, hasCapability, actorMaxRankOnScope } from '../auth/capability'
 
 // Shared creation paths — the dashboard handlers call the SAME service functions
 // the /api routes call, never re-implementing the write/validation logic.
@@ -583,15 +583,24 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
     )
   }
 
+  // Resolve the minter's effective rank on the org scope.
+  // actorMaxRankOnScope combines the coarse org role (owner=5, admin=4) with any
+  // fine-grained capability grants the minter holds.  This is the authoritative
+  // ceiling passed to mintScopedKey for the rank-ceiling check.
+  const minterRank = await actorMaxRankOnScope(c, 'org', null)
+
   const result = await mintScopedKey(c.env, {
     memberId: memberIdRaw,
     presetId: presetIdRaw,
     scopeId: scopeIdRaw || null,
+    minterRank,
   })
 
   if (!result.ok) {
     const view = await loadKeysView(c.env)
-    const msg = result.error === 'member_not_found'
+    const msg = result.error === 'rank_ceiling'
+      ? 'You cannot mint a key at or above your own capability rank. An admin cannot mint another admin; only an owner can.'
+      : result.error === 'member_not_found'
       ? 'Member not found or inactive.'
       : result.error === 'squad_not_found'
       ? 'Squad not found.'
@@ -602,9 +611,10 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
       : result.error === 'scope_id_required_for_department_preset'
       ? 'This preset requires a department. Pick one from the scope picker.'
       : `Mint failed: ${result.error}`
+    const statusCode = result.error === 'rank_ceiling' ? 403 : 400
     return c.html(
       shell(c.env.BRAND, 'Scoped API Keys', keysPageBody(view, presetIdRaw, scopeIdRaw ?? undefined, msg)),
-      400,
+      statusCode,
     )
   }
 
@@ -621,7 +631,11 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
   // Cache-Control: no-store and Referrer-Policy: no-referrer are set by the
   // dashboard-wide middleware above.
   return c.html(
-    shell(c.env.BRAND, 'Key minted', keysMintedBody(memberName, result.label, preset.label, result.raw)),
+    shell(
+      c.env.BRAND,
+      'Key minted',
+      keysMintedBody(memberName, result.label, preset.label, result.raw, result.grantUnchanged),
+    ),
   )
 })
 
