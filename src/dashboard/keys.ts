@@ -255,6 +255,11 @@ function esc(s: string): string {
 
 /** The guide panel for a preset — what it allows and what it denies. */
 function presetGuidePanel(preset: RolePreset): string {
+  // Enterprise rendering: surface the scope-type tag as "team"/"organization".
+  // The allow/deny entries below are permission/scope identifiers (the API
+  // contract) and are shown verbatim by design.
+  const scopeTypeLabel =
+    preset.scopeType === 'squad' ? 'team' : preset.scopeType === 'org' ? 'organization' : preset.scopeType
   const allows = preset.allows
     .map((a) => `<li class="guide-allow">&#10003; ${esc(a)}</li>`)
     .join('')
@@ -266,7 +271,7 @@ function presetGuidePanel(preset: RolePreset): string {
     `<div class="guide-header">` +
     `<strong>${esc(preset.label)}</strong>` +
     `<span class="tag cap">${esc(preset.role)}</span>` +
-    `<span class="tag">${esc(preset.scopeType)}</span>` +
+    `<span class="tag">${esc(scopeTypeLabel)}</span>` +
     `</div>` +
     `<p class="guide-desc">${esc(preset.description)}</p>` +
     `<div class="guide-cols">` +
@@ -293,10 +298,14 @@ export function keysPageBody(
   const { members, squads, departments, tokens } = view
 
   // ── preset selector options ──
+  // Enterprise rendering: surface the 'squad' scope type as "team" / 'org' as
+  // "organization" in the visible label; the option value stays the preset id.
+  const scopeTypeLabel = (t: string) =>
+    t === 'squad' ? 'team' : t === 'org' ? 'organization' : t
   const presetOptions = ROLE_PRESETS.map(
     (p) =>
       `<option value="${esc(p.id)}"${selectedPresetId === p.id ? ' selected' : ''}>` +
-      `${esc(p.label)} (${esc(p.role)} / ${esc(p.scopeType)})` +
+      `${esc(p.label)} (${esc(p.role)} / ${esc(scopeTypeLabel(p.scopeType))})` +
       `</option>`,
   ).join('')
 
@@ -350,17 +359,17 @@ export function keysPageBody(
     : ''
 
   return html`
-<div class="crumbs"><a href="/">Overview</a> › <a href="/admin/members">Members</a> › Scoped API Keys</div>
+<div class="crumbs"><a href="/">Overview</a> › <a href="/admin/members">People &amp; Access</a> › Scoped API Keys</div>
 <h1>Scoped API Keys</h1>
 <p style="color:var(--muted);font-size:14px;max-width:640px">
-  Mint a fine-grained API key for a member based on a role preset. The key is shown <strong>exactly once</strong>
-  and never stored in plain text. Pick the preset — the guide shows what it allows and denies — then pick a member
-  and (for squad/department presets) the target scope.
+  Provision a fine-grained API key for a person based on a role preset. The key is shown <strong>exactly once</strong>
+  and never stored in plain text. Pick the preset — the guide shows what it allows and denies — then pick a person
+  and (for team/department presets) the target scope.
 </p>
 
 ${honoRaw(errorHtml)}
 
-<h2>Mint a key</h2>
+<h2>Provision a key</h2>
 <div class="card">
   <form method="post" action="/admin/keys/mint" id="mintForm">
     <div class="adminform" style="flex-direction:column;align-items:stretch">
@@ -374,17 +383,17 @@ ${honoRaw(errorHtml)}
           </select>
         </label>
         <label>
-          Member
+          Person
           <select name="member_id" required>
-            <option value="">— choose a member —</option>
+            <option value="">— choose a person —</option>
             ${honoRaw(memberOptions)}
           </select>
         </label>
         <div id="scopePickerContainer" style="display:none">
           <label id="squadPickerLabel">
-            Squad (scope)
+            Team (scope)
             <select name="scope_id" id="squadPicker">
-              <option value="">— choose a squad —</option>
+              <option value="">— choose a team —</option>
               ${honoRaw(squadOptions)}
             </select>
           </label>
@@ -403,7 +412,7 @@ ${honoRaw(errorHtml)}
       </div>
 
       <div style="margin-top:16px">
-        <button class="btn" type="submit" id="mintBtn" disabled>Mint key</button>
+        <button class="btn" type="submit" id="mintBtn" disabled>Provision key</button>
         <span style="font-size:13px;color:var(--muted);margin-left:12px">
           The raw key is shown once and never stored.
         </span>
@@ -416,7 +425,7 @@ ${honoRaw(errorHtml)}
 <div class="card" style="padding:0;overflow:hidden">
   <table class="grid">
     <thead><tr>
-      <th>Member</th><th>Label (preset:scope)</th><th>Created</th><th></th>
+      <th>Person</th><th>Label (preset:scope)</th><th>Created</th><th></th>
     </tr></thead>
     <tbody>${honoRaw(tokenRows)}</tbody>
   </table>
@@ -501,8 +510,8 @@ export function keysMintedBody(
   </div>`
     : ''
   return html`
-<div class="crumbs"><a href="/">Overview</a> › <a href="/admin/keys">Scoped API Keys</a> › Key minted</div>
-<h1>Key minted</h1>
+<div class="crumbs"><a href="/">Overview</a> › <a href="/admin/keys">Scoped API Keys</a> › Key provisioned</div>
+<h1>Key provisioned</h1>
 <div class="card">
   <p style="font-size:14px;color:var(--muted);margin:0 0 14px">
     Scoped key for <strong>${memberName}</strong> · Preset: <strong>${presetLabel}</strong>

@@ -41,14 +41,14 @@ export function connectorsPageBody(
 
   const connectorRows =
     rows.length === 0
-      ? `<tr><td colspan="5" class="empty">No active connectors yet.</td></tr>`
+      ? `<tr><td colspan="5" class="empty">No active credentials yet.</td></tr>`
       : rows
           .map((r) => {
             const typeLabel = TYPE_LABELS[r.type] ?? r.type
             const scopeLabel =
               r.scope_type === 'pot'
-                ? 'Pot-wide'
-                : `${esc(r.scope_type)}: ${esc(r.scope_id ?? '—')}`
+                ? 'Organization-wide'
+                : `${esc(r.scope_type === 'squad' ? 'team' : r.scope_type)}: ${esc(r.scope_id ?? '—')}`
             return (
               `<tr>` +
               `<td><span class="tag">${esc(typeLabel)}</span></td>` +
@@ -64,7 +64,7 @@ export function connectorsPageBody(
               `</form>` +
               // Revoke
               `<form method="post" action="/admin/connectors/${esc(r.id)}/revoke" style="display:inline">` +
-              `<button class="btn sm secondary" type="submit" onclick="return confirm('Revoke connector \\'${esc(r.label)}\\'?')">Revoke</button>` +
+              `<button class="btn sm secondary" type="submit" onclick="return confirm('Revoke credential \\'${esc(r.label)}\\'?')">Revoke</button>` +
               `</form>` +
               `</td>` +
               `</tr>`
@@ -80,14 +80,14 @@ export function connectorsPageBody(
 <div class="crumbs"><a href="/">Overview</a> › Connector Credentials</div>
 <h1>Connector Credentials</h1>
 <p style="color:var(--muted);font-size:14px;max-width:640px">
-  Tool credentials (Telegram bot tokens, Instantly keys, GHL, custom) stored <strong>encrypted at rest</strong>.
-  The raw secret is shown <strong>once on add/rotate</strong>, then discarded — never stored plaintext, never returned
-  by the list. Agents receive credentials at call-time via <code>resolveConnector()</code>; the plaintext is never logged.
+  Tool access credentials (Telegram bot tokens, Instantly keys, GHL, custom) stored <strong>encrypted at rest</strong>.
+  The raw secret is shown <strong>once on provision/rotate</strong>, then discarded — never stored plaintext, never returned
+  by the list. AI agents receive credentials at call-time via <code>resolveConnector()</code>; the plaintext is never logged.
 </p>
 
 ${raw(errorHtml)}
 
-<h2>Add connector</h2>
+<h2>Provision credential</h2>
 <div class="card">
   <form method="post" action="/admin/connectors">
     <div class="adminform" style="flex-direction:column;align-items:stretch">
@@ -112,14 +112,14 @@ ${raw(errorHtml)}
         <label>
           Scope
           <select name="scope_type" id="scopeTypeSelect" onchange="updateScopeId(this.value)">
-            <option value="pot">Pot-wide</option>
-            <option value="squad">Squad</option>
-            <option value="agent">Agent</option>
+            <option value="pot">Organization-wide</option>
+            <option value="squad">Team</option>
+            <option value="agent">AI Agent</option>
           </select>
         </label>
         <label id="scopeIdLabel" style="display:none">
           Scope ID (UUID)
-          <input type="text" name="scope_id" id="scopeIdInput" placeholder="squad or agent UUID" pattern="[0-9a-f-]{36}">
+          <input type="text" name="scope_id" id="scopeIdInput" placeholder="team or agent UUID" pattern="[0-9a-f-]{36}">
         </label>
       </div>
       <div style="margin-top:12px">
@@ -129,7 +129,7 @@ ${raw(errorHtml)}
         </label>
       </div>
       <div style="margin-top:16px">
-        <button class="btn" type="submit">Add connector</button>
+        <button class="btn" type="submit">Provision credential</button>
         <span style="font-size:13px;color:var(--muted);margin-left:12px">
           The secret is encrypted immediately and shown once — then gone.
         </span>
@@ -138,7 +138,7 @@ ${raw(errorHtml)}
   </form>
 </div>
 
-<h2>Active connectors</h2>
+<h2>Active credentials</h2>
 <div class="card" style="padding:0;overflow:hidden">
   <table class="grid">
     <thead><tr>
@@ -176,8 +176,8 @@ export function connectorAddedBody(
   connectorId: string,
 ) {
   return html`
-<div class="crumbs"><a href="/">Overview</a> › <a href="/admin/connectors">Connector Credentials</a> › Added</div>
-<h1>Connector added</h1>
+<div class="crumbs"><a href="/">Overview</a> › <a href="/admin/connectors">Connector Credentials</a> › Provisioned</div>
+<h1>Credential provisioned</h1>
 <div class="card">
   <p style="font-size:14px;color:var(--muted);margin:0 0 14px">
     <strong>${esc(TYPE_LABELS[type] ?? type)}</strong> — ${esc(label)}
@@ -191,7 +191,7 @@ export function connectorAddedBody(
     Hint (last 4): <strong>…${esc(hint)}</strong>
   </div>
   <div style="margin-top:14px">
-    <a href="/admin/connectors" class="btn secondary sm">Back to connectors</a>
+    <a href="/admin/connectors" class="btn secondary sm">Back to credentials</a>
   </div>
 </div>`
 }
@@ -218,7 +218,7 @@ export function connectorRotatedBody(
     New hint (last 4): <strong>…${esc(hint)}</strong>
   </div>
   <div style="margin-top:14px">
-    <a href="/admin/connectors" class="btn secondary sm">Back to connectors</a>
+    <a href="/admin/connectors" class="btn secondary sm">Back to credentials</a>
   </div>
 </div>`
 }

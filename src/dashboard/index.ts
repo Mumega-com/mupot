@@ -508,7 +508,7 @@ dashboardApp.get('/admin/members', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
     return c.html(
-      shell(c.env.BRAND, 'Members', errorBody('Members admin requires owner or admin.')),
+      shell(c.env.BRAND, 'People & Access', errorBody('People & Access admin requires owner or admin.')),
       403,
     )
   }
@@ -522,7 +522,7 @@ dashboardApp.get('/admin/members', async (c) => {
   return c.html(
     shell(
       c.env.BRAND,
-      'Members',
+      'People & Access',
       membersAdminBody(members, grants, channels, depts, scopeNames, auth),
     ),
   )
@@ -534,7 +534,7 @@ dashboardApp.get('/admin/divisions', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
     return c.html(
-      shell(c.env.BRAND, 'Divisions', errorBody('Divisions admin requires owner or admin.')),
+      shell(c.env.BRAND, 'Organization', errorBody('Organization admin requires owner or admin.')),
       403,
     )
   }
@@ -545,7 +545,7 @@ dashboardApp.get('/admin/divisions', async (c) => {
     loadMembers(c.env),
   ])
   return c.html(
-    shell(c.env.BRAND, 'Divisions', divisionsAdminBody(depts, squads, grants, members, auth)),
+    shell(c.env.BRAND, 'Organization', divisionsAdminBody(depts, squads, grants, members, auth)),
   )
 })
 
@@ -656,7 +656,7 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
   return c.html(
     shell(
       c.env.BRAND,
-      'Key minted',
+      'Key provisioned',
       keysMintedBody(memberName, result.label, preset.label, result.raw, result.grantUnchanged),
     ),
   )
@@ -841,7 +841,7 @@ dashboardApp.get('/members', async (c) => {
     loadLiveTokens(c.env),
   ])
   return c.html(
-    shell(c.env.BRAND, 'Members', membersPageBody(members, channels, tokens, canManage, auth)),
+    shell(c.env.BRAND, 'Access Tokens', membersPageBody(members, channels, tokens, canManage, auth)),
   )
 })
 
@@ -850,31 +850,31 @@ dashboardApp.get('/members', async (c) => {
 dashboardApp.post('/members/:id/tokens', async (c) => {
   const auth = c.get('auth')
   if (!(await canOnOrg(c.env, auth, 'admin'))) {
-    return c.html(shell(c.env.BRAND, 'Members', errorBody('Minting a token requires admin.')), 403)
+    return c.html(shell(c.env.BRAND, 'Access Tokens', errorBody('Provisioning a token requires admin.')), 403)
   }
   const memberId = c.req.param('id')
   const member = await c.env.DB.prepare('SELECT id, display_name FROM members WHERE id = ? LIMIT 1')
     .bind(memberId)
     .first<{ id: string; display_name: string }>()
   if (!member) {
-    return c.html(shell(c.env.BRAND, 'Members', errorBody('Member not found.')), 404)
+    return c.html(shell(c.env.BRAND, 'Access Tokens', errorBody('Person not found.')), 404)
   }
 
   const form = await c.req.parseBody()
   const labelRaw = typeof form.label === 'string' ? form.label : ''
   if (labelRaw.length > 64) {
-    return c.html(shell(c.env.BRAND, 'Members', errorBody('Label too long (max 64 chars).')), 400)
+    return c.html(shell(c.env.BRAND, 'Access Tokens', errorBody('Label too long (max 64 chars).')), 400)
   }
   const channelRaw = typeof form.channel === 'string' ? form.channel : 'workspace'
   if (!isChannel(channelRaw)) {
-    return c.html(shell(c.env.BRAND, 'Members', errorBody('Invalid channel.')), 400)
+    return c.html(shell(c.env.BRAND, 'Access Tokens', errorBody('Invalid channel.')), 400)
   }
 
   // Shared mint path — raw returned once, only the hash persisted.
   const minted = await mintMemberToken(c.env, memberId, labelRaw, channelRaw)
   const origin = new URL(c.req.url).origin
   return c.html(
-    shell(c.env.BRAND, 'Token minted', tokenShowOnceBody(c.env.TENANT_SLUG, origin, member.display_name, minted)),
+    shell(c.env.BRAND, 'Token provisioned', tokenShowOnceBody(c.env.TENANT_SLUG, origin, member.display_name, minted)),
   )
 })
 
@@ -882,7 +882,7 @@ dashboardApp.post('/members/:id/tokens', async (c) => {
 dashboardApp.post('/members/:id/tokens/:tid/revoke', async (c) => {
   const auth = c.get('auth')
   if (!(await canOnOrg(c.env, auth, 'admin'))) {
-    return c.html(shell(c.env.BRAND, 'Members', errorBody('Revoking a token requires admin.')), 403)
+    return c.html(shell(c.env.BRAND, 'Access Tokens', errorBody('Revoking a token requires admin.')), 403)
   }
   await revokeMemberToken(c.env, c.req.param('id'), c.req.param('tid'))
   // Idempotent — whether or not a live token matched, land back on the roster.
@@ -1674,8 +1674,8 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         <a href="/flights">Flights</a>
         <a href="/agents">Agents</a>
         <a href="/fleet">Fleet</a>
-        <a href="/members">Members</a>
-        <a href="/admin/divisions">Divisions</a>
+        <a href="/members">People</a>
+        <a href="/admin/divisions">Organization</a>
         <a href="/admin/keys">Scoped Keys</a>
         <a href="/setup">Setup</a>
         <a href="/auth/logout">Sign out</a>
@@ -2659,7 +2659,7 @@ function membersPageBody(
 
   const rows =
     members.length === 0
-      ? '<p class="empty">No members yet. Invite someone from the Divisions / admin console — first connect mints their member + token.</p>'
+      ? '<p class="empty">No people yet. Onboard someone from the People &amp; Access console — first sign-in provisions their identity + token.</p>'
       : members
           .map((m) =>
             memberConnectRow(
@@ -2673,17 +2673,17 @@ function membersPageBody(
           .join('')
 
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / Members</p>
-    <h1>Members</h1>
+    <p class="crumbs"><a href="/">Overview</a> / Access Tokens</p>
+    <h1>Access Tokens</h1>
     <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role} ·
-      ${members.length} member${members.length === 1 ? '' : 's'}. A token is what a member pastes into
-      their workspace config (see the <a href="/">Connect card</a>). Mint one below — it is shown
+      ${members.length} ${members.length === 1 ? 'person' : 'people'}. A token is what a person pastes into
+      their workspace config (see the <a href="/">Connect card</a>). Provision one below — it is shown
       exactly once.</p>
     <div class="card" style="padding:0">
       <table class="grid">
         <thead>
-          <tr><th>Member</th><th>Channels</th><th>Tokens</th>${
-            canManage ? raw('<th>Mint</th>') : raw('')
+          <tr><th>Person</th><th>Channels</th><th>Tokens</th>${
+            canManage ? raw('<th>Provision</th>') : raw('')
           }</tr>
         </thead>
         <tbody>${raw(rows)}</tbody>
@@ -2745,7 +2745,7 @@ function memberConnectRow(
               <option value="dashboard">dashboard</option>
             </select>
           </label>
-          <button type="submit" class="btn sm">Mint token</button>
+          <button type="submit" class="btn sm">Provision token</button>
         </form>
       </td>`
     : html``
@@ -2767,8 +2767,8 @@ function memberConnectRow(
 // not show the token again (it does not exist server-side in raw form).
 function tokenShowOnceBody(slug: string, origin: string, memberName: string, minted: MintedToken) {
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / <a href="/members">Members</a> / Token minted</p>
-    <h1>Token minted for ${memberName}</h1>
+    <p class="crumbs"><a href="/">Overview</a> / <a href="/members">Access Tokens</a> / Token provisioned</p>
+    <h1>Token provisioned for ${memberName}</h1>
     <div class="warn-box">
       <strong>Copy this token now — it is shown exactly once.</strong> We store only a hash, so it
       can never be displayed again. If it is lost, revoke it and mint a new one.
@@ -2789,14 +2789,16 @@ function tokenShowOnceBody(slug: string, origin: string, memberName: string, min
       <h3 style="font-size:13px;color:var(--muted);margin:14px 0 0">Codex · <code class="inline">~/.codex/config.toml</code></h3>
       <pre class="snippet">${codexSnippet(slug, origin)}</pre>
     </div>
-    <p><a href="/members">← Back to members</a></p>`
+    <p><a href="/members">← Back to access tokens</a></p>`
 }
 
-/** Render one capability grant as a human label: "admin · Engineering" / "owner · org". */
+/** Render one entitlement grant as a human label: "admin · Engineering" / "owner · organization". */
 function grantLabel(g: CapabilityGrant, scopeNames: Map<string, string>): string {
-  if (g.scope_type === 'org') return `${g.capability} · org`
+  if (g.scope_type === 'org') return `${g.capability} · organization`
+  // Enterprise rendering: the 'squad' scope type is surfaced as "team".
+  const scopeWord = g.scope_type === 'squad' ? 'team' : g.scope_type
   const name = g.scope_id ? (scopeNames.get(g.scope_id) ?? g.scope_id) : g.scope_id
-  return `${g.capability} · ${g.scope_type} ${name ?? ''}`.trim()
+  return `${g.capability} · ${scopeWord} ${name ?? ''}`.trim()
 }
 
 function capabilityRank(cap: Capability): number {
@@ -2834,23 +2836,23 @@ function membersAdminBody(
 
   const rows =
     members.length === 0
-      ? '<p class="empty">No members yet. Invite someone below — first connect mints their member + token.</p>'
+      ? '<p class="empty">No people yet. Onboard someone below — first sign-in provisions their identity + token.</p>'
       : members
           .map((m) => memberRow(m, grantsByMember.get(m.id) ?? [], channelsByMember.get(m.id), scopeNames))
           .map((x) => x.toString())
           .join('')
 
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / Members</p>
-    <h1>Members</h1>
+    <p class="crumbs"><a href="/">Overview</a> / People &amp; Access</p>
+    <h1>People &amp; Access</h1>
     <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role} ·
-      ${members.length} member${members.length === 1 ? '' : 's'} · humans are
-      first-class network nodes (one person = one member, many channels).</p>
+      ${members.length} ${members.length === 1 ? 'person' : 'people'} · each person is a
+      sponsor or owner accountable for the AI agents they register (one person, many channels).</p>
 
-    <h2>Invite a member</h2>
+    <h2>Onboard a person</h2>
     <div class="card">
-      <p class="empty" style="margin-top:0">An invite is redeemed once: first connect mints the
-        member, capability and a workspace token. The capability applies org-wide unless you scope it
+      <p class="empty" style="margin-top:0">An invite is redeemed once: first sign-in provisions the
+        person, their entitlement and a workspace token. The entitlement applies organization-wide unless you scope it
         to a department.</p>
       <form id="invite-form" class="adminform" autocomplete="off">
         <label>Email
@@ -2858,23 +2860,23 @@ function membersAdminBody(
         </label>
         <label>Department
           <select name="department_id">
-            <option value="">— org-wide —</option>
+            <option value="">— organization-wide —</option>
             ${raw(deptOptions)}
           </select>
         </label>
-        <label>Capability
+        <label>Entitlement
           <select name="capability">${raw(capOptions)}</select>
         </label>
-        <button type="submit" class="btn">Create invite</button>
+        <button type="submit" class="btn">Send invite</button>
       </form>
       <div id="invite-status" class="status-line"></div>
     </div>
 
-    <h2>Roster</h2>
+    <h2>Directory</h2>
     <div class="card" style="padding:0">
       <table class="grid">
         <thead>
-          <tr><th>Member</th><th>Channels</th><th>Capabilities</th><th>Status</th><th>Actions</th></tr>
+          <tr><th>Person</th><th>Channels</th><th>Entitlements</th><th>Status</th><th>Actions</th></tr>
         </thead>
         <tbody>${raw(rows)}</tbody>
       </table>
@@ -2932,7 +2934,7 @@ function memberRow(
           ${suspended ? 'Reactivate' : 'Suspend'}
         </button>
         <button class="btn secondary sm js-grant" data-member="${m.id}"
-          data-name="${escAttr(m.display_name)}">Grant capability</button>
+          data-name="${escAttr(m.display_name)}">Grant entitlement</button>
       </td>
     </tr>`
 }
@@ -2979,9 +2981,9 @@ function divisionsAdminBody(
 
   if (depts.length === 0) {
     return html`
-      <p class="crumbs"><a href="/">Overview</a> / Divisions</p>
-      <h1>Divisions</h1>
-      <div class="card"><p class="empty">No departments yet. Seed the org via
+      <p class="crumbs"><a href="/">Overview</a> / Organization</p>
+      <h1>Organization</h1>
+      <div class="card"><p class="empty">No departments yet. Seed the organization via
         <code>POST /api/org/departments</code> and they'll appear here.</p></div>`
   }
 
@@ -2997,7 +2999,7 @@ function divisionsAdminBody(
                   <div class="squad-row">
                     <div>
                       <a href="/squads/${s.id}"><strong>${s.name}</strong></a>
-                      <span class="meta"> · squad</span>
+                      <span class="meta"> · team</span>
                     </div>
                     <div class="meta">${heads(s.id)}</div>
                   </div>`.toString(),
@@ -3013,15 +3015,15 @@ function divisionsAdminBody(
     .join('')
 
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / Divisions</p>
-    <h1>Divisions</h1>
+    <p class="crumbs"><a href="/">Overview</a> / Organization</p>
+    <h1>Organization</h1>
     <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role} ·
       ${depts.length} department${depts.length === 1 ? '' : 's'} ·
-      ${squads.length} squad${squads.length === 1 ? '' : 's'}. A head is any member holding
-      <strong>lead</strong> or stronger capability on that scope.</p>
+      ${squads.length} team${squads.length === 1 ? '' : 's'}. An owner is any person holding the
+      <strong>lead</strong> entitlement or stronger on that scope.</p>
     ${raw(cards)}
-    <p class="empty">Assign a head from the <a href="/admin/members">Members</a> page — grant a member
-      <code>lead</code> (or higher) on the department or squad scope.</p>`
+    <p class="empty">Assign an owner from the <a href="/admin/members">People &amp; Access</a> page — grant a person
+      the <code>lead</code> entitlement (or higher) on the department or team scope.</p>`
 }
 
 // ── client scripts (POST to the RBAC-gated /api/members/* — never write here) ──
@@ -3032,21 +3034,27 @@ function scopeNamesToOptions(scopeNames: Map<string, string>, depts: Department[
   const opts: string[] = []
   for (const [id, name] of scopeNames) {
     const kind = deptIds.has(id) ? 'department' : 'squad'
-    opts.push(`<option value="${escAttr(id)}" data-kind="${kind}">${escHtml(name)} (${kind})</option>`)
+    // data-kind keeps the API scope-type ('squad'); the visible word is the
+    // enterprise rendering ('team').
+    const kindLabel = kind === 'squad' ? 'team' : kind
+    opts.push(`<option value="${escAttr(id)}" data-kind="${kind}">${escHtml(name)} (${kindLabel})</option>`)
   }
   return opts.join('')
 }
 
 function membersAdminScript(scopeOptions: string) {
   const capOptions = CAPABILITY_ORDER.map((c) => `<option value="${c}">${c}</option>`).join('')
-  const scopeTypeOptions = SCOPE_TYPES.map((s) => `<option value="${s}">${s}</option>`).join('')
+  // Enterprise rendering: keep the API value ('org'|'department'|'squad') but
+  // surface 'org'→'organization' and 'squad'→'team' to the reader.
+  const scopeTypeLabel = (s: string) => (s === 'squad' ? 'team' : s === 'org' ? 'organization' : s)
+  const scopeTypeOptions = SCOPE_TYPES.map((s) => `<option value="${s}">${scopeTypeLabel(s)}</option>`).join('')
   // The member-admin API base. The Integrate phase mounts membersApp under this
   // prefix; buttons call it (we never duplicate the API's writes here).
   const api = '/api/members'
   return raw(`
     <div id="grant-modal" class="modal" hidden>
       <div class="modal-card">
-        <h3 style="margin-top:0">Grant capability — <span id="grant-who"></span></h3>
+        <h3 style="margin-top:0">Grant entitlement — <span id="grant-who"></span></h3>
         <form id="grant-form" class="adminform">
           <label>Scope type
             <select name="scope_type" id="grant-scope-type">${scopeTypeOptions}</select>
@@ -3054,7 +3062,7 @@ function membersAdminScript(scopeOptions: string) {
           <label id="grant-scope-wrap">Scope
             <select name="scope_id" id="grant-scope-id">${scopeOptions}</select>
           </label>
-          <label>Capability
+          <label>Entitlement
             <select name="capability">${capOptions}</select>
           </label>
           <div class="modal-actions">

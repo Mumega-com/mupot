@@ -67,7 +67,7 @@ export const ROLE_PRESETS: readonly RolePreset[] = [
     id: 'sales-rep',
     label: 'Sales Rep',
     description:
-      'Front-line sales: read + draft outreach for one squad. Can send gated outreach (human-approved). No admin, no cross-squad, no budget write.',
+      'Front-line sales: read + draft outreach for one team. Can send gated outreach (human-approved). No admin, no cross-team, no budget write.',
     role: 'member',
     scopeType: 'squad',
     scopeHint: 'squad',
@@ -94,7 +94,7 @@ export const ROLE_PRESETS: readonly RolePreset[] = [
     id: 'admin',
     label: 'Admin',
     description:
-      'Org-wide administrator. Can manage members, tokens, departments, squads, agents. Cannot mint owner-level tokens.',
+      'Organization-wide administrator. Can manage people, tokens, departments, teams, and AI agents. Cannot provision owner-level tokens.',
     role: 'admin',
     scopeType: 'org',
     scopeHint: 'org',
@@ -119,7 +119,7 @@ export const ROLE_PRESETS: readonly RolePreset[] = [
     id: 'observer',
     label: 'Observer',
     description:
-      'Read-only access to a squad. Can read tasks, pipeline, and content. Cannot write or send anything.',
+      'Read-only access to a team. Can read tasks, pipeline, and content. Cannot write or send anything.',
     role: 'observer',
     scopeType: 'squad',
     scopeHint: 'squad',
