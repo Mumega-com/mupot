@@ -16,6 +16,7 @@ import { createLoop, listLoops, getLoop, setLoopStatus } from './service'
 import { isLoopStatus } from './manifest'
 import type { LoopStatus } from './manifest'
 import { seedOutreachLoop } from './outreach-pack'
+import { listLoopDecisions } from './decisions'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -58,6 +59,23 @@ loopsApp.post('/', async (c) => {
   const r = await createLoop(c.env, body)
   if (!r.ok) return c.json({ error: r.error }, 400)
   return c.json({ loop: r.value }, 201)
+})
+
+// GET /api/loops/:id/decisions — persisted cycle-outcome feed (S-BRAIN-CTRL-MUPOT-1 AC#3).
+// Tenant-scoped; requireAuth (read) only — no admin gate. The /brain panel calls this.
+// ?limit= (max 200, default 50) ?offset= (for pagination).
+loopsApp.get('/:id/decisions', async (c) => {
+  const loopId = c.req.param('id')
+  const loop = await getLoop(c.env, loopId)
+  if (!loop) return c.json({ error: 'not_found' }, 404)
+
+  const limitRaw = c.req.query('limit')
+  const offsetRaw = c.req.query('offset')
+  const limit = limitRaw ? Math.max(1, Math.min(200, parseInt(limitRaw, 10) || 50)) : 50
+  const offset = offsetRaw ? Math.max(0, parseInt(offsetRaw, 10) || 0) : 0
+
+  const decisions = await listLoopDecisions(c.env, loopId, { limit, offset })
+  return c.json({ decisions, loop_id: loopId, limit, offset })
 })
 
 // POST /api/loops/:id/status — pause / resume (active) / kill.

@@ -77,6 +77,9 @@ import { buildBoard } from '../flight/board'
 import type { FlightCard } from '../flight/board'
 import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
+import { loadBrainView, brainBody } from './brain'
+import { setLoopControl, isLoopControlAction } from '../loops/decisions'
+import { getLoop } from '../loops/service'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -169,6 +172,56 @@ dashboardApp.get('/approvals', async (c) => {
 dashboardApp.get('/loops', async (c) => {
   const view = await loadLoopsView(c.env)
   return c.html(shell(c.env.BRAND, 'Loops', loopsBody(view)))
+})
+
+// ── brain (per-pot brain panel — decision feed + governor) ───────────────────
+// GET /brain — decision feed + governor controls (S-BRAIN-CTRL-MUPOT-1 AC#4).
+// Reads are requireAuth only (the outer middleware already gates the whole app).
+// Governor writes are isAdmin-gated (AC#7) in the POST handler below.
+dashboardApp.get('/brain', async (c) => {
+  const auth = c.get('auth')
+  const view = await loadBrainView(c.env)
+  return c.html(shell(c.env.BRAND, 'Brain', brainBody(view, isAdmin(auth))))
+})
+
+// POST /brain/loops/:id/control — governor control signal (isAdmin-gated, AC#7).
+// Writes a loop_controls row; the driver picks it up on the next heartbeat cycle.
+// Accepted actions: pause | kill | budget_override
+// For budget_override: body must include value (micro-USD integer as string).
+// For pause/kill: value is ignored.
+dashboardApp.post('/brain/loops/:id/control', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+
+  const loopId = c.req.param('id')
+  if (!loopId || loopId.length > 64) return c.json({ error: 'invalid_loop_id' }, 400)
+
+  // Verify the loop belongs to this pot (tenant guard).
+  const loop = await getLoop(c.env, loopId)
+  if (!loop) return c.json({ error: 'not_found' }, 404)
+
+  let body: { action?: unknown; value?: unknown }
+  try {
+    body = (await c.req.json()) as { action?: unknown; value?: unknown }
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+
+  if (!isLoopControlAction(body.action)) {
+    return c.json({ error: 'invalid_action', accepted: ['pause', 'kill', 'budget_override'] }, 400)
+  }
+
+  const value =
+    body.action === 'budget_override' && typeof body.value === 'string'
+      ? body.value
+      : null
+
+  if (body.action === 'budget_override' && value === null) {
+    return c.json({ error: 'budget_override requires value (micro-USD integer string)' }, 400)
+  }
+
+  await setLoopControl(c.env, loopId, body.action, auth.email ?? auth.userId, value)
+  return c.json({ ok: true, action: body.action, loop_id: loopId })
 })
 
 // ── flights (the flight board — what is flying/sleeping + each flight's cost) ─
@@ -1304,6 +1357,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         <a href="/send">Send</a>
         <a href="/approvals">Approvals</a>
         <a href="/loops">Loops</a>
+        <a href="/brain">Brain</a>
         <a href="/flights">Flights</a>
         <a href="/agents">Agents</a>
         <a href="/fleet">Fleet</a>
