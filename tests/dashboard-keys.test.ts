@@ -189,42 +189,58 @@ describe('loadKeysView', () => {
 })
 
 // ── 3. mintScopedKey ──────────────────────────────────────────────────────────
+//
+// DB call order (per mintScopedKey):
+//   1. .first() — member exists check
+//   2. .first() — squad/dept exists check (only for squad/department scope)
+//   3. .first() — existing capability read (rank-max upsert gate)
+//   4. .run()   — INSERT OR REPLACE capabilities (skipped if existing rank >=)
+//   5. .run()   — INSERT member_tokens
+//
+// minterRank values used in tests:
+//   owner=5, admin=4, lead=3, member=2, observer=1
+//   admin minting sales-rep(member,2): minterRank=4, presetRank=2 → 2<4 → OK
+//   owner minting admin(admin,4):      minterRank=5, presetRank=4 → 4<5 → OK
+//   admin minting admin(admin,4):      minterRank=4, presetRank=4 → 4>=4 → rank_ceiling
+//   admin minting observer(observer,1):minterRank=4, presetRank=1 → 1<4 → OK
 
 describe('mintScopedKey', () => {
-  // Happy path: sales-rep (squad scope)
+  // Happy path: sales-rep (squad scope), admin minter (rank 4 > member rank 2)
   it('returns ok:true + raw token for a valid sales-rep mint', async () => {
     const { env, calls } = makeEnv({
       firstResults: [
-        { id: 'm1' },        // member exists check
-        { id: 's1' },        // squad exists check
-        // mintMemberToken does 1 .run() not .first(), so no more firsts needed
+        { id: 'm1' },  // member exists check
+        { id: 's1' },  // squad exists check
+        null,          // no existing capability grant on this scope
       ],
-      runChanges: [1, 1],    // INSERT capabilities, INSERT member_tokens
+      runChanges: [1, 1],  // INSERT OR REPLACE capabilities, INSERT member_tokens
     })
     const result = await mintScopedKey(env, {
       memberId: 'm1',
       presetId: 'sales-rep',
       scopeId: 's1',
+      minterRank: 4,  // admin
     })
     expect(result.ok).toBe(true)
     if (!result.ok) throw new Error('expected ok')
     expect(result.raw).toMatch(/^mupot_/)
     expect(result.label).toBe('[preset:sales-rep:s1]')
     expect(result.tokenId).toBeTruthy()
+    expect(result.grantUnchanged).toBeFalsy()
     // capability INSERT must use the correct scope values
-    const capInsert = calls.find((c) => c.sql.includes('INSERT OR IGNORE INTO capabilities'))
+    const capInsert = calls.find((c) => c.sql.includes('INSERT OR REPLACE INTO capabilities'))
     expect(capInsert).toBeDefined()
     expect(capInsert!.binds[2]).toBe('squad')   // scope_type
     expect(capInsert!.binds[3]).toBe('s1')      // scope_id
     expect(capInsert!.binds[4]).toBe('member')  // capability
   })
 
-  // Happy path: admin preset (org scope — no scope_id needed)
+  // Happy path: admin preset (org scope), owner minter (rank 5 > admin rank 4)
   it('mints org-scope admin preset correctly (scope_id null)', async () => {
     const { env, calls } = makeEnv({
       firstResults: [
         { id: 'm2' },  // member exists
-        // no squad check for org preset
+        null,          // no existing capability grant (no squad check for org preset)
       ],
       runChanges: [1, 1],
     })
@@ -232,20 +248,22 @@ describe('mintScopedKey', () => {
       memberId: 'm2',
       presetId: 'admin',
       scopeId: null,
+      minterRank: 5,  // owner
     })
     expect(result.ok).toBe(true)
-    const capInsert = calls.find((c) => c.sql.includes('INSERT OR IGNORE INTO capabilities'))!
+    const capInsert = calls.find((c) => c.sql.includes('INSERT OR REPLACE INTO capabilities'))!
     expect(capInsert.binds[2]).toBe('org')
     expect(capInsert.binds[3]).toBeNull()
     expect(capInsert.binds[4]).toBe('admin')
   })
 
-  // Happy path: observer preset (squad scope)
+  // Happy path: observer preset (squad scope), admin minter (rank 4 > observer rank 1)
   it('mints observer preset correctly', async () => {
     const { env, calls } = makeEnv({
       firstResults: [
         { id: 'm3' },
         { id: 's2' },
+        null,  // no existing capability
       ],
       runChanges: [1, 1],
     })
@@ -253,16 +271,17 @@ describe('mintScopedKey', () => {
       memberId: 'm3',
       presetId: 'observer',
       scopeId: 's2',
+      minterRank: 4,  // admin
     })
     expect(result.ok).toBe(true)
-    const capInsert = calls.find((c) => c.sql.includes('INSERT OR IGNORE INTO capabilities'))!
+    const capInsert = calls.find((c) => c.sql.includes('INSERT OR REPLACE INTO capabilities'))!
     expect(capInsert.binds[4]).toBe('observer')
   })
 
-  // Guard: unknown preset
+  // Guard: unknown preset (no DB calls, no minterRank needed)
   it('returns ok:false + unknown_preset for an unrecognised preset id', async () => {
     const { env } = makeEnv()
-    const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'hacker', scopeId: null })
+    const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'hacker', scopeId: null, minterRank: 5 })
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected failure')
     expect(result.error).toBe('unknown_preset')
@@ -273,7 +292,7 @@ describe('mintScopedKey', () => {
     const { env } = makeEnv({
       firstResults: [null], // member not found
     })
-    const result = await mintScopedKey(env, { memberId: 'ghost', presetId: 'admin', scopeId: null })
+    const result = await mintScopedKey(env, { memberId: 'ghost', presetId: 'admin', scopeId: null, minterRank: 5 })
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected failure')
     expect(result.error).toBe('member_not_found')
@@ -284,7 +303,7 @@ describe('mintScopedKey', () => {
     const { env } = makeEnv({
       firstResults: [{ id: 'm1' }],
     })
-    const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'sales-rep', scopeId: null })
+    const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'sales-rep', scopeId: null, minterRank: 4 })
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected failure')
     expect(result.error).toBe('scope_id_required_for_squad_preset')
@@ -298,7 +317,7 @@ describe('mintScopedKey', () => {
         null,          // squad NOT found — tenant-scope guard
       ],
     })
-    const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'sales-rep', scopeId: 'foreign-squad-uuid' })
+    const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'sales-rep', scopeId: 'foreign-squad-uuid', minterRank: 4 })
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected failure')
     expect(result.error).toBe('squad_not_found')
@@ -307,37 +326,43 @@ describe('mintScopedKey', () => {
   // Show-once discipline: raw is on the result, not stored separately
   it('show-once: raw token is returned on result and is a mupot_ prefixed string', async () => {
     const { env } = makeEnv({
-      firstResults: [{ id: 'm1' }, { id: 's1' }],
+      firstResults: [{ id: 'm1' }, { id: 's1' }, null],
       runChanges: [1, 1],
     })
-    const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'sales-rep', scopeId: 's1' })
+    const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'sales-rep', scopeId: 's1', minterRank: 4 })
     expect(result.ok).toBe(true)
     if (!result.ok) throw new Error('expected ok')
     // The raw token is our only access to the plaintext — it must start with mupot_
     expect(result.raw).toMatch(/^mupot_[0-9a-f]{64}$/)
   })
 
-  // The capability INSERT is OR IGNORE — re-minting does not downgrade a higher grant
-  it('uses INSERT OR IGNORE to avoid downgrading existing higher-rank grants', async () => {
+  // Rank-max upsert: existing higher grant is preserved (downgrade protection)
+  it('skips the capability INSERT and sets grantUnchanged when existing rank is higher', async () => {
     const { env, calls } = makeEnv({
-      firstResults: [{ id: 'm1' }, { id: 's1' }],
-      runChanges: [0, 1], // 0 changes on cap INSERT = row already existed (higher rank)
+      firstResults: [
+        { id: 'm1' },                // member exists
+        { id: 's1' },                // squad exists
+        { capability: 'lead' },      // existing grant is lead (rank 3) — higher than observer (rank 1)
+      ],
+      runChanges: [1],               // only the token INSERT runs (no cap INSERT)
     })
-    const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'observer', scopeId: 's1' })
-    // Even if capability already existed (higher rank), the token mint still succeeds
+    const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'observer', scopeId: 's1', minterRank: 4 })
+    // Token still minted (the key is still valid), but grant was not downgraded
     expect(result.ok).toBe(true)
-    const capInsert = calls.find((c) => c.sql.includes('INSERT OR IGNORE'))!
-    expect(capInsert).toBeDefined()
-    expect(capInsert.sql).toContain('INSERT OR IGNORE INTO capabilities')
+    if (!result.ok) throw new Error('expected ok')
+    expect(result.grantUnchanged).toBe(true)
+    // No INSERT OR REPLACE should have run for capabilities
+    const capInsert = calls.find((c) => c.sql.includes('INSERT OR REPLACE INTO capabilities'))
+    expect(capInsert).toBeUndefined()
   })
 
   // Token label encodes the preset id for the audit trail
   it('token label encodes preset id and scope_id for audit trail', async () => {
     const { env } = makeEnv({
-      firstResults: [{ id: 'm1' }, { id: 'squad-abc' }],
+      firstResults: [{ id: 'm1' }, { id: 'squad-abc' }, null],
       runChanges: [1, 1],
     })
-    const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'sales-rep', scopeId: 'squad-abc' })
+    const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'sales-rep', scopeId: 'squad-abc', minterRank: 4 })
     expect(result.ok).toBe(true)
     if (!result.ok) throw new Error('expected ok')
     expect(result.label).toContain('[preset:sales-rep')
@@ -347,13 +372,124 @@ describe('mintScopedKey', () => {
   // Org preset: label has no scope segment (null scope)
   it('label for org preset has no scope_id segment', async () => {
     const { env } = makeEnv({
-      firstResults: [{ id: 'm2' }],
+      firstResults: [{ id: 'm2' }, null],
       runChanges: [1, 1],
     })
-    const result = await mintScopedKey(env, { memberId: 'm2', presetId: 'admin', scopeId: null })
+    const result = await mintScopedKey(env, { memberId: 'm2', presetId: 'admin', scopeId: null, minterRank: 5 })
     expect(result.ok).toBe(true)
     if (!result.ok) throw new Error('expected ok')
     expect(result.label).toBe('[preset:admin]')
+  })
+
+  // ── NEW: rank-ceiling tests (the BLOCK fix) ──────────────────────────────────
+
+  // (1) admin minting admin preset → 403 (rank_ceiling: 4 >= 4)
+  it('rank_ceiling: admin (rank 4) cannot mint admin preset (rank 4)', async () => {
+    const { env } = makeEnv()
+    // rank_ceiling fires before any DB access — no firstResults needed
+    const result = await mintScopedKey(env, {
+      memberId: 'm-admin',
+      presetId: 'admin',
+      scopeId: null,
+      minterRank: 4,  // admin rank
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected failure')
+    expect(result.error).toBe('rank_ceiling')
+  })
+
+  // (2) owner minting admin preset → OK (rank 4 < 5)
+  it('rank_ceiling: owner (rank 5) CAN mint admin preset (rank 4)', async () => {
+    const { env } = makeEnv({
+      firstResults: [{ id: 'm1' }, null],
+      runChanges: [1, 1],
+    })
+    const result = await mintScopedKey(env, {
+      memberId: 'm1',
+      presetId: 'admin',
+      scopeId: null,
+      minterRank: 5,  // owner rank
+    })
+    expect(result.ok).toBe(true)
+  })
+
+  // (3) admin minting sales-rep (member, rank 2) → OK; admin minting observer (rank 1) → OK
+  it('rank_ceiling: admin (rank 4) can mint sales-rep (member, rank 2)', async () => {
+    const { env } = makeEnv({
+      firstResults: [{ id: 'm1' }, { id: 's1' }, null],
+      runChanges: [1, 1],
+    })
+    const result = await mintScopedKey(env, {
+      memberId: 'm1',
+      presetId: 'sales-rep',
+      scopeId: 's1',
+      minterRank: 4,  // admin rank
+    })
+    expect(result.ok).toBe(true)
+  })
+
+  it('rank_ceiling: admin (rank 4) can mint observer preset (rank 1)', async () => {
+    const { env } = makeEnv({
+      firstResults: [{ id: 'm1' }, { id: 's1' }, null],
+      runChanges: [1, 1],
+    })
+    const result = await mintScopedKey(env, {
+      memberId: 'm1',
+      presetId: 'observer',
+      scopeId: 's1',
+      minterRank: 4,
+    })
+    expect(result.ok).toBe(true)
+  })
+
+  // (4) rank-max upsert: sales-rep (member, rank 2) over existing observer (rank 1) → grant upgraded
+  it('rank-max upsert: sales-rep (member, rank 2) over existing observer (rank 1) → grant upgraded', async () => {
+    const { env, calls } = makeEnv({
+      firstResults: [
+        { id: 'm1' },              // member exists
+        { id: 's1' },              // squad exists
+        { capability: 'observer' }, // existing grant is observer (rank 1) — lower than member (rank 2)
+      ],
+      runChanges: [1, 1],
+    })
+    const result = await mintScopedKey(env, {
+      memberId: 'm1',
+      presetId: 'sales-rep',  // role=member (rank 2)
+      scopeId: 's1',
+      minterRank: 4,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('expected ok')
+    // Grant was upgraded — grantUnchanged should be false
+    expect(result.grantUnchanged).toBeFalsy()
+    // INSERT OR REPLACE should have run (upgrading observer → member)
+    const capInsert = calls.find((c) => c.sql.includes('INSERT OR REPLACE INTO capabilities'))
+    expect(capInsert).toBeDefined()
+    expect(capInsert!.binds[4]).toBe('member')
+  })
+
+  // (5) observer over existing lead → stays lead (downgrade protection, grantUnchanged=true)
+  it('rank-max upsert: observer (rank 1) over existing lead (rank 3) → stays lead, grantUnchanged=true', async () => {
+    const { env, calls } = makeEnv({
+      firstResults: [
+        { id: 'm1' },           // member exists
+        { id: 's1' },           // squad exists
+        { capability: 'lead' }, // existing grant is lead (rank 3) — higher than observer (rank 1)
+      ],
+      runChanges: [1],          // only token INSERT runs
+    })
+    const result = await mintScopedKey(env, {
+      memberId: 'm1',
+      presetId: 'observer',  // role=observer (rank 1)
+      scopeId: 's1',
+      minterRank: 4,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('expected ok')
+    expect(result.grantUnchanged).toBe(true)
+    // No INSERT OR REPLACE for capabilities — downgrade blocked
+    const capInsert = calls.find((c) => c.sql.includes('INSERT OR REPLACE INTO capabilities'))
+    expect(capInsert).toBeUndefined()
   })
 })
 

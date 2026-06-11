@@ -19,14 +19,19 @@
 //   3. The capability grant is written atomically with the token (same D1 batch).
 //   4. scope_id is only accepted from the pot's own squads/departments — the
 //      caller cannot supply an arbitrary UUID to claim another pot's scope.
-//   5. An admin can only mint at ranks BELOW their own effective rank (owner
-//      guard: adminpresets top at 'admin' so an admin can never mint 'owner').
+//   5. The minted preset's role rank MUST be STRICTLY LESS THAN the minter's
+//      effective rank (passed as minterRank). An admin (rank 4) can mint lead,
+//      member, or observer but NOT another admin (rank 4 >= 4 → 403). Only an
+//      owner (rank 5) can mint admin (rank 4 < 5). This is enforced at the
+//      service layer, not just by the preset list, so it holds even if a new
+//      preset is added that assigns rank 4.
 
-import { html, raw } from 'hono/html'
-import type { Env } from '../types'
+import { html, raw as honoRaw } from 'hono/html'
+import type { Env, Capability } from '../types'
 import { mintMemberToken } from '../members/service'
 import { ROLE_PRESETS, findPreset } from '../auth/role-presets'
 import type { RolePreset } from '../auth/role-presets'
+import { capabilityRank } from '../auth/capability'
 
 // ── shapes ────────────────────────────────────────────────────────────────────
 
@@ -103,10 +108,17 @@ export interface MintParams {
   presetId: string
   /** squad id (required when preset.scopeHint === 'squad'), dept id for 'department'. Null for 'org'. */
   scopeId: string | null
+  /**
+   * The minter's effective rank on the org scope (owner=5, admin=4, …).
+   * The preset's role rank MUST be strictly less than this value.
+   * Pass the result of actorMaxRankOnScope (or capabilityRank(auth.role) for a
+   * legacy web-login) — the route handler is responsible for resolving it.
+   */
+  minterRank: number
 }
 
 export type MintResult =
-  | { ok: true; raw: string; tokenId: string; label: string }
+  | { ok: true; raw: string; tokenId: string; label: string; grantUnchanged?: boolean }
   | { ok: false; error: string }
 
 /**
@@ -116,19 +128,33 @@ export type MintResult =
  * This function does NOT re-check admin — it is an internal service layer, not a gate.
  *
  * Steps:
- *  1. Validate preset + member exist in this pot.
- *  2. When scope is squad/department, validate the scope_id belongs to this pot
+ *  1. Validate preset + rank ceiling: preset.role rank MUST be strictly less than
+ *     minterRank. Rejects with 'rank_ceiling' if the minter's rank is <= the preset's.
+ *  2. Validate member exists in this pot.
+ *  3. When scope is squad/department, validate the scope_id belongs to this pot
  *     (prevents a caller from claiming another tenant's scope uuid).
- *  3. Write a capability grant for the member on the resolved scope.
- *  4. Mint a member_token (channel='workspace') via the shared service.
- *  5. Return raw once; never persisted.
+ *  4. Write the capability grant using a rank-max strategy: read any existing grant
+ *     on the same (member, scope_type, scope_id) — if the existing rank is already
+ *     >= the preset's rank, skip the write (return grantUnchanged=true); otherwise
+ *     INSERT OR REPLACE to upgrade.  This ensures the stored grant reflects the
+ *     highest rank ever minted and the token label is never a lie.
+ *  5. Mint a member_token (channel='workspace') via the shared service.
+ *  6. Return raw once; never persisted.
  */
 export async function mintScopedKey(env: Env, params: MintParams): Promise<MintResult> {
-  const { memberId, presetId, scopeId } = params
+  const { memberId, presetId, scopeId, minterRank } = params
 
   // 1. Validate preset.
   const preset = findPreset(presetId)
   if (!preset) return { ok: false, error: 'unknown_preset' }
+
+  // 1b. Rank-ceiling check: the preset's role rank must be STRICTLY LESS THAN the
+  //     minter's effective rank.  An admin (rank 4) cannot mint another admin (rank 4);
+  //     only an owner (rank 5) can.  This prevents lateral admin proliferation.
+  const presetRank = capabilityRank(preset.role)
+  if (presetRank >= minterRank) {
+    return { ok: false, error: 'rank_ceiling' }
+  }
 
   // 2. Validate member belongs to this pot (D1 is per-tenant — no extra tenant column
   //    needed, but we check existence to give a clean error vs a FK violation).
@@ -161,19 +187,35 @@ export async function mintScopedKey(env: Env, params: MintParams): Promise<MintR
 
   const resolvedScopeId = preset.scopeHint === 'org' ? null : (scopeId ?? null)
 
-  // 4. Write (or upsert) the capability grant for the member on this scope.
-  //    UNIQUE(member_id, scope_type, scope_id) — upsert on conflict to allow
-  //    re-minting (e.g. an admin mints a replacement key; the grant already exists).
-  //    We never DOWNGRADE an existing grant — if the member already has a higher
-  //    capability on this scope, we leave it (INSERT OR IGNORE is safe: a
-  //    higher-rank row is left unchanged, and the token is still minted).
-  const capId = crypto.randomUUID()
-  await env.DB.prepare(
-    `INSERT OR IGNORE INTO capabilities (id, member_id, scope_type, scope_id, capability)
-     VALUES (?1, ?2, ?3, ?4, ?5)`,
+  // 4. Rank-max upsert for the capability grant.
+  //    Read any existing grant on the same (member, scope_type, scope_id) row first.
+  //    If the existing capability rank is >= the preset's rank, skip the write and
+  //    flag grantUnchanged so the show-once page can surface a notice.
+  //    If the existing rank is lower (or there is no row), INSERT OR REPLACE to
+  //    upgrade the grant to the preset's capability.
+  //    This prevents both:
+  //      - Downgrade: re-minting a weaker preset silently reducing an existing grant.
+  //      - Audit divergence: the stored grant always matches the highest label issued.
+  const existing = await env.DB.prepare(
+    `SELECT capability FROM capabilities WHERE member_id = ?1 AND scope_type = ?2 AND scope_id IS ?3 LIMIT 1`,
   )
-    .bind(capId, memberId, preset.scopeType, resolvedScopeId, preset.role)
-    .run()
+    .bind(memberId, preset.scopeType, resolvedScopeId)
+    .first<{ capability: Capability }>()
+
+  let grantUnchanged = false
+  if (existing && capabilityRank(existing.capability) >= presetRank) {
+    // Existing grant is at equal or higher rank — leave it, never downgrade.
+    grantUnchanged = true
+  } else {
+    // No existing grant, or existing is weaker — write the higher rank.
+    const capId = crypto.randomUUID()
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO capabilities (id, member_id, scope_type, scope_id, capability)
+       VALUES (?1, ?2, ?3, ?4, ?5)`,
+    )
+      .bind(capId, memberId, preset.scopeType, resolvedScopeId, preset.role)
+      .run()
+  }
 
   // 5. Mint a member_token. Label encodes the preset + scope for the audit trail.
   //    The `[preset:<id>]` prefix is what loadKeysView uses to list scoped keys.
@@ -181,7 +223,7 @@ export async function mintScopedKey(env: Env, params: MintParams): Promise<MintR
   const label = `[preset:${preset.id}${scopeLabel}]`
   const minted = await mintMemberToken(env, memberId, label, 'workspace')
 
-  return { ok: true, raw: minted.raw, tokenId: minted.id, label }
+  return { ok: true, raw: minted.raw, tokenId: minted.id, label, grantUnchanged }
 }
 
 // ── HTML views ────────────────────────────────────────────────────────────────
@@ -299,7 +341,7 @@ export function keysPageBody(
   and (for squad/department presets) the target scope.
 </p>
 
-${raw(errorHtml)}
+${honoRaw(errorHtml)}
 
 <h2>Mint a key</h2>
 <div class="card">
@@ -311,14 +353,14 @@ ${raw(errorHtml)}
           Role preset
           <select name="preset_id" id="presetSelect" required onchange="updateGuide(this.value)">
             <option value="">— choose a preset —</option>
-            ${raw(presetOptions)}
+            ${honoRaw(presetOptions)}
           </select>
         </label>
         <label>
           Member
           <select name="member_id" required>
             <option value="">— choose a member —</option>
-            ${raw(memberOptions)}
+            ${honoRaw(memberOptions)}
           </select>
         </label>
         <div id="scopePickerContainer" style="display:none">
@@ -326,21 +368,21 @@ ${raw(errorHtml)}
             Squad (scope)
             <select name="scope_id" id="squadPicker">
               <option value="">— choose a squad —</option>
-              ${raw(squadOptions)}
+              ${honoRaw(squadOptions)}
             </select>
           </label>
           <label id="deptPickerLabel" style="display:none">
             Department (scope)
             <select name="scope_id" id="deptPicker">
               <option value="">— choose a department —</option>
-              ${raw(deptOptions)}
+              ${honoRaw(deptOptions)}
             </select>
           </label>
         </div>
       </div>
 
       <div id="guidePanelContainer" style="margin-top:14px">
-        ${raw(guidePanels)}
+        ${honoRaw(guidePanels)}
       </div>
 
       <div style="margin-top:16px">
@@ -359,7 +401,7 @@ ${raw(errorHtml)}
     <thead><tr>
       <th>Member</th><th>Label (preset:scope)</th><th>Created</th><th></th>
     </tr></thead>
-    <tbody>${raw(tokenRows)}</tbody>
+    <tbody>${honoRaw(tokenRows)}</tbody>
   </table>
 </div>
 
@@ -381,7 +423,7 @@ ${raw(errorHtml)}
 <script>
   // Preset metadata for scope picker visibility + guide toggling.
   // Populated from the server-rendered preset list (no fetch needed).
-  const PRESET_META = ${raw(
+  const PRESET_META = ${honoRaw(
     JSON.stringify(
       Object.fromEntries(
         ROLE_PRESETS.map((p) => [p.id, { scopeHint: p.scopeHint }]),
@@ -432,7 +474,15 @@ export function keysMintedBody(
   label: string,
   presetLabel: string,
   raw: string,
+  grantUnchanged?: boolean,
 ) {
+  const grantNotice = grantUnchanged
+    ? `<div class="warn-box" style="margin-bottom:14px;border-color:var(--warn)">
+    <strong>Grant unchanged (kept existing higher rank).</strong>
+    This member already held a capability at equal or higher rank on this scope.
+    The existing grant was preserved. The new token is still valid and scoped correctly.
+  </div>`
+    : ''
   return html`
 <div class="crumbs"><a href="/">Overview</a> › <a href="/admin/keys">Scoped API Keys</a> › Key minted</div>
 <h1>Key minted</h1>
@@ -440,6 +490,7 @@ export function keysMintedBody(
   <p style="font-size:14px;color:var(--muted);margin:0 0 14px">
     Scoped key for <strong>${memberName}</strong> · Preset: <strong>${presetLabel}</strong>
   </p>
+  ${honoRaw(grantNotice)}
   <div class="warn-box" style="margin-bottom:14px">
     <strong>Show once only.</strong> Copy this key now — it cannot be retrieved again.
     Store it in a secrets manager. Do not paste it in logs, chat, or version control.
