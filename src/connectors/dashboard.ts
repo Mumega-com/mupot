@@ -18,8 +18,9 @@ const TYPE_LABELS: Record<ConnectorType, string> = {
   instantly: 'Instantly',
   ghl:       'GoHighLevel',
   apify:     'Apify',
-  mcpwp:     'MCPWP',
-  custom:    'Custom',
+  mcpwp:      'MCPWP',
+  github_app: 'GitHub App',
+  custom:     'Custom',
 }
 
 function esc(s: string): string {
