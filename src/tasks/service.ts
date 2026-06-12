@@ -6,6 +6,7 @@
 
 import type { Env, Task, TaskVerdict, BusEvent } from '../types'
 import { createBus } from '../bus'
+import { resolveOutboundGitHubToken } from '../integrations/github-app'
 
 export type TaskStatus = Task['status']
 type TaskActor = NonNullable<BusEvent['actor']>
@@ -117,9 +118,11 @@ function issueBody(task: Task): string {
 }
 
 export async function mirrorTaskCreate(env: Env, task: Task): Promise<string | null> {
-  const token = env.GITHUB_TOKEN
   const repo = githubRepo(env)
-  if (!token || !repo) return null
+  if (!repo) return null
+  // App-first: prefer a short-lived installation token; fall back to the static PAT.
+  const token = await resolveOutboundGitHubToken(env)
+  if (!token) return null
 
   try {
     const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
@@ -136,9 +139,10 @@ export async function mirrorTaskCreate(env: Env, task: Task): Promise<string | n
 }
 
 export async function mirrorTaskUpdate(env: Env, task: Task): Promise<string | null> {
-  const token = env.GITHUB_TOKEN
   const repo = githubRepo(env)
-  if (!token || !repo) return task.github_issue_url
+  if (!repo) return task.github_issue_url
+  const token = await resolveOutboundGitHubToken(env)
+  if (!token) return task.github_issue_url
 
   const issueNumber = parseIssueNumber(task.github_issue_url)
   if (issueNumber === null) {

@@ -24,7 +24,14 @@
 const IV_BYTES = 12 // GCM standard 96-bit IV
 const KEY_BITS = 256
 
-export type ConnectorType = 'telegram' | 'instantly' | 'ghl' | 'apify' | 'mcpwp' | 'custom'
+export type ConnectorType =
+  | 'telegram'
+  | 'instantly'
+  | 'ghl'
+  | 'apify'
+  | 'mcpwp'
+  | 'github_app'
+  | 'custom'
 export type ConnectorScopeType = 'squad' | 'agent' | 'pot'
 
 const VALID_TYPES: readonly ConnectorType[] = [
@@ -33,6 +40,7 @@ const VALID_TYPES: readonly ConnectorType[] = [
   'ghl',
   'apify',
   'mcpwp',
+  'github_app',
   'custom',
 ]
 const VALID_SCOPE_TYPES: readonly ConnectorScopeType[] = ['squad', 'agent', 'pot']
