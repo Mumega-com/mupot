@@ -67,6 +67,21 @@ describe('GET /admin/github/status', () => {
   })
 })
 
+describe('GET /admin/github (HTML card)', () => {
+  it('non-admin → 403', async () => {
+    const res = await dashboardApp.fetch(req('/admin/github', 'GET'), envForRole('member'))
+    expect(res.status).toBe(403)
+  })
+  it('admin → 200 HTML with connect CTA (not connected by default)', async () => {
+    const res = await dashboardApp.fetch(req('/admin/github', 'GET'), envForRole('admin'))
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain('Connect GitHub')
+    expect(text).toContain('Capabilities')
+    expect(text).toContain('Sync the fleet to GitHub')
+  })
+})
+
 describe('POST /admin/github/agent-def', () => {
   it('non-admin → 403', async () => {
     const res = await dashboardApp.fetch(

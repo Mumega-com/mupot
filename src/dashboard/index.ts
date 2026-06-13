@@ -93,8 +93,9 @@ import {
 import { isConnectorType, isConnectorScopeType } from '../connectors/crypto'
 import { githubCapabilitySnapshot } from '../integrations/github-capabilities'
 import { writeAgentDef, assignIssueToCopilot } from '../integrations/github-repo-write'
-import { installUrl, parseInstallCallback, storeInstallation } from '../integrations/github-install'
+import { installUrl, parseInstallCallback, storeInstallation, getInstallationId } from '../integrations/github-install'
 import { syncFleetToGitHub } from '../integrations/github-fleet-sync'
+import { githubStatusBody } from '../integrations/github-dashboard'
 import { connectorsPageBody, connectorAddedBody, connectorRotatedBody } from '../connectors/dashboard'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -840,6 +841,23 @@ dashboardApp.get('/admin/github/status', async (c) => {
   if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const snapshot = await githubCapabilitySnapshot(c.env)
   return c.json(snapshot)
+})
+
+// GET /admin/github — the HTML status + connect + sync card (A4).
+dashboardApp.get('/admin/github', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(shell(c.env.BRAND, 'GitHub', errorBody('GitHub management requires owner or admin.')), 403)
+  }
+  const snapshot = await githubCapabilitySnapshot(c.env)
+  const installationId = await getInstallationId(c.env)
+  return c.html(
+    shell(
+      c.env.BRAND,
+      'GitHub',
+      githubStatusBody({ ...snapshot, connected: installationId !== null, installationId }),
+    ),
+  )
 })
 
 dashboardApp.post('/admin/github/agent-def', async (c) => {
@@ -1791,6 +1809,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         <a href="/members">People</a>
         <a href="/admin/divisions">Organization</a>
         <a href="/admin/keys">Scoped Keys</a>
+        <a href="/admin/github">GitHub</a>
         <a href="/setup">Setup</a>
         <a href="/auth/logout">Sign out</a>
       </nav>
