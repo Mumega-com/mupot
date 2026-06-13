@@ -151,6 +151,24 @@ describe('POST /admin/github/sync-fleet', () => {
   })
 })
 
+describe('POST /admin/github/execute-task', () => {
+  it('non-admin → 403', async () => {
+    const res = await dashboardApp.fetch(
+      req('/admin/github/execute-task', 'POST', { taskId: 'T1', repo: 'o/r', branchName: 'b', files: [{ path: 'a.ts', content: 'x' }], title: 'T' }),
+      envForRole('member'),
+    )
+    expect(res.status).toBe(403)
+  })
+  it('admin, invalid repo → 400 validate stage', async () => {
+    const res = await dashboardApp.fetch(
+      req('/admin/github/execute-task', 'POST', { taskId: 'T1', repo: 'bad', branchName: 'b', files: [{ path: 'a.ts', content: 'x' }], title: 'T' }),
+      envForRole('admin'),
+    )
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { stage: string }).stage).toBe('validate')
+  })
+})
+
 describe('POST /admin/github/assign-copilot', () => {
   it('non-admin → 403', async () => {
     const res = await dashboardApp.fetch(
