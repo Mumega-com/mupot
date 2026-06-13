@@ -200,6 +200,7 @@ describe('EVENT_REGISTRY — all canonical types produce valid done_when', () =>
     'booking.created': { booking_id: 'B3', contact_id: 'C3', start_time: '2026-07-01T10:00Z' },
     'pipeline.stage_changed': { contact_id: 'C4', stage: 'Proposal Sent' },
     'analytics.signal': { event: 'page_viewed_pricing', distinct_id: 'user-5' },
+    'memory.insight_captured': { insight_id: 'ins-001', title: 'colony retro finding #7' },
   }
 
   for (const [eventType, payload] of Object.entries(samplePayloads)) {
@@ -410,5 +411,108 @@ describe('eventIngestApp HTTP handler', () => {
     expect(res.status).toBe(404)
     const json = await res.json() as { error: string }
     expect(json.error).toBe('squad_not_found')
+  })
+})
+
+// ── D2: memory.insight_captured — dogfood the colony's own memory loop ────────
+//
+// Requirement: a signed/processed memory.insight_captured event mints a task
+// whose done_when is the real registry string (NOT a placeholder/sentinel).
+// An unmapped type must still return unmapped_event_type (regression guard).
+
+describe('D2 — memory.insight_captured', () => {
+  const SENTINEL_PATTERNS = [
+    '(backfill required)',
+    '(set via task update)',
+    '(agent-generated',
+  ]
+
+  it('D2-a. memory.insight_captured deriver produces non-placeholder done_when with insight ref', () => {
+    const deriver = EVENT_REGISTRY.get('memory.insight_captured')
+    expect(deriver).toBeDefined()
+    if (!deriver) return
+
+    const payload = { insight_id: 'ins-007', title: 'colony retro finding #7' }
+    const derived = deriver(payload)
+
+    // title must reference the insight
+    expect(derived.title).toBe('[insight] ins-007')
+
+    // done_when must be the canonical real predicate
+    const expectedDoneWhen =
+      'insight "ins-007" recorded as a durable memory node — committed to git, tier-set, provenance-linked, and confirmed present'
+    expect(derived.done_when).toBe(expectedDoneWhen)
+
+    // done_when must not be a known placeholder sentinel
+    for (const s of SENTINEL_PATTERNS) {
+      expect(derived.done_when.toLowerCase()).not.toContain(s.toLowerCase())
+    }
+
+    // body must be present and carry the payload
+    expect(derived.body).toContain('ins-007')
+  })
+
+  it('D2-a fallback. deriver falls back to payload.id when insight_id is absent', () => {
+    const deriver = EVENT_REGISTRY.get('memory.insight_captured')
+    expect(deriver).toBeDefined()
+    if (!deriver) return
+
+    const derived = deriver({ id: 'mem-fallback-id' })
+    expect(derived.title).toBe('[insight] mem-fallback-id')
+    expect(derived.done_when).toContain('"mem-fallback-id"')
+  })
+
+  it('D2-a fallback. deriver falls back to payload.title when insight_id and id are absent', () => {
+    const deriver = EVENT_REGISTRY.get('memory.insight_captured')
+    expect(deriver).toBeDefined()
+    if (!deriver) return
+
+    const derived = deriver({ title: 'adversarial-gate-pattern' })
+    expect(derived.title).toBe('[insight] adversarial-gate-pattern')
+    expect(derived.done_when).toContain('"adversarial-gate-pattern"')
+  })
+
+  it('D2-b. ingestEvent with memory.insight_captured mints a task with the real done_when', async () => {
+    const { env, inserts } = makeEnvWithDB()
+    const event: InboundEvent = {
+      type: 'memory.insight_captured',
+      source: 'mumega-brain',
+      squad_id: SQUAD_ID,
+      payload: { insight_id: 'ins-d2-test', title: 'D2 test insight' },
+    }
+
+    const result = await ingestEvent(env, event)
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    expect(result.done_when).toBe(
+      'insight "ins-d2-test" recorded as a durable memory node — committed to git, tier-set, provenance-linked, and confirmed present',
+    )
+
+    // Task must have been written to DB
+    const taskInsert = inserts.find(r => r.sql.includes('INSERT INTO tasks'))
+    expect(taskInsert).toBeDefined()
+
+    // The done_when in the DB row must match the returned value
+    const doneWhenInRow = taskInsert?.binds.find(b => b === result.done_when)
+    expect(doneWhenInRow).toBeDefined()
+  })
+
+  it('D2-b regression. an unmapped event type still returns unmapped_event_type (not silently dropped)', async () => {
+    const { env } = makeEnvWithDB()
+    const event: InboundEvent = {
+      type: 'colony.mystery.event',
+      source: 'mumega-brain',
+      squad_id: SQUAD_ID,
+      payload: { insight_id: 'ghost-001' },
+    }
+
+    const result = await ingestEvent(env, event)
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.code).toBe('unmapped_event_type')
+    expect(result.event_type).toBe('colony.mystery.event')
   })
 })
