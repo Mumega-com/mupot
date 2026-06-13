@@ -71,6 +71,10 @@ export function patchToDoneBypassesGate(
 export interface CreateTaskInput {
   squad_id: string
   title: string
+  // #142 capsule keystone: a verifiable success predicate. Required and must be
+  // a non-empty string — the application layer rejects blank/missing values before
+  // calling createTask() so the DB sentinel default is never written by new code.
+  done_when: string
   body?: string
   status?: TaskStatus
   assignee_agent_id?: string | null
@@ -276,17 +280,29 @@ export async function emitTaskEvent(
   })
 }
 
+// #142 capsule keystone: done_when must be a non-empty string.
+// Called by createTask() and the MCP tool handler before createTask() is invoked.
+export function isDoneWhenValid(v: unknown): v is string {
+  return typeof v === 'string' && v.trim().length > 0
+}
+
 export async function createTask(
   env: Env,
   input: CreateTaskInput,
   options: CreateTaskOptions = {},
 ): Promise<Task> {
+  // Enforce done_when before touching the DB.
+  if (!isDoneWhenValid(input.done_when)) {
+    throw new Error('done_when_required: task creation requires a non-empty verifiable success predicate')
+  }
+
   const now = new Date().toISOString()
   const task: Task = {
     id: crypto.randomUUID(),
     squad_id: input.squad_id,
     title: input.title.trim(),
     body: input.body ?? '',
+    done_when: input.done_when.trim(),
     status: input.status ?? 'open',
     assignee_agent_id: input.assignee_agent_id ?? null,
     github_issue_url: null,
@@ -300,14 +316,15 @@ export async function createTask(
   task.github_issue_url = options.skipMirror ? null : await mirrorTaskCreate(env, task)
 
   await env.DB.prepare(
-    `INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       task.id,
       task.squad_id,
       task.title,
       task.body,
+      task.done_when,
       task.status,
       task.assignee_agent_id,
       task.github_issue_url,

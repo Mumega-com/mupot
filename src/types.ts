@@ -196,6 +196,10 @@ export interface Task {
   result: string | null // execution output (model answer) or a short failure note
   completed_at: string | null // ISO; set when execution finishes (done OR blocked)
   gate_owner: string | null // capability string gating the review→approved|rejected transition
+  // #142 capsule keystone: a checkable success predicate (e.g. "test X passes",
+  // "GET /url returns 200", "migration applied"). Required on creation; the DB
+  // column carries a sentinel default for rows pre-dating this migration.
+  done_when: string
   // Durable pipeline (issue #7): set when this task was started via
   // POST /api/tasks/:id/pipeline.  Null on the legacy direct-execute path.
   // Used by the verdict endpoint to best-effort resume the waiting instance.

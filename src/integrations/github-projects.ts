@@ -191,6 +191,8 @@ export async function importProjectItems(
           squad_id: agent.squad_id,
           title: it.title,
           body: [it.url, `from GitHub Project (item ${it.itemId})`].filter(Boolean).join('\n'),
+          // #142: GitHub Project sync — predicate is the GH issue itself closing.
+          done_when: `GitHub Project item ${it.itemId} closed`,
           status: 'open',
           assignee_agent_id: agent.id,
         },

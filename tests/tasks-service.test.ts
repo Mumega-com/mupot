@@ -52,6 +52,7 @@ describe('createTask', () => {
       {
         squad_id: 'squad-1',
         title: '  Ship channel tasks  ',
+        done_when: 'channel tasks test passes',
         body: 'durable work',
       },
       { actor: { kind: 'agent', id: 'agent-1' } },
@@ -62,6 +63,7 @@ describe('createTask', () => {
       expect.objectContaining({ method: 'POST' }),
     )
     expect(task.title).toBe('Ship channel tasks')
+    expect(task.done_when).toBe('channel tasks test passes')
     expect(task.github_issue_url).toBe('https://github.com/acme/widgets/issues/7')
 
     expect(inserts).toHaveLength(1)
@@ -70,6 +72,7 @@ describe('createTask', () => {
       'squad-1',
       'Ship channel tasks',
       'durable work',
+      'channel tasks test passes',
       'open',
       null,
       'https://github.com/acme/widgets/issues/7',
@@ -99,10 +102,13 @@ describe('mirrorTaskUpdate', () => {
     squad_id: 'squad-1',
     title: 'A task',
     body: '',
+    done_when: 'task verified complete',
     status: 'open' as const,
     assignee_agent_id: null,
     result: null,
     completed_at: null,
+    gate_owner: null,
+    github_issue_url: null,
     created_at: '2026-06-06T00:00:00.000Z',
     updated_at: '2026-06-06T00:00:00.000Z',
   }

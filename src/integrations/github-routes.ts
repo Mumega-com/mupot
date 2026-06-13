@@ -237,6 +237,8 @@ githubInboundApp.post('/', async (c) => {
           squad_id: squadId,
           title: `${prefix} issue #${num}: ${safeField(issue.title)}`.slice(0, TITLE_MAX).trim(),
           body: [safeField(issue.html_url, 300), 'event: issues.opened'].filter(Boolean).join('\n'),
+          // #142: GitHub-inbound issue — predicate is that issue closing.
+          done_when: `GitHub issue #${num} closed`,
           status: 'open',
         },
         { skipMirror: true },
@@ -274,6 +276,7 @@ githubInboundApp.post('/', async (c) => {
 
   // skipMirror: a GitHub-origin task must NOT be mirrored back out to a GitHub issue —
   // that reflects untrusted PR fields under our token + risks a feedback loop (P1).
-  await createTask(c.env, { squad_id: squadId, title: mapped.title, body: mapped.body, status: 'open' }, { skipMirror: true })
+  // #142: GitHub event mapped to task — predicate is the triggering event resolved.
+  await createTask(c.env, { squad_id: squadId, title: mapped.title, body: mapped.body, done_when: `GitHub event ${eventType} resolved`, status: 'open' }, { skipMirror: true })
   return c.json({ ok: true })
 })

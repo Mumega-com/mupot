@@ -283,15 +283,22 @@ const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } 
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
 
 // task_create — create a task on a squad. cap: member+ on the TARGET squad.
+// #142 capsule keystone: done_when is required — a non-empty verifiable success
+// predicate (e.g. "test X passes", "GET /health returns 200").
 const toolTaskCreate: ToolSpec = {
   name: 'task_create',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, title: string, body?: string }',
+  args: '{ squad_id: string, title: string, done_when: string, body?: string }',
   inputSchema: {
     type: 'object',
-    properties: { squad_id: STRING_SCHEMA, title: STRING_SCHEMA, body: STRING_SCHEMA },
-    required: ['squad_id', 'title'],
+    properties: {
+      squad_id: STRING_SCHEMA,
+      title: STRING_SCHEMA,
+      done_when: { ...STRING_SCHEMA, description: 'Verifiable success predicate — a checkable condition that proves the task is complete.' },
+      body: STRING_SCHEMA,
+    },
+    required: ['squad_id', 'title', 'done_when'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
@@ -299,6 +306,10 @@ const toolTaskCreate: ToolSpec = {
     const title = str(args.title)
     if (!squadId) return fail(400, 'invalid_args', 'squad_id required')
     if (!title) return fail(400, 'invalid_args', 'title required')
+
+    // #142: done_when guard at the MCP boundary (before any DB work).
+    const doneWhen = typeof args.done_when === 'string' ? args.done_when.trim() : ''
+    if (!doneWhen) return fail(400, 'done_when_required', 'done_when must be a non-empty verifiable success predicate')
 
     const squad = await loadSquad(env, squadId)
     if (!squad) return fail(404, 'squad_not_found')
@@ -321,6 +332,7 @@ const toolTaskCreate: ToolSpec = {
       {
         squad_id: squad.id,
         title: title.trim(),
+        done_when: doneWhen,
         body,
       },
       { actor: memberActor(auth.memberId as string) },

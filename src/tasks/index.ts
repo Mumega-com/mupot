@@ -186,6 +186,8 @@ tasksApp.get('/:id', async (c) => {
 interface CreateTaskBody {
   squad_id?: unknown
   title?: unknown
+  // #142 capsule keystone: required — a verifiable success predicate.
+  done_when?: unknown
   body?: unknown
   status?: unknown
   assignee_agent_id?: unknown
@@ -205,6 +207,8 @@ tasksApp.post('/', async (c) => {
 
   if (!isNonEmptyString(body.squad_id)) return c.json({ error: 'invalid_squad_id' }, 400)
   if (!isNonEmptyString(body.title)) return c.json({ error: 'invalid_title' }, 400)
+  // #142: done_when is required at the REST boundary.
+  if (!isNonEmptyString(body.done_when)) return c.json({ error: 'done_when_required', detail: 'done_when must be a non-empty verifiable success predicate' }, 400)
 
   const squad = await getById<Squad>(c.env, 'squads', body.squad_id)
   if (!squad) return c.json({ error: 'squad_not_found' }, 404)
@@ -258,6 +262,7 @@ tasksApp.post('/', async (c) => {
   const task = await createTask(c.env, {
     squad_id: squad.id,
     title: body.title.trim(),
+    done_when: (body.done_when as string).trim(),
     body: taskBody,
     status,
     assignee_agent_id: assigneeAgentId,

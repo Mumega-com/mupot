@@ -307,7 +307,8 @@ describe('C6 OAuth zero-capability defaults', () => {
   it('task_create (needs member on squad) → forbidden or squad_not_found', async () => {
     const res = await post(
       mcpApp, '/',
-      { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'task_create', arguments: { squad_id: 'sq-1', title: 'hi' } } },
+      // #142: done_when required — include it so the pre-check passes and the auth/squad gate fires.
+      { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'task_create', arguments: { squad_id: 'sq-1', title: 'hi', done_when: 'task verified' } } },
       zeroHeaders,
       zeroCapEnv,
     )
@@ -765,7 +766,8 @@ describe('TEST-3 — zero-cap with real squad: 403 forbidden (not 404)', () => {
       {
         jsonrpc: '2.0', id: 30,
         method: 'tools/call',
-        params: { name: 'task_create', arguments: { squad_id: SQUAD_ID, title: 'test task' } },
+        // #142: done_when required — include it so the pre-check passes and the cap gate fires.
+        params: { name: 'task_create', arguments: { squad_id: SQUAD_ID, title: 'test task', done_when: 'task verified' } },
       },
       headers,
       env,

@@ -343,6 +343,8 @@ async function taskReply(
     {
       squad_id: squad.id,
       title: title.trim(),
+      // #142: IM quick-add has no predicate — sentinel flags it for backfill.
+      done_when: '(set via task update)',
       body: '',
     },
     { actor: memberActor(member.id) },
