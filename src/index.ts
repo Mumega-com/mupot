@@ -34,6 +34,7 @@ import { channelsApp, reconcileMembership } from './channels'
 import { channelsAdminApp } from './channels/admin'
 import { ghlInboundApp } from './integrations/ghl-routes'
 import { githubInboundApp } from './integrations/github-routes'
+import { eventIngestApp } from './events/ingest'
 import { prospectsApp } from './loops/prospects-routes'
 import { loopsApp } from './loops/routes'
 import { fleetCheckinApp } from './fleet/checkin-routes'
@@ -73,6 +74,9 @@ app.route('/api/channels', channelsAdminApp)
 // GHL act-channel: inbound webhook (unauthenticated by session; verified by HMAC secret).
 // Mounted BEFORE the dashboard '/' catch-all so /api/integrations/ghl/* wins.
 app.route('/api/integrations/ghl', ghlInboundApp)
+// Generic event → task ingestion (feedback-loop act wiring). HMAC-verified by EVENT_INGEST_SECRET.
+// Mounted BEFORE the dashboard '/' catch-all.
+app.route('/api/events', eventIngestApp)
 // GitHub weave: inbound webhook (HMAC-verified by GITHUB_WEBHOOK_SECRET) → work units.
 app.route('/api/integrations/github', githubInboundApp)
 app.route('/api/prospects', prospectsApp)
