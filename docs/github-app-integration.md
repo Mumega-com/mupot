@@ -92,12 +92,36 @@ behavior change for pots not yet on the App.
    - Or Worker secrets: `wrangler secret put GITHUB_APP_ID` (etc.).
 4. Set `GITHUB_REPO` (`owner/repo`) for the mirror target.
 
-## Roadmap (follow-ups)
+## Repo-write actions (the pot's GitHub hands)
 
-- [ ] **Agent-def writer** — pot writes `.github/agents/<name>.agent.md` into the tenant repo
-      via the installation token (Contents R/W). Makes the pot the author of the tenant's
-      GitHub coding agents.
-- [ ] **Copilot assign** — assign a mupot task's mirrored issue to the Copilot coding agent.
+`src/integrations/github-repo-write.ts` — built on the keystone + capability gate:
+
+- **`writeAgentDef(env, { repo, agentName, content })`** — write/update
+  `.github/agents/<name>.agent.md` in a repo (create-or-update via blob SHA). Gated on
+  `custom_agent_defs` (free tier). Makes the pot the AUTHOR of the tenant's GitHub coding
+  agents. `agentName` is `[a-z0-9-]`-only (no path traversal); `repo` rejects dot-segments.
+- **`assignIssueToCopilot(env, { repo, issueNumber })`** — hand an issue to the Copilot
+  coding agent via GraphQL `replaceActorsForAssignable` (actorIds = the `copilot-swe-agent`
+  bot resolved from `suggestedActors`, with the `issues_copilot_assignment_api_support`
+  feature header). Gated on `coding_agent_assign` (paid tier). Returns `copilot_unavailable`
+  if the bot isn't assignable for the repo/plan.
+
+Both gate on `githubCan()` BEFORE any network call, resolve the App token (App-first), and
+fail closed (typed `{ok:false}`; no token/detail leaks). Adversarial-reviewed: no P0/P1.
+
+## Live status (Mumega tenant #0)
+
+The `mupot` worker (TENANT_SLUG=`mumega`) has the App wired: `GITHUB_APP_ID`,
+`GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_REPO` set as Worker secrets;
+keystone deployed. Minting verified live — a real installation token reached all 33
+Mumega-com repos (incl private) with contents/issues/PRs/workflows=write.
+
+## Roadmap (remaining)
+
+- [x] Agent-def writer — `writeAgentDef`
+- [x] Copilot assign — `assignIssueToCopilot`
+- [ ] **Route/UI wiring** — expose the two actions behind admin-gated routes (or a task-flow
+      hook) so an operator triggers them from the dashboard. (Service layer is ready.)
 - [ ] **Install callback** — a `/connect/github` flow that captures `installation_id` from
       the GitHub App install redirect and writes the connector automatically.
 - [ ] **Per-agent MCP wiring** — point each `.agent.md`'s `mcp-servers` at the tenant's pot
