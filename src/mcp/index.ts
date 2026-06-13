@@ -551,6 +551,61 @@ const toolStatus: ToolSpec = {
   },
 }
 
+// boot_context — first-call coherence signal for any connecting principal.
+//
+// Problem (#126): boot_context must tell a first-run agent whether it has a claimed
+// identity seat (qNFT / mint_agent_token binding) so onboarding UX is coherent — an
+// unminted agent knows it must complete the mint ceremony; a minted agent can proceed.
+//
+// The signal is derived ENTIRELY from the server-side token record (the weld in
+// migration 0019_agent_token_binding.sql). member_tokens.agent_id is:
+//   - NULL  → human/operator principal   → identity_status: "unminted"
+//   - set   → agent-scoped token (minted) → identity_status: "minted"
+//
+// boot_context is deliberately LIGHTWEIGHT: it answers "who am I and am I minted?"
+// without the deep D1 fan-out of orient. An unminted agent calls boot_context first,
+// gets identity_status:"unminted" + next_step, completes mint, then calls orient.
+// A minted agent calls boot_context for a fast coherence check, then proceeds with work.
+//
+// ADDITIVE: all existing fields remain unchanged; identity_status is a NEW field on
+// the response. No breaking changes to callers who ignore unknown fields.
+const toolBootContext: ToolSpec = {
+  name: 'boot_context',
+  scope: 'self (read-only — no args required)',
+  min: 'authenticated',
+  args: '{}  // no args — identity is derived entirely from the bearer token',
+  inputSchema: {
+    type: 'object',
+    properties: {},
+    additionalProperties: false,
+  },
+  async run(auth, env, _args, ctx) {
+    // identity_status: derived from whether this token has an agent-identity binding.
+    // The weld (migration 0019) sets member_tokens.agent_id when mint_agent_token runs.
+    // auth.boundAgentId mirrors that field — it is resolved server-side from the token,
+    // never from client input.
+    const isMinted = auth.boundAgentId !== null
+    const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
+
+    const nextStep = isMinted
+      ? 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
+      : 'ask an org-admin to call mint_agent_token for your agent, then reconnect with the issued token'
+
+    return done({
+      // principal fields (mirrors the status tool's self-echo, kept stable)
+      tenant: auth.tenant,
+      member_id: auth.memberId,
+      channel: auth.channel,
+      capabilities: auth.capabilities ?? [],
+      mcp_endpoint: mcpEndpoint(canonicalOrigin(env, ctx.origin)),
+      // identity coherence (#126) — NEW field
+      identity_status: identityStatus,
+      bound_agent_id: auth.boundAgentId ?? null,
+      next_step: nextStep,
+    })
+  },
+}
+
 // orient — the basin-drop. Any agent on any harness reads "who am I, my squad, my scope,
 // my tasks, my tools, my field state" in-band. This is the harness-agnostic onboarding:
 // the agent's identity is the token, the packet is grounded in THIS pot's D1 only.
@@ -618,6 +673,7 @@ const TOOLS: ToolSpec[] = [
   toolWakeAgent,
   toolSquadMessage,
   toolStatus,
+  toolBootContext,
   toolOrient,
   ...PROVISION_TOOLS,
 ]
