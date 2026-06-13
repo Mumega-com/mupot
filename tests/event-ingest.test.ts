@@ -236,9 +236,15 @@ describe('ingestEvent — skipMirror default', () => {
 
       expect(result.ok).toBe(true)
       // fetch must NOT have been called (no GitHub mirror)
-      const ghCalls = fetchSpy.mock.calls.filter(
-        (args) => typeof args[0] === 'string' && (args[0] as string).includes('github.com'),
-      )
+      const ghCalls = fetchSpy.mock.calls.filter((args) => {
+        if (typeof args[0] !== 'string') return false
+        try {
+          const host = new URL(args[0] as string).hostname
+          return host === 'github.com' || host.endsWith('.github.com')
+        } catch {
+          return false
+        }
+      })
       expect(ghCalls).toHaveLength(0)
     } finally {
       vi.unstubAllGlobals()
