@@ -1,0 +1,84 @@
+# mupot-viamar — Viamar tenant pot. NOT the template config (that's wrangler.toml).
+# Deploy: CLOUDFLARE_API_TOKEN=$(cat ~/.sos/keys/cf-token-admin.token) \
+#         CLOUDFLARE_ACCOUNT_ID=e39eaf94f33092c4efd029d94ae1e9dd \
+#         NODE_OPTIONS=--dns-result-order=ipv4first wrangler deploy -c wrangler.viamar.toml
+# Tracked copy: mumega.com/agents/viamar/mupot-viamar.wrangler.toml (keep in sync).
+#
+# Security mode: LOW (token auth, inbound-only). OAuth secrets deliberately NOT set.
+# Upgrade to MEDIUM (Google OAuth + verified seats) per wave-1 plan — requires Hadi nod.
+# Bus tenant: viamar (token tail 2b3cdd92), SOS project: viamar.
+name = "mupot-viamar"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+TENANT_SLUG = "viamar"
+BRAND = "Viamar"
+OAUTH_PROVIDER = "google"
+PUBLIC_ORIGIN = "https://mupot-viamar.workers.dev"
+FLEET_PROJECT = "viamar"
+FLEET_OPS_AGENT = "viamar"
+# GitHub weave (Lo-Agency/torivers-v2 is the sink for torivers; viamar uses Digidinc/viamar or similar).
+# GITHUB_REPO intentionally unset at LOW mode — set when egress gate opens.
+#
+# Secrets deliberately NOT set yet (inbound-only LOW mode, egress-gate):
+# no OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN,
+# no channel tokens. Set when wave-1 MEDIUM-OAuth receives Hadi nod.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mupot-viamar"
+database_id = "bfc6d04c-6979-4f03-8574-2cfb144f7f46"
+migrations_dir = "migrations"
+
+[[vectorize]]
+binding = "VEC"
+index_name = "mupot-viamar-memory"
+
+[[queues.producers]]
+binding = "BUS"
+queue = "mupot-viamar-events"
+
+[[queues.consumers]]
+queue = "mupot-viamar-events"
+max_batch_size = 10
+max_retries = 3
+dead_letter_queue = "mupot-viamar-events-dlq"
+
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "ce04191473bf4028a166accc7173b9a6"
+
+# OAuth 2.1 state (clients, grants, tokens) — isolated from sessions.
+# Required by @cloudflare/workers-oauth-provider for the MCP JSON-RPC path.
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "493221d4bf6b408299e0115b8e0722dc"
+
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "mupot-viamar-blobs"
+
+[ai]
+binding = "AI"
+
+[[durable_objects.bindings]]
+name = "AGENT"
+class_name = "AgentDO"
+
+[[durable_objects.bindings]]
+name = "SQUAD"
+class_name = "SquadCoordinatorDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AgentDO", "SquadCoordinatorDO"]
+
+[[workflows]]
+name = "mupot-viamar-task-workflow"
+binding = "TASK_WORKFLOW"
+class_name = "TaskWorkflow"
+
+[triggers]
+crons = ["*/15 * * * *"]
