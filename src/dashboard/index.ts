@@ -93,6 +93,7 @@ import {
 import { isConnectorType, isConnectorScopeType } from '../connectors/crypto'
 import { githubCapabilitySnapshot } from '../integrations/github-capabilities'
 import { writeAgentDef, assignIssueToCopilot } from '../integrations/github-repo-write'
+import { installUrl, parseInstallCallback, storeInstallation } from '../integrations/github-install'
 import { connectorsPageBody, connectorAddedBody, connectorRotatedBody } from '../connectors/dashboard'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -874,6 +875,44 @@ dashboardApp.post('/admin/github/assign-copilot', async (c) => {
 
   const result = await assignIssueToCopilot(c.env, { repo, issueNumber })
   return c.json(result, result.ok ? 200 : 400)
+})
+
+// ── GitHub one-click connect (install flow) ───────────────────────────────────
+//
+// GET /admin/github/connect    — isAdmin; mint a CSRF state, redirect to the App install
+// GET /connect/github/callback — GitHub redirects here post-install with installation_id;
+//                                verify state (single-use, KV-stored, tenant-bound), capture id.
+//
+// The shared "mupot" App's key is a platform secret; this captures THIS tenant's installation_id.
+
+dashboardApp.get('/admin/github/connect', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const state = crypto.randomUUID()
+  // Single-use, tenant-bound, 10-min TTL. Verified + deleted on callback.
+  await c.env.SESSIONS.put(`ghstate:${state}`, c.env.TENANT_SLUG, { expirationTtl: 600 })
+  return c.redirect(installUrl(state))
+})
+
+dashboardApp.get('/connect/github/callback', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+
+  const url = new URL(c.req.url)
+  const state = url.searchParams.get('state') ?? ''
+  // CSRF: state must match a stored, tenant-bound token. Single-use (deleted after read).
+  const boundTenant = state ? await c.env.SESSIONS.get(`ghstate:${state}`) : null
+  if (!boundTenant || boundTenant !== c.env.TENANT_SLUG) {
+    return c.html(shell(c.env.BRAND, 'Connect GitHub', errorBody('Invalid or expired connect request.')), 400)
+  }
+  await c.env.SESSIONS.delete(`ghstate:${state}`)
+
+  const parsed = parseInstallCallback(url)
+  if (!parsed) {
+    return c.html(shell(c.env.BRAND, 'Connect GitHub', errorBody('GitHub did not return a valid installation.')), 400)
+  }
+  await storeInstallation(c.env, parsed.installationId, url.searchParams.get('account_login'))
+  return c.redirect('/admin/github/status')
 })
 
 // ── members page (GET) + token mint/revoke (POST-redirect-GET) ────────────────

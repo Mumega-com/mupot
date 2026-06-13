@@ -23,6 +23,7 @@
 
 import type { Env } from '../types'
 import { decryptConnectorSecret } from '../connectors/crypto'
+import { getInstallationId } from './github-install'
 
 const GITHUB_API = 'https://api.github.com'
 // GitHub validates the WHOLE span (exp - iat) against a 600s hard cap. iat is backdated
@@ -230,13 +231,19 @@ export async function resolveGitHubAppCreds(env: Env): Promise<GitHubAppCreds | 
     }
   }
 
-  // Worker-secret fallback.
+  // Platform-key path (the multi-tenant model): the shared App's id + private key live as
+  // Worker secrets; the installation_id is per-tenant. Resolve the installation_id from the
+  // explicit Worker secret first (single-tenant dogfood), else the per-tenant install store
+  // written by the /connect/github callback.
   const e = appEnv(env)
-  if (e.GITHUB_APP_ID && e.GITHUB_APP_PRIVATE_KEY && e.GITHUB_APP_INSTALLATION_ID) {
-    return {
-      appId: e.GITHUB_APP_ID,
-      privateKeyPem: e.GITHUB_APP_PRIVATE_KEY,
-      installationId: e.GITHUB_APP_INSTALLATION_ID,
+  if (e.GITHUB_APP_ID && e.GITHUB_APP_PRIVATE_KEY) {
+    let installationId = e.GITHUB_APP_INSTALLATION_ID
+    if (!installationId) {
+      const stored = await getInstallationId(env)
+      if (stored) installationId = stored
+    }
+    if (installationId) {
+      return { appId: e.GITHUB_APP_ID, privateKeyPem: e.GITHUB_APP_PRIVATE_KEY, installationId }
     }
   }
   return null
