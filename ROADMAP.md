@@ -40,14 +40,20 @@ re-measures.** Plus `docs/coherence-model.md` as the north star every agent read
 - the brain→dispatch→state→brain wire (decide: CF-native port of `coherence.py` vs defer to a forked brain).
 - coherence-model doc — the four rails + the loop.
 
-## v0.21.0 — Flock complete
+## ✅ v0.21.0 — GitHub agent substrate *(shipped 2026-06-13 — see CHANGELOG)*
+A pot acts on GitHub under its own scoped identity, two execution backends (Copilot + own
+fleet), full provisioning chain, plan-tier-tagged with an Enterprise kill switch. PRs
+#129–#137. Docs: public connect guides + internal security model. The pot's GitHub body.
+This is the GitHub weave (#71/#73/#74) completed — foreshadowed in 0.19, shipped here.
+
+## v0.22.0 — Flock complete
 Any runtime onboards + operates a pot, gated — including your DevOps agent.
 - **#53** harness packs — Codex, Hermes (Nous), openclaw, Claude Cowork.
 - **#46** Fleet wake / control (gated, ops-agent-executed) + the token-scope half of #44.
 - **#47** ChatGPT Business into the flock (caller-client; depends #41).
 - **#40** Fleet Layer-A polish.
 
-## v0.22.0 — digid operates live (the MCPWP pilot)
+## v0.23.0 — digid operates live (the MCPWP pilot)
 A pot runs a **real business** coherently through the rails — the proof.
 - **#42** Digid marketing roster — Inbound · Outbound · Internet-Research (seeded via product path).
 - the gated **MCPWP content loop** — read brand-crystal → draft a WP post via MCPWP → `/approvals` → publish.
