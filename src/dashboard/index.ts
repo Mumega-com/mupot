@@ -91,6 +91,8 @@ import {
   listConnectors,
 } from '../connectors/service'
 import { isConnectorType, isConnectorScopeType } from '../connectors/crypto'
+import { githubCapabilitySnapshot } from '../integrations/github-capabilities'
+import { writeAgentDef, assignIssueToCopilot } from '../integrations/github-repo-write'
 import { connectorsPageBody, connectorAddedBody, connectorRotatedBody } from '../connectors/dashboard'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -821,6 +823,57 @@ dashboardApp.post('/admin/connectors/:id/revoke', async (c) => {
   }
 
   return c.redirect('/admin/connectors')
+})
+
+// ── GitHub admin (JSON API) ───────────────────────────────────────────────────
+//
+// The pot's GitHub hands, exposed for the operator + agents. All isAdmin-gated and
+// tenant-scoped (the App token is this pot's). JSON (not HTML) so agents call them too.
+//   GET  /admin/github/status         — capability snapshot (tier, kill switch, per-feature)
+//   POST /admin/github/agent-def      — write .github/agents/<name>.agent.md  { repo, agentName, content, message? }
+//   POST /admin/github/assign-copilot — assign an issue to Copilot            { repo, issueNumber }
+
+dashboardApp.get('/admin/github/status', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const snapshot = await githubCapabilitySnapshot(c.env)
+  return c.json(snapshot)
+})
+
+dashboardApp.post('/admin/github/agent-def', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+
+  let body: { repo?: unknown; agentName?: unknown; content?: unknown; message?: unknown }
+  try {
+    body = (await c.req.json()) as typeof body
+  } catch {
+    return c.json({ ok: false, error: 'invalid_json' }, 400)
+  }
+  const repo = typeof body.repo === 'string' ? body.repo.trim() : ''
+  const agentName = typeof body.agentName === 'string' ? body.agentName.trim() : ''
+  const content = typeof body.content === 'string' ? body.content : ''
+  const message = typeof body.message === 'string' ? body.message : undefined
+
+  const result = await writeAgentDef(c.env, { repo, agentName, content, message })
+  return c.json(result, result.ok ? 200 : 400)
+})
+
+dashboardApp.post('/admin/github/assign-copilot', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+
+  let body: { repo?: unknown; issueNumber?: unknown }
+  try {
+    body = (await c.req.json()) as typeof body
+  } catch {
+    return c.json({ ok: false, error: 'invalid_json' }, 400)
+  }
+  const repo = typeof body.repo === 'string' ? body.repo.trim() : ''
+  const issueNumber = typeof body.issueNumber === 'number' ? body.issueNumber : NaN
+
+  const result = await assignIssueToCopilot(c.env, { repo, issueNumber })
+  return c.json(result, result.ok ? 200 : 400)
 })
 
 // ── members page (GET) + token mint/revoke (POST-redirect-GET) ────────────────
