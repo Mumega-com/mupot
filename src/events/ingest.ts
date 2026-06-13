@@ -156,6 +156,24 @@ export const EVENT_REGISTRY: ReadonlyMap<string, DoneWhenDeriver> = new Map([
       body: JSON.stringify(payload).slice(0, 2000),
     }
   }],
+
+  // ── memory.insight_captured ───────────────────────────────────────────────
+  // The colony captured a new insight (agent observation, pattern, retro
+  // finding, or brain suggestion) and needs it durably recorded as a memory
+  // node — committed to git, tier-set, provenance-linked, and confirmed present.
+  // done_when: the insight is a durable, retrievable memory node (not just a
+  // bus message or ephemeral log line).
+  ['memory.insight_captured', (payload) => {
+    const ref = safeStr(
+      payload.insight_id ?? payload.id ?? payload.title,
+      'unknown-insight',
+    )
+    return {
+      title: `[insight] ${ref}`,
+      done_when: `insight "${ref}" recorded as a durable memory node — committed to git, tier-set, provenance-linked, and confirmed present`,
+      body: JSON.stringify(payload).slice(0, 2000),
+    }
+  }],
 ])
 
 // ── Core ingest function ─────────────────────────────────────────────────────
