@@ -46,6 +46,7 @@ export type GitHubFeature =
   | 'issue_mirror' // task↔issue sync — any plan, incl free/public
   | 'app_token_mint' // GitHub App installation tokens — any plan
   | 'custom_agent_defs' // write .github/agents/*.agent.md — any plan (GA across plans)
+  | 'repo_file_write' // own-fleet writes: branch + arbitrary file + open PR — any plan
   | 'coding_agent_assign' // assign an issue to the Copilot coding agent — PAID plans
   | 'org_mcp_allowlist' // org-level MCP server allowlist for agents — ENTERPRISE
   | 'audit_log_stream' // audit-log streaming — ENTERPRISE
@@ -65,6 +66,7 @@ export const GITHUB_FEATURES: Record<GitHubFeature, FeatureSpec> = {
   issue_mirror: { minTier: 'free', enterprise: false, label: 'Task ↔ issue mirror' },
   app_token_mint: { minTier: 'free', enterprise: false, label: 'App installation tokens' },
   custom_agent_defs: { minTier: 'free', enterprise: false, label: 'Custom agent definitions' },
+  repo_file_write: { minTier: 'free', enterprise: false, label: 'Own-fleet repo writes (branch/file/PR)' },
   coding_agent_assign: { minTier: 'pro', enterprise: false, label: 'Copilot coding-agent assign' },
   org_mcp_allowlist: { minTier: 'enterprise', enterprise: true, label: 'Org MCP server allowlist' },
   audit_log_stream: { minTier: 'enterprise', enterprise: true, label: 'Audit-log streaming' },
