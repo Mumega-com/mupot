@@ -179,6 +179,43 @@ function parseIssueNumber(url: string | null): number | null {
   return Number.isInteger(n) ? n : null
 }
 
+/**
+ * B3 — inbound status sync: a GitHub issue (that mirrors a pot task) was closed/reopened, so
+ * reflect it onto the task. Finds the task by its github_issue_url and updates status DIRECTLY
+ * (no mirrorTaskUpdate — this update ORIGINATES from GitHub; mirroring it back would PATCH the
+ * very issue that fired the webhook → a feedback loop). closed → done, reopened/open → open.
+ *
+ * Idempotent + bounded: only flips open⇄done, never overrides a task already in the target
+ * state or in review/approved/rejected (those are pot-side gate states GitHub must not clobber).
+ * Returns whether a row changed.
+ */
+export async function syncTaskStatusFromIssue(
+  env: Env,
+  issueUrl: string,
+  action: 'closed' | 'reopened',
+): Promise<{ updated: boolean }> {
+  if (!issueUrl) return { updated: false }
+  const now = new Date().toISOString()
+  if (action === 'closed') {
+    // open/in_progress → done. Leave review/approved/rejected/done untouched.
+    const res = await env.DB.prepare(
+      `UPDATE tasks SET status = 'done', completed_at = ?1, updated_at = ?1
+        WHERE github_issue_url = ?2 AND status IN ('open','in_progress')`,
+    )
+      .bind(now, issueUrl)
+      .run()
+    return { updated: Boolean(res.meta?.changes && res.meta.changes > 0) }
+  }
+  // reopened: done → open (only if it was closed by us). Never touch gate states.
+  const res = await env.DB.prepare(
+    `UPDATE tasks SET status = 'open', completed_at = NULL, updated_at = ?1
+      WHERE github_issue_url = ?2 AND status = 'done'`,
+  )
+    .bind(now, issueUrl)
+    .run()
+  return { updated: Boolean(res.meta?.changes && res.meta.changes > 0) }
+}
+
 function eventAgentId(task: Task, actor?: TaskActor): string | undefined {
   if (actor?.kind === 'agent') return actor.id
   return task.assignee_agent_id ?? undefined
