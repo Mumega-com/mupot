@@ -242,6 +242,9 @@ export async function runGoalCycle(
           squad_id: agent.squad_id,
           title: proposal.title,
           body: proposal.body,
+          // Loop-proposed tasks carry a sentinel; the operator or the next cycle
+          // should update done_when to a real predicate before marking done.
+          done_when: '(agent-generated — set via task update)',
           gate_owner: gateOwner,
           assignee_agent_id: assignee,
         },

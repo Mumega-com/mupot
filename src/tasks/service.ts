@@ -286,6 +286,57 @@ export function isDoneWhenValid(v: unknown): v is string {
   return typeof v === 'string' && v.trim().length > 0
 }
 
+// Door 5 — completion gate: placeholder sentinel strings that satisfy non-empty
+// presence (Door 3) but are NOT verifiable predicates. A task must have its
+// done_when replaced with a real predicate before it can be marked done.
+//
+// Canonical sentinel set (matches Door 3 inbound call-site fallback values):
+//  - '(backfill required)'                     — DB migration column default
+//  - '(set via task update)'                   — IM / channel inbound path
+//  - '(agent-generated — set via task update)' — agent-do model-fallback
+//
+// Matching is case-insensitive and whitespace-trimmed so minor typos in old rows
+// still hit the guard. New sentinels should be added here AND at the inbound call
+// site that produces them.
+const PLACEHOLDER_SENTINELS: ReadonlySet<string> = new Set([
+  '(backfill required)',
+  '(set via task update)',
+  '(agent-generated — set via task update)',
+])
+
+/**
+ * Returns true when the done_when value is a known placeholder sentinel — i.e.
+ * it satisfies presence (non-empty) but is NOT a verifiable predicate.
+ * Used by the completion gate to refuse DONE transitions with unset predicates.
+ */
+export function isPlaceholderDoneWhen(v: string): boolean {
+  return PLACEHOLDER_SENTINELS.has(v.trim().toLowerCase().replace(/\s+/g, ' '))
+    || PLACEHOLDER_SENTINELS.has(v.trim())
+}
+
+/**
+ * Throws `done_when_placeholder` if the done_when is blank or a known sentinel.
+ * Call this at every completion chokepoint (PATCH→done, agent finishTask) before
+ * writing `done` status to the DB.
+ *
+ * The auto-VERIFY step (checking the predicate holds) is a future door — this
+ * door closes the simpler gap: placeholder present ≠ completable.
+ */
+export function assertCompletableDoneWhen(doneWhen: string | null | undefined): void {
+  if (!isDoneWhenValid(doneWhen)) {
+    throw Object.assign(
+      new Error('done_when_placeholder: task cannot be marked done while done_when is blank — set a verifiable success predicate first'),
+      { code: 'done_when_placeholder' },
+    )
+  }
+  if (isPlaceholderDoneWhen(doneWhen as string)) {
+    throw Object.assign(
+      new Error(`done_when_placeholder: task cannot be marked done while done_when is a placeholder sentinel ("${(doneWhen as string).trim()}") — replace it with a real, checkable predicate first`),
+      { code: 'done_when_placeholder' },
+    )
+  }
+}
+
 export async function createTask(
   env: Env,
   input: CreateTaskInput,

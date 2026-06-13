@@ -25,7 +25,7 @@
 //    note; no tokens are spent.
 
 import type { Env, Agent, Task, ModelMessage, ModelPort, BusEvent } from '../types'
-import { checkTransition } from '../tasks/service'
+import { checkTransition, assertCompletableDoneWhen } from '../tasks/service'
 import { createModel } from '../model'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
@@ -158,6 +158,31 @@ export async function runTaskExecution(
       throw new Error(`gate_transition_invariant_violated: in_progress → ${successStatus}`)
     }
 
+    // Door 5 — completion gate: refuse DONE while done_when is a placeholder.
+    // Ungated tasks (gate_owner absent) go directly to 'done'; gated tasks land
+    // 'review' first, so the placeholder check only fires on the direct-done path.
+    // A placeholder done_when means the predicate was never set — the agent cannot
+    // verify completion against a sentinel. Block it here; surface as 'blocked' so
+    // the task stays visible and the operator can update done_when + retry.
+    if (successStatus === 'done') {
+      try {
+        assertCompletableDoneWhen(task.done_when)
+      } catch (placeholderErr) {
+        const note = capResult(
+          `done_when_placeholder: cannot mark done — done_when is a placeholder sentinel ("${String(task.done_when).trim()}"). ` +
+          'Update done_when to a real, checkable predicate before retrying.',
+        )
+        await finishTask(env, task.id, 'blocked', note, finishedAt, cycleCostMicroUsd)
+        await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
+        return {
+          ok: false,
+          task_id: task.id,
+          decided: 'done_when_placeholder',
+          task_status: 'blocked',
+          error: 'done_when_placeholder',
+        }
+      }
+    }
     await finishTask(env, task.id, successStatus, result, finishedAt, cycleCostMicroUsd)
     // Emit task.completed for ungated (terminal); task.review for gated (awaiting verdict).
     const eventType = successStatus === 'done' ? 'task.completed' : 'task.review'

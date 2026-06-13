@@ -97,6 +97,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     squad_id: 'squad-1',
     title: 'Gate me',
     body: '',
+    done_when: 'gate verdict recorded and audit receipt present',
     status: 'review',
     assignee_agent_id: null,
     github_issue_url: null,
