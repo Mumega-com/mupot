@@ -5,6 +5,7 @@ import {
   claudeCodeSnippet,
   codexSnippet,
   mcpServerKey,
+  wakeContractForAgent,
 } from '../src/dashboard/connect'
 
 describe('canonicalOrigin', () => {
@@ -68,5 +69,38 @@ describe('codexSnippet', () => {
     expect(snippet).toContain('bearer_token_env_var = "ACME_MCP_TOKEN"')
     expect(snippet).not.toContain('transport = "sse"') // Codex uses streamable-http
     expect(snippet).not.toContain('mupot_')
+  })
+})
+
+describe('wakeContractForAgent', () => {
+  const contract = wakeContractForAgent('agent-1', 'squad-1', 'digid', 'https://agents.digid.ca')
+
+  it('emit_url is <origin>/bus/emit (not /mcp — the bus endpoint, not the MCP endpoint)', () => {
+    expect(contract.emit_url).toBe('https://agents.digid.ca/bus/emit')
+  })
+
+  it('strips a trailing slash from the origin before joining', () => {
+    const c = wakeContractForAgent('a', 's', 't', 'https://agents.digid.ca/')
+    expect(c.emit_url).toBe('https://agents.digid.ca/bus/emit')
+  })
+
+  it('auth_header is the literal string "Authorization" (never a header value)', () => {
+    expect(contract.auth_header).toBe('Authorization')
+  })
+
+  it('body_shape.type is exactly "agent.wake" — matching the BusEventType', () => {
+    expect(contract.body_shape.type).toBe('agent.wake')
+  })
+
+  it('body_shape pre-fills agent_id, squad_id, tenant from the provided args', () => {
+    expect(contract.body_shape.agent_id).toBe('agent-1')
+    expect(contract.body_shape.squad_id).toBe('squad-1')
+    expect(contract.body_shape.tenant).toBe('digid')
+  })
+
+  it('note is a non-empty string with the S175 cross-tenant caveat', () => {
+    expect(typeof contract.note).toBe('string')
+    expect(contract.note.length).toBeGreaterThan(0)
+    expect(contract.note).toContain('S175')
   })
 })

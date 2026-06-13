@@ -25,7 +25,7 @@ import type { Env, BusEvent } from '../types'
 import { hasCapability } from '../auth/capability'
 import { createDepartment, createSquad, createAgent } from '../org/service'
 import { mintRawToken, sha256Hex } from '../members/service'
-import { mcpEndpoint } from '../dashboard/connect'
+import { mcpEndpoint, wakeContractForAgent } from '../dashboard/connect'
 import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
 import {
@@ -312,7 +312,11 @@ const toolMintAgentToken: ToolSpec = {
 
     // SECURITY: `raw` is the show-once token — returned as a BARE field, never woven
     // into a reusable config snippet (see src/dashboard/connect security note). The
-    // caller renders its own client config from raw + mcp_endpoint.
+    // caller renders its own client config from raw + mcp_endpoint + wake_contract.
+    //
+    // wake_contract (#115): the machine-readable spec for waking this agent via the
+    // bus HTTP surface. Returned alongside mcp_endpoint so the operator has the full
+    // self-serve picture in one flow — no manual tmux or shell access required.
     return done({
       token: {
         id: tokenId,
@@ -325,6 +329,7 @@ const toolMintAgentToken: ToolSpec = {
       },
       agent: { id: agent.id, slug: agent.slug, name: agent.name },
       mcp_endpoint: mcpEndpoint(ctx.origin),
+      wake_contract: wakeContractForAgent(agent.id, agent.squad_id, env.TENANT_SLUG, ctx.origin),
       note: 'raw token is shown ONCE — store it now; it is never retrievable again',
     })
   },
