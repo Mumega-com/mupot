@@ -4,6 +4,7 @@ import { describe, it, expect } from 'vitest'
 import {
   isValidBranch,
   isValidRepoPath,
+  isValidCommitIdentity,
   createBranch,
   putFile,
   openPullRequest,
@@ -40,6 +41,18 @@ describe('validation', () => {
     // adjacent .github paths are still allowed
     expect(isValidRepoPath('.github/agents/kasra.agent.md')).toBe(true)
     expect(isValidRepoPath('.github/CODEOWNERS')).toBe(true)
+  })
+})
+
+describe('isValidCommitIdentity (#21)', () => {
+  it('accepts a sane name + email', () => {
+    expect(isValidCommitIdentity({ name: 'Kasra', email: 'kasra@agents.mumega.com' })).toBe(true)
+  })
+  it('rejects empty name, bad email, non-object', () => {
+    expect(isValidCommitIdentity({ name: '', email: 'a@b.com' })).toBe(false)
+    expect(isValidCommitIdentity({ name: 'X', email: 'noat' })).toBe(false)
+    expect(isValidCommitIdentity(null)).toBe(false)
+    expect(isValidCommitIdentity({ name: 'X' })).toBe(false)
   })
 })
 
@@ -87,6 +100,39 @@ describe('putFile', () => {
     expect(body.branch).toBe('feature/x')
     expect(body.sha).toBeUndefined()
     expect(typeof body.content).toBe('string')
+    expect(body.author).toBeUndefined() // no identity → App identity
+  })
+
+  it('authors the commit as the named agent when an identity is given (#21)', async () => {
+    let body: Record<string, unknown> = {}
+    const fetchImpl = (async (_url: string, init?: RequestInit) => {
+      if (!init || init.method === undefined) return new Response('{}', { status: 404 })
+      body = JSON.parse(String(init.body))
+      return new Response(JSON.stringify({ commit: {} }), { status: 201 })
+    }) as unknown as typeof fetch
+    await putFile(
+      env(),
+      { repo: 'o/r', path: 'a.ts', content: 'x', branch: 'b', message: 'm', author: { name: 'Kasra', email: 'kasra@agents.mumega.com' } },
+      { fetchImpl },
+    )
+    expect(body.author).toEqual({ name: 'Kasra', email: 'kasra@agents.mumega.com' })
+    expect(body.committer).toEqual({ name: 'Kasra', email: 'kasra@agents.mumega.com' })
+  })
+
+  it('drops an invalid identity (falls back to App), does not fail the write', async () => {
+    let body: Record<string, unknown> = {}
+    const fetchImpl = (async (_url: string, init?: RequestInit) => {
+      if (!init || init.method === undefined) return new Response('{}', { status: 404 })
+      body = JSON.parse(String(init.body))
+      return new Response(JSON.stringify({ commit: {} }), { status: 201 })
+    }) as unknown as typeof fetch
+    const res = await putFile(
+      env(),
+      { repo: 'o/r', path: 'a.ts', content: 'x', branch: 'b', message: 'm', author: { name: '', email: 'bad' } as never },
+      { fetchImpl },
+    )
+    expect(res.ok).toBe(true)
+    expect(body.author).toBeUndefined()
   })
   it('rejects path traversal', async () => {
     expect((await putFile(env(), { repo: 'o/r', path: '../etc/passwd', content: 'x', branch: 'b', message: 'm' })).ok).toBe(false)

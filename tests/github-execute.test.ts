@@ -61,6 +61,38 @@ describe('executeTaskAsPR', () => {
     expect(updates[0].args).toContain('https://x/pull/11')
   })
 
+  it('authors commits as the task\'s assigned agent (#21)', async () => {
+    // env where the task has an assignee + the agents table resolves it.
+    const agent = { slug: 'kasra', name: 'Kasra' }
+    const DB = {
+      prepare: (sql: string) => ({
+        bind: (...args: unknown[]) => ({
+          first: async () => {
+            if (sql.includes('FROM tasks')) return { id: 'T1', status: 'open', assignee_agent_id: 'A1' }
+            if (sql.includes('FROM agents')) return agent
+            return null
+          },
+          run: async () => ({ meta: { changes: 1 } }),
+          all: async () => ({ results: [] }),
+        }),
+      }),
+    }
+    const e = { TENANT_SLUG: 't', DB, GITHUB_TOKEN: 'ghp_x', GITHUB_PLAN_TIER: 'free' } as unknown as Env
+    let authorSeen: unknown = null
+    const impl = (async (url: string, init?: RequestInit) => {
+      const u = String(url)
+      if (u.includes('/git/ref/heads/')) return new Response(JSON.stringify({ object: { sha: 'S' } }), { status: 200 })
+      if (u.endsWith('/git/refs')) return new Response('{}', { status: 201 })
+      if (u.includes('/contents/') && (!init || init.method === undefined)) return new Response('{}', { status: 404 })
+      if (u.includes('/contents/')) { authorSeen = JSON.parse(String(init?.body)).author; return new Response(JSON.stringify({ commit: {} }), { status: 201 }) }
+      if (u.endsWith('/pulls')) return new Response(JSON.stringify({ number: 1, html_url: 'https://x/pull/1' }), { status: 201 })
+      return new Response('{}', { status: 500 })
+    }) as unknown as typeof fetch
+    const res = await executeTaskAsPR(e, { ...base, files: [{ path: 'a.ts', content: 'x' }] }, { fetchImpl: impl })
+    expect(res.ok).toBe(true)
+    expect(authorSeen).toEqual({ name: 'Kasra', email: 'kasra@agents.mumega.com' })
+  })
+
   it('tolerates an existing branch (branch_exists) and proceeds', async () => {
     const { env: e } = env()
     const impl = (async (url: string, init?: RequestInit) => {

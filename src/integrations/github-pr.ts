@@ -66,6 +66,25 @@ interface ActionOpts {
   fetchImpl?: typeof fetch
 }
 
+/** A commit author/committer identity — so a named pot agent authors its own commits. */
+export interface CommitIdentity {
+  name: string
+  email: string
+}
+
+// Bounded, sane name + email. Not RFC-strict — just enough to keep the API body clean and
+// reject obviously-malformed values. Identities are pot-derived (agent roster), not attacker
+// input, but validate anyway (defense-in-depth).
+const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,255}$/
+export function isValidCommitIdentity(a: unknown): a is CommitIdentity {
+  if (!a || typeof a !== 'object') return false
+  const { name, email } = a as Record<string, unknown>
+  return (
+    typeof name === 'string' && name.trim().length > 0 && name.length <= 100 &&
+    typeof email === 'string' && EMAIL_RE.test(email)
+  )
+}
+
 export type CreateBranchResult = { ok: true; ref: string } | { ok: false; error: string }
 export type PutFileResult = { ok: true; commitUrl: string | null; updated: boolean } | { ok: false; error: string }
 export type OpenPrResult = { ok: true; number: number; url: string } | { ok: false; error: string }
@@ -126,10 +145,13 @@ export async function createBranch(
  */
 export async function putFile(
   env: Env,
-  params: { repo: string; path: string; content: string; branch: string; message: string },
+  params: { repo: string; path: string; content: string; branch: string; message: string; author?: CommitIdentity },
   opts: ActionOpts = {},
 ): Promise<PutFileResult> {
   const { repo, path, content, branch, message } = params
+  // Per-agent authorship: a valid identity authors+commits as that named agent; an invalid
+  // one is dropped (commit falls back to the App identity) rather than failing the write.
+  const author = isValidCommitIdentity(params.author) ? params.author : undefined
   if (!isValidRepo(repo)) return { ok: false, error: 'invalid_repo' }
   if (!isValidRepoPath(path)) return { ok: false, error: 'invalid_path' }
   if (!isValidBranch(branch)) return { ok: false, error: 'invalid_branch' }
@@ -159,7 +181,13 @@ export async function putFile(
     const r = await doFetch(url, {
       method: 'PUT',
       headers: ghHeaders(token),
-      body: JSON.stringify({ message, content: toBase64(content), branch, ...(sha ? { sha } : {}) }),
+      body: JSON.stringify({
+        message,
+        content: toBase64(content),
+        branch,
+        ...(sha ? { sha } : {}),
+        ...(author ? { author, committer: author } : {}),
+      }),
     })
     if (!r.ok) return { ok: false, error: `write_failed_${r.status}` }
     const b = (await r.json()) as { commit?: { html_url?: string } }
