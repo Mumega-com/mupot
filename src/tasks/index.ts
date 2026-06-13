@@ -23,7 +23,7 @@ import { requireAuth } from '../auth'
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap } from '../auth/capability'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid } from './service'
 import type { TaskStatus } from './service'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
@@ -186,6 +186,8 @@ tasksApp.get('/:id', async (c) => {
 interface CreateTaskBody {
   squad_id?: unknown
   title?: unknown
+  // #142 capsule keystone: required — a verifiable success predicate.
+  done_when?: unknown
   body?: unknown
   status?: unknown
   assignee_agent_id?: unknown
@@ -205,6 +207,8 @@ tasksApp.post('/', async (c) => {
 
   if (!isNonEmptyString(body.squad_id)) return c.json({ error: 'invalid_squad_id' }, 400)
   if (!isNonEmptyString(body.title)) return c.json({ error: 'invalid_title' }, 400)
+  // #142: done_when is required at the REST boundary.
+  if (!isNonEmptyString(body.done_when)) return c.json({ error: 'done_when_required', detail: 'done_when must be a non-empty verifiable success predicate' }, 400)
 
   const squad = await getById<Squad>(c.env, 'squads', body.squad_id)
   if (!squad) return c.json({ error: 'squad_not_found' }, 404)
@@ -258,6 +262,7 @@ tasksApp.post('/', async (c) => {
   const task = await createTask(c.env, {
     squad_id: squad.id,
     title: body.title.trim(),
+    done_when: (body.done_when as string).trim(),
     body: taskBody,
     status,
     assignee_agent_id: assigneeAgentId,
@@ -296,6 +301,9 @@ tasksApp.post('/', async (c) => {
 interface UpdateTaskBody {
   title?: unknown
   body?: unknown
+  // done_when may be updated to replace a placeholder sentinel with a real predicate.
+  // Must be a non-empty, non-sentinel string. Cannot be cleared (blank → error).
+  done_when?: unknown
   status?: unknown
   assignee_agent_id?: unknown
   gate_owner?: unknown
@@ -331,6 +339,16 @@ tasksApp.patch('/:id', async (c) => {
     if (typeof body.body !== 'string') return c.json({ error: 'invalid_body' }, 400)
     next.body = body.body
   }
+  // Door 5: done_when is updatable via PATCH so operators/agents can replace a
+  // placeholder sentinel with a real predicate before marking the task done.
+  // Allowed at any task status (even open/in_progress) — the constraint is only
+  // that the VALUE must be valid (non-empty, not a sentinel).
+  if (body.done_when !== undefined) {
+    if (!isDoneWhenValid(body.done_when)) {
+      return c.json({ error: 'invalid_done_when', detail: 'done_when must be a non-empty verifiable success predicate' }, 400)
+    }
+    next.done_when = (body.done_when as string).trim()
+  }
   if (body.status !== undefined) {
     // PATCH may only set patchable statuses; approved|rejected require the verdict endpoint.
     if (!isPatchableStatus(body.status)) return c.json({ error: 'invalid_status' }, 400)
@@ -349,6 +367,20 @@ tasksApp.patch('/:id', async (c) => {
         { error: 'gate_open', detail: 'gated task must be approved via /verdict before it can be marked done' },
         409,
       )
+    }
+    // Door 5 — completion gate: refuse DONE while done_when is a placeholder sentinel.
+    // Presence (non-empty) was enforced at creation (Door 3). This gate closes the loop:
+    // the predicate must be a real, checkable string — not one of the known sentinels
+    // that call sites inject when the model or inbound channel did not supply one.
+    if (body.status === 'done') {
+      try {
+        assertCompletableDoneWhen(existing.done_when)
+      } catch (err) {
+        return c.json(
+          { error: 'done_when_placeholder', detail: err instanceof Error ? err.message : 'done_when is a placeholder — set a real predicate first' },
+          409,
+        )
+      }
     }
     next.status = body.status
   }
@@ -386,12 +418,13 @@ tasksApp.patch('/:id', async (c) => {
 
   await c.env.DB.prepare(
     `UPDATE tasks
-        SET title = ?, body = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, updated_at = ?
+        SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, updated_at = ?
       WHERE id = ?`,
   )
     .bind(
       next.title,
       next.body,
+      next.done_when,
       next.status,
       next.assignee_agent_id,
       next.github_issue_url,

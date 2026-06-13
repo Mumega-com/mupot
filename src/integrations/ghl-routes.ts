@@ -200,6 +200,8 @@ ghlInboundApp.post('/inbound', async (c) => {
     squad_id: squadId,
     title,
     body: rawBody.slice(0, 2000), // store the raw event (truncated) for context
+    // #142: GHL inbound webhook — predicate is the CRM contact receiving a reply.
+    done_when: `GHL contact ${typeof event.contact_id === 'string' ? event.contact_id : 'replied'} processed`,
     status: 'open',
   })
 

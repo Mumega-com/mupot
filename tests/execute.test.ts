@@ -21,6 +21,10 @@ function makeTask(over: Partial<Task> = {}): Task {
     squad_id: 'squad-1',
     title: 'Draft the intro',
     body: 'two paragraphs',
+    // Door 5: default to a real predicate so existing execute tests are unaffected
+    // by the completion gate. Tests that specifically test placeholder blocking
+    // override done_when with a sentinel in their own setup.
+    done_when: 'Draft intro section accepted by reviewer',
     status: 'open',
     assignee_agent_id: null,
     github_issue_url: null,

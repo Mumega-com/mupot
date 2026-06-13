@@ -71,8 +71,10 @@ const RECALL_LIMIT = 5
 // parse defensively and fall back to a no-op decision rather than throwing.
 interface Decision {
   summary: string
-  // each action becomes a bus emit (currently only task creation is wired)
-  tasks: { title: string; body: string }[]
+  // each action becomes a bus emit (currently only task creation is wired).
+  // #142 capsule keystone: done_when is optional here (cheap models may omit it)
+  // — the creation path falls back to a sentinel; callers should backfill later.
+  tasks: { title: string; body: string; done_when?: string }[]
 }
 
 export class AgentDO extends DurableObject<Env> {
@@ -197,6 +199,8 @@ export class AgentDO extends DurableObject<Env> {
           squad_id: squadId,
           title: t.title,
           body: t.body,
+          // #142: use model-supplied predicate; fall back to a named sentinel.
+          done_when: t.done_when ?? '(agent-generated — set via task update)',
         }, {
           actor: { kind: 'agent', id: agent.id },
         })
@@ -228,7 +232,8 @@ export class AgentDO extends DurableObject<Env> {
         role: 'system',
         content:
           'You are an autonomous org agent. Respond ONLY with a compact JSON object: ' +
-          '{"summary": string, "tasks": [{"title": string, "body": string}]}. ' +
+          '{"summary": string, "tasks": [{"title": string, "body": string, "done_when": string}]}. ' +
+          'done_when must be a short, checkable success predicate (e.g. "test X passes", "PR merged"). ' +
           'Propose at most 3 concrete tasks. If nothing is warranted, return an empty tasks array.',
       },
       { role: 'user', content: prompt },
@@ -262,8 +267,12 @@ export class AgentDO extends DurableObject<Env> {
       const summary = typeof obj.summary === 'string' ? obj.summary : 'decided'
       const tasks = Array.isArray(obj.tasks)
         ? obj.tasks
-            .filter((t): t is { title: string; body?: string } => typeof t === 'object' && t !== null && typeof (t as { title?: unknown }).title === 'string')
-            .map((t) => ({ title: String(t.title).slice(0, 200), body: typeof t.body === 'string' ? t.body.slice(0, 4000) : '' }))
+            .filter((t): t is { title: string; body?: string; done_when?: string } => typeof t === 'object' && t !== null && typeof (t as { title?: unknown }).title === 'string')
+            .map((t) => ({
+              title: String(t.title).slice(0, 200),
+              body: typeof t.body === 'string' ? t.body.slice(0, 4000) : '',
+              done_when: typeof t.done_when === 'string' && t.done_when.trim().length > 0 ? t.done_when.trim().slice(0, 500) : undefined,
+            }))
         : []
       return { summary: summary.slice(0, 500), tasks }
     } catch {

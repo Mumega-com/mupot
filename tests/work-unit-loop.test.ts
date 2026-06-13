@@ -123,11 +123,12 @@ function makeRecall(): NonNullable<LoopDeps['recall']> {
 
 function makeCreateTask(): LoopDeps['createTask'] {
   return vi.fn().mockImplementation(
-    async (_env: Env, input: { squad_id: string; title: string; body?: string; gate_owner?: string | null; assignee_agent_id?: string | null }) => ({
+    async (_env: Env, input: { squad_id: string; title: string; body?: string; done_when?: string; gate_owner?: string | null; assignee_agent_id?: string | null }) => ({
       id: 'task-' + Math.random().toString(36).slice(2),
       squad_id: input.squad_id,
       title: input.title,
       body: input.body ?? '',
+      done_when: input.done_when ?? '(set via task update)',
       status: 'open' as const,
       assignee_agent_id: input.assignee_agent_id ?? null,
       github_issue_url: null,

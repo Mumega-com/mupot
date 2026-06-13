@@ -283,15 +283,22 @@ const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } 
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
 
 // task_create — create a task on a squad. cap: member+ on the TARGET squad.
+// #142 capsule keystone: done_when is required — a non-empty verifiable success
+// predicate (e.g. "test X passes", "GET /health returns 200").
 const toolTaskCreate: ToolSpec = {
   name: 'task_create',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, title: string, body?: string }',
+  args: '{ squad_id: string, title: string, done_when: string, body?: string }',
   inputSchema: {
     type: 'object',
-    properties: { squad_id: STRING_SCHEMA, title: STRING_SCHEMA, body: STRING_SCHEMA },
-    required: ['squad_id', 'title'],
+    properties: {
+      squad_id: STRING_SCHEMA,
+      title: STRING_SCHEMA,
+      done_when: { ...STRING_SCHEMA, description: 'Verifiable success predicate — a checkable condition that proves the task is complete.' },
+      body: STRING_SCHEMA,
+    },
+    required: ['squad_id', 'title', 'done_when'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
@@ -299,6 +306,10 @@ const toolTaskCreate: ToolSpec = {
     const title = str(args.title)
     if (!squadId) return fail(400, 'invalid_args', 'squad_id required')
     if (!title) return fail(400, 'invalid_args', 'title required')
+
+    // #142: done_when guard at the MCP boundary (before any DB work).
+    const doneWhen = typeof args.done_when === 'string' ? args.done_when.trim() : ''
+    if (!doneWhen) return fail(400, 'done_when_required', 'done_when must be a non-empty verifiable success predicate')
 
     const squad = await loadSquad(env, squadId)
     if (!squad) return fail(404, 'squad_not_found')
@@ -321,6 +332,7 @@ const toolTaskCreate: ToolSpec = {
       {
         squad_id: squad.id,
         title: title.trim(),
+        done_when: doneWhen,
         body,
       },
       { actor: memberActor(auth.memberId as string) },
@@ -539,6 +551,65 @@ const toolStatus: ToolSpec = {
   },
 }
 
+// boot_context — first-call coherence signal for any connecting principal.
+//
+// Problem (#126): boot_context must tell a first-run agent whether it has a claimed
+// identity seat (qNFT / mint_agent_token binding) so onboarding UX is coherent — an
+// unminted agent knows it must complete the mint ceremony; a minted agent can proceed.
+//
+// The signal is derived ENTIRELY from the server-side token record (the weld in
+// migration 0019_agent_token_binding.sql). member_tokens.agent_id is:
+//   - NULL  → human/operator principal   → identity_status: "unminted"
+//   - set   → agent-scoped token (minted) → identity_status: "minted"
+//
+// boot_context is deliberately LIGHTWEIGHT: it answers "who am I and am I minted?"
+// without the deep D1 fan-out of orient. An unminted agent calls boot_context first,
+// gets identity_status:"unminted" + next_step, completes mint, then calls orient.
+// A minted agent calls boot_context for a fast coherence check, then proceeds with work.
+//
+// ADDITIVE: all existing fields remain unchanged; identity_status is a NEW field on
+// the response. No breaking changes to callers who ignore unknown fields.
+const toolBootContext: ToolSpec = {
+  name: 'boot_context',
+  scope: 'self (read-only — no args required)',
+  min: 'authenticated',
+  args: '{}  // no args — identity is derived entirely from the bearer token',
+  inputSchema: {
+    type: 'object',
+    properties: {},
+    additionalProperties: false,
+  },
+  async run(auth, env, _args, ctx) {
+    // identity_status: derived from whether this token has an agent-identity binding.
+    // The weld (migration 0019) sets member_tokens.agent_id when mint_agent_token runs.
+    // auth.boundAgentId mirrors that field — it is resolved server-side from the token,
+    // never from client input.
+    const isMinted = auth.boundAgentId !== null
+    const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
+
+    // QA-1: every refusal/unminted signal must carry the full map out — no dead ends.
+    // Two paths for an unbound token:
+    //   A) Shared apikey + know your name → call connect { agent_name } (session-local, works now).
+    //   B) Want a permanent weld → ask an admin to call mint_agent_token, then reconnect.
+    const nextStep = isMinted
+      ? 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
+      : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
+
+    return done({
+      // principal fields (mirrors the status tool's self-echo, kept stable)
+      tenant: auth.tenant,
+      member_id: auth.memberId,
+      channel: auth.channel,
+      capabilities: auth.capabilities ?? [],
+      mcp_endpoint: mcpEndpoint(canonicalOrigin(env, ctx.origin)),
+      // identity coherence (#126) — NEW field
+      identity_status: identityStatus,
+      bound_agent_id: auth.boundAgentId ?? null,
+      next_step: nextStep,
+    })
+  },
+}
+
 // orient — the basin-drop. Any agent on any harness reads "who am I, my squad, my scope,
 // my tasks, my tools, my field state" in-band. This is the harness-agnostic onboarding:
 // the agent's identity is the token, the packet is grounded in THIS pot's D1 only.
@@ -560,7 +631,15 @@ const toolOrient: ToolSpec = {
     // ref: explicit arg wins; else the token's bound agent (the weld). No identity from args
     // is ever TRUSTED — `agent` only NAMES a target; the capability check below authorizes it.
     const ref = str(args.agent) ?? auth.boundAgentId ?? null
-    if (!ref) return fail(400, 'invalid_args', 'agent required (token is not agent-bound)')
+    if (!ref) {
+      // QA-1: dead-end refusal must carry the map out. An unbound token that calls orient
+      // without naming an agent is stuck — give the two paths that resolve it.
+      return fail(400, 'invalid_args', [
+        'agent required: your token is not agent-bound.',
+        'If you are a named agent connecting with a shared apikey, call connect { agent_name } first to claim your identity.',
+        'If you are a human or operator, pass { agent: "<id-or-slug>" } explicitly.',
+      ].join(' '))
+    }
 
     // Resolve id-first, slug-with-ambiguity-refusal (shared ../org/resolve). A bare slug
     // can match agents in different squads (UNIQUE(squad_id, slug)); refusing an ambiguous
@@ -599,6 +678,129 @@ const toolOrient: ToolSpec = {
   },
 }
 
+// connect — self-name-to-bind (#128). The cold→hot path for an authorized-but-unbound
+// connection (shared apikey, channel=workspace, boundAgentId=null) that knows its own
+// agent identity.
+//
+// Problem: agents boot with a shared apikey. They are AUTHORIZED (member + capabilities
+// on their squad) but UNBOUND (member_tokens.agent_id is null — no weld). They cannot
+// call orient without naming their agent explicitly, and every act-tool that requires a
+// bound-agent context is a dead end. connect bridges this gap: the connection DECLARES
+// its agent name → mupot resolves + verifies it → returns the orient packet → HOT.
+//
+// Security invariants (River's hard-RED respected):
+//   - We NEVER fabricate or auto-create an agent identity. The agent must already exist
+//     (created by an admin via create_agent or the dashboard).
+//   - The caller must have squad-member capability on the named agent's squad. A shared
+//     apikey without squad access cannot claim any agent in this pot.
+//   - The binding is SESSION-LOCAL: connect does NOT write to member_tokens.agent_id.
+//     Permanent binding requires an admin to call mint_agent_token and the agent to
+//     reconnect with the minted token. connect is the "work now" path; mint is the
+//     "promoted identity" path.
+//   - agent_name is a CLAIM, not a privilege: it only NAMES a target; the capability
+//     check authorizes it. We never read an identity from args and trust it directly.
+//
+// QA-3 (security): tool descriptions and args strings must NEVER use real tenant slugs
+// as examples. Use fictional slugs only (e.g. "acme", "example-co"). This tool sets the
+// pattern: the description and inputSchema use only fictional examples.
+const toolConnect: ToolSpec = {
+  name: 'connect',
+  scope: 'self (session-local agent identity claim — no args beyond agent_name)',
+  min: 'authenticated',
+  // QA-3 guard: fictional slugs only in the args documentation. Real tenant slugs must
+  // never appear here — this string is the public tool description served to connectors.
+  args: '{ agent_name: string }  // the agent slug or id you are connecting as (e.g. "growth-lead", "researcher"); must already exist in this pot',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      agent_name: {
+        type: 'string',
+        description: 'The slug or id of the agent you are connecting as. Must already exist in this pot. Examples: "growth-lead", "researcher" (fictional — use your actual agent slug).',
+      },
+    },
+    required: ['agent_name'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args, ctx) {
+    const agentName = str(args.agent_name)
+    if (!agentName) return fail(400, 'invalid_args', 'agent_name required — provide your agent slug or id')
+
+    // Resolve the named agent. id-first, slug-with-ambiguity-refusal (same as orient).
+    // The name is a CLAIM only; the capability check below authorizes it.
+    const resolved = await resolveAgentRef(env, agentName)
+    if (!resolved.ok) {
+      return resolved.reason === 'ambiguous'
+        ? fail(409, 'ambiguous_slug', [
+            'agent_name matches multiple agents — use the agent id instead of the slug.',
+            'Call status {} to see your member_id, then ask an admin for your agent id.',
+          ].join(' '))
+        : fail(404, 'agent_not_found', [
+            `No agent named "${agentName}" exists in this pot.`,
+            'Ask an org-admin to call create_agent with your name, or verify the slug/id is correct.',
+          ].join(' '))
+    }
+    const agentRef = resolved.value
+
+    // Authorization: caller must have squad-member capability on this agent's squad.
+    // An org-admin also passes (inherits down via memberCanOnSquad). This prevents an
+    // authorized-but-unscoped token from claiming an agent on a squad it has no access to.
+    const grants = auth.capabilities ?? []
+    const orgAdmin = hasCapability(grants, 'org', null, 'admin')
+    const onSquad = await memberCanOnSquad(env, grants, agentRef.squad_id, 'member')
+    if (!orgAdmin && !onSquad) {
+      return fail(403, 'forbidden', {
+        reason: 'no_squad_access',
+        detail: [
+          `Your token does not have member-or-higher capability on the squad for agent "${agentRef.slug}".`,
+          'Ask an org-admin to grant you squad membership, or verify you are using the right token.',
+        ].join(' '),
+        need: 'member',
+        scope: 'squad',
+      })
+    }
+
+    // viewSensitive (#88 parity): same rule as orient — orgAdmin || isSelf || squad-lead.
+    // A bare squad-member calling connect on a PEER (not their own agent) must get the
+    // redacted packet just as orient would return. isSelf covers the expected hot-path:
+    //   - unbound token (boundAgentId=null) claiming its own agent → isSelf=false, BUT
+    //     they have 'member' capability on the squad, and an actual self-claim is the whole
+    //     point; however that alone does not justify viewSensitive.
+    //   - a permanently-welded token reconnecting as itself → isSelf=true → full packet.
+    //   - a bare member claiming a PEER (or a different agent on their squad) → isSelf=false
+    //     + not lead + not admin → viewSensitive=false → redacted.
+    // The self-connect (cold→hot) case for an unbound member ends up viewSensitive=false
+    // unless they are also lead/admin. This is the correct least-privilege posture: the
+    // member sees a redacted packet until they are formally welded (mint_agent_token),
+    // at which point isSelf=true on all subsequent orient/connect calls. (#128)
+    const isSelf = auth.boundAgentId === agentRef.id
+    const viewSensitive =
+      orgAdmin || isSelf || (await memberCanOnSquad(env, grants, agentRef.squad_id, 'lead'))
+
+    // Resolve the full orient packet for the claimed agent (read-only, no D1 write).
+    const { data, notFound } = await buildOrient(
+      env,
+      agentRef.id,
+      orgAdmin ? 'admin' : 'observer+',
+      mcpEndpoint(canonicalOrigin(env, ctx.origin)),
+      viewSensitive,
+      Date.now(),
+    )
+    if (notFound || !data) return fail(404, 'agent_not_found', 'Agent was found but orient data is unavailable.')
+
+    return done({
+      connection_status: 'hot',
+      claimed_agent: { id: agentRef.id, slug: agentRef.slug, name: agentRef.name },
+      // SESSION-LOCAL binding note: this does not write member_tokens.agent_id.
+      // To promote to a permanent weld (so reconnects are automatic), ask an admin
+      // to call mint_agent_token { agent: "<id>" } and use the issued token going forward.
+      binding: 'session_local',
+      next_step: 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop. For a permanent identity weld ask an admin to call mint_agent_token.',
+      packet: data,
+      brief: renderBrief(data),
+    })
+  },
+}
+
 const TOOLS: ToolSpec[] = [
   toolTaskCreate,
   toolRemember,
@@ -606,7 +808,9 @@ const TOOLS: ToolSpec[] = [
   toolWakeAgent,
   toolSquadMessage,
   toolStatus,
+  toolBootContext,
   toolOrient,
+  toolConnect,
   ...PROVISION_TOOLS,
 ]
 

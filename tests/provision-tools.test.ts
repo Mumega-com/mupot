@@ -265,7 +265,19 @@ describe('mint_agent_token', () => {
     const res = await call('mint_agent_token', { agent: 'growth-lead' }, makeEnv({}, cap))
     expect(res.status).toBe(200)
     const body = (await res.json()) as {
-      result: { structuredContent: { token: { raw: string; agent_id: string }; agent: { id: string }; mcp_endpoint: string } }
+      result: {
+        structuredContent: {
+          token: { raw: string; agent_id: string }
+          agent: { id: string }
+          mcp_endpoint: string
+          wake_contract: {
+            emit_url: string
+            auth_header: string
+            body_shape: { type: string; agent_id: string; tenant: string; squad_id: string }
+            note: string
+          }
+        }
+      }
     }
     const sc = body.result.structuredContent
     // show-once raw token, bound to the agent
@@ -273,6 +285,15 @@ describe('mint_agent_token', () => {
     expect(sc.token.agent_id).toBe('agent-1')
     expect(sc.agent.id).toBe('agent-1')
     expect(sc.mcp_endpoint).toBe('https://agents.digid.ca/mcp')
+
+    // THE WAKE CONTRACT (#115): machine-readable wake spec returned alongside mcp_endpoint.
+    expect(sc.wake_contract.emit_url).toBe('https://agents.digid.ca/bus/emit')
+    expect(sc.wake_contract.auth_header).toBe('Authorization')
+    expect(sc.wake_contract.body_shape.type).toBe('agent.wake')
+    expect(sc.wake_contract.body_shape.agent_id).toBe('agent-1')
+    expect(sc.wake_contract.body_shape.squad_id).toBe('squad-1')
+    expect(sc.wake_contract.body_shape.tenant).toBe('digid')
+    expect(typeof sc.wake_contract.note).toBe('string')
 
     // THE WELD: member_tokens insert carries the agent id in agent_id (6th bind;
     // channel is a hard-coded literal, so binds are id,member,hash,label,created_at,agent_id).

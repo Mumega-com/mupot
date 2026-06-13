@@ -196,6 +196,10 @@ export interface Task {
   result: string | null // execution output (model answer) or a short failure note
   completed_at: string | null // ISO; set when execution finishes (done OR blocked)
   gate_owner: string | null // capability string gating the review→approved|rejected transition
+  // #142 capsule keystone: a checkable success predicate (e.g. "test X passes",
+  // "GET /url returns 200", "migration applied"). Required on creation; the DB
+  // column carries a sentinel default for rows pre-dating this migration.
+  done_when: string
   // Durable pipeline (issue #7): set when this task was started via
   // POST /api/tasks/:id/pipeline.  Null on the legacy direct-execute path.
   // Used by the verdict endpoint to best-effort resume the waiting instance.
@@ -290,6 +294,40 @@ export interface BusEvent<T = unknown> {
   actor?: { kind: 'member' | 'agent'; id: string } // attribution — who caused this
   payload: T
   ts: string // ISO; set by the producer
+}
+
+// ── Wake Contract ────────────────────────────────────────────────────────────
+//
+// Returned by mint_agent_token alongside mcp_endpoint. Describes exactly HOW
+// to fire an agent.wake event at this agent via the mupot bus HTTP surface —
+// the method, URL, required headers, and the body shape to POST.
+//
+// This is the self-serve equivalent of manual tmux send-keys: any caller that
+// holds the operator token + this contract can wake the agent without hand-wiring
+// or shell access. The bus consumer already routes agent.wake → AgentDO.wake();
+// this type makes the wire format explicit and machine-readable.
+//
+// Cross-project note (S175): today the /bus/emit endpoint is tenant-scoped —
+// only tokens minted inside the same pot can emit. Cross-project wake (e.g.
+// kasra@mumega waking agent:dgd.admin) requires S175 multiplex opt-in on the
+// SOS bus side; that is a runtime change outside this contract's scope.
+export interface WakeContract {
+  // POST this URL to fire the wake event.
+  emit_url: string
+  // Required header: 'Authorization: Bearer <OPERATOR_TOKEN>'
+  auth_header: 'Authorization'
+  // The body shape to POST (JSON). agent_id and tenant are pre-filled; reason
+  // is caller-supplied context (short string, optional but recommended).
+  body_shape: {
+    type: 'agent.wake'
+    agent_id: string
+    tenant: string
+    squad_id: string
+    // context / reason the caller fills in at call time
+    payload: { reason: string; context?: string }
+  }
+  // Human-readable note about the wake mechanism.
+  note: string
 }
 
 // ── Ports (the swappable seams; CF profile implements these) ──

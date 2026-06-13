@@ -34,6 +34,7 @@ import { channelsApp, reconcileMembership } from './channels'
 import { channelsAdminApp } from './channels/admin'
 import { ghlInboundApp } from './integrations/ghl-routes'
 import { githubInboundApp } from './integrations/github-routes'
+import { eventIngestApp } from './events/ingest'
 import { prospectsApp } from './loops/prospects-routes'
 import { loopsApp } from './loops/routes'
 import { fleetCheckinApp } from './fleet/checkin-routes'
@@ -41,6 +42,7 @@ import { flightsApp } from './flight/routes'
 import { orientApp } from './orient/routes'
 import { handleOAuthAuthorize, resolveExternalToken as memberKeyResolver } from './mcp/oauth-authorize'
 import { McpOAuthApiHandler } from './mcp/oauth-api-handler'
+import { brainPhysicsIngestApp } from './dashboard/brain-ingest'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -73,6 +75,9 @@ app.route('/api/channels', channelsAdminApp)
 // GHL act-channel: inbound webhook (unauthenticated by session; verified by HMAC secret).
 // Mounted BEFORE the dashboard '/' catch-all so /api/integrations/ghl/* wins.
 app.route('/api/integrations/ghl', ghlInboundApp)
+// Generic event → task ingestion (feedback-loop act wiring). HMAC-verified by EVENT_INGEST_SECRET.
+// Mounted BEFORE the dashboard '/' catch-all.
+app.route('/api/events', eventIngestApp)
 // GitHub weave: inbound webhook (HMAC-verified by GITHUB_WEBHOOK_SECRET) → work units.
 app.route('/api/integrations/github', githubInboundApp)
 app.route('/api/prospects', prospectsApp)
@@ -86,6 +91,10 @@ app.route('/api/flights', flightsApp)
 // Orient seam (#digid-hybrid S1): an agent reads its basin-drop packet; the mind pushes
 // per-agent field state inbound. Before the '/' catch-all. See docs/superpowers/specs.
 app.route('/api/orient', orientApp)
+// Brain physics ingest (#138): the sovereign daemon POSTs coherence scalars here after
+// each measure_and_log() cycle. Bearer-auth (admin token); stores to SESSIONS KV.
+// Mounted before the dashboard '/' catch-all so /api/brain/* is not shadowed.
+app.route('/api/brain', brainPhysicsIngestApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp

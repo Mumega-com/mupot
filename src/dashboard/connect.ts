@@ -8,6 +8,8 @@
 // never a real token. A raw token is shown EXACTLY ONCE on the mint show-once
 // page, never woven into a reusable config snippet.
 
+import type { WakeContract } from '../types'
+
 /** The pot's MCP endpoint, derived from the request origin (never hardcoded). */
 export function mcpEndpoint(origin: string): string {
   // origin is the scheme+host the browser reached us on (e.g. https://pot.example).
@@ -77,4 +79,48 @@ export function mcpServerKey(slug: string): string {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
   return cleaned.length > 0 ? cleaned : 'mupot'
+}
+
+/**
+ * wakeContractForAgent — build the WakeContract for an agent.
+ *
+ * Returns the machine-readable specification of HOW to fire an agent.wake event
+ * at this specific agent via the mupot bus HTTP surface. Returned alongside
+ * mcp_endpoint from mint_agent_token so the operator has everything in one flow.
+ *
+ * PURE: no DB, no env, no secrets. Accepts the resolved agent row fields and
+ * the request origin (scheme+host only; used the same way as mcpEndpoint).
+ *
+ * The emit_url is the bus emit endpoint: POST /bus/emit with the body shape
+ * filled in. The caller supplies the operator bearer token as the Authorization
+ * header (never embedded in this contract).
+ *
+ * Cross-project boundary note (#115 / S175): this contract is for callers
+ * within the SAME tenant pot. Waking agents across tenant boundaries (e.g.
+ * kasra@mumega -> agent:dgd.admin) requires S175 cross-project bus multiplex
+ * opt-in on the SOS layer — that is a runtime/infra change that this contract
+ * documents but does not implement (see note field).
+ */
+export function wakeContractForAgent(
+  agentId: string,
+  squadId: string,
+  tenant: string,
+  origin: string,
+): WakeContract {
+  const base = origin.replace(/\/+$/, '')
+  return {
+    emit_url: `${base}/bus/emit`,
+    auth_header: 'Authorization',
+    body_shape: {
+      type: 'agent.wake',
+      agent_id: agentId,
+      tenant,
+      squad_id: squadId,
+      payload: { reason: '<caller-supplied reason>', context: '<optional context string>' },
+    },
+    note:
+      'POST emit_url with Authorization: Bearer <OPERATOR_TOKEN> and the body_shape JSON (fill in payload.reason). ' +
+      'The bus consumer routes agent.wake to the AgentDO.wake() cycle immediately. ' +
+      'Cross-tenant wake (S175) requires additional bus-layer opt-in — see issue #115.',
+  }
 }

@@ -57,6 +57,9 @@ export async function wireGatedAct(
       squad_id: squadId,
       title: (act.summary || `loop act: ${act.tool}`).slice(0, 200),
       body: JSON.stringify({ loop_id: loop.id, tool: act.tool, args: act.args }),
+      // Loop-gate tasks enter at 'review' (human approval pending). The done_when
+      // predicate is auto-derived from the act: approval = task approved + act applied.
+      done_when: `Loop act "${act.tool}" approved and applied`,
       status: 'review',
       gate_owner: LOOP_GATE_OWNER,
     },
