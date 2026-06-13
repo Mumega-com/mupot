@@ -7,6 +7,10 @@
 //   (d) brainBody renders a "no data yet" panel when physics is null.
 //   (e) POST /api/brain/physics — 401 on no token, 200 + stores on valid admin token.
 //   (f) POST /api/brain/physics — 422 on a malformed payload.
+//   (g) isSparseSnapshot — detection logic for fed-not-rich dead signal.
+//   (h) brainBody renders sparse/carried qualifier when signal is sparse (ARF=0, C=1.0).
+//   (i) brainBody renders normally (no sparse qualifier) when signal is rich (ARF!=0).
+//   (j) brainBody sparse: surfaces completion count when present; "unknown" caveat when absent.
 
 import { describe, expect, it, vi } from 'vitest'
 
@@ -246,5 +250,140 @@ describe('(f) POST /api/brain/physics — 422 on malformed payload', () => {
     expect(res.status).toBe(422)
     const body = await res.json() as { error: string }
     expect(body.error).toBe('invalid_physics_payload')
+  })
+})
+
+// ── (g) isSparseSnapshot — detection logic ───────────────────────────────────
+import { isSparseSnapshot } from '../src/dashboard/brain'
+import type { PhysicsSnapshot } from '../src/dashboard/brain'
+
+function makeSparse(over: Partial<PhysicsSnapshot> = {}): PhysicsSnapshot {
+  return {
+    C: 1.0, R: 0.5, Psi: 0.0, ARF: 0.0,
+    regime: 'coercion',
+    raw_C: 1.0, completed: 0, failed: 0, backlog: 2,
+    had_signal: false, ts: 1720000000,
+    ...over,
+  }
+}
+
+function makeRich(over: Partial<PhysicsSnapshot> = {}): PhysicsSnapshot {
+  return {
+    C: 0.85, R: 0.6, Psi: 0.05, ARF: 0.0255,
+    regime: 'flow',
+    raw_C: 0.9, completed: 12, failed: 2, backlog: 1,
+    had_signal: true, ts: 1720000000,
+    ...over,
+  }
+}
+
+describe('(g) isSparseSnapshot', () => {
+  it('returns true when ARF=0 and C=1.0 (canonical dead-signal)', () => {
+    expect(isSparseSnapshot(makeSparse({ completed: undefined as unknown as number }))).toBe(true)
+  })
+
+  it('returns true when completed=0 (explicit zero, regardless of ARF)', () => {
+    // Even if ARF is nonzero (e.g. rounding), explicit zero completions = sparse.
+    expect(isSparseSnapshot(makeSparse({ ARF: 0.001, completed: 0 }))).toBe(true)
+  })
+
+  it('returns false when ARF!=0 (activation force present)', () => {
+    expect(isSparseSnapshot(makeRich())).toBe(false)
+  })
+
+  it('returns false when completed>0 (real completions in window)', () => {
+    expect(isSparseSnapshot(makeRich({ completed: 5 }))).toBe(false)
+  })
+
+  it('returns false when C!=1.0 and ARF=0 and no completed field (C decayed — not a carry)', () => {
+    // ARF=0 but C already decayed to 0.7 and there is no completed count in the
+    // snapshot: the EMA moved (prior cycles had completions), and C is not at the
+    // carried-1.0 starting point, so this is not the dead-signal case.
+    expect(isSparseSnapshot(makeSparse({
+      C: 0.7, ARF: 0.0,
+      completed: undefined as unknown as number,
+    }))).toBe(false)
+  })
+})
+
+// ── (h) brainBody renders sparse qualifier when snapshot is sparse ────────────
+describe('(h) brainBody: sparse snapshot renders carried qualifier, not confident-healthy style', () => {
+  it('C(t) cell uses scalar-value-sparse class (muted), not scalar-value (bold)', () => {
+    const html = String(brainBody({ loops: [], decisions: [], physics: makeSparse() }, false))
+    expect(html).toContain('scalar-value-sparse')
+    // The plain scalar-value class must NOT appear for the C cell when sparse.
+    // (Other cells — R, Psi, ARF — still use scalar-value, so we check for the sparse label instead.)
+    expect(html).toContain('carried · sparse')
+  })
+
+  it('renders the human label "fed, not rich" and "pilot-scale throughput"', () => {
+    const html = String(brainBody({ loops: [], decisions: [], physics: makeSparse() }, false))
+    expect(html).toContain('fed, not rich')
+    expect(html).toContain('pilot-scale throughput')
+  })
+
+  it('surfaces completion count when completed is present in snapshot', () => {
+    const html = String(brainBody({ loops: [], decisions: [], physics: makeSparse({ completed: 0 }) }, false))
+    expect(html).toContain('based on 0 completions in window')
+  })
+
+  it('does NOT render confident-green style for a sparse C=1.0', () => {
+    const html = String(brainBody({ loops: [], decisions: [], physics: makeSparse() }, false))
+    // The panel must not use a style that implies health (regime-flow badge is
+    // coercion for sparse fixture; the C cell must be muted not bold).
+    expect(html).toContain('scalar-value-sparse')
+    expect(html).not.toContain('"scalar-value">1.000') // no confident bold 1.000
+  })
+})
+
+// ── (i) brainBody renders normally when signal is rich ───────────────────────
+describe('(i) brainBody: rich snapshot renders C normally without sparse qualifier', () => {
+  it('does NOT render "carried · sparse" or "fed, not rich" for a rich signal', () => {
+    const html = String(brainBody({ loops: [], decisions: [], physics: makeRich() }, false))
+    // The sparse qualifier text must not appear in the rendered HTML body.
+    // (The CSS style block defines .scalar-value-sparse but that is a definition,
+    // not a usage — we check the human-readable qualifier text instead.)
+    expect(html).not.toContain('carried · sparse')
+    expect(html).not.toContain('fed, not rich')
+  })
+
+  it('uses the class attribute "scalar-value" (not sparse variant) on the C cell for a rich signal', () => {
+    const html = String(brainBody({ loops: [], decisions: [], physics: makeRich() }, false))
+    // Rich: the C cell renders with plain scalar-value, not scalar-value-sparse.
+    // Hono html`` renders: class="scalar-value">0.850
+    expect(html).toContain('"scalar-value">0.850')
+    expect(html).not.toContain('"scalar-value-sparse">0.850')
+  })
+
+  it('still renders the C value in the panel', () => {
+    const html = String(brainBody({ loops: [], decisions: [], physics: makeRich() }, false))
+    expect(html).toContain('0.850')
+  })
+})
+
+// ── (j) brainBody sparse: "sample size unknown" when completed absent ─────────
+describe('(j) brainBody sparse: caveat when completed field is absent from snapshot', () => {
+  it('shows "sample size unknown — interpret C as directional only" when completed is absent', () => {
+    // Snapshot triggers ARF=0 + C=1.0 path but has no `completed` field.
+    const noCompleted: PhysicsSnapshot = {
+      C: 1.0, R: 0.5, Psi: 0.0, ARF: 0.0,
+      regime: 'coercion',
+      raw_C: 1.0,
+      // completed deliberately omitted to simulate older snapshot shape
+      completed: undefined as unknown as number,
+      failed: 0, backlog: 2,
+      had_signal: false, ts: 1720000000,
+    }
+    const html = String(brainBody({ loops: [], decisions: [], physics: noCompleted }, false))
+    expect(html).toContain('sample size unknown')
+    expect(html).toContain('directional only')
+  })
+})
+
+// ── no data still shows "no data yet" (regression guard) ────────────────────
+describe('no-data panel: unchanged behaviour', () => {
+  it('shows "no data yet" when physics is null', () => {
+    const html = String(brainBody({ loops: [], decisions: [], physics: null }, false))
+    expect(html).toContain('no data yet')
   })
 })

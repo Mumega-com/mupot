@@ -214,6 +214,27 @@ function statusBadgeClass(status: string): string {
 
 // ── coherence panel helpers ───────────────────────────────────────────────────
 
+/**
+ * isSparseSnapshot — true when C is "fed, not rich": the EMA has not been
+ * driven by real completions so C is a carried value, not a measured one.
+ *
+ * Detection (ordered, first match wins):
+ *   1. ARF == 0  AND  C == 1.0  — canonical dead-signal: no activation force,
+ *      C is at the EMA starting point (or carried from a prior cycle).
+ *   2. completed == 0 (explicit zero from the snapshot) — direct evidence of
+ *      no completions in the window, regardless of ARF.
+ *
+ * If the snapshot carries no `completed` field (it is optional) we fall back
+ * to condition 1. We do NOT invent counts.
+ */
+export function isSparseSnapshot(p: PhysicsSnapshot): boolean {
+  // Condition 2: explicit zero completions in window.
+  if (typeof p.completed === 'number' && p.completed === 0) return true
+  // Condition 1: no activation force + C at 1.0 (carried).
+  if (p.ARF === 0 && p.C === 1.0) return true
+  return false
+}
+
 function regimeBadgeClass(regime: string): string {
   switch (regime) {
     case 'flow':     return 'regime-flow'
@@ -253,20 +274,30 @@ function physicsPanel(physics: PhysicsSnapshot | null) {
   const regimeClass = regimeBadgeClass(physics.regime)
   const regimeLbl = regimeLabel(physics.regime)
   const updatedAt = new Date(physics.ts * 1000).toISOString().slice(0, 16).replace('T', ' ')
-  const signalNote = physics.had_signal ? '' : ' (no completions — C carried)'
+  const sparse = isSparseSnapshot(physics)
+
+  // C(t) cell: muted style + qualifier when sparse; normal bold when rich.
+  const cValueClass = sparse ? 'scalar-value scalar-value-sparse' : 'scalar-value'
+  const completionNote = typeof physics.completed === 'number'
+    ? `based on ${physics.completed} completion${physics.completed === 1 ? '' : 's'} in window`
+    : 'sample size unknown — interpret C as directional only'
+  const sparseQualifier = sparse
+    ? html` <span class="scalar-sparse-label">carried · sparse<br><em>(fed, not rich — pilot-scale throughput)</em><br><small>${completionNote}</small></span>`
+    : html``
 
   return html`
     <section class="coherence-panel card" aria-label="Coherence physics">
       <div class="coherence-header">
         <span class="coherence-title">Coherence</span>
         <span class="regime-badge ${raw(regimeClass)}">${regimeLbl}</span>
-        <span class="coherence-updated">${updatedAt} UTC${raw(signalNote)}</span>
+        <span class="coherence-updated">${updatedAt} UTC</span>
       </div>
       <div class="coherence-scalars">
         <div class="scalar-cell">
           <span class="scalar-label">C(t)</span>
-          <span class="scalar-value">${physics.C.toFixed(3)}</span>
+          <span class="${raw(cValueClass)}">${physics.C.toFixed(3)}</span>
           <span class="scalar-sub">coherence</span>
+          ${sparseQualifier}
         </div>
         <div class="scalar-cell">
           <span class="scalar-label">R</span>
@@ -446,6 +477,17 @@ async function brainControl(btn) {
         font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums;
         line-height: 1.2; margin: 4px 0 2px;
       }
+      /* Sparse/carried C(t): muted neutral instead of confident bold. */
+      .scalar-value-sparse {
+        font-size: 22px; font-weight: 400; font-variant-numeric: tabular-nums;
+        line-height: 1.2; margin: 4px 0 2px; color: var(--dim);
+      }
+      .scalar-sparse-label {
+        font-size: 10px; color: var(--dim); text-align: center;
+        line-height: 1.5; margin-top: 4px;
+      }
+      .scalar-sparse-label em { font-style: italic; }
+      .scalar-sparse-label small { font-size: 9px; opacity: .8; }
       .scalar-sub {
         font-size: 10px; color: var(--muted);
       }
