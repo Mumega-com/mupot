@@ -41,7 +41,9 @@ Legend: ✅ shipped · 🔨 in progress · ⬜ planned · 🏢 Enterprise-tagged
 ### EPIC B — Work Sync (GitHub ⇄ pot tasks)
 - ✅ **B1** Inbound webhook (GitHub events → pot tasks) — exists
 - ✅ **B2** Outbound mirror (pot tasks → GitHub issues), now App-first (PR #129)
-- 🔨 **B3** Bidirectional status sync (PR merged → task done; issue closed → task done) — harden
+- ✅ **B3** Bidirectional status sync — an `issues` close/reopen webhook flips the mirrored
+  pot task (closed→done, reopened→open) via `syncTaskStatusFromIssue`; no mirror-back (no
+  feedback loop), never clobbers review/approved/rejected gate states
 - ✅ **B4** App webhook secret (`GITHUB_WEBHOOK_SECRET`) set on the live `mupot` worker
 - ⬜ **B5** Issue→task squad routing + label mapping
 

@@ -15,7 +15,7 @@
 
 import { Hono } from 'hono'
 import type { Env } from '../types'
-import { createTask } from '../tasks/service'
+import { createTask, syncTaskStatusFromIssue } from '../tasks/service'
 
 interface GitHubRouteEnv {
   GITHUB_WEBHOOK_SECRET?: string
@@ -158,6 +158,20 @@ githubInboundApp.post('/', async (c) => {
   }
 
   const eventType = c.req.header('x-github-event') ?? 'unknown'
+
+  // B3 — inbound status sync: an `issues` close/reopen on an issue that mirrors a pot task
+  // flips the task's status (no new task, no mirror-back). Handled before the create path.
+  if (eventType === 'issues') {
+    const action = typeof payload.action === 'string' ? payload.action : ''
+    if (action === 'closed' || action === 'reopened') {
+      const issue = (payload.issue ?? {}) as { html_url?: string }
+      const issueUrl = typeof issue.html_url === 'string' ? issue.html_url : ''
+      const { updated } = await syncTaskStatusFromIssue(c.env, issueUrl, action)
+      return c.json({ ok: true, synced: updated, action })
+    }
+    return c.json({ ok: true, ignored: `issues.${action}` })
+  }
+
   const mapped = taskFromGitHubEvent(eventType, payload)
   if (!mapped) return c.json({ ok: true, ignored: eventType }) // ping / unhandled — ack, don't record
 
