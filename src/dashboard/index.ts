@@ -95,6 +95,7 @@ import { githubCapabilitySnapshot } from '../integrations/github-capabilities'
 import { writeAgentDef, assignIssueToCopilot } from '../integrations/github-repo-write'
 import { installUrl, parseInstallCallback, storeInstallation, getInstallationId } from '../integrations/github-install'
 import { syncFleetToGitHub } from '../integrations/github-fleet-sync'
+import { executeTaskAsPR } from '../integrations/github-execute'
 import { githubStatusBody } from '../integrations/github-dashboard'
 import { connectorsPageBody, connectorAddedBody, connectorRotatedBody } from '../connectors/dashboard'
 
@@ -915,6 +916,39 @@ dashboardApp.post('/admin/github/sync-fleet', async (c) => {
   const mcpUrl = mcpEndpoint(new URL(c.req.url).origin)
   const result = await syncFleetToGitHub(c.env, { repo, mcpUrl, dryRun })
   return c.json({ ok: true, ...result })
+})
+
+// POST /admin/github/execute-task — own-fleet executor: ship a task's work as a PR.
+// { taskId, repo, branchName, files:[{path,content}], title, body?, baseBranch? }
+dashboardApp.post('/admin/github/execute-task', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+
+  let body: {
+    taskId?: unknown; repo?: unknown; branchName?: unknown
+    files?: unknown; title?: unknown; bodyText?: unknown; baseBranch?: unknown
+  }
+  try {
+    body = (await c.req.json()) as typeof body
+  } catch {
+    return c.json({ ok: false, error: 'invalid_json', stage: 'validate' }, 400)
+  }
+  const files = Array.isArray(body.files)
+    ? (body.files as Array<{ path?: unknown; content?: unknown }>).map((f) => ({
+        path: typeof f?.path === 'string' ? f.path : '',
+        content: typeof f?.content === 'string' ? f.content : '',
+      }))
+    : []
+  const result = await executeTaskAsPR(c.env, {
+    taskId: typeof body.taskId === 'string' ? body.taskId : '',
+    repo: typeof body.repo === 'string' ? body.repo.trim() : '',
+    branchName: typeof body.branchName === 'string' ? body.branchName.trim() : '',
+    baseBranch: typeof body.baseBranch === 'string' ? body.baseBranch.trim() : undefined,
+    files,
+    title: typeof body.title === 'string' ? body.title : '',
+    body: typeof body.bodyText === 'string' ? body.bodyText : undefined,
+  })
+  return c.json(result, result.ok ? 200 : 400)
 })
 
 // ── GitHub one-click connect (install flow) ───────────────────────────────────

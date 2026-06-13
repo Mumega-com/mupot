@@ -33,6 +33,14 @@ describe('validation', () => {
     expect(isValidRepoPath('a/../b')).toBe(false)
     expect(isValidRepoPath('')).toBe(false)
   })
+  it('forbids GitHub Actions workflow files (CI-RCE guard)', () => {
+    expect(isValidRepoPath('.github/workflows/ci.yml')).toBe(false)
+    expect(isValidRepoPath('.github/workflows/deploy.yaml')).toBe(false)
+    expect(isValidRepoPath('.github/WORKFLOWS/x.yml')).toBe(false) // case-insensitive
+    // adjacent .github paths are still allowed
+    expect(isValidRepoPath('.github/agents/kasra.agent.md')).toBe(true)
+    expect(isValidRepoPath('.github/CODEOWNERS')).toBe(true)
+  })
 })
 
 describe('createBranch', () => {

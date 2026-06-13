@@ -32,8 +32,14 @@ export function isValidBranch(b: string): boolean {
 
 // Repo file path: relative, no leading slash, no '..' segment, safe chars, bounded depth.
 const PATH_SEG_RE = /^[A-Za-z0-9._-]+$/
+// SECURITY (P0): never write GitHub Actions workflow files. A workflow with `on: push` runs
+// the moment it lands on a same-repo branch — BEFORE any PR/merge — with repo secrets. The
+// pot's no-merge/review gate does NOT contain that, so workflow authorship is forbidden at the
+// write layer. (.github/agents/ is fine — that's a different path, written by writeAgentDef.)
+const PROTECTED_PATH_RE = /^\.github\/workflows(\/|$)/i
 export function isValidRepoPath(p: string): boolean {
   if (!p || p.startsWith('/') || p.length > 512) return false
+  if (PROTECTED_PATH_RE.test(p)) return false
   const segs = p.split('/')
   if (segs.length > 20) return false
   return segs.every((s) => s.length > 0 && s !== '.' && s !== '..' && PATH_SEG_RE.test(s))
