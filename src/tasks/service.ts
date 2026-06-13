@@ -216,6 +216,44 @@ export async function syncTaskStatusFromIssue(
   return { updated: Boolean(res.meta?.changes && res.meta.changes > 0) }
 }
 
+/**
+ * D3 — CI feedback: a completed workflow_run for PR #`prNumber` writes its `conclusion` onto
+ * the task whose github_issue_url is that PR. A failing/cancelled/timed-out conclusion on a
+ * task in `review` bumps it back to `in_progress` (the agent's work needs another pass);
+ * success leaves the task in review (awaiting human merge). Matches by the PR-number suffix of
+ * the stored PR url. Never clobbers approved/rejected/done. Returns whether a row changed.
+ */
+export async function syncCiResultToTask(
+  env: Env,
+  prNumber: number,
+  conclusion: string,
+): Promise<{ updated: boolean }> {
+  if (!Number.isInteger(prNumber) || prNumber <= 0) return { updated: false }
+  const now = new Date().toISOString()
+  const note = `CI: ${conclusion}`
+  const failed = conclusion !== 'success' && conclusion !== 'neutral' && conclusion !== 'skipped'
+  // LIKE on the PR-number suffix; bound param (no injection). The '%/pull/N' shape is what
+  // openPullRequest stores. ESCAPE not needed — prNumber is an integer.
+  const suffix = `%/pull/${prNumber}`
+  if (failed) {
+    const res = await env.DB.prepare(
+      `UPDATE tasks SET result = ?1, status = 'in_progress', updated_at = ?2
+        WHERE github_issue_url LIKE ?3 AND status = 'review'`,
+    )
+      .bind(note, now, suffix)
+      .run()
+    return { updated: Boolean(res.meta?.changes && res.meta.changes > 0) }
+  }
+  // success/neutral/skipped: record the note without changing a gate state.
+  const res = await env.DB.prepare(
+    `UPDATE tasks SET result = ?1, updated_at = ?2
+      WHERE github_issue_url LIKE ?3 AND status IN ('review','in_progress','open')`,
+  )
+    .bind(note, now, suffix)
+    .run()
+  return { updated: Boolean(res.meta?.changes && res.meta.changes > 0) }
+}
+
 function eventAgentId(task: Task, actor?: TaskActor): string | undefined {
   if (actor?.kind === 'agent') return actor.id
   return task.assignee_agent_id ?? undefined

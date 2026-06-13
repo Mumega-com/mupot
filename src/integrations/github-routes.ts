@@ -15,11 +15,12 @@
 
 import { Hono } from 'hono'
 import type { Env } from '../types'
-import { createTask, syncTaskStatusFromIssue } from '../tasks/service'
+import { createTask, syncTaskStatusFromIssue, syncCiResultToTask } from '../tasks/service'
 
 interface GitHubRouteEnv {
   GITHUB_WEBHOOK_SECRET?: string
   GITHUB_INBOUND_SQUAD_ID?: string
+  GITHUB_LABEL_SQUAD_MAP?: string // B5: JSON { "<label>": "<squad_id>" }
 }
 
 function githubRouteEnv(env: Env): GitHubRouteEnv {
@@ -66,11 +67,64 @@ export async function verifyGitHubWebhook(
   return 'ok'
 }
 
-async function resolveInboundSquad(env: Env): Promise<string | null> {
+/**
+ * Parse the optional GITHUB_LABEL_SQUAD_MAP env — a JSON object `{ "<label>": "<squad_id>" }`
+ * (B5). Returns {} on absent/invalid. Labels are matched case-insensitively.
+ */
+export function parseLabelSquadMap(raw: unknown): Record<string, string> {
+  if (typeof raw !== 'string' || !raw.trim()) return {}
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    const out: Record<string, string> = {}
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof k === 'string' && typeof v === 'string' && k.trim() && v.trim()) {
+        out[k.trim().toLowerCase()] = v.trim()
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+/** Pick the squad id for a set of issue labels from the map, or null if none match. */
+export function squadForLabels(map: Record<string, string>, labels: string[]): string | null {
+  for (const l of labels) {
+    const hit = map[l.trim().toLowerCase()]
+    if (hit) return hit
+  }
+  return null
+}
+
+/**
+ * Resolve the squad an inbound work-unit lands on (B5). Priority:
+ *   1. a label → squad mapping (GITHUB_LABEL_SQUAD_MAP) matching the event's labels
+ *   2. GITHUB_INBOUND_SQUAD_ID (the default inbound squad)
+ *   3. the oldest squad in the pot
+ */
+async function resolveInboundSquad(env: Env, labels: string[] = []): Promise<string | null> {
+  if (labels.length > 0) {
+    const mapped = squadForLabels(parseLabelSquadMap(githubRouteEnv(env).GITHUB_LABEL_SQUAD_MAP), labels)
+    if (mapped) {
+      // verify the mapped squad exists in this pot (config could be stale)
+      const ok = await env.DB.prepare(`SELECT id FROM squads WHERE id = ?1 LIMIT 1`).bind(mapped).first<{ id: string }>()
+      if (ok) return mapped
+    }
+  }
   const configured = githubRouteEnv(env).GITHUB_INBOUND_SQUAD_ID
   if (typeof configured === 'string' && configured.trim().length > 0) return configured.trim()
   const row = await env.DB.prepare(`SELECT id FROM squads ORDER BY created_at ASC LIMIT 1`).first<{ id: string }>()
   return row?.id ?? null
+}
+
+/** Extract label names from an issue/PR payload (best-effort, bounded). */
+function eventLabels(payload: Record<string, unknown>): string[] {
+  const src = (payload.issue ?? payload.pull_request ?? {}) as { labels?: Array<{ name?: unknown }> }
+  if (!Array.isArray(src.labels)) return []
+  return src.labels
+    .map((l) => (typeof l?.name === 'string' ? l.name : ''))
+    .filter((n) => n.length > 0)
+    .slice(0, 20)
 }
 
 /**
@@ -159,23 +213,63 @@ githubInboundApp.post('/', async (c) => {
 
   const eventType = c.req.header('x-github-event') ?? 'unknown'
 
-  // B3 — inbound status sync: an `issues` close/reopen on an issue that mirrors a pot task
-  // flips the task's status (no new task, no mirror-back). Handled before the create path.
+  // B3/B5 — `issues` events.
   if (eventType === 'issues') {
     const action = typeof payload.action === 'string' ? payload.action : ''
+    // B3 status sync: close/reopen flips a mirrored task (no new task, no mirror-back).
     if (action === 'closed' || action === 'reopened') {
       const issue = (payload.issue ?? {}) as { html_url?: string }
       const issueUrl = typeof issue.html_url === 'string' ? issue.html_url : ''
       const { updated } = await syncTaskStatusFromIssue(c.env, issueUrl, action)
       return c.json({ ok: true, synced: updated, action })
     }
+    // B5: a newly opened issue becomes a task, routed to a squad by its labels.
+    if (action === 'opened') {
+      const issue = (payload.issue ?? {}) as { number?: number; title?: string; html_url?: string }
+      const repo = safeField((payload.repository as { full_name?: string })?.full_name, 80)
+      const prefix = repo ? `[GH ${repo}]` : '[GH]'
+      const num = Number.isInteger(issue.number) ? issue.number : '?'
+      const squadId = await resolveInboundSquad(c.env, eventLabels(payload))
+      if (!squadId) return c.json({ ok: true, skipped: true, reason: 'no_squad' })
+      await createTask(
+        c.env,
+        {
+          squad_id: squadId,
+          title: `${prefix} issue #${num}: ${safeField(issue.title)}`.slice(0, TITLE_MAX).trim(),
+          body: [safeField(issue.html_url, 300), 'event: issues.opened'].filter(Boolean).join('\n'),
+          status: 'open',
+        },
+        { skipMirror: true },
+      )
+      return c.json({ ok: true, routed: squadId })
+    }
     return c.json({ ok: true, ignored: `issues.${action}` })
+  }
+
+  // D3 — CI feedback: a completed workflow_run that references a PR linked to a task writes
+  // the conclusion onto that task. A failing run on a task in `review` bumps it back to
+  // `in_progress` (work to redo); success leaves it in review. No mirror-back.
+  if (eventType === 'workflow_run') {
+    const wr = (payload.workflow_run ?? {}) as {
+      status?: string; conclusion?: string; pull_requests?: Array<{ number?: number }>
+    }
+    if (wr.status === 'completed' && Array.isArray(wr.pull_requests) && wr.pull_requests.length > 0) {
+      const concl = safeField(wr.conclusion, 20) || 'completed'
+      let linked = false
+      for (const pr of wr.pull_requests) {
+        if (!Number.isInteger(pr.number)) continue
+        const res = await syncCiResultToTask(c.env, pr.number as number, concl)
+        if (res.updated) linked = true
+      }
+      if (linked) return c.json({ ok: true, ci: concl })
+      // not linked to a tracked task → fall through to record as a work-unit (existing behavior)
+    }
   }
 
   const mapped = taskFromGitHubEvent(eventType, payload)
   if (!mapped) return c.json({ ok: true, ignored: eventType }) // ping / unhandled — ack, don't record
 
-  const squadId = await resolveInboundSquad(c.env)
+  const squadId = await resolveInboundSquad(c.env, eventLabels(payload))
   if (!squadId) return c.json({ ok: true, skipped: true, reason: 'no_squad' })
 
   // skipMirror: a GitHub-origin task must NOT be mirrored back out to a GitHub issue —
