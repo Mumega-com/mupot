@@ -10,9 +10,24 @@
 // fail-closed, returns the stage that failed.
 
 import type { Env } from '../types'
-import { createBranch, putFile, openPullRequest, isValidRepoPath } from './github-pr'
+import { createBranch, putFile, openPullRequest, isValidRepoPath, type CommitIdentity } from './github-pr'
 import { githubCan } from './github-capabilities'
 import { isValidRepo } from './github-repo-write'
+
+/**
+ * Resolve a named pot agent's git commit identity (#21). The agent authors its own commits as
+ * `Name <slug@agents.mumega.com>`. Returns undefined if the agent can't be resolved (commit
+ * then falls back to the App identity). slug is sanitized to a safe email local-part.
+ */
+export async function resolveAgentIdentity(env: Env, agentId: string): Promise<CommitIdentity | undefined> {
+  const row = await env.DB.prepare(`SELECT slug, name FROM agents WHERE id = ?1 LIMIT 1`)
+    .bind(agentId)
+    .first<{ slug: string; name: string }>()
+  if (!row) return undefined
+  const local = (row.slug || '').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40)
+  if (!local) return undefined
+  return { name: row.name?.trim() || row.slug, email: `${local}@agents.mumega.com` }
+}
 
 export interface ExecuteFile {
   path: string
@@ -54,10 +69,14 @@ export async function executeTaskAsPR(
   if (!(await githubCan(env, 'repo_file_write'))) return { ok: false, error: 'capability_disabled', stage: 'capability' }
 
   // ── task must exist (this pot's D1) ───────────────────────────────────────────
-  const task = await env.DB.prepare(`SELECT id, status FROM tasks WHERE id = ?1 LIMIT 1`)
+  const task = await env.DB.prepare(`SELECT id, status, assignee_agent_id FROM tasks WHERE id = ?1 LIMIT 1`)
     .bind(taskId)
-    .first<{ id: string; status: string }>()
+    .first<{ id: string; status: string; assignee_agent_id: string | null }>()
   if (!task) return { ok: false, error: 'task_not_found', stage: 'task' }
+
+  // Per-agent authorship (#21): the task's assigned agent authors the commits as itself.
+  // Falls back to the App identity if the task has no agent or it can't be resolved.
+  const author = task.assignee_agent_id ? await resolveAgentIdentity(env, task.assignee_agent_id) : undefined
 
   const fetchOpt = opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}
 
@@ -71,7 +90,7 @@ export async function executeTaskAsPR(
   for (const f of files) {
     const r = await putFile(
       env,
-      { repo, path: f.path, content: f.content, branch: branchName, message: `${title} — ${f.path}` },
+      { repo, path: f.path, content: f.content, branch: branchName, message: `${title} — ${f.path}`, author },
       fetchOpt,
     )
     if (!r.ok) return { ok: false, error: `${f.path}:${r.error}`, stage: 'file' }
