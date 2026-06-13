@@ -149,6 +149,7 @@ import { handleQueue } from './bus/consumer'
 // Metabolism — the pot heartbeat that pulses goal-bearing work-units (#27 loop, made autonomous).
 import { runMetabolism } from './agents/metabolism'
 import { runLoopsTick } from './loops/driver'
+import { syncGitHubProject } from './integrations/github-projects'
 
 export default {
   // The OAuth provider is the outer entry point. It handles OAuth paths and
@@ -160,14 +161,17 @@ export default {
   // Queue and scheduled handlers are preserved unchanged (spec §A.2).
   queue: handleQueue,
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Three independent heartbeats on the same cron:
+    // Four independent heartbeats on the same cron:
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
     //     ("design loops, not prompts"; without this the v0.3.0 loop never fires).
     //  3. loop driver — run one cycle of each active Loop manifest (the container
     //     heartbeat; without this runLoopCycle has no scheduled caller).
+    //  4. GitHub Project sync (#23) — reconcile the configured board → pot tasks
+    //     (no-op unless GITHUB_SYNC_PROJECT is set; idempotent/KV-deduped).
     ctx.waitUntil(reconcileMembership(env))
     ctx.waitUntil(runMetabolism(env))
     ctx.waitUntil(runLoopsTick(env))
+    ctx.waitUntil(syncGitHubProject(env).then(() => undefined))
   },
 }

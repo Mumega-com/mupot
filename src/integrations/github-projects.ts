@@ -112,6 +112,38 @@ async function resolveAgentByValue(env: Env, value: string): Promise<{ id: strin
   return row ?? null
 }
 
+// ── scheduled / webhook sync entry ────────────────────────────────────────────────
+
+interface SyncEnv {
+  GITHUB_SYNC_PROJECT?: string // "owner/number" — the board this pot auto-syncs
+}
+
+/**
+ * Parse GITHUB_SYNC_PROJECT ("owner/number") into its parts, or null if unset/invalid.
+ */
+export function parseSyncProject(raw: unknown): { owner: string; projectNumber: number } | null {
+  if (typeof raw !== 'string') return null
+  const m = raw.trim().match(/^([A-Za-z0-9-]{1,39})\/(\d{1,10})$/)
+  if (!m) return null
+  return { owner: m[1], projectNumber: Number(m[2]) }
+}
+
+/**
+ * Cron / webhook sync entry (#23): reconcile the configured GitHub Project board → pot tasks.
+ * No-op (ok:false, reason) when no board is configured — so the cron stays cheap on pots that
+ * don't use GitHub Projects. Idempotent (importProjectItems is KV-deduped).
+ */
+export async function syncGitHubProject(
+  env: Env,
+  opts: { fetchImpl?: typeof fetch } = {},
+): Promise<{ ok: boolean; reason?: string; imported?: number; skipped?: number }> {
+  const cfg = parseSyncProject((env as unknown as SyncEnv).GITHUB_SYNC_PROJECT)
+  if (!cfg) return { ok: false, reason: 'not_configured' }
+  const res = await importProjectItems(env, { owner: cfg.owner, projectNumber: cfg.projectNumber }, opts)
+  if (!res.ok) return { ok: false, reason: res.error }
+  return { ok: true, imported: res.imported, skipped: res.skipped }
+}
+
 // ── the import ───────────────────────────────────────────────────────────────────────
 
 /**
