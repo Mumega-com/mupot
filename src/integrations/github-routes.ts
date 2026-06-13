@@ -16,6 +16,7 @@
 import { Hono } from 'hono'
 import type { Env } from '../types'
 import { createTask, syncTaskStatusFromIssue, syncCiResultToTask } from '../tasks/service'
+import { syncGitHubProject } from './github-projects'
 
 interface GitHubRouteEnv {
   GITHUB_WEBHOOK_SECRET?: string
@@ -212,6 +213,13 @@ githubInboundApp.post('/', async (c) => {
   }
 
   const eventType = c.req.header('x-github-event') ?? 'unknown'
+
+  // #23 — a Project board item changed: reconcile the configured board → pot tasks (real-time
+  // complement to the cron). No-op unless GITHUB_SYNC_PROJECT is set; idempotent (KV-deduped).
+  if (eventType === 'projects_v2_item') {
+    const r = await syncGitHubProject(c.env)
+    return c.json({ ok: true, sync: r })
+  }
 
   // B3/B5 — `issues` events.
   if (eventType === 'issues') {
