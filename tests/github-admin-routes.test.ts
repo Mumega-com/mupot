@@ -106,6 +106,36 @@ describe('POST /admin/github/agent-def', () => {
   })
 })
 
+describe('POST /admin/github/sync-fleet', () => {
+  it('non-admin → 403', async () => {
+    const res = await dashboardApp.fetch(
+      req('/admin/github/sync-fleet', 'POST', { repo: 'a/b', dryRun: true }),
+      envForRole('member'),
+    )
+    expect(res.status).toBe(403)
+  })
+
+  it('admin, missing repo → 400 repo_required', async () => {
+    const res = await dashboardApp.fetch(
+      req('/admin/github/sync-fleet', 'POST', { dryRun: true }),
+      envForRole('admin'),
+    )
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { error: string }).error).toBe('repo_required')
+  })
+
+  it('admin, dry-run with no agents → 200 ok, 0 synced', async () => {
+    const res = await dashboardApp.fetch(
+      req('/admin/github/sync-fleet', 'POST', { repo: 'Mumega-com/mumega-com', dryRun: true }),
+      envForRole('admin'),
+    )
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { ok: boolean; synced: number }
+    expect(body.ok).toBe(true)
+    expect(body.synced).toBe(0)
+  })
+})
+
 describe('POST /admin/github/assign-copilot', () => {
   it('non-admin → 403', async () => {
     const res = await dashboardApp.fetch(
