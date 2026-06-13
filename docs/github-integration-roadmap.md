@@ -49,9 +49,11 @@ Legend: ✅ shipped · 🔨 in progress · ⬜ planned · 🏢 Enterprise-tagged
 - ✅ **C2** `assignIssueToCopilot` — hand an issue to the Copilot coding agent (PR #131)
 - ✅ **C3** Admin-gated JSON routes — `GET /admin/github/status`, `POST /admin/github/agent-def`,
   `POST /admin/github/assign-copilot` (isAdmin-gated, JSON so agents call them too)
-- ⬜ **C4** Fleet→GitHub sync — each pot agent gets a `.agent.md`, kept in sync with the roster
-- ⬜ **C5** Per-agent MCP wiring — `.agent.md` `mcp-servers` → tenant pot MCP endpoint, so the
-  GitHub cloud agent reads that pot's bus/memory/tasks
+- ✅ **C4** Fleet→GitHub sync — `syncFleetToGitHub` writes a `.agent.md` per active agent
+  (dry-run preview + live write via gated writeAgentDef); `POST /admin/github/sync-fleet`
+- ✅ **C5** Per-agent MCP wiring — each generated `.agent.md` wires `mcp-servers.mupot` at this
+  pot's MCP endpoint (`/mcp`), token `${COPILOT_MCP_MUPOT_TOKEN}`, so the GitHub cloud agent
+  reads the pot's own bus/memory/tasks
 - ⬜ **C6** Role templates (build / review / coordinate) generated from the pot's agent defs
 
 ### EPIC D — Execution Loop (the payoff: autonomous work)

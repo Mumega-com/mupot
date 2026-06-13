@@ -94,6 +94,7 @@ import { isConnectorType, isConnectorScopeType } from '../connectors/crypto'
 import { githubCapabilitySnapshot } from '../integrations/github-capabilities'
 import { writeAgentDef, assignIssueToCopilot } from '../integrations/github-repo-write'
 import { installUrl, parseInstallCallback, storeInstallation } from '../integrations/github-install'
+import { syncFleetToGitHub } from '../integrations/github-fleet-sync'
 import { connectorsPageBody, connectorAddedBody, connectorRotatedBody } from '../connectors/dashboard'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -875,6 +876,27 @@ dashboardApp.post('/admin/github/assign-copilot', async (c) => {
 
   const result = await assignIssueToCopilot(c.env, { repo, issueNumber })
   return c.json(result, result.ok ? 200 : 400)
+})
+
+// POST /admin/github/sync-fleet — write a .agent.md for every active pot agent into `repo`,
+// each wired to THIS pot's MCP endpoint. { repo, dryRun? }. dryRun previews without writing.
+dashboardApp.post('/admin/github/sync-fleet', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+
+  let body: { repo?: unknown; dryRun?: unknown }
+  try {
+    body = (await c.req.json()) as typeof body
+  } catch {
+    return c.json({ ok: false, error: 'invalid_json' }, 400)
+  }
+  const repo = typeof body.repo === 'string' ? body.repo.trim() : ''
+  const dryRun = body.dryRun === true
+  if (!repo) return c.json({ ok: false, error: 'repo_required' }, 400)
+
+  const mcpUrl = mcpEndpoint(new URL(c.req.url).origin)
+  const result = await syncFleetToGitHub(c.env, { repo, mcpUrl, dryRun })
+  return c.json({ ok: true, ...result })
 })
 
 // ── GitHub one-click connect (install flow) ───────────────────────────────────
