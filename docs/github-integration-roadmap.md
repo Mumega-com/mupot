@@ -29,8 +29,10 @@ Legend: ✅ shipped · 🔨 in progress · ⬜ planned · 🏢 Enterprise-tagged
 ### EPIC A — Identity & Connection (the pot IS an actor on GitHub)
 - ✅ **A1** App installation-token minting (PR #129)
 - ✅ **A2** Capability tiers + Enterprise kill switch (PR #130)
-- ⬜ **A3** `/connect/github` install flow — one-click connect, capture `installation_id` from
-  the redirect, write the `github_app` connector automatically (client_secret already saved)
+- ✅ **A3** `/connect/github` one-click install flow — `GET /admin/github/connect` (CSRF state →
+  redirect to App install) + `GET /connect/github/callback` (verify single-use tenant-bound
+  state → capture `installation_id` → `github_installations` per-tenant). Multi-tenant model:
+  shared App key on the platform, per-tenant install id. (migration 0025)
 - ⬜ **A4** Connector dashboard surface — GitHub status card, capability snapshot, connect button
 - ⬜ **A5** Plan-tier auto-detection — read the tenant's real GitHub plan via API instead of
   manual `GITHUB_PLAN_TIER`
