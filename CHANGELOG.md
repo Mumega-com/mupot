@@ -6,6 +6,52 @@ All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 this changelog (shipped, dated) share version numbers and feed each other — a roadmap
 block collapses into a changelog entry when it ships.
 
+## [0.21.0] — 2026-06-13
+
+GitHub as an agent substrate. An overnight session wired mupot↔GitHub end-to-end: a pot
+now acts on GitHub under its own scoped, short-lived identity, with **two execution
+backends** (GitHub Copilot, paid; own-fleet, free) and the full provisioning chain. Every
+feature is plan-tier-tagged with an Enterprise kill switch — nothing requires Enterprise.
+Adversarial-gated throughout (no P0/P1 shipped); 962 tests.
+
+### Added
+- **GitHub App token minting** (#129). Per-tenant installation tokens — RS256 App JWT via
+  `crypto.subtle`, in-isolate cache, App-first `resolveOutboundGitHubToken` (static PAT
+  fallback). New `github_app` connector type; key+meta from one row (migration 0024).
+- **Capability gate + Enterprise kill switch** (#130). `GITHUB_FEATURES` registry tags every
+  feature by min plan tier + `enterprise` flag; `githubCan()`; `GITHUB_ENTERPRISE_FEATURES`
+  off by default. Tier defaults `free` (never assumes Enterprise).
+- **Repo-write hands** (#131). `writeAgentDef` (`.github/agents/*.agent.md`),
+  `assignIssueToCopilot` (GraphQL `replaceActorsForAssignable`, `copilot-swe-agent`).
+- **Admin routes** (#132). `GET /admin/github/status`, `POST /admin/github/agent-def`,
+  `POST /admin/github/assign-copilot` (isAdmin, JSON).
+- **One-click connect** (#133). `GET /admin/github/connect` + `/connect/github/callback` —
+  single-use tenant-bound CSRF state, per-tenant `github_installations` (migration 0025).
+  Multi-tenant model: shared App key on the platform, per-tenant install id.
+- **Fleet→GitHub sync + per-agent MCP wiring** (#134). `syncFleetToGitHub` writes a
+  `.agent.md` per active agent, each wired at this pot's MCP endpoint;
+  `POST /admin/github/sync-fleet` (dry-run + live).
+- **GitHub dashboard card** (#135). `GET /admin/github` — connection state, capability table,
+  connect + fleet-sync UI. Nav link.
+- **Own-fleet PR primitives** (#137). `createBranch` / `putFile` / `openPullRequest` via the
+  App token — the pot's own agents complete a PR without GitHub Copilot. Gated
+  `repo_file_write`; path-traversal-proof.
+
+### Changed
+- **Bidirectional status sync** (#136). The GitHub weave's outbound mirror (foreshadowed in
+  0.19) is now App-first, and an `issues` close/reopen flips the mirrored task done/open —
+  no feedback loop, never clobbers gate states. App webhook secret wired.
+
+### Docs
+- Public "Connect GitHub" / "Connect WordPress" / "Members & roles" / "Security & trust"
+  (mumega.com/docs). Internal security model + deploy runbook + GitHub internals
+  (mumega-docs). Docs RBAC machine-enforced (`audience: internal` can't ship public).
+
+### Live
+- App installed on Mumega-com (tenant #0); minting verified against all org repos. The App
+  bypasses the enterprise fine-grained-PAT block (it's an App, not a PAT). Copilot path waits
+  on a paid Copilot plan; own-fleet path works on free today.
+
 ## [0.20.0] — 2026-06-11
 
 Security, identity, and the operable surface. A long multi-agent session: shipped the
