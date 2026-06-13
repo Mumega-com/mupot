@@ -96,6 +96,7 @@ import { writeAgentDef, assignIssueToCopilot } from '../integrations/github-repo
 import { installUrl, parseInstallCallback, storeInstallation, getInstallationId } from '../integrations/github-install'
 import { syncFleetToGitHub } from '../integrations/github-fleet-sync'
 import { executeTaskAsPR } from '../integrations/github-execute'
+import { importProjectItems } from '../integrations/github-projects'
 import { githubStatusBody } from '../integrations/github-dashboard'
 import { connectorsPageBody, connectorAddedBody, connectorRotatedBody } from '../connectors/dashboard'
 
@@ -947,6 +948,27 @@ dashboardApp.post('/admin/github/execute-task', async (c) => {
     files,
     title: typeof body.title === 'string' ? body.title : '',
     body: typeof body.bodyText === 'string' ? body.bodyText : undefined,
+  })
+  return c.json(result, result.ok ? 200 : 400)
+})
+
+// POST /admin/github/import-project — Projects v2 ↔ pot bridge: import board items assigned to
+// a named agent (via the "Agent" field) as routed tasks. { owner, projectNumber, agentField?, dryRun? }
+dashboardApp.post('/admin/github/import-project', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+
+  let body: { owner?: unknown; projectNumber?: unknown; agentField?: unknown; dryRun?: unknown }
+  try {
+    body = (await c.req.json()) as typeof body
+  } catch {
+    return c.json({ ok: false, error: 'invalid_json' }, 400)
+  }
+  const result = await importProjectItems(c.env, {
+    owner: typeof body.owner === 'string' ? body.owner.trim() : '',
+    projectNumber: typeof body.projectNumber === 'number' ? body.projectNumber : NaN,
+    agentField: typeof body.agentField === 'string' ? body.agentField : undefined,
+    dryRun: body.dryRun === true,
   })
   return c.json(result, result.ok ? 200 : 400)
 })
