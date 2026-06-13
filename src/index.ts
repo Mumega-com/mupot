@@ -42,6 +42,7 @@ import { flightsApp } from './flight/routes'
 import { orientApp } from './orient/routes'
 import { handleOAuthAuthorize, resolveExternalToken as memberKeyResolver } from './mcp/oauth-authorize'
 import { McpOAuthApiHandler } from './mcp/oauth-api-handler'
+import { brainPhysicsIngestApp } from './dashboard/brain-ingest'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -90,6 +91,10 @@ app.route('/api/flights', flightsApp)
 // Orient seam (#digid-hybrid S1): an agent reads its basin-drop packet; the mind pushes
 // per-agent field state inbound. Before the '/' catch-all. See docs/superpowers/specs.
 app.route('/api/orient', orientApp)
+// Brain physics ingest (#138): the sovereign daemon POSTs coherence scalars here after
+// each measure_and_log() cycle. Bearer-auth (admin token); stores to SESSIONS KV.
+// Mounted before the dashboard '/' catch-all so /api/brain/* is not shadowed.
+app.route('/api/brain', brainPhysicsIngestApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp

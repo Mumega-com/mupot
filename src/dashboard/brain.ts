@@ -1,8 +1,9 @@
 // mupot — /dashboard/brain: per-pot brain panel (S-BRAIN-CTRL-MUPOT-1).
 //
 // Renders:
-//   1. Decision feed — cycle outcomes from loop_decisions (newest-first).
-//   2. Governor controls — pause / resume / kill per loop + budget override.
+//   1. Coherence physics panel — C(t)/regime/Psi/ARF read from KV (observe-only, #138).
+//   2. Decision feed — cycle outcomes from loop_decisions (newest-first).
+//   3. Governor controls — pause / resume / kill per loop + budget override.
 //      Writes are isAdmin-gated (AC#7).
 //      The /brain dashboard page is requireAuth-gated (any authenticated pot member
 //      can view the feed). The API route GET /api/loops/:id/decisions is admin-gated
@@ -12,6 +13,11 @@
 // gate live in dashboard/index.ts. All writes go through EXISTING endpoints:
 //   - POST /api/loops/:id/status (pause/resume/kill) — src/loops/routes.ts:63
 //   - loop_controls signal: new POST endpoint wired in dashboard/index.ts
+//
+// Coherence physics ingest:
+//   - POST /api/brain/physics — bearer-auth (admin token); body = PhysicsSnapshot JSON;
+//     stored in SESSIONS KV under key PHYSICS_KV_KEY (TTL 26h). The sovereign brain
+//     daemon POSTs here after each measure_and_log() cycle. Read-only to the panel.
 //
 // Capability descriptor field (AC#8 / E-BRAIN-CONTROL §12): threaded as a
 // design property. The feed renders it when present; the runtime persists it
@@ -24,6 +30,90 @@ import { listLoops } from '../loops/service'
 import { listLoopDecisions } from '../loops/decisions'
 import type { LoopDecisionRow } from '../loops/decisions'
 import type { LoopManifest } from '../loops/manifest'
+
+// ── coherence physics (observe-only, #138) ───────────────────────────────────
+
+/** KV key under SESSIONS where the sovereign daemon POSTs its physics snapshot. */
+export const PHYSICS_KV_KEY = 'brain:physics'
+
+/** KV TTL: 26h — longer than the max daemon cycle gap (24h) so EMA continuity is preserved. */
+export const PHYSICS_KV_TTL_S = 93600
+
+/**
+ * PhysicsSnapshot — the canonical shape written by `sovereign/coherence.py::compute_physics`.
+ * Only the fields needed for display are declared; extras are silently ignored.
+ *
+ * regime values (canon WHITEPAPER:291-294):
+ *   flow     = R-hi & C-hi  (healthy: high receptivity + high coherence)
+ *   chaos    = R-hi & C-lo  (active but incoherent)
+ *   coercion = R-lo & C-hi  (coherent but constrained)
+ *   stall    = R-lo & C-lo  (blocked: low receptivity + low coherence)
+ */
+export interface PhysicsSnapshot {
+  C: number       // runtime coherence [0,1]; EMA(success-fraction, alpha=0.1)
+  R: number       // receptivity = 1/(1+backlog)
+  Psi: number     // coherence gradient |dC|
+  ARF: number     // defect-activation dS = R*Psi*C
+  regime: 'flow' | 'chaos' | 'coercion' | 'stall'
+  raw_C: number   // non-EMA-smoothed success fraction this window
+  completed: number
+  failed: number
+  backlog: number
+  had_signal: boolean
+  ts: number      // Unix epoch (seconds) when computed
+}
+
+/**
+ * Zod-free runtime parse: returns a typed PhysicsSnapshot when the stored value is valid,
+ * or null when absent / malformed. Called from loadBrainPhysics (panelonly — never throws).
+ */
+export function parsePhysicsSnapshot(raw: string | null): PhysicsSnapshot | null {
+  if (!raw) return null
+  try {
+    const p = JSON.parse(raw) as Partial<PhysicsSnapshot>
+    if (
+      typeof p.C !== 'number' || typeof p.R !== 'number' ||
+      typeof p.Psi !== 'number' || typeof p.ARF !== 'number' ||
+      typeof p.regime !== 'string' || typeof p.ts !== 'number'
+    ) return null
+    return p as PhysicsSnapshot
+  } catch {
+    return null
+  }
+}
+
+/**
+ * loadBrainPhysics — read the latest physics snapshot from SESSIONS KV.
+ * Returns null when no snapshot has been ingested yet (panel shows "no data yet").
+ * Never throws — the coherence panel is observe-only and must not break the brain page.
+ */
+export async function loadBrainPhysics(env: Env): Promise<PhysicsSnapshot | null> {
+  try {
+    const raw = await env.SESSIONS.get(PHYSICS_KV_KEY)
+    return parsePhysicsSnapshot(raw)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * storePhysicsSnapshot — write an ingested physics body into SESSIONS KV.
+ * Called from POST /api/brain/physics. Validates the payload before storing.
+ * Returns { ok: true } or { ok: false, error: string }.
+ */
+export async function storePhysicsSnapshot(
+  env: Env,
+  body: unknown,
+): Promise<{ ok: true; physics: PhysicsSnapshot } | { ok: false; error: string }> {
+  const physics = parsePhysicsSnapshot(typeof body === 'string' ? body : JSON.stringify(body))
+  if (!physics) return { ok: false, error: 'invalid_physics_payload' }
+  try {
+    await env.SESSIONS.put(PHYSICS_KV_KEY, JSON.stringify(physics), { expirationTtl: PHYSICS_KV_TTL_S })
+    return { ok: true, physics }
+  } catch {
+    return { ok: false, error: 'kv_write_failed' }
+  }
+}
 
 // ── data layer ────────────────────────────────────────────────────────────────
 
@@ -43,25 +133,35 @@ export interface BrainView {
   loops: BrainLoopRow[]
   /** Recent decisions across ALL loops (or a specific loop if loop_id filtered). */
   decisions: LoopDecisionRow[]
+  /** Latest coherence physics snapshot from the sovereign daemon. Null = not yet ingested. */
+  physics: PhysicsSnapshot | null
 }
 
 export interface BrainViewDeps {
   listLoopsFn?: (env: Env) => Promise<LoopManifest[]>
   listDecisionsFn?: (env: Env, loopId: string, opts?: { limit?: number }) => Promise<LoopDecisionRow[]>
+  loadPhysicsFn?: (env: Env) => Promise<PhysicsSnapshot | null>
 }
 
 /**
  * loadBrainView — load the data for the /brain panel.
  *
- * Loads all loops + the last 20 decisions from each (limit per loop so the
- * page stays snappy). In practice most pots have 1-3 active loops so the
- * total query count is bounded.
+ * Loads physics snapshot + all loops + the last 20 decisions from each (limit
+ * per loop so the page stays snappy). In practice most pots have 1-3 active
+ * loops so the total query count is bounded. Physics load is fire-and-forget
+ * (returns null when absent — the coherence panel shows "no data yet").
  */
 export async function loadBrainView(env: Env, deps: BrainViewDeps = {}): Promise<BrainView> {
   const listFn = deps.listLoopsFn ?? ((e) => listLoops(e))
   const decisionsFn = deps.listDecisionsFn ?? listLoopDecisions
+  const physicsFn = deps.loadPhysicsFn ?? loadBrainPhysics
 
-  const loops = await listFn(env)
+  // Load physics + loops concurrently — they touch independent storage (KV vs D1).
+  const [physics, loops] = await Promise.all([
+    physicsFn(env).catch(() => null),
+    listFn(env),
+  ])
+
   const loopRows: BrainLoopRow[] = loops.map((l) => ({
     id: l.id,
     okr: l.okr,
@@ -84,7 +184,7 @@ export async function loadBrainView(env: Env, deps: BrainViewDeps = {}): Promise
     .sort((a, b) => b.recorded_at.localeCompare(a.recorded_at))
     .slice(0, 100) // cap the combined feed at 100 rows
 
-  return { loops: loopRows, decisions }
+  return { loops: loopRows, decisions, physics }
 }
 
 // ── HTML body ────────────────────────────────────────────────────────────────
@@ -110,6 +210,96 @@ function statusBadgeClass(status: string): string {
     case 'killed': return 'loop-terminal'
     default: return ''
   }
+}
+
+// ── coherence panel helpers ───────────────────────────────────────────────────
+
+function regimeBadgeClass(regime: string): string {
+  switch (regime) {
+    case 'flow':     return 'regime-flow'
+    case 'chaos':    return 'regime-chaos'
+    case 'coercion': return 'regime-coercion'
+    case 'stall':    return 'regime-stall'
+    default:         return ''
+  }
+}
+
+function regimeLabel(regime: string): string {
+  switch (regime) {
+    case 'flow':     return 'flow — R-hi & C-hi'
+    case 'chaos':    return 'chaos — R-hi & C-lo'
+    case 'coercion': return 'coercion — R-lo & C-hi'
+    case 'stall':    return 'stall — R-lo & C-lo'
+    default:         return regime
+  }
+}
+
+function physicsPanel(physics: PhysicsSnapshot | null) {
+  if (!physics) {
+    return html`
+      <section class="coherence-panel card" aria-label="Coherence physics">
+        <div class="coherence-header">
+          <span class="coherence-title">Coherence</span>
+          <span class="regime-badge regime-none">no data yet</span>
+        </div>
+        <p class="empty" style="margin:8px 0 0">
+          The sovereign brain daemon has not posted a physics snapshot yet.
+          Wire it by POSTing to <code>POST /api/brain/physics</code>
+          with an admin bearer token after each <code>measure_and_log()</code> cycle.
+        </p>
+      </section>`
+  }
+
+  const regimeClass = regimeBadgeClass(physics.regime)
+  const regimeLbl = regimeLabel(physics.regime)
+  const updatedAt = new Date(physics.ts * 1000).toISOString().slice(0, 16).replace('T', ' ')
+  const signalNote = physics.had_signal ? '' : ' (no completions — C carried)'
+
+  return html`
+    <section class="coherence-panel card" aria-label="Coherence physics">
+      <div class="coherence-header">
+        <span class="coherence-title">Coherence</span>
+        <span class="regime-badge ${raw(regimeClass)}">${regimeLbl}</span>
+        <span class="coherence-updated">${updatedAt} UTC${raw(signalNote)}</span>
+      </div>
+      <div class="coherence-scalars">
+        <div class="scalar-cell">
+          <span class="scalar-label">C(t)</span>
+          <span class="scalar-value">${physics.C.toFixed(3)}</span>
+          <span class="scalar-sub">coherence</span>
+        </div>
+        <div class="scalar-cell">
+          <span class="scalar-label">R</span>
+          <span class="scalar-value">${physics.R.toFixed(3)}</span>
+          <span class="scalar-sub">receptivity</span>
+        </div>
+        <div class="scalar-cell">
+          <span class="scalar-label">Ψ</span>
+          <span class="scalar-value">${physics.Psi.toFixed(3)}</span>
+          <span class="scalar-sub">potential |dC|</span>
+        </div>
+        <div class="scalar-cell">
+          <span class="scalar-label">ARF</span>
+          <span class="scalar-value">${physics.ARF.toFixed(4)}</span>
+          <span class="scalar-sub">R·Ψ·C</span>
+        </div>
+        <div class="scalar-cell">
+          <span class="scalar-label">done</span>
+          <span class="scalar-value">${physics.completed}</span>
+          <span class="scalar-sub">6h window</span>
+        </div>
+        <div class="scalar-cell">
+          <span class="scalar-label">failed</span>
+          <span class="scalar-value">${physics.failed}</span>
+          <span class="scalar-sub">6h window</span>
+        </div>
+        <div class="scalar-cell">
+          <span class="scalar-label">backlog</span>
+          <span class="scalar-value">${physics.backlog}</span>
+          <span class="scalar-sub">scored tasks</span>
+        </div>
+      </div>
+    </section>`
 }
 
 /**
@@ -216,6 +406,51 @@ async function brainControl(btn) {
 
   return html`
     <style>
+      /* coherence physics panel */
+      .coherence-panel {
+        padding: 16px 20px; margin-bottom: 28px;
+      }
+      .coherence-header {
+        display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px;
+      }
+      .coherence-title {
+        font-weight: 700; font-size: 15px;
+      }
+      .coherence-updated {
+        font-size: 11px; color: var(--dim); margin-left: auto;
+      }
+      .regime-badge {
+        font-size: 11px; font-weight: 700; padding: 2px 10px;
+        border-radius: 999px; border: 1px solid;
+      }
+      .regime-none     { color: var(--dim);    border-color: var(--border); }
+      .regime-flow     { color: var(--ok);     border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
+      .regime-chaos    { color: var(--warn2);  border-color: color-mix(in srgb, var(--warn2) 40%, var(--border)); }
+      .regime-coercion { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+      .regime-stall    { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); }
+      .coherence-scalars {
+        display: flex; flex-wrap: wrap; gap: 0; border: 1px solid var(--border);
+        border-radius: var(--radius); overflow: hidden;
+      }
+      .scalar-cell {
+        display: flex; flex-direction: column; align-items: center;
+        padding: 12px 16px; flex: 1; min-width: 80px;
+        border-right: 1px solid var(--border);
+      }
+      .scalar-cell:last-child { border-right: none; }
+      .scalar-label {
+        font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
+        color: var(--dim); font-weight: 600;
+      }
+      .scalar-value {
+        font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums;
+        line-height: 1.2; margin: 4px 0 2px;
+      }
+      .scalar-sub {
+        font-size: 10px; color: var(--muted);
+      }
+
+      /* loops + decisions */
       .brain-loops { display: flex; flex-direction: column; gap: 10px; margin-bottom: 28px; }
       .brain-loop-card {
         background: var(--surface); border: 1px solid var(--border);
@@ -266,9 +501,12 @@ async function brainControl(btn) {
     <p class="crumbs"><a href="/">Overview</a> / Brain</p>
     <h1>Brain</h1>
     <p class="empty" style="margin-top:0;max-width:680px">
-      Per-pot loop governor. Decision feed shows what each loop decided last cycle.
+      Per-pot loop governor. Coherence panel shows the sovereign daemon's latest physics
+      (observe-only). Decision feed shows what each loop decided last cycle.
       Governor controls pause, resume, or kill a loop${canAdmin ? raw('') : raw(' (admin only)')}.
     </p>
+
+    ${physicsPanel(view.physics)}
 
     <h2>Loops</h2>
     ${
