@@ -34,6 +34,8 @@ interface Opts {
   grants?: CapabilityGrant[]
   agentExists?: boolean
   ambiguousSlug?: boolean
+  /** budget_cap_cents on the agent row (default null). Set non-null to prove redaction. */
+  agentBudgetCents?: number | null
 }
 
 function makeEnv(opts: Opts = {}): Env {
@@ -41,6 +43,7 @@ function makeEnv(opts: Opts = {}): Env {
   const boundAgentId = opts.boundAgentId ?? null
   const agentExists = opts.agentExists ?? true
   const ambiguousSlug = opts.ambiguousSlug ?? false
+  const agentBudgetCents = opts.agentBudgetCents ?? null
 
   const grants: CapabilityGrant[] = opts.grants ?? [
     // Squad-member capability on the agent's squad (typical shared-apikey scenario)
@@ -68,19 +71,25 @@ function makeEnv(opts: Opts = {}): Env {
             }
           }
           if (sql.includes('FROM squads') && sql.includes('WHERE id')) {
-            if (bound === SQUAD.id) return { id: SQUAD.id, department_id: SQUAD.department_id }
+            if (bound === SQUAD.id) return { id: SQUAD.id, name: 'Acme Eng', charter: null, okr: null, department_id: SQUAD.department_id }
             return null
           }
-          if (sql.includes('FROM agents') && sql.includes('WHERE id')) {
-            if (agentExists && bound === AGENT.id) {
-              return { id: AGENT.id, squad_id: AGENT.squad_id, slug: AGENT.slug, name: AGENT.name }
+          if (sql.includes('FROM departments') && sql.includes('WHERE id')) {
+            return { id: SQUAD.department_id, name: 'Engineering' }
+          }
+          // orient service full agent SELECT (includes kpi_progress / budget_cap_cents)
+          // Must precede the narrow resolveAgentRef check (id+squad_id only) because
+          // buildOrient's SELECT also contains WHERE id — distinguisher is kpi_progress.
+          if (sql.includes('FROM agents') && sql.includes('kpi_progress')) {
+            if (agentExists) {
+              return { id: AGENT.id, squad_id: AGENT.squad_id, slug: AGENT.slug, name: AGENT.name, role: 'engineer', status: 'active', effort: 'standard', autonomy: 'draft', kpi_progress: 0, budget_cap_cents: agentBudgetCents, budget_window: 'day', okr: null, kpi_target: null }
             }
             return null
           }
-          // orient service: agent row by id
-          if (sql.includes('SELECT') && sql.includes('FROM agents')) {
-            if (agentExists) {
-              return { id: AGENT.id, squad_id: AGENT.squad_id, slug: AGENT.slug, name: AGENT.name, role: 'engineer', model: 'test', status: 'active', created_at: '2026-06-13', effort: 'standard', autonomy: 'draft', kpi_progress: 0, budget_cap_cents: null, budget_window: 'day', okr: null, kpi_target: null, revoked_at: null }
+          // resolveAgentRef narrow lookup (id + squad_id only)
+          if (sql.includes('FROM agents') && sql.includes('WHERE id')) {
+            if (agentExists && bound === AGENT.id) {
+              return { id: AGENT.id, squad_id: AGENT.squad_id, slug: AGENT.slug, name: AGENT.name }
             }
             return null
           }
@@ -433,5 +442,83 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
       expect(desc, `tool ${tool.name} description leaks real slug "gaf"`).not.toContain(' gaf ')
       expect(desc, `tool ${tool.name} description leaks "gaf)" `).not.toMatch(/\bgaf\b/)
     }
+  })
+
+  // ── viewSensitive parity regressions (#128 security fix) ─────────────────────
+  //
+  // kasra-review DOOR-7 finding: connect hardcoded viewSensitive=true, letting a bare
+  // squad-member read a PEER's budget_cap_cents / field state that orient would redact.
+  // These three cases lock the corrected parity rule (orgAdmin || isSelf || squad-lead).
+
+  it('SEC: bare squad-member connecting as a PEER gets redacted packet (no budget/field)', async () => {
+    // The caller is a bare member on the squad (not lead, not admin, not welded to AGENT).
+    // boundAgentId=null (unbound shared key). Connect claims the agent → must be redacted.
+    const env = makeEnv({
+      boundAgentId: null,             // unbound — isSelf=false
+      agentBudgetCents: 9900,         // $99 budget; must be hidden from the peer
+      grants: [
+        { member_id: 'member-bot-1', scope_type: 'squad', scope_id: SQUAD.id, capability: 'member' },
+      ],
+    })
+    const res = await callConnect(env, AGENT.slug)
+    expect(res.status).toBe(200)
+
+    const body = (await res.json()) as {
+      result: {
+        structuredContent: {
+          connection_status: string
+          packet: { agent: { budget_cap_cents: number | null }; field_restricted?: boolean }
+        }
+      }
+    }
+    const sc = body.result.structuredContent
+    expect(sc.connection_status).toBe('hot')
+    // sensitive fields must be redacted — peer budget hidden, field restricted
+    expect(sc.packet.agent.budget_cap_cents).toBeNull()
+    expect(sc.packet.field_restricted).toBe(true)
+  })
+
+  it('SEC: self-connect (welded token, isSelf=true) gets full unredacted packet', async () => {
+    // The token is permanently welded to AGENT.id — this IS the agent connecting as itself.
+    const env = makeEnv({
+      boundAgentId: AGENT.id,         // isSelf=true → viewSensitive=true
+      agentBudgetCents: 5000,
+      grants: [
+        { member_id: 'member-bot-1', scope_type: 'squad', scope_id: SQUAD.id, capability: 'member' },
+      ],
+    })
+    const res = await callConnect(env, AGENT.slug)
+    expect(res.status).toBe(200)
+
+    const body = (await res.json()) as {
+      result: {
+        structuredContent: {
+          connection_status: string
+          packet: { agent: { budget_cap_cents: number | null }; field_restricted?: boolean }
+        }
+      }
+    }
+    const sc = body.result.structuredContent
+    expect(sc.connection_status).toBe('hot')
+    // isSelf → full packet, budget and field visible
+    expect(sc.packet.agent.budget_cap_cents).toBe(5000)
+    expect(sc.packet.field_restricted).toBe(false)
+  })
+
+  it('SEC: cross-squad capability claim → 403 (member on squad-B cannot claim agent on squad-A)', async () => {
+    // The caller has member capability on squad-OTHER (squad-B), but AGENT lives on SQUAD.id
+    // (squad-A). connect must 403 — no squad access on the target agent's squad.
+    const env = makeEnv({
+      boundAgentId: null,
+      grants: [
+        // capability on a DIFFERENT squad — not the agent's squad
+        { member_id: 'member-bot-1', scope_type: 'squad', scope_id: 'squad-other', capability: 'member' },
+      ],
+    })
+    const res = await callConnect(env, AGENT.slug)
+    expect(res.status).toBe(403)
+    const body = (await res.json()) as { error: { message: string; data: { reason: string } } }
+    expect(body.error.message).toBe('forbidden')
+    expect(body.error.data.reason).toBe('no_squad_access')
   })
 })

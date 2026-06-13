@@ -759,15 +759,30 @@ const toolConnect: ToolSpec = {
       })
     }
 
+    // viewSensitive (#88 parity): same rule as orient — orgAdmin || isSelf || squad-lead.
+    // A bare squad-member calling connect on a PEER (not their own agent) must get the
+    // redacted packet just as orient would return. isSelf covers the expected hot-path:
+    //   - unbound token (boundAgentId=null) claiming its own agent → isSelf=false, BUT
+    //     they have 'member' capability on the squad, and an actual self-claim is the whole
+    //     point; however that alone does not justify viewSensitive.
+    //   - a permanently-welded token reconnecting as itself → isSelf=true → full packet.
+    //   - a bare member claiming a PEER (or a different agent on their squad) → isSelf=false
+    //     + not lead + not admin → viewSensitive=false → redacted.
+    // The self-connect (cold→hot) case for an unbound member ends up viewSensitive=false
+    // unless they are also lead/admin. This is the correct least-privilege posture: the
+    // member sees a redacted packet until they are formally welded (mint_agent_token),
+    // at which point isSelf=true on all subsequent orient/connect calls. (#128)
+    const isSelf = auth.boundAgentId === agentRef.id
+    const viewSensitive =
+      orgAdmin || isSelf || (await memberCanOnSquad(env, grants, agentRef.squad_id, 'lead'))
+
     // Resolve the full orient packet for the claimed agent (read-only, no D1 write).
-    // viewSensitive = true because the caller is claiming THIS agent's identity — it is
-    // effectively self-orienting, even without a permanent weld.
     const { data, notFound } = await buildOrient(
       env,
       agentRef.id,
       orgAdmin ? 'admin' : 'observer+',
       mcpEndpoint(canonicalOrigin(env, ctx.origin)),
-      true, // viewSensitive: self-connect always sees full packet
+      viewSensitive,
       Date.now(),
     )
     if (notFound || !data) return fail(404, 'agent_not_found', 'Agent was found but orient data is unavailable.')
