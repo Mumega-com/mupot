@@ -66,6 +66,11 @@ export interface Env {
   // orient brief pins its MCP endpoint to THIS instead of echoing the request Host
   // header (which is client-influenceable and renders into a DIRECTIVE surface). #88.
   PUBLIC_ORIGIN?: string
+  // SSO handoff (#262): mumega is the verified-identity issuer; this pot is a relying
+  // party that ACCEPTS a signed verified-email claim and mints its OWN session — while
+  // keeping its own Google OAuth (additive). We hold ONLY the issuer's Ed25519 PUBLIC
+  // key (a var, not a secret — public material). No shared secret = sovereignty.
+  MUPOT_HANDOFF_PUBLIC_KEY?: string
   // fleet window: SOS bus bridge REST
   BUS_URL?: string
   // fleet scoping (Flock #43): which bus project this pot's fleet addresses, and
