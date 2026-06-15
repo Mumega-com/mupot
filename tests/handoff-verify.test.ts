@@ -85,6 +85,13 @@ describe('pot handoff-verify', () => {
     expect(r.reason).toBe('wrong_aud')
   })
 
+  it('rejects a wrong issuer (#262 P2-a defense-in-depth)', async () => {
+    const t = await sign(priv, baseClaim({ iss: 'https://evil.example.com' }))
+    const r = await verifyHandoffClaim(pubJwk, t, NOW + 1)
+    expect(r.ok).toBe(false)
+    expect(r.reason).toBe('wrong_iss')
+  })
+
   it('rejects an expired claim', async () => {
     const t = await sign(priv, baseClaim())
     const r = await verifyHandoffClaim(pubJwk, t, NOW + 61)

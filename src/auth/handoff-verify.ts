@@ -8,6 +8,7 @@
 
 const HANDOFF_ALG = 'EdDSA' // Ed25519
 export const HANDOFF_AUD = 'mupot.mumega.com'
+export const HANDOFF_ISS = 'https://mumega.com'
 
 export interface HandoffClaim {
   iss: string
@@ -88,6 +89,9 @@ export async function verifyHandoffClaim(
   )
   if (!valid) return { ok: false, reason: 'bad_signature' }
   if (claim.aud !== HANDOFF_AUD) return { ok: false, reason: 'wrong_aud' }
+  // Defense in depth: pin the issuer. Signature already binds the key, but checking
+  // iss guards against keypair reuse / a two-pot misconfig accepting a foreign issuer.
+  if (claim.iss !== HANDOFF_ISS) return { ok: false, reason: 'wrong_iss' }
   if (claim.email_verified !== true) return { ok: false, reason: 'email_not_verified' }
   if (typeof claim.exp !== 'number' || claim.exp <= nowSeconds) return { ok: false, reason: 'expired' }
   const email = (claim.email ?? '').trim().toLowerCase()
