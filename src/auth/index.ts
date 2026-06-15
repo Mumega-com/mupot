@@ -16,6 +16,7 @@ import { Hono } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import type { Context, MiddlewareHandler } from 'hono'
 import type { Env, AuthContext } from '../types'
+import { verifyHandoffClaim } from './handoff-verify'
 
 // ── tunables ──
 const COOKIE_NAME = 'mupot_session'
@@ -186,14 +187,21 @@ authApp.get('/callback', async (c) => {
     return c.json({ error: 'no_subject' }, 401)
   }
   // Require a verified email — unverified emails are not a trustworthy identity.
-  if (info.email && info.email_verified === false) {
+  // Strict !== true: an omitted/undefined email_verified (some Workspace configs /
+  // partial userinfo) must NOT pass. A verified email is the cross-path dedup key
+  // (#262) — an unverified-email row here would poison a handoff claim's dedup match.
+  if (info.email && info.email_verified !== true) {
     return c.json({ error: 'email_unverified' }, 403)
   }
 
-  const userId = await deriveUserId('google', info.sub)
+  const derivedId = await deriveUserId('google', info.sub)
   const email = info.email ?? null
 
-  const role = await upsertUser(env, userId, email)
+  // Dedup on verified email (#262): a prior mumega SSO handoff may have already
+  // created this user — reuse that row so one human = one mupot user. `userId` is
+  // canonical (may differ from derivedId if email-matched). allowBootstrapOwner=true:
+  // the pot's own Google login is the legitimate first-owner path.
+  const { id: userId, role } = await upsertUserByEmail(env, derivedId, email, true)
 
   // Mint the session: random opaque id → server-side record in KV.
   const sessionId = randomId(32)
@@ -207,6 +215,59 @@ authApp.get('/callback', async (c) => {
     expirationTtl: SESSION_TTL_SECONDS,
   })
 
+  setSessionCookie(c, sessionId)
+  return c.redirect('/')
+})
+
+// GET /auth/handoff?token= → accept a mumega-signed verified-email claim (#262).
+// The SSO seam: mumega (issuer) verified the email; we (relying party) verify its
+// signature with mumega's PUBLIC key only, then mint our OWN session. Additive — the
+// pot keeps its own Google OAuth (/login, /callback). Any failure falls back to our
+// own login (never strands the user, never trusts an unverified/replayed claim).
+authApp.get('/handoff', async (c) => {
+  const env = c.env
+  // Keep the token-bearing URL out of the Referer sent to any resource the landing
+  // page loads, and out of shared/browser caches. (#262 P2-a; CF edge-log residual is
+  // internal + acceptable given the 60s one-time claim.)
+  c.header('Referrer-Policy', 'no-referrer')
+  c.header('Cache-Control', 'no-store')
+
+  const token = c.req.query('token')
+  if (!token) return c.redirect('/auth/login')
+
+  // Verify signature + alg + aud + iss + email_verified + exp with the PUBLIC key only.
+  const res = await verifyHandoffClaim(env.MUPOT_HANDOFF_PUBLIC_KEY, token)
+  if (!res.ok || !res.claim) return c.redirect('/auth/login')
+
+  // One-time: consume the jti so a captured claim can't be replayed. KV get-then-put
+  // is NON-ATOMIC (CF KV has no CAS) → a concurrent same-token replay within the 60s
+  // window can race. Accepted (River μ5 proportionality, #262): the residual is
+  // duplicate sessions for the SAME already-verified identity (no escalation — the
+  // bootstrap-owner teeth are removed by allowBootstrapOwner=false), and a D1-atomic
+  // fix would cost a new table = D1-drift risk, disproportionate to a LOW impact.
+  const jtiKey = `handoffjti:${res.claim.jti}`
+  if (await env.SESSIONS.get(jtiKey)) return c.redirect('/auth/login')
+  await env.SESSIONS.put(jtiKey, '1', { expirationTtl: 120 }) // > claim TTL
+
+  // Resolve/create the user BY VERIFIED EMAIL — dedup both directions (a prior
+  // own-Google login OR this handoff = one user). preferredId for a handoff-first
+  // user is hash(mumega:email); email-match reconciles it to any existing row.
+  // allowBootstrapOwner defaults FALSE here — a handoff never mints the first owner.
+  const preferredId = await deriveUserId('mumega', res.claim.email)
+  const { id: userId, role } = await upsertUserByEmail(env, preferredId, res.claim.email)
+
+  // Mint the pot's OWN session (mirror /callback). We never trust mumega's session —
+  // we issue our own opaque server-side session.
+  const sessionId = randomId(32)
+  const record: SessionRecord = {
+    userId,
+    email: res.claim.email,
+    role,
+    createdAt: new Date().toISOString(),
+  }
+  await env.SESSIONS.put(sessionKey(sessionId), JSON.stringify(record), {
+    expirationTtl: SESSION_TTL_SECONDS,
+  })
   setSessionCookie(c, sessionId)
   return c.redirect('/')
 })
@@ -229,37 +290,81 @@ authApp.get('/me', requireAuthMw(), (c) => {
 // ── user upsert (AuthZ side) ─────────────────────────────────────────────────
 
 /**
- * Upsert the user row and return their org role. First user EVER to log in
- * becomes 'owner' (bootstrap); everyone after defaults to 'member'. An existing
- * user's role is preserved — never demoted/escalated by a login.
+ * Upsert the user row and return their CANONICAL id + org role. First user EVER to
+ * log in becomes 'owner' (bootstrap); everyone after defaults to 'member'. An
+ * existing user's role is preserved — never demoted/escalated by a login.
+ *
+ * VERIFIED EMAIL is the cross-path dedup key (#262). `users.email` is UNIQUE, so a
+ * given verified email maps to exactly ONE user whether they arrive via this pot's
+ * own Google OAuth OR a mumega SSO handoff — one human, one mupot user, BOTH
+ * directions. The returned `id` is canonical: callers must use it for the session
+ * (it may differ from `preferredId` if an email-matched row already exists).
+ *
+ * `preferredId` is the id to create if no row exists yet (e.g. hash(google:sub) for
+ * a Google login, or hash(mumega:email) for a handoff-first user).
+ *
+ * `allowBootstrapOwner` DEFAULTS FALSE (fail-safe): only the pot's own Google
+ * /callback — the legitimate first-owner path — passes true. Any other auth path
+ * (the SSO handoff, or a future one) can NEVER auto-mint the first-ever owner; the
+ * worst case for a virgin-pot handoff is a member, and the owner comes from
+ * provisioning. (#262 P2-c.)
  */
-async function upsertUser(env: Env, userId: string, email: string | null): Promise<OrgRole> {
-  // Existing user → keep their role.
-  const existing = await env.DB.prepare('SELECT role FROM users WHERE id = ?1')
-    .bind(userId)
-    .first<{ role: OrgRole }>()
-  if (existing) {
-    return existing.role
+export async function upsertUserByEmail(
+  env: Env,
+  preferredId: string,
+  email: string | null,
+  allowBootstrapOwner = false,
+): Promise<{ id: string; role: OrgRole }> {
+  const normEmail = email ? email.trim().toLowerCase() : null
+
+  // 1. Email match wins (the dedup key). Reuse the existing user regardless of which
+  //    AuthN path created them. Never clobber their id or role.
+  if (normEmail) {
+    const byEmail = await env.DB.prepare('SELECT id, role FROM users WHERE email = ?1')
+      .bind(normEmail)
+      .first<{ id: string; role: OrgRole }>()
+    if (byEmail) return { id: byEmail.id, role: byEmail.role }
   }
 
-  // First user becomes owner. COUNT is read inside the same logical step; D1 is
-  // single-writer per database so the bootstrap race is not a concern here.
+  // 2. No email match → id match (emailless legacy users, idempotent re-runs).
+  const byId = await env.DB.prepare('SELECT role FROM users WHERE id = ?1')
+    .bind(preferredId)
+    .first<{ role: OrgRole }>()
+  if (byId) return { id: preferredId, role: byId.role }
+
+  // 3. New user → bootstrap-owner only if the caller allows it (own-Google path).
   const countRow = await env.DB.prepare('SELECT COUNT(*) AS n FROM users').first<{ n: number }>()
   const isFirst = (countRow?.n ?? 0) === 0
-  const role: OrgRole = isFirst ? 'owner' : 'member'
+  const role: OrgRole = isFirst && allowBootstrapOwner ? 'owner' : 'member'
 
-  // INSERT … ON CONFLICT: if a concurrent login inserted the same id first,
-  // fall back to reading the now-existing role (never clobber).
-  await env.DB.prepare(
-    'INSERT INTO users (id, email, role) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO NOTHING',
-  )
-    .bind(userId, email, role)
-    .run()
+  // INSERT … ON CONFLICT(id) suppresses an id race, but NOT a UNIQUE(email) violation
+  // — two concurrent first-logins for the same email both pass step 1, both INSERT,
+  // and the second hits `UNIQUE constraint failed: users.email`. Catch it and fall
+  // back to the email lookup (the winner's row now exists) so neither caller 500s.
+  // (#262 P2 concurrent-first-login.)
+  try {
+    await env.DB.prepare(
+      'INSERT INTO users (id, email, role) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO NOTHING',
+    )
+      .bind(preferredId, normEmail, role)
+      .run()
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (!/UNIQUE constraint failed: users\.email/i.test(msg)) throw err
+    // Lost the email race → the winning row exists; resolve it below.
+  }
 
-  const row = await env.DB.prepare('SELECT role FROM users WHERE id = ?1')
-    .bind(userId)
-    .first<{ role: OrgRole }>()
-  return row?.role ?? role
+  // Re-resolve (email-first) to return the canonical row after the insert/race.
+  if (normEmail) {
+    const row = await env.DB.prepare('SELECT id, role FROM users WHERE email = ?1')
+      .bind(normEmail)
+      .first<{ id: string; role: OrgRole }>()
+    if (row) return { id: row.id, role: row.role }
+  }
+  const row2 = await env.DB.prepare('SELECT id, role FROM users WHERE id = ?1')
+    .bind(preferredId)
+    .first<{ id: string; role: OrgRole }>()
+  return { id: row2?.id ?? preferredId, role: row2?.role ?? role }
 }
 
 // ── cookie ───────────────────────────────────────────────────────────────────
