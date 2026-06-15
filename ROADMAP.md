@@ -60,6 +60,34 @@ A pot runs a **real business** coherently through the rails — the proof.
 - **#39** Loops UI + gated approval pipeline (fixes `gated_approval_pipeline_unwired`).
 - **#41** ChatGPT connector production auth path.
 
+## v0.24.0 — The breathing organism (brain = the board's prioritizer) *(proposed 2026-06-15, Chair to ratify)*
+Redefine the brain's JOB: **prioritize the backlog, don't act.** perceive→decide→**act** was
+the spam-loop; **rank** is idempotent (same state → same answer → no spam). Mechanical-first,
+cheap. Research-validated vs GBrain (YC CEO brain) + the agent-loop field; extends the v0.20
+coherence-loop. Operating model: *everything task-like → task system; brain prioritizes; Hadi
+updates priority.*
+- **brain-as-prioritizer** — reads board + pulses + goals → ranks what's next. Runs as a cheap
+  **Hermes/qwen3.7-plus DMN** ($0.12/day, $20≈5mo); the Opus **dyad-gate** (Kasra+Codex) acts on
+  hard calls. Retire the spamming VPS sovereign loop → a Hermes brain-scan/prioritize cron.
+- **pulses (neurology)** — wire **PostHog** (provisioned on every project, ZERO events) as the
+  afferent signal feeding the brain. Controlling pulse cadence = controlling metabolism.
+- **minions** — cheap qwen workers (Hermes cron/kanban) for mechanical system-care; strong-model
+  reserved for the gate. `no_agent` cron = free.
+- **visible kanban/sprint board** (mumega + each pot) — the board the brain ranks + everyone sees;
+  new priorities queue, **no reactive jumps** (priority-discipline; Chair overrides).
+- **mechanical safeguards** — termination predicate, no-progress halt (3 identical fingerprints),
+  per-action circuit breaker, `rest` as a valid output.
+
+## v0.25.0 — True microkernel (substrate-portable, BYO) *(proposed 2026-06-15, Chair to ratify)*
+The pot is the **microkernel** (the 14 ports), **not pure-Cloudflare**. CF stays the fast/free
+**default adapter** — achieved *via* the kernel, so it's both fast AND portable.
+- **CF as one adapter** — audit + fix any direct-CF coupling (D1/DO/Queues/R2) so it sits behind
+  the ports; CF swappable, not baked in.
+- **prove portability** — a 2nd adapter set (openclaw / non-CF reference); a kernel isn't real
+  until two adapters exist. (Sharpens v0.22 #53 harness packs.)
+- **BYOK** (tenant's own model keys) + **BYO-Hermes** (tenant's own runtime, BYO-host: VPS / Mac
+  mini / their machine). Sovereign = portable across substrate + keys + runtime + host.
+
 ## v1.0.0 — GA *(was milestone #1; meaning evolved)*
 The loop **closed** + ≥1 pot operating a real business **end-to-end**: brain measures →
 flight corrects → gated act → state updates → re-measures, on a live business (digid),
