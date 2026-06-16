@@ -17,18 +17,10 @@
 
 import { Hono } from 'hono'
 import type { Env } from '../types'
-import { getJSON, setJSON, setSetting } from '../dashboard/settings'
-import { PLAN_TIER_KEY } from './entitlement'
+import { applyPlanEvent } from './entitlement'
 import { isPotTier } from './plans'
 
 const MAX_BODY_BYTES = 4096
-/** org_settings key: last billing event applied (idempotency + ordering guard). */
-const LAST_EVENT_KEY = 'billing_last_event'
-
-interface LastEvent {
-  event_id: string
-  effective_at: number
-}
 
 async function hmacHex(secret: string, message: string): Promise<string> {
   const enc = new TextEncoder()
@@ -93,16 +85,13 @@ billingAdminApp.post('/plan', async (c) => {
   if (typeof body.effective_at !== 'number' || !Number.isFinite(body.effective_at)) {
     return c.json({ error: 'missing_effective_at' }, 400)
   }
-  // REPLAY / ORDER guard.
-  const last = await getJSON<LastEvent>(c.env, LAST_EVENT_KEY)
-  if (last && last.event_id === body.event_id) {
-    return c.json({ ok: true, tier: body.tier, applied: false, reason: 'duplicate_event' })
-  }
-  if (last && body.effective_at < last.effective_at) {
-    return c.json({ ok: true, applied: false, reason: 'stale_event' })
-  }
-  // Apply: write the plan + record the event as last-applied.
-  await setSetting(c.env, PLAN_TIER_KEY, body.tier)
-  await setJSON(c.env, LAST_EVENT_KEY, { event_id: body.event_id, effective_at: body.effective_at })
-  return c.json({ ok: true, tier: body.tier, applied: true })
+  // REPLAY / ORDER: a single conditional upsert (CAS) — freshness check + write are
+  // atomic, so concurrent/stale/duplicate events can't race or partially persist.
+  // applied:false = a safe no-op (duplicate or stale); still 200 (event handled).
+  const result = await applyPlanEvent(c.env, {
+    tier: body.tier,
+    eventId: body.event_id,
+    effectiveAt: body.effective_at,
+  })
+  return c.json({ ok: true, tier: body.tier, applied: result.applied })
 })
