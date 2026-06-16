@@ -339,6 +339,10 @@ authApp.get('/logout', async (c) => {
 // (no enumeration). Read-only: no session mutation, no jti consumption (replaying a
 // read is harmless).
 authApp.get('/presence', async (c) => {
+  // Keep the token-bearing URL out of Referer (follow-on nav/resource loads) and
+  // out of shared/browser caches — same protection /auth/handoff applies, since a
+  // leaked presence claim is a replayable read-oracle until exp.
+  c.header('Referrer-Policy', 'no-referrer')
   c.header('Cache-Control', 'no-store')
   const token = c.req.query('token')
   if (!token) return c.json({ ok: false }, 401)
