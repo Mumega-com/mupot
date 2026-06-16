@@ -162,4 +162,40 @@ describe('pot handoff-verify', () => {
       expect(r.reason).toBe('wrong_aud')
     })
   })
+
+  // ── per-pot login-handoff aud (fix/handoff-aud-per-pot): mumega mints the login
+  // claim with aud = the pot's dashboard_url HOSTNAME (#yp-aud-gap). A non-mumega pot
+  // therefore CANNOT verify against the default HANDOFF_AUD ('mupot.mumega.com') — it
+  // must pass its own MUPOT_HANDOFF_AUD. These lock that contract (the viamar blocker).
+  describe('per-pot login-handoff audience (hostname aud)', () => {
+    const VIAMAR_AUD = 'mupot-viamar.weathered-scene-2272.workers.dev'
+
+    it('rejects a viamar-hostname claim under the default aud (the bug)', async () => {
+      const t = await sign(priv, baseClaim({ aud: VIAMAR_AUD }))
+      const r = await verifyHandoffClaim(pubJwk, t, NOW + 1) // defaults to HANDOFF_AUD
+      expect(r.ok).toBe(false)
+      expect(r.reason).toBe('wrong_aud')
+    })
+
+    it('accepts a viamar-hostname claim when expectedAud = MUPOT_HANDOFF_AUD (the fix)', async () => {
+      const t = await sign(priv, baseClaim({ aud: VIAMAR_AUD }))
+      const r = await verifyHandoffClaim(pubJwk, t, NOW + 1, VIAMAR_AUD)
+      expect(r.ok).toBe(true)
+      expect(r.claim?.email).toBe('op@mumega.com')
+    })
+
+    it('mumega#0 still verifies under the default when MUPOT_HANDOFF_AUD is unset', async () => {
+      // The route passes env.MUPOT_HANDOFF_AUD; undefined ⇒ default HANDOFF_AUD.
+      const t = await sign(priv, baseClaim({ aud: HANDOFF_AUD }))
+      const r = await verifyHandoffClaim(pubJwk, t, NOW + 1, undefined)
+      expect(r.ok).toBe(true)
+    })
+
+    it('a viamar pot rejects a claim minted for mumega#0 (cross-pot isolation)', async () => {
+      const t = await sign(priv, baseClaim({ aud: HANDOFF_AUD }))
+      const r = await verifyHandoffClaim(pubJwk, t, NOW + 1, VIAMAR_AUD)
+      expect(r.ok).toBe(false)
+      expect(r.reason).toBe('wrong_aud')
+    })
+  })
 })

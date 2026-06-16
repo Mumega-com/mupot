@@ -275,7 +275,15 @@ authApp.get('/handoff', async (c) => {
   if (!token) return c.redirect('/auth/login')
 
   // Verify signature + alg + aud + iss + email_verified + exp with the PUBLIC key only.
-  const res = await verifyHandoffClaim(env.MUPOT_HANDOFF_PUBLIC_KEY, token)
+  // aud: mumega mints the claim with aud = THIS pot's dashboard_url hostname
+  // (#yp-aud-gap), so we verify against our own MUPOT_HANDOFF_AUD. Passing undefined
+  // (var unset) falls through to the HANDOFF_AUD default — correct for mumega#0 only.
+  const res = await verifyHandoffClaim(
+    env.MUPOT_HANDOFF_PUBLIC_KEY,
+    token,
+    undefined,
+    env.MUPOT_HANDOFF_AUD,
+  )
   if (!res.ok || !res.claim) return c.redirect('/auth/login')
 
   // One-time: consume the jti so a captured claim can't be replayed. KV get-then-put
