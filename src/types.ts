@@ -359,8 +359,67 @@ export interface ModelMessage {
   content: string
 }
 
+// ── Model port (substrate-contract.md §kernel ports). Version lives as a module
+// constant, NOT a field on the interface, so adapters/mocks stay structural and
+// the parent still knows the contract version. Adding optional ModelChatOpts
+// fields is additive (no version bump); changing chat()'s shape is a v2 + shim.
+export const MODEL_PORT_VERSION = 1 as const
+
+export interface ModelChatOpts {
+  model?: string
+  maxTokens?: number
+  temperature?: number // additive v1-optional
+}
+
 export interface ModelPort {
-  chat(messages: ModelMessage[], opts?: { model?: string; maxTokens?: number }): Promise<string>
+  chat(messages: ModelMessage[], opts?: ModelChatOpts): Promise<string>
+}
+
+// ── Brain port (substrate-contract.md §kernel ports). RANK-ONLY: the brain reads
+// a context snapshot and returns a RANKING of proposals — it NEVER acts. The
+// sealed core applies the ranking through the autonomy + capability + budget
+// gates. This is what makes brain-swapping (sovereign C(t) #70, a YC-CEO brain,
+// BYO) safe: a swapped brain changes WHAT is proposed, never bypasses a gate.
+// Idempotent by contract: a stable BrainContext should yield a stable ranking
+// (rank, don't act → same state → same answer → no spam).
+export const BRAIN_PORT_VERSION = 1 as const
+
+// JSON-only, capability-free by TYPE. BrainContext is a SANITIZED snapshot — raw
+// bus/event payloads, Env handles, bindings, or secrets must never cross the brain
+// port. `unknown` would defeat that by convention; BrainJson enforces it at the
+// type level (a binding/secret object cannot satisfy this type).
+export type BrainJson =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly BrainJson[]
+  | { readonly [k: string]: BrainJson }
+
+export interface BrainContext {
+  tenant: string
+  goals: ReadonlyArray<{ agentId: string; okr: string; kpiProgress: number }>
+  board: ReadonlyArray<{ taskId: string; status: string; agentId: string | null }>
+  pulses?: ReadonlyArray<{ kind: string; at: number; payload?: BrainJson }>
+  lastHumanDirective?: string | null // position-0 of every decision (bus WAKES, never STEERS)
+  budgetRemainingMicroUsd?: number
+}
+
+export interface BrainProposal {
+  kind: 'spawn_task' | 'wake_agent' | 'noop'
+  agentId?: string
+  summary: string // human-readable intent (audit trail / Brain page)
+  doneWhen?: string // proposed done-condition; core still gates
+  priority: number // brain's rank; core may re-clamp
+}
+
+export interface BrainDecision {
+  ranked: ReadonlyArray<BrainProposal> // ordered best-first; idempotent for a given context
+  rationale?: string
+}
+
+export interface BrainPort {
+  decide(ctx: BrainContext): Promise<BrainDecision>
 }
 
 // key/value org settings (onboarding state, chosen model provider, brand, …).
