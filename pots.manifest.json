@@ -1,0 +1,8 @@
+{
+  "_comment": "Pots this mupot core deploys to. `config: null` = the repo default wrangler.toml (mumega's pot). Others point at the tenant's wrangler config (copied into the repo root at deploy time so src/ + migrations/ resolve). `db` = the D1 database name. Used by scripts/mupot-update.mjs.",
+  "pots": [
+    { "slug": "mumega", "config": null, "db": "mupot", "health": "https://mupot.mumega.com/health" },
+    { "slug": "viamar", "config": "../mumega.com/agents/viamar/mupot-viamar.wrangler.toml", "db": "mupot-viamar", "health": "https://mupot-viamar.weathered-scene-2272.workers.dev/health" },
+    { "slug": "digid", "config": "../mumega.com/agents/digid/mupot-digid.wrangler.toml", "db": "mupot-digid", "health": "https://agents.digid.ca/health" }
+  ]
+}
