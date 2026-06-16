@@ -104,6 +104,7 @@ export interface Env {
   GHL_API_KEY?: string           // GoHighLevel location API key (outbound send)
   GHL_LOCATION_ID?: string       // GHL location id (scopes all API calls)
   GHL_WEBHOOK_SECRET?: string    // HMAC-SHA256 secret for inbound webhook verification
+  BILLING_PLAN_SECRET?: string   // HMAC-SHA256 secret: central billing source → POST /api/billing/plan (writes plan_tier)
   // Connector credential vault (issue #116) — AES-GCM-256 master key.
   // Deploy prerequisite: `npx wrangler secret put CONNECTOR_MASTER_KEY`
   // Value: 64-char hex string (32 bytes / 256-bit, e.g. `openssl rand -hex 32`).

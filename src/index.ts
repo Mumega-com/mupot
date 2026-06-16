@@ -43,6 +43,7 @@ import { orientApp } from './orient/routes'
 import { handleOAuthAuthorize, resolveExternalToken as memberKeyResolver } from './mcp/oauth-authorize'
 import { McpOAuthApiHandler } from './mcp/oauth-api-handler'
 import { brainPhysicsIngestApp } from './dashboard/brain-ingest'
+import { billingAdminApp } from './billing/admin'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -95,6 +96,10 @@ app.route('/api/orient', orientApp)
 // each measure_and_log() cycle. Bearer-auth (admin token); stores to SESSIONS KV.
 // Mounted before the dashboard '/' catch-all so /api/brain/* is not shadowed.
 app.route('/api/brain', brainPhysicsIngestApp)
+// Billing plan-setter (#175 S2): the central billing source (mumega Stripe webhook)
+// writes the pot's plan_tier here, HMAC-verified by BILLING_PLAN_SECRET. Inbound,
+// machine-to-machine. Before the dashboard '/' catch-all.
+app.route('/api/billing', billingAdminApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp
