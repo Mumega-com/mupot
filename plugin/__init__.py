@@ -34,10 +34,12 @@ def register(ctx: Any) -> None:
         fn=mupot_provision,
         schema=MUPOT_PROVISION_SCHEMA,
         description=(
-            "v0.1 PLAN-ONLY: emit an idempotent plan + exact wrangler CLI commands to "
-            "provision a mupot instance (D1 + KV + wrangler toml). Does NOT call the "
-            "Cloudflare API directly — run the emitted commands yourself. Real auto-apply "
-            "lands in v0.2. Never runs migrations automatically (Risk 2: drift landmine)."
+            "Idempotent mupot provisioner. Default (dry_run=True): emit a plan showing "
+            "what will be created without touching Cloudflare. Apply mode "
+            "(confirm=True + dry_run=False): uses MUPOT_CF_API_TOKEN + "
+            "MUPOT_CF_ACCOUNT_ID to create D1 + KV namespaces via the CF REST API "
+            "and writes wrangler.<slug>.toml with resolved IDs. Migration apply is "
+            "always emitted as a gated next_step — never auto-run (Risk 2)."
         ),
     )
 

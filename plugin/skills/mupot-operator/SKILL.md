@@ -5,7 +5,7 @@ description: >
   Covers provisioning a new pot, understanding org/RBAC/board/memory concepts,
   enabling the DMN brain, and avoiding known pitfalls (migration drift, token scope,
   cron symlink failure). Load when a user wants to set up, operate, or troubleshoot mupot.
-version: "0.1.0"
+version: "0.2.0"
 required_environment_variables:
   - MUPOT_CF_ACCOUNT_ID
   - MUPOT_CF_API_TOKEN
@@ -23,10 +23,11 @@ companion_skills:
 
 # mupot Operator Skill
 
-> **v0.1 is PLAN-ONLY.** `mupot_provision` emits a structured plan and the exact
-> wrangler CLI commands to run. It does NOT call the Cloudflare API directly — no SDK
-> client is bundled in v0.1. Run the emitted commands yourself. Real auto-apply lands
-> in v0.2.
+> **v0.2 ships the real CF provisioner.** `mupot_provision` with `confirm=True, dry_run=False`
+> calls the Cloudflare API directly (pure stdlib urllib) to create D1 databases and KV
+> namespaces, then writes `wrangler.<slug>.toml` with resolved IDs. Default (`dry_run=True`)
+> emits a plan without touching Cloudflare. Requires `MUPOT_CF_API_TOKEN` and
+> `MUPOT_CF_ACCOUNT_ID` in the environment for apply mode.
 
 ## What mupot is
 
@@ -41,7 +42,7 @@ Core concepts:
 - **Memory** — D1 relational + Vectorize semantic recall (Vectorize deferred to v0.2)
 - **Brain** — an optional always-on DMN prioritiser (qwen3.7-plus via OpenRouter, free tier)
 
-## Provision flow (v0.1 — plan-only)
+## Provision flow (v0.2 — real CF provisioner)
 
 **Prerequisites:**
 1. A Cloudflare account (free tier is sufficient for a single pot)
@@ -49,33 +50,26 @@ Core concepts:
    Workers KV Storage:Edit, Account Settings:Read
 3. `MUPOT_CF_ACCOUNT_ID` and `MUPOT_CF_API_TOKEN` set in your environment
 
-**Step 1 — Get the plan:**
+**Step 1 — Get the plan (dry-run, default):**
 ```
 mupot_provision(slug="acme", brand="Acme Corp", cf_account_id="...", cf_api_token="...")
-# Returns a plan with exact wrangler CLI commands. confirm defaults to False.
-# v0.1: this is ALL the tool does — it plans, not applies.
+# Returns a plan showing what will be created. confirm defaults to False (dry-run).
+# No CF API calls are made in dry-run mode.
 ```
 
-**Step 2 — Review the plan.** Check for existing resources (idempotent list-guard).
-If your D1 or KV already exists, the tool notes skips.
+**Step 2 — Review the plan.** The idempotent list-guard shows which D1/KV resources
+already exist (SKIP) and which will be created (CREATE).
 
-**Step 3 — Run the emitted wrangler commands yourself (v0.1 — manual):**
-```bash
-# Commands are in result["next_steps"]. Example for slug="acme":
-
-# Create D1 database:
-npx wrangler d1 create mupot-acme
-
-# Create KV namespaces:
-npx wrangler kv namespace create mupot-acme-sessions
-npx wrangler kv namespace create mupot-acme-oauth
-
-# Copy wrangler.example.toml → wrangler.acme.toml and fill in the IDs above.
+**Step 3 — Apply (v0.2):**
 ```
-
-> v0.2 will bundle the Cloudflare SDK and run steps 1–3 automatically via
-> `confirm=True, dry_run=False`. In v0.1, those flags return the same plan-only
-> response (no live CF calls are made either way without an SDK client).
+mupot_provision(
+    slug="acme", brand="Acme Corp", cf_account_id="...", cf_api_token="...",
+    confirm=True, dry_run=False
+)
+# Calls the CF REST API to create D1 + KV namespaces (skips any that already exist),
+# then writes wrangler.acme.toml with the resolved resource IDs.
+# Requires MUPOT_CF_API_TOKEN + MUPOT_CF_ACCOUNT_ID in the environment.
+```
 
 **Step 4 — Deploy + migrate (follow next_steps exactly):**
 ```bash
@@ -153,21 +147,22 @@ Each pot = one Workers slot. Free tier = 100 slots. If you're near the limit, th
 `mupot_provision` tool will warn you. Workers-for-Platforms centralisation is explicitly
 rejected (it breaks pot sovereignty) — each user must stay within their own slot budget.
 
-## v0.1 scope / deferred
+## v0.2 scope / deferred
 
-**In v0.1 (plan-only):**
-- Dry-run plan with exact wrangler CLI commands for manual execution
-- Idempotent list-guard logic (skip existing D1/KV)
-- `wrangler.toml` generation when an injected CF client is provided (test/CI path)
+**In v0.2 (real CF provisioner):**
+- Real apply: CF REST API via pure stdlib urllib (no extra deps), idempotent D1 + KV creation
+- Paginated list-guard: fetches all pages before create (no double-create on accounts with >100 resources)
+- `wrangler.<slug>.toml` written with resolved D1 + KV IDs after apply
+- Optional `wrangler deploy` via subprocess (version-check gate; token never in argv)
+- Token security: never in argv, repr, error messages, or toml output
 - Brain profile + cron plan emission
 - Deploy-to-Cloudflare button (README)
 
-**Deferred to v0.2+:**
-- Real auto-apply: bundles `cloudflare` SDK, auto-creates D1/KV resources
+**Deferred to v0.3+:**
 - CF OAuth one-click (pending Mumega OAuth app public approval)
 - Full SDK provisioner (no wrangler dep): `client.workers.scripts.update()`
 - OAuth secret automation (guided prompt + CF secrets API)
 - R2 / Vectorize / Queues provisioning (add via re-run)
-- `mupot_revoke_token` post-provision
+- `mupot_revoke_token` post-provision (needs token ID stored at mint time)
 - `pot_registry` / `pot_owners` D1 migrations for the "Your Pots" console (G4)
 - `hermes plugins install Mumega-com/mupot-plugin` standalone repo (publish-time step)

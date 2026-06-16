@@ -93,13 +93,30 @@ _CF_LIST_PAGE_SIZE = 100  # CF default; request up to 100 per page
 
 
 class CloudflareApiError(RuntimeError):
-    """Raised when the CF REST API returns a non-2xx status or error payload."""
+    """Raised when the CF REST API returns a non-2xx status or error payload.
 
-    def __init__(self, method: str, url: str, status: int, body: str) -> None:
-        # Never include the token in this message — it is NOT passed here.
-        super().__init__(
-            f"CF API {method} {url} → HTTP {status}: {body[:400]}"
-        )
+    Security: the raw response body is NEVER embedded in the error message — an
+    upstream or proxy error body may echo the auth token.  Only the HTTP method,
+    URL, status code, and (when available) the parsed CF error codes/messages are
+    included.  CF error payloads contain structured codes/messages, not credentials.
+    """
+
+    def __init__(
+        self,
+        method: str,
+        url: str,
+        status: int,
+        *,
+        cf_errors: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if cf_errors:
+            # CF errors array contains {code, message} — safe to include, never contains tokens.
+            errors_str = "; ".join(
+                f"[{e.get('code', '?')}] {e.get('message', '')}" for e in cf_errors
+            )
+            super().__init__(f"CF API {method} {url} → HTTP {status}: {errors_str}")
+        else:
+            super().__init__(f"CF API {method} {url} → HTTP {status}")
         self.status = status
 
 
@@ -147,23 +164,38 @@ class CloudflareApiClient:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 raw = resp.read().decode()
         except urllib.error.HTTPError as exc:
-            raw = exc.read().decode() if exc.fp else ""
-            raise CloudflareApiError(method, url, exc.code, raw) from exc
+            # Security: do NOT read or embed the response body — it may echo the auth token.
+            # Include only method + url + status code in the error (Risk 1).
+            raise CloudflareApiError(method, url, exc.code) from exc
         parsed: dict[str, Any] = json.loads(raw)
         if not parsed.get("success", False):
-            errors = parsed.get("errors", [])
-            raise CloudflareApiError(method, url, 0, json.dumps(errors))
+            # CF errors array contains structured {code, message} — safe, never contains tokens.
+            cf_errors: list[dict[str, Any]] = parsed.get("errors", [])
+            raise CloudflareApiError(method, url, 0, cf_errors=cf_errors)
         return parsed
 
     def list_d1_databases(self, account_id: str) -> list[dict[str, Any]]:
         """
-        List all D1 databases for the account.
-        GET /accounts/{account_id}/d1/database
-        Returns the 'result' array (list of {uuid, name, ...}).
+        List ALL D1 databases for the account, paginating until exhausted.
+        GET /accounts/{account_id}/d1/database?per_page=N&page=P
+        Returns the aggregated 'result' array across all pages.
         """
-        path = f"/accounts/{account_id}/d1/database?per_page={_CF_LIST_PAGE_SIZE}"
-        parsed = self._request("GET", path)
-        return parsed.get("result", [])
+        all_results: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            path = (
+                f"/accounts/{account_id}/d1/database"
+                f"?per_page={_CF_LIST_PAGE_SIZE}&page={page}"
+            )
+            parsed = self._request("GET", path)
+            page_results = parsed.get("result", [])
+            all_results.extend(page_results)
+            result_info = parsed.get("result_info", {})
+            total_pages = result_info.get("total_pages", 1)
+            if page >= total_pages:
+                break
+            page += 1
+        return all_results
 
     def create_d1_database(self, account_id: str, name: str) -> dict[str, Any]:
         """
@@ -177,16 +209,26 @@ class CloudflareApiClient:
 
     def list_kv_namespaces(self, account_id: str) -> list[dict[str, Any]]:
         """
-        List all KV namespaces for the account.
-        GET /accounts/{account_id}/storage/kv/namespaces
-        Returns the 'result' array (list of {id, title, ...}).
+        List ALL KV namespaces for the account, paginating until exhausted.
+        GET /accounts/{account_id}/storage/kv/namespaces?per_page=N&page=P
+        Returns the aggregated 'result' array across all pages.
         """
-        path = (
-            f"/accounts/{account_id}/storage/kv/namespaces"
-            f"?per_page={_CF_LIST_PAGE_SIZE}"
-        )
-        parsed = self._request("GET", path)
-        return parsed.get("result", [])
+        all_results: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            path = (
+                f"/accounts/{account_id}/storage/kv/namespaces"
+                f"?per_page={_CF_LIST_PAGE_SIZE}&page={page}"
+            )
+            parsed = self._request("GET", path)
+            page_results = parsed.get("result", [])
+            all_results.extend(page_results)
+            result_info = parsed.get("result_info", {})
+            total_pages = result_info.get("total_pages", 1)
+            if page >= total_pages:
+                break
+            page += 1
+        return all_results
 
     def create_kv_namespace(self, account_id: str, title: str) -> dict[str, Any]:
         """
@@ -199,11 +241,12 @@ class CloudflareApiClient:
         return parsed.get("result", {})
 
 
-def _build_api_client_from_env() -> CloudflareApiClient:
+def _build_api_client_from_env() -> tuple["CloudflareApiClient", str]:
     """
-    Construct CloudflareApiClient from environment variables.
-    Raises ValueError with a clear message if env vars are missing.
-    Risk 1: token read from env — never logged; error message names the env var, not the value.
+    Construct CloudflareApiClient + validate MUPOT_CF_ACCOUNT_ID from environment.
+    Raises ValueError with a clear message if either env var is missing.
+    Risk 1: error messages name the env var, NEVER its value.
+    Returns (client, account_id).
     """
     token = os.environ.get("MUPOT_CF_API_TOKEN", "")
     if not token:
@@ -212,9 +255,14 @@ def _build_api_client_from_env() -> CloudflareApiClient:
             "Create a scoped CF API token (5 permission groups — see design doc) "
             "and export it as MUPOT_CF_API_TOKEN before running with confirm=True."
         )
-    # MUPOT_CF_ACCOUNT_ID is consumed by the caller (mupot_provision) as cf_account_id.
-    # No account-id validation needed here — the CF API will reject bad ones.
-    return CloudflareApiClient(token)
+    account_id = os.environ.get("MUPOT_CF_ACCOUNT_ID", "").strip()
+    if not account_id:
+        raise ValueError(
+            "MUPOT_CF_ACCOUNT_ID is not set. "
+            "Find your Cloudflare account ID at dash.cloudflare.com → right sidebar "
+            "and export it as MUPOT_CF_ACCOUNT_ID before running with confirm=True."
+        )
+    return CloudflareApiClient(token), account_id
 
 
 # ── stub for token revocation (Risk 1, v0.3 implementation) ──────────────────
@@ -346,6 +394,14 @@ def mupot_provision(
     # dry_run flag takes precedence over confirm as a safety guard
     applying = confirm and not dry_run
 
+    # Reject a blank cf_account_id on the apply path — even when a client is injected.
+    # A blank account_id would silently call the wrong CF endpoint or return nonsense.
+    if applying and not cf_account_id.strip():
+        raise ValueError(
+            "cf_account_id is blank. Provide your Cloudflare account ID (32 hex chars) "
+            "or set MUPOT_CF_ACCOUNT_ID in the environment."
+        )
+
     # Choose client: injected > construct from env (apply only) > DryRunClient
     client: CloudflareClient
     if cf_client is not None:
@@ -354,7 +410,9 @@ def mupot_provision(
         # v0.2: construct the real client from env — no SDK dep, pure urllib.
         # cf_api_token param is accepted for API surface compatibility but the real
         # client is always constructed from env (token never re-logged from param).
-        client = _build_api_client_from_env()
+        # _build_api_client_from_env also validates MUPOT_CF_ACCOUNT_ID; if the env
+        # account_id differs from the param, the env one takes precedence (env is authoritative).
+        client, _ = _build_api_client_from_env()
     else:
         client = DryRunClient()
 

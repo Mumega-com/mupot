@@ -455,6 +455,38 @@ class TestMupotProvisionApplyGate:
         assert "create_d1_database" in methods
         assert "create_kv_namespace" in methods
 
+    def test_apply_with_blank_account_id_rejected_even_with_injected_client(
+        self, tmp_path: Path
+    ) -> None:
+        """Blocker 4: blank cf_account_id on apply path must raise even when cf_client is injected."""
+        dry = DryRunClient()
+        with pytest.raises(ValueError, match="cf_account_id"):
+            mupot_provision(
+                slug="acme",
+                brand="Acme Corp",
+                cf_account_id="",  # blank — must be rejected
+                cf_api_token="tok",
+                confirm=True,
+                dry_run=False,
+                cf_client=dry,
+                toml_output_dir=tmp_path,
+            )
+
+    def test_apply_with_whitespace_account_id_rejected(self, tmp_path: Path) -> None:
+        """Whitespace-only cf_account_id must also be rejected on apply path."""
+        dry = DryRunClient()
+        with pytest.raises(ValueError, match="cf_account_id"):
+            mupot_provision(
+                slug="acme",
+                brand="Acme Corp",
+                cf_account_id="   ",  # whitespace-only — must be rejected
+                cf_api_token="tok",
+                confirm=True,
+                dry_run=False,
+                cf_client=dry,
+                toml_output_dir=tmp_path,
+            )
+
 
 # ── mupot_status ──────────────────────────────────────────────────────────────
 
@@ -855,6 +887,111 @@ class TestCloudflareApiClientConstruction:
     def test_base_url_is_cf_v4(self) -> None:
         assert _CF_API_BASE == "https://api.cloudflare.com/client/v4"
 
+    def test_list_d1_databases_paginates_all_pages(self) -> None:
+        """Blocker 2: when result_info.total_pages=2, client must make 2 urlopen calls
+        and return resources from both pages so the idempotent guard finds page-2 resources."""
+        client = CloudflareApiClient("test-token-pagination")
+        account_id = "acct_" + "p" * 27
+
+        page1_resp = MagicMock()
+        page1_resp.read.return_value = json.dumps({
+            "success": True,
+            "errors": [],
+            "result": [{"name": "page1-db", "id": "id-page1"}],
+            "result_info": {"page": 1, "per_page": 100, "total_pages": 2, "count": 1},
+        }).encode()
+        page1_resp.__enter__ = lambda s: s
+        page1_resp.__exit__ = MagicMock(return_value=False)
+
+        page2_resp = MagicMock()
+        page2_resp.read.return_value = json.dumps({
+            "success": True,
+            "errors": [],
+            "result": [{"name": "page2-db", "id": "id-page2"}],
+            "result_info": {"page": 2, "per_page": 100, "total_pages": 2, "count": 1},
+        }).encode()
+        page2_resp.__enter__ = lambda s: s
+        page2_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", side_effect=[page1_resp, page2_resp]) as mock_urlopen:
+            results = client.list_d1_databases(account_id)
+
+        # Must have made 2 calls (one per page)
+        assert mock_urlopen.call_count == 2, (
+            "list_d1_databases must fetch both pages when total_pages=2"
+        )
+        # Must aggregate both pages — page-2 resource is visible to the idempotent guard
+        names = [r["name"] for r in results]
+        assert "page1-db" in names
+        assert "page2-db" in names
+
+    def test_list_kv_namespaces_paginates_all_pages(self) -> None:
+        """Blocker 2: when result_info.total_pages=2, client must return KV from both pages."""
+        client = CloudflareApiClient("test-token-kv-pagination")
+        account_id = "acct_" + "q" * 27
+
+        page1_resp = MagicMock()
+        page1_resp.read.return_value = json.dumps({
+            "success": True,
+            "errors": [],
+            "result": [{"title": "page1-kv", "id": "kv-page1"}],
+            "result_info": {"page": 1, "per_page": 100, "total_pages": 2, "count": 1},
+        }).encode()
+        page1_resp.__enter__ = lambda s: s
+        page1_resp.__exit__ = MagicMock(return_value=False)
+
+        page2_resp = MagicMock()
+        page2_resp.read.return_value = json.dumps({
+            "success": True,
+            "errors": [],
+            "result": [{"title": "page2-kv", "id": "kv-page2"}],
+            "result_info": {"page": 2, "per_page": 100, "total_pages": 2, "count": 1},
+        }).encode()
+        page2_resp.__enter__ = lambda s: s
+        page2_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", side_effect=[page1_resp, page2_resp]) as mock_urlopen:
+            results = client.list_kv_namespaces(account_id)
+
+        assert mock_urlopen.call_count == 2, (
+            "list_kv_namespaces must fetch both pages when total_pages=2"
+        )
+        titles = [r["title"] for r in results]
+        assert "page1-kv" in titles
+        assert "page2-kv" in titles
+
+    def test_api_error_body_does_not_leak_response_body_contents(self) -> None:
+        """Blocker 3: an HTTPError whose body contains a secret must NOT appear in str(exc)."""
+        SECRET_IN_BODY = "proxy-echoed-token-supersecret-xyz"
+        client = CloudflareApiClient("my-real-token")
+        account_id = "acct_" + "r" * 27
+
+        class FakeErrorFP:
+            """Simulate exc.fp (file-like) with a body containing a secret."""
+            def read(self) -> bytes:
+                return f"upstream error: Bearer {SECRET_IN_BODY}".encode()
+            def close(self) -> None:
+                pass
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.side_effect = urllib.error.HTTPError(
+                url=f"{_CF_API_BASE}/accounts/{account_id}/d1/database",
+                code=502,
+                msg="Bad Gateway",
+                hdrs=MagicMock(),  # type: ignore[arg-type]
+                fp=FakeErrorFP(),  # type: ignore[arg-type]
+            )
+            with pytest.raises(CloudflareApiError) as exc_info:
+                client.list_d1_databases(account_id)
+
+        error_str = str(exc_info.value)
+        # The secret from the response body must NEVER appear in the error string
+        assert SECRET_IN_BODY not in error_str, (
+            "CloudflareApiError must not embed response body contents (token leak risk)"
+        )
+        # Status code must be in the message (so callers know what went wrong)
+        assert "502" in error_str
+
 
 # ── v0.2: FakeCFClient — idempotent apply path ───────────────────────────────
 
@@ -1114,10 +1251,22 @@ class TestBuildApiClientFromEnv:
             with pytest.raises(ValueError, match="MUPOT_CF_API_TOKEN"):
                 _build_api_client_from_env()
 
-    def test_present_token_returns_client(self) -> None:
-        with patch.dict(os.environ, {"MUPOT_CF_API_TOKEN": "tok-from-env"}):
-            client = _build_api_client_from_env()
+    def test_missing_account_id_raises_valueerror_naming_the_var(self) -> None:
+        """Blocker 4: MUPOT_CF_ACCOUNT_ID must be validated — missing must raise naming the var."""
+        with patch.dict(os.environ, {"MUPOT_CF_API_TOKEN": "tok-present"}, clear=True):
+            os.environ.pop("MUPOT_CF_ACCOUNT_ID", None)
+            with pytest.raises(ValueError, match="MUPOT_CF_ACCOUNT_ID"):
+                _build_api_client_from_env()
+
+    def test_present_token_and_account_id_returns_client_and_account_id(self) -> None:
+        """_build_api_client_from_env returns (client, account_id) tuple when both are set."""
+        with patch.dict(
+            os.environ,
+            {"MUPOT_CF_API_TOKEN": "tok-from-env", "MUPOT_CF_ACCOUNT_ID": "acct" + "a" * 28},
+        ):
+            client, account_id = _build_api_client_from_env()
         assert isinstance(client, CloudflareApiClient)
+        assert account_id == "acct" + "a" * 28
 
     def test_error_message_names_env_var_not_value(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -1127,7 +1276,19 @@ class TestBuildApiClientFromEnv:
         msg = str(exc_info.value)
         assert "MUPOT_CF_API_TOKEN" in msg
         # The error must name the var, not expose a secret value
-        # (value is empty here but the pattern must hold in principle)
+        assert "Bearer" not in msg
+
+    def test_account_id_error_message_names_var_not_value(self) -> None:
+        """Error for missing MUPOT_CF_ACCOUNT_ID must name the var, not expose any value."""
+        with patch.dict(
+            os.environ,
+            {"MUPOT_CF_API_TOKEN": "tok-present", "MUPOT_CF_ACCOUNT_ID": ""},
+            clear=True,
+        ):
+            with pytest.raises(ValueError) as exc_info:
+                _build_api_client_from_env()
+        msg = str(exc_info.value)
+        assert "MUPOT_CF_ACCOUNT_ID" in msg
         assert "Bearer" not in msg
 
 

@@ -1,26 +1,32 @@
-# mupot Hermes Plugin v0.1 — PLAN-ONLY
-# v0.1 does NOT bundle the Cloudflare SDK: it EMITS the provision plan + the exact
-# wrangler commands; it does not create resources itself (v0.2 wires real apply).
-# Install (v0.1): git clone the mupot repo; the plugin lives at mupot/plugin/.
-#   (The `hermes plugins install Mumega-com/mupot-plugin` one-liner is the v0.2+ path,
+# mupot Hermes Plugin v0.2 — REAL CF PROVISIONER
+# v0.2 ships a real Cloudflare provisioner using pure stdlib urllib (no extra deps).
+# When confirm=True and dry_run=False, the tool creates D1 databases and KV namespaces
+# via the CF REST API and writes wrangler.<slug>.toml with the resolved resource IDs.
+# Requires MUPOT_CF_API_TOKEN and MUPOT_CF_ACCOUNT_ID in the environment.
+# Install: git clone the mupot repo; the plugin lives at mupot/plugin/.
+#   (The `hermes plugins install Mumega-com/mupot-plugin` one-liner is the v0.3+ path,
 #    once the standalone repo is published.)
 # Docs: see README.md and skills/mupot-operator/SKILL.md
 
 name: mupot
-version: "0.1.0"
+version: "0.2.0"
 kind: backend
 description: >
-  Plan your own mupot instance on Cloudflare (org/RBAC/board/memory + an idempotent
-  brain). v0.1 EMITS the exact wrangler commands to stand up a mupot-<slug>.workers.dev
-  + a 15-min scan brain; you run them. v0.2 will execute them for you.
+  Provision and operate your own mupot instance on Cloudflare (org/RBAC/board/memory +
+  an idempotent brain). v0.2 ships the REAL CF provisioner: confirm=True + dry_run=False
+  creates D1 databases + KV namespaces via the CF REST API and writes
+  wrangler.<slug>.toml with resolved IDs. Requires MUPOT_CF_API_TOKEN +
+  MUPOT_CF_ACCOUNT_ID. Default (dry_run=True) emits a plan without touching CF.
 
 provides_tools:
   - name: mupot_provision
     description: >
-      v0.1 PLAN-ONLY: emit the idempotent create plan for D1 + KV (SESSIONS + OAUTH_KV)
-      and the exact wrangler deploy + dry-run-first migration commands. Does NOT create
-      resources and confirm does NOT apply in v0.1 (no SDK bundled) — run the emitted
-      commands yourself. v0.2 wires the Cloudflare SDK to execute behind an explicit confirm.
+      Idempotent mupot provisioner. Default (dry_run=True or confirm=False): emit a plan
+      showing what WILL be created. Apply mode (confirm=True + dry_run=False): uses
+      MUPOT_CF_API_TOKEN + MUPOT_CF_ACCOUNT_ID to create D1 + KV namespaces via the CF
+      REST API (idempotent — skips resources that already exist) and writes
+      wrangler.<slug>.toml with resolved IDs. Migration apply is NEVER auto-run — always
+      emitted as a gated DRY-RUN-FIRST next_step (Risk 2: drift landmine).
   - name: mupot_status
     description: >
       Probe a live mupot deployment's /health endpoint.

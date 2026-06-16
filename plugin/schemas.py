@@ -6,9 +6,13 @@ Each schema is a dict compatible with JSON Schema Draft-7 / OpenAI tool calling.
 MUPOT_PROVISION_SCHEMA = {
     "type": "object",
     "description": (
-        "v0.1 PLAN-ONLY: emit an idempotent plan + exact wrangler CLI commands to "
-        "provision a mupot instance on Cloudflare. Does NOT call the Cloudflare API "
-        "directly — run the emitted commands yourself. Real auto-apply in v0.2."
+        "Idempotent mupot provisioner. Default (dry_run=True or confirm=False): emit a "
+        "plan showing what will be created without touching Cloudflare. Apply mode "
+        "(confirm=True + dry_run=False): creates D1 + KV namespaces via the CF REST API "
+        "(idempotent — skips resources that already exist) and writes "
+        "wrangler.<slug>.toml with resolved IDs. Requires MUPOT_CF_API_TOKEN and "
+        "MUPOT_CF_ACCOUNT_ID. Migration apply is always emitted as a gated next_step "
+        "— never auto-run (Risk 2: drift landmine)."
     ),
     "properties": {
         "slug": {
@@ -51,10 +55,10 @@ MUPOT_PROVISION_SCHEMA = {
             "type": "boolean",
             "default": False,
             "description": (
-                "v0.1: confirm=True returns the same plan-only response — no live CF "
-                "calls are made without the bundled SDK client (coming in v0.2). "
-                "In v0.2+, confirm=True will create CF resources. "
-                "NEVER apply without reviewing dry-run output first (Risk 2: drift landmine)."
+                "When True AND dry_run=False, the tool calls the Cloudflare API to create "
+                "D1 + KV namespaces and writes wrangler.<slug>.toml with resolved IDs. "
+                "Requires MUPOT_CF_API_TOKEN + MUPOT_CF_ACCOUNT_ID in environment. "
+                "NEVER apply without reviewing the dry-run plan first (Risk 2: drift landmine)."
             ),
         },
         "dry_run": {
