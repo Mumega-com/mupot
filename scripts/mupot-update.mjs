@@ -22,10 +22,17 @@ import { dirname, join, resolve } from 'node:path'
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DESTRUCTIVE = /\bDROP\s+TABLE\b|\bDROP\s+COLUMN\b|\bDELETE\s+FROM\b|\bTRUNCATE\b|\bRENAME\s+TO\b/i
+// Bindings the current core REQUIRES at runtime. A config missing any of these can
+// still `wrangler deploy` + pass /health while OAuth/MCP/DO paths are broken — so
+// we preflight the config text. (OAuthProvider needs OAUTH_KV; the DOs + workflow
+// are class-bound; the rest are resource bindings.)
+const REQUIRED_BINDINGS = ['DB', 'VEC', 'BUS', 'SESSIONS', 'OAUTH_KV', 'BLOBS', 'AI', 'AGENT', 'SQUAD', 'TASK_WORKFLOW']
+const ALLOWED_REF = 'main'
 
 const args = process.argv.slice(2)
 const APPLY = args.includes('--apply')
 const FORCE = args.includes('--force')
+const ALLOW_DIRTY = args.includes('--allow-dirty')
 const JSON_OUT = args.includes('--json')
 const target = args.includes('--all') ? '--all' : args.find((a) => !a.startsWith('--'))
 
@@ -43,6 +50,38 @@ const manifest = JSON.parse(readFileSync(join(REPO, 'pots.manifest.json'), 'utf8
 const all = manifest.pots
 const targets = target === '--all' ? all : all.filter((p) => p.slug === target)
 if (targets.length === 0) die(`unknown pot '${target}'. Known: ${all.map((p) => p.slug).join(', ')}`)
+
+// ── source-state guard (BLOCK-2): never push a dirty tree or a non-main ref to a
+// customer pot without an explicit override. Reported in dry-run + apply.
+function gitState() {
+  const branch = (sh('git', ['rev-parse', '--abbrev-ref', 'HEAD']).stdout || '').trim()
+  const sha = (sh('git', ['rev-parse', '--short', 'HEAD']).stdout || '').trim()
+  const dirty = ((sh('git', ['status', '--porcelain']).stdout || '').trim().length) > 0
+  return { branch, sha, dirty }
+}
+const GIT = gitState()
+
+if (APPLY) {
+  if (GIT.dirty && !ALLOW_DIRTY) {
+    die(`refusing to --apply with a DIRTY working tree (${GIT.branch}@${GIT.sha}). Commit/stash, or pass --allow-dirty.`)
+  }
+  if (GIT.branch !== ALLOWED_REF && !ALLOW_DIRTY) {
+    die(`refusing to --apply from ref '${GIT.branch}' (not '${ALLOWED_REF}'). Switch to ${ALLOWED_REF}, or pass --allow-dirty to override.`)
+  }
+}
+
+// ── binding preflight (BLOCK-1): a config missing a required current-core binding
+// can deploy + pass /health while OAuth/MCP/DO paths break. Read the config text.
+function missingBindings(configPath) {
+  if (!configPath) return [] // mumega: the repo default wrangler.toml is canonical.
+  let text
+  try {
+    text = readFileSync(configPath, 'utf8')
+  } catch {
+    return ['<config_unreadable>']
+  }
+  return REQUIRED_BINDINGS.filter((b) => !text.includes(`"${b}"`))
+}
 
 const localMigrations = readdirSync(join(REPO, 'migrations'))
   .filter((f) => f.endsWith('.sql'))
@@ -98,15 +137,29 @@ for (const pot of targets) {
   }
   const pending = localMigrations.filter((f) => !applied.names.includes(f))
   const { destructive } = classifyPending(pending)
+  const missing = missingBindings(pot.config ? resolve(REPO, pot.config) : null)
   line.applied = applied.names.length
   line.pending = pending
   line.destructive = destructive
+  line.missingBindings = missing
 
   if (!APPLY) {
     // --apply ALWAYS redeploys the code; migrations only when pending. We can't
     // yet detect code-version drift (no version marker in /health — a follow-up),
     // so we never claim "up-to-date": --apply will push current code regardless.
-    line.status = pending.length ? 'would-migrate+deploy' : 'would-deploy'
+    line.status = missing.length
+      ? 'BLOCKED_missing_bindings'
+      : pending.length
+        ? 'would-migrate+deploy'
+        : 'would-deploy'
+    report.push(line)
+    continue
+  }
+  // BLOCK-1 guard: a config missing required bindings would deploy + pass /health
+  // while OAuth/MCP/DO break. Refuse unless explicitly forced.
+  if (missing.length && !FORCE) {
+    line.status = 'ABORTED_missing_bindings'
+    line.hint = `config is missing required binding(s): ${missing.join(', ')} — fix the tenant config (or --force)`
     report.push(line)
     continue
   }
@@ -148,12 +201,14 @@ for (const pot of targets) {
 }
 
 if (JSON_OUT) {
-  console.log(JSON.stringify({ apply: APPLY, report }, null, 2))
+  console.log(JSON.stringify({ apply: APPLY, git: GIT, report }, null, 2))
 } else {
-  console.log(`\nmupot-update — ${APPLY ? 'APPLY' : 'DRY RUN'} (${targets.length} pot${targets.length === 1 ? '' : 's'})\n`)
+  const gitLabel = `${GIT.branch}@${GIT.sha}${GIT.dirty ? ' (DIRTY)' : ''}`
+  console.log(`\nmupot-update — ${APPLY ? 'APPLY' : 'DRY RUN'} · source ${gitLabel} · ${targets.length} pot${targets.length === 1 ? '' : 's'}\n`)
   for (const r of report) {
     const p = r.pending ? `${r.pending.length} pending${r.destructive?.length ? ` (${r.destructive.length} DESTRUCTIVE)` : ''}` : '—'
-    console.log(`  ${r.slug.padEnd(10)} ${String(r.status).padEnd(26)} migrations: ${p}${r.health ? ` · health ${r.health}` : ''}${r.detail ? ` · ${r.detail}` : ''}`)
+    const miss = r.missingBindings?.length ? ` · MISSING: ${r.missingBindings.join(',')}` : ''
+    console.log(`  ${r.slug.padEnd(10)} ${String(r.status).padEnd(28)} migrations: ${p}${miss}${r.health ? ` · health ${r.health}` : ''}${r.detail ? ` · ${r.detail}` : ''}`)
   }
   if (!APPLY) console.log(`\n(dry run — pass --apply to apply migrations + deploy)`)
 }
