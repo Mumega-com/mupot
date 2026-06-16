@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "migrate:local": "wrangler d1 migrations apply mupot --local",
-    "migrate:remote": "wrangler d1 migrations apply mupot --remote"
+    "migrate:remote": "wrangler d1 migrations apply mupot --remote",
+    "update": "node scripts/mupot-update.mjs"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "^0.4.0",
