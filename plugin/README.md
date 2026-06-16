@@ -9,23 +9,21 @@ Cloudflare — org/RBAC/board/memory with an optional idempotent brain — from 
 > Default (`dry_run=True`) emits a plan without touching Cloudflare. Requires
 > `MUPOT_CF_API_TOKEN` and `MUPOT_CF_ACCOUNT_ID` in the environment for apply mode.
 
-## Current install (v0.2 — nested in the mupot repo)
-
-v0.2 lives at `mupot/plugin/` inside the [Mumega-com/mupot](https://github.com/Mumega-com/mupot)
-repository. A standalone `Mumega-com/mupot-plugin` repo is the publish-time target — not yet
-created. Until v0.3 publishes there, install from source:
+## Install (v0.2 — published)
 
 ```bash
-# Clone the mupot repo and load the plugin from the nested path:
-git clone https://github.com/Mumega-com/mupot
-cd mupot/plugin
-
-# Run tests to verify the provisioner:
-python3 -m pytest tests/ -v
+hermes plugins install Mumega-com/mupot-plugin
 ```
 
-The `hermes plugins install Mumega-com/mupot-plugin` one-liner is the **future** (v0.3+)
-install path once the standalone repo is published.
+This directory (`mupot/plugin/`) is the **source of truth**; it is mirrored to the standalone
+[Mumega-com/mupot-plugin](https://github.com/Mumega-com/mupot-plugin) repo (the Hermes install
+target, tagged releases). Published 2026-06-16 at v0.2.0.
+
+To verify the provisioner locally:
+
+```bash
+cd mupot/plugin && python3 -m pytest tests/ -v
+```
 
 ### Companion CF skill tap (for Hermes users)
 
