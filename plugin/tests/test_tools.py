@@ -880,6 +880,32 @@ class TestCloudflareApiClientConstruction:
             with pytest.raises(CloudflareApiError):
                 client.list_d1_databases(account_id)
 
+    def test_success_false_cf_error_message_does_not_leak_token(self) -> None:
+        """Blocker RED-2: a success=false CF error whose MESSAGE echoes the token
+        must NOT appear in str(exc). CloudflareApiError includes only numeric codes."""
+        secret = "cf_live_SECRETTOKEN_zzz"
+        client = CloudflareApiClient(secret)
+        account_id = "acct_" + "h" * 27
+
+        error_payload = json.dumps(
+            {"success": False, "errors": [{"code": 1000, "message": f"bad token {secret}"}]}
+        ).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = error_payload
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            with pytest.raises(CloudflareApiError) as exc_info:
+                client.list_d1_databases(account_id)
+
+        error_str = str(exc_info.value)
+        assert secret not in error_str, (
+            "CloudflareApiError must not embed CF error message text (token leak risk)"
+        )
+        # The numeric code IS safe to surface, and aids debugging.
+        assert "1000" in error_str
+
     def test_empty_token_raises_valueerror(self) -> None:
         with pytest.raises(ValueError, match="CF API token is empty"):
             CloudflareApiClient("")

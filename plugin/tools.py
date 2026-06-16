@@ -95,10 +95,12 @@ _CF_LIST_PAGE_SIZE = 100  # CF default; request up to 100 per page
 class CloudflareApiError(RuntimeError):
     """Raised when the CF REST API returns a non-2xx status or error payload.
 
-    Security: the raw response body is NEVER embedded in the error message — an
-    upstream or proxy error body may echo the auth token.  Only the HTTP method,
-    URL, status code, and (when available) the parsed CF error codes/messages are
-    included.  CF error payloads contain structured codes/messages, not credentials.
+    Security: NEITHER the raw response body NOR CF error message TEXT is ever
+    embedded in the error message. An upstream/proxy body OR a CF error message
+    can echo the auth token verbatim (e.g. "bad token <secret>"), so only the
+    HTTP method, URL, status code, and the numeric CF error CODES (never the
+    message strings) are included. Codes are integers and never contain
+    credentials.
     """
 
     def __init__(
@@ -110,11 +112,15 @@ class CloudflareApiError(RuntimeError):
         cf_errors: list[dict[str, Any]] | None = None,
     ) -> None:
         if cf_errors:
-            # CF errors array contains {code, message} — safe to include, never contains tokens.
-            errors_str = "; ".join(
-                f"[{e.get('code', '?')}] {e.get('message', '')}" for e in cf_errors
+            # Security (Codex RED-2): include ONLY the numeric CF error codes and a
+            # count — NEVER the message text. CF error messages can echo the
+            # offending token; excluding message strings by construction keeps the
+            # invariant "the token never appears in an exception message".
+            codes = ", ".join(str(e.get("code", "?")) for e in cf_errors)
+            super().__init__(
+                f"CF API {method} {url} → HTTP {status}: "
+                f"{len(cf_errors)} CF error(s) [codes: {codes}]"
             )
-            super().__init__(f"CF API {method} {url} → HTTP {status}: {errors_str}")
         else:
             super().__init__(f"CF API {method} {url} → HTTP {status}")
         self.status = status
@@ -169,7 +175,8 @@ class CloudflareApiClient:
             raise CloudflareApiError(method, url, exc.code) from exc
         parsed: dict[str, Any] = json.loads(raw)
         if not parsed.get("success", False):
-            # CF errors array contains structured {code, message} — safe, never contains tokens.
+            # Pass only the CF errors array; CloudflareApiError includes ONLY the
+            # numeric codes (never the message text, which can echo the token).
             cf_errors: list[dict[str, Any]] = parsed.get("errors", [])
             raise CloudflareApiError(method, url, 0, cf_errors=cf_errors)
         return parsed
@@ -410,8 +417,10 @@ def mupot_provision(
         # v0.2: construct the real client from env — no SDK dep, pure urllib.
         # cf_api_token param is accepted for API surface compatibility but the real
         # client is always constructed from env (token never re-logged from param).
-        # _build_api_client_from_env also validates MUPOT_CF_ACCOUNT_ID; if the env
-        # account_id differs from the param, the env one takes precedence (env is authoritative).
+        # _build_api_client_from_env ALSO validates MUPOT_CF_ACCOUNT_ID is present
+        # (raises if unset). The cf_account_id PARAM is what's used for all CF API
+        # calls below (and line 406 guarantees it is non-blank on the apply path) —
+        # env account_id is validated for presence, not used as an override.
         client, _ = _build_api_client_from_env()
     else:
         client = DryRunClient()
