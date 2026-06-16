@@ -6,6 +6,53 @@ All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 this changelog (shipped, dated) share version numbers and feed each other — a roadmap
 block collapses into a changelog entry when it ships.
 
+## [0.21.1] — 2026-06-16
+
+A face for the console. The pot dashboard gets a **Stripe-style shell** — a left
+sidebar with grouped sections, a top-left **pot switcher**, and presence-aware
+**check-in / check-out** across every pot you own. Cross-pot presence rides the #262
+SSO seam as a *signed, pot-bound probe* (distinct audience — it can read presence but
+can never mint a session). Diverse-gated throughout (Codex, a different model than the
+builder); the gate caught and closed a `Referer` leak and a body-read console-hang
+before ship. 1146 tests.
+
+### Added
+- **Stripe-style sidebar nav** (#161). Flat top-bar → a vertical left sidebar in
+  `shell()`: top-left pot switcher, grouped nav (Workspace / Work / People & Org /
+  Settings), client-side active-link highlight, responsive collapse < 860px. One file,
+  every page. The `/setup` wizard keeps its own chrome-less shell (intentional).
+- **In-pot check-in / check-out** (#163). The switcher shows "Checked in as <you>"
+  (read from `/auth/me`) and "Check out of <brand>" (→ `/auth/logout`). Identity is
+  rendered via `textContent` — no XSS from the echoed email.
+- **Signed presence probe** (#164, B2a). New `GET /auth/presence` — verifies a
+  mumega-signed claim bound to a **distinct, pot-scoped audience** `presence:<slug>`
+  and returns `{checked_in, since}` for the signature-bound email only (no
+  enumeration, no session mutation, read-only). An email-keyed presence marker is
+  written on every session mint (Google callback + SSO handoff) and cleared on logout.
+  +4 audience-isolation tests prove a presence claim can never be replayed at
+  `/auth/handoff`, nor probe a different pot.
+- **Cross-pot presence in the Control Tower** (mumega-com #294, B2b). Your Pots mints a
+  per-pot claim (audience taken from the pot's own `/health` tenant, so it always
+  matches the pot's `TENANT_SLUG`), probes `/auth/presence`, and renders a
+  **● checked in / ○ available** chip plus a **Check in / Open** action. Fail-soft —
+  an unreachable pot simply shows nothing.
+
+### Changed
+- `verifyHandoffClaim` gains an optional `expectedAud` (default unchanged) so
+  `/auth/handoff` stays strict `HANDOFF_AUD` while `/auth/presence` pins
+  `presence:<slug>`.
+
+### Fixed
+- `/auth/presence` sets `Referrer-Policy: no-referrer` alongside `no-store`
+  (token-in-query hygiene, matching `/auth/handoff`) — Codex auth-gate catch.
+- The liveness + presence probes keep the 3s abort timer armed **through the JSON body
+  read**: a pot that returns headers then stalls its body no longer hangs the console
+  (a latent bug in the pre-existing `probePotHealth`, fixed here). +regression test.
+
+### Live
+- `mupot.mumega.com` redeployed; mumega-com worker + Pages deployed (#294).
+  `/auth/presence` verified live: `401` + `no-store` + `no-referrer`, no body leak.
+
 ## [0.21.0] — 2026-06-13
 
 GitHub as an agent substrate. An overnight session wired mupot↔GitHub end-to-end: a pot
