@@ -1442,6 +1442,12 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         display: block; padding: 8px 12px; border-radius: 7px; color: var(--muted); font-size: 13px;
       }
       .switcher-menu a:hover { background: var(--bg); color: var(--text); text-decoration: none; }
+      .switcher-whoami {
+        padding: 6px 12px 8px; font-size: 12px; color: var(--dim);
+        border-bottom: 1px solid var(--border); margin-bottom: 4px;
+      }
+      .switcher-whoami b { color: var(--muted); font-weight: 600; }
+      .switcher-checkout { color: var(--warn) !important; }
       /* grouped nav */
       .nav-groups { flex: 1; padding: 14px 10px; display: flex; flex-direction: column; gap: 16px; }
       .nav-group { display: flex; flex-direction: column; gap: 2px; }
@@ -1896,7 +1902,9 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         <details class="switcher">
           <summary><span class="dot"></span><b>${brand}</b><span class="caret">▾</span></summary>
           <div class="switcher-menu">
+            <div class="switcher-whoami" id="switcher-whoami">Checked in</div>
             <a href="https://mumega.com/dashboard/pots">Switch pot →</a>
+            <a href="/auth/logout" class="switcher-checkout">Check out of ${brand} ↩</a>
           </div>
         </details>
         <nav class="nav-groups">
@@ -1942,6 +1950,20 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
           if (match && href.length > bestLen) { best = a; bestLen = href.length; }
         });
         if (best) best.classList.add('active');
+
+        // "Checked in as <you>" — pot-local presence, read from /auth/me.
+        fetch('/auth/me', { credentials: 'same-origin' })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (a) {
+            var el = document.getElementById('switcher-whoami');
+            if (!el || !a || !(a.email || a.userId)) return;
+            el.textContent = '';
+            el.appendChild(document.createTextNode('Checked in as '));
+            var who = document.createElement('b');
+            who.textContent = a.email || a.userId; // textContent = no XSS
+            el.appendChild(who);
+          })
+          .catch(function () {});
       })();
     </script>
   </body>
