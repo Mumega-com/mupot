@@ -80,7 +80,9 @@ function missingBindings(configPath) {
   } catch {
     return ['<config_unreadable>']
   }
-  return REQUIRED_BINDINGS.filter((b) => !text.includes(`"${b}"`))
+  // Anchored to a TOML assignment (binding = "X" / name = "X") so a comment that
+  // merely mentions a binding name can't satisfy the check.
+  return REQUIRED_BINDINGS.filter((b) => !new RegExp(`(?:binding|name)\\s*=\\s*["']${b}["']`).test(text))
 }
 
 const localMigrations = readdirSync(join(REPO, 'migrations'))
@@ -125,55 +127,78 @@ function withConfig(config, fn) {
   }
 }
 
-const report = []
+// ── Phase 1: PREFLIGHT every selected pot — NO mutation. ──
+const pf = []
 for (const pot of targets) {
-  const line = { slug: pot.slug, db: pot.db }
+  const e = { slug: pot.slug, db: pot.db }
   const applied = appliedMigrations(pot.db, pot.config ? resolve(REPO, pot.config) : null)
   if (!applied.ok) {
-    line.status = 'migration_check_failed'
-    line.detail = applied.error
-    report.push(line)
+    e.error = applied.error
+    pf.push(e)
     continue
   }
-  const pending = localMigrations.filter((f) => !applied.names.includes(f))
-  const { destructive } = classifyPending(pending)
-  const missing = missingBindings(pot.config ? resolve(REPO, pot.config) : null)
-  line.applied = applied.names.length
-  line.pending = pending
-  line.destructive = destructive
-  line.missingBindings = missing
+  e.applied = applied.names.length
+  e.pending = localMigrations.filter((f) => !applied.names.includes(f))
+  e.destructive = classifyPending(e.pending).destructive
+  e.missing = missingBindings(pot.config ? resolve(REPO, pot.config) : null)
+  pf.push(e)
+}
 
-  if (!APPLY) {
-    // --apply ALWAYS redeploys the code; migrations only when pending. We can't
-    // yet detect code-version drift (no version marker in /health — a follow-up),
-    // so we never claim "up-to-date": --apply will push current code regardless.
-    line.status = missing.length
-      ? 'BLOCKED_missing_bindings'
-      : pending.length
-        ? 'would-migrate+deploy'
-        : 'would-deploy'
-    report.push(line)
-    continue
-  }
-  // BLOCK-1 guard: a config missing required bindings would deploy + pass /health
-  // while OAuth/MCP/DO break. Refuse unless explicitly forced.
-  if (missing.length && !FORCE) {
-    line.status = 'ABORTED_missing_bindings'
-    line.hint = `config is missing required binding(s): ${missing.join(', ')} — fix the tenant config (or --force)`
-    report.push(line)
-    continue
-  }
-  if (destructive.length && !FORCE) {
-    line.status = 'ABORTED_destructive'
-    line.hint = 'destructive pending migration — verify the D1 manually, then re-run with --force'
-    report.push(line)
-    continue
-  }
+// Blocking classification. Missing required bindings = NON-forcible (fix the config
+// or drop it from the manifest — --force does NOT bypass it). Destructive migrations
+// are forcible with --force. A failed migration check also blocks.
+function blocker(e) {
+  if (e.error) return 'migration_check_failed'
+  if (e.missing?.length) return 'missing_bindings'
+  if (e.destructive?.length && !FORCE) return 'destructive_needs_force'
+  return null
+}
+for (const e of pf) {
+  const b = blocker(e)
+  e.status = b
+    ? b === 'missing_bindings' ? 'BLOCKED_missing_bindings'
+      : b === 'destructive_needs_force' ? 'BLOCKED_destructive' : 'BLOCKED_migration_check'
+    : APPLY ? 'ready' : e.pending?.length ? 'would-migrate+deploy' : 'would-deploy'
+}
 
-  // APPLY: migrations → deploy → verify.
+function printReport(phase) {
+  if (JSON_OUT) {
+    console.log(JSON.stringify({ phase, apply: APPLY, git: GIT, report: pf }, null, 2))
+    return
+  }
+  const gitLabel = `${GIT.branch}@${GIT.sha}${GIT.dirty ? ' (DIRTY)' : ''}`
+  console.log(`\nmupot-update — ${phase} · source ${gitLabel} · ${targets.length} pot${targets.length === 1 ? '' : 's'}\n`)
+  for (const e of pf) {
+    const p = e.pending ? `${e.pending.length} pending${e.destructive?.length ? ` (${e.destructive.length} DESTRUCTIVE)` : ''}` : '—'
+    const miss = e.missing?.length ? ` · MISSING: ${e.missing.join(',')}` : ''
+    console.log(`  ${e.slug.padEnd(10)} ${String(e.status).padEnd(26)} migrations: ${p}${miss}${e.health ? ` · health ${e.health}` : ''}${e.error ? ` · ${e.error}` : ''}`)
+  }
+}
+
+// ── Dry run: report + exit (no mutation ever). ──
+if (!APPLY) {
+  printReport('DRY RUN')
+  console.log(`\n(dry run — pass --apply to apply migrations + deploy)`)
+  process.exit(pf.some(blocker) ? 1 : 0)
+}
+
+// ── Apply gate: ALL-OR-NOTHING. If ANY target is blocked, mutate NOTHING. ──
+const blocked = pf.filter(blocker)
+if (blocked.length) {
+  printReport('APPLY · BLOCKED (no pots deployed)')
+  console.error(
+    `\n✘ ${blocked.length}/${pf.length} target(s) blocked — NO pots were deployed. ` +
+      `Fix: ${blocked.map((e) => `${e.slug}(${blocker(e)})`).join(', ')}`,
+  )
+  process.exit(1)
+}
+
+// ── Phase 2: MUTATE — every target passed preflight. ──
+for (const e of pf) {
+  const pot = targets.find((t) => t.slug === e.slug)
   const ok = withConfig(pot.config, (tmp) => {
     const cfg = tmp ? ['--config', tmp] : []
-    if (pending.length) {
+    if (e.pending.length) {
       const m = sh('npx', ['wrangler', 'd1', 'migrations', 'apply', pot.db, '--remote', ...cfg], {
         input: 'y\n', stdio: ['pipe', 'inherit', 'inherit'],
       })
@@ -184,34 +209,17 @@ for (const pot of targets) {
     return { ok: true }
   })
   if (!ok.ok) {
-    line.status = `FAILED_${ok.step}`
-    report.push(line)
+    e.status = `FAILED_${ok.step}`
     continue
   }
-  // health verify
   try {
     const res = await fetch(pot.health, { signal: AbortSignal.timeout(12000) })
     const body = await res.json().catch(() => ({}))
-    line.status = res.ok && body.ok ? 'updated' : 'deployed_unhealthy'
-    line.health = `${res.status} tenant=${body.tenant ?? '?'}`
+    e.status = res.ok && body.ok ? 'updated' : 'deployed_unhealthy'
+    e.health = `${res.status} tenant=${body.tenant ?? '?'}`
   } catch {
-    line.status = 'deployed_health_unreachable'
+    e.status = 'deployed_health_unreachable'
   }
-  report.push(line)
 }
-
-if (JSON_OUT) {
-  console.log(JSON.stringify({ apply: APPLY, git: GIT, report }, null, 2))
-} else {
-  const gitLabel = `${GIT.branch}@${GIT.sha}${GIT.dirty ? ' (DIRTY)' : ''}`
-  console.log(`\nmupot-update — ${APPLY ? 'APPLY' : 'DRY RUN'} · source ${gitLabel} · ${targets.length} pot${targets.length === 1 ? '' : 's'}\n`)
-  for (const r of report) {
-    const p = r.pending ? `${r.pending.length} pending${r.destructive?.length ? ` (${r.destructive.length} DESTRUCTIVE)` : ''}` : '—'
-    const miss = r.missingBindings?.length ? ` · MISSING: ${r.missingBindings.join(',')}` : ''
-    console.log(`  ${r.slug.padEnd(10)} ${String(r.status).padEnd(28)} migrations: ${p}${miss}${r.health ? ` · health ${r.health}` : ''}${r.detail ? ` · ${r.detail}` : ''}`)
-  }
-  if (!APPLY) console.log(`\n(dry run — pass --apply to apply migrations + deploy)`)
-}
-
-const failed = report.some((r) => /FAILED|ABORTED|failed|unhealthy/.test(r.status))
-process.exit(failed ? 1 : 0)
+printReport('APPLY · DONE')
+process.exit(pf.some((e) => /FAILED|unhealthy|unreachable/.test(e.status)) ? 1 : 0)
