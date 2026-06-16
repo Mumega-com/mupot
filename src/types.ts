@@ -384,11 +384,23 @@ export interface ModelPort {
 // (rank, don't act → same state → same answer → no spam).
 export const BRAIN_PORT_VERSION = 1 as const
 
+// JSON-only, capability-free by TYPE. BrainContext is a SANITIZED snapshot — raw
+// bus/event payloads, Env handles, bindings, or secrets must never cross the brain
+// port. `unknown` would defeat that by convention; BrainJson enforces it at the
+// type level (a binding/secret object cannot satisfy this type).
+export type BrainJson =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly BrainJson[]
+  | { readonly [k: string]: BrainJson }
+
 export interface BrainContext {
   tenant: string
   goals: ReadonlyArray<{ agentId: string; okr: string; kpiProgress: number }>
   board: ReadonlyArray<{ taskId: string; status: string; agentId: string | null }>
-  pulses?: ReadonlyArray<{ kind: string; at: number; payload?: unknown }>
+  pulses?: ReadonlyArray<{ kind: string; at: number; payload?: BrainJson }>
   lastHumanDirective?: string | null // position-0 of every decision (bus WAKES, never STEERS)
   budgetRemainingMicroUsd?: number
 }
