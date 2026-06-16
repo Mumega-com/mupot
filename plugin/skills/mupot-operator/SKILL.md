@@ -23,6 +23,11 @@ companion_skills:
 
 # mupot Operator Skill
 
+> **v0.1 is PLAN-ONLY.** `mupot_provision` emits a structured plan and the exact
+> wrangler CLI commands to run. It does NOT call the Cloudflare API directly — no SDK
+> client is bundled in v0.1. Run the emitted commands yourself. Real auto-apply lands
+> in v0.2.
+
 ## What mupot is
 
 mupot is a **Cloudflare-native sovereign agent substrate** — org, RBAC, board, memory, and
@@ -36,29 +41,41 @@ Core concepts:
 - **Memory** — D1 relational + Vectorize semantic recall (Vectorize deferred to v0.2)
 - **Brain** — an optional always-on DMN prioritiser (qwen3.7-plus via OpenRouter, free tier)
 
-## Provision flow
+## Provision flow (v0.1 — plan-only)
 
 **Prerequisites:**
 1. A Cloudflare account (free tier is sufficient for a single pot)
-2. A scoped CF API token — use the token-template link in README.md:
-   minimum permissions: Workers Scripts:Edit, D1:Edit, Workers KV Storage:Edit, Account Settings:Read
+2. A scoped CF API token — minimum permissions: Workers Scripts:Edit, D1:Edit,
+   Workers KV Storage:Edit, Account Settings:Read
 3. `MUPOT_CF_ACCOUNT_ID` and `MUPOT_CF_API_TOKEN` set in your environment
 
-**Step 1 — Dry-run plan:**
+**Step 1 — Get the plan:**
 ```
 mupot_provision(slug="acme", brand="Acme Corp", cf_account_id="...", cf_api_token="...")
-# Returns a plan. confirm defaults to False — nothing is created yet.
+# Returns a plan with exact wrangler CLI commands. confirm defaults to False.
+# v0.1: this is ALL the tool does — it plans, not applies.
 ```
 
 **Step 2 — Review the plan.** Check for existing resources (idempotent list-guard).
-If your D1 or KV already exists, the tool skips creation.
+If your D1 or KV already exists, the tool notes skips.
 
-**Step 3 — Apply:**
+**Step 3 — Run the emitted wrangler commands yourself (v0.1 — manual):**
+```bash
+# Commands are in result["next_steps"]. Example for slug="acme":
+
+# Create D1 database:
+npx wrangler d1 create mupot-acme
+
+# Create KV namespaces:
+npx wrangler kv namespace create mupot-acme-sessions
+npx wrangler kv namespace create mupot-acme-oauth
+
+# Copy wrangler.example.toml → wrangler.acme.toml and fill in the IDs above.
 ```
-mupot_provision(slug="acme", brand="Acme Corp", cf_account_id="...", cf_api_token="...",
-                confirm=True, dry_run=False)
-# Creates D1 + KV, writes wrangler.acme.toml.
-```
+
+> v0.2 will bundle the Cloudflare SDK and run steps 1–3 automatically via
+> `confirm=True, dry_run=False`. In v0.1, those flags return the same plan-only
+> response (no live CF calls are made either way without an SDK client).
 
 **Step 4 — Deploy + migrate (follow next_steps exactly):**
 ```bash
@@ -97,6 +114,8 @@ Then follow the `next_steps` in the result:
 2. Write the cron script as a **real file** (not a symlink — see Pitfall 3)
 3. Register the cron entry in `~/.hermes/cron/jobs.json`
 4. Set `MUMEGA_BRAIN_TOKEN_ACME` to a **scoped token** (task:read + priority:write only)
+   — **operator's responsibility**: the plugin documents this requirement but cannot
+   enforce token scope (no token introspection available in the cron context)
 5. Hermes hotloads cron config without daemon restart
 
 ## Pitfalls
@@ -104,9 +123,8 @@ Then follow the `next_steps` in the result:
 ### Pitfall 1 — CF token on disk (Risk 1)
 Your `MUPOT_CF_API_TOKEN` lives in Hermes `.env.secrets` in plaintext.
 Mitigate: use the minimum-scope token (5 permission groups, not Edit-All). After
-provisioning, consider running `mupot_revoke_token` (v0.2) or manually rotating the token
-in the CF dashboard. CF OAuth (one-click, no token on disk) is coming once Mumega's OAuth
-app passes CF public vetting.
+provisioning, consider rotating the token in the CF dashboard. CF OAuth (one-click, no
+token on disk) is coming once Mumega's OAuth app passes CF public vetting.
 
 ### Pitfall 2 — Migration drift landmine (Risk 2)
 **NEVER run `npx wrangler d1 migrations apply --remote` without `--dry-run` first.**
@@ -122,10 +140,13 @@ Hermes cron scheduler reads the script path directly. A symlink to a missing tar
 a **silent** non-execution — no error, no log, the brain simply never runs. Always write
 a **real file** for the cron script. `mupot_brain_enable` outputs a real-file template.
 
-### Pitfall 4 — Brain token must be scoped (Risk 3)
+### Pitfall 4 — Brain token scope (Risk 3 — operator responsibility)
 `MUMEGA_BRAIN_TOKEN_<SLUG>` must carry ONLY `task:read` + `priority:write`.
-Using `mcp:*` would grant full bus control to an always-on automated agent. The cron
-script template enforces this by checking and refusing to start without the right token.
+Using `mcp:*` would grant full bus control to an always-on automated agent.
+
+**The cron script checks that the token is SET, but cannot verify its scope.** The
+Mumega bus does not expose token introspection to the cron context. The operator must
+supply the correctly-scoped token — this is documented but not enforced by the plugin.
 
 ### Pitfall 5 — Workers free-tier slot (Risk 5)
 Each pot = one Workers slot. Free tier = 100 slots. If you're near the limit, the
@@ -134,17 +155,19 @@ rejected (it breaks pot sovereignty) — each user must stay within their own sl
 
 ## v0.1 scope / deferred
 
-**In v0.1:**
-- BYO-CF via API token paste (Model B)
-- D1 + KV (SESSIONS + OAUTH_KV) provisioning
-- `wrangler.toml` generation
+**In v0.1 (plan-only):**
+- Dry-run plan with exact wrangler CLI commands for manual execution
+- Idempotent list-guard logic (skip existing D1/KV)
+- `wrangler.toml` generation when an injected CF client is provided (test/CI path)
 - Brain profile + cron plan emission
 - Deploy-to-Cloudflare button (README)
 
 **Deferred to v0.2+:**
+- Real auto-apply: bundles `cloudflare` SDK, auto-creates D1/KV resources
 - CF OAuth one-click (pending Mumega OAuth app public approval)
 - Full SDK provisioner (no wrangler dep): `client.workers.scripts.update()`
 - OAuth secret automation (guided prompt + CF secrets API)
 - R2 / Vectorize / Queues provisioning (add via re-run)
 - `mupot_revoke_token` post-provision
 - `pot_registry` / `pot_owners` D1 migrations for the "Your Pots" console (G4)
+- `hermes plugins install Mumega-com/mupot-plugin` standalone repo (publish-time step)

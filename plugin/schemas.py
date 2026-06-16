@@ -6,8 +6,9 @@ Each schema is a dict compatible with JSON Schema Draft-7 / OpenAI tool calling.
 MUPOT_PROVISION_SCHEMA = {
     "type": "object",
     "description": (
-        "Idempotently provision a mupot instance on Cloudflare. "
-        "Runs DRY-RUN by default — set confirm=true to apply."
+        "v0.1 PLAN-ONLY: emit an idempotent plan + exact wrangler CLI commands to "
+        "provision a mupot instance on Cloudflare. Does NOT call the Cloudflare API "
+        "directly — run the emitted commands yourself. Real auto-apply in v0.2."
     ),
     "properties": {
         "slug": {
@@ -50,10 +51,10 @@ MUPOT_PROVISION_SCHEMA = {
             "type": "boolean",
             "default": False,
             "description": (
-                "Set to true to APPLY the plan (create CF resources, deploy worker, "
-                "run migrations). Default false = dry-run only. "
-                "NEVER set to true without reviewing the dry-run output first. "
-                "See Risk 2: migration drift landmine."
+                "v0.1: confirm=True returns the same plan-only response — no live CF "
+                "calls are made without the bundled SDK client (coming in v0.2). "
+                "In v0.2+, confirm=True will create CF resources. "
+                "NEVER apply without reviewing dry-run output first (Risk 2: drift landmine)."
             ),
         },
         "dry_run": {

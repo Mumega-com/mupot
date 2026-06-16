@@ -1,13 +1,17 @@
 """
 mupot Hermes Plugin — tool implementations (v0.1).
 
-All Cloudflare API calls are guarded behind an injectable CloudflareClient.
-Set DRY_RUN=true (default) or inject a mock client to run without a live CF account.
+v0.1 IS PLAN-ONLY for provisioning.  The apply path (confirm=True, dry_run=False)
+requires an externally-constructed CloudflareClient — the real `cloudflare` SDK is NOT
+bundled in v0.1.  Without an injected client, the tool returns a structured plan with
+the exact wrangler CLI commands to run.  Real apply (auto-constructed SDK client) lands
+in v0.2.
 
 Risk annotations match the design doc (mupot-hermes-plugin-v0.1.md):
   Risk 1 — CF token on disk (least-scoped token; revoke after provision).
   Risk 2 — Migration drift landmine (DRY-RUN + explicit confirm required).
-  Risk 3 — Brain token must be SCOPED, not mcp:*.
+  Risk 3 — Brain token must be SCOPED, not mcp:*.  Plugin documents the requirement
+            but CANNOT enforce token scope — the operator must supply a scoped token.
   Risk 4 — wrangler version drift (pin + check).
   Risk 5 — Workers free-tier slot warning.
 """
@@ -180,14 +184,54 @@ def mupot_provision(
     elif not applying:
         client = DryRunClient()
     else:
-        # In production this would be: cloudflare.Cloudflare(api_token=cf_api_token)
-        # We guard here so tests never reach real CF even if confirm=True is passed
-        # without an injected client.
-        raise RuntimeError(
-            "mupot_provision: apply mode requires an injected cf_client. "
-            "In production, pass cf_client=cloudflare.Cloudflare(api_token=...). "
-            "This guard prevents accidental live CF calls in test/CI environments."
-        )
+        # v0.1 does NOT bundle the cloudflare SDK — it cannot construct a real client.
+        # Return an honest plan-only response with the exact CLI commands to run.
+        # Real SDK-backed apply lands in v0.2.
+        _validate_slug(slug)
+        worker_name = f"mupot-{slug}"
+        return {
+            "dry_run": True,
+            "plan_only": True,
+            "slug": slug,
+            "worker_name": worker_name,
+            "applied": False,
+            "toml_path": None,
+            "plan": [
+                f"[v0.1 PLAN-ONLY] v0.1 cannot create real Cloudflare resources — "
+                "no SDK client is bundled. Run the commands in next_steps yourself, "
+                "or wait for v0.2 which wires the real Cloudflare client.",
+            ],
+            "next_steps": [
+                "v0.1 is PLAN-ONLY. To provision your mupot instance, run these "
+                "wrangler commands manually (or with automation):",
+                f"1. Create D1 database:\n"
+                f"   npx wrangler d1 create mupot-{slug}",
+                f"2. Create KV namespaces:\n"
+                f"   npx wrangler kv namespace create mupot-{slug}-sessions\n"
+                f"   npx wrangler kv namespace create mupot-{slug}-oauth",
+                "3. Copy wrangler.example.toml → wrangler.{slug}.toml and fill in "
+                "the D1 database_id and KV namespace IDs from the output above.",
+                f"4. Deploy the worker:\n"
+                f"   npx wrangler deploy --config wrangler.{slug}.toml",
+                "5. MIGRATION — always dry-run first (Risk 2):\n"
+                f"   npx wrangler d1 migrations apply mupot-{slug} --dry-run "
+                f"--config wrangler.{slug}.toml\n"
+                "   Review output. Only apply without --dry-run after confirming no "
+                "destructive operations.",
+                "6. Set OAuth secrets:\n"
+                f"   npx wrangler secret put OAUTH_CLIENT_ID --config wrangler.{slug}.toml\n"
+                f"   npx wrangler secret put OAUTH_CLIENT_SECRET --config wrangler.{slug}.toml",
+                f"7. Verify: mupot_status(url='https://mupot-{slug}.workers.dev')",
+                "v0.2 will wire the real Cloudflare SDK client so this tool executes "
+                "steps 1-3 automatically. Track: https://github.com/Mumega-com/mupot/issues",
+            ],
+            "warnings": [
+                "v0.1 is PLAN-ONLY. confirm=True + dry_run=False without an injected "
+                "cf_client returns this plan, not a live apply. Real apply = v0.2.",
+                "Each mupot pot consumes one Workers slot. "
+                "Free tier = 100 slots. Check your usage before provisioning many pots.",
+            ],
+        }
 
     worker_name = f"mupot-{slug}"
     d1_name = f"mupot-{slug}"
@@ -414,6 +458,12 @@ _CRON_SCRIPT_TEMPLATE = """\
 #
 # This script is the entrypoint for the mupot-{slug} brain's priority scan.
 # It calls the brain profile's prioritize_scan logic with the pot's token.
+#
+# TOKEN SCOPE NOTE (Risk 3): This script checks that TOKEN_ENV is SET, but it
+# CANNOT verify the token's scope — token introspection is not available here.
+# The OPERATOR must supply a scoped token (task:read + priority:write only).
+# Using mcp:* would grant full bus control to this always-on automated agent.
+# Scope enforcement is the operator's responsibility — not this script's.
 
 import os
 import subprocess
@@ -428,8 +478,9 @@ def main() -> None:
     if not token:
         print(
             f"[mupot-brain-cron] {{TOKEN_ENV}} not set. "
-            "Set a SCOPED token (task:read + priority:write). "
-            "NOT mcp:* — see Risk 3 in mupot-hermes-plugin-v0.1.md.",
+            "Operator must supply a SCOPED token (task:read + priority:write). "
+            "NOT mcp:* — see Risk 3 in mupot-hermes-plugin-v0.1.md. "
+            "Note: this script can only check the token EXISTS, not its scope.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -512,7 +563,8 @@ def mupot_brain_enable(
         f"   Hermes hotloads cron config without daemon restart.\n"
         f"   Entry to add (emitted under 'cron_entry').",
         f"6. Set a SCOPED brain token (Risk 3 — NOT mcp:*):\n"
-        f"   The token must carry ONLY: task:read + priority:write\n"
+        f"   OPERATOR RESPONSIBILITY: supply a token scoped to task:read + priority:write.\n"
+        f"   The plugin documents this requirement but cannot enforce token scope.\n"
         f"   Export: export {token_env_var}=<scoped-token>\n"
         f"   Or add to ~/.env.secrets: {token_env_var}=<scoped-token>",
         f"7. Set {openrouter_api_key_env} in your environment for qwen3.7-plus.",
@@ -523,8 +575,11 @@ def mupot_brain_enable(
     ]
 
     warnings = [
-        f"Risk 3: {token_env_var} MUST be a scoped token (task:read + priority:write). "
-        "mcp:* would grant full bus control to an always-on automated agent — never do this.",
+        f"Risk 3 (token scope — operator responsibility): {token_env_var} MUST be a "
+        "scoped token (task:read + priority:write). mcp:* would grant full bus control "
+        "to an always-on automated agent — never do this. "
+        "The plugin DOCUMENTS this requirement but CANNOT enforce token scope — "
+        "the Mumega bus does not expose token introspection to this cron script.",
         "Cron script MUST be a real file, not a symlink. Hermes cron scheduler reads "
         "the script path directly; a broken symlink causes a silent non-execution.",
         f"The brain profile uses qwen/qwen3.7-plus via OpenRouter. "

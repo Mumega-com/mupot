@@ -330,20 +330,30 @@ class TestMupotProvisionIdempotentGuard:
 
 
 class TestMupotProvisionApplyGate:
-    def test_apply_without_client_raises(self) -> None:
+    def test_apply_without_client_returns_plan_only(self) -> None:
         """
-        confirm=True + dry_run=False without an injected client must raise.
-        This is the guard that prevents accidental live CF calls in tests/CI.
+        confirm=True + dry_run=False without an injected client must return an honest
+        plan-only response (v0.1 does not bundle the CF SDK — no live calls are made).
+        It must NOT raise — a bare RuntimeError is an unhelpful error surface.
         """
-        with pytest.raises(RuntimeError, match="injected cf_client"):
-            mupot_provision(
-                slug="acme",
-                brand="Acme Corp",
-                cf_account_id="a" * 32,
-                cf_api_token="tok_" + "x" * 40,
-                confirm=True,
-                dry_run=False,
-            )
+        result = mupot_provision(
+            slug="acme",
+            brand="Acme Corp",
+            cf_account_id="a" * 32,
+            cf_api_token="tok_" + "x" * 40,
+            confirm=True,
+            dry_run=False,
+        )
+        # Must be plan-only, not applied
+        assert result["dry_run"] is True
+        assert result["applied"] is False
+        assert result["toml_path"] is None
+        # Must clearly communicate it's plan-only
+        plan_str = "\n".join(result["plan"])
+        assert "v0.1" in plan_str or "PLAN-ONLY" in plan_str
+        # Must include the wrangler CLI commands in next_steps
+        next_str = "\n".join(result["next_steps"])
+        assert "wrangler" in next_str
 
     def test_apply_with_client_creates_toml(self, tmp_path: Path) -> None:
         """With an injected client, apply mode writes the wrangler toml."""
@@ -524,11 +534,13 @@ class TestMupotBrainEnable:
         assert "mcp" not in token_var.lower()
 
     def test_scoped_token_warning_mentions_not_mcp_star(self) -> None:
-        """Warnings must explicitly say NOT mcp:* (Risk 3)."""
+        """Warnings must say NOT mcp:* AND that scope enforcement is operator's responsibility."""
         result = mupot_brain_enable(slug="acme")
         warnings_str = "\n".join(result["warnings"])
         assert "mcp:*" in warnings_str
         assert "NOT" in warnings_str or "not" in warnings_str
+        # v0.1 documents but cannot enforce scope — must say so
+        assert "cannot enforce" in warnings_str or "operator" in warnings_str.lower()
 
     def test_token_var_next_steps_mention_task_read_priority_write(self) -> None:
         """next_steps must mention the specific scopes required."""

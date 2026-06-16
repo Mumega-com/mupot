@@ -34,9 +34,10 @@ def register(ctx: Any) -> None:
         fn=mupot_provision,
         schema=MUPOT_PROVISION_SCHEMA,
         description=(
-            "Idempotently provision a mupot instance on your Cloudflare account "
-            "(D1 + KV + wrangler toml). Dry-run by default — set confirm=True to apply. "
-            "Never runs migrations automatically (Risk 2: drift landmine)."
+            "v0.1 PLAN-ONLY: emit an idempotent plan + exact wrangler CLI commands to "
+            "provision a mupot instance (D1 + KV + wrangler toml). Does NOT call the "
+            "Cloudflare API directly — run the emitted commands yourself. Real auto-apply "
+            "lands in v0.2. Never runs migrations automatically (Risk 2: drift landmine)."
         ),
     )
 
