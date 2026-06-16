@@ -128,4 +128,38 @@ describe('pot handoff-verify', () => {
     expect(r.ok).toBe(false)
     expect(r.reason).toBe('malformed')
   })
+
+  // ── aud isolation (#162 B2): presence claims and login-handoff claims MUST NOT
+  // be interchangeable, or a leaked read-only presence claim could mint a session.
+  describe('audience isolation (presence vs handoff)', () => {
+    const PRESENCE_AUD = 'presence:mumega'
+
+    it('accepts a presence-aud claim when expectedAud matches', async () => {
+      const t = await sign(priv, baseClaim({ aud: PRESENCE_AUD }))
+      const r = await verifyHandoffClaim(pubJwk, t, NOW + 1, PRESENCE_AUD)
+      expect(r.ok).toBe(true)
+      expect(r.claim?.email).toBe('op@mumega.com')
+    })
+
+    it('rejects a login-handoff claim at the presence endpoint (wrong_aud)', async () => {
+      const t = await sign(priv, baseClaim()) // aud = HANDOFF_AUD
+      const r = await verifyHandoffClaim(pubJwk, t, NOW + 1, PRESENCE_AUD)
+      expect(r.ok).toBe(false)
+      expect(r.reason).toBe('wrong_aud')
+    })
+
+    it('rejects a presence claim at the login-handoff verify (default aud)', async () => {
+      const t = await sign(priv, baseClaim({ aud: PRESENCE_AUD }))
+      const r = await verifyHandoffClaim(pubJwk, t, NOW + 1) // defaults to HANDOFF_AUD
+      expect(r.ok).toBe(false)
+      expect(r.reason).toBe('wrong_aud')
+    })
+
+    it('rejects a presence claim minted for a different pot slug', async () => {
+      const t = await sign(priv, baseClaim({ aud: 'presence:digid' }))
+      const r = await verifyHandoffClaim(pubJwk, t, NOW + 1, PRESENCE_AUD)
+      expect(r.ok).toBe(false)
+      expect(r.reason).toBe('wrong_aud')
+    })
+  })
 })

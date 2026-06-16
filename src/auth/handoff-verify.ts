@@ -61,6 +61,7 @@ export async function verifyHandoffClaim(
   publicKeyJwkJson: string | undefined,
   token: string,
   nowSeconds: number = Math.floor(Date.now() / 1000),
+  expectedAud: string = HANDOFF_AUD,
 ): Promise<VerifyResult> {
   if (!publicKeyJwkJson) return { ok: false, reason: 'unconfigured' }
   const parts = token.split('.')
@@ -88,7 +89,7 @@ export async function verifyHandoffClaim(
     new TextEncoder().encode(`${h}.${p}`),
   )
   if (!valid) return { ok: false, reason: 'bad_signature' }
-  if (claim.aud !== HANDOFF_AUD) return { ok: false, reason: 'wrong_aud' }
+  if (claim.aud !== expectedAud) return { ok: false, reason: 'wrong_aud' }
   // Defense in depth: pin the issuer. Signature already binds the key, but checking
   // iss guards against keypair reuse / a two-pot misconfig accepting a foreign issuer.
   if (claim.iss !== HANDOFF_ISS) return { ok: false, reason: 'wrong_iss' }

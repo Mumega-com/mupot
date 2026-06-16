@@ -73,6 +73,44 @@ function stateKey(state: string): string {
   return `${STATE_PREFIX}${state}`
 }
 
+// ── presence (pot check-in marker, #162 B2 Option P) ──────────────────────────
+// An email-keyed marker so the Control Tower's SIGNED presence probe can answer
+// "is owner X checked in to this pot?" without scanning sessions. Written on every
+// session mint, cleared on logout.
+const PRESENCE_PREFIX = 'presence:'
+
+/** Full SHA-256 hex of the lowercased email — the presence marker key suffix. */
+async function emailHash(email: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(email.trim().toLowerCase()))
+  let s = ''
+  for (const b of new Uint8Array(digest)) s += b.toString(16).padStart(2, '0')
+  return s
+}
+
+async function presenceKey(email: string): Promise<string> {
+  return `${PRESENCE_PREFIX}${await emailHash(email)}`
+}
+
+/**
+ * Mark the owner present in THIS pot. Single marker per email + TTL backstop: in the
+ * rare multi-session case, logging out of one session clears the marker while another
+ * is still live (a LOW-impact false "available"). Presence is a hint, not authz — the
+ * tradeoff avoids a KV list-scan on every probe.
+ */
+async function writePresence(env: Env, email: string | null, userId: string): Promise<void> {
+  if (!email) return
+  await env.SESSIONS.put(
+    await presenceKey(email),
+    JSON.stringify({ since: Date.now(), userId }),
+    { expirationTtl: SESSION_TTL_SECONDS },
+  )
+}
+
+async function clearPresence(env: Env, email: string | null): Promise<void> {
+  if (!email) return
+  await env.SESSIONS.delete(await presenceKey(email))
+}
+
 /** Resolve the OAuth provider; default google. */
 function provider(env: Env): 'google' | 'telegram' {
   return env.OAUTH_PROVIDER ?? 'google'
@@ -214,6 +252,7 @@ authApp.get('/callback', async (c) => {
   await env.SESSIONS.put(sessionKey(sessionId), JSON.stringify(record), {
     expirationTtl: SESSION_TTL_SECONDS,
   })
+  await writePresence(env, email, userId)
 
   setSessionCookie(c, sessionId)
   return c.redirect('/')
@@ -268,18 +307,58 @@ authApp.get('/handoff', async (c) => {
   await env.SESSIONS.put(sessionKey(sessionId), JSON.stringify(record), {
     expirationTtl: SESSION_TTL_SECONDS,
   })
+  await writePresence(env, res.claim.email, userId)
   setSessionCookie(c, sessionId)
   return c.redirect('/')
 })
 
-// GET /auth/logout → clear server-side session + cookie.
+// GET /auth/logout → clear server-side session + cookie (= check out of this pot).
 authApp.get('/logout', async (c) => {
   const sessionId = getCookie(c, COOKIE_NAME)
   if (sessionId) {
+    // Read the record first so we can clear the email-keyed presence marker too.
+    const raw = await c.env.SESSIONS.get(sessionKey(sessionId))
     await c.env.SESSIONS.delete(sessionKey(sessionId))
+    if (raw) {
+      try {
+        await clearPresence(c.env, (JSON.parse(raw) as SessionRecord).email)
+      } catch {
+        /* malformed record — presence marker lapses at TTL */
+      }
+    }
   }
   deleteCookie(c, COOKIE_NAME, { path: '/' })
   return c.redirect('/')
+})
+
+// GET /auth/presence?token= → signed, read-only presence probe (#162 B2, Option P).
+// The Control Tower (mumega) mints a SHORT-LIVED claim with aud='presence:<slug>',
+// DISTINCT from the login-handoff aud — so a leaked presence claim can NEVER be
+// replayed at /auth/handoff to mint a session, nor probe a different pot. We verify
+// with mumega's PUBLIC key only and answer ONLY for the email the signature binds
+// (no enumeration). Read-only: no session mutation, no jti consumption (replaying a
+// read is harmless).
+authApp.get('/presence', async (c) => {
+  // Keep the token-bearing URL out of Referer (follow-on nav/resource loads) and
+  // out of shared/browser caches — same protection /auth/handoff applies, since a
+  // leaked presence claim is a replayable read-oracle until exp.
+  c.header('Referrer-Policy', 'no-referrer')
+  c.header('Cache-Control', 'no-store')
+  const token = c.req.query('token')
+  if (!token) return c.json({ ok: false }, 401)
+  const expectedAud = `presence:${c.env.TENANT_SLUG}`
+  const res = await verifyHandoffClaim(c.env.MUPOT_HANDOFF_PUBLIC_KEY, token, undefined, expectedAud)
+  if (!res.ok || !res.claim) return c.json({ ok: false }, 401)
+  const raw = await c.env.SESSIONS.get(await presenceKey(res.claim.email))
+  let since: number | null = null
+  if (raw) {
+    try {
+      since = (JSON.parse(raw) as { since?: number }).since ?? null
+    } catch {
+      since = null
+    }
+  }
+  return c.json({ ok: true, checked_in: raw !== null, since })
 })
 
 // GET /auth/me → echo the current AuthContext (debug / dashboard bootstrap).
