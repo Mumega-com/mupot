@@ -71,6 +71,11 @@ export interface Env {
   // keeping its own Google OAuth (additive). We hold ONLY the issuer's Ed25519 PUBLIC
   // key (a var, not a secret — public material). No shared secret = sovereignty.
   MUPOT_HANDOFF_PUBLIC_KEY?: string
+  // The login-handoff audience THIS pot accepts. mumega mints the claim with
+  // aud = the pot's dashboard_url hostname (#yp-aud-gap), so each pot must verify
+  // against its OWN hostname. Unset ⇒ default HANDOFF_AUD ('mupot.mumega.com'),
+  // correct only for mumega#0. Every other pot MUST set this to its host.
+  MUPOT_HANDOFF_AUD?: string
   // fleet window: SOS bus bridge REST
   BUS_URL?: string
   // fleet scoping (Flock #43): which bus project this pot's fleet addresses, and
