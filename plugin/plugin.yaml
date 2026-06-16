@@ -1,0 +1,61 @@
+# mupot Hermes Plugin v0.1
+# Registers the mupot provisioner as a Hermes backend plugin.
+# Install: hermes plugins install Mumega-com/mupot-plugin
+# Docs: see README.md and skills/mupot-operator/SKILL.md
+
+name: mupot
+version: "0.1.0"
+kind: backend
+description: >
+  Provision and operate your own mupot instance on Cloudflare — org/RBAC/board/
+  memory with an optional idempotent brain. One command: connect your CF account,
+  get a live mupot-<slug>.workers.dev + a 15-min scan brain.
+
+provides_tools:
+  - name: mupot_provision
+    description: >
+      Idempotently create D1 + KV (SESSIONS + OAUTH_KV) on your Cloudflare account,
+      generate a wrangler.<slug>.toml, and emit the deploy + migration plan.
+      Runs in DRY-RUN mode by default — requires explicit confirm=true to apply.
+  - name: mupot_status
+    description: >
+      Probe a live mupot deployment's /health endpoint.
+      Returns { ok, tenant, url } — no CF credentials required.
+  - name: mupot_brain_enable
+    description: >
+      Emit the steps to wire the idempotent DMN brain for a provisioned mupot:
+      copy the Hermes profile, write config.yaml (qwen3.7-plus), register a real
+      15-min cron file, and note the SCOPED token required (NOT mcp:*).
+
+provides_hooks:
+  - name: on_session_start
+    description: >
+      Checks if MUPOT_CF_ACCOUNT_ID is set. If not, injects a one-time reminder
+      that mupot_provision is available to get started.
+
+# ── Environment variables ──────────────────────────────────────────────────────
+# Required for provisioning. Not needed for mupot_status.
+requires_env:
+  - name: MUPOT_CF_ACCOUNT_ID
+    description: >
+      Your Cloudflare account ID (visible at dash.cloudflare.com → right sidebar).
+  - name: MUPOT_CF_API_TOKEN
+    description: >
+      A scoped CF API token (NOT your Global API Key).
+      Minimum permissions: Workers Scripts:Edit, D1:Edit, Workers KV Storage:Edit,
+      Account Settings:Read. Use the token-template link in README.md.
+    secret: true
+
+optional_env:
+  - name: MUPOT_SLUG
+    description: Your pot slug (lowercase, no spaces). Default: derived from CF account name.
+  - name: MUPOT_BRAND
+    description: Display brand name shown in the dashboard. Default: the slug capitalized.
+  - name: MUPOT_OAUTH_PROVIDER
+    description: "OAuth identity provider: google (default) or telegram."
+    default: google
+
+# ── Companion installs ────────────────────────────────────────────────────────
+# cloudflare/skills provides the official CF skill tap (Workers/D1/KV/R2/Wrangler).
+# Install alongside mupot for richer CF context:
+#   hermes skills install cloudflare/skills
