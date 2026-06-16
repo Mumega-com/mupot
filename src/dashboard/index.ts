@@ -60,6 +60,7 @@ import { findPreset, isValidPresetId } from '../auth/role-presets'
 import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
 import { loadApprovals, resultPreview } from './approvals'
 import { loadLoopsView, loopsBody } from './loops'
+import { loadEconomy, economyBody } from './economy'
 import type { ApprovalItem } from './approvals'
 import {
   loadObservatory,
@@ -191,6 +192,15 @@ dashboardApp.get('/approvals', async (c) => {
 dashboardApp.get('/loops', async (c) => {
   const view = await loadLoopsView(c.env)
   return c.html(shell(c.env.BRAND, 'Loops', loopsBody(view)))
+})
+
+// ── economy (squad Anthropic spend — #179) ───────────────────────────────────
+// GET /economy — real Claude Code spend pushed in from the server transcript
+// rollup (actual tokens × Anthropic list rates). Read-only; requireAuth via the
+// outer middleware. Separate from the pot's internal burn gauge.
+dashboardApp.get('/economy', async (c) => {
+  const data = await loadEconomy(c.env)
+  return c.html(shell(c.env.BRAND, 'Economy', economyBody(data)))
 })
 
 // ── brain (per-pot brain panel — decision feed + governor) ───────────────────
@@ -1912,6 +1922,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
             <div class="nav-group-label">Workspace</div>
             <a href="/">Overview</a>
             <a href="/brain">Brain</a>
+            <a href="/economy">Economy</a>
             <a href="/flights">Flights</a>
           </div>
           <div class="nav-group">
