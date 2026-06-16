@@ -131,9 +131,17 @@ ccSpendApp.post('/cc-spend', async (c) => {
   if (typeof body.tenant !== 'string' || body.tenant !== c.env.TENANT_SLUG) {
     return c.json({ error: 'wrong_tenant' }, 403)
   }
-  // FRESHNESS source: an ISO timestamp the rollup stamps at generation time.
-  if (typeof body.generated_at !== 'string' || Number.isNaN(Date.parse(body.generated_at))) {
-    return c.json({ error: 'missing_generated_at' }, 400)
+  // FRESHNESS source: an ISO timestamp the rollup stamps at generation time. It is
+  // compared LEXICALLY against the stored updated_at in the upsert guard, which is
+  // sound ONLY for canonical UTC ISO-8601 (those sort chronologically). A non-
+  // canonical-but-parseable value (e.g. RFC-2822 'Tue, 16 Jun 2026 …') would sort
+  // wrong and could wedge a row stale, so we require EXACT canonical form.
+  if (
+    typeof body.generated_at !== 'string' ||
+    Number.isNaN(Date.parse(body.generated_at)) ||
+    new Date(body.generated_at).toISOString() !== body.generated_at
+  ) {
+    return c.json({ error: 'invalid_generated_at', detail: 'must be canonical UTC ISO-8601 (e.g. 2026-06-16T20:00:00.000Z)' }, 400)
   }
   const generatedAt = body.generated_at
   if (!Array.isArray(body.rows)) {

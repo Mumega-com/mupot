@@ -63,7 +63,7 @@ function row(over: Record<string, unknown> = {}) {
   }
 }
 function payload(over: Record<string, unknown> = {}) {
-  return JSON.stringify({ tenant: TENANT, generated_at: '2026-06-16T20:00:00Z', rows: [row()], ...over })
+  return JSON.stringify({ tenant: TENANT, generated_at: '2026-06-16T20:00:00.000Z', rows: [row()], ...over })
 }
 async function post(body: string, sig: string | null, env: unknown) {
   const headers: Record<string, string> = { 'content-type': 'application/json' }
@@ -90,7 +90,7 @@ describe('POST /api/economy/cc-spend — auth + audience + freshness + validatio
 
   it('413 on oversized body', async () => {
     const { env } = makeEnv(SECRET)
-    const big = JSON.stringify({ tenant: TENANT, generated_at: '2026-06-16T20:00:00Z', rows: [row({ agent: 'x'.repeat(300_000) })] })
+    const big = JSON.stringify({ tenant: TENANT, generated_at: '2026-06-16T20:00:00.000Z', rows: [row({ agent: 'x'.repeat(300_000) })] })
     expect((await post(big, await sign(big), env)).status).toBe(413)
   })
 
@@ -106,6 +106,17 @@ describe('POST /api/economy/cc-spend — auth + audience + freshness + validatio
     expect((await post(body, await sign(body), env)).status).toBe(400)
   })
 
+  it('400 on a NON-canonical (parseable) generated_at — would break lexical freshness', async () => {
+    const { env, store } = makeEnv(SECRET)
+    // RFC-2822: Date.parse() accepts it, but it sorts wrong lexically → must be rejected.
+    const rfc = JSON.stringify({ tenant: TENANT, generated_at: 'Tue, 16 Jun 2026 20:00:00 GMT', rows: [row()] })
+    expect((await post(rfc, await sign(rfc), env)).status).toBe(400)
+    // No-millis ISO is also non-canonical (toISOString always emits .000Z).
+    const noMs = JSON.stringify({ tenant: TENANT, generated_at: '2026-06-16T20:00:00Z', rows: [row()] })
+    expect((await post(noMs, await sign(noMs), env)).status).toBe(400)
+    expect(store.size).toBe(0)
+  })
+
   it('200 happy path writes the row', async () => {
     const { env, store } = makeEnv(SECRET)
     const res = await send(env)
@@ -116,7 +127,7 @@ describe('POST /api/economy/cc-spend — auth + audience + freshness + validatio
 
   it('rejects the WHOLE batch on any invalid row (fail-closed, no partial write)', async () => {
     const { env, store } = makeEnv(SECRET)
-    const bad = { tenant: TENANT, generated_at: '2026-06-16T20:00:00Z', rows: [row(), row({ usd_micro: -1 })] }
+    const bad = { tenant: TENANT, generated_at: '2026-06-16T20:00:00.000Z', rows: [row(), row({ usd_micro: -1 })] }
     const body = JSON.stringify(bad)
     expect((await post(body, await sign(body), env)).status).toBe(400)
     expect(store.size).toBe(0) // the valid sibling row must NOT have persisted
@@ -124,25 +135,25 @@ describe('POST /api/economy/cc-spend — auth + audience + freshness + validatio
 
   it('rejects an unknown model_family', async () => {
     const { env } = makeEnv(SECRET)
-    const body = JSON.stringify({ tenant: TENANT, generated_at: '2026-06-16T20:00:00Z', rows: [row({ model_family: 'gpt' })] })
+    const body = JSON.stringify({ tenant: TENANT, generated_at: '2026-06-16T20:00:00.000Z', rows: [row({ model_family: 'gpt' })] })
     expect((await post(body, await sign(body), env)).status).toBe(400)
   })
 
   it('rejects a non-integer token count', async () => {
     const { env } = makeEnv(SECRET)
-    const body = JSON.stringify({ tenant: TENANT, generated_at: '2026-06-16T20:00:00Z', rows: [row({ input_tokens: 1.5 })] })
+    const body = JSON.stringify({ tenant: TENANT, generated_at: '2026-06-16T20:00:00.000Z', rows: [row({ input_tokens: 1.5 })] })
     expect((await post(body, await sign(body), env)).status).toBe(400)
   })
 
   it('a fresher push updates; a STALE push is a per-row no-op (freshness guard)', async () => {
     const { env, store } = makeEnv(SECRET)
     // initial @ 20:00 = $5
-    await send(env, { generated_at: '2026-06-16T20:00:00Z' })
+    await send(env, { generated_at: '2026-06-16T20:00:00.000Z' })
     // fresher @ 21:00 = $9 → updates
-    await send(env, { generated_at: '2026-06-16T21:00:00Z', rows: [row({ usd_micro: 9_000_000 })] })
+    await send(env, { generated_at: '2026-06-16T21:00:00.000Z', rows: [row({ usd_micro: 9_000_000 })] })
     expect(store.get('2026-06-16|kasra|opus')?.usd_micro).toBe(9_000_000)
     // stale @ 19:00 = $1 → must NOT regress
-    const res = await send(env, { generated_at: '2026-06-16T19:00:00Z', rows: [row({ usd_micro: 1_000_000 })] })
+    const res = await send(env, { generated_at: '2026-06-16T19:00:00.000Z', rows: [row({ usd_micro: 1_000_000 })] })
     expect(res.status).toBe(200) // still handled (idempotent no-op)
     expect(store.get('2026-06-16|kasra|opus')?.usd_micro).toBe(9_000_000)
   })
