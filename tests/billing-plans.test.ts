@@ -7,6 +7,7 @@ import {
   isPotTier,
   withinLimit,
   POT_FEATURES,
+  PLAN_LIMITS,
 } from '../src/billing/plans'
 
 describe('pot tier coercion (fail-closed)', () => {
@@ -70,5 +71,25 @@ describe('entitlement snapshot', () => {
   it('scale snapshot lists all features', () => {
     const e = entitlementFor('scale')
     expect(e.features.length).toBe(Object.keys(POT_FEATURES).length)
+  })
+})
+
+describe('immutability — a snapshot cannot poison the catalog (Codex RED-1)', () => {
+  it('mutating a snapshot does not change the catalog or gates', () => {
+    const e = entitlementFor('free')
+    e.limits.maxAgents = 999 // snapshot.limits is a copy — isolated
+    expect(withinLimit('free', 'maxAgents', 3)).toBe(false) // catalog unchanged
+    expect(entitlementFor('free').limits.maxAgents).toBe(2)
+  })
+  it('the catalog itself is frozen', () => {
+    expect(Object.isFrozen(PLAN_LIMITS)).toBe(true)
+    expect(Object.isFrozen(PLAN_LIMITS.free)).toBe(true)
+    expect(Object.isFrozen(POT_FEATURES)).toBe(true)
+    try {
+      ;(PLAN_LIMITS.free as { maxAgents: number }).maxAgents = 999 // strict-mode throws; frozen
+    } catch {
+      /* expected in strict mode */
+    }
+    expect(PLAN_LIMITS.free.maxAgents).toBe(2)
   })
 })

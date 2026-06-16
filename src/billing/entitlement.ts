@@ -14,7 +14,10 @@ import {
   type PotTier,
 } from './plans'
 
-/** org_settings key holding the pot's plan tier. Written only by the billing source. */
+/** org_settings key holding the pot's plan tier. Written ONLY by the billing source
+ *  (Stripe webhook / marketplace fulfillment / admin override) — never self-service.
+ *  Owned by the billing module (intentionally not in dashboard SETTINGS_KEYS, which
+ *  is substrate/wizard config; billing is its own concern). */
 export const PLAN_TIER_KEY = 'plan_tier'
 
 /** Resolve the pot's plan tier from org_settings (fail-closed to 'free'). */

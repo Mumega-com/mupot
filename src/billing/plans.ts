@@ -14,9 +14,19 @@
 // Fail-closed: unknown/missing tier → 'free' (most restrictive). A swapped brain
 // or bad overlay can never raise its own tier — tier is owner/subscription state.
 //
-// NOTE: the per-tier LIMITS and PRICES below are SCAFFOLDING DEFAULTS. Real pricing
-// + limits are an owner/product decision (set via subscription config); the
-// MECHANISM (rank, gate, fail-closed) is what this module guarantees.
+// NOTE: the per-tier LIMITS below are SCAFFOLDING DEFAULTS. Real limits/pricing are
+// an owner/product decision (set via subscription config); the MECHANISM (rank,
+// gate, fail-closed, IMMUTABLE authority) is what this module guarantees.
+
+/** Deep-freeze: the plan catalog is immutable authority — a consumer holding an
+ *  entitlement snapshot must never be able to mutate the global enforcement table. */
+function deepFreeze<T>(o: T): T {
+  if (o && typeof o === 'object') {
+    for (const v of Object.values(o as Record<string, unknown>)) deepFreeze(v)
+    Object.freeze(o)
+  }
+  return o
+}
 
 // ── tiers ────────────────────────────────────────────────────────────────────
 export type PotTier = 'free' | 'starter' | 'pro' | 'scale'
@@ -53,7 +63,7 @@ interface FeatureSpec {
 }
 
 /** The tag registry: each feature → minimum tier. Single place to read tier gates. */
-export const POT_FEATURES: Record<PotFeature, FeatureSpec> = {
+export const POT_FEATURES: Record<PotFeature, FeatureSpec> = deepFreeze({
   byo_model: { minTier: 'starter', label: 'Bring your own model / AI Gateway' },
   extra_channels: { minTier: 'starter', label: 'Extra comms channels (WhatsApp/multi)' },
   byo_brain: { minTier: 'pro', label: 'Swap the brain (sovereign / custom)' },
@@ -61,7 +71,7 @@ export const POT_FEATURES: Record<PotFeature, FeatureSpec> = {
   priority_metabolism: { minTier: 'pro', label: 'Priority brain cadence' },
   audit_export: { minTier: 'scale', label: 'Audit-log export' },
   sso: { minTier: 'scale', label: 'SSO enforcement' },
-}
+})
 
 // ── limits (numeric ceilings per tier) ─────────────────────────────────────────
 // SCAFFOLDING DEFAULTS — tune via product/pricing decision. -1 = unlimited.
@@ -71,12 +81,12 @@ export interface PotLimits {
   monthlyModelBudgetMicroUsd: number
 }
 
-export const PLAN_LIMITS: Record<PotTier, PotLimits> = {
+export const PLAN_LIMITS: Record<PotTier, PotLimits> = deepFreeze({
   free: { maxAgents: 2, maxSquads: 1, monthlyModelBudgetMicroUsd: 2_000_000 }, // ~$2/mo Workers-AI
   starter: { maxAgents: 8, maxSquads: 3, monthlyModelBudgetMicroUsd: 50_000_000 }, // ~$50/mo
   pro: { maxAgents: 30, maxSquads: 10, monthlyModelBudgetMicroUsd: 300_000_000 }, // ~$300/mo
   scale: { maxAgents: -1, maxSquads: -1, monthlyModelBudgetMicroUsd: -1 }, // unlimited / metered
-}
+})
 
 // ── pure gates (no I/O — fully testable) ───────────────────────────────────────
 
@@ -103,5 +113,8 @@ export interface Entitlement {
 
 export function entitlementFor(tier: PotTier): Entitlement {
   const features = (Object.keys(POT_FEATURES) as PotFeature[]).filter((f) => entitled(tier, f))
-  return { tier, limits: PLAN_LIMITS[tier], features }
+  // Defensive copy of limits + frozen features — a snapshot holder can never mutate
+  // the immutable PLAN_LIMITS/POT_FEATURES authority. withinLimit() reads the frozen
+  // catalog directly, so even a tampered snapshot can't change enforcement.
+  return { tier, limits: { ...PLAN_LIMITS[tier] }, features: Object.freeze(features) }
 }
