@@ -209,7 +209,7 @@ def mupot_provision(
                 f"2. Create KV namespaces:\n"
                 f"   npx wrangler kv namespace create mupot-{slug}-sessions\n"
                 f"   npx wrangler kv namespace create mupot-{slug}-oauth",
-                "3. Copy wrangler.example.toml → wrangler.{slug}.toml and fill in "
+                f"3. Copy wrangler.example.toml → wrangler.{slug}.toml and fill in "
                 "the D1 database_id and KV namespace IDs from the output above.",
                 f"4. Deploy the worker:\n"
                 f"   npx wrangler deploy --config wrangler.{slug}.toml",
@@ -284,15 +284,22 @@ def mupot_provision(
 
     if not applying:
         result["next_steps"] = [
-            "1. Review the plan above.",
-            f"2. Re-run with confirm=True, dry_run=False to apply.",
-            "3. After apply: set secrets via `wrangler secret put` for OAUTH_CLIENT_ID "
-            "and OAUTH_CLIENT_SECRET (Risk 1: least-scoped token only).",
-            "4. Run migrations with DRY-RUN first: "
-            f"`npx wrangler d1 migrations apply mupot-{slug} --dry-run --config wrangler.{slug}.toml` "
-            "then apply only after reviewing output (Risk 2: migration drift landmine).",
-            "5. Run mupot_status to verify the deployment.",
-            "6. Optionally run mupot_brain_enable to wire the DMN brain.",
+            "v0.1 is PLAN-ONLY — this tool does NOT create resources and confirm does "
+            "NOT apply (no Cloudflare SDK is bundled in v0.1). Run these wrangler "
+            "commands manually to provision (v0.2 will wire the SDK to run them):",
+            f"1. npx wrangler d1 create mupot-{slug}",
+            f"2. npx wrangler kv namespace create mupot-{slug}-sessions  &&  "
+            f"npx wrangler kv namespace create mupot-{slug}-oauth",
+            f"3. Copy wrangler.example.toml → wrangler.{slug}.toml; fill in the D1 "
+            f"database_id + KV namespace IDs from the output above.",
+            f"4. npx wrangler deploy --config wrangler.{slug}.toml",
+            f"5. MIGRATION — dry-run FIRST (Risk 2 drift landmine): npx wrangler d1 "
+            f"migrations apply mupot-{slug} --dry-run --config wrangler.{slug}.toml ; "
+            "apply only after reviewing output for destructive ops.",
+            f"6. npx wrangler secret put OAUTH_CLIENT_ID (then OAUTH_CLIENT_SECRET) "
+            f"--config wrangler.{slug}.toml (Risk 1: least-scoped token).",
+            f"7. mupot_status(url='https://mupot-{slug}.workers.dev') to verify.",
+            "8. Optionally mupot_brain_enable to wire the DMN brain.",
         ]
         return result
 
@@ -523,8 +530,9 @@ def mupot_brain_enable(
     v0.1: returns a structured plan dict. Does NOT execute against a live host.
     The caller (Hermes agent or human operator) follows the next_steps.
 
-    Risk 3 guard: the plan explicitly requires a SCOPED token (task:read +
-    priority:write), NOT mcp:*. This is enforced by the cron script template.
+    Risk 3: the plan DOCUMENTS that the operator must supply a SCOPED token (task:read +
+    priority:write), NOT mcp:*. The plugin does NOT enforce token scope — no bus
+    introspection is available in the cron context; scope is the operator's responsibility.
     """
     _validate_slug(slug)
     slug_upper = slug.upper().replace("-", "_")

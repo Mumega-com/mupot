@@ -180,6 +180,21 @@ class TestMupotProvisionDryRun:
         # Must tell the user to dry-run migrations (Risk 2)
         assert "--dry-run" in next_steps_str or "dry-run" in next_steps_str.lower()
 
+    def test_dry_run_next_steps_is_honest_plan_only(self) -> None:
+        """v0.1 default output must emit manual wrangler commands and must NOT claim
+        confirm applies (Codex re-gate P0 — v0.1 has no SDK)."""
+        result = mupot_provision(
+            slug="acme",
+            brand="Acme Corp",
+            cf_account_id="a" * 32,
+            cf_api_token="tok_" + "x" * 40,
+        )
+        next_steps_str = "\n".join(result["next_steps"])
+        assert "wrangler d1 create" in next_steps_str
+        assert "PLAN-ONLY" in next_steps_str
+        assert "confirm=True, dry_run=False to apply" not in next_steps_str
+        assert "After apply" not in next_steps_str
+
     def test_dry_run_uses_dry_run_client(self) -> None:
         # DryRunClient records calls but never hits CF
         dry = DryRunClient()

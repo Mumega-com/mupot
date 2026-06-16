@@ -1,22 +1,26 @@
-# mupot Hermes Plugin v0.1
-# Registers the mupot provisioner as a Hermes backend plugin.
-# Install: hermes plugins install Mumega-com/mupot-plugin
+# mupot Hermes Plugin v0.1 — PLAN-ONLY
+# v0.1 does NOT bundle the Cloudflare SDK: it EMITS the provision plan + the exact
+# wrangler commands; it does not create resources itself (v0.2 wires real apply).
+# Install (v0.1): git clone the mupot repo; the plugin lives at mupot/plugin/.
+#   (The `hermes plugins install Mumega-com/mupot-plugin` one-liner is the v0.2+ path,
+#    once the standalone repo is published.)
 # Docs: see README.md and skills/mupot-operator/SKILL.md
 
 name: mupot
 version: "0.1.0"
 kind: backend
 description: >
-  Provision and operate your own mupot instance on Cloudflare — org/RBAC/board/
-  memory with an optional idempotent brain. One command: connect your CF account,
-  get a live mupot-<slug>.workers.dev + a 15-min scan brain.
+  Plan your own mupot instance on Cloudflare (org/RBAC/board/memory + an idempotent
+  brain). v0.1 EMITS the exact wrangler commands to stand up a mupot-<slug>.workers.dev
+  + a 15-min scan brain; you run them. v0.2 will execute them for you.
 
 provides_tools:
   - name: mupot_provision
     description: >
-      Idempotently create D1 + KV (SESSIONS + OAUTH_KV) on your Cloudflare account,
-      generate a wrangler.<slug>.toml, and emit the deploy + migration plan.
-      Runs in DRY-RUN mode by default — requires explicit confirm=true to apply.
+      v0.1 PLAN-ONLY: emit the idempotent create plan for D1 + KV (SESSIONS + OAUTH_KV)
+      and the exact wrangler deploy + dry-run-first migration commands. Does NOT create
+      resources and confirm does NOT apply in v0.1 (no SDK bundled) — run the emitted
+      commands yourself. v0.2 wires the Cloudflare SDK to execute behind an explicit confirm.
   - name: mupot_status
     description: >
       Probe a live mupot deployment's /health endpoint.
