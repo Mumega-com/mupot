@@ -1418,15 +1418,55 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       }
       a { color: var(--accent2); text-decoration: none; }
       a:hover { text-decoration: underline; }
-      header.top {
-        display: flex; align-items: center; justify-content: space-between;
-        padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--surface);
-        position: sticky; top: 0; z-index: 5;
+      /* ── Sidebar shell (Stripe-style: switcher + grouped nav) ── */
+      .layout { display: flex; min-height: 100vh; }
+      .sidebar {
+        width: 232px; flex-shrink: 0; background: var(--surface);
+        border-right: 1px solid var(--border);
+        position: sticky; top: 0; height: 100vh; overflow-y: auto;
+        display: flex; flex-direction: column;
       }
-      header.top .brand { font-weight: 700; letter-spacing: .3px; color: var(--text); }
-      header.top .brand b { color: var(--accent); }
-      header.top nav a { margin-left: 18px; color: var(--muted); font-size: 14px; }
-      main { max-width: 1080px; margin: 0 auto; padding: 28px 24px 64px; }
+      /* pot switcher (top-left, like Stripe's account menu) */
+      .switcher { border-bottom: 1px solid var(--border); }
+      .switcher > summary {
+        list-style: none; cursor: pointer; user-select: none;
+        display: flex; align-items: center; gap: 8px;
+        padding: 16px 18px; font-weight: 700; color: var(--text);
+      }
+      .switcher > summary::-webkit-details-marker { display: none; }
+      .switcher > summary b { color: var(--accent); letter-spacing: .3px; }
+      .switcher > summary .caret { margin-left: auto; color: var(--muted); font-size: 11px; }
+      .switcher .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex-shrink: 0; }
+      .switcher-menu { padding: 6px; background: var(--surface2); border-top: 1px solid var(--border); }
+      .switcher-menu a {
+        display: block; padding: 8px 12px; border-radius: 7px; color: var(--muted); font-size: 13px;
+      }
+      .switcher-menu a:hover { background: var(--bg); color: var(--text); text-decoration: none; }
+      /* grouped nav */
+      .nav-groups { flex: 1; padding: 14px 10px; display: flex; flex-direction: column; gap: 16px; }
+      .nav-group { display: flex; flex-direction: column; gap: 2px; }
+      .nav-group-label {
+        font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
+        color: var(--dim); padding: 0 12px 4px; font-weight: 600;
+      }
+      .sidebar nav a {
+        display: block; padding: 7px 12px; border-radius: 7px; color: var(--muted); font-size: 14px;
+      }
+      .sidebar nav a:hover { background: var(--surface2); color: var(--text); text-decoration: none; }
+      .sidebar nav a.active { background: var(--surface2); color: var(--accent); font-weight: 600; }
+      .sidebar-footer { padding: 10px; border-top: 1px solid var(--border); }
+      .sidebar-footer a { display: block; padding: 7px 12px; border-radius: 7px; color: var(--muted); font-size: 13px; }
+      .sidebar-footer a:hover { background: var(--surface2); color: var(--text); text-decoration: none; }
+      main { flex: 1; max-width: 1080px; margin: 0 auto; padding: 28px 24px 64px; width: 100%; }
+      /* mobile: sidebar collapses to a top strip */
+      @media (max-width: 860px) {
+        .layout { flex-direction: column; }
+        .sidebar { width: 100%; height: auto; position: static;
+          border-right: none; border-bottom: 1px solid var(--border); }
+        .nav-groups { flex-direction: row; flex-wrap: wrap; gap: 8px 18px; }
+        .nav-group { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+        .nav-group-label { width: 100%; padding: 0; }
+      }
       h1 { font-size: 22px; margin: 0 0 4px; }
       h2 { font-size: 16px; margin: 28px 0 12px; color: var(--text); }
       .crumbs { color: var(--dim); font-size: 13px; margin-bottom: 18px; }
@@ -1851,26 +1891,59 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
     </style>
   </head>
   <body>
-    <header class="top">
-      <div class="brand"><b>${brand}</b> · substrate console</div>
-      <nav>
-        <a href="/">Overview</a>
-        <a href="/send">Send</a>
-        <a href="/approvals">Approvals</a>
-        <a href="/loops">Loops</a>
-        <a href="/brain">Brain</a>
-        <a href="/flights">Flights</a>
-        <a href="/agents">Agents</a>
-        <a href="/fleet">Fleet</a>
-        <a href="/members">People</a>
-        <a href="/admin/divisions">Organization</a>
-        <a href="/admin/keys">Scoped Keys</a>
-        <a href="/admin/github">GitHub</a>
-        <a href="/setup">Setup</a>
-        <a href="/auth/logout">Sign out</a>
-      </nav>
-    </header>
-    <main>${body}</main>
+    <div class="layout">
+      <aside class="sidebar">
+        <details class="switcher">
+          <summary><span class="dot"></span><b>${brand}</b><span class="caret">▾</span></summary>
+          <div class="switcher-menu">
+            <a href="https://mumega.com/dashboard/pots">Switch pot →</a>
+          </div>
+        </details>
+        <nav class="nav-groups">
+          <div class="nav-group">
+            <div class="nav-group-label">Workspace</div>
+            <a href="/">Overview</a>
+            <a href="/brain">Brain</a>
+            <a href="/flights">Flights</a>
+          </div>
+          <div class="nav-group">
+            <div class="nav-group-label">Work</div>
+            <a href="/send">Send</a>
+            <a href="/approvals">Approvals</a>
+            <a href="/loops">Loops</a>
+          </div>
+          <div class="nav-group">
+            <div class="nav-group-label">People &amp; Org</div>
+            <a href="/agents">Agents</a>
+            <a href="/fleet">Fleet</a>
+            <a href="/members">People</a>
+            <a href="/admin/divisions">Organization</a>
+          </div>
+          <div class="nav-group">
+            <div class="nav-group-label">Settings</div>
+            <a href="/admin/keys">Scoped Keys</a>
+            <a href="/admin/github">GitHub</a>
+            <a href="/setup">Setup</a>
+          </div>
+        </nav>
+        <div class="sidebar-footer">
+          <a href="/auth/logout">Sign out</a>
+        </div>
+      </aside>
+      <main>${body}</main>
+    </div>
+    <script>
+      (function () {
+        var p = location.pathname;
+        var best = null, bestLen = -1;
+        document.querySelectorAll('.sidebar nav a').forEach(function (a) {
+          var href = a.getAttribute('href');
+          var match = href === '/' ? p === '/' : p.indexOf(href) === 0;
+          if (match && href.length > bestLen) { best = a; bestLen = href.length; }
+        });
+        if (best) best.classList.add('active');
+      })();
+    </script>
   </body>
 </html>`
 }
