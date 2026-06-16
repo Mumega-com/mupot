@@ -137,6 +137,32 @@ export const ROLE_PRESETS: readonly RolePreset[] = [
       'settings:write',
     ],
   },
+  {
+    id: 'brain',
+    label: 'Brain (prioritizer)',
+    description:
+      'Autonomous prioritizer (e.g. a sovereign Hermes brain). Reads the task board org-wide and rests when nothing changed; at most emits a gated priority signal. Cannot write, mint, send outreach, change settings, or cross tenant. Least-privilege by construction — a runaway brain with this key can only read and rest. Dispatch (signal:send-gated) is intentionally NOT granted here yet: until the signal surface is wired + enforced, the brain fails CLOSED on dispatch (read + rest only). Add signal:send-gated when that surface lands.',
+    role: 'observer',
+    scopeType: 'org',
+    scopeHint: 'org',
+    allows: [
+      'tasks:read',
+      'pipeline:read',
+      'agents:read',
+    ],
+    denies: [
+      'write',
+      'mint-tokens',
+      'provision',
+      'outreach:send',
+      'content:write',
+      'budget:write',
+      'settings:write',
+      'cross-squad',
+      'cross-tenant',
+      'mcpwp:write',
+    ],
+  },
 ] as const
 
 // ── lookup helpers ─────────────────────────────────────────────────────────────

@@ -1,0 +1,71 @@
+# mupot Hermes Plugin v0.2 — REAL CF PROVISIONER
+# v0.2 ships a real Cloudflare provisioner using pure stdlib urllib (no extra deps).
+# When confirm=True and dry_run=False, the tool creates D1 databases and KV namespaces
+# via the CF REST API and writes wrangler.<slug>.toml with the resolved resource IDs.
+# Requires MUPOT_CF_API_TOKEN and MUPOT_CF_ACCOUNT_ID in the environment.
+# Install: git clone the mupot repo; the plugin lives at mupot/plugin/.
+#   (The `hermes plugins install Mumega-com/mupot-plugin` one-liner is the v0.3+ path,
+#    once the standalone repo is published.)
+# Docs: see README.md and skills/mupot-operator/SKILL.md
+
+name: mupot
+version: "0.2.0"
+kind: backend
+description: >
+  Provision and operate your own mupot instance on Cloudflare (org/RBAC/board/memory +
+  an idempotent brain). v0.2 ships the REAL CF provisioner: confirm=True + dry_run=False
+  creates D1 databases + KV namespaces via the CF REST API and writes
+  wrangler.<slug>.toml with resolved IDs. Requires MUPOT_CF_API_TOKEN +
+  MUPOT_CF_ACCOUNT_ID. Default (dry_run=True) emits a plan without touching CF.
+
+provides_tools:
+  - name: mupot_provision
+    description: >
+      Idempotent mupot provisioner. Default (dry_run=True or confirm=False): emit a plan
+      showing what WILL be created. Apply mode (confirm=True + dry_run=False): uses
+      MUPOT_CF_API_TOKEN + MUPOT_CF_ACCOUNT_ID to create D1 + KV namespaces via the CF
+      REST API (idempotent — skips resources that already exist) and writes
+      wrangler.<slug>.toml with resolved IDs. Migration apply is NEVER auto-run — always
+      emitted as a gated DRY-RUN-FIRST next_step (Risk 2: drift landmine).
+  - name: mupot_status
+    description: >
+      Probe a live mupot deployment's /health endpoint.
+      Returns { ok, tenant, url } — no CF credentials required.
+  - name: mupot_brain_enable
+    description: >
+      Emit the steps to wire the idempotent DMN brain for a provisioned mupot:
+      copy the Hermes profile, write config.yaml (qwen3.7-plus), register a real
+      15-min cron file, and note the SCOPED token required (NOT mcp:*).
+
+provides_hooks:
+  - name: on_session_start
+    description: >
+      Checks if MUPOT_CF_ACCOUNT_ID is set. If not, injects a one-time reminder
+      that mupot_provision is available to get started.
+
+# ── Environment variables ──────────────────────────────────────────────────────
+# Required for provisioning. Not needed for mupot_status.
+requires_env:
+  - name: MUPOT_CF_ACCOUNT_ID
+    description: >
+      Your Cloudflare account ID (visible at dash.cloudflare.com → right sidebar).
+  - name: MUPOT_CF_API_TOKEN
+    description: >
+      A scoped CF API token (NOT your Global API Key).
+      Minimum permissions: Workers Scripts:Edit, D1:Edit, Workers KV Storage:Edit,
+      Account Settings:Read. Use the token-template link in README.md.
+    secret: true
+
+optional_env:
+  - name: MUPOT_SLUG
+    description: Your pot slug (lowercase, no spaces). Default: derived from CF account name.
+  - name: MUPOT_BRAND
+    description: Display brand name shown in the dashboard. Default: the slug capitalized.
+  - name: MUPOT_OAUTH_PROVIDER
+    description: "OAuth identity provider: google (default) or telegram."
+    default: google
+
+# ── Companion installs ────────────────────────────────────────────────────────
+# cloudflare/skills provides the official CF skill tap (Workers/D1/KV/R2/Wrangler).
+# Install alongside mupot for richer CF context:
+#   hermes skills install cloudflare/skills
