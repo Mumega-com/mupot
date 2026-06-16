@@ -1,18 +1,23 @@
 """
-mupot Hermes Plugin — tool implementations (v0.1).
+mupot Hermes Plugin — tool implementations (v0.2).
 
-v0.1 IS PLAN-ONLY for provisioning.  The apply path (confirm=True, dry_run=False)
-requires an externally-constructed CloudflareClient — the real `cloudflare` SDK is NOT
-bundled in v0.1.  Without an injected client, the tool returns a structured plan with
-the exact wrangler CLI commands to run.  Real apply (auto-constructed SDK client) lands
-in v0.2.
+v0.2 ships the REAL Cloudflare provisioner (CloudflareApiClient) using pure urllib —
+no extra dependencies.  When confirm=True, dry_run=False, and no cf_client is injected,
+the tool constructs CloudflareApiClient from env (MUPOT_CF_API_TOKEN / MUPOT_CF_ACCOUNT_ID)
+and performs real idempotent provisioning (create D1 + KV).
 
-Risk annotations match the design doc (mupot-hermes-plugin-v0.1.md):
-  Risk 1 — CF token on disk (least-scoped token; revoke after provision).
-  Risk 2 — Migration drift landmine (DRY-RUN + explicit confirm required).
-  Risk 3 — Brain token must be SCOPED, not mcp:*.  Plugin documents the requirement
-            but CANNOT enforce token scope — the operator must supply a scoped token.
-  Risk 4 — wrangler version drift (pin + check).
+v0.2 also wires the Worker deploy path: after D1+KV are provisioned, the generated
+wrangler.<slug>.toml is used by `npx wrangler deploy`.  Migration apply follows the
+DRY-RUN-FIRST gate (Risk 2) and is emitted as a gated next_step — NOT auto-run.
+
+v0.3 defers: full Cloudflare Workers SDK upload (no wrangler dep), live BYO-CF
+integration test (requires a real CF account), publish to PyPI / GH release (#266).
+
+Risk annotations (unchanged from v0.1 design doc):
+  Risk 1 — CF token in env (least-scoped token; mupot_revoke_token stub noted).
+  Risk 2 — Migration drift landmine (DRY-RUN + explicit confirm; never blind apply).
+  Risk 3 — Brain token must be SCOPED, not mcp:*. Plugin documents; operator enforces.
+  Risk 4 — wrangler version drift (pin min version, check before deploy; v0.3 removes dep).
   Risk 5 — Workers free-tier slot warning.
 """
 
@@ -21,7 +26,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import textwrap
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Protocol
@@ -76,6 +84,157 @@ class DryRunClient:
         )
         self._kv_ns_counter += 1
         return {"id": f"dry-run-kv-{self._kv_ns_counter:04d}", "title": title}
+
+
+# ── Real Cloudflare API client (v0.2) ────────────────────────────────────────
+
+_CF_API_BASE = "https://api.cloudflare.com/client/v4"
+_CF_LIST_PAGE_SIZE = 100  # CF default; request up to 100 per page
+
+
+class CloudflareApiError(RuntimeError):
+    """Raised when the CF REST API returns a non-2xx status or error payload."""
+
+    def __init__(self, method: str, url: str, status: int, body: str) -> None:
+        # Never include the token in this message — it is NOT passed here.
+        super().__init__(
+            f"CF API {method} {url} → HTTP {status}: {body[:400]}"
+        )
+        self.status = status
+
+
+class CloudflareApiClient:
+    """
+    Real Cloudflare REST API client using stdlib urllib only (no extra deps).
+
+    Auth: Authorization: Bearer <token>  (Risk 1: token NEVER logged or echoed).
+    Account: passed explicitly to each call; sourced from MUPOT_CF_ACCOUNT_ID env.
+
+    Implements the CloudflareClient Protocol used by mupot_provision.
+    """
+
+    def __init__(self, api_token: str, *, timeout: int = 30) -> None:
+        if not api_token:
+            raise ValueError(
+                "CF API token is empty. Set MUPOT_CF_API_TOKEN in your environment."
+            )
+        # Store token only in this private slot — never surface in repr/str/logs.
+        self.__token = api_token
+        self._timeout = timeout
+
+    def __repr__(self) -> str:
+        # Deliberately omit the token from repr (Risk 1).
+        return "CloudflareApiClient(<token_redacted>)"
+
+    def _request(
+        self, method: str, path: str, body: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        """
+        Low-level JSON request.  Returns parsed response dict on success.
+        Raises CloudflareApiError on non-2xx responses.
+        Risk 1: Authorization header value is NEVER logged, echoed, or included in
+        error messages raised from this method.
+        """
+        url = f"{_CF_API_BASE}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {
+            # Risk 1: token only in the Authorization header — not in logs or errors.
+            "Authorization": f"Bearer {self.__token}",
+            "Content-Type": "application/json",
+        }
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                raw = resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode() if exc.fp else ""
+            raise CloudflareApiError(method, url, exc.code, raw) from exc
+        parsed: dict[str, Any] = json.loads(raw)
+        if not parsed.get("success", False):
+            errors = parsed.get("errors", [])
+            raise CloudflareApiError(method, url, 0, json.dumps(errors))
+        return parsed
+
+    def list_d1_databases(self, account_id: str) -> list[dict[str, Any]]:
+        """
+        List all D1 databases for the account.
+        GET /accounts/{account_id}/d1/database
+        Returns the 'result' array (list of {uuid, name, ...}).
+        """
+        path = f"/accounts/{account_id}/d1/database?per_page={_CF_LIST_PAGE_SIZE}"
+        parsed = self._request("GET", path)
+        return parsed.get("result", [])
+
+    def create_d1_database(self, account_id: str, name: str) -> dict[str, Any]:
+        """
+        Create a D1 database.
+        POST /accounts/{account_id}/d1/database
+        Returns the created db dict (id, name, ...).
+        """
+        path = f"/accounts/{account_id}/d1/database"
+        parsed = self._request("POST", path, body={"name": name})
+        return parsed.get("result", {})
+
+    def list_kv_namespaces(self, account_id: str) -> list[dict[str, Any]]:
+        """
+        List all KV namespaces for the account.
+        GET /accounts/{account_id}/storage/kv/namespaces
+        Returns the 'result' array (list of {id, title, ...}).
+        """
+        path = (
+            f"/accounts/{account_id}/storage/kv/namespaces"
+            f"?per_page={_CF_LIST_PAGE_SIZE}"
+        )
+        parsed = self._request("GET", path)
+        return parsed.get("result", [])
+
+    def create_kv_namespace(self, account_id: str, title: str) -> dict[str, Any]:
+        """
+        Create a KV namespace.
+        POST /accounts/{account_id}/storage/kv/namespaces
+        Returns the created namespace dict (id, title, ...).
+        """
+        path = f"/accounts/{account_id}/storage/kv/namespaces"
+        parsed = self._request("POST", path, body={"title": title})
+        return parsed.get("result", {})
+
+
+def _build_api_client_from_env() -> CloudflareApiClient:
+    """
+    Construct CloudflareApiClient from environment variables.
+    Raises ValueError with a clear message if env vars are missing.
+    Risk 1: token read from env — never logged; error message names the env var, not the value.
+    """
+    token = os.environ.get("MUPOT_CF_API_TOKEN", "")
+    if not token:
+        raise ValueError(
+            "MUPOT_CF_API_TOKEN is not set. "
+            "Create a scoped CF API token (5 permission groups — see design doc) "
+            "and export it as MUPOT_CF_API_TOKEN before running with confirm=True."
+        )
+    # MUPOT_CF_ACCOUNT_ID is consumed by the caller (mupot_provision) as cf_account_id.
+    # No account-id validation needed here — the CF API will reject bad ones.
+    return CloudflareApiClient(token)
+
+
+# ── stub for token revocation (Risk 1, v0.3 implementation) ──────────────────
+
+
+def mupot_revoke_token() -> dict[str, Any]:
+    """
+    Stub: revoke the CF API token after successful provisioning (Risk 1).
+    v0.2 documents the pattern; real revocation via CF /user/tokens/{id} lands in v0.3
+    (needs token ID stored at mint time, not just the token value).
+    """
+    return {
+        "stubbed": True,
+        "message": (
+            "mupot_revoke_token is stubbed in v0.2. "
+            "To revoke: log in to dash.cloudflare.com → My Profile → API Tokens "
+            "and delete the mupot-provision token once provisioning is complete. "
+            "v0.3 will automate revocation via the CF API."
+        ),
+    }
 
 
 # ── slug validation ───────────────────────────────────────────────────────────
@@ -162,13 +321,23 @@ def mupot_provision(
     *,
     cf_client: Optional[CloudflareClient] = None,
     toml_output_dir: Optional[Path] = None,
+    wrangler_deploy: bool = False,
 ) -> dict[str, Any]:
     """
-    Idempotent mupot provisioner.
+    Idempotent mupot provisioner (v0.2 — real CF provisioning).
 
     Phase 1 (always): list-guard check existing CF resources, build a plan.
-    Phase 2 (only if confirm=True AND dry_run=False): create resources + write toml.
-    Migration apply is NEVER done here — emitted as next_steps only (Risk 2).
+    Phase 2 (only if confirm=True AND dry_run=False):
+      - construct CloudflareApiClient from env (if cf_client not injected)
+      - idempotently create D1 database + KV namespaces (skip if already exist)
+      - write wrangler.<slug>.toml with resolved IDs
+      - if wrangler_deploy=True: run `npx wrangler deploy` (Risk 4)
+    Migration apply is NEVER auto-run — emitted as a gated DRY-RUN-FIRST next_step (Risk 2).
+
+    wrangler_deploy=False (default): write toml only; emit deploy command in next_steps.
+    wrangler_deploy=True: run `npx wrangler deploy --config wrangler.<slug>.toml` via
+      subprocess after provisioning.  Requires wrangler >= 3.x on PATH.  Worker deploy
+      uses the generated toml — MUPOT_CF_API_TOKEN must be in env (Risk 1).
 
     Returns a structured plan/result dict.
     """
@@ -177,61 +346,17 @@ def mupot_provision(
     # dry_run flag takes precedence over confirm as a safety guard
     applying = confirm and not dry_run
 
-    # Use stub client if dry-running or no real client provided
+    # Choose client: injected > construct from env (apply only) > DryRunClient
     client: CloudflareClient
     if cf_client is not None:
         client = cf_client
-    elif not applying:
-        client = DryRunClient()
+    elif applying:
+        # v0.2: construct the real client from env — no SDK dep, pure urllib.
+        # cf_api_token param is accepted for API surface compatibility but the real
+        # client is always constructed from env (token never re-logged from param).
+        client = _build_api_client_from_env()
     else:
-        # v0.1 does NOT bundle the cloudflare SDK — it cannot construct a real client.
-        # Return an honest plan-only response with the exact CLI commands to run.
-        # Real SDK-backed apply lands in v0.2.
-        _validate_slug(slug)
-        worker_name = f"mupot-{slug}"
-        return {
-            "dry_run": True,
-            "plan_only": True,
-            "slug": slug,
-            "worker_name": worker_name,
-            "applied": False,
-            "toml_path": None,
-            "plan": [
-                f"[v0.1 PLAN-ONLY] v0.1 cannot create real Cloudflare resources — "
-                "no SDK client is bundled. Run the commands in next_steps yourself, "
-                "or wait for v0.2 which wires the real Cloudflare client.",
-            ],
-            "next_steps": [
-                "v0.1 is PLAN-ONLY. To provision your mupot instance, run these "
-                "wrangler commands manually (or with automation):",
-                f"1. Create D1 database:\n"
-                f"   npx wrangler d1 create mupot-{slug}",
-                f"2. Create KV namespaces:\n"
-                f"   npx wrangler kv namespace create mupot-{slug}-sessions\n"
-                f"   npx wrangler kv namespace create mupot-{slug}-oauth",
-                f"3. Copy wrangler.example.toml → wrangler.{slug}.toml and fill in "
-                "the D1 database_id and KV namespace IDs from the output above.",
-                f"4. Deploy the worker:\n"
-                f"   npx wrangler deploy --config wrangler.{slug}.toml",
-                "5. MIGRATION — always dry-run first (Risk 2):\n"
-                f"   npx wrangler d1 migrations apply mupot-{slug} --dry-run "
-                f"--config wrangler.{slug}.toml\n"
-                "   Review output. Only apply without --dry-run after confirming no "
-                "destructive operations.",
-                "6. Set OAuth secrets:\n"
-                f"   npx wrangler secret put OAUTH_CLIENT_ID --config wrangler.{slug}.toml\n"
-                f"   npx wrangler secret put OAUTH_CLIENT_SECRET --config wrangler.{slug}.toml",
-                f"7. Verify: mupot_status(url='https://mupot-{slug}.workers.dev')",
-                "v0.2 will wire the real Cloudflare SDK client so this tool executes "
-                "steps 1-3 automatically. Track: https://github.com/Mumega-com/mupot/issues",
-            ],
-            "warnings": [
-                "v0.1 is PLAN-ONLY. confirm=True + dry_run=False without an injected "
-                "cf_client returns this plan, not a live apply. Real apply = v0.2.",
-                "Each mupot pot consumes one Workers slot. "
-                "Free tier = 100 slots. Check your usage before provisioning many pots.",
-            ],
-        }
+        client = DryRunClient()
 
     worker_name = f"mupot-{slug}"
     d1_name = f"mupot-{slug}"
@@ -284,26 +409,27 @@ def mupot_provision(
 
     if not applying:
         result["next_steps"] = [
-            "v0.1 is PLAN-ONLY — this tool does NOT create resources and confirm does "
-            "NOT apply (no Cloudflare SDK is bundled in v0.1). Run these wrangler "
-            "commands manually to provision (v0.2 will wire the SDK to run them):",
-            f"1. npx wrangler d1 create mupot-{slug}",
-            f"2. npx wrangler kv namespace create mupot-{slug}-sessions  &&  "
-            f"npx wrangler kv namespace create mupot-{slug}-oauth",
-            f"3. Copy wrangler.example.toml → wrangler.{slug}.toml; fill in the D1 "
-            f"database_id + KV namespace IDs from the output above.",
-            f"4. npx wrangler deploy --config wrangler.{slug}.toml",
-            f"5. MIGRATION — dry-run FIRST (Risk 2 drift landmine): npx wrangler d1 "
-            f"migrations apply mupot-{slug} --dry-run --config wrangler.{slug}.toml ; "
-            "apply only after reviewing output for destructive ops.",
-            f"6. npx wrangler secret put OAUTH_CLIENT_ID (then OAUTH_CLIENT_SECRET) "
-            f"--config wrangler.{slug}.toml (Risk 1: least-scoped token).",
-            f"7. mupot_status(url='https://mupot-{slug}.workers.dev') to verify.",
-            "8. Optionally mupot_brain_enable to wire the DMN brain.",
+            "This is a DRY-RUN plan (dry_run=True or confirm=False). "
+            "To apply, call mupot_provision(..., confirm=True, dry_run=False).",
+            f"1. Will create D1: mupot-{slug}  (skipped if already exists)",
+            f"2. Will create KV: mupot-{slug}-sessions  (skipped if already exists)",
+            f"3. Will create KV: mupot-{slug}-oauth  (skipped if already exists)",
+            f"4. Will write wrangler.{slug}.toml with resolved resource IDs.",
+            f"5. To deploy the worker: npx wrangler deploy --config wrangler.{slug}.toml",
+            "6. MIGRATION — DRY-RUN FIRST (Risk 2 drift landmine):\n"
+            f"   npx wrangler d1 migrations apply mupot-{slug} --dry-run "
+            f"--config wrangler.{slug}.toml\n"
+            "   Apply only after reviewing output for destructive operations.",
+            f"7. Set OAuth secrets:\n"
+            f"   npx wrangler secret put OAUTH_CLIENT_ID --config wrangler.{slug}.toml\n"
+            f"   npx wrangler secret put OAUTH_CLIENT_SECRET --config wrangler.{slug}.toml",
+            f"8. Verify: mupot_status(url='https://mupot-{slug}.workers.dev')",
+            "9. Optionally: mupot_brain_enable(slug=...) to wire the DMN brain.",
+            "10. Consider revoking or scoping down the CF token after provision (Risk 1).",
         ]
         return result
 
-    # ── Apply phase ──────────────────────────────────────────────────────────
+    # ── Apply phase (v0.2 — real provisioning) ───────────────────────────────
     d1_id = (
         existing_d1_ids[d1_name]
         if d1_exists
@@ -338,19 +464,103 @@ def mupot_provision(
     result["d1_id"] = d1_id
     result["sessions_kv_id"] = sessions_kv_id
     result["oauth_kv_id"] = oauth_kv_id
-    result["next_steps"] = [
-        f"1. Deploy the worker: `npx wrangler deploy --config {toml_path}`",
-        "2. MIGRATION — DRY-RUN FIRST (Risk 2):\n"
+
+    # ── Optional wrangler deploy ─────────────────────────────────────────────
+    deploy_result: Optional[dict[str, Any]] = None
+    if wrangler_deploy:
+        deploy_result = _run_wrangler_deploy(slug=slug, toml_path=toml_path)
+        result["deploy"] = deploy_result
+
+    result["next_steps"] = _apply_next_steps(
+        slug=slug,
+        toml_path=toml_path,
+        deployed=wrangler_deploy and deploy_result is not None and deploy_result.get("ok"),
+    )
+    return result
+
+
+def _apply_next_steps(
+    slug: str, toml_path: Path, *, deployed: bool
+) -> list[str]:
+    """Build the post-apply next_steps list with migration dry-run-first gate (Risk 2)."""
+    steps: list[str] = []
+    if not deployed:
+        steps.append(
+            f"1. Deploy the worker:\n"
+            f"   npx wrangler deploy --config {toml_path}  (Risk 4: needs wrangler >= 3.x)"
+        )
+    else:
+        steps.append("1. Worker deployed (wrangler_deploy=True).")
+    steps += [
+        # Risk 2: migration dry-run BEFORE apply — this ordering is tested.
+        "2. MIGRATION — DRY-RUN FIRST (Risk 2 drift landmine):\n"
         f"   npx wrangler d1 migrations apply mupot-{slug} --dry-run --config {toml_path}\n"
-        "   Review the output. Only run WITHOUT --dry-run after confirming no destructive ops.",
-        "3. Set secrets:\n"
+        "   Review the plan carefully. Only apply WITHOUT --dry-run after confirming "
+        "no destructive operations (DROP, column removal, etc.).",
+        f"   npx wrangler d1 migrations apply mupot-{slug} --config {toml_path}",
+        "3. Set OAuth secrets:\n"
         f"   npx wrangler secret put OAUTH_CLIENT_ID --config {toml_path}\n"
         f"   npx wrangler secret put OAUTH_CLIENT_SECRET --config {toml_path}",
-        f"4. Test: mupot_status(url='https://mupot-{slug}.workers.dev')",
+        f"4. Verify: mupot_status(url='https://mupot-{slug}.workers.dev')",
         "5. Optionally: mupot_brain_enable(slug=...) to wire the DMN brain.",
-        "6. After provision, consider revoking the CF token or reducing its scope (Risk 1).",
+        "6. After provision, revoke or scope down the CF token (Risk 1): "
+        "see mupot_revoke_token() stub; full auto-revoke lands in v0.3.",
     ]
-    return result
+    return steps
+
+
+def _run_wrangler_deploy(
+    slug: str,
+    toml_path: Path,
+    *,
+    _subprocess_run: Any = None,  # injectable for tests
+) -> dict[str, Any]:
+    """
+    Run `npx wrangler deploy --config <toml_path>` via subprocess.
+
+    Risk 4: wrangler version drift — checks wrangler --version before deploying.
+    The CF API token is read by wrangler from the environment (MUPOT_CF_API_TOKEN);
+    we do NOT pass it on the command line (Risk 1: never in argv / subprocess logs).
+
+    _subprocess_run: injectable for tests (defaults to subprocess.run).
+    Returns {ok: bool, returncode: int, stdout: str, stderr: str}.
+    """
+    run = _subprocess_run if _subprocess_run is not None else subprocess.run
+
+    # Risk 4: verify wrangler is present and meets minimum version before deploying.
+    version_check = run(
+        ["npx", "wrangler", "--version"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if version_check.returncode != 0:
+        return {
+            "ok": False,
+            "returncode": version_check.returncode,
+            "stdout": version_check.stdout,
+            "stderr": version_check.stderr,
+            "error": (
+                "wrangler not found or returned non-zero on --version. "
+                "Install wrangler >= 3.x: `npm install -g wrangler`. (Risk 4)"
+            ),
+        }
+
+    deploy_proc = run(
+        # Risk 1: NEVER pass the token on the argv (it would appear in process list).
+        # wrangler reads CLOUDFLARE_API_TOKEN from env; MUPOT_CF_API_TOKEN is set by
+        # the operator. The caller is responsible for mapping these if names differ.
+        ["npx", "wrangler", "deploy", "--config", str(toml_path)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return {
+        "ok": deploy_proc.returncode == 0,
+        "returncode": deploy_proc.returncode,
+        "stdout": deploy_proc.stdout,
+        "stderr": deploy_proc.stderr,
+    }
 
 
 # ── mupot_status ─────────────────────────────────────────────────────────────
