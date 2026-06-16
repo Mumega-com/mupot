@@ -44,6 +44,7 @@ import { handleOAuthAuthorize, resolveExternalToken as memberKeyResolver } from 
 import { McpOAuthApiHandler } from './mcp/oauth-api-handler'
 import { brainPhysicsIngestApp } from './dashboard/brain-ingest'
 import { billingAdminApp } from './billing/admin'
+import { ccSpendApp } from './economy/cc-spend'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -100,6 +101,11 @@ app.route('/api/brain', brainPhysicsIngestApp)
 // writes the pot's plan_tier here, HMAC-verified by BILLING_PLAN_SECRET. Inbound,
 // machine-to-machine. Before the dashboard '/' catch-all.
 app.route('/api/billing', billingAdminApp)
+
+// Squad Anthropic spend ingest (#179): the server transcript rollup pushes the
+// squad's REAL Claude Code spend here, HMAC-verified by CC_SPEND_SECRET. Inbound,
+// machine-to-machine. Before the dashboard '/' catch-all.
+app.route('/api/economy', ccSpendApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp
