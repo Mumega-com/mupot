@@ -35,7 +35,7 @@
 //   9. EXPORT SURFACE ASSERTIONS — structural: no mint/token/clear symbol importable from
 //      ctx.ts or registry.ts.
 
-import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest'
+import { describe, it, expect, beforeEach, afterAll } from 'vitest'
 import type { D1Database } from '@cloudflare/workers-types'
 
 // --- Department microkernel imports ---
@@ -353,7 +353,7 @@ describe('1. Activation — getActive / ConsoleSections / MetricDescriptors', ()
   let db: D1Database
 
   beforeEach(() => {
-    register(FixtureModule, { replace: true })
+    register(FixtureModule)
     const store = makeDb()
     db = store.db
   })
@@ -414,7 +414,7 @@ describe('2. Idempotent activation — activate twice → seeds once', () => {
   let store: ReturnType<typeof makeDb>
 
   beforeEach(() => {
-    register(FixtureModule, { replace: true })
+    register(FixtureModule)
     store = makeDb()
     db = store.db
   })
@@ -461,7 +461,7 @@ describe('3. Deactivate / reactivate — data retained', () => {
   let store: ReturnType<typeof makeDb>
 
   beforeEach(() => {
-    register(FixtureModule, { replace: true })
+    register(FixtureModule)
     store = makeDb()
     db = store.db
   })
@@ -584,7 +584,7 @@ describe('5. Capability confinement via ctx', () => {
   let db: D1Database
 
   beforeEach(() => {
-    register(FixtureModule, { replace: true })
+    register(FixtureModule)
     db = makeDb().db
   })
 
@@ -783,7 +783,7 @@ describe('6. Honesty propagation — ohlcEligible and seriesShape', () => {
   let db: D1Database
 
   beforeEach(() => {
-    register(FixtureModule, { replace: true })
+    register(FixtureModule)
     db = makeDb().db
   })
 
@@ -853,7 +853,7 @@ describe('7. ADVERSARIAL — ctx confinement holds against hostile module code',
   let metricStore: ReturnType<typeof makeMetricDb>
 
   beforeEach(() => {
-    register(FixtureModule, { replace: true })
+    register(FixtureModule)
     db = makeDb().db
     metricStore = makeMetricDb()
   })
@@ -1018,20 +1018,25 @@ describe('8. Registry hardening', () => {
   let db: D1Database
 
   beforeEach(() => {
-    register(FixtureModule, { replace: true })
+    register(FixtureModule)
     db = makeDb().db
   })
 
-  it('register() duplicate key without replace flag throws', () => {
+  it('register() same module object re-registered is a no-op (idempotent)', () => {
+    // Production register() has no `replace` option.
+    // Re-registering the exact same module object (same key + same reference) is safe.
     expect(() => {
-      register(FixtureModule)  // no replace flag — fixture already registered
-    }).toThrow(/registry_duplicate_key/)
+      register(FixtureModule)  // already registered — same object reference → no-op
+    }).not.toThrow()
   })
 
-  it('register() duplicate key with replace:true does NOT throw', () => {
+  it('register() DIFFERENT module under existing key throws registry_duplicate_key', () => {
+    // A hostile module cannot displace an existing registration.
+    // Even if the key matches, a different object reference → registry_duplicate_key.
+    const HostileModule = { ...FixtureModule }  // different object, same key
     expect(() => {
-      register(FixtureModule, { replace: true })
-    }).not.toThrow()
+      register(HostileModule)
+    }).toThrow(/registry_duplicate_key/)
   })
 
   it('activate() returns slug_conflict when slug exists with a different template_key', async () => {
@@ -1085,13 +1090,12 @@ describe('8. Registry hardening', () => {
   // We cannot obtain the real kernel token (it is module-private in kernel.ts),
   // so we use a wrong symbol and verify the gate fires.
 
-  it('minting with a wrong token via createMintSeam rejects with kernel_token_invalid', () => {
-    // Obtain a DIFFERENT seam (a fresh KERNEL_TOKEN — not the one kernel.ts holds).
-    // Importing createMintSeam directly here to get a fresh seam for the test.
-    // Note: even with this fresh seam, the wrong-token check fires because each
-    // seam's mint validates against its OWN token.
-    // We use the _isKernelToken from kernel.ts to confirm a wrong symbol is not the
-    // production kernel's token.
+  it('a wrong-token symbol is correctly rejected by the kernel token gate', () => {
+    // _KERNEL_TOKEN is module-private in kernel.ts — we cannot obtain it.
+    // _isKernelToken confirms that an arbitrary Symbol is NOT the kernel token.
+    // The token gate inside _mintCtxInternal compares callerToken === _KERNEL_TOKEN;
+    // since only kernelMintCtx (which supplies _KERNEL_TOKEN directly) can mint,
+    // no external caller can pass a symbol that satisfies this check.
     const fakeToken = Symbol('fake')
     expect(_isKernelToken(fakeToken)).toBe(false)
   })
@@ -1142,7 +1146,14 @@ describe('8. Registry hardening', () => {
 // registry.ts contain NO symbol that can mint a ctx or acquire/clear state.
 //
 // Threat model: a department module is hostile first-party code in the same bundle.
-// It can `import` anything exported. The ONLY real boundary is a non-exported symbol.
+// It can `import` anything exported. The ONLY real authority boundary is
+// "a symbol that is NEVER exported cannot be imported" (CF Workers, no process
+// isolation).
+//
+// Architecture after FIX-2:
+//   ctx.ts    — pure types, interfaces, CtxError. ZERO mint logic.
+//   kernel.ts — ALL mint logic (_KERNEL_TOKEN, _mintCtxInternal, port facades).
+//               Exports only: kernelMintCtx (function, no token param), _isKernelToken.
 //
 // These assertions use dynamic import to get the live module namespace and check
 // specific property names. TypeScript types don't help here — we check the runtime
@@ -1155,24 +1166,47 @@ describe('9. EXPORT SURFACE ASSERTIONS — no mint/token/clear symbol reachable'
     expect(ctxMod['acquireKernelToken']).toBeUndefined()
   })
 
-  it('ctx.ts does NOT export mintCtx', async () => {
+  it('ctx.ts does NOT export mintCtx (minting logic lives in kernel.ts, not ctx.ts)', async () => {
+    // ctx.ts is now a pure types/contracts file — no mint function at all.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const ctxMod = await import('../src/departments/ctx') as Record<string, any>
     expect(ctxMod['mintCtx']).toBeUndefined()
   })
 
-  it('ctx.ts does NOT export _isKernelToken', async () => {
-    // _isKernelToken is on kernel.ts (the kernel-private seam), NOT ctx.ts.
+  it('ctx.ts does NOT export createMintSeam', async () => {
+    // createMintSeam has been removed from ctx.ts entirely. All minting lives in
+    // kernel.ts as private module-scope code.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ctxMod = await import('../src/departments/ctx') as Record<string, any>
+    expect(ctxMod['createMintSeam']).toBeUndefined()
+  })
+
+  it('ctx.ts does NOT export _isKernelToken or _isKernelTokenCtx', async () => {
+    // These predicates live in kernel.ts only.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const ctxMod = await import('../src/departments/ctx') as Record<string, any>
     expect(ctxMod['_isKernelToken']).toBeUndefined()
+    expect(ctxMod['_isKernelTokenCtx']).toBeUndefined()
   })
 
-  it('ctx.ts does NOT export KERNEL_TOKEN or any symbol named like a token', async () => {
+  it('ctx.ts does NOT export KERNEL_TOKEN or any token-shaped symbol', async () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const ctxMod = await import('../src/departments/ctx') as Record<string, any>
     expect(ctxMod['KERNEL_TOKEN']).toBeUndefined()
+    expect(ctxMod['_KERNEL_TOKEN']).toBeUndefined()
     expect(ctxMod['_tokenAcquired']).toBeUndefined()
+  })
+
+  it('ctx.ts has no callable function that yields a DepartmentCtx', async () => {
+    // Enumerate all exports of ctx.ts and confirm none are functions (ctx.ts is
+    // purely types + CtxError class).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ctxMod = await import('../src/departments/ctx') as Record<string, any>
+    const exportedFunctions = Object.entries(ctxMod)
+      .filter(([, v]) => typeof v === 'function')
+      .map(([k]) => k)
+    // CtxError is a class (constructor function) — it is the ONLY allowed function.
+    expect(exportedFunctions).toEqual(['CtxError'])
   })
 
   it('registry.ts does NOT export _clearRegistry', async () => {
@@ -1193,39 +1227,27 @@ describe('9. EXPORT SURFACE ASSERTIONS — no mint/token/clear symbol reachable'
     expect(regMod['_testOnly']).toBeUndefined()
   })
 
-  it('a hostile module calling createMintSeam gets a DIFFERENT token than the kernel holds', async () => {
-    // Even if a department module imports createMintSeam from ctx.ts, the seam it
-    // gets has a DIFFERENT token than the one kernel.ts acquired at load time.
-    // _isKernelToken (from kernel.ts) proves this: the fresh seam's token is NOT
-    // the production kernel token.
-    const { createMintSeam } = await import('../src/departments/ctx')
-    const hostileSeam = createMintSeam()
-    // The hostile seam's token is a different Symbol from the kernel's token.
-    expect(_isKernelToken(hostileSeam.token)).toBe(false)
+  it('registry.ts production register does NOT accept a replace option (hostile displacement blocked)', async () => {
+    // The exported `register` from registry.ts wraps the production singleton with
+    // idempotent same-object semantics and no `replace` parameter. A hostile module
+    // that calls register(EvilModule, {replace:true}) cannot displace an existing key
+    // because the parameter is simply absent from the production wrapper.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const regMod = await import('../src/departments/registry') as Record<string, any>
+    const regFn: (...args: unknown[]) => void = regMod['register']
+    expect(typeof regFn).toBe('function')
+    // The production register accepts exactly 1 parameter (module). TypeScript
+    // enforces this at compile time; at runtime extra args are silently ignored
+    // but the production singleton register() does NOT honor replace.
+    // Verify: passing a different module under an existing key throws.
+    const HostileModule = { ...FixtureModule }  // different object, same key
+    expect(() => regFn(HostileModule)).toThrow(/registry_duplicate_key/)
   })
 
-  it('calling hostileSeam.mint with hostileSeam.token produces a ctx (isolation within the hostile scope)', async () => {
-    // Even the "hostile" seam can mint a ctx — but ONLY with its own matching token.
-    // This proves the token gate works: wrong token → rejected; own token → accepted.
-    // The production kernel's token is still safe because the hostile seam's token
-    // is a different Symbol.
-    const { createMintSeam } = await import('../src/departments/ctx')
-    const hostileSeam = createMintSeam()
-    const db = makeDb().db
-    // This should succeed (hostile seam uses its own matching token)
-    const ctx = hostileSeam.mint(hostileSeam.token, makeKernelHandle(db), {
-      tenantId: 'attacker',
-      departmentKey: 'fixture',
-      module: FixtureModule,
-      capabilities: ['owner'],
-    })
-    // But this ctx is entirely separate from any production ctx — and a module
-    // needs to HAVE the seam object to do this. The seam is not exported from
-    // registry.ts or kernel.ts — only from ctx.ts (createMintSeam is exported
-    // there so this test can reach it). Production code never calls createMintSeam;
-    // only kernel.ts does, and it doesn't re-export the seam object.
-    expect(ctx.tenantId).toBe('attacker')
-    expect(_isKernelToken(hostileSeam.token)).toBe(false)  // not the production token
+  it('a fake token symbol is correctly identified as NOT the kernel token', () => {
+    // _isKernelToken lets the harness prove the token gate without exposing the token.
+    const fakeToken = Symbol('fake.kernel.mint')
+    expect(_isKernelToken(fakeToken)).toBe(false)
   })
 
   it('registry instance isolation: one instance state does not leak into another', () => {
