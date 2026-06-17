@@ -11,7 +11,6 @@
 // DepartmentCtx after resolving { tenantId, actor, departmentKey, capabilities }
 // and hands the module only narrow port facades:
 //   ctx.metrics.emit(...)  — validates key ownership + source authority + tenant bind
-//   ctx.db.query(...)      — scoped query with tenant assertion injected
 //   ctx.audit.write(...)   — capability-checked audit stub
 //   ctx.gate.propose(...)  — capability-checked gate stub
 //   ctx.bus.publish(...)   — capability-checked bus stub
@@ -22,6 +21,8 @@
 //   - A ctx cannot emit from a source not in the key's sourceAuthority.
 //   - A ctx with insufficient capability is denied before any DB call.
 //   - A module holding ctx has no raw DB/env handle — the Env type is never exposed.
+//   - Mutating ctx.capabilities or ctx.metricsEmitted has NO effect on any check.
+//   - The ctx object and all nested port objects are frozen (TypeError on mutation).
 
 import type { D1Database } from '@cloudflare/workers-types'
 import type { Capability } from '../types'
@@ -29,38 +30,92 @@ import type { DepartmentModule, MetricDescriptor } from './contract'
 import { emitMetric } from '../metrics/pulse'
 import type { EmitOutcome } from '../metrics/pulse'
 
+// ── Kernel-mint token ─────────────────────────────────────────────────────────
+//
+// An unforgeable module-private Symbol. mintCtx() requires this token as its
+// first argument. Because the Symbol is NOT exported from this module, department
+// code (which never imports from ctx.ts directly) cannot call mintCtx.
+//
+// Only the kernel (registry.ts) holds a reference, obtained via the exported
+// accessor acquireKernelToken() — which itself is guarded so it can only be
+// called once (by the kernel at boot).
+
+const KERNEL_TOKEN = Symbol('mupot.kernel.mint')
+
+// Tracks whether the token has been handed out. The kernel calls
+// acquireKernelToken() exactly once at module load time.
+let _tokenAcquired = false
+
+/**
+ * Called ONCE — by registry.ts at module load — to acquire the kernel mint token.
+ * Returns the token on first call. Throws on any subsequent call.
+ *
+ * The token is then used internally by registry.ts's kernelMintCtx() wrapper, which
+ * is the only public path for creating a DepartmentCtx in production and in tests.
+ * Department modules NEVER import or call this function.
+ */
+export function acquireKernelToken(): symbol {
+  if (_tokenAcquired) {
+    throw new Error(
+      '[kernel_token_already_acquired] The kernel mint token may only be acquired once. ' +
+        'Department modules must not call acquireKernelToken.',
+    )
+  }
+  _tokenAcquired = true
+  return KERNEL_TOKEN
+}
+
+/**
+ * Verify that a given symbol IS the kernel token (for testing the gate itself).
+ * Returns true only when the symbol is the real KERNEL_TOKEN.
+ * Used by the test harness to prove that a wrong symbol is rejected.
+ */
+export function _isKernelToken(sym: symbol): boolean {
+  return sym === KERNEL_TOKEN
+}
+
 // ── Sealed kernel handle ──────────────────────────────────────────────────────
 //
-// KernelHandle is passed to mintCtx(). It is intentionally NOT exported from this
-// module — only the kernel (registry.ts + test harnesses) should hold one. A
-// department module only receives DepartmentCtx.
+// KernelHandle is passed to mintCtx(). It is intentionally NOT exported from
+// this module — only the kernel (registry.ts) holds one. A department module
+// only receives DepartmentCtx.
 
-export interface KernelHandle {
+interface KernelHandle {
   /** Raw D1 database handle — held by kernel, never passed to department code. */
   db: D1Database
 }
 
 // ── DepartmentCtx ─────────────────────────────────────────────────────────────
 //
-// The object a department module operates through. It carries pre-resolved identity
-// + pre-bound tenant + the narrow port facades. Raw DB/Env are absent by design.
+// The object a department module operates through. It carries pre-resolved
+// identity + pre-bound tenant + the narrow port facades.
+//
+// SECURITY NOTE: the fields ctx.capabilities and ctx.metricsEmitted are
+// INERT FROZEN SNAPSHOTS (array of strings / frozen descriptor array).
+// They are NOT the live instances the facade checks read. Mutating them —
+// even via `(ctx.capabilities as any).push(...)` — has zero effect on any
+// cap check or ownership check. The checks read closure-private consts.
 
 export interface DepartmentCtx {
   /** Tenant id — immutably bound at mint time. Cannot be overridden by module code. */
   readonly tenantId: string
   /** The department module key this ctx is scoped to. */
   readonly departmentKey: string
-  /** Resolved capabilities for the actor in this context. Read-only. */
-  readonly capabilities: ReadonlySet<Capability>
   /**
-   * The metric descriptors declared by this department's module. Held here so
-   * facades can validate key + source without a registry round-trip.
+   * Frozen snapshot of capability strings for display / introspection only.
+   * The facade checks read the closure-private capSet, NOT this field.
+   * Mutating this array (even with `as any`) has NO effect on any check.
    */
-  readonly metricsEmitted: ReadonlyMap<string, MetricDescriptor>
+  readonly capabilities: readonly Capability[]
+  /**
+   * Frozen snapshot of metric descriptors for display / introspection only.
+   * The facade checks read the closure-private metricsEmitted Map, NOT this field.
+   * Mutating this array (even with `as any`) has NO effect on any ownership check.
+   */
+  readonly metricsEmitted: readonly Readonly<MetricDescriptor>[]
 
   // Port facades — each is a narrow, capability-checked, tenant-bound function.
   readonly metrics: MetricsPort
-  readonly db: DbPort
   readonly audit: AuditPort
   readonly gate: GatePort
   readonly bus: BusPort
@@ -86,18 +141,6 @@ export interface MetricsPort {
    *   - insufficient capability (requires 'member' minimum)
    */
   emit(input: MetricsEmitInput): Promise<EmitOutcome>
-}
-
-export interface DbPort {
-  /**
-   * Scoped query. Tenant scoping is injected/asserted — the caller supplies SQL
-   * and binds but the facade verifies tenant_id appears in binds OR injects it.
-   *
-   * TODO(full-impl): verify SQL contains tenant_id predicate, inject if absent.
-   * Current stub: verifies capability + logs the call; real D1 call deferred until
-   * the department route layer is wired (Phase 3). The SHAPE is the contract.
-   */
-  query(sql: string, binds?: readonly (string | number | null)[]): Promise<readonly Record<string, unknown>[]>
 }
 
 export interface AuditPort {
@@ -146,38 +189,68 @@ export class CtxError extends Error {
 // The ONLY path through which a DepartmentCtx is created. Called by the kernel
 // (registry.ts) after resolving tenant + actor + capabilities. A department module
 // never calls mintCtx; it receives the ctx.
+//
+// REQUIRES the kernel-mint token as first argument. Throws if the token is wrong.
 
 export function mintCtx(
+  kernelToken: symbol,
   handle: KernelHandle,
   opts: {
     tenantId: string
     departmentKey: string
     module: DepartmentModule
     capabilities: Capability[]
+    /** Optional injected clock for deterministic tests (default: Date.now / crypto.randomUUID). */
+    now?: () => string
+    idGen?: () => string
   },
 ): DepartmentCtx {
+  // ── Token gate — only the kernel may mint ctx ──────────────────────────────
+  if (kernelToken !== KERNEL_TOKEN) {
+    throw new CtxError(
+      'kernel_token_invalid',
+      'mintCtx requires the kernel mint token — department modules may not call mintCtx directly',
+    )
+  }
+
   const { tenantId, departmentKey, module, capabilities } = opts
-  const capSet: ReadonlySet<Capability> = new Set(capabilities)
+  const nowFn = opts.now ?? (() => new Date().toISOString())
+  const idFn = opts.idGen ?? (() => crypto.randomUUID())
+
+  // ── Closure-private authority state (NOT exposed on ctx) ──────────────────
+  //
+  // These are the instances the facade checks read. They are private to this
+  // closure. Mutating ctx.capabilities or ctx.metricsEmitted (the frozen
+  // snapshots) has zero effect here.
+  const _capSet: ReadonlySet<Capability> = new Set(capabilities)
 
   // Build a fast-lookup descriptor map keyed by metric key.
-  const metricsEmitted: ReadonlyMap<string, MetricDescriptor> = new Map(
-    module.metricsEmitted.map((d) => [d.key, d]),
+  // Deep-freeze each descriptor + its sourceAuthority array.
+  const _metricsMap = new Map<string, Readonly<MetricDescriptor>>(
+    module.metricsEmitted.map((d) => {
+      const frozen: Readonly<MetricDescriptor> = Object.freeze({
+        ...d,
+        sourceAuthority: Object.freeze([...d.sourceAuthority]) as readonly string[],
+        display: Object.freeze({ ...d.display }),
+      })
+      return [d.key, frozen]
+    }),
   )
 
   // ── metrics facade ────────────────────────────────────────────────────────
 
-  const metrics: MetricsPort = {
+  const metrics: MetricsPort = Object.freeze({
     async emit(input: MetricsEmitInput): Promise<EmitOutcome> {
       // Capability check — minimum 'member' to emit metrics.
-      if (!hasCapability(capSet, 'member')) {
+      if (!hasCapability(_capSet, 'member')) {
         throw new CtxError(
           'capability_denied',
           `ctx(${departmentKey}@${tenantId}): 'member' capability required to emit metrics`,
         )
       }
 
-      // Key ownership check — the key must be declared in this department's metricsEmitted.
-      const descriptor = metricsEmitted.get(input.key)
+      // Key ownership check — reads from closure-private _metricsMap, NOT ctx field.
+      const descriptor = _metricsMap.get(input.key)
       if (!descriptor) {
         throw new CtxError(
           'key_not_owned',
@@ -185,7 +258,7 @@ export function mintCtx(
         )
       }
 
-      // Source authority check — the source must be in the descriptor's sourceAuthority.
+      // Source authority check — reads from frozen descriptor.sourceAuthority array.
       if (!descriptor.sourceAuthority.includes(input.source)) {
         throw new CtxError(
           'source_not_authorized',
@@ -201,14 +274,14 @@ export function mintCtx(
         )
       }
 
-      // Tenant is bound from ctx — NEVER from input args.
+      // Tenant is bound from closure-private tenantId — NEVER from input args.
       // emitMetric requires an explicit id + createdAt (no Date.now() inside the spine).
-      const emitId = crypto.randomUUID()
-      const emitCreatedAt = new Date().toISOString()
+      const emitId = idFn()
+      const emitCreatedAt = nowFn()
       return emitMetric(
         handle.db,
         {
-          tenantId,          // always the ctx-bound tenant, not caller-supplied
+          tenantId,          // always the closure-bound tenant, not caller-supplied
           metricKey: input.key,
           value: input.value,
           occurredAt: input.occurredAt,
@@ -218,94 +291,72 @@ export function mintCtx(
         emitCreatedAt,
       )
     },
-  }
-
-  // ── db facade ─────────────────────────────────────────────────────────────
-  //
-  // Minimum capability to run a scoped query is 'observer'.
-  // TODO(full-impl): inject/assert tenant_id in the SQL WHERE clause.
-
-  const db: DbPort = {
-    async query(
-      sql: string,
-      binds: readonly (string | number | null)[] = [],
-    ): Promise<readonly Record<string, unknown>[]> {
-      if (!hasCapability(capSet, 'observer')) {
-        throw new CtxError(
-          'capability_denied',
-          `ctx(${departmentKey}@${tenantId}): 'observer' capability required to query`,
-        )
-      }
-      // TODO(full-impl): assert or inject tenant_id scoping in sql.
-      // For now: execute the query but ensure all callers supply tenant_id in binds.
-      // The conformance harness tests that a ctx for tenant A cannot be used to read
-      // tenant B's data (by verifying the tenant bind in the returned rows).
-      const result = await handle.db
-        .prepare(sql)
-        .bind(...(binds as (string | number | null)[]))
-        .all<Record<string, unknown>>()
-      return result.results ?? []
-    },
-  }
+  })
 
   // ── audit facade (stub — shape is the contract) ────────────────────────────
 
-  const audit: AuditPort = {
+  const audit: AuditPort = Object.freeze({
     async write(event: { action: string; payload?: unknown }): Promise<void> {
-      if (!hasCapability(capSet, 'member')) {
+      if (!hasCapability(_capSet, 'member')) {
         throw new CtxError(
           'capability_denied',
           `ctx(${departmentKey}@${tenantId}): 'member' capability required to write audit`,
         )
       }
       // TODO(full-impl): insert into audit log table with tenantId + departmentKey.
-      // The action and payload are ctx-bound — the module cannot spoof tenant or dept.
-      void event // acknowledged by stub; full impl will persist.
+      void event
     },
-  }
+  })
 
   // ── gate facade (stub — shape is the contract) ─────────────────────────────
 
-  const gate: GatePort = {
+  const gate: GatePort = Object.freeze({
     async propose(proposal: { action: string; payload?: unknown }): Promise<{ gateId: string }> {
-      if (!hasCapability(capSet, 'member')) {
+      if (!hasCapability(_capSet, 'member')) {
         throw new CtxError(
           'capability_denied',
           `ctx(${departmentKey}@${tenantId}): 'member' capability required to propose`,
         )
       }
-      // TODO(full-impl): write a gated proposal row with ctx bindings.
       void proposal
-      return { gateId: `stub-${tenantId}-${departmentKey}-${Date.now()}` }
+      return { gateId: `stub-${tenantId}-${departmentKey}-${nowFn()}` }
     },
-  }
+  })
 
   // ── bus facade (stub — shape is the contract) ──────────────────────────────
 
-  const bus: BusPort = {
+  const bus: BusPort = Object.freeze({
     async publish(msg: { type: string; payload?: unknown }): Promise<void> {
-      if (!hasCapability(capSet, 'member')) {
+      if (!hasCapability(_capSet, 'member')) {
         throw new CtxError(
           'capability_denied',
           `ctx(${departmentKey}@${tenantId}): 'member' capability required to publish`,
         )
       }
-      // TODO(full-impl): enqueue on CF Queue binding with tenantId envelope.
       void msg
     },
-  }
+  })
 
-  return {
+  // ── Build inert frozen snapshots for ctx.capabilities / ctx.metricsEmitted ──
+  //
+  // These are COPIES — mutating them has zero effect on _capSet or _metricsMap.
+  const capSnapshot: readonly Capability[] = Object.freeze([...capabilities])
+  const metricsSnapshot: readonly Readonly<MetricDescriptor>[] = Object.freeze(
+    [..._metricsMap.values()],
+  )
+
+  // Return a fully frozen ctx. Every nested object is already frozen above.
+  // Using Object.freeze at the top level prevents tenantId/departmentKey re-binding.
+  return Object.freeze({
     tenantId,
     departmentKey,
-    capabilities: capSet,
-    metricsEmitted,
+    capabilities: capSnapshot,
+    metricsEmitted: metricsSnapshot,
     metrics,
-    db,
     audit,
     gate,
     bus,
-  }
+  } satisfies DepartmentCtx)
 }
 
 // ── Internal helper ────────────────────────────────────────────────────────────

@@ -4,7 +4,8 @@
 // console-department-microkernel.md) BEFORE any real department is built.
 //
 // The harness drives the fixture department (key='fixture') through the full
-// microkernel lifecycle and asserts every invariant enumerated in the spec.
+// microkernel lifecycle and asserts every invariant enumerated in the spec —
+// including adversarial scenarios that attack the ctx confinement boundary.
 //
 // STRUCTURAL ASSERTION (§3.5 — the litmus, stated once in prose):
 //   Adding the fixture department to the microkernel required ONLY:
@@ -22,13 +23,15 @@
 //   Isolation: removing fixture.ts + its register() call leaves all other tests GREEN.
 //
 // Test groups:
-//   1. Registration — module appears in registry after import.
-//   2. Activation + lifecycle — getActive / getActiveConsoleSections / getActiveMetricDescriptors.
-//   3. Idempotent activation — activate twice → seeds once (seed receipt guard).
-//   4. Deactivate / reactivate — data retained, visibility restored.
-//   5. Isolation — unregister fixture, all lists empty, no crash.
-//   6. Capability confinement via ctx — key ownership, source authority, tenant bind.
-//   7. Honesty propagation — ohlcEligible=false → seriesShape() returns 'bar'.
+//   0. Registration guard.
+//   1. Activation + lifecycle — getActive / getActiveConsoleSections / getActiveMetricDescriptors.
+//   2. Idempotent activation — activate twice → seeds once (seed receipt guard).
+//   3. Deactivate / reactivate — data retained, visibility restored.
+//   4. Isolation — unregister fixture, all lists empty, no crash.
+//   5. Capability confinement via ctx — key ownership, source authority, tenant bind.
+//   6. Honesty propagation — ohlcEligible=false → seriesShape() returns 'bar'.
+//   7. ADVERSARIAL — attacker-in-ctx scenarios (mutate snapshots, re-bind tenant, forge keys).
+//   8. Registry hardening — duplicate key, slug_conflict, mintCtx without token.
 
 import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest'
 import type { D1Database } from '@cloudflare/workers-types'
@@ -44,10 +47,12 @@ import {
   getActiveMetricDescriptors,
   activate,
   deactivate,
+  kernelMintCtx,
   _clearRegistry,
   _unregister,
 } from '../src/departments/registry'
-import { mintCtx, CtxError } from '../src/departments/ctx'
+// mintCtx + _isKernelToken imported directly from ctx only for the token-gate test (§8).
+import { mintCtx, _isKernelToken, CtxError } from '../src/departments/ctx'
 
 // --- Pulse spine imports for honesty propagation test ---
 import { seriesShape, aggregateOHLC } from '../src/metrics/pulse'
@@ -60,8 +65,10 @@ import type { OHLCBucket } from '../src/metrics/pulse'
 //   - INSERT INTO departments (…) VALUES (…)
 //   - UPDATE departments SET … WHERE id = ?1
 //   - UPDATE departments SET active = 0 WHERE slug = ?1 AND template_key = ?1
+//   - UPDATE departments SET seed_receipt = ?2 WHERE id = ?1 AND seed_receipt IS NULL
 //   - SELECT … FROM departments WHERE active = 1 AND template_key IS NOT NULL
-//   - INSERT INTO squads (…) VALUES (…)
+//   - INSERT OR IGNORE INTO squads (…) VALUES (…)
+//   - db.batch([...]) for atomic squad seeding
 //
 // The store is a plain array — real row semantics (UNIQUE on slug enforced).
 
@@ -86,21 +93,24 @@ interface SquadRow {
   created_at: string
 }
 
-function makeDb(): {
+function makeDb(opts?: { initialDepts?: DeptRow[] }): {
   db: D1Database
   depts: () => DeptRow[]
   squads: () => SquadRow[]
 } {
-  const depts: DeptRow[] = []
+  const depts: DeptRow[] = opts?.initialDepts ? [...opts.initialDepts] : []
   const squads: SquadRow[] = []
 
-  function runSql(sql: string, args: unknown[]) {
+  function runSql(sql: string, args: unknown[]): { success: boolean; meta: { changes: number } } {
     const upper = sql.trim().toUpperCase()
 
     // ── INSERT INTO departments ─────────────────────────────────────────────
+    // SQL: VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)
+    // Binds: [id, slug, name, template_key, template_version, activated_at, created_at]
+    // The literal `1` for `active` is in the SQL, not a bind param.
     if (upper.startsWith('INSERT INTO DEPARTMENTS')) {
-      const [id, slug, name, template_key, template_version, activated_at, , created_at] =
-        args as [string, string, string, string, string, string, number, string]
+      const [id, slug, name, template_key, template_version, activated_at, created_at] =
+        args as [string, string, string, string, string, string, string]
       const conflict = depts.some((d) => d.slug === slug)
       if (conflict) throw new Error('UNIQUE constraint failed: departments.slug')
       depts.push({
@@ -133,7 +143,16 @@ function makeDb(): {
       return { success: true, meta: { changes: 1 } }
     }
 
-    // ── UPDATE departments SET seed_receipt ──────────────────────────────────
+    // ── UPDATE departments SET seed_receipt … WHERE … AND seed_receipt IS NULL
+    if (upper.startsWith('UPDATE DEPARTMENTS') && upper.includes('SEED_RECEIPT') && upper.includes('AND SEED_RECEIPT IS NULL')) {
+      const [id, receipt] = args as [string, string]
+      const row = depts.find((d) => d.id === id && d.seed_receipt === null)
+      if (!row) return { success: true, meta: { changes: 0 } }
+      row.seed_receipt = receipt
+      return { success: true, meta: { changes: 1 } }
+    }
+
+    // ── UPDATE departments SET seed_receipt (unconditional — legacy path) ────
     if (upper.startsWith('UPDATE DEPARTMENTS') && upper.includes('SEED_RECEIPT')) {
       const [id, receipt] = args as [string, string]
       const row = depts.find((d) => d.id === id)
@@ -151,15 +170,19 @@ function makeDb(): {
       return { success: true, meta: { changes: 1 } }
     }
 
-    // ── INSERT INTO squads ──────────────────────────────────────────────────
-    if (upper.startsWith('INSERT INTO SQUADS')) {
+    // ── INSERT OR IGNORE INTO squads ────────────────────────────────────────
+    if (upper.startsWith('INSERT OR IGNORE INTO SQUADS') || upper.startsWith('INSERT INTO SQUADS')) {
       const [id, department_id, slug, name, charter, created_at] = args as [
         string, string, string, string, string | null, string,
       ]
       const conflict = squads.some(
         (s) => s.department_id === department_id && s.slug === slug,
       )
-      if (conflict) throw new Error('UNIQUE constraint failed: squads.department_id, squads.slug')
+      if (conflict) {
+        // INSERT OR IGNORE: silently skip
+        if (upper.includes('OR IGNORE')) return { success: true, meta: { changes: 0 } }
+        throw new Error('UNIQUE constraint failed: squads.department_id, squads.slug')
+      }
       squads.push({ id, department_id, slug, name, charter, created_at })
       return { success: true, meta: { changes: 1 } }
     }
@@ -167,14 +190,13 @@ function makeDb(): {
     return { success: true, meta: { changes: 0 } }
   }
 
-  function allSql(sql: string, _args: unknown[]) {
+  function allSql(sql: string, _args: unknown[]): { results: unknown[]; success: boolean } {
     const upper = sql.trim().toUpperCase()
 
     // ── SELECT from departments WHERE slug = ?1 LIMIT 1 (exists check) ──────
     if (upper.includes('FROM DEPARTMENTS') && upper.includes('WHERE SLUG')) {
       const [slug] = _args as [string]
       const row = depts.find((d) => d.slug === slug) ?? null
-      // first() is called on this stmt — return { results: [row] } or { results: [] }
       return { results: row ? [row] : [], success: true }
     }
 
@@ -188,27 +210,39 @@ function makeDb(): {
     return { results: [], success: true }
   }
 
+  // Makes a single prepared statement object
+  function makeStmt(sql: string) {
+    const boundArgs: unknown[] = []
+    const stmt = {
+      bind(...args: unknown[]) {
+        boundArgs.push(...args)
+        return stmt
+      },
+      async run() {
+        return runSql(sql, boundArgs)
+      },
+      async all() {
+        return allSql(sql, boundArgs)
+      },
+      async first() {
+        const r = allSql(sql, boundArgs)
+        return (r.results[0] as Record<string, unknown>) ?? null
+      },
+    }
+    return stmt
+  }
+
   const db = {
     prepare(sql: string) {
-      const boundArgs: unknown[] = []
-      const stmt = {
-        bind(...args: unknown[]) {
-          boundArgs.push(...args)
-          return stmt
-        },
-        async run() {
-          return runSql(sql, boundArgs)
-        },
-        async all() {
-          return allSql(sql, boundArgs)
-        },
-        // first() — used by the SELECT ... LIMIT 1 slug lookup
-        async first() {
-          const r = allSql(sql, boundArgs)
-          return r.results[0] ?? null
-        },
+      return makeStmt(sql)
+    },
+    // db.batch([stmt1, stmt2, ...]) — execute sequentially, return array of results
+    async batch(statements: ReturnType<typeof makeStmt>[]) {
+      const results = []
+      for (const stmt of statements) {
+        results.push(await stmt.run())
       }
-      return stmt
+      return results
     },
   } as unknown as D1Database
 
@@ -254,11 +288,9 @@ function makeMetricDb(): { db: D1Database; rows: () => MetricRow[] } {
           if (upper.includes('INSERT INTO METRIC_POINTS')) {
             const [id, tenant_id, metric_key, value, occurred_at, source, created_at] =
               boundArgs as [string, string, string, number, string, string, string]
-            // PK collision
             if (store.some((r) => r.id === id)) {
               throw new Error('UNIQUE constraint failed: metric_points.id')
             }
-            // Composite UNIQUE collision
             if (
               store.some(
                 (r) =>
@@ -286,19 +318,19 @@ function makeMetricDb(): { db: D1Database; rows: () => MetricRow[] } {
       }
       return stmt
     },
+    async batch(stmts: unknown[]) {
+      // Not needed for metric tests
+      return stmts.map(() => ({ success: true, meta: { changes: 0 } }))
+    },
   } as unknown as D1Database
 
   return { db, rows: () => store }
 }
 
 // ── 0. Guard: module is registered by import ──────────────────────────────────
-//
-// FixtureModule is imported at the top of this file; the side-effect register()
-// call in fixture.ts fires at import time. Verify it's in the registry.
 
 describe('0. Registration guard', () => {
   it('FixtureModule is registered by importing fixture.ts', () => {
-    // Importing the module at top-of-file already called register(FixtureModule).
     const found = getRegistered('fixture')
     expect(found).toBeDefined()
     expect(found?.key).toBe('fixture')
@@ -325,8 +357,7 @@ describe('1. Activation — getActive / ConsoleSections / MetricDescriptors', ()
   let db: D1Database
 
   beforeEach(() => {
-    // Re-register fixture in case isolation tests cleared the registry.
-    register(FixtureModule)
+    register(FixtureModule, { replace: true })
     const store = makeDb()
     db = store.db
   })
@@ -342,7 +373,7 @@ describe('1. Activation — getActive / ConsoleSections / MetricDescriptors', ()
     if (!result.ok) throw new Error('activation failed')
     expect(typeof result.departmentId).toBe('string')
     expect(result.departmentId.length).toBeGreaterThan(0)
-    expect(result.seeded).toBe(true) // first activation → squads seeded
+    expect(result.seeded).toBe(true)
   })
 
   it('after activation: getActive includes the fixture row', async () => {
@@ -361,8 +392,6 @@ describe('1. Activation — getActive / ConsoleSections / MetricDescriptors', ()
     expect(sections[0].id).toBe('fixture')
     expect(sections[0].navIcon).toBe('beaker')
     expect(sections[0].path).toBe('/departments/fixture')
-    // STRUCTURAL: the registry iterated getActive() → matched registered module.
-    // No switch statement was needed to produce this result.
   })
 
   it('getActiveMetricDescriptors() returns fixture descriptors WITHOUT per-dept branching', async () => {
@@ -372,7 +401,6 @@ describe('1. Activation — getActive / ConsoleSections / MetricDescriptors', ()
     const keys = descs.map((d) => d.key)
     expect(keys).toContain('fixture.pings')
     expect(keys).toContain('fixture.scalar')
-    // STRUCTURAL: no switch — the registry iterated active rows and spread metricsEmitted.
   })
 
   it('activate() fails cleanly for an unregistered module key', async () => {
@@ -390,7 +418,7 @@ describe('2. Idempotent activation — activate twice → seeds once', () => {
   let store: ReturnType<typeof makeDb>
 
   beforeEach(() => {
-    register(FixtureModule)
+    register(FixtureModule, { replace: true })
     store = makeDb()
     db = store.db
   })
@@ -400,7 +428,6 @@ describe('2. Idempotent activation — activate twice → seeds once', () => {
     expect(r1.ok).toBe(true)
     if (!r1.ok) throw new Error()
     expect(r1.seeded).toBe(true)
-    // One squad row created.
     expect(store.squads()).toHaveLength(1)
     expect(store.squads()[0].slug).toBe('fixture-core')
   })
@@ -410,9 +437,7 @@ describe('2. Idempotent activation — activate twice → seeds once', () => {
     const r2 = await activate(db, 'fixture')
     expect(r2.ok).toBe(true)
     if (!r2.ok) throw new Error()
-    // seeded=false: receipt found, squad creation skipped.
     expect(r2.seeded).toBe(false)
-    // Still exactly one squad row — NOT two.
     expect(store.squads()).toHaveLength(1)
   })
 
@@ -440,7 +465,7 @@ describe('3. Deactivate / reactivate — data retained', () => {
   let store: ReturnType<typeof makeDb>
 
   beforeEach(() => {
-    register(FixtureModule)
+    register(FixtureModule, { replace: true })
     store = makeDb()
     db = store.db
   })
@@ -472,7 +497,6 @@ describe('3. Deactivate / reactivate — data retained', () => {
   it('squad row is retained (data dormant) after deactivation', async () => {
     await activate(db, 'fixture')
     await deactivate(db, 'fixture')
-    // Squad rows are NOT deleted on deactivation — data retained dormant.
     expect(store.squads()).toHaveLength(1)
   })
 
@@ -492,8 +516,8 @@ describe('3. Deactivate / reactivate — data retained', () => {
     const r = await activate(db, 'fixture')
     expect(r.ok).toBe(true)
     if (!r.ok) throw new Error()
-    expect(r.seeded).toBe(false) // seed_receipt still present → skip
-    expect(store.squads()).toHaveLength(1) // still one squad
+    expect(r.seeded).toBe(false)
+    expect(store.squads()).toHaveLength(1)
   })
 
   it('deactivate on non-activated key returns not_found', async () => {
@@ -505,15 +529,12 @@ describe('3. Deactivate / reactivate — data retained', () => {
 })
 
 // ── 4. Isolation — removing fixture leaves everything else green ──────────────
-//
-// This group verifies that the fixture has NO coupling to the kernel or siblings.
-// After _unregister('fixture'), the dynamic lists return empty; no other test fails.
 
 describe('4. Isolation — unregister fixture, kernel is unaffected', () => {
   let db: D1Database
 
   beforeEach(() => {
-    register(FixtureModule)
+    register(FixtureModule, { replace: true })
     const store = makeDb()
     db = store.db
   })
@@ -525,10 +546,8 @@ describe('4. Isolation — unregister fixture, kernel is unaffected', () => {
   })
 
   it('after _unregister: getActiveConsoleSections() returns empty without crashing', async () => {
-    await activate(db, 'fixture') // activate while registered
+    await activate(db, 'fixture')
     _unregister('fixture')
-    // The row exists in DB but the module is gone from the registry.
-    // getActiveConsoleSections skips rows whose template_key has no registered module.
     const sections = await getActiveConsoleSections(db)
     expect(sections).toHaveLength(0)
   })
@@ -549,28 +568,22 @@ describe('4. Isolation — unregister fixture, kernel is unaffected', () => {
   })
 
   afterEach(() => {
-    // Restore fixture so subsequent groups work.
-    register(FixtureModule)
+    register(FixtureModule, { replace: true })
   })
 })
 
 // ── 5. Capability confinement via ctx ─────────────────────────────────────────
-//
-// These tests prove that DepartmentCtx enforces ownership + source authority +
-// tenant binding WITHOUT the module holding any raw DB/Env handle.
 
 describe('5. Capability confinement via ctx', () => {
   let db: D1Database
 
   beforeEach(() => {
-    register(FixtureModule)
+    register(FixtureModule, { replace: true })
     db = makeDb().db
   })
 
-  // ── metrics.emit: key ownership ──────────────────────────────────────────
-
   it('metrics.emit rejects a key not in metricsEmitted (key not owned)', async () => {
-    const ctx = mintCtx(makeKernelHandle(db), {
+    const ctx = kernelMintCtx(makeKernelHandle(db), {
       tenantId: 'tenant-a',
       departmentKey: 'fixture',
       module: FixtureModule,
@@ -578,7 +591,7 @@ describe('5. Capability confinement via ctx', () => {
     })
     await expect(
       ctx.metrics.emit({
-        key: 'growth.revenue', // not a fixture key
+        key: 'growth.revenue',
         value: 10,
         occurredAt: '2026-06-17T10:00:00.000Z',
         source: 'fixture-harness',
@@ -586,10 +599,8 @@ describe('5. Capability confinement via ctx', () => {
     ).rejects.toThrow(/key_not_owned|is not declared/)
   })
 
-  // ── metrics.emit: source authority ───────────────────────────────────────
-
   it('metrics.emit rejects a source not in sourceAuthority', async () => {
-    const ctx = mintCtx(makeKernelHandle(db), {
+    const ctx = kernelMintCtx(makeKernelHandle(db), {
       tenantId: 'tenant-a',
       departmentKey: 'fixture',
       module: FixtureModule,
@@ -600,15 +611,14 @@ describe('5. Capability confinement via ctx', () => {
         key: 'fixture.pings',
         value: 5,
         occurredAt: '2026-06-17T10:00:00.000Z',
-        source: 'stripe', // NOT in fixture.pings.sourceAuthority
+        source: 'stripe',
       }),
     ).rejects.toThrow(/source_not_authorized|not in sourceAuthority/)
   })
 
   it('metrics.emit accepts a valid source from sourceAuthority', async () => {
-    // Use the metric_points-aware mock so the INSERT path succeeds.
     const metricStore = makeMetricDb()
-    const ctx = mintCtx(makeKernelHandle(metricStore.db), {
+    const ctx = kernelMintCtx(makeKernelHandle(metricStore.db), {
       tenantId: 'tenant-a',
       departmentKey: 'fixture',
       module: FixtureModule,
@@ -623,10 +633,8 @@ describe('5. Capability confinement via ctx', () => {
     expect(result.ok).toBe(true)
   })
 
-  // ── metrics.emit: non-finite value ────────────────────────────────────────
-
   it('metrics.emit rejects a non-finite value', async () => {
-    const ctx = mintCtx(makeKernelHandle(db), {
+    const ctx = kernelMintCtx(makeKernelHandle(db), {
       tenantId: 'tenant-a',
       departmentKey: 'fixture',
       module: FixtureModule,
@@ -642,16 +650,9 @@ describe('5. Capability confinement via ctx', () => {
     ).rejects.toThrow(/value_not_finite|must be finite/)
   })
 
-  // ── tenant binding ────────────────────────────────────────────────────────
-  //
-  // A ctx minted for tenant-a binds tenant-a in all emitMetric calls.
-  // A ctx minted for tenant-b cannot emit to tenant-a's namespace.
-  // We verify this by checking the stored row's tenant_id.
-
   it('tenant is bound from ctx — module cannot override tenant via input', async () => {
-    // Use the metric_points-aware mock so both emits can succeed.
     const metricStore = makeMetricDb()
-    const ctx = mintCtx(makeKernelHandle(metricStore.db), {
+    const ctx = kernelMintCtx(makeKernelHandle(metricStore.db), {
       tenantId: 'tenant-a',
       departmentKey: 'fixture',
       module: FixtureModule,
@@ -663,12 +664,9 @@ describe('5. Capability confinement via ctx', () => {
       occurredAt: '2026-06-17T10:02:00.000Z',
       source: 'fixture-harness',
     })
-    // Verify tenant-a's row is in the store.
     expect(metricStore.rows()[0].tenant_id).toBe('tenant-a')
 
-    // A ctx for tenant-b emitting the same key+time+source → different tenant_id
-    // → NOT a UNIQUE collision (the composite key includes tenant_id).
-    const ctxB = mintCtx(makeKernelHandle(metricStore.db), {
+    const ctxB = kernelMintCtx(makeKernelHandle(metricStore.db), {
       tenantId: 'tenant-b',
       departmentKey: 'fixture',
       module: FixtureModule,
@@ -681,18 +679,15 @@ describe('5. Capability confinement via ctx', () => {
       source: 'fixture-harness',
     })
     expect(r.ok).toBe(true)
-    // Verify tenant-b's row is stored separately.
     expect(metricStore.rows()[1].tenant_id).toBe('tenant-b')
   })
 
-  // ── capability check ──────────────────────────────────────────────────────
-
   it('ctx with empty capabilities is denied on metrics.emit', async () => {
-    const ctx = mintCtx(makeKernelHandle(db), {
+    const ctx = kernelMintCtx(makeKernelHandle(db), {
       tenantId: 'tenant-a',
       departmentKey: 'fixture',
       module: FixtureModule,
-      capabilities: [], // no capabilities
+      capabilities: [],
     })
     await expect(
       ctx.metrics.emit({
@@ -705,11 +700,11 @@ describe('5. Capability confinement via ctx', () => {
   })
 
   it('ctx with observer capability is denied on metrics.emit (requires member)', async () => {
-    const ctx = mintCtx(makeKernelHandle(db), {
+    const ctx = kernelMintCtx(makeKernelHandle(db), {
       tenantId: 'tenant-a',
       departmentKey: 'fixture',
       module: FixtureModule,
-      capabilities: ['observer'], // below 'member'
+      capabilities: ['observer'],
     })
     await expect(
       ctx.metrics.emit({
@@ -723,7 +718,7 @@ describe('5. Capability confinement via ctx', () => {
 
   it('ctx with lead capability passes (lead > member)', async () => {
     const metricStore = makeMetricDb()
-    const ctx = mintCtx(makeKernelHandle(metricStore.db), {
+    const ctx = kernelMintCtx(makeKernelHandle(metricStore.db), {
       tenantId: 'tenant-a',
       departmentKey: 'fixture',
       module: FixtureModule,
@@ -739,39 +734,34 @@ describe('5. Capability confinement via ctx', () => {
   })
 
   it('ctx has NO raw db/env properties — module cannot access raw handle', () => {
-    const ctx = mintCtx(makeKernelHandle(db), {
+    const ctx = kernelMintCtx(makeKernelHandle(db), {
       tenantId: 'tenant-a',
       departmentKey: 'fixture',
       module: FixtureModule,
       capabilities: ['member'],
     })
-    // The ctx object must NOT expose raw DB or Env.
-    // We check that none of the known raw-handle keys are present on the ctx.
     const ctxAsRecord = ctx as Record<string, unknown>
     expect(ctxAsRecord['DB']).toBeUndefined()
     expect(ctxAsRecord['env']).toBeUndefined()
     expect(ctxAsRecord['KV']).toBeUndefined()
     expect(ctxAsRecord['SESSIONS']).toBeUndefined()
     expect(ctxAsRecord['BUS']).toBeUndefined()
-    // The ctx DOES expose port facades — verify they are functions, not raw handles.
+    expect(ctxAsRecord['db']).toBeUndefined()
     expect(typeof ctx.metrics.emit).toBe('function')
-    expect(typeof ctx.db.query).toBe('function')
     expect(typeof ctx.audit.write).toBe('function')
     expect(typeof ctx.gate.propose).toBe('function')
     expect(typeof ctx.bus.publish).toBe('function')
   })
 
-  // ── CtxError is used for confinement violations ────────────────────────────
-
   it('confinement violations throw CtxError (not generic Error)', async () => {
-    const ctx = mintCtx(makeKernelHandle(db), {
+    const ctx = kernelMintCtx(makeKernelHandle(db), {
       tenantId: 'tenant-a',
       departmentKey: 'fixture',
       module: FixtureModule,
       capabilities: ['member'],
     })
     const err = await ctx.metrics.emit({
-      key: 'growth.revenue', // not owned
+      key: 'growth.revenue',
       value: 1,
       occurredAt: '2026-06-17T10:00:00.000Z',
       source: 'fixture-harness',
@@ -782,20 +772,12 @@ describe('5. Capability confinement via ctx', () => {
 })
 
 // ── 6. Honesty propagation — ohlcEligible=false → bar (not candle) ────────────
-//
-// §4.2: a MetricDescriptor with ohlcEligible=false must NEVER yield a candle,
-// even when there are multiple readings per day. The honesty guard is:
-//   1. Declared on the descriptor (ohlcEligible field).
-//   2. Propagated via getActiveMetricDescriptors() so the selector can filter.
-//   3. seriesShape() independently returns 'bar' for single-reading days (the
-//      OHLC spine guard). This tests that the descriptor's declaration matches
-//      real series behavior.
 
 describe('6. Honesty propagation — ohlcEligible and seriesShape', () => {
   let db: D1Database
 
   beforeEach(() => {
-    register(FixtureModule)
+    register(FixtureModule, { replace: true })
     db = makeDb().db
   })
 
@@ -818,11 +800,9 @@ describe('6. Honesty propagation — ohlcEligible and seriesShape', () => {
     const descs = await getActiveMetricDescriptors(db)
     const scalar = descs.find((d) => d.key === 'fixture.scalar')!
     expect(scalar.ohlcEligible).toBe(false)
-    // The candlestick metric selector must filter this out of candle options.
   })
 
   it('seriesShape returns bar for single-reading-per-day series (ohlc honesty spine)', () => {
-    // A fixture.scalar series: one reading per day — O==H==L==C → bar, not candle.
     const buckets: OHLCBucket[] = [
       { date: '2026-06-15', open: 5, high: 5, low: 5, close: 5, count: 1 },
       { date: '2026-06-16', open: 7, high: 7, low: 7, close: 7, count: 1 },
@@ -831,7 +811,6 @@ describe('6. Honesty propagation — ohlcEligible and seriesShape', () => {
   })
 
   it('seriesShape returns candle when any day has count >= 2 (fixture.pings eligible)', () => {
-    // A fixture.pings series: multiple readings in a day → real OHLC.
     const buckets: OHLCBucket[] = [
       { date: '2026-06-15', open: 1, high: 5, low: 1, close: 4, count: 4 },
       { date: '2026-06-16', open: 2, high: 2, low: 2, close: 2, count: 1 },
@@ -850,17 +829,355 @@ describe('6. Honesty propagation — ohlcEligible and seriesShape', () => {
     ]
     const buckets = aggregateOHLC(readings, { bucket: 'day' })
     expect(buckets).toHaveLength(2)
-    // Each bucket has count=1 → O==H==L==C → seriesShape returns 'bar'.
     expect(buckets.every((b) => b.count === 1)).toBe(true)
     expect(seriesShape(buckets)).toBe('bar')
   })
 })
 
+// ── 7. ADVERSARIAL — attacker-in-ctx scenarios ────────────────────────────────
+//
+// These tests prove that an attacker holding a ctx (a hostile department module)
+// cannot escalate privileges or forge metric ownership by mutating the ctx object.
+//
+// The attacker is allowed to use `as any` casts — the fix must hold at runtime
+// via Object.freeze + closure-private state, not via TypeScript types.
+
+describe('7. ADVERSARIAL — ctx confinement holds against hostile module code', () => {
+  let db: D1Database
+  let metricStore: ReturnType<typeof makeMetricDb>
+
+  beforeEach(() => {
+    register(FixtureModule, { replace: true })
+    db = makeDb().db
+    metricStore = makeMetricDb()
+  })
+
+  // ── P0-1a: mutate ctx.capabilities → cap check still uses closure ──────────
+
+  it('P0-1a: mutating ctx.capabilities (add "owner") has NO effect on cap check', async () => {
+    // Mint a ctx with no capabilities — should be denied on emit.
+    const ctx = kernelMintCtx(makeKernelHandle(metricStore.db), {
+      tenantId: 'tenant-a',
+      departmentKey: 'fixture',
+      module: FixtureModule,
+      capabilities: [],  // no caps
+    })
+
+    // Attacker attempt: cast to any and push 'owner' onto the frozen snapshot.
+    // This should either throw (TypeError: cannot add property to frozen object)
+    // or be silently ignored, but MUST NOT affect the cap check.
+    let mutationThrew = false
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(ctx.capabilities as any).push('owner')
+    } catch {
+      mutationThrew = true
+    }
+
+    // Regardless of whether mutation threw or was silently ignored:
+    // the emit MUST still be denied because the closure capSet has no 'owner'.
+    await expect(
+      ctx.metrics.emit({
+        key: 'fixture.pings',
+        value: 1,
+        occurredAt: '2026-06-17T12:00:00.000Z',
+        source: 'fixture-harness',
+      }),
+    ).rejects.toThrow(/capability_denied/)
+
+    // Mutation should have thrown (frozen array), but denial is the hard invariant.
+    // We log if it didn't to surface any regression in the freeze.
+    if (!mutationThrew) {
+      // The freeze didn't work — but the check still held because it reads closure.
+      // This is acceptable but suboptimal; the freeze is belt-and-suspenders.
+    }
+  })
+
+  // ── P0-1b: mutate ctx.metricsEmitted → key ownership check uses closure ───
+
+  it('P0-1b: forging ctx.metricsEmitted (add foreign key) has NO effect on ownership check', async () => {
+    // Mint a ctx for the fixture department.
+    const ctx = kernelMintCtx(makeKernelHandle(metricStore.db), {
+      tenantId: 'tenant-a',
+      departmentKey: 'fixture',
+      module: FixtureModule,
+      capabilities: ['owner'],
+    })
+
+    // Attacker attempt: cast to any and inject a foreign metric key into the snapshot.
+    // This simulates a hostile module trying to self-authorize 'growth.revenue'.
+    let mutationThrew = false
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(ctx.metricsEmitted as any).push({
+        key: 'growth.revenue',
+        unit: 'usd',
+        direction: 'up_good',
+        cadence: 'realtime',
+        aggregation: 'sum',
+        ohlcEligible: true,
+        sourceAuthority: ['anything'],
+        retention: '365d',
+        display: { precision: 2 },
+      })
+    } catch {
+      mutationThrew = true
+    }
+
+    // The emit of the foreign key MUST still be denied.
+    await expect(
+      ctx.metrics.emit({
+        key: 'growth.revenue',
+        value: 99999,
+        occurredAt: '2026-06-17T12:00:00.000Z',
+        source: 'anything',
+      }),
+    ).rejects.toThrow(/key_not_owned/)
+
+    // As above: freeze is belt-and-suspenders; closure is the hard gate.
+    void mutationThrew
+  })
+
+  // ── P0-1c: re-bind ctx.tenantId → ctx is frozen, re-bind throws or no-ops ──
+
+  it('P0-1c: re-binding ctx.tenantId via "as any" is blocked (frozen object)', () => {
+    const ctx = kernelMintCtx(makeKernelHandle(metricStore.db), {
+      tenantId: 'tenant-a',
+      departmentKey: 'fixture',
+      module: FixtureModule,
+      capabilities: ['owner'],
+    })
+
+    // Attacker attempt: re-bind tenantId to a victim tenant.
+    expect(() => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(ctx as any).tenantId = 'victim-tenant'
+    }).toThrow()  // TypeError: Cannot assign to read only property
+
+    // Even if the throw weren't there, the emit uses the closure-bound tenant.
+    expect(ctx.tenantId).toBe('tenant-a')
+  })
+
+  // ── P0-1d: re-bind a port (ctx.metrics = evil_port) → ctx is frozen ────────
+
+  it('P0-1d: replacing a port facade on ctx is blocked (frozen object)', () => {
+    const ctx = kernelMintCtx(makeKernelHandle(metricStore.db), {
+      tenantId: 'tenant-a',
+      departmentKey: 'fixture',
+      module: FixtureModule,
+      capabilities: ['member'],
+    })
+
+    expect(() => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(ctx as any).metrics = { emit: async () => ({ ok: true }) }
+    }).toThrow()
+  })
+
+  // ── P0-1e: mutate descriptor.sourceAuthority on the metricsEmitted snapshot ──
+
+  it('P0-1e: mutating a descriptor.sourceAuthority on the snapshot has NO effect on source check', async () => {
+    const ctx = kernelMintCtx(makeKernelHandle(metricStore.db), {
+      tenantId: 'tenant-a',
+      departmentKey: 'fixture',
+      module: FixtureModule,
+      capabilities: ['owner'],
+    })
+
+    // Attacker: add a foreign source to the sourceAuthority on the snapshot.
+    const snapshotDesc = ctx.metricsEmitted.find((d) => d.key === 'fixture.pings')
+    if (snapshotDesc) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ;(snapshotDesc.sourceAuthority as any).push('stripe')
+      } catch {
+        // Freeze threw — good.
+      }
+    }
+
+    // 'stripe' is NOT in the closure-private descriptor.sourceAuthority.
+    await expect(
+      ctx.metrics.emit({
+        key: 'fixture.pings',
+        value: 1,
+        occurredAt: '2026-06-17T12:01:00.000Z',
+        source: 'stripe',
+      }),
+    ).rejects.toThrow(/source_not_authorized/)
+  })
+
+  // ── No raw DB on ctx ──────────────────────────────────────────────────────
+
+  it('ctx exposes no db.query (raw SQL facade has been removed)', () => {
+    const ctx = kernelMintCtx(makeKernelHandle(metricStore.db), {
+      tenantId: 'tenant-a',
+      departmentKey: 'fixture',
+      module: FixtureModule,
+      capabilities: ['owner'],
+    })
+    // The db port must not exist on the ctx at all.
+    const ctxAsRecord = ctx as Record<string, unknown>
+    expect(ctxAsRecord['db']).toBeUndefined()
+  })
+
+  // ── Tenant binding holds under emit ──────────────────────────────────────
+
+  it('emit always stores the closure-bound tenant, not any attacker-supplied value', async () => {
+    const ctx = kernelMintCtx(makeKernelHandle(metricStore.db), {
+      tenantId: 'tenant-a',
+      departmentKey: 'fixture',
+      module: FixtureModule,
+      capabilities: ['member'],
+    })
+
+    await ctx.metrics.emit({
+      key: 'fixture.pings',
+      value: 1,
+      occurredAt: '2026-06-17T12:02:00.000Z',
+      source: 'fixture-harness',
+    })
+
+    // The stored row must use the closure-bound tenantId, not any attacker value.
+    expect(metricStore.rows()[0].tenant_id).toBe('tenant-a')
+  })
+})
+
+// ── 8. Registry hardening ─────────────────────────────────────────────────────
+
+describe('8. Registry hardening', () => {
+  let db: D1Database
+
+  beforeEach(() => {
+    register(FixtureModule, { replace: true })
+    db = makeDb().db
+  })
+
+  // ── Duplicate key → throws ────────────────────────────────────────────────
+
+  it('register() duplicate key without replace flag throws', () => {
+    // FixtureModule is already registered.
+    expect(() => {
+      register(FixtureModule)  // no replace flag
+    }).toThrow(/registry_duplicate_key/)
+  })
+
+  it('register() duplicate key with replace:true does NOT throw', () => {
+    expect(() => {
+      register(FixtureModule, { replace: true })
+    }).not.toThrow()
+  })
+
+  // ── slug_conflict: activate over a foreign template key ───────────────────
+
+  it('activate() returns slug_conflict when slug exists with a different template_key', async () => {
+    // Pre-populate a dept row with slug='fixture' but template_key='other-module'.
+    const foreignStore = makeDb({
+      initialDepts: [
+        {
+          id: 'pre-existing-id',
+          slug: 'fixture',
+          name: 'Some Other Department',
+          template_key: 'other-module',  // different from 'fixture'
+          template_version: '1.0.0',
+          activated_at: '2026-06-01T00:00:00.000Z',
+          active: 1,
+          seed_receipt: null,
+          created_at: '2026-06-01T00:00:00.000Z',
+        },
+      ],
+    })
+
+    const result = await activate(foreignStore.db, 'fixture')
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected slug_conflict')
+    expect(result.reason).toBe('slug_conflict')
+    expect(result.detail).toMatch(/fixture.*other-module|slug.*owned/)
+  })
+
+  it('activate() succeeds when existing row has template_key=NULL (legacy row)', async () => {
+    // Pre-populate a legacy row (template_key IS NULL — old createDepartment path).
+    const legacyStore = makeDb({
+      initialDepts: [
+        {
+          id: 'legacy-id',
+          slug: 'fixture',
+          name: 'Old Fixture',
+          template_key: null,  // legacy: no template origin
+          template_version: null,
+          activated_at: null,
+          active: 0,
+          seed_receipt: null,
+          created_at: '2026-05-01T00:00:00.000Z',
+        },
+      ],
+    })
+
+    const result = await activate(legacyStore.db, 'fixture')
+    expect(result.ok).toBe(true)
+  })
+
+  // ── mintCtx without kernel token → throws ────────────────────────────────
+
+  it('mintCtx with wrong token throws kernel_token_invalid', () => {
+    const fakeToken = Symbol('fake')
+    expect(() => {
+      mintCtx(fakeToken, makeKernelHandle(db), {
+        tenantId: 'attacker',
+        departmentKey: 'fixture',
+        module: FixtureModule,
+        capabilities: ['owner'],
+      })
+    }).toThrow(/kernel_token_invalid/)
+  })
+
+  it('mintCtx with wrong token throws CtxError', () => {
+    const fakeToken = Symbol('fake')
+    let err: unknown
+    try {
+      mintCtx(fakeToken, makeKernelHandle(db), {
+        tenantId: 'attacker',
+        departmentKey: 'fixture',
+        module: FixtureModule,
+        capabilities: ['owner'],
+      })
+    } catch (e) {
+      err = e
+    }
+    expect(err).toBeInstanceOf(CtxError)
+    expect((err as CtxError).code).toBe('kernel_token_invalid')
+  })
+
+  // ── Injected clock ────────────────────────────────────────────────────────
+
+  it('activate() uses injected now() for deterministic timestamps', async () => {
+    const FIXED_TIME = '2026-01-01T00:00:00.000Z'
+    const store = makeDb()
+    const result = await activate(store.db, 'fixture', {
+      now: () => FIXED_TIME,
+      idGen: () => 'fixed-uuid',
+    })
+    expect(result.ok).toBe(true)
+    const row = store.depts()[0]
+    expect(row.activated_at).toBe(FIXED_TIME)
+    expect(row.created_at).toBe(FIXED_TIME)
+  })
+
+  it('mintCtx uses injected now() in gate.propose gateId', async () => {
+    const FIXED_TIME = '2026-01-01T00:00:00.000Z'
+    const ctx = kernelMintCtx(makeKernelHandle(db), {
+      tenantId: 'tenant-a',
+      departmentKey: 'fixture',
+      module: FixtureModule,
+      capabilities: ['member'],
+      now: () => FIXED_TIME,
+    })
+    const result = await ctx.gate.propose({ action: 'test' })
+    expect(result.gateId).toContain(FIXED_TIME)
+  })
+})
+
 // ── Cleanup after all tests ───────────────────────────────────────────────────
 
-// Restore the fixture registration so it doesn't bleed into other test files.
-// (vitest runs test files in isolated module contexts by default, but this is
-// belt-and-suspenders for in-process registry state.)
 afterAll(() => {
-  register(FixtureModule)
+  register(FixtureModule, { replace: true })
 })

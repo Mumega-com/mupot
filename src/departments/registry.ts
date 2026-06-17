@@ -8,6 +8,7 @@
 //
 //   REGISTRATION is DATA-DRIVEN:
 //     - `register(module)` adds a module to the in-process map keyed by module.key.
+//     - Duplicate key → throws (prevents silent replacement in production).
 //     - `listRegistered()` returns all registered modules.
 //     - No switch / if-else on department keys anywhere in this file.
 //
@@ -16,6 +17,9 @@
 //     - Re-activating an already-active department re-flips the active flag but
 //       does NOT re-seed squads (seed receipt guard).
 //     - template_version is recorded as activated_version at activation time.
+//     - Template hijack guard: only adopt an existing row if template_key matches
+//       or template_key IS NULL (legacy / UI-created row). Foreign slug → slug_conflict.
+//     - Seed is atomic: INSERTs + receipt written in a single db.batch() call.
 //
 //   DEACTIVATION retains data:
 //     - `deactivate()` flips active=0 and nulls the console section from nav.
@@ -33,7 +37,51 @@
 
 import type { D1Database } from '@cloudflare/workers-types'
 import type { DepartmentModule, MetricDescriptor, ConsoleSectionRef } from './contract'
+import type { DepartmentCtx } from './ctx'
+import { acquireKernelToken, mintCtx } from './ctx'
 import { assertWritten } from '../lib/receipt'
+import type { Capability } from '../types'
+
+// ── Kernel token acquisition ──────────────────────────────────────────────────
+//
+// The registry (the kernel) acquires the unforgeable mint token once at module
+// load time. This token is stored here as a module-private const — it never
+// leaves this file. Department modules that import from registry.ts receive no
+// reference to the token and cannot call mintCtx directly.
+//
+// kernelMintCtx() (exported below) is the ONLY public path to create a ctx in
+// both production and tests. Tests import kernelMintCtx from this file.
+
+const _kernelToken = acquireKernelToken()
+
+// ── KernelHandle ──────────────────────────────────────────────────────────────
+//
+// Holds the raw D1 handle. Only the kernel holds this; department modules never
+// receive it. The type is intentionally NOT re-exported so module code that
+// imports only from registry.ts cannot construct a KernelHandle.
+
+export interface KernelHandle {
+  db: D1Database
+}
+
+/**
+ * The ONLY public path to mint a DepartmentCtx. Wraps mintCtx() with the
+ * kernel-private token so callers (including the test harness) never need the
+ * raw token. Department modules never receive or call this function.
+ */
+export function kernelMintCtx(
+  handle: KernelHandle,
+  opts: {
+    tenantId: string
+    departmentKey: string
+    module: DepartmentModule
+    capabilities: Capability[]
+    now?: () => string
+    idGen?: () => string
+  },
+): DepartmentCtx {
+  return mintCtx(_kernelToken, handle, opts)
+}
 
 // ── In-process module registry ─────────────────────────────────────────────────
 //
@@ -44,11 +92,21 @@ import { assertWritten } from '../lib/receipt'
 const _registry = new Map<string, DepartmentModule>()
 
 /**
- * Register a DepartmentModule. Idempotent: re-registering the same key replaces
- * the previous entry (useful during tests). Registration is DATA-DRIVEN — this
- * function is the ONLY registration path. No switch or if-else on module.key.
+ * Register a DepartmentModule.
+ *
+ * Throws on duplicate key — silent replacement would allow a hostile module
+ * to shadow an already-registered kernel module mid-flight.
+ *
+ * Pass `{ replace: true }` only from test harnesses that need controlled
+ * override (e.g. re-registering after _clearRegistry).
  */
-export function register(module: DepartmentModule): void {
+export function register(module: DepartmentModule, opts?: { replace?: boolean }): void {
+  if (_registry.has(module.key) && !opts?.replace) {
+    throw new Error(
+      `[registry_duplicate_key] Module key '${module.key}' is already registered. ` +
+        'Use register(module, { replace: true }) only in tests.',
+    )
+  }
   _registry.set(module.key, module)
 }
 
@@ -66,6 +124,36 @@ export function listRegistered(): DepartmentModule[] {
 export function getRegistered(key: string): DepartmentModule | undefined {
   return _registry.get(key)
 }
+
+// ── Test-only registry helpers ────────────────────────────────────────────────
+//
+// These are NOT part of the production surface. They are exported for use by
+// the conformance test harness only. Module-facing code (department modules,
+// production Workers) should never call these.
+//
+// Note: We cannot physically prevent a module author from importing them (no
+// process isolation in CF Workers), but the naming convention + the fact that
+// they're documented as test-only + the register() duplicate-key guard together
+// make accidental or adversarial misuse visible and loud.
+
+export const _testOnly = {
+  /**
+   * Clear all registrations. Used by the conformance harness to test isolation.
+   * NOT a production path.
+   */
+  clearRegistry(): void {
+    _registry.clear()
+  },
+
+  /**
+   * Remove a single module registration. Used by the conformance harness to test
+   * that removing a module leaves the kernel and sibling modules unaffected.
+   * NOT a production path.
+   */
+  unregister(key: string): void {
+    _registry.delete(key)
+  },
+} as const
 
 // ── Activation row shape ──────────────────────────────────────────────────────
 //
@@ -151,7 +239,7 @@ export async function getActiveMetricDescriptors(db: D1Database): Promise<Metric
 
 export type ActivateResult =
   | { ok: true; departmentId: string; seeded: boolean }
-  | { ok: false; reason: 'module_not_registered' | 'db_error'; detail?: string }
+  | { ok: false; reason: 'module_not_registered' | 'slug_conflict' | 'db_error'; detail?: string }
 
 /**
  * Activate a department module for this pot's D1.
@@ -159,39 +247,65 @@ export type ActivateResult =
  * Steps:
  *   1. Look up the module in the registry — fail if not registered.
  *   2. Upsert a departments row with template_key, template_version, active=1.
- *      Uses INSERT OR REPLACE (by slug) so activation is idempotent at the row level.
+ *      Uses INSERT on new rows, UPDATE on existing rows.
+ *      Template hijack guard: only adopt an existing row if template_key matches
+ *      OR template_key IS NULL (legacy row). Foreign template → slug_conflict.
  *   3. Check seed_receipt — if already seeded, skip squad creation.
- *   4. If not yet seeded: call createSquad for each defaultSquad, write seed receipt.
+ *   4. If not yet seeded: insert squads + write receipt in a single db.batch()
+ *      (atomic — concurrent double-activate cannot race past the receipt).
  *
  * The department slug used is the module.key (stable, unique per module).
- * If a departments row with that slug already exists (from a prior activation),
- * we UPDATE rather than INSERT to preserve the existing id and created_at.
  *
  * Idempotency guarantee: calling activate() twice results in exactly one seed pass.
+ *
+ * @param now - Optional injected timestamp for deterministic tests.
+ * @param idGen - Optional injected UUID generator for deterministic tests.
  */
 export async function activate(
   db: D1Database,
   moduleKey: string,
+  opts?: { now?: () => string; idGen?: () => string },
 ): Promise<ActivateResult> {
   const module = _registry.get(moduleKey)
   if (!module) {
     return { ok: false, reason: 'module_not_registered', detail: `module '${moduleKey}' is not registered` }
   }
 
+  const nowFn = opts?.now ?? (() => new Date().toISOString())
+  const idFn = opts?.idGen ?? (() => crypto.randomUUID())
+
   try {
     // Check for existing row by slug (module.key is the stable slug).
     const existing = await db
       .prepare(
-        `SELECT id, slug, seed_receipt FROM departments WHERE slug = ?1 LIMIT 1`,
+        `SELECT id, slug, template_key, seed_receipt FROM departments WHERE slug = ?1 LIMIT 1`,
       )
       .bind(module.key)
-      .first<{ id: string; slug: string; seed_receipt: string | null }>()
+      .first<{ id: string; slug: string; template_key: string | null; seed_receipt: string | null }>()
 
-    const now = new Date().toISOString()
+    const now = nowFn()
     let departmentId: string
     let priorSeedReceipt: SeedReceipt | null = null
 
     if (existing) {
+      // ── Template hijack guard ──────────────────────────────────────────────
+      //
+      // Only adopt the existing row if:
+      //   - template_key is NULL (UI-created / legacy row with no template origin), OR
+      //   - template_key matches our module key (safe to update version / flip active).
+      //
+      // If template_key is set to a DIFFERENT value, this slug belongs to another
+      // module. Refuse with slug_conflict to prevent foreign department takeover.
+      if (existing.template_key !== null && existing.template_key !== module.key) {
+        return {
+          ok: false,
+          reason: 'slug_conflict',
+          detail:
+            `slug '${module.key}' is already owned by module '${existing.template_key}'. ` +
+            `Cannot activate module '${module.key}' over a foreign slug.`,
+        }
+      }
+
       departmentId = existing.id
 
       // Parse existing seed receipt for idempotency check.
@@ -220,7 +334,7 @@ export async function activate(
       assertWritten(updateResult, `departments.activate.update(${module.key})`)
     } else {
       // Insert new row.
-      departmentId = crypto.randomUUID()
+      departmentId = idFn()
       const insertResult = await db
         .prepare(
           `INSERT INTO departments (id, slug, name, template_key, template_version, activated_at, active, created_at)
@@ -231,45 +345,45 @@ export async function activate(
       assertWritten(insertResult, `departments.activate.insert(${module.key})`)
     }
 
-    // ── Idempotent squad seeding ───────────────────────────────────────────
+    // ── Idempotent squad seeding (atomic batch) ────────────────────────────
     //
-    // If seed_receipt already exists and covers the same set of squads, skip.
-    // Guard is: receipt present = already seeded = no double-seed.
+    // If seed_receipt already exists, skip. This is the idempotency gate.
+    // When seeding IS needed, we INSERT all squads + the receipt update in a
+    // single db.batch() call so concurrent activate() calls cannot both pass
+    // the receipt check and then both seed (TOCTOU race).
 
     let seeded = false
     if (!priorSeedReceipt && module.defaultSquads.length > 0) {
-      const seededSlugs: string[] = []
+      const squadStatements = module.defaultSquads.map((seed) => {
+        const squadId = idFn()
+        return db
+          .prepare(
+            `INSERT OR IGNORE INTO squads (id, department_id, slug, name, charter, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+          )
+          .bind(squadId, departmentId, seed.slug, seed.name, seed.charter ?? null, now)
+      })
 
-      for (const seed of module.defaultSquads) {
-        const squadId = crypto.randomUUID()
-        try {
-          const r = await db
-            .prepare(
-              `INSERT INTO squads (id, department_id, slug, name, charter, created_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
-            )
-            .bind(squadId, departmentId, seed.slug, seed.name, seed.charter ?? null, now)
-            .run()
-          assertWritten(r, `squads.seed(${seed.slug})`)
-          seededSlugs.push(seed.slug)
-        } catch (err) {
-          // UNIQUE(department_id, slug) conflict means squad already exists — skip.
-          if (err instanceof Error && /UNIQUE constraint failed/i.test(err.message)) {
-            seededSlugs.push(seed.slug)
-            continue
-          }
-          throw err
-        }
+      // The receipt UPDATE is the atomic lock. A concurrent activate() that also
+      // passes the receipt-null check will race here; only one will win (D1
+      // serializes writes within a database). The loser's receipt UPDATE will
+      // run after the winner's, but INSERT OR IGNORE ensures squads aren't duped.
+      const receipt: SeedReceipt = {
+        seeded_at: now,
+        squads: module.defaultSquads.map((s) => s.slug),
       }
-
-      // Write seed receipt so re-activation skips this block.
-      const receipt: SeedReceipt = { seeded_at: now, squads: seededSlugs }
-      const receiptResult = await db
-        .prepare(`UPDATE departments SET seed_receipt = ?2 WHERE id = ?1`)
+      const receiptStmt = db
+        .prepare(`UPDATE departments SET seed_receipt = ?2 WHERE id = ?1 AND seed_receipt IS NULL`)
         .bind(departmentId, JSON.stringify(receipt))
-        .run()
-      assertWritten(receiptResult, `departments.seed_receipt(${module.key})`)
-      seeded = true
+
+      // Execute all squad INSERTs + receipt write as one batch.
+      const batchResults = await db.batch([...squadStatements, receiptStmt])
+
+      // Check if the receipt UPDATE actually changed a row. If changes=0, a
+      // concurrent activate() won the race and already wrote the receipt — that
+      // is fine (squads are already seeded by the winner, INSERT OR IGNORE is safe).
+      const receiptResult = batchResults[batchResults.length - 1]
+      seeded = (receiptResult.meta.changes ?? 0) > 0
     }
 
     return { ok: true, departmentId, seeded }
@@ -315,16 +429,19 @@ export async function deactivate(
   }
 }
 
-// ── clearRegistry (test use only) ─────────────────────────────────────────────
+// ── Legacy exports for backward compat with existing test imports ─────────────
 //
-// Used by the conformance harness to test isolation (remove fixture module and
-// verify siblings are unaffected). NOT exported as part of the public API — only
-// test files import this.
+// The conformance harness imported _clearRegistry and _unregister directly.
+// Those names are now under _testOnly. We keep the legacy export names as
+// thin wrappers so the existing import lines continue to work without a
+// mass-rename. New code should use _testOnly.clearRegistry / _testOnly.unregister.
 
+/** @deprecated Use _testOnly.clearRegistry() — test harness only. */
 export function _clearRegistry(): void {
-  _registry.clear()
+  _testOnly.clearRegistry()
 }
 
+/** @deprecated Use _testOnly.unregister() — test harness only. */
 export function _unregister(key: string): void {
-  _registry.delete(key)
+  _testOnly.unregister(key)
 }

@@ -58,8 +58,12 @@ export interface MetricDescriptor {
    * Anti-pollution guard (§4.1): the set of `source` values that may write this
    * key. Any emit() call whose source is not in this list is rejected by the ctx
    * facade BEFORE touching D1.
+   *
+   * Declared as readonly string[] so deep-frozen descriptors (ctx internals) are
+   * assignable here without widening — callers may pass mutable arrays, the ctx
+   * will freeze them.
    */
-  sourceAuthority: string[]
+  sourceAuthority: readonly string[]
   /** How long readings are kept. Informational for now; future cleanup job uses this. */
   retention: string
   /** Display hints for the console: how many decimal places, optional prefix/suffix. */

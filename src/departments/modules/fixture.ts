@@ -87,4 +87,9 @@ export const FixtureModule: DepartmentModule = {
 // Auto-register when this module is imported.
 // This is the ONE registry call that must exist per department (§3.5 "registry plumbing").
 // It does NOT edit the registry file — it calls the open registration function.
-register(FixtureModule)
+//
+// replace: true is safe here for the module's own initial registration because this
+// file is imported once at test harness setup (after _clearRegistry) and once at
+// production boot. The duplicate-key guard in register() would fire on double-import
+// in a long-lived process; `replace: true` makes re-registration idempotent.
+register(FixtureModule, { replace: true })
