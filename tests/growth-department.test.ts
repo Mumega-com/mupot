@@ -405,8 +405,10 @@ describe('B. collectGrowthMetrics: seeded prospects → correct emissions', () =
     expect(repliesRow?.value).toBe(3)
   })
 
-  it('emits growth.conversion = replied/sent ratio', async () => {
-    // 2 sent, 1 replied → 0.5
+  it('emits growth.conversion = replied/(sent+replied) ratio', async () => {
+    // sent=2, replied=1 → reached = 2+1 = 3, conversion = 1/3 ≈ 0.333
+    // (old formula replied/sent = 1/2 = 0.5 was wrong — it ignored the denominator contribution
+    //  from prospects that already moved from 'sent' to 'replied')
     const { db, metricRows } = makeCollectorDb([
       { tenant: TENANT, status: 'sent' },
       { tenant: TENANT, status: 'sent' },
@@ -417,7 +419,7 @@ describe('B. collectGrowthMetrics: seeded prospects → correct emissions', () =
 
     const convRow = metricRows().find((r) => r.metric_key === 'growth.conversion')
     expect(convRow).toBeDefined()
-    expect(convRow?.value).toBeCloseTo(0.5, 5)
+    expect(convRow?.value).toBeCloseTo(1 / 3, 5)
   })
 
   it('metric points have correct occurred_at (injected now)', async () => {
@@ -495,8 +497,11 @@ describe('C. Honesty: zero prospects → no fabrication', () => {
 // D. Honesty: sent=0 → no conversion point
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('D. Honesty: sent=0 → no growth.conversion emitted', () => {
-  it('queued-only funnel (no sent) → conversion is skipped', async () => {
+describe('D. Honesty: reached=0 → no growth.conversion emitted', () => {
+  // "reached" = sent + replied. Conversion is only meaningful when at least one
+  // prospect has been contacted. queued/drafted rows have NOT been contacted.
+
+  it('queued-only funnel (reached=0) → conversion is skipped', async () => {
     const { db, metricRows } = makeCollectorDb([
       { tenant: TENANT, status: 'queued' },
       { tenant: TENANT, status: 'queued' },
@@ -504,7 +509,7 @@ describe('D. Honesty: sent=0 → no growth.conversion emitted', () => {
 
     const result = await collectGrowthMetrics({ db }, TENANT, NOW, { idGen: makeId })
 
-    // leads + replies emitted; conversion skipped
+    // leads + replies emitted; conversion skipped (reached=0)
     expect(result.emitted).toBe(2)
     expect(result.skipped).toBe(1)
 
@@ -513,10 +518,10 @@ describe('D. Honesty: sent=0 → no growth.conversion emitted', () => {
 
     const convOutcome = result.outcomes.find((o) => o.key === 'growth.conversion')
     expect(convOutcome?.outcome).toBe('skipped')
-    expect(convOutcome?.detail).toMatch(/sent=0/)
+    expect(convOutcome?.detail).toMatch(/reached=0/)
   })
 
-  it('drafted-only funnel (not yet sent) → conversion is skipped', async () => {
+  it('drafted-only funnel (reached=0) → conversion is skipped', async () => {
     const { db, metricRows } = makeCollectorDb([
       { tenant: TENANT, status: 'drafted' },
       { tenant: TENANT, status: 'drafted' },
@@ -526,27 +531,53 @@ describe('D. Honesty: sent=0 → no growth.conversion emitted', () => {
     expect(result.emitted).toBe(2) // leads + replies(=0)
     expect(metricRows().find((r) => r.metric_key === 'growth.conversion')).toBeUndefined()
   })
+
+  it('zero prospects (all zero) → conversion is skipped', async () => {
+    // No prospects at all → reached=0; distinct from the C-section zero-total test
+    // (that proves emitted=0 overall; this specifically verifies the conversion guard).
+    const { metricRows } = makeCollectorDb([])
+    expect(metricRows().find((r) => r.metric_key === 'growth.conversion')).toBeUndefined()
+  })
 })
 
 // ────────────────────────────────────────────────────────────────────────────
 // E. Conversion arithmetic
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('E. Conversion arithmetic', () => {
-  it('100% reply rate: all sent have replied', async () => {
+describe('E. Conversion arithmetic — reply rate = replied / (sent + replied)', () => {
+  // All cases must produce a value in [0, 1] — bounded by construction.
+  // reached = sent + replied (mutually-exclusive current-state statuses).
+
+  it('100% rate: sent=0, replied=2 → reached=2, conversion=1.0 (NOT skipped)', async () => {
+    // All contacted prospects have replied — they moved out of 'sent' into 'replied'.
+    // Old logic would incorrectly skip this (sent=0); correct logic: reached=2, rate=1.0.
     const { db, metricRows } = makeCollectorDb([
-      { tenant: TENANT, status: 'sent' },
       { tenant: TENANT, status: 'replied' },
       { tenant: TENANT, status: 'replied' },
     ])
-    // sent=1, replied=2 → ratio = 2/1 = 2.0
-    // (cumulative model: replied can exceed sent if replies outpace current sent count)
     await collectGrowthMetrics({ db }, TENANT, NOW, { idGen: makeId })
     const row = metricRows().find((r) => r.metric_key === 'growth.conversion')
-    expect(row?.value).toBeCloseTo(2.0, 5)
+    expect(row?.value).toBeCloseTo(1.0, 5)
   })
 
-  it('25% reply rate: 4 sent, 1 replied', async () => {
+  it('~33% rate: sent=1, replied=2 → reached=3, conversion≈0.667 (NOT 2.0)', async () => {
+    // Old formula replied/sent = 2/1 = 2.0 — mathematically impossible rate > 100%.
+    // Correct: reached = 1+2 = 3, rate = 2/3 ≈ 0.667 — bounded in [0,1].
+    const { db, metricRows } = makeCollectorDb([
+      { tenant: TENANT, status: 'sent' },
+      { tenant: TENANT, status: 'replied' },
+      { tenant: TENANT, status: 'replied' },
+    ])
+    await collectGrowthMetrics({ db }, TENANT, NOW, { idGen: makeId })
+    const row = metricRows().find((r) => r.metric_key === 'growth.conversion')
+    expect(row?.value).toBeCloseTo(2 / 3, 5)
+    // Sanity: must be ≤ 1.0
+    expect((row?.value ?? 2)).toBeLessThanOrEqual(1.0)
+  })
+
+  it('20% rate: sent=4, replied=1 → reached=5, conversion=0.2', async () => {
+    // Old formula: 1/4 = 0.25 — wrong (ignored the replied row's contribution to denominator).
+    // Correct: reached = 4+1 = 5, rate = 1/5 = 0.2.
     const { db, metricRows } = makeCollectorDb([
       { tenant: TENANT, status: 'sent' },
       { tenant: TENANT, status: 'sent' },
@@ -556,10 +587,10 @@ describe('E. Conversion arithmetic', () => {
     ])
     await collectGrowthMetrics({ db }, TENANT, NOW, { idGen: makeId })
     const row = metricRows().find((r) => r.metric_key === 'growth.conversion')
-    expect(row?.value).toBeCloseTo(0.25, 5)
+    expect(row?.value).toBeCloseTo(0.2, 5)
   })
 
-  it('0% reply rate: 5 sent, 0 replied', async () => {
+  it('0% rate: sent=5, replied=0 → reached=5, conversion=0.0 (IS emitted)', async () => {
     const { db, metricRows } = makeCollectorDb([
       { tenant: TENANT, status: 'sent' },
       { tenant: TENANT, status: 'sent' },
@@ -569,8 +600,31 @@ describe('E. Conversion arithmetic', () => {
     ])
     await collectGrowthMetrics({ db }, TENANT, NOW, { idGen: makeId })
     const row = metricRows().find((r) => r.metric_key === 'growth.conversion')
-    // 0 replied / 5 sent = 0.0 — this IS emitted (sent > 0, so the ratio is defined)
+    // 0 replied / 5 reached = 0.0 — ratio IS defined (reached > 0) → emitted
     expect(row?.value).toBe(0)
+  })
+
+  it('conversion is always bounded [0, 1] across all status combinations', async () => {
+    // Exhaustive bound check: try several combinations and verify ≤ 1.0.
+    const scenarios: Array<{ sent: number; replied: number; expected: number }> = [
+      { sent: 0, replied: 1, expected: 1.0 },
+      { sent: 1, replied: 1, expected: 0.5 },
+      { sent: 3, replied: 1, expected: 0.25 },
+      { sent: 0, replied: 5, expected: 1.0 },
+      { sent: 5, replied: 0, expected: 0.0 },
+    ]
+    for (const { sent, replied, expected } of scenarios) {
+      const rows = [
+        ...Array.from({ length: sent }, () => ({ tenant: TENANT, status: 'sent' as const })),
+        ...Array.from({ length: replied }, () => ({ tenant: TENANT, status: 'replied' as const })),
+      ]
+      const { db, metricRows } = makeCollectorDb(rows)
+      await collectGrowthMetrics({ db }, TENANT, NOW, { idGen: makeId })
+      const row = metricRows().find((r) => r.metric_key === 'growth.conversion')
+      expect(row?.value ?? 0).toBeCloseTo(expected, 5)
+      expect(row?.value ?? 0).toBeLessThanOrEqual(1.0)
+      expect(row?.value ?? 0).toBeGreaterThanOrEqual(0.0)
+    }
   })
 })
 
@@ -813,5 +867,68 @@ describe('J. readProspectCounts tenant isolation', () => {
     expect(counts.sent).toBe(0)
     expect(counts.replied).toBe(0)
     // Total active funnel = 1, not 3
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// K. Kernel boundary hardening (WARN-1 + WARN-2)
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('K. Kernel boundary: key_mismatch + module freeze (WARN-1, WARN-2)', () => {
+  it('WARN-2: mint throws key_mismatch when departmentKey differs from module.key', () => {
+    const { db } = makeCollectorDb([])
+    expect(() =>
+      kernelMintCtx({ db }, {
+        tenantId: TENANT,
+        departmentKey: 'finance',   // does NOT match GrowthModule.key = 'growth'
+        module: GrowthModule,
+        capabilities: ['member'],
+      }),
+    ).toThrow(/key_mismatch/)
+  })
+
+  it('WARN-2: mint succeeds when departmentKey matches module.key', () => {
+    const { db } = makeCollectorDb([])
+    expect(() =>
+      kernelMintCtx({ db }, {
+        tenantId: TENANT,
+        departmentKey: 'growth',
+        module: GrowthModule,
+        capabilities: ['member'],
+      }),
+    ).not.toThrow()
+  })
+
+  it('WARN-1: mutating the module object after mint does not widen ctx authority', async () => {
+    // Construct a mutable copy of GrowthModule and mint a ctx from it.
+    // Then push a new (unauthorized) metric descriptor onto the original's metricsEmitted.
+    // The ctx authority must remain frozen to the state at mint time.
+    const mutableModule = { ...GrowthModule, metricsEmitted: [...GrowthModule.metricsEmitted] }
+    const { db } = makeCollectorDb([])
+    const ctx = kernelMintCtx({ db }, {
+      tenantId: TENANT,
+      departmentKey: 'growth',
+      module: mutableModule,
+      capabilities: ['member'],
+    })
+
+    // Attempt to widen authority post-mint by injecting a new key into the original array.
+    // The kernel froze a clone at mint time — this push does NOT affect _metricsMap.
+    mutableModule.metricsEmitted.push({
+      key: 'growth.injected',
+      unit: 'count',
+      direction: 'up_good',
+      cadence: 'daily',
+      aggregation: 'sum',
+      ohlcEligible: false,
+      sourceAuthority: ['prospects'],
+      retention: '90d',
+      display: { precision: 0 },
+    })
+
+    // Emit on the injected key should still be rejected — it was not present at mint time.
+    await expect(
+      ctx.metrics.emit({ key: 'growth.injected', value: 1, occurredAt: NOW, source: 'prospects' }),
+    ).rejects.toThrow(/key_not_owned|is not declared/)
   })
 })

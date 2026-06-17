@@ -20,7 +20,7 @@
 //
 // Honesty contract:
 //   - Zero prospects → emits nothing (empty state, not fabricated zeros).
-//   - sent = 0 → no conversion point emitted (avoids division-by-zero fabrication).
+//   - reached = 0 → no conversion point emitted (reached = sent + replied; no-data, not fabricated zero).
 //   - All emitted values are direct DB counts — no interpolation or estimation.
 //   - occurred_at = `now` parameter (injected, deterministic — no Date.now() inside).
 //
@@ -106,8 +106,8 @@ export interface CollectResult {
 // Honesty:
 //   - Zero total prospects (queued+drafted+sent+replied all zero) → emits nothing.
 //     The caller sees { emitted: 0, skipped: 3 } — an honest empty state.
-//   - sent = 0 → no growth.conversion point emitted (no division-by-zero fabrication).
-//     The caller sees 'skipped' for growth.conversion with detail 'sent=0'.
+//   - reached = 0 → no growth.conversion point emitted (reached = sent + replied; no outreach yet).
+//     The caller sees 'skipped' for growth.conversion with detail 'reached=0'.
 
 export async function collectGrowthMetrics(
   handle: KernelHandle,
@@ -179,23 +179,30 @@ export async function collectGrowthMetrics(
 
   // ── growth.conversion ─────────────────────────────────────────────────────
   //
-  // Ratio: replied / sent. Only emitted when sent > 0 to avoid fabrication.
-  // Definition: of the prospects we actually reached out to (status='sent'),
-  // how many replied? This is the outreach effectiveness rate.
+  // Reply rate = replied / (sent + replied).
   //
-  // Note: prospects in 'replied' may have been 'sent' in a prior tick. The
-  // formula counts cumulative totals (not a per-period cohort). This is honest
-  // for the current data model — a per-period cohort would require temporal
-  // joins we don't have yet.
-  if (counts.sent === 0) {
+  // Why (sent + replied) as the denominator, not just sent:
+  //   The prospects table uses mutually-exclusive, current-state statuses.
+  //   A prospect moves FROM 'sent' TO 'replied' — so replied rows are NO LONGER
+  //   counted in sent. Using sent alone as the denominator produces values > 1
+  //   (e.g. sent=1, replied=2 → 2.0) and incorrectly skips the metric when
+  //   everyone who was reached has already replied (sent=0, replied>0).
+  //
+  //   reached = sent + replied = total prospects known to have been contacted.
+  //   By construction: 0 ≤ replied ≤ reached, so conversion ∈ [0, 1].
+  //
+  // When reached === 0 (nobody contacted yet) → no conversion point emitted.
+  // Honest no-data, not a fabricated zero.
+  const reached = counts.sent + counts.replied
+  if (reached === 0) {
     result.skipped++
     result.outcomes.push({
       key: 'growth.conversion',
       outcome: 'skipped',
-      detail: 'sent=0 (no outreach yet — conversion undefined)',
+      detail: 'reached=0 (no outreach yet — conversion undefined)',
     })
   } else {
-    const conversionValue = counts.replied / counts.sent
+    const conversionValue = counts.replied / reached
     const convOutcome = await emitSafe(ctx.metrics.emit({
       key: 'growth.conversion',
       value: conversionValue,
