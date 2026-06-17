@@ -6,6 +6,7 @@
 
 import type { Env, Task, TaskVerdict, BusEvent } from '../types'
 import { createBus } from '../bus'
+import { assertWritten } from '../lib/receipt'
 import { resolveOutboundGitHubToken } from '../integrations/github-app'
 
 export type TaskStatus = Task['status']
@@ -366,7 +367,7 @@ export async function createTask(
 
   task.github_issue_url = options.skipMirror ? null : await mirrorTaskCreate(env, task)
 
-  await env.DB.prepare(
+  const taskInsert = await env.DB.prepare(
     `INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
@@ -386,6 +387,9 @@ export async function createTask(
       task.updated_at,
     )
     .run()
+  // Receipt (#186): a 0-row INSERT resolves without throwing — verify the row
+  // actually landed before we emit "created" and return the task as success.
+  assertWritten(taskInsert, 'tasks.insert')
 
   await emitTaskEvent(env, 'task.created', task, options.actor)
   return task
