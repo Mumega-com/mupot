@@ -8,7 +8,9 @@
 // Key invariants (enforced here, verified in tests):
 //   - tenant_id is ALWAYS bound in SQL, never derived from a metric-row field.
 //   - emitMetric() uses the write-receipt guard (assertWritten) — no phantom success.
-//   - UNIQUE(tenant_id, metric_key, occurred_at, source) collisions → 'duplicate', not 500.
+//   - ONLY composite ingest-key collisions (tenant_id,metric_key,occurred_at,source)
+//     → 'duplicate'. PK (id) or any other UNIQUE failure → rethrow (distinct reading
+//     must not be silently dropped).
 //   - aggregateOHLC is PURE (no I/O, no side-effects; inject timestamps, not Date.now).
 //   - seriesShape refuses to label a single-reading-per-day series 'candle'.
 //
@@ -61,6 +63,12 @@ const METRIC_KEY_RE = /^[a-z0-9._]+$/
 const MAX_KEY_LEN = 64
 const MAX_SOURCE_LEN = 64
 
+// FIX-4: year range guard for assertIso — negative-year and far-future ISO strings
+// round-trip perfectly but produce malformed day-buckets (e.g. '-000001-06-17' sliced
+// to '-000' as the date prefix). Restrict to [2000, 2200].
+const MIN_YEAR = 2000
+const MAX_YEAR = 2200
+
 class ValidationError extends Error {
   readonly code = 'validation_error'
   constructor(field: string, reason: string) {
@@ -68,10 +76,44 @@ class ValidationError extends Error {
   }
 }
 
-/** Strict ISO 8601 round-trip check: the only canonical forms pass. */
+/**
+ * Strict ISO 8601 round-trip + sanity guards.
+ *
+ * FIX-2: `new Date(v).toISOString()` itself throws a RangeError for empty strings,
+ * whitespace, invalid month/second, 'not-a-date', etc.  We guard with getTime()
+ * first so ALL bad inputs produce a ValidationError (not a raw RangeError → 500).
+ *
+ * FIX-4: Negative-year ISO timestamps round-trip correctly but `.slice(0,10)` in
+ * aggregateOHLC would produce a malformed bucket key.  We reject years outside
+ * [MIN_YEAR, MAX_YEAR].
+ */
 function assertIso(v: string, field: string): void {
-  if (v !== new Date(v).toISOString()) {
+  let date: Date
+  try {
+    date = new Date(v)
+  } catch {
+    throw new ValidationError(field, `unparseable timestamp (got "${v}")`)
+  }
+  if (isNaN(date.getTime())) {
+    throw new ValidationError(field, `unparseable/non-canonical timestamp (got "${v}")`)
+  }
+  // Round-trip check: only strict canonical forms (e.g. "…Z" with milliseconds) pass
+  let canonical: string
+  try {
+    canonical = date.toISOString()
+  } catch {
+    throw new ValidationError(field, `unparseable/non-canonical timestamp (got "${v}")`)
+  }
+  if (v !== canonical) {
     throw new ValidationError(field, `not strict-canonical ISO 8601 (got "${v}")`)
+  }
+  // Year range guard (FIX-4)
+  const year = date.getUTCFullYear()
+  if (year < MIN_YEAR || year > MAX_YEAR) {
+    throw new ValidationError(
+      field,
+      `year ${year} out of allowed range [${MIN_YEAR}, ${MAX_YEAR}] (got "${v}")`,
+    )
   }
 }
 
@@ -150,13 +192,25 @@ export async function emitMetric(
       )
       .run()
   } catch (err: unknown) {
-    // D1 UNIQUE constraint violation surfaces as an error whose message contains
-    // 'UNIQUE constraint failed'. Map to a clean 'duplicate' outcome.
+    // FIX-1: Only the composite ingest key (tenant_id, metric_key, occurred_at, source)
+    // is a safe idempotent duplicate — the SAME reading being re-submitted.  A PK (id)
+    // collision or any other/unknown UNIQUE violation means a DISTINCT reading was about
+    // to be dropped; that must not be silently mapped to 'duplicate'.
+    //
+    // SQLite/D1 names the offending columns in the message, e.g.:
+    //   "UNIQUE constraint failed: metric_points.tenant_id, metric_points.metric_key,
+    //    metric_points.occurred_at, metric_points.source"
+    // vs a PK collision:
+    //   "UNIQUE constraint failed: metric_points.id"
+    //
+    // We match only the exact composite set; anything else is rethrown.
     const msg = err instanceof Error ? err.message : String(err)
-    if (msg.includes('UNIQUE constraint failed')) {
+    const COMPOSITE_UNIQUE_PATTERN =
+      /UNIQUE constraint failed:\s*metric_points\.tenant_id,\s*metric_points\.metric_key,\s*metric_points\.occurred_at,\s*metric_points\.source/
+    if (COMPOSITE_UNIQUE_PATTERN.test(msg)) {
       return { ok: false, reason: 'duplicate' }
     }
-    throw err // re-throw anything else
+    throw err // PK collision, other UNIQUE, or any non-constraint error — fail hard
   }
 
   // assertWritten throws receipt_failed if D1 acknowledged 0 rows without an error
@@ -168,9 +222,18 @@ export async function emitMetric(
 
 // ── readSeries ────────────────────────────────────────────────────────────────
 
+// FIX-3: Cap rows returned by readSeries so aggregateOHLC's reduce-based min/max
+// never receives an unbounded array.  10 000 rows ≈ 27 readings/day over a full year —
+// a defensible upper bound for dashboard charting.  Callers needing bulk export must
+// page themselves.
+const READ_SERIES_LIMIT = 10_000
+
 /**
  * Fetch metric readings for one tenant + key within [fromISO, toISO] inclusive.
  * tenant_id is always in the SQL WHERE clause — no cross-tenant data ever returns.
+ *
+ * FIX-3: LIMIT READ_SERIES_LIMIT prevents unbounded result sets that would cause
+ * Math.max/min spread-crash in aggregateOHLC for tenants with many readings.
  */
 export async function readSeries(
   db: D1Database,
@@ -187,6 +250,7 @@ export async function readSeries(
       AND occurred_at >= ?3
       AND occurred_at <= ?4
     ORDER BY occurred_at ASC
+    LIMIT ${READ_SERIES_LIMIT}
   `
   const result = await db
     .prepare(sql)
@@ -253,11 +317,16 @@ export function aggregateOHLC(
     const pts = days.get(date)! // always present by construction
     // pts already arrive sorted by occurred_at (readSeries ORDER BY occurred_at ASC)
     const values = pts.map((p) => p.value)
+    // FIX-3: Use reduce-based min/max to avoid spread RangeError ("Maximum call stack")
+    // on large series (>~120k elements).  Math.max(...values) applies the spread as
+    // individual function arguments which exhaust the call stack at scale.
+    const high = values.reduce((m, v) => (v > m ? v : m), values[0])
+    const low = values.reduce((m, v) => (v < m ? v : m), values[0])
     result.push({
       date,
       open: values[0],
-      high: Math.max(...values),
-      low: Math.min(...values),
+      high,
+      low,
       close: values[values.length - 1],
       count: values.length,
     })

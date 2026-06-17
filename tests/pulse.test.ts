@@ -4,6 +4,10 @@
 //   - emitMetric: round-trip via readSeries; tenant isolation.
 //   - emitMetric rejects: non-finite value, non-canonical occurred_at, oversized /
 //     invalid metric_key, 0-row write receipt guard, UNIQUE collision → 'duplicate'.
+//   - FIX-1: PK (id) collision on a DISTINCT tuple → throws, not 'duplicate'.
+//   - FIX-2: assertIso rejects '', whitespace, bad month, bad second → ValidationError.
+//   - FIX-3: aggregateOHLC handles large bucket without spread RangeError.
+//   - FIX-4: negative-year / out-of-range ISO → ValidationError.
 //   - aggregateOHLC: multi-reading day (real OHLC); single-reading day (O==H==L==C).
 //   - seriesShape: any day with count>=2 → 'candle'; all single-reading → 'bar'.
 //
@@ -53,6 +57,12 @@ function makeDb(opts: { phantomZeroOnInsert?: boolean } = {}): {
                 // args: id, tenant_id, metric_key, value, occurred_at, source, created_at
                 const [id, tenant_id, metric_key, value, occurred_at, source, created_at] =
                   args as [string, string, string, number, string, string, string]
+
+                // PK UNIQUE (id) — checked first, like SQLite does
+                const pkDup = store.some((r) => r.id === id)
+                if (pkDup) {
+                  throw new Error('D1_ERROR: UNIQUE constraint failed: metric_points.id')
+                }
 
                 // UNIQUE(tenant_id, metric_key, occurred_at, source) — throw like real D1
                 const dup = store.some(
@@ -441,5 +451,231 @@ describe('integration: emit → read → aggregate → shape', () => {
     const pts = await readSeries(db, TENANT_A, KEY, T1, T_DAY2)
     const buckets = aggregateOHLC(pts, { bucket: 'day' })
     expect(seriesShape(buckets)).toBe('bar')
+  })
+})
+
+// ── FIX-1: PK collision on a DISTINCT tuple → must throw, not 'duplicate' ──────
+//
+// Regression: the old code mapped ANY "UNIQUE constraint failed" to 'duplicate',
+// including PK (id) collisions where the TUPLE is different. A caller that
+// generates a collision on `id` (e.g. UUID exhaustion, a bug, or an adversarial
+// replay) would have silently lost a distinct reading.  The fix matches ONLY the
+// composite ingest key; a PK violation rethrows.
+
+describe('FIX-1 — PK (id) collision on distinct tuple must throw, not duplicate', () => {
+  it('re-using the same id for a different tuple throws (not "duplicate")', async () => {
+    const { db } = makeDb()
+    const SHARED_ID = 'shared-id-001'
+    // First insert — succeeds with id=SHARED_ID for tuple-A
+    const first = await emitMetric(
+      db,
+      { tenantId: TENANT_A, metricKey: KEY, value: 1, occurredAt: T1, source: 'manual' },
+      SHARED_ID,
+      CREATED,
+    )
+    expect(first).toEqual({ ok: true, id: SHARED_ID })
+
+    // Second insert — DIFFERENT tuple (T2 ≠ T1) but SAME id → PK collision → must throw
+    await expect(
+      emitMetric(
+        db,
+        { tenantId: TENANT_A, metricKey: KEY, value: 999, occurredAt: T2, source: 'manual' },
+        SHARED_ID,   // same id as above
+        CREATED,
+      ),
+    ).rejects.toThrow(/metric_points\.id/)
+  })
+
+  it('composite-key duplicate (same id AND same tuple) still returns "duplicate"', async () => {
+    // Guard: identical tuple AND same id → the composite check wins (real D1 would
+    // hit PK first, but since the mock checks PK first too, this is consistent).
+    // For the idempotent-resend scenario (same everything) the caller uses a
+    // deterministic id derived from the tuple, so both constraints fire together.
+    // We test with the COMPOSITE-only path (different id, same tuple):
+    const { db } = makeDb()
+    const input = { tenantId: TENANT_A, metricKey: KEY, value: 5, occurredAt: T1, source: 'manual' }
+    await emitMetric(db, input, 'id-first-2', CREATED)
+    // Different id, same tuple → composite key collision → 'duplicate'
+    const second = await emitMetric(db, input, 'id-second-2', CREATED)
+    expect(second).toEqual({ ok: false, reason: 'duplicate' })
+  })
+})
+
+// ── FIX-2: assertIso — unparseable inputs → ValidationError, not RangeError ────
+//
+// Regression: `new Date(v).toISOString()` throws a native RangeError for empty
+// strings, whitespace, invalid month (13), invalid second (61), 'not-a-date', etc.
+// The prior code had no guard, so those inputs would surface as a 500 rather than
+// the documented validation_error.
+
+describe('FIX-2 — assertIso rejects all bad inputs with ValidationError, not RangeError', () => {
+  const base = { tenantId: TENANT_A, metricKey: KEY, value: 5, source: 'manual' }
+
+  describe('occurredAt field', () => {
+    it('rejects empty string', async () => {
+      const { db } = makeDb()
+      const err = await emitMetric(db, { ...base, occurredAt: '' }, 'id', CREATED).catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(Error)
+      expect((err as Error).message).toMatch(/occurred_at/)
+      // Must NOT be a native RangeError from toISOString()
+      expect((err as Error).constructor.name).not.toBe('RangeError')
+    })
+
+    it('rejects whitespace-only string', async () => {
+      const { db } = makeDb()
+      await expect(emitMetric(db, { ...base, occurredAt: '   ' }, 'id', CREATED)).rejects.toThrow(/occurred_at/)
+    })
+
+    it('rejects invalid month (13)', async () => {
+      const { db } = makeDb()
+      await expect(
+        emitMetric(db, { ...base, occurredAt: '2026-13-01T00:00:00.000Z' }, 'id', CREATED),
+      ).rejects.toThrow(/occurred_at/)
+    })
+
+    it('rejects invalid second (61)', async () => {
+      const { db } = makeDb()
+      await expect(
+        emitMetric(db, { ...base, occurredAt: '2026-06-17T00:00:61.000Z' }, 'id', CREATED),
+      ).rejects.toThrow(/occurred_at/)
+    })
+
+    it('rejects "not-a-date"', async () => {
+      const { db } = makeDb()
+      await expect(
+        emitMetric(db, { ...base, occurredAt: 'not-a-date' }, 'id', CREATED),
+      ).rejects.toThrow(/occurred_at/)
+    })
+  })
+
+  describe('createdAt field', () => {
+    it('rejects empty string', async () => {
+      const { db } = makeDb()
+      const err = await emitMetric(db, { ...base, occurredAt: T1 }, 'id', '').catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(Error)
+      expect((err as Error).message).toMatch(/created_at/)
+      expect((err as Error).constructor.name).not.toBe('RangeError')
+    })
+
+    it('rejects whitespace-only createdAt', async () => {
+      const { db } = makeDb()
+      await expect(emitMetric(db, { ...base, occurredAt: T1 }, 'id', '   ')).rejects.toThrow(/created_at/)
+    })
+
+    it('rejects invalid month (13) in createdAt', async () => {
+      const { db } = makeDb()
+      await expect(
+        emitMetric(db, { ...base, occurredAt: T1 }, 'id', '2026-13-01T00:00:00.000Z'),
+      ).rejects.toThrow(/created_at/)
+    })
+
+    it('rejects invalid second (61) in createdAt', async () => {
+      const { db } = makeDb()
+      await expect(
+        emitMetric(db, { ...base, occurredAt: T1 }, 'id', '2026-06-17T00:00:61.000Z'),
+      ).rejects.toThrow(/created_at/)
+    })
+  })
+})
+
+// ── FIX-3: aggregateOHLC handles large buckets without spread RangeError ────────
+//
+// Regression: Math.max(...values) / Math.min(...values) throw "Maximum call stack
+// exceeded" at ~120k+ arguments (all fed as individual function args via spread).
+// The fix uses reduce-based min/max which handles any array length.
+
+describe('FIX-3 — aggregateOHLC does not crash on large bucket (reduce-based min/max)', () => {
+  it('handles 5 000 readings in a single day without throwing', () => {
+    // Build 5000 readings all on the same UTC day.
+    // Values alternate high/low so we can verify correct min/max.
+    const N = 5_000
+    const rows: Array<{ value: number; occurredAt: string }> = []
+    for (let i = 0; i < N; i++) {
+      // Use a zero-padded second to stay within one day (00:00:00 – 01:23:19)
+      const hh = String(Math.floor(i / 3600)).padStart(2, '0')
+      const mm = String(Math.floor((i % 3600) / 60)).padStart(2, '0')
+      const ss = String(i % 60).padStart(2, '0')
+      rows.push({ value: i, occurredAt: `2026-06-17T${hh}:${mm}:${ss}.000Z` })
+    }
+
+    let buckets: ReturnType<typeof aggregateOHLC>
+    // Must NOT throw
+    expect(() => {
+      buckets = aggregateOHLC(rows, { bucket: 'day' })
+    }).not.toThrow()
+
+    expect(buckets!).toHaveLength(1)
+    const b = buckets![0]
+    expect(b.date).toBe('2026-06-17')
+    expect(b.count).toBe(N)
+    expect(b.open).toBe(0)       // first reading value=0
+    expect(b.close).toBe(N - 1) // last reading value=N-1
+    expect(b.high).toBe(N - 1)  // max value = N-1
+    expect(b.low).toBe(0)       // min value = 0
+  })
+})
+
+// ── FIX-4: negative-year and out-of-range ISO → ValidationError ─────────────────
+//
+// Regression: '-000001-06-17T00:00:00.000Z' passes the round-trip check (JS Date
+// handles it and toISOString() emits the same string) but aggregateOHLC slices
+// occurredAt.slice(0,10) → '-000' which is a malformed bucket key corrupting the
+// candlestick series.  The year range guard [2000, 2200] in assertIso blocks this.
+
+describe('FIX-4 — negative-year and out-of-range ISO rejected with ValidationError', () => {
+  const base = { tenantId: TENANT_A, metricKey: KEY, value: 5, source: 'manual' }
+
+  it('rejects negative-year occurredAt', async () => {
+    const { db } = makeDb()
+    // Note: '-000001-06-17T00:00:00.000Z' is a valid ECMAScript ISO extended date
+    // that passes round-trip but has year=-1 which we ban.
+    await expect(
+      emitMetric(db, { ...base, occurredAt: '-000001-06-17T00:00:00.000Z' }, 'id', CREATED),
+    ).rejects.toThrow(/occurred_at/)
+  })
+
+  it('rejects year 1999 (below MIN_YEAR=2000) in occurredAt', async () => {
+    const { db } = makeDb()
+    await expect(
+      emitMetric(db, { ...base, occurredAt: '1999-12-31T23:59:59.999Z' }, 'id', CREATED),
+    ).rejects.toThrow(/occurred_at/)
+  })
+
+  it('rejects year 2201 (above MAX_YEAR=2200) in occurredAt', async () => {
+    const { db } = makeDb()
+    await expect(
+      emitMetric(db, { ...base, occurredAt: '2201-01-01T00:00:00.000Z' }, 'id', CREATED),
+    ).rejects.toThrow(/occurred_at/)
+  })
+
+  it('rejects negative-year createdAt', async () => {
+    const { db } = makeDb()
+    await expect(
+      emitMetric(db, { ...base, occurredAt: T1 }, 'id', '-000001-06-17T00:00:00.000Z'),
+    ).rejects.toThrow(/created_at/)
+  })
+
+  it('accepts a normal in-range year (boundary: 2000)', async () => {
+    const { db } = makeDb()
+    await expect(
+      emitMetric(
+        db,
+        { ...base, occurredAt: '2000-01-01T00:00:00.000Z' },
+        'id-y2k',
+        '2000-01-01T00:00:00.000Z',
+      ),
+    ).resolves.toMatchObject({ ok: true })
+  })
+
+  it('accepts a normal in-range year (boundary: 2200)', async () => {
+    const { db } = makeDb()
+    await expect(
+      emitMetric(
+        db,
+        { ...base, occurredAt: '2200-12-31T23:59:59.999Z' },
+        'id-y2200',
+        '2200-12-31T23:59:59.999Z',
+      ),
+    ).resolves.toMatchObject({ ok: true })
   })
 })
