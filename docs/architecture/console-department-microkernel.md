@@ -106,6 +106,11 @@ interface DepartmentModule {
 primitives.** Departments are orchestrations *on top of* the ports, not extensions of them.
 The core stays minimal; departments are services built from kernel calls.
 
+**Keep the contract declarative (Codex, 2026-06-17).** `DepartmentModule` is a *manifest* —
+metrics, console refs, default seeds, connector refs, required caps. It must NOT grow bespoke
+per-department runtime lifecycle hooks; runtime behavior calls existing ports. If every department
+gets its own hooks, the contract accretes into a **second kernel** and the architecture is lost.
+
 ### 3.3 Registry + lifecycle (reuses the existing `departments` table)
 
 - Activation does **not** require a schema migration. It writes a real `department` row +
@@ -115,25 +120,69 @@ The core stays minimal; departments are services built from kernel calls.
   one department's removal cannot break the kernel or its siblings.
 - Console nav = **active departments only**. The org shape *is* the activated set.
 
-### 3.4 Capability confinement (deny-by-default — this is the AAGATE floor, #183)
+### 3.4 Capability confinement — object-capability `ctx`, not raw access (the real mechanism)
 
-Each module declares `requiredCapabilities`; the kernel enforces deny-by-default. Growth cannot
-read Finance's tables, cannot mint tokens, cannot act un-gated. The capability-floor work
-(PR #183, live) is the kernel guarantee that makes department isolation real, not cosmetic.
-Marketing *actions* (sends, spend commits) flow through the **Gate** — agents propose, the human
-authorizes — same governance story, same wake-not-steer rule.
+Each module declares `requiredCapabilities`; the kernel enforces deny-by-default (the AAGATE
+floor, PR #183, live). Growth cannot read Finance's tables, cannot mint tokens, cannot act
+un-gated. Marketing *actions* (sends, spend commits) flow through the **Gate** — agents propose,
+human authorizes — same wake-not-steer rule.
 
-### 3.5 The litmus test (how we "make sure it's microkernel")
+**But confinement is only real if modules never touch raw substrate (Codex, 2026-06-17).** CF
+Workers give **no process isolation** — "user space" here is *architectural, not physical*, one
+bundle. So a module that receives raw `D1`/`KV`/`env`/`session` makes capability-confinement
+**theater**. The required shape is **object-capability**:
 
-> **Add a brand-new department — e.g. "Legal" — by writing ONE module that satisfies
-> `DepartmentModule`, registering it, with ZERO edits to the kernel and ZERO edits to any other
-> department.**
+- A module **never sees** raw DB/KV/env/session.
+- The kernel mints a **`ctx`** after resolving `tenant + actor + department + capabilities`, and
+  hands the module only narrow port facades:
+  `metrics.emit(ctx, …)` · `audit.write(ctx, …)` · `gate.propose(ctx, …)` · `bus.publish(ctx, …)` ·
+  `db.query(ctx, …)` (scoped).
+- **Every port re-checks** the capability, **binds tenant + department** into the query, and
+  **writes a receipt.** A module cannot widen its own scope because it holds no unbound handle.
+- **Direct DB access inside a department = a policy violation**, caught by the conformance harness
+  (§6), not just by convention.
 
-- **Yes** → it is a microkernel.
-- **If adding a department requires touching core code** → it's a monolith with sections.
+This is the AAGATE floor extended from "checked at the door" to "the module is handed only
+pre-bound, self-checking capabilities." It is the single thing that makes in-bundle department
+isolation real rather than cosmetic.
 
-Removal counterpart: deactivating a department cannot break the kernel or its siblings.
-**Every PR in this system is gated against this test.**
+### 3.4b Versioning & lifecycle — activation is harder than registration (Codex, 2026-06-17)
+
+Registering a module is easy; *evolving* an activated one is the hard part. The lifecycle must carry:
+- **template version** vs **activated-instance version** (a pot pinned an old template; the template moved on).
+- **idempotent seed receipts** — re-activation never double-seeds squads/agents.
+- **deactivate / reactivate** semantics (data retained dormant) + **rollback** rules.
+- **migrations/backfills** when a template version bumps.
+
+Without this, departments are *easy to add and painful to evolve* — the trap.
+
+### 3.5 The litmus test (how we "make sure it's microkernel") — mechanical version
+
+Sharpened after cross-vendor review (Codex, 2026-06-17). "Zero kernel edits" alone is too loose;
+the bar is **mechanical and enumerated**:
+
+> **Add a brand-new department — e.g. "Legal" — by adding ONE module package/manifest + its tests,
+> with NO edits to any of:**
+> - kernel code · the nav switch/registry logic · the metric-selector logic
+> - the capability resolver · the audit writer · the bus routing · the DB schema
+> - any *sibling* department
+>
+> **AND** activation/deactivation is **idempotent**, **AND** removing Legal leaves every other
+> department + all kernel tests **green**.
+
+- If bundling requires one import into a *non-kernel* module index, that is **registry plumbing** —
+  call it out explicitly; it is not a kernel edit.
+- **Yes** → microkernel. **Any edit to the enumerated list** → modular monolith wearing the name.
+
+Enforced by a **department conformance harness** (§6), not by prose — the fixture department must
+pass it before any real department is built.
+
+### 3.5b Naming discipline
+
+Keep the word "microkernel" **only while the core stays tiny** — identity / caps / audit / bus /
+registry / ports. The 9 universal functions are **bundled default modules, never privileged core.**
+The moment Growth or Finance gets special-cased in `shell()`, the metric selector, or the
+capability resolver, the architecture has already slipped to modular monolith — drop the word.
 
 ---
 
@@ -156,6 +205,25 @@ CREATE TABLE metric_points (
 
 Departments (and connectors) **emit timestamped readings** into this one table. It is the
 single per-pot time-series spine.
+
+**Every `metric_key` needs a typed `MetricDescriptor` (Codex, 2026-06-17) — or the spine pollutes.**
+A bare key lets `growth.revenue` from Stripe, manual entry, and brain inference collapse into one
+meaningless series. Each metric a department emits must declare:
+```ts
+interface MetricDescriptor {
+  key: string                 // 'growth.revenue'
+  unit: string                // 'usd' | 'count' | 'ratio' | …
+  direction: 'up_good' | 'down_good' | 'neutral'
+  cadence: 'realtime' | 'daily' | 'weekly'
+  aggregation: 'sum' | 'last' | 'avg' | 'max'   // how multiple readings combine
+  ohlcEligible: boolean       // honesty: false → render as bar, never a candle
+  sourceAuthority: string[]   // which sources may write this key (Stripe? manual? brain?)
+  retention: string           // how long readings are kept
+  display: { precision: number; prefix?: string; suffix?: string }
+}
+```
+`sourceAuthority` is the anti-pollution guard: a reading whose `source` isn't authorized for the
+key is rejected. `ohlcEligible` is the honesty guard from §4.2 made declarative.
 
 ### 4.2 OHLC aggregation — honest by construction
 
@@ -205,14 +273,26 @@ pulses = the v0.24 afferent rail) feed it; connector secrets are **Hadi-gated**.
 ## 6. Build sequence
 
 - **Phase 0 — this doc.** ✅
-- **Phase 1 — Console spine re-skin.** Light-default theme tokens + 3 fonts + light/dark toggle
-  + re-skinned Stripe sidebar + top-bar regime chip in `shell()`. Wire the **scalar KPIs to real
-  data** (they exist today). Branch, diverse-gated, **no live flip without Hadi-go.**
-- **Phase 2 — Microkernel core.** `DepartmentModule` contract + registry + activate/deactivate on
-  the `departments` table + `metric_points` spine + OHLC aggregation. **Must pass the §3.5 litmus
-  test.**
-- **Phase 3 — Growth department** (first module) + candle wired to its metrics + honest empty states.
-- **Phase 4 —** Finance revenue side · Customer Success · re-skin remaining strong departments.
+- **Phase 1 — Pulse spine.** `metric_points` + OHLC aggregation + honest `seriesShape` + truncation
+  flag. ✅ (PR #192, dual-gated GREEN.)
+- **Phase 2 — Microkernel core + PROOF (sequence corrected per Codex, 2026-06-17).** In order:
+  1. `DepartmentModule` **declarative** contract + `MetricDescriptor` schema (§4.1).
+  2. Object-capability **`ctx` + port facades** (§3.4) — modules never see raw substrate.
+  3. **Registry + lifecycle** (activate/deactivate/versioning, §3.4b) on the `departments` table.
+  4. A **Null/Legal *fixture* department** — no product value, exists only to prove the litmus.
+  5. A **department conformance harness** that mechanically enforces §3.5: the fixture activates
+     (nav appears, descriptors register, seeds idempotently), deactivates (hides), and is *removed*
+     with **zero edits** to kernel/nav/metric-selector/capability-resolver/audit/bus/schema/siblings
+     + all kernel tests green.
+  - **Gate: the harness must pass on the fixture before any real department is built.** If it can't,
+    fix the seam first. (Growth is too semantically rich to be the first proof — it would hide
+    contract mistakes behind product complexity.)
+- **Phase 3 — Console spine re-skin.** Light-default tokens + 3 fonts + light/dark toggle +
+  re-skinned Stripe sidebar + regime chip in `shell()`; wire the **scalar KPIs to real data**
+  (exist today). Branch, diverse-gated, **no live flip without Hadi-go.**
+- **Phase 4 — Growth department** (first *real* module, built once the harness is green) + candle
+  wired to its metrics + honest empty states.
+- **Phase 5 —** Finance revenue side · Customer Success · re-skin remaining strong departments.
 
 ---
 
