@@ -121,3 +121,54 @@ describe('invokeTool — capability floor enforced at the chokepoint', () => {
     expect(out.error).toBe('unknown_tool')
   })
 })
+
+// ── 4. status — `authenticated` floor exempt, but the cross-agent branch is gated ─
+// (#183 adversarial review P1: the floor cannot gate min:'authenticated' tools, so
+// the status agent_id lookup must carry its own observer-on-squad check.)
+describe('status — self-echo open, cross-agent lookup gated in-handler', () => {
+  // DB answering the status agent_id path: an agent row + a (dept-less) squad.
+  const agentDb = {
+    prepare(sql: string) {
+      return {
+        bind: () => ({
+          async first() {
+            if (sql.includes('FROM agents')) return { id: 'agent-9', name: 'a', role: 'r', model: 'm', status: 'idle', squad_id: 'squad-Z' }
+            if (sql.includes('FROM squads')) return { department_id: null }
+            return null
+          },
+          async all() { return { results: [] } },
+        }),
+      }
+    },
+  }
+
+  it('self-echo (no agent_id) is open to any authenticated member — no 403', async () => {
+    const noTouchDb = { prepare() { throw new Error('self-echo must not touch DB') } }
+    const env = { TENANT_SLUG: 'test', DB: noTouchDb } as unknown as Env
+    const out = await invokeTool(auth({ capabilities: [] }), env, 'status', {}, 'https://test')
+    expect(out.ok).toBe(true) // returns the caller's own principal, touches no DB
+  })
+
+  it('cross-agent lookup by a grantless member → 403 forbidden (observer-on-squad required)', async () => {
+    const env = { TENANT_SLUG: 'test', DB: agentDb } as unknown as Env
+    const out = await invokeTool(auth({ capabilities: [] }), env, 'status', { agent_id: 'agent-9' }, 'https://test')
+    expect(out.ok).toBe(false)
+    expect(out.status).toBe(403)
+    expect(out.error).toBe('forbidden')
+    expect((out.detail as { need?: string })?.need).toBe('observer')
+  })
+})
+
+// ── 5. OAuth-path invariant — capabilities:[] is NOT the legacy-role escape ────
+// The directory/OAuth channel intentionally yields capabilities:[] (a resolved,
+// non-undefined array). An org admin going through that door must be floored out of
+// admin-gated tools — the legacy-role escape fires ONLY for capabilities===undefined
+// (web-login seam that cannot reach MCP dispatch). Documents the B1 isolation.
+describe('OAuth/directory channel — resolved empty array does not inherit the role escape', () => {
+  it('capabilities:[] with role admin does NOT satisfy an admin floor', () => {
+    expect(holdsCapabilityFloor(auth({ capabilities: [], role: 'admin' }), 'admin')).toBe(false)
+  })
+  it('only capabilities===undefined takes the legacy-role branch', () => {
+    expect(holdsCapabilityFloor(auth({ capabilities: undefined, role: 'admin' }), 'admin')).toBe(true)
+  })
+})

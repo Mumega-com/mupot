@@ -80,6 +80,12 @@ async function resolveAuth(c: {
       const auth = JSON.parse(injected) as AuthContext
       // Validate the minimal invariants we require before accepting the injected context.
       if (typeof auth.userId === 'string' && typeof auth.tenant === 'string') {
+        // Defense-in-depth (#183): the capability floor's legacy-role escape fires
+        // when `capabilities === undefined`. On this internal seam capabilities is
+        // always a resolved array (buildAuthContextFromProps sets it); a crafted
+        // blob that OMITS the key must not inherit the role escape and pass an
+        // admin-gated tool. Normalize a missing/non-array value to [] (fail-closed).
+        if (!Array.isArray(auth.capabilities)) auth.capabilities = []
         return auth
       }
     } catch {
@@ -533,6 +539,17 @@ const toolStatus: ToolSpec = {
 
     const agent = await loadAgent(env, agentId)
     if (!agent) return fail(404, 'agent_not_found')
+
+    // A cross-agent lookup is NOT a self-op — gate it. `min: 'authenticated'` keeps
+    // the self-echo branch above open, but reading another agent's row + Durable
+    // Object runtime requires observer+ on THAT agent's squad (org/dept grants
+    // inherit). Without this an authenticated zero-grant member could enumerate and
+    // probe every agent's runtime. (Floor exempts 'authenticated' tools, so the
+    // gate must live here — #183 adversarial review, P1.)
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'observer'))) {
+      return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
+    }
 
     const stub = env.AGENT.get(env.AGENT.idFromName(agent.id))
     const res = await stub.fetch('https://agent/status')
