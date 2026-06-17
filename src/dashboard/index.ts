@@ -1418,7 +1418,13 @@ const TASK_LANES: ReadonlyArray<{ key: Task['status']; label: string }> = [
   { key: 'done', label: 'Done' },
 ]
 
-/** Outer HTML document with inline CSS (no framework, no build step). */
+/** Outer HTML document with inline CSS (no framework, no build step).
+ *
+ * Theme: light by default, dark toggled via [data-theme="dark"] on <html>.
+ * Persisted in localStorage under the key "mupot-theme".
+ * Fonts: Instrument Serif (headings/metrics) · Hanken Grotesk (body) · JetBrains Mono (IDs/badges).
+ * Sidebar: Stripe-style with collapsible sections that remember open/closed state.
+ */
 function shell(brand: string, title: string, body: HtmlEscapedString | Promise<HtmlEscapedString>) {
   return html`<!doctype html>
 <html lang="en">
@@ -1426,83 +1432,299 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>${title} · ${brand}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Hanken+Grotesk:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
     <style>
+      /* ── Light palette (default) ─────────────────────────────────────────── */
       :root {
-        --bg: #0e1116; --surface: #161b22; --surface2: #1c2230; --border: #2a3140;
-        --text: #e6edf3; --muted: #9aa7b5; --dim: #6b7685; --accent: #d4a017; --accent2: #06b6d4;
-        --ok: #3fb950; --warn: #d29922; --radius: 10px;
+        --bg: #f6f7f6;
+        --surface: #fff;
+        --sidebar: #fff;
+        --text: #171b19;
+        --text2: #454c48;
+        --dim: #7a827d;
+        --primary: #0e7a55;
+        --primary-soft: #e9f4ef;
+        --border: #e7e9e7;
+        --border-soft: #eef0ee;
+        --hover: #f4f6f4;
+        --bars: #dfe6e1;
+        /* semantic aliases kept for view bodies */
+        --surface2: #f4f6f4;
+        --muted: #7a827d;
+        --accent: #0e7a55;
+        --accent2: #0891b2;
+        --ok: #16a34a;
+        --warn: #ca8a04;
+        --radius: 10px;
+        --font-display: 'Instrument Serif', Georgia, serif;
+        --font-body: 'Hanken Grotesk', system-ui, -apple-system, sans-serif;
+        --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      /* ── Dark palette ─────────────────────────────────────────────────────── */
+      [data-theme="dark"] {
+        --bg: #0e1116;
+        --surface: #161b22;
+        --sidebar: #161b22;
+        --text: #e6edf3;
+        --text2: #9aa7b5;
+        --dim: #6b7685;
+        --primary: #3fb950;
+        --primary-soft: #1a2e1a;
+        --border: #2a3140;
+        --border-soft: #222b38;
+        --hover: #1c2230;
+        --bars: #2a3140;
+        --surface2: #1c2230;
+        --muted: #9aa7b5;
+        --accent: #d4a017;
+        --accent2: #06b6d4;
+        --ok: #3fb950;
+        --warn: #d29922;
       }
       * { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; }
       body {
-        margin: 0; background: var(--bg); color: var(--text);
-        font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        background: var(--bg); color: var(--text);
+        font-family: var(--font-body);
+        font-size: 15px; line-height: 1.55;
+        -webkit-font-smoothing: antialiased;
       }
-      a { color: var(--accent2); text-decoration: none; }
+      a { color: var(--primary); text-decoration: none; }
       a:hover { text-decoration: underline; }
-      /* ── Sidebar shell (Stripe-style: switcher + grouped nav) ── */
+      ::selection { background: rgba(14,122,85,.18); }
+      :focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: 4px; }
+      ::-webkit-scrollbar { width: 11px; height: 11px; }
+      ::-webkit-scrollbar-thumb {
+        background: var(--border); border-radius: 8px;
+        border: 3px solid transparent; background-clip: content-box;
+      }
+
+      /* ── App layout ──────────────────────────────────────────────────────── */
       .layout { display: flex; min-height: 100vh; }
+
+      /* ── Sidebar ─────────────────────────────────────────────────────────── */
       .sidebar {
-        width: 232px; flex-shrink: 0; background: var(--surface);
+        width: 252px; flex-shrink: 0; background: var(--sidebar);
         border-right: 1px solid var(--border);
         position: sticky; top: 0; height: 100vh; overflow-y: auto;
         display: flex; flex-direction: column;
       }
-      /* pot switcher (top-left, like Stripe's account menu) */
-      .switcher { border-bottom: 1px solid var(--border); }
+      /* pot switcher */
+      .switcher { border-bottom: 1px solid var(--border); padding: 12px 12px 8px; }
       .switcher > summary {
         list-style: none; cursor: pointer; user-select: none;
         display: flex; align-items: center; gap: 8px;
-        padding: 16px 18px; font-weight: 700; color: var(--text);
+        padding: 8px 9px; border: 1px solid var(--border); border-radius: 10px;
+        font-weight: 700; color: var(--text); background: transparent;
       }
       .switcher > summary::-webkit-details-marker { display: none; }
-      .switcher > summary b { color: var(--accent); letter-spacing: .3px; }
-      .switcher > summary .caret { margin-left: auto; color: var(--muted); font-size: 11px; }
-      .switcher .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex-shrink: 0; }
-      .switcher-menu { padding: 6px; background: var(--surface2); border-top: 1px solid var(--border); }
+      .switcher > summary .pot-icon {
+        width: 30px; height: 30px; flex: none; border-radius: 8px;
+        background: linear-gradient(140deg,#1aa472,#0e7a55);
+        display: flex; align-items: center; justify-content: center;
+        color: #fff; font-family: var(--font-display); font-size: 17px;
+      }
+      .switcher > summary .pot-name {
+        flex: 1; min-width: 0; font-size: 13.5px; font-weight: 700;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .switcher > summary .caret { color: var(--dim); flex: none; }
+      .switcher-menu {
+        background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+        box-shadow: 0 8px 30px rgba(16,24,20,.14); padding: 6px; margin-top: 6px;
+      }
+      .switcher-menu-label {
+        font-family: var(--font-mono); font-size: 10px; letter-spacing: .6px;
+        color: var(--dim); padding: 7px 9px 5px;
+      }
       .switcher-menu a {
-        display: block; padding: 8px 12px; border-radius: 7px; color: var(--muted); font-size: 13px;
+        display: flex; align-items: center; padding: 8px 10px; border-radius: 8px;
+        color: var(--text2); font-size: 13px;
       }
-      .switcher-menu a:hover { background: var(--bg); color: var(--text); text-decoration: none; }
-      .switcher-whoami {
-        padding: 6px 12px 8px; font-size: 12px; color: var(--dim);
-        border-bottom: 1px solid var(--border); margin-bottom: 4px;
-      }
-      .switcher-whoami b { color: var(--muted); font-weight: 600; }
+      .switcher-menu a:hover { background: var(--hover); text-decoration: none; }
       .switcher-checkout { color: var(--warn) !important; }
-      /* grouped nav */
-      .nav-groups { flex: 1; padding: 14px 10px; display: flex; flex-direction: column; gap: 16px; }
-      .nav-group { display: flex; flex-direction: column; gap: 2px; }
-      .nav-group-label {
-        font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
-        color: var(--dim); padding: 0 12px 4px; font-weight: 600;
+      .switcher-whoami {
+        padding: 6px 10px 8px; font-size: 12px; color: var(--dim);
+        border-bottom: 1px solid var(--border-soft); margin-bottom: 4px;
       }
-      .sidebar nav a {
-        display: block; padding: 7px 12px; border-radius: 7px; color: var(--muted); font-size: 14px;
+      .switcher-whoami b { color: var(--text2); font-weight: 600; }
+      /* search bar */
+      .sidebar-search { padding: 4px 12px 10px; }
+      .sidebar-search-inner {
+        display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+        border: 1px solid var(--border); border-radius: 9px; background: var(--bg);
       }
-      .sidebar nav a:hover { background: var(--surface2); color: var(--text); text-decoration: none; }
-      .sidebar nav a.active { background: var(--surface2); color: var(--accent); font-weight: 600; }
-      .sidebar-footer { padding: 10px; border-top: 1px solid var(--border); }
-      .sidebar-footer a { display: block; padding: 7px 12px; border-radius: 7px; color: var(--muted); font-size: 13px; }
-      .sidebar-footer a:hover { background: var(--surface2); color: var(--text); text-decoration: none; }
+      .sidebar-search-inner input {
+        border: none; outline: none; background: transparent;
+        font-family: var(--font-body); font-size: 13px; color: var(--text); width: 100%;
+      }
+      .sidebar-search-inner .kbd {
+        font-family: var(--font-mono); font-size: 10px; color: var(--dim);
+        border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; flex: none;
+      }
+      /* nav sections */
+      .nav-scroll { flex: 1; overflow-y: auto; padding: 4px 12px 12px; display: flex; flex-direction: column; }
+      .nav-link {
+        display: flex; align-items: center; gap: 9px;
+        padding: 7px 9px; border-radius: 8px;
+        color: var(--text2); font-size: 13.5px;
+        cursor: pointer; text-decoration: none;
+        border: none; background: transparent; width: 100%; text-align: left;
+        font-family: var(--font-body);
+      }
+      .nav-link:hover { background: var(--hover); text-decoration: none; color: var(--text); }
+      .nav-link.active { background: var(--primary-soft); color: var(--primary); font-weight: 600; }
+      .nav-link svg { flex: none; color: inherit; }
+      .nav-link .nav-label { flex: 1; }
+      /* collapsible section header (parent link with chevron) */
+      .nav-section { display: flex; flex-direction: column; }
+      .nav-section-toggle {
+        display: flex; align-items: center; gap: 9px;
+        padding: 7px 9px; border-radius: 8px;
+        color: var(--text2); font-size: 13.5px;
+        cursor: pointer; background: transparent; border: none;
+        width: 100%; text-align: left; font-family: var(--font-body);
+      }
+      .nav-section-toggle:hover { background: var(--hover); color: var(--text); }
+      .nav-section-toggle .nav-label { flex: 1; }
+      .nav-chevron { flex: none; transition: transform .18s; color: var(--dim); }
+      .nav-chevron.open { transform: rotate(90deg); }
+      .nav-children {
+        display: flex; flex-direction: column; gap: 1px; margin: 1px 0 2px;
+        /* hidden by default; JS toggles display */
+      }
+      .nav-children[hidden] { display: none; }
+      .nav-child {
+        display: flex; align-items: center;
+        padding: 6px 9px 6px 36px; border-radius: 8px;
+        color: var(--text2); font-size: 13px;
+        cursor: pointer; text-decoration: none;
+        border: none; background: transparent; width: 100%; text-align: left;
+        font-family: var(--font-body);
+      }
+      .nav-child:hover { background: var(--hover); text-decoration: none; color: var(--text); }
+      .nav-child.active { color: var(--primary); font-weight: 600; }
+      /* SOVEREIGNTY label */
+      .nav-sovereignty-label {
+        font-family: var(--font-mono); font-size: 10px; letter-spacing: 1px;
+        color: var(--dim); padding: 16px 10px 6px; text-transform: uppercase;
+      }
+      /* count badge */
+      .nav-badge {
+        font-family: var(--font-mono); font-size: 10px; font-weight: 700;
+        min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+        background: var(--primary); color: #fff;
+        display: flex; align-items: center; justify-content: center; flex: none;
+      }
+      /* sidebar bottom: account row + theme toggle */
+      .sidebar-footer {
+        border-top: 1px solid var(--border); padding: 10px 12px;
+        display: flex; align-items: center; gap: 10px; flex: none;
+      }
+      .sidebar-footer-account {
+        flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px;
+        background: transparent; border: none; cursor: pointer; padding: 0; text-align: left;
+      }
+      .sidebar-footer-avatar {
+        width: 30px; height: 30px; flex: none; border-radius: 50%;
+        background: linear-gradient(135deg,var(--bars),var(--border));
+        display: flex; align-items: center; justify-content: center;
+        font-size: 12px; font-weight: 700; color: var(--text2);
+      }
+      .sidebar-footer-name { font-size: 13px; font-weight: 600; color: var(--text); }
+      .sidebar-footer-role { font-size: 11px; color: var(--dim); }
+      .sidebar-theme-btn {
+        width: 30px; height: 30px; border: 1px solid var(--border); border-radius: 8px;
+        background: transparent; cursor: pointer;
+        display: flex; align-items: center; justify-content: center;
+        color: var(--dim); font-size: 14px; flex: none;
+      }
+      .sidebar-theme-btn:hover { background: var(--hover); color: var(--text); }
+
+      /* ── Top bar ─────────────────────────────────────────────────────────── */
+      .topbar {
+        position: sticky; top: 0; z-index: 10;
+        display: flex; align-items: center; gap: 14px;
+        padding: 0 28px; height: 60px;
+        background: rgba(246,247,246,.88);
+        backdrop-filter: blur(12px);
+        border-bottom: 1px solid var(--border);
+      }
+      [data-theme="dark"] .topbar { background: rgba(14,17,22,.88); }
+      .topbar-crumb { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+      .topbar-crumb-pot { color: var(--dim); }
+      .topbar-crumb-sep { color: var(--border); }
+      .topbar-crumb-view { color: var(--text); font-weight: 600; }
+      .regime-chip {
+        display: flex; align-items: center; gap: 7px;
+        padding: 5px 11px; border-radius: 8px;
+        background: var(--primary-soft);
+        font-size: 12.5px;
+      }
+      .regime-chip .regime-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--primary); flex: none; }
+      .regime-chip .regime-label { font-weight: 700; color: var(--primary); }
+      .regime-chip .regime-ct { font-family: var(--font-mono); font-size: 11px; color: var(--dim); }
+      .topbar-spacer { flex: 1; }
+      .cloud-pill {
+        display: flex; align-items: center; gap: 7px;
+        padding: 6px 11px; border: 1px solid var(--border); border-radius: 8px;
+        background: var(--surface);
+        font-family: var(--font-mono); font-size: 11px; color: var(--text2);
+      }
+      .cloud-pill-dot { color: var(--primary); }
+      .topbar-invite {
+        padding: 7px 14px; border: none; border-radius: 8px;
+        background: var(--primary); color: #fff; cursor: pointer;
+        font-size: 13px; font-weight: 600; font-family: var(--font-body);
+        box-shadow: 0 1px 2px rgba(14,122,85,.3);
+      }
+      .topbar-invite:hover { filter: brightness(1.06); }
+      .topbar-menu-btn {
+        display: none; align-items: center; justify-content: center;
+        width: 34px; height: 34px; flex: none;
+        border: 1px solid var(--border); border-radius: 8px;
+        background: var(--surface); cursor: pointer; color: var(--text2);
+      }
+
+      /* ── Main content area ───────────────────────────────────────────────── */
+      .content-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; }
       main { flex: 1; max-width: 1080px; margin: 0 auto; padding: 28px 24px 64px; width: 100%; }
-      /* mobile: sidebar collapses to a top strip */
+
+      /* ── Mobile: sidebar slides in ───────────────────────────────────────── */
       @media (max-width: 860px) {
-        .layout { flex-direction: column; }
-        .sidebar { width: 100%; height: auto; position: static;
-          border-right: none; border-bottom: 1px solid var(--border); }
-        .nav-groups { flex-direction: row; flex-wrap: wrap; gap: 8px 18px; }
-        .nav-group { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
-        .nav-group-label { width: 100%; padding: 0; }
+        .topbar-menu-btn { display: flex; }
+        .sidebar {
+          position: fixed; top: 0; bottom: 0; left: 0; z-index: 80;
+          transform: translateX(-100%); transition: transform .26s cubic-bezier(.2,.8,.2,1);
+          box-shadow: 0 0 50px rgba(16,24,20,.22);
+        }
+        .sidebar.open { transform: translateX(0); }
+        .nav-scrim {
+          display: block; position: fixed; inset: 0; z-index: 75;
+          background: rgba(16,24,20,.34);
+        }
       }
-      h1 { font-size: 22px; margin: 0 0 4px; }
+      @media (min-width: 861px) {
+        .nav-scrim { display: none; }
+      }
+
+      /* ── Typography ──────────────────────────────────────────────────────── */
+      h1 {
+        font-family: var(--font-display); font-weight: 400;
+        font-size: 32px; line-height: 1.08; margin: 0 0 4px;
+      }
       h2 { font-size: 16px; margin: 28px 0 12px; color: var(--text); }
       .crumbs { color: var(--dim); font-size: 13px; margin-bottom: 18px; }
       .crumbs a { color: var(--muted); }
+
+      /* ── Component tokens (views inherit these) ──────────────────────────── */
       .card {
         background: var(--surface); border: 1px solid var(--border);
         border-radius: var(--radius); padding: 16px 18px; margin: 12px 0;
       }
-      .dept > .dept-name { font-size: 15px; font-weight: 600; color: var(--accent); margin-bottom: 8px; }
+      .dept > .dept-name { font-size: 15px; font-weight: 600; color: var(--primary); margin-bottom: 8px; }
       .squad-row {
         display: flex; align-items: center; justify-content: space-between;
         padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
@@ -1529,16 +1751,16 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       .kv dd { margin: 0; }
       .charter { white-space: pre-wrap; color: var(--muted); font-size: 14px; }
       .btn {
-        appearance: none; cursor: pointer; font: inherit; font-weight: 600;
-        padding: 9px 18px; border-radius: 8px; border: 1px solid var(--accent);
-        background: var(--accent); color: #1b1402;
+        appearance: none; cursor: pointer; font-family: var(--font-body); font-weight: 600;
+        padding: 9px 18px; border-radius: 8px; border: 1px solid var(--primary);
+        background: var(--primary); color: #fff;
       }
       .btn:disabled { opacity: .5; cursor: not-allowed; }
-      .btn.secondary { background: transparent; color: var(--accent); }
+      .btn.secondary { background: transparent; color: var(--primary); }
       .status-line { margin-top: 12px; font-size: 13px; color: var(--muted); min-height: 18px; }
       .empty { color: var(--dim); font-size: 14px; padding: 8px 0; }
       .tag { font-size: 11px; padding: 1px 7px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); }
-      .tag.cap { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+      .tag.cap { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 40%, var(--border)); }
       .tag.chan { color: var(--accent2); border-color: color-mix(in srgb, var(--accent2) 40%, var(--border)); }
       table.grid { width: 100%; border-collapse: collapse; font-size: 14px; }
       table.grid th, table.grid td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
@@ -1553,7 +1775,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       }
       .btn.sm { padding: 5px 11px; font-size: 12px; margin-right: 6px; }
       .modal {
-        position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex;
+        position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex;
         align-items: center; justify-content: center; z-index: 20; padding: 20px;
       }
       .modal[hidden] { display: none; }
@@ -1566,22 +1788,27 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
         padding: 12px 14px; overflow-x: auto; font-size: 12.5px; line-height: 1.5;
         color: var(--text); margin: 6px 0 0;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-family: var(--font-mono);
       }
-      code.inline { background: var(--surface2); border: 1px solid var(--border);
-        border-radius: 6px; padding: 1px 6px; font-size: 13px; color: var(--text); }
+      code.inline {
+        background: var(--surface2); border: 1px solid var(--border);
+        border-radius: 6px; padding: 1px 6px; font-size: 13px; color: var(--text);
+        font-family: var(--font-mono);
+      }
       code.token {
         display: block; word-break: break-all; background: var(--bg);
-        border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
-        border-radius: 8px; padding: 12px 14px; font-size: 13px; color: var(--accent);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        border: 1px solid color-mix(in srgb, var(--primary) 45%, var(--border));
+        border-radius: 8px; padding: 12px 14px; font-size: 13px; color: var(--primary);
+        font-family: var(--font-mono);
       }
       .warn-box {
-        border: 1px solid color-mix(in srgb, #f85149 50%, var(--border));
-        background: color-mix(in srgb, #f85149 10%, var(--surface));
-        color: #ffb4ab; border-radius: 8px; padding: 12px 14px; font-size: 13px; margin: 12px 0;
+        border: 1px solid color-mix(in srgb, #ef4444 50%, var(--border));
+        background: color-mix(in srgb, #ef4444 8%, var(--surface));
+        color: #b91c1c; border-radius: 8px; padding: 12px 14px; font-size: 13px; margin: 12px 0;
       }
-      .warn-box strong { color: #ff7b72; }
+      [data-theme="dark"] .warn-box { color: #ffb4ab; }
+      .warn-box strong { color: #dc2626; }
+      [data-theme="dark"] .warn-box strong { color: #ff7b72; }
       .tokenline { display: flex; align-items: center; gap: 8px; margin: 4px 0; flex-wrap: wrap; }
       .tokenline .lbl { font-size: 13px; }
       @media (max-width: 720px) { .board { grid-template-columns: 1fr 1fr; } }
@@ -1918,74 +2145,310 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
     </style>
   </head>
   <body>
+    <!-- nav scrim for mobile -->
+    <div class="nav-scrim" id="nav-scrim" onclick="document.getElementById('app-sidebar').classList.remove('open');this.style.display='none';" style="display:none;"></div>
+
     <div class="layout">
-      <aside class="sidebar">
-        <details class="switcher">
-          <summary><span class="dot"></span><b>${brand}</b><span class="caret">▾</span></summary>
-          <div class="switcher-menu">
-            <div class="switcher-whoami" id="switcher-whoami">Checked in</div>
-            <a href="https://mumega.com/dashboard/pots">Switch pot →</a>
-            <a href="/auth/logout" class="switcher-checkout">Check out of ${brand} ↩</a>
-          </div>
-        </details>
-        <nav class="nav-groups">
-          <div class="nav-group">
-            <div class="nav-group-label">Workspace</div>
-            <a href="/">Overview</a>
-            <a href="/brain">Brain</a>
-            <a href="/economy">Economy</a>
-            <a href="/flights">Flights</a>
-          </div>
-          <div class="nav-group">
-            <div class="nav-group-label">Work</div>
-            <a href="/send">Send</a>
-            <a href="/approvals">Approvals</a>
-            <a href="/loops">Loops</a>
-          </div>
-          <div class="nav-group">
-            <div class="nav-group-label">People &amp; Org</div>
-            <a href="/agents">Agents</a>
-            <a href="/fleet">Fleet</a>
-            <a href="/members">People</a>
-            <a href="/admin/divisions">Organization</a>
-          </div>
-          <div class="nav-group">
-            <div class="nav-group-label">Settings</div>
-            <a href="/admin/keys">Scoped Keys</a>
-            <a href="/admin/github">GitHub</a>
-            <a href="/setup">Setup</a>
-          </div>
-        </nav>
-        <div class="sidebar-footer">
-          <a href="/auth/logout">Sign out</a>
+      <!-- ══ SIDEBAR ══════════════════════════════════════════════════════════ -->
+      <aside class="sidebar" id="app-sidebar">
+
+        <!-- pot switcher -->
+        <div class="switcher">
+          <details id="pot-details">
+            <summary>
+              <span class="pot-icon" id="pot-icon">M</span>
+              <span class="pot-name" id="pot-name">${brand}</span>
+              <span class="caret">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M5 6.5 8 9.5l3-3"/></svg>
+              </span>
+            </summary>
+            <div class="switcher-menu">
+              <div class="switcher-menu-label">YOUR POTS</div>
+              <div class="switcher-whoami" id="switcher-whoami">Checked in</div>
+              <a href="https://mumega.com/dashboard/pots">Switch pot →</a>
+              <a href="/auth/logout" class="switcher-checkout">Check out ↩</a>
+            </div>
+          </details>
         </div>
+
+        <!-- search -->
+        <div class="sidebar-search">
+          <div class="sidebar-search-inner">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" width="14" height="14" style="color:var(--dim);flex:none;"><circle cx="7" cy="7" r="4.2"/><path d="M10.2 10.2 13.5 13.5"/></svg>
+            <input type="text" placeholder="Search agents, tasks, PRs…" />
+            <span class="kbd">/</span>
+          </div>
+        </div>
+
+        <!-- nav -->
+        <nav class="nav-scroll" id="app-nav">
+
+          <!-- Home -->
+          <a class="nav-link" href="/">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M3.5 9 10 3.5 16.5 9"/><path d="M5 8.2V16h10V8.2"/></svg>
+            <span class="nav-label">Home</span>
+          </a>
+
+          <!-- Organization (collapsible) -->
+          <div class="nav-section">
+            <button class="nav-section-toggle" data-section="org" onclick="navToggle('org')">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" width="17" height="17"><rect x="3.5" y="3.5" width="5.2" height="5.2" rx="1"/><rect x="11.3" y="3.5" width="5.2" height="5.2" rx="1"/><rect x="3.5" y="11.3" width="5.2" height="5.2" rx="1"/><rect x="11.3" y="11.3" width="5.2" height="5.2" rx="1"/></svg>
+              <span class="nav-label">Organization</span>
+              <span class="nav-chevron" id="chev-org"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M6 4l4 4-4 4"/></svg></span>
+            </button>
+            <div class="nav-children" id="children-org">
+              <a class="nav-child" href="/admin/divisions">Departments</a>
+              <a class="nav-child" href="/admin/divisions">Squads</a>
+              <a class="nav-child" href="/agents">Agents</a>
+            </div>
+          </div>
+
+          <!-- Work (collapsible) -->
+          <div class="nav-section">
+            <button class="nav-section-toggle" data-section="work" onclick="navToggle('work')">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="5.5" cy="5.5" r="2"/><circle cx="5.5" cy="14.5" r="2"/><circle cx="14.5" cy="10" r="2"/><path d="M5.5 7.5v5M7.4 5.9 12.7 9.2M7.3 13.9 12.7 10.7"/></svg>
+              <span class="nav-label">Work</span>
+              <span class="nav-chevron" id="chev-work"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M6 4l4 4-4 4"/></svg></span>
+            </button>
+            <div class="nav-children" id="children-work">
+              <a class="nav-child" href="/send">Tasks</a>
+              <a class="nav-child" href="/flights">Pull requests</a>
+              <a class="nav-child" href="/loops">Verifications</a>
+            </div>
+          </div>
+
+          <!-- Approvals (with live badge) -->
+          <a class="nav-link" href="/approvals" id="nav-approvals">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3 4.5 5.2v4.3c0 3.4 2.3 5.8 5.5 7 3.2-1.2 5.5-3.6 5.5-7V5.2z"/><path d="M7.6 10l1.7 1.7 3.1-3.4"/></svg>
+            <span class="nav-label">Approvals</span>
+            <span class="nav-badge" id="approvals-badge" style="display:none;">0</span>
+          </a>
+
+          <!-- Fleet -->
+          <a class="nav-link" href="/fleet">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" width="17" height="17"><circle cx="10" cy="10" r="6.2"/><circle cx="10" cy="10" r="1.7" fill="currentColor" stroke="none"/></svg>
+            <span class="nav-label">Fleet</span>
+          </a>
+
+          <!-- Economy (collapsible) -->
+          <div class="nav-section">
+            <button class="nav-section-toggle" data-section="econ" onclick="navToggle('econ')">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="10" cy="10" r="6.5"/><path d="M10 6v8M8.2 8h2.6a1.5 1.5 0 0 1 0 3H8.4"/></svg>
+              <span class="nav-label">Economy</span>
+              <span class="nav-chevron" id="chev-econ"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M6 4l4 4-4 4"/></svg></span>
+            </button>
+            <div class="nav-children" id="children-econ">
+              <a class="nav-child" href="/economy">Wallet</a>
+              <a class="nav-child" href="/economy">Marketplace</a>
+              <a class="nav-child" href="/economy">Billing</a>
+            </div>
+          </div>
+
+          <!-- Members & access -->
+          <a class="nav-link" href="/members">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="7.3" cy="7.5" r="2.5"/><circle cx="13.6" cy="8.5" r="2"/><path d="M3.4 16c0-2.3 1.8-3.8 3.9-3.8s3.9 1.5 3.9 3.8M12.4 12.5c2 0 3.9 1.1 3.9 3.5"/></svg>
+            <span class="nav-label">Members &amp; access</span>
+          </a>
+
+          <!-- Audit log -->
+          <a class="nav-link" href="/brain">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M5.5 3.5h6l3.5 3.5V16.5h-9.5z"/><path d="M11.3 3.5V7h3.4M7.5 10.5h5M7.5 13h5"/></svg>
+            <span class="nav-label">Audit log</span>
+          </a>
+
+          <!-- SOVEREIGNTY section label -->
+          <div class="nav-sovereignty-label">SOVEREIGNTY</div>
+
+          <!-- Deployment -->
+          <a class="nav-link" href="/setup">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" width="17" height="17"><rect x="3.5" y="4" width="13" height="5" rx="1.3"/><rect x="3.5" y="11" width="13" height="5" rx="1.3"/><circle cx="6.6" cy="6.5" r=".8" fill="currentColor" stroke="none"/><circle cx="6.6" cy="13.5" r=".8" fill="currentColor" stroke="none"/></svg>
+            <span class="nav-label">Deployment</span>
+          </a>
+
+          <!-- Directory sync -->
+          <a class="nav-link" href="/admin/github">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M4.5 8.5a5.5 5.5 0 0 1 9.3-3M15.5 11.5a5.5 5.5 0 0 1-9.3 3"/><path d="M14 3.5V6h-2.5M6 16.5V14h2.5"/></svg>
+            <span class="nav-label">Directory sync</span>
+          </a>
+
+          <!-- Keys & secrets -->
+          <a class="nav-link" href="/admin/keys">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="7.5" cy="8.5" r="3.2"/><path d="M9.8 10.8 16.5 17.5M13.5 14.5l1.7-1.7"/></svg>
+            <span class="nav-label">Keys &amp; secrets</span>
+          </a>
+
+        </nav>
+
+        <!-- account row + theme toggle -->
+        <div class="sidebar-footer">
+          <button class="sidebar-footer-account" id="footer-account" aria-label="Account menu">
+            <span class="sidebar-footer-avatar" id="footer-avatar">?</span>
+            <span>
+              <span class="sidebar-footer-name" id="footer-name">—</span>
+              <span class="sidebar-footer-role" id="footer-role">member</span>
+            </span>
+          </button>
+          <button class="sidebar-theme-btn" id="theme-toggle" title="Toggle theme" aria-label="Toggle light/dark theme">
+            <span id="theme-icon">☀</span>
+          </button>
+        </div>
+
       </aside>
-      <main>${body}</main>
-    </div>
+
+      <!-- ══ CONTENT AREA ══════════════════════════════════════════════════════ -->
+      <div class="content-wrap">
+
+        <!-- top bar -->
+        <header class="topbar" id="app-topbar">
+          <button class="topbar-menu-btn" id="topbar-menu-btn" aria-label="Open navigation" onclick="document.getElementById('app-sidebar').classList.add('open');document.getElementById('nav-scrim').style.display='block';">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" width="18" height="18"><path d="M3.5 6h13M3.5 10h13M3.5 14h13"/></svg>
+          </button>
+          <div class="topbar-crumb" id="topbar-crumb">
+            <span class="topbar-crumb-pot" id="crumb-pot">${brand}</span>
+            <span class="topbar-crumb-sep">/</span>
+            <span class="topbar-crumb-view" id="crumb-view">Overview</span>
+          </div>
+          <!-- regime chip: static placeholder — live value requires KV at request time; shown on /brain only -->
+          <div class="regime-chip" id="regime-chip" style="display:none;" title="Coherence regime — brain physics from KV. Labeled static placeholder until live KV read is wired per-request.">
+            <span class="regime-dot" id="regime-dot"></span>
+            <span class="regime-label" id="regime-label">—</span>
+            <span class="regime-ct" id="regime-ct">C(t) —</span>
+          </div>
+          <div class="topbar-spacer"></div>
+          <div class="cloud-pill">
+            <span class="cloud-pill-dot">◆</span> YOUR CLOUD · CF
+          </div>
+          <button class="topbar-invite">Invite member</button>
+        </header>
+
+        <main>${body}</main>
+
+      </div><!-- /.content-wrap -->
+    </div><!-- /.layout -->
+
     <script>
       (function () {
+        // ── Theme ─────────────────────────────────────────────────────────────
+        var THEME_KEY = 'mupot-theme';
+        var htmlEl = document.documentElement;
+        var themeIcon = document.getElementById('theme-icon');
+        function applyTheme(t) {
+          if (t === 'dark') {
+            htmlEl.setAttribute('data-theme', 'dark');
+            if (themeIcon) themeIcon.textContent = '☾';
+          } else {
+            htmlEl.removeAttribute('data-theme');
+            if (themeIcon) themeIcon.textContent = '☀';
+          }
+        }
+        applyTheme(localStorage.getItem(THEME_KEY) || 'light');
+        var themeBtn = document.getElementById('theme-toggle');
+        if (themeBtn) {
+          themeBtn.addEventListener('click', function () {
+            var next = htmlEl.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+            localStorage.setItem(THEME_KEY, next);
+            applyTheme(next);
+          });
+        }
+
+        // ── Active nav link (longest-prefix match) ─────────────────────────────
         var p = location.pathname;
         var best = null, bestLen = -1;
-        document.querySelectorAll('.sidebar nav a').forEach(function (a) {
+        document.querySelectorAll('#app-nav a.nav-link, #app-nav a.nav-child').forEach(function (a) {
           var href = a.getAttribute('href');
+          if (!href) return;
           var match = href === '/' ? p === '/' : p.indexOf(href) === 0;
           if (match && href.length > bestLen) { best = a; bestLen = href.length; }
         });
         if (best) best.classList.add('active');
 
-        // "Checked in as <you>" — pot-local presence, read from /auth/me.
+        // Update topbar crumb from active link label
+        var crumbView = document.getElementById('crumb-view');
+        if (crumbView && best) crumbView.textContent = (best.querySelector('.nav-label') || best).textContent.trim() || crumbView.textContent;
+
+        // Open section if a child is active
+        ['org','work','econ'].forEach(function (sec) {
+          var kids = document.getElementById('children-' + sec);
+          if (!kids) return;
+          if (kids.querySelector('.active')) {
+            kids.removeAttribute('hidden');
+            var chev = document.getElementById('chev-' + sec);
+            if (chev) chev.classList.add('open');
+          } else {
+            kids.setAttribute('hidden', '');
+          }
+        });
+
+        // ── Section toggle (collapsible nav groups) ─────────────────────────
+        window.navToggle = function (sec) {
+          var kids = document.getElementById('children-' + sec);
+          var chev = document.getElementById('chev-' + sec);
+          var STORAGE_KEY = 'mupot-nav-' + sec;
+          if (!kids) return;
+          var open = kids.hasAttribute('hidden') ? false : true;
+          if (open) {
+            kids.setAttribute('hidden', '');
+            if (chev) chev.classList.remove('open');
+            localStorage.setItem(STORAGE_KEY, '0');
+          } else {
+            kids.removeAttribute('hidden');
+            if (chev) chev.classList.add('open');
+            localStorage.setItem(STORAGE_KEY, '1');
+          }
+        };
+        // Restore section states from localStorage (unless a child is already active)
+        ['org','work','econ'].forEach(function (sec) {
+          var kids = document.getElementById('children-' + sec);
+          var chev = document.getElementById('chev-' + sec);
+          if (!kids || kids.querySelector('.active')) return; // active overrides
+          var stored = localStorage.getItem('mupot-nav-' + sec);
+          if (stored === '1') {
+            kids.removeAttribute('hidden');
+            if (chev) chev.classList.add('open');
+          }
+        });
+
+        // ── Auth/me — fill "Checked in as" + account row ───────────────────
         fetch('/auth/me', { credentials: 'same-origin' })
           .then(function (r) { return r.ok ? r.json() : null; })
           .then(function (a) {
+            if (!a) return;
+            var who = a.email || a.userId || '';
+            // switcher label
             var el = document.getElementById('switcher-whoami');
-            if (!el || !a || !(a.email || a.userId)) return;
-            el.textContent = '';
-            el.appendChild(document.createTextNode('Checked in as '));
-            var who = document.createElement('b');
-            who.textContent = a.email || a.userId; // textContent = no XSS
-            el.appendChild(who);
+            if (el && who) {
+              el.textContent = '';
+              el.appendChild(document.createTextNode('Checked in as '));
+              var b = document.createElement('b');
+              b.textContent = who; // textContent = no XSS
+              el.appendChild(b);
+            }
+            // footer account row
+            var name = document.getElementById('footer-name');
+            var role = document.getElementById('footer-role');
+            var av   = document.getElementById('footer-avatar');
+            if (name) name.textContent = a.name || who;
+            if (role && a.capability) role.textContent = a.capability;
+            if (av) {
+              var initials = (a.name || who || '?').replace(/\s+/g, ' ').split(' ').map(function(w){ return w[0]; }).join('').substring(0, 2).toUpperCase();
+              av.textContent = initials;
+            }
           })
           .catch(function () {});
+
+        // ── Approvals badge — cheap HEAD check on /approvals data ─────────
+        fetch('/approvals', { credentials: 'same-origin', headers: { 'Accept': 'application/json' } })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (d) {
+            // The /approvals page returns HTML; skip if not JSON-parseable
+            var badge = document.getElementById('approvals-badge');
+            if (badge && d && typeof d.pending === 'number' && d.pending > 0) {
+              badge.textContent = String(d.pending);
+              badge.style.display = '';
+            }
+          })
+          .catch(function () {});
+
       })();
     </script>
   </body>
