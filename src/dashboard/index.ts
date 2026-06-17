@@ -83,6 +83,7 @@ import type { FlightCard } from '../flight/board'
 import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
 import { loadBrainView, brainBody } from './brain'
+import { loadGrowthView, growthBody } from './growth'
 import { setLoopControl, isLoopControlAction } from '../loops/decisions'
 import { getLoop } from '../loops/service'
 import {
@@ -211,6 +212,16 @@ dashboardApp.get('/brain', async (c) => {
   const auth = c.get('auth')
   const view = await loadBrainView(c.env)
   return c.html(shell(c.env.BRAND, 'Brain', brainBody(view, isAdmin(auth))))
+})
+
+// ── departments/growth (Marketing & Sales console view) ─────────────────────
+// GET /departments/growth — read-only view: funnel + KPIs + trend chart + squads.
+// Data: prospects table (countByStatus), metric_points (growth.leads series),
+//       departments + squads tables. No mutations. requireAuth via outer gate.
+dashboardApp.get('/departments/growth', async (c) => {
+  const auth = c.get('auth')
+  const view = await loadGrowthView(c.env, auth)
+  return c.html(shell(c.env.BRAND, 'Marketing & Sales', growthBody(view)))
 })
 
 // POST /brain/loops/:id/control — governor control signal.
