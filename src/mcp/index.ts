@@ -241,7 +241,7 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // ── tool result shape ─────────────────────────────────────────────────────────
 // A tool returns either a value (→ 200 {ok:true, result}) or a typed error with
 // an HTTP status (→ that status, {ok:false, error}).
-type ToolError = { status: 400 | 403 | 404 | 409; error: string; detail?: unknown }
+type ToolError = { status: 400 | 403 | 404 | 409 | 500; error: string; detail?: unknown }
 export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
 
 export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
@@ -948,7 +948,21 @@ export async function invokeTool(
     return { ...fail(403, 'forbidden', { need: spec.min }), tool: spec.name }
   }
 
-  const outcome = await spec.run(auth, env, args, { origin })
+  // A handler that THROWS (rather than returning fail()) must not escape as an
+  // opaque 500 / unhandled rejection — convert it to a structured outcome so the
+  // MCP client always gets a JSON-RPC error. `receipt_failed` (#186 write-receipt
+  // guard) is the expected case; surface its code + safe message. For anything else
+  // return a generic internal_error — never echo an arbitrary throw (leak guard).
+  let outcome: ToolOutcome
+  try {
+    outcome = await spec.run(auth, env, args, { origin })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (msg.startsWith('receipt_failed')) {
+      return { ...fail(500, 'receipt_failed', msg), tool: spec.name }
+    }
+    return { ...fail(500, 'internal_error'), tool: spec.name }
+  }
   return { ...outcome, tool: spec.name }
 }
 

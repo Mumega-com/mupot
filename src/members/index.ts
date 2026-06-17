@@ -38,6 +38,7 @@ import type {
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
+import { assertBatchWritten } from '../lib/receipt'
 // The FROZEN capability API — everyone codes against these exact signatures.
 import { requireCapability, capabilityRank, actorMaxRankOnScope } from '../auth/capability'
 // Shared token lifecycle — the single mint/revoke path (also used by the dashboard).
@@ -199,7 +200,7 @@ membersApp.post('/invites/:id/accept', async (c) => {
   }
 
   try {
-    await c.env.DB.batch([
+    const acceptWrites = await c.env.DB.batch([
       c.env.DB.prepare(
         'INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
       ).bind(
@@ -217,6 +218,11 @@ membersApp.post('/invites/:id/accept', async (c) => {
         'INSERT INTO member_tokens (id, member_id, token_hash, label, channel) VALUES (?, ?, ?, ?, ?)',
       ).bind(tokenId, member.id, tokenHash, 'workspace', 'workspace'),
     ])
+    // Receipt (#186): all three mint rows must land before we return `raw`. A
+    // 0-row INSERT does not throw on its own; a partial mint would hand out a
+    // show-once token bound to a broken identity. Failure → the catch rolls the
+    // invite back so the person can retry.
+    assertBatchWritten(acceptWrites, 'invite_accept_mint', 1)
   } catch (err) {
     // Roll the invite back so the person can retry (e.g. duplicate email collision
     // on members.email UNIQUE). The conditional claim above already serialized us.

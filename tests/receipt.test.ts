@@ -44,6 +44,36 @@ describe('assertBatchWritten', () => {
   })
 })
 
+// Dispatch: a handler THROW (receipt_failed or otherwise) is converted to a
+// structured outcome, never escapes invokeTool as an unhandled exception (#186 P1).
+describe('invokeTool — a thrown handler error becomes a structured outcome', () => {
+  const auth = {
+    userId: 'u', email: null, role: 'member', tenant: 'test', channel: 'workspace',
+    memberId: 'm1', capabilities: [{ member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'member' }],
+    boundAgentId: null,
+  } as unknown as import('../src/types').AuthContext
+  const args = { squad_id: 's1', title: 't', done_when: 'GET /health 200' }
+
+  it('maps a receipt_failed throw to a 500 receipt_failed outcome (no unhandled throw)', async () => {
+    const { invokeTool } = await import('../src/mcp/index')
+    const env = { DB: { prepare: () => { throw new Error('receipt_failed: tasks.insert wrote 0 row(s)') } } } as unknown as import('../src/types').Env
+    const out = await invokeTool(auth, env, 'task_create', args, 'https://t')
+    expect(out.ok).toBe(false)
+    expect(out.status).toBe(500)
+    expect(out.error).toBe('receipt_failed')
+  })
+
+  it('maps any other throw to a generic internal_error (no leak)', async () => {
+    const { invokeTool } = await import('../src/mcp/index')
+    const env = { DB: { prepare: () => { throw new Error('secret connection string leaked here') } } } as unknown as import('../src/types').Env
+    const out = await invokeTool(auth, env, 'task_create', args, 'https://t')
+    expect(out.ok).toBe(false)
+    expect(out.status).toBe(500)
+    expect(out.error).toBe('internal_error')
+    expect(JSON.stringify(out)).not.toContain('secret connection string') // message not echoed
+  })
+})
+
 // Wiring: the guard actually fires inside createTask (not just in isolation).
 describe('createTask — phantom-success is surfaced', () => {
   it('throws receipt_failed when the INSERT writes 0 rows', async () => {
