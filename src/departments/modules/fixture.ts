@@ -88,8 +88,8 @@ export const FixtureModule: DepartmentModule = {
 // This is the ONE registry call that must exist per department (§3.5 "registry plumbing").
 // It does NOT edit the registry file — it calls the open registration function.
 //
-// replace: true is safe here for the module's own initial registration because this
-// file is imported once at test harness setup (after _clearRegistry) and once at
-// production boot. The duplicate-key guard in register() would fire on double-import
-// in a long-lived process; `replace: true` makes re-registration idempotent.
-register(FixtureModule, { replace: true })
+// The production `register` is idempotent for the same module object (same key + same
+// reference → no-op). Re-importing this file in a long-lived process therefore does
+// not throw — it is a safe no-op. No `replace` flag is used or accepted on the
+// production singleton.
+register(FixtureModule)

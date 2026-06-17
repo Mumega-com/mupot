@@ -331,13 +331,26 @@ export function createDepartmentRegistry(): DepartmentRegistry {
 // this instance so callers (fixture.ts, production routes) use the same API as
 // before without any change.
 //
+// SECURITY: the production `register` exported here does NOT accept a `replace`
+// option. Registration on the singleton is idempotent for the same module object
+// (same key + same identity reference → no-op) and throws `registry_duplicate_key`
+// for any different module under an existing key. This closes the hostile-displacement
+// attack: a module cannot call register(EvilModule, {replace:true}) to displace a
+// sibling's key. `replace` exists only on isolated `createDepartmentRegistry()`
+// instances used by tests.
+//
 // THERE ARE NO global-mutation exports (_clearRegistry, _unregister, _testOnly).
 // Tests use createDepartmentRegistry() for isolated instances.
 
 const _singleton = createDepartmentRegistry()
 
-export function register(module: DepartmentModule, opts?: { replace?: boolean }): void {
-  _singleton.register(module, opts)
+export function register(module: DepartmentModule): void {
+  // Idempotent for the same module object (same key + same reference) — no-op.
+  // Different module under existing key → throws registry_duplicate_key.
+  // No `replace` accepted: production registration is permanent.
+  const existing = _singleton.getRegistered(module.key)
+  if (existing === module) return  // same object re-imported → safe no-op
+  _singleton.register(module)     // throws registry_duplicate_key if key taken by different object
 }
 
 export function listRegistered(): DepartmentModule[] {
@@ -374,4 +387,3 @@ export async function deactivate(
 ): Promise<DeactivateResult> {
   return _singleton.deactivate(db, moduleKey)
 }
-
