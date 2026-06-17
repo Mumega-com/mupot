@@ -22,6 +22,7 @@ import {
   readSeries,
   aggregateOHLC,
   seriesShape,
+  READ_SERIES_LIMIT,
   type MetricPoint,
   type OHLCBucket,
 } from '../src/metrics/pulse'
@@ -97,7 +98,7 @@ function makeDb(opts: { phantomZeroOnInsert?: boolean } = {}): {
                 string,
                 string,
               ]
-              const results = store.filter(
+              const matched = store.filter(
                 (r) =>
                   r.tenant_id === tenantId &&
                   r.metric_key === metricKey &&
@@ -105,7 +106,11 @@ function makeDb(opts: { phantomZeroOnInsert?: boolean } = {}): {
                   r.occurred_at <= toISO,
               )
               // ORDER BY occurred_at ASC
-              results.sort((a, b) => a.occurred_at.localeCompare(b.occurred_at))
+              matched.sort((a, b) => a.occurred_at.localeCompare(b.occurred_at))
+              // Replicate LIMIT READ_SERIES_LIMIT + 1 (the sentinel query in readSeries).
+              // Real D1 never returns more rows than the LIMIT clause; the mock must
+              // honour the same cap so truncation detection works in tests.
+              const results = matched.slice(0, READ_SERIES_LIMIT + 1)
               return { results, success: true, meta: { rows_read: results.length } }
             },
           }
@@ -137,7 +142,7 @@ describe('emitMetric + readSeries round-trip', () => {
     const out = await emitMetric(db, { tenantId: TENANT_A, metricKey: KEY, value: 5, occurredAt: T1, source: 'manual' }, id, CREATED)
     expect(out).toEqual({ ok: true, id })
 
-    const pts = await readSeries(db, TENANT_A, KEY, T1, T1)
+    const { points: pts } = await readSeries(db, TENANT_A, KEY, T1, T1)
     expect(pts).toHaveLength(1)
     expect(pts[0]).toMatchObject({ id, tenantId: TENANT_A, metricKey: KEY, value: 5, occurredAt: T1, source: 'manual' })
   })
@@ -148,7 +153,7 @@ describe('emitMetric + readSeries round-trip', () => {
     await emitMetric(db, { tenantId: TENANT_A, metricKey: KEY, value: 1, occurredAt: T1, source: 'connector' }, 'id1', CREATED)
     await emitMetric(db, { tenantId: TENANT_A, metricKey: KEY, value: 2, occurredAt: T2, source: 'connector' }, 'id2', CREATED)
 
-    const pts = await readSeries(db, TENANT_A, KEY, T1, T3)
+    const { points: pts } = await readSeries(db, TENANT_A, KEY, T1, T3)
     expect(pts.map((p) => p.value)).toEqual([1, 2, 3])
   })
 })
@@ -161,8 +166,8 @@ describe('tenant isolation', () => {
     await emitMetric(db, { tenantId: TENANT_A, metricKey: KEY, value: 10, occurredAt: T1, source: 'manual' }, 'ida', CREATED)
     await emitMetric(db, { tenantId: TENANT_B, metricKey: KEY, value: 99, occurredAt: T1, source: 'manual' }, 'idb', CREATED)
 
-    const forA = await readSeries(db, TENANT_A, KEY, T1, T1)
-    const forB = await readSeries(db, TENANT_B, KEY, T1, T1)
+    const { points: forA } = await readSeries(db, TENANT_A, KEY, T1, T1)
+    const { points: forB } = await readSeries(db, TENANT_B, KEY, T1, T1)
 
     expect(forA).toHaveLength(1)
     expect(forA[0].value).toBe(10)
@@ -173,7 +178,7 @@ describe('tenant isolation', () => {
   it('readSeries with tenant B returns empty when only A has data', async () => {
     const { db } = makeDb()
     await emitMetric(db, { tenantId: TENANT_A, metricKey: KEY, value: 10, occurredAt: T1, source: 'manual' }, 'ida2', CREATED)
-    const pts = await readSeries(db, TENANT_B, KEY, T1, T1)
+    const { points: pts } = await readSeries(db, TENANT_B, KEY, T1, T1)
     expect(pts).toHaveLength(0)
   })
 })
@@ -433,7 +438,7 @@ describe('integration: emit → read → aggregate → shape', () => {
     // Day 2: 1 reading (daily scalar)
     await emitMetric(db, { tenantId: TENANT_A, metricKey: KEY, value: 5, occurredAt: T_DAY2, source: 'connector' }, 'day2-0', CREATED)
 
-    const pts = await readSeries(db, TENANT_A, KEY, T1, T_DAY2)
+    const { points: pts } = await readSeries(db, TENANT_A, KEY, T1, T_DAY2)
     const buckets = aggregateOHLC(pts, { bucket: 'day' })
     const shape = seriesShape(buckets)
 
@@ -448,7 +453,7 @@ describe('integration: emit → read → aggregate → shape', () => {
     await emitMetric(db, { tenantId: TENANT_A, metricKey: KEY, value: 10, occurredAt: T1, source: 'manual' }, 'x1', CREATED)
     await emitMetric(db, { tenantId: TENANT_A, metricKey: KEY, value: 20, occurredAt: T_DAY2, source: 'manual' }, 'x2', CREATED)
 
-    const pts = await readSeries(db, TENANT_A, KEY, T1, T_DAY2)
+    const { points: pts } = await readSeries(db, TENANT_A, KEY, T1, T_DAY2)
     const buckets = aggregateOHLC(pts, { bucket: 'day' })
     expect(seriesShape(buckets)).toBe('bar')
   })
@@ -486,7 +491,7 @@ describe('FIX-1 — PK (id) collision on distinct tuple must throw, not duplicat
     ).rejects.toThrow(/metric_points\.id/)
   })
 
-  it('composite-key duplicate (same id AND same tuple) still returns "duplicate"', async () => {
+  it('different id, same composite tuple → duplicate (composite-only collision path)', async () => {
     // Guard: identical tuple AND same id → the composite check wins (real D1 would
     // hit PK first, but since the mock checks PK first too, this is consistent).
     // For the idempotent-resend scenario (same everything) the caller uses a
@@ -677,5 +682,69 @@ describe('FIX-4 — negative-year and out-of-range ISO rejected with ValidationE
         '2200-12-31T23:59:59.999Z',
       ),
     ).resolves.toMatchObject({ ok: true })
+  })
+})
+
+// ── FIX-A: readSeries truncation detection (data-honesty invariant) ────────────
+//
+// Invariant: if a tenant+metric window contains more than READ_SERIES_LIMIT
+// readings, returning exactly READ_SERIES_LIMIT rows silently drops the newest
+// ones — the final day's OHLC would be computed over a PARTIAL day and the
+// seriesShape would still say 'candle' with no signal that the window is capped.
+//
+// Fix: query LIMIT + 1; if more than READ_SERIES_LIMIT rows come back, set
+// `truncated = true` and drop the sentinel row. Callers must check this flag
+// before presenting the trailing bucket as a complete candle.
+
+describe('FIX-A — readSeries truncation detection (>READ_SERIES_LIMIT rows in window)', () => {
+  it('truncated === false when readings fit within the cap', async () => {
+    const { db } = makeDb()
+    // Insert fewer than READ_SERIES_LIMIT readings
+    await emitMetric(
+      db,
+      { tenantId: TENANT_A, metricKey: KEY, value: 1, occurredAt: T1, source: 'manual' },
+      'trunc-small-1',
+      CREATED,
+    )
+    await emitMetric(
+      db,
+      { tenantId: TENANT_A, metricKey: KEY, value: 2, occurredAt: T2, source: 'manual' },
+      'trunc-small-2',
+      CREATED,
+    )
+    const result = await readSeries(db, TENANT_A, KEY, T1, T2)
+    expect(result.truncated).toBe(false)
+    expect(result.points).toHaveLength(2)
+  })
+
+  it('truncated === true when window exceeds READ_SERIES_LIMIT; points capped at limit', async () => {
+    // Build READ_SERIES_LIMIT + 1 readings spread across seconds of a single day.
+    // Generating 10 001 unique ISO timestamps: 2026-06-17T00:00:00.000Z through
+    // 2026-06-17T02:46:40.000Z (10 001 seconds apart at 1s spacing).
+    const N = READ_SERIES_LIMIT + 1 // 10 001
+    const { db } = makeDb()
+    const baseMs = new Date('2026-06-17T00:00:00.000Z').getTime()
+
+    for (let i = 0; i < N; i++) {
+      const occurredAt = new Date(baseMs + i * 1000).toISOString()
+      await emitMetric(
+        db,
+        { tenantId: TENANT_A, metricKey: 'growth.trunctest', value: i, occurredAt, source: 'test' },
+        `trunc-id-${i}`,
+        CREATED,
+      )
+    }
+
+    // Window spans the full day; all 10 001 readings fall within it.
+    // T1 = 08:00 so we use midnight as fromISO to capture rows that start at 00:00.
+    const result = await readSeries(db, TENANT_A, 'growth.trunctest', '2026-06-17T00:00:00.000Z', '2026-06-17T23:59:59.999Z')
+
+    // Data-honesty invariant: truncated must be true, not silently capped
+    expect(result.truncated).toBe(true)
+    // Points are capped at READ_SERIES_LIMIT (sentinel row dropped)
+    expect(result.points).toHaveLength(READ_SERIES_LIMIT)
+    // Points are the FIRST READ_SERIES_LIMIT readings (oldest), ordered ASC
+    expect(result.points[0].value).toBe(0)
+    expect(result.points[READ_SERIES_LIMIT - 1].value).toBe(READ_SERIES_LIMIT - 1)
   })
 })

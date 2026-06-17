@@ -226,7 +226,28 @@ export async function emitMetric(
 // never receives an unbounded array.  10 000 rows ≈ 27 readings/day over a full year —
 // a defensible upper bound for dashboard charting.  Callers needing bulk export must
 // page themselves.
-const READ_SERIES_LIMIT = 10_000
+//
+// DATA-HONESTY INVARIANT (truncation contract):
+//   readSeries queries LIMIT + 1 rows as a sentinel.  If the DB returns more than
+//   READ_SERIES_LIMIT rows the window is larger than the cap — the trailing bucket
+//   is computed over a partial day and MUST NOT be presented as a complete candle.
+//   The returned `truncated` flag signals this to every caller:
+//     - truncated === false → the series is complete; OHLC is accurate.
+//     - truncated === true  → data was capped at READ_SERIES_LIMIT rows; the
+//                             final day's OHLC covers only a partial window.
+//                             Surface a "partial — capped at N readings" warning
+//                             wherever the series is displayed.
+//   Receiving exactly READ_SERIES_LIMIT rows with truncated === false means the
+//   window fit exactly within the cap — no ambiguity.
+export const READ_SERIES_LIMIT = 10_000
+
+export interface ReadSeriesResult {
+  points: MetricPoint[]
+  /** True when the DB had more rows than READ_SERIES_LIMIT in the window.
+   *  The trailing bucket(s) are computed over a partial day and must not be
+   *  presented as a complete candle — surface a "capped" warning to consumers. */
+  truncated: boolean
+}
 
 /**
  * Fetch metric readings for one tenant + key within [fromISO, toISO] inclusive.
@@ -234,6 +255,11 @@ const READ_SERIES_LIMIT = 10_000
  *
  * FIX-3: LIMIT READ_SERIES_LIMIT prevents unbounded result sets that would cause
  * Math.max/min spread-crash in aggregateOHLC for tenants with many readings.
+ *
+ * Truncation detection (data-honesty invariant): queries LIMIT + 1 rows. If the
+ * DB returns more than READ_SERIES_LIMIT rows, `truncated` is set to true and
+ * the extra sentinel row is dropped before returning. Callers MUST check
+ * `truncated` before treating the trailing bucket as a complete OHLC candle.
  */
 export async function readSeries(
   db: D1Database,
@@ -241,7 +267,9 @@ export async function readSeries(
   metricKey: string,
   fromISO: string,
   toISO: string,
-): Promise<MetricPoint[]> {
+): Promise<ReadSeriesResult> {
+  // Query one extra row as a truncation sentinel. If we get back more than
+  // READ_SERIES_LIMIT rows the window exceeded the cap.
   const sql = `
     SELECT id, tenant_id, metric_key, value, occurred_at, source, created_at
     FROM metric_points
@@ -250,7 +278,7 @@ export async function readSeries(
       AND occurred_at >= ?3
       AND occurred_at <= ?4
     ORDER BY occurred_at ASC
-    LIMIT ${READ_SERIES_LIMIT}
+    LIMIT ${READ_SERIES_LIMIT + 1}
   `
   const result = await db
     .prepare(sql)
@@ -265,15 +293,23 @@ export async function readSeries(
       created_at: string
     }>()
 
-  return (result.results ?? []).map((r) => ({
-    id: r.id,
-    tenantId: r.tenant_id,
-    metricKey: r.metric_key,
-    value: r.value,
-    occurredAt: r.occurred_at,
-    source: r.source,
-    createdAt: r.created_at,
-  }))
+  const raw = result.results ?? []
+  const truncated = raw.length > READ_SERIES_LIMIT
+  // Drop the sentinel row so callers always receive at most READ_SERIES_LIMIT rows
+  const capped = truncated ? raw.slice(0, READ_SERIES_LIMIT) : raw
+
+  return {
+    points: capped.map((r) => ({
+      id: r.id,
+      tenantId: r.tenant_id,
+      metricKey: r.metric_key,
+      value: r.value,
+      occurredAt: r.occurred_at,
+      source: r.source,
+      createdAt: r.created_at,
+    })),
+    truncated,
+  }
 }
 
 // ── aggregateOHLC ─────────────────────────────────────────────────────────────
