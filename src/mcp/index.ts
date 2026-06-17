@@ -33,7 +33,7 @@ import type {
   Agent,
   Squad,
 } from '../types'
-import { resolveCapabilities, hasCapability } from '../auth/capability'
+import { resolveCapabilities, hasCapability, holdsCapabilityFloor } from '../auth/capability'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import { createTask } from '../tasks/service'
@@ -801,7 +801,9 @@ const toolConnect: ToolSpec = {
   },
 }
 
-const TOOLS: ToolSpec[] = [
+// Exported for the capability-floor test (#183) — the registry-completeness
+// assertion + the dispatch wiring proof read these directly.
+export const TOOLS: ToolSpec[] = [
   toolTaskCreate,
   toolRemember,
   toolRecall,
@@ -894,7 +896,7 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
   return null
 }
 
-async function invokeTool(
+export async function invokeTool(
   auth: AuthContext,
   env: Env,
   toolName: unknown,
@@ -919,6 +921,15 @@ async function invokeTool(
 
   const schemaError = validateArgs(spec.inputSchema, args)
   if (schemaError) return { ...fail(400, 'invalid_args', schemaError), tool: spec.name }
+
+  // AAGATE (#183) — deny-by-default capability FLOOR. `spec.min` is enforced HERE,
+  // centrally, BEFORE the handler runs. A tool that declares a capability minimum
+  // can no longer fail-open if its handler omits the inline scope check: a caller
+  // holding `min` on NO scope is rejected at the chokepoint. The handler still runs
+  // its precise per-scope check (the floor is scope-agnostic — see capability.ts).
+  if (spec.min !== 'authenticated' && !holdsCapabilityFloor(auth, spec.min)) {
+    return { ...fail(403, 'forbidden', { need: spec.min }), tool: spec.name }
+  }
 
   const outcome = await spec.run(auth, env, args, { origin })
   return { ...outcome, tool: spec.name }

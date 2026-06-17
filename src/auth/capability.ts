@@ -104,6 +104,33 @@ export function hasCapability(
   return false
 }
 
+// ── capability floor (deny-by-default chokepoint, #183 AAGATE) ──────────────────
+
+/**
+ * holdsCapabilityFloor — scope-AGNOSTIC capability floor for the MCP dispatch
+ * chokepoint (#183). Returns true iff the principal holds `min`-or-higher on SOME
+ * scope. Enforced centrally in `invokeTool` BEFORE a tool handler runs, so a tool
+ * that declares `min` can never fail-open if its handler omits the inline scope
+ * check: a caller who holds `min` on NO scope is rejected at the chokepoint.
+ *
+ * This is a FLOOR, not full authz. The handler's precise per-scope check (which
+ * squad? department inheritance?) remains authoritative via hasCapability — the
+ * floor closes the grantless / under-privileged case, NOT cross-scope confusion
+ * (a member on squad A still passes the floor for a tool targeting squad B; the
+ * handler's own check is what stops that). Defense-in-depth, not a replacement.
+ *
+ * Honors the same legacy-role escape as requireCapability: a pure web-login
+ * owner/admin (no fine-grained `capabilities` array) satisfies the floor when
+ * their org role ranks at/above `min` — so a dashboard owner is never locked out.
+ */
+export function holdsCapabilityFloor(auth: AuthContext, min: Capability): boolean {
+  // Legacy web-login owner/admin: no fine-grained grants → judge by org role.
+  if (auth.capabilities === undefined) {
+    return legacyRoleSatisfies(auth.role, min)
+  }
+  return auth.capabilities.some((g) => meets(g.capability, min))
+}
+
 // ── scope extractor type (frozen) ──────────────────────────────────────────────
 
 /** A route declares the scope it targets as a function of the request context. */
