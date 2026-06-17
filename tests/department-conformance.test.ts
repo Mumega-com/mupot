@@ -1275,6 +1275,239 @@ describe('9. EXPORT SURFACE ASSERTIONS — no mint/token/clear symbol reachable'
   })
 })
 
+// ── 10. ADVERSARIAL — registry-level manifest mutation (BLOCK-1, Codex round 3) ─
+//
+// Proves that the deep-freeze-clone introduced in this sprint closes the
+// mutable-registered-manifest vector. An attacker who obtains a reference via
+// getRegistered() cannot alter authority structures in place, and the registry
+// source-of-truth remains the original frozen clone.
+//
+// Exploit attempted (from Codex BLOCK-1 brief):
+//   const m = getRegistered('fixture') as any
+//   m.metricsEmitted.push({ key:'growth.revenue', sourceAuthority:['stripe'], ... })
+//   m.defaultSquads.push({ slug:'evil', name:'Evil' })
+//   m.consoleSection.path = '/departments/evil'
+//
+// Post-fix: all mutation attempts throw (frozen) or are silently inert (strict mode
+// always throws on frozen arrays/objects in V8). Subsequent selector calls reflect
+// only the original frozen manifest — no forged descriptors, no nav displacement.
+
+describe('10. ADVERSARIAL — registry manifest immutability (BLOCK-1 close)', () => {
+  // Use an isolated registry instance so these tests do not interact with the
+  // singleton. The exploit works the same way on both — we use isolated for hermeticity.
+  let reg: ReturnType<typeof createDepartmentRegistry>
+  let db: D1Database
+
+  beforeEach(() => {
+    reg = createDepartmentRegistry()
+    reg.register(FixtureModule)
+    db = makeDb().db
+  })
+
+  it('getRegistered returns a frozen object (top-level)', () => {
+    const m = reg.getRegistered('fixture')
+    expect(m).toBeDefined()
+    expect(Object.isFrozen(m)).toBe(true)
+  })
+
+  it('getRegistered: metricsEmitted array is frozen', () => {
+    const m = reg.getRegistered('fixture')!
+    expect(Object.isFrozen(m.metricsEmitted)).toBe(true)
+  })
+
+  it('getRegistered: each MetricDescriptor is frozen', () => {
+    const m = reg.getRegistered('fixture')!
+    for (const desc of m.metricsEmitted) {
+      expect(Object.isFrozen(desc)).toBe(true)
+    }
+  })
+
+  it('getRegistered: each MetricDescriptor.sourceAuthority array is frozen', () => {
+    const m = reg.getRegistered('fixture')!
+    for (const desc of m.metricsEmitted) {
+      expect(Object.isFrozen(desc.sourceAuthority)).toBe(true)
+    }
+  })
+
+  it('getRegistered: each MetricDescriptor.display object is frozen', () => {
+    const m = reg.getRegistered('fixture')!
+    for (const desc of m.metricsEmitted) {
+      expect(Object.isFrozen(desc.display)).toBe(true)
+    }
+  })
+
+  it('getRegistered: defaultSquads array is frozen', () => {
+    const m = reg.getRegistered('fixture')!
+    expect(Object.isFrozen(m.defaultSquads)).toBe(true)
+  })
+
+  it('getRegistered: each SquadSeed is frozen', () => {
+    const m = reg.getRegistered('fixture')!
+    for (const squad of m.defaultSquads) {
+      expect(Object.isFrozen(squad)).toBe(true)
+    }
+  })
+
+  it('getRegistered: consoleSection is frozen', () => {
+    const m = reg.getRegistered('fixture')!
+    expect(Object.isFrozen(m.consoleSection)).toBe(true)
+  })
+
+  it('getRegistered: connectors array is frozen', () => {
+    const m = reg.getRegistered('fixture')!
+    expect(Object.isFrozen(m.connectors)).toBe(true)
+  })
+
+  it('getRegistered: requiredCapabilities array is frozen', () => {
+    const m = reg.getRegistered('fixture')!
+    expect(Object.isFrozen(m.requiredCapabilities)).toBe(true)
+  })
+
+  it('EXPLOIT: push to metricsEmitted throws (frozen array)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const m = reg.getRegistered('fixture') as any
+    expect(() => {
+      m.metricsEmitted.push({
+        key: 'growth.revenue',
+        unit: 'usd',
+        direction: 'up_good',
+        cadence: 'realtime',
+        aggregation: 'sum',
+        ohlcEligible: true,
+        sourceAuthority: ['stripe'],
+        retention: '365d',
+        display: { precision: 2 },
+      })
+    }).toThrow()
+  })
+
+  it('EXPLOIT: push to defaultSquads throws (frozen array)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const m = reg.getRegistered('fixture') as any
+    expect(() => {
+      m.defaultSquads.push({ slug: 'evil', name: 'Evil' })
+    }).toThrow()
+  })
+
+  it('EXPLOIT: assign to consoleSection.path throws (frozen object)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const m = reg.getRegistered('fixture') as any
+    expect(() => {
+      m.consoleSection.path = '/departments/evil'
+    }).toThrow()
+  })
+
+  it('EXPLOIT: assign to metricsEmitted[0].sourceAuthority throws (frozen object)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const m = reg.getRegistered('fixture') as any
+    expect(() => {
+      m.metricsEmitted[0].sourceAuthority = ['stripe']
+    }).toThrow()
+  })
+
+  it('EXPLOIT: push to metricsEmitted[0].sourceAuthority throws (frozen array)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const m = reg.getRegistered('fixture') as any
+    expect(() => {
+      m.metricsEmitted[0].sourceAuthority.push('stripe')
+    }).toThrow()
+  })
+
+  it('post-exploit: getActiveMetricDescriptors reflects ONLY original — no forged growth.revenue', async () => {
+    // Activate in the isolated registry then attempt the full exploit sequence.
+    await reg.activate(db, 'fixture')
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const m = reg.getRegistered('fixture') as any
+    try { m.metricsEmitted.push({ key: 'growth.revenue', sourceAuthority: ['stripe'] }) } catch { /* frozen */ }
+    try { m.defaultSquads.push({ slug: 'evil', name: 'Evil' }) } catch { /* frozen */ }
+    try { m.consoleSection.path = '/departments/evil' } catch { /* frozen */ }
+
+    const descs = await reg.getActiveMetricDescriptors(db)
+    const keys = descs.map((d) => d.key)
+    // Original two descriptors only — no forged growth.revenue
+    expect(keys).not.toContain('growth.revenue')
+    expect(keys).toContain('fixture.pings')
+    expect(keys).toContain('fixture.scalar')
+    expect(descs).toHaveLength(2)
+  })
+
+  it('post-exploit: consoleSection.path is the original — no nav displacement', async () => {
+    await reg.activate(db, 'fixture')
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const m = reg.getRegistered('fixture') as any
+    try { m.consoleSection.path = '/departments/evil' } catch { /* frozen */ }
+
+    const sections = await reg.getActiveConsoleSections(db)
+    expect(sections).toHaveLength(1)
+    expect(sections[0].path).toBe('/departments/fixture')
+    expect(sections[0].path).not.toBe('/departments/evil')
+  })
+
+  it('clone isolation: mutating the CALLER original after register has no effect on stored manifest', () => {
+    // Build a fresh mutable module (not FixtureModule itself — we must not mutate it).
+    const mutableModule: DepartmentModule = {
+      key: 'muttest',
+      name: 'Mutation Test',
+      version: '0.1.0',
+      defaultSquads: [{ slug: 'muttest-core', name: 'MutTest Core' }],
+      metricsEmitted: [{
+        key: 'muttest.pings',
+        unit: 'count',
+        direction: 'neutral',
+        cadence: 'realtime',
+        aggregation: 'sum',
+        ohlcEligible: true,
+        sourceAuthority: ['test-source'],
+        retention: '30d',
+        display: { precision: 0 },
+      }],
+      consoleSection: { id: 'muttest', title: 'MutTest', navIcon: 'beaker', path: '/departments/muttest' },
+      requiredCapabilities: ['member'],
+      connectors: [],
+    }
+
+    const reg2 = createDepartmentRegistry()
+    reg2.register(mutableModule)
+
+    // Mutate the CALLER's original after registration.
+    // The stored manifest must remain unchanged.
+    mutableModule.metricsEmitted.push({
+      key: 'growth.revenue',
+      unit: 'usd',
+      direction: 'up_good',
+      cadence: 'realtime',
+      aggregation: 'sum',
+      ohlcEligible: true,
+      sourceAuthority: ['stripe'],
+      retention: '365d',
+      display: { precision: 2 },
+    })
+    mutableModule.defaultSquads.push({ slug: 'evil', name: 'Evil' })
+    mutableModule.consoleSection.path = '/departments/evil'
+
+    const stored = reg2.getRegistered('muttest')!
+    // Stored manifest is isolated from caller mutations
+    expect(stored.metricsEmitted).toHaveLength(1)
+    expect(stored.metricsEmitted[0].key).toBe('muttest.pings')
+    expect(stored.defaultSquads).toHaveLength(1)
+    expect(stored.defaultSquads[0].slug).toBe('muttest-core')
+    expect(stored.consoleSection.path).toBe('/departments/muttest')
+  })
+
+  it('listRegistered: returned array elements are frozen', () => {
+    const all = reg.listRegistered()
+    expect(all.length).toBeGreaterThan(0)
+    for (const m of all) {
+      expect(Object.isFrozen(m)).toBe(true)
+      expect(Object.isFrozen(m.metricsEmitted)).toBe(true)
+      expect(Object.isFrozen(m.consoleSection)).toBe(true)
+      expect(Object.isFrozen(m.defaultSquads)).toBe(true)
+    }
+  })
+})
+
 // ── Cleanup after all tests ───────────────────────────────────────────────────
 
 afterAll(() => {

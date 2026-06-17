@@ -51,8 +51,65 @@ import type { D1Database } from '@cloudflare/workers-types'
 import type { DepartmentModule, MetricDescriptor, ConsoleSectionRef } from './contract'
 import { assertWritten } from '../lib/receipt'
 
+// ── deepFreezeClone ───────────────────────────────────────────────────────────
+//
+// Clones a DepartmentModule manifest with structuredClone (Web API, available on
+// CF Workers + Node 18+) and then deeply freezes the clone so no post-registration
+// mutation can alter authority structures.
+//
+// Why clone-then-freeze (registry-side normalization):
+//   - The caller keeps their original mutable object — we cannot freeze it for them.
+//   - Future callers who mutate the original must not affect the stored manifest.
+//   - Callers who obtain the stored manifest via getRegistered() / listRegistered()
+//     cannot push/assign to freeze-protected arrays or objects.
+//
+// Structures frozen (authority-bearing surfaces):
+//   metricsEmitted array + each MetricDescriptor + its sourceAuthority array + display object
+//   defaultSquads array + each SquadSeed
+//   consoleSection object
+//   connectors array + each ConnectorRef
+//   requiredCapabilities array
+//   The top-level DepartmentModule object itself
+
+function deepFreezeClone(module: DepartmentModule): DepartmentModule {
+  // structuredClone is the Web-API-standard deep-copy utility available on
+  // CF Workers (via the V8 structured-clone algorithm) and Node 17+.
+  const clone = structuredClone(module) as DepartmentModule
+
+  // Freeze nested authority arrays and their elements before freezing the top object.
+  for (const desc of clone.metricsEmitted) {
+    Object.freeze((desc as { sourceAuthority: readonly string[] }).sourceAuthority)
+    Object.freeze((desc as { display: object }).display)
+    Object.freeze(desc)
+  }
+  Object.freeze(clone.metricsEmitted)
+
+  for (const squad of clone.defaultSquads) {
+    Object.freeze(squad)
+  }
+  Object.freeze(clone.defaultSquads)
+
+  Object.freeze(clone.consoleSection)
+
+  for (const conn of clone.connectors) {
+    Object.freeze(conn)
+  }
+  Object.freeze(clone.connectors)
+
+  Object.freeze(clone.requiredCapabilities)
+
+  Object.freeze(clone)
+
+  return clone
+}
+
 // Re-export so callers only need to import from registry.ts.
 export type { KernelHandle } from './ctx'
+// TODO(non-blocking): kernelMintCtx is a public export here, usable only with a
+// raw D1 handle that department modules cannot obtain. Keep it out of module-facing
+// barrels (e.g. a future departments/index.ts) in a later pass to narrow the surface
+// further. The current re-export from registry.ts is already scoped to kernel-internal
+// callers — no module receives a D1 handle directly.
 export { kernelMintCtx } from './kernel'
 
 // ── Activation row shape ──────────────────────────────────────────────────────
@@ -103,6 +160,21 @@ export interface DepartmentRegistry {
   deactivate(db: D1Database, moduleKey: string): Promise<DeactivateResult>
 }
 
+// ── RegistryInternal ─────────────────────────────────────────────────────────
+//
+// Internal-only type that extends DepartmentRegistry with _getOriginal.
+// This method is NOT exported via the DepartmentRegistry interface — it is only
+// used by the production singleton wrapper to maintain the same-object idempotency
+// check after deep-freeze-clone changes getRegistered() return type.
+//
+// It is NOT accessible via module-facing barrels or the exported DepartmentRegistry
+// interface. The only caller is the `register` export below, which holds a direct
+// reference to `_singleton` (typed as RegistryInternal, a module-private type).
+
+interface RegistryInternal extends DepartmentRegistry {
+  _getOriginal(key: string): DepartmentModule | undefined
+}
+
 // ── createDepartmentRegistry ──────────────────────────────────────────────────
 //
 // Factory that returns an isolated registry instance. Tests create fresh instances
@@ -116,9 +188,19 @@ export interface DepartmentRegistry {
 //
 // Notably absent: _clearRegistry, _unregister, _testOnly. Tests use their own
 // fresh instance instead.
+//
+// Note: the returned concrete object also carries _getOriginal (needed by the
+// singleton wrapper for same-object idempotency), but the public return type is
+// DepartmentRegistry so callers cannot observe or call _getOriginal.
 
 export function createDepartmentRegistry(): DepartmentRegistry {
+  // _map holds the frozen deep-clone of each registered manifest.
+  // _originals maps key → the ORIGINAL (caller's) module reference.
+  // _originals is used ONLY by the production singleton's same-object idempotency
+  // check (existing === module → no-op). It is NOT exposed on the DepartmentRegistry
+  // interface — no module-facing API can reach the original mutable reference.
   const _map = new Map<string, DepartmentModule>()
+  const _originals = new Map<string, DepartmentModule>()
 
   function register(module: DepartmentModule, opts?: { replace?: boolean }): void {
     if (_map.has(module.key) && !opts?.replace) {
@@ -127,15 +209,31 @@ export function createDepartmentRegistry(): DepartmentRegistry {
           'Use register(module, { replace: true }) only in tests.',
       )
     }
-    _map.set(module.key, module)
+    // Deep-clone then deep-freeze the manifest before storing.
+    // The stored manifest is immutable — push/assign on any nested authority
+    // structure throws in strict mode and is silently inert in sloppy mode.
+    // Callers who retain their original mutable object cannot affect the stored clone.
+    const frozen = deepFreezeClone(module)
+    _map.set(module.key, frozen)
+    _originals.set(module.key, module)
   }
 
   function listRegistered(): DepartmentModule[] {
+    // Return the frozen stored clones. Callers may spread the array, but the
+    // elements themselves are frozen — mutation of any descriptor / authority
+    // array throws in strict mode.
     return [..._map.values()]
   }
 
   function getRegistered(key: string): DepartmentModule | undefined {
+    // Returns the frozen stored clone, never the live caller reference.
     return _map.get(key)
+  }
+
+  // Internal accessor used ONLY by the production singleton wrapper's same-object
+  // idempotency check. Not part of the DepartmentRegistry interface.
+  function _getOriginal(key: string): DepartmentModule | undefined {
+    return _originals.get(key)
   }
 
   async function getActive(db: D1Database): Promise<ActivatedDepartmentRow[]> {
@@ -313,7 +411,11 @@ export function createDepartmentRegistry(): DepartmentRegistry {
     }
   }
 
-  return {
+  // Return the concrete object (a RegistryInternal superset of DepartmentRegistry).
+  // The function's declared return type is DepartmentRegistry so external callers
+  // cannot observe _getOriginal. The singleton variable is cast to RegistryInternal
+  // internally (module-private cast) to access it for idempotency checks.
+  const instance: RegistryInternal = {
     register,
     listRegistered,
     getRegistered,
@@ -322,7 +424,9 @@ export function createDepartmentRegistry(): DepartmentRegistry {
     getActiveMetricDescriptors,
     activate,
     deactivate,
+    _getOriginal,
   }
+  return instance
 }
 
 // ── Singleton production registry ─────────────────────────────────────────────
@@ -342,14 +446,21 @@ export function createDepartmentRegistry(): DepartmentRegistry {
 // THERE ARE NO global-mutation exports (_clearRegistry, _unregister, _testOnly).
 // Tests use createDepartmentRegistry() for isolated instances.
 
-const _singleton = createDepartmentRegistry()
+// Cast to RegistryInternal so we can call _getOriginal in the singleton wrapper.
+// RegistryInternal is a module-private type — it is NOT exported and cannot be
+// imported by hostile module code. The DepartmentRegistry interface (exported)
+// has no _getOriginal member.
+const _singleton = createDepartmentRegistry() as RegistryInternal
 
 export function register(module: DepartmentModule): void {
   // Idempotent for the same module object (same key + same reference) — no-op.
+  // After deep-freeze-clone, getRegistered() returns the frozen CLONE, not the
+  // original. We use _getOriginal (internal only, not on DepartmentRegistry) to
+  // compare against the caller's reference for the idempotency check.
   // Different module under existing key → throws registry_duplicate_key.
   // No `replace` accepted: production registration is permanent.
-  const existing = _singleton.getRegistered(module.key)
-  if (existing === module) return  // same object re-imported → safe no-op
+  const original = _singleton._getOriginal(module.key)
+  if (original === module) return  // same object re-imported → safe no-op
   _singleton.register(module)     // throws registry_duplicate_key if key taken by different object
 }
 
