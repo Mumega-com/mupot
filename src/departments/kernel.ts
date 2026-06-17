@@ -105,9 +105,46 @@ function _mintCtxInternal(
     )
   }
 
-  const { tenantId, departmentKey, module, capabilities } = opts
+  const { tenantId, departmentKey, capabilities } = opts
   const nowFn = opts.now ?? (() => new Date().toISOString())
   const idFn = opts.idGen ?? (() => crypto.randomUUID())
+
+  // ── WARN-2: departmentKey / module.key agreement check ────────────────────
+  //
+  // The two are supplied independently by the caller. A mismatch means the
+  // authority map would be built for one key while the ctx is labelled with
+  // another — a silent structural lie. Fail loudly at mint time instead.
+  if (opts.departmentKey !== opts.module.key) {
+    throw new CtxError(
+      'key_mismatch',
+      `kernelMintCtx: departmentKey '${opts.departmentKey}' does not match module.key '${opts.module.key}'`,
+    )
+  }
+
+  // ── WARN-1: deep-freeze the module at the kernel boundary ─────────────────
+  //
+  // The caller may pass a mutable module reference (e.g. the directly-imported
+  // GrowthModule singleton). A pre-mint mutation of that reference would silently
+  // widen the authority map built below. We structuredClone + deep-freeze the
+  // module here — BEFORE reading any authority-bearing field — so the kernel
+  // boundary is closed for ALL callers regardless of whether the registry's own
+  // frozen copy was used. Belt-and-suspenders with the registry's deepFreezeClone.
+  const module: DepartmentModule = ((): DepartmentModule => {
+    const clone = structuredClone(opts.module) as DepartmentModule
+    for (const desc of clone.metricsEmitted) {
+      Object.freeze((desc as { sourceAuthority: readonly string[] }).sourceAuthority)
+      Object.freeze((desc as { display: object }).display)
+      Object.freeze(desc)
+    }
+    Object.freeze(clone.metricsEmitted)
+    for (const squad of clone.defaultSquads) Object.freeze(squad)
+    Object.freeze(clone.defaultSquads)
+    Object.freeze(clone.consoleSection)
+    for (const conn of clone.connectors) Object.freeze(conn)
+    Object.freeze(clone.connectors)
+    Object.freeze(clone.requiredCapabilities)
+    return Object.freeze(clone)
+  })()
 
   // ── Closure-private authority state (NOT exposed on ctx) ──────────────────
   const _capSet: ReadonlySet<Capability> = new Set(capabilities)

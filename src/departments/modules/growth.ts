@@ -13,7 +13,7 @@
 //   growth.leads      — count of ALL prospects ever queued (sum of queued+drafted+sent+replied).
 //                       A new prospect row = a new lead entering the funnel.
 //   growth.replies    — count of prospects in 'replied' status. The KPI outcome.
-//   growth.conversion — ratio replied/sent. Only emitted when sent > 0 (no divide-by-zero).
+//   growth.conversion — reply rate = replied / (sent + replied). Only emitted when reached > 0.
 //
 // ohlcEligible = false for all three: the collector runs once per cron tick (daily cadence)
 // and emits a single scalar snapshot. With one reading per day, O==H==L==C → fabricated
@@ -87,8 +87,9 @@ export const GrowthModule: DepartmentModule = {
     },
     {
       key: 'growth.conversion',
-      // Ratio: replied / sent (range 0–1). Only emitted when sent > 0.
-      // Zero-sent → no conversion point emitted (not fabricated as 0).
+      // Reply rate = replied / (sent + replied) — range 0–1 by construction.
+      // Denominator is all prospects known to have been contacted (reached).
+      // When reached === 0 (nobody contacted yet) → no conversion point emitted.
       unit: 'ratio',
       direction: 'up_good',
       cadence: 'daily',
