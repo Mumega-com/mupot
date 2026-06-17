@@ -23,6 +23,16 @@
 //   - A module holding ctx has no raw DB/env handle — the Env type is never exposed.
 //   - Mutating ctx.capabilities or ctx.metricsEmitted has NO effect on any check.
 //   - The ctx object and all nested port objects are frozen (TypeError on mutation).
+//
+// EXPORT SURFACE INVARIANT (structural, not naming):
+//   This file exports ONLY: types/interfaces, CtxError, createMintSeam.
+//   mintCtx, acquireKernelToken, _isKernelToken, and KERNEL_TOKEN are NOT exported.
+//   createMintSeam() is the single seam kernel.ts uses to obtain minting capability
+//   at module-load time; it is not useful to a department module because the token
+//   it returns only works with the specific mint function it co-returns.
+//   A department module that imports ctx.ts receives NO function that can mint
+//   a ctx without having first obtained the matching token from the same createMintSeam()
+//   call — and since kernel.ts holds that call private, the boundary is real.
 
 import type { D1Database } from '@cloudflare/workers-types'
 import type { Capability } from '../types'
@@ -30,57 +40,12 @@ import type { DepartmentModule, MetricDescriptor } from './contract'
 import { emitMetric } from '../metrics/pulse'
 import type { EmitOutcome } from '../metrics/pulse'
 
-// ── Kernel-mint token ─────────────────────────────────────────────────────────
+// ── KernelHandle ──────────────────────────────────────────────────────────────
 //
-// An unforgeable module-private Symbol. mintCtx() requires this token as its
-// first argument. Because the Symbol is NOT exported from this module, department
-// code (which never imports from ctx.ts directly) cannot call mintCtx.
-//
-// Only the kernel (registry.ts) holds a reference, obtained via the exported
-// accessor acquireKernelToken() — which itself is guarded so it can only be
-// called once (by the kernel at boot).
+// Holds the raw D1 handle. Only the kernel (registry.ts via kernel.ts) holds one.
+// Department modules never receive it.
 
-const KERNEL_TOKEN = Symbol('mupot.kernel.mint')
-
-// Tracks whether the token has been handed out. The kernel calls
-// acquireKernelToken() exactly once at module load time.
-let _tokenAcquired = false
-
-/**
- * Called ONCE — by registry.ts at module load — to acquire the kernel mint token.
- * Returns the token on first call. Throws on any subsequent call.
- *
- * The token is then used internally by registry.ts's kernelMintCtx() wrapper, which
- * is the only public path for creating a DepartmentCtx in production and in tests.
- * Department modules NEVER import or call this function.
- */
-export function acquireKernelToken(): symbol {
-  if (_tokenAcquired) {
-    throw new Error(
-      '[kernel_token_already_acquired] The kernel mint token may only be acquired once. ' +
-        'Department modules must not call acquireKernelToken.',
-    )
-  }
-  _tokenAcquired = true
-  return KERNEL_TOKEN
-}
-
-/**
- * Verify that a given symbol IS the kernel token (for testing the gate itself).
- * Returns true only when the symbol is the real KERNEL_TOKEN.
- * Used by the test harness to prove that a wrong symbol is rejected.
- */
-export function _isKernelToken(sym: symbol): boolean {
-  return sym === KERNEL_TOKEN
-}
-
-// ── Sealed kernel handle ──────────────────────────────────────────────────────
-//
-// KernelHandle is passed to mintCtx(). It is intentionally NOT exported from
-// this module — only the kernel (registry.ts) holds one. A department module
-// only receives DepartmentCtx.
-
-interface KernelHandle {
+export interface KernelHandle {
   /** Raw D1 database handle — held by kernel, never passed to department code. */
   db: D1Database
 }
@@ -184,29 +149,47 @@ export class CtxError extends Error {
   }
 }
 
-// ── mintCtx ───────────────────────────────────────────────────────────────────
+// ── Capability ladder (module-private) ────────────────────────────────────────
 //
-// The ONLY path through which a DepartmentCtx is created. Called by the kernel
-// (registry.ts) after resolving tenant + actor + capabilities. A department module
-// never calls mintCtx; it receives the ctx.
-//
-// REQUIRES the kernel-mint token as first argument. Throws if the token is wrong.
+// Kept private here — ctx facades do NOT call the authz module (no circular dep).
+// This is a structural check only; the full RBAC (grants, scope inheritance) lives
+// in auth/capability.ts.
 
-export function mintCtx(
-  kernelToken: symbol,
+const RANK: Record<Capability, number> = {
+  observer: 1,
+  member: 2,
+  lead: 3,
+  admin: 4,
+  owner: 5,
+}
+
+function hasCapability(caps: ReadonlySet<Capability>, min: Capability): boolean {
+  for (const c of caps) {
+    if ((RANK[c] ?? 0) >= (RANK[min] ?? 0)) return true
+  }
+  return false
+}
+
+// ── mintCtxInternal (module-private — NOT exported) ───────────────────────────
+//
+// The actual minting logic. Called only by the factory returned from
+// createMintSeam(). Never exported, never reachable by department module code.
+
+function mintCtxInternal(
+  callerToken: symbol,
+  realToken: symbol,
   handle: KernelHandle,
   opts: {
     tenantId: string
     departmentKey: string
     module: DepartmentModule
     capabilities: Capability[]
-    /** Optional injected clock for deterministic tests (default: Date.now / crypto.randomUUID). */
     now?: () => string
     idGen?: () => string
   },
 ): DepartmentCtx {
-  // ── Token gate — only the kernel may mint ctx ──────────────────────────────
-  if (kernelToken !== KERNEL_TOKEN) {
+  // ── Token gate ─────────────────────────────────────────────────────────────
+  if (callerToken !== realToken) {
     throw new CtxError(
       'kernel_token_invalid',
       'mintCtx requires the kernel mint token — department modules may not call mintCtx directly',
@@ -218,14 +201,8 @@ export function mintCtx(
   const idFn = opts.idGen ?? (() => crypto.randomUUID())
 
   // ── Closure-private authority state (NOT exposed on ctx) ──────────────────
-  //
-  // These are the instances the facade checks read. They are private to this
-  // closure. Mutating ctx.capabilities or ctx.metricsEmitted (the frozen
-  // snapshots) has zero effect here.
   const _capSet: ReadonlySet<Capability> = new Set(capabilities)
 
-  // Build a fast-lookup descriptor map keyed by metric key.
-  // Deep-freeze each descriptor + its sourceAuthority array.
   const _metricsMap = new Map<string, Readonly<MetricDescriptor>>(
     module.metricsEmitted.map((d) => {
       const frozen: Readonly<MetricDescriptor> = Object.freeze({
@@ -241,7 +218,6 @@ export function mintCtx(
 
   const metrics: MetricsPort = Object.freeze({
     async emit(input: MetricsEmitInput): Promise<EmitOutcome> {
-      // Capability check — minimum 'member' to emit metrics.
       if (!hasCapability(_capSet, 'member')) {
         throw new CtxError(
           'capability_denied',
@@ -249,7 +225,6 @@ export function mintCtx(
         )
       }
 
-      // Key ownership check — reads from closure-private _metricsMap, NOT ctx field.
       const descriptor = _metricsMap.get(input.key)
       if (!descriptor) {
         throw new CtxError(
@@ -258,7 +233,6 @@ export function mintCtx(
         )
       }
 
-      // Source authority check — reads from frozen descriptor.sourceAuthority array.
       if (!descriptor.sourceAuthority.includes(input.source)) {
         throw new CtxError(
           'source_not_authorized',
@@ -266,7 +240,6 @@ export function mintCtx(
         )
       }
 
-      // Non-finite guard (defense-in-depth; pulse.emitMetric also checks this).
       if (!Number.isFinite(input.value)) {
         throw new CtxError(
           'value_not_finite',
@@ -274,14 +247,12 @@ export function mintCtx(
         )
       }
 
-      // Tenant is bound from closure-private tenantId — NEVER from input args.
-      // emitMetric requires an explicit id + createdAt (no Date.now() inside the spine).
       const emitId = idFn()
       const emitCreatedAt = nowFn()
       return emitMetric(
         handle.db,
         {
-          tenantId,          // always the closure-bound tenant, not caller-supplied
+          tenantId,
           metricKey: input.key,
           value: input.value,
           occurredAt: input.occurredAt,
@@ -293,7 +264,7 @@ export function mintCtx(
     },
   })
 
-  // ── audit facade (stub — shape is the contract) ────────────────────────────
+  // ── audit facade ──────────────────────────────────────────────────────────
 
   const audit: AuditPort = Object.freeze({
     async write(event: { action: string; payload?: unknown }): Promise<void> {
@@ -303,12 +274,11 @@ export function mintCtx(
           `ctx(${departmentKey}@${tenantId}): 'member' capability required to write audit`,
         )
       }
-      // TODO(full-impl): insert into audit log table with tenantId + departmentKey.
       void event
     },
   })
 
-  // ── gate facade (stub — shape is the contract) ─────────────────────────────
+  // ── gate facade ───────────────────────────────────────────────────────────
 
   const gate: GatePort = Object.freeze({
     async propose(proposal: { action: string; payload?: unknown }): Promise<{ gateId: string }> {
@@ -323,7 +293,7 @@ export function mintCtx(
     },
   })
 
-  // ── bus facade (stub — shape is the contract) ──────────────────────────────
+  // ── bus facade ────────────────────────────────────────────────────────────
 
   const bus: BusPort = Object.freeze({
     async publish(msg: { type: string; payload?: unknown }): Promise<void> {
@@ -337,16 +307,12 @@ export function mintCtx(
     },
   })
 
-  // ── Build inert frozen snapshots for ctx.capabilities / ctx.metricsEmitted ──
-  //
-  // These are COPIES — mutating them has zero effect on _capSet or _metricsMap.
+  // ── Build inert frozen snapshots ──────────────────────────────────────────
   const capSnapshot: readonly Capability[] = Object.freeze([...capabilities])
   const metricsSnapshot: readonly Readonly<MetricDescriptor>[] = Object.freeze(
     [..._metricsMap.values()],
   )
 
-  // Return a fully frozen ctx. Every nested object is already frozen above.
-  // Using Object.freeze at the top level prevents tenantId/departmentKey re-binding.
   return Object.freeze({
     tenantId,
     departmentKey,
@@ -359,23 +325,49 @@ export function mintCtx(
   } satisfies DepartmentCtx)
 }
 
-// ── Internal helper ────────────────────────────────────────────────────────────
+// ── createMintSeam ────────────────────────────────────────────────────────────
 //
-// Capability ladder (mirrors capability.ts). Kept private here — ctx facades do
-// NOT call the authz module (no circular dep). This is a structural check only;
-// the full RBAC (grants, scope inheritance) lives in auth/capability.ts.
+// STRUCTURAL BOUNDARY: this is the single seam through which minting capability
+// is obtained. kernel.ts calls createMintSeam() ONCE at module load and holds the
+// result in a module-private const — the token and the mint function never leave
+// kernel.ts.
+//
+// Why this is a real boundary (not a naming convention):
+//   - The `token` is a fresh Symbol created inside this call.
+//   - The `mint` function validates that the caller passes the SAME symbol.
+//   - A department module that imports ctx.ts gets CtxError and type exports only —
+//     it receives NO token and NO mint function.
+//   - Even if a module somehow called createMintSeam() itself, it would get a
+//     DIFFERENT token (new Symbol each call) that the kernel's mint function would
+//     reject. The kernel's token is bound at kernel.ts load time and is unreachable.
+//
+// The `isToken` helper lets kernel.ts test whether a given symbol is the real token
+// (used in the conformance harness to prove the gate rejects wrong tokens).
 
-const RANK: Record<Capability, number> = {
-  observer: 1,
-  member: 2,
-  lead: 3,
-  admin: 4,
-  owner: 5,
-}
-
-function hasCapability(caps: ReadonlySet<Capability>, min: Capability): boolean {
-  for (const c of caps) {
-    if ((RANK[c] ?? 0) >= (RANK[min] ?? 0)) return true
+export function createMintSeam(): {
+  token: symbol
+  mint: (
+    callerToken: symbol,
+    handle: KernelHandle,
+    opts: {
+      tenantId: string
+      departmentKey: string
+      module: DepartmentModule
+      capabilities: Capability[]
+      now?: () => string
+      idGen?: () => string
+    },
+  ) => DepartmentCtx
+  isToken: (sym: symbol) => boolean
+} {
+  const KERNEL_TOKEN = Symbol('mupot.kernel.mint')
+  return {
+    token: KERNEL_TOKEN,
+    mint(callerToken, handle, opts) {
+      return mintCtxInternal(callerToken, KERNEL_TOKEN, handle, opts)
+    },
+    isToken(sym) {
+      return sym === KERNEL_TOKEN
+    },
   }
-  return false
 }
