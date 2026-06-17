@@ -64,8 +64,20 @@ export interface GrowthView {
     name: string
     active: boolean
   }
+  /**
+   * True when all four funnel counts loaded successfully.
+   * False when ANY of the four countFn calls rejected — the funnel is
+   * UNAVAILABLE (DB error), not legitimately empty.
+   * The honest empty state (real all-zero funnel) always has funnelAvailable=true.
+   */
+  funnelAvailable: boolean
+  /** Funnel counts. Only meaningful when funnelAvailable=true. */
   funnel: GrowthFunnel
-  kpis: GrowthKPIs
+  /**
+   * KPI computations derived from the funnel.
+   * null when funnelAvailable=false — KPIs cannot be computed from fabricated zeros.
+   */
+  kpis: GrowthKPIs | null
   /** OHLC buckets for growth.leads over last 30 days. Empty = no history yet. */
   leadsBuckets: OHLCBucket[]
   /** True if readSeries was truncated (data-honesty invariant from pulse.ts). */
@@ -131,15 +143,39 @@ export async function loadGrowthView(env: Env, auth: AuthContext, deps: GrowthVi
   const readSeriesFn = deps.readSeriesFn ?? readSeries
   const nowMs = deps.nowMs ?? Date.now()
 
-  // ── 1. Funnel counts (parallel) ────────────────────────────────────────────
-  const [queued, drafted, sent, replied] = await Promise.all([
-    countFn(env, 'queued').catch(() => 0),
-    countFn(env, 'drafted').catch(() => 0),
-    countFn(env, 'sent').catch(() => 0),
-    countFn(env, 'replied').catch(() => 0),
+  // ── 1. Funnel counts (parallel, allSettled) ────────────────────────────────
+  //
+  // We use Promise.allSettled so that a DB error is DETECTABLE, not silently
+  // swallowed into a zero. A zero returned by .catch(() => 0) is
+  // indistinguishable from a real empty funnel — that conflation fabricates data.
+  //
+  // If ANY of the four counts rejects → funnelAvailable=false.
+  //   Render: "Funnel data unavailable" (distinct from the honest empty state).
+  // If ALL resolve → funnelAvailable=true, and the counts are real (may be zeros).
+  //   A real all-zero funnel is honest; render: "No prospects yet — connect a source".
+  const [queuedResult, draftedResult, sentResult, repliedResult] = await Promise.allSettled([
+    countFn(env, 'queued'),
+    countFn(env, 'drafted'),
+    countFn(env, 'sent'),
+    countFn(env, 'replied'),
   ])
-  const funnel: GrowthFunnel = { queued, drafted, sent, replied }
-  const kpis = computeKPIs(funnel)
+
+  const funnelAvailable =
+    queuedResult.status === 'fulfilled' &&
+    draftedResult.status === 'fulfilled' &&
+    sentResult.status === 'fulfilled' &&
+    repliedResult.status === 'fulfilled'
+
+  const funnel: GrowthFunnel = funnelAvailable
+    ? {
+        queued: (queuedResult as PromiseFulfilledResult<number>).value,
+        drafted: (draftedResult as PromiseFulfilledResult<number>).value,
+        sent: (sentResult as PromiseFulfilledResult<number>).value,
+        replied: (repliedResult as PromiseFulfilledResult<number>).value,
+      }
+    : { queued: 0, drafted: 0, sent: 0, replied: 0 }  // sentinel — not rendered when !funnelAvailable
+
+  const kpis: GrowthKPIs | null = funnelAvailable ? computeKPIs(funnel) : null
 
   // ── 2. Trend series (growth.leads, last 30 days) ───────────────────────────
   //
@@ -195,7 +231,7 @@ export async function loadGrowthView(env: Env, auth: AuthContext, deps: GrowthVi
     // Department not yet activated — squads stay empty, dept stays default.
   }
 
-  return { dept, funnel, kpis, leadsBuckets, truncated, squads }
+  return { dept, funnelAvailable, funnel, kpis, leadsBuckets, truncated, squads }
 }
 
 // ── SVG bar chart — deterministic, no Math.random, no Date.now ───────────────
@@ -283,6 +319,18 @@ function funnelCell(label: string, count: number, highlight: boolean, showArrow:
   </div>`
 }
 
+/**
+ * Rendered when funnelAvailable=false (DB error on any of the four counts).
+ * Visually distinct from the honest empty state so operators can tell the
+ * difference between "no data yet" and "something went wrong".
+ */
+function funnelUnavailableRow() {
+  return html`<div class="card">
+    <p class="unavailable">Funnel data unavailable — the prospects database could not be reached.
+      Check the D1 binding and try reloading.</p>
+  </div>`
+}
+
 /** The four-stage funnel row. */
 function funnelRow(f: GrowthFunnel, hasProspects: boolean) {
   if (!hasProspects) {
@@ -321,7 +369,11 @@ function squadCard(s: GrowthSquadRow) {
  *   - Honest empty states throughout — no fabricated bars/numbers.
  */
 export function growthBody(view: GrowthView) {
-  const hasProspects = view.funnel.queued + view.funnel.drafted + view.funnel.sent + view.funnel.replied > 0
+  // Only check real prospect presence when the funnel is actually available.
+  // When unavailable, hasProspects is false but we render the unavailable state,
+  // not the empty-funnel state — the distinction is what funnelAvailable is for.
+  const hasProspects = view.funnelAvailable &&
+    (view.funnel.queued + view.funnel.drafted + view.funnel.sent + view.funnel.replied > 0)
   // seriesShape is always 'bar' for growth.leads (ohlcEligible=false on the module).
   // We verify at runtime so future metric descriptor changes don't silently enable
   // candle rendering. If somehow the shape is 'candle', we still render as bar — the
@@ -396,14 +448,18 @@ export function growthBody(view: GrowthView) {
 
     <!-- KPI Cards -->
     <div class="growth-kpis">
-      ${kpiCard('Leads', String(view.kpis.leads), 'total funnel entries')}
+      ${view.kpis !== null
+        ? html`${kpiCard('Leads', String(view.kpis.leads), 'total funnel entries')}
       ${kpiCard('Replies', String(view.kpis.replies), 'prospects replied')}
-      ${kpiCard('Reply rate', fmtRate(view.kpis.replyRate), view.kpis.replyRate === null ? 'no one reached yet' : 'replied / reached')}
+      ${kpiCard('Reply rate', fmtRate(view.kpis.replyRate), view.kpis.replyRate === null ? 'no one reached yet' : 'replied / reached')}`
+        : html`${kpiCard('Leads', '—', 'unavailable')}
+      ${kpiCard('Replies', '—', 'unavailable')}
+      ${kpiCard('Reply rate', '—', 'unavailable')}`}
     </div>
 
     <!-- Funnel -->
     <div class="growth-section-label">Prospect funnel</div>
-    ${funnelRow(view.funnel, hasProspects)}
+    ${view.funnelAvailable ? funnelRow(view.funnel, hasProspects) : funnelUnavailableRow()}
 
     <!-- Trend chart -->
     <div class="growth-section-label">Lead trend (last 30 days)</div>

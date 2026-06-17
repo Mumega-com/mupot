@@ -37,6 +37,11 @@ import {
 import { aggregateOHLC, seriesShape } from '../src/metrics/pulse'
 import type { OHLCBucket } from '../src/metrics/pulse'
 
+// ── Growth dashboard view imports ─────────────────────────────────────────────
+import { loadGrowthView, growthBody, computeKPIs } from '../src/dashboard/growth'
+import type { GrowthFunnel } from '../src/dashboard/growth'
+import type { Env } from '../src/types'
+
 // ────────────────────────────────────────────────────────────────────────────
 // In-memory department DB mock (reused from conformance test, same shape)
 // ────────────────────────────────────────────────────────────────────────────
@@ -1180,5 +1185,192 @@ describe('M. Frozen-module mint: collector uses registry frozen copy', () => {
     expect(isolatedReg.getRegistered('growth')).toBeUndefined()
     // The production singleton (used by the collector) DOES have growth registered.
     expect(getRegistered('growth')).toBeDefined()
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// N. loadGrowthView + growthBody: funnelAvailable honesty
+//
+// Proves the three distinct funnel states:
+//   N1. DB error on any count → funnelAvailable=false, kpis=null, body renders
+//       "unavailable" marker (NOT zeros, NOT the empty-source message).
+//   N2. Real all-zero funnel → funnelAvailable=true, kpis computed (all zeros),
+//       body renders the honest empty state ("connect a source").
+//   N3. Populated funnel → funnelAvailable=true, kpis computed, body renders counts.
+//
+// Also: N4. Single-count error makes the whole funnel unavailable (allSettled gate).
+//       N5. computeKPIs is unaffected — it still works on valid GrowthFunnel input.
+// ────────────────────────────────────────────────────────────────────────────
+
+// Minimal stubs for loadGrowthView (it needs env.DB for dept/squads + series,
+// but we control countFn + readSeriesFn via deps to isolate the funnel logic).
+
+function makeMinimalEnv(): Env {
+  // Only DB is used inside loadGrowthView. We provide a stub that returns
+  // empty results for dept/squad queries (the non-funnel paths).
+  const db = {
+    prepare(_sql: string) {
+      const stmt = {
+        bind(..._args: unknown[]) { return stmt },
+        async run() { return { success: true, meta: { changes: 0 } } },
+        async all() { return { results: [], success: true } },
+        async first() { return null },
+      }
+      return stmt
+    },
+    async batch(stmts: unknown[]) { return stmts.map(() => ({ success: true, meta: { changes: 0 } })) },
+  }
+  return { DB: db } as unknown as Env
+}
+
+const STUB_AUTH = {
+  userId: 'u1', email: null, role: 'owner' as const, tenant: TENANT,
+}
+
+// readSeriesFn stub that returns an empty result (no chart data needed for these tests).
+const emptySeriesFn = async () => ({ points: [], truncated: false })
+
+describe('N. loadGrowthView + growthBody: funnelAvailable honesty', () => {
+  // ── N1. DB error → funnelAvailable=false, kpis=null, body renders "unavailable" ──
+
+  it('N1a: any countFn rejection → funnelAvailable=false', async () => {
+    const env = makeMinimalEnv()
+    // One of the four counts rejects (e.g. DB timeout on 'queued')
+    const countFn = async (_env: Env, status: string) => {
+      if (status === 'queued') throw new Error('D1 timeout')
+      return 0
+    }
+    const view = await loadGrowthView(env, STUB_AUTH, { countFn, readSeriesFn: emptySeriesFn, nowMs: 0 })
+    expect(view.funnelAvailable).toBe(false)
+  })
+
+  it('N1b: funnelAvailable=false → kpis is null', async () => {
+    const env = makeMinimalEnv()
+    const countFn = async () => { throw new Error('DB down') }
+    const view = await loadGrowthView(env, STUB_AUTH, { countFn, readSeriesFn: emptySeriesFn, nowMs: 0 })
+    expect(view.kpis).toBeNull()
+  })
+
+  it('N1c: funnelAvailable=false → growthBody renders "unavailable" marker, not zeros', () => {
+    const env = makeMinimalEnv()
+    void env
+    // Construct a view directly with funnelAvailable=false
+    const view = {
+      dept: { id: null, name: 'Marketing & Sales', active: false },
+      funnelAvailable: false,
+      funnel: { queued: 0, drafted: 0, sent: 0, replied: 0 },
+      kpis: null,
+      leadsBuckets: [],
+      truncated: false,
+      squads: [],
+    }
+    const body = String(growthBody(view))
+    // Must contain the unavailable marker
+    expect(body).toContain('unavailable')
+    // Must NOT contain the empty-source message (that's for a real empty funnel)
+    expect(body).not.toContain('connect a source')
+    // Must NOT show a numeric zero from the KPIs (the cards render "—")
+    // KPI values "—" (em dash) should appear 3 times (Leads, Replies, Reply rate)
+    const dashMatches = (body.match(/—/g) ?? []).length
+    expect(dashMatches).toBeGreaterThanOrEqual(3)
+  })
+
+  it('N1d: growthBody unavailable state does NOT render the funnel cells (no count numbers)', () => {
+    const view = {
+      dept: { id: null, name: 'Marketing & Sales', active: false },
+      funnelAvailable: false,
+      funnel: { queued: 0, drafted: 0, sent: 0, replied: 0 },
+      kpis: null,
+      leadsBuckets: [],
+      truncated: false,
+      squads: [],
+    }
+    const body = String(growthBody(view))
+    // The funnelUnavailableRow renders a .unavailable paragraph, not the stage cells.
+    // The funnel cell labels (queued/drafted/sent/replied) must NOT appear.
+    expect(body).not.toContain('>queued<')
+    expect(body).not.toContain('>drafted<')
+  })
+
+  // ── N2. Real all-zero funnel → funnelAvailable=true, honest empty state ──
+
+  it('N2a: all counts resolve to 0 → funnelAvailable=true', async () => {
+    const env = makeMinimalEnv()
+    const countFn = async () => 0
+    const view = await loadGrowthView(env, STUB_AUTH, { countFn, readSeriesFn: emptySeriesFn, nowMs: 0 })
+    expect(view.funnelAvailable).toBe(true)
+  })
+
+  it('N2b: all-zero counts → kpis computed (leads=0, replies=0, replyRate=null)', async () => {
+    const env = makeMinimalEnv()
+    const countFn = async () => 0
+    const view = await loadGrowthView(env, STUB_AUTH, { countFn, readSeriesFn: emptySeriesFn, nowMs: 0 })
+    expect(view.kpis).not.toBeNull()
+    expect(view.kpis?.leads).toBe(0)
+    expect(view.kpis?.replies).toBe(0)
+    expect(view.kpis?.replyRate).toBeNull()
+  })
+
+  it('N2c: all-zero funnel → growthBody renders "connect a source" (NOT "unavailable")', async () => {
+    const env = makeMinimalEnv()
+    const countFn = async () => 0
+    const view = await loadGrowthView(env, STUB_AUTH, { countFn, readSeriesFn: emptySeriesFn, nowMs: 0 })
+    const body = String(growthBody(view))
+    expect(body).toContain('connect a source')
+    expect(body).not.toContain('unavailable')
+  })
+
+  // ── N3. Populated funnel → normal render ──
+
+  it('N3a: populated funnel → funnelAvailable=true, kpis computed correctly', async () => {
+    const env = makeMinimalEnv()
+    const counts: Record<string, number> = { queued: 3, drafted: 2, sent: 5, replied: 1 }
+    const countFn = async (_env: Env, status: string) => counts[status] ?? 0
+    const view = await loadGrowthView(env, STUB_AUTH, { countFn, readSeriesFn: emptySeriesFn, nowMs: 0 })
+    expect(view.funnelAvailable).toBe(true)
+    expect(view.kpis).not.toBeNull()
+    expect(view.kpis?.leads).toBe(11)   // 3+2+5+1
+    expect(view.kpis?.replies).toBe(1)
+    // replyRate = 1 / (5+1) ≈ 0.1667
+    expect(view.kpis?.replyRate).toBeCloseTo(1 / 6, 5)
+  })
+
+  it('N3b: populated funnel → growthBody renders numeric counts (not "—" or "unavailable")', async () => {
+    const env = makeMinimalEnv()
+    const counts: Record<string, number> = { queued: 3, drafted: 2, sent: 5, replied: 1 }
+    const countFn = async (_env: Env, status: string) => counts[status] ?? 0
+    const view = await loadGrowthView(env, STUB_AUTH, { countFn, readSeriesFn: emptySeriesFn, nowMs: 0 })
+    const body = String(growthBody(view))
+    expect(body).not.toContain('connect a source')
+    expect(body).not.toContain('unavailable')
+    // KPI leads = 11 should appear in the body
+    expect(body).toContain('11')
+  })
+
+  // ── N4. Partial failure: single-count error makes whole funnel unavailable ──
+
+  it('N4: only one count rejects → still funnelAvailable=false (not partially zero)', async () => {
+    const env = makeMinimalEnv()
+    // 'sent' rejects; others succeed with realistic counts
+    const countFn = async (_env: Env, status: string) => {
+      if (status === 'sent') throw new Error('timeout')
+      return status === 'queued' ? 5 : 2
+    }
+    const view = await loadGrowthView(env, STUB_AUTH, { countFn, readSeriesFn: emptySeriesFn, nowMs: 0 })
+    // A partial count is worse than no count — the funnel must be unavailable, not
+    // a silently-wrong partial total.
+    expect(view.funnelAvailable).toBe(false)
+    expect(view.kpis).toBeNull()
+  })
+
+  // ── N5. computeKPIs purity — unaffected by the funnelAvailable flag ──
+
+  it('N5: computeKPIs still returns correct values on a valid GrowthFunnel', () => {
+    const f: GrowthFunnel = { queued: 10, drafted: 5, sent: 8, replied: 2 }
+    const kpis = computeKPIs(f)
+    expect(kpis.leads).toBe(25)
+    expect(kpis.replies).toBe(2)
+    // replyRate = 2 / (8+2) = 0.2
+    expect(kpis.replyRate).toBeCloseTo(0.2, 5)
   })
 })
