@@ -25,6 +25,7 @@ import type { Env, BusEvent } from '../types'
 import { hasCapability } from '../auth/capability'
 import { createDepartment, createSquad, createAgent } from '../org/service'
 import { mintRawToken, sha256Hex } from '../members/service'
+import { assertBatchWritten } from '../lib/receipt'
 import { mcpEndpoint, wakeContractForAgent } from '../dashboard/connect'
 import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
@@ -285,7 +286,7 @@ const toolMintAgentToken: ToolSpec = {
     const tokenHash = await sha256Hex(rawToken)
     const createdAt = new Date().toISOString()
 
-    await env.DB.batch([
+    const mintWrites = await env.DB.batch([
       // 1) dedicated member envelope for the agent (no email, no IM — it is not a human).
       env.DB.prepare(
         `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at)
@@ -304,6 +305,10 @@ const toolMintAgentToken: ToolSpec = {
          VALUES (?, ?, ?, ?, 'workspace', ?, ?)`,
       ).bind(tokenId, memberId, tokenHash, label, createdAt, agent.id),
     ])
+    // Receipt (#186): all three rows must land. A partial mint — e.g. the token row
+    // without its capability row — would hand out a show-once token bound to a broken
+    // identity. Verify before returning `raw` (a 0-row INSERT does not throw on its own).
+    assertBatchWritten(mintWrites, 'mint_agent_token', 1)
 
     await emitProvisioned(env, auth.memberId as string, 'token', tokenId, {
       squad_id: agent.squad_id,
