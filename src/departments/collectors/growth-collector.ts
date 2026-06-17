@@ -9,10 +9,14 @@
 //   1. The collector receives a KernelHandle (raw D1) + a tenantId.
 //   2. It mints a DepartmentCtx via kernelMintCtx — the kernel-side-only path.
 //   3. All metric writes go through ctx.metrics.emit(...) — NOT raw DB calls.
-//   4. The GrowthModule is imported for the manifest (passed to kernelMintCtx).
-//      This import does NOT give the collector minting capability — it only gives
-//      the module descriptor (a plain data object). The kernel token is closure-private
-//      in kernel.ts; kernelMintCtx holds it internally, the caller never sees it.
+//   4. The manifest passed to kernelMintCtx is sourced from the REGISTRY's frozen
+//      registered copy (getRegistered('growth')), NOT the directly-imported mutable
+//      GrowthModule singleton. This satisfies the "minted authority comes only from a
+//      frozen manifest" invariant at the SOURCE level — not just at the kernel boundary.
+//      The kernel still clone+freezes the module it receives (belt-and-suspenders), but
+//      with this change the source is already the registry's deep-frozen clone.
+//      The GrowthModule import below is retained ONLY to trigger auto-registration on
+//      module load — we do NOT pass it directly to kernelMintCtx.
 //
 // Data sourced from:
 //   - prospects table via direct D1 queries (same SELECT pattern as countByStatus
@@ -24,16 +28,21 @@
 //   - All emitted values are direct DB counts — no interpolation or estimation.
 //   - occurred_at = `now` parameter (injected, deterministic — no Date.now() inside).
 //
-// Invocation: the existing cron (src/cron/heartbeat.ts or equivalent) can call
-// collectGrowthMetrics(handle, tenantId, now) directly. A guarded admin route is also
-// provided below for manual trigger during development. No new cron is registered
-// in this pass — that is left for the wiring sprint.
+// Invocation: the scheduled handler in src/index.ts calls collectGrowthMetrics(handle,
+// tenantId, now) directly, guarded by an active-department check (getActive(db)).
+// A fail-soft try/catch in the scheduled handler ensures a collector error never breaks
+// the rest of the cron.
 
 import type { D1Database } from '@cloudflare/workers-types'
 import type { KernelHandle } from '../ctx'
+import type { DepartmentModule } from '../contract'
 import type { EmitOutcome } from '../../metrics/pulse'
-import { kernelMintCtx } from '../registry'
-import { GrowthModule } from '../modules/growth'
+import { kernelMintCtx, getRegistered } from '../registry'
+// Import GrowthModule to trigger auto-registration on module load.
+// Do NOT pass this directly to kernelMintCtx — use the registry's frozen copy instead.
+import { GrowthModule as _GrowthModuleForRegistration } from '../modules/growth'
+// Suppress unused-variable lint: the side-effect import is intentional.
+void _GrowthModuleForRegistration
 
 // ── ProspectCounts ────────────────────────────────────────────────────────────
 
@@ -137,12 +146,28 @@ export async function collectGrowthMetrics(
   //
   // kernelMintCtx is the only public path to a DepartmentCtx. The kernel token
   // is closure-private in kernel.ts — the collector cannot observe or forge it.
-  // We pass GrowthModule (the manifest) so the ctx knows which keys and sources
-  // are authorised for this department.
+  //
+  // WARN-1 (closed): we source the manifest from the REGISTRY's frozen registered
+  // copy (getRegistered('growth')), not the directly-imported mutable GrowthModule
+  // singleton. The registry stored a deep-frozen structuredClone at registration time,
+  // so the module we pass here is already immutable — any post-registration mutation
+  // of the original GrowthModule object cannot affect the minted ctx's authority map.
+  // The kernel still clone+freezes the module it receives (belt-and-suspenders).
+  //
+  // If growth is not registered (defensive — should never happen in production since
+  // the import above triggers auto-registration), we throw rather than silently mint
+  // with an undefined module (which would cause a runtime TypeError anyway, but this
+  // surfaces the problem at the right place with a legible message).
+  const frozenModule: DepartmentModule = (() => {
+    const m = getRegistered('growth')
+    if (!m) throw new Error('[growth_collector] GrowthModule is not registered — cannot mint ctx')
+    return m
+  })()
+
   const ctx = kernelMintCtx(handle, {
     tenantId,
     departmentKey: 'growth',
-    module: GrowthModule,
+    module: frozenModule,
     capabilities: ['member'],
     now: () => now,
     idGen: opts?.idGen,
