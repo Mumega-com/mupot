@@ -33,7 +33,7 @@ import type {
   Agent,
   Squad,
 } from '../types'
-import { resolveCapabilities, hasCapability } from '../auth/capability'
+import { resolveCapabilities, hasCapability, holdsCapabilityFloor } from '../auth/capability'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import { createTask } from '../tasks/service'
@@ -80,6 +80,12 @@ async function resolveAuth(c: {
       const auth = JSON.parse(injected) as AuthContext
       // Validate the minimal invariants we require before accepting the injected context.
       if (typeof auth.userId === 'string' && typeof auth.tenant === 'string') {
+        // Defense-in-depth (#183): the capability floor's legacy-role escape fires
+        // when `capabilities === undefined`. On this internal seam capabilities is
+        // always a resolved array (buildAuthContextFromProps sets it); a crafted
+        // blob that OMITS the key must not inherit the role escape and pass an
+        // admin-gated tool. Normalize a missing/non-array value to [] (fail-closed).
+        if (!Array.isArray(auth.capabilities)) auth.capabilities = []
         return auth
       }
     } catch {
@@ -534,6 +540,17 @@ const toolStatus: ToolSpec = {
     const agent = await loadAgent(env, agentId)
     if (!agent) return fail(404, 'agent_not_found')
 
+    // A cross-agent lookup is NOT a self-op — gate it. `min: 'authenticated'` keeps
+    // the self-echo branch above open, but reading another agent's row + Durable
+    // Object runtime requires observer+ on THAT agent's squad (org/dept grants
+    // inherit). Without this an authenticated zero-grant member could enumerate and
+    // probe every agent's runtime. (Floor exempts 'authenticated' tools, so the
+    // gate must live here — #183 adversarial review, P1.)
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'observer'))) {
+      return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
+    }
+
     const stub = env.AGENT.get(env.AGENT.idFromName(agent.id))
     const res = await stub.fetch('https://agent/status')
     const runtime = await res.json<unknown>()
@@ -801,7 +818,9 @@ const toolConnect: ToolSpec = {
   },
 }
 
-const TOOLS: ToolSpec[] = [
+// Exported for the capability-floor test (#183) — the registry-completeness
+// assertion + the dispatch wiring proof read these directly.
+export const TOOLS: ToolSpec[] = [
   toolTaskCreate,
   toolRemember,
   toolRecall,
@@ -894,7 +913,7 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
   return null
 }
 
-async function invokeTool(
+export async function invokeTool(
   auth: AuthContext,
   env: Env,
   toolName: unknown,
@@ -919,6 +938,15 @@ async function invokeTool(
 
   const schemaError = validateArgs(spec.inputSchema, args)
   if (schemaError) return { ...fail(400, 'invalid_args', schemaError), tool: spec.name }
+
+  // AAGATE (#183) — deny-by-default capability FLOOR. `spec.min` is enforced HERE,
+  // centrally, BEFORE the handler runs. A tool that declares a capability minimum
+  // can no longer fail-open if its handler omits the inline scope check: a caller
+  // holding `min` on NO scope is rejected at the chokepoint. The handler still runs
+  // its precise per-scope check (the floor is scope-agnostic — see capability.ts).
+  if (spec.min !== 'authenticated' && !holdsCapabilityFloor(auth, spec.min)) {
+    return { ...fail(403, 'forbidden', { need: spec.min }), tool: spec.name }
+  }
 
   const outcome = await spec.run(auth, env, args, { origin })
   return { ...outcome, tool: spec.name }
