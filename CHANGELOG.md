@@ -6,6 +6,50 @@ All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 this changelog (shipped, dated) share version numbers and feed each other — a roadmap
 block collapses into a changelog entry when it ships.
 
+## [0.22.0] — 2026-06-18
+
+**The department-template microkernel + the first real department.** The console becomes a
+**microkernel**: a tiny trusted core (identity · capability · bus · audit) plus **activatable
+department modules** that adapt per pot via config — *one template, N sovereign tenants, zero
+per-tenant code*. The first real department (**Marketing & Sales**) is live and self-running, and
+the **multi-channel command layer** is proven on the real outbound funnel. Light-default console.
+**Every security/identity surface dual-gated Opus + Codex** — the cross-vendor gate caught real
+vectors single-lens missed: false-idempotency on a PK collision, object-capability *theater*
+(ctx-escape), import-order token theft, mutable registry manifests, channel key-shadowing, and a
+data-model conversion-honesty bug (`replied/sent` unbounded on a current-state funnel).
+
+### Added
+- **AAGATE capability floor** (#189). Deny-by-default tool floor enforced centrally at MCP dispatch
+  — closes the fail-open auth gap (excessive agency). Live.
+- **Write receipts** (#190). `assertWritten`/`assertBatchWritten` on integrity-critical writes
+  (task create, token mint, invite-accept) — a 0-row D1 write can no longer report success
+  (phantom-success guard).
+- **`metric_points` pulse spine** (#192). One generic per-pot time-series table every department +
+  connector emits to; honest OHLC (`seriesShape` returns *bar* for daily-scalar series — never a
+  fabricated candle), truncation flag, bounded/canonical inputs.
+- **Department-template microkernel core** (#196). Declarative `DepartmentModule` + **object-capability
+  `ctx`** (closure-private authority, frozen inert snapshots, no raw DB/env reachable, kernel-only
+  mint behind an unexported token) + factory registry (deep-frozen manifests, no `replace`) + a
+  **conformance harness** proving the litmus: *add a department with zero kernel edits.*
+- **Growth / Marketing department** (#197). The first real department: declarative manifest + a
+  real-funnel collector (honest conversion = `replied/(sent+replied)`, bounded 0–1) +
+  `/departments/growth` view (honest empty/unavailable states) + a `*/15` fail-soft cron. Activate
+  it on any pot → seeds squads → reads that pot's funnel → emits honest metrics.
+- **Light-default console re-skin** (#195). Stripe sidebar (collapsible groups + pot switcher),
+  editorial type (Instrument Serif / Hanken Grotesk / JetBrains Mono), light/dark toggle (persists),
+  regime vital-sign chip. Human-QA'd clean on the live pot.
+- **Marketing channel layer — S1 + S2** (#200, #202). A **flat** `ChannelDescriptor` (declarative
+  data, not a second kernel) composed under a department; the existing outbound funnel extracted as
+  the first real channel. Channels never mint authority — they compose metrics/work-types through
+  the department's existing ctx/Gate/`metric_points`. Architecture + sprints: `docs/architecture/
+  marketing-channels.md`; remaining sprints (SEO/CRO perceive · gated writes · the daily closed loop)
+  tracked in epic #199.
+
+### Architecture
+- `docs/architecture/console-department-microkernel.md` — the department-template microkernel + the
+  sterile-pot/garden rule (qNFT/FRC/business logic live in the garden, never in the sterile pot).
+- `docs/architecture/marketing-channels.md` — the multi-channel command layer (cross-vendor reviewed).
+
 ## [0.21.1] — 2026-06-16
 
 A face for the console. The pot dashboard gets a **Stripe-style shell** — a left
