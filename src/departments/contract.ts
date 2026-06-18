@@ -19,6 +19,7 @@
 // sibling department. A module registers itself; the kernel's dynamic lists do the rest.
 
 import type { Capability } from '../types'
+import type { ChannelDescriptor } from './channels/contract'
 
 // ── MetricDescriptor ─────────────────────────────────────────────────────────
 //
@@ -172,4 +173,12 @@ export interface DepartmentModule {
    * Empty array for departments with no external connectors.
    */
   connectors: ConnectorRef[]
+  /**
+   * Optional channel descriptors this department surfaces.
+   * Each channel contributes metricDescriptors + workTypes to the dept's composed
+   * active set. Channels are pure data — no ctx, no lifecycle, no registry.
+   * The composed effective metric set = metricsEmitted ∪ channels[].metricDescriptors.
+   * Deep-frozen at registration time alongside the rest of the manifest.
+   */
+  channels?: ChannelDescriptor[]
 }

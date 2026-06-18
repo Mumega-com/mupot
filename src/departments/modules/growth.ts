@@ -9,11 +9,16 @@
 //     departments are NOT edited.
 //   - Removing this file + its register() call leaves all other tests green.
 //
-// Metrics backed by real data today (via prospects table, countByStatus):
+// Metrics (S2: via OutboundChannel in the channels field below):
 //   growth.leads      — count of ALL prospects ever queued (sum of queued+drafted+sent+replied).
 //                       A new prospect row = a new lead entering the funnel.
 //   growth.replies    — count of prospects in 'replied' status. The KPI outcome.
 //   growth.conversion — reply rate = replied / (sent + replied). Only emitted when reached > 0.
+//
+// These three descriptors were MOVED from metricsEmitted into OutboundChannel (S2).
+// The collector (growth-collector.ts) is unchanged — same keys, same source, same logic.
+// The composed manifest (metricsEmitted ∪ OutboundChannel.metricDescriptors) authorizes
+// the collector's emits through the kernel's existing source-authority check.
 //
 // ohlcEligible = false for all three: the collector runs once per cron tick (daily cadence)
 // and emits a single scalar snapshot. With one reading per day, O==H==L==C → fabricated
@@ -25,6 +30,7 @@
 
 import type { DepartmentModule } from '../contract'
 import { register } from '../registry'
+import { OutboundChannel } from '../channels/outbound-channel'
 
 export const GrowthModule: DepartmentModule = {
   key: 'growth',
@@ -51,58 +57,15 @@ export const GrowthModule: DepartmentModule = {
 
   // ── metricsEmitted ────────────────────────────────────────────────────────────
   //
-  // Full MetricDescriptor schema required — these are the ONLY keys the growth
-  // collector may emit (the ctx rejects anything not in this list).
+  // S2 change: growth.leads / growth.replies / growth.conversion have been MOVED
+  // into OutboundChannel (src/departments/channels/outbound-channel.ts) and are
+  // composed in via the `channels` field below. The collector is UNCHANGED —
+  // those keys are still authorized through composeDeptMetricDescriptors.
   //
-  // Data source for all: the `prospects` table (src/loops/prospects.ts:countByStatus).
-  // Honesty: ohlcEligible=false for all (daily snapshot scalars → bar, never candle).
-  metricsEmitted: [
-    {
-      key: 'growth.leads',
-      // Total prospects entering the funnel (all statuses except opted_out/bounced are
-      // "leads" from a marketing perspective). In practice the collector sums
-      // queued+drafted+sent+replied as the total funnel entry count.
-      unit: 'count',
-      direction: 'up_good',
-      cadence: 'daily',
-      aggregation: 'sum',
-      // ohlcEligible=false: the collector emits one reading per tick (daily scalar).
-      // O==H==L==C → fabricated candle. Honest rendering = bar.
-      ohlcEligible: false,
-      sourceAuthority: ['prospects'],
-      retention: '90d',
-      display: { precision: 0 },
-    },
-    {
-      key: 'growth.replies',
-      // Prospects that replied — the primary KPI outcome signal.
-      unit: 'count',
-      direction: 'up_good',
-      cadence: 'daily',
-      aggregation: 'sum',
-      ohlcEligible: false,
-      sourceAuthority: ['prospects'],
-      retention: '90d',
-      display: { precision: 0 },
-    },
-    {
-      key: 'growth.conversion',
-      // Reply rate = replied / (sent + replied) — range 0–1 by construction.
-      // Denominator is all prospects known to have been contacted (reached).
-      // When reached === 0 (nobody contacted yet) → no conversion point emitted.
-      unit: 'ratio',
-      direction: 'up_good',
-      cadence: 'daily',
-      // aggregation=last: the conversion ratio is a rate, not an additive count.
-      // Taking the last reading of the day (from the most recent snapshot) is honest
-      // for a daily scalar. 'sum' of ratios is meaningless.
-      aggregation: 'last',
-      ohlcEligible: false,
-      sourceAuthority: ['prospects'],
-      retention: '90d',
-      display: { precision: 3, suffix: ' reply rate' },
-    },
-  ],
+  // metricsEmitted is empty because all current growth metrics are channel-owned.
+  // The field remains (not removed) because DepartmentModule.metricsEmitted is
+  // required, and future dept-owned metrics (not tied to a channel) would go here.
+  metricsEmitted: [],
 
   // ── consoleSection ────────────────────────────────────────────────────────────
   //
@@ -139,6 +102,14 @@ export const GrowthModule: DepartmentModule = {
       required: false,
     },
   ],
+
+  // ── channels ──────────────────────────────────────────────────────────────────
+  //
+  // S2: the outbound prospects funnel is extracted as a ChannelDescriptor.
+  // growth.leads / growth.replies / growth.conversion now live in OutboundChannel
+  // and are composed into the dept's effective metric set at registration/mint time.
+  // The collector (growth-collector.ts) is UNCHANGED — same keys, same source.
+  channels: [OutboundChannel],
 }
 
 // Auto-register when this module is imported.

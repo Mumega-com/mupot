@@ -50,6 +50,7 @@
 import type { D1Database } from '@cloudflare/workers-types'
 import type { DepartmentModule, MetricDescriptor, ConsoleSectionRef } from './contract'
 import { assertWritten } from '../lib/receipt'
+import { composeDeptMetricDescriptors, deepFreezeChannels } from './channels/compose'
 
 // ── deepFreezeClone ───────────────────────────────────────────────────────────
 //
@@ -97,6 +98,13 @@ function deepFreezeClone(module: DepartmentModule): DepartmentModule {
   Object.freeze(clone.connectors)
 
   Object.freeze(clone.requiredCapabilities)
+
+  // Freeze channels if present. deepFreezeChannels freezes each ChannelDescriptor
+  // and all nested arrays/objects (metricDescriptors, sourceAuthority, workTypes,
+  // connectorRefs, renderHints) to match the depth of the rest of this function.
+  if (clone.channels) {
+    deepFreezeChannels(clone.channels)
+  }
 
   Object.freeze(clone)
 
@@ -264,7 +272,13 @@ export function createDepartmentRegistry(): DepartmentRegistry {
     const descriptors: MetricDescriptor[] = []
     for (const row of rows) {
       const module = _map.get(row.template_key)
-      if (module) descriptors.push(...module.metricsEmitted)
+      if (module) {
+        // Use the composed set: metricsEmitted ∪ channels[].metricDescriptors.
+        // composeDeptMetricDescriptors throws ChannelComposeError on duplicate key — any
+        // such error here is a registration-time config bug that should surface loudly.
+        const composed = composeDeptMetricDescriptors(module.metricsEmitted, module.channels ?? [])
+        descriptors.push(...composed)
+      }
     }
     return descriptors
   }
