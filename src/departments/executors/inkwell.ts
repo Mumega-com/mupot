@@ -8,10 +8,16 @@
 // adapter is inert unless the Worker explicitly supplies a credential.
 
 export interface InkwellExecutorConfig {
-  /** Inkwell API origin, e.g. https://inkwell-api.mumega.com (staging by default). */
+  /** Inkwell API origin, e.g. https://inkwell-api.mumega.com (https, public host). */
   apiUrl: string
-  /** Bearer publish token (resolved from the per-pot 'inkwell' connector). */
+  /** Bearer secret for the internal pot-publish endpoint (per-pot 'inkwell' connector). */
   token: string
+  /**
+   * Pot tenant slug — sent EXPLICITLY in the body so inkwell-api writes to this
+   * pot's draft area (the internal endpoint is tenant-explicit, not host-resolved).
+   * The write is always a DRAFT (server-forced), pot-scoped.
+   */
+  tenantSlug: string
 }
 
 export interface InkwellWriteResult {
@@ -140,24 +146,26 @@ export async function inkwellContentWrite(
   payload: unknown,
   fetchImpl: typeof fetch = fetch,
 ): Promise<InkwellWriteResult> {
-  if (!cfg || !cfg.apiUrl || !cfg.token) {
-    throw new InkwellExecutorError('inkwell_not_configured', 'missing apiUrl or token')
+  if (!cfg || !cfg.apiUrl || !cfg.token || !cfg.tenantSlug) {
+    throw new InkwellExecutorError('inkwell_not_configured', 'missing apiUrl, token, or tenantSlug')
   }
   const base = assertSafeInkwellUrl(cfg.apiUrl)
   const body = toPublishBody(payload)
   if (!body) {
     throw new InkwellExecutorError('invalid_payload', 'stored payload lacks title/content')
   }
+  // tenant-explicit, pot-scoped, server-forced-draft internal endpoint.
+  const internalBody = { ...body, tenant_slug: cfg.tenantSlug }
 
   let res: Response
   try {
-    res = await fetchImpl(`${base.origin}/api/content/publish`, {
+    res = await fetchImpl(`${base.origin}/api/internal/content/publish`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${cfg.token}`,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(internalBody),
     })
   } catch (e) {
     throw new InkwellExecutorError('inkwell_unreachable', String(e))

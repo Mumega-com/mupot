@@ -311,7 +311,7 @@ dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
   }
   const handle: KernelHandle = {
     db: c.env.DB,
-    executorEnv: { inkwell: { apiUrl: c.env.INKWELL_API_URL, token } },
+    executorEnv: { inkwell: { apiUrl: c.env.INKWELL_API_URL, token, tenantSlug: c.env.TENANT_SLUG } },
   }
   const ctx = kernelMintCtx(handle, {
     tenantId: c.env.TENANT_SLUG,

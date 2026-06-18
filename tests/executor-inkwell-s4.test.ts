@@ -46,17 +46,18 @@ function okFetch(slug = 'test-slug', url = '/blog/test-slug') {
 }
 
 describe('inkwellContentWrite — fail-closed', () => {
-  const cfg = { apiUrl: 'https://inkwell.test', token: 'tok' }
+  const cfg = { apiUrl: 'https://inkwell.test', token: 'tok', tenantSlug: 'mumega' }
   const payload = { title: 't', content: 'c' }
 
   it('writes and returns the artifact on a good response', async () => {
     const f = okFetch('s1', '/blog/s1')
     const r = await inkwellContentWrite(cfg, payload, f)
     expect(r).toEqual({ ok: true, slug: 's1', url: '/blog/s1' })
-    // posts to /api/content/publish with a Bearer token
+    // posts to the internal pot-publish endpoint with a Bearer token + tenant_slug
     const call = (f as unknown as ReturnType<typeof vi.fn>).mock.calls[0]
-    expect(String(call[0])).toBe('https://inkwell.test/api/content/publish')
+    expect(String(call[0])).toBe('https://inkwell.test/api/internal/content/publish')
     expect((call[1] as RequestInit).headers).toMatchObject({ authorization: 'Bearer tok' })
+    expect(JSON.parse((call[1] as RequestInit).body as string).tenant_slug).toBe('mumega')
   })
 
   it('missing config → inkwell_not_configured', async () => {
@@ -144,7 +145,7 @@ describe('execute() — inkwell-content adapter dispatch', () => {
   it('with executorEnv + approval → executed:true, artifactUrl (real write)', async () => {
     vi.stubGlobal('fetch', okFetch('hello-world', '/blog/hello-world'))
     const db = makeStubDb()
-    const ctx = mintCtx({ db, executorEnv: { inkwell: { apiUrl: 'https://inkwell.test', token: 'tok' } } })
+    const ctx = mintCtx({ db, executorEnv: { inkwell: { apiUrl: 'https://inkwell.test', token: 'tok', tenantSlug: 'mumega' } } })
     const { gateId } = await ctx.gate.propose({
       action: 'seo-meta-fix',
       payload: { executor: 'inkwell-content', title: 'Hello World', content: '# body' },
@@ -173,7 +174,7 @@ describe('execute() — inkwell-content adapter dispatch', () => {
   it('adapter HTTP error → fail-closed (executed:false), never throws out of execute()', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 502 })))
     const db = makeStubDb()
-    const ctx = mintCtx({ db, executorEnv: { inkwell: { apiUrl: 'https://inkwell.test', token: 'tok' } } })
+    const ctx = mintCtx({ db, executorEnv: { inkwell: { apiUrl: 'https://inkwell.test', token: 'tok', tenantSlug: 'mumega' } } })
     const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: { executor: 'inkwell-content', title: 't', content: 'c' } })
     await approve(db, gateId)
     const outcome = await ctx.executor.execute(gateId)
@@ -184,7 +185,7 @@ describe('execute() — inkwell-content adapter dispatch', () => {
   it('still fail-closed without approval even WITH executorEnv', async () => {
     vi.stubGlobal('fetch', okFetch())
     const db = makeStubDb()
-    const ctx = mintCtx({ db, executorEnv: { inkwell: { apiUrl: 'https://inkwell.test', token: 'tok' } } })
+    const ctx = mintCtx({ db, executorEnv: { inkwell: { apiUrl: 'https://inkwell.test', token: 'tok', tenantSlug: 'mumega' } } })
     const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: { executor: 'inkwell-content', title: 't', content: 'c' } })
     // NOT approved
     await expect(ctx.executor.execute(gateId)).rejects.toThrow(/not_approved/)

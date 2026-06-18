@@ -110,7 +110,7 @@ describe('department_proposals durability — cross-isolate propose→approve→
     await approve(db, gateId)
 
     // ctxB = a fresh isolate: different closure-private _pendingStore, SAME db.
-    const ctxB = mintCtx({ db, executorEnv: { inkwell: { apiUrl: 'https://inkwell.test', token: 'tok' } } })
+    const ctxB = mintCtx({ db, executorEnv: { inkwell: { apiUrl: 'https://inkwell.test', token: 'tok', tenantSlug: 'mumega' } } })
     const outcome = await ctxB.executor.execute(gateId)
     expect(outcome.executed).toBe(true) // found via DB, approval verified, adapter ran
     expect(outcome.artifactUrl).toBe('/blog/durable')
