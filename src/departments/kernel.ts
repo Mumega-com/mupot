@@ -52,6 +52,7 @@ import type {
 } from './ctx'
 import { composeDeptMetricDescriptors, deepFreezeChannels, getChannelWorkTypes } from './channels/compose'
 import type { GatedWorkType } from './channels/contract'
+import { inkwellContentWrite, InkwellExecutorError } from './executors/inkwell'
 
 // Re-export types so registry.ts only needs to import from kernel.ts.
 export type { KernelHandle, DepartmentCtx } from './ctx'
@@ -575,13 +576,24 @@ function _mintCtxInternal(
       // Adapter dispatch (all stubbed at S4).
       let outcome: ExecuteOutcome
       if (executorHint === 'inkwell-content') {
-        // STUB: inkwell-content adapter (Inkwell CMS write path — not wired at S4).
-        // Full-impl: POST to Inkwell worker /api/content with the proposal payload.
-        // Requires: Hadi-go, Inkwell API credentials, content-write capability.
-        outcome = {
-          executed: false,
-          reason: 'executor_not_wired',
-          adapter: 'inkwell-content',
+        // inkwell-content adapter — real Inkwell content write (S4).
+        // FAIL-CLOSED: only fires when the Worker boundary resolved the per-pot
+        // 'inkwell' connector credential (Hadi-go) into handle.executorEnv.inkwell.
+        // Absent → executor_not_wired (every current call site). The payload is the
+        // STORED record's (content-bound), never caller-supplied.
+        const inkwellCfg = handle.executorEnv?.inkwell
+        if (!inkwellCfg) {
+          outcome = { executed: false, reason: 'executor_not_wired', adapter: 'inkwell-content' }
+        } else {
+          try {
+            const written = await inkwellContentWrite(inkwellCfg, storedPayload)
+            outcome = { executed: true, adapter: 'inkwell-content', artifactUrl: written.url }
+          } catch (e) {
+            // Fail-closed on any adapter error (config/payload/HTTP) — never throw out
+            // of execute(); surface the reason for the receipt/console.
+            const reason = e instanceof InkwellExecutorError ? e.reason : 'inkwell_error'
+            outcome = { executed: false, reason, adapter: 'inkwell-content' }
+          }
         }
       } else if (executorHint === 'mcpwp') {
         // STUB: mcpwp adapter (MCPWP-managed WordPress write path — not wired at S4).

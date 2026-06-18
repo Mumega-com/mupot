@@ -30,6 +30,7 @@ export type ConnectorType =
   | 'ghl'
   | 'apify'
   | 'mcpwp'
+  | 'inkwell'
   | 'github_app'
   | 'custom'
 export type ConnectorScopeType = 'squad' | 'agent' | 'pot'
@@ -40,6 +41,7 @@ const VALID_TYPES: readonly ConnectorType[] = [
   'ghl',
   'apify',
   'mcpwp',
+  'inkwell',
   'github_app',
   'custom',
 ]
