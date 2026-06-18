@@ -127,6 +127,46 @@ async function _hasApprovedVerdict(db: D1Database, gateId: string): Promise<bool
   return row?.verdict === 'approved'
 }
 
+// ── Durable proposal store (S4 durability slice) ──────────────────────────────
+//
+// gate.propose() write-throughs the proposal CONTENT here so executor.execute()
+// can find it across requests / isolates (the in-memory _pendingStore is a
+// same-isolate fast-path only). NO approval flag and NO secret is stored — only the
+// content + the tenant/department BINDING that execute() re-checks. Fail-closed: if
+// the durable write fails, propose() throws (a gateId that won't survive a cold
+// isolate is worse than a failed propose).
+async function _persistProposal(db: D1Database, r: PendingRecord): Promise<void> {
+  const payloadJson = r.payload === undefined ? null : JSON.stringify(r.payload)
+  await db
+    .prepare(
+      `INSERT OR REPLACE INTO department_proposals
+         (gate_id, tenant_id, department_key, action, payload_json)
+       VALUES (?1, ?2, ?3, ?4, ?5)`,
+    )
+    .bind(r.gateId, r.tenantId, r.departmentKey, r.action, payloadJson)
+    .run()
+}
+
+// Read-fallback for execute(): reconstruct the PendingRecord from the durable row.
+// Returns null when no row exists (→ execute() fails not_approved, as before).
+async function _loadProposal(db: D1Database, gateId: string): Promise<PendingRecord | null> {
+  const row = await db
+    .prepare(
+      `SELECT gate_id, tenant_id, department_key, action, payload_json
+         FROM department_proposals WHERE gate_id = ?1 LIMIT 1`,
+    )
+    .bind(gateId)
+    .first<{ gate_id: string; tenant_id: string; department_key: string; action: string; payload_json: string | null }>()
+  if (!row) return null
+  return {
+    gateId: row.gate_id,
+    tenantId: row.tenant_id,
+    departmentKey: row.department_key,
+    action: row.action,
+    payload: row.payload_json === null ? undefined : JSON.parse(row.payload_json),
+  }
+}
+
 // ── isCapability (WARN-S4-1 fix) ─────────────────────────────────────────────
 //
 // Returns true iff `v` is a known Capability key in RANK. Used to guard
@@ -431,9 +471,10 @@ function _mintCtxInternal(
       // holds NO approval flag: approval is a task_verdicts row (the real Gate),
       // not an in-process bit (see executor / _hasApprovedVerdict).
       //
-      // TODO(full-impl): persist a durable proposal row (a `review`-status task with
-      // gate_owner=departmentKey) so execute() reads content across requests too;
-      // the approval gate is already the real DB verdict.
+      // Durable content store (S4 durability slice): write the proposal row to
+      // department_proposals so execute() reads the content across requests/isolates
+      // too. The in-memory _pendingStore is a same-isolate fast-path. The approval
+      // gate is already the real DB verdict (task_verdicts).
       const gateId = idFn()
       const pendingRecord: PendingRecord = {
         gateId,
@@ -443,6 +484,9 @@ function _mintCtxInternal(
         departmentKey,
       }
       _pendingStore.set(gateId, pendingRecord)
+      // Fail-closed: a non-durable proposal (lost on a cold isolate) is worse than a
+      // failed propose, so let a durable-write error propagate.
+      await _persistProposal(handle.db, pendingRecord)
       return { gateId }
     },
   })
@@ -512,8 +556,10 @@ function _mintCtxInternal(
 
       // ── FAIL-CLOSED + CONTENT-BOUND ──────────────────────────────────────
       //
-      // 1. Look up the proposal content. No record → never proposed here → reject.
-      const record = _pendingStore.get(gateId)
+      // 1. Look up the proposal content. In-memory fast-path first, then the durable
+      //    department_proposals row (cross-request / cold-isolate). No record in
+      //    either → never proposed → reject.
+      const record = _pendingStore.get(gateId) ?? (await _loadProposal(handle.db, gateId))
       if (!record) {
         throw new CtxError(
           'not_approved',
