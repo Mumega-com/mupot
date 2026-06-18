@@ -47,7 +47,8 @@ import type {
   GatePort,
   BusPort,
 } from './ctx'
-import { composeDeptMetricDescriptors, deepFreezeChannels } from './channels/compose'
+import { composeDeptMetricDescriptors, deepFreezeChannels, getChannelWorkTypes } from './channels/compose'
+import type { GatedWorkType } from './channels/contract'
 
 // Re-export types so registry.ts only needs to import from kernel.ts.
 export type { KernelHandle, DepartmentCtx } from './ctx'
@@ -207,6 +208,24 @@ function _mintCtxInternal(
     }),
   )
 
+  // ── Closure-private work-type map (NOT exposed on ctx) ───────────────────
+  //
+  // Built from the composed channel work-types: getChannelWorkTypes(module.channels).
+  // Maps work-type key → frozen GatedWorkType descriptor.
+  //
+  // gate.propose MUST fail closed:
+  //   - Unknown action (not in any declared work-type) → throw 'work_type_not_declared'
+  //   - Known work-type but proposesOnly=false        → throw 'work_type_not_proposesOnly'
+  //     (non-proposesOnly work-types are unsupported until S4)
+  //   - requiredCapability present → enforce it (else fall back to 'member' floor)
+  //
+  // getChannelWorkTypes already throws ChannelComposeError on duplicate keys, so the
+  // map is built only from a validated dedup-clean list. The module is already frozen
+  // above, so the channel work-type definitions cannot be widened after mint.
+  const _workTypeMap = new Map<string, Readonly<GatedWorkType>>(
+    getChannelWorkTypes(module.channels ?? []).map((wt) => [wt.key, Object.freeze({ ...wt })]),
+  )
+
   // ── metrics facade ────────────────────────────────────────────────────────
 
   const metrics: MetricsPort = Object.freeze({
@@ -275,12 +294,52 @@ function _mintCtxInternal(
 
   const gate: GatePort = Object.freeze({
     async propose(proposal: { action: string; payload?: unknown }): Promise<{ gateId: string }> {
+      // ── Capability floor ───────────────────────────────────────────────────
       if (!hasCapability(_capSet, 'member')) {
         throw new CtxError(
           'capability_denied',
           `ctx(${departmentKey}@${tenantId}): 'member' capability required to propose`,
         )
       }
+
+      // ── Work-type existence check (fail closed) ───────────────────────────
+      //
+      // proposal.action MUST be a declared work-type key from this dept's composed
+      // channel work-types. If not found, the caller is proposing an undeclared or
+      // fabricated action — reject before producing any gate record.
+      const workType = _workTypeMap.get(proposal.action)
+      if (!workType) {
+        throw new CtxError(
+          'work_type_not_declared',
+          `ctx(${departmentKey}@${tenantId}): work-type '${proposal.action}' is not declared in any channel of this department`,
+        )
+      }
+
+      // ── proposesOnly check ────────────────────────────────────────────────
+      //
+      // Non-proposesOnly work-types are unsupported until S4 (Gate-as-approval-surface).
+      // All S1/S2/S3 work-types must be proposesOnly=true.
+      if (!workType.proposesOnly) {
+        throw new CtxError(
+          'work_type_not_proposesOnly',
+          `ctx(${departmentKey}@${tenantId}): work-type '${proposal.action}' is not proposesOnly — non-proposesOnly work-types are unsupported until S4`,
+        )
+      }
+
+      // ── requiredCapability check ──────────────────────────────────────────
+      //
+      // If the work-type declares a requiredCapability, enforce it. Otherwise the
+      // 'member' floor above is sufficient.
+      if (workType.requiredCapability !== undefined) {
+        if (!hasCapability(_capSet, workType.requiredCapability)) {
+          throw new CtxError(
+            'capability_denied',
+            `ctx(${departmentKey}@${tenantId}): work-type '${proposal.action}' requires '${workType.requiredCapability}' capability`,
+          )
+        }
+      }
+
+      // ── Record intent (stub — S4 will write to gates table) ──────────────
       void proposal
       return { gateId: `stub-${tenantId}-${departmentKey}-${nowFn()}` }
     },

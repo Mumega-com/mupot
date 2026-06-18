@@ -345,6 +345,67 @@ describe('3. configSchema deep-frozen after deepFreezeChannels — S3 TODO CLOSE
     expect(() => deepFreezeChannels([noConfig])).not.toThrow()
     expect(Object.isFrozen(noConfig)).toBe(true)
   })
+
+  it('WARN-1 fix: configSchema.shape getter result is frozen post-deepFreezeChannels (nested freeze)', () => {
+    // WARN-1 (Opus + Codex gate): Object.freeze(configSchema) is top-level only.
+    // Zod v4 exposes .shape as a getter whose return value is a mutable object.
+    // deepFreezeChannels must also freeze the .shape result so nested field
+    // descriptors cannot be mutated post-registration.
+    const copy: ChannelDescriptor = { ...SeoChannel }
+    deepFreezeChannels([copy])
+
+    const schemaWithShape = copy.configSchema as Record<string, unknown>
+    expect(typeof schemaWithShape['shape']).toBe('object')
+    expect(Object.isFrozen(schemaWithShape['shape'])).toBe(true)
+  })
+
+  it('WARN-1 fix: attempting to mutate configSchema.shape.domain post-freeze throws in strict mode', () => {
+    // The .shape object (Zod field map) must be frozen so a caller cannot
+    // inject a new field or replace an existing one post-registration.
+    const copy: ChannelDescriptor = { ...SeoChannel }
+    deepFreezeChannels([copy])
+
+    const schemaWithShape = copy.configSchema as Record<string, Record<string, unknown>>
+    expect(() => {
+      schemaWithShape['shape']['domain'] = 'REPLACED'
+    }).toThrow() // TypeError: Cannot assign to read only property in strict mode
+  })
+
+  it('WARN-1 fix: .parse() still works after deep-freeze of configSchema and its .shape', () => {
+    // Regression: freezing configSchema and configSchema.shape must not break
+    // SeoChannelConfigSchema.parse() — the Zod parse path reads own properties
+    // of the frozen shape but never adds to it.
+    const copy: ChannelDescriptor = { ...SeoChannel }
+    deepFreezeChannels([copy])
+
+    // Import the original schema and verify parse still functions.
+    // The schema stored on the channel IS SeoChannelConfigSchema — cast and test.
+    const frozenSchema = copy.configSchema as { safeParse: (v: unknown) => { success: boolean } }
+    expect(typeof frozenSchema.safeParse).toBe('function')
+    const result = frozenSchema.safeParse({
+      domain: 'mumega.com',
+      keywordClusters: ['agent'],
+      competitors: [],
+      executor: 'inkwell-content',
+    })
+    expect(result.success).toBe(true)
+  })
+
+  it('WARN-1 fix: configSchema.shape is also frozen on GrowthModule registration path', () => {
+    // Prove the registry deepFreezeClone path (which calls deepFreezeChannels)
+    // also freezes configSchema.shape on SeoChannel.
+    // We verify by reading the registered frozen module from the registry instance
+    // already imported at the top of this file.
+    const reg = createDepartmentRegistry()
+    reg.register(GrowthModule)
+    const frozen = reg.getRegistered('growth')
+    const seoChannel = frozen?.channels?.find((c: { key: string }) => c.key === 'seo')
+    expect(seoChannel).toBeDefined()
+    expect(Object.isFrozen(seoChannel?.configSchema)).toBe(true)
+    const schemaShape = (seoChannel?.configSchema as Record<string, unknown>)?.['shape']
+    expect(typeof schemaShape).toBe('object')
+    expect(Object.isFrozen(schemaShape)).toBe(true)
+  })
 })
 
 // ── 4. SeoChannel composes into the Growth dept ───────────────────────────────

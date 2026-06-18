@@ -99,12 +99,33 @@ export function deepFreezeChannels(channels: ChannelDescriptor[]): readonly Chan
     }
 
     // Freeze configSchema if present and it is a plain object (ZodObject etc.).
-    // This closes the S3 TODO: a channel's configSchema cannot be mutated post-registration
-    // to widen authority or carry prompt-with-authority (marketing-channels.md §3 leak-guard 3).
-    // We deep-freeze the schema object itself; Zod schema objects are plain JS objects
-    // (their methods are on the prototype, not own properties, so freeze does not break them).
+    //
+    // WARN-1 fix (Opus + Codex gate): a single Object.freeze(ch.configSchema) is
+    // top-level only. Zod v4 exposes `.shape` as a getter whose return value is a
+    // mutable object — it must be frozen separately so nested field descriptors
+    // cannot be added or overwritten post-registration.
+    //
+    // Strategy: freeze the schema object itself, then freeze the `.shape` getter
+    // result (the Zod field map) if it exists and is an object. Tested: Zod v4
+    // .parse() / .safeParse() continue to work after both freezes because the
+    // parse path reads own enumerable properties of the frozen shape object (it
+    // does not add to it). Methods live on the prototype (not own props) so they
+    // are unaffected by Object.freeze on the instance.
+    //
+    // Authority note: configSchema is NOT authority-bearing (it is a validation
+    // spec only — marketing-channels.md §3 leak-guard 3). This freeze is defensive:
+    // it closes the S4 landmine where a future code path might read configSchema to
+    // make authority decisions on a mutated shape.
     if (ch.configSchema !== undefined && ch.configSchema !== null && typeof ch.configSchema === 'object') {
       Object.freeze(ch.configSchema)
+      // Freeze the `.shape` getter result if present (Zod ZodObject shape map).
+      const schemaAsRecord = ch.configSchema as Record<string, unknown>
+      if (
+        typeof schemaAsRecord['shape'] === 'object' &&
+        schemaAsRecord['shape'] !== null
+      ) {
+        Object.freeze(schemaAsRecord['shape'])
+      }
     }
 
     // Freeze the descriptor itself.
