@@ -123,12 +123,24 @@ export function statusDot(tone: Tone, label?: string): Html {
 // Mono-headed, hover-row table. `cols` define labels + optional grid widths.
 // `rows` are arrays of pre-escaped cells (HtmlEscapedString). When empty, renders
 // the honest empty line.
+// Allowlist a single grid-track value. `raw(template)` is injected into an inline
+// style, so a user-controlled `width` could otherwise inject CSS. Anything that
+// isn't a simple track (fr / px / % / em / rem / auto / minmax-of-those) falls back
+// to 1fr. (Hardening — all current callers pass literal widths.)
+function safeTrack(w: string | undefined): string {
+  if (!w) return '1fr'
+  const ok = /^(auto|[0-9]+(\.[0-9]+)?(fr|px|%|em|rem)|minmax\(\s*[0-9]+(\.[0-9]+)?(px|%|em|rem|fr)\s*,\s*[0-9]+(\.[0-9]+)?(px|%|em|rem|fr)\s*\))$/.test(
+    w.trim(),
+  )
+  return ok ? w.trim() : '1fr'
+}
+
 export function dataTable(opts: {
   cols: { label: string; width?: string }[]
   rows: Html[][]
   empty?: string
 }): Html {
-  const template = opts.cols.map((c) => c.width ?? '1fr').join(' ')
+  const template = opts.cols.map((c) => safeTrack(c.width)).join(' ')
   const head = html`<div class="ui-tr ui-thead" style="grid-template-columns:${raw(template)}">
     ${opts.cols.map((c) => html`<div class="ui-th">${c.label}</div>`)}
   </div>`

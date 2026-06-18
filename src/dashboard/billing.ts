@@ -29,7 +29,7 @@ import {
   emptyState,
 } from './ui'
 import type { HtmlEscapedString } from 'hono/utils/html'
-import { html, raw } from 'hono/html'
+import { html } from 'hono/html'
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
@@ -186,7 +186,7 @@ export function billingBody(model: BillingViewModel): HtmlEscapedString {
     <div style="display:flex;flex-wrap:wrap;gap:var(--sp-3);align-items:center;margin-bottom:var(--sp-4)">
       <span style="font-size:1.1rem;font-weight:600">Plan:</span>
       ${pill(model.plan.charAt(0).toUpperCase() + model.plan.slice(1), TIER_TONE[model.plan])}
-      ${model.since ? html`<span style="color:var(--dim);font-size:.85rem">Active since ${raw(fmtDate(model.since))}</span>` as HtmlEscapedString : ''}
+      ${model.since ? html`<span style="color:var(--dim);font-size:.85rem">Active since ${fmtDate(model.since)}</span>` as HtmlEscapedString : ''}
     </div>
     ${kpis}
     <div style="margin-top:var(--sp-4)">
