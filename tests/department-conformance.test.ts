@@ -1130,20 +1130,27 @@ describe('8. Registry hardening', () => {
     expect(row.created_at).toBe(FIXED_TIME)
   })
 
-  it('mintCtx uses injected now() in gate.propose gateId — requires a declared proposesOnly work-type', async () => {
-    // BLOCK-1 fix: gate.propose now enforces the work-type map. FixtureModule has
+  it('mintCtx gate.propose returns a non-empty gateId — uses idGen (S4: idFn() replaces now() in gateId)', async () => {
+    // S3: gateId was `stub-${tenantId}-${departmentKey}-${nowFn()}` (contained FIXED_TIME).
+    // S4: gateId is idFn() — a UUID from the injected idGen (or crypto.randomUUID() by default).
+    // BLOCK-1 fix: gate.propose enforces the work-type map. FixtureModule has
     // no channels (no declared work-types), so any propose would throw work_type_not_declared.
     // Use GrowthModule which has SeoChannel with seo-audit-proposal (proposesOnly=true).
     const FIXED_TIME = '2026-01-01T00:00:00.000Z'
+    let idCtr = 0
     const ctx = kernelMintCtx(makeKernelHandle(db), {
       tenantId: 'tenant-a',
       departmentKey: 'growth',
       module: GrowthModule,
       capabilities: ['member'],
       now: () => FIXED_TIME,
+      idGen: () => `test-gate-id-${++idCtr}`,
     })
     const result = await ctx.gate.propose({ action: 'seo-audit-proposal' })
-    expect(result.gateId).toContain(FIXED_TIME)
+    expect(typeof result.gateId).toBe('string')
+    expect(result.gateId.length).toBeGreaterThan(0)
+    // The gateId is now a deterministic idGen result (not the now() timestamp).
+    expect(result.gateId).toBe('test-gate-id-1')
   })
 })
 

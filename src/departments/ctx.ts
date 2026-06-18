@@ -82,6 +82,12 @@ export interface DepartmentCtx {
   readonly audit: AuditPort
   readonly gate: GatePort
   readonly bus: BusPort
+  /**
+   * S4: executor port. Fail-closed — requires a real approval record per gateId.
+   * Adapters are STUBBED at S4 (no external writes, no creds).
+   * Closure-private in the kernel: channels cannot hold or call it directly.
+   */
+  readonly executor: ExecutorPort
 }
 
 // ── Port facade interfaces ─────────────────────────────────────────────────────
@@ -134,6 +140,60 @@ export interface BusPort {
    * Shape is the contract; enforcement is ctx-first + capability-checked.
    */
   publish(msg: { type: string; payload?: unknown }): Promise<void>
+}
+
+// ── ExecutorPort ──────────────────────────────────────────────────────────────
+//
+// S4: the gated-ACT port. Only the kernel can mint this. Channels never hold it.
+//
+// execute() is fail-closed: it REQUIRES a real approval record for the work item
+// before dispatching to any adapter. No approval → throws CtxError('not_approved').
+//
+// Adapters are STUBBED at S4 — each returns
+//   { executed: false, reason: 'executor_not_wired' }
+// with NO external writes, NO fetch, NO credentials. The port + the dispatch +
+// the fail-closed authority surface is the S4 build; real adapters (inkwell-content,
+// mcpwp) are a later connector increment.
+//
+// S-LOOP SEAM (auto-act policy — NOT built at S4):
+//   The S-loop's policy engine (auto-act low-risk within envelope vs always-gate)
+//   will call execute() from inside its decision path. At S4 every executable
+//   action requires human approval: the auto-act fast-path is intentionally absent.
+//   When S-loop is built, the entry point is: policy decides → if approved-auto →
+//   mint an approval record via the policy authority → call execute().
+//   The fail-closed check here (real approval required) always holds — the S-loop
+//   adapter must produce a real record, not a bypass.
+
+export interface ApprovedWorkItem {
+  /** The gate record id returned by gate.propose() for this piece of work. */
+  gateId: string
+  /** The work-type action key (must match the gated record). */
+  action: string
+  /** The original proposal payload. */
+  payload?: unknown
+}
+
+export interface ExecuteOutcome {
+  /** Always false at S4 — real adapters are not wired yet. */
+  executed: boolean
+  /** Reason when executed=false: 'executor_not_wired' at S4. */
+  reason?: string
+  /** Which adapter was targeted (e.g. 'inkwell-content' | 'mcpwp'). */
+  adapter?: string
+}
+
+export interface ExecutorPort {
+  /**
+   * Execute an approved piece of work, dispatching to the pot's configured adapter.
+   *
+   * FAIL-CLOSED: throws CtxError('not_approved') if no real approval record
+   * exists for this gateId. A gated record that has not been approved by a human
+   * via the /approvals gate MUST NOT execute — ever.
+   *
+   * @param approvedWork - The approved work item (gateId + action + payload).
+   * @returns ExecuteOutcome — at S4 always { executed: false, reason: 'executor_not_wired' }.
+   */
+  execute(approvedWork: ApprovedWorkItem): Promise<ExecuteOutcome>
 }
 
 // ── CtxError ─────────────────────────────────────────────────────────────────

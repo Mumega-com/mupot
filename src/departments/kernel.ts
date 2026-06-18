@@ -46,6 +46,9 @@ import type {
   AuditPort,
   GatePort,
   BusPort,
+  ExecutorPort,
+  ApprovedWorkItem,
+  ExecuteOutcome,
 } from './ctx'
 import { composeDeptMetricDescriptors, deepFreezeChannels, getChannelWorkTypes } from './channels/compose'
 import type { GatedWorkType } from './channels/contract'
@@ -75,9 +78,26 @@ const RANK: Record<Capability, number> = {
   owner: 5,
 }
 
+// ── isCapability (WARN-S4-1 fix) ─────────────────────────────────────────────
+//
+// Returns true iff `v` is a known Capability key in RANK. Used to guard
+// requiredCapability values in GatedWorkType before passing to hasCapability.
+//
+// S4 context: S3 hasCapability used `RANK[min] ?? 0` — an unknown min (e.g.
+// a typo 'adminn') resolved to rank 0 (less than every real rank) which would
+// PASS the cap check for any holder of any capability. Now that executable
+// work-types (proposesOnly=false) use requiredCapability for real, a malformed
+// min must be caught immediately at propose time — fail closed, throw
+// CtxError('capability_invalid'). This is the isCapability guard.
+function isCapability(v: string): v is Capability {
+  return Object.prototype.hasOwnProperty.call(RANK, v)
+}
+
+// hasCapability ONLY called after the caller has already validated `min` with
+// isCapability (see gate.propose below for the guarded path).
 function hasCapability(caps: ReadonlySet<Capability>, min: Capability): boolean {
   for (const c of caps) {
-    if ((RANK[c] ?? 0) >= (RANK[min] ?? 0)) return true
+    if (RANK[c] >= RANK[min]) return true
   }
   return false
 }
@@ -215,9 +235,12 @@ function _mintCtxInternal(
   //
   // gate.propose MUST fail closed:
   //   - Unknown action (not in any declared work-type) → throw 'work_type_not_declared'
-  //   - Known work-type but proposesOnly=false        → throw 'work_type_not_proposesOnly'
-  //     (non-proposesOnly work-types are unsupported until S4)
+  //   - proposesOnly=true  → creates a gated record, returns gateId. NO execution.
+  //   - proposesOnly=false → S4: creates a gated record (pending), returns gateId.
+  //                          NO execution at propose time. Execution requires a
+  //                          separate human-approval step + executor.execute().
   //   - requiredCapability present → enforce it (else fall back to 'member' floor)
+  //   - invalid requiredCapability (unknown key) → throw 'capability_invalid' (WARN-S4-1)
   //
   // getChannelWorkTypes already throws ChannelComposeError on duplicate keys, so the
   // map is built only from a validated dedup-clean list. The module is already frozen
@@ -315,22 +338,34 @@ function _mintCtxInternal(
         )
       }
 
-      // ── proposesOnly check ────────────────────────────────────────────────
+      // ── S4: proposesOnly=false is now allowed ────────────────────────────
       //
-      // Non-proposesOnly work-types are unsupported until S4 (Gate-as-approval-surface).
-      // All S1/S2/S3 work-types must be proposesOnly=true.
-      if (!workType.proposesOnly) {
-        throw new CtxError(
-          'work_type_not_proposesOnly',
-          `ctx(${departmentKey}@${tenantId}): work-type '${proposal.action}' is not proposesOnly — non-proposesOnly work-types are unsupported until S4`,
-        )
-      }
+      // S3 threw 'work_type_not_proposesOnly' for non-proposesOnly work-types.
+      // S4 enables them: a non-proposesOnly proposal creates a gated record
+      // (status=pending, returned as gateId) but does NOT execute. Execution
+      // is a separate step: a human approves via /approvals, then the caller
+      // invokes ctx.executor.execute() with the gateId. The fail-closed authority
+      // check in executor.execute() ensures no execution without a real approval.
+      //
+      // S-LOOP SEAM: when the S-loop auto-act policy is built, it will decide
+      // whether to auto-approve (mint an approval record itself) or require human
+      // approval before calling execute(). That policy decision happens ABOVE
+      // this layer — propose always creates a gated record and returns.
 
-      // ── requiredCapability check ──────────────────────────────────────────
+      // ── requiredCapability check (WARN-S4-1 fix) ─────────────────────────
       //
-      // If the work-type declares a requiredCapability, enforce it. Otherwise the
-      // 'member' floor above is sufficient.
+      // isCapability guard: if the work-type declares a requiredCapability, it
+      // MUST be a known Capability value. An unknown/invalid min (typo, invalid
+      // value injected post-freeze) fails closed — throw 'capability_invalid'.
+      // This matters now that executable work-types (proposesOnly=false) use
+      // requiredCapability for real gating authority.
       if (workType.requiredCapability !== undefined) {
+        if (!isCapability(workType.requiredCapability)) {
+          throw new CtxError(
+            'capability_invalid',
+            `ctx(${departmentKey}@${tenantId}): work-type '${proposal.action}' has invalid requiredCapability '${workType.requiredCapability}' — not a known Capability value (observer|member|lead|admin|owner)`,
+          )
+        }
         if (!hasCapability(_capSet, workType.requiredCapability)) {
           throw new CtxError(
             'capability_denied',
@@ -339,9 +374,15 @@ function _mintCtxInternal(
         }
       }
 
-      // ── Record intent (stub — S4 will write to gates table) ──────────────
+      // ── Record gated work (stub — S4 writes the gateId as a deterministic key) ──
+      //
+      // TODO(full-impl): write to a gated_work_items table with:
+      //   { id: gateId, tenant_id, department_key, action, payload, status: 'pending', created_at }
+      // For now the gateId is returned as a deterministic stub value that the
+      // approval stub store in executor.execute() can match.
       void proposal
-      return { gateId: `stub-${tenantId}-${departmentKey}-${nowFn()}` }
+      const gateId = idFn()
+      return { gateId }
     },
   })
 
@@ -359,13 +400,143 @@ function _mintCtxInternal(
     },
   })
 
+  // ── executor facade ───────────────────────────────────────────────────────
+  //
+  // S4: the gated-ACT port. CLOSURE-PRIVATE — not exposed to channels, not
+  // obtained from any other path. Only the kernel mints it here.
+  //
+  // APPROVAL STORE: a closure-private Map<gateId, boolean> tracks which gateIds
+  // have been approved. In production this will query the task_verdicts table
+  // (status='approved' verdict on the gated record). At S4 (stub), the store
+  // is seeded by recordApproval() — called only from tests and from a future
+  // approval-write path — so real production code has no way to auto-approve.
+  //
+  // FAIL-CLOSED: execute() checks the approval store FIRST. No approval record
+  // → throw CtxError('not_approved'). Dispatch to an adapter only after approval.
+  //
+  // STUB ADAPTERS: both 'inkwell-content' and 'mcpwp' adapters return
+  //   { executed: false, reason: 'executor_not_wired' }
+  // with no fetch, no external write, no credentials. The PORT + the dispatch
+  // routing + the fail-closed authority check is the S4 deliverable.
+  //
+  // CONFIG AUTHORITY-SAFETY (Opus Low fix):
+  //   The executor adapter choice reads from the pot's SeoChannelConfig.executor.
+  //   Rather than trusting a frozen-in-place configSchema object (whose ._def may be
+  //   mutated by Zod internal churn), we accept the executor value as a re-parsed
+  //   string literal at call time — the caller supplies it or it defaults to 'unknown'.
+  //   This means a mutated schema.internal cannot change which adapter executes.
+
+  // Closure-private approval store.
+  const _approvalStore = new Map<string, true>()
+
+  // recordApproval is NOT on the ExecutorPort interface — it is the test/write-path
+  // seam that the full-impl will replace with a DB query. Exposed only for tests
+  // via the _approvalStoreForTest export on the ctx object (see below).
+  function _recordApproval(gateId: string): void {
+    _approvalStore.set(gateId, true)
+  }
+
+  const executor: ExecutorPort = Object.freeze({
+    async execute(approvedWork: ApprovedWorkItem): Promise<ExecuteOutcome> {
+      if (!hasCapability(_capSet, 'member')) {
+        throw new CtxError(
+          'capability_denied',
+          `ctx(${departmentKey}@${tenantId}): 'member' capability required to execute`,
+        )
+      }
+
+      // ── FAIL-CLOSED: require a real approval record ───────────────────────
+      //
+      // Arms never write un-gated. No approval record in the store → reject
+      // immediately. In full-impl this will be: query task_verdicts WHERE
+      // task_id = gateId AND verdict = 'approved'. At S4 it checks the
+      // closure-private _approvalStore. The behaviour is identical — no record,
+      // no execute. EVER.
+      if (!_approvalStore.has(approvedWork.gateId)) {
+        throw new CtxError(
+          'not_approved',
+          `ctx(${departmentKey}@${tenantId}): gateId '${approvedWork.gateId}' has no approval record — execute requires a human-approved verdict. Propose first (gate.propose), approve via /approvals, then execute.`,
+        )
+      }
+
+      // ── Dispatch to the (stubbed) adapter ────────────────────────────────
+      //
+      // CONFIG AUTHORITY-SAFETY: the executor type is passed explicitly as part
+      // of approvedWork.payload (or could come from re-parsed channel config).
+      // We read it from payload only as a display hint — the actual dispatch
+      // below covers all valid values; unknown values are caught by the default
+      // branch without any authority escape.
+      //
+      // At S4 every adapter returns { executed: false, reason: 'executor_not_wired' }.
+      // No fetch, no external write, no credentials in any branch.
+      const executorHint = (() => {
+        if (
+          approvedWork.payload !== null &&
+          approvedWork.payload !== undefined &&
+          typeof approvedWork.payload === 'object' &&
+          'executor' in (approvedWork.payload as object)
+        ) {
+          return (approvedWork.payload as Record<string, unknown>)['executor']
+        }
+        return undefined
+      })()
+
+      // S-LOOP SEAM: when the S-loop auto-act policy is built, its decision
+      // (auto-approve vs human-gate) happens before this function is reached.
+      // The fail-closed check above always holds: the S-loop adapter must have
+      // produced a real approval record before execute() is called.
+
+      // Adapter dispatch (all stubbed at S4).
+      let outcome: ExecuteOutcome
+      if (executorHint === 'inkwell-content') {
+        // STUB: inkwell-content adapter (Inkwell CMS write path — not wired at S4).
+        // Full-impl: POST to Inkwell worker /api/content with the proposal payload.
+        // Requires: Hadi-go, Inkwell API credentials, content-write capability.
+        outcome = {
+          executed: false,
+          reason: 'executor_not_wired',
+          adapter: 'inkwell-content',
+        }
+      } else if (executorHint === 'mcpwp') {
+        // STUB: mcpwp adapter (MCPWP-managed WordPress write path — not wired at S4).
+        // Full-impl: call MCPWP MCP tool with the proposal payload.
+        // Requires: Hadi-go, MCPWP credentials, per-pot WordPress connection.
+        outcome = {
+          executed: false,
+          reason: 'executor_not_wired',
+          adapter: 'mcpwp',
+        }
+      } else {
+        // Unknown or unspecified executor hint — still fails safe (no write).
+        outcome = {
+          executed: false,
+          reason: 'executor_not_wired',
+          adapter: 'unknown',
+        }
+      }
+
+      return outcome
+    },
+  })
+
   // ── Build inert frozen snapshots ──────────────────────────────────────────
   const capSnapshot: readonly Capability[] = Object.freeze([...capabilities])
   const metricsSnapshot: readonly Readonly<MetricDescriptor>[] = Object.freeze(
     [..._metricsMap.values()],
   )
 
-  return Object.freeze({
+  // ── Test-harness seam ─────────────────────────────────────────────────────
+  //
+  // _recordApproval seeds the closure-private approval store. NOT on the
+  // DepartmentCtx interface — production code cannot call it through the typed
+  // interface. Tests cast to `unknown` first to access it.
+  //
+  // Built into the object literal BEFORE Object.freeze so the property is
+  // own-settable (frozen objects reject new properties via [[DefineOwnProperty]]).
+  //
+  // Full-impl: executor.execute() will query task_verdicts (WHERE task_id=gateId
+  // AND verdict='approved') instead of checking _approvalStore. This seam goes away.
+  const ctxBase: DepartmentCtx & { _recordApproval: (gateId: string) => void } = {
     tenantId,
     departmentKey,
     capabilities: capSnapshot,
@@ -374,7 +545,11 @@ function _mintCtxInternal(
     audit,
     gate,
     bus,
-  } satisfies DepartmentCtx)
+    executor,
+    _recordApproval,
+  }
+
+  return Object.freeze(ctxBase) as DepartmentCtx
 }
 
 // ── kernelMintCtx ─────────────────────────────────────────────────────────────

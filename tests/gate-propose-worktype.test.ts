@@ -1,16 +1,17 @@
-// tests/gate-propose-worktype.test.ts — gate.propose work-type binding (BLOCK-1 fix).
+// tests/gate-propose-worktype.test.ts — gate.propose work-type binding (BLOCK-1 fix + S4 update).
 //
-// PURPOSE: prove the S3 invariant that ctx.gate.propose is FAIL-CLOSED against
-// the declared channel work-type map. Added after Codex gate RED (2026-06-18):
-// gate.propose previously accepted ANY action (stub) — breaking the S3 authority
-// seam before S4 makes gate records operational.
+// PURPOSE: prove the gate.propose is FAIL-CLOSED against the declared channel work-type map.
+// Added after Codex gate RED (2026-06-18). Updated for S4: non-proposesOnly work-types are
+// now ALLOWED by gate.propose (they create gated records that require human approval before
+// execution via executor.execute).
 //
-// Contract (post-fix):
+// Contract (S4):
 //   - Undeclared action                   → throws CtxError('work_type_not_declared')
-//   - Declared proposesOnly=true          → accepted (returns gateId)
-//   - Declared proposesOnly=false         → throws CtxError('work_type_not_proposesOnly')
+//   - Declared proposesOnly=true          → accepted (returns gateId) — S3 unchanged
+//   - Declared proposesOnly=false         → accepted (returns gateId, no auto-execute) — S4 NEW
 //   - requiredCapability not met          → throws CtxError('capability_denied')
 //   - requiredCapability met              → accepted
+//   - invalid requiredCapability string   → throws CtxError('capability_invalid') — S4 NEW
 //   - Cross-dept: work-type from channel A can't be proposed via a ctx that has
 //     no channel A (because the work-type map is built from the frozen module channels)
 //
@@ -205,16 +206,17 @@ describe('2. Declared proposesOnly=true work-type → gate.propose accepted', ()
   })
 })
 
-// ── 3. Non-proposesOnly work-type → rejected (unsupported until S4) ──────────
+// ── 3. Non-proposesOnly work-type → S4: now ACCEPTED (creates gated record, no execute) ──
 
-describe('3. Non-proposesOnly work-type → gate.propose throws work_type_not_proposesOnly', () => {
-  it('a declared proposesOnly=false work-type throws work_type_not_proposesOnly', async () => {
-    // Build a module that has a proposesOnly=false work-type (S4 reserved).
+describe('3. Non-proposesOnly work-type → S4: gate.propose creates gated record (not rejected)', () => {
+  it('a declared proposesOnly=false work-type creates a gated record (S4 enables this)', async () => {
+    // S4: non-proposesOnly work-types are now allowed by gate.propose.
+    // They create a pending gated record. Execution requires a separate human approval step.
     const modWithNonProposesOnly = makeModuleWithWorkTypes([
       {
         key: 'sync-execute',
-        name: 'Sync Execute (S4 reserved)',
-        proposesOnly: false, // NOT a proposesOnly work-type
+        name: 'Sync Execute',
+        proposesOnly: false, // S4: this is now valid at propose time
       },
     ])
 
@@ -226,16 +228,17 @@ describe('3. Non-proposesOnly work-type → gate.propose throws work_type_not_pr
       now: () => NOW,
     })
 
-    await expect(
-      ctx.gate.propose({ action: 'sync-execute' }),
-    ).rejects.toThrow(/work_type_not_proposesOnly/)
+    // S4: should NOT throw — returns a gateId.
+    const result = await ctx.gate.propose({ action: 'sync-execute' })
+    expect(typeof result.gateId).toBe('string')
+    expect(result.gateId.length).toBeGreaterThan(0)
   })
 
-  it('the error code is work_type_not_proposesOnly', async () => {
+  it('non-proposesOnly gated record does NOT auto-execute (fail-closed — no approval)', async () => {
     const modWithNonProposesOnly = makeModuleWithWorkTypes([
       {
         key: 'execute-now',
-        name: 'Execute Now (S4)',
+        name: 'Execute Now',
         proposesOnly: false,
       },
     ])
@@ -248,19 +251,16 @@ describe('3. Non-proposesOnly work-type → gate.propose throws work_type_not_pr
       now: () => NOW,
     })
 
-    let caught: unknown
-    try {
-      await ctx.gate.propose({ action: 'execute-now' })
-    } catch (e) {
-      caught = e
-    }
-    expect(caught).toBeInstanceOf(CtxError)
-    expect((caught as CtxError).code).toBe('work_type_not_proposesOnly')
+    const { gateId } = await ctx.gate.propose({ action: 'execute-now' })
+    // No recordApproval called → executor.execute must reject with not_approved.
+    await expect(
+      ctx.executor.execute({ gateId, action: 'execute-now' })
+    ).rejects.toThrow(/not_approved/)
   })
 
-  it('non-proposesOnly is a distinct error from undeclared (different codes)', async () => {
+  it('undeclared action still distinguishes from non-proposesOnly (different codes)', async () => {
     const modWithNonProposesOnly = makeModuleWithWorkTypes([
-      { key: 'batch-delete', name: 'Batch Delete (S4)', proposesOnly: false },
+      { key: 'batch-delete', name: 'Batch Delete', proposesOnly: false },
     ])
 
     const ctx = kernelMintCtx({ db }, {
@@ -271,14 +271,14 @@ describe('3. Non-proposesOnly work-type → gate.propose throws work_type_not_pr
       now: () => NOW,
     })
 
-    // 'batch-delete' IS declared, but proposesOnly=false
-    let nonProposesOnlyCaught: unknown
-    try { await ctx.gate.propose({ action: 'batch-delete' }) } catch (e) { nonProposesOnlyCaught = e }
-    expect((nonProposesOnlyCaught as CtxError).code).toBe('work_type_not_proposesOnly')
+    // 'batch-delete' IS declared → should succeed (returns gateId), NOT throw.
+    const result = await ctx.gate.propose({ action: 'batch-delete' })
+    expect(typeof result.gateId).toBe('string')
 
-    // 'completely-unknown' is NOT declared
+    // 'completely-unknown' is NOT declared → work_type_not_declared.
     let undeclaredCaught: unknown
     try { await ctx.gate.propose({ action: 'completely-unknown' }) } catch (e) { undeclaredCaught = e }
+    expect(undeclaredCaught).toBeInstanceOf(CtxError)
     expect((undeclaredCaught as CtxError).code).toBe('work_type_not_declared')
   })
 })
