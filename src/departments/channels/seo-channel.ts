@@ -59,6 +59,20 @@ export type SeoChannelConfig = z.infer<typeof SeoChannelConfigSchema>
 //
 // The SEO & Content channel descriptor.
 // Pure data — no ctx, no lifecycle, no registry call.
+//
+// S4 additions:
+//   - Two executable work-types (proposesOnly=false) are added below.
+//     These require requiredCapability='lead' — a member alone cannot propose
+//     an executable action on SEO content; lead or above may.
+//   - The propose→approve→execute flow:
+//     1. gate.propose({ action: 'seo-meta-fix' | 'seo-internal-links', payload })
+//        → creates a gated record (status=pending), returns { gateId }.
+//        NO execution happens at propose time.
+//     2. Human approves via the existing /approvals Gate (tasks status='review' →
+//        verdict='approved'). An approval record is written to task_verdicts.
+//     3. ctx.executor.execute({ gateId, action, payload }) → verifies the approval
+//        record exists, dispatches to the (stubbed) adapter.
+//   - S4 invariant: NO path executes without a real human approval record.
 
 export const SeoChannel: ChannelDescriptor = {
   key: 'seo',
@@ -166,10 +180,16 @@ export const SeoChannel: ChannelDescriptor = {
 
   // ── workTypes ─────────────────────────────────────────────────────────────
   //
-  // All proposesOnly=true (S3 invariant): an agent researches and proposes;
-  // it never directly mutates a customer asset. The human (or Gate) confirms
-  // before any write occurs.
+  // S3 work-types: proposesOnly=true — research and propose; never mutate.
+  // S4 work-types: proposesOnly=false — gated executable actions.
+  //   requiredCapability='lead': a lead (or admin/owner) may propose executable
+  //   SEO work. A member alone may not (member can still propose proposesOnly work).
+  //
+  // BINDING: proposesOnly=false does NOT mean "auto-execute". gate.propose() creates
+  // a pending gated record. A human must approve via /approvals. Only then may
+  // ctx.executor.execute() be called — fail-closed on missing approval record.
   workTypes: [
+    // ── S3 propose-only work-types (unchanged) ──────────────────────────────
     {
       key: 'seo-audit-proposal',
       name: 'SEO Audit Proposal',
@@ -189,6 +209,25 @@ export const SeoChannel: ChannelDescriptor = {
       key: 'content-refresh-proposal',
       name: 'Content Refresh Proposal',
       proposesOnly: true,
+    },
+    // ── S4 executable work-types ──────────────────────────────────────────
+    {
+      key: 'seo-meta-fix',
+      name: 'SEO Meta Fix',
+      // proposesOnly=false: this work-type produces a gated record + can be
+      // executed after human approval via ctx.executor.execute().
+      proposesOnly: false,
+      // requiredCapability='lead': executing meta fixes on a pot's content is a
+      // lead-level action. Members may not propose executable actions on content.
+      requiredCapability: 'lead' as const,
+    },
+    {
+      key: 'seo-internal-links',
+      name: 'SEO Internal Links',
+      // proposesOnly=false: same pattern as seo-meta-fix.
+      proposesOnly: false,
+      // requiredCapability='lead': same reasoning.
+      requiredCapability: 'lead' as const,
     },
   ],
 

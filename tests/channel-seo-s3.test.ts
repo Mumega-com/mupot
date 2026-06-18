@@ -178,9 +178,12 @@ describe('1. SeoChannel structure — descriptor is well-formed', () => {
     expect(desc?.sourceAuthority).toEqual(['first-party'])
   })
 
-  it('has exactly 4 workTypes, all proposesOnly=true', () => {
-    expect(SeoChannel.workTypes).toHaveLength(4)
-    for (const wt of SeoChannel.workTypes) {
+  it('has exactly 4 proposesOnly=true workTypes (S3 original; S4 adds 2 more executable)', () => {
+    // S3 shipped 4 proposesOnly=true work-types. S4 adds seo-meta-fix + seo-internal-links
+    // (proposesOnly=false). Total is now 6; this test checks the S3 subset.
+    const proposesOnlyTypes = SeoChannel.workTypes.filter((w) => w.proposesOnly)
+    expect(proposesOnlyTypes).toHaveLength(4)
+    for (const wt of proposesOnlyTypes) {
       expect(wt.proposesOnly).toBe(true)
     }
   })
@@ -821,12 +824,13 @@ describe('9. Regression: GrowthModule with SeoChannel — outbound keys intact, 
     expect(uniqueKeys.size).toBe(keys.length)
   })
 
-  it('5 work-types total (1 outbound + 4 seo), no duplicates', () => {
+  it('7 work-types total (1 outbound + 6 seo = 4 propose-only + 2 executable), no duplicates', () => {
+    // S3: 1 outbound + 4 seo = 5. S4 adds 2 executable seo work-types → 7 total.
     const wts = getChannelWorkTypes(GrowthModule.channels ?? [])
-    expect(wts).toHaveLength(5)
+    expect(wts).toHaveLength(7)
     const keys = wts.map((w) => w.key)
     const uniqueKeys = new Set(keys)
-    expect(uniqueKeys.size).toBe(5)
+    expect(uniqueKeys.size).toBe(7)
   })
 
   it('registered GrowthModule channels are frozen (deepFreezeClone covers channels)', () => {

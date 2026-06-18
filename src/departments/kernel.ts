@@ -30,6 +30,7 @@
 //   ctx.ts has no mint logic at all — it is a pure types/contracts file. A module
 //   that imports ctx.ts receives zero minting capability.
 
+import type { D1Database } from '@cloudflare/workers-types'
 import type { Capability } from '../types'
 import type { DepartmentModule, MetricDescriptor } from './contract'
 import { emitMetric } from '../metrics/pulse'
@@ -46,6 +47,8 @@ import type {
   AuditPort,
   GatePort,
   BusPort,
+  ExecutorPort,
+  ExecuteOutcome,
 } from './ctx'
 import { composeDeptMetricDescriptors, deepFreezeChannels, getChannelWorkTypes } from './channels/compose'
 import type { GatedWorkType } from './channels/contract'
@@ -75,9 +78,74 @@ const RANK: Record<Capability, number> = {
   owner: 5,
 }
 
+// ── PendingRecord (module-private) ───────────────────────────────────────────
+//
+// The full content of a gated work proposal, stored by gate.propose() and looked
+// up by executor.execute(). Keyed by gateId in the closure-private _pendingStore.
+//
+// BLOCK-2 fix (2026-06-18): execute() reads the action/payload/tenantId/
+// departmentKey ONLY from this stored record — the caller supplies only a gateId.
+//
+// NOTE: this record carries the proposal CONTENT (the S4 in-memory content stub).
+// It deliberately holds NO `approved` field. Approval is NOT an in-process flag —
+// it is a row in the real Gate store (task_verdicts), read by execute() via
+// handle.db (see _hasApprovedVerdict). That is the BLOCK-1 structural close: there
+// is no in-process approval writer, so there is nothing importable to self-approve.
+interface PendingRecord {
+  gateId: string
+  action: string
+  payload: unknown
+  tenantId: string
+  departmentKey: string
+}
+
+// ── _hasApprovedVerdict — approval lives in the REAL Gate store ───────────────
+//
+// BLOCK-1 structural close (2026-06-18): the ONLY approval path is an `approved`
+// row in task_verdicts, written EXCLUSIVELY by the authenticated verdict route
+// (writeVerdict ← POST /api/tasks/:id/verdict, RBAC-gated on the task's gate_owner).
+// No in-process function can mint that row. A hostile/future collector holds a
+// ctx but the ctx exposes NO approval writer — and it cannot forge a DB verdict.
+//
+// execute() calls this with handle.db (the same D1 the verdict route writes to).
+// Tests "approve the real way" by writing an approved task_verdicts row to the
+// same store — modeling the verdict route's output — never via a kernel export.
+//
+// LATEST-VERDICT SEMANTICS (Codex cross-vendor catch, 2026-06-18): task_verdicts is
+// append-only and multiple verdicts per task are legitimate (rejected → in_progress
+// → review → approved, per src/tasks/service.ts). A query for "any approved row ever"
+// would keep execution authority open after a LATER rejection — a stale-verdict
+// authority bug. So we read the LATEST verdict (ORDER BY decided_at DESC LIMIT 1)
+// and require it to be 'approved' — matching the production readers in
+// src/workflows/pipeline.ts and src/integrations/ghl.ts.
+async function _hasApprovedVerdict(db: D1Database, gateId: string): Promise<boolean> {
+  const row = await db
+    .prepare(`SELECT verdict FROM task_verdicts WHERE task_id = ?1 ORDER BY decided_at DESC LIMIT 1`)
+    .bind(gateId)
+    .first<{ verdict: string }>()
+  return row?.verdict === 'approved'
+}
+
+// ── isCapability (WARN-S4-1 fix) ─────────────────────────────────────────────
+//
+// Returns true iff `v` is a known Capability key in RANK. Used to guard
+// requiredCapability values in GatedWorkType before passing to hasCapability.
+//
+// S4 context: S3 hasCapability used `RANK[min] ?? 0` — an unknown min (e.g.
+// a typo 'adminn') resolved to rank 0 (less than every real rank) which would
+// PASS the cap check for any holder of any capability. Now that executable
+// work-types (proposesOnly=false) use requiredCapability for real, a malformed
+// min must be caught immediately at propose time — fail closed, throw
+// CtxError('capability_invalid'). This is the isCapability guard.
+function isCapability(v: string): v is Capability {
+  return Object.prototype.hasOwnProperty.call(RANK, v)
+}
+
+// hasCapability ONLY called after the caller has already validated `min` with
+// isCapability (see gate.propose below for the guarded path).
 function hasCapability(caps: ReadonlySet<Capability>, min: Capability): boolean {
   for (const c of caps) {
-    if ((RANK[c] ?? 0) >= (RANK[min] ?? 0)) return true
+    if (RANK[c] >= RANK[min]) return true
   }
   return false
 }
@@ -215,9 +283,12 @@ function _mintCtxInternal(
   //
   // gate.propose MUST fail closed:
   //   - Unknown action (not in any declared work-type) → throw 'work_type_not_declared'
-  //   - Known work-type but proposesOnly=false        → throw 'work_type_not_proposesOnly'
-  //     (non-proposesOnly work-types are unsupported until S4)
+  //   - proposesOnly=true  → creates a gated record, returns gateId. NO execution.
+  //   - proposesOnly=false → S4: creates a gated record (pending), returns gateId.
+  //                          NO execution at propose time. Execution requires a
+  //                          separate human-approval step + executor.execute().
   //   - requiredCapability present → enforce it (else fall back to 'member' floor)
+  //   - invalid requiredCapability (unknown key) → throw 'capability_invalid' (WARN-S4-1)
   //
   // getChannelWorkTypes already throws ChannelComposeError on duplicate keys, so the
   // map is built only from a validated dedup-clean list. The module is already frozen
@@ -315,22 +386,34 @@ function _mintCtxInternal(
         )
       }
 
-      // ── proposesOnly check ────────────────────────────────────────────────
+      // ── S4: proposesOnly=false is now allowed ────────────────────────────
       //
-      // Non-proposesOnly work-types are unsupported until S4 (Gate-as-approval-surface).
-      // All S1/S2/S3 work-types must be proposesOnly=true.
-      if (!workType.proposesOnly) {
-        throw new CtxError(
-          'work_type_not_proposesOnly',
-          `ctx(${departmentKey}@${tenantId}): work-type '${proposal.action}' is not proposesOnly — non-proposesOnly work-types are unsupported until S4`,
-        )
-      }
+      // S3 threw 'work_type_not_proposesOnly' for non-proposesOnly work-types.
+      // S4 enables them: a non-proposesOnly proposal creates a gated record
+      // (status=pending, returned as gateId) but does NOT execute. Execution
+      // is a separate step: a human approves via /approvals, then the caller
+      // invokes ctx.executor.execute() with the gateId. The fail-closed authority
+      // check in executor.execute() ensures no execution without a real approval.
+      //
+      // S-LOOP SEAM: when the S-loop auto-act policy is built, it will decide
+      // whether to auto-approve (mint an approval record itself) or require human
+      // approval before calling execute(). That policy decision happens ABOVE
+      // this layer — propose always creates a gated record and returns.
 
-      // ── requiredCapability check ──────────────────────────────────────────
+      // ── requiredCapability check (WARN-S4-1 fix) ─────────────────────────
       //
-      // If the work-type declares a requiredCapability, enforce it. Otherwise the
-      // 'member' floor above is sufficient.
+      // isCapability guard: if the work-type declares a requiredCapability, it
+      // MUST be a known Capability value. An unknown/invalid min (typo, invalid
+      // value injected post-freeze) fails closed — throw 'capability_invalid'.
+      // This matters now that executable work-types (proposesOnly=false) use
+      // requiredCapability for real gating authority.
       if (workType.requiredCapability !== undefined) {
+        if (!isCapability(workType.requiredCapability)) {
+          throw new CtxError(
+            'capability_invalid',
+            `ctx(${departmentKey}@${tenantId}): work-type '${proposal.action}' has invalid requiredCapability '${workType.requiredCapability}' — not a known Capability value (observer|member|lead|admin|owner)`,
+          )
+        }
         if (!hasCapability(_capSet, workType.requiredCapability)) {
           throw new CtxError(
             'capability_denied',
@@ -339,9 +422,27 @@ function _mintCtxInternal(
         }
       }
 
-      // ── Record intent (stub — S4 will write to gates table) ──────────────
-      void proposal
-      return { gateId: `stub-${tenantId}-${departmentKey}-${nowFn()}` }
+      // ── Record gated work (BLOCK-2 fix: store full record keyed by gateId) ──
+      //
+      // The proposal CONTENT is stored in the closure-private _pendingStore.
+      // executor.execute() looks up this record by gateId and dispatches using
+      // ONLY the stored action + payload — not caller-supplied values. The record
+      // holds NO approval flag: approval is a task_verdicts row (the real Gate),
+      // not an in-process bit (see executor / _hasApprovedVerdict).
+      //
+      // TODO(full-impl): persist a durable proposal row (a `review`-status task with
+      // gate_owner=departmentKey) so execute() reads content across requests too;
+      // the approval gate is already the real DB verdict.
+      const gateId = idFn()
+      const pendingRecord: PendingRecord = {
+        gateId,
+        action: proposal.action,
+        payload: proposal.payload,
+        tenantId,
+        departmentKey,
+      }
+      _pendingStore.set(gateId, pendingRecord)
+      return { gateId }
     },
   })
 
@@ -359,13 +460,165 @@ function _mintCtxInternal(
     },
   })
 
+  // ── executor facade ───────────────────────────────────────────────────────
+  //
+  // S4: the gated-ACT port. CLOSURE-PRIVATE — not exposed to channels, not
+  // obtained from any other path. Only the kernel mints it here.
+  //
+  // PENDING STORE: a closure-private Map<gateId, PendingRecord> stores the
+  // record created by gate.propose(). The record holds action, payload, tenantId,
+  // and departmentKey — CONTENT ONLY, NO approval flag. Approval lives in the DB
+  // (task_verdicts), read via _hasApprovedVerdict (latest-verdict semantics).
+  //
+  // APPROVAL: an `approved` row in task_verdicts (the real Gate store), written
+  // EXCLUSIVELY by the authenticated verdict route (writeVerdict ← POST
+  // /api/tasks/:id/verdict, RBAC-gated on gate_owner). The ctx object has NO method
+  // that can approve a record, and there is NO importable approval function in this
+  // module — the approval is data in a DB the ctx cannot write. A ctx-holder using
+  // `(ctx as any)` finds NO approval method; a module importer finds NO approve fn.
+  //
+  // FAIL-CLOSED + CONTENT-BOUND (BLOCK-1 + BLOCK-2 close, 2026-06-18):
+  //   execute(gateId):
+  //     1. Check capability (member floor).
+  //     2. Look up gateId in _pendingStore (content + binding) → not found: not_approved.
+  //     3. Check record.tenantId === tenantId AND record.departmentKey === departmentKey
+  //        → mismatch: throw not_approved (cross-tenant / cross-dept rejected).
+  //     4. Query task_verdicts via handle.db for an `approved` verdict on gateId
+  //        → none: throw not_approved. THIS is the gate — unforgeable by ctx code.
+  //     5. Dispatch using record.action and record.payload — NOT caller-supplied values.
+  //
+  // CONTENT NOTE: _pendingStore holds the proposal CONTENT (the documented S4
+  // in-memory content stub). Durable content (a proposal row read across requests)
+  // lands when real adapters wire; the APPROVAL gate is already real (DB verdict).
+  //
+  // STUB ADAPTERS: both 'inkwell-content' and 'mcpwp' adapters return
+  //   { executed: false, reason: 'executor_not_wired' }
+  // with no fetch, no external write, no credentials. The PORT + the dispatch
+  // routing + the fail-closed authority check is the S4 deliverable.
+
+  // Closure-private content store (proposal action/payload + tenant/dept binding).
+  // Holds NO approval flag — approval lives in task_verdicts (see _hasApprovedVerdict).
+  const _pendingStore = new Map<string, PendingRecord>()
+
+  const executor: ExecutorPort = Object.freeze({
+    async execute(gateId: string): Promise<ExecuteOutcome> {
+      if (!hasCapability(_capSet, 'member')) {
+        throw new CtxError(
+          'capability_denied',
+          `ctx(${departmentKey}@${tenantId}): 'member' capability required to execute`,
+        )
+      }
+
+      // ── FAIL-CLOSED + CONTENT-BOUND ──────────────────────────────────────
+      //
+      // 1. Look up the proposal content. No record → never proposed here → reject.
+      const record = _pendingStore.get(gateId)
+      if (!record) {
+        throw new CtxError(
+          'not_approved',
+          `ctx(${departmentKey}@${tenantId}): gateId '${gateId}' has no proposal record — execute requires a prior gate.propose in this ctx, a human-approved verdict, then execute.`,
+        )
+      }
+
+      // 2. Cross-tenant / cross-department binding check.
+      //
+      // The stored record carries the tenantId + departmentKey from the ctx that
+      // called gate.propose(). A different ctx (different tenant or department)
+      // that somehow holds the same gateId cannot execute it — the bindings must
+      // match. This closes the cross-tenant substitution attack.
+      if (record.tenantId !== tenantId || record.departmentKey !== departmentKey) {
+        throw new CtxError(
+          'not_approved',
+          `ctx(${departmentKey}@${tenantId}): gateId '${gateId}' was proposed in a different tenant/department — cross-tenant/dept execute rejected.`,
+        )
+      }
+
+      // 3. THE GATE — approval is a real `approved` row in task_verdicts, written
+      //    ONLY by the authenticated verdict route. No in-process function can
+      //    forge it; a ctx-holder cannot write it. This is the structural close of
+      //    the self-approve seam (BLOCK-1): there is no importable approval path.
+      const approved = await _hasApprovedVerdict(handle.db, gateId)
+      if (!approved) {
+        throw new CtxError(
+          'not_approved',
+          `ctx(${departmentKey}@${tenantId}): gateId '${gateId}' has no approved verdict in the Gate store — execute requires a human-approved verdict (POST /api/tasks/${gateId}/verdict). Propose, approve via /approvals, then execute.`,
+        )
+      }
+
+      // ── Dispatch to the (stubbed) adapter ────────────────────────────────
+      //
+      // CONTENT-BOUND (BLOCK-2 fix): executor hint comes from the STORED record's
+      // payload — NOT from any caller-supplied value. The caller passed only gateId.
+      // This means approve-A/execute-B-payload substitution is structurally impossible:
+      // the caller has no parameter to substitute.
+      //
+      // At S4 every adapter returns { executed: false, reason: 'executor_not_wired' }.
+      // No fetch, no external write, no credentials in any branch.
+      const storedPayload = record.payload
+      const executorHint = (() => {
+        if (
+          storedPayload !== null &&
+          storedPayload !== undefined &&
+          typeof storedPayload === 'object' &&
+          'executor' in (storedPayload as object)
+        ) {
+          return (storedPayload as Record<string, unknown>)['executor']
+        }
+        return undefined
+      })()
+
+      // S-LOOP SEAM: when the S-loop auto-act policy is built, its decision
+      // (auto-approve vs human-gate) happens before this function is reached.
+      // The fail-closed check above always holds: the S-loop adapter must have
+      // produced a real approval record before execute() is called.
+
+      // Adapter dispatch (all stubbed at S4).
+      let outcome: ExecuteOutcome
+      if (executorHint === 'inkwell-content') {
+        // STUB: inkwell-content adapter (Inkwell CMS write path — not wired at S4).
+        // Full-impl: POST to Inkwell worker /api/content with the proposal payload.
+        // Requires: Hadi-go, Inkwell API credentials, content-write capability.
+        outcome = {
+          executed: false,
+          reason: 'executor_not_wired',
+          adapter: 'inkwell-content',
+        }
+      } else if (executorHint === 'mcpwp') {
+        // STUB: mcpwp adapter (MCPWP-managed WordPress write path — not wired at S4).
+        // Full-impl: call MCPWP MCP tool with the proposal payload.
+        // Requires: Hadi-go, MCPWP credentials, per-pot WordPress connection.
+        outcome = {
+          executed: false,
+          reason: 'executor_not_wired',
+          adapter: 'mcpwp',
+        }
+      } else {
+        // Unknown or unspecified executor hint — still fails safe (no write).
+        outcome = {
+          executed: false,
+          reason: 'executor_not_wired',
+          adapter: 'unknown',
+        }
+      }
+
+      return outcome
+    },
+  })
+
   // ── Build inert frozen snapshots ──────────────────────────────────────────
   const capSnapshot: readonly Capability[] = Object.freeze([...capabilities])
   const metricsSnapshot: readonly Readonly<MetricDescriptor>[] = Object.freeze(
     [..._metricsMap.values()],
   )
 
-  return Object.freeze({
+  // ── Ctx build (BLOCK-1 structural close) ─────────────────────────────────
+  //
+  // The ctx carries NO approval writer — not on the object, not in any module
+  // WeakMap, not behind any exported function. Approval is a row in task_verdicts
+  // (the real Gate store) that only the authenticated verdict route can write and
+  // that execute() reads via handle.db. A hostile ctx-holder using `(ctx as any)`
+  // finds no approval method; a module importer finds no approve function to call.
+  const ctxBase: DepartmentCtx = {
     tenantId,
     departmentKey,
     capabilities: capSnapshot,
@@ -374,7 +627,10 @@ function _mintCtxInternal(
     audit,
     gate,
     bus,
-  } satisfies DepartmentCtx)
+    executor,
+  }
+
+  return Object.freeze(ctxBase)
 }
 
 // ── kernelMintCtx ─────────────────────────────────────────────────────────────
@@ -410,3 +666,15 @@ export function kernelMintCtx(
 export function _isKernelToken(sym: symbol): boolean {
   return sym === _KERNEL_TOKEN
 }
+
+// ── NO approval export ────────────────────────────────────────────────────────
+//
+// BLOCK-1 structural close (2026-06-18): there is intentionally NO
+// _kernelApproveForTest / _recordApproval / approve* export in this module.
+// Approval is a row in task_verdicts written ONLY by the authenticated verdict
+// route (writeVerdict ← POST /api/tasks/:id/verdict, RBAC-gated on gate_owner).
+// execute() reads it via handle.db (_hasApprovedVerdict). Tests approve by writing
+// an approved task_verdicts row to the same store — never via a kernel export.
+//
+// A guard test (tests/kernel-no-approval-export.test.ts) asserts this module
+// exports nothing matching /approve/i, so the seam cannot silently return.

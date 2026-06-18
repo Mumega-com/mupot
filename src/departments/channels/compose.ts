@@ -105,26 +105,48 @@ export function deepFreezeChannels(channels: ChannelDescriptor[]): readonly Chan
     // mutable object — it must be frozen separately so nested field descriptors
     // cannot be added or overwritten post-registration.
     //
-    // Strategy: freeze the schema object itself, then freeze the `.shape` getter
-    // result (the Zod field map) if it exists and is an object. Tested: Zod v4
-    // .parse() / .safeParse() continue to work after both freezes because the
-    // parse path reads own enumerable properties of the frozen shape object (it
-    // does not add to it). Methods live on the prototype (not own props) so they
-    // are unaffected by Object.freeze on the instance.
+    // Opus Low fix (S4): configSchema._def stays mutable after the shape-freeze.
+    // S4 now VALIDATES configSchema (to pick the executor) → config becomes
+    // authority-relevant. Fix: deep-freeze ._def (and its .shape sub-key) too,
+    // so a mutated schema internal cannot change the executor choice.
     //
-    // Authority note: configSchema is NOT authority-bearing (it is a validation
-    // spec only — marketing-channels.md §3 leak-guard 3). This freeze is defensive:
-    // it closes the S4 landmine where a future code path might read configSchema to
-    // make authority decisions on a mutated shape.
+    // Strategy:
+    //   1. Freeze the schema object itself.
+    //   2. Freeze the `.shape` getter result (Zod field map) if present.
+    //   3. Freeze `._def` (the Zod internal descriptor) if present and an object.
+    //   4. Freeze `._def.shape` if present (nested field map on _def).
+    //
+    // Tested: Zod v4 .parse() / .safeParse() continue to work after all freezes
+    // because the parse path reads own enumerable properties of the frozen objects
+    // but never adds to them. Methods live on the prototype, unaffected by freeze.
+    //
+    // Authority-safety note: the executor.execute() dispatch reads the executor
+    // type from approvedWork.payload (re-parsed at execute time, not from schema
+    // internals) — this freeze is belt-and-suspenders defense so no future code
+    // path can derive authority from a mutated schema._def.
     if (ch.configSchema !== undefined && ch.configSchema !== null && typeof ch.configSchema === 'object') {
       Object.freeze(ch.configSchema)
-      // Freeze the `.shape` getter result if present (Zod ZodObject shape map).
       const schemaAsRecord = ch.configSchema as Record<string, unknown>
+
+      // Freeze the `.shape` getter result if present (Zod ZodObject shape map).
       if (
         typeof schemaAsRecord['shape'] === 'object' &&
         schemaAsRecord['shape'] !== null
       ) {
         Object.freeze(schemaAsRecord['shape'])
+      }
+
+      // Opus Low fix: freeze `._def` and `._def.shape` if present.
+      if (
+        typeof schemaAsRecord['_def'] === 'object' &&
+        schemaAsRecord['_def'] !== null
+      ) {
+        const def = schemaAsRecord['_def'] as Record<string, unknown>
+        // Freeze ._def.shape (the Zod internal field map) if present.
+        if (typeof def['shape'] === 'object' && def['shape'] !== null) {
+          Object.freeze(def['shape'])
+        }
+        Object.freeze(def)
       }
     }
 
