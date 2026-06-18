@@ -35,6 +35,7 @@ import type { D1Database } from '@cloudflare/workers-types'
 import type { Capability } from '../types'
 import type { MetricDescriptor } from './contract'
 import type { EmitOutcome } from '../metrics/pulse'
+import type { InkwellExecutorConfig } from './executors/inkwell'
 
 // ── KernelHandle ──────────────────────────────────────────────────────────────
 //
@@ -44,6 +45,16 @@ import type { EmitOutcome } from '../metrics/pulse'
 export interface KernelHandle {
   /** Raw D1 database handle — held by kernel, never passed to department code. */
   db: D1Database
+  /**
+   * Resolved ACT-executor credentials (S4). OPTIONAL + fail-closed: when absent
+   * (every current call site), adapters stay `executor_not_wired` — no behavior
+   * change. The Worker boundary resolves the per-pot connector credential
+   * (Hadi-go) and populates this; the kernel only consumes the narrow config and
+   * never touches env/connector decrypt itself.
+   */
+  executorEnv?: {
+    inkwell?: InkwellExecutorConfig
+  }
 }
 
 // ── DepartmentCtx ─────────────────────────────────────────────────────────────
@@ -172,12 +183,14 @@ export interface BusPort {
 //   adapter must produce a real record, not a bypass.
 
 export interface ExecuteOutcome {
-  /** Always false at S4 — real adapters are not wired yet. */
+  /** True only when a real adapter performed an external write. */
   executed: boolean
-  /** Reason when executed=false: 'executor_not_wired' at S4. */
+  /** Reason when executed=false: e.g. 'executor_not_wired', 'inkwell_not_configured'. */
   reason?: string
   /** Which adapter was targeted (e.g. 'inkwell-content' | 'mcpwp'). */
   adapter?: string
+  /** URL/path of the artifact created on a successful write (e.g. /blog/<slug>). */
+  artifactUrl?: string
 }
 
 export interface ExecutorPort {

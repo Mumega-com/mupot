@@ -19,6 +19,7 @@ const TYPE_LABELS: Record<ConnectorType, string> = {
   ghl:       'GoHighLevel',
   apify:     'Apify',
   mcpwp:      'MCPWP',
+  inkwell:    'Inkwell',
   github_app: 'GitHub App',
   custom:     'Custom',
 }
