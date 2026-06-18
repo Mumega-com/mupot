@@ -105,6 +105,10 @@ import { executeTaskAsPR } from '../integrations/github-execute'
 import { importProjectItems } from '../integrations/github-projects'
 import { githubStatusBody } from '../integrations/github-dashboard'
 import { connectorsPageBody, connectorAddedBody, connectorRotatedBody } from '../connectors/dashboard'
+import { resolveConnector } from '../connectors/service'
+import { kernelMintCtx, getRegistered } from '../departments/registry'
+import type { KernelHandle } from '../departments/ctx'
+import '../departments/modules/growth' // side-effect: register GrowthModule so getRegistered('growth') resolves
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -278,6 +282,51 @@ dashboardApp.get('/departments/growth', async (c) => {
   const auth = c.get('auth')
   const view = await loadGrowthView(c.env, auth)
   return c.html(shell(c.env.BRAND, 'Marketing & Sales', growthBody(view)))
+})
+
+// POST /admin/departments/:dept/execute/:gateId — owner/admin-triggered execution
+// of an ALREADY-APPROVED department proposal (S4 live-wire). Human-in-the-loop:
+// the owner approves via /approvals (writes the task_verdicts row), then fires this
+// to perform the real Inkwell write. The kernel re-checks the approval + tenant/dept
+// binding; this route only resolves the per-pot connector credential and mints the
+// ctx. Fail-closed: no INKWELL_API_URL or no 'inkwell' connector → 503 (inert).
+dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const dept = c.req.param('dept')
+  const gateId = c.req.param('gateId')
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(dept) || !gateId) {
+    return c.json({ error: 'invalid_params' }, 400)
+  }
+  const moduleDef = getRegistered(dept)
+  if (!moduleDef) return c.json({ error: 'department_not_found' }, 404)
+  if (!c.env.INKWELL_API_URL) {
+    return c.json({ error: 'executor_not_configured', reason: 'INKWELL_API_URL unset' }, 503)
+  }
+  // Pot-scoped 'inkwell' connector. resolveConnector fails closed (null) when no
+  // CONNECTOR_MASTER_KEY or no row — the executor stays inert.
+  const token = await resolveConnector(c.env, dept, 'inkwell')
+  if (!token) {
+    return c.json({ error: 'connector_not_configured', reason: 'no inkwell connector for this pot' }, 503)
+  }
+  const handle: KernelHandle = {
+    db: c.env.DB,
+    executorEnv: { inkwell: { apiUrl: c.env.INKWELL_API_URL, token } },
+  }
+  const ctx = kernelMintCtx(handle, {
+    tenantId: c.env.TENANT_SLUG,
+    departmentKey: dept,
+    module: moduleDef,
+    capabilities: [auth.role === 'owner' ? 'owner' : 'admin'],
+  })
+  try {
+    const outcome = await ctx.executor.execute(gateId)
+    return c.json(outcome, outcome.executed ? 200 : 422)
+  } catch (e) {
+    // execute() throws CtxError on not_approved / capability / cross-tenant.
+    const reason = e instanceof Error ? e.message : 'execute_failed'
+    return c.json({ executed: false, error: 'not_executable', reason }, 409)
+  }
 })
 
 // POST /brain/loops/:id/control — governor control signal.
