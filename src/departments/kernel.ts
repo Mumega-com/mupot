@@ -47,6 +47,7 @@ import type {
   GatePort,
   BusPort,
 } from './ctx'
+import { composeDeptMetricDescriptors, deepFreezeChannels } from './channels/compose'
 
 // Re-export types so registry.ts only needs to import from kernel.ts.
 export type { KernelHandle, DepartmentCtx } from './ctx'
@@ -143,14 +144,24 @@ function _mintCtxInternal(
     for (const conn of clone.connectors) Object.freeze(conn)
     Object.freeze(clone.connectors)
     Object.freeze(clone.requiredCapabilities)
+    // Freeze channels if present — same depth as registry.ts deepFreezeClone.
+    if (clone.channels) {
+      deepFreezeChannels(clone.channels)
+    }
     return Object.freeze(clone)
   })()
 
   // ── Closure-private authority state (NOT exposed on ctx) ──────────────────
   const _capSet: ReadonlySet<Capability> = new Set(capabilities)
 
+  // Build _metricsMap from the COMPOSED set: metricsEmitted ∪ channels[].metricDescriptors.
+  // This means a collector emitting a channel metric key (e.g. growth.leads via OutboundChannel)
+  // is authorized through the kernel's source-authority check — no channel bypasses the guard.
+  // composeDeptMetricDescriptors throws ChannelComposeError on any duplicate key, so a
+  // misconfigured module cannot shadow an existing key to widen sourceAuthority.
+  const _composedDescriptors = composeDeptMetricDescriptors(module.metricsEmitted, module.channels ?? [])
   const _metricsMap = new Map<string, Readonly<MetricDescriptor>>(
-    module.metricsEmitted.map((d) => {
+    _composedDescriptors.map((d) => {
       const frozen: Readonly<MetricDescriptor> = Object.freeze({
         ...d,
         sourceAuthority: Object.freeze([...d.sourceAuthority]) as readonly string[],
