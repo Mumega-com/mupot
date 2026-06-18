@@ -46,17 +46,29 @@ fleet), full provisioning chain, plan-tier-tagged with an Enterprise kill switch
 #129–#137. Docs: public connect guides + internal security model. The pot's GitHub body.
 This is the GitHub weave (#71/#73/#74) completed — foreshadowed in 0.19, shipped here.
 
-## v0.22.0 — Flock complete
+## ✅ v0.22.0 — Department-template microkernel + Marketing department *(shipped 2026-06-18 — see CHANGELOG)*
+Emerged ahead of plan (2026-06-17/18) and **landed the v0.23 marketing substrate early**, so it
+took the 0.22 slot; "Flock complete" re-sequences below. The console became a **microkernel**:
+activatable **department templates** (one template, N sovereign pots, config not code), the first
+real department (**Marketing & Sales**) live + self-running, the **multi-channel command layer**
+proven on the outbound funnel, light-default console. Diverse-gated Opus + Codex throughout.
+Architecture: [docs/architecture/console-department-microkernel.md](docs/architecture/console-department-microkernel.md) ·
+[docs/architecture/marketing-channels.md](docs/architecture/marketing-channels.md).
+
+## v0.22.5 — Flock complete *(re-sequenced after the microkernel shipped as 0.22.0)*
 Any runtime onboards + operates a pot, gated — including your DevOps agent.
 - **#53** harness packs — Codex, Hermes (Nous), openclaw, Claude Cowork.
 - **#46** Fleet wake / control (gated, ops-agent-executed) + the token-scope half of #44.
 - **#47** ChatGPT Business into the flock (caller-client; depends #41).
 - **#40** Fleet Layer-A polish.
 
-## v0.23.0 — digid operates live (the MCPWP pilot)
-A pot runs a **real business** coherently through the rails — the proof.
-- **#42** Digid marketing roster — Inbound · Outbound · Internet-Research (seeded via product path).
-- the gated **MCPWP content loop** — read brand-crystal → draft a WP post via MCPWP → `/approvals` → publish.
+## v0.23.0 — A real business operates live (the marketing pilot)
+A pot runs a **real business** coherently through the rails — the proof. The 0.22 microkernel
+**generalized #42** into a reusable Marketing department; the rest is the closed-loop CRO engine.
+Tracking: **epic #199** (marketing channels) + the sprint plan in `marketing-channels.md`.
+- **#42** Marketing roster — ✅ generalized as the **Marketing department** (Outbound channel live; the prospect funnel = the Outbound channel).
+- **the gated content loop** — SEO/CRO **perceive** (PostHog + first-party first; GSC the next connector) → gated **proposals** → gated **writes** (per pot: MCPWP for WordPress pots, the Inkwell content engine for mumega.com). Sprints **S3/S4** in #199.
+- **S-loop** — the daily closed loop on the `loops` runtime (perceive→act→measure, **acted-vs-gated policy** approved: low-risk auto within a budget/threshold envelope, risky queues for approval).
 - **#39** Loops UI + gated approval pipeline (fixes `gated_approval_pipeline_unwired`).
 - **#41** ChatGPT connector production auth path.
 
