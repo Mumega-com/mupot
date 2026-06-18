@@ -30,6 +30,7 @@
 //   ctx.ts has no mint logic at all — it is a pure types/contracts file. A module
 //   that imports ctx.ts receives zero minting capability.
 
+import type { D1Database } from '@cloudflare/workers-types'
 import type { Capability } from '../types'
 import type { DepartmentModule, MetricDescriptor } from './contract'
 import { emitMetric } from '../metrics/pulse'
@@ -82,29 +83,40 @@ const RANK: Record<Capability, number> = {
 // The full content of a gated work proposal, stored by gate.propose() and looked
 // up by executor.execute(). Keyed by gateId in the closure-private _pendingStore.
 //
-// BLOCK-2 fix (2026-06-18): execute() reads ONLY from the stored record — the
-// caller supplies only a gateId; action/payload/tenantId/departmentKey are taken
-// from this record, never from the caller.
+// BLOCK-2 fix (2026-06-18): execute() reads the action/payload/tenantId/
+// departmentKey ONLY from this stored record — the caller supplies only a gateId.
+//
+// NOTE: this record carries the proposal CONTENT (the S4 in-memory content stub).
+// It deliberately holds NO `approved` field. Approval is NOT an in-process flag —
+// it is a row in the real Gate store (task_verdicts), read by execute() via
+// handle.db (see _hasApprovedVerdict). That is the BLOCK-1 structural close: there
+// is no in-process approval writer, so there is nothing importable to self-approve.
 interface PendingRecord {
   gateId: string
   action: string
   payload: unknown
   tenantId: string
   departmentKey: string
-  approved: boolean
 }
 
-// ── _testApproveSeams (module-private WeakMap) ────────────────────────────────
+// ── _hasApprovedVerdict — approval lives in the REAL Gate store ───────────────
 //
-// BLOCK-1 fix (2026-06-18): _recordApproval is NOT a property on the ctx object.
-// The approval-writer is closure-private. The test seam is exposed only through
-// _kernelApproveForTest (exported below) which reads this WeakMap.
+// BLOCK-1 structural close (2026-06-18): the ONLY approval path is an `approved`
+// row in task_verdicts, written EXCLUSIVELY by the authenticated verdict route
+// (writeVerdict ← POST /api/tasks/:id/verdict, RBAC-gated on the task's gate_owner).
+// No in-process function can mint that row. A hostile/future collector holds a
+// ctx but the ctx exposes NO approval writer — and it cannot forge a DB verdict.
 //
-// The WeakMap key is the DepartmentCtx reference (object identity). The value
-// is a function that marks a pending record approved in the closure-private store.
-// Because DepartmentCtx is frozen before being returned, the WeakMap is the only
-// path to reach the writer — it is not on the ctx, not reachable via `as any`.
-const _testApproveSeams = new WeakMap<DepartmentCtx, (gateId: string) => void>()
+// execute() calls this with handle.db (the same D1 the verdict route writes to).
+// Tests "approve the real way" by writing an approved task_verdicts row to the
+// same store — modeling the verdict route's output — never via a kernel export.
+async function _hasApprovedVerdict(db: D1Database, gateId: string): Promise<boolean> {
+  const row = await db
+    .prepare(`SELECT verdict FROM task_verdicts WHERE task_id = ?1 AND verdict = 'approved' LIMIT 1`)
+    .bind(gateId)
+    .first<{ verdict: string }>()
+  return row?.verdict === 'approved'
+}
 
 // ── isCapability (WARN-S4-1 fix) ─────────────────────────────────────────────
 //
@@ -404,12 +416,15 @@ function _mintCtxInternal(
 
       // ── Record gated work (BLOCK-2 fix: store full record keyed by gateId) ──
       //
-      // The full pending record is stored in the closure-private _pendingStore.
-      // executor.execute() will look up this record by gateId and dispatch using
-      // ONLY the stored action + payload — not caller-supplied values.
+      // The proposal CONTENT is stored in the closure-private _pendingStore.
+      // executor.execute() looks up this record by gateId and dispatches using
+      // ONLY the stored action + payload — not caller-supplied values. The record
+      // holds NO approval flag: approval is a task_verdicts row (the real Gate),
+      // not an in-process bit (see executor / _hasApprovedVerdict).
       //
-      // TODO(full-impl): write to a gated_work_items table with:
-      //   { id: gateId, tenant_id, department_key, action, payload, status: 'pending', created_at }
+      // TODO(full-impl): persist a durable proposal row (a `review`-status task with
+      // gate_owner=departmentKey) so execute() reads content across requests too;
+      // the approval gate is already the real DB verdict.
       const gateId = idFn()
       const pendingRecord: PendingRecord = {
         gateId,
@@ -417,7 +432,6 @@ function _mintCtxInternal(
         payload: proposal.payload,
         tenantId,
         departmentKey,
-        approved: false,
       }
       _pendingStore.set(gateId, pendingRecord)
       return { gateId }
@@ -447,36 +461,35 @@ function _mintCtxInternal(
   // record created by gate.propose(). The record holds action, payload, tenantId,
   // departmentKey, and approved:boolean. gate.propose() inserts with approved=false.
   //
-  // APPROVAL: approved is flipped to true ONLY by the _testApproveSeams write-path
-  // (test seam, see below) or, in full-impl, by the /approvals Gate endpoint writing
-  // a task_verdicts row. The ctx object has NO method that can approve a record.
-  // A ctx-holder using `(ctx as any)` finds NO approval method — it is not there.
+  // APPROVAL: an `approved` row in task_verdicts (the real Gate store), written
+  // EXCLUSIVELY by the authenticated verdict route (writeVerdict ← POST
+  // /api/tasks/:id/verdict, RBAC-gated on gate_owner). The ctx object has NO method
+  // that can approve a record, and there is NO importable approval function in this
+  // module — the approval is data in a DB the ctx cannot write. A ctx-holder using
+  // `(ctx as any)` finds NO approval method; a module importer finds NO approve fn.
   //
-  // FAIL-CLOSED + CONTENT-BOUND (BLOCK-1 + BLOCK-2 fix, 2026-06-18):
+  // FAIL-CLOSED + CONTENT-BOUND (BLOCK-1 + BLOCK-2 close, 2026-06-18):
   //   execute(gateId):
   //     1. Check capability (member floor).
-  //     2. Look up gateId in _pendingStore → not found: throw not_approved.
-  //     3. Check record.approved → false: throw not_approved.
-  //     4. Check record.tenantId === tenantId AND record.departmentKey === departmentKey
+  //     2. Look up gateId in _pendingStore (content + binding) → not found: not_approved.
+  //     3. Check record.tenantId === tenantId AND record.departmentKey === departmentKey
   //        → mismatch: throw not_approved (cross-tenant / cross-dept rejected).
+  //     4. Query task_verdicts via handle.db for an `approved` verdict on gateId
+  //        → none: throw not_approved. THIS is the gate — unforgeable by ctx code.
   //     5. Dispatch using record.action and record.payload — NOT caller-supplied values.
+  //
+  // CONTENT NOTE: _pendingStore holds the proposal CONTENT (the documented S4
+  // in-memory content stub). Durable content (a proposal row read across requests)
+  // lands when real adapters wire; the APPROVAL gate is already real (DB verdict).
   //
   // STUB ADAPTERS: both 'inkwell-content' and 'mcpwp' adapters return
   //   { executed: false, reason: 'executor_not_wired' }
   // with no fetch, no external write, no credentials. The PORT + the dispatch
   // routing + the fail-closed authority check is the S4 deliverable.
 
-  // Closure-private pending store (stores proposal records; approved field tracks gate).
+  // Closure-private content store (proposal action/payload + tenant/dept binding).
+  // Holds NO approval flag — approval lives in task_verdicts (see _hasApprovedVerdict).
   const _pendingStore = new Map<string, PendingRecord>()
-
-  // _approveRecord is closure-private and NOT placed on the ctx object.
-  // It is exposed ONLY via _testApproveSeams (a module-level WeakMap) so that
-  // _kernelApproveForTest (exported below) can reach it by ctx identity.
-  // Nothing reachable via `(ctx as any)` can call this function.
-  function _approveRecord(gateId: string): void {
-    const rec = _pendingStore.get(gateId)
-    if (rec) rec.approved = true
-  }
 
   const executor: ExecutorPort = Object.freeze({
     async execute(gateId: string): Promise<ExecuteOutcome> {
@@ -489,21 +502,16 @@ function _mintCtxInternal(
 
       // ── FAIL-CLOSED + CONTENT-BOUND ──────────────────────────────────────
       //
-      // Look up the pending record. No record → never proposed → reject.
-      // Record not approved → human approval not received → reject.
-      // Record tenantId/departmentKey mismatch → cross-tenant/dept → reject.
-      // In full-impl: query task_verdicts WHERE task_id=gateId AND verdict='approved'
-      // AND tenant_id=tenantId AND department_key=departmentKey. At S4 the
-      // _pendingStore is the equivalent — same semantics, no DB.
+      // 1. Look up the proposal content. No record → never proposed here → reject.
       const record = _pendingStore.get(gateId)
-      if (!record || !record.approved) {
+      if (!record) {
         throw new CtxError(
           'not_approved',
-          `ctx(${departmentKey}@${tenantId}): gateId '${gateId}' has no approval record — execute requires a human-approved verdict. Propose first (gate.propose), approve via /approvals, then execute.`,
+          `ctx(${departmentKey}@${tenantId}): gateId '${gateId}' has no proposal record — execute requires a prior gate.propose in this ctx, a human-approved verdict, then execute.`,
         )
       }
 
-      // ── Cross-tenant / cross-department binding check ─────────────────────
+      // 2. Cross-tenant / cross-department binding check.
       //
       // The stored record carries the tenantId + departmentKey from the ctx that
       // called gate.propose(). A different ctx (different tenant or department)
@@ -513,6 +521,18 @@ function _mintCtxInternal(
         throw new CtxError(
           'not_approved',
           `ctx(${departmentKey}@${tenantId}): gateId '${gateId}' was proposed in a different tenant/department — cross-tenant/dept execute rejected.`,
+        )
+      }
+
+      // 3. THE GATE — approval is a real `approved` row in task_verdicts, written
+      //    ONLY by the authenticated verdict route. No in-process function can
+      //    forge it; a ctx-holder cannot write it. This is the structural close of
+      //    the self-approve seam (BLOCK-1): there is no importable approval path.
+      const approved = await _hasApprovedVerdict(handle.db, gateId)
+      if (!approved) {
+        throw new CtxError(
+          'not_approved',
+          `ctx(${departmentKey}@${tenantId}): gateId '${gateId}' has no approved verdict in the Gate store — execute requires a human-approved verdict (POST /api/tasks/${gateId}/verdict). Propose, approve via /approvals, then execute.`,
         )
       }
 
@@ -582,20 +602,13 @@ function _mintCtxInternal(
     [..._metricsMap.values()],
   )
 
-  // ── Ctx build + test-seam registration (BLOCK-1 fix) ─────────────────────
+  // ── Ctx build (BLOCK-1 structural close) ─────────────────────────────────
   //
-  // _approveRecord is NOT placed on the ctx object. A hostile ctx-holder using
-  // `(ctx as any)` will find NO approval method — it is simply not there.
-  //
-  // The test seam is the module-level WeakMap _testApproveSeams, populated here
-  // BEFORE freeze. The frozen ctx is the WeakMap key; the writer is the value.
-  // Only code that has both the frozen ctx reference AND access to the exported
-  // _kernelApproveForTest function can trigger an approval — and that function
-  // is for test harnesses only, clearly labelled as such.
-  //
-  // Full-impl: executor.execute() will query task_verdicts (WHERE task_id=gateId
-  // AND verdict='approved' AND tenant_id=tenantId AND department_key=departmentKey)
-  // instead of using _pendingStore. This seam goes away then.
+  // The ctx carries NO approval writer — not on the object, not in any module
+  // WeakMap, not behind any exported function. Approval is a row in task_verdicts
+  // (the real Gate store) that only the authenticated verdict route can write and
+  // that execute() reads via handle.db. A hostile ctx-holder using `(ctx as any)`
+  // finds no approval method; a module importer finds no approve function to call.
   const ctxBase: DepartmentCtx = {
     tenantId,
     departmentKey,
@@ -608,13 +621,7 @@ function _mintCtxInternal(
     executor,
   }
 
-  const frozenCtx = Object.freeze(ctxBase)
-
-  // Register the approval writer in the module-level WeakMap AFTER freeze.
-  // The WeakMap key is the frozen ctx object (identity, not structure).
-  _testApproveSeams.set(frozenCtx, _approveRecord)
-
-  return frozenCtx
+  return Object.freeze(ctxBase)
 }
 
 // ── kernelMintCtx ─────────────────────────────────────────────────────────────
@@ -651,30 +658,14 @@ export function _isKernelToken(sym: symbol): boolean {
   return sym === _KERNEL_TOKEN
 }
 
-// ── _kernelApproveForTest ─────────────────────────────────────────────────────
+// ── NO approval export ────────────────────────────────────────────────────────
 //
-// TEST-HARNESS ONLY. Simulates a human approval of a pending gated record.
+// BLOCK-1 structural close (2026-06-18): there is intentionally NO
+// _kernelApproveForTest / _recordApproval / approve* export in this module.
+// Approval is a row in task_verdicts written ONLY by the authenticated verdict
+// route (writeVerdict ← POST /api/tasks/:id/verdict, RBAC-gated on gate_owner).
+// execute() reads it via handle.db (_hasApprovedVerdict). Tests approve by writing
+// an approved task_verdicts row to the same store — never via a kernel export.
 //
-// BLOCK-1 fix (2026-06-18): _recordApproval is NOT on the DepartmentCtx object.
-// A ctx-holder using `(ctx as any)` finds no approval method. The approval
-// mechanism is reached ONLY through this function, which requires:
-//   1. The exported function itself (tests import it; prod code should not).
-//   2. The exact ctx reference (WeakMap key — object identity).
-//
-// INVARIANT a test must prove: `(ctx as any)._recordApproval` is undefined,
-// `(ctx as any)._approveRecord` is undefined — the ctx object has NO property
-// that can approve a proposal. Only this function path can.
-//
-// Full-impl: this function goes away. executor.execute() queries task_verdicts
-// (a real DB row written by the /approvals Gate endpoint). The only approval
-// path is then an authenticated HTTP request through the real Gate.
-
-export function _kernelApproveForTest(ctx: DepartmentCtx, gateId: string): void {
-  const writer = _testApproveSeams.get(ctx)
-  if (!writer) {
-    throw new Error(
-      '_kernelApproveForTest: ctx not found in approval seam map — was it minted by kernelMintCtx?',
-    )
-  }
-  writer(gateId)
-}
+// A guard test (tests/kernel-no-approval-export.test.ts) asserts this module
+// exports nothing matching /approve/i, so the seam cannot silently return.

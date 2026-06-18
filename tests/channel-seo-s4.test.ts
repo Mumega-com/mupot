@@ -29,26 +29,53 @@ import {
   ChannelComposeError,
 } from '../src/departments/channels/compose'
 import type { ChannelDescriptor } from '../src/departments/channels/contract'
-import { kernelMintCtx, _kernelApproveForTest } from '../src/departments/kernel'
+import { kernelMintCtx } from '../src/departments/kernel'
 import { CtxError } from '../src/departments/ctx'
 import type { DepartmentCtx } from '../src/departments/ctx'
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Minimal D1 stub — metric emits are not the focus of S4 tests. */
+let _idCtr = 0
+function makeId() { return `s4-id-${++_idCtr}` }
+const NOW = '2026-06-18T12:00:00.000Z'
+const TENANT = 'mumega'
+
+/**
+ * SQL-aware D1 stub.
+ *
+ * BLOCK-1 structural close: approval is a row in task_verdicts, NOT an in-process
+ * flag. This stub stores approved verdict rows written through the REAL verdict
+ * INSERT SQL (modeling POST /api/tasks/:id/verdict → writeVerdict) and answers the
+ * `_hasApprovedVerdict` SELECT. execute() reads approval ONLY from here — there is
+ * no kernel approval export to import.
+ */
 function makeStubDb(): { db: D1Database } {
+  const approved = new Set<string>()
   const db = {
     prepare(sql: string) {
       const upper = sql.trim().toUpperCase()
       const boundArgs: unknown[] = []
       const stmt = {
         bind(...args: unknown[]) { boundArgs.push(...args); return stmt },
-        async run() { return { success: true, meta: { changes: 1 } } },
+        async run() {
+          // The authenticated verdict route writes an approved row here.
+          // Columns: (id, task_id, verdict, note, decided_by, decided_at).
+          if (upper.includes('INSERT INTO TASK_VERDICTS') && boundArgs[2] === 'approved') {
+            approved.add(String(boundArgs[1]))
+          }
+          return { success: true, meta: { changes: 1 } }
+        },
         async all() {
           if (upper.includes('FROM DEPARTMENTS')) return { results: [], success: true }
           return { results: [], success: true }
         },
-        async first() { return null },
+        async first() {
+          // _hasApprovedVerdict: SELECT verdict FROM task_verdicts WHERE task_id=?1 AND verdict='approved'
+          if (upper.includes('FROM TASK_VERDICTS')) {
+            return approved.has(String(boundArgs[0])) ? { verdict: 'approved' } : null
+          }
+          return null
+        },
       }
       return stmt
     },
@@ -57,15 +84,13 @@ function makeStubDb(): { db: D1Database } {
   return { db }
 }
 
-let _idCtr = 0
-function makeId() { return `s4-id-${++_idCtr}` }
-const NOW = '2026-06-18T12:00:00.000Z'
-const TENANT = 'mumega'
+// ctx → the D1 it reads, so a test can approve through the SAME gate store.
+const _ctxDb = new WeakMap<DepartmentCtx, D1Database>()
 
 /** Mint a ctx for the growth department with the given capabilities. */
 function mintCtx(caps: ('observer' | 'member' | 'lead' | 'admin' | 'owner')[] = ['member']) {
   const { db } = makeStubDb()
-  return kernelMintCtx({ db }, {
+  const ctx = kernelMintCtx({ db }, {
     tenantId: TENANT,
     departmentKey: 'growth',
     module: GrowthModule,
@@ -73,16 +98,29 @@ function mintCtx(caps: ('observer' | 'member' | 'lead' | 'admin' | 'owner')[] = 
     now: () => NOW,
     idGen: makeId,
   })
+  _ctxDb.set(ctx, db)
+  return ctx
 }
 
 /**
- * Test-harness approval seam (BLOCK-1 fix).
- * Uses _kernelApproveForTest — NOT a property on the ctx object.
- * Any attempt to reach approval via `(ctx as any)._recordApproval` or
- * `(ctx as any)._approveRecord` will fail: those properties do not exist on ctx.
+ * Approve "the real way": write an `approved` task_verdicts row to the gate store
+ * via the REAL verdict INSERT SQL — modeling POST /api/tasks/:id/verdict. This is
+ * NOT a kernel export; it is a DB write the ctx itself cannot perform.
  */
-function recordApproval(ctx: DepartmentCtx, gateId: string): void {
-  _kernelApproveForTest(ctx, gateId)
+async function approveInStore(db: D1Database, gateId: string): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at) VALUES (?1,?2,?3,?4,?5,?6)`,
+    )
+    .bind(`v-${gateId}`, gateId, 'approved', null, 'member-test', NOW)
+    .run()
+}
+
+/** Approve a proposal on the gate store the given ctx reads. */
+async function recordApproval(ctx: DepartmentCtx, gateId: string): Promise<void> {
+  const db = _ctxDb.get(ctx)
+  if (!db) throw new Error('test: ctx has no associated db (mint via mintCtx)')
+  await approveInStore(db, gateId)
 }
 
 // ── 1. executor.execute with NO approval record → throws not_approved ─────────
@@ -137,7 +175,7 @@ describe('2. executor.execute — with approval: dispatches to stub (executed=fa
       action: 'seo-meta-fix',
       payload: { executor: 'inkwell-content' },
     })
-    recordApproval(ctx, gateId)
+    await recordApproval(ctx, gateId)
 
     // execute takes ONLY gateId — adapter is read from the STORED record payload.
     const outcome = await ctx.executor.execute(gateId)
@@ -152,7 +190,7 @@ describe('2. executor.execute — with approval: dispatches to stub (executed=fa
       action: 'seo-internal-links',
       payload: { executor: 'mcpwp' },
     })
-    recordApproval(ctx, gateId)
+    await recordApproval(ctx, gateId)
 
     const outcome = await ctx.executor.execute(gateId)
     expect(outcome.executed).toBe(false)
@@ -163,7 +201,7 @@ describe('2. executor.execute — with approval: dispatches to stub (executed=fa
   it('unknown executor hint (no executor in payload): executed=false, adapter=unknown', async () => {
     const ctx = mintCtx(['lead'])
     const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: {} })
-    recordApproval(ctx, gateId)
+    await recordApproval(ctx, gateId)
 
     const outcome = await ctx.executor.execute(gateId)
     expect(outcome.executed).toBe(false)
@@ -177,7 +215,7 @@ describe('2. executor.execute — with approval: dispatches to stub (executed=fa
 
     const { gateId } = await ctxA.gate.propose({ action: 'seo-meta-fix', payload: {} })
     // Approve only in ctxA's store.
-    recordApproval(ctxA, gateId)
+    await recordApproval(ctxA, gateId)
 
     // ctxA can execute.
     const outcomeA = await ctxA.executor.execute(gateId)
@@ -493,7 +531,7 @@ describe('8. Config authority-safety — mutating configSchema._def cannot chang
       action: 'seo-meta-fix',
       payload: { executor: 'inkwell-content' },
     })
-    recordApproval(ctx, gateId)
+    await recordApproval(ctx, gateId)
 
     // execute() takes only gateId — dispatch comes from the stored record.
     const outcome = await ctx.executor.execute(gateId)
@@ -511,7 +549,7 @@ describe('8. Config authority-safety — mutating configSchema._def cannot chang
       action: 'seo-meta-fix',
       payload: { executor: 'inkwell-content' },
     })
-    recordApproval(ctx, gateId)
+    await recordApproval(ctx, gateId)
 
     // The only parameter is gateId — the caller has no way to say "use mcpwp instead."
     // The stored executor hint is 'inkwell-content', so that is what executes.
@@ -526,7 +564,7 @@ describe('9. Executor adapters are stubs — no external writes (no fetch/creds)
   it('inkwell-content adapter returns executed=false (stub invariant)', async () => {
     const ctx = mintCtx(['lead'])
     const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: { executor: 'inkwell-content' } })
-    recordApproval(ctx, gateId)
+    await recordApproval(ctx, gateId)
 
     const out = await ctx.executor.execute(gateId)
     expect(out.executed).toBe(false)
@@ -537,7 +575,7 @@ describe('9. Executor adapters are stubs — no external writes (no fetch/creds)
   it('mcpwp adapter returns executed=false (stub invariant)', async () => {
     const ctx = mintCtx(['lead'])
     const { gateId } = await ctx.gate.propose({ action: 'seo-internal-links', payload: { executor: 'mcpwp' } })
-    recordApproval(ctx, gateId)
+    await recordApproval(ctx, gateId)
 
     const out = await ctx.executor.execute(gateId)
     expect(out.executed).toBe(false)
@@ -582,7 +620,7 @@ describe('10. Arms-never-write — NO path executes without a human approval rec
     // The stored record's action (seo-meta-fix) is what executes — substitution is impossible.
     const ctx = mintCtx(['lead'])
     const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: {} })
-    recordApproval(ctx, gateId)
+    await recordApproval(ctx, gateId)
 
     // execute(gateId) — no action param. The stored action (seo-meta-fix) is used.
     const out = await ctx.executor.execute(gateId)
@@ -636,12 +674,14 @@ describe('10. Arms-never-write — NO path executes without a human approval rec
     })
 
     const { gateId } = await ctxA.gate.propose({ action: 'seo-meta-fix', payload: {} })
-    recordApproval(ctxA, gateId)
+    // Approve in the shared gate store (the verdict is global, keyed by gateId).
+    await approveInStore(db, gateId)
 
     // ctxA can execute its own approved record.
     await expect(ctxA.executor.execute(gateId)).resolves.toMatchObject({ executed: false })
 
-    // ctxB cannot — the gateId was proposed+approved in ctxA's store, not ctxB's.
+    // ctxB cannot — even though the DB verdict is global, the gateId was proposed
+    // in ctxA's closure-private content store, not ctxB's → content lookup fails first.
     await expect(ctxB.executor.execute(gateId)).rejects.toThrow(/not_approved/)
   })
 })
