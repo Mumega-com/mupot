@@ -76,6 +76,19 @@ describe('Loop manifest contract v1 (FROZEN)', () => {
     expect(validateLoopSpec({ ...FROZEN_V1, gate: { require_approval: true, on_timeout: 'approve' } }).ok).toBe(false)
   })
 
+  // ── ADDITIVE extensions (non-breaking; do not alter the frozen v1 shape) ──
+  it('ADDITIVE (S5): `kind` is optional — absent ⇒ omitted (v1 shape unchanged), explicit ⇒ carried', () => {
+    const r0 = validateLoopSpec(FROZEN_V1) // v1 manifest has no kind
+    expect(r0.ok).toBe(true)
+    if (r0.ok) expect('kind' in r0.value).toBe(false) // frozen shape preserved
+
+    const rc = validateLoopSpec({ ...FROZEN_V1, kind: 'cro' })
+    expect(rc.ok).toBe(true)
+    if (rc.ok) expect(rc.value.kind).toBe('cro')
+
+    expect(validateLoopSpec({ ...FROZEN_V1, kind: 'nope' }).ok).toBe(false) // unknown kind rejected
+  })
+
   // ── v1 INVARIANTS — guarantees consumers build on. Breaking any = a 2.0. ──
   it('INVARIANT: exactly one owner (squad XOR agent)', () => {
     expect(validateLoopSpec({ ...FROZEN_V1, squad_id: 's', agent_id: 'a' }).ok).toBe(false)

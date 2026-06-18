@@ -24,6 +24,7 @@ import type { RuntimeDeps } from './runtime'
 import type { LoopManifest } from './manifest'
 import { wireGatedAct } from './gate'
 import { makeOutreachReason, makeOutreachObserveKpi } from './outreach'
+import { makeCroReason, makeCroObserveKpi } from './cro'
 import {
   getLoopControl,
   clearLoopControl,
@@ -32,6 +33,35 @@ import type { LoopControlRow } from './decisions'
 
 /** Max loops driven per cron tick. Large tenants rotate across ticks (oldest-first via listLoops order). */
 export const MAX_LOOPS_PER_TICK = 25
+
+/** The runtime seams a loop's CONFIG supplies (reason + KPI). queueGatedAct is config-agnostic. */
+export interface LoopConfig {
+  reason: NonNullable<RuntimeDeps['reason']>
+  observeKpi: NonNullable<RuntimeDeps['observeKpi']>
+}
+
+/** Factory per loop kind. Injectable so the routing is unit-tested without invoking a model. */
+export interface LoopConfigFactories {
+  outreach: () => LoopConfig
+  cro: () => LoopConfig
+}
+
+const DEFAULT_LOOP_CONFIG_FACTORIES: LoopConfigFactories = {
+  outreach: () => ({ reason: makeOutreachReason(), observeKpi: makeOutreachObserveKpi() }),
+  cro: () => ({ reason: makeCroReason(), observeKpi: makeCroObserveKpi() }),
+}
+
+/**
+ * loopRuntimeConfig — pick the reason + KPI seams for a loop by its `kind`. An absent
+ * kind resolves to 'outreach' (back-compat). This is the ONLY place the driver branches
+ * on config, so a new loop kind is added by extending the factory map + the LoopKind enum.
+ */
+export function loopRuntimeConfig(
+  loop: LoopManifest,
+  factories: LoopConfigFactories = DEFAULT_LOOP_CONFIG_FACTORIES,
+): LoopConfig {
+  return loop.kind === 'cro' ? factories.cro() : factories.outreach()
+}
 
 export interface LoopsTickResult {
   ok: boolean
@@ -94,17 +124,6 @@ export async function runLoopsTick(env: Env, deps: DriverDeps = {}): Promise<Loo
   // the tick-relative sequence is sufficient for the feed UI.
   const cycleCounts = new Map<string, number>()
 
-  // Production runtime seams: gated acts → verdict/approvals (wireGatedAct); the outreach
-  // reasoner drafts to queued prospects (consuming each = dedup); the KPI is positive
-  // replies. These are the first loop CONFIG; non-outreach loops simply propose nothing
-  // (items without an email are skipped). A caller's runtimeDeps override any of these.
-  const baseRuntimeDeps: RuntimeDeps = {
-    queueGatedAct: wireGatedAct,
-    reason: makeOutreachReason(),
-    observeKpi: makeOutreachObserveKpi(),
-    ...deps.runtimeDeps,
-  }
-
   for (const loop of batch) {
     try {
       // ── loop_control check (AC#6) ────────────────────────────────────────
@@ -153,10 +172,20 @@ export async function runLoopsTick(env: Env, deps: DriverDeps = {}): Promise<Loo
         // control check is best-effort; never abort the cycle
       }
 
-      // Thread the cycle number into the runtime deps so appendDecision gets it.
+      // Select the loop's CONFIG (reason + KPI) by its kind; queueGatedAct is config-
+      // agnostic (gated acts → /approvals via wireGatedAct). A caller's deps.runtimeDeps
+      // overrides any seam; cycleNum is driver-forced (applied last) so appendDecision
+      // gets the right number. Selection uses controlledLoop so a per-cycle patch is honored.
+      const cfg = loopRuntimeConfig(controlledLoop)
       const cycleNum = (cycleCounts.get(loop.id) ?? 0) + 1
       cycleCounts.set(loop.id, cycleNum)
-      const runtimeDeps: RuntimeDeps = { ...baseRuntimeDeps, cycleNum }
+      const runtimeDeps: RuntimeDeps = {
+        queueGatedAct: wireGatedAct,
+        reason: cfg.reason,
+        observeKpi: cfg.observeKpi,
+        ...deps.runtimeDeps,
+        cycleNum,
+      }
 
       const r = await runCycle(env, controlledLoop, runtimeDeps)
       ran++

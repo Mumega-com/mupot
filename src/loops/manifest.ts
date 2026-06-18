@@ -23,13 +23,20 @@ import { isEffort, isBudgetWindow } from '../types'
 export type LoopStatus = 'active' | 'paused' | 'done' | 'killed'
 export type ResourceKind = 'mcp' | 'queue' | 'memory'
 export type GateTimeout = 'pause' | 'reject'
+// The loop's CONFIG: which reason + KPI seams the driver runs for it. Absent on a
+// stored spec ⇒ 'outreach' (back-compat: the first config; every pre-S5 loop is one).
+export type LoopKind = 'outreach' | 'cro'
 
 const LOOP_STATUSES: readonly LoopStatus[] = ['active', 'paused', 'done', 'killed']
 const RESOURCE_KINDS: readonly ResourceKind[] = ['mcp', 'queue', 'memory']
 const GATE_TIMEOUTS: readonly GateTimeout[] = ['pause', 'reject']
+const LOOP_KINDS: readonly LoopKind[] = ['outreach', 'cro']
 
 export function isLoopStatus(v: unknown): v is LoopStatus {
   return typeof v === 'string' && (LOOP_STATUSES as readonly string[]).includes(v)
+}
+export function isLoopKind(v: unknown): v is LoopKind {
+  return typeof v === 'string' && (LOOP_KINDS as readonly string[]).includes(v)
 }
 export function isResourceKind(v: unknown): v is ResourceKind {
   return typeof v === 'string' && (RESOURCE_KINDS as readonly string[]).includes(v)
@@ -87,6 +94,10 @@ export interface LoopStop {
 
 /** The writable subset of a loop (what a caller declares). */
 export interface LoopSpec {
+  // Which config (reason+KPI) the driver runs. OPTIONAL + additive: absent ⇒ the driver
+  // treats it as 'outreach', and the validated shape omits the key entirely (a pre-S5 v1
+  // manifest round-trips byte-identical). Only an explicit kind (e.g. 'cro') carries it.
+  kind?: LoopKind
   squad_id: string | null
   agent_id: string | null
   okr: string
@@ -285,6 +296,14 @@ function validateStop(input: unknown): Validate<LoopStop> {
 export function validateLoopSpec(input: unknown): Validate<LoopSpec> {
   if (!isPlainObject(input)) return { ok: false, error: 'spec_not_object' }
 
+  // kind: absent ⇒ omitted (the driver defaults to 'outreach'). Present ⇒ must be a
+  // known LoopKind. Kept out of the output when absent so the v1 shape is unchanged.
+  let kind: LoopKind | undefined
+  if (input.kind !== undefined) {
+    if (!isLoopKind(input.kind)) return { ok: false, error: 'invalid_loop_kind' }
+    kind = input.kind
+  }
+
   const squad_id = input.squad_id === undefined ? null : input.squad_id
   const agent_id = input.agent_id === undefined ? null : input.agent_id
   if (squad_id !== null && typeof squad_id !== 'string') return { ok: false, error: 'invalid_squad_id' }
@@ -321,21 +340,22 @@ export function validateLoopSpec(input: unknown): Validate<LoopSpec> {
     return { ok: false, error: 'channel_loop_must_be_gated' }
   }
 
-  return {
-    ok: true,
-    value: {
-      squad_id: squad_id as string | null,
-      agent_id: agent_id as string | null,
-      okr: input.okr,
-      kpi: kpi.value,
-      sources: sources.value,
-      channels: channels.value,
-      gate: gate.value,
-      budget: budget.value,
-      cadence: cadence.value,
-      stop: stop.value,
-    },
+  const value: LoopSpec = {
+    squad_id: squad_id as string | null,
+    agent_id: agent_id as string | null,
+    okr: input.okr,
+    kpi: kpi.value,
+    sources: sources.value,
+    channels: channels.value,
+    gate: gate.value,
+    budget: budget.value,
+    cadence: cadence.value,
+    stop: stop.value,
   }
+  // Additive: only attach `kind` when explicitly provided, so a v1 manifest's validated
+  // shape is unchanged (the frozen contract pins the no-kind key set).
+  if (kind !== undefined) value.kind = kind
+  return { ok: true, value }
 }
 
 function validateRefList(input: unknown, label: string): Validate<ResourceRef[]> {
