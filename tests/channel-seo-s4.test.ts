@@ -9,9 +9,11 @@
 //   5. gate.propose: undeclared work-type still rejects (work_type_not_declared regression).
 //   6. requiredCapability: executable work-type requires its cap (member denied, lead allowed).
 //   7. WARN-S4-1 fix: invalid requiredCapability string → throws capability_invalid (fail closed).
-//   8. Config authority-safety: mutating configSchema._def internals cannot change the selected executor.
+//   8. Content-bound execute: action/payload/executor come from the STORED record — caller cannot
+//      substitute them. Substitution tests now assert the swap is impossible / rejected.
 //   9. Executor adapters are stubs — no fetch/creds; inkwell-content and mcpwp both return not_wired.
-//  10. Arms-never-write: NO path executes without an approval record — ever.
+//  10. Arms-never-write: NO path executes without an approval record — ever. Cross-tenant/dept also
+//      rejected. Self-approve: ctx has NO method that can approve its own proposal.
 //  11. S3 regression: proposesOnly invariant still holds for all 4 original seo work-types.
 //  12. S3 regression: channel/dept/growth/pulse conformance green.
 //  13. tsc clean (verified by CI — this file is just the runtime proof).
@@ -27,9 +29,9 @@ import {
   ChannelComposeError,
 } from '../src/departments/channels/compose'
 import type { ChannelDescriptor } from '../src/departments/channels/contract'
-import { kernelMintCtx } from '../src/departments/registry'
+import { kernelMintCtx, _kernelApproveForTest } from '../src/departments/kernel'
 import { CtxError } from '../src/departments/ctx'
-import type { DepartmentCtx, ApprovedWorkItem } from '../src/departments/ctx'
+import type { DepartmentCtx } from '../src/departments/ctx'
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -73,11 +75,14 @@ function mintCtx(caps: ('observer' | 'member' | 'lead' | 'admin' | 'owner')[] = 
   })
 }
 
-/** Access the test-harness _recordApproval seam on a ctx. */
+/**
+ * Test-harness approval seam (BLOCK-1 fix).
+ * Uses _kernelApproveForTest — NOT a property on the ctx object.
+ * Any attempt to reach approval via `(ctx as any)._recordApproval` or
+ * `(ctx as any)._approveRecord` will fail: those properties do not exist on ctx.
+ */
 function recordApproval(ctx: DepartmentCtx, gateId: string): void {
-  // Cast through unknown — this seam is intentionally NOT on the public interface.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  ;(ctx as any)._recordApproval(gateId)
+  _kernelApproveForTest(ctx, gateId)
 }
 
 // ── 1. executor.execute with NO approval record → throws not_approved ─────────
@@ -85,18 +90,14 @@ function recordApproval(ctx: DepartmentCtx, gateId: string): void {
 describe('1. executor.execute — fail-closed: no approval record → not_approved', () => {
   it('execute without any prior approve → throws CtxError not_approved', async () => {
     const ctx = mintCtx(['lead'])
-    const work: ApprovedWorkItem = {
-      gateId: 'gate-never-approved',
-      action: 'seo-meta-fix',
-    }
-    await expect(ctx.executor.execute(work)).rejects.toThrow(/not_approved/)
+    await expect(ctx.executor.execute('gate-never-approved')).rejects.toThrow(/not_approved/)
   })
 
   it('error is a CtxError instance', async () => {
     const ctx = mintCtx(['lead'])
     let caught: unknown
     try {
-      await ctx.executor.execute({ gateId: 'no-record', action: 'seo-meta-fix' })
+      await ctx.executor.execute('no-record')
     } catch (e) {
       caught = e
     }
@@ -107,7 +108,7 @@ describe('1. executor.execute — fail-closed: no approval record → not_approv
   it('fabricated gateId (random UUID) that was never proposed → not_approved', async () => {
     const ctx = mintCtx(['lead'])
     await expect(
-      ctx.executor.execute({ gateId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', action: 'seo-meta-fix' })
+      ctx.executor.execute('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')
     ).rejects.toThrow(/not_approved/)
   })
 
@@ -115,19 +116,15 @@ describe('1. executor.execute — fail-closed: no approval record → not_approv
     // Propose creates a gated record (gateId). Execute before approving → rejected.
     const ctx = mintCtx(['lead'])
     const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: {} })
-    // No _recordApproval called here.
-    await expect(
-      ctx.executor.execute({ gateId, action: 'seo-meta-fix' })
-    ).rejects.toThrow(/not_approved/)
+    // No recordApproval called here.
+    await expect(ctx.executor.execute(gateId)).rejects.toThrow(/not_approved/)
   })
 
   it('observer cap (below member floor) → capability_denied before approval check', async () => {
     // execute() checks capability (member floor) before the approval record.
     // observer < member → capability_denied. This proves the cap check runs first.
     const ctx = mintCtx(['observer'])
-    await expect(
-      ctx.executor.execute({ gateId: 'any-id', action: 'seo-meta-fix' })
-    ).rejects.toThrow(/capability_denied/)
+    await expect(ctx.executor.execute('any-id')).rejects.toThrow(/capability_denied/)
   })
 })
 
@@ -142,11 +139,8 @@ describe('2. executor.execute — with approval: dispatches to stub (executed=fa
     })
     recordApproval(ctx, gateId)
 
-    const outcome = await ctx.executor.execute({
-      gateId,
-      action: 'seo-meta-fix',
-      payload: { executor: 'inkwell-content' },
-    })
+    // execute takes ONLY gateId — adapter is read from the STORED record payload.
+    const outcome = await ctx.executor.execute(gateId)
     expect(outcome.executed).toBe(false)
     expect(outcome.reason).toBe('executor_not_wired')
     expect(outcome.adapter).toBe('inkwell-content')
@@ -160,28 +154,24 @@ describe('2. executor.execute — with approval: dispatches to stub (executed=fa
     })
     recordApproval(ctx, gateId)
 
-    const outcome = await ctx.executor.execute({
-      gateId,
-      action: 'seo-internal-links',
-      payload: { executor: 'mcpwp' },
-    })
+    const outcome = await ctx.executor.execute(gateId)
     expect(outcome.executed).toBe(false)
     expect(outcome.reason).toBe('executor_not_wired')
     expect(outcome.adapter).toBe('mcpwp')
   })
 
-  it('unknown executor hint: executed=false, adapter=unknown', async () => {
+  it('unknown executor hint (no executor in payload): executed=false, adapter=unknown', async () => {
     const ctx = mintCtx(['lead'])
     const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: {} })
     recordApproval(ctx, gateId)
 
-    const outcome = await ctx.executor.execute({ gateId, action: 'seo-meta-fix', payload: {} })
+    const outcome = await ctx.executor.execute(gateId)
     expect(outcome.executed).toBe(false)
     expect(outcome.reason).toBe('executor_not_wired')
   })
 
   it('approval is per-ctx: approving on ctx-A does not unlock ctx-B', async () => {
-    // Two independently minted ctxs have independent closure-private approval stores.
+    // Two independently minted ctxs have independent closure-private pending stores.
     const ctxA = mintCtx(['lead'])
     const ctxB = mintCtx(['lead'])
 
@@ -190,14 +180,12 @@ describe('2. executor.execute — with approval: dispatches to stub (executed=fa
     recordApproval(ctxA, gateId)
 
     // ctxA can execute.
-    const outcomeA = await ctxA.executor.execute({ gateId, action: 'seo-meta-fix' })
+    const outcomeA = await ctxA.executor.execute(gateId)
     expect(outcomeA.executed).toBe(false)
     expect(outcomeA.reason).toBe('executor_not_wired')
 
-    // ctxB cannot — different approval store.
-    await expect(
-      ctxB.executor.execute({ gateId, action: 'seo-meta-fix' })
-    ).rejects.toThrow(/not_approved/)
+    // ctxB cannot — different pending store (the gateId was never proposed in ctxB).
+    await expect(ctxB.executor.execute(gateId)).rejects.toThrow(/not_approved/)
   })
 
   it('returning false from execute does NOT mean the operation ran — no external writes', () => {
@@ -233,9 +221,7 @@ describe('3. gate.propose — executable work-type creates gated record (not rej
     const ctx = mintCtx(['lead'])
     const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: {} })
 
-    await expect(
-      ctx.executor.execute({ gateId, action: 'seo-meta-fix' })
-    ).rejects.toThrow(/not_approved/)
+    await expect(ctx.executor.execute(gateId)).rejects.toThrow(/not_approved/)
   })
 
   it('two consecutive proposes on the same work-type produce distinct gateIds', async () => {
@@ -493,11 +479,15 @@ describe('8. Config authority-safety — mutating configSchema._def cannot chang
     expect(result.success).toBe(false)
   })
 
-  it('executor.execute reads executor from payload (re-parsed at call time) — not from schema', async () => {
-    // This test proves the authority-safety mechanism: the executor hint comes from
-    // approvedWork.payload, provided at execute() call time by the authorized caller,
-    // not from reading frozen schema internals. Even if schema._def were corrupted,
-    // the executor choice comes from the payload string re-read at runtime.
+  it('BLOCK-2 (content-bound): executor swap is impossible — execute(gateId) uses STORED record', async () => {
+    // BLOCK-2 fix: execute() takes only gateId. The action, payload, and executor hint
+    // come from the stored pending record created at gate.propose() time. A caller
+    // cannot supply a different action/payload/executor at execute time — there is no
+    // parameter for it. The API structurally prevents substitution.
+    //
+    // Proposed with inkwell-content → stored record has executor=inkwell-content.
+    // execute(gateId) reads the stored record → dispatches inkwell-content.
+    // No mechanism exists to override to mcpwp at execute time.
     const ctx = mintCtx(['lead'])
     const { gateId } = await ctx.gate.propose({
       action: 'seo-meta-fix',
@@ -505,15 +495,28 @@ describe('8. Config authority-safety — mutating configSchema._def cannot chang
     })
     recordApproval(ctx, gateId)
 
-    // Execute with mcpwp in payload — dispatch goes to mcpwp adapter, not inkwell-content.
-    const outcome = await ctx.executor.execute({
-      gateId,
-      action: 'seo-meta-fix',
-      payload: { executor: 'mcpwp' }, // differs from propose payload — executor reads this
-    })
-    expect(outcome.adapter).toBe('mcpwp')
+    // execute() takes only gateId — dispatch comes from the stored record.
+    const outcome = await ctx.executor.execute(gateId)
+    // Stored record has executor=inkwell-content → adapter=inkwell-content (not mcpwp).
+    expect(outcome.adapter).toBe('inkwell-content')
     expect(outcome.executed).toBe(false)
     expect(outcome.reason).toBe('executor_not_wired')
+  })
+
+  it('BLOCK-2 (content-bound): approve seo-meta-fix, attempt mcpwp — stored record wins', async () => {
+    // Confirm the stored record's executor (inkwell-content) is used, not mcpwp.
+    // This is the same scenario as above but stated as: "the approved record wins."
+    const ctx = mintCtx(['lead'])
+    const { gateId } = await ctx.gate.propose({
+      action: 'seo-meta-fix',
+      payload: { executor: 'inkwell-content' },
+    })
+    recordApproval(ctx, gateId)
+
+    // The only parameter is gateId — the caller has no way to say "use mcpwp instead."
+    // The stored executor hint is 'inkwell-content', so that is what executes.
+    const outcome = await ctx.executor.execute(gateId)
+    expect(outcome.adapter).toBe('inkwell-content')
   })
 })
 
@@ -525,7 +528,7 @@ describe('9. Executor adapters are stubs — no external writes (no fetch/creds)
     const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: { executor: 'inkwell-content' } })
     recordApproval(ctx, gateId)
 
-    const out = await ctx.executor.execute({ gateId, action: 'seo-meta-fix', payload: { executor: 'inkwell-content' } })
+    const out = await ctx.executor.execute(gateId)
     expect(out.executed).toBe(false)
     expect(out.reason).toBe('executor_not_wired')
     expect(out.adapter).toBe('inkwell-content')
@@ -536,7 +539,7 @@ describe('9. Executor adapters are stubs — no external writes (no fetch/creds)
     const { gateId } = await ctx.gate.propose({ action: 'seo-internal-links', payload: { executor: 'mcpwp' } })
     recordApproval(ctx, gateId)
 
-    const out = await ctx.executor.execute({ gateId, action: 'seo-internal-links', payload: { executor: 'mcpwp' } })
+    const out = await ctx.executor.execute(gateId)
     expect(out.executed).toBe(false)
     expect(out.reason).toBe('executor_not_wired')
     expect(out.adapter).toBe('mcpwp')
@@ -562,36 +565,84 @@ describe('9. Executor adapters are stubs — no external writes (no fetch/creds)
 // ── 10. Arms-never-write: NO path executes without approval — exhaustive cases ─
 
 describe('10. Arms-never-write — NO path executes without a human approval record', () => {
-  it('random gateId → not_approved', async () => {
+  it('random gateId (never proposed) → not_approved', async () => {
     const ctx = mintCtx(['lead'])
-    await expect(ctx.executor.execute({ gateId: 'x'.repeat(36), action: 'seo-meta-fix' }))
-      .rejects.toThrow(/not_approved/)
+    await expect(ctx.executor.execute('x'.repeat(36))).rejects.toThrow(/not_approved/)
   })
 
   it('empty gateId → not_approved', async () => {
     const ctx = mintCtx(['lead'])
-    await expect(ctx.executor.execute({ gateId: '', action: 'seo-meta-fix' }))
-      .rejects.toThrow(/not_approved/)
+    await expect(ctx.executor.execute('')).rejects.toThrow(/not_approved/)
   })
 
-  it('gateId from a different action propose → not_approved before dispatch', async () => {
-    // Propose seo-meta-fix, try to execute seo-internal-links with that gateId.
-    // The approval record only exists for the seo-meta-fix gateId.
+  it('BLOCK-2 (flipped): approve seo-meta-fix gateId → execute dispatches seo-meta-fix (not substituted)', async () => {
+    // OLD test (BLOCK-2 vulnerable): approved gateId for seo-meta-fix could be "executed" with
+    // action=seo-internal-links because execute() trusted the caller's action param.
+    // NEW behaviour: execute(gateId) takes only gateId. There is no "action" parameter.
+    // The stored record's action (seo-meta-fix) is what executes — substitution is impossible.
     const ctx = mintCtx(['lead'])
     const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: {} })
     recordApproval(ctx, gateId)
 
-    // Execute with same gateId but different action — the approval check keys on gateId only.
-    // Even with approved gateId, dispatch goes through for any action (the auth
-    // check is on the gateId record, not action-specific at S4 stub level).
-    const out = await ctx.executor.execute({ gateId, action: 'seo-internal-links' })
+    // execute(gateId) — no action param. The stored action (seo-meta-fix) is used.
+    const out = await ctx.executor.execute(gateId)
     expect(out.executed).toBe(false)
+    // The stored record had no executor hint → adapter=unknown (not seo-internal-links dispatch).
   })
 
   it('a ctx with only observer cap cannot execute (capability floor enforced before approval check)', async () => {
     const ctx = mintCtx(['observer'])
-    await expect(ctx.executor.execute({ gateId: 'any', action: 'seo-meta-fix' }))
-      .rejects.toThrow(/capability_denied/)
+    await expect(ctx.executor.execute('any')).rejects.toThrow(/capability_denied/)
+  })
+
+  it('BLOCK-1 (self-approve impossible): ctx has NO method that can approve a proposal', async () => {
+    // A hostile ctx-holder using (ctx as any) finds no approval method.
+    // _recordApproval and _approveRecord do NOT exist on the ctx object.
+    const ctx = mintCtx(['lead'])
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((ctx as any)._recordApproval).toBeUndefined()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((ctx as any)._approveRecord).toBeUndefined()
+
+    // Even with a proposed gateId and a hostile as-any cast, no approval is possible.
+    const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: {} })
+    // Any attempt via as-any to "self-approve" fails — no such property exists.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(typeof (ctx as any)._recordApproval).toBe('undefined')
+    // Without a real approval, execute must still reject.
+    await expect(ctx.executor.execute(gateId)).rejects.toThrow(/not_approved/)
+  })
+
+  it('BLOCK-2 (cross-tenant): approval bound to tenantId — different tenant ctx cannot execute', async () => {
+    // Propose in tenant=mumega, try to execute via a ctx minted for tenant=other-tenant.
+    // Both ctxs are independent (different closure stores). The gateId proposed in ctxA
+    // was never proposed in ctxB → not in ctxB's pending store → not_approved.
+    const { db } = makeStubDb()
+    const ctxA = kernelMintCtx({ db }, {
+      tenantId: 'tenant-a',
+      departmentKey: 'growth',
+      module: GrowthModule,
+      capabilities: ['lead'],
+      now: () => NOW,
+      idGen: makeId,
+    })
+    const ctxB = kernelMintCtx({ db }, {
+      tenantId: 'tenant-b',
+      departmentKey: 'growth',
+      module: GrowthModule,
+      capabilities: ['lead'],
+      now: () => NOW,
+      idGen: makeId,
+    })
+
+    const { gateId } = await ctxA.gate.propose({ action: 'seo-meta-fix', payload: {} })
+    recordApproval(ctxA, gateId)
+
+    // ctxA can execute its own approved record.
+    await expect(ctxA.executor.execute(gateId)).resolves.toMatchObject({ executed: false })
+
+    // ctxB cannot — the gateId was proposed+approved in ctxA's store, not ctxB's.
+    await expect(ctxB.executor.execute(gateId)).rejects.toThrow(/not_approved/)
   })
 })
 

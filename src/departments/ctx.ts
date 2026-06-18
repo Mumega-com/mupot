@@ -149,6 +149,13 @@ export interface BusPort {
 // execute() is fail-closed: it REQUIRES a real approval record for the work item
 // before dispatching to any adapter. No approval → throws CtxError('not_approved').
 //
+// CONTENT-BOUND EXECUTION (BLOCK-2 fix, 2026-06-18):
+//   execute() takes ONLY a gateId (not a caller-supplied action/payload). The
+//   kernel looks up the stored pending record (created by gate.propose) and dispatches
+//   using ONLY the stored action + payload from that record. The caller cannot
+//   substitute action, payload, or executor — those come from the approved record.
+//   This closes the approve-A/execute-B substitution attack.
+//
 // Adapters are STUBBED at S4 — each returns
 //   { executed: false, reason: 'executor_not_wired' }
 // with NO external writes, NO fetch, NO credentials. The port + the dispatch +
@@ -164,15 +171,6 @@ export interface BusPort {
 //   The fail-closed check here (real approval required) always holds — the S-loop
 //   adapter must produce a real record, not a bypass.
 
-export interface ApprovedWorkItem {
-  /** The gate record id returned by gate.propose() for this piece of work. */
-  gateId: string
-  /** The work-type action key (must match the gated record). */
-  action: string
-  /** The original proposal payload. */
-  payload?: unknown
-}
-
 export interface ExecuteOutcome {
   /** Always false at S4 — real adapters are not wired yet. */
   executed: boolean
@@ -184,16 +182,22 @@ export interface ExecuteOutcome {
 
 export interface ExecutorPort {
   /**
-   * Execute an approved piece of work, dispatching to the pot's configured adapter.
+   * Execute an approved piece of work identified by gateId, dispatching to the
+   * pot's configured adapter using ONLY the stored record (not caller-supplied payload).
    *
-   * FAIL-CLOSED: throws CtxError('not_approved') if no real approval record
-   * exists for this gateId. A gated record that has not been approved by a human
-   * via the /approvals gate MUST NOT execute — ever.
+   * FAIL-CLOSED: throws CtxError('not_approved') if:
+   *   - no pending record exists for this gateId (never proposed), OR
+   *   - the record has not been approved, OR
+   *   - the record's tenantId / departmentKey do not match this ctx's bindings
+   *     (cross-tenant or cross-department execution is rejected as not_approved).
    *
-   * @param approvedWork - The approved work item (gateId + action + payload).
+   * CONTENT-BOUND: the action and payload dispatched come from the stored pending
+   * record created at gate.propose() time — the caller cannot substitute them.
+   *
+   * @param gateId - The gate record id returned by gate.propose().
    * @returns ExecuteOutcome — at S4 always { executed: false, reason: 'executor_not_wired' }.
    */
-  execute(approvedWork: ApprovedWorkItem): Promise<ExecuteOutcome>
+  execute(gateId: string): Promise<ExecuteOutcome>
 }
 
 // ── CtxError ─────────────────────────────────────────────────────────────────

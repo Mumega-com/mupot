@@ -47,7 +47,6 @@ import type {
   GatePort,
   BusPort,
   ExecutorPort,
-  ApprovedWorkItem,
   ExecuteOutcome,
 } from './ctx'
 import { composeDeptMetricDescriptors, deepFreezeChannels, getChannelWorkTypes } from './channels/compose'
@@ -77,6 +76,35 @@ const RANK: Record<Capability, number> = {
   admin: 4,
   owner: 5,
 }
+
+// ── PendingRecord (module-private) ───────────────────────────────────────────
+//
+// The full content of a gated work proposal, stored by gate.propose() and looked
+// up by executor.execute(). Keyed by gateId in the closure-private _pendingStore.
+//
+// BLOCK-2 fix (2026-06-18): execute() reads ONLY from the stored record — the
+// caller supplies only a gateId; action/payload/tenantId/departmentKey are taken
+// from this record, never from the caller.
+interface PendingRecord {
+  gateId: string
+  action: string
+  payload: unknown
+  tenantId: string
+  departmentKey: string
+  approved: boolean
+}
+
+// ── _testApproveSeams (module-private WeakMap) ────────────────────────────────
+//
+// BLOCK-1 fix (2026-06-18): _recordApproval is NOT a property on the ctx object.
+// The approval-writer is closure-private. The test seam is exposed only through
+// _kernelApproveForTest (exported below) which reads this WeakMap.
+//
+// The WeakMap key is the DepartmentCtx reference (object identity). The value
+// is a function that marks a pending record approved in the closure-private store.
+// Because DepartmentCtx is frozen before being returned, the WeakMap is the only
+// path to reach the writer — it is not on the ctx, not reachable via `as any`.
+const _testApproveSeams = new WeakMap<DepartmentCtx, (gateId: string) => void>()
 
 // ── isCapability (WARN-S4-1 fix) ─────────────────────────────────────────────
 //
@@ -374,14 +402,24 @@ function _mintCtxInternal(
         }
       }
 
-      // ── Record gated work (stub — S4 writes the gateId as a deterministic key) ──
+      // ── Record gated work (BLOCK-2 fix: store full record keyed by gateId) ──
+      //
+      // The full pending record is stored in the closure-private _pendingStore.
+      // executor.execute() will look up this record by gateId and dispatch using
+      // ONLY the stored action + payload — not caller-supplied values.
       //
       // TODO(full-impl): write to a gated_work_items table with:
       //   { id: gateId, tenant_id, department_key, action, payload, status: 'pending', created_at }
-      // For now the gateId is returned as a deterministic stub value that the
-      // approval stub store in executor.execute() can match.
-      void proposal
       const gateId = idFn()
+      const pendingRecord: PendingRecord = {
+        gateId,
+        action: proposal.action,
+        payload: proposal.payload,
+        tenantId,
+        departmentKey,
+        approved: false,
+      }
+      _pendingStore.set(gateId, pendingRecord)
       return { gateId }
     },
   })
@@ -405,39 +443,43 @@ function _mintCtxInternal(
   // S4: the gated-ACT port. CLOSURE-PRIVATE — not exposed to channels, not
   // obtained from any other path. Only the kernel mints it here.
   //
-  // APPROVAL STORE: a closure-private Map<gateId, boolean> tracks which gateIds
-  // have been approved. In production this will query the task_verdicts table
-  // (status='approved' verdict on the gated record). At S4 (stub), the store
-  // is seeded by recordApproval() — called only from tests and from a future
-  // approval-write path — so real production code has no way to auto-approve.
+  // PENDING STORE: a closure-private Map<gateId, PendingRecord> stores the full
+  // record created by gate.propose(). The record holds action, payload, tenantId,
+  // departmentKey, and approved:boolean. gate.propose() inserts with approved=false.
   //
-  // FAIL-CLOSED: execute() checks the approval store FIRST. No approval record
-  // → throw CtxError('not_approved'). Dispatch to an adapter only after approval.
+  // APPROVAL: approved is flipped to true ONLY by the _testApproveSeams write-path
+  // (test seam, see below) or, in full-impl, by the /approvals Gate endpoint writing
+  // a task_verdicts row. The ctx object has NO method that can approve a record.
+  // A ctx-holder using `(ctx as any)` finds NO approval method — it is not there.
+  //
+  // FAIL-CLOSED + CONTENT-BOUND (BLOCK-1 + BLOCK-2 fix, 2026-06-18):
+  //   execute(gateId):
+  //     1. Check capability (member floor).
+  //     2. Look up gateId in _pendingStore → not found: throw not_approved.
+  //     3. Check record.approved → false: throw not_approved.
+  //     4. Check record.tenantId === tenantId AND record.departmentKey === departmentKey
+  //        → mismatch: throw not_approved (cross-tenant / cross-dept rejected).
+  //     5. Dispatch using record.action and record.payload — NOT caller-supplied values.
   //
   // STUB ADAPTERS: both 'inkwell-content' and 'mcpwp' adapters return
   //   { executed: false, reason: 'executor_not_wired' }
   // with no fetch, no external write, no credentials. The PORT + the dispatch
   // routing + the fail-closed authority check is the S4 deliverable.
-  //
-  // CONFIG AUTHORITY-SAFETY (Opus Low fix):
-  //   The executor adapter choice reads from the pot's SeoChannelConfig.executor.
-  //   Rather than trusting a frozen-in-place configSchema object (whose ._def may be
-  //   mutated by Zod internal churn), we accept the executor value as a re-parsed
-  //   string literal at call time — the caller supplies it or it defaults to 'unknown'.
-  //   This means a mutated schema.internal cannot change which adapter executes.
 
-  // Closure-private approval store.
-  const _approvalStore = new Map<string, true>()
+  // Closure-private pending store (stores proposal records; approved field tracks gate).
+  const _pendingStore = new Map<string, PendingRecord>()
 
-  // recordApproval is NOT on the ExecutorPort interface — it is the test/write-path
-  // seam that the full-impl will replace with a DB query. Exposed only for tests
-  // via the _approvalStoreForTest export on the ctx object (see below).
-  function _recordApproval(gateId: string): void {
-    _approvalStore.set(gateId, true)
+  // _approveRecord is closure-private and NOT placed on the ctx object.
+  // It is exposed ONLY via _testApproveSeams (a module-level WeakMap) so that
+  // _kernelApproveForTest (exported below) can reach it by ctx identity.
+  // Nothing reachable via `(ctx as any)` can call this function.
+  function _approveRecord(gateId: string): void {
+    const rec = _pendingStore.get(gateId)
+    if (rec) rec.approved = true
   }
 
   const executor: ExecutorPort = Object.freeze({
-    async execute(approvedWork: ApprovedWorkItem): Promise<ExecuteOutcome> {
+    async execute(gateId: string): Promise<ExecuteOutcome> {
       if (!hasCapability(_capSet, 'member')) {
         throw new CtxError(
           'capability_denied',
@@ -445,38 +487,53 @@ function _mintCtxInternal(
         )
       }
 
-      // ── FAIL-CLOSED: require a real approval record ───────────────────────
+      // ── FAIL-CLOSED + CONTENT-BOUND ──────────────────────────────────────
       //
-      // Arms never write un-gated. No approval record in the store → reject
-      // immediately. In full-impl this will be: query task_verdicts WHERE
-      // task_id = gateId AND verdict = 'approved'. At S4 it checks the
-      // closure-private _approvalStore. The behaviour is identical — no record,
-      // no execute. EVER.
-      if (!_approvalStore.has(approvedWork.gateId)) {
+      // Look up the pending record. No record → never proposed → reject.
+      // Record not approved → human approval not received → reject.
+      // Record tenantId/departmentKey mismatch → cross-tenant/dept → reject.
+      // In full-impl: query task_verdicts WHERE task_id=gateId AND verdict='approved'
+      // AND tenant_id=tenantId AND department_key=departmentKey. At S4 the
+      // _pendingStore is the equivalent — same semantics, no DB.
+      const record = _pendingStore.get(gateId)
+      if (!record || !record.approved) {
         throw new CtxError(
           'not_approved',
-          `ctx(${departmentKey}@${tenantId}): gateId '${approvedWork.gateId}' has no approval record — execute requires a human-approved verdict. Propose first (gate.propose), approve via /approvals, then execute.`,
+          `ctx(${departmentKey}@${tenantId}): gateId '${gateId}' has no approval record — execute requires a human-approved verdict. Propose first (gate.propose), approve via /approvals, then execute.`,
+        )
+      }
+
+      // ── Cross-tenant / cross-department binding check ─────────────────────
+      //
+      // The stored record carries the tenantId + departmentKey from the ctx that
+      // called gate.propose(). A different ctx (different tenant or department)
+      // that somehow holds the same gateId cannot execute it — the bindings must
+      // match. This closes the cross-tenant substitution attack.
+      if (record.tenantId !== tenantId || record.departmentKey !== departmentKey) {
+        throw new CtxError(
+          'not_approved',
+          `ctx(${departmentKey}@${tenantId}): gateId '${gateId}' was proposed in a different tenant/department — cross-tenant/dept execute rejected.`,
         )
       }
 
       // ── Dispatch to the (stubbed) adapter ────────────────────────────────
       //
-      // CONFIG AUTHORITY-SAFETY: the executor type is passed explicitly as part
-      // of approvedWork.payload (or could come from re-parsed channel config).
-      // We read it from payload only as a display hint — the actual dispatch
-      // below covers all valid values; unknown values are caught by the default
-      // branch without any authority escape.
+      // CONTENT-BOUND (BLOCK-2 fix): executor hint comes from the STORED record's
+      // payload — NOT from any caller-supplied value. The caller passed only gateId.
+      // This means approve-A/execute-B-payload substitution is structurally impossible:
+      // the caller has no parameter to substitute.
       //
       // At S4 every adapter returns { executed: false, reason: 'executor_not_wired' }.
       // No fetch, no external write, no credentials in any branch.
+      const storedPayload = record.payload
       const executorHint = (() => {
         if (
-          approvedWork.payload !== null &&
-          approvedWork.payload !== undefined &&
-          typeof approvedWork.payload === 'object' &&
-          'executor' in (approvedWork.payload as object)
+          storedPayload !== null &&
+          storedPayload !== undefined &&
+          typeof storedPayload === 'object' &&
+          'executor' in (storedPayload as object)
         ) {
-          return (approvedWork.payload as Record<string, unknown>)['executor']
+          return (storedPayload as Record<string, unknown>)['executor']
         }
         return undefined
       })()
@@ -525,18 +582,21 @@ function _mintCtxInternal(
     [..._metricsMap.values()],
   )
 
-  // ── Test-harness seam ─────────────────────────────────────────────────────
+  // ── Ctx build + test-seam registration (BLOCK-1 fix) ─────────────────────
   //
-  // _recordApproval seeds the closure-private approval store. NOT on the
-  // DepartmentCtx interface — production code cannot call it through the typed
-  // interface. Tests cast to `unknown` first to access it.
+  // _approveRecord is NOT placed on the ctx object. A hostile ctx-holder using
+  // `(ctx as any)` will find NO approval method — it is simply not there.
   //
-  // Built into the object literal BEFORE Object.freeze so the property is
-  // own-settable (frozen objects reject new properties via [[DefineOwnProperty]]).
+  // The test seam is the module-level WeakMap _testApproveSeams, populated here
+  // BEFORE freeze. The frozen ctx is the WeakMap key; the writer is the value.
+  // Only code that has both the frozen ctx reference AND access to the exported
+  // _kernelApproveForTest function can trigger an approval — and that function
+  // is for test harnesses only, clearly labelled as such.
   //
   // Full-impl: executor.execute() will query task_verdicts (WHERE task_id=gateId
-  // AND verdict='approved') instead of checking _approvalStore. This seam goes away.
-  const ctxBase: DepartmentCtx & { _recordApproval: (gateId: string) => void } = {
+  // AND verdict='approved' AND tenant_id=tenantId AND department_key=departmentKey)
+  // instead of using _pendingStore. This seam goes away then.
+  const ctxBase: DepartmentCtx = {
     tenantId,
     departmentKey,
     capabilities: capSnapshot,
@@ -546,10 +606,15 @@ function _mintCtxInternal(
     gate,
     bus,
     executor,
-    _recordApproval,
   }
 
-  return Object.freeze(ctxBase) as DepartmentCtx
+  const frozenCtx = Object.freeze(ctxBase)
+
+  // Register the approval writer in the module-level WeakMap AFTER freeze.
+  // The WeakMap key is the frozen ctx object (identity, not structure).
+  _testApproveSeams.set(frozenCtx, _approveRecord)
+
+  return frozenCtx
 }
 
 // ── kernelMintCtx ─────────────────────────────────────────────────────────────
@@ -584,4 +649,32 @@ export function kernelMintCtx(
 
 export function _isKernelToken(sym: symbol): boolean {
   return sym === _KERNEL_TOKEN
+}
+
+// ── _kernelApproveForTest ─────────────────────────────────────────────────────
+//
+// TEST-HARNESS ONLY. Simulates a human approval of a pending gated record.
+//
+// BLOCK-1 fix (2026-06-18): _recordApproval is NOT on the DepartmentCtx object.
+// A ctx-holder using `(ctx as any)` finds no approval method. The approval
+// mechanism is reached ONLY through this function, which requires:
+//   1. The exported function itself (tests import it; prod code should not).
+//   2. The exact ctx reference (WeakMap key — object identity).
+//
+// INVARIANT a test must prove: `(ctx as any)._recordApproval` is undefined,
+// `(ctx as any)._approveRecord` is undefined — the ctx object has NO property
+// that can approve a proposal. Only this function path can.
+//
+// Full-impl: this function goes away. executor.execute() queries task_verdicts
+// (a real DB row written by the /approvals Gate endpoint). The only approval
+// path is then an authenticated HTTP request through the real Gate.
+
+export function _kernelApproveForTest(ctx: DepartmentCtx, gateId: string): void {
+  const writer = _testApproveSeams.get(ctx)
+  if (!writer) {
+    throw new Error(
+      '_kernelApproveForTest: ctx not found in approval seam map — was it minted by kernelMintCtx?',
+    )
+  }
+  writer(gateId)
 }

@@ -254,7 +254,7 @@ describe('3. Non-proposesOnly work-type → S4: gate.propose creates gated recor
     const { gateId } = await ctx.gate.propose({ action: 'execute-now' })
     // No recordApproval called → executor.execute must reject with not_approved.
     await expect(
-      ctx.executor.execute({ gateId, action: 'execute-now' })
+      ctx.executor.execute(gateId)
     ).rejects.toThrow(/not_approved/)
   })
 
