@@ -310,9 +310,25 @@ describe('A. GrowthModule registration + activation', () => {
     expect(keys).toContain('growth')
   })
 
-  it('GrowthModule declares 3 metric descriptors', () => {
-    expect(GrowthModule.metricsEmitted).toHaveLength(3)
-    const keys = GrowthModule.metricsEmitted.map((d) => d.key)
+  it('GrowthModule metricsEmitted is empty (S2: funnel metrics moved to OutboundChannel)', () => {
+    // S2: growth.leads / growth.replies / growth.conversion are now in OutboundChannel.
+    // The dept's effective descriptors = composeDeptMetricDescriptors(metricsEmitted, channels).
+    expect(GrowthModule.metricsEmitted).toHaveLength(0)
+  })
+
+  it('GrowthModule has OutboundChannel in channels (S2)', () => {
+    expect(GrowthModule.channels).toBeDefined()
+    expect(GrowthModule.channels).toHaveLength(1)
+    expect(GrowthModule.channels![0].key).toBe('outbound')
+  })
+
+  it('GrowthModule composed metric set has 3 funnel descriptors (via OutboundChannel)', () => {
+    // The composed set is what the kernel authorizes — test it via OutboundChannel directly.
+    // growth.channels = [OutboundChannel], which has 3 metricDescriptors.
+    const channelMetrics = GrowthModule.channels?.flatMap((ch) => ch.metricDescriptors) ?? []
+    const allMetrics = [...GrowthModule.metricsEmitted, ...channelMetrics]
+    expect(allMetrics).toHaveLength(3)
+    const keys = allMetrics.map((d) => d.key)
     expect(keys).toContain('growth.leads')
     expect(keys).toContain('growth.replies')
     expect(keys).toContain('growth.conversion')
@@ -647,20 +663,21 @@ describe('F. Pulse readback: daily scalars → seriesShape=bar', () => {
     expect(seriesShape(buckets)).toBe('bar')
   })
 
-  it('growth.leads ohlcEligible=false declared in module manifest', () => {
-    const desc = GrowthModule.metricsEmitted.find((d) => d.key === 'growth.leads')!
+  it('growth.leads ohlcEligible=false declared in OutboundChannel (S2: moved from metricsEmitted)', () => {
+    // S2: growth.leads is now in OutboundChannel.metricDescriptors.
+    const desc = GrowthModule.channels![0].metricDescriptors.find((d) => d.key === 'growth.leads')!
     expect(desc.ohlcEligible).toBe(false)
     expect(desc.cadence).toBe('daily')
   })
 
-  it('growth.replies ohlcEligible=false declared in module manifest', () => {
-    const desc = GrowthModule.metricsEmitted.find((d) => d.key === 'growth.replies')!
+  it('growth.replies ohlcEligible=false declared in OutboundChannel (S2: moved from metricsEmitted)', () => {
+    const desc = GrowthModule.channels![0].metricDescriptors.find((d) => d.key === 'growth.replies')!
     expect(desc.ohlcEligible).toBe(false)
     expect(desc.cadence).toBe('daily')
   })
 
-  it('growth.conversion ohlcEligible=false declared in module manifest', () => {
-    const desc = GrowthModule.metricsEmitted.find((d) => d.key === 'growth.conversion')!
+  it('growth.conversion ohlcEligible=false declared in OutboundChannel (S2: moved from metricsEmitted)', () => {
+    const desc = GrowthModule.channels![0].metricDescriptors.find((d) => d.key === 'growth.conversion')!
     expect(desc.ohlcEligible).toBe(false)
     expect(desc.cadence).toBe('daily')
     expect(desc.unit).toBe('ratio')

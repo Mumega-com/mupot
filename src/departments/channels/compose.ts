@@ -189,10 +189,16 @@ export function composeDeptMetricDescriptors(
   // First pass: collect all keys and fail closed on the first duplicate.
   const seen = new Set<string>()
 
+  // Step 1: check for duplicates WITHIN deptOwn itself (authority-shadow vector).
+  // A dup inside deptOwn is a config bug; fail closed before building anything.
   for (const desc of deptOwn) {
+    if (seen.has(desc.key)) {
+      throw new ChannelComposeError('duplicate_metric_key', desc.key)
+    }
     seen.add(desc.key)
   }
 
+  // Step 2: check for deptOwn-vs-channel and channel-vs-channel collisions.
   for (const ch of channels) {
     for (const desc of ch.metricDescriptors) {
       if (seen.has(desc.key)) {
