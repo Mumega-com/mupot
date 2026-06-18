@@ -32,6 +32,24 @@ export async function resolveTier(env: Env): Promise<PotTier> {
   return coerceTier(state?.tier)
 }
 
+/**
+ * Resolve the tier from a raw D1 handle — for enforcement paths that hold a `db` but
+ * not the full `env` (e.g. the department registry's atomic activate batch). Same
+ * fail-closed-to-'free' semantics as resolveTier, read directly off org_settings.
+ */
+export async function resolveTierFromDb(db: D1Database): Promise<PotTier> {
+  const row = await db
+    .prepare('SELECT value FROM org_settings WHERE key = ?1 LIMIT 1')
+    .bind(BILLING_STATE_KEY)
+    .first<{ value: string }>()
+  if (!row?.value) return 'free'
+  try {
+    return coerceTier((JSON.parse(row.value) as { tier?: unknown }).tier)
+  } catch {
+    return 'free'
+  }
+}
+
 /** Resolve the pot's full entitlement snapshot (tier + limits + features). */
 export async function resolveEntitlement(env: Env): Promise<Entitlement> {
   return entitlementFor(await resolveTier(env))

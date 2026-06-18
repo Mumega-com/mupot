@@ -67,13 +67,16 @@ interface SquadRow {
   created_at: string
 }
 
-function makeDb(opts?: { initialDepts?: DeptRow[] }): {
+function makeDb(opts?: { initialDepts?: DeptRow[]; tier?: string }): {
   db: D1Database
   depts: () => DeptRow[]
   squads: () => SquadRow[]
 } {
   const depts: DeptRow[] = opts?.initialDepts ? [...opts.initialDepts] : []
   const squads: SquadRow[] = []
+  // Default 'scale' (unlimited) so seeding tests aren't limited; the S6 gate is
+  // exercised explicitly by passing tier:'free' (see the entitlement-gate test).
+  const tier = opts?.tier ?? 'scale'
 
   function runSql(sql: string, args: unknown[]): { success: boolean; meta: { changes: number } } {
     const upper = sql.trim().toUpperCase()
@@ -147,6 +150,14 @@ function makeDb(opts?: { initialDepts?: DeptRow[] }): {
       const active = depts.filter((d) => d.active === 1 && d.template_key !== null)
       active.sort((a, b) => (a.activated_at ?? '').localeCompare(b.activated_at ?? ''))
       return { results: active, success: true }
+    }
+
+    // S6 entitlement gate reads: billing_state tier + the live squad count.
+    if (upper.includes('FROM ORG_SETTINGS')) {
+      return { results: [{ value: JSON.stringify({ tier }) }], success: true }
+    }
+    if (upper.includes('COUNT(*)') && upper.includes('FROM SQUADS')) {
+      return { results: [{ n: squads.length }], success: true }
     }
 
     return { results: [], success: true }
@@ -384,6 +395,17 @@ describe('A. GrowthModule registration + activation', () => {
     await activate(store.db, 'growth', { now: () => NOW, idGen: makeId })
     await activate(store.db, 'growth', { now: () => NOW, idGen: makeId })
     expect(store.squads()).toHaveLength(2)
+  })
+
+  it('S6 entitlement gate: refuses activation when seeding default squads exceeds the tier (free maxSquads=1, growth seeds 2)', async () => {
+    const store = makeDb({ tier: 'free' })
+    register(GrowthModule)
+    const result = await activate(store.db, 'growth', { now: () => NOW, idGen: makeId })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toBe('squad_limit_reached')
+    // Atomic refusal — the bypass Opus flagged is closed: NO department row, NO squads seeded.
+    expect(store.depts()).toHaveLength(0)
+    expect(store.squads()).toHaveLength(0)
   })
 
   it('isolated registry: growth is independent of other registrations', () => {

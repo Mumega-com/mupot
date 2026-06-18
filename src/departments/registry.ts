@@ -51,6 +51,8 @@ import type { D1Database } from '@cloudflare/workers-types'
 import type { DepartmentModule, MetricDescriptor, ConsoleSectionRef } from './contract'
 import { assertWritten } from '../lib/receipt'
 import { composeDeptMetricDescriptors, deepFreezeChannels } from './channels/compose'
+import { withinLimit } from '../billing/plans'
+import { resolveTierFromDb } from '../billing/entitlement'
 
 // ── deepFreezeClone ───────────────────────────────────────────────────────────
 //
@@ -189,7 +191,7 @@ interface SeedReceipt {
 
 export type ActivateResult =
   | { ok: true; departmentId: string; seeded: boolean }
-  | { ok: false; reason: 'module_not_registered' | 'slug_conflict' | 'db_error'; detail?: string }
+  | { ok: false; reason: 'module_not_registered' | 'slug_conflict' | 'squad_limit_reached' | 'db_error'; detail?: string }
 
 export type DeactivateResult =
   | { ok: true }
@@ -357,6 +359,34 @@ export function createDepartmentRegistry(): DepartmentRegistry {
           seed_receipt: string | null
         }>()
 
+      // ── ENTITLEMENT gate (S6, BLOCK-1 Opus catch) ──────────────────────────
+      // activate() seeds module.defaultSquads via a raw atomic batch below (NOT
+      // createSquad), so the pot's maxSquads ceiling is enforced HERE — and BEFORE any
+      // department write — so an over-limit activation is refused atomically (no partial
+      // dept row, no partial seed). Only gates when this activation will actually seed:
+      // a first activation (no prior seed_receipt) of a template carrying default squads.
+      // A re-activation (prior receipt) never re-seeds, so it is never limited.
+      let existingSeedReceipt: SeedReceipt | null = null
+      if (existing?.seed_receipt) {
+        try {
+          existingSeedReceipt = JSON.parse(existing.seed_receipt) as SeedReceipt
+        } catch {
+          existingSeedReceipt = null
+        }
+      }
+      if (!existingSeedReceipt && module.defaultSquads.length > 0) {
+        const squadCount =
+          (await db.prepare('SELECT COUNT(*) AS n FROM squads').bind().first<{ n: number }>())?.n ?? 0
+        const tier = await resolveTierFromDb(db)
+        if (!withinLimit(tier, 'maxSquads', squadCount + module.defaultSquads.length)) {
+          return {
+            ok: false,
+            reason: 'squad_limit_reached',
+            detail: `activating '${module.key}' would seed ${module.defaultSquads.length} squad(s), exceeding tier '${tier}' maxSquads (have ${squadCount})`,
+          }
+        }
+      }
+
       const now = nowFn()
       let departmentId: string
       let priorSeedReceipt: SeedReceipt | null = null
@@ -374,14 +404,7 @@ export function createDepartmentRegistry(): DepartmentRegistry {
         }
 
         departmentId = existing.id
-
-        if (existing.seed_receipt) {
-          try {
-            priorSeedReceipt = JSON.parse(existing.seed_receipt) as SeedReceipt
-          } catch {
-            priorSeedReceipt = null
-          }
-        }
+        priorSeedReceipt = existingSeedReceipt // parsed once, above (entitlement gate)
 
         const updateResult = await db
           .prepare(
