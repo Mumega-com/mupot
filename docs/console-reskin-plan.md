@@ -83,6 +83,31 @@ branch only — never merge/deploy.
 6. **Diverse-gate** — Opus + Codex on the implementation; GREEN both → merge under the dual-GREEN
    delegation (Hadi 2026-06-18). Arms never merge/deploy.
 
+## 4b. Codex acceptance conditions (BINDING — gated on implementation, 2026-06-18)
+
+Codex ACCEPTED the architecture WITH CONDITIONS. All fold into the build:
+
+1. **ui.ts purity enforceable** — no env/DB/fetch/auth imports, no route construction, no mutation
+   helpers. Accepts already-loaded values only. Primitives escape string inputs (or accept
+   `HtmlEscapedString` only where the caller already escaped). **No `raw()` around untrusted strings.**
+2. **shell/topbar is not a hidden data layer** — C(t)/regime comes in as a small OPTIONAL topbar model
+   passed into `shell()`, fail-soft to "—". No DB/KV reads inside generic presentation helpers.
+3. **New wired reads declare explicit visibility** — not just the tenant guard:
+   - **Verifications**: same task/approval visibility semantics (do NOT raw-list all `task_verdicts`
+     to every member); admin-or-approval-scoped.
+   - **Audit**: admin/owner by default (unless a documented narrower safe subset).
+   - **Billing tier**: may be broader, but NO billing secrets/events.
+4. **Audit gets its own `/audit` read-only route** — `/brain` STAYS Sovereignty/physics. (Supersedes
+   the §1 "Audit→/brain" mapping: the sidebar Audit item points to the new `/audit`.)
+5. **The Gate modal write path** — only `POST /api/tasks/:id/verdict`, same-origin credentialed. No
+   client-side approve state is truth; optimistic UI is display-only and must revert/show endpoint errors.
+6. **Honest-empty = visibly unavailable/not-connected** — never "coming soon" with fake KPIs. No mock
+   wallet balances, listings, deployment state, or pot inventory.
+7. **No secret-exposure regression** — Keys/Connectors keep list-safe/show-once; no
+   `encrypted_secret`/raw-secret/hint resurrection in shared table primitives.
+8. **Token/theme discipline literal** — CSS vars only for colors; light+dark smoke; no hardcoded
+   one-off colors in bodies.
+
 ## 5. Out of scope tonight (explicit, not silently dropped)
 Real Wallet/Marketplace economic models (ledger, listings, escrow) — these are product surfaces, not
 a reskin; tonight they get honest-empty chrome. Flagged for a follow-up epic.
