@@ -110,9 +110,17 @@ interface PendingRecord {
 // execute() calls this with handle.db (the same D1 the verdict route writes to).
 // Tests "approve the real way" by writing an approved task_verdicts row to the
 // same store — modeling the verdict route's output — never via a kernel export.
+//
+// LATEST-VERDICT SEMANTICS (Codex cross-vendor catch, 2026-06-18): task_verdicts is
+// append-only and multiple verdicts per task are legitimate (rejected → in_progress
+// → review → approved, per src/tasks/service.ts). A query for "any approved row ever"
+// would keep execution authority open after a LATER rejection — a stale-verdict
+// authority bug. So we read the LATEST verdict (ORDER BY decided_at DESC LIMIT 1)
+// and require it to be 'approved' — matching the production readers in
+// src/workflows/pipeline.ts and src/integrations/ghl.ts.
 async function _hasApprovedVerdict(db: D1Database, gateId: string): Promise<boolean> {
   const row = await db
-    .prepare(`SELECT verdict FROM task_verdicts WHERE task_id = ?1 AND verdict = 'approved' LIMIT 1`)
+    .prepare(`SELECT verdict FROM task_verdicts WHERE task_id = ?1 ORDER BY decided_at DESC LIMIT 1`)
     .bind(gateId)
     .first<{ verdict: string }>()
   return row?.verdict === 'approved'
@@ -457,9 +465,10 @@ function _mintCtxInternal(
   // S4: the gated-ACT port. CLOSURE-PRIVATE — not exposed to channels, not
   // obtained from any other path. Only the kernel mints it here.
   //
-  // PENDING STORE: a closure-private Map<gateId, PendingRecord> stores the full
+  // PENDING STORE: a closure-private Map<gateId, PendingRecord> stores the
   // record created by gate.propose(). The record holds action, payload, tenantId,
-  // departmentKey, and approved:boolean. gate.propose() inserts with approved=false.
+  // and departmentKey — CONTENT ONLY, NO approval flag. Approval lives in the DB
+  // (task_verdicts), read via _hasApprovedVerdict (latest-verdict semantics).
   //
   // APPROVAL: an `approved` row in task_verdicts (the real Gate store), written
   // EXCLUSIVELY by the authenticated verdict route (writeVerdict ← POST

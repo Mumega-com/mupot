@@ -49,8 +49,10 @@ const TENANT = 'mumega'
  * `_hasApprovedVerdict` SELECT. execute() reads approval ONLY from here — there is
  * no kernel approval export to import.
  */
+interface VerdictRow { verdict: string; decided_at: string }
 function makeStubDb(): { db: D1Database } {
-  const approved = new Set<string>()
+  // Append-only verdict log per task_id (mirrors task_verdicts).
+  const verdicts = new Map<string, VerdictRow[]>()
   const db = {
     prepare(sql: string) {
       const upper = sql.trim().toUpperCase()
@@ -58,10 +60,13 @@ function makeStubDb(): { db: D1Database } {
       const stmt = {
         bind(...args: unknown[]) { boundArgs.push(...args); return stmt },
         async run() {
-          // The authenticated verdict route writes an approved row here.
+          // The authenticated verdict route appends a verdict row here.
           // Columns: (id, task_id, verdict, note, decided_by, decided_at).
-          if (upper.includes('INSERT INTO TASK_VERDICTS') && boundArgs[2] === 'approved') {
-            approved.add(String(boundArgs[1]))
+          if (upper.includes('INSERT INTO TASK_VERDICTS')) {
+            const taskId = String(boundArgs[1])
+            const log = verdicts.get(taskId) ?? []
+            log.push({ verdict: String(boundArgs[2]), decided_at: String(boundArgs[5]) })
+            verdicts.set(taskId, log)
           }
           return { success: true, meta: { changes: 1 } }
         },
@@ -70,9 +75,15 @@ function makeStubDb(): { db: D1Database } {
           return { results: [], success: true }
         },
         async first() {
-          // _hasApprovedVerdict: SELECT verdict FROM task_verdicts WHERE task_id=?1 AND verdict='approved'
+          // _hasApprovedVerdict: SELECT verdict FROM task_verdicts WHERE task_id=?1
+          //                      ORDER BY decided_at DESC LIMIT 1 (latest-verdict).
           if (upper.includes('FROM TASK_VERDICTS')) {
-            return approved.has(String(boundArgs[0])) ? { verdict: 'approved' } : null
+            const log = verdicts.get(String(boundArgs[0]))
+            if (!log || log.length === 0) return null
+            // Return the latest row by decided_at (DESC). Append order is the
+            // tiebreaker, matching how the real route writes sequentially.
+            const latest = [...log].sort((a, b) => (a.decided_at < b.decided_at ? -1 : a.decided_at > b.decided_at ? 1 : 0)).at(-1)
+            return latest ? { verdict: latest.verdict } : null
           }
           return null
         },
@@ -103,17 +114,34 @@ function mintCtx(caps: ('observer' | 'member' | 'lead' | 'admin' | 'owner')[] = 
 }
 
 /**
- * Approve "the real way": write an `approved` task_verdicts row to the gate store
- * via the REAL verdict INSERT SQL — modeling POST /api/tasks/:id/verdict. This is
- * NOT a kernel export; it is a DB write the ctx itself cannot perform.
+ * Write a verdict row to the gate store via the REAL verdict INSERT SQL — modeling
+ * POST /api/tasks/:id/verdict. NOT a kernel export; a DB write the ctx cannot perform.
+ * decidedAt orders the append-only log (latest verdict wins in _hasApprovedVerdict).
  */
-async function approveInStore(db: D1Database, gateId: string): Promise<void> {
+async function insertVerdict(
+  db: D1Database,
+  gateId: string,
+  verdict: 'approved' | 'rejected',
+  decidedAt: string = NOW,
+): Promise<void> {
   await db
     .prepare(
       `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at) VALUES (?1,?2,?3,?4,?5,?6)`,
     )
-    .bind(`v-${gateId}`, gateId, 'approved', null, 'member-test', NOW)
+    .bind(`v-${gateId}-${decidedAt}`, gateId, verdict, null, 'member-test', decidedAt)
     .run()
+}
+
+/** Approve "the real way": append an `approved` verdict row to the gate store. */
+async function approveInStore(db: D1Database, gateId: string): Promise<void> {
+  await insertVerdict(db, gateId, 'approved')
+}
+
+/** The gate store (D1) the given ctx reads. */
+function dbOf(ctx: DepartmentCtx): D1Database {
+  const db = _ctxDb.get(ctx)
+  if (!db) throw new Error('test: ctx has no associated db (mint via mintCtx)')
+  return db
 }
 
 /** Approve a proposal on the gate store the given ctx reads. */
@@ -683,6 +711,47 @@ describe('10. Arms-never-write — NO path executes without a human approval rec
     // ctxB cannot — even though the DB verdict is global, the gateId was proposed
     // in ctxA's closure-private content store, not ctxB's → content lookup fails first.
     await expect(ctxB.executor.execute(gateId)).rejects.toThrow(/not_approved/)
+  })
+})
+
+// ── 10b. Latest-verdict semantics (Codex cross-vendor catch) ──────────────────
+//
+// task_verdicts is append-only; multiple verdicts per task are legitimate
+// (rejected → in_progress → review → approved). _hasApprovedVerdict must read the
+// LATEST verdict, not "any approved row ever" — otherwise a stale approved row keeps
+// execution authority open after a later rejection. These tests pin that.
+
+describe('10b. Latest-verdict — stale approved row must not survive a later rejection', () => {
+  it('approved THEN rejected (latest=rejected) → execute throws not_approved', async () => {
+    const ctx = mintCtx(['lead'])
+    const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: {} })
+    const db = dbOf(ctx)
+    // Append-only history: approve early, reject later. Latest verdict = rejected.
+    await insertVerdict(db, gateId, 'approved', '2026-06-18T10:00:00.000Z')
+    await insertVerdict(db, gateId, 'rejected', '2026-06-18T11:00:00.000Z')
+
+    await expect(ctx.executor.execute(gateId)).rejects.toThrow(/not_approved/)
+  })
+
+  it('rejected THEN approved (latest=approved) → execute proceeds (executed=false stub)', async () => {
+    const ctx = mintCtx(['lead'])
+    const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: { executor: 'inkwell-content' } })
+    const db = dbOf(ctx)
+    await insertVerdict(db, gateId, 'rejected', '2026-06-18T10:00:00.000Z')
+    await insertVerdict(db, gateId, 'approved', '2026-06-18T11:00:00.000Z')
+
+    const out = await ctx.executor.execute(gateId)
+    expect(out.executed).toBe(false)
+    expect(out.reason).toBe('executor_not_wired')
+    expect(out.adapter).toBe('inkwell-content')
+  })
+
+  it('a lone rejected verdict (no approval) → not_approved', async () => {
+    const ctx = mintCtx(['lead'])
+    const { gateId } = await ctx.gate.propose({ action: 'seo-meta-fix', payload: {} })
+    await insertVerdict(dbOf(ctx), gateId, 'rejected')
+
+    await expect(ctx.executor.execute(gateId)).rejects.toThrow(/not_approved/)
   })
 })
 
