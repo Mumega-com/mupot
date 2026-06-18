@@ -116,6 +116,10 @@ export interface Env {
   // Value: 64-char hex string (32 bytes / 256-bit, e.g. `openssl rand -hex 32`).
   // Fail-closed: if absent, resolveConnector() returns null and addConnector() throws.
   CONNECTOR_MASTER_KEY?: string
+  // Inkwell API origin the inkwell-content ACT executor POSTs to (S4 live-wire).
+  // Non-secret; set in wrangler.toml [vars]. e.g. https://inkwell-api.mumega.com.
+  // Must be https + a public host (executor SSRF-guards it). Absent ⇒ executor 503.
+  INKWELL_API_URL?: string
 }
 
 // ── Org domain (mirrors migrations/0001_init.sql + 0009_work_unit.sql) ──
