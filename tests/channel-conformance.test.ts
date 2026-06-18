@@ -49,6 +49,7 @@ import {
   getChannelMetricDescriptors,
   getChannelWorkTypes,
   composeDeptMetricDescriptors,
+  ChannelComposeError,
 } from '../src/departments/channels/compose'
 import type { ChannelDescriptor } from '../src/departments/channels/contract'
 
@@ -383,6 +384,8 @@ describe('4. NO AUTHORITY MACHINERY — channel module export surfaces are pure 
     expect(typeof mod['getChannelMetricDescriptors']).toBe('function')
     expect(typeof mod['getChannelWorkTypes']).toBe('function')
     expect(typeof mod['composeDeptMetricDescriptors']).toBe('function')
+    // ChannelComposeError is a class — typeof === 'function' (JS class = function)
+    expect(typeof mod['ChannelComposeError']).toBe('function')
 
     // No singleton, no registry, no state
     expect(mod['_registry']).toBeUndefined()
@@ -665,5 +668,235 @@ describe('7. ADVERSARIAL — FixtureChannel data object gives no authority footh
       expect(kind, `property '${name}' must not be a function`).not.toBe('function')
       expect(kind, `property '${name}' must not be a Symbol`).not.toBe('symbol')
     }
+  })
+})
+
+// ── 8. DUPLICATE-KEY GUARD — authority-shadow is blocked at compose time ────────
+//
+// Codex gate RED (S1): composeDeptMetricDescriptors returned [...deptOwn, ...channelMetrics]
+// with NO duplicate-key check. The kernel builds its ctx authority map via
+//   new Map(module.metricsEmitted.map(...))
+// so a channel contributing the SAME key as a dept-owned metric (but with a WIDER
+// sourceAuthority) would silently overwrite the dept's authority entry — last key wins.
+//
+// Fix: composeDeptMetricDescriptors and getChannelWorkTypes now fail closed:
+// any duplicate key throws ChannelComposeError BEFORE the result is ever produced.
+//
+// These tests prove fail-closed semantics:
+//   8a. dept-owned key shadowed by a channel → throws duplicate_metric_key
+//   8b. channel-vs-channel metric key collision → throws duplicate_metric_key
+//   8c. channel-vs-channel work-type key collision → throws duplicate_work_type_key
+//   8d. non-colliding keys → compose succeeds (the existing happy path is intact)
+//   8e. ChannelComposeError carries the correct typed code and key fields
+
+describe('8. DUPLICATE-KEY GUARD — authority-shadow blocked at compose time', () => {
+  // ── helpers ────────────────────────────────────────────────────────────────
+
+  // A channel that declares `fixture.pings` — a key owned by FixtureModule.
+  // This is the exact Codex exploit: same key, wider sourceAuthority (adds 'stripe').
+  const channelShadowingDeptKey: ChannelDescriptor = {
+    key: 'shadow-channel',
+    name: 'Shadow Channel (exploit attempt)',
+    metricDescriptors: [
+      {
+        key: 'fixture.pings', // COLLISION: FixtureModule owns this key
+        unit: 'count',
+        direction: 'neutral',
+        cadence: 'daily',
+        aggregation: 'sum',
+        ohlcEligible: false,
+        // Wider sourceAuthority than the dept's: adds 'stripe' (not in dept's list)
+        sourceAuthority: ['fixture-harness', 'manual', 'stripe'],
+        retention: '30d',
+        display: { precision: 0 },
+      },
+    ],
+    sourceAuthority: ['fixture-harness', 'manual', 'stripe'],
+    connectorRefs: [],
+    workTypes: [],
+  }
+
+  // A second channel that declares `fixture.channel.pings` — same as FixtureChannel.
+  const channelCollidingWithSibling: ChannelDescriptor = {
+    key: 'colliding-channel',
+    name: 'Colliding Channel (exploit attempt)',
+    metricDescriptors: [
+      {
+        key: 'fixture.channel.pings', // COLLISION: FixtureChannel owns this key
+        unit: 'count',
+        direction: 'neutral',
+        cadence: 'daily',
+        aggregation: 'sum',
+        ohlcEligible: false,
+        sourceAuthority: ['evil-source'],
+        retention: '30d',
+        display: { precision: 0 },
+      },
+    ],
+    sourceAuthority: ['evil-source'],
+    connectorRefs: [],
+    workTypes: [],
+  }
+
+  // A channel with a work-type key that collides with FixtureChannel's work-type.
+  const channelCollidingWorkType: ChannelDescriptor = {
+    key: 'colliding-wt-channel',
+    name: 'Colliding Work-Type Channel (exploit attempt)',
+    metricDescriptors: [],
+    sourceAuthority: [],
+    connectorRefs: [],
+    workTypes: [
+      {
+        key: 'channel-ping-proposal', // COLLISION: FixtureChannel owns this key
+        name: 'Evil Proposal',
+        proposesOnly: true,
+      },
+    ],
+  }
+
+  // ── 8a. dept-owned key shadowed by a channel → THROWS ─────────────────────
+
+  it('8a. dept-owned metric key shadowed by a channel → composeDeptMetricDescriptors THROWS (duplicate_metric_key)', () => {
+    // FixtureModule.metricsEmitted includes 'fixture.pings'.
+    // channelShadowingDeptKey also declares 'fixture.pings' with a wider sourceAuthority.
+    // The compose MUST throw before producing a result — fail closed.
+    expect(() => {
+      composeDeptMetricDescriptors(FixtureModule.metricsEmitted, [channelShadowingDeptKey])
+    }).toThrow(ChannelComposeError)
+  })
+
+  it('8a. the thrown error has code=duplicate_metric_key and key=fixture.pings', () => {
+    let caught: unknown
+    try {
+      composeDeptMetricDescriptors(FixtureModule.metricsEmitted, [channelShadowingDeptKey])
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(ChannelComposeError)
+    const err = caught as ChannelComposeError
+    expect(err.code).toBe('duplicate_metric_key')
+    expect(err.key).toBe('fixture.pings')
+  })
+
+  it('8a. the result is NEVER produced when a dept-vs-channel collision is present (fail closed)', () => {
+    // Confirm that composeDeptMetricDescriptors does not return a partial result
+    // before throwing. The throw must happen BEFORE the return statement.
+    let result: unknown = 'not-set'
+    try {
+      result = composeDeptMetricDescriptors(FixtureModule.metricsEmitted, [channelShadowingDeptKey])
+    } catch {
+      // expected
+    }
+    // result must still be the sentinel — it was never assigned by the function
+    expect(result).toBe('not-set')
+  })
+
+  // ── 8b. channel-vs-channel metric key collision → THROWS ──────────────────
+
+  it('8b. channel-vs-channel metric key collision → composeDeptMetricDescriptors THROWS (duplicate_metric_key)', () => {
+    // FixtureChannel declares 'fixture.channel.pings'.
+    // channelCollidingWithSibling also declares 'fixture.channel.pings'.
+    // Both are distinct channels with no dept-level collision, but they collide
+    // with each other. The compose MUST throw.
+    expect(() => {
+      composeDeptMetricDescriptors(FixtureModule.metricsEmitted, [
+        FixtureChannel,
+        channelCollidingWithSibling,
+      ])
+    }).toThrow(ChannelComposeError)
+  })
+
+  it('8b. the channel-vs-channel collision error has code=duplicate_metric_key and key=fixture.channel.pings', () => {
+    let caught: unknown
+    try {
+      composeDeptMetricDescriptors(FixtureModule.metricsEmitted, [
+        FixtureChannel,
+        channelCollidingWithSibling,
+      ])
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(ChannelComposeError)
+    const err = caught as ChannelComposeError
+    expect(err.code).toBe('duplicate_metric_key')
+    expect(err.key).toBe('fixture.channel.pings')
+  })
+
+  // ── 8c. duplicate work-type key across channels → THROWS ──────────────────
+
+  it('8c. duplicate work-type key across channels → getChannelWorkTypes THROWS (duplicate_work_type_key)', () => {
+    // FixtureChannel has work-type 'channel-ping-proposal'.
+    // channelCollidingWorkType also has 'channel-ping-proposal'.
+    expect(() => {
+      getChannelWorkTypes([FixtureChannel, channelCollidingWorkType])
+    }).toThrow(ChannelComposeError)
+  })
+
+  it('8c. the work-type collision error has code=duplicate_work_type_key and key=channel-ping-proposal', () => {
+    let caught: unknown
+    try {
+      getChannelWorkTypes([FixtureChannel, channelCollidingWorkType])
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(ChannelComposeError)
+    const err = caught as ChannelComposeError
+    expect(err.code).toBe('duplicate_work_type_key')
+    expect(err.key).toBe('channel-ping-proposal')
+  })
+
+  // ── 8d. non-colliding keys → compose succeeds (happy path stays green) ─────
+
+  it('8d. non-colliding metric keys (dept own + channels) → composeDeptMetricDescriptors succeeds', () => {
+    // FixtureModule: fixture.pings, fixture.scalar
+    // FixtureChannel: fixture.channel.pings
+    // siblingChannel: sibling.channel.events
+    // All 4 keys are distinct — must succeed and return all 4 descriptors.
+    const result = composeDeptMetricDescriptors(FixtureModule.metricsEmitted, [
+      FixtureChannel,
+      siblingChannel,
+    ])
+    expect(result).toHaveLength(4)
+    const keys = result.map((d) => d.key)
+    expect(keys).toContain('fixture.pings')
+    expect(keys).toContain('fixture.scalar')
+    expect(keys).toContain('fixture.channel.pings')
+    expect(keys).toContain('sibling.channel.events')
+  })
+
+  it('8d. non-colliding work-type keys → getChannelWorkTypes succeeds', () => {
+    // FixtureChannel: channel-ping-proposal
+    // siblingChannel: sibling-proposal
+    // Both distinct — must succeed.
+    const result = getChannelWorkTypes([FixtureChannel, siblingChannel])
+    expect(result).toHaveLength(2)
+    const keys = result.map((w) => w.key)
+    expect(keys).toContain('channel-ping-proposal')
+    expect(keys).toContain('sibling-proposal')
+  })
+
+  // ── 8e. ChannelComposeError fields are correctly typed ─────────────────────
+
+  it('8e. ChannelComposeError is an instanceof Error and has correct name', () => {
+    const err = new ChannelComposeError('duplicate_metric_key', 'some.key')
+    expect(err).toBeInstanceOf(Error)
+    expect(err).toBeInstanceOf(ChannelComposeError)
+    expect(err.name).toBe('ChannelComposeError')
+  })
+
+  it('8e. ChannelComposeError.code and .key are set correctly for duplicate_metric_key', () => {
+    const err = new ChannelComposeError('duplicate_metric_key', 'fixture.pings')
+    expect(err.code).toBe('duplicate_metric_key')
+    expect(err.key).toBe('fixture.pings')
+    expect(err.message).toContain('duplicate_metric_key')
+    expect(err.message).toContain('fixture.pings')
+  })
+
+  it('8e. ChannelComposeError.code and .key are set correctly for duplicate_work_type_key', () => {
+    const err = new ChannelComposeError('duplicate_work_type_key', 'channel-ping-proposal')
+    expect(err.code).toBe('duplicate_work_type_key')
+    expect(err.key).toBe('channel-ping-proposal')
+    expect(err.message).toContain('duplicate_work_type_key')
+    expect(err.message).toContain('channel-ping-proposal')
   })
 })

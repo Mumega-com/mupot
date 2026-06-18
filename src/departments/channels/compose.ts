@@ -32,6 +32,36 @@
 import type { MetricDescriptor } from '../contract'
 import type { ChannelDescriptor, GatedWorkType } from './contract'
 
+// ── ChannelComposeError ───────────────────────────────────────────────────────
+//
+// Thrown by composeDeptMetricDescriptors and getChannelWorkTypes when a duplicate
+// key is detected across (deptOwn ∪ channels) or across sibling channels.
+//
+// SECURITY: a duplicate metric key means a channel is shadowing a dept-owned (or
+// sibling-owned) descriptor with a potentially wider sourceAuthority. The kernel
+// builds its authority map via `new Map(module.metricsEmitted.map(...))` — last key
+// wins — so any duplicate is an authority-shadow vector. We FAIL CLOSED: throw
+// before the result is ever produced. Do NOT silently dedupe or last-wins.
+//
+// A duplicate work-type key is a hard error too: work-type keys may become
+// authority-bearing in S3/S4. Fail closed now.
+
+export class ChannelComposeError extends Error {
+  readonly code: 'duplicate_metric_key' | 'duplicate_work_type_key'
+  readonly key: string
+
+  constructor(code: 'duplicate_metric_key' | 'duplicate_work_type_key', key: string) {
+    super(
+      code === 'duplicate_metric_key'
+        ? `ChannelComposeError: duplicate_metric_key — key '${key}' appears more than once across dept own + channel descriptors. A channel cannot shadow a dept-owned or sibling metric key (authority-widening vector). Fix: ensure every metric key is globally unique within the department.`
+        : `ChannelComposeError: duplicate_work_type_key — key '${key}' appears more than once across channel work-types. Fix: ensure every work-type key is unique across all channels in this department.`,
+    )
+    this.name = 'ChannelComposeError'
+    this.code = code
+    this.key = key
+  }
+}
+
 // ── deepFreezeChannels ────────────────────────────────────────────────────────
 //
 // Deep-freeze an array of ChannelDescriptors and return the frozen array.
@@ -95,13 +125,30 @@ export function getChannelMetricDescriptors(
 //
 // Returns the flat union of workTypes from all channels.
 // Pure function — no side effects, no state.
+//
+// DUPLICATE-KEY GUARD: throws ChannelComposeError('duplicate_work_type_key', key)
+// if the same work-type key appears in more than one channel. A duplicate is a hard
+// error — work-type keys may become authority-bearing in S3/S4 (Codex gate, S1).
+// Do NOT silently dedupe; fail closed before the result is produced.
+//
+// TODO(S2): when channels are wired into DepartmentModule, the registration/mint
+// path MUST call getChannelWorkTypes (or cover the channels field in
+// registry.deepFreezeClone) so composed work-type descriptors are frozen before
+// the kernel consumes them.
 
 export function getChannelWorkTypes(
   channels: readonly ChannelDescriptor[],
 ): GatedWorkType[] {
+  const seen = new Set<string>()
   const result: GatedWorkType[] = []
   for (const ch of channels) {
-    result.push(...ch.workTypes)
+    for (const wt of ch.workTypes) {
+      if (seen.has(wt.key)) {
+        throw new ChannelComposeError('duplicate_work_type_key', wt.key)
+      }
+      seen.add(wt.key)
+      result.push(wt)
+    }
   }
   return result
 }
@@ -115,10 +162,46 @@ export function getChannelWorkTypes(
 // Usage: registry.ts's getActiveMetricDescriptors() calls this when a dept
 // module carries a `channels` field (future wiring in S2). Tests call this
 // directly to assert composition.
+//
+// DUPLICATE-KEY GUARD (SECURITY — fail closed): throws
+// ChannelComposeError('duplicate_metric_key', key) if ANY metric key appears
+// more than once across (deptOwn ∪ all channel metricDescriptors), including
+// channel-vs-channel duplicates. The kernel builds its authority map via:
+//   new Map(module.metricsEmitted.map(...))   ← last duplicate key wins
+// A channel can therefore shadow a dept-owned key with a wider sourceAuthority.
+// We reject BEFORE the result array is produced — the Map is never built from
+// a poisoned input. Do NOT silently dedupe or last-wins; a key collision is
+// always either an authority-shadow attempt or a configuration bug.
+//
+// TODO(S2): when channels are wired into DepartmentModule, the registration/mint
+// path MUST deepFreezeChannels (or registry.deepFreezeClone must cover the
+// channels field) so composed channel descriptors are frozen before the kernel
+// consumes them.
+//
+// TODO(S3): configSchema is not deep-frozen in deepFreezeChannels. Wire
+// Zod-validate + freeze configSchema here when the SEO channel defines a real
+// config shape (Opus Low finding, S1 gate).
 
 export function composeDeptMetricDescriptors(
   deptOwn: readonly MetricDescriptor[],
   channels: readonly ChannelDescriptor[],
 ): MetricDescriptor[] {
+  // First pass: collect all keys and fail closed on the first duplicate.
+  const seen = new Set<string>()
+
+  for (const desc of deptOwn) {
+    seen.add(desc.key)
+  }
+
+  for (const ch of channels) {
+    for (const desc of ch.metricDescriptors) {
+      if (seen.has(desc.key)) {
+        throw new ChannelComposeError('duplicate_metric_key', desc.key)
+      }
+      seen.add(desc.key)
+    }
+  }
+
+  // Second pass: produce the result only after all keys are proven unique.
   return [...deptOwn, ...getChannelMetricDescriptors(channels)]
 }
