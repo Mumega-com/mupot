@@ -75,7 +75,51 @@ import { composeDeptMetricDescriptors, deepFreezeChannels } from './channels/com
 function deepFreezeClone(module: DepartmentModule): DepartmentModule {
   // structuredClone is the Web-API-standard deep-copy utility available on
   // CF Workers (via the V8 structured-clone algorithm) and Node 17+.
-  const clone = structuredClone(module) as DepartmentModule
+  //
+  // S3 NOTE: configSchema on ChannelDescriptors may be a Zod schema object.
+  // Zod schemas contain functions (their validation logic), which structuredClone
+  // cannot handle (DataCloneError). We strip configSchema from each channel
+  // descriptor before cloning, then restore the original schema references on
+  // the cloned channels. We do NOT deep-clone the schema itself — Zod schema
+  // objects are singletons and are frozen in place by deepFreezeChannels below.
+  const configSchemas = new Map<string, unknown>()
+  if (module.channels) {
+    for (const ch of module.channels) {
+      if (ch.configSchema !== undefined) {
+        configSchemas.set(ch.key, ch.configSchema)
+      }
+    }
+  }
+
+  // Temporarily create a cloneable version of the module (configSchema stripped).
+  let cloneableModule: DepartmentModule = module
+  if (configSchemas.size > 0) {
+    cloneableModule = {
+      ...module,
+      channels: module.channels?.map((ch) =>
+        ch.configSchema !== undefined ? { ...ch, configSchema: undefined } : ch,
+      ),
+    }
+  }
+
+  const clone = structuredClone(cloneableModule) as DepartmentModule
+
+  // Restore configSchema references on the cloned channels.
+  // We point to the ORIGINAL Zod schema objects (not clones) — Zod schemas are
+  // singletons; deepFreezeChannels will freeze them in place below.
+  if (configSchemas.size > 0 && clone.channels) {
+    // clone.channels is a fresh array from structuredClone — it is not frozen yet.
+    for (let i = 0; i < clone.channels.length; i++) {
+      const key = clone.channels[i].key
+      if (configSchemas.has(key)) {
+        // The channel objects in the clone are plain objects (not frozen yet).
+        // We cast to mutable here to restore the schema before deepFreezeChannels
+        // freezes everything. This is the only place we write to the clone.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ;(clone.channels[i] as any).configSchema = configSchemas.get(key)
+      }
+    }
+  }
 
   // Freeze nested authority arrays and their elements before freezing the top object.
   for (const desc of clone.metricsEmitted) {

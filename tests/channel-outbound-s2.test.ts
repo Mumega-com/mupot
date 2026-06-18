@@ -199,23 +199,27 @@ describe('1. COMPOSED MANIFEST — getActiveMetricDescriptors includes OutboundC
     expect(keys).toContain('growth.conversion')
   })
 
-  it('getActiveMetricDescriptors returns exactly 3 descriptors for growth (all from OutboundChannel)', async () => {
+  it('getActiveMetricDescriptors returns exactly 8 descriptors for growth (S3: 3 outbound + 5 seo)', async () => {
     const reg = createDepartmentRegistry()
     reg.register(GrowthModule)
 
     const db = makeDeptDb(['growth'])
     const descriptors = await reg.getActiveMetricDescriptors(db)
-    // growth.metricsEmitted is [] + OutboundChannel contributes 3
-    expect(descriptors).toHaveLength(3)
+    // growth.metricsEmitted is [] + OutboundChannel (3) + SeoChannel (5) = 8
+    expect(descriptors).toHaveLength(8)
   })
 
-  it('composeDeptMetricDescriptors(GrowthModule.metricsEmitted, GrowthModule.channels) produces 3 descriptors', () => {
+  it('composeDeptMetricDescriptors(GrowthModule.metricsEmitted, GrowthModule.channels) produces 8 descriptors (S3)', () => {
     const composed = composeDeptMetricDescriptors(GrowthModule.metricsEmitted, GrowthModule.channels ?? [])
-    expect(composed).toHaveLength(3)
+    // S3: OutboundChannel (3) + SeoChannel (5) = 8
+    expect(composed).toHaveLength(8)
     const keys = composed.map((d) => d.key)
     expect(keys).toContain('growth.leads')
     expect(keys).toContain('growth.replies')
     expect(keys).toContain('growth.conversion')
+    // SEO metrics also present
+    expect(keys).toContain('seo.organic_sessions')
+    expect(keys).toContain('seo.indexed_pages')
   })
 })
 

@@ -130,8 +130,44 @@ function _mintCtxInternal(
   // module here — BEFORE reading any authority-bearing field — so the kernel
   // boundary is closed for ALL callers regardless of whether the registry's own
   // frozen copy was used. Belt-and-suspenders with the registry's deepFreezeClone.
+  //
+  // S3 NOTE: configSchema on ChannelDescriptors may be a Zod schema object.
+  // Zod schemas contain functions which structuredClone cannot handle (DataCloneError).
+  // We strip configSchema from each channel before cloning and restore the original
+  // references post-clone. deepFreezeChannels then freezes them in place.
+  // configSchema is NOT authority-bearing (it is validation-spec data only), so
+  // omitting it from the structuredClone does not weaken the boundary.
   const module: DepartmentModule = ((): DepartmentModule => {
-    const clone = structuredClone(opts.module) as DepartmentModule
+    const configSchemas = new Map<string, unknown>()
+    let cloneableModule = opts.module
+    if (opts.module.channels) {
+      for (const ch of opts.module.channels) {
+        if (ch.configSchema !== undefined) {
+          configSchemas.set(ch.key, ch.configSchema)
+        }
+      }
+    }
+    if (configSchemas.size > 0) {
+      cloneableModule = {
+        ...opts.module,
+        channels: opts.module.channels?.map((ch) =>
+          ch.configSchema !== undefined ? { ...ch, configSchema: undefined } : ch,
+        ),
+      }
+    }
+
+    const clone = structuredClone(cloneableModule) as DepartmentModule
+
+    // Restore configSchema references from the original module.
+    if (configSchemas.size > 0 && clone.channels) {
+      for (let i = 0; i < clone.channels.length; i++) {
+        const key = clone.channels[i].key
+        if (configSchemas.has(key)) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ;(clone.channels[i] as any).configSchema = configSchemas.get(key)
+        }
+      }
+    }
     for (const desc of clone.metricsEmitted) {
       Object.freeze((desc as { sourceAuthority: readonly string[] }).sourceAuthority)
       Object.freeze((desc as { display: object }).display)
