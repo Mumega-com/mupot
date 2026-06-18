@@ -9,6 +9,7 @@
 
 import type { Env, Department, Squad, Agent, Effort, Autonomy, BudgetWindow } from '../types'
 import { isEffort, isAutonomy, isBudgetWindow } from '../types'
+import { checkCreateLimit } from '../billing/entitlement'
 
 // slugs are URL-safe identifiers: lowercase alphanumeric + single hyphens,
 // 1–48 chars, no leading/trailing/double hyphen.
@@ -148,6 +149,14 @@ export async function createSquad(
     input.budget_window === undefined ? 'week' : (input.budget_window as BudgetWindow)
   if (!isBudgetWindow(budget_window)) return { ok: false, error: 'invalid_budget_window' }
 
+  // ── Plan ENTITLEMENT gate (S6) — the pot's tier must permit one more squad ──────
+  // This is a pot-level invariant (the tier's maxSquads), NOT caller authz (the route
+  // already gated scope). Fail-closed: an unconfigured pot resolves to 'free'. Existing
+  // overage is grandfathered — only the NEXT create is blocked.
+  const squadCount = (await env.DB.prepare('SELECT COUNT(*) AS n FROM squads').bind().first<{ n: number }>())?.n ?? 0
+  const squadGate = await checkCreateLimit(env, 'maxSquads', squadCount)
+  if (!squadGate.ok) return { ok: false, error: 'squad_limit_reached' }
+
   const squad: Squad = {
     id: crypto.randomUUID(),
     department_id: departmentId,
@@ -269,6 +278,13 @@ export async function createAgent(
   const budget_window: BudgetWindow =
     input.budget_window === undefined ? 'week' : (input.budget_window as BudgetWindow)
   if (!isBudgetWindow(budget_window)) return { ok: false, error: 'invalid_budget_window' }
+
+  // ── Plan ENTITLEMENT gate (S6) — the pot's tier must permit one more agent ──────
+  // Pot-level invariant (the tier's maxAgents), NOT caller authz. Fail-closed to 'free'
+  // when unconfigured. Existing overage grandfathered — only the NEXT create is blocked.
+  const agentCount = (await env.DB.prepare('SELECT COUNT(*) AS n FROM agents').bind().first<{ n: number }>())?.n ?? 0
+  const agentGate = await checkCreateLimit(env, 'maxAgents', agentCount)
+  if (!agentGate.ok) return { ok: false, error: 'agent_limit_reached' }
 
   // The AgentDO is lazy — provisioned on first wake. Here we only insert the row;
   // the agent's id doubles as the DurableObject id name.

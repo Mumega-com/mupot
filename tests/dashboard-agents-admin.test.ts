@@ -46,6 +46,12 @@ function makeEnv(
             const batch = batches[thisIndex] ?? []
             return { results: batch }
           },
+          // S6: createAgent now reads a COUNT(*) and billing_state via .first().
+          // null → COUNT resolves to 0 and tier resolves to 'free' (count 0 < 2 → allowed),
+          // so these model-default tests exercise createAgent past the entitlement gate.
+          async first() {
+            return null
+          },
           async run() {
             const changes = changeCounts[changeIndex++] ?? 1
             call.changes = changes

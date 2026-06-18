@@ -15,8 +15,11 @@ import {
   coerceTier,
   entitled,
   entitlementFor,
+  withinLimit,
+  PLAN_LIMITS,
   type Entitlement,
   type PotFeature,
+  type PotLimits,
   type PotTier,
 } from './plans'
 
@@ -37,6 +40,36 @@ export async function resolveEntitlement(env: Env): Promise<Entitlement> {
 /** Convenience gate: is `feature` available for this pot right now? */
 export async function potEntitled(env: Env, feature: PotFeature): Promise<boolean> {
   return entitled(await resolveTier(env), feature)
+}
+
+/** A blocked create — carries the why so a caller/route can surface an upgrade prompt. */
+export interface LimitDenial {
+  ok: false
+  limit: keyof PotLimits
+  tier: PotTier
+  ceiling: number
+  current: number
+}
+
+/**
+ * The COUNT enforcement gate: may the pot create one more of `limit` (e.g. 'maxAgents')
+ * given `currentCount` existing? Reads the resolved tier (fail-closed to 'free') and the
+ * frozen PLAN_LIMITS ceiling. A `scale` (-1) ceiling is always allowed. Existing overage
+ * is GRANDFATHERED — this only blocks the NEXT create, never deletes or counts backward.
+ *
+ * NOTE (acceptable for a plan limit, not a security boundary): count→create is not atomic,
+ * so two concurrent creates at the boundary could both pass and reach ceiling+1. The limit
+ * is a soft commercial gate; a rare one-over race is tolerated rather than serialized.
+ */
+export async function checkCreateLimit(
+  env: Env,
+  limit: keyof PotLimits,
+  currentCount: number,
+): Promise<{ ok: true } | LimitDenial> {
+  const tier = await resolveTier(env)
+  // "one more" = currentCount + 1 must be within the ceiling.
+  if (withinLimit(tier, limit, currentCount + 1)) return { ok: true }
+  return { ok: false, limit, tier, ceiling: PLAN_LIMITS[tier][limit], current: currentCount }
 }
 
 /**

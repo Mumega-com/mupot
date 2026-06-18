@@ -280,6 +280,8 @@ describe('/setup/seed-agent — idempotency (slug_taken)', () => {
       [
         { firstRow: null },             // onboarding_complete
         { firstRow: { id: 'squad-1' } },// squad
+        { firstRow: null },             // S6 entitlement gate: COUNT agents → 0 (under free limit)
+        { firstRow: null },             // S6 entitlement gate: billing_state → unconfigured → free
         { throws: uniqueErr },           // INSERT → UNIQUE violation
       ],
     )
