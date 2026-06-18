@@ -254,7 +254,10 @@ dashboardApp.get('/verifications', async (c) => {
 // ── audit — immutable trail (connector actions + gate decisions). Owner/admin. ─
 dashboardApp.get('/audit', async (c) => {
   const result = await loadAudit(c.env, c.get('auth'))
-  return c.html(shell(c.env.BRAND, 'Audit log', auditBody(result)))
+  // WARN-1 (Codex): a non-admin gets a real 403, not a 200-with-empty. The body
+  // still renders the restricted state; the status makes the denial monitorable.
+  const status = result.forbidden ? 403 : 200
+  return c.html(shell(c.env.BRAND, 'Audit log', auditBody(result)), status)
 })
 
 // ── brain (per-pot brain panel — decision feed + governor) ───────────────────
