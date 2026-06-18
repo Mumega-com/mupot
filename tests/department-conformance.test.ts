@@ -58,6 +58,10 @@ import {
 // see test group 9 for the export-surface assertion.
 import { _isKernelToken } from '../src/departments/kernel'
 
+// GrowthModule has channels with declared proposesOnly work-types (needed for
+// gate.propose tests after the BLOCK-1 fix enforces the work-type map).
+import { GrowthModule } from '../src/departments/modules/growth'
+
 // CtxError is still exported from ctx.ts (it is a type, not a minting capability).
 import { CtxError } from '../src/departments/ctx'
 
@@ -1126,16 +1130,19 @@ describe('8. Registry hardening', () => {
     expect(row.created_at).toBe(FIXED_TIME)
   })
 
-  it('mintCtx uses injected now() in gate.propose gateId', async () => {
+  it('mintCtx uses injected now() in gate.propose gateId — requires a declared proposesOnly work-type', async () => {
+    // BLOCK-1 fix: gate.propose now enforces the work-type map. FixtureModule has
+    // no channels (no declared work-types), so any propose would throw work_type_not_declared.
+    // Use GrowthModule which has SeoChannel with seo-audit-proposal (proposesOnly=true).
     const FIXED_TIME = '2026-01-01T00:00:00.000Z'
     const ctx = kernelMintCtx(makeKernelHandle(db), {
       tenantId: 'tenant-a',
-      departmentKey: 'fixture',
-      module: FixtureModule,
+      departmentKey: 'growth',
+      module: GrowthModule,
       capabilities: ['member'],
       now: () => FIXED_TIME,
     })
-    const result = await ctx.gate.propose({ action: 'test' })
+    const result = await ctx.gate.propose({ action: 'seo-audit-proposal' })
     expect(result.gateId).toContain(FIXED_TIME)
   })
 })

@@ -47,7 +47,8 @@ import type {
   GatePort,
   BusPort,
 } from './ctx'
-import { composeDeptMetricDescriptors, deepFreezeChannels } from './channels/compose'
+import { composeDeptMetricDescriptors, deepFreezeChannels, getChannelWorkTypes } from './channels/compose'
+import type { GatedWorkType } from './channels/contract'
 
 // Re-export types so registry.ts only needs to import from kernel.ts.
 export type { KernelHandle, DepartmentCtx } from './ctx'
@@ -130,8 +131,44 @@ function _mintCtxInternal(
   // module here — BEFORE reading any authority-bearing field — so the kernel
   // boundary is closed for ALL callers regardless of whether the registry's own
   // frozen copy was used. Belt-and-suspenders with the registry's deepFreezeClone.
+  //
+  // S3 NOTE: configSchema on ChannelDescriptors may be a Zod schema object.
+  // Zod schemas contain functions which structuredClone cannot handle (DataCloneError).
+  // We strip configSchema from each channel before cloning and restore the original
+  // references post-clone. deepFreezeChannels then freezes them in place.
+  // configSchema is NOT authority-bearing (it is validation-spec data only), so
+  // omitting it from the structuredClone does not weaken the boundary.
   const module: DepartmentModule = ((): DepartmentModule => {
-    const clone = structuredClone(opts.module) as DepartmentModule
+    const configSchemas = new Map<string, unknown>()
+    let cloneableModule = opts.module
+    if (opts.module.channels) {
+      for (const ch of opts.module.channels) {
+        if (ch.configSchema !== undefined) {
+          configSchemas.set(ch.key, ch.configSchema)
+        }
+      }
+    }
+    if (configSchemas.size > 0) {
+      cloneableModule = {
+        ...opts.module,
+        channels: opts.module.channels?.map((ch) =>
+          ch.configSchema !== undefined ? { ...ch, configSchema: undefined } : ch,
+        ),
+      }
+    }
+
+    const clone = structuredClone(cloneableModule) as DepartmentModule
+
+    // Restore configSchema references from the original module.
+    if (configSchemas.size > 0 && clone.channels) {
+      for (let i = 0; i < clone.channels.length; i++) {
+        const key = clone.channels[i].key
+        if (configSchemas.has(key)) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ;(clone.channels[i] as any).configSchema = configSchemas.get(key)
+        }
+      }
+    }
     for (const desc of clone.metricsEmitted) {
       Object.freeze((desc as { sourceAuthority: readonly string[] }).sourceAuthority)
       Object.freeze((desc as { display: object }).display)
@@ -169,6 +206,24 @@ function _mintCtxInternal(
       })
       return [d.key, frozen]
     }),
+  )
+
+  // ── Closure-private work-type map (NOT exposed on ctx) ───────────────────
+  //
+  // Built from the composed channel work-types: getChannelWorkTypes(module.channels).
+  // Maps work-type key → frozen GatedWorkType descriptor.
+  //
+  // gate.propose MUST fail closed:
+  //   - Unknown action (not in any declared work-type) → throw 'work_type_not_declared'
+  //   - Known work-type but proposesOnly=false        → throw 'work_type_not_proposesOnly'
+  //     (non-proposesOnly work-types are unsupported until S4)
+  //   - requiredCapability present → enforce it (else fall back to 'member' floor)
+  //
+  // getChannelWorkTypes already throws ChannelComposeError on duplicate keys, so the
+  // map is built only from a validated dedup-clean list. The module is already frozen
+  // above, so the channel work-type definitions cannot be widened after mint.
+  const _workTypeMap = new Map<string, Readonly<GatedWorkType>>(
+    getChannelWorkTypes(module.channels ?? []).map((wt) => [wt.key, Object.freeze({ ...wt })]),
   )
 
   // ── metrics facade ────────────────────────────────────────────────────────
@@ -239,12 +294,52 @@ function _mintCtxInternal(
 
   const gate: GatePort = Object.freeze({
     async propose(proposal: { action: string; payload?: unknown }): Promise<{ gateId: string }> {
+      // ── Capability floor ───────────────────────────────────────────────────
       if (!hasCapability(_capSet, 'member')) {
         throw new CtxError(
           'capability_denied',
           `ctx(${departmentKey}@${tenantId}): 'member' capability required to propose`,
         )
       }
+
+      // ── Work-type existence check (fail closed) ───────────────────────────
+      //
+      // proposal.action MUST be a declared work-type key from this dept's composed
+      // channel work-types. If not found, the caller is proposing an undeclared or
+      // fabricated action — reject before producing any gate record.
+      const workType = _workTypeMap.get(proposal.action)
+      if (!workType) {
+        throw new CtxError(
+          'work_type_not_declared',
+          `ctx(${departmentKey}@${tenantId}): work-type '${proposal.action}' is not declared in any channel of this department`,
+        )
+      }
+
+      // ── proposesOnly check ────────────────────────────────────────────────
+      //
+      // Non-proposesOnly work-types are unsupported until S4 (Gate-as-approval-surface).
+      // All S1/S2/S3 work-types must be proposesOnly=true.
+      if (!workType.proposesOnly) {
+        throw new CtxError(
+          'work_type_not_proposesOnly',
+          `ctx(${departmentKey}@${tenantId}): work-type '${proposal.action}' is not proposesOnly — non-proposesOnly work-types are unsupported until S4`,
+        )
+      }
+
+      // ── requiredCapability check ──────────────────────────────────────────
+      //
+      // If the work-type declares a requiredCapability, enforce it. Otherwise the
+      // 'member' floor above is sufficient.
+      if (workType.requiredCapability !== undefined) {
+        if (!hasCapability(_capSet, workType.requiredCapability)) {
+          throw new CtxError(
+            'capability_denied',
+            `ctx(${departmentKey}@${tenantId}): work-type '${proposal.action}' requires '${workType.requiredCapability}' capability`,
+          )
+        }
+      }
+
+      // ── Record intent (stub — S4 will write to gates table) ──────────────
       void proposal
       return { gateId: `stub-${tenantId}-${departmentKey}-${nowFn()}` }
     },

@@ -98,6 +98,36 @@ export function deepFreezeChannels(channels: ChannelDescriptor[]): readonly Chan
       Object.freeze(ch.renderHints)
     }
 
+    // Freeze configSchema if present and it is a plain object (ZodObject etc.).
+    //
+    // WARN-1 fix (Opus + Codex gate): a single Object.freeze(ch.configSchema) is
+    // top-level only. Zod v4 exposes `.shape` as a getter whose return value is a
+    // mutable object — it must be frozen separately so nested field descriptors
+    // cannot be added or overwritten post-registration.
+    //
+    // Strategy: freeze the schema object itself, then freeze the `.shape` getter
+    // result (the Zod field map) if it exists and is an object. Tested: Zod v4
+    // .parse() / .safeParse() continue to work after both freezes because the
+    // parse path reads own enumerable properties of the frozen shape object (it
+    // does not add to it). Methods live on the prototype (not own props) so they
+    // are unaffected by Object.freeze on the instance.
+    //
+    // Authority note: configSchema is NOT authority-bearing (it is a validation
+    // spec only — marketing-channels.md §3 leak-guard 3). This freeze is defensive:
+    // it closes the S4 landmine where a future code path might read configSchema to
+    // make authority decisions on a mutated shape.
+    if (ch.configSchema !== undefined && ch.configSchema !== null && typeof ch.configSchema === 'object') {
+      Object.freeze(ch.configSchema)
+      // Freeze the `.shape` getter result if present (Zod ZodObject shape map).
+      const schemaAsRecord = ch.configSchema as Record<string, unknown>
+      if (
+        typeof schemaAsRecord['shape'] === 'object' &&
+        schemaAsRecord['shape'] !== null
+      ) {
+        Object.freeze(schemaAsRecord['shape'])
+      }
+    }
+
     // Freeze the descriptor itself.
     Object.freeze(ch)
   }
@@ -178,9 +208,9 @@ export function getChannelWorkTypes(
 // channels field) so composed channel descriptors are frozen before the kernel
 // consumes them.
 //
-// TODO(S3): configSchema is not deep-frozen in deepFreezeChannels. Wire
-// Zod-validate + freeze configSchema here when the SEO channel defines a real
-// config shape (Opus Low finding, S1 gate).
+// S3: configSchema is now frozen in deepFreezeChannels — the TODO above is CLOSED.
+// configSchema is declared as `unknown`; channels that define a Zod schema (SeoChannel)
+// store it here. deepFreezeChannels freezes the schema object post-registration.
 
 export function composeDeptMetricDescriptors(
   deptOwn: readonly MetricDescriptor[],

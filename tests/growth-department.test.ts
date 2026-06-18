@@ -316,22 +316,31 @@ describe('A. GrowthModule registration + activation', () => {
     expect(GrowthModule.metricsEmitted).toHaveLength(0)
   })
 
-  it('GrowthModule has OutboundChannel in channels (S2)', () => {
+  it('GrowthModule has OutboundChannel + SeoChannel in channels (S2+S3)', () => {
     expect(GrowthModule.channels).toBeDefined()
-    expect(GrowthModule.channels).toHaveLength(1)
-    expect(GrowthModule.channels![0].key).toBe('outbound')
+    // S3: SeoChannel was added alongside OutboundChannel → 2 channels total.
+    expect(GrowthModule.channels).toHaveLength(2)
+    const keys = GrowthModule.channels!.map((c) => c.key)
+    expect(keys).toContain('outbound')
+    expect(keys).toContain('seo')
   })
 
-  it('GrowthModule composed metric set has 3 funnel descriptors (via OutboundChannel)', () => {
-    // The composed set is what the kernel authorizes — test it via OutboundChannel directly.
-    // growth.channels = [OutboundChannel], which has 3 metricDescriptors.
+  it('GrowthModule composed metric set has 8 descriptors (3 outbound + 5 seo via channels, S3)', () => {
+    // S3: growth.channels = [OutboundChannel (3), SeoChannel (5)] → 8 total.
     const channelMetrics = GrowthModule.channels?.flatMap((ch) => ch.metricDescriptors) ?? []
     const allMetrics = [...GrowthModule.metricsEmitted, ...channelMetrics]
-    expect(allMetrics).toHaveLength(3)
+    expect(allMetrics).toHaveLength(8)
     const keys = allMetrics.map((d) => d.key)
+    // Outbound keys (S2)
     expect(keys).toContain('growth.leads')
     expect(keys).toContain('growth.replies')
     expect(keys).toContain('growth.conversion')
+    // SEO keys (S3)
+    expect(keys).toContain('seo.organic_sessions')
+    expect(keys).toContain('seo.conversion_rate')
+    expect(keys).toContain('seo.indexed_pages')
+    expect(keys).toContain('seo.issues_open')
+    expect(keys).toContain('seo.ai_citations')
   })
 
   it('GrowthModule declares 2 default squads (demand-gen + pipeline)', () => {

@@ -31,6 +31,7 @@
 import type { DepartmentModule } from '../contract'
 import { register } from '../registry'
 import { OutboundChannel } from '../channels/outbound-channel'
+import { SeoChannel } from '../channels/seo-channel'
 
 export const GrowthModule: DepartmentModule = {
   key: 'growth',
@@ -109,7 +110,11 @@ export const GrowthModule: DepartmentModule = {
   // growth.leads / growth.replies / growth.conversion now live in OutboundChannel
   // and are composed into the dept's effective metric set at registration/mint time.
   // The collector (growth-collector.ts) is UNCHANGED — same keys, same source.
-  channels: [OutboundChannel],
+  //
+  // S3: SeoChannel adds 5 SEO/AEO metric descriptors + 4 gated work-types.
+  // The SEO collector (seo-collector.ts) emits from 'first-party' source (pot's
+  // own pulse spine). PostHog and GSC connectors are declared as intent (not live).
+  channels: [OutboundChannel, SeoChannel],
 }
 
 // Auto-register when this module is imported.
