@@ -64,7 +64,7 @@ import { loadEconomy, economyBody } from './economy'
 import { loadVerifications, verificationsBody } from './verifications'
 import { loadAudit, auditBody } from './audit'
 import { loadBilling, billingBody } from './billing'
-import { pageHeader, notConnected } from './ui'
+import { pageHeader, notConnected, statCard, kpiRow } from './ui'
 import type { ApprovalItem } from './approvals'
 import {
   loadObservatory,
@@ -2709,6 +2709,23 @@ function observatoryBody(
   const queueCount = approvals.length
   const queueCards = approvals.map((t) => approvalCardHtml(t)).join('')
 
+  // ── fleet-level KPI strip (ui.ts) — real numbers only, summed from loaded stats
+  let inFlightTotal = 0
+  let spendTotal = 0
+  for (const a of agents) {
+    const s = stats.get(a.id)
+    if (s) {
+      inFlightTotal += s.in_flight
+      spendTotal += s.spend_micro_usd
+    }
+  }
+  const kpiStrip = kpiRow([
+    statCard({ label: 'Agents', value: String(agents.length) }),
+    statCard({ label: 'In flight', value: String(inFlightTotal), subTone: inFlightTotal > 0 ? 'primary' : 'dim' }),
+    statCard({ label: 'Needs decision', value: String(queueCount), subTone: queueCount > 0 ? 'warn' : 'dim' }),
+    statCard({ label: 'Spend · 24h', value: formatUsd(spendTotal) }),
+  ])
+
   const operatorSection = `
   <section class="panel queue-section">
     <div class="panel-head">
@@ -2769,9 +2786,12 @@ function observatoryBody(
        </div>`
 
   return html`
-    <h1>${brand}</h1>
-    <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role}</p>
+    ${pageHeader({
+      title: brand,
+      crumbs: `Signed in as ${auth.email ?? auth.userId} · ${auth.role}`,
+    })}
     <p style="margin:4px 0 14px"><a class="btn" href="/send" style="display:inline-block;text-decoration:none">Send a task →</a></p>
+    ${kpiStrip}
     ${raw(hint)}
     <div class="obs">
       ${raw(swimlaneSection)}
@@ -2945,8 +2965,7 @@ function squadBoardBody(squad: Squad, agents: Agent[], tasks: Task[], canAddAgen
     </div>`
 
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / ${squad.name}</p>
-    <h1>${squad.name}</h1>
+    ${pageHeader({ crumbs: `Overview / ${squad.name}`, title: squad.name })}
     ${squadHeader}
     ${
       squad.charter
@@ -3023,7 +3042,11 @@ function agentConsoleBody(agent: Agent, squad: Squad | null, canWake: boolean) {
   return html`
     <p class="crumbs"><a href="/">Overview</a> /
       ${squad ? html`<a href="/squads/${squad.id}">${squad.name}</a>` : html`squad`} / ${agent.name}</p>
-    <h1>${statusDot(agent.status)} ${agent.name}</h1>
+    ${pageHeader({
+      title: agent.name,
+      badge: agent.status,
+      badgeTone: agent.status === 'active' ? 'ok' : 'dim',
+    })}
     <div class="card">
       <dl class="kv">
         <dt>Slug</dt><dd>${agent.slug}</dd>
@@ -3310,13 +3333,16 @@ function flightsBody(cards: FlightCard[]) {
     : `<p class="empty">No flights yet. A flight = one bounded run of an agent toward a goal —
        it appears here when a flight is created (preflight), and shows its accounted cost on land.</p>`
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / Flights</p>
-    <h1>Flights</h1>
-    <p class="empty" style="margin-top:0;max-width:680px">
-      Each flight is one bounded agent run toward a goal. <b>${flying}</b> flying,
-      <b>${sleeping}</b> sleeping. Score is readiness at preflight / coherence on land,
-      with its trend vs that agent's last flight. Cost is metered (the black box).
-      Read-only — control lives on <a href="/fleet">Fleet</a>.</p>
+    ${pageHeader({
+      crumbs: 'Overview / Flights',
+      title: 'Flights',
+      sub:
+        'Each flight is one bounded agent run toward a goal. Score is readiness at preflight / coherence on land, with its trend vs that agent’s last flight. Cost is metered (the black box). Read-only — control lives on Fleet.',
+    })}
+    ${kpiRow([
+      statCard({ label: 'Flying', value: String(flying), subTone: flying > 0 ? 'ok' : 'dim' }),
+      statCard({ label: 'Sleeping', value: String(sleeping), subTone: 'dim' }),
+    ])}
     <style>
       .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
       .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;
@@ -3372,14 +3398,13 @@ function potFleetBody(rows: PresenceView[]) {
        pack + a member token; it checks in at <code>POST /api/fleet/checkin</code> and
        appears here (active when in, fades to dead when out).</p>`
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / Fleet</p>
-    <h1>Fleet</h1>
-    <p class="empty" style="margin-top:0;max-width:680px">
-      Your flock — agents that check in to this pot, on any runtime (Claude Code,
-      Codex, Hermes, openclaw…). <b>${present}</b> present now. Always-on agents read
-      their heartbeat (active/idle/dead); session agents read their schedule
-      (flying / sleeping · next run / done) — a resting agent is sleeping, not dead.
-      Times UTC. Control arrives with the bus/ops wiring.</p>
+    ${pageHeader({
+      crumbs: 'Overview / Fleet',
+      title: 'Fleet',
+      sub:
+        'Your flock — agents that check in to this pot, on any runtime (Claude Code, Codex, Hermes, openclaw…). Always-on agents read their heartbeat (active/idle/dead); session agents read their schedule (flying / sleeping · next run / done) — a resting agent is sleeping, not dead. Times UTC. Control arrives with the bus/ops wiring.',
+    })}
+    ${kpiRow([statCard({ label: 'Present now', value: String(present), subTone: present > 0 ? 'ok' : 'dim' })])}
     <style>
       .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
       .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;
@@ -3421,13 +3446,18 @@ function fleetBody(rows: FleetRow[], error: string | null) {
         <tbody>${rows.map(tr).join('')}</tbody>
       </table>`
     : '<p class="empty">No agents visible on the bus.</p>'
+  const liveFleet = rows.filter((r) => r.liveness === 'active').length
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / Fleet</p>
-    <h1>Fleet</h1>
-    <p class="empty" style="margin-top:0;max-width:680px">
-      Every company agent on the bus. <b>Run</b> pings the agent directly.
-      Pause / Deactivate / Delete send a receipted control request to operations
-      (owner/admin only) — nothing here kills a process silently.</p>
+    ${pageHeader({
+      crumbs: 'Overview / Fleet',
+      title: 'Fleet',
+      sub:
+        'Every company agent on the bus. Run pings the agent directly. Pause / Deactivate / Delete send a receipted control request to operations (owner/admin only) — nothing here kills a process silently.',
+    })}
+    ${kpiRow([
+      statCard({ label: 'On the bus', value: String(rows.length) }),
+      statCard({ label: 'Active', value: String(liveFleet), subTone: liveFleet > 0 ? 'ok' : 'dim' }),
+    ])}
     <style>
       .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
       .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;
@@ -3543,12 +3573,12 @@ function membersPageBody(
           .join('')
 
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / Access Tokens</p>
-    <h1>Access Tokens</h1>
-    <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role} ·
-      ${members.length} ${members.length === 1 ? 'person' : 'people'}. A token is what a person pastes into
-      their workspace config (see the <a href="/">Connect card</a>). Provision one below — it is shown
-      exactly once.</p>
+    ${pageHeader({
+      crumbs: `Signed in as ${auth.email ?? auth.userId} · ${auth.role} · ${members.length} ${members.length === 1 ? 'person' : 'people'}`,
+      title: 'Access Tokens',
+      sub:
+        'A token is what a person pastes into their workspace config (see the Connect card). Provision one below — it is shown exactly once.',
+    })}
     <div class="card" style="padding:0">
       <table class="grid">
         <thead>
@@ -3713,11 +3743,12 @@ function membersAdminBody(
           .join('')
 
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / People &amp; Access</p>
-    <h1>People &amp; Access</h1>
-    <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role} ·
-      ${members.length} ${members.length === 1 ? 'person' : 'people'} · each person is a
-      sponsor or owner accountable for the AI agents they register (one person, many channels).</p>
+    ${pageHeader({
+      crumbs: `Signed in as ${auth.email ?? auth.userId} · ${auth.role} · ${members.length} ${members.length === 1 ? 'person' : 'people'}`,
+      title: 'People & Access',
+      sub:
+        'Each person is a sponsor or owner accountable for the AI agents they register (one person, many channels).',
+    })}
 
     <h2>Onboard a person</h2>
     <div class="card">
@@ -3851,8 +3882,7 @@ function divisionsAdminBody(
 
   if (depts.length === 0) {
     return html`
-      <p class="crumbs"><a href="/">Overview</a> / Organization</p>
-      <h1>Organization</h1>
+      ${pageHeader({ crumbs: 'Overview / Organization', title: 'Organization' })}
       <div class="card"><p class="empty">No departments yet. Seed the organization via
         <code>POST /api/org/departments</code> and they'll appear here.</p></div>`
   }
@@ -3885,12 +3915,15 @@ function divisionsAdminBody(
     .join('')
 
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / Organization</p>
-    <h1>Organization</h1>
-    <p class="crumbs">Signed in as ${auth.email ?? auth.userId} · ${auth.role} ·
-      ${depts.length} department${depts.length === 1 ? '' : 's'} ·
-      ${squads.length} team${squads.length === 1 ? '' : 's'}. An owner is any person holding the
-      <strong>lead</strong> entitlement or stronger on that scope.</p>
+    ${pageHeader({
+      crumbs: `Signed in as ${auth.email ?? auth.userId} · ${auth.role}`,
+      title: 'Organization',
+      sub: 'An owner is any person holding the lead entitlement or stronger on that scope.',
+    })}
+    ${kpiRow([
+      statCard({ label: 'Departments', value: String(depts.length) }),
+      statCard({ label: 'Teams', value: String(squads.length) }),
+    ])}
     ${raw(cards)}
     <p class="empty">Assign an owner from the <a href="/admin/members">People &amp; Access</a> page — grant a person
       the <code>lead</code> entitlement (or higher) on the department or team scope.</p>`
@@ -4328,13 +4361,22 @@ function agentsBody(
       </div>`
     : ''
 
+  const activeCount = agents.filter((a) => a.status === 'active').length
+  const pausedCount = agents.length - activeCount
+
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / Agents</p>
-    <h1>Agents</h1>
-    <p class="empty" style="margin-top:0;max-width:680px">
-      All agents across this pot. Each card shows the unit's objective, KPI, effort level, autonomy, and current work.
-      ${canManage ? raw('Use the Configure panel on each card to set OKR, effort, autonomy, and budget.') : html``}
-    </p>
+    ${pageHeader({
+      crumbs: 'Overview / Agents',
+      title: 'Agents',
+      sub:
+        'All agents across this pot. Each card shows the unit’s objective, KPI, effort level, autonomy, and current work.' +
+        (canManage ? ' Use the Configure panel on each card to set OKR, effort, autonomy, and budget.' : ''),
+    })}
+    ${kpiRow([
+      statCard({ label: 'Agents', value: String(agents.length) }),
+      statCard({ label: 'Active', value: String(activeCount), subTone: 'ok' }),
+      statCard({ label: 'Paused', value: String(pausedCount), subTone: pausedCount > 0 ? 'dim' : 'dim' }),
+    ])}
     ${raw(errorBanner)}
     ${raw(cardsHtml)}
     ${raw(addForm)}
