@@ -51,7 +51,7 @@ describe('inkwellContentWrite — SSRF guard on apiUrl', () => {
     ['https://127.0.0.1.', 'trailing-dot-loopback'],
     ['not-a-url', 'unparseable'],
   ])('rejects %s (%s) with inkwell_bad_apiurl, no fetch', async (apiUrl) => {
-    await expect(inkwellContentWrite({ apiUrl, token: 'tok' }, payload, neverFetch)).rejects.toMatchObject({
+    await expect(inkwellContentWrite({ apiUrl, token: 'tok', tenantSlug: 'mumega' }, payload, neverFetch)).rejects.toMatchObject({
       reason: 'inkwell_bad_apiurl',
     })
     expect(neverFetch).not.toHaveBeenCalled()
@@ -59,7 +59,7 @@ describe('inkwellContentWrite — SSRF guard on apiUrl', () => {
 
   it('allows a public https host', async () => {
     const ok = vi.fn(async () => new Response(JSON.stringify({ ok: true, slug: 's', url: '/blog/s' }), { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch
-    const r = await inkwellContentWrite({ apiUrl: 'https://inkwell-api.mumega.com', token: 'tok' }, payload, ok)
+    const r = await inkwellContentWrite({ apiUrl: 'https://inkwell-api.mumega.com', token: 'tok', tenantSlug: 'mumega' }, payload, ok)
     expect(r.ok).toBe(true)
     expect(ok).toHaveBeenCalledOnce()
   })
