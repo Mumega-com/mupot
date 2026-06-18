@@ -61,6 +61,10 @@ import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
 import { loadApprovals, resultPreview } from './approvals'
 import { loadLoopsView, loopsBody } from './loops'
 import { loadEconomy, economyBody } from './economy'
+import { loadVerifications, verificationsBody } from './verifications'
+import { loadAudit, auditBody } from './audit'
+import { loadBilling, billingBody } from './billing'
+import { pageHeader, notConnected } from './ui'
 import type { ApprovalItem } from './approvals'
 import {
   loadObservatory,
@@ -202,6 +206,58 @@ dashboardApp.get('/loops', async (c) => {
 dashboardApp.get('/economy', async (c) => {
   const data = await loadEconomy(c.env)
   return c.html(shell(c.env.BRAND, 'Economy', economyBody(data)))
+})
+
+// ── economy/billing — current plan + tier from org_settings (no secrets) ─────
+dashboardApp.get('/economy/billing', async (c) => {
+  const model = await loadBilling(c.env, c.get('auth'))
+  return c.html(shell(c.env.BRAND, 'Billing', billingBody(model)))
+})
+
+// ── economy/wallet + marketplace — honest-empty (greenfield, no backing model) ─
+// Per the reskin plan §5 + Codex condition 6: render the real chrome with a
+// visible "not connected" state. NEVER fabricate a balance or a listing.
+dashboardApp.get('/economy/wallet', (c) =>
+  c.html(
+    shell(
+      c.env.BRAND,
+      'Wallet',
+      html`${pageHeader({ crumbs: 'Overview / Economy / Wallet', title: 'Wallet' })}
+      ${notConnected(
+        'Wallet',
+        'A per-pot credit wallet — balance, top-ups, and per-execution debits — has no backing model yet. Real Claude Code spend is visible under Economy.',
+      )}`,
+    ),
+  ),
+)
+dashboardApp.get('/economy/marketplace', (c) =>
+  c.html(
+    shell(
+      c.env.BRAND,
+      'Marketplace',
+      html`${pageHeader({ crumbs: 'Overview / Economy / Marketplace', title: 'Marketplace' })}
+      ${notConnected(
+        'Marketplace',
+        'Listing this pot’s agents/capabilities for rent or sale (and the earnings ledger) is not connected yet.',
+      )}`,
+    ),
+  ),
+)
+
+// ── verifications — latest verdict per task (reuses the S4-hardened verdict store) ─
+// Read-only. Visibility mirrors /approvals (owner/admin all; others gate-scoped).
+dashboardApp.get('/verifications', async (c) => {
+  const items = await loadVerifications(c.env, c.get('auth'))
+  return c.html(shell(c.env.BRAND, 'Verifications', verificationsBody(items)))
+})
+
+// ── audit — immutable trail (connector actions + gate decisions). Owner/admin. ─
+dashboardApp.get('/audit', async (c) => {
+  const result = await loadAudit(c.env, c.get('auth'))
+  // WARN-1 (Codex): a non-admin gets a real 403, not a 200-with-empty. The body
+  // still renders the restricted state; the status makes the denial monitorable.
+  const status = result.forbidden ? 403 : 200
+  return c.html(shell(c.env.BRAND, 'Audit log', auditBody(result)), status)
 })
 
 // ── brain (per-pot brain panel — decision feed + governor) ───────────────────
@@ -2141,6 +2197,47 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       .squad-unit-meta .suf-item { display: flex; flex-direction: column; gap: 2px; }
       .squad-unit-meta .suf-label { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
 
+      /* ══ console-reskin primitives (src/dashboard/ui.ts) ══════════════════ */
+      .ui-pagehead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 4px; }
+      .ui-h1 { font-family: var(--font-display); font-weight: 400; font-size: 36px; line-height: 1.1; margin: 0; letter-spacing: -.01em; }
+      .ui-sub { color: var(--dim); font-size: 13.5px; margin: 6px 0 18px; max-width: 680px; line-height: 1.5; }
+      .ui-pill { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 10.5px; font-weight: 600; letter-spacing: .04em; padding: 3px 8px; border-radius: 999px;
+        color: var(--pill,var(--primary)); background: color-mix(in srgb, var(--pill,var(--primary)) 12%, transparent); border: 1px solid color-mix(in srgb, var(--pill,var(--primary)) 28%, transparent); }
+      .ui-status { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text2); }
+      .ui-status-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+
+      .ui-kpis { display: grid; grid-template-columns: repeat(4,1fr); gap: 14px; margin: 18px 0; }
+      @media (max-width:1180px){ .ui-kpis { grid-template-columns: repeat(2,1fr); } }
+      @media (max-width:680px){ .ui-kpis { grid-template-columns: 1fr; } }
+      .ui-stat { border: 1px solid var(--border); border-radius: 14px; background: var(--surface); padding: 15px 16px; box-shadow: var(--shadow,none); }
+      .ui-stat-label { font-size: 12.5px; color: var(--dim); margin-bottom: 8px; }
+      .ui-stat-value { font-family: var(--font-display); font-weight: 400; font-size: 38px; line-height: 1; color: var(--text); }
+      .ui-stat-bar { height: 6px; border-radius: 5px; background: var(--bars); margin: 12px 0 8px; overflow: hidden; }
+      .ui-stat-bar > span { display: block; height: 100%; border-radius: 5px; }
+      .ui-stat-sub { font-size: 11.5px; }
+
+      .ui-panel { border: 1px solid var(--border); border-radius: 16px; background: var(--surface); padding: 0; margin: 18px 0; box-shadow: var(--shadow,none); overflow: hidden; }
+      .ui-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 15px 18px; border-bottom: 1px solid var(--border-soft); }
+      .ui-panel-title { font-family: var(--font-body); font-weight: 700; font-size: 14px; margin: 0; }
+      .ui-panel-right { display: flex; align-items: center; gap: 8px; }
+      .ui-panel-body { padding: 16px 18px; }
+
+      .ui-table { width: 100%; }
+      .ui-tr { display: grid; align-items: center; gap: 12px; padding: 10px 14px; }
+      .ui-thead { border-bottom: 1px solid var(--border-soft); }
+      .ui-th { font-family: var(--font-mono); font-size: 10px; font-weight: 600; letter-spacing: .6px; text-transform: uppercase; color: var(--dim); }
+      .ui-row { border-bottom: 1px solid var(--border-soft); }
+      .ui-row:last-child { border-bottom: none; }
+      .ui-row:hover { background: var(--hover); }
+      .ui-td { font-size: 13px; color: var(--text); min-width: 0; }
+      .ui-table-empty { padding: 22px 14px; color: var(--dim); font-size: 13px; }
+
+      .ui-empty { border: 1px dashed var(--border); border-radius: 16px; background: var(--surface); padding: 40px 24px; text-align: center; margin: 18px 0; }
+      .ui-empty-mark { font-size: 30px; color: var(--dim); line-height: 1; margin-bottom: 12px; }
+      .ui-empty-title { font-weight: 700; font-size: 15px; color: var(--text); margin-bottom: 6px; }
+      .ui-empty-detail { font-size: 13px; color: var(--text2); max-width: 460px; margin: 0 auto; line-height: 1.5; }
+      .ui-empty-hint { font-size: 11.5px; color: var(--dim); margin-top: 10px; }
+
       /* ── /approvals page styles (kept here to avoid duplication) ── */
     </style>
   </head>
@@ -2213,7 +2310,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
             <div class="nav-children" id="children-work">
               <a class="nav-child" href="/send">Tasks</a>
               <a class="nav-child" href="/flights">Pull requests</a>
-              <a class="nav-child" href="/loops">Verifications</a>
+              <a class="nav-child" href="/verifications">Verifications</a>
             </div>
           </div>
 
@@ -2238,9 +2335,10 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
               <span class="nav-chevron" id="chev-econ"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M6 4l4 4-4 4"/></svg></span>
             </button>
             <div class="nav-children" id="children-econ">
-              <a class="nav-child" href="/economy">Wallet</a>
-              <a class="nav-child" href="/economy">Marketplace</a>
-              <a class="nav-child" href="/economy">Billing</a>
+              <a class="nav-child" href="/economy">Spend</a>
+              <a class="nav-child" href="/economy/wallet">Wallet</a>
+              <a class="nav-child" href="/economy/marketplace">Marketplace</a>
+              <a class="nav-child" href="/economy/billing">Billing</a>
             </div>
           </div>
 
@@ -2251,7 +2349,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
           </a>
 
           <!-- Audit log -->
-          <a class="nav-link" href="/brain">
+          <a class="nav-link" href="/audit">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M5.5 3.5h6l3.5 3.5V16.5h-9.5z"/><path d="M11.3 3.5V7h3.4M7.5 10.5h5M7.5 13h5"/></svg>
             <span class="nav-label">Audit log</span>
           </a>
@@ -3123,15 +3221,18 @@ function approvalsBody(items: ApprovalItem[]) {
   // Re-use the shared card renderer. Wrap in a named container so the script can
   // scope its querySelectorAll without touching #obs-queue on the home page.
   const cards = items.map((t) => approvalCardHtml(t)).join('')
+  const n = items.length
 
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / Approvals</p>
-    <h1>Approvals</h1>
-    <p class="empty" style="margin-top:0;max-width:640px">
-      Work waiting at your gate. Approve to release it; reject sends it back with your note.
-    </p>
-    ${items.length ? raw(`<div id="approvals-list">${cards}</div>`) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
-    ${items.length ? approvalsScript() : html``}`
+    ${pageHeader({
+      crumbs: 'Overview / The Gate',
+      title: 'The Gate',
+      sub: 'Agents propose work; you authorize it. This is the only place human authority enters the loop — untrusted input can wake an agent, never steer it.',
+      badge: n ? `${String(n)} awaiting your gate` : 'Gate clear',
+      badgeTone: n ? 'warn' : 'ok',
+    })}
+    ${n ? raw(`<div id="approvals-list">${cards}</div>`) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
+    ${n ? approvalsScript() : html``}`
 }
 
 function approvalsScript() {
