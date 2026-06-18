@@ -59,6 +59,22 @@ describe('wireGatedAct', () => {
     expect(input.squad_id).toBe('sq-from-agent')
   })
 
+  it('BLOCK-1: passes skipMirror so a pre-verdict proposal NEVER mirrors to GitHub (Codex cross-vendor catch)', async () => {
+    const d = deps()
+    // A CRO proposal whose args carry first-party page-performance data + a model rec.
+    const croAct: ProposedAct = {
+      channel_index: -1,
+      tool: 'cro_content_update',
+      args: { slug: 'pricing', url: '/pricing', current_conversion_bps: 50, recommendation: 'tighten headline' },
+      summary: 'CRO: improve Pricing',
+    }
+    await wireGatedAct(ENV, makeLoop(), croAct, d)
+    const [, , options] = d.createTask.mock.calls[0]
+    // createTask mirrors to a GitHub issue BEFORE the local insert unless skipMirror —
+    // mirroring un-approved proposal args would be an external write before any verdict.
+    expect(options?.skipMirror).toBe(true)
+  })
+
   it('throws (no silent drop) when the squad cannot be resolved', async () => {
     const d = deps()
     await expect(

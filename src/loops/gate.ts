@@ -63,7 +63,14 @@ export async function wireGatedAct(
       status: 'review',
       gate_owner: LOOP_GATE_OWNER,
     },
-    { actor: { kind: 'agent', id: loop.agent_id ?? loop.id } },
+    // skipMirror: a loop proposal is an AUTONOMOUS, pre-verdict artifact — its body
+    // carries the act args (CRO: page url + conversion + model recommendation; outreach:
+    // prospect email + draft). createTask mirrors to a GitHub issue BEFORE the local
+    // insert, which would be an EXTERNAL WRITE of un-approved proposal data (BLOCK-1,
+    // Codex cross-vendor catch, 2026-06-18). The gate invariant is "no external write
+    // before a human verdict", so loop-gated proposals are internal-only. (If approved
+    // work should mirror, do it AFTER the verdict with a sanitized payload — not here.)
+    { actor: { kind: 'agent', id: loop.agent_id ?? loop.id }, skipMirror: true },
   )
 
   if (GHL_ACT_KINDS.has(act.tool)) {
