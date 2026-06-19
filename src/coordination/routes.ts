@@ -103,6 +103,11 @@ coordinationApp.get('/', async (c) => {
     if (!Number.isFinite(n)) return c.json({ error: 'invalid_limit' }, 400)
     limit = n
   }
-  const rows = await listJourneys(c.env, { scope, limit })
-  return c.json({ ok: true, board: buildDepartureBoard(rows, Date.now()), scope })
+  try {
+    const rows = await listJourneys(c.env, { scope, limit })
+    return c.json({ ok: true, board: buildDepartureBoard(rows, Date.now()), scope })
+  } catch {
+    // Explicit db_error — never silently return an empty board on a read failure (no fake-green).
+    return c.json({ error: 'db_error' }, 500)
+  }
 })

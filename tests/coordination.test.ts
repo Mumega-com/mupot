@@ -2,7 +2,8 @@
 // Service (board/update/list + board model) + the HTTP routes. Faithful in-memory journeys fake.
 
 import { describe, it, expect, vi } from 'vitest'
-import { boardJourney, updateJourney, listJourneys, buildDepartureBoard, type JourneyRow } from '../src/coordination/journeys'
+import { boardJourney, updateJourney, listJourneys, buildDepartureBoard, type JourneyRow, type DepartureCard } from '../src/coordination/journeys'
+import { controlTowerBody } from '../src/dashboard/index'
 import type { Env } from '../src/types'
 
 vi.mock('../src/auth/member-bearer', () => ({
@@ -16,7 +17,7 @@ vi.mock('../src/auth/member-bearer', () => ({
 }))
 const { coordinationApp } = await import('../src/coordination/routes')
 
-function makeDb() {
+function makeDb(opts: { throwOnList?: boolean } = {}) {
   const rows: JourneyRow[] = []
   function runRun(sql: string, b: unknown[]) {
     if (sql.includes('INSERT INTO journeys')) {
@@ -41,6 +42,7 @@ function makeDb() {
   }
   function runAll(sql: string, b: unknown[]) {
     if (sql.includes('FROM journeys')) {
+      if (opts.throwOnList) throw new Error('d1 unavailable')
       const [tenant, limit] = b as [string, number]
       const live = sql.includes("status IN ('boarding','departed','delayed')")
       return rows
@@ -88,6 +90,7 @@ describe('boardJourney', () => {
     ['empty agent', { agent: '' }, 'invalid_agent'],
     ['negative eta', { eta: -5 }, 'invalid_eta'],
     ['NaN eta', { eta: Number.NaN }, 'invalid_eta'],
+    ['eta beyond horizon', { eta: 50_000_000_000 }, 'invalid_eta'], // > now + 30d
   ])('rejects %s', async (_l, patch, reason) => {
     const r = await boardJourney(env(makeDb()), { agent: 'ag-code', project: 'mupot', ...(patch as object) }, clock)
     expect(r.ok).toBe(false)
@@ -214,5 +217,36 @@ describe('coordination routes', () => {
   })
   it('GET no token → 401', async () => {
     expect((await coordinationApp.fetch(reqJson('GET', undefined), env(makeDb()))).status).toBe(401)
+  })
+  it('GET on a DB read failure → explicit 500 db_error (never a silent empty board)', async () => {
+    const res = await coordinationApp.fetch(reqJson('GET', 'tok-code'), env(makeDb({ throwOnList: true })))
+    expect(res.status).toBe(500)
+    expect(((await res.json()) as { error: string }).error).toBe('db_error')
+  })
+})
+
+describe('controlTowerBody — XSS regression (rendered board escapes agent fields)', () => {
+  it('escapes a malicious agent / project / goal / gate', () => {
+    const card: DepartureCard = {
+      id: 'x',
+      agent: '<script>alert(1)</script>',
+      project: 'mupot',
+      goal: '<img src=x onerror=alert(2)>',
+      status: 'departed',
+      phase: 'IN FLIGHT',
+      live: true,
+      gate: '"><script>steal()</script>',
+      departed: '1m ago',
+      eta: 'in 5m',
+      age: '2m ago',
+    }
+    const out = String(controlTowerBody([card]))
+    // the raw tags must NOT survive into the HTML
+    expect(out).not.toContain('<script>alert(1)</script>')
+    expect(out).not.toContain('<img src=x onerror')
+    expect(out).not.toContain('"><script>steal()')
+    // they must appear ESCAPED instead
+    expect(out).toContain('&lt;script&gt;')
+    expect(out).toContain('&lt;img')
   })
 })
