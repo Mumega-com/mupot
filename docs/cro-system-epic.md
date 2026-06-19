@@ -24,9 +24,14 @@ A CRO system that **handles conversion optimization proactively** and that Hadi 
 ## Slices (each dyad-gated Opus + Codex, shipped live)
 - [ ] **S5b — apply bridge** — an approved CRO/content act auto-applies via the S4 executor (draft).
       Closes the loop's apply leg. *Most sensitive: writes on policy → full adversarial gate.*
-- [ ] **CRO data fabric — foundation** — a source-adapter interface that normalizes conversion/perf
-      signal across sources + a first-party-events adapter (zero-cred floor) + the CRO loop perceiving
-      from all connected sources with graceful degradation.
+- [x] **CRO data fabric — foundation** ✅ (PR #214, live) — `src/cro/sources.ts` (`CroSource` adapter
+      interface + `collectFromSources` graceful degradation + `MAX_POINTS_PER_SOURCE` cap) +
+      `src/cro/first-party.ts` (zero-cred floor over `metric_points`) + connector types (posthog/gsc/
+      google_ads/facebook_ads/crm). Both lenses green; Codex caught the missing per-source cap.
+- [x] **CRO event grain** ✅ (PR #215, live) — `migrations/0031_cro_events.sql` + `src/cro/events.ts`
+      (`recordCroEvents`/`readCroEvents` — tenant-bound, validated, capped, **idempotent** via
+      `event_key` + unique index + INSERT OR IGNORE). The attribution/segmentation grain alongside
+      `metric_points` (research-forced; Codex caught the retry-overcount + unbounded-fields holes).
 - [ ] **Connectors** — PostHog first (Hadi's startup), then GSC / Google Ads / Facebook Ads / CRM —
       each an adapter on the same interface, secrets behind the connector vault.
 - [ ] **Connect-by-stack** — the console surfaces which sources fit the pot's business stack + a connect
