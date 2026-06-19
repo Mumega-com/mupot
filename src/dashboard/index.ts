@@ -109,6 +109,7 @@ import { resolveConnector } from '../connectors/service'
 import { kernelMintCtx, getRegistered } from '../departments/registry'
 import type { KernelHandle } from '../departments/ctx'
 import '../departments/modules/growth' // side-effect: register GrowthModule so getRegistered('growth') resolves
+import '../departments/modules/agency' // side-effect: register AgencyModule (reusable agency/AEO template)
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
