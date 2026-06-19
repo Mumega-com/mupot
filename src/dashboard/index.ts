@@ -65,7 +65,18 @@ import { loadVerifications, verificationsBody } from './verifications'
 import { loadAudit, auditBody } from './audit'
 import { loadBilling, billingBody } from './billing'
 import { servicesBody } from './services'
-import { pageHeader, notConnected, statCard, kpiRow } from './ui'
+import {
+  pageHeader,
+  notConnected,
+  statCard,
+  kpiRow,
+  sectionPanel,
+  dataTable,
+  emptyState,
+  avatarBadge,
+  statusDot as uiStatusDot,
+} from './ui'
+import type { Html } from './ui'
 import type { ApprovalItem } from './approvals'
 import {
   loadObservatory,
@@ -2314,6 +2325,30 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       .ui-empty-detail { font-size: 13px; color: var(--text2); max-width: 460px; margin: 0 auto; line-height: 1.5; }
       .ui-empty-hint { font-size: 11.5px; color: var(--dim); margin-top: 10px; }
 
+      /* gradient initial tile (agent directory, recent rows, queue) */
+      .ui-av {
+        width: 30px; height: 30px; flex: none; border-radius: 9px;
+        display: inline-flex; align-items: center; justify-content: center;
+        font-family: var(--font-display); font-size: 14px; color: #fff;
+        text-shadow: 0 1px 2px rgba(0,0,0,.35);
+      }
+      .ui-av.sm { width: 22px; height: 22px; font-size: 11px; border-radius: 7px; }
+
+      /* observatory: agent-directory cells + name link */
+      .ui-agent-cell { display: flex; align-items: center; gap: 10px; min-width: 0; }
+      .ui-agent-meta { min-width: 0; }
+      .ui-agent-name { display: block; font-size: 13.5px; font-weight: 600; color: var(--text); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      a.ui-agent-name:hover { color: var(--primary); }
+      .ui-agent-role { display: block; font-size: 11.5px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .ui-mono-dim { font-family: var(--font-mono); font-size: 12px; color: var(--text2); }
+      .ui-panel-sub { font-size: 12px; color: var(--dim); margin-top: 1px; }
+      .ui-link { font-size: 12.5px; color: var(--primary); text-decoration: none; font-weight: 600; }
+      .ui-link:hover { text-decoration: underline; }
+      .obs-queue-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+      @media (max-width: 720px) {
+        .ui-tr.ui-hide-sm-3 > .ui-td:nth-child(n+4), .ui-tr.ui-hide-sm-3 > .ui-th:nth-child(n+4) { display: none; }
+      }
+
       /* ── /approvals page styles (kept here to avoid duplication) ── */
     </style>
   </head>
@@ -2814,77 +2849,111 @@ function observatoryBody(
     statCard({ label: 'Spend · 24h', value: formatUsd(spendTotal) }),
   ])
 
-  const operatorSection = `
-  <section class="panel queue-section">
-    <div class="panel-head">
-      <h2>Needs your decision${queueCount > 0 ? ` <span class="count-badge">${queueCount}</span>` : ''}</h2>
-      <a href="/approvals" style="font-size:13px;color:var(--muted)">All approvals →</a>
-    </div>
-    ${queueCount > 0
-      ? `<div id="obs-queue">${queueCards}</div>`
-      : `<div style="padding:14px 18px"><p class="empty" style="margin:0">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`
-    }
-  </section>`
+  // ── operator queue — "The Gate" surface, rendered inside the new section panel.
+  // Cards are existing escaped HTML strings (approvalCardHtml); the verdict buttons
+  // still POST to the RBAC-gated /api/tasks/:id/verdict — no new write path.
+  const operatorPanel = sectionPanel({
+    title: 'Needs your decision',
+    right: html`<a class="ui-link" href="/approvals">All approvals →</a>`,
+    body:
+      queueCount > 0
+        ? html`<div id="obs-queue" class="obs-queue-grid">${raw(queueCards)}</div>`
+        : emptyState({
+            title: 'Gate clear',
+            detail:
+              'Nothing waiting at your gates. Agents propose; gated work lands here for you to authorize.',
+          }),
+  })
+
+  // ── agent directory (design's signature full-width table) — real data only.
+  // Columns are what THIS function already loads: identity, role, live status,
+  // 24h task count, success %, 24h spend. No fabricated capabilities/Workday.
+  const directoryRows: Html[][] = agents.map((a) => {
+    const stat = stats.get(a.id)
+    const taskCount = stat?.task_count ?? 0
+    const successPct = stat?.success_pct ?? 0
+    const spend = stat?.spend_micro_usd ?? 0
+    const initial = a.name.slice(0, 1).toUpperCase()
+    const dotTone = a.status === 'active' ? 'ok' : 'dim'
+    return [
+      html`<div class="ui-agent-cell">
+        ${avatarBadge({ initial, fill: agentGradient(a.name), title: a.name })}
+        <span class="ui-agent-meta">
+          <a class="ui-agent-name" href="/agents/${a.id}">${a.name}</a>
+          <span class="ui-agent-role">${a.role}</span>
+        </span>
+      </div>`,
+      uiStatusDot(dotTone, a.status),
+      html`<span class="ui-mono-dim">${String(taskCount)}</span>`,
+      html`<span class="ui-mono-dim">${taskCount > 0 ? `${successPct}%` : '—'}</span>`,
+      html`<span class="ui-mono-dim">${spend > 0 ? formatUsd(spend) : '—'}</span>`,
+    ]
+  })
+
+  const directoryPanel = sectionPanel({
+    title: 'Agent directory',
+    right: html`<a class="ui-link" href="/agents">View all →</a>`,
+    body: dataTable({
+      cols: [
+        { label: 'Agent', width: '2fr' },
+        { label: 'Status', width: '1fr' },
+        { label: 'Tasks · 24h', width: '1fr' },
+        { label: 'Success', width: '1fr' },
+        { label: 'Spend · 24h', width: '1fr' },
+      ],
+      rows: directoryRows,
+      empty: 'No agents yet. Add departments and squads from the org tree, then add agents.',
+    }),
+  })
 
   // ── recent tasks ──────────────────────────────────────────────────────────
-  const taskRows = recentTasks.map((t) => {
+  const recentRows: Html[][] = recentTasks.map((t) => {
     const agentName = t.agent_name ?? t.agent_id ?? '—'
-    const grad = t.agent_name ? agentGradient(t.agent_name) : 'var(--dim)'
+    const grad = t.agent_name ? agentGradient(t.agent_name) : 'var(--bars)'
     const initial = agentName.slice(0, 1).toUpperCase()
     const when = (t.completed_at ?? t.created_at).slice(0, 16).replace('T', ' ')
-    return (
-      `<tr>` +
-      `<td class="task-title">${escHtml(t.title)}</td>` +
-      `<td>` +
-      `<span class="agent-chip">` +
-      `<span class="agent-chip-av" style="background:${grad}" title="${escAttr(agentName)}">${escHtml(initial)}</span>` +
-      `${escHtml(agentName)}` +
-      `</span>` +
-      `</td>` +
-      `<td><span class="st-badge st-badge--${t.status}">${escHtml(t.status.replace('_', ' '))}</span></td>` +
+    return [
+      html`<span class="task-title">${t.title}</span>`,
+      html`<span class="agent-chip">${avatarBadge({
+        initial,
+        fill: grad,
+        title: agentName,
+      })}${agentName}</span>`,
+      html`<span class="st-badge st-badge--${raw(escAttr(t.status))}">${t.status.replace('_', ' ')}</span>`,
       // Cost (#15): per-task spend stamped at execution (estimated; '—' if never run).
-      `<td class="cost-chip" title="Estimated spend for this task">${t.cost_micro_usd > 0 ? escHtml(formatUsd(t.cost_micro_usd)) : '—'}</td>` +
-      `<td style="color:var(--dim);font-size:12px">${escHtml(when)}</td>` +
-      `</tr>`
-    )
-  }).join('')
+      html`<span class="ui-mono-dim">${t.cost_micro_usd > 0 ? formatUsd(t.cost_micro_usd) : '—'}</span>`,
+      html`<span style="color:var(--dim);font-size:12px">${when}</span>`,
+    ]
+  })
 
-  const recentSection = `
-  <section class="panel">
-    <div class="panel-head">
-      <h2>Recent tasks</h2>
-    </div>
-    ${recentTasks.length === 0
-      ? `<div style="padding:14px 18px"><p class="empty" style="margin:0">No tasks yet.</p></div>`
-      : `<div style="overflow-x:auto"><table class="recent-tasks">
-           <thead><tr>
-             <th>Task</th><th>Agent</th><th>Status</th>
-             <th class="cost-chip">Cost</th><th>When</th>
-           </tr></thead>
-           <tbody>${taskRows}</tbody>
-         </table></div>`
-    }
-  </section>`
-
-  const hasData = agents.length > 0
-  const hint = hasData
-    ? ''
-    : `<div class="card" style="margin-bottom:14px">
-         <p class="empty" style="margin:0">No agents yet. <a href="/">Add departments and squads</a> from the org tree, then add agents to see them here.</p>
-       </div>`
+  const recentPanel = sectionPanel({
+    title: 'Recent tasks',
+    body: dataTable({
+      cols: [
+        { label: 'Task', width: '2fr' },
+        { label: 'Agent', width: '1.2fr' },
+        { label: 'Status', width: '1fr' },
+        { label: 'Cost', width: '0.8fr' },
+        { label: 'When', width: '1fr' },
+      ],
+      rows: recentRows,
+      empty: 'No tasks yet. Send a task to see it land here.',
+    }),
+  })
 
   return html`
     ${pageHeader({
       title: brand,
       crumbs: `Signed in as ${auth.email ?? auth.userId} · ${auth.role}`,
+      sub: 'A living company of agent-employees you hire, grow, and watch — running where you control it.',
     })}
-    <p style="margin:4px 0 14px"><a class="btn" href="/send" style="display:inline-block;text-decoration:none">Send a task →</a></p>
+    <p style="margin:4px 0 18px"><a class="btn" href="/send" style="display:inline-block;text-decoration:none">Send a task →</a></p>
     ${kpiStrip}
-    ${raw(hint)}
     <div class="obs">
       ${raw(swimlaneSection)}
-      ${raw(operatorSection)}
-      ${raw(recentSection)}
+      ${operatorPanel}
+      ${directoryPanel}
+      ${recentPanel}
     </div>
     ${queueCount > 0 ? raw(obsQueueScript()) : html``}`
 }
