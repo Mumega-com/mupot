@@ -21,6 +21,11 @@ const TYPE_LABELS: Record<ConnectorType, string> = {
   mcpwp:      'MCPWP',
   inkwell:    'Inkwell',
   github_app: 'GitHub App',
+  posthog:               'PostHog',
+  google_search_console: 'Google Search Console',
+  google_ads:            'Google Ads',
+  facebook_ads:          'Facebook Ads',
+  crm:                   'CRM',
   custom:     'Custom',
 }
 

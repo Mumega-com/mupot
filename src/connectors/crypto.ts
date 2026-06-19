@@ -32,6 +32,12 @@ export type ConnectorType =
   | 'mcpwp'
   | 'inkwell'
   | 'github_app'
+  // CRO data sources (read-credential connectors feeding the data fabric):
+  | 'posthog'
+  | 'google_search_console'
+  | 'google_ads'
+  | 'facebook_ads'
+  | 'crm'
   | 'custom'
 export type ConnectorScopeType = 'squad' | 'agent' | 'pot'
 
@@ -43,6 +49,11 @@ const VALID_TYPES: readonly ConnectorType[] = [
   'mcpwp',
   'inkwell',
   'github_app',
+  'posthog',
+  'google_search_console',
+  'google_ads',
+  'facebook_ads',
+  'crm',
   'custom',
 ]
 const VALID_SCOPE_TYPES: readonly ConnectorScopeType[] = ['squad', 'agent', 'pot']
