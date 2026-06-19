@@ -23,9 +23,17 @@ interface MsgRow {
   read_at: string | null
 }
 
-function makeDb(opts: { agents?: Array<{ id: string; squad_id: string; slug: string; name: string }> } = {}) {
+function makeDb(
+  opts: {
+    agents?: Array<{ id: string; squad_id: string; slug: string; name: string }>
+    /** Force the first N findBySenderRequestId lookups to MISS — simulates the race where a
+     *  concurrent writer's row isn't visible to the pre-check but exists by re-check time. */
+    missDedupCalls?: number
+  } = {},
+) {
   const messages: MsgRow[] = []
   const agents = opts.agents ?? []
+  let missLeft = opts.missDedupCalls ?? 0
   let seqCounter = 0
 
   function runRun(sql: string, b: unknown[]) {
@@ -52,6 +60,10 @@ function makeDb(opts: { agents?: Array<{ id: string; squad_id: string; slug: str
 
   function runFirst(sql: string, b: unknown[]) {
     if (sql.includes('from_agent = ?2 AND request_id = ?3')) {
+      if (missLeft > 0) {
+        missLeft--
+        return null // forced pre-check miss (race simulation)
+      }
       const [tenant, from_agent, request_id] = b as [string, string, string]
       const m = messages.find(
         (x) => x.tenant === tenant && x.from_agent === from_agent && x.request_id === request_id,
@@ -230,6 +242,45 @@ describe('sendAgentMessage', () => {
     // consume one → budget frees → next send accepted
     await readAgentInbox(env, { agent: 'ag-x', limit: 1 })
     expect((await send('4')).ok).toBe(true)
+  })
+
+  it('dedup wins over the cap: a same-rid duplicate arriving while at cap resolves as duplicate, NOT inbox_full', async () => {
+    // Race: a concurrent writer already landed (rid r1, fills the cap of 1); THIS send is the
+    // same (sender, rid, content) but its pre-check misses the not-yet-visible row. The cap
+    // guard then refuses the insert (changes=0) — it must re-check and return the original.
+    const db = makeDb({ missDedupCalls: 1 })
+    db._messages.push({
+      seq: 1, id: 'A', tenant: 't', to_agent: 'ag-y', from_agent: 'ag-x', from_member: 'm',
+      kind: 'message', body: 'hi', request_id: 'r1', in_reply_to: null, created_at: 't0', read_at: null,
+    })
+    const env = envWith(db)
+    const b = await sendAgentMessage(
+      env,
+      { fromAgent: 'ag-x', fromMember: 'm', toAgent: 'ag-y', body: 'hi', requestId: 'r1' },
+      { maxUnread: 1 },
+    )
+    expect(b.ok).toBe(true)
+    if (!b.ok) return
+    expect(b.duplicate).toBe(true) // NOT inbox_full — the message actually landed (writer A)
+    expect(b.id).toBe('A')
+    expect(db._messages.length).toBe(1) // no second row
+  })
+
+  it('at cap with a NON-duplicate rid still returns inbox_full', async () => {
+    const db = makeDb({ missDedupCalls: 1 }) // force the (empty) pre-check + re-check to miss
+    db._messages.push({
+      seq: 1, id: 'X', tenant: 't', to_agent: 'ag-y', from_agent: 'ag-other', from_member: 'm',
+      kind: 'message', body: 'filler', request_id: null, in_reply_to: null, created_at: 't0', read_at: null,
+    })
+    const env = envWith(db)
+    const r = await sendAgentMessage(
+      env,
+      { fromAgent: 'ag-x', fromMember: 'm', toAgent: 'ag-y', body: 'new', requestId: 'fresh' },
+      { maxUnread: 1 },
+    )
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.reason).toBe('inbox_full')
   })
 
   it('fail-closed without a tenant', async () => {

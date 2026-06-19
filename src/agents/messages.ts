@@ -173,6 +173,16 @@ export async function sendAgentMessage(
       )
       .run()
     if ((result.meta?.changes ?? 0) === 0) {
+      // The cap guard refused — BUT a 0-row insert also means the UNIQUE(tenant, from_agent,
+      // request_id) index was never consulted (no row was attempted). So a same-(sender,rid)
+      // duplicate that a concurrent writer landed AFTER our pre-check would be masked as
+      // inbox_full. Resolve replay-once FIRST: dedup must win over the cap, consistently with
+      // the pre-check and the catch path — an idempotent retry returns its original, never a
+      // spurious inbox_full for a message that actually landed.
+      if (input.requestId !== undefined) {
+        const existing = await findBySenderRequestId(env, tenant, input.fromAgent, input.requestId)
+        if (existing) return idempotentOrConflict(existing, input, kind)
+      }
       return { ok: false, reason: 'inbox_full', detail: `recipient at unread cap ${maxUnread}` }
     }
     const seq = Number(result.meta?.last_row_id ?? 0)
