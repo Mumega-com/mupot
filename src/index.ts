@@ -47,6 +47,7 @@ import { billingAdminApp } from './billing/admin'
 import { ccSpendApp } from './economy/cc-spend'
 import { resellerApp } from './reseller/routes'
 import { inboxApp } from './agents/inbox-routes'
+import { coordinationApp } from './coordination/routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -119,6 +120,11 @@ app.route('/api/reseller', resellerApp)
 // delegations over HTTP (they can't speak MCP JSON-RPC). Member-bearer auth, self-scoped to the
 // token's welded agent. Same pure service as the MCP send/inbox tools. Before the '/' catch-all.
 app.route('/api/inbox', inboxApp)
+
+// Control Tower (coordination board): agents board cross-project flights; the colony reads the
+// departures board. Member-bearer auth, agent welded from the token. The rendered board page is
+// dashboard /coordination. Before the '/' catch-all.
+app.route('/api/coordination', coordinationApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp
