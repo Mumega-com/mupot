@@ -119,6 +119,36 @@ export function statusDot(tone: Tone, label?: string): Html {
   )}"></span>${label ? html`<span>${label}</span>` : ''}</span>`
 }
 
+// ── avatarBadge ─────────────────────────────────────────────────────────────────
+// The gradient initial tile reused in the agent directory, recent-tasks rows and
+// the operator queue. `initial` is auto-escaped (it's plain text). `fill` is a
+// CSS color/gradient injected into an inline `style` via raw(), so — exactly like
+// dataTable's safeTrack — we allowlist it to a deterministic gradient or a CSS var
+// and otherwise fall back to var(--bars). Current callers pass agentGradient(name)
+// (a fixed `linear-gradient(135deg,hsl(...))`) or a `var(--…)` token. Pure: no data
+// access, no side effects — colour discipline lives here, not in the caller.
+function safeFill(fill: string | undefined): string {
+  if (!fill) return 'var(--bars)'
+  const f = fill.trim()
+  // var(--token) or var(--token,#fallback)
+  if (/^var\(--[a-z0-9-]+(\s*,\s*#[0-9a-fA-F]{3,8})?\)$/.test(f)) return f
+  // linear-gradient(135deg,hsl(H S% L%),hsl(H S% L%)) — exactly agentGradient's shape
+  if (
+    /^linear-gradient\(135deg,hsl\(\d{1,3} \d{1,3}% \d{1,3}%\),hsl\(\d{1,3} \d{1,3}% \d{1,3}%\)\)$/.test(
+      f,
+    )
+  ) {
+    return f
+  }
+  return 'var(--bars)'
+}
+
+export function avatarBadge(opts: { initial: string; fill?: string; title?: string }): Html {
+  return html`<span class="ui-av" style="background:${raw(safeFill(opts.fill))}"${
+    opts.title ? html` title="${opts.title}"` : raw('')
+  }>${opts.initial}</span>`
+}
+
 // ── dataTable ─────────────────────────────────────────────────────────────────
 // Mono-headed, hover-row table. `cols` define labels + optional grid widths.
 // `rows` are arrays of pre-escaped cells (HtmlEscapedString). When empty, renders
