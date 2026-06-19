@@ -172,6 +172,7 @@ import { runLoopsTick } from './loops/driver'
 import { syncGitHubProject } from './integrations/github-projects'
 // Growth cron step — active-guarded, fail-soft collection of growth metrics each tick.
 import { runGrowthCollection } from './departments/collectors/growth-cron'
+import { runCroCollection } from './cro/collect'
 
 export default {
   // The OAuth provider is the outer entry point. It handles OAuth paths and
@@ -195,10 +196,14 @@ export default {
     //     Only runs when the 'growth' department is active. Fail-soft: a collector
     //     error is caught and logged so it never breaks the rest of the cron.
     //     Logic: src/departments/collectors/growth-cron.ts (also unit-tested there).
+    //  6. CRO ingest — pull EXTERNAL connector signal (PostHog, then GSC/Ads/CRM) into
+    //     metric_points. Runs whatever sources are connected (graceful degradation); a
+    //     missing/broken source never blocks. Fail-soft. Logic: src/cro/collect.ts.
     ctx.waitUntil(reconcileMembership(env))
     ctx.waitUntil(runMetabolism(env))
     ctx.waitUntil(runLoopsTick(env))
     ctx.waitUntil(syncGitHubProject(env).then(() => undefined))
     ctx.waitUntil(runGrowthCollection(env))
+    ctx.waitUntil(runCroCollection(env).then(() => undefined))
   },
 }
