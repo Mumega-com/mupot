@@ -33,14 +33,20 @@ resellerApp.post('/provision-plan', async (c) => {
     return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
   }
 
-  // size-cap before parse (cheap DoS guard)
+  // size-cap as a TRUE byte cap. Reject by declared Content-Length first (before reading the
+  // body at all), then by the actual UTF-8 byte length — `raw.length` is a CHAR count, so a
+  // multibyte payload could exceed the byte budget and slip past a length check.
+  const declaredLen = Number(c.req.header('content-length') ?? '0')
+  if (Number.isFinite(declaredLen) && declaredLen > MAX_BODY_BYTES) {
+    return c.json({ error: 'payload_too_large' }, 413)
+  }
   let raw: string
   try {
     raw = await c.req.text()
   } catch {
     return c.json({ error: 'invalid_body' }, 400)
   }
-  if (raw.length > MAX_BODY_BYTES) {
+  if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) {
     return c.json({ error: 'payload_too_large' }, 413)
   }
 
@@ -54,9 +60,12 @@ resellerApp.post('/provision-plan', async (c) => {
     return c.json({ error: 'invalid_body' }, 400)
   }
 
-  // This slice only PLANS. A caller asking to actually execute is refused loudly — the live
-  // stand-up (CF account/repo/deploy/secrets/customer mint) is Hadi-go ops, not this endpoint.
-  if (body.dryRun === false) {
+  // This slice only PLANS. POSITIVE allow-list: only an ABSENT dryRun or strict boolean `true`
+  // is a plan request. ANYTHING else — false, "false", 0, null, {} — is read as "execute" and
+  // refused loudly. The live stand-up (CF account/repo/deploy/secrets/customer mint) is Hadi-go
+  // ops, never this endpoint. Hardened as an allow-list so the later live leg can't fail-open
+  // here on a truthy-coercion footgun.
+  if (body.dryRun !== undefined && body.dryRun !== true) {
     return c.json(
       {
         error: 'not_implemented',

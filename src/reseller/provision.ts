@@ -282,11 +282,16 @@ export function planResellerTenant(input: ResellerProvisionInput): ResellerProvi
   // ── assemble the plan (deterministic) ─────────────────────────────────────────────────
   const potHost = `${slug}.${DEFAULT_POT_HOST_SUFFIX}`
   const squads: PlannedSquad[] = AgencyModule.defaultSquads.map((s) => ({ slug: s.slug, name: s.name }))
+  // DEEP-COPY into the plan — the returned plan must OWN its data. `o.tiers` is a reference
+  // into the shared SERVICE_CATALOG singleton (a top-level-readonly array, NOT deep-frozen);
+  // aliasing it would let a caller mutate plan.catalog[i].tiers[...] and silently corrupt the
+  // global + every later call, breaking the purity/determinism contract. A fresh array of
+  // shallow-cloned (flat) tier objects severs that link. squads above are already fresh literals.
   const catalog: PlannedOffering[] = chosen.map((o) => ({
     key: o.key,
     name: o.name,
     deliveredBy: o.deliveredBy,
-    tiers: o.tiers,
+    tiers: o.tiers.map((t) => ({ ...t })),
   }))
 
   const warnings: string[] = []

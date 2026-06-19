@@ -181,4 +181,28 @@ describe('planResellerTenant — determinism & purity', () => {
     expect(AgencyModule.defaultSquads.length).toBe(squadsBefore)
     expect(SERVICE_CATALOG.length).toBe(catBefore)
   })
+
+  it('returned plan OWNS its data — mutating nested tiers cannot corrupt the shared catalog or a later call', () => {
+    const a = planResellerTenant({ resellerDomain: 'example.com' })
+    expect(a.ok).toBe(true)
+    if (!a.ok) return
+    const globalBefore = SERVICE_CATALOG[0].tiers[0].monthlyCents
+    // hostile caller mutates the plan's nested tier object + array
+    a.catalog[0].tiers[0].monthlyCents = 999_999_999
+    a.catalog[0].tiers.push({ key: 'evil', name: 'evil', monthlyCents: 0 })
+    // the shared singleton is untouched
+    expect(SERVICE_CATALOG[0].tiers[0].monthlyCents).toBe(globalBefore)
+    expect(SERVICE_CATALOG[0].tiers.some((t) => t.key === 'evil')).toBe(false)
+    // and a fresh call is uncorrupted
+    const b = planResellerTenant({ resellerDomain: 'example.com' })
+    if (!b.ok) return
+    expect(b.catalog[0].tiers[0].monthlyCents).toBe(globalBefore)
+    expect(b.catalog[0].tiers.some((t) => t.key === 'evil')).toBe(false)
+  })
+
+  it('plan squads do not alias the agency manifest squads', () => {
+    const a = planResellerTenant({ resellerDomain: 'example.com' })
+    if (!a.ok) return
+    expect(a.department.squads[0]).not.toBe(AgencyModule.defaultSquads[0])
+  })
 })

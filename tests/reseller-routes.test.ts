@@ -71,6 +71,27 @@ describe('POST /api/reseller/provision-plan', () => {
     expect(body.error).toBe('not_implemented')
   })
 
+  it.each([
+    ['string "false"', 'false'],
+    ['zero', 0],
+    ['null', null],
+    ['object', {}],
+  ])('dryRun truthy-coercion footgun (%s) → 501, never fall-open', async (_label, dryRun) => {
+    const res = await resellerApp.fetch(
+      req({ resellerDomain: 'example.com', dryRun }),
+      envForRole('admin'),
+    )
+    expect(res.status).toBe(501)
+  })
+
+  it('dryRun:true → 200 (explicit plan request allowed)', async () => {
+    const res = await resellerApp.fetch(
+      req({ resellerDomain: 'example.com', dryRun: true }),
+      envForRole('admin'),
+    )
+    expect(res.status).toBe(200)
+  })
+
   it('oversized body → 413', async () => {
     const huge = JSON.stringify({ resellerDomain: 'example.com', pad: 'x'.repeat(9000) })
     const res = await resellerApp.fetch(req(undefined, { raw: huge }), envForRole('admin'))
