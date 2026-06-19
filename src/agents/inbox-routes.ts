@@ -40,7 +40,9 @@ inboxApp.get('/', async (c) => {
 
   const res = await readAgentInbox(c.env, { agent: id.boundAgentId, peek, limit })
   if (!res.ok) {
-    return c.json({ error: res.reason, detail: res.detail }, res.reason === 'db_error' ? 500 : 400)
+    // Never forward a raw DB error string to the client (leak-guard, matches the MCP path).
+    if (res.reason === 'db_error') return c.json({ error: res.reason }, 500)
+    return c.json({ error: res.reason, detail: res.detail }, 400)
   }
   return c.json({ ok: true, messages: res.messages, remaining: res.remaining, consumed: !peek })
 })
@@ -91,14 +93,14 @@ inboxApp.post('/send', async (c) => {
     inReplyTo: typeof body.in_reply_to === 'string' ? body.in_reply_to : undefined,
   })
   if (!res.ok) {
+    // Never forward a raw DB error string to the client (leak-guard, matches the MCP path).
+    if (res.reason === 'db_error') return c.json({ error: res.reason }, 500)
     const status =
       res.reason === 'recipient_not_found'
         ? 404
         : res.reason === 'recipient_ambiguous' || res.reason === 'request_id_conflict' || res.reason === 'inbox_full'
           ? 409
-          : res.reason === 'db_error'
-            ? 500
-            : 400
+          : 400
     return c.json({ error: res.reason, detail: res.detail }, status)
   }
   return c.json({ ok: true, id: res.id, seq: res.seq, duplicate: res.duplicate, to: res.toAgent })
