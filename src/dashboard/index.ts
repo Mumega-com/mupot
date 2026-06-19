@@ -1576,8 +1576,8 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         --text: #171b19;
         --text2: #454c48;
         --dim: #7a827d;
-        --primary: #0e7a55;
-        --primary-soft: #e9f4ef;
+        --primary: #96780A;
+        --primary-soft: #f7f1dd;
         --border: #e7e9e7;
         --border-soft: #eef0ee;
         --hover: #f4f6f4;
@@ -1585,8 +1585,8 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         /* semantic aliases kept for view bodies */
         --surface2: #f4f6f4;
         --muted: #7a827d;
-        --accent: #0e7a55;
-        --accent2: #0891b2;
+        --accent: #96780A;
+        --accent2: #06b6d4;
         --ok: #16a34a;
         --warn: #ca8a04;
         --radius: 10px;
@@ -1602,8 +1602,8 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         --text: #e6edf3;
         --text2: #9aa7b5;
         --dim: #6b7685;
-        --primary: #3fb950;
-        --primary-soft: #1a2e1a;
+        --primary: #d4a017;
+        --primary-soft: #2e2812;
         --border: #2a3140;
         --border-soft: #222b38;
         --hover: #1c2230;
@@ -1654,7 +1654,7 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       .switcher > summary::-webkit-details-marker { display: none; }
       .switcher > summary .pot-icon {
         width: 30px; height: 30px; flex: none; border-radius: 8px;
-        background: linear-gradient(140deg,#1aa472,#0e7a55);
+        background: linear-gradient(140deg,#d4a017,#96780A);
         display: flex; align-items: center; justify-content: center;
         color: #fff; font-family: var(--font-display); font-size: 17px;
       }
