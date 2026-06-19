@@ -49,7 +49,11 @@ Like mumega resells PECB: agencies/experts resell our engine to **their** networ
 ## CRO data fabric (the loop's eyes — see cro-system-epic.md)
 - ✅ Foundation (PR #214): pluggable `CroSource` adapters → `metric_points`, graceful degradation, capped.
 - ✅ Event grain (PR #215): `cro_events` (idempotent via `event_key`) for attribution/segmentation.
-- Next: PostHog connector (key secured) → autonomy envelope (G1–G8) → CRO producer → cockpit.
+- ✅ PostHog connector (PR #219, deployed): the first EXTERNAL source — `runCroCollection` is the 6th
+  cron heartbeat, persisting a server-aggregated 24h conversion signal (events + unique users, HogQL)
+  into `metric_points`. Shared SSRF guard (`src/lib/ssrf.ts`) now also armors the S4 executor. Dual-gate:
+  Codex caught the https-only SSRF hole Opus passed → fixed.
+- Next: GSC / Ads / CRM connectors (same shape) → autonomy envelope (G1–G8) → CRO producer → cockpit.
 
 ## Open / gated / discipline
 - **Hadi-go:** customer-pot mints/deploys, Stripe Connect keys, token mints, RBAC, secrets.

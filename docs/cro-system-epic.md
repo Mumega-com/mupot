@@ -32,8 +32,15 @@ A CRO system that **handles conversion optimization proactively** and that Hadi 
       (`recordCroEvents`/`readCroEvents` — tenant-bound, validated, capped, **idempotent** via
       `event_key` + unique index + INSERT OR IGNORE). The attribution/segmentation grain alongside
       `metric_points` (research-forced; Codex caught the retry-overcount + unbounded-fields holes).
-- [ ] **Connectors** — PostHog first (Hadi's startup), then GSC / Google Ads / Facebook Ads / CRM —
-      each an adapter on the same interface, secrets behind the connector vault.
+- [x] **Connectors — PostHog** ✅ (PR #219, live) — `src/cro/posthog.ts` (`posthogCroSource`: a
+      server-aggregated 24h conversion signal — event volume + unique users — via the PostHog
+      Query API/HogQL) + `src/cro/collect.ts` (`runCroCollection`, the 6th cron heartbeat: collect
+      external sources → persist via `emitMetric`, first-party write-amplification guard) +
+      `src/lib/ssrf.ts` (shared hardened private-host blocker, extracted from the S4 executor).
+      Dual-gate: **Codex RED→GREEN** (BLOCK-1 SSRF: https-only let internal hosts through — fixed
+      by routing through the shared guard), Opus GREEN (2 WARNs fixed: body-read inside the abort
+      window + the missing timeout test). Next connectors (GSC / Google Ads / Facebook Ads / CRM)
+      = the same adapter shape; secrets move behind the connector vault when multi-pot.
 - [ ] **Connect-by-stack** — the console surfaces which sources fit the pot's business stack + a connect
       flow; the loop runs on whatever is provided.
 - [ ] **CRO producer** — `reason` drafts an *applyable* change (copy/headline/draft) from the multi-source
