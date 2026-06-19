@@ -1248,7 +1248,7 @@ dashboardApp.post('/departments', async (c) => {
       result.error === 'slug_taken' ? 409 : 400,
     )
   }
-  return c.redirect('/')
+  return c.redirect('/admin/divisions')
 })
 
 // POST /squads — create a squad in a department (admin on THAT department).
@@ -1280,7 +1280,7 @@ dashboardApp.post('/squads', async (c) => {
       result.error === 'slug_taken' ? 409 : 400,
     )
   }
-  return c.redirect('/')
+  return c.redirect('/admin/divisions')
 })
 
 // POST /squads/packs/:key — seed a starter squad pack (#11): one squad + its
@@ -2403,6 +2403,12 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
             <span class="nav-label">Fleet</span>
           </a>
 
+          <!-- Control Tower (coordination departures board) -->
+          <a class="nav-link" href="/coordination">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 2v6M6 5l8 0M5 17l5-9 5 9M7.5 13h5"/></svg>
+            <span class="nav-label">Control Tower</span>
+          </a>
+
           <!-- Economy (collapsible) -->
           <div class="nav-section">
             <button class="nav-section-toggle" data-section="econ" onclick="navToggle('econ')">
@@ -2418,10 +2424,16 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
             </div>
           </div>
 
-          <!-- Members & access -->
+          <!-- Members & access (tokens) -->
           <a class="nav-link" href="/members">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="7.3" cy="7.5" r="2.5"/><circle cx="13.6" cy="8.5" r="2"/><path d="M3.4 16c0-2.3 1.8-3.8 3.9-3.8s3.9 1.5 3.9 3.8M12.4 12.5c2 0 3.9 1.1 3.9 3.5"/></svg>
-            <span class="nav-label">Members &amp; access</span>
+            <span class="nav-label">Access tokens</span>
+          </a>
+
+          <!-- People & roles (grants roster) -->
+          <a class="nav-link" href="/admin/members">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="10" cy="6.5" r="2.6"/><path d="M4.5 16c0-2.6 2.5-4.3 5.5-4.3s5.5 1.7 5.5 4.3"/></svg>
+            <span class="nav-label">People &amp; roles</span>
           </a>
 
           <!-- Audit log -->
@@ -3961,6 +3973,27 @@ function memberRow(
     </tr>`
 }
 
+// Persistent org-creation forms (the gap: dept/squad creation was wizard-only). Plain
+// same-origin POST forms — the csrf() middleware validates the Origin, no token field needed.
+// They target the existing (RBAC-gated) POST /departments + POST /squads handlers.
+function addDepartmentFormHtml(): string {
+  return `<div class="card" style="margin-top:12px"><h3 style="margin:0 0 10px">Add a department</h3>
+    <form class="adminform" method="post" action="/departments" autocomplete="off">
+      <input name="name" required placeholder="Engineering" />
+      <input name="slug" required placeholder="engineering" pattern="[a-z0-9][a-z0-9-]*" title="lowercase letters, digits, dashes" />
+      <button type="submit" class="btn">Add department</button>
+    </form></div>`
+}
+function addSquadFormHtml(deptId: string): string {
+  return `<form class="adminform" method="post" action="/squads" autocomplete="off" style="margin-top:10px;border-top:1px solid var(--border,#e7e9e7);padding-top:10px">
+      <input type="hidden" name="department_id" value="${escAttr(deptId)}" />
+      <input name="name" required placeholder="New team" />
+      <input name="slug" required placeholder="team-slug" pattern="[a-z0-9][a-z0-9-]*" title="lowercase letters, digits, dashes" />
+      <input name="charter" placeholder="What this team does (optional)" />
+      <button type="submit" class="btn secondary sm">Add team</button>
+    </form>`
+}
+
 function divisionsAdminBody(
   depts: Department[],
   squads: Squad[],
@@ -4004,8 +4037,8 @@ function divisionsAdminBody(
   if (depts.length === 0) {
     return html`
       ${pageHeader({ crumbs: 'Overview / Organization', title: 'Organization' })}
-      <div class="card"><p class="empty">No departments yet. Seed the organization via
-        <code>POST /api/org/departments</code> and they'll appear here.</p></div>`
+      <div class="card"><p class="empty">No departments yet — add your first one to start the org tree.</p></div>
+      ${raw(addDepartmentFormHtml())}`
   }
 
   const cards = depts
@@ -4031,6 +4064,7 @@ function divisionsAdminBody(
           <div class="dept-name">${d.name}</div>
           <div class="t-meta" style="margin-bottom:8px">Department head: ${heads(d.id)}</div>
           ${raw(squadRows)}
+          ${raw(addSquadFormHtml(d.id))}
         </div>`.toString()
     })
     .join('')
@@ -4046,6 +4080,7 @@ function divisionsAdminBody(
       statCard({ label: 'Teams', value: String(squads.length) }),
     ])}
     ${raw(cards)}
+    ${raw(addDepartmentFormHtml())}
     <p class="empty">Assign an owner from the <a href="/admin/members">People &amp; Access</a> page — grant a person
       the <code>lead</code> entitlement (or higher) on the department or team scope.</p>`
 }
