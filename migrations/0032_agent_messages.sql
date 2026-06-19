@@ -12,9 +12,13 @@
 --   - ADDRESSED: to_agent = recipient agent id; from_agent = the sender's welded agent
 --     (member_tokens.agent_id); from_member = the authenticated member (the real principal,
 --     for accountability — identity is NEVER read from message text).
---   - REQUEST/ACK + REPLAY-ONCE: request_id carries the ACK-protocol rid; UNIQUE(tenant,
---     request_id) makes a duplicate send an idempotent no-op (consume-once). in_reply_to
---     links an ack back to its request.
+--   - REQUEST/ACK + REPLAY-ONCE: request_id is the SENDER's idempotency key — uniqueness is
+--     scoped (tenant, from_agent, request_id) so two different senders reusing the same rid
+--     string never collide (a bare (tenant, request_id) key would let agent X pre-seed an rid
+--     and silently swallow agent Y's later send — a cross-agent ACK-poisoning vector). A
+--     same-sender rid re-send with identical content is an idempotent no-op; with DIFFERENT
+--     content it is rejected (request_id_conflict), never silently dropped. in_reply_to links
+--     an ack back to its request.
 --   - CONSUME: read_at is the consume marker; inbox() reads unread oldest-first and marks
 --     them read atomically (UPDATE…RETURNING), so a message is delivered once.
 -- Tenant is environment-derived (env.TENANT_SLUG); a row can never address another pot.
@@ -38,6 +42,7 @@ CREATE TABLE IF NOT EXISTS agent_messages (
 CREATE INDEX IF NOT EXISTS idx_agent_messages_inbox
   ON agent_messages(tenant, to_agent, read_at, seq);
 
--- replay-once: a request_id is unique within the pot (partial — unsent/plain messages allowed).
+-- replay-once: a request_id is unique PER SENDER (partial — plain messages with no rid allowed).
+-- Scoped by from_agent so one agent's idempotency keys can't collide with another's (anti-poison).
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_messages_rid
-  ON agent_messages(tenant, request_id) WHERE request_id IS NOT NULL;
+  ON agent_messages(tenant, from_agent, request_id) WHERE request_id IS NOT NULL;

@@ -32,7 +32,10 @@ function makeDb(opts: { agents?: Array<{ id: string; squad_id: string; slug: str
     if (sql.includes('INSERT INTO agent_messages')) {
       const [id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at] =
         b as [string, string, string, string, string, string, string, string | null, string | null, string]
-      if (request_id != null && messages.some((m) => m.tenant === tenant && m.request_id === request_id)) {
+      if (
+        request_id != null &&
+        messages.some((m) => m.tenant === tenant && m.from_agent === from_agent && m.request_id === request_id)
+      ) {
         throw new Error('UNIQUE constraint failed: idx_agent_messages_rid')
       }
       const seq = ++seqCounter
@@ -43,10 +46,14 @@ function makeDb(opts: { agents?: Array<{ id: string; squad_id: string; slug: str
   }
 
   function runFirst(sql: string, b: unknown[]) {
-    if (sql.includes('SELECT id, seq FROM agent_messages')) {
-      const [tenant, request_id] = b as [string, string]
-      const m = messages.find((x) => x.tenant === tenant && x.request_id === request_id)
-      return m ? { id: m.id, seq: m.seq } : null
+    if (sql.includes('from_agent = ?2 AND request_id = ?3')) {
+      const [tenant, from_agent, request_id] = b as [string, string, string]
+      const m = messages.find(
+        (x) => x.tenant === tenant && x.from_agent === from_agent && x.request_id === request_id,
+      )
+      return m
+        ? { id: m.id, seq: m.seq, to_agent: m.to_agent, kind: m.kind, body: m.body, in_reply_to: m.in_reply_to }
+        : null
     }
     if (sql.includes('COUNT(*) AS n FROM agent_messages')) {
       const [tenant, to_agent] = b as [string, string]
@@ -141,14 +148,82 @@ describe('sendAgentMessage', () => {
   it('replay-once: same request_id is an idempotent no-op (no second row)', async () => {
     const db = makeDb()
     const env = envWith(db)
-    const a = await sendAgentMessage(env, { fromAgent: 'ag-code', fromMember: 'm1', toAgent: 'ag-review', body: 'x', requestId: 'rid-1' })
-    const b = await sendAgentMessage(env, { fromAgent: 'ag-code', fromMember: 'm1', toAgent: 'ag-review', body: 'x again', requestId: 'rid-1' })
+    // identical content + same sender + same rid = a true idempotent replay (e.g. a retry).
+    const msg = { fromAgent: 'ag-code', fromMember: 'm1', toAgent: 'ag-review', body: 'x', requestId: 'rid-1' }
+    const a = await sendAgentMessage(env, msg)
+    const b = await sendAgentMessage(env, msg)
     expect(a.ok && b.ok).toBe(true)
     if (!a.ok || !b.ok) return
     expect(b.duplicate).toBe(true)
     expect(b.id).toBe(a.id)
     expect(b.seq).toBe(a.seq)
     expect(db._messages.length).toBe(1)
+  })
+
+  it('replay-once is SENDER-SCOPED — a different sender reusing the same rid is NOT a collision', async () => {
+    const db = makeDb()
+    const env = envWith(db)
+    // ag-a and ag-b both pick request_id 'rid-x' addressed to ag-x. Neither must suppress the other.
+    const a = await sendAgentMessage(env, { fromAgent: 'ag-a', fromMember: 'm', toAgent: 'ag-x', body: 'from A', requestId: 'rid-x' })
+    const b = await sendAgentMessage(env, { fromAgent: 'ag-b', fromMember: 'm', toAgent: 'ag-x', body: 'from B', requestId: 'rid-x' })
+    expect(a.ok && b.ok).toBe(true)
+    if (!a.ok || !b.ok) return
+    expect(b.duplicate).toBe(false) // ag-b's send is NOT swallowed by ag-a's rid
+    expect(db._messages.length).toBe(2)
+    expect(db._messages.map((m) => m.body).sort()).toEqual(['from A', 'from B'])
+  })
+
+  it('an agent CANNOT pre-seed an rid to silently drop another agent‘s later send (anti-poison)', async () => {
+    const db = makeDb()
+    const env = envWith(db)
+    // attacker ag-evil pre-seeds rid 'shared' to ag-victim-inbox
+    await sendAgentMessage(env, { fromAgent: 'ag-evil', fromMember: 'm', toAgent: 'ag-x', body: 'poison', requestId: 'shared' })
+    // honest ag-good sends with the same rid string — must land, NOT return the attacker's row
+    const good = await sendAgentMessage(env, { fromAgent: 'ag-good', fromMember: 'm', toAgent: 'ag-x', body: 'real message', requestId: 'shared' })
+    expect(good.ok).toBe(true)
+    if (!good.ok) return
+    expect(good.duplicate).toBe(false)
+    const inbox = await readAgentInbox(env, { agent: 'ag-x' })
+    if (!inbox.ok) return
+    expect(inbox.messages.map((m) => m.body)).toContain('real message') // not silently dropped
+  })
+
+  it('same sender + same rid + DIFFERENT content → request_id_conflict (never a silent success)', async () => {
+    const db = makeDb()
+    const env = envWith(db)
+    const first = await sendAgentMessage(env, { fromAgent: 'ag-a', fromMember: 'm', toAgent: 'ag-x', body: 'v1', requestId: 'r1' })
+    const reused = await sendAgentMessage(env, { fromAgent: 'ag-a', fromMember: 'm', toAgent: 'ag-x', body: 'v2-different', requestId: 'r1' })
+    expect(first.ok).toBe(true)
+    expect(reused.ok).toBe(false)
+    if (reused.ok) return
+    expect(reused.reason).toBe('request_id_conflict')
+    expect(db._messages.length).toBe(1) // the conflicting second send did NOT persist
+  })
+
+  it('same sender + same rid + SAME content → idempotent duplicate', async () => {
+    const env = envWith(makeDb())
+    const base = { fromAgent: 'ag-a', fromMember: 'm', toAgent: 'ag-x', body: 'same', requestId: 'r2', kind: 'request' as const, inReplyTo: undefined }
+    const a = await sendAgentMessage(env, base)
+    const b = await sendAgentMessage(env, base)
+    expect(a.ok && b.ok).toBe(true)
+    if (!a.ok || !b.ok) return
+    expect(b.duplicate).toBe(true)
+    expect(b.seq).toBe(a.seq)
+  })
+
+  it('per-recipient unread cap refuses spam (inbox_full); a read frees the budget', async () => {
+    const db = makeDb()
+    const env = envWith(db)
+    const send = (body: string) => sendAgentMessage(env, { fromAgent: 'ag-spammer', fromMember: 'm', toAgent: 'ag-x', body }, { maxUnread: 2 })
+    expect((await send('1')).ok).toBe(true)
+    expect((await send('2')).ok).toBe(true)
+    const third = await send('3')
+    expect(third.ok).toBe(false)
+    if (third.ok) return
+    expect(third.reason).toBe('inbox_full')
+    // consume one → budget frees → next send accepted
+    await readAgentInbox(env, { agent: 'ag-x', limit: 1 })
+    expect((await send('4')).ok).toBe(true)
   })
 
   it('fail-closed without a tenant', async () => {

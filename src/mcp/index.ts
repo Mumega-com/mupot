@@ -565,7 +565,12 @@ const toolSend: ToolSpec = {
       inReplyTo: typeof args.in_reply_to === 'string' ? args.in_reply_to : undefined,
     })
     if (!res.ok) {
-      const status = res.reason === 'db_error' ? 500 : 400
+      const status =
+        res.reason === 'db_error'
+          ? 500
+          : res.reason === 'request_id_conflict' || res.reason === 'inbox_full'
+            ? 409
+            : 400
       return fail(status, res.reason, res.detail)
     }
     return done({ id: res.id, seq: res.seq, duplicate: res.duplicate, to: resolved.value.id })

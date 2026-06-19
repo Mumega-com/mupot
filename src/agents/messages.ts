@@ -20,6 +20,10 @@ const MAX_BODY_CHARS = 8000
 const MAX_REF_CHARS = 128 // agent ids / member ids
 const DEFAULT_INBOX_LIMIT = 20
 const MAX_INBOX_LIMIT = 100
+// Backpressure / anti-DoS: a recipient may hold at most this many UNREAD messages. A sender
+// is refused (inbox_full) past the cap so a compromised agent-bound token cannot spam a
+// recipient's inbox into unbounded storage growth. Reads (consume) free the budget.
+export const MAX_UNREAD_PER_RECIPIENT = 1000
 const KINDS = ['message', 'request', 'ack'] as const
 type MessageKind = (typeof KINDS)[number]
 // ACK-protocol rid shape: a uuid or a slug-ish token. Linear, bounded — no ReDoS.
@@ -71,6 +75,8 @@ export type SendFailure = {
     | 'invalid_kind'
     | 'invalid_request_id'
     | 'invalid_in_reply_to'
+    | 'request_id_conflict'
+    | 'inbox_full'
     | 'db_error'
   detail?: string
 }
@@ -81,9 +87,11 @@ export type InboxFailure = {
   detail?: string
 }
 
-interface Clock {
+interface Opts {
   now?: () => string
   idGen?: () => string
+  /** Override the per-recipient unread cap (tests). Defaults to MAX_UNREAD_PER_RECIPIENT. */
+  maxUnread?: number
 }
 
 function isRef(v: string): boolean {
@@ -99,7 +107,7 @@ function isRef(v: string): boolean {
 export async function sendAgentMessage(
   env: Env,
   input: SendInput,
-  clock: Clock = {},
+  opts: Opts = {},
 ): Promise<SendResult | SendFailure> {
   const tenant = env.TENANT_SLUG
   if (!tenant) return { ok: false, reason: 'no_tenant' }
@@ -123,13 +131,27 @@ export async function sendAgentMessage(
   if (input.inReplyTo !== undefined && !RID_RE.test(input.inReplyTo))
     return { ok: false, reason: 'invalid_in_reply_to', detail: 'in_reply_to must match [A-Za-z0-9_.:-]{1,128}' }
 
-  const now = clock.now ?? (() => new Date().toISOString())
-  const idGen = clock.idGen ?? (() => crypto.randomUUID())
+  const now = opts.now ?? (() => new Date().toISOString())
+  const idGen = opts.idGen ?? (() => crypto.randomUUID())
 
-  // replay-once: if this rid already landed, return the original (idempotent no-op).
+  // replay-once, SENDER-SCOPED: if THIS sender already used this rid, it's idempotent only
+  // when the content is identical — otherwise it's a conflict (a reused key with a different
+  // message), rejected loudly so a sender is never told "delivered" for a message that wasn't.
+  // Scoping by from_agent means another agent's rid namespace can't poison this one.
   if (input.requestId !== undefined) {
-    const existing = await findByRequestId(env, tenant, input.requestId)
-    if (existing) return { ok: true, id: existing.id, seq: existing.seq, duplicate: true }
+    const existing = await findBySenderRequestId(env, tenant, input.fromAgent, input.requestId)
+    if (existing) return idempotentOrConflict(existing, input, kind)
+  }
+
+  // Backpressure: refuse if the recipient is already at the unread cap (anti-spam/DoS).
+  const maxUnread = opts.maxUnread ?? MAX_UNREAD_PER_RECIPIENT
+  const unreadRow = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM agent_messages WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL`,
+  )
+    .bind(tenant, input.toAgent)
+    .first<{ n: number }>()
+  if (Number(unreadRow?.n ?? 0) >= maxUnread) {
+    return { ok: false, reason: 'inbox_full', detail: `recipient has ${unreadRow?.n} unread (cap ${maxUnread})` }
   }
 
   const id = idGen()
@@ -156,27 +178,56 @@ export async function sendAgentMessage(
     const seq = Number(result.meta?.last_row_id ?? 0)
     return { ok: true, id, seq, duplicate: false }
   } catch (err) {
-    // A UNIQUE(tenant, request_id) collision means a concurrent send already landed this rid —
-    // re-read and return it as a duplicate (idempotent), not an error.
+    // A UNIQUE(tenant, from_agent, request_id) collision means THIS sender already landed this
+    // rid (a concurrent retry) — re-read and apply the same idempotent-or-conflict decision.
     if (input.requestId !== undefined) {
-      const existing = await findByRequestId(env, tenant, input.requestId)
-      if (existing) return { ok: true, id: existing.id, seq: existing.seq, duplicate: true }
+      const existing = await findBySenderRequestId(env, tenant, input.fromAgent, input.requestId)
+      if (existing) return idempotentOrConflict(existing, input, kind)
     }
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
   }
 }
 
-async function findByRequestId(
+interface ExistingMessage {
+  id: string
+  seq: number
+  to_agent: string
+  kind: string
+  body: string
+  in_reply_to: string | null
+}
+
+/** A same-(tenant, from_agent, request_id) row: idempotent no-op iff every immutable field
+ *  matches, else a conflict (the rid was reused for a DIFFERENT message — reject, never claim
+ *  success for a message that was not stored). */
+function idempotentOrConflict(
+  existing: ExistingMessage,
+  input: SendInput,
+  kind: MessageKind,
+): SendResult | SendFailure {
+  const same =
+    existing.to_agent === input.toAgent &&
+    existing.kind === kind &&
+    existing.body === input.body &&
+    (existing.in_reply_to ?? null) === (input.inReplyTo ?? null)
+  return same
+    ? { ok: true, id: existing.id, seq: Number(existing.seq), duplicate: true }
+    : { ok: false, reason: 'request_id_conflict', detail: 'request_id reused with different content' }
+}
+
+async function findBySenderRequestId(
   env: Env,
   tenant: string,
+  fromAgent: string,
   requestId: string,
-): Promise<{ id: string; seq: number } | null> {
+): Promise<ExistingMessage | null> {
   const row = await env.DB.prepare(
-    `SELECT id, seq FROM agent_messages WHERE tenant = ?1 AND request_id = ?2 LIMIT 1`,
+    `SELECT id, seq, to_agent, kind, body, in_reply_to FROM agent_messages
+      WHERE tenant = ?1 AND from_agent = ?2 AND request_id = ?3 LIMIT 1`,
   )
-    .bind(tenant, requestId)
-    .first<{ id: string; seq: number }>()
-  return row ? { id: row.id, seq: Number(row.seq) } : null
+    .bind(tenant, fromAgent, requestId)
+    .first<ExistingMessage>()
+  return row ? { ...row, seq: Number(row.seq) } : null
 }
 
 // ── inbox ───────────────────────────────────────────────────────────────────────────────
@@ -186,7 +237,7 @@ async function findByRequestId(
 export async function readAgentInbox(
   env: Env,
   input: { agent: string; limit?: number; peek?: boolean },
-  clock: Clock = {},
+  opts: Opts = {},
 ): Promise<InboxResult | InboxFailure> {
   const tenant = env.TENANT_SLUG
   if (!tenant) return { ok: false, reason: 'no_tenant' }
@@ -200,7 +251,7 @@ export async function readAgentInbox(
     limit = Math.min(MAX_INBOX_LIMIT, Math.max(1, Math.floor(input.limit)))
   }
   const peek = input.peek === true
-  const now = clock.now ?? (() => new Date().toISOString())
+  const now = opts.now ?? (() => new Date().toISOString())
 
   const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at'
   try {
