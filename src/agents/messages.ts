@@ -8,9 +8,11 @@
 //   - Tenant is env.TENANT_SLUG, NEVER client-supplied. Fail-closed if absent.
 //   - The sender identity (from_agent / from_member) is the AUTHENTICATED caller, passed in
 //     by the tool from auth.boundAgentId / auth.memberId — never read from args.
-//   - Every field is validated + capped before the write. Writes are receipt-guarded.
-//   - request_id gives replay-once (UNIQUE(tenant, request_id)) — a duplicate send is an
-//     idempotent no-op returning the original, so the ACK protocol can't double-deliver.
+//   - Every field is validated + capped before the write.
+//   - request_id gives SENDER-SCOPED replay-once (UNIQUE(tenant, from_agent, request_id)) — a
+//     same-sender re-send with identical content is an idempotent no-op returning the original;
+//     with different content it is rejected (request_id_conflict), never a silent drop. Scoping
+//     by from_agent stops one agent poisoning another's rid namespace. Dedup wins over the cap.
 
 import type { Env } from '../types'
 import { resolveAgentRef } from '../org/resolve'
