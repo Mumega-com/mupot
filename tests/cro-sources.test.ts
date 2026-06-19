@@ -1,7 +1,7 @@
 // tests/cro-sources.test.ts — the CRO data fabric: graceful degradation + first-party floor.
 
 import { describe, it, expect } from 'vitest'
-import { collectFromSources } from '../src/cro/sources'
+import { collectFromSources, MAX_POINTS_PER_SOURCE } from '../src/cro/sources'
 import type { CroSource, CroMetric } from '../src/cro/sources'
 import { firstPartyCroSource, CRO_FIRST_PARTY_PREFIXES } from '../src/cro/first-party'
 import type { Env } from '../src/types'
@@ -76,6 +76,28 @@ describe('collectFromSources — graceful degradation', () => {
     const res = await collectFromSources(ENV, [source('first_party')])
     expect(res.metrics).toHaveLength(1)
     expect(res.sources).toHaveLength(1)
+  })
+
+  it('BLOCK-1: caps a source returning more than MAX_POINTS_PER_SOURCE (truncate + flag, never amplify)', async () => {
+    const huge: CroMetric[] = Array.from({ length: MAX_POINTS_PER_SOURCE + 500 }, (_, i) => ({
+      metric_key: `posthog.m${i}`,
+      value: i,
+      occurred_at: '2026-06-19T00:00:00Z',
+    }))
+    const res = await collectFromSources(ENV, [source('posthog', { collect: async () => huge })])
+    expect(res.metrics).toHaveLength(MAX_POINTS_PER_SOURCE)
+    expect(res.sources[0]).toMatchObject({ ok: true, count: MAX_POINTS_PER_SOURCE, capped: true })
+  })
+
+  it('BLOCK-1: a non-array return is rejected (ok:false), the sweep continues', async () => {
+    const res = await collectFromSources(ENV, [
+      // hostile adapter: returns an object instead of an array
+      source('crm', { collect: async () => ({ not: 'an array' }) as unknown as CroMetric[] }),
+      source('first_party'),
+    ])
+    expect(res.metrics.map((m) => m.source)).toEqual(['first_party'])
+    const crm = res.sources.find((s) => s.key === 'crm')!
+    expect(crm).toMatchObject({ available: true, ok: false, count: 0, error: 'non_array_return' })
   })
 })
 

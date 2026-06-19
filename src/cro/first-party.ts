@@ -55,8 +55,9 @@ export const firstPartyCroSource: CroSource = {
     const rows = result.results ?? []
     const out: CroMetric[] = []
     for (const r of rows) {
-      if (typeof r.metric_key !== 'string' || typeof r.value !== 'number' || !Number.isFinite(r.value)) continue
-      if (typeof r.occurred_at !== 'string') continue
+      if (typeof r.metric_key !== 'string' || !r.metric_key) continue
+      if (typeof r.value !== 'number' || !Number.isFinite(r.value)) continue
+      if (typeof r.occurred_at !== 'string' || !r.occurred_at) continue
       out.push({ metric_key: r.metric_key, value: r.value, occurred_at: r.occurred_at })
     }
     return out

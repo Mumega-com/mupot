@@ -40,12 +40,23 @@ export interface CroSource {
   collect(env: Env): Promise<CroMetric[]>
 }
 
+/**
+ * Hard per-source output cap (BLOCK-1, Codex cross-vendor catch). The collector is the
+ * one place every source funnels through, so the bound lives HERE — a buggy or hostile
+ * source (especially a future untrusted external API: PostHog/GSC/Ads/CRM) returning a
+ * huge array cannot CPU/memory-amplify the sweep or, downstream, amplify metric_points
+ * writes. A source returning more than this is truncated and flagged (`capped`), never
+ * silently dropped.
+ */
+export const MAX_POINTS_PER_SOURCE = 1000
+
 /** Per-source outcome of a collection sweep — surfaced so the console shows what ran. */
 export interface SourceStatus {
   key: string
   available: boolean
-  ok: boolean // collected without throwing
-  count: number // metrics collected
+  ok: boolean // collected without throwing AND returned an array
+  count: number // metrics accepted (after poison-filter + cap)
+  capped?: boolean // true when the source returned more than MAX_POINTS_PER_SOURCE
   error?: string
 }
 
@@ -83,8 +94,17 @@ export async function collectFromSources(env: Env, sources: CroSource[]): Promis
 
     try {
       const collected = await src.collect(env)
+      // A non-array return is a misbehaving adapter — record it, don't crash/iterate it.
+      if (!Array.isArray(collected)) {
+        statuses.push({ key: src.key, available: true, ok: false, count: 0, error: 'non_array_return' })
+        continue
+      }
+      // CAP FIRST (BLOCK-1): bound processing to MAX_POINTS_PER_SOURCE before iterating, so
+      // a huge return can't amplify CPU/memory or the downstream write. Truncation is flagged.
+      const capped = collected.length > MAX_POINTS_PER_SOURCE
+      const bounded = capped ? collected.slice(0, MAX_POINTS_PER_SOURCE) : collected
       let count = 0
-      for (const m of collected) {
+      for (const m of bounded) {
         // Defensive: a hostile/buggy adapter must not poison the store with NaN/∞ or a
         // non-string key. Drop bad points rather than failing the whole source.
         if (typeof m?.metric_key !== 'string' || !m.metric_key) continue
@@ -93,7 +113,7 @@ export async function collectFromSources(env: Env, sources: CroSource[]): Promis
         metrics.push({ metric_key: m.metric_key, value: m.value, occurred_at: m.occurred_at, source: src.key })
         count++
       }
-      statuses.push({ key: src.key, available: true, ok: true, count })
+      statuses.push({ key: src.key, available: true, ok: true, count, ...(capped ? { capped: true } : {}) })
     } catch (e) {
       statuses.push({
         key: src.key,
