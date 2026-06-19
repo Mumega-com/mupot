@@ -13,7 +13,6 @@
 //     idempotent no-op returning the original, so the ACK protocol can't double-deliver.
 
 import type { Env } from '../types'
-import { assertWritten } from '../lib/receipt'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 const MAX_BODY_CHARS = 8000
@@ -143,23 +142,21 @@ export async function sendAgentMessage(
     if (existing) return idempotentOrConflict(existing, input, kind)
   }
 
-  // Backpressure: refuse if the recipient is already at the unread cap (anti-spam/DoS).
+  // Backpressure / anti-DoS: the unread cap is enforced ATOMICALLY inside the INSERT —
+  // INSERT … SELECT … WHERE (unread count) < cap. SQLite evaluates the guard subquery against
+  // committed state under the write lock, so concurrent sends to the same recipient are
+  // serialized and cannot race past the cap (a separate COUNT-then-INSERT could overshoot —
+  // Codex WARN-2). changes === 0 means the guard refused the write → inbox_full. That is a
+  // LEGITIMATE non-write (the cap), not a phantom drop, so it replaces assertWritten here.
   const maxUnread = opts.maxUnread ?? MAX_UNREAD_PER_RECIPIENT
-  const unreadRow = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM agent_messages WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL`,
-  )
-    .bind(tenant, input.toAgent)
-    .first<{ n: number }>()
-  if (Number(unreadRow?.n ?? 0) >= maxUnread) {
-    return { ok: false, reason: 'inbox_full', detail: `recipient has ${unreadRow?.n} unread (cap ${maxUnread})` }
-  }
-
   const id = idGen()
   const createdAt = now()
   try {
     const result = await env.DB.prepare(
       `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+             WHERE (SELECT COUNT(*) FROM agent_messages
+                     WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11`,
     )
       .bind(
         id,
@@ -172,9 +169,12 @@ export async function sendAgentMessage(
         input.requestId ?? null,
         input.inReplyTo ?? null,
         createdAt,
+        maxUnread,
       )
       .run()
-    assertWritten(result, 'agent_messages.send')
+    if ((result.meta?.changes ?? 0) === 0) {
+      return { ok: false, reason: 'inbox_full', detail: `recipient at unread cap ${maxUnread}` }
+    }
     const seq = Number(result.meta?.last_row_id ?? 0)
     return { ok: true, id, seq, duplicate: false }
   } catch (err) {

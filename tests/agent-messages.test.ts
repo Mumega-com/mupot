@@ -30,8 +30,13 @@ function makeDb(opts: { agents?: Array<{ id: string; squad_id: string; slug: str
 
   function runRun(sql: string, b: unknown[]) {
     if (sql.includes('INSERT INTO agent_messages')) {
-      const [id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at] =
-        b as [string, string, string, string, string, string, string, string | null, string | null, string]
+      const [id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, maxUnread] =
+        b as [string, string, string, string, string, string, string, string | null, string | null, string, number]
+      // atomic cap guard — the real INSERT…SELECT…WHERE (unread count) < cap. At cap → 0 rows.
+      const unread = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).length
+      if (typeof maxUnread === 'number' && unread >= maxUnread) {
+        return { meta: { changes: 0 } }
+      }
       if (
         request_id != null &&
         messages.some((m) => m.tenant === tenant && m.from_agent === from_agent && m.request_id === request_id)
@@ -221,6 +226,7 @@ describe('sendAgentMessage', () => {
     expect(third.ok).toBe(false)
     if (third.ok) return
     expect(third.reason).toBe('inbox_full')
+    expect(db._messages.length).toBe(2) // the capped send did NOT persist (atomic guard)
     // consume one → budget frees → next send accepted
     await readAgentInbox(env, { agent: 'ag-x', limit: 1 })
     expect((await send('4')).ok).toBe(true)
