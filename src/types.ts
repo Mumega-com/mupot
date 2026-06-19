@@ -120,6 +120,13 @@ export interface Env {
   // Non-secret; set in wrangler.toml [vars]. e.g. https://inkwell-api.mumega.com.
   // Must be https + a public host (executor SSRF-guards it). Absent ⇒ executor 503.
   INKWELL_API_URL?: string
+  // CRO data source — PostHog connector (CRO epic, slice 2). The first EXTERNAL source on
+  // the data fabric. PROJECT_ID + HOST are non-secret (wrangler.toml [vars]); the personal
+  // API key is a secret (`wrangler secret put POSTHOG_PERSONAL_API_KEY`). Fail-closed: the
+  // PostHog source is `available()` only when KEY + PROJECT_ID are both present.
+  POSTHOG_PROJECT_ID?: string // PostHog project id (e.g. "436189"). Non-secret.
+  POSTHOG_HOST?: string // PostHog API host. Default https://us.posthog.com. Non-secret; https only.
+  POSTHOG_PERSONAL_API_KEY?: string // PostHog personal API key (read-scope). Secret. Absent ⇒ source unavailable.
 }
 
 // ── Org domain (mirrors migrations/0001_init.sql + 0009_work_unit.sql) ──
