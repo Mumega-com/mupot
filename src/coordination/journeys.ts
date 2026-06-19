@@ -75,8 +75,12 @@ export type UpdateResult =
 function capStr(v: unknown, max: number): string | null {
   return typeof v === 'string' ? v.slice(0, max) : null
 }
-function validEta(v: unknown): v is number {
-  return typeof v === 'number' && Number.isFinite(v) && v > 0
+// eta is a Unix-ms timestamp. Bound it: positive, and no more than this horizon past `now` — so a
+// garbage value (e.g. 1e300) can't land a dishonest "ETA" on the board. A past eta is allowed (the
+// board shows it as "due").
+const MAX_ETA_HORIZON_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
+function validEta(v: unknown, nowMs: number): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= nowMs + MAX_ETA_HORIZON_MS
 }
 
 // ── board: an agent boards a flight ──────────────────────────────────────────────────────────
@@ -91,16 +95,17 @@ export async function boardJourney(env: Env, input: BoardInput, opts: Opts = {})
   if (goal === null) return { ok: false, reason: 'invalid_goal' }
   const gate = input.gate === undefined ? '' : capStr(input.gate, MAX_GATE)
   if (gate === null) return { ok: false, reason: 'invalid_gate' }
+
+  const now = opts.now ?? (() => Date.now())
+  const ts = now()
   let eta: number | null = null
   if (input.eta !== undefined) {
-    if (!validEta(input.eta)) return { ok: false, reason: 'invalid_eta' }
+    if (!validEta(input.eta, ts)) return { ok: false, reason: 'invalid_eta' }
     eta = Math.floor(input.eta)
   }
 
-  const now = opts.now ?? (() => Date.now())
   const idGen = opts.idGen ?? (() => crypto.randomUUID())
   const id = idGen()
-  const ts = now()
   try {
     const r = await env.DB.prepare(
       `INSERT INTO journeys (id, tenant, agent, project, goal, status, gate, eta, created_at, updated_at)
@@ -142,14 +147,13 @@ export async function updateJourney(
     if (g === null) return { ok: false, reason: 'invalid_gate' }
     gate = g
   }
-  let eta: number | undefined
-  if (patch.eta !== undefined) {
-    if (!validEta(patch.eta)) return { ok: false, reason: 'invalid_eta' }
-    eta = Math.floor(patch.eta)
-  }
-
   const now = opts.now ?? (() => Date.now())
   const ts = now()
+  let eta: number | undefined
+  if (patch.eta !== undefined) {
+    if (!validEta(patch.eta, ts)) return { ok: false, reason: 'invalid_eta' }
+    eta = Math.floor(patch.eta)
+  }
   // Build a single conditional UPDATE. departed_at / arrived_at are stamped only on the FIRST
   // transition into that status (COALESCE keeps an earlier stamp). Ownership is enforced in the
   // WHERE (tenant + agent) — a non-owner / unknown id changes 0 rows → not_found (no ownership oracle).

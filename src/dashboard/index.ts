@@ -482,8 +482,13 @@ dashboardApp.post('/fleet/control', async (c) => {
 // any authenticated pot member. Agents board flights at POST /api/coordination.
 dashboardApp.get('/coordination', async (c) => {
   const scope = c.req.query('scope') === 'all' ? 'all' : 'live'
-  const rows = await listJourneys(c.env, { scope })
-  const cards = buildDepartureBoard(rows, Date.now())
+  // Render even if the read fails — an empty board, never a raw 500 with a stack.
+  let cards: DepartureCard[] = []
+  try {
+    cards = buildDepartureBoard(await listJourneys(c.env, { scope }), Date.now())
+  } catch {
+    cards = []
+  }
   return c.html(shell(c.env.BRAND, 'Control Tower', controlTowerBody(cards)))
 })
 
@@ -3430,8 +3435,9 @@ function flightsBody(cards: FlightCard[]) {
 }
 
 // The Control Tower departures board. Cards come pre-derived (buildDepartureBoard); every
-// agent-supplied field (agent/project/goal/gate) is escHtml'd before interpolation.
-function controlTowerBody(cards: DepartureCard[]) {
+// agent-supplied field (agent/project/goal/gate) is escHtml'd before interpolation. Exported so
+// the XSS regression test can assert the escaping on the rendered output directly.
+export function controlTowerBody(cards: DepartureCard[]) {
   const dot = (p: string) =>
     p === 'IN FLIGHT' ? 'var(--ok)' : p === 'BOARDING' ? 'var(--warn)' : p === 'DELAYED' ? '#e5534b' : 'var(--dim)'
   const tr = (c: DepartureCard) => `
