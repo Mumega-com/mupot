@@ -25,10 +25,14 @@
 //      is never logged, never returned, never persisted. Error messages carry the HTTP
 //      status, never the request detail.
 //   5. NO SSRF. The host is operator-set env (POSTHOG_HOST, default US cloud) — never
-//      client input — and is validated to be an https URL before the fetch.
+//      client input — and is validated through the SHARED hardened guard (src/lib/ssrf.ts):
+//      https + a PUBLIC host. Loopback / RFC1918 / link-local / cloud-metadata / ULA /
+//      IPv4-mapped-IPv6 are all blocked, so a misconfigured or hostile POSTHOG_HOST cannot
+//      point the cron at an internal target (#219 BLOCK-1, Codex cross-vendor catch).
 
 import type { Env } from '../types'
 import type { CroMetric, CroSource } from './sources'
+import { assertPublicHttpsUrl } from '../lib/ssrf'
 
 export const POSTHOG_KEY = 'posthog'
 
@@ -58,19 +62,22 @@ interface PostHogQueryResponse {
 
 /**
  * Validate + normalize the PostHog base host. Operator-set env only (never client input).
- * Must be a parseable https URL; returns the origin (no trailing slash). Throws otherwise
- * so collect() records an honest error rather than firing a request at a bad/insecure URL.
+ * Must be a parseable https URL with a PUBLIC host (the shared SSRF guard blocks loopback /
+ * RFC1918 / link-local / metadata / ULA / IPv4-mapped-IPv6). Returns the origin (drops any
+ * path/userinfo/query). Throws a stable code-string otherwise so collect() records an honest
+ * error rather than firing a request at a bad/insecure/internal URL.
+ *   posthog_host_unparseable | posthog_host_not_https | posthog_host_private
  */
 export function posthogHost(env: Env): string {
   const raw = (env.POSTHOG_HOST ?? POSTHOG_DEFAULT_HOST).trim()
-  let url: URL
   try {
-    url = new URL(raw)
-  } catch {
+    return assertPublicHttpsUrl(raw).origin
+  } catch (e) {
+    const code = e instanceof Error ? e.message : 'url_unparseable'
+    if (code === 'url_not_https') throw new Error('posthog_host_not_https')
+    if (code === 'url_private_host') throw new Error('posthog_host_private')
     throw new Error('posthog_host_unparseable')
   }
-  if (url.protocol !== 'https:') throw new Error('posthog_host_not_https')
-  return url.origin
 }
 
 export const posthogCroSource: CroSource = {
@@ -94,9 +101,13 @@ export const posthogCroSource: CroSource = {
 
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), POSTHOG_TIMEOUT_MS)
-    let res: Response
+    // Keep the abort armed across BOTH the fetch AND the body read (WARN-1, Opus): a server
+    // that returns headers fast but hangs the body stream must still be bounded by the
+    // timeout. The signal is on the fetch; the json() read inherits the abort because it is
+    // inside the same armed window, and clearTimeout only fires once the body is fully read.
+    let data: PostHogQueryResponse
     try {
-      res = await fetch(endpoint, {
+      const res = await fetch(endpoint, {
         method: 'POST',
         headers: {
           // Secret ONLY here. Never logged, never echoed.
@@ -106,17 +117,14 @@ export const posthogCroSource: CroSource = {
         body: JSON.stringify({ query: { kind: 'HogQLQuery', query: HOGQL_24H_ROLLUP } }),
         signal: controller.signal,
       })
+      if (!res.ok) {
+        // Carry the status, never the request detail (keeps secret-discipline tight).
+        throw new Error(`posthog_query_http_${res.status}`)
+      }
+      data = (await res.json()) as PostHogQueryResponse
     } finally {
       clearTimeout(timer)
     }
-
-    if (!res.ok) {
-      // Carry the status, never the request detail (which would leak nothing sensitive
-      // today, but keep the discipline tight).
-      throw new Error(`posthog_query_http_${res.status}`)
-    }
-
-    const data = (await res.json()) as PostHogQueryResponse
     const rows = data.results
     // Aggregate ⇒ exactly one row. Defensive slice(0,1): a future query shape change can't
     // amplify this adapter's output beyond the single aggregate row we asked for.

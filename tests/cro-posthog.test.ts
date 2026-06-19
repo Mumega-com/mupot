@@ -5,7 +5,12 @@
 // poison-resistant normalization into CroMetric points.
 
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { posthogCroSource, posthogHost, POSTHOG_DEFAULT_HOST } from '../src/cro/posthog'
+import {
+  posthogCroSource,
+  posthogHost,
+  POSTHOG_DEFAULT_HOST,
+  POSTHOG_TIMEOUT_MS,
+} from '../src/cro/posthog'
 import type { Env } from '../src/types'
 
 function env(over: Partial<Env> = {}): Env {
@@ -52,14 +57,37 @@ describe('posthogHost — https-only, operator-set, no SSRF', () => {
   it('defaults to US cloud when unset', () => {
     expect(posthogHost(env({ POSTHOG_HOST: undefined }))).toBe(POSTHOG_DEFAULT_HOST)
   })
-  it('returns the origin (no trailing path) for a valid https host', () => {
+  it('returns the origin (drops path/query) for a valid public https host', () => {
     expect(posthogHost(env({ POSTHOG_HOST: 'https://eu.posthog.com/' }))).toBe('https://eu.posthog.com')
+    expect(posthogHost(env({ POSTHOG_HOST: 'https://eu.posthog.com/path?x=1' }))).toBe('https://eu.posthog.com')
   })
   it('rejects a non-https host (fail-closed)', () => {
-    expect(() => posthogHost(env({ POSTHOG_HOST: 'http://evil.internal' }))).toThrow('posthog_host_not_https')
+    expect(() => posthogHost(env({ POSTHOG_HOST: 'http://posthog.example.com' }))).toThrow('posthog_host_not_https')
   })
   it('rejects an unparseable host', () => {
     expect(() => posthogHost(env({ POSTHOG_HOST: 'not a url' }))).toThrow('posthog_host_unparseable')
+  })
+
+  // BLOCK-1 (#219, Codex): https alone is NOT enough — an internal/private host over https
+  // must be blocked or POSTHOG_HOST is an SSRF lever. The shared guard (src/lib/ssrf.ts)
+  // catches loopback / RFC1918 / link-local / metadata / .internal / .local / IPv4-mapped v6.
+  it.each([
+    ['https://127.0.0.1', 'loopback v4'],
+    ['https://localhost', 'localhost'],
+    ['https://10.0.0.1', 'RFC1918 10/8'],
+    ['https://192.168.1.1', 'RFC1918 192.168/16'],
+    ['https://172.16.5.5', 'RFC1918 172.16/12'],
+    ['https://169.254.169.254', 'link-local / cloud metadata'],
+    ['https://100.64.0.1', 'CGNAT 100.64/10'],
+    ['https://metadata.google.internal', 'GCE metadata name'],
+    ['https://foo.internal', '.internal suffix'],
+    ['https://bar.local', '.local suffix'],
+    ['https://[::1]', 'IPv6 loopback'],
+    ['https://[::ffff:127.0.0.1]', 'IPv4-mapped IPv6 loopback'],
+    ['https://[fd00::1]', 'IPv6 ULA'],
+    ['https://127.0.0.1.', 'trailing-dot loopback'],
+  ])('blocks a private/internal host over https: %s (%s)', (host) => {
+    expect(() => posthogHost(env({ POSTHOG_HOST: host }))).toThrow('posthog_host_private')
   })
 })
 
@@ -125,5 +153,44 @@ describe('posthogCroSource.collect — the HogQL aggregate call', () => {
       'posthog_host_not_https',
     )
     expect(fetchFn).not.toHaveBeenCalled()
+  })
+
+  it('BLOCK-1: refuses to fetch an internal host (SSRF) — throws before the request', async () => {
+    const fetchFn = mockFetchOnce({ results: [[1, 1]] })
+    await expect(posthogCroSource.collect(env({ POSTHOG_HOST: 'https://169.254.169.254' }))).rejects.toThrow(
+      'posthog_host_private',
+    )
+    expect(fetchFn).not.toHaveBeenCalled()
+  })
+
+  // WARN-1 (Opus) regression guard: the abort timer must stay armed across the BODY read,
+  // not just the fetch. A server that returns headers fast but hangs json() must still be
+  // bounded by POSTHOG_TIMEOUT_MS. We use a signal-aware mock whose json() rejects on abort;
+  // with fake timers we advance past the timeout and assert the hung body read is aborted.
+  // (Under the old code — clearTimeout right after fetch — the timer would be cleared before
+  // json(), abort would never fire, and this promise would hang forever.)
+  it('WARN-1: keeps the timeout armed across the body read (a hung json() is aborted)', async () => {
+    vi.useFakeTimers()
+    try {
+      const fetchFn = vi.fn(async (_url: string, opts: RequestInit) => {
+        const signal = opts.signal as AbortSignal
+        return {
+          ok: true,
+          status: 200,
+          json: () =>
+            new Promise((_resolve, reject) => {
+              signal.addEventListener('abort', () => reject(new Error('body_aborted')))
+            }),
+        }
+      }) as unknown as typeof fetch
+      vi.stubGlobal('fetch', fetchFn)
+
+      const p = posthogCroSource.collect(env())
+      const assertion = expect(p).rejects.toThrow('body_aborted')
+      await vi.advanceTimersByTimeAsync(POSTHOG_TIMEOUT_MS + 1) // armed timer fires the abort
+      await assertion
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
