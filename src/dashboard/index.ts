@@ -64,6 +64,7 @@ import { loadEconomy, economyBody } from './economy'
 import { loadVerifications, verificationsBody } from './verifications'
 import { loadAudit, auditBody } from './audit'
 import { loadBilling, billingBody } from './billing'
+import { servicesBody } from './services'
 import { pageHeader, notConnected, statCard, kpiRow } from './ui'
 import type { ApprovalItem } from './approvals'
 import {
@@ -202,6 +203,13 @@ dashboardApp.get('/approvals', async (c) => {
 dashboardApp.get('/loops', async (c) => {
   const view = await loadLoopsView(c.env)
   return c.html(shell(c.env.BRAND, 'Loops', loopsBody(view)))
+})
+
+// ── services (the priced "basket of services" the reseller sells) ────────────
+// GET /services — read-only render of SERVICE_CATALOG (config). requireAuth via the
+// outer middleware. Draft prices live in src/services/catalog.ts.
+dashboardApp.get('/services', async (c) => {
+  return c.html(shell(c.env.BRAND, 'Services', servicesBody()))
 })
 
 // ── economy (squad Anthropic spend — #179) ───────────────────────────────────
