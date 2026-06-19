@@ -46,6 +46,7 @@ import { brainPhysicsIngestApp } from './dashboard/brain-ingest'
 import { billingAdminApp } from './billing/admin'
 import { ccSpendApp } from './economy/cc-spend'
 import { resellerApp } from './reseller/routes'
+import { inboxApp } from './agents/inbox-routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -113,6 +114,11 @@ app.route('/api/economy', ccSpendApp)
 // The live stand-up (CF account/repo/deploy/secrets/mint) is Hadi-go ops — this plans only.
 // Before the dashboard '/' catch-all.
 app.route('/api/reseller', resellerApp)
+
+// Agent inbox HTTP mirror (squad → mupot, S3 follow-on): the bash wake-hooks poll the pot for
+// delegations over HTTP (they can't speak MCP JSON-RPC). Member-bearer auth, self-scoped to the
+// token's welded agent. Same pure service as the MCP send/inbox tools. Before the '/' catch-all.
+app.route('/api/inbox', inboxApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp

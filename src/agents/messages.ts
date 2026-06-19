@@ -13,6 +13,7 @@
 //     idempotent no-op returning the original, so the ACK protocol can't double-deliver.
 
 import type { Env } from '../types'
+import { resolveAgentRef } from '../org/resolve'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 const MAX_BODY_CHARS = 8000
@@ -306,4 +307,46 @@ export async function readAgentInbox(
   } catch (err) {
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
   }
+}
+
+// ── send by ref (shared by the MCP `send` tool AND the HTTP /api/inbox/send route) ─────────
+// Resolves a recipient REF (id or unique slug) via the canonical, security-reviewed
+// resolveAgentRef (id-first, slug-ambiguity refused), then delegates to sendAgentMessage. One
+// code path so the MCP and HTTP surfaces can NEVER diverge on validation/replay/cap semantics.
+export type SendToRefResult =
+  | { ok: true; id: string; seq: number; duplicate: boolean; toAgent: string }
+  | { ok: false; reason: 'recipient_not_found' | 'recipient_ambiguous' | SendFailure['reason']; detail?: string }
+
+export async function sendToRef(
+  env: Env,
+  input: {
+    fromAgent: string
+    fromMember: string
+    toRef: string
+    body: string
+    kind?: MessageKind
+    requestId?: string
+    inReplyTo?: string
+  },
+  opts: Opts = {},
+): Promise<SendToRefResult> {
+  const resolved = await resolveAgentRef(env, input.toRef)
+  if (!resolved.ok) {
+    return { ok: false, reason: resolved.reason === 'ambiguous' ? 'recipient_ambiguous' : 'recipient_not_found' }
+  }
+  const res = await sendAgentMessage(
+    env,
+    {
+      fromAgent: input.fromAgent,
+      fromMember: input.fromMember,
+      toAgent: resolved.value.id,
+      body: input.body,
+      kind: input.kind,
+      requestId: input.requestId,
+      inReplyTo: input.inReplyTo,
+    },
+    opts,
+  )
+  if (!res.ok) return res
+  return { ok: true, id: res.id, seq: res.seq, duplicate: res.duplicate, toAgent: resolved.value.id }
 }

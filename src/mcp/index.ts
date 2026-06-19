@@ -40,7 +40,7 @@ import { createTask } from '../tasks/service'
 import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
 import { resolveAgentRef } from '../org/resolve'
-import { sendAgentMessage, readAgentInbox } from '../agents/messages'
+import { sendToRef, readAgentInbox } from '../agents/messages'
 import { PROVISION_TOOLS } from './provision'
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
 // Vitest can import it without the CF runtime. See ./auth-header.ts.
@@ -548,17 +548,10 @@ const toolSend: ToolSpec = {
     if (args.in_reply_to !== undefined && typeof args.in_reply_to !== 'string')
       return fail(400, 'invalid_args', 'in_reply_to must be a string')
 
-    const resolved = await resolveAgentRef(env, to)
-    if (!resolved.ok) {
-      return resolved.reason === 'ambiguous'
-        ? fail(409, 'recipient_ambiguous', `more than one agent matches '${to}' — use the id`)
-        : fail(404, 'recipient_not_found')
-    }
-
-    const res = await sendAgentMessage(env, {
+    const res = await sendToRef(env, {
       fromAgent,
       fromMember: auth.memberId as string,
-      toAgent: resolved.value.id,
+      toRef: to,
       body,
       kind: args.kind as 'message' | 'request' | 'ack' | undefined,
       requestId: typeof args.request_id === 'string' ? args.request_id : undefined,
@@ -566,14 +559,18 @@ const toolSend: ToolSpec = {
     })
     if (!res.ok) {
       const status =
-        res.reason === 'db_error'
-          ? 500
-          : res.reason === 'request_id_conflict' || res.reason === 'inbox_full'
+        res.reason === 'recipient_not_found'
+          ? 404
+          : res.reason === 'recipient_ambiguous' ||
+              res.reason === 'request_id_conflict' ||
+              res.reason === 'inbox_full'
             ? 409
-            : 400
+            : res.reason === 'db_error'
+              ? 500
+              : 400
       return fail(status, res.reason, res.detail)
     }
-    return done({ id: res.id, seq: res.seq, duplicate: res.duplicate, to: resolved.value.id })
+    return done({ id: res.id, seq: res.seq, duplicate: res.duplicate, to: res.toAgent })
   },
 }
 
