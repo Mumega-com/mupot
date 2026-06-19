@@ -82,6 +82,8 @@ import { loadFleet, wakeFleetAgent, requestFleetControl, fleetScoped } from './f
 import type { FleetRow } from './fleet'
 import { listPresence } from '../fleet/presence'
 import type { PresenceView } from '../fleet/presence'
+import { listJourneys, buildDepartureBoard } from '../coordination/journeys'
+import type { DepartureCard } from '../coordination/journeys'
 import { listFlights } from '../flight/service'
 import { buildBoard } from '../flight/board'
 import type { FlightCard } from '../flight/board'
@@ -473,6 +475,16 @@ dashboardApp.post('/fleet/control', async (c) => {
   }
   const r = await requestFleetControl(c.env, agent, action, auth.email ?? 'admin')
   return c.json(r, r.ok ? 200 : 400)
+})
+
+// ── Control Tower (coordination departures board) ────────────────────────────
+// GET /coordination — which agent flies to which project, when, what status. Read-only,
+// any authenticated pot member. Agents board flights at POST /api/coordination.
+dashboardApp.get('/coordination', async (c) => {
+  const scope = c.req.query('scope') === 'all' ? 'all' : 'live'
+  const rows = await listJourneys(c.env, { scope })
+  const cards = buildDepartureBoard(rows, Date.now())
+  return c.html(shell(c.env.BRAND, 'Control Tower', controlTowerBody(cards)))
 })
 
 // ── /agents — unified agent management ───────────────────────────────────────
@@ -3415,6 +3427,50 @@ function flightsBody(cards: FlightCard[]) {
       .fl-over { color: #e5534b; }
     </style>
     ${raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}`
+}
+
+// The Control Tower departures board. Cards come pre-derived (buildDepartureBoard); every
+// agent-supplied field (agent/project/goal/gate) is escHtml'd before interpolation.
+function controlTowerBody(cards: DepartureCard[]) {
+  const dot = (p: string) =>
+    p === 'IN FLIGHT' ? 'var(--ok)' : p === 'BOARDING' ? 'var(--warn)' : p === 'DELAYED' ? '#e5534b' : 'var(--dim)'
+  const tr = (c: DepartureCard) => `
+    <tr class="ct-row ${c.live ? '' : 'ct-dim'}">
+      <td><span class="ct-dot" style="background:${dot(c.phase)}"></span>${escHtml(c.agent)}</td>
+      <td class="ct-dest">${escHtml(c.project)}</td>
+      <td class="ct-label">${escHtml(c.goal || '—')}</td>
+      <td><span class="ct-badge">${escHtml(c.phase)}</span></td>
+      <td>${escHtml(c.departed)}</td>
+      <td>${escHtml(c.eta)}</td>
+      <td class="ct-label">${c.gate ? escHtml(c.gate) : '—'}</td>
+      <td>${escHtml(c.age)}</td>
+    </tr>`
+  const live = cards.filter((c) => c.live).length
+  const table = cards.length
+    ? `<table class="ct-table">
+        <thead><tr><th>Flight (agent)</th><th>Destination</th><th>Goal</th><th>Status</th><th>Departed</th><th>ETA</th><th>Gate</th><th>Age</th></tr></thead>
+        <tbody>${cards.map(tr).join('')}</tbody>
+      </table>`
+    : `<p class="empty">No flights on the board. An agent boards one at <code>POST /api/coordination</code> with {project, goal, gate, eta_ms} and it appears here.</p>`
+  return html`
+    ${pageHeader({
+      crumbs: 'Overview / Control Tower',
+      title: 'Control Tower',
+      sub: 'Departures board — which agent flies to which project, when, and what status. Any agent-bound token boards a flight (POST /api/coordination); the colony reads the board. Live flights first; arrived/cancelled fade to history. Times UTC.',
+    })}
+    ${kpiRow([statCard({ label: 'In the air', value: String(live), subTone: live > 0 ? 'ok' : 'dim' })])}
+    <style>
+      .ct-table{width:100%;border-collapse:collapse;font-size:14px}
+      .ct-table th{text-align:left;padding:8px 10px;color:var(--dim);font-weight:600;border-bottom:1px solid var(--border)}
+      .ct-table td{padding:8px 10px;border-bottom:1px solid var(--border)}
+      .ct-row.ct-dim{opacity:.5}
+      .ct-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;vertical-align:middle}
+      .ct-dest{font-weight:600}
+      .ct-label{color:var(--dim)}
+      .ct-badge{font-size:11px;padding:2px 8px;border-radius:10px;background:var(--surface);border:1px solid var(--border)}
+      .empty{color:var(--dim);padding:16px}
+    </style>
+    ${raw(table)}`
 }
 
 function potFleetBody(rows: PresenceView[]) {
