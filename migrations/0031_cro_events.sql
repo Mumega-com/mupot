@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS cro_events (
   tenant_id   TEXT NOT NULL,
   source      TEXT NOT NULL,        -- 'first_party' | 'posthog' | 'google_ads' | 'crm' | …
   event_name  TEXT NOT NULL,        -- 'pageview' | 'signup' | 'checkout' | …
+  event_key   TEXT,                 -- the SOURCE's own stable event id (idempotency key); nullable
   user_id     TEXT,                 -- pseudonymous, nullable
   session_id  TEXT,                 -- nullable
   occurred_at INTEGER NOT NULL,     -- epoch ms the event is FOR
@@ -22,6 +23,12 @@ CREATE TABLE IF NOT EXISTS cro_events (
   created_at  INTEGER NOT NULL      -- epoch ms the row was written
 );
 
+-- IDEMPOTENCY (BLOCK-1, Codex catch): a connector retry must NOT duplicate the conversion
+-- grain. The source supplies its own stable event id as event_key; this unique index +
+-- INSERT OR IGNORE make a re-delivery a no-op. (SQLite treats NULLs as distinct, so events
+-- without a source id — e.g. some first-party signals — are simply not deduped, which is
+-- correct: they carry no retry identity.)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cro_events_dedup ON cro_events (tenant_id, source, event_key);
 -- Time-series scan by source (the collector's primary read).
 CREATE INDEX IF NOT EXISTS idx_cro_events_source ON cro_events (tenant_id, source, occurred_at);
 -- Funnel-step scan by event name (conversion-rate aggregation).

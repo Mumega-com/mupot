@@ -1,12 +1,17 @@
 // tests/cro-events.test.ts — the CRO event grain: validated, tenant-bound, capped write + read.
 
 import { describe, it, expect } from 'vitest'
-import { recordCroEvents, readCroEvents, MAX_EVENTS_PER_WRITE, MAX_EVENTS_PER_READ } from '../src/cro/events'
+import { recordCroEvents, readCroEvents, MAX_EVENTS_PER_WRITE, MAX_EVENTS_PER_READ, MAX_FIELD_LEN } from '../src/cro/events'
 import type { CroEventInput, CroEventRow } from '../src/cro/events'
 import type { Env } from '../src/types'
 
+// Mock that SIMULATES the unique-index dedup: INSERT OR IGNORE on a (tenant, source, event_key)
+// already seen → 0 changes (the no-op). `seen` persists across batch() calls on the same env,
+// so a second recordCroEvents (a retry) is correctly deduped. bind layout:
+// [0]id [1]tenant [2]source [3]event_name [4]event_key [5]user_id [6]session_id [7]occurred_at [8]properties [9]created_at
 function makeEnv(opts: { tenant?: string; rows?: CroEventRow[] } = {}) {
   const inserts: unknown[][] = []
+  const seen = new Set<string>()
   let lastSql = ''
   let lastBinds: unknown[] = []
   const env = {
@@ -28,8 +33,18 @@ function makeEnv(opts: { tenant?: string; rows?: CroEventRow[] } = {}) {
         return stmt
       },
       async batch(stmts: Array<{ _binds: unknown[] }>) {
-        for (const s of stmts) inserts.push(s._binds)
-        return stmts.map(() => ({ meta: { changes: 1 } }))
+        return stmts.map((s) => {
+          inserts.push(s._binds)
+          const tenant = s._binds[1]
+          const source = s._binds[2]
+          const eventKey = s._binds[4]
+          if (eventKey != null) {
+            const k = `${tenant}|${source}|${eventKey}`
+            if (seen.has(k)) return { meta: { changes: 0 } } // idempotent no-op
+            seen.add(k)
+          }
+          return { meta: { changes: 1 } }
+        })
       },
     },
   } as unknown as Env
@@ -88,14 +103,53 @@ describe('recordCroEvents', () => {
       ev({ properties: { variant: 'B', device: 'mobile' } }),
       ev({ properties: circular }),
     ])
-    expect(inserts[0][7]).toBe(JSON.stringify({ variant: 'B', device: 'mobile' })) // bind 7 = properties
-    expect(inserts[1][7]).toBeNull()
+    expect(inserts[0][8]).toBe(JSON.stringify({ variant: 'B', device: 'mobile' })) // bind 8 = properties
+    expect(inserts[1][8]).toBeNull()
   })
 
   it('handles an empty / non-array input gracefully', async () => {
     const { env } = makeEnv()
     expect(await recordCroEvents(env, [])).toMatchObject({ written: 0 })
     expect(await recordCroEvents(env, undefined as unknown as CroEventInput[])).toMatchObject({ written: 0 })
+  })
+
+  it('BLOCK-1: idempotent on (source, event_key) — a connector RETRY is a no-op, never overcounts', async () => {
+    const { env } = makeEnv()
+    const e = ev({ event_key: 'ph-evt-abc123' })
+    expect(await recordCroEvents(env, [e])).toMatchObject({ written: 1, deduped: 0 })
+    // same env (same dedup state) = a re-delivery → 0 written, counted as deduped
+    expect(await recordCroEvents(env, [e])).toMatchObject({ written: 0, deduped: 1 })
+  })
+
+  it('BLOCK-1: dedups duplicate event_keys WITHIN a single batch', async () => {
+    const { env } = makeEnv()
+    const res = await recordCroEvents(env, [
+      ev({ event_key: 'k1' }),
+      ev({ event_key: 'k1' }), // dup in same batch
+      ev({ event_key: 'k2' }),
+    ])
+    expect(res).toMatchObject({ written: 2, deduped: 1 })
+  })
+
+  it('keyless events are never deduped (no retry identity)', async () => {
+    const { env } = makeEnv()
+    const res = await recordCroEvents(env, [ev(), ev()]) // no event_key on either
+    expect(res).toMatchObject({ written: 2, deduped: 0 })
+  })
+
+  it('BLOCK-2: rejects events with an oversized adapter field (>MAX_FIELD_LEN)', async () => {
+    const { env, inserts } = makeEnv()
+    const big = 'x'.repeat(MAX_FIELD_LEN + 1)
+    const res = await recordCroEvents(env, [
+      ev({ source: big }),
+      ev({ event_name: big }),
+      ev({ user_id: big }),
+      ev({ session_id: big }),
+      ev({ event_key: big }),
+      ev(), // the one valid event
+    ])
+    expect(res).toMatchObject({ written: 1, rejected: 5 })
+    expect(inserts).toHaveLength(1)
   })
 })
 
