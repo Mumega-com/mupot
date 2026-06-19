@@ -558,6 +558,7 @@ const toolSend: ToolSpec = {
       inReplyTo: typeof args.in_reply_to === 'string' ? args.in_reply_to : undefined,
     })
     if (!res.ok) {
+      if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
       const status =
         res.reason === 'recipient_not_found'
           ? 404
@@ -565,9 +566,7 @@ const toolSend: ToolSpec = {
               res.reason === 'request_id_conflict' ||
               res.reason === 'inbox_full'
             ? 409
-            : res.reason === 'db_error'
-              ? 500
-              : 400
+            : 400
       return fail(status, res.reason, res.detail)
     }
     return done({ id: res.id, seq: res.seq, duplicate: res.duplicate, to: res.toAgent })
@@ -602,8 +601,8 @@ const toolInbox: ToolSpec = {
 
     const res = await readAgentInbox(env, { agent, limit, peek: args.peek === true })
     if (!res.ok) {
-      const status = res.reason === 'db_error' ? 500 : 400
-      return fail(status, res.reason, res.detail)
+      if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
+      return fail(400, res.reason, res.detail)
     }
     return done({ messages: res.messages, remaining: res.remaining, consumed: args.peek !== true })
   },
