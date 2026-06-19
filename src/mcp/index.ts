@@ -40,6 +40,7 @@ import { createTask } from '../tasks/service'
 import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
 import { resolveAgentRef } from '../org/resolve'
+import { sendAgentMessage, readAgentInbox } from '../agents/messages'
 import { PROVISION_TOOLS } from './provision'
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
 // Vitest can import it without the CF runtime. See ./auth-header.ts.
@@ -512,6 +513,105 @@ const toolSquadMessage: ToolSpec = {
   },
 }
 
+// send — leave a durable message in another agent's inbox (squad → mupot migration, S3).
+// The sender MUST be an agent-bound token (auth.boundAgentId = the weld) so every message is
+// accountable to a real agent; humans use im/squad_message. Recipient resolved via the canonical
+// resolveAgentRef (id-first, slug ambiguity refused). Tenant-scoped: cannot address another pot.
+const toolSend: ToolSpec = {
+  name: 'send',
+  scope: 'agent→agent (this pot); sender must be agent-bound',
+  min: 'authenticated',
+  args: '{ to: string (agent id or unique slug), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      to: STRING_SCHEMA,
+      body: STRING_SCHEMA,
+      kind: STRING_SCHEMA,
+      request_id: STRING_SCHEMA,
+      in_reply_to: STRING_SCHEMA,
+    },
+    required: ['to', 'body'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const fromAgent = auth.boundAgentId
+    if (!fromAgent) return fail(403, 'not_agent_bound', 'send requires an agent-bound token (member_tokens.agent_id)')
+    const to = str(args.to)
+    const body = str(args.body)
+    if (!to) return fail(400, 'invalid_args', 'to required')
+    if (!body) return fail(400, 'invalid_args', 'body required')
+    if (args.kind !== undefined && typeof args.kind !== 'string')
+      return fail(400, 'invalid_args', 'kind must be a string')
+    if (args.request_id !== undefined && typeof args.request_id !== 'string')
+      return fail(400, 'invalid_args', 'request_id must be a string')
+    if (args.in_reply_to !== undefined && typeof args.in_reply_to !== 'string')
+      return fail(400, 'invalid_args', 'in_reply_to must be a string')
+
+    const resolved = await resolveAgentRef(env, to)
+    if (!resolved.ok) {
+      return resolved.reason === 'ambiguous'
+        ? fail(409, 'recipient_ambiguous', `more than one agent matches '${to}' — use the id`)
+        : fail(404, 'recipient_not_found')
+    }
+
+    const res = await sendAgentMessage(env, {
+      fromAgent,
+      fromMember: auth.memberId as string,
+      toAgent: resolved.value.id,
+      body,
+      kind: args.kind as 'message' | 'request' | 'ack' | undefined,
+      requestId: typeof args.request_id === 'string' ? args.request_id : undefined,
+      inReplyTo: typeof args.in_reply_to === 'string' ? args.in_reply_to : undefined,
+    })
+    if (!res.ok) {
+      const status =
+        res.reason === 'db_error'
+          ? 500
+          : res.reason === 'request_id_conflict' || res.reason === 'inbox_full'
+            ? 409
+            : 400
+      return fail(status, res.reason, res.detail)
+    }
+    return done({ id: res.id, seq: res.seq, duplicate: res.duplicate, to: resolved.value.id })
+  },
+}
+
+// inbox — read (and by default CONSUME) the CALLER's own inbox. cap: agent-bound member.
+// Self-scoped: an agent only ever reads to_agent = its own welded id; it cannot read another
+// agent's inbox. peek=true reads without consuming.
+const toolInbox: ToolSpec = {
+  name: 'inbox',
+  scope: 'self (the caller agent reads its own inbox)',
+  min: 'authenticated',
+  args: '{ limit?: number, peek?: boolean }',
+  inputSchema: {
+    type: 'object',
+    properties: { limit: OPTIONAL_NUMBER_SCHEMA, peek: { type: 'boolean' } },
+    required: [],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const agent = auth.boundAgentId
+    if (!agent) return fail(403, 'not_agent_bound', 'inbox requires an agent-bound token (member_tokens.agent_id)')
+    let limit: number | undefined
+    if (args.limit !== undefined) {
+      if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
+        return fail(400, 'invalid_args', 'limit must be a number')
+      limit = args.limit
+    }
+    if (args.peek !== undefined && typeof args.peek !== 'boolean')
+      return fail(400, 'invalid_args', 'peek must be a boolean')
+
+    const res = await readAgentInbox(env, { agent, limit, peek: args.peek === true })
+    if (!res.ok) {
+      const status = res.reason === 'db_error' ? 500 : 400
+      return fail(status, res.reason, res.detail)
+    }
+    return done({ messages: res.messages, remaining: res.remaining, consumed: args.peek !== true })
+  },
+}
+
 // status — read-only agent runtime telemetry. cap: any authenticated member.
 // Read-only and tenant-scoped (the agent row is resolved from this pot's D1).
 const toolStatus: ToolSpec = {
@@ -826,6 +926,8 @@ export const TOOLS: ToolSpec[] = [
   toolRecall,
   toolWakeAgent,
   toolSquadMessage,
+  toolSend,
+  toolInbox,
   toolStatus,
   toolBootContext,
   toolOrient,
