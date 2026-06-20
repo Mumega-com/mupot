@@ -91,6 +91,9 @@ import { formatBurn, formatUsd } from '../agents/cost'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
 import { loadFleet, wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
 import type { FleetRow } from './fleet'
+import { listFleetAgents } from '../fleet/registry'
+import { emitControlRequest } from '../fleet/control'
+import { hostAgentsPanel } from './fleet-host'
 import { listPresence } from '../fleet/presence'
 import type { PresenceView } from '../fleet/presence'
 import { listJourneys, buildDepartureBoard } from '../coordination/journeys'
@@ -431,12 +434,22 @@ dashboardApp.get('/flights', async (c) => {
 // GET /fleet — see every company agent: liveness, last active, role/label.
 // Window only: data comes from the bus bridge; the pot runs none of them.
 dashboardApp.get('/fleet', async (c) => {
+  // The host-agents panel (signed control via mupot, the durable replacement for the bus path) is
+  // shown on BOTH the pot-native and the bus window — it's the pot's OWN fleet control surface.
+  const auth = c.get('auth')
+  const hostAgents = await listFleetAgents(c.env)
+  const hostPanel = hostAgentsPanel(hostAgents, {
+    configured: !!c.env.FLEET_PANEL_SK && !!c.env.FLEET_CONSUMER_AGENT,
+    canControl: auth.role === 'owner',
+    flash: c.req.query('hc') ?? null,
+  })
+
   // No company-bus connection → show the POT-NATIVE flock instead of an empty
   // notice: agents that checked in to THIS pot (inbound, no egress). This is the
   // tenant-pot path (Digid); the bus path below is the company/HQ window.
   if (!fleetScoped(c.env)) {
     const presence = await listPresence(c.env, Date.now())
-    return c.html(shell(c.env.BRAND, 'Fleet', potFleetBody(presence)))
+    return c.html(shell(c.env.BRAND, 'Fleet', html`${potFleetBody(presence)}${hostPanel}`))
   }
   let rows: FleetRow[] = []
   let error: string | null = null
@@ -445,7 +458,24 @@ dashboardApp.get('/fleet', async (c) => {
   } catch (e) {
     error = e instanceof Error ? e.message : 'bus_unreachable'
   }
-  return c.html(shell(c.env.BRAND, 'Fleet', fleetBody(rows, error)))
+  return c.html(shell(c.env.BRAND, 'Fleet', html`${fleetBody(rows, error)}${hostPanel}`))
+})
+
+// POST /fleet/host-control — start|stop|restart a HOST agent via the SIGNED control plane (mupot
+// inbox → host daemon verifies the Ed25519 signature → engine). OWNER only (highest-stakes action;
+// host process control). The principal comes from the session, never the form. Form POST + redirect.
+dashboardApp.post('/fleet/host-control', async (c) => {
+  const auth = c.get('auth')
+  if (auth.role !== 'owner') return c.json({ error: 'forbidden', need: 'owner' }, 403)
+  const form = await c.req.parseBody()
+  const agent_id = typeof form.agent_id === 'string' ? form.agent_id : ''
+  const verb = typeof form.verb === 'string' ? form.verb : ''
+  const res = await emitControlRequest(
+    c.env,
+    { agent_id, verb },
+    { memberId: auth.memberId ?? auth.userId, boundAgentId: auth.boundAgentId ?? null },
+  )
+  return c.redirect(`/fleet?hc=${encodeURIComponent(res.ok ? 'ok' : res.reason)}`)
 })
 
 // POST /fleet/wake — direct bus ping to the agent. Owner/admin only
