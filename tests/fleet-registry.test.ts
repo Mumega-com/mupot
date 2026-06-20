@@ -32,7 +32,9 @@ function makeDb(tokens: Record<string, TokenRow> = {}) {
   function run(sql: string, b: unknown[]) {
     if (sql.includes('INSERT INTO fleet_agents')) {
       const [agent_id, tenant, display, runtime, squads, lifecycle, pc, status, reported_by] = b as string[]
-      fleet.set(agent_id, {
+      // faithful to the composite PK (tenant, agent_id): keyed by both, so a different tenant's same
+      // agent_id is a SEPARATE row (ON CONFLICT(tenant, agent_id)).
+      fleet.set(`${tenant}:${agent_id}`, {
         agent_id, tenant, display, runtime, squads, lifecycle,
         provider_contract: (pc as string | null) ?? null, status, reported_by, last_reported_at: 'now',
       })
@@ -95,6 +97,19 @@ describe('reportFleetAgents / listFleetAgents', () => {
     const db = makeDb()
     const many = Array.from({ length: 201 }, (_, i) => ({ agent_id: `a${i}`, status: 'unknown' }))
     expect((await reportFleetAgents(env(db), 'c', many)).ok).toBe(false)
+  })
+
+  it('keys by (tenant, agent_id) — tenant B cannot overwrite tenant A (BLOCK-1)', async () => {
+    const db = makeDb()
+    await reportFleetAgents(env(db, { TENANT_SLUG: 'tA' }), 'c', [{ agent_id: 'image-gen', status: 'running' }])
+    await reportFleetAgents(env(db, { TENANT_SLUG: 'tB' }), 'c', [{ agent_id: 'image-gen', status: 'stopped' }])
+    const a = await listFleetAgents(env(db, { TENANT_SLUG: 'tA' }))
+    const b = await listFleetAgents(env(db, { TENANT_SLUG: 'tB' }))
+    expect(a).toHaveLength(1)
+    expect(a[0].status).toBe('running') // NOT overwritten by tenant B
+    expect(b).toHaveLength(1)
+    expect(b[0].status).toBe('stopped')
+    expect(db._fleet.size).toBe(2)
   })
 })
 

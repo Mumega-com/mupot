@@ -151,6 +151,14 @@ describe('POST /api/fleet/control', () => {
     expect(res.status).toBe(413)
   })
 
+  it('413 on a multibyte body over the BYTE cap (BLOCK-2 — not String.length)', async () => {
+    const headers: Record<string, string> = { 'content-type': 'application/json', authorization: `Bearer ${OWNER}` }
+    // ~2050 UTF-16 code units (< 4096) but ~6KB UTF-8 bytes (each '€' = 3 bytes) — must be capped by bytes.
+    const huge = JSON.stringify({ agent_id: 'image-gen', verb: 'status', pad: '€'.repeat(2050) })
+    const res = await fleetControlApp.request('/control', { method: 'POST', headers, body: huge }, env(db()))
+    expect(res.status).toBe(413)
+  })
+
   it('happy path: emits a verifiable signed control-request + audit row', async () => {
     const d = db()
     const res = await post(d, OWNER, { agent_id: 'image-gen', verb: 'stop' })

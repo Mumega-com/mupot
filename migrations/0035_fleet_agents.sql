@@ -9,7 +9,7 @@
 -- Tenant is environment-derived (env.TENANT_SLUG). Only the configured consumer agent may report.
 
 CREATE TABLE IF NOT EXISTS fleet_agents (
-  agent_id          TEXT PRIMARY KEY,                       -- manifest id (the controlled agent)
+  agent_id          TEXT NOT NULL,                          -- manifest id (the controlled agent)
   tenant            TEXT NOT NULL,                          -- = TENANT_SLUG, isolation
   display           TEXT NOT NULL DEFAULT '',
   runtime           TEXT NOT NULL DEFAULT '',               -- codex|claude-code|nous|hermes-cron|systemd-user|tmux|python
@@ -19,7 +19,10 @@ CREATE TABLE IF NOT EXISTS fleet_agents (
   status            TEXT NOT NULL DEFAULT 'unknown',        -- running|stopped|unknown (last reported)
   reported_by       TEXT NOT NULL DEFAULT '',               -- the agent that reported (the daemon/consumer)
   last_reported_at  TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  -- Composite PK, tenant FIRST so the key is tenant-scoped. mupot is single-tenant-per-deploy today,
+  -- but keying on (tenant, agent_id) means a future shared-DB fork can't have tenant B overwrite
+  -- tenant A's same agent_id via ON CONFLICT (dyad BLOCK-1). The PK also serves the tenant-filtered
+  -- list query, so no separate index is needed.
+  PRIMARY KEY (tenant, agent_id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_fleet_agents_tenant ON fleet_agents(tenant, agent_id);

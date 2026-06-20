@@ -73,7 +73,7 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
     await env.DB.prepare(
       `INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status, reported_by, last_reported_at, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now'))
-       ON CONFLICT(agent_id) DO UPDATE SET
+       ON CONFLICT(tenant, agent_id) DO UPDATE SET
             display=excluded.display, runtime=excluded.runtime, squads=excluded.squads,
             lifecycle=excluded.lifecycle, provider_contract=excluded.provider_contract,
             status=excluded.status, reported_by=excluded.reported_by,

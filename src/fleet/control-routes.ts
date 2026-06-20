@@ -20,14 +20,22 @@ export const fleetControlApp = new Hono<{ Bindings: Env }>()
 
 type Parsed = { ok: true; value: unknown } | { ok: false; reason: 'too_large' | 'bad_json' }
 
-/** Read + parse a JSON body with a HARD byte cap applied BEFORE parsing (anti-DoS, codex note):
- *  reject by content-length and by actual length, then parse. */
+/** Read + parse a JSON body with a HARD byte cap applied BEFORE parsing (anti-DoS, codex note).
+ *  The cap is in UTF-8 BYTES — measured on the raw ArrayBuffer, not String.length (UTF-16 code
+ *  units), so a multibyte body can't slip past (dyad BLOCK-2). content-length is a fast pre-check;
+ *  the byteLength check is authoritative against a lying header. */
 async function readJsonCapped(c: Context, maxBytes: number): Promise<Parsed> {
   const len = c.req.header('content-length')
   if (len && Number(len) > maxBytes) return { ok: false, reason: 'too_large' }
-  const text = await c.req.text()
-  if (text.length > maxBytes) return { ok: false, reason: 'too_large' }
-  if (!text) return { ok: true, value: {} }
+  const buf = await c.req.arrayBuffer()
+  if (buf.byteLength > maxBytes) return { ok: false, reason: 'too_large' }
+  if (buf.byteLength === 0) return { ok: true, value: {} }
+  let text: string
+  try {
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(buf) // reject invalid UTF-8 too
+  } catch {
+    return { ok: false, reason: 'bad_json' }
+  }
   try {
     return { ok: true, value: JSON.parse(text) }
   } catch {
