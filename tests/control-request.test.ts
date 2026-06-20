@@ -9,6 +9,8 @@ import {
   canonicalBytes,
   genNonce,
   ControlRequestError,
+  _ID_RE,
+  _NONCE_RE,
 } from '../src/fleet/control-request'
 
 async function freshKeys(): Promise<{ priv: string; pub: string }> {
@@ -61,5 +63,17 @@ describe('fleet control-request signer', () => {
 
   it('genNonce is url-safe and within the host bounds (16-128)', () => {
     for (let i = 0; i < 50; i++) expect(genNonce()).toMatch(/^[A-Za-z0-9_-]{16,128}$/)
+  })
+
+  // Cross-language anchor parity (Opus NOTE): JS `$` (no `/m`) must reject a trailing newline
+  // exactly like the host's Python `\Z` — else a '\n' could be smuggled past the signer.
+  it('regex anchors reject a trailing newline (must equal host \\Z behavior)', () => {
+    expect(_ID_RE.test('image-gen\n')).toBe(false)
+    expect(_ID_RE.test('image-gen')).toBe(true)
+    expect(_NONCE_RE.test('vectornonce000000000\n')).toBe(false)
+    expect(_NONCE_RE.test('vectornonce000000000')).toBe(true)
+    // also confirm no `/m` flag is set on either
+    expect(_ID_RE.flags).toBe('')
+    expect(_NONCE_RE.flags).toBe('')
   })
 })
