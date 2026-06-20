@@ -38,6 +38,7 @@ import { eventIngestApp } from './events/ingest'
 import { prospectsApp } from './loops/prospects-routes'
 import { loopsApp } from './loops/routes'
 import { fleetCheckinApp } from './fleet/checkin-routes'
+import { fleetControlApp } from './fleet/control-routes'
 import { flightsApp } from './flight/routes'
 import { orientApp } from './orient/routes'
 import { handleOAuthAuthorize, resolveExternalToken as memberKeyResolver } from './mcp/oauth-authorize'
@@ -90,6 +91,7 @@ app.route('/api/loops', loopsApp)
 // Flock check-in (Flock #45): agents POST presence with their member-token (bearer).
 // Inbound only — the pot needs no egress. Mounted before the dashboard '/' catch-all.
 app.route('/api/fleet', fleetCheckinApp)
+app.route('/api/fleet', fleetControlApp)
 // Coherence-loop connector (#70): the brain dispatches gated flights + pulls outcomes,
 // inbound (the pot stays sealed). Org-admin via member-token. Before the '/' catch-all.
 app.route('/api/flights', flightsApp)

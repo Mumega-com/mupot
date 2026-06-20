@@ -17,8 +17,17 @@ export const CONTROL_VERBS = ['start', 'stop', 'status', 'restart'] as const
 export type ControlVerb = (typeof CONTROL_VERBS)[number]
 
 // Mirror the host's spec.ID_RE (slug, bounded 64) and NONCE_RE (url-safe, 16-128).
+// SECURITY — NO `/m` FLAG. With no flags, `$` anchors at the absolute string end, matching
+// Python's `\Z` exactly (the host uses `\Z`). If anyone adds `/m`, JS `$` would also match
+// before a trailing `\n`, letting a trailing-newline agent_id/nonce pass here but be rejected
+// by the host — re-opening cross-language signature confusion. The control-request.test.ts
+// asserts `ID_RE.test('x\n') === false`; keep it that way.
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 const NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/
+
+// Exposed for the parity test (must equal the host regexes' trailing-newline behavior).
+export const _ID_RE = ID_RE
+export const _NONCE_RE = NONCE_RE
 
 export interface ControlRequest {
   agent_id: string
