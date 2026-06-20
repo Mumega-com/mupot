@@ -144,6 +144,13 @@ describe('POST /api/fleet/control', () => {
     expect(res.status).toBe(503)
   })
 
+  it('413 on an oversized control body (cap before parse)', async () => {
+    const headers: Record<string, string> = { 'content-type': 'application/json', authorization: `Bearer ${OWNER}` }
+    const huge = JSON.stringify({ agent_id: 'image-gen', verb: 'status', pad: 'x'.repeat(5000) })
+    const res = await fleetControlApp.request('/control', { method: 'POST', headers, body: huge }, env(db()))
+    expect(res.status).toBe(413)
+  })
+
   it('happy path: emits a verifiable signed control-request + audit row', async () => {
     const d = db()
     const res = await post(d, OWNER, { agent_id: 'image-gen', verb: 'stop' })
