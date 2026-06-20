@@ -1,0 +1,13 @@
+{
+  "_comment": "Cross-language test vector pinning the fleet-control signed control-request contract: a TS signer (crypto.subtle Ed25519, src/fleet/control-request.ts) must produce bytes the host Python verifier (mumega.com agents/fleet-control/control_request.py) accepts, and vice-versa. Generated once by node WebCrypto; the throwaway PRIVATE key is intentionally NOT committed. The SAME file lives in the mumega.com repo (agents/fleet-control/testdata/) so both sides test the identical vector. If either side changes canonicalization, one of the two tests fails.",
+  "pubkey_b64url": "5c2qcgyH-XJyGIYqP--Ibqlc8Y2qIuNhEhqEZZyv0oY",
+  "public_jwk": { "kty": "OKP", "crv": "Ed25519", "x": "5c2qcgyH-XJyGIYqP--Ibqlc8Y2qIuNhEhqEZZyv0oY" },
+  "request": {
+    "agent_id": "image-gen",
+    "verb": "status",
+    "nonce": "vectornonce000000000",
+    "ts": 1700000000,
+    "sig": "W7ax6zC2juU4I-J5jf2VASh_TZkQ7ZPkEnN_W3Md8yy5XMr9fE1mqH-DgPsJsW6Ucr7gHV9Aw-wBoPxEHDdQDQ=="
+  },
+  "canonical": "fleet-control.v1\nimage-gen\nstatus\nvectornonce000000000\n1700000000"
+}
