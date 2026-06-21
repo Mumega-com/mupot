@@ -61,5 +61,9 @@ Like mumega resells PECB: agencies/experts resell our engine to **their** networ
 - **Open:** mupot multi-tenancy (if we outgrow per-tenant deploys); the reseller sell-glue; web-ops
   materialization (console renderer, narrow agent-def tools, MCPWP/GHL connectors); tier-set the mumega
   pot to scale; flip the dyad-gate ON (branch protection + `DYAD_GATE_REVIEWERS`).
+- **IM control parity** (Hadi, 2026-06-21): do from Telegram what the dashboard backend does — fleet
+  start/stop, approve/reject, directive — on the single capability-gated IM seam (`src/im/index.ts`).
+  Verbs status/wake/task exist; fleet/approve/directive are wiring slices, not new trust. Design:
+  `docs/im-control-parity.md`.
 - **Infra note:** recall/remember (Postgres) backend down — async `kasra-review` freezes on it; run gate
   reviews **sync with recall skipped**.
