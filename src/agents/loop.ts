@@ -56,7 +56,11 @@ import { createMemory } from '../memory'
 import { checkAndReserve, recordTokens } from './meter'
 import { costMicroUsd } from './cost'
 import { buildSensorium, renderSensorium } from './sensorium'
-import type { AgentRuntime } from './sensorium'
+import type { AgentRuntime, Sensorium } from './sensorium'
+import { computeDecisionFp, reserveDecision } from './dedup'
+import type { FpProposal } from './dedup'
+import { observe } from './observer'
+import type { ObserverOutcome, ObserveResult } from './observer'
 
 // ── Effort → max tasks spawned per tick ──────────────────────────────────────
 
@@ -79,6 +83,7 @@ export type GoalCycleDecided =
   | 'budget_exhausted' // dollar cap reached — loop paused, zero spend (#4)
   | 'observe-only'     // effort=low — progress updated, no tasks spawned
   | 'spawned'          // at least one task was created
+  | 'deduped'          // same fingerprint already reserved — idempotent rest, no spawn
 
 export interface GoalCycleResult {
   ok: boolean
@@ -87,6 +92,9 @@ export interface GoalCycleResult {
   autonomy: Autonomy | null
   effort: Effort | null
   error?: string
+  // S2: observer signals — AgentDO reads these to extend the alarm (cooldown)
+  // and emit a single operator escalation. Absent when observer is not wired or skipped.
+  observer?: ObserveResult
 }
 
 export interface KpiUpdateResult {
@@ -123,6 +131,12 @@ export interface LoopDeps {
   // to buildSensorium so it can populate the clock block. AgentDO sets this;
   // tests inject a fixed AgentRuntime.
   sensoriumRuntime?: AgentRuntime | null
+  // S2: dedup seam — injectable so tests run without D1. Default: real computeDecisionFp.
+  computeDecisionFp?: typeof computeDecisionFp
+  // S2: reserve seam — injectable so tests run without D1. Default: real reserveDecision.
+  reserveDecision?: typeof reserveDecision
+  // S2: observer seam — injectable so tests run without D1. Default: real observe.
+  observe?: typeof observe
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────
@@ -166,6 +180,11 @@ export async function runGoalCycle(
   // ── Guard 4: effort → task budget (low = observe-only; no model call needed) ──
   const taskBudget = EFFORT_TASK_BUDGET[effort]
 
+  // ── S2: resolve injectable seams for dedup + observer (needed in all paths below) ──
+  const doComputeFp = deps.computeDecisionFp ?? computeDecisionFp
+  const doReserve = deps.reserveDecision ?? reserveDecision
+  const doObserve = deps.observe ?? observe
+
   // ── Guard 5: meter check (economic governor) ─────────────────────────────────
   const meterCheck = deps.meterCheck ?? checkAndReserve
   const estimateMicroUsd = costMicroUsd(agent.model, LOOP_PLANNING_MAX_TOKENS)
@@ -177,6 +196,8 @@ export async function runGoalCycle(
   if (!meterResult.ok) {
     const decided: GoalCycleDecided =
       meterResult.reason === 'budget_cap_exceeded' ? 'budget_exhausted' : 'rate_limited'
+    // S2: observe the meter-block as a noop (not a failure — it is a governed state).
+    const observerResult = await safeObserve(doObserve, env, agent, decided as ObserverOutcome)
     return {
       ok: false,
       decided,
@@ -184,6 +205,7 @@ export async function runGoalCycle(
       autonomy,
       effort,
       error: meterResult.reason,
+      observer: observerResult ?? undefined,
     }
   }
 
@@ -192,7 +214,9 @@ export async function runGoalCycle(
     // Still update kpi_progress on each observe tick so the dashboard stays fresh.
     const writeProgress = deps.writeProgress ?? defaultWriteProgress
     await safeWriteProgress(writeProgress, env, agent)
-    return { ok: true, decided: 'observe-only', spawned: 0, autonomy, effort }
+    // S2: observe noop tick (best-effort — never abort on observer failure).
+    const observerResult = await safeObserve(doObserve, env, agent, 'observe-only')
+    return { ok: true, decided: 'observe-only', spawned: 0, autonomy, effort, observer: observerResult ?? undefined }
   }
 
   // ── Model call: generate next step proposals toward the KPI ─────────────────
@@ -204,9 +228,11 @@ export async function runGoalCycle(
     const recentContext = hits.map((h) => `- ${h.text}`).join('\n')
 
     // Build the sensorium self-state block (LLM-free, deterministic).
+    // We capture both the raw object (for fp) and the rendered string (for prompt).
     // Failures are soft: a missing sensorium never aborts the cycle.
     const doSensorium = deps.buildSensorium ?? buildSensorium
-    const sensoriumBlock = await safeSensorium(doSensorium, env, agent, deps.sensoriumRuntime)
+    const sensoriumObj = await safeSensoriumObj(doSensorium, env, agent, deps.sensoriumRuntime)
+    const sensoriumBlock = sensoriumObj ? renderSensorium(sensoriumObj) : null
 
     const messages: ModelMessage[] = [
       {
@@ -238,6 +264,27 @@ export async function runGoalCycle(
     }
 
     const proposals = parseProposals(raw, taskBudget)
+
+    // ── S2: Dedup gate — BEFORE any spawn or dispatch ─────────────────────────
+    // Fingerprint the (sensorium + proposals) pair. If already reserved this tick,
+    // return 'deduped' immediately — idempotent rest, no tasks created.
+    if (sensoriumObj) {
+      const fpProposals: FpProposal[] = proposals.map((p) => ({ title: p.title }))
+      const fp = await doComputeFp(agent, sensoriumObj, fpProposals)
+      const { reserved } = await doReserve(env, env.TENANT_SLUG, agent.id, fp)
+      if (!reserved) {
+        // Already seen this exact (state + proposals) pair — idempotent rest.
+        const observerResult = await safeObserve(doObserve, env, agent, 'deduped')
+        return {
+          ok: true,
+          decided: 'deduped',
+          spawned: 0,
+          autonomy,
+          effort,
+          observer: observerResult ?? undefined,
+        }
+      }
+    }
 
     // ── Dispatch: create tasks + apply autonomy disposition ─────────────────
     const doCreateTask = deps.createTask ?? createTask
@@ -279,11 +326,15 @@ export async function runGoalCycle(
     const writeProgress = deps.writeProgress ?? defaultWriteProgress
     await safeWriteProgress(writeProgress, env, agent)
 
+    // ── S2: observer — productive tick resets counters ────────────────────────
+    const observerResult = await safeObserve(doObserve, env, agent, 'spawned')
     const decided: GoalCycleDecided = 'spawned'
-    return { ok: true, decided, spawned, autonomy, effort }
+    return { ok: true, decided, spawned, autonomy, effort, observer: observerResult ?? undefined }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'goal_cycle_failed'
-    return { ok: false, decided: 'spawned', spawned: 0, autonomy, effort, error: msg }
+    // S2: observer — record the error (best-effort).
+    const observerResult = await safeObserve(doObserve, env, agent, 'error')
+    return { ok: false, decided: 'spawned', spawned: 0, autonomy, effort, error: msg, observer: observerResult ?? undefined }
   }
 }
 
@@ -460,19 +511,39 @@ async function safeRecall(
 }
 
 /**
- * Safe sensorium: build + render, swallow any error.
- * A failed sensorium must never abort the goal cycle — the model still runs,
- * just without the self-state prefix. Returns null on failure.
+ * Safe sensorium (object form): build the raw Sensorium, swallow any error.
+ * Returns the object so callers can use both the raw data (for fp) and render
+ * the prompt block. Returns null on failure — the cycle degrades gracefully.
+ *
+ * S2: replaces the old safeSensorium string-only helper. The rendered string is
+ * derived from the object at the call site via renderSensorium(sensoriumObj).
  */
-async function safeSensorium(
+async function safeSensoriumObj(
   build: typeof buildSensorium,
   env: Env,
   agent: Agent,
   runtime?: AgentRuntime | null,
-): Promise<string | null> {
+): Promise<Sensorium | null> {
   try {
-    const s = await build(env, agent, runtime)
-    return renderSensorium(s)
+    return await build(env, agent, runtime)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Safe observer: call observe() and swallow any error.
+ * The observer is instrumentation — it must never abort the cycle.
+ * Returns null on failure (caller omits the observer field from the result).
+ */
+async function safeObserve(
+  doObserve: typeof observe,
+  env: Env,
+  agent: Agent,
+  outcome: ObserverOutcome,
+): Promise<ObserveResult | null> {
+  try {
+    return await doObserve(env, agent, outcome)
   } catch {
     return null
   }

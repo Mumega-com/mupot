@@ -17,6 +17,7 @@ import { createModel } from '../model'
 import { createTask } from '../tasks/service'
 import { runTaskExecution, resolveTaskId } from './execute'
 import { runGoalCycle } from './loop'
+import { COOLDOWN_EXTENSION_MS } from './observer'
 
 // Wake request body — who/why woke this agent, and how hard it may work.
 //
@@ -169,7 +170,24 @@ export class AgentDO extends DurableObject<Env> {
         })
         const decided = goalResult.decided + (goalResult.error ? `: ${goalResult.error}` : '')
         this.recordCycle(cycle, `goal: ${decided}`)
-        await this.ensureAlarm()
+
+        // S2: consume observer signals from the goal cycle.
+        // cooldown=true → extend the next alarm so the agent backs off instead of
+        //   busy-looping on an identical situation every 15 min.
+        // escalate=true → TODO: emit a single operator notification via the
+        //   approval/notification seam (see loops/notifications or tasks gate_owner).
+        //   Left as a result field for now — the surface to wire it onto is S3 scope.
+        const obs = goalResult.observer
+        if (obs?.cooldown) {
+          // Extend alarm by COOLDOWN_EXTENSION_MS on top of the standard interval.
+          // The agent backs off instead of busy-looping on an identical situation.
+          await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS + COOLDOWN_EXTENSION_MS)
+        } else {
+          await this.ensureAlarm()
+        }
+        // obs?.escalate → TODO: emit a single operator notification via approval/notification
+        // seam. Surface: return it in the result for now; S3 wires the actual emit.
+
         return {
           ok: goalResult.ok,
           agent_id: agent.id,
