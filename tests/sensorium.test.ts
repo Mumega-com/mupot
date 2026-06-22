@@ -678,15 +678,19 @@ describe('loop.ts — sensorium seam integration', () => {
 
     const result = await runGoalCycle(env, agent, {
       meterCheck: vi.fn().mockResolvedValue({ ok: true, windowKey: 'k', count: 1, tokens: 0 }),
-      model: { chat: vi.fn().mockResolvedValue(JSON.stringify({ summary: 'plan', tasks: [] })) },
+      // One real proposal → the cycle is productive (proves it proceeds + spawns
+      // even with a null sensorium; dedup is skipped when sensorium is null).
+      model: { chat: vi.fn().mockResolvedValue(JSON.stringify({ summary: 'plan', tasks: [{ title: 'T', body: 'b' }] })) },
       recall: vi.fn().mockResolvedValue([]),
       createTask: makeCreateTask(),
       writeProgress: vi.fn().mockResolvedValue(undefined),
+      remember: vi.fn().mockResolvedValue('engram'),
       buildSensorium: failingSensorium,
     })
 
-    // Cycle must succeed even though sensorium failed
+    // Cycle must succeed even though sensorium failed (soft-degrade, not abort).
     expect(result.ok).toBe(true)
     expect(result.decided).toBe('spawned')
+    expect(result.spawned).toBe(1)
   })
 })

@@ -483,7 +483,10 @@ describe('parseLeadingInt', () => {
 // ── Smoke: model returns empty tasks array → spawned=0 ────────────────────────
 
 describe('runGoalCycle — model returns no proposals', () => {
-  it('spawned=0 when model returns empty tasks array', async () => {
+  it("empty tasks array → decided='observe-only' (no-op tick, not productive)", async () => {
+    // S3 gate-RED fix: an empty-proposal tick is NOT 'spawned' — it produced
+    // nothing, so it is a no-op (observe-only): no memory write, observer counts
+    // it toward cooldown rather than resetting productivity counters.
     const agent = makeAgent({ autonomy: 'execute', effort: 'sprint' })
     const { env } = makeEnv()
     const ct = makeCreateTask()
@@ -497,7 +500,7 @@ describe('runGoalCycle — model returns no proposals', () => {
       writeProgress: makeWriteProgress(),
     })
 
-    expect(result).toMatchObject({ ok: true, decided: 'spawned', spawned: 0 })
+    expect(result).toMatchObject({ ok: true, decided: 'observe-only', spawned: 0 })
     expect(ct).not.toHaveBeenCalled()
   })
 })

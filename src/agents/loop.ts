@@ -200,26 +200,34 @@ export async function runGoalCycle(
   const doReserve = deps.reserveDecision ?? reserveDecision
   const doObserve = deps.observe ?? observe
 
-  // ── S1/S3: build the sensorium EARLY (before meter check) ────────────────────
+  // ── S1/S2: build the sensorium EARLY (before meter check) ────────────────────
   //
   // The sensorium is deterministic + LLM-free (no model calls, no Vectorize).
-  // Building it here once serves three downstream consumers without a double query:
-  //   1. Backpressure guard (S3) — reads sensorium.schedule.counts.open
-  //   2. Decision fingerprint (S2) — uses the raw Sensorium object
-  //   3. Prompt injection (S1) — renders the sensorium block for the model call
+  // Building it here once serves two downstream consumers without a double query:
+  //   1. Decision fingerprint (S2) — uses the raw Sensorium object
+  //   2. Prompt injection (S1) — renders the sensorium block for the model call
+  // (The S3 backpressure guard uses its OWN count — see below — because the
+  //  sensorium's open count is assignee-only and misses suggest/draft backlog.)
   //
   // Failures are soft: safeSensoriumObj returns null on any DB hiccup, and each
-  // downstream consumer degrades gracefully (guard skips, fp omitted, prompt omits block).
+  // downstream consumer degrades gracefully (fp omitted, prompt omits block).
   const doSensorium = deps.buildSensorium ?? buildSensorium
   const sensoriumObj = await safeSensoriumObj(doSensorium, env, agent, deps.sensoriumRuntime)
 
   // ── S3: Guard 5 — backpressure (open-task queue full) ────────────────────────
   //
-  // If the agent already has >= MAX_OPEN_TASKS open tasks, skip the model call and
-  // spawn entirely. The queue must drain first. We still call observe() so that
-  // persistent backpressure increments consecutive_noops → eventually triggers
-  // cooldown (which is correct: nothing to do until tasks drain).
-  if (sensoriumObj && sensoriumObj.schedule.counts.open >= MAX_OPEN_TASKS) {
+  // Count the agent's OWN open backlog: tasks it must answer for. That is BOTH
+  // self-assigned tasks (execute / execute_with_approval) AND the unassigned
+  // tasks its loop created in its own squad (suggest / draft leave assignee NULL).
+  // The sensorium's schedule.counts.open is assignee-only, so it MISSES the
+  // suggest/draft backlog — we count it directly here (migration-free; the tasks
+  // table has no creator column, so squad-scoped unassigned is the proxy).
+  //
+  // At/above MAX_OPEN_TASKS → skip the model call + spawn; the queue must drain.
+  // observe() still runs so persistent backpressure accrues consecutive_noops →
+  // cooldown. Independent of the sensorium (fires even if that read failed).
+  const openBacklog = await safeCountOpenBacklog(env, agent)
+  if (openBacklog >= MAX_OPEN_TASKS) {
     const observerResult = await safeObserve(doObserve, env, agent, 'backpressure')
     return {
       ok: true,
@@ -369,10 +377,18 @@ export async function runGoalCycle(
     const writeProgress = deps.writeProgress ?? defaultWriteProgress
     await safeWriteProgress(writeProgress, env, agent)
 
-    // ── S3: goal-path memory write — productive ticks compound ───────────────
+    // ── Empty-proposal no-op: the model ran but proposed nothing (spawned===0).
+    // This is NOT productive — do NOT write memory (no-op memory = noise, the
+    // mumega-brain lesson) and do NOT reset the observer's productivity counters.
+    // Treat it as observe-only so persistent empty ticks accrue toward cooldown.
+    if (spawned === 0) {
+      const observerResult = await safeObserve(doObserve, env, agent, 'observe-only')
+      return { ok: true, decided: 'observe-only', spawned: 0, autonomy, effort, observer: observerResult ?? undefined }
+    }
+
+    // ── S3: goal-path memory write — PRODUCTIVE ticks only (spawned > 0) ──────
     // Write a bounded outcome engram so future recalls carry episodic context.
-    // Only on 'spawned' (productive ticks) — no-op/dedup/backpressure ticks are
-    // noise (the mumega brain lesson: no-op memory = noise, only signal competes).
+    // Skipped on no-op/dedup/backpressure/empty-proposal ticks (noise).
     // Injectable seam keeps tests off Vectorize. Best-effort: never abort the cycle.
     const doRemember = deps.remember ?? ((id, text) => createMemory(env).remember(id, text))
     await safeRemember(doRemember, agent.id, buildOutcomeSummary(agent, proposals, spawned))
@@ -611,6 +627,35 @@ async function safeDispatch(
     await dispatch(taskId, squadId, agentId)
   } catch {
     // best-effort; the task is created; the dispatch is a wake signal
+  }
+}
+
+/**
+ * countOpenBacklog — the agent's OWN open backlog for backpressure.
+ *
+ * Counts open tasks the agent is responsible for: self-assigned (execute paths)
+ * OR unassigned tasks in its own squad (suggest/draft leave assignee NULL). The
+ * tasks table has no creator column, so squad-scoped unassigned is the proxy for
+ * "tasks this agent's loop produced and left for pickup". Counts status='open'
+ * only (open = not yet started backlog; in_progress = being worked, not pile-up).
+ */
+async function countOpenBacklog(env: Env, agent: Agent): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS cnt FROM tasks
+       WHERE status = 'open'
+         AND (assignee_agent_id = ? OR (assignee_agent_id IS NULL AND squad_id = ?))`,
+  )
+    .bind(agent.id, agent.squad_id)
+    .first<{ cnt: number }>()
+  return row?.cnt ?? 0
+}
+
+/** Safe wrapper: a DB hiccup fails OPEN (returns 0 → guard does not fire, loop proceeds). */
+async function safeCountOpenBacklog(env: Env, agent: Agent): Promise<number> {
+  try {
+    return await countOpenBacklog(env, agent)
+  } catch {
+    return 0
   }
 }
 
