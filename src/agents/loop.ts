@@ -55,6 +55,8 @@ import { createModel } from '../model'
 import { createMemory } from '../memory'
 import { checkAndReserve, recordTokens } from './meter'
 import { costMicroUsd } from './cost'
+import { buildSensorium, renderSensorium } from './sensorium'
+import type { AgentRuntime } from './sensorium'
 
 // ── Effort → max tasks spawned per tick ──────────────────────────────────────
 
@@ -113,6 +115,14 @@ export interface LoopDeps {
   dispatch?: (taskId: string, squadId: string, agentId: string) => Promise<void>
   // kpi_progress write seam: injectable so tests can verify the SQL without D1.
   writeProgress?: (env: Env, agentId: string, progress: number) => Promise<void>
+  // Sensorium seam: builds the self-state block injected at the top of each
+  // goal-cycle prompt. Injectable so tests can mock without D1 or a clock.
+  // When omitted, the real buildSensorium is used (default prod path).
+  buildSensorium?: typeof buildSensorium
+  // Runtime state from AgentDO (cycles, last_woke_at, etc.) — passed through
+  // to buildSensorium so it can populate the clock block. AgentDO sets this;
+  // tests inject a fixed AgentRuntime.
+  sensoriumRuntime?: AgentRuntime | null
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────
@@ -193,6 +203,11 @@ export async function runGoalCycle(
     const hits = await safeRecall(recall, agent.id, agent.okr, 5)
     const recentContext = hits.map((h) => `- ${h.text}`).join('\n')
 
+    // Build the sensorium self-state block (LLM-free, deterministic).
+    // Failures are soft: a missing sensorium never aborts the cycle.
+    const doSensorium = deps.buildSensorium ?? buildSensorium
+    const sensoriumBlock = await safeSensorium(doSensorium, env, agent, deps.sensoriumRuntime)
+
     const messages: ModelMessage[] = [
       {
         role: 'system',
@@ -206,7 +221,7 @@ export async function runGoalCycle(
       },
       {
         role: 'user',
-        content: buildGoalPrompt(agent, taskBudget, recentContext),
+        content: buildGoalPrompt(agent, taskBudget, recentContext, sensoriumBlock),
       },
     ]
 
@@ -337,14 +352,28 @@ export async function updateKpiProgress(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-function buildGoalPrompt(agent: Agent, taskBudget: number, recentContext: string): string {
-  const lines = [
+function buildGoalPrompt(
+  agent: Agent,
+  taskBudget: number,
+  recentContext: string,
+  sensoriumBlock?: string | null,
+): string {
+  const lines: string[] = []
+
+  // Sensorium block at the top — the agent reads its self-state first.
+  // This is the keystone of S1: the model sees its situation before proposing.
+  if (sensoriumBlock) {
+    lines.push(sensoriumBlock)
+    lines.push('')
+  }
+
+  lines.push(
     `Agent: ${agent.name} (role: ${agent.role})`,
     `OKR: ${agent.okr}`,
     `KPI target: ${agent.kpi_target ?? '(not set)'}`,
     `KPI progress: ${agent.kpi_progress}%`,
     `Task budget this tick: ${taskBudget}`,
-  ]
+  )
   if (recentContext) {
     lines.push(`\nRecent activity:\n${recentContext}`)
   }
@@ -427,6 +456,25 @@ async function safeRecall(
     return await recall(agentId, query, limit)
   } catch {
     return []
+  }
+}
+
+/**
+ * Safe sensorium: build + render, swallow any error.
+ * A failed sensorium must never abort the goal cycle — the model still runs,
+ * just without the self-state prefix. Returns null on failure.
+ */
+async function safeSensorium(
+  build: typeof buildSensorium,
+  env: Env,
+  agent: Agent,
+  runtime?: AgentRuntime | null,
+): Promise<string | null> {
+  try {
+    const s = await build(env, agent, runtime)
+    return renderSensorium(s)
+  } catch {
+    return null
   }
 }
 

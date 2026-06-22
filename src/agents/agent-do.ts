@@ -157,7 +157,16 @@ export class AgentDO extends DurableObject<Env> {
     // continue to run the original cortex propose-cycle below unchanged.
     if (agent.okr && agent.okr.trim().length > 0) {
       try {
-        const goalResult = await runGoalCycle(this.env, agent)
+        // Thread the DO runtime state (cycles, last_woke_at, last_decision, wake
+        // reason) into the sensorium so the agent reads its self-state each cycle.
+        const goalResult = await runGoalCycle(this.env, agent, {
+          sensoriumRuntime: {
+            cycles: cycle,
+            last_woke_at: this.get('last_woke_at'),
+            last_decision: this.get('last_decision'),
+            wake_reason: input.reason ?? null,
+          },
+        })
         const decided = goalResult.decided + (goalResult.error ? `: ${goalResult.error}` : '')
         this.recordCycle(cycle, `goal: ${decided}`)
         await this.ensureAlarm()
