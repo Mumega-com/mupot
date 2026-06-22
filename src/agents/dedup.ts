@@ -97,7 +97,7 @@ export async function reserveDecision(
   const now = new Date().toISOString()
 
   const result = await env.DB.prepare(
-    `INSERT INTO loop_decisions (id, tenant, agent_id, decision_fp, created_at)
+    `INSERT INTO loop_decision_dedup (id, tenant, agent_id, decision_fp, created_at)
        VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(tenant, agent_id, decision_fp) DO NOTHING`,
   )

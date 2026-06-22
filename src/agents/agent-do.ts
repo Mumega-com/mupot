@@ -51,6 +51,10 @@ interface WakeResult {
   // execute-mode telemetry (present only when the wake carried a task_id)
   task_id?: string
   task_status?: Task['status']
+  // S2: true when wake() already scheduled the next alarm itself (cooldown
+  // extension or ensureAlarm). alarm() must NOT re-arm in that case, or it would
+  // overwrite the cooldown backoff with the default interval.
+  rescheduled?: boolean
 }
 
 interface AgentStatus {
@@ -115,7 +119,11 @@ export class AgentDO extends DurableObject<Env> {
     // Self-driven cycle. If the agent is paused/missing this becomes a no-op and
     // we stop rescheduling (no zombie alarms burning quota).
     const result = await this.wake({ reason: 'alarm' })
-    if (result.ok) {
+    // Only re-arm at the default interval if wake() did NOT already schedule the
+    // next alarm itself. The goal/cortex paths self-schedule (incl. the S2 cooldown
+    // extension); re-arming here would clobber that backoff. Execute-mode + paths
+    // that don't self-schedule still get the heartbeat re-arm.
+    if (result.ok && !result.rescheduled) {
       await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS)
     }
   }
@@ -195,6 +203,8 @@ export class AgentDO extends DurableObject<Env> {
           decided: `goal:${decided}`,
           actions: goalResult.spawned,
           error: goalResult.error,
+          // wake() set the alarm itself above (cooldown extension or ensureAlarm).
+          rescheduled: true,
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'goal_cycle_failed'
@@ -240,7 +250,8 @@ export class AgentDO extends DurableObject<Env> {
       this.recordCycle(cycle, decision.summary)
       await this.ensureAlarm()
 
-      return { ok: true, agent_id: agent.id, cycle, decided: decision.summary, actions: toEmit.length }
+      // ensureAlarm() above already scheduled the heartbeat — don't let alarm() re-arm.
+      return { ok: true, agent_id: agent.id, cycle, decided: decision.summary, actions: toEmit.length, rescheduled: true }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'cycle_failed'
       this.recordCycle(cycle, `error: ${msg}`)

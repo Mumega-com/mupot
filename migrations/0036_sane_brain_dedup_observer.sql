@@ -3,7 +3,10 @@
 -- Two tables keyed by (tenant, agent_id) — tenant FIRST so every row is
 -- tenant-scoped and a cross-tenant scan is structurally impossible.
 --
--- loop_decisions — idempotent dedup key for one goal-cycle tick.
+-- loop_decision_dedup — idempotent dedup key for one goal-cycle tick.
+-- (Named loop_decision_dedup, NOT loop_decisions, to avoid collision with the
+--  pre-existing 0021_loop_decisions cortex decision-LOG table — that one is a
+--  per-cycle telemetry log with a different schema/purpose.)
 --   The unique constraint on (tenant, agent_id, decision_fp) is the atomic
 --   reservation point: INSERT ... ON CONFLICT DO NOTHING is the commit — if
 --   meta.changes=0 the cycle already ran for this fingerprint.
@@ -13,9 +16,9 @@
 --   the loop can self-regulate (cooldown) and escalate to the operator ONCE
 --   (deduped via last_escalated_at) rather than on every tick.
 
--- ── loop_decisions ────────────────────────────────────────────────────────────
+-- ── loop_decision_dedup ────────────────────────────────────────────────────────────
 
-CREATE TABLE IF NOT EXISTS loop_decisions (
+CREATE TABLE IF NOT EXISTS loop_decision_dedup (
   id            TEXT NOT NULL,                          -- uuid, for row identity / audit
   tenant        TEXT NOT NULL,                          -- = TENANT_SLUG, tenant isolation (first in PK)
   agent_id      TEXT NOT NULL,                          -- the agent that produced this fingerprint
@@ -26,8 +29,8 @@ CREATE TABLE IF NOT EXISTS loop_decisions (
   UNIQUE (tenant, agent_id, decision_fp)
 );
 
-CREATE INDEX IF NOT EXISTS idx_loop_decisions_agent
-  ON loop_decisions(tenant, agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_loop_decision_dedup_agent
+  ON loop_decision_dedup(tenant, agent_id, created_at DESC);
 
 -- ── loop_observer ─────────────────────────────────────────────────────────────
 

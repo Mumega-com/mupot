@@ -76,11 +76,11 @@ function makeAgent(overrides: Partial<Agent> = {}): Agent {
 
 // ── D1 mock for dedup + observer ──────────────────────────────────────────────
 //
-// Simulates loop_decisions (unique on tenant+agent_id+fp) and loop_observer
+// Simulates loop_decision_dedup (unique on tenant+agent_id+fp) and loop_observer
 // (upsert on tenant+agent_id). Uses in-memory sets/maps.
 
 function makeD1(opts: {
-  decidedFps?: Set<string>          // loop_decisions key = `${tenant}:${agentId}:${fp}`
+  decidedFps?: Set<string>          // loop_decision_dedup key = `${tenant}:${agentId}:${fp}`
   observerRows?: Map<string, {      // loop_observer key = `${tenant}:${agentId}`
     consecutive_noops: number
     consecutive_fails: number
@@ -94,7 +94,7 @@ function makeD1(opts: {
 
   return {
     prepare(sql: string) {
-      const isDecisionInsert = sql.includes('INSERT INTO loop_decisions')
+      const isDecisionInsert = sql.includes('INSERT INTO loop_decision_dedup')
       const isObserverSelect = sql.includes('FROM loop_observer')
       const isObserverUpsert = sql.includes('INSERT INTO loop_observer')
 
