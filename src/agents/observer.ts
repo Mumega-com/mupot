@@ -50,6 +50,7 @@ export type ObserverOutcome =
   | 'rate_limited'
   | 'budget_exhausted'
   | 'observe-only'
+  | 'backpressure'      // S3: open-task queue full; noop until tasks drain
   | 'no-goal'
   | 'kpi-met'
   | 'liveness_fail'
@@ -144,7 +145,11 @@ export async function observe(
     case 'rate_limited':
     case 'budget_exhausted':
     case 'observe-only':
+    case 'backpressure':
       // Non-productive but non-failing ticks → increment noop counter only.
+      // 'backpressure' is a governed state (queue full) — not a failure.
+      // Persistent backpressure will accumulate noops → cooldown, which is
+      // correct: the agent should back off until the open-task queue drains.
       consecutive_noops += 1
       // Do NOT increment fail counters — these are governed/expected states.
       break
