@@ -220,9 +220,11 @@ export function renderSensorium(s: Sensorium): string {
     (s.schedule.overdue > 0 ? ` overdue=${s.schedule.overdue}` : ''),
   )
 
-  // Vitals
+  // Vitals — include the KPI source tag when present so the agent knows which signal
+  // is being measured (S4b: pluggable KPI sources, e.g. "[github_prs]" suffix).
+  const kpiTargetRaw = s.vitals.kpi_target ?? '(unset)'
   lines.push(
-    `KPI: ${s.vitals.kpi_progress}% / target: ${s.vitals.kpi_target ?? '(unset)'}`,
+    `KPI: ${s.vitals.kpi_progress}% / target: ${kpiTargetRaw}`,
   )
   if (s.vitals.budget_remaining_micro_usd !== null) {
     // micro-USD → USD is /1_000_000 (NOT /10_000, which is cents). Dollar-labeled.

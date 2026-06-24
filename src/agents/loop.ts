@@ -63,6 +63,8 @@ import { observe } from './observer'
 import type { ObserverOutcome, ObserveResult } from './observer'
 import { safeRecordEpisode, safeRecentEpisodes, renderEpisodes } from './episodic'
 import type { EpisodeInput, Episode } from './episodic'
+import { computeKpiSignal } from './kpi-sources'
+import type { KpiSignalResult } from './kpi-sources'
 
 // ── Effort → max tasks spawned per tick ──────────────────────────────────────
 
@@ -140,6 +142,15 @@ export interface LoopDeps {
   dispatch?: (taskId: string, squadId: string, agentId: string) => Promise<void>
   // kpi_progress write seam: injectable so tests can verify the SQL without D1.
   writeProgress?: (env: Env, agentId: string, progress: number) => Promise<void>
+  // S4b: KPI signal seam — injectable so tests run without D1 + a specific source.
+  // When omitted, the real computeKpiSignal is used (picks source from kpi_target tag).
+  // S1 determinism law: receives the SAME nowMs clock the sensorium uses so the 30-day
+  // window is fixed to the loop tick, not a floating Date.now() per call.
+  kpiSignal?: (env: Env, agent: Agent, nowMs: number) => Promise<KpiSignalResult>
+  // S1 determinism: the loop clock. Single source of truth for BOTH the sensorium's
+  // clock.now and the KPI source's window boundary. Defaults to Date.now() in prod;
+  // tests inject a fixed value so two cycles at the same tick are always identical.
+  nowMs?: number
   // Sensorium seam: builds the self-state block injected at the top of each
   // goal-cycle prompt. Injectable so tests can mock without D1 or a clock.
   // When omitted, the real buildSensorium is used (default prod path).
@@ -210,6 +221,16 @@ export async function runGoalCycle(
   // episode (escalations build on failure/noop ticks, not just the spawned path).
   const doRecord = deps.recordEpisode ?? safeRecordEpisode
 
+  // ── S1 determinism: SINGLE loop clock ────────────────────────────────────────
+  //
+  // Both the sensorium (clock.now) and the KPI source window boundary must share
+  // the SAME instant. This is the S1 law: two identical cycles near the 30-day
+  // boundary must produce identical vitals + fingerprints → no spurious churn.
+  // In production, deps.nowMs is undefined → Date.now() here, once, then threaded
+  // everywhere below. Tests inject a fixed value.
+  const nowMs = deps.nowMs ?? Date.now()
+  const nowIso = new Date(nowMs).toISOString()
+
   // ── S1/S2: build the sensorium EARLY (before meter check) ────────────────────
   //
   // The sensorium is deterministic + LLM-free (no model calls, no Vectorize).
@@ -221,8 +242,11 @@ export async function runGoalCycle(
   //
   // Failures are soft: safeSensoriumObj returns null on any DB hiccup, and each
   // downstream consumer degrades gracefully (fp omitted, prompt omits block).
+  //
+  // nowIso is passed so the sensorium clock.now is the same instant as the KPI
+  // window — single source of truth, no drift between sensorium vitals and KPI.
   const doSensorium = deps.buildSensorium ?? buildSensorium
-  const sensoriumObj = await safeSensoriumObj(doSensorium, env, agent, deps.sensoriumRuntime)
+  const sensoriumObj = await safeSensoriumObj(doSensorium, env, agent, deps.sensoriumRuntime, nowIso)
 
   // ── S4a: fetch recent episodes EARLY (alongside sensorium, before meter check) ─
   //
@@ -294,7 +318,7 @@ export async function runGoalCycle(
   if (taskBudget === 0) {
     // Still update kpi_progress on each observe tick so the dashboard stays fresh.
     const writeProgress = deps.writeProgress ?? defaultWriteProgress
-    await safeWriteProgress(writeProgress, env, agent)
+    await safeWriteProgress(writeProgress, env, agent, nowMs, deps.kpiSignal)
     // S2: observe noop tick (best-effort — never abort on observer failure).
     const observerResult = await observeStep(doObserve, doRecord, env, agent, 'observe-only', deps.sensoriumRuntime?.cycles ?? null)
     return { ok: true, decided: 'observe-only', spawned: 0, autonomy, effort, observer: observerResult ?? undefined }
@@ -405,9 +429,9 @@ export async function runGoalCycle(
       spawned++
     }
 
-    // ── Update kpi_progress post-tick ────────────────────────────────────────
+    // ── Update kpi_progress post-tick (S4b: uses pluggable KPI signal source) ──
     const writeProgress = deps.writeProgress ?? defaultWriteProgress
-    await safeWriteProgress(writeProgress, env, agent)
+    await safeWriteProgress(writeProgress, env, agent, nowMs, deps.kpiSignal)
 
     // ── Empty-proposal no-op: the model ran but proposed nothing (spawned===0).
     // This is NOT productive — do NOT write memory (no-op memory = noise, the
@@ -600,17 +624,39 @@ async function defaultWriteProgress(env: Env, agentId: string, progress: number)
     .run()
 }
 
-/** Calls updateKpiProgress and writes via the seam. Wraps in a try/catch (best-effort). */
+/**
+ * safeWriteProgress — compute KPI signal via the pluggable source, then persist.
+ *
+ * S4b: The signal source is selected by parseKpiSource(agent.kpi_target):
+ *   - 'task_counter' (default)  — original done-task-count behavior (backward-compat)
+ *   - 'github_prs'              — merged PRs in trailing 30-day window
+ *
+ * The injected kpiSignal seam overrides for tests. Production uses computeKpiSignal
+ * which dispatches to the right adapter without polling or external creds.
+ *
+ * S1 determinism: nowMs is the SAME clock the sensorium used for clock.now — single
+ * source of truth so the 30-day KPI window and the sensorium vitals are always pinned
+ * to the identical instant within one loop tick. The real computeKpiSignal receives
+ * nowMs and threads it into githubPrsSource. A floating Date.now() INSIDE the source
+ * must never be used in the live goal-cycle path.
+ *
+ * Wraps in a try/catch (best-effort): a signal failure or DB hiccup never aborts the
+ * cycle — kpi_progress is left at its last known value, which is honest.
+ */
 async function safeWriteProgress(
   write: (env: Env, agentId: string, progress: number) => Promise<void>,
   env: Env,
   agent: Agent,
+  nowMs: number,
+  kpiSignalFn?: (env: Env, agent: Agent, nowMs: number) => Promise<KpiSignalResult>,
 ): Promise<void> {
   try {
-    const result = await updateKpiProgress(env, agent.id, agent.kpi_target)
-    if (result.updated) {
-      await write(env, agent.id, result.current)
+    const signal = kpiSignalFn ?? ((e, a, ms) => computeKpiSignal(e, a, { nowMs: ms }))
+    const result = await signal(env, agent, nowMs)
+    if (result.ok) {
+      await write(env, agent.id, result.progress)
     }
+    // result.ok===false → no target or DB miss → leave kpi_progress unchanged (honest)
   } catch {
     // best-effort; a failed progress write must not abort the cycle
   }
@@ -637,15 +683,19 @@ async function safeRecall(
  *
  * S2: replaces the old safeSensorium string-only helper. The rendered string is
  * derived from the object at the call site via renderSensorium(sensoriumObj).
+ *
+ * nowIso: the loop's fixed-clock ISO string, so sensorium.clock.now is pinned
+ * to the same instant as the KPI window boundary (S1 determinism law).
  */
 async function safeSensoriumObj(
   build: typeof buildSensorium,
   env: Env,
   agent: Agent,
   runtime?: AgentRuntime | null,
+  nowIso?: string,
 ): Promise<Sensorium | null> {
   try {
-    return await build(env, agent, runtime)
+    return await build(env, agent, runtime, nowIso ? { now: nowIso } : undefined)
   } catch {
     return null
   }

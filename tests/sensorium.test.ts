@@ -573,6 +573,11 @@ describe('loop.ts — sensorium seam integration', () => {
     const agent = makeAgent({ effort: 'standard', autonomy: 'draft' })
     const { env } = makeLoopEnv()
 
+    // Inject a fixed clock so the determinism law is verifiable: the 4th opts arg
+    // that the loop passes to buildSensorium must equal new Date(nowMs).toISOString().
+    const fixedNowMs = new Date(FIXED_NOW).getTime()
+    const expectedNowIso = new Date(fixedNowMs).toISOString() // === FIXED_NOW
+
     const mockSensorium = vi.fn().mockResolvedValue({
       version: 'v1' as const,
       clock: { now: FIXED_NOW, agent_age_days: 10, cycles: 7, last_woke_at: null },
@@ -599,14 +604,17 @@ describe('loop.ts — sensorium seam integration', () => {
       writeProgress: vi.fn().mockResolvedValue(undefined),
       buildSensorium: mockSensorium,
       sensoriumRuntime: { cycles: 7, last_woke_at: null, last_decision: null, wake_reason: 'test' },
+      nowMs: fixedNowMs,
     })
 
     expect(mockSensorium).toHaveBeenCalledTimes(1)
-    // The sensorium call should receive the agent and the runtime
+    // S1 determinism law: the loop's fixed clock (nowMs) must flow into the sensorium
+    // as opts.now — the same ISO instant, not a separate Date.now() call.
     expect(mockSensorium).toHaveBeenCalledWith(
       env,
       agent,
       { cycles: 7, last_woke_at: null, last_decision: null, wake_reason: 'test' },
+      { now: expectedNowIso },
     )
   })
 
