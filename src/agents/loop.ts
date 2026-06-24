@@ -206,6 +206,9 @@ export async function runGoalCycle(
   const doComputeFp = deps.computeDecisionFp ?? computeDecisionFp
   const doReserve = deps.reserveDecision ?? reserveDecision
   const doObserve = deps.observe ?? observe
+  // S4a: episode-record seam, hoisted so EVERY exit path can record an escalation
+  // episode (escalations build on failure/noop ticks, not just the spawned path).
+  const doRecord = deps.recordEpisode ?? safeRecordEpisode
 
   // ── S1/S2: build the sensorium EARLY (before meter check) ────────────────────
   //
@@ -245,9 +248,8 @@ export async function runGoalCycle(
   // cooldown. Independent of the sensorium (fires even if that read failed).
   const openBacklog = await safeCountOpenBacklog(env, agent)
   if (openBacklog >= MAX_OPEN_TASKS) {
-    const observerResult = await safeObserve(doObserve, env, agent, 'backpressure')
+    const observerResult = await observeStep(doObserve, doRecord, env, agent, 'backpressure', deps.sensoriumRuntime?.cycles ?? null)
     // S4a: record 'backpressure' episode — queue-full is a real operational signal.
-    const doRecord = deps.recordEpisode ?? safeRecordEpisode
     await safeDoRecord(doRecord, env, agent, {
       cycle: deps.sensoriumRuntime?.cycles ?? null,
       kind: 'backpressure',
@@ -276,7 +278,7 @@ export async function runGoalCycle(
     const decided: GoalCycleDecided =
       meterResult.reason === 'budget_cap_exceeded' ? 'budget_exhausted' : 'rate_limited'
     // S2: observe the meter-block as a noop (not a failure — it is a governed state).
-    const observerResult = await safeObserve(doObserve, env, agent, decided as ObserverOutcome)
+    const observerResult = await observeStep(doObserve, doRecord, env, agent, decided as ObserverOutcome, deps.sensoriumRuntime?.cycles ?? null)
     return {
       ok: false,
       decided,
@@ -294,7 +296,7 @@ export async function runGoalCycle(
     const writeProgress = deps.writeProgress ?? defaultWriteProgress
     await safeWriteProgress(writeProgress, env, agent)
     // S2: observe noop tick (best-effort — never abort on observer failure).
-    const observerResult = await safeObserve(doObserve, env, agent, 'observe-only')
+    const observerResult = await observeStep(doObserve, doRecord, env, agent, 'observe-only', deps.sensoriumRuntime?.cycles ?? null)
     return { ok: true, decided: 'observe-only', spawned: 0, autonomy, effort, observer: observerResult ?? undefined }
   }
 
@@ -355,7 +357,7 @@ export async function runGoalCycle(
       const { reserved } = await doReserve(env, env.TENANT_SLUG, agent.id, fp)
       if (!reserved) {
         // Already seen this exact (state + proposals) pair — idempotent rest.
-        const observerResult = await safeObserve(doObserve, env, agent, 'deduped')
+        const observerResult = await observeStep(doObserve, doRecord, env, agent, 'deduped', deps.sensoriumRuntime?.cycles ?? null)
         return {
           ok: true,
           decided: 'deduped',
@@ -412,7 +414,7 @@ export async function runGoalCycle(
     // mumega-brain lesson) and do NOT reset the observer's productivity counters.
     // Treat it as observe-only so persistent empty ticks accrue toward cooldown.
     if (spawned === 0) {
-      const observerResult = await safeObserve(doObserve, env, agent, 'observe-only')
+      const observerResult = await observeStep(doObserve, doRecord, env, agent, 'observe-only', deps.sensoriumRuntime?.cycles ?? null)
       return { ok: true, decided: 'observe-only', spawned: 0, autonomy, effort, observer: observerResult ?? undefined }
     }
 
@@ -424,9 +426,7 @@ export async function runGoalCycle(
     await safeRemember(doRemember, agent.id, buildOutcomeSummary(agent, proposals, spawned))
 
     // ── S4a: record episode for 'spawned' — always (productive cycle) ─────────
-    // Injectable seam (deps.recordEpisode) keeps tests off D1. Wrapped in
-    // safeDoRecord so a throwing seam never aborts the cycle.
-    const doRecord = deps.recordEpisode ?? safeRecordEpisode
+    // doRecord is hoisted at the top of the function (used on every exit path).
     await safeDoRecord(doRecord, env, agent, {
       cycle: deps.sensoriumRuntime?.cycles ?? null,
       kind: 'spawned',
@@ -435,25 +435,17 @@ export async function runGoalCycle(
     })
 
     // ── S2: observer — productive tick resets counters ────────────────────────
-    const observerResult = await safeObserve(doObserve, env, agent, 'spawned')
-
-    // S4a: record 'escalated' episode when observer fires an escalation.
-    // This is distinct from 'spawned' — it means the operator was notified.
-    if (observerResult?.escalate) {
-      await safeDoRecord(doRecord, env, agent, {
-        cycle: deps.sensoriumRuntime?.cycles ?? null,
-        kind: 'escalated',
-        summary: `Observer escalation fired after 'spawned' outcome. Operator attention requested.`,
-        kpiProgress: agent.kpi_progress,
-      })
-    }
+    // S4a: observeStep also records an 'escalated' episode if the observer fires
+    // (won't on 'spawned' since that resets counters, but kept uniform across paths).
+    const observerResult = await observeStep(doObserve, doRecord, env, agent, 'spawned', deps.sensoriumRuntime?.cycles ?? null)
 
     const decided: GoalCycleDecided = 'spawned'
     return { ok: true, decided, spawned, autonomy, effort, observer: observerResult ?? undefined }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'goal_cycle_failed'
-    // S2: observer — record the error (best-effort).
-    const observerResult = await safeObserve(doObserve, env, agent, 'error')
+    // S2: observer — record the error (best-effort). S4a: observeStep records an
+    // 'escalated' episode if consecutive errors cross the escalation threshold.
+    const observerResult = await observeStep(doObserve, doRecord, env, agent, 'error', deps.sensoriumRuntime?.cycles ?? null)
     return { ok: false, decided: 'spawned', spawned: 0, autonomy, effort, error: msg, observer: observerResult ?? undefined }
   }
 }
@@ -675,6 +667,34 @@ async function safeObserve(
   } catch {
     return null
   }
+}
+
+/**
+ * observeStep — observe the cycle outcome AND record an 'escalated' episode if the
+ * observer fires an escalation. Centralized so escalation is captured on EVERY exit
+ * path: escalations build on failure/liveness/noop ticks (consecutive_fails /
+ * liveness_fails), NOT the 'spawned' path which resets those counters. Wiring the
+ * escalated-episode record only after 'spawned' (the pre-fix bug) meant it never ran.
+ * Both the observe and the record are best-effort and never abort the cycle.
+ */
+async function observeStep(
+  doObserve: typeof observe,
+  doRecord: typeof safeRecordEpisode,
+  env: Env,
+  agent: Agent,
+  outcome: ObserverOutcome,
+  cycle: number | null,
+): Promise<ObserveResult | null> {
+  const obs = await safeObserve(doObserve, env, agent, outcome)
+  if (obs?.escalate) {
+    await safeDoRecord(doRecord, env, agent, {
+      cycle,
+      kind: 'escalated',
+      summary: `Observer escalation (${obs.reason ?? 'operator attention requested'}) on '${outcome}' outcome.`,
+      kpiProgress: agent.kpi_progress,
+    })
+  }
+  return obs
 }
 
 /** Safe dispatch: swallow on error (the task row is already persisted). */

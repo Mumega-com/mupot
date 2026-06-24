@@ -619,3 +619,47 @@ describe('computeDecisionFp — EPISODIC_VERSION in preimage', () => {
     expect(fp1).not.toBe(fp2)
   })
 })
+
+// ── Escalation episode recording (gate-RED fix: on ANY path, not just spawned) ──
+
+describe('escalated episode — recorded on every path the observer can escalate', () => {
+  it("records 'escalated' on the error path when the observer escalates", async () => {
+    const agent = makeAgent()
+    const env = makeLoopEnv(makeLoopD1({ backlogCount: 0 }))
+    const recordEpisode = vi.fn().mockResolvedValue(undefined)
+    const result = await runGoalCycle(env, agent, baseDeps({
+      model: { chat: vi.fn().mockRejectedValue(new Error('model down')) },
+      observe: vi.fn().mockResolvedValue({ cooldown: false, escalate: true, reason: 'consecutive_fails=3' }),
+      recordEpisode,
+    }))
+    expect(result.error).toBeDefined()
+    const kinds = recordEpisode.mock.calls.map(([, , ep]) => (ep as { kind: string }).kind)
+    expect(kinds).toContain('escalated')
+  })
+
+  it("records 'escalated' (plus 'backpressure') on the backpressure path when the observer escalates", async () => {
+    const agent = makeAgent()
+    const env = makeLoopEnv(makeLoopD1({ backlogCount: MAX_OPEN_TASKS }))
+    const recordEpisode = vi.fn().mockResolvedValue(undefined)
+    const result = await runGoalCycle(env, agent, baseDeps({
+      observe: vi.fn().mockResolvedValue({ cooldown: true, escalate: true, reason: 'liveness_fails=3' }),
+      recordEpisode,
+    }))
+    expect(result.decided).toBe('backpressure')
+    const kinds = recordEpisode.mock.calls.map(([, , ep]) => (ep as { kind: string }).kind)
+    expect(kinds).toContain('backpressure')
+    expect(kinds).toContain('escalated')
+  })
+
+  it("does NOT record 'escalated' when the observer does not escalate", async () => {
+    const agent = makeAgent()
+    const env = makeLoopEnv(makeLoopD1({ backlogCount: MAX_OPEN_TASKS }))
+    const recordEpisode = vi.fn().mockResolvedValue(undefined)
+    await runGoalCycle(env, agent, baseDeps({
+      observe: vi.fn().mockResolvedValue({ cooldown: false, escalate: false }),
+      recordEpisode,
+    }))
+    const kinds = recordEpisode.mock.calls.map(([, , ep]) => (ep as { kind: string }).kind)
+    expect(kinds).not.toContain('escalated')
+  })
+})

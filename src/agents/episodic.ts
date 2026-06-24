@@ -27,20 +27,28 @@
 //             'deduped'      — idempotent rest (not a new event)
 //             'rate_limited' / 'budget_exhausted' — economic gates, not trajectory
 //
-// FINGERPRINT PREIMAGE: the episodic block is INJECTED INTO THE GOAL PROMPT so
-// the model sees it — this means the sensorium+episode block together form the
-// context the model reasons over. To prevent the episode content from
-// unexpectedly changing the S2 fingerprint (which would break dedup), we ADD
-// an EPISODIC_VERSION to the dedup preimage. Callers must import and include it
-// when computing computeDecisionFp (see dedup.ts update). Bumping EPISODIC_VERSION
-// invalidates ALL stale dedup rows for the episodic context change.
+// FINGERPRINT / DEDUP RELATIONSHIP (intentional — read carefully):
+//   The episodic block is INJECTED INTO THE GOAL PROMPT, so it influences what the
+//   model PROPOSES. But the dedup fingerprint (computeDecisionFp) keys on
+//   (sensorium state + the resulting PROPOSALS + version constants) — NOT on the
+//   raw episode text. Deliberate:
+//     - Episode content is CONTEXT, not decision IDENTITY. The decision is the
+//       proposal set; if episodes shift the model's proposals, the fp shifts via
+//       the proposals (→ not deduped). If proposals are identical, re-acting would
+//       duplicate work → dedup SHOULD fire (rest). Correct either way.
+//     - Hashing the ever-changing recent-episode TEXT into the fp would make it
+//       churn every tick → dedup never fires → defeats S2's anti-spam purpose.
+//   EPISODIC_VERSION (a constant) is in the preimage ONLY so an episodic
+//   logic/format change can invalidate stale dedup on demand — same role as
+//   SENSORIUM_VERSION. It is NOT the episode content. See dedup.ts.
 
 import type { Env, Agent } from '../types'
 
 // ── Version (fingerprint preimage component) ──────────────────────────────────
 //
-// Include this in computeDecisionFp's preimage (dedup.ts) alongside SENSORIUM_VERSION.
-// Bumping this invalidates ALL stale dedup rows for the episodic context change.
+// A CONSTANT included in computeDecisionFp's preimage (dedup.ts) alongside
+// SENSORIUM_VERSION. It is NOT the episode content — only a version token. Bump it
+// to invalidate stale dedup rows when the episodic logic/format changes.
 export const EPISODIC_VERSION = 'v1' as const
 
 // ── Caps ──────────────────────────────────────────────────────────────────────
@@ -171,10 +179,11 @@ export async function recentEpisodes(
  *
  * Empty list → empty string (no block injected, no noise).
  *
- * NOTE ON DEDUP: since this block is injected into the prompt the model reads,
- * the dedup fingerprint (computeDecisionFp) MUST include EPISODIC_VERSION in its
- * preimage so that adding/changing episodes invalidates stale dedup records.
- * See dedup.ts for the updated preimage.
+ * NOTE ON DEDUP: this block is prompt CONTEXT, not dedup identity. The fp keys on
+ * state + proposals (+ version constants); episodes shape proposals, and the fp
+ * follows the proposals. Only the EPISODIC_VERSION constant is in the preimage (to
+ * invalidate on a logic change) — never the episode text (that would churn the fp
+ * every tick and defeat dedup). See dedup.ts.
  */
 export function renderEpisodes(eps: Episode[]): string {
   if (eps.length === 0) return ''
