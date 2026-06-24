@@ -63,6 +63,8 @@ import { observe } from './observer'
 import type { ObserverOutcome, ObserveResult } from './observer'
 import { safeRecordEpisode, safeRecentEpisodes, renderEpisodes } from './episodic'
 import type { EpisodeInput, Episode } from './episodic'
+import { computeKpiSignal } from './kpi-sources'
+import type { KpiSignalResult } from './kpi-sources'
 
 // ── Effort → max tasks spawned per tick ──────────────────────────────────────
 
@@ -140,6 +142,9 @@ export interface LoopDeps {
   dispatch?: (taskId: string, squadId: string, agentId: string) => Promise<void>
   // kpi_progress write seam: injectable so tests can verify the SQL without D1.
   writeProgress?: (env: Env, agentId: string, progress: number) => Promise<void>
+  // S4b: KPI signal seam — injectable so tests run without D1 + a specific source.
+  // When omitted, the real computeKpiSignal is used (picks source from kpi_target tag).
+  kpiSignal?: (env: Env, agent: Agent) => Promise<KpiSignalResult>
   // Sensorium seam: builds the self-state block injected at the top of each
   // goal-cycle prompt. Injectable so tests can mock without D1 or a clock.
   // When omitted, the real buildSensorium is used (default prod path).
@@ -294,7 +299,7 @@ export async function runGoalCycle(
   if (taskBudget === 0) {
     // Still update kpi_progress on each observe tick so the dashboard stays fresh.
     const writeProgress = deps.writeProgress ?? defaultWriteProgress
-    await safeWriteProgress(writeProgress, env, agent)
+    await safeWriteProgress(writeProgress, env, agent, deps.kpiSignal)
     // S2: observe noop tick (best-effort — never abort on observer failure).
     const observerResult = await observeStep(doObserve, doRecord, env, agent, 'observe-only', deps.sensoriumRuntime?.cycles ?? null)
     return { ok: true, decided: 'observe-only', spawned: 0, autonomy, effort, observer: observerResult ?? undefined }
@@ -405,9 +410,9 @@ export async function runGoalCycle(
       spawned++
     }
 
-    // ── Update kpi_progress post-tick ────────────────────────────────────────
+    // ── Update kpi_progress post-tick (S4b: uses pluggable KPI signal source) ──
     const writeProgress = deps.writeProgress ?? defaultWriteProgress
-    await safeWriteProgress(writeProgress, env, agent)
+    await safeWriteProgress(writeProgress, env, agent, deps.kpiSignal)
 
     // ── Empty-proposal no-op: the model ran but proposed nothing (spawned===0).
     // This is NOT productive — do NOT write memory (no-op memory = noise, the
@@ -600,17 +605,32 @@ async function defaultWriteProgress(env: Env, agentId: string, progress: number)
     .run()
 }
 
-/** Calls updateKpiProgress and writes via the seam. Wraps in a try/catch (best-effort). */
+/**
+ * safeWriteProgress — compute KPI signal via the pluggable source, then persist.
+ *
+ * S4b: The signal source is selected by parseKpiSource(agent.kpi_target):
+ *   - 'task_counter' (default)  — original done-task-count behavior (backward-compat)
+ *   - 'github_prs'              — merged PRs in trailing 30-day window
+ *
+ * The injected kpiSignal seam overrides for tests. Production uses computeKpiSignal
+ * which dispatches to the right adapter without polling or external creds.
+ *
+ * Wraps in a try/catch (best-effort): a signal failure or DB hiccup never aborts the
+ * cycle — kpi_progress is left at its last known value, which is honest.
+ */
 async function safeWriteProgress(
   write: (env: Env, agentId: string, progress: number) => Promise<void>,
   env: Env,
   agent: Agent,
+  kpiSignalFn?: (env: Env, agent: Agent) => Promise<KpiSignalResult>,
 ): Promise<void> {
   try {
-    const result = await updateKpiProgress(env, agent.id, agent.kpi_target)
-    if (result.updated) {
-      await write(env, agent.id, result.current)
+    const signal = kpiSignalFn ?? computeKpiSignal
+    const result = await signal(env, agent)
+    if (result.ok) {
+      await write(env, agent.id, result.progress)
     }
+    // result.ok===false → no target or DB miss → leave kpi_progress unchanged (honest)
   } catch {
     // best-effort; a failed progress write must not abort the cycle
   }

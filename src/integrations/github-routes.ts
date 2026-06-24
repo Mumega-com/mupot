@@ -17,6 +17,7 @@ import { Hono } from 'hono'
 import type { Env } from '../types'
 import { createTask, syncTaskStatusFromIssue, syncCiResultToTask } from '../tasks/service'
 import { syncGitHubProject } from './github-projects'
+import { recordMergedPr } from '../agents/kpi-sources'
 
 interface GitHubRouteEnv {
   GITHUB_WEBHOOK_SECRET?: string
@@ -286,5 +287,27 @@ githubInboundApp.post('/', async (c) => {
   // that reflects untrusted PR fields under our token + risks a feedback loop (P1).
   // #142: GitHub event mapped to task — predicate is the triggering event resolved.
   await createTask(c.env, { squad_id: squadId, title: mapped.title, body: mapped.body, done_when: `GitHub event ${eventType} resolved`, status: 'open' }, { skipMirror: true })
+
+  // S4b: if this is a merged pull_request, record it in github_prs_merged for the
+  // 'github_prs' KPI source. Best-effort: a record failure never blocks the ack.
+  // The KPI source reads from this table (event-fed, no polling, no new secrets).
+  if (eventType === 'pull_request') {
+    const action = typeof payload.action === 'string' ? payload.action : ''
+    const pr = (payload.pull_request ?? {}) as { number?: number; title?: string; merged?: boolean }
+    if (action === 'closed' && pr.merged === true && Number.isInteger(pr.number)) {
+      const repo = safeField((payload.repository as { full_name?: string })?.full_name, 80)
+      const prTitle = safeField(pr.title, 200) || null
+      try {
+        await recordMergedPr(c.env, {
+          repo,
+          prNumber: pr.number as number,
+          title: prTitle,
+        })
+      } catch {
+        // best-effort — webhook must always ack even if the record fails
+      }
+    }
+  }
+
   return c.json({ ok: true })
 })
