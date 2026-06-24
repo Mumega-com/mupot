@@ -3,11 +3,17 @@
 // computeDecisionFp: produces a stable SHA-256 hex fingerprint over a canonical,
 // deterministically-serialised preimage that covers:
 //   - SENSORIUM_VERSION  (bump invalidates ALL stale dedup records → clean slate)
+//   - EPISODIC_VERSION   (S4a: bump invalidates ALL stale dedup records → clean slate;
+//                         added because the episode block is injected into the prompt
+//                         the model sees — changing it changes the context and thus the
+//                         fp. Without this, the same (sensorium + proposals) after a new
+//                         episode would NOT produce a new fp and would incorrectly dedup.)
 //   - agent.id           (fingerprint is per-agent, cannot collide across agents)
 //   - salient sensorium projection: kpi_progress, schedule.counts.open, schedule.overdue
 //   - normalised proposal set: sorted titles
 //
-// Same (state + proposals) → same fp.  A SENSORIUM_VERSION bump → different fp.
+// Same (state + proposals + episode version) → same fp.
+// A SENSORIUM_VERSION OR EPISODIC_VERSION bump → different fp.
 //
 // reserveDecision: single-statement INSERT ... ON CONFLICT DO NOTHING.
 //   meta.changes === 1 → reservation won   → reserved: true  (caller proceeds)
@@ -17,6 +23,7 @@
 // commit point, not a separate SELECT.
 
 import type { Sensorium } from './sensorium'
+import { EPISODIC_VERSION } from './episodic'
 import type { Env, Agent } from '../types'
 
 // ── Proposal shape (minimal — we only hash titles) ────────────────────────────
@@ -54,8 +61,12 @@ export async function computeDecisionFp(
   // Canonical preimage object — explicit key list, no spreading, no optionals.
   // Use sensorium.version (the runtime value carried BY the sensorium) so that a
   // SENSORIUM_VERSION bump produces a different fp for otherwise-identical state.
+  // S4a: also include EPISODIC_VERSION — the episode block is injected into the prompt
+  // the model sees (same context surface as sensorium). A version bump here invalidates
+  // stale dedup rows that were computed without the episode context.
   const preimage = {
     version: sensorium.version,
+    episodicVersion: EPISODIC_VERSION,
     agent: agent.id,
     kpi: sensorium.vitals.kpi_progress,
     open: sensorium.schedule.counts.open,

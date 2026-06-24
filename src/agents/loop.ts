@@ -61,6 +61,8 @@ import { computeDecisionFp, reserveDecision } from './dedup'
 import type { FpProposal } from './dedup'
 import { observe } from './observer'
 import type { ObserverOutcome, ObserveResult } from './observer'
+import { safeRecordEpisode, safeRecentEpisodes, renderEpisodes } from './episodic'
+import type { EpisodeInput, Episode } from './episodic'
 
 // ── Effort → max tasks spawned per tick ──────────────────────────────────────
 
@@ -152,6 +154,11 @@ export interface LoopDeps {
   reserveDecision?: typeof reserveDecision
   // S2: observer seam — injectable so tests run without D1. Default: real observe.
   observe?: typeof observe
+  // S4a: episodic memory seams — injectable so tests run without D1.
+  // recordEpisode: write a new episode row (best-effort; default: safeRecordEpisode).
+  // recentEpisodes: fetch recent episodes for prompt injection (best-effort; default: safeRecentEpisodes).
+  recordEpisode?: (env: Env, agent: Agent, ep: EpisodeInput, now?: string) => Promise<void>
+  recentEpisodes?: (env: Env, agent: Agent, limit?: number) => Promise<Episode[]>
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────
@@ -214,6 +221,16 @@ export async function runGoalCycle(
   const doSensorium = deps.buildSensorium ?? buildSensorium
   const sensoriumObj = await safeSensoriumObj(doSensorium, env, agent, deps.sensoriumRuntime)
 
+  // ── S4a: fetch recent episodes EARLY (alongside sensorium, before meter check) ─
+  //
+  // Episodes are cheap: a single D1 SELECT (no Vectorize, no AI). They are fetched
+  // here so the agent re-enters with its RECENT TRAJECTORY before the model call.
+  // A DB hiccup returns [] — the cycle degrades to "no recent history" gracefully.
+  // Injectable seam (deps.recentEpisodes) keeps tests off D1.
+  // Wrapped in safeFetchEpisodes so a throwing seam (or real DB hiccup) never aborts.
+  const doRecentEpisodes = deps.recentEpisodes ?? safeRecentEpisodes
+  const episodes = await safeFetchEpisodes(doRecentEpisodes, env, agent)
+
   // ── S3: Guard 5 — backpressure (open-task queue full) ────────────────────────
   //
   // Count the agent's OWN open backlog: tasks it must answer for. That is BOTH
@@ -229,6 +246,14 @@ export async function runGoalCycle(
   const openBacklog = await safeCountOpenBacklog(env, agent)
   if (openBacklog >= MAX_OPEN_TASKS) {
     const observerResult = await safeObserve(doObserve, env, agent, 'backpressure')
+    // S4a: record 'backpressure' episode — queue-full is a real operational signal.
+    const doRecord = deps.recordEpisode ?? safeRecordEpisode
+    await safeDoRecord(doRecord, env, agent, {
+      cycle: deps.sensoriumRuntime?.cycles ?? null,
+      kind: 'backpressure',
+      summary: `Backpressure: ${openBacklog} open tasks (cap=${MAX_OPEN_TASKS}). Spawn skipped until queue drains.`,
+      kpiProgress: agent.kpi_progress,
+    })
     return {
       ok: true,
       decided: 'backpressure',
@@ -285,6 +310,11 @@ export async function runGoalCycle(
     // sensoriumObj was built early (before meter check) — reuse it here; do not rebuild.
     const sensoriumBlock = sensoriumObj ? renderSensorium(sensoriumObj) : null
 
+    // S4a: render recent episodes for prompt injection. The agent reads its own
+    // recent trajectory before proposing — cross-run continuity without a model call.
+    // episodes was fetched early (before meter check); render here for injection.
+    const episodeBlock = renderEpisodes(episodes)
+
     const messages: ModelMessage[] = [
       {
         role: 'system',
@@ -298,7 +328,7 @@ export async function runGoalCycle(
       },
       {
         role: 'user',
-        content: buildGoalPrompt(agent, taskBudget, recentContext, sensoriumBlock),
+        content: buildGoalPrompt(agent, taskBudget, recentContext, sensoriumBlock, episodeBlock),
       },
     ]
 
@@ -393,8 +423,31 @@ export async function runGoalCycle(
     const doRemember = deps.remember ?? ((id, text) => createMemory(env).remember(id, text))
     await safeRemember(doRemember, agent.id, buildOutcomeSummary(agent, proposals, spawned))
 
+    // ── S4a: record episode for 'spawned' — always (productive cycle) ─────────
+    // Injectable seam (deps.recordEpisode) keeps tests off D1. Wrapped in
+    // safeDoRecord so a throwing seam never aborts the cycle.
+    const doRecord = deps.recordEpisode ?? safeRecordEpisode
+    await safeDoRecord(doRecord, env, agent, {
+      cycle: deps.sensoriumRuntime?.cycles ?? null,
+      kind: 'spawned',
+      summary: buildOutcomeSummary(agent, proposals, spawned),
+      kpiProgress: agent.kpi_progress,
+    })
+
     // ── S2: observer — productive tick resets counters ────────────────────────
     const observerResult = await safeObserve(doObserve, env, agent, 'spawned')
+
+    // S4a: record 'escalated' episode when observer fires an escalation.
+    // This is distinct from 'spawned' — it means the operator was notified.
+    if (observerResult?.escalate) {
+      await safeDoRecord(doRecord, env, agent, {
+        cycle: deps.sensoriumRuntime?.cycles ?? null,
+        kind: 'escalated',
+        summary: `Observer escalation fired after 'spawned' outcome. Operator attention requested.`,
+        kpiProgress: agent.kpi_progress,
+      })
+    }
+
     const decided: GoalCycleDecided = 'spawned'
     return { ok: true, decided, spawned, autonomy, effort, observer: observerResult ?? undefined }
   } catch (err) {
@@ -475,6 +528,7 @@ function buildGoalPrompt(
   taskBudget: number,
   recentContext: string,
   sensoriumBlock?: string | null,
+  episodeBlock?: string | null,
 ): string {
   const lines: string[] = []
 
@@ -482,6 +536,13 @@ function buildGoalPrompt(
   // This is the keystone of S1: the model sees its situation before proposing.
   if (sensoriumBlock) {
     lines.push(sensoriumBlock)
+    lines.push('')
+  }
+
+  // S4a: Episode block — the agent reads its recent trajectory after the sensorium.
+  // "What did I do in the last N cycles?" — cross-run continuity without a model call.
+  if (episodeBlock) {
+    lines.push(episodeBlock)
     lines.push('')
   }
 
@@ -689,4 +750,44 @@ function buildOutcomeSummary(agent: Agent, proposals: { title: string }[], spawn
   // Bounded: cycle summary never exceeds ~300 chars so the embedding model sees
   // a focused signal (large engrams dilute the semantic centroid).
   return `Goal cycle: spawned ${spawned} task(s) toward "${(agent.okr ?? '').slice(0, 80)}". Tasks: ${titles}. KPI: ${agent.kpi_progress}%`.slice(0, 300)
+}
+
+// ── S4a: episodic safe helpers ─────────────────────────────────────────────────
+
+/**
+ * safeFetchEpisodes — fetch recent episodes, degrading to [] on any error.
+ *
+ * Wraps the injectable seam so a throwing seam (or real DB hiccup) never aborts
+ * the goal cycle. The cycle proceeds with an empty episode list.
+ */
+async function safeFetchEpisodes(
+  fetch: typeof safeRecentEpisodes,
+  env: Env,
+  agent: Agent,
+): Promise<Episode[]> {
+  try {
+    return await fetch(env, agent)
+  } catch {
+    // best-effort; episode fetch is enrichment, not a gate
+    return []
+  }
+}
+
+/**
+ * safeDoRecord — record an episode best-effort.
+ *
+ * Wraps the injectable seam so a throwing seam (or real DB hiccup) never aborts
+ * the goal cycle.
+ */
+async function safeDoRecord(
+  record: (env: Env, agent: Agent, ep: EpisodeInput, now?: string) => Promise<void>,
+  env: Env,
+  agent: Agent,
+  ep: EpisodeInput,
+): Promise<void> {
+  try {
+    await record(env, agent, ep)
+  } catch {
+    // best-effort; episode write must never abort the cycle
+  }
 }
