@@ -209,16 +209,20 @@ export async function recordMergedPr(
   env: Env,
   input: RecordMergedPrInput,
 ): Promise<RecordMergedPrResult> {
-  const nowMs = input.nowMs ?? Date.now()
-  const id = `gpr-${env.TENANT_SLUG}-${input.repo.replace(/[^a-z0-9]/gi, '-')}-${input.prNumber}-${nowMs}`
+  try {
+    const nowMs = input.nowMs ?? Date.now()
+    const id = `gpr-${env.TENANT_SLUG}-${input.repo.replace(/[^a-z0-9]/gi, '-')}-${input.prNumber}-${nowMs}`
 
-  const result = await env.DB.prepare(
-    `INSERT OR IGNORE INTO github_prs_merged
-       (id, tenant_id, repo, pr_number, title, merged_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(id, env.TENANT_SLUG, input.repo, input.prNumber, input.title, nowMs, nowMs)
-    .run()
+    const result = await env.DB.prepare(
+      `INSERT OR IGNORE INTO github_prs_merged
+         (id, tenant_id, repo, pr_number, title, merged_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(id, env.TENANT_SLUG, input.repo, input.prNumber, input.title, nowMs, nowMs)
+      .run()
 
-  return { ok: true, inserted: (result.meta?.changes ?? 0) > 0 }
+    return { ok: true, inserted: (result.meta?.changes ?? 0) > 0 }
+  } catch {
+    return { ok: false, inserted: false }
+  }
 }

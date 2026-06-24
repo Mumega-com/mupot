@@ -307,6 +307,31 @@ describe('recordMergedPr', () => {
     const insertCall = calls.find((c) => c.sql.includes('INSERT OR IGNORE'))
     expect(insertCall?.binds[4]).toBeNull()
   })
+
+  it('never throws — returns {ok:false} on DB error (contract matches comment)', async () => {
+    // DB stub that throws on INSERT
+    const env = {
+      TENANT_SLUG: 'test-tenant',
+      DB: {
+        prepare(_sql: string) {
+          return {
+            bind() { return this },
+            async run() { throw new Error('D1 explosion') },
+          }
+        },
+      },
+    } as unknown as Env
+
+    // Must NOT throw — the webhook handler calls this and always 200s GitHub
+    const result = await recordMergedPr(env, {
+      repo: 'Mumega-com/mupot',
+      prNumber: 99,
+      title: 'test',
+      nowMs: 1_700_000_000_000,
+    })
+    expect(result.ok).toBe(false)
+    expect(result.inserted).toBe(false)
+  })
 })
 
 // ── 7. loop.ts integration — kpiSignal seam ──────────────────────────────────
@@ -431,6 +456,56 @@ describe('runGoalCycle kpiSignal integration', () => {
     expect(result.decided).toBe('observe-only')
     // Progress write was skipped (signal threw) — writtenProgress stays empty
     expect(writtenProgress).toHaveLength(0)
+  })
+
+  // ── 11. S1 determinism regression (Codex blocker) ────────────────────────────
+  // The live goal-cycle path must thread the loop's injected nowMs into the
+  // github_prs KPI source — it must NEVER fall back to Date.now() internally.
+  //
+  // Proof: inject a fixed nowMs far in the past (1970-01-02). The production
+  // computeKpiSignal would use Date.now() ≈ 2026 if the seam is broken — the
+  // window boundary would be ~56 years later, so a DB returning cnt=1 would show
+  // non-zero progress. With the correct seam the kpiSignal receives the exact
+  // injected nowMs; we assert by capturing what the seam was called with.
+  it('[S1 regression] runGoalCycle threads injected nowMs into github_prs source — no Date.now() fallback', async () => {
+    const env = makeLoopEnv()
+    const FIXED_NOW_MS = 86_400_000 // 1970-01-02T00:00:00.000Z — far in the past
+
+    // Capture the nowMs argument the kpiSignal seam receives.
+    const capturedNowMs: number[] = []
+    const kpiSignalFn = vi.fn().mockImplementation(
+      async (_e: Env, _a: Agent, receivedNowMs: number) => {
+        capturedNowMs.push(receivedNowMs)
+        return { ok: true, count: 1, target: 10, progress: 10, source: 'github_prs' } satisfies KpiSignalResult
+      },
+    )
+    const writtenProgress: number[] = []
+
+    const deps: LoopDeps = {
+      nowMs: FIXED_NOW_MS, // ← single loop clock injected here
+      kpiSignal: kpiSignalFn,
+      writeProgress: async (_env, _id, p) => { writtenProgress.push(p) },
+      buildSensorium: vi.fn().mockResolvedValue(null),
+      observe: vi.fn().mockResolvedValue({ escalate: false, reason: null, consecutiveNoops: 0 }),
+      recordEpisode: vi.fn().mockResolvedValue(undefined),
+      recentEpisodes: vi.fn().mockResolvedValue([]),
+    }
+
+    const agent = makeAgent({ kpi_target: '10 [github_prs]', effort: 'low' })
+    const result = await runGoalCycle(env, agent, deps)
+
+    expect(result.decided).toBe('observe-only')
+
+    // kpiSignal was called exactly once
+    expect(kpiSignalFn).toHaveBeenCalledOnce()
+
+    // The nowMs received by the seam MUST be the injected fixed value.
+    // If Date.now() leaked in, this would be ~1.7e12 (year 2026), not 86_400_000.
+    expect(capturedNowMs).toHaveLength(1)
+    expect(capturedNowMs[0]).toBe(FIXED_NOW_MS)
+
+    // Progress was written from the signal result
+    expect(writtenProgress).toEqual([10])
   })
 
   it('backward-compat: untagged kpi_target uses task_counter (no kpiSignal override)', async () => {
