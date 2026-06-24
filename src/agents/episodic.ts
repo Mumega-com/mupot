@@ -233,7 +233,9 @@ export async function safeRecentEpisodes(
  * prompt lines. Bounds length. Does NOT wrap in quotes (caller context determines).
  */
 function sanitizeData(s: string): string {
-  /* eslint-disable-next-line no-control-regex */
-  const noControl = s.replace(/[ -]+/g, ' ')
+  // Strip C0 control chars (\r \n \t and friends) so a summary cannot forge
+  // prompt lines; bound length. (Do NOT wrap — caller context determines.)
+  // eslint-disable-next-line no-control-regex
+  const noControl = s.replace(/[\u0000-\u001F\u007F]+/g, ' ')
   return noControl.trim().slice(0, EPISODE_SUMMARY_MAX)
 }
