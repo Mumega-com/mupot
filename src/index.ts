@@ -39,6 +39,7 @@ import { prospectsApp } from './loops/prospects-routes'
 import { loopsApp } from './loops/routes'
 import { fleetCheckinApp } from './fleet/checkin-routes'
 import { fleetControlApp } from './fleet/control-routes'
+import { fleetAttachApp } from './fleet/attach-routes'
 import { flightsApp } from './flight/routes'
 import { orientApp } from './orient/routes'
 import { handleOAuthAuthorize, resolveExternalToken as memberKeyResolver } from './mcp/oauth-authorize'
@@ -92,6 +93,9 @@ app.route('/api/loops', loopsApp)
 // Inbound only — the pot needs no egress. Mounted before the dashboard '/' catch-all.
 app.route('/api/fleet', fleetCheckinApp)
 app.route('/api/fleet', fleetControlApp)
+// Agent self-attach/detach (Step 2a): the agent runtime reports ITSELF as running/stopped.
+// member_id is auth-derived; an agent can only manage its own row.
+app.route('/api/fleet', fleetAttachApp)
 // Coherence-loop connector (#70): the brain dispatches gated flights + pulls outcomes,
 // inbound (the pot stays sealed). Org-admin via member-token. Before the '/' catch-all.
 app.route('/api/flights', flightsApp)
