@@ -14,7 +14,8 @@ import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { emitControlRequest } from './control'
-import { reportFleetAgents, listFleetAgents } from './registry'
+import { reportFleetAgents, getAgentView } from './registry'
+import { resolveOrgAdmin } from '../auth/member-bearer'
 
 export const fleetControlApp = new Hono<{ Bindings: Env }>()
 
@@ -83,8 +84,11 @@ fleetControlApp.post('/report', async (c) => {
   return c.json(res, res.ok ? 200 : 400)
 })
 
+// GET /agents — admin-gated unified view: runtime rows + identity (member) + capabilities.
+// Requires org-admin (or higher) capability on the bearer token. Non-admin tokens get 403.
+// This is the data feed for the dashboard agent roster and the #agent-bus Discord feed.
 fleetControlApp.get('/agents', async (c) => {
-  const id = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
-  if (!id) return c.json({ error: 'unauthorized' }, 401)
-  return c.json({ ok: true, agents: await listFleetAgents(c.env) })
+  const auth = await resolveOrgAdmin(c.env, c.req.header('authorization'))
+  if (!auth.ok) return c.json({ error: auth.status === 401 ? 'unauthorized' : 'forbidden' }, auth.status)
+  return c.json({ ok: true, agents: await getAgentView(c.env) })
 })

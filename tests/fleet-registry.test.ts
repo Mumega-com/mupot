@@ -12,31 +12,50 @@ async function sha256Hex(s: string): Promise<string> {
 
 interface FleetRow {
   agent_id: string; tenant: string; display: string; runtime: string; squads: string
-  lifecycle: string; provider_contract: string | null; status: string; reported_by: string; last_reported_at: string
+  lifecycle: string; provider_contract: string | null; status: string; reported_by: string
+  last_reported_at: string; agent_type: string; member_id: string | null
 }
 interface TokenRow { member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null }
+interface CapRow { member_id: string; scope_type: string; scope_id: string | null; capability: string }
 
-function makeDb(tokens: Record<string, TokenRow> = {}) {
+function makeDb(tokens: Record<string, TokenRow> = {}, caps: Record<string, CapRow[]> = {}) {
   const fleet = new Map<string, FleetRow>()
   function first(sql: string, b: unknown[]) {
     if (sql.includes('FROM member_tokens t')) return tokens[b[0] as string] ?? null
+    // member_id existence check added in 0039 — no members seeded in this fixture, always null
+    if (sql.includes('FROM members WHERE id')) return null
     throw new Error('unhandled first: ' + sql)
   }
   function all(sql: string, b: unknown[]) {
+    // getAgentView LEFT JOIN (must be checked before generic FROM fleet_agents)
+    if (sql.includes('LEFT JOIN members m ON m.id')) {
+      const [tenant] = b as [string]
+      return [...fleet.values()].filter((r) => r.tenant === tenant).sort((x, y) => (x.agent_id < y.agent_id ? -1 : 1))
+        .map((r) => ({ ...r, m_id: null, m_email: null, m_display: null }))
+    }
     if (sql.includes('FROM fleet_agents')) {
       const [tenant] = b as [string]
       return [...fleet.values()].filter((r) => r.tenant === tenant).sort((x, y) => (x.agent_id < y.agent_id ? -1 : 1))
+    }
+    // resolveCapabilities (called by GET /agents admin gate)
+    if (sql.includes('capabilities')) {
+      const [memberId] = b as [string]
+      return caps[memberId] ?? []
     }
     throw new Error('unhandled all: ' + sql)
   }
   function run(sql: string, b: unknown[]) {
     if (sql.includes('INSERT INTO fleet_agents')) {
-      const [agent_id, tenant, display, runtime, squads, lifecycle, pc, status, reported_by] = b as string[]
+      // Params: agent_id(?1) tenant(?2) display(?3) runtime(?4) squads(?5) lifecycle(?6)
+      //         provider_contract(?7) status(?8) reported_by(?9) agent_type(?10) member_id(?11)
+      const [agent_id, tenant, display, runtime, squads, lifecycle, pc, status, reported_by, agent_type, member_id] = b as Array<string | null>
       // faithful to the composite PK (tenant, agent_id): keyed by both, so a different tenant's same
       // agent_id is a SEPARATE row (ON CONFLICT(tenant, agent_id)).
       fleet.set(`${tenant}:${agent_id}`, {
-        agent_id, tenant, display, runtime, squads, lifecycle,
-        provider_contract: (pc as string | null) ?? null, status, reported_by, last_reported_at: 'now',
+        agent_id: agent_id!, tenant: tenant!, display: display!, runtime: runtime!, squads: squads!,
+        lifecycle: lifecycle!, provider_contract: (pc as string | null) ?? null,
+        status: status!, reported_by: reported_by!,
+        last_reported_at: 'now', agent_type: agent_type ?? 'generic', member_id: member_id ?? null,
       })
       return { meta: { changes: 1 } }
     }
@@ -124,10 +143,18 @@ beforeAll(async () => {
 })
 
 function routeDb() {
-  return makeDb({
-    [consumerHash]: { member_id: 'm-c', display_name: 'Daemon', email: null, status: 'active', bound_agent_id: 'fleet-consumer' },
-    [otherHash]: { member_id: 'm-o', display_name: 'Other', email: null, status: 'active', bound_agent_id: 'kasra' },
-  })
+  // GET /agents is now admin-gated. Give the consumer token org-admin capability so the
+  // existing "consumer can list agents" test keeps passing — the daemon that reports status
+  // is operator-tier; admin capability is appropriate. m-o (OTHER) has no caps → 403.
+  return makeDb(
+    {
+      [consumerHash]: { member_id: 'm-c', display_name: 'Daemon', email: null, status: 'active', bound_agent_id: 'fleet-consumer' },
+      [otherHash]: { member_id: 'm-o', display_name: 'Other', email: null, status: 'active', bound_agent_id: 'kasra' },
+    },
+    {
+      'm-c': [{ member_id: 'm-c', scope_type: 'org', scope_id: null, capability: 'admin' }],
+    },
+  )
 }
 
 function req(app: typeof fleetControlApp, path: string, method: string, token: string | null, body: unknown, e: Env) {
