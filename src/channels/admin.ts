@@ -173,14 +173,11 @@ const SyncBody = z.object({
 })
 
 // Per-member projection result (safe to return; no token or secret included).
-interface ProjectionEntry {
-  memberId: string
-  ok: boolean
-  targetRole?: string | null
-  added?: string[]
-  removed?: string[]
-  reason?: string
-}
+// Discriminated union so TypeScript knows `reason` is always present on failure
+// and `targetRole`/`added`/`removed` are always present on success.
+type ProjectionEntry =
+  | { memberId: string; ok: true; targetRole: string | null; added: string[]; removed: string[] }
+  | { memberId: string; ok: false; reason: string }
 
 channelsAdminApp.post('/discord/sync', requireOrgCapability('admin'), async (c) => {
   // ── parse + validate body ─────────────────────────────────────────────────
@@ -271,11 +268,13 @@ channelsAdminApp.post('/discord/sync', requireOrgCapability('admin'), async (c) 
         roleMap[roleName] = newRoleId
         rolesEnsured.push(`${roleName}:created`)
       } catch (err) {
-        // Redact token from error detail (belt + suspenders: createGuildRole
-        // already never includes the token, but sanitise defensively).
-        const raw = err instanceof Error ? err.message : String(err)
-        const detail = raw.replace(/DISCORD_BOT_TOKEN/gi, '[redacted]')
-        return c.json({ error: 'role_create_failed', role: roleName, detail }, 502)
+        // createGuildRole throws status-only messages (e.g. "discord: createGuildRole failed (403)").
+        // We extract the numeric HTTP status and return ONLY {error, role, status} — no upstream
+        // response body, no raw error string, no detail that could carry injected content.
+        const msg = err instanceof Error ? err.message : String(err)
+        const statusMatch = /\((\d+)\)/.exec(msg)
+        const status = statusMatch ? statusMatch[1] : 'unknown'
+        return c.json({ error: 'role_create_failed', role: roleName, status }, 502)
       }
     }
   }
@@ -323,5 +322,28 @@ channelsAdminApp.post('/discord/sync', requireOrgCapability('admin'), async (c) 
     }
   }
 
-  return c.json({ ok: true, guildId, rolesEnsured, projections })
+  // ── outcome: fail-CLOSED reporting (BLOCK-1 fix) ─────────────────────────
+  // ok:true + 200 ONLY when every projection succeeded (or zero linked members).
+  // Any per-member failure → ok:false + 207 Multi-Status with a `failed` summary.
+  // The caller must check ok and inspect `failed` — they cannot assume a 200 means
+  // "all members synced". This is not a soft warning: a failed member means Discord
+  // roles may diverge from mupot capabilities for that principal.
+
+  if (projections.length === 0) {
+    // Explicitly signal zero linked members so the caller knows the sync ran but
+    // had no targets (common during initial setup before any /link codes are used).
+    return c.json({ ok: true, projected: 0, guildId, rolesEnsured, projections }, 200)
+  }
+
+  const failed = projections
+    .filter((p): p is ProjectionEntry & { ok: false; reason: string } => !p.ok)
+    .map((p) => ({ memberId: p.memberId, reason: p.reason }))
+
+  if (failed.length > 0) {
+    // 207 Multi-Status: some operations succeeded, some failed. Caller gets the full
+    // projections array for detail and a `failed` summary for quick triage.
+    return c.json({ ok: false, guildId, rolesEnsured, projections, failed }, 207)
+  }
+
+  return c.json({ ok: true, projected: projections.length, guildId, rolesEnsured, projections }, 200)
 })

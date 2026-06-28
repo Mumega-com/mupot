@@ -10,9 +10,12 @@
 //   4. token absent → 503, no add/remove called.
 //   5. dryRun → no mutations; no role CREATE; reports intended projections.
 //   6. admin gate: non-admin → 403.
+//   7. BLOCK-1 regression: per-member api_error → route 207 ok:false with failed array.
+//   8. BLOCK-2 regression: createGuildRole 403 with injected body → body NOT in error/response.
 
-import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { channelsAdminApp } from '../src/channels/admin'
+import { createGuildRole } from '../src/channels/adapters/discord'
 import type { Env } from '../src/types'
 
 // ── fixtures ──────────────────────────────────────────────────────────────────
@@ -174,7 +177,14 @@ interface MockFetchOpts {
   channelId?: string
   existingRoleNames?: string[]  // which managed roles already exist in guild
   memberCurrentRoles?: string[] // role IDs the member currently holds in Discord
-  createRoleId?: string         // id to return for POST /roles
+  createRoleId?: string         // id to return for POST /roles (on success)
+  /** Force the member GET (/guilds/.../members/<uid>) to fail → triggers api_error
+   *  in projectMemberCapabilitiesToDiscord (BLOCK-1 regression). */
+  memberGetFails?: boolean
+  /** Force createGuildRole POST /roles to fail with the given HTTP status and body.
+   *  Used for BLOCK-2 regression: body string must NOT leak into errors/response. */
+  createRoleFailStatus?: number
+  createRoleFailBody?: string
   /** For recording calls */
   onCreateRole?: (name: string) => void
   onAddRole?: (roleId: string) => void
@@ -215,8 +225,17 @@ function makeFetch(opts: MockFetchOpts = {}) {
       return { ok: true, json: async () => guildRolesArray }
     }
 
-    // Create guild role POST
+    // Create guild role POST (must be checked before member-role PUT/DELETE)
     if (urlStr.includes(`/guilds/${guildId}/roles`) && method === 'POST') {
+      // BLOCK-2 regression: return a failure with a body that contains a fake secret.
+      if (opts.createRoleFailStatus !== undefined) {
+        const failBody = opts.createRoleFailBody ?? 'error'
+        return {
+          ok: false,
+          status: opts.createRoleFailStatus,
+          text: async () => failBody,
+        }
+      }
       let roleName = '@new-role'
       try {
         const body = JSON.parse(_init?.body as string ?? '{}') as { name?: string }
@@ -228,6 +247,10 @@ function makeFetch(opts: MockFetchOpts = {}) {
 
     // Member GET (discord-cap-sync uses this for current roles)
     if (urlStr.includes(`/guilds/${guildId}/members/`) && method === 'GET') {
+      // BLOCK-1 regression: return non-OK so discordGet returns null → api_error.
+      if (opts.memberGetFails) {
+        return { ok: false, status: 404, json: async () => null }
+      }
       return {
         ok: true,
         json: async () => ({ roles: memberCurrentRoles }),
@@ -618,20 +641,145 @@ describe('security: bot token never in response', () => {
   })
 
   it('503 response does not contain a secret token value', async () => {
-    const state = stateWithBinding()
-    // Even when a token env var is present, the value should never leak.
-    const env = makeEnv(state, { hasBotToken: true })
-    // Inject the token value we know, then verify it doesn't appear in the
-    // response body. We simulate a fast-path reject by using the real token
-    // check (token IS present → route continues to the binding lookup,
-    // which returns 404 since we have no binding mocked). What matters:
-    // no path should echo the token value.
+    // Token IS present → route continues to binding lookup → 404 (no binding).
+    // Verify the token value never appears in any response body.
     const stateNoBinding = stateWithBinding({ binding: null })
     const envWithToken = makeEnv(stateNoBinding, { hasBotToken: true })
     const res = await channelsAdminApp.fetch(req('/discord/sync'), envWithToken)
     const text = await res.text()
-
-    // The token VALUE should never appear in any response body.
     expect(text).not.toContain('fake-bot-token-for-test')
+  })
+})
+
+// ── BLOCK-1 regression: per-member api_error → ok:false 207, failed array ────
+//
+// BEFORE THE FIX: a failed per-member projection (api_error / suspended / unbound)
+// returned 200 ok:true — caller assumed full success.
+// AFTER THE FIX: any projection failure → 207 ok:false with a `failed` summary.
+
+describe('BLOCK-1 regression — per-member failure escalates to top-level ok:false', () => {
+  it('member GET fails (api_error) → route returns 207 ok:false with failed array', async () => {
+    // memberGetFails=true → Discord GET /members/<uid> returns 404 → discordGet returns null
+    // → projectMemberCapabilitiesToDiscord returns {ok:false, reason:'api_error'}
+    const mockFetch = makeFetch({ memberGetFails: true })
+    vi.stubGlobal('fetch', mockFetch)
+
+    const state = stateWithBinding()
+    const env = makeEnv(state)
+    const res = await channelsAdminApp.fetch(req('/discord/sync'), env)
+
+    // Must NOT be 200 ok:true — that would be fail-open reporting.
+    expect(res.status).toBe(207)
+    const body = await res.json() as {
+      ok: boolean
+      failed: Array<{ memberId: string; reason: string }>
+      projections: Array<{ ok: boolean; reason?: string }>
+    }
+    expect(body.ok).toBe(false)
+
+    // `failed` array lists the member and reason
+    expect(body.failed).toHaveLength(1)
+    expect(body.failed[0].memberId).toBe(HADI_MEMBER_ID)
+    expect(body.failed[0].reason).toBe('api_error')
+
+    // Full projections still present for detail
+    expect(body.projections).toHaveLength(1)
+    expect(body.projections[0].ok).toBe(false)
+  })
+
+  it('zero discord-linked members → ok:true, projected:0 (not a failure)', async () => {
+    const mockFetch = makeFetch()
+    vi.stubGlobal('fetch', mockFetch)
+
+    const state = stateWithBinding({ memberIdentities: [] })
+    const env = makeEnv(state)
+    const res = await channelsAdminApp.fetch(req('/discord/sync'), env)
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as { ok: boolean; projected: number }
+    expect(body.ok).toBe(true)
+    expect(body.projected).toBe(0)
+  })
+
+  it('all projections succeed → ok:true 200 with projected count', async () => {
+    const mockFetch = makeFetch({ memberCurrentRoles: [] })
+    vi.stubGlobal('fetch', mockFetch)
+
+    const state = stateWithBinding()
+    const env = makeEnv(state)
+    const res = await channelsAdminApp.fetch(req('/discord/sync'), env)
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as { ok: boolean; projected: number }
+    expect(body.ok).toBe(true)
+    expect(body.projected).toBe(1) // hadi
+  })
+})
+
+// ── BLOCK-2 regression: createGuildRole body never surfaces in errors/response ─
+//
+// BEFORE THE FIX: createGuildRole did `await res.text()` and included the upstream
+// body in the thrown error; the route then returned that detail to the caller.
+// An upstream response body could contain injected or reflected content.
+// AFTER THE FIX: status code only in thrown errors and route responses.
+
+describe('BLOCK-2 regression — createGuildRole upstream body does not leak', () => {
+  const INJECTED_SECRET = 'Bot LEAKED-TOKEN-ABCDEF-THIS-SHOULD-NOT-APPEAR'
+
+  it('createGuildRole: thrown error contains only the status, NOT the upstream body', async () => {
+    const mockFetch = vi.fn(async (url: string | Request, _init?: RequestInit) => {
+      const urlStr = typeof url === 'string' ? url : url.toString()
+      const method = (_init?.method ?? 'GET').toUpperCase()
+      if (urlStr.includes('/roles') && method === 'POST') {
+        return {
+          ok: false,
+          status: 403,
+          text: async () => INJECTED_SECRET,  // upstream body with "token-looking" content
+        }
+      }
+      throw new Error(`unexpected fetch: ${urlStr}`)
+    })
+    vi.stubGlobal('fetch', mockFetch)
+
+    // Build a minimal env with DISCORD_BOT_TOKEN set.
+    const env = { DISCORD_BOT_TOKEN: 'fake-bot-token-for-test' } as unknown as Env
+
+    let caughtError: Error | undefined
+    try {
+      await createGuildRole(env, GUILD_ID, '@owner')
+    } catch (err) {
+      caughtError = err as Error
+    }
+
+    expect(caughtError).toBeDefined()
+    // Error message must contain the status code.
+    expect(caughtError!.message).toContain('403')
+    // Error message must NOT contain the upstream body (the injected secret).
+    expect(caughtError!.message).not.toContain(INJECTED_SECRET)
+    expect(caughtError!.message).not.toContain('LEAKED-TOKEN')
+  })
+
+  it('route role_create_failed response contains only status, NOT the upstream body', async () => {
+    // @lead missing from guild → createGuildRole is called → Discord returns 403
+    // with an upstream body containing a fake-secret string.
+    const mockFetch = makeFetch({
+      existingRoleNames: ['@owner', '@squad', '@member', '@public'], // @lead missing
+      createRoleFailStatus: 403,
+      createRoleFailBody: INJECTED_SECRET,
+    })
+    vi.stubGlobal('fetch', mockFetch)
+
+    const state = stateWithBinding()
+    const env = makeEnv(state)
+    const res = await channelsAdminApp.fetch(req('/discord/sync'), env)
+
+    expect(res.status).toBe(502)
+    const text = await res.text()
+
+    // The route 502 must include the HTTP status code for triage.
+    expect(text).toContain('403')
+    // The upstream body (injected secret) must NEVER appear in the response.
+    expect(text).not.toContain(INJECTED_SECRET)
+    expect(text).not.toContain('LEAKED-TOKEN')
   })
 })
