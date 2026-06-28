@@ -283,6 +283,36 @@ describe('getAgentView', () => {
     expect(views[0].capabilities).toEqual([])
   })
 
+  // BLOCK-2 regression: cross-tenant member WITH capabilities must not leak those caps.
+  //
+  // The BLOCK-1 test above verified member:null for a cross-tenant link. But the pre-fix
+  // code still called resolveCapabilities(env, r.member_id) — the raw fleet column, not
+  // the join-matched r.m_id. So even with member:null, the foreign member's capabilities
+  // were returned. This test seeds a cross-tenant member WITH real capabilities (org owner)
+  // and asserts that BOTH member AND capabilities are empty on getAgentView output.
+  //
+  // Fails-without-fix: old code → capabilities:[{org,null,owner}] (foreign cap leaked).
+  // Passes-with-fix: joinedId=null → capabilities:[] (foreign caps are never resolved).
+  it('cross-tenant member WITH capabilities → member:null, capabilities:[] (BLOCK-2)', async () => {
+    const db = makeDb({
+      members: [{ id: 'm-owner', email: 'owner@other.com', display_name: 'ForeignOwner', tenant: 'other' }],
+      // This member holds org-level owner on their own tenant. A bug would leak this.
+      caps: [{ member_id: 'm-owner', scope_type: 'org', scope_id: null, capability: 'owner' }],
+    })
+    // Seed fleet row directly under tenant='t' with member_id pointing at the foreign member.
+    db._fleet.set('t:kasra', {
+      agent_id: 'kasra', tenant: 't', display: 'Kasra', runtime: 'claude-code', squads: '[]',
+      lifecycle: 'always_on', provider_contract: null, status: 'running', reported_by: 'fc',
+      last_reported_at: 'now', agent_type: 'builder', member_id: 'm-owner',
+    })
+    const views = await getAgentView(env(db, { TENANT_SLUG: 't' }))
+    expect(views).toHaveLength(1)
+    // The foreign member must not appear in any output field.
+    expect(views[0].member).toBeNull()
+    // The foreign member's capabilities must NOT be returned (BLOCK-2).
+    expect(views[0].capabilities).toEqual([])
+  })
+
   // BLOCK-1 fix (backfill path): a pre-migration member with tenant=NULL gets stamped
   // with env.TENANT_SLUG by the lazy backfill, then joins correctly.
   it('NULL-tenant member is backfilled and joins correctly (backfill path)', async () => {

@@ -210,8 +210,14 @@ export async function getAgentView(env: Env): Promise<AgentView[]> {
 
   const out: AgentView[] = []
   for (const r of rows.results ?? []) {
-    const memberId = r.member_id == null ? null : String(r.member_id)
-    const capabilities = memberId ? (await resolveCapabilities(env, memberId)).map((g) => ({
+    // BLOCK-2 fix: derive everything from the JOINED column (m_id), not the raw fleet row's
+    // member_id. The JOIN is tenant-bound (AND m.tenant = fa.tenant), so m_id is null when
+    // the linked member belongs to a different tenant or doesn't exist. Using r.member_id here
+    // bypasses that filter — a cross-tenant fa.member_id would still reach resolveCapabilities
+    // and expose the foreign member's capabilities even though member is correctly null.
+    // Only the tenant-matched joined identity may produce output (member + capabilities).
+    const joinedId = r.m_id == null ? null : String(r.m_id)
+    const capabilities = joinedId ? (await resolveCapabilities(env, joinedId)).map((g) => ({
       scope_type: g.scope_type,
       scope_id: g.scope_id,
       capability: g.capability,
@@ -223,8 +229,8 @@ export async function getAgentView(env: Env): Promise<AgentView[]> {
       status: String(r.status ?? 'unknown'),
       lifecycle: String(r.lifecycle ?? ''),
       last_seen: String(r.last_reported_at ?? ''),
-      member: r.m_id == null ? null : {
-        id: String(r.m_id),
+      member: joinedId == null ? null : {
+        id: joinedId,
         email: r.m_email == null ? null : String(r.m_email),
         display_name: String(r.m_display ?? ''),
       },
