@@ -150,6 +150,16 @@ export interface SeedFailure {
  *
  * APPLY-GATED: this function must only be called from an explicit operator script
  * or a test against a local/test D1. It is NOT called on startup.
+ *
+ * EXISTING-MEMBER SAFETY (BLOCK-1 fix): the seed uses a deterministic synthetic
+ * UUID for fresh members. If a member already exists in the DB with the same
+ * email (e.g. hadi@mumega.com was onboarded earlier with a different UUID), the
+ * member INSERT OR IGNORE no-ops correctly — but we MUST look up the real
+ * existing member_id by email and bind that to the capability insert. Using the
+ * synthetic UUID for the capability would create an orphan (member_id that has
+ * no matching members.id row) because capabilities.member_id FK-references
+ * members.id. We resolve this by always reading back the true member id when
+ * the INSERT is a no-op.
  */
 export async function seedSquadMembers(
   env: Env,
@@ -161,35 +171,56 @@ export async function seedSquadMembers(
 
   for (const def of defs) {
     try {
-      const memberId = await deterministicMemberId(def.slug)
-      const grantId = await deterministicGrantId(memberId, def.scope_type, def.scope_id)
+      const syntheticId = await deterministicMemberId(def.slug)
 
-      // INSERT OR IGNORE: idempotent member creation.
-      // email UNIQUE constraint: if the member row already exists (same email or same id),
-      // this is a safe no-op — the existing row is preserved.
+      // Step 1: INSERT OR IGNORE the member row using the deterministic id.
+      // If the email already exists (prior onboarding with a different UUID), the
+      // insert is silently ignored — the existing row is preserved.
       const memberResult = await env.DB.prepare(
         `INSERT OR IGNORE INTO members (id, email, display_name, status, created_at)
          VALUES (?1, ?2, ?3, 'active', ?4)`,
       )
-        .bind(memberId, def.email, def.display_name, now)
+        .bind(syntheticId, def.email, def.display_name, now)
         .run()
 
       const memberInserted = (memberResult.meta?.changes ?? 0) > 0
 
-      // INSERT OR IGNORE: idempotent capability grant.
-      // The UNIQUE(member_id, scope_type, scope_id) constraint ensures an existing
-      // grant is preserved (the existing capability level is NOT overwritten, preventing
-      // an accidental downgrade on re-seed).
+      // Step 2: Resolve the AUTHORITATIVE member_id for the capability grant.
+      // If the INSERT was a no-op, look up the real existing id by email so the
+      // capability row references a real members.id (not an orphaned synthetic id).
+      let effectiveMemberId = syntheticId
+      if (!memberInserted) {
+        const existing = await env.DB.prepare(
+          `SELECT id FROM members WHERE email = ?1 LIMIT 1`,
+        )
+          .bind(def.email)
+          .first<{ id: string }>()
+
+        if (!existing) {
+          // INSERT was no-op but lookup failed — concurrent delete or DB error.
+          return {
+            ok: false,
+            reason: 'db_error',
+            detail: `member ${def.slug} (${def.email}) exists but id lookup failed after no-op insert`,
+          }
+        }
+        effectiveMemberId = existing.id
+      }
+
+      // Step 3: INSERT OR IGNORE the capability grant using the authoritative id.
+      // UNIQUE(member_id, scope_type, scope_id) ensures an existing grant is
+      // preserved; the existing capability level is NOT overwritten on re-seed.
+      const grantId = await deterministicGrantId(effectiveMemberId, def.scope_type, def.scope_id)
       const grantResult = await env.DB.prepare(
         `INSERT OR IGNORE INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
       )
-        .bind(grantId, memberId, def.scope_type, def.scope_id, def.capability, now)
+        .bind(grantId, effectiveMemberId, def.scope_type, def.scope_id, def.capability, now)
         .run()
 
       const grantInserted = (grantResult.meta?.changes ?? 0) > 0
 
-      results.push({ slug: def.slug, memberId, inserted: memberInserted, grantInserted })
+      results.push({ slug: def.slug, memberId: effectiveMemberId, inserted: memberInserted, grantInserted })
     } catch (err) {
       return {
         ok: false,

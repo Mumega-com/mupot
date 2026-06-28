@@ -36,7 +36,7 @@
 
 import type { Env, Capability, CapabilityGrant, CapabilityScopeType } from '../types'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
-import { addMemberRole, removeMemberRole } from './adapters/discord'
+import { addMemberRole, removeMemberRole, discordGet } from './adapters/discord'
 
 // ── §2A capability → Discord role name map ────────────────────────────────────
 //
@@ -83,17 +83,17 @@ export function capToRoleKey(grants: CapabilityGrant[]): string | null {
   if (grants.length === 0) return null
 
   // Check in descending rank order.
+  // @owner and @lead both require ORG scope (WARN-1 + Loom §2A clarification):
+  //   #admin is org-level visibility; a dept-scoped or squad-scoped lead does NOT
+  //   earn org-level Discord admin access. Use hasCapability(…,'org',null,…) for
+  //   both — no "any-scope" fallback for privileged tiers.
   if (hasCapability(grants, 'org', null, 'owner')) return '@owner'
-  // lead at any scope (org, dept, squad)
-  if (
-    hasCapability(grants, 'org', null, 'lead') ||
-    grants.some((g) => g.capability === 'lead')
-  ) return '@lead'
+  if (hasCapability(grants, 'org', null, 'lead')) return '@lead'
 
-  // member at squad scope → @squad
+  // member at squad scope → @squad (internal channel access)
   if (grants.some((g) => g.capability === 'member' && g.scope_type === 'squad')) return '@squad'
 
-  // member at org or dept scope → @member
+  // member at org or dept scope → @member (OAuth-verified community)
   if (
     hasCapability(grants, 'org', null, 'member') ||
     grants.some((g) => g.capability === 'member' && (g.scope_type === 'org' || g.scope_type === 'department'))
@@ -282,7 +282,14 @@ export async function projectMemberCapabilitiesToDiscord(
   const targetRole = capToRoleKey(grants)
 
   // Resolve injectables (defaults to real Discord API helpers).
-  const getFn = inject?.discordGetFn ?? noopGet
+  //
+  // BLOCK-2 fix: the production GET default is the REAL discordGet (bot-token fetch),
+  // NOT noopGet. noopGet always returns null → currentRoleIds=[] → toRemove=[] →
+  // stale roles are never removed → "revoke a mupot grant removes the Discord role"
+  // criterion is broken on the real path. The real discordGet is fail-soft (returns
+  // null on any error), so a transient Discord outage still doesn't crash the sync —
+  // but stale roles ARE removed when Discord is reachable.
+  const getFn = inject?.discordGetFn ?? ((path: string) => discordGet(env, path))
   const doAddRole = inject?.addRoleFn ?? ((g, u, r) => addMemberRole(env, g, u, r))
   const doRemoveRole = inject?.removeRoleFn ?? ((g, u, r) => removeMemberRole(env, g, u, r))
 
@@ -347,7 +354,6 @@ export async function projectMemberCapabilitiesToDiscord(
   return { ok: true, discordUserId, targetRole, added, removed }
 }
 
-// Fallback no-op GET (for when no getter is injected in tests that don't need it).
-async function noopGet(_path: string): Promise<null> {
-  return null
-}
+// noopGet was removed as part of the BLOCK-2 fix. The production default is now
+// the real discordGet (bot-token fetch); tests that need a controlled GET inject
+// a discordGetFn via ProjectionInjectables. See projectMemberCapabilitiesToDiscord.

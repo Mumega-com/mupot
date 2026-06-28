@@ -8,7 +8,7 @@
 //
 // All Discord API calls are MOCKED. No real HTTP to discord.com.
 
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
   resolveDiscordInboundMember,
   checkInboundDiscordCap,
@@ -431,8 +431,11 @@ describe('capToRoleKey — §2A capability→role mapping', () => {
     expect(capToRoleKey([grant('lead', 'org')])).toBe('@lead')
   })
 
-  it('lead at squad → @lead', () => {
-    expect(capToRoleKey([grant('lead', 'squad', SQUAD_ID)])).toBe('@lead')
+  it('lead at squad → null (WARN-1: @lead requires org scope only)', () => {
+    // WARN-1 fix: squad-scoped lead does NOT project to @lead. @lead/#admin is an
+    // org-level Discord role — only org-scoped lead should receive it. A dept/squad
+    // lead operates within that scope and must not gain org-level Discord visibility.
+    expect(capToRoleKey([grant('lead', 'squad', SQUAD_ID)])).toBeNull()
   })
 
   it('member at squad scope → @squad', () => {
@@ -532,5 +535,90 @@ describe('projectMemberCapabilitiesToDiscord — diff + idempotency', () => {
     expect(CAP_TO_DISCORD_ROLE['lead']).toBe('@lead')
     expect(CAP_TO_DISCORD_ROLE['member']).toBe('@member')
     expect(CAP_TO_DISCORD_ROLE['observer']).toBe('@public')
+  })
+})
+
+// ── BLOCK-2 regression: production GET path uses real discordGet ──────────────
+//
+// BUG: const getFn = inject?.discordGetFn ?? noopGet — noopGet always returned
+// null, so currentRoleIds was always [] → toRemove was always [] → stale Discord
+// roles could NEVER be removed in production. Fix: default to real discordGet.
+//
+// This test verifies the production default path (no discordGetFn injected) calls
+// the real discordGet (which calls fetch), so stale roles ARE fetched and removed.
+
+describe('BLOCK-2 regression — production GET path fetches real Discord member roles', () => {
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('without injected discordGetFn, stale @owner is removed when Alice is demoted to member', async () => {
+    // Alice: owner→member in mupot. Discord still shows @owner (stale).
+    // The production GET must fetch her real Discord roles so @owner is removed.
+    const db = makeDb(aliceMember('member', 'org'))
+    // DISCORD_BOT_TOKEN must be set so discordGet doesn't short-circuit to null.
+    const env = { DB: db, DISCORD_BOT_TOKEN: 'fake-bot-token-for-test' } as unknown as ReturnType<typeof makeEnv>
+
+    // Stub global fetch: Discord GET returns Alice with stale @owner role.
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ roles: [ROLE_MAP['@owner']] }),
+    })
+    vi.stubGlobal('fetch', mockFetch)
+
+    const addedRoles: string[] = []
+    const removedRoles: string[] = []
+    // Note: NO discordGetFn injected — tests production default path.
+    const result = await projectMemberCapabilitiesToDiscord(
+      env as unknown as Env,
+      ALICE_MEMBER_ID, GUILD_ID, ROLE_MAP,
+      {
+        addRoleFn: async (_g, _u, roleId) => { addedRoles.push(roleId) },
+        removeRoleFn: async (_g, _u, roleId) => { removedRoles.push(roleId) },
+      },
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    // BLOCK-2 fix verification: fetch was called (real discordGet, not noopGet).
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+    expect(mockFetch.mock.calls[0][0]).toContain(`/guilds/${GUILD_ID}/members/${ALICE_DISCORD_ID}`)
+
+    // Stale @owner REMOVED; @member ADDED (correct mupot cap).
+    expect(result.removed).toContain('@owner')
+    expect(result.added).toContain('@member')
+    expect(removedRoles).toContain(ROLE_MAP['@owner'])
+    expect(addedRoles).toContain(ROLE_MAP['@member'])
+  })
+})
+
+// ── WARN-1 regression: @lead requires ORG scope only ─────────────────────────
+//
+// BUG: capToRoleKey used `hasCapability(g,'org',null,'lead') || grants.some(g=>g.capability==='lead')`
+// — the any-scope fallback granted @lead to squad/dept-scoped leads, giving them
+// org-level Discord (#admin) visibility. Fix: use hasCapability(,'org',null,'lead') ONLY.
+
+describe('WARN-1 regression — @lead requires org-scope lead, not any-scope', () => {
+  function grant(cap: string, scopeType: string, scopeId: string | null = null): CapabilityGrant {
+    return {
+      member_id: 'm',
+      scope_type: scopeType as 'org' | 'department' | 'squad',
+      scope_id: scopeId,
+      capability: cap as CapabilityGrant['capability'],
+    }
+  }
+
+  it('squad-scoped lead does NOT project to @lead (returns null)', () => {
+    // A lead at squad scope must not receive #admin-level Discord visibility.
+    expect(capToRoleKey([grant('lead', 'squad', SQUAD_ID)])).toBeNull()
+  })
+
+  it('dept-scoped lead does NOT project to @lead (returns null)', () => {
+    // Same invariant for department scope: only org-scope lead → @lead.
+    expect(capToRoleKey([grant('lead', 'department', 'dept-001')])).toBeNull()
+  })
+
+  it('org-scoped lead DOES project to @lead', () => {
+    // The happy path must still work: org-scope lead → @lead.
+    expect(capToRoleKey([grant('lead', 'org')])).toBe('@lead')
   })
 })

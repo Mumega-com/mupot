@@ -411,7 +411,16 @@ interface DiscordGuildMember {
   user?: DiscordUser | null
 }
 
-async function discordGet(env: Env, path: string): Promise<unknown | null> {
+/**
+ * discordGet — authenticated GET against the Discord API with the bot token.
+ * Exported so discord-cap-sync can use it as the production default for fetching
+ * guild member role data in the capability→role projection (BLOCK-2 fix: the sync
+ * must use the real GET on the live path so stale roles are actually removed).
+ * Returns null on any error (token absent, non-2xx, parse failure) — fail-soft so
+ * a transient Discord outage does not wedge reconciliation. Callers must treat
+ * null as "no data" and handle accordingly (see discord-cap-sync.ts).
+ */
+export async function discordGet(env: Env, path: string): Promise<unknown | null> {
   const token = discordSecrets(env).DISCORD_BOT_TOKEN
   if (!token) return null
   const res = await fetch(`${DISCORD_API}${path}`, {

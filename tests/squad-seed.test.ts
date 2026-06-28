@@ -153,6 +153,15 @@ function makeDb() {
           return { id: m.id, seq: m.seq, to_agent: m.to_agent, kind: m.kind, body: m.body, in_reply_to: m.in_reply_to } as unknown as T
         }
 
+        // BLOCK-1 fix: SELECT id FROM members WHERE email = ?1 LIMIT 1
+        // Used when INSERT OR IGNORE was a no-op (member already exists with different UUID).
+        if (/SELECT id FROM members WHERE email = \?1/i.test(s)) {
+          const [email] = binds as [string]
+          const m = members.find((x) => x.email === email)
+          if (!m) return null
+          return { id: m.id } as unknown as T
+        }
+
         throw new Error(`squad-seed makeDb: unhandled first sql:\n${s}`)
       },
       async all<T>(): Promise<{ results: T[] }> {
@@ -472,5 +481,91 @@ describe('agent↔agent inbox round-trip (Slice D proof — S196)', () => {
     const river = await readAgentInbox(env, { agent: 'ag-river' })
     if (!river.ok) return
     expect(river.messages.map((m) => m.body)).toEqual(['for river'])
+  })
+})
+
+// ── BLOCK-1 regression: pre-existing member with different UUID ───────────────
+//
+// BUG: seedSquadMembers used the synthetic deterministic UUID for both the member
+// INSERT and the capability INSERT. If hadi was already in the DB (onboarded earlier
+// with a different UUID), the member INSERT no-ops but the capability INSERT would
+// use the synthetic UUID → orphan row (member_id with no matching members.id).
+// FIX: after a no-op INSERT, look up the real existing id by email, bind that to
+// the capability INSERT.
+
+describe('BLOCK-1 regression — pre-existing member with different UUID', () => {
+  it('seed with pre-existing hadi (different UUID) attaches capability to real id', async () => {
+    const db = makeDb()
+    const env = makeEnv(db)
+
+    const REAL_HADI_ID = 'real-hadi-uuid-pre-existing-0001'
+
+    // Pre-seed the DB: hadi already exists with a REAL id (not the synthetic one).
+    db._members.push({
+      id: REAL_HADI_ID,
+      email: 'hadi@mumega.com',
+      display_name: 'Hadi Servat (pre-existing)',
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    })
+
+    // Now run the squad seed.
+    const result = await seedSquadMembers(env, null)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    // Find hadi's seeded result.
+    const hadiEntry = result.seeded.find((s) => s.slug === 'hadi')
+    expect(hadiEntry).toBeDefined()
+    if (!hadiEntry) return
+
+    // BLOCK-1 assertion: capability must be bound to the REAL pre-existing id.
+    expect(hadiEntry.memberId).toBe(REAL_HADI_ID)
+    // Member was not re-inserted (INSERT OR IGNORE was a no-op).
+    expect(hadiEntry.inserted).toBe(false)
+    // Grant was inserted (new capability row with the correct real id).
+    expect(hadiEntry.grantInserted).toBe(true)
+
+    // Critical: no orphan capability row (all capability member_ids must exist in members).
+    for (const cap of db._capabilities) {
+      const memberExists = db._members.some((m) => m.id === cap.member_id)
+      expect(memberExists).toBe(true)
+    }
+
+    // The capability for hadi references REAL_HADI_ID, not any synthetic UUID.
+    const hadiCap = db._capabilities.find((c) => c.member_id === REAL_HADI_ID)
+    expect(hadiCap).toBeDefined()
+    expect(hadiCap?.capability).toBe('owner')
+    expect(hadiCap?.scope_type).toBe('org')
+  })
+
+  it('re-seed with pre-existing hadi is fully idempotent (0 inserts on second run)', async () => {
+    const db = makeDb()
+    const env = makeEnv(db)
+
+    const REAL_HADI_ID = 'real-hadi-uuid-pre-existing-0001'
+    db._members.push({
+      id: REAL_HADI_ID,
+      email: 'hadi@mumega.com',
+      display_name: 'Hadi Servat',
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    })
+
+    // First seed: inserts 5 new members + 1 capability on real id + 5 synthetic caps.
+    await seedSquadMembers(env, null)
+    const capCountAfterFirst = db._capabilities.length
+
+    // Second seed: all INSERT OR IGNORE no-ops.
+    const second = await seedSquadMembers(env, null)
+    expect(second.ok).toBe(true)
+    if (!second.ok) return
+
+    // No new rows on second run.
+    expect(db._capabilities.length).toBe(capCountAfterFirst)
+    for (const entry of second.seeded) {
+      expect(entry.inserted).toBe(false)
+      expect(entry.grantInserted).toBe(false)
+    }
   })
 })
