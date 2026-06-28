@@ -39,13 +39,26 @@ Legend: ✅ shipped · 🔨 in progress · ⬜ planned · 🏢 Enterprise-tagged
   manual `GITHUB_PLAN_TIER`
 
 ### EPIC B — Work Sync (GitHub ⇄ pot tasks)
-- ✅ **B1** Inbound webhook (GitHub events → pot tasks) — exists
+- ✅ **B1** Inbound webhook *handler* (GitHub events → pot tasks) — `POST /api/integrations/github`
+  (`src/integrations/github-routes.ts`), HMAC-verified. **Handler exists; delivery is per-repo
+  classic webhooks — see B6.** (Originally marked ✅ "exists" but no webhook ever pointed at it.)
 - ✅ **B2** Outbound mirror (pot tasks → GitHub issues), now App-first (PR #129)
 - ✅ **B3** Bidirectional status sync — an `issues` close/reopen webhook flips the mirrored
   pot task (closed→done, reopened→open) via `syncTaskStatusFromIssue`; no mirror-back (no
-  feedback loop), never clobbers review/approved/rejected gate states
+  feedback loop), never clobbers review/approved/rejected gate states. **Code-ready; not active
+  until an `issues`-subscribed webhook is wired (current webhooks are `pull_request`-only).**
 - ✅ **B4** App webhook secret (`GITHUB_WEBHOOK_SECRET`) set on the live `mupot` worker
+- ✅ **B6** Inbound delivery wired (2026-06-27) — **per-repo classic webhooks**, NOT the App
+  webhook. The Mumega "mupot" App is **token-mint only**; its webhook is intentionally left
+  unset (`GET /app/hook/config` url=None, events=[]) because an **org-wide App firehose into a
+  single-tenant pot is wrong** — all 33 repos would flood this pot and inflate the KPI (the
+  `github_prs` COUNT is `tenant_id`-scoped, not repo-scoped). Instead, scoped `pull_request`
+  webhooks on the 3 pillar repos this squad ships: **Mumega-com/mupot (646865323) ·
+  Mumega-com/sos (647355020) · Mumega-com/mumega-com (647355036)** → the same endpoint, same
+  secret; each verified by ping → 200. Feeds the S4b `github_prs` KPI = real squad velocity.
 - ⬜ **B5** Issue→task squad routing + label mapping
+- ⬜ **B7** Repo-scope the `github_prs` KPI (the `repo` column is already stored) IF a future
+  pot needs per-repo velocity instead of the tenant-wide aggregate.
 
 ### EPIC C — Agent Provisioning (the pot AUTHORS GitHub agents)
 - ✅ **C1** `writeAgentDef` — write `.github/agents/<name>.agent.md` (PR #131)
@@ -83,14 +96,24 @@ Legend: ✅ shipped · 🔨 in progress · ⬜ planned · 🏢 Enterprise-tagged
 ## Current live state (Mumega tenant #0)
 
 - App "mupot" (ID 4041094) installed on Mumega-com, all 33 repos, full write perms.
-- `mupot` worker (TENANT_SLUG=mumega) wired with 4 secrets, keystone + actions deployed.
+  **Token-mint only — App webhook deliberately unconfigured** (see B6).
+- `mupot` worker (TENANT_SLUG=mumega) wired with secrets, keystone + actions deployed.
 - Minting verified live; reaches private repos the PAT was enterprise-blocked from.
+- **Inbound delivery (2026-06-27): per-repo `pull_request` webhooks on mupot · sos · mumega-com,
+  feeding the live S4b `github_prs` KPI** (`kpi_target='10 [github_prs]'` on the Kasra agent).
+
+## Note for multi-tenant (when other orgs connect)
+
+A *tenant's own* org App install MAY use the App-level webhook (one org → one pot = no
+cross-tenant flood). The "no org firehose" rule is specific to **our single shared App also
+serving tenant #0**. For tenant pots, prefer the per-repo or per-tenant-org webhook so each
+pot only sees its own org's events. If the App webhook is ever turned on, repo-scope the KPI
+first (B7) and gate the issue→task fan-out (B5).
 
 ## Build order (next)
 
-1. **B4** wire webhook secret (trivial, activates verified inbound)
-2. **C3** admin routes for writeAgentDef + assignIssueToCopilot + GitHub status (makes the
+1. **C3** admin routes for writeAgentDef + assignIssueToCopilot + GitHub status (makes the
    hands usable from the dashboard)
-3. **A3** `/connect/github` install callback (one-click connect)
-4. **D1** stitch the end-to-end execution loop
-5. **C4/C5** fleet→GitHub sync + per-agent MCP wiring (the network effect)
+2. **A3** `/connect/github` install callback (one-click connect)
+3. **D1** stitch the end-to-end execution loop
+4. **C4/C5** fleet→GitHub sync + per-agent MCP wiring (the network effect)
