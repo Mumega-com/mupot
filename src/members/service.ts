@@ -5,8 +5,14 @@
 // same SQL twice. Keeping mint/revoke here means the SECURITY DISCIPLINE lives in
 // one place: tokens are stored HASHED, the raw is returned EXACTLY ONCE at mint and
 // never logged or persisted, and revoke is idempotent (only flips live tokens).
+//
+// mintAgentBoundToken — the AGENT-BOUND mint path (shared between the MCP provision
+// tool and the dashboard /admin/agent-token route).  It is the ONLY place the three-
+// statement atomic batch (member envelope + escalation-guard capability + agent-weld
+// token) is written, so no logic lives in two places.
 
 import type { Env, MemberToken, ConnectionChannel } from '../types'
+import { assertBatchWritten } from '../lib/receipt'
 
 const CHANNELS: readonly ConnectionChannel[] = ['workspace', 'im', 'dashboard']
 export function isChannel(v: unknown): v is ConnectionChannel {
@@ -105,6 +111,75 @@ export interface PublicMemberToken {
   channel: ConnectionChannel
   created_at: string
   revoked_at: string | null
+}
+
+// ── agent-bound mint (shared) ─────────────────────────────────────────────────
+
+/** The agent row shape mintAgentBoundToken needs (resolved from agents table). */
+export interface AgentForMint {
+  id: string
+  squad_id: string
+  slug: string
+  name: string
+}
+
+/** What the agent-bound mint returns. raw is the show-once plaintext. */
+export interface AgentMintResult {
+  raw: string
+  tokenId: string
+  memberId: string
+  createdAt: string
+}
+
+/**
+ * Atomically mint a DEDICATED member envelope + squad-scoped 'member' capability +
+ * agent-weld token for `agent`.
+ *
+ * SECURITY INVARIANTS (same as the original mint_agent_token MCP tool):
+ *   - THREE ROWS, ONE BATCH — all land or none do (no orphan credentials).
+ *   - THE ESCALATION GUARD: the capability is hard-coded to scope_type='squad',
+ *     scope_id=agent.squad_id, capability='member'.  It cannot be widened from args.
+ *   - THE WELD: member_tokens.agent_id = agent.id (binds the token to the agent).
+ *   - Raw shown once; only the hash is stored. Never logged, never re-derivable.
+ *
+ * Caller MUST have already gated on org-admin (this layer does no authz).
+ * Caller MUST have already resolved and validated `agent` from the pot's own D1.
+ */
+export async function mintAgentBoundToken(
+  env: Env,
+  agent: AgentForMint,
+  label: string,
+): Promise<AgentMintResult> {
+  const memberId = crypto.randomUUID()
+  const tokenId = crypto.randomUUID()
+  const rawToken = mintRawToken()
+  const tokenHash = await sha256Hex(rawToken)
+  const createdAt = new Date().toISOString()
+  const safeLabel = label.trim().slice(0, 64) || agent.slug
+
+  const mintWrites = await env.DB.batch([
+    // 1) Dedicated member envelope for the agent (no email, no IM).
+    env.DB.prepare(
+      `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(memberId, null, agent.name, null, 'active', createdAt, env.TENANT_SLUG),
+    // 2) THE ESCALATION GUARD: squad-scoped 'member' on the agent's OWN squad only.
+    //    Hard-coded scope + capability — never widened from caller args.
+    env.DB.prepare(
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+       VALUES (?, ?, 'squad', ?, 'member')`,
+    ).bind(crypto.randomUUID(), memberId, agent.squad_id),
+    // 3) THE WELD: bind token to the agent (agent_id set). Only the hash is stored.
+    env.DB.prepare(
+      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id)
+       VALUES (?, ?, ?, ?, 'workspace', ?, ?)`,
+    ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id),
+  ])
+  // Receipt: all three rows MUST land. A partial mint (e.g. token row without its
+  // capability row) would hand out a show-once token bound to a broken identity.
+  assertBatchWritten(mintWrites, 'mint_agent_bound_token', 1)
+
+  return { raw: rawToken, tokenId, memberId, createdAt }
 }
 
 /** Live (non-revoked) tokens for every member — for the dashboard roster. The
