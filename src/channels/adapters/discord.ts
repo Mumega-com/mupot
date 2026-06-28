@@ -400,10 +400,10 @@ async function post(env: Env, externalChannelId: string, text: string): Promise<
   })
 
   if (!res.ok) {
-    // Surface status only — never the request headers (which carry the token) or the
-    // token itself. Discord's error body is safe to include (no secret echoed back).
-    const detail = await res.text().catch(() => '')
-    throw new Error(`discord: post failed (${res.status}) ${detail.slice(0, 256)}`)
+    // Status only — never surface the upstream response body (could contain injected
+    // content or a reflected token value). The calling layer gets the HTTP status; the
+    // full Discord error lives in their logging pipeline, not in our error surface.
+    throw new Error(`discord: post failed (${res.status})`)
   }
 }
 
@@ -603,12 +603,51 @@ export async function addMemberRole(
     },
   )
 
-  // 204 = success; 404 on an unknown guild/member is surfaced as a thrown Error.
-  // We do NOT log the status if 2xx — only surface the status for failures.
+  // 204 = success; non-2xx on an unknown guild/member is surfaced as a thrown Error.
+  // Status only — never surface the upstream response body (same reasoning as post()).
   if (!res.ok && res.status !== 204) {
-    const detail = await res.text().catch(() => '')
-    throw new Error(`discord: addMemberRole failed (${res.status}) ${detail.slice(0, 256)}`)
+    throw new Error(`discord: addMemberRole failed (${res.status})`)
   }
+}
+
+/**
+ * createGuildRole — POST /guilds/{guildId}/roles.
+ * Creates a new guild role with the given name and returns its role id.
+ * Called by the Discord cap→role sync route when a managed role (e.g. @owner,
+ * @lead) is absent from the guild — the bot must hold Manage Roles permission.
+ * The bot token is never logged or returned in the error message.
+ */
+export async function createGuildRole(
+  env: Env,
+  guildId: string,
+  name: string,
+): Promise<string> {
+  const token = discordSecrets(env).DISCORD_BOT_TOKEN
+  if (!token) throw new Error('discord: DISCORD_BOT_TOKEN not configured')
+
+  const res = await fetch(
+    `${DISCORD_API}/guilds/${encodeURIComponent(guildId)}/roles`,
+    {
+      method: 'POST',
+      headers: {
+        authorization: `Bot ${token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ name }),
+    },
+  )
+
+  if (!res.ok) {
+    // Status only — never surface the upstream response body (same reasoning as post()).
+    // An upstream 403/429/500 detail string could contain injected or reflected content.
+    throw new Error(`discord: createGuildRole failed (${res.status})`)
+  }
+
+  const data: { id?: unknown } = await res.json<{ id?: unknown }>().catch(() => ({}))
+  if (typeof data.id !== 'string' || !data.id) {
+    throw new Error('discord: createGuildRole: response missing role id')
+  }
+  return data.id
 }
 
 /**
@@ -637,8 +676,8 @@ export async function removeMemberRole(
   )
 
   if (!res.ok && res.status !== 204) {
-    const detail = await res.text().catch(() => '')
-    throw new Error(`discord: removeMemberRole failed (${res.status}) ${detail.slice(0, 256)}`)
+    // Status only — never surface the upstream response body (same reasoning as post()).
+    throw new Error(`discord: removeMemberRole failed (${res.status})`)
   }
 }
 

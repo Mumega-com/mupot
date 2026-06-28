@@ -7,10 +7,13 @@
 // others) — single-use, short-TTL, never a self-claimed identity.
 
 import { Hono, type MiddlewareHandler } from 'hono'
+import { z } from 'zod'
 import type { Env, AuthContext, Capability, ChannelBinding } from '../types'
 import { requireAuth } from '../auth'
 import { requireOrgCapability, actorMaxRankOnScope } from '../auth/capability'
 import { getAdapter } from './registry'
+import { discordGet, createGuildRole, getDiscordBotToken } from './adapters/discord'
+import { projectMemberCapabilitiesToDiscord, MANAGED_DISCORD_ROLES } from './discord-cap-sync'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -145,4 +148,202 @@ channelsAdminApp.get('/sync/status', requireOrgCapability('member'), async (c) =
        FROM channel_bindings b ORDER BY b.created_at DESC`,
   ).all<{ id: string; platform: string; squad_id: string; identities: number }>()
   return c.json({ bindings: rows.results ?? [] })
+})
+
+// ── Discord cap→role sync ─────────────────────────────────────────────────────
+// POST /discord/sync — admin-gated. One-way projection of mupot capabilities
+// onto Discord guild roles for every member with a Discord identity. mupot is
+// the master; Discord roles are purely derived from mupot grants.
+//
+// §2A role names: @owner | @lead | @squad | @member | @public (MANAGED_DISCORD_ROLES).
+// Missing managed roles are CREATED in the guild (live path). Roles not in the
+// managed set are NEVER touched.
+//
+// Dry-run (?dryRun=1 or body {dryRun:true}): resolves guild + builds roleMap
+// but does NOT create missing roles. Reports intended projections per member
+// with no-op add/remove, so nothing mutates on Discord.
+//
+// Security: the bot token is NEVER included in a response or error body.
+// The route fails closed on absent token, missing binding, or any Discord API
+// error that prevents a reliable projection.
+
+const SyncBody = z.object({
+  squadId: z.string().optional(),
+  dryRun: z.boolean().optional(),
+})
+
+// Per-member projection result (safe to return; no token or secret included).
+// Discriminated union so TypeScript knows `reason` is always present on failure
+// and `targetRole`/`added`/`removed` are always present on success.
+type ProjectionEntry =
+  | { memberId: string; ok: true; targetRole: string | null; added: string[]; removed: string[] }
+  | { memberId: string; ok: false; reason: string }
+
+channelsAdminApp.post('/discord/sync', requireOrgCapability('admin'), async (c) => {
+  // ── parse + validate body ─────────────────────────────────────────────────
+  let rawBody: unknown = {}
+  try {
+    rawBody = await c.req.json()
+  } catch {
+    // empty body or non-JSON body is fine — defaults apply below
+  }
+
+  const dryRunQuery = c.req.query('dryRun') === '1'
+
+  const parse = SyncBody.safeParse(rawBody)
+  if (!parse.success) {
+    return c.json({ error: 'invalid_body', issues: parse.error.issues }, 400)
+  }
+
+  const squadId = parse.data.squadId ?? 'squad-core'
+  const dryRun = dryRunQuery || (parse.data.dryRun ?? false)
+
+  // ── fail-closed on absent bot token before any external calls ────────────
+  const botToken = getDiscordBotToken(c.env)
+  if (!botToken) {
+    return c.json({ error: 'no_discord_token', hint: 'DISCORD_BOT_TOKEN not configured' }, 503)
+  }
+
+  // ── step 1: resolve guild id from the squad's bound Discord channel ───────
+  const binding = await c.env.DB.prepare(
+    `SELECT external_channel_id
+       FROM channel_bindings
+      WHERE platform = 'discord' AND squad_id = ?1
+      LIMIT 1`,
+  )
+    .bind(squadId)
+    .first<{ external_channel_id: string }>()
+
+  if (!binding) {
+    return c.json({ error: 'no_discord_binding', squadId }, 404)
+  }
+
+  const channelData = await discordGet(
+    c.env,
+    `/channels/${encodeURIComponent(binding.external_channel_id)}`,
+  )
+  if (!channelData || typeof channelData !== 'object') {
+    return c.json(
+      { error: 'channel_get_failed', hint: 'Discord GET /channels returned null' },
+      502,
+    )
+  }
+  const rawGuildId = (channelData as { guild_id?: unknown }).guild_id
+  if (typeof rawGuildId !== 'string' || !rawGuildId) {
+    return c.json({ error: 'no_guild_id', hint: 'Discord channel has no guild_id' }, 502)
+  }
+  const guildId = rawGuildId
+
+  // ── step 2: build roleMap; create missing managed roles (live path only) ──
+  const rolesData = await discordGet(
+    c.env,
+    `/guilds/${encodeURIComponent(guildId)}/roles`,
+  )
+  if (!Array.isArray(rolesData)) {
+    return c.json(
+      { error: 'guild_roles_get_failed', hint: 'Discord GET /guilds/roles returned null' },
+      502,
+    )
+  }
+
+  const roleMap: Record<string, string> = {}
+  for (const role of rolesData as { id?: unknown; name?: unknown }[]) {
+    const id = typeof role.id === 'string' ? role.id : null
+    const name = typeof role.name === 'string' ? role.name : null
+    if (id && name && (MANAGED_DISCORD_ROLES as readonly string[]).includes(name)) {
+      roleMap[name] = id
+    }
+  }
+
+  const rolesEnsured: string[] = []
+  for (const roleName of MANAGED_DISCORD_ROLES) {
+    if (roleMap[roleName]) {
+      rolesEnsured.push(`${roleName}:exists`)
+    } else if (dryRun) {
+      rolesEnsured.push(`${roleName}:would_create`)
+    } else {
+      // Create the missing managed role in the guild.
+      try {
+        const newRoleId = await createGuildRole(c.env, guildId, roleName)
+        roleMap[roleName] = newRoleId
+        rolesEnsured.push(`${roleName}:created`)
+      } catch (err) {
+        // createGuildRole throws status-only messages (e.g. "discord: createGuildRole failed (403)").
+        // We extract the numeric HTTP status and return ONLY {error, role, status} — no upstream
+        // response body, no raw error string, no detail that could carry injected content.
+        const msg = err instanceof Error ? err.message : String(err)
+        const statusMatch = /\((\d+)\)/.exec(msg)
+        const status = statusMatch ? statusMatch[1] : 'unknown'
+        return c.json({ error: 'role_create_failed', role: roleName, status }, 502)
+      }
+    }
+  }
+
+  // ── step 3: project per discord-linked member ─────────────────────────────
+  const identityRows = await c.env.DB.prepare(
+    `SELECT member_id FROM member_identities WHERE platform = 'discord'`,
+  ).all<{ member_id: string }>()
+
+  const projections: ProjectionEntry[] = []
+
+  for (const { member_id } of identityRows.results ?? []) {
+    // Dry-run: inject no-op add/remove so nothing mutates on Discord.
+    // The production discordGet (GET member roles) still runs so we can report
+    // what WOULD be added/removed — making the dry-run output meaningful.
+    const inject = dryRun
+      ? {
+          addRoleFn: async (_g: string, _u: string, _r: string): Promise<void> => {},
+          removeRoleFn: async (_g: string, _u: string, _r: string): Promise<void> => {},
+        }
+      : undefined
+
+    const result = await projectMemberCapabilitiesToDiscord(
+      c.env,
+      member_id,
+      guildId,
+      roleMap,
+      inject,
+    )
+
+    if (result.ok) {
+      projections.push({
+        memberId: member_id,
+        ok: true,
+        targetRole: result.targetRole,
+        added: result.added,
+        removed: result.removed,
+      })
+    } else {
+      projections.push({
+        memberId: member_id,
+        ok: false,
+        reason: result.reason,
+      })
+    }
+  }
+
+  // ── outcome: fail-CLOSED reporting (BLOCK-1 fix) ─────────────────────────
+  // ok:true + 200 ONLY when every projection succeeded (or zero linked members).
+  // Any per-member failure → ok:false + 207 Multi-Status with a `failed` summary.
+  // The caller must check ok and inspect `failed` — they cannot assume a 200 means
+  // "all members synced". This is not a soft warning: a failed member means Discord
+  // roles may diverge from mupot capabilities for that principal.
+
+  if (projections.length === 0) {
+    // Explicitly signal zero linked members so the caller knows the sync ran but
+    // had no targets (common during initial setup before any /link codes are used).
+    return c.json({ ok: true, projected: 0, guildId, rolesEnsured, projections }, 200)
+  }
+
+  const failed = projections
+    .filter((p): p is ProjectionEntry & { ok: false; reason: string } => !p.ok)
+    .map((p) => ({ memberId: p.memberId, reason: p.reason }))
+
+  if (failed.length > 0) {
+    // 207 Multi-Status: some operations succeeded, some failed. Caller gets the full
+    // projections array for detail and a `failed` summary for quick triage.
+    return c.json({ ok: false, guildId, rolesEnsured, projections, failed }, 207)
+  }
+
+  return c.json({ ok: true, projected: projections.length, guildId, rolesEnsured, projections }, 200)
 })
