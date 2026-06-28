@@ -24,8 +24,7 @@
 import type { Env, BusEvent } from '../types'
 import { hasCapability } from '../auth/capability'
 import { createDepartment, createSquad, createAgent } from '../org/service'
-import { mintRawToken, sha256Hex } from '../members/service'
-import { assertBatchWritten } from '../lib/receipt'
+import { mintAgentBoundToken } from '../members/service'
 import { mcpEndpoint, wakeContractForAgent } from '../dashboard/connect'
 import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
@@ -274,43 +273,13 @@ const toolMintAgentToken: ToolSpec = {
     // member-supplied free field on a credential write; bound it to 64 chars.
     const label = (str(args.label) ?? agent.slug).trim().slice(0, 64)
 
-    // ATOMIC mint (kasra-review: was 3 sequential writes → orphan-on-partial-failure).
-    // member + capability + token go in ONE D1 batch (a transaction): either all three
-    // land or none do — no member without a grant, no grant without a token. We compose
-    // the token row inline using the SAME security primitives as the single mint path
-    // (mintRawToken + sha256Hex from members/service) so the discipline is preserved:
-    // only the hash is stored, the raw is returned exactly once.
-    const memberId = crypto.randomUUID()
-    const tokenId = crypto.randomUUID()
-    const rawToken = mintRawToken()
-    const tokenHash = await sha256Hex(rawToken)
-    const createdAt = new Date().toISOString()
+    // Delegate to the shared atomic-mint helper (members/service.ts).
+    // Three rows in ONE D1 batch: member envelope + escalation-guard capability +
+    // agent-weld token. Either all three land or none do — no orphan credentials.
+    // The helper enforces: squad-scoped 'member' only, hash-only storage, show-once raw.
+    const minted = await mintAgentBoundToken(env, agent, label)
 
-    const mintWrites = await env.DB.batch([
-      // 1) dedicated member envelope for the agent (no email, no IM — it is not a human).
-      env.DB.prepare(
-        `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ).bind(memberId, null, agent.name, null, 'active', createdAt, env.TENANT_SLUG),
-      // 2) THE ESCALATION GUARD: squad-scoped 'member' on the agent's OWN squad only.
-      //    Hard-coded scope + capability — never widened from args, never inherits the
-      //    operator's standing. The agent token's authority is exactly this one row.
-      env.DB.prepare(
-        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         VALUES (?, ?, 'squad', ?, 'member')`,
-      ).bind(crypto.randomUUID(), memberId, agent.squad_id),
-      // 3) the weld: bind the token to the agent (agent_id set). Only the hash is stored.
-      env.DB.prepare(
-        `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id)
-         VALUES (?, ?, ?, ?, 'workspace', ?, ?)`,
-      ).bind(tokenId, memberId, tokenHash, label, createdAt, agent.id),
-    ])
-    // Receipt (#186): all three rows must land. A partial mint — e.g. the token row
-    // without its capability row — would hand out a show-once token bound to a broken
-    // identity. Verify before returning `raw` (a 0-row INSERT does not throw on its own).
-    assertBatchWritten(mintWrites, 'mint_agent_token', 1)
-
-    await emitProvisioned(env, auth.memberId as string, 'token', tokenId, {
+    await emitProvisioned(env, auth.memberId as string, 'token', minted.tokenId, {
       squad_id: agent.squad_id,
       agent_id: agent.id,
     })
@@ -324,13 +293,13 @@ const toolMintAgentToken: ToolSpec = {
     // self-serve picture in one flow — no manual tmux or shell access required.
     return done({
       token: {
-        id: tokenId,
-        member_id: memberId,
+        id: minted.tokenId,
+        member_id: minted.memberId,
         agent_id: agent.id,
         label,
         channel: 'workspace',
-        created_at: createdAt,
-        raw: rawToken,
+        created_at: minted.createdAt,
+        raw: minted.raw,
       },
       agent: { id: agent.id, slug: agent.slug, name: agent.name },
       mcp_endpoint: mcpEndpoint(ctx.origin),

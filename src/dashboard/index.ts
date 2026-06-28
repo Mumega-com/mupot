@@ -56,6 +56,11 @@ import type { MintedToken, PublicMemberToken } from '../members/service'
 import { loadKeysView, mintScopedKey, keysPageBody, keysMintedBody } from './keys'
 import { findPreset, isValidPresetId } from '../auth/role-presets'
 
+// Agent-bound token mint UI.
+import { loadAgentTokenView, agentTokenPageBody, agentTokenMintedBody } from './agent-token'
+import { mintAgentBoundToken } from '../members/service'
+import { resolveAgentRef } from '../org/resolve'
+
 // Connect-config builders (pure) for the Connect card.
 import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
 import { loadApprovals, resultPreview } from './approvals'
@@ -859,6 +864,103 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
       c.env.BRAND,
       'Key provisioned',
       keysMintedBody(memberName, result.label, preset.label, result.raw, result.grantUnchanged),
+    ),
+  )
+})
+
+// ── agent-bound token mint ───────────────────────────────────────────────────
+//
+// Distinct from the operator token mint at POST /members/:id/tokens (which mints a
+// NULL-bound token for a HUMAN member). This path mints a token whose
+// member_tokens.agent_id is set to the chosen agent — required by /attach.
+//
+// GET /admin/agent-token — agent picker form (org-admin only).
+// POST /admin/agent-token/mint — mints via the shared mintAgentBoundToken helper,
+//   shows the raw token EXACTLY ONCE (no redirect, Cache-Control: no-store).
+//
+// Security:
+//   - Both routes check isAdmin before any DB access.
+//   - CSRF middleware covers the POST (applied dashboard-wide above).
+//   - agent is validated against the pot's own agents table — not a free-form string.
+//   - mintAgentBoundToken enforces the escalation guard and batch atomicity.
+//   - Raw token rendered once; never persisted or logged anywhere.
+
+// GET /admin/agent-token
+dashboardApp.get('/admin/agent-token', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(
+      shell(c.env.BRAND, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
+      403,
+    )
+  }
+  const view = await loadAgentTokenView(c.env)
+  return c.html(shell(c.env.BRAND, 'Mint agent token', agentTokenPageBody(view)))
+})
+
+// POST /admin/agent-token/mint
+dashboardApp.post('/admin/agent-token/mint', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(
+      shell(c.env.BRAND, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
+      403,
+    )
+  }
+
+  const form = await c.req.parseBody()
+  const agentIdRaw = typeof form.agent_id === 'string' ? form.agent_id.trim() : ''
+  const labelRaw   = typeof form.label    === 'string' ? form.label.trim()    : ''
+
+  if (!agentIdRaw) {
+    const view = await loadAgentTokenView(c.env)
+    return c.html(
+      shell(c.env.BRAND, 'Mint agent token', agentTokenPageBody(view, 'Pick an agent.')),
+      400,
+    )
+  }
+  if (labelRaw.length > 64) {
+    const view = await loadAgentTokenView(c.env)
+    return c.html(
+      shell(c.env.BRAND, 'Mint agent token', agentTokenPageBody(view, 'Label too long (max 64 chars).')),
+      400,
+    )
+  }
+
+  // Validate agent against the pot's own agents table (resolveAgentRef: id-first,
+  // slug-with-ambiguity-refusal). A free-form string from the form is NOT trusted.
+  const agentResult = await resolveAgentRef(c.env, agentIdRaw)
+  if (!agentResult.ok) {
+    const view = await loadAgentTokenView(c.env)
+    const msg = agentResult.reason === 'ambiguous'
+      ? 'Agent slug is ambiguous — use the agent id instead.'
+      : 'Agent not found in this pot.'
+    const status = agentResult.reason === 'ambiguous' ? 409 : 404
+    return c.html(
+      shell(c.env.BRAND, 'Mint agent token', agentTokenPageBody(view, msg)),
+      status,
+    )
+  }
+  const agent = agentResult.value
+
+  // Delegate to the shared atomic-mint helper.
+  // Three rows in ONE D1 batch: member envelope + escalation-guard capability +
+  // agent-weld token. Same path the MCP mint_agent_token tool uses.
+  const minted = await mintAgentBoundToken(c.env, agent, labelRaw)
+
+  // Look up the squad name for the show-once page.
+  const squadRow = await c.env.DB.prepare('SELECT name FROM squads WHERE id = ?1 LIMIT 1')
+    .bind(agent.squad_id)
+    .first<{ name: string }>()
+
+  // Render ONCE — do NOT redirect (raw must not survive past this response).
+  // Cache-Control: no-store and Referrer-Policy: no-referrer are set by the
+  // dashboard-wide middleware above.
+  return c.html(
+    shell(
+      c.env.BRAND,
+      'Agent token minted',
+      agentTokenMintedBody(agent.name, agent.slug, squadRow?.name ?? null, minted.raw, minted.tokenId),
     ),
   )
 })
@@ -3811,11 +3913,20 @@ function membersPageBody(
       sub:
         'A token is what a person pastes into their workspace config (see the Connect card). Provision one below — it is shown exactly once.',
     })}
+    <div class="card" style="padding:12px 18px;margin-bottom:16px;background:var(--surface2)">
+      <p style="margin:0;font-size:13px;color:var(--muted)">
+        <strong>Operator tokens (this page)</strong> — NULL-bound; for humans and operator
+        harnesses. Not accepted by the <code class="inline">/attach</code> endpoint.<br/>
+        <strong>Agent tokens</strong> — bound to a specific agent runtime; required for
+        <code class="inline">/attach</code>.
+        ${canManage ? raw('<a href="/admin/agent-token" class="btn secondary sm" style="margin-left:10px;vertical-align:middle">Mint agent token</a>') : raw('')}
+      </p>
+    </div>
     <div class="card" style="padding:0">
       <table class="grid">
         <thead>
           <tr><th>Person</th><th>Channels</th><th>Tokens</th>${
-            canManage ? raw('<th>Provision</th>') : raw('')
+            canManage ? raw('<th>Provision operator token</th>') : raw('')
           }</tr>
         </thead>
         <tbody>${raw(rows)}</tbody>
