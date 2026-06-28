@@ -93,12 +93,24 @@ function validReport(a: unknown): FleetAgentReport | null {
   return { agent_id: r.agent_id, display: cleanStr(r.display), runtime, squads, lifecycle, provider_contract: pc, status: r.status, agent_type, member_id }
 }
 
+/** Backfill tenant on any members row whose tenant is NULL. Idempotent — WHERE tenant IS NULL
+ *  ensures only untagged rows are updated; subsequent calls are cheap no-ops. Run lazily before
+ *  any tenant-scoped member check or join so pre-migration rows (Hadi + squad seed members) pick
+ *  up env.TENANT_SLUG before the scoped query executes. Sterile-pot safe: the slug comes from
+ *  the runtime env, never a hardcoded literal. */
+async function backfillMemberTenant(env: Env): Promise<void> {
+  await env.DB.prepare('UPDATE members SET tenant = ?1 WHERE tenant IS NULL')
+    .bind(env.TENANT_SLUG)
+    .run()
+}
+
 /** Upsert the reported agents. Rejects a malformed batch wholesale (all-or-nothing on validation),
  *  caps the count, and records which agent reported. Returns the number upserted.
  *
- *  member_id validation (fail-closed): if a report sets member_id, the referenced member MUST
- *  exist in the members table — the entire batch is rejected if any member_id is unknown. This
- *  prevents stale or forged identity links from silently landing in the registry. */
+ *  member_id validation (fail-closed, tenant-scoped): if a report sets member_id, the referenced
+ *  member MUST exist in THIS TENANT's members. An unknown or other-tenant member_id rejects the
+ *  entire batch (BLOCK-1: prevents cross-tenant identity links from landing in the registry). The
+ *  lazy backfill runs first so pre-migration NULL-tenant rows are scoped before the check. */
 export async function reportFleetAgents(env: Env, reportedBy: string, agents: unknown): Promise<ReportResult> {
   if (!env.TENANT_SLUG) return { ok: false, reason: 'no_tenant' }
   if (!Array.isArray(agents)) return { ok: false, reason: 'agents must be an array' }
@@ -109,11 +121,15 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
     if (!v) return { ok: false, reason: 'invalid agent in batch' } // fail the batch, never silently drop
     valid.push(v)
   }
-  // member_id existence check: validate ALL member_ids before any writes (fail-closed).
+  // Lazy backfill: stamp any NULL-tenant member rows before the tenant-scoped existence check.
+  if (valid.some((v) => v.member_id)) {
+    await backfillMemberTenant(env)
+  }
+  // member_id existence check: TENANT-SCOPED (fail-closed). Unknown or other-tenant → reject batch.
   for (const v of valid) {
     if (v.member_id) {
-      const exists = await env.DB.prepare('SELECT 1 FROM members WHERE id = ?1 LIMIT 1')
-        .bind(v.member_id)
+      const exists = await env.DB.prepare('SELECT 1 FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1')
+        .bind(v.member_id, env.TENANT_SLUG)
         .first<{ 1: number }>()
       if (!exists) return { ok: false, reason: `member_id not found: ${v.member_id}` }
     }
@@ -162,22 +178,30 @@ export async function listFleetAgents(env: Env): Promise<FleetAgentRow[]> {
  * then resolve capabilities per linked member. Returns the canonical agent record
  * for the dashboard and #agent-bus feed (admin-gated; tenant-scoped).
  *
+ * The JOIN is TENANT-BOUND (BLOCK-1 fix): `m.tenant = fa.tenant` ensures that in a
+ * future shared-DB fork, a fleet row can only expose the member that belongs to the
+ * SAME tenant, never a cross-tenant identity. The lazy backfill stamps pre-migration
+ * NULL-tenant rows before the JOIN so existing members are visible immediately.
+ *
  * SQL shape:
  *   SELECT fa.agent_id, fa.agent_type, fa.runtime, fa.status, fa.lifecycle,
  *          fa.last_reported_at, fa.member_id,
  *          m.id AS m_id, m.email AS m_email, m.display_name AS m_display
  *   FROM fleet_agents fa
- *   LEFT JOIN members m ON m.id = fa.member_id
+ *   LEFT JOIN members m ON m.id = fa.member_id AND m.tenant = fa.tenant
  *   WHERE fa.tenant = ?1
  *   ORDER BY fa.agent_id ASC
  */
 export async function getAgentView(env: Env): Promise<AgentView[]> {
+  // Lazy backfill: stamp any NULL-tenant member rows before the tenant-bound JOIN runs.
+  await backfillMemberTenant(env)
+
   const rows = await env.DB.prepare(
     `SELECT fa.agent_id, fa.agent_type, fa.runtime, fa.status, fa.lifecycle,
             fa.last_reported_at, fa.member_id,
             m.id AS m_id, m.email AS m_email, m.display_name AS m_display
        FROM fleet_agents fa
-       LEFT JOIN members m ON m.id = fa.member_id
+       LEFT JOIN members m ON m.id = fa.member_id AND m.tenant = fa.tenant
       WHERE fa.tenant = ?1
       ORDER BY fa.agent_id ASC`,
   )

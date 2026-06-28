@@ -1,0 +1,22 @@
+-- 0040_members_tenant.sql — add tenant column to members for cross-tenant isolation.
+--
+-- Motivation: fleet_agents.member_id is a soft-FK to members.id. Without a tenant
+-- constraint on the members side, a shared-DB / future multi-tenant fork could allow
+-- tenant-A fleet rows to attach tenant-B member identities and expose those members +
+-- their capabilities via GET /api/fleet/agents (BLOCK-1, dyad gate RED).
+--
+-- Design (sterile-pot safe — this migration ships in every fork):
+--   - Column is NULLABLE with NO DEFAULT and NO hardcoded backfill here.
+--     A `DEFAULT 'mumega'` or a SET clause would bake a literal slug into every
+--     fork of the pot, violating the sterile-pot / no-hardcoded-state contract.
+--   - Lazy, idempotent app-level backfill: reportFleetAgents and getAgentView both
+--     run `UPDATE members SET tenant=?1 WHERE tenant IS NULL` bound to env.TENANT_SLUG
+--     before any tenant-scoped check or join executes. Existing rows (e.g. Hadi +
+--     the 5 squad seed members) get this pot's slug on the first fleet call.
+--   - New INSERT paths (provision.ts, oauth-authorize.ts, members/index.ts,
+--     members/squad-seed.ts) write tenant=env.TENANT_SLUG at creation time so all
+--     future rows are tenant-tagged from day one.
+--
+-- Single-apply migration — SQLite does not support ADD COLUMN IF NOT EXISTS.
+
+ALTER TABLE members ADD COLUMN tenant TEXT;

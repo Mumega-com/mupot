@@ -202,7 +202,7 @@ membersApp.post('/invites/:id/accept', async (c) => {
   try {
     const acceptWrites = await c.env.DB.batch([
       c.env.DB.prepare(
-        'INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant) VALUES (?, ?, ?, ?, ?, ?, ?)',
       ).bind(
         member.id,
         member.email,
@@ -210,6 +210,7 @@ membersApp.post('/invites/:id/accept', async (c) => {
         member.telegram_chat_id,
         member.status,
         member.created_at,
+        c.env.TENANT_SLUG,
       ),
       c.env.DB.prepare(
         'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)',

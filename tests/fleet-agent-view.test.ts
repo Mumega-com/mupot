@@ -2,13 +2,12 @@
 //
 // Tests:
 //  - reportFleetAgents: persists agent_type + member_id; defaults agent_type to 'generic'; rejects
-//    unknown agent_type; rejects member_id that doesn't exist (fail-closed); null member_id OK.
-//  - getAgentView: LEFT JOIN runtime + identity + capabilities; member_id null → member:null +
-//    capabilities:[]; tenant-scoped (no cross-tenant rows).
+//    unknown agent_type; rejects member_id that doesn't exist or belongs to another tenant (fail-closed);
+//    null member_id OK; lazy backfill stamps NULL-tenant members before existence check.
+//  - getAgentView: LEFT JOIN runtime + identity + capabilities (tenant-bound); member_id null →
+//    member:null; cross-tenant member_id → member:null (BLOCK-1 fix); backfill → NULL-tenant member
+//    gets this pot's slug and then joins correctly.
 //  - GET /api/fleet/agents: admin → 200 unified list; non-admin token → 403; no token → 401.
-//
-// Existing fleet/registry/control tests remain in fleet-registry.test.ts — this file only covers
-// the new unified-view surface.
 
 import { describe, it, expect, beforeAll } from 'vitest'
 import { reportFleetAgents, getAgentView } from '../src/fleet/registry'
@@ -29,7 +28,9 @@ interface FleetRow {
   last_reported_at: string; agent_type: string; member_id: string | null
 }
 
-interface MemberRow { id: string; email: string | null; display_name: string }
+// tenant is nullable — migration 0040 adds it as nullable, and NULL is the
+// pre-migration state. The lazy backfill sets it from env.TENANT_SLUG at runtime.
+interface MemberRow { id: string; email: string | null; display_name: string; tenant: string | null }
 interface CapRow { member_id: string; scope_type: string; scope_id: string | null; capability: string }
 interface TokenRow { member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null }
 
@@ -41,7 +42,8 @@ interface MockDbOpts {
 
 function makeDb(opts: MockDbOpts = {}) {
   const fleet = new Map<string, FleetRow>()
-  const members: MemberRow[] = opts.members ?? []
+  // Members are mutable so the lazy backfill UPDATE can set tenant on NULL rows.
+  const members: MemberRow[] = [...(opts.members ?? [])]
   const caps: CapRow[] = opts.caps ?? []
   const tokens: Record<string, TokenRow> = opts.tokens ?? {}
 
@@ -50,22 +52,24 @@ function makeDb(opts: MockDbOpts = {}) {
     if (sql.includes('FROM member_tokens t')) {
       return tokens[b[0] as string] ?? null
     }
-    // member_id existence check
+    // member_id existence check — TENANT-SCOPED (BLOCK-1 fix: ?1=id, ?2=tenant)
     if (sql.includes('FROM members WHERE id')) {
-      const [id] = b as [string]
-      const found = members.find((m) => m.id === id)
+      const [id, tenant] = b as [string, string]
+      const found = members.find((m) => m.id === id && m.tenant === tenant)
       return found ? { 1: 1 } : null
     }
     throw new Error('unhandled first: ' + sql)
   }
 
   function all(sql: string, b: unknown[]) {
-    // getAgentView — LEFT JOIN query
+    // getAgentView — LEFT JOIN with tenant-bound join condition (BLOCK-1 fix)
     if (sql.includes('LEFT JOIN members m ON m.id')) {
       const [tenant] = b as [string]
       const rows = [...fleet.values()].filter((r) => r.tenant === tenant).sort((x, y) => x.agent_id < y.agent_id ? -1 : 1)
       return rows.map((r) => {
-        const m = r.member_id ? members.find((x) => x.id === r.member_id) : undefined
+        // The JOIN condition is `m.id = fa.member_id AND m.tenant = fa.tenant`.
+        // A cross-tenant member (tenant='other' vs fa.tenant='t') does NOT join.
+        const m = r.member_id ? members.find((x) => x.id === r.member_id && x.tenant === r.tenant) : undefined
         return {
           agent_id: r.agent_id,
           agent_type: r.agent_type,
@@ -80,7 +84,7 @@ function makeDb(opts: MockDbOpts = {}) {
         }
       })
     }
-    // listFleetAgents (used by the /report test path via existing tests — kept for compat)
+    // listFleetAgents (kept for compat)
     if (sql.includes('FROM fleet_agents WHERE tenant')) {
       const [tenant] = b as [string]
       return [...fleet.values()].filter((r) => r.tenant === tenant).sort((x, y) => x.agent_id < y.agent_id ? -1 : 1)
@@ -108,11 +112,23 @@ function makeDb(opts: MockDbOpts = {}) {
       })
       return { meta: { changes: 1 } }
     }
+    // Lazy backfill (0040): set tenant on NULL-tenant members from env.TENANT_SLUG.
+    // Idempotent — only rows where tenant IS NULL are updated; already-tagged rows (including
+    // cross-tenant members tagged 'other') are not touched.
+    if (sql.includes('UPDATE members SET tenant')) {
+      const [tenantSlug] = b as [string]
+      let changed = 0
+      for (const m of members) {
+        if (m.tenant == null) { m.tenant = tenantSlug; changed++ }
+      }
+      return { meta: { changes: changed } }
+    }
     throw new Error('unhandled run: ' + sql)
   }
 
   const db = {
     _fleet: fleet,
+    _members: members, // exposed for direct seeding in backfill tests
     prepare(sql: string) {
       const binds: unknown[] = []
       const api = {
@@ -166,16 +182,31 @@ describe('reportFleetAgents — agent_type + member_id', () => {
     expect([...db._fleet.values()][0].member_id).toBeNull()
   })
 
-  it('persists member_id when the member exists', async () => {
-    const db = makeDb({ members: [{ id: 'm-kasra', email: 'kasra@mumega.com', display_name: 'Kasra' }] })
+  it('persists member_id when the member exists in this tenant (backfill + tenant-scoped check)', async () => {
+    // Member starts with null tenant — the lazy backfill stamps it with TENANT_SLUG='t'
+    // before the tenant-scoped existence check runs, so it is found.
+    const db = makeDb({ members: [{ id: 'm-kasra', email: 'kasra@mumega.com', display_name: 'Kasra', tenant: null }] })
     const r = await reportFleetAgents(env(db), 'fleet-consumer', [{ ...BASE, member_id: 'm-kasra' }])
     expect(r).toEqual({ ok: true, count: 1 })
     expect([...db._fleet.values()][0].member_id).toBe('m-kasra')
+    // Backfill side-effect: the member's tenant is now 't'
+    expect(db._members.find((m) => m.id === 'm-kasra')?.tenant).toBe('t')
   })
 
-  it('rejects the batch when member_id does not exist (fail-closed)', async () => {
+  it('rejects the batch when member_id does not exist in this tenant (fail-closed)', async () => {
     const db = makeDb() // no members seeded
     const r = await reportFleetAgents(env(db), 'fleet-consumer', [{ ...BASE, member_id: 'm-ghost' }])
+    expect(r.ok).toBe(false)
+    expect((r as { ok: false; reason: string }).reason).toMatch(/member_id not found/)
+    expect(db._fleet.size).toBe(0)
+  })
+
+  // BLOCK-1 fix: a member tagged to a DIFFERENT tenant must be rejected.
+  it('rejects the batch when member_id belongs to a different tenant (BLOCK-1)', async () => {
+    // Pre-tag this member as 'other' — the backfill only touches NULL-tenant rows, so
+    // 'other' is preserved and the tenant-scoped check (AND tenant='t') finds nothing.
+    const db = makeDb({ members: [{ id: 'm-other', email: 'x@other.com', display_name: 'Other', tenant: 'other' }] })
+    const r = await reportFleetAgents(env(db, { TENANT_SLUG: 't' }), 'fleet-consumer', [{ ...BASE, member_id: 'm-other' }])
     expect(r.ok).toBe(false)
     expect((r as { ok: false; reason: string }).reason).toMatch(/member_id not found/)
     expect(db._fleet.size).toBe(0)
@@ -207,7 +238,9 @@ describe('getAgentView', () => {
 
   it('joins runtime + identity + capabilities when member_id is set', async () => {
     const db = makeDb({
-      members: [{ id: 'm-kasra', email: 'kasra@mumega.com', display_name: 'Kasra' }],
+      // Member seeded with null tenant — backfill in reportFleetAgents (triggered by member_id)
+      // sets it to 't' so both the existence check and the subsequent LEFT JOIN match.
+      members: [{ id: 'm-kasra', email: 'kasra@mumega.com', display_name: 'Kasra', tenant: null }],
       caps: [
         { member_id: 'm-kasra', scope_type: 'org', scope_id: null, capability: 'admin' },
         { member_id: 'm-kasra', scope_type: 'squad', scope_id: 'sq-build', capability: 'lead' },
@@ -227,7 +260,53 @@ describe('getAgentView', () => {
     expect(v.capabilities).toContainEqual({ scope_type: 'squad', scope_id: 'sq-build', capability: 'lead' })
   })
 
-  it('is tenant-scoped: tenant A rows are not visible to tenant B', async () => {
+  // BLOCK-1 fix: a fleet row whose member_id points to a DIFFERENT-TENANT member must
+  // surface member:null (no cross-tenant identity leak through the unified view).
+  it('cross-tenant member_id → member:null, capabilities:[] (BLOCK-1)', async () => {
+    // Directly seed a fleet row referencing 'm-other' under tenant='t'.
+    // The member 'm-other' exists but is tagged tenant='other', so the
+    // tenant-bound LEFT JOIN (AND m.tenant = fa.tenant) finds nothing.
+    const db = makeDb({
+      members: [{ id: 'm-other', email: 'x@other.com', display_name: 'Other', tenant: 'other' }],
+    })
+    // Seed fleet row directly (bypassing the existence check in reportFleetAgents so we can
+    // test getAgentView's own isolation even if the row somehow landed without the check).
+    db._fleet.set('t:kasra', {
+      agent_id: 'kasra', tenant: 't', display: 'Kasra', runtime: 'claude-code', squads: '[]',
+      lifecycle: 'always_on', provider_contract: null, status: 'running', reported_by: 'fc',
+      last_reported_at: 'now', agent_type: 'builder', member_id: 'm-other',
+    })
+    const views = await getAgentView(env(db, { TENANT_SLUG: 't' }))
+    expect(views).toHaveLength(1)
+    // Cross-tenant member MUST NOT be exposed.
+    expect(views[0].member).toBeNull()
+    expect(views[0].capabilities).toEqual([])
+  })
+
+  // BLOCK-1 fix (backfill path): a pre-migration member with tenant=NULL gets stamped
+  // with env.TENANT_SLUG by the lazy backfill, then joins correctly.
+  it('NULL-tenant member is backfilled and joins correctly (backfill path)', async () => {
+    const db = makeDb({
+      members: [{ id: 'm-kasra', email: 'kasra@mumega.com', display_name: 'Kasra', tenant: null }],
+    })
+    // Seed fleet row directly — member_id is set but tenant is null on the member.
+    db._fleet.set('t:kasra', {
+      agent_id: 'kasra', tenant: 't', display: 'Kasra', runtime: 'claude-code', squads: '[]',
+      lifecycle: 'always_on', provider_contract: null, status: 'running', reported_by: 'fc',
+      last_reported_at: 'now', agent_type: 'builder', member_id: 'm-kasra',
+    })
+    // Before getAgentView: member has null tenant (not joined yet).
+    expect(db._members.find((m) => m.id === 'm-kasra')?.tenant).toBeNull()
+
+    const views = await getAgentView(env(db, { TENANT_SLUG: 't' }))
+
+    // After getAgentView: backfill ran → member now has tenant='t'.
+    expect(db._members.find((m) => m.id === 'm-kasra')?.tenant).toBe('t')
+    // The LEFT JOIN (AND m.tenant = fa.tenant = 't') now matches → member is joined.
+    expect(views[0].member).toEqual({ id: 'm-kasra', email: 'kasra@mumega.com', display_name: 'Kasra' })
+  })
+
+  it('is tenant-scoped: tenant A fleet rows are not visible to tenant B', async () => {
     const db = makeDb()
     await reportFleetAgents(env(db, { TENANT_SLUG: 'tA' }), 'fc', [{ ...BASE }])
     await reportFleetAgents(env(db, { TENANT_SLUG: 'tB' }), 'fc', [{ agent_id: 'loom', status: 'running' }])
@@ -251,8 +330,10 @@ beforeAll(async () => {
 })
 
 function routeDb() {
+  // m-admin seeded with null tenant — the lazy backfill in getAgentView stamps it with 't'
+  // before the LEFT JOIN runs, so the member is visible in the unified view.
   return makeDb({
-    members: [{ id: 'm-admin', email: 'admin@x.com', display_name: 'Admin' }],
+    members: [{ id: 'm-admin', email: 'admin@x.com', display_name: 'Admin', tenant: null }],
     caps: [
       { member_id: 'm-admin', scope_type: 'org', scope_id: null, capability: 'admin' },
     ],
@@ -279,9 +360,11 @@ describe('GET /api/fleet/agents', () => {
     expect((await get(routeDb(), MEMBER_TOKEN)).status).toBe(403)
   })
 
-  it('200 for an admin token returning the unified agent list', async () => {
+  it('200 for an admin token returning the unified agent list with joined member', async () => {
     const db = routeDb()
-    // Seed an agent
+    // Seed an agent with member_id='m-admin' (which starts null-tenant; backfill will tag it 't')
+    // The backfill in reportFleetAgents runs first: m-admin.tenant becomes 't'.
+    // Then the existence check (AND tenant='t') passes, and the fleet row is written.
     await reportFleetAgents(env(db), 'fleet-consumer', [{ ...BASE, agent_type: 'builder', member_id: 'm-admin' }])
     const res = await get(db, ADMIN_TOKEN)
     expect(res.status).toBe(200)

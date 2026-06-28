@@ -59,6 +59,8 @@ function makeDb(tokens: Record<string, TokenRow> = {}, caps: Record<string, CapR
       })
       return { meta: { changes: 1 } }
     }
+    // Lazy backfill (0040): idempotent no-op in this mock (no members seeded in fleet-registry tests)
+    if (sql.includes('UPDATE members SET tenant')) return { meta: { changes: 0 } }
     throw new Error('unhandled run: ' + sql)
   }
   const db = {

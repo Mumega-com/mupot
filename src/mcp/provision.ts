@@ -289,9 +289,9 @@ const toolMintAgentToken: ToolSpec = {
     const mintWrites = await env.DB.batch([
       // 1) dedicated member envelope for the agent (no email, no IM — it is not a human).
       env.DB.prepare(
-        `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      ).bind(memberId, null, agent.name, null, 'active', createdAt),
+        `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(memberId, null, agent.name, null, 'active', createdAt, env.TENANT_SLUG),
       // 2) THE ESCALATION GUARD: squad-scoped 'member' on the agent's OWN squad only.
       //    Hard-coded scope + capability — never widened from args, never inherits the
       //    operator's standing. The agent token's authority is exactly this one row.

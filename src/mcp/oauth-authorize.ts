@@ -105,9 +105,9 @@ async function findOrCreateMember(
 
   const memberId = crypto.randomUUID()
   await env.DB.prepare(
-    `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at)
-     VALUES (?1, ?2, ?3, NULL, 'active', datetime('now'))`,
-  ).bind(memberId, email, displayName.trim().slice(0, 128) || email).run()
+    `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
+     VALUES (?1, ?2, ?3, NULL, 'active', datetime('now'), ?4)`,
+  ).bind(memberId, email, displayName.trim().slice(0, 128) || email, env.TENANT_SLUG).run()
   return memberId
 }
 
