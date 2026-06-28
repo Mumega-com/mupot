@@ -34,6 +34,16 @@ function discordSecrets(env: Env): DiscordSecrets {
   return env as unknown as DiscordSecrets
 }
 
+/**
+ * getDiscordBotToken — surface the bot token (or undefined if absent).
+ * Exported so callers (e.g. discord-cap-sync) can check token presence before
+ * making API calls, enabling explicit fail-closed behaviour instead of treating
+ * a missing token as an empty role set.
+ */
+export function getDiscordBotToken(env: Env): string | undefined {
+  return discordSecrets(env).DISCORD_BOT_TOKEN
+}
+
 const DISCORD_API = 'https://discord.com/api/v10'
 
 // ── Ed25519 verification (Web Crypto, fail-closed) ────────────────────────────
@@ -411,7 +421,16 @@ interface DiscordGuildMember {
   user?: DiscordUser | null
 }
 
-async function discordGet(env: Env, path: string): Promise<unknown | null> {
+/**
+ * discordGet — authenticated GET against the Discord API with the bot token.
+ * Exported so discord-cap-sync can use it as the production default for fetching
+ * guild member role data in the capability→role projection (BLOCK-2 fix: the sync
+ * must use the real GET on the live path so stale roles are actually removed).
+ * Returns null on any error (token absent, non-2xx, parse failure) — fail-soft so
+ * a transient Discord outage does not wedge reconciliation. Callers must treat
+ * null as "no data" and handle accordingly (see discord-cap-sync.ts).
+ */
+export async function discordGet(env: Env, path: string): Promise<unknown | null> {
   const token = discordSecrets(env).DISCORD_BOT_TOKEN
   if (!token) return null
   const res = await fetch(`${DISCORD_API}${path}`, {
@@ -544,6 +563,83 @@ async function roleCapability(
     if (cap && (best === null || capRank(cap) > capRank(best))) best = cap
   }
   return best
+}
+
+// ── role writes (Slice B: capability → Discord role projection) ───────────────
+// mupot is master; Discord roles are a ONE-WAY projection of mupot capabilities.
+// These helpers are NOT exposed on the ChannelAdapter interface (the core never
+// writes roles — that is a projection concern). They are exported for use by the
+// discord-cap-sync module only. The bot token never appears in a log or error.
+//
+// Discord REST endpoints:
+//   PUT    /guilds/{guildId}/members/{userId}/roles/{roleId}  → add role (204)
+//   DELETE /guilds/{guildId}/members/{userId}/roles/{roleId}  → remove role (204)
+// Both return 204 No Content on success and have no body to parse.
+
+/**
+ * addMemberRole — PUT /guilds/{guildId}/members/{userId}/roles/{roleId}.
+ * Adds `roleId` to the Discord guild member. Idempotent (Discord ignores
+ * adding a role the member already holds). Throws on HTTP error (never on 204).
+ * The bot token is never logged or returned in the error message.
+ */
+export async function addMemberRole(
+  env: Env,
+  guildId: string,
+  discordUserId: string,
+  roleId: string,
+): Promise<void> {
+  const token = discordSecrets(env).DISCORD_BOT_TOKEN
+  if (!token) throw new Error('discord: DISCORD_BOT_TOKEN not configured')
+
+  const res = await fetch(
+    `${DISCORD_API}/guilds/${encodeURIComponent(guildId)}/members/${encodeURIComponent(discordUserId)}/roles/${encodeURIComponent(roleId)}`,
+    {
+      method: 'PUT',
+      headers: {
+        authorization: `Bot ${token}`,
+        // Discord requires Content-Length: 0 for role-add (no body)
+        'content-length': '0',
+      },
+    },
+  )
+
+  // 204 = success; 404 on an unknown guild/member is surfaced as a thrown Error.
+  // We do NOT log the status if 2xx — only surface the status for failures.
+  if (!res.ok && res.status !== 204) {
+    const detail = await res.text().catch(() => '')
+    throw new Error(`discord: addMemberRole failed (${res.status}) ${detail.slice(0, 256)}`)
+  }
+}
+
+/**
+ * removeMemberRole — DELETE /guilds/{guildId}/members/{userId}/roles/{roleId}.
+ * Removes `roleId` from the Discord guild member. Idempotent (Discord ignores
+ * removing a role the member does not hold). Throws on HTTP error.
+ * The bot token is never logged or returned in the error message.
+ */
+export async function removeMemberRole(
+  env: Env,
+  guildId: string,
+  discordUserId: string,
+  roleId: string,
+): Promise<void> {
+  const token = discordSecrets(env).DISCORD_BOT_TOKEN
+  if (!token) throw new Error('discord: DISCORD_BOT_TOKEN not configured')
+
+  const res = await fetch(
+    `${DISCORD_API}/guilds/${encodeURIComponent(guildId)}/members/${encodeURIComponent(discordUserId)}/roles/${encodeURIComponent(roleId)}`,
+    {
+      method: 'DELETE',
+      headers: {
+        authorization: `Bot ${token}`,
+      },
+    },
+  )
+
+  if (!res.ok && res.status !== 204) {
+    const detail = await res.text().catch(() => '')
+    throw new Error(`discord: removeMemberRole failed (${res.status}) ${detail.slice(0, 256)}`)
+  }
 }
 
 // ── the adapter (the only export the core sees) ───────────────────────────────
