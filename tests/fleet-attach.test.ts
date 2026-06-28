@@ -1,11 +1,13 @@
 // tests/fleet-attach.test.ts — agent self-attach / self-detach routes (Step 2a).
 //
 // Security properties under test:
-//  - member_id is ALWAYS auth-derived; a body member_id is ignored (attach).
-//  - An agent can only detach its OWN row (detach ownership gate).
-//  - No token → 401; unknown type / bad runtime → 400.
-//  - attach returns the getAgentView boot-ack shape.
-//  - All writes are tenant-scoped; cross-tenant attach/detach is structurally impossible.
+//   BLOCK-1 (strong): token.boundAgentId MUST equal body.agent_id on BOTH routes.
+//     - A token bound to 'loom' can only attach/detach agent_id='loom'.
+//     - A pure member token (boundAgentId=null) is rejected (403) on any attach/detach.
+//     - member_id is always auth-derived (body member_id silently discarded).
+//   WARN-1: body > 8 KB → 413 {error:'payload_too_large'} on both routes.
+//   Detach: WHERE member_id=auth clause as defense-in-depth (404 on member mismatch).
+//   All writes are tenant-scoped.
 
 import { describe, it, expect, beforeAll } from 'vitest'
 import { fleetAttachApp } from '../src/fleet/attach-routes'
@@ -25,7 +27,8 @@ interface FleetRow {
 }
 
 interface TokenRow {
-  member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null
+  member_id: string; display_name: string; email: string | null
+  status: string; bound_agent_id: string | null
 }
 
 interface MemberRow { id: string; email: string | null; display_name: string; tenant: string | null }
@@ -44,7 +47,6 @@ function makeDb(opts: MockOpts = {}) {
   const caps: CapRow[] = opts.caps ?? []
   const fleet = new Map<string, FleetRow>()
 
-  // Seed pre-existing fleet rows.
   for (const r of (opts.fleet ?? [])) {
     fleet.set(`${r.tenant}:${r.agent_id}`, r)
   }
@@ -61,7 +63,6 @@ function makeDb(opts: MockOpts = {}) {
   }
 
   function all(sql: string, binds: unknown[]) {
-    // getAgentView — LEFT JOIN fleet_agents ↔ members, tenant-bound.
     if (sql.includes('LEFT JOIN members m ON m.id')) {
       const [tenant] = binds as [string]
       const rows = [...fleet.values()]
@@ -79,7 +80,6 @@ function makeDb(opts: MockOpts = {}) {
         }
       })
     }
-    // resolveCapabilities
     if (sql.includes('capabilities')) {
       const [memberId] = binds as [string]
       return caps.filter((c) => c.member_id === memberId)
@@ -89,16 +89,15 @@ function makeDb(opts: MockOpts = {}) {
 
   function run(sql: string, binds: unknown[]) {
     // fleet_agents INSERT ON CONFLICT upsert (attach).
-    // The attach SQL uses SQL literals for display='', squads='[]', provider_contract=NULL,
-    // status='running'. Only 7 bound params: agent_id(?1), tenant(?2), runtime(?3),
+    // Only 7 bound params: agent_id(?1), tenant(?2), runtime(?3),
     // lifecycle(?4), reported_by(?5), agent_type(?6), member_id(?7).
+    // SQL literals: display='', squads='[]', provider_contract=NULL, status='running'.
     if (sql.includes('INSERT INTO fleet_agents')) {
       const [agent_id, tenant, runtime, lifecycle, reported_by, agent_type, member_id]
         = binds as Array<string | null>
       const key = `${tenant}:${agent_id}`
       const existing = fleet.get(key)
       if (existing) {
-        // ON CONFLICT DO UPDATE — mirrors the ON CONFLICT SET list in attach-routes.ts.
         existing.runtime = runtime!
         existing.lifecycle = lifecycle!
         existing.status = 'running'
@@ -124,16 +123,14 @@ function makeDb(opts: MockOpts = {}) {
       const [tenant, agent_id, member_id] = binds as [string, string, string]
       const key = `${tenant}:${agent_id}`
       const row = fleet.get(key)
-      if (!row || row.member_id !== member_id) {
-        return { meta: { changes: 0 } }
-      }
+      if (!row || row.member_id !== member_id) return { meta: { changes: 0 } }
       row.status = 'stopped'
       row.last_reported_at = 'now'
       row.updated_at = 'now'
       return { meta: { changes: 1 } }
     }
 
-    // Lazy backfill (stamp NULL-tenant members).
+    // Lazy backfill (getAgentView).
     if (sql.includes('UPDATE members SET tenant')) {
       const [slug] = binds as [string]
       let changed = 0
@@ -168,115 +165,142 @@ function makeEnv(db: ReturnType<typeof makeDb>, over: Partial<Env> = {}): Env {
 }
 
 // ── token fixtures ───────────────────────────────────────────────────────────────
+//
+// TOKEN_KASRA is bound to agent_id='kasra'.
+// TOKEN_LOOM  is bound to agent_id='loom'.
+// TOKEN_UNBOUND is a pure member token (no agent binding).
 
-const TOKEN_A = 'token-agent-a'
-const TOKEN_B = 'token-agent-b'
-let hashA = ''
-let hashB = ''
+const TOKEN_KASRA   = 'token-kasra'
+const TOKEN_LOOM    = 'token-loom'
+const TOKEN_UNBOUND = 'token-unbound'
+let hashKasra   = ''
+let hashLoom    = ''
+let hashUnbound = ''
 
 beforeAll(async () => {
-  hashA = await sha256Hex(TOKEN_A)
-  hashB = await sha256Hex(TOKEN_B)
+  hashKasra   = await sha256Hex(TOKEN_KASRA)
+  hashLoom    = await sha256Hex(TOKEN_LOOM)
+  hashUnbound = await sha256Hex(TOKEN_UNBOUND)
 })
 
-// Members for token fixtures.
-const MEMBER_A: MemberRow = { id: 'm-a', email: 'a@x.com', display_name: 'Agent A', tenant: 't' }
-const MEMBER_B: MemberRow = { id: 'm-b', email: 'b@x.com', display_name: 'Agent B', tenant: 't' }
+const MEMBER_KASRA: MemberRow = { id: 'm-kasra', email: 'kasra@x.com', display_name: 'Kasra', tenant: 't' }
+const MEMBER_LOOM:  MemberRow = { id: 'm-loom',  email: 'loom@x.com',  display_name: 'Loom',  tenant: 't' }
+const MEMBER_X:     MemberRow = { id: 'm-x',     email: 'x@x.com',     display_name: 'X',     tenant: 't' }
 
 function defaultDb(): ReturnType<typeof makeDb> {
   return makeDb({
-    members: [MEMBER_A, MEMBER_B],
+    members: [MEMBER_KASRA, MEMBER_LOOM, MEMBER_X],
     tokens: {
-      [hashA]: { member_id: 'm-a', display_name: 'Agent A', email: 'a@x.com', status: 'active', bound_agent_id: 'kasra' },
-      [hashB]: { member_id: 'm-b', display_name: 'Agent B', email: 'b@x.com', status: 'active', bound_agent_id: 'loom' },
+      [hashKasra]:   { member_id: 'm-kasra', display_name: 'Kasra', email: 'kasra@x.com', status: 'active', bound_agent_id: 'kasra' },
+      [hashLoom]:    { member_id: 'm-loom',  display_name: 'Loom',  email: 'loom@x.com',  status: 'active', bound_agent_id: 'loom'  },
+      [hashUnbound]: { member_id: 'm-x',     display_name: 'X',     email: 'x@x.com',     status: 'active', bound_agent_id: null    },
     },
   })
 }
 
-// ── request helper ───────────────────────────────────────────────────────────────
+// ── request helpers ───────────────────────────────────────────────────────────────
 
 function post(path: string, token: string | null, body: unknown, e: Env) {
   const headers: Record<string, string> = { 'content-type': 'application/json' }
   if (token) headers.authorization = `Bearer ${token}`
-  return fleetAttachApp.request(path, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  }, e)
+  return fleetAttachApp.request(path, { method: 'POST', headers, body: JSON.stringify(body) }, e)
+}
+
+function postRaw(path: string, token: string | null, rawBody: string, e: Env) {
+  const headers: Record<string, string> = { 'content-type': 'application/json' }
+  if (token) headers.authorization = `Bearer ${token}`
+  return fleetAttachApp.request(path, { method: 'POST', headers, body: rawBody }, e)
 }
 
 // ── POST /attach ─────────────────────────────────────────────────────────────────
 
 describe('POST /attach', () => {
+
   it('401 when no token is supplied', async () => {
     const db = defaultDb()
     const res = await post('/attach', null, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' }, makeEnv(db))
     expect(res.status).toBe(401)
-    expect(db._fleet.size).toBe(0) // no mutation
+    expect(db._fleet.size).toBe(0)
   })
 
   it('400 on unknown agent type', async () => {
     const db = defaultDb()
-    const res = await post('/attach', TOKEN_A, { agent_id: 'kasra', type: 'hacker', runtime: 'claude-code' }, makeEnv(db))
+    const res = await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'hacker', runtime: 'claude-code' }, makeEnv(db))
     expect(res.status).toBe(400)
     expect(db._fleet.size).toBe(0)
   })
 
   it('400 on bad runtime', async () => {
     const db = defaultDb()
-    const res = await post('/attach', TOKEN_A, { agent_id: 'kasra', type: 'builder', runtime: 'elixir' }, makeEnv(db))
+    const res = await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'elixir' }, makeEnv(db))
     expect(res.status).toBe(400)
     expect(db._fleet.size).toBe(0)
   })
 
   it('400 on bad agent_id (path traversal)', async () => {
     const db = defaultDb()
-    const res = await post('/attach', TOKEN_A, { agent_id: '../evil', type: 'builder', runtime: 'claude-code' }, makeEnv(db))
+    const res = await post('/attach', TOKEN_KASRA, { agent_id: '../evil', type: 'builder', runtime: 'claude-code' }, makeEnv(db))
     expect(res.status).toBe(400)
     expect(db._fleet.size).toBe(0)
   })
 
-  it('200 on a valid attach — upserts status=running with member_id FROM AUTH', async () => {
-    const db = defaultDb()
-    const res = await post('/attach', TOKEN_A, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code', lifecycle: 'always_on' }, makeEnv(db))
-    expect(res.status).toBe(200)
-    const json = (await res.json()) as { ok: boolean; agent: { agent_id: string; type: string; status: string } }
-    expect(json.ok).toBe(true)
+  // ── BLOCK-1: token binding gate ───────────────────────────────────────────────
 
+  it('BLOCK-1 REGRESSION: token bound to loom cannot attach agent_id=kasra → 403, no mutation', async () => {
+    // Token bound to 'loom' attempts to attach as 'kasra'. This is the hijack attempt.
+    // Fails-without: old code did a TOFU pre-SELECT, which could still be bypassed on first-claim.
+    // Passes-with: boundAgentId check rejects at auth-resolution, before any DB write.
+    const db = defaultDb()
+    const res = await post('/attach', TOKEN_LOOM, { agent_id: 'kasra', type: 'comms', runtime: 'python' }, makeEnv(db))
+    expect(res.status).toBe(403)
+    const json = (await res.json()) as { error: string; detail: string }
+    expect(json.error).toBe('forbidden')
+    expect(json.detail).toMatch(/not bound to this agent_id/)
+    // No mutation.
+    expect(db._fleet.has('t:kasra')).toBe(false)
+  })
+
+  it('BLOCK-1: pure member token (boundAgentId=null) cannot attach → 403', async () => {
+    const db = defaultDb()
+    const res = await post('/attach', TOKEN_UNBOUND, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' }, makeEnv(db))
+    expect(res.status).toBe(403)
+    expect(db._fleet.size).toBe(0)
+  })
+
+  it('BLOCK-1: token bound to kasra CAN attach agent_id=kasra → 200', async () => {
+    const db = defaultDb()
+    const res = await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code', lifecycle: 'always_on' }, makeEnv(db))
+    expect(res.status).toBe(200)
     const row = db._fleet.get('t:kasra')!
-    expect(row).toBeDefined()
     expect(row.status).toBe('running')
     expect(row.agent_type).toBe('builder')
     expect(row.runtime).toBe('claude-code')
     expect(row.lifecycle).toBe('always_on')
-    // Keystone: member_id is from auth (m-a), not from any body field.
-    expect(row.member_id).toBe('m-a')
+    // member_id from auth (not body).
+    expect(row.member_id).toBe('m-kasra')
   })
 
-  it('SECURITY: body member_id is ignored — stored member is auth-derived', async () => {
+  it('BLOCK-1: token bound to loom CAN attach agent_id=loom → 200', async () => {
     const db = defaultDb()
-    // Send a body with member_id='m-b' (agent B's id) while authenticated as TOKEN_A (m-a).
-    // The stored member_id must be m-a (auth), never m-b (body).
-    const res = await post(
-      '/attach',
-      TOKEN_A,
-      { agent_id: 'kasra', type: 'builder', runtime: 'claude-code', member_id: 'm-b' },
-      makeEnv(db),
-    )
+    const res = await post('/attach', TOKEN_LOOM, { agent_id: 'loom', type: 'comms', runtime: 'nous' }, makeEnv(db))
     expect(res.status).toBe(200)
-    const row = db._fleet.get('t:kasra')!
-    // Auth-derived identity wins; body member_id silently discarded.
-    expect(row.member_id).toBe('m-a')
+    expect(db._fleet.get('t:loom')!.member_id).toBe('m-loom')
+  })
+
+  it('SECURITY: body member_id is silently discarded — stored member is auth-derived', async () => {
+    const db = defaultDb()
+    // TOKEN_KASRA is bound to kasra; member_id='m-kasra'. Send body member_id='m-loom'.
+    const res = await post('/attach', TOKEN_KASRA,
+      { agent_id: 'kasra', type: 'builder', runtime: 'claude-code', member_id: 'm-loom' },
+      makeEnv(db))
+    expect(res.status).toBe(200)
+    // Stored member is m-kasra (auth), not m-loom (body).
+    expect(db._fleet.get('t:kasra')!.member_id).toBe('m-kasra')
   })
 
   it('returns the getAgentView boot-ack shape for the attached agent', async () => {
     const db = defaultDb()
-    const res = await post(
-      '/attach',
-      TOKEN_A,
-      { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' },
-      makeEnv(db),
-    )
+    const res = await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' }, makeEnv(db))
     expect(res.status).toBe(200)
     const json = (await res.json()) as {
       ok: boolean
@@ -286,7 +310,6 @@ describe('POST /attach', () => {
       } | null
     }
     expect(json.ok).toBe(true)
-    // Boot-ack shape: agent_id, type, runtime, status, lifecycle, last_seen, member, capabilities.
     const a = json.agent!
     expect(a.agent_id).toBe('kasra')
     expect(a.type).toBe('builder')
@@ -297,16 +320,14 @@ describe('POST /attach', () => {
     expect(Array.isArray(a.capabilities)).toBe(true)
   })
 
-  it('upsert updates an existing row (second attach updates status back to running)', async () => {
+  it('re-attach by same bound token refreshes an existing row (status back to running)', async () => {
     const db = defaultDb()
     const e = makeEnv(db)
-    // First attach.
-    await post('/attach', TOKEN_A, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' }, e)
-    // Manually flip to stopped.
-    const row = db._fleet.get('t:kasra')!
-    row.status = 'stopped'
-    // Second attach.
-    const res = await post('/attach', TOKEN_A, { agent_id: 'kasra', type: 'builder', runtime: 'hermes' }, e)
+    await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' }, e)
+    // Manually stop the row.
+    db._fleet.get('t:kasra')!.status = 'stopped'
+    // Re-attach.
+    const res = await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'hermes' }, e)
     expect(res.status).toBe(200)
     expect(db._fleet.get('t:kasra')!.status).toBe('running')
     expect(db._fleet.get('t:kasra')!.runtime).toBe('hermes') // updated
@@ -314,118 +335,139 @@ describe('POST /attach', () => {
 
   it('lifecycle defaults to on_demand when omitted', async () => {
     const db = defaultDb()
-    await post('/attach', TOKEN_A, { agent_id: 'kasra', type: 'generic', runtime: 'tmux' }, makeEnv(db))
+    await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'generic', runtime: 'tmux' }, makeEnv(db))
     expect(db._fleet.get('t:kasra')!.lifecycle).toBe('on_demand')
   })
 
-  it('tenant-scoped: two tenants can attach same agent_id without collision', async () => {
+  it('tenant-scoped: same bound token attaches same agent_id on two tenants independently', async () => {
     const db = defaultDb()
-    const eA = makeEnv(db, { TENANT_SLUG: 'tA' })
-    const eB = makeEnv(db, { TENANT_SLUG: 'tB' })
-    await post('/attach', TOKEN_A, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' }, eA)
-    await post('/attach', TOKEN_A, { agent_id: 'kasra', type: 'reviewer', runtime: 'codex' }, eB)
+    await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' }, makeEnv(db, { TENANT_SLUG: 'tA' }))
+    await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'reviewer', runtime: 'codex' }, makeEnv(db, { TENANT_SLUG: 'tB' }))
     expect(db._fleet.get('tA:kasra')!.agent_type).toBe('builder')
     expect(db._fleet.get('tB:kasra')!.agent_type).toBe('reviewer')
     expect(db._fleet.size).toBe(2)
+  })
+
+  // ── WARN-1: body size cap ─────────────────────────────────────────────────────
+
+  it('WARN-1: 413 when attach body exceeds 8 KB', async () => {
+    const db = defaultDb()
+    const huge = JSON.stringify({ agent_id: 'kasra', type: 'builder', runtime: 'claude-code', pad: 'x'.repeat(9000) })
+    const res = await postRaw('/attach', TOKEN_KASRA, huge, makeEnv(db))
+    expect(res.status).toBe(413)
+    const json = (await res.json()) as { error: string }
+    expect(json.error).toBe('payload_too_large')
+    expect(db._fleet.size).toBe(0) // no mutation before cap check
   })
 })
 
 // ── POST /detach ─────────────────────────────────────────────────────────────────
 
 describe('POST /detach', () => {
+
   it('401 when no token is supplied', async () => {
     const db = defaultDb()
-    const res = await post('/detach', null, { agent_id: 'kasra' }, makeEnv(db))
-    expect(res.status).toBe(401)
+    expect((await post('/detach', null, { agent_id: 'kasra' }, makeEnv(db))).status).toBe(401)
   })
 
-  it('404 when the agent_id does not exist', async () => {
+  it('BLOCK-1 REGRESSION: token bound to loom cannot detach kasra → 403, row unchanged', async () => {
+    // Set up kasra row so we can verify no mutation.
+    const db = makeDb({
+      members: [MEMBER_KASRA, MEMBER_LOOM],
+      tokens: {
+        [hashKasra]: { member_id: 'm-kasra', display_name: 'Kasra', email: null, status: 'active', bound_agent_id: 'kasra' },
+        [hashLoom]:  { member_id: 'm-loom',  display_name: 'Loom',  email: null, status: 'active', bound_agent_id: 'loom'  },
+      },
+      fleet: [{
+        agent_id: 'kasra', tenant: 't', display: 'Kasra', runtime: 'claude-code', squads: '[]',
+        lifecycle: 'always_on', provider_contract: null, status: 'running', reported_by: 'm-kasra',
+        last_reported_at: 'before', updated_at: 'before', agent_type: 'builder', member_id: 'm-kasra',
+      }],
+    })
+    const res = await post('/detach', TOKEN_LOOM, { agent_id: 'kasra' }, makeEnv(db))
+    expect(res.status).toBe(403)
+    expect(((await res.json()) as { error: string }).error).toBe('forbidden')
+    // Row completely unchanged.
+    const row = db._fleet.get('t:kasra')!
+    expect(row.status).toBe('running')
+    expect(row.member_id).toBe('m-kasra')
+  })
+
+  it('BLOCK-1: pure member token (boundAgentId=null) cannot detach → 403', async () => {
     const db = defaultDb()
-    const res = await post('/detach', TOKEN_A, { agent_id: 'ghost' }, makeEnv(db))
-    expect(res.status).toBe(404)
-    const json = (await res.json()) as { error: string }
-    expect(json.error).toBe('not_found_or_not_owner')
+    const res = await post('/detach', TOKEN_UNBOUND, { agent_id: 'kasra' }, makeEnv(db))
+    expect(res.status).toBe(403)
   })
 
-  it('200 + status=stopped when agent detaches its own row', async () => {
+  it('200 + status=stopped when bound token detaches its own row', async () => {
     const db = defaultDb()
     const e = makeEnv(db)
     // Attach first.
-    await post('/attach', TOKEN_A, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' }, e)
+    await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' }, e)
     expect(db._fleet.get('t:kasra')!.status).toBe('running')
-
     // Detach.
-    const res = await post('/detach', TOKEN_A, { agent_id: 'kasra' }, e)
+    const res = await post('/detach', TOKEN_KASRA, { agent_id: 'kasra' }, e)
     expect(res.status).toBe(200)
-    const json = (await res.json()) as { ok: boolean }
-    expect(json.ok).toBe(true)
+    expect(((await res.json()) as { ok: boolean }).ok).toBe(true)
     expect(db._fleet.get('t:kasra')!.status).toBe('stopped')
   })
 
-  it('SECURITY: agent B cannot detach agent A row (ownership gate → 404, no mutation)', async () => {
+  it('404 when the agent row does not exist (bound token, correct agent_id, missing row)', async () => {
     const db = defaultDb()
-    const e = makeEnv(db)
-    // Agent A attaches itself.
-    await post('/attach', TOKEN_A, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' }, e)
-    const rowBefore = { ...db._fleet.get('t:kasra')! }
-
-    // Agent B tries to detach kasra (owned by m-a, not m-b).
-    const res = await post('/detach', TOKEN_B, { agent_id: 'kasra' }, e)
+    // TOKEN_KASRA is bound to 'kasra' but no row exists.
+    const res = await post('/detach', TOKEN_KASRA, { agent_id: 'kasra' }, makeEnv(db))
     expect(res.status).toBe(404)
-    const json = (await res.json()) as { error: string }
-    expect(json.error).toBe('not_found_or_not_owner')
-
-    // Row must be UNCHANGED — no mutation on ownership mismatch.
-    const rowAfter = db._fleet.get('t:kasra')!
-    expect(rowAfter.status).toBe(rowBefore.status)
-    expect(rowAfter.member_id).toBe(rowBefore.member_id)
+    expect(((await res.json()) as { error: string }).error).toBe('not_found_or_not_owner')
   })
 
-  it('SECURITY: 404 is deliberately ambiguous (unknown agent vs wrong owner same response)', async () => {
-    // A non-existent agent_id and a cross-member agent_id both return 404 not_found_or_not_owner.
-    // This prevents callers from inferring which agent_ids belong to which members.
+  it('defense-in-depth: 404 when member_id mismatch (re-keying scenario)', async () => {
+    // Token is correctly bound to 'kasra' but the row's member_id is a different member
+    // (e.g., the agent was re-keyed). The WHERE member_id=auth clause catches this.
     const db = makeDb({
-      members: [MEMBER_A, MEMBER_B],
+      members: [MEMBER_KASRA, MEMBER_X],
       tokens: {
-        [hashA]: { member_id: 'm-a', display_name: 'A', email: null, status: 'active', bound_agent_id: null },
-        [hashB]: { member_id: 'm-b', display_name: 'B', email: null, status: 'active', bound_agent_id: null },
+        // TOKEN_KASRA is now bound to 'kasra' but its member is m-x (re-keyed principal).
+        [hashKasra]: { member_id: 'm-x', display_name: 'X', email: null, status: 'active', bound_agent_id: 'kasra' },
       },
       fleet: [{
-        agent_id: 'owned-by-a', tenant: 't', display: '', runtime: 'claude-code', squads: '[]',
-        lifecycle: 'on_demand', provider_contract: null, status: 'running', reported_by: 'm-a',
-        last_reported_at: 'now', updated_at: 'now', agent_type: 'builder', member_id: 'm-a',
+        agent_id: 'kasra', tenant: 't', display: '', runtime: 'claude-code', squads: '[]',
+        lifecycle: 'always_on', provider_contract: null, status: 'running', reported_by: 'm-kasra',
+        last_reported_at: 'before', updated_at: 'before', agent_type: 'builder',
+        // Row still has the old member_id.
+        member_id: 'm-kasra',
       }],
     })
-    const e = makeEnv(db)
-    // Non-existent agent.
-    const r1 = await post('/detach', TOKEN_A, { agent_id: 'ghost' }, e)
-    expect(r1.status).toBe(404)
-    expect(((await r1.json()) as { error: string }).error).toBe('not_found_or_not_owner')
-    // Existing agent owned by a different member.
-    const r2 = await post('/detach', TOKEN_B, { agent_id: 'owned-by-a' }, e)
-    expect(r2.status).toBe(404)
-    expect(((await r2.json()) as { error: string }).error).toBe('not_found_or_not_owner')
-    // Original row still running.
-    expect(db._fleet.get('t:owned-by-a')!.status).toBe('running')
+    const res = await post('/detach', TOKEN_KASRA, { agent_id: 'kasra' }, makeEnv(db))
+    // Passes token binding (boundAgentId='kasra' == 'kasra'), fails member_id WHERE (m-x != m-kasra).
+    expect(res.status).toBe(404)
+    // Row is NOT stopped (no mutation on member_id mismatch).
+    expect(db._fleet.get('t:kasra')!.status).toBe('running')
   })
 
-  it('400 on bad agent_id in detach', async () => {
+  it('400 on bad agent_id in detach body', async () => {
     const db = defaultDb()
-    const res = await post('/detach', TOKEN_A, { agent_id: '../escape' }, makeEnv(db))
+    const res = await post('/detach', TOKEN_KASRA, { agent_id: '../escape' }, makeEnv(db))
     expect(res.status).toBe(400)
   })
 
-  it('tenant-scoped: detach by token-A on tA does not touch the same agent_id on tB', async () => {
+  it('tenant-scoped: detach on tA does not touch same agent_id on tB', async () => {
     const db = defaultDb()
-    // Attach kasra on both tenants as different members.
-    await post('/attach', TOKEN_A, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' }, makeEnv(db, { TENANT_SLUG: 'tA' }))
-    await post('/attach', TOKEN_A, { agent_id: 'kasra', type: 'brain', runtime: 'nous' }, makeEnv(db, { TENANT_SLUG: 'tB' }))
+    await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' }, makeEnv(db, { TENANT_SLUG: 'tA' }))
+    await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'brain',   runtime: 'nous'       }, makeEnv(db, { TENANT_SLUG: 'tB' }))
 
-    // Detach only on tA.
-    const res = await post('/detach', TOKEN_A, { agent_id: 'kasra' }, makeEnv(db, { TENANT_SLUG: 'tA' }))
+    const res = await post('/detach', TOKEN_KASRA, { agent_id: 'kasra' }, makeEnv(db, { TENANT_SLUG: 'tA' }))
     expect(res.status).toBe(200)
     expect(db._fleet.get('tA:kasra')!.status).toBe('stopped')
-    // tB row is untouched.
-    expect(db._fleet.get('tB:kasra')!.status).toBe('running')
+    expect(db._fleet.get('tB:kasra')!.status).toBe('running') // untouched
+  })
+
+  // ── WARN-1: body size cap ─────────────────────────────────────────────────────
+
+  it('WARN-1: 413 when detach body exceeds 8 KB', async () => {
+    const db = defaultDb()
+    const huge = JSON.stringify({ agent_id: 'kasra', pad: 'x'.repeat(9000) })
+    const res = await postRaw('/detach', TOKEN_KASRA, huge, makeEnv(db))
+    expect(res.status).toBe(413)
+    expect(((await res.json()) as { error: string }).error).toBe('payload_too_large')
   })
 })
