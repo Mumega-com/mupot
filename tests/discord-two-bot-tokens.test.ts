@@ -566,3 +566,44 @@ describe('BLOCK fix regression smoke tests (two-bot env)', () => {
     expect(caughtMsg).not.toContain('LEAKED-SECRET')
   })
 })
+
+// ── per-agent token naming (Hadi 2026-06-28: DISCORD_BOT_TOKEN_<AGENT>) ──────────
+describe('per-agent Discord bot tokens', () => {
+  const env = (o: Record<string, string | undefined>) => o as unknown as Parameters<typeof getDiscordBotToken>[0]
+
+  it('getDiscordBotToken(env, agent) prefers the per-agent bot', () => {
+    const e = env({ DISCORD_BOT_TOKEN: 'default', DISCORD_BOT_TOKEN_KASRA: 'kasra-bot' })
+    expect(getDiscordBotToken(e, 'kasra')).toBe('kasra-bot')
+  })
+
+  it('getDiscordBotToken(env, agent) falls back to default when per-agent unset', () => {
+    const e = env({ DISCORD_BOT_TOKEN: 'default' })
+    expect(getDiscordBotToken(e, 'river')).toBe('default')
+  })
+
+  it('getDiscordBotToken(env) with no agent returns the default poster', () => {
+    const e = env({ DISCORD_BOT_TOKEN: 'default', DISCORD_BOT_TOKEN_KASRA: 'kasra-bot' })
+    expect(getDiscordBotToken(e)).toBe('default')
+  })
+
+  it('agent slug normalises to UPPER_SNAKE env key', () => {
+    const e = env({ DISCORD_BOT_TOKEN_MUMEGA_BRAIN: 'brain-bot' })
+    expect(getDiscordBotToken(e, 'mumega-brain')).toBe('brain-bot')
+  })
+
+  it('getDiscordAdminToken resolves the default admin agent (kasra) per-agent bot', () => {
+    const e = env({ DISCORD_BOT_TOKEN: 'default', DISCORD_BOT_TOKEN_KASRA: 'kasra-admin' })
+    expect(getDiscordAdminToken(e)).toBe('kasra-admin')
+  })
+
+  it('getDiscordAdminToken honours a configurable DISCORD_ADMIN_AGENT', () => {
+    const e = env({ DISCORD_ADMIN_AGENT: 'loom', DISCORD_BOT_TOKEN_LOOM: 'loom-admin', DISCORD_BOT_TOKEN_KASRA: 'kasra-bot' })
+    expect(getDiscordAdminToken(e)).toBe('loom-admin')
+  })
+
+  it('getDiscordAdminToken fallback chain: per-agent → DISCORD_ADMIN_BOT_TOKEN → DISCORD_BOT_TOKEN', () => {
+    expect(getDiscordAdminToken(env({ DISCORD_ADMIN_BOT_TOKEN: 'legacy-admin', DISCORD_BOT_TOKEN: 'default' }))).toBe('legacy-admin')
+    expect(getDiscordAdminToken(env({ DISCORD_BOT_TOKEN: 'default' }))).toBe('default')
+    expect(getDiscordAdminToken(env({}))).toBeUndefined()
+  })
+})

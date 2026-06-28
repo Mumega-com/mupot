@@ -25,15 +25,18 @@ import type { ChannelAdapter, Env, InboundMessage, Capability } from '../../type
 // it widens nothing for the core and never escapes this module.
 interface DiscordSecrets {
   DISCORD_PUBLIC_KEY?: string
-  // General / posting bot (Mumega). Used for: outbound posts (post(), postAgentActivity)
-  // and inbound interaction handling. Must be configured in all setups.
+  // Default / posting bot. Used as the fallback for any agent without its own bot,
+  // and by the outbound post path today. Must be configured in all setups.
   DISCORD_BOT_TOKEN?: string
-  // Admin bot (Kasra). Holds Manage Roles + Manage Channels for privileged guild ops.
-  // Optional: absent in single-bot setups where DISCORD_BOT_TOKEN covers both roles.
-  // When set, all role-write and sync-read paths use this token instead of BOT_TOKEN.
-  // The fallback to DISCORD_BOT_TOKEN is intentional and documented — single-admin-
-  // capable-bot deployments need only DISCORD_BOT_TOKEN; separated setups set
-  // DISCORD_ADMIN_BOT_TOKEN for privileged ops only.
+  // PER-AGENT bots (scalable naming, Hadi 2026-06-28): DISCORD_BOT_TOKEN_<AGENT>
+  // (e.g. DISCORD_BOT_TOKEN_KASRA, DISCORD_BOT_TOKEN_MUMEGA, later _LOOM/_RIVER/_CODEX).
+  // Each agent can run its own Discord bot identity; absence falls back to
+  // DISCORD_BOT_TOKEN. These keys are dynamic — read via perAgentToken(), not declared
+  // individually here.
+  // Which agent is the privileged (Manage Roles/Channels) admin bot. Default 'kasra'.
+  DISCORD_ADMIN_AGENT?: string
+  // Back-compat: a role-named admin token. Still honored as a fallback after the
+  // per-agent admin bot, before the default DISCORD_BOT_TOKEN.
   DISCORD_ADMIN_BOT_TOKEN?: string
 }
 
@@ -44,27 +47,38 @@ function discordSecrets(env: Env): DiscordSecrets {
 }
 
 /**
- * getDiscordBotToken — surface the general/posting bot token (or undefined if absent).
- * Used by: outbound post(), inbound interaction handling.
- * Exported so callers can check token presence before making API calls.
+ * perAgentToken — resolve DISCORD_BOT_TOKEN_<AGENT> for an agent slug, or undefined.
+ * Agent slug is normalised to an UPPER_SNAKE env-key suffix (e.g. 'mumega-brain' →
+ * DISCORD_BOT_TOKEN_MUMEGA_BRAIN). Dynamic lookup over the adapter-local env seam.
  */
-export function getDiscordBotToken(env: Env): string | undefined {
+function perAgentToken(env: Env, agent: string): string | undefined {
+  const suffix = agent.toUpperCase().replace(/[^A-Z0-9]/g, '_')
+  // Dynamic env key — env carries wrangler secrets not declared on the Env type.
+  return (env as unknown as Record<string, string | undefined>)[`DISCORD_BOT_TOKEN_${suffix}`]
+}
+
+/**
+ * getDiscordBotToken — resolve a bot token. With an `agent`, prefer that agent's own
+ * bot (DISCORD_BOT_TOKEN_<AGENT>), falling back to the default DISCORD_BOT_TOKEN.
+ * With no `agent`, return the default posting token. Returns undefined if unset.
+ */
+export function getDiscordBotToken(env: Env, agent?: string): string | undefined {
+  if (agent) return perAgentToken(env, agent) ?? discordSecrets(env).DISCORD_BOT_TOKEN
   return discordSecrets(env).DISCORD_BOT_TOKEN
 }
 
 /**
- * getDiscordAdminToken — surface the admin bot token for privileged guild ops
- * (role management, channel management, sync-path reads).
- *
- * Two-bot setup: DISCORD_ADMIN_BOT_TOKEN is the Kasra admin bot (Manage Roles +
- * Manage Channels). Single-bot setup: falls back to DISCORD_BOT_TOKEN — the fallback
- * is intentional. Separated setups set DISCORD_ADMIN_BOT_TOKEN for privileged ops;
- * single-admin-capable-bot setups set only DISCORD_BOT_TOKEN. If neither token is
- * configured this returns undefined and callers MUST fail closed.
+ * getDiscordAdminToken — token for privileged guild ops (role/channel management,
+ * sync-path reads). Resolves the configured ADMIN AGENT's own bot
+ * (DISCORD_ADMIN_AGENT, default 'kasra' → DISCORD_BOT_TOKEN_KASRA), then the legacy
+ * DISCORD_ADMIN_BOT_TOKEN, then the default DISCORD_BOT_TOKEN. The agent is
+ * configurable, not hardcoded. Returns undefined if nothing resolves — callers MUST
+ * fail closed.
  */
 export function getDiscordAdminToken(env: Env): string | undefined {
   const s = discordSecrets(env)
-  return s.DISCORD_ADMIN_BOT_TOKEN ?? s.DISCORD_BOT_TOKEN
+  const adminAgent = s.DISCORD_ADMIN_AGENT ?? 'kasra'
+  return perAgentToken(env, adminAgent) ?? s.DISCORD_ADMIN_BOT_TOKEN ?? s.DISCORD_BOT_TOKEN
 }
 
 const DISCORD_API = 'https://discord.com/api/v10'
