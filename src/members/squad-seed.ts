@@ -67,13 +67,15 @@ async function deterministicGrantId(memberId: string, scopeType: CapabilityScope
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
 }
 
-/** Build the full squad definition for the given optional squadId. */
-export function buildSquadDefs(squadId: string | null): SquadMemberDef[] {
-  // Agent-scoped members default to squad scope when squadId is provided, else org.
-  const agentScope: { scope_type: CapabilityScopeType; scope_id: string | null } =
-    squadId
-      ? { scope_type: 'squad', scope_id: squadId }
-      : { scope_type: 'org', scope_id: null }
+/** Build the full squad definition. squadId is REQUIRED: squad agents are granted
+ *  at squad scope only. There is deliberately NO org-scope fallback — an org-scope
+ *  fallback would silently make kasra=admin@org (org-admin), an escalation past the
+ *  "bounded squad-admin" intent. hadi alone is org-scoped (the org owner). */
+export function buildSquadDefs(squadId: string): SquadMemberDef[] {
+  const agentScope: { scope_type: CapabilityScopeType; scope_id: string | null } = {
+    scope_type: 'squad',
+    scope_id: squadId,
+  }
 
   return [
     // hadi is the org owner — ALWAYS org scope, unchanged (pre-existing mem-hadi).
@@ -134,7 +136,7 @@ export interface SeedResult {
 
 export interface SeedFailure {
   ok: false
-  reason: 'db_error'
+  reason: 'db_error' | 'squad_required'
   detail: string
 }
 
@@ -144,8 +146,9 @@ export interface SeedFailure {
  * seedSquadMembers — idempotent seed of the Mumega squad onto this pot.
  *
  * @param env      the Cloudflare Worker environment (must have env.DB)
- * @param squadId  optional squad UUID: when provided, kasra/river/codex are
- *                 granted at squad scope; when absent they fall back to org scope.
+ * @param squadId  REQUIRED squad UUID — all squad agents are granted at squad scope.
+ *                 There is NO org-scope fallback (that would escalate kasra to
+ *                 org-admin). An empty squadId fails closed ('squad_required').
  *
  * All writes are INSERT OR IGNORE — safe to re-run at any time. The function
  * NEVER writes member_tokens (tokens are minted at dock time via the admin UI).
@@ -165,8 +168,17 @@ export interface SeedFailure {
  */
 export async function seedSquadMembers(
   env: Env,
-  squadId: string | null = null,
+  squadId: string,
 ): Promise<SeedResult | SeedFailure> {
+  // Fail closed: squad-scoped grants require a squad. Never fall back to org
+  // scope (that would make kasra=admin@org — an escalation past squad-admin).
+  if (!squadId) {
+    return {
+      ok: false,
+      reason: 'squad_required',
+      detail: 'seedSquadMembers requires a squadId — no org-scope fallback for squad agents',
+    }
+  }
   const defs = buildSquadDefs(squadId)
   const now = new Date().toISOString()
   const results: SeedResult['seeded'] = []

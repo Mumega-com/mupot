@@ -4,9 +4,10 @@
 //   1. After seedSquadMembers(), resolveCapabilities(memberId) returns the expected
 //      ladder rank for each agent (per §2A community map).
 //   2. Idempotency: re-running the seed does not fail or duplicate rows.
-//   3. Squad-scope grants: when a squadId is provided, kasra/river/codex are
-//      granted at squad scope; hasCapability at org scope is false for them.
-//   4. Org-scope fallback: when no squadId, all agents granted at org scope.
+//   3. Squad-scope grants: squad agents are granted at squad scope; hasCapability
+//      at org scope is false for them (no upward bubble).
+//   4. squadId is REQUIRED (fail-closed) — there is NO org-scope fallback, which
+//      would escalate kasra to org-admin.
 //   5. Agent↔agent messages round-trip + request/ack correlation (Slice D proof
 //      that the existing service works for our agents).
 
@@ -15,6 +16,9 @@ import { seedSquadMembers, deterministicMemberId, buildSquadDefs } from '../src/
 import { resolveCapabilities, hasCapability } from '../src/auth/capability'
 import { sendAgentMessage, readAgentInbox } from '../src/agents/messages'
 import type { Env } from '../src/types'
+
+// Canonical test squad id (all seed calls require a squadId — no org fallback).
+const SQUAD_ID = 'sq-test-0001-0001-0001-000000000001'
 
 // ── faithful in-memory D1 ─────────────────────────────────────────────────────
 
@@ -238,7 +242,7 @@ describe('seedSquadMembers — Slice A', () => {
   it('creates all 6 member rows on first seed', async () => {
     const db = makeDb()
     const env = makeEnv(db)
-    const result = await seedSquadMembers(env, null)
+    const result = await seedSquadMembers(env, SQUAD_ID)
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(result.seeded.length).toBe(6)
@@ -250,14 +254,14 @@ describe('seedSquadMembers — Slice A', () => {
   it('all 6 members get exactly 1 capability grant each', async () => {
     const db = makeDb()
     const env = makeEnv(db)
-    await seedSquadMembers(env, null)
+    await seedSquadMembers(env, SQUAD_ID)
     expect(db._capabilities.length).toBe(6)
   })
 
   it('resolveCapabilities → hadi has owner at org scope', async () => {
     const db = makeDb()
     const env = makeEnv(db)
-    await seedSquadMembers(env, null)
+    await seedSquadMembers(env, SQUAD_ID)
     const hadiId = await deterministicMemberId('hadi')
     const grants = await resolveCapabilities(env, hadiId)
     expect(grants.length).toBeGreaterThan(0)
@@ -268,44 +272,45 @@ describe('seedSquadMembers — Slice A', () => {
     expect(hasCapability(grants, 'org', null, 'observer')).toBe(true)
   })
 
-  it('resolveCapabilities → kasra has admin (no squadId → org fallback)', async () => {
+  it('resolveCapabilities → kasra has admin @ squad (bounded — NOT org-admin)', async () => {
     const db = makeDb()
     const env = makeEnv(db)
-    await seedSquadMembers(env, null)
+    await seedSquadMembers(env, SQUAD_ID)
     const kasraId = await deterministicMemberId('kasra')
     const grants = await resolveCapabilities(env, kasraId)
-    // admin covers lead/member/observer on the ladder…
-    expect(hasCapability(grants, 'org', null, 'admin')).toBe(true)
-    expect(hasCapability(grants, 'org', null, 'lead')).toBe(true)
-    expect(hasCapability(grants, 'org', null, 'member')).toBe(true)
-    // …but NOT owner.
+    // admin covers lead/member on the squad scope…
+    expect(hasCapability(grants, 'squad', SQUAD_ID, 'admin')).toBe(true)
+    expect(hasCapability(grants, 'squad', SQUAD_ID, 'lead')).toBe(true)
+    expect(hasCapability(grants, 'squad', SQUAD_ID, 'member')).toBe(true)
+    // …but is BOUNDED: squad-admin does NOT satisfy an org-scope admin check.
+    expect(hasCapability(grants, 'org', null, 'admin')).toBe(false)
     expect(hasCapability(grants, 'org', null, 'owner')).toBe(false)
   })
 
-  it('resolveCapabilities → loom/river have lead, NOT admin (no squadId)', async () => {
+  it('resolveCapabilities → loom/river have lead @ squad, NOT admin', async () => {
     const db = makeDb()
     const env = makeEnv(db)
-    await seedSquadMembers(env, null)
+    await seedSquadMembers(env, SQUAD_ID)
     for (const slug of ['loom', 'river']) {
       const id = await deterministicMemberId(slug)
       const grants = await resolveCapabilities(env, id)
-      expect(hasCapability(grants, 'org', null, 'lead')).toBe(true)
-      expect(hasCapability(grants, 'org', null, 'member')).toBe(true)
-      expect(hasCapability(grants, 'org', null, 'admin')).toBe(false) // not admin
-      expect(hasCapability(grants, 'org', null, 'owner')).toBe(false) // not owner
+      expect(hasCapability(grants, 'squad', SQUAD_ID, 'lead')).toBe(true)
+      expect(hasCapability(grants, 'squad', SQUAD_ID, 'member')).toBe(true)
+      expect(hasCapability(grants, 'squad', SQUAD_ID, 'admin')).toBe(false) // not admin
+      expect(hasCapability(grants, 'org', null, 'lead')).toBe(false) // no org bubble
     }
   })
 
-  it('resolveCapabilities → codex/mumega-brain have member, NOT lead (no squadId)', async () => {
+  it('resolveCapabilities → codex/mumega-brain have member @ squad, NOT lead', async () => {
     const db = makeDb()
     const env = makeEnv(db)
-    await seedSquadMembers(env, null)
+    await seedSquadMembers(env, SQUAD_ID)
     for (const slug of ['codex', 'mumega-brain']) {
       const id = await deterministicMemberId(slug)
       const grants = await resolveCapabilities(env, id)
-      expect(hasCapability(grants, 'org', null, 'member')).toBe(true)
-      expect(hasCapability(grants, 'org', null, 'lead')).toBe(false) // not lead
-      expect(hasCapability(grants, 'org', null, 'owner')).toBe(false) // not owner
+      expect(hasCapability(grants, 'squad', SQUAD_ID, 'member')).toBe(true)
+      expect(hasCapability(grants, 'squad', SQUAD_ID, 'lead')).toBe(false) // not lead
+      expect(hasCapability(grants, 'org', null, 'member')).toBe(false) // no org bubble
     }
   })
 
@@ -329,8 +334,8 @@ describe('seedSquadMembers — Slice A', () => {
   it('idempotency: re-seeding returns ok with 0 inserts (no duplicates)', async () => {
     const db = makeDb()
     const env = makeEnv(db)
-    const r1 = await seedSquadMembers(env, null)
-    const r2 = await seedSquadMembers(env, null)
+    const r1 = await seedSquadMembers(env, SQUAD_ID)
+    const r2 = await seedSquadMembers(env, SQUAD_ID)
     expect(r1.ok).toBe(true)
     expect(r2.ok).toBe(true)
     if (!r2.ok) return
@@ -375,12 +380,26 @@ describe('seedSquadMembers — Slice A', () => {
     const kasra = defs.find((d) => d.slug === 'kasra')!
     expect(kasra.scope_type).toBe('squad')
     expect(kasra.scope_id).toBe(squadId)
-    // no-squadId fallback → org scope (same caps)
-    const defsNoSquad = buildSquadDefs(null)
-    const kasraNoSquad = defsNoSquad.find((d) => d.slug === 'kasra')!
-    expect(kasraNoSquad.scope_type).toBe('org')
-    expect(kasraNoSquad.scope_id).toBeNull()
-    expect(kasraNoSquad.capability).toBe('admin')
+    // ALL non-hadi agents are squad-scoped — NO org-scope fallback (would escalate
+    // kasra to org-admin). Only hadi is org-scoped.
+    const nonHadi = defs.filter((d) => d.slug !== 'hadi')
+    for (const d of nonHadi) {
+      expect(d.scope_type).toBe('squad')
+      expect(d.scope_id).toBe(squadId)
+    }
+  })
+
+  it('seedSquadMembers fails closed without a squadId (no org-scope fallback)', async () => {
+    const db = makeDb()
+    const env = makeEnv(db)
+    // Empty squadId exercises the runtime fail-closed guard.
+    const result = await seedSquadMembers(env, '')
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason).toBe('squad_required')
+    // Nothing written.
+    expect(db._members.length).toBe(0)
+    expect(db._capabilities.length).toBe(0)
   })
 })
 
@@ -529,7 +548,7 @@ describe('BLOCK-1 regression — pre-existing member with different UUID', () =>
     })
 
     // Now run the squad seed.
-    const result = await seedSquadMembers(env, null)
+    const result = await seedSquadMembers(env, SQUAD_ID)
     expect(result.ok).toBe(true)
     if (!result.ok) return
 
@@ -572,11 +591,11 @@ describe('BLOCK-1 regression — pre-existing member with different UUID', () =>
     })
 
     // First seed: inserts 5 new members + 1 capability on real id + 5 synthetic caps.
-    await seedSquadMembers(env, null)
+    await seedSquadMembers(env, SQUAD_ID)
     const capCountAfterFirst = db._capabilities.length
 
     // Second seed: all INSERT OR IGNORE no-ops.
-    const second = await seedSquadMembers(env, null)
+    const second = await seedSquadMembers(env, SQUAD_ID)
     expect(second.ok).toBe(true)
     if (!second.ok) return
 
