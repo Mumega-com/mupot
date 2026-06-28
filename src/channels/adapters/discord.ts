@@ -612,6 +612,46 @@ export async function addMemberRole(
 }
 
 /**
+ * createGuildRole — POST /guilds/{guildId}/roles.
+ * Creates a new guild role with the given name and returns its role id.
+ * Called by the Discord cap→role sync route when a managed role (e.g. @owner,
+ * @lead) is absent from the guild — the bot must hold Manage Roles permission.
+ * The bot token is never logged or returned in the error message.
+ */
+export async function createGuildRole(
+  env: Env,
+  guildId: string,
+  name: string,
+): Promise<string> {
+  const token = discordSecrets(env).DISCORD_BOT_TOKEN
+  if (!token) throw new Error('discord: DISCORD_BOT_TOKEN not configured')
+
+  const res = await fetch(
+    `${DISCORD_API}/guilds/${encodeURIComponent(guildId)}/roles`,
+    {
+      method: 'POST',
+      headers: {
+        authorization: `Bot ${token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ name }),
+    },
+  )
+
+  if (!res.ok) {
+    // Surface status only — never headers (carry the token) or the token itself.
+    const detail = await res.text().catch(() => '')
+    throw new Error(`discord: createGuildRole failed (${res.status}) ${detail.slice(0, 256)}`)
+  }
+
+  const data: { id?: unknown } = await res.json<{ id?: unknown }>().catch(() => ({}))
+  if (typeof data.id !== 'string' || !data.id) {
+    throw new Error('discord: createGuildRole: response missing role id')
+  }
+  return data.id
+}
+
+/**
  * removeMemberRole — DELETE /guilds/{guildId}/members/{userId}/roles/{roleId}.
  * Removes `roleId` from the Discord guild member. Idempotent (Discord ignores
  * removing a role the member does not hold). Throws on HTTP error.
