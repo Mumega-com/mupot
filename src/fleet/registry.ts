@@ -6,11 +6,14 @@
 // panel, never authorize a host action. Reports are accepted ONLY from the configured consumer agent.
 
 import type { Env } from '../types'
+import { resolveCapabilities } from '../auth/capability'
 
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 const STATUSES = new Set(['running', 'stopped', 'unknown'])
 const RUNTIMES = new Set(['codex', 'claude-code', 'nous', 'hermes-cron', 'systemd-user', 'tmux', 'python', ''])
 const LIFECYCLES = new Set(['on_demand', 'always_on', ''])
+// Valid agent type values — what KIND of agent, not the runtime it runs on.
+const AGENT_TYPES = new Set(['builder', 'reviewer', 'weaver', 'brain', 'comms', 'generic'])
 const MAX_AGENTS = 200
 const MAX_SQUADS = 16
 const MAX_STR = 200
@@ -23,6 +26,9 @@ export interface FleetAgentReport {
   lifecycle?: string
   provider_contract?: string | null
   status: string
+  // Optional identity fields — Step 1 of "agent running on mupot".
+  agent_type?: string      // builder|reviewer|weaver|brain|comms|generic; defaults 'generic'
+  member_id?: string | null  // mupot members.id; validated to exist if supplied
 }
 
 export interface FleetAgentRow {
@@ -35,6 +41,21 @@ export interface FleetAgentRow {
   status: string
   reported_by: string
   last_reported_at: string
+  agent_type: string
+  member_id: string | null
+}
+
+// Unified view: runtime row + identity (member) + capabilities.
+// Returned by getAgentView — the data feed for the dashboard and #agent-bus.
+export interface AgentView {
+  agent_id: string
+  type: string                           // agent_type
+  runtime: string
+  status: string
+  lifecycle: string
+  last_seen: string                      // last_reported_at
+  member: { id: string; email: string | null; display_name: string } | null
+  capabilities: Array<{ scope_type: string; scope_id: string | null; capability: string }>
 }
 
 export type ReportResult = { ok: true; count: number } | { ok: false; reason: string }
@@ -54,11 +75,42 @@ function validReport(a: unknown): FleetAgentReport | null {
     ? r.squads.filter((s): s is string => typeof s === 'string' && AGENT_ID_RE.test(s)).slice(0, MAX_SQUADS)
     : []
   const pc = typeof r.provider_contract === 'string' && AGENT_ID_RE.test(r.provider_contract) ? r.provider_contract : null
-  return { agent_id: r.agent_id, display: cleanStr(r.display), runtime, squads, lifecycle, provider_contract: pc, status: r.status }
+  // agent_type: if provided must be a known value; omitted → 'generic'. Unknown value rejects the batch.
+  let agent_type: string
+  if (r.agent_type === undefined || r.agent_type === null) {
+    agent_type = 'generic'
+  } else if (typeof r.agent_type === 'string' && AGENT_TYPES.has(r.agent_type)) {
+    agent_type = r.agent_type
+  } else {
+    return null // unknown agent_type → reject (fail-closed)
+  }
+  // member_id: if provided must match AGENT_ID_RE format (server-validated existence check happens in reportFleetAgents).
+  let member_id: string | null = null
+  if (r.member_id != null) {
+    if (typeof r.member_id !== 'string' || !AGENT_ID_RE.test(r.member_id)) return null
+    member_id = r.member_id
+  }
+  return { agent_id: r.agent_id, display: cleanStr(r.display), runtime, squads, lifecycle, provider_contract: pc, status: r.status, agent_type, member_id }
+}
+
+/** Backfill tenant on any members row whose tenant is NULL. Idempotent — WHERE tenant IS NULL
+ *  ensures only untagged rows are updated; subsequent calls are cheap no-ops. Run lazily before
+ *  any tenant-scoped member check or join so pre-migration rows (Hadi + squad seed members) pick
+ *  up env.TENANT_SLUG before the scoped query executes. Sterile-pot safe: the slug comes from
+ *  the runtime env, never a hardcoded literal. */
+async function backfillMemberTenant(env: Env): Promise<void> {
+  await env.DB.prepare('UPDATE members SET tenant = ?1 WHERE tenant IS NULL')
+    .bind(env.TENANT_SLUG)
+    .run()
 }
 
 /** Upsert the reported agents. Rejects a malformed batch wholesale (all-or-nothing on validation),
- *  caps the count, and records which agent reported. Returns the number upserted. */
+ *  caps the count, and records which agent reported. Returns the number upserted.
+ *
+ *  member_id validation (fail-closed, tenant-scoped): if a report sets member_id, the referenced
+ *  member MUST exist in THIS TENANT's members. An unknown or other-tenant member_id rejects the
+ *  entire batch (BLOCK-1: prevents cross-tenant identity links from landing in the registry). The
+ *  lazy backfill runs first so pre-migration NULL-tenant rows are scoped before the check. */
 export async function reportFleetAgents(env: Env, reportedBy: string, agents: unknown): Promise<ReportResult> {
   if (!env.TENANT_SLUG) return { ok: false, reason: 'no_tenant' }
   if (!Array.isArray(agents)) return { ok: false, reason: 'agents must be an array' }
@@ -69,17 +121,31 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
     if (!v) return { ok: false, reason: 'invalid agent in batch' } // fail the batch, never silently drop
     valid.push(v)
   }
+  // Lazy backfill: stamp any NULL-tenant member rows before the tenant-scoped existence check.
+  if (valid.some((v) => v.member_id)) {
+    await backfillMemberTenant(env)
+  }
+  // member_id existence check: TENANT-SCOPED (fail-closed). Unknown or other-tenant → reject batch.
+  for (const v of valid) {
+    if (v.member_id) {
+      const exists = await env.DB.prepare('SELECT 1 FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1')
+        .bind(v.member_id, env.TENANT_SLUG)
+        .first<{ 1: number }>()
+      if (!exists) return { ok: false, reason: `member_id not found: ${v.member_id}` }
+    }
+  }
   for (const v of valid) {
     await env.DB.prepare(
-      `INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status, reported_by, last_reported_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now'))
+      `INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status, reported_by, agent_type, member_id, last_reported_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'), datetime('now'))
        ON CONFLICT(tenant, agent_id) DO UPDATE SET
             display=excluded.display, runtime=excluded.runtime, squads=excluded.squads,
             lifecycle=excluded.lifecycle, provider_contract=excluded.provider_contract,
             status=excluded.status, reported_by=excluded.reported_by,
+            agent_type=excluded.agent_type, member_id=excluded.member_id,
             last_reported_at=excluded.last_reported_at, updated_at=excluded.updated_at`,
     )
-      .bind(v.agent_id, env.TENANT_SLUG, v.display, v.runtime, JSON.stringify(v.squads), v.lifecycle, v.provider_contract, v.status, reportedBy)
+      .bind(v.agent_id, env.TENANT_SLUG, v.display, v.runtime, JSON.stringify(v.squads), v.lifecycle, v.provider_contract, v.status, reportedBy, v.agent_type ?? 'generic', v.member_id ?? null)
       .run()
   }
   return { ok: true, count: valid.length }
@@ -87,7 +153,7 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
 
 export async function listFleetAgents(env: Env): Promise<FleetAgentRow[]> {
   const rows = await env.DB.prepare(
-    `SELECT agent_id, display, runtime, squads, lifecycle, provider_contract, status, reported_by, last_reported_at
+    `SELECT agent_id, display, runtime, squads, lifecycle, provider_contract, status, reported_by, last_reported_at, agent_type, member_id
        FROM fleet_agents WHERE tenant = ?1 ORDER BY agent_id ASC`,
   )
     .bind(env.TENANT_SLUG)
@@ -102,7 +168,76 @@ export async function listFleetAgents(env: Env): Promise<FleetAgentRow[]> {
     status: String(r.status ?? 'unknown'),
     reported_by: String(r.reported_by ?? ''),
     last_reported_at: String(r.last_reported_at ?? ''),
+    agent_type: String(r.agent_type ?? 'generic'),
+    member_id: r.member_id == null ? null : String(r.member_id),
   }))
+}
+
+/**
+ * getAgentView — unified read: LEFT JOIN fleet_agents ↔ members on member_id,
+ * then resolve capabilities per linked member. Returns the canonical agent record
+ * for the dashboard and #agent-bus feed (admin-gated; tenant-scoped).
+ *
+ * The JOIN is TENANT-BOUND (BLOCK-1 fix): `m.tenant = fa.tenant` ensures that in a
+ * future shared-DB fork, a fleet row can only expose the member that belongs to the
+ * SAME tenant, never a cross-tenant identity. The lazy backfill stamps pre-migration
+ * NULL-tenant rows before the JOIN so existing members are visible immediately.
+ *
+ * SQL shape:
+ *   SELECT fa.agent_id, fa.agent_type, fa.runtime, fa.status, fa.lifecycle,
+ *          fa.last_reported_at, fa.member_id,
+ *          m.id AS m_id, m.email AS m_email, m.display_name AS m_display
+ *   FROM fleet_agents fa
+ *   LEFT JOIN members m ON m.id = fa.member_id AND m.tenant = fa.tenant
+ *   WHERE fa.tenant = ?1
+ *   ORDER BY fa.agent_id ASC
+ */
+export async function getAgentView(env: Env): Promise<AgentView[]> {
+  // Lazy backfill: stamp any NULL-tenant member rows before the tenant-bound JOIN runs.
+  await backfillMemberTenant(env)
+
+  const rows = await env.DB.prepare(
+    `SELECT fa.agent_id, fa.agent_type, fa.runtime, fa.status, fa.lifecycle,
+            fa.last_reported_at, fa.member_id,
+            m.id AS m_id, m.email AS m_email, m.display_name AS m_display
+       FROM fleet_agents fa
+       LEFT JOIN members m ON m.id = fa.member_id AND m.tenant = fa.tenant
+      WHERE fa.tenant = ?1
+      ORDER BY fa.agent_id ASC`,
+  )
+    .bind(env.TENANT_SLUG)
+    .all<Record<string, unknown>>()
+
+  const out: AgentView[] = []
+  for (const r of rows.results ?? []) {
+    // BLOCK-2 fix: derive everything from the JOINED column (m_id), not the raw fleet row's
+    // member_id. The JOIN is tenant-bound (AND m.tenant = fa.tenant), so m_id is null when
+    // the linked member belongs to a different tenant or doesn't exist. Using r.member_id here
+    // bypasses that filter — a cross-tenant fa.member_id would still reach resolveCapabilities
+    // and expose the foreign member's capabilities even though member is correctly null.
+    // Only the tenant-matched joined identity may produce output (member + capabilities).
+    const joinedId = r.m_id == null ? null : String(r.m_id)
+    const capabilities = joinedId ? (await resolveCapabilities(env, joinedId)).map((g) => ({
+      scope_type: g.scope_type,
+      scope_id: g.scope_id,
+      capability: g.capability,
+    })) : []
+    out.push({
+      agent_id: String(r.agent_id),
+      type: String(r.agent_type ?? 'generic'),
+      runtime: String(r.runtime ?? ''),
+      status: String(r.status ?? 'unknown'),
+      lifecycle: String(r.lifecycle ?? ''),
+      last_seen: String(r.last_reported_at ?? ''),
+      member: joinedId == null ? null : {
+        id: joinedId,
+        email: r.m_email == null ? null : String(r.m_email),
+        display_name: String(r.m_display ?? ''),
+      },
+      capabilities,
+    })
+  }
+  return out
 }
 
 function parseSquads(v: unknown): string[] {

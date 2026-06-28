@@ -191,10 +191,10 @@ export async function seedSquadMembers(
       // If the email already exists (prior onboarding with a different UUID), the
       // insert is silently ignored — the existing row is preserved.
       const memberResult = await env.DB.prepare(
-        `INSERT OR IGNORE INTO members (id, email, display_name, status, created_at)
-         VALUES (?1, ?2, ?3, 'active', ?4)`,
+        `INSERT OR IGNORE INTO members (id, email, display_name, status, created_at, tenant)
+         VALUES (?1, ?2, ?3, 'active', ?4, ?5)`,
       )
-        .bind(syntheticId, def.email, def.display_name, now)
+        .bind(syntheticId, def.email, def.display_name, now, env.TENANT_SLUG)
         .run()
 
       const memberInserted = (memberResult.meta?.changes ?? 0) > 0
