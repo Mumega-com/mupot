@@ -25,7 +25,16 @@ import type { ChannelAdapter, Env, InboundMessage, Capability } from '../../type
 // it widens nothing for the core and never escapes this module.
 interface DiscordSecrets {
   DISCORD_PUBLIC_KEY?: string
+  // General / posting bot (Mumega). Used for: outbound posts (post(), postAgentActivity)
+  // and inbound interaction handling. Must be configured in all setups.
   DISCORD_BOT_TOKEN?: string
+  // Admin bot (Kasra). Holds Manage Roles + Manage Channels for privileged guild ops.
+  // Optional: absent in single-bot setups where DISCORD_BOT_TOKEN covers both roles.
+  // When set, all role-write and sync-read paths use this token instead of BOT_TOKEN.
+  // The fallback to DISCORD_BOT_TOKEN is intentional and documented — single-admin-
+  // capable-bot deployments need only DISCORD_BOT_TOKEN; separated setups set
+  // DISCORD_ADMIN_BOT_TOKEN for privileged ops only.
+  DISCORD_ADMIN_BOT_TOKEN?: string
 }
 
 function discordSecrets(env: Env): DiscordSecrets {
@@ -35,13 +44,27 @@ function discordSecrets(env: Env): DiscordSecrets {
 }
 
 /**
- * getDiscordBotToken — surface the bot token (or undefined if absent).
- * Exported so callers (e.g. discord-cap-sync) can check token presence before
- * making API calls, enabling explicit fail-closed behaviour instead of treating
- * a missing token as an empty role set.
+ * getDiscordBotToken — surface the general/posting bot token (or undefined if absent).
+ * Used by: outbound post(), inbound interaction handling.
+ * Exported so callers can check token presence before making API calls.
  */
 export function getDiscordBotToken(env: Env): string | undefined {
   return discordSecrets(env).DISCORD_BOT_TOKEN
+}
+
+/**
+ * getDiscordAdminToken — surface the admin bot token for privileged guild ops
+ * (role management, channel management, sync-path reads).
+ *
+ * Two-bot setup: DISCORD_ADMIN_BOT_TOKEN is the Kasra admin bot (Manage Roles +
+ * Manage Channels). Single-bot setup: falls back to DISCORD_BOT_TOKEN — the fallback
+ * is intentional. Separated setups set DISCORD_ADMIN_BOT_TOKEN for privileged ops;
+ * single-admin-capable-bot setups set only DISCORD_BOT_TOKEN. If neither token is
+ * configured this returns undefined and callers MUST fail closed.
+ */
+export function getDiscordAdminToken(env: Env): string | undefined {
+  const s = discordSecrets(env)
+  return s.DISCORD_ADMIN_BOT_TOKEN ?? s.DISCORD_BOT_TOKEN
 }
 
 const DISCORD_API = 'https://discord.com/api/v10'
@@ -422,19 +445,29 @@ interface DiscordGuildMember {
 }
 
 /**
- * discordGet — authenticated GET against the Discord API with the bot token.
- * Exported so discord-cap-sync can use it as the production default for fetching
- * guild member role data in the capability→role projection (BLOCK-2 fix: the sync
- * must use the real GET on the live path so stale roles are actually removed).
+ * discordGet — authenticated GET against the Discord API.
+ *
+ * Exported so discord-cap-sync and the sync route can use it for production
+ * Discord reads (BLOCK-2 fix: real bot-token fetch, not a noop).
+ *
+ * Token resolution:
+ *   - If `token` is supplied explicitly, that token is used (e.g. admin token for
+ *     sync-path reads that require Manage Roles scope).
+ *   - If `token` is omitted, falls back to DISCORD_BOT_TOKEN — the general/posting
+ *     bot. This preserves back-compat for non-admin callers (listChannelMembers,
+ *     roleCapability, channelGuildId) that do not need the admin token.
+ *
  * Returns null on any error (token absent, non-2xx, parse failure) — fail-soft so
  * a transient Discord outage does not wedge reconciliation. Callers must treat
  * null as "no data" and handle accordingly (see discord-cap-sync.ts).
  */
-export async function discordGet(env: Env, path: string): Promise<unknown | null> {
-  const token = discordSecrets(env).DISCORD_BOT_TOKEN
-  if (!token) return null
+export async function discordGet(env: Env, path: string, token?: string): Promise<unknown | null> {
+  // Explicit token takes precedence (admin-bot path). Fall back to the posting bot
+  // for back-compat callers that do not pass a token.
+  const tok = token ?? discordSecrets(env).DISCORD_BOT_TOKEN
+  if (!tok) return null
   const res = await fetch(`${DISCORD_API}${path}`, {
-    headers: { authorization: `Bot ${token}` },
+    headers: { authorization: `Bot ${tok}` },
   })
   if (!res.ok) return null
   return res.json<unknown>().catch(() => null)
@@ -588,8 +621,10 @@ export async function addMemberRole(
   discordUserId: string,
   roleId: string,
 ): Promise<void> {
-  const token = discordSecrets(env).DISCORD_BOT_TOKEN
-  if (!token) throw new Error('discord: DISCORD_BOT_TOKEN not configured')
+  // Privileged op — use the admin bot (Manage Roles). Falls back to DISCORD_BOT_TOKEN
+  // for single-bot setups. See getDiscordAdminToken().
+  const token = getDiscordAdminToken(env)
+  if (!token) throw new Error('discord: DISCORD_ADMIN_BOT_TOKEN (or DISCORD_BOT_TOKEN) not configured')
 
   const res = await fetch(
     `${DISCORD_API}/guilds/${encodeURIComponent(guildId)}/members/${encodeURIComponent(discordUserId)}/roles/${encodeURIComponent(roleId)}`,
@@ -622,8 +657,10 @@ export async function createGuildRole(
   guildId: string,
   name: string,
 ): Promise<string> {
-  const token = discordSecrets(env).DISCORD_BOT_TOKEN
-  if (!token) throw new Error('discord: DISCORD_BOT_TOKEN not configured')
+  // Privileged op — use the admin bot (Manage Roles). Falls back to DISCORD_BOT_TOKEN
+  // for single-bot setups. See getDiscordAdminToken().
+  const token = getDiscordAdminToken(env)
+  if (!token) throw new Error('discord: DISCORD_ADMIN_BOT_TOKEN (or DISCORD_BOT_TOKEN) not configured')
 
   const res = await fetch(
     `${DISCORD_API}/guilds/${encodeURIComponent(guildId)}/roles`,
@@ -662,8 +699,10 @@ export async function removeMemberRole(
   discordUserId: string,
   roleId: string,
 ): Promise<void> {
-  const token = discordSecrets(env).DISCORD_BOT_TOKEN
-  if (!token) throw new Error('discord: DISCORD_BOT_TOKEN not configured')
+  // Privileged op — use the admin bot (Manage Roles). Falls back to DISCORD_BOT_TOKEN
+  // for single-bot setups. See getDiscordAdminToken().
+  const token = getDiscordAdminToken(env)
+  if (!token) throw new Error('discord: DISCORD_ADMIN_BOT_TOKEN (or DISCORD_BOT_TOKEN) not configured')
 
   const res = await fetch(
     `${DISCORD_API}/guilds/${encodeURIComponent(guildId)}/members/${encodeURIComponent(discordUserId)}/roles/${encodeURIComponent(roleId)}`,

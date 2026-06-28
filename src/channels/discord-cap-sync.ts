@@ -36,7 +36,7 @@
 
 import type { Env, Capability, CapabilityGrant, CapabilityScopeType } from '../types'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
-import { addMemberRole, removeMemberRole, discordGet, getDiscordBotToken } from './adapters/discord'
+import { addMemberRole, removeMemberRole, discordGet, getDiscordAdminToken } from './adapters/discord'
 
 // ── §2A capability → Discord role name map ────────────────────────────────────
 //
@@ -287,18 +287,27 @@ export async function projectMemberCapabilitiesToDiscord(
 
   // Resolve injectables and enforce fail-closed GET discipline.
   // BLOCK-3 fix: fail-CLOSED on absent token and on GET failure.
-  //   - No token + no injected getter  → 'no_token' (don't call add/remove).
+  //   - No admin token + no injected getter  → 'no_token' (don't call add/remove).
   //   - Token present but GET null/throws → 'api_error' (don't treat as empty roles).
   //   - A member with no managed roles returns { roles:[] }, never null — so null from
   //     getFn unambiguously signals a failed GET, not a legitimately empty role set.
+  //
+  // S196 two-bot: admin token (DISCORD_ADMIN_BOT_TOKEN ?? DISCORD_BOT_TOKEN) is used
+  // for the sync GET (member roles read) — the same bot that holds Manage Roles must
+  // also be able to read the member's current role set to diff correctly.
   const usingProductionGetter = !inject?.discordGetFn
   if (usingProductionGetter) {
-    const token = getDiscordBotToken(env)
+    const token = getDiscordAdminToken(env)
     if (!token) {
-      return { ok: false, reason: 'no_token', detail: 'DISCORD_BOT_TOKEN not configured' }
+      return {
+        ok: false,
+        reason: 'no_token',
+        detail: 'No Discord admin token configured (DISCORD_ADMIN_BOT_TOKEN or DISCORD_BOT_TOKEN)',
+      }
     }
   }
-  const getFn = inject?.discordGetFn ?? ((path: string) => discordGet(env, path))
+  // Admin bot reads the member's current role set; posting bot is not used here.
+  const getFn = inject?.discordGetFn ?? ((path: string) => discordGet(env, path, getDiscordAdminToken(env)))
   const doAddRole = inject?.addRoleFn ?? ((g, u, r) => addMemberRole(env, g, u, r))
   const doRemoveRole = inject?.removeRoleFn ?? ((g, u, r) => removeMemberRole(env, g, u, r))
 

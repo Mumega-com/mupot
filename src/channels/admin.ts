@@ -12,7 +12,7 @@ import type { Env, AuthContext, Capability, ChannelBinding } from '../types'
 import { requireAuth } from '../auth'
 import { requireOrgCapability, actorMaxRankOnScope } from '../auth/capability'
 import { getAdapter } from './registry'
-import { discordGet, createGuildRole, getDiscordBotToken } from './adapters/discord'
+import { discordGet, createGuildRole, getDiscordAdminToken } from './adapters/discord'
 import { projectMemberCapabilitiesToDiscord, MANAGED_DISCORD_ROLES } from './discord-cap-sync'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -198,10 +198,19 @@ channelsAdminApp.post('/discord/sync', requireOrgCapability('admin'), async (c) 
   const squadId = parse.data.squadId ?? 'squad-core'
   const dryRun = dryRunQuery || (parse.data.dryRun ?? false)
 
-  // ── fail-closed on absent bot token before any external calls ────────────
-  const botToken = getDiscordBotToken(c.env)
-  if (!botToken) {
-    return c.json({ error: 'no_discord_token', hint: 'DISCORD_BOT_TOKEN not configured' }, 503)
+  // ── fail-closed on absent admin token before any external calls ──────────
+  // S196 two-bot: DISCORD_ADMIN_BOT_TOKEN is the Kasra admin bot (Manage Roles +
+  // Manage Channels). Single-bot setups fall back to DISCORD_BOT_TOKEN via
+  // getDiscordAdminToken. If neither is configured → 503.
+  const adminToken = getDiscordAdminToken(c.env)
+  if (!adminToken) {
+    return c.json(
+      {
+        error: 'no_discord_token',
+        hint: 'Set DISCORD_ADMIN_BOT_TOKEN (privileged ops) or DISCORD_BOT_TOKEN (single-bot setup)',
+      },
+      503,
+    )
   }
 
   // ── step 1: resolve guild id from the squad's bound Discord channel ───────
@@ -218,9 +227,12 @@ channelsAdminApp.post('/discord/sync', requireOrgCapability('admin'), async (c) 
     return c.json({ error: 'no_discord_binding', squadId }, 404)
   }
 
+  // Admin bot reads the channel and guild roles — the same bot that holds Manage Roles
+  // must be able to read guild metadata for the sync to work correctly.
   const channelData = await discordGet(
     c.env,
     `/channels/${encodeURIComponent(binding.external_channel_id)}`,
+    adminToken,
   )
   if (!channelData || typeof channelData !== 'object') {
     return c.json(
@@ -238,6 +250,7 @@ channelsAdminApp.post('/discord/sync', requireOrgCapability('admin'), async (c) 
   const rolesData = await discordGet(
     c.env,
     `/guilds/${encodeURIComponent(guildId)}/roles`,
+    adminToken,
   )
   if (!Array.isArray(rolesData)) {
     return c.json(
