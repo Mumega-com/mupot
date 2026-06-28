@@ -34,6 +34,16 @@ function discordSecrets(env: Env): DiscordSecrets {
   return env as unknown as DiscordSecrets
 }
 
+/**
+ * getDiscordBotToken — surface the bot token (or undefined if absent).
+ * Exported so callers (e.g. discord-cap-sync) can check token presence before
+ * making API calls, enabling explicit fail-closed behaviour instead of treating
+ * a missing token as an empty role set.
+ */
+export function getDiscordBotToken(env: Env): string | undefined {
+  return discordSecrets(env).DISCORD_BOT_TOKEN
+}
+
 const DISCORD_API = 'https://discord.com/api/v10'
 
 // ── Ed25519 verification (Web Crypto, fail-closed) ────────────────────────────

@@ -538,24 +538,26 @@ describe('projectMemberCapabilitiesToDiscord — diff + idempotency', () => {
   })
 })
 
-// ── BLOCK-2 regression: production GET path uses real discordGet ──────────────
+// ── BLOCK-2 + BLOCK-3 regression: fail-closed GET discipline ─────────────────
 //
-// BUG: const getFn = inject?.discordGetFn ?? noopGet — noopGet always returned
-// null, so currentRoleIds was always [] → toRemove was always [] → stale Discord
-// roles could NEVER be removed in production. Fix: default to real discordGet.
+// BLOCK-2 BUG: production GET default was noopGet (always null) — stale Discord
+// roles could never be removed in production. Fix: default to real discordGet.
 //
-// This test verifies the production default path (no discordGetFn injected) calls
-// the real discordGet (which calls fetch), so stale roles ARE fetched and removed.
+// BLOCK-3 BUG: null from discordGet was treated as "member has no roles" (empty
+// array) — revoked members kept their @owner/@lead in Discord because the sync
+// thought there was nothing to remove. Fix:
+//   - No token + no injected getter  -> ok:false 'no_token', zero add/remove.
+//   - Token present but GET returns null -> ok:false 'api_error', zero add/remove.
+//   - Real empty-roles member (roles:[]) -> proceed normally (add target, no remove).
 
-describe('BLOCK-2 regression — production GET path fetches real Discord member roles', () => {
+describe('BLOCK-2+3 regression — production GET path + fail-closed discipline', () => {
   afterEach(() => { vi.unstubAllGlobals() })
 
-  it('without injected discordGetFn, stale @owner is removed when Alice is demoted to member', async () => {
-    // Alice: owner→member in mupot. Discord still shows @owner (stale).
-    // The production GET must fetch her real Discord roles so @owner is removed.
+  it('BLOCK-2: no injected discordGetFn, stale @owner removed via real discordGet (mocked fetch)', async () => {
+    // Alice: demoted owner->member in mupot. Discord still shows @owner (stale).
     const db = makeDb(aliceMember('member', 'org'))
-    // DISCORD_BOT_TOKEN must be set so discordGet doesn't short-circuit to null.
-    const env = { DB: db, DISCORD_BOT_TOKEN: 'fake-bot-token-for-test' } as unknown as ReturnType<typeof makeEnv>
+    // DISCORD_BOT_TOKEN must be set so discordGet does not short-circuit to null.
+    const env = { DB: db, DISCORD_BOT_TOKEN: 'fake-bot-token-for-test' } as unknown as Env
 
     // Stub global fetch: Discord GET returns Alice with stale @owner role.
     const mockFetch = vi.fn().mockResolvedValue({
@@ -566,9 +568,9 @@ describe('BLOCK-2 regression — production GET path fetches real Discord member
 
     const addedRoles: string[] = []
     const removedRoles: string[] = []
-    // Note: NO discordGetFn injected — tests production default path.
+    // NO discordGetFn injected -- production default path.
     const result = await projectMemberCapabilitiesToDiscord(
-      env as unknown as Env,
+      env,
       ALICE_MEMBER_ID, GUILD_ID, ROLE_MAP,
       {
         addRoleFn: async (_g, _u, roleId) => { addedRoles.push(roleId) },
@@ -579,15 +581,68 @@ describe('BLOCK-2 regression — production GET path fetches real Discord member
     expect(result.ok).toBe(true)
     if (!result.ok) return
 
-    // BLOCK-2 fix verification: fetch was called (real discordGet, not noopGet).
+    // Fetch was called (real discordGet, not noopGet or null).
     expect(mockFetch).toHaveBeenCalledTimes(1)
     expect(mockFetch.mock.calls[0][0]).toContain(`/guilds/${GUILD_ID}/members/${ALICE_DISCORD_ID}`)
 
-    // Stale @owner REMOVED; @member ADDED (correct mupot cap).
+    // Stale @owner REMOVED; @member ADDED.
     expect(result.removed).toContain('@owner')
     expect(result.added).toContain('@member')
     expect(removedRoles).toContain(ROLE_MAP['@owner'])
     expect(addedRoles).toContain(ROLE_MAP['@member'])
+  })
+
+  it('BLOCK-3a: absent DISCORD_BOT_TOKEN returns ok:false reason:no_token, zero add/remove', async () => {
+    // Alice: stale @owner in Discord, demoted to member in mupot. No bot token set.
+    // The sync must refuse entirely, not silently claim no stale roles exist.
+    const db = makeDb(aliceMember('member', 'org'))
+    const env = { DB: db } as unknown as Env  // no DISCORD_BOT_TOKEN
+
+    const addRoleSpy = vi.fn()
+    const removeRoleSpy = vi.fn()
+
+    const result = await projectMemberCapabilitiesToDiscord(
+      env,
+      ALICE_MEMBER_ID, GUILD_ID, ROLE_MAP,
+      // No discordGetFn -- production getter path requires the token.
+      { addRoleFn: addRoleSpy, removeRoleFn: removeRoleSpy },
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason).toBe('no_token')
+
+    // CRITICAL: no add or remove was called. The sync did not report false success.
+    expect(addRoleSpy).not.toHaveBeenCalled()
+    expect(removeRoleSpy).not.toHaveBeenCalled()
+  })
+
+  it('BLOCK-3b: token present but GET returns null returns ok:false reason:api_error, no removals', async () => {
+    // Alice: stale @owner in Discord, demoted to member in mupot. GET fails (null).
+    // Treating null as "no roles" would suppress the removal of @owner. Must not.
+    const db = makeDb(aliceMember('member', 'org'))
+    const env = makeEnv(db)
+
+    const addRoleSpy = vi.fn()
+    const removeRoleSpy = vi.fn()
+
+    const result = await projectMemberCapabilitiesToDiscord(
+      env,
+      ALICE_MEMBER_ID, GUILD_ID, ROLE_MAP,
+      {
+        discordGetFn: async (_path) => null,  // simulates API error / 404 / timeout
+        addRoleFn: addRoleSpy,
+        removeRoleFn: removeRoleSpy,
+      },
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason).toBe('api_error')
+
+    // No add or remove -- sync did not proceed without confirmed current roles.
+    expect(addRoleSpy).not.toHaveBeenCalled()
+    expect(removeRoleSpy).not.toHaveBeenCalled()
   })
 })
 

@@ -36,7 +36,7 @@
 
 import type { Env, Capability, CapabilityGrant, CapabilityScopeType } from '../types'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
-import { addMemberRole, removeMemberRole, discordGet } from './adapters/discord'
+import { addMemberRole, removeMemberRole, discordGet, getDiscordBotToken } from './adapters/discord'
 
 // ── §2A capability → Discord role name map ────────────────────────────────────
 //
@@ -216,7 +216,11 @@ export interface ProjectionResult {
 
 export interface ProjectionFailure {
   ok: false
-  reason: 'unbound' | 'suspended' | 'api_error'
+  reason:
+    | 'unbound'    // member has no Discord identity in member_identities
+    | 'suspended'  // member is suspended
+    | 'no_token'   // DISCORD_BOT_TOKEN absent — cannot reach Discord API
+    | 'api_error'  // Discord API returned null or threw (token present but GET failed)
   detail?: string
 }
 
@@ -281,32 +285,46 @@ export async function projectMemberCapabilitiesToDiscord(
   // 3. Compute target Discord role.
   const targetRole = capToRoleKey(grants)
 
-  // Resolve injectables (defaults to real Discord API helpers).
-  //
-  // BLOCK-2 fix: the production GET default is the REAL discordGet (bot-token fetch),
-  // NOT noopGet. noopGet always returns null → currentRoleIds=[] → toRemove=[] →
-  // stale roles are never removed → "revoke a mupot grant removes the Discord role"
-  // criterion is broken on the real path. The real discordGet is fail-soft (returns
-  // null on any error), so a transient Discord outage still doesn't crash the sync —
-  // but stale roles ARE removed when Discord is reachable.
+  // Resolve injectables and enforce fail-closed GET discipline.
+  // BLOCK-3 fix: fail-CLOSED on absent token and on GET failure.
+  //   - No token + no injected getter  → 'no_token' (don't call add/remove).
+  //   - Token present but GET null/throws → 'api_error' (don't treat as empty roles).
+  //   - A member with no managed roles returns { roles:[] }, never null — so null from
+  //     getFn unambiguously signals a failed GET, not a legitimately empty role set.
+  const usingProductionGetter = !inject?.discordGetFn
+  if (usingProductionGetter) {
+    const token = getDiscordBotToken(env)
+    if (!token) {
+      return { ok: false, reason: 'no_token', detail: 'DISCORD_BOT_TOKEN not configured' }
+    }
+  }
   const getFn = inject?.discordGetFn ?? ((path: string) => discordGet(env, path))
   const doAddRole = inject?.addRoleFn ?? ((g, u, r) => addMemberRole(env, g, u, r))
   const doRemoveRole = inject?.removeRoleFn ?? ((g, u, r) => removeMemberRole(env, g, u, r))
 
   // 4. Fetch current Discord roles for this guild member.
   const getPath = `/guilds/${encodeURIComponent(guildId)}/members/${encodeURIComponent(discordUserId)}`
-  let currentRoleIds: string[] = []
+  let memberData: unknown
   try {
-    const memberData = await getFn(getPath)
-    if (memberData && typeof memberData === 'object') {
-      const roles = (memberData as { roles?: unknown }).roles
-      if (Array.isArray(roles)) {
-        currentRoleIds = roles.filter((r): r is string => typeof r === 'string')
-      }
+    memberData = await getFn(getPath)
+  } catch (err) {
+    return {
+      ok: false,
+      reason: 'api_error',
+      detail: `discord: member GET threw: ${err instanceof Error ? err.message : String(err)}`,
     }
-  } catch {
-    // Fail-soft: if Discord is unreachable, skip the sync this cycle. Do NOT
-    // mutate capabilities. A failed sync is retried on the next projection run.
+  }
+  // null = GET failed (API error, 404, network). An object with roles:[] is a
+  // member who legitimately holds no managed roles — that's fine, not a failure.
+  if (memberData == null) {
+    return { ok: false, reason: 'api_error', detail: 'discord: member GET returned null' }
+  }
+  let currentRoleIds: string[] = []
+  if (typeof memberData === 'object') {
+    const roles = (memberData as { roles?: unknown }).roles
+    if (Array.isArray(roles)) {
+      currentRoleIds = roles.filter((r): r is string => typeof r === 'string')
+    }
   }
 
   // Build current role id → name reverse map for the managed roles only.
