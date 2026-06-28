@@ -1,9 +1,10 @@
 // mupot — S196 squad-seed (Slice A).
 //
 // Idempotent mechanism that creates mupot `members` + `capabilities` rows for
-// the Mumega squad: hadi (owner), loom (lead), kasra/river/codex (member),
-// and a +1 colleague placeholder (observer). All writes use INSERT OR IGNORE so
-// re-running is a safe no-op.
+// the Mumega squad (S196 confirmed map, Hadi-direct 2026-06-28):
+//   hadi → owner @ org · kasra → admin · loom → lead · river → lead ·
+//   codex → member · mumega-brain → member (all squad-scope except hadi).
+// All writes use INSERT OR IGNORE so re-running is a safe no-op.
 //
 // DISCIPLINE (same as the rest of the sovereign core):
 //   - This module has NO side-effects on import. seedSquadMembers() is called
@@ -15,17 +16,17 @@
 //   - The seed NEVER writes member_tokens (tokens are minted at dock time by the
 //     pot's own /admin/members flow — dogfooding the existing surface).
 //
-// Capability map (§2A S196):
-//   hadi      → owner    @ org
-//   loom      → lead     @ org     (weaver / CFO, runs the ledger)
-//   kasra     → member   @ squad   (build arm — squad-scoped; falls back to org)
-//   river     → member   @ squad   (editor / creative)
-//   codex     → member   @ squad   (adversarial review arm)
-//   colleague → observer @ org     (placeholder; elevated at dock by admin)
+// Capability map (S196 confirmed, Hadi-direct 2026-06-28):
+//   hadi         → owner  @ org    (unchanged; pre-existing mem-hadi)
+//   kasra        → admin  @ squad  (build arm — squad-admin, bounded; NOT org-admin)
+//   loom         → lead   @ squad  (weaver / CFO, runs the ledger)
+//   river        → lead   @ squad  (editor / creative)
+//   codex        → member @ squad  (adversarial review arm)
+//   mumega-brain → member @ squad  (the prioritizer / ATC)
 //
-// The squadId is optional. When provided, agent members (kasra/river/codex) are
-// granted at squad scope. When absent they fall back to org scope so the grants
-// are still useful without a squad pre-existing.
+// The squadId is optional. When provided, the agents are granted at squad scope.
+// When absent they fall back to org scope (same caps) so the grants are still
+// useful without a squad pre-existing.
 
 import type { Env, CapabilityScopeType, Capability } from '../types'
 
@@ -66,15 +67,18 @@ async function deterministicGrantId(memberId: string, scopeType: CapabilityScope
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
 }
 
-/** Build the full squad definition for the given optional squadId. */
-export function buildSquadDefs(squadId: string | null): SquadMemberDef[] {
-  // Agent-scoped members default to squad scope when squadId is provided, else org.
-  const agentScope: { scope_type: CapabilityScopeType; scope_id: string | null } =
-    squadId
-      ? { scope_type: 'squad', scope_id: squadId }
-      : { scope_type: 'org', scope_id: null }
+/** Build the full squad definition. squadId is REQUIRED: squad agents are granted
+ *  at squad scope only. There is deliberately NO org-scope fallback — an org-scope
+ *  fallback would silently make kasra=admin@org (org-admin), an escalation past the
+ *  "bounded squad-admin" intent. hadi alone is org-scoped (the org owner). */
+export function buildSquadDefs(squadId: string): SquadMemberDef[] {
+  const agentScope: { scope_type: CapabilityScopeType; scope_id: string | null } = {
+    scope_type: 'squad',
+    scope_id: squadId,
+  }
 
   return [
+    // hadi is the org owner — ALWAYS org scope, unchanged (pre-existing mem-hadi).
     {
       slug: 'hadi',
       display_name: 'Hadi Servat',
@@ -83,26 +87,27 @@ export function buildSquadDefs(squadId: string | null): SquadMemberDef[] {
       scope_type: 'org',
       scope_id: null,
     },
+    // Squad agents (S196 confirmed map, Hadi-direct 2026-06-28): squad-scope when a
+    // squadId is provided, org fallback (same caps) when absent.
+    {
+      slug: 'kasra',
+      display_name: 'Kasra',
+      email: 'kasra@agents.mumega.com',
+      capability: 'admin',
+      ...agentScope,
+    },
     {
       slug: 'loom',
       display_name: 'Loom',
       email: 'loom@agents.mumega.com',
       capability: 'lead',
-      scope_type: 'org',
-      scope_id: null,
-    },
-    {
-      slug: 'kasra',
-      display_name: 'Kasra',
-      email: 'kasra@agents.mumega.com',
-      capability: 'member',
       ...agentScope,
     },
     {
       slug: 'river',
       display_name: 'River',
       email: 'river@agents.mumega.com',
-      capability: 'member',
+      capability: 'lead',
       ...agentScope,
     },
     {
@@ -113,12 +118,11 @@ export function buildSquadDefs(squadId: string | null): SquadMemberDef[] {
       ...agentScope,
     },
     {
-      slug: 'colleague',
-      display_name: 'Colleague (placeholder)',
-      email: 'colleague@mumega.com',
-      capability: 'observer',
-      scope_type: 'org',
-      scope_id: null,
+      slug: 'mumega-brain',
+      display_name: 'Mumega Brain',
+      email: 'mumega-brain@agents.mumega.com',
+      capability: 'member',
+      ...agentScope,
     },
   ]
 }
@@ -132,7 +136,7 @@ export interface SeedResult {
 
 export interface SeedFailure {
   ok: false
-  reason: 'db_error'
+  reason: 'db_error' | 'squad_required'
   detail: string
 }
 
@@ -142,8 +146,9 @@ export interface SeedFailure {
  * seedSquadMembers — idempotent seed of the Mumega squad onto this pot.
  *
  * @param env      the Cloudflare Worker environment (must have env.DB)
- * @param squadId  optional squad UUID: when provided, kasra/river/codex are
- *                 granted at squad scope; when absent they fall back to org scope.
+ * @param squadId  REQUIRED squad UUID — all squad agents are granted at squad scope.
+ *                 There is NO org-scope fallback (that would escalate kasra to
+ *                 org-admin). An empty squadId fails closed ('squad_required').
  *
  * All writes are INSERT OR IGNORE — safe to re-run at any time. The function
  * NEVER writes member_tokens (tokens are minted at dock time via the admin UI).
@@ -163,8 +168,17 @@ export interface SeedFailure {
  */
 export async function seedSquadMembers(
   env: Env,
-  squadId: string | null = null,
+  squadId: string,
 ): Promise<SeedResult | SeedFailure> {
+  // Fail closed: squad-scoped grants require a squad. Never fall back to org
+  // scope (that would make kasra=admin@org — an escalation past squad-admin).
+  if (!squadId) {
+    return {
+      ok: false,
+      reason: 'squad_required',
+      detail: 'seedSquadMembers requires a squadId — no org-scope fallback for squad agents',
+    }
+  }
   const defs = buildSquadDefs(squadId)
   const now = new Date().toISOString()
   const results: SeedResult['seeded'] = []
