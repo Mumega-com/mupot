@@ -1,9 +1,10 @@
 // mupot — S196 squad-seed (Slice A).
 //
 // Idempotent mechanism that creates mupot `members` + `capabilities` rows for
-// the Mumega squad: hadi (owner), loom (lead), kasra/river/codex (member),
-// and a +1 colleague placeholder (observer). All writes use INSERT OR IGNORE so
-// re-running is a safe no-op.
+// the Mumega squad (S196 confirmed map, Hadi-direct 2026-06-28):
+//   hadi → owner @ org · kasra → admin · loom → lead · river → lead ·
+//   codex → member · mumega-brain → member (all squad-scope except hadi).
+// All writes use INSERT OR IGNORE so re-running is a safe no-op.
 //
 // DISCIPLINE (same as the rest of the sovereign core):
 //   - This module has NO side-effects on import. seedSquadMembers() is called
@@ -15,17 +16,17 @@
 //   - The seed NEVER writes member_tokens (tokens are minted at dock time by the
 //     pot's own /admin/members flow — dogfooding the existing surface).
 //
-// Capability map (§2A S196):
-//   hadi      → owner    @ org
-//   loom      → lead     @ org     (weaver / CFO, runs the ledger)
-//   kasra     → member   @ squad   (build arm — squad-scoped; falls back to org)
-//   river     → member   @ squad   (editor / creative)
-//   codex     → member   @ squad   (adversarial review arm)
-//   colleague → observer @ org     (placeholder; elevated at dock by admin)
+// Capability map (S196 confirmed, Hadi-direct 2026-06-28):
+//   hadi         → owner  @ org    (unchanged; pre-existing mem-hadi)
+//   kasra        → admin  @ squad  (build arm — squad-admin, bounded; NOT org-admin)
+//   loom         → lead   @ squad  (weaver / CFO, runs the ledger)
+//   river        → lead   @ squad  (editor / creative)
+//   codex        → member @ squad  (adversarial review arm)
+//   mumega-brain → member @ squad  (the prioritizer / ATC)
 //
-// The squadId is optional. When provided, agent members (kasra/river/codex) are
-// granted at squad scope. When absent they fall back to org scope so the grants
-// are still useful without a squad pre-existing.
+// The squadId is optional. When provided, the agents are granted at squad scope.
+// When absent they fall back to org scope (same caps) so the grants are still
+// useful without a squad pre-existing.
 
 import type { Env, CapabilityScopeType, Capability } from '../types'
 
@@ -75,6 +76,7 @@ export function buildSquadDefs(squadId: string | null): SquadMemberDef[] {
       : { scope_type: 'org', scope_id: null }
 
   return [
+    // hadi is the org owner — ALWAYS org scope, unchanged (pre-existing mem-hadi).
     {
       slug: 'hadi',
       display_name: 'Hadi Servat',
@@ -83,26 +85,27 @@ export function buildSquadDefs(squadId: string | null): SquadMemberDef[] {
       scope_type: 'org',
       scope_id: null,
     },
+    // Squad agents (S196 confirmed map, Hadi-direct 2026-06-28): squad-scope when a
+    // squadId is provided, org fallback (same caps) when absent.
+    {
+      slug: 'kasra',
+      display_name: 'Kasra',
+      email: 'kasra@agents.mumega.com',
+      capability: 'admin',
+      ...agentScope,
+    },
     {
       slug: 'loom',
       display_name: 'Loom',
       email: 'loom@agents.mumega.com',
       capability: 'lead',
-      scope_type: 'org',
-      scope_id: null,
-    },
-    {
-      slug: 'kasra',
-      display_name: 'Kasra',
-      email: 'kasra@agents.mumega.com',
-      capability: 'member',
       ...agentScope,
     },
     {
       slug: 'river',
       display_name: 'River',
       email: 'river@agents.mumega.com',
-      capability: 'member',
+      capability: 'lead',
       ...agentScope,
     },
     {
@@ -113,12 +116,11 @@ export function buildSquadDefs(squadId: string | null): SquadMemberDef[] {
       ...agentScope,
     },
     {
-      slug: 'colleague',
-      display_name: 'Colleague (placeholder)',
-      email: 'colleague@mumega.com',
-      capability: 'observer',
-      scope_type: 'org',
-      scope_id: null,
+      slug: 'mumega-brain',
+      display_name: 'Mumega Brain',
+      email: 'mumega-brain@agents.mumega.com',
+      capability: 'member',
+      ...agentScope,
     },
   ]
 }

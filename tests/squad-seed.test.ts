@@ -244,7 +244,7 @@ describe('seedSquadMembers — Slice A', () => {
     expect(result.seeded.length).toBe(6)
     expect(db._members.length).toBe(6)
     const slugs = result.seeded.map((s) => s.slug).sort()
-    expect(slugs).toEqual(['codex', 'colleague', 'hadi', 'kasra', 'loom', 'river'])
+    expect(slugs).toEqual(['codex', 'hadi', 'kasra', 'loom', 'mumega-brain', 'river'])
   })
 
   it('all 6 members get exactly 1 capability grant each', async () => {
@@ -268,23 +268,39 @@ describe('seedSquadMembers — Slice A', () => {
     expect(hasCapability(grants, 'org', null, 'observer')).toBe(true)
   })
 
-  it('resolveCapabilities → loom has lead at org scope', async () => {
+  it('resolveCapabilities → kasra has admin (no squadId → org fallback)', async () => {
     const db = makeDb()
     const env = makeEnv(db)
     await seedSquadMembers(env, null)
-    const loomId = await deterministicMemberId('loom')
-    const grants = await resolveCapabilities(env, loomId)
+    const kasraId = await deterministicMemberId('kasra')
+    const grants = await resolveCapabilities(env, kasraId)
+    // admin covers lead/member/observer on the ladder…
+    expect(hasCapability(grants, 'org', null, 'admin')).toBe(true)
     expect(hasCapability(grants, 'org', null, 'lead')).toBe(true)
     expect(hasCapability(grants, 'org', null, 'member')).toBe(true)
-    // loom does NOT have owner
+    // …but NOT owner.
     expect(hasCapability(grants, 'org', null, 'owner')).toBe(false)
   })
 
-  it('resolveCapabilities → kasra/river/codex have member at org scope (no squadId)', async () => {
+  it('resolveCapabilities → loom/river have lead, NOT admin (no squadId)', async () => {
     const db = makeDb()
     const env = makeEnv(db)
     await seedSquadMembers(env, null)
-    for (const slug of ['kasra', 'river', 'codex']) {
+    for (const slug of ['loom', 'river']) {
+      const id = await deterministicMemberId(slug)
+      const grants = await resolveCapabilities(env, id)
+      expect(hasCapability(grants, 'org', null, 'lead')).toBe(true)
+      expect(hasCapability(grants, 'org', null, 'member')).toBe(true)
+      expect(hasCapability(grants, 'org', null, 'admin')).toBe(false) // not admin
+      expect(hasCapability(grants, 'org', null, 'owner')).toBe(false) // not owner
+    }
+  })
+
+  it('resolveCapabilities → codex/mumega-brain have member, NOT lead (no squadId)', async () => {
+    const db = makeDb()
+    const env = makeEnv(db)
+    await seedSquadMembers(env, null)
+    for (const slug of ['codex', 'mumega-brain']) {
       const id = await deterministicMemberId(slug)
       const grants = await resolveCapabilities(env, id)
       expect(hasCapability(grants, 'org', null, 'member')).toBe(true)
@@ -293,29 +309,21 @@ describe('seedSquadMembers — Slice A', () => {
     }
   })
 
-  it('resolveCapabilities → kasra/river/codex have member at squad scope (with squadId)', async () => {
+  it('resolveCapabilities → squad-scope grants do NOT bubble to org (with squadId)', async () => {
     const db = makeDb()
     const env = makeEnv(db)
     const squadId = 'sq-test-0001-0001-0001-000000000001'
     await seedSquadMembers(env, squadId)
-    for (const slug of ['kasra', 'river', 'codex']) {
-      const id = await deterministicMemberId(slug)
-      const grants = await resolveCapabilities(env, id)
-      // squad-scope grant satisfies squad-scope checks
+    // kasra=admin@squad, codex=member@squad — each satisfies its squad check,
+    // and NONE satisfy the org check (no upward bubble).
+    const kasraGrants = await resolveCapabilities(env, await deterministicMemberId('kasra'))
+    expect(hasCapability(kasraGrants, 'squad', squadId, 'admin')).toBe(true)
+    expect(hasCapability(kasraGrants, 'org', null, 'admin')).toBe(false)
+    for (const slug of ['codex', 'mumega-brain']) {
+      const grants = await resolveCapabilities(env, await deterministicMemberId(slug))
       expect(hasCapability(grants, 'squad', squadId, 'member')).toBe(true)
-      // squad-scope grant does NOT satisfy org-scope checks (no upward bubble)
       expect(hasCapability(grants, 'org', null, 'member')).toBe(false)
     }
-  })
-
-  it('resolveCapabilities → colleague has observer at org scope', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
-    await seedSquadMembers(env, null)
-    const id = await deterministicMemberId('colleague')
-    const grants = await resolveCapabilities(env, id)
-    expect(hasCapability(grants, 'org', null, 'observer')).toBe(true)
-    expect(hasCapability(grants, 'org', null, 'member')).toBe(false)
   })
 
   it('idempotency: re-seeding returns ok with 0 inserts (no duplicates)', async () => {
@@ -345,23 +353,34 @@ describe('seedSquadMembers — Slice A', () => {
     expect(id1).not.toBe(id3)
   })
 
-  it('buildSquadDefs returns 6 defs; squad scope sets correct scope_id', () => {
+  it('buildSquadDefs returns 6 defs with the confirmed cap map; squad scope sets scope_id', () => {
     const squadId = 'test-squad-id'
     const defs = buildSquadDefs(squadId)
     expect(defs.length).toBe(6)
-    // hadi/loom/colleague always org scope
+    expect(defs.map((d) => d.slug).sort()).toEqual(
+      ['codex', 'hadi', 'kasra', 'loom', 'mumega-brain', 'river'],
+    )
+    // Confirmed capability map.
+    const cap = (slug: string) => defs.find((d) => d.slug === slug)!.capability
+    expect(cap('hadi')).toBe('owner')
+    expect(cap('kasra')).toBe('admin')
+    expect(cap('loom')).toBe('lead')
+    expect(cap('river')).toBe('lead')
+    expect(cap('codex')).toBe('member')
+    expect(cap('mumega-brain')).toBe('member')
+    // hadi ALWAYS org scope; agents get squad scope when squadId provided.
     const hadi = defs.find((d) => d.slug === 'hadi')!
     expect(hadi.scope_type).toBe('org')
     expect(hadi.scope_id).toBeNull()
-    // kasra/river/codex get squad scope when squadId provided
     const kasra = defs.find((d) => d.slug === 'kasra')!
     expect(kasra.scope_type).toBe('squad')
     expect(kasra.scope_id).toBe(squadId)
-    // no-squadId fallback
+    // no-squadId fallback → org scope (same caps)
     const defsNoSquad = buildSquadDefs(null)
     const kasraNoSquad = defsNoSquad.find((d) => d.slug === 'kasra')!
     expect(kasraNoSquad.scope_type).toBe('org')
     expect(kasraNoSquad.scope_id).toBeNull()
+    expect(kasraNoSquad.capability).toBe('admin')
   })
 })
 
