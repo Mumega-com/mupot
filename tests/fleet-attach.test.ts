@@ -55,6 +55,11 @@ function makeDb(opts: MockOpts = {}) {
     if (sql.includes('FROM member_tokens t')) {
       return tokens[binds[0] as string] ?? null
     }
+    // Downgrade-block check (hasRegisteredKey): no signed-attach key registered in these
+    // bearer-path tests → null → bearer /attach proceeds as before.
+    if (sql.includes('FROM agent_keys')) {
+      return null
+    }
     if (sql.includes('FROM members WHERE id')) {
       const [id, tenant] = binds as [string, string]
       return members.find((m) => m.id === id && m.tenant === tenant) ? { 1: 1 } : null
