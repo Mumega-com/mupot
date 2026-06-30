@@ -58,7 +58,9 @@ export interface AgentView {
   capabilities: Array<{ scope_type: string; scope_id: string | null; capability: string }>
 }
 
-export type ReportResult = { ok: true; count: number } | { ok: false; reason: string }
+export type ReportResult =
+  | { ok: true; count: number; skipped?: number }
+  | { ok: false; reason: string }
 
 function cleanStr(v: unknown, max = MAX_STR): string {
   return typeof v === 'string' ? v.slice(0, max) : ''
@@ -121,12 +123,30 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
     if (!v) return { ok: false, reason: 'invalid agent in batch' } // fail the batch, never silently drop
     valid.push(v)
   }
+  // Signed-attach sovereignty (gate fix, P2): an agent that has a registered signing key
+  // asserts its OWN identity by signature via /api/fleet/attach-signed. The daemon /report
+  // path is an unsigned, observation-based bulk write — it must NOT be able to forge a keyed
+  // agent's presence or rebind its member_id/agent_type/runtime. Keyed agents are FILTERED OUT
+  // here, BEFORE any validation or write; their row is owned exclusively by the signed path
+  // (and signed detach). Filtering first also closes a DoS lever: a keyed agent carrying a bad
+  // member_id must not be able to fail the whole batch and suppress legit agents' reports.
+  // Trades daemon-observed liveness for keyed agents (handled by their own attach/detach + a
+  // future presence TTL) against the downgrade hole — same principle as the bearer /attach block.
+  const keyed = new Set<string>()
+  const keyRows = await env.DB.prepare('SELECT agent_id FROM agent_keys WHERE tenant = ?1')
+    .bind(env.TENANT_SLUG)
+    .all<{ agent_id: string }>()
+  for (const k of keyRows.results ?? []) keyed.add(k.agent_id)
+
+  const toWrite = valid.filter((v) => !keyed.has(v.agent_id))
+  const skipped = valid.length - toWrite.length
+
   // Lazy backfill: stamp any NULL-tenant member rows before the tenant-scoped existence check.
-  if (valid.some((v) => v.member_id)) {
+  if (toWrite.some((v) => v.member_id)) {
     await backfillMemberTenant(env)
   }
   // member_id existence check: TENANT-SCOPED (fail-closed). Unknown or other-tenant → reject batch.
-  for (const v of valid) {
+  for (const v of toWrite) {
     if (v.member_id) {
       const exists = await env.DB.prepare('SELECT 1 FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1')
         .bind(v.member_id, env.TENANT_SLUG)
@@ -134,7 +154,9 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
       if (!exists) return { ok: false, reason: `member_id not found: ${v.member_id}` }
     }
   }
-  for (const v of valid) {
+
+  let written = 0
+  for (const v of toWrite) {
     await env.DB.prepare(
       `INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status, reported_by, agent_type, member_id, last_reported_at, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'), datetime('now'))
@@ -147,8 +169,9 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
     )
       .bind(v.agent_id, env.TENANT_SLUG, v.display, v.runtime, JSON.stringify(v.squads), v.lifecycle, v.provider_contract, v.status, reportedBy, v.agent_type ?? 'generic', v.member_id ?? null)
       .run()
+    written++
   }
-  return { ok: true, count: valid.length }
+  return skipped > 0 ? { ok: true, count: written, skipped } : { ok: true, count: written }
 }
 
 export async function listFleetAgents(env: Env): Promise<FleetAgentRow[]> {

@@ -23,6 +23,50 @@ import type { Context } from 'hono'
 import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { getAgentView } from './registry'
+import { verifySignedAttach } from './signed-attach'
+
+// ── shared upsert ───────────────────────────────────────────────────────────────────
+
+/** Upsert a fleet_agents row to status='running'. Shared by the bearer (/attach) and the
+ *  signed (/attach-signed) paths so both produce identical registry rows. member_id is the
+ *  caller-authenticated identity (token-derived for bearer; key-bound for signed). */
+async function upsertRunning(
+  env: Env,
+  agentId: string,
+  runtime: string,
+  lifecycle: string,
+  agentType: string,
+  memberId: string | null,
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO fleet_agents
+          (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract,
+           status, reported_by, agent_type, member_id, last_reported_at, updated_at)
+     VALUES (?1, ?2, '', ?3, '[]', ?4, NULL, 'running', ?5, ?6, ?7, datetime('now'), datetime('now'))
+     ON CONFLICT(tenant, agent_id) DO UPDATE SET
+          runtime          = excluded.runtime,
+          lifecycle        = excluded.lifecycle,
+          status           = 'running',
+          reported_by      = excluded.reported_by,
+          agent_type       = excluded.agent_type,
+          member_id        = excluded.member_id,
+          last_reported_at = excluded.last_reported_at,
+          updated_at       = excluded.updated_at`,
+  )
+    .bind(agentId, env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId)
+    .run()
+}
+
+/** True if a signed-attach public key is registered for (tenant, agent_id). Such agents
+ *  MUST use /attach-signed — the bearer path refuses them (no auth downgrade). */
+async function hasRegisteredKey(env: Env, agentId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS x FROM agent_keys WHERE tenant = ?1 AND agent_id = ?2`,
+  )
+    .bind(env.TENANT_SLUG, agentId)
+    .first<{ x: number }>()
+  return !!row
+}
 
 // ── constants ─────────────────────────────────────────────────────────────────────
 
@@ -124,37 +168,65 @@ fleetAttachApp.post('/attach', async (c) => {
     return c.json({ error: 'forbidden', detail: 'token is not bound to this agent_id' }, 403)
   }
 
-  // 5. Security: member_id is auth-derived — NEVER from the body.
+  // 5. Downgrade block: if a signed-attach key is registered for this agent, the bearer
+  //    path is CLOSED — the agent must prove identity by signature (/attach-signed). This
+  //    stops a stolen/leaked bearer from substituting for the stronger key proof.
+  if (await hasRegisteredKey(c.env, agentId)) {
+    return c.json({ error: 'forbidden', detail: 'agent requires signed attach (/api/fleet/attach-signed)' }, 403)
+  }
+
+  // 6. Security: member_id is auth-derived — NEVER from the body.
   //    Any b.member_id in the request is silently discarded.
   const memberId = id.memberId
 
-  // 6. Upsert — reuses the ON CONFLICT shape from reportFleetAgents.
-  //    display + squads + provider_contract are set to defaults on INSERT and NOT
-  //    overwritten on UPDATE (agent doesn't supply them via self-attach; preserve any
-  //    value the daemon has already populated).
-  await c.env.DB.prepare(
-    `INSERT INTO fleet_agents
-          (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract,
-           status, reported_by, agent_type, member_id, last_reported_at, updated_at)
-     VALUES (?1, ?2, '', ?3, '[]', ?4, NULL, 'running', ?5, ?6, ?7, datetime('now'), datetime('now'))
-     ON CONFLICT(tenant, agent_id) DO UPDATE SET
-          runtime          = excluded.runtime,
-          lifecycle        = excluded.lifecycle,
-          status           = 'running',
-          reported_by      = excluded.reported_by,
-          agent_type       = excluded.agent_type,
-          member_id        = excluded.member_id,
-          last_reported_at = excluded.last_reported_at,
-          updated_at       = excluded.updated_at`,
-  )
-    .bind(agentId, c.env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId)
-    .run()
+  // 7. Upsert (shared with the signed path). display + squads + provider_contract default
+  //    on INSERT and are NOT overwritten on UPDATE (preserve any daemon-populated value).
+  await upsertRunning(c.env, agentId, runtime, lifecycle, agentType, memberId)
 
-  // 7. Boot-ack: return the full getAgentView row so the runtime confirms its identity,
+  // 8. Boot-ack: return the full getAgentView row so the runtime confirms its identity,
   //    type, and capabilities as mupot sees them after the upsert.
   const views = await getAgentView(c.env)
   const agent = views.find((v) => v.agent_id === agentId) ?? null
 
+  return c.json({ ok: true, agent })
+})
+
+// ── POST /api/fleet/attach-signed ──────────────────────────────────────────────────
+//
+// No-bearer identity proof. The runtime SIGNS a tenant-bound, time-boxed, single-use
+// message with its host-held Ed25519 private key; mupot verifies against the PUBLIC key
+// registered in agent_keys. No secret is transported or placed. This is the cutover path
+// for "agent running on mupot" — the agent that has a registered key MUST use this route
+// (the bearer /attach refuses it: see hasRegisteredKey downgrade block).
+//
+// Security: identity (member_id) is bound to the KEY at registration, never taken from the
+// body. verifySignedAttach enforces freshness (±window), single-use (nonce burn), tenant
+// binding (in the signed bytes + key lookup), and signature validity before this handler
+// touches the registry.
+fleetAttachApp.post('/attach-signed', async (c) => {
+  // 1. Parse body with byte cap (WARN-1). No bearer auth — the signature IS the auth.
+  const parsed = await readJsonCapped(c, MAX_BODY_BYTES)
+  if (!parsed.ok) {
+    return c.json({ error: parsed.reason === 'too_large' ? 'payload_too_large' : 'bad_request' },
+      parsed.reason === 'too_large' ? 413 : 400)
+  }
+  if (!parsed.value || typeof parsed.value !== 'object') {
+    return c.json({ error: 'bad_request', detail: 'body must be an object' }, 400)
+  }
+  const b = parsed.value as Record<string, unknown>
+
+  // 2. Verify the signature. Does ALL field validation (incl. lifecycle, which is SIGNED),
+  //    freshness, key lookup, and the single-use nonce burn.
+  const v = await verifySignedAttach(c.env, b, VALID_TYPES, VALID_RUNTIMES, VALID_LIFECYCLES)
+  if (!v.ok) return c.json({ error: v.error, detail: v.detail }, v.status as 400 | 401 | 409)
+
+  // 3. Upsert — EVERY written field is signature-covered: agent_id/type/runtime/lifecycle
+  //    are in the signed bytes; member_id is key-bound (from agent_keys), never the body.
+  await upsertRunning(c.env, v.agent_id, v.runtime, v.lifecycle, v.type, v.member_id)
+
+  // 4. Boot-ack.
+  const views = await getAgentView(c.env)
+  const agent = views.find((view) => view.agent_id === v.agent_id) ?? null
   return c.json({ ok: true, agent })
 })
 
