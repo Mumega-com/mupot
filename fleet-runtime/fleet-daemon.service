@@ -1,0 +1,30 @@
+# Fleet daemon — systemd USER unit. Keeps pot presence truthful by heartbeating only the
+# agents whose runtime is actually running. STERILE: runs from ~/.fleet/runtime (copied from
+# this fleet-runtime/ dir), so it does NOT depend on where the pot repo is checked out.
+#
+# Install (run in YOUR terminal):
+#   mkdir -p ~/.fleet/runtime ~/.config/systemd/user
+#   cp fleet-runtime/*.mjs ~/.fleet/runtime/
+#   cp fleet-runtime/daemon.example.json ~/.fleet/daemon.json   # then edit base_url, tenant, probes
+#   cp fleet-runtime/fleet-daemon.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   loginctl enable-linger "$USER"                               # survive logout/reboot
+#   systemctl --user enable --now fleet-daemon.service
+#   journalctl --user -u fleet-daemon -f                         # watch heartbeats
+#
+# Stop:  systemctl --user disable --now fleet-daemon             (presence decays to stale)
+[Unit]
+Description=Pot fleet daemon (signed presence heartbeat)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.fleet/runtime
+ExecStart=/usr/bin/env node %h/.fleet/runtime/fleet-daemon.mjs %h/.fleet/daemon.json
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
