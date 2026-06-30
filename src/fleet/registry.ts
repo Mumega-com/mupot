@@ -51,11 +51,46 @@ export interface AgentView {
   agent_id: string
   type: string                           // agent_type
   runtime: string
-  status: string
+  status: string                         // stored INTENT: running | stopped (set by attach/detach)
+  presence: Presence                     // DERIVED liveness from last_seen age vs TTL (live|stale|offline)
   lifecycle: string
   last_seen: string                      // last_reported_at
   member: { id: string; email: string | null; display_name: string } | null
   capabilities: Array<{ scope_type: string; scope_id: string | null; capability: string }>
+}
+
+// Liveness derived from heartbeat recency — distinct from the stored `status` INTENT.
+//   live    = status=running AND last_seen within TTL (a heartbeat arrived recently)
+//   stale   = status=running BUT last_seen older than TTL (claims running, no recent ping)
+//   offline = status=stopped (explicitly detached — intent wins over recency)
+// Honest by construction: with no daemon emitting heartbeats yet, a one-shot attach goes
+// `live` then decays to `stale` after the TTL — it never fakes liveness.
+export type Presence = 'live' | 'stale' | 'offline'
+
+/** Heartbeat freshness window (seconds). The fleet daemon re-attaches on a cadence; an agent
+ *  is `live` only if its last attach/heartbeat landed within this window. Env-overridable. */
+export const DEFAULT_PRESENCE_TTL_SEC = 180
+
+export function presenceTtlSec(env: Env): number {
+  const raw = Number((env as { FLEET_PRESENCE_TTL_SEC?: string }).FLEET_PRESENCE_TTL_SEC)
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_PRESENCE_TTL_SEC
+}
+
+/** Pure liveness derivation. `lastReportedAt` is the SQLite UTC stamp 'YYYY-MM-DD HH:MM:SS'
+ *  (written via datetime('now')). An unparseable/empty stamp is treated as NOT live (fail to
+ *  stale, never to live). A future-dated stamp (clock skew) is still within TTL → live. */
+export function derivePresence(
+  status: string,
+  lastReportedAt: string,
+  ttlSec: number,
+  nowMs: number,
+): Presence {
+  if (status === 'stopped') return 'offline'
+  if (!lastReportedAt) return 'stale'
+  const t = Date.parse(lastReportedAt.replace(' ', 'T') + 'Z')
+  if (Number.isNaN(t)) return 'stale'
+  const ageSec = (nowMs - t) / 1000
+  return ageSec <= ttlSec ? 'live' : 'stale'
 }
 
 export type ReportResult =
@@ -232,6 +267,8 @@ export async function getAgentView(env: Env): Promise<AgentView[]> {
     .all<Record<string, unknown>>()
 
   const out: AgentView[] = []
+  const ttlSec = presenceTtlSec(env)
+  const nowMs = Date.now()
   for (const r of rows.results ?? []) {
     // BLOCK-2 fix: derive everything from the JOINED column (m_id), not the raw fleet row's
     // member_id. The JOIN is tenant-bound (AND m.tenant = fa.tenant), so m_id is null when
@@ -245,13 +282,16 @@ export async function getAgentView(env: Env): Promise<AgentView[]> {
       scope_id: g.scope_id,
       capability: g.capability,
     })) : []
+    const status = String(r.status ?? 'unknown')
+    const lastSeen = String(r.last_reported_at ?? '')
     out.push({
       agent_id: String(r.agent_id),
       type: String(r.agent_type ?? 'generic'),
       runtime: String(r.runtime ?? ''),
-      status: String(r.status ?? 'unknown'),
+      status,
+      presence: derivePresence(status, lastSeen, ttlSec, nowMs),
       lifecycle: String(r.lifecycle ?? ''),
-      last_seen: String(r.last_reported_at ?? ''),
+      last_seen: lastSeen,
       member: joinedId == null ? null : {
         id: joinedId,
         email: r.m_email == null ? null : String(r.m_email),
