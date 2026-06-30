@@ -18,7 +18,7 @@ interface FleetRow {
 interface TokenRow { member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null }
 interface CapRow { member_id: string; scope_type: string; scope_id: string | null; capability: string }
 
-function makeDb(tokens: Record<string, TokenRow> = {}, caps: Record<string, CapRow[]> = {}) {
+function makeDb(tokens: Record<string, TokenRow> = {}, caps: Record<string, CapRow[]> = {}, keyedAgents: string[] = []) {
   const fleet = new Map<string, FleetRow>()
   function first(sql: string, b: unknown[]) {
     if (sql.includes('FROM member_tokens t')) return tokens[b[0] as string] ?? null
@@ -42,6 +42,8 @@ function makeDb(tokens: Record<string, TokenRow> = {}, caps: Record<string, CapR
       const [memberId] = b as [string]
       return caps[memberId] ?? []
     }
+    // reportFleetAgents keyed-agent skip check — keyed agents own their row via signed attach.
+    if (sql.includes('FROM agent_keys')) return keyedAgents.map((a) => ({ agent_id: a }))
     throw new Error('unhandled all: ' + sql)
   }
   function run(sql: string, b: unknown[]) {
@@ -95,6 +97,18 @@ describe('reportFleetAgents / listFleetAgents', () => {
     expect(rows.map((x) => x.agent_id)).toEqual(['image-gen', 'mumega-brain'])
     expect(rows[0].squads).toEqual(['media'])
     expect(rows[0].status).toBe('stopped')
+  })
+
+  it('P2: skips keyed agents (signed-attach owns their row; daemon /report cannot forge it)', async () => {
+    // 'kasra' has a registered signing key → the unsigned /report path must NOT write/rebind it.
+    const db = makeDb({}, {}, ['kasra'])
+    const r = await reportFleetAgents(env(db), 'fleet-consumer', [
+      GOOD,
+      { agent_id: 'kasra', status: 'running', runtime: 'codex', member_id: 'attacker-member' },
+    ])
+    expect(r).toEqual({ ok: true, count: 1, skipped: 1 })
+    const rows = await listFleetAgents(env(db))
+    expect(rows.map((x) => x.agent_id)).toEqual(['image-gen'])   // kasra NOT written by /report
   })
 
   it('upsert updates status on a second report', async () => {

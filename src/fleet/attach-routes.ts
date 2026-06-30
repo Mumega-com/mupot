@@ -215,24 +215,16 @@ fleetAttachApp.post('/attach-signed', async (c) => {
   }
   const b = parsed.value as Record<string, unknown>
 
-  // 2. Verify the signature (does ALL field validation, freshness, key lookup, nonce burn).
-  const v = await verifySignedAttach(c.env, b, VALID_TYPES, VALID_RUNTIMES)
+  // 2. Verify the signature. Does ALL field validation (incl. lifecycle, which is SIGNED),
+  //    freshness, key lookup, and the single-use nonce burn.
+  const v = await verifySignedAttach(c.env, b, VALID_TYPES, VALID_RUNTIMES, VALID_LIFECYCLES)
   if (!v.ok) return c.json({ error: v.error, detail: v.detail }, v.status as 400 | 401 | 409)
 
-  // 3. lifecycle is optional metadata, NOT part of the signed identity assertion. Default
-  //    on_demand; validate if supplied. (It does not affect who the agent IS.)
-  let lifecycle = 'on_demand'
-  if (b.lifecycle !== undefined) {
-    if (typeof b.lifecycle !== 'string' || !VALID_LIFECYCLES.has(b.lifecycle)) {
-      return c.json({ error: 'bad_request', detail: 'lifecycle: must be on_demand|always_on or omitted' }, 400)
-    }
-    lifecycle = b.lifecycle
-  }
+  // 3. Upsert — EVERY written field is signature-covered: agent_id/type/runtime/lifecycle
+  //    are in the signed bytes; member_id is key-bound (from agent_keys), never the body.
+  await upsertRunning(c.env, v.agent_id, v.runtime, v.lifecycle, v.type, v.member_id)
 
-  // 4. Upsert — member_id is the KEY-BOUND identity (from agent_keys), never the body.
-  await upsertRunning(c.env, v.agent_id, v.runtime, lifecycle, v.type, v.member_id)
-
-  // 5. Boot-ack.
+  // 4. Boot-ack.
   const views = await getAgentView(c.env)
   const agent = views.find((view) => view.agent_id === v.agent_id) ?? null
   return c.json({ ok: true, agent })

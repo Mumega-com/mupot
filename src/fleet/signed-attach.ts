@@ -38,16 +38,21 @@ const PUBKEY_B64URL_RE = /^[A-Za-z0-9_-]{40,64}$/ // Ed25519 pub = 32 bytes → 
 
 /** The exact bytes both sides sign/verify. Fixed field order, newline-joined, with the
  *  domain tag first and the tenant bound in. The host signer MUST produce byte-identical
- *  output (see agents/fleet-control/attach-signed.mjs). */
+ *  output (see agents/fleet-control/attach-signed.mjs).
+ *
+ *  lifecycle is INCLUDED in the signed bytes (gate fix): every field written to the
+ *  fleet_agents row under this signature must be covered by it, so an in-flight request
+ *  cannot be mutated (e.g. lifecycle→always_on) and still verify. */
 export function canonicalAttachMessage(p: {
   tenant: string
   agent_id: string
   type: string
   runtime: string
+  lifecycle: string
   ts: number
   nonce: string
 }): Uint8Array {
-  const s = [SIG_DOMAIN, p.tenant, p.agent_id, p.type, p.runtime, String(p.ts), p.nonce].join('\n')
+  const s = [SIG_DOMAIN, p.tenant, p.agent_id, p.type, p.runtime, p.lifecycle, String(p.ts), p.nonce].join('\n')
   return new TextEncoder().encode(s)
 }
 
@@ -89,6 +94,7 @@ export type SignedAttachOk = {
   agent_id: string
   type: string
   runtime: string
+  lifecycle: string
   member_id: string | null
 }
 export type SignedAttachErr = {
@@ -112,6 +118,7 @@ export async function verifySignedAttach(
   body: Record<string, unknown>,
   validTypes: Set<string>,
   validRuntimes: Set<string>,
+  validLifecycles: Set<string>,
 ): Promise<SignedAttachResult> {
   // 1. Shape + field validation (all from the UNTRUSTED body).
   if (typeof body.agent_id !== 'string' || !AGENT_ID_RE.test(body.agent_id)) {
@@ -128,6 +135,13 @@ export async function verifySignedAttach(
     return { ok: false, status: 400, error: 'bad_request', detail: 'runtime: invalid' }
   }
   const runtime = body.runtime
+
+  // lifecycle MUST be present and signed (gate fix — no unsigned field reaches the upsert).
+  // The host signer always includes it (defaulting to on_demand) so it is part of the bytes.
+  if (typeof body.lifecycle !== 'string' || !validLifecycles.has(body.lifecycle)) {
+    return { ok: false, status: 400, error: 'bad_request', detail: 'lifecycle: invalid (must be signed on_demand|always_on)' }
+  }
+  const lifecycle = body.lifecycle
 
   if (typeof body.ts !== 'number' || !Number.isInteger(body.ts) || body.ts <= 0) {
     return { ok: false, status: 400, error: 'bad_request', detail: 'ts: unix-seconds integer required' }
@@ -173,7 +187,7 @@ export async function verifySignedAttach(
   }
 
   // 4. Verify the signature over the canonical, tenant-bound message.
-  const msg = canonicalAttachMessage({ tenant, agent_id: agentId, type, runtime, ts, nonce })
+  const msg = canonicalAttachMessage({ tenant, agent_id: agentId, type, runtime, lifecycle, ts, nonce })
   let verified = false
   try {
     verified = await crypto.subtle.verify({ name: 'Ed25519' }, pubKey, sigBytes, msg)
@@ -187,8 +201,15 @@ export async function verifySignedAttach(
   // 5. Burn the nonce — single-use. INSERT OR IGNORE is atomic on the PK; changes=0 means
   //    the nonce was already used → replay. Only verified requests reach this line, so the
   //    ledger never holds unsigned junk. Opportunistically prune expired nonces first.
+  //
+  //    RETENTION = 2×window (gate fix, P1): a signature is fresh while |now − ts| ≤ window,
+  //    and we accept ts up to now+window (future-dated). So a captured request bearing this
+  //    nonce can be presented as late as (receipt + window) + window = receipt + 2×window.
+  //    The nonce row is stamped created_at = receipt time; pruning at receipt+window (one
+  //    window) would reap it while the signature is STILL fresh → replay. Retaining for the
+  //    full 2×window covers the entire validity span the freshness check permits.
   await env.DB.prepare(`DELETE FROM agent_attach_nonces WHERE created_at < ?1`)
-    .bind(now - ATTACH_WINDOW_SEC)
+    .bind(now - 2 * ATTACH_WINDOW_SEC)
     .run()
 
   const burn = await env.DB.prepare(
@@ -202,5 +223,5 @@ export async function verifySignedAttach(
     return { ok: false, status: 409, error: 'replay', detail: 'nonce already used' }
   }
 
-  return { ok: true, agent_id: agentId, type, runtime, member_id: keyRow.member_id ?? null }
+  return { ok: true, agent_id: agentId, type, runtime, lifecycle, member_id: keyRow.member_id ?? null }
 }

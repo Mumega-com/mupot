@@ -17,7 +17,7 @@ import type { Env } from '../src/types'
 
 const SIG_DOMAIN = 'fleet-attach:v1'
 const canon = (p: Record<string, string | number>) =>
-  [SIG_DOMAIN, p.tenant, p.agent_id, p.type, p.runtime, String(p.ts), p.nonce].join('\n')
+  [SIG_DOMAIN, p.tenant, p.agent_id, p.type, p.runtime, p.lifecycle, String(p.ts), p.nonce].join('\n')
 
 async function sha256Hex(s: string): Promise<string> {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s))
@@ -36,8 +36,9 @@ function makeDb(opts: {
 } = {}) {
   const keys = opts.keys ?? {}
   const tokens = opts.tokens ?? {}
-  const nonces = new Set<string>()
+  const nonces = new Map<string, number>()   // nonce → created_at (faithful: prune applies)
   const fleet = new Map<string, Record<string, unknown>>()
+  const meta = { pruneCutoff: -1 }            // last DELETE cutoff (for the retention assertion)
 
   function first(sql: string, b: unknown[]) {
     if (sql.includes('FROM agent_keys WHERE tenant')) {
@@ -62,11 +63,16 @@ function makeDb(opts: {
     throw new Error('unhandled all: ' + sql)
   }
   function run(sql: string, b: unknown[]) {
-    if (sql.includes('DELETE FROM agent_attach_nonces')) return { meta: { changes: 0 } }
+    if (sql.includes('DELETE FROM agent_attach_nonces')) {
+      const cutoff = b[0] as number
+      meta.pruneCutoff = cutoff
+      for (const [n, created] of nonces) if (created < cutoff) nonces.delete(n)
+      return { meta: { changes: 0 } }
+    }
     if (sql.includes('INSERT OR IGNORE INTO agent_attach_nonces')) {
-      const n = b[0] as string
+      const [n, , created] = b as [string, string, number]
       if (nonces.has(n)) return { meta: { changes: 0 } }   // replay
-      nonces.add(n)
+      nonces.set(n, created)
       return { meta: { changes: 1 } }
     }
     if (sql.includes('INSERT INTO fleet_agents')) {
@@ -82,6 +88,7 @@ function makeDb(opts: {
   }
   return {
     _fleet: fleet,
+    _meta: meta,
     prepare(sql: string) {
       const bs: unknown[] = []
       const api = {
@@ -110,7 +117,7 @@ async function sign(privKey: CryptoKey, p: Record<string, string | number>) {
 }
 function freshBody(agent_id: string, tenant: string, over: Record<string, unknown> = {}) {
   return {
-    agent_id, type: 'builder', runtime: 'claude-code',
+    agent_id, type: 'builder', runtime: 'claude-code', lifecycle: 'on_demand',
     ts: Math.floor(Date.now() / 1000),
     nonce: b64url(crypto.getRandomValues(new Uint8Array(32))),
     ...over,
@@ -199,5 +206,29 @@ describe('signed attach', () => {
     expect(res.status).toBe(403)
     const j = await res.json() as { detail?: string }
     expect(j.detail).toContain('signed attach')
+  })
+
+  it('P1: nonce retention horizon is 2×window (covers future-dated ts validity span)', async () => {
+    const { kp, pubX } = await genKey()
+    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: null } } })
+    const env = makeEnv(db)
+    const body = freshBody('kasra', 'mumega')
+    ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+    await post(env, '/attach-signed', body)
+    const nowSec = Math.floor(Date.now() / 1000)
+    // Prune cutoff must be ≈ now − 2*300 = now − 600. A 1*window (now − 300) horizon would
+    // reap a nonce while a future-dated signature (ts up to now+300) is still fresh → replay.
+    const age = nowSec - db._meta.pruneCutoff
+    expect(age).toBeGreaterThanOrEqual(590)
+    expect(age).toBeLessThanOrEqual(610)
+  })
+
+  it('tampered lifecycle after signing → 401 (lifecycle is signed)', async () => {
+    const { kp, pubX } = await genKey()
+    const env = makeEnv(makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: null } } }))
+    const body = freshBody('kasra', 'mumega')  // signed with lifecycle=on_demand
+    ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+    ;(body as Record<string, unknown>).lifecycle = 'always_on'   // mutate AFTER signing
+    expect((await post(env, '/attach-signed', body)).status).toBe(401)
   })
 })

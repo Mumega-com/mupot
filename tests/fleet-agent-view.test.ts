@@ -99,6 +99,8 @@ function makeDb(opts: MockDbOpts = {}) {
         capability: c.capability,
       }))
     }
+    // reportFleetAgents keyed-agent skip check: no registered keys in these tests.
+    if (sql.includes('FROM agent_keys')) return []
     throw new Error('unhandled all: ' + sql)
   }
 
