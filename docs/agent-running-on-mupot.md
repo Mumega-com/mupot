@@ -1,7 +1,10 @@
 # What "an agent running on mupot" means
 
-**Status:** design / north-star (2026-06-28, Hadi-directed). Synthesises fleet-control,
-the hermit-crab identity model, and the bus-reflection migration into one definition.
+**Status:** LIVE (2026-06-30) — the full squad (kasra, codex, river, mumega-brain) is
+registered + member-bound + signature-authenticated on mupot via Ed25519 signed-attach.
+Identity is real; liveness (heartbeat) + coordination + SOS-retirement are the remaining
+build. Synthesises fleet-control, the hermit-crab identity model, and the bus-reflection
+migration into one definition.
 
 ## The core decoupling: AGENT ≠ RUNTIME
 
@@ -94,3 +97,74 @@ Discord is a **view + control surface** onto mupot-managed agents, not a separat
 
 See also: fleet-control (`agents/fleet-control/SPEC.md` in mumega.com), hermit-crab harness,
 S196 brief (`agents/loom/briefs/S196-dogfood-mupot-migration.md`), Hermes-per-pot (#18).
+
+---
+
+## 2026-06-30 — squad live + the road to a breathing mupot
+
+**What shipped (Ed25519 signed-attach cutover).** The runtime proves identity by SIGNING a
+tenant-bound, time-boxed, single-use message with a host-held private key; mupot stores only
+the PUBLIC key (`agent_keys`) and verifies. No bearer secret is transported or placed —
+Hadi rejected the hand-placed token, which forced the stronger public-key design. Per agent:
+`keygen` (private stays on host) → register public key bound to `members.id` → signed attach.
+
+Live now (`fleet_agents`, all `running` + member-bound):
+
+| agent | type | runtime | capability |
+|---|---|---|---|
+| kasra | builder | claude-code | squad-core admin |
+| codex | reviewer | codex | squad-core member |
+| river | generic | hermes | squad-core lead |
+| mumega-brain | brain | hermes-cron | squad-core member |
+
+Dyad-gate (Sonnet adversarial lens; builder was Opus): round-1 BLOCK found 3 gameability
+vectors behind a green suite (nonce-prune-vs-future-ts replay; unsigned `/report` keyed-forge;
+unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: mupot #248, host #344.
+
+### Condition status (the 5 from above)
+1. Registered (identity+type+RBAC) — ✅ **done** for the whole squad.
+2. Lifecycle controlled via mupot — ⛏ partial (signed attach/detach exist; no open/close API
+   wired to actual process start/kill).
+3. Coordinates via the reflected bus — ⛏ partial (`agent_messages` inbox built; runtime loops
+   still talk SOS, not mupot).
+4. Runtime binding reports presence + swappable — ⬜ **gap** (the rows are one-shot static
+   stamps, NOT heartbeats; no persistent daemon).
+5. SOS retired — ⬜ not yet.
+
+### Punch-list to LIVE
+**Phase 1 — liveness (make `running` true)** ← biggest gap, critical path
+1. Presence/heartbeat: TTL column; registry computes running/stale/stopped from last-ping.
+2. Fleet daemon (host): boot-attach all managed agents, re-attach on drop, heartbeat, drain
+   inbox, detach on stop; systemd user unit. (Install = Hadi host-go.)
+
+**Phase 2 — lifecycle control (open/close from mupot)**
+3. open/close API: signed control-request → daemon starts/kills the agent's runtime.
+4. Control surface: `#agent-bus` = `top` (live presence + open/close); `#gates` = signals.
+
+**Phase 3 — coordinate through mupot (not SOS)**
+5. Runtime loops consume the mupot inbox (send/inbox/wake/ack) instead of the SOS bus.
+6. Reflect any missing primitives (wake/request/ack) on the durable substrate (Queues+DO+D1).
+7. Repoint squad wake-hooks / bus identity SOS → mupot.
+
+**Phase 4 — retire SOS** (8) decommission the python bus for the squad once nothing depends on it.
+
+**Cross-cutting** — (9) durable, reliably-wakeable 2nd adversarial gate lens (Codex bus-peer
+was stale on both pings); (10) dyad-gate.yml single-quote glob (1-line).
+
+### Identity must project from the qNFT + DNA (not flat rows)
+The mupot agent record is currently disconnected from the agent's REAL identity. Each agent
+already has: a **qNFT** (`~/.claude/qnft/<agent>/qnft.json` — minted soul: tier, signer +
+countersigner chain, model, cause/descriptor pointers, visual card) and a **DNA definition**
+(`~/.claude/agents/<agent>.md` — role, skills, lane). These are the source of truth for *who
+an agent is*. The signed-attach rows I seeded hand-type `agent_type`/`runtime` (e.g. river was
+guessed `generic`) and the `agent_keys` pubkey is a bare credential with no link to the soul.
+
+Direction: mupot identity should **project from the qNFT + DNA**, not be ad-hoc —
+- `agent_type` / role / skills read from the **DNA def**, not guessed;
+- the signed-attach key registered as **authorized-by-the-qNFT** (qNFT = canonical identity;
+  the mupot key = a runtime credential the soul vouches for, signer/countersigner chain intact);
+- `fleet_agents`/member carries the **qNFT ref** (tier, cause, descriptor) so mupot's view is
+  the real soul, not a thin row.
+This reshapes Phase 1: the daemon/attach reads each agent's DNA + qNFT and reports the *real*
+identity; key-registration ties to the signed qNFT chain. (Ties to the hermit-crab body model
+and the molt-card trajectory stack.)
