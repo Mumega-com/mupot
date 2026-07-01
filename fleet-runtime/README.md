@@ -76,8 +76,16 @@ node fleet-runtime/flight.mjs list             # show configured flights
 
 Config `~/.fleet/flights.json` (see `flights.example.json`): per agent, `launch` (a **non-blocking**
 command that brings the runtime up, e.g. `tmux new-session -d`) + `teardown` (brings it down).
-`open` runs `launch` then signs an attach — the takeoff ping that flips presence `live`. `close`
-runs `teardown`; the runtime goes down so presence decays running→`stale` (landed).
+`open` runs `launch` then signs an attach — a **point-in-time** takeoff ping that flips presence
+`live` (and, if attach fails after launch, rolls the runtime back so nothing is orphaned). `close`
+runs `teardown`; a clean teardown lands it (presence decays running→`stale`), a failed teardown
+reports `LAND_UNCERTAIN` (runtime may still be up) rather than a false `LANDED`.
+
+Note: a single `flight open` proves the runtime was up *at takeoff* + a valid signature — it does
+NOT guarantee sustained liveness. Continuous truthful presence (`live` while running → `stale`
+when it dies) is the **heartbeat daemon's** job (`fleet-daemon.mjs`), which re-attaches on a
+cadence. Run the daemon alongside flights for a runtime that should report presence for its whole
+flight; use bare `flight open/close` for the lifecycle transitions.
 
 The **remote trigger** — mupot `POST /api/fleet/control {agent_id, verb:start}` → signed
 control-request → host control-daemon → runs the flight — is the ATC layer (fleet-control

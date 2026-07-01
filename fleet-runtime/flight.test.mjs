@@ -37,3 +37,9 @@ test('validateFlights: teardown optional (defaults empty)', () => {
   const c = validateFlights({ ...ok(), agents: [{ agent_id: 'a1', launch: 'true' }] })
   assert.equal(c.agents.get('a1').teardown, '')
 })
+
+test('validateFlights: duplicate agent_id rejected (no silent last-win)', () => {
+  assert.throws(() => validateFlights({ ...ok(), agents: [
+    { agent_id: 'a1', launch: 'true' }, { agent_id: 'a1', launch: 'false' },
+  ] }), /duplicate agent_id/)
+})
