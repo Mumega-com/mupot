@@ -1,0 +1,21 @@
+{
+  "_comment": "Flight config. Copy to ~/.fleet/flights.json and set REAL values. A flight = a bounded activation: `flight.mjs open <agent>` runs `launch` (bring the runtime up) then signed-attach (takeoff → presence live); `flight.mjs close <agent>` runs `teardown` (runtime down → presence decays to stale = landed). STERILE: base_url + tenant required. `launch` must be non-blocking (start the runtime detached and return, e.g. `tmux new-session -d`), not the long-running agent process itself.",
+  "base_url": "https://YOUR-POT.example.com",
+  "tenant": "YOUR_TENANT_SLUG",
+  "agents": [
+    {
+      "agent_id": "agent-claude",
+      "type": "builder",
+      "runtime": "claude-code",
+      "launch": "tmux new-session -d -s agent-claude 'claude --resume <SESSION> || claude'",
+      "teardown": "tmux kill-session -t agent-claude"
+    },
+    {
+      "agent_id": "agent-hermes",
+      "type": "generic",
+      "runtime": "hermes",
+      "launch": "systemctl --user start hermes-agent-hermes",
+      "teardown": "systemctl --user stop hermes-agent-hermes"
+    }
+  ]
+}
