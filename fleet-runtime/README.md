@@ -62,7 +62,38 @@ runtime is alive *now*. Use liveness signals (`tmux has-session`, `systemctl is-
 **freshness** check (`find marker -mmin -5`), never a bare `test -f marker` (passes forever once
 the marker exists → heartbeats a dead agent).
 
+## Flights (the activation unit) — `flight.mjs`
+
+Agents don't sit warm. They **fly** bounded bursts and land. mupot brings the runtime up for a
+flight; the agent works; it lands and the runtime goes down. Tokens burn only between takeoff
+and land — idle is zero.
+
+```bash
+node fleet-runtime/flight.mjs open  my-agent   # takeoff: run `launch` → signed-attach (→ live)
+node fleet-runtime/flight.mjs close my-agent   # land: run `teardown` (→ presence decays = landed)
+node fleet-runtime/flight.mjs list             # show configured flights
+```
+
+Config `~/.fleet/flights.json` (see `flights.example.json`): per agent, `launch` (a **non-blocking**
+command that brings the runtime up, e.g. `tmux new-session -d`) + `teardown` (brings it down).
+`open` runs `launch` then signs an attach — a **point-in-time** takeoff ping that flips presence
+`live` (and, if attach fails after launch, rolls the runtime back so nothing is orphaned). `close`
+runs `teardown`; a clean teardown lands it (presence decays running→`stale`), a failed teardown
+reports `LAND_UNCERTAIN` (runtime may still be up) rather than a false `LANDED`.
+
+Note: a single `flight open` proves the runtime was up *at takeoff* + a valid signature — it does
+NOT guarantee sustained liveness. Continuous truthful presence (`live` while running → `stale`
+when it dies) is the **heartbeat daemon's** job (`fleet-daemon.mjs`), which re-attaches on a
+cadence. Run the daemon alongside flights for a runtime that should report presence for its whole
+flight; use bare `flight open/close` for the lifecycle transitions.
+
+The **remote trigger** — mupot `POST /api/fleet/control {agent_id, verb:start}` → signed
+control-request → host control-daemon → runs the flight — is the ATC layer (fleet-control
+`daemon.py`/`engine.py`); it needs the consumer agent minted + the control-daemon installed
+(owner-gated). Until then, flights run locally via `flight.mjs`.
+
 ## Notes
 - `interval_sec` is clamped to `[15,120]` and must stay under the pot's presence TTL (default 180s).
-- v1 has no signed `/detach`: on daemon stop, presence decays to `stale` (honest interim).
+- v1 has no signed `/detach`: on land / daemon stop, presence decays to `stale` (honest interim;
+  crisp `offline` needs a signed detach — follow-up).
 - Supersedes the bearer-token `adapter.py` flow for the signed path.
