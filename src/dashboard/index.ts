@@ -454,7 +454,7 @@ dashboardApp.get('/fleet', async (c) => {
   // tenant-pot path (Digid); the bus path below is the company/HQ window.
   if (!fleetScoped(c.env)) {
     const presence = await listPresence(c.env, Date.now())
-    return c.html(shell(c.env.BRAND, 'Fleet', html`${potFleetBody(presence)}${hostPanel}`))
+    return c.html(shell(c.env.BRAND, 'Fleet', html`${hostPanel}${potFleetBody(presence)}`))
   }
   let rows: FleetRow[] = []
   let error: string | null = null
@@ -463,7 +463,7 @@ dashboardApp.get('/fleet', async (c) => {
   } catch (e) {
     error = e instanceof Error ? e.message : 'bus_unreachable'
   }
-  return c.html(shell(c.env.BRAND, 'Fleet', html`${fleetBody(rows, error)}${hostPanel}`))
+  return c.html(shell(c.env.BRAND, 'Fleet', html`${hostPanel}${fleetBody(rows, error)}`))
 })
 
 // POST /fleet/host-control — start|stop|restart a HOST agent via the SIGNED control plane (mupot
