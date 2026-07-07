@@ -700,6 +700,110 @@ describe('TEST-2 — B1 directory-channel capability ceiling', () => {
 })
 
 // ────────────────────────────────────────────────────────────────────────────
+// TEST-2b — member API key through production convergence keeps grants + weld
+//
+// Production /mcp wraps requests with OAuthProvider. For a bearer the provider does
+// not own, it calls resolveExternalToken(), then dispatches through
+// McpOAuthApiHandler/buildAuthContextFromProps(). Direct mcpApp tests do NOT cover
+// that convergence path. This regression test does.
+// ────────────────────────────────────────────────────────────────────────────
+describe('TEST-2b — member API key convergence preserves workspace grants and agent weld', () => {
+  it('resolveExternalToken → buildAuthContextFromProps keeps workspace channel, caps, and bound agent', async () => {
+    const { resolveExternalToken, buildAuthContextFromProps } = await import('../src/mcp/oauth-authorize')
+    const { invokeTool } = await import('../src/mcp/index')
+
+    const MEMBER_ID = 'mbr-workspace-admin'
+    const TOKEN_ID = 'tok-workspace-agent'
+    const AGENT_ID = 'agent-bound-1'
+    const SQUAD_ID = 'sq-prod-path'
+    const DEPT_ID = 'dept-prod-path'
+    const grants: CapabilityGrant[] = [
+      { member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' },
+      { member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'member' },
+    ]
+
+    const env = {
+      TENANT_SLUG: TENANT,
+      BRAND: 'Mumega',
+      OAUTH_PROVIDER: 'google',
+      BUS: { send: async () => undefined },
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind() {
+              return {
+                async first() {
+                  if (sql.includes('FROM member_tokens t')) {
+                    return {
+                      member_id: MEMBER_ID,
+                      email: 'workspace@example.com',
+                      status: 'active',
+                      token_id: TOKEN_ID,
+                      channel: 'workspace',
+                      bound_agent_id: AGENT_ID,
+                    }
+                  }
+                  if (sql.includes('FROM squads WHERE id = ?1')) {
+                    return {
+                      id: SQUAD_ID,
+                      department_id: DEPT_ID,
+                      slug: 'prod-path',
+                      name: 'Prod Path',
+                      charter: null,
+                      created_at: '2026-01-01 00:00:00',
+                    }
+                  }
+                  if (sql.includes('COUNT(*) AS n FROM agent_messages')) return { n: 0 }
+                  return null
+                },
+                async all() {
+                  if (sql.includes('FROM capabilities') || sql.includes('FROM channel_capability_grants')) {
+                    return { results: grants }
+                  }
+                  if (sql.includes('FROM agent_messages')) return { results: [] }
+                  return { results: [] }
+                },
+                async run() {
+                  return { meta: { changes: 1 } }
+                },
+              }
+            },
+          }
+        },
+      },
+    } as unknown as Env
+
+    const resolved = await resolveExternalToken(env, 'mupot_workspace_key')
+    expect(resolved).not.toBeNull()
+    expect(resolved!.props).toMatchObject({
+      memberId: MEMBER_ID,
+      tokenId: TOKEN_ID,
+      channel: 'workspace',
+      boundAgentId: AGENT_ID,
+    })
+
+    const auth = await buildAuthContextFromProps(env, resolved!.props)
+    expect(auth).not.toBeNull()
+    expect(auth!.channel).toBe('workspace')
+    expect(auth!.boundAgentId).toBe(AGENT_ID)
+    expect(auth!.capabilities).toEqual(grants)
+
+    const created = await invokeTool(
+      auth!,
+      env,
+      'task_create',
+      { squad_id: SQUAD_ID, title: 'prod path task', done_when: 'task row is created' },
+      'https://pot.example',
+    )
+    expect(created.ok).toBe(true)
+
+    const inbox = await invokeTool(auth!, env, 'inbox', { peek: true }, 'https://pot.example')
+    expect(inbox.ok).toBe(true)
+    expect((inbox.result as { messages?: unknown[] }).messages).toEqual([])
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
 // TEST-3 — tightened zero-cap: real squad in DB → 403 forbidden (not 404)
 //
 // The previous zero-cap tests allowed either 403 (forbidden) or 404 (squad_not_found)

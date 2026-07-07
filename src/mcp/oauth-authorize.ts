@@ -20,7 +20,7 @@
 //   /.well-known/oauth-protected-resource, /token, /register.
 // This file handles: /authorize → Google redirect, /oauth/google-callback → complete.
 
-import type { Env } from '../types'
+import type { Env, AuthContext, CapabilityGrant, ConnectionChannel } from '../types'
 import { resolveCapabilities } from '../auth/capability'
 import { sha256Hex, mintRawToken } from '../members/service'
 
@@ -31,6 +31,21 @@ export interface OAuthMemberProps {
   memberId: string
   tokenId: string
   email: string | null
+  /**
+   * Member-token channel. OAuthProvider-owned seats are `directory`; normal
+   * mupot_ member API keys preserve their stored token channel, usually
+   * `workspace`. Optional for backwards compatibility with older stored OAuth
+   * grants; buildAuthContextFromProps re-reads the live token row before use.
+   */
+  channel?: ConnectionChannel
+  /** The agent weld from member_tokens.agent_id, if this is an agent-bound key. */
+  boundAgentId?: string | null
+}
+
+const CONNECTION_CHANNELS: readonly ConnectionChannel[] = ['workspace', 'im', 'dashboard', 'directory']
+
+function isConnectionChannel(v: unknown): v is ConnectionChannel {
+  return typeof v === 'string' && (CONNECTION_CHANNELS as readonly string[]).includes(v)
 }
 
 // ── Google OAuth helpers ──────────────────────────────────────────────────────
@@ -159,7 +174,8 @@ export async function resolveExternalToken(
   // lookup against member_tokens, and a mupot_ key is never stored in OAUTH_KV.
   const tokenHash = await sha256Hex(token)
   const row = await env.DB.prepare(
-    `SELECT m.id AS member_id, m.email AS email, m.status AS status, t.id AS token_id
+    `SELECT m.id AS member_id, m.email AS email, m.status AS status,
+            t.id AS token_id, t.channel AS channel, t.agent_id AS bound_agent_id
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
       WHERE t.token_hash = ?1 AND t.revoked_at IS NULL
@@ -169,6 +185,8 @@ export async function resolveExternalToken(
     email: string | null
     status: string
     token_id: string
+    channel: ConnectionChannel | null
+    bound_agent_id: string | null
   }>()
 
   if (!row || row.status !== 'active') return null
@@ -178,6 +196,8 @@ export async function resolveExternalToken(
       memberId: row.member_id,
       tokenId: row.token_id,
       email: row.email,
+      channel: isConnectionChannel(row.channel) ? row.channel : 'workspace',
+      boundAgentId: row.bound_agent_id ?? null,
     } satisfies OAuthMemberProps,
   }
 }
@@ -209,39 +229,54 @@ export async function resolveExternalToken(
 export async function buildAuthContextFromProps(
   env: Env,
   props: OAuthMemberProps,
-): Promise<import('../types').AuthContext | null> {
+): Promise<AuthContext | null> {
   // Verify the referenced token is still live (not revoked since authorization).
   const tokenRow = await env.DB.prepare(
-    `SELECT m.status AS status
+    `SELECT m.status AS status, m.email AS email, t.channel AS channel, t.agent_id AS bound_agent_id
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
-      WHERE t.id = ?1 AND t.revoked_at IS NULL
+      WHERE t.id = ?1 AND t.member_id = ?2 AND t.revoked_at IS NULL
       LIMIT 1`,
-  ).bind(props.tokenId).first<{ status: string }>()
+  ).bind(props.tokenId, props.memberId).first<{
+    status: string
+    email: string | null
+    channel?: ConnectionChannel | null
+    bound_agent_id?: string | null
+  }>()
 
   if (!tokenRow || tokenRow.status !== 'active') return null
 
   // Re-resolve capabilities every request (C2: revocation propagates immediately).
-  // The resolved grants are NOT used for the directory channel — see B1 comment above.
-  // They are resolved here only so this function remains correct if the channel ceiling
-  // is ever made configurable (replace [] with intersect(resolvedGrants, ceiling)).
-  await resolveCapabilities(env, props.memberId) // B1: resolved but intentionally discarded
+  // The resolved grants are NOT used for the directory channel — see B1 comment above —
+  // but workspace/member API keys must preserve their live D1 grants.
+  const resolvedCapabilities = await resolveCapabilities(env, props.memberId)
+
+  const channel =
+    isConnectionChannel(tokenRow.channel)
+      ? tokenRow.channel
+      : isConnectionChannel(props.channel)
+        ? props.channel
+        : 'directory'
 
   // B1: directory-channel capability ceiling = [] (zero).
   // An OAuth seat NEVER inherits the member's existing standing grants.
   // criterion-6 "byte-identical for same person" reinterpreted as "for a fresh
   // directory seat" — an existing admin gets zero caps through the directory door.
-  const capabilities: import('../types').CapabilityGrant[] = []
+  const capabilities: CapabilityGrant[] = channel === 'directory' ? [] : resolvedCapabilities
+  const boundAgentId =
+    channel === 'directory'
+      ? null
+      : tokenRow.bound_agent_id ?? props.boundAgentId ?? null
 
   return {
     userId: props.memberId,
-    email: props.email,
+    email: tokenRow.email ?? props.email,
     role: 'member', // coarse org-role; real authz is `capabilities`
     tenant: env.TENANT_SLUG, // environment-derived, never from props (C2)
     memberId: props.memberId,
-    channel: 'directory',
-    capabilities, // always defined, always empty for directory — prevents legacyRoleSatisfies escape
-    boundAgentId: null, // OAuth seats are pure human/operator principals
+    channel,
+    capabilities, // always defined; empty only for directory — prevents legacyRoleSatisfies escape
+    boundAgentId, // directory seats are pure human/operator principals; workspace keys preserve the weld
   }
 }
 
@@ -453,6 +488,8 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
           memberId,
           tokenId,
           email: googleUser.email,
+          channel: 'directory',
+          boundAgentId: null,
         } satisfies OAuthMemberProps,
       })
       redirectTo = result.redirectTo

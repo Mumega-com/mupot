@@ -4,6 +4,17 @@ Review target: `Mumega-com/mupot` `main` at `ba43289`.
 
 This note captures the highest-signal issues found during a local review pass. It is meant to be copied into GitHub issues or used as the working checklist for a fix branch.
 
+## Codex Branch Status
+
+Branch: `codex/mupot-review-findings`
+
+| Finding | Status | Evidence |
+| --- | --- | --- |
+| Preserve workspace and agent member-token auth through production `/mcp` | Fixed on branch | `src/mcp/oauth-authorize.ts` now preserves token channel, live capabilities, and `agent_id` weld for non-directory keys; `tests/oauth-dual-auth.test.ts` adds the production convergence regression. |
+| Resolve dependency audit advisories | Fixed on branch | `hono` updated to `4.12.28`; `wrangler` updated to `4.102.0`; `@cloudflare/workers-types` updated to `4.20260617.1`; `npm audit --audit-level=high` reports zero vulnerabilities. |
+| Expand CI to cover all shipped test suites | Fixed on branch | `.github/workflows/ci.yml` now uses `npm ci`, audit, typecheck, Vitest, fleet runtime tests, Wrangler dry-run bundle check, D1 migration chain check, and Python plugin tests. |
+| Add pre-auth body size caps to HMAC webhook ingress routes | Fixed on branch | `src/events/ingest.ts` and `src/integrations/ghl-routes.ts` reject declared and actual bodies over 256 KiB before HMAC verification; tests cover both paths. |
+
 ## Findings to File
 
 ### 1. P1 - Preserve workspace and agent member-token auth through production `/mcp`
@@ -117,21 +128,18 @@ Acceptance checks:
 
 ## Validation Already Run
 
-- `npm ci` passed, with audit advisories.
+- `npm ci` passed, with zero audit vulnerabilities.
+- `npm audit --audit-level=high` passed: zero vulnerabilities.
 - `npm run typecheck` passed.
-- `npm test` passed: 121 test files, 2278 tests.
+- `npm test` passed: 121 test files, 2283 tests.
 - `node --test fleet-runtime/*.test.mjs` passed: 18 tests.
-- `npx wrangler deploy --dry-run --config wrangler.example.toml` passed.
+- `npx wrangler deploy --dry-run --config wrangler.example.toml` passed on Wrangler `4.102.0`.
 - D1 migrations `0001` through `0041` applied cleanly to scratch SQLite.
 - Python plugin tests passed in a temporary venv: 102 tests.
 - `python -m compileall -q plugin` passed.
 
 ## Work I Can Do Next
 
-- File the four GitHub issues with titles, labels, and acceptance criteria.
-- Implement the `/mcp` production auth regression fix and add tests.
-- Update Hono and validate the dependency/security impact.
-- Plan or perform the coordinated Cloudflare dependency bump.
-- Expand GitHub Actions CI to include fleet runtime, plugin, dry-run bundle, and migration checks.
-- Add webhook body caps and route-level tests.
+- File GitHub issues or close the original review findings against this branch's fixes.
 - Open a draft pull request from this `codex/` branch.
+- Add any follow-up CI polish the project wants, such as caching Node/Python dependencies.
