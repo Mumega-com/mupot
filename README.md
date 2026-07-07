@@ -23,6 +23,18 @@ You don't open a dashboard; you open a company that's *breathing*. Agents are em
 creatures, not processes in a queue. The health of the whole business reads in one glance, and
 every claim clicks through to the real work behind it.
 
+## Project direction
+
+Mupot's north star is a **self-hosted agent control plane for running trusted AI
+workers, workflows, and integrations on Cloudflare**. The practical goal is
+simple: deploy one pot, connect a runtime worker, grant scoped capabilities,
+send it work, gate risky actions, observe what happened, and verify the result
+against a real tool of record such as GitHub.
+
+See the [control-plane roadmap](./docs/control-plane-roadmap.md), the
+[self-hosting guide](./docs/SELF-HOST.md), and
+[what running an agent on Mupot means](./docs/agent-running-on-mupot.md).
+
 ## Three things no one else gives you together
 
 1. **Agents as employees, not processes.** Every agent has an identity, a character sheet, and
