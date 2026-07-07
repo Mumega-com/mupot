@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { verifyGitHubWebhook, taskFromGitHubEvent } from '../src/integrations/github-routes'
+import {
+  GITHUB_INBOUND_MAX_BODY_BYTES,
+  githubInboundApp,
+  verifyGitHubWebhook,
+  taskFromGitHubEvent,
+} from '../src/integrations/github-routes'
 import type { Env } from '../src/types'
 
 async function hmacHex(secret: string, msg: string): Promise<string> {
@@ -77,5 +82,35 @@ describe('taskFromGitHubEvent', () => {
   it('sanitizes a non-numeric PR number', () => {
     const t = taskFromGitHubEvent('pull_request', { ...repo, action: 'opened', pull_request: { number: 'evil' as unknown as number, title: 'Y' } })
     expect(t?.title).toContain('PR #?')
+  })
+})
+
+describe('githubInboundApp body caps', () => {
+  it('oversized declared body returns 413 before signature verification', async () => {
+    const req = new Request('http://localhost/', {
+      method: 'POST',
+      body: '{}',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': String(GITHUB_INBOUND_MAX_BODY_BYTES + 1),
+      },
+    })
+    const res = await githubInboundApp.fetch(req, {} as Env, {} as ExecutionContext)
+    expect(res.status).toBe(413)
+    const json = await res.json() as { error: string }
+    expect(json.error).toBe('payload_too_large')
+  })
+
+  it('oversized actual UTF-8 body returns 413 before signature verification', async () => {
+    const body = 'x'.repeat(GITHUB_INBOUND_MAX_BODY_BYTES + 1)
+    const req = new Request('http://localhost/', {
+      method: 'POST',
+      body,
+      headers: { 'content-type': 'application/json' },
+    })
+    const res = await githubInboundApp.fetch(req, {} as Env, {} as ExecutionContext)
+    expect(res.status).toBe(413)
+    const json = await res.json() as { error: string }
+    expect(json.error).toBe('payload_too_large')
   })
 })

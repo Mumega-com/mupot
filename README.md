@@ -170,6 +170,10 @@ fail-closed (Discord Ed25519, Google signed-JWT, Telegram secret). Untrusted con
 an agent but never *steer* it — the directive path is the only steer, at position-0 of every
 decision.
 
+See [docs/security-model.md](./docs/security-model.md) for the current trust-boundary map:
+sessions, member tokens, agent keys, webhooks, channel relays, capability gates, and approval
+paths.
+
 ## Architecture
 
 `src/types.ts` is the shared contract (bindings, org domain, ports, the `ChannelAdapter`

@@ -1,7 +1,7 @@
 # Hermes ── mupot relay config (EXAMPLE)
 #
 # Copy to your Hermes deployment's config and fill in your pot's host. The real
-# gateway token is read from a secret/env at runtime — NEVER paste a real token
+# webhook secret is read from a secret/env at runtime — NEVER paste a real secret
 # into a committed file. This is a public-repo template; placeholders only.
 
 mupot:
@@ -12,10 +12,10 @@ mupot:
   # Hermes sends the RAW update: { message: { chat: { id }, text } }.
   webhook_path: "/im/webhook"
 
-  # Gateway member token (channel: im). Hermes holds this to authenticate the
-  # relay hop if your perimeter requires it. Resolved from env at runtime — the
-  # literal "${MUPOT_GATEWAY_TOKEN}" is a placeholder, not a secret.
-  gateway_token: "${MUPOT_GATEWAY_TOKEN}"
+  # Shared webhook secret. Hermes sends it as:
+  # X-Telegram-Bot-Api-Secret-Token: <value>
+  # Resolved from env at runtime — the literal below is a placeholder, not a secret.
+  webhook_secret: "${IM_WEBHOOK_SECRET}"
 
 telegram:
   # Your Telegram bot token, read from env at runtime (never committed).

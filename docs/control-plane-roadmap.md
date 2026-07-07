@@ -32,7 +32,7 @@ and the running product.
 | Self-hosted install | A new operator can deploy a pot into their own Cloudflare account and keep data in their account. | `docs/SELF-HOST.md`, `scripts/setup.sh`, `wrangler.example.toml` |
 | Agent identity | Each agent has a durable identity separate from its runtime shell. | `docs/agent-running-on-mupot.md`, `fleet_agents`, `agent_keys`, member/capability tests |
 | Runtime adapters | Hermes, Codex, Claude Code, and custom workers can attach through a stable contract. | `connectors/`, `fleet-runtime/`, signed attach flow |
-| Scoped authority | Every sensitive action is guarded by role and capability checks. | `src/auth/`, `tests/*capability*`, `tests/*gate*` |
+| Scoped authority | Every sensitive action is guarded by role and capability checks. | `docs/security-model.md`, `src/auth/`, `tests/*capability*`, `tests/*gate*` |
 | Work lifecycle | Work has a predictable state path from request to claim to result to verification. | task, gate, loop, workflow, and GitHub integration tests |
 | Approval gates | Customer-facing or high-risk actions wait for accountable approval. | `/approvals`, gated loops, gate protocol docs |
 | Observability | Operators can see agent liveness, tasks, gates, errors, and audit events. | dashboard modules, fleet presence, audit routes |
@@ -49,7 +49,7 @@ what it reports.
 - Keep dependency alerts at zero on `main`.
 - Preserve typecheck, unit tests, migration checks, browser smoke tests, and
   GitHub Actions as merge gates.
-- Finish the security model documentation for workspaces, member tokens,
+- Keep the security model documentation current for workspaces, member tokens,
   agent keys, role presets, capabilities, webhooks, and approval gates.
 - Make Hermes behavior explicit: payload format, authentication, task creation,
   retry/idempotency rules, and failure states.
