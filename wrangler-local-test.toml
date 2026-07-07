@@ -1,0 +1,74 @@
+# mupot local browser/Hermes smoke harness.
+# Run with:
+#   npm run migrate:local:test
+#   npm run seed:local:test
+#   npm run dev:local:test
+
+name = "mupot-local-test"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+TENANT_SLUG = "local"
+BRAND = "Mupot Local"
+OAUTH_PROVIDER = "google"
+PUBLIC_ORIGIN = "http://127.0.0.1:8787"
+FLEET_PROJECT = "local"
+FLEET_OPS_AGENT = "local-ops"
+LOCAL_TEST_AUTH = "1"
+LOCAL_TEST_AUTH_EMAIL = "local-owner@mupot.test"
+IM_WEBHOOK_SECRET = "local-im-secret"
+GITHUB_PLAN_TIER = "team"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mupot-local-test"
+database_id = "local-test"
+migrations_dir = "migrations"
+
+[[vectorize]]
+binding = "VEC"
+index_name = "mupot-local-test-memory"
+
+[[queues.producers]]
+binding = "BUS"
+queue = "mupot-local-test-events"
+
+[[queues.consumers]]
+queue = "mupot-local-test-events"
+max_batch_size = 10
+max_retries = 3
+dead_letter_queue = "mupot-local-test-events-dlq"
+
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "local-test-sessions"
+
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "local-test-oauth"
+
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "mupot-local-test-blobs"
+
+[ai]
+binding = "AI"
+
+[[durable_objects.bindings]]
+name = "AGENT"
+class_name = "AgentDO"
+
+[[durable_objects.bindings]]
+name = "SQUAD"
+class_name = "SquadCoordinatorDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AgentDO", "SquadCoordinatorDO"]
+
+[[workflows]]
+name = "mupot-local-test-task-workflow"
+binding = "TASK_WORKFLOW"
+class_name = "TaskWorkflow"

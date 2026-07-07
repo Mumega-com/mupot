@@ -173,6 +173,36 @@ authApp.get('/login', async (c) => {
   return c.redirect(`${GOOGLE_AUTH}?${params.toString()}`)
 })
 
+// GET /auth/dev-login → local-only session mint for browser smoke tests.
+// Enabled only with LOCAL_TEST_AUTH=1, so production deploys keep OAuth/handoff as
+// the only login doors. The cookie is deliberately non-Secure because wrangler dev
+// serves http://localhost; production sessions still use Secure below.
+authApp.get('/dev-login', async (c) => {
+  const env = c.env
+  if (env.LOCAL_TEST_AUTH !== '1') {
+    return c.json({ error: 'not_found' }, 404)
+  }
+
+  const email = (env.LOCAL_TEST_AUTH_EMAIL ?? 'local-owner@mupot.test').trim().toLowerCase()
+  const preferredId = await deriveUserId('local-test', email)
+  const { id: userId, role } = await upsertUserByEmail(env, preferredId, email, true)
+
+  const sessionId = randomId(32)
+  const record: SessionRecord = {
+    userId,
+    email,
+    role,
+    createdAt: new Date().toISOString(),
+  }
+  await env.SESSIONS.put(sessionKey(sessionId), JSON.stringify(record), {
+    expirationTtl: SESSION_TTL_SECONDS,
+  })
+  await writePresence(env, email, userId)
+
+  setSessionCookie(c, sessionId, { secure: false })
+  return c.redirect('/')
+})
+
 // GET /auth/callback → exchange code, upsert user, mint session, set cookie.
 authApp.get('/callback', async (c) => {
   const env = c.env
@@ -456,12 +486,16 @@ export async function upsertUserByEmail(
 
 // ── cookie ───────────────────────────────────────────────────────────────────
 
-function setSessionCookie(c: Context<AppEnv>, sessionId: string): void {
+function setSessionCookie(
+  c: Context<AppEnv>,
+  sessionId: string,
+  opts: { secure?: boolean } = {},
+): void {
   // HttpOnly (no JS access) + Secure (HTTPS only) + SameSite=Lax (survives the
   // OAuth redirect back, blocks cross-site POST CSRF) + Path=/ + bounded Max-Age.
   setCookie(c, COOKIE_NAME, sessionId, {
     httpOnly: true,
-    secure: true,
+    secure: opts.secure ?? true,
     sameSite: 'Lax',
     path: '/',
     maxAge: SESSION_TTL_SECONDS,

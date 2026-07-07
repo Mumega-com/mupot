@@ -87,6 +87,10 @@ export interface Env {
   // secrets (present at runtime only)
   OAUTH_CLIENT_ID?: string
   OAUTH_CLIENT_SECRET?: string
+  // Local-only test login. Intended for `wrangler dev` smoke testing with a local D1/KV.
+  // Never set this on a deployed pot; when unset, /auth/dev-login is disabled.
+  LOCAL_TEST_AUTH?: string
+  LOCAL_TEST_AUTH_EMAIL?: string
   // OAuth 2.1 Google IdP secrets — set via `wrangler secret put`, never in .toml.
   // Deploy prerequisites: npx wrangler secret put GOOGLE_CLIENT_ID
   //                       npx wrangler secret put GOOGLE_CLIENT_SECRET

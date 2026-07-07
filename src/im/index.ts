@@ -196,6 +196,9 @@ const HELP =
   'I can: "task: <title>" (optionally "@squad"), "status" or "status <agent>", ' +
   '"wake <agent>". I act as you, with your permissions.'
 
+const IM_TASK_DONE_WHEN =
+  'A task result or linked artifact provides evidence that the requested IM task is complete.'
+
 // ── the entry point Hermes calls ──────────────────────────────────────────────
 // (env, chatId, text) → a short text reply to send back into the chat. Pure with
 // respect to HTTP — no Hono context — so Hermes can invoke it directly.
@@ -343,8 +346,7 @@ async function taskReply(
     {
       squad_id: squad.id,
       title: title.trim(),
-      // #142: IM quick-add has no predicate — sentinel flags it for backfill.
-      done_when: '(set via task update)',
+      done_when: IM_TASK_DONE_WHEN,
       body: '',
     },
     { actor: memberActor(member.id) },
