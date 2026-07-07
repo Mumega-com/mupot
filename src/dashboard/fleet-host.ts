@@ -17,8 +17,11 @@ const STATUS_TONE: Record<string, Tone> = { running: 'ok', stopped: 'dim', unkno
 
 function controlCell(agentId: string): Html {
   // One form, three submit buttons sharing name="verb" — the browser sends only the CLICKED verb.
-  return html`<form method="post" action="/fleet/host-control"
-      onsubmit="Array.from(this.querySelectorAll('button')).forEach(b=>b.disabled=true)">
+  // NB: do NOT disable the clicked button in onsubmit — a disabled submitter is excluded from the
+  // form data, so `verb` would arrive empty and the emit silently fails as invalid_input (the bug
+  // that made the live panel a no-op, 2026-07-05). Each emit is nonce-unique + idempotent by
+  // requestId, so double-submit protection isn't needed here.
+  return html`<form method="post" action="/fleet/host-control">
     <input type="hidden" name="agent_id" value="${agentId}">
     <button class="btn sm" name="verb" value="start">Start</button>
     <button class="btn sm secondary" name="verb" value="stop">Stop</button>
