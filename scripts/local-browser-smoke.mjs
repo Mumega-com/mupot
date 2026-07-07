@@ -7,6 +7,8 @@ import { chromium } from 'playwright'
 
 const baseUrl = (process.env.MUPOT_LOCAL_URL || process.argv[2] || 'http://127.0.0.1:8787').replace(/\/$/, '')
 const artifactsDir = path.resolve(process.env.MUPOT_SMOKE_ARTIFACTS || 'tmp/local-smoke')
+const runtimeContract = 'runtime-adapter/v1'
+const hermesLifecycle = 'Hermes IM task lifecycle: Telegram update -> IM webhook -> chat_id member mapping -> capability gate -> task.created -> reply'
 
 const pages = [
   '/',
@@ -40,10 +42,10 @@ const pages = [
 ]
 
 const hermesMessages = [
-  { text: 'help', expect: 'I can:' },
-  { text: 'status', expect: 'Hermes Test Operator' },
-  { text: 'status hermes', expect: 'Hermes Local' },
-  { text: 'task: Local smoke task from Hermes @growth', expect: 'Added to Growth Local' },
+  { lifecycle: 'Hermes IM help lifecycle', text: 'help', expect: 'I can:' },
+  { lifecycle: 'Hermes IM member status lifecycle', text: 'status', expect: 'Hermes Test Operator' },
+  { lifecycle: 'Hermes IM agent status lifecycle', text: 'status hermes', expect: 'Hermes Local' },
+  { lifecycle: 'Hermes IM task lifecycle', text: 'task: Local smoke task from Hermes @growth', expect: 'Added to Growth Local' },
 ]
 
 function fail(message, details) {
@@ -99,13 +101,13 @@ try {
       timeout: 20_000,
     })
     const json = await res.json().catch(() => null)
-    hermes.push({ text: msg.text, status: res.status(), json })
+    hermes.push({ lifecycle: msg.lifecycle, text: msg.text, status: res.status(), json })
     if (res.status() !== 200 || !json?.ok || !String(json.reply ?? '').includes(msg.expect)) {
       fail(`Hermes smoke failed: ${msg.text}`, { status: res.status(), json, expected: msg.expect })
     }
   }
 
-  const report = { baseUrl, pages: results, hermes, screenshots: artifactsDir }
+  const report = { baseUrl, contract: runtimeContract, hermesLifecycle, pages: results, hermes, screenshots: artifactsDir }
   console.log(JSON.stringify(report, null, 2))
 } finally {
   await browser.close()

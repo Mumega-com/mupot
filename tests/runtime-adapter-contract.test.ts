@@ -1,0 +1,124 @@
+import { readFileSync } from 'node:fs'
+import { describe, expect, it } from 'vitest'
+
+const contract = JSON.parse(
+  readFileSync(new URL('../docs/runtime-adapter-v1.json', import.meta.url), 'utf8'),
+) as {
+  id: string
+  status: string
+  signedAttachDomain: string
+  attach: {
+    signed: { path: string; required: string[]; lifecycles: string[]; errors: Record<string, string> }
+    bearer: { path: string; downgradePolicy: string }
+    detach: { path: string }
+  }
+  messaging: {
+    mcpTools: string[]
+    kinds: string[]
+    idempotency: { scope: string[]; identicalRetry: string; differentContent: string }
+    readSemantics: { default: string; peek: string }
+  }
+  tasks: {
+    statuses: string[]
+    createStatuses: string[]
+    patchStatuses: string[]
+    verdictStatuses: string[]
+    doneWhenRequired: boolean
+    transitions: Record<string, string[]>
+  }
+  hermes: {
+    webhook: { path: string; secretHeader: string }
+    lifecycleName: string
+    lifecycle: string[]
+    taskDoneWhen: string
+  }
+  conformance: { planned: string[] }
+}
+
+describe('runtime-adapter/v1 contract artifact', () => {
+  it('documents the signed attach proof used by fleet attach', () => {
+    expect(contract.id).toBe('runtime-adapter/v1')
+    expect(contract.status).toBe('documented')
+    expect(contract.signedAttachDomain).toBe('fleet-attach:v1')
+    expect(contract.attach.signed.path).toBe('/api/fleet/attach-signed')
+    expect(contract.attach.signed.required).toEqual([
+      'agent_id',
+      'type',
+      'runtime',
+      'lifecycle',
+      'ts',
+      'nonce',
+      'sig',
+    ])
+    expect(contract.attach.signed.lifecycles).toEqual(['on_demand', 'always_on'])
+    expect(contract.attach.signed.errors).toMatchObject({
+      '401': 'unauthorized',
+      '409': 'replay',
+    })
+  })
+
+  it('captures bearer attach, detach, and inbox idempotency semantics', () => {
+    expect(contract.attach.bearer.path).toBe('/api/fleet/attach')
+    expect(contract.attach.bearer.downgradePolicy).toContain('refuse-bearer-attach')
+    expect(contract.attach.detach.path).toBe('/api/fleet/detach')
+    expect(contract.messaging.mcpTools).toEqual(['send', 'inbox'])
+    expect(contract.messaging.kinds).toEqual(['message', 'request', 'ack'])
+    expect(contract.messaging.idempotency.scope).toEqual(['tenant', 'from_agent', 'request_id'])
+    expect(contract.messaging.idempotency.identicalRetry).toBe('duplicate:true')
+    expect(contract.messaging.idempotency.differentContent).toBe('request_id_conflict')
+    expect(contract.messaging.readSemantics).toEqual({ default: 'consume', peek: 'non-consuming' })
+  })
+
+  it('tracks the implemented task lifecycle states and gates', () => {
+    expect(contract.tasks.statuses).toEqual([
+      'open',
+      'in_progress',
+      'blocked',
+      'done',
+      'review',
+      'approved',
+      'rejected',
+    ])
+    expect(contract.tasks.createStatuses).toEqual(['open', 'in_progress'])
+    expect(contract.tasks.patchStatuses).toEqual(['open', 'in_progress', 'blocked', 'done', 'review'])
+    expect(contract.tasks.verdictStatuses).toEqual(['approved', 'rejected'])
+    expect(contract.tasks.doneWhenRequired).toBe(true)
+    expect(contract.tasks.transitions.review).toEqual(['approved', 'rejected'])
+    expect(contract.tasks.transitions.done).toEqual([])
+  })
+
+  it('keeps Hermes and local smoke coverage on the same lifecycle language', () => {
+    expect(contract.hermes.webhook.path).toBe('/im/webhook')
+    expect(contract.hermes.webhook.secretHeader).toBe('X-Telegram-Bot-Api-Secret-Token')
+    expect(contract.hermes.lifecycleName).toBe('Hermes IM task lifecycle')
+    expect(contract.hermes.lifecycle).toEqual([
+      'Telegram update',
+      'IM webhook',
+      'chat_id member mapping',
+      'intent parsing',
+      'capability gate',
+      'createTask',
+      'task.created',
+      'reply',
+    ])
+    expect(contract.hermes.taskDoneWhen).toBe(
+      'A task result or linked artifact provides evidence that the requested IM task is complete.',
+    )
+
+    const smoke = readFileSync(new URL('../scripts/local-browser-smoke.mjs', import.meta.url), 'utf8')
+    expect(smoke).toContain('runtime-adapter/v1')
+    expect(smoke).toContain('Hermes IM task lifecycle')
+  })
+
+  it('names the follow-up conformance suites adapters must pass', () => {
+    expect(contract.conformance.planned).toEqual(
+      expect.arrayContaining([
+        'signed-attach',
+        'inbox-idempotency',
+        'hermes-im-task',
+        'task-lifecycle',
+        'result-receipts',
+      ]),
+    )
+  })
+})

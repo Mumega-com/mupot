@@ -32,6 +32,7 @@ send it work, gate risky actions, observe what happened, and verify the result
 against a real tool of record such as GitHub.
 
 See the [control-plane roadmap](./docs/control-plane-roadmap.md), the
+[runtime adapter contract](./docs/runtime-adapter-contract.md), the
 [self-hosting guide](./docs/SELF-HOST.md), and
 [what running an agent on Mupot means](./docs/agent-running-on-mupot.md).
 
