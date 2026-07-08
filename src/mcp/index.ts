@@ -51,6 +51,7 @@ import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
 import { resolveAgentRef } from '../org/resolve'
 import { sendToRef, readAgentInbox } from '../agents/messages'
+import { recordCheckin } from '../fleet/presence'
 import { PROVISION_TOOLS } from './provision'
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
 // Vitest can import it without the CF runtime. See ./auth-header.ts.
@@ -235,6 +236,27 @@ async function loadAgent(env: Env, agentId: string): Promise<Agent | null> {
     .bind(agentId)
     .first<Agent>()
   return row ?? null
+}
+
+async function loadMemberIdentity(env: Env, auth: AuthContext): Promise<{
+  memberId: string
+  displayName: string
+  email: string | null
+  boundAgentId: string | null
+} | null> {
+  const memberId = auth.memberId
+  if (!memberId) return null
+  const row = await env.DB.prepare(
+    `SELECT display_name, email FROM members WHERE id = ?1 LIMIT 1`,
+  )
+    .bind(memberId)
+    .first<{ display_name: string; email: string | null }>()
+  return {
+    memberId,
+    displayName: row?.display_name ?? auth.email ?? memberId,
+    email: row?.email ?? auth.email ?? null,
+    boundAgentId: auth.boundAgentId ?? null,
+  }
 }
 
 // ── attributed bus emit ───────────────────────────────────────────────────────
@@ -900,6 +922,52 @@ const toolInbox: ToolSpec = {
   },
 }
 
+// check_in — pot-native presence heartbeat over MCP. This mirrors
+// POST /api/fleet/checkin for runtimes that only have an MCP transport: identity
+// is the authenticated member token, source/label are descriptive only, and a
+// rapid repeat is debounced with the same tenant+member KV key as the HTTP route.
+const toolCheckIn: ToolSpec = {
+  name: 'check_in',
+  scope: 'self (member-token presence)',
+  min: 'authenticated',
+  args: '{ source?: "claude-code"|"codex"|"hermes"|"openclaw"|"tmux"|"cowork"|"unknown", label?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      source: STRING_SCHEMA,
+      label: STRING_SCHEMA,
+    },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (args.source !== undefined && args.source !== null && typeof args.source !== 'string') {
+      return fail(400, 'invalid_args', 'source must be a string')
+    }
+    if (args.label !== undefined && args.label !== null && typeof args.label !== 'string') {
+      return fail(400, 'invalid_args', 'label must be a string')
+    }
+
+    const id = await loadMemberIdentity(env, auth)
+    if (!id) return fail(403, 'not_member_bound', 'check_in requires a member-token principal')
+
+    const dkey = `checkin:${env.TENANT_SLUG}:${id.memberId}`
+    try {
+      if (await env.SESSIONS.get(dkey)) {
+        return done({ ok: true, agent: id.displayName, agent_id: id.boundAgentId, debounced: true })
+      }
+      await env.SESSIONS.put(dkey, '1', { expirationTtl: 30 })
+    } catch {
+      // KV unavailable — match /api/fleet/checkin and prefer recording presence.
+    }
+
+    await recordCheckin(env, id, {
+      source: args.source,
+      label: args.label,
+    })
+    return done({ ok: true, agent: id.displayName, agent_id: id.boundAgentId, debounced: false })
+  },
+}
+
 // status — read-only agent runtime telemetry. cap: any authenticated member.
 // Read-only and tenant-scoped (the agent row is resolved from this pot's D1).
 const toolStatus: ToolSpec = {
@@ -1219,6 +1287,7 @@ export const TOOLS: ToolSpec[] = [
   toolSquadMessage,
   toolSend,
   toolInbox,
+  toolCheckIn,
   toolStatus,
   toolBootContext,
   toolOrient,

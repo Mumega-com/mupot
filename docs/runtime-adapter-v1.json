@@ -80,6 +80,13 @@
     },
     "signedBytes": ["fleet-control.v1", "agent_id", "verb", "nonce", "ts"]
   },
+  "presence": {
+    "mcpTools": ["check_in"],
+    "http": "POST /api/fleet/checkin",
+    "identitySource": "authenticated-member-token",
+    "bodyFieldsDescriptiveOnly": ["source", "label"],
+    "debounce": "tenant-member-30s"
+  },
   "messaging": {
     "mcpTools": ["send", "inbox"],
     "http": {

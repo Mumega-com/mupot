@@ -21,6 +21,13 @@ const contract = JSON.parse(
     verbs: Record<string, string>
     signedBytes: string[]
   }
+  presence: {
+    mcpTools: string[]
+    http: string
+    identitySource: string
+    bodyFieldsDescriptiveOnly: string[]
+    debounce: string
+  }
   messaging: {
     mcpTools: string[]
     http: { signedRead: { path: string; required: string[]; domain: string } }
@@ -111,6 +118,14 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(contract.control.verbs.stop).toContain('flight.mjs close')
     expect(contract.control.verbs.restart).toContain('then')
     expect(contract.control.signedBytes).toEqual(['fleet-control.v1', 'agent_id', 'verb', 'nonce', 'ts'])
+  })
+
+  it('captures runtime presence check-in semantics', () => {
+    expect(contract.presence.mcpTools).toEqual(['check_in'])
+    expect(contract.presence.http).toBe('POST /api/fleet/checkin')
+    expect(contract.presence.identitySource).toBe('authenticated-member-token')
+    expect(contract.presence.bodyFieldsDescriptiveOnly).toEqual(['source', 'label'])
+    expect(contract.presence.debounce).toBe('tenant-member-30s')
   })
 
   it('tracks the implemented task lifecycle states and gates', () => {

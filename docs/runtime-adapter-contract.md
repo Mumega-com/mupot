@@ -170,6 +170,11 @@ presence by periodically attaching or by using the fleet daemon/report path. The
 operator-facing state distinguishes the last reported runtime state from actual
 task progress.
 
+MCP `check_in { source?, label? }` mirrors `POST /api/fleet/checkin` for runtimes
+that only have an MCP transport. Identity is derived from the authenticated
+member token; `source` and `label` are descriptive only. Repeated check-ins are
+debounced by tenant/member for 30 seconds before touching D1.
+
 ## Lifecycle Control
 
 `POST /api/fleet/control` is the Worker/dashboard API for remote lifecycle
