@@ -439,7 +439,8 @@ against `wrangler-local-test.toml` after `npm run migrate:local:test`,
 `npm run seed:local:test`, and `npm run dev:local:test`. It proves the first
 runtime path over real HTTP: signed attach, attach replay refusal, bearer send
 to the runtime inbox, signed inbox peek and consume, signed inbox replay refusal,
-consume-once behavior, and signed detach.
+consume-once behavior, `fleet-control.v1` request signing/delivery, and signed
+detach.
 
 The broader adapter conformance suite should cover:
 

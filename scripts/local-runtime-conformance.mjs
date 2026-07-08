@@ -12,6 +12,7 @@ const agentType = 'builder'
 const runtime = 'python'
 const lifecycle = 'on_demand'
 const senderToken = process.env.MUPOT_CONFORMANCE_SENDER_TOKEN || 'local-runtime-conformance-sender-token'
+const ownerToken = process.env.MUPOT_CONFORMANCE_OWNER_TOKEN || 'local-runtime-conformance-owner-token'
 
 // Local-only deterministic key for scripts/local-test-seed.sql. This is not a
 // production credential; it exists so the signed runtime path can be smoke-tested
@@ -23,6 +24,14 @@ const privateJwk = {
   d: '8HMGWlPR9d_UaJdSXZDImH431TLG9NNz7cerK-MNIlg',
   ext: true,
   key_ops: ['sign'],
+}
+
+const panelPublicJwk = {
+  kty: 'OKP',
+  crv: 'Ed25519',
+  x: 'bqjg1QCM1_F1Oe4xxjDidrEkNzkgwbAUk65dJUYFaLI',
+  ext: true,
+  key_ops: ['verify'],
 }
 
 const enc = new TextEncoder()
@@ -148,6 +157,26 @@ function findRequest(messages, requestId) {
   return Array.isArray(messages) ? messages.find((m) => m?.request_id === requestId) : null
 }
 
+function findControlRequest(messages, nonce) {
+  if (!Array.isArray(messages)) return null
+  for (const message of messages) {
+    try {
+      const control = JSON.parse(message?.body ?? '')
+      if (control?.nonce === nonce && control?.agent_id === agentId) return { message, control }
+    } catch {
+      // ignore non-control messages
+    }
+  }
+  return null
+}
+
+async function verifyControlRequest(control) {
+  const key = await cryptoImpl.subtle.importKey('jwk', panelPublicJwk, { name: 'Ed25519' }, false, ['verify'])
+  const sig = Buffer.from(String(control.sig).replace(/-/g, '+').replace(/_/g, '/'), 'base64')
+  const msg = enc.encode(['fleet-control.v1', control.agent_id, control.verb, control.nonce, String(control.ts)].join('\n'))
+  return cryptoImpl.subtle.verify({ name: 'Ed25519' }, key, sig, msg)
+}
+
 async function main() {
   const key = await importPrivateKey()
   const runId = randomUUID()
@@ -223,6 +252,30 @@ async function main() {
   expectStatus('signed inbox post-consume peek', afterConsume.status, 200, afterConsume.json)
   expect(!findRequest(afterConsume.json?.messages, requestId), 'consumed conformance request was still unread', afterConsume.json)
   steps.push({ name: 'consume-once confirmation', status: 'passed' })
+
+  const control = await requestJson('/api/fleet/control', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${ownerToken}` },
+    body: JSON.stringify({
+      agent_id: agentId,
+      verb: 'status',
+    }),
+  })
+  expectStatus('fleet control request', control.status, 200, control.json)
+  expect(control.json?.ok === true && control.json?.agent_id === agentId && control.json?.verb === 'status', 'fleet control did not accept the conformance command', control.json)
+  steps.push({ name: 'fleet control emit', status: 'passed', nonce: control.json.nonce })
+
+  const controlInbox = await requestJson('/api/inbox/signed', {
+    method: 'POST',
+    body: JSON.stringify(await signedInboxBody(key, { peek: false, limit: 10 })),
+  })
+  expectStatus('signed inbox control consume', controlInbox.status, 200, controlInbox.json)
+  const controlRequest = findControlRequest(controlInbox.json?.messages, control.json.nonce)
+  expect(Boolean(controlRequest), 'signed inbox did not receive the emitted fleet control request', controlInbox.json)
+  expect(controlRequest.message.kind === 'request', 'fleet control message was not request kind', controlRequest.message)
+  expect(controlRequest.message.from_agent === 'fleet-panel', 'fleet control message did not come from fleet-panel', controlRequest.message)
+  expect(await verifyControlRequest(controlRequest.control), 'fleet-control.v1 signature did not verify with the local panel public key', controlRequest.control)
+  steps.push({ name: 'fleet-control.v1 signed inbox delivery', status: 'passed', verb: controlRequest.control.verb })
 
   const detach = await requestJson('/api/fleet/detach-signed', {
     method: 'POST',

@@ -198,8 +198,9 @@ gate-specific verdict route rather than being completed by direct status writes.
   `env.TENANT_SLUG`, but the token row itself does not yet carry an explicit
   tenant claim. Keep the per-pot database invariant or add token-row tenant
   binding before any shared-database mode. Track this in GitHub issue #58.
-- Runtime adapter behavior is not yet frozen as a versioned conformance contract.
-  Track this in GitHub issue #269.
+- `runtime-adapter/v1` is documented and has a local signed HTTP conformance
+  smoke for attach, inbox, fleet control, and detach. Broader runtime/webhook
+  conformance suites remain follow-up under GitHub issue #269.
 - Browser workflow coverage still needs deeper operator flows beyond page smoke
   and basic Hermes checks. Track this in GitHub issue #270.
 - Dashboard health/observability needs a single operator view for failed

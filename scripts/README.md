@@ -69,7 +69,7 @@ npm run conformance:runtime:local
 The local seed creates a non-production `agent-conformance` key and a welded
 sender token. The harness proves `runtime-adapter/v1` over HTTP: signed attach,
 replay refusal, bearer send to the runtime inbox, signed inbox peek/consume,
-consume-once behavior, and signed detach.
+consume-once behavior, fleet control request signing/delivery, and signed detach.
 
 ## One-time deploy (fork → deploy → log in)
 

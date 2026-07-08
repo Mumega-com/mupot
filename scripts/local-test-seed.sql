@@ -131,6 +131,25 @@ ON CONFLICT(id) DO UPDATE SET
   revoked_at = NULL,
   agent_id = excluded.agent_id;
 
+INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id)
+VALUES (
+  'tok-conformance-owner',
+  'mbr-local-admin',
+  '39b5d3cacafcbe252552358da941aea53d6f39d8ae2ffa8e129f352caf45ef0b',
+  'local runtime conformance owner',
+  'workspace',
+  datetime('now'),
+  NULL,
+  NULL
+)
+ON CONFLICT(id) DO UPDATE SET
+  member_id = excluded.member_id,
+  token_hash = excluded.token_hash,
+  label = excluded.label,
+  channel = excluded.channel,
+  revoked_at = NULL,
+  agent_id = excluded.agent_id;
+
 INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
 VALUES
   ('gg-hermes-local', 'gate:local', 'member', 'mbr-hermes-user', 'usr-local-owner', datetime('now')),

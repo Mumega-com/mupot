@@ -245,6 +245,7 @@ describe('runtime-adapter/v1 contract artifact', () => {
         'bearer-inbox-send',
         'signed-inbox-consume',
         'consume-once',
+        'fleet-control',
         'signed-detach',
       ]),
     )
@@ -270,14 +271,18 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(pkg.scripts['conformance:runtime:local']).toBe('node scripts/local-runtime-conformance.mjs')
     expect(script).toContain('runtime-adapter/v1')
     expect(script).toContain('/api/fleet/attach-signed')
+    expect(script).toContain('/api/fleet/control')
     expect(script).toContain('/api/inbox/signed')
     expect(script).toContain('/api/fleet/detach-signed')
     expect(script).toContain('local-runtime-conformance-sender-token')
+    expect(script).toContain('local-runtime-conformance-owner-token')
     expect(seed).toContain('agent-conformance')
     expect(seed).toContain('tok-conformance-sender')
+    expect(seed).toContain('tok-conformance-owner')
     expect(seed).toContain('5hhsUxlkZWNACkMQjUFNIO1-e4bbFtTaLUd7_5L7sdU')
     expect(scriptsReadme).toContain('npm run conformance:runtime:local')
     expect(scriptsReadme).toContain('signed attach')
+    expect(scriptsReadme).toContain('fleet control')
     expect(scriptsReadme).toContain('signed detach')
   })
 })

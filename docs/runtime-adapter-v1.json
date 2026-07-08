@@ -211,6 +211,8 @@
         "signed-inbox-consume",
         "signed-inbox-replay",
         "consume-once",
+        "fleet-control",
+        "fleet-control-signature-verify",
         "signed-detach"
       ]
     },
