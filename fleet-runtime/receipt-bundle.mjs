@@ -257,6 +257,68 @@ function sameSummary(actual, expected) {
     actual?.warnings === expected?.warnings
 }
 
+function manifestAgents(manifest) {
+  return Array.isArray(manifest?.inputs?.agents) ? manifest.inputs.agents.filter(Boolean) : []
+}
+
+function hasArtifact(entries, predicate) {
+  return entries.some((entry) => predicate(entry))
+}
+
+function addRequiredEvidenceChecks(checks, manifestPath, entries, agents) {
+  const runtimeEntries = entries.filter((entry) => entry.label.startsWith('runtime:'))
+  const controlEntries = entries.filter((entry) => entry.label.startsWith('control:'))
+  checks.push({
+    ok: agents.length > 0,
+    component: 'receipt-bundle-check',
+    check: 'selected_agents_recorded',
+    path: manifestPath,
+    agents,
+  })
+  checks.push({
+    ok: hasArtifact(entries, (entry) => entry.label === 'host'),
+    component: 'receipt-bundle-check',
+    check: 'required_artifact_present',
+    path: manifestPath,
+    artifact: 'host',
+  })
+  checks.push({
+    ok: runtimeEntries.length > 0,
+    component: 'receipt-bundle-check',
+    check: 'required_artifact_present',
+    path: manifestPath,
+    artifact: 'runtime',
+    count: runtimeEntries.length,
+  })
+  checks.push({
+    ok: controlEntries.length > 0,
+    component: 'receipt-bundle-check',
+    check: 'required_artifact_present',
+    path: manifestPath,
+    artifact: 'control',
+    count: controlEntries.length,
+  })
+  checks.push({
+    ok: hasArtifact(entries, (entry) => entry.label === 'cutover_gate'),
+    component: 'receipt-bundle-check',
+    check: 'required_artifact_present',
+    path: manifestPath,
+    artifact: 'cutover_gate',
+  })
+
+  for (const agentId of agents) {
+    const expectedRuntime = `runtime-${safeName(agentId)}.json`
+    checks.push({
+      ok: runtimeEntries.some((entry) => typeof entry.path === 'string' && basename(entry.path) === expectedRuntime),
+      component: 'receipt-bundle-check',
+      check: 'runtime_artifact_for_agent',
+      path: manifestPath,
+      agent_id: agentId,
+      expected_file: expectedRuntime,
+    })
+  }
+}
+
 function checkBundleManifest(opts = {}) {
   const checks = []
   const manifestPath = manifestPathForCheck(opts)
@@ -331,6 +393,7 @@ function checkBundleManifest(opts = {}) {
     })
 
     const entries = bundleArtifactEntries(manifest)
+    const agents = manifestAgents(manifest)
     checks.push({
       ok: entries.length > 0,
       component: 'receipt-bundle-check',
@@ -338,6 +401,7 @@ function checkBundleManifest(opts = {}) {
       path: manifestPath,
       count: entries.length,
     })
+    addRequiredEvidenceChecks(checks, manifestPath, entries, agents)
 
     for (const entry of entries) {
       const checkedPath = resolveArtifactPath(manifestDir, entry.path)

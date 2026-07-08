@@ -456,8 +456,9 @@ node ~/.fleet/runtime/receipt-bundle.mjs \
 To verify a copied bundle without rewriting anything, run the manifest check. It
 reads `manifest.json`, checks the recorded receipt artifact SHA-256 hashes, reads
 each saved receipt JSON, verifies receipt type/status against the manifest,
-recomputes the manifest summary from its recorded checks, and exits non-zero if
-any saved file or manifest status drifted:
+requires the host/runtime/control/cutover-gate evidence categories, recomputes
+the manifest summary from its recorded checks, and exits non-zero if any saved
+file or manifest status drifted:
 
 ```bash
 node ~/.fleet/runtime/receipt-bundle.mjs \
@@ -483,8 +484,8 @@ The manifest includes SHA-256 hashes for the saved receipt artifacts
 inside itself because that file is self-referential. The manifest check emits
 `mupot-fleet-receipt-bundle-check/v1`; it accepts installer `pass|warn` and
 requires the host, probe, runtime, control, and cutover-gate receipts to be
-`status:"pass"`. The check receipt includes the SHA-256 of the `manifest.json`
-file it inspected.
+`status:"pass"`. It also requires a runtime artifact for each selected agent.
+The check receipt includes the SHA-256 of the `manifest.json` file it inspected.
 
 Every bundle manifest also includes `next_steps`. Treat those as operator
 guidance only: the hard gate remains `manifest.json` and `cutover-gate.json`
