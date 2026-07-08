@@ -198,6 +198,22 @@
     "taskDoneWhen": "A task result or linked artifact provides evidence that the requested IM task is complete."
   },
   "conformance": {
+    "localHarness": {
+      "script": "scripts/local-runtime-conformance.mjs",
+      "npmScript": "conformance:runtime:local",
+      "config": "wrangler-local-test.toml",
+      "seed": "scripts/local-test-seed.sql",
+      "covers": [
+        "signed-attach",
+        "signed-attach-replay",
+        "bearer-inbox-send",
+        "signed-inbox-peek",
+        "signed-inbox-consume",
+        "signed-inbox-replay",
+        "consume-once",
+        "signed-detach"
+      ]
+    },
     "planned": [
       "signed-attach",
       "signed-detach",

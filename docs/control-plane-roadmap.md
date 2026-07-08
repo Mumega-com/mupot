@@ -31,7 +31,7 @@ and the running product.
 |---|---|---|
 | Self-hosted install | A new operator can deploy a pot into their own Cloudflare account and keep data in their account. | `docs/SELF-HOST.md`, `docs/production-runbook.md`, `scripts/setup.sh`, `wrangler.example.toml` |
 | Agent identity | Each agent has a durable identity separate from its runtime shell. | `docs/agent-running-on-mupot.md`, `fleet_agents`, `agent_keys`, member/capability tests |
-| Runtime adapters | Hermes, Codex, Claude Code, and custom workers can attach through a stable contract. | `docs/runtime-adapter-contract.md`, `docs/runtime-adapter-v1.json`, `connectors/`, signed attach flow |
+| Runtime adapters | Hermes, Codex, Claude Code, and custom workers can attach through a stable contract. | `docs/runtime-adapter-contract.md`, `docs/runtime-adapter-v1.json`, `scripts/local-runtime-conformance.mjs`, `connectors/`, signed attach flow |
 | Scoped authority | Every sensitive action is guarded by role and capability checks. | `docs/security-model.md`, `src/auth/`, `tests/*capability*`, `tests/*gate*` |
 | Work lifecycle | Work has a predictable state path from request to claim to result to verification. | task, gate, loop, workflow, and GitHub integration tests |
 | Approval gates | Customer-facing or high-risk actions wait for accountable approval. | `/approvals`, gated loops, gate protocol docs |

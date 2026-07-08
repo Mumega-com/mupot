@@ -52,6 +52,25 @@ Artifacts:
 `npm run smoke:local` prints a JSON report containing the page crawl, workflow
 results, Hermes checks, runtime contract name, and artifact directory.
 
+## Local runtime adapter conformance
+
+Use this with the same local Wrangler server when changing signed runtime,
+inbox, or detach behavior:
+
+```bash
+npm run migrate:local:test
+npm run seed:local:test
+npm run dev:local:test
+
+# in another shell, after Wrangler prints the local URL:
+npm run conformance:runtime:local
+```
+
+The local seed creates a non-production `agent-conformance` key and a welded
+sender token. The harness proves `runtime-adapter/v1` over HTTP: signed attach,
+replay refusal, bearer send to the runtime inbox, signed inbox peek/consume,
+consume-once behavior, and signed detach.
+
 ## One-time deploy (fork → deploy → log in)
 
 ```bash

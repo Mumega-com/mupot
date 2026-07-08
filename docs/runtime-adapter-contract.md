@@ -15,7 +15,8 @@ artifact and the local smoke harness references this same contract name.
 ## Version
 
 - Contract id: `runtime-adapter/v1`
-- Status: documented; adapter conformance tests are planned
+- Status: documented; local runtime conformance smoke covers the signed HTTP
+  path, with broader adapter conformance still planned
 - Signed attach domain: `fleet-attach:v1`
 - Signed detach domain: `fleet-detach:v1`
 - Signed inbox domain: `agent-inbox:v1`
@@ -433,7 +434,14 @@ Runtimes must assume Mupot is the policy authority:
 
 ## Planned Conformance Tests
 
-The adapter conformance suite should cover:
+The local conformance smoke is `npm run conformance:runtime:local`. It runs
+against `wrangler-local-test.toml` after `npm run migrate:local:test`,
+`npm run seed:local:test`, and `npm run dev:local:test`. It proves the first
+runtime path over real HTTP: signed attach, attach replay refusal, bearer send
+to the runtime inbox, signed inbox peek and consume, signed inbox replay refusal,
+consume-once behavior, and signed detach.
+
+The broader adapter conformance suite should cover:
 
 - signed attach success, replay, stale timestamp, tampered field, and cross-tenant
   signature refusal

@@ -76,7 +76,16 @@ const contract = JSON.parse(
     lifecycle: string[]
     taskDoneWhen: string
   }
-  conformance: { planned: string[] }
+  conformance: {
+    localHarness: {
+      script: string
+      npmScript: string
+      config: string
+      seed: string
+      covers: string[]
+    }
+    planned: string[]
+  }
 }
 
 describe('runtime-adapter/v1 contract artifact', () => {
@@ -224,6 +233,21 @@ describe('runtime-adapter/v1 contract artifact', () => {
   })
 
   it('names the follow-up conformance suites adapters must pass', () => {
+    expect(contract.conformance.localHarness).toMatchObject({
+      script: 'scripts/local-runtime-conformance.mjs',
+      npmScript: 'conformance:runtime:local',
+      config: 'wrangler-local-test.toml',
+      seed: 'scripts/local-test-seed.sql',
+    })
+    expect(contract.conformance.localHarness.covers).toEqual(
+      expect.arrayContaining([
+        'signed-attach',
+        'bearer-inbox-send',
+        'signed-inbox-consume',
+        'consume-once',
+        'signed-detach',
+      ]),
+    )
     expect(contract.conformance.planned).toEqual(
       expect.arrayContaining([
         'signed-attach',
@@ -235,5 +259,25 @@ describe('runtime-adapter/v1 contract artifact', () => {
         'result-receipts',
       ]),
     )
+  })
+
+  it('keeps the local runtime conformance harness wired to package scripts and seed fixtures', () => {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { scripts: Record<string, string> }
+    const script = readFileSync(new URL('../scripts/local-runtime-conformance.mjs', import.meta.url), 'utf8')
+    const seed = readFileSync(new URL('../scripts/local-test-seed.sql', import.meta.url), 'utf8')
+    const scriptsReadme = readFileSync(new URL('../scripts/README.md', import.meta.url), 'utf8')
+
+    expect(pkg.scripts['conformance:runtime:local']).toBe('node scripts/local-runtime-conformance.mjs')
+    expect(script).toContain('runtime-adapter/v1')
+    expect(script).toContain('/api/fleet/attach-signed')
+    expect(script).toContain('/api/inbox/signed')
+    expect(script).toContain('/api/fleet/detach-signed')
+    expect(script).toContain('local-runtime-conformance-sender-token')
+    expect(seed).toContain('agent-conformance')
+    expect(seed).toContain('tok-conformance-sender')
+    expect(seed).toContain('5hhsUxlkZWNACkMQjUFNIO1-e4bbFtTaLUd7_5L7sdU')
+    expect(scriptsReadme).toContain('npm run conformance:runtime:local')
+    expect(scriptsReadme).toContain('signed attach')
+    expect(scriptsReadme).toContain('signed detach')
   })
 })

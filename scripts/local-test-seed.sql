@@ -54,7 +54,9 @@ INSERT INTO agents (
   kpi_progress, effort, autonomy, budget_cap_cents, budget_window
 ) VALUES
   ('agent-hermes', 'sq-growth', 'hermes', 'Hermes Local', 'IM control and local smoke', '@cf/meta/llama-3.3', 'active', datetime('now'), NULL, 'local smoke passing', 0.66, 'standard', 'draft', 1500, 'week'),
-  ('agent-growth', 'sq-growth', 'growth-lead', 'Growth Lead Local', 'Growth operator', '@cf/meta/llama-3.3', 'paused', datetime('now'), 'Improve local pipeline confidence', '3 smoke checks green', 0.45, 'low', 'suggest', 500, 'day')
+  ('agent-growth', 'sq-growth', 'growth-lead', 'Growth Lead Local', 'Growth operator', '@cf/meta/llama-3.3', 'paused', datetime('now'), 'Improve local pipeline confidence', '3 smoke checks green', 0.45, 'low', 'suggest', 500, 'day'),
+  ('agent-conformance', 'sq-growth', 'runtime-conformance', 'Runtime Conformance Local', 'Local signed runtime adapter fixture', 'local-fixture', 'active', datetime('now'), 'Prove runtime-adapter/v1 over HTTP', 'signed attach, inbox, and detach pass', 0.1, 'low', 'draft', 100, 'day'),
+  ('agent-conformance-sender', 'sq-growth', 'runtime-conformance-sender', 'Runtime Conformance Sender', 'Local sender fixture for runtime conformance', 'local-fixture', 'active', datetime('now'), 'Seed conformance inbox messages', 'bearer send succeeds', 0.1, 'low', 'draft', 100, 'day')
 ON CONFLICT(id) DO UPDATE SET
   squad_id = excluded.squad_id,
   slug = excluded.slug,
@@ -73,13 +75,17 @@ ON CONFLICT(id) DO UPDATE SET
 INSERT INTO memberships (id, agent_id, squad_id, capability)
 VALUES
   ('memship-hermes-growth', 'agent-hermes', 'sq-growth', 'lead'),
-  ('memship-growth-growth', 'agent-growth', 'sq-growth', 'member')
+  ('memship-growth-growth', 'agent-growth', 'sq-growth', 'member'),
+  ('memship-conformance-growth', 'agent-conformance', 'sq-growth', 'member'),
+  ('memship-conformance-sender-growth', 'agent-conformance-sender', 'sq-growth', 'member')
 ON CONFLICT(id) DO UPDATE SET capability = excluded.capability;
 
 INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
 VALUES
   ('mbr-hermes-user', 'hermes@mupot.test', 'Hermes Test Operator', '123456789', 'active', datetime('now'), 'local'),
-  ('mbr-local-admin', 'local-admin@mupot.test', 'Local Admin', NULL, 'active', datetime('now'), 'local')
+  ('mbr-local-admin', 'local-admin@mupot.test', 'Local Admin', NULL, 'active', datetime('now'), 'local'),
+  ('mbr-conformance-runtime', 'runtime-conformance@mupot.test', 'Runtime Conformance Local', NULL, 'active', datetime('now'), 'local'),
+  ('mbr-conformance-sender', 'runtime-conformance-sender@mupot.test', 'Runtime Conformance Sender', NULL, 'active', datetime('now'), 'local')
 ON CONFLICT(id) DO UPDATE SET
   email = excluded.email,
   display_name = excluded.display_name,
@@ -90,8 +96,40 @@ ON CONFLICT(id) DO UPDATE SET
 INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
 VALUES
   ('cap-hermes-org-admin', 'mbr-hermes-user', 'org', NULL, 'admin'),
-  ('cap-admin-org-owner', 'mbr-local-admin', 'org', NULL, 'owner')
+  ('cap-admin-org-owner', 'mbr-local-admin', 'org', NULL, 'owner'),
+  ('cap-conformance-runtime-member', 'mbr-conformance-runtime', 'squad', 'sq-growth', 'member'),
+  ('cap-conformance-sender-member', 'mbr-conformance-sender', 'squad', 'sq-growth', 'member')
 ON CONFLICT(id) DO UPDATE SET capability = excluded.capability;
+
+-- Local-only runtime adapter conformance fixtures. The private key matching this
+-- public key is embedded in scripts/local-runtime-conformance.mjs and is not a
+-- production credential.
+INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
+VALUES ('local', 'agent-conformance', '5hhsUxlkZWNACkMQjUFNIO1-e4bbFtTaLUd7_5L7sdU', 'Ed25519', 'mbr-conformance-runtime', unixepoch('now'))
+ON CONFLICT(tenant, agent_id) DO UPDATE SET
+  pubkey = excluded.pubkey,
+  algo = excluded.algo,
+  member_id = excluded.member_id,
+  created_at = excluded.created_at;
+
+INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id)
+VALUES (
+  'tok-conformance-sender',
+  'mbr-conformance-sender',
+  'fd112c91b89c533d421777fcdfb826e3c6cd620da1c2094d407c28a9627f8f17',
+  'local runtime conformance sender',
+  'workspace',
+  datetime('now'),
+  NULL,
+  'agent-conformance-sender'
+)
+ON CONFLICT(id) DO UPDATE SET
+  member_id = excluded.member_id,
+  token_hash = excluded.token_hash,
+  label = excluded.label,
+  channel = excluded.channel,
+  revoked_at = NULL,
+  agent_id = excluded.agent_id;
 
 INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
 VALUES
