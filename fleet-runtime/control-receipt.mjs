@@ -111,6 +111,8 @@ function addPollChecks(result, checks) {
     ok: result.ok === true,
     component: 'fleet-control-daemon',
     check: 'control_request_executed',
+    agent_id: result.request?.agent_id ?? null,
+    verb: result.request?.verb ?? null,
     action: result.action,
     status: result.status ?? null,
     retry: result.retry ?? null,

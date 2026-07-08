@@ -162,6 +162,10 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
 7. Repoint squad wake-hooks / bus identity SOS → mupot.
 
 **Phase 4 — retire SOS** (8) decommission the python bus for the squad once nothing depends on it.
+Use `fleet-runtime/cutover-receipt.mjs` as the per-agent final gate: it combines
+saved host, runtime, and start/stop control receipts and emits
+`mupot-sos-cutover-gate/v1`. Only a `status:"pass"` gate should allow removing
+that agent's SOS bus/wake path.
 
 **Cross-cutting** — (9) durable, reliably-wakeable 2nd adversarial gate lens (Codex bus-peer
 was stale on both pings); (10) dyad-gate.yml single-quote glob (1-line).

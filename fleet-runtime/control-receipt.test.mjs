@@ -40,7 +40,7 @@ test('control receipt passes when one poll executes a signed flight action', asy
     ledger: { burn: () => true },
     pollOnce: async (cfg, consumerKey, publicKey, ledger, opts) => {
       calls.push({ cfg, consumerKey, publicKey, ledger, opts })
-      return { ok: true, action: 'open' }
+      return { ok: true, action: 'open', request: { agent_id: 'agent-one', verb: 'start' } }
     },
   })
 
@@ -51,7 +51,7 @@ test('control receipt passes when one poll executes a signed flight action', asy
   assert.equal(calls[0].consumerKey, 'key:fleet-consumer')
   assert.equal(calls[0].publicKey.imported, true)
   assert.equal(typeof calls[0].opts.log, 'function')
-  assert.ok(receipt.checks.some((c) => c.component === 'fleet-control-daemon' && c.check === 'control_request_executed' && c.ok && c.action === 'open'))
+  assert.ok(receipt.checks.some((c) => c.component === 'fleet-control-daemon' && c.check === 'control_request_executed' && c.ok && c.action === 'open' && c.agent_id === 'agent-one' && c.verb === 'start'))
 })
 
 test('control receipt warns when the signed control inbox is idle', async () => {

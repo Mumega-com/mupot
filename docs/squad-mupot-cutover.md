@@ -311,6 +311,10 @@ and exiting `0` so the daemon consumes the batch.
      run `node ~/.fleet/runtime/control-receipt.mjs --control ~/.fleet/control.json`.
      A `mupot-fleet-control-receipt/v1` `status:"pass"` proves the host consumed
      a signed `fleet-control.v1` request and reached the flight layer.
+   - Final cutover gate: after saving the host, runtime, and start/stop control
+     receipts, run `node ~/.fleet/runtime/cutover-receipt.mjs --agent <agent_id> --host <host.json> --runtime <runtime.json> --control <control-start.json> --control <control-stop.json>`.
+     A `mupot-sos-cutover-gate/v1` `status:"pass"` is the receipt that permits
+     removing that agent's SOS bus/wake path.
 
 6. **Decommission SOS per surface, not all-at-once.** Only after an arm's memory + messaging + wake are all verified on mupot AND stable for a few cycles, drop that arm's `mumega-bus` allowlist entries. Keep the bus token valid (don't revoke) until the whole squad is migrated and Hadi signs off — the bus is the rollback floor.
 
@@ -328,6 +332,7 @@ and exiting `0` so the daemon consumes the batch.
 | host install | `host-receipt.mjs` emits `mupot-fleet-host-receipt/v1` with `status:"pass"` |
 | runtime live | `runtime-receipt.mjs --agent <id>` emits `mupot-fleet-runtime-receipt/v1` with `status:"pass"` |
 | control live | `control-receipt.mjs` emits `mupot-fleet-control-receipt/v1` with `status:"pass"` |
+| SOS cutover gate | `cutover-receipt.mjs` emits `mupot-sos-cutover-gate/v1` with `status:"pass"` for that agent |
 | wake-hook (post-route) | watcher launches a session from a mupot `inbox` poll, logged in `watcher.log` |
 
 ---
@@ -365,4 +370,8 @@ and exiting `0` so the daemon consumes the batch.
    attach/inbox/control smoke, and `fleet-runtime/runtime-receipt.mjs` gives a
    one-cycle live receipt for signed attach plus inbox handoff once an agent is
    actually up.
-2. **Dropping `verify-delegation.py` HMAC** — safe only after the host handler diff proves it reads from signed Mupot inbox batches and does not trust client-supplied routing. Security-relevant; must pass diverse review.
+2. **Final SOS removal gate** — `fleet-runtime/cutover-receipt.mjs` now verifies
+   saved host/runtime/control receipts and refuses `status:"pass"` unless the
+   selected agent has host readiness, runtime inbox handoff, and start+stop
+   lifecycle evidence. Run it before deleting any SOS runtime wiring.
+3. **Dropping `verify-delegation.py` HMAC** — safe only after the host handler diff proves it reads from signed Mupot inbox batches and does not trust client-supplied routing. Security-relevant; must pass diverse review.

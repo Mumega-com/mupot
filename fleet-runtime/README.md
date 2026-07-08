@@ -38,6 +38,7 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `host-receipt.mjs` | non-destructive local verifier that emits a redacted host-install receipt |
 | `runtime-receipt.mjs` | one-shot live daemon-cycle receipt for signed attach + inbox drain |
 | `control-receipt.mjs` | one-shot live control receipt for signed open/close/restart |
+| `cutover-receipt.mjs` | verifies host/runtime/control receipts before SOS removal |
 
 ## Quickstart (per agent)
 
@@ -287,6 +288,42 @@ It prints JSON with `receipt_type: "mupot-fleet-runtime-receipt/v1"`. A
 and drain Mupot inbox work. `status:"warn"` with `inbox_no_messages_to_handoff`
 means the signed inbox route worked, but no queued message was available to prove
 handler delivery; send a cutover probe message and rerun it.
+
+## SOS cutover gate
+
+Do not remove an agent's SOS bus/wake path from the runtime config until the
+host, runtime, and control receipts have all passed and the combined gate passes:
+
+```bash
+node ~/.fleet/runtime/cutover-receipt.mjs \
+  --agent my-agent \
+  --host ~/.fleet/receipts/host.json \
+  --runtime ~/.fleet/receipts/runtime-my-agent.json \
+  --control ~/.fleet/receipts/control-start-my-agent.json \
+  --control ~/.fleet/receipts/control-stop-my-agent.json
+```
+
+or from a checkout:
+
+```bash
+npm run receipt:cutover -- \
+  --agent my-agent \
+  --host ./receipts/host.json \
+  --runtime ./receipts/runtime-my-agent.json \
+  --control ./receipts/control-start-my-agent.json \
+  --control ./receipts/control-stop-my-agent.json
+```
+
+It prints JSON with `receipt_type: "mupot-sos-cutover-gate/v1"`. A
+`status:"pass"` receipt proves that:
+
+- the host pre-flight receipt passed
+- the selected agent's runtime receipt passed signed attach and inbox handoff
+- lifecycle control has start and stop evidence for that same agent
+
+By default the gate requires both `start` and `stop` lifecycle evidence. A
+single `restart` control receipt can satisfy both because the control daemon
+runs close then open for that verb.
 
 ## Notes
 - `interval_sec` is clamped to `[15,120]` and must stay under the pot's presence TTL (default 180s).

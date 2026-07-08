@@ -156,9 +156,11 @@ export async function pollOnce(cfg, consumerKey, publicKey, ledger, opts = {}) {
       peek: false,
       limit: 1,
     })
-    if (!consume.ok) return { ok: false, action: 'consume_failed', status: consume.status }
+    if (!consume.ok) return { ok: false, action: 'consume_failed', status: consume.status, request: handled.request ?? null }
   }
-  return handled.ok ? { ok: true, action: handled.action } : { ok: false, action: handled.reason, retry: !handled.consume }
+  return handled.ok
+    ? { ok: true, action: handled.action, request: handled.request ?? null }
+    : { ok: false, action: handled.reason, retry: !handled.consume, request: handled.request ?? null }
 }
 
 async function main() {
