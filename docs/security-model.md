@@ -146,7 +146,7 @@ their live D1 capabilities and agent weld.
 | MCP tools | `src/mcp/index.ts` | OAuthProvider token or member API key | tool-level `min` floor plus per-tool target-scope checks |
 | Agent inbox/send | `src/mcp/index.ts`, `src/agents/inbox-routes.ts` | Agent-welded member token | `boundAgentId` self-scopes sender/receiver |
 | Fleet attach/detach | `src/fleet/attach-routes.ts` | Bound bearer token or Ed25519 signature | token weld or registered public key; signed path verifies nonce/timestamp |
-| Fleet control | `src/fleet/control-routes.ts`, `src/fleet/control-request.ts` | Dashboard/session controls and signed host consumption | owner/admin/control gates plus signed control request |
+| Fleet control | `src/fleet/control-routes.ts`, `src/fleet/control-request.ts`, `fleet-runtime/fleet-control-daemon.mjs` | Dashboard/session controls and signed host consumption | owner gate, `fleet-control.v1` signature, host public-key verification, local nonce ledger |
 | Channel relay/webhooks | `src/channels/index.ts` | Adapter verify or `HERMES_RELAY_SECRET` | platform user -> member mapping, then capability checks |
 | IM webhook | `src/im/index.ts` | `IM_WEBHOOK_SECRET` | `chat_id` -> member mapping, then capability checks |
 | External event -> task | `src/events/ingest.ts` | HMAC secret | squad existence plus canonical task creation |

@@ -1,0 +1,29 @@
+# Fleet control daemon — systemd USER unit. Consumes signed Mupot control requests
+# from the fleet consumer inbox and runs flight.mjs open/close/restart locally.
+#
+# Install (run in YOUR terminal):
+#   mkdir -p ~/.fleet/runtime ~/.config/systemd/user
+#   cp fleet-runtime/*.mjs ~/.fleet/runtime/
+#   cp fleet-runtime/control.example.json ~/.fleet/control.json  # then edit values
+#   cp fleet-runtime/fleet-control-daemon.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   loginctl enable-linger "$USER"
+#   systemctl --user enable --now fleet-control-daemon.service
+#   journalctl --user -u fleet-control-daemon -f
+#
+# Stop: systemctl --user disable --now fleet-control-daemon
+[Unit]
+Description=Pot fleet control daemon (signed runtime open/close)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.fleet/runtime
+ExecStart=/usr/bin/env node %h/.fleet/runtime/fleet-control-daemon.mjs %h/.fleet/control.json
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

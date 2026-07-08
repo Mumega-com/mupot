@@ -170,6 +170,40 @@ presence by periodically attaching or by using the fleet daemon/report path. The
 operator-facing state distinguishes the last reported runtime state from actual
 task progress.
 
+## Lifecycle Control
+
+`POST /api/fleet/control` is the Worker/dashboard API for remote lifecycle
+control. It does not touch a host process directly. The Worker signs a
+`fleet-control.v1` request with `FLEET_PANEL_SK` and sends it to the configured
+`FLEET_CONSUMER_AGENT` inbox.
+
+The host control daemon must:
+
+- read the consumer inbox through signed `POST /api/inbox/signed`
+- verify the `fleet-control.v1` signature with the panel public key
+- enforce timestamp freshness
+- burn the nonce in a local ledger before touching a process
+- run the local flight adapter
+- consume malformed, stale, bad-signature, replayed, and verified-failed
+  commands so one poison message cannot block later control requests
+
+The signed bytes are:
+
+```text
+fleet-control.v1
+<agent_id>
+<verb>
+<nonce>
+<ts>
+```
+
+Supported verbs:
+
+- `start` → `flight.mjs open <agent>`
+- `stop` → `flight.mjs close <agent>`
+- `restart` → close then open
+- `status` → verified no-op
+
 ## Agent Messaging
 
 Runtimes exchange direct durable messages through the MCP `send` and `inbox`

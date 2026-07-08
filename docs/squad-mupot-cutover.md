@@ -306,6 +306,7 @@ runtime, then exits `0` so the daemon consumes the batch.
 - **Writing the minted `raw` tokens into config / launch env** (secrets handling — runtime lane).
 - **Editing `~/.mcp.json`, `~/.claude.json`, the arm `.md` allowlists** (runtime config — Hadi manages agent runtime per "Stay in dev lane" memory).
 - **Deploying the signed fleet/inbox routes** (`/api/fleet/detach-signed` and `/api/inbox/signed`; mupot worker deploy — arms never deploy; CLAUDE.md hard rule).
+- **Installing `fleet-control-daemon.mjs` on the host** (runtime start/stop lane; host process control).
 - **Revoking the SOS bus token** (final decommission — irreversible-ish; his sign-off).
 
 ### Kasra (mine — prep + verify, no mint, no deploy, no config write)

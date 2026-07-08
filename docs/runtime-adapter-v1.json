@@ -58,6 +58,28 @@
       }
     }
   },
+  "control": {
+    "version": "fleet-control.v1",
+    "api": {
+      "method": "POST",
+      "path": "/api/fleet/control",
+      "required": ["agent_id", "verb"]
+    },
+    "consumer": {
+      "inbox": "FLEET_CONSUMER_AGENT",
+      "read": "POST /api/inbox/signed",
+      "panelKey": "public-jwk-for-FLEET_PANEL_SK",
+      "nonceLedger": "host-local",
+      "consumePolicy": "consume-invalid-replay-and-verified-failures"
+    },
+    "verbs": {
+      "start": "flight.mjs open <agent>",
+      "stop": "flight.mjs close <agent>",
+      "restart": "flight.mjs close <agent> then flight.mjs open <agent>",
+      "status": "verified-noop"
+    },
+    "signedBytes": ["fleet-control.v1", "agent_id", "verb", "nonce", "ts"]
+  },
   "messaging": {
     "mcpTools": ["send", "inbox"],
     "http": {
@@ -137,6 +159,7 @@
     "planned": [
       "signed-attach",
       "signed-detach",
+      "fleet-control",
       "bearer-attach",
       "detach-ownership",
       "presence-heartbeat",

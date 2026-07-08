@@ -29,6 +29,10 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `fleet-daemon.mjs` | presence heartbeat loop, optional signed inbox drain, signed shutdown detach |
 | `daemon.example.json` | config template (set base_url, tenant, agents, probes) |
 | `fleet-daemon.service` | systemd user unit |
+| `fleet-control-daemon.mjs` | signed open/close/restart consumer for `POST /api/fleet/control` |
+| `control-request.mjs` | host verifier for `fleet-control.v1` requests |
+| `control.example.json` | control-daemon config template |
+| `fleet-control-daemon.service` | systemd user unit for host lifecycle control |
 
 ## Quickstart (per agent)
 
@@ -105,6 +109,45 @@ The command receives one JSON object on stdin:
 Exit `0` only after the runtime has persisted or accepted the batch. A non-zero exit, crash,
 or timeout leaves the Mupot messages unread for the next daemon tick. The inbox read is signed
 with the agent's Ed25519 key and POSTed to `/api/inbox/signed`; it does not need a bearer token.
+
+## Run the control daemon (remote open/close)
+
+The dashboard and API emit signed control requests with `FLEET_PANEL_SK`:
+
+```bash
+POST /api/fleet/control { "agent_id": "agent-one", "verb": "start" }
+```
+
+The host does not trust the inbox by itself. `fleet-control-daemon.mjs` reads the configured
+consumer agent inbox through `/api/inbox/signed`, verifies the `fleet-control.v1` signature
+with the panel **public** key, burns the nonce in `~/.fleet/control-nonces.json`, then runs:
+
+```bash
+node ~/.fleet/runtime/flight.mjs open|close <agent> ~/.fleet/flights.json
+```
+
+Configure it:
+
+```bash
+cp fleet-runtime/control.example.json ~/.fleet/control.json
+cp fleet-runtime/fleet-control-daemon.service ~/.config/systemd/user/
+```
+
+`consumer_agent_id` must be the same agent as `FLEET_CONSUMER_AGENT` in the Worker. That
+consumer needs an Ed25519 agent key registered in Mupot so it can read its own inbox without a
+bearer token. `panel_public_key` must be the public JWK corresponding to the Worker's
+`FLEET_PANEL_SK`; never put the private panel key on the host.
+
+Supported verbs:
+
+- `start` → `flight.mjs open <agent>`
+- `stop` → `flight.mjs close <agent>`
+- `restart` → `flight.mjs close <agent>` then `flight.mjs open <agent>`
+- `status` → verified no-op, consumed as a health/probe request
+
+Malformed, stale, bad-signature, or replayed requests are consumed without executing so one
+poison message cannot block later control. A verified command failure is also consumed because
+the nonce is already burned before process touch; inspect the journal and issue a fresh command.
 
 ## Flights (the activation unit) — `flight.mjs`
 

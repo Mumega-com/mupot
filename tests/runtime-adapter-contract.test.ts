@@ -14,6 +14,13 @@ const contract = JSON.parse(
     bearer: { path: string; downgradePolicy: string }
     detach: { path: string; signed: { path: string; required: string[]; domain: string } }
   }
+  control: {
+    version: string
+    api: { path: string; required: string[] }
+    consumer: { read: string; nonceLedger: string; consumePolicy: string }
+    verbs: Record<string, string>
+    signedBytes: string[]
+  }
   messaging: {
     mcpTools: string[]
     http: { signedRead: { path: string; required: string[]; domain: string } }
@@ -84,6 +91,19 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(contract.messaging.readSemantics).toEqual({ default: 'consume', peek: 'non-consuming' })
   })
 
+  it('captures signed host lifecycle control semantics', () => {
+    expect(contract.control.version).toBe('fleet-control.v1')
+    expect(contract.control.api.path).toBe('/api/fleet/control')
+    expect(contract.control.api.required).toEqual(['agent_id', 'verb'])
+    expect(contract.control.consumer.read).toBe('POST /api/inbox/signed')
+    expect(contract.control.consumer.nonceLedger).toBe('host-local')
+    expect(contract.control.consumer.consumePolicy).toContain('consume-invalid')
+    expect(contract.control.verbs.start).toContain('flight.mjs open')
+    expect(contract.control.verbs.stop).toContain('flight.mjs close')
+    expect(contract.control.verbs.restart).toContain('then')
+    expect(contract.control.signedBytes).toEqual(['fleet-control.v1', 'agent_id', 'verb', 'nonce', 'ts'])
+  })
+
   it('tracks the implemented task lifecycle states and gates', () => {
     expect(contract.tasks.statuses).toEqual([
       'open',
@@ -130,6 +150,7 @@ describe('runtime-adapter/v1 contract artifact', () => {
       expect.arrayContaining([
         'signed-attach',
         'signed-detach',
+        'fleet-control',
         'inbox-idempotency',
         'hermes-im-task',
         'task-lifecycle',

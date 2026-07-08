@@ -124,8 +124,9 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
 
 ### Condition status (the 5 from above)
 1. Registered (identity+type+RBAC) — ✅ **done** for the whole squad.
-2. Lifecycle controlled via mupot — ⛏ partial (signed attach/detach exist; no open/close API
-   wired to actual process start/kill).
+2. Lifecycle controlled via mupot — ⛏ partial (signed attach/detach and Worker
+   control requests exist; host control daemon now verifies requests and runs
+   `flight.mjs open|close`, host install remains).
 3. Coordinates via the reflected bus — ⛏ partial (`agent_messages` inbox and signed
    daemon read are built; runtime hook rollout still needs host/operator wiring).
 4. Runtime binding reports presence + swappable — ⛏ partial (fleet daemon code now
@@ -140,6 +141,7 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
 
 **Phase 2 — lifecycle control (open/close from mupot)**
 3. open/close API: signed control-request → daemon starts/kills the agent's runtime.
+   ✅ branch implementation via `fleet-control-daemon.mjs`; install = Hadi host-go.
 4. Control surface: `#agent-bus` = `top` (live presence + open/close); `#gates` = signals.
 
 **Phase 3 — coordinate through mupot (not SOS)**
