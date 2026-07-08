@@ -30,6 +30,9 @@ const contract = JSON.parse(
     readSemantics: { default: string; peek: string }
   }
   tasks: {
+    mcpTools: string[]
+    defaultSquad: string
+    authorization: string
     statuses: string[]
     createStatuses: string[]
     patchStatuses: string[]
@@ -111,6 +114,9 @@ describe('runtime-adapter/v1 contract artifact', () => {
   })
 
   it('tracks the implemented task lifecycle states and gates', () => {
+    expect(contract.tasks.mcpTools).toEqual(['task_create', 'task_list', 'task_board', 'task_update'])
+    expect(contract.tasks.defaultSquad).toContain('auth.boundAgentId')
+    expect(contract.tasks.authorization).toBe('member-on-target-squad')
     expect(contract.tasks.statuses).toEqual([
       'open',
       'in_progress',

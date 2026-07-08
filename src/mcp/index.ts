@@ -32,11 +32,21 @@ import type {
   BusEvent,
   Agent,
   Squad,
+  Task,
 } from '../types'
 import { resolveCapabilities, hasCapability, holdsCapabilityFloor } from '../auth/capability'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
-import { createTask } from '../tasks/service'
+import {
+  assertCompletableDoneWhen,
+  checkTransition,
+  createTask,
+  emitTaskEvent,
+  isDoneWhenValid,
+  mirrorTaskUpdate,
+  patchToDoneBypassesGate,
+} from '../tasks/service'
+import type { TaskStatus } from '../tasks/service'
 import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
 import { resolveAgentRef } from '../org/resolve'
@@ -248,6 +258,9 @@ export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolEr
 export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
   return { ok: false, status, error, detail }
 }
+function failOnly(status: ToolError['status'], error: string, detail?: unknown): Extract<ToolOutcome, { ok: false }> {
+  return fail(status, error, detail) as Extract<ToolOutcome, { ok: false }>
+}
 export function done(result: unknown): ToolOutcome {
   return { ok: true, result }
 }
@@ -288,6 +301,63 @@ type JsonSchema = {
 const STRING_SCHEMA = { type: 'string' }
 const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
+const TASK_STATUSES: readonly TaskStatus[] = ['open', 'in_progress', 'blocked', 'done', 'review', 'approved', 'rejected']
+const PATCH_ALLOWED_STATUSES: ReadonlySet<string> = new Set(['open', 'in_progress', 'blocked', 'done', 'review'])
+
+function isTaskStatus(v: unknown): v is TaskStatus {
+  return typeof v === 'string' && (TASK_STATUSES as readonly string[]).includes(v)
+}
+
+function isPatchableStatus(v: unknown): v is TaskStatus {
+  return typeof v === 'string' && PATCH_ALLOWED_STATUSES.has(v)
+}
+
+function readLimit(v: unknown, fallback: number, max: number): number | Extract<ToolOutcome, { ok: false }> {
+  if (v === undefined || v === null) return fallback
+  if (typeof v !== 'number' || !Number.isFinite(v)) return failOnly(400, 'invalid_args', 'limit must be a number')
+  return Math.min(max, Math.max(1, Math.floor(v)))
+}
+
+async function loadTask(env: Env, taskId: string): Promise<Task | null> {
+  const row = await env.DB.prepare(
+    `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+       FROM tasks WHERE id = ?1 LIMIT 1`,
+  )
+    .bind(taskId)
+    .first<Task>()
+  return row ?? null
+}
+
+async function resolveTaskSquad(
+  env: Env,
+  auth: AuthContext,
+  args: Record<string, unknown>,
+): Promise<{ ok: true; squad: Squad } | Extract<ToolOutcome, { ok: false }>> {
+  let squadId = str(args.squad_id)
+  if (!squadId && auth.boundAgentId) {
+    const agent = await loadAgent(env, auth.boundAgentId)
+    squadId = agent?.squad_id ?? null
+  }
+  if (!squadId) return failOnly(400, 'invalid_args', 'squad_id required unless the token is agent-bound')
+
+  const squad = await loadSquad(env, squadId)
+  if (!squad) return failOnly(404, 'squad_not_found')
+
+  const grants = auth.capabilities ?? []
+  if (!(await memberCanOnSquad(env, grants, squad.id, 'member'))) {
+    return failOnly(403, 'forbidden', { need: 'member', scope: 'squad' })
+  }
+  return { ok: true, squad }
+}
+
+async function resolveTaskAssignee(env: Env, raw: unknown, squadId: string): Promise<{ value: string | null; error?: string }> {
+  if (raw === undefined || raw === null) return { value: null }
+  if (typeof raw !== 'string' || raw.length === 0) return { value: null, error: 'invalid_assignee' }
+  const agent = await loadAgent(env, raw)
+  if (!agent) return { value: null, error: 'invalid_assignee' }
+  if (agent.squad_id !== squadId) return { value: null, error: 'assignee_not_in_squad' }
+  return { value: agent.id }
+}
 
 // task_create — create a task on a squad. cap: member+ on the TARGET squad.
 // #142 capsule keystone: done_when is required — a non-empty verifiable success
@@ -346,6 +416,228 @@ const toolTaskCreate: ToolSpec = {
     )
 
     return done({ task })
+  },
+}
+
+// task_list — list visible squad tasks over the MCP seam. cap: member+ on the
+// target squad. Agent-bound tokens may omit squad_id and default to their own
+// squad, which matches the runtime cutover path for brain/code agents.
+const toolTaskList: ToolSpec = {
+  name: 'task_list',
+  scope: 'squad',
+  min: 'member',
+  args: '{ squad_id?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review"|"approved"|"rejected", assignee_agent_id?: string, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      squad_id: STRING_SCHEMA,
+      status: STRING_SCHEMA,
+      assignee_agent_id: STRING_SCHEMA,
+      limit: OPTIONAL_NUMBER_SCHEMA,
+    },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const squadRes = await resolveTaskSquad(env, auth, args)
+    if (!squadRes.ok) return squadRes
+    const status = args.status
+    if (status !== undefined && status !== null && !isTaskStatus(status)) {
+      return fail(400, 'invalid_status')
+    }
+    const assignee = args.assignee_agent_id
+    if (assignee !== undefined && assignee !== null && typeof assignee !== 'string') {
+      return fail(400, 'invalid_args', 'assignee_agent_id must be a string')
+    }
+    const limit = readLimit(args.limit, 25, 100)
+    if (typeof limit !== 'number') return limit
+
+    const clauses = ['squad_id = ?1']
+    const binds: unknown[] = [squadRes.squad.id]
+    if (status) {
+      clauses.push(`status = ?${binds.length + 1}`)
+      binds.push(status)
+    }
+    if (typeof assignee === 'string' && assignee.trim()) {
+      clauses.push(`assignee_agent_id = ?${binds.length + 1}`)
+      binds.push(assignee.trim())
+    }
+    binds.push(limit)
+
+    const rows = await env.DB.prepare(
+      `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+         FROM tasks
+        WHERE ${clauses.join(' AND ')}
+        ORDER BY created_at DESC
+        LIMIT ?${binds.length}`,
+    )
+      .bind(...binds)
+      .all<Task>()
+
+    return done({ squad_id: squadRes.squad.id, tasks: rows.results ?? [] })
+  },
+}
+
+// task_board — compact kanban-style view for brain loops. It is intentionally
+// read-only and squad-scoped; it groups the same rows task_list can read.
+const toolTaskBoard: ToolSpec = {
+  name: 'task_board',
+  scope: 'squad',
+  min: 'member',
+  args: '{ squad_id?: string, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: { squad_id: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const squadRes = await resolveTaskSquad(env, auth, args)
+    if (!squadRes.ok) return squadRes
+    const limit = readLimit(args.limit, 100, 250)
+    if (typeof limit !== 'number') return limit
+
+    const rows = await env.DB.prepare(
+      `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+         FROM tasks
+        WHERE squad_id = ?1
+        ORDER BY created_at DESC
+        LIMIT ?2`,
+    )
+      .bind(squadRes.squad.id, limit)
+      .all<Task>()
+
+    const columns: Record<TaskStatus, Task[]> = {
+      open: [],
+      in_progress: [],
+      blocked: [],
+      review: [],
+      approved: [],
+      rejected: [],
+      done: [],
+    }
+    for (const task of rows.results ?? []) {
+      if (columns[task.status]) columns[task.status].push(task)
+    }
+    const counts = Object.fromEntries(
+      TASK_STATUSES.map((status) => [status, columns[status].length]),
+    ) as Record<TaskStatus, number>
+    return done({ squad_id: squadRes.squad.id, counts, columns })
+  },
+}
+
+// task_update — mutate a task through the same lifecycle gates as PATCH /api/tasks/:id.
+// cap: member+ on the task's squad. approved/rejected still require the verdict
+// endpoint; this tool can move work through open/in_progress/blocked/review/done.
+const toolTaskUpdate: ToolSpec = {
+  name: 'task_update',
+  scope: 'squad (of the task)',
+  min: 'member',
+  args: '{ task_id: string, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", assignee_agent_id?: string|null, gate_owner?: string|null }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: STRING_SCHEMA,
+      title: STRING_SCHEMA,
+      body: STRING_SCHEMA,
+      done_when: STRING_SCHEMA,
+      status: STRING_SCHEMA,
+      assignee_agent_id: STRING_SCHEMA,
+      gate_owner: STRING_SCHEMA,
+    },
+    required: ['task_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const taskId = str(args.task_id)
+    if (!taskId) return fail(400, 'invalid_args', 'task_id required')
+    const existing = await loadTask(env, taskId)
+    if (!existing) return fail(404, 'task_not_found')
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'member'))) {
+      return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
+    }
+
+    const next: Task = { ...existing }
+    let changed = false
+
+    if (args.title !== undefined) {
+      if (!str(args.title)) return fail(400, 'invalid_title')
+      next.title = (args.title as string).trim()
+      changed = true
+    }
+    if (args.body !== undefined) {
+      if (typeof args.body !== 'string') return fail(400, 'invalid_body')
+      next.body = args.body
+      changed = true
+    }
+    if (args.done_when !== undefined) {
+      if (!isDoneWhenValid(args.done_when)) {
+        return fail(400, 'invalid_done_when', 'done_when must be a non-empty verifiable success predicate')
+      }
+      next.done_when = (args.done_when as string).trim()
+      changed = true
+    }
+    if (args.status !== undefined) {
+      if (!isPatchableStatus(args.status)) return fail(400, 'invalid_status')
+      const transitionErr = checkTransition(existing.status, args.status)
+      if (transitionErr) return fail(400, 'invalid_transition', transitionErr)
+      if (patchToDoneBypassesGate(existing.status, existing.gate_owner, args.status)) {
+        return fail(409, 'gate_open', 'gated task must be approved via verdict before it can be marked done')
+      }
+      if (args.status === 'done') {
+        try {
+          assertCompletableDoneWhen(next.done_when)
+        } catch (err) {
+          return fail(409, 'done_when_placeholder', err instanceof Error ? err.message : 'done_when is not completable')
+        }
+      }
+      next.status = args.status
+      changed = true
+    }
+    if (args.assignee_agent_id !== undefined) {
+      const check = await resolveTaskAssignee(env, args.assignee_agent_id, existing.squad_id)
+      if (check.error) return fail(400, check.error)
+      next.assignee_agent_id = check.value
+      changed = true
+    }
+    if (args.gate_owner !== undefined) {
+      const lockStatuses: ReadonlySet<TaskStatus> = new Set(['review', 'approved', 'rejected', 'done'])
+      if (lockStatuses.has(existing.status)) return fail(409, 'gate_owner_locked', { status: existing.status })
+      if (args.gate_owner === null) {
+        next.gate_owner = null
+      } else if (typeof args.gate_owner === 'string' && args.gate_owner.trim().length > 0) {
+        next.gate_owner = args.gate_owner.trim()
+      } else {
+        return fail(400, 'invalid_gate_owner')
+      }
+      changed = true
+    }
+    if (!changed) return fail(400, 'invalid_args', 'at least one update field is required')
+
+    next.updated_at = new Date().toISOString()
+    next.github_issue_url = await mirrorTaskUpdate(env, next)
+
+    const res = await env.DB.prepare(
+      `UPDATE tasks
+          SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, updated_at = ?
+        WHERE id = ?`,
+    )
+      .bind(
+        next.title,
+        next.body,
+        next.done_when,
+        next.status,
+        next.assignee_agent_id,
+        next.github_issue_url,
+        next.gate_owner,
+        next.updated_at,
+        next.id,
+      )
+      .run()
+    if (!res.meta?.changes) return fail(409, 'task_update_race')
+
+    await emitTaskEvent(env, 'task.updated', next, memberActor(auth.memberId as string))
+    return done({ task: next })
   },
 }
 
@@ -918,6 +1210,9 @@ const toolConnect: ToolSpec = {
 // assertion + the dispatch wiring proof read these directly.
 export const TOOLS: ToolSpec[] = [
   toolTaskCreate,
+  toolTaskList,
+  toolTaskBoard,
+  toolTaskUpdate,
   toolRemember,
   toolRecall,
   toolWakeAgent,
