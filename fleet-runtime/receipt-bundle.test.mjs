@@ -263,6 +263,17 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
     c.checked_path === join(copiedDir, 'host.json') &&
     c.ok === true
   ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'artifact_receipt_type_expected' &&
+    c.artifact === 'cutover_gate' &&
+    c.expected === 'mupot-sos-cutover-gate/v1' &&
+    c.ok === true
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'artifact_status_cutover_ready' &&
+    c.artifact === 'host' &&
+    c.ok === true
+  ))
 
   writeJson(join(copiedDir, 'host.json'), hostReceipt('fail'))
   const drift = checkBundleManifest({ manifestPath })
@@ -274,6 +285,46 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
     c.checked_path === join(copiedDir, 'host.json') &&
     c.ok === false &&
     c.expected !== c.actual
+  ))
+})
+
+test('manifest check fails when manifest metadata disagrees with artifact content', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+  await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+  })
+
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.host.status = 'warn'
+  manifest.artifacts.host.receipt_type = 'wrong-receipt/v1'
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ manifestPath })
+
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((c) =>
+    c.check === 'artifact_receipt_type_matches_manifest' &&
+    c.artifact === 'host' &&
+    c.expected === 'wrong-receipt/v1' &&
+    c.actual === 'mupot-fleet-host-receipt/v1' &&
+    c.ok === false
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'artifact_status_matches_manifest' &&
+    c.artifact === 'host' &&
+    c.expected === 'warn' &&
+    c.actual === 'pass' &&
+    c.ok === false
   ))
 })
 

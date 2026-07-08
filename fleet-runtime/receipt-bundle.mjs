@@ -21,6 +21,7 @@ const EXPECTED = {
   host: 'mupot-fleet-host-receipt/v1',
   runtime: 'mupot-fleet-runtime-receipt/v1',
   control: 'mupot-fleet-control-receipt/v1',
+  cutover_gate: 'mupot-sos-cutover-gate/v1',
 }
 
 const CONTROL_VERBS = new Set(['start', 'stop', 'restart'])
@@ -234,6 +235,21 @@ function bundleArtifactEntries(manifest) {
   return entries
 }
 
+function expectedArtifactType(label) {
+  if (label === 'install') return EXPECTED.install
+  if (label.startsWith('probe:')) return EXPECTED.probe
+  if (label === 'host') return EXPECTED.host
+  if (label.startsWith('runtime:')) return EXPECTED.runtime
+  if (label.startsWith('control:')) return EXPECTED.control
+  if (label === 'cutover_gate') return EXPECTED.cutover_gate
+  return null
+}
+
+function artifactStatusOk(label, status) {
+  if (label === 'install') return status === 'pass' || status === 'warn'
+  return status === 'pass'
+}
+
 function checkBundleManifest(opts = {}) {
   const checks = []
   const manifestPath = manifestPathForCheck(opts)
@@ -293,8 +309,10 @@ function checkBundleManifest(opts = {}) {
 
     for (const entry of entries) {
       const checkedPath = resolveArtifactPath(manifestDir, entry.path)
+      const receipt = checkedPath ? readReceipt(checkedPath) : null
       const actual = checkedPath ? fileSha256(checkedPath) : null
       const expectedOk = typeof entry.sha256 === 'string' && /^[a-f0-9]{64}$/.test(entry.sha256)
+      const expectedType = expectedArtifactType(entry.label)
       checks.push({
         ok: typeof entry.path === 'string' && entry.path.length > 0,
         component: 'receipt-bundle-check',
@@ -326,6 +344,54 @@ function checkBundleManifest(opts = {}) {
         checked_path: checkedPath || null,
         expected: entry.sha256,
         actual,
+      })
+      checks.push({
+        ok: Boolean(receipt),
+        component: 'receipt-bundle-check',
+        check: 'artifact_receipt_json_read',
+        artifact: entry.label,
+        declared_path: entry.path ?? null,
+        checked_path: checkedPath || null,
+      })
+      checks.push({
+        ok: receipt?.receipt_type === entry.receipt_type,
+        component: 'receipt-bundle-check',
+        check: 'artifact_receipt_type_matches_manifest',
+        artifact: entry.label,
+        declared_path: entry.path ?? null,
+        checked_path: checkedPath || null,
+        expected: entry.receipt_type,
+        actual: receipt?.receipt_type ?? null,
+      })
+      checks.push({
+        ok: !expectedType || receipt?.receipt_type === expectedType,
+        component: 'receipt-bundle-check',
+        check: 'artifact_receipt_type_expected',
+        artifact: entry.label,
+        declared_path: entry.path ?? null,
+        checked_path: checkedPath || null,
+        expected: expectedType,
+        actual: receipt?.receipt_type ?? null,
+      })
+      checks.push({
+        ok: receipt?.status === entry.status,
+        component: 'receipt-bundle-check',
+        check: 'artifact_status_matches_manifest',
+        artifact: entry.label,
+        declared_path: entry.path ?? null,
+        checked_path: checkedPath || null,
+        expected: entry.status,
+        actual: receipt?.status ?? null,
+      })
+      checks.push({
+        ok: artifactStatusOk(entry.label, receipt?.status),
+        component: 'receipt-bundle-check',
+        check: 'artifact_status_cutover_ready',
+        artifact: entry.label,
+        declared_path: entry.path ?? null,
+        checked_path: checkedPath || null,
+        actual: receipt?.status ?? null,
+        accepted: entry.label === 'install' ? ['pass', 'warn'] : ['pass'],
       })
     }
   }

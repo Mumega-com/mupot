@@ -25,6 +25,7 @@ describe('squad mupot cutover runbook', () => {
     expect(runbook).toContain('--verify-only')
     expect(runbook).toContain('--check-manifest')
     expect(runbook).toContain('mupot-fleet-receipt-bundle-check/v1')
+    expect(runbook).toContain('receipt type/status metadata')
     expect(runbook).toContain('SHA-256 hashes')
     expect(runbook).toContain('manifest.json.next_steps')
     expect(runbook).toContain('advisory `next_steps`')
