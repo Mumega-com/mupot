@@ -99,7 +99,8 @@ Edit these generated files before enabling services:
 - `~/.fleet/flights.json`
 
 Then place agent private keys under `~/.fleet/agents/` with `chmod 600`, place
-the panel public key at `~/.fleet/panel.pub.jwk`, and run the host receipt.
+the public-only panel Ed25519 JWK at `~/.fleet/panel.pub.jwk`, and run the host
+receipt.
 
 ## Run the daemon (continuous presence + optional inbox drain)
 
@@ -293,7 +294,8 @@ The receipt validates:
 - real `base_url` and `tenant` values instead of copied placeholders
 - agent private key files exist with `0600`-style permissions
 - daemon inbox-enabled agents have matching handler config
-- panel public key, flights config, and flight script paths exist for remote control
+- panel public key exists and is a public-only Ed25519 JWK
+- flights config and flight script paths exist for remote control
 
 It prints JSON with `receipt_type: "mupot-fleet-host-receipt/v1"`. A `status:"pass"`
 receipt proves host wiring is ready for live attach/inbox/control smoke tests. Add

@@ -6,6 +6,12 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { buildReceipt, hasPlaceholder, summarize } from './host-receipt.mjs'
 
+const PANEL_PUBLIC_JWK = {
+  kty: 'OKP',
+  crv: 'Ed25519',
+  x: 'bqjg1QCM1_F1Oe4xxjDidrEkNzkgwbAUk65dJUYFaLI',
+}
+
 function tmp() {
   return mkdtempSync(join(tmpdir(), 'mupot-host-receipt-'))
 }
@@ -64,7 +70,7 @@ function fixture(overrides = {}) {
   writeJson(controlPath, overrides.control ?? control)
   touch(join(keys, 'agent-one.key'))
   touch(join(keys, 'fleet-consumer.key'))
-  touch(panelPublicKey)
+  writeJson(panelPublicKey, overrides.panelPublicKey ?? PANEL_PUBLIC_JWK)
   touch(flightsConfig)
   touch(flightScript, 0o755)
 
@@ -101,6 +107,7 @@ test('host receipt passes for a complete local host layout without executing pro
   assert.ok(receipt.checks.some((c) => c.component === 'fleet-daemon' && c.check === 'agent_private_key_present_0600' && c.ok))
   assert.ok(receipt.checks.some((c) => c.component === 'inbox-handler' && c.check === 'daemon_inbox_agent_has_handler_config' && c.ok))
   assert.ok(receipt.checks.some((c) => c.component === 'fleet-control-daemon' && c.check === 'consumer_private_key_present_0600' && c.ok))
+  assert.ok(receipt.checks.some((c) => c.component === 'fleet-control-daemon' && c.check === 'panel_public_key_public_only' && c.ok))
   assert.ok(receipt.checks.some((c) => c.component === 'host-receipt' && c.check === 'daemon_control_base_url_match' && c.ok))
   assert.ok(receipt.checks.some((c) => c.component === 'host-receipt' && c.check === 'daemon_control_tenant_match' && c.ok))
 })
@@ -189,6 +196,27 @@ test('host receipt fails when daemon and control config target different pots', 
     c.ok === false &&
     c.daemon_tenant === 'tenant-a' &&
     c.control_tenant === 'tenant-b'
+  ))
+})
+
+test('host receipt fails when panel public key contains private JWK material', async () => {
+  const f = fixture({ panelPublicKey: { ...PANEL_PUBLIC_JWK, d: 'private-scalar' } })
+  const receipt = await buildReceipt({
+    daemonPath: f.daemonPath,
+    inboxPath: f.inboxPath,
+    controlPath: f.controlPath,
+    skipInbox: false,
+    skipControl: false,
+    execProbes: false,
+    keyPathFor: f.keyPathFor,
+  })
+
+  assert.equal(receipt.status, 'fail')
+  assert.ok(receipt.checks.some((c) =>
+    c.component === 'fleet-control-daemon' &&
+    c.check === 'panel_public_key_public_only' &&
+    c.ok === false &&
+    /PUBLIC Ed25519 OKP JWK/.test(c.reason)
   ))
 })
 

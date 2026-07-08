@@ -14,6 +14,7 @@ import { validateConfig as validateDaemonConfig, runProbe } from './fleet-daemon
 import { validateConfig as validateInboxHandlerConfig } from './inbox-handler.mjs'
 import { validateConfig as validateControlConfig } from './fleet-control-daemon.mjs'
 import { keyPathFor } from './fleet-sign.mjs'
+import { importPanelPublicKey } from './control-request.mjs'
 
 function expandHome(path) {
   return typeof path === 'string' && path.startsWith('~/') ? join(homedir(), path.slice(2)) : path
@@ -220,7 +221,27 @@ function collectInboxChecks(opts, checks, daemonCfg) {
   return cfg
 }
 
-function collectControlChecks(opts, checks) {
+async function validatePanelPublicKey(path, checks) {
+  try {
+    await importPanelPublicKey(readFileSync(path, 'utf8'))
+    checks.push({
+      ok: true,
+      component: 'fleet-control-daemon',
+      check: 'panel_public_key_public_only',
+      path,
+    })
+  } catch (err) {
+    checks.push({
+      ok: false,
+      component: 'fleet-control-daemon',
+      check: 'panel_public_key_public_only',
+      path,
+      reason: String(err && err.message ? err.message : err),
+    })
+  }
+}
+
+async function collectControlChecks(opts, checks) {
   if (opts.skipControl) {
     checks.push({ ok: null, component: 'fleet-control-daemon', check: 'skipped' })
     return null
@@ -249,6 +270,7 @@ function collectControlChecks(opts, checks) {
     component: 'fleet-control-daemon',
     check: 'panel_public_key_present',
   }))
+  await validatePanelPublicKey(cfg.panelPublicKeyPath, checks)
   checks.push(normalizeCheck(checkPath(cfg.flightsConfigPath, { label: 'flights_config', file: true }), {
     component: 'fleet-control-daemon',
     check: 'flights_config_present',
@@ -282,7 +304,7 @@ export async function buildReceipt(opts) {
   const checks = []
   const daemonCfg = collectDaemonChecks(opts, checks)
   collectInboxChecks(opts, checks, daemonCfg)
-  const controlCfg = collectControlChecks(opts, checks)
+  const controlCfg = await collectControlChecks(opts, checks)
   addHostTargetConsistencyChecks(checks, daemonCfg, controlCfg)
 
   if (opts.execProbes && daemonCfg) {

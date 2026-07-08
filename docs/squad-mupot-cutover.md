@@ -324,6 +324,8 @@ and exiting `0` so the daemon consumes the batch.
      run `node ~/.fleet/runtime/control-receipt.mjs --control ~/.fleet/control.json`.
      A `mupot-fleet-control-receipt/v1` `status:"pass"` proves the host consumed
      a signed `fleet-control.v1` request and reached the flight layer.
+     The preceding host receipt must verify `panel_public_key_public_only` so the
+     host stores only the panel public Ed25519 JWK, never `FLEET_PANEL_SK`.
    - Final cutover gate: after saving the host, runtime, and start/stop control
      receipts, run `node ~/.fleet/runtime/cutover-receipt.mjs --agent <agent_id> --host <host.json> --runtime <runtime.json> --control <control-start.json> --control <control-stop.json>`.
      A `mupot-sos-cutover-gate/v1` `status:"pass"` is the receipt that permits

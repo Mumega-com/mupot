@@ -27,6 +27,8 @@ describe('squad mupot cutover runbook', () => {
     expect(runbook).toContain('--status')
     expect(runbook).toContain('mupot-fleet-receipt-bundle-status/v1')
     expect(runbook).toContain('host_go_checklist')
+    expect(runbook).toContain('panel_public_key_public_only')
+    expect(runbook).toContain('public Ed25519 JWK')
     expect(runbook).toContain('--status-summary')
     expect(runbook).toContain('npm run receipt:bundle:status-summary')
     expect(pkg.scripts['receipt:bundle:status-summary']).toBe('node fleet-runtime/receipt-bundle.mjs --status --status-summary')
