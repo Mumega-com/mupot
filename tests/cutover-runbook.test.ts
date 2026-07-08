@@ -26,6 +26,7 @@ describe('squad mupot cutover runbook', () => {
     expect(runbook).toContain('--status')
     expect(runbook).toContain('mupot-fleet-receipt-bundle-status/v1')
     expect(runbook).toContain('host_go_checklist')
+    expect(runbook).toContain('--status-summary')
     expect(runbook).toContain('--export')
     expect(runbook).toContain('--export-dir')
     expect(runbook).toContain('npm run receipt:bundle:export')

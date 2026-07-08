@@ -469,6 +469,16 @@ or from a checkout:
 npm run receipt:bundle:status -- --agent my-agent --out-dir ./receipts/my-agent
 ```
 
+For a compact human-readable view during the live run, add
+`--status-summary`:
+
+```bash
+npm run receipt:bundle:status -- \
+  --agent my-agent \
+  --out-dir ./receipts/my-agent \
+  --status-summary
+```
+
 It prints `receipt_type: "mupot-fleet-receipt-bundle-status/v1"` and checks
 the issue #274 evidence contract: install receipt, host receipt, queued probe
 receipts, runtime receipt, per-agent start/stop control evidence,

@@ -180,6 +180,8 @@ the live host runtime before attaching the final cutover record.
 Use `receipt-bundle.mjs --status` during collection for a read-only host-go
 progress receipt that reports missing evidence, including missing per-agent
 start/stop lifecycle verbs, `host_go_checklist`, and command-level next steps.
+Use `--status-summary` for the same gates as a compact text checklist during a
+live operator session.
 Use `receipt-bundle.mjs --export --export-dir <attachable-dir>` after the
 manifest and cutover gate pass; it copies only the manifest and listed receipt
 artifacts into the attachable directory, emits

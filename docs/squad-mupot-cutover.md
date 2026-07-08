@@ -353,6 +353,8 @@ and exiting `0` so the daemon consumes the batch.
      the issue #274 gates, and returns `next_steps` without polling the host or
      rewriting files. From a checkout, use
      `npm run receipt:bundle:status -- --agent <agent_id> --out-dir ./receipts/<agent_id>`.
+     Add `--status-summary` when a compact text checklist is easier to read
+     during the live host session.
      `manifest.json` carries SHA-256 hashes for the saved receipt artifacts so
      copied evidence can be checked for drift; it excludes its own self-referential
      file hash. Export the clean attachable directory with

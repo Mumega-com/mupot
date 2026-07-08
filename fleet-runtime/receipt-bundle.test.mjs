@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildBundle, checkBundleManifest, exportBundle, inspectBundleStatus, parseArgs, safeName } from './receipt-bundle.mjs'
+import { buildBundle, checkBundleManifest, exportBundle, formatStatusSummary, inspectBundleStatus, parseArgs, safeName } from './receipt-bundle.mjs'
 
 const POT_URL = 'https://pot.example.org'
 const POT_TENANT = 'tenant-a'
@@ -603,6 +603,7 @@ test('status reports missing host-go evidence and next steps for a partial bundl
   writeJson(join(outDir, 'host.json'), hostReceipt())
 
   const status = inspectBundleStatus({ outDir, agents: ['agent-one'] })
+  const summary = formatStatusSummary(status)
 
   assert.equal(status.status, 'fail')
   assert.ok(status.checks.some((c) => c.check === 'host_receipt_pass' && c.ok === true))
@@ -622,6 +623,11 @@ test('status reports missing host-go evidence and next steps for a partial bundl
   assert.equal(checklistById(status, 'control_receipts_passed_for_required_verbs').missing.includes('agent-one:stop'), true)
   assert.equal(checklistById(status, 'attachable_manifest_check_passed').status, 'fail')
   assert.equal(checklistById(status, 'attachable_bundle_safe').status, 'fail')
+  assert.ok(summary.includes('Host-go status: fail'))
+  assert.ok(summary.includes('[PASS] bundle_directory_ready'))
+  assert.ok(summary.includes('[FAIL] install_receipt_saved'))
+  assert.ok(summary.includes('missing: agent-one:start, agent-one:stop'))
+  assert.ok(summary.includes('Next steps:'))
   assert.ok(status.next_steps.some((s) => s.includes('save installer output')))
   assert.ok(status.next_steps.some((s) => s.includes('queue inbox and lifecycle inputs')))
   assert.ok(status.next_steps.some((s) => s.includes('runtime-agent-one.json')))
@@ -1020,9 +1026,10 @@ test('parseArgs accepts attachable bundle export options', () => {
 })
 
 test('parseArgs accepts read-only host-go status', () => {
-  const opts = parseArgs(['--out-dir', './receipts', '--agent', 'agent-one', '--status'])
+  const opts = parseArgs(['--out-dir', './receipts', '--agent', 'agent-one', '--status', '--status-summary'])
 
   assert.equal(opts.status, true)
+  assert.equal(opts.statusSummary, true)
   assert.ok(opts.outDir.endsWith('/receipts'))
   assert.deepEqual(opts.agents, ['agent-one'])
 })

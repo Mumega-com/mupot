@@ -113,6 +113,10 @@ function parseArgs(argv) {
     }
     else if (arg === '--exec-probes') opts.execProbes = true
     else if (arg === '--status') opts.status = true
+    else if (arg === '--status-summary') {
+      opts.status = true
+      opts.statusSummary = true
+    }
     else if (arg === '--check-manifest') opts.checkManifest = true
     else if (arg === '--export') opts.export = true
     else if (arg === '--force') opts.force = true
@@ -142,6 +146,7 @@ function usage() {
     '  --skip-control                do not run a live control poll; reuse existing control-*.json',
     '  --verify-only                 read-only recheck; reuse host/runtime/control receipts',
     '  --status                      read-only host-go evidence status for an in-progress bundle',
+    '  --status-summary              with --status, print a compact text checklist instead of JSON',
     '  --check-manifest              read-only hash/status check; writes nothing',
     '  --export                      copy manifest + listed artifacts to --export-dir and check it',
     '  --require-control-verb <verb> default: start,stop; values: start, stop, restart',
@@ -1436,6 +1441,29 @@ function hostGoStatusChecklist({ outDir, artifacts, agents, gateReceipt, manifes
   ]
 }
 
+function formatStatusSummary(receipt) {
+  const lines = []
+  lines.push(`Host-go status: ${receipt?.status ?? 'unknown'}`)
+  lines.push(`Bundle: ${receipt?.inputs?.out_dir ?? '<none>'}`)
+  lines.push(`Agents: ${(receipt?.inputs?.agents ?? []).join(', ') || '<none>'}`)
+  lines.push(`Required controls: ${(receipt?.inputs?.required_control_verbs ?? []).join(', ') || '<none>'}`)
+  lines.push('')
+  lines.push('Checklist:')
+  for (const item of receipt?.host_go_checklist ?? []) {
+    const label = item.status === 'pass' ? 'PASS' : 'FAIL'
+    lines.push(`- [${label}] ${item.id}: ${item.title}`)
+    if (item.status !== 'pass' && item.next_action) lines.push(`  next: ${item.next_action}`)
+    if (Array.isArray(item.missing) && item.missing.length > 0) lines.push(`  missing: ${item.missing.join(', ')}`)
+    if (Array.isArray(item.missing_agents) && item.missing_agents.length > 0) lines.push(`  missing agents: ${item.missing_agents.join(', ')}`)
+  }
+  if ((receipt?.next_steps ?? []).length > 0) {
+    lines.push('')
+    lines.push('Next steps:')
+    for (const step of receipt.next_steps) lines.push(`- ${step}`)
+  }
+  return `${lines.join('\n')}\n`
+}
+
 function inspectBundleStatus(opts = {}) {
   const checks = []
   const outDir = opts.outDir ? pathArg(opts.outDir) : ''
@@ -2012,7 +2040,7 @@ async function main() {
   }
   if (opts.status) {
     const receipt = inspectBundleStatus(opts)
-    console.log(JSON.stringify(receipt, null, 2))
+    process.stdout.write(opts.statusSummary ? formatStatusSummary(receipt) : `${JSON.stringify(receipt, null, 2)}\n`)
     process.exit(receipt.status === 'fail' ? 1 : 0)
   }
   const bundle = await buildBundle(opts)
@@ -2024,4 +2052,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   await main()
 }
 
-export { buildBundle, checkBundleManifest, defaultStamp, exportBundle, inspectBundleStatus, parseArgs, safeName, summarize }
+export { buildBundle, checkBundleManifest, defaultStamp, exportBundle, formatStatusSummary, inspectBundleStatus, parseArgs, safeName, summarize }
