@@ -3,15 +3,25 @@
 // controls appear only for an owner on a configured pot.
 import { describe, it, expect } from 'vitest'
 import { hostAgentsPanel } from '../src/dashboard/fleet-host'
-import type { FleetAgentRow } from '../src/fleet/registry'
+import type { AgentView } from '../src/fleet/registry'
 
 async function render(p: ReturnType<typeof hostAgentsPanel>): Promise<string> {
   return String(await p)
 }
 
-const row = (over: Partial<FleetAgentRow> = {}): FleetAgentRow => ({
-  agent_id: 'image-gen', display: '', runtime: 'codex', squads: ['media'], lifecycle: 'on_demand',
-  provider_contract: 'openai', status: 'running', reported_by: 'fleet-consumer', last_reported_at: 'now', ...over,
+const row = (over: Partial<AgentView> = {}): AgentView => ({
+  agent_id: 'image-gen',
+  display: '',
+  type: 'builder',
+  runtime: 'codex',
+  squads: ['media'],
+  lifecycle: 'on_demand',
+  status: 'running',
+  presence: 'live',
+  last_seen: '2026-07-08 01:00:00',
+  member: null,
+  capabilities: [],
+  ...over,
 })
 
 describe('hostAgentsPanel', () => {
@@ -35,6 +45,14 @@ describe('hostAgentsPanel', () => {
     const viewer = await render(hostAgentsPanel([row()], { configured: true, canControl: false, flash: null }))
     expect(viewer).toContain('owner only')
     expect(viewer).not.toContain('value="start"')
+  })
+
+  it('renders derived presence separately from stored lifecycle intent', async () => {
+    const out = await render(hostAgentsPanel([row({ status: 'running', presence: 'stale' })], { configured: true, canControl: true, flash: null }))
+
+    expect(out).toContain('stale')
+    expect(out).toContain('running')
+    expect(out).toContain('2026-07-08 01:00:00')
   })
 
   it('honest-empty + "not configured" when nothing reported / unconfigured', async () => {

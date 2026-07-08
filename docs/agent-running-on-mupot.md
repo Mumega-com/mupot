@@ -141,7 +141,9 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
 
 ### Punch-list to LIVE
 **Phase 1 — liveness (make `running` true)** ← biggest gap, critical path
-1. Presence/heartbeat: TTL column; registry computes running/stale/stopped from last-ping.
+1. Presence/heartbeat: ✅ branch implementation derives registry presence from
+   heartbeat recency and the `/fleet` host-control panel shows presence separately
+   from stored lifecycle intent, so a stale `running` row is visible as stale.
 2. Fleet daemon (host): boot-attach all managed agents, re-attach on drop, heartbeat, drain
    inbox, detach on stop; systemd user unit. ✅ branch implementation plus
    `host-receipt.mjs` and `runtime-receipt.mjs`; install + host receipt + live

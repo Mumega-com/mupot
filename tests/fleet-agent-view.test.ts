@@ -72,8 +72,10 @@ function makeDb(opts: MockDbOpts = {}) {
         const m = r.member_id ? members.find((x) => x.id === r.member_id && x.tenant === r.tenant) : undefined
         return {
           agent_id: r.agent_id,
+          display: r.display,
           agent_type: r.agent_type,
           runtime: r.runtime,
+          squads: r.squads,
           status: r.status,
           lifecycle: r.lifecycle,
           last_reported_at: r.last_reported_at,
@@ -253,8 +255,10 @@ describe('getAgentView', () => {
     expect(views).toHaveLength(1)
     const v = views[0]
     expect(v.agent_id).toBe('kasra')
+    expect(v.display).toBe('Kasra')
     expect(v.type).toBe('builder')
     expect(v.runtime).toBe('claude-code')
+    expect(v.squads).toEqual([])
     expect(v.status).toBe('running')
     expect(v.member).toEqual({ id: 'm-kasra', email: 'kasra@mumega.com', display_name: 'Kasra' })
     expect(v.capabilities).toHaveLength(2)

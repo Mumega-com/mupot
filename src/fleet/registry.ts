@@ -49,8 +49,10 @@ export interface FleetAgentRow {
 // Returned by getAgentView — the data feed for the dashboard and #agent-bus.
 export interface AgentView {
   agent_id: string
+  display: string
   type: string                           // agent_type
   runtime: string
+  squads: string[]
   status: string                         // stored INTENT: running | stopped (set by attach/detach)
   presence: Presence                     // DERIVED liveness from last_seen age vs TTL (live|stale|offline)
   lifecycle: string
@@ -242,7 +244,7 @@ export async function listFleetAgents(env: Env): Promise<FleetAgentRow[]> {
  * NULL-tenant rows before the JOIN so existing members are visible immediately.
  *
  * SQL shape:
- *   SELECT fa.agent_id, fa.agent_type, fa.runtime, fa.status, fa.lifecycle,
+ *   SELECT fa.agent_id, fa.display, fa.agent_type, fa.runtime, fa.squads, fa.status, fa.lifecycle,
  *          fa.last_reported_at, fa.member_id,
  *          m.id AS m_id, m.email AS m_email, m.display_name AS m_display
  *   FROM fleet_agents fa
@@ -255,7 +257,7 @@ export async function getAgentView(env: Env): Promise<AgentView[]> {
   await backfillMemberTenant(env)
 
   const rows = await env.DB.prepare(
-    `SELECT fa.agent_id, fa.agent_type, fa.runtime, fa.status, fa.lifecycle,
+    `SELECT fa.agent_id, fa.display, fa.agent_type, fa.runtime, fa.squads, fa.status, fa.lifecycle,
             fa.last_reported_at, fa.member_id,
             m.id AS m_id, m.email AS m_email, m.display_name AS m_display
        FROM fleet_agents fa
@@ -286,8 +288,10 @@ export async function getAgentView(env: Env): Promise<AgentView[]> {
     const lastSeen = String(r.last_reported_at ?? '')
     out.push({
       agent_id: String(r.agent_id),
+      display: String(r.display ?? ''),
       type: String(r.agent_type ?? 'generic'),
       runtime: String(r.runtime ?? ''),
+      squads: parseSquads(r.squads),
       status,
       presence: derivePresence(status, lastSeen, ttlSec, nowMs),
       lifecycle: String(r.lifecycle ?? ''),

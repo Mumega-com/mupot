@@ -11,9 +11,10 @@
 
 import { html } from 'hono/html'
 import { sectionPanel, dataTable, statusDot, pill, emptyState, type Html, type Tone } from './ui'
-import type { FleetAgentRow } from '../fleet/registry'
+import type { AgentView } from '../fleet/registry'
 
-const STATUS_TONE: Record<string, Tone> = { running: 'ok', stopped: 'dim', unknown: 'warn' }
+const PRESENCE_TONE: Record<string, Tone> = { live: 'ok', stale: 'warn', offline: 'dim' }
+const INTENT_TONE: Record<string, Tone> = { running: 'ok', stopped: 'dim', unknown: 'warn' }
 
 function controlCell(agentId: string): Html {
   // One form, three submit buttons sharing name="verb" — the browser sends only the CLICKED verb.
@@ -35,7 +36,7 @@ export interface HostPanelOpts {
   flash: string | null // result of a just-submitted control action (?hc=...)
 }
 
-export function hostAgentsPanel(agents: FleetAgentRow[], opts: HostPanelOpts): Html {
+export function hostAgentsPanel(agents: AgentView[], opts: HostPanelOpts): Html {
   const body: Html = agents.length === 0
     ? emptyState({
         title: 'No host agents reported yet',
@@ -45,13 +46,15 @@ export function hostAgentsPanel(agents: FleetAgentRow[], opts: HostPanelOpts): H
       })
     : dataTable({
         cols: [
-          { label: 'Agent' }, { label: 'Runtime' }, { label: 'Squads' }, { label: 'Status' }, { label: 'Control' },
+          { label: 'Agent' }, { label: 'Runtime' }, { label: 'Squads' }, { label: 'Presence' }, { label: 'Intent' }, { label: 'Last seen' }, { label: 'Control' },
         ],
         rows: agents.map((a) => [
           html`<span class="ui-mono-dim">${a.agent_id}</span>${a.display ? html` ${a.display}` : ''}`,
           html`${a.runtime || '—'}`,
           a.squads.length ? html`${a.squads.map((s) => pill(s, 'accent2'))}` : html`<span class="ui-panel-sub">—</span>`,
-          statusDot(STATUS_TONE[a.status] ?? 'warn', a.status),
+          statusDot(PRESENCE_TONE[a.presence] ?? 'warn', a.presence),
+          statusDot(INTENT_TONE[a.status] ?? 'warn', a.status),
+          html`<span class="ui-panel-sub">${a.last_seen || '—'}</span>`,
           opts.canControl && opts.configured
             ? controlCell(a.agent_id)
             : html`<span class="ui-panel-sub">${opts.configured ? 'owner only' : 'not configured'}</span>`,
