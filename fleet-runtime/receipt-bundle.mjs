@@ -27,6 +27,10 @@ const EXPECTED = {
 const NEXT_STEP_ATTACH = 'attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)'
 const NEXT_STEP_HOLD = 'do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass'
 
+const REQUIRED_HOST_RECEIPT_CHECKS = [
+  { component: 'fleet-control-daemon', check: 'panel_public_key_public_only' },
+]
+
 const CONTROL_VERBS = new Set(['start', 'stop', 'restart'])
 const SECRET_VALUE_PATTERNS = [
   ['private_pem', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
@@ -408,6 +412,31 @@ function receiptTargetAgents(label, receipt) {
     for (const agent of receipt?.target?.daemon_agents ?? []) add(agent)
   }
   return sortStrings(agents)
+}
+
+function receiptHasPassingCheck(receipt, required) {
+  return (receipt?.checks ?? []).some((check) =>
+    check?.component === required.component &&
+    check?.check === required.check &&
+    check?.ok === true
+  )
+}
+
+function hostReceiptRequiredChecksPass(receipt) {
+  return REQUIRED_HOST_RECEIPT_CHECKS.every((required) => receiptHasPassingCheck(receipt, required))
+}
+
+function addHostReceiptRequiredChecks(checks, { component, receipt, extra = {} }) {
+  for (const required of REQUIRED_HOST_RECEIPT_CHECKS) {
+    checks.push({
+      ok: Boolean(receipt && receiptHasPassingCheck(receipt, required)),
+      component,
+      check: 'host_receipt_required_check_pass',
+      required_component: required.component,
+      required_check: required.check,
+      ...extra,
+    })
+  }
 }
 
 function addTargetConsistencyChecks(checks, manifestPath, entries, receiptRecords, agents) {
@@ -942,6 +971,17 @@ function checkBundleManifest(opts = {}) {
         findings: secretFindingSummary(secretFindings),
         finding_count: secretFindings.length,
       })
+      if (entry.label === 'host') {
+        addHostReceiptRequiredChecks(checks, {
+          component: 'receipt-bundle-check',
+          receipt,
+          extra: {
+            artifact: entry.label,
+            declared_path: entry.path ?? null,
+            checked_path: checkedPath || null,
+          },
+        })
+      }
       if (entry.label === 'cutover_gate' && receipt) {
         addCutoverGateConsistencyChecks(checks, manifestPath, manifest, entries, receipt)
       }
@@ -1254,6 +1294,11 @@ function controlEvidenceFromArtifacts(artifacts) {
   return controlRuns(receipts)
 }
 
+function hostReceiptMetaReady(meta) {
+  if (meta?.receipt_type !== EXPECTED.host || meta?.status !== 'pass') return false
+  return hostReceiptRequiredChecksPass(readReceipt(meta.path))
+}
+
 function controlRunSatisfiesRequiredVerb(run, requiredVerb) {
   if (run?.agent_id == null || run?.verb == null) return false
   if (requiredVerb === 'start') return run.verb === 'start' || run.verb === 'restart'
@@ -1297,6 +1342,8 @@ function addHostGoStatusNextSteps(steps, { outDir, artifacts, agents, gateReceip
   }
   if (artifacts.host?.receipt_type !== EXPECTED.host || artifacts.host.status !== 'pass') {
     add('run receipt-bundle without --skip-host after editing host configs and placing keys')
+  } else if (!hostReceiptMetaReady(artifacts.host)) {
+    add('rerun host receipt with the current fleet-runtime so host.json includes panel_public_key_public_only evidence')
   }
   if (passingMetaCount(artifacts.probes, EXPECTED.probe) === 0) {
     add('queue inbox and lifecycle inputs with cutover-probe.mjs, save probe-*.json, then rerun receipt-bundle with --probe-receipt')
@@ -1353,7 +1400,7 @@ function hostGoStatusChecklist({ outDir, artifacts, agents, gateReceipt, manifes
   const gatePass = artifacts.cutover_gate?.receipt_type === EXPECTED.cutover_gate && gateReceipt?.status === 'pass'
   const manifestCheckPass = manifestCheck?.status === 'pass'
   const installOk = artifacts.install?.receipt_type === EXPECTED.install && (artifacts.install?.status === 'pass' || artifacts.install?.status === 'warn')
-  const hostOk = artifacts.host?.receipt_type === EXPECTED.host && artifacts.host?.status === 'pass'
+  const hostOk = hostReceiptMetaReady(artifacts.host)
 
   return [
     hostGoChecklistItem(
@@ -1379,7 +1426,7 @@ function hostGoStatusChecklist({ outDir, artifacts, agents, gateReceipt, manifes
     ),
     hostGoChecklistItem(
       'host_receipt_passed',
-      'Host config, keys, and runtime layout pass host receipt checks',
+      'Host config, keys, panel public key, and runtime layout pass host receipt checks',
       hostOk,
       'Edit daemon/control/inbox/flights config for the real pot, place keys, then rerun receipt-bundle without --skip-host.',
       { path: artifacts.host?.path ?? (outDir ? join(outDir, 'host.json') : null), receipt_type: artifacts.host?.receipt_type ?? null, receipt_status: artifacts.host?.status ?? null },
@@ -1487,6 +1534,7 @@ function inspectBundleStatus(opts = {}) {
   const manifestCheck = manifest ? checkBundleManifest({ manifestPath }) : null
   const requiredControlVerbs = requiredStatusControlVerbs(opts, manifest)
   const controlEvidence = controlEvidenceFromArtifacts(artifacts)
+  const hostReceipt = artifacts.host?.path ? readReceipt(artifacts.host.path) : null
 
   statusCheck(checks, 'selected_agents_recorded', agents.length > 0, { agents })
   statusCheck(checks, 'install_receipt_present', artifacts.install?.receipt_type === EXPECTED.install, {
@@ -1501,6 +1549,11 @@ function inspectBundleStatus(opts = {}) {
     path: artifacts.host?.path ?? join(outDir || '<out-dir>', 'host.json'),
     receipt_type: artifacts.host?.receipt_type ?? null,
     status: artifacts.host?.status ?? null,
+  })
+  addHostReceiptRequiredChecks(checks, {
+    component: 'receipt-bundle-status',
+    receipt: hostReceipt,
+    extra: { path: artifacts.host?.path ?? join(outDir || '<out-dir>', 'host.json') },
   })
   statusCheck(checks, 'probe_receipt_pass_present', passingMetaCount(artifacts.probes, EXPECTED.probe) > 0, {
     count: artifacts.probes.length,
@@ -1746,7 +1799,16 @@ function passPaths(paths, expectedType, checks, label) {
     const meta = receiptMeta(path)
     const typeOk = meta.receipt_type === expectedType
     const passOk = meta.status === 'pass'
-    if (typeOk && passOk) {
+    const receipt = label === 'host' ? readReceipt(path) : null
+    const requiredOk = label !== 'host' || hostReceiptRequiredChecksPass(receipt)
+    if (label === 'host') {
+      addHostReceiptRequiredChecks(checks, {
+        component: 'receipt-bundle',
+        receipt,
+        extra: { path },
+      })
+    }
+    if (typeOk && passOk && requiredOk) {
       selected.push(path)
       checks.push({ ok: true, component: 'receipt-bundle', check: `${label}_candidate_selected`, path })
     } else {
@@ -1757,6 +1819,7 @@ function passPaths(paths, expectedType, checks, label) {
         path,
         receipt_type: meta.receipt_type,
         status: meta.status,
+        required_checks_pass: requiredOk,
       })
     }
   }
@@ -1807,8 +1870,10 @@ function buildNextSteps({ artifacts, agents, gateReceipt, outDir, bundleStatus, 
     }
   }
 
-  if (artifacts.host?.status !== 'pass') {
+  if (artifacts.host?.receipt_type !== EXPECTED.host || artifacts.host?.status !== 'pass') {
     add('edit host configs, place keys, then rerun receipt-bundle without --skip-host until host.json is status pass')
+  } else if (!hostReceiptMetaReady(artifacts.host)) {
+    add('rerun host receipt with the current fleet-runtime so host.json includes panel_public_key_public_only evidence')
   }
 
   for (const agentId of agents ?? []) {

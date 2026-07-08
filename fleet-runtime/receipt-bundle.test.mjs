@@ -9,6 +9,11 @@ import { buildBundle, checkBundleManifest, exportBundle, formatStatusSummary, in
 
 const POT_URL = 'https://pot.example.org'
 const POT_TENANT = 'tenant-a'
+const HOST_PANEL_PUBLIC_KEY_CHECK = {
+  ok: true,
+  component: 'fleet-control-daemon',
+  check: 'panel_public_key_public_only',
+}
 
 function tmpDir() {
   return mkdtempSync(join(tmpdir(), 'mupot-receipt-bundle-'))
@@ -61,19 +66,27 @@ function probeReceipt(status = 'pass') {
   }
 }
 
-function hostReceipt(status = 'pass') {
+function hostReceipt(status = 'pass', opts = {}) {
+  const checks = opts.checks ?? [
+    { ...HOST_PANEL_PUBLIC_KEY_CHECK, ok: status === 'pass' },
+  ]
   return {
     receipt_type: 'mupot-fleet-host-receipt/v1',
     generated_at: '2026-07-08T00:00:00.000Z',
     status,
-    summary: { status, passed: 1, failed: status === 'pass' ? 0 : 1, warnings: 0 },
+    summary: {
+      status,
+      passed: checks.filter((check) => check.ok === true).length,
+      failed: checks.filter((check) => check.ok === false).length,
+      warnings: checks.filter((check) => check.ok === null).length,
+    },
     target: {
       base_url: POT_URL,
       tenant: POT_TENANT,
       daemon_agents: ['agent-one'],
       control_consumer_agent: 'fleet-consumer',
     },
-    checks: [],
+    checks,
   }
 }
 
@@ -217,6 +230,38 @@ test('receipt bundle can reuse existing host, runtime, and control receipts', as
   assert.ok(bundle.checks.some((c) => c.check === 'host_receipt_reused' && c.ok === true))
   assert.ok(bundle.checks.some((c) => c.check === 'runtime_receipts_reused' && c.ok === true))
   assert.ok(bundle.checks.some((c) => c.check === 'control_receipts_reused' && c.ok === true))
+})
+
+test('receipt bundle fails when reused host receipt lacks public-only panel key evidence', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
+  writeJson(join(outDir, 'host.json'), hostReceipt('pass', { checks: [] }))
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    skipHost: true,
+    skipRuntime: true,
+    skipControl: true,
+  })
+
+  assert.equal(bundle.status, 'fail')
+  assert.ok(bundle.checks.some((c) =>
+    c.check === 'host_receipt_required_check_pass' &&
+    c.required_check === 'panel_public_key_public_only' &&
+    c.ok === false
+  ))
+  assert.ok(bundle.checks.some((c) =>
+    c.check === 'host_candidate_ignored' &&
+    c.required_checks_pass === false
+  ))
+  assert.ok(bundle.next_steps.some((s) => s.includes('panel_public_key_public_only')))
 })
 
 test('verify-only rechecks an existing bundle without live receipt builders', async () => {
@@ -430,6 +475,45 @@ test('export writes a clean self-contained attachable bundle', async () => {
   assert.equal(checkBundleManifest({ outDir }).status, 'fail')
 })
 
+test('manifest check fails when host receipt lacks public-only panel key evidence', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+  await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+  })
+
+  const hostPath = join(outDir, 'host.json')
+  writeJson(hostPath, hostReceipt('pass', { checks: [] }))
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.host.sha256 = sha256(hostPath)
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ manifestPath })
+
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((c) =>
+    c.check === 'artifact_status_cutover_ready' &&
+    c.artifact === 'host' &&
+    c.ok === true
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'host_receipt_required_check_pass' &&
+    c.artifact === 'host' &&
+    c.required_check === 'panel_public_key_public_only' &&
+    c.ok === false
+  ))
+})
+
 test('manifest check fails when copied bundle is not self-contained', async () => {
   const outDir = tmpDir()
   writeJson(join(outDir, 'probe-start.json'), probeReceipt())
@@ -632,6 +716,23 @@ test('status reports missing host-go evidence and next steps for a partial bundl
   assert.ok(status.next_steps.some((s) => s.includes('queue inbox and lifecycle inputs')))
   assert.ok(status.next_steps.some((s) => s.includes('runtime-agent-one.json')))
   assert.ok(status.next_steps.some((s) => s.includes('do not remove SOS wiring yet')))
+})
+
+test('status reports stale host receipt missing public-only panel key evidence', () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'host.json'), hostReceipt('pass', { checks: [] }))
+
+  const status = inspectBundleStatus({ outDir, agents: ['agent-one'] })
+
+  assert.equal(status.status, 'fail')
+  assert.ok(status.checks.some((c) => c.check === 'host_receipt_pass' && c.ok === true))
+  assert.ok(status.checks.some((c) =>
+    c.check === 'host_receipt_required_check_pass' &&
+    c.required_check === 'panel_public_key_public_only' &&
+    c.ok === false
+  ))
+  assert.equal(checklistById(status, 'host_receipt_passed').status, 'fail')
+  assert.ok(status.next_steps.some((s) => s.includes('panel_public_key_public_only')))
 })
 
 test('status reports missing lifecycle control verbs before the gate is rebuilt', () => {

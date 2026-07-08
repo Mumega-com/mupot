@@ -376,9 +376,9 @@ and exiting `0` so the daemon consumes the batch.
      manifest summary/status from the recorded checks, requires
      host/probe/runtime/control/cutover-gate evidence categories, compares
      cutover-gate inputs back to the manifest evidence, verifies receipt target
-     base URLs and tenants match, rejects secret material, rejects non-self-contained
-     copied evidence or extra files, rejects contradictory `next_steps`, and
-     writes nothing.
+     base URLs and tenants match, requires host `panel_public_key_public_only`
+     evidence, rejects secret material, rejects non-self-contained copied evidence
+     or extra files, rejects contradictory `next_steps`, and writes nothing.
      `manifest.json.next_steps` is advisory and should explain the next missing
      operator action when the bundle is not ready.
 

@@ -489,7 +489,10 @@ for the same issue #274 gates: bundle directory, selected agents, installer,
 host, probe, runtime, control, cutover gate, manifest, copied manifest check,
 and attachable-bundle safety. It exits non-zero until the evidence is ready, and
 its `next_steps` name the next host action to run, including missing
-`agent:verb` lifecycle evidence before the final gate is rebuilt.
+`agent:verb` lifecycle evidence before the final gate is rebuilt. Stale
+`host.json` files generated before `panel_public_key_public_only` will fail the
+host checklist; rerun the host receipt with the current runtime so copied
+evidence proves the panel key is public-only.
 
 To produce the clean attachable copy for #274, export from the working receipt
 directory into a fresh directory. The export command copies only `manifest.json`
@@ -522,6 +525,7 @@ To verify a copied bundle without rewriting anything, run the manifest check. It
 reads `manifest.json`, checks the recorded receipt artifact SHA-256 hashes, reads
 each saved receipt JSON, verifies receipt type/status against the manifest,
 requires the host/probe/runtime/control/cutover-gate evidence categories,
+requires host evidence to include `panel_public_key_public_only`,
 recomputes the manifest summary from its recorded checks, verifies the cutover
 gate was built for the manifest's selected agents/control verbs/artifacts,
 verifies all non-secret receipt target identities agree on the same pot base URL
@@ -559,7 +563,8 @@ inside itself because that file is self-referential. The manifest check emits
 `mupot-fleet-receipt-bundle-check/v1`; it accepts installer `pass|warn` and
 requires the host, probe, runtime, control, and cutover-gate receipts to be
 `status:"pass"`. It also requires probe and runtime artifacts for each selected
-agent.
+agent, and rejects stale host receipts that do not include the
+`panel_public_key_public_only` evidence check.
 The check receipt includes the SHA-256 of the `manifest.json` file it inspected
 and compares `cutover-gate.json.inputs` back to the manifest evidence. It
 rejects copied evidence that mixes receipts from different pot base URLs or
