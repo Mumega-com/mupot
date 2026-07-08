@@ -470,6 +470,12 @@ test('export writes a clean self-contained attachable bundle', async () => {
       'runtime-agent-one.json',
     ],
   )
+  const exportReceiptText = readFileSync(join(exportDir, 'export-receipt.json'), 'utf8')
+  const manifestCheckText = readFileSync(join(exportDir, 'manifest-check.json'), 'utf8')
+  assert.equal(exportReceiptText.includes(outDir), false)
+  assert.equal(exportReceiptText.includes(exportDir), false)
+  assert.equal(manifestCheckText.includes(outDir), false)
+  assert.equal(manifestCheckText.includes(exportDir), false)
   const exportReceipt = JSON.parse(readFileSync(join(exportDir, 'export-receipt.json'), 'utf8'))
   const manifestCheckReceipt = JSON.parse(readFileSync(join(exportDir, 'manifest-check.json'), 'utf8'))
   assert.equal(exportReceipt.receipt_type, 'mupot-fleet-receipt-bundle-export/v1')
@@ -498,6 +504,16 @@ test('export writes a clean self-contained attachable bundle', async () => {
   ))
   assert.ok(copiedCheck.checks.some((c) =>
     c.check === 'export_sidecar_manifest_hash_matches' &&
+    c.sidecar === 'manifest-check.json' &&
+    c.ok === true
+  ))
+  assert.ok(copiedCheck.checks.some((c) =>
+    c.check === 'export_sidecar_summary_matches_checks' &&
+    c.sidecar === 'export-receipt.json' &&
+    c.ok === true
+  ))
+  assert.ok(copiedCheck.checks.some((c) =>
+    c.check === 'export_sidecar_summary_matches_checks' &&
     c.sidecar === 'manifest-check.json' &&
     c.ok === true
   ))

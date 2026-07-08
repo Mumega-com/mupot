@@ -500,7 +500,9 @@ receipt artifacts named in that manifest, and two sidecar receipts:
 `export-receipt.json` plus `manifest-check.json`. It then runs the same manifest
 check against the exported directory. The exported `manifest.json` is made
 portable: receipt artifact paths are local filenames and the exported `out_dir`
-is `.`; the working source manifest is not rewritten.
+is `.`. The sidecar receipts are also written in portable form so local source
+and export directory paths do not travel with the attachable evidence; the
+working source manifest is not rewritten.
 
 ```bash
 node ~/.fleet/runtime/receipt-bundle.mjs \
@@ -535,12 +537,13 @@ verifies all non-secret receipt target identities agree on the same pot base URL
 and tenant, scans the manifest and receipt artifacts for obvious secret material
 such as bearer tokens, raw `mupot_` tokens, private-key PEM/JWK data, GitHub
 tokens, or authorization fields, verifies exported sidecar receipts when present
-and requires them for portable exported manifests, verifies the checked directory
-contains only `manifest.json`, the receipt artifacts named in the manifest, and
-the known sidecars, verifies every artifact is present in that same copied
-directory rather than resolved through an old absolute host path, verifies
-`next_steps` does not contradict readiness, and exits non-zero if any saved file,
-manifest status, or attachable evidence safety check drifted:
+and requires them for portable exported manifests, recomputes their recorded
+status/summary from their own checks, verifies the checked directory contains
+only `manifest.json`, the receipt artifacts named in the manifest, and the known
+sidecars, verifies every artifact is present in that same copied directory rather
+than resolved through an old absolute host path, verifies `next_steps` does not
+contradict readiness, and exits non-zero if any saved file, manifest status, or
+attachable evidence safety check drifted:
 
 ```bash
 node ~/.fleet/runtime/receipt-bundle.mjs \

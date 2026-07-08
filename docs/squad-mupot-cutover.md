@@ -370,6 +370,8 @@ and exiting `0` so the daemon consumes the batch.
      and `manifest-check.json` sidecars, then runs the same manifest check
      against the exported directory. The exported manifest uses local artifact
      filenames and `out_dir:"."`, without rewriting the working source manifest.
+     The exported sidecars are portable too, so source/export filesystem paths
+     do not travel with the attachable evidence.
      Run `receipt-bundle.mjs
      --check-manifest --out-dir ~/.fleet/receipts/<agent_id>-attach` before
      attaching copied evidence; it emits `mupot-fleet-receipt-bundle-check/v1`,
@@ -378,9 +380,10 @@ and exiting `0` so the daemon consumes the batch.
      host/probe/runtime/control/cutover-gate evidence categories, compares
      cutover-gate inputs back to the manifest evidence, verifies receipt target
      base URLs and tenants match, requires host `panel_public_key_public_only`
-     evidence, verifies the export/check sidecars, rejects secret material,
-     rejects non-self-contained copied evidence or extra files, rejects
-     contradictory `next_steps`, and writes nothing.
+     evidence, verifies the export/check sidecars and recomputes their
+     status/summary from their own checks, rejects secret material, rejects
+     non-self-contained copied evidence or extra files, rejects contradictory
+     `next_steps`, and writes nothing.
      `manifest.json.next_steps` is advisory and should explain the next missing
      operator action when the bundle is not ready.
 

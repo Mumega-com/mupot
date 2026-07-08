@@ -773,6 +773,37 @@ function addExportSidecarChecks(checks, manifestPath, manifestDir, manifest, opt
       checked_path: path,
       actual: receipt?.status ?? null,
     })
+    const sidecarChecks = Array.isArray(receipt?.checks) ? receipt.checks : null
+    const sidecarSummary = sidecarChecks ? summarize(sidecarChecks) : null
+    checks.push({
+      ok: Boolean(sidecarChecks),
+      component: 'receipt-bundle-check',
+      check: 'export_sidecar_checks_present',
+      path: manifestPath,
+      sidecar: sidecar.file,
+      checked_path: path,
+      count: sidecarChecks?.length ?? 0,
+    })
+    checks.push({
+      ok: receipt?.status === sidecarSummary?.status,
+      component: 'receipt-bundle-check',
+      check: 'export_sidecar_status_matches_checks',
+      path: manifestPath,
+      sidecar: sidecar.file,
+      checked_path: path,
+      expected: sidecarSummary?.status ?? null,
+      actual: receipt?.status ?? null,
+    })
+    checks.push({
+      ok: sameSummary(receipt?.summary, sidecarSummary),
+      component: 'receipt-bundle-check',
+      check: 'export_sidecar_summary_matches_checks',
+      path: manifestPath,
+      sidecar: sidecar.file,
+      checked_path: path,
+      expected: sidecarSummary,
+      actual: receipt?.summary ?? null,
+    })
 
     const sidecarSecretFindings = receipt ? findSecretMaterial(receipt) : []
     checks.push({
@@ -1216,9 +1247,17 @@ function writeExportManifest(sourceManifest, dest, opts, checks) {
   }
 }
 
+function portableExportSidecarReceipt(receipt, opts = {}) {
+  let portable = portableManifestValue(receipt)
+  if (opts.sourceDir) portable = replaceStringValue(portable, opts.sourceDir, '.')
+  if (opts.exportDir) portable = replaceStringValue(portable, opts.exportDir, '.')
+  return portable
+}
+
 function writeExportSidecar(path, receipt, opts, checks, label) {
   try {
-    writeFileSync(path, JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600, flag: opts.force ? 'w' : 'wx' })
+    const portable = portableExportSidecarReceipt(receipt, opts)
+    writeFileSync(path, JSON.stringify(portable, null, 2) + '\n', { mode: 0o600, flag: opts.force ? 'w' : 'wx' })
     checks.push({
       ok: true,
       component: 'receipt-bundle-export',
@@ -1241,12 +1280,14 @@ function writeExportSidecar(path, receipt, opts, checks, label) {
   }
 }
 
-function overwriteExportSidecar(path, receipt) {
-  writeFileSync(path, JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600, flag: 'w' })
+function overwriteExportSidecar(path, receipt, opts = {}) {
+  const portable = portableExportSidecarReceipt(receipt, opts)
+  writeFileSync(path, JSON.stringify(portable, null, 2) + '\n', { mode: 0o600, flag: 'w' })
 }
 
 function makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck }) {
-  const summary = summarize(checks)
+  const checkSnapshot = JSON.parse(JSON.stringify(checks))
+  const summary = summarize(checkSnapshot)
   return {
     receipt_type: 'mupot-fleet-receipt-bundle-export/v1',
     generated_at: new Date().toISOString(),
@@ -1280,7 +1321,7 @@ function makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, mani
     next_steps: summary.status === 'pass'
       ? [NEXT_STEP_ATTACH]
       : ['fix the source receipts or export directory, rerun receipt-bundle --export, then attach only the exported directory after it passes'],
-    checks,
+    checks: checkSnapshot,
   }
 }
 
@@ -1377,8 +1418,9 @@ function exportBundle(opts = {}) {
   const manifestCheckPath = exportDir ? join(exportDir, MANIFEST_CHECK_RECEIPT_FILE) : ''
   if (exportDir && manifestCheck) {
     const baseReceipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck })
-    writeExportSidecar(manifestCheckPath, manifestCheck, opts, checks, 'manifest_check')
-    writeExportSidecar(exportReceiptPath, baseReceipt, opts, checks, 'export_receipt')
+    const sidecarOpts = { ...opts, sourceDir, exportDir }
+    writeExportSidecar(manifestCheckPath, manifestCheck, sidecarOpts, checks, 'manifest_check')
+    writeExportSidecar(exportReceiptPath, baseReceipt, sidecarOpts, checks, 'export_receipt')
     manifestCheck = checkBundleManifest({ outDir: exportDir })
     checks.push({
       ok: manifestCheck?.status === 'pass',
@@ -1391,9 +1433,10 @@ function exportBundle(opts = {}) {
 
   let receipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck })
   if (exportDir && manifestCheck) {
+    const sidecarOpts = { ...opts, sourceDir, exportDir }
     try {
-      overwriteExportSidecar(manifestCheckPath, manifestCheck)
-      overwriteExportSidecar(exportReceiptPath, receipt)
+      overwriteExportSidecar(manifestCheckPath, manifestCheck, sidecarOpts)
+      overwriteExportSidecar(exportReceiptPath, receipt, sidecarOpts)
       checks.push({
         ok: true,
         component: 'receipt-bundle-export',
@@ -1413,7 +1456,7 @@ function exportBundle(opts = {}) {
     }
     receipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck })
     try {
-      overwriteExportSidecar(exportReceiptPath, receipt)
+      overwriteExportSidecar(exportReceiptPath, receipt, sidecarOpts)
     } catch {
       // The preceding finalization check captures sidecar write failures.
     }
