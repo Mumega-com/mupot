@@ -7,6 +7,7 @@
 // separate operator steps.
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { buildReceipt as buildHostReceipt } from './host-receipt.mjs'
@@ -172,12 +173,21 @@ function readReceipt(path) {
   }
 }
 
+function fileSha256(path) {
+  try {
+    return createHash('sha256').update(readFileSync(path)).digest('hex')
+  } catch {
+    return null
+  }
+}
+
 function receiptMeta(path) {
   const receipt = readReceipt(path)
   return {
     path,
     receipt_type: receipt?.receipt_type ?? null,
     status: receipt?.status ?? null,
+    sha256: fileSha256(path),
   }
 }
 
@@ -533,6 +543,11 @@ async function buildBundle(opts) {
     generated_at: new Date().toISOString(),
     status: summary.status,
     summary,
+    integrity: {
+      algorithm: 'sha256',
+      covers: 'receipt artifact files',
+      excludes: ['manifest.json'],
+    },
     inputs: {
       agents,
       out_dir: outDir,

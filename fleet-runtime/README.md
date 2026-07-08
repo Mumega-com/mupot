@@ -459,6 +459,11 @@ When `manifest.json` and `cutover-gate.json` both report
 to attach to the cutover record for that agent. Use `--force` only to replace a
 same-name failed attempt after fixing the underlying host issue.
 
+The manifest includes SHA-256 hashes for the saved receipt artifacts
+(`install.json`, `probe-*.json`, `host.json`, `runtime-*.json`,
+`control-*.json`, and `cutover-gate.json`). It does not hash `manifest.json`
+inside itself because that file is self-referential.
+
 Every bundle manifest also includes `next_steps`. Treat those as operator
 guidance only: the hard gate remains `manifest.json` and `cutover-gate.json`
 both reporting `status: "pass"`.

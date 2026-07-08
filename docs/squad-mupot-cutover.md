@@ -345,6 +345,9 @@ and exiting `0` so the daemon consumes the batch.
      Use `--verify-only` to recheck an already gathered bundle without polling
      the live host runtime; it reuses saved host/runtime/control receipts and
      rewrites only the final gate and manifest.
+     `manifest.json` carries SHA-256 hashes for the saved receipt artifacts so
+     copied evidence can be checked for drift; it excludes its own self-referential
+     file hash.
      `manifest.json.next_steps` is advisory and should explain the next missing
      operator action when the bundle is not ready.
 
@@ -367,7 +370,7 @@ and exiting `0` so the daemon consumes the batch.
 | control live | `control-receipt.mjs` emits `mupot-fleet-control-receipt/v1` with `status:"pass"` |
 | probe queue | `cutover-probe.mjs` emits `mupot-fleet-cutover-probe/v1` after queuing inbox/control evidence inputs |
 | SOS cutover gate | `cutover-receipt.mjs` emits `mupot-sos-cutover-gate/v1` with `status:"pass"` for that agent |
-| receipt bundle | `receipt-bundle.mjs` writes optional `install.json`, optional `probe-*.json`, `mupot-fleet-receipt-bundle/v1` `manifest.json` with advisory `next_steps`, and `cutover-gate.json`; `--verify-only` rechecks saved evidence without live host polling; `manifest.json` and `cutover-gate.json` must both report `status:"pass"` |
+| receipt bundle | `receipt-bundle.mjs` writes optional `install.json`, optional `probe-*.json`, `mupot-fleet-receipt-bundle/v1` `manifest.json` with receipt-artifact SHA-256 hashes and advisory `next_steps`, and `cutover-gate.json`; `--verify-only` rechecks saved evidence without live host polling; `manifest.json` and `cutover-gate.json` must both report `status:"pass"` |
 | wake-hook (post-route) | watcher launches a session from a mupot `inbox` poll, logged in `watcher.log` |
 
 ---

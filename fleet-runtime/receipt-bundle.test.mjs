@@ -1,6 +1,7 @@
 // node --test receipt-bundle.test.mjs
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -13,6 +14,10 @@ function tmpDir() {
 function writeJson(path, value) {
   writeFileSync(path, JSON.stringify(value, null, 2) + '\n')
   return path
+}
+
+function sha256(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex')
 }
 
 function installReceipt(status = 'warn') {
@@ -117,8 +122,16 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
 
   const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
   assert.equal(manifest.status, 'pass')
+  assert.equal(manifest.integrity.algorithm, 'sha256')
+  assert.deepEqual(manifest.integrity.excludes, ['manifest.json'])
   assert.equal(manifest.artifacts.install.status, 'warn')
   assert.equal(manifest.artifacts.probes[0].status, 'pass')
+  assert.equal(manifest.artifacts.install.sha256, sha256(join(outDir, 'install.json')))
+  assert.equal(manifest.artifacts.probes[0].sha256, sha256(join(outDir, 'probe-start-probe.json')))
+  assert.equal(manifest.artifacts.host.sha256, sha256(join(outDir, 'host.json')))
+  assert.equal(manifest.artifacts.runtimes[0].sha256, sha256(join(outDir, 'runtime-agent-one.json')))
+  assert.equal(manifest.artifacts.controls[0].sha256, sha256(join(outDir, 'control-restart.json')))
+  assert.equal(manifest.artifacts.cutover_gate.sha256, sha256(join(outDir, 'cutover-gate.json')))
   assert.ok(manifest.next_steps.some((s) => s.includes('manifest.json and cutover-gate.json')))
   assert.ok(manifest.checks.some((c) => c.check === 'install_receipt_status_non_fail' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'probe_receipt_status_pass' && c.ok === true))
@@ -210,6 +223,10 @@ test('verify-only rechecks an existing bundle without live receipt builders', as
 
   const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
   assert.equal(manifest.inputs.verify_only, true)
+  assert.equal(manifest.artifacts.host.sha256, sha256(join(outDir, 'host.json')))
+  assert.equal(manifest.artifacts.runtimes[0].sha256, sha256(join(outDir, 'runtime-agent-one.json')))
+  assert.equal(manifest.artifacts.controls[0].sha256, sha256(join(outDir, 'control-start.json')))
+  assert.equal(manifest.artifacts.cutover_gate.sha256, sha256(join(outDir, 'cutover-gate.json')))
   assert.ok(manifest.next_steps.some((s) => s.includes('attach manifest.json and cutover-gate.json')))
 })
 
