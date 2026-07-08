@@ -350,7 +350,8 @@ and exiting `0` so the daemon consumes the batch.
      file hash. Run `receipt-bundle.mjs --check-manifest --out-dir
      ~/.fleet/receipts/<agent_id>` before attaching copied evidence; it emits
      `mupot-fleet-receipt-bundle-check/v1`, verifies artifact hashes plus
-     receipt type/status metadata, and writes nothing.
+     receipt type/status metadata, recomputes manifest summary/status from the
+     recorded checks, and writes nothing.
      `manifest.json.next_steps` is advisory and should explain the next missing
      operator action when the bundle is not ready.
 

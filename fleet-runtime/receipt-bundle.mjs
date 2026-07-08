@@ -250,6 +250,13 @@ function artifactStatusOk(label, status) {
   return status === 'pass'
 }
 
+function sameSummary(actual, expected) {
+  return actual?.status === expected?.status &&
+    actual?.passed === expected?.passed &&
+    actual?.failed === expected?.failed &&
+    actual?.warnings === expected?.warnings
+}
+
 function checkBundleManifest(opts = {}) {
   const checks = []
   const manifestPath = manifestPathForCheck(opts)
@@ -274,6 +281,8 @@ function checkBundleManifest(opts = {}) {
   }
 
   if (manifest) {
+    const manifestChecks = Array.isArray(manifest.checks) ? manifest.checks : null
+    const computedManifestSummary = manifestChecks ? summarize(manifestChecks) : null
     checks.push({
       ok: manifest.receipt_type === 'mupot-fleet-receipt-bundle/v1',
       component: 'receipt-bundle-check',
@@ -296,6 +305,29 @@ function checkBundleManifest(opts = {}) {
       path: manifestPath,
       expected: 'sha256',
       actual: manifest.integrity?.algorithm ?? null,
+    })
+    checks.push({
+      ok: Boolean(manifestChecks),
+      component: 'receipt-bundle-check',
+      check: 'manifest_checks_present',
+      path: manifestPath,
+      count: manifestChecks?.length ?? 0,
+    })
+    checks.push({
+      ok: computedManifestSummary?.status === manifest.status,
+      component: 'receipt-bundle-check',
+      check: 'manifest_status_matches_checks',
+      path: manifestPath,
+      expected: computedManifestSummary?.status ?? null,
+      actual: manifest.status ?? null,
+    })
+    checks.push({
+      ok: sameSummary(manifest.summary, computedManifestSummary),
+      component: 'receipt-bundle-check',
+      check: 'manifest_summary_matches_checks',
+      path: manifestPath,
+      expected: computedManifestSummary,
+      actual: manifest.summary ?? null,
     })
 
     const entries = bundleArtifactEntries(manifest)
@@ -411,6 +443,7 @@ function checkBundleManifest(opts = {}) {
       receipt_type: manifest.receipt_type ?? null,
       status: manifest.status ?? null,
       generated_at: manifest.generated_at ?? null,
+      sha256: fileSha256(manifestPath),
     } : null,
     checks,
   }

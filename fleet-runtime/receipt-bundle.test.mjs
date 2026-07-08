@@ -256,7 +256,10 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
 
   assert.equal(check.receipt_type, 'mupot-fleet-receipt-bundle-check/v1')
   assert.equal(check.status, 'pass')
+  assert.equal(check.manifest.sha256, sha256(manifestPath))
   assert.equal(readFileSync(manifestPath, 'utf8'), before)
+  assert.ok(check.checks.some((c) => c.check === 'manifest_status_matches_checks' && c.ok === true))
+  assert.ok(check.checks.some((c) => c.check === 'manifest_summary_matches_checks' && c.ok === true))
   assert.ok(check.checks.some((c) =>
     c.check === 'artifact_sha256_match' &&
     c.artifact === 'host' &&
@@ -285,6 +288,46 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
     c.checked_path === join(copiedDir, 'host.json') &&
     c.ok === false &&
     c.expected !== c.actual
+  ))
+})
+
+test('manifest check fails when manifest status or summary disagrees with recorded checks', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+  await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+  })
+
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  const selected = manifest.checks.find((check) => check.check === 'host_candidate_selected')
+  selected.ok = false
+  manifest.status = 'pass'
+  manifest.summary = { status: 'pass', passed: 999, failed: 0, warnings: 0 }
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ manifestPath })
+
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((c) =>
+    c.check === 'manifest_status_matches_checks' &&
+    c.expected === 'fail' &&
+    c.actual === 'pass' &&
+    c.ok === false
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'manifest_summary_matches_checks' &&
+    c.expected.status === 'fail' &&
+    c.actual.status === 'pass' &&
+    c.ok === false
   ))
 })
 
