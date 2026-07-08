@@ -93,12 +93,18 @@ async function resolveAuth(c: {
       const auth = JSON.parse(injected) as AuthContext
       // Validate the minimal invariants we require before accepting the injected context.
       if (typeof auth.userId === 'string' && typeof auth.tenant === 'string') {
-        // Defense-in-depth (#183): the capability floor's legacy-role escape fires
-        // when `capabilities === undefined`. On this internal seam capabilities is
-        // always a resolved array (buildAuthContextFromProps sets it); a crafted
-        // blob that OMITS the key must not inherit the role escape and pass an
-        // admin-gated tool. Normalize a missing/non-array value to [] (fail-closed).
-        if (!Array.isArray(auth.capabilities)) auth.capabilities = []
+        // Boundary re-resolve (post-#266 hardening): the OAuth-convergence fix in
+        // buildAuthContextFromProps now lets workspace/im channels carry the
+        // member's real standing grants through this header (previously it was
+        // ALWAYS []). That raised the blast radius of this internal seam — a
+        // header the caller could ever influence (a future direct mcpApp mount,
+        // a provider routing edge, a new resolveAuth caller) would go from
+        // "carries nothing" to "carries owner-level authorization" verbatim.
+        // So we treat the injected blob as an IDENTITY assertion only and always
+        // re-derive capabilities server-side, ignoring whatever the blob claims —
+        // same ceiling rule as buildAuthContextFromProps itself, applied again here.
+        auth.capabilities = auth.channel === 'directory' ? [] : await resolveCapabilities(c.env, auth.userId)
+        if (auth.channel === 'directory') auth.boundAgentId = null
         return auth
       }
     } catch {

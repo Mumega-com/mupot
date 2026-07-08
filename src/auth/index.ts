@@ -182,6 +182,17 @@ authApp.get('/dev-login', async (c) => {
   if (env.LOCAL_TEST_AUTH !== '1') {
     return c.json({ error: 'not_found' }, 404)
   }
+  // Second, independent gate: even a misconfigured LOCAL_TEST_AUTH=1 in a real
+  // deployment must not mint an owner session for a REMOTE caller — only requests
+  // that actually reached this Worker via localhost/127.0.0.1 (wrangler dev) may
+  // use this door. One env var alone should not be able to mint prod owner access.
+  const hostname = new URL(c.req.url).hostname
+  // .test is a reserved TLD (RFC 2606) — never real-world routable, so allowing it
+  // here doesn't reopen the real attack surface; it's what the unit-test harness
+  // uses for synthetic in-process requests (e.g. https://pot.test/...).
+  if (hostname !== 'localhost' && hostname !== '127.0.0.1' && !hostname.endsWith('.test')) {
+    return c.json({ error: 'not_found' }, 404)
+  }
 
   const email = (env.LOCAL_TEST_AUTH_EMAIL ?? 'local-owner@mupot.test').trim().toLowerCase()
   const preferredId = await deriveUserId('local-test', email)

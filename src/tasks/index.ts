@@ -455,6 +455,15 @@ tasksApp.patch('/:id', async (c) => {
 // sealed with a 404. Auth, tenant, and squad member+ gates still run first.
 tasksApp.post('/:id/local-smoke-complete', async (c) => {
   if (c.env.LOCAL_TEST_AUTH !== '1') return c.json({ error: 'not_found' }, 404)
+  // Second, independent gate — see src/auth/index.ts dev-login for the same reasoning:
+  // a misconfigured LOCAL_TEST_AUTH=1 in prod must not let a REMOTE caller force-complete
+  // a gated task; only localhost/127.0.0.1 (wrangler dev) may reach this route.
+  const smokeHostname = new URL(c.req.url).hostname
+  // .test is a reserved TLD (RFC 2606) — never real-world routable; it's what the
+  // unit-test harness uses for synthetic in-process requests (e.g. https://pot.test/...).
+  if (smokeHostname !== 'localhost' && smokeHostname !== '127.0.0.1' && !smokeHostname.endsWith('.test')) {
+    return c.json({ error: 'not_found' }, 404)
+  }
 
   const id = c.req.param('id')
   const existing = await getById<Task>(c.env, 'tasks', id)
