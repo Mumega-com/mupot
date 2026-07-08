@@ -3,24 +3,21 @@
 // controls appear only for an owner on a configured pot.
 import { describe, it, expect } from 'vitest'
 import { hostAgentsPanel } from '../src/dashboard/fleet-host'
-import type { AgentView } from '../src/fleet/registry'
+import type { FleetAgentRuntimeView } from '../src/fleet/registry'
 
 async function render(p: ReturnType<typeof hostAgentsPanel>): Promise<string> {
   return String(await p)
 }
 
-const row = (over: Partial<AgentView> = {}): AgentView => ({
+const row = (over: Partial<FleetAgentRuntimeView> = {}): FleetAgentRuntimeView => ({
   agent_id: 'image-gen',
   display: '',
-  type: 'builder',
   runtime: 'codex',
   squads: ['media'],
   lifecycle: 'on_demand',
   status: 'running',
   presence: 'live',
   last_seen: '2026-07-08 01:00:00',
-  member: null,
-  capabilities: [],
   ...over,
 })
 

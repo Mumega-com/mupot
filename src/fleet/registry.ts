@@ -45,18 +45,23 @@ export interface FleetAgentRow {
   member_id: string | null
 }
 
-// Unified view: runtime row + identity (member) + capabilities.
-// Returned by getAgentView — the data feed for the dashboard and #agent-bus.
-export interface AgentView {
+// Runtime control-surface view: the host row fields needed by /fleet and #agent-bus
+// style surfaces. It intentionally excludes member/capability details.
+export interface FleetAgentRuntimeView {
   agent_id: string
   display: string
-  type: string                           // agent_type
   runtime: string
   squads: string[]
   status: string                         // stored INTENT: running | stopped (set by attach/detach)
   presence: Presence                     // DERIVED liveness from last_seen age vs TTL (live|stale|offline)
   lifecycle: string
   last_seen: string                      // last_reported_at
+}
+
+// Unified admin/API view: runtime row + identity (member) + capabilities.
+// Returned by getAgentView — the rich data feed for admin roster/API consumers.
+export interface AgentView extends FleetAgentRuntimeView {
+  type: string                           // agent_type
   member: { id: string; email: string | null; display_name: string } | null
   capabilities: Array<{ scope_type: string; scope_id: string | null; capability: string }>
 }
@@ -231,6 +236,31 @@ export async function listFleetAgents(env: Env): Promise<FleetAgentRow[]> {
     agent_type: String(r.agent_type ?? 'generic'),
     member_id: r.member_id == null ? null : String(r.member_id),
   }))
+}
+
+export async function listFleetAgentRuntimeView(env: Env, nowMs = Date.now()): Promise<FleetAgentRuntimeView[]> {
+  const rows = await env.DB.prepare(
+    `SELECT agent_id, display, runtime, squads, lifecycle, status, last_reported_at
+       FROM fleet_agents WHERE tenant = ?1 ORDER BY agent_id ASC`,
+  )
+    .bind(env.TENANT_SLUG)
+    .all<Record<string, unknown>>()
+
+  const ttlSec = presenceTtlSec(env)
+  return (rows.results ?? []).map((r) => {
+    const status = String(r.status ?? 'unknown')
+    const lastSeen = String(r.last_reported_at ?? '')
+    return {
+      agent_id: String(r.agent_id),
+      display: String(r.display ?? ''),
+      runtime: String(r.runtime ?? ''),
+      squads: parseSquads(r.squads),
+      status,
+      presence: derivePresence(status, lastSeen, ttlSec, nowMs),
+      lifecycle: String(r.lifecycle ?? ''),
+      last_seen: lastSeen,
+    }
+  })
 }
 
 /**

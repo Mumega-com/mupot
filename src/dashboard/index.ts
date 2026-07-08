@@ -98,7 +98,7 @@ import { formatBurn, formatUsd } from '../agents/cost'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
 import { loadFleet, wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
 import type { FleetRow } from './fleet'
-import { getAgentView } from '../fleet/registry'
+import { listFleetAgentRuntimeView } from '../fleet/registry'
 import { emitControlRequest } from '../fleet/control'
 import { hostAgentsPanel } from './fleet-host'
 import { listPresence } from '../fleet/presence'
@@ -456,7 +456,7 @@ dashboardApp.get('/fleet', async (c) => {
   // The host-agents panel (signed control via mupot, the durable replacement for the bus path) is
   // shown on BOTH the pot-native and the bus window — it's the pot's OWN fleet control surface.
   const auth = c.get('auth')
-  const hostAgents = await getAgentView(c.env)
+  const hostAgents = await listFleetAgentRuntimeView(c.env)
   const hostPanel = hostAgentsPanel(hostAgents, {
     configured: !!c.env.FLEET_PANEL_SK && !!c.env.FLEET_CONSUMER_AGENT,
     canControl: auth.role === 'owner',

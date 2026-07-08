@@ -11,7 +11,7 @@
 
 import { html } from 'hono/html'
 import { sectionPanel, dataTable, statusDot, pill, emptyState, type Html, type Tone } from './ui'
-import type { AgentView } from '../fleet/registry'
+import type { FleetAgentRuntimeView } from '../fleet/registry'
 
 const PRESENCE_TONE: Record<string, Tone> = { live: 'ok', stale: 'warn', offline: 'dim' }
 const INTENT_TONE: Record<string, Tone> = { running: 'ok', stopped: 'dim', unknown: 'warn' }
@@ -36,7 +36,7 @@ export interface HostPanelOpts {
   flash: string | null // result of a just-submitted control action (?hc=...)
 }
 
-export function hostAgentsPanel(agents: AgentView[], opts: HostPanelOpts): Html {
+export function hostAgentsPanel(agents: FleetAgentRuntimeView[], opts: HostPanelOpts): Html {
   const body: Html = agents.length === 0
     ? emptyState({
         title: 'No host agents reported yet',

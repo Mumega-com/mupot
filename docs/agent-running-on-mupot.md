@@ -154,6 +154,8 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
    ✅ branch implementation via `fleet-control-daemon.mjs` plus
    `control-receipt.mjs`; install + live control receipt = Hadi host-go.
 4. Control surface: `#agent-bus` = `top` (live presence + open/close); `#gates` = signals.
+   ✅ dashboard host-control path uses a least-privilege runtime feed with derived
+   presence + lifecycle intent; IM/Hermes queues the same signed control requests.
 
 **Phase 3 — coordinate through mupot (not SOS)**
 5. Runtime loops consume the mupot inbox (send/inbox/wake/ack) instead of the SOS bus.
