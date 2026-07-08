@@ -1,12 +1,14 @@
 # Kasra Squad → mupot Cutover Runbook
 
-**Status:** ready to run AFTER the durable-inbox MCP surface is deployed to `mupot.mumega.com`.
+**Status:** ready to run after the durable inbox routes are deployed to `mupot.mumega.com`
+and Hadi wires the host-side runtime handlers.
 **Audience:** Hadi (operator — mints, config, deploy) + Kasra (prep, verify).
 **Discipline:** every step ends in a RECEIPT, not a grade. Keep the SOS bus live as fallback until each surface is verified on mupot.
 
 This runbook migrates the kasra squad — five arms (`kasra-code`, `kasra-comms`, `kasra-review`, `kasra-research`, `brain`) plus `kasra` itself — off the SOS bus (`mcp.mumega.com` SSE / local Redis streams) onto the mupot pot's MCP seam.
 
-Every claim below is grounded in code with `file:line`. Where a step needs code that does **not yet exist**, it is flagged **BLOCKER / follow-on** — not papered over.
+Every claim below is grounded in code. Where a step still needs host/operator
+wiring, it is flagged as such — not papered over.
 
 ---
 
@@ -197,26 +199,50 @@ Each arm must present its OWN welded token so `auth.boundAgentId` resolves to th
 
 All three speak **Redis stream protocol** and assume the SOS bus's HMAC-signed-delegation envelope. None speak HTTP or MCP.
 
-### 3.2 The repoint target on mupot — and the BLOCKER
+### 3.2 The repoint target on mupot
 
 mupot's durable inbox is `agent_messages` (D1), read by `readAgentInbox` (`src/agents/messages.ts:237-299`), which CONSUMES on read (atomic `UPDATE…RETURNING`, `src/agents/messages.ts:272-283`).
 
-**The single caller of `readAgentInbox` is the MCP `inbox` tool** (`src/mcp/index.ts:606`). I grepped the whole worker: there is **NO HTTP route** that exposes the inbox. The agents app mounts only `/:agentId/wake` and `/:agentId/status` (`src/agents/index.ts:72, 128`) — no `/inbox`. The only inbound HTTP presence route is `POST /api/fleet/checkin` (`src/fleet/checkin-routes.ts:16`), which RECORDS presence; it does not READ messages.
+Mupot now exposes the thin HTTP inbox mirror in `src/agents/inbox-routes.ts`,
+mounted at `/api/inbox` in `src/index.ts`.
 
-> **BLOCKER / follow-on build (required for the bash hooks):** the cold-start hooks are bash + `redis-cli` + `python3`. They cannot speak MCP JSON-RPC over HTTP easily (no bearer-MCP client in bash; the `inbox` tool *consumes* on read, which a polling watcher would mis-handle). To repoint `check-inbox.sh` / `activation-watcher.sh` at mupot, mupot needs a **thin authenticated HTTP inbox route** the hooks can `curl`:
->
-> - **`GET /api/agents/inbox`** (or `/api/fleet/inbox`), bearer = the arm's welded member token, resolving `to_agent` from `auth.boundAgentId` (same self-scope as the MCP `inbox` tool, `src/mcp/index.ts:595-596`).
-> - It MUST support a **peek/non-consuming** mode (`?peek=1`) so the watcher can poll without destroying messages — `readAgentInbox` already supports `peek` (`src/agents/messages.ts:253, 259-267`); the route just forwards it.
-> - It should return `seq`/`id` so the bash cursor logic (`activation-watcher.sh:59-74`) maps cleanly onto `agent_messages.seq` instead of Redis stream IDs.
->
-> This route is a **small addition** (wrap `readAgentInbox` + bearer auth via the existing `resolveMemberByToken` used by fleet check-in, `src/fleet/checkin-routes.ts:11-19`) — but it does **not exist today** and is a hard prerequisite for migrating the bash hooks. Until it ships, the hooks stay on SOS Redis (see section 4 rollback).
+- `GET /api/inbox?peek=1&limit=N` uses the welded member bearer token and resolves
+  `to_agent` from `auth.boundAgentId`.
+- `POST /api/inbox/send` uses the welded member bearer token and resolves
+  `from_agent` from `auth.boundAgentId`.
+- `POST /api/inbox/signed` uses the registered Ed25519 `agent_keys` public key,
+  domain `agent-inbox:v1`, and reads only the signed `agent_id`'s inbox. This is
+  the fleet-daemon path, so the host does not need a raw bearer token just to
+  drain inbox messages.
+- All read paths support non-consuming `peek`; consuming reads return `seq`/`id`
+  so the handler can map to cursor-style logic.
+
+The remaining work is host-side wiring: replace Redis polling with the fleet
+daemon's signed inbox drain and a local handler that persists or launches the
+runtime, then exits `0` so the daemon consumes the batch.
 
 ### 3.3 What changes in the hooks once the HTTP inbox route exists
 
-- **`check-inbox.sh`:** replace the `redis-cli XREVRANGE` block (`:63-83`) with `curl -s -H "Authorization: Bearer $MUPOT_TOKEN" "https://mupot.mumega.com/api/agents/inbox?peek=1"`, parse the JSON `messages[]` (already structured — `from_agent`, `body`, `request_id`, `src/agents/messages.ts:50-60`), and keep the existing `[request_id:` → block-on-Stop logic (`:147-157`). Cursor becomes the max `seq` instead of a Redis stream ID.
-- **`activation-watcher.sh`:** replace `redis-cli XRANGE` (`:70`) with the same `curl ?peek=1`. **The HMAC-signed-delegation envelope goes away** — mupot's `send` already authenticates the sender server-side (the welded `from_agent`, `src/agents/messages.ts:116-118`) and replay-guards by `UNIQUE(tenant, from_agent, request_id)` (`src/agents/messages.ts:137-144`). So `verify-delegation.py`'s HMAC check (`verify-delegation.py:48-55`) is REDUNDANT on mupot: the bus already proved the sender. The watcher keeps the *launch* logic (lockfile, concurrency cap, HALT flag, body-to-file 0600 — `activation-watcher.sh:44-110`) but drops the HMAC gate. **Verify this claim before deleting the HMAC path** — it is a security-relevant change and must pass kasra-review + a diverse second eye.
+- **`check-inbox.sh`:** replace the `redis-cli XREVRANGE` block (`:63-83`) with
+  the fleet daemon's inbox handler payload, or with a bearer fallback:
+  `curl -s -H "Authorization: Bearer $MUPOT_TOKEN" "https://mupot.mumega.com/api/inbox?peek=1"`.
+  Parse the JSON `messages[]` (already structured: `seq`, `from_agent`, `body`,
+  `request_id`) and keep the existing `[request_id:` → block-on-Stop logic.
+  Cursor becomes the max `seq` instead of a Redis stream ID.
+- **`activation-watcher.sh`:** prefer the fleet daemon `inbox.command` handler:
+  the daemon signs `POST /api/inbox/signed`, peeks a batch, sends the batch JSON
+  to the handler on stdin, and consumes only after the handler exits `0`. The
+  handler keeps the launch logic (lockfile, concurrency cap, HALT flag, body-to-file
+  0600). **The HMAC-signed-delegation envelope goes away** because mupot's `send`
+  already authenticates the sender server-side and replay-guards by
+  `UNIQUE(tenant, from_agent, request_id)`. Verify the host diff before deleting
+  the HMAC path — it is a security-relevant runtime change.
 
-> **Decision for Hadi:** dropping `verify-delegation.py`'s HMAC means trusting mupot's server-side sender authentication end-to-end. That is correct *if and only if* the HTTP inbox route resolves `to_agent` strictly from the bearer token (never from a query param). The follow-on route MUST be built that way (mirror `src/mcp/index.ts:595` — `agent = auth.boundAgentId`, never client-supplied).
+> **Decision for Hadi:** dropping `verify-delegation.py`'s HMAC means trusting
+> mupot's server-side sender authentication end-to-end. That is correct because
+> `/api/inbox` resolves from `auth.boundAgentId`, and `/api/inbox/signed` resolves
+> from the verified Ed25519 `agent_id`; neither accepts a client-supplied
+> `to_agent` for reads. The host diff still needs review before rollout.
 
 ---
 
@@ -246,7 +272,11 @@ mupot's durable inbox is `agent_messages` (D1), read by `readAgentInbox` (`src/a
    - kasra-comms `broadcast`/`peers`: leave comms on SOS until a fan-out tool exists; `squad_message` is single-squad only.
    - `check_in`: arms can hit `POST /api/fleet/checkin` with their bearer (`src/fleet/checkin-routes.ts:16`) — but that is HTTP, not an MCP tool, so it needs a tiny wrapper or a hook, not an allowlist entry.
 
-5. **Wake-hooks cutover — BLOCKED on section 3.2 HTTP inbox route.** Do NOT migrate the hooks until that route ships and passes review. Until then: arms run on mupot for memory + messaging, but cold-start delegation still flows through SOS Redis (`activation-watcher.sh`). This is a fine intermediate state — the hooks are the LAST thing to move.
+5. **Wake-hooks cutover — host wiring step.** Do NOT migrate the hooks until
+   `/api/inbox/signed` is deployed and the local handler has passed review.
+   Until then: arms can run on mupot for memory + messaging, but cold-start
+   delegation still flows through SOS Redis (`activation-watcher.sh`). This is a
+   fine intermediate state — the hooks are the LAST thing to move.
 
 6. **Decommission SOS per surface, not all-at-once.** Only after an arm's memory + messaging + wake are all verified on mupot AND stable for a few cycles, drop that arm's `mumega-bus` allowlist entries. Keep the bus token valid (don't revoke) until the whole squad is migrated and Hadi signs off — the bus is the rollback floor.
 
@@ -268,19 +298,19 @@ mupot's durable inbox is `agent_messages` (D1), read by `readAgentInbox` (`src/a
 - **Shared squad memory** — `squad_remember`/`squad_recall`, `MEMORY.md`. mupot memory is per-token-private (`src/mcp/index.ts:104-106`); no squad-scoped memory tool exists.
 - **`task_update` / `task_board` / `task_list`** — not on the mupot seam (`src/mcp/index.ts:923-936`). Brain's prioritizer loop + kasra-code's task updates stay bus-side, or move to GitHub Issues/Project per CLAUDE.md.
 - **`broadcast` fan-out + `peers`** — no mupot equivalent; `squad_message` is single-squad.
-- **Cold-start wake-hooks** — blocked on the section-3 HTTP inbox route (BLOCKER).
+- **Cold-start wake-hooks** — blocked on host handler rollout against `/api/inbox/signed`.
 - **The SOS bus token itself** — keep live as the rollback floor until the full squad is verified on mupot.
 
 ### Hadi-go (his DIRECT approval / runtime lane — per CLAUDE.md SECURITY APPROVAL PROTOCOL)
 - **Minting all six tokens** (token/identity mint — high-stakes, `src/mcp/provision.ts:247`). His direct go.
 - **Writing the minted `raw` tokens into config / launch env** (secrets handling — runtime lane).
 - **Editing `~/.mcp.json`, `~/.claude.json`, the arm `.md` allowlists** (runtime config — Hadi manages agent runtime per "Stay in dev lane" memory).
-- **Deploying the follow-on HTTP inbox route** (mupot worker deploy — arms never deploy; CLAUDE.md hard rule).
+- **Deploying the signed HTTP inbox route** (mupot worker deploy — arms never deploy; CLAUDE.md hard rule).
 - **Revoking the SOS bus token** (final decommission — irreversible-ish; his sign-off).
 
 ### Kasra (mine — prep + verify, no mint, no deploy, no config write)
 - **Prep the exact mint calls** (section 1.3) and the config diffs (section 2.4) — hand to Hadi.
-- **Build the follow-on HTTP inbox route on a branch** (section 3.2) — branch only, through the diverse-gate (kasra-review + a different-model second eye) + Hadi-go before any deploy.
+- **Prepare the host handler diff for signed inbox drain** (section 3.2) — branch only, through the diverse-gate (kasra-review + a different-model second eye) + Hadi-go before any deploy.
 - **Run the verification round-trips** (section 4 receipts) once Hadi has minted + wired, and report receipts (not grades).
 - **Gate the security-relevant change** of dropping `verify-delegation.py`'s HMAC (section 3.3) — mandatory diverse review before it lands.
 
@@ -288,8 +318,10 @@ mupot's durable inbox is `agent_messages` (D1), read by `readAgentInbox` (`src/a
 
 ## Open BLOCKERS / follow-on builds (explicit, not papered over)
 
-1. **HTTP inbox route** (`GET /api/agents/inbox`, bearer self-scoped, peek mode) — REQUIRED for the bash wake-hooks to read mupot's inbox. Does not exist; only the MCP `inbox` tool reads `agent_messages` (`src/mcp/index.ts:606`). **Hard prerequisite for section 3.**
-2. **Per-arm capability granularity in `mint_agent_token`** — today every minted token gets uniform squad `member` (`src/mcp/provision.ts:298-301`). True per-arm least-privilege (e.g. review = recall/remember/inbox only) is not expressible. Follow-on: optional explicit-capability arg, still hard-capped ≤ `member`.
+1. **Host handler rollout for signed inbox drain** — `/api/inbox/signed` exists, but
+   the bash wake-hooks still need a reviewed handler that receives daemon batches,
+   launches the right runtime, and exits `0` only after durable local handoff.
+2. **Per-arm capability granularity in `mint_agent_token`** — today every minted token gets uniform squad `member` (`src/mcp/provision.ts:298-301`). True per-arm least-privilege (e.g. review = recall/remember/inbox only, NO task_create/squad_message) is not expressible. Follow-on: optional explicit-capability arg, still hard-capped ≤ `member`.
 3. **Squad-scoped memory on mupot** — no `squad_remember`/`squad_recall`; mupot memory is per-token-private. Shared `MEMORY.md`-style squad memory is NOT covered by this cutover.
 4. **`task_update` / `task_board` / `task_list` / `broadcast` / `peers` MCP tools** — absent on the mupot seam; the arms that use them keep those flows on SOS or on GitHub until built.
-5. **Dropping `verify-delegation.py` HMAC** — safe only if the HTTP inbox route resolves `to_agent` strictly from the bearer (never a query param). Security-relevant; must pass diverse review.
+5. **Dropping `verify-delegation.py` HMAC** — safe only after the host handler diff proves it reads from signed Mupot inbox batches and does not trust client-supplied routing. Security-relevant; must pass diverse review.

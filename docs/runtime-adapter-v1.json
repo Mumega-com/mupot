@@ -2,6 +2,7 @@
   "id": "runtime-adapter/v1",
   "status": "documented",
   "signedAttachDomain": "fleet-attach:v1",
+  "signedInboxDomain": "agent-inbox:v1",
   "identity": {
     "tenantSource": "env.TENANT_SLUG",
     "agentIdSource": "bearer-token-binding-or-signed-attach-key",
@@ -53,6 +54,13 @@
     "mcpTools": ["send", "inbox"],
     "http": {
       "read": "GET /api/inbox?peek=1&limit=N",
+      "signedRead": {
+        "method": "POST",
+        "path": "/api/inbox/signed",
+        "required": ["agent_id", "peek", "limit", "ts", "nonce", "sig"],
+        "domain": "agent-inbox:v1",
+        "retry": "retry-with-fresh-nonce-ts-and-signature"
+      },
       "send": "POST /api/inbox/send"
     },
     "identitySource": "auth.boundAgentId",

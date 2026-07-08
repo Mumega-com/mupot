@@ -13,6 +13,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 export const SIG_DOMAIN = 'fleet-attach:v1'
+export const INBOX_SIG_DOMAIN = 'agent-inbox:v1'
 
 // HTTP wall-clock bound. Without it, one stalled (half-open) connection freezes the whole
 // sequential heartbeat tick → undici's ~300s default would flip the entire fleet to stale.
@@ -46,6 +47,24 @@ export function canonicalMessage({ tenant, agentId, type, runtime, lifecycle, ts
   return [SIG_DOMAIN, tenant, agentId, type, runtime, lifecycle, String(ts), nonce].join('\n')
 }
 
+/** Domain-separated bytes for signed inbox reads. Keep byte-identical to
+ *  src/fleet/signed-inbox.ts canonicalInboxMessage(). */
+export function canonicalInboxMessage({ tenant, agentId, peek, limit, ts, nonce }) {
+  return [
+    INBOX_SIG_DOMAIN,
+    tenant,
+    agentId,
+    peek ? '1' : '0',
+    String(limit),
+    String(ts),
+    nonce,
+  ].join('\n')
+}
+
+function nonce() {
+  return Buffer.from(w.getRandomValues(new Uint8Array(32))).toString('base64url')
+}
+
 /** Sign + POST a signed-attach (the agent's identity proof / heartbeat). Returns
  *  {ok, status, json}. Never throws on HTTP failure (returns ok:false) so a daemon loop
  *  survives transient errors; a missing/bad key OR a missing tenant throws.
@@ -65,11 +84,11 @@ export async function signedAttach(baseUrl, agentId, opts = {}) {
   }
   const key = privKey ?? (await loadPrivKey(agentId))
   const ts = Math.floor(Date.now() / 1000)
-  const nonce = Buffer.from(w.getRandomValues(new Uint8Array(32))).toString('base64url')
-  const message = canonicalMessage({ tenant, agentId, type, runtime, lifecycle, ts, nonce })
+  const requestNonce = nonce()
+  const message = canonicalMessage({ tenant, agentId, type, runtime, lifecycle, ts, nonce: requestNonce })
   const sigBuf = await w.subtle.sign({ name: 'Ed25519' }, key, new TextEncoder().encode(message))
   const sig = Buffer.from(sigBuf).toString('base64url')
-  const body = { agent_id: agentId, type, runtime, lifecycle, ts, nonce, sig }
+  const body = { agent_id: agentId, type, runtime, lifecycle, ts, nonce: requestNonce, sig }
 
   try {
     const res = await fetchImpl(`${baseUrl.replace(/\/$/, '')}/api/fleet/attach-signed`, {
@@ -78,6 +97,47 @@ export async function signedAttach(baseUrl, agentId, opts = {}) {
       body: JSON.stringify(body),
       // NB AbortSignal.timeout's timer is unref'd — safe here because a real fetch holds a
       // ref'd socket; only a fully-mocked fetch (no pending I/O) could settle early.
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    })
+    const text = await res.text()
+    let json
+    try { json = JSON.parse(text) } catch { json = { raw: text } }
+    return { ok: res.ok, status: res.status, json }
+  } catch (e) {
+    return { ok: false, status: 0, json: { error: String(e && e.message ? e.message : e) } }
+  }
+}
+
+/** Sign + POST an inbox read. This is the no-bearer path for fleet-daemon inbox
+ *  drain: the same host-held private key used for signed attach proves the agent
+ *  identity, and the worker reads only that agent's own inbox. */
+export async function signedInbox(baseUrl, agentId, opts = {}) {
+  const {
+    tenant,
+    peek = true,
+    limit = 20,
+    privKey,
+    fetchImpl = fetch,
+  } = opts
+  if (typeof tenant !== 'string' || !tenant) {
+    throw new Error('signedInbox: tenant is required (this runtime hardcodes no tenant)')
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    throw new Error('signedInbox: limit must be an integer 1-100')
+  }
+  const key = privKey ?? (await loadPrivKey(agentId))
+  const ts = Math.floor(Date.now() / 1000)
+  const requestNonce = nonce()
+  const message = canonicalInboxMessage({ tenant, agentId, peek: !!peek, limit, ts, nonce: requestNonce })
+  const sigBuf = await w.subtle.sign({ name: 'Ed25519' }, key, new TextEncoder().encode(message))
+  const sig = Buffer.from(sigBuf).toString('base64url')
+  const body = { agent_id: agentId, peek: !!peek, limit, ts, nonce: requestNonce, sig }
+
+  try {
+    const res = await fetchImpl(`${baseUrl.replace(/\/$/, '')}/api/inbox/signed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     })
     const text = await res.text()

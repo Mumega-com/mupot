@@ -7,6 +7,7 @@ const contract = JSON.parse(
   id: string
   status: string
   signedAttachDomain: string
+  signedInboxDomain: string
   attach: {
     signed: { path: string; required: string[]; lifecycles: string[]; errors: Record<string, string> }
     bearer: { path: string; downgradePolicy: string }
@@ -14,6 +15,7 @@ const contract = JSON.parse(
   }
   messaging: {
     mcpTools: string[]
+    http: { signedRead: { path: string; required: string[]; domain: string } }
     kinds: string[]
     idempotency: { scope: string[]; identicalRetry: string; differentContent: string }
     readSemantics: { default: string; peek: string }
@@ -40,6 +42,7 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(contract.id).toBe('runtime-adapter/v1')
     expect(contract.status).toBe('documented')
     expect(contract.signedAttachDomain).toBe('fleet-attach:v1')
+    expect(contract.signedInboxDomain).toBe('agent-inbox:v1')
     expect(contract.attach.signed.path).toBe('/api/fleet/attach-signed')
     expect(contract.attach.signed.required).toEqual([
       'agent_id',
@@ -62,6 +65,11 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(contract.attach.bearer.downgradePolicy).toContain('refuse-bearer-attach')
     expect(contract.attach.detach.path).toBe('/api/fleet/detach')
     expect(contract.messaging.mcpTools).toEqual(['send', 'inbox'])
+    expect(contract.messaging.http.signedRead).toMatchObject({
+      path: '/api/inbox/signed',
+      domain: 'agent-inbox:v1',
+    })
+    expect(contract.messaging.http.signedRead.required).toEqual(['agent_id', 'peek', 'limit', 'ts', 'nonce', 'sig'])
     expect(contract.messaging.kinds).toEqual(['message', 'request', 'ack'])
     expect(contract.messaging.idempotency.scope).toEqual(['tenant', 'from_agent', 'request_id'])
     expect(contract.messaging.idempotency.identicalRetry).toBe('duplicate:true')

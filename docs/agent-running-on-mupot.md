@@ -77,8 +77,9 @@ Discord is a **view + control surface** onto mupot-managed agents, not a separat
 
 ## What's built vs the gap (be honest)
 
-- ✅ **Substrate / home**: identity + RBAC (Slice A), inbox (Slice D), Discord roles +
-  reach surface (Slice B), fleet-control signed start/stop + agent registry.
+- ✅ **Substrate / home**: identity + RBAC (Slice A), inbox (Slice D), signed HTTP
+  inbox reads for daemon drain, Discord roles + reach surface (Slice B),
+  fleet-control signed start/stop + agent registry.
 - ⬜ **The gap = runtime cutover (Slices F/G + Hermes-per-pot, #18):** the squad's shells
   still execute against the SOS bus / local sessions. "Running on mupot" is only true once
   each agent's runtime points at mupot's reflected bus, reports presence to the registry,
@@ -125,8 +126,8 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
 1. Registered (identity+type+RBAC) — ✅ **done** for the whole squad.
 2. Lifecycle controlled via mupot — ⛏ partial (signed attach/detach exist; no open/close API
    wired to actual process start/kill).
-3. Coordinates via the reflected bus — ⛏ partial (`agent_messages` inbox built; runtime loops
-   still talk SOS, not mupot).
+3. Coordinates via the reflected bus — ⛏ partial (`agent_messages` inbox and signed
+   daemon read are built; runtime hook rollout still needs host/operator wiring).
 4. Runtime binding reports presence + swappable — ⬜ **gap** (the rows are one-shot static
    stamps, NOT heartbeats; no persistent daemon).
 5. SOS retired — ⬜ not yet.
@@ -143,6 +144,8 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
 
 **Phase 3 — coordinate through mupot (not SOS)**
 5. Runtime loops consume the mupot inbox (send/inbox/wake/ack) instead of the SOS bus.
+   The pot now exposes `/api/inbox/signed` so the fleet daemon can deliver inbox
+   batches without storing a bearer token; host hook rollout remains the cutover work.
 6. Reflect any missing primitives (wake/request/ack) on the durable substrate (Queues+DO+D1).
 7. Repoint squad wake-hooks / bus identity SOS → mupot.
 

@@ -1,7 +1,7 @@
 // node --test fleet-daemon.test.mjs   (node >= 18 built-in runner, no deps)
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { validateConfig, runProbe } from './fleet-daemon.mjs'
+import { validateConfig, runProbe, runInboxCommand } from './fleet-daemon.mjs'
 
 const okCfg = () => ({
   base_url: 'https://your-pot.example.com',
@@ -50,10 +50,46 @@ test('validateConfig: per-agent defaults (type/runtime/lifecycle)', () => {
   assert.equal(c.agents[0].type, 'generic')
   assert.equal(c.agents[0].runtime, 'claude-code')
   assert.equal(c.agents[0].lifecycle, 'on_demand')
+  assert.equal(c.agents[0].inbox, null)
+})
+
+test('validateConfig: optional inbox handler is normalized and limit is clamped', () => {
+  const c = validateConfig({
+    ...okCfg(),
+    agents: [{
+      agent_id: 'x',
+      probe: 'exit 0',
+      inbox: { command: 'node handle-inbox.mjs', limit: 500 },
+    }],
+  })
+  assert.deepEqual(c.agents[0].inbox, { command: 'node handle-inbox.mjs', limit: 100 })
+})
+
+test('validateConfig: rejects malformed inbox handler config', () => {
+  assert.throws(() => validateConfig({
+    ...okCfg(),
+    agents: [{ agent_id: 'x', probe: 'exit 0', inbox: { command: '   ' } }],
+  }), /inbox.command/)
 })
 
 test('runProbe: exit 0 → alive', async () => { assert.equal(await runProbe('exit 0'), true) })
 test('runProbe: exit 1 → dead', async () => { assert.equal(await runProbe('exit 1'), false) })
 test('runProbe: a hanging probe times out → dead (never throws)', async () => {
   assert.equal(await runProbe('sleep 5', 200), false)
+})
+
+test('runInboxCommand: exits 0 only after reading the JSON payload', async () => {
+  const ok = await runInboxCommand(
+    `node -e "let s=''; process.stdin.on('data', d => s += d); process.stdin.on('end', () => process.exit(JSON.parse(s).messages[0].body === 'hi' ? 0 : 1))"`,
+    JSON.stringify({ messages: [{ body: 'hi' }] }),
+  )
+  assert.equal(ok, true)
+})
+
+test('runInboxCommand: non-zero handler result is false', async () => {
+  assert.equal(await runInboxCommand('exit 7', JSON.stringify({ messages: [] })), false)
+})
+
+test('runInboxCommand: hanging handler times out', async () => {
+  assert.equal(await runInboxCommand('sleep 5', '{}', 200), false)
 })

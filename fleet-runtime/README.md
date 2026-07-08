@@ -2,7 +2,8 @@
 
 The **distributable, sterile** companion to the pot worker. The worker (`src/fleet/`) *verifies*
 signed-attach and computes presence; this runtime *runs on a host*, proves each agent's identity
-by signature, and heartbeats only the agents whose runtime is actually alive.
+by signature, heartbeats only the agents whose runtime is actually alive, and
+can drain each live agent's Mupot inbox into a local handler.
 
 Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` come from your config.
 
@@ -11,9 +12,11 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 - **Agent identity ≠ runtime.** An agent is a durable identity (member + Ed25519 key + RBAC);
   the runtime (claude-code / codex / hermes) is a swappable shell. See `docs/agent-running-on-mupot.md`.
 - **No placed secret.** The host holds a private key; the pot stores only the public key. Each
-  attach is a signature — nothing secret is transported or placed.
+  attach and signed inbox read is a signature — nothing secret is transported or placed.
 - **Truthful presence.** The daemon probes each agent's runtime; it heartbeats only the live
   ones, so the pot's presence reflects reality (`live` while running → `stale` when it dies).
+- **Consume after delivery.** Inbox drain peeks first, hands the JSON batch to a local command,
+  and consumes from Mupot only after that command exits 0.
 
 ## Files
 
@@ -23,7 +26,7 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `register-agent-key.sh` | register the **public** key in the pot (`agent_keys`) via wrangler |
 | `attach-signed.mjs` | one-shot signed attach (CLI) |
 | `fleet-sign.mjs` | shared signer core (no tenant default) |
-| `fleet-daemon.mjs` | presence heartbeat loop (probe → signed-attach live agents) |
+| `fleet-daemon.mjs` | presence heartbeat loop plus optional signed inbox drain |
 | `daemon.example.json` | config template (set base_url, tenant, agents, probes) |
 | `fleet-daemon.service` | systemd user unit |
 
@@ -44,7 +47,7 @@ TENANT_SLUG=<your-tenant> ./fleet-runtime/register-agent-key.sh my-agent <AGENT_
 node fleet-runtime/attach-signed.mjs https://YOUR-POT my-agent --tenant <your-tenant> --type builder --runtime claude-code
 ```
 
-## Run the daemon (continuous presence)
+## Run the daemon (continuous presence + optional inbox drain)
 
 ```bash
 mkdir -p ~/.fleet/runtime ~/.config/systemd/user
@@ -61,6 +64,47 @@ journalctl --user -u fleet-daemon -f
 runtime is alive *now*. Use liveness signals (`tmux has-session`, `systemctl is-active`) or a
 **freshness** check (`find marker -mmin -5`), never a bare `test -f marker` (passes forever once
 the marker exists → heartbeats a dead agent).
+
+To let the daemon deliver Mupot inbox messages to a runtime hook, add an optional `inbox`
+block to that agent:
+
+```json
+{
+  "agent_id": "agent-one",
+  "type": "builder",
+  "runtime": "claude-code",
+  "probe": "tmux has-session -t agent-one 2>/dev/null",
+  "inbox": {
+    "command": "$HOME/.fleet/handlers/agent-one-inbox.sh",
+    "limit": 20
+  }
+}
+```
+
+The command receives one JSON object on stdin:
+
+```json
+{
+  "tenant": "acme",
+  "base_url": "https://YOUR-POT.example.com",
+  "agent_id": "agent-one",
+  "messages": [
+    {
+      "seq": 1,
+      "id": "msg-id",
+      "from_agent": "review",
+      "kind": "request",
+      "body": "do the work",
+      "request_id": "rid-1"
+    }
+  ],
+  "remaining": 0
+}
+```
+
+Exit `0` only after the runtime has persisted or accepted the batch. A non-zero exit, crash,
+or timeout leaves the Mupot messages unread for the next daemon tick. The inbox read is signed
+with the agent's Ed25519 key and POSTed to `/api/inbox/signed`; it does not need a bearer token.
 
 ## Flights (the activation unit) — `flight.mjs`
 

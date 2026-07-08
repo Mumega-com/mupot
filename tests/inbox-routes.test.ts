@@ -24,8 +24,14 @@ interface MsgRow {
   kind: string; body: string; request_id: string | null; in_reply_to: string | null; created_at: string; read_at: string | null
 }
 
-function makeDb(agents: Array<{ id: string; squad_id: string; slug: string; name: string }>) {
+interface KeyRow { pubkey: string; algo: string; member_id: string | null }
+
+function makeDb(
+  agents: Array<{ id: string; squad_id: string; slug: string; name: string }>,
+  keys: Record<string, KeyRow> = {},
+) {
   const messages: MsgRow[] = []
+  const nonces = new Set<string>()
   let seqCounter = 0
 
   function runRun(sql: string, b: unknown[]) {
@@ -57,6 +63,10 @@ function makeDb(agents: Array<{ id: string; squad_id: string; slug: string; name
       const [ref] = b as [string]
       return agents.find((a) => a.id === ref) ?? null
     }
+    if (sql.includes('FROM agent_keys WHERE tenant')) {
+      const [tenant, agentId] = b as [string, string]
+      return keys[`${tenant}:${agentId}`] ?? null
+    }
     throw new Error('unhandled first: ' + sql)
   }
   function runAll(sql: string, b: unknown[]) {
@@ -76,6 +86,16 @@ function makeDb(agents: Array<{ id: string; squad_id: string; slug: string; name
     }
     throw new Error('unhandled all: ' + sql)
   }
+  function runSigned(sql: string, b: unknown[]) {
+    if (sql.includes('DELETE FROM agent_attach_nonces')) return { meta: { changes: 0 } }
+    if (sql.includes('INSERT OR IGNORE INTO agent_attach_nonces')) {
+      const [nonce] = b as [string]
+      if (nonces.has(nonce)) return { meta: { changes: 0 } }
+      nonces.add(nonce)
+      return { meta: { changes: 1 } }
+    }
+    return null
+  }
 
   const db = {
     _messages: messages,
@@ -85,7 +105,7 @@ function makeDb(agents: Array<{ id: string; squad_id: string; slug: string; name
         bind(...a: unknown[]) { binds.push(...a); return api },
         async first<T>() { return runFirst(sql, binds) as T },
         async all<T>() { return { results: runAll(sql, binds) as T[] } },
-        async run() { return runRun(sql, binds) },
+        async run() { return runSigned(sql, binds) ?? runRun(sql, binds) },
       }
       return api
     },
@@ -93,8 +113,11 @@ function makeDb(agents: Array<{ id: string; squad_id: string; slug: string; name
   return db
 }
 
-function env(agents: Array<{ id: string; squad_id: string; slug: string; name: string }> = []): { env: Env; db: ReturnType<typeof makeDb> } {
-  const db = makeDb(agents)
+function env(
+  agents: Array<{ id: string; squad_id: string; slug: string; name: string }> = [],
+  keys: Record<string, KeyRow> = {},
+): { env: Env; db: ReturnType<typeof makeDb> } {
+  const db = makeDb(agents, keys)
   return { env: { TENANT_SLUG: 't', DB: db } as unknown as Env, db }
 }
 
@@ -111,6 +134,48 @@ function postReq(token: string | undefined, body: unknown, raw?: string): Reques
     body: raw !== undefined ? raw : JSON.stringify(body),
   })
 }
+
+const INBOX_SIG_DOMAIN = 'agent-inbox:v1'
+const canonInbox = (p: {
+  tenant: string
+  agent_id: string
+  peek: boolean
+  limit: number
+  ts: number
+  nonce: string
+}) => [INBOX_SIG_DOMAIN, p.tenant, p.agent_id, p.peek ? '1' : '0', String(p.limit), String(p.ts), p.nonce].join('\n')
+const b64url = (b: ArrayBuffer | Uint8Array) =>
+  Buffer.from(b instanceof Uint8Array ? b : new Uint8Array(b)).toString('base64url')
+
+async function genKey() {
+  const kp = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify'])
+  const pub = await crypto.subtle.exportKey('jwk', kp.publicKey)
+  return { kp, pubX: (pub as JsonWebKey).x as string }
+}
+
+async function signedInboxBody(
+  privKey: CryptoKey,
+  agent_id: string,
+  over: Partial<{ tenant: string; peek: boolean; limit: number; ts: number; nonce: string }> = {},
+) {
+  const body = {
+    agent_id,
+    peek: over.peek ?? true,
+    limit: over.limit ?? 20,
+    ts: over.ts ?? Math.floor(Date.now() / 1000),
+    nonce: over.nonce ?? b64url(crypto.getRandomValues(new Uint8Array(32))),
+  }
+  const tenant = over.tenant ?? 't'
+  const sig = await crypto.subtle.sign({ name: 'Ed25519' }, privKey, new TextEncoder().encode(canonInbox({ tenant, ...body })))
+  return { ...body, sig: b64url(sig) }
+}
+
+const postSigned = (body: unknown, e: Env) =>
+  inboxApp.fetch(new Request('https://pot.test/signed', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }), e)
 
 const AGENTS = [
   { id: 'ag-code', squad_id: 's1', slug: 'code', name: 'Code' },
@@ -181,5 +246,64 @@ describe('POST /api/inbox/send', () => {
     const { env: e } = env(AGENTS)
     const raw = JSON.stringify({ to: 'review', body: 'x'.repeat(9000) })
     expect((await inboxApp.fetch(postReq('tok-code', undefined, raw), e)).status).toBe(413)
+  })
+})
+
+describe('POST /api/inbox/signed', () => {
+  it('valid signature can peek without consuming, then consume the signed agent inbox', async () => {
+    const { kp, pubX } = await genKey()
+    const { env: e, db } = env(AGENTS, { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-code' } })
+    db._messages.push({
+      seq: 1,
+      id: 'x',
+      tenant: 't',
+      to_agent: 'ag-code',
+      from_agent: 'ag-review',
+      from_member: 'm-rev',
+      kind: 'request',
+      body: 'wake up',
+      request_id: 'rid-1',
+      in_reply_to: null,
+      created_at: 't0',
+      read_at: null,
+    })
+
+    const peekRes = await postSigned(await signedInboxBody(kp.privateKey, 'ag-code', { peek: true, limit: 10 }), e)
+    expect(peekRes.status).toBe(200)
+    const peek = await peekRes.json() as { messages: Array<{ body: string }>; consumed: boolean; agent: string }
+    expect(peek.agent).toBe('ag-code')
+    expect(peek.consumed).toBe(false)
+    expect(peek.messages.map((m) => m.body)).toEqual(['wake up'])
+
+    const consumeRes = await postSigned(await signedInboxBody(kp.privateKey, 'ag-code', { peek: false, limit: 10 }), e)
+    expect(consumeRes.status).toBe(200)
+    const consumed = await consumeRes.json() as { messages: Array<{ body: string }>; consumed: boolean }
+    expect(consumed.consumed).toBe(true)
+    expect(consumed.messages.map((m) => m.body)).toEqual(['wake up'])
+
+    const emptyRes = await postSigned(await signedInboxBody(kp.privateKey, 'ag-code', { peek: true, limit: 10 }), e)
+    expect(((await emptyRes.json()) as { messages: unknown[] }).messages).toEqual([])
+  })
+
+  it('replay of the same signed inbox request is rejected', async () => {
+    const { kp, pubX } = await genKey()
+    const { env: e } = env(AGENTS, { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: null } })
+    const body = await signedInboxBody(kp.privateKey, 'ag-code', { peek: true, limit: 10 })
+    expect((await postSigned(body, e)).status).toBe(200)
+    expect((await postSigned(body, e)).status).toBe(409)
+  })
+
+  it('tampered read mode after signing is rejected', async () => {
+    const { kp, pubX } = await genKey()
+    const { env: e } = env(AGENTS, { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: null } })
+    const body = await signedInboxBody(kp.privateKey, 'ag-code', { peek: true, limit: 10 })
+    ;(body as Record<string, unknown>).peek = false
+    expect((await postSigned(body, e)).status).toBe(401)
+  })
+
+  it('unknown signed agent key is unauthorized', async () => {
+    const { kp } = await genKey()
+    const { env: e } = env(AGENTS)
+    expect((await postSigned(await signedInboxBody(kp.privateKey, 'ag-code'), e)).status).toBe(401)
   })
 })

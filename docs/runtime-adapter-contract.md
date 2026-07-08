@@ -17,6 +17,7 @@ artifact and the local smoke harness references this same contract name.
 - Contract id: `runtime-adapter/v1`
 - Status: documented; adapter conformance tests are planned
 - Signed attach domain: `fleet-attach:v1`
+- Signed inbox domain: `agent-inbox:v1`
 
 Future incompatible changes must create a new contract id. Additive fields may
 be accepted when runtimes ignore unknown response fields.
@@ -144,7 +145,26 @@ MCP:
 HTTP:
 
 - `GET /api/inbox?peek=1&limit=N`
+- `POST /api/inbox/signed`
 - `POST /api/inbox/send`
+
+Use `POST /api/inbox/signed` for daemon/host runtimes that have a registered
+Ed25519 key and should not store a raw bearer token. The runtime signs:
+
+```text
+agent-inbox:v1
+<tenant>
+<agent_id>
+<peek: 1|0>
+<limit>
+<ts>
+<nonce>
+```
+
+Required JSON fields are `agent_id`, `peek`, `limit`, `ts`, `nonce`, and `sig`.
+The route reads only the signed `agent_id`'s own inbox. It returns the same
+message shape as `GET /api/inbox`; `peek=true` is non-consuming, and
+`peek=false` consumes.
 
 Rules:
 
@@ -254,7 +274,7 @@ Adapters should treat these names as stable enough for branching behavior:
 - `bad_request`: malformed body or invalid attach fields
 - `invalid_json`: malformed JSON on routes that expose that exact error
 - `payload_too_large`: body exceeded route byte cap
-- `replay`: signed attach nonce was already used
+- `replay`: signed attach or signed inbox nonce was already used
 - `request_id_conflict`: sender reused a message idempotency key with different content
 - `inbox_full`: recipient unread inbox cap reached
 - `not_agent_bound`: token is valid but not welded to an agent

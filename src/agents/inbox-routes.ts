@@ -14,13 +14,43 @@
 // sealed). A non-agent-bound token is refused (only welded agents have an agent inbox).
 
 import { Hono } from 'hono'
+import type { Context } from 'hono'
 import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { sendToRef, readAgentInbox } from './messages'
+import { verifySignedInboxRead } from '../fleet/signed-inbox'
 
 const MAX_BODY_BYTES = 8192
 
 export const inboxApp = new Hono<{ Bindings: Env }>()
+
+type ParsedBody = { ok: true; value: Record<string, unknown> } | { ok: false; status: 400 | 413; error: string }
+
+async function readJsonObjectCapped(c: Context<{ Bindings: Env }>): Promise<ParsedBody> {
+  const declaredLen = Number(c.req.header('content-length') ?? '0')
+  if (Number.isFinite(declaredLen) && declaredLen > MAX_BODY_BYTES) {
+    return { ok: false, status: 413, error: 'payload_too_large' }
+  }
+  let raw: string
+  try {
+    raw = await c.req.text()
+  } catch {
+    return { ok: false, status: 400, error: 'invalid_body' }
+  }
+  if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) {
+    return { ok: false, status: 413, error: 'payload_too_large' }
+  }
+  let body: unknown
+  try {
+    body = JSON.parse(raw)
+  } catch {
+    return { ok: false, status: 400, error: 'invalid_json' }
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, status: 400, error: 'invalid_body' }
+  }
+  return { ok: true, value: body as Record<string, unknown> }
+}
 
 // GET /api/inbox — read (and by default CONSUME) the authenticated agent's own inbox.
 inboxApp.get('/', async (c) => {
@@ -47,33 +77,47 @@ inboxApp.get('/', async (c) => {
   return c.json({ ok: true, messages: res.messages, remaining: res.remaining, consumed: !peek })
 })
 
+// POST /api/inbox/signed — read the signed agent's own inbox without a bearer token.
+//
+// This is the fleet-daemon path: the host proves possession of the registered
+// Ed25519 private key, and the worker resolves the target inbox strictly from
+// the signed agent_id. No request field can name some other recipient.
+inboxApp.post('/signed', async (c) => {
+  const parsed = await readJsonObjectCapped(c)
+  if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
+
+  const verified = await verifySignedInboxRead(c.env, parsed.value)
+  if (!verified.ok) {
+    return c.json({ error: verified.error, detail: verified.detail }, verified.status as 400 | 401 | 409)
+  }
+
+  const res = await readAgentInbox(c.env, {
+    agent: verified.agent_id,
+    peek: verified.peek,
+    limit: verified.limit,
+  })
+  if (!res.ok) {
+    if (res.reason === 'db_error') return c.json({ error: res.reason }, 500)
+    return c.json({ error: res.reason, detail: res.detail }, 400)
+  }
+  return c.json({
+    ok: true,
+    agent: verified.agent_id,
+    messages: res.messages,
+    remaining: res.remaining,
+    consumed: !verified.peek,
+  })
+})
+
 // POST /api/inbox/send — leave a message in another agent's inbox. Sender = the token's weld.
 inboxApp.post('/send', async (c) => {
   const id = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
   if (!id) return c.json({ error: 'unauthorized' }, 401)
   if (!id.boundAgentId) return c.json({ error: 'not_agent_bound' }, 403)
 
-  // size-cap before parse (byte budget — char count would let multibyte slip)
-  const declaredLen = Number(c.req.header('content-length') ?? '0')
-  if (Number.isFinite(declaredLen) && declaredLen > MAX_BODY_BYTES) {
-    return c.json({ error: 'payload_too_large' }, 413)
-  }
-  let raw: string
-  try {
-    raw = await c.req.text()
-  } catch {
-    return c.json({ error: 'invalid_body' }, 400)
-  }
-  if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) {
-    return c.json({ error: 'payload_too_large' }, 413)
-  }
-  let body: { to?: unknown; body?: unknown; kind?: unknown; request_id?: unknown; in_reply_to?: unknown }
-  try {
-    body = JSON.parse(raw)
-  } catch {
-    return c.json({ error: 'invalid_json' }, 400)
-  }
-  if (body === null || typeof body !== 'object') return c.json({ error: 'invalid_body' }, 400)
+  const parsed = await readJsonObjectCapped(c)
+  if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
+  const body = parsed.value as { to?: unknown; body?: unknown; kind?: unknown; request_id?: unknown; in_reply_to?: unknown }
 
   const to = typeof body.to === 'string' ? body.to : ''
   const text = typeof body.body === 'string' ? body.body : ''
