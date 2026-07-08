@@ -11,6 +11,44 @@ surgery. Substrate only: nothing here touches business content.
 - An OAuth app (Google or Telegram) for login — you'll need its client id +
   secret. Set the redirect/callback URI to `https://<your-deployment>/auth/callback`.
 
+## Local browser workflow smoke
+
+Use this before merging production-sensitive dashboard, task, auth, Hermes, or
+runtime changes. It runs against the local test Wrangler config and produces
+release evidence in `tmp/local-smoke`.
+
+```bash
+npm run migrate:local:test
+npm run seed:local:test
+npm run dev:local:test
+
+# in another shell, after Wrangler prints the local URL:
+npm run smoke:local
+```
+
+The harness uses `/auth/dev-login`, which is enabled only when
+`LOCAL_TEST_AUTH=1` in `wrangler-local-test.toml`. It verifies:
+
+- local owner login and unauthenticated dashboard redirect behavior
+- the authenticated dashboard route crawl
+- `/send` validation, task creation, `done_when`, lifecycle completion, and
+  visible result rendering
+- `/approvals` rejection validation and real verdict approval
+- Hermes `/im/webhook` help/status/task flows with `IM_WEBHOOK_SECRET`
+- dashboard refresh after a Hermes-created task
+
+Artifacts:
+
+- `tmp/local-smoke/home.png`
+- `tmp/local-smoke/fleet.png`
+- `tmp/local-smoke/send-workflow.png`
+- `tmp/local-smoke/approvals-workflow.png`
+- `tmp/local-smoke/hermes-dashboard-update.png`
+- `tmp/local-smoke/failure-*.png` when a workflow fails
+
+`npm run smoke:local` prints a JSON report containing the page crawl, workflow
+results, Hermes checks, runtime contract name, and artifact directory.
+
 ## One-time deploy (fork → deploy → log in)
 
 ```bash

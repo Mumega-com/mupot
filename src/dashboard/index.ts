@@ -3441,6 +3441,9 @@ function sendScript() {
           });
         }
         function fmtSecs(ms) { return Math.max(0, Math.round(ms / 1000)) + 's'; }
+        function shouldDispatch() {
+          return window.__MUPOT_SMOKE_DISABLE_DISPATCH === true ? false : true;
+        }
 
         async function poll(taskId, startedAt) {
           var deadline = startedAt + MAX_MS;
@@ -3499,7 +3502,14 @@ function sendScript() {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
               credentials: 'same-origin',
-              body: JSON.stringify({ squad_id: squadId, title: title, body: text, assignee_agent_id: agentId, dispatch: true })
+              body: JSON.stringify({
+                squad_id: squadId,
+                title: title,
+                done_when: 'The task result explains the completed work and names any follow-up needed.',
+                body: text,
+                assignee_agent_id: agentId,
+                dispatch: shouldDispatch()
+              })
             });
             if (res.status === 403) { status.textContent = 'You do not have permission to task that agent.'; return; }
             if (!res.ok) {

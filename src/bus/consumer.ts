@@ -88,7 +88,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<void> {
       // Terminal observations, gate decisions, and structural provisioning; no DO
       // wake by default. Log for the activity feed (the agent-actor branch in
       // handleQueue surfaces task.completed/blocked into the squad's bound channel).
-      console.error(`bus: ${event.type}`, {
+      console.log(`bus: ${event.type}`, {
         tenant: event.tenant,
         squad_id: event.squad_id,
       })
