@@ -8,10 +8,11 @@ import { chromium } from 'playwright'
 const baseUrl = (process.env.MUPOT_LOCAL_URL || process.argv[2] || 'http://127.0.0.1:8787').replace(/\/$/, '')
 const artifactsDir = path.resolve(process.env.MUPOT_SMOKE_ARTIFACTS || 'tmp/local-smoke')
 const runtimeContract = 'runtime-adapter/v1'
-const hermesLifecycle = 'Hermes IM task lifecycle: Telegram update -> IM webhook -> chat_id member mapping -> capability gate -> task.created -> reply'
+const hermesLifecycle = 'Hermes IM lifecycle: Telegram update -> IM webhook -> chat_id member mapping -> capability gate -> fleet/approval/task effect -> reply'
 const smokeRunId = new Date().toISOString().replace(/[:.]/g, '-')
 const sendTaskTitle = `Browser workflow smoke ${smokeRunId}`
 const approvalTaskTitle = `Approval workflow smoke ${smokeRunId}`
+const hermesApprovalTaskTitle = `Hermes approval smoke ${smokeRunId}`
 const hermesTaskTitle = `Hermes dashboard refresh ${smokeRunId}`
 
 const pages = [
@@ -233,6 +234,76 @@ async function runApprovalWorkflow() {
   })
 }
 
+async function postHermesMessage(hermes, msg) {
+  const res = await context.request.post(`${baseUrl}/im/webhook`, {
+    headers: {
+      'content-type': 'application/json',
+      'X-Telegram-Bot-Api-Secret-Token': 'local-im-secret',
+    },
+    data: { message: { chat: { id: 123456789 }, text: msg.text } },
+    timeout: 20_000,
+  })
+  const json = await res.json().catch(() => null)
+  hermes.push({ lifecycle: msg.lifecycle, text: msg.text, status: res.status(), json })
+  if (res.status() !== 200 || !json?.ok || !String(json.reply ?? '').includes(msg.expect)) {
+    fail(`Hermes smoke failed: ${msg.text}`, { status: res.status(), json, expected: msg.expect })
+  }
+  return json
+}
+
+async function runHermesApprovalWorkflow(hermes) {
+  const createResponse = await context.request.post(`${baseUrl}/api/tasks`, {
+    headers: { 'content-type': 'application/json' },
+    data: {
+      squad_id: 'sq-growth',
+      title: hermesApprovalTaskTitle,
+      done_when: 'Hermes approves this browser smoke task through the IM gate.',
+      body: 'Created by the local browser smoke harness to exercise IM approval parity.',
+      status: 'in_progress',
+      assignee_agent_id: 'agent-growth',
+      gate_owner: 'gate:local',
+    },
+    timeout: 20_000,
+  })
+  const created = await createResponse.json().catch(() => null)
+  const taskId = created?.task?.id
+  if (createResponse.status() !== 201 || typeof taskId !== 'string') {
+    fail('Hermes approval task create failed', { status: createResponse.status(), created })
+  }
+
+  const reviewResponse = await context.request.patch(`${baseUrl}/api/tasks/${encodeURIComponent(taskId)}`, {
+    headers: { 'content-type': 'application/json' },
+    data: { status: 'review' },
+    timeout: 20_000,
+  })
+  const reviewed = await reviewResponse.json().catch(() => null)
+  if (reviewResponse.status() !== 200 || reviewed?.task?.status !== 'review') {
+    fail('Hermes approval task did not enter review', { status: reviewResponse.status(), reviewed })
+  }
+
+  await postHermesMessage(hermes, {
+    lifecycle: 'Hermes IM approval lifecycle',
+    text: `approve ${taskId}`,
+    expect: `Approved "${hermesApprovalTaskTitle}".`,
+  })
+
+  const readResponse = await context.request.get(`${baseUrl}/api/tasks/${encodeURIComponent(taskId)}`, {
+    timeout: 20_000,
+  })
+  const read = await readResponse.json().catch(() => null)
+  if (readResponse.status() !== 200 || read?.task?.status !== 'approved') {
+    fail('Hermes-approved task did not persist approved status', { status: readResponse.status(), read })
+  }
+
+  workflows.push({
+    name: 'Hermes IM approval verdict',
+    status: 'passed',
+    taskId,
+    title: hermesApprovalTaskTitle,
+    verdict: 'approved',
+  })
+}
+
 try {
   const login = await page.goto(`${baseUrl}/auth/dev-login`, { waitUntil: 'networkidle', timeout: 20_000 })
   if (!login || login.status() >= 400) fail('dev login failed', { status: login?.status() })
@@ -263,20 +334,9 @@ try {
   await runApprovalWorkflow()
 
   const hermes = []
+  await runHermesApprovalWorkflow(hermes)
   for (const msg of hermesMessages) {
-    const res = await context.request.post(`${baseUrl}/im/webhook`, {
-      headers: {
-        'content-type': 'application/json',
-        'X-Telegram-Bot-Api-Secret-Token': 'local-im-secret',
-      },
-      data: { message: { chat: { id: 123456789 }, text: msg.text } },
-      timeout: 20_000,
-    })
-    const json = await res.json().catch(() => null)
-    hermes.push({ lifecycle: msg.lifecycle, text: msg.text, status: res.status(), json })
-    if (res.status() !== 200 || !json?.ok || !String(json.reply ?? '').includes(msg.expect)) {
-      fail(`Hermes smoke failed: ${msg.text}`, { status: res.status(), json, expected: msg.expect })
-    }
+    await postHermesMessage(hermes, msg)
   }
 
   await page.goto(`${baseUrl}/squads/sq-growth`, { waitUntil: 'networkidle', timeout: 20_000 })

@@ -40,6 +40,7 @@ wiring an existing, already-gated backend action to a new trigger.
 | `status` / `status <agent>` | who am I + my scopes / an agent's runtime | none (read, tenant-scoped) |
 | `wake <agent>` | wake an agent | `lead`+ on the agent's squad |
 | `fleet start\|stop\|restart\|status <agent>` | queue signed host-agent control | `owner` on the org |
+| `approve <id>` / `reject <id> <reason>` | approve or reject a pending gate task | task gate capability or org `admin`+ |
 | `task: <title> [@squad]` | create a task | member on the target scope |
 
 Plus Telegram already **receives** decision-gate notifications and brain directives (today via host
@@ -52,7 +53,6 @@ These exist in the dashboard but have no IM verb yet. Closing the gap = one new 
 
 | Backend surface | Dashboard today | Proposed IM verb | Gate |
 |---|---|---|---|
-| Approvals (`src/dashboard/approvals.ts`) | approve / reject a pending gate | `approve <id>` · `reject <id> <reason>` | the approval's required capability |
 | Human directive (`last_human_directive`) | brain reads it at decision position-0 | `directive: <text>` · `directive clear` | `owner` (org), **direct principal only** |
 
 ### Fleet from Telegram — rides the existing signed plane, unchanged trust root
@@ -114,12 +114,13 @@ seam; notifications (gates, heartbeats) are sent back into that same chat.
 
 1. **Done: `fleet <verb> <agent>`** — highest value, smallest surface; reuses the signer. Built as
    IM intent + handler + owner gate + signed `fleet-control.v1` delivery + local smoke coverage.
-2. **Next: `approve <id>` / `reject <id> <reason>`** — wire to the approval service; then inline-keyboard
-   buttons on the notification.
+2. **Done: `approve <id>` / `reject <id> <reason>`** — wired to the verdict store with the same
+   gate capability checks and `task.verdict` receipts as the dashboard. Inline-keyboard buttons on
+   the notification remain a UI refinement.
 3. **Next: `directive: <text>` / `directive clear`** — owner-direct write to `last_human_directive`,
    preserving the no-relay rule.
 4. **Unify the bot front-door** — converge notifications + control onto the single IM seam so the
    owner messages one place.
 
-Status: **fleet parity slice built; approvals, directives, and bot-front-door unification remain.**
+Status: **fleet and approval parity slices built; directives and bot-front-door unification remain.**
 The seam and signed fleet plane already exist — the remaining items are wiring slices, not new trust.

@@ -32,10 +32,11 @@ import type {
   BusEvent,
   Agent,
   Squad,
+  Task,
 } from '../types'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
-import { createTask } from '../tasks/service'
+import { createTask, writeVerdict, VerdictRaceError } from '../tasks/service'
 import { emitControlRequest } from '../fleet/control'
 import { CONTROL_VERBS, type ControlVerb } from '../fleet/control-request'
 import { listFleetAgents, type FleetAgentRow } from '../fleet/registry'
@@ -145,6 +146,7 @@ type Intent =
   | { kind: 'status'; ref: string | null }
   | { kind: 'wake'; ref: string }
   | { kind: 'fleet'; verb: ControlVerb; ref: string }
+  | { kind: 'verdict'; verdict: 'approved' | 'rejected'; ref: string; note: string | null }
   | { kind: 'task'; title: string; squadRef: string | null }
   | { kind: 'unknown' }
 
@@ -196,6 +198,18 @@ function parseIntent(text: string): Intent {
     return { kind: 'unknown' }
   }
 
+  // "approve <task-id> [note]" or "reject <task-id> <reason>"
+  const verdictMatch = trimmed.match(/^\/?(approve|reject)\s+([A-Za-z0-9_-]{6,64})(?:\s+(.+))?$/i)
+  if (verdictMatch) {
+    const note = verdictMatch[3]?.trim() || null
+    return {
+      kind: 'verdict',
+      verdict: verdictMatch[1].toLowerCase() === 'approve' ? 'approved' : 'rejected',
+      ref: verdictMatch[2],
+      note,
+    }
+  }
+
   // "task: <title>" (also tolerate "task <title>")
   const taskMatch = trimmed.match(/^\/?task\s*[:|-]?\s+(.+)$/i)
   if (taskMatch) {
@@ -209,7 +223,8 @@ function parseIntent(text: string): Intent {
 // ── reply copy (short, friendly, never leaks internals) ───────────────────────
 const HELP =
   'I can: "task: <title>" (optionally "@squad"), "status" or "status <agent>", ' +
-  '"wake <agent>", or "fleet start|stop|restart|status <agent>". I act as you, with your permissions.'
+  '"wake <agent>", "fleet start|stop|restart|status <agent>", "approve <task-id>", ' +
+  'or "reject <task-id> <reason>". I act as you, with your permissions.'
 
 const IM_TASK_DONE_WHEN =
   'A task result or linked artifact provides evidence that the requested IM task is complete.'
@@ -251,6 +266,9 @@ export async function handleImMessage(
 
     case 'fleet':
       return fleetReply(env, member, grants, intent.verb, intent.ref)
+
+    case 'verdict':
+      return verdictReply(env, member, grants, intent.verdict, intent.ref, intent.note)
 
     case 'task':
       return taskReply(env, member, grants, intent.title, intent.squadRef)
@@ -389,6 +407,128 @@ async function fleetReply(
   await createBus(env).emit(event)
 
   return `Queued fleet ${verb} for ${agent.display || agent.agent_id}.`
+}
+
+// ── intent: approval verdict (cap: gate_owner or org admin/owner) ────────────
+// Approval authority remains the same append-only gate store as the dashboard:
+// IM only resolves the member, checks access, then calls writeVerdict().
+function canBypassApprovalGate(grants: CapabilityGrant[]): boolean {
+  return hasCapability(grants, 'org', null, 'admin')
+}
+
+async function memberHasGateGrant(env: Env, memberId: string, capability: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM gate_grants
+      WHERE capability = ?1 AND principal_type = 'member' AND principal_id = ?2
+      LIMIT 1`,
+  )
+    .bind(capability, memberId)
+    .first<{ 1: number }>()
+  return row !== null
+}
+
+async function memberHasSurfaceGrant(
+  env: Env,
+  member: Member,
+  grants: CapabilityGrant[],
+  surface: string,
+): Promise<boolean> {
+  if (canBypassApprovalGate(grants)) return true
+  return memberHasGateGrant(env, member.id, surface)
+}
+
+function escapeLikePrefix(ref: string): string {
+  return ref.replace(/[\\%_]/g, (ch) => `\\${ch}`)
+}
+
+async function resolveTaskRef(env: Env, ref: string): Promise<Task | 'ambiguous' | null> {
+  const exact = await env.DB.prepare(
+    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at,
+            gate_owner, workflow_instance_id, created_at, updated_at
+       FROM tasks WHERE id = ?1 LIMIT 1`,
+  )
+    .bind(ref)
+    .first<Task>()
+  if (exact) return exact
+
+  // Telegram is awkward for UUIDs; allow a unique prefix once it is specific enough.
+  if (ref.length < 8) return null
+  const rows = await env.DB.prepare(
+    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at,
+            gate_owner, workflow_instance_id, created_at, updated_at
+       FROM tasks WHERE id LIKE ?1 ESCAPE '\\' ORDER BY created_at DESC LIMIT 2`,
+  )
+    .bind(`${escapeLikePrefix(ref)}%`)
+    .all<Task>()
+  const results = rows.results ?? []
+  if (results.length === 0) return null
+  if (results.length > 1) return 'ambiguous'
+  return results[0]
+}
+
+async function verdictReply(
+  env: Env,
+  member: Member,
+  grants: CapabilityGrant[],
+  verdict: 'approved' | 'rejected',
+  ref: string,
+  note: string | null,
+): Promise<string> {
+  if (verdict === 'rejected' && !note) {
+    return `Add a rejection reason: reject ${ref} <reason>.`
+  }
+
+  const task = await resolveTaskRef(env, ref)
+  if (task === 'ambiguous') return `More than one task matches "${ref}". Use the full task id.`
+  if (!task) return `No task named "${ref}" here.`
+
+  if (!(await canOnSquad(env, grants, task.squad_id, 'member'))) {
+    return `You don't have permission to decide that task (need member on its squad).`
+  }
+  if (!task.gate_owner) return `"${task.title}" has no approval gate.`
+  if (task.status !== 'review') return `"${task.title}" is ${task.status}, not waiting for approval.`
+
+  const hasGate =
+    canBypassApprovalGate(grants) || (await memberHasGateGrant(env, member.id, task.gate_owner))
+  if (!hasGate) {
+    return `You don't have permission to decide "${task.title}" (need ${task.gate_owner}).`
+  }
+
+  if (
+    task.gate_owner === 'gate:loops' &&
+    verdict === 'approved' &&
+    !(await memberHasSurfaceGrant(env, member, grants, 'outreach:send-gated'))
+  ) {
+    return `You don't have permission to approve "${task.title}" (need outreach:send-gated).`
+  }
+
+  if (member.id === task.assignee_agent_id) {
+    return `You can't decide "${task.title}" because you are the assignee.`
+  }
+
+  try {
+    await writeVerdict(
+      env,
+      { task, verdict, note, decidedBy: member.id },
+      memberActor(member.id),
+    )
+  } catch (err) {
+    if (err instanceof VerdictRaceError) {
+      return `"${task.title}" changed before I could record the verdict. Reload approvals and try again.`
+    }
+    throw err
+  }
+
+  if (task.workflow_instance_id && env.TASK_WORKFLOW) {
+    try {
+      const inst = await env.TASK_WORKFLOW.get(task.workflow_instance_id)
+      await inst.sendEvent({ type: 'gate-verdict', payload: { verdict } })
+    } catch {
+      // The verdict is already durable in D1; the workflow re-reads it on resume.
+    }
+  }
+
+  return verdict === 'approved' ? `Approved "${task.title}".` : `Rejected "${task.title}".`
 }
 
 // ── intent: task (cap: member+ on the target squad) ───────────────────────────

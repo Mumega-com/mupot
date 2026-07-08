@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest'
 import { handleImMessage } from '../src/im'
 import { verifyControlRequest } from '../src/fleet/control-request'
-import type { Env } from '../src/types'
+import type { Env, Task } from '../src/types'
 
 let panelPrivJwk = ''
 let panelPubJwk = ''
@@ -12,7 +12,12 @@ beforeAll(async () => {
   panelPubJwk = JSON.stringify(await crypto.subtle.exportKey('jwk', kp.publicKey))
 })
 
-function makeEnv(opts: { capability?: 'owner' | 'admin' | 'member' } = {}) {
+function makeEnv(opts: {
+  capability?: 'owner' | 'admin' | 'member'
+  gateGrants?: string[]
+  taskStatus?: Task['status']
+  taskGateOwner?: string | null
+} = {}) {
   const inserts: unknown[][] = []
   const busEvents: unknown[] = []
   const messages: Array<{
@@ -28,6 +33,7 @@ function makeEnv(opts: { capability?: 'owner' | 'admin' | 'member' } = {}) {
     in_reply_to: string | null
   }> = []
   const controlLog: unknown[][] = []
+  const verdicts: unknown[][] = []
   let seq = 0
 
   const member = {
@@ -64,6 +70,24 @@ function makeEnv(opts: { capability?: 'owner' | 'admin' | 'member' } = {}) {
       member_id: member.id,
     },
   ]
+  const tasks: Task[] = [
+    {
+      id: 'task-review-local',
+      squad_id: squad.id,
+      title: 'Review local approval task',
+      body: 'Seeded review task for IM approval.',
+      status: opts.taskStatus ?? 'review',
+      assignee_agent_id: 'agent-growth',
+      github_issue_url: null,
+      result: 'Draft result ready for approval.',
+      completed_at: null,
+      gate_owner: opts.taskGateOwner === undefined ? 'gate:local' : opts.taskGateOwner,
+      done_when: 'A reviewer approves or rejects this seeded local task.',
+      created_at: '2026-07-07T00:00:00.000Z',
+      updated_at: '2026-07-07T00:00:00.000Z',
+    },
+  ]
+  const gateGrants = opts.gateGrants ?? []
 
   const DB = {
     prepare(sql: string) {
@@ -73,6 +97,15 @@ function makeEnv(opts: { capability?: 'owner' | 'admin' | 'member' } = {}) {
             async first<T>() {
               if (sql.includes('FROM members') && sql.includes('telegram_chat_id')) return member as T
               if (sql.includes('SELECT department_id FROM squads')) return { department_id: squad.department_id } as T
+              if (sql.includes('FROM tasks') && sql.includes('WHERE id = ?1')) {
+                const [id] = args as [string]
+                return (tasks.find((task) => task.id === id) as T) ?? null as T | null
+              }
+              if (sql.includes('FROM gate_grants')) {
+                const [capability, principalId] = args as [string, string]
+                const ok = principalId === member.id && gateGrants.includes(capability)
+                return ok ? ({ 1: 1 } as T) : null as T | null
+              }
               if (sql.includes('FROM agent_messages') && sql.includes('from_agent = ?2 AND request_id = ?3')) {
                 const [tenant, fromAgent, requestId] = args as [string, string, string]
                 const found = messages.find(
@@ -95,10 +128,27 @@ function makeEnv(opts: { capability?: 'owner' | 'admin' | 'member' } = {}) {
               if (sql.includes('FROM capabilities')) return { results: grants } as { results: T[] }
               if (sql.includes('FROM squads') && sql.includes('slug = ?1')) return { results: [squad] } as { results: T[] }
               if (sql.includes('FROM fleet_agents')) return { results: fleetAgents } as { results: T[] }
+              if (sql.includes('FROM tasks') && sql.includes('id LIKE ?1')) {
+                const [pattern] = args as [string]
+                const prefix = pattern.replace(/%$/, '')
+                return { results: tasks.filter((task) => task.id.startsWith(prefix)).slice(0, 2) } as { results: T[] }
+              }
               return { results: [] } as { results: T[] }
             },
             async run() {
               if (sql.includes('INSERT INTO tasks')) inserts.push(args)
+              if (sql.includes('UPDATE tasks SET status = ?')) {
+                const [status, updatedAt, id] = args as [Task['status'], string, string]
+                const task = tasks.find((row) => row.id === id)
+                if (!task || task.status !== 'review') return { meta: { changes: 0 } }
+                task.status = status
+                task.updated_at = updatedAt
+                return { meta: { changes: 1 } }
+              }
+              if (sql.includes('INSERT INTO task_verdicts')) {
+                verdicts.push(args)
+                return { meta: { changes: 1 } }
+              }
               if (sql.includes('INSERT INTO agent_messages')) {
                 const [
                   id,
@@ -148,7 +198,7 @@ function makeEnv(opts: { capability?: 'owner' | 'admin' | 'member' } = {}) {
     },
   } as unknown as Env
 
-  return { env, inserts, busEvents, messages, controlLog }
+  return { env, inserts, busEvents, messages, controlLog, tasks, verdicts }
 }
 
 describe('Hermes IM control', () => {
@@ -211,5 +261,56 @@ describe('Hermes IM control', () => {
     expect(messages).toHaveLength(0)
     expect(controlLog).toHaveLength(0)
     expect(busEvents).toHaveLength(0)
+  })
+
+  it('approves a review task from an owner IM command', async () => {
+    const { env, tasks, verdicts, busEvents } = makeEnv()
+
+    const reply = await handleImMessage(env, 123456789, 'approve task-review-local')
+
+    expect(reply).toBe('Approved "Review local approval task".')
+    expect(tasks[0].status).toBe('approved')
+    expect(verdicts).toHaveLength(1)
+    expect(verdicts[0][1]).toBe('task-review-local')
+    expect(verdicts[0][2]).toBe('approved')
+    expect(verdicts[0][4]).toBe('mbr-hermes-user')
+    expect(busEvents).toContainEqual(
+      expect.objectContaining({
+        type: 'task.verdict',
+        tenant: 'local',
+        squad_id: 'sq-growth',
+        actor: { kind: 'member', id: 'mbr-hermes-user' },
+      }),
+    )
+  })
+
+  it('allows delegated gate grants to approve from IM', async () => {
+    const { env, tasks, verdicts } = makeEnv({ capability: 'member', gateGrants: ['gate:local'] })
+
+    const reply = await handleImMessage(env, 123456789, 'approve task-review')
+
+    expect(reply).toBe('Approved "Review local approval task".')
+    expect(tasks[0].status).toBe('approved')
+    expect(verdicts).toHaveLength(1)
+  })
+
+  it('refuses IM approval without the task gate grant', async () => {
+    const { env, tasks, verdicts } = makeEnv({ capability: 'member' })
+
+    const reply = await handleImMessage(env, 123456789, 'approve task-review-local')
+
+    expect(reply).toBe('You don\'t have permission to decide "Review local approval task" (need gate:local).')
+    expect(tasks[0].status).toBe('review')
+    expect(verdicts).toHaveLength(0)
+  })
+
+  it('requires a rejection reason from IM', async () => {
+    const { env, tasks, verdicts } = makeEnv()
+
+    const reply = await handleImMessage(env, 123456789, 'reject task-review-local')
+
+    expect(reply).toBe('Add a rejection reason: reject task-review-local <reason>.')
+    expect(tasks[0].status).toBe('review')
+    expect(verdicts).toHaveLength(0)
   })
 })
