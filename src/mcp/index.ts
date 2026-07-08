@@ -35,6 +35,7 @@ import type {
   Task,
 } from '../types'
 import { resolveCapabilities, hasCapability, holdsCapabilityFloor } from '../auth/capability'
+import { isChannel } from '../members/service'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import {
@@ -103,8 +104,13 @@ async function resolveAuth(c: {
         // So we treat the injected blob as an IDENTITY assertion only and always
         // re-derive capabilities server-side, ignoring whatever the blob claims —
         // same ceiling rule as buildAuthContextFromProps itself, applied again here.
-        auth.capabilities = auth.channel === 'directory' ? [] : await resolveCapabilities(c.env, auth.userId)
-        if (auth.channel === 'directory') auth.boundAgentId = null
+        // isChannel (not a raw !== 'directory' check) mirrors buildAuthContextFromProps'
+        // own normalization exactly: only a KNOWN non-directory channel (workspace/im/
+        // dashboard) earns real caps — missing/garbage channel fails closed to [], same
+        // as the producer, so the two ceilings can never diverge on a malformed blob.
+        const knownNonDirectory = isChannel(auth.channel)
+        auth.capabilities = knownNonDirectory ? await resolveCapabilities(c.env, auth.userId) : []
+        if (!knownNonDirectory) auth.boundAgentId = null
         return auth
       }
     } catch {
