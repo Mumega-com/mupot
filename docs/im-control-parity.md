@@ -68,6 +68,11 @@ calls the **same** internal signer that `POST /fleet/host-control` calls. The ho
 the trust root (`FLEET_PANEL_SK`) and the verification path are identical. Telegram becomes another
 authenticated trigger of an already-safe action.
 
+Fleet IM replies also include the same narrow runtime view used by `/fleet`: derived Mupot
+presence, stored lifecycle intent, and last-seen time. The host-side `fleet status` request is
+still queued through `fleet-control.v1`; the immediate chat context is Mupot's current view, not
+member identity or capability data.
+
 ### Approvals from Telegram — close the loop that already half-exists
 
 Telegram already *receives* gate notifications. Parity means *acting* on them by reply: `approve <id>`
@@ -115,7 +120,8 @@ seam; notifications (gates, heartbeats) are sent back into that same chat.
 ## Build sequence (each slice dyad-gated Opus + codex1, on a PR; deploy is owner-go)
 
 1. **Done: `fleet <verb> <agent>`** — highest value, smallest surface; reuses the signer. Built as
-   IM intent + handler + owner gate + signed `fleet-control.v1` delivery + local smoke coverage.
+   IM intent + handler + owner gate + signed `fleet-control.v1` delivery, narrow runtime-context
+   replies, and local smoke coverage.
 2. **Done: `approve <id>` / `reject <id> <reason>`** — wired to the verdict store with the same
    gate capability checks and `task.verdict` receipts as the dashboard. Inline-keyboard buttons on
    the notification remain a UI refinement.

@@ -247,7 +247,9 @@ describe('Hermes IM control', () => {
 
     const reply = await handleImMessage(env, 123456789, 'fleet status hermes')
 
-    expect(reply).toBe('Queued fleet status for Hermes Local Relay.')
+    expect(reply).toBe('Queued fleet status for Hermes Local Relay. Mupot sees presence stale, intent running, last seen 2026-07-07 00:00:00.')
+    expect(reply).not.toContain('mbr-hermes-user')
+    expect(reply).not.toContain('owner@org')
     expect(messages).toHaveLength(1)
     expect(messages[0]).toMatchObject({
       to_agent: 'agent-conformance',

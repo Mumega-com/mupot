@@ -39,7 +39,7 @@ import { createBus } from '../bus'
 import { createTask, writeVerdict, VerdictRaceError } from '../tasks/service'
 import { emitControlRequest } from '../fleet/control'
 import { CONTROL_VERBS, type ControlVerb } from '../fleet/control-request'
-import { listFleetAgents, type FleetAgentRow } from '../fleet/registry'
+import { listFleetAgentRuntimeView, type FleetAgentRuntimeView } from '../fleet/registry'
 import {
   clearHumanDirective,
   HUMAN_DIRECTIVE_KEY,
@@ -381,11 +381,11 @@ function canControlFleet(grants: CapabilityGrant[]): boolean {
   return hasCapability(grants, 'org', null, 'owner')
 }
 
-async function resolveFleetAgent(env: Env, ref: string): Promise<FleetAgentRow | 'ambiguous' | null> {
+async function resolveFleetAgent(env: Env, ref: string): Promise<FleetAgentRuntimeView | 'ambiguous' | null> {
   const needle = ref.trim().toLowerCase()
   if (!needle) return null
 
-  const rows = await listFleetAgents(env)
+  const rows = await listFleetAgentRuntimeView(env)
   const exact = rows.filter(
     (row) => row.agent_id.toLowerCase() === needle || row.display.toLowerCase() === needle,
   )
@@ -397,6 +397,15 @@ async function resolveFleetAgent(env: Env, ref: string): Promise<FleetAgentRow |
   if (prefixed.length > 1) return 'ambiguous'
 
   return null
+}
+
+function fleetAgentLabel(agent: FleetAgentRuntimeView): string {
+  return agent.display || agent.agent_id
+}
+
+function fleetRuntimeContext(agent: FleetAgentRuntimeView): string {
+  const lastSeen = agent.last_seen || 'unknown'
+  return `Mupot sees presence ${agent.presence}, intent ${agent.status}, last seen ${lastSeen}.`
 }
 
 async function fleetReply(
@@ -425,8 +434,8 @@ async function fleetReply(
   )
   if (!res.ok) {
     if (res.reason === 'unconfigured') return 'Fleet control is not configured here yet.'
-    if (res.reason === 'invalid_input') return `I couldn't queue fleet ${verb} for ${agent.display || agent.agent_id}: ${res.detail ?? 'invalid request'}.`
-    return `Fleet control request for ${agent.display || agent.agent_id} could not be delivered.`
+    if (res.reason === 'invalid_input') return `I couldn't queue fleet ${verb} for ${fleetAgentLabel(agent)}: ${res.detail ?? 'invalid request'}.`
+    return `Fleet control request for ${fleetAgentLabel(agent)} could not be delivered.`
   }
 
   const now = new Date().toISOString()
@@ -440,7 +449,7 @@ async function fleetReply(
   }
   await createBus(env).emit(event)
 
-  return `Queued fleet ${verb} for ${agent.display || agent.agent_id}.`
+  return `Queued fleet ${verb} for ${fleetAgentLabel(agent)}. ${fleetRuntimeContext(agent)}`
 }
 
 // ── intent: approval verdict (cap: gate_owner or org admin/owner) ────────────
