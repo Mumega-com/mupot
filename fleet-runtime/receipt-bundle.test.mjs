@@ -260,6 +260,8 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
   assert.equal(readFileSync(manifestPath, 'utf8'), before)
   assert.ok(check.checks.some((c) => c.check === 'manifest_status_matches_checks' && c.ok === true))
   assert.ok(check.checks.some((c) => c.check === 'manifest_summary_matches_checks' && c.ok === true))
+  assert.ok(check.checks.some((c) => c.check === 'next_steps_attach_when_ready' && c.ready === true && c.ok === true))
+  assert.ok(check.checks.some((c) => c.check === 'next_steps_no_hold_when_ready' && c.ready === true && c.ok === true))
   assert.ok(check.checks.some((c) =>
     c.check === 'artifact_sha256_match' &&
     c.artifact === 'host' &&
@@ -316,6 +318,51 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
     c.checked_path === join(copiedDir, 'host.json') &&
     c.ok === false &&
     c.expected !== c.actual
+  ))
+  assert.ok(drift.checks.some((c) =>
+    c.check === 'next_steps_no_attach_when_not_ready' &&
+    c.ready === false &&
+    c.ok === false
+  ))
+  assert.ok(drift.checks.some((c) =>
+    c.check === 'next_steps_hold_when_not_ready' &&
+    c.ready === false &&
+    c.ok === false
+  ))
+})
+
+test('manifest check fails when next_steps contradict readiness', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+  await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+  })
+
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.next_steps = ['do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass']
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ manifestPath })
+
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((c) =>
+    c.check === 'next_steps_attach_when_ready' &&
+    c.ready === true &&
+    c.ok === false
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'next_steps_no_hold_when_ready' &&
+    c.ready === true &&
+    c.ok === false
   ))
 })
 

@@ -458,8 +458,9 @@ reads `manifest.json`, checks the recorded receipt artifact SHA-256 hashes, read
 each saved receipt JSON, verifies receipt type/status against the manifest,
 requires the host/runtime/control/cutover-gate evidence categories, recomputes
 the manifest summary from its recorded checks, verifies the cutover gate was
-built for the manifest's selected agents/control verbs/artifacts, and exits
-non-zero if any saved file or manifest status drifted:
+built for the manifest's selected agents/control verbs/artifacts, verifies
+`next_steps` does not contradict readiness, and exits non-zero if any saved
+file or manifest status drifted:
 
 ```bash
 node ~/.fleet/runtime/receipt-bundle.mjs \
@@ -487,11 +488,14 @@ inside itself because that file is self-referential. The manifest check emits
 requires the host, probe, runtime, control, and cutover-gate receipts to be
 `status:"pass"`. It also requires a runtime artifact for each selected agent.
 The check receipt includes the SHA-256 of the `manifest.json` file it inspected
-and compares `cutover-gate.json.inputs` back to the manifest evidence.
+and compares `cutover-gate.json.inputs` back to the manifest evidence. It also
+rejects advisory `next_steps` guidance that says to attach the bundle before the
+hard gate passes, or says to keep SOS wiring after the hard gate passes.
 
 Every bundle manifest also includes `next_steps`. Treat those as operator
 guidance only: the hard gate remains `manifest.json` and `cutover-gate.json`
-both reporting `status: "pass"`.
+both reporting `status: "pass"`, and `--check-manifest` enforces that the
+advisory guidance does not contradict that state.
 
 ## Notes
 - `interval_sec` is clamped to `[15,120]` and must stay under the pot's presence TTL (default 180s).

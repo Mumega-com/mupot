@@ -24,6 +24,9 @@ const EXPECTED = {
   cutover_gate: 'mupot-sos-cutover-gate/v1',
 }
 
+const NEXT_STEP_ATTACH = 'attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)'
+const NEXT_STEP_HOLD = 'do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass'
+
 const CONTROL_VERBS = new Set(['start', 'stop', 'restart'])
 
 function expandHome(path) {
@@ -257,6 +260,50 @@ function sameSummary(actual, expected) {
     actual?.warnings === expected?.warnings
 }
 
+function nextSteps(manifest) {
+  return Array.isArray(manifest?.next_steps) ? manifest.next_steps.filter((step) => typeof step === 'string') : []
+}
+
+function addNextStepChecks(checks, manifestPath, manifest, hardGateSummary) {
+  const steps = nextSteps(manifest)
+  const ready = hardGateSummary?.status === 'pass'
+  checks.push({
+    ok: Array.isArray(manifest?.next_steps),
+    component: 'receipt-bundle-check',
+    check: 'next_steps_present',
+    path: manifestPath,
+    count: steps.length,
+  })
+  checks.push({
+    ok: !ready || steps.includes(NEXT_STEP_ATTACH),
+    component: 'receipt-bundle-check',
+    check: 'next_steps_attach_when_ready',
+    path: manifestPath,
+    ready,
+  })
+  checks.push({
+    ok: ready || !steps.includes(NEXT_STEP_ATTACH),
+    component: 'receipt-bundle-check',
+    check: 'next_steps_no_attach_when_not_ready',
+    path: manifestPath,
+    ready,
+  })
+  checks.push({
+    ok: ready || steps.includes(NEXT_STEP_HOLD),
+    component: 'receipt-bundle-check',
+    check: 'next_steps_hold_when_not_ready',
+    path: manifestPath,
+    ready,
+  })
+  checks.push({
+    ok: !ready || !steps.includes(NEXT_STEP_HOLD),
+    component: 'receipt-bundle-check',
+    check: 'next_steps_no_hold_when_ready',
+    path: manifestPath,
+    ready,
+  })
+}
+
 function manifestAgents(manifest) {
   return Array.isArray(manifest?.inputs?.agents) ? manifest.inputs.agents.filter(Boolean) : []
 }
@@ -472,7 +519,6 @@ function checkBundleManifest(opts = {}) {
       expected: computedManifestSummary,
       actual: manifest.summary ?? null,
     })
-
     const entries = bundleArtifactEntries(manifest)
     const agents = manifestAgents(manifest)
     checks.push({
@@ -574,6 +620,8 @@ function checkBundleManifest(opts = {}) {
         addCutoverGateConsistencyChecks(checks, manifestPath, manifest, entries, receipt)
       }
     }
+
+    addNextStepChecks(checks, manifestPath, manifest, summarize(checks))
   }
 
   const summary = summarize(checks)
@@ -828,11 +876,11 @@ function buildNextSteps({ artifacts, agents, gateReceipt, outDir, bundleStatus }
   }
 
   if (bundleStatus !== 'pass' || gateReceipt?.status !== 'pass') {
-    add('do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass')
+    add(NEXT_STEP_HOLD)
   }
 
   if (bundleStatus === 'pass' && gateReceipt?.status === 'pass') {
-    add('attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)')
+    add(NEXT_STEP_ATTACH)
   }
 
   return steps
