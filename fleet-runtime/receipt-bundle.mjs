@@ -28,6 +28,16 @@ const NEXT_STEP_ATTACH = 'attach manifest.json and cutover-gate.json to the cuto
 const NEXT_STEP_HOLD = 'do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass'
 
 const CONTROL_VERBS = new Set(['start', 'stop', 'restart'])
+const SECRET_VALUE_PATTERNS = [
+  ['private_pem', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
+  ['bearer_token', /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/i],
+  ['mupot_token', /\bmupot_[A-Za-z0-9._-]{12,}\b/],
+  ['openai_api_key', /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/],
+  ['github_token', /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b/],
+  ['jwt', /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/],
+]
+const SECRET_FIELD_RE = /(?:^|[_-])(authorization|bearer|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|api[_-]?key|private[_-]?key|client[_-]?secret|cookie)(?:$|[_-])/i
+const SECRET_REFERENCE_FIELD_RE = /(?:^|[_-])(env|name|ref|path|file|id)$/i
 
 function expandHome(path) {
   return typeof path === 'string' && path.startsWith('~/') ? join(homedir(), path.slice(2)) : path
@@ -183,6 +193,90 @@ function readReceipt(path) {
   } catch {
     return null
   }
+}
+
+function normalizeFieldName(key) {
+  return String(key)
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[^A-Za-z0-9]+/g, '_')
+    .toLowerCase()
+}
+
+function isSecretReferenceField(key) {
+  const normalized = normalizeFieldName(key)
+  return normalized.split('_').some((part) => SECRET_REFERENCE_FIELD_RE.test(part)) &&
+    /(token|secret|private_key|api_key|password|authorization|bearer|cookie)/i.test(normalized)
+}
+
+function isSafeReferenceValue(value) {
+  const raw = String(value).trim()
+  return raw.length === 0 ||
+    /^<[^>]+>$/.test(raw) ||
+    /^\$\{[A-Z0-9_]+\}$/.test(raw) ||
+    /^(redacted|\[redacted\]|placeholder|changeme|change-me)$/i.test(raw) ||
+    (/^[A-Z][A-Z0-9_]{2,}$/.test(raw) && /(TOKEN|SECRET|KEY|AUTH|PASS|COOKIE)/.test(raw))
+}
+
+function fieldLooksSecret(key) {
+  const normalized = normalizeFieldName(key)
+  return SECRET_FIELD_RE.test(normalized) && !isSecretReferenceField(normalized)
+}
+
+function jsonPath(parent, key) {
+  if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(String(key))) return `${parent}.${key}`
+  return `${parent}[${JSON.stringify(String(key))}]`
+}
+
+function addSecretFinding(findings, finding) {
+  const key = `${finding.path}:${finding.reason}`
+  if (findings.some((existing) => `${existing.path}:${existing.reason}` === key)) return
+  findings.push(finding)
+}
+
+function findSecretMaterial(value, path = '$', findings = []) {
+  if (typeof value === 'string') {
+    for (const [reason, pattern] of SECRET_VALUE_PATTERNS) {
+      if (pattern.test(value)) addSecretFinding(findings, { path, reason })
+    }
+    return findings
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => findSecretMaterial(item, `${path}[${index}]`, findings))
+    return findings
+  }
+  if (!value || typeof value !== 'object') return findings
+
+  if (typeof value.kty === 'string' && typeof value.d === 'string') {
+    addSecretFinding(findings, { path: jsonPath(path, 'd'), reason: 'jwk_private_key' })
+  }
+
+  for (const [key, item] of Object.entries(value)) {
+    const childPath = jsonPath(path, key)
+    if (typeof item === 'string' && fieldLooksSecret(key) && !isSafeReferenceValue(item)) {
+      addSecretFinding(findings, { path: childPath, reason: 'secret_named_field', field: key })
+    }
+    findSecretMaterial(item, childPath, findings)
+  }
+  return findings
+}
+
+function secretFindingSummary(findings) {
+  return findings.slice(0, 20).map((finding) => ({
+    path: finding.path,
+    reason: finding.reason,
+    ...(finding.field ? { field: finding.field } : {}),
+  }))
+}
+
+function secretScanChecks(manifestCheck) {
+  return (manifestCheck?.checks ?? []).filter((check) =>
+    check?.check === 'manifest_no_secret_material' ||
+    check?.check === 'artifact_no_secret_material'
+  )
+}
+
+function hasSecretScanFailures(manifestCheck) {
+  return secretScanChecks(manifestCheck).some((check) => check.ok === false)
 }
 
 function fileSha256(path) {
@@ -653,6 +747,15 @@ function checkBundleManifest(opts = {}) {
       expected: computedManifestSummary,
       actual: manifest.summary ?? null,
     })
+    const manifestSecretFindings = findSecretMaterial(manifest)
+    checks.push({
+      ok: manifestSecretFindings.length === 0,
+      component: 'receipt-bundle-check',
+      check: 'manifest_no_secret_material',
+      path: manifestPath,
+      findings: secretFindingSummary(manifestSecretFindings),
+      finding_count: manifestSecretFindings.length,
+    })
     const entries = bundleArtifactEntries(manifest)
     const agents = manifestAgents(manifest)
     const receiptRecords = []
@@ -751,6 +854,17 @@ function checkBundleManifest(opts = {}) {
         checked_path: checkedPath || null,
         actual: receipt?.status ?? null,
         accepted: entry.label === 'install' ? ['pass', 'warn'] : ['pass'],
+      })
+      const secretFindings = receipt ? findSecretMaterial(receipt) : []
+      checks.push({
+        ok: receipt ? secretFindings.length === 0 : null,
+        component: 'receipt-bundle-check',
+        check: 'artifact_no_secret_material',
+        artifact: entry.label,
+        declared_path: entry.path ?? null,
+        checked_path: checkedPath || null,
+        findings: secretFindingSummary(secretFindings),
+        finding_count: secretFindings.length,
       })
       if (entry.label === 'cutover_gate' && receipt) {
         addCutoverGateConsistencyChecks(checks, manifestPath, manifest, entries, receipt)
@@ -902,6 +1016,9 @@ function addHostGoStatusNextSteps(steps, { outDir, artifacts, agents, gateReceip
   if (artifacts.manifest?.status === 'pass' && manifestCheck?.status !== 'pass') {
     add('run receipt-bundle.mjs --check-manifest --out-dir <bundle> and fix any copied-bundle drift')
   }
+  if (hasSecretScanFailures(manifestCheck)) {
+    add('remove or redact secret material from receipt JSON, rerun receipt-bundle --verify-only, then rerun --check-manifest before attaching evidence')
+  }
   return steps
 }
 
@@ -983,6 +1100,12 @@ function inspectBundleStatus(opts = {}) {
   statusCheck(checks, 'manifest_check_pass', manifestCheck?.status === 'pass', {
     path: manifestPath || null,
     status: manifestCheck?.status ?? null,
+  })
+  const manifestSecretChecks = secretScanChecks(manifestCheck)
+  statusCheck(checks, 'copied_bundle_no_secret_material', manifestCheck ? manifestSecretChecks.length > 0 && manifestSecretChecks.every((check) => check.ok === true) : null, {
+    path: manifestPath || null,
+    failed: manifestSecretChecks.filter((check) => check.ok === false).length,
+    warnings: manifestSecretChecks.filter((check) => check.ok === null).length,
   })
 
   const summary = summarize(checks)

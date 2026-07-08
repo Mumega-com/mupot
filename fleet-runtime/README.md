@@ -484,8 +484,11 @@ requires the host/probe/runtime/control/cutover-gate evidence categories,
 recomputes the manifest summary from its recorded checks, verifies the cutover
 gate was built for the manifest's selected agents/control verbs/artifacts,
 verifies all non-secret receipt target identities agree on the same pot base URL
-and tenant, verifies `next_steps` does not contradict readiness, and exits
-non-zero if any saved file or manifest status drifted:
+and tenant, scans the manifest and receipt artifacts for obvious secret material
+such as bearer tokens, raw `mupot_` tokens, private-key PEM/JWK data, GitHub
+tokens, or authorization fields, verifies `next_steps` does not contradict
+readiness, and exits non-zero if any saved file, manifest status, or attachable
+evidence safety check drifted:
 
 ```bash
 node ~/.fleet/runtime/receipt-bundle.mjs \
@@ -518,7 +521,8 @@ and compares `cutover-gate.json.inputs` back to the manifest evidence. It
 rejects copied evidence that mixes receipts from different pot base URLs or
 tenants. It also rejects advisory `next_steps` guidance that says to attach the
 bundle before the hard gate passes, or says to keep SOS wiring after the hard
-gate passes.
+gate passes. Secret-scan findings include only the JSON path and reason; they do
+not echo the suspected secret value.
 
 Every bundle manifest also includes `next_steps`. Treat those as operator
 guidance only: the hard gate remains `manifest.json` and `cutover-gate.json`

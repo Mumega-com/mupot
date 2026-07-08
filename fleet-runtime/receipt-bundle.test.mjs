@@ -383,6 +383,59 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
   ))
 })
 
+test('manifest check fails when copied bundle contains secret material', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+  await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+  })
+
+  const rawSecret = 'Bearer mupot_host_secret_abcdefghijklmnopqrstuvwxyz'
+  const runtimePath = join(outDir, 'runtime-agent-one.json')
+  const runtime = JSON.parse(readFileSync(runtimePath, 'utf8'))
+  runtime.leaked = {
+    authorization: rawSecret,
+    privateKey: { kty: 'OKP', d: 'private-scalar' },
+  }
+  writeJson(runtimePath, runtime)
+
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.runtimes[0].sha256 = sha256(runtimePath)
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ manifestPath })
+
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((c) =>
+    c.check === 'artifact_no_secret_material' &&
+    c.artifact === 'runtime:1' &&
+    c.ok === false &&
+    c.finding_count >= 2 &&
+    c.findings.some((finding) => finding.reason === 'bearer_token') &&
+    c.findings.some((finding) => finding.reason === 'jwk_private_key')
+  ))
+  assert.equal(JSON.stringify(check).includes(rawSecret), false)
+
+  const status = inspectBundleStatus({ outDir, agents: ['agent-one'] })
+  assert.equal(status.status, 'fail')
+  assert.ok(status.checks.some((c) =>
+    c.check === 'copied_bundle_no_secret_material' &&
+    c.ok === false &&
+    c.failed > 0
+  ))
+  assert.ok(status.next_steps.some((step) => step.includes('redact secret material')))
+})
+
 test('status reports a complete host-go bundle as pass', async () => {
   const outDir = tmpDir()
   const installPath = writeJson(join(tmpDir(), 'install.json'), installReceipt())
@@ -411,6 +464,7 @@ test('status reports a complete host-go bundle as pass', async () => {
   assert.equal(status.artifacts.install.receipt_type, 'mupot-fleet-install-receipt/v1')
   assert.equal(status.artifacts.cutover_gate.status, 'pass')
   assert.ok(status.checks.some((c) => c.check === 'manifest_check_pass' && c.ok === true))
+  assert.ok(status.checks.some((c) => c.check === 'copied_bundle_no_secret_material' && c.ok === true))
   assert.ok(status.next_steps.some((s) => s.includes('SOS removal is permitted only for the proven agent')))
 })
 
