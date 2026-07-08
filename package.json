@@ -15,6 +15,7 @@
     "seed:local:test": "wrangler d1 execute mupot-local-test --local --config wrangler-local-test.toml --file scripts/local-test-seed.sql",
     "smoke:local": "node scripts/local-browser-smoke.mjs",
     "receipt:host": "node fleet-runtime/host-receipt.mjs",
+    "receipt:runtime": "node fleet-runtime/runtime-receipt.mjs",
     "migrate:remote": "wrangler d1 migrations apply mupot --remote",
     "update": "node scripts/mupot-update.mjs"
   },

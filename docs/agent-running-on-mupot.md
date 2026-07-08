@@ -127,14 +127,15 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
 2. Lifecycle controlled via mupot — ⛏ partial (signed attach/detach and Worker
    control requests exist; host control daemon now verifies requests and runs
    `flight.mjs open|close`, and `host-receipt.mjs` can pre-flight local host
-   wiring; live host install/receipt remains).
+   wiring; live host install/control receipt remains).
 3. Coordinates via the reflected bus — ⛏ partial (`agent_messages` inbox and signed
    daemon read are built; `inbox-handler.mjs` provides durable host handoff;
-   `host-receipt.mjs` checks handler coverage; runtime hook rollout still needs
-   host/operator wiring).
+   `host-receipt.mjs` checks handler coverage; `runtime-receipt.mjs` can now
+   prove one live signed attach + signed inbox handoff cycle; runtime hook
+   rollout still needs host/operator wiring).
 4. Runtime binding reports presence + swappable — ⛏ partial (fleet daemon code now
    heartbeats, drains signed inbox, and signed-detaches on shutdown; live host
-   install/receipt remains).
+   install plus live `runtime-receipt.mjs` evidence remains).
 5. SOS retired — ⬜ not yet.
 
 ### Punch-list to LIVE
@@ -142,7 +143,8 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
 1. Presence/heartbeat: TTL column; registry computes running/stale/stopped from last-ping.
 2. Fleet daemon (host): boot-attach all managed agents, re-attach on drop, heartbeat, drain
    inbox, detach on stop; systemd user unit. ✅ branch implementation plus
-   `host-receipt.mjs`; install + receipt = Hadi host-go.
+   `host-receipt.mjs` and `runtime-receipt.mjs`; install + host receipt + live
+   runtime receipt = Hadi host-go.
 
 **Phase 2 — lifecycle control (open/close from mupot)**
 3. open/close API: signed control-request → daemon starts/kills the agent's runtime.

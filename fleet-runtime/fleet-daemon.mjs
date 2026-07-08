@@ -132,20 +132,23 @@ export function runInboxCommand(cmd, payload, timeoutMs = INBOX_COMMAND_TIMEOUT_
   })
 }
 
-async function drainInbox(cfg, agent, key) {
-  if (!agent.inbox) return
-  const peek = await signedInbox(cfg.baseUrl, agent.agent_id, {
+export async function drainInbox(cfg, agent, key, opts = {}) {
+  if (!agent.inbox) return { agent: agent.agent_id, ok: null, action: 'inbox_not_configured', messages: 0, consumed: false }
+  const signedInboxFn = opts.signedInbox ?? signedInbox
+  const runInboxCommandFn = opts.runInboxCommand ?? runInboxCommand
+  const logFn = opts.log ?? log
+  const peek = await signedInboxFn(cfg.baseUrl, agent.agent_id, {
     tenant: cfg.tenant,
     privKey: key,
     peek: true,
     limit: agent.inbox.limit,
   })
   if (!peek.ok) {
-    log({ agent: agent.agent_id, action: 'inbox_peek_fail', status: peek.status })
-    return
+    logFn({ agent: agent.agent_id, action: 'inbox_peek_fail', status: peek.status })
+    return { agent: agent.agent_id, ok: false, action: 'inbox_peek_fail', status: peek.status, messages: 0, consumed: false }
   }
   const messages = Array.isArray(peek.json?.messages) ? peek.json.messages : []
-  if (messages.length === 0) return
+  if (messages.length === 0) return { agent: agent.agent_id, ok: true, action: 'inbox_empty', status: peek.status, messages: 0, remaining: Number(peek.json?.remaining ?? 0), consumed: false }
 
   const payload = JSON.stringify({
     tenant: cfg.tenant,
@@ -154,24 +157,33 @@ async function drainInbox(cfg, agent, key) {
     messages,
     remaining: Number(peek.json?.remaining ?? 0),
   }) + '\n'
-  const delivered = await runInboxCommand(agent.inbox.command, payload)
+  const delivered = await runInboxCommandFn(agent.inbox.command, payload)
   if (!delivered) {
-    log({ agent: agent.agent_id, action: 'inbox_handler_fail', messages: messages.length })
-    return
+    logFn({ agent: agent.agent_id, action: 'inbox_handler_fail', messages: messages.length })
+    return { agent: agent.agent_id, ok: false, action: 'inbox_handler_fail', status: peek.status, messages: messages.length, consumed: false }
   }
 
-  const consume = await signedInbox(cfg.baseUrl, agent.agent_id, {
+  const consume = await signedInboxFn(cfg.baseUrl, agent.agent_id, {
     tenant: cfg.tenant,
     privKey: key,
     peek: false,
     limit: messages.length,
   })
-  log({
+  logFn({
     agent: agent.agent_id,
     action: consume.ok ? 'inbox_consumed' : 'inbox_consume_fail',
     status: consume.status,
     messages: consume.ok && Array.isArray(consume.json?.messages) ? consume.json.messages.length : messages.length,
   })
+  return {
+    agent: agent.agent_id,
+    ok: consume.ok,
+    action: consume.ok ? 'inbox_consumed' : 'inbox_consume_fail',
+    status: consume.status,
+    messages: consume.ok && Array.isArray(consume.json?.messages) ? consume.json.messages.length : messages.length,
+    remaining: Number(peek.json?.remaining ?? 0),
+    consumed: consume.ok,
+  }
 }
 
 export async function detachAgents(cfg, keys, liveAgents, detachFn = signedDetach) {
@@ -194,23 +206,46 @@ export async function detachAgents(cfg, keys, liveAgents, detachFn = signedDetac
   return results
 }
 
-async function tick(cfg, keys, liveAgents) {
+export async function runDaemonOnce(cfg, keys, liveAgents = new Set(), opts = {}) {
+  const runProbeFn = opts.runProbe ?? runProbe
+  const signedAttachFn = opts.signedAttach ?? signedAttach
+  const drainInboxFn = opts.drainInbox ?? drainInbox
+  const logFn = opts.log ?? log
+  const results = []
   for (const a of cfg.agents) {
     let alive = false
-    try { alive = await runProbe(a.probe) } catch { alive = false }
+    try { alive = await runProbeFn(a.probe) } catch { alive = false }
     if (!alive) {
-      log({ agent: a.agent_id, probe: 'dead', action: 'skip' })
+      logFn({ agent: a.agent_id, probe: 'dead', action: 'skip' })
+      results.push({
+        agent: a.agent_id,
+        probe: 'dead',
+        heartbeat: { ok: false, skipped: true },
+        inbox: a.inbox ? { ok: null, action: 'not_attempted_probe_dead', messages: 0, consumed: false } : null,
+      })
       continue
     }
-    const res = await signedAttach(cfg.baseUrl, a.agent_id, {
+    const res = await signedAttachFn(cfg.baseUrl, a.agent_id, {
       type: a.type, runtime: a.runtime, tenant: cfg.tenant, lifecycle: a.lifecycle, privKey: keys.get(a.agent_id),
     })
-    log({ agent: a.agent_id, probe: 'alive', action: res.ok ? 'heartbeat_ok' : 'heartbeat_fail', status: res.status })
+    logFn({ agent: a.agent_id, probe: 'alive', action: res.ok ? 'heartbeat_ok' : 'heartbeat_fail', status: res.status })
+    const result = {
+      agent: a.agent_id,
+      probe: 'alive',
+      heartbeat: { ok: res.ok, status: res.status },
+      inbox: null,
+    }
     if (res.ok) {
       liveAgents.add(a.agent_id)
-      await drainInbox(cfg, a, keys.get(a.agent_id))
+      result.inbox = a.inbox
+        ? await drainInboxFn(cfg, a, keys.get(a.agent_id), { ...opts, log: logFn })
+        : null
+    } else if (a.inbox) {
+      result.inbox = { ok: null, action: 'not_attempted_heartbeat_failed', messages: 0, consumed: false }
     }
+    results.push(result)
   }
+  return results
 }
 
 async function main() {
@@ -242,7 +277,7 @@ async function main() {
   const loop = async () => {
     if (stopping) return
     try {
-      activeTick = tick(cfg, keys, liveAgents)
+      activeTick = runDaemonOnce(cfg, keys, liveAgents)
       await activeTick
     } catch (e) {
       log({ event: 'tick_error', error: String(e && e.message ? e.message : e) })

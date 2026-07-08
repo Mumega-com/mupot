@@ -302,6 +302,11 @@ and exiting `0` so the daemon consumes the batch.
    delegation still flows through SOS Redis (`activation-watcher.sh`). This is a
    fine intermediate state — the hooks are the LAST thing to move.
    - Pre-flight receipt: run `node ~/.fleet/runtime/host-receipt.mjs --daemon ~/.fleet/daemon.json --inbox ~/.fleet/inbox-handler.json --control ~/.fleet/control.json` on the host. A `mupot-fleet-host-receipt/v1` `status:"pass"` proves local daemon/control/handler config, key files, and handler coverage are ready for live smoke.
+   - Live runtime receipt: after the target runtime is up and at least one Mupot
+     inbox probe is queued, run `node ~/.fleet/runtime/runtime-receipt.mjs --daemon ~/.fleet/daemon.json --agent <agent_id>`.
+     A `mupot-fleet-runtime-receipt/v1` `status:"pass"` proves the real daemon
+     path can probe, signed-attach, signed-peek the inbox, deliver to the local
+     handler, and consume only after handler success.
 
 6. **Decommission SOS per surface, not all-at-once.** Only after an arm's memory + messaging + wake are all verified on mupot AND stable for a few cycles, drop that arm's `mumega-bus` allowlist entries. Keep the bus token valid (don't revoke) until the whole squad is migrated and Hadi signs off — the bus is the rollback floor.
 
@@ -317,6 +322,7 @@ and exiting `0` so the daemon consumes the batch.
 | check-in | MCP `check_in { source, label }` or `POST /api/fleet/checkin` → `{ ok:true, agent }` |
 | peers | MCP `peers {}` from a welded arm returns its squad roster with `is_self:true` on that arm |
 | host install | `host-receipt.mjs` emits `mupot-fleet-host-receipt/v1` with `status:"pass"` |
+| runtime live | `runtime-receipt.mjs --agent <id>` emits `mupot-fleet-runtime-receipt/v1` with `status:"pass"` |
 | wake-hook (post-route) | watcher launches a session from a mupot `inbox` poll, logged in `watcher.log` |
 
 ---
@@ -351,5 +357,7 @@ and exiting `0` so the daemon consumes the batch.
    reviewed host config/command that launches the right runtime and exits `0`
    only after durable local handoff. `fleet-runtime/host-receipt.mjs` now gives
    Hadi a local pre-flight receipt for config/key/handler readiness before live
-   attach/inbox/control smoke.
+   attach/inbox/control smoke, and `fleet-runtime/runtime-receipt.mjs` gives a
+   one-cycle live receipt for signed attach plus inbox handoff once an agent is
+   actually up.
 2. **Dropping `verify-delegation.py` HMAC** — safe only after the host handler diff proves it reads from signed Mupot inbox batches and does not trust client-supplied routing. Security-relevant; must pass diverse review.

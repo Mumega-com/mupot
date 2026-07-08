@@ -1,7 +1,7 @@
 // node --test fleet-daemon.test.mjs   (node >= 18 built-in runner, no deps)
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { validateConfig, runProbe, runInboxCommand, detachAgents } from './fleet-daemon.mjs'
+import { validateConfig, runProbe, runInboxCommand, detachAgents, runDaemonOnce } from './fleet-daemon.mjs'
 
 const okCfg = () => ({
   base_url: 'https://your-pot.example.com',
@@ -115,4 +115,75 @@ test('detachAgents: sends signed detach only for agents observed live', async ()
   )
   assert.deepEqual(calls, [{ baseUrl: 'https://pot.example.com', agentId: 'alive', tenant: 't', key: 'key-alive' }])
   assert.deepEqual(results, [{ agent: 'alive', ok: true, status: 200 }])
+})
+
+test('runDaemonOnce: alive agent heartbeats, drains inbox, and marks live', async () => {
+  const cfg = validateConfig({
+    base_url: 'https://pot.example.com',
+    tenant: 't',
+    agents: [{
+      agent_id: 'alive',
+      type: 'builder',
+      runtime: 'codex',
+      lifecycle: 'managed',
+      probe: 'probe-alive',
+      inbox: { command: 'handle-inbox', limit: 5 },
+    }],
+  })
+  const live = new Set()
+  const calls = []
+  const results = await runDaemonOnce(cfg, new Map([['alive', 'key-alive']]), live, {
+    log: () => {},
+    runProbe: async (cmd) => cmd === 'probe-alive',
+    signedAttach: async (baseUrl, agentId, opts) => {
+      calls.push({ type: 'attach', baseUrl, agentId, tenant: opts.tenant, key: opts.privKey })
+      return { ok: true, status: 200, json: { ok: true } }
+    },
+    signedInbox: async (baseUrl, agentId, opts) => {
+      calls.push({ type: 'inbox', baseUrl, agentId, tenant: opts.tenant, peek: opts.peek, limit: opts.limit, key: opts.privKey })
+      if (opts.peek) {
+        return {
+          ok: true,
+          status: 200,
+          json: { remaining: 0, messages: [{ id: 'm1', seq: 1, from_agent: 'sender', kind: 'request', body: 'wake' }] },
+        }
+      }
+      return { ok: true, status: 200, json: { messages: [{ id: 'm1' }] } }
+    },
+    runInboxCommand: async (cmd, payload) => {
+      calls.push({ type: 'handler', cmd, payload: JSON.parse(payload) })
+      return true
+    },
+  })
+
+  assert.deepEqual(live, new Set(['alive']))
+  assert.deepEqual(results, [{
+    agent: 'alive',
+    probe: 'alive',
+    heartbeat: { ok: true, status: 200 },
+    inbox: { agent: 'alive', ok: true, action: 'inbox_consumed', status: 200, messages: 1, remaining: 0, consumed: true },
+  }])
+  assert.equal(calls[0].type, 'attach')
+  assert.deepEqual(calls.map((c) => c.type), ['attach', 'inbox', 'handler', 'inbox'])
+  assert.equal(calls[2].payload.messages[0].body, 'wake')
+})
+
+test('runDaemonOnce: dead probe skips heartbeat and inbox', async () => {
+  const cfg = validateConfig({
+    base_url: 'https://pot.example.com',
+    tenant: 't',
+    agents: [{ agent_id: 'dead', probe: 'exit 1', inbox: { command: 'handle-inbox' } }],
+  })
+  const results = await runDaemonOnce(cfg, new Map([['dead', 'key-dead']]), new Set(), {
+    log: () => {},
+    runProbe: async () => false,
+    signedAttach: async () => { throw new Error('should not attach') },
+    signedInbox: async () => { throw new Error('should not read inbox') },
+  })
+  assert.deepEqual(results, [{
+    agent: 'dead',
+    probe: 'dead',
+    heartbeat: { ok: false, skipped: true },
+    inbox: { ok: null, action: 'not_attempted_probe_dead', messages: 0, consumed: false },
+  }])
 })

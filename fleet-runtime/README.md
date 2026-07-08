@@ -36,6 +36,7 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `control.example.json` | control-daemon config template |
 | `fleet-control-daemon.service` | systemd user unit for host lifecycle control |
 | `host-receipt.mjs` | non-destructive local verifier that emits a redacted host-install receipt |
+| `runtime-receipt.mjs` | one-shot live daemon-cycle receipt for signed attach + inbox drain |
 
 ## Quickstart (per agent)
 
@@ -225,6 +226,37 @@ The receipt validates:
 It prints JSON with `receipt_type: "mupot-fleet-host-receipt/v1"`. A `status:"pass"`
 receipt proves host wiring is ready for live attach/inbox/control smoke tests. Add
 `--exec-probes` only when you want the receipt to run the configured liveness probes.
+
+## Runtime live receipt
+
+After the host receipt passes and at least one managed runtime is actually up,
+run a one-cycle live receipt for the agent you are cutting over:
+
+```bash
+node ~/.fleet/runtime/runtime-receipt.mjs \
+  --daemon ~/.fleet/daemon.json \
+  --agent my-agent
+```
+
+or from a checkout:
+
+```bash
+npm run receipt:runtime -- --agent my-agent
+```
+
+The runtime receipt runs the same path as the daemon service once:
+
+- executes the configured liveness probe
+- signs `/api/fleet/attach-signed`
+- signs `/api/inbox/signed` in peek mode
+- hands any messages to the configured local inbox command
+- consumes messages from Mupot only after handler exit `0`
+
+It prints JSON with `receipt_type: "mupot-fleet-runtime-receipt/v1"`. A
+`status:"pass"` receipt proves that selected agent's live runtime can heartbeat
+and drain Mupot inbox work. `status:"warn"` with `inbox_no_messages_to_handoff`
+means the signed inbox route worked, but no queued message was available to prove
+handler delivery; send a cutover probe message and rerun it.
 
 ## Notes
 - `interval_sec` is clamped to `[15,120]` and must stay under the pot's presence TTL (default 180s).
