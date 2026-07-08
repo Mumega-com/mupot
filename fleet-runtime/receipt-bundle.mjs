@@ -58,6 +58,7 @@ function parseArgs(argv) {
     skipHost: false,
     skipRuntime: false,
     skipControl: false,
+    verifyOnly: false,
     execProbes: false,
     force: false,
   }
@@ -85,6 +86,12 @@ function parseArgs(argv) {
     } else if (arg === '--skip-host') opts.skipHost = true
     else if (arg === '--skip-runtime') opts.skipRuntime = true
     else if (arg === '--skip-control') opts.skipControl = true
+    else if (arg === '--verify-only') {
+      opts.verifyOnly = true
+      opts.skipHost = true
+      opts.skipRuntime = true
+      opts.skipControl = true
+    }
     else if (arg === '--exec-probes') opts.execProbes = true
     else if (arg === '--force') opts.force = true
     else if (arg === '--help' || arg === '-h') opts.help = true
@@ -109,6 +116,7 @@ function usage() {
     '  --skip-host                   reuse existing host.json from the bundle directory',
     '  --skip-runtime                reuse existing runtime-*.json receipts from the bundle directory',
     '  --skip-control                do not run a live control poll; reuse existing control-*.json',
+    '  --verify-only                 read-only recheck; reuse host/runtime/control receipts',
     '  --require-control-verb <verb> default: start,stop; values: start, stop, restart',
     '  --exec-probes                 pass through to host-receipt.mjs',
     '  --force                       overwrite same-name receipt files',
@@ -419,6 +427,10 @@ async function buildBundle(opts) {
   const stamp = opts.stamp ?? defaultStamp()
   const outDir = opts.outDir ? pathArg(opts.outDir) : join(homedir(), '.fleet', 'receipts', stamp)
   const agents = [...new Set(opts.agents ?? [])]
+  const verifyOnly = Boolean(opts.verifyOnly)
+  const skipHost = Boolean(opts.skipHost || verifyOnly)
+  const skipRuntime = Boolean(opts.skipRuntime || verifyOnly)
+  const skipControl = Boolean(opts.skipControl || verifyOnly)
   checks.push({ ok: agents.length > 0, component: 'receipt-bundle', check: 'selected_agents_present', agents })
   ensureDir(outDir, checks)
 
@@ -441,7 +453,7 @@ async function buildBundle(opts) {
   artifacts.install = includeInstallReceipt(outDir, opts, checks)
   artifacts.probes = includeProbeReceipts(outDir, opts, checks)
 
-  if (!opts.skipHost) {
+  if (!skipHost) {
     const path = join(outDir, 'host.json')
     const result = await runAndWrite('host', path, hostBuilder, {
       daemonPath: opts.daemonPath,
@@ -458,7 +470,7 @@ async function buildBundle(opts) {
     artifacts.host = receiptMeta(join(outDir, 'host.json'))
   }
 
-  if (!opts.skipRuntime) {
+  if (!skipRuntime) {
     for (const agentId of agents) {
       const path = join(outDir, `runtime-${safeName(agentId)}.json`)
       const result = await runAndWrite('runtime', path, runtimeBuilder, {
@@ -472,7 +484,7 @@ async function buildBundle(opts) {
     checks.push({ ok: true, component: 'receipt-bundle', check: 'runtime_receipts_reused' })
   }
 
-  if (!opts.skipControl) {
+  if (!skipControl) {
     const label = opts.controlLabel ? safeName(opts.controlLabel) : stamp
     const path = join(outDir, `control-${label}.json`)
     const result = await runAndWrite('control', path, controlBuilder, {
@@ -532,9 +544,10 @@ async function buildBundle(opts) {
       control_label: opts.controlLabel || null,
       required_control_verbs: opts.requiredControlVerbs ?? ['start', 'stop'],
       exec_probes: Boolean(opts.execProbes),
-      skip_host: Boolean(opts.skipHost),
-      skip_runtime: Boolean(opts.skipRuntime),
-      skip_control: Boolean(opts.skipControl),
+      verify_only: verifyOnly,
+      skip_host: skipHost,
+      skip_runtime: skipRuntime,
+      skip_control: skipControl,
     },
     artifacts,
     next_steps: [],

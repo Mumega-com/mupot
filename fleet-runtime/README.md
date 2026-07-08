@@ -441,6 +441,18 @@ node ~/.fleet/runtime/receipt-bundle.mjs \
   --control-label stop
 ```
 
+To recheck an already gathered evidence directory without touching the live host
+runtime, use read-only verification. This reuses `host.json`,
+`runtime-*.json`, and `control-*.json`, then rewrites only `cutover-gate.json`
+and `manifest.json`:
+
+```bash
+node ~/.fleet/runtime/receipt-bundle.mjs \
+  --agent my-agent \
+  --out-dir ~/.fleet/receipts/my-agent \
+  --verify-only
+```
+
 When `manifest.json` and `cutover-gate.json` both report
 `receipt_type: "mupot-fleet-receipt-bundle/v1"` /
 `"mupot-sos-cutover-gate/v1"` with `status: "pass"`, the saved evidence is ready

@@ -22,6 +22,7 @@ describe('squad mupot cutover runbook', () => {
     expect(runbook).toContain('cutover-gate.json')
     expect(runbook).toContain('manifest.json')
     expect(runbook).toContain('manifest.json` and `cutover-gate.json` report `status:"pass"`')
+    expect(runbook).toContain('--verify-only')
     expect(runbook).toContain('manifest.json.next_steps')
     expect(runbook).toContain('advisory `next_steps`')
   })

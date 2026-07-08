@@ -171,6 +171,8 @@ operator command because it saves the host/runtime/control receipts,
 `cutover-gate.json`, and `manifest.json` under one attachable evidence directory.
 Use `fleet-runtime/cutover-probe.mjs` to queue the inbox probe and Mupot
 `start|stop|restart|status` control requests that the live receipts must observe.
+Use `receipt-bundle.mjs --verify-only` to recheck saved evidence without polling
+the live host runtime before attaching the final cutover record.
 
 **Cross-cutting** — (9) durable, reliably-wakeable 2nd adversarial gate lens (Codex bus-peer
 was stale on both pings); (10) dyad-gate.yml single-quote glob (1-line).

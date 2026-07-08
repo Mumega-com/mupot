@@ -175,6 +175,44 @@ test('receipt bundle can reuse existing host, runtime, and control receipts', as
   assert.ok(bundle.checks.some((c) => c.check === 'control_receipts_reused' && c.ok === true))
 })
 
+test('verify-only rechecks an existing bundle without live receipt builders', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+
+  const liveBuilder = async () => {
+    throw new Error('verify-only must not call live builders')
+  }
+
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+    hostBuilder: liveBuilder,
+    runtimeBuilder: liveBuilder,
+    controlBuilder: liveBuilder,
+  })
+
+  assert.equal(bundle.status, 'pass')
+  assert.equal(bundle.inputs.verify_only, true)
+  assert.equal(bundle.inputs.skip_host, true)
+  assert.equal(bundle.inputs.skip_runtime, true)
+  assert.equal(bundle.inputs.skip_control, true)
+  assert.equal(bundle.artifacts.cutover_gate.status, 'pass')
+  assert.ok(bundle.checks.some((c) => c.check === 'host_receipt_reused' && c.ok === true))
+  assert.ok(bundle.checks.some((c) => c.check === 'runtime_receipts_reused' && c.ok === true))
+  assert.ok(bundle.checks.some((c) => c.check === 'control_receipts_reused' && c.ok === true))
+
+  const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.inputs.verify_only, true)
+  assert.ok(manifest.next_steps.some((s) => s.includes('attach manifest.json and cutover-gate.json')))
+})
+
 test('receipt bundle fails when the final cutover gate lacks stop evidence', async () => {
   const outDir = tmpDir()
   const bundle = await buildBundle({
@@ -228,4 +266,14 @@ test('parseArgs accepts bundle controls and safe filenames', () => {
   assert.equal(opts.execProbes, true)
   assert.equal(opts.force, true)
   assert.equal(safeName('a/b c'), 'a_b_c')
+})
+
+test('parseArgs expands --verify-only to read-only reuse flags', () => {
+  const opts = parseArgs(['--agent', 'agent-one', '--verify-only'])
+
+  assert.deepEqual(opts.agents, ['agent-one'])
+  assert.equal(opts.verifyOnly, true)
+  assert.equal(opts.skipHost, true)
+  assert.equal(opts.skipRuntime, true)
+  assert.equal(opts.skipControl, true)
 })
