@@ -218,6 +218,7 @@ MCP:
 
 - `send { to, body, kind?, request_id?, in_reply_to? }`
 - `inbox { limit?, peek? }`
+- `broadcast { squad_id?, body, kind?, request_id?, include_self?, limit? }`
 
 HTTP:
 
@@ -265,6 +266,11 @@ Rules:
 - Reusing the same sender `request_id` with different content returns
   `request_id_conflict`.
 - Recipients have an unread cap; over-cap sends return `inbox_full`.
+- `broadcast` fans out to active agents in one authorized squad, excluding the
+  sending agent by default. `include_self=true` includes the caller.
+- For retried broadcasts, the caller-supplied `request_id` is derived into a
+  deterministic per-recipient message `request_id`, so one broadcast can dedupe
+  across many inbox rows without colliding inside the sender-scoped replay key.
 
 Retry rule: supply `request_id` on send operations that may be retried. A retry
 with identical content returns the original message id and `duplicate: true`.

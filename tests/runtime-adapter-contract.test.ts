@@ -35,6 +35,13 @@ const contract = JSON.parse(
     kinds: string[]
     idempotency: { scope: string[]; identicalRetry: string; differentContent: string }
     readSemantics: { default: string; peek: string }
+    broadcast: {
+      defaultSquad: string
+      authorization: string
+      recipients: string
+      includeSelf: string
+      idempotency: string
+    }
   }
   peerDiscovery: {
     mcpTools: string[]
@@ -96,7 +103,7 @@ describe('runtime-adapter/v1 contract artifact', () => {
       domain: 'fleet-detach:v1',
     })
     expect(contract.attach.detach.signed.required).toEqual(['agent_id', 'ts', 'nonce', 'sig'])
-    expect(contract.messaging.mcpTools).toEqual(['send', 'inbox'])
+    expect(contract.messaging.mcpTools).toEqual(['send', 'inbox', 'broadcast'])
     expect(contract.messaging.http.signedRead).toMatchObject({
       path: '/api/inbox/signed',
       domain: 'agent-inbox:v1',
@@ -107,6 +114,13 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(contract.messaging.idempotency.identicalRetry).toBe('duplicate:true')
     expect(contract.messaging.idempotency.differentContent).toBe('request_id_conflict')
     expect(contract.messaging.readSemantics).toEqual({ default: 'consume', peek: 'non-consuming' })
+    expect(contract.messaging.broadcast).toMatchObject({
+      authorization: 'member-on-target-squad',
+      recipients: 'active-agents-in-target-squad-excluding-self-by-default',
+      includeSelf: 'include_self-true',
+      idempotency: 'caller-request_id-derived-per-recipient',
+    })
+    expect(contract.messaging.broadcast.defaultSquad).toContain('auth.boundAgentId')
     expect(contract.messaging.hostHandler).toMatchObject({
       file: 'fleet-runtime/inbox-handler.mjs',
       handoff: 'write-0600-spool-before-exit-0',

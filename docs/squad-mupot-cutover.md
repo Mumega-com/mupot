@@ -27,6 +27,7 @@ The arms' frontmatter lists `mcp__mumega-bus__*` tools (SOS bus). The mupot seam
 | `wake_agent` | `src/mcp/index.ts` | `lead` | agent's squad |
 | `squad_message` | `src/mcp/index.ts` | `member` | squad |
 | `send` | `src/mcp/index.ts` | `authenticated` **+ agent-bound** | agent→agent, this pot |
+| `broadcast` | `src/mcp/index.ts` | `member` **+ agent-bound** | active agents in caller/target squad |
 | `inbox` | `src/mcp/index.ts` | `authenticated` **+ agent-bound** | self |
 | `peers` | `src/mcp/index.ts` | `authenticated` + observer on squad | squad roster |
 | `check_in` | `src/mcp/index.ts` | `authenticated` | self (member-token presence) |
@@ -50,12 +51,12 @@ The arms' frontmatter lists `mcp__mumega-bus__*` tools (SOS bus). The mupot seam
 | `boot_context` | `boot_context` | **same name** (`src/mcp/index.ts`) |
 | `status` | `status` | **same name** (`src/mcp/index.ts`) |
 | `check_in` (kasra-code, kasra-comms, brain) | `check_in` | **covered** — same presence writer as `POST /api/fleet/checkin` |
-| `broadcast` (kasra-comms) | `squad_message` (closest) | **shape differs** — `squad_message` targets one squad (`src/mcp/index.ts`); there is no fan-out broadcast |
+| `broadcast` (kasra-comms) | `broadcast` | **covered** — durable per-recipient inbox fan-out to active agents in one squad |
 | `task_update` (kasra-code) | `task_update` | **covered** — same transition/gate checks as the HTTP task route |
 | `task_board` / `task_list` (brain) | `task_board` / `task_list` | **covered** — member-gated on squad; agent-bound tokens default to their own squad |
 | `peers` (kasra-comms, brain) | `peers` | **covered** — single-squad roster; agent-bound tokens default to their own squad |
 
-**Implication for the loadout (section 1):** the arms' *bus* tool lists do not all have mupot equivalents. The cutover gives each arm the mupot tools that exist; the missing one (`broadcast` fan-out) either stays on SOS during transition or becomes a follow-on build. Flag each per-arm below.
+**Implication for the loadout (section 1):** the arms' listed *bus* primitives now have Mupot equivalents. The remaining coordination gap is not a frontmatter tool in the arm defs: shared squad memory (`squad_remember`/`squad_recall`) stays on SOS or becomes a follow-on build.
 
 ---
 
@@ -81,6 +82,7 @@ The arms' frontmatter lists `mcp__mumega-bus__*` tools (SOS bus). The mupot seam
 What `member` actually buys, per the tool gates:
 - `recall` / `remember` / `boot_context` / `check_in` / `status` / `orient` / `connect` — `min: 'authenticated'` → any live token (`src/mcp/index.ts`).
 - `send` / `inbox` — `min: 'authenticated'` **AND** `auth.boundAgentId` set (the weld) → a minted token passes; a bare apikey does not (`src/mcp/index.ts`).
+- `broadcast` — `min: 'member'` on the target squad **AND** `auth.boundAgentId` set; by default it fans out to active squad agents except the sender (`src/mcp/index.ts`).
 - `peers` — `min: 'authenticated'` plus `observer` on the target squad; a minted `member` token passes for its OWN squad and defaults there when `squad_id` is omitted (`src/mcp/index.ts`).
 - `task_create` / `task_list` / `task_board` / `task_update` / `squad_message` — `min: 'member'` on the target squad → a minted token passes for its OWN squad (`src/mcp/index.ts`).
 - `wake_agent` — `min: 'lead'` → a minted `member` token is REFUSED (`src/mcp/index.ts`). Good: arms can't wake each other.
@@ -125,13 +127,13 @@ All calls are `POST https://mupot.mumega.com/mcp` with `Authorization: Bearer <O
 ```
 (`src/mcp/provision.ts`. If a slug is ambiguous across squads use the agent **id** — `409 ambiguous_slug`, `src/mcp/provision.ts`.)
 
-### 1.4 Per-arm bus-tool → mupot-capability map + what's missing
+### 1.4 Per-arm bus-tool → mupot-capability map + remaining caveats
 
-| arm | bus tools in its def (frontmatter) | mupot tools it gets with a `member`-welded token | GAP (no mupot equivalent today) |
+| arm | bus tools in its def (frontmatter) | mupot tools it gets with a `member`-welded token | remaining caveat |
 |---|---|---|---|
 | **kasra-review** | `send, inbox, recall, remember` (`kasra-review.md:18-21`) | `send`, `inbox`, `recall`, `remember`, `status`, `orient`, `boot_context` | none — fully covered |
 | **kasra-code** | `send, inbox, recall, remember, check_in, task_update` (`kasra-code.md:20-25`) | `send`, `inbox`, `recall`, `remember`, `check_in`, `task_create`, `task_update`, `task_list`, `task_board`, `squad_message` | none for listed bus tools except broader shared-memory caveat |
-| **kasra-comms** | `send, inbox, broadcast, check_in, peers, recall, remember` (`kasra-comms.md:13-19`) | `send`, `inbox`, `recall`, `remember`, `check_in`, `peers`, `squad_message` | `broadcast` fan-out |
+| **kasra-comms** | `send, inbox, broadcast, check_in, peers, recall, remember` (`kasra-comms.md:13-19`) | `send`, `inbox`, `broadcast`, `recall`, `remember`, `check_in`, `peers`, `squad_message` | none for listed bus tools except broader shared-memory caveat |
 | **kasra-research** | `send, inbox, recall, remember` (`kasra-research.md:17-20`) | `send`, `inbox`, `recall`, `remember`, `status`, `orient` | none — fully covered |
 | **brain** | `inbox, send, recall, remember, boot_context, status, task_board` (`brain.md:22-28`) + an `mcp__sos__*` set (`brain.md:11-21`) | `inbox`, `send`, `recall`, `remember`, `boot_context`, `check_in`, `peers`, `status`, `task_board`, `task_list`, `task_update` | none for listed bus tools except broader shared-memory caveat |
 | **kasra** (core) | (uses the workspace `.mcp.json` `sos` server, not a `mcp__mumega-bus__` allowlist) | full `member` set incl. `task_create`, `squad_message` | merge/deploy stays bus-side + GitHub regardless |
@@ -152,7 +154,7 @@ The arm defs reference tools by the server alias prefix: `mcp__mumega-bus__send`
 
 ### 2.2 Does mupot expose the same tool names? — YES for the core set
 
-Confirmed against `src/mcp/index.ts`: `recall`, `remember`, `send`, `inbox`, `boot_context`, `status`, `check_in`, `peers`, `task_list`, `task_board`, and `task_update` are byte-identical tool names to the bus where those bus tools exist. So an arm allowlist entry `mcp__mumega-bus__recall` becomes `mcp__mupot__recall` — same tool name, new server prefix. The transport is **HTTP** (mupot's `POST /mcp` accepts pragmatic JSON and JSON-RPC `tools/call`, `src/mcp/index.ts`), so the server entry is `type: "http"`, identical in shape to the existing `mumega-bus` entry.
+Confirmed against `src/mcp/index.ts`: `recall`, `remember`, `send`, `broadcast`, `inbox`, `boot_context`, `status`, `check_in`, `peers`, `task_list`, `task_board`, and `task_update` are byte-identical tool names to the bus where those bus tools exist. So an arm allowlist entry `mcp__mumega-bus__recall` becomes `mcp__mupot__recall` — same tool name, new server prefix. The transport is **HTTP** (mupot's `POST /mcp` accepts pragmatic JSON and JSON-RPC `tools/call`, `src/mcp/index.ts`), so the server entry is `type: "http"`, identical in shape to the existing `mumega-bus` entry.
 
 ### 2.3 Add the mupot MCP server entry
 
@@ -281,7 +283,7 @@ and exiting `0` so the daemon consumes the batch.
      their SOS task tools.
    - `check_in` can now move to Mupot MCP directly; verify one check-in receipt before removing any SOS presence/check-in hook.
    - `peers` can now move to Mupot MCP directly; verify that kasra-comms or brain sees its squad roster before removing the SOS `peers` hook.
-   - kasra-comms `broadcast`: leave fan-out broadcast on SOS until a fan-out tool exists; `squad_message` is single-squad only.
+   - kasra-comms `broadcast` can now move to Mupot MCP directly; verify one fan-out receipt and one recipient inbox receipt before removing the SOS `broadcast` hook.
 
 5. **Wake-hooks cutover — host wiring step.** Do NOT migrate the hooks until
    `/api/inbox/signed` is deployed and the local handler has passed review.
@@ -298,6 +300,7 @@ and exiting `0` so the daemon consumes the batch.
 | mint | mint response `token.agent_id` set + `raw` captured |
 | memory | `remember`→`engram_id`, `recall` returns the probe |
 | messaging | `send`→`seq`, peer `inbox` shows it, `remaining` decrements |
+| broadcast | `broadcast`→`delivered:N`, peer `inbox` shows one fan-out message |
 | check-in | MCP `check_in { source, label }` or `POST /api/fleet/checkin` → `{ ok:true, agent }` |
 | peers | MCP `peers {}` from a welded arm returns its squad roster with `is_self:true` on that arm |
 | wake-hook (post-route) | watcher launches a session from a mupot `inbox` poll, logged in `watcher.log` |
@@ -308,7 +311,6 @@ and exiting `0` so the daemon consumes the batch.
 
 ### Stays on SOS (no mupot equivalent today — do not migrate yet)
 - **Shared squad memory** — `squad_remember`/`squad_recall`, `MEMORY.md`. mupot memory is per-token-private (`src/mcp/index.ts`); no squad-scoped memory tool exists.
-- **`broadcast` fan-out** — no equivalent fan-out tool; `squad_message` is single-squad.
 - **Cold-start wake-hooks** — blocked on host handler rollout against `/api/inbox/signed`.
 - **The SOS bus token itself** — keep live as the rollback floor until the full squad is verified on mupot.
 
@@ -337,5 +339,4 @@ and exiting `0` so the daemon consumes the batch.
    only after durable local handoff.
 2. **Per-arm capability granularity in `mint_agent_token`** — today every minted token gets uniform squad `member` (`src/mcp/provision.ts`). True per-arm least-privilege (e.g. review = recall/remember/inbox only, NO task_create/squad_message) is not expressible. Follow-on: optional explicit-capability arg, still hard-capped ≤ `member`.
 3. **Squad-scoped memory on mupot** — no `squad_remember`/`squad_recall`; mupot memory is per-token-private. Shared `MEMORY.md`-style squad memory is NOT covered by this cutover.
-4. **`broadcast` fan-out tool** — absent on the mupot seam; kasra-comms keeps that flow on SOS until built.
-5. **Dropping `verify-delegation.py` HMAC** — safe only after the host handler diff proves it reads from signed Mupot inbox batches and does not trust client-supplied routing. Security-relevant; must pass diverse review.
+4. **Dropping `verify-delegation.py` HMAC** — safe only after the host handler diff proves it reads from signed Mupot inbox batches and does not trust client-supplied routing. Security-relevant; must pass diverse review.

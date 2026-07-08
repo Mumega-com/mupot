@@ -88,7 +88,7 @@
     "debounce": "tenant-member-30s"
   },
   "messaging": {
-    "mcpTools": ["send", "inbox"],
+    "mcpTools": ["send", "inbox", "broadcast"],
     "http": {
       "read": "GET /api/inbox?peek=1&limit=N",
       "signedRead": {
@@ -111,6 +111,13 @@
     "readSemantics": {
       "default": "consume",
       "peek": "non-consuming"
+    },
+    "broadcast": {
+      "defaultSquad": "agent-bound-token-may-derive-squad-from-auth.boundAgentId",
+      "authorization": "member-on-target-squad",
+      "recipients": "active-agents-in-target-squad-excluding-self-by-default",
+      "includeSelf": "include_self-true",
+      "idempotency": "caller-request_id-derived-per-recipient"
     },
     "hostHandler": {
       "file": "fleet-runtime/inbox-handler.mjs",

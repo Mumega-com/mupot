@@ -51,7 +51,7 @@ import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
 import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
-import { sendToRef, readAgentInbox } from '../agents/messages'
+import { sendToRef, readAgentInbox, sendAgentMessage } from '../agents/messages'
 import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { PROVISION_TOOLS } from './provision'
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
@@ -326,6 +326,7 @@ const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } 
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
 const TASK_STATUSES: readonly TaskStatus[] = ['open', 'in_progress', 'blocked', 'done', 'review', 'approved', 'rejected']
 const PATCH_ALLOWED_STATUSES: ReadonlySet<string> = new Set(['open', 'in_progress', 'blocked', 'done', 'review'])
+const BROADCAST_REQUEST_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/
 
 function isTaskStatus(v: unknown): v is TaskStatus {
   return typeof v === 'string' && (TASK_STATUSES as readonly string[]).includes(v)
@@ -333,6 +334,18 @@ function isTaskStatus(v: unknown): v is TaskStatus {
 
 function isPatchableStatus(v: unknown): v is TaskStatus {
   return typeof v === 'string' && PATCH_ALLOWED_STATUSES.has(v)
+}
+
+async function sha256Short(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s))
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, 64)
+}
+
+async function broadcastRecipientRequestId(base: string, toAgent: string): Promise<string> {
+  return `bcast:${await sha256Short(`${base}\n${toAgent}`)}`
 }
 
 function readLimit(v: unknown, fallback: number, max: number): number | Extract<ToolOutcome, { ok: false }> {
@@ -904,6 +917,112 @@ const toolSend: ToolSpec = {
   },
 }
 
+type BroadcastTarget = Pick<Agent, 'id' | 'slug' | 'name'>
+
+// broadcast — fan out a durable message to every active agent in one squad. This
+// is still a set of ordinary agent_messages rows, so inbox delivery, unread caps,
+// and replay semantics remain identical to direct send.
+const toolBroadcast: ToolSpec = {
+  name: 'broadcast',
+  scope: 'squad fan-out (active agents only); sender must be agent-bound',
+  min: 'member',
+  args: '{ squad_id?: string, body: string, kind?: "message"|"request", request_id?: string, include_self?: boolean, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      squad_id: STRING_SCHEMA,
+      body: STRING_SCHEMA,
+      kind: STRING_SCHEMA,
+      request_id: STRING_SCHEMA,
+      include_self: { type: 'boolean' },
+      limit: OPTIONAL_NUMBER_SCHEMA,
+    },
+    required: ['body'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const fromAgent = auth.boundAgentId
+    if (!fromAgent) return fail(403, 'not_agent_bound', 'broadcast requires an agent-bound token (member_tokens.agent_id)')
+
+    const body = str(args.body)
+    if (!body) return fail(400, 'invalid_args', 'body required')
+    const kind = args.kind ?? 'message'
+    if (kind !== 'message' && kind !== 'request') {
+      return fail(400, 'invalid_args', 'kind must be "message" or "request"')
+    }
+    if (args.request_id !== undefined && typeof args.request_id !== 'string') {
+      return fail(400, 'invalid_args', 'request_id must be a string')
+    }
+    const requestId = typeof args.request_id === 'string' ? args.request_id : undefined
+    if (requestId !== undefined && !BROADCAST_REQUEST_ID_RE.test(requestId)) {
+      return fail(400, 'invalid_request_id', 'request_id must match [A-Za-z0-9_.:-]{1,128}')
+    }
+    if (args.include_self !== undefined && typeof args.include_self !== 'boolean') {
+      return fail(400, 'invalid_args', 'include_self must be a boolean')
+    }
+    const includeSelf = args.include_self === true
+    const limit = readLimit(args.limit, 100, 200)
+    if (typeof limit !== 'number') return limit
+
+    const squadRes = await resolveScopedSquad(
+      env,
+      auth,
+      args,
+      'member',
+      'squad_id required unless the token is agent-bound',
+    )
+    if (!squadRes.ok) return squadRes
+
+    const rows = await env.DB.prepare(
+      `SELECT id, slug, name
+         FROM agents
+        WHERE squad_id = ?1 AND status = 'active'
+        ORDER BY slug ASC
+        LIMIT ?2`,
+    )
+      .bind(squadRes.squad.id, limit)
+      .all<BroadcastTarget>()
+    const targets = (rows.results ?? []).filter((agent) => includeSelf || agent.id !== fromAgent)
+
+    const deliveries: Array<{ to: string; slug: string; id: string; seq: number; duplicate: boolean; request_id: string | null }> = []
+    const failures: Array<{ to: string; slug: string; error: string; detail?: string }> = []
+    for (const target of targets) {
+      const recipientRequestId = requestId ? await broadcastRecipientRequestId(requestId, target.id) : undefined
+      const res = await sendAgentMessage(env, {
+        fromAgent,
+        fromMember: auth.memberId as string,
+        toAgent: target.id,
+        body,
+        kind,
+        requestId: recipientRequestId,
+      })
+      if (res.ok) {
+        deliveries.push({
+          to: target.id,
+          slug: target.slug,
+          id: res.id,
+          seq: res.seq,
+          duplicate: res.duplicate,
+          request_id: recipientRequestId ?? null,
+        })
+      } else {
+        failures.push({ to: target.id, slug: target.slug, error: res.reason, detail: res.detail })
+      }
+    }
+
+    return done({
+      ok: failures.length === 0,
+      squad_id: squadRes.squad.id,
+      from: fromAgent,
+      attempted: targets.length,
+      delivered: deliveries.length,
+      failed: failures.length,
+      deliveries,
+      failures,
+    })
+  },
+}
+
 // inbox — read (and by default CONSUME) the CALLER's own inbox. cap: agent-bound member.
 // Self-scoped: an agent only ever reads to_agent = its own welded id; it cannot read another
 // agent's inbox. peek=true reads without consuming.
@@ -1387,6 +1506,7 @@ export const TOOLS: ToolSpec[] = [
   toolWakeAgent,
   toolSquadMessage,
   toolSend,
+  toolBroadcast,
   toolInbox,
   toolPeers,
   toolCheckIn,
