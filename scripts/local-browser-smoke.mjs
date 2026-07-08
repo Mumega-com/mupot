@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 
-import { mkdir } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
 import { chromium } from 'playwright'
 
 const baseUrl = (process.env.MUPOT_LOCAL_URL || process.argv[2] || 'http://127.0.0.1:8787').replace(/\/$/, '')
 const artifactsDir = path.resolve(process.env.MUPOT_SMOKE_ARTIFACTS || 'tmp/local-smoke')
+const reportPath = path.join(artifactsDir, 'report.json')
 const runtimeContract = 'runtime-adapter/v1'
 const hermesLifecycle = 'Hermes IM lifecycle: Telegram update -> IM webhook -> chat_id member mapping -> capability gate -> fleet/approval/task effect -> reply'
 const smokeRunId = new Date().toISOString().replace(/[:.]/g, '-')
@@ -391,18 +392,24 @@ try {
     title: hermesTaskTitle,
   })
 
-  const report = { baseUrl, contract: runtimeContract, hermesLifecycle, pages: results, workflows, hermes, screenshots: artifactsDir }
+  const report = { baseUrl, contract: runtimeContract, hermesLifecycle, pages: results, workflows, hermes, screenshots: artifactsDir, reportPath }
+  await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n')
   console.log(JSON.stringify(report, null, 2))
 } catch (err) {
-  const failurePath = path.join(artifactsDir, `failure-${Date.now()}.png`)
+  const failureStamp = Date.now()
+  const failurePath = path.join(artifactsDir, `failure-${failureStamp}.png`)
+  const failureReportPath = path.join(artifactsDir, `failure-${failureStamp}.json`)
   await page.screenshot({ path: failurePath, fullPage: true }).catch(() => undefined)
-  console.error(JSON.stringify({
+  const failureReport = {
     error: err instanceof Error ? err.message : String(err),
     details: err instanceof Error && 'details' in err ? err.details : undefined,
     workflows,
     pagesChecked: results.length,
     failureScreenshot: failurePath,
-  }, null, 2))
+    failureReportPath,
+  }
+  await writeFile(failureReportPath, JSON.stringify(failureReport, null, 2) + '\n').catch(() => undefined)
+  console.error(JSON.stringify(failureReport, null, 2))
   throw err
 } finally {
   await browser.close()

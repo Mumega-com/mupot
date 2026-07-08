@@ -230,6 +230,9 @@ describe('runtime-adapter/v1 contract artifact', () => {
     const smoke = readFileSync(new URL('../scripts/local-browser-smoke.mjs', import.meta.url), 'utf8')
     expect(smoke).toContain('runtime-adapter/v1')
     expect(smoke).toContain('Hermes IM task lifecycle')
+    expect(smoke).toContain("path.join(artifactsDir, 'report.json')")
+    expect(smoke).toContain('await writeFile(reportPath')
+    expect(smoke).toContain('failureReportPath')
   })
 
   it('names the follow-up conformance suites adapters must pass', () => {

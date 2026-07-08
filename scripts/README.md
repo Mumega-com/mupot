@@ -41,16 +41,19 @@ The harness uses `/auth/dev-login`, which is enabled only when
 
 Artifacts:
 
+- `tmp/local-smoke/report.json`
 - `tmp/local-smoke/home.png`
 - `tmp/local-smoke/fleet.png`
 - `tmp/local-smoke/ops-health.png`
 - `tmp/local-smoke/send-workflow.png`
 - `tmp/local-smoke/approvals-workflow.png`
 - `tmp/local-smoke/hermes-dashboard-update.png`
+- `tmp/local-smoke/failure-*.json` when a workflow fails
 - `tmp/local-smoke/failure-*.png` when a workflow fails
 
-`npm run smoke:local` prints a JSON report containing the page crawl, workflow
-results, Hermes checks, runtime contract name, and artifact directory.
+`npm run smoke:local` writes `report.json` and prints the same JSON report to
+stdout. The report contains the page crawl, workflow results, Hermes checks,
+runtime contract name, artifact directory, and report path.
 
 ## Local runtime adapter conformance
 

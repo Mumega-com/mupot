@@ -64,6 +64,7 @@ describe('production self-hosting runbook', () => {
     expect(runbook).toContain('Local/dev validation proves the code path in the local test config')
     expect(runbook).toContain('Production validation proves the deployed pot and its real bindings')
     expect(runbook).toContain('npm run smoke:local')
+    expect(runbook).toContain('tmp/local-smoke/report.json')
     expect(runbook).toContain('curl -fsS "$BASE_URL/health"')
     expect(runbook).toContain('npx wrangler tail "$WORKER"')
   })

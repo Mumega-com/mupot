@@ -287,6 +287,9 @@ npm run dev:local:test
 npm run smoke:local
 ```
 
+Save `tmp/local-smoke/report.json` plus the referenced screenshots with the
+release evidence.
+
 Production validation proves the deployed pot and its real bindings:
 
 ```bash
