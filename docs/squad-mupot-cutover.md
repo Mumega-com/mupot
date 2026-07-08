@@ -349,8 +349,9 @@ and exiting `0` so the daemon consumes the batch.
      --out-dir ~/.fleet/receipts/<agent_id>` is the read-only progress check:
      it emits `mupot-fleet-receipt-bundle-status/v1`, verifies the #274 host-go
      evidence categories that are present, checks per-agent start/stop lifecycle
-     evidence before the final gate is rebuilt, and returns `next_steps` without
-     polling the host or rewriting files. From a checkout, use
+     evidence before the final gate is rebuilt, returns `host_go_checklist` for
+     the issue #274 gates, and returns `next_steps` without polling the host or
+     rewriting files. From a checkout, use
      `npm run receipt:bundle:status -- --agent <agent_id> --out-dir ./receipts/<agent_id>`.
      `manifest.json` carries SHA-256 hashes for the saved receipt artifacts so
      copied evidence can be checked for drift; it excludes its own self-referential

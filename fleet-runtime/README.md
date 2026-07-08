@@ -473,9 +473,12 @@ It prints `receipt_type: "mupot-fleet-receipt-bundle-status/v1"` and checks
 the issue #274 evidence contract: install receipt, host receipt, queued probe
 receipts, runtime receipt, per-agent start/stop control evidence,
 `cutover-gate.json`, `manifest.json`, and copied-bundle manifest verification
-when present. It exits non-zero until the evidence is ready, and its `next_steps`
-name the next host action to run, including missing `agent:verb` lifecycle
-evidence before the final gate is rebuilt.
+when present. It also includes `host_go_checklist`, a machine-readable checklist
+for the same issue #274 gates: bundle directory, selected agents, installer,
+host, probe, runtime, control, cutover gate, manifest, copied manifest check,
+and attachable-bundle safety. It exits non-zero until the evidence is ready, and
+its `next_steps` name the next host action to run, including missing
+`agent:verb` lifecycle evidence before the final gate is rebuilt.
 
 To produce the clean attachable copy for #274, export from the working receipt
 directory into a fresh directory. The export command copies only `manifest.json`

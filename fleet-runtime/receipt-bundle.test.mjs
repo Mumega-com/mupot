@@ -23,6 +23,10 @@ function sha256(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex')
 }
 
+function checklistById(status, id) {
+  return status.host_go_checklist.find((item) => item.id === id)
+}
+
 function installReceipt(status = 'warn') {
   return {
     receipt_type: 'mupot-fleet-install-receipt/v1',
@@ -583,6 +587,11 @@ test('status reports a complete host-go bundle as pass', async () => {
   assert.equal(status.manifest_check.status, 'pass')
   assert.equal(status.artifacts.install.receipt_type, 'mupot-fleet-install-receipt/v1')
   assert.equal(status.artifacts.cutover_gate.status, 'pass')
+  assert.equal(status.host_go_checklist.every((item) => item.status === 'pass'), true)
+  assert.equal(checklistById(status, 'selected_agents_named').agents.includes('agent-one'), true)
+  assert.equal(checklistById(status, 'attachable_manifest_check_passed').manifest_check_status, 'pass')
+  assert.equal(checklistById(status, 'attachable_bundle_safe').secret_scan_passed, true)
+  assert.equal(checklistById(status, 'attachable_bundle_safe').directory_scope_passed, true)
   assert.ok(status.checks.some((c) => c.check === 'manifest_check_pass' && c.ok === true))
   assert.ok(status.checks.some((c) => c.check === 'copied_bundle_no_secret_material' && c.ok === true))
   assert.ok(status.checks.some((c) => c.check === 'copied_bundle_only_manifest_artifacts' && c.ok === true))
@@ -605,6 +614,14 @@ test('status reports missing host-go evidence and next steps for a partial bundl
     c.ok === false
   ))
   assert.ok(status.checks.some((c) => c.check === 'manifest_check_pass' && c.ok === false))
+  assert.equal(checklistById(status, 'bundle_directory_ready').status, 'pass')
+  assert.equal(checklistById(status, 'install_receipt_saved').status, 'fail')
+  assert.equal(checklistById(status, 'probe_receipts_passed_for_agents').missing_agents.includes('agent-one'), true)
+  assert.equal(checklistById(status, 'runtime_receipts_passed_for_agents').missing_agents.includes('agent-one'), true)
+  assert.equal(checklistById(status, 'control_receipts_passed_for_required_verbs').missing.includes('agent-one:start'), true)
+  assert.equal(checklistById(status, 'control_receipts_passed_for_required_verbs').missing.includes('agent-one:stop'), true)
+  assert.equal(checklistById(status, 'attachable_manifest_check_passed').status, 'fail')
+  assert.equal(checklistById(status, 'attachable_bundle_safe').status, 'fail')
   assert.ok(status.next_steps.some((s) => s.includes('save installer output')))
   assert.ok(status.next_steps.some((s) => s.includes('queue inbox and lifecycle inputs')))
   assert.ok(status.next_steps.some((s) => s.includes('runtime-agent-one.json')))

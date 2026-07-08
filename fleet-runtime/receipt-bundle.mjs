@@ -1221,6 +1221,16 @@ function hasPassingRuntimeMeta(artifacts, agentId) {
   )
 }
 
+function passingProbeAgents(artifacts) {
+  const agents = []
+  for (const meta of artifacts.probes ?? []) {
+    if (meta?.receipt_type !== EXPECTED.probe || meta?.status !== 'pass') continue
+    const receipt = readReceipt(meta.path)
+    agents.push(...receiptTargetAgents('probe:status', receipt))
+  }
+  return sortStrings(agents)
+}
+
 function passingMetaCount(items, expectedType) {
   return (items ?? []).filter((meta) => meta?.receipt_type === expectedType && meta?.status === 'pass').length
 }
@@ -1313,6 +1323,117 @@ function addHostGoStatusNextSteps(steps, { outDir, artifacts, agents, gateReceip
     add('copy only manifest.json and its listed receipt artifacts into the attachable bundle directory, then rerun --check-manifest')
   }
   return steps
+}
+
+function hostGoChecklistItem(id, title, ok, nextAction, evidence = {}) {
+  return {
+    id,
+    title,
+    status: ok ? 'pass' : 'fail',
+    next_action: ok ? null : nextAction,
+    ...evidence,
+  }
+}
+
+function hostGoStatusChecklist({ outDir, artifacts, agents, gateReceipt, manifestCheck, requiredControlVerbs, controlEvidence }) {
+  const probeAgents = passingProbeAgents(artifacts)
+  const missingProbeAgents = sortStrings((agents ?? []).filter((agentId) => !probeAgents.includes(agentId)))
+  const missingRuntimeAgents = sortStrings((agents ?? []).filter((agentId) => !hasPassingRuntimeMeta(artifacts, agentId)))
+  const missingControls = missingControlEvidenceForAgents({ agents, requiredControlVerbs, controlEvidence })
+  const secretChecks = secretScanChecks(manifestCheck)
+  const scopeChecks = bundleScopeChecks(manifestCheck)
+  const secretSafe = manifestCheck ? secretChecks.length > 0 && secretChecks.every((check) => check.ok === true) : false
+  const scopeSafe = manifestCheck ? scopeChecks.length > 0 && scopeChecks.every((check) => check.ok === true) : false
+  const manifestPass = artifacts.manifest?.receipt_type === 'mupot-fleet-receipt-bundle/v1' && artifacts.manifest?.status === 'pass'
+  const gatePass = artifacts.cutover_gate?.receipt_type === EXPECTED.cutover_gate && gateReceipt?.status === 'pass'
+  const manifestCheckPass = manifestCheck?.status === 'pass'
+  const installOk = artifacts.install?.receipt_type === EXPECTED.install && (artifacts.install?.status === 'pass' || artifacts.install?.status === 'warn')
+  const hostOk = artifacts.host?.receipt_type === EXPECTED.host && artifacts.host?.status === 'pass'
+
+  return [
+    hostGoChecklistItem(
+      'bundle_directory_ready',
+      'Bundle directory exists for the host-go run',
+      Boolean(outDir && existsSync(outDir)),
+      'Run receipt-bundle.mjs with --out-dir <bundle-dir> on the target host.',
+      { path: outDir || null },
+    ),
+    hostGoChecklistItem(
+      'selected_agents_named',
+      'Selected agent(s) are named in the evidence',
+      (agents ?? []).length > 0,
+      'Pass --agent <agent_id> or rebuild the manifest so selected agents are recorded.',
+      { agents },
+    ),
+    hostGoChecklistItem(
+      'install_receipt_saved',
+      'Installer receipt is saved with status pass or warn',
+      installOk,
+      'Run fleet-runtime/install.mjs or npm run fleet:install on the target host and save install.json.',
+      { path: artifacts.install?.path ?? (outDir ? join(outDir, 'install.json') : null), receipt_type: artifacts.install?.receipt_type ?? null, receipt_status: artifacts.install?.status ?? null },
+    ),
+    hostGoChecklistItem(
+      'host_receipt_passed',
+      'Host config, keys, and runtime layout pass host receipt checks',
+      hostOk,
+      'Edit daemon/control/inbox/flights config for the real pot, place keys, then rerun receipt-bundle without --skip-host.',
+      { path: artifacts.host?.path ?? (outDir ? join(outDir, 'host.json') : null), receipt_type: artifacts.host?.receipt_type ?? null, receipt_status: artifacts.host?.status ?? null },
+    ),
+    hostGoChecklistItem(
+      'probe_receipts_passed_for_agents',
+      'Cutover probe queued inbox and lifecycle inputs for every selected agent',
+      (agents ?? []).length > 0 && missingProbeAgents.length === 0,
+      'Run cutover-probe.mjs for each selected agent, save probe-*.json, then rerun receipt-bundle with --probe-receipt.',
+      { passing_agents: probeAgents, missing_agents: missingProbeAgents },
+    ),
+    hostGoChecklistItem(
+      'runtime_receipts_passed_for_agents',
+      'Runtime receipt proves signed attach and inbox handoff for every selected agent',
+      (agents ?? []).length > 0 && missingRuntimeAgents.length === 0,
+      'Run receipt-bundle after a queued inbox probe until runtime-<agent_id>.json is status pass for each selected agent.',
+      { missing_agents: missingRuntimeAgents },
+    ),
+    hostGoChecklistItem(
+      'control_receipts_passed_for_required_verbs',
+      'Lifecycle control receipt evidence covers every required agent/verb',
+      (agents ?? []).length > 0 && missingControls.length === 0,
+      'Queue missing lifecycle controls with cutover-probe.mjs, then collect control receipts with --control-label.',
+      { required_control_verbs: requiredControlVerbs, missing: missingControls },
+    ),
+    hostGoChecklistItem(
+      'cutover_gate_passed',
+      'cutover-gate.json reports status pass',
+      gatePass,
+      'Run receipt-bundle --verify-only after host/runtime/control receipts are present so cutover-gate.json is rebuilt.',
+      { path: artifacts.cutover_gate?.path ?? (outDir ? join(outDir, 'cutover-gate.json') : null), receipt_status: gateReceipt?.status ?? null },
+    ),
+    hostGoChecklistItem(
+      'manifest_passed',
+      'manifest.json reports status pass',
+      manifestPass,
+      'Run receipt-bundle --verify-only so manifest.json records the final evidence state.',
+      { path: artifacts.manifest?.path ?? (outDir ? join(outDir, 'manifest.json') : null), receipt_status: artifacts.manifest?.status ?? null },
+    ),
+    hostGoChecklistItem(
+      'attachable_manifest_check_passed',
+      'Read-only manifest check passes for the current evidence directory',
+      manifestCheckPass,
+      'Run receipt-bundle.mjs --export, then run --check-manifest against the exported attachable directory.',
+      { manifest_check_status: manifestCheck?.status ?? null },
+    ),
+    hostGoChecklistItem(
+      'attachable_bundle_safe',
+      'Attachable bundle is self-contained and secret-free',
+      manifestCheckPass && secretSafe && scopeSafe,
+      'Attach only the exported directory after secret scan and self-contained directory checks pass.',
+      {
+        secret_scan_passed: secretSafe,
+        directory_scope_passed: scopeSafe,
+        secret_scan_failures: secretChecks.filter((check) => check.ok === false).length,
+        directory_scope_failures: scopeChecks.filter((check) => check.ok === false).length,
+      },
+    ),
+  ]
 }
 
 function inspectBundleStatus(opts = {}) {
@@ -1418,6 +1539,7 @@ function inspectBundleStatus(opts = {}) {
     controlEvidence,
   })
   addHostGoStatusNextSteps(next, { outDir, artifacts, agents, gateReceipt, manifestCheck, requiredControlVerbs, controlEvidence })
+  const hostGoChecklist = hostGoStatusChecklist({ outDir, artifacts, agents, gateReceipt, manifestCheck, requiredControlVerbs, controlEvidence })
 
   return {
     receipt_type: 'mupot-fleet-receipt-bundle-status/v1',
@@ -1435,6 +1557,7 @@ function inspectBundleStatus(opts = {}) {
       summary: manifestCheck.summary,
       manifest: manifestCheck.manifest,
     } : null,
+    host_go_checklist: hostGoChecklist,
     next_steps: next,
     checks,
   }

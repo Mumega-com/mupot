@@ -37,7 +37,7 @@ and the running product.
 | Approval gates | Customer-facing or high-risk actions wait for accountable approval. | `/approvals`, gated loops, gate protocol docs |
 | Observability | Operators can see agent liveness, tasks, gates, errors, and audit events. | `/ops`, dashboard modules, fleet presence, audit routes |
 | Browser confidence | Core dashboard, operator workflows, and Hermes flows are exercised in a local browser harness. | `scripts/local-browser-smoke.mjs`, `scripts/README.md` |
-| Commercial boundary | Non-commercial source availability is clear, and commercial use has a separate path. | `LICENSE`, README license section |
+| Commercial boundary | Non-commercial source availability is clear, and commercial use has a separate path. | `LICENSE.md`, README license section |
 
 ## Roadmap
 
