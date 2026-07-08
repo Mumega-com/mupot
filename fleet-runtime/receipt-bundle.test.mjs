@@ -27,6 +27,22 @@ function installReceipt(status = 'warn') {
   }
 }
 
+function probeReceipt(status = 'pass') {
+  return {
+    receipt_type: 'mupot-fleet-cutover-probe/v1',
+    generated_at: '2026-07-08T00:00:30.000Z',
+    status,
+    summary: { status, passed: status === 'pass' ? 2 : 1, failed: status === 'pass' ? 0 : 1, warnings: 0 },
+    actions: [
+      { kind: 'inbox_probe', target_agent: 'agent-one', request_id: 'probe-1-inbox', ok: status === 'pass' },
+      { kind: 'control_request', target_agent: 'agent-one', verb: 'start', ok: status === 'pass' },
+    ],
+    checks: [
+      { ok: status === 'pass', component: 'cutover-probe', check: 'inbox_probe_queued' },
+    ],
+  }
+}
+
 function hostReceipt(status = 'pass') {
   return {
     receipt_type: 'mupot-fleet-host-receipt/v1',
@@ -67,6 +83,7 @@ function controlReceipt(agentId, verb, status = 'pass') {
 test('receipt bundle writes host, runtime, control, cutover gate, and manifest', async () => {
   const outDir = tmpDir()
   const installPath = writeJson(join(tmpDir(), 'install.json'), installReceipt())
+  const probePath = writeJson(join(tmpDir(), 'start-probe.json'), probeReceipt())
   const bundle = await buildBundle({
     outDir,
     agents: ['agent-one'],
@@ -74,6 +91,7 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
     inboxPath: '/tmp/inbox.json',
     controlPath: '/tmp/control.json',
     installReceiptPath: installPath,
+    probeReceiptPaths: [probePath],
     controlLabel: 'restart',
     hostBuilder: async () => hostReceipt(),
     runtimeBuilder: async (opts) => runtimeReceipt(opts.agents[0]),
@@ -85,8 +103,11 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
   assert.equal(bundle.summary.failed, 0)
   assert.equal(bundle.artifacts.install.receipt_type, 'mupot-fleet-install-receipt/v1')
   assert.equal(bundle.artifacts.install.status, 'warn')
+  assert.equal(bundle.artifacts.probes.length, 1)
+  assert.equal(bundle.artifacts.probes[0].receipt_type, 'mupot-fleet-cutover-probe/v1')
   assert.equal(bundle.artifacts.cutover_gate.status, 'pass')
   assert.ok(existsSync(join(outDir, 'install.json')))
+  assert.ok(existsSync(join(outDir, 'probe-start-probe.json')))
   assert.ok(existsSync(join(outDir, 'host.json')))
   assert.ok(existsSync(join(outDir, 'runtime-agent-one.json')))
   assert.ok(existsSync(join(outDir, 'control-restart.json')))
@@ -96,9 +117,33 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
   const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
   assert.equal(manifest.status, 'pass')
   assert.equal(manifest.artifacts.install.status, 'warn')
+  assert.equal(manifest.artifacts.probes[0].status, 'pass')
   assert.ok(manifest.checks.some((c) => c.check === 'install_receipt_status_non_fail' && c.ok === true))
+  assert.ok(manifest.checks.some((c) => c.check === 'probe_receipt_status_pass' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'cutover_gate_status_pass' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'manifest_written' && c.ok === true))
+})
+
+test('receipt bundle fails when an included probe receipt did not queue inputs', async () => {
+  const outDir = tmpDir()
+  const probePath = writeJson(join(tmpDir(), 'failed-probe.json'), probeReceipt('fail'))
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    probeReceiptPaths: [probePath],
+    controlLabel: 'restart',
+    hostBuilder: async () => hostReceipt(),
+    runtimeBuilder: async (opts) => runtimeReceipt(opts.agents[0]),
+    controlBuilder: async () => controlReceipt('agent-one', 'restart'),
+  })
+
+  assert.equal(bundle.status, 'fail')
+  assert.ok(bundle.checks.some((c) => c.check === 'probe_receipt_status_pass' && c.ok === false && c.actual === 'fail'))
+  const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.artifacts.probes[0].status, 'fail')
 })
 
 test('receipt bundle can reuse existing host, runtime, and control receipts', async () => {
@@ -154,6 +199,7 @@ test('parseArgs accepts bundle controls and safe filenames', () => {
     '--inbox', './inbox.json',
     '--control', './control.json',
     '--install-receipt', './install.json',
+    '--probe-receipt', './probe-start.json,./probe-stop.json',
     '--control-label', 'start/pass',
     '--require-control-verb', 'restart',
     '--skip-host',
@@ -166,6 +212,9 @@ test('parseArgs accepts bundle controls and safe filenames', () => {
   assert.deepEqual(opts.agents, ['agent-one', 'agent-two'])
   assert.ok(opts.outDir.endsWith('/receipts'))
   assert.ok(opts.installReceiptPath.endsWith('/install.json'))
+  assert.equal(opts.probeReceiptPaths.length, 2)
+  assert.ok(opts.probeReceiptPaths[0].endsWith('/probe-start.json'))
+  assert.ok(opts.probeReceiptPaths[1].endsWith('/probe-stop.json'))
   assert.equal(opts.controlLabel, 'start_pass')
   assert.deepEqual(opts.requiredControlVerbs, ['restart'])
   assert.equal(opts.skipHost, true)

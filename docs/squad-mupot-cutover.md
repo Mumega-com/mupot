@@ -331,10 +331,14 @@ and exiting `0` so the daemon consumes the batch.
      --agent <agent_id> --out-dir ~/.fleet/receipts/<agent_id>
      --install-receipt ~/.fleet/receipts/install.json --skip-runtime
      --skip-control` first for install + host evidence. Then queue an inbox
-     probe and `start` control request with `cutover-probe.mjs`, rerun the
-     bundle with `--skip-host --control-label start`, queue `stop`, and rerun
-     with `--skip-host --skip-runtime --control-label stop`. The bundle writes
-     `install.json`, `host.json`, `runtime-<agent_id>.json`, `control-*.json`,
+     probe and `start` control request with `cutover-probe.mjs`, saving its
+     JSON as `~/.fleet/receipts/<agent_id>/probe-start.json`; rerun the bundle
+     with `--probe-receipt ~/.fleet/receipts/<agent_id>/probe-start.json
+     --skip-host --control-label start`; queue `stop` into
+     `probe-stop.json`, and rerun with `--probe-receipt
+     ~/.fleet/receipts/<agent_id>/probe-stop.json --skip-host --skip-runtime
+     --control-label stop`. The bundle writes `install.json`, `probe-*.json`,
+     `host.json`, `runtime-<agent_id>.json`, `control-*.json`,
      `cutover-gate.json`, and `manifest.json`; the cutover is ready only when
      both `manifest.json` and `cutover-gate.json` report `status:"pass"`.
 
@@ -357,7 +361,7 @@ and exiting `0` so the daemon consumes the batch.
 | control live | `control-receipt.mjs` emits `mupot-fleet-control-receipt/v1` with `status:"pass"` |
 | probe queue | `cutover-probe.mjs` emits `mupot-fleet-cutover-probe/v1` after queuing inbox/control evidence inputs |
 | SOS cutover gate | `cutover-receipt.mjs` emits `mupot-sos-cutover-gate/v1` with `status:"pass"` for that agent |
-| receipt bundle | `receipt-bundle.mjs` writes optional `install.json`, `mupot-fleet-receipt-bundle/v1` `manifest.json`, and `cutover-gate.json`; `manifest.json` and `cutover-gate.json` must both report `status:"pass"` |
+| receipt bundle | `receipt-bundle.mjs` writes optional `install.json`, optional `probe-*.json`, `mupot-fleet-receipt-bundle/v1` `manifest.json`, and `cutover-gate.json`; `manifest.json` and `cutover-gate.json` must both report `status:"pass"` |
 | wake-hook (post-route) | watcher launches a session from a mupot `inbox` poll, logged in `watcher.log` |
 
 ---

@@ -398,7 +398,7 @@ runtime and lifecycle evidence exist. If `--install-receipt` is supplied, the
 bundle copies it into `install.json` and accepts installer `status:"warn"` as
 non-failing because the later host pre-flight receipt proves edited config and
 key readiness. Queue the live inbox probe and `start` control request without
-putting tokens on the command line:
+putting tokens on the command line, and save the redacted queue receipt:
 
 ```bash
 MUPOT_AGENT_TOKEN='<welded-sender-token>' \
@@ -407,7 +407,8 @@ node ~/.fleet/runtime/cutover-probe.mjs \
   --base-url https://YOUR-POT.example.com \
   --agent my-agent \
   --queue-inbox \
-  --control start
+  --control start \
+  > ~/.fleet/receipts/my-agent/probe-start.json
 ```
 
 Then collect the runtime handoff and `start` control receipts:
@@ -416,6 +417,7 @@ Then collect the runtime handoff and `start` control receipts:
 node ~/.fleet/runtime/receipt-bundle.mjs \
   --agent my-agent \
   --out-dir ~/.fleet/receipts/my-agent \
+  --probe-receipt ~/.fleet/receipts/my-agent/probe-start.json \
   --skip-host \
   --control-label start
 ```
@@ -427,11 +429,13 @@ MUPOT_OWNER_TOKEN='<owner-token>' \
 node ~/.fleet/runtime/cutover-probe.mjs \
   --base-url https://YOUR-POT.example.com \
   --agent my-agent \
-  --control stop
+  --control stop \
+  > ~/.fleet/receipts/my-agent/probe-stop.json
 
 node ~/.fleet/runtime/receipt-bundle.mjs \
   --agent my-agent \
   --out-dir ~/.fleet/receipts/my-agent \
+  --probe-receipt ~/.fleet/receipts/my-agent/probe-stop.json \
   --skip-host \
   --skip-runtime \
   --control-label stop
