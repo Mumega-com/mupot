@@ -39,13 +39,22 @@ function idToString(v: unknown): string | null {
   return null
 }
 
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
 export const telegramAdapter: ChannelAdapter = {
   platform: 'telegram',
 
   // Fail-closed: the webhook must carry the secret_token registered via setWebhook.
   async verify(req: Request, env: Env): Promise<boolean> {
     if (!env.IM_WEBHOOK_SECRET) return false
-    return req.headers.get('X-Telegram-Bot-Api-Secret-Token') === env.IM_WEBHOOK_SECRET
+    const provided = req.headers.get('X-Telegram-Bot-Api-Secret-Token')
+    if (!provided) return false
+    return timingSafeEqual(provided, env.IM_WEBHOOK_SECRET)
   },
 
   async parseInbound(req: Request, _env: Env): Promise<InboundMessage | null> {
