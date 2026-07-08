@@ -253,6 +253,129 @@ function artifactStatusOk(label, status) {
   return status === 'pass'
 }
 
+function receiptBaseUrl(label, receipt) {
+  if (label.startsWith('probe:')) return receipt?.inputs?.base_url ?? null
+  return receipt?.target?.base_url ?? null
+}
+
+function receiptTenant(label, receipt) {
+  if (label.startsWith('probe:')) return null
+  return receipt?.target?.tenant ?? null
+}
+
+function receiptTargetAgents(label, receipt) {
+  const agents = []
+  const add = (value) => {
+    if (typeof value === 'string' && value.length > 0) agents.push(value)
+  }
+  if (label.startsWith('probe:')) {
+    add(receipt?.inputs?.agent)
+    for (const action of receipt?.actions ?? []) {
+      add(action?.target_agent)
+      add(action?.agent_id)
+    }
+  } else if (label.startsWith('runtime:')) {
+    for (const agent of receipt?.target?.agents ?? []) add(agent)
+    for (const agent of receipt?.inputs?.selected_agents ?? []) add(agent)
+    for (const result of receipt?.agents ?? []) add(result?.agent)
+  } else if (label.startsWith('control:')) {
+    for (const agent of receipt?.target?.executed_agents ?? []) add(agent)
+    add(receipt?.poll?.request?.agent_id)
+    for (const check of receipt?.checks ?? []) {
+      if (check?.component === 'fleet-control-daemon' && check?.check === 'control_request_executed') {
+        add(check?.agent_id)
+      }
+    }
+  } else if (label === 'host') {
+    for (const agent of receipt?.target?.daemon_agents ?? []) add(agent)
+  }
+  return sortStrings(agents)
+}
+
+function addTargetConsistencyChecks(checks, manifestPath, entries, receiptRecords, agents) {
+  const targetLabels = new Set(['host'])
+  for (const entry of entries) {
+    if (entry.label.startsWith('probe:') || entry.label.startsWith('runtime:') || entry.label.startsWith('control:')) {
+      targetLabels.add(entry.label)
+    }
+  }
+
+  const baseUrlRecords = []
+  const tenantRecords = []
+  for (const record of receiptRecords) {
+    if (!targetLabels.has(record.label)) continue
+    const baseUrl = receiptBaseUrl(record.label, record.receipt)
+    const tenant = receiptTenant(record.label, record.receipt)
+    checks.push({
+      ok: typeof baseUrl === 'string' && baseUrl.length > 0,
+      component: 'receipt-bundle-check',
+      check: 'artifact_target_base_url_recorded',
+      path: manifestPath,
+      artifact: record.label,
+      base_url: baseUrl,
+    })
+    if (baseUrl) baseUrlRecords.push({ label: record.label, value: baseUrl })
+
+    if (!record.label.startsWith('probe:')) {
+      checks.push({
+        ok: typeof tenant === 'string' && tenant.length > 0,
+        component: 'receipt-bundle-check',
+        check: 'artifact_target_tenant_recorded',
+        path: manifestPath,
+        artifact: record.label,
+        tenant,
+      })
+      if (tenant) tenantRecords.push({ label: record.label, value: tenant })
+    }
+  }
+
+  const baseUrls = sortStrings(baseUrlRecords.map((entry) => entry.value))
+  checks.push({
+    ok: baseUrls.length === 1,
+    component: 'receipt-bundle-check',
+    check: 'artifact_target_base_urls_match',
+    path: manifestPath,
+    base_urls: baseUrls,
+    artifacts: baseUrlRecords.map((entry) => entry.label),
+  })
+
+  const tenants = sortStrings(tenantRecords.map((entry) => entry.value))
+  checks.push({
+    ok: tenants.length === 1,
+    component: 'receipt-bundle-check',
+    check: 'artifact_target_tenants_match',
+    path: manifestPath,
+    tenants,
+    artifacts: tenantRecords.map((entry) => entry.label),
+  })
+
+  const selected = new Set(agents)
+  for (const record of receiptRecords) {
+    const targetAgents = receiptTargetAgents(record.label, record.receipt)
+    if (!(record.label.startsWith('probe:') || record.label.startsWith('runtime:') || record.label.startsWith('control:'))) continue
+    checks.push({
+      ok: targetAgents.length > 0 && targetAgents.every((agent) => selected.has(agent)),
+      component: 'receipt-bundle-check',
+      check: 'artifact_target_agents_selected',
+      path: manifestPath,
+      artifact: record.label,
+      agents: targetAgents,
+      selected_agents: sortStrings(agents),
+    })
+  }
+
+  const passingProbeRecords = receiptRecords.filter((record) => record.label.startsWith('probe:') && record.receipt?.status === 'pass')
+  for (const agentId of agents) {
+    checks.push({
+      ok: passingProbeRecords.some((record) => receiptTargetAgents(record.label, record.receipt).includes(agentId)),
+      component: 'receipt-bundle-check',
+      check: 'probe_artifact_for_agent',
+      path: manifestPath,
+      agent_id: agentId,
+    })
+  }
+}
+
 function sameSummary(actual, expected) {
   return actual?.status === expected?.status &&
     actual?.passed === expected?.passed &&
@@ -340,6 +463,7 @@ function receiptInputBasenames(paths) {
 }
 
 function addRequiredEvidenceChecks(checks, manifestPath, entries, agents) {
+  const probeEntries = entries.filter((entry) => entry.label.startsWith('probe:'))
   const runtimeEntries = entries.filter((entry) => entry.label.startsWith('runtime:'))
   const controlEntries = entries.filter((entry) => entry.label.startsWith('control:'))
   checks.push({
@@ -355,6 +479,14 @@ function addRequiredEvidenceChecks(checks, manifestPath, entries, agents) {
     check: 'required_artifact_present',
     path: manifestPath,
     artifact: 'host',
+  })
+  checks.push({
+    ok: probeEntries.length > 0,
+    component: 'receipt-bundle-check',
+    check: 'required_artifact_present',
+    path: manifestPath,
+    artifact: 'probe',
+    count: probeEntries.length,
   })
   checks.push({
     ok: runtimeEntries.length > 0,
@@ -521,6 +653,7 @@ function checkBundleManifest(opts = {}) {
     })
     const entries = bundleArtifactEntries(manifest)
     const agents = manifestAgents(manifest)
+    const receiptRecords = []
     checks.push({
       ok: entries.length > 0,
       component: 'receipt-bundle-check',
@@ -533,6 +666,7 @@ function checkBundleManifest(opts = {}) {
     for (const entry of entries) {
       const checkedPath = resolveArtifactPath(manifestDir, entry.path)
       const receipt = checkedPath ? readReceipt(checkedPath) : null
+      if (receipt) receiptRecords.push({ label: entry.label, receipt, checkedPath })
       const actual = checkedPath ? fileSha256(checkedPath) : null
       const expectedOk = typeof entry.sha256 === 'string' && /^[a-f0-9]{64}$/.test(entry.sha256)
       const expectedType = expectedArtifactType(entry.label)
@@ -621,6 +755,7 @@ function checkBundleManifest(opts = {}) {
       }
     }
 
+    addTargetConsistencyChecks(checks, manifestPath, entries, receiptRecords, agents)
     addNextStepChecks(checks, manifestPath, manifest, summarize(checks))
   }
 
@@ -852,6 +987,9 @@ function buildNextSteps({ artifacts, agents, gateReceipt, outDir, bundleStatus }
     add('rerun fleet-runtime/install.mjs and pass a valid mupot-fleet-install-receipt/v1 with status pass or warn')
   }
 
+  if ((artifacts.probes ?? []).length === 0) {
+    add('queue inbox and lifecycle evidence with cutover-probe.mjs, save probe-*.json, and rerun receipt-bundle with --probe-receipt')
+  }
   for (const probe of artifacts.probes ?? []) {
     if (probe?.status !== 'pass') {
       add('rerun cutover-probe.mjs for the failed probe and pass the new receipt with --probe-receipt')
@@ -916,6 +1054,12 @@ async function buildBundle(opts) {
 
   artifacts.install = includeInstallReceipt(outDir, opts, checks)
   artifacts.probes = includeProbeReceipts(outDir, opts, checks)
+  checks.push({
+    ok: artifacts.probes.some((probe) => probe?.status === 'pass'),
+    component: 'receipt-bundle',
+    check: 'probe_receipt_present',
+    count: artifacts.probes.length,
+  })
 
   if (!skipHost) {
     const path = join(outDir, 'host.json')
@@ -972,6 +1116,14 @@ async function buildBundle(opts) {
     const meta = receiptMeta(path)
     return { ...meta }
   })
+
+  const targetEntries = bundleArtifactEntries({ artifacts })
+  const targetReceiptRecords = []
+  for (const entry of targetEntries) {
+    const receipt = readReceipt(entry.path)
+    if (receipt) targetReceiptRecords.push({ label: entry.label, receipt, checkedPath: entry.path })
+  }
+  addTargetConsistencyChecks(checks, artifacts.manifest, targetEntries, targetReceiptRecords, agents)
 
   const gatePath = join(outDir, 'cutover-gate.json')
   const gateReceipt = await cutoverBuilder({

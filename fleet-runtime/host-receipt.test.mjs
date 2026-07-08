@@ -1,7 +1,7 @@
 // node --test host-receipt.test.mjs
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { buildReceipt, hasPlaceholder, summarize } from './host-receipt.mjs'
@@ -92,9 +92,17 @@ test('host receipt passes for a complete local host layout without executing pro
   assert.equal(receipt.receipt_type, 'mupot-fleet-host-receipt/v1')
   assert.equal(receipt.status, 'pass')
   assert.equal(receipt.summary.failed, 0)
+  assert.deepEqual(receipt.target, {
+    base_url: 'https://pot.example.org',
+    tenant: 'tenant-a',
+    daemon_agents: ['agent-one'],
+    control_consumer_agent: 'fleet-consumer',
+  })
   assert.ok(receipt.checks.some((c) => c.component === 'fleet-daemon' && c.check === 'agent_private_key_present_0600' && c.ok))
   assert.ok(receipt.checks.some((c) => c.component === 'inbox-handler' && c.check === 'daemon_inbox_agent_has_handler_config' && c.ok))
   assert.ok(receipt.checks.some((c) => c.component === 'fleet-control-daemon' && c.check === 'consumer_private_key_present_0600' && c.ok))
+  assert.ok(receipt.checks.some((c) => c.component === 'host-receipt' && c.check === 'daemon_control_base_url_match' && c.ok))
+  assert.ok(receipt.checks.some((c) => c.component === 'host-receipt' && c.check === 'daemon_control_tenant_match' && c.ok))
 })
 
 test('host receipt fails when daemon inbox agents have no handler config', async () => {
@@ -139,6 +147,49 @@ test('host receipt fails placeholder base_url and tenant values', async () => {
   assert.equal(receipt.status, 'fail')
   assert.ok(receipt.checks.some((c) => c.component === 'fleet-daemon' && c.check === 'base_url_real' && !c.ok))
   assert.ok(receipt.checks.some((c) => c.component === 'fleet-daemon' && c.check === 'tenant_real' && !c.ok))
+})
+
+test('host receipt fails when daemon and control config target different pots', async () => {
+  const f = fixture({
+    control: {
+      base_url: 'https://staging-pot.example.org',
+      tenant: 'tenant-b',
+      consumer_agent_id: 'fleet-consumer',
+      panel_public_key: join(tmp(), 'panel.pub.jwk'),
+      flights_config: join(tmp(), 'flights.json'),
+      flight_script: join(tmp(), 'flight.mjs'),
+    },
+  })
+  const control = JSON.parse(readFileSync(f.controlPath, 'utf8'))
+  touch(control.panel_public_key)
+  touch(control.flights_config)
+  touch(control.flight_script, 0o755)
+
+  const receipt = await buildReceipt({
+    daemonPath: f.daemonPath,
+    inboxPath: f.inboxPath,
+    controlPath: f.controlPath,
+    skipInbox: false,
+    skipControl: false,
+    execProbes: false,
+    keyPathFor: f.keyPathFor,
+  })
+
+  assert.equal(receipt.status, 'fail')
+  assert.ok(receipt.checks.some((c) =>
+    c.component === 'host-receipt' &&
+    c.check === 'daemon_control_base_url_match' &&
+    c.ok === false &&
+    c.daemon_base_url === 'https://pot.example.org' &&
+    c.control_base_url === 'https://staging-pot.example.org'
+  ))
+  assert.ok(receipt.checks.some((c) =>
+    c.component === 'host-receipt' &&
+    c.check === 'daemon_control_tenant_match' &&
+    c.ok === false &&
+    c.daemon_tenant === 'tenant-a' &&
+    c.control_tenant === 'tenant-b'
+  ))
 })
 
 test('summary and placeholder helpers keep receipt status deterministic', () => {

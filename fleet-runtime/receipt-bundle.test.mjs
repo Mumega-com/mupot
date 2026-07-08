@@ -7,6 +7,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { buildBundle, checkBundleManifest, parseArgs, safeName } from './receipt-bundle.mjs'
 
+const POT_URL = 'https://pot.example.org'
+const POT_TENANT = 'tenant-a'
+
 function tmpDir() {
   return mkdtempSync(join(tmpdir(), 'mupot-receipt-bundle-'))
 }
@@ -38,6 +41,12 @@ function probeReceipt(status = 'pass') {
     generated_at: '2026-07-08T00:00:30.000Z',
     status,
     summary: { status, passed: status === 'pass' ? 2 : 1, failed: status === 'pass' ? 0 : 1, warnings: 0 },
+    inputs: {
+      base_url: POT_URL,
+      agent: 'agent-one',
+      queue_inbox: true,
+      control_verbs: ['start'],
+    },
     actions: [
       { kind: 'inbox_probe', target_agent: 'agent-one', request_id: 'probe-1-inbox', ok: status === 'pass' },
       { kind: 'control_request', target_agent: 'agent-one', verb: 'start', ok: status === 'pass' },
@@ -54,6 +63,12 @@ function hostReceipt(status = 'pass') {
     generated_at: '2026-07-08T00:00:00.000Z',
     status,
     summary: { status, passed: 1, failed: status === 'pass' ? 0 : 1, warnings: 0 },
+    target: {
+      base_url: POT_URL,
+      tenant: POT_TENANT,
+      daemon_agents: ['agent-one'],
+      control_consumer_agent: 'fleet-consumer',
+    },
     checks: [],
   }
 }
@@ -64,6 +79,11 @@ function runtimeReceipt(agentId, status = 'pass') {
     generated_at: '2026-07-08T00:01:00.000Z',
     status,
     inputs: { selected_agents: [agentId] },
+    target: {
+      base_url: POT_URL,
+      tenant: POT_TENANT,
+      agents: [agentId],
+    },
     agents: [{ agent: agentId }],
     checks: [
       { ok: true, component: 'fleet-daemon', check: 'signed_attach_ok', agent_id: agentId },
@@ -78,6 +98,12 @@ function controlReceipt(agentId, verb, status = 'pass') {
     receipt_type: 'mupot-fleet-control-receipt/v1',
     generated_at: '2026-07-08T00:02:00.000Z',
     status,
+    target: {
+      base_url: POT_URL,
+      tenant: POT_TENANT,
+      consumer_agent: 'fleet-consumer',
+      executed_agents: [agentId],
+    },
     checks: [
       { ok: true, component: 'fleet-control-daemon', check: 'control_request_executed', agent_id: agentId, verb, action },
     ],
@@ -165,6 +191,7 @@ test('receipt bundle fails when an included probe receipt did not queue inputs',
 
 test('receipt bundle can reuse existing host, runtime, and control receipts', async () => {
   const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
   writeJson(join(outDir, 'host.json'), hostReceipt())
   writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
   writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
@@ -190,6 +217,7 @@ test('receipt bundle can reuse existing host, runtime, and control receipts', as
 
 test('verify-only rechecks an existing bundle without live receipt builders', async () => {
   const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
   writeJson(join(outDir, 'host.json'), hostReceipt())
   writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
   writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
@@ -223,6 +251,7 @@ test('verify-only rechecks an existing bundle without live receipt builders', as
 
   const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
   assert.equal(manifest.inputs.verify_only, true)
+  assert.equal(manifest.artifacts.probes[0].sha256, sha256(join(outDir, 'probe-start.json')))
   assert.equal(manifest.artifacts.host.sha256, sha256(join(outDir, 'host.json')))
   assert.equal(manifest.artifacts.runtimes[0].sha256, sha256(join(outDir, 'runtime-agent-one.json')))
   assert.equal(manifest.artifacts.controls[0].sha256, sha256(join(outDir, 'control-start.json')))
@@ -232,6 +261,7 @@ test('verify-only rechecks an existing bundle without live receipt builders', as
 
 test('manifest check verifies copied bundle hashes without rewriting files', async () => {
   const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
   writeJson(join(outDir, 'host.json'), hostReceipt())
   writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
   writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
@@ -286,7 +316,29 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
   ))
   assert.ok(check.checks.some((c) =>
     c.check === 'required_artifact_present' &&
+    c.artifact === 'probe' &&
+    c.ok === true
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'required_artifact_present' &&
     c.artifact === 'runtime' &&
+    c.ok === true
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'probe_artifact_for_agent' &&
+    c.agent_id === 'agent-one' &&
+    c.ok === true
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'artifact_target_base_urls_match' &&
+    c.base_urls.length === 1 &&
+    c.base_urls[0] === POT_URL &&
+    c.ok === true
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'artifact_target_tenants_match' &&
+    c.tenants.length === 1 &&
+    c.tenants[0] === POT_TENANT &&
     c.ok === true
   ))
   assert.ok(check.checks.some((c) =>
@@ -333,6 +385,7 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
 
 test('manifest check fails when next_steps contradict readiness', async () => {
   const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
   writeJson(join(outDir, 'host.json'), hostReceipt())
   writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
   writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
@@ -368,6 +421,7 @@ test('manifest check fails when next_steps contradict readiness', async () => {
 
 test('manifest check fails when cutover gate inputs disagree with manifest evidence', async () => {
   const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
   writeJson(join(outDir, 'host.json'), hostReceipt())
   writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
   writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
@@ -418,6 +472,7 @@ test('manifest check fails when cutover gate inputs disagree with manifest evide
 
 test('manifest check fails when required evidence categories are missing', async () => {
   const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
   writeJson(join(outDir, 'host.json'), hostReceipt())
   writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
   writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
@@ -433,6 +488,7 @@ test('manifest check fails when required evidence categories are missing', async
 
   const manifestPath = join(outDir, 'manifest.json')
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.probes = []
   manifest.artifacts.host = null
   manifest.artifacts.runtimes = []
   writeJson(manifestPath, manifest)
@@ -440,6 +496,11 @@ test('manifest check fails when required evidence categories are missing', async
   const check = checkBundleManifest({ manifestPath })
 
   assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((c) =>
+    c.check === 'required_artifact_present' &&
+    c.artifact === 'probe' &&
+    c.ok === false
+  ))
   assert.ok(check.checks.some((c) =>
     c.check === 'required_artifact_present' &&
     c.artifact === 'host' &&
@@ -460,6 +521,7 @@ test('manifest check fails when required evidence categories are missing', async
 
 test('manifest check fails when manifest status or summary disagrees with recorded checks', async () => {
   const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
   writeJson(join(outDir, 'host.json'), hostReceipt())
   writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
   writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
@@ -500,6 +562,7 @@ test('manifest check fails when manifest status or summary disagrees with record
 
 test('manifest check fails when manifest metadata disagrees with artifact content', async () => {
   const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
   writeJson(join(outDir, 'host.json'), hostReceipt())
   writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
   writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
@@ -538,14 +601,50 @@ test('manifest check fails when manifest metadata disagrees with artifact conten
   ))
 })
 
+test('manifest check fails when receipt target identity mixes pots', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+  await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+  })
+
+  const runtimePath = join(outDir, 'runtime-agent-one.json')
+  const runtime = JSON.parse(readFileSync(runtimePath, 'utf8'))
+  runtime.target.base_url = 'https://staging-pot.example.org'
+  writeJson(runtimePath, runtime)
+
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.runtimes[0].sha256 = sha256(runtimePath)
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ manifestPath })
+  const mismatch = check.checks.find((c) => c.check === 'artifact_target_base_urls_match')
+
+  assert.equal(check.status, 'fail')
+  assert.equal(mismatch.ok, false)
+  assert.deepEqual(mismatch.base_urls, [POT_URL, 'https://staging-pot.example.org'].sort())
+})
+
 test('receipt bundle fails when the final cutover gate lacks stop evidence', async () => {
   const outDir = tmpDir()
+  const probePath = writeJson(join(tmpDir(), 'start-probe.json'), probeReceipt())
   const bundle = await buildBundle({
     outDir,
     agents: ['agent-one'],
     daemonPath: '/tmp/daemon.json',
     inboxPath: '/tmp/inbox.json',
     controlPath: '/tmp/control.json',
+    probeReceiptPaths: [probePath],
     controlLabel: 'start',
     hostBuilder: async () => hostReceipt(),
     runtimeBuilder: async (opts) => runtimeReceipt(opts.agents[0]),

@@ -149,6 +149,12 @@ export async function buildReceipt(opts) {
       control_config: opts.controlPath,
       consumer_agent: cfg?.consumerAgent ?? null,
     },
+    target: {
+      base_url: cfg?.baseUrl ?? null,
+      tenant: cfg?.tenant ?? null,
+      consumer_agent: cfg?.consumerAgent ?? null,
+      executed_agents: pollResult?.request?.agent_id ? [pollResult.request.agent_id] : [],
+    },
     checks,
     poll: pollResult,
   }

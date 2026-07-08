@@ -456,11 +456,12 @@ node ~/.fleet/runtime/receipt-bundle.mjs \
 To verify a copied bundle without rewriting anything, run the manifest check. It
 reads `manifest.json`, checks the recorded receipt artifact SHA-256 hashes, reads
 each saved receipt JSON, verifies receipt type/status against the manifest,
-requires the host/runtime/control/cutover-gate evidence categories, recomputes
-the manifest summary from its recorded checks, verifies the cutover gate was
-built for the manifest's selected agents/control verbs/artifacts, verifies
-`next_steps` does not contradict readiness, and exits non-zero if any saved
-file or manifest status drifted:
+requires the host/probe/runtime/control/cutover-gate evidence categories,
+recomputes the manifest summary from its recorded checks, verifies the cutover
+gate was built for the manifest's selected agents/control verbs/artifacts,
+verifies all non-secret receipt target identities agree on the same pot base URL
+and tenant, verifies `next_steps` does not contradict readiness, and exits
+non-zero if any saved file or manifest status drifted:
 
 ```bash
 node ~/.fleet/runtime/receipt-bundle.mjs \
@@ -486,11 +487,14 @@ The manifest includes SHA-256 hashes for the saved receipt artifacts
 inside itself because that file is self-referential. The manifest check emits
 `mupot-fleet-receipt-bundle-check/v1`; it accepts installer `pass|warn` and
 requires the host, probe, runtime, control, and cutover-gate receipts to be
-`status:"pass"`. It also requires a runtime artifact for each selected agent.
+`status:"pass"`. It also requires probe and runtime artifacts for each selected
+agent.
 The check receipt includes the SHA-256 of the `manifest.json` file it inspected
-and compares `cutover-gate.json.inputs` back to the manifest evidence. It also
-rejects advisory `next_steps` guidance that says to attach the bundle before the
-hard gate passes, or says to keep SOS wiring after the hard gate passes.
+and compares `cutover-gate.json.inputs` back to the manifest evidence. It
+rejects copied evidence that mixes receipts from different pot base URLs or
+tenants. It also rejects advisory `next_steps` guidance that says to attach the
+bundle before the hard gate passes, or says to keep SOS wiring after the hard
+gate passes.
 
 Every bundle manifest also includes `next_steps`. Treat those as operator
 guidance only: the hard gate remains `manifest.json` and `cutover-gate.json`

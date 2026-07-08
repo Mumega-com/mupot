@@ -191,6 +191,11 @@ export async function buildReceipt(opts) {
       daemon_config: opts.daemonPath,
       selected_agents: (opts.agents ?? []).length > 0 ? opts.agents : agents.map((a) => a.agent_id),
     },
+    target: {
+      base_url: cfg?.baseUrl ?? null,
+      tenant: cfg?.tenant ?? null,
+      agents: agents.map((a) => a.agent_id),
+    },
     checks,
     agents: results,
   }

@@ -260,11 +260,30 @@ function collectControlChecks(opts, checks) {
   return cfg
 }
 
+function addHostTargetConsistencyChecks(checks, daemonCfg, controlCfg) {
+  if (!daemonCfg || !controlCfg) return
+  checks.push({
+    ok: daemonCfg.baseUrl === controlCfg.baseUrl,
+    component: 'host-receipt',
+    check: 'daemon_control_base_url_match',
+    daemon_base_url: daemonCfg.baseUrl,
+    control_base_url: controlCfg.baseUrl,
+  })
+  checks.push({
+    ok: daemonCfg.tenant === controlCfg.tenant,
+    component: 'host-receipt',
+    check: 'daemon_control_tenant_match',
+    daemon_tenant: daemonCfg.tenant,
+    control_tenant: controlCfg.tenant,
+  })
+}
+
 export async function buildReceipt(opts) {
   const checks = []
   const daemonCfg = collectDaemonChecks(opts, checks)
   collectInboxChecks(opts, checks, daemonCfg)
-  collectControlChecks(opts, checks)
+  const controlCfg = collectControlChecks(opts, checks)
+  addHostTargetConsistencyChecks(checks, daemonCfg, controlCfg)
 
   if (opts.execProbes && daemonCfg) {
     for (const agent of daemonCfg.agents) {
@@ -284,6 +303,12 @@ export async function buildReceipt(opts) {
       inbox_handler_config: opts.skipInbox ? null : opts.inboxPath,
       control_config: opts.skipControl ? null : opts.controlPath,
       exec_probes: opts.execProbes,
+    },
+    target: {
+      base_url: daemonCfg?.baseUrl ?? controlCfg?.baseUrl ?? null,
+      tenant: daemonCfg?.tenant ?? controlCfg?.tenant ?? null,
+      daemon_agents: (daemonCfg?.agents ?? []).map((agent) => agent.agent_id),
+      control_consumer_agent: controlCfg?.consumerAgent ?? null,
     },
     checks,
   }
