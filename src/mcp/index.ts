@@ -117,6 +117,10 @@ function memberMemoryScope(memberId: string): string {
   return `member:${memberId}`
 }
 
+function squadMemoryScope(squadId: string): string {
+  return `squad:${squadId}`
+}
+
 // ── token hashing (Web Crypto, SHA-256 hex) ──────────────────────────────────
 // Same discipline as the SOS bus: we store/compare only the hex digest, never
 // the raw token. Constant work; no secret ever leaves this function as output.
@@ -352,6 +356,12 @@ function readLimit(v: unknown, fallback: number, max: number): number | Extract<
   if (v === undefined || v === null) return fallback
   if (typeof v !== 'number' || !Number.isFinite(v)) return failOnly(400, 'invalid_args', 'limit must be a number')
   return Math.min(max, Math.max(1, Math.floor(v)))
+}
+
+function readConcepts(v: unknown): string[] | undefined | Extract<ToolOutcome, { ok: false }> {
+  if (v === undefined || v === null) return undefined
+  if (!Array.isArray(v)) return failOnly(400, 'invalid_args', 'concepts must be a string[]')
+  return v.filter((x): x is string => typeof x === 'string')
 }
 
 async function loadTask(env: Env, taskId: string): Promise<Task | null> {
@@ -709,12 +719,8 @@ const toolRemember: ToolSpec = {
     const text = str(args.text)
     if (!text) return fail(400, 'invalid_args', 'text required')
 
-    let concepts: string[] | undefined
-    if (Array.isArray(args.concepts)) {
-      concepts = args.concepts.filter((x): x is string => typeof x === 'string')
-    } else if (args.concepts !== undefined) {
-      return fail(400, 'invalid_args', 'concepts must be a string[]')
-    }
+    const concepts = readConcepts(args.concepts)
+    if (concepts && !Array.isArray(concepts)) return concepts
 
     const scope = memberMemoryScope(auth.memberId as string)
     const id = await createMemory(env).remember(scope, text, concepts)
@@ -748,6 +754,75 @@ const toolRecall: ToolSpec = {
     const scope = memberMemoryScope(auth.memberId as string)
     const hits = await createMemory(env).recall(scope, query, limit)
     return done({ hits })
+  },
+}
+
+// squad_remember — write to the squad's shared memory scope. cap: member+ on squad.
+// Agent-bound tokens may omit squad_id and default to their own squad.
+const toolSquadRemember: ToolSpec = {
+  name: 'squad_remember',
+  scope: 'squad memory',
+  min: 'member',
+  args: '{ squad_id?: string, text: string, concepts?: string[] }',
+  inputSchema: {
+    type: 'object',
+    properties: { squad_id: STRING_SCHEMA, text: STRING_SCHEMA, concepts: OPTIONAL_STRING_ARRAY_SCHEMA },
+    required: ['text'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const text = str(args.text)
+    if (!text) return fail(400, 'invalid_args', 'text required')
+
+    const concepts = readConcepts(args.concepts)
+    if (concepts && !Array.isArray(concepts)) return concepts
+
+    const squadRes = await resolveScopedSquad(
+      env,
+      auth,
+      args,
+      'member',
+      'squad_id required unless the token is agent-bound',
+    )
+    if (!squadRes.ok) return squadRes
+
+    const scope = squadMemoryScope(squadRes.squad.id)
+    const id = await createMemory(env).remember(scope, text, concepts)
+    return done({ engram_id: id, squad_id: squadRes.squad.id, scope })
+  },
+}
+
+// squad_recall — read the squad's shared memory scope. cap: observer+ on squad.
+// This is intentionally separate from recall so private per-token memory remains private.
+const toolSquadRecall: ToolSpec = {
+  name: 'squad_recall',
+  scope: 'squad memory',
+  min: 'observer',
+  args: '{ squad_id?: string, query: string, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: { squad_id: STRING_SCHEMA, query: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA },
+    required: ['query'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const query = str(args.query)
+    if (!query) return fail(400, 'invalid_args', 'query required')
+    const limit = readLimit(args.limit, 5, 20)
+    if (typeof limit !== 'number') return limit
+
+    const squadRes = await resolveScopedSquad(
+      env,
+      auth,
+      args,
+      'observer',
+      'squad_id required unless the token is agent-bound',
+    )
+    if (!squadRes.ok) return squadRes
+
+    const scope = squadMemoryScope(squadRes.squad.id)
+    const hits = await createMemory(env).recall(scope, query, limit)
+    return done({ squad_id: squadRes.squad.id, scope, hits })
   },
 }
 
@@ -1503,6 +1578,8 @@ export const TOOLS: ToolSpec[] = [
   toolTaskUpdate,
   toolRemember,
   toolRecall,
+  toolSquadRemember,
+  toolSquadRecall,
   toolWakeAgent,
   toolSquadMessage,
   toolSend,

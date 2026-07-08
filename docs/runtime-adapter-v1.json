@@ -136,6 +136,18 @@
       "payload_too_large"
     ]
   },
+  "memory": {
+    "privateMcpTools": ["remember", "recall"],
+    "squadMcpTools": ["squad_remember", "squad_recall"],
+    "privateScope": "member:<member_id>",
+    "squadScope": "squad:<squad_id>",
+    "squadAuthorization": {
+      "write": "member-on-target-squad",
+      "read": "observer-on-target-squad"
+    },
+    "defaultSquad": "agent-bound-token-may-derive-squad-from-auth.boundAgentId",
+    "vectorFilter": ["agentId", "tenant"]
+  },
   "peerDiscovery": {
     "mcpTools": ["peers"],
     "defaultSquad": "agent-bound-token-may-derive-squad-from-auth.boundAgentId",

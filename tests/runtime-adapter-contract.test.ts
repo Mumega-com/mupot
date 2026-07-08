@@ -43,6 +43,15 @@ const contract = JSON.parse(
       idempotency: string
     }
   }
+  memory: {
+    privateMcpTools: string[]
+    squadMcpTools: string[]
+    privateScope: string
+    squadScope: string
+    squadAuthorization: { write: string; read: string }
+    defaultSquad: string
+    vectorFilter: string[]
+  }
   peerDiscovery: {
     mcpTools: string[]
     defaultSquad: string
@@ -126,6 +135,19 @@ describe('runtime-adapter/v1 contract artifact', () => {
       handoff: 'write-0600-spool-before-exit-0',
     })
     expect(contract.messaging.hostHandler.failure).toContain('unread')
+  })
+
+  it('captures private and squad memory scope semantics', () => {
+    expect(contract.memory.privateMcpTools).toEqual(['remember', 'recall'])
+    expect(contract.memory.squadMcpTools).toEqual(['squad_remember', 'squad_recall'])
+    expect(contract.memory.privateScope).toBe('member:<member_id>')
+    expect(contract.memory.squadScope).toBe('squad:<squad_id>')
+    expect(contract.memory.squadAuthorization).toEqual({
+      write: 'member-on-target-squad',
+      read: 'observer-on-target-squad',
+    })
+    expect(contract.memory.defaultSquad).toContain('auth.boundAgentId')
+    expect(contract.memory.vectorFilter).toEqual(['agentId', 'tenant'])
   })
 
   it('captures signed host lifecycle control semantics', () => {

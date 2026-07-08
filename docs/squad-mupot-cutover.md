@@ -24,6 +24,8 @@ The arms' frontmatter lists `mcp__mumega-bus__*` tools (SOS bus). The mupot seam
 | `task_update` | `src/mcp/index.ts` | `member` | task squad |
 | `remember` | `src/mcp/index.ts` | `authenticated` | self (member scope) |
 | `recall` | `src/mcp/index.ts` | `authenticated` | self (member scope) |
+| `squad_remember` | `src/mcp/index.ts` | `member` | shared squad memory |
+| `squad_recall` | `src/mcp/index.ts` | `observer` | shared squad memory |
 | `wake_agent` | `src/mcp/index.ts` | `lead` | agent's squad |
 | `squad_message` | `src/mcp/index.ts` | `member` | squad |
 | `send` | `src/mcp/index.ts` | `authenticated` **+ agent-bound** | agent→agent, this pot |
@@ -55,8 +57,9 @@ The arms' frontmatter lists `mcp__mumega-bus__*` tools (SOS bus). The mupot seam
 | `task_update` (kasra-code) | `task_update` | **covered** — same transition/gate checks as the HTTP task route |
 | `task_board` / `task_list` (brain) | `task_board` / `task_list` | **covered** — member-gated on squad; agent-bound tokens default to their own squad |
 | `peers` (kasra-comms, brain) | `peers` | **covered** — single-squad roster; agent-bound tokens default to their own squad |
+| `squad_remember` / `squad_recall` | `squad_remember` / `squad_recall` | **covered** — shared squad memory under `squad:<squad_id>` |
 
-**Implication for the loadout (section 1):** the arms' listed *bus* primitives now have Mupot equivalents. The remaining coordination gap is not a frontmatter tool in the arm defs: shared squad memory (`squad_remember`/`squad_recall`) stays on SOS or becomes a follow-on build.
+**Implication for the loadout (section 1):** the arms' listed *bus* primitives now have Mupot equivalents, including direct messaging, inbox, broadcast, peer discovery, task coordination, private memory, and shared squad memory. The remaining cutover work is operational: mint/wire tokens, run receipts, and roll out the signed host inbox handler.
 
 ---
 
@@ -81,6 +84,8 @@ The arms' frontmatter lists `mcp__mumega-bus__*` tools (SOS bus). The mupot seam
 
 What `member` actually buys, per the tool gates:
 - `recall` / `remember` / `boot_context` / `check_in` / `status` / `orient` / `connect` — `min: 'authenticated'` → any live token (`src/mcp/index.ts`).
+- `squad_recall` — `min: 'observer'` on the target squad; agent-bound tokens may omit `squad_id` and default to their own squad (`src/mcp/index.ts`).
+- `squad_remember` — `min: 'member'` on the target squad; agent-bound tokens may omit `squad_id` and default to their own squad (`src/mcp/index.ts`).
 - `send` / `inbox` — `min: 'authenticated'` **AND** `auth.boundAgentId` set (the weld) → a minted token passes; a bare apikey does not (`src/mcp/index.ts`).
 - `broadcast` — `min: 'member'` on the target squad **AND** `auth.boundAgentId` set; by default it fans out to active squad agents except the sender (`src/mcp/index.ts`).
 - `peers` — `min: 'authenticated'` plus `observer` on the target squad; a minted `member` token passes for its OWN squad and defaults there when `squad_id` is omitted (`src/mcp/index.ts`).
@@ -131,11 +136,11 @@ All calls are `POST https://mupot.mumega.com/mcp` with `Authorization: Bearer <O
 
 | arm | bus tools in its def (frontmatter) | mupot tools it gets with a `member`-welded token | remaining caveat |
 |---|---|---|---|
-| **kasra-review** | `send, inbox, recall, remember` (`kasra-review.md:18-21`) | `send`, `inbox`, `recall`, `remember`, `status`, `orient`, `boot_context` | none — fully covered |
-| **kasra-code** | `send, inbox, recall, remember, check_in, task_update` (`kasra-code.md:20-25`) | `send`, `inbox`, `recall`, `remember`, `check_in`, `task_create`, `task_update`, `task_list`, `task_board`, `squad_message` | none for listed bus tools except broader shared-memory caveat |
-| **kasra-comms** | `send, inbox, broadcast, check_in, peers, recall, remember` (`kasra-comms.md:13-19`) | `send`, `inbox`, `broadcast`, `recall`, `remember`, `check_in`, `peers`, `squad_message` | none for listed bus tools except broader shared-memory caveat |
-| **kasra-research** | `send, inbox, recall, remember` (`kasra-research.md:17-20`) | `send`, `inbox`, `recall`, `remember`, `status`, `orient` | none — fully covered |
-| **brain** | `inbox, send, recall, remember, boot_context, status, task_board` (`brain.md:22-28`) + an `mcp__sos__*` set (`brain.md:11-21`) | `inbox`, `send`, `recall`, `remember`, `boot_context`, `check_in`, `peers`, `status`, `task_board`, `task_list`, `task_update` | none for listed bus tools except broader shared-memory caveat |
+| **kasra-review** | `send, inbox, recall, remember` (`kasra-review.md:18-21`) | `send`, `inbox`, `recall`, `remember`, `squad_recall`, `squad_remember`, `status`, `orient`, `boot_context` | none — fully covered |
+| **kasra-code** | `send, inbox, recall, remember, check_in, task_update` (`kasra-code.md:20-25`) | `send`, `inbox`, `recall`, `remember`, `squad_recall`, `squad_remember`, `check_in`, `task_create`, `task_update`, `task_list`, `task_board`, `squad_message` | none — fully covered |
+| **kasra-comms** | `send, inbox, broadcast, check_in, peers, recall, remember` (`kasra-comms.md:13-19`) | `send`, `inbox`, `broadcast`, `recall`, `remember`, `squad_recall`, `squad_remember`, `check_in`, `peers`, `squad_message` | none — fully covered |
+| **kasra-research** | `send, inbox, recall, remember` (`kasra-research.md:17-20`) | `send`, `inbox`, `recall`, `remember`, `squad_recall`, `squad_remember`, `status`, `orient` | none — fully covered |
+| **brain** | `inbox, send, recall, remember, boot_context, status, task_board` (`brain.md:22-28`) + an `mcp__sos__*` set (`brain.md:11-21`) | `inbox`, `send`, `recall`, `remember`, `squad_recall`, `squad_remember`, `boot_context`, `check_in`, `peers`, `status`, `task_board`, `task_list`, `task_update` | none — fully covered |
 | **kasra** (core) | (uses the workspace `.mcp.json` `sos` server, not a `mcp__mumega-bus__` allowlist) | full `member` set incl. `task_create`, `squad_message` | merge/deploy stays bus-side + GitHub regardless |
 
 **Capture discipline (BINDING — Hadi's rule, agent-comms § secrets):** each `raw` is a credential. Never echo it onto the bus, into chat, or into a logged argv. From the mint response, write each `raw` directly into the target arm's config file (section 2) under `chmod 600`, or pipe it through `npx wrangler secret put` / an age-encrypted handoff. The mint return deliberately hands back `raw` as a BARE field, not a ready-made config snippet, exactly so the operator renders config locally and never round-trips the secret (`src/mcp/provision.ts`).
@@ -154,7 +159,7 @@ The arm defs reference tools by the server alias prefix: `mcp__mumega-bus__send`
 
 ### 2.2 Does mupot expose the same tool names? — YES for the core set
 
-Confirmed against `src/mcp/index.ts`: `recall`, `remember`, `send`, `broadcast`, `inbox`, `boot_context`, `status`, `check_in`, `peers`, `task_list`, `task_board`, and `task_update` are byte-identical tool names to the bus where those bus tools exist. So an arm allowlist entry `mcp__mumega-bus__recall` becomes `mcp__mupot__recall` — same tool name, new server prefix. The transport is **HTTP** (mupot's `POST /mcp` accepts pragmatic JSON and JSON-RPC `tools/call`, `src/mcp/index.ts`), so the server entry is `type: "http"`, identical in shape to the existing `mumega-bus` entry.
+Confirmed against `src/mcp/index.ts`: `recall`, `remember`, `squad_recall`, `squad_remember`, `send`, `broadcast`, `inbox`, `boot_context`, `status`, `check_in`, `peers`, `task_list`, `task_board`, and `task_update` are byte-identical tool names to the bus where those bus tools exist. So an arm allowlist entry `mcp__mumega-bus__recall` becomes `mcp__mupot__recall` — same tool name, new server prefix. The transport is **HTTP** (mupot's `POST /mcp` accepts pragmatic JSON and JSON-RPC `tools/call`, `src/mcp/index.ts`), so the server entry is `type: "http"`, identical in shape to the existing `mumega-bus` entry.
 
 ### 2.3 Add the mupot MCP server entry
 
@@ -264,12 +269,13 @@ and exiting `0` so the daemon consumes the batch.
 
 1. **Mint all six tokens (section 1).** Receipt: each `mint_agent_token` returns `{ token: { raw, agent_id, member_id }, … }` with `agent_id` set — that IS the weld receipt (`src/mcp/provision.ts`). Capture raw securely; do not proceed if any mint 4xx'd.
 
-2. **Memory cutover — verify scope first (reversible).** For ONE arm, point only `recall`/`remember` at mupot and run a round-trip:
+2. **Memory cutover — verify private and shared scopes first (reversible).** For ONE arm, point memory tools at mupot and run two round-trips:
    - `remember { text: "cutover-probe-<ts>" }` → receipt `{ engram_id }` (`src/mcp/index.ts`).
    - `recall { query: "cutover-probe" }` → the probe text comes back (`src/mcp/index.ts`).
-   - **Memory-scope reality (load-bearing):** mupot memory is **per-member-token**, NOT shared. `remember`/`recall` use `scope = member:<memberId>` (`src/mcp/index.ts`), which the MemoryPort maps to `engrams.agent_id` and filters Vectorize by `{ agentId: scope, tenant }` (`src/memory/index.ts:53, 66`). **Each minted token is its own member → its own isolated memory silo.** kasra-code cannot recall kasra-review's engrams, and neither sees the shared `MEMORY.md` / project memory.
-     - **Consequence:** the squad's shared project memory (`MEMORY.md`, the bus `squad_remember`/`squad_recall` surface) does **NOT** migrate by minting tokens. mupot has no `squad_recall`/`squad_remember` tool (not in `TOOLS`, `src/mcp/index.ts`). Shared squad memory stays on SOS, OR becomes a follow-on (a squad-scoped memory tool on mupot). Flag to Hadi: **arms get private memory on mupot; shared squad memory is NOT covered by this cutover.**
-   - Rollback: revert the arm's `recall`/`remember` prefixes to `mcp__mumega-bus__*`. Zero data loss — bus memory untouched.
+   - Private memory remains per-member-token: `remember`/`recall` use `scope = member:<memberId>` (`src/mcp/index.ts`), which the MemoryPort maps to `engrams.agent_id` and filters Vectorize by `{ agentId: scope, tenant }` (`src/memory/index.ts`).
+   - Then verify shared squad memory: `squad_remember { text: "shared-cutover-probe-<ts>" }` from arm A returns `{ engram_id, squad_id, scope: "squad:<id>" }`, and `squad_recall { query: "shared-cutover-probe" }` from arm B in the same squad returns the probe.
+   - Shared memory uses `scope = squad:<squadId>` and the same tenant-filtered MemoryPort. Writes require `member` on the target squad; reads require `observer` on the target squad.
+   - Rollback: revert the arm's `recall`/`remember`/`squad_recall`/`squad_remember` prefixes to `mcp__mumega-bus__*`. Zero data loss — bus memory untouched.
 
 3. **Messaging cutover (per arm, reversible).** Repoint `send`/`inbox` for one arm (start with **kasra-review** — zero-gap, section 2.4). Receipt:
    - From arm A's token: `send { to: "<arm-B-slug>", body: "ping", request_id: "<uuid>" }` → `{ id, seq, duplicate:false, to }` (`src/mcp/index.ts`).
@@ -298,7 +304,8 @@ and exiting `0` so the daemon consumes the batch.
 | step | receipt (not a grade) |
 |---|---|
 | mint | mint response `token.agent_id` set + `raw` captured |
-| memory | `remember`→`engram_id`, `recall` returns the probe |
+| private memory | `remember`→`engram_id`, `recall` returns the probe |
+| squad memory | `squad_remember`→`scope:"squad:<id>"`, peer `squad_recall` returns the probe |
 | messaging | `send`→`seq`, peer `inbox` shows it, `remaining` decrements |
 | broadcast | `broadcast`→`delivered:N`, peer `inbox` shows one fan-out message |
 | check-in | MCP `check_in { source, label }` or `POST /api/fleet/checkin` → `{ ok:true, agent }` |
@@ -309,8 +316,7 @@ and exiting `0` so the daemon consumes the batch.
 
 ## 5. What stays on SOS / Hadi-go vs Kasra
 
-### Stays on SOS (no mupot equivalent today — do not migrate yet)
-- **Shared squad memory** — `squad_remember`/`squad_recall`, `MEMORY.md`. mupot memory is per-token-private (`src/mcp/index.ts`); no squad-scoped memory tool exists.
+### Stays on SOS (do not migrate yet)
 - **Cold-start wake-hooks** — blocked on host handler rollout against `/api/inbox/signed`.
 - **The SOS bus token itself** — keep live as the rollback floor until the full squad is verified on mupot.
 
@@ -338,5 +344,4 @@ and exiting `0` so the daemon consumes the batch.
    reviewed host config/command that launches the right runtime and exits `0`
    only after durable local handoff.
 2. **Per-arm capability granularity in `mint_agent_token`** — today every minted token gets uniform squad `member` (`src/mcp/provision.ts`). True per-arm least-privilege (e.g. review = recall/remember/inbox only, NO task_create/squad_message) is not expressible. Follow-on: optional explicit-capability arg, still hard-capped ≤ `member`.
-3. **Squad-scoped memory on mupot** — no `squad_remember`/`squad_recall`; mupot memory is per-token-private. Shared `MEMORY.md`-style squad memory is NOT covered by this cutover.
-4. **Dropping `verify-delegation.py` HMAC** — safe only after the host handler diff proves it reads from signed Mupot inbox batches and does not trust client-supplied routing. Security-relevant; must pass diverse review.
+3. **Dropping `verify-delegation.py` HMAC** — safe only after the host handler diff proves it reads from signed Mupot inbox batches and does not trust client-supplied routing. Security-relevant; must pass diverse review.

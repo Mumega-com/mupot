@@ -275,6 +275,26 @@ Rules:
 Retry rule: supply `request_id` on send operations that may be retried. A retry
 with identical content returns the original message id and `duplicate: true`.
 
+## Memory
+
+Runtimes have two explicit memory lanes:
+
+- `remember { text, concepts? }` and `recall { query, limit? }` use private
+  member memory under `member:<member_id>`.
+- `squad_remember { squad_id?, text, concepts? }` and
+  `squad_recall { squad_id?, query, limit? }` use shared squad memory under
+  `squad:<squad_id>`.
+
+Agent-bound tokens may omit `squad_id` for squad memory; Mupot derives the
+target squad from `auth.boundAgentId`. Explicit squad memory writes require
+`member` or higher on the target squad. Explicit squad memory reads require
+`observer` or higher on the target squad.
+
+Both lanes use the same MemoryPort. The scope string is stored as
+`engrams.agent_id` and Vectorize queries are filtered by `{ agentId: scope,
+tenant }`, so private and shared memories cannot bleed across member, squad, or
+tenant boundaries.
+
 ## Peer Discovery
 
 Runtimes discover addressable squad peers through MCP `peers { squad_id?,
