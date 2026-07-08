@@ -26,9 +26,16 @@ const EXPECTED = {
 
 const NEXT_STEP_ATTACH = 'attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)'
 const NEXT_STEP_HOLD = 'do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass'
+const EXPORT_RECEIPT_FILE = 'export-receipt.json'
+const MANIFEST_CHECK_RECEIPT_FILE = 'manifest-check.json'
 
 const REQUIRED_HOST_RECEIPT_CHECKS = [
   { component: 'fleet-control-daemon', check: 'panel_public_key_public_only' },
+]
+
+const EXPORT_SIDECAR_RECEIPTS = [
+  { file: EXPORT_RECEIPT_FILE, receipt_type: 'mupot-fleet-receipt-bundle-export/v1' },
+  { file: MANIFEST_CHECK_RECEIPT_FILE, receipt_type: 'mupot-fleet-receipt-bundle-check/v1' },
 ]
 
 const CONTROL_VERBS = new Set(['start', 'stop', 'restart'])
@@ -152,7 +159,7 @@ function usage() {
     '  --status                      read-only host-go evidence status for an in-progress bundle',
     '  --status-summary              with --status, print a compact text checklist instead of JSON',
     '  --check-manifest              read-only hash/status check; writes nothing',
-    '  --export                      copy manifest + listed artifacts to --export-dir and check it',
+    '  --export                      copy manifest, artifacts, and export/check sidecars to --export-dir and check it',
     '  --require-control-verb <verb> default: start,stop; values: start, stop, restart',
     '  --exec-probes                 pass through to host-receipt.mjs',
     '  --force                       overwrite same-name receipt files',
@@ -286,7 +293,8 @@ function secretFindingSummary(findings) {
 function secretScanChecks(manifestCheck) {
   return (manifestCheck?.checks ?? []).filter((check) =>
     check?.check === 'manifest_no_secret_material' ||
-    check?.check === 'artifact_no_secret_material'
+    check?.check === 'artifact_no_secret_material' ||
+    check?.check === 'export_sidecar_no_secret_material'
   )
 }
 
@@ -584,6 +592,10 @@ function manifestRequiredControlVerbs(manifest) {
     : ['start', 'stop']
 }
 
+function isPortableExportManifest(manifest) {
+  return manifest?.inputs?.out_dir === '.' && manifest?.artifacts?.out_dir === '.'
+}
+
 function hasArtifact(entries, predicate) {
   return entries.some((entry) => predicate(entry))
 }
@@ -677,6 +689,7 @@ function addBundleDirectoryScopeChecks(checks, manifestPath, manifestDir, entrie
   for (const entry of entries) {
     if (typeof entry.path === 'string' && entry.path.length > 0) allowed.add(basename(entry.path))
   }
+  for (const sidecar of EXPORT_SIDECAR_RECEIPTS) allowed.add(sidecar.file)
 
   let names = []
   try {
@@ -711,6 +724,92 @@ function addBundleDirectoryScopeChecks(checks, manifestPath, manifestDir, entrie
     allowed: [...allowed].sort(),
     unexpected,
   })
+}
+
+function addExportSidecarChecks(checks, manifestPath, manifestDir, manifest, opts = {}) {
+  const requireSidecars = isPortableExportManifest(manifest) && !opts.allowMissingSidecars
+  const manifestHash = fileSha256(manifestPath)
+
+  for (const sidecar of EXPORT_SIDECAR_RECEIPTS) {
+    const path = join(manifestDir, sidecar.file)
+    const present = existsSync(path)
+    if (requireSidecars) {
+      checks.push({
+        ok: present,
+        component: 'receipt-bundle-check',
+        check: 'export_sidecar_receipt_present',
+        path: manifestPath,
+        sidecar: sidecar.file,
+        expected: sidecar.receipt_type,
+      })
+    }
+    if (!present) continue
+
+    const receipt = readReceipt(path)
+    checks.push({
+      ok: Boolean(receipt),
+      component: 'receipt-bundle-check',
+      check: 'export_sidecar_receipt_json_read',
+      path: manifestPath,
+      sidecar: sidecar.file,
+      checked_path: path,
+    })
+    checks.push({
+      ok: receipt?.receipt_type === sidecar.receipt_type,
+      component: 'receipt-bundle-check',
+      check: 'export_sidecar_receipt_type_expected',
+      path: manifestPath,
+      sidecar: sidecar.file,
+      checked_path: path,
+      expected: sidecar.receipt_type,
+      actual: receipt?.receipt_type ?? null,
+    })
+    checks.push({
+      ok: receipt?.status === 'pass',
+      component: 'receipt-bundle-check',
+      check: 'export_sidecar_status_pass',
+      path: manifestPath,
+      sidecar: sidecar.file,
+      checked_path: path,
+      actual: receipt?.status ?? null,
+    })
+
+    const sidecarSecretFindings = receipt ? findSecretMaterial(receipt) : []
+    checks.push({
+      ok: receipt ? sidecarSecretFindings.length === 0 : null,
+      component: 'receipt-bundle-check',
+      check: 'export_sidecar_no_secret_material',
+      path: manifestPath,
+      sidecar: sidecar.file,
+      checked_path: path,
+      findings: secretFindingSummary(sidecarSecretFindings),
+      finding_count: sidecarSecretFindings.length,
+    })
+
+    if (sidecar.file === MANIFEST_CHECK_RECEIPT_FILE) {
+      checks.push({
+        ok: receipt?.manifest?.sha256 === manifestHash,
+        component: 'receipt-bundle-check',
+        check: 'export_sidecar_manifest_hash_matches',
+        path: manifestPath,
+        sidecar: sidecar.file,
+        checked_path: path,
+        expected: manifestHash,
+        actual: receipt?.manifest?.sha256 ?? null,
+      })
+    }
+    if (sidecar.file === EXPORT_RECEIPT_FILE) {
+      checks.push({
+        ok: receipt?.manifest_check?.status === 'pass',
+        component: 'receipt-bundle-check',
+        check: 'export_sidecar_manifest_check_pass',
+        path: manifestPath,
+        sidecar: sidecar.file,
+        checked_path: path,
+        actual: receipt?.manifest_check?.status ?? null,
+      })
+    }
+  }
 }
 
 function addCutoverGateConsistencyChecks(checks, manifestPath, manifest, entries, receipt) {
@@ -860,6 +959,7 @@ function checkBundleManifest(opts = {}) {
     })
     addRequiredEvidenceChecks(checks, manifestPath, entries, agents)
     addBundleDirectoryScopeChecks(checks, manifestPath, manifestDir, entries)
+    addExportSidecarChecks(checks, manifestPath, manifestDir, manifest, opts)
 
     for (const entry of entries) {
       const expectedLocalPath = typeof entry.path === 'string' && entry.path.length > 0
@@ -1116,6 +1216,74 @@ function writeExportManifest(sourceManifest, dest, opts, checks) {
   }
 }
 
+function writeExportSidecar(path, receipt, opts, checks, label) {
+  try {
+    writeFileSync(path, JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600, flag: opts.force ? 'w' : 'wx' })
+    checks.push({
+      ok: true,
+      component: 'receipt-bundle-export',
+      check: 'sidecar_receipt_written',
+      sidecar: label,
+      path,
+      sha256: fileSha256(path),
+    })
+    return true
+  } catch (err) {
+    checks.push({
+      ok: false,
+      component: 'receipt-bundle-export',
+      check: 'sidecar_receipt_written',
+      sidecar: label,
+      path,
+      reason: String(err && err.message ? err.message : err),
+    })
+    return false
+  }
+}
+
+function overwriteExportSidecar(path, receipt) {
+  writeFileSync(path, JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600, flag: 'w' })
+}
+
+function makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck }) {
+  const summary = summarize(checks)
+  return {
+    receipt_type: 'mupot-fleet-receipt-bundle-export/v1',
+    generated_at: new Date().toISOString(),
+    status: summary.status,
+    summary,
+    inputs: {
+      manifest: manifestPath || null,
+      out_dir: opts.outDir ? pathArg(opts.outDir) : null,
+      export_dir: exportDir || null,
+    },
+    artifacts: {
+      copied,
+      sidecars: exportDir ? [
+        {
+          label: 'export_receipt',
+          path: join(exportDir, EXPORT_RECEIPT_FILE),
+          receipt_type: 'mupot-fleet-receipt-bundle-export/v1',
+        },
+        {
+          label: 'manifest_check',
+          path: join(exportDir, MANIFEST_CHECK_RECEIPT_FILE),
+          receipt_type: 'mupot-fleet-receipt-bundle-check/v1',
+        },
+      ] : [],
+    },
+    manifest_check: manifestCheck ? {
+      status: manifestCheck.status,
+      summary: manifestCheck.summary,
+      manifest: manifestCheck.manifest,
+    } : null,
+    next_steps: summary.status === 'pass'
+      ? [NEXT_STEP_ATTACH]
+      : ['fix the source receipts or export directory, rerun receipt-bundle --export, then attach only the exported directory after it passes'],
+    checks,
+  }
+}
+
 function exportBundle(opts = {}) {
   const checks = []
   const manifestPath = manifestPathForCheck(opts)
@@ -1196,7 +1364,7 @@ function exportBundle(opts = {}) {
     }
   }
 
-  const manifestCheck = exportDir ? checkBundleManifest({ outDir: exportDir }) : null
+  let manifestCheck = exportDir ? checkBundleManifest({ outDir: exportDir, allowMissingSidecars: true }) : null
   checks.push({
     ok: manifestCheck?.status === 'pass',
     component: 'receipt-bundle-export',
@@ -1205,30 +1373,53 @@ function exportBundle(opts = {}) {
     status: manifestCheck?.status ?? null,
   })
 
-  const summary = summarize(checks)
-  return {
-    receipt_type: 'mupot-fleet-receipt-bundle-export/v1',
-    generated_at: new Date().toISOString(),
-    status: summary.status,
-    summary,
-    inputs: {
-      manifest: manifestPath || null,
-      out_dir: opts.outDir ? pathArg(opts.outDir) : null,
+  const exportReceiptPath = exportDir ? join(exportDir, EXPORT_RECEIPT_FILE) : ''
+  const manifestCheckPath = exportDir ? join(exportDir, MANIFEST_CHECK_RECEIPT_FILE) : ''
+  if (exportDir && manifestCheck) {
+    const baseReceipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck })
+    writeExportSidecar(manifestCheckPath, manifestCheck, opts, checks, 'manifest_check')
+    writeExportSidecar(exportReceiptPath, baseReceipt, opts, checks, 'export_receipt')
+    manifestCheck = checkBundleManifest({ outDir: exportDir })
+    checks.push({
+      ok: manifestCheck?.status === 'pass',
+      component: 'receipt-bundle-export',
+      check: 'export_manifest_check_with_sidecars_pass',
       export_dir: exportDir || null,
-    },
-    artifacts: {
-      copied,
-    },
-    manifest_check: manifestCheck ? {
-      status: manifestCheck.status,
-      summary: manifestCheck.summary,
-      manifest: manifestCheck.manifest,
-    } : null,
-    next_steps: summary.status === 'pass'
-      ? [NEXT_STEP_ATTACH]
-      : ['fix the source receipts or export directory, rerun receipt-bundle --export, then attach only the exported directory after it passes'],
-    checks,
+      status: manifestCheck?.status ?? null,
+    })
   }
+
+  let receipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck })
+  if (exportDir && manifestCheck) {
+    try {
+      overwriteExportSidecar(manifestCheckPath, manifestCheck)
+      overwriteExportSidecar(exportReceiptPath, receipt)
+      checks.push({
+        ok: true,
+        component: 'receipt-bundle-export',
+        check: 'sidecar_receipts_finalized',
+        export_receipt: exportReceiptPath,
+        manifest_check: manifestCheckPath,
+      })
+    } catch (err) {
+      checks.push({
+        ok: false,
+        component: 'receipt-bundle-export',
+        check: 'sidecar_receipts_finalized',
+        export_receipt: exportReceiptPath,
+        manifest_check: manifestCheckPath,
+        reason: String(err && err.message ? err.message : err),
+      })
+    }
+    receipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck })
+    try {
+      overwriteExportSidecar(exportReceiptPath, receipt)
+    } catch {
+      // The preceding finalization check captures sidecar write failures.
+    }
+  }
+
+  return receipt
 }
 
 function firstMeta(path) {

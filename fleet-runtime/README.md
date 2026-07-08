@@ -495,8 +495,9 @@ host checklist; rerun the host receipt with the current runtime so copied
 evidence proves the panel key is public-only.
 
 To produce the clean attachable copy for #274, export from the working receipt
-directory into a fresh directory. The export command copies only `manifest.json`
-and the receipt artifacts named in that manifest, then runs the same manifest
+directory into a fresh directory. The export command copies `manifest.json`, the
+receipt artifacts named in that manifest, and two sidecar receipts:
+`export-receipt.json` plus `manifest-check.json`. It then runs the same manifest
 check against the exported directory. The exported `manifest.json` is made
 portable: receipt artifact paths are local filenames and the exported `out_dir`
 is `.`; the working source manifest is not rewritten.
@@ -516,10 +517,12 @@ npm run receipt:bundle:export -- \
   --export-dir ./receipts/my-agent-attach
 ```
 
-Attach only the exported directory after the export receipt reports
-`receipt_type: "mupot-fleet-receipt-bundle-export/v1"` with `status: "pass"`.
-Use `--force` only to overwrite a failed export after fixing the source
-evidence or clearing the destination.
+Attach only the exported directory after `export-receipt.json` reports
+`receipt_type: "mupot-fleet-receipt-bundle-export/v1"` with `status: "pass"` and
+`manifest-check.json` reports
+`receipt_type: "mupot-fleet-receipt-bundle-check/v1"` with `status: "pass"`.
+Use `--force` only to overwrite a failed export after fixing the source evidence
+or clearing the destination.
 
 To verify a copied bundle without rewriting anything, run the manifest check. It
 reads `manifest.json`, checks the recorded receipt artifact SHA-256 hashes, reads
@@ -531,12 +534,13 @@ gate was built for the manifest's selected agents/control verbs/artifacts,
 verifies all non-secret receipt target identities agree on the same pot base URL
 and tenant, scans the manifest and receipt artifacts for obvious secret material
 such as bearer tokens, raw `mupot_` tokens, private-key PEM/JWK data, GitHub
-tokens, or authorization fields, verifies the checked directory contains only
-`manifest.json` plus the receipt artifacts named in the manifest, verifies every
-artifact is present in that same copied directory rather than resolved through an
-old absolute host path, verifies `next_steps` does not contradict readiness, and
-exits non-zero if any saved file, manifest status, or attachable evidence safety
-check drifted:
+tokens, or authorization fields, verifies exported sidecar receipts when present
+and requires them for portable exported manifests, verifies the checked directory
+contains only `manifest.json`, the receipt artifacts named in the manifest, and
+the known sidecars, verifies every artifact is present in that same copied
+directory rather than resolved through an old absolute host path, verifies
+`next_steps` does not contradict readiness, and exits non-zero if any saved file,
+manifest status, or attachable evidence safety check drifted:
 
 ```bash
 node ~/.fleet/runtime/receipt-bundle.mjs \
@@ -575,7 +579,8 @@ not echo the suspected secret value.
 Directory-scope failures mean the attachable bundle is not self-contained or
 contains files outside the allowed evidence set; rebuild a clean copy with only
 `manifest.json`, `install.json` when present, `probe-*.json`, `host.json`,
-`runtime-*.json`, `control-*.json`, and `cutover-gate.json`.
+`runtime-*.json`, `control-*.json`, `cutover-gate.json`,
+`export-receipt.json`, and `manifest-check.json`.
 
 Every bundle manifest also includes `next_steps`. Treat those as operator
 guidance only: the hard gate remains `manifest.json` and `cutover-gate.json`

@@ -365,11 +365,12 @@ and exiting `0` so the daemon consumes the batch.
      --export-dir ~/.fleet/receipts/<agent_id>-attach`, or from a checkout
      `npm run receipt:bundle:export -- --out-dir ./receipts/<agent_id>
      --export-dir ./receipts/<agent_id>-attach`. It emits
-     `mupot-fleet-receipt-bundle-export/v1`, copies only `manifest.json` plus
-     the receipt artifacts named in the manifest, then runs the same manifest
-     check against the exported directory. The exported manifest uses local
-     artifact filenames and `out_dir:"."`, without rewriting the working source
-     manifest. Run `receipt-bundle.mjs
+     `mupot-fleet-receipt-bundle-export/v1`, copies `manifest.json` plus
+     the receipt artifacts named in the manifest, writes `export-receipt.json`
+     and `manifest-check.json` sidecars, then runs the same manifest check
+     against the exported directory. The exported manifest uses local artifact
+     filenames and `out_dir:"."`, without rewriting the working source manifest.
+     Run `receipt-bundle.mjs
      --check-manifest --out-dir ~/.fleet/receipts/<agent_id>-attach` before
      attaching copied evidence; it emits `mupot-fleet-receipt-bundle-check/v1`,
      verifies artifact hashes plus receipt type/status metadata, recomputes
@@ -377,8 +378,9 @@ and exiting `0` so the daemon consumes the batch.
      host/probe/runtime/control/cutover-gate evidence categories, compares
      cutover-gate inputs back to the manifest evidence, verifies receipt target
      base URLs and tenants match, requires host `panel_public_key_public_only`
-     evidence, rejects secret material, rejects non-self-contained copied evidence
-     or extra files, rejects contradictory `next_steps`, and writes nothing.
+     evidence, verifies the export/check sidecars, rejects secret material,
+     rejects non-self-contained copied evidence or extra files, rejects
+     contradictory `next_steps`, and writes nothing.
      `manifest.json.next_steps` is advisory and should explain the next missing
      operator action when the bundle is not ready.
 
@@ -401,7 +403,7 @@ and exiting `0` so the daemon consumes the batch.
 | control live | `control-receipt.mjs` emits `mupot-fleet-control-receipt/v1` with `status:"pass"` |
 | probe queue | `cutover-probe.mjs` emits `mupot-fleet-cutover-probe/v1` after queuing inbox/control evidence inputs |
 | SOS cutover gate | `cutover-receipt.mjs` emits `mupot-sos-cutover-gate/v1` with `status:"pass"` for that agent |
-| receipt bundle | `receipt-bundle.mjs` writes optional `install.json`, optional `probe-*.json`, `mupot-fleet-receipt-bundle/v1` `manifest.json` with receipt-artifact SHA-256 hashes and advisory `next_steps`, and `cutover-gate.json`; `--verify-only` rechecks saved evidence without live host polling; `--status` emits `mupot-fleet-receipt-bundle-status/v1` for in-progress host-go evidence without writing files; `--export` emits `mupot-fleet-receipt-bundle-export/v1`, creates a clean attachable directory, and checks it; `--check-manifest` emits `mupot-fleet-receipt-bundle-check/v1` without rewriting files, verifies copied evidence, rejects secret material or extra files, and rejects contradictory `next_steps`; `manifest.json` and `cutover-gate.json` must both report `status:"pass"` |
+| receipt bundle | `receipt-bundle.mjs` writes optional `install.json`, optional `probe-*.json`, `mupot-fleet-receipt-bundle/v1` `manifest.json` with receipt-artifact SHA-256 hashes and advisory `next_steps`, and `cutover-gate.json`; `--verify-only` rechecks saved evidence without live host polling; `--status` emits `mupot-fleet-receipt-bundle-status/v1` for in-progress host-go evidence without writing files; `--export` emits `mupot-fleet-receipt-bundle-export/v1`, creates a clean attachable directory, writes `export-receipt.json` plus `manifest-check.json`, and checks it; `--check-manifest` emits `mupot-fleet-receipt-bundle-check/v1` without rewriting files, verifies copied evidence and sidecars, rejects secret material or extra files, and rejects contradictory `next_steps`; `manifest.json` and `cutover-gate.json` must both report `status:"pass"` |
 | wake-hook (post-route) | watcher launches a session from a mupot `inbox` poll, logged in `watcher.log` |
 
 ---

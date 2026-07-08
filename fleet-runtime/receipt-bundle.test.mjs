@@ -2,7 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { buildBundle, checkBundleManifest, exportBundle, formatStatusSummary, inspectBundleStatus, parseArgs, safeName } from './receipt-bundle.mjs'
@@ -458,8 +458,26 @@ test('export writes a clean self-contained attachable bundle', async () => {
   assert.ok(receipt.artifacts.copied.some((artifact) => artifact.label === 'manifest'))
   assert.deepEqual(
     readdirSync(exportDir).sort(),
-    ['control-start.json', 'control-stop.json', 'cutover-gate.json', 'host.json', 'manifest.json', 'probe-start.json', 'runtime-agent-one.json'],
+    [
+      'control-start.json',
+      'control-stop.json',
+      'cutover-gate.json',
+      'export-receipt.json',
+      'host.json',
+      'manifest-check.json',
+      'manifest.json',
+      'probe-start.json',
+      'runtime-agent-one.json',
+    ],
   )
+  const exportReceipt = JSON.parse(readFileSync(join(exportDir, 'export-receipt.json'), 'utf8'))
+  const manifestCheckReceipt = JSON.parse(readFileSync(join(exportDir, 'manifest-check.json'), 'utf8'))
+  assert.equal(exportReceipt.receipt_type, 'mupot-fleet-receipt-bundle-export/v1')
+  assert.equal(exportReceipt.status, 'pass')
+  assert.equal(exportReceipt.manifest_check.status, 'pass')
+  assert.equal(manifestCheckReceipt.receipt_type, 'mupot-fleet-receipt-bundle-check/v1')
+  assert.equal(manifestCheckReceipt.status, 'pass')
+  assert.equal(manifestCheckReceipt.manifest.sha256, sha256(join(exportDir, 'manifest.json')))
   const exportedManifestText = readFileSync(join(exportDir, 'manifest.json'), 'utf8')
   const exportedManifest = JSON.parse(exportedManifestText)
   assert.equal(exportedManifest.inputs.out_dir, '.')
@@ -471,8 +489,54 @@ test('export writes a clean self-contained attachable bundle', async () => {
   assert.equal(exportedManifest.artifacts.host.receipt_type, 'mupot-fleet-host-receipt/v1')
   assert.equal(exportedManifestText.includes(outDir), false)
   assert.equal(existsSync(join(exportDir, 'daemon.json')), false)
-  assert.equal(checkBundleManifest({ outDir: exportDir }).status, 'pass')
+  const copiedCheck = checkBundleManifest({ outDir: exportDir })
+  assert.equal(copiedCheck.status, 'pass')
+  assert.ok(copiedCheck.checks.some((c) =>
+    c.check === 'export_sidecar_receipt_present' &&
+    c.sidecar === 'export-receipt.json' &&
+    c.ok === true
+  ))
+  assert.ok(copiedCheck.checks.some((c) =>
+    c.check === 'export_sidecar_manifest_hash_matches' &&
+    c.sidecar === 'manifest-check.json' &&
+    c.ok === true
+  ))
   assert.equal(checkBundleManifest({ outDir }).status, 'fail')
+})
+
+test('manifest check fails when exported bundle sidecar receipts are missing', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+  await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+  })
+
+  const exportDir = tmpDir()
+  assert.equal(exportBundle({ outDir, exportDir }).status, 'pass')
+  rmSync(join(exportDir, 'export-receipt.json'))
+
+  const check = checkBundleManifest({ outDir: exportDir })
+
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((c) =>
+    c.check === 'export_sidecar_receipt_present' &&
+    c.sidecar === 'export-receipt.json' &&
+    c.ok === false
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'export_sidecar_receipt_present' &&
+    c.sidecar === 'manifest-check.json' &&
+    c.ok === true
+  ))
 })
 
 test('manifest check fails when host receipt lacks public-only panel key evidence', async () => {
