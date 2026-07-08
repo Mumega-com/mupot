@@ -129,6 +129,13 @@
       "payload_too_large"
     ]
   },
+  "peerDiscovery": {
+    "mcpTools": ["peers"],
+    "defaultSquad": "agent-bound-token-may-derive-squad-from-auth.boundAgentId",
+    "authorization": "observer-on-target-squad",
+    "scope": "single-squad-roster",
+    "presence": "latest-check-in-per-agent"
+  },
   "tasks": {
     "mcpTools": ["task_create", "task_list", "task_board", "task_update"],
     "defaultSquad": "agent-bound-token-may-derive-squad-from-auth.boundAgentId",

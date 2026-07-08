@@ -36,6 +36,13 @@ const contract = JSON.parse(
     idempotency: { scope: string[]; identicalRetry: string; differentContent: string }
     readSemantics: { default: string; peek: string }
   }
+  peerDiscovery: {
+    mcpTools: string[]
+    defaultSquad: string
+    authorization: string
+    scope: string
+    presence: string
+  }
   tasks: {
     mcpTools: string[]
     defaultSquad: string
@@ -147,6 +154,14 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(contract.tasks.doneWhenRequired).toBe(true)
     expect(contract.tasks.transitions.review).toEqual(['approved', 'rejected'])
     expect(contract.tasks.transitions.done).toEqual([])
+  })
+
+  it('tracks squad-scoped peer discovery semantics', () => {
+    expect(contract.peerDiscovery.mcpTools).toEqual(['peers'])
+    expect(contract.peerDiscovery.defaultSquad).toContain('auth.boundAgentId')
+    expect(contract.peerDiscovery.authorization).toBe('observer-on-target-squad')
+    expect(contract.peerDiscovery.scope).toBe('single-squad-roster')
+    expect(contract.peerDiscovery.presence).toBe('latest-check-in-per-agent')
   })
 
   it('keeps Hermes and local smoke coverage on the same lifecycle language', () => {

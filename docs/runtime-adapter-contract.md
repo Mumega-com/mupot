@@ -269,6 +269,17 @@ Rules:
 Retry rule: supply `request_id` on send operations that may be retried. A retry
 with identical content returns the original message id and `duplicate: true`.
 
+## Peer Discovery
+
+Runtimes discover addressable squad peers through MCP `peers { squad_id?,
+limit? }`. Agent-bound tokens may omit `squad_id`; Mupot derives the caller's
+squad from `auth.boundAgentId`. Explicit squad reads require `observer` or
+higher on that squad.
+
+`peers` returns a single-squad roster with stable agent identity fields,
+`is_self`, and the latest presence check-in summary per agent. It does not expose
+a global agent directory and does not authorize cross-squad messaging.
+
 ## Task Lifecycle
 
 Tasks are the unit of durable work. All surfaces should use the shared task

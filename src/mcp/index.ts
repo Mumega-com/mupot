@@ -49,9 +49,10 @@ import {
 import type { TaskStatus } from '../tasks/service'
 import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
+import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
 import { sendToRef, readAgentInbox } from '../agents/messages'
-import { recordCheckin } from '../fleet/presence'
+import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { PROVISION_TOOLS } from './provision'
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
 // Vitest can import it without the CF runtime. See ./auth-header.ts.
@@ -355,19 +356,35 @@ async function resolveTaskSquad(
   auth: AuthContext,
   args: Record<string, unknown>,
 ): Promise<{ ok: true; squad: Squad } | Extract<ToolOutcome, { ok: false }>> {
+  return resolveScopedSquad(
+    env,
+    auth,
+    args,
+    'member',
+    'squad_id required unless the token is agent-bound',
+  )
+}
+
+async function resolveScopedSquad(
+  env: Env,
+  auth: AuthContext,
+  args: Record<string, unknown>,
+  min: Capability,
+  missingDetail: string,
+): Promise<{ ok: true; squad: Squad } | Extract<ToolOutcome, { ok: false }>> {
   let squadId = str(args.squad_id)
   if (!squadId && auth.boundAgentId) {
     const agent = await loadAgent(env, auth.boundAgentId)
     squadId = agent?.squad_id ?? null
   }
-  if (!squadId) return failOnly(400, 'invalid_args', 'squad_id required unless the token is agent-bound')
+  if (!squadId) return failOnly(400, 'invalid_args', missingDetail)
 
   const squad = await loadSquad(env, squadId)
   if (!squad) return failOnly(404, 'squad_not_found')
 
   const grants = auth.capabilities ?? []
-  if (!(await memberCanOnSquad(env, grants, squad.id, 'member'))) {
-    return failOnly(403, 'forbidden', { need: 'member', scope: 'squad' })
+  if (!(await memberCanOnSquad(env, grants, squad.id, min))) {
+    return failOnly(403, 'forbidden', { need: min, scope: 'squad' })
   }
   return { ok: true, squad }
 }
@@ -922,6 +939,90 @@ const toolInbox: ToolSpec = {
   },
 }
 
+type PeerRow = Agent & {
+  presence_source: string | null
+  presence_label: string | null
+  presence_last_seen_at: string | null
+}
+
+// peers — read the caller's squad roster for coordination. This is not a global
+// directory: agent-bound tokens default to their own squad, and explicit squad
+// reads require observer+ on that squad.
+const toolPeers: ToolSpec = {
+  name: 'peers',
+  scope: 'squad roster (read-only)',
+  min: 'authenticated',
+  args: '{ squad_id?: string, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: { squad_id: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const squadRes = await resolveScopedSquad(
+      env,
+      auth,
+      args,
+      'observer',
+      'squad_id required unless the token is agent-bound',
+    )
+    if (!squadRes.ok) return squadRes
+    const limit = readLimit(args.limit, 50, 200)
+    if (typeof limit !== 'number') return limit
+
+    const rows = await env.DB.prepare(
+      `SELECT a.id, a.squad_id, a.slug, a.name, a.role, a.model, a.status, a.created_at,
+              (SELECT p.source FROM presence p
+                WHERE p.tenant = ?2 AND p.agent_id = a.id
+                ORDER BY p.last_seen_at DESC LIMIT 1) AS presence_source,
+              (SELECT p.label FROM presence p
+                WHERE p.tenant = ?2 AND p.agent_id = a.id
+                ORDER BY p.last_seen_at DESC LIMIT 1) AS presence_label,
+              (SELECT p.last_seen_at FROM presence p
+                WHERE p.tenant = ?2 AND p.agent_id = a.id
+                ORDER BY p.last_seen_at DESC LIMIT 1) AS presence_last_seen_at
+         FROM agents a
+        WHERE a.squad_id = ?1
+        ORDER BY a.slug ASC
+        LIMIT ?3`,
+    )
+      .bind(squadRes.squad.id, env.TENANT_SLUG, limit)
+      .all<PeerRow>()
+
+    const nowMs = Date.now()
+    const peers = (rows.results ?? []).map((row) => {
+      const lastSeenMs = sqliteUtcToMs(row.presence_last_seen_at)
+      return {
+        id: row.id,
+        slug: row.slug,
+        name: row.name,
+        role: row.role,
+        model: row.model,
+        status: row.status,
+        squad_id: row.squad_id,
+        is_self: auth.boundAgentId === row.id,
+        presence: {
+          source: row.presence_source ?? null,
+          label: row.presence_label ?? '',
+          last_seen_at: row.presence_last_seen_at ?? null,
+          liveness: classify(lastSeenMs, nowMs),
+          last_seen_human: humanAge(lastSeenMs, nowMs),
+        },
+      }
+    })
+
+    return done({
+      squad: {
+        id: squadRes.squad.id,
+        slug: squadRes.squad.slug,
+        name: squadRes.squad.name,
+      },
+      self_agent_id: auth.boundAgentId ?? null,
+      peers,
+    })
+  },
+}
+
 // check_in — pot-native presence heartbeat over MCP. This mirrors
 // POST /api/fleet/checkin for runtimes that only have an MCP transport: identity
 // is the authenticated member token, source/label are descriptive only, and a
@@ -1287,6 +1388,7 @@ export const TOOLS: ToolSpec[] = [
   toolSquadMessage,
   toolSend,
   toolInbox,
+  toolPeers,
   toolCheckIn,
   toolStatus,
   toolBootContext,
