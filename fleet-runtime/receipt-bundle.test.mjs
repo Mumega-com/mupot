@@ -106,6 +106,7 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
   assert.equal(bundle.artifacts.probes.length, 1)
   assert.equal(bundle.artifacts.probes[0].receipt_type, 'mupot-fleet-cutover-probe/v1')
   assert.equal(bundle.artifacts.cutover_gate.status, 'pass')
+  assert.ok(bundle.next_steps.some((s) => s.includes('SOS removal is permitted only for the proven agent')))
   assert.ok(existsSync(join(outDir, 'install.json')))
   assert.ok(existsSync(join(outDir, 'probe-start-probe.json')))
   assert.ok(existsSync(join(outDir, 'host.json')))
@@ -118,6 +119,7 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
   assert.equal(manifest.status, 'pass')
   assert.equal(manifest.artifacts.install.status, 'warn')
   assert.equal(manifest.artifacts.probes[0].status, 'pass')
+  assert.ok(manifest.next_steps.some((s) => s.includes('manifest.json and cutover-gate.json')))
   assert.ok(manifest.checks.some((c) => c.check === 'install_receipt_status_non_fail' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'probe_receipt_status_pass' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'cutover_gate_status_pass' && c.ok === true))
@@ -142,8 +144,10 @@ test('receipt bundle fails when an included probe receipt did not queue inputs',
 
   assert.equal(bundle.status, 'fail')
   assert.ok(bundle.checks.some((c) => c.check === 'probe_receipt_status_pass' && c.ok === false && c.actual === 'fail'))
+  assert.ok(bundle.next_steps.some((s) => s.includes('rerun cutover-probe.mjs for the failed probe')))
   const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
   assert.equal(manifest.artifacts.probes[0].status, 'fail')
+  assert.ok(manifest.next_steps.some((s) => s.includes('do not remove SOS wiring yet')))
 })
 
 test('receipt bundle can reuse existing host, runtime, and control receipts', async () => {
@@ -187,6 +191,7 @@ test('receipt bundle fails when the final cutover gate lacks stop evidence', asy
 
   assert.equal(bundle.status, 'fail')
   assert.ok(bundle.checks.some((c) => c.check === 'cutover_gate_status_pass' && c.ok === false && c.actual === 'fail'))
+  assert.ok(bundle.next_steps.some((s) => s.includes('agent-one:stop')))
   const gate = JSON.parse(readFileSync(join(outDir, 'cutover-gate.json'), 'utf8'))
   assert.ok(gate.checks.some((c) => c.check === 'control_verb_for_agent' && c.required_verb === 'stop' && c.ok === false))
 })

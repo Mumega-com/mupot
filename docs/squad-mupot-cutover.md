@@ -342,6 +342,8 @@ and exiting `0` so the daemon consumes the batch.
      `host.json`, `runtime-<agent_id>.json`, `control-*.json`,
      `cutover-gate.json`, and `manifest.json`; the cutover is ready only when
      both `manifest.json` and `cutover-gate.json` report `status:"pass"`.
+     `manifest.json.next_steps` is advisory and should explain the next missing
+     operator action when the bundle is not ready.
 
 6. **Decommission SOS per surface, not all-at-once.** Only after an arm's memory + messaging + wake are all verified on mupot AND stable for a few cycles, drop that arm's `mumega-bus` allowlist entries. Keep the bus token valid (don't revoke) until the whole squad is migrated and Hadi signs off — the bus is the rollback floor.
 
@@ -362,7 +364,7 @@ and exiting `0` so the daemon consumes the batch.
 | control live | `control-receipt.mjs` emits `mupot-fleet-control-receipt/v1` with `status:"pass"` |
 | probe queue | `cutover-probe.mjs` emits `mupot-fleet-cutover-probe/v1` after queuing inbox/control evidence inputs |
 | SOS cutover gate | `cutover-receipt.mjs` emits `mupot-sos-cutover-gate/v1` with `status:"pass"` for that agent |
-| receipt bundle | `receipt-bundle.mjs` writes optional `install.json`, optional `probe-*.json`, `mupot-fleet-receipt-bundle/v1` `manifest.json`, and `cutover-gate.json`; `manifest.json` and `cutover-gate.json` must both report `status:"pass"` |
+| receipt bundle | `receipt-bundle.mjs` writes optional `install.json`, optional `probe-*.json`, `mupot-fleet-receipt-bundle/v1` `manifest.json` with advisory `next_steps`, and `cutover-gate.json`; `manifest.json` and `cutover-gate.json` must both report `status:"pass"` |
 | wake-hook (post-route) | watcher launches a session from a mupot `inbox` poll, logged in `watcher.log` |
 
 ---

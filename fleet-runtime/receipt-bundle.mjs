@@ -345,6 +345,75 @@ function passPaths(paths, expectedType, checks, label) {
   return selected
 }
 
+function hasPassingRuntimeForAgent(artifacts, agentId) {
+  const expectedName = `runtime-${safeName(agentId)}.json`
+  return (artifacts.runtimes ?? []).some((meta) =>
+    meta?.status === 'pass' && typeof meta.path === 'string' && basename(meta.path) === expectedName
+  )
+}
+
+function missingControlVerbs(gateReceipt) {
+  const missing = []
+  for (const check of gateReceipt?.checks ?? []) {
+    if (check?.component !== 'cutover-receipt') continue
+    if (check?.check !== 'control_verb_for_agent' || check?.ok !== false) continue
+    const agent = check.agent_id ?? 'unknown-agent'
+    const verb = check.required_verb ?? 'required-control'
+    missing.push(`${agent}:${verb}`)
+  }
+  return [...new Set(missing)].sort()
+}
+
+function buildNextSteps({ artifacts, agents, gateReceipt, outDir, bundleStatus }) {
+  const steps = []
+  const add = (text) => {
+    if (!steps.includes(text)) steps.push(text)
+  }
+
+  if ((agents ?? []).length === 0) {
+    add('rerun receipt-bundle with --agent <agent_id>')
+  }
+
+  if (!artifacts.install) {
+    add(`optional: save installer output as ${join(outDir, 'install.json')} and pass --install-receipt so install evidence travels with the bundle`)
+  } else if (artifacts.install.status !== 'pass' && artifacts.install.status !== 'warn') {
+    add('rerun fleet-runtime/install.mjs and pass a valid mupot-fleet-install-receipt/v1 with status pass or warn')
+  }
+
+  for (const probe of artifacts.probes ?? []) {
+    if (probe?.status !== 'pass') {
+      add('rerun cutover-probe.mjs for the failed probe and pass the new receipt with --probe-receipt')
+    }
+  }
+
+  if (artifacts.host?.status !== 'pass') {
+    add('edit host configs, place keys, then rerun receipt-bundle without --skip-host until host.json is status pass')
+  }
+
+  for (const agentId of agents ?? []) {
+    if (!hasPassingRuntimeForAgent(artifacts, agentId)) {
+      add(`queue an inbox probe for ${agentId}, then rerun receipt-bundle with --skip-host and --agent ${agentId} until runtime-${safeName(agentId)}.json is status pass`)
+    }
+  }
+
+  const missingControls = missingControlVerbs(gateReceipt)
+  if (missingControls.length > 0) {
+    add(`queue missing lifecycle control evidence (${missingControls.join(', ')}) with cutover-probe.mjs, then rerun receipt-bundle with --probe-receipt and --control-label`)
+  } else if ((artifacts.controls ?? []).length === 0) {
+    add('queue lifecycle control with cutover-probe.mjs and rerun receipt-bundle with --control-label start/stop, or one restart receipt when acceptable')
+  }
+
+  if (bundleStatus !== 'pass' || gateReceipt?.status !== 'pass') {
+    add('do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass')
+  }
+
+  if (bundleStatus === 'pass' && gateReceipt?.status === 'pass') {
+    add('attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)')
+  }
+
+  return steps
+}
+
 async function buildBundle(opts) {
   const checks = []
   const stamp = opts.stamp ?? defaultStamp()
@@ -468,6 +537,7 @@ async function buildBundle(opts) {
       skip_control: Boolean(opts.skipControl),
     },
     artifacts,
+    next_steps: [],
     checks,
   }
   try {
@@ -479,6 +549,13 @@ async function buildBundle(opts) {
   const finalSummary = summarize(checks)
   bundle.summary = finalSummary
   bundle.status = finalSummary.status
+  bundle.next_steps = buildNextSteps({
+    artifacts,
+    agents,
+    gateReceipt,
+    outDir,
+    bundleStatus: finalSummary.status,
+  })
   try {
     writeJsonUnchecked(artifacts.manifest, bundle, { ...opts, force: true })
   } catch {

@@ -447,6 +447,10 @@ When `manifest.json` and `cutover-gate.json` both report
 to attach to the cutover record for that agent. Use `--force` only to replace a
 same-name failed attempt after fixing the underlying host issue.
 
+Every bundle manifest also includes `next_steps`. Treat those as operator
+guidance only: the hard gate remains `manifest.json` and `cutover-gate.json`
+both reporting `status: "pass"`.
+
 ## Notes
 - `interval_sec` is clamped to `[15,120]` and must stay under the pot's presence TTL (default 180s).
 - The daemon sends signed detach on shutdown for agents it successfully heartbeated during
