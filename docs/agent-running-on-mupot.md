@@ -166,6 +166,9 @@ Use `fleet-runtime/cutover-receipt.mjs` as the per-agent final gate: it combines
 saved host, runtime, and start/stop control receipts and emits
 `mupot-sos-cutover-gate/v1`. Only a `status:"pass"` gate should allow removing
 that agent's SOS bus/wake path.
+For the live host rollout, `fleet-runtime/receipt-bundle.mjs` is the preferred
+operator command because it saves the host/runtime/control receipts,
+`cutover-gate.json`, and `manifest.json` under one attachable evidence directory.
 
 **Cross-cutting** — (9) durable, reliably-wakeable 2nd adversarial gate lens (Codex bus-peer
 was stale on both pings); (10) dyad-gate.yml single-quote glob (1-line).

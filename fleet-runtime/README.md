@@ -39,6 +39,7 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `runtime-receipt.mjs` | one-shot live daemon-cycle receipt for signed attach + inbox drain |
 | `control-receipt.mjs` | one-shot live control receipt for signed open/close/restart |
 | `cutover-receipt.mjs` | verifies host/runtime/control receipts before SOS removal |
+| `receipt-bundle.mjs` | saves host/runtime/control receipts, final gate, and manifest in one directory |
 
 ## Quickstart (per agent)
 
@@ -324,6 +325,57 @@ It prints JSON with `receipt_type: "mupot-sos-cutover-gate/v1"`. A
 By default the gate requires both `start` and `stop` lifecycle evidence. A
 single `restart` control receipt can satisfy both because the control daemon
 runs close then open for that verb.
+
+## Resumable receipt bundle
+
+For live rollout, prefer writing every receipt for an agent into one 0700 bundle
+directory. The bundle command runs the existing receipt tools, saves their JSON
+output as 0600 files, runs the final cutover gate over all passing receipts in
+that directory, and writes `manifest.json`:
+
+```bash
+node ~/.fleet/runtime/receipt-bundle.mjs \
+  --agent my-agent \
+  --out-dir ~/.fleet/receipts/my-agent
+```
+
+or from a checkout:
+
+```bash
+npm run receipt:bundle -- \
+  --agent my-agent \
+  --out-dir ./receipts/my-agent
+```
+
+The first run usually proves host and runtime wiring and fails the final gate
+until lifecycle control evidence exists. Then queue a `start` control request in
+Mupot and collect that live receipt:
+
+```bash
+node ~/.fleet/runtime/receipt-bundle.mjs \
+  --agent my-agent \
+  --out-dir ~/.fleet/receipts/my-agent \
+  --skip-host \
+  --skip-runtime \
+  --control-label start
+```
+
+Queue a `stop` control request and collect the second live control receipt:
+
+```bash
+node ~/.fleet/runtime/receipt-bundle.mjs \
+  --agent my-agent \
+  --out-dir ~/.fleet/receipts/my-agent \
+  --skip-host \
+  --skip-runtime \
+  --control-label stop
+```
+
+When `manifest.json` and `cutover-gate.json` both report
+`receipt_type: "mupot-fleet-receipt-bundle/v1"` /
+`"mupot-sos-cutover-gate/v1"` with `status: "pass"`, the saved evidence is ready
+to attach to the cutover record for that agent. Use `--force` only to replace a
+same-name failed attempt after fixing the underlying host issue.
 
 ## Notes
 - `interval_sec` is clamped to `[15,120]` and must stay under the pot's presence TTL (default 180s).
