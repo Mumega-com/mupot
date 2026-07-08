@@ -87,6 +87,10 @@ export interface Env {
   // secrets (present at runtime only)
   OAUTH_CLIENT_ID?: string
   OAUTH_CLIENT_SECRET?: string
+  // Local-only test login. Intended for `wrangler dev` smoke testing with a local D1/KV.
+  // Never set this on a deployed pot; when unset, /auth/dev-login is disabled.
+  LOCAL_TEST_AUTH?: string
+  LOCAL_TEST_AUTH_EMAIL?: string
   // OAuth 2.1 Google IdP secrets — set via `wrangler secret put`, never in .toml.
   // Deploy prerequisites: npx wrangler secret put GOOGLE_CLIENT_ID
   //                       npx wrangler secret put GOOGLE_CLIENT_SECRET
@@ -308,6 +312,8 @@ export type BusEventType =
   | 'task.blocked' // execution failed (model error/timeout) — short note persisted
   | 'task.verdict' // gate decision written — verdict + new task status in payload
   | 'agent.wake'
+  | 'fleet.control.requested' // signed host-control request queued for the fleet daemon
+  | 'brain.directive.updated' // owner-pinned directive changed for the brain decision loop
   | 'squad.dispatch'
   | 'org.provisioned' // a department/squad/agent/token was created in-band (payload.kind)
 

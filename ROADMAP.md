@@ -15,6 +15,23 @@ their target version. Pre-1.0, minor bumps may break.
 
 ---
 
+## Product north star
+
+Mupot is becoming a **self-hosted agent control plane for running trusted AI
+workers, workflows, and integrations on Cloudflare**.
+
+That means the project should prove one operating loop end to end: deploy a pot,
+connect a runtime worker, grant scoped capabilities, send it work, gate risky
+actions, observe status and failures, and verify the result against an external
+tool of record such as GitHub.
+
+The detailed product roadmap and acceptance criteria live in
+[docs/control-plane-roadmap.md](docs/control-plane-roadmap.md). This file keeps
+the version sequence; the control-plane roadmap defines what those versions must
+make true.
+
+---
+
 Every milestone closes one part of the **coherence loop** (brain measures → detects a
 defect → flies a gated flight → updates state → re-measures) on the four rails (one
 backlog, one state, one gate, one memory). See [docs/coherence-model.md](docs/coherence-model.md).

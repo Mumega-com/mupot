@@ -45,16 +45,23 @@ export interface FleetAgentRow {
   member_id: string | null
 }
 
-// Unified view: runtime row + identity (member) + capabilities.
-// Returned by getAgentView — the data feed for the dashboard and #agent-bus.
-export interface AgentView {
+// Runtime control-surface view: the host row fields needed by /fleet and #agent-bus
+// style surfaces. It intentionally excludes member/capability details.
+export interface FleetAgentRuntimeView {
   agent_id: string
-  type: string                           // agent_type
+  display: string
   runtime: string
+  squads: string[]
   status: string                         // stored INTENT: running | stopped (set by attach/detach)
   presence: Presence                     // DERIVED liveness from last_seen age vs TTL (live|stale|offline)
   lifecycle: string
   last_seen: string                      // last_reported_at
+}
+
+// Unified admin/API view: runtime row + identity (member) + capabilities.
+// Returned by getAgentView — the rich data feed for admin roster/API consumers.
+export interface AgentView extends FleetAgentRuntimeView {
+  type: string                           // agent_type
   member: { id: string; email: string | null; display_name: string } | null
   capabilities: Array<{ scope_type: string; scope_id: string | null; capability: string }>
 }
@@ -231,6 +238,31 @@ export async function listFleetAgents(env: Env): Promise<FleetAgentRow[]> {
   }))
 }
 
+export async function listFleetAgentRuntimeView(env: Env, nowMs = Date.now()): Promise<FleetAgentRuntimeView[]> {
+  const rows = await env.DB.prepare(
+    `SELECT agent_id, display, runtime, squads, lifecycle, status, last_reported_at
+       FROM fleet_agents WHERE tenant = ?1 ORDER BY agent_id ASC`,
+  )
+    .bind(env.TENANT_SLUG)
+    .all<Record<string, unknown>>()
+
+  const ttlSec = presenceTtlSec(env)
+  return (rows.results ?? []).map((r) => {
+    const status = String(r.status ?? 'unknown')
+    const lastSeen = String(r.last_reported_at ?? '')
+    return {
+      agent_id: String(r.agent_id),
+      display: String(r.display ?? ''),
+      runtime: String(r.runtime ?? ''),
+      squads: parseSquads(r.squads),
+      status,
+      presence: derivePresence(status, lastSeen, ttlSec, nowMs),
+      lifecycle: String(r.lifecycle ?? ''),
+      last_seen: lastSeen,
+    }
+  })
+}
+
 /**
  * getAgentView — unified read: LEFT JOIN fleet_agents ↔ members on member_id,
  * then resolve capabilities per linked member. Returns the canonical agent record
@@ -242,7 +274,7 @@ export async function listFleetAgents(env: Env): Promise<FleetAgentRow[]> {
  * NULL-tenant rows before the JOIN so existing members are visible immediately.
  *
  * SQL shape:
- *   SELECT fa.agent_id, fa.agent_type, fa.runtime, fa.status, fa.lifecycle,
+ *   SELECT fa.agent_id, fa.display, fa.agent_type, fa.runtime, fa.squads, fa.status, fa.lifecycle,
  *          fa.last_reported_at, fa.member_id,
  *          m.id AS m_id, m.email AS m_email, m.display_name AS m_display
  *   FROM fleet_agents fa
@@ -255,7 +287,7 @@ export async function getAgentView(env: Env): Promise<AgentView[]> {
   await backfillMemberTenant(env)
 
   const rows = await env.DB.prepare(
-    `SELECT fa.agent_id, fa.agent_type, fa.runtime, fa.status, fa.lifecycle,
+    `SELECT fa.agent_id, fa.display, fa.agent_type, fa.runtime, fa.squads, fa.status, fa.lifecycle,
             fa.last_reported_at, fa.member_id,
             m.id AS m_id, m.email AS m_email, m.display_name AS m_display
        FROM fleet_agents fa
@@ -286,8 +318,10 @@ export async function getAgentView(env: Env): Promise<AgentView[]> {
     const lastSeen = String(r.last_reported_at ?? '')
     out.push({
       agent_id: String(r.agent_id),
+      display: String(r.display ?? ''),
       type: String(r.agent_type ?? 'generic'),
       runtime: String(r.runtime ?? ''),
+      squads: parseSquads(r.squads),
       status,
       presence: derivePresence(status, lastSeen, ttlSec, nowMs),
       lifecycle: String(r.lifecycle ?? ''),

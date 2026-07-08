@@ -30,6 +30,7 @@ import { listLoops } from '../loops/service'
 import { listLoopDecisions } from '../loops/decisions'
 import type { LoopDecisionRow } from '../loops/decisions'
 import type { LoopManifest } from '../loops/manifest'
+import { getHumanDirective, type HumanDirective } from '../brain/directive'
 
 // ── coherence physics (observe-only, #138) ───────────────────────────────────
 
@@ -135,12 +136,15 @@ export interface BrainView {
   decisions: LoopDecisionRow[]
   /** Latest coherence physics snapshot from the sovereign daemon. Null = not yet ingested. */
   physics: PhysicsSnapshot | null
+  /** Human-pinned decision directive, read by the brain before the next cycle. */
+  directive?: HumanDirective | null
 }
 
 export interface BrainViewDeps {
   listLoopsFn?: (env: Env) => Promise<LoopManifest[]>
   listDecisionsFn?: (env: Env, loopId: string, opts?: { limit?: number }) => Promise<LoopDecisionRow[]>
   loadPhysicsFn?: (env: Env) => Promise<PhysicsSnapshot | null>
+  loadDirectiveFn?: (env: Env) => Promise<HumanDirective | null>
 }
 
 /**
@@ -155,10 +159,13 @@ export async function loadBrainView(env: Env, deps: BrainViewDeps = {}): Promise
   const listFn = deps.listLoopsFn ?? ((e) => listLoops(e))
   const decisionsFn = deps.listDecisionsFn ?? listLoopDecisions
   const physicsFn = deps.loadPhysicsFn ?? loadBrainPhysics
+  const directiveFn = deps.loadDirectiveFn ?? getHumanDirective
 
-  // Load physics + loops concurrently — they touch independent storage (KV vs D1).
-  const [physics, loops] = await Promise.all([
+  // Load directive + physics + loops concurrently; the directive and loops are D1,
+  // but the directive is a single-key lookup and failures must not break the page.
+  const [physics, directive, loops] = await Promise.all([
     physicsFn(env).catch(() => null),
+    directiveFn(env).catch(() => null),
     listFn(env),
   ])
 
@@ -184,7 +191,7 @@ export async function loadBrainView(env: Env, deps: BrainViewDeps = {}): Promise
     .sort((a, b) => b.recorded_at.localeCompare(a.recorded_at))
     .slice(0, 100) // cap the combined feed at 100 rows
 
-  return { loops: loopRows, decisions, physics }
+  return { loops: loopRows, decisions, physics, directive }
 }
 
 // ── HTML body ────────────────────────────────────────────────────────────────
@@ -330,6 +337,35 @@ function physicsPanel(physics: PhysicsSnapshot | null) {
           <span class="scalar-sub">scored tasks</span>
         </div>
       </div>
+    </section>`
+}
+
+function directivePanel(directive: HumanDirective | null | undefined) {
+  if (!directive) {
+    return html`
+      <section class="brain-directive-panel card" aria-label="Human directive">
+        <div class="directive-head">
+          <span class="directive-title">Human Directive</span>
+          <span class="directive-badge directive-none">none pinned</span>
+        </div>
+        <p class="empty" style="margin:8px 0 0">
+          No owner directive is pinned. The brain will use its normal loop context.
+        </p>
+      </section>`
+  }
+
+  const updatedAt = directive.updated_at
+    ? directive.updated_at.slice(0, 16).replace('T', ' ')
+    : 'time unknown'
+
+  return html`
+    <section class="brain-directive-panel card" aria-label="Human directive">
+      <div class="directive-head">
+        <span class="directive-title">Human Directive</span>
+        <span class="directive-badge">pinned</span>
+        <span class="directive-meta">${directive.source} · ${updatedAt}</span>
+      </div>
+      <p class="directive-text">${directive.text}</p>
     </section>`
 }
 
@@ -492,6 +528,25 @@ async function brainControl(btn) {
         font-size: 10px; color: var(--muted);
       }
 
+      /* human directive */
+      .brain-directive-panel {
+        padding: 16px 20px; margin-bottom: 28px;
+      }
+      .directive-head {
+        display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;
+      }
+      .directive-title { font-weight: 700; font-size: 15px; }
+      .directive-badge {
+        font-size: 11px; font-weight: 700; padding: 2px 10px;
+        border-radius: 999px; border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+        color: var(--accent);
+      }
+      .directive-none { color: var(--dim); border-color: var(--border); }
+      .directive-meta { color: var(--dim); font-size: 11px; margin-left: auto; }
+      .directive-text {
+        margin: 0; white-space: pre-wrap; line-height: 1.5; color: var(--text);
+      }
+
       /* loops + decisions */
       .brain-loops { display: flex; flex-direction: column; gap: 10px; margin-bottom: 28px; }
       .brain-loop-card {
@@ -549,6 +604,8 @@ async function brainControl(btn) {
     </p>
 
     ${physicsPanel(view.physics)}
+
+    ${directivePanel(view.directive)}
 
     <h2>Loops</h2>
     ${

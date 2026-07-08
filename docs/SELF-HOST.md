@@ -14,7 +14,8 @@ A pot is a single Worker (`wrangler.<pot>.toml`) bound to:
 | `DB` | D1 | org, tasks, gates, loops, prospects, meter |
 | `VEC` | Vectorize | memory / semantic search |
 | `BUS` | Queues (+ DLQ) | internal event bus |
-| `SESSIONS` | KV | sessions, OAuth state |
+| `SESSIONS` | KV | dashboard sessions, OAuth request nonce/state, lightweight cache |
+| `OAUTH_KV` | KV | OAuth 2.1 provider clients, grants, and access-token state |
 | `BLOBS` | R2 | blobs/files |
 | `AI` | Workers AI | default model |
 | `AGENT`, `SQUAD` | Durable Objects | per-unit state + alarms |
@@ -28,15 +29,19 @@ per pot.
 ```bash
 npx wrangler login                 # on the TARGET account
 scripts/provision-pot.sh acme      # creates D1/Vectorize/Queues/KV/R2 for pot "acme"
+cp wrangler.example.toml wrangler.acme.toml
 ```
 
-Then follow the printed steps: copy `wrangler.toml` → `wrangler.acme.toml`, paste the
-resource IDs, set `[vars]` (`TENANT_SLUG`, OAuth), put secrets, apply migrations, deploy.
+Then follow the printed steps: paste the resource IDs/names into
+`wrangler.acme.toml`, set `[vars]` (`TENANT_SLUG`, `BRAND`,
+`OAUTH_PROVIDER`, fleet settings), put secrets, apply migrations, deploy.
 
 ## Secrets
 
 Secrets are Worker secrets (`wrangler secret put`), never in the toml.
-- `OAUTH_CLIENT_SECRET` — Google sign-in.
+- `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` — dashboard login.
+- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` — optional MCP OAuth 2.1
+  provider credentials when exposing the Google-backed OAuth flow.
 - Per-integration (optional): `GHL_API_KEY` / `GHL_LOCATION_ID` / `GHL_WEBHOOK_SECRET`.
 - **BYO MCP credentials** for a loop: `LOOP_SECRET_<name>` (the token) + a
   `LOOP_SECRET_<name>_HOST` var (the only host it may travel to). See
@@ -45,10 +50,14 @@ Secrets are Worker secrets (`wrangler secret put`), never in the toml.
 
 ## Staying in sync with upstream
 
-A self-hosted pot is the same code as upstream mupot. To update:
+A self-hosted pot is the same code as upstream mupot. For production upgrades,
+backups, rollback, restore, and incident response, use the
+[production self-hosting runbook](./production-runbook.md). The short happy path
+is:
 
 ```bash
 git pull
+node scripts/mupot-update.mjs acme          # dry-run if the pot is in pots.manifest.json
 npx wrangler d1 migrations apply mupot-acme --remote --config wrangler.acme.toml
 npx wrangler deploy --config wrangler.acme.toml
 ```

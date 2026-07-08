@@ -447,6 +447,91 @@ tasksApp.patch('/:id', async (c) => {
   return c.json({ task: next })
 })
 
+// ── POST /:id/local-smoke-complete — local browser harness result injection ──
+//
+// This route exists only when LOCAL_TEST_AUTH=1. It lets the local Playwright
+// smoke harness prove the browser flow from "send a task" through visible result
+// state without calling a live model provider. Production deployments leave this
+// sealed with a 404. Auth, tenant, and squad member+ gates still run first.
+tasksApp.post('/:id/local-smoke-complete', async (c) => {
+  if (c.env.LOCAL_TEST_AUTH !== '1') return c.json({ error: 'not_found' }, 404)
+
+  const id = c.req.param('id')
+  const existing = await getById<Task>(c.env, 'tasks', id)
+  if (!existing) return c.json({ error: 'task_not_found' }, 404)
+
+  if (!(await canActOnSquad(c.env, c.get('auth'), existing.squad_id))) {
+    return c.json({ error: 'forbidden', need: 'member' }, 403)
+  }
+
+  let body: { result?: unknown }
+  try {
+    body = (await c.req.json()) as { result?: unknown }
+  } catch {
+    body = {}
+  }
+
+  const result =
+    typeof body.result === 'string' && body.result.trim().length > 0
+      ? body.result.trim()
+      : 'Local browser smoke completed this task.'
+
+  if (existing.status !== 'open' && existing.status !== 'in_progress') {
+    return c.json({ error: 'task_not_runnable', status: existing.status }, 409)
+  }
+
+  const doneErr = checkTransition('in_progress', 'done')
+  if (doneErr) return c.json(doneErr, 409)
+  try {
+    assertCompletableDoneWhen(existing.done_when)
+  } catch (err) {
+    return c.json(
+      { error: 'done_when_placeholder', detail: err instanceof Error ? err.message : 'done_when is not completable' },
+      409,
+    )
+  }
+
+  if (existing.status === 'open') {
+    const startErr = checkTransition(existing.status, 'in_progress')
+    if (startErr) return c.json(startErr, 409)
+    const startedAt = new Date().toISOString()
+    await c.env.DB.prepare(
+      `UPDATE tasks SET status = 'in_progress', updated_at = ?1 WHERE id = ?2 AND status = 'open'`,
+    )
+      .bind(startedAt, existing.id)
+      .run()
+  }
+
+  const completedAt = new Date().toISOString()
+  const update = await c.env.DB.prepare(
+    `UPDATE tasks
+        SET status = 'done', result = ?1, completed_at = ?2, updated_at = ?2
+      WHERE id = ?3 AND status = 'in_progress'`,
+  )
+    .bind(result, completedAt, existing.id)
+    .run()
+  if ((update.meta?.changes ?? 0) === 0) {
+    return c.json({ error: 'task_not_runnable' }, 409)
+  }
+
+  const task: Task = {
+    ...existing,
+    status: 'done',
+    result,
+    completed_at: completedAt,
+    updated_at: completedAt,
+  }
+  const auth = c.get('auth')
+  await emitTaskEvent(
+    c.env,
+    'task.updated',
+    task,
+    auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
+  )
+
+  return c.json({ task, local_smoke: true })
+})
+
 // ── POST /:id/verdict — approve or reject a task in review ───────────────────
 //
 // RBAC: the caller must hold the task's gate_owner capability (e.g. 'gate:outreach').

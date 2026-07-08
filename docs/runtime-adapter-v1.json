@@ -1,0 +1,234 @@
+{
+  "id": "runtime-adapter/v1",
+  "status": "documented",
+  "signedAttachDomain": "fleet-attach:v1",
+  "signedDetachDomain": "fleet-detach:v1",
+  "signedInboxDomain": "agent-inbox:v1",
+  "identity": {
+    "tenantSource": "env.TENANT_SLUG",
+    "agentIdSource": "bearer-token-binding-or-signed-attach-key",
+    "memberIdSource": "bearer-token-or-agent-key",
+    "bodyFieldsNeverTrustedFor": ["tenant", "member_id", "capabilities"]
+  },
+  "attach": {
+    "signed": {
+      "method": "POST",
+      "path": "/api/fleet/attach-signed",
+      "required": ["agent_id", "type", "runtime", "lifecycle", "ts", "nonce", "sig"],
+      "lifecycles": ["on_demand", "always_on"],
+      "retry": "retry-with-fresh-nonce-ts-and-signature",
+      "errors": {
+        "400": "bad_request",
+        "401": "unauthorized",
+        "409": "replay",
+        "413": "payload_too_large"
+      }
+    },
+    "bearer": {
+      "method": "POST",
+      "path": "/api/fleet/attach",
+      "required": ["agent_id", "type", "runtime"],
+      "optional": ["lifecycle"],
+      "lifecycles": ["on_demand", "always_on"],
+      "downgradePolicy": "refuse-bearer-attach-when-agent-key-is-registered",
+      "errors": {
+        "400": "bad_request",
+        "401": "unauthorized",
+        "403": "forbidden",
+        "413": "payload_too_large"
+      }
+    },
+    "detach": {
+      "method": "POST",
+      "path": "/api/fleet/detach",
+      "required": ["agent_id"],
+      "signed": {
+        "method": "POST",
+        "path": "/api/fleet/detach-signed",
+        "required": ["agent_id", "ts", "nonce", "sig"],
+        "domain": "fleet-detach:v1",
+        "retry": "retry-with-fresh-nonce-ts-and-signature"
+      },
+      "errors": {
+        "400": "bad_request",
+        "401": "unauthorized",
+        "403": "forbidden",
+        "404": "not_found_or_not_owner",
+        "413": "payload_too_large"
+      }
+    }
+  },
+  "control": {
+    "version": "fleet-control.v1",
+    "api": {
+      "method": "POST",
+      "path": "/api/fleet/control",
+      "required": ["agent_id", "verb"]
+    },
+    "consumer": {
+      "inbox": "FLEET_CONSUMER_AGENT",
+      "read": "POST /api/inbox/signed",
+      "panelKey": "public-jwk-for-FLEET_PANEL_SK",
+      "nonceLedger": "host-local",
+      "consumePolicy": "consume-invalid-replay-and-verified-failures"
+    },
+    "verbs": {
+      "start": "flight.mjs open <agent>",
+      "stop": "flight.mjs close <agent>",
+      "restart": "flight.mjs close <agent> then flight.mjs open <agent>",
+      "status": "verified-noop"
+    },
+    "signedBytes": ["fleet-control.v1", "agent_id", "verb", "nonce", "ts"]
+  },
+  "presence": {
+    "mcpTools": ["check_in"],
+    "http": "POST /api/fleet/checkin",
+    "identitySource": "authenticated-member-token",
+    "bodyFieldsDescriptiveOnly": ["source", "label"],
+    "debounce": "tenant-member-30s"
+  },
+  "messaging": {
+    "mcpTools": ["send", "inbox", "broadcast"],
+    "http": {
+      "read": "GET /api/inbox?peek=1&limit=N",
+      "signedRead": {
+        "method": "POST",
+        "path": "/api/inbox/signed",
+        "required": ["agent_id", "peek", "limit", "ts", "nonce", "sig"],
+        "domain": "agent-inbox:v1",
+        "retry": "retry-with-fresh-nonce-ts-and-signature"
+      },
+      "send": "POST /api/inbox/send"
+    },
+    "identitySource": "auth.boundAgentId",
+    "kinds": ["message", "request", "ack"],
+    "requestIdPattern": "^[A-Za-z0-9_.:-]{1,128}$",
+    "idempotency": {
+      "scope": ["tenant", "from_agent", "request_id"],
+      "identicalRetry": "duplicate:true",
+      "differentContent": "request_id_conflict"
+    },
+    "readSemantics": {
+      "default": "consume",
+      "peek": "non-consuming"
+    },
+    "broadcast": {
+      "defaultSquad": "agent-bound-token-may-derive-squad-from-auth.boundAgentId",
+      "authorization": "member-on-target-squad",
+      "recipients": "active-agents-in-target-squad-excluding-self-by-default",
+      "includeSelf": "include_self-true",
+      "idempotency": "caller-request_id-derived-per-recipient"
+    },
+    "hostHandler": {
+      "file": "fleet-runtime/inbox-handler.mjs",
+      "handoff": "write-0600-spool-before-exit-0",
+      "commandInput": "json-stdin-with-files-and-messages",
+      "failure": "exit-nonzero-leaves-mupot-messages-unread"
+    },
+    "errors": [
+      "unauthorized",
+      "not_agent_bound",
+      "invalid_args",
+      "recipient_not_found",
+      "recipient_ambiguous",
+      "request_id_conflict",
+      "inbox_full",
+      "payload_too_large"
+    ]
+  },
+  "memory": {
+    "privateMcpTools": ["remember", "recall"],
+    "squadMcpTools": ["squad_remember", "squad_recall"],
+    "privateScope": "member:<member_id>",
+    "squadScope": "squad:<squad_id>",
+    "squadAuthorization": {
+      "write": "member-on-target-squad",
+      "read": "observer-on-target-squad"
+    },
+    "defaultSquad": "agent-bound-token-may-derive-squad-from-auth.boundAgentId",
+    "vectorFilter": ["agentId", "tenant"]
+  },
+  "peerDiscovery": {
+    "mcpTools": ["peers"],
+    "defaultSquad": "agent-bound-token-may-derive-squad-from-auth.boundAgentId",
+    "authorization": "observer-on-target-squad",
+    "scope": "single-squad-roster",
+    "presence": "latest-check-in-per-agent"
+  },
+  "tasks": {
+    "mcpTools": ["task_create", "task_list", "task_board", "task_update"],
+    "defaultSquad": "agent-bound-token-may-derive-squad-from-auth.boundAgentId",
+    "authorization": "member-on-target-squad",
+    "statuses": ["open", "in_progress", "blocked", "done", "review", "approved", "rejected"],
+    "createStatuses": ["open", "in_progress"],
+    "patchStatuses": ["open", "in_progress", "blocked", "done", "review"],
+    "verdictStatuses": ["approved", "rejected"],
+    "doneWhenRequired": true,
+    "transitions": {
+      "open": ["in_progress"],
+      "in_progress": ["review", "blocked", "done"],
+      "review": ["approved", "rejected"],
+      "approved": ["done"],
+      "rejected": ["in_progress", "done"],
+      "blocked": ["in_progress"],
+      "done": []
+    },
+    "events": ["task.created", "task.updated", "task.verdict"]
+  },
+  "hermes": {
+    "runtime": "hermes",
+    "webhook": {
+      "method": "POST",
+      "path": "/im/webhook",
+      "secretHeader": "X-Telegram-Bot-Api-Secret-Token",
+      "body": "{ message: { chat: { id }, text } }"
+    },
+    "lifecycleName": "Hermes IM task lifecycle",
+    "lifecycle": [
+      "Telegram update",
+      "IM webhook",
+      "chat_id member mapping",
+      "intent parsing",
+      "capability gate",
+      "createTask",
+      "task.created",
+      "reply"
+    ],
+    "intents": ["help", "status", "wake", "task"],
+    "taskDoneWhen": "A task result or linked artifact provides evidence that the requested IM task is complete."
+  },
+  "conformance": {
+    "localHarness": {
+      "script": "scripts/local-runtime-conformance.mjs",
+      "npmScript": "conformance:runtime:local",
+      "config": "wrangler-local-test.toml",
+      "seed": "scripts/local-test-seed.sql",
+      "covers": [
+        "signed-attach",
+        "signed-attach-replay",
+        "bearer-inbox-send",
+        "signed-inbox-peek",
+        "signed-inbox-consume",
+        "signed-inbox-replay",
+        "consume-once",
+        "fleet-control",
+        "fleet-control-signature-verify",
+        "signed-detach"
+      ]
+    },
+    "planned": [
+      "signed-attach",
+      "signed-detach",
+      "fleet-control",
+      "bearer-attach",
+      "detach-ownership",
+      "presence-heartbeat",
+      "inbox-idempotency",
+      "inbox-http-mcp-parity",
+      "hermes-im-task",
+      "hermes-permission-refusals",
+      "task-lifecycle",
+      "result-receipts"
+    ]
+  }
+}

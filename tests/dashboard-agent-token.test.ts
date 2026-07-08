@@ -6,7 +6,7 @@
 //   3. Route: GET /admin/agent-token — org-admin gated (redirect no-auth, 403 non-admin)
 //   4. Route: POST /admin/agent-token/mint — org-admin gated
 //   5. Mint binds agent_id (the weld): member_tokens.agent_id = agent.id
-//   6. Escalation guard: capability is squad-scoped 'member' on the agent's own squad
+//   6. Escalation guard: capability is squad-scoped observer/member on the agent's own squad
 //   7. Unknown agent → 404 (no token minted)
 //   8. Raw returned once in response; token hash ≠ raw; raw absent from members/caps rows
 //   9. Existing provision-tools tests stay green (separate file)
@@ -139,17 +139,29 @@ describe('mintAgentBoundToken', () => {
     expect(args[args.length - 1]).toBe(AGENT.id)
   })
 
-  it("THE ESCALATION GUARD: capability is scope_type='squad' capability='member' on agent's squad", async () => {
+  it("THE ESCALATION GUARD: default capability is scope_type='squad' capability='member' on agent's squad", async () => {
     const captured: Captured[] = []
     const env = makeUnitEnv({ captured })
     await mintAgentBoundToken(env, AGENT, 'guard-test')
     const capInsert = captured.find((c) => c.sql.includes('INSERT INTO capabilities'))
     expect(capInsert).toBeDefined()
     expect(capInsert!.sql).toContain("'squad'")
-    expect(capInsert!.sql).toContain("'member'")
     expect(capInsert!.args).toContain(AGENT.squad_id)
+    expect(capInsert!.args).toContain('member')
     expect(capInsert!.sql).not.toContain("'org'")
     expect(capInsert!.sql).not.toContain("'department'")
+  })
+
+  it("can lower the agent grant to observer without widening scope", async () => {
+    const captured: Captured[] = []
+    const env = makeUnitEnv({ captured })
+    const result = await mintAgentBoundToken(env, AGENT, 'observer-test', 'observer')
+    expect(result.grantCapability).toBe('observer')
+    const capInsert = captured.find((c) => c.sql.includes('INSERT INTO capabilities'))
+    expect(capInsert).toBeDefined()
+    expect(capInsert!.sql).toContain("'squad'")
+    expect(capInsert!.args).toContain(AGENT.squad_id)
+    expect(capInsert!.args).toContain('observer')
   })
 
   it('label truncates to 64 chars', async () => {
@@ -310,6 +322,7 @@ describe('GET /admin/agent-token', () => {
     const body = await res.text()
     expect(body).toContain('Mint agent token')
     expect(body).toContain('agent_id')
+    expect(body).toContain('name="capability"')
   })
 
   it('200s an owner role as well', async () => {
@@ -375,6 +388,31 @@ describe('POST /admin/agent-token/mint', () => {
     const tokenInsert = captured.find((c) => c.sql.includes('INSERT INTO member_tokens'))
     expect(tokenInsert).toBeDefined()
     expect(tokenInsert!.args[tokenInsert!.args.length - 1]).toBe(AGENT.id)
+  })
+
+  it('mints an observer agent token from the dashboard form', async () => {
+    const captured: Captured[] = []
+    const env = makeRouteEnv('admin', { captured })
+    const form = new URLSearchParams({ agent_id: AGENT.id, label: 'review-host', capability: 'observer' })
+    const res = await dashboardApp.fetch(makeReq('/admin/agent-token/mint', 'POST', form), env)
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain('Squad grant:')
+    expect(text).toContain('observer')
+    const capInsert = captured.find((c) => c.sql.includes('INSERT INTO capabilities'))
+    expect(capInsert).toBeDefined()
+    expect(capInsert!.args).toContain('observer')
+  })
+
+  it('400s an invalid agent grant before minting rows', async () => {
+    const captured: Captured[] = []
+    const env = makeRouteEnv('admin', { captured })
+    const form = new URLSearchParams({ agent_id: AGENT.id, label: 'bad-host', capability: 'lead' })
+    const res = await dashboardApp.fetch(makeReq('/admin/agent-token/mint', 'POST', form), env)
+    expect(res.status).toBe(400)
+    const text = await res.text()
+    expect(text).toContain('Grant must be observer or member')
+    expect(captured.length).toBe(0)
   })
 
   it('Cache-Control: no-store on the mint result page', async () => {

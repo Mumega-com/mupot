@@ -58,7 +58,7 @@ import { findPreset, isValidPresetId } from '../auth/role-presets'
 
 // Agent-bound token mint UI.
 import { loadAgentTokenView, agentTokenPageBody, agentTokenMintedBody } from './agent-token'
-import { mintAgentBoundToken } from '../members/service'
+import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
 import { resolveAgentRef } from '../org/resolve'
 
 // Connect-config builders (pure) for the Connect card.
@@ -88,6 +88,8 @@ import {
   agentGradient,
 } from './observatory'
 import type { ObservatoryData, SwimlaneBar, AgentStat } from './observatory'
+import { loadOpsHealth } from './health'
+import type { OpsHealthData, HealthTone } from './health'
 import { loadAllAgents, loadSquadOptions } from './agents-admin'
 import type { AgentAdminRow, SquadOption } from './agents-admin'
 import { formatBurn, formatUsd } from '../agents/cost'
@@ -96,7 +98,7 @@ import { formatBurn, formatUsd } from '../agents/cost'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
 import { loadFleet, wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
 import type { FleetRow } from './fleet'
-import { listFleetAgents } from '../fleet/registry'
+import { listFleetAgentRuntimeView } from '../fleet/registry'
 import { emitControlRequest } from '../fleet/control'
 import { hostAgentsPanel } from './fleet-host'
 import { listPresence } from '../fleet/presence'
@@ -219,6 +221,18 @@ dashboardApp.get('/send', async (c) => {
 dashboardApp.get('/approvals', async (c) => {
   const items = await loadApprovals(c.env, c.get('auth'))
   return c.html(shell(c.env.BRAND, 'Approvals', approvalsBody(items)))
+})
+
+// GET /ops — owner/admin health and observability console.
+// Read-only. Aggregates existing runtime/task/integration/audit evidence so an
+// operator can answer "is this pot healthy?" without querying SQL.
+dashboardApp.get('/ops', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(shell(c.env.BRAND, 'Operations', errorBody('Operations health requires owner or admin.')), 403)
+  }
+  const data = await loadOpsHealth(c.env)
+  return c.html(shell(c.env.BRAND, 'Operations', opsHealthBody(data)))
 })
 
 // ── loops (watch goal-seeking work-units + the outreach funnel) ──────────────
@@ -442,7 +456,7 @@ dashboardApp.get('/fleet', async (c) => {
   // The host-agents panel (signed control via mupot, the durable replacement for the bus path) is
   // shown on BOTH the pot-native and the bus window — it's the pot's OWN fleet control surface.
   const auth = c.get('auth')
-  const hostAgents = await listFleetAgents(c.env)
+  const hostAgents = await listFleetAgentRuntimeView(c.env)
   const hostPanel = hostAgentsPanel(hostAgents, {
     configured: !!c.env.FLEET_PANEL_SK && !!c.env.FLEET_CONSUMER_AGENT,
     canControl: auth.role === 'owner',
@@ -911,6 +925,9 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   const form = await c.req.parseBody()
   const agentIdRaw = typeof form.agent_id === 'string' ? form.agent_id.trim() : ''
   const labelRaw   = typeof form.label    === 'string' ? form.label.trim()    : ''
+  const capabilityRaw = typeof form.capability === 'string' && form.capability.trim()
+    ? form.capability.trim()
+    : 'member'
 
   if (!agentIdRaw) {
     const view = await loadAgentTokenView(c.env)
@@ -923,6 +940,13 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
     const view = await loadAgentTokenView(c.env)
     return c.html(
       shell(c.env.BRAND, 'Mint agent token', agentTokenPageBody(view, 'Label too long (max 64 chars).')),
+      400,
+    )
+  }
+  if (!isAgentTokenCapability(capabilityRaw)) {
+    const view = await loadAgentTokenView(c.env)
+    return c.html(
+      shell(c.env.BRAND, 'Mint agent token', agentTokenPageBody(view, 'Grant must be observer or member.')),
       400,
     )
   }
@@ -946,7 +970,7 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   // Delegate to the shared atomic-mint helper.
   // Three rows in ONE D1 batch: member envelope + escalation-guard capability +
   // agent-weld token. Same path the MCP mint_agent_token tool uses.
-  const minted = await mintAgentBoundToken(c.env, agent, labelRaw)
+  const minted = await mintAgentBoundToken(c.env, agent, labelRaw, capabilityRaw)
 
   // Look up the squad name for the show-once page.
   const squadRow = await c.env.DB.prepare('SELECT name FROM squads WHERE id = ?1 LIMIT 1')
@@ -960,7 +984,14 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
     shell(
       c.env.BRAND,
       'Agent token minted',
-      agentTokenMintedBody(agent.name, agent.slug, squadRow?.name ?? null, minted.raw, minted.tokenId),
+      agentTokenMintedBody(
+        agent.name,
+        agent.slug,
+        squadRow?.name ?? null,
+        minted.raw,
+        minted.tokenId,
+        minted.grantCapability,
+      ),
     ),
   )
 })
@@ -2570,6 +2601,12 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
             <span class="nav-label">Fleet</span>
           </a>
 
+          <!-- Health (operator console) -->
+          <a class="nav-link" href="/ops">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 2v4"/><path d="M10 14v4"/><path d="M4.3 4.3l2.8 2.8"/><path d="m12.9 12.9 2.8 2.8"/><path d="M2 10h4"/><path d="M14 10h4"/><path d="m4.3 15.7 2.8-2.8"/><path d="m12.9 7.1 2.8-2.8"/><circle cx="10" cy="10" r="3"/></svg>
+            <span class="nav-label">Health</span>
+          </a>
+
           <!-- Control Tower (coordination departures board) -->
           <a class="nav-link" href="/coordination">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 2v6M6 5l8 0M5 17l5-9 5 9M7.5 13h5"/></svg>
@@ -3090,6 +3127,117 @@ function observatoryBody(
     ${queueCount > 0 ? raw(obsQueueScript()) : html``}`
 }
 
+function uiToneFromHealth(tone: HealthTone): 'ok' | 'warn' | 'danger' | 'dim' {
+  if (tone === 'ok') return 'ok'
+  if (tone === 'warn') return 'warn'
+  if (tone === 'danger') return 'danger'
+  return 'dim'
+}
+
+function opsHealthBody(data: OpsHealthData) {
+  const checkRows: Html[][] = data.checks.map((c) => [
+    html`<a class="ui-link" href="${c.href}">${c.label}</a>`,
+    uiStatusDot(uiToneFromHealth(c.tone), c.state),
+    html`<span>${c.detail}</span>`,
+    html`<span>${c.nextAction}</span>`,
+  ])
+
+  const runtimeRows: Html[][] = data.runtimeSignals.map((r) => [
+    html`<a class="ui-link" href="${r.href}">${r.label}</a>`,
+    html`<span class="ui-mono-dim">${r.kind === 'fleet_agent' ? 'fleet' : 'presence'}</span>`,
+    html`<span>${r.runtime}</span>`,
+    uiStatusDot(uiToneFromHealth(r.tone), r.state),
+    html`<span class="ui-mono-dim">${r.lastSeen}</span>`,
+    html`<span>${r.detail}</span>`,
+  ])
+
+  const failureRows: Html[][] = data.recentFailures.map((f) => [
+    html`<a class="ui-link" href="${f.href}">${f.title}</a>`,
+    uiStatusDot(f.status === 'blocked' || f.status === 'rejected' ? 'danger' : 'warn', f.status.replace('_', ' ')),
+    html`<span>${f.detail}</span>`,
+    html`<span class="ui-mono-dim">${f.updatedAt.slice(0, 16).replace('T', ' ')}</span>`,
+  ])
+
+  const auditRows: Html[][] = data.auditSignals.map((a) => [
+    html`<a class="ui-link" href="${a.href}">${a.label}</a>`,
+    html`<span>${a.detail}</span>`,
+    html`<span class="ui-mono-dim">${a.at.slice(0, 16).replace('T', ' ')}</span>`,
+  ])
+
+  return html`
+    ${pageHeader({
+      crumbs: 'Overview / Operations',
+      title: 'Operations health',
+      sub:
+        'A read-only console for runtime liveness, queues, integration readiness, schema state, and audit-linked events.',
+      badge: data.overallTone === 'ok' ? 'Healthy' : data.overallTone === 'danger' ? 'Action needed' : 'Needs review',
+      badgeTone: uiToneFromHealth(data.overallTone),
+    })}
+    ${kpiRow([
+      statCard({ label: 'Active agents', value: String(data.kpis.activeAgents), subTone: data.kpis.activeAgents > 0 ? 'ok' : 'warn' }),
+      statCard({ label: 'Runtime online', value: String(data.kpis.runtimeOnline), subTone: data.kpis.runtimeOnline > 0 ? 'ok' : 'warn' }),
+      statCard({ label: 'Needs decision', value: String(data.kpis.needsDecision), subTone: data.kpis.needsDecision > 0 ? 'warn' : 'dim' }),
+      statCard({ label: 'Failures', value: String(data.kpis.blockedOrRejected), subTone: data.kpis.blockedOrRejected > 0 ? 'danger' : 'dim' }),
+    ])}
+    ${sectionPanel({
+      title: 'Health checks',
+      right: html`<span class="ui-mono-dim">${data.generatedAt.slice(0, 16).replace('T', ' ')}</span>`,
+      body: dataTable({
+        cols: [
+          { label: 'Surface', width: '1.1fr' },
+          { label: 'State', width: '1fr' },
+          { label: 'Reason', width: '2fr' },
+          { label: 'Next action', width: '2fr' },
+        ],
+        rows: checkRows,
+        empty: 'No health checks returned.',
+      }),
+    })}
+    ${sectionPanel({
+      title: 'Runtime signals',
+      right: html`<a class="ui-link" href="/fleet">Open Fleet -></a>`,
+      body: dataTable({
+        cols: [
+          { label: 'Runtime', width: '1.3fr' },
+          { label: 'Kind', width: '0.8fr' },
+          { label: 'Adapter', width: '1fr' },
+          { label: 'State', width: '1fr' },
+          { label: 'Last seen', width: '0.9fr' },
+          { label: 'Detail', width: '2fr' },
+        ],
+        rows: runtimeRows,
+        empty: 'No runtime or presence signals yet. Attach a worker or run a local fleet check-in.',
+      }),
+    })}
+    ${sectionPanel({
+      title: 'Recent failures',
+      right: html`<a class="ui-link" href="/send">Open work queue -></a>`,
+      body: dataTable({
+        cols: [
+          { label: 'Work', width: '1.5fr' },
+          { label: 'Status', width: '1fr' },
+          { label: 'Detail', width: '2.2fr' },
+          { label: 'Updated', width: '1fr' },
+        ],
+        rows: failureRows,
+        empty: 'No blocked tasks, rejected tasks, or failed workflow receipts in the recent window.',
+      }),
+    })}
+    ${sectionPanel({
+      title: 'Audit-linked events',
+      right: html`<a class="ui-link" href="/audit">Open Audit log -></a>`,
+      body: dataTable({
+        cols: [
+          { label: 'Event', width: '1.2fr' },
+          { label: 'Detail', width: '2fr' },
+          { label: 'When', width: '1fr' },
+        ],
+        rows: auditRows,
+        empty: 'No connector, fleet, verdict, or workflow receipts found yet.',
+      }),
+    })}`
+}
+
 /**
  * Render one approval item as an HTML card string.
  * Shared between observatoryBody (operator queue) and approvalsBody (/approvals page).
@@ -3441,6 +3589,9 @@ function sendScript() {
           });
         }
         function fmtSecs(ms) { return Math.max(0, Math.round(ms / 1000)) + 's'; }
+        function shouldDispatch() {
+          return window.__MUPOT_SMOKE_DISABLE_DISPATCH === true ? false : true;
+        }
 
         async function poll(taskId, startedAt) {
           var deadline = startedAt + MAX_MS;
@@ -3499,7 +3650,14 @@ function sendScript() {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
               credentials: 'same-origin',
-              body: JSON.stringify({ squad_id: squadId, title: title, body: text, assignee_agent_id: agentId, dispatch: true })
+              body: JSON.stringify({
+                squad_id: squadId,
+                title: title,
+                done_when: 'The task result explains the completed work and names any follow-up needed.',
+                body: text,
+                assignee_agent_id: agentId,
+                dispatch: shouldDispatch()
+              })
             });
             if (res.status === 403) { status.textContent = 'You do not have permission to task that agent.'; return; }
             if (!res.ok) {

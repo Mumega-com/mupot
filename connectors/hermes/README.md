@@ -14,8 +14,8 @@ Telegram user ──message──▶ Hermes ──POST /im/webhook──▶ your
 your pot ──{ok, reply}──▶ Hermes ──reply text──▶ Telegram user
 ```
 
-Hermes holds **one gateway member token** (`channel: im`) and forwards the *raw
-Telegram update* to your pot's IM seam. The pot:
+Hermes forwards the *raw Telegram update* to your pot's IM seam with Telegram's
+webhook secret-token header. The pot:
 
 1. Reads **only** `message.chat.id` for identity and `message.text` for intent.
    It never reads a username, "from" field, or any identity from the text.
@@ -36,16 +36,17 @@ POST the raw Telegram update straight through:
 ```
 POST https://YOUR-POT.example.workers.dev/im/webhook
 Content-Type: application/json
+X-Telegram-Bot-Api-Secret-Token: <IM_WEBHOOK_SECRET>
 
 { "message": { "chat": { "id": 123456789 }, "text": "task: ship the landing page @growth" } }
 ```
 
 Response: `{ "ok": true, "reply": "Added to Growth: \"ship the landing page\"." }`
 
-The webhook itself does not require the bearer token (the pot trusts the chat_id
-mapping for identity). If your perimeter requires the gateway token on the relay
-hop, send it as `Authorization: Bearer <MUPOT_GATEWAY_TOKEN>` — the pot tolerates
-its presence; identity is still the chat_id mapping.
+Set `IM_WEBHOOK_SECRET` as a Worker secret and configure Telegram/Hermes to send
+that value in `X-Telegram-Bot-Api-Secret-Token`. Without the secret, the route
+returns `503`; with the wrong header, it returns `401`. Identity is still the
+`chat_id` mapping, not the relay token or any user-provided text.
 
 ### B. Direct call (Hermes co-located / Worker-to-Worker)
 
@@ -64,11 +65,11 @@ Most Hermes deployments are a separate service → use the webhook (A).
 See [`hermes.config.example.yaml`](./hermes.config.example.yaml). It tells Hermes:
 
 - which pot to relay to (`mupot.url`)
-- the gateway member token to hold (`mupot.gateway_token` — placeholder only)
+- the webhook secret to send (`mupot.webhook_secret` or equivalent — placeholder only)
 - which Telegram chats to relay, and the `chat_id → member` expectation
 
-**No real token goes in this file in git.** Hermes reads the real value from a
-secret/env at runtime (e.g. `${MUPOT_GATEWAY_TOKEN}`).
+**No real secret goes in this file in git.** Hermes reads the real value from a
+secret/env at runtime.
 
 ## Mapping Telegram chat_id → mupot member
 
@@ -83,10 +84,15 @@ From then on, any message that user sends through Hermes resolves to that member
 and acts with their permissions. To off-board, suspend the member or clear their
 `telegram_chat_id` — their messages immediately go inert.
 
-## Gateway token
+## Webhook secret
 
-Mint the gateway token as a member token with `channel: im` (see the top-level
-[connectors README](../README.md)). Hermes holds it to authenticate the **relay
-hop** if your perimeter requires it. It is not an identity for the chat users —
-each chat user's identity is their own `chat_id` mapping. Revoke it to cut Hermes
-off entirely.
+Set the pot secret:
+
+```bash
+wrangler secret put IM_WEBHOOK_SECRET
+```
+
+Then configure Hermes or Telegram to send the same value as
+`X-Telegram-Bot-Api-Secret-Token`. Rotating this secret cuts the relay off until
+Hermes is updated. It is not an identity for chat users: each chat user's identity
+is still their own `chat_id` mapping.

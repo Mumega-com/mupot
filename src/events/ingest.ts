@@ -276,6 +276,8 @@ interface EventRouteEnv {
   EVENT_INGEST_SECRET?: string
 }
 
+export const EVENT_INGEST_MAX_BODY_BYTES = 256 * 1024
+
 function eventRouteEnv(env: Env): EventRouteEnv {
   // Same adapter pattern as GHL route (optional extras not in core Env).
   return env as unknown as EventRouteEnv
@@ -324,11 +326,19 @@ export async function verifyEventSignature(
 export const eventIngestApp = new Hono<{ Bindings: Env }>()
 
 eventIngestApp.post('/ingest', async (c) => {
+  const declaredLen = Number(c.req.header('content-length') ?? '0')
+  if (Number.isFinite(declaredLen) && declaredLen > EVENT_INGEST_MAX_BODY_BYTES) {
+    return c.json({ error: 'payload_too_large' }, 413)
+  }
+
   let rawBody: string
   try {
     rawBody = await c.req.text()
   } catch {
     return c.json({ error: 'invalid_body' }, 400)
+  }
+  if (new TextEncoder().encode(rawBody).byteLength > EVENT_INGEST_MAX_BODY_BYTES) {
+    return c.json({ error: 'payload_too_large' }, 413)
   }
 
   const signatureHeader = c.req.header('x-mupot-signature') ?? null

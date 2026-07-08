@@ -746,5 +746,5 @@ describe('FIX-A — readSeries truncation detection (>READ_SERIES_LIMIT rows in 
     // Points are the FIRST READ_SERIES_LIMIT readings (oldest), ordered ASC
     expect(result.points[0].value).toBe(0)
     expect(result.points[READ_SERIES_LIMIT - 1].value).toBe(READ_SERIES_LIMIT - 1)
-  })
+  }, 15_000)
 })

@@ -32,15 +32,27 @@ import type {
   BusEvent,
   Agent,
   Squad,
+  Task,
 } from '../types'
 import { resolveCapabilities, hasCapability, holdsCapabilityFloor } from '../auth/capability'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
-import { createTask } from '../tasks/service'
+import {
+  assertCompletableDoneWhen,
+  checkTransition,
+  createTask,
+  emitTaskEvent,
+  isDoneWhenValid,
+  mirrorTaskUpdate,
+  patchToDoneBypassesGate,
+} from '../tasks/service'
+import type { TaskStatus } from '../tasks/service'
 import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
+import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
-import { sendToRef, readAgentInbox } from '../agents/messages'
+import { sendToRef, readAgentInbox, sendAgentMessage } from '../agents/messages'
+import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { PROVISION_TOOLS } from './provision'
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
 // Vitest can import it without the CF runtime. See ./auth-header.ts.
@@ -103,6 +115,10 @@ async function resolveAuth(c: {
 // their own scope; there is no cross-member or agent memory access via this seam.
 function memberMemoryScope(memberId: string): string {
   return `member:${memberId}`
+}
+
+function squadMemoryScope(squadId: string): string {
+  return `squad:${squadId}`
 }
 
 // ── token hashing (Web Crypto, SHA-256 hex) ──────────────────────────────────
@@ -227,6 +243,27 @@ async function loadAgent(env: Env, agentId: string): Promise<Agent | null> {
   return row ?? null
 }
 
+async function loadMemberIdentity(env: Env, auth: AuthContext): Promise<{
+  memberId: string
+  displayName: string
+  email: string | null
+  boundAgentId: string | null
+} | null> {
+  const memberId = auth.memberId
+  if (!memberId) return null
+  const row = await env.DB.prepare(
+    `SELECT display_name, email FROM members WHERE id = ?1 LIMIT 1`,
+  )
+    .bind(memberId)
+    .first<{ display_name: string; email: string | null }>()
+  return {
+    memberId,
+    displayName: row?.display_name ?? auth.email ?? memberId,
+    email: row?.email ?? auth.email ?? null,
+    boundAgentId: auth.boundAgentId ?? null,
+  }
+}
+
 // ── attributed bus emit ───────────────────────────────────────────────────────
 // Every member-caused event carries actor {kind:'member', id} so the consumer +
 // activity feed attribute the effect to the human, not an anonymous system call.
@@ -247,6 +284,9 @@ export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolEr
 
 export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
   return { ok: false, status, error, detail }
+}
+function failOnly(status: ToolError['status'], error: string, detail?: unknown): Extract<ToolOutcome, { ok: false }> {
+  return fail(status, error, detail) as Extract<ToolOutcome, { ok: false }>
 }
 export function done(result: unknown): ToolOutcome {
   return { ok: true, result }
@@ -288,6 +328,98 @@ type JsonSchema = {
 const STRING_SCHEMA = { type: 'string' }
 const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
+const TASK_STATUSES: readonly TaskStatus[] = ['open', 'in_progress', 'blocked', 'done', 'review', 'approved', 'rejected']
+const PATCH_ALLOWED_STATUSES: ReadonlySet<string> = new Set(['open', 'in_progress', 'blocked', 'done', 'review'])
+const BROADCAST_REQUEST_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/
+
+function isTaskStatus(v: unknown): v is TaskStatus {
+  return typeof v === 'string' && (TASK_STATUSES as readonly string[]).includes(v)
+}
+
+function isPatchableStatus(v: unknown): v is TaskStatus {
+  return typeof v === 'string' && PATCH_ALLOWED_STATUSES.has(v)
+}
+
+async function sha256Short(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s))
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, 64)
+}
+
+async function broadcastRecipientRequestId(base: string, toAgent: string): Promise<string> {
+  return `bcast:${await sha256Short(`${base}\n${toAgent}`)}`
+}
+
+function readLimit(v: unknown, fallback: number, max: number): number | Extract<ToolOutcome, { ok: false }> {
+  if (v === undefined || v === null) return fallback
+  if (typeof v !== 'number' || !Number.isFinite(v)) return failOnly(400, 'invalid_args', 'limit must be a number')
+  return Math.min(max, Math.max(1, Math.floor(v)))
+}
+
+function readConcepts(v: unknown): string[] | undefined | Extract<ToolOutcome, { ok: false }> {
+  if (v === undefined || v === null) return undefined
+  if (!Array.isArray(v)) return failOnly(400, 'invalid_args', 'concepts must be a string[]')
+  return v.filter((x): x is string => typeof x === 'string')
+}
+
+async function loadTask(env: Env, taskId: string): Promise<Task | null> {
+  const row = await env.DB.prepare(
+    `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+       FROM tasks WHERE id = ?1 LIMIT 1`,
+  )
+    .bind(taskId)
+    .first<Task>()
+  return row ?? null
+}
+
+async function resolveTaskSquad(
+  env: Env,
+  auth: AuthContext,
+  args: Record<string, unknown>,
+): Promise<{ ok: true; squad: Squad } | Extract<ToolOutcome, { ok: false }>> {
+  return resolveScopedSquad(
+    env,
+    auth,
+    args,
+    'member',
+    'squad_id required unless the token is agent-bound',
+  )
+}
+
+async function resolveScopedSquad(
+  env: Env,
+  auth: AuthContext,
+  args: Record<string, unknown>,
+  min: Capability,
+  missingDetail: string,
+): Promise<{ ok: true; squad: Squad } | Extract<ToolOutcome, { ok: false }>> {
+  let squadId = str(args.squad_id)
+  if (!squadId && auth.boundAgentId) {
+    const agent = await loadAgent(env, auth.boundAgentId)
+    squadId = agent?.squad_id ?? null
+  }
+  if (!squadId) return failOnly(400, 'invalid_args', missingDetail)
+
+  const squad = await loadSquad(env, squadId)
+  if (!squad) return failOnly(404, 'squad_not_found')
+
+  const grants = auth.capabilities ?? []
+  if (!(await memberCanOnSquad(env, grants, squad.id, min))) {
+    return failOnly(403, 'forbidden', { need: min, scope: 'squad' })
+  }
+  return { ok: true, squad }
+}
+
+async function resolveTaskAssignee(env: Env, raw: unknown, squadId: string): Promise<{ value: string | null; error?: string }> {
+  if (raw === undefined || raw === null) return { value: null }
+  if (typeof raw !== 'string' || raw.length === 0) return { value: null, error: 'invalid_assignee' }
+  const agent = await loadAgent(env, raw)
+  if (!agent) return { value: null, error: 'invalid_assignee' }
+  if (agent.squad_id !== squadId) return { value: null, error: 'assignee_not_in_squad' }
+  return { value: agent.id }
+}
 
 // task_create — create a task on a squad. cap: member+ on the TARGET squad.
 // #142 capsule keystone: done_when is required — a non-empty verifiable success
@@ -349,6 +481,228 @@ const toolTaskCreate: ToolSpec = {
   },
 }
 
+// task_list — list visible squad tasks over the MCP seam. cap: member+ on the
+// target squad. Agent-bound tokens may omit squad_id and default to their own
+// squad, which matches the runtime cutover path for brain/code agents.
+const toolTaskList: ToolSpec = {
+  name: 'task_list',
+  scope: 'squad',
+  min: 'member',
+  args: '{ squad_id?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review"|"approved"|"rejected", assignee_agent_id?: string, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      squad_id: STRING_SCHEMA,
+      status: STRING_SCHEMA,
+      assignee_agent_id: STRING_SCHEMA,
+      limit: OPTIONAL_NUMBER_SCHEMA,
+    },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const squadRes = await resolveTaskSquad(env, auth, args)
+    if (!squadRes.ok) return squadRes
+    const status = args.status
+    if (status !== undefined && status !== null && !isTaskStatus(status)) {
+      return fail(400, 'invalid_status')
+    }
+    const assignee = args.assignee_agent_id
+    if (assignee !== undefined && assignee !== null && typeof assignee !== 'string') {
+      return fail(400, 'invalid_args', 'assignee_agent_id must be a string')
+    }
+    const limit = readLimit(args.limit, 25, 100)
+    if (typeof limit !== 'number') return limit
+
+    const clauses = ['squad_id = ?1']
+    const binds: unknown[] = [squadRes.squad.id]
+    if (status) {
+      clauses.push(`status = ?${binds.length + 1}`)
+      binds.push(status)
+    }
+    if (typeof assignee === 'string' && assignee.trim()) {
+      clauses.push(`assignee_agent_id = ?${binds.length + 1}`)
+      binds.push(assignee.trim())
+    }
+    binds.push(limit)
+
+    const rows = await env.DB.prepare(
+      `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+         FROM tasks
+        WHERE ${clauses.join(' AND ')}
+        ORDER BY created_at DESC
+        LIMIT ?${binds.length}`,
+    )
+      .bind(...binds)
+      .all<Task>()
+
+    return done({ squad_id: squadRes.squad.id, tasks: rows.results ?? [] })
+  },
+}
+
+// task_board — compact kanban-style view for brain loops. It is intentionally
+// read-only and squad-scoped; it groups the same rows task_list can read.
+const toolTaskBoard: ToolSpec = {
+  name: 'task_board',
+  scope: 'squad',
+  min: 'member',
+  args: '{ squad_id?: string, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: { squad_id: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const squadRes = await resolveTaskSquad(env, auth, args)
+    if (!squadRes.ok) return squadRes
+    const limit = readLimit(args.limit, 100, 250)
+    if (typeof limit !== 'number') return limit
+
+    const rows = await env.DB.prepare(
+      `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+         FROM tasks
+        WHERE squad_id = ?1
+        ORDER BY created_at DESC
+        LIMIT ?2`,
+    )
+      .bind(squadRes.squad.id, limit)
+      .all<Task>()
+
+    const columns: Record<TaskStatus, Task[]> = {
+      open: [],
+      in_progress: [],
+      blocked: [],
+      review: [],
+      approved: [],
+      rejected: [],
+      done: [],
+    }
+    for (const task of rows.results ?? []) {
+      if (columns[task.status]) columns[task.status].push(task)
+    }
+    const counts = Object.fromEntries(
+      TASK_STATUSES.map((status) => [status, columns[status].length]),
+    ) as Record<TaskStatus, number>
+    return done({ squad_id: squadRes.squad.id, counts, columns })
+  },
+}
+
+// task_update — mutate a task through the same lifecycle gates as PATCH /api/tasks/:id.
+// cap: member+ on the task's squad. approved/rejected still require the verdict
+// endpoint; this tool can move work through open/in_progress/blocked/review/done.
+const toolTaskUpdate: ToolSpec = {
+  name: 'task_update',
+  scope: 'squad (of the task)',
+  min: 'member',
+  args: '{ task_id: string, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", assignee_agent_id?: string|null, gate_owner?: string|null }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: STRING_SCHEMA,
+      title: STRING_SCHEMA,
+      body: STRING_SCHEMA,
+      done_when: STRING_SCHEMA,
+      status: STRING_SCHEMA,
+      assignee_agent_id: STRING_SCHEMA,
+      gate_owner: STRING_SCHEMA,
+    },
+    required: ['task_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const taskId = str(args.task_id)
+    if (!taskId) return fail(400, 'invalid_args', 'task_id required')
+    const existing = await loadTask(env, taskId)
+    if (!existing) return fail(404, 'task_not_found')
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'member'))) {
+      return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
+    }
+
+    const next: Task = { ...existing }
+    let changed = false
+
+    if (args.title !== undefined) {
+      if (!str(args.title)) return fail(400, 'invalid_title')
+      next.title = (args.title as string).trim()
+      changed = true
+    }
+    if (args.body !== undefined) {
+      if (typeof args.body !== 'string') return fail(400, 'invalid_body')
+      next.body = args.body
+      changed = true
+    }
+    if (args.done_when !== undefined) {
+      if (!isDoneWhenValid(args.done_when)) {
+        return fail(400, 'invalid_done_when', 'done_when must be a non-empty verifiable success predicate')
+      }
+      next.done_when = (args.done_when as string).trim()
+      changed = true
+    }
+    if (args.status !== undefined) {
+      if (!isPatchableStatus(args.status)) return fail(400, 'invalid_status')
+      const transitionErr = checkTransition(existing.status, args.status)
+      if (transitionErr) return fail(400, 'invalid_transition', transitionErr)
+      if (patchToDoneBypassesGate(existing.status, existing.gate_owner, args.status)) {
+        return fail(409, 'gate_open', 'gated task must be approved via verdict before it can be marked done')
+      }
+      if (args.status === 'done') {
+        try {
+          assertCompletableDoneWhen(next.done_when)
+        } catch (err) {
+          return fail(409, 'done_when_placeholder', err instanceof Error ? err.message : 'done_when is not completable')
+        }
+      }
+      next.status = args.status
+      changed = true
+    }
+    if (args.assignee_agent_id !== undefined) {
+      const check = await resolveTaskAssignee(env, args.assignee_agent_id, existing.squad_id)
+      if (check.error) return fail(400, check.error)
+      next.assignee_agent_id = check.value
+      changed = true
+    }
+    if (args.gate_owner !== undefined) {
+      const lockStatuses: ReadonlySet<TaskStatus> = new Set(['review', 'approved', 'rejected', 'done'])
+      if (lockStatuses.has(existing.status)) return fail(409, 'gate_owner_locked', { status: existing.status })
+      if (args.gate_owner === null) {
+        next.gate_owner = null
+      } else if (typeof args.gate_owner === 'string' && args.gate_owner.trim().length > 0) {
+        next.gate_owner = args.gate_owner.trim()
+      } else {
+        return fail(400, 'invalid_gate_owner')
+      }
+      changed = true
+    }
+    if (!changed) return fail(400, 'invalid_args', 'at least one update field is required')
+
+    next.updated_at = new Date().toISOString()
+    next.github_issue_url = await mirrorTaskUpdate(env, next)
+
+    const res = await env.DB.prepare(
+      `UPDATE tasks
+          SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, updated_at = ?
+        WHERE id = ?`,
+    )
+      .bind(
+        next.title,
+        next.body,
+        next.done_when,
+        next.status,
+        next.assignee_agent_id,
+        next.github_issue_url,
+        next.gate_owner,
+        next.updated_at,
+        next.id,
+      )
+      .run()
+    if (!res.meta?.changes) return fail(409, 'task_update_race')
+
+    await emitTaskEvent(env, 'task.updated', next, memberActor(auth.memberId as string))
+    return done({ task: next })
+  },
+}
+
 // remember — write to the MEMBER's OWN memory scope. cap: authenticated member.
 const toolRemember: ToolSpec = {
   name: 'remember',
@@ -365,12 +719,8 @@ const toolRemember: ToolSpec = {
     const text = str(args.text)
     if (!text) return fail(400, 'invalid_args', 'text required')
 
-    let concepts: string[] | undefined
-    if (Array.isArray(args.concepts)) {
-      concepts = args.concepts.filter((x): x is string => typeof x === 'string')
-    } else if (args.concepts !== undefined) {
-      return fail(400, 'invalid_args', 'concepts must be a string[]')
-    }
+    const concepts = readConcepts(args.concepts)
+    if (concepts && !Array.isArray(concepts)) return concepts
 
     const scope = memberMemoryScope(auth.memberId as string)
     const id = await createMemory(env).remember(scope, text, concepts)
@@ -404,6 +754,75 @@ const toolRecall: ToolSpec = {
     const scope = memberMemoryScope(auth.memberId as string)
     const hits = await createMemory(env).recall(scope, query, limit)
     return done({ hits })
+  },
+}
+
+// squad_remember — write to the squad's shared memory scope. cap: member+ on squad.
+// Agent-bound tokens may omit squad_id and default to their own squad.
+const toolSquadRemember: ToolSpec = {
+  name: 'squad_remember',
+  scope: 'squad memory',
+  min: 'member',
+  args: '{ squad_id?: string, text: string, concepts?: string[] }',
+  inputSchema: {
+    type: 'object',
+    properties: { squad_id: STRING_SCHEMA, text: STRING_SCHEMA, concepts: OPTIONAL_STRING_ARRAY_SCHEMA },
+    required: ['text'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const text = str(args.text)
+    if (!text) return fail(400, 'invalid_args', 'text required')
+
+    const concepts = readConcepts(args.concepts)
+    if (concepts && !Array.isArray(concepts)) return concepts
+
+    const squadRes = await resolveScopedSquad(
+      env,
+      auth,
+      args,
+      'member',
+      'squad_id required unless the token is agent-bound',
+    )
+    if (!squadRes.ok) return squadRes
+
+    const scope = squadMemoryScope(squadRes.squad.id)
+    const id = await createMemory(env).remember(scope, text, concepts)
+    return done({ engram_id: id, squad_id: squadRes.squad.id, scope })
+  },
+}
+
+// squad_recall — read the squad's shared memory scope. cap: observer+ on squad.
+// This is intentionally separate from recall so private per-token memory remains private.
+const toolSquadRecall: ToolSpec = {
+  name: 'squad_recall',
+  scope: 'squad memory',
+  min: 'observer',
+  args: '{ squad_id?: string, query: string, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: { squad_id: STRING_SCHEMA, query: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA },
+    required: ['query'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const query = str(args.query)
+    if (!query) return fail(400, 'invalid_args', 'query required')
+    const limit = readLimit(args.limit, 5, 20)
+    if (typeof limit !== 'number') return limit
+
+    const squadRes = await resolveScopedSquad(
+      env,
+      auth,
+      args,
+      'observer',
+      'squad_id required unless the token is agent-bound',
+    )
+    if (!squadRes.ok) return squadRes
+
+    const scope = squadMemoryScope(squadRes.squad.id)
+    const hits = await createMemory(env).recall(scope, query, limit)
+    return done({ squad_id: squadRes.squad.id, scope, hits })
   },
 }
 
@@ -573,6 +992,112 @@ const toolSend: ToolSpec = {
   },
 }
 
+type BroadcastTarget = Pick<Agent, 'id' | 'slug' | 'name'>
+
+// broadcast — fan out a durable message to every active agent in one squad. This
+// is still a set of ordinary agent_messages rows, so inbox delivery, unread caps,
+// and replay semantics remain identical to direct send.
+const toolBroadcast: ToolSpec = {
+  name: 'broadcast',
+  scope: 'squad fan-out (active agents only); sender must be agent-bound',
+  min: 'member',
+  args: '{ squad_id?: string, body: string, kind?: "message"|"request", request_id?: string, include_self?: boolean, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      squad_id: STRING_SCHEMA,
+      body: STRING_SCHEMA,
+      kind: STRING_SCHEMA,
+      request_id: STRING_SCHEMA,
+      include_self: { type: 'boolean' },
+      limit: OPTIONAL_NUMBER_SCHEMA,
+    },
+    required: ['body'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const fromAgent = auth.boundAgentId
+    if (!fromAgent) return fail(403, 'not_agent_bound', 'broadcast requires an agent-bound token (member_tokens.agent_id)')
+
+    const body = str(args.body)
+    if (!body) return fail(400, 'invalid_args', 'body required')
+    const kind = args.kind ?? 'message'
+    if (kind !== 'message' && kind !== 'request') {
+      return fail(400, 'invalid_args', 'kind must be "message" or "request"')
+    }
+    if (args.request_id !== undefined && typeof args.request_id !== 'string') {
+      return fail(400, 'invalid_args', 'request_id must be a string')
+    }
+    const requestId = typeof args.request_id === 'string' ? args.request_id : undefined
+    if (requestId !== undefined && !BROADCAST_REQUEST_ID_RE.test(requestId)) {
+      return fail(400, 'invalid_request_id', 'request_id must match [A-Za-z0-9_.:-]{1,128}')
+    }
+    if (args.include_self !== undefined && typeof args.include_self !== 'boolean') {
+      return fail(400, 'invalid_args', 'include_self must be a boolean')
+    }
+    const includeSelf = args.include_self === true
+    const limit = readLimit(args.limit, 100, 200)
+    if (typeof limit !== 'number') return limit
+
+    const squadRes = await resolveScopedSquad(
+      env,
+      auth,
+      args,
+      'member',
+      'squad_id required unless the token is agent-bound',
+    )
+    if (!squadRes.ok) return squadRes
+
+    const rows = await env.DB.prepare(
+      `SELECT id, slug, name
+         FROM agents
+        WHERE squad_id = ?1 AND status = 'active'
+        ORDER BY slug ASC
+        LIMIT ?2`,
+    )
+      .bind(squadRes.squad.id, limit)
+      .all<BroadcastTarget>()
+    const targets = (rows.results ?? []).filter((agent) => includeSelf || agent.id !== fromAgent)
+
+    const deliveries: Array<{ to: string; slug: string; id: string; seq: number; duplicate: boolean; request_id: string | null }> = []
+    const failures: Array<{ to: string; slug: string; error: string; detail?: string }> = []
+    for (const target of targets) {
+      const recipientRequestId = requestId ? await broadcastRecipientRequestId(requestId, target.id) : undefined
+      const res = await sendAgentMessage(env, {
+        fromAgent,
+        fromMember: auth.memberId as string,
+        toAgent: target.id,
+        body,
+        kind,
+        requestId: recipientRequestId,
+      })
+      if (res.ok) {
+        deliveries.push({
+          to: target.id,
+          slug: target.slug,
+          id: res.id,
+          seq: res.seq,
+          duplicate: res.duplicate,
+          request_id: recipientRequestId ?? null,
+        })
+      } else {
+        failures.push({ to: target.id, slug: target.slug, error: res.reason, detail: res.detail })
+      }
+    }
+
+    return done({
+      ok: failures.length === 0,
+      squad_id: squadRes.squad.id,
+      from: fromAgent,
+      attempted: targets.length,
+      delivered: deliveries.length,
+      failed: failures.length,
+      deliveries,
+      failures,
+    })
+  },
+}
+
 // inbox — read (and by default CONSUME) the CALLER's own inbox. cap: agent-bound member.
 // Self-scoped: an agent only ever reads to_agent = its own welded id; it cannot read another
 // agent's inbox. peek=true reads without consuming.
@@ -605,6 +1130,136 @@ const toolInbox: ToolSpec = {
       return fail(400, res.reason, res.detail)
     }
     return done({ messages: res.messages, remaining: res.remaining, consumed: args.peek !== true })
+  },
+}
+
+type PeerRow = Agent & {
+  presence_source: string | null
+  presence_label: string | null
+  presence_last_seen_at: string | null
+}
+
+// peers — read the caller's squad roster for coordination. This is not a global
+// directory: agent-bound tokens default to their own squad, and explicit squad
+// reads require observer+ on that squad.
+const toolPeers: ToolSpec = {
+  name: 'peers',
+  scope: 'squad roster (read-only)',
+  min: 'authenticated',
+  args: '{ squad_id?: string, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: { squad_id: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const squadRes = await resolveScopedSquad(
+      env,
+      auth,
+      args,
+      'observer',
+      'squad_id required unless the token is agent-bound',
+    )
+    if (!squadRes.ok) return squadRes
+    const limit = readLimit(args.limit, 50, 200)
+    if (typeof limit !== 'number') return limit
+
+    const rows = await env.DB.prepare(
+      `SELECT a.id, a.squad_id, a.slug, a.name, a.role, a.model, a.status, a.created_at,
+              (SELECT p.source FROM presence p
+                WHERE p.tenant = ?2 AND p.agent_id = a.id
+                ORDER BY p.last_seen_at DESC LIMIT 1) AS presence_source,
+              (SELECT p.label FROM presence p
+                WHERE p.tenant = ?2 AND p.agent_id = a.id
+                ORDER BY p.last_seen_at DESC LIMIT 1) AS presence_label,
+              (SELECT p.last_seen_at FROM presence p
+                WHERE p.tenant = ?2 AND p.agent_id = a.id
+                ORDER BY p.last_seen_at DESC LIMIT 1) AS presence_last_seen_at
+         FROM agents a
+        WHERE a.squad_id = ?1
+        ORDER BY a.slug ASC
+        LIMIT ?3`,
+    )
+      .bind(squadRes.squad.id, env.TENANT_SLUG, limit)
+      .all<PeerRow>()
+
+    const nowMs = Date.now()
+    const peers = (rows.results ?? []).map((row) => {
+      const lastSeenMs = sqliteUtcToMs(row.presence_last_seen_at)
+      return {
+        id: row.id,
+        slug: row.slug,
+        name: row.name,
+        role: row.role,
+        model: row.model,
+        status: row.status,
+        squad_id: row.squad_id,
+        is_self: auth.boundAgentId === row.id,
+        presence: {
+          source: row.presence_source ?? null,
+          label: row.presence_label ?? '',
+          last_seen_at: row.presence_last_seen_at ?? null,
+          liveness: classify(lastSeenMs, nowMs),
+          last_seen_human: humanAge(lastSeenMs, nowMs),
+        },
+      }
+    })
+
+    return done({
+      squad: {
+        id: squadRes.squad.id,
+        slug: squadRes.squad.slug,
+        name: squadRes.squad.name,
+      },
+      self_agent_id: auth.boundAgentId ?? null,
+      peers,
+    })
+  },
+}
+
+// check_in — pot-native presence heartbeat over MCP. This mirrors
+// POST /api/fleet/checkin for runtimes that only have an MCP transport: identity
+// is the authenticated member token, source/label are descriptive only, and a
+// rapid repeat is debounced with the same tenant+member KV key as the HTTP route.
+const toolCheckIn: ToolSpec = {
+  name: 'check_in',
+  scope: 'self (member-token presence)',
+  min: 'authenticated',
+  args: '{ source?: "claude-code"|"codex"|"hermes"|"openclaw"|"tmux"|"cowork"|"unknown", label?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      source: STRING_SCHEMA,
+      label: STRING_SCHEMA,
+    },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (args.source !== undefined && args.source !== null && typeof args.source !== 'string') {
+      return fail(400, 'invalid_args', 'source must be a string')
+    }
+    if (args.label !== undefined && args.label !== null && typeof args.label !== 'string') {
+      return fail(400, 'invalid_args', 'label must be a string')
+    }
+
+    const id = await loadMemberIdentity(env, auth)
+    if (!id) return fail(403, 'not_member_bound', 'check_in requires a member-token principal')
+
+    const dkey = `checkin:${env.TENANT_SLUG}:${id.memberId}`
+    try {
+      if (await env.SESSIONS.get(dkey)) {
+        return done({ ok: true, agent: id.displayName, agent_id: id.boundAgentId, debounced: true })
+      }
+      await env.SESSIONS.put(dkey, '1', { expirationTtl: 30 })
+    } catch {
+      // KV unavailable — match /api/fleet/checkin and prefer recording presence.
+    }
+
+    await recordCheckin(env, id, {
+      source: args.source,
+      label: args.label,
+    })
+    return done({ ok: true, agent: id.displayName, agent_id: id.boundAgentId, debounced: false })
   },
 }
 
@@ -918,12 +1573,20 @@ const toolConnect: ToolSpec = {
 // assertion + the dispatch wiring proof read these directly.
 export const TOOLS: ToolSpec[] = [
   toolTaskCreate,
+  toolTaskList,
+  toolTaskBoard,
+  toolTaskUpdate,
   toolRemember,
   toolRecall,
+  toolSquadRemember,
+  toolSquadRecall,
   toolWakeAgent,
   toolSquadMessage,
   toolSend,
+  toolBroadcast,
   toolInbox,
+  toolPeers,
+  toolCheckIn,
   toolStatus,
   toolBootContext,
   toolOrient,

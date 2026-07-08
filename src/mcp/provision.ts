@@ -11,10 +11,11 @@
 //     from args. `agent`/`squad`/`department` args only NAME a target; the capability
 //     check authorizes it.
 //   - THE ESCALATION GUARD: mint_agent_token grants the new agent member a HARD-CAPPED
-//     squad-scoped 'member' capability on the agent's OWN squad — never org/department,
-//     never above 'member'. A minted agent token therefore can NEVER inherit the
-//     operator's org-admin: it can only ever act as 'member' on its one squad. This is
-//     the sovereign default and the reason mint is itself gated at 'admin'.
+//     squad-scoped observer/member capability on the agent's OWN squad — never
+//     org/department, never above 'member'. A minted agent token therefore can NEVER
+//     inherit the operator's org-admin: it can only ever act at or below 'member' on
+//     its one squad. This is the sovereign default and the reason mint is itself gated
+//     at 'admin'.
 //
 // Tools (registered into the TOOLS array in src/mcp/index):
 //   create_squad      — admin on the department (org inherits)
@@ -24,7 +25,7 @@
 import type { Env, BusEvent } from '../types'
 import { hasCapability } from '../auth/capability'
 import { createDepartment, createSquad, createAgent } from '../org/service'
-import { mintAgentBoundToken } from '../members/service'
+import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
 import { mcpEndpoint, wakeContractForAgent } from '../dashboard/connect'
 import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
@@ -241,16 +242,17 @@ const toolCreateAgent: ToolSpec = {
 
 // ── mint_agent_token ─────────────────────────────────────────────────────────────
 // Creates a DEDICATED member for the agent, grants it a HARD-CAPPED squad-scoped
-// 'member' capability on the agent's own squad, binds a fresh token to the agent
-// (the weld: member_tokens.agent_id), and returns the raw token EXACTLY ONCE.
+// capability on the agent's own squad, binds a fresh token to the agent (the weld:
+// member_tokens.agent_id), and returns the raw token EXACTLY ONCE. Default grant is
+// 'member'; callers may lower to 'observer' but never above member.
 const toolMintAgentToken: ToolSpec = {
   name: 'mint_agent_token',
   scope: "agent's squad",
   min: 'admin',
-  args: '{ agent: string (id|slug), label? }',
+  args: '{ agent: string (id|slug), label?, capability?: "observer"|"member" }',
   inputSchema: {
     type: 'object',
-    properties: { agent: STRING_SCHEMA, label: STRING_SCHEMA },
+    properties: { agent: STRING_SCHEMA, label: STRING_SCHEMA, capability: STRING_SCHEMA },
     required: ['agent'],
     additionalProperties: false,
   },
@@ -272,12 +274,19 @@ const toolMintAgentToken: ToolSpec = {
     // Cap the label length (parity with the HTTP mint path, members/index.ts) — a
     // member-supplied free field on a credential write; bound it to 64 chars.
     const label = (str(args.label) ?? agent.slug).trim().slice(0, 64)
+    const grantCapability = args.capability === undefined || args.capability === null
+      ? 'member'
+      : args.capability
+    if (!isAgentTokenCapability(grantCapability)) {
+      return fail(400, 'invalid_capability', 'capability must be observer or member')
+    }
 
     // Delegate to the shared atomic-mint helper (members/service.ts).
     // Three rows in ONE D1 batch: member envelope + escalation-guard capability +
     // agent-weld token. Either all three land or none do — no orphan credentials.
-    // The helper enforces: squad-scoped 'member' only, hash-only storage, show-once raw.
-    const minted = await mintAgentBoundToken(env, agent, label)
+    // The helper enforces: squad-scoped observer/member only, hash-only storage,
+    // show-once raw.
+    const minted = await mintAgentBoundToken(env, agent, label, grantCapability)
 
     await emitProvisioned(env, auth.memberId as string, 'token', minted.tokenId, {
       squad_id: agent.squad_id,
@@ -298,6 +307,7 @@ const toolMintAgentToken: ToolSpec = {
         agent_id: agent.id,
         label,
         channel: 'workspace',
+        capability: minted.grantCapability,
         created_at: minted.createdAt,
         raw: minted.raw,
       },

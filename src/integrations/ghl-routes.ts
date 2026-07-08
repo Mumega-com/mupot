@@ -41,6 +41,8 @@ function ghlRouteEnv(env: Env): GHLRouteEnv {
   return env as unknown as GHLRouteEnv
 }
 
+export const GHL_INBOUND_MAX_BODY_BYTES = 256 * 1024
+
 // ── Constant-time comparison ──────────────────────────────────────────────────
 //
 // timingSafeEqual is the canonical approach (Web Crypto TextEncoder → ArrayBuffer).
@@ -138,12 +140,20 @@ export const ghlInboundApp = new Hono<{ Bindings: Env }>()
  * The only auth is the webhook secret verified above.
  */
 ghlInboundApp.post('/inbound', async (c) => {
+  const declaredLen = Number(c.req.header('content-length') ?? '0')
+  if (Number.isFinite(declaredLen) && declaredLen > GHL_INBOUND_MAX_BODY_BYTES) {
+    return c.json({ error: 'payload_too_large' }, 413)
+  }
+
   // Read the raw body first (we need it for HMAC verification; cannot re-read after json()).
   let rawBody: string
   try {
     rawBody = await c.req.text()
   } catch {
     return c.json({ error: 'invalid_body' }, 400)
+  }
+  if (new TextEncoder().encode(rawBody).byteLength > GHL_INBOUND_MAX_BODY_BYTES) {
+    return c.json({ error: 'payload_too_large' }, 413)
   }
 
   const signatureHeader = c.req.header('x-ghl-signature') ?? null

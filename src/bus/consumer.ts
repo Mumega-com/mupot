@@ -84,11 +84,13 @@ async function routeEvent(env: Env, event: BusEvent): Promise<void> {
     case 'task.review':   // K1: gated execution success — task awaits verdict; no DO wake
     case 'task.blocked':
     case 'task.verdict':
+    case 'fleet.control.requested':
+    case 'brain.directive.updated':
     case 'org.provisioned': {
       // Terminal observations, gate decisions, and structural provisioning; no DO
       // wake by default. Log for the activity feed (the agent-actor branch in
       // handleQueue surfaces task.completed/blocked into the squad's bound channel).
-      console.error(`bus: ${event.type}`, {
+      console.log(`bus: ${event.type}`, {
         tenant: event.tenant,
         squad_id: event.squad_id,
       })

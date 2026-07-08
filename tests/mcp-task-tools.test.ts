@@ -1,0 +1,199 @@
+import { describe, expect, it } from 'vitest'
+import { TOOLS, invokeTool } from '../src/mcp'
+import type { AuthContext, Env, Task } from '../src/types'
+
+const TENANT = 'test-tenant'
+const MEMBER_ID = 'member-1'
+const SQUAD_ID = 'squad-1'
+const OTHER_SQUAD_ID = 'squad-2'
+const AGENT_ID = 'agent-1'
+
+function auth(overrides: Partial<AuthContext> = {}): AuthContext {
+  return {
+    userId: MEMBER_ID,
+    memberId: MEMBER_ID,
+    email: null,
+    role: 'member',
+    tenant: TENANT,
+    channel: 'workspace',
+    boundAgentId: AGENT_ID,
+    capabilities: [
+      { member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'member' },
+    ],
+    ...overrides,
+  }
+}
+
+function task(overrides: Partial<Task> = {}): Task {
+  return {
+    id: 'task-1',
+    squad_id: SQUAD_ID,
+    title: 'Ship the adapter',
+    body: 'wire the task tools',
+    done_when: 'task tool tests pass',
+    status: 'open',
+    assignee_agent_id: null,
+    github_issue_url: null,
+    result: null,
+    completed_at: null,
+    gate_owner: null,
+    created_at: '2026-07-08T00:00:00.000Z',
+    updated_at: '2026-07-08T00:00:00.000Z',
+    ...overrides,
+  }
+}
+
+function makeEnv(rows: Task[] = [task()]) {
+  const updates: { sql: string; args: unknown[] }[] = []
+  const events: unknown[] = []
+  const agents = new Map([
+    [AGENT_ID, { id: AGENT_ID, squad_id: SQUAD_ID, slug: 'agent-one', name: 'Agent One', role: null, model: null, status: 'active', created_at: 'now' }],
+    ['agent-other', { id: 'agent-other', squad_id: OTHER_SQUAD_ID, slug: 'other', name: 'Other', role: null, model: null, status: 'active', created_at: 'now' }],
+  ])
+  const squads = new Map([
+    [SQUAD_ID, { id: SQUAD_ID, department_id: 'dept-1', slug: 'squad-one', name: 'Squad One', charter: null, created_at: 'now' }],
+    [OTHER_SQUAD_ID, { id: OTHER_SQUAD_ID, department_id: 'dept-2', slug: 'squad-two', name: 'Squad Two', charter: null, created_at: 'now' }],
+  ])
+  const tasks = new Map(rows.map((r) => [r.id, r]))
+
+  const env = {
+    TENANT_SLUG: TENANT,
+    BUS: {
+      send: async (event: unknown) => {
+        events.push(event)
+      },
+    },
+    DB: {
+      prepare(sql: string) {
+        return {
+          bind(...args: unknown[]) {
+            return {
+              async first() {
+                if (sql.includes('FROM agents WHERE id = ?1')) return agents.get(args[0] as string) ?? null
+                if (sql.includes('SELECT department_id FROM squads')) {
+                  return { department_id: squads.get(args[0] as string)?.department_id ?? null }
+                }
+                if (sql.includes('FROM squads WHERE id = ?1')) return squads.get(args[0] as string) ?? null
+                if (sql.includes('FROM tasks WHERE id = ?1')) return tasks.get(args[0] as string) ?? null
+                return null
+              },
+              async all() {
+                if (sql.includes('FROM tasks')) {
+                  const squadId = args[0] as string
+                  let result = rows.filter((r) => r.squad_id === squadId)
+                  if (sql.includes('status = ?2')) result = result.filter((r) => r.status === args[1])
+                  if (sql.includes('assignee_agent_id')) {
+                    const assignee = args.find((a) => typeof a === 'string' && String(a).startsWith('agent-'))
+                    if (assignee) result = result.filter((r) => r.assignee_agent_id === assignee)
+                  }
+                  return { results: result }
+                }
+                return { results: [] }
+              },
+              async run() {
+                updates.push({ sql, args })
+                return { meta: { changes: 1 } }
+              },
+            }
+          },
+        }
+      },
+    },
+  } as unknown as Env
+
+  return { env, updates, events }
+}
+
+describe('MCP task cutover tools', () => {
+  it('advertises task_list, task_board, and task_update on the MCP surface', () => {
+    const names = TOOLS.map((t) => t.name)
+    expect(names).toEqual(expect.arrayContaining(['task_create', 'task_list', 'task_board', 'task_update']))
+  })
+
+  it('task_list defaults an agent-bound token to its own squad and filters status', async () => {
+    const { env } = makeEnv([
+      task({ id: 'task-open', status: 'open' }),
+      task({ id: 'task-done', status: 'done' }),
+      task({ id: 'task-other', squad_id: OTHER_SQUAD_ID, status: 'open' }),
+    ])
+
+    const res = await invokeTool(auth(), env, 'task_list', { status: 'open', limit: 10 }, 'https://pot.example')
+
+    expect(res.ok).toBe(true)
+    const result = res.result as { squad_id: string; tasks: Task[] }
+    expect(result.squad_id).toBe(SQUAD_ID)
+    expect(result.tasks.map((t) => t.id)).toEqual(['task-open'])
+  })
+
+  it('task_board groups visible squad tasks by lifecycle status', async () => {
+    const { env } = makeEnv([
+      task({ id: 'task-open', status: 'open' }),
+      task({ id: 'task-review', status: 'review' }),
+      task({ id: 'task-blocked', status: 'blocked' }),
+    ])
+
+    const res = await invokeTool(auth(), env, 'task_board', {}, 'https://pot.example')
+
+    expect(res.ok).toBe(true)
+    const result = res.result as { counts: Record<string, number>; columns: Record<string, Task[]> }
+    expect(result.counts.open).toBe(1)
+    expect(result.counts.review).toBe(1)
+    expect(result.counts.blocked).toBe(1)
+    expect(result.columns.review[0].id).toBe('task-review')
+  })
+
+  it('task_update applies transition gates, same-squad assignment, and emits task.updated', async () => {
+    const { env, updates, events } = makeEnv([task()])
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', status: 'in_progress', assignee_agent_id: AGENT_ID, body: 'updated' },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(true)
+    const result = res.result as { task: Task }
+    expect(result.task.status).toBe('in_progress')
+    expect(result.task.assignee_agent_id).toBe(AGENT_ID)
+    expect(result.task.body).toBe('updated')
+    expect(updates[0].sql).toContain('UPDATE tasks')
+    expect(updates[0].args).toEqual([
+      'Ship the adapter',
+      'updated',
+      'task tool tests pass',
+      'in_progress',
+      AGENT_ID,
+      null,
+      null,
+      result.task.updated_at,
+      'task-1',
+    ])
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: 'task.updated',
+        squad_id: SQUAD_ID,
+        actor: { kind: 'member', id: MEMBER_ID },
+      }),
+    ])
+  })
+
+  it('task_update refuses cross-squad tasks even when the caller has a member grant elsewhere', async () => {
+    const { env } = makeEnv([task({ squad_id: OTHER_SQUAD_ID })])
+
+    const res = await invokeTool(auth(), env, 'task_update', { task_id: 'task-1', status: 'in_progress' }, 'https://pot.example')
+
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('forbidden')
+  })
+
+  it('task_update refuses invalid lifecycle jumps', async () => {
+    const { env } = makeEnv([task({ status: 'open' })])
+
+    const res = await invokeTool(auth(), env, 'task_update', { task_id: 'task-1', status: 'done' }, 'https://pot.example')
+
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('invalid_transition')
+  })
+})

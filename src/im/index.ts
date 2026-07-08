@@ -32,10 +32,22 @@ import type {
   BusEvent,
   Agent,
   Squad,
+  Task,
 } from '../types'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
-import { createTask } from '../tasks/service'
+import { createTask, writeVerdict, VerdictRaceError } from '../tasks/service'
+import { emitControlRequest } from '../fleet/control'
+import { CONTROL_VERBS, type ControlVerb } from '../fleet/control-request'
+import { listFleetAgentRuntimeView, type FleetAgentRuntimeView } from '../fleet/registry'
+import {
+  clearHumanDirective,
+  HUMAN_DIRECTIVE_KEY,
+  HUMAN_DIRECTIVE_MAX_CHARS,
+  setHumanDirective,
+  validateHumanDirectiveText,
+  type HumanDirectiveAction,
+} from '../brain/directive'
 
 type AppEnv = { Bindings: Env }
 
@@ -141,6 +153,9 @@ type Intent =
   | { kind: 'help' }
   | { kind: 'status'; ref: string | null }
   | { kind: 'wake'; ref: string }
+  | { kind: 'fleet'; verb: ControlVerb; ref: string }
+  | { kind: 'verdict'; verdict: 'approved' | 'rejected'; ref: string; note: string | null }
+  | { kind: 'directive'; action: HumanDirectiveAction; text: string | null }
   | { kind: 'task'; title: string; squadRef: string | null }
   | { kind: 'unknown' }
 
@@ -181,6 +196,41 @@ function parseIntent(text: string): Intent {
     return ref ? { kind: 'wake', ref } : { kind: 'unknown' }
   }
 
+  // "fleet <start|stop|restart|status> <host-agent>"
+  const fleetMatch = trimmed.match(/^\/?fleet\s+([A-Za-z]+)\s+(.+)$/i)
+  if (fleetMatch) {
+    const verb = fleetMatch[1].toLowerCase()
+    const ref = fleetMatch[2].trim()
+    if ((CONTROL_VERBS as readonly string[]).includes(verb) && ref) {
+      return { kind: 'fleet', verb: verb as ControlVerb, ref }
+    }
+    return { kind: 'unknown' }
+  }
+
+  // "directive: <text>" pins a direct owner instruction for the brain.
+  // "directive clear" removes it. The colon form is intentional so a natural
+  // sentence starting with "directive" does not accidentally become control state.
+  if (/^\/?directive\s+clear$/i.test(trimmed)) {
+    return { kind: 'directive', action: 'clear', text: null }
+  }
+  const directiveMatch = trimmed.match(/^\/?directive\s*:\s*([\s\S]+)$/i)
+  if (directiveMatch) {
+    const text = directiveMatch[1]
+    return { kind: 'directive', action: 'set', text }
+  }
+
+  // "approve <task-id> [note]" or "reject <task-id> <reason>"
+  const verdictMatch = trimmed.match(/^\/?(approve|reject)\s+([A-Za-z0-9_-]{6,64})(?:\s+(.+))?$/i)
+  if (verdictMatch) {
+    const note = verdictMatch[3]?.trim() || null
+    return {
+      kind: 'verdict',
+      verdict: verdictMatch[1].toLowerCase() === 'approve' ? 'approved' : 'rejected',
+      ref: verdictMatch[2],
+      note,
+    }
+  }
+
   // "task: <title>" (also tolerate "task <title>")
   const taskMatch = trimmed.match(/^\/?task\s*[:|-]?\s+(.+)$/i)
   if (taskMatch) {
@@ -194,7 +244,16 @@ function parseIntent(text: string): Intent {
 // ── reply copy (short, friendly, never leaks internals) ───────────────────────
 const HELP =
   'I can: "task: <title>" (optionally "@squad"), "status" or "status <agent>", ' +
-  '"wake <agent>". I act as you, with your permissions.'
+  '"wake <agent>", "fleet start|stop|restart|status <agent>", "approve <task-id>", ' +
+  '"reject <task-id> <reason>", "directive: <text>", or "directive clear". ' +
+  'I act as you, with your permissions.'
+
+const IM_TASK_DONE_WHEN =
+  'A task result or linked artifact provides evidence that the requested IM task is complete.'
+
+export interface HandleImMessageOptions {
+  forwarded?: boolean
+}
 
 // ── the entry point Hermes calls ──────────────────────────────────────────────
 // (env, chatId, text) → a short text reply to send back into the chat. Pure with
@@ -203,6 +262,7 @@ export async function handleImMessage(
   env: Env,
   chatId: string | number,
   text: string,
+  options: HandleImMessageOptions = {},
 ): Promise<string> {
   const chat = String(chatId)
 
@@ -230,6 +290,15 @@ export async function handleImMessage(
 
     case 'wake':
       return wakeReply(env, member, grants, intent.ref)
+
+    case 'fleet':
+      return fleetReply(env, member, grants, intent.verb, intent.ref, options)
+
+    case 'verdict':
+      return verdictReply(env, member, grants, intent.verdict, intent.ref, intent.note)
+
+    case 'directive':
+      return directiveReply(env, member, grants, intent.action, intent.text, options)
 
     case 'task':
       return taskReply(env, member, grants, intent.title, intent.squadRef)
@@ -305,6 +374,280 @@ async function wakeReply(
   return `Woke ${agent.name}. It's running one cycle now.`
 }
 
+// ── intent: fleet (cap: owner on org) ────────────────────────────────────────
+// This is host process control, so IM uses the exact same signed fleet-control
+// plane as the dashboard: owner gate here, Ed25519 verification on the host.
+function canControlFleet(grants: CapabilityGrant[]): boolean {
+  return hasCapability(grants, 'org', null, 'owner')
+}
+
+async function resolveFleetAgent(env: Env, ref: string): Promise<FleetAgentRuntimeView | 'ambiguous' | null> {
+  const needle = ref.trim().toLowerCase()
+  if (!needle) return null
+
+  const rows = await listFleetAgentRuntimeView(env)
+  const exact = rows.filter(
+    (row) => row.agent_id.toLowerCase() === needle || row.display.toLowerCase() === needle,
+  )
+  if (exact.length === 1) return exact[0]
+  if (exact.length > 1) return 'ambiguous'
+
+  const prefixed = rows.filter((row) => row.agent_id.toLowerCase().startsWith(`${needle}-`))
+  if (prefixed.length === 1) return prefixed[0]
+  if (prefixed.length > 1) return 'ambiguous'
+
+  return null
+}
+
+function fleetAgentLabel(agent: FleetAgentRuntimeView): string {
+  return agent.display || agent.agent_id
+}
+
+function fleetRuntimeContext(agent: FleetAgentRuntimeView): string {
+  const lastSeen = agent.last_seen || 'unknown'
+  return `Mupot sees presence ${agent.presence}, intent ${agent.status}, last seen ${lastSeen}.`
+}
+
+async function fleetReply(
+  env: Env,
+  member: Member,
+  grants: CapabilityGrant[],
+  verb: ControlVerb,
+  ref: string,
+  options: HandleImMessageOptions,
+): Promise<string> {
+  if (options.forwarded) {
+    return 'Fleet control commands must be sent directly from your paired chat, not forwarded.'
+  }
+  if (!canControlFleet(grants)) {
+    return `You don't have permission to control fleet agents (need owner on the org).`
+  }
+
+  const agent = await resolveFleetAgent(env, ref)
+  if (agent === 'ambiguous') return `More than one fleet agent matches "${ref}". Be more specific.`
+  if (!agent) return `No fleet agent named "${ref}" here.`
+
+  const res = await emitControlRequest(
+    env,
+    { agent_id: agent.agent_id, verb },
+    { memberId: member.id, boundAgentId: null },
+  )
+  if (!res.ok) {
+    if (res.reason === 'unconfigured') return 'Fleet control is not configured here yet.'
+    if (res.reason === 'invalid_input') return `I couldn't queue fleet ${verb} for ${fleetAgentLabel(agent)}: ${res.detail ?? 'invalid request'}.`
+    return `Fleet control request for ${fleetAgentLabel(agent)} could not be delivered.`
+  }
+
+  const now = new Date().toISOString()
+  const event: BusEvent<{ verb: ControlVerb; nonce: string; seq: number | null }> = {
+    type: 'fleet.control.requested',
+    tenant: env.TENANT_SLUG,
+    agent_id: agent.agent_id,
+    actor: memberActor(member.id),
+    payload: { verb, nonce: res.nonce, seq: res.seq },
+    ts: now,
+  }
+  await createBus(env).emit(event)
+
+  return `Queued fleet ${verb} for ${fleetAgentLabel(agent)}. ${fleetRuntimeContext(agent)}`
+}
+
+// ── intent: approval verdict (cap: gate_owner or org admin/owner) ────────────
+// Approval authority remains the same append-only gate store as the dashboard:
+// IM only resolves the member, checks access, then calls writeVerdict().
+function canBypassApprovalGate(grants: CapabilityGrant[]): boolean {
+  return hasCapability(grants, 'org', null, 'admin')
+}
+
+async function memberHasGateGrant(env: Env, memberId: string, capability: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM gate_grants
+      WHERE capability = ?1 AND principal_type = 'member' AND principal_id = ?2
+      LIMIT 1`,
+  )
+    .bind(capability, memberId)
+    .first<{ 1: number }>()
+  return row !== null
+}
+
+async function memberHasSurfaceGrant(
+  env: Env,
+  member: Member,
+  grants: CapabilityGrant[],
+  surface: string,
+): Promise<boolean> {
+  if (canBypassApprovalGate(grants)) return true
+  return memberHasGateGrant(env, member.id, surface)
+}
+
+function escapeLikePrefix(ref: string): string {
+  return ref.replace(/[\\%_]/g, (ch) => `\\${ch}`)
+}
+
+async function resolveTaskRef(env: Env, ref: string): Promise<Task | 'ambiguous' | null> {
+  const exact = await env.DB.prepare(
+    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at,
+            gate_owner, workflow_instance_id, created_at, updated_at
+       FROM tasks WHERE id = ?1 LIMIT 1`,
+  )
+    .bind(ref)
+    .first<Task>()
+  if (exact) return exact
+
+  // Telegram is awkward for UUIDs; allow a unique prefix once it is specific enough.
+  if (ref.length < 8) return null
+  const rows = await env.DB.prepare(
+    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at,
+            gate_owner, workflow_instance_id, created_at, updated_at
+       FROM tasks WHERE id LIKE ?1 ESCAPE '\\' ORDER BY created_at DESC LIMIT 2`,
+  )
+    .bind(`${escapeLikePrefix(ref)}%`)
+    .all<Task>()
+  const results = rows.results ?? []
+  if (results.length === 0) return null
+  if (results.length > 1) return 'ambiguous'
+  return results[0]
+}
+
+async function verdictReply(
+  env: Env,
+  member: Member,
+  grants: CapabilityGrant[],
+  verdict: 'approved' | 'rejected',
+  ref: string,
+  note: string | null,
+): Promise<string> {
+  if (verdict === 'rejected' && !note) {
+    return `Add a rejection reason: reject ${ref} <reason>.`
+  }
+
+  const task = await resolveTaskRef(env, ref)
+  if (task === 'ambiguous') return `More than one task matches "${ref}". Use the full task id.`
+  if (!task) return `No task named "${ref}" here.`
+
+  if (!(await canOnSquad(env, grants, task.squad_id, 'member'))) {
+    return `You don't have permission to decide that task (need member on its squad).`
+  }
+  if (!task.gate_owner) return `"${task.title}" has no approval gate.`
+  if (task.status !== 'review') return `"${task.title}" is ${task.status}, not waiting for approval.`
+
+  const hasGate =
+    canBypassApprovalGate(grants) || (await memberHasGateGrant(env, member.id, task.gate_owner))
+  if (!hasGate) {
+    return `You don't have permission to decide "${task.title}" (need ${task.gate_owner}).`
+  }
+
+  if (
+    task.gate_owner === 'gate:loops' &&
+    verdict === 'approved' &&
+    !(await memberHasSurfaceGrant(env, member, grants, 'outreach:send-gated'))
+  ) {
+    return `You don't have permission to approve "${task.title}" (need outreach:send-gated).`
+  }
+
+  if (member.id === task.assignee_agent_id) {
+    return `You can't decide "${task.title}" because you are the assignee.`
+  }
+
+  try {
+    await writeVerdict(
+      env,
+      { task, verdict, note, decidedBy: member.id },
+      memberActor(member.id),
+    )
+  } catch (err) {
+    if (err instanceof VerdictRaceError) {
+      return `"${task.title}" changed before I could record the verdict. Reload approvals and try again.`
+    }
+    throw err
+  }
+
+  if (task.workflow_instance_id && env.TASK_WORKFLOW) {
+    try {
+      const inst = await env.TASK_WORKFLOW.get(task.workflow_instance_id)
+      await inst.sendEvent({ type: 'gate-verdict', payload: { verdict } })
+    } catch {
+      // The verdict is already durable in D1; the workflow re-reads it on resume.
+    }
+  }
+
+  return verdict === 'approved' ? `Approved "${task.title}".` : `Rejected "${task.title}".`
+}
+
+// ── intent: human directive (cap: owner on org, direct chat only) ─────────────
+function canPinHumanDirective(grants: CapabilityGrant[]): boolean {
+  return hasCapability(grants, 'org', null, 'owner')
+}
+
+async function emitDirectiveUpdate(
+  env: Env,
+  member: Member,
+  action: HumanDirectiveAction,
+  textLength: number | null,
+): Promise<void> {
+  const now = new Date().toISOString()
+  const payload: {
+    action: HumanDirectiveAction
+    key: typeof HUMAN_DIRECTIVE_KEY
+    source: 'im'
+    by_member_id: string
+    text_length?: number
+  } = {
+    action,
+    key: HUMAN_DIRECTIVE_KEY,
+    source: 'im',
+    by_member_id: member.id,
+  }
+  if (textLength !== null) payload.text_length = textLength
+
+  const event: BusEvent<typeof payload> = {
+    type: 'brain.directive.updated',
+    tenant: env.TENANT_SLUG,
+    actor: memberActor(member.id),
+    payload,
+    ts: now,
+  }
+  await createBus(env).emit(event)
+}
+
+async function directiveReply(
+  env: Env,
+  member: Member,
+  grants: CapabilityGrant[],
+  action: HumanDirectiveAction,
+  text: string | null,
+  options: HandleImMessageOptions,
+): Promise<string> {
+  if (options.forwarded) {
+    return 'Brain directives must be sent directly from your paired chat, not forwarded.'
+  }
+  if (!canPinHumanDirective(grants)) {
+    return `You don't have permission to pin brain directives (need owner on the org).`
+  }
+
+  if (action === 'clear') {
+    await clearHumanDirective(env)
+    await emitDirectiveUpdate(env, member, 'clear', null)
+    return 'Cleared the pinned directive.'
+  }
+
+  const checked = validateHumanDirectiveText(text ?? '')
+  if (!checked.ok) {
+    if (checked.reason === 'too_long') {
+      return `Directive is too long. Keep it under ${HUMAN_DIRECTIVE_MAX_CHARS} characters.`
+    }
+    return 'Write the directive after "directive:".'
+  }
+
+  const directive = await setHumanDirective(env, {
+    text: checked.text,
+    byMemberId: member.id,
+    source: 'im',
+  })
+  await emitDirectiveUpdate(env, member, 'set', directive.text.length)
+  return 'Pinned directive for the brain.'
+}
+
 // ── intent: task (cap: member+ on the target squad) ───────────────────────────
 async function taskReply(
   env: Env,
@@ -343,8 +686,7 @@ async function taskReply(
     {
       squad_id: squad.id,
       title: title.trim(),
-      // #142: IM quick-add has no predicate — sentinel flags it for backfill.
-      done_when: '(set via task update)',
+      done_when: IM_TASK_DONE_WHEN,
       body: '',
     },
     { actor: memberActor(member.id) },
@@ -367,6 +709,10 @@ interface TelegramUpdate {
   message?: {
     chat?: { id?: unknown }
     text?: unknown
+    forward_origin?: unknown
+    forward_from?: unknown
+    forward_from_chat?: unknown
+    forward_date?: unknown
   }
 }
 
@@ -405,6 +751,12 @@ imApp.post('/webhook', async (c) => {
 
   const text = typeof update.message?.text === 'string' ? update.message.text : ''
 
-  const reply = await handleImMessage(c.env, chatId, text)
+  const forwarded =
+    update.message?.forward_origin !== undefined ||
+    update.message?.forward_from !== undefined ||
+    update.message?.forward_from_chat !== undefined ||
+    update.message?.forward_date !== undefined
+
+  const reply = await handleImMessage(c.env, chatId, text, { forwarded })
   return c.json({ ok: true, reply })
 })

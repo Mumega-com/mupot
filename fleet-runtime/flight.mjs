@@ -2,20 +2,19 @@
 // flight — the activation unit. Agents don't sit warm; they fly bounded bursts and land.
 //
 //   node flight.mjs open  <agent> [config.json]   # takeoff: bring up runtime + signed-attach
-//   node flight.mjs close <agent> [config.json]   # land: tear down runtime (presence decays)
+//   node flight.mjs close <agent> [config.json]   # land: tear down runtime + signed-detach
 //   node flight.mjs list  [config.json]           # show configured flights
 //
 // STERILE / FORKABLE: hardcodes no tenant. Config (default ~/.fleet/flights.json) supplies
 // base_url, tenant, and per-agent { launch, teardown } commands — how THIS host brings each
 // runtime up and down. `open` runs `launch` then signed-attach (the takeoff ping → presence
-// `live`). `close` runs `teardown` (the runtime goes down → presence decays running→stale =
-// landed). A crisp `offline` on land needs a signed /detach (follow-up); stale is the honest
-// interim. Tokens burn only between takeoff and land.
+// `live`). `close` runs `teardown` then signed-detach (the runtime goes down → presence
+// `offline`). Tokens burn only between takeoff and land.
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
-import { loadPrivKey, signedAttach } from './fleet-sign.mjs'
+import { loadPrivKey, signedAttach, signedDetach } from './fleet-sign.mjs'
 
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 const LAUNCH_TIMEOUT_MS = 30_000
@@ -129,24 +128,42 @@ async function close(cfg, agentId) {
   const a = cfg.agents.get(agentId)
   if (!a) throw new Error(`no flight configured for '${agentId}'`)
   if (!a.teardown) {
-    // Nothing to tear down (e.g. the runtime self-exits). Landing is only the presence decay.
-    log({ flight: agentId, phase: 'land', result: 'LANDED', note: 'no teardown configured; presence decays to stale' })
-    return
-  }
-  log({ flight: agentId, phase: 'land', step: 'teardown' })
-  const t = await runCmd(a.teardown)
-  if (t !== 0) {
-    // Teardown failed/timed out → the runtime MAY STILL BE UP and billing. Do NOT claim LANDED —
-    // that would read as "tokens stopped" up the ATC chain while the burn continues.
     log({
-      flight: agentId, phase: 'land', result: 'LAND_UNCERTAIN', teardown_exit: t,
-      note: 'teardown did not exit 0 — runtime may still be up / still billing',
+      flight: agentId,
+      phase: 'land',
+      result: 'LANDED',
+      note: 'no teardown configured; cannot prove runtime stopped, so signed detach is skipped and presence decays to stale',
     })
+    return
+  } else {
+    log({ flight: agentId, phase: 'land', step: 'teardown' })
+    const t = await runCmd(a.teardown)
+    if (t !== 0) {
+      // Teardown failed/timed out → the runtime MAY STILL BE UP and billing. Do NOT claim LANDED —
+      // that would read as "tokens stopped" up the ATC chain while the burn continues.
+      log({
+        flight: agentId, phase: 'land', result: 'LAND_UNCERTAIN', teardown_exit: t,
+        note: 'teardown did not exit 0 — runtime may still be up / still billing',
+      })
+      process.exit(1)
+    }
+  }
+
+  let res
+  try {
+    res = await signedDetach(cfg.baseUrl, agentId, {
+      tenant: cfg.tenant,
+      privKey: await loadPrivKey(agentId),
+    })
+  } catch (e) {
+    log({ flight: agentId, phase: 'land', result: 'LANDED_DETACH_FAILED', error: String(e && e.message ? e.message : e) })
     process.exit(1)
   }
-  // Clean teardown: runtime down → presence decays running→stale (= landed). Crisp `offline`
-  // needs a signed /detach (follow-up).
-  log({ flight: agentId, phase: 'land', result: 'LANDED', note: 'presence decays to stale (offline needs signed detach — follow-up)' })
+  if (!res.ok) {
+    log({ flight: agentId, phase: 'land', result: 'LANDED_DETACH_FAILED', status: res.status })
+    process.exit(1)
+  }
+  log({ flight: agentId, phase: 'land', result: 'LANDED', status: res.status, note: 'signed detach accepted; presence offline' })
 }
 
 async function main() {

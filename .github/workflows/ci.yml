@@ -4,6 +4,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -12,11 +15,40 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
+      - run: npm ci
+      - name: Dependency audit
+        run: npm audit --audit-level=high
       - name: Typecheck
         run: npm run typecheck
       - name: Test
-        run: npm test --if-present
+        run: npm test
+      - name: Fleet runtime tests
+        run: node --test fleet-runtime/*.test.mjs
+      - name: Wrangler dry-run bundle check
+        run: npx wrangler deploy --dry-run --config wrangler.example.toml
+      - name: D1 migration chain check
+        run: |
+          tmp_db="$(mktemp)"
+          trap 'rm -f "$tmp_db"' EXIT
+          for migration in migrations/*.sql; do
+            sqlite3 "$tmp_db" < "$migration"
+          done
+
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install plugin test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+      - name: Compile plugin
+        run: python -m compileall -q plugin
+      - name: Plugin tests
+        run: python -m pytest plugin/tests
 
   no-secrets:
     runs-on: ubuntu-latest

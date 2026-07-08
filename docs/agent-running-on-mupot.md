@@ -77,8 +77,9 @@ Discord is a **view + control surface** onto mupot-managed agents, not a separat
 
 ## What's built vs the gap (be honest)
 
-- ✅ **Substrate / home**: identity + RBAC (Slice A), inbox (Slice D), Discord roles +
-  reach surface (Slice B), fleet-control signed start/stop + agent registry.
+- ✅ **Substrate / home**: identity + RBAC (Slice A), inbox (Slice D), signed HTTP
+  inbox reads for daemon drain, Discord roles + reach surface (Slice B),
+  fleet-control signed start/stop + agent registry.
 - ⬜ **The gap = runtime cutover (Slices F/G + Hermes-per-pot, #18):** the squad's shells
   still execute against the SOS bus / local sessions. "Running on mupot" is only true once
   each agent's runtime points at mupot's reflected bus, reports presence to the registry,
@@ -123,30 +124,78 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
 
 ### Condition status (the 5 from above)
 1. Registered (identity+type+RBAC) — ✅ **done** for the whole squad.
-2. Lifecycle controlled via mupot — ⛏ partial (signed attach/detach exist; no open/close API
-   wired to actual process start/kill).
-3. Coordinates via the reflected bus — ⛏ partial (`agent_messages` inbox built; runtime loops
-   still talk SOS, not mupot).
-4. Runtime binding reports presence + swappable — ⬜ **gap** (the rows are one-shot static
-   stamps, NOT heartbeats; no persistent daemon).
+2. Lifecycle controlled via mupot — ⛏ partial (signed attach/detach and Worker
+   control requests exist; host control daemon now verifies requests and runs
+   `flight.mjs open|close`, and `host-receipt.mjs` can pre-flight local host
+   wiring; `control-receipt.mjs` can prove one signed control request reaches
+   the host flight layer; live host install/control receipt remains).
+3. Coordinates via the reflected bus — ⛏ partial (`agent_messages` inbox and signed
+   daemon read are built; `inbox-handler.mjs` provides durable host handoff;
+   `host-receipt.mjs` checks handler coverage; `runtime-receipt.mjs` can now
+   prove one live signed attach + signed inbox handoff cycle; runtime hook
+   rollout still needs host/operator wiring).
+4. Runtime binding reports presence + swappable — ⛏ partial (fleet daemon code now
+   heartbeats, drains signed inbox, and signed-detaches on shutdown; live host
+   install plus live `runtime-receipt.mjs` evidence remains).
 5. SOS retired — ⬜ not yet.
 
 ### Punch-list to LIVE
 **Phase 1 — liveness (make `running` true)** ← biggest gap, critical path
-1. Presence/heartbeat: TTL column; registry computes running/stale/stopped from last-ping.
+1. Presence/heartbeat: ✅ branch implementation derives registry presence from
+   heartbeat recency and the `/fleet` host-control panel shows presence separately
+   from stored lifecycle intent, so a stale `running` row is visible as stale.
 2. Fleet daemon (host): boot-attach all managed agents, re-attach on drop, heartbeat, drain
-   inbox, detach on stop; systemd user unit. (Install = Hadi host-go.)
+   inbox, detach on stop; systemd user unit. ✅ branch implementation plus
+   `host-receipt.mjs` and `runtime-receipt.mjs`; install + host receipt + live
+   runtime receipt = Hadi host-go.
 
 **Phase 2 — lifecycle control (open/close from mupot)**
 3. open/close API: signed control-request → daemon starts/kills the agent's runtime.
+   ✅ branch implementation via `fleet-control-daemon.mjs` plus
+   `control-receipt.mjs`; install + live control receipt = Hadi host-go.
 4. Control surface: `#agent-bus` = `top` (live presence + open/close); `#gates` = signals.
+   ✅ dashboard host-control path uses a least-privilege runtime feed with derived
+   presence + lifecycle intent; IM/Hermes queues the same signed control requests.
 
 **Phase 3 — coordinate through mupot (not SOS)**
 5. Runtime loops consume the mupot inbox (send/inbox/wake/ack) instead of the SOS bus.
+   The pot now exposes `/api/inbox/signed` so the fleet daemon can deliver inbox
+   batches without storing a bearer token; `fleet-runtime/inbox-handler.mjs`
+   persists batches before consume, and host hook rollout remains the cutover work.
 6. Reflect any missing primitives (wake/request/ack) on the durable substrate (Queues+DO+D1).
 7. Repoint squad wake-hooks / bus identity SOS → mupot.
 
 **Phase 4 — retire SOS** (8) decommission the python bus for the squad once nothing depends on it.
+Use `fleet-runtime/cutover-receipt.mjs` as the per-agent final gate: it combines
+saved host, runtime, and start/stop control receipts and emits
+`mupot-sos-cutover-gate/v1`. Only a `status:"pass"` gate should allow removing
+that agent's SOS bus/wake path.
+For the live host rollout, `fleet-runtime/receipt-bundle.mjs` is the preferred
+operator command because it saves the host/runtime/control receipts,
+`cutover-gate.json`, and `manifest.json` under one attachable evidence directory.
+Use `fleet-runtime/cutover-probe.mjs` to queue the inbox probe and Mupot
+`start|stop|restart|status` control requests that the live receipts must observe.
+Use `receipt-bundle.mjs --verify-only` to recheck saved evidence without polling
+the live host runtime before attaching the final cutover record.
+Use `receipt-bundle.mjs --status` during collection for a read-only host-go
+progress receipt that reports missing evidence, including missing per-agent
+start/stop lifecycle verbs, `host_go_checklist`, and command-level next steps.
+Use `--status-summary` for the same gates as a compact text checklist during a
+live operator session.
+Use `receipt-bundle.mjs --export --export-dir <attachable-dir>` after the
+manifest and cutover gate pass; it copies only the manifest and listed receipt
+artifacts into the attachable directory, emits
+`mupot-fleet-receipt-bundle-export/v1`, and runs the copied-bundle manifest
+check on that exported directory. The exported manifest uses local artifact
+filenames and `out_dir:"."`, leaving the working source manifest unchanged.
+The bundle manifest includes SHA-256 hashes for the saved receipt artifacts so
+the final cutover record can prove exactly which files were reviewed.
+Use `receipt-bundle.mjs --check-manifest` for a read-only drift check before
+attaching copied bundle evidence; run it against the exported directory. It
+validates artifact hashes plus saved receipt type/status metadata, required
+evidence categories, manifest summary/status consistency, absence of obvious
+secret material, and self-contained directory scope, then compares cutover-gate
+inputs and advisory `next_steps` back to the manifest evidence.
 
 **Cross-cutting** — (9) durable, reliably-wakeable 2nd adversarial gate lens (Codex bus-peer
 was stale on both pings); (10) dyad-gate.yml single-quote glob (1-line).

@@ -39,7 +39,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { ghlConfigured, runApprovedActs, createOutboundAct } from '../src/integrations/ghl'
 import type { GHLFetch, ReadLatestVerdict, ActRunResult } from '../src/integrations/ghl'
 import { verifyGHLWebhook } from '../src/integrations/ghl-routes'
-import { ghlInboundApp } from '../src/integrations/ghl-routes'
+import { ghlInboundApp, GHL_INBOUND_MAX_BODY_BYTES } from '../src/integrations/ghl-routes'
 import { runTaskPipeline } from '../src/workflows/pipeline'
 import type { StepLike, TaskPipelineParams, PipelineDeps, VerdictRow } from '../src/workflows/pipeline'
 import type { Env, Agent } from '../src/types'
@@ -505,6 +505,36 @@ describe('ghlInboundApp HTTP handler', () => {
     })
     const res = await ghlInboundApp.fetch(req, env, {} as ExecutionContext)
     expect(res.status).toBe(401)
+  })
+
+  it('oversized declared body → 413 before signature verification', async () => {
+    const env = makeEnvWithSquad()
+    const req = new Request('http://localhost/inbound', {
+      method: 'POST',
+      body: '{}',
+      headers: {
+        'Content-Type': 'application/json',
+        'content-length': String(GHL_INBOUND_MAX_BODY_BYTES + 1),
+      },
+    })
+    const res = await ghlInboundApp.fetch(req, env, {} as ExecutionContext)
+    expect(res.status).toBe(413)
+    const json = await res.json() as { error: string }
+    expect(json.error).toBe('payload_too_large')
+  })
+
+  it('oversized actual UTF-8 body → 413 before signature verification', async () => {
+    const env = makeEnvWithSquad()
+    const body = '💥'.repeat(Math.ceil((GHL_INBOUND_MAX_BODY_BYTES + 1) / 4))
+    const req = new Request('http://localhost/inbound', {
+      method: 'POST',
+      body,
+      headers: { 'Content-Type': 'application/json' },
+    })
+    const res = await ghlInboundApp.fetch(req, env, {} as ExecutionContext)
+    expect(res.status).toBe(413)
+    const json = await res.json() as { error: string }
+    expect(json.error).toBe('payload_too_large')
   })
 
   it('valid signature → 200 ok', async () => {

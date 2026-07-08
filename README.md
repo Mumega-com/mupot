@@ -23,6 +23,20 @@ You don't open a dashboard; you open a company that's *breathing*. Agents are em
 creatures, not processes in a queue. The health of the whole business reads in one glance, and
 every claim clicks through to the real work behind it.
 
+## Project direction
+
+Mupot's north star is a **self-hosted agent control plane for running trusted AI
+workers, workflows, and integrations on Cloudflare**. The practical goal is
+simple: deploy one pot, connect a runtime worker, grant scoped capabilities,
+send it work, gate risky actions, observe what happened, and verify the result
+against a real tool of record such as GitHub.
+
+See the [control-plane roadmap](./docs/control-plane-roadmap.md), the
+[runtime adapter contract](./docs/runtime-adapter-contract.md), the
+[self-hosting guide](./docs/SELF-HOST.md), the
+[production runbook](./docs/production-runbook.md), and
+[what running an agent on Mupot means](./docs/agent-running-on-mupot.md).
+
 ## Three things no one else gives you together
 
 1. **Agents as employees, not processes.** Every agent has an identity, a character sheet, and
@@ -157,6 +171,10 @@ every mutation is capability-gated with a grant-ceiling; per-platform webhooks v
 fail-closed (Discord Ed25519, Google signed-JWT, Telegram secret). Untrusted content can *wake*
 an agent but never *steer* it — the directive path is the only steer, at position-0 of every
 decision.
+
+See [docs/security-model.md](./docs/security-model.md) for the current trust-boundary map:
+sessions, member tokens, agent keys, webhooks, channel relays, capability gates, and approval
+paths.
 
 ## Architecture
 

@@ -178,8 +178,14 @@ export function taskFromGitHubEvent(
 }
 
 export const githubInboundApp = new Hono<{ Bindings: Env }>()
+export const GITHUB_INBOUND_MAX_BODY_BYTES = 256 * 1024
 
 githubInboundApp.post('/', async (c) => {
+  const declaredLen = Number(c.req.header('content-length') ?? '0')
+  if (Number.isFinite(declaredLen) && declaredLen > GITHUB_INBOUND_MAX_BODY_BYTES) {
+    return c.json({ error: 'payload_too_large' }, 413)
+  }
+
   let rawBody: string
   try {
     rawBody = await c.req.text()
@@ -187,7 +193,9 @@ githubInboundApp.post('/', async (c) => {
     return c.json({ error: 'invalid_body' }, 400)
   }
   // Size cap BEFORE HMAC/parse — bound work + avoid hashing a huge body (DoS guard).
-  if (rawBody.length > 256 * 1024) return c.json({ error: 'payload_too_large' }, 413)
+  if (new TextEncoder().encode(rawBody).byteLength > GITHUB_INBOUND_MAX_BODY_BYTES) {
+    return c.json({ error: 'payload_too_large' }, 413)
+  }
 
   const signatureHeader = c.req.header('x-hub-signature-256') ?? null
   const verify = await verifyGitHubWebhook(c.env, rawBody, signatureHeader)

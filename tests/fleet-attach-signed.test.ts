@@ -1,4 +1,4 @@
-// tests/fleet-attach-signed.test.ts — Ed25519 signed-attach (the no-bearer cutover path).
+// tests/fleet-attach-signed.test.ts — Ed25519 signed attach/detach (the no-bearer cutover path).
 //
 // Security properties under test:
 //   - A VALID signature over the canonical, tenant-bound message → 200 + running row,
@@ -16,8 +16,11 @@ import { fleetAttachApp } from '../src/fleet/attach-routes'
 import type { Env } from '../src/types'
 
 const SIG_DOMAIN = 'fleet-attach:v1'
+const DETACH_SIG_DOMAIN = 'fleet-detach:v1'
 const canon = (p: Record<string, string | number>) =>
   [SIG_DOMAIN, p.tenant, p.agent_id, p.type, p.runtime, p.lifecycle, String(p.ts), p.nonce].join('\n')
+const canonDetach = (p: Record<string, string | number>) =>
+  [DETACH_SIG_DOMAIN, p.tenant, p.agent_id, String(p.ts), p.nonce].join('\n')
 
 async function sha256Hex(s: string): Promise<string> {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s))
@@ -83,6 +86,17 @@ function makeDb(opts: {
       })
       return { meta: { changes: 1 } }
     }
+    if (sql.includes('UPDATE fleet_agents')) {
+      const [tenant, agent_id, member_id] = b as [string, string, string | null]
+      const row = fleet.get(`${tenant}:${agent_id}`)
+      if (!row) return { meta: { changes: 0 } }
+      if (member_id === null ? row.member_id !== null : row.member_id !== member_id) {
+        return { meta: { changes: 0 } }
+      }
+      row.status = 'stopped'
+      row.last_reported_at = 'now'
+      return { meta: { changes: 1 } }
+    }
     if (sql.includes('UPDATE members SET tenant')) return { meta: { changes: 0 } }
     throw new Error('unhandled run: ' + sql)
   }
@@ -115,9 +129,21 @@ async function sign(privKey: CryptoKey, p: Record<string, string | number>) {
   const sig = await crypto.subtle.sign({ name: 'Ed25519' }, privKey, new TextEncoder().encode(canon(p)))
   return b64url(sig)
 }
+async function signDetach(privKey: CryptoKey, p: Record<string, string | number>) {
+  const sig = await crypto.subtle.sign({ name: 'Ed25519' }, privKey, new TextEncoder().encode(canonDetach(p)))
+  return b64url(sig)
+}
 function freshBody(agent_id: string, tenant: string, over: Record<string, unknown> = {}) {
   return {
     agent_id, type: 'builder', runtime: 'claude-code', lifecycle: 'on_demand',
+    ts: Math.floor(Date.now() / 1000),
+    nonce: b64url(crypto.getRandomValues(new Uint8Array(32))),
+    ...over,
+  }
+}
+function freshDetachBody(agent_id: string, over: Record<string, unknown> = {}) {
+  return {
+    agent_id,
     ts: Math.floor(Date.now() / 1000),
     nonce: b64url(crypto.getRandomValues(new Uint8Array(32))),
     ...over,
@@ -230,5 +256,132 @@ describe('signed attach', () => {
     ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
     ;(body as Record<string, unknown>).lifecycle = 'always_on'   // mutate AFTER signing
     expect((await post(env, '/attach-signed', body)).status).toBe(401)
+  })
+})
+
+describe('signed detach', () => {
+  it('valid signature → 200 and stopped row for the key-bound member', async () => {
+    const { kp, pubX } = await genKey()
+    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } } })
+    const env = makeEnv(db)
+    db._fleet.set('mumega:kasra', {
+      agent_id: 'kasra',
+      tenant: 'mumega',
+      runtime: 'claude-code',
+      lifecycle: 'on_demand',
+      status: 'running',
+      reported_by: 'm-kasra',
+      agent_type: 'builder',
+      member_id: 'm-kasra',
+      last_reported_at: 'before',
+    })
+
+    const body = freshDetachBody('kasra')
+    ;(body as Record<string, unknown>).sig = await signDetach(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+    const res = await post(env, '/detach-signed', body)
+    expect(res.status).toBe(200)
+    expect(db._fleet.get('mumega:kasra')!.status).toBe('stopped')
+  })
+
+  it('valid signature can stop a null-owned legacy key row', async () => {
+    const { kp, pubX } = await genKey()
+    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: null } } })
+    const env = makeEnv(db)
+    db._fleet.set('mumega:kasra', {
+      agent_id: 'kasra',
+      tenant: 'mumega',
+      runtime: 'claude-code',
+      lifecycle: 'on_demand',
+      status: 'running',
+      reported_by: null,
+      agent_type: 'builder',
+      member_id: null,
+      last_reported_at: 'before',
+    })
+
+    const body = freshDetachBody('kasra')
+    ;(body as Record<string, unknown>).sig = await signDetach(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+    expect((await post(env, '/detach-signed', body)).status).toBe(200)
+    expect(db._fleet.get('mumega:kasra')!.status).toBe('stopped')
+  })
+
+  it('replay of the same signed detach body → 409', async () => {
+    const { kp, pubX } = await genKey()
+    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: null } } })
+    const env = makeEnv(db)
+    db._fleet.set('mumega:kasra', {
+      agent_id: 'kasra',
+      tenant: 'mumega',
+      runtime: 'claude-code',
+      lifecycle: 'on_demand',
+      status: 'running',
+      reported_by: null,
+      agent_type: 'builder',
+      member_id: null,
+      last_reported_at: 'before',
+    })
+    const body = freshDetachBody('kasra')
+    ;(body as Record<string, unknown>).sig = await signDetach(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+
+    expect((await post(env, '/detach-signed', body)).status).toBe(200)
+    expect((await post(env, '/detach-signed', body)).status).toBe(409)
+  })
+
+  it('tampered agent_id after signing → 401 and row unchanged', async () => {
+    const { kp, pubX } = await genKey()
+    const db = makeDb({
+      keys: {
+        'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' },
+        'mumega:loom': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-loom' },
+      },
+    })
+    const env = makeEnv(db)
+    db._fleet.set('mumega:loom', {
+      agent_id: 'loom',
+      tenant: 'mumega',
+      runtime: 'codex',
+      lifecycle: 'on_demand',
+      status: 'running',
+      reported_by: 'm-loom',
+      agent_type: 'reviewer',
+      member_id: 'm-loom',
+      last_reported_at: 'before',
+    })
+    const body = freshDetachBody('kasra')
+    ;(body as Record<string, unknown>).sig = await signDetach(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+    ;(body as Record<string, unknown>).agent_id = 'loom'
+
+    expect((await post(env, '/detach-signed', body)).status).toBe(401)
+    expect(db._fleet.get('mumega:loom')!.status).toBe('running')
+  })
+
+  it('member mismatch returns 404 and does not stop the row', async () => {
+    const { kp, pubX } = await genKey()
+    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-new' } } })
+    const env = makeEnv(db)
+    db._fleet.set('mumega:kasra', {
+      agent_id: 'kasra',
+      tenant: 'mumega',
+      runtime: 'claude-code',
+      lifecycle: 'on_demand',
+      status: 'running',
+      reported_by: 'm-old',
+      agent_type: 'builder',
+      member_id: 'm-old',
+      last_reported_at: 'before',
+    })
+    const body = freshDetachBody('kasra')
+    ;(body as Record<string, unknown>).sig = await signDetach(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+
+    expect((await post(env, '/detach-signed', body)).status).toBe(404)
+    expect(db._fleet.get('mumega:kasra')!.status).toBe('running')
+  })
+
+  it('no registered key → 401', async () => {
+    const { kp } = await genKey()
+    const env = makeEnv(makeDb({ keys: {} }))
+    const body = freshDetachBody('kasra')
+    ;(body as Record<string, unknown>).sig = await signDetach(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+    expect((await post(env, '/detach-signed', body)).status).toBe(401)
   })
 })

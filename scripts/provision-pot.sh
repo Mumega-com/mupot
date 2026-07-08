@@ -29,20 +29,29 @@ npx wrangler queues create "mupot-${POT}-events-dlq" || true
 echo "→ KV namespace (SESSIONS binding)…"
 npx wrangler kv namespace create "mupot-${POT}-sessions" || true
 
+echo "→ KV namespace (OAUTH_KV binding)…"
+npx wrangler kv namespace create "mupot-${POT}-oauth" || true
+
 echo "→ R2 bucket (BLOBS binding)…"
 npx wrangler r2 bucket create "mupot-${POT}-blobs" || true
 
 cat <<EOF
 
 ── Resources created. Finish the pot: ───────────────────────────────────────────
-A. cp wrangler.toml wrangler.${POT}.toml
+A. cp wrangler.example.toml wrangler.${POT}.toml
    - set name = "mupot-${POT}"
-   - paste the IDs printed above (d1 database_id, vectorize name, kv id, r2 bucket,
-     queue names: mupot-${POT}-events / -events-dlq, workflow name mupot-${POT}-task-workflow)
-   - [vars]: TENANT_SLUG = "${POT}" (+ BRAND, Google OAuth client id, etc.)
+   - paste the IDs/names printed above:
+     d1 database_id, vectorize index name, SESSIONS kv id, OAUTH_KV id,
+     R2 bucket name, queue names mupot-${POT}-events / -events-dlq,
+     workflow name mupot-${POT}-task-workflow
+   - [vars]: TENANT_SLUG = "${POT}" (+ BRAND, OAUTH_PROVIDER, fleet settings)
 
 B. Secrets (never in the toml):
+   npx wrangler secret put OAUTH_CLIENT_ID       --config wrangler.${POT}.toml
    npx wrangler secret put OAUTH_CLIENT_SECRET   --config wrangler.${POT}.toml
+   # if exposing the MCP OAuth 2.1 provider with Google:
+   npx wrangler secret put GOOGLE_CLIENT_ID       --config wrangler.${POT}.toml
+   npx wrangler secret put GOOGLE_CLIENT_SECRET   --config wrangler.${POT}.toml
    # optional, per integration the pot's loops use:
    npx wrangler secret put GHL_API_KEY           --config wrangler.${POT}.toml
    npx wrangler secret put GHL_LOCATION_ID       --config wrangler.${POT}.toml

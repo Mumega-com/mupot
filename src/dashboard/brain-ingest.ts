@@ -41,8 +41,18 @@ import { Hono } from 'hono'
 import type { Env } from '../types'
 import { resolveOrgAdmin } from '../auth/member-bearer'
 import { storePhysicsSnapshot } from './brain'
+import { getHumanDirective } from '../brain/directive'
 
 export const brainPhysicsIngestApp = new Hono<{ Bindings: Env }>()
+
+// GET /api/brain/directive — read the owner-pinned directive for the next brain cycle.
+brainPhysicsIngestApp.get('/directive', async (c) => {
+  const auth = await resolveOrgAdmin(c.env, c.req.header('authorization'))
+  if (!auth.ok) return c.json({ error: auth.status === 401 ? 'unauthorized' : 'forbidden' }, auth.status)
+
+  const directive = await getHumanDirective(c.env)
+  return c.json({ ok: true, directive })
+})
 
 // POST /api/brain/physics — ingest a new physics snapshot from the sovereign daemon.
 brainPhysicsIngestApp.post('/physics', async (c) => {

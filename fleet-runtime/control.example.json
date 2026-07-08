@@ -1,0 +1,11 @@
+{
+  "_comment": "Fleet control daemon config. Copy to ~/.fleet/control.json and set REAL values. The consumer agent must have an Ed25519 key registered in Mupot so the daemon can read its inbox through /api/inbox/signed. panel_public_key is the PUBLIC Ed25519 JWK matching FLEET_PANEL_SK; never put the private panel key on the host.",
+  "base_url": "https://YOUR-POT.example.com",
+  "tenant": "YOUR_TENANT_SLUG",
+  "consumer_agent_id": "fleet-consumer",
+  "panel_public_key": "~/.fleet/panel.pub.jwk",
+  "flights_config": "~/.fleet/flights.json",
+  "nonce_ledger": "~/.fleet/control-nonces.json",
+  "poll_sec": 5,
+  "command_timeout_ms": 120000
+}

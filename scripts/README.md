@@ -1,8 +1,10 @@
 # Deploy mupot to your Cloudflare account
 
-These two scripts replace hand-editing `wrangler.toml`. After forking, you run
-them once and you have a live pot on **your** Cloudflare account — no bespoke
-surgery. Substrate only: nothing here touches business content.
+These two scripts replace most hand-editing of `wrangler.toml`. After forking,
+you run them once and you have a live pot on **your** Cloudflare account. The
+setup script creates `wrangler.toml` from `wrangler.example.toml` when needed,
+fills the Cloudflare resource ids it can discover, and leaves tenant-specific
+vars for you to review. Substrate only: nothing here touches business content.
 
 ## Prerequisites
 
@@ -10,6 +12,67 @@ surgery. Substrate only: nothing here touches business content.
 - A Cloudflare account, authenticated once: `wrangler login`
 - An OAuth app (Google or Telegram) for login — you'll need its client id +
   secret. Set the redirect/callback URI to `https://<your-deployment>/auth/callback`.
+
+## Local browser workflow smoke
+
+Use this before merging production-sensitive dashboard, task, auth, Hermes, or
+runtime changes. It runs against the local test Wrangler config and produces
+release evidence in `tmp/local-smoke`.
+
+```bash
+npm run migrate:local:test
+npm run seed:local:test
+npm run dev:local:test
+
+# in another shell, after Wrangler prints the local URL:
+npm run smoke:local
+```
+
+The harness uses `/auth/dev-login`, which is enabled only when
+`LOCAL_TEST_AUTH=1` in `wrangler-local-test.toml`. It verifies:
+
+- local owner login and unauthenticated dashboard redirect behavior
+- the authenticated dashboard route crawl, including the `/ops` health console
+- `/send` validation, task creation, `done_when`, lifecycle completion, and
+  visible result rendering
+- `/approvals` rejection validation and real verdict approval
+- Hermes `/im/webhook` help/status/task flows with `IM_WEBHOOK_SECRET`
+- dashboard refresh after a Hermes-created task
+
+Artifacts:
+
+- `tmp/local-smoke/report.json`
+- `tmp/local-smoke/home.png`
+- `tmp/local-smoke/fleet.png`
+- `tmp/local-smoke/ops-health.png`
+- `tmp/local-smoke/send-workflow.png`
+- `tmp/local-smoke/approvals-workflow.png`
+- `tmp/local-smoke/hermes-dashboard-update.png`
+- `tmp/local-smoke/failure-*.json` when a workflow fails
+- `tmp/local-smoke/failure-*.png` when a workflow fails
+
+`npm run smoke:local` writes `report.json` and prints the same JSON report to
+stdout. The report contains the page crawl, workflow results, Hermes checks,
+runtime contract name, artifact directory, and report path.
+
+## Local runtime adapter conformance
+
+Use this with the same local Wrangler server when changing signed runtime,
+inbox, or detach behavior:
+
+```bash
+npm run migrate:local:test
+npm run seed:local:test
+npm run dev:local:test
+
+# in another shell, after Wrangler prints the local URL:
+npm run conformance:runtime:local
+```
+
+The local seed creates a non-production `agent-conformance` key and a welded
+sender token. The harness proves `runtime-adapter/v1` over HTTP: signed attach,
+replay refusal, bearer send to the runtime inbox, signed inbox peek/consume,
+consume-once behavior, fleet control request signing/delivery, and signed detach.
 
 ## One-time deploy (fork → deploy → log in)
 
@@ -53,6 +116,7 @@ leaves any id already present in `wrangler.toml` untouched. It creates:
 | Queue     | `mupot-events`       | events / leads                     |
 | Queue     | `mupot-events-dlq`   | dead-letter                        |
 | KV        | `SESSIONS`           | id written back to `wrangler.toml` |
+| KV        | `OAUTH_KV`           | id written back to `wrangler.toml` |
 | R2        | `mupot-blobs`        | blobs                              |
 
 Then it applies the D1 migrations remotely (`wrangler d1 migrations apply mupot

@@ -19,6 +19,13 @@ export function isChannel(v: unknown): v is ConnectionChannel {
   return typeof v === 'string' && (CHANNELS as readonly string[]).includes(v)
 }
 
+const AGENT_TOKEN_CAPABILITIES = ['observer', 'member'] as const
+export type AgentTokenCapability = (typeof AGENT_TOKEN_CAPABILITIES)[number]
+
+export function isAgentTokenCapability(v: unknown): v is AgentTokenCapability {
+  return typeof v === 'string' && (AGENT_TOKEN_CAPABILITIES as readonly string[]).includes(v)
+}
+
 /** SHA-256 hex of a raw token. Stored value; the raw is never persisted.
  *  Exported for the one flow that mints inside a larger atomic D1 batch
  *  (invite accept) — everything else goes through mintMemberToken(). */
@@ -129,16 +136,18 @@ export interface AgentMintResult {
   tokenId: string
   memberId: string
   createdAt: string
+  grantCapability: AgentTokenCapability
 }
 
 /**
- * Atomically mint a DEDICATED member envelope + squad-scoped 'member' capability +
+ * Atomically mint a DEDICATED member envelope + squad-scoped agent capability +
  * agent-weld token for `agent`.
  *
  * SECURITY INVARIANTS (same as the original mint_agent_token MCP tool):
  *   - THREE ROWS, ONE BATCH — all land or none do (no orphan credentials).
- *   - THE ESCALATION GUARD: the capability is hard-coded to scope_type='squad',
- *     scope_id=agent.squad_id, capability='member'.  It cannot be widened from args.
+ *   - THE ESCALATION GUARD: the grant is hard-coded to scope_type='squad',
+ *     scope_id=agent.squad_id, and capability <= 'member'.  Callers may lower it
+ *     to 'observer', but can never widen it to lead/admin/owner or another scope.
  *   - THE WELD: member_tokens.agent_id = agent.id (binds the token to the agent).
  *   - Raw shown once; only the hash is stored. Never logged, never re-derivable.
  *
@@ -149,7 +158,11 @@ export async function mintAgentBoundToken(
   env: Env,
   agent: AgentForMint,
   label: string,
+  grantCapability: AgentTokenCapability = 'member',
 ): Promise<AgentMintResult> {
+  if (!isAgentTokenCapability(grantCapability)) {
+    throw new Error('invalid agent token capability')
+  }
   const memberId = crypto.randomUUID()
   const tokenId = crypto.randomUUID()
   const rawToken = mintRawToken()
@@ -163,12 +176,12 @@ export async function mintAgentBoundToken(
       `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).bind(memberId, null, agent.name, null, 'active', createdAt, env.TENANT_SLUG),
-    // 2) THE ESCALATION GUARD: squad-scoped 'member' on the agent's OWN squad only.
-    //    Hard-coded scope + capability — never widened from caller args.
+    // 2) THE ESCALATION GUARD: squad-scoped grant on the agent's OWN squad only.
+    //    Hard-coded scope, with only observer/member allowed — never widened.
     env.DB.prepare(
       `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-       VALUES (?, ?, 'squad', ?, 'member')`,
-    ).bind(crypto.randomUUID(), memberId, agent.squad_id),
+       VALUES (?, ?, 'squad', ?, ?)`,
+    ).bind(crypto.randomUUID(), memberId, agent.squad_id, grantCapability),
     // 3) THE WELD: bind token to the agent (agent_id set). Only the hash is stored.
     env.DB.prepare(
       `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id)
@@ -179,7 +192,7 @@ export async function mintAgentBoundToken(
   // capability row) would hand out a show-once token bound to a broken identity.
   assertBatchWritten(mintWrites, 'mint_agent_bound_token', 1)
 
-  return { raw: rawToken, tokenId, memberId, createdAt }
+  return { raw: rawToken, tokenId, memberId, createdAt, grantCapability }
 }
 
 /** Live (non-revoked) tokens for every member — for the dashboard roster. The

@@ -39,21 +39,24 @@ wiring an existing, already-gated backend action to a new trigger.
 | `help` / `?` | list verbs | none (read) |
 | `status` / `status <agent>` | who am I + my scopes / an agent's runtime | none (read, tenant-scoped) |
 | `wake <agent>` | wake an agent | `lead`+ on the agent's squad |
+| `fleet start\|stop\|restart\|status <agent>` | queue signed host-agent control | `owner` on the org |
+| `approve <id>` / `reject <id> <reason>` | approve or reject a pending gate task | task gate capability or org `admin`+ |
+| `directive: <text>` / `directive clear` | pin or clear the brain's next-cycle human directive | `owner` on the org, direct chat only |
 | `task: <title> [@squad]` | create a task | member on the target scope |
 
-Plus Telegram already **receives** decision-gate notifications and brain directives (today via host
-scripts — see "Fragmentation" below).
+Plus Telegram already **receives** decision-gate notifications and host-side brain signals (today via
+host scripts — see "Fragmentation" below).
 
-## The gap — backend actions not yet reachable from chat
+## Closed parity slices
 
-These exist in the dashboard but have no IM verb yet. Closing the gap = one new `parseIntent` branch
-+ one handler each, calling the **same service** the web route already calls.
+The main dashboard-equivalent control verbs are now reachable from chat through one `parseIntent`
+branch + one handler each, calling the **same service** or durable store the web/API route uses.
 
-| Backend surface | Dashboard today | Proposed IM verb | Gate |
+| Backend surface | Mupot path | IM verb | Gate |
 |---|---|---|---|
-| Fleet — host agents (`/fleet`, `POST /fleet/host-control`) | start / stop / restart a server agent | `fleet stop <agent>` · `fleet start <agent>` · `fleet restart <agent>` | `owner` (org) |
-| Approvals (`src/dashboard/approvals.ts`) | approve / reject a pending gate | `approve <id>` · `reject <id> <reason>` | the approval's required capability |
-| Human directive (`last_human_directive`) | brain reads it at decision position-0 | `directive: <text>` · `directive clear` | `owner` (org), **direct principal only** |
+| Host fleet control | signed `fleet-control.v1` request | `fleet <verb> <agent>` | `owner` (org) |
+| Approval verdicts | `writeVerdict()` + task workflow resume | `approve <id>` · `reject <id> <reason>` | task gate capability or org `admin`+ |
+| Human directive (`last_human_directive`) | `org_settings` canonical value + `/api/brain/directive` read | `directive: <text>` · `directive clear` | `owner` (org), **direct principal only** |
 
 ### Fleet from Telegram — rides the existing signed plane, unchanged trust root
 
@@ -65,6 +68,11 @@ calls the **same** internal signer that `POST /fleet/host-control` calls. The ho
 the trust root (`FLEET_PANEL_SK`) and the verification path are identical. Telegram becomes another
 authenticated trigger of an already-safe action.
 
+Fleet IM replies also include the same narrow runtime view used by `/fleet`: derived Mupot
+presence, stored lifecycle intent, and last-seen time. The host-side `fleet status` request is
+still queued through `fleet-control.v1`; the immediate chat context is Mupot's current view, not
+member identity or capability data.
+
 ### Approvals from Telegram — close the loop that already half-exists
 
 Telegram already *receives* gate notifications. Parity means *acting* on them by reply: `approve <id>`
@@ -74,12 +82,11 @@ notification itself, so the owner acts with one tap.
 
 ### Directive from Telegram — preserve the single write-path discipline
 
-`last_human_directive` has exactly one legitimate write path today (the host `brain-pinned.sh`,
-deliberately **not** bus-parsed, because the bus may wake the brain but never steer it). Unifying it
-under "my Telegram" means a `directive: <text>` from the **owner's own paired chat_id** writes the
-pinned directive — preserving the rule that it is the *direct* principal, never a relayed claim. The
-seam must continue to refuse any directive that arrives as a relayed/forwarded message rather than
-from the owner's mapped chat.
+`last_human_directive` is now a canonical `org_settings` value with one in-repo write path from IM:
+`directive: <text>` from the **owner's own paired chat_id**. The brain/dashboard read it through
+`loadBrainView`, and the host brain can pull it through `GET /api/brain/directive` with an org-admin
+member token. The seam refuses forwarded Telegram messages for this verb, preserving the direct
+principal rule: a relayed claim can wake or notify, but it cannot steer the brain.
 
 ## Fragmentation → one control surface
 
@@ -90,8 +97,8 @@ from the owner's mapped chat.
 2. **mumega.com inkwell-api `src/routes/telegram.ts`** — a separate social-PM/marketing bot
    (`social-pm` commands). Different concern; leave it, but the owner should not have to remember
    which bot does what.
-3. **Host scripts** (`brain-pinned.sh` for directives; `athena-pulse.sh` etc. for gate
-   notifications) — out-of-band sends from the VPS.
+3. **Host scripts** (`athena-pulse.sh` etc. for gate notifications; older `brain-pinned.sh` style
+   directives) — out-of-band sends from the VPS until the host side reads `/api/brain/directive`.
 
 Target: the owner messages **one** bot, and identity + capabilities decide what each message can do.
 The control verbs (status/wake/task/fleet/approve/directive) all resolve through the single mupot IM
@@ -112,14 +119,18 @@ seam; notifications (gates, heartbeats) are sent back into that same chat.
 
 ## Build sequence (each slice dyad-gated Opus + codex1, on a PR; deploy is owner-go)
 
-1. **`fleet <verb> <agent>`** — highest value, smallest surface; reuses the signer. Add intent +
-   handler + owner gate + tests (incl. a refused non-owner and a refused forwarded message).
-2. **`approve <id>` / `reject <id> <reason>`** — wire to the approval service; then inline-keyboard
-   buttons on the notification.
-3. **`directive: <text>` / `directive clear`** — owner-direct write to `last_human_directive`,
-   preserving the no-relay rule.
+1. **Done: `fleet <verb> <agent>`** — highest value, smallest surface; reuses the signer. Built as
+   IM intent + handler + owner gate + signed `fleet-control.v1` delivery, narrow runtime-context
+   replies, and local smoke coverage.
+2. **Done: `approve <id>` / `reject <id> <reason>`** — wired to the verdict store with the same
+   gate capability checks and `task.verdict` receipts as the dashboard. Inline-keyboard buttons on
+   the notification remain a UI refinement.
+3. **Done: `directive: <text>` / `directive clear`** — owner-direct write to
+   `last_human_directive`, `/brain` render, `/api/brain/directive` daemon read, and
+   `brain.directive.updated` BusEvent.
 4. **Unify the bot front-door** — converge notifications + control onto the single IM seam so the
    owner messages one place.
 
-Status: **design captured, not yet built.** The seam and the signed fleet plane already exist — these
-are wiring slices, not new trust.
+Status: **fleet, approval, and directive parity slices are built in the PR branch; bot-front-door
+unification and real host adoption remain.** The seam and signed fleet plane already exist — the
+remaining items are wiring/evidence slices, not new trust.

@@ -6,10 +6,27 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "dev:local:test": "wrangler dev --config wrangler-local-test.toml --port 8787",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "migrate:local": "wrangler d1 migrations apply mupot --local",
+    "migrate:local:test": "wrangler d1 migrations apply mupot-local-test --local --config wrangler-local-test.toml",
+    "seed:local:test": "wrangler d1 execute mupot-local-test --local --config wrangler-local-test.toml --file scripts/local-test-seed.sql",
+    "smoke:local": "node scripts/local-browser-smoke.mjs",
+    "conformance:runtime:local": "node scripts/local-runtime-conformance.mjs",
+    "receipt:host": "node fleet-runtime/host-receipt.mjs",
+    "receipt:runtime": "node fleet-runtime/runtime-receipt.mjs",
+    "receipt:control": "node fleet-runtime/control-receipt.mjs",
+    "receipt:cutover": "node fleet-runtime/cutover-receipt.mjs",
+    "receipt:bundle": "node fleet-runtime/receipt-bundle.mjs",
+    "receipt:bundle:plan": "node fleet-runtime/receipt-bundle.mjs --host-go-plan",
+    "receipt:bundle:status": "node fleet-runtime/receipt-bundle.mjs --status",
+    "receipt:bundle:status-summary": "node fleet-runtime/receipt-bundle.mjs --status --status-summary",
+    "receipt:bundle:check": "node fleet-runtime/receipt-bundle.mjs --check-manifest",
+    "receipt:bundle:export": "node fleet-runtime/receipt-bundle.mjs --export",
+    "probe:cutover": "node fleet-runtime/cutover-probe.mjs",
+    "fleet:install": "node fleet-runtime/install.mjs",
     "migrate:remote": "wrangler d1 migrations apply mupot --remote",
     "update": "node scripts/mupot-update.mjs"
   },
@@ -17,13 +34,14 @@
     "@cloudflare/workers-oauth-provider": "^0.4.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "agents": "^0.14.5",
-    "hono": "^4.6.0"
+    "hono": "^4.12.28"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260601.0",
+    "@cloudflare/workers-types": "^4.20260617.1",
+    "playwright": "^1.61.1",
     "typescript": "^5.6.0",
     "vitest": "^4.1.8",
-    "wrangler": "^4.0.0"
+    "wrangler": "^4.102.0"
   },
   "license": "SEE LICENSE IN LICENSE.md"
 }

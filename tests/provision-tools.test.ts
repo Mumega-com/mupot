@@ -7,8 +7,8 @@ import type { CapabilityGrant, Env } from '../src/types'
 // same way Codex/Claude Code would. The DB mock routes by SQL substring AND records every
 // bound INSERT so we can assert the two security invariants directly:
 //   - the WELD: mint_agent_token binds the new token to the agent (member_tokens.agent_id).
-//   - the ESCALATION GUARD: the agent's only capability is squad-scoped 'member' (never
-//     org/department, never above member) — it cannot inherit the operator's org-admin.
+//   - the ESCALATION GUARD: the agent's only capability is squad-scoped observer/member
+//     (never org/department, never above member) — it cannot inherit the operator's org-admin.
 
 interface Captured {
   sql: string
@@ -260,14 +260,14 @@ describe('create_agent', () => {
 })
 
 describe('mint_agent_token', () => {
-  it('org-admin mints a bound token (the weld) with a hard-capped squad member grant', async () => {
+  it('org-admin mints a bound token (the weld) with a default hard-capped squad member grant', async () => {
     const cap = [] as Captured[]
     const res = await call('mint_agent_token', { agent: 'growth-lead' }, makeEnv({}, cap))
     expect(res.status).toBe(200)
     const body = (await res.json()) as {
       result: {
         structuredContent: {
-          token: { raw: string; agent_id: string }
+          token: { raw: string; agent_id: string; capability: string }
           agent: { id: string }
           mcp_endpoint: string
           wake_contract: {
@@ -283,6 +283,7 @@ describe('mint_agent_token', () => {
     // show-once raw token, bound to the agent
     expect(sc.token.raw.startsWith('mupot_')).toBe(true)
     expect(sc.token.agent_id).toBe('agent-1')
+    expect(sc.token.capability).toBe('member')
     expect(sc.agent.id).toBe('agent-1')
     expect(sc.mcp_endpoint).toBe('https://agents.digid.ca/mcp')
 
@@ -301,13 +302,41 @@ describe('mint_agent_token', () => {
     expect(tokenInsert).toBeDefined()
     expect(tokenInsert!.args[5]).toBe('agent-1')
 
-    // THE ESCALATION GUARD: the agent's only capability is squad-scoped 'member'
-    // on its OWN squad — never org/department, never above member.
+    // THE ESCALATION GUARD: the agent's capability is squad-scoped 'member' by
+    // default on its OWN squad — never org/department, never above member.
     const capInsert = cap.find((c) => c.sql.includes('INSERT INTO capabilities'))
     expect(capInsert).toBeDefined()
     expect(capInsert!.sql).toContain("'squad'")
-    expect(capInsert!.sql).toContain("'member'")
     expect(capInsert!.args).toContain('squad-1') // scope_id bound to the agent's squad
+    expect(capInsert!.args).toContain('member')
+  })
+
+  it('can mint a lower observer-bound token but not a higher one', async () => {
+    const observerRows = [] as Captured[]
+    const observerRes = await call(
+      'mint_agent_token',
+      { agent: 'growth-lead', capability: 'observer' },
+      makeEnv({}, observerRows),
+    )
+    expect(observerRes.status).toBe(200)
+    const observerBody = (await observerRes.json()) as {
+      result: { structuredContent: { token: { capability: string } } }
+    }
+    expect(observerBody.result.structuredContent.token.capability).toBe('observer')
+    const observerCap = observerRows.find((c) => c.sql.includes('INSERT INTO capabilities'))
+    expect(observerCap).toBeDefined()
+    expect(observerCap!.args).toContain('observer')
+    expect(observerCap!.args).toContain('squad-1')
+
+    const higherRows = [] as Captured[]
+    const higherRes = await call(
+      'mint_agent_token',
+      { agent: 'growth-lead', capability: 'lead' },
+      makeEnv({}, higherRows),
+    )
+    expect(higherRes.status).toBe(400)
+    expect(((await higherRes.json()) as { error: { message: string } }).error.message).toBe('invalid_capability')
+    expect(higherRows).toEqual([])
   })
 
   it('403s a squad-lead — minting a credential needs admin', async () => {

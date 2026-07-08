@@ -1,10 +1,19 @@
 {
-  "_comment": "Fleet daemon config. Copy to ~/.fleet/daemon.json and set REAL values. STERILE: base_url + tenant are REQUIRED (no defaults). Each probe is a shell command that exits 0 IFF that agent's runtime is actually running NOW. CRITICAL: a probe must detect DEATH, not just past-life — `test -f marker` passes forever once the marker exists and will heartbeat a dead agent (use a freshness/mtime check like `find ... -mmin -5`). interval_sec is clamped to [15,120] and must stay well under the pot's presence TTL (default 180s).",
+  "_comment": "Fleet daemon config. Copy to ~/.fleet/daemon.json and set REAL values. STERILE: base_url + tenant are REQUIRED (no defaults). Each probe is a shell command that exits 0 IFF that agent's runtime is actually running NOW. CRITICAL: a probe must detect DEATH, not just past-life — `test -f marker` passes forever once the marker exists and will heartbeat a dead agent (use a freshness/mtime check like `find ... -mmin -5`). interval_sec is clamped to [15,120] and must stay well under the pot's presence TTL (default 180s). Optional inbox.command reads a JSON batch on stdin; the daemon peeks first and consumes from the pot only after the command exits 0. On daemon shutdown, agents successfully heartbeated during this daemon run are signed-detached.",
   "base_url": "https://YOUR-POT.example.com",
   "tenant": "YOUR_TENANT_SLUG",
   "interval_sec": 75,
   "agents": [
-    { "agent_id": "agent-one", "type": "builder",  "runtime": "claude-code", "probe": "tmux has-session -t agent-one 2>/dev/null" },
+    {
+      "agent_id": "agent-one",
+      "type": "builder",
+      "runtime": "claude-code",
+      "probe": "tmux has-session -t agent-one 2>/dev/null",
+      "inbox": {
+        "command": "node $HOME/.fleet/runtime/inbox-handler.mjs $HOME/.fleet/inbox-handler.json",
+        "limit": 20
+      }
+    },
     { "agent_id": "agent-two", "type": "reviewer", "runtime": "codex",       "probe": "systemctl --user is-active --quiet agent-two" },
     { "agent_id": "agent-cron","type": "brain",    "runtime": "hermes-cron", "probe": "find $HOME/.agent-cron/last_run_ok -mmin -20 2>/dev/null | grep -q ." }
   ]

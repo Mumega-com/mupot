@@ -10,7 +10,7 @@
 //  - GET /api/fleet/agents: admin → 200 unified list; non-admin token → 403; no token → 401.
 
 import { describe, it, expect, beforeAll } from 'vitest'
-import { reportFleetAgents, getAgentView } from '../src/fleet/registry'
+import { reportFleetAgents, getAgentView, listFleetAgentRuntimeView } from '../src/fleet/registry'
 import { fleetControlApp } from '../src/fleet/control-routes'
 import type { Env } from '../src/types'
 
@@ -72,8 +72,10 @@ function makeDb(opts: MockDbOpts = {}) {
         const m = r.member_id ? members.find((x) => x.id === r.member_id && x.tenant === r.tenant) : undefined
         return {
           agent_id: r.agent_id,
+          display: r.display,
           agent_type: r.agent_type,
           runtime: r.runtime,
+          squads: r.squads,
           status: r.status,
           lifecycle: r.lifecycle,
           last_reported_at: r.last_reported_at,
@@ -253,8 +255,10 @@ describe('getAgentView', () => {
     expect(views).toHaveLength(1)
     const v = views[0]
     expect(v.agent_id).toBe('kasra')
+    expect(v.display).toBe('Kasra')
     expect(v.type).toBe('builder')
     expect(v.runtime).toBe('claude-code')
+    expect(v.squads).toEqual([])
     expect(v.status).toBe('running')
     expect(v.member).toEqual({ id: 'm-kasra', email: 'kasra@mumega.com', display_name: 'Kasra' })
     expect(v.capabilities).toHaveLength(2)
@@ -346,6 +350,39 @@ describe('getAgentView', () => {
     const viewsB = await getAgentView(env(db, { TENANT_SLUG: 'tB' }))
     expect(viewsA.map((v) => v.agent_id)).toEqual(['kasra'])
     expect(viewsB.map((v) => v.agent_id)).toEqual(['loom'])
+  })
+})
+
+describe('listFleetAgentRuntimeView', () => {
+  it('returns the least-privilege runtime status feed with derived presence only', async () => {
+    const db = makeDb({
+      members: [{ id: 'm-kasra', email: 'kasra@mumega.com', display_name: 'Kasra', tenant: 't' }],
+      caps: [{ member_id: 'm-kasra', scope_type: 'org', scope_id: null, capability: 'owner' }],
+    })
+    db._fleet.set('t:kasra', {
+      agent_id: 'kasra', tenant: 't', display: 'Kasra', runtime: 'claude-code', squads: '["growth"]',
+      lifecycle: 'always_on', provider_contract: null, status: 'running', reported_by: 'fc',
+      last_reported_at: '2026-07-08 00:59:00', agent_type: 'builder', member_id: 'm-kasra',
+    })
+
+    const views = await listFleetAgentRuntimeView(
+      env(db, { TENANT_SLUG: 't', FLEET_PRESENCE_TTL_SEC: '180' } as Partial<Env>),
+      Date.parse('2026-07-08T01:00:00Z'),
+    )
+
+    expect(views).toEqual([{
+      agent_id: 'kasra',
+      display: 'Kasra',
+      runtime: 'claude-code',
+      squads: ['growth'],
+      status: 'running',
+      presence: 'live',
+      lifecycle: 'always_on',
+      last_seen: '2026-07-08 00:59:00',
+    }])
+    expect(views[0]).not.toHaveProperty('member')
+    expect(views[0]).not.toHaveProperty('capabilities')
+    expect(views[0]).not.toHaveProperty('type')
   })
 })
 

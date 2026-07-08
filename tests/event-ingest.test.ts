@@ -22,7 +22,7 @@
 // HMAC cryptography (tested in ghl-integration.test.ts).
 
 import { describe, it, expect, vi } from 'vitest'
-import { ingestEvent, verifyEventSignature, eventIngestApp, EVENT_REGISTRY } from '../src/events/ingest'
+import { ingestEvent, verifyEventSignature, eventIngestApp, EVENT_REGISTRY, EVENT_INGEST_MAX_BODY_BYTES } from '../src/events/ingest'
 import type { InboundEvent } from '../src/events/ingest'
 import type { Env } from '../src/types'
 
@@ -330,6 +330,36 @@ describe('eventIngestApp HTTP handler', () => {
     })
     const res = await eventIngestApp.fetch(req, env, {} as ExecutionContext)
     expect(res.status).toBe(401)
+  })
+
+  it('7c. oversized declared body → 413 before signature verification', async () => {
+    const env = makeEnv()
+    const req = new Request('http://localhost/ingest', {
+      method: 'POST',
+      body: '{}',
+      headers: {
+        'Content-Type': 'application/json',
+        'content-length': String(EVENT_INGEST_MAX_BODY_BYTES + 1),
+      },
+    })
+    const res = await eventIngestApp.fetch(req, env, {} as ExecutionContext)
+    expect(res.status).toBe(413)
+    const json = await res.json() as { error: string }
+    expect(json.error).toBe('payload_too_large')
+  })
+
+  it('7d. oversized actual UTF-8 body → 413 before signature verification', async () => {
+    const env = makeEnv()
+    const body = '💥'.repeat(Math.ceil((EVENT_INGEST_MAX_BODY_BYTES + 1) / 4))
+    const req = new Request('http://localhost/ingest', {
+      method: 'POST',
+      body,
+      headers: { 'Content-Type': 'application/json' },
+    })
+    const res = await eventIngestApp.fetch(req, env, {} as ExecutionContext)
+    expect(res.status).toBe(413)
+    const json = await res.json() as { error: string }
+    expect(json.error).toBe('payload_too_large')
   })
 
   it('8. valid signature + unmapped type → 400 unmapped_event_type (not silent)', async () => {
