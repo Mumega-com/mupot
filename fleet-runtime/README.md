@@ -477,6 +477,31 @@ when present. It exits non-zero until the evidence is ready, and its `next_steps
 name the next host action to run, including missing `agent:verb` lifecycle
 evidence before the final gate is rebuilt.
 
+To produce the clean attachable copy for #274, export from the working receipt
+directory into a fresh directory. The export command copies only `manifest.json`
+and the receipt artifacts named in that manifest, then runs the same manifest
+check against the exported directory:
+
+```bash
+node ~/.fleet/runtime/receipt-bundle.mjs \
+  --out-dir ~/.fleet/receipts/my-agent \
+  --export-dir ~/.fleet/receipts/my-agent-attach \
+  --export
+```
+
+or from a checkout:
+
+```bash
+npm run receipt:bundle:export -- \
+  --out-dir ./receipts/my-agent \
+  --export-dir ./receipts/my-agent-attach
+```
+
+Attach only the exported directory after the export receipt reports
+`receipt_type: "mupot-fleet-receipt-bundle-export/v1"` with `status: "pass"`.
+Use `--force` only to overwrite a failed export after fixing the source
+evidence or clearing the destination.
+
 To verify a copied bundle without rewriting anything, run the manifest check. It
 reads `manifest.json`, checks the recorded receipt artifact SHA-256 hashes, reads
 each saved receipt JSON, verifies receipt type/status against the manifest,

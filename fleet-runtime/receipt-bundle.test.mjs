@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildBundle, checkBundleManifest, inspectBundleStatus, parseArgs, safeName } from './receipt-bundle.mjs'
+import { buildBundle, checkBundleManifest, exportBundle, inspectBundleStatus, parseArgs, safeName } from './receipt-bundle.mjs'
 
 const POT_URL = 'https://pot.example.org'
 const POT_TENANT = 'tenant-a'
@@ -381,6 +381,39 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
     c.ready === false &&
     c.ok === false
   ))
+})
+
+test('export writes a clean self-contained attachable bundle', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+  await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+  })
+  writeJson(join(outDir, 'daemon.json'), { note: 'operator working file, not evidence' })
+
+  const exportDir = tmpDir()
+  const receipt = exportBundle({ outDir, exportDir })
+
+  assert.equal(receipt.receipt_type, 'mupot-fleet-receipt-bundle-export/v1')
+  assert.equal(receipt.status, 'pass')
+  assert.equal(receipt.manifest_check.status, 'pass')
+  assert.ok(receipt.artifacts.copied.some((artifact) => artifact.label === 'manifest'))
+  assert.deepEqual(
+    readdirSync(exportDir).sort(),
+    ['control-start.json', 'control-stop.json', 'cutover-gate.json', 'host.json', 'manifest.json', 'probe-start.json', 'runtime-agent-one.json'],
+  )
+  assert.equal(existsSync(join(exportDir, 'daemon.json')), false)
+  assert.equal(checkBundleManifest({ outDir: exportDir }).status, 'pass')
+  assert.equal(checkBundleManifest({ outDir }).status, 'fail')
 })
 
 test('manifest check fails when copied bundle is not self-contained', async () => {
@@ -949,6 +982,14 @@ test('parseArgs accepts read-only manifest check options', () => {
   assert.equal(opts.checkManifest, true)
   assert.ok(opts.outDir.endsWith('/receipts'))
   assert.ok(opts.manifestPath.endsWith('/manifest.json'))
+})
+
+test('parseArgs accepts attachable bundle export options', () => {
+  const opts = parseArgs(['--out-dir', './receipts', '--export-dir', './attachable', '--export'])
+
+  assert.equal(opts.export, true)
+  assert.ok(opts.outDir.endsWith('/receipts'))
+  assert.ok(opts.exportDir.endsWith('/attachable'))
 })
 
 test('parseArgs accepts read-only host-go status', () => {

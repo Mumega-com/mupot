@@ -68,6 +68,7 @@ function parseArgs(argv) {
     installReceiptPath: '',
     probeReceiptPaths: [],
     outDir: '',
+    exportDir: '',
     controlLabel: '',
     manifestPath: '',
     requiredControlVerbs: ['start', 'stop'],
@@ -92,6 +93,7 @@ function parseArgs(argv) {
     else if (arg === '--install-receipt') opts.installReceiptPath = pathArg(next())
     else if (arg === '--probe-receipt') opts.probeReceiptPaths.push(...splitValues(next()).map(pathArg))
     else if (arg === '--out-dir') opts.outDir = pathArg(next())
+    else if (arg === '--export-dir') opts.exportDir = pathArg(next())
     else if (arg === '--control-label') opts.controlLabel = safeName(next())
     else if (arg === '--manifest') opts.manifestPath = pathArg(next())
     else if (arg === '--require-control-verb') {
@@ -112,6 +114,7 @@ function parseArgs(argv) {
     else if (arg === '--exec-probes') opts.execProbes = true
     else if (arg === '--status') opts.status = true
     else if (arg === '--check-manifest') opts.checkManifest = true
+    else if (arg === '--export') opts.export = true
     else if (arg === '--force') opts.force = true
     else if (arg === '--help' || arg === '-h') opts.help = true
     else throw new Error(`unknown argument: ${arg}`)
@@ -131,6 +134,7 @@ function usage() {
     '  --control <path>              fleet-control-daemon config (default: ~/.fleet/control.json)',
     '  --install-receipt <path>      optional install.mjs receipt to copy into install.json',
     '  --probe-receipt <path>        optional cutover-probe.mjs receipt; repeat or comma-separate',
+    '  --export-dir <path>           write a clean attachable copy, then check the copied manifest',
     '  --control-label <label>       filename label for this live control receipt, e.g. start or stop',
     '  --manifest <path>             manifest path for --check-manifest',
     '  --skip-host                   reuse existing host.json from the bundle directory',
@@ -139,6 +143,7 @@ function usage() {
     '  --verify-only                 read-only recheck; reuse host/runtime/control receipts',
     '  --status                      read-only host-go evidence status for an in-progress bundle',
     '  --check-manifest              read-only hash/status check; writes nothing',
+    '  --export                      copy manifest + listed artifacts to --export-dir and check it',
     '  --require-control-verb <verb> default: start,stop; values: start, stop, restart',
     '  --exec-probes                 pass through to host-receipt.mjs',
     '  --force                       overwrite same-name receipt files',
@@ -148,6 +153,7 @@ function usage() {
     '  node ~/.fleet/runtime/receipt-bundle.mjs --agent my-agent --out-dir ~/.fleet/receipts/my-agent --install-receipt ~/.fleet/receipts/install.json --skip-runtime --skip-control',
     '  queue inbox + start with cutover-probe.mjs > ~/.fleet/receipts/my-agent/probe-start.json, then rerun with --probe-receipt ~/.fleet/receipts/my-agent/probe-start.json --skip-host --control-label start',
     '  queue stop with cutover-probe.mjs > ~/.fleet/receipts/my-agent/probe-stop.json, then rerun with --probe-receipt ~/.fleet/receipts/my-agent/probe-stop.json --skip-host --skip-runtime --control-label stop',
+    '  node ~/.fleet/runtime/receipt-bundle.mjs --out-dir ~/.fleet/receipts/my-agent --export-dir ~/.fleet/receipts/my-agent-attach --export',
     '  node ~/.fleet/runtime/receipt-bundle.mjs --out-dir ~/.fleet/receipts/my-agent --check-manifest',
   ].join('\n')
 }
@@ -961,6 +967,146 @@ function checkBundleManifest(opts = {}) {
   }
 }
 
+function copyEvidenceFile(source, dest, opts, checks, label) {
+  try {
+    writeFileSync(dest, readFileSync(source), { mode: 0o600, flag: opts.force ? 'w' : 'wx' })
+    checks.push({
+      ok: true,
+      component: 'receipt-bundle-export',
+      check: `${label}_copied`,
+      source,
+      path: dest,
+      sha256: fileSha256(dest),
+    })
+    return true
+  } catch (err) {
+    checks.push({
+      ok: false,
+      component: 'receipt-bundle-export',
+      check: `${label}_copied`,
+      source,
+      path: dest,
+      reason: String(err && err.message ? err.message : err),
+    })
+    return false
+  }
+}
+
+function exportBundle(opts = {}) {
+  const checks = []
+  const manifestPath = manifestPathForCheck(opts)
+  const sourceDir = manifestPath ? dirname(manifestPath) : ''
+  const exportDir = opts.exportDir ? pathArg(opts.exportDir) : ''
+  let manifest = null
+  const copied = []
+
+  checks.push({
+    ok: Boolean(manifestPath),
+    component: 'receipt-bundle-export',
+    check: 'source_manifest_selected',
+    path: manifestPath || null,
+  })
+  checks.push({
+    ok: Boolean(exportDir),
+    component: 'receipt-bundle-export',
+    check: 'export_dir_selected',
+    path: exportDir || null,
+  })
+  checks.push({
+    ok: Boolean(manifestPath && exportDir && resolve(sourceDir) !== resolve(exportDir)),
+    component: 'receipt-bundle-export',
+    check: 'export_dir_separate_from_source',
+    source_dir: sourceDir || null,
+    export_dir: exportDir || null,
+  })
+
+  if (manifestPath) {
+    manifest = readReceipt(manifestPath)
+    checks.push({
+      ok: Boolean(manifest),
+      component: 'receipt-bundle-export',
+      check: 'source_manifest_read',
+      path: manifestPath,
+    })
+  }
+
+  if (exportDir) ensureDir(exportDir, checks)
+
+  if (manifest && exportDir && sourceDir && resolve(sourceDir) !== resolve(exportDir)) {
+    const manifestDest = join(exportDir, 'manifest.json')
+    if (copyEvidenceFile(manifestPath, manifestDest, opts, checks, 'manifest')) {
+      copied.push({ label: 'manifest', source: manifestPath, path: manifestDest, sha256: fileSha256(manifestDest) })
+    }
+
+    for (const entry of bundleArtifactEntries(manifest)) {
+      const fileName = typeof entry.path === 'string' && entry.path.length > 0 ? basename(entry.path) : ''
+      const source = resolveArtifactPath(sourceDir, entry.path)
+      const dest = fileName ? join(exportDir, fileName) : ''
+      checks.push({
+        ok: Boolean(fileName),
+        component: 'receipt-bundle-export',
+        check: 'artifact_export_name_selected',
+        artifact: entry.label,
+        declared_path: entry.path ?? null,
+        file_name: fileName || null,
+      })
+      checks.push({
+        ok: Boolean(source && existsSync(source)),
+        component: 'receipt-bundle-export',
+        check: 'artifact_export_source_readable',
+        artifact: entry.label,
+        declared_path: entry.path ?? null,
+        source: source || null,
+      })
+      if (!fileName || !source || !existsSync(source)) continue
+      if (copyEvidenceFile(source, dest, opts, checks, `artifact_${safeName(entry.label)}`)) {
+        copied.push({
+          label: entry.label,
+          source,
+          path: dest,
+          sha256: fileSha256(dest),
+          receipt_type: entry.receipt_type ?? null,
+          status: entry.status ?? null,
+        })
+      }
+    }
+  }
+
+  const manifestCheck = exportDir ? checkBundleManifest({ outDir: exportDir }) : null
+  checks.push({
+    ok: manifestCheck?.status === 'pass',
+    component: 'receipt-bundle-export',
+    check: 'export_manifest_check_pass',
+    export_dir: exportDir || null,
+    status: manifestCheck?.status ?? null,
+  })
+
+  const summary = summarize(checks)
+  return {
+    receipt_type: 'mupot-fleet-receipt-bundle-export/v1',
+    generated_at: new Date().toISOString(),
+    status: summary.status,
+    summary,
+    inputs: {
+      manifest: manifestPath || null,
+      out_dir: opts.outDir ? pathArg(opts.outDir) : null,
+      export_dir: exportDir || null,
+    },
+    artifacts: {
+      copied,
+    },
+    manifest_check: manifestCheck ? {
+      status: manifestCheck.status,
+      summary: manifestCheck.summary,
+      manifest: manifestCheck.manifest,
+    } : null,
+    next_steps: summary.status === 'pass'
+      ? [NEXT_STEP_ATTACH]
+      : ['fix the source receipts or export directory, rerun receipt-bundle --export, then attach only the exported directory after it passes'],
+    checks,
+  }
+}
+
 function firstMeta(path) {
   return existsSync(path) ? receiptMeta(path) : null
 }
@@ -1652,6 +1798,11 @@ async function main() {
     console.log(usage())
     return
   }
+  if (opts.export || opts.exportDir) {
+    const receipt = exportBundle(opts)
+    console.log(JSON.stringify(receipt, null, 2))
+    process.exit(receipt.status === 'fail' ? 1 : 0)
+  }
   if (opts.checkManifest) {
     const receipt = checkBundleManifest(opts)
     console.log(JSON.stringify(receipt, null, 2))
@@ -1671,4 +1822,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   await main()
 }
 
-export { buildBundle, checkBundleManifest, defaultStamp, inspectBundleStatus, parseArgs, safeName, summarize }
+export { buildBundle, checkBundleManifest, defaultStamp, exportBundle, inspectBundleStatus, parseArgs, safeName, summarize }
