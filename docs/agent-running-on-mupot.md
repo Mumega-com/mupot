@@ -180,13 +180,19 @@ the live host runtime before attaching the final cutover record.
 Use `receipt-bundle.mjs --status` during collection for a read-only host-go
 progress receipt that reports missing evidence, including missing per-agent
 start/stop lifecycle verbs, and command-level next steps.
+Use `receipt-bundle.mjs --export --export-dir <attachable-dir>` after the
+manifest and cutover gate pass; it copies only the manifest and listed receipt
+artifacts into the attachable directory, emits
+`mupot-fleet-receipt-bundle-export/v1`, and runs the copied-bundle manifest
+check on that exported directory.
 The bundle manifest includes SHA-256 hashes for the saved receipt artifacts so
 the final cutover record can prove exactly which files were reviewed.
 Use `receipt-bundle.mjs --check-manifest` for a read-only drift check before
-attaching copied bundle evidence; it validates artifact hashes plus saved receipt
-type/status metadata, required evidence categories, and manifest summary/status
-consistency, then compares cutover-gate inputs and advisory `next_steps` back to
-the manifest evidence.
+attaching copied bundle evidence; run it against the exported directory. It
+validates artifact hashes plus saved receipt type/status metadata, required
+evidence categories, manifest summary/status consistency, absence of obvious
+secret material, and self-contained directory scope, then compares cutover-gate
+inputs and advisory `next_steps` back to the manifest evidence.
 
 **Cross-cutting** — (9) durable, reliably-wakeable 2nd adversarial gate lens (Codex bus-peer
 was stale on both pings); (10) dyad-gate.yml single-quote glob (1-line).
