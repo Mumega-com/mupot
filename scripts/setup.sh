@@ -2,9 +2,10 @@
 # mupot — one-shot resource provisioner for YOUR Cloudflare account.
 #
 # What it does (idempotent): creates the Cloudflare resources this app needs on the
-# account you are logged into with wrangler, writes the generated ids back into
-# wrangler.toml (replacing the REPLACE_WITH_YOUR_* placeholders), then applies the
-# D1 migrations. Re-running is safe: already-created resources are detected and
+# account you are logged into with wrangler, creates wrangler.toml from
+# wrangler.example.toml when needed, writes the generated ids back into
+# wrangler.toml (replacing the <YOUR_*> placeholders), then applies the D1
+# migrations. Re-running is safe: already-created resources are detected and
 # skipped, and ids already filled in are left untouched.
 #
 # It provisions, in order:
@@ -13,6 +14,7 @@
 #   - Queue               "mupot-events"     (async events / leads)
 #   - Queue               "mupot-events-dlq" (dead-letter)
 #   - KV namespace        SESSIONS           (sessions / config cache)
+#   - KV namespace        OAUTH_KV           (OAuth provider state)
 #   - R2 bucket           "mupot-blobs"      (blobs)
 #
 # Substrate only. This script never touches any tenant business content; it just
@@ -30,6 +32,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WRANGLER_TOML="${ROOT_DIR}/wrangler.toml"
+WRANGLER_EXAMPLE_TOML="${ROOT_DIR}/wrangler.example.toml"
 
 # ── resource names (must match wrangler.toml + src/types.ts Env) ──────────────
 D1_NAME="mupot"
@@ -39,6 +42,7 @@ VEC_METRIC="cosine"
 QUEUE_NAME="mupot-events"
 QUEUE_DLQ_NAME="mupot-events-dlq"
 KV_BINDING="SESSIONS"
+OAUTH_KV_BINDING="OAUTH_KV"
 R2_NAME="mupot-blobs"
 
 # wrangler invocation — prefer a repo-local install, fall back to npx.
@@ -53,7 +57,11 @@ ok()   { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
 skip() { printf '\033[1;33m∼\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
-[ -f "${WRANGLER_TOML}" ] || die "wrangler.toml not found at ${WRANGLER_TOML} — run from a mupot checkout."
+if [ ! -f "${WRANGLER_TOML}" ]; then
+  [ -f "${WRANGLER_EXAMPLE_TOML}" ] || die "wrangler.example.toml not found at ${WRANGLER_EXAMPLE_TOML} — run from a mupot checkout."
+  cp "${WRANGLER_EXAMPLE_TOML}" "${WRANGLER_TOML}"
+  ok "Created wrangler.toml from wrangler.example.toml."
+fi
 
 # ── preflight: wrangler present + authenticated ───────────────────────────────
 say "Checking wrangler is installed and authenticated…"
@@ -89,12 +97,35 @@ replace_placeholder() {
 
 # True if wrangler.toml still contains the given placeholder token.
 has_placeholder() {
-  grep -q "$1" "${WRANGLER_TOML}"
+  grep -Fq "$1" "${WRANGLER_TOML}"
+}
+
+has_any_placeholder() {
+  local placeholder
+  for placeholder in "$@"; do
+    if has_placeholder "$placeholder"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+replace_any_placeholder() {
+  local value="$1"
+  shift
+  local placeholder replaced=0
+  for placeholder in "$@"; do
+    if has_placeholder "$placeholder"; then
+      replace_placeholder "$placeholder" "$value"
+      replaced=1
+    fi
+  done
+  [ "$replaced" -eq 1 ]
 }
 
 # ── D1 ────────────────────────────────────────────────────────────────────────
 provision_d1() {
-  if ! has_placeholder "REPLACE_WITH_YOUR_D1_ID"; then
+  if ! has_any_placeholder "REPLACE_WITH_YOUR_D1_ID" "<YOUR_D1_DATABASE_ID>"; then
     skip "D1 id already set in wrangler.toml — skipping create."
     return
   fi
@@ -116,7 +147,7 @@ provision_d1() {
     | grep -Eo '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' \
     | head -n1 || true)"
   [ -n "$id" ] || die "Could not parse D1 id from wrangler output:\n${out}"
-  replace_placeholder "REPLACE_WITH_YOUR_D1_ID" "$id"
+  replace_any_placeholder "$id" "REPLACE_WITH_YOUR_D1_ID" "<YOUR_D1_DATABASE_ID>" || die "Could not replace D1 id placeholder in wrangler.toml."
   ok "D1 \"${D1_NAME}\" → ${id} (written to wrangler.toml)."
 }
 
@@ -153,24 +184,26 @@ provision_queue() {
 
 # ── KV ────────────────────────────────────────────────────────────────────────
 provision_kv() {
-  if ! has_placeholder "REPLACE_WITH_YOUR_KV_ID"; then
-    skip "KV id already set in wrangler.toml — skipping create."
+  local binding="$1"
+  shift
+  if ! has_any_placeholder "$@"; then
+    skip "KV id for ${binding} already set in wrangler.toml — skipping create."
     return
   fi
-  say "Creating KV namespace \"${KV_BINDING}\"…"
+  say "Creating KV namespace \"${binding}\"…"
   local out
-  if ! out="$("${WRANGLER[@]}" kv namespace create "${KV_BINDING}" 2>&1)"; then
+  if ! out="$("${WRANGLER[@]}" kv namespace create "${binding}" 2>&1)"; then
     if printf '%s' "$out" | grep -qi "already exists"; then
-      skip "KV namespace \"${KV_BINDING}\" already exists — looking up its id."
+      skip "KV namespace \"${binding}\" already exists — looking up its id."
       out="$("${WRANGLER[@]}" kv namespace list 2>&1)" || die "kv namespace list failed:\n${out}"
       # list is JSON: find the entry whose title ends in the binding name.
       local id
       id="$(printf '%s' "$out" | tr ',{}' '\n\n\n' \
-        | grep -A1 -i "\"title\".*${KV_BINDING}" | grep '"id"' \
+        | grep -A1 -i "\"title\".*${binding}" | grep '"id"' \
         | grep -Eo '[0-9a-f]{32}' | head -n1 || true)"
-      [ -n "$id" ] || die "Could not find existing KV id for ${KV_BINDING} in:\n${out}"
-      replace_placeholder "REPLACE_WITH_YOUR_KV_ID" "$id"
-      ok "KV \"${KV_BINDING}\" → ${id} (written to wrangler.toml)."
+      [ -n "$id" ] || die "Could not find existing KV id for ${binding} in:\n${out}"
+      replace_any_placeholder "$id" "$@" || die "Could not replace KV id placeholder for ${binding} in wrangler.toml."
+      ok "KV \"${binding}\" → ${id} (written to wrangler.toml)."
       return
     fi
     die "kv namespace create failed:\n${out}"
@@ -179,8 +212,8 @@ provision_kv() {
   local id
   id="$(printf '%s\n' "$out" | grep -Eo '[0-9a-f]{32}' | head -n1 || true)"
   [ -n "$id" ] || die "Could not parse KV id from wrangler output:\n${out}"
-  replace_placeholder "REPLACE_WITH_YOUR_KV_ID" "$id"
-  ok "KV \"${KV_BINDING}\" → ${id} (written to wrangler.toml)."
+  replace_any_placeholder "$id" "$@" || die "Could not replace KV id placeholder for ${binding} in wrangler.toml."
+  ok "KV \"${binding}\" → ${id} (written to wrangler.toml)."
 }
 
 # ── R2 ────────────────────────────────────────────────────────────────────────
@@ -199,7 +232,7 @@ provision_r2() {
 
 # ── migrations ────────────────────────────────────────────────────────────────
 apply_migrations() {
-  if has_placeholder "REPLACE_WITH_YOUR_D1_ID"; then
+  if has_any_placeholder "REPLACE_WITH_YOUR_D1_ID" "<YOUR_D1_DATABASE_ID>"; then
     die "D1 id is still a placeholder — cannot apply migrations. (Provisioning failed above.)"
   fi
   say "Applying D1 migrations to the remote database…"
@@ -214,7 +247,8 @@ provision_d1
 provision_vectorize
 provision_queue "${QUEUE_NAME}"
 provision_queue "${QUEUE_DLQ_NAME}"
-provision_kv
+provision_kv "${KV_BINDING}" "REPLACE_WITH_YOUR_KV_ID" "<YOUR_SESSIONS_KV_ID>"
+provision_kv "${OAUTH_KV_BINDING}" "<YOUR_OAUTH_KV_ID>"
 provision_r2
 apply_migrations
 

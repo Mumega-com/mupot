@@ -1,8 +1,10 @@
 # Deploy mupot to your Cloudflare account
 
-These two scripts replace hand-editing `wrangler.toml`. After forking, you run
-them once and you have a live pot on **your** Cloudflare account — no bespoke
-surgery. Substrate only: nothing here touches business content.
+These two scripts replace most hand-editing of `wrangler.toml`. After forking,
+you run them once and you have a live pot on **your** Cloudflare account. The
+setup script creates `wrangler.toml` from `wrangler.example.toml` when needed,
+fills the Cloudflare resource ids it can discover, and leaves tenant-specific
+vars for you to review. Substrate only: nothing here touches business content.
 
 ## Prerequisites
 
@@ -92,6 +94,7 @@ leaves any id already present in `wrangler.toml` untouched. It creates:
 | Queue     | `mupot-events`       | events / leads                     |
 | Queue     | `mupot-events-dlq`   | dead-letter                        |
 | KV        | `SESSIONS`           | id written back to `wrangler.toml` |
+| KV        | `OAUTH_KV`           | id written back to `wrangler.toml` |
 | R2        | `mupot-blobs`        | blobs                              |
 
 Then it applies the D1 migrations remotely (`wrangler d1 migrations apply mupot

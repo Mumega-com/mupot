@@ -29,7 +29,7 @@ and the running product.
 
 | Requirement | What must be true | Current evidence |
 |---|---|---|
-| Self-hosted install | A new operator can deploy a pot into their own Cloudflare account and keep data in their account. | `docs/SELF-HOST.md`, `scripts/setup.sh`, `wrangler.example.toml` |
+| Self-hosted install | A new operator can deploy a pot into their own Cloudflare account and keep data in their account. | `docs/SELF-HOST.md`, `docs/production-runbook.md`, `scripts/setup.sh`, `wrangler.example.toml` |
 | Agent identity | Each agent has a durable identity separate from its runtime shell. | `docs/agent-running-on-mupot.md`, `fleet_agents`, `agent_keys`, member/capability tests |
 | Runtime adapters | Hermes, Codex, Claude Code, and custom workers can attach through a stable contract. | `docs/runtime-adapter-contract.md`, `docs/runtime-adapter-v1.json`, `connectors/`, signed attach flow |
 | Scoped authority | Every sensitive action is guarded by role and capability checks. | `docs/security-model.md`, `src/auth/`, `tests/*capability*`, `tests/*gate*` |
@@ -105,13 +105,19 @@ Exit criteria:
 
 Goal: make a self-hosted pot safe to operate for serious teams.
 
-- Add a deployment checklist that covers required Cloudflare resources,
+- Maintain the production runbook that covers required Cloudflare resources,
   secrets, D1 migrations, OAuth, rollback, backups, and health checks.
 - Add backup and restore guidance for D1, R2, and configuration state.
 - Add rate limits and abuse protection for public or semi-public endpoints.
 - Add structured logs and audit export.
 - Document incident response for leaked secrets, compromised runtime hosts,
   failed migrations, broken webhooks, and bad agent output.
+
+Current evidence:
+
+- `docs/production-runbook.md` covers production deploy, upgrade, rollback,
+  backup, restore, validation, and incidents for leaked secrets, compromised
+  runtime hosts, broken webhooks, and bad agent output.
 
 Exit criteria:
 
