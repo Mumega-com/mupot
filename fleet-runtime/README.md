@@ -473,10 +473,9 @@ For a compact human-readable view during the live run, add
 `--status-summary`:
 
 ```bash
-npm run receipt:bundle:status -- \
+npm run receipt:bundle:status-summary -- \
   --agent my-agent \
-  --out-dir ./receipts/my-agent \
-  --status-summary
+  --out-dir ./receipts/my-agent
 ```
 
 It prints `receipt_type: "mupot-fleet-receipt-bundle-status/v1"` and checks

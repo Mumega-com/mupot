@@ -21,6 +21,7 @@
     "receipt:cutover": "node fleet-runtime/cutover-receipt.mjs",
     "receipt:bundle": "node fleet-runtime/receipt-bundle.mjs",
     "receipt:bundle:status": "node fleet-runtime/receipt-bundle.mjs --status",
+    "receipt:bundle:status-summary": "node fleet-runtime/receipt-bundle.mjs --status --status-summary",
     "receipt:bundle:check": "node fleet-runtime/receipt-bundle.mjs --check-manifest",
     "receipt:bundle:export": "node fleet-runtime/receipt-bundle.mjs --export",
     "probe:cutover": "node fleet-runtime/cutover-probe.mjs",

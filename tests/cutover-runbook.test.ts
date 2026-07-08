@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 const runbook = readFileSync(new URL('../docs/squad-mupot-cutover.md', import.meta.url), 'utf8')
+const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { scripts: Record<string, string> }
 
 describe('squad mupot cutover runbook', () => {
   it('does not describe wake-hook cutover as blocked by a missing inbox route', () => {
@@ -27,6 +28,8 @@ describe('squad mupot cutover runbook', () => {
     expect(runbook).toContain('mupot-fleet-receipt-bundle-status/v1')
     expect(runbook).toContain('host_go_checklist')
     expect(runbook).toContain('--status-summary')
+    expect(runbook).toContain('npm run receipt:bundle:status-summary')
+    expect(pkg.scripts['receipt:bundle:status-summary']).toBe('node fleet-runtime/receipt-bundle.mjs --status --status-summary')
     expect(runbook).toContain('--export')
     expect(runbook).toContain('--export-dir')
     expect(runbook).toContain('npm run receipt:bundle:export')
