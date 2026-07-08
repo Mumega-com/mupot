@@ -10,7 +10,7 @@
       "runtime": "claude-code",
       "probe": "tmux has-session -t agent-one 2>/dev/null",
       "inbox": {
-        "command": "$HOME/.fleet/handlers/agent-one-inbox.sh",
+        "command": "node $HOME/.fleet/runtime/inbox-handler.mjs $HOME/.fleet/inbox-handler.json",
         "limit": 20
       }
     },

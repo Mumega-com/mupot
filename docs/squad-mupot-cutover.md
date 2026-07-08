@@ -218,8 +218,9 @@ mounted at `/api/inbox` in `src/index.ts`.
   so the handler can map to cursor-style logic.
 
 The remaining work is host-side wiring: replace Redis polling with the fleet
-daemon's signed inbox drain and a local handler that persists or launches the
-runtime, then exits `0` so the daemon consumes the batch.
+daemon's signed inbox drain and `fleet-runtime/inbox-handler.mjs`, which persists
+each message to a 0600 local spool file before optionally launching the runtime
+and exiting `0` so the daemon consumes the batch.
 
 ### 3.3 What changes in the hooks once the HTTP inbox route exists
 
@@ -231,9 +232,10 @@ runtime, then exits `0` so the daemon consumes the batch.
   Cursor becomes the max `seq` instead of a Redis stream ID.
 - **`activation-watcher.sh`:** prefer the fleet daemon `inbox.command` handler:
   the daemon signs `POST /api/inbox/signed`, peeks a batch, sends the batch JSON
-  to the handler on stdin, and consumes only after the handler exits `0`. The
-  handler keeps the launch logic (lockfile, concurrency cap, HALT flag, body-to-file
-  0600). **The HMAC-signed-delegation envelope goes away** because mupot's `send`
+  to `inbox-handler.mjs` on stdin, and consumes only after the handler exits `0`.
+  The handler writes 0600 spool files and can invoke a per-agent command that keeps
+  the launch logic (lockfile, concurrency cap, HALT flag).
+  **The HMAC-signed-delegation envelope goes away** because mupot's `send`
   already authenticates the sender server-side and replay-guards by
   `UNIQUE(tenant, from_agent, request_id)`. Verify the host diff before deleting
   the HMAC path — it is a security-relevant runtime change.
@@ -307,11 +309,12 @@ runtime, then exits `0` so the daemon consumes the batch.
 - **Editing `~/.mcp.json`, `~/.claude.json`, the arm `.md` allowlists** (runtime config — Hadi manages agent runtime per "Stay in dev lane" memory).
 - **Deploying the signed fleet/inbox routes** (`/api/fleet/detach-signed` and `/api/inbox/signed`; mupot worker deploy — arms never deploy; CLAUDE.md hard rule).
 - **Installing `fleet-control-daemon.mjs` on the host** (runtime start/stop lane; host process control).
+- **Installing/configuring `inbox-handler.mjs` on the host** (runtime wake-hook lane; launches local sessions from Mupot inbox batches).
 - **Revoking the SOS bus token** (final decommission — irreversible-ish; his sign-off).
 
 ### Kasra (mine — prep + verify, no mint, no deploy, no config write)
 - **Prep the exact mint calls** (section 1.3) and the config diffs (section 2.4) — hand to Hadi.
-- **Prepare the host handler diff for signed inbox drain** (section 3.2) — branch only, through the diverse-gate (kasra-review + a different-model second eye) + Hadi-go before any deploy.
+- **Prepare/review the host handler rollout for signed inbox drain** (section 3.2) — branch only, through the diverse-gate (kasra-review + a different-model second eye) + Hadi-go before any deploy.
 - **Run the verification round-trips** (section 4 receipts) once Hadi has minted + wired, and report receipts (not grades).
 - **Gate the security-relevant change** of dropping `verify-delegation.py`'s HMAC (section 3.3) — mandatory diverse review before it lands.
 
@@ -319,9 +322,10 @@ runtime, then exits `0` so the daemon consumes the batch.
 
 ## Open BLOCKERS / follow-on builds (explicit, not papered over)
 
-1. **Host handler rollout for signed inbox drain** — `/api/inbox/signed` exists, but
-   the bash wake-hooks still need a reviewed handler that receives daemon batches,
-   launches the right runtime, and exits `0` only after durable local handoff.
+1. **Host handler rollout for signed inbox drain** — `/api/inbox/signed` and
+   `fleet-runtime/inbox-handler.mjs` exist, but the bash wake-hooks still need a
+   reviewed host config/command that launches the right runtime and exits `0`
+   only after durable local handoff.
 2. **Per-arm capability granularity in `mint_agent_token`** — today every minted token gets uniform squad `member` (`src/mcp/provision.ts:298-301`). True per-arm least-privilege (e.g. review = recall/remember/inbox only, NO task_create/squad_message) is not expressible. Follow-on: optional explicit-capability arg, still hard-capped ≤ `member`.
 3. **Squad-scoped memory on mupot** — no `squad_remember`/`squad_recall`; mupot memory is per-token-private. Shared `MEMORY.md`-style squad memory is NOT covered by this cutover.
 4. **`task_update` / `task_board` / `task_list` / `broadcast` / `peers` MCP tools** — absent on the mupot seam; the arms that use them keep those flows on SOS or on GitHub until built.

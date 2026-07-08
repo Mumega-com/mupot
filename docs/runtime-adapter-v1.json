@@ -105,6 +105,12 @@
       "default": "consume",
       "peek": "non-consuming"
     },
+    "hostHandler": {
+      "file": "fleet-runtime/inbox-handler.mjs",
+      "handoff": "write-0600-spool-before-exit-0",
+      "commandInput": "json-stdin-with-files-and-messages",
+      "failure": "exit-nonzero-leaves-mupot-messages-unread"
+    },
     "errors": [
       "unauthorized",
       "not_agent_bound",

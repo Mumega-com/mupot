@@ -29,6 +29,8 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `fleet-daemon.mjs` | presence heartbeat loop, optional signed inbox drain, signed shutdown detach |
 | `daemon.example.json` | config template (set base_url, tenant, agents, probes) |
 | `fleet-daemon.service` | systemd user unit |
+| `inbox-handler.mjs` | durable local handoff command for daemon inbox batches |
+| `inbox-handler.example.json` | per-agent spool + launch command config |
 | `fleet-control-daemon.mjs` | signed open/close/restart consumer for `POST /api/fleet/control` |
 | `control-request.mjs` | host verifier for `fleet-control.v1` requests |
 | `control.example.json` | control-daemon config template |
@@ -70,7 +72,8 @@ runtime is alive *now*. Use liveness signals (`tmux has-session`, `systemctl is-
 the marker exists → heartbeats a dead agent).
 
 To let the daemon deliver Mupot inbox messages to a runtime hook, add an optional `inbox`
-block to that agent:
+block to that agent. The maintained handler is the safest default because it writes every
+message to a 0600 local spool file before it exits 0:
 
 ```json
 {
@@ -79,7 +82,7 @@ block to that agent:
   "runtime": "claude-code",
   "probe": "tmux has-session -t agent-one 2>/dev/null",
   "inbox": {
-    "command": "$HOME/.fleet/handlers/agent-one-inbox.sh",
+    "command": "node $HOME/.fleet/runtime/inbox-handler.mjs $HOME/.fleet/inbox-handler.json",
     "limit": 20
   }
 }
@@ -106,9 +109,20 @@ The command receives one JSON object on stdin:
 }
 ```
 
-Exit `0` only after the runtime has persisted or accepted the batch. A non-zero exit, crash,
-or timeout leaves the Mupot messages unread for the next daemon tick. The inbox read is signed
-with the agent's Ed25519 key and POSTed to `/api/inbox/signed`; it does not need a bearer token.
+Configure the handler:
+
+```bash
+cp fleet-runtime/inbox-handler.example.json ~/.fleet/inbox-handler.json
+mkdir -p ~/.fleet/handlers
+```
+
+The handler validates the daemon payload, writes each message under
+`~/.fleet/inbox/<agent_id>/`, then runs the configured per-agent command only when a message
+kind matches `run_for`. The command receives JSON on stdin with `files[]`, `messages[]`,
+`agent_id`, `tenant`, and `base_url`. Exit `0` only after the runtime has accepted or persisted
+the batch. A non-zero exit, crash, or timeout leaves the Mupot messages unread for the next
+daemon tick. The inbox read is signed with the agent's Ed25519 key and POSTed to
+`/api/inbox/signed`; it does not need a bearer token.
 
 ## Run the control daemon (remote open/close)
 

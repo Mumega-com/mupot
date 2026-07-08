@@ -24,6 +24,7 @@ const contract = JSON.parse(
   messaging: {
     mcpTools: string[]
     http: { signedRead: { path: string; required: string[]; domain: string } }
+    hostHandler: { file: string; handoff: string; commandInput: string; failure: string }
     kinds: string[]
     idempotency: { scope: string[]; identicalRetry: string; differentContent: string }
     readSemantics: { default: string; peek: string }
@@ -89,6 +90,11 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(contract.messaging.idempotency.identicalRetry).toBe('duplicate:true')
     expect(contract.messaging.idempotency.differentContent).toBe('request_id_conflict')
     expect(contract.messaging.readSemantics).toEqual({ default: 'consume', peek: 'non-consuming' })
+    expect(contract.messaging.hostHandler).toMatchObject({
+      file: 'fleet-runtime/inbox-handler.mjs',
+      handoff: 'write-0600-spool-before-exit-0',
+    })
+    expect(contract.messaging.hostHandler.failure).toContain('unread')
   })
 
   it('captures signed host lifecycle control semantics', () => {

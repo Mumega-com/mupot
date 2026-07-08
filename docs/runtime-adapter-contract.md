@@ -238,6 +238,15 @@ The route reads only the signed `agent_id`'s own inbox. It returns the same
 message shape as `GET /api/inbox`; `peek=true` is non-consuming, and
 `peek=false` consumes.
 
+Host runtimes should wire `fleet-daemon.mjs` `inbox.command` to
+`inbox-handler.mjs` or an equivalent handler that:
+
+- validates the daemon payload
+- persists each message durably before exit 0
+- invokes a per-agent runtime command only after persistence
+- exits non-zero when the runtime did not accept the batch, leaving messages
+  unread for the next daemon tick
+
 Rules:
 
 - Sender identity is the authenticated token weld, `auth.boundAgentId`.

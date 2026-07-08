@@ -128,7 +128,8 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
    control requests exist; host control daemon now verifies requests and runs
    `flight.mjs open|close`, host install remains).
 3. Coordinates via the reflected bus — ⛏ partial (`agent_messages` inbox and signed
-   daemon read are built; runtime hook rollout still needs host/operator wiring).
+   daemon read are built; `inbox-handler.mjs` provides durable host handoff;
+   runtime hook rollout still needs host/operator wiring).
 4. Runtime binding reports presence + swappable — ⛏ partial (fleet daemon code now
    heartbeats, drains signed inbox, and signed-detaches on shutdown; host install remains).
 5. SOS retired — ⬜ not yet.
@@ -147,7 +148,8 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
 **Phase 3 — coordinate through mupot (not SOS)**
 5. Runtime loops consume the mupot inbox (send/inbox/wake/ack) instead of the SOS bus.
    The pot now exposes `/api/inbox/signed` so the fleet daemon can deliver inbox
-   batches without storing a bearer token; host hook rollout remains the cutover work.
+   batches without storing a bearer token; `fleet-runtime/inbox-handler.mjs`
+   persists batches before consume, and host hook rollout remains the cutover work.
 6. Reflect any missing primitives (wake/request/ack) on the durable substrate (Queues+DO+D1).
 7. Repoint squad wake-hooks / bus identity SOS → mupot.
 
