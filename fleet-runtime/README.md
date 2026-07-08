@@ -35,6 +35,7 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `control-request.mjs` | host verifier for `fleet-control.v1` requests |
 | `control.example.json` | control-daemon config template |
 | `fleet-control-daemon.service` | systemd user unit for host lifecycle control |
+| `host-receipt.mjs` | non-destructive local verifier that emits a redacted host-install receipt |
 
 ## Quickstart (per agent)
 
@@ -194,6 +195,36 @@ The **remote trigger** — mupot `POST /api/fleet/control {agent_id, verb:start}
 control-request → host control-daemon → runs the flight — is the ATC layer (fleet-control
 `daemon.py`/`engine.py`); it needs the consumer agent minted + the control-daemon installed
 (owner-gated). Until then, flights run locally via `flight.mjs`.
+
+## Host install receipt
+
+After installing `fleet-daemon`, `inbox-handler`, and `fleet-control-daemon`, run a
+non-destructive receipt before asking Mupot to consume live work:
+
+```bash
+node ~/.fleet/runtime/host-receipt.mjs \
+  --daemon ~/.fleet/daemon.json \
+  --inbox ~/.fleet/inbox-handler.json \
+  --control ~/.fleet/control.json
+```
+
+or from a checkout:
+
+```bash
+npm run receipt:host
+```
+
+The receipt validates:
+
+- daemon, inbox-handler, and control-daemon config shapes
+- real `base_url` and `tenant` values instead of copied placeholders
+- agent private key files exist with `0600`-style permissions
+- daemon inbox-enabled agents have matching handler config
+- panel public key, flights config, and flight script paths exist for remote control
+
+It prints JSON with `receipt_type: "mupot-fleet-host-receipt/v1"`. A `status:"pass"`
+receipt proves host wiring is ready for live attach/inbox/control smoke tests. Add
+`--exec-probes` only when you want the receipt to run the configured liveness probes.
 
 ## Notes
 - `interval_sec` is clamped to `[15,120]` and must stay under the pot's presence TTL (default 180s).
