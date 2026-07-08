@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildBundle, checkBundleManifest, parseArgs, safeName } from './receipt-bundle.mjs'
+import { buildBundle, checkBundleManifest, inspectBundleStatus, parseArgs, safeName } from './receipt-bundle.mjs'
 
 const POT_URL = 'https://pot.example.org'
 const POT_TENANT = 'tenant-a'
@@ -383,6 +383,58 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
   ))
 })
 
+test('status reports a complete host-go bundle as pass', async () => {
+  const outDir = tmpDir()
+  const installPath = writeJson(join(tmpDir(), 'install.json'), installReceipt())
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+  await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    installReceiptPath: installPath,
+    verifyOnly: true,
+  })
+
+  const status = inspectBundleStatus({ outDir })
+
+  assert.equal(status.receipt_type, 'mupot-fleet-receipt-bundle-status/v1')
+  assert.equal(status.status, 'pass')
+  assert.deepEqual(status.inputs.agents, ['agent-one'])
+  assert.equal(status.manifest_check.status, 'pass')
+  assert.equal(status.artifacts.install.receipt_type, 'mupot-fleet-install-receipt/v1')
+  assert.equal(status.artifacts.cutover_gate.status, 'pass')
+  assert.ok(status.checks.some((c) => c.check === 'manifest_check_pass' && c.ok === true))
+  assert.ok(status.next_steps.some((s) => s.includes('SOS removal is permitted only for the proven agent')))
+})
+
+test('status reports missing host-go evidence and next steps for a partial bundle', () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+
+  const status = inspectBundleStatus({ outDir, agents: ['agent-one'] })
+
+  assert.equal(status.status, 'fail')
+  assert.ok(status.checks.some((c) => c.check === 'host_receipt_pass' && c.ok === true))
+  assert.ok(status.checks.some((c) => c.check === 'install_receipt_present' && c.ok === false))
+  assert.ok(status.checks.some((c) => c.check === 'probe_receipt_pass_present' && c.ok === false))
+  assert.ok(status.checks.some((c) =>
+    c.check === 'runtime_receipt_pass_for_agent' &&
+    c.agent_id === 'agent-one' &&
+    c.ok === false
+  ))
+  assert.ok(status.checks.some((c) => c.check === 'manifest_check_pass' && c.ok === false))
+  assert.ok(status.next_steps.some((s) => s.includes('save installer output')))
+  assert.ok(status.next_steps.some((s) => s.includes('queue inbox and lifecycle inputs')))
+  assert.ok(status.next_steps.some((s) => s.includes('runtime-agent-one.json')))
+  assert.ok(status.next_steps.some((s) => s.includes('do not remove SOS wiring yet')))
+})
+
 test('manifest check fails when next_steps contradict readiness', async () => {
   const outDir = tmpDir()
   writeJson(join(outDir, 'probe-start.json'), probeReceipt())
@@ -708,4 +760,12 @@ test('parseArgs accepts read-only manifest check options', () => {
   assert.equal(opts.checkManifest, true)
   assert.ok(opts.outDir.endsWith('/receipts'))
   assert.ok(opts.manifestPath.endsWith('/manifest.json'))
+})
+
+test('parseArgs accepts read-only host-go status', () => {
+  const opts = parseArgs(['--out-dir', './receipts', '--agent', 'agent-one', '--status'])
+
+  assert.equal(opts.status, true)
+  assert.ok(opts.outDir.endsWith('/receipts'))
+  assert.deepEqual(opts.agents, ['agent-one'])
 })

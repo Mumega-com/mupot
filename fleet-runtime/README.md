@@ -453,6 +453,28 @@ node ~/.fleet/runtime/receipt-bundle.mjs \
   --verify-only
 ```
 
+At any point while collecting evidence, inspect the current host-go state
+without polling the host or rewriting files:
+
+```bash
+node ~/.fleet/runtime/receipt-bundle.mjs \
+  --agent my-agent \
+  --out-dir ~/.fleet/receipts/my-agent \
+  --status
+```
+
+or from a checkout:
+
+```bash
+npm run receipt:bundle:status -- --agent my-agent --out-dir ./receipts/my-agent
+```
+
+It prints `receipt_type: "mupot-fleet-receipt-bundle-status/v1"` and checks
+the issue #274 evidence contract: install receipt, host receipt, queued probe
+receipts, runtime receipt, control receipts, `cutover-gate.json`, `manifest.json`,
+and copied-bundle manifest verification when present. It exits non-zero until
+the evidence is ready, and its `next_steps` are the next host action to run.
+
 To verify a copied bundle without rewriting anything, run the manifest check. It
 reads `manifest.json`, checks the recorded receipt artifact SHA-256 hashes, reads
 each saved receipt JSON, verifies receipt type/status against the manifest,

@@ -100,6 +100,7 @@ function parseArgs(argv) {
       opts.skipControl = true
     }
     else if (arg === '--exec-probes') opts.execProbes = true
+    else if (arg === '--status') opts.status = true
     else if (arg === '--check-manifest') opts.checkManifest = true
     else if (arg === '--force') opts.force = true
     else if (arg === '--help' || arg === '-h') opts.help = true
@@ -126,6 +127,7 @@ function usage() {
     '  --skip-runtime                reuse existing runtime-*.json receipts from the bundle directory',
     '  --skip-control                do not run a live control poll; reuse existing control-*.json',
     '  --verify-only                 read-only recheck; reuse host/runtime/control receipts',
+    '  --status                      read-only host-go evidence status for an in-progress bundle',
     '  --check-manifest              read-only hash/status check; writes nothing',
     '  --require-control-verb <verb> default: start,stop; values: start, stop, restart',
     '  --exec-probes                 pass through to host-receipt.mjs',
@@ -780,6 +782,181 @@ function checkBundleManifest(opts = {}) {
   }
 }
 
+function firstMeta(path) {
+  return existsSync(path) ? receiptMeta(path) : null
+}
+
+function statusCheck(checks, check, ok, extra = {}) {
+  checks.push({ ok, component: 'receipt-bundle-status', check, ...extra })
+}
+
+function inferStatusAgents(opts, manifest, artifacts) {
+  if ((opts.agents ?? []).length > 0) return sortStrings(opts.agents)
+  const manifestIds = manifestAgents(manifest)
+  if (manifestIds.length > 0) return sortStrings(manifestIds)
+
+  const ids = []
+  for (const meta of artifacts.runtimes ?? []) {
+    const receipt = readReceipt(meta.path)
+    for (const agent of receiptTargetAgents('runtime:status', receipt)) ids.push(agent)
+  }
+  for (const meta of artifacts.probes ?? []) {
+    const receipt = readReceipt(meta.path)
+    for (const agent of receiptTargetAgents('probe:status', receipt)) ids.push(agent)
+  }
+  return sortStrings(ids)
+}
+
+function hasPassingRuntimeMeta(artifacts, agentId) {
+  const expected = `runtime-${safeName(agentId)}.json`
+  return (artifacts.runtimes ?? []).some((meta) =>
+    meta?.receipt_type === EXPECTED.runtime &&
+    meta?.status === 'pass' &&
+    typeof meta.path === 'string' &&
+    basename(meta.path) === expected
+  )
+}
+
+function passingMetaCount(items, expectedType) {
+  return (items ?? []).filter((meta) => meta?.receipt_type === expectedType && meta?.status === 'pass').length
+}
+
+function addHostGoStatusNextSteps(steps, { outDir, artifacts, agents, gateReceipt, manifestCheck }) {
+  const add = (text) => {
+    if (!steps.includes(text)) steps.push(text)
+  }
+  if (!outDir) {
+    add('rerun receipt-bundle --status with --out-dir <bundle>')
+    return steps
+  }
+  if (!existsSync(outDir)) {
+    add(`create the bundle with receipt-bundle.mjs --agent <agent_id> --out-dir ${outDir}`)
+    return steps
+  }
+  if (artifacts.install?.receipt_type !== EXPECTED.install || !(artifacts.install.status === 'pass' || artifacts.install.status === 'warn')) {
+    add(`save installer output as ${join(outDir, 'install.json')}`)
+  }
+  if (artifacts.host?.receipt_type !== EXPECTED.host || artifacts.host.status !== 'pass') {
+    add('run receipt-bundle without --skip-host after editing host configs and placing keys')
+  }
+  if (passingMetaCount(artifacts.probes, EXPECTED.probe) === 0) {
+    add('queue inbox and lifecycle inputs with cutover-probe.mjs, save probe-*.json, then rerun receipt-bundle with --probe-receipt')
+  }
+  for (const agentId of agents) {
+    if (!hasPassingRuntimeMeta(artifacts, agentId)) {
+      add(`run receipt-bundle --skip-host --agent ${agentId} after a queued inbox probe until runtime-${safeName(agentId)}.json is status pass`)
+    }
+  }
+  if (passingMetaCount(artifacts.controls, EXPECTED.control) === 0) {
+    add('queue start and stop lifecycle controls with cutover-probe.mjs, then collect control receipts with --control-label start/stop')
+  }
+  if (artifacts.cutover_gate?.receipt_type !== EXPECTED.cutover_gate || gateReceipt?.status !== 'pass') {
+    add('run receipt-bundle --verify-only after host/runtime/control receipts are present so cutover-gate.json is rebuilt')
+  }
+  if (artifacts.manifest?.receipt_type !== 'mupot-fleet-receipt-bundle/v1' || artifacts.manifest?.status !== 'pass') {
+    add('run receipt-bundle --verify-only so manifest.json records the final evidence state')
+  }
+  if (artifacts.manifest?.status === 'pass' && manifestCheck?.status !== 'pass') {
+    add('run receipt-bundle.mjs --check-manifest --out-dir <bundle> and fix any copied-bundle drift')
+  }
+  return steps
+}
+
+function inspectBundleStatus(opts = {}) {
+  const checks = []
+  const outDir = opts.outDir ? pathArg(opts.outDir) : ''
+  statusCheck(checks, 'out_dir_selected', Boolean(outDir), { out_dir: outDir || null })
+  statusCheck(checks, 'out_dir_exists', Boolean(outDir && existsSync(outDir)), { out_dir: outDir || null })
+
+  const manifestPath = outDir ? join(outDir, 'manifest.json') : ''
+  const manifest = manifestPath && existsSync(manifestPath) ? readReceipt(manifestPath) : null
+  const artifacts = {
+    out_dir: outDir || null,
+    install: outDir ? firstMeta(join(outDir, 'install.json')) : null,
+    probes: outDir ? listReceiptFiles(outDir, 'probe-').map(receiptMeta) : [],
+    host: outDir ? firstMeta(join(outDir, 'host.json')) : null,
+    runtimes: outDir ? listReceiptFiles(outDir, 'runtime-').map(receiptMeta) : [],
+    controls: outDir ? listReceiptFiles(outDir, 'control-').map(receiptMeta) : [],
+    cutover_gate: outDir ? firstMeta(join(outDir, 'cutover-gate.json')) : null,
+    manifest: outDir ? firstMeta(manifestPath) : null,
+  }
+  const agents = inferStatusAgents(opts, manifest, artifacts)
+  const gateReceipt = outDir ? readReceipt(join(outDir, 'cutover-gate.json')) : null
+  const manifestCheck = manifest ? checkBundleManifest({ manifestPath }) : null
+
+  statusCheck(checks, 'selected_agents_recorded', agents.length > 0, { agents })
+  statusCheck(checks, 'install_receipt_present', artifacts.install?.receipt_type === EXPECTED.install, {
+    path: artifacts.install?.path ?? join(outDir || '<out-dir>', 'install.json'),
+    actual: artifacts.install?.receipt_type ?? null,
+  })
+  statusCheck(checks, 'install_receipt_non_fail', artifacts.install?.status === 'pass' || artifacts.install?.status === 'warn', {
+    actual: artifacts.install?.status ?? null,
+    accepted: ['pass', 'warn'],
+  })
+  statusCheck(checks, 'host_receipt_pass', artifacts.host?.receipt_type === EXPECTED.host && artifacts.host?.status === 'pass', {
+    path: artifacts.host?.path ?? join(outDir || '<out-dir>', 'host.json'),
+    receipt_type: artifacts.host?.receipt_type ?? null,
+    status: artifacts.host?.status ?? null,
+  })
+  statusCheck(checks, 'probe_receipt_pass_present', passingMetaCount(artifacts.probes, EXPECTED.probe) > 0, {
+    count: artifacts.probes.length,
+    passing: passingMetaCount(artifacts.probes, EXPECTED.probe),
+  })
+  for (const agentId of agents) {
+    statusCheck(checks, 'runtime_receipt_pass_for_agent', hasPassingRuntimeMeta(artifacts, agentId), {
+      agent_id: agentId,
+      expected_file: `runtime-${safeName(agentId)}.json`,
+    })
+  }
+  statusCheck(checks, 'control_receipt_pass_present', passingMetaCount(artifacts.controls, EXPECTED.control) > 0, {
+    count: artifacts.controls.length,
+    passing: passingMetaCount(artifacts.controls, EXPECTED.control),
+  })
+  statusCheck(checks, 'cutover_gate_pass', artifacts.cutover_gate?.receipt_type === EXPECTED.cutover_gate && gateReceipt?.status === 'pass', {
+    path: artifacts.cutover_gate?.path ?? join(outDir || '<out-dir>', 'cutover-gate.json'),
+    receipt_type: artifacts.cutover_gate?.receipt_type ?? null,
+    status: gateReceipt?.status ?? null,
+  })
+  statusCheck(checks, 'manifest_pass', artifacts.manifest?.receipt_type === 'mupot-fleet-receipt-bundle/v1' && artifacts.manifest?.status === 'pass', {
+    path: artifacts.manifest?.path ?? join(outDir || '<out-dir>', 'manifest.json'),
+    receipt_type: artifacts.manifest?.receipt_type ?? null,
+    status: artifacts.manifest?.status ?? null,
+  })
+  statusCheck(checks, 'manifest_check_pass', manifestCheck?.status === 'pass', {
+    path: manifestPath || null,
+    status: manifestCheck?.status ?? null,
+  })
+
+  const summary = summarize(checks)
+  const next = buildNextSteps({
+    artifacts,
+    agents,
+    gateReceipt,
+    outDir: outDir || '<out-dir>',
+    bundleStatus: summary.status,
+  })
+  addHostGoStatusNextSteps(next, { outDir, artifacts, agents, gateReceipt, manifestCheck })
+
+  return {
+    receipt_type: 'mupot-fleet-receipt-bundle-status/v1',
+    generated_at: new Date().toISOString(),
+    status: summary.status,
+    summary,
+    inputs: {
+      out_dir: outDir || null,
+      agents,
+    },
+    artifacts,
+    manifest_check: manifestCheck ? {
+      status: manifestCheck.status,
+      summary: manifestCheck.summary,
+      manifest: manifestCheck.manifest,
+    } : null,
+    next_steps: next,
+    checks,
+  }
+}
+
 function addReceiptStatusCheck(checks, label, path, receipt, expectedType) {
   checks.push({
     ok: receipt?.receipt_type === expectedType,
@@ -1216,6 +1393,11 @@ async function main() {
     console.log(JSON.stringify(receipt, null, 2))
     process.exit(receipt.status === 'fail' ? 1 : 0)
   }
+  if (opts.status) {
+    const receipt = inspectBundleStatus(opts)
+    console.log(JSON.stringify(receipt, null, 2))
+    process.exit(receipt.status === 'fail' ? 1 : 0)
+  }
   const bundle = await buildBundle(opts)
   console.log(JSON.stringify(bundle, null, 2))
   process.exit(bundle.status === 'fail' ? 1 : 0)
@@ -1225,4 +1407,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   await main()
 }
 
-export { buildBundle, checkBundleManifest, defaultStamp, parseArgs, safeName, summarize }
+export { buildBundle, checkBundleManifest, defaultStamp, inspectBundleStatus, parseArgs, safeName, summarize }
