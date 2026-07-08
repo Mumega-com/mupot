@@ -30,7 +30,7 @@ The harness uses `/auth/dev-login`, which is enabled only when
 `LOCAL_TEST_AUTH=1` in `wrangler-local-test.toml`. It verifies:
 
 - local owner login and unauthenticated dashboard redirect behavior
-- the authenticated dashboard route crawl
+- the authenticated dashboard route crawl, including the `/ops` health console
 - `/send` validation, task creation, `done_when`, lifecycle completion, and
   visible result rendering
 - `/approvals` rejection validation and real verdict approval
@@ -41,6 +41,7 @@ Artifacts:
 
 - `tmp/local-smoke/home.png`
 - `tmp/local-smoke/fleet.png`
+- `tmp/local-smoke/ops-health.png`
 - `tmp/local-smoke/send-workflow.png`
 - `tmp/local-smoke/approvals-workflow.png`
 - `tmp/local-smoke/hermes-dashboard-update.png`

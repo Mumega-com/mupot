@@ -30,6 +30,7 @@ const pages = [
   '/departments/growth',
   '/flights',
   '/fleet',
+  '/ops',
   '/coordination',
   '/agents',
   '/squads/sq-growth',
@@ -254,6 +255,8 @@ try {
   await page.screenshot({ path: path.join(artifactsDir, 'home.png'), fullPage: true })
   await page.goto(`${baseUrl}/fleet`, { waitUntil: 'networkidle' })
   await page.screenshot({ path: path.join(artifactsDir, 'fleet.png'), fullPage: true })
+  await page.goto(`${baseUrl}/ops`, { waitUntil: 'networkidle' })
+  await page.screenshot({ path: path.join(artifactsDir, 'ops-health.png'), fullPage: true })
 
   await runSendTaskWorkflow()
   await runApprovalWorkflow()
