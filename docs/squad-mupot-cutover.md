@@ -303,8 +303,15 @@ and exiting `0` so the daemon consumes the batch.
    fine intermediate state — the hooks are the LAST thing to move.
    - Host install: run `npm run fleet:install` from a checkout, or
      `node fleet-runtime/install.mjs`, to lay down `~/.fleet/runtime`, editable
-     config templates, receipt directories, and systemd user units. The
-     installer emits `mupot-fleet-install-receipt/v1`; `status:"warn"` is
+     config templates, receipt directories, and systemd user units. For evidence
+     capture, save the installer JSON:
+
+     ```bash
+     mkdir -p ~/.fleet/receipts
+     node fleet-runtime/install.mjs > ~/.fleet/receipts/install.json
+     ```
+
+     The installer emits `mupot-fleet-install-receipt/v1`; `status:"warn"` is
      expected until the templates are edited.
    - Pre-flight receipt: after editing configs and placing keys, run `node ~/.fleet/runtime/host-receipt.mjs --daemon ~/.fleet/daemon.json --inbox ~/.fleet/inbox-handler.json --control ~/.fleet/control.json` on the host. A `mupot-fleet-host-receipt/v1` `status:"pass"` proves local daemon/control/handler config, key files, and handler coverage are ready for live smoke.
    - Live runtime receipt: after the target runtime is up and at least one Mupot
@@ -321,12 +328,13 @@ and exiting `0` so the daemon consumes the batch.
      A `mupot-sos-cutover-gate/v1` `status:"pass"` is the receipt that permits
      removing that agent's SOS bus/wake path.
    - Preferred evidence pack: run `node ~/.fleet/runtime/receipt-bundle.mjs
-     --agent <agent_id> --out-dir ~/.fleet/receipts/<agent_id> --skip-runtime
-     --skip-control` first for host evidence only. Then queue an inbox probe and
-     `start` control request with `cutover-probe.mjs`, rerun the bundle with
-     `--skip-host --control-label start`, queue `stop`, and rerun with
-     `--skip-host --skip-runtime --control-label stop`. The bundle writes
-     `host.json`, `runtime-<agent_id>.json`, `control-*.json`,
+     --agent <agent_id> --out-dir ~/.fleet/receipts/<agent_id>
+     --install-receipt ~/.fleet/receipts/install.json --skip-runtime
+     --skip-control` first for install + host evidence. Then queue an inbox
+     probe and `start` control request with `cutover-probe.mjs`, rerun the
+     bundle with `--skip-host --control-label start`, queue `stop`, and rerun
+     with `--skip-host --skip-runtime --control-label stop`. The bundle writes
+     `install.json`, `host.json`, `runtime-<agent_id>.json`, `control-*.json`,
      `cutover-gate.json`, and `manifest.json`; the cutover is ready only when
      both `manifest.json` and `cutover-gate.json` report `status:"pass"`.
 
@@ -349,7 +357,7 @@ and exiting `0` so the daemon consumes the batch.
 | control live | `control-receipt.mjs` emits `mupot-fleet-control-receipt/v1` with `status:"pass"` |
 | probe queue | `cutover-probe.mjs` emits `mupot-fleet-cutover-probe/v1` after queuing inbox/control evidence inputs |
 | SOS cutover gate | `cutover-receipt.mjs` emits `mupot-sos-cutover-gate/v1` with `status:"pass"` for that agent |
-| receipt bundle | `receipt-bundle.mjs` writes `mupot-fleet-receipt-bundle/v1` `manifest.json` plus `cutover-gate.json`, both `status:"pass"` |
+| receipt bundle | `receipt-bundle.mjs` writes optional `install.json`, `mupot-fleet-receipt-bundle/v1` `manifest.json`, and `cutover-gate.json`; `manifest.json` and `cutover-gate.json` must both report `status:"pass"` |
 | wake-hook (post-route) | watcher launches a session from a mupot `inbox` poll, logged in `watcher.log` |
 
 ---

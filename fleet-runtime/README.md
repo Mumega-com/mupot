@@ -83,6 +83,14 @@ install usually returns `status:"warn"` because `~/.fleet/*.json` was created
 from templates and must be edited. It preserves existing config files unless
 you pass `--force-config`, so rerunning it is safe for script/unit updates.
 
+To keep the install receipt with the later cutover evidence, save it as JSON
+before running the bundle:
+
+```bash
+mkdir -p ~/.fleet/receipts
+node fleet-runtime/install.mjs > ~/.fleet/receipts/install.json
+```
+
 Edit these generated files before enabling services:
 
 - `~/.fleet/daemon.json`
@@ -369,6 +377,7 @@ that directory, and writes `manifest.json`:
 node ~/.fleet/runtime/receipt-bundle.mjs \
   --agent my-agent \
   --out-dir ~/.fleet/receipts/my-agent \
+  --install-receipt ~/.fleet/receipts/install.json \
   --skip-runtime \
   --skip-control
 ```
@@ -379,13 +388,17 @@ or from a checkout:
 npm run receipt:bundle -- \
   --agent my-agent \
   --out-dir ./receipts/my-agent \
+  --install-receipt ./receipts/install.json \
   --skip-runtime \
   --skip-control
 ```
 
 The first run proves host wiring and writes a failing final gate until live
-runtime and lifecycle evidence exist. Queue the live inbox probe and `start`
-control request without putting tokens on the command line:
+runtime and lifecycle evidence exist. If `--install-receipt` is supplied, the
+bundle copies it into `install.json` and accepts installer `status:"warn"` as
+non-failing because the later host pre-flight receipt proves edited config and
+key readiness. Queue the live inbox probe and `start` control request without
+putting tokens on the command line:
 
 ```bash
 MUPOT_AGENT_TOKEN='<welded-sender-token>' \

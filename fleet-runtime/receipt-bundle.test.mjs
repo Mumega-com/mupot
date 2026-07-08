@@ -15,6 +15,18 @@ function writeJson(path, value) {
   return path
 }
 
+function installReceipt(status = 'warn') {
+  return {
+    receipt_type: 'mupot-fleet-install-receipt/v1',
+    generated_at: '2026-07-08T00:00:00.000Z',
+    status,
+    summary: { status, passed: 1, failed: 0, warnings: status === 'warn' ? 1 : 0 },
+    checks: [
+      { ok: status === 'warn' ? null : true, component: 'fleet-install', check: 'config_needs_edit' },
+    ],
+  }
+}
+
 function hostReceipt(status = 'pass') {
   return {
     receipt_type: 'mupot-fleet-host-receipt/v1',
@@ -54,12 +66,14 @@ function controlReceipt(agentId, verb, status = 'pass') {
 
 test('receipt bundle writes host, runtime, control, cutover gate, and manifest', async () => {
   const outDir = tmpDir()
+  const installPath = writeJson(join(tmpDir(), 'install.json'), installReceipt())
   const bundle = await buildBundle({
     outDir,
     agents: ['agent-one'],
     daemonPath: '/tmp/daemon.json',
     inboxPath: '/tmp/inbox.json',
     controlPath: '/tmp/control.json',
+    installReceiptPath: installPath,
     controlLabel: 'restart',
     hostBuilder: async () => hostReceipt(),
     runtimeBuilder: async (opts) => runtimeReceipt(opts.agents[0]),
@@ -69,7 +83,10 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
   assert.equal(bundle.receipt_type, 'mupot-fleet-receipt-bundle/v1')
   assert.equal(bundle.status, 'pass')
   assert.equal(bundle.summary.failed, 0)
+  assert.equal(bundle.artifacts.install.receipt_type, 'mupot-fleet-install-receipt/v1')
+  assert.equal(bundle.artifacts.install.status, 'warn')
   assert.equal(bundle.artifacts.cutover_gate.status, 'pass')
+  assert.ok(existsSync(join(outDir, 'install.json')))
   assert.ok(existsSync(join(outDir, 'host.json')))
   assert.ok(existsSync(join(outDir, 'runtime-agent-one.json')))
   assert.ok(existsSync(join(outDir, 'control-restart.json')))
@@ -78,6 +95,8 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
 
   const manifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
   assert.equal(manifest.status, 'pass')
+  assert.equal(manifest.artifacts.install.status, 'warn')
+  assert.ok(manifest.checks.some((c) => c.check === 'install_receipt_status_non_fail' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'cutover_gate_status_pass' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'manifest_written' && c.ok === true))
 })
@@ -134,6 +153,7 @@ test('parseArgs accepts bundle controls and safe filenames', () => {
     '--daemon', './daemon.json',
     '--inbox', './inbox.json',
     '--control', './control.json',
+    '--install-receipt', './install.json',
     '--control-label', 'start/pass',
     '--require-control-verb', 'restart',
     '--skip-host',
@@ -145,6 +165,7 @@ test('parseArgs accepts bundle controls and safe filenames', () => {
 
   assert.deepEqual(opts.agents, ['agent-one', 'agent-two'])
   assert.ok(opts.outDir.endsWith('/receipts'))
+  assert.ok(opts.installReceiptPath.endsWith('/install.json'))
   assert.equal(opts.controlLabel, 'start_pass')
   assert.deepEqual(opts.requiredControlVerbs, ['restart'])
   assert.equal(opts.skipHost, true)

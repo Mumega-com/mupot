@@ -15,6 +15,7 @@ import { buildReceipt as buildControlReceipt } from './control-receipt.mjs'
 import { buildReceipt as buildCutoverReceipt } from './cutover-receipt.mjs'
 
 const EXPECTED = {
+  install: 'mupot-fleet-install-receipt/v1',
   host: 'mupot-fleet-host-receipt/v1',
   runtime: 'mupot-fleet-runtime-receipt/v1',
   control: 'mupot-fleet-control-receipt/v1',
@@ -48,6 +49,7 @@ function parseArgs(argv) {
     daemonPath: join(homedir(), '.fleet', 'daemon.json'),
     inboxPath: join(homedir(), '.fleet', 'inbox-handler.json'),
     controlPath: join(homedir(), '.fleet', 'control.json'),
+    installReceiptPath: '',
     outDir: '',
     controlLabel: '',
     requiredControlVerbs: ['start', 'stop'],
@@ -68,6 +70,7 @@ function parseArgs(argv) {
     else if (arg === '--daemon') opts.daemonPath = pathArg(next())
     else if (arg === '--inbox') opts.inboxPath = pathArg(next())
     else if (arg === '--control') opts.controlPath = pathArg(next())
+    else if (arg === '--install-receipt') opts.installReceiptPath = pathArg(next())
     else if (arg === '--out-dir') opts.outDir = pathArg(next())
     else if (arg === '--control-label') opts.controlLabel = safeName(next())
     else if (arg === '--require-control-verb') {
@@ -97,6 +100,7 @@ function usage() {
     '  --daemon <path>               fleet-daemon config (default: ~/.fleet/daemon.json)',
     '  --inbox <path>                inbox-handler config (default: ~/.fleet/inbox-handler.json)',
     '  --control <path>              fleet-control-daemon config (default: ~/.fleet/control.json)',
+    '  --install-receipt <path>      optional install.mjs receipt to copy into install.json',
     '  --control-label <label>       filename label for this live control receipt, e.g. start or stop',
     '  --skip-host                   reuse existing host.json from the bundle directory',
     '  --skip-runtime                reuse existing runtime-*.json receipts from the bundle directory',
@@ -107,7 +111,7 @@ function usage() {
     '  -h, --help                    show this help',
     '',
     'Typical sequence:',
-    '  node ~/.fleet/runtime/receipt-bundle.mjs --agent my-agent --out-dir ~/.fleet/receipts/my-agent --skip-runtime --skip-control',
+    '  node ~/.fleet/runtime/receipt-bundle.mjs --agent my-agent --out-dir ~/.fleet/receipts/my-agent --install-receipt ~/.fleet/receipts/install.json --skip-runtime --skip-control',
     '  queue inbox + start with cutover-probe.mjs, then rerun with --skip-host --control-label start',
     '  queue stop with cutover-probe.mjs, then rerun with --skip-host --skip-runtime --control-label stop',
   ].join('\n')
@@ -183,6 +187,25 @@ function addReceiptStatusCheck(checks, label, path, receipt, expectedType) {
   })
 }
 
+function addInstallReceiptStatusChecks(checks, path, receipt) {
+  checks.push({
+    ok: receipt?.receipt_type === EXPECTED.install,
+    component: 'receipt-bundle',
+    check: 'install_receipt_type',
+    path,
+    expected: EXPECTED.install,
+    actual: receipt?.receipt_type ?? null,
+  })
+  checks.push({
+    ok: receipt?.status === 'pass' || receipt?.status === 'warn',
+    component: 'receipt-bundle',
+    check: 'install_receipt_status_non_fail',
+    path,
+    accepted: ['pass', 'warn'],
+    actual: receipt?.status ?? null,
+  })
+}
+
 async function runAndWrite(label, path, builder, builderOpts, opts, checks) {
   try {
     const receipt = await builder(builderOpts)
@@ -193,6 +216,36 @@ async function runAndWrite(label, path, builder, builderOpts, opts, checks) {
     checks.push({ ok: false, component: 'receipt-bundle', check: `${label}_receipt_build`, path, reason: String(err && err.message ? err.message : err) })
     return { path, receipt: null, wrote: false }
   }
+}
+
+function includeInstallReceipt(outDir, opts, checks) {
+  const dest = join(outDir, 'install.json')
+  const source = opts.installReceiptPath ? pathArg(opts.installReceiptPath) : ''
+  if (!source) {
+    if (!existsSync(dest)) return null
+    const receipt = readReceipt(dest)
+    checks.push({ ok: true, component: 'receipt-bundle', check: 'install_receipt_reused', path: dest })
+    addInstallReceiptStatusChecks(checks, dest, receipt)
+    return receiptMeta(dest)
+  }
+
+  const receipt = readReceipt(source)
+  if (!receipt) {
+    checks.push({ ok: false, component: 'receipt-bundle', check: 'install_receipt_read', path: source, reason: 'invalid_or_unreadable_json' })
+    return { path: dest, receipt_type: null, status: null }
+  }
+  checks.push({ ok: true, component: 'receipt-bundle', check: 'install_receipt_read', path: source })
+
+  if (resolve(source) === resolve(dest)) {
+    checks.push({ ok: true, component: 'receipt-bundle', check: 'install_receipt_reused', path: dest })
+    addInstallReceiptStatusChecks(checks, dest, receipt)
+    return receiptMeta(dest)
+  }
+
+  const wrote = writeJson(dest, receipt, opts, checks, 'install')
+  if (!wrote) return existsSync(dest) ? receiptMeta(dest) : { path: dest, receipt_type: null, status: null }
+  addInstallReceiptStatusChecks(checks, dest, receipt)
+  return receiptMeta(dest)
 }
 
 function listReceiptFiles(outDir, prefix) {
@@ -241,12 +294,15 @@ async function buildBundle(opts) {
 
   const artifacts = {
     out_dir: outDir,
+    install: null,
     host: null,
     runtimes: [],
     controls: [],
     cutover_gate: null,
     manifest: join(outDir, 'manifest.json'),
   }
+
+  artifacts.install = includeInstallReceipt(outDir, opts, checks)
 
   if (!opts.skipHost) {
     const path = join(outDir, 'host.json')
@@ -334,6 +390,7 @@ async function buildBundle(opts) {
       daemon_config: opts.daemonPath,
       inbox_handler_config: opts.inboxPath,
       control_config: opts.controlPath,
+      install_receipt: opts.installReceiptPath || null,
       control_label: opts.controlLabel || null,
       required_control_verbs: opts.requiredControlVerbs ?? ['start', 'stop'],
       exec_probes: Boolean(opts.execProbes),
