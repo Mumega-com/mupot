@@ -358,6 +358,15 @@ and exiting `0` so the daemon consumes the batch.
      Add `--status-summary` when a compact text checklist is easier to read
      during the live host session, or use
      `npm run receipt:bundle:status-summary -- --agent <agent_id> --out-dir ./receipts/<agent_id>`.
+     Before the live session, generate the concrete operator command plan with
+     `receipt-bundle.mjs --host-go-plan --agent <agent_id> --base-url
+     <pot_url> --out-dir ~/.fleet/receipts/<agent_id> --export-dir
+     ~/.fleet/receipts/<agent_id>-attach`, or from a checkout
+     `npm run receipt:bundle:plan -- --agent <agent_id> --base-url <pot_url>
+     --out-dir ./receipts/<agent_id> --export-dir ./receipts/<agent_id>-attach`.
+     The plan is read-only and prints installer, host receipt, probe, runtime,
+     control, final verify, export, and copied-bundle check commands with token
+     placeholders instead of secret values.
      `manifest.json` carries SHA-256 hashes for the saved receipt artifacts so
      copied evidence can be checked for drift; it excludes its own self-referential
      file hash. Export the clean attachable directory with

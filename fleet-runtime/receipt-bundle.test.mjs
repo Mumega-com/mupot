@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildBundle, checkBundleManifest, exportBundle, formatStatusSummary, inspectBundleStatus, parseArgs, safeName } from './receipt-bundle.mjs'
+import { buildBundle, checkBundleManifest, exportBundle, formatHostGoPlan, formatStatusSummary, inspectBundleStatus, parseArgs, safeName } from './receipt-bundle.mjs'
 
 const POT_URL = 'https://pot.example.org'
 const POT_TENANT = 'tenant-a'
@@ -1213,4 +1213,37 @@ test('parseArgs accepts read-only host-go status', () => {
   assert.equal(opts.statusSummary, true)
   assert.ok(opts.outDir.endsWith('/receipts'))
   assert.deepEqual(opts.agents, ['agent-one'])
+})
+
+test('parseArgs accepts host-go plan options', () => {
+  const opts = parseArgs(['--agent', 'agent-one', '--out-dir', './receipts/agent-one', '--export-dir', './receipts/agent-one-attach', '--base-url', 'https://pot.example.org', '--host-go-plan'])
+
+  assert.equal(opts.hostGoPlan, true)
+  assert.equal(opts.baseUrl, 'https://pot.example.org')
+  assert.ok(opts.outDir.endsWith('/receipts/agent-one'))
+  assert.ok(opts.exportDir.endsWith('/receipts/agent-one-attach'))
+  assert.deepEqual(opts.agents, ['agent-one'])
+})
+
+test('formatHostGoPlan prints the full #274 live-host command sequence without token values', () => {
+  const plan = formatHostGoPlan({
+    agents: ['agent-one'],
+    outDir: '~/.fleet/receipts/agent-one',
+    exportDir: '~/.fleet/receipts/agent-one-attach',
+    installReceiptPath: '~/.fleet/receipts/install.json',
+    baseUrl: 'https://pot.example.org',
+    requiredControlVerbs: ['start', 'stop'],
+  })
+
+  assert.ok(plan.includes('Mupot host-go plan (#274)'))
+  assert.ok(plan.includes('node fleet-runtime/install.mjs > ~/.fleet/receipts/install.json'))
+  assert.ok(plan.includes('node ~/.fleet/runtime/receipt-bundle.mjs --agent agent-one --out-dir ~/.fleet/receipts/agent-one --require-control-verb start,stop --install-receipt ~/.fleet/receipts/install.json --skip-runtime --skip-control'))
+  assert.ok(plan.includes("MUPOT_AGENT_TOKEN='<agent-token>' MUPOT_OWNER_TOKEN='<owner-token>' node ~/.fleet/runtime/cutover-probe.mjs --base-url https://pot.example.org --agent agent-one --queue-inbox --control start > ~/.fleet/receipts/agent-one/probe-start.json"))
+  assert.ok(plan.includes("MUPOT_OWNER_TOKEN='<owner-token>' node ~/.fleet/runtime/cutover-probe.mjs --base-url https://pot.example.org --agent agent-one --control stop > ~/.fleet/receipts/agent-one/probe-stop.json"))
+  assert.ok(plan.includes('--verify-only'))
+  assert.ok(plan.includes('--export-dir ~/.fleet/receipts/agent-one-attach --export'))
+  assert.ok(plan.includes('--out-dir ~/.fleet/receipts/agent-one-attach --check-manifest'))
+  assert.ok(plan.includes('export-receipt.json, and manifest-check.json all report status "pass"'))
+  assert.doesNotMatch(plan, /mupot_[A-Za-z0-9]/)
+  assert.doesNotMatch(plan, /Bearer\s+[A-Za-z0-9]/)
 })

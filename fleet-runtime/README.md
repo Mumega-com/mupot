@@ -494,6 +494,32 @@ its `next_steps` name the next host action to run, including missing
 host checklist; rerun the host receipt with the current runtime so copied
 evidence proves the panel key is public-only.
 
+Before the live session, generate a concrete #274 command plan from the selected
+agent, pot URL, working receipt directory, and attachable export directory:
+
+```bash
+npm run receipt:bundle:plan -- \
+  --agent my-agent \
+  --base-url https://YOUR-POT.example.com \
+  --out-dir ./receipts/my-agent \
+  --export-dir ./receipts/my-agent-attach
+```
+
+or on the host:
+
+```bash
+node ~/.fleet/runtime/receipt-bundle.mjs \
+  --host-go-plan \
+  --agent my-agent \
+  --base-url https://YOUR-POT.example.com \
+  --out-dir ~/.fleet/receipts/my-agent \
+  --export-dir ~/.fleet/receipts/my-agent-attach
+```
+
+The plan is read-only. It prints the installer, host receipt, probe, runtime,
+control, final verify, export, and copied-bundle check commands with
+`<agent-token>` and `<owner-token>` placeholders instead of secret values.
+
 To produce the clean attachable copy for #274, export from the working receipt
 directory into a fresh directory. The export command copies `manifest.json`, the
 receipt artifacts named in that manifest, and two sidecar receipts:

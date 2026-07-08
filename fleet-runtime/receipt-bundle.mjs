@@ -128,6 +128,8 @@ function parseArgs(argv) {
       opts.status = true
       opts.statusSummary = true
     }
+    else if (arg === '--host-go-plan') opts.hostGoPlan = true
+    else if (arg === '--base-url') opts.baseUrl = next()
     else if (arg === '--check-manifest') opts.checkManifest = true
     else if (arg === '--export') opts.export = true
     else if (arg === '--force') opts.force = true
@@ -158,6 +160,8 @@ function usage() {
     '  --verify-only                 read-only recheck; reuse host/runtime/control receipts',
     '  --status                      read-only host-go evidence status for an in-progress bundle',
     '  --status-summary              with --status, print a compact text checklist instead of JSON',
+    '  --host-go-plan                print the #274 live-host command plan; writes nothing',
+    '  --base-url <url>              pot URL used in --host-go-plan probe commands',
     '  --check-manifest              read-only hash/status check; writes nothing',
     '  --export                      copy manifest, artifacts, and export/check sidecars to --export-dir and check it',
     '  --require-control-verb <verb> default: start,stop; values: start, stop, restart',
@@ -171,7 +175,109 @@ function usage() {
     '  queue stop with cutover-probe.mjs > ~/.fleet/receipts/my-agent/probe-stop.json, then rerun with --probe-receipt ~/.fleet/receipts/my-agent/probe-stop.json --skip-host --skip-runtime --control-label stop',
     '  node ~/.fleet/runtime/receipt-bundle.mjs --out-dir ~/.fleet/receipts/my-agent --export-dir ~/.fleet/receipts/my-agent-attach --export',
     '  node ~/.fleet/runtime/receipt-bundle.mjs --out-dir ~/.fleet/receipts/my-agent --check-manifest',
+    '  npm run receipt:bundle:plan -- --agent my-agent --base-url https://mupot.example.com',
   ].join('\n')
+}
+
+function shellQuote(value) {
+  const raw = String(value)
+  if (/^[A-Za-z0-9_./:=@%+~,-]+$/.test(raw)) return raw
+  return `'${raw.replace(/'/g, `'\\''`)}'`
+}
+
+function commandLine(parts, suffix = '') {
+  return `${parts.map(shellQuote).join(' ')}${suffix}`
+}
+
+function envCommandLine(env, parts, suffix = '') {
+  const envPrefix = Object.entries(env)
+    .map(([key, value]) => `${key}=${shellQuote(value)}`)
+    .join(' ')
+  return `${envPrefix} ${commandLine(parts, suffix)}`
+}
+
+function requiredControlVerbArgs(requiredControlVerbs = []) {
+  return ['--require-control-verb', requiredControlVerbs.join(',')]
+}
+
+function hostGoPlanAgentOutDir(opts, agentId, multipleAgents) {
+  if (opts.outDir && !multipleAgents) return opts.outDir
+  if (opts.outDir && multipleAgents) return join(opts.outDir, safeName(agentId))
+  return `~/.fleet/receipts/${safeName(agentId)}`
+}
+
+function formatHostGoPlan(opts = {}) {
+  const agents = opts.agents?.length ? opts.agents : ['<agent_id>']
+  const requiredControlVerbs = opts.requiredControlVerbs?.length ? opts.requiredControlVerbs : ['start', 'stop']
+  const baseUrl = opts.baseUrl || process.env.MUPOT_BASE_URL || 'https://YOUR-POT.example.com'
+  const installReceipt = opts.installReceiptPath || '~/.fleet/receipts/install.json'
+  const multipleAgents = agents.length > 1
+  const lines = []
+
+  lines.push('Mupot host-go plan (#274)')
+  lines.push('')
+  lines.push('Manual prerequisites before running the live receipt steps:')
+  lines.push('- Edit ~/.fleet/daemon.json, ~/.fleet/inbox-handler.json, ~/.fleet/control.json, and ~/.fleet/flights.json for the real pot/tenant.')
+  lines.push('- Place agent private keys with 0600-style permissions and install the panel public key as public material only.')
+  lines.push('- Export MUPOT_AGENT_TOKEN for inbox probes and MUPOT_OWNER_TOKEN for lifecycle control probes; do not paste token values into receipt files.')
+  lines.push('')
+  lines.push('0. Install/update the runtime layout and save the installer receipt:')
+  lines.push(commandLine(['mkdir', '-p', '~/.fleet/receipts']))
+  lines.push(commandLine(['node', 'fleet-runtime/install.mjs'], ` > ${shellQuote(installReceipt)}`))
+  lines.push('')
+
+  for (const agentId of agents) {
+    const outDir = hostGoPlanAgentOutDir(opts, agentId, multipleAgents)
+    const exportDir = multipleAgents
+      ? `${outDir}-attach`
+      : opts.exportDir || `${outDir}-attach`
+    const agentArgs = ['--agent', agentId]
+    const commonReceiptArgs = ['node', '~/.fleet/runtime/receipt-bundle.mjs', ...agentArgs, '--out-dir', outDir, ...requiredControlVerbArgs(requiredControlVerbs)]
+
+    lines.push(`${multipleAgents ? `Agent ${agentId}` : 'Agent evidence'}:`)
+    lines.push('')
+    lines.push('1. Create the bundle directory and collect install + host evidence:')
+    lines.push(commandLine(['mkdir', '-p', outDir]))
+    lines.push(commandLine([...commonReceiptArgs, '--install-receipt', installReceipt, '--skip-runtime', '--skip-control']))
+    lines.push(commandLine(['node', '~/.fleet/runtime/receipt-bundle.mjs', ...agentArgs, '--out-dir', outDir, '--status', '--status-summary', ...requiredControlVerbArgs(requiredControlVerbs)]))
+    lines.push('')
+
+    requiredControlVerbs.forEach((verb, index) => {
+      const probePath = join(outDir, `probe-${safeName(verb)}.json`)
+      const queueArgs = ['node', '~/.fleet/runtime/cutover-probe.mjs', '--base-url', baseUrl, '--agent', agentId]
+      const env = index === 0
+        ? { MUPOT_AGENT_TOKEN: '<agent-token>', MUPOT_OWNER_TOKEN: '<owner-token>' }
+        : { MUPOT_OWNER_TOKEN: '<owner-token>' }
+      if (index === 0) queueArgs.push('--queue-inbox')
+      queueArgs.push('--control', verb)
+
+      lines.push(`${index + 2}. Queue ${index === 0 ? 'inbox + ' : ''}${verb} evidence and collect the receipt:`)
+      lines.push(envCommandLine(env, queueArgs, ` > ${shellQuote(probePath)}`))
+      lines.push(commandLine([
+        ...commonReceiptArgs,
+        '--probe-receipt',
+        probePath,
+        '--skip-host',
+        ...(index === 0 ? [] : ['--skip-runtime']),
+        '--control-label',
+        safeName(verb),
+      ]))
+      lines.push(commandLine(['node', '~/.fleet/runtime/receipt-bundle.mjs', ...agentArgs, '--out-dir', outDir, '--status', '--status-summary', ...requiredControlVerbArgs(requiredControlVerbs)]))
+      lines.push('')
+    })
+
+    lines.push(`${requiredControlVerbs.length + 2}. Rebuild the final gate and manifest from saved evidence:`)
+    lines.push(commandLine([...commonReceiptArgs, '--verify-only']))
+    lines.push('')
+    lines.push(`${requiredControlVerbs.length + 3}. Export the attachable bundle and check the copied evidence:`)
+    lines.push(commandLine(['node', '~/.fleet/runtime/receipt-bundle.mjs', '--out-dir', outDir, '--export-dir', exportDir, '--export']))
+    lines.push(commandLine(['node', '~/.fleet/runtime/receipt-bundle.mjs', '--out-dir', exportDir, '--check-manifest']))
+    lines.push('')
+    lines.push('Attach only the exported directory after manifest.json, cutover-gate.json, export-receipt.json, and manifest-check.json all report status "pass".')
+    lines.push('')
+  }
+
+  return `${lines.join('\n')}\n`
 }
 
 function summarize(checks) {
@@ -2327,6 +2433,10 @@ async function main() {
     console.log(usage())
     return
   }
+  if (opts.hostGoPlan) {
+    process.stdout.write(formatHostGoPlan(opts))
+    return
+  }
   if (opts.export || opts.exportDir) {
     const receipt = exportBundle(opts)
     console.log(JSON.stringify(receipt, null, 2))
@@ -2351,4 +2461,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   await main()
 }
 
-export { buildBundle, checkBundleManifest, defaultStamp, exportBundle, formatStatusSummary, inspectBundleStatus, parseArgs, safeName, summarize }
+export { buildBundle, checkBundleManifest, defaultStamp, exportBundle, formatHostGoPlan, formatStatusSummary, inspectBundleStatus, parseArgs, safeName, summarize }
