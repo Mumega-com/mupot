@@ -13,7 +13,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { buildReceipt as buildHostReceipt } from './host-receipt.mjs'
 import { buildReceipt as buildRuntimeReceipt } from './runtime-receipt.mjs'
 import { buildReceipt as buildControlReceipt } from './control-receipt.mjs'
-import { buildReceipt as buildCutoverReceipt } from './cutover-receipt.mjs'
+import { buildReceipt as buildCutoverReceipt, controlRuns } from './cutover-receipt.mjs'
 
 const EXPECTED = {
   install: 'mupot-fleet-install-receipt/v1',
@@ -821,7 +821,47 @@ function passingMetaCount(items, expectedType) {
   return (items ?? []).filter((meta) => meta?.receipt_type === expectedType && meta?.status === 'pass').length
 }
 
-function addHostGoStatusNextSteps(steps, { outDir, artifacts, agents, gateReceipt, manifestCheck }) {
+function requiredStatusControlVerbs(opts, manifest) {
+  return sortStrings(manifest ? manifestRequiredControlVerbs(manifest) : (opts.requiredControlVerbs ?? ['start', 'stop']))
+}
+
+function controlEvidenceFromArtifacts(artifacts) {
+  const receipts = []
+  for (const meta of artifacts.controls ?? []) {
+    if (meta?.receipt_type !== EXPECTED.control || meta?.status !== 'pass') continue
+    const receipt = readReceipt(meta.path)
+    if (receipt?.receipt_type === EXPECTED.control && receipt?.status === 'pass') receipts.push(receipt)
+  }
+  return controlRuns(receipts)
+}
+
+function controlRunSatisfiesRequiredVerb(run, requiredVerb) {
+  if (run?.agent_id == null || run?.verb == null) return false
+  if (requiredVerb === 'start') return run.verb === 'start' || run.verb === 'restart'
+  if (requiredVerb === 'stop') return run.verb === 'stop' || run.verb === 'restart'
+  return run.verb === requiredVerb
+}
+
+function controlEvidenceForAgent(controlEvidence, agentId) {
+  return (controlEvidence ?? []).filter((run) => run?.agent_id === agentId)
+}
+
+function matchedControlEvidence(controlEvidence, agentId, requiredVerb) {
+  return controlEvidenceForAgent(controlEvidence, agentId)
+    .find((run) => controlRunSatisfiesRequiredVerb(run, requiredVerb))
+}
+
+function missingControlEvidenceForAgents({ agents, requiredControlVerbs, controlEvidence }) {
+  const missing = []
+  for (const agentId of agents ?? []) {
+    for (const requiredVerb of requiredControlVerbs ?? []) {
+      if (!matchedControlEvidence(controlEvidence, agentId, requiredVerb)) missing.push(`${agentId}:${requiredVerb}`)
+    }
+  }
+  return sortStrings(missing)
+}
+
+function addHostGoStatusNextSteps(steps, { outDir, artifacts, agents, gateReceipt, manifestCheck, requiredControlVerbs, controlEvidence }) {
   const add = (text) => {
     if (!steps.includes(text)) steps.push(text)
   }
@@ -847,7 +887,10 @@ function addHostGoStatusNextSteps(steps, { outDir, artifacts, agents, gateReceip
       add(`run receipt-bundle --skip-host --agent ${agentId} after a queued inbox probe until runtime-${safeName(agentId)}.json is status pass`)
     }
   }
-  if (passingMetaCount(artifacts.controls, EXPECTED.control) === 0) {
+  const missingControls = missingControlEvidenceForAgents({ agents, requiredControlVerbs, controlEvidence })
+  if (missingControls.length > 0) {
+    add(`queue missing lifecycle control evidence (${missingControls.join(', ')}) with cutover-probe.mjs, then rerun receipt-bundle with --probe-receipt and --control-label`)
+  } else if (passingMetaCount(artifacts.controls, EXPECTED.control) === 0) {
     add('queue start and stop lifecycle controls with cutover-probe.mjs, then collect control receipts with --control-label start/stop')
   }
   if (artifacts.cutover_gate?.receipt_type !== EXPECTED.cutover_gate || gateReceipt?.status !== 'pass') {
@@ -883,6 +926,8 @@ function inspectBundleStatus(opts = {}) {
   const agents = inferStatusAgents(opts, manifest, artifacts)
   const gateReceipt = outDir ? readReceipt(join(outDir, 'cutover-gate.json')) : null
   const manifestCheck = manifest ? checkBundleManifest({ manifestPath }) : null
+  const requiredControlVerbs = requiredStatusControlVerbs(opts, manifest)
+  const controlEvidence = controlEvidenceFromArtifacts(artifacts)
 
   statusCheck(checks, 'selected_agents_recorded', agents.length > 0, { agents })
   statusCheck(checks, 'install_receipt_present', artifacts.install?.receipt_type === EXPECTED.install, {
@@ -912,6 +957,19 @@ function inspectBundleStatus(opts = {}) {
     count: artifacts.controls.length,
     passing: passingMetaCount(artifacts.controls, EXPECTED.control),
   })
+  for (const agentId of agents) {
+    const agentControlEvidence = controlEvidenceForAgent(controlEvidence, agentId)
+    for (const requiredVerb of requiredControlVerbs) {
+      const match = matchedControlEvidence(controlEvidence, agentId, requiredVerb)
+      statusCheck(checks, 'control_verb_for_agent', Boolean(match), {
+        agent_id: agentId,
+        required_verb: requiredVerb,
+        matched_verb: match?.verb ?? null,
+        matched_action: match?.action ?? null,
+        evidence_verbs: sortStrings(agentControlEvidence.map((run) => run.verb)),
+      })
+    }
+  }
   statusCheck(checks, 'cutover_gate_pass', artifacts.cutover_gate?.receipt_type === EXPECTED.cutover_gate && gateReceipt?.status === 'pass', {
     path: artifacts.cutover_gate?.path ?? join(outDir || '<out-dir>', 'cutover-gate.json'),
     receipt_type: artifacts.cutover_gate?.receipt_type ?? null,
@@ -934,8 +992,10 @@ function inspectBundleStatus(opts = {}) {
     gateReceipt,
     outDir: outDir || '<out-dir>',
     bundleStatus: summary.status,
+    requiredControlVerbs,
+    controlEvidence,
   })
-  addHostGoStatusNextSteps(next, { outDir, artifacts, agents, gateReceipt, manifestCheck })
+  addHostGoStatusNextSteps(next, { outDir, artifacts, agents, gateReceipt, manifestCheck, requiredControlVerbs, controlEvidence })
 
   return {
     receipt_type: 'mupot-fleet-receipt-bundle-status/v1',
@@ -945,6 +1005,7 @@ function inspectBundleStatus(opts = {}) {
     inputs: {
       out_dir: outDir || null,
       agents,
+      required_control_verbs: requiredControlVerbs,
     },
     artifacts,
     manifest_check: manifestCheck ? {
@@ -1148,7 +1209,7 @@ function missingControlVerbs(gateReceipt) {
   return [...new Set(missing)].sort()
 }
 
-function buildNextSteps({ artifacts, agents, gateReceipt, outDir, bundleStatus }) {
+function buildNextSteps({ artifacts, agents, gateReceipt, outDir, bundleStatus, requiredControlVerbs, controlEvidence }) {
   const steps = []
   const add = (text) => {
     if (!steps.includes(text)) steps.push(text)
@@ -1183,7 +1244,10 @@ function buildNextSteps({ artifacts, agents, gateReceipt, outDir, bundleStatus }
     }
   }
 
-  const missingControls = missingControlVerbs(gateReceipt)
+  const missingControls = sortStrings([
+    ...missingControlVerbs(gateReceipt),
+    ...missingControlEvidenceForAgents({ agents, requiredControlVerbs, controlEvidence }),
+  ])
   if (missingControls.length > 0) {
     add(`queue missing lifecycle control evidence (${missingControls.join(', ')}) with cutover-probe.mjs, then rerun receipt-bundle with --probe-receipt and --control-label`)
   } else if ((artifacts.controls ?? []).length === 0) {
@@ -1293,6 +1357,7 @@ async function buildBundle(opts) {
     const meta = receiptMeta(path)
     return { ...meta }
   })
+  const requiredControlVerbs = opts.requiredControlVerbs ?? ['start', 'stop']
 
   const targetEntries = bundleArtifactEntries({ artifacts })
   const targetReceiptRecords = []
@@ -1308,7 +1373,7 @@ async function buildBundle(opts) {
     hostPath: hostPaths[0] ?? '',
     runtimePaths,
     controlPaths,
-    requiredControlVerbs: opts.requiredControlVerbs ?? ['start', 'stop'],
+    requiredControlVerbs,
   })
   writeJson(gatePath, gateReceipt, { ...opts, force: true }, checks, 'cutover')
   checks.push({
@@ -1340,7 +1405,7 @@ async function buildBundle(opts) {
       install_receipt: opts.installReceiptPath || null,
       probe_receipts: opts.probeReceiptPaths ?? [],
       control_label: opts.controlLabel || null,
-      required_control_verbs: opts.requiredControlVerbs ?? ['start', 'stop'],
+      required_control_verbs: requiredControlVerbs,
       exec_probes: Boolean(opts.execProbes),
       verify_only: verifyOnly,
       skip_host: skipHost,
@@ -1366,6 +1431,8 @@ async function buildBundle(opts) {
     gateReceipt,
     outDir,
     bundleStatus: finalSummary.status,
+    requiredControlVerbs,
+    controlEvidence: controlEvidenceFromArtifacts(artifacts),
   })
   try {
     writeJsonUnchecked(artifacts.manifest, bundle, { ...opts, force: true })

@@ -471,9 +471,11 @@ npm run receipt:bundle:status -- --agent my-agent --out-dir ./receipts/my-agent
 
 It prints `receipt_type: "mupot-fleet-receipt-bundle-status/v1"` and checks
 the issue #274 evidence contract: install receipt, host receipt, queued probe
-receipts, runtime receipt, control receipts, `cutover-gate.json`, `manifest.json`,
-and copied-bundle manifest verification when present. It exits non-zero until
-the evidence is ready, and its `next_steps` are the next host action to run.
+receipts, runtime receipt, per-agent start/stop control evidence,
+`cutover-gate.json`, `manifest.json`, and copied-bundle manifest verification
+when present. It exits non-zero until the evidence is ready, and its `next_steps`
+name the next host action to run, including missing `agent:verb` lifecycle
+evidence before the final gate is rebuilt.
 
 To verify a copied bundle without rewriting anything, run the manifest check. It
 reads `manifest.json`, checks the recorded receipt artifact SHA-256 hashes, reads

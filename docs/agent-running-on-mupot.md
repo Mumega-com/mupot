@@ -174,7 +174,8 @@ Use `fleet-runtime/cutover-probe.mjs` to queue the inbox probe and Mupot
 Use `receipt-bundle.mjs --verify-only` to recheck saved evidence without polling
 the live host runtime before attaching the final cutover record.
 Use `receipt-bundle.mjs --status` during collection for a read-only host-go
-progress receipt that reports missing evidence and command-level next steps.
+progress receipt that reports missing evidence, including missing per-agent
+start/stop lifecycle verbs, and command-level next steps.
 The bundle manifest includes SHA-256 hashes for the saved receipt artifacts so
 the final cutover record can prove exactly which files were reviewed.
 Use `receipt-bundle.mjs --check-manifest` for a read-only drift check before
