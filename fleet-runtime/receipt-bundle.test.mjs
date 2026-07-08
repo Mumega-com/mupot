@@ -411,6 +411,16 @@ test('export writes a clean self-contained attachable bundle', async () => {
     readdirSync(exportDir).sort(),
     ['control-start.json', 'control-stop.json', 'cutover-gate.json', 'host.json', 'manifest.json', 'probe-start.json', 'runtime-agent-one.json'],
   )
+  const exportedManifestText = readFileSync(join(exportDir, 'manifest.json'), 'utf8')
+  const exportedManifest = JSON.parse(exportedManifestText)
+  assert.equal(exportedManifest.inputs.out_dir, '.')
+  assert.equal(exportedManifest.artifacts.out_dir, '.')
+  assert.equal(exportedManifest.artifacts.manifest, 'manifest.json')
+  assert.equal(exportedManifest.artifacts.host.path, 'host.json')
+  assert.equal(exportedManifest.artifacts.runtimes[0].path, 'runtime-agent-one.json')
+  assert.equal(exportedManifest.artifacts.controls[0].path, 'control-start.json')
+  assert.equal(exportedManifest.artifacts.host.receipt_type, 'mupot-fleet-host-receipt/v1')
+  assert.equal(exportedManifestText.includes(outDir), false)
   assert.equal(existsSync(join(exportDir, 'daemon.json')), false)
   assert.equal(checkBundleManifest({ outDir: exportDir }).status, 'pass')
   assert.equal(checkBundleManifest({ outDir }).status, 'fail')

@@ -992,6 +992,85 @@ function copyEvidenceFile(source, dest, opts, checks, label) {
   }
 }
 
+function localPathField(key) {
+  if (key === 'receipt_type' || String(key).endsWith('_type')) return false
+  return /(^|_)(path|dir|directory|config|receipt|receipts|source|manifest)(_|$)/i.test(String(key))
+}
+
+function portablePathValue(value, key) {
+  if (typeof value !== 'string') return value
+  if (key === 'out_dir' || key === 'directory' || key === 'source_dir' || key === 'export_dir') return value ? '.' : value
+  if (!localPathField(key)) return value
+  if (!value || value === '.' || value.startsWith('<')) return value
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)) return value
+  if (value.includes('/') || value.startsWith('~')) return basename(value)
+  return value
+}
+
+function portableManifestValue(value, key = '') {
+  if (Array.isArray(value)) return value.map((item) => portableManifestValue(item, key))
+  if (value && typeof value === 'object') {
+    const out = {}
+    for (const [childKey, childValue] of Object.entries(value)) {
+      out[childKey] = portableManifestValue(childValue, childKey)
+    }
+    return out
+  }
+  return portablePathValue(value, key)
+}
+
+function replaceStringValue(value, needle, replacement) {
+  if (Array.isArray(value)) return value.map((item) => replaceStringValue(item, needle, replacement))
+  if (value && typeof value === 'object') {
+    const out = {}
+    for (const [childKey, childValue] of Object.entries(value)) {
+      out[childKey] = replaceStringValue(childValue, needle, replacement)
+    }
+    return out
+  }
+  if (typeof value === 'string' && needle) return value.split(needle).join(replacement)
+  return value
+}
+
+function portableManifestForExport(manifest, sourceDir = '') {
+  let portable = portableManifestValue(manifest)
+  if (sourceDir) portable = replaceStringValue(portable, sourceDir, '.')
+  if (portable?.artifacts && typeof portable.artifacts === 'object') {
+    portable.artifacts.out_dir = '.'
+    portable.artifacts.manifest = 'manifest.json'
+  }
+  if (portable?.inputs && typeof portable.inputs === 'object') {
+    portable.inputs.out_dir = '.'
+  }
+  return portable
+}
+
+function writeExportManifest(sourceManifest, dest, opts, checks) {
+  const portable = portableManifestForExport(sourceManifest, opts.sourceDir)
+  try {
+    writeFileSync(dest, JSON.stringify(portable, null, 2) + '\n', { mode: 0o600, flag: opts.force ? 'w' : 'wx' })
+    checks.push({
+      ok: true,
+      component: 'receipt-bundle-export',
+      check: 'manifest_copied',
+      source: 'portable-manifest',
+      path: dest,
+      sha256: fileSha256(dest),
+    })
+    return true
+  } catch (err) {
+    checks.push({
+      ok: false,
+      component: 'receipt-bundle-export',
+      check: 'manifest_copied',
+      source: 'portable-manifest',
+      path: dest,
+      reason: String(err && err.message ? err.message : err),
+    })
+    return false
+  }
+}
+
 function exportBundle(opts = {}) {
   const checks = []
   const manifestPath = manifestPathForCheck(opts)
@@ -1034,7 +1113,7 @@ function exportBundle(opts = {}) {
 
   if (manifest && exportDir && sourceDir && resolve(sourceDir) !== resolve(exportDir)) {
     const manifestDest = join(exportDir, 'manifest.json')
-    if (copyEvidenceFile(manifestPath, manifestDest, opts, checks, 'manifest')) {
+    if (writeExportManifest(manifest, manifestDest, { ...opts, sourceDir }, checks)) {
       copied.push({ label: 'manifest', source: manifestPath, path: manifestDest, sha256: fileSha256(manifestDest) })
     }
 

@@ -184,7 +184,8 @@ Use `receipt-bundle.mjs --export --export-dir <attachable-dir>` after the
 manifest and cutover gate pass; it copies only the manifest and listed receipt
 artifacts into the attachable directory, emits
 `mupot-fleet-receipt-bundle-export/v1`, and runs the copied-bundle manifest
-check on that exported directory.
+check on that exported directory. The exported manifest uses local artifact
+filenames and `out_dir:"."`, leaving the working source manifest unchanged.
 The bundle manifest includes SHA-256 hashes for the saved receipt artifacts so
 the final cutover record can prove exactly which files were reviewed.
 Use `receipt-bundle.mjs --check-manifest` for a read-only drift check before

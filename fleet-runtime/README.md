@@ -480,7 +480,9 @@ evidence before the final gate is rebuilt.
 To produce the clean attachable copy for #274, export from the working receipt
 directory into a fresh directory. The export command copies only `manifest.json`
 and the receipt artifacts named in that manifest, then runs the same manifest
-check against the exported directory:
+check against the exported directory. The exported `manifest.json` is made
+portable: receipt artifact paths are local filenames and the exported `out_dir`
+is `.`; the working source manifest is not rewritten.
 
 ```bash
 node ~/.fleet/runtime/receipt-bundle.mjs \

@@ -361,7 +361,9 @@ and exiting `0` so the daemon consumes the batch.
      --export-dir ./receipts/<agent_id>-attach`. It emits
      `mupot-fleet-receipt-bundle-export/v1`, copies only `manifest.json` plus
      the receipt artifacts named in the manifest, then runs the same manifest
-     check against the exported directory. Run `receipt-bundle.mjs
+     check against the exported directory. The exported manifest uses local
+     artifact filenames and `out_dir:"."`, without rewriting the working source
+     manifest. Run `receipt-bundle.mjs
      --check-manifest --out-dir ~/.fleet/receipts/<agent_id>-attach` before
      attaching copied evidence; it emits `mupot-fleet-receipt-bundle-check/v1`,
      verifies artifact hashes plus receipt type/status metadata, recomputes
