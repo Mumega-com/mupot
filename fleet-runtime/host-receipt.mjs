@@ -103,8 +103,17 @@ function hasPlaceholder(v) {
     v.includes('YOUR_') ||
     v.includes('YOUR-POT') ||
     v.includes('YOUR-TENANT') ||
-    v.includes('example.com')
+    hasReservedExampleHost(v)
   )
+}
+
+function hasReservedExampleHost(v) {
+  try {
+    const hostname = new URL(v).hostname.toLowerCase()
+    return hostname === 'example.com' || hostname.endsWith('.example.com')
+  } catch {
+    return false
+  }
 }
 
 function checkConfigIdentity(kind, cfg) {

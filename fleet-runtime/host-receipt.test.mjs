@@ -143,7 +143,10 @@ test('host receipt fails placeholder base_url and tenant values', async () => {
 
 test('summary and placeholder helpers keep receipt status deterministic', () => {
   assert.equal(hasPlaceholder('https://YOUR-POT.example.com'), true)
+  assert.equal(hasPlaceholder('https://sub.example.com/runtime'), true)
   assert.equal(hasPlaceholder('https://pot.example.org'), false)
+  assert.equal(hasPlaceholder('https://example.com.evil.invalid'), false)
+  assert.equal(hasPlaceholder('https://notexample.com/runtime'), false)
   assert.deepEqual(summarize([{ ok: true }, { ok: null }]), { status: 'warn', passed: 1, failed: 0, warnings: 1 })
   assert.deepEqual(summarize([{ ok: true }, { ok: false }]), { status: 'fail', passed: 1, failed: 1, warnings: 0 })
 })
