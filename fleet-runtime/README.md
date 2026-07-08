@@ -26,6 +26,7 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `register-agent-key.sh` | register the **public** key in the pot (`agent_keys`) via wrangler |
 | `attach-signed.mjs` | one-shot signed attach (CLI) |
 | `fleet-sign.mjs` | shared signer core (no tenant default) |
+| `install.mjs` | non-destructive host installer for runtime scripts, templates, and systemd units |
 | `fleet-daemon.mjs` | presence heartbeat loop, optional signed inbox drain, signed shutdown detach |
 | `daemon.example.json` | config template (set base_url, tenant, agents, probes) |
 | `fleet-daemon.service` | systemd user unit |
@@ -59,13 +60,42 @@ TENANT_SLUG=<your-tenant> ./fleet-runtime/register-agent-key.sh my-agent <AGENT_
 node fleet-runtime/attach-signed.mjs https://YOUR-POT my-agent --tenant <your-tenant> --type builder --runtime claude-code
 ```
 
+## Install on a host
+
+From a checkout, lay down the runtime scripts, systemd user units, editable
+config templates, and receipt directories:
+
+```bash
+npm run fleet:install
+```
+
+or directly from a checkout:
+
+```bash
+node fleet-runtime/install.mjs
+```
+
+If you copied only the `fleet-runtime` directory to a host, run `node install.mjs`
+from inside that copied directory.
+
+The installer emits `receipt_type: "mupot-fleet-install-receipt/v1"`. A first
+install usually returns `status:"warn"` because `~/.fleet/*.json` was created
+from templates and must be edited. It preserves existing config files unless
+you pass `--force-config`, so rerunning it is safe for script/unit updates.
+
+Edit these generated files before enabling services:
+
+- `~/.fleet/daemon.json`
+- `~/.fleet/inbox-handler.json`
+- `~/.fleet/control.json`
+- `~/.fleet/flights.json`
+
+Then place agent private keys under `~/.fleet/agents/` with `chmod 600`, place
+the panel public key at `~/.fleet/panel.pub.jwk`, and run the host receipt.
+
 ## Run the daemon (continuous presence + optional inbox drain)
 
 ```bash
-mkdir -p ~/.fleet/runtime ~/.config/systemd/user
-cp fleet-runtime/*.mjs ~/.fleet/runtime/
-cp fleet-runtime/daemon.example.json ~/.fleet/daemon.json    # edit base_url, tenant, REAL probes
-cp fleet-runtime/fleet-daemon.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 loginctl enable-linger "$USER"                                # survive logout/reboot
 systemctl --user enable --now fleet-daemon.service
@@ -232,8 +262,9 @@ read worked, but no control request was queued; trigger one from Mupot and rerun
 
 ## Host install receipt
 
-After installing `fleet-daemon`, `inbox-handler`, and `fleet-control-daemon`, run a
-non-destructive receipt before asking Mupot to consume live work:
+After installing and editing `fleet-daemon`, `inbox-handler`, and
+`fleet-control-daemon` config, run a non-destructive receipt before asking
+Mupot to consume live work:
 
 ```bash
 node ~/.fleet/runtime/host-receipt.mjs \

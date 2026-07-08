@@ -301,7 +301,12 @@ and exiting `0` so the daemon consumes the batch.
    Until then: arms can run on mupot for memory + messaging, but cold-start
    delegation still flows through SOS Redis (`activation-watcher.sh`). This is a
    fine intermediate state — the hooks are the LAST thing to move.
-   - Pre-flight receipt: run `node ~/.fleet/runtime/host-receipt.mjs --daemon ~/.fleet/daemon.json --inbox ~/.fleet/inbox-handler.json --control ~/.fleet/control.json` on the host. A `mupot-fleet-host-receipt/v1` `status:"pass"` proves local daemon/control/handler config, key files, and handler coverage are ready for live smoke.
+   - Host install: run `npm run fleet:install` from a checkout, or
+     `node fleet-runtime/install.mjs`, to lay down `~/.fleet/runtime`, editable
+     config templates, receipt directories, and systemd user units. The
+     installer emits `mupot-fleet-install-receipt/v1`; `status:"warn"` is
+     expected until the templates are edited.
+   - Pre-flight receipt: after editing configs and placing keys, run `node ~/.fleet/runtime/host-receipt.mjs --daemon ~/.fleet/daemon.json --inbox ~/.fleet/inbox-handler.json --control ~/.fleet/control.json` on the host. A `mupot-fleet-host-receipt/v1` `status:"pass"` proves local daemon/control/handler config, key files, and handler coverage are ready for live smoke.
    - Live runtime receipt: after the target runtime is up and at least one Mupot
      inbox probe is queued, run `node ~/.fleet/runtime/runtime-receipt.mjs --daemon ~/.fleet/daemon.json --agent <agent_id>`.
      A `mupot-fleet-runtime-receipt/v1` `status:"pass"` proves the real daemon
@@ -338,7 +343,8 @@ and exiting `0` so the daemon consumes the batch.
 | broadcast | `broadcast`→`delivered:N`, peer `inbox` shows one fan-out message |
 | check-in | MCP `check_in { source, label }` or `POST /api/fleet/checkin` → `{ ok:true, agent }` |
 | peers | MCP `peers {}` from a welded arm returns its squad roster with `is_self:true` on that arm |
-| host install | `host-receipt.mjs` emits `mupot-fleet-host-receipt/v1` with `status:"pass"` |
+| host installer | `install.mjs` emits `mupot-fleet-install-receipt/v1`; initial template installs usually warn until edited |
+| host pre-flight | `host-receipt.mjs` emits `mupot-fleet-host-receipt/v1` with `status:"pass"` |
 | runtime live | `runtime-receipt.mjs --agent <id>` emits `mupot-fleet-runtime-receipt/v1` with `status:"pass"` |
 | control live | `control-receipt.mjs` emits `mupot-fleet-control-receipt/v1` with `status:"pass"` |
 | probe queue | `cutover-probe.mjs` emits `mupot-fleet-cutover-probe/v1` after queuing inbox/control evidence inputs |
