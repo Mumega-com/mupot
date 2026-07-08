@@ -293,6 +293,18 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
     c.expected_file === 'runtime-agent-one.json' &&
     c.ok === true
   ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'cutover_gate_agents_match_manifest' &&
+    c.expected.includes('agent-one') &&
+    c.actual.includes('agent-one') &&
+    c.ok === true
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'cutover_gate_required_control_verbs_match_manifest' &&
+    c.expected.includes('start') &&
+    c.expected.includes('stop') &&
+    c.ok === true
+  ))
 
   writeJson(join(copiedDir, 'host.json'), hostReceipt('fail'))
   const drift = checkBundleManifest({ manifestPath })
@@ -304,6 +316,56 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
     c.checked_path === join(copiedDir, 'host.json') &&
     c.ok === false &&
     c.expected !== c.actual
+  ))
+})
+
+test('manifest check fails when cutover gate inputs disagree with manifest evidence', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+  await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+  })
+
+  const gatePath = join(outDir, 'cutover-gate.json')
+  const gate = JSON.parse(readFileSync(gatePath, 'utf8'))
+  gate.inputs.agents = ['other-agent']
+  gate.inputs.required_control_verbs = ['restart']
+  gate.inputs.runtime_receipts = []
+  writeJson(gatePath, gate)
+
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.cutover_gate.sha256 = sha256(gatePath)
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ manifestPath })
+
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((c) =>
+    c.check === 'cutover_gate_agents_match_manifest' &&
+    c.expected.includes('agent-one') &&
+    c.actual.includes('other-agent') &&
+    c.ok === false
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'cutover_gate_required_control_verbs_match_manifest' &&
+    c.expected.includes('start') &&
+    c.actual.includes('restart') &&
+    c.ok === false
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'cutover_gate_runtime_artifacts_match_manifest' &&
+    c.expected.includes('runtime-agent-one.json') &&
+    c.actual.length === 0 &&
+    c.ok === false
   ))
 })
 

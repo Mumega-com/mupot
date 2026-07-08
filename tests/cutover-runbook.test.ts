@@ -28,6 +28,7 @@ describe('squad mupot cutover runbook', () => {
     expect(runbook).toContain('receipt type/status metadata')
     expect(runbook).toContain('manifest summary/status')
     expect(runbook).toContain('host/runtime/control/cutover-gate evidence')
+    expect(runbook).toContain('cutover-gate inputs')
     expect(runbook).toContain('SHA-256 hashes')
     expect(runbook).toContain('manifest.json.next_steps')
     expect(runbook).toContain('advisory `next_steps`')

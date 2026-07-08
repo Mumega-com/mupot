@@ -352,7 +352,8 @@ and exiting `0` so the daemon consumes the batch.
      `mupot-fleet-receipt-bundle-check/v1`, verifies artifact hashes plus
      receipt type/status metadata, recomputes manifest summary/status from the
      recorded checks, requires host/runtime/control/cutover-gate evidence
-     categories, and writes nothing.
+     categories, compares cutover-gate inputs back to the manifest evidence,
+     and writes nothing.
      `manifest.json.next_steps` is advisory and should explain the next missing
      operator action when the bundle is not ready.
 

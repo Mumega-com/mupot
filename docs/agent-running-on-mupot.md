@@ -178,7 +178,7 @@ the final cutover record can prove exactly which files were reviewed.
 Use `receipt-bundle.mjs --check-manifest` for a read-only drift check before
 attaching copied bundle evidence; it validates artifact hashes plus saved receipt
 type/status metadata, required evidence categories, and manifest summary/status
-consistency.
+consistency, then compares cutover-gate inputs back to the manifest evidence.
 
 **Cross-cutting** — (9) durable, reliably-wakeable 2nd adversarial gate lens (Codex bus-peer
 was stale on both pings); (10) dyad-gate.yml single-quote glob (1-line).

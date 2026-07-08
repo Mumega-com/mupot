@@ -261,8 +261,35 @@ function manifestAgents(manifest) {
   return Array.isArray(manifest?.inputs?.agents) ? manifest.inputs.agents.filter(Boolean) : []
 }
 
+function manifestRequiredControlVerbs(manifest) {
+  return Array.isArray(manifest?.inputs?.required_control_verbs)
+    ? manifest.inputs.required_control_verbs.filter(Boolean)
+    : ['start', 'stop']
+}
+
 function hasArtifact(entries, predicate) {
   return entries.some((entry) => predicate(entry))
+}
+
+function sortStrings(values) {
+  return [...new Set((values ?? []).filter((value) => typeof value === 'string' && value.length > 0))].sort()
+}
+
+function sameStringSet(a, b) {
+  return JSON.stringify(sortStrings(a)) === JSON.stringify(sortStrings(b))
+}
+
+function artifactBasenames(entries, predicate) {
+  return entries
+    .filter((entry) => predicate(entry))
+    .map((entry) => typeof entry.path === 'string' ? basename(entry.path) : '')
+    .filter(Boolean)
+}
+
+function receiptInputBasenames(paths) {
+  return (paths ?? [])
+    .map((path) => typeof path === 'string' ? basename(path) : '')
+    .filter(Boolean)
 }
 
 function addRequiredEvidenceChecks(checks, manifestPath, entries, agents) {
@@ -317,6 +344,60 @@ function addRequiredEvidenceChecks(checks, manifestPath, entries, agents) {
       expected_file: expectedRuntime,
     })
   }
+}
+
+function addCutoverGateConsistencyChecks(checks, manifestPath, manifest, entries, receipt) {
+  const agents = manifestAgents(manifest)
+  const requiredControlVerbs = manifestRequiredControlVerbs(manifest)
+  const passingArtifact = (kind) => (entry) =>
+    expectedArtifactType(entry.label) === kind && entry.status === 'pass'
+  const expectedHost = artifactBasenames(entries, (entry) => entry.label === 'host' && passingArtifact(EXPECTED.host)(entry))
+  const actualHost = receipt?.inputs?.host_receipt ? [basename(receipt.inputs.host_receipt)] : []
+  const expectedRuntimes = artifactBasenames(entries, passingArtifact(EXPECTED.runtime))
+  const actualRuntimes = receiptInputBasenames(receipt?.inputs?.runtime_receipts)
+  const expectedControls = artifactBasenames(entries, passingArtifact(EXPECTED.control))
+  const actualControls = receiptInputBasenames(receipt?.inputs?.control_receipts)
+
+  checks.push({
+    ok: sameStringSet(receipt?.inputs?.agents, agents),
+    component: 'receipt-bundle-check',
+    check: 'cutover_gate_agents_match_manifest',
+    path: manifestPath,
+    expected: sortStrings(agents),
+    actual: sortStrings(receipt?.inputs?.agents),
+  })
+  checks.push({
+    ok: sameStringSet(receipt?.inputs?.required_control_verbs, requiredControlVerbs),
+    component: 'receipt-bundle-check',
+    check: 'cutover_gate_required_control_verbs_match_manifest',
+    path: manifestPath,
+    expected: sortStrings(requiredControlVerbs),
+    actual: sortStrings(receipt?.inputs?.required_control_verbs),
+  })
+  checks.push({
+    ok: sameStringSet(actualHost, expectedHost),
+    component: 'receipt-bundle-check',
+    check: 'cutover_gate_host_artifact_matches_manifest',
+    path: manifestPath,
+    expected: sortStrings(expectedHost),
+    actual: sortStrings(actualHost),
+  })
+  checks.push({
+    ok: sameStringSet(actualRuntimes, expectedRuntimes),
+    component: 'receipt-bundle-check',
+    check: 'cutover_gate_runtime_artifacts_match_manifest',
+    path: manifestPath,
+    expected: sortStrings(expectedRuntimes),
+    actual: sortStrings(actualRuntimes),
+  })
+  checks.push({
+    ok: sameStringSet(actualControls, expectedControls),
+    component: 'receipt-bundle-check',
+    check: 'cutover_gate_control_artifacts_match_manifest',
+    path: manifestPath,
+    expected: sortStrings(expectedControls),
+    actual: sortStrings(actualControls),
+  })
 }
 
 function checkBundleManifest(opts = {}) {
@@ -489,6 +570,9 @@ function checkBundleManifest(opts = {}) {
         actual: receipt?.status ?? null,
         accepted: entry.label === 'install' ? ['pass', 'warn'] : ['pass'],
       })
+      if (entry.label === 'cutover_gate' && receipt) {
+        addCutoverGateConsistencyChecks(checks, manifestPath, manifest, entries, receipt)
+      }
     }
   }
 
