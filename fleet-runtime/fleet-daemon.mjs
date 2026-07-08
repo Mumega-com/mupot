@@ -123,6 +123,7 @@ export function runInboxCommand(cmd, payload, timeoutMs = INBOX_COMMAND_TIMEOUT_
     }, timeoutMs)
     child.on('error', () => { clearTimeout(timer); finish(false) })
     child.on('exit', (code) => { clearTimeout(timer); finish(code === 0) })
+    child.stdin.on('error', () => { clearTimeout(timer); finish(false) })
     try {
       child.stdin.end(payload)
     } catch {

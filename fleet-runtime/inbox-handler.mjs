@@ -163,6 +163,7 @@ export function runCommand(cmd, stdinPayload, timeoutMs = DEFAULT_TIMEOUT_MS, sp
     }, timeoutMs)
     child.on('error', () => { clearTimeout(timer); finish(false, null) })
     child.on('exit', (code) => { clearTimeout(timer); finish(code === 0, code) })
+    child.stdin.on('error', () => { clearTimeout(timer); finish(false, null) })
     try {
       child.stdin.end(stdinPayload)
     } catch {
