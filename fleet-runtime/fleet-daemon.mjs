@@ -8,9 +8,11 @@
 // STERILE / FORKABLE: hardcodes no tenant. The config MUST specify `tenant` and `base_url`
 // for your pot. Each agent's `probe` is a shell command (exit 0 = its runtime is alive NOW).
 // Alive → signed-attach (re-stamps last_reported_at → presence stays `live`) and, when
-// configured, signed-inbox peek → local handler → consume-on-success. Probe fails → SKIP —
-// no heartbeat, no inbox drain — and presence honestly decays running→stale after the pot's
-// TTL. The daemon never asserts liveness it cannot observe.
+// configured, signed-inbox peek → local handler → consume-on-success. On daemon shutdown,
+// agents successfully heartbeated during this daemon run are signed-detached to report an
+// explicit `offline`. Probe fails → SKIP — no heartbeat, no inbox drain — and presence
+// honestly decays running→stale after the pot's TTL. The daemon never asserts liveness it
+// cannot observe.
 //
 // Heartbeat cadence must be comfortably under the pot's presence TTL (default 180s); default
 // interval 75s gives ~2.4 beats/window. Private keys are loaded once at startup (fail-fast).
@@ -18,7 +20,7 @@ import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
-import { loadPrivKey, signedAttach, signedInbox } from './fleet-sign.mjs'
+import { loadPrivKey, signedAttach, signedDetach, signedInbox } from './fleet-sign.mjs'
 
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 const PROBE_TIMEOUT_MS = 10_000
@@ -172,7 +174,27 @@ async function drainInbox(cfg, agent, key) {
   })
 }
 
-async function tick(cfg, keys) {
+export async function detachAgents(cfg, keys, liveAgents, detachFn = signedDetach) {
+  const live = liveAgents instanceof Set ? liveAgents : new Set()
+  if (live.size === 0) {
+    log({ event: 'detach_skip', reason: 'no_live_agents_seen' })
+    return []
+  }
+
+  const results = []
+  for (const a of cfg.agents) {
+    if (!live.has(a.agent_id)) continue
+    const res = await detachFn(cfg.baseUrl, a.agent_id, {
+      tenant: cfg.tenant,
+      privKey: keys.get(a.agent_id),
+    })
+    results.push({ agent: a.agent_id, ok: res.ok, status: res.status })
+    log({ agent: a.agent_id, action: res.ok ? 'signed_detach_ok' : 'signed_detach_fail', status: res.status })
+  }
+  return results
+}
+
+async function tick(cfg, keys, liveAgents) {
   for (const a of cfg.agents) {
     let alive = false
     try { alive = await runProbe(a.probe) } catch { alive = false }
@@ -184,7 +206,10 @@ async function tick(cfg, keys) {
       type: a.type, runtime: a.runtime, tenant: cfg.tenant, lifecycle: a.lifecycle, privKey: keys.get(a.agent_id),
     })
     log({ agent: a.agent_id, probe: 'alive', action: res.ok ? 'heartbeat_ok' : 'heartbeat_fail', status: res.status })
-    if (res.ok) await drainInbox(cfg, a, keys.get(a.agent_id))
+    if (res.ok) {
+      liveAgents.add(a.agent_id)
+      await drainInbox(cfg, a, keys.get(a.agent_id))
+    }
   }
 }
 
@@ -212,20 +237,35 @@ async function main() {
 
   let stopping = false
   let timer = null
+  let activeTick = null
+  const liveAgents = new Set()
   const loop = async () => {
     if (stopping) return
-    try { await tick(cfg, keys) } catch (e) { log({ event: 'tick_error', error: String(e && e.message ? e.message : e) }) }
+    try {
+      activeTick = tick(cfg, keys, liveAgents)
+      await activeTick
+    } catch (e) {
+      log({ event: 'tick_error', error: String(e && e.message ? e.message : e) })
+    } finally {
+      activeTick = null
+    }
     if (!stopping) timer = setTimeout(loop, cfg.intervalSec * 1000)
   }
 
-  const shutdown = (sig) => {
+  const shutdown = async (sig) => {
+    if (stopping) return
     stopping = true
     if (timer) clearTimeout(timer)
-    log({ event: 'stop', signal: sig, note: 'presence decays to stale; no signed detach in v1' })
+    log({ event: 'stop_begin', signal: sig })
+    if (activeTick) {
+      try { await activeTick } catch { /* tick error is logged by loop */ }
+    }
+    await detachAgents(cfg, keys, liveAgents)
+    log({ event: 'stop', signal: sig, note: 'signed detach sent for agents live during this daemon run' })
     process.exit(0)
   }
-  process.on('SIGTERM', () => shutdown('SIGTERM'))
-  process.on('SIGINT', () => shutdown('SIGINT'))
+  process.on('SIGTERM', () => { void shutdown('SIGTERM') })
+  process.on('SIGINT', () => { void shutdown('SIGINT') })
 
   await loop()
 }

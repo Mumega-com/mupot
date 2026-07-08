@@ -13,7 +13,7 @@
 #   systemctl --user enable --now fleet-daemon.service
 #   journalctl --user -u fleet-daemon -f                         # watch heartbeats
 #
-# Stop:  systemctl --user disable --now fleet-daemon             (presence decays to stale)
+# Stop:  systemctl --user disable --now fleet-daemon             (signed-detaches live agents)
 [Unit]
 Description=Pot fleet daemon (signed presence heartbeat)
 After=network-online.target

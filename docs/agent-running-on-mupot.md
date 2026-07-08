@@ -128,15 +128,15 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
    wired to actual process start/kill).
 3. Coordinates via the reflected bus — ⛏ partial (`agent_messages` inbox and signed
    daemon read are built; runtime hook rollout still needs host/operator wiring).
-4. Runtime binding reports presence + swappable — ⬜ **gap** (the rows are one-shot static
-   stamps, NOT heartbeats; no persistent daemon).
+4. Runtime binding reports presence + swappable — ⛏ partial (fleet daemon code now
+   heartbeats, drains signed inbox, and signed-detaches on shutdown; host install remains).
 5. SOS retired — ⬜ not yet.
 
 ### Punch-list to LIVE
 **Phase 1 — liveness (make `running` true)** ← biggest gap, critical path
 1. Presence/heartbeat: TTL column; registry computes running/stale/stopped from last-ping.
 2. Fleet daemon (host): boot-attach all managed agents, re-attach on drop, heartbeat, drain
-   inbox, detach on stop; systemd user unit. (Install = Hadi host-go.)
+   inbox, detach on stop; systemd user unit. ✅ branch implementation; install = Hadi host-go.
 
 **Phase 2 — lifecycle control (open/close from mupot)**
 3. open/close API: signed control-request → daemon starts/kills the agent's runtime.

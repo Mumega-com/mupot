@@ -7,11 +7,12 @@ const contract = JSON.parse(
   id: string
   status: string
   signedAttachDomain: string
+  signedDetachDomain: string
   signedInboxDomain: string
   attach: {
     signed: { path: string; required: string[]; lifecycles: string[]; errors: Record<string, string> }
     bearer: { path: string; downgradePolicy: string }
-    detach: { path: string }
+    detach: { path: string; signed: { path: string; required: string[]; domain: string } }
   }
   messaging: {
     mcpTools: string[]
@@ -42,6 +43,7 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(contract.id).toBe('runtime-adapter/v1')
     expect(contract.status).toBe('documented')
     expect(contract.signedAttachDomain).toBe('fleet-attach:v1')
+    expect(contract.signedDetachDomain).toBe('fleet-detach:v1')
     expect(contract.signedInboxDomain).toBe('agent-inbox:v1')
     expect(contract.attach.signed.path).toBe('/api/fleet/attach-signed')
     expect(contract.attach.signed.required).toEqual([
@@ -64,6 +66,11 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(contract.attach.bearer.path).toBe('/api/fleet/attach')
     expect(contract.attach.bearer.downgradePolicy).toContain('refuse-bearer-attach')
     expect(contract.attach.detach.path).toBe('/api/fleet/detach')
+    expect(contract.attach.detach.signed).toMatchObject({
+      path: '/api/fleet/detach-signed',
+      domain: 'fleet-detach:v1',
+    })
+    expect(contract.attach.detach.signed.required).toEqual(['agent_id', 'ts', 'nonce', 'sig'])
     expect(contract.messaging.mcpTools).toEqual(['send', 'inbox'])
     expect(contract.messaging.http.signedRead).toMatchObject({
       path: '/api/inbox/signed',
@@ -122,6 +129,7 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(contract.conformance.planned).toEqual(
       expect.arrayContaining([
         'signed-attach',
+        'signed-detach',
         'inbox-idempotency',
         'hermes-im-task',
         'task-lifecycle',

@@ -5,7 +5,8 @@
 // it can see). Here the agent calls in directly, authenticated by its own member-token.
 //
 // Security properties:
-//   - member_id is ALWAYS derived from the bearer token (never from the body).
+//   - member_id is ALWAYS derived from bearer token or registered agent key
+//     (never from the body).
 //   - BLOCK-1 fix (strong): the token's boundAgentId MUST equal the requested agent_id.
 //     A token bound to 'loom' can only attach/detach agent_id='loom'. A pure member
 //     token (boundAgentId=null) cannot attach at all. This is race-free: no TOFU
@@ -15,8 +16,9 @@
 //   - Request bodies are capped at 8 KB before parsing (WARN-1 fix, anti-DoS).
 //   - Detach uses an additional member_id WHERE clause as defense-in-depth.
 //
-// POST /api/fleet/attach  — upsert fleet_agents status='running', member=auth-resolved.
-// POST /api/fleet/detach  — SET status='stopped' WHERE tenant + agent_id + member_id=auth.
+// POST /api/fleet/attach         — upsert fleet_agents status='running', member=auth-resolved.
+// POST /api/fleet/detach         — bearer detach for token-welded agents.
+// POST /api/fleet/detach-signed  — key proof detach for signed agents.
 
 import { Hono } from 'hono'
 import type { Context } from 'hono'
@@ -24,6 +26,7 @@ import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { getAgentView } from './registry'
 import { verifySignedAttach } from './signed-attach'
+import { verifySignedDetach } from './signed-detach'
 
 // ── shared upsert ───────────────────────────────────────────────────────────────────
 
@@ -55,6 +58,24 @@ async function upsertRunning(
   )
     .bind(agentId, env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId)
     .run()
+}
+
+/** Mark a fleet row stopped for the authenticated/key-bound identity. `memberId`
+ *  may be null for legacy key rows; in that case only a null-owned row can stop. */
+async function markStopped(env: Env, agentId: string, memberId: string | null): Promise<number> {
+  const result = await env.DB.prepare(
+    `UPDATE fleet_agents
+        SET status           = 'stopped',
+            last_reported_at = datetime('now'),
+            updated_at       = datetime('now')
+      WHERE tenant    = ?1
+        AND agent_id  = ?2
+        AND ((?3 IS NULL AND member_id IS NULL) OR member_id = ?4)`,
+  )
+    .bind(env.TENANT_SLUG, agentId, memberId, memberId)
+    .run()
+
+  return (result.meta as { changes?: number }).changes ?? 0
 }
 
 /** True if a signed-attach public key is registered for (tenant, agent_id). Such agents
@@ -230,6 +251,30 @@ fleetAttachApp.post('/attach-signed', async (c) => {
   return c.json({ ok: true, agent })
 })
 
+// ── POST /api/fleet/detach-signed ─────────────────────────────────────────────────
+
+fleetAttachApp.post('/detach-signed', async (c) => {
+  // No bearer auth: the tenant-bound Ed25519 signature is the auth.
+  const parsed = await readJsonCapped(c, MAX_BODY_BYTES)
+  if (!parsed.ok) {
+    return c.json({ error: parsed.reason === 'too_large' ? 'payload_too_large' : 'bad_request' },
+      parsed.reason === 'too_large' ? 413 : 400)
+  }
+  if (!parsed.value || typeof parsed.value !== 'object') {
+    return c.json({ error: 'bad_request', detail: 'body must be an object' }, 400)
+  }
+
+  const v = await verifySignedDetach(c.env, parsed.value as Record<string, unknown>)
+  if (!v.ok) return c.json({ error: v.error, detail: v.detail }, v.status as 400 | 401 | 409)
+
+  const changes = await markStopped(c.env, v.agent_id, v.member_id)
+  if (changes === 0) {
+    return c.json({ error: 'not_found_or_not_owner' }, 404)
+  }
+
+  return c.json({ ok: true })
+})
+
 // ── POST /api/fleet/detach ────────────────────────────────────────────────────────
 
 fleetAttachApp.post('/detach', async (c) => {
@@ -258,22 +303,10 @@ fleetAttachApp.post('/detach', async (c) => {
     return c.json({ error: 'forbidden', detail: 'token is not bound to this agent_id' }, 403)
   }
 
-  // 4. Ownership-gated update. The WHERE member_id = ?3 clause is defense-in-depth:
+  // 4. Ownership-gated update. The member_id clause is defense-in-depth:
   //    if the token binding matches but the fleet row has a different member_id (e.g.,
   //    a re-keying scenario), changes=0 → 404. An agent can only stop its own row.
-  const result = await c.env.DB.prepare(
-    `UPDATE fleet_agents
-        SET status           = 'stopped',
-            last_reported_at = datetime('now'),
-            updated_at       = datetime('now')
-      WHERE tenant    = ?1
-        AND agent_id  = ?2
-        AND member_id = ?3`,
-  )
-    .bind(c.env.TENANT_SLUG, agentId, id.memberId)
-    .run()
-
-  const changes = (result.meta as { changes?: number }).changes ?? 0
+  const changes = await markStopped(c.env, agentId, id.memberId)
   if (changes === 0) {
     // Row not found OR member_id mismatch (re-keying scenario). Deliberately ambiguous.
     return c.json({ error: 'not_found_or_not_owner' }, 404)

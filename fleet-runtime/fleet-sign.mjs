@@ -13,6 +13,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 export const SIG_DOMAIN = 'fleet-attach:v1'
+export const DETACH_SIG_DOMAIN = 'fleet-detach:v1'
 export const INBOX_SIG_DOMAIN = 'agent-inbox:v1'
 
 // HTTP wall-clock bound. Without it, one stalled (half-open) connection freezes the whole
@@ -45,6 +46,12 @@ export async function loadPrivKey(agentId) {
 /** The exact bytes both sides sign/verify. Keep field order in lockstep with the worker. */
 export function canonicalMessage({ tenant, agentId, type, runtime, lifecycle, ts, nonce }) {
   return [SIG_DOMAIN, tenant, agentId, type, runtime, lifecycle, String(ts), nonce].join('\n')
+}
+
+/** Domain-separated bytes for signed detach. Keep byte-identical to
+ *  src/fleet/signed-detach.ts canonicalDetachMessage(). */
+export function canonicalDetachMessage({ tenant, agentId, ts, nonce }) {
+  return [DETACH_SIG_DOMAIN, tenant, agentId, String(ts), nonce].join('\n')
 }
 
 /** Domain-separated bytes for signed inbox reads. Keep byte-identical to
@@ -97,6 +104,42 @@ export async function signedAttach(baseUrl, agentId, opts = {}) {
       body: JSON.stringify(body),
       // NB AbortSignal.timeout's timer is unref'd — safe here because a real fetch holds a
       // ref'd socket; only a fully-mocked fetch (no pending I/O) could settle early.
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    })
+    const text = await res.text()
+    let json
+    try { json = JSON.parse(text) } catch { json = { raw: text } }
+    return { ok: res.ok, status: res.status, json }
+  } catch (e) {
+    return { ok: false, status: 0, json: { error: String(e && e.message ? e.message : e) } }
+  }
+}
+
+/** Sign + POST a signed detach. This is the explicit offline transition for a
+ *  keyed runtime after the host has stopped the agent process or the daemon is
+ *  shutting down its managed live agents. */
+export async function signedDetach(baseUrl, agentId, opts = {}) {
+  const {
+    tenant,
+    privKey,
+    fetchImpl = fetch,
+  } = opts
+  if (typeof tenant !== 'string' || !tenant) {
+    throw new Error('signedDetach: tenant is required (this runtime hardcodes no tenant)')
+  }
+  const key = privKey ?? (await loadPrivKey(agentId))
+  const ts = Math.floor(Date.now() / 1000)
+  const requestNonce = nonce()
+  const message = canonicalDetachMessage({ tenant, agentId, ts, nonce: requestNonce })
+  const sigBuf = await w.subtle.sign({ name: 'Ed25519' }, key, new TextEncoder().encode(message))
+  const sig = Buffer.from(sigBuf).toString('base64url')
+  const body = { agent_id: agentId, ts, nonce: requestNonce, sig }
+
+  try {
+    const res = await fetchImpl(`${baseUrl.replace(/\/$/, '')}/api/fleet/detach-signed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     })
     const text = await res.text()

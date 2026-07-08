@@ -86,18 +86,21 @@ tokens welded to a different agent.
 
 ### Signed Runtime Hosts
 
-The stronger runtime identity proof is Ed25519 signed attach:
+The stronger runtime identity proof is Ed25519 signed attach/detach:
 
 - host keeps the private key
 - pot stores only the public key in `agent_keys`
-- signed bytes include protocol domain, tenant, agent id, type, runtime,
+- signed attach bytes include protocol domain, tenant, agent id, type, runtime,
   lifecycle, timestamp, and nonce
-- timestamp must be within the attach window
+- signed detach bytes use the separate `fleet-detach:v1` domain and bind tenant,
+  agent id, timestamp, and nonce
+- timestamp must be within the signature freshness window
 - nonce is burned after successful signature verification
 
-`/api/fleet/attach-signed` writes presence only after verification. If an agent
-has a registered public key, the older bearer attach route refuses it to avoid an
-auth downgrade.
+`/api/fleet/attach-signed` writes running presence only after verification.
+`/api/fleet/detach-signed` writes stopped presence only for the key-bound row. If
+an agent has a registered public key, the older bearer attach route refuses it to
+avoid an auth downgrade.
 
 ## Authorization Model
 

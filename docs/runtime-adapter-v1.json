@@ -2,6 +2,7 @@
   "id": "runtime-adapter/v1",
   "status": "documented",
   "signedAttachDomain": "fleet-attach:v1",
+  "signedDetachDomain": "fleet-detach:v1",
   "signedInboxDomain": "agent-inbox:v1",
   "identity": {
     "tenantSource": "env.TENANT_SLUG",
@@ -41,6 +42,13 @@
       "method": "POST",
       "path": "/api/fleet/detach",
       "required": ["agent_id"],
+      "signed": {
+        "method": "POST",
+        "path": "/api/fleet/detach-signed",
+        "required": ["agent_id", "ts", "nonce", "sig"],
+        "domain": "fleet-detach:v1",
+        "retry": "retry-with-fresh-nonce-ts-and-signature"
+      },
       "errors": {
         "400": "bad_request",
         "401": "unauthorized",
@@ -128,6 +136,7 @@
   "conformance": {
     "planned": [
       "signed-attach",
+      "signed-detach",
       "bearer-attach",
       "detach-ownership",
       "presence-heartbeat",

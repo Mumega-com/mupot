@@ -26,7 +26,7 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `register-agent-key.sh` | register the **public** key in the pot (`agent_keys`) via wrangler |
 | `attach-signed.mjs` | one-shot signed attach (CLI) |
 | `fleet-sign.mjs` | shared signer core (no tenant default) |
-| `fleet-daemon.mjs` | presence heartbeat loop plus optional signed inbox drain |
+| `fleet-daemon.mjs` | presence heartbeat loop, optional signed inbox drain, signed shutdown detach |
 | `daemon.example.json` | config template (set base_url, tenant, agents, probes) |
 | `fleet-daemon.service` | systemd user unit |
 
@@ -114,7 +114,7 @@ and land — idle is zero.
 
 ```bash
 node fleet-runtime/flight.mjs open  my-agent   # takeoff: run `launch` → signed-attach (→ live)
-node fleet-runtime/flight.mjs close my-agent   # land: run `teardown` (→ presence decays = landed)
+node fleet-runtime/flight.mjs close my-agent   # land: run `teardown` → signed-detach (→ offline)
 node fleet-runtime/flight.mjs list             # show configured flights
 ```
 
@@ -122,8 +122,10 @@ Config `~/.fleet/flights.json` (see `flights.example.json`): per agent, `launch`
 command that brings the runtime up, e.g. `tmux new-session -d`) + `teardown` (brings it down).
 `open` runs `launch` then signs an attach — a **point-in-time** takeoff ping that flips presence
 `live` (and, if attach fails after launch, rolls the runtime back so nothing is orphaned). `close`
-runs `teardown`; a clean teardown lands it (presence decays running→`stale`), a failed teardown
-reports `LAND_UNCERTAIN` (runtime may still be up) rather than a false `LANDED`.
+runs `teardown`; a clean teardown then signs `/api/fleet/detach-signed` so the pot reports
+`offline`. If no teardown is configured, close skips signed detach because it cannot prove the
+runtime stopped. A failed teardown reports `LAND_UNCERTAIN` (runtime may still be up) rather
+than a false `LANDED`.
 
 Note: a single `flight open` proves the runtime was up *at takeoff* + a valid signature — it does
 NOT guarantee sustained liveness. Continuous truthful presence (`live` while running → `stale`
@@ -138,6 +140,6 @@ control-request → host control-daemon → runs the flight — is the ATC layer
 
 ## Notes
 - `interval_sec` is clamped to `[15,120]` and must stay under the pot's presence TTL (default 180s).
-- v1 has no signed `/detach`: on land / daemon stop, presence decays to `stale` (honest interim;
-  crisp `offline` needs a signed detach — follow-up).
+- The daemon sends signed detach on shutdown for agents it successfully heartbeated during
+  this daemon run. `flight close` also signs detach after teardown succeeds.
 - Supersedes the bearer-token `adapter.py` flow for the signed path.

@@ -17,6 +17,7 @@ artifact and the local smoke harness references this same contract name.
 - Contract id: `runtime-adapter/v1`
 - Status: documented; adapter conformance tests are planned
 - Signed attach domain: `fleet-attach:v1`
+- Signed detach domain: `fleet-detach:v1`
 - Signed inbox domain: `agent-inbox:v1`
 
 Future incompatible changes must create a new contract id. Additive fields may
@@ -112,7 +113,44 @@ Failure behavior:
 - `400 bad_request`: malformed JSON or invalid fields
 - `413 payload_too_large`: body exceeds the attach route cap
 
-### Detach
+### Signed Detach
+
+`POST /api/fleet/detach-signed`
+
+Use this path for agents with a registered Ed25519 public key in `agent_keys`.
+The runtime signs a tenant-bound, time-boxed, single-use message after the host
+has stopped the agent process or when the daemon is shutting down agents it has
+observed live.
+
+Required JSON fields:
+
+- `agent_id`
+- `ts`
+- `nonce`
+- `sig`
+
+The signed bytes are:
+
+```text
+fleet-detach:v1
+<tenant>
+<agent_id>
+<ts>
+<nonce>
+```
+
+Failure behavior:
+
+- `400 bad_request`: malformed JSON or invalid field
+- `401 unauthorized`: missing key, bad signature, or stale/future timestamp
+- `404 not_found_or_not_owner`: no matching row owned by the key-bound member
+- `409 replay`: nonce already used
+- `413 payload_too_large`: body exceeds the attach route cap
+
+Retry rule: retry failed network requests with a fresh `nonce`, `ts`, and
+signature.
+
+### Bearer Detach
 
 `POST /api/fleet/detach`
 
@@ -274,7 +312,7 @@ Adapters should treat these names as stable enough for branching behavior:
 - `bad_request`: malformed body or invalid attach fields
 - `invalid_json`: malformed JSON on routes that expose that exact error
 - `payload_too_large`: body exceeded route byte cap
-- `replay`: signed attach or signed inbox nonce was already used
+- `replay`: signed attach, signed detach, or signed inbox nonce was already used
 - `request_id_conflict`: sender reused a message idempotency key with different content
 - `inbox_full`: recipient unread inbox cap reached
 - `not_agent_bound`: token is valid but not welded to an agent

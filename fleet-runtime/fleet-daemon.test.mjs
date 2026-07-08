@@ -1,7 +1,7 @@
 // node --test fleet-daemon.test.mjs   (node >= 18 built-in runner, no deps)
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { validateConfig, runProbe, runInboxCommand } from './fleet-daemon.mjs'
+import { validateConfig, runProbe, runInboxCommand, detachAgents } from './fleet-daemon.mjs'
 
 const okCfg = () => ({
   base_url: 'https://your-pot.example.com',
@@ -92,4 +92,27 @@ test('runInboxCommand: non-zero handler result is false', async () => {
 
 test('runInboxCommand: hanging handler times out', async () => {
   assert.equal(await runInboxCommand('sleep 5', '{}', 200), false)
+})
+
+test('detachAgents: sends signed detach only for agents observed live', async () => {
+  const cfg = validateConfig({
+    base_url: 'https://pot.example.com',
+    tenant: 't',
+    agents: [
+      { agent_id: 'alive', probe: 'exit 0' },
+      { agent_id: 'never-live', probe: 'exit 0' },
+    ],
+  })
+  const calls = []
+  const results = await detachAgents(
+    cfg,
+    new Map([['alive', 'key-alive'], ['never-live', 'key-never']]),
+    new Set(['alive']),
+    async (baseUrl, agentId, opts) => {
+      calls.push({ baseUrl, agentId, tenant: opts.tenant, key: opts.privKey })
+      return { ok: true, status: 200, json: { ok: true } }
+    },
+  )
+  assert.deepEqual(calls, [{ baseUrl: 'https://pot.example.com', agentId: 'alive', tenant: 't', key: 'key-alive' }])
+  assert.deepEqual(results, [{ agent: 'alive', ok: true, status: 200 }])
 })
