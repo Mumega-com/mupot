@@ -2,10 +2,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildBundle, parseArgs, safeName } from './receipt-bundle.mjs'
+import { buildBundle, checkBundleManifest, parseArgs, safeName } from './receipt-bundle.mjs'
 
 function tmpDir() {
   return mkdtempSync(join(tmpdir(), 'mupot-receipt-bundle-'))
@@ -230,6 +230,53 @@ test('verify-only rechecks an existing bundle without live receipt builders', as
   assert.ok(manifest.next_steps.some((s) => s.includes('attach manifest.json and cutover-gate.json')))
 })
 
+test('manifest check verifies copied bundle hashes without rewriting files', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+  await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+  })
+
+  const copiedDir = tmpDir()
+  for (const name of readdirSync(outDir).filter((entry) => entry.endsWith('.json'))) {
+    copyFileSync(join(outDir, name), join(copiedDir, name))
+  }
+
+  const manifestPath = join(copiedDir, 'manifest.json')
+  const before = readFileSync(manifestPath, 'utf8')
+  const check = checkBundleManifest({ manifestPath })
+
+  assert.equal(check.receipt_type, 'mupot-fleet-receipt-bundle-check/v1')
+  assert.equal(check.status, 'pass')
+  assert.equal(readFileSync(manifestPath, 'utf8'), before)
+  assert.ok(check.checks.some((c) =>
+    c.check === 'artifact_sha256_match' &&
+    c.artifact === 'host' &&
+    c.checked_path === join(copiedDir, 'host.json') &&
+    c.ok === true
+  ))
+
+  writeJson(join(copiedDir, 'host.json'), hostReceipt('fail'))
+  const drift = checkBundleManifest({ manifestPath })
+
+  assert.equal(drift.status, 'fail')
+  assert.ok(drift.checks.some((c) =>
+    c.check === 'artifact_sha256_match' &&
+    c.artifact === 'host' &&
+    c.checked_path === join(copiedDir, 'host.json') &&
+    c.ok === false &&
+    c.expected !== c.actual
+  ))
+})
+
 test('receipt bundle fails when the final cutover gate lacks stop evidence', async () => {
   const outDir = tmpDir()
   const bundle = await buildBundle({
@@ -293,4 +340,12 @@ test('parseArgs expands --verify-only to read-only reuse flags', () => {
   assert.equal(opts.skipHost, true)
   assert.equal(opts.skipRuntime, true)
   assert.equal(opts.skipControl, true)
+})
+
+test('parseArgs accepts read-only manifest check options', () => {
+  const opts = parseArgs(['--out-dir', './receipts', '--manifest', './manifest.json', '--check-manifest'])
+
+  assert.equal(opts.checkManifest, true)
+  assert.ok(opts.outDir.endsWith('/receipts'))
+  assert.ok(opts.manifestPath.endsWith('/manifest.json'))
 })

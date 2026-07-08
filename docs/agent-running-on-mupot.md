@@ -175,6 +175,8 @@ Use `receipt-bundle.mjs --verify-only` to recheck saved evidence without polling
 the live host runtime before attaching the final cutover record.
 The bundle manifest includes SHA-256 hashes for the saved receipt artifacts so
 the final cutover record can prove exactly which files were reviewed.
+Use `receipt-bundle.mjs --check-manifest` for a read-only drift check before
+attaching copied bundle evidence.
 
 **Cross-cutting** — (9) durable, reliably-wakeable 2nd adversarial gate lens (Codex bus-peer
 was stale on both pings); (10) dyad-gate.yml single-quote glob (1-line).

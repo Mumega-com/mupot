@@ -9,7 +9,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
-import { basename, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { buildReceipt as buildHostReceipt } from './host-receipt.mjs'
 import { buildReceipt as buildRuntimeReceipt } from './runtime-receipt.mjs'
 import { buildReceipt as buildControlReceipt } from './control-receipt.mjs'
@@ -55,6 +55,7 @@ function parseArgs(argv) {
     probeReceiptPaths: [],
     outDir: '',
     controlLabel: '',
+    manifestPath: '',
     requiredControlVerbs: ['start', 'stop'],
     skipHost: false,
     skipRuntime: false,
@@ -78,6 +79,7 @@ function parseArgs(argv) {
     else if (arg === '--probe-receipt') opts.probeReceiptPaths.push(...splitValues(next()).map(pathArg))
     else if (arg === '--out-dir') opts.outDir = pathArg(next())
     else if (arg === '--control-label') opts.controlLabel = safeName(next())
+    else if (arg === '--manifest') opts.manifestPath = pathArg(next())
     else if (arg === '--require-control-verb') {
       const verbs = splitValues(next())
       for (const verb of verbs) {
@@ -94,6 +96,7 @@ function parseArgs(argv) {
       opts.skipControl = true
     }
     else if (arg === '--exec-probes') opts.execProbes = true
+    else if (arg === '--check-manifest') opts.checkManifest = true
     else if (arg === '--force') opts.force = true
     else if (arg === '--help' || arg === '-h') opts.help = true
     else throw new Error(`unknown argument: ${arg}`)
@@ -114,10 +117,12 @@ function usage() {
     '  --install-receipt <path>      optional install.mjs receipt to copy into install.json',
     '  --probe-receipt <path>        optional cutover-probe.mjs receipt; repeat or comma-separate',
     '  --control-label <label>       filename label for this live control receipt, e.g. start or stop',
+    '  --manifest <path>             manifest path for --check-manifest',
     '  --skip-host                   reuse existing host.json from the bundle directory',
     '  --skip-runtime                reuse existing runtime-*.json receipts from the bundle directory',
     '  --skip-control                do not run a live control poll; reuse existing control-*.json',
     '  --verify-only                 read-only recheck; reuse host/runtime/control receipts',
+    '  --check-manifest              read-only hash/status check; writes nothing',
     '  --require-control-verb <verb> default: start,stop; values: start, stop, restart',
     '  --exec-probes                 pass through to host-receipt.mjs',
     '  --force                       overwrite same-name receipt files',
@@ -127,6 +132,7 @@ function usage() {
     '  node ~/.fleet/runtime/receipt-bundle.mjs --agent my-agent --out-dir ~/.fleet/receipts/my-agent --install-receipt ~/.fleet/receipts/install.json --skip-runtime --skip-control',
     '  queue inbox + start with cutover-probe.mjs > ~/.fleet/receipts/my-agent/probe-start.json, then rerun with --probe-receipt ~/.fleet/receipts/my-agent/probe-start.json --skip-host --control-label start',
     '  queue stop with cutover-probe.mjs > ~/.fleet/receipts/my-agent/probe-stop.json, then rerun with --probe-receipt ~/.fleet/receipts/my-agent/probe-stop.json --skip-host --skip-runtime --control-label stop',
+    '  node ~/.fleet/runtime/receipt-bundle.mjs --out-dir ~/.fleet/receipts/my-agent --check-manifest',
   ].join('\n')
 }
 
@@ -188,6 +194,159 @@ function receiptMeta(path) {
     receipt_type: receipt?.receipt_type ?? null,
     status: receipt?.status ?? null,
     sha256: fileSha256(path),
+  }
+}
+
+function manifestPathForCheck(opts) {
+  if (opts.manifestPath) return pathArg(opts.manifestPath)
+  if (opts.outDir) return join(pathArg(opts.outDir), 'manifest.json')
+  return ''
+}
+
+function resolveArtifactPath(manifestDir, declaredPath) {
+  if (typeof declaredPath !== 'string' || declaredPath.length === 0) return ''
+  const localPath = join(manifestDir, basename(declaredPath))
+  if (existsSync(localPath)) return localPath
+  if (declaredPath.startsWith('~/') || isAbsolute(declaredPath)) return pathArg(declaredPath)
+  return resolve(manifestDir, declaredPath)
+}
+
+function bundleArtifactEntries(manifest) {
+  const artifacts = manifest?.artifacts ?? {}
+  const entries = []
+  const add = (label, meta) => {
+    if (!meta || typeof meta !== 'object') return
+    entries.push({
+      label,
+      path: meta.path,
+      sha256: meta.sha256 ?? null,
+      receipt_type: meta.receipt_type ?? null,
+      status: meta.status ?? null,
+    })
+  }
+
+  add('install', artifacts.install)
+  for (const [index, probe] of (artifacts.probes ?? []).entries()) add(`probe:${index + 1}`, probe)
+  add('host', artifacts.host)
+  for (const [index, runtime] of (artifacts.runtimes ?? []).entries()) add(`runtime:${index + 1}`, runtime)
+  for (const [index, control] of (artifacts.controls ?? []).entries()) add(`control:${index + 1}`, control)
+  add('cutover_gate', artifacts.cutover_gate)
+  return entries
+}
+
+function checkBundleManifest(opts = {}) {
+  const checks = []
+  const manifestPath = manifestPathForCheck(opts)
+  const manifestDir = manifestPath ? dirname(manifestPath) : ''
+  let manifest = null
+
+  checks.push({
+    ok: Boolean(manifestPath),
+    component: 'receipt-bundle-check',
+    check: 'manifest_path_selected',
+    path: manifestPath || null,
+  })
+
+  if (manifestPath) {
+    manifest = readReceipt(manifestPath)
+    checks.push({
+      ok: Boolean(manifest),
+      component: 'receipt-bundle-check',
+      check: 'manifest_read',
+      path: manifestPath,
+    })
+  }
+
+  if (manifest) {
+    checks.push({
+      ok: manifest.receipt_type === 'mupot-fleet-receipt-bundle/v1',
+      component: 'receipt-bundle-check',
+      check: 'manifest_receipt_type',
+      path: manifestPath,
+      expected: 'mupot-fleet-receipt-bundle/v1',
+      actual: manifest.receipt_type ?? null,
+    })
+    checks.push({
+      ok: manifest.status === 'pass',
+      component: 'receipt-bundle-check',
+      check: 'manifest_status_pass',
+      path: manifestPath,
+      actual: manifest.status ?? null,
+    })
+    checks.push({
+      ok: manifest.integrity?.algorithm === 'sha256',
+      component: 'receipt-bundle-check',
+      check: 'manifest_integrity_algorithm',
+      path: manifestPath,
+      expected: 'sha256',
+      actual: manifest.integrity?.algorithm ?? null,
+    })
+
+    const entries = bundleArtifactEntries(manifest)
+    checks.push({
+      ok: entries.length > 0,
+      component: 'receipt-bundle-check',
+      check: 'artifact_entries_present',
+      path: manifestPath,
+      count: entries.length,
+    })
+
+    for (const entry of entries) {
+      const checkedPath = resolveArtifactPath(manifestDir, entry.path)
+      const actual = checkedPath ? fileSha256(checkedPath) : null
+      const expectedOk = typeof entry.sha256 === 'string' && /^[a-f0-9]{64}$/.test(entry.sha256)
+      checks.push({
+        ok: typeof entry.path === 'string' && entry.path.length > 0,
+        component: 'receipt-bundle-check',
+        check: 'artifact_path_recorded',
+        artifact: entry.label,
+        declared_path: entry.path ?? null,
+      })
+      checks.push({
+        ok: expectedOk,
+        component: 'receipt-bundle-check',
+        check: 'artifact_sha256_recorded',
+        artifact: entry.label,
+        declared_path: entry.path ?? null,
+      })
+      checks.push({
+        ok: Boolean(actual),
+        component: 'receipt-bundle-check',
+        check: 'artifact_file_readable',
+        artifact: entry.label,
+        declared_path: entry.path ?? null,
+        checked_path: checkedPath || null,
+      })
+      checks.push({
+        ok: expectedOk && actual === entry.sha256,
+        component: 'receipt-bundle-check',
+        check: 'artifact_sha256_match',
+        artifact: entry.label,
+        declared_path: entry.path ?? null,
+        checked_path: checkedPath || null,
+        expected: entry.sha256,
+        actual,
+      })
+    }
+  }
+
+  const summary = summarize(checks)
+  return {
+    receipt_type: 'mupot-fleet-receipt-bundle-check/v1',
+    generated_at: new Date().toISOString(),
+    status: summary.status,
+    summary,
+    inputs: {
+      manifest: manifestPath || null,
+      out_dir: opts.outDir ? pathArg(opts.outDir) : null,
+    },
+    manifest: manifest ? {
+      path: manifestPath,
+      receipt_type: manifest.receipt_type ?? null,
+      status: manifest.status ?? null,
+      generated_at: manifest.generated_at ?? null,
+    } : null,
+    checks,
   }
 }
 
@@ -605,6 +764,11 @@ async function main() {
     console.log(usage())
     return
   }
+  if (opts.checkManifest) {
+    const receipt = checkBundleManifest(opts)
+    console.log(JSON.stringify(receipt, null, 2))
+    process.exit(receipt.status === 'fail' ? 1 : 0)
+  }
   const bundle = await buildBundle(opts)
   console.log(JSON.stringify(bundle, null, 2))
   process.exit(bundle.status === 'fail' ? 1 : 0)
@@ -614,4 +778,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   await main()
 }
 
-export { buildBundle, defaultStamp, parseArgs, safeName, summarize }
+export { buildBundle, checkBundleManifest, defaultStamp, parseArgs, safeName, summarize }

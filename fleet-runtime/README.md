@@ -453,6 +453,22 @@ node ~/.fleet/runtime/receipt-bundle.mjs \
   --verify-only
 ```
 
+To verify a copied bundle without rewriting anything, run the manifest check. It
+reads `manifest.json`, checks the recorded receipt artifact SHA-256 hashes, and
+exits non-zero if any saved file drifted:
+
+```bash
+node ~/.fleet/runtime/receipt-bundle.mjs \
+  --out-dir ~/.fleet/receipts/my-agent \
+  --check-manifest
+```
+
+or from a checkout:
+
+```bash
+npm run receipt:bundle:check -- --out-dir ./receipts/my-agent
+```
+
 When `manifest.json` and `cutover-gate.json` both report
 `receipt_type: "mupot-fleet-receipt-bundle/v1"` /
 `"mupot-sos-cutover-gate/v1"` with `status: "pass"`, the saved evidence is ready
@@ -462,7 +478,8 @@ same-name failed attempt after fixing the underlying host issue.
 The manifest includes SHA-256 hashes for the saved receipt artifacts
 (`install.json`, `probe-*.json`, `host.json`, `runtime-*.json`,
 `control-*.json`, and `cutover-gate.json`). It does not hash `manifest.json`
-inside itself because that file is self-referential.
+inside itself because that file is self-referential. The manifest check emits
+`mupot-fleet-receipt-bundle-check/v1`.
 
 Every bundle manifest also includes `next_steps`. Treat those as operator
 guidance only: the hard gate remains `manifest.json` and `cutover-gate.json`
