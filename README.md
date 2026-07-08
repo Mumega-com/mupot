@@ -169,4 +169,9 @@ endpoint) connect as **gateway providers** — the core calls a provider, it nev
 
 ## License
 
-Open template — fork it, own it.
+[Mumega Sustainable Use License](LICENSE.md) (fair-code). Free to fork,
+deploy, and modify for your own internal business or personal use.
+Paid consulting and implementation services on top are welcome. Selling
+the software itself — hosting it as a service, embedding it in a paid
+product, white-labeling it for resale — requires a commercial license
+from Mumega Inc. (hadi@mumega.com). Contributions: see [CLA.md](CLA.md).
