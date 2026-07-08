@@ -107,9 +107,9 @@ function usage() {
     '  -h, --help                    show this help',
     '',
     'Typical sequence:',
-    '  node ~/.fleet/runtime/receipt-bundle.mjs --agent my-agent --out-dir ~/.fleet/receipts/my-agent',
-    '  queue start in Mupot, then rerun with --skip-host --skip-runtime --control-label start',
-    '  queue stop in Mupot, then rerun with --skip-host --skip-runtime --control-label stop',
+    '  node ~/.fleet/runtime/receipt-bundle.mjs --agent my-agent --out-dir ~/.fleet/receipts/my-agent --skip-runtime --skip-control',
+    '  queue inbox + start with cutover-probe.mjs, then rerun with --skip-host --control-label start',
+    '  queue stop with cutover-probe.mjs, then rerun with --skip-host --skip-runtime --control-label stop',
   ].join('\n')
 }
 
