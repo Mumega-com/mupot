@@ -58,7 +58,7 @@ import { findPreset, isValidPresetId } from '../auth/role-presets'
 
 // Agent-bound token mint UI.
 import { loadAgentTokenView, agentTokenPageBody, agentTokenMintedBody } from './agent-token'
-import { mintAgentBoundToken } from '../members/service'
+import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
 import { resolveAgentRef } from '../org/resolve'
 
 // Connect-config builders (pure) for the Connect card.
@@ -925,6 +925,9 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   const form = await c.req.parseBody()
   const agentIdRaw = typeof form.agent_id === 'string' ? form.agent_id.trim() : ''
   const labelRaw   = typeof form.label    === 'string' ? form.label.trim()    : ''
+  const capabilityRaw = typeof form.capability === 'string' && form.capability.trim()
+    ? form.capability.trim()
+    : 'member'
 
   if (!agentIdRaw) {
     const view = await loadAgentTokenView(c.env)
@@ -937,6 +940,13 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
     const view = await loadAgentTokenView(c.env)
     return c.html(
       shell(c.env.BRAND, 'Mint agent token', agentTokenPageBody(view, 'Label too long (max 64 chars).')),
+      400,
+    )
+  }
+  if (!isAgentTokenCapability(capabilityRaw)) {
+    const view = await loadAgentTokenView(c.env)
+    return c.html(
+      shell(c.env.BRAND, 'Mint agent token', agentTokenPageBody(view, 'Grant must be observer or member.')),
       400,
     )
   }
@@ -960,7 +970,7 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   // Delegate to the shared atomic-mint helper.
   // Three rows in ONE D1 batch: member envelope + escalation-guard capability +
   // agent-weld token. Same path the MCP mint_agent_token tool uses.
-  const minted = await mintAgentBoundToken(c.env, agent, labelRaw)
+  const minted = await mintAgentBoundToken(c.env, agent, labelRaw, capabilityRaw)
 
   // Look up the squad name for the show-once page.
   const squadRow = await c.env.DB.prepare('SELECT name FROM squads WHERE id = ?1 LIMIT 1')
@@ -974,7 +984,14 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
     shell(
       c.env.BRAND,
       'Agent token minted',
-      agentTokenMintedBody(agent.name, agent.slug, squadRow?.name ?? null, minted.raw, minted.tokenId),
+      agentTokenMintedBody(
+        agent.name,
+        agent.slug,
+        squadRow?.name ?? null,
+        minted.raw,
+        minted.tokenId,
+        minted.grantCapability,
+      ),
     ),
   )
 })

@@ -73,16 +73,16 @@ The arms' frontmatter lists `mcp__mumega-bus__*` tools (SOS bus). The mupot seam
 - **Gate:** caller must hold `admin` on the agent's squad (`memberCanOnSquad(..., 'admin')`, `src/mcp/provision.ts`). Org/department admin inherit down. Mint is an org-trust act → `admin`, never `lead`/`member`.
 - **What it writes — ONE atomic D1 batch** (`src/mcp/provision.ts`), all-or-nothing, receipt-guarded (`assertBatchWritten`, `src/mcp/provision.ts`):
   1. a dedicated `members` row for the agent (no email/IM — it is not a human) (`:291-294`)
-  2. **THE ESCALATION GUARD** — a single `capabilities` row, **hard-coded** `scope_type='squad'`, `capability='member'` on the agent's OWN squad (`:298-301`). This is the *only* grant the token ever carries. It can NEVER be widened from args and NEVER inherits the operator's org-admin (`src/mcp/provision.ts`, `295-297`).
+  2. **THE ESCALATION GUARD** — a single `capabilities` row, **hard-coded** `scope_type='squad'` on the agent's OWN squad. The default grant is `member`, but the operator may lower it to `observer`; it can NEVER be widened above `member`, moved to org/department scope, or inherit the operator's org-admin (`src/mcp/provision.ts`; `src/members/service.ts`).
   3. **THE WELD** — `member_tokens` row with `agent_id = agent.id` set (`:303-306`). Only the SHA-256 `token_hash` is stored, never the raw (`:285-286`).
 - **Agent row creation** is a SEPARATE prior step: `create_agent` (`src/mcp/provision.ts`), gate `lead` on the squad, args `{ squad, slug, name, role?, model?, ... }`. It calls `createAgent` in `src/org/service`. mint does **not** create the agent — the agent must already exist (`src/mcp/provision.ts` resolves it; 404 if absent).
-- **Return — SHOW-ONCE** (`src/mcp/provision.ts`): `{ token: { id, member_id, agent_id, label, channel:'workspace', created_at, raw }, agent, mcp_endpoint, wake_contract, note }`. The `raw` field is the bearer token, returned exactly once: *"raw token is shown ONCE — store it now; it is never retrievable again"* (`:338`). `mcp_endpoint` is `<origin>/mcp` (`src/dashboard/connect.ts:14-17`).
+- **Return — SHOW-ONCE** (`src/mcp/provision.ts`): `{ token: { id, member_id, agent_id, label, channel:'workspace', capability, created_at, raw }, agent, mcp_endpoint, wake_contract, note }`. The `raw` field is the bearer token, returned exactly once: *"raw token is shown ONCE — store it now; it is never retrievable again"* (`:338`). `mcp_endpoint` is `<origin>/mcp` (`src/dashboard/connect.ts:14-17`).
 
 ### 1.2 The least-privilege reality (important — read before planning per-arm caps)
 
-**There is no per-tool capability granularity in the mint.** Every minted agent token gets EXACTLY ONE grant: `member` on its own squad (`src/mcp/provision.ts`). The differentiated "review = read-only, code = +task_update, comms = +broadcast, brain = +task_board" loadout the brief imagines is **not expressible through `mint_agent_token`** — the tool hard-codes `member` and cannot widen.
+`mint_agent_token` now supports a small, hard-capped grant selector: `capability` may be `observer` or `member`, defaulting to `member`. It still mints exactly one squad-scoped grant on the agent's own squad; it cannot mint `lead`, `admin`, `owner`, org scope, or department scope.
 
-What `member` actually buys, per the tool gates:
+What `member` buys, per the tool gates:
 - `recall` / `remember` / `boot_context` / `check_in` / `status` / `orient` / `connect` — `min: 'authenticated'` → any live token (`src/mcp/index.ts`).
 - `squad_recall` — `min: 'observer'` on the target squad; agent-bound tokens may omit `squad_id` and default to their own squad (`src/mcp/index.ts`).
 - `squad_remember` — `min: 'member'` on the target squad; agent-bound tokens may omit `squad_id` and default to their own squad (`src/mcp/index.ts`).
@@ -93,9 +93,14 @@ What `member` actually buys, per the tool gates:
 - `wake_agent` — `min: 'lead'` → a minted `member` token is REFUSED (`src/mcp/index.ts`). Good: arms can't wake each other.
 - `create_*` / `mint_agent_token` — `admin`/`lead` → minted `member` token REFUSED (`src/mcp/provision.ts`). Good: an arm can't provision or escalate.
 
-So least-privilege is achieved STRUCTURALLY by the escalation guard, not by hand-tuning caps. Every arm gets the same `member` grant; the differentiation that matters (an arm can't deploy, mint, or escalate) is enforced by the guard + the floor (`src/mcp/index.ts`).
+What `observer` buys:
+- `recall` / `remember` / `boot_context` / `check_in` / `status` / `orient` / `connect` — still available because they require an authenticated live token.
+- `send` / `inbox` — still available when the token is agent-bound.
+- `peers` and `squad_recall` — available for the agent's own squad because `observer` satisfies read access.
+- `task_create` / `task_update` / `broadcast` / `squad_remember` / `squad_message` — refused because those require `member`.
+- `wake_agent`, `create_*`, and `mint_agent_token` — refused because those require `lead`/`admin`.
 
-> **If true per-arm differentiation is required** (e.g. review = recall/remember/inbox only, NO task_create/squad_message), that is a **follow-on build**: `mint_agent_token` would need an optional explicit-capability arg (still hard-capped at ≤ `member`, still squad-scoped), or a post-mint capability-revoke path. Today it is not parameterizable. **Recommend: ship uniform `member` first (it is already least-privilege for the dangerous axes), file the granularity build as a follow-on.**
+So least-privilege is achieved structurally by the escalation guard plus a small grant selector. Use `observer` for read-mostly arms and `member` for arms that need to write squad tasks, broadcast, or shared memory.
 
 ### 1.3 The exact ceremony (operator runs these against the live `/mcp` seam)
 
@@ -123,23 +128,23 @@ All calls are `POST https://mupot.mumega.com/mcp` with `Authorization: Bearer <O
 
 **Step C — mint the welded token for each** (SHOW-ONCE — capture each `raw` immediately):
 ```json
-{ "tool": "mint_agent_token", "args": { "agent": "kasra-code",     "label": "kasra-code workspace" } }
-{ "tool": "mint_agent_token", "args": { "agent": "kasra-comms",    "label": "kasra-comms workspace" } }
-{ "tool": "mint_agent_token", "args": { "agent": "kasra-review",   "label": "kasra-review workspace" } }
-{ "tool": "mint_agent_token", "args": { "agent": "kasra-research", "label": "kasra-research workspace" } }
-{ "tool": "mint_agent_token", "args": { "agent": "brain",          "label": "brain workspace" } }
-{ "tool": "mint_agent_token", "args": { "agent": "kasra",          "label": "kasra-core workspace" } }
+{ "tool": "mint_agent_token", "args": { "agent": "kasra-code",     "label": "kasra-code workspace",     "capability": "member" } }
+{ "tool": "mint_agent_token", "args": { "agent": "kasra-comms",    "label": "kasra-comms workspace",    "capability": "member" } }
+{ "tool": "mint_agent_token", "args": { "agent": "kasra-review",   "label": "kasra-review workspace",   "capability": "observer" } }
+{ "tool": "mint_agent_token", "args": { "agent": "kasra-research", "label": "kasra-research workspace", "capability": "observer" } }
+{ "tool": "mint_agent_token", "args": { "agent": "brain",          "label": "brain workspace",          "capability": "member" } }
+{ "tool": "mint_agent_token", "args": { "agent": "kasra",          "label": "kasra-core workspace",     "capability": "member" } }
 ```
 (`src/mcp/provision.ts`. If a slug is ambiguous across squads use the agent **id** — `409 ambiguous_slug`, `src/mcp/provision.ts`.)
 
 ### 1.4 Per-arm bus-tool → mupot-capability map + remaining caveats
 
-| arm | bus tools in its def (frontmatter) | mupot tools it gets with a `member`-welded token | remaining caveat |
+| arm | bus tools in its def (frontmatter) | mupot tools it gets with the recommended grant | remaining caveat |
 |---|---|---|---|
-| **kasra-review** | `send, inbox, recall, remember` (`kasra-review.md:18-21`) | `send`, `inbox`, `recall`, `remember`, `squad_recall`, `squad_remember`, `status`, `orient`, `boot_context` | none — fully covered |
+| **kasra-review** | `send, inbox, recall, remember` (`kasra-review.md:18-21`) | with `observer`: `send`, `inbox`, `recall`, `remember`, `squad_recall`, `status`, `orient`, `boot_context` | no write tools unless minted as `member` |
 | **kasra-code** | `send, inbox, recall, remember, check_in, task_update` (`kasra-code.md:20-25`) | `send`, `inbox`, `recall`, `remember`, `squad_recall`, `squad_remember`, `check_in`, `task_create`, `task_update`, `task_list`, `task_board`, `squad_message` | none — fully covered |
 | **kasra-comms** | `send, inbox, broadcast, check_in, peers, recall, remember` (`kasra-comms.md:13-19`) | `send`, `inbox`, `broadcast`, `recall`, `remember`, `squad_recall`, `squad_remember`, `check_in`, `peers`, `squad_message` | none — fully covered |
-| **kasra-research** | `send, inbox, recall, remember` (`kasra-research.md:17-20`) | `send`, `inbox`, `recall`, `remember`, `squad_recall`, `squad_remember`, `status`, `orient` | none — fully covered |
+| **kasra-research** | `send, inbox, recall, remember` (`kasra-research.md:17-20`) | with `observer`: `send`, `inbox`, `recall`, `remember`, `squad_recall`, `status`, `orient` | no write tools unless minted as `member` |
 | **brain** | `inbox, send, recall, remember, boot_context, status, task_board` (`brain.md:22-28`) + an `mcp__sos__*` set (`brain.md:11-21`) | `inbox`, `send`, `recall`, `remember`, `squad_recall`, `squad_remember`, `boot_context`, `check_in`, `peers`, `status`, `task_board`, `task_list`, `task_update` | none — fully covered |
 | **kasra** (core) | (uses the workspace `.mcp.json` `sos` server, not a `mcp__mumega-bus__` allowlist) | full `member` set incl. `task_create`, `squad_message` | merge/deploy stays bus-side + GitHub regardless |
 
@@ -343,5 +348,4 @@ and exiting `0` so the daemon consumes the batch.
    `fleet-runtime/inbox-handler.mjs` exist, but the bash wake-hooks still need a
    reviewed host config/command that launches the right runtime and exits `0`
    only after durable local handoff.
-2. **Per-arm capability granularity in `mint_agent_token`** — today every minted token gets uniform squad `member` (`src/mcp/provision.ts`). True per-arm least-privilege (e.g. review = recall/remember/inbox only, NO task_create/squad_message) is not expressible. Follow-on: optional explicit-capability arg, still hard-capped ≤ `member`.
-3. **Dropping `verify-delegation.py` HMAC** — safe only after the host handler diff proves it reads from signed Mupot inbox batches and does not trust client-supplied routing. Security-relevant; must pass diverse review.
+2. **Dropping `verify-delegation.py` HMAC** — safe only after the host handler diff proves it reads from signed Mupot inbox batches and does not trust client-supplied routing. Security-relevant; must pass diverse review.

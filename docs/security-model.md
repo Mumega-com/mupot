@@ -77,8 +77,10 @@ The caller never supplies its own member id.
 
 Agent-bound member tokens weld a member-token row to one `agent_id`. The shared
 mint path is `mintAgentBoundToken` in `src/members/service.ts`. It writes the
-member envelope, one squad-scoped `member` capability, and the agent-welded token
-in one D1 batch.
+member envelope, one squad-scoped capability, and the agent-welded token in one
+D1 batch. The grant is hard-capped to the agent's own squad and may only be
+`observer` or `member` (`member` is the default); mint cannot create `lead`,
+`admin`, `owner`, department, or org grants.
 
 This means a runtime using that token can act as that agent only where the token
 and capability allow. The fleet bearer attach route rejects pure human tokens and

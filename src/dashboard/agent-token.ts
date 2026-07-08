@@ -2,8 +2,8 @@
 //
 // An AGENT-BOUND token is different from an operator/human token:
 //   - It mints a DEDICATED member envelope (no email, no IM) for the agent.
-//   - The escalation guard is hard-coded: squad-scoped 'member' on the agent's
-//     OWN squad — never org/dept, never above member.
+//   - The escalation guard is hard-coded: squad-scoped observer/member on the
+//     agent's OWN squad — never org/dept, never above member.
 //   - The token row's agent_id = the agent's id (the weld).  The /attach endpoint
 //     requires token.boundAgentId === agent_id; an operator token (agent_id NULL)
 //     fails that check.
@@ -95,8 +95,8 @@ export function agentTokenPageBody(view: AgentTokenView, error?: string) {
   the agent runtime pastes into its workspace config. Unlike an operator token (which has
   <em>no</em> agent binding), an agent-bound token is required by the
   <code class="inline">/attach</code> endpoint and carries only a hard-capped
-  squad-scoped <code class="inline">member</code> grant — it can never inherit your
-  org-admin standing.
+  squad-scoped <code class="inline">observer</code> or <code class="inline">member</code>
+  grant — it can never inherit your org-admin standing.
 </p>
 
 ${honoRaw(errorHtml)}
@@ -119,6 +119,13 @@ ${honoRaw(errorHtml)}
       <label style="margin-top:10px">
         Label <span style="font-size:12px;color:var(--muted)">(optional — max 64 chars)</span>
         <input name="label" placeholder="e.g. main-host" maxlength="64" style="min-width:200px" />
+      </label>
+      <label style="margin-top:10px">
+        Squad grant
+        <select name="capability">
+          <option value="member">Member — can write squad tasks, broadcast, and shared memory</option>
+          <option value="observer">Observer — can read roster/shared memory, inbox, and private memory</option>
+        </select>
       </label>
       <div style="margin-top:16px">
         <button class="btn" type="submit">Mint agent token</button>
@@ -144,6 +151,7 @@ export function agentTokenMintedBody(
   squadName: string | null,
   raw: string,
   tokenId: string,
+  capability: string,
 ) {
   const scopeLabel = squadName ? `${squadName} / ${agentName}` : agentName
   return html`
@@ -152,7 +160,8 @@ export function agentTokenMintedBody(
 <div class="card">
   <p style="font-size:14px;color:var(--muted);margin:0 0 14px">
     Bound to <strong>${scopeLabel}</strong> (slug: <code class="inline">${agentSlug}</code>) ·
-    Token ID: <code class="inline">${tokenId}</code>
+    Token ID: <code class="inline">${tokenId}</code> ·
+    Squad grant: <code class="inline">${capability}</code>
   </p>
   <div class="warn-box" style="margin-bottom:14px">
     <strong>Shown once only.</strong> Copy this token now — it cannot be retrieved again.
