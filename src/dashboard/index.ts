@@ -3984,7 +3984,7 @@ function fleetScript() {
             btn.addEventListener('click', function () {
               var act = btn.getAttribute('data-act');
               if (act === 'delete' && !confirm('Request DELETE of agent "' + agent + '"? Operations executes and acks.')) return;
-              var url = act === 'wake' ? '/dashboard/fleet/wake' : '/dashboard/fleet/control';
+              var url = act === 'wake' ? '/fleet/wake' : '/fleet/control';
               var payload = act === 'wake' ? { agent: agent } : { agent: agent, action: act };
               btn.disabled = true; status.textContent = '…';
               fetch(url, { method: 'POST', credentials: 'same-origin',
