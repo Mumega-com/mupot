@@ -16,6 +16,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 // ── (a) parsePhysicsSnapshot ─────────────────────────────────────────────────
 import { parsePhysicsSnapshot } from '../src/dashboard/brain'
+import type { HumanDirective } from '../src/brain/directive'
 
 const VALID_SNAPSHOT = {
   C: 0.912, R: 0.5, Psi: 0.012, ARF: 0.00547,
@@ -132,6 +133,40 @@ describe('(c) brainBody renders coherence scalars from physics snapshot', () => 
   })
 })
 
+// ── (c2) brainBody renders pinned human directive ───────────────────────────
+const VALID_DIRECTIVE: HumanDirective = {
+  text: 'Pause outbound sends until host receipts are attached.',
+  by_member_id: 'm-owner',
+  updated_at: '2026-07-08T12:34:00.000Z',
+  source: 'im',
+}
+
+describe('(c2) brainBody renders pinned human directive', () => {
+  it('renders directive text and metadata when pinned', () => {
+    const html = String(brainBody({ loops: [], decisions: [], physics: null, directive: VALID_DIRECTIVE }, false))
+    expect(html).toContain('Human Directive')
+    expect(html).toContain('pinned')
+    expect(html).toContain('Pause outbound sends until host receipts are attached.')
+    expect(html).toContain('im · 2026-07-08 12:34')
+  })
+
+  it('escapes directive text', () => {
+    const html = String(brainBody({
+      loops: [],
+      decisions: [],
+      physics: null,
+      directive: { ...VALID_DIRECTIVE, text: '<script>alert(1)</script>' },
+    }, false))
+    expect(html).not.toContain('<script>alert(1)</script>')
+    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;')
+  })
+
+  it('renders a none-pinned state when no directive exists', () => {
+    const html = String(brainBody({ loops: [], decisions: [], physics: null, directive: null }, false))
+    expect(html).toContain('none pinned')
+  })
+})
+
 // ── (d) brainBody renders "no data yet" when physics is null ────────────────
 describe('(d) brainBody renders "no data yet" when physics is null', () => {
   it('shows the no-data message', () => {
@@ -156,8 +191,9 @@ import { PHYSICS_KV_KEY } from '../src/dashboard/brain'
 function makeIngestEnv(opts: {
   adminTokenHash?: string | null
   kvPutResult?: 'ok' | 'fail'
+  directiveRaw?: string | null
 } = {}) {
-  const { adminTokenHash = null, kvPutResult = 'ok' } = opts
+  const { adminTokenHash = null, kvPutResult = 'ok', directiveRaw = null } = opts
 
   // sha256 of literal "admin-token" pre-computed to avoid async in mock setup.
   // We inject a DB that recognises the hash directly.
@@ -165,30 +201,40 @@ function makeIngestEnv(opts: {
 
   const kvStore: Record<string, string> = {}
 
-  const stmt = {
-    bind: (..._args: unknown[]) => stmt,
-    first: vi.fn(async () => {
-      // Return a member row if a hash was given (simulating a valid admin token lookup).
-      if (!storedHash) return null
-      return {
-        member_id: 'm1',
-        display_name: 'Brain Daemon',
-        email: null,
-        status: 'active',
-        bound_agent_id: null,
-      }
-    }),
-    all: vi.fn(async () => ({
-      results: storedHash
-        ? [{ member_id: 'm1', scope_type: 'org', scope_id: null, capability: 'admin' }]
-        : [],
-    })),
-    run: vi.fn(async () => ({ meta: { changes: 1 } })),
-  }
-
   return {
     TENANT_SLUG: 't',
-    DB: { prepare: vi.fn(() => stmt) },
+    DB: {
+      prepare: vi.fn((sql: string) => {
+        const stmt = {
+          bind: (..._args: unknown[]) => ({
+            first: vi.fn(async () => {
+              if (sql.includes('FROM member_tokens')) {
+                // Return a member row if a hash was given (simulating a valid admin token lookup).
+                if (!storedHash) return null
+                return {
+                  member_id: 'm1',
+                  display_name: 'Brain Daemon',
+                  email: null,
+                  status: 'active',
+                  bound_agent_id: null,
+                }
+              }
+              if (sql.includes('FROM org_settings')) {
+                return directiveRaw === null ? null : { value: directiveRaw }
+              }
+              return null
+            }),
+            all: vi.fn(async () => ({
+              results: sql.includes('FROM capabilities') && storedHash
+                ? [{ member_id: 'm1', scope_type: 'org', scope_id: null, capability: 'admin' }]
+                : [],
+            })),
+            run: vi.fn(async () => ({ meta: { changes: 1 } })),
+          }),
+        }
+        return stmt
+      }),
+    },
     SESSIONS: {
       get: vi.fn(async (k: string) => kvStore[k] ?? null),
       put: vi.fn(async (k: string, v: string) => {
@@ -231,6 +277,30 @@ describe('(e) POST /api/brain/physics — auth + ingest', () => {
     // Verify KV.put was called with the correct key.
     expect((env.SESSIONS as ReturnType<typeof makeIngestEnv>['SESSIONS']).put)
       .toHaveBeenCalledWith(PHYSICS_KV_KEY, expect.any(String), expect.objectContaining({ expirationTtl: expect.any(Number) }))
+  })
+})
+
+describe('(e2) GET /api/brain/directive — auth + read', () => {
+  it('returns 401 when no Authorization header is provided', async () => {
+    const env = makeIngestEnv()
+    const req = new Request('https://pot.test/directive')
+    const res = await brainPhysicsIngestApp.fetch(req, env)
+    expect(res.status).toBe(401)
+  })
+
+  it('returns the pinned directive when a valid admin token is provided', async () => {
+    const env = makeIngestEnv({
+      adminTokenHash: 'some-hash',
+      directiveRaw: JSON.stringify(VALID_DIRECTIVE),
+    })
+    const req = new Request('https://pot.test/directive', {
+      headers: { Authorization: 'Bearer valid-admin-token' },
+    })
+    const res = await brainPhysicsIngestApp.fetch(req, env)
+    expect(res.status).toBe(200)
+    const body = await res.json() as { ok: boolean; directive: HumanDirective | null }
+    expect(body.ok).toBe(true)
+    expect(body.directive).toMatchObject(VALID_DIRECTIVE)
   })
 })
 

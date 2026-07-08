@@ -313,6 +313,7 @@ export type BusEventType =
   | 'task.verdict' // gate decision written — verdict + new task status in payload
   | 'agent.wake'
   | 'fleet.control.requested' // signed host-control request queued for the fleet daemon
+  | 'brain.directive.updated' // owner-pinned directive changed for the brain decision loop
   | 'squad.dispatch'
   | 'org.provisioned' // a department/squad/agent/token was created in-band (payload.kind)
 

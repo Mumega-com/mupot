@@ -14,6 +14,7 @@ const sendTaskTitle = `Browser workflow smoke ${smokeRunId}`
 const approvalTaskTitle = `Approval workflow smoke ${smokeRunId}`
 const hermesApprovalTaskTitle = `Hermes approval smoke ${smokeRunId}`
 const hermesTaskTitle = `Hermes dashboard refresh ${smokeRunId}`
+const hermesDirectiveText = `Hold all outbound automation until local browser smoke ${smokeRunId} is complete.`
 
 const pages = [
   '/',
@@ -304,6 +305,44 @@ async function runHermesApprovalWorkflow(hermes) {
   })
 }
 
+async function runHermesDirectiveWorkflow(hermes) {
+  await postHermesMessage(hermes, {
+    lifecycle: 'Hermes IM directive set lifecycle',
+    text: `directive: ${hermesDirectiveText}`,
+    expect: 'Pinned directive for the brain.',
+  })
+
+  await page.goto(`${baseUrl}/brain`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const pinnedBrainText = await textSnippet(page.locator('body'), 3000)
+  if (!pinnedBrainText.includes(hermesDirectiveText)) {
+    fail('Hermes-pinned directive did not appear on the brain dashboard', {
+      hermesDirectiveText,
+      pinnedBrainText,
+    })
+  }
+
+  await postHermesMessage(hermes, {
+    lifecycle: 'Hermes IM directive clear lifecycle',
+    text: 'directive clear',
+    expect: 'Cleared the pinned directive.',
+  })
+
+  await page.goto(`${baseUrl}/brain`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const clearedBrainText = await textSnippet(page.locator('body'), 3000)
+  if (clearedBrainText.includes(hermesDirectiveText)) {
+    fail('Hermes-cleared directive still appears on the brain dashboard', {
+      hermesDirectiveText,
+      clearedBrainText,
+    })
+  }
+
+  workflows.push({
+    name: 'Hermes IM brain directive set and clear',
+    status: 'passed',
+    directive: hermesDirectiveText,
+  })
+}
+
 try {
   const login = await page.goto(`${baseUrl}/auth/dev-login`, { waitUntil: 'networkidle', timeout: 20_000 })
   if (!login || login.status() >= 400) fail('dev login failed', { status: login?.status() })
@@ -335,6 +374,7 @@ try {
 
   const hermes = []
   await runHermesApprovalWorkflow(hermes)
+  await runHermesDirectiveWorkflow(hermes)
   for (const msg of hermesMessages) {
     await postHermesMessage(hermes, msg)
   }

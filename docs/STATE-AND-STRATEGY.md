@@ -63,7 +63,8 @@ Like mumega resells PECB: agencies/experts resell our engine to **their** networ
   pot to scale; flip the dyad-gate ON (branch protection + `DYAD_GATE_REVIEWERS`).
 - **IM control parity** (Hadi, 2026-06-21): do from Telegram what the dashboard backend does — fleet
   start/stop, approve/reject, directive — on the single capability-gated IM seam (`src/im/index.ts`).
-  Verbs status/wake/task/fleet/approve/reject exist; directive is the remaining wiring slice, not new
-  trust. Design: `docs/im-control-parity.md`.
+  Verbs status/wake/task/fleet/approve/reject/directive exist in the PR branch; bot-front-door
+  unification and real host adoption are the remaining evidence/wiring slices, not new trust. Design:
+  `docs/im-control-parity.md`.
 - **Infra note:** recall/remember (Postgres) backend down — async `kasra-review` freezes on it; run gate
   reviews **sync with recall skipped**.

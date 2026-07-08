@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest'
 import { handleImMessage } from '../src/im'
 import { verifyControlRequest } from '../src/fleet/control-request'
+import { HUMAN_DIRECTIVE_KEY } from '../src/brain/directive'
 import type { Env, Task } from '../src/types'
 
 let panelPrivJwk = ''
@@ -34,6 +35,7 @@ function makeEnv(opts: {
   }> = []
   const controlLog: unknown[][] = []
   const verdicts: unknown[][] = []
+  const settings = new Map<string, string>()
   let seq = 0
 
   const member = {
@@ -106,6 +108,11 @@ function makeEnv(opts: {
                 const ok = principalId === member.id && gateGrants.includes(capability)
                 return ok ? ({ 1: 1 } as T) : null as T | null
               }
+              if (sql.includes('FROM org_settings')) {
+                const [key] = args as [string]
+                const value = settings.get(key)
+                return value === undefined ? null as T | null : { value } as T
+              }
               if (sql.includes('FROM agent_messages') && sql.includes('from_agent = ?2 AND request_id = ?3')) {
                 const [tenant, fromAgent, requestId] = args as [string, string, string]
                 const found = messages.find(
@@ -147,6 +154,16 @@ function makeEnv(opts: {
               }
               if (sql.includes('INSERT INTO task_verdicts')) {
                 verdicts.push(args)
+                return { meta: { changes: 1 } }
+              }
+              if (sql.includes('INSERT INTO org_settings')) {
+                const [key, value] = args as [string, string]
+                settings.set(key, value)
+                return { meta: { changes: 1 } }
+              }
+              if (sql.includes('DELETE FROM org_settings')) {
+                const [key] = args as [string]
+                settings.delete(key)
                 return { meta: { changes: 1 } }
               }
               if (sql.includes('INSERT INTO agent_messages')) {
@@ -198,7 +215,7 @@ function makeEnv(opts: {
     },
   } as unknown as Env
 
-  return { env, inserts, busEvents, messages, controlLog, tasks, verdicts }
+  return { env, inserts, busEvents, messages, controlLog, tasks, verdicts, settings }
 }
 
 describe('Hermes IM control', () => {
@@ -260,6 +277,97 @@ describe('Hermes IM control', () => {
     expect(reply).toBe("You don't have permission to control fleet agents (need owner on the org).")
     expect(messages).toHaveLength(0)
     expect(controlLog).toHaveLength(0)
+    expect(busEvents).toHaveLength(0)
+  })
+
+  it('refuses forwarded fleet control commands', async () => {
+    const { env, messages, controlLog, busEvents } = makeEnv()
+
+    const reply = await handleImMessage(env, 123456789, 'fleet stop hermes', { forwarded: true })
+
+    expect(reply).toBe('Fleet control commands must be sent directly from your paired chat, not forwarded.')
+    expect(messages).toHaveLength(0)
+    expect(controlLog).toHaveLength(0)
+    expect(busEvents).toHaveLength(0)
+  })
+
+  it('pins a human directive from an owner IM command', async () => {
+    const { env, settings, busEvents } = makeEnv()
+    const text = 'Hold outbound outreach until receipt evidence is attached.'
+
+    const reply = await handleImMessage(env, 123456789, `directive: ${text}`)
+
+    expect(reply).toBe('Pinned directive for the brain.')
+    const raw = settings.get(HUMAN_DIRECTIVE_KEY)
+    expect(raw).toBeTruthy()
+    expect(JSON.parse(raw as string)).toMatchObject({
+      text,
+      by_member_id: 'mbr-hermes-user',
+      source: 'im',
+    })
+    expect(busEvents).toContainEqual(
+      expect.objectContaining({
+        type: 'brain.directive.updated',
+        tenant: 'local',
+        actor: { kind: 'member', id: 'mbr-hermes-user' },
+        payload: expect.objectContaining({
+          action: 'set',
+          key: HUMAN_DIRECTIVE_KEY,
+          source: 'im',
+          by_member_id: 'mbr-hermes-user',
+          text_length: text.length,
+        }),
+      }),
+    )
+  })
+
+  it('clears a pinned human directive from owner IM', async () => {
+    const { env, settings, busEvents } = makeEnv()
+    settings.set(HUMAN_DIRECTIVE_KEY, JSON.stringify({
+      text: 'Existing directive',
+      by_member_id: 'mbr-hermes-user',
+      updated_at: '2026-07-07T00:00:00.000Z',
+      source: 'im',
+    }))
+
+    const reply = await handleImMessage(env, 123456789, 'directive clear')
+
+    expect(reply).toBe('Cleared the pinned directive.')
+    expect(settings.has(HUMAN_DIRECTIVE_KEY)).toBe(false)
+    expect(busEvents).toContainEqual(
+      expect.objectContaining({
+        type: 'brain.directive.updated',
+        tenant: 'local',
+        actor: { kind: 'member', id: 'mbr-hermes-user' },
+        payload: expect.objectContaining({
+          action: 'clear',
+          key: HUMAN_DIRECTIVE_KEY,
+          source: 'im',
+          by_member_id: 'mbr-hermes-user',
+        }),
+      }),
+    )
+  })
+
+  it('refuses directive writes without owner capability', async () => {
+    const { env, settings, busEvents } = makeEnv({ capability: 'admin' })
+
+    const reply = await handleImMessage(env, 123456789, 'directive: Change the brain policy')
+
+    expect(reply).toBe("You don't have permission to pin brain directives (need owner on the org).")
+    expect(settings.has(HUMAN_DIRECTIVE_KEY)).toBe(false)
+    expect(busEvents).toHaveLength(0)
+  })
+
+  it('refuses forwarded directive commands', async () => {
+    const { env, settings, busEvents } = makeEnv()
+
+    const reply = await handleImMessage(env, 123456789, 'directive: forwarded control', {
+      forwarded: true,
+    })
+
+    expect(reply).toBe('Brain directives must be sent directly from your paired chat, not forwarded.')
+    expect(settings.has(HUMAN_DIRECTIVE_KEY)).toBe(false)
     expect(busEvents).toHaveLength(0)
   })
 

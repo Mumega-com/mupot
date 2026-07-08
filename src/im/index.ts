@@ -40,6 +40,14 @@ import { createTask, writeVerdict, VerdictRaceError } from '../tasks/service'
 import { emitControlRequest } from '../fleet/control'
 import { CONTROL_VERBS, type ControlVerb } from '../fleet/control-request'
 import { listFleetAgents, type FleetAgentRow } from '../fleet/registry'
+import {
+  clearHumanDirective,
+  HUMAN_DIRECTIVE_KEY,
+  HUMAN_DIRECTIVE_MAX_CHARS,
+  setHumanDirective,
+  validateHumanDirectiveText,
+  type HumanDirectiveAction,
+} from '../brain/directive'
 
 type AppEnv = { Bindings: Env }
 
@@ -147,6 +155,7 @@ type Intent =
   | { kind: 'wake'; ref: string }
   | { kind: 'fleet'; verb: ControlVerb; ref: string }
   | { kind: 'verdict'; verdict: 'approved' | 'rejected'; ref: string; note: string | null }
+  | { kind: 'directive'; action: HumanDirectiveAction; text: string | null }
   | { kind: 'task'; title: string; squadRef: string | null }
   | { kind: 'unknown' }
 
@@ -198,6 +207,18 @@ function parseIntent(text: string): Intent {
     return { kind: 'unknown' }
   }
 
+  // "directive: <text>" pins a direct owner instruction for the brain.
+  // "directive clear" removes it. The colon form is intentional so a natural
+  // sentence starting with "directive" does not accidentally become control state.
+  if (/^\/?directive\s+clear$/i.test(trimmed)) {
+    return { kind: 'directive', action: 'clear', text: null }
+  }
+  const directiveMatch = trimmed.match(/^\/?directive\s*:\s*([\s\S]+)$/i)
+  if (directiveMatch) {
+    const text = directiveMatch[1]
+    return { kind: 'directive', action: 'set', text }
+  }
+
   // "approve <task-id> [note]" or "reject <task-id> <reason>"
   const verdictMatch = trimmed.match(/^\/?(approve|reject)\s+([A-Za-z0-9_-]{6,64})(?:\s+(.+))?$/i)
   if (verdictMatch) {
@@ -224,10 +245,15 @@ function parseIntent(text: string): Intent {
 const HELP =
   'I can: "task: <title>" (optionally "@squad"), "status" or "status <agent>", ' +
   '"wake <agent>", "fleet start|stop|restart|status <agent>", "approve <task-id>", ' +
-  'or "reject <task-id> <reason>". I act as you, with your permissions.'
+  '"reject <task-id> <reason>", "directive: <text>", or "directive clear". ' +
+  'I act as you, with your permissions.'
 
 const IM_TASK_DONE_WHEN =
   'A task result or linked artifact provides evidence that the requested IM task is complete.'
+
+export interface HandleImMessageOptions {
+  forwarded?: boolean
+}
 
 // ── the entry point Hermes calls ──────────────────────────────────────────────
 // (env, chatId, text) → a short text reply to send back into the chat. Pure with
@@ -236,6 +262,7 @@ export async function handleImMessage(
   env: Env,
   chatId: string | number,
   text: string,
+  options: HandleImMessageOptions = {},
 ): Promise<string> {
   const chat = String(chatId)
 
@@ -265,10 +292,13 @@ export async function handleImMessage(
       return wakeReply(env, member, grants, intent.ref)
 
     case 'fleet':
-      return fleetReply(env, member, grants, intent.verb, intent.ref)
+      return fleetReply(env, member, grants, intent.verb, intent.ref, options)
 
     case 'verdict':
       return verdictReply(env, member, grants, intent.verdict, intent.ref, intent.note)
+
+    case 'directive':
+      return directiveReply(env, member, grants, intent.action, intent.text, options)
 
     case 'task':
       return taskReply(env, member, grants, intent.title, intent.squadRef)
@@ -375,7 +405,11 @@ async function fleetReply(
   grants: CapabilityGrant[],
   verb: ControlVerb,
   ref: string,
+  options: HandleImMessageOptions,
 ): Promise<string> {
+  if (options.forwarded) {
+    return 'Fleet control commands must be sent directly from your paired chat, not forwarded.'
+  }
   if (!canControlFleet(grants)) {
     return `You don't have permission to control fleet agents (need owner on the org).`
   }
@@ -531,6 +565,80 @@ async function verdictReply(
   return verdict === 'approved' ? `Approved "${task.title}".` : `Rejected "${task.title}".`
 }
 
+// ── intent: human directive (cap: owner on org, direct chat only) ─────────────
+function canPinHumanDirective(grants: CapabilityGrant[]): boolean {
+  return hasCapability(grants, 'org', null, 'owner')
+}
+
+async function emitDirectiveUpdate(
+  env: Env,
+  member: Member,
+  action: HumanDirectiveAction,
+  textLength: number | null,
+): Promise<void> {
+  const now = new Date().toISOString()
+  const payload: {
+    action: HumanDirectiveAction
+    key: typeof HUMAN_DIRECTIVE_KEY
+    source: 'im'
+    by_member_id: string
+    text_length?: number
+  } = {
+    action,
+    key: HUMAN_DIRECTIVE_KEY,
+    source: 'im',
+    by_member_id: member.id,
+  }
+  if (textLength !== null) payload.text_length = textLength
+
+  const event: BusEvent<typeof payload> = {
+    type: 'brain.directive.updated',
+    tenant: env.TENANT_SLUG,
+    actor: memberActor(member.id),
+    payload,
+    ts: now,
+  }
+  await createBus(env).emit(event)
+}
+
+async function directiveReply(
+  env: Env,
+  member: Member,
+  grants: CapabilityGrant[],
+  action: HumanDirectiveAction,
+  text: string | null,
+  options: HandleImMessageOptions,
+): Promise<string> {
+  if (options.forwarded) {
+    return 'Brain directives must be sent directly from your paired chat, not forwarded.'
+  }
+  if (!canPinHumanDirective(grants)) {
+    return `You don't have permission to pin brain directives (need owner on the org).`
+  }
+
+  if (action === 'clear') {
+    await clearHumanDirective(env)
+    await emitDirectiveUpdate(env, member, 'clear', null)
+    return 'Cleared the pinned directive.'
+  }
+
+  const checked = validateHumanDirectiveText(text ?? '')
+  if (!checked.ok) {
+    if (checked.reason === 'too_long') {
+      return `Directive is too long. Keep it under ${HUMAN_DIRECTIVE_MAX_CHARS} characters.`
+    }
+    return 'Write the directive after "directive:".'
+  }
+
+  const directive = await setHumanDirective(env, {
+    text: checked.text,
+    byMemberId: member.id,
+    source: 'im',
+  })
+  await emitDirectiveUpdate(env, member, 'set', directive.text.length)
+  return 'Pinned directive for the brain.'
+}
+
 // ── intent: task (cap: member+ on the target squad) ───────────────────────────
 async function taskReply(
   env: Env,
@@ -592,6 +700,10 @@ interface TelegramUpdate {
   message?: {
     chat?: { id?: unknown }
     text?: unknown
+    forward_origin?: unknown
+    forward_from?: unknown
+    forward_from_chat?: unknown
+    forward_date?: unknown
   }
 }
 
@@ -630,6 +742,12 @@ imApp.post('/webhook', async (c) => {
 
   const text = typeof update.message?.text === 'string' ? update.message.text : ''
 
-  const reply = await handleImMessage(c.env, chatId, text)
+  const forwarded =
+    update.message?.forward_origin !== undefined ||
+    update.message?.forward_from !== undefined ||
+    update.message?.forward_from_chat !== undefined ||
+    update.message?.forward_date !== undefined
+
+  const reply = await handleImMessage(c.env, chatId, text, { forwarded })
   return c.json({ ok: true, reply })
 })

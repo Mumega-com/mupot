@@ -85,6 +85,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<void> {
     case 'task.blocked':
     case 'task.verdict':
     case 'fleet.control.requested':
+    case 'brain.directive.updated':
     case 'org.provisioned': {
       // Terminal observations, gate decisions, and structural provisioning; no DO
       // wake by default. Log for the activity feed (the agent-actor branch in
