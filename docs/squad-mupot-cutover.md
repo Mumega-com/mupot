@@ -240,7 +240,7 @@ daemon's signed inbox drain and `fleet-runtime/inbox-handler.mjs`, which persist
 each message to a 0600 local spool file before optionally launching the runtime
 and exiting `0` so the daemon consumes the batch.
 
-### 3.3 What changes in the hooks once the HTTP inbox route exists
+### 3.3 What changes in the hooks now that signed inbox exists
 
 - **`check-inbox.sh`:** replace the `redis-cli XREVRANGE` block (`:63-83`) with
   the fleet daemon's inbox handler payload, or with a bearer fallback:
@@ -268,7 +268,7 @@ and exiting `0` so the daemon consumes the batch.
 
 ## 4. Cutover order + rollback
 
-**Principle:** memory + identity FIRST (idempotent, reversible, no message-loss risk), messaging SECOND, wake-hooks LAST (blocked on the HTTP inbox route). Keep SOS bus running the whole time; flip one arm at a time; verify each with a receipt.
+**Principle:** memory + identity FIRST (idempotent, reversible, no message-loss risk), messaging SECOND, wake-hooks LAST (gated by live host receipts, not by route availability). Keep SOS bus running the whole time; flip one arm at a time; verify each with a receipt.
 
 ### Sequence
 
@@ -296,11 +296,12 @@ and exiting `0` so the daemon consumes the batch.
    - `peers` can now move to Mupot MCP directly; verify that kasra-comms or brain sees its squad roster before removing the SOS `peers` hook.
    - kasra-comms `broadcast` can now move to Mupot MCP directly; verify one fan-out receipt and one recipient inbox receipt before removing the SOS `broadcast` hook.
 
-5. **Wake-hooks cutover — host wiring step.** Do NOT migrate the hooks until
-   `/api/inbox/signed` is deployed and the local handler has passed review.
-   Until then: arms can run on mupot for memory + messaging, but cold-start
-   delegation still flows through SOS Redis (`activation-watcher.sh`). This is a
-   fine intermediate state — the hooks are the LAST thing to move.
+5. **Wake-hooks cutover — host wiring step.** `/api/inbox/signed` and the
+   maintained local handler now exist in this branch; do NOT migrate the hooks
+   until the target host has a passing receipt bundle. Until then: arms can run
+   on mupot for memory + messaging, but cold-start delegation still flows
+   through SOS Redis (`activation-watcher.sh`). This is a fine intermediate
+   state — the hooks are the LAST thing to move.
    - Host install: run `npm run fleet:install` from a checkout, or
      `node fleet-runtime/install.mjs`, to lay down `~/.fleet/runtime`, editable
      config templates, receipt directories, and systemd user units. For evidence
@@ -369,7 +370,9 @@ and exiting `0` so the daemon consumes the batch.
 ## 5. What stays on SOS / Hadi-go vs Kasra
 
 ### Stays on SOS (do not migrate yet)
-- **Cold-start wake-hooks** — blocked on host handler rollout against `/api/inbox/signed`.
+- **Cold-start wake-hooks** — keep on SOS until the target host's receipt bundle
+  proves install, queued probes, signed inbox handoff, signed lifecycle control,
+  and the final cutover gate.
 - **The SOS bus token itself** — keep live as the rollback floor until the full squad is verified on mupot.
 
 ### Hadi-go (his DIRECT approval / runtime lane — per CLAUDE.md SECURITY APPROVAL PROTOCOL)
@@ -383,22 +386,23 @@ and exiting `0` so the daemon consumes the batch.
 
 ### Kasra (mine — prep + verify, no mint, no deploy, no config write)
 - **Prep the exact mint calls** (section 1.3) and the config diffs (section 2.4) — hand to Hadi.
-- **Prepare/review the host handler rollout for signed inbox drain** (section 3.2) — branch only, through the diverse-gate (kasra-review + a different-model second eye) + Hadi-go before any deploy.
+- **Review the host handler rollout for signed inbox drain** (section 3.2) — branch
+  implementation exists, but per-host config/command changes still go through
+  the diverse-gate (kasra-review + a different-model second eye) + Hadi-go.
 - **Run the verification round-trips** (section 4 receipts) once Hadi has minted + wired, and report receipts (not grades).
 - **Gate the security-relevant change** of dropping `verify-delegation.py`'s HMAC (section 3.3) — mandatory diverse review before it lands.
 
 ---
 
-## Open BLOCKERS / follow-on builds (explicit, not papered over)
+## Open host-gated follow-ons (explicit, not papered over)
 
 1. **Host handler rollout for signed inbox drain** — `/api/inbox/signed` and
-   `fleet-runtime/inbox-handler.mjs` exist, but the bash wake-hooks still need a
-   reviewed host config/command that launches the right runtime and exits `0`
-   only after durable local handoff. `fleet-runtime/host-receipt.mjs` now gives
-   Hadi a local pre-flight receipt for config/key/handler readiness before live
-   attach/inbox/control smoke, and `fleet-runtime/runtime-receipt.mjs` gives a
-   one-cycle live receipt for signed attach plus inbox handoff once an agent is
-   actually up.
+   `fleet-runtime/inbox-handler.mjs` exist, but each host still needs reviewed
+   config/commands that launch the right runtime and exit `0` only after durable
+   local handoff. `fleet-runtime/host-receipt.mjs` gives Hadi a local pre-flight
+   receipt for config/key/handler readiness before live attach/inbox/control
+   smoke, and `fleet-runtime/runtime-receipt.mjs` gives a one-cycle live receipt
+   for signed attach plus inbox handoff once an agent is actually up.
 2. **Final SOS removal gate** — `fleet-runtime/cutover-receipt.mjs` now verifies
    saved host/runtime/control receipts and refuses `status:"pass"` unless the
    selected agent has host readiness, runtime inbox handoff, and start+stop
