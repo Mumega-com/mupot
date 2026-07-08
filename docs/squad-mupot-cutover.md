@@ -316,10 +316,12 @@ and exiting `0` so the daemon consumes the batch.
      A `mupot-sos-cutover-gate/v1` `status:"pass"` is the receipt that permits
      removing that agent's SOS bus/wake path.
    - Preferred evidence pack: run `node ~/.fleet/runtime/receipt-bundle.mjs
-     --agent <agent_id> --out-dir ~/.fleet/receipts/<agent_id>` first, then rerun
-     the same command after each queued control request with `--skip-host
-     --skip-runtime --control-label start` and `--control-label stop`. The
-     bundle writes `host.json`, `runtime-<agent_id>.json`, `control-*.json`,
+     --agent <agent_id> --out-dir ~/.fleet/receipts/<agent_id> --skip-runtime
+     --skip-control` first for host evidence only. Then queue an inbox probe and
+     `start` control request with `cutover-probe.mjs`, rerun the bundle with
+     `--skip-host --control-label start`, queue `stop`, and rerun with
+     `--skip-host --skip-runtime --control-label stop`. The bundle writes
+     `host.json`, `runtime-<agent_id>.json`, `control-*.json`,
      `cutover-gate.json`, and `manifest.json`; the cutover is ready only when
      both `manifest.json` and `cutover-gate.json` report `status:"pass"`.
 
@@ -339,6 +341,7 @@ and exiting `0` so the daemon consumes the batch.
 | host install | `host-receipt.mjs` emits `mupot-fleet-host-receipt/v1` with `status:"pass"` |
 | runtime live | `runtime-receipt.mjs --agent <id>` emits `mupot-fleet-runtime-receipt/v1` with `status:"pass"` |
 | control live | `control-receipt.mjs` emits `mupot-fleet-control-receipt/v1` with `status:"pass"` |
+| probe queue | `cutover-probe.mjs` emits `mupot-fleet-cutover-probe/v1` after queuing inbox/control evidence inputs |
 | SOS cutover gate | `cutover-receipt.mjs` emits `mupot-sos-cutover-gate/v1` with `status:"pass"` for that agent |
 | receipt bundle | `receipt-bundle.mjs` writes `mupot-fleet-receipt-bundle/v1` `manifest.json` plus `cutover-gate.json`, both `status:"pass"` |
 | wake-hook (post-route) | watcher launches a session from a mupot `inbox` poll, logged in `watcher.log` |

@@ -19,6 +19,7 @@
     "receipt:control": "node fleet-runtime/control-receipt.mjs",
     "receipt:cutover": "node fleet-runtime/cutover-receipt.mjs",
     "receipt:bundle": "node fleet-runtime/receipt-bundle.mjs",
+    "probe:cutover": "node fleet-runtime/cutover-probe.mjs",
     "migrate:remote": "wrangler d1 migrations apply mupot --remote",
     "update": "node scripts/mupot-update.mjs"
   },

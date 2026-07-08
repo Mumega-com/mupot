@@ -39,6 +39,7 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `runtime-receipt.mjs` | one-shot live daemon-cycle receipt for signed attach + inbox drain |
 | `control-receipt.mjs` | one-shot live control receipt for signed open/close/restart |
 | `cutover-receipt.mjs` | verifies host/runtime/control receipts before SOS removal |
+| `cutover-probe.mjs` | queues inbox and lifecycle probes that live receipts must observe |
 | `receipt-bundle.mjs` | saves host/runtime/control receipts, final gate, and manifest in one directory |
 
 ## Quickstart (per agent)
@@ -336,7 +337,9 @@ that directory, and writes `manifest.json`:
 ```bash
 node ~/.fleet/runtime/receipt-bundle.mjs \
   --agent my-agent \
-  --out-dir ~/.fleet/receipts/my-agent
+  --out-dir ~/.fleet/receipts/my-agent \
+  --skip-runtime \
+  --skip-control
 ```
 
 or from a checkout:
@@ -344,25 +347,44 @@ or from a checkout:
 ```bash
 npm run receipt:bundle -- \
   --agent my-agent \
-  --out-dir ./receipts/my-agent
+  --out-dir ./receipts/my-agent \
+  --skip-runtime \
+  --skip-control
 ```
 
-The first run usually proves host and runtime wiring and fails the final gate
-until lifecycle control evidence exists. Then queue a `start` control request in
-Mupot and collect that live receipt:
+The first run proves host wiring and writes a failing final gate until live
+runtime and lifecycle evidence exist. Queue the live inbox probe and `start`
+control request without putting tokens on the command line:
+
+```bash
+MUPOT_AGENT_TOKEN='<welded-sender-token>' \
+MUPOT_OWNER_TOKEN='<owner-token>' \
+node ~/.fleet/runtime/cutover-probe.mjs \
+  --base-url https://YOUR-POT.example.com \
+  --agent my-agent \
+  --queue-inbox \
+  --control start
+```
+
+Then collect the runtime handoff and `start` control receipts:
 
 ```bash
 node ~/.fleet/runtime/receipt-bundle.mjs \
   --agent my-agent \
   --out-dir ~/.fleet/receipts/my-agent \
   --skip-host \
-  --skip-runtime \
   --control-label start
 ```
 
 Queue a `stop` control request and collect the second live control receipt:
 
 ```bash
+MUPOT_OWNER_TOKEN='<owner-token>' \
+node ~/.fleet/runtime/cutover-probe.mjs \
+  --base-url https://YOUR-POT.example.com \
+  --agent my-agent \
+  --control stop
+
 node ~/.fleet/runtime/receipt-bundle.mjs \
   --agent my-agent \
   --out-dir ~/.fleet/receipts/my-agent \
