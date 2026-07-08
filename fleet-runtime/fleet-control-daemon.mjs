@@ -127,6 +127,7 @@ export async function handleControlMessage(message, cfg, publicKey, ledger, runI
 export async function pollOnce(cfg, consumerKey, publicKey, ledger, opts = {}) {
   const inboxFn = opts.signedInbox ?? signedInbox
   const runImpl = opts.runFlightVerb ?? runFlightVerb
+  const logFn = opts.log ?? log
   const peek = await inboxFn(cfg.baseUrl, cfg.consumerAgent, {
     tenant: cfg.tenant,
     privKey: consumerKey,
@@ -134,14 +135,14 @@ export async function pollOnce(cfg, consumerKey, publicKey, ledger, opts = {}) {
     limit: 1,
   })
   if (!peek.ok) {
-    log({ event: 'control_inbox_peek_fail', status: peek.status })
+    logFn({ event: 'control_inbox_peek_fail', status: peek.status })
     return { ok: false, action: 'peek_failed', status: peek.status }
   }
   const messages = Array.isArray(peek.json?.messages) ? peek.json.messages : []
   if (messages.length === 0) return { ok: true, action: 'idle' }
 
   const handled = await handleControlMessage(messages[0], cfg, publicKey, ledger, runImpl)
-  log({
+  logFn({
     event: handled.ok ? 'control_executed' : 'control_rejected',
     action: handled.action,
     reason: handled.reason,

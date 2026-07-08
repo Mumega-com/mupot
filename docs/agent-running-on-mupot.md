@@ -127,7 +127,8 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
 2. Lifecycle controlled via mupot — ⛏ partial (signed attach/detach and Worker
    control requests exist; host control daemon now verifies requests and runs
    `flight.mjs open|close`, and `host-receipt.mjs` can pre-flight local host
-   wiring; live host install/control receipt remains).
+   wiring; `control-receipt.mjs` can prove one signed control request reaches
+   the host flight layer; live host install/control receipt remains).
 3. Coordinates via the reflected bus — ⛏ partial (`agent_messages` inbox and signed
    daemon read are built; `inbox-handler.mjs` provides durable host handoff;
    `host-receipt.mjs` checks handler coverage; `runtime-receipt.mjs` can now
@@ -148,7 +149,8 @@ unsigned `lifecycle` under a signed upsert) — all fixed, re-gate GREEN. PRs: m
 
 **Phase 2 — lifecycle control (open/close from mupot)**
 3. open/close API: signed control-request → daemon starts/kills the agent's runtime.
-   ✅ branch implementation via `fleet-control-daemon.mjs`; install = Hadi host-go.
+   ✅ branch implementation via `fleet-control-daemon.mjs` plus
+   `control-receipt.mjs`; install + live control receipt = Hadi host-go.
 4. Control surface: `#agent-bus` = `top` (live presence + open/close); `#gates` = signals.
 
 **Phase 3 — coordinate through mupot (not SOS)**

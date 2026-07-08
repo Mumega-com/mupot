@@ -37,6 +37,7 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `fleet-control-daemon.service` | systemd user unit for host lifecycle control |
 | `host-receipt.mjs` | non-destructive local verifier that emits a redacted host-install receipt |
 | `runtime-receipt.mjs` | one-shot live daemon-cycle receipt for signed attach + inbox drain |
+| `control-receipt.mjs` | one-shot live control receipt for signed open/close/restart |
 
 ## Quickstart (per agent)
 
@@ -196,6 +197,35 @@ The **remote trigger** — mupot `POST /api/fleet/control {agent_id, verb:start}
 control-request → host control-daemon → runs the flight — is the ATC layer (fleet-control
 `daemon.py`/`engine.py`); it needs the consumer agent minted + the control-daemon installed
 (owner-gated). Until then, flights run locally via `flight.mjs`.
+
+## Control live receipt
+
+After the host receipt passes and an owner/admin has queued a control request
+from Mupot, run one live control poll:
+
+```bash
+node ~/.fleet/runtime/control-receipt.mjs \
+  --control ~/.fleet/control.json
+```
+
+or from a checkout:
+
+```bash
+npm run receipt:control
+```
+
+The control receipt runs the same path as the control daemon once:
+
+- signs `/api/inbox/signed` as the fleet consumer agent
+- verifies the queued `fleet-control.v1` request with the panel public key
+- burns the nonce in the local ledger
+- maps `start|stop|restart|status` to the flight layer
+- consumes the control message after handling
+
+It prints JSON with `receipt_type: "mupot-fleet-control-receipt/v1"`. A
+`status:"pass"` receipt proves Mupot lifecycle control reached the host flight
+layer. `status:"warn"` with `control_inbox_idle` means the signed consumer inbox
+read worked, but no control request was queued; trigger one from Mupot and rerun.
 
 ## Host install receipt
 

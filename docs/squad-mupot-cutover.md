@@ -307,6 +307,10 @@ and exiting `0` so the daemon consumes the batch.
      A `mupot-fleet-runtime-receipt/v1` `status:"pass"` proves the real daemon
      path can probe, signed-attach, signed-peek the inbox, deliver to the local
      handler, and consume only after handler success.
+   - Live control receipt: after an owner/admin queues a Mupot lifecycle request,
+     run `node ~/.fleet/runtime/control-receipt.mjs --control ~/.fleet/control.json`.
+     A `mupot-fleet-control-receipt/v1` `status:"pass"` proves the host consumed
+     a signed `fleet-control.v1` request and reached the flight layer.
 
 6. **Decommission SOS per surface, not all-at-once.** Only after an arm's memory + messaging + wake are all verified on mupot AND stable for a few cycles, drop that arm's `mumega-bus` allowlist entries. Keep the bus token valid (don't revoke) until the whole squad is migrated and Hadi signs off — the bus is the rollback floor.
 
@@ -323,6 +327,7 @@ and exiting `0` so the daemon consumes the batch.
 | peers | MCP `peers {}` from a welded arm returns its squad roster with `is_self:true` on that arm |
 | host install | `host-receipt.mjs` emits `mupot-fleet-host-receipt/v1` with `status:"pass"` |
 | runtime live | `runtime-receipt.mjs --agent <id>` emits `mupot-fleet-runtime-receipt/v1` with `status:"pass"` |
+| control live | `control-receipt.mjs` emits `mupot-fleet-control-receipt/v1` with `status:"pass"` |
 | wake-hook (post-route) | watcher launches a session from a mupot `inbox` poll, logged in `watcher.log` |
 
 ---
