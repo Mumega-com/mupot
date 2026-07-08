@@ -95,7 +95,7 @@ ON CONFLICT(id) DO UPDATE SET
 
 INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
 VALUES
-  ('cap-hermes-org-admin', 'mbr-hermes-user', 'org', NULL, 'admin'),
+  ('cap-hermes-org-admin', 'mbr-hermes-user', 'org', NULL, 'owner'),
   ('cap-admin-org-owner', 'mbr-local-admin', 'org', NULL, 'owner'),
   ('cap-conformance-runtime-member', 'mbr-conformance-runtime', 'squad', 'sq-growth', 'member'),
   ('cap-conformance-sender-member', 'mbr-conformance-sender', 'squad', 'sq-growth', 'member')

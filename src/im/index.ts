@@ -36,6 +36,9 @@ import type {
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
 import { createTask } from '../tasks/service'
+import { emitControlRequest } from '../fleet/control'
+import { CONTROL_VERBS, type ControlVerb } from '../fleet/control-request'
+import { listFleetAgents, type FleetAgentRow } from '../fleet/registry'
 
 type AppEnv = { Bindings: Env }
 
@@ -141,6 +144,7 @@ type Intent =
   | { kind: 'help' }
   | { kind: 'status'; ref: string | null }
   | { kind: 'wake'; ref: string }
+  | { kind: 'fleet'; verb: ControlVerb; ref: string }
   | { kind: 'task'; title: string; squadRef: string | null }
   | { kind: 'unknown' }
 
@@ -181,6 +185,17 @@ function parseIntent(text: string): Intent {
     return ref ? { kind: 'wake', ref } : { kind: 'unknown' }
   }
 
+  // "fleet <start|stop|restart|status> <host-agent>"
+  const fleetMatch = trimmed.match(/^\/?fleet\s+([A-Za-z]+)\s+(.+)$/i)
+  if (fleetMatch) {
+    const verb = fleetMatch[1].toLowerCase()
+    const ref = fleetMatch[2].trim()
+    if ((CONTROL_VERBS as readonly string[]).includes(verb) && ref) {
+      return { kind: 'fleet', verb: verb as ControlVerb, ref }
+    }
+    return { kind: 'unknown' }
+  }
+
   // "task: <title>" (also tolerate "task <title>")
   const taskMatch = trimmed.match(/^\/?task\s*[:|-]?\s+(.+)$/i)
   if (taskMatch) {
@@ -194,7 +209,7 @@ function parseIntent(text: string): Intent {
 // ── reply copy (short, friendly, never leaks internals) ───────────────────────
 const HELP =
   'I can: "task: <title>" (optionally "@squad"), "status" or "status <agent>", ' +
-  '"wake <agent>". I act as you, with your permissions.'
+  '"wake <agent>", or "fleet start|stop|restart|status <agent>". I act as you, with your permissions.'
 
 const IM_TASK_DONE_WHEN =
   'A task result or linked artifact provides evidence that the requested IM task is complete.'
@@ -233,6 +248,9 @@ export async function handleImMessage(
 
     case 'wake':
       return wakeReply(env, member, grants, intent.ref)
+
+    case 'fleet':
+      return fleetReply(env, member, grants, intent.verb, intent.ref)
 
     case 'task':
       return taskReply(env, member, grants, intent.title, intent.squadRef)
@@ -306,6 +324,71 @@ async function wakeReply(
   })
   if (!res.ok) return `Tried to wake ${agent.name} but it didn't run. Try again shortly.`
   return `Woke ${agent.name}. It's running one cycle now.`
+}
+
+// ── intent: fleet (cap: owner on org) ────────────────────────────────────────
+// This is host process control, so IM uses the exact same signed fleet-control
+// plane as the dashboard: owner gate here, Ed25519 verification on the host.
+function canControlFleet(grants: CapabilityGrant[]): boolean {
+  return hasCapability(grants, 'org', null, 'owner')
+}
+
+async function resolveFleetAgent(env: Env, ref: string): Promise<FleetAgentRow | 'ambiguous' | null> {
+  const needle = ref.trim().toLowerCase()
+  if (!needle) return null
+
+  const rows = await listFleetAgents(env)
+  const exact = rows.filter(
+    (row) => row.agent_id.toLowerCase() === needle || row.display.toLowerCase() === needle,
+  )
+  if (exact.length === 1) return exact[0]
+  if (exact.length > 1) return 'ambiguous'
+
+  const prefixed = rows.filter((row) => row.agent_id.toLowerCase().startsWith(`${needle}-`))
+  if (prefixed.length === 1) return prefixed[0]
+  if (prefixed.length > 1) return 'ambiguous'
+
+  return null
+}
+
+async function fleetReply(
+  env: Env,
+  member: Member,
+  grants: CapabilityGrant[],
+  verb: ControlVerb,
+  ref: string,
+): Promise<string> {
+  if (!canControlFleet(grants)) {
+    return `You don't have permission to control fleet agents (need owner on the org).`
+  }
+
+  const agent = await resolveFleetAgent(env, ref)
+  if (agent === 'ambiguous') return `More than one fleet agent matches "${ref}". Be more specific.`
+  if (!agent) return `No fleet agent named "${ref}" here.`
+
+  const res = await emitControlRequest(
+    env,
+    { agent_id: agent.agent_id, verb },
+    { memberId: member.id, boundAgentId: null },
+  )
+  if (!res.ok) {
+    if (res.reason === 'unconfigured') return 'Fleet control is not configured here yet.'
+    if (res.reason === 'invalid_input') return `I couldn't queue fleet ${verb} for ${agent.display || agent.agent_id}: ${res.detail ?? 'invalid request'}.`
+    return `Fleet control request for ${agent.display || agent.agent_id} could not be delivered.`
+  }
+
+  const now = new Date().toISOString()
+  const event: BusEvent<{ verb: ControlVerb; nonce: string; seq: number | null }> = {
+    type: 'fleet.control.requested',
+    tenant: env.TENANT_SLUG,
+    agent_id: agent.agent_id,
+    actor: memberActor(member.id),
+    payload: { verb, nonce: res.nonce, seq: res.seq },
+    ts: now,
+  }
+  await createBus(env).emit(event)
+
+  return `Queued fleet ${verb} for ${agent.display || agent.agent_id}.`
 }
 
 // ── intent: task (cap: member+ on the target squad) ───────────────────────────

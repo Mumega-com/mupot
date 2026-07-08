@@ -50,6 +50,7 @@ const hermesMessages = [
   { lifecycle: 'Hermes IM help lifecycle', text: 'help', expect: 'I can:' },
   { lifecycle: 'Hermes IM member status lifecycle', text: 'status', expect: 'Hermes Test Operator' },
   { lifecycle: 'Hermes IM agent status lifecycle', text: 'status hermes', expect: 'Hermes Local' },
+  { lifecycle: 'Hermes IM fleet control lifecycle', text: 'fleet status hermes', expect: 'Queued fleet status for Hermes Local Relay.' },
   { lifecycle: 'Hermes IM task lifecycle', text: `task: ${hermesTaskTitle} @growth`, expect: `Added to Growth Local: "${hermesTaskTitle}".` },
 ]
 

@@ -312,6 +312,7 @@ export type BusEventType =
   | 'task.blocked' // execution failed (model error/timeout) — short note persisted
   | 'task.verdict' // gate decision written — verdict + new task status in payload
   | 'agent.wake'
+  | 'fleet.control.requested' // signed host-control request queued for the fleet daemon
   | 'squad.dispatch'
   | 'org.provisioned' // a department/squad/agent/token was created in-band (payload.kind)
 

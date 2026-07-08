@@ -39,6 +39,7 @@ wiring an existing, already-gated backend action to a new trigger.
 | `help` / `?` | list verbs | none (read) |
 | `status` / `status <agent>` | who am I + my scopes / an agent's runtime | none (read, tenant-scoped) |
 | `wake <agent>` | wake an agent | `lead`+ on the agent's squad |
+| `fleet start\|stop\|restart\|status <agent>` | queue signed host-agent control | `owner` on the org |
 | `task: <title> [@squad]` | create a task | member on the target scope |
 
 Plus Telegram already **receives** decision-gate notifications and brain directives (today via host
@@ -51,7 +52,6 @@ These exist in the dashboard but have no IM verb yet. Closing the gap = one new 
 
 | Backend surface | Dashboard today | Proposed IM verb | Gate |
 |---|---|---|---|
-| Fleet — host agents (`/fleet`, `POST /fleet/host-control`) | start / stop / restart a server agent | `fleet stop <agent>` · `fleet start <agent>` · `fleet restart <agent>` | `owner` (org) |
 | Approvals (`src/dashboard/approvals.ts`) | approve / reject a pending gate | `approve <id>` · `reject <id> <reason>` | the approval's required capability |
 | Human directive (`last_human_directive`) | brain reads it at decision position-0 | `directive: <text>` · `directive clear` | `owner` (org), **direct principal only** |
 
@@ -112,14 +112,14 @@ seam; notifications (gates, heartbeats) are sent back into that same chat.
 
 ## Build sequence (each slice dyad-gated Opus + codex1, on a PR; deploy is owner-go)
 
-1. **`fleet <verb> <agent>`** — highest value, smallest surface; reuses the signer. Add intent +
-   handler + owner gate + tests (incl. a refused non-owner and a refused forwarded message).
-2. **`approve <id>` / `reject <id> <reason>`** — wire to the approval service; then inline-keyboard
+1. **Done: `fleet <verb> <agent>`** — highest value, smallest surface; reuses the signer. Built as
+   IM intent + handler + owner gate + signed `fleet-control.v1` delivery + local smoke coverage.
+2. **Next: `approve <id>` / `reject <id> <reason>`** — wire to the approval service; then inline-keyboard
    buttons on the notification.
-3. **`directive: <text>` / `directive clear`** — owner-direct write to `last_human_directive`,
+3. **Next: `directive: <text>` / `directive clear`** — owner-direct write to `last_human_directive`,
    preserving the no-relay rule.
 4. **Unify the bot front-door** — converge notifications + control onto the single IM seam so the
    owner messages one place.
 
-Status: **design captured, not yet built.** The seam and the signed fleet plane already exist — these
-are wiring slices, not new trust.
+Status: **fleet parity slice built; approvals, directives, and bot-front-door unification remain.**
+The seam and signed fleet plane already exist — the remaining items are wiring slices, not new trust.
