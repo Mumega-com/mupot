@@ -279,6 +279,17 @@ function hasSecretScanFailures(manifestCheck) {
   return secretScanChecks(manifestCheck).some((check) => check.ok === false)
 }
 
+function bundleScopeChecks(manifestCheck) {
+  return (manifestCheck?.checks ?? []).filter((check) =>
+    check?.check === 'bundle_directory_only_manifest_artifacts' ||
+    check?.check === 'artifact_file_in_bundle_dir'
+  )
+}
+
+function hasBundleScopeFailures(manifestCheck) {
+  return bundleScopeChecks(manifestCheck).some((check) => check.ok === false)
+}
+
 function fileSha256(path) {
   try {
     return createHash('sha256').update(readFileSync(path)).digest('hex')
@@ -621,6 +632,47 @@ function addRequiredEvidenceChecks(checks, manifestPath, entries, agents) {
   }
 }
 
+function addBundleDirectoryScopeChecks(checks, manifestPath, manifestDir, entries) {
+  const allowed = new Set(['manifest.json'])
+  for (const entry of entries) {
+    if (typeof entry.path === 'string' && entry.path.length > 0) allowed.add(basename(entry.path))
+  }
+
+  let names = []
+  try {
+    names = readdirSync(manifestDir).sort()
+    checks.push({
+      ok: true,
+      component: 'receipt-bundle-check',
+      check: 'bundle_directory_read',
+      path: manifestPath,
+      directory: manifestDir,
+      count: names.length,
+    })
+  } catch (err) {
+    checks.push({
+      ok: false,
+      component: 'receipt-bundle-check',
+      check: 'bundle_directory_read',
+      path: manifestPath,
+      directory: manifestDir,
+      reason: String(err && err.message ? err.message : err),
+    })
+    return
+  }
+
+  const unexpected = names.filter((name) => !allowed.has(name))
+  checks.push({
+    ok: unexpected.length === 0,
+    component: 'receipt-bundle-check',
+    check: 'bundle_directory_only_manifest_artifacts',
+    path: manifestPath,
+    directory: manifestDir,
+    allowed: [...allowed].sort(),
+    unexpected,
+  })
+}
+
 function addCutoverGateConsistencyChecks(checks, manifestPath, manifest, entries, receipt) {
   const agents = manifestAgents(manifest)
   const requiredControlVerbs = manifestRequiredControlVerbs(manifest)
@@ -767,8 +819,12 @@ function checkBundleManifest(opts = {}) {
       count: entries.length,
     })
     addRequiredEvidenceChecks(checks, manifestPath, entries, agents)
+    addBundleDirectoryScopeChecks(checks, manifestPath, manifestDir, entries)
 
     for (const entry of entries) {
+      const expectedLocalPath = typeof entry.path === 'string' && entry.path.length > 0
+        ? join(manifestDir, basename(entry.path))
+        : ''
       const checkedPath = resolveArtifactPath(manifestDir, entry.path)
       const receipt = checkedPath ? readReceipt(checkedPath) : null
       if (receipt) receiptRecords.push({ label: entry.label, receipt, checkedPath })
@@ -796,6 +852,15 @@ function checkBundleManifest(opts = {}) {
         artifact: entry.label,
         declared_path: entry.path ?? null,
         checked_path: checkedPath || null,
+      })
+      checks.push({
+        ok: Boolean(expectedLocalPath && checkedPath === expectedLocalPath && existsSync(expectedLocalPath)),
+        component: 'receipt-bundle-check',
+        check: 'artifact_file_in_bundle_dir',
+        artifact: entry.label,
+        declared_path: entry.path ?? null,
+        checked_path: checkedPath || null,
+        expected_path: expectedLocalPath || null,
       })
       checks.push({
         ok: expectedOk && actual === entry.sha256,
@@ -1019,6 +1084,9 @@ function addHostGoStatusNextSteps(steps, { outDir, artifacts, agents, gateReceip
   if (hasSecretScanFailures(manifestCheck)) {
     add('remove or redact secret material from receipt JSON, rerun receipt-bundle --verify-only, then rerun --check-manifest before attaching evidence')
   }
+  if (hasBundleScopeFailures(manifestCheck)) {
+    add('copy only manifest.json and its listed receipt artifacts into the attachable bundle directory, then rerun --check-manifest')
+  }
   return steps
 }
 
@@ -1106,6 +1174,12 @@ function inspectBundleStatus(opts = {}) {
     path: manifestPath || null,
     failed: manifestSecretChecks.filter((check) => check.ok === false).length,
     warnings: manifestSecretChecks.filter((check) => check.ok === null).length,
+  })
+  const manifestScopeChecks = bundleScopeChecks(manifestCheck)
+  statusCheck(checks, 'copied_bundle_only_manifest_artifacts', manifestCheck ? manifestScopeChecks.length > 0 && manifestScopeChecks.every((check) => check.ok === true) : null, {
+    path: manifestPath || null,
+    failed: manifestScopeChecks.filter((check) => check.ok === false).length,
+    warnings: manifestScopeChecks.filter((check) => check.ok === null).length,
   })
 
   const summary = summarize(checks)

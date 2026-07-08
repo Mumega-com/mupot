@@ -383,6 +383,83 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
   ))
 })
 
+test('manifest check fails when copied bundle is not self-contained', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+  await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+  })
+
+  const copiedDir = tmpDir()
+  copyFileSync(join(outDir, 'manifest.json'), join(copiedDir, 'manifest.json'))
+  const manifestPath = join(copiedDir, 'manifest.json')
+  const check = checkBundleManifest({ manifestPath })
+
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((c) =>
+    c.check === 'artifact_file_readable' &&
+    c.artifact === 'host' &&
+    c.ok === true &&
+    c.checked_path === join(outDir, 'host.json')
+  ))
+  assert.ok(check.checks.some((c) =>
+    c.check === 'artifact_file_in_bundle_dir' &&
+    c.artifact === 'host' &&
+    c.expected_path === join(copiedDir, 'host.json') &&
+    c.ok === false
+  ))
+
+  const status = inspectBundleStatus({ outDir: copiedDir, agents: ['agent-one'] })
+  assert.equal(status.status, 'fail')
+  assert.ok(status.checks.some((c) =>
+    c.check === 'copied_bundle_only_manifest_artifacts' &&
+    c.ok === false &&
+    c.failed > 0
+  ))
+  assert.ok(status.next_steps.some((step) => step.includes('copy only manifest.json')))
+})
+
+test('manifest check fails when copied bundle contains extra files', async () => {
+  const outDir = tmpDir()
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
+  writeJson(join(outDir, 'host.json'), hostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+  await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+  })
+
+  writeJson(join(outDir, 'daemon.json'), { base_url: POT_URL, token: 'redacted' })
+  const manifestPath = join(outDir, 'manifest.json')
+  const check = checkBundleManifest({ manifestPath })
+
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((c) =>
+    c.check === 'bundle_directory_only_manifest_artifacts' &&
+    c.ok === false &&
+    c.unexpected.includes('daemon.json')
+  ))
+
+  const status = inspectBundleStatus({ outDir, agents: ['agent-one'] })
+  assert.equal(status.status, 'fail')
+  assert.ok(status.next_steps.some((step) => step.includes('copy only manifest.json')))
+})
+
 test('manifest check fails when copied bundle contains secret material', async () => {
   const outDir = tmpDir()
   writeJson(join(outDir, 'probe-start.json'), probeReceipt())
@@ -465,6 +542,7 @@ test('status reports a complete host-go bundle as pass', async () => {
   assert.equal(status.artifacts.cutover_gate.status, 'pass')
   assert.ok(status.checks.some((c) => c.check === 'manifest_check_pass' && c.ok === true))
   assert.ok(status.checks.some((c) => c.check === 'copied_bundle_no_secret_material' && c.ok === true))
+  assert.ok(status.checks.some((c) => c.check === 'copied_bundle_only_manifest_artifacts' && c.ok === true))
   assert.ok(status.next_steps.some((s) => s.includes('SOS removal is permitted only for the proven agent')))
 })
 

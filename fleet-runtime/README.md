@@ -486,9 +486,12 @@ gate was built for the manifest's selected agents/control verbs/artifacts,
 verifies all non-secret receipt target identities agree on the same pot base URL
 and tenant, scans the manifest and receipt artifacts for obvious secret material
 such as bearer tokens, raw `mupot_` tokens, private-key PEM/JWK data, GitHub
-tokens, or authorization fields, verifies `next_steps` does not contradict
-readiness, and exits non-zero if any saved file, manifest status, or attachable
-evidence safety check drifted:
+tokens, or authorization fields, verifies the checked directory contains only
+`manifest.json` plus the receipt artifacts named in the manifest, verifies every
+artifact is present in that same copied directory rather than resolved through an
+old absolute host path, verifies `next_steps` does not contradict readiness, and
+exits non-zero if any saved file, manifest status, or attachable evidence safety
+check drifted:
 
 ```bash
 node ~/.fleet/runtime/receipt-bundle.mjs \
@@ -523,6 +526,10 @@ tenants. It also rejects advisory `next_steps` guidance that says to attach the
 bundle before the hard gate passes, or says to keep SOS wiring after the hard
 gate passes. Secret-scan findings include only the JSON path and reason; they do
 not echo the suspected secret value.
+Directory-scope failures mean the attachable bundle is not self-contained or
+contains files outside the allowed evidence set; rebuild a clean copy with only
+`manifest.json`, `install.json` when present, `probe-*.json`, `host.json`,
+`runtime-*.json`, `control-*.json`, and `cutover-gate.json`.
 
 Every bundle manifest also includes `next_steps`. Treat those as operator
 guidance only: the hard gate remains `manifest.json` and `cutover-gate.json`
