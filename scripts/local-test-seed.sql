@@ -112,7 +112,7 @@ ON CONFLICT(tenant, agent_id) DO UPDATE SET
   member_id = excluded.member_id,
   created_at = excluded.created_at;
 
-INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id)
+INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id, tenant)
 VALUES (
   'tok-conformance-sender',
   'mbr-conformance-sender',
@@ -121,7 +121,8 @@ VALUES (
   'workspace',
   datetime('now'),
   NULL,
-  'agent-conformance-sender'
+  'agent-conformance-sender',
+  'local'
 )
 ON CONFLICT(id) DO UPDATE SET
   member_id = excluded.member_id,
@@ -129,9 +130,10 @@ ON CONFLICT(id) DO UPDATE SET
   label = excluded.label,
   channel = excluded.channel,
   revoked_at = NULL,
-  agent_id = excluded.agent_id;
+  agent_id = excluded.agent_id,
+  tenant = excluded.tenant;
 
-INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id)
+INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id, tenant)
 VALUES (
   'tok-conformance-owner',
   'mbr-local-admin',
@@ -140,7 +142,8 @@ VALUES (
   'workspace',
   datetime('now'),
   NULL,
-  NULL
+  NULL,
+  'local'
 )
 ON CONFLICT(id) DO UPDATE SET
   member_id = excluded.member_id,
@@ -148,7 +151,8 @@ ON CONFLICT(id) DO UPDATE SET
   label = excluded.label,
   channel = excluded.channel,
   revoked_at = NULL,
-  agent_id = excluded.agent_id;
+  agent_id = excluded.agent_id,
+  tenant = excluded.tenant;
 
 INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
 VALUES

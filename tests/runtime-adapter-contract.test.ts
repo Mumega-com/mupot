@@ -287,6 +287,8 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(seed).toContain('agent-conformance')
     expect(seed).toContain('tok-conformance-sender')
     expect(seed).toContain('tok-conformance-owner')
+    expect(seed).toContain('agent_id, tenant')
+    expect(seed).toContain('tenant = excluded.tenant')
     expect(seed).toContain('5hhsUxlkZWNACkMQjUFNIO1-e4bbFtTaLUd7_5L7sdU')
     expect(scriptsReadme).toContain('npm run conformance:runtime:local')
     expect(scriptsReadme).toContain('signed attach')
