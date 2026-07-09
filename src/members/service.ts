@@ -71,6 +71,7 @@ export async function mintMemberToken(
   const tokenHash = await sha256Hex(rawToken)
   const token: Omit<MemberToken, 'token_hash'> = {
     id: crypto.randomUUID(),
+    tenant: env.TENANT_SLUG,
     member_id: memberId,
     label: label.trim(),
     channel,
@@ -80,9 +81,9 @@ export async function mintMemberToken(
 
   // agent_id binds this token to an agent (the weld). NULL = a human/operator principal.
   await env.DB.prepare(
-    'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
   )
-    .bind(token.id, token.member_id, tokenHash, token.label, token.channel, token.created_at, agentId)
+    .bind(token.id, token.member_id, tokenHash, token.label, token.channel, token.created_at, agentId, token.tenant)
     .run()
 
   return {
@@ -103,9 +104,9 @@ export async function revokeMemberToken(
   tokenId: string,
 ): Promise<boolean> {
   const res = await env.DB.prepare(
-    'UPDATE member_tokens SET revoked_at = ? WHERE id = ? AND member_id = ? AND revoked_at IS NULL',
+    'UPDATE member_tokens SET revoked_at = ? WHERE id = ? AND member_id = ? AND tenant = ? AND revoked_at IS NULL',
   )
-    .bind(new Date().toISOString(), tokenId, memberId)
+    .bind(new Date().toISOString(), tokenId, memberId, env.TENANT_SLUG)
     .run()
   return Boolean(res.meta && res.meta.changes > 0)
 }
@@ -184,9 +185,9 @@ export async function mintAgentBoundToken(
     ).bind(crypto.randomUUID(), memberId, agent.squad_id, grantCapability),
     // 3) THE WELD: bind token to the agent (agent_id set). Only the hash is stored.
     env.DB.prepare(
-      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id)
-       VALUES (?, ?, ?, ?, 'workspace', ?, ?)`,
-    ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id),
+      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+       VALUES (?, ?, ?, ?, 'workspace', ?, ?, ?)`,
+    ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id, env.TENANT_SLUG),
   ])
   // Receipt: all three rows MUST land. A partial mint (e.g. token row without its
   // capability row) would hand out a show-once token bound to a broken identity.
@@ -199,7 +200,7 @@ export async function mintAgentBoundToken(
  *  hash is NEVER selected. */
 export async function loadLiveTokens(env: Env): Promise<PublicMemberToken[]> {
   const rows = await env.DB.prepare(
-    'SELECT id, member_id, label, channel, created_at, revoked_at FROM member_tokens WHERE revoked_at IS NULL ORDER BY created_at ASC',
-  ).all<PublicMemberToken>()
+    'SELECT id, member_id, label, channel, created_at, revoked_at FROM member_tokens WHERE tenant = ? AND revoked_at IS NULL ORDER BY created_at ASC',
+  ).bind(env.TENANT_SLUG).all<PublicMemberToken>()
   return rows.results ?? []
 }

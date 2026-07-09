@@ -180,10 +180,13 @@ async function authenticateMember(c: {
             t.agent_id      AS bound_agent_id
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
-      WHERE t.token_hash = ?1 AND t.revoked_at IS NULL
+      WHERE t.token_hash = ?1
+        AND t.tenant = ?2
+        AND m.tenant = ?2
+        AND t.revoked_at IS NULL
       LIMIT 1`,
   )
-    .bind(tokenHash)
+    .bind(tokenHash, c.env.TENANT_SLUG)
     .first<{
       member_id: string
       email: string | null

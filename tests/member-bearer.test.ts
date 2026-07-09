@@ -10,12 +10,16 @@ describe('bearerToken', () => {
   it('null on empty token', () => expect(bearerToken('Bearer    ')).toBeNull())
 })
 
-function makeEnv(row: Record<string, unknown> | null): Env {
+function makeEnv(row: Record<string, unknown> | null, seen: { sql?: string; binds?: unknown[] } = {}): Env {
   return {
     TENANT_SLUG: 'digid',
     DB: {
-      prepare() {
-        return { bind: () => ({ first: async () => row }) }
+      prepare(sql: string) {
+        seen.sql = sql
+        return { bind: (...args: unknown[]) => ({ first: async () => {
+          seen.binds = args
+          return row
+        } }) }
       },
     },
   } as unknown as Env
@@ -49,5 +53,15 @@ describe('resolveMemberByToken', () => {
       email: null,
       boundAgentId: 'agent-7',
     })
+  })
+  it('binds member token auth to the current tenant', async () => {
+    const seen: { sql?: string; binds?: unknown[] } = {}
+    const env = makeEnv({ member_id: 'm1', display_name: 'Kasra', email: 'k@x', status: 'active' }, seen)
+
+    await resolveMemberByToken(env, 'sk-x')
+
+    expect(seen.sql).toContain('t.tenant = ?2')
+    expect(seen.sql).toContain('m.tenant = ?2')
+    expect(seen.binds?.[1]).toBe('digid')
   })
 })

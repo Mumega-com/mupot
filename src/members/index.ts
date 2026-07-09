@@ -216,8 +216,8 @@ membersApp.post('/invites/:id/accept', async (c) => {
         'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)',
       ).bind(grantId, member.id, scopeType, scopeId, invite.capability),
       c.env.DB.prepare(
-        'INSERT INTO member_tokens (id, member_id, token_hash, label, channel) VALUES (?, ?, ?, ?, ?)',
-      ).bind(tokenId, member.id, tokenHash, 'workspace', 'workspace'),
+        'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant) VALUES (?, ?, ?, ?, ?, ?)',
+      ).bind(tokenId, member.id, tokenHash, 'workspace', 'workspace', c.env.TENANT_SLUG),
     ])
     // Receipt (#186): all three mint rows must land before we return `raw`. A
     // 0-row INSERT does not throw on its own; a partial mint would hand out a

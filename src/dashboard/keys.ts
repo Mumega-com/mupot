@@ -89,9 +89,9 @@ export async function loadKeysView(env: Env): Promise<KeysView> {
     env.DB.prepare(
       `SELECT id, member_id, label, created_at
          FROM member_tokens
-        WHERE revoked_at IS NULL AND label LIKE '[preset:%'
+        WHERE tenant = ?1 AND revoked_at IS NULL AND label LIKE '[preset:%'
         ORDER BY created_at DESC`,
-    ).all<ScopedKeyToken>(),
+    ).bind(env.TENANT_SLUG).all<ScopedKeyToken>(),
   ])
   return {
     members: members.results ?? [],

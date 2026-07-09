@@ -129,14 +129,14 @@ describe('mintAgentBoundToken', () => {
     expect(captured.some((c) => c.sql.includes('INSERT INTO member_tokens'))).toBe(true)
   })
 
-  it('THE WELD: member_tokens last arg = agent.id (boundAgentId)', async () => {
+  it('THE WELD: member_tokens binds agent.id and tenant', async () => {
     const captured: Captured[] = []
     const env = makeUnitEnv({ captured })
     await mintAgentBoundToken(env, AGENT, 'weld-test')
     const tokenInsert = captured.find((c) => c.sql.includes('INSERT INTO member_tokens'))
     expect(tokenInsert).toBeDefined()
-    const args = tokenInsert!.args
-    expect(args[args.length - 1]).toBe(AGENT.id)
+    expect(tokenInsert!.args).toContain(AGENT.id)
+    expect(tokenInsert!.args).toContain('test')
   })
 
   it("THE ESCALATION GUARD: default capability is scope_type='squad' capability='member' on agent's squad", async () => {
@@ -384,10 +384,11 @@ describe('POST /admin/agent-token/mint', () => {
     const text = await res.text()
     expect(text).toContain('Shown once only')
     expect(text).toContain('mupot_')
-    // THE WELD: agent_id is the last bound arg of the member_tokens INSERT
+    // THE WELD: agent_id is bound on the member_tokens INSERT.
     const tokenInsert = captured.find((c) => c.sql.includes('INSERT INTO member_tokens'))
     expect(tokenInsert).toBeDefined()
-    expect(tokenInsert!.args[tokenInsert!.args.length - 1]).toBe(AGENT.id)
+    expect(tokenInsert!.args).toContain(AGENT.id)
+    expect(tokenInsert!.args).toContain('test')
   })
 
   it('mints an observer agent token from the dashboard form', async () => {

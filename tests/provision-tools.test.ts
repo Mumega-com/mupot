@@ -296,11 +296,11 @@ describe('mint_agent_token', () => {
     expect(sc.wake_contract.body_shape.tenant).toBe('digid')
     expect(typeof sc.wake_contract.note).toBe('string')
 
-    // THE WELD: member_tokens insert carries the agent id in agent_id (6th bind;
-    // channel is a hard-coded literal, so binds are id,member,hash,label,created_at,agent_id).
+    // THE WELD: member_tokens insert carries the agent id in agent_id.
     const tokenInsert = cap.find((c) => c.sql.includes('INSERT INTO member_tokens'))
     expect(tokenInsert).toBeDefined()
-    expect(tokenInsert!.args[5]).toBe('agent-1')
+    expect(tokenInsert!.args).toContain('agent-1')
+    expect(tokenInsert!.args).toContain('digid')
 
     // THE ESCALATION GUARD: the agent's capability is squad-scoped 'member' by
     // default on its OWN squad — never org/department, never above member.

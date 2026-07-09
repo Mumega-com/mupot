@@ -284,6 +284,7 @@ export type ConnectionChannel = 'workspace' | 'im' | 'dashboard' | 'directory'
 // Hermes holds to act for IM members). Stored hashed, like the SOS bus model.
 export interface MemberToken {
   id: string
+  tenant: string
   member_id: string
   token_hash: string
   label: string // "laptop", "hermes-gateway", ...

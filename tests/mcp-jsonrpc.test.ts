@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { mcpActionsApp, mcpApp } from '../src/mcp'
 import type { CapabilityGrant, Env } from '../src/types'
 
-function makeEnv(): Env {
+function makeEnv(seen: { authSql?: string; authBinds?: unknown[] } = {}): Env {
   const memberId = 'member-1'
   const grants: CapabilityGrant[] = [
     { member_id: memberId, scope_type: 'org', scope_id: null, capability: 'admin' },
@@ -15,10 +15,12 @@ function makeEnv(): Env {
     DB: {
       prepare(sql: string) {
         return {
-          bind() {
+          bind(...args: unknown[]) {
             return {
               async first() {
                 if (sql.includes('FROM member_tokens')) {
+                  seen.authSql = sql
+                  seen.authBinds = args
                   return {
                     member_id: memberId,
                     email: null,
@@ -97,6 +99,24 @@ describe('mcp JSON-RPC compatibility', () => {
       scope_type: 'org',
       capability: 'admin',
     })
+  })
+
+  it('binds MCP bearer auth to the current tenant', async () => {
+    const seen: { authSql?: string; authBinds?: unknown[] } = {}
+    const res = await mcpApp.request(
+      'https://pot.example/',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'status', arguments: {} } }),
+      },
+      makeEnv(seen),
+    )
+
+    expect(res.status).toBe(200)
+    expect(seen.authSql).toContain('t.tenant = ?2')
+    expect(seen.authSql).toContain('m.tenant = ?2')
+    expect(seen.authBinds?.[1]).toBe('digid')
   })
 
   it('preserves the legacy {tool,args} invocation contract', async () => {

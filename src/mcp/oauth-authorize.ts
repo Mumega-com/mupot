@@ -145,9 +145,9 @@ async function mintDirectoryToken(
   const tokenHash = await sha256Hex(raw)
   const tokenId = crypto.randomUUID()
   await env.DB.prepare(
-    `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id)
-     VALUES (?1, ?2, ?3, ?4, 'directory', datetime('now'), NULL)`,
-  ).bind(tokenId, memberId, tokenHash, label).run()
+    `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+     VALUES (?1, ?2, ?3, ?4, 'directory', datetime('now'), NULL, ?5)`,
+  ).bind(tokenId, memberId, tokenHash, label, env.TENANT_SLUG).run()
   // Raw is intentionally discarded here — the OAuth access token IS the credential;
   // the member_tokens row exists purely for capability resolution and revocation.
   // The raw token is never returned to the caller (it is not the OAuth access token).
@@ -178,9 +178,12 @@ export async function resolveExternalToken(
             t.id AS token_id, t.channel AS channel, t.agent_id AS bound_agent_id
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
-      WHERE t.token_hash = ?1 AND t.revoked_at IS NULL
+      WHERE t.token_hash = ?1
+        AND t.tenant = ?2
+        AND m.tenant = ?2
+        AND t.revoked_at IS NULL
       LIMIT 1`,
-  ).bind(tokenHash).first<{
+  ).bind(tokenHash, env.TENANT_SLUG).first<{
     member_id: string
     email: string | null
     status: string
@@ -235,9 +238,13 @@ export async function buildAuthContextFromProps(
     `SELECT m.status AS status, m.email AS email, t.channel AS channel, t.agent_id AS bound_agent_id
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
-      WHERE t.id = ?1 AND t.member_id = ?2 AND t.revoked_at IS NULL
+      WHERE t.id = ?1
+        AND t.member_id = ?2
+        AND t.tenant = ?3
+        AND m.tenant = ?3
+        AND t.revoked_at IS NULL
       LIMIT 1`,
-  ).bind(props.tokenId, props.memberId).first<{
+  ).bind(props.tokenId, props.memberId, env.TENANT_SLUG).first<{
     status: string
     email: string | null
     channel?: ConnectionChannel | null
