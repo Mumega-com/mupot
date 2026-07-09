@@ -280,12 +280,17 @@ const IM_TASK_DONE_WHEN =
   'A task result or linked artifact provides evidence that the requested IM task is complete.'
 
 export interface HandleImMessageOptions {
+  /** True only when the transport can prove Telegram forwarded-message metadata. */
   forwarded?: boolean
 }
 
 // ── the entry point Hermes calls ──────────────────────────────────────────────
 // (env, chatId, text) → a short text reply to send back into the chat. Pure with
 // respect to HTTP — no Hono context — so Hermes can invoke it directly.
+//
+// The 3-arg call is intentionally direct/trusted transport. Telegram webhook
+// calls must pass { forwarded:true } when update metadata shows a forwarded
+// message so owner-only effects can fail closed.
 export async function handleImMessage(
   env: Env,
   chatId: string | number,
@@ -508,6 +513,22 @@ async function memberHasSurfaceGrant(
   return memberHasGateGrant(env, member.id, surface)
 }
 
+async function memberOwnsAssigneeAgent(
+  env: Env,
+  memberId: string,
+  assigneeAgentId: string | null,
+): Promise<boolean> {
+  if (!assigneeAgentId) return false
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM agent_keys
+      WHERE tenant = ?1 AND agent_id = ?2 AND member_id = ?3
+      LIMIT 1`,
+  )
+    .bind(env.TENANT_SLUG, assigneeAgentId, memberId)
+    .first<{ 1: number }>()
+  return row !== null
+}
+
 function escapeLikePrefix(ref: string): string {
   return ref.replace(/[\\%_]/g, (ch) => `\\${ch}`)
 }
@@ -573,7 +594,7 @@ async function verdictReply(
     return `You don't have permission to approve "${task.title}" (need outreach:send-gated).`
   }
 
-  if (member.id === task.assignee_agent_id) {
+  if (await memberOwnsAssigneeAgent(env, member.id, task.assignee_agent_id)) {
     return `You can't decide "${task.title}" because you are the assignee.`
   }
 

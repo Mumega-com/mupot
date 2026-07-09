@@ -18,6 +18,7 @@ function makeEnv(opts: {
   gateGrants?: string[]
   taskStatus?: Task['status']
   taskGateOwner?: string | null
+  assigneeAgentMemberId?: string | null
 } = {}) {
   const inserts: unknown[][] = []
   const busEvents: unknown[] = []
@@ -106,6 +107,15 @@ function makeEnv(opts: {
               if (sql.includes('FROM gate_grants')) {
                 const [capability, principalId] = args as [string, string]
                 const ok = principalId === member.id && gateGrants.includes(capability)
+                return ok ? ({ 1: 1 } as T) : null as T | null
+              }
+              if (sql.includes('FROM agent_keys')) {
+                const [tenant, agentId, memberId] = args as [string, string, string]
+                const ok =
+                  tenant === 'local' &&
+                  agentId === 'agent-growth' &&
+                  memberId === member.id &&
+                  opts.assigneeAgentMemberId === member.id
                 return ok ? ({ 1: 1 } as T) : null as T | null
               }
               if (sql.includes('FROM org_settings')) {
@@ -402,6 +412,16 @@ describe('Hermes IM control', () => {
     expect(reply).toBe('Approved "Review local approval task".')
     expect(tasks[0].status).toBe('approved')
     expect(verdicts).toHaveLength(1)
+  })
+
+  it('refuses IM self-verdict when the member owns the assigned runtime key', async () => {
+    const { env, tasks, verdicts } = makeEnv({ assigneeAgentMemberId: 'mbr-hermes-user' })
+
+    const reply = await handleImMessage(env, 123456789, 'approve task-review-local')
+
+    expect(reply).toBe('You can\'t decide "Review local approval task" because you are the assignee.')
+    expect(tasks[0].status).toBe('review')
+    expect(verdicts).toHaveLength(0)
   })
 
   it('refuses IM approval without the task gate grant', async () => {
