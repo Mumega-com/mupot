@@ -5,6 +5,7 @@ const runbook = readFileSync(new URL('../docs/production-runbook.md', import.met
 const selfHost = readFileSync(new URL('../docs/SELF-HOST.md', import.meta.url), 'utf8')
 const setup = readFileSync(new URL('../scripts/setup.sh', import.meta.url), 'utf8')
 const provisionPot = readFileSync(new URL('../scripts/provision-pot.sh', import.meta.url), 'utf8')
+const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { scripts: Record<string, string> }
 
 describe('production self-hosting runbook', () => {
   it('is discoverable from the short self-hosting guide', () => {
@@ -37,6 +38,7 @@ describe('production self-hosting runbook', () => {
       '## Restore',
       '## Rollback',
       '## Validation',
+      '## Staging recovery rehearsal',
       '## Incident response',
     ]) {
       expect(runbook).toContain(heading)
@@ -55,6 +57,8 @@ describe('production self-hosting runbook', () => {
       'npx wrangler secret list --config "$CONFIG"',
       'npx wrangler r2 object get "${BUCKET}/path/to/object" --remote --file "$BACKUP_DIR/r2/path/to/object"',
       'aws s3 sync "s3://${BUCKET}"',
+      'npm run receipt:staging-recovery:plan',
+      'npm run receipt:staging-recovery:check',
     ]) {
       expect(runbook).toContain(command)
     }
@@ -67,6 +71,27 @@ describe('production self-hosting runbook', () => {
     expect(runbook).toContain('tmp/local-smoke/report.json')
     expect(runbook).toContain('curl -fsS "$BASE_URL/health"')
     expect(runbook).toContain('npx wrangler tail "$WORKER"')
+  })
+
+  it('defines a machine-checkable staging recovery evidence bundle', () => {
+    for (const file of [
+      'upgrade.json',
+      'backup.json',
+      'restore.json',
+      'rollback.json',
+      'queue-dlq.json',
+      'failure-reporting.json',
+      'final-validation.json',
+      'staging-recovery-check.json',
+    ]) {
+      expect(runbook).toContain(file)
+    }
+
+    expect(runbook).toContain('mupot-staging-recovery-step/v1')
+    expect(runbook).toContain('mupot-staging-recovery-rehearsal/v1')
+    expect(runbook).toContain('Do not include tokens, webhook secrets, private keys, cookies, or password')
+    expect(pkg.scripts['receipt:staging-recovery:plan']).toBe('node scripts/staging-recovery-rehearsal.mjs --plan')
+    expect(pkg.scripts['receipt:staging-recovery:check']).toBe('node scripts/staging-recovery-rehearsal.mjs --check')
   })
 
   it('covers the named incident classes from the tracker', () => {

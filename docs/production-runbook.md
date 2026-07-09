@@ -310,6 +310,83 @@ A production deploy is not healthy until the HTTP health endpoints pass, `/ops`
 has no unexplained danger checks, an owner can log in, and the relevant runtime
 worker can attach or check in.
 
+## Staging recovery rehearsal
+
+Before a release candidate, run the recovery path on a staging pot and save an
+attachable evidence bundle. This is the operational reliability gate for
+`v0.23.0`; do not run it first against production.
+
+Print the checklist:
+
+```bash
+npm run receipt:staging-recovery:plan -- \
+  --pot "$POT" \
+  --base-url "$BASE_URL" \
+  --out-dir "tmp/staging-recovery/${POT}"
+```
+
+The bundle directory must contain these redacted step receipts:
+
+| File | Proves |
+|---|---|
+| `upgrade.json` | migrations were applied and the staging Worker deployed the target git SHA |
+| `backup.json` | D1 export, config inventory, and secret-name inventory exist before mutation |
+| `restore.json` | the backup restored into a new D1 database and the restored pot validated |
+| `rollback.json` | Worker rollback or previous-ref redeploy was exercised and validated |
+| `queue-dlq.json` | Queue delivery, DLQ capture, and idempotency behavior were observed |
+| `failure-reporting.json` | `/ops`, tail output, or release logs exposed an injected failure |
+| `final-validation.json` | health, MCP health, owner login, and agent presence passed after recovery |
+
+Each step receipt must use:
+
+```json
+{
+  "receipt_type": "mupot-staging-recovery-step/v1",
+  "step": "upgrade",
+  "status": "pass",
+  "started_at": "2026-07-09T20:00:00.000Z",
+  "completed_at": "2026-07-09T20:03:00.000Z",
+  "target": {
+    "pot": "staging",
+    "base_url": "https://staging.example.com",
+    "worker": "mupot-staging",
+    "db": "mupot-staging",
+    "git_sha": "<deployed git sha>"
+  },
+  "commands": [
+    { "command": "redacted command or command id", "ok": true, "exit_code": 0 }
+  ],
+  "evidence": {
+    "required_key": true
+  }
+}
+```
+
+Do not include tokens, webhook secrets, private keys, cookies, or password
+values in the receipts. Environment variable names, secret names, redacted
+placeholders, command ids, hashes, and artifact paths are acceptable.
+
+Check the completed bundle:
+
+```bash
+npm run receipt:staging-recovery:check -- \
+  --out-dir "tmp/staging-recovery/${POT}" \
+  --pot "$POT" \
+  --base-url "$BASE_URL" \
+  > "tmp/staging-recovery/${POT}/staging-recovery-check.json"
+
+npm run receipt:staging-recovery:check -- \
+  --summary \
+  --out-dir "tmp/staging-recovery/${POT}" \
+  --pot "$POT" \
+  --base-url "$BASE_URL"
+```
+
+The rehearsal is release evidence only when
+`staging-recovery-check.json` reports
+`receipt_type:"mupot-staging-recovery-rehearsal/v1"` and `status:"pass"`.
+Attach the bundle and the check receipt to the release issue.
+
 ## Incident response
 
 ### Leaked Worker secret

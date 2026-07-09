@@ -42,10 +42,13 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       '#274',
       '#150',
       '#277',
+      '#279',
       'manifest.json',
       'cutover-gate.json',
       'export-receipt.json',
       'manifest-check.json',
+      'staging-recovery-check.json',
+      'mupot-staging-recovery-rehearsal/v1',
       'v0.23.0-rc.1',
       'seven-day production soak',
       'package.json',
@@ -82,6 +85,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'npm test',
       'node --test fleet-runtime/*.test.mjs',
       'bash scripts/ci-local-evidence.sh',
+      'npm run receipt:staging-recovery:plan',
       'npx wrangler deploy --dry-run --config wrangler.example.toml',
     ]) {
       expect(releaseDoc).toContain(command)
@@ -91,5 +95,6 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     expect(workflow).toContain('bash scripts/ci-local-evidence.sh')
     expect(pkg.scripts['smoke:local']).toBe('node scripts/local-browser-smoke.mjs')
     expect(pkg.scripts['conformance:runtime:local']).toBe('node scripts/local-runtime-conformance.mjs')
+    expect(pkg.scripts['receipt:staging-recovery:check']).toBe('node scripts/staging-recovery-rehearsal.mjs --check')
   })
 })
