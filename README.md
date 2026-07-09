@@ -32,6 +32,7 @@ send it work, gate risky actions, observe what happened, and verify the result
 against a real tool of record such as GitHub.
 
 See the [control-plane roadmap](./docs/control-plane-roadmap.md), the
+[v0.23.0 Trusted Runtime release gate](./docs/releases/v0.23.0-trusted-runtime.md), the
 [runtime adapter contract](./docs/runtime-adapter-contract.md), the
 [self-hosting guide](./docs/SELF-HOST.md), the
 [production runbook](./docs/production-runbook.md), and

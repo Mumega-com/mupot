@@ -1,0 +1,95 @@
+import { readFileSync } from 'node:fs'
+import { describe, expect, it } from 'vitest'
+
+const read = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8')
+
+const releaseDoc = read('../docs/releases/v0.23.0-trusted-runtime.md')
+const roadmap = read('../ROADMAP.md')
+const controlRoadmap = read('../docs/control-plane-roadmap.md')
+const readme = read('../README.md')
+const pkg = JSON.parse(read('../package.json')) as { version: string; scripts: Record<string, string> }
+const workflow = read('../.github/workflows/ci.yml')
+
+describe('v0.23.0 Trusted Runtime release gate', () => {
+  it('is the named current release target across top-level docs', () => {
+    for (const doc of [releaseDoc, roadmap, controlRoadmap, readme]) {
+      expect(doc).toContain('v0.23.0')
+      expect(doc).toContain('Trusted Runtime')
+    }
+
+    expect(readme).toContain('./docs/releases/v0.23.0-trusted-runtime.md')
+    expect(roadmap).toContain('docs/releases/v0.23.0-trusted-runtime.md')
+    expect(controlRoadmap).toContain('releases/v0.23.0-trusted-runtime.md')
+  })
+
+  it('pins the ten release objectives and their evidence expectations', () => {
+    for (const objective of [
+      'Reproducible installation',
+      'Trusted agent identity',
+      'Scoped authority',
+      'Complete work lifecycle',
+      'External verification',
+      'Independent evidence',
+      'Operational reliability',
+      'Automated release confidence',
+      'Release integrity',
+      'Production soak',
+    ]) {
+      expect(releaseDoc).toContain(objective)
+    }
+
+    for (const evidence of [
+      '#274',
+      '#150',
+      '#277',
+      'manifest.json',
+      'cutover-gate.json',
+      'export-receipt.json',
+      'manifest-check.json',
+      'v0.23.0-rc.1',
+      'seven-day production soak',
+      'package.json',
+      'CHANGELOG.md',
+      'GitHub Release',
+    ]) {
+      expect(releaseDoc).toContain(evidence)
+    }
+  })
+
+  it('keeps out-of-scope work out of the release definition', () => {
+    for (const deferred of [
+      'marketplace',
+      'economy',
+      'new departments',
+      'full SOS retirement',
+      'GCP portability',
+      'autonomous-brain expansion',
+    ]) {
+      expect(releaseDoc).toContain(deferred)
+      expect(roadmap).toContain(deferred)
+    }
+  })
+
+  it('does not pretend the package has shipped before release blockers pass', () => {
+    expect(pkg.version).not.toBe('0.23.0')
+    expect(releaseDoc).toContain('Do not bump `package.json` or tag until all release blockers pass.')
+  })
+
+  it('names the automated gates required for a release candidate', () => {
+    for (const command of [
+      'npm audit --audit-level=high',
+      'npm run typecheck',
+      'npm test',
+      'node --test fleet-runtime/*.test.mjs',
+      'bash scripts/ci-local-evidence.sh',
+      'npx wrangler deploy --dry-run --config wrangler.example.toml',
+    ]) {
+      expect(releaseDoc).toContain(command)
+    }
+
+    expect(workflow).toContain('local-evidence:')
+    expect(workflow).toContain('bash scripts/ci-local-evidence.sh')
+    expect(pkg.scripts['smoke:local']).toBe('node scripts/local-browser-smoke.mjs')
+    expect(pkg.scripts['conformance:runtime:local']).toBe('node scripts/local-runtime-conformance.mjs')
+  })
+})

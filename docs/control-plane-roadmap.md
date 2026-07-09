@@ -41,6 +41,18 @@ and the running product.
 
 ## Roadmap
 
+### Current Release Target: v0.23.0 - Trusted Runtime
+
+Goal: make one complete trusted-agent operating loop repeatable and
+recoverable. The release is successful only when an operator can deploy a pot,
+connect a real agent, grant scoped authority, run and approve work, verify the
+result in GitHub, and recover the system without losing state.
+
+The detailed release gate lives in
+[`docs/releases/v0.23.0-trusted-runtime.md`](releases/v0.23.0-trusted-runtime.md).
+It intentionally defers marketplace/economy expansion, new departments, full
+SOS retirement, GCP portability, and autonomous-brain expansion.
+
 ### Phase 1: Trust the Core
 
 Goal: make the current substrate reliable enough that an operator can believe
