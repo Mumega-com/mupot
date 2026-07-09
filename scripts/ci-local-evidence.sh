@@ -62,6 +62,7 @@ npm run seed:local:test
 
 say "Starting local Wrangler server at ${BASE_URL}"
 "${WRANGLER[@]}" dev \
+  --local \
   --config wrangler-local-test.toml \
   --port "${PORT}" \
   --show-interactive-dev-session=false \

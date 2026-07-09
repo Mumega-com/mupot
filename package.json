@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "dev:local:test": "wrangler dev --config wrangler-local-test.toml --port 8787",
+    "dev:local:test": "wrangler dev --local --config wrangler-local-test.toml --port 8787",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

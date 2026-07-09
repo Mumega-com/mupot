@@ -272,6 +272,7 @@ describe('runtime-adapter/v1 contract artifact', () => {
     const scriptsReadme = readFileSync(new URL('../scripts/README.md', import.meta.url), 'utf8')
 
     expect(pkg.scripts['conformance:runtime:local']).toBe('node scripts/local-runtime-conformance.mjs')
+    expect(pkg.scripts['dev:local:test']).toContain('wrangler dev --local')
     expect(script).toContain('runtime-adapter/v1')
     expect(script).toContain('/api/fleet/attach-signed')
     expect(script).toContain('/api/fleet/control')
@@ -306,6 +307,7 @@ describe('runtime-adapter/v1 contract artifact', () => {
 
     expect(script).toContain('npm run migrate:local:test')
     expect(script).toContain('npm run seed:local:test')
+    expect(script).toContain('--local')
     expect(script).toContain('wrangler-local-test.toml')
     expect(script).toContain('npm run smoke:local')
     expect(script).toContain('npm run conformance:runtime:local')
