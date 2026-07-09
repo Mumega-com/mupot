@@ -57,8 +57,11 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'v0.23.0-rc.1',
       'seven-day production soak',
       'package.json',
+      'src/version.ts',
       'CHANGELOG.md',
       'GitHub Release',
+      'release-integrity-check.json',
+      'mupot-release-integrity/v1',
     ]) {
       expect(releaseDoc).toContain(evidence)
     }
@@ -93,6 +96,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'npm run receipt:external-pr-cycle:plan',
       'npm run receipt:staging-recovery:plan',
       'npm run receipt:production-soak:plan',
+      'npm run receipt:release-integrity:plan',
       'npx wrangler deploy --dry-run --config wrangler.example.toml',
     ]) {
       expect(releaseDoc).toContain(command)
@@ -105,5 +109,6 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     expect(pkg.scripts['receipt:external-pr-cycle:check']).toBe('node scripts/external-pr-cycle-receipt.mjs --check')
     expect(pkg.scripts['receipt:staging-recovery:check']).toBe('node scripts/staging-recovery-rehearsal.mjs --check')
     expect(pkg.scripts['receipt:production-soak:check']).toBe('node scripts/production-soak-receipt.mjs --check')
+    expect(pkg.scripts['receipt:release-integrity:check']).toBe('node scripts/release-integrity-receipt.mjs --check')
   })
 })

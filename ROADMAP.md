@@ -105,7 +105,8 @@ Required proof:
 - CI gates for typecheck, unit tests, fleet tests, plugin tests, migration
   tests, dependency/security checks, browser smoke, and runtime conformance.
 - Release metadata aligned across package version, public API version,
-  changelog, roadmap, Git tag, milestone, and GitHub Release.
+  changelog, roadmap, Git tag, milestone, and GitHub Release, with a passing
+  `mupot-release-integrity/v1` evidence receipt.
 - `v0.23.0-rc.1` completes a seven-day real-agent soak without lost work,
   duplicated effects, unauthorized actions, or critical failures, with a
   passing `mupot-production-soak/v1` evidence receipt on #280.

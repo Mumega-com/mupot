@@ -31,6 +31,8 @@
     "receipt:external-pr-cycle:check": "node scripts/external-pr-cycle-receipt.mjs --check",
     "receipt:production-soak:plan": "node scripts/production-soak-receipt.mjs --plan",
     "receipt:production-soak:check": "node scripts/production-soak-receipt.mjs --check",
+    "receipt:release-integrity:plan": "node scripts/release-integrity-receipt.mjs --plan",
+    "receipt:release-integrity:check": "node scripts/release-integrity-receipt.mjs --check",
     "probe:cutover": "node fleet-runtime/cutover-probe.mjs",
     "fleet:install": "node fleet-runtime/install.mjs",
     "migrate:remote": "wrangler d1 migrations apply mupot --remote",

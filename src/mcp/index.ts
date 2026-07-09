@@ -58,6 +58,7 @@ import { PROVISION_TOOLS } from './provision'
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
 // Vitest can import it without the CF runtime. See ./auth-header.ts.
 import { AUTH_CONTEXT_HEADER } from './auth-header'
+import { MUPOT_PUBLIC_API_VERSION } from '../version'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -1750,7 +1751,7 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
     return rpcResult(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
-      serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: '0.16.0' },
+      serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: MUPOT_PUBLIC_API_VERSION },
     })
   }
 
@@ -1891,7 +1892,7 @@ function openApiSpec(origin: string): Record<string, unknown> {
     openapi: '3.0.3',
     info: {
       title: 'Mupot Digid Actions',
-      version: '0.16.0',
+      version: MUPOT_PUBLIC_API_VERSION,
       description: 'Custom GPT Actions facade for the Digid Mupot tool surface.',
     },
     servers: [{ url: origin }],

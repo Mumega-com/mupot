@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { mcpActionsApp, mcpApp } from '../src/mcp'
+import { MUPOT_PUBLIC_API_VERSION } from '../src/version'
 import type { CapabilityGrant, Env } from '../src/types'
 
 function makeEnv(seen: { authSql?: string; authBinds?: unknown[] } = {}): Env {
@@ -64,8 +65,9 @@ describe('mcp JSON-RPC compatibility', () => {
   it('initializes without a bearer token for ChatGPT connector discovery', async () => {
     const res = await rpc('initialize')
     expect(res.status).toBe(200)
-    const body = await res.json() as { result: { capabilities: unknown; serverInfo: { name: string } } }
+    const body = await res.json() as { result: { capabilities: unknown; serverInfo: { name: string; version: string } } }
     expect(body.result.serverInfo.name).toBe('mupot-digid')
+    expect(body.result.serverInfo.version).toBe(MUPOT_PUBLIC_API_VERSION)
     expect(body.result.capabilities).toEqual({ tools: {} })
   })
 
@@ -142,10 +144,12 @@ describe('custom GPT Actions compatibility', () => {
     expect(res.status).toBe(200)
     const body = await res.json() as {
       openapi: string
+      info: { version: string }
       paths: Record<string, unknown>
       components: { securitySchemes: Record<string, unknown> }
     }
     expect(body.openapi).toBe('3.0.3')
+    expect(body.info.version).toBe(MUPOT_PUBLIC_API_VERSION)
     expect(body.paths['/actions/status']).toBeTruthy()
     expect(body.paths['/actions/task_create']).toBeTruthy()
     expect(body.components.securitySchemes.bearerAuth).toMatchObject({ type: 'http', scheme: 'bearer' })
