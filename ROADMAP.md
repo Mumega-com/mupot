@@ -96,7 +96,8 @@ Required proof:
 - One task lifecycle through the product: create -> execute -> approve ->
   complete -> audit.
 - One external board -> Mupot task -> agent -> GitHub PR cycle with the PR
-  linked back to the task.
+  linked back to the task and a passing `mupot-external-pr-cycle/v1`
+  evidence receipt on #150.
 - A real Hadi-host receipt bundle for #274 with passing `manifest.json`,
   `cutover-gate.json`, `export-receipt.json`, and `manifest-check.json`.
 - A staging rehearsal for upgrade, backup, restore, rollback, Queue/DLQ

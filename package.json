@@ -27,6 +27,8 @@
     "receipt:bundle:export": "node fleet-runtime/receipt-bundle.mjs --export",
     "receipt:staging-recovery:plan": "node scripts/staging-recovery-rehearsal.mjs --plan",
     "receipt:staging-recovery:check": "node scripts/staging-recovery-rehearsal.mjs --check",
+    "receipt:external-pr-cycle:plan": "node scripts/external-pr-cycle-receipt.mjs --plan",
+    "receipt:external-pr-cycle:check": "node scripts/external-pr-cycle-receipt.mjs --check",
     "probe:cutover": "node fleet-runtime/cutover-probe.mjs",
     "fleet:install": "node fleet-runtime/install.mjs",
     "migrate:remote": "wrangler d1 migrations apply mupot --remote",

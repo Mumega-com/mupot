@@ -43,6 +43,8 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       '#150',
       '#277',
       '#279',
+      'external-pr-cycle-check.json',
+      'mupot-external-pr-cycle/v1',
       'manifest.json',
       'cutover-gate.json',
       'export-receipt.json',
@@ -85,6 +87,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'npm test',
       'node --test fleet-runtime/*.test.mjs',
       'bash scripts/ci-local-evidence.sh',
+      'npm run receipt:external-pr-cycle:plan',
       'npm run receipt:staging-recovery:plan',
       'npx wrangler deploy --dry-run --config wrangler.example.toml',
     ]) {
@@ -95,6 +98,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     expect(workflow).toContain('bash scripts/ci-local-evidence.sh')
     expect(pkg.scripts['smoke:local']).toBe('node scripts/local-browser-smoke.mjs')
     expect(pkg.scripts['conformance:runtime:local']).toBe('node scripts/local-runtime-conformance.mjs')
+    expect(pkg.scripts['receipt:external-pr-cycle:check']).toBe('node scripts/external-pr-cycle-receipt.mjs --check')
     expect(pkg.scripts['receipt:staging-recovery:check']).toBe('node scripts/staging-recovery-rehearsal.mjs --check')
   })
 })
