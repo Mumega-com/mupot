@@ -73,6 +73,23 @@ The local seed creates a non-production `agent-conformance` key and a welded
 sender token. The harness proves `runtime-adapter/v1` over HTTP: signed attach,
 replay refusal, bearer send to the runtime inbox, signed inbox peek/consume,
 consume-once behavior, fleet control request signing/delivery, and signed detach.
+It writes `tmp/local-runtime-conformance/report.json` and prints the same JSON
+report to stdout. Failures write `tmp/local-runtime-conformance/failure-*.json`
+when the process can create artifacts.
+
+## CI local evidence
+
+GitHub Actions runs the same local evidence gate with:
+
+```bash
+bash scripts/ci-local-evidence.sh
+```
+
+The script applies local D1 migrations, seeds the local fixtures, starts
+`wrangler dev` with `wrangler-local-test.toml`, waits for `/health`, runs
+`npm run smoke:local`, and then runs `npm run conformance:runtime:local`.
+Actions uploads `tmp/local-evidence`, `tmp/local-smoke`, and
+`tmp/local-runtime-conformance` as the `local-evidence` artifact.
 
 ## One-time deploy (fork → deploy → log in)
 
