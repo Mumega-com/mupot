@@ -103,6 +103,37 @@ async function canActOnSquad(
   return hasCapability(grants, 'squad', squadId, 'member', deptId)
 }
 
+async function readableSquadIds(env: Env, auth: AuthContext): Promise<string[] | null> {
+  if (legacyOwnerAdmin(auth)) return null
+  if (!auth.memberId) return []
+  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
+  if (hasCapability(grants, 'org', null, 'member')) return null
+
+  const squadIds = new Set<string>()
+  const deptIds = new Set<string>()
+  for (const grant of grants) {
+    if (grant.scope_type === 'squad' && grant.scope_id && hasCapability([grant], 'squad', grant.scope_id, 'member')) {
+      squadIds.add(grant.scope_id)
+    }
+    if (grant.scope_type === 'department' && grant.scope_id && hasCapability([grant], 'department', grant.scope_id, 'member')) {
+      deptIds.add(grant.scope_id)
+    }
+  }
+
+  if (deptIds.size > 0) {
+    const ids = [...deptIds]
+    const placeholders = ids.map((_, i) => `?${i + 1}`).join(', ')
+    const rows = await env.DB.prepare(
+      `SELECT id FROM squads WHERE department_id IN (${placeholders})`,
+    )
+      .bind(...ids)
+      .all<{ id: string }>()
+    for (const row of rows.results ?? []) squadIds.add(row.id)
+  }
+
+  return [...squadIds]
+}
+
 // ── app ──────────────────────────────────────────────────────────────────────
 
 export const tasksApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
@@ -130,6 +161,7 @@ tasksApp.use('*', async (c, next) => {
 tasksApp.get('/', async (c) => {
   const squadId = c.req.query('squad_id')
   const status = c.req.query('status')
+  const auth = c.get('auth')
 
   if (status !== undefined && !isTaskStatus(status)) {
     return c.json({ error: 'invalid_status' }, 400)
@@ -139,8 +171,19 @@ tasksApp.get('/', async (c) => {
   const clauses: string[] = []
   const binds: string[] = []
   if (squadId !== undefined) {
+    if (!(await canActOnSquad(c.env, auth, squadId))) {
+      return c.json({ error: 'forbidden', need: 'member' }, 403)
+    }
     clauses.push('squad_id = ?')
     binds.push(squadId)
+  } else {
+    const readable = await readableSquadIds(c.env, auth)
+    if (readable !== null) {
+      if (readable.length === 0) return c.json({ tasks: [] })
+      const placeholders = readable.map(() => '?').join(', ')
+      clauses.push(`squad_id IN (${placeholders})`)
+      binds.push(...readable)
+    }
   }
   if (status !== undefined) {
     clauses.push('status = ?')

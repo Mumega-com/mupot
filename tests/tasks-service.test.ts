@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createTask, mirrorTaskUpdate } from '../src/tasks/service'
 
-function makeTaskEnv() {
+function makeTaskEnv(opts: { insertChanges?: number; linkChanges?: number } = {}) {
   const inserts: unknown[][] = []
+  const linkUpdates: unknown[][] = []
   const events: unknown[] = []
+  const insertChanges = opts.insertChanges ?? 1
+  const linkChanges = opts.linkChanges ?? 1
 
   const env = {
     TENANT_SLUG: 'test-tenant',
@@ -21,6 +24,11 @@ function makeTaskEnv() {
             return {
               async run() {
                 if (sql.includes('INSERT INTO tasks')) inserts.push(args)
+                if (sql.includes('INSERT INTO tasks')) return { meta: { changes: insertChanges } }
+                if (sql.includes('UPDATE tasks SET github_issue_url')) {
+                  linkUpdates.push(args)
+                  return { meta: { changes: linkChanges } }
+                }
                 return { meta: { changes: 1 } }
               },
             }
@@ -30,7 +38,7 @@ function makeTaskEnv() {
     },
   }
 
-  return { env: env as never, inserts, events }
+  return { env: env as never, inserts, linkUpdates, events }
 }
 
 afterEach(() => {
@@ -39,7 +47,7 @@ afterEach(() => {
 
 describe('createTask', () => {
   it('persists once, mirrors to GitHub, and emits an attributed notification', async () => {
-    const { env, inserts, events } = makeTaskEnv()
+    const { env, inserts, linkUpdates, events } = makeTaskEnv()
     const fetchMock = vi.fn(async () =>
       new Response(JSON.stringify({ html_url: 'https://github.com/acme/widgets/issues/7' }), {
         status: 201,
@@ -75,13 +83,14 @@ describe('createTask', () => {
       'channel tasks test passes',
       'open',
       null,
-      'https://github.com/acme/widgets/issues/7',
+      null,
       null, // result — unset on create
       null, // completed_at — unset on create
       null, // gate_owner — unset on create
       task.created_at,
       task.updated_at,
     ])
+    expect(linkUpdates).toEqual([['https://github.com/acme/widgets/issues/7', task.id]])
 
     expect(events).toEqual([
       expect.objectContaining({
@@ -93,6 +102,27 @@ describe('createTask', () => {
         payload: expect.objectContaining({ task_id: task.id, title: task.title }),
       }),
     ])
+  })
+
+  it('does not mirror to GitHub when the task insert receipt fails', async () => {
+    const { env, inserts, linkUpdates, events } = makeTaskEnv({ insertChanges: 0 })
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ html_url: 'https://github.com/acme/widgets/issues/9' }), {
+        status: 201,
+      }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(createTask(env, {
+      squad_id: 'squad-1',
+      title: 'No orphan issue',
+      done_when: 'task insert failure does not create a GitHub issue',
+    })).rejects.toThrow(/receipt_failed: tasks\.insert/)
+
+    expect(inserts).toHaveLength(1)
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(linkUpdates).toEqual([])
+    expect(events).toEqual([])
   })
 })
 
