@@ -30,6 +30,7 @@ import type { BusEvent } from '../types'
 import { startTaskPipeline } from '../workflows/pipeline'
 
 // ── validation helpers ───────────────────────────────────────────────────────
+type TaskActor = NonNullable<BusEvent['actor']>
 
 // Gate statuses (review/approved/rejected) extend the base set. PATCH is
 // constrained to a safe subset: review→approved|rejected is forbidden via PATCH
@@ -132,6 +133,16 @@ async function readableSquadIds(env: Env, auth: AuthContext): Promise<string[] |
   }
 
   return [...squadIds]
+}
+
+export function verdictPrincipal(auth: AuthContext): { id: string; type: 'member' | 'agent'; actor?: TaskActor } {
+  if (auth.boundAgentId) {
+    return { id: auth.boundAgentId, type: 'agent', actor: { kind: 'agent', id: auth.boundAgentId } }
+  }
+  if (auth.memberId) {
+    return { id: auth.memberId, type: 'member', actor: { kind: 'member', id: auth.memberId } }
+  }
+  return { id: auth.userId, type: 'agent', actor: auth.userId ? { kind: 'agent', id: auth.userId } : undefined }
 }
 
 // ── app ──────────────────────────────────────────────────────────────────────
@@ -627,11 +638,12 @@ async function callerHoldsGateCapability(
   // Org owners/admins always pass (same escape used throughout tasks).
   if (legacyOwnerAdmin(auth)) return true
 
-  // Determine what principal id + type to check.
-  // Member tokens: auth.memberId is set.
-  // Agent tokens: auth.memberId is absent; auth.userId carries the agent id.
-  const principalId = auth.memberId ?? auth.userId
-  const principalType: 'member' | 'agent' = auth.memberId ? 'member' : 'agent'
+  // Determine what principal id + type to check. Agent-bound tokens represent the
+  // bound agent for gate grants and self-verdict, even though they also carry the
+  // member envelope used for token revocation and capability resolution.
+  const principal = verdictPrincipal(auth)
+  const principalId = principal.id
+  const principalType = principal.type
 
   if (!principalId) return false
 
@@ -708,21 +720,21 @@ tasksApp.post('/:id/verdict', async (c) => {
   // K4: self-verdict prevention.
   //
   // Policy: a principal may not approve or reject their own work.
-  // "Own work" = the principal IS the task assignee (agent-token callers use
-  // auth.userId which is the agent id; member-token callers use auth.memberId).
+  // "Own work" = the principal IS the task assignee. Agent-bound tokens use
+  // auth.boundAgentId, not the member envelope id, so they cannot approve their
+  // own assigned tasks by hiding behind member_tokens.member_id.
   //
   // Comparison logic:
-  //  - agent token (no memberId): decider = auth.userId = agent id → compare to
-  //    task.assignee_agent_id directly.
-  //  - member token (has memberId): decider = auth.memberId. The assignee is an
-  //    agent id, not a member id — a direct equality check here is safe (they are
-  //    different id spaces and can never collide). Future: when tasks carry a
-  //    created_by member_id column, extend this check to also compare memberId
-  //    against the creator.
+  //  - agent-bound token: decider = auth.boundAgentId = agent id.
+  //  - legacy agent token without member envelope: decider = auth.userId.
+  //  - human member token/session: decider = auth.memberId.
+  // Future: when tasks carry a created_by member_id column, also compare memberId
+  // against the creator.
   //
   // Override: org owner may self-verdict by passing { override_self_verdict: true }
   // in the body. The override is logged in the verdict note for auditability.
-  const deciderPrincipalId = auth.memberId ?? auth.userId
+  const principal = verdictPrincipal(auth)
+  const deciderPrincipalId = principal.id
   const isSelfVerdict = deciderPrincipalId === task.assignee_agent_id
   if (isSelfVerdict) {
     const isOrgOwner = auth.role === 'owner'
@@ -740,12 +752,12 @@ tasksApp.post('/:id/verdict', async (c) => {
   }
 
   // Write verdict with conditional UPDATE guard (K5 race protection).
-  const decidedBy = auth.memberId ?? auth.userId
+  const decidedBy = principal.id
   try {
     const result = await writeVerdict(
       c.env,
       { task, verdict: body.verdict, note, decidedBy },
-      auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
+      principal.actor,
     )
 
     // Best-effort Workflow resume: if a pipeline instance is parked on

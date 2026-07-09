@@ -51,6 +51,34 @@ import {
 
 type AppEnv = { Bindings: Env }
 
+export const IM_WEBHOOK_MAX_BODY_BYTES = 64 * 1024
+
+type CappedBody =
+  | { ok: true; raw: string }
+  | { ok: false; reason: 'too_large' | 'bad_utf8' }
+
+async function readCappedBody(req: Request, maxBytes: number): Promise<CappedBody> {
+  const declared = req.headers.get('content-length')
+  if (declared && Number(declared) > maxBytes) return { ok: false, reason: 'too_large' }
+  const buf = await req.arrayBuffer()
+  if (buf.byteLength > maxBytes) return { ok: false, reason: 'too_large' }
+  try {
+    return { ok: true, raw: new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(buf) }
+  } catch {
+    return { ok: false, reason: 'bad_utf8' }
+  }
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  const enc = new TextEncoder()
+  const ab = enc.encode(a)
+  const bb = enc.encode(b)
+  if (ab.length !== bb.length) return false
+  let diff = 0
+  for (let i = 0; i < ab.length; i++) diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0)
+  return diff === 0
+}
+
 // ── attribution ───────────────────────────────────────────────────────────────
 function memberActor(memberId: string): { kind: 'member'; id: string } {
   return { kind: 'member', id: memberId }
@@ -721,6 +749,13 @@ interface TelegramUpdate {
 // We always answer 200 with a reply string (even for refusals) so the relay has
 // a clear message to deliver; transport-level problems are the only non-200s.
 imApp.post('/webhook', async (c) => {
+  const body = await readCappedBody(c.req.raw, IM_WEBHOOK_MAX_BODY_BYTES)
+  if (!body.ok) {
+    const status = body.reason === 'too_large' ? 413 : 400
+    const error = body.reason === 'too_large' ? 'payload_too_large' : 'invalid_json'
+    return c.json({ error }, status)
+  }
+
   // Auth (fail-closed): the webhook must carry the shared secret. Telegram sends
   // the secret_token you registered via setWebhook in this header. Without a
   // configured secret the webhook is sealed — an unauthenticated POST could forge
@@ -728,13 +763,14 @@ imApp.post('/webhook', async (c) => {
   if (!c.env.IM_WEBHOOK_SECRET) {
     return c.json({ error: 'webhook_not_configured' }, 503)
   }
-  if (c.req.header('X-Telegram-Bot-Api-Secret-Token') !== c.env.IM_WEBHOOK_SECRET) {
+  const providedSecret = c.req.header('X-Telegram-Bot-Api-Secret-Token')
+  if (!providedSecret || !timingSafeEqual(providedSecret, c.env.IM_WEBHOOK_SECRET)) {
     return c.json({ error: 'unauthorized' }, 401)
   }
 
   let update: TelegramUpdate
   try {
-    update = (await c.req.json()) as TelegramUpdate
+    update = JSON.parse(body.raw) as TelegramUpdate
   } catch {
     return c.json({ error: 'invalid_json' }, 400)
   }
