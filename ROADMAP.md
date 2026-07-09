@@ -107,7 +107,8 @@ Required proof:
 - Release metadata aligned across package version, public API version,
   changelog, roadmap, Git tag, milestone, and GitHub Release.
 - `v0.23.0-rc.1` completes a seven-day real-agent soak without lost work,
-  duplicated effects, unauthorized actions, or critical failures.
+  duplicated effects, unauthorized actions, or critical failures, with a
+  passing `mupot-production-soak/v1` evidence receipt on #280.
 
 Deferred from this version: marketplace/economy expansion, new departments,
 full SOS retirement, GCP portability, and autonomous-brain expansion.
