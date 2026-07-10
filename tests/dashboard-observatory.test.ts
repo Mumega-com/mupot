@@ -285,16 +285,16 @@ describe('runtime state', () => {
   const NOW = new Date('2026-07-10T12:00:00.000Z').getTime()
 
   it('never calls a configured-but-unkeyed agent live', () => {
-    expect(deriveAgentRuntimeState({ key_agent_id: null, fleet_status: 'running', last_reported_at: '2026-07-10 11:59:00' }, 180, NOW))
+    expect(deriveAgentRuntimeState({ key_member_id: null, fleet_status: 'running', last_reported_at: '2026-07-10 11:59:00' }, 180, NOW))
       .toBe('unattached')
   })
 
   it('requires a fresh signed heartbeat after key registration', () => {
-    expect(deriveAgentRuntimeState({ key_agent_id: 'a1', fleet_status: null, last_reported_at: null }, 180, NOW))
+    expect(deriveAgentRuntimeState({ key_member_id: 'member-a1', fleet_status: null, last_reported_at: null }, 180, NOW))
       .toBe('offline')
-    expect(deriveAgentRuntimeState({ key_agent_id: 'a1', fleet_status: 'running', last_reported_at: '2026-07-10 11:59:00' }, 180, NOW))
+    expect(deriveAgentRuntimeState({ key_member_id: 'member-a1', fleet_status: 'running', last_reported_at: '2026-07-10 11:59:00' }, 180, NOW))
       .toBe('live')
-    expect(deriveAgentRuntimeState({ key_agent_id: 'a1', fleet_status: 'running', last_reported_at: '2026-07-10 11:50:00' }, 180, NOW))
+    expect(deriveAgentRuntimeState({ key_member_id: 'member-a1', fleet_status: 'running', last_reported_at: '2026-07-10 11:50:00' }, 180, NOW))
       .toBe('stale')
   })
 
@@ -302,6 +302,8 @@ describe('runtime state', () => {
     const { env, calls } = makeSingleEnv([])
     await loadAgentRuntimeStates(env)
     expect(calls[0].sql).toContain('LEFT JOIN agent_keys')
+    expect(calls[0].sql).toContain("LEFT JOIN members m")
+    expect(calls[0].sql).toContain("m.status = 'active'")
     expect(calls[0].sql).toContain('LEFT JOIN fleet_agents')
     expect(calls[0].binds).toEqual(['test'])
   })

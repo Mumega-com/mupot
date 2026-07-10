@@ -252,17 +252,17 @@ export type AgentRuntimeState = 'live' | 'stale' | 'offline' | 'unattached'
 
 interface AgentRuntimeEvidence {
   agent_id: string
-  key_agent_id: string | null
+  key_member_id: string | null
   fleet_status: string | null
   last_reported_at: string | null
 }
 
 export function deriveAgentRuntimeState(
-  evidence: Pick<AgentRuntimeEvidence, 'key_agent_id' | 'fleet_status' | 'last_reported_at'>,
+  evidence: Pick<AgentRuntimeEvidence, 'key_member_id' | 'fleet_status' | 'last_reported_at'>,
   ttlSec: number,
   nowMs: number,
 ): AgentRuntimeState {
-  if (!evidence.key_agent_id) return 'unattached'
+  if (!evidence.key_member_id) return 'unattached'
   if (!evidence.fleet_status) return 'offline'
   return derivePresence(evidence.fleet_status, evidence.last_reported_at ?? '', ttlSec, nowMs)
 }
@@ -270,12 +270,14 @@ export function deriveAgentRuntimeState(
 export async function loadAgentRuntimeStates(env: Env, nowMs = Date.now()): Promise<Map<string, AgentRuntimeState>> {
   const rows = await env.DB.prepare(
     `SELECT a.id AS agent_id,
-            k.agent_id AS key_agent_id,
+            m.id AS key_member_id,
             f.status AS fleet_status,
             f.last_reported_at
        FROM agents a
        LEFT JOIN agent_keys k
               ON k.tenant = ?1 AND k.agent_id = a.id
+       LEFT JOIN members m
+              ON m.id = k.member_id AND m.tenant = k.tenant AND m.status = 'active'
        LEFT JOIN fleet_agents f
               ON f.tenant = ?1 AND f.agent_id = a.id
       ORDER BY a.created_at ASC, a.name ASC`,
