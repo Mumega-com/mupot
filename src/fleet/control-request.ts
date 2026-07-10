@@ -84,12 +84,24 @@ function parsePrivateKey(jwkJson: string): PanelPrivateJwk {
   ) {
     throw new ControlRequestError('FLEET_PANEL_SK must be a PRIVATE Ed25519 OKP JWK (with d)')
   }
+  if (jwk.alg !== undefined && jwk.alg !== 'Ed25519' && jwk.alg !== 'EdDSA') {
+    throw new ControlRequestError('FLEET_PANEL_SK alg must be Ed25519 or EdDSA when present')
+  }
+  if (jwk.key_ops !== undefined && (!Array.isArray(jwk.key_ops) || !jwk.key_ops.includes('sign'))) {
+    throw new ControlRequestError('FLEET_PANEL_SK key_ops must include sign when present')
+  }
   return jwk as PanelPrivateJwk
+}
+
+function normalizedPrivateKey(jwk: PanelPrivateJwk): JsonWebKey {
+  // Workerd production rejects Node 22's non-standard alg:"Ed25519" metadata,
+  // while local WebCrypto accepts it. Pin only the actual Ed25519 key material.
+  return { kty: 'OKP', crv: 'Ed25519', x: jwk.x, d: jwk.d }
 }
 
 async function importPrivateKey(jwkJson: string): Promise<CryptoKey> {
   const jwk = parsePrivateKey(jwkJson)
-  return crypto.subtle.importKey('jwk', jwk, { name: 'Ed25519' }, false, ['sign'])
+  return crypto.subtle.importKey('jwk', normalizedPrivateKey(jwk), { name: 'Ed25519' }, false, ['sign'])
 }
 
 /**
@@ -99,7 +111,7 @@ async function importPrivateKey(jwkJson: string): Promise<CryptoKey> {
 export async function panelPublicJwk(privateKeyJwkJson: string | undefined): Promise<JsonWebKey> {
   if (!privateKeyJwkJson) throw new ControlRequestError('FLEET_PANEL_SK not configured (fail-closed)')
   const jwk = parsePrivateKey(privateKeyJwkJson)
-  await crypto.subtle.importKey('jwk', jwk, { name: 'Ed25519' }, false, ['sign'])
+  await crypto.subtle.importKey('jwk', normalizedPrivateKey(jwk), { name: 'Ed25519' }, false, ['sign'])
   return { kty: 'OKP', crv: 'Ed25519', x: jwk.x }
 }
 

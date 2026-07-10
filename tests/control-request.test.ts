@@ -62,6 +62,17 @@ describe('fleet control-request signer', () => {
     await expect(panelPublicJwk(JSON.stringify({ kty: 'OKP', crv: 'Ed25519', x: expected.x }))).rejects.toThrow(ControlRequestError)
   })
 
+  it('normalizes accepted JWK metadata before WebCrypto import', async () => {
+    const { priv, pub } = await freshKeys()
+    const parsed = JSON.parse(priv) as JsonWebKey
+    const standardAlg = JSON.stringify({ ...parsed, alg: 'EdDSA', key_ops: ['sign'] })
+    expect(await panelPublicJwk(standardAlg)).toMatchObject({
+      kty: 'OKP', crv: 'Ed25519', x: (JSON.parse(pub) as JsonWebKey).x,
+    })
+    await expect(panelPublicJwk(JSON.stringify({ ...parsed, alg: 'RS256' }))).rejects.toThrow(/alg/)
+    await expect(panelPublicJwk(JSON.stringify({ ...parsed, key_ops: ['verify'] }))).rejects.toThrow(/key_ops/)
+  })
+
   it('canonical bytes match the committed vector string', () => {
     const r = vector.request
     const got = new TextDecoder().decode(canonicalBytes(r.agent_id, r.verb, r.nonce, r.ts))
