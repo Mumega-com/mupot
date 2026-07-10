@@ -378,7 +378,7 @@ must attest `evidence.no_manual_db_edits:true`.
 Check the completed bundle:
 
 ```bash
-npm run receipt:fresh-install:check -- \
+npm run --silent receipt:fresh-install:check -- \
   --out-dir "tmp/fresh-install/${POT}" \
   --pot "$POT" \
   --base-url "$BASE_URL" \
@@ -463,7 +463,7 @@ both expected revisions.
 Check the completed bundle:
 
 ```bash
-npm run receipt:staging-recovery:check -- \
+npm run --silent receipt:staging-recovery:check -- \
   --out-dir "tmp/staging-recovery/${POT}" \
   --pot "$POT" \
   --base-url "$BASE_URL" \
