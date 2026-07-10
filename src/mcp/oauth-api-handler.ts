@@ -20,6 +20,7 @@ import { WorkerEntrypoint } from 'cloudflare:workers'
 import type { Env } from '../types'
 import { mcpApp } from './index'
 import { buildAuthContextFromProps, type OAuthMemberProps } from './oauth-authorize'
+import { mcpInternalRequest } from './internal-dispatch'
 // AUTH_CONTEXT_HEADER is defined in ./auth-header (no cloudflare:workers import)
 // so it can be imported by tests without pulling in the CF runtime.
 import { AUTH_CONTEXT_HEADER } from './auth-header'
@@ -44,19 +45,10 @@ export class McpOAuthApiHandler extends WorkerEntrypoint<Env> {
       )
     }
 
-    // Attach the resolved AuthContext to the forwarded request so the Hono
-    // mcpApp can read it without re-doing authn. The header value is a JSON
-    // blob that only travels Worker-internally (never to the original client).
-    const forwarded = new Request(request.url, {
-      method: request.method,
-      headers: (() => {
-        const h = new Headers(request.headers)
-        h.set(AUTH_CONTEXT_HEADER, JSON.stringify(auth))
-        return h
-      })(),
-      // body is null for GET; forward as-is for POST
-      body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined,
-    })
+    // The OAuthProvider invokes us with the public /mcp pathname, while mcpApp
+    // itself is not mounted here and only exposes POST /. Re-root the request and
+    // attach the resolved context before the internal dispatch.
+    const forwarded = mcpInternalRequest(request, auth)
 
     return mcpApp.fetch(forwarded, this.env)
   }
