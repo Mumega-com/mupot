@@ -120,8 +120,9 @@ describe('self-hosting provisioning scripts', () => {
   })
 
   it('per-pot provisioning points fresh operators at wrangler.example.toml and OAUTH_KV', () => {
-    expect(provisionPot).toContain('cp wrangler.example.toml wrangler.${POT}.toml')
-    expect(provisionPot).toContain('mupot-${POT}-oauth')
-    expect(provisionPot).toContain('GOOGLE_CLIENT_ID')
+    expect(provisionPot).toContain('setup.sh" --pot "${POT}"')
+    expect(setup).toContain('wrangler.${POT}.toml')
+    expect(setup).toContain('mupot-${POT}-oauth')
+    expect(setup).toContain('OAUTH_KV')
   })
 })

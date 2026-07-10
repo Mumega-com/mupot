@@ -16,6 +16,7 @@
 # Usage:
 #   wrangler login         # once
 #   bash scripts/secrets.sh
+#   bash scripts/secrets.sh --pot acme
 #
 # Re-runnable: setting a secret again simply overwrites it.
 
@@ -23,6 +24,44 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+POT=""
+
+usage() {
+  cat <<'EOF'
+Usage: bash scripts/secrets.sh [--pot <slug>]
+
+Without --pot, targets wrangler.toml. With --pot, targets wrangler.<slug>.toml.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --pot)
+      [ "$#" -ge 2 ] || { usage >&2; exit 1; }
+      POT="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [ -n "${POT}" ] && ! [[ "${POT}" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; then
+  printf 'Invalid pot slug %q; use lowercase letters, digits, and hyphens.\n' "${POT}" >&2
+  exit 1
+fi
+
+if [ -n "${POT}" ]; then
+  WRANGLER_TOML="${ROOT_DIR}/wrangler.${POT}.toml"
+else
+  WRANGLER_TOML="${ROOT_DIR}/wrangler.toml"
+fi
 
 WRANGLER=(npx --no-install wrangler)
 if ! npx --no-install wrangler --version >/dev/null 2>&1; then
@@ -35,6 +74,7 @@ skip() { printf '\033[1;33m∼\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
 cd "${ROOT_DIR}"
+[ -f "${WRANGLER_TOML}" ] || die "Missing $(basename "${WRANGLER_TOML}"). Run setup first."
 
 # ── preflight ─────────────────────────────────────────────────────────────────
 "${WRANGLER[@]}" --version >/dev/null 2>&1 || die "wrangler not available. Run: npm install"
@@ -75,7 +115,7 @@ put_secret() {
 
   say "Setting ${name}…"
   # Pipe via stdin so the value never appears in argv / process list / history.
-  if printf '%s' "$value" | "${WRANGLER[@]}" secret put "$name" >/dev/null 2>&1; then
+  if printf '%s' "$value" | "${WRANGLER[@]}" secret put "$name" --config "${WRANGLER_TOML}" >/dev/null 2>&1; then
     ok "${name} set."
   else
     unset value
@@ -84,7 +124,7 @@ put_secret() {
   unset value
 }
 
-say "Setting mupot secrets on your Cloudflare account."
+say "Setting mupot secrets for $(basename "${WRANGLER_TOML}")."
 printf 'Values are read silently and never written to disk or git.\n\n'
 
 put_secret OAUTH_CLIENT_ID     required
@@ -94,4 +134,4 @@ put_secret AI_GATEWAY_TOKEN    optional
 
 printf '\n'
 ok "Secrets configured."
-say "Deploy (or re-deploy) to pick them up:  npm run deploy"
+say "Deploy (or re-deploy) to pick them up:  npx wrangler deploy --config \"${WRANGLER_TOML}\""

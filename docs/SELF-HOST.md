@@ -28,13 +28,18 @@ per pot.
 
 ```bash
 npx wrangler login                 # on the TARGET account
-scripts/provision-pot.sh acme      # creates D1/Vectorize/Queues/KV/R2 for pot "acme"
-cp wrangler.example.toml wrangler.acme.toml
+scripts/provision-pot.sh acme      # creates resources, writes wrangler.acme.toml, applies migrations
 ```
 
-Then follow the printed steps: paste the resource IDs/names into
-`wrangler.acme.toml`, set `[vars]` (`TENANT_SLUG`, `BRAND`,
-`OAUTH_PROVIDER`, fleet settings), put secrets, apply migrations, deploy.
+The script writes tenant-scoped resource names and bindings into
+`wrangler.acme.toml`; no resource ID copying is required. Set secrets against
+that exact config, deploy once, set the secrets, then deploy again:
+
+```bash
+npx wrangler deploy --config wrangler.acme.toml
+bash scripts/secrets.sh --pot acme
+npx wrangler deploy --config wrangler.acme.toml
+```
 
 ## Secrets
 
