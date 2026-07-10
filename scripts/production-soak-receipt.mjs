@@ -356,7 +356,7 @@ export function checkBundle(opts = {}) {
   pushCheck(checks, Boolean(outDir && existsSync(outDir)), 'out_dir_exists', { out_dir: outDir })
 
   if (outDir && existsSync(outDir)) {
-    const allowedFixed = new Set(['soak-start.json', 'soak-end.json'])
+    const allowedFixed = new Set(['soak-start.json', 'soak-end.json', 'production-soak-check.json'])
     const extraFiles = readdirSync(outDir).filter((name) =>
       name.endsWith('.json') &&
       !allowedFixed.has(name) &&
@@ -552,4 +552,3 @@ if (entry && entry === fileURLToPath(import.meta.url)) {
     process.exitCode = 1
   }
 }
-

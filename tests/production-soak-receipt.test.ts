@@ -156,6 +156,20 @@ describe('production soak receipt checker', () => {
     expect(receipt.target.agent).toBe(TARGET.agent)
   })
 
+  it('accepts the aggregate output file created by shell redirection', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+    writeFileSync(join(dir, 'production-soak-check.json'), '')
+
+    const receipt = checkBundle({ outDir: dir, rcVersion: TARGET.rc_version })
+
+    expect(receipt.status).toBe('pass')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: true,
+      check: 'bundle_only_expected_json_files',
+    }))
+  })
+
   it('fails when soak duration is shorter than seven days', () => {
     const dir = tempDir()
     writeBundle(dir, (receipt, name) => {
@@ -228,4 +242,3 @@ describe('production soak receipt checker', () => {
     }))
   })
 })
-

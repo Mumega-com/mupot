@@ -385,7 +385,7 @@ export function checkBundle(opts = {}) {
   pushCheck(checks, Boolean(outDir && existsSync(outDir)), 'out_dir_exists', { out_dir: outDir })
 
   if (outDir && existsSync(outDir)) {
-    const allowed = new Set(REQUIRED_STEPS.map((step) => step.file))
+    const allowed = new Set([...REQUIRED_STEPS.map((step) => step.file), 'external-pr-cycle-check.json'])
     const extraFiles = readdirSync(outDir).filter((name) => name.endsWith('.json') && !allowed.has(name))
     pushCheck(checks, extraFiles.length === 0, 'bundle_only_required_json_files', { extra_files: extraFiles })
   }

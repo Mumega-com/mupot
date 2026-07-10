@@ -402,14 +402,15 @@ npm run receipt:staging-recovery:plan -- \
   --out-dir "tmp/staging-recovery/${POT}"
 ```
 
-The bundle directory must contain these redacted step receipts:
+The bundle directory must contain these redacted step receipts. Run them in
+this order without overlap so each step starts after the previous step ends:
 
 | File | Proves |
 |---|---|
-| `upgrade.json` | migrations were applied and the staging Worker deployed the target git SHA |
-| `backup.json` | D1 export, config inventory, and secret-name inventory exist before mutation |
+| `backup.json` | D1 export, config inventory, secret-name inventory, and source git SHA exist before mutation |
+| `upgrade.json` | the source SHA differs from the target SHA, migrations were applied, and the staging Worker deployed the target SHA |
 | `restore.json` | the backup restored into a new D1 database and the restored pot validated |
-| `rollback.json` | Worker rollback or previous-ref redeploy was exercised and validated |
+| `rollback.json` | Worker rollback reached the source SHA, validated, and then recovered to the target SHA |
 | `queue-dlq.json` | Queue delivery, DLQ capture, and idempotency behavior were observed |
 | `failure-reporting.json` | `/ops`, tail output, or release logs exposed an injected failure |
 | `final-validation.json` | health, MCP health, owner login, and agent presence passed after recovery |
@@ -442,6 +443,13 @@ Each step receipt must use:
 Do not include tokens, webhook secrets, private keys, cookies, or password
 values in the receipts. Environment variable names, secret names, redacted
 placeholders, command ids, hashes, and artifact paths are acceptable.
+
+The backup evidence must include `source_git_sha`. Upgrade evidence must include
+the same value as `previous_git_sha` and the release candidate as `deployed_sha`.
+Rollback evidence must include that source SHA as `rolled_back_to_sha` and the
+candidate SHA as `recovered_to_sha`. The checker rejects a no-op upgrade,
+out-of-order or overlapping steps, and rollback evidence that does not return to
+both expected revisions.
 
 Check the completed bundle:
 
