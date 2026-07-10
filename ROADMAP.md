@@ -88,7 +88,8 @@ state. The detailed gate is
 [docs/releases/v0.23.0-trusted-runtime.md](docs/releases/v0.23.0-trusted-runtime.md).
 
 Required proof:
-- Fresh self-host deployment and owner setup without manual database edits.
+- Fresh self-host deployment and owner setup without manual database edits, with
+  a passing `mupot-fresh-install/v1` evidence receipt.
 - One real runtime attached through signed identity with heartbeat, signed
   inbox, and lifecycle control evidence.
 - No unresolved P0/P1 security findings across tenant, squad RBAC, GitHub,

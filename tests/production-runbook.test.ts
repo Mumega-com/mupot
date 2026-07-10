@@ -57,6 +57,7 @@ describe('production self-hosting runbook', () => {
       'npx wrangler secret list --config "$CONFIG"',
       'npx wrangler r2 object get "${BUCKET}/path/to/object" --remote --file "$BACKUP_DIR/r2/path/to/object"',
       'aws s3 sync "s3://${BUCKET}"',
+      'npm run receipt:fresh-install:plan',
       'npm run receipt:staging-recovery:plan',
       'npm run receipt:staging-recovery:check',
     ]) {

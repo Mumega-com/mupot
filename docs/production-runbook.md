@@ -310,6 +310,83 @@ A production deploy is not healthy until the HTTP health endpoints pass, `/ops`
 has no unexplained danger checks, an owner can log in, and the relevant runtime
 worker can attach or check in.
 
+## Fresh install evidence
+
+Before a release candidate, prove the happy path from a fresh operator point of
+view. Use a new or throwaway pot path, record redacted receipts, and do not
+repair setup by editing D1 rows manually. If manual database edits are needed,
+the receipt must fail.
+
+Print the checklist:
+
+```bash
+npm run receipt:fresh-install:plan -- \
+  --pot "$POT" \
+  --base-url "$BASE_URL" \
+  --operator "<operator-email-or-id>" \
+  --out-dir "tmp/fresh-install/${POT}"
+```
+
+The bundle directory must contain these redacted step receipts:
+
+| File | Proves |
+|---|---|
+| `provision-resources.json` | Wrangler auth, D1, Vectorize, Queue, DLQ, KV, OAuth KV, R2, and config were created or found. |
+| `secrets-configured.json` | Required Worker secrets were configured by name without exposing secret values. |
+| `migrations-applied.json` | Remote migrations applied and no pending migration drift remains. |
+| `worker-deployed.json` | Dry-run passed, deploy succeeded, and the deployed URL is known. |
+| `owner-setup.json` | The fresh operator logged in, became owner, completed setup, and needed no manual DB edits. |
+| `post-setup-validation.json` | Health, MCP health, owner dashboard login, and setup-complete UI passed without manual DB edits. |
+
+Each step receipt must use:
+
+```json
+{
+  "receipt_type": "mupot-fresh-install-step/v1",
+  "step": "owner_setup",
+  "status": "pass",
+  "started_at": "2026-07-09T20:00:00.000Z",
+  "completed_at": "2026-07-09T20:03:00.000Z",
+  "target": {
+    "pot": "acme",
+    "base_url": "https://acme.example.com",
+    "operator": "owner@example.com",
+    "cloudflare_account": "redacted account label",
+    "worker": "mupot-acme",
+    "db": "mupot-acme",
+    "config": "wrangler.acme.toml"
+  },
+  "commands": [
+    { "command": "redacted command or command id", "ok": true, "exit_code": 0 }
+  ],
+  "evidence": {
+    "required_key": true,
+    "no_manual_db_edits": true
+  }
+}
+```
+
+Check the completed bundle:
+
+```bash
+npm run receipt:fresh-install:check -- \
+  --out-dir "tmp/fresh-install/${POT}" \
+  --pot "$POT" \
+  --base-url "$BASE_URL" \
+  --operator "<operator-email-or-id>" \
+  > "tmp/fresh-install/${POT}/fresh-install-check.json"
+
+npm run receipt:fresh-install:check -- \
+  --summary \
+  --out-dir "tmp/fresh-install/${POT}" \
+  --pot "$POT" \
+  --base-url "$BASE_URL" \
+  --operator "<operator-email-or-id>"
+```
+
+The fresh install is release evidence only when `fresh-install-check.json`
+reports `receipt_type:"mupot-fresh-install/v1"` and `status:"pass"`.
+
 ## Staging recovery rehearsal
 
 Before a release candidate, run the recovery path on a staging pot and save an

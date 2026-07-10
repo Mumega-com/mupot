@@ -25,6 +25,8 @@
     "receipt:bundle:status-summary": "node fleet-runtime/receipt-bundle.mjs --status --status-summary",
     "receipt:bundle:check": "node fleet-runtime/receipt-bundle.mjs --check-manifest",
     "receipt:bundle:export": "node fleet-runtime/receipt-bundle.mjs --export",
+    "receipt:fresh-install:plan": "node scripts/fresh-install-receipt.mjs --plan",
+    "receipt:fresh-install:check": "node scripts/fresh-install-receipt.mjs --check",
     "receipt:staging-recovery:plan": "node scripts/staging-recovery-rehearsal.mjs --plan",
     "receipt:staging-recovery:check": "node scripts/staging-recovery-rehearsal.mjs --check",
     "receipt:external-pr-cycle:plan": "node scripts/external-pr-cycle-receipt.mjs --plan",
