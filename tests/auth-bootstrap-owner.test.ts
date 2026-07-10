@@ -28,6 +28,16 @@ function makeEnv(
             const email = args[0] as string
             return ([...users.values()].find((user) => user.email === email) ?? null) as T | null
           }
+          if (sql.includes('SELECT user_id FROM owner_bootstrap_claim')) {
+            return (claim ? { user_id: claim.userId } : null) as T | null
+          }
+          if (sql.includes('SELECT 1 AS present FROM owner_bootstrap_claim')) {
+            return (claim ? { present: 1 } : null) as T | null
+          }
+          if (sql.includes('SELECT id, email, role FROM users WHERE id')) {
+            const id = args[0] as string
+            return (users.get(id) ?? null) as T | null
+          }
           if (sql.includes("SELECT 1 AS present FROM users WHERE role = 'owner'")) {
             return ([...users.values()].some((user) => user.role === 'owner') ? { present: 1 } : null) as T | null
           }
@@ -86,7 +96,7 @@ describe('/auth/bootstrap', () => {
     const { env, sessions, users, claim } = makeEnv()
     const form = await authApp.request('/bootstrap', {}, env)
     expect(form.status).toBe(200)
-    expect(await form.text()).toContain('One-time token')
+    expect(await form.text()).toContain('Bootstrap token')
     expect(form.headers.get('cache-control')).toBe('no-store')
     expect(form.headers.get('referrer-policy')).toBe('no-referrer')
 
@@ -117,11 +127,12 @@ describe('/auth/bootstrap', () => {
     }
   })
 
-  it('promotes the secret holder once and permanently rejects a second claim', async () => {
+  it('promotes the secret holder once, resumes that owner, and rejects a second principal', async () => {
     const { env, users, claim } = makeEnv({}, [{ id: 'member-1', email: 'owner@example.test', role: 'member' }])
     expect((await authApp.fetch(bootstrapRequest('b'.repeat(48), 'owner@example.test'), env)).status).toBe(302)
     expect(users.get('member-1')?.role).toBe('owner')
     expect(claim()).toEqual({ userId: 'member-1' })
+    expect((await authApp.fetch(bootstrapRequest('b'.repeat(48), 'owner@example.test'), env)).status).toBe(302)
     expect((await authApp.fetch(bootstrapRequest('b'.repeat(48), 'other@example.test'), env)).status).toBe(409)
     expect(users.size).toBe(1)
   })

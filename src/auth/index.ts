@@ -192,7 +192,32 @@ async function mintSession(
   setSessionCookie(c, sessionId, opts)
 }
 
-async function claimBootstrapOwner(env: Env, email: string): Promise<{ id: string; role: 'owner' } | null> {
+type BootstrapOwnerResult = { id: string; role: 'owner'; state: 'claimed' | 'resumed' }
+
+async function loadClaimedBootstrapOwner(env: Env, email: string): Promise<BootstrapOwnerResult | null> {
+  const claim = await env.DB.prepare('SELECT user_id FROM owner_bootstrap_claim WHERE singleton = 1')
+    .first<{ user_id: string }>()
+  if (!claim) return null
+
+  const user = await env.DB.prepare('SELECT id, email, role FROM users WHERE id = ?1')
+    .bind(claim.user_id)
+    .first<{ id: string; email: string | null; role: OrgRole }>()
+  if (!user || user.role !== 'owner' || user.email !== email) return null
+  return { id: user.id, role: 'owner', state: 'resumed' }
+}
+
+async function claimBootstrapOwner(env: Env, email: string): Promise<BootstrapOwnerResult | null> {
+  const claimed = await loadClaimedBootstrapOwner(env, email)
+  if (claimed) return claimed
+
+  const existingClaim = await env.DB.prepare('SELECT 1 AS present FROM owner_bootstrap_claim WHERE singleton = 1')
+    .first<{ present: number }>()
+  if (existingClaim) return null
+
+  const existingOwner = await env.DB.prepare("SELECT 1 AS present FROM users WHERE role = 'owner' LIMIT 1")
+    .first<{ present: number }>()
+  if (existingOwner) return null
+
   const existing = await env.DB.prepare('SELECT id FROM users WHERE email = ?1')
     .bind(email)
     .first<{ id: string }>()
@@ -209,11 +234,11 @@ async function claimBootstrapOwner(env: Env, email: string): Promise<{ id: strin
     ])
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    if (/UNIQUE constraint failed|constraint failed/i.test(message)) return null
+    if (/UNIQUE constraint failed|constraint failed/i.test(message)) return loadClaimedBootstrapOwner(env, email)
     throw err
   }
 
-  return { id: userId, role: 'owner' }
+  return { id: userId, role: 'owner', state: 'claimed' }
 }
 
 // ── OAuth: Google (Authorization Code) ───────────────────────────────────────
@@ -244,12 +269,13 @@ export const authApp = new Hono<AppEnv>()
 // GET/POST /auth/bootstrap — one-time self-hosted owner setup.
 // This is deliberately unavailable as soon as dashboard OAuth is configured. The
 // operator supplies a high-entropy Worker secret in a same-origin form; D1's
-// singleton claim makes the successful ceremony permanently one-time.
+// singleton claim makes owner selection one-time while allowing that same owner
+// to resume their session until the operator deletes the secret.
 authApp.get('/bootstrap', async (c) => {
   if (!bootstrapOwnerEnabled(c.env)) return c.json({ error: 'not_found' }, 404)
   c.header('Cache-Control', 'no-store')
   c.header('Referrer-Policy', 'no-referrer')
-  return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bootstrap Mupot owner</title></head><body><main><h1>Bootstrap owner</h1><form method="post" action="/auth/bootstrap"><label>Email <input name="email" type="email" autocomplete="email" required></label><label>One-time token <input name="token" type="password" autocomplete="off" required></label><button type="submit">Create owner session</button></form></main></body></html>`)
+  return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bootstrap Mupot owner</title></head><body><main><h1>Bootstrap owner</h1><form method="post" action="/auth/bootstrap"><label>Email <input name="email" type="email" autocomplete="email" required></label><label>Bootstrap token <input name="token" type="password" autocomplete="off" required></label><button type="submit">Create owner session</button></form></main></body></html>`)
 })
 
 authApp.post('/bootstrap', async (c) => {
@@ -262,10 +288,6 @@ authApp.post('/bootstrap', async (c) => {
   if (!constantTimeEqual(form.token, c.env.BOOTSTRAP_OWNER_TOKEN as string)) {
     return c.json({ error: 'unauthorized' }, 401)
   }
-
-  const existingOwner = await c.env.DB.prepare("SELECT 1 AS present FROM users WHERE role = 'owner' LIMIT 1")
-    .first<{ present: number }>()
-  if (existingOwner) return c.json({ error: 'bootstrap_already_claimed' }, 409)
 
   const owner = await claimBootstrapOwner(c.env, form.email)
   if (!owner) return c.json({ error: 'bootstrap_already_claimed' }, 409)

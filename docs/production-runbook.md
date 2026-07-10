@@ -76,9 +76,10 @@ npx wrangler deploy --config "$CONFIG" --message "bootstrap owner ${POT}"
 npx wrangler secret delete BOOTSTRAP_OWNER_TOKEN --config "$CONFIG"
 ```
 
-The route requires the generated high-entropy secret, is disabled if either
-dashboard OAuth secret is present, and is permanently closed after its D1 singleton
-claim succeeds.
+The route requires the generated high-entropy secret and is disabled if either
+dashboard OAuth secret is present. Its D1 singleton permanently selects one owner;
+until the operator removes the bootstrap secret, only that owner may use it to
+resume a dashboard session.
 
 Required only when exposing the Google-backed MCP OAuth 2.1 provider:
 

@@ -19,7 +19,7 @@ FLEET_OPS_AGENT = "kasra"         # ops agent that executes control requests (ex
 # For a one-time self-hosted first owner without dashboard OAuth, set
 # BOOTSTRAP_OWNER_TOKEN via `bash scripts/secrets.sh --pot <slug> --bootstrap-owner`,
 # deploy, open /auth/bootstrap, then delete that secret. The route is unavailable
-# whenever OAuth is configured and permanently closes after the first successful claim.
+# whenever OAuth is configured; its singleton claim permits only the selected owner.
 # OAuth 2.1 Google IdP secrets (deploy prerequisites — set before live-flip, Hadi approval required):
 #   npx wrangler secret put GOOGLE_CLIENT_ID          # Google OAuth app client ID
 #   npx wrangler secret put GOOGLE_CLIENT_SECRET      # Google OAuth app client secret
