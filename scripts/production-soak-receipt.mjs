@@ -138,6 +138,8 @@ export function formatPlan(opts = {}) {
   lines.push('- Start only after #274, #150, and #279 have passing evidence.')
   lines.push('- Use the real release-candidate deployment and a real signed runtime agent.')
   lines.push('- Keep tokens, cookies, private keys, webhook secrets, and provider credentials out of receipts.')
+  lines.push('- Capture day-N.json during the Nth 24-hour window after soak-start.json; observed_at must be inside that window.')
+  lines.push('- Capture every cycle receipt after the soak starts and before soak-end.json completes.')
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', outDir]))
   lines.push('')
@@ -377,6 +379,16 @@ export function checkBundle(opts = {}) {
   if (startReceipt) checkReceiptBasics(checks, startReceipt, startPath, START_RECEIPT_TYPE, 'start')
   if (endReceipt) checkReceiptBasics(checks, endReceipt, endPath, END_RECEIPT_TYPE, 'end')
 
+  const startAt = parseTime(startReceipt?.started_at ?? startReceipt?.observed_at)
+  const endAt = parseTime(endReceipt?.completed_at ?? endReceipt?.observed_at)
+  pushCheck(checks, startAt !== null, 'soak_start_time_present', { value: startReceipt?.started_at ?? startReceipt?.observed_at ?? null })
+  pushCheck(checks, endAt !== null, 'soak_end_time_present', { value: endReceipt?.completed_at ?? endReceipt?.observed_at ?? null })
+  const durationMs = startAt !== null && endAt !== null ? endAt - startAt : null
+  pushCheck(checks, durationMs !== null && durationMs >= MIN_SOAK_DAYS * DAY_MS, 'soak_duration_at_least_seven_days', {
+    duration_ms: durationMs,
+    minimum_ms: MIN_SOAK_DAYS * DAY_MS,
+  })
+
   const dayReceipts = []
   const dayFiles = listJsonFiles(outDir, 'day-')
   pushCheck(checks, dayFiles.length >= MIN_SOAK_DAYS, 'minimum_day_receipts_present', {
@@ -388,10 +400,33 @@ export function checkBundle(opts = {}) {
     const receipt = readReceiptFile(checks, path, 'day')
     artifacts.days.push(artifactMeta(path, receipt))
     if (!receipt) continue
-    dayReceipts.push({ name, path, receipt })
     checkReceiptBasics(checks, receipt, path, DAY_RECEIPT_TYPE, 'day')
-    const dayIndex = Number(receipt.day_index ?? name.match(/^day-(\d+)\.json$/)?.[1])
+    const filenameDayIndex = Number(name.match(/^day-(\d+)\.json$/)?.[1])
+    const dayIndex = Number(receipt.day_index)
+    const observedAt = parseTime(receipt?.observed_at)
     pushCheck(checks, Number.isInteger(dayIndex) && dayIndex >= 1, 'day_index_valid', { path, day_index: receipt.day_index ?? null })
+    pushCheck(checks, Number.isInteger(dayIndex) && dayIndex === filenameDayIndex, 'day_index_matches_filename', {
+      path,
+      filename_day_index: filenameDayIndex,
+      receipt_day_index: Number.isFinite(dayIndex) ? dayIndex : null,
+    })
+    pushCheck(checks, observedAt !== null, 'day_observed_at_parseable', { path, day_index: dayIndex, observed_at: receipt?.observed_at ?? null })
+    const windowStart = startAt !== null && Number.isInteger(dayIndex) ? startAt + (dayIndex - 1) * DAY_MS : null
+    const windowEnd = windowStart !== null ? windowStart + DAY_MS : null
+    pushCheck(checks, observedAt !== null && windowStart !== null && windowEnd !== null && observedAt >= windowStart && observedAt < windowEnd, 'day_observed_in_expected_window', {
+      path,
+      day_index: dayIndex,
+      observed_at: receipt?.observed_at ?? null,
+      window_started_at: windowStart === null ? null : new Date(windowStart).toISOString(),
+      window_ended_at: windowEnd === null ? null : new Date(windowEnd).toISOString(),
+    })
+    pushCheck(checks, observedAt !== null && endAt !== null && observedAt <= endAt, 'day_observed_before_soak_end', {
+      path,
+      day_index: dayIndex,
+      observed_at: receipt?.observed_at ?? null,
+      soak_completed_at: endAt === null ? null : new Date(endAt).toISOString(),
+    })
+    dayReceipts.push({ name, path, receipt, dayIndex, observedAt })
     for (const key of REQUIRED_DAY_EVIDENCE) {
       const value = receipt?.evidence?.[key]
       pushCheck(checks, evidenceValuePass(value), 'day_required_evidence_present', {
@@ -403,7 +438,7 @@ export function checkBundle(opts = {}) {
     }
   }
 
-  const dayIndexes = [...new Set(dayReceipts.map(({ name, receipt }) => Number(receipt.day_index ?? name.match(/^day-(\d+)\.json$/)?.[1])).filter(Number.isInteger))]
+  const dayIndexes = [...new Set(dayReceipts.map(({ dayIndex }) => dayIndex).filter(Number.isInteger))]
   for (let i = 1; i <= MIN_SOAK_DAYS; i += 1) {
     pushCheck(checks, dayIndexes.includes(i), 'required_day_index_present', { day_index: i, observed_day_indexes: dayIndexes })
   }
@@ -419,8 +454,16 @@ export function checkBundle(opts = {}) {
     const receipt = readReceiptFile(checks, path, 'cycle')
     artifacts.cycles.push(artifactMeta(path, receipt))
     if (!receipt) continue
-    cycleReceipts.push({ name, path, receipt })
     checkReceiptBasics(checks, receipt, path, CYCLE_RECEIPT_TYPE, 'cycle')
+    const observedAt = parseTime(receipt?.observed_at)
+    pushCheck(checks, observedAt !== null, 'cycle_observed_at_parseable', { path, observed_at: receipt?.observed_at ?? null })
+    pushCheck(checks, observedAt !== null && startAt !== null && endAt !== null && observedAt >= startAt && observedAt <= endAt, 'cycle_observed_within_soak_window', {
+      path,
+      observed_at: receipt?.observed_at ?? null,
+      soak_started_at: startAt === null ? null : new Date(startAt).toISOString(),
+      soak_completed_at: endAt === null ? null : new Date(endAt).toISOString(),
+    })
+    cycleReceipts.push({ name, path, receipt, observedAt })
     pushCheck(checks, targetValue(receipt, 'task_id').length > 0, 'cycle_task_id_present', {
       path,
       task_id: targetValue(receipt, 'task_id') || null,
@@ -453,16 +496,6 @@ export function checkBundle(opts = {}) {
     target[field] = values.length === 1 ? values[0] : null
   }
 
-  const startAt = parseTime(startReceipt?.started_at ?? startReceipt?.observed_at)
-  const endAt = parseTime(endReceipt?.completed_at ?? endReceipt?.observed_at)
-  pushCheck(checks, startAt !== null, 'soak_start_time_present', { value: startReceipt?.started_at ?? startReceipt?.observed_at ?? null })
-  pushCheck(checks, endAt !== null, 'soak_end_time_present', { value: endReceipt?.completed_at ?? endReceipt?.observed_at ?? null })
-  const durationMs = startAt !== null && endAt !== null ? endAt - startAt : null
-  pushCheck(checks, durationMs !== null && durationMs >= MIN_SOAK_DAYS * DAY_MS, 'soak_duration_at_least_seven_days', {
-    duration_ms: durationMs,
-    minimum_ms: MIN_SOAK_DAYS * DAY_MS,
-  })
-
   const taskIds = [...new Set(cycleReceipts.map(({ receipt }) => targetValue(receipt, 'task_id')).filter(Boolean))]
   pushCheck(checks, taskIds.length >= MIN_TASK_CYCLES, 'minimum_distinct_task_cycles_present', {
     task_ids: taskIds,
@@ -490,6 +523,18 @@ export function checkBundle(opts = {}) {
     checked_at: new Date().toISOString(),
     out_dir: outDir,
     target,
+    timeline: {
+      started_at: startAt === null ? null : new Date(startAt).toISOString(),
+      days: dayReceipts
+        .filter(({ observedAt }) => observedAt !== null)
+        .sort((a, b) => a.dayIndex - b.dayIndex)
+        .map(({ dayIndex, name, receipt }) => ({ day_index: dayIndex, file: name, observed_at: receipt.observed_at })),
+      cycles: cycleReceipts
+        .filter(({ observedAt }) => observedAt !== null)
+        .sort((a, b) => a.observedAt - b.observedAt)
+        .map(({ name, receipt }) => ({ file: name, task_id: targetValue(receipt, 'task_id'), observed_at: receipt.observed_at })),
+      completed_at: endAt === null ? null : new Date(endAt).toISOString(),
+    },
     summary: {
       passed: passed.length,
       failed: failed.length,

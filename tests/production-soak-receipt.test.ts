@@ -22,6 +22,7 @@ const TARGET = {
 
 const START = Date.parse('2026-07-09T00:00:00.000Z')
 const END = Date.parse('2026-07-16T00:10:00.000Z')
+const DAY_MS = 24 * 60 * 60 * 1000
 
 function iso(ms: number) {
   return new Date(ms).toISOString()
@@ -45,7 +46,7 @@ function dayReceipt(day: number) {
   return {
     ...baseReceipt(DAY_RECEIPT_TYPE),
     day_index: day,
-    observed_at: iso(START + day * 24 * 60 * 60 * 1000),
+    observed_at: iso(START + (day - 0.5) * DAY_MS),
     evidence: {
       health: true,
       mcp_health: true,
@@ -154,6 +155,56 @@ describe('production soak receipt checker', () => {
     expect(receipt.summary.day_receipts).toBe(7)
     expect(receipt.summary.task_cycles).toBe(3)
     expect(receipt.target.agent).toBe(TARGET.agent)
+    expect(receipt.timeline.days.map((day) => day.day_index)).toEqual([1, 2, 3, 4, 5, 6, 7])
+    expect(receipt.timeline.cycles).toHaveLength(3)
+  })
+
+  it('fails when daily observations are not captured in their 24-hour windows', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, name) => {
+      if (name.startsWith('day-')) receipt.observed_at = iso(START)
+    })
+
+    const receipt = checkBundle({ outDir: dir, rcVersion: TARGET.rc_version })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'day_observed_in_expected_window',
+      day_index: 2,
+    }))
+  })
+
+  it('fails when a day receipt index does not match its filename', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, name) => {
+      if (name === 'day-4.json') receipt.day_index = 5
+    })
+
+    const receipt = checkBundle({ outDir: dir, rcVersion: TARGET.rc_version })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'day_index_matches_filename',
+      filename_day_index: 4,
+      receipt_day_index: 5,
+    }))
+  })
+
+  it('fails when a task cycle falls outside the soak window', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, name) => {
+      if (name === 'cycle-2.json') receipt.observed_at = iso(START - 1)
+    })
+
+    const receipt = checkBundle({ outDir: dir, rcVersion: TARGET.rc_version })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'cycle_observed_within_soak_window',
+    }))
   })
 
   it('accepts the aggregate output file created by shell redirection', () => {
