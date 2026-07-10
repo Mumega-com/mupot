@@ -59,12 +59,26 @@ npx wrangler deploy --dry-run --config "$CONFIG"
 Secrets are Worker secrets. Enter them through the Wrangler prompt; do not pass
 secret values as command arguments.
 
-Required for dashboard login:
+Choose one first-owner method. OAuth dashboard login uses:
 
 ```bash
 npx wrangler secret put OAUTH_CLIENT_ID --config "$CONFIG"
 npx wrangler secret put OAUTH_CLIENT_SECRET --config "$CONFIG"
 ```
+
+An OAuth-free self-hosted first owner may instead run the generated bootstrap
+ceremony before any dashboard OAuth credential is configured:
+
+```bash
+bash scripts/secrets.sh --pot "$POT" --bootstrap-owner
+npx wrangler deploy --config "$CONFIG" --message "bootstrap owner ${POT}"
+# Open https://<your-pot-host>/auth/bootstrap and submit the printed token + owner email.
+npx wrangler secret delete BOOTSTRAP_OWNER_TOKEN --config "$CONFIG"
+```
+
+The route requires the generated high-entropy secret, is disabled if either
+dashboard OAuth secret is present, and is permanently closed after its D1 singleton
+claim succeeds.
 
 Required only when exposing the Google-backed MCP OAuth 2.1 provider:
 
@@ -123,7 +137,8 @@ npx wrangler secret list --config "$CONFIG"
 npx wrangler deploy --config "$CONFIG" --message "production secrets configured"
 ```
 
-Register OAuth redirect URLs with the identity provider before inviting users:
+When dashboard OAuth is selected, register redirect URLs with the identity provider
+before inviting users:
 
 ```text
 Dashboard login: https://<your-pot-host>/auth/callback
@@ -338,7 +353,7 @@ completes:
 | `secrets-configured.json` | Required Worker secrets were configured by name without exposing secret values. |
 | `migrations-applied.json` | Remote migrations applied and no pending migration drift remains. |
 | `worker-deployed.json` | Dry-run passed, deploy succeeded, and the deployed URL is known. |
-| `owner-setup.json` | The fresh operator logged in, became owner, completed setup, and needed no manual DB edits. |
+| `owner-setup.json` | The fresh operator used `owner_auth_method: "oauth_google"` or `"bootstrap_token"`, became owner, completed setup, and needed no manual DB edits. |
 | `post-setup-validation.json` | Health, MCP health, owner dashboard login, and setup-complete UI passed without manual DB edits. |
 
 Each step receipt must use:

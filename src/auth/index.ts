@@ -24,6 +24,8 @@ const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7 // 7 days
 const STATE_TTL_SECONDS = 60 * 10 // OAuth state/PKCE lifetime
 const SESSION_PREFIX = 'sess:'
 const STATE_PREFIX = 'oauthstate:'
+const BOOTSTRAP_OWNER_TOKEN_MIN_LENGTH = 32
+const BOOTSTRAP_FORM_MAX_BYTES = 4096
 
 type OrgRole = AuthContext['role']
 
@@ -122,6 +124,98 @@ function callbackUrl(reqUrl: string): string {
   return `${u.origin}/auth/callback`
 }
 
+function bootstrapOwnerEnabled(env: Env): boolean {
+  const token = env.BOOTSTRAP_OWNER_TOKEN
+  // OAuth and bootstrap are intentionally mutually exclusive. Once an OAuth
+  // door is configured, first-owner identity must come from that provider.
+  return typeof token === 'string'
+    && token.length >= BOOTSTRAP_OWNER_TOKEN_MIN_LENGTH
+    && !env.OAUTH_CLIENT_ID
+    && !env.OAUTH_CLIENT_SECRET
+}
+
+function constantTimeEqual(actual: string, expected: string): boolean {
+  let mismatch = actual.length ^ expected.length
+  const length = Math.max(actual.length, expected.length)
+  for (let index = 0; index < length; index += 1) {
+    mismatch |= (actual.charCodeAt(index) || 0) ^ (expected.charCodeAt(index) || 0)
+  }
+  return mismatch === 0
+}
+
+type BootstrapForm = { token: string; email: string }
+
+async function readBootstrapForm(c: Context<AppEnv>): Promise<BootstrapForm | null> {
+  const declaredLength = Number(c.req.header('content-length') ?? '0')
+  if (Number.isFinite(declaredLength) && declaredLength > BOOTSTRAP_FORM_MAX_BYTES) return null
+  if (!c.req.header('content-type')?.toLowerCase().startsWith('application/x-www-form-urlencoded')) return null
+
+  const raw = await c.req.arrayBuffer()
+  if (raw.byteLength === 0 || raw.byteLength > BOOTSTRAP_FORM_MAX_BYTES) return null
+
+  let text: string
+  try {
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(raw)
+  } catch {
+    return null
+  }
+
+  const fields = new URLSearchParams(text)
+  const tokens = fields.getAll('token')
+  const emails = fields.getAll('email')
+  if (tokens.length !== 1 || emails.length !== 1) return null
+  return { token: tokens[0], email: emails[0].trim().toLowerCase() }
+}
+
+function isBootstrapEmail(value: string): boolean {
+  return value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
+}
+
+async function mintSession(
+  c: Context<AppEnv>,
+  userId: string,
+  email: string | null,
+  role: OrgRole,
+  opts: { secure?: boolean } = {},
+): Promise<void> {
+  const sessionId = randomId(32)
+  const record: SessionRecord = {
+    userId,
+    email,
+    role,
+    createdAt: new Date().toISOString(),
+  }
+  await c.env.SESSIONS.put(sessionKey(sessionId), JSON.stringify(record), {
+    expirationTtl: SESSION_TTL_SECONDS,
+  })
+  await writePresence(c.env, email, userId)
+  setSessionCookie(c, sessionId, opts)
+}
+
+async function claimBootstrapOwner(env: Env, email: string): Promise<{ id: string; role: 'owner' } | null> {
+  const existing = await env.DB.prepare('SELECT id FROM users WHERE email = ?1')
+    .bind(email)
+    .first<{ id: string }>()
+  const userId = existing?.id ?? await deriveUserId('bootstrap', email)
+
+  try {
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO users (id, email, role) VALUES (?1, ?2, 'owner') ON CONFLICT(email) DO UPDATE SET role = 'owner'",
+      ).bind(userId, email),
+      env.DB.prepare(
+        'INSERT INTO owner_bootstrap_claim (singleton, user_id, claimed_at) VALUES (1, ?1, datetime(\'now\'))',
+      ).bind(userId),
+    ])
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    if (/UNIQUE constraint failed|constraint failed/i.test(message)) return null
+    throw err
+  }
+
+  return { id: userId, role: 'owner' }
+}
+
 // ── OAuth: Google (Authorization Code) ───────────────────────────────────────
 // Only Google's web flow is implemented here. Telegram's Login Widget is a
 // different (signed-payload) flow handled at the perimeter; for that provider we
@@ -146,6 +240,39 @@ interface GoogleUserInfo {
 // ── routes ────────────────────────────────────────────────────────────────
 
 export const authApp = new Hono<AppEnv>()
+
+// GET/POST /auth/bootstrap — one-time self-hosted owner setup.
+// This is deliberately unavailable as soon as dashboard OAuth is configured. The
+// operator supplies a high-entropy Worker secret in a same-origin form; D1's
+// singleton claim makes the successful ceremony permanently one-time.
+authApp.get('/bootstrap', async (c) => {
+  if (!bootstrapOwnerEnabled(c.env)) return c.json({ error: 'not_found' }, 404)
+  c.header('Cache-Control', 'no-store')
+  c.header('Referrer-Policy', 'no-referrer')
+  return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bootstrap Mupot owner</title></head><body><main><h1>Bootstrap owner</h1><form method="post" action="/auth/bootstrap"><label>Email <input name="email" type="email" autocomplete="email" required></label><label>One-time token <input name="token" type="password" autocomplete="off" required></label><button type="submit">Create owner session</button></form></main></body></html>`)
+})
+
+authApp.post('/bootstrap', async (c) => {
+  if (!bootstrapOwnerEnabled(c.env)) return c.json({ error: 'not_found' }, 404)
+  c.header('Cache-Control', 'no-store')
+  c.header('Referrer-Policy', 'no-referrer')
+
+  const form = await readBootstrapForm(c)
+  if (!form || !isBootstrapEmail(form.email)) return c.json({ error: 'bad_request' }, 400)
+  if (!constantTimeEqual(form.token, c.env.BOOTSTRAP_OWNER_TOKEN as string)) {
+    return c.json({ error: 'unauthorized' }, 401)
+  }
+
+  const existingOwner = await c.env.DB.prepare("SELECT 1 AS present FROM users WHERE role = 'owner' LIMIT 1")
+    .first<{ present: number }>()
+  if (existingOwner) return c.json({ error: 'bootstrap_already_claimed' }, 409)
+
+  const owner = await claimBootstrapOwner(c.env, form.email)
+  if (!owner) return c.json({ error: 'bootstrap_already_claimed' }, 409)
+
+  await mintSession(c, owner.id, form.email, owner.role)
+  return c.redirect('/')
+})
 
 // GET /auth/login → redirect to the provider's consent screen.
 authApp.get('/login', async (c) => {
@@ -198,19 +325,7 @@ authApp.get('/dev-login', async (c) => {
   const preferredId = await deriveUserId('local-test', email)
   const { id: userId, role } = await upsertUserByEmail(env, preferredId, email, true)
 
-  const sessionId = randomId(32)
-  const record: SessionRecord = {
-    userId,
-    email,
-    role,
-    createdAt: new Date().toISOString(),
-  }
-  await env.SESSIONS.put(sessionKey(sessionId), JSON.stringify(record), {
-    expirationTtl: SESSION_TTL_SECONDS,
-  })
-  await writePresence(env, email, userId)
-
-  setSessionCookie(c, sessionId, { secure: false })
+  await mintSession(c, userId, email, role, { secure: false })
   return c.redirect('/')
 })
 
@@ -283,19 +398,7 @@ authApp.get('/callback', async (c) => {
   const { id: userId, role } = await upsertUserByEmail(env, derivedId, email, true)
 
   // Mint the session: random opaque id → server-side record in KV.
-  const sessionId = randomId(32)
-  const record: SessionRecord = {
-    userId,
-    email,
-    role,
-    createdAt: new Date().toISOString(),
-  }
-  await env.SESSIONS.put(sessionKey(sessionId), JSON.stringify(record), {
-    expirationTtl: SESSION_TTL_SECONDS,
-  })
-  await writePresence(env, email, userId)
-
-  setSessionCookie(c, sessionId)
+  await mintSession(c, userId, email, role)
   return c.redirect('/')
 })
 
@@ -346,18 +449,7 @@ authApp.get('/handoff', async (c) => {
 
   // Mint the pot's OWN session (mirror /callback). We never trust mumega's session —
   // we issue our own opaque server-side session.
-  const sessionId = randomId(32)
-  const record: SessionRecord = {
-    userId,
-    email: res.claim.email,
-    role,
-    createdAt: new Date().toISOString(),
-  }
-  await env.SESSIONS.put(sessionKey(sessionId), JSON.stringify(record), {
-    expirationTtl: SESSION_TTL_SECONDS,
-  })
-  await writePresence(env, res.claim.email, userId)
-  setSessionCookie(c, sessionId)
+  await mintSession(c, userId, res.claim.email, role)
   return c.redirect('/')
 })
 

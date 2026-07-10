@@ -15,7 +15,11 @@ BRAND = "Mumega"                   # dashboard brand
 OAUTH_PROVIDER = "google"         # google | telegram
 FLEET_PROJECT = "sos"             # bus project the fleet window addresses (company fleet = sos, not the mumega slug)
 FLEET_OPS_AGENT = "kasra"         # ops agent that executes control requests (explicit — resolvers fail closed, no code default)
-# secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN
+# secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN.
+# For a one-time self-hosted first owner without dashboard OAuth, set
+# BOOTSTRAP_OWNER_TOKEN via `bash scripts/secrets.sh --pot <slug> --bootstrap-owner`,
+# deploy, open /auth/bootstrap, then delete that secret. The route is unavailable
+# whenever OAuth is configured and permanently closes after the first successful claim.
 # OAuth 2.1 Google IdP secrets (deploy prerequisites — set before live-flip, Hadi approval required):
 #   npx wrangler secret put GOOGLE_CLIENT_ID          # Google OAuth app client ID
 #   npx wrangler secret put GOOGLE_CLIENT_SECRET      # Google OAuth app client secret

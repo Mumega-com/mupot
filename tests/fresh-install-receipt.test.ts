@@ -59,6 +59,7 @@ function evidenceFor(step: string) {
   const evidence = Object.fromEntries(spec.evidence.map((key) => [key, true]))
   evidence.no_manual_db_edits = true
   if (step === 'worker_deployed') evidence.deployed_url = TARGET.base_url
+  if (step === 'owner_setup') evidence.owner_auth_method = 'bootstrap_token'
   return evidence
 }
 
@@ -240,6 +241,27 @@ describe('fresh install receipt checker', () => {
       step: 'owner_setup',
       evidence: 'first_login_became_owner',
       value: 'no',
+    }))
+  })
+
+  it('requires an audited first-owner authentication method', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      if (file === 'owner-setup.json') {
+        const evidence = receipt.evidence as Record<string, unknown>
+        evidence.owner_auth_method = 'manual_database_edit'
+      }
+    })
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'required_evidence_present',
+      step: 'owner_setup',
+      evidence: 'owner_auth_method',
+      value: 'manual_database_edit',
     }))
   })
 

@@ -47,7 +47,7 @@ export const REQUIRED_STEPS = [
   {
     step: 'owner_setup',
     file: 'owner-setup.json',
-    evidence: ['owner_login_succeeded', 'first_login_became_owner', 'setup_wizard_completed', 'no_manual_db_edits'],
+    evidence: ['owner_login_succeeded', 'first_login_became_owner', 'owner_auth_method', 'setup_wizard_completed', 'no_manual_db_edits'],
   },
   {
     step: 'post_setup_validation',
@@ -158,6 +158,7 @@ export function formatPlan(opts = {}) {
   lines.push('- Do not repair setup by editing D1 rows manually. If manual DB edits are needed, the receipt must fail.')
   lines.push('- Run every step in the printed order without overlap; each step must start after the previous step completes.')
   lines.push('- Every step must attest no_manual_db_edits:true and identify the same account, Worker, D1 database, and config.')
+  lines.push('- owner_setup must record owner_auth_method as oauth_google or bootstrap_token; never record the bootstrap token itself.')
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', outDir]))
   lines.push('')
@@ -189,6 +190,7 @@ export function formatPlan(opts = {}) {
     ],
     evidence: {
       '<required_key>': true,
+      owner_auth_method: '<oauth_google|bootstrap_token for owner_setup>',
       no_manual_db_edits: true,
     },
     artifacts: [
@@ -419,7 +421,11 @@ export function checkBundle(opts = {}) {
 
     for (const key of spec.evidence) {
       const value = receipt?.evidence?.[key]
-      const evidencePasses = key === 'deployed_url' ? evidenceValuePass(value) : value === true
+      const evidencePasses = key === 'deployed_url'
+        ? evidenceValuePass(value)
+        : key === 'owner_auth_method'
+          ? value === 'oauth_google' || value === 'bootstrap_token'
+          : value === true
       pushCheck(checks, evidencePasses, 'required_evidence_present', {
         path,
         step: spec.step,
