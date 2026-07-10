@@ -138,6 +138,7 @@ export function formatPlan(opts = {}) {
   lines.push('Before running:')
   lines.push('- Use a real deployed pot and a real signed runtime agent.')
   lines.push('- The task must be created and completed through product surfaces, not direct SQL.')
+  lines.push('- Each step receipt must include a parseable ISO-8601 observed_at value, and observed_at values must follow the lifecycle order below.')
   lines.push('- Keep token values, cookies, private keys, provider credentials, and raw webhook payload secrets out of receipts.')
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', outDir]))
@@ -298,6 +299,16 @@ function checkReceiptBasics(checks, receipt, path, step) {
   })
 }
 
+function observedAtMs(receipt) {
+  const raw = typeof receipt?.observed_at === 'string' ? receipt.observed_at.trim() : ''
+  const ms = raw ? Date.parse(raw) : NaN
+  return {
+    raw,
+    ms,
+    ok: Boolean(raw) && Number.isFinite(ms),
+  }
+}
+
 export function checkBundle(opts = {}) {
   const outDir = resolve(defaultOutDir(opts))
   const checks = []
@@ -311,6 +322,7 @@ export function checkBundle(opts = {}) {
   }
 
   const receipts = []
+  const timeline = []
   for (const spec of REQUIRED_STEPS) {
     const path = join(outDir, spec.file)
     const receipt = readReceiptFile(checks, path, spec.step)
@@ -318,6 +330,13 @@ export function checkBundle(opts = {}) {
     if (!receipt) continue
     receipts.push({ spec, path, receipt })
     checkReceiptBasics(checks, receipt, path, spec.step)
+    const observed = observedAtMs(receipt)
+    pushCheck(checks, observed.ok, 'observed_at_parseable', {
+      path,
+      step: spec.step,
+      observed_at: observed.raw || null,
+    })
+    if (observed.ok) timeline.push({ step: spec.step, path, observed_at: observed.raw, observed_ms: observed.ms })
     for (const key of spec.evidence) {
       const value = receipt?.evidence?.[key]
       pushCheck(checks, evidenceValuePass(value), 'required_evidence_present', {
@@ -327,6 +346,17 @@ export function checkBundle(opts = {}) {
         value: value ?? null,
       })
     }
+  }
+
+  for (let index = 1; index < timeline.length; index += 1) {
+    const previous = timeline[index - 1]
+    const current = timeline[index]
+    pushCheck(checks, current.observed_ms >= previous.observed_ms, 'lifecycle_steps_observed_in_order', {
+      previous_step: previous.step,
+      previous_observed_at: previous.observed_at,
+      step: current.step,
+      observed_at: current.observed_at,
+    })
   }
 
   const targetFields = ['pot', 'base_url', 'agent', 'task_id']
@@ -353,6 +383,7 @@ export function checkBundle(opts = {}) {
     checked_at: new Date().toISOString(),
     out_dir: outDir,
     target,
+    timeline: timeline.map(({ step, observed_at }) => ({ step, observed_at })),
     summary: {
       passed: passed.length,
       failed: failed.length,
