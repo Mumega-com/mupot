@@ -178,6 +178,13 @@ debounced by tenant/member for 30 seconds before touching D1.
 
 ## Lifecycle Control
 
+`GET /api/fleet/trust` publishes the public Ed25519 JWK corresponding to
+`FLEET_PANEL_SK`, the tenant, and the exact configured `FLEET_CONSUMER_AGENT`.
+It is public verification metadata, analogous to a JWKS document: it carries no
+private scalar, bearer credential, capability, or control authority. Hosts use
+`fleet-runtime/trust-bootstrap.mjs` to install that public key and update the
+consumer identity in `control.json` without guessing a slug.
+
 `POST /api/fleet/control` is the Worker/dashboard API for remote lifecycle
 control. It does not touch a host process directly. The Worker signs a
 `fleet-control.v1` request with `FLEET_PANEL_SK` and sends it to the configured

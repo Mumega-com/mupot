@@ -314,6 +314,24 @@ and exiting `0` so the daemon consumes the batch.
 
      The installer emits `mupot-fleet-install-receipt/v1`; `status:"warn"` is
      expected until the templates are edited.
+   - Trust bootstrap: fetch the public-only panel JWK and exact configured
+     consumer identity directly from the pot, then generate the consumer key
+     under the returned ID:
+
+     ```bash
+     node ~/.fleet/runtime/trust-bootstrap.mjs \
+       --base-url https://mupot.mumega.com \
+       > ~/.fleet/receipts/trust-bootstrap.json
+     node ~/.fleet/runtime/agent-keygen.mjs "$(jq -r .consumer_agent_id ~/.fleet/receipts/trust-bootstrap.json)"
+     ```
+
+     Register each generated public `AGENT_PUBKEY` through the admin-gated MCP
+     `register_agent_key` tool. For the consumer pass `agent:"fleet-consumer"`
+     and `key_id` equal to the returned consumer ID. For a normal runtime omit
+     `key_id`; Mupot uses the resolved agent's canonical slug. The tool derives
+     the member binding from the agent's unique active welded token, stores only
+     public material, is idempotent for the same binding, and refuses silent key
+     replacement. Do not use direct D1 writes for this ceremony.
    - Pre-flight receipt: after editing configs and placing keys, run `node ~/.fleet/runtime/host-receipt.mjs --daemon ~/.fleet/daemon.json --inbox ~/.fleet/inbox-handler.json --control ~/.fleet/control.json` on the host. A `mupot-fleet-host-receipt/v1` `status:"pass"` proves local daemon/control/handler config, key files, and handler coverage are ready for live smoke.
    - Live runtime receipt: after the target runtime is up and at least one Mupot
      inbox probe is queued, run `node ~/.fleet/runtime/runtime-receipt.mjs --daemon ~/.fleet/daemon.json --agent <agent_id>`.
