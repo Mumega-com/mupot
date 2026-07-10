@@ -149,6 +149,25 @@ the redacted App and installation schemas, validates both exact permission
 objects, and records both artifact hashes. The final release-readiness check
 requires those hashes to match the attached exports.
 
+When the production App private key is deliberately confined to the Worker and
+should not be copied into a release environment, use the authenticated GitHub
+CLI export instead. It reads the configured App permissions from
+`gh api apps/<slug>` and the effective installation through the current
+organization-owner `gh` session. The command writes the identical redacted
+schemas and runs through the same checker:
+
+```bash
+node scripts/github-app-permissions-receipt.mjs \
+  --export-gh \
+  --app mupot \
+  --organization Mumega-com \
+  --installation-id 139955064 \
+  --out-dir tmp/github-app-permissions/mupot
+```
+
+This path requires a GitHub CLI identity that can read the organization App and
+installation. It does not mint, download, print, or rotate a private key.
+
 ## Roadmap (remaining)
 
 - [x] Agent-def writer — `writeAgentDef`
