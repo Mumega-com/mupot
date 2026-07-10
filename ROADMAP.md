@@ -95,7 +95,7 @@ Required proof:
 - No unresolved P0/P1 security findings across tenant, squad RBAC, GitHub,
   replay, webhook, and self-verdict surfaces.
 - One task lifecycle through the product: create -> execute -> approve ->
-  complete -> audit.
+  complete -> audit, with a passing `mupot-work-lifecycle/v1` evidence receipt.
 - One external board -> Mupot task -> agent -> GitHub PR cycle with the PR
   linked back to the task and a passing `mupot-external-pr-cycle/v1`
   evidence receipt on #150.

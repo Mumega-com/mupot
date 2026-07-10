@@ -46,6 +46,8 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       '#280',
       'fresh-install-check.json',
       'mupot-fresh-install/v1',
+      'work-lifecycle-check.json',
+      'mupot-work-lifecycle/v1',
       'external-pr-cycle-check.json',
       'mupot-external-pr-cycle/v1',
       'production-soak-check.json',
@@ -96,6 +98,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'node --test fleet-runtime/*.test.mjs',
       'bash scripts/ci-local-evidence.sh',
       'npm run receipt:fresh-install:plan',
+      'npm run receipt:work-lifecycle:plan',
       'npm run receipt:external-pr-cycle:plan',
       'npm run receipt:staging-recovery:plan',
       'npm run receipt:production-soak:plan',
@@ -110,6 +113,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     expect(pkg.scripts['smoke:local']).toBe('node scripts/local-browser-smoke.mjs')
     expect(pkg.scripts['conformance:runtime:local']).toBe('node scripts/local-runtime-conformance.mjs')
     expect(pkg.scripts['receipt:fresh-install:check']).toBe('node scripts/fresh-install-receipt.mjs --check')
+    expect(pkg.scripts['receipt:work-lifecycle:check']).toBe('node scripts/work-lifecycle-receipt.mjs --check')
     expect(pkg.scripts['receipt:external-pr-cycle:check']).toBe('node scripts/external-pr-cycle-receipt.mjs --check')
     expect(pkg.scripts['receipt:staging-recovery:check']).toBe('node scripts/staging-recovery-rehearsal.mjs --check')
     expect(pkg.scripts['receipt:production-soak:check']).toBe('node scripts/production-soak-receipt.mjs --check')
