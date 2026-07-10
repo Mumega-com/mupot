@@ -58,6 +58,7 @@ import { PROVISION_TOOLS } from './provision'
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
 // Vitest can import it without the CF runtime. See ./auth-header.ts.
 import { AUTH_CONTEXT_HEADER } from './auth-header'
+import { MUPOT_PUBLIC_API_VERSION } from '../version'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -180,10 +181,13 @@ async function authenticateMember(c: {
             t.agent_id      AS bound_agent_id
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
-      WHERE t.token_hash = ?1 AND t.revoked_at IS NULL
+      WHERE t.token_hash = ?1
+        AND t.tenant = ?2
+        AND m.tenant = ?2
+        AND t.revoked_at IS NULL
       LIMIT 1`,
   )
-    .bind(tokenHash)
+    .bind(tokenHash, c.env.TENANT_SLUG)
     .first<{
       member_id: string
       email: string | null
@@ -1747,7 +1751,7 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
     return rpcResult(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
-      serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: '0.16.0' },
+      serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: MUPOT_PUBLIC_API_VERSION },
     })
   }
 
@@ -1888,7 +1892,7 @@ function openApiSpec(origin: string): Record<string, unknown> {
     openapi: '3.0.3',
     info: {
       title: 'Mupot Digid Actions',
-      version: '0.16.0',
+      version: MUPOT_PUBLIC_API_VERSION,
       description: 'Custom GPT Actions facade for the Digid Mupot tool surface.',
     },
     servers: [{ url: origin }],

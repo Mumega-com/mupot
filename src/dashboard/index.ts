@@ -1668,8 +1668,8 @@ interface MemberChannel {
 /** Live (non-revoked) connection channels per member, derived from member_tokens. */
 async function loadChannels(env: Env): Promise<MemberChannel[]> {
   const rows = await env.DB.prepare(
-    'SELECT DISTINCT member_id, channel FROM member_tokens WHERE revoked_at IS NULL',
-  ).all<MemberChannel>()
+    'SELECT DISTINCT member_id, channel FROM member_tokens WHERE tenant = ? AND revoked_at IS NULL',
+  ).bind(env.TENANT_SLUG).all<MemberChannel>()
   return rows.results ?? []
 }
 

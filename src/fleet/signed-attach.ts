@@ -18,12 +18,13 @@
 //     leaks key material.
 
 import type { Env } from '../types'
+import { burnSharedAgentNonce, sharedNonceWindowSec } from './shared-nonce-ledger'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────
 
 /** Signature freshness window, seconds. A signed attach is valid for ±this around the
  *  server clock. Bounds both replay exposure and nonce-ledger growth. */
-export const ATTACH_WINDOW_SEC = 300
+export const ATTACH_WINDOW_SEC = sharedNonceWindowSec('fleet-attach:v1')
 
 /** Domain-separation tag — pins these bytes to the attach protocol + version. Any future
  *  signed surface MUST use a different tag so signatures never cross protocols. */
@@ -208,18 +209,14 @@ export async function verifySignedAttach(
   //    The nonce row is stamped created_at = receipt time; pruning at receipt+window (one
   //    window) would reap it while the signature is STILL fresh → replay. Retaining for the
   //    full 2×window covers the entire validity span the freshness check permits.
-  await env.DB.prepare(`DELETE FROM agent_attach_nonces WHERE created_at < ?1`)
-    .bind(now - 2 * ATTACH_WINDOW_SEC)
-    .run()
-
-  const burn = await env.DB.prepare(
-    `INSERT OR IGNORE INTO agent_attach_nonces (nonce, agent_id, created_at) VALUES (?1, ?2, ?3)`,
-  )
-    .bind(nonce, agentId, now)
-    .run()
-
-  const changes = (burn.meta as { changes?: number }).changes ?? 0
-  if (changes === 0) {
+  const burned = await burnSharedAgentNonce(env, {
+    domain: SIG_DOMAIN,
+    windowSec: ATTACH_WINDOW_SEC,
+    agentId,
+    nonce,
+    now,
+  })
+  if (!burned) {
     return { ok: false, status: 409, error: 'replay', detail: 'nonce already used' }
   }
 

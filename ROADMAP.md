@@ -79,15 +79,49 @@ Any runtime onboards + operates a pot, gated — including your DevOps agent.
 - **#47** ChatGPT Business into the flock (caller-client; depends #41).
 - **#40** Fleet Layer-A polish.
 
-## v0.23.0 — A real business operates live (the marketing pilot)
-A pot runs a **real business** coherently through the rails — the proof. The 0.22 microkernel
-**generalized #42** into a reusable Marketing department; the rest is the closed-loop CRO engine.
-Tracking: **epic #199** (marketing channels) + the sprint plan in `marketing-channels.md`.
-- **#42** Marketing roster — ✅ generalized as the **Marketing department** (Outbound channel live; the prospect funnel = the Outbound channel).
-- **the gated content loop** — SEO/CRO **perceive** (PostHog + first-party first; GSC the next connector) → gated **proposals** → gated **writes** (per pot: MCPWP for WordPress pots, the Inkwell content engine for mumega.com). Sprints **S3/S4** in #199.
-- **S-loop** — the daily closed loop on the `loops` runtime (perceive→act→measure, **acted-vs-gated policy** approved: low-risk auto within a budget/threshold envelope, risky queues for approval).
-- **#39** Loops UI + gated approval pipeline (fixes `gated_approval_pipeline_unwired`).
-- **#41** ChatGPT connector production auth path.
+## v0.23.0 — Trusted Runtime
+Make one complete trusted-agent operating loop repeatable and recoverable. The
+release target is narrower than the earlier marketing-pilot plan: prove a
+self-hosted pot can deploy, connect a real runtime, grant limited authority,
+run and approve work, verify the result in GitHub, and recover without losing
+state. The detailed gate is
+[docs/releases/v0.23.0-trusted-runtime.md](docs/releases/v0.23.0-trusted-runtime.md).
+
+Required proof:
+- Fresh self-host deployment and owner setup without manual database edits, with
+  a passing `mupot-fresh-install/v1` evidence receipt.
+- One real runtime attached through signed identity with heartbeat, signed
+  inbox, and lifecycle control evidence.
+- No unresolved P0/P1 security findings across tenant, squad RBAC, GitHub,
+  replay, webhook, and self-verdict surfaces, including GitHub App
+  least-privilege proof for #151 with a passing
+  `mupot-github-app-permissions/v1` evidence receipt.
+- One task lifecycle through the product: create -> execute -> approve ->
+  complete -> audit, with a passing `mupot-work-lifecycle/v1` evidence receipt.
+- One external board -> Mupot task -> agent -> GitHub PR cycle with the PR
+  linked back to the task and a passing `mupot-external-pr-cycle/v1`
+  evidence receipt on #150.
+- A real Hadi-host receipt bundle for #274 with passing `manifest.json`,
+  `cutover-gate.json`, `export-receipt.json`, and `manifest-check.json`.
+- A staging rehearsal for upgrade, backup, restore, rollback, Queue/DLQ
+  behavior, and failure reporting.
+- CI gates for typecheck, unit tests, fleet tests, plugin tests, migration
+  tests, dependency/security checks, browser smoke, and runtime conformance.
+- Release metadata aligned across package version, public API version,
+  changelog, roadmap, Git tag, milestone, and GitHub Release, with a passing
+  `mupot-release-integrity/v1` evidence receipt.
+- `v0.23.0-rc.1` completes a seven-day real-agent soak without lost work,
+  duplicated effects, unauthorized actions, or critical failures, with a
+  passing `mupot-production-soak/v1` evidence receipt on #280.
+- Final release readiness has a passing `mupot-v023-release-readiness/v1`
+  aggregate receipt across all objective receipts, tracker issues, and required
+  CI checks.
+
+Deferred from this version: marketplace/economy expansion, new departments,
+full SOS retirement, GCP portability, and autonomous-brain expansion.
+
+The marketing pilot remains valuable, but it moves behind the trusted runtime
+proof instead of defining the `v0.23.0` release gate.
 
 ## v0.24.0 — The breathing organism (brain = the board's prioritizer) *(proposed 2026-06-15, Chair to ratify)*
 Redefine the brain's JOB: **prioritize the backlog, don't act.** perceive→decide→**act** was

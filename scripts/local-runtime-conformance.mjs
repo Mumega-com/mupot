@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 
 import { randomUUID, webcrypto } from 'node:crypto'
+import { mkdir, writeFile } from 'node:fs/promises'
+import path from 'node:path'
 import process from 'node:process'
 
 const cryptoImpl = globalThis.crypto ?? webcrypto
 const baseUrl = (process.env.MUPOT_LOCAL_URL || process.argv[2] || 'http://127.0.0.1:8787').replace(/\/$/, '')
+const artifactsDir = path.resolve(process.env.MUPOT_CONFORMANCE_ARTIFACTS || 'tmp/local-runtime-conformance')
+const reportPath = path.join(artifactsDir, 'report.json')
 const contract = 'runtime-adapter/v1'
 const tenant = 'local'
 const agentId = 'agent-conformance'
@@ -178,6 +182,7 @@ async function verifyControlRequest(control) {
 }
 
 async function main() {
+  await mkdir(artifactsDir, { recursive: true })
   const key = await importPrivateKey()
   const runId = randomUUID()
   const requestId = `local-runtime-conformance:${runId}`
@@ -285,25 +290,36 @@ async function main() {
   expect(detach.json?.ok === true, 'signed detach did not return ok:true', detach.json)
   steps.push({ name: 'signed detach', status: 'passed', agent: agentId })
 
-  console.log(JSON.stringify({
+  const report = {
     ok: true,
     contract,
     baseUrl,
+    artifactsDir,
+    reportPath,
     tenant,
     agent: agentId,
     runtime,
     lifecycle,
     steps,
-  }, null, 2))
+  }
+  await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n')
+  console.log(JSON.stringify(report, null, 2))
 }
 
-main().catch((err) => {
-  console.error(JSON.stringify({
+main().catch(async (err) => {
+  await mkdir(artifactsDir, { recursive: true }).catch(() => undefined)
+  const failureReportPath = path.join(artifactsDir, `failure-${Date.now()}.json`)
+  const failureReport = {
     ok: false,
     contract,
     baseUrl,
+    artifactsDir,
+    reportPath,
+    failureReportPath,
     error: err instanceof Error ? err.message : String(err),
     detail: err?.detail ?? null,
-  }, null, 2))
+  }
+  await writeFile(failureReportPath, JSON.stringify(failureReport, null, 2) + '\n').catch(() => undefined)
+  console.error(JSON.stringify(failureReport, null, 2))
   process.exit(1)
 })

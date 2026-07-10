@@ -632,6 +632,7 @@ describe('TEST-2 — B1 directory-channel capability ceiling', () => {
 
     const ADMIN_MEMBER_ID = 'mbr-existing-admin'
     const TOKEN_ID = 'tok-existing-admin-directory'
+    const seen: { tokenSql?: string; tokenBinds?: unknown[] } = {}
 
     // Mock env: the member has org-admin grant in the capabilities table.
     // buildAuthContextFromProps must discard this and return [] for a directory seat.
@@ -642,11 +643,13 @@ describe('TEST-2 — B1 directory-channel capability ceiling', () => {
       DB: {
         prepare(sql: string) {
           return {
-            bind() {
+            bind(...args: unknown[]) {
               return {
                 async first() {
                   // Token liveness check (member_tokens JOIN members WHERE t.id = tokenId)
                   if (sql.includes('FROM member_tokens t') && sql.includes('t.id = ?1')) {
+                    seen.tokenSql = sql
+                    seen.tokenBinds = args
                     return { status: 'active' }
                   }
                   return null
@@ -696,6 +699,9 @@ describe('TEST-2 — B1 directory-channel capability ceiling', () => {
 
     // Tenant is from env, not props.
     expect(auth!.tenant).toBe(TENANT)
+    expect(seen.tokenSql).toContain('t.tenant = ?3')
+    expect(seen.tokenSql).toContain('m.tenant = ?3')
+    expect(seen.tokenBinds?.[2]).toBe(TENANT)
   })
 })
 
@@ -717,6 +723,7 @@ describe('TEST-2b — member API key convergence preserves workspace grants and 
     const AGENT_ID = 'agent-bound-1'
     const SQUAD_ID = 'sq-prod-path'
     const DEPT_ID = 'dept-prod-path'
+    const seen: { externalSql?: string; externalBinds?: unknown[]; recheckSql?: string; recheckBinds?: unknown[] } = {}
     const grants: CapabilityGrant[] = [
       { member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' },
       { member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'member' },
@@ -730,10 +737,18 @@ describe('TEST-2b — member API key convergence preserves workspace grants and 
       DB: {
         prepare(sql: string) {
           return {
-            bind() {
+            bind(...args: unknown[]) {
               return {
                 async first() {
                   if (sql.includes('FROM member_tokens t')) {
+                    if (sql.includes('t.token_hash = ?1')) {
+                      seen.externalSql = sql
+                      seen.externalBinds = args
+                    }
+                    if (sql.includes('t.id = ?1')) {
+                      seen.recheckSql = sql
+                      seen.recheckBinds = args
+                    }
                     return {
                       member_id: MEMBER_ID,
                       email: 'workspace@example.com',
@@ -775,6 +790,9 @@ describe('TEST-2b — member API key convergence preserves workspace grants and 
 
     const resolved = await resolveExternalToken(env, 'mupot_workspace_key')
     expect(resolved).not.toBeNull()
+    expect(seen.externalSql).toContain('t.tenant = ?2')
+    expect(seen.externalSql).toContain('m.tenant = ?2')
+    expect(seen.externalBinds?.[1]).toBe(TENANT)
     expect(resolved!.props).toMatchObject({
       memberId: MEMBER_ID,
       tokenId: TOKEN_ID,
@@ -784,6 +802,9 @@ describe('TEST-2b — member API key convergence preserves workspace grants and 
 
     const auth = await buildAuthContextFromProps(env, resolved!.props)
     expect(auth).not.toBeNull()
+    expect(seen.recheckSql).toContain('t.tenant = ?3')
+    expect(seen.recheckSql).toContain('m.tenant = ?3')
+    expect(seen.recheckBinds?.[2]).toBe(TENANT)
     expect(auth!.channel).toBe('workspace')
     expect(auth!.boundAgentId).toBe(AGENT_ID)
     expect(auth!.capabilities).toEqual(grants)

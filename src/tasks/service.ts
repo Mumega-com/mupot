@@ -365,8 +365,6 @@ export async function createTask(
     updated_at: now,
   }
 
-  task.github_issue_url = options.skipMirror ? null : await mirrorTaskCreate(env, task)
-
   const taskInsert = await env.DB.prepare(
     `INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -390,6 +388,19 @@ export async function createTask(
   // Receipt (#186): a 0-row INSERT resolves without throwing — verify the row
   // actually landed before we emit "created" and return the task as success.
   assertWritten(taskInsert, 'tasks.insert')
+
+  if (!options.skipMirror) {
+    const issueUrl = await mirrorTaskCreate(env, task)
+    if (issueUrl) {
+      const linkUpdate = await env.DB.prepare(
+        `UPDATE tasks SET github_issue_url = ?1 WHERE id = ?2 AND github_issue_url IS NULL`,
+      )
+        .bind(issueUrl, task.id)
+        .run()
+      assertWritten(linkUpdate, 'tasks.github_issue_url.update')
+      task.github_issue_url = issueUrl
+    }
+  }
 
   await emitTaskEvent(env, 'task.created', task, options.actor)
   return task

@@ -10,6 +10,7 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import { checkTransition } from '../src/tasks/service'
+import { verdictPrincipal } from '../src/tasks'
 import type { TaskStatus } from '../src/tasks/service'
 import type { Task, TaskVerdict, Env, AuthContext } from '../src/types'
 import { writeVerdict } from '../src/tasks/service'
@@ -408,6 +409,40 @@ describe('K3 — gate_grants RBAC logic', () => {
 // Override: org owner + body.override_self_verdict=true → audit note prepended.
 
 describe('K4 — self-verdict logic', () => {
+  it('verdictPrincipal: bound agent wins over member envelope id', () => {
+    const auth: AuthContext = {
+      userId: 'mbr-agent-envelope',
+      email: null,
+      role: 'member',
+      tenant: 'test-tenant',
+      memberId: 'mbr-agent-envelope',
+      boundAgentId: 'agent-77',
+    }
+
+    expect(verdictPrincipal(auth)).toEqual({
+      id: 'agent-77',
+      type: 'agent',
+      actor: { kind: 'agent', id: 'agent-77' },
+    })
+  })
+
+  it('verdictPrincipal: unbound member remains a member principal', () => {
+    const auth: AuthContext = {
+      userId: 'member-user-1',
+      email: null,
+      role: 'member',
+      tenant: 'test-tenant',
+      memberId: 'member-42',
+      boundAgentId: null,
+    }
+
+    expect(verdictPrincipal(auth)).toEqual({
+      id: 'member-42',
+      type: 'member',
+      actor: { kind: 'member', id: 'member-42' },
+    })
+  })
+
   it('isSelfVerdict: true when decider equals assignee_agent_id', () => {
     // For an agent-token caller, userId IS the agent id.
     const task = makeTask({ assignee_agent_id: 'agent-77' })

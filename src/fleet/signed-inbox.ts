@@ -7,8 +7,9 @@
 // the nonce ledger is shared with signed attach so replay is still single-use.
 
 import type { Env } from '../types'
+import { burnSharedAgentNonce, sharedNonceWindowSec } from './shared-nonce-ledger'
 
-export const INBOX_WINDOW_SEC = 300
+export const INBOX_WINDOW_SEC = sharedNonceWindowSec('agent-inbox:v1')
 export const INBOX_SIG_DOMAIN = 'agent-inbox:v1'
 
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
@@ -151,18 +152,14 @@ export async function verifySignedInboxRead(
     return { ok: false, status: 401, error: 'unauthorized', detail: 'signature verification failed' }
   }
 
-  await env.DB.prepare(`DELETE FROM agent_attach_nonces WHERE created_at < ?1`)
-    .bind(now - 2 * INBOX_WINDOW_SEC)
-    .run()
-
-  const burn = await env.DB.prepare(
-    `INSERT OR IGNORE INTO agent_attach_nonces (nonce, agent_id, created_at) VALUES (?1, ?2, ?3)`,
-  )
-    .bind(nonce, agentId, now)
-    .run()
-
-  const changes = (burn.meta as { changes?: number }).changes ?? 0
-  if (changes === 0) {
+  const burned = await burnSharedAgentNonce(env, {
+    domain: INBOX_SIG_DOMAIN,
+    windowSec: INBOX_WINDOW_SEC,
+    agentId,
+    nonce,
+    now,
+  })
+  if (!burned) {
     return { ok: false, status: 409, error: 'replay', detail: 'nonce already used' }
   }
 

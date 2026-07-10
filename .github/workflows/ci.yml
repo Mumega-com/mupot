@@ -50,6 +50,28 @@ jobs:
       - name: Plugin tests
         run: python -m pytest plugin/tests
 
+  local-evidence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Local browser and runtime evidence
+        run: bash scripts/ci-local-evidence.sh
+      - name: Upload local evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-evidence
+          path: |
+            tmp/local-evidence
+            tmp/local-smoke
+            tmp/local-runtime-conformance
+
   no-secrets:
     runs-on: ubuntu-latest
     steps:

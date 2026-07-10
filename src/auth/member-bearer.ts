@@ -47,10 +47,13 @@ export async function resolveMemberByToken(env: Env, raw: string | null): Promis
     `SELECT m.id AS member_id, m.display_name AS display_name, m.email AS email, m.status AS status, t.agent_id AS bound_agent_id
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
-      WHERE t.token_hash = ?1 AND t.revoked_at IS NULL
+      WHERE t.token_hash = ?1
+        AND t.tenant = ?2
+        AND m.tenant = ?2
+        AND t.revoked_at IS NULL
       LIMIT 1`,
   )
-    .bind(tokenHash)
+    .bind(tokenHash, env.TENANT_SLUG)
     .first<{ member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null }>()
   if (!row || row.status !== 'active') return null
   return { memberId: row.member_id, displayName: row.display_name, email: row.email, boundAgentId: row.bound_agent_id ?? null }

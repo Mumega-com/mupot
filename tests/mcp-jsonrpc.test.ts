@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { mcpActionsApp, mcpApp } from '../src/mcp'
+import { MUPOT_PUBLIC_API_VERSION } from '../src/version'
 import type { CapabilityGrant, Env } from '../src/types'
 
-function makeEnv(): Env {
+function makeEnv(seen: { authSql?: string; authBinds?: unknown[] } = {}): Env {
   const memberId = 'member-1'
   const grants: CapabilityGrant[] = [
     { member_id: memberId, scope_type: 'org', scope_id: null, capability: 'admin' },
@@ -15,10 +16,12 @@ function makeEnv(): Env {
     DB: {
       prepare(sql: string) {
         return {
-          bind() {
+          bind(...args: unknown[]) {
             return {
               async first() {
                 if (sql.includes('FROM member_tokens')) {
+                  seen.authSql = sql
+                  seen.authBinds = args
                   return {
                     member_id: memberId,
                     email: null,
@@ -62,8 +65,9 @@ describe('mcp JSON-RPC compatibility', () => {
   it('initializes without a bearer token for ChatGPT connector discovery', async () => {
     const res = await rpc('initialize')
     expect(res.status).toBe(200)
-    const body = await res.json() as { result: { capabilities: unknown; serverInfo: { name: string } } }
+    const body = await res.json() as { result: { capabilities: unknown; serverInfo: { name: string; version: string } } }
     expect(body.result.serverInfo.name).toBe('mupot-digid')
+    expect(body.result.serverInfo.version).toBe(MUPOT_PUBLIC_API_VERSION)
     expect(body.result.capabilities).toEqual({ tools: {} })
   })
 
@@ -99,6 +103,24 @@ describe('mcp JSON-RPC compatibility', () => {
     })
   })
 
+  it('binds MCP bearer auth to the current tenant', async () => {
+    const seen: { authSql?: string; authBinds?: unknown[] } = {}
+    const res = await mcpApp.request(
+      'https://pot.example/',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'status', arguments: {} } }),
+      },
+      makeEnv(seen),
+    )
+
+    expect(res.status).toBe(200)
+    expect(seen.authSql).toContain('t.tenant = ?2')
+    expect(seen.authSql).toContain('m.tenant = ?2')
+    expect(seen.authBinds?.[1]).toBe('digid')
+  })
+
   it('preserves the legacy {tool,args} invocation contract', async () => {
     const res = await mcpApp.request(
       'https://pot.example/',
@@ -122,10 +144,12 @@ describe('custom GPT Actions compatibility', () => {
     expect(res.status).toBe(200)
     const body = await res.json() as {
       openapi: string
+      info: { version: string }
       paths: Record<string, unknown>
       components: { securitySchemes: Record<string, unknown> }
     }
     expect(body.openapi).toBe('3.0.3')
+    expect(body.info.version).toBe(MUPOT_PUBLIC_API_VERSION)
     expect(body.paths['/actions/status']).toBeTruthy()
     expect(body.paths['/actions/task_create']).toBeTruthy()
     expect(body.components.securitySchemes.bearerAuth).toMatchObject({ type: 'http', scheme: 'bearer' })
