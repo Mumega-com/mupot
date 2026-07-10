@@ -129,7 +129,8 @@ coordinate in-band with the owner/admin MCP token:
 ```
 
 For a normal runtime, omit `key_id`; the tool uses the resolved agent's canonical
-slug. It resolves the member binding from the agent's unique active welded token,
+database ID so signed attach, inbox delivery, and lifecycle control share one
+identity. It resolves the member binding from the agent's unique active welded token,
 stores only public material, and refuses silent key replacement.
 
 ## Run the daemon (continuous presence + optional inbox drain)

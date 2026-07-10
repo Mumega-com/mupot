@@ -394,13 +394,13 @@ describe('register_agent_key', () => {
     }
     expect(body.result.structuredContent).toMatchObject({
       status: 'registered',
-      key_id: 'growth-lead',
+      key_id: 'agent-1',
       member_id: 'member-agent-1',
       public_key: publicKey,
       agent: { id: 'agent-1' },
     })
     const insert = captured.find((row) => row.sql.includes('INSERT INTO agent_keys'))
-    expect(insert?.args).toEqual(['digid', 'growth-lead', publicKey, 'member-agent-1', expect.any(Number)])
+    expect(insert?.args).toEqual(['digid', 'agent-1', publicKey, 'member-agent-1', expect.any(Number)])
     expect(JSON.stringify(captured)).not.toContain('"d"')
   })
 
@@ -430,7 +430,7 @@ describe('register_agent_key', () => {
     expect(captured).toEqual([])
   })
 
-  it('allows the exact database id for configured infrastructure consumers and rejects aliases', async () => {
+  it('allows an explicit legacy slug or exact database id and rejects aliases', async () => {
     const idRows: Captured[] = []
     const idRes = await call(
       'register_agent_key',
@@ -439,6 +439,15 @@ describe('register_agent_key', () => {
     )
     expect(idRes.status).toBe(200)
     expect(idRows.find((row) => row.sql.includes('INSERT INTO agent_keys'))?.args[1]).toBe('agent-1')
+
+    const slugRows: Captured[] = []
+    const slugRes = await call(
+      'register_agent_key',
+      { agent: 'growth-lead', key_id: 'growth-lead', public_key: publicKey },
+      makeEnv({}, slugRows),
+    )
+    expect(slugRes.status).toBe(200)
+    expect(slugRows.find((row) => row.sql.includes('INSERT INTO agent_keys'))?.args[1]).toBe('growth-lead')
 
     const aliasRows: Captured[] = []
     const aliasRes = await call(
