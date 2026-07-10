@@ -138,6 +138,7 @@ export function formatPlan(opts = {}) {
   lines.push('- Start only after #274, #150, and #279 have passing evidence.')
   lines.push('- Use the real release-candidate deployment and a real signed runtime agent.')
   lines.push('- Keep tokens, cookies, private keys, webhook secrets, and provider credentials out of receipts.')
+  lines.push('- Optional supporting runtime/probe output must use redacted `day-*-runtime.txt`, `day-*-probe.txt`, or `cycle-*-runtime.txt` filenames; the checker scans those sidecars for credential patterns.')
   lines.push('- Capture day-N.json during the Nth 24-hour window after soak-start.json; observed_at must be inside that window.')
   lines.push('- Capture every cycle receipt after the soak starts and before soak-end.json completes.')
   lines.push('')
@@ -346,12 +347,30 @@ function readReceiptFile(checks, path, label) {
   return parsed.ok ? parsed.value : null
 }
 
+function isSupportingTextFile(name) {
+  return /^(?:day-\d+-(?:probe|runtime)|cycle-[A-Za-z0-9_.-]+-runtime)\.txt$/.test(name)
+}
+
+function findTextSecretMaterial(path) {
+  try {
+    const text = readFileSync(path, 'utf8')
+    const findings = []
+    for (const [reason, pattern] of SECRET_VALUE_PATTERNS) {
+      if (pattern.test(text)) findings.push({ reason })
+    }
+    return { ok: true, findings }
+  } catch (err) {
+    return { ok: false, findings: [{ reason: 'read_error', detail: String(err && err.message ? err.message : err) }] }
+  }
+}
+
 export function checkBundle(opts = {}) {
   const outDir = opts.outDir ? resolve(opts.outDir) : ''
   const checks = []
   const artifacts = {
     days: [],
     cycles: [],
+    supporting_text: [],
   }
 
   pushCheck(checks, Boolean(outDir), 'out_dir_arg_present', { out_dir: outDir })
@@ -359,13 +378,30 @@ export function checkBundle(opts = {}) {
 
   if (outDir && existsSync(outDir)) {
     const allowedFixed = new Set(['soak-start.json', 'soak-end.json', 'production-soak-check.json'])
-    const extraFiles = readdirSync(outDir).filter((name) =>
+    const names = readdirSync(outDir)
+    const extraFiles = names.filter((name) =>
       name.endsWith('.json') &&
       !allowedFixed.has(name) &&
       !/^day-\d+\.json$/.test(name) &&
       !/^cycle-[A-Za-z0-9_.-]+\.json$/.test(name)
     )
     pushCheck(checks, extraFiles.length === 0, 'bundle_only_expected_json_files', { extra_files: extraFiles })
+
+    const unexpectedSupportingFiles = names.filter((name) => !name.endsWith('.json') && !isSupportingTextFile(name))
+    pushCheck(checks, unexpectedSupportingFiles.length === 0, 'bundle_only_expected_supporting_files', {
+      extra_files: unexpectedSupportingFiles,
+    })
+
+    for (const name of names.filter(isSupportingTextFile).sort((a, b) => a.localeCompare(b))) {
+      const path = join(outDir, name)
+      const inspected = findTextSecretMaterial(path)
+      artifacts.supporting_text.push({ path, sha256: sha256(path) })
+      pushCheck(checks, inspected.ok, 'supporting_text_readable', { path })
+      pushCheck(checks, inspected.ok && inspected.findings.length === 0, 'supporting_text_no_secret_material', {
+        path,
+        findings: inspected.findings.slice(0, 20),
+      })
+    }
   }
 
   const startPath = outDir ? join(outDir, 'soak-start.json') : 'soak-start.json'
