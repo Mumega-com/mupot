@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   CHECK_RECEIPT_TYPE,
+  REQUIRED_APP_PERMISSIONS,
   REQUIRED_CHECKS,
   REQUIRED_ISSUES,
   REQUIRED_RECEIPTS,
@@ -49,6 +50,12 @@ function writeBundle(dir: string, mutate?: (dir: string) => void) {
     link: `https://github.test/checks/${encodeURIComponent(name)}`,
   })))
 
+  writeJson(join(dir, 'github-app.json'), {
+    id: 123456,
+    slug: 'mupot',
+    permissions: REQUIRED_APP_PERMISSIONS,
+  })
+
   mutate?.(dir)
 }
 
@@ -69,6 +76,8 @@ describe('release readiness receipt checker', () => {
     expect(plan).toContain('fresh-install-check.json')
     expect(plan).toContain('github-issues.json')
     expect(plan).toContain('github-checks.json')
+    expect(plan).toContain('github-app.json')
+    expect(plan).toContain('GET /app')
     expect(plan).toContain('release-readiness-check.json')
   })
 
@@ -83,6 +92,7 @@ describe('release readiness receipt checker', () => {
     expect(receipt.summary.required_receipts).toBe(REQUIRED_RECEIPTS.length)
     expect(receipt.summary.required_issues).toBe(REQUIRED_ISSUES.length)
     expect(receipt.summary.required_ci_checks).toBe(REQUIRED_CHECKS.length)
+    expect(receipt.summary.required_app_permissions).toBe(Object.keys(REQUIRED_APP_PERMISSIONS).length)
   })
 
   it('fails when a required receipt has the wrong type', () => {
@@ -141,6 +151,48 @@ describe('release readiness receipt checker', () => {
       ok: false,
       check: 'required_ci_check_passed',
       check_name: 'local-evidence',
+    }))
+  })
+
+  it('fails when the GitHub App still has workflow write permission', () => {
+    const dir = tempDir()
+    writeBundle(dir, () => {
+      writeJson(join(dir, 'github-app.json'), {
+        permissions: {
+          ...REQUIRED_APP_PERMISSIONS,
+          workflows: 'write',
+        },
+      })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0' })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'github_app_workflows_disabled',
+      actual: 'write',
+    }))
+  })
+
+  it('fails when the GitHub App has extra organization admin permissions', () => {
+    const dir = tempDir()
+    writeBundle(dir, () => {
+      writeJson(join(dir, 'github-app.json'), {
+        permissions: {
+          ...REQUIRED_APP_PERMISSIONS,
+          members: 'write',
+        },
+      })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0' })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'github_app_has_no_extra_permissions',
+      extras: [{ permission: 'members', actual: 'write' }],
     }))
   })
 })

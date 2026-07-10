@@ -41,6 +41,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     for (const evidence of [
       '#274',
       '#150',
+      '#151',
       '#277',
       '#279',
       '#280',
@@ -69,6 +70,9 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'mupot-release-integrity/v1',
       'release-readiness-check.json',
       'mupot-v023-release-readiness/v1',
+      'github-app.json',
+      'GET /app',
+      'Workflows disabled',
     ]) {
       expect(releaseDoc).toContain(evidence)
     }

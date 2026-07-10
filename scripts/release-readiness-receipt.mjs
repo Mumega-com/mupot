@@ -28,7 +28,15 @@ export const REQUIRED_RECEIPTS = [
   { objective: 9, issue: 281, file: 'release-integrity-check.json', receipt_type: 'mupot-release-integrity/v1' },
 ]
 
-export const REQUIRED_ISSUES = [150, 274, 277, 279, 280, 281, 282, 283]
+export const REQUIRED_ISSUES = [150, 151, 274, 277, 279, 280, 281, 282, 283]
+
+export const REQUIRED_APP_PERMISSIONS = {
+  metadata: 'read',
+  contents: 'write',
+  issues: 'write',
+  pull_requests: 'write',
+  organization_projects: 'read',
+}
 
 export const REQUIRED_CHECKS = [
   'build',
@@ -161,6 +169,19 @@ export function formatPlan(opts = {}) {
     'name,state,link,bucket',
   ], ` > ${shellQuote(join(outDir, 'github-checks.json'))}`))
   lines.push('')
+  lines.push('Export the live GitHub App definition after #151 is remediated (GET /app):')
+  lines.push(commandLine([
+    'curl',
+    '-fsSL',
+    '-H',
+    'Authorization: Bearer <github-app-jwt>',
+    '-H',
+    'Accept: application/vnd.github+json',
+    '-H',
+    'X-GitHub-Api-Version: 2022-11-28',
+    'https://api.github.com/app',
+  ], ` > ${shellQuote(join(outDir, 'github-app.json'))}`))
+  lines.push('')
   lines.push('Check the aggregate evidence:')
   lines.push(commandLine([
     'node',
@@ -252,6 +273,19 @@ function checkSucceeded(entry) {
   return conclusion === 'SUCCESS' || state === 'SUCCESS' || state === 'COMPLETED' && conclusion === 'SUCCESS' || bucket === 'pass'
 }
 
+function permissionLevel(value) {
+  const normalized = String(value ?? 'none').toLowerCase()
+  if (normalized === 'read' || normalized === 'write') return normalized
+  return 'none'
+}
+
+function appPermissions(parsed) {
+  if (parsed?.permissions && typeof parsed.permissions === 'object' && !Array.isArray(parsed.permissions)) {
+    return parsed.permissions
+  }
+  return {}
+}
+
 export function checkBundle(opts = {}) {
   const version = normalizeTag(opts.version || DEFAULT_VERSION)
   const outDir = resolve(defaultOutDir({ ...opts, version }))
@@ -310,6 +344,26 @@ export function checkBundle(opts = {}) {
     })
   }
 
+  const appPath = join(outDir, 'github-app.json')
+  const appJson = readJson(checks, appPath, 'github_app')
+  artifacts['github-app.json'] = artifactMeta(appPath, appJson)
+  const permissions = appPermissions(appJson)
+  for (const [permission, expected] of Object.entries(REQUIRED_APP_PERMISSIONS)) {
+    const actual = permissionLevel(permissions[permission])
+    pushCheck(checks, actual === expected, 'github_app_permission_matches', {
+      permission,
+      expected,
+      actual,
+    })
+  }
+  const extras = Object.entries(permissions)
+    .filter(([permission, value]) => !(permission in REQUIRED_APP_PERMISSIONS) && permissionLevel(value) !== 'none')
+    .map(([permission, value]) => ({ permission, actual: permissionLevel(value) }))
+  pushCheck(checks, permissionLevel(permissions.workflows) === 'none', 'github_app_workflows_disabled', {
+    actual: permissionLevel(permissions.workflows),
+  })
+  pushCheck(checks, extras.length === 0, 'github_app_has_no_extra_permissions', { extras })
+
   const failed = checks.filter((check) => check.ok === false)
   const passed = checks.filter((check) => check.ok === true)
   return {
@@ -326,11 +380,13 @@ export function checkBundle(opts = {}) {
       required_receipts: REQUIRED_RECEIPTS.length,
       required_issues: REQUIRED_ISSUES.length,
       required_ci_checks: REQUIRED_CHECKS.length,
+      required_app_permissions: Object.keys(REQUIRED_APP_PERMISSIONS).length,
     },
     required: {
       receipts: REQUIRED_RECEIPTS,
       issues: REQUIRED_ISSUES,
       ci_checks: REQUIRED_CHECKS,
+      app_permissions: REQUIRED_APP_PERMISSIONS,
     },
     artifacts,
     checks,

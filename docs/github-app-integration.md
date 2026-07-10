@@ -84,7 +84,13 @@ behavior change for pots not yet on the App.
 ## Setup (dogfood: Mumega as tenant #0)
 
 1. Create the GitHub App at `github.com/settings/apps/new`:
-   - Permissions: Contents R/W, Issues R/W, Pull requests R/W, Workflows R/W, Metadata R.
+   - Repository permissions: Contents R/W, Issues R/W, Pull requests R/W,
+     Metadata R, Workflows **No access**.
+   - Organization permissions: Projects R.
+   - Everything else: **No access**. In particular, do not grant members,
+     organization secrets, organization personal access tokens,
+     organization self-hosted runners, organization custom roles, actions, hooks,
+     or organization plan permissions.
    - Generate a private key → convert to PKCS#8: `openssl pkcs8 -topk8 -nocrypt -in key.pem`.
 2. Install it on the `Mumega-com` org; note the `installation_id` (from the install URL).
 3. Store creds — either:
@@ -113,8 +119,11 @@ fail closed (typed `{ok:false}`; no token/detail leaks). Adversarial-reviewed: n
 
 The `mupot` worker (TENANT_SLUG=`mumega`) has the App wired: `GITHUB_APP_ID`,
 `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_REPO` set as Worker secrets;
-keystone deployed. Minting verified live — a real installation token reached all 33
-Mumega-com repos (incl private) with contents/issues/PRs/workflows=write.
+keystone deployed. Before `v0.23.0`, #151 must prove the live App definition and
+re-accepted installation use the least-privilege set above. The release-readiness bundle
+must include a redacted `GET /app` export whose `permissions` object has only:
+`metadata:"read"`, `contents:"write"`, `issues:"write"`, `pull_requests:"write"`,
+and `organization_projects:"read"`.
 
 ## Roadmap (remaining)
 
