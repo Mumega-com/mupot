@@ -221,6 +221,51 @@ describe('production soak receipt checker', () => {
     }))
   })
 
+  it('accepts redacted supporting runtime output', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+    writeFileSync(join(dir, 'day-1-runtime.txt'), '{"agent_token_env":"MUPOT_AGENT_TOKEN","status":200}\n')
+
+    const receipt = checkBundle({ outDir: dir, rcVersion: TARGET.rc_version })
+
+    expect(receipt.status).toBe('pass')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: true,
+      check: 'supporting_text_no_secret_material',
+      path: join(dir, 'day-1-runtime.txt'),
+    }))
+  })
+
+  it('rejects credential material in supporting runtime output', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+    writeFileSync(join(dir, 'cycle-1-runtime.txt'), `Bearer ${'abcdefghijklmnopqrstuvwxyz123456'}\n`)
+
+    const receipt = checkBundle({ outDir: dir, rcVersion: TARGET.rc_version })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'supporting_text_no_secret_material',
+      path: join(dir, 'cycle-1-runtime.txt'),
+    }))
+  })
+
+  it('rejects unexpected supporting files', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+    writeFileSync(join(dir, 'raw-credentials.env'), 'MUPOT_AGENT_TOKEN=not-a-receipt\n')
+
+    const receipt = checkBundle({ outDir: dir, rcVersion: TARGET.rc_version })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'bundle_only_expected_supporting_files',
+      extra_files: ['raw-credentials.env'],
+    }))
+  })
+
   it('fails when soak duration is shorter than seven days', () => {
     const dir = tempDir()
     writeBundle(dir, (receipt, name) => {
