@@ -144,6 +144,7 @@ export function checkBundle(opts = {}) {
   push(checks, health.version === semver, 'deployment_health_version_matches', { expected: semver, actual: health.version ?? null })
   push(checks, githubRelease.tagName === tag, 'github_prerelease_tag_matches', { expected: tag, actual: githubRelease.tagName ?? null })
   push(checks, githubRelease.isPrerelease === true && githubRelease.isDraft === false, 'github_release_is_published_prerelease', { is_prerelease: githubRelease.isPrerelease ?? null, is_draft: githubRelease.isDraft ?? null })
+  push(checks, githubRelease.targetCommitish === head && Boolean(githubRelease.targetCommitish), 'github_prerelease_target_matches_candidate_commit', { expected: head || null, actual: githubRelease.targetCommitish ?? null })
 
   const failed = checks.filter((check) => !check.ok)
   return {

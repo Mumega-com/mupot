@@ -26,7 +26,7 @@ function fixture(mutate?: (dir: string, outDir: string, commit: string) => void)
     target: { base_url: 'https://mupot.example.com', rc_version: TAG, tag: TAG, commit },
     health: { ok: true, service: 'mupot', tenant: 'example', version: VERSION },
   }))
-  writeFileSync(join(outDir, 'github-release.json'), JSON.stringify({ tagName: TAG, isPrerelease: true, isDraft: false }))
+  writeFileSync(join(outDir, 'github-release.json'), JSON.stringify({ tagName: TAG, isPrerelease: true, isDraft: false, targetCommitish: commit }))
   mutate?.(dir, outDir, commit)
   return { dir, outDir }
 }
@@ -54,5 +54,14 @@ describe('release candidate receipt checker', () => {
     const receipt = checkBundle({ repoRoot: dir, outDir, version: TAG })
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({ check: 'deployment_health_version_matches', ok: false }))
+  })
+
+  it('fails when the GitHub prerelease target is not the candidate commit', () => {
+    const { dir, outDir } = fixture((_, evidenceDir) => {
+      writeFileSync(join(evidenceDir, 'github-release.json'), JSON.stringify({ tagName: TAG, isPrerelease: true, isDraft: false, targetCommitish: 'main' }))
+    })
+    const receipt = checkBundle({ repoRoot: dir, outDir, version: TAG })
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({ check: 'github_prerelease_target_matches_candidate_commit', ok: false }))
   })
 })
