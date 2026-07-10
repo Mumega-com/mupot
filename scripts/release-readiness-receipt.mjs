@@ -48,6 +48,8 @@ export const REQUIRED_CHECKS = [
   'Analyze (python)',
 ]
 
+const GITHUB_PR_FILE = 'github-pr.json'
+
 const SECRET_VALUE_PATTERNS = [
   ['bearer_token', /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/i],
   ['mupot_token', /\bmupot_[A-Za-z0-9._-]{12,}\b/],
@@ -164,6 +166,16 @@ export function formatPlan(opts = {}) {
   lines.push(commandLine([
     'gh',
     'pr',
+    'view',
+    checksPr,
+    '--repo',
+    repo,
+    '--json',
+    'number,url,state,isDraft,headRefName,headRefOid,baseRefName,mergeStateStatus,statusCheckRollup',
+  ], ` > ${shellQuote(join(outDir, GITHUB_PR_FILE))}`))
+  lines.push(commandLine([
+    'gh',
+    'pr',
     'checks',
     '--repo',
     repo,
@@ -218,6 +230,8 @@ export function formatPlan(opts = {}) {
     repo,
     '--out-dir',
     outDir,
+    '--checks-pr',
+    checksPr,
   ], ` > ${shellQuote(join(outDir, 'release-readiness-check.json'))}`))
   lines.push(commandLine([
     'node',
@@ -230,6 +244,8 @@ export function formatPlan(opts = {}) {
     repo,
     '--out-dir',
     outDir,
+    '--checks-pr',
+    checksPr,
   ]))
   return `${lines.join('\n')}\n`
 }
@@ -291,6 +307,13 @@ function checkEntries(parsed) {
   return []
 }
 
+function expectedPrNumber(checksPr) {
+  const raw = String(checksPr ?? '').trim()
+  if (!raw) return null
+  const number = Number(raw)
+  return Number.isInteger(number) && number > 0 ? number : null
+}
+
 function checkSucceeded(entry) {
   const conclusion = String(entry?.conclusion ?? '').toUpperCase()
   const state = String(entry?.state ?? entry?.status ?? '').toUpperCase()
@@ -314,10 +337,12 @@ function appPermissions(parsed) {
 export function checkBundle(opts = {}) {
   const version = normalizeTag(opts.version || DEFAULT_VERSION)
   const outDir = resolve(defaultOutDir({ ...opts, version }))
+  const checksPr = expectedPrNumber(opts.checksPr)
   const checks = []
   const artifacts = {}
 
   pushCheck(checks, existsSync(outDir), 'evidence_directory_present', { out_dir: outDir })
+  pushCheck(checks, checksPr !== null, 'checks_pr_specified', { actual: opts.checksPr ?? null })
 
   for (const required of REQUIRED_RECEIPTS) {
     const path = join(outDir, required.file)
@@ -369,6 +394,28 @@ export function checkBundle(opts = {}) {
     })
   }
 
+  const prPath = join(outDir, GITHUB_PR_FILE)
+  const prJson = readJson(checks, prPath, 'github_pr')
+  artifacts[GITHUB_PR_FILE] = artifactMeta(prPath, prJson)
+  pushCheck(checks, Number(prJson?.number) === checksPr, 'checks_pr_number_matches_export', {
+    expected: checksPr,
+    actual: prJson?.number ?? null,
+  })
+  const prChecks = checkEntries(prJson)
+  for (const requiredName of REQUIRED_CHECKS) {
+    const matching = prChecks.filter((entry) => String(entry?.name ?? '') === requiredName)
+    pushCheck(checks, matching.length > 0, 'required_pr_rollup_check_exported', { check_name: requiredName })
+    pushCheck(checks, matching.some(checkSucceeded), 'required_pr_rollup_check_passed', {
+      check_name: requiredName,
+      observed: matching.map((entry) => ({
+        name: entry?.name ?? null,
+        conclusion: entry?.conclusion ?? null,
+        state: entry?.state ?? entry?.status ?? null,
+        bucket: entry?.bucket ?? null,
+      })),
+    })
+  }
+
   const appPath = join(outDir, 'github-app.json')
   const appJson = readJson(checks, appPath, 'github_app')
   artifacts['github-app.json'] = artifactMeta(appPath, appJson)
@@ -397,6 +444,7 @@ export function checkBundle(opts = {}) {
     checked_at: new Date().toISOString(),
     version,
     repo: opts.repo || DEFAULT_REPO,
+    checks_pr: checksPr,
     out_dir: outDir,
     summary: {
       passed: passed.length,
@@ -411,6 +459,7 @@ export function checkBundle(opts = {}) {
       receipts: REQUIRED_RECEIPTS,
       issues: REQUIRED_ISSUES,
       ci_checks: REQUIRED_CHECKS,
+      checks_pr: checksPr,
       app_permissions: REQUIRED_APP_PERMISSIONS,
     },
     artifacts,
