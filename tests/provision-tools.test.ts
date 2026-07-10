@@ -59,6 +59,7 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
               bound_agent_id: null,
             }
           }
+          if (sql.includes('FROM agent_keys')) return null
           if (sql.includes('FROM departments') && byId) {
             return deptExists && ref === 'dept-1' ? { id: 'dept-1' } : null
           }
@@ -75,6 +76,9 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
         },
         async all() {
           if (sql.includes('FROM capabilities')) return { results: grants }
+          if (sql.includes('SELECT DISTINCT t.member_id')) {
+            return { results: [{ member_id: 'member-agent-1' }] }
+          }
           // slug resolves: count matches. 'dup' deliberately matches TWO agents.
           if (sql.includes('FROM agents') && sql.includes('WHERE slug')) {
             if (ref === 'dup') return { results: [agentRow, { ...agentRow, id: 'agent-2', squad_id: 'squad-2' }] }
@@ -131,7 +135,7 @@ async function call(name: string, args: Record<string, unknown>, env: Env, auth 
 }
 
 describe('provision tools — advertised', () => {
-  it('all three appear in tools/list', async () => {
+  it('all provision tools appear in tools/list', async () => {
     const res = await mcpApp.request(
       'https://agents.digid.ca/',
       {
@@ -147,6 +151,7 @@ describe('provision tools — advertised', () => {
     expect(names).toContain('create_squad')
     expect(names).toContain('create_agent')
     expect(names).toContain('mint_agent_token')
+    expect(names).toContain('register_agent_key')
   })
 })
 
@@ -370,5 +375,79 @@ describe('mint_agent_token', () => {
   it('requires a bearer token', async () => {
     const res = await call('mint_agent_token', { agent: 'growth-lead' }, makeEnv(), false)
     expect(res.status).toBe(401)
+  })
+})
+
+describe('register_agent_key', () => {
+  const publicKey = '5c2qcgyH-XJyGIYqP--Ibqlc8Y2qIuNhEhqEZZyv0oY'
+
+  it('registers public-only material against the minted agent identity', async () => {
+    const captured: Captured[] = []
+    const res = await call(
+      'register_agent_key',
+      { agent: 'growth-lead', public_key: publicKey },
+      makeEnv({}, captured),
+    )
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      result: { structuredContent: { status: string; key_id: string; member_id: string; public_key: string; agent: { id: string } } }
+    }
+    expect(body.result.structuredContent).toMatchObject({
+      status: 'registered',
+      key_id: 'growth-lead',
+      member_id: 'member-agent-1',
+      public_key: publicKey,
+      agent: { id: 'agent-1' },
+    })
+    const insert = captured.find((row) => row.sql.includes('INSERT INTO agent_keys'))
+    expect(insert?.args).toEqual(['digid', 'growth-lead', publicKey, 'member-agent-1', expect.any(Number)])
+    expect(JSON.stringify(captured)).not.toContain('"d"')
+  })
+
+  it('rejects malformed public keys before writing', async () => {
+    const captured: Captured[] = []
+    const res = await call(
+      'register_agent_key',
+      { agent: 'growth-lead', public_key: 'not-a-key' },
+      makeEnv({}, captured),
+    )
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe('invalid_public_key')
+    expect(captured).toEqual([])
+  })
+
+  it('requires admin on the agent squad', async () => {
+    const grants: CapabilityGrant[] = [
+      { member_id: 'member-operator', scope_type: 'squad', scope_id: 'squad-1', capability: 'lead' },
+    ]
+    const captured: Captured[] = []
+    const res = await call(
+      'register_agent_key',
+      { agent: 'growth-lead', public_key: publicKey },
+      makeEnv({ grants }, captured),
+    )
+    expect(res.status).toBe(403)
+    expect(captured).toEqual([])
+  })
+
+  it('allows the exact database id for configured infrastructure consumers and rejects aliases', async () => {
+    const idRows: Captured[] = []
+    const idRes = await call(
+      'register_agent_key',
+      { agent: 'growth-lead', key_id: 'agent-1', public_key: publicKey },
+      makeEnv({}, idRows),
+    )
+    expect(idRes.status).toBe(200)
+    expect(idRows.find((row) => row.sql.includes('INSERT INTO agent_keys'))?.args[1]).toBe('agent-1')
+
+    const aliasRows: Captured[] = []
+    const aliasRes = await call(
+      'register_agent_key',
+      { agent: 'growth-lead', key_id: 'another-agent', public_key: publicKey },
+      makeEnv({}, aliasRows),
+    )
+    expect(aliasRes.status).toBe(400)
+    expect(((await aliasRes.json()) as { error: { message: string } }).error.message).toBe('invalid_key_id')
+    expect(aliasRows).toEqual([])
   })
 })

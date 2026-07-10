@@ -192,3 +192,34 @@ describe('POST /api/fleet/control', () => {
     expect(msgs[0].from_agent).toBe('kasra')
   })
 })
+
+describe('GET /api/fleet/trust', () => {
+  function get(over: Partial<Env> = {}) {
+    return fleetControlApp.request('/trust', {}, env(db(), over))
+  }
+
+  it('is publicly readable because it exposes verification material, not authority', async () => {
+    const res = await get({ FLEET_CONSUMER_AGENT: '05fb2b56-8332-4034-b311-e8d4100dc166' })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('cache-control')).toBe('no-store')
+    const body = (await res.json()) as {
+      tenant: string
+      consumer_agent_id: string
+      panel_public_key: JsonWebKey
+    }
+    const expected = JSON.parse(panelPubJwk) as JsonWebKey
+    expect(body.tenant).toBe('t')
+    expect(body.consumer_agent_id).toBe('05fb2b56-8332-4034-b311-e8d4100dc166')
+    expect(body.panel_public_key).toEqual({ kty: 'OKP', crv: 'Ed25519', x: expected.x })
+    expect(body.panel_public_key).not.toHaveProperty('d')
+    expect(JSON.stringify(body)).not.toContain((JSON.parse(panelPrivJwk) as JsonWebKey).d)
+  })
+
+  it('fails closed when either trust binding is unavailable or malformed', async () => {
+    expect((await get({ FLEET_PANEL_SK: undefined })).status).toBe(503)
+    expect((await get({ FLEET_CONSUMER_AGENT: undefined })).status).toBe(503)
+    expect((await get({ FLEET_PANEL_SK: '{bad' })).status).toBe(503)
+    expect((await get({ FLEET_CONSUMER_AGENT: '../consumer' })).status).toBe(503)
+    expect((await get({ TENANT_SLUG: 'Bad Tenant' })).status).toBe(503)
+  })
+})

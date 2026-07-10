@@ -1,6 +1,6 @@
 // mupot — MCP provision tools (SENSITIVE: org-structure writes + identity mint).
 //
-// These three tools let an authenticated operator stand up a squad/agent/bound-token
+// These tools let an authenticated operator stand up a squad/agent/bound-token/key
 // chain IN-BAND from any harness (Codex, Claude Code, …) instead of the dashboard.
 // They MIRROR the dashboard creation path exactly — createSquad/createAgent live in
 // src/org/service, mintMemberToken in src/members/service — so there is ONE source of
@@ -21,6 +21,7 @@
 //   create_squad      — admin on the department (org inherits)
 //   create_agent      — lead on the squad (org/department inherit)
 //   mint_agent_token  — admin on the agent's squad (org/department inherit) → show-once raw
+//   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
 import type { Env, BusEvent } from '../types'
 import { hasCapability } from '../auth/capability'
@@ -29,6 +30,7 @@ import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
 import { mcpEndpoint, wakeContractForAgent } from '../dashboard/connect'
 import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
+import { isValidEd25519PublicX, registerAgentPublicKey } from '../fleet/agent-keys'
 import {
   type ToolSpec,
   fail,
@@ -46,7 +48,7 @@ const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
 async function emitProvisioned(
   env: Env,
   memberId: string,
-  kind: 'department' | 'squad' | 'agent' | 'token',
+  kind: 'department' | 'squad' | 'agent' | 'token' | 'key',
   id: string,
   extra: { squad_id?: string; agent_id?: string } = {},
 ): Promise<void> {
@@ -319,9 +321,75 @@ const toolMintAgentToken: ToolSpec = {
   },
 }
 
+// ── register_agent_key ────────────────────────────────────────────────────────
+// Stores only a host-generated Ed25519 PUBLIC key. The key is bound to the one
+// active member identity already welded to this agent by mint_agent_token.
+const toolRegisterAgentKey: ToolSpec = {
+  name: 'register_agent_key',
+  scope: "agent's squad",
+  min: 'admin',
+  args: '{ agent: string (id|slug), public_key: string (Ed25519 JWK x), key_id?: exact agent slug or id }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent: STRING_SCHEMA, public_key: STRING_SCHEMA, key_id: STRING_SCHEMA },
+    required: ['agent', 'public_key'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const agentRef = str(args.agent)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const agent = agentResult.value
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    }
+
+    const publicKey = str(args.public_key)
+    if (!publicKey || !(await isValidEd25519PublicX(publicKey))) {
+      return fail(400, 'invalid_public_key', 'public_key must be a canonical Ed25519 JWK x value')
+    }
+
+    const keyId = str(args.key_id) ?? agent.slug
+    if (keyId !== agent.slug && keyId !== agent.id) {
+      return fail(400, 'invalid_key_id', 'key_id must exactly match the resolved agent slug or id')
+    }
+
+    const registered = await registerAgentPublicKey(env, keyId, agent.id, publicKey)
+    if (!registered.ok) {
+      if (registered.reason === 'identity_unminted') {
+        return fail(409, 'agent_identity_unminted', 'call mint_agent_token before registering the key')
+      }
+      if (registered.reason === 'identity_ambiguous') {
+        return fail(409, 'agent_identity_ambiguous', 'revoke stale agent tokens until one active member identity remains')
+      }
+      return fail(409, 'agent_key_conflict', 'a different key or member binding already exists; implicit rotation is refused')
+    }
+
+    if (registered.status !== 'already_registered') {
+      await emitProvisioned(env, auth.memberId as string, 'key', agent.id, {
+        squad_id: agent.squad_id,
+        agent_id: agent.id,
+      })
+    }
+    return done({
+      status: registered.status,
+      agent: { id: agent.id, slug: agent.slug, name: agent.name },
+      key_id: keyId,
+      member_id: registered.memberId,
+      public_key: publicKey,
+      note: 'only public Ed25519 material is stored; the private key remains on the host',
+    })
+  },
+}
+
 export const PROVISION_TOOLS: ToolSpec[] = [
   toolCreateDepartment,
   toolCreateSquad,
   toolCreateAgent,
   toolMintAgentToken,
+  toolRegisterAgentKey,
 ]

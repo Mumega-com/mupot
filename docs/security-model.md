@@ -92,6 +92,9 @@ The stronger runtime identity proof is Ed25519 signed attach/detach:
 
 - host keeps the private key
 - pot stores only the public key in `agent_keys`
+- `GET /api/fleet/trust` publishes only the panel verification JWK and exact
+  consumer routing identity; control remains owner-only and consumer inbox reads
+  still require the consumer's registered private-key proof
 - signed attach bytes include protocol domain, tenant, agent id, type, runtime,
   lifecycle, timestamp, and nonce
 - signed detach bytes use the separate `fleet-detach:v1` domain and bind tenant,

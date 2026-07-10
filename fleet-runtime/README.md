@@ -102,6 +102,36 @@ Then place agent private keys under `~/.fleet/agents/` with `chmod 600`, place
 the public-only panel Ed25519 JWK at `~/.fleet/panel.pub.jwk`, and run the host
 receipt.
 
+Fetch the panel public key and the Worker's exact configured consumer identity
+through the public, read-only trust endpoint instead of copying them from Worker
+secrets or guessing that the consumer slug is its configured ID:
+
+```bash
+node ~/.fleet/runtime/trust-bootstrap.mjs \
+  --base-url https://YOUR-POT.example.com \
+  > ~/.fleet/receipts/trust-bootstrap.json
+```
+
+The command writes only the public panel JWK, updates `control.json` with the
+returned tenant and `consumer_agent_id`, and does not require a bearer token. Generate
+the consumer signing key under that exact returned ID, then register its public `x`
+coordinate in-band with the owner/admin MCP token:
+
+```json
+{
+  "tool": "register_agent_key",
+  "args": {
+    "agent": "fleet-consumer",
+    "key_id": "<consumer_agent_id returned by trust bootstrap>",
+    "public_key": "<AGENT_PUBKEY>"
+  }
+}
+```
+
+For a normal runtime, omit `key_id`; the tool uses the resolved agent's canonical
+slug. It resolves the member binding from the agent's unique active welded token,
+stores only public material, and refuses silent key replacement.
+
 ## Run the daemon (continuous presence + optional inbox drain)
 
 ```bash

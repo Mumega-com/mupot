@@ -65,17 +65,42 @@ function validate(agentId: string, verb: string, nonce: string, ts: number): voi
   if (!Number.isInteger(ts)) throw new ControlRequestError('ts must be an integer (unix seconds)')
 }
 
-async function importPrivateKey(jwkJson: string): Promise<CryptoKey> {
+type PanelPrivateJwk = JsonWebKey & { kty: 'OKP'; crv: 'Ed25519'; x: string; d: string }
+
+function parsePrivateKey(jwkJson: string): PanelPrivateJwk {
   let jwk: JsonWebKey
   try {
     jwk = JSON.parse(jwkJson) as JsonWebKey
   } catch {
     throw new ControlRequestError('FLEET_PANEL_SK is not valid JSON')
   }
-  if (jwk.kty !== 'OKP' || jwk.crv !== 'Ed25519' || !(jwk as { d?: string }).d) {
+  if (
+    jwk.kty !== 'OKP' ||
+    jwk.crv !== 'Ed25519' ||
+    typeof jwk.x !== 'string' ||
+    !jwk.x ||
+    typeof (jwk as { d?: unknown }).d !== 'string' ||
+    !(jwk as { d: string }).d
+  ) {
     throw new ControlRequestError('FLEET_PANEL_SK must be a PRIVATE Ed25519 OKP JWK (with d)')
   }
+  return jwk as PanelPrivateJwk
+}
+
+async function importPrivateKey(jwkJson: string): Promise<CryptoKey> {
+  const jwk = parsePrivateKey(jwkJson)
   return crypto.subtle.importKey('jwk', jwk, { name: 'Ed25519' }, false, ['sign'])
+}
+
+/**
+ * Derive the host-safe trust root from FLEET_PANEL_SK without returning private
+ * scalar `d`. Importing first makes this fail closed for malformed JWK material.
+ */
+export async function panelPublicJwk(privateKeyJwkJson: string | undefined): Promise<JsonWebKey> {
+  if (!privateKeyJwkJson) throw new ControlRequestError('FLEET_PANEL_SK not configured (fail-closed)')
+  const jwk = parsePrivateKey(privateKeyJwkJson)
+  await crypto.subtle.importKey('jwk', jwk, { name: 'Ed25519' }, false, ['sign'])
+  return { kty: 'OKP', crv: 'Ed25519', x: jwk.x }
 }
 
 export interface SignOpts {

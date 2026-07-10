@@ -9,6 +9,7 @@ import {
   canonicalBytes,
   genNonce,
   ControlRequestError,
+  panelPublicJwk,
   _ID_RE,
   _NONCE_RE,
 } from '../src/fleet/control-request'
@@ -49,6 +50,16 @@ describe('fleet control-request signer', () => {
   it('rejects a public key passed where a private key is required', async () => {
     const { pub } = await freshKeys()
     await expect(signControlRequest(pub, { agent_id: 'image-gen', verb: 'status' })).rejects.toThrow(ControlRequestError)
+  })
+
+  it('exports only the public panel JWK from the configured private key', async () => {
+    const { priv, pub } = await freshKeys()
+    const expected = JSON.parse(pub) as JsonWebKey
+    const exported = await panelPublicJwk(priv)
+    expect(exported).toEqual({ kty: 'OKP', crv: 'Ed25519', x: expected.x })
+    expect(exported).not.toHaveProperty('d')
+    await expect(panelPublicJwk(undefined)).rejects.toThrow(ControlRequestError)
+    await expect(panelPublicJwk(JSON.stringify({ kty: 'OKP', crv: 'Ed25519', x: expected.x }))).rejects.toThrow(ControlRequestError)
   })
 
   it('canonical bytes match the committed vector string', () => {

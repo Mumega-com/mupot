@@ -3,6 +3,7 @@
 //  POST /control  — emit a signed control-request (owner-cap; the host verifies + executes).
 //  POST /report   — the host consumer daemon publishes its controllable agents + live status.
 //  GET  /agents   — read the registry (the dashboard renders the roster from this).
+//  GET  /trust    — publish public-only panel verification metadata for host bootstrap.
 //
 // Control is the high-stakes write (drives host processes) and requires an EXPLICIT owner capability
 // (no legacy web-role escape). Report is accepted ONLY from the configured consumer agent and only
@@ -16,8 +17,10 @@ import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { emitControlRequest } from './control'
 import { reportFleetAgents, getAgentView } from './registry'
 import { resolveOrgAdmin } from '../auth/member-bearer'
+import { panelPublicJwk } from './control-request'
 
 export const fleetControlApp = new Hono<{ Bindings: Env }>()
+const FLEET_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 
 type Parsed = { ok: true; value: unknown } | { ok: false; reason: 'too_large' | 'bad_json' }
 
@@ -91,4 +94,31 @@ fleetControlApp.get('/agents', async (c) => {
   const auth = await resolveOrgAdmin(c.env, c.req.header('authorization'))
   if (!auth.ok) return c.json({ error: auth.status === 401 ? 'unauthorized' : 'forbidden' }, auth.status)
   return c.json({ ok: true, agents: await getAgentView(c.env) })
+})
+
+// GET /trust — public host bootstrap metadata, analogous to a JWKS document. The
+// private scalar never leaves the Worker; hosts receive only its public JWK and the exact
+// configured consumer identity (which may be an agent UUID rather than its display slug).
+fleetControlApp.get('/trust', async (c) => {
+  if (
+    !c.env.FLEET_PANEL_SK ||
+    !FLEET_ID_RE.test(c.env.TENANT_SLUG) ||
+    !c.env.FLEET_CONSUMER_AGENT ||
+    !FLEET_ID_RE.test(c.env.FLEET_CONSUMER_AGENT)
+  ) {
+    return c.json({ error: 'fleet_trust_unavailable' }, 503)
+  }
+
+  try {
+    const publicKey = await panelPublicJwk(c.env.FLEET_PANEL_SK)
+    c.header('cache-control', 'no-store')
+    return c.json({
+      ok: true,
+      tenant: c.env.TENANT_SLUG,
+      consumer_agent_id: c.env.FLEET_CONSUMER_AGENT,
+      panel_public_key: publicKey,
+    })
+  } catch {
+    return c.json({ error: 'fleet_trust_unavailable' }, 503)
+  }
 })
