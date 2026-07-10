@@ -18,6 +18,7 @@ import { Hono } from 'hono'
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider'
 import type { Env } from './types'
 import { ROUTES } from './types'
+import { publicHealth } from './health'
 
 // Component routers (each subagent fills these in their folder).
 // Stubs are provided so the app type-checks before all components land.
@@ -62,7 +63,7 @@ export { McpOAuthApiHandler }
 
 const app = new Hono<{ Bindings: Env }>()
 
-app.get('/health', (c) => c.json({ ok: true, service: 'mupot', tenant: c.env.TENANT_SLUG }))
+app.get('/health', (c) => c.json(publicHealth(c.env.TENANT_SLUG)))
 
 app.route(ROUTES.auth, authApp)
 app.route(ROUTES.org, orgApp)

@@ -6,6 +6,14 @@ All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 this changelog (shipped, dated) share version numbers and feed each other — a roadmap
 block collapses into a changelog entry when it ships.
 
+## [0.23.0-rc.1] — 2026-07-10
+
+Release candidate for **Trusted Runtime**. It packages the signed agent runtime,
+host receipt, real GitHub board-to-task-to-PR cycle, recovery rehearsal, and
+release evidence gates for a seven-day production soak. `/health` now reports
+the public API version so the deployed candidate can be identified without an
+authenticated request.
+
 ## [0.22.0] — 2026-06-18
 
 **The department-template microkernel + the first real department.** The console becomes a

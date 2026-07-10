@@ -1,6 +1,6 @@
 {
   "name": "mupot",
-  "version": "0.21.1",
+  "version": "0.23.0-rc.1",
   "private": false,
   "description": "Installable Cloudflare-native sovereign agent substrate (the pot).",
   "type": "module",
@@ -37,6 +37,8 @@
     "receipt:github-app-permissions:check": "node scripts/github-app-permissions-receipt.mjs --check",
     "receipt:production-soak:plan": "node scripts/production-soak-receipt.mjs --plan",
     "receipt:production-soak:check": "node scripts/production-soak-receipt.mjs --check",
+    "receipt:release-candidate:plan": "node scripts/release-candidate-receipt.mjs --plan",
+    "receipt:release-candidate:check": "node scripts/release-candidate-receipt.mjs --check",
     "receipt:release-integrity:plan": "node scripts/release-integrity-receipt.mjs --plan",
     "receipt:release-integrity:check": "node scripts/release-integrity-receipt.mjs --check",
     "receipt:release-readiness:plan": "node scripts/release-readiness-receipt.mjs --plan",

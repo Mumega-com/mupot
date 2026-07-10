@@ -94,9 +94,10 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     }
   })
 
-  it('does not pretend the package has shipped before release blockers pass', () => {
+  it('allows a bounded RC without treating the final release as shipped', () => {
     expect(pkg.version).not.toBe('0.23.0')
-    expect(releaseDoc).toContain('Do not bump `package.json` or tag until all release blockers pass.')
+    expect(pkg.version).toBe('0.23.0-rc.1')
+    expect(releaseDoc).toContain('The RC uses its own package/API version and prerelease evidence, never the final tag.')
   })
 
   it('names the automated gates required for a release candidate', () => {
@@ -112,6 +113,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'npm run receipt:external-pr-cycle:plan',
       'npm run receipt:staging-recovery:plan',
       'npm run receipt:production-soak:plan',
+      'npm run receipt:release-candidate:plan',
       'npm run receipt:release-integrity:plan',
       'npm run receipt:release-readiness:plan',
       '--checks-pr <release-pr-number>',
@@ -130,6 +132,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     expect(pkg.scripts['receipt:external-pr-cycle:check']).toBe('node scripts/external-pr-cycle-receipt.mjs --check')
     expect(pkg.scripts['receipt:staging-recovery:check']).toBe('node scripts/staging-recovery-rehearsal.mjs --check')
     expect(pkg.scripts['receipt:production-soak:check']).toBe('node scripts/production-soak-receipt.mjs --check')
+    expect(pkg.scripts['receipt:release-candidate:check']).toBe('node scripts/release-candidate-receipt.mjs --check')
     expect(pkg.scripts['receipt:release-integrity:check']).toBe('node scripts/release-integrity-receipt.mjs --check')
     expect(pkg.scripts['receipt:release-readiness:check']).toBe('node scripts/release-readiness-receipt.mjs --check')
   })
