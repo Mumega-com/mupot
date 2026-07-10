@@ -30,7 +30,12 @@ function evidenceFor(step: string): Record<string, unknown> {
     case 'board_item':
       return { project_item_id: 'PVTI_lADO', issue_url: TARGET.issue_url, agent_field: TARGET.agent }
     case 'task_import':
-      return { task_id: TARGET.task_id, assigned_agent_id: TARGET.agent, board_item_linked: true }
+      return {
+        task_id: TARGET.task_id,
+        assigned_agent_id: TARGET.agent,
+        board_item_linked: true,
+        task_mirror_issue_url: TARGET.issue_url,
+      }
     case 'agent_execution':
       return { runtime_identity: TARGET.agent, inbox_work_received: true, execution_started: true }
     case 'pull_request':
@@ -172,6 +177,25 @@ describe('external PR-cycle receipt checker', () => {
       ok: false,
       check: 'target_field_consistent_across_steps',
       field: 'pr_url',
+    }))
+  })
+
+  it('fails when the Mupot task mirror is in a different repository', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, step) => {
+      if (step === 'task_import') {
+        const evidence = receipt.evidence as Record<string, unknown>
+        evidence.task_mirror_issue_url = 'https://github.com/Mumega-com/other/issues/9'
+      }
+    })
+
+    const receipt = checkBundle({ outDir: dir, repo: TARGET.repo })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'task_mirror_repo_matches_target_repo',
+      task_mirror_repo: 'Mumega-com/other',
     }))
   })
 

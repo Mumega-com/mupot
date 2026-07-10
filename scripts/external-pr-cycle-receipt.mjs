@@ -22,7 +22,7 @@ export const REQUIRED_STEPS = [
   {
     step: 'task_import',
     file: 'task-import.json',
-    evidence: ['task_id', 'assigned_agent_id', 'board_item_linked'],
+    evidence: ['task_id', 'assigned_agent_id', 'board_item_linked', 'task_mirror_issue_url'],
     links: ['task_url'],
   },
   {
@@ -498,11 +498,23 @@ export function checkBundle(opts = {}) {
 
   const repoFromIssue = githubIssueOrPrRepo(target.issue_url)
   const repoFromPr = githubIssueOrPrRepo(target.pr_url)
+  const taskImportReceipt = receipts.find(({ step }) => step === 'task_import')?.receipt
+  const taskMirrorIssueUrl = typeof taskImportReceipt?.evidence?.task_mirror_issue_url === 'string'
+    ? stripTrailingSlash(taskImportReceipt.evidence.task_mirror_issue_url)
+    : ''
+  const repoFromTaskMirror = githubIssueOrPrRepo(taskMirrorIssueUrl)
   pushCheck(checks, repoFromIssue.length > 0, 'issue_url_is_github_issue', { issue_url: target.issue_url })
   pushCheck(checks, repoFromPr.length > 0, 'pr_url_is_github_pr', { pr_url: target.pr_url })
+  pushCheck(checks, repoFromTaskMirror.length > 0, 'task_mirror_issue_url_is_github_issue', {
+    task_mirror_issue_url: taskMirrorIssueUrl || null,
+  })
   pushCheck(checks, repoFromIssue.length > 0 && repoFromIssue === repoFromPr, 'issue_and_pr_same_repo', {
     issue_repo: repoFromIssue || null,
     pr_repo: repoFromPr || null,
+  })
+  pushCheck(checks, repoFromTaskMirror.length > 0 && normalizeRepo(target.repo) === normalizeRepo(repoFromTaskMirror), 'task_mirror_repo_matches_target_repo', {
+    target_repo: target.repo,
+    task_mirror_repo: repoFromTaskMirror || null,
   })
   pushCheck(checks, normalizeRepo(target.repo) === normalizeRepo(repoFromPr), 'target_repo_matches_pr_repo', {
     target_repo: target.repo,
