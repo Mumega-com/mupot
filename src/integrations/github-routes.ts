@@ -179,6 +179,59 @@ export function taskFromGitHubEvent(
 
 export const githubInboundApp = new Hono<{ Bindings: Env }>()
 export const GITHUB_INBOUND_MAX_BODY_BYTES = 256 * 1024
+const GITHUB_DELIVERY_ID_MAX_CHARS = 128
+const GITHUB_DELIVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+
+type DeliveryClaim = 'new' | 'duplicate' | 'unavailable'
+
+/**
+ * GitHub supplies an x-github-delivery UUID for every delivery. When a proxy
+ * strips that header, use the already-verified signature as a conservative
+ * fallback: identical signed bodies are treated as one delivery rather than
+ * risking duplicate side effects.
+ */
+function deliveryId(request: Request, signatureHeader: string): string {
+  const supplied = request.headers.get('x-github-delivery')?.trim() ?? ''
+  if (new RegExp(`^[A-Za-z0-9-]{1,${GITHUB_DELIVERY_ID_MAX_CHARS}}$`).test(supplied)) return supplied
+  return `sig:${signatureHeader.toLowerCase()}`
+}
+
+/**
+ * Atomically reserve one verified delivery. A ledger outage must not weaken
+ * idempotency: returning 503 asks GitHub to retry after D1 recovers.
+ */
+async function claimDelivery(env: Env, id: string): Promise<DeliveryClaim> {
+  const receivedAt = Date.now()
+  try {
+    const result = await env.DB.prepare(
+      `INSERT OR IGNORE INTO github_webhook_deliveries (tenant, delivery_id, received_at)
+       VALUES (?1, ?2, ?3)`,
+    )
+      .bind(env.TENANT_SLUG, id, receivedAt)
+      .run()
+
+    const changes = result.meta?.changes
+    if (changes === 0) return 'duplicate'
+    if (changes !== 1) return 'unavailable'
+
+    // Retention is best-effort housekeeping after the atomic claim. It cannot
+    // change the claim outcome or make a verified delivery execute twice.
+    try {
+      await env.DB.prepare(
+        `DELETE FROM github_webhook_deliveries
+          WHERE tenant = ?1 AND received_at < ?2`,
+      )
+        .bind(env.TENANT_SLUG, receivedAt - GITHUB_DELIVERY_RETENTION_MS)
+        .run()
+    } catch {
+      // A stale-row cleanup failure is safe: the claimed delivery remains unique.
+    }
+
+    return 'new'
+  } catch {
+    return 'unavailable'
+  }
+}
 
 githubInboundApp.post('/', async (c) => {
   const declaredLen = Number(c.req.header('content-length') ?? '0')
@@ -201,18 +254,16 @@ githubInboundApp.post('/', async (c) => {
   const verify = await verifyGitHubWebhook(c.env, rawBody, signatureHeader)
   if (verify === 'not_configured') return c.json({ error: 'not_configured' }, 503)
   if (verify === 'invalid') return c.json({ error: 'unauthorized' }, 401)
+  // verifyGitHubWebhook returning ok proves this is present; retain an explicit
+  // guard so future verifier changes cannot accidentally weaken the ledger key.
+  if (!signatureHeader) return c.json({ error: 'unauthorized' }, 401)
 
-  // Replay / idempotency guard: dedups GitHub REDELIVERIES (manual re-send reuses the same
-  // x-github-delivery UUID) — NOT duplicate-content events (distinct real events get distinct
-  // delivery ids, which is correct: they're distinct work). Best-effort; KV outage → process.
-  const delivery = c.req.header('x-github-delivery') ?? signatureHeader
-  const nonceKey = `ghnonce:${delivery}`
-  try {
-    if (await c.env.SESSIONS.get(nonceKey)) return c.json({ ok: true, duplicate: true })
-    await c.env.SESSIONS.put(nonceKey, '1', { expirationTtl: 86400 })
-  } catch {
-    // KV unavailable — process rather than block a legitimate delivery
-  }
+  // Replay / idempotency guard: GitHub uses the same x-github-delivery UUID for
+  // manual and automatic redeliveries. D1's unique key makes this atomic across
+  // concurrent Workers; a ledger failure is a retryable 503, never fail-open.
+  const claim = await claimDelivery(c.env, deliveryId(c.req.raw, signatureHeader))
+  if (claim === 'duplicate') return c.json({ ok: true, duplicate: true })
+  if (claim === 'unavailable') return c.json({ error: 'delivery_ledger_unavailable' }, 503)
 
   let payload: Record<string, unknown>
   try {
