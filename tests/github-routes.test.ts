@@ -14,6 +14,63 @@ async function hmacHex(secret: string, msg: string): Promise<string> {
   return Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 
+function webhookEnv(opts: { throwOnClaim?: boolean } = {}) {
+  const deliveries = new Set<string>()
+  const claims: unknown[][] = []
+  const db = {
+    prepare(sql: string) {
+      return {
+        bind(...args: unknown[]) {
+          return {
+            async run() {
+              if (sql.includes('INSERT OR IGNORE INTO github_webhook_deliveries')) {
+                if (opts.throwOnClaim) throw new Error('D1 unavailable')
+                claims.push(args)
+                const key = `${args[0]}:${args[1]}`
+                if (deliveries.has(key)) return { meta: { changes: 0 } }
+                deliveries.add(key)
+                return { meta: { changes: 1 } }
+              }
+              if (sql.includes('DELETE FROM github_webhook_deliveries')) return { meta: { changes: 0 } }
+              throw new Error(`unexpected query: ${sql}`)
+            },
+          }
+        },
+      }
+    },
+  }
+  return {
+    env: {
+      TENANT_SLUG: 'tenant-a',
+      GITHUB_WEBHOOK_SECRET: 'webhook-secret',
+      DB: db,
+    } as unknown as Env,
+    claims,
+  }
+}
+
+async function signedWebhook(
+  env: Env,
+  body: string,
+  delivery = '2d6c992c-a41e-4d9f-9ed5-3d87e28eb6a9',
+) {
+  const signature = `sha256=${await hmacHex('webhook-secret', body)}`
+  return githubInboundApp.fetch(
+    new Request('https://pot.test/', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-github-event': 'ping',
+        'x-github-delivery': delivery,
+        'x-hub-signature-256': signature,
+      },
+      body,
+    }),
+    env,
+    {} as ExecutionContext,
+  )
+}
+
 describe('verifyGitHubWebhook', () => {
   const body = '{"action":"opened"}'
   it('not_configured when no secret', async () => {
@@ -112,5 +169,29 @@ describe('githubInboundApp body caps', () => {
     expect(res.status).toBe(413)
     const json = await res.json() as { error: string }
     expect(json.error).toBe('payload_too_large')
+  })
+})
+
+describe('githubInboundApp delivery replay ledger', () => {
+  it('atomically deduplicates a verified GitHub redelivery by tenant and delivery id', async () => {
+    const { env, claims } = webhookEnv()
+    const first = await signedWebhook(env, '{"zen":"hello"}')
+    const replay = await signedWebhook(env, '{"zen":"hello"}')
+
+    expect(first.status).toBe(200)
+    expect(await first.json()).toEqual({ ok: true, ignored: 'ping' })
+    expect(replay.status).toBe(200)
+    expect(await replay.json()).toEqual({ ok: true, duplicate: true })
+    expect(claims).toHaveLength(2)
+    expect(claims[0]?.[0]).toBe('tenant-a')
+    expect(claims[0]?.[1]).toBe('2d6c992c-a41e-4d9f-9ed5-3d87e28eb6a9')
+  })
+
+  it('fails closed with a retryable response when the durable replay ledger is unavailable', async () => {
+    const { env } = webhookEnv({ throwOnClaim: true })
+    const res = await signedWebhook(env, '{"zen":"hello"}')
+
+    expect(res.status).toBe(503)
+    expect(await res.json()).toEqual({ error: 'delivery_ledger_unavailable' })
   })
 })
