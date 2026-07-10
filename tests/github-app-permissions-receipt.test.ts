@@ -11,6 +11,7 @@ import {
   checkBundle,
   createAppJwt,
   exportAppDefinition,
+  exportGhAppDefinition,
   formatPlan,
   parseArgs,
   redactAppDefinition,
@@ -57,6 +58,9 @@ describe('GitHub App permissions receipt checker', () => {
     const exportOpts = parseArgs(['--export-app', '--app-id', '123', '--private-key-file', './key.pem'])
     expect(exportOpts.exportApp).toBe(true)
     expect(exportOpts.appId).toBe('123')
+    const ghOpts = parseArgs(['--export-gh', '--app', 'mupot', '--organization', 'Mumega-com'])
+    expect(ghOpts.exportGh).toBe(true)
+    expect(ghOpts.organization).toBe('Mumega-com')
   })
 
   it('prints the #151 evidence plan', () => {
@@ -67,6 +71,7 @@ describe('GitHub App permissions receipt checker', () => {
 
     expect(plan).toContain('Mupot v0.23 GitHub App least-privilege evidence plan')
     expect(plan).toContain('GET /app')
+    expect(plan).toContain('--export-gh')
     expect(plan).toContain('--export-app')
     expect(plan).toContain('github-app.json')
     expect(plan).toContain('github-installation.json')
@@ -216,6 +221,58 @@ describe('GitHub App permissions receipt checker', () => {
     expect(installation.id).toBe(Number(INSTALLATION_ID))
     expect(installation.permissions).toEqual(REQUIRED_APP_PERMISSIONS)
     expect(installation.account.extra).toBeUndefined()
+  })
+
+  it('exports the same redacted proof through the authenticated GitHub CLI without an App key', async () => {
+    const dir = tempDir()
+    const ghCalls: Array<{ file: string, args: string[] }> = []
+    const ghExec = (file: string, args: string[]) => {
+      ghCalls.push({ file, args })
+      if (args.at(-1) === 'apps/mupot') {
+        return JSON.stringify({
+          id: 123456,
+          slug: 'mupot',
+          name: 'mupot',
+          html_url: 'https://github.com/apps/mupot',
+          owner: { login: 'Mumega-com', id: 999, type: 'Organization', extra: 'drop' },
+          permissions: REQUIRED_APP_PERMISSIONS,
+        })
+      }
+      return JSON.stringify([{
+        installations: [{
+          id: Number(INSTALLATION_ID),
+          app_id: 123456,
+          app_slug: 'mupot',
+          account: { login: 'Mumega-com', id: 999, type: 'Organization', extra: 'drop' },
+          repository_selection: 'all',
+          permissions: REQUIRED_APP_PERMISSIONS,
+          created_at: '2026-07-01T00:00:00.000Z',
+          updated_at: '2026-07-10T00:00:00.000Z',
+          suspended_at: null,
+        }],
+      }])
+    }
+
+    const result = await exportGhAppDefinition({
+      outDir: dir,
+      app: 'mupot',
+      organization: 'Mumega-com',
+      installationId: INSTALLATION_ID,
+    }, { ghExec })
+
+    expect(ghCalls).toEqual([{
+      file: 'gh',
+      args: ['api', 'apps/mupot'],
+    }, {
+      file: 'gh',
+      args: ['api', '--paginate', '--slurp', 'orgs/Mumega-com/installations'],
+    }])
+    expect(result.source).toEqual({
+      app: 'gh api apps/mupot',
+      installation: 'gh api orgs/Mumega-com/installations',
+    })
+    expect(JSON.parse(readFileSync(result.path, 'utf8')).permissions).toEqual(REQUIRED_APP_PERMISSIONS)
+    expect(JSON.parse(readFileSync(result.installationPath, 'utf8')).permissions).toEqual(REQUIRED_APP_PERMISSIONS)
   })
 
   it('passes when the App has only the v0.23 least-privilege set', () => {

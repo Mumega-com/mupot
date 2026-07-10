@@ -6,6 +6,7 @@
 // redacted GET /app export must show only the permissions v0.23 needs.
 
 import { createHash, createSign } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -40,6 +41,8 @@ export function parseArgs(argv) {
     privateKeyFile: '',
     apiUrl: 'https://api.github.com/app',
     exportApp: false,
+    exportGh: false,
+    organization: '',
     plan: false,
     check: false,
     summary: false,
@@ -61,6 +64,8 @@ export function parseArgs(argv) {
     else if (arg === '--private-key-file') opts.privateKeyFile = resolve(next())
     else if (arg === '--api-url') opts.apiUrl = next()
     else if (arg === '--export-app') opts.exportApp = true
+    else if (arg === '--export-gh') opts.exportGh = true
+    else if (arg === '--organization') opts.organization = next()
     else if (arg === '--plan') opts.plan = true
     else if (arg === '--check') opts.check = true
     else if (arg === '--summary') opts.summary = true
@@ -73,16 +78,18 @@ export function parseArgs(argv) {
 
 export function usage() {
   return [
-    'Usage: node scripts/github-app-permissions-receipt.mjs --plan|--export-app|--check [options]',
+    'Usage: node scripts/github-app-permissions-receipt.mjs --plan|--export-app|--export-gh|--check [options]',
     '',
     'Options:',
     '  --plan              print the GitHub App least-privilege evidence plan',
     '  --export-app        fetch GET /app and write a redacted github-app.json',
+    '  --export-gh         fetch GET /apps/:slug plus the org installation through authenticated gh',
     '  --check             check a completed GitHub App evidence directory',
     '  --summary           with --check, print a compact text summary',
     '  --out-dir <path>    evidence directory',
     '  --app <slug>        expected GitHub App slug, for example mupot',
     '  --app-id <id>       GitHub App ID for --export-app',
+    '  --organization <login> organization that owns the installed App, for --export-gh',
     '  --installation-id <id> installed GitHub App ID for export and check',
     '  --private-key-file <path> PKCS#8 GitHub App private key PEM for --export-app',
     '  --api-url <url>     GitHub App API URL for --export-app; default https://api.github.com/app',
@@ -144,6 +151,21 @@ export function formatPlan(opts = {}) {
   ]))
   lines.push('')
   lines.push(`The export writes ${join(outDir, APP_FILE)} from GET /app and ${join(outDir, INSTALLATION_FILE)} from GET /app/installations/<installation-id>.`)
+  lines.push('')
+  lines.push('If the App private key is correctly confined to a Worker secret, use the GitHub CLI path instead. It reads the configured permission object with gh api apps/<slug> and the organization installation through the authenticated GitHub CLI; no private key is copied or generated:')
+  lines.push(commandLine([
+    'node',
+    'scripts/github-app-permissions-receipt.mjs',
+    '--export-gh',
+    '--out-dir',
+    outDir,
+    '--app',
+    app,
+    '--organization',
+    '<organization-login>',
+    '--installation-id',
+    '<github-app-installation-id>',
+  ]))
   lines.push('')
   lines.push('Check the evidence:')
   lines.push(commandLine([
@@ -255,6 +277,48 @@ async function fetchGitHubJson(fetchImpl, url, jwt) {
   return res.json()
 }
 
+function organizationValid(value) {
+  return /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(String(value || ''))
+}
+
+function ghApiJson(args, ghExec, errorMessage) {
+  let raw
+  try {
+    raw = ghExec('gh', ['api', ...args], { encoding: 'utf8' })
+  } catch {
+    throw new Error(errorMessage)
+  }
+  try {
+    return JSON.parse(raw)
+  } catch {
+    throw new Error('gh api returned invalid JSON')
+  }
+}
+
+function installationFromGh(organization, installationId, ghExec) {
+  const pages = ghApiJson(
+    ['--paginate', '--slurp', `orgs/${encodeURIComponent(organization)}/installations`],
+    ghExec,
+    'gh api could not read the organization installations; authenticate gh as an organization owner or App manager',
+  )
+  const installations = (Array.isArray(pages) ? pages : [pages])
+    .flatMap((page) => Array.isArray(page?.installations) ? page.installations : [])
+  const matches = installations.filter((installation) => String(installation?.id ?? '') === String(installationId))
+  if (matches.length !== 1) {
+    throw new Error(`organization installation ${installationId} was not found exactly once under ${organization}`)
+  }
+  return matches[0]
+}
+
+function writeExportedDefinitions(outDir, app, installation) {
+  mkdirSync(outDir, { recursive: true })
+  const outPath = join(outDir, APP_FILE)
+  const installationPath = join(outDir, INSTALLATION_FILE)
+  writeFileSync(outPath, `${JSON.stringify(app, null, 2)}\n`)
+  writeFileSync(installationPath, `${JSON.stringify(installation, null, 2)}\n`)
+  return { path: outPath, installationPath }
+}
+
 export async function exportAppDefinition(opts = {}, fetchImpl = fetch) {
   if (!opts.outDir) throw new Error('--out-dir is required for --export-app')
   if (!opts.appId) throw new Error('--app-id is required for --export-app')
@@ -279,12 +343,51 @@ export async function exportAppDefinition(opts = {}, fetchImpl = fetch) {
   if (installation.app_slug !== app.slug) {
     throw new Error(`installation app_slug ${installation.app_slug ?? '<missing>'} does not match App slug ${app.slug ?? '<missing>'}`)
   }
-  mkdirSync(opts.outDir, { recursive: true })
-  const outPath = join(opts.outDir, APP_FILE)
-  const installationPath = join(opts.outDir, INSTALLATION_FILE)
-  writeFileSync(outPath, `${JSON.stringify(app, null, 2)}\n`)
-  writeFileSync(installationPath, `${JSON.stringify(installation, null, 2)}\n`)
-  return { path: outPath, installationPath, app, installation }
+  return { ...writeExportedDefinitions(opts.outDir, app, installation), app, installation }
+}
+
+/**
+ * Export the same redacted evidence without reading or rotating an App private
+ * key. `gh` supplies the operator authentication for both GitHub reads.
+ */
+export async function exportGhAppDefinition(opts = {}, deps = {}) {
+  if (!opts.outDir) throw new Error('--out-dir is required for --export-gh')
+  if (!opts.app) throw new Error('--app is required for --export-gh')
+  if (!organizationValid(opts.organization)) throw new Error('--organization must be a valid GitHub organization login')
+  if (!installationIdValid(opts.installationId)) throw new Error('--installation-id must be a positive numeric GitHub installation ID')
+
+  const ghExec = deps.ghExec ?? execFileSync
+  const app = redactAppDefinition(ghApiJson(
+    [`apps/${encodeURIComponent(opts.app)}`],
+    ghExec,
+    'gh api could not read the GitHub App definition; authenticate gh as an App manager',
+  ))
+  if (app.slug !== opts.app) {
+    throw new Error(`gh api apps/${opts.app} returned slug ${app.slug ?? '<missing>'}`)
+  }
+
+  const installation = redactInstallationDefinition(
+    installationFromGh(opts.organization, opts.installationId, ghExec),
+  )
+  if (String(installation.id ?? '') !== String(opts.installationId)) {
+    throw new Error(`organization installation returned id ${installation.id ?? '<missing>'}, expected ${opts.installationId}`)
+  }
+  if (String(installation.app_id ?? '') !== String(app.id ?? '')) {
+    throw new Error(`installation app_id ${installation.app_id ?? '<missing>'} does not match App id ${app.id ?? '<missing>'}`)
+  }
+  if (installation.app_slug !== app.slug) {
+    throw new Error(`installation app_slug ${installation.app_slug ?? '<missing>'} does not match App slug ${app.slug ?? '<missing>'}`)
+  }
+
+  return {
+    ...writeExportedDefinitions(opts.outDir, app, installation),
+    app,
+    installation,
+    source: {
+      app: `gh api apps/${opts.app}`,
+      installation: `gh api orgs/${opts.organization}/installations`,
+    },
+  }
 }
 
 function scanSecretText(text, path) {
@@ -500,7 +603,7 @@ export function formatSummary(receipt) {
 
 function main() {
   const opts = parseArgs(process.argv.slice(2))
-  if (opts.help || (!opts.plan && !opts.check && !opts.exportApp)) {
+  if (opts.help || (!opts.plan && !opts.check && !opts.exportApp && !opts.exportGh)) {
     console.log(usage())
     return
   }
@@ -514,6 +617,32 @@ function main() {
         console.log(JSON.stringify({
           ok: true,
           path: result.path,
+          app: {
+            slug: result.app.slug,
+            id: result.app.id,
+            html_url: result.app.html_url,
+          },
+          installation: {
+            path: result.installationPath,
+            id: result.installation.id,
+            account: result.installation.account,
+          },
+          next_step: `run this script again with --check --installation-id ${result.installation.id} to validate both exports`,
+        }, null, 2))
+      })
+      .catch((err) => {
+        console.error(`github-app-permissions-receipt: ${err && err.message ? err.message : err}`)
+        process.exitCode = 1
+      })
+    return
+  }
+  if (opts.exportGh) {
+    exportGhAppDefinition(opts)
+      .then((result) => {
+        console.log(JSON.stringify({
+          ok: true,
+          path: result.path,
+          source: result.source,
           app: {
             slug: result.app.slug,
             id: result.app.id,
