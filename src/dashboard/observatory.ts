@@ -15,6 +15,7 @@
 // from token usage via src/agents/cost.ts (see that module for the caveats).
 
 import type { Env, Agent } from '../types'
+import { derivePresence, presenceTtlSec } from '../fleet/registry'
 
 // ── Time window ───────────────────────────────────────────────────────────────
 
@@ -238,17 +239,65 @@ export async function loadRecentTasks(env: Env): Promise<RecentTask[]> {
 export interface ObservatoryData {
   agents: Agent[]
   stats: Map<string, AgentStat>
+  runtimeStates: Map<string, AgentRuntimeState>
   bars: SwimlaneBar[]
   ticks: string[]
   recentTasks: RecentTask[]
 }
 
+// An active catalog row means the operator enabled an agent. It does not mean a
+// trusted runtime is connected: that requires both its signing key and a fresh
+// fleet heartbeat.
+export type AgentRuntimeState = 'live' | 'stale' | 'offline' | 'unattached'
+
+interface AgentRuntimeEvidence {
+  agent_id: string
+  key_agent_id: string | null
+  fleet_status: string | null
+  last_reported_at: string | null
+}
+
+export function deriveAgentRuntimeState(
+  evidence: Pick<AgentRuntimeEvidence, 'key_agent_id' | 'fleet_status' | 'last_reported_at'>,
+  ttlSec: number,
+  nowMs: number,
+): AgentRuntimeState {
+  if (!evidence.key_agent_id) return 'unattached'
+  if (!evidence.fleet_status) return 'offline'
+  return derivePresence(evidence.fleet_status, evidence.last_reported_at ?? '', ttlSec, nowMs)
+}
+
+export async function loadAgentRuntimeStates(env: Env, nowMs = Date.now()): Promise<Map<string, AgentRuntimeState>> {
+  const rows = await env.DB.prepare(
+    `SELECT a.id AS agent_id,
+            k.agent_id AS key_agent_id,
+            f.status AS fleet_status,
+            f.last_reported_at
+       FROM agents a
+       LEFT JOIN agent_keys k
+              ON k.tenant = ?1 AND k.agent_id = a.id
+       LEFT JOIN fleet_agents f
+              ON f.tenant = ?1 AND f.agent_id = a.id
+      ORDER BY a.created_at ASC, a.name ASC`,
+  )
+    .bind(env.TENANT_SLUG)
+    .all<AgentRuntimeEvidence>()
+
+  const states = new Map<string, AgentRuntimeState>()
+  const ttlSec = presenceTtlSec(env)
+  for (const row of rows.results ?? []) {
+    states.set(row.agent_id, deriveAgentRuntimeState(row, ttlSec, nowMs))
+  }
+  return states
+}
+
 export async function loadObservatory(env: Env): Promise<ObservatoryData> {
-  const [agentRows, statsMap, bars, recentTasks] = await Promise.all([
+  const [agentRows, statsMap, runtimeStates, bars, recentTasks] = await Promise.all([
     env.DB.prepare(
       'SELECT id, squad_id, slug, name, role, model, status, created_at FROM agents ORDER BY created_at ASC, name ASC',
     ).all<Agent>(),
     loadAgentStats(env),
+    loadAgentRuntimeStates(env),
     loadSwimlaneBars(env),
     loadRecentTasks(env),
   ])
@@ -256,6 +305,7 @@ export async function loadObservatory(env: Env): Promise<ObservatoryData> {
   return {
     agents: agentRows.results ?? [],
     stats: statsMap,
+    runtimeStates,
     bars,
     ticks: buildHourlyTicks(),
     recentTasks,

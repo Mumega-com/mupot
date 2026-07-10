@@ -87,7 +87,7 @@ import {
   loadObservatory,
   agentGradient,
 } from './observatory'
-import type { ObservatoryData, SwimlaneBar, AgentStat } from './observatory'
+import type { ObservatoryData, SwimlaneBar, AgentRuntimeState, AgentStat } from './observatory'
 import { loadOpsHealth } from './health'
 import type { OpsHealthData, HealthTone } from './health'
 import { loadAllAgents, loadSquadOptions } from './agents-admin'
@@ -2877,7 +2877,20 @@ function observatoryBody(
   approvals: ApprovalItem[],
   auth: AuthContext,
 ) {
-  const { agents, stats, bars, ticks, recentTasks } = data
+  const { agents, stats, runtimeStates, bars, ticks, recentTasks } = data
+
+  function runtimeLabel(state: AgentRuntimeState): string {
+    if (state === 'live') return 'live runtime'
+    if (state === 'stale') return 'stale runtime'
+    if (state === 'offline') return 'runtime offline'
+    return 'runtime unattached'
+  }
+
+  function runtimeTone(state: AgentRuntimeState): 'ok' | 'warn' | 'dim' {
+    if (state === 'live') return 'ok'
+    if (state === 'stale') return 'warn'
+    return 'dim'
+  }
 
   // ── swimlane ──────────────────────────────────────────────────────────────
   // Bars grouped by agent_id for O(1) row render.
@@ -2921,14 +2934,15 @@ function observatoryBody(
         const pressClass = pressure > 85 ? 'red' : pressure > 65 ? 'amber' : 'green'
         const grad = agentGradient(a.name)
         const initial = escHtml(a.name.slice(0, 1).toUpperCase())
-        const dotClass = a.status === 'active' ? 'active' : 'paused'
+        const runtime = runtimeStates.get(a.id) ?? 'unattached'
+        const dotClass = runtime === 'live' ? 'active' : 'paused'
         return (
           `<div class="tile">` +
           `<span class="tile-av" style="background:${grad}">${initial}</span>` +
           `<div class="tile-body">` +
           `<div class="tile-top">` +
           `<a href="/agents/${escAttr(a.id)}" class="tile-name">${escHtml(a.name)}</a>` +
-          `<span class="tile-dot tile-dot--${dotClass}" title="${escAttr(a.status)}"></span>` +
+          `<span class="tile-dot tile-dot--${dotClass}" title="${escAttr(runtimeLabel(runtime))}"></span>` +
           `<span class="tile-role">${escHtml(a.role)}</span>` +
           `</div>` +
           `<div class="press"><div class="press-fill press-fill--${pressClass}" style="width:${pressure}%"></div></div>` +
@@ -3013,8 +3027,10 @@ function observatoryBody(
       spendTotal += s.spend_micro_usd
     }
   }
+  const liveRuntimeCount = agents.filter((a) => runtimeStates.get(a.id) === 'live').length
   const kpiStrip = kpiRow([
-    statCard({ label: 'Agents', value: String(agents.length) }),
+    statCard({ label: 'Configured agents', value: String(agents.length) }),
+    statCard({ label: 'Live runtimes', value: String(liveRuntimeCount), subTone: liveRuntimeCount > 0 ? 'primary' : 'warn' }),
     statCard({ label: 'In flight', value: String(inFlightTotal), subTone: inFlightTotal > 0 ? 'primary' : 'dim' }),
     statCard({ label: 'Needs decision', value: String(queueCount), subTone: queueCount > 0 ? 'warn' : 'dim' }),
     statCard({ label: 'Spend · 24h', value: formatUsd(spendTotal) }),
@@ -3045,7 +3061,7 @@ function observatoryBody(
     const successPct = stat?.success_pct ?? 0
     const spend = stat?.spend_micro_usd ?? 0
     const initial = a.name.slice(0, 1).toUpperCase()
-    const dotTone = a.status === 'active' ? 'ok' : 'dim'
+    const runtime = runtimeStates.get(a.id) ?? 'unattached'
     return [
       html`<div class="ui-agent-cell">
         ${avatarBadge({ initial, fill: agentGradient(a.name), title: a.name })}
@@ -3054,7 +3070,7 @@ function observatoryBody(
           <span class="ui-agent-role">${a.role}</span>
         </span>
       </div>`,
-      uiStatusDot(dotTone, a.status),
+      uiStatusDot(runtimeTone(runtime), `${runtimeLabel(runtime)} · ${a.status}`),
       html`<span class="ui-mono-dim">${String(taskCount)}</span>`,
       html`<span class="ui-mono-dim">${taskCount > 0 ? `${successPct}%` : '—'}</span>`,
       html`<span class="ui-mono-dim">${spend > 0 ? formatUsd(spend) : '—'}</span>`,
@@ -3067,7 +3083,7 @@ function observatoryBody(
     body: dataTable({
       cols: [
         { label: 'Agent', width: '2fr' },
-        { label: 'Status', width: '1fr' },
+        { label: 'Runtime', width: '1fr' },
         { label: 'Tasks · 24h', width: '1fr' },
         { label: 'Success', width: '1fr' },
         { label: 'Spend · 24h', width: '1fr' },
