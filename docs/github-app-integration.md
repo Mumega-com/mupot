@@ -129,6 +129,12 @@ Use the dedicated receipt checker before closing #151:
 
 ```bash
 npm run receipt:github-app-permissions:plan -- --app mupot
+node scripts/github-app-permissions-receipt.mjs \
+  --export-app \
+  --app mupot \
+  --app-id "$GITHUB_APP_ID" \
+  --private-key-file /path/to/pkcs8-private-key.pem \
+  --out-dir tmp/github-app-permissions/mupot
 npm run receipt:github-app-permissions:check -- \
   --app mupot \
   --out-dir tmp/github-app-permissions/mupot \

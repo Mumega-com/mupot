@@ -5,8 +5,8 @@
 // GitHub App definition is remediated and the installation is re-accepted, a
 // redacted GET /app export must show only the permissions v0.23 needs.
 
-import { createHash } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { createHash, createSign } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -33,6 +33,10 @@ export function parseArgs(argv) {
   const opts = {
     outDir: '',
     app: '',
+    appId: '',
+    privateKeyFile: '',
+    apiUrl: 'https://api.github.com/app',
+    exportApp: false,
     plan: false,
     check: false,
     summary: false,
@@ -49,6 +53,10 @@ export function parseArgs(argv) {
 
     if (arg === '--out-dir') opts.outDir = resolve(next())
     else if (arg === '--app') opts.app = next()
+    else if (arg === '--app-id') opts.appId = next()
+    else if (arg === '--private-key-file') opts.privateKeyFile = resolve(next())
+    else if (arg === '--api-url') opts.apiUrl = next()
+    else if (arg === '--export-app') opts.exportApp = true
     else if (arg === '--plan') opts.plan = true
     else if (arg === '--check') opts.check = true
     else if (arg === '--summary') opts.summary = true
@@ -61,14 +69,18 @@ export function parseArgs(argv) {
 
 export function usage() {
   return [
-    'Usage: node scripts/github-app-permissions-receipt.mjs --plan|--check [options]',
+    'Usage: node scripts/github-app-permissions-receipt.mjs --plan|--export-app|--check [options]',
     '',
     'Options:',
     '  --plan              print the GitHub App least-privilege evidence plan',
+    '  --export-app        fetch GET /app and write a redacted github-app.json',
     '  --check             check a completed GitHub App evidence directory',
     '  --summary           with --check, print a compact text summary',
     '  --out-dir <path>    evidence directory',
     '  --app <slug>        expected GitHub App slug, for example mupot',
+    '  --app-id <id>       GitHub App ID for --export-app',
+    '  --private-key-file <path> PKCS#8 GitHub App private key PEM for --export-app',
+    '  --api-url <url>     GitHub App API URL for --export-app; default https://api.github.com/app',
     '  -h, --help          show this help',
   ].join('\n')
 }
@@ -105,7 +117,22 @@ export function formatPlan(opts = {}) {
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', outDir]))
   lines.push('')
-  lines.push('Export the live GitHub App definition with GET /app and an App-authentication JWT, then remove unrelated non-permission metadata if desired:')
+  lines.push('Export the live GitHub App definition with GET /app and an App-authentication JWT. The script writes only redacted App metadata plus permissions:')
+  lines.push(commandLine([
+    'node',
+    'scripts/github-app-permissions-receipt.mjs',
+    '--export-app',
+    '--out-dir',
+    outDir,
+    '--app',
+    app,
+    '--app-id',
+    '<github-app-id>',
+    '--private-key-file',
+    '<path-to-pkcs8-private-key.pem>',
+  ]))
+  lines.push('')
+  lines.push('Manual fallback if you already have an App-authentication JWT:')
   lines.push(commandLine([
     'curl',
     '-fsSL',
@@ -143,6 +170,69 @@ export function formatPlan(opts = {}) {
 
 function pushCheck(checks, ok, check, detail = {}) {
   checks.push({ ok: Boolean(ok), check, ...detail })
+}
+
+function base64UrlJson(value) {
+  return Buffer.from(JSON.stringify(value)).toString('base64url')
+}
+
+export function createAppJwt(appId, privateKeyPem, nowSeconds = Math.floor(Date.now() / 1000)) {
+  if (!appId) throw new Error('--app-id is required')
+  if (!privateKeyPem) throw new Error('--private-key-file is required')
+  const header = { alg: 'RS256', typ: 'JWT' }
+  const payload = {
+    iat: nowSeconds - 60,
+    exp: nowSeconds + 8 * 60,
+    iss: String(appId),
+  }
+  const signingInput = `${base64UrlJson(header)}.${base64UrlJson(payload)}`
+  const signer = createSign('RSA-SHA256')
+  signer.update(signingInput)
+  signer.end()
+  return `${signingInput}.${signer.sign(privateKeyPem).toString('base64url')}`
+}
+
+export function redactAppDefinition(app) {
+  return {
+    id: app?.id ?? null,
+    slug: app?.slug ?? null,
+    name: app?.name ?? null,
+    html_url: app?.html_url ?? null,
+    owner: app?.owner && typeof app.owner === 'object'
+      ? {
+          login: app.owner.login ?? null,
+          id: app.owner.id ?? null,
+          type: app.owner.type ?? null,
+        }
+      : null,
+    permissions: appPermissions(app),
+  }
+}
+
+export async function exportAppDefinition(opts = {}, fetchImpl = fetch) {
+  if (!opts.outDir) throw new Error('--out-dir is required for --export-app')
+  if (!opts.appId) throw new Error('--app-id is required for --export-app')
+  if (!opts.privateKeyFile) throw new Error('--private-key-file is required for --export-app')
+
+  const privateKeyPem = readFileSync(opts.privateKeyFile, 'utf8')
+  const jwt = createAppJwt(opts.appId, privateKeyPem, opts.nowSeconds ?? Math.floor(Date.now() / 1000))
+  const res = await fetchImpl(opts.apiUrl || 'https://api.github.com/app', {
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'mupot-release-evidence',
+    },
+  })
+  if (!res.ok) throw new Error(`GET /app failed with HTTP ${res.status}`)
+  const redacted = redactAppDefinition(await res.json())
+  if (opts.app && redacted.slug !== opts.app) {
+    throw new Error(`GET /app returned slug ${redacted.slug ?? '<missing>'}, expected ${opts.app}`)
+  }
+  mkdirSync(opts.outDir, { recursive: true })
+  const outPath = join(opts.outDir, 'github-app.json')
+  writeFileSync(outPath, `${JSON.stringify(redacted, null, 2)}\n`)
+  return { path: outPath, app: redacted }
 }
 
 function scanSecretText(text, path) {
@@ -279,12 +369,32 @@ export function formatSummary(receipt) {
 
 function main() {
   const opts = parseArgs(process.argv.slice(2))
-  if (opts.help || (!opts.plan && !opts.check)) {
+  if (opts.help || (!opts.plan && !opts.check && !opts.exportApp)) {
     console.log(usage())
     return
   }
   if (opts.plan) {
     process.stdout.write(formatPlan(opts))
+    return
+  }
+  if (opts.exportApp) {
+    exportAppDefinition(opts)
+      .then((result) => {
+        console.log(JSON.stringify({
+          ok: true,
+          path: result.path,
+          app: {
+            slug: result.app.slug,
+            id: result.app.id,
+            html_url: result.app.html_url,
+          },
+          next_step: 'run this script again with --check to validate github-app.json',
+        }, null, 2))
+      })
+      .catch((err) => {
+        console.error(`github-app-permissions-receipt: ${err && err.message ? err.message : err}`)
+        process.exitCode = 1
+      })
     return
   }
   const receipt = checkBundle(opts)

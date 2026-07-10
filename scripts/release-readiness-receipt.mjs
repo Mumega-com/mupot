@@ -169,6 +169,7 @@ export function formatPlan(opts = {}) {
   ], ` > ${shellQuote(join(outDir, 'github-checks.json'))}`))
   lines.push('')
   lines.push('Export the live GitHub App definition after #151 is remediated (GET /app):')
+  lines.push(`The export command writes ${join(outDir, 'github-app.json')}.`)
   lines.push(commandLine([
     'npm',
     'run',
@@ -180,16 +181,18 @@ export function formatPlan(opts = {}) {
     outDir,
   ]))
   lines.push(commandLine([
-    'curl',
-    '-fsSL',
-    '-H',
-    'Authorization: Bearer <github-app-jwt>',
-    '-H',
-    'Accept: application/vnd.github+json',
-    '-H',
-    'X-GitHub-Api-Version: 2022-11-28',
-    'https://api.github.com/app',
-  ], ` > ${shellQuote(join(outDir, 'github-app.json'))}`))
+    'node',
+    'scripts/github-app-permissions-receipt.mjs',
+    '--export-app',
+    '--out-dir',
+    outDir,
+    '--app',
+    'mupot',
+    '--app-id',
+    '<github-app-id>',
+    '--private-key-file',
+    '<path-to-pkcs8-private-key.pem>',
+  ]))
   lines.push(commandLine([
     'node',
     'scripts/github-app-permissions-receipt.mjs',
