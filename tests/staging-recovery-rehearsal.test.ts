@@ -66,7 +66,7 @@ function passingEvidence(step: string): Record<string, unknown> {
     case 'failure_reporting':
       return { ops_failure_visible: true, tail_or_log_reference: 'wrangler-tail-error-window-1' }
     case 'final_validation':
-      return { health: true, mcp_health: true, owner_login: true, agent_presence: true }
+      return { health: true, mcp_health: true, owner_login: true, agent_presence: true, active_validation_git_sha: TARGET_SHA }
     default:
       throw new Error(`unknown step ${step}`)
   }
@@ -203,6 +203,26 @@ describe('staging recovery rehearsal checker', () => {
       expect.objectContaining({ ok: false, check: 'rollback_returns_to_previous_git_sha' }),
       expect.objectContaining({ ok: false, check: 'rollback_recovery_returns_to_target_git_sha' }),
     ]))
+  })
+
+  it('fails when final validation ran on a different deployment than the recovered candidate', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, step) => {
+      if (step === 'final_validation') {
+        const evidence = receipt.evidence as Record<string, string>
+        evidence.active_validation_git_sha = PREVIOUS_SHA
+      }
+    })
+
+    const receipt = checkBundle({ outDir: dir, pot: 'staging', baseUrl: 'https://staging.mupot.test' })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'final_validation_runs_target_git_sha',
+      active_validation_git_sha: PREVIOUS_SHA,
+      target_git_sha: TARGET_SHA,
+    }))
   })
 
   it('fails when required evidence is missing', () => {

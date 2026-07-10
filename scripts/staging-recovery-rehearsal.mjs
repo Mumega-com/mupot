@@ -47,7 +47,7 @@ export const REQUIRED_STEPS = [
   {
     step: 'final_validation',
     file: 'final-validation.json',
-    evidence: ['health', 'mcp_health', 'owner_login', 'agent_presence'],
+    evidence: ['health', 'mcp_health', 'owner_login', 'agent_presence', 'active_validation_git_sha'],
   },
 ]
 
@@ -454,6 +454,7 @@ export function checkBundle(opts = {}) {
   const upgradeDeployedSha = evidenceString(receiptByStep.get('upgrade'), 'deployed_sha')
   const rolledBackToSha = evidenceString(receiptByStep.get('rollback'), 'rolled_back_to_sha')
   const recoveredToSha = evidenceString(receiptByStep.get('rollback'), 'recovered_to_sha')
+  const activeValidationSha = evidenceString(receiptByStep.get('final_validation'), 'active_validation_git_sha')
 
   for (const [field, value] of [
     ['backup.source_git_sha', backupSourceSha],
@@ -487,6 +488,13 @@ export function checkBundle(opts = {}) {
   pushCheck(checks, Boolean(recoveredToSha && upgradeDeployedSha && recoveredToSha === upgradeDeployedSha), 'rollback_recovery_returns_to_target_git_sha', {
     recovered_to_sha: recoveredToSha || null,
     target_git_sha: upgradeDeployedSha || null,
+  })
+  pushCheck(checks, isGitSha(activeValidationSha), 'final_validation_git_sha_valid', {
+    active_validation_git_sha: activeValidationSha || null,
+  })
+  pushCheck(checks, Boolean(activeValidationSha && target.git_sha && activeValidationSha === target.git_sha), 'final_validation_runs_target_git_sha', {
+    active_validation_git_sha: activeValidationSha || null,
+    target_git_sha: target.git_sha,
   })
 
   const failed = checks.filter((check) => check.ok === false)
