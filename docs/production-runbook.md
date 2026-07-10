@@ -43,10 +43,11 @@ Provision a new pot:
 ```bash
 npx wrangler login
 scripts/provision-pot.sh "$POT"
-cp wrangler.example.toml "$CONFIG"
 ```
 
-Paste the printed resource IDs and names into `$CONFIG`, then review:
+`scripts/provision-pot.sh "$POT"` writes `$CONFIG`, creates the isolated
+resources, and applies remote migrations. Review the generated bindings before
+the first deploy:
 
 ```bash
 grep -nE 'name =|TENANT_SLUG|binding =|database_name|database_id|index_name|queue =|bucket_name' "$CONFIG"

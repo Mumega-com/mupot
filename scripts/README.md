@@ -121,6 +121,16 @@ from there the in-app setup wizard walks you through seeding your org
 > Tip: if `secret put` complains the Worker doesn't exist yet, run `npm run deploy`
 > once first (step 4), then `bash scripts/secrets.sh`. Re-deploy afterward.
 
+For an additional isolated pot in the same checkout, use a slug instead of
+copying resource identifiers by hand:
+
+```bash
+bash scripts/setup.sh --pot acme
+npx wrangler deploy --config wrangler.acme.toml
+bash scripts/secrets.sh --pot acme
+npx wrangler deploy --config wrangler.acme.toml
+```
+
 ## What `setup.sh` does
 
 Idempotent provisioner — detects already-created resources and skips them, and
@@ -138,6 +148,9 @@ leaves any id already present in `wrangler.toml` untouched. It creates:
 
 Then it applies the D1 migrations remotely (`wrangler d1 migrations apply mupot
 --remote`). Re-running after a partial failure picks up where it left off.
+
+With `--pot acme`, the script instead provisions `mupot-acme` resources,
+writes `wrangler.acme.toml`, and applies migrations through that config.
 
 ## What `secrets.sh` does
 

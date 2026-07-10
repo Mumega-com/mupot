@@ -1,6 +1,7 @@
-# mupot — Cloudflare bindings TEMPLATE. Copy this to wrangler.<yourpot>.toml, set YOUR
-# account_id + create YOUR resources (D1/KV/Vectorize/Queues/R2) + paste YOUR ids, then
-# `wrangler deploy --config wrangler.<yourpot>.toml`. All <YOUR_*> below are placeholders.
+# mupot — Cloudflare bindings TEMPLATE. For a new isolated pot, run
+# `bash scripts/setup.sh --pot <yourpot>` to create resources, write
+# wrangler.<yourpot>.toml, and apply migrations. The manual path may copy this template,
+# create the resources, and replace the <YOUR_*> placeholders before deployment.
 # This file is the BINDING CONTRACT every component builds against (see src/types.ts Env).
 name = "mupot"
 main = "src/index.ts"
