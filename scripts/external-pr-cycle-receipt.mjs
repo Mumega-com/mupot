@@ -170,6 +170,7 @@ export function formatPlan(opts = {}) {
   lines.push('- Use the real GitHub Project board and a real agent provisioned in the pot.')
   lines.push('- Keep GitHub tokens, Mupot member tokens, webhook secrets, cookies, and private keys out of receipts.')
   lines.push('- Each step receipt must use receipt_type "mupot-external-pr-cycle-step/v1" and status "pass".')
+  lines.push('- Each step receipt must include a parseable ISO-8601 observed_at value, and observed_at values must follow the board -> task -> agent -> PR -> linkback -> CI -> final verification order below.')
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', outDir]))
   lines.push('')
@@ -363,11 +364,22 @@ function normalizeRepo(repo) {
   return String(repo || '').trim().toLowerCase()
 }
 
+function observedAtMs(receipt) {
+  const raw = typeof receipt?.observed_at === 'string' ? receipt.observed_at.trim() : ''
+  const ms = raw ? Date.parse(raw) : NaN
+  return {
+    raw,
+    ms,
+    ok: Boolean(raw) && Number.isFinite(ms),
+  }
+}
+
 export function checkBundle(opts = {}) {
   const outDir = opts.outDir ? resolve(opts.outDir) : ''
   const checks = []
   const artifacts = {}
   const receipts = []
+  const timeline = []
 
   pushCheck(checks, Boolean(outDir), 'out_dir_arg_present', { out_dir: outDir })
   pushCheck(checks, Boolean(outDir && existsSync(outDir)), 'out_dir_exists', { out_dir: outDir })
@@ -421,8 +433,9 @@ export function checkBundle(opts = {}) {
       actual: receipt?.status ?? null,
     })
 
-    const observedAt = Date.parse(String(receipt?.observed_at ?? receipt?.completed_at ?? ''))
-    pushCheck(checks, Number.isFinite(observedAt), 'step_observed_at_iso', { step: step.step, path, value: receipt?.observed_at ?? receipt?.completed_at ?? null })
+    const observed = observedAtMs(receipt)
+    pushCheck(checks, observed.ok, 'step_observed_at_iso', { step: step.step, path, value: observed.raw || null })
+    if (observed.ok) timeline.push({ step: step.step, path, observed_at: observed.raw, observed_ms: observed.ms })
 
     const evidence = receipt?.evidence && typeof receipt.evidence === 'object' ? receipt.evidence : {}
     for (const key of step.evidence) {
@@ -458,6 +471,17 @@ export function checkBundle(opts = {}) {
       step: step.step,
       path,
       findings: secretFindings.slice(0, 20),
+    })
+  }
+
+  for (let index = 1; index < timeline.length; index += 1) {
+    const previous = timeline[index - 1]
+    const current = timeline[index]
+    pushCheck(checks, current.observed_ms >= previous.observed_ms, 'external_pr_cycle_steps_observed_in_order', {
+      previous_step: previous.step,
+      previous_observed_at: previous.observed_at,
+      step: current.step,
+      observed_at: current.observed_at,
     })
   }
 
@@ -501,6 +525,7 @@ export function checkBundle(opts = {}) {
     checked_at: new Date().toISOString(),
     out_dir: outDir,
     target,
+    timeline: timeline.map(({ step, observed_at }) => ({ step, observed_at })),
     required_steps: REQUIRED_STEPS.map(({ step, file, evidence, links }) => ({ step, file, evidence, links })),
     artifacts,
     summary: {
@@ -556,4 +581,3 @@ if (entry && entry === fileURLToPath(import.meta.url)) {
     process.exitCode = 1
   }
 }
-
