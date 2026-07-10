@@ -328,7 +328,7 @@ const toolRegisterAgentKey: ToolSpec = {
   name: 'register_agent_key',
   scope: "agent's squad",
   min: 'admin',
-  args: '{ agent: string (id|slug), public_key: string (Ed25519 JWK x), key_id?: exact agent slug or id }',
+  args: '{ agent: string (id|slug), public_key: string (Ed25519 JWK x), key_id?: exact agent id (default; slug only for legacy compatibility) }',
   inputSchema: {
     type: 'object',
     properties: { agent: STRING_SCHEMA, public_key: STRING_SCHEMA, key_id: STRING_SCHEMA },
@@ -353,7 +353,9 @@ const toolRegisterAgentKey: ToolSpec = {
       return fail(400, 'invalid_public_key', 'public_key must be a canonical Ed25519 JWK x value')
     }
 
-    const keyId = str(args.key_id) ?? agent.slug
+    // Signed inbox delivery addresses the canonical agent ID. Defaulting runtime
+    // keys to that same ID keeps attach, inbox, and lifecycle control aligned.
+    const keyId = str(args.key_id) ?? agent.id
     if (keyId !== agent.slug && keyId !== agent.id) {
       return fail(400, 'invalid_key_id', 'key_id must exactly match the resolved agent slug or id')
     }

@@ -328,7 +328,8 @@ and exiting `0` so the daemon consumes the batch.
      Register each generated public `AGENT_PUBKEY` through the admin-gated MCP
      `register_agent_key` tool. For the consumer pass `agent:"fleet-consumer"`
      and `key_id` equal to the returned consumer ID. For a normal runtime omit
-     `key_id`; Mupot uses the resolved agent's canonical slug. The tool derives
+     `key_id`; Mupot uses the resolved agent's canonical database ID so signed
+     attach, inbox delivery, and lifecycle control share one identity. The tool derives
      the member binding from the agent's unique active welded token, stores only
      public material, is idempotent for the same binding, and refuses silent key
      replacement. Do not use direct D1 writes for this ceremony.
