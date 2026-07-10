@@ -71,6 +71,8 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'release-readiness-check.json',
       'mupot-v023-release-readiness/v1',
       'github-app.json',
+      'github-app-permissions-check.json',
+      'mupot-github-app-permissions/v1',
       'GET /app',
       'Workflows disabled',
     ]) {
@@ -105,6 +107,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'node --test fleet-runtime/*.test.mjs',
       'bash scripts/ci-local-evidence.sh',
       'npm run receipt:fresh-install:plan',
+      'npm run receipt:github-app-permissions:plan',
       'npm run receipt:work-lifecycle:plan',
       'npm run receipt:external-pr-cycle:plan',
       'npm run receipt:staging-recovery:plan',
@@ -121,6 +124,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     expect(pkg.scripts['smoke:local']).toBe('node scripts/local-browser-smoke.mjs')
     expect(pkg.scripts['conformance:runtime:local']).toBe('node scripts/local-runtime-conformance.mjs')
     expect(pkg.scripts['receipt:fresh-install:check']).toBe('node scripts/fresh-install-receipt.mjs --check')
+    expect(pkg.scripts['receipt:github-app-permissions:check']).toBe('node scripts/github-app-permissions-receipt.mjs --check')
     expect(pkg.scripts['receipt:work-lifecycle:check']).toBe('node scripts/work-lifecycle-receipt.mjs --check')
     expect(pkg.scripts['receipt:external-pr-cycle:check']).toBe('node scripts/external-pr-cycle-receipt.mjs --check')
     expect(pkg.scripts['receipt:staging-recovery:check']).toBe('node scripts/staging-recovery-rehearsal.mjs --check')

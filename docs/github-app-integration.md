@@ -125,6 +125,16 @@ must include a redacted `GET /app` export whose `permissions` object has only:
 `metadata:"read"`, `contents:"write"`, `issues:"write"`, `pull_requests:"write"`,
 and `organization_projects:"read"`.
 
+Use the dedicated receipt checker before closing #151:
+
+```bash
+npm run receipt:github-app-permissions:plan -- --app mupot
+npm run receipt:github-app-permissions:check -- \
+  --app mupot \
+  --out-dir tmp/github-app-permissions/mupot \
+  > tmp/github-app-permissions/mupot/github-app-permissions-check.json
+```
+
 ## Roadmap (remaining)
 
 - [x] Agent-def writer — `writeAgentDef`

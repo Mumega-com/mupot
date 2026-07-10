@@ -33,6 +33,8 @@
     "receipt:staging-recovery:check": "node scripts/staging-recovery-rehearsal.mjs --check",
     "receipt:external-pr-cycle:plan": "node scripts/external-pr-cycle-receipt.mjs --plan",
     "receipt:external-pr-cycle:check": "node scripts/external-pr-cycle-receipt.mjs --check",
+    "receipt:github-app-permissions:plan": "node scripts/github-app-permissions-receipt.mjs --plan",
+    "receipt:github-app-permissions:check": "node scripts/github-app-permissions-receipt.mjs --check",
     "receipt:production-soak:plan": "node scripts/production-soak-receipt.mjs --plan",
     "receipt:production-soak:check": "node scripts/production-soak-receipt.mjs --check",
     "receipt:release-integrity:plan": "node scripts/release-integrity-receipt.mjs --plan",

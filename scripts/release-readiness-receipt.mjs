@@ -9,6 +9,12 @@ import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  CHECK_RECEIPT_TYPE as GITHUB_APP_PERMISSIONS_RECEIPT_TYPE,
+  REQUIRED_APP_PERMISSIONS,
+} from './github-app-permissions-receipt.mjs'
+
+export { REQUIRED_APP_PERMISSIONS } from './github-app-permissions-receipt.mjs'
 
 export const CHECK_RECEIPT_TYPE = 'mupot-v023-release-readiness/v1'
 
@@ -21,6 +27,7 @@ export const REQUIRED_RECEIPTS = [
   { objective: 2, issue: 274, file: 'host-go/cutover-gate.json', receipt_type: 'mupot-sos-cutover-gate/v1' },
   { objective: 2, issue: 274, file: 'host-go/export-receipt.json', receipt_type: 'mupot-fleet-receipt-bundle-export/v1' },
   { objective: 2, issue: 274, file: 'host-go/manifest-check.json', receipt_type: 'mupot-fleet-receipt-bundle-check/v1' },
+  { objective: 3, issue: 151, file: 'github-app-permissions-check.json', receipt_type: GITHUB_APP_PERMISSIONS_RECEIPT_TYPE },
   { objective: 4, issue: 283, file: 'work-lifecycle-check.json', receipt_type: 'mupot-work-lifecycle/v1' },
   { objective: 5, issue: 150, file: 'external-pr-cycle-check.json', receipt_type: 'mupot-external-pr-cycle/v1' },
   { objective: 7, issue: 279, file: 'staging-recovery-check.json', receipt_type: 'mupot-staging-recovery-rehearsal/v1' },
@@ -29,14 +36,6 @@ export const REQUIRED_RECEIPTS = [
 ]
 
 export const REQUIRED_ISSUES = [150, 151, 274, 277, 279, 280, 281, 282, 283]
-
-export const REQUIRED_APP_PERMISSIONS = {
-  metadata: 'read',
-  contents: 'write',
-  issues: 'write',
-  pull_requests: 'write',
-  organization_projects: 'read',
-}
 
 export const REQUIRED_CHECKS = [
   'build',
@@ -171,6 +170,16 @@ export function formatPlan(opts = {}) {
   lines.push('')
   lines.push('Export the live GitHub App definition after #151 is remediated (GET /app):')
   lines.push(commandLine([
+    'npm',
+    'run',
+    'receipt:github-app-permissions:plan',
+    '--',
+    '--app',
+    'mupot',
+    '--out-dir',
+    outDir,
+  ]))
+  lines.push(commandLine([
     'curl',
     '-fsSL',
     '-H',
@@ -181,6 +190,15 @@ export function formatPlan(opts = {}) {
     'X-GitHub-Api-Version: 2022-11-28',
     'https://api.github.com/app',
   ], ` > ${shellQuote(join(outDir, 'github-app.json'))}`))
+  lines.push(commandLine([
+    'node',
+    'scripts/github-app-permissions-receipt.mjs',
+    '--check',
+    '--out-dir',
+    outDir,
+    '--app',
+    'mupot',
+  ], ` > ${shellQuote(join(outDir, 'github-app-permissions-check.json'))}`))
   lines.push('')
   lines.push('Check the aggregate evidence:')
   lines.push(commandLine([

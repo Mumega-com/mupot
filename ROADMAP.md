@@ -94,7 +94,8 @@ Required proof:
   inbox, and lifecycle control evidence.
 - No unresolved P0/P1 security findings across tenant, squad RBAC, GitHub,
   replay, webhook, and self-verdict surfaces, including GitHub App
-  least-privilege proof for #151.
+  least-privilege proof for #151 with a passing
+  `mupot-github-app-permissions/v1` evidence receipt.
 - One task lifecycle through the product: create -> execute -> approve ->
   complete -> audit, with a passing `mupot-work-lifecycle/v1` evidence receipt.
 - One external board -> Mupot task -> agent -> GitHub PR cycle with the PR
