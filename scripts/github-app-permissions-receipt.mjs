@@ -11,6 +11,8 @@ import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const CHECK_RECEIPT_TYPE = 'mupot-github-app-permissions/v1'
+export const APP_FILE = 'github-app.json'
+export const INSTALLATION_FILE = 'github-installation.json'
 
 export const REQUIRED_APP_PERMISSIONS = {
   metadata: 'read',
@@ -34,6 +36,7 @@ export function parseArgs(argv) {
     outDir: '',
     app: '',
     appId: '',
+    installationId: '',
     privateKeyFile: '',
     apiUrl: 'https://api.github.com/app',
     exportApp: false,
@@ -54,6 +57,7 @@ export function parseArgs(argv) {
     if (arg === '--out-dir') opts.outDir = resolve(next())
     else if (arg === '--app') opts.app = next()
     else if (arg === '--app-id') opts.appId = next()
+    else if (arg === '--installation-id') opts.installationId = next()
     else if (arg === '--private-key-file') opts.privateKeyFile = resolve(next())
     else if (arg === '--api-url') opts.apiUrl = next()
     else if (arg === '--export-app') opts.exportApp = true
@@ -79,6 +83,7 @@ export function usage() {
     '  --out-dir <path>    evidence directory',
     '  --app <slug>        expected GitHub App slug, for example mupot',
     '  --app-id <id>       GitHub App ID for --export-app',
+    '  --installation-id <id> installed GitHub App ID for export and check',
     '  --private-key-file <path> PKCS#8 GitHub App private key PEM for --export-app',
     '  --api-url <url>     GitHub App API URL for --export-app; default https://api.github.com/app',
     '  -h, --help          show this help',
@@ -99,6 +104,10 @@ function defaultOutDir(opts) {
   return opts.outDir || `tmp/github-app-permissions/${opts.app || '<app-slug>'}`
 }
 
+function installationIdValid(value) {
+  return /^[1-9]\d*$/.test(String(value || ''))
+}
+
 export function formatPlan(opts = {}) {
   const app = opts.app || '<app-slug>'
   const outDir = defaultOutDir(opts)
@@ -117,7 +126,7 @@ export function formatPlan(opts = {}) {
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', outDir]))
   lines.push('')
-  lines.push('Export the live GitHub App definition with GET /app and an App-authentication JWT. The script writes only redacted App metadata plus permissions:')
+  lines.push('Export the live App definition and installed App with one App-authentication JWT. The script writes only redacted metadata plus effective permissions:')
   lines.push(commandLine([
     'node',
     'scripts/github-app-permissions-receipt.mjs',
@@ -128,22 +137,13 @@ export function formatPlan(opts = {}) {
     app,
     '--app-id',
     '<github-app-id>',
+    '--installation-id',
+    '<github-app-installation-id>',
     '--private-key-file',
     '<path-to-pkcs8-private-key.pem>',
   ]))
   lines.push('')
-  lines.push('Manual fallback if you already have an App-authentication JWT:')
-  lines.push(commandLine([
-    'curl',
-    '-fsSL',
-    '-H',
-    'Authorization: Bearer <github-app-jwt>',
-    '-H',
-    'Accept: application/vnd.github+json',
-    '-H',
-    'X-GitHub-Api-Version: 2022-11-28',
-    'https://api.github.com/app',
-  ], ` > ${shellQuote(join(outDir, 'github-app.json'))}`))
+  lines.push(`The export writes ${join(outDir, APP_FILE)} from GET /app and ${join(outDir, INSTALLATION_FILE)} from GET /app/installations/<installation-id>.`)
   lines.push('')
   lines.push('Check the evidence:')
   lines.push(commandLine([
@@ -154,6 +154,8 @@ export function formatPlan(opts = {}) {
     outDir,
     '--app',
     app,
+    '--installation-id',
+    '<github-app-installation-id>',
   ], ` > ${shellQuote(join(outDir, 'github-app-permissions-check.json'))}`))
   lines.push(commandLine([
     'node',
@@ -164,6 +166,8 @@ export function formatPlan(opts = {}) {
     outDir,
     '--app',
     app,
+    '--installation-id',
+    '<github-app-installation-id>',
   ]))
   return `${lines.join('\n')}\n`
 }
@@ -209,14 +213,37 @@ export function redactAppDefinition(app) {
   }
 }
 
-export async function exportAppDefinition(opts = {}, fetchImpl = fetch) {
-  if (!opts.outDir) throw new Error('--out-dir is required for --export-app')
-  if (!opts.appId) throw new Error('--app-id is required for --export-app')
-  if (!opts.privateKeyFile) throw new Error('--private-key-file is required for --export-app')
+export function redactInstallationDefinition(installation) {
+  return {
+    id: installation?.id ?? null,
+    app_id: installation?.app_id ?? null,
+    app_slug: installation?.app_slug ?? null,
+    target_id: installation?.target_id ?? null,
+    target_type: installation?.target_type ?? null,
+    repository_selection: installation?.repository_selection ?? null,
+    account: installation?.account && typeof installation.account === 'object'
+      ? {
+          login: installation.account.login ?? null,
+          id: installation.account.id ?? null,
+          type: installation.account.type ?? null,
+        }
+      : null,
+    permissions: appPermissions(installation),
+    created_at: installation?.created_at ?? null,
+    updated_at: installation?.updated_at ?? null,
+    suspended_at: installation?.suspended_at ?? null,
+  }
+}
 
-  const privateKeyPem = readFileSync(opts.privateKeyFile, 'utf8')
-  const jwt = createAppJwt(opts.appId, privateKeyPem, opts.nowSeconds ?? Math.floor(Date.now() / 1000))
-  const res = await fetchImpl(opts.apiUrl || 'https://api.github.com/app', {
+function installationApiUrl(apiUrl, installationId) {
+  const url = new URL(apiUrl)
+  if (!/\/app\/?$/.test(url.pathname)) throw new Error('--api-url must end with /app')
+  url.pathname = url.pathname.replace(/\/app\/?$/, `/app/installations/${encodeURIComponent(installationId)}`)
+  return url.toString()
+}
+
+async function fetchGitHubJson(fetchImpl, url, jwt) {
+  const res = await fetchImpl(url, {
     headers: {
       Authorization: `Bearer ${jwt}`,
       Accept: 'application/vnd.github+json',
@@ -224,15 +251,40 @@ export async function exportAppDefinition(opts = {}, fetchImpl = fetch) {
       'User-Agent': 'mupot-release-evidence',
     },
   })
-  if (!res.ok) throw new Error(`GET /app failed with HTTP ${res.status}`)
-  const redacted = redactAppDefinition(await res.json())
-  if (opts.app && redacted.slug !== opts.app) {
-    throw new Error(`GET /app returned slug ${redacted.slug ?? '<missing>'}, expected ${opts.app}`)
+  if (!res.ok) throw new Error(`GET ${new URL(url).pathname} failed with HTTP ${res.status}`)
+  return res.json()
+}
+
+export async function exportAppDefinition(opts = {}, fetchImpl = fetch) {
+  if (!opts.outDir) throw new Error('--out-dir is required for --export-app')
+  if (!opts.appId) throw new Error('--app-id is required for --export-app')
+  if (!installationIdValid(opts.installationId)) throw new Error('--installation-id must be a positive numeric GitHub installation ID')
+  if (!opts.privateKeyFile) throw new Error('--private-key-file is required for --export-app')
+
+  const privateKeyPem = readFileSync(opts.privateKeyFile, 'utf8')
+  const jwt = createAppJwt(opts.appId, privateKeyPem, opts.nowSeconds ?? Math.floor(Date.now() / 1000))
+  const apiUrl = opts.apiUrl || 'https://api.github.com/app'
+  const app = redactAppDefinition(await fetchGitHubJson(fetchImpl, apiUrl, jwt))
+  if (opts.app && app.slug !== opts.app) {
+    throw new Error(`GET /app returned slug ${app.slug ?? '<missing>'}, expected ${opts.app}`)
+  }
+  const installationUrl = installationApiUrl(apiUrl, opts.installationId)
+  const installation = redactInstallationDefinition(await fetchGitHubJson(fetchImpl, installationUrl, jwt))
+  if (String(installation.id ?? '') !== String(opts.installationId)) {
+    throw new Error(`GET /app/installations returned id ${installation.id ?? '<missing>'}, expected ${opts.installationId}`)
+  }
+  if (String(installation.app_id ?? '') !== String(app.id ?? '')) {
+    throw new Error(`installation app_id ${installation.app_id ?? '<missing>'} does not match App id ${app.id ?? '<missing>'}`)
+  }
+  if (installation.app_slug !== app.slug) {
+    throw new Error(`installation app_slug ${installation.app_slug ?? '<missing>'} does not match App slug ${app.slug ?? '<missing>'}`)
   }
   mkdirSync(opts.outDir, { recursive: true })
-  const outPath = join(opts.outDir, 'github-app.json')
-  writeFileSync(outPath, `${JSON.stringify(redacted, null, 2)}\n`)
-  return { path: outPath, app: redacted }
+  const outPath = join(opts.outDir, APP_FILE)
+  const installationPath = join(opts.outDir, INSTALLATION_FILE)
+  writeFileSync(outPath, `${JSON.stringify(app, null, 2)}\n`)
+  writeFileSync(installationPath, `${JSON.stringify(installation, null, 2)}\n`)
+  return { path: outPath, installationPath, app, installation }
 }
 
 function scanSecretText(text, path) {
@@ -270,8 +322,13 @@ function artifactMeta(path, parsed) {
     exists: true,
     bytes: text.byteLength,
     sha256: createHash('sha256').update(text).digest('hex'),
-    app_slug: parsed?.slug ?? null,
+    app_slug: parsed?.slug ?? parsed?.app_slug ?? null,
   }
+}
+
+function unexpectedKeys(value, allowed) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ['<not-an-object>']
+  return Object.keys(value).filter((key) => !allowed.has(key))
 }
 
 function appPermissions(parsed) {
@@ -281,45 +338,111 @@ function appPermissions(parsed) {
   return {}
 }
 
-function permissionLevel(value) {
-  const normalized = String(value ?? 'none').toLowerCase()
-  if (normalized === 'read' || normalized === 'write') return normalized
-  return 'none'
+function permissionDisplay(value) {
+  if (value === undefined) return 'none'
+  return typeof value === 'string' ? value.toLowerCase() : String(value)
+}
+
+export function inspectPermissionSet(parsed) {
+  const permissions = appPermissions(parsed)
+  const entries = Object.entries(permissions)
+  return {
+    permissions,
+    entries,
+    invalid: entries
+      .filter(([, value]) => value !== 'read' && value !== 'write')
+      .map(([permission, value]) => ({ permission, actual: permissionDisplay(value) })),
+    extras: entries
+      .filter(([permission]) => !(permission in REQUIRED_APP_PERMISSIONS))
+      .map(([permission, value]) => ({ permission, actual: permissionDisplay(value) })),
+    workflows_present: Object.hasOwn(permissions, 'workflows'),
+    workflows_actual: permissionDisplay(permissions.workflows),
+  }
+}
+
+function checkPermissionSet(checks, parsed, prefix) {
+  const inspected = inspectPermissionSet(parsed)
+  pushCheck(checks, inspected.entries.length > 0, `${prefix}_permissions_exported`, { count: inspected.entries.length })
+  pushCheck(checks, inspected.invalid.length === 0, `${prefix}_permission_values_valid`, { invalid: inspected.invalid })
+  for (const [permission, expected] of Object.entries(REQUIRED_APP_PERMISSIONS)) {
+    const actual = permissionDisplay(inspected.permissions[permission])
+    pushCheck(checks, actual === expected, `${prefix}_permission_matches`, {
+      permission,
+      expected,
+      actual,
+    })
+  }
+  pushCheck(checks, !inspected.workflows_present, `${prefix}_workflows_disabled`, {
+    actual: inspected.workflows_actual,
+  })
+  pushCheck(checks, inspected.extras.length === 0, `${prefix}_has_no_extra_permissions`, { extras: inspected.extras })
+  return inspected
 }
 
 export function checkBundle(opts = {}) {
   const outDir = resolve(defaultOutDir(opts))
   const checks = []
-  const appPath = join(outDir, 'github-app.json')
+  const appPath = join(outDir, APP_FILE)
+  const installationPath = join(outDir, INSTALLATION_FILE)
   const appJson = readJson(checks, appPath, 'github_app')
-  const permissions = appPermissions(appJson)
-  const permissionEntries = Object.entries(permissions)
+  const installationJson = readJson(checks, installationPath, 'github_installation')
 
   pushCheck(checks, existsSync(outDir), 'evidence_directory_present', { out_dir: outDir })
-  pushCheck(checks, permissionEntries.length > 0, 'github_app_permissions_exported', { count: permissionEntries.length })
+  pushCheck(checks, installationIdValid(opts.installationId), 'github_installation_id_expected', { expected: opts.installationId || null })
   if (opts.app) {
     pushCheck(checks, appJson?.slug === opts.app, 'github_app_slug_matches', {
       expected: opts.app,
       actual: appJson?.slug ?? null,
     })
   }
-
-  for (const [permission, expected] of Object.entries(REQUIRED_APP_PERMISSIONS)) {
-    const actual = permissionLevel(permissions[permission])
-    pushCheck(checks, actual === expected, 'github_app_permission_matches', {
-      permission,
-      expected,
-      actual,
-    })
-  }
-
-  const extras = permissionEntries
-    .filter(([permission, value]) => !(permission in REQUIRED_APP_PERMISSIONS) && permissionLevel(value) !== 'none')
-    .map(([permission, value]) => ({ permission, actual: permissionLevel(value) }))
-  pushCheck(checks, permissionLevel(permissions.workflows) === 'none', 'github_app_workflows_disabled', {
-    actual: permissionLevel(permissions.workflows),
+  const appExtraFields = unexpectedKeys(appJson, new Set(['id', 'slug', 'name', 'html_url', 'owner', 'permissions']))
+  const appOwnerExtraFields = unexpectedKeys(appJson?.owner, new Set(['login', 'id', 'type']))
+  pushCheck(checks, appExtraFields.length === 0 && appOwnerExtraFields.length === 0, 'github_app_export_redacted', {
+    extra_fields: appExtraFields,
+    owner_extra_fields: appOwnerExtraFields,
   })
-  pushCheck(checks, extras.length === 0, 'github_app_has_no_extra_permissions', { extras })
+  const installationExtraFields = unexpectedKeys(installationJson, new Set([
+    'id',
+    'app_id',
+    'app_slug',
+    'target_id',
+    'target_type',
+    'repository_selection',
+    'account',
+    'permissions',
+    'created_at',
+    'updated_at',
+    'suspended_at',
+  ]))
+  const installationAccountExtraFields = unexpectedKeys(installationJson?.account, new Set(['login', 'id', 'type']))
+  pushCheck(checks, installationExtraFields.length === 0 && installationAccountExtraFields.length === 0, 'github_installation_export_redacted', {
+    extra_fields: installationExtraFields,
+    account_extra_fields: installationAccountExtraFields,
+  })
+
+  pushCheck(checks, String(installationJson?.id ?? '') === String(opts.installationId ?? ''), 'github_installation_id_matches', {
+    expected: opts.installationId || null,
+    actual: installationJson?.id ?? null,
+  })
+  pushCheck(checks, String(installationJson?.app_id ?? '') === String(appJson?.id ?? ''), 'github_installation_app_id_matches', {
+    expected: appJson?.id ?? null,
+    actual: installationJson?.app_id ?? null,
+  })
+  pushCheck(checks, Boolean(appJson?.slug) && installationJson?.app_slug === appJson?.slug, 'github_installation_app_slug_matches', {
+    expected: appJson?.slug ?? null,
+    actual: installationJson?.app_slug ?? null,
+  })
+  pushCheck(checks, Boolean(installationJson?.account?.login && installationJson?.account?.id), 'github_installation_account_present', {
+    account: installationJson?.account ?? null,
+  })
+  pushCheck(checks, installationJson?.suspended_at === null, 'github_installation_active', {
+    suspended_at: installationJson?.suspended_at ?? null,
+  })
+  pushCheck(checks, Number.isFinite(Date.parse(String(installationJson?.updated_at ?? ''))), 'github_installation_updated_at_parseable', {
+    updated_at: installationJson?.updated_at ?? null,
+  })
+  checkPermissionSet(checks, appJson, 'github_app')
+  checkPermissionSet(checks, installationJson, 'github_installation')
 
   const failed = checks.filter((check) => check.ok === false)
   const passed = checks.filter((check) => check.ok === true)
@@ -334,6 +457,13 @@ export function checkBundle(opts = {}) {
       id: appJson?.id ?? null,
       html_url: appJson?.html_url ?? null,
     },
+    installation: {
+      expected_id: opts.installationId || null,
+      id: installationJson?.id ?? null,
+      account: installationJson?.account ?? null,
+      repository_selection: installationJson?.repository_selection ?? null,
+      updated_at: installationJson?.updated_at ?? null,
+    },
     summary: {
       passed: passed.length,
       failed: failed.length,
@@ -345,11 +475,12 @@ export function checkBundle(opts = {}) {
       forbidden: ['workflows', 'members', 'organization_secrets', 'organization_personal_access_tokens', 'organization_self_hosted_runners', 'organization_custom_org_roles', 'actions', 'hooks', 'organization_plan'],
     },
     artifacts: {
-      'github-app.json': artifactMeta(appPath, appJson),
+      [APP_FILE]: artifactMeta(appPath, appJson),
+      [INSTALLATION_FILE]: artifactMeta(installationPath, installationJson),
     },
     checks,
     next_steps: failed.length === 0
-      ? ['attach github-app-permissions-check.json and github-app.json to #151, then close #151']
+      ? [`attach github-app-permissions-check.json, ${APP_FILE}, and ${INSTALLATION_FILE} to #151, then close #151`]
       : ['fix the live GitHub App permissions, re-accept the installation, export GET /app again, then rerun this check'],
   }
 }
@@ -388,7 +519,12 @@ function main() {
             id: result.app.id,
             html_url: result.app.html_url,
           },
-          next_step: 'run this script again with --check to validate github-app.json',
+          installation: {
+            path: result.installationPath,
+            id: result.installation.id,
+            account: result.installation.account,
+          },
+          next_step: `run this script again with --check --installation-id ${result.installation.id} to validate both exports`,
         }, null, 2))
       })
       .catch((err) => {

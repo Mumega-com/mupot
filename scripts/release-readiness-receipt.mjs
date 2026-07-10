@@ -10,8 +10,11 @@ import { existsSync, readFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
+  APP_FILE,
   CHECK_RECEIPT_TYPE as GITHUB_APP_PERMISSIONS_RECEIPT_TYPE,
+  INSTALLATION_FILE,
   REQUIRED_APP_PERMISSIONS,
+  inspectPermissionSet,
 } from './github-app-permissions-receipt.mjs'
 
 export { REQUIRED_APP_PERMISSIONS } from './github-app-permissions-receipt.mjs'
@@ -184,8 +187,8 @@ export function formatPlan(opts = {}) {
     'name,state,link,bucket',
   ], ` > ${shellQuote(join(outDir, 'github-checks.json'))}`))
   lines.push('')
-  lines.push('Export the live GitHub App definition after #151 is remediated (GET /app):')
-  lines.push(`The export command writes ${join(outDir, 'github-app.json')}.`)
+  lines.push('Export the live GitHub App definition and re-accepted installation after #151 is remediated (GET /app and GET /app/installations/{installation_id}):')
+  lines.push(`The export command writes ${join(outDir, APP_FILE)} and ${join(outDir, INSTALLATION_FILE)}.`)
   lines.push(commandLine([
     'npm',
     'run',
@@ -206,6 +209,8 @@ export function formatPlan(opts = {}) {
     'mupot',
     '--app-id',
     '<github-app-id>',
+    '--installation-id',
+    '<github-app-installation-id>',
     '--private-key-file',
     '<path-to-pkcs8-private-key.pem>',
   ]))
@@ -217,6 +222,8 @@ export function formatPlan(opts = {}) {
     outDir,
     '--app',
     'mupot',
+    '--installation-id',
+    '<github-app-installation-id>',
   ], ` > ${shellQuote(join(outDir, 'github-app-permissions-check.json'))}`))
   lines.push('')
   lines.push('Check the aggregate evidence:')
@@ -321,17 +328,27 @@ function checkSucceeded(entry) {
   return conclusion === 'SUCCESS' || state === 'SUCCESS' || state === 'COMPLETED' && conclusion === 'SUCCESS' || bucket === 'pass'
 }
 
-function permissionLevel(value) {
-  const normalized = String(value ?? 'none').toLowerCase()
-  if (normalized === 'read' || normalized === 'write') return normalized
-  return 'none'
+function permissionDisplay(value) {
+  if (value === undefined) return 'none'
+  return typeof value === 'string' ? value.toLowerCase() : String(value)
 }
 
-function appPermissions(parsed) {
-  if (parsed?.permissions && typeof parsed.permissions === 'object' && !Array.isArray(parsed.permissions)) {
-    return parsed.permissions
+function pushPermissionChecks(checks, parsed, prefix) {
+  const inspected = inspectPermissionSet(parsed)
+  pushCheck(checks, inspected.entries.length > 0, `${prefix}_permissions_exported`, { count: inspected.entries.length })
+  pushCheck(checks, inspected.invalid.length === 0, `${prefix}_permission_values_valid`, { invalid: inspected.invalid })
+  for (const [permission, expected] of Object.entries(REQUIRED_APP_PERMISSIONS)) {
+    const actual = permissionDisplay(inspected.permissions[permission])
+    pushCheck(checks, actual === expected, `${prefix}_permission_matches`, {
+      permission,
+      expected,
+      actual,
+    })
   }
-  return {}
+  pushCheck(checks, !inspected.workflows_present, `${prefix}_workflows_disabled`, {
+    actual: inspected.workflows_actual,
+  })
+  pushCheck(checks, inspected.extras.length === 0, `${prefix}_has_no_extra_permissions`, { extras: inspected.extras })
 }
 
 export function checkBundle(opts = {}) {
@@ -340,6 +357,7 @@ export function checkBundle(opts = {}) {
   const checksPr = expectedPrNumber(opts.checksPr)
   const checks = []
   const artifacts = {}
+  const receiptValues = new Map()
 
   pushCheck(checks, existsSync(outDir), 'evidence_directory_present', { out_dir: outDir })
   pushCheck(checks, checksPr !== null, 'checks_pr_specified', { actual: opts.checksPr ?? null })
@@ -347,6 +365,7 @@ export function checkBundle(opts = {}) {
   for (const required of REQUIRED_RECEIPTS) {
     const path = join(outDir, required.file)
     const receipt = readJson(checks, path, required.file)
+    receiptValues.set(required.file, receipt)
     artifacts[required.file] = artifactMeta(path, receipt)
     pushCheck(checks, receipt?.receipt_type === required.receipt_type, 'receipt_type_matches', {
       path,
@@ -416,25 +435,39 @@ export function checkBundle(opts = {}) {
     })
   }
 
-  const appPath = join(outDir, 'github-app.json')
+  const appPath = join(outDir, APP_FILE)
   const appJson = readJson(checks, appPath, 'github_app')
-  artifacts['github-app.json'] = artifactMeta(appPath, appJson)
-  const permissions = appPermissions(appJson)
-  for (const [permission, expected] of Object.entries(REQUIRED_APP_PERMISSIONS)) {
-    const actual = permissionLevel(permissions[permission])
-    pushCheck(checks, actual === expected, 'github_app_permission_matches', {
-      permission,
-      expected,
-      actual,
+  artifacts[APP_FILE] = artifactMeta(appPath, appJson)
+  const installationPath = join(outDir, INSTALLATION_FILE)
+  const installationJson = readJson(checks, installationPath, 'github_installation')
+  artifacts[INSTALLATION_FILE] = artifactMeta(installationPath, installationJson)
+  const permissionReceipt = receiptValues.get('github-app-permissions-check.json')
+  for (const file of [APP_FILE, INSTALLATION_FILE]) {
+    const expectedSha = permissionReceipt?.artifacts?.[file]?.sha256 ?? null
+    const actualSha = artifacts[file]?.sha256 ?? null
+    pushCheck(checks, Boolean(expectedSha && actualSha && expectedSha === actualSha), 'github_permission_artifact_matches_receipt', {
+      file,
+      expected_sha256: expectedSha,
+      actual_sha256: actualSha,
     })
   }
-  const extras = Object.entries(permissions)
-    .filter(([permission, value]) => !(permission in REQUIRED_APP_PERMISSIONS) && permissionLevel(value) !== 'none')
-    .map(([permission, value]) => ({ permission, actual: permissionLevel(value) }))
-  pushCheck(checks, permissionLevel(permissions.workflows) === 'none', 'github_app_workflows_disabled', {
-    actual: permissionLevel(permissions.workflows),
+  pushCheck(checks, String(installationJson?.app_id ?? '') === String(appJson?.id ?? ''), 'github_installation_app_id_matches', {
+    expected: appJson?.id ?? null,
+    actual: installationJson?.app_id ?? null,
   })
-  pushCheck(checks, extras.length === 0, 'github_app_has_no_extra_permissions', { extras })
+  pushCheck(checks, Boolean(appJson?.slug) && installationJson?.app_slug === appJson?.slug, 'github_installation_app_slug_matches', {
+    expected: appJson?.slug ?? null,
+    actual: installationJson?.app_slug ?? null,
+  })
+  pushCheck(checks, Boolean(installationJson?.id && installationJson?.account?.login && installationJson?.account?.id), 'github_installation_identity_present', {
+    installation_id: installationJson?.id ?? null,
+    account: installationJson?.account ?? null,
+  })
+  pushCheck(checks, installationJson?.suspended_at === null, 'github_installation_active', {
+    suspended_at: installationJson?.suspended_at ?? null,
+  })
+  pushPermissionChecks(checks, appJson, 'github_app')
+  pushPermissionChecks(checks, installationJson, 'github_installation')
 
   const failed = checks.filter((check) => check.ok === false)
   const passed = checks.filter((check) => check.ok === true)

@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -20,6 +21,10 @@ function tempDir() {
 function writeJson(path: string, value: unknown) {
   mkdirSync(dirname(path), { recursive: true })
   writeFileSync(path, JSON.stringify(value, null, 2))
+}
+
+function sha256(path: string) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex')
 }
 
 function writeBundle(dir: string, mutate?: (dir: string) => void) {
@@ -72,6 +77,25 @@ function writeBundle(dir: string, mutate?: (dir: string) => void) {
     slug: 'mupot',
     permissions: REQUIRED_APP_PERMISSIONS,
   })
+  writeJson(join(dir, 'github-installation.json'), {
+    id: 789012,
+    app_id: 123456,
+    app_slug: 'mupot',
+    account: { login: 'Mumega-com', id: 999, type: 'Organization' },
+    repository_selection: 'all',
+    permissions: REQUIRED_APP_PERMISSIONS,
+    updated_at: '2026-07-10T00:00:00.000Z',
+    suspended_at: null,
+  })
+  const permissionReceipt = REQUIRED_RECEIPTS.find((receipt) => receipt.file === 'github-app-permissions-check.json')!
+  writeJson(join(dir, permissionReceipt.file), {
+    receipt_type: permissionReceipt.receipt_type,
+    status: 'pass',
+    artifacts: {
+      'github-app.json': { sha256: sha256(join(dir, 'github-app.json')) },
+      'github-installation.json': { sha256: sha256(join(dir, 'github-installation.json')) },
+    },
+  })
 
   mutate?.(dir)
 }
@@ -99,6 +123,8 @@ describe('release readiness receipt checker', () => {
     expect(plan).toContain('github-checks.json')
     expect(plan).toContain('gh pr checks --repo Mumega-com/mupot 285')
     expect(plan).toContain('github-app.json')
+    expect(plan).toContain('github-installation.json')
+    expect(plan).toContain('--installation-id')
     expect(plan).toContain('GET /app')
     expect(plan).toContain('release-readiness-check.json')
   })
@@ -215,6 +241,50 @@ describe('release readiness receipt checker', () => {
       ok: false,
       check: 'github_app_has_no_extra_permissions',
       extras: [{ permission: 'members', actual: 'write' }],
+    }))
+  })
+
+  it('fails when the installed GitHub App retained broader effective permissions', () => {
+    const dir = tempDir()
+    writeBundle(dir, () => {
+      writeJson(join(dir, 'github-installation.json'), {
+        id: 789012,
+        app_id: 123456,
+        app_slug: 'mupot',
+        account: { login: 'Mumega-com', id: 999, type: 'Organization' },
+        permissions: {
+          ...REQUIRED_APP_PERMISSIONS,
+          organization_secrets: 'write',
+        },
+        suspended_at: null,
+      })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'github_installation_has_no_extra_permissions',
+      extras: [{ permission: 'organization_secrets', actual: 'write' }],
+    }))
+  })
+
+  it('fails when permission artifacts do not match the passing permission receipt', () => {
+    const dir = tempDir()
+    writeBundle(dir, () => {
+      const installation = JSON.parse(readFileSync(join(dir, 'github-installation.json'), 'utf8'))
+      installation.updated_at = '2026-07-10T01:00:00.000Z'
+      writeJson(join(dir, 'github-installation.json'), installation)
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'github_permission_artifact_matches_receipt',
+      file: 'github-installation.json',
     }))
   })
 
