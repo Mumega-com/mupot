@@ -121,6 +121,20 @@ describe('external PR-cycle receipt checker', () => {
     expect(receipt.checks.find((check) => check.check === 'issue_and_pr_same_repo')?.ok).toBe(true)
   })
 
+  it('accepts the aggregate output file created by shell redirection', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+    writeFileSync(join(dir, 'external-pr-cycle-check.json'), '')
+
+    const receipt = checkBundle({ outDir: dir, repo: TARGET.repo })
+
+    expect(receipt.status).toBe('pass')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: true,
+      check: 'bundle_only_required_json_files',
+    }))
+  })
+
   it('fails when the task linkback does not prove the PR link', () => {
     const dir = tempDir()
     writeBundle(dir, (receipt, step) => {

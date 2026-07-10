@@ -15,14 +15,14 @@ export const CHECK_RECEIPT_TYPE = 'mupot-staging-recovery-rehearsal/v1'
 
 export const REQUIRED_STEPS = [
   {
-    step: 'upgrade',
-    file: 'upgrade.json',
-    evidence: ['migrations_applied', 'deployed_sha'],
-  },
-  {
     step: 'backup',
     file: 'backup.json',
-    evidence: ['d1_export', 'config_inventory', 'secret_names_export'],
+    evidence: ['d1_export', 'config_inventory', 'secret_names_export', 'source_git_sha'],
+  },
+  {
+    step: 'upgrade',
+    file: 'upgrade.json',
+    evidence: ['previous_git_sha', 'migrations_applied', 'deployed_sha'],
   },
   {
     step: 'restore',
@@ -32,7 +32,7 @@ export const REQUIRED_STEPS = [
   {
     step: 'rollback',
     file: 'rollback.json',
-    evidence: ['worker_rollback', 'rollback_validation'],
+    evidence: ['worker_rollback', 'rolled_back_to_sha', 'rollback_validation', 'recovered_to_sha'],
   },
   {
     step: 'queue_dlq',
@@ -136,12 +136,14 @@ export function formatPlan(opts = {}) {
 
   lines.push('Mupot v0.23 staging recovery rehearsal')
   lines.push('')
-  lines.push('Goal: prove upgrade, backup, restore, rollback, Queue/DLQ behavior, failure reporting, and final health on a staging pot.')
+  lines.push('Goal: prove backup, upgrade, restore, rollback, Queue/DLQ behavior, failure reporting, and final health on a staging pot.')
   lines.push('')
   lines.push('Before running:')
   lines.push('- Use a staging pot, not production.')
   lines.push('- Keep secret values out of receipts. Record secret names, key names, command references, or redacted placeholders only.')
   lines.push('- Each step receipt must use receipt_type "mupot-staging-recovery-step/v1" and status "pass".')
+  lines.push('- Run each step in the printed order without overlap; every step must start at or after the previous step completed.')
+  lines.push('- Record the older source SHA in backup/upgrade evidence and both rollback and recovered SHAs in rollback evidence.')
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', outDir]))
   lines.push('')
@@ -294,17 +296,27 @@ function targetValue(receipt, key) {
   return typeof value === 'string' ? stripTrailingSlash(value) : ''
 }
 
+function evidenceString(receipt, key) {
+  const value = receipt?.evidence?.[key]
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function isGitSha(value) {
+  return /^[0-9a-f]{40}$/i.test(value)
+}
+
 export function checkBundle(opts = {}) {
   const outDir = opts.outDir ? resolve(opts.outDir) : ''
   const checks = []
   const artifacts = {}
   const receipts = []
+  const timeline = []
 
   pushCheck(checks, Boolean(outDir), 'out_dir_arg_present', { out_dir: outDir })
   pushCheck(checks, Boolean(outDir && existsSync(outDir)), 'out_dir_exists', { out_dir: outDir })
 
   if (outDir && existsSync(outDir)) {
-    const allowed = new Set(REQUIRED_STEPS.map((step) => step.file))
+    const allowed = new Set([...REQUIRED_STEPS.map((step) => step.file), 'staging-recovery-check.json'])
     const extraFiles = readdirSync(outDir).filter((name) => name.endsWith('.json') && !allowed.has(name))
     pushCheck(checks, extraFiles.length === 0, 'bundle_only_required_json_files', { extra_files: extraFiles })
   }
@@ -357,6 +369,15 @@ export function checkBundle(opts = {}) {
     pushCheck(checks, Number.isFinite(started), 'step_started_at_iso', { step: step.step, path, value: receipt?.started_at ?? null })
     pushCheck(checks, Number.isFinite(completed), 'step_completed_at_iso', { step: step.step, path, value: receipt?.completed_at ?? null })
     pushCheck(checks, Number.isFinite(started) && Number.isFinite(completed) && completed >= started, 'step_time_order', { step: step.step, path })
+    if (Number.isFinite(started) && Number.isFinite(completed)) {
+      timeline.push({
+        step: step.step,
+        started_at: receipt.started_at,
+        completed_at: receipt.completed_at,
+        started_ms: started,
+        completed_ms: completed,
+      })
+    }
 
     const commands = Array.isArray(receipt?.commands) ? receipt.commands : []
     pushCheck(checks, commands.length > 0, 'step_commands_recorded', { step: step.step, path, count: commands.length })
@@ -392,6 +413,17 @@ export function checkBundle(opts = {}) {
     })
   }
 
+  for (let index = 1; index < timeline.length; index += 1) {
+    const previous = timeline[index - 1]
+    const current = timeline[index]
+    pushCheck(checks, current.started_ms >= previous.completed_ms, 'rehearsal_steps_run_in_order_without_overlap', {
+      previous_step: previous.step,
+      previous_completed_at: previous.completed_at,
+      step: current.step,
+      started_at: current.started_at,
+    })
+  }
+
   const targetFields = ['pot', 'base_url', 'worker', 'db', 'git_sha']
   const target = {}
   for (const field of targetFields) {
@@ -416,6 +448,47 @@ export function checkBundle(opts = {}) {
     })
   }
 
+  const receiptByStep = new Map(receipts.map(({ step, receipt }) => [step, receipt]))
+  const backupSourceSha = evidenceString(receiptByStep.get('backup'), 'source_git_sha')
+  const upgradePreviousSha = evidenceString(receiptByStep.get('upgrade'), 'previous_git_sha')
+  const upgradeDeployedSha = evidenceString(receiptByStep.get('upgrade'), 'deployed_sha')
+  const rolledBackToSha = evidenceString(receiptByStep.get('rollback'), 'rolled_back_to_sha')
+  const recoveredToSha = evidenceString(receiptByStep.get('rollback'), 'recovered_to_sha')
+
+  for (const [field, value] of [
+    ['backup.source_git_sha', backupSourceSha],
+    ['upgrade.previous_git_sha', upgradePreviousSha],
+    ['upgrade.deployed_sha', upgradeDeployedSha],
+    ['rollback.rolled_back_to_sha', rolledBackToSha],
+    ['rollback.recovered_to_sha', recoveredToSha],
+  ]) {
+    pushCheck(checks, isGitSha(value), 'recovery_git_sha_valid', {
+      field,
+      value: value || null,
+    })
+  }
+
+  pushCheck(checks, Boolean(backupSourceSha && upgradePreviousSha && backupSourceSha === upgradePreviousSha), 'backup_source_matches_upgrade_previous_sha', {
+    backup_source_git_sha: backupSourceSha || null,
+    upgrade_previous_git_sha: upgradePreviousSha || null,
+  })
+  pushCheck(checks, Boolean(upgradePreviousSha && upgradeDeployedSha && upgradePreviousSha !== upgradeDeployedSha), 'upgrade_changes_git_sha', {
+    previous_git_sha: upgradePreviousSha || null,
+    deployed_sha: upgradeDeployedSha || null,
+  })
+  pushCheck(checks, Boolean(upgradeDeployedSha && target.git_sha && upgradeDeployedSha === target.git_sha), 'upgrade_deploys_target_git_sha', {
+    deployed_sha: upgradeDeployedSha || null,
+    target_git_sha: target.git_sha,
+  })
+  pushCheck(checks, Boolean(rolledBackToSha && upgradePreviousSha && rolledBackToSha === upgradePreviousSha), 'rollback_returns_to_previous_git_sha', {
+    rolled_back_to_sha: rolledBackToSha || null,
+    previous_git_sha: upgradePreviousSha || null,
+  })
+  pushCheck(checks, Boolean(recoveredToSha && upgradeDeployedSha && recoveredToSha === upgradeDeployedSha), 'rollback_recovery_returns_to_target_git_sha', {
+    recovered_to_sha: recoveredToSha || null,
+    target_git_sha: upgradeDeployedSha || null,
+  })
+
   const failed = checks.filter((check) => check.ok === false)
   const passed = checks.filter((check) => check.ok === true)
   return {
@@ -424,6 +497,7 @@ export function checkBundle(opts = {}) {
     checked_at: new Date().toISOString(),
     out_dir: outDir,
     target,
+    timeline: timeline.map(({ step, started_at, completed_at }) => ({ step, started_at, completed_at })),
     required_steps: REQUIRED_STEPS.map(({ step, file, evidence }) => ({ step, file, evidence })),
     artifacts,
     summary: {
