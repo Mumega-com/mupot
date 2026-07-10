@@ -95,7 +95,7 @@ async function kickAgentDO(env: Env, agentId: string): Promise<boolean> {
   const res = await stub.fetch('https://agent/wake', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ reason: 'metabolism' }),
+    body: JSON.stringify({ agent_id: agentId, reason: 'metabolism' }),
   })
   return res.ok
 }

@@ -113,6 +113,7 @@ agentsApp.post('/:agentId/wake', async (c) => {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
+      agent_id: agent.id,
       reason: body.reason ?? 'manual',
       squad_id: agent.squad_id,
       context: body.context,
