@@ -121,7 +121,8 @@ The `mupot` worker (TENANT_SLUG=`mumega`) has the App wired: `GITHUB_APP_ID`,
 `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_REPO` set as Worker secrets;
 keystone deployed. Before `v0.23.0`, #151 must prove the live App definition and
 re-accepted installation use the least-privilege set above. The release-readiness bundle
-must include a redacted `GET /app` export whose `permissions` object has only:
+must include redacted `GET /app` and `GET /app/installations/{installation_id}` exports
+whose `permissions` objects both have only:
 `metadata:"read"`, `contents:"write"`, `issues:"write"`, `pull_requests:"write"`,
 and `organization_projects:"read"`.
 
@@ -133,13 +134,20 @@ node scripts/github-app-permissions-receipt.mjs \
   --export-app \
   --app mupot \
   --app-id "$GITHUB_APP_ID" \
+  --installation-id "$GITHUB_APP_INSTALLATION_ID" \
   --private-key-file /path/to/pkcs8-private-key.pem \
   --out-dir tmp/github-app-permissions/mupot
 npm run receipt:github-app-permissions:check -- \
   --app mupot \
+  --installation-id "$GITHUB_APP_INSTALLATION_ID" \
   --out-dir tmp/github-app-permissions/mupot \
   > tmp/github-app-permissions/mupot/github-app-permissions-check.json
 ```
+
+Use the exporter rather than attaching raw API responses. The checker requires
+the redacted App and installation schemas, validates both exact permission
+objects, and records both artifact hashes. The final release-readiness check
+requires those hashes to match the attached exports.
 
 ## Roadmap (remaining)
 
