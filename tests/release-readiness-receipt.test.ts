@@ -236,6 +236,12 @@ describe('release readiness receipt checker', () => {
     expect(receipt.summary.required_ci_checks).toBe(REQUIRED_CHECKS.length)
     expect(receipt.summary.required_app_permissions).toBe(Object.keys(REQUIRED_APP_PERMISSIONS).length)
     expect(REQUIRED_ISSUES).toContain(319)
+    expect(REQUIRED_ISSUES).toContain(323)
+    expect(REQUIRED_RECEIPTS).toContainEqual(expect.objectContaining({
+      issue: 323,
+      file: 'release-candidate-check.json',
+      receipt_type: 'mupot-release-candidate/v1',
+    }))
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: true,
       check: 'host_go_exported_bundle_reverified',
