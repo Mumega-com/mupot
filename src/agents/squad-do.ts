@@ -130,6 +130,7 @@ export class SquadCoordinatorDO extends DurableObject<Env> {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
+            agent_id: agentId,
             reason: input.reason ?? 'squad.dispatch',
             squad_id: squadId,
             context: input.context,

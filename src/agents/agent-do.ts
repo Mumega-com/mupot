@@ -18,6 +18,7 @@ import { createTask } from '../tasks/service'
 import { runTaskExecution, resolveTaskId } from './execute'
 import { runGoalCycle } from './loop'
 import { COOLDOWN_EXTENSION_MS } from './observer'
+import { resolveAgentIdentity } from './identity'
 
 // Wake request body — who/why woke this agent, and how hard it may work.
 //
@@ -26,6 +27,9 @@ import { COOLDOWN_EXTENSION_MS } from './observer'
 // the raw event). We read the structured fields we know from either: a top-level
 // `task_id` (execute mode) OR `payload.task_id` (when woken by a task.* event).
 interface WakeInput {
+  // Logical Mupot agent id. Durable Object ids are opaque and cannot be used to
+  // re-load the corresponding D1 row, so the first internal wake binds this id.
+  agent_id?: string
   reason?: string
   squad_id?: string
   // optional inline context (e.g. a dispatched lead/task) to seed the cycle
@@ -130,9 +134,22 @@ export class AgentDO extends DurableObject<Env> {
 
   // ── Core: run one cortex cycle ──
   private async wake(input: WakeInput): Promise<WakeResult> {
-    const agent = await this.loadAgent()
+    const identity = resolveAgentIdentity(this.get('agent_id'), input.agent_id)
+    if (!identity.ok) {
+      return {
+        ok: false,
+        agent_id: this.get('agent_id') ?? this.ctx.id.toString(),
+        cycle: this.getCycles(),
+        decided: '',
+        actions: 0,
+        error: identity.error,
+      }
+    }
+    if (identity.bind) this.put('agent_id', identity.agentId)
+
+    const agent = await this.loadAgent(identity.agentId)
     if (!agent) {
-      return { ok: false, agent_id: this.ctx.id.toString(), cycle: 0, decided: '', actions: 0, error: 'agent_not_found' }
+      return { ok: false, agent_id: identity.agentId, cycle: this.getCycles(), decided: '', actions: 0, error: 'agent_not_found' }
     }
     if (agent.status !== 'active') {
       return { ok: false, agent_id: agent.id, cycle: this.getCycles(), decided: '', actions: 0, error: 'agent_paused' }
@@ -329,8 +346,7 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   // ── DB: resolve the agent row (tenant-scoped re-verification on every wake) ──
-  private async loadAgent(): Promise<Agent | null> {
-    const id = this.ctx.id.toString()
+  private async loadAgent(id: string): Promise<Agent | null> {
     // Load the FULL work-unit row (0009): the goal loop reads okr/kpi/effort/autonomy
     // and the spend gate reads budget_cap_cents/budget_window. Omitting these columns
     // silently disables the goal loop (no okr → falls through to cortex) AND the
@@ -379,7 +395,7 @@ export class AgentDO extends DurableObject<Env> {
     const next = await this.ctx.storage.getAlarm()
     const cycles = this.getCycles()
     return {
-      agent_id: this.ctx.id.toString(),
+      agent_id: this.get('agent_id') ?? this.ctx.id.toString(),
       initialized: cycles > 0 || this.get('last_woke_at') !== null,
       cycles,
       last_woke_at: this.get('last_woke_at'),

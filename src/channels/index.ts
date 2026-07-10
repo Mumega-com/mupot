@@ -304,7 +304,7 @@ async function wakeReply(
   const res = await stub.fetch('https://agent/wake', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ reason: 'channel.wake', squad_id: agent.squad_id }),
+    body: JSON.stringify({ agent_id: agent.id, reason: 'channel.wake', squad_id: agent.squad_id }),
   })
   if (!res.ok) return `Tried to wake ${agent.name} but it didn't run. Try again shortly.`
   return `Woke ${agent.name}. It's running one cycle now.`

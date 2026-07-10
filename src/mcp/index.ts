@@ -897,7 +897,7 @@ const toolWakeAgent: ToolSpec = {
     const res = await stub.fetch('https://agent/wake', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ reason, squad_id: agent.squad_id, context, maxActions }),
+      body: JSON.stringify({ agent_id: agent.id, reason, squad_id: agent.squad_id, context, maxActions }),
     })
     const runtime = await res.json<unknown>()
     // Do NOT reflect the raw Durable Object error body (WARN-4) — it may carry internal
