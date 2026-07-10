@@ -146,6 +146,48 @@ describe('work lifecycle receipt checker', () => {
     }))
   })
 
+  it('fails when a lifecycle receipt is missing a parseable observation time', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      if (file === 'agent-execution.json') {
+        receipt.observed_at = 'not a timestamp'
+      }
+    })
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'observed_at_parseable',
+      step: 'agent_execution',
+    }))
+  })
+
+  it('fails when lifecycle evidence is observed out of order', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      const observedAtByFile: Record<string, string> = {
+        'task-created.json': '2026-07-09T20:00:00.000Z',
+        'agent-execution.json': '2026-07-09T20:05:00.000Z',
+        'approval-recorded.json': '2026-07-09T20:04:00.000Z',
+        'task-completed.json': '2026-07-09T20:06:00.000Z',
+        'audit-verified.json': '2026-07-09T20:07:00.000Z',
+      }
+      receipt.observed_at = observedAtByFile[file]
+    })
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'lifecycle_steps_observed_in_order',
+      previous_step: 'agent_execution',
+      step: 'approval_recorded',
+    }))
+  })
+
   it('fails when a receipt contains sensitive field material', () => {
     const dir = tempDir()
     writeBundle(dir, (receipt, file) => {
