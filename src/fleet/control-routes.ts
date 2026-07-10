@@ -118,7 +118,10 @@ fleetControlApp.get('/trust', async (c) => {
       consumer_agent_id: c.env.FLEET_CONSUMER_AGENT,
       panel_public_key: publicKey,
     })
-  } catch {
+  } catch (error) {
+    console.error('fleet trust export failed', {
+      error: error instanceof Error ? `${error.name}: ${error.message}` : 'unknown error',
+    })
     return c.json({ error: 'fleet_trust_unavailable' }, 503)
   }
 })
