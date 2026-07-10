@@ -50,8 +50,9 @@ npx wrangler secret delete BOOTSTRAP_OWNER_TOKEN --config wrangler.acme.toml
 ```
 
 The bootstrap route is intentionally available only while dashboard OAuth is
-unconfigured. Its D1-backed singleton claim allows one owner session only; deleting
-the secret after use removes the remaining deployment credential.
+unconfigured. Its D1-backed singleton claim selects one owner only; the same owner
+may use the secret to resume a session until you delete it. Deleting the secret
+removes the remaining deployment credential.
 
 ## Secrets
 

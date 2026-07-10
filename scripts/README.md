@@ -142,8 +142,9 @@ npx wrangler deploy --config wrangler.acme.toml
 ```
 
 Open `<your-pot-url>/auth/bootstrap`, submit the printed token and the owner's
-email, then delete `BOOTSTRAP_OWNER_TOKEN` with Wrangler. The route is disabled
-when dashboard OAuth is configured and closes permanently after the first claim.
+email, then delete `BOOTSTRAP_OWNER_TOKEN` with Wrangler. Until deletion, only the
+claimed owner may use the secret to resume a session; the route is disabled when
+dashboard OAuth is configured.
 
 ## What `setup.sh` does
 
