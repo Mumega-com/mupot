@@ -96,6 +96,14 @@ function isUniqueViolation(err: unknown): boolean {
   return err instanceof Error && /UNIQUE constraint failed/i.test(err.message)
 }
 
+// A raw bearer is returned exactly once on the two mint paths below. Keep that
+// response out of browser/edge caches and prevent a subsequent navigation from
+// forwarding its URL as a Referer.
+function protectRawTokenResponse(c: Context): void {
+  c.header('Cache-Control', 'no-store')
+  c.header('Referrer-Policy', 'no-referrer')
+}
+
 interface InviteRow {
   id: string
   email: string
@@ -235,6 +243,7 @@ membersApp.post('/invites/:id/accept', async (c) => {
   }
 
   // Return the RAW token EXACTLY ONCE. It is never stored or returned again.
+  protectRawTokenResponse(c)
   return c.json(
     {
       member_id: member.id,
@@ -453,6 +462,7 @@ membersApp.post('/members/:id/tokens', requireCapability(orgScope, 'admin'), asy
 
   // Shared mint path — raw token returned EXACTLY ONCE; only the hash is persisted.
   const token = await mintMemberToken(c.env, memberId, label, channel)
+  protectRawTokenResponse(c)
   return c.json({ token }, 201)
 })
 
