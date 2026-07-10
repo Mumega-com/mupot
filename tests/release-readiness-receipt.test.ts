@@ -217,6 +217,8 @@ describe('release readiness receipt checker', () => {
     expect(plan).toContain('github-installation.json')
     expect(plan).toContain('--installation-id')
     expect(plan).toContain('GET /app')
+    expect(plan).toContain('--export-gh')
+    expect(plan).toContain('--organization')
     expect(plan).toContain('release-readiness-check.json')
   })
 
