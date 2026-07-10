@@ -178,5 +178,48 @@ describe('external PR-cycle receipt checker', () => {
       step: 'ci_feedback',
     }))
   })
-})
 
+  it('fails when a step receipt is missing a parseable observation time', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, step) => {
+      if (step === 'agent_execution') {
+        receipt.observed_at = 'not a timestamp'
+      }
+    })
+
+    const receipt = checkBundle({ outDir: dir, repo: TARGET.repo })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'step_observed_at_iso',
+      step: 'agent_execution',
+    }))
+  })
+
+  it('fails when external PR-cycle evidence is observed out of order', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, step) => {
+      const observedAtByStep: Record<string, string> = {
+        board_item: '2026-07-09T21:00:00.000Z',
+        task_import: '2026-07-09T21:02:00.000Z',
+        agent_execution: '2026-07-09T21:04:00.000Z',
+        pull_request: '2026-07-09T21:10:00.000Z',
+        task_linkback: '2026-07-09T21:08:00.000Z',
+        ci_feedback: '2026-07-09T21:12:00.000Z',
+        final_verification: '2026-07-09T21:14:00.000Z',
+      }
+      receipt.observed_at = observedAtByStep[step]
+    })
+
+    const receipt = checkBundle({ outDir: dir, repo: TARGET.repo })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'external_pr_cycle_steps_observed_in_order',
+      previous_step: 'pull_request',
+      step: 'task_linkback',
+    }))
+  })
+})
