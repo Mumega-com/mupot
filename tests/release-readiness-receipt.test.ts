@@ -63,6 +63,7 @@ describe('release readiness receipt checker', () => {
   it('parses plan and check arguments', () => {
     expect(parseArgs(['--plan', '--version', 'v0.23.0']).plan).toBe(true)
     expect(parseArgs(['--check', '--out-dir', './tmp/release-readiness']).check).toBe(true)
+    expect(parseArgs(['--plan', '--checks-pr', '285']).checksPr).toBe('285')
   })
 
   it('prints the final release-readiness evidence plan', () => {
@@ -70,12 +71,14 @@ describe('release readiness receipt checker', () => {
       outDir: 'tmp/release-readiness/v0.23.0',
       version: 'v0.23.0',
       repo: 'Mumega-com/mupot',
+      checksPr: '285',
     })
 
     expect(plan).toContain('Mupot v0.23 final release-readiness evidence plan')
     expect(plan).toContain('fresh-install-check.json')
     expect(plan).toContain('github-issues.json')
     expect(plan).toContain('github-checks.json')
+    expect(plan).toContain('gh pr checks --repo Mumega-com/mupot 285')
     expect(plan).toContain('github-app.json')
     expect(plan).toContain('GET /app')
     expect(plan).toContain('release-readiness-check.json')

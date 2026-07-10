@@ -62,6 +62,7 @@ export function parseArgs(argv) {
     outDir: '',
     version: DEFAULT_VERSION,
     repo: DEFAULT_REPO,
+    checksPr: '',
     plan: false,
     check: false,
     summary: false,
@@ -79,6 +80,7 @@ export function parseArgs(argv) {
     if (arg === '--out-dir') opts.outDir = resolve(next())
     else if (arg === '--version') opts.version = normalizeTag(next())
     else if (arg === '--repo') opts.repo = next()
+    else if (arg === '--checks-pr') opts.checksPr = next()
     else if (arg === '--plan') opts.plan = true
     else if (arg === '--check') opts.check = true
     else if (arg === '--summary') opts.summary = true
@@ -100,6 +102,7 @@ export function usage() {
     '  --out-dir <path>    aggregate evidence directory',
     '  --version <version> expected version; default v0.23.0',
     '  --repo <owner/repo> GitHub repo; default Mumega-com/mupot',
+    '  --checks-pr <number> PR number whose required checks prove this release candidate',
     '  -h, --help          show this help',
   ].join('\n')
 }
@@ -129,6 +132,7 @@ function defaultOutDir(opts) {
 export function formatPlan(opts = {}) {
   const version = normalizeTag(opts.version || DEFAULT_VERSION)
   const repo = opts.repo || DEFAULT_REPO
+  const checksPr = opts.checksPr || '<release-pr-number>'
   const outDir = defaultOutDir({ ...opts, version })
   const lines = []
 
@@ -143,7 +147,7 @@ export function formatPlan(opts = {}) {
     lines.push(`- ${receipt.file} (${receipt.receipt_type}, issue #${receipt.issue}, objective ${receipt.objective})`)
   }
   lines.push('')
-  lines.push('Export GitHub issue state and checks:')
+  lines.push('Export GitHub issue state and checks from the release-candidate PR:')
   lines.push(commandLine([
     'gh',
     'issue',
@@ -163,7 +167,7 @@ export function formatPlan(opts = {}) {
     'checks',
     '--repo',
     repo,
-    '278',
+    checksPr,
     '--json',
     'name,state,link,bucket',
   ], ` > ${shellQuote(join(outDir, 'github-checks.json'))}`))

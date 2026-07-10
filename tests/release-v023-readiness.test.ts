@@ -114,6 +114,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'npm run receipt:production-soak:plan',
       'npm run receipt:release-integrity:plan',
       'npm run receipt:release-readiness:plan',
+      '--checks-pr <release-pr-number>',
       'npx wrangler deploy --dry-run --config wrangler.example.toml',
     ]) {
       expect(releaseDoc).toContain(command)
