@@ -111,6 +111,9 @@ Required proof:
 - `v0.23.0-rc.1` completes a seven-day real-agent soak without lost work,
   duplicated effects, unauthorized actions, or critical failures, with a
   passing `mupot-production-soak/v1` evidence receipt on #280.
+- Final release readiness has a passing `mupot-v023-release-readiness/v1`
+  aggregate receipt across all objective receipts, tracker issues, and required
+  CI checks.
 
 Deferred from this version: marketplace/economy expansion, new departments,
 full SOS retirement, GCP portability, and autonomous-brain expansion.
