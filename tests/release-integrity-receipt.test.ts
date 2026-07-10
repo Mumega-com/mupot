@@ -61,6 +61,11 @@ function writeRepo(mutate?: (repo: string, outDir: string) => void) {
   git(repo, ['add', '.'])
   git(repo, ['-c', 'user.email=test@example.com', '-c', 'user.name=Mupot Test', 'commit', '-m', 'release fixture'])
   git(repo, ['tag', TAG])
+  const tagSha = execFileSync('git', ['-C', repo, 'rev-list', '-n', '1', TAG], { encoding: 'utf8' }).trim()
+  writeFileSync(join(outDir, 'github-tag.json'), JSON.stringify({
+    sha: tagSha,
+    html_url: `https://github.test/commit/${tagSha}`,
+  }, null, 2))
 
   return { repo, outDir }
 }
@@ -82,6 +87,8 @@ describe('release integrity receipt checker', () => {
     expect(plan).toContain('Mupot v0.23 release-integrity evidence plan')
     expect(plan).toContain('gh api repos/Mumega-com/mupot/milestones')
     expect(plan).toContain('gh release view v0.23.0')
+    expect(plan).toContain('repos/Mumega-com/mupot/commits/v0.23.0')
+    expect(plan).toContain('github-tag.json')
     expect(plan).toContain('release-integrity-check.json')
   })
 
@@ -100,6 +107,7 @@ describe('release integrity receipt checker', () => {
     expect(receipt.target.package_version).toBe(VERSION)
     expect(receipt.target.public_api_version).toBe(VERSION)
     expect(receipt.target.release_tag).toBe(TAG)
+    expect(receipt.target.github_tag_sha).toBe(receipt.target.git_tag_sha)
   })
 
   it('fails when package and public API versions are not aligned', () => {
@@ -162,6 +170,21 @@ describe('release integrity receipt checker', () => {
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
       check: 'github_release_tag_matches_expected',
+    }))
+  })
+
+  it('fails when the GitHub-resolved tag commit differs from the local tag', () => {
+    const { repo, outDir } = writeRepo()
+    writeFileSync(join(outDir, 'github-tag.json'), JSON.stringify({
+      sha: 'a'.repeat(40),
+    }, null, 2))
+
+    const receipt = checkBundle({ repoRoot: repo, outDir, version: TAG })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'github_tag_commit_matches_local_tag',
     }))
   })
 })
