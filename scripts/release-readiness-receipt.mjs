@@ -191,7 +191,7 @@ export function formatPlan(opts = {}) {
     'name,state,link,bucket',
   ], ` > ${shellQuote(join(outDir, 'github-checks.json'))}`))
   lines.push('')
-  lines.push('Export the live GitHub App definition and re-accepted installation after #151 is remediated. Use the App-JWT GET /app and GET /app/installations/{installation_id} path only where the private key is intentionally authorized; otherwise use the authenticated GitHub CLI path below so the Worker-confined key is never copied or rotated:')
+  lines.push('Export the live GitHub App definition and re-accepted installation after #151 is remediated with the authenticated GitHub CLI. The final release plan deliberately does not read, copy, print, or rotate the Worker-confined App private key:')
   lines.push(`The export command writes ${join(outDir, APP_FILE)} and ${join(outDir, INSTALLATION_FILE)}.`)
   lines.push(commandLine([
     'npm',
@@ -202,21 +202,6 @@ export function formatPlan(opts = {}) {
     'mupot',
     '--out-dir',
     outDir,
-  ]))
-  lines.push(commandLine([
-    'node',
-    'scripts/github-app-permissions-receipt.mjs',
-    '--export-app',
-    '--out-dir',
-    outDir,
-    '--app',
-    'mupot',
-    '--app-id',
-    '<github-app-id>',
-    '--installation-id',
-    '<github-app-installation-id>',
-    '--private-key-file',
-    '<path-to-pkcs8-private-key.pem>',
   ]))
   lines.push(commandLine([
     'node',
