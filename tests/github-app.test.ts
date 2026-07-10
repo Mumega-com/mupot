@@ -187,6 +187,16 @@ describe('getInstallationToken', () => {
     expect(await getInstallationToken(envWithAppSecrets(), { fetchImpl })).toBeNull()
   })
 
+  it('fails closed when GitHub never completes the token response', async () => {
+    const fetchImpl = ((_: string, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        const signal = init?.signal as AbortSignal
+        signal.addEventListener('abort', () => reject(new Error('request_aborted')))
+      })) as unknown as typeof fetch
+
+    await expect(getInstallationToken(envWithAppSecrets(), { fetchImpl, timeoutMs: 1 })).resolves.toBeNull()
+  })
+
   it('returns null when no App creds are configured', async () => {
     const env = envWithAppSecrets({
       GITHUB_APP_ID: undefined,

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createTask, mirrorTaskUpdate } from '../src/tasks/service'
+import { createTask, mirrorTaskCreate, mirrorTaskUpdate } from '../src/tasks/service'
 
 function makeTaskEnv(opts: { insertChanges?: number; linkChanges?: number } = {}) {
   const inserts: unknown[][] = []
@@ -171,5 +171,45 @@ describe('mirrorTaskUpdate', () => {
 
     expect(url).toBe('https://github.com/acme/widgets/issues/8')
     expect(fetchMock).toHaveBeenCalledTimes(1) // PATCH, not create
+  })
+})
+
+describe('mirrorTaskCreate timeout', () => {
+  it('fails soft when GitHub never completes the issue response', async () => {
+    vi.useFakeTimers()
+    try {
+      const { env } = makeTaskEnv()
+      const fetchMock = vi.fn((_: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          const signal = init?.signal as AbortSignal
+          signal.addEventListener('abort', () => reject(new Error('request_aborted')))
+        }))
+      vi.stubGlobal('fetch', fetchMock)
+
+      const pending = mirrorTaskCreate(env, {
+        id: 'task-timeout',
+        squad_id: 'squad-1',
+        title: 'Bound GitHub mirror',
+        body: '',
+        done_when: 'the request returns without hanging',
+        status: 'open',
+        assignee_agent_id: null,
+        github_issue_url: null,
+        result: null,
+        completed_at: null,
+        gate_owner: null,
+        created_at: '2026-07-10T00:00:00.000Z',
+        updated_at: '2026-07-10T00:00:00.000Z',
+      })
+
+      await vi.advanceTimersByTimeAsync(5_001)
+      await expect(pending).resolves.toBeNull()
+      expect(fetchMock).toHaveBeenCalledWith(
+        'https://api.github.com/repos/acme/widgets/issues',
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

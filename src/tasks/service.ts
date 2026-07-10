@@ -12,6 +12,10 @@ import { resolveOutboundGitHubToken } from '../integrations/github-app'
 export type TaskStatus = Task['status']
 type TaskActor = NonNullable<BusEvent['actor']>
 
+// Task rows are durable before mirroring begins. Bound the best-effort GitHub
+// mirror so a slow upstream cannot indefinitely hold the operator's POST open.
+const GITHUB_TASK_MIRROR_TIMEOUT_MS = 5_000
+
 // ── Status transition matrix ────────────────────────────────────────────────
 //
 // Allowed transitions (enforced by assertValidTransition; invalid → 400):
@@ -122,6 +126,25 @@ function issueBody(task: Task): string {
   return lines.join('\n')
 }
 
+async function requestGitHubIssue(
+  url: string,
+  init: Omit<RequestInit, 'signal'>,
+): Promise<string | null> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), GITHUB_TASK_MIRROR_TIMEOUT_MS)
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal })
+    if (!res.ok) return null
+    // Keep the deadline armed through the body read as well as the request.
+    const data = (await res.json()) as { html_url?: string }
+    return typeof data.html_url === 'string' ? data.html_url : null
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export async function mirrorTaskCreate(env: Env, task: Task): Promise<string | null> {
   const repo = githubRepo(env)
   if (!repo) return null
@@ -129,18 +152,11 @@ export async function mirrorTaskCreate(env: Env, task: Task): Promise<string | n
   const token = await resolveOutboundGitHubToken(env)
   if (!token) return null
 
-  try {
-    const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
-      method: 'POST',
-      headers: githubHeaders(token),
-      body: JSON.stringify({ title: task.title, body: issueBody(task) }),
-    })
-    if (!res.ok) return null
-    const data = (await res.json()) as { html_url?: string }
-    return typeof data.html_url === 'string' ? data.html_url : null
-  } catch {
-    return null
-  }
+  return requestGitHubIssue(`https://api.github.com/repos/${repo}/issues`, {
+    method: 'POST',
+    headers: githubHeaders(token),
+    body: JSON.stringify({ title: task.title, body: issueBody(task) }),
+  })
 }
 
 export async function mirrorTaskUpdate(env: Env, task: Task): Promise<string | null> {
@@ -158,22 +174,15 @@ export async function mirrorTaskUpdate(env: Env, task: Task): Promise<string | n
     return task.github_issue_url
   }
 
-  try {
-    const res = await fetch(`https://api.github.com/repos/${repo}/issues/${issueNumber}`, {
-      method: 'PATCH',
-      headers: githubHeaders(token),
-      body: JSON.stringify({
-        title: task.title,
-        body: issueBody(task),
-        state: issueState(task.status),
-      }),
-    })
-    if (!res.ok) return task.github_issue_url
-    const data = (await res.json()) as { html_url?: string }
-    return typeof data.html_url === 'string' ? data.html_url : task.github_issue_url
-  } catch {
-    return task.github_issue_url
-  }
+  return (await requestGitHubIssue(`https://api.github.com/repos/${repo}/issues/${issueNumber}`, {
+    method: 'PATCH',
+    headers: githubHeaders(token),
+    body: JSON.stringify({
+      title: task.title,
+      body: issueBody(task),
+      state: issueState(task.status),
+    }),
+  })) ?? task.github_issue_url
 }
 
 function parseIssueNumber(url: string | null): number | null {
