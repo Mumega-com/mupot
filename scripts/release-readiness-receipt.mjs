@@ -39,7 +39,10 @@ export const REQUIRED_RECEIPTS = [
   { objective: 9, issue: 281, file: 'release-integrity-check.json', receipt_type: 'mupot-release-integrity/v1' },
 ]
 
-export const REQUIRED_ISSUES = [150, 151, 274, 277, 279, 280, 281, 282, 283]
+// #319 closes the live board/task-mirror/PR repository divergence found while
+// collecting #150 evidence. Keep it in the final release audit so that proof
+// cannot be treated as complete if its fail-closed guard is reopened.
+export const REQUIRED_ISSUES = [150, 151, 274, 277, 279, 280, 281, 282, 283, 319]
 
 export const REQUIRED_CHECKS = [
   'build',
