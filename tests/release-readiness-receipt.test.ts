@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { buildBundle, exportBundle } from '../fleet-runtime/receipt-bundle.mjs'
 import {
   CHECK_RECEIPT_TYPE,
   REQUIRED_APP_PERMISSIONS,
@@ -27,9 +28,96 @@ function sha256(path: string) {
   return createHash('sha256').update(readFileSync(path)).digest('hex')
 }
 
-function writeBundle(dir: string, mutate?: (dir: string) => void) {
+const HOST_BASE_URL = 'https://pot.example.org'
+const HOST_TENANT = 'tenant-a'
+
+function hostProbeReceipt() {
+  return {
+    receipt_type: 'mupot-fleet-cutover-probe/v1',
+    generated_at: '2026-07-08T00:00:30.000Z',
+    status: 'pass',
+    summary: { status: 'pass', passed: 2, failed: 0, warnings: 0 },
+    inputs: { base_url: HOST_BASE_URL, agent: 'agent-one', queue_inbox: true, control_verbs: ['start'] },
+    actions: [
+      { kind: 'inbox_probe', target_agent: 'agent-one', request_id: 'probe-1-inbox', ok: true },
+      { kind: 'control_request', target_agent: 'agent-one', verb: 'start', ok: true },
+    ],
+    checks: [{ ok: true, component: 'cutover-probe', check: 'inbox_probe_queued' }],
+  }
+}
+
+function hostReceipt() {
+  return {
+    receipt_type: 'mupot-fleet-host-receipt/v1',
+    generated_at: '2026-07-08T00:00:00.000Z',
+    status: 'pass',
+    summary: { status: 'pass', passed: 1, failed: 0, warnings: 0 },
+    target: {
+      base_url: HOST_BASE_URL,
+      tenant: HOST_TENANT,
+      daemon_agents: ['agent-one'],
+      control_consumer_agent: 'fleet-consumer',
+    },
+    checks: [{ ok: true, component: 'fleet-control-daemon', check: 'panel_public_key_public_only' }],
+  }
+}
+
+function runtimeReceipt() {
+  return {
+    receipt_type: 'mupot-fleet-runtime-receipt/v1',
+    generated_at: '2026-07-08T00:01:00.000Z',
+    status: 'pass',
+    inputs: { selected_agents: ['agent-one'] },
+    target: { base_url: HOST_BASE_URL, tenant: HOST_TENANT, agents: ['agent-one'] },
+    agents: [{ agent: 'agent-one' }],
+    checks: [
+      { ok: true, component: 'fleet-daemon', check: 'signed_attach_ok', agent_id: 'agent-one' },
+      { ok: true, component: 'fleet-daemon', check: 'signed_inbox_handoff_consumed', agent_id: 'agent-one' },
+    ],
+  }
+}
+
+function controlReceipt(verb: 'start' | 'stop') {
+  const action = verb === 'start' ? 'open' : 'close'
+  return {
+    receipt_type: 'mupot-fleet-control-receipt/v1',
+    generated_at: '2026-07-08T00:02:00.000Z',
+    status: 'pass',
+    target: {
+      base_url: HOST_BASE_URL,
+      tenant: HOST_TENANT,
+      consumer_agent: 'fleet-consumer',
+      executed_agents: ['agent-one'],
+    },
+    checks: [{ ok: true, component: 'fleet-control-daemon', check: 'control_request_executed', agent_id: 'agent-one', verb, action }],
+    poll: { ok: true, action, request: { agent_id: 'agent-one', verb } },
+  }
+}
+
+async function writeHostBundle(exportDir: string) {
+  const sourceDir = tempDir()
+  writeJson(join(sourceDir, 'probe-start.json'), hostProbeReceipt())
+  writeJson(join(sourceDir, 'host.json'), hostReceipt())
+  writeJson(join(sourceDir, 'runtime-agent-one.json'), runtimeReceipt())
+  writeJson(join(sourceDir, 'control-start.json'), controlReceipt('start'))
+  writeJson(join(sourceDir, 'control-stop.json'), controlReceipt('stop'))
+  await buildBundle({
+    outDir: sourceDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+    requiredControlVerbs: ['start', 'stop'],
+  })
+  const exported = exportBundle({ outDir: sourceDir, exportDir })
+  if (exported.status !== 'pass') throw new Error('failed to build passing host bundle fixture')
+}
+
+async function writeBundle(dir: string, mutate?: (dir: string) => void) {
   mkdirSync(join(dir, 'host-go'), { recursive: true })
   for (const required of REQUIRED_RECEIPTS) {
+    if (required.file.startsWith('host-go/')) continue
     writeJson(join(dir, required.file), {
       receipt_type: required.receipt_type,
       status: 'pass',
@@ -40,6 +128,7 @@ function writeBundle(dir: string, mutate?: (dir: string) => void) {
       },
     })
   }
+  await writeHostBundle(join(dir, 'host-go'))
 
   writeJson(join(dir, 'github-issues.json'), REQUIRED_ISSUES.map((number) => ({
     number,
@@ -116,6 +205,8 @@ describe('release readiness receipt checker', () => {
     })
 
     expect(plan).toContain('Mupot v0.23 final release-readiness evidence plan')
+    expect(plan).toContain('complete exported #274 attachable directory')
+    expect(plan).toContain('reruns the read-only fleet manifest verifier')
     expect(plan).toContain('fresh-install-check.json')
     expect(plan).toContain('github-issues.json')
     expect(plan).toContain('github-pr.json')
@@ -129,9 +220,9 @@ describe('release readiness receipt checker', () => {
     expect(plan).toContain('release-readiness-check.json')
   })
 
-  it('passes when every objective receipt, issue, and CI check is present and passing', () => {
+  it('passes when every objective receipt, issue, and CI check is present and passing', async () => {
     const dir = tempDir()
-    writeBundle(dir)
+    await writeBundle(dir)
 
     const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
 
@@ -141,11 +232,34 @@ describe('release readiness receipt checker', () => {
     expect(receipt.summary.required_issues).toBe(REQUIRED_ISSUES.length)
     expect(receipt.summary.required_ci_checks).toBe(REQUIRED_CHECKS.length)
     expect(receipt.summary.required_app_permissions).toBe(Object.keys(REQUIRED_APP_PERMISSIONS).length)
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: true,
+      check: 'host_go_exported_bundle_reverified',
+      status: 'pass',
+    }))
   })
 
-  it('fails when a required receipt has the wrong type', () => {
+  it('fails when an artifact in the copied host bundle is changed after export', async () => {
     const dir = tempDir()
-    writeBundle(dir, () => {
+    await writeBundle(dir)
+    const hostPath = join(dir, 'host-go', 'host.json')
+    const host = JSON.parse(readFileSync(hostPath, 'utf8'))
+    host.generated_at = '2026-07-10T02:00:00.000Z'
+    writeJson(hostPath, host)
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'host_go_exported_bundle_reverified',
+      status: 'fail',
+    }))
+  })
+
+  it('fails when a required receipt has the wrong type', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
       const required = REQUIRED_RECEIPTS[0]
       writeJson(join(dir, required.file), {
         receipt_type: 'wrong/v1',
@@ -163,9 +277,9 @@ describe('release readiness receipt checker', () => {
     }))
   })
 
-  it('fails when a release tracker issue is still open', () => {
+  it('fails when a release tracker issue is still open', async () => {
     const dir = tempDir()
-    writeBundle(dir, () => {
+    await writeBundle(dir, () => {
       writeJson(join(dir, 'github-issues.json'), REQUIRED_ISSUES.map((number) => ({
         number,
         state: number === 150 ? 'OPEN' : 'CLOSED',
@@ -182,9 +296,9 @@ describe('release readiness receipt checker', () => {
     }))
   })
 
-  it('fails when a required CI check did not pass', () => {
+  it('fails when a required CI check did not pass', async () => {
     const dir = tempDir()
-    writeBundle(dir, () => {
+    await writeBundle(dir, () => {
       writeJson(join(dir, 'github-checks.json'), REQUIRED_CHECKS.map((name) => ({
         name,
         bucket: name === 'local-evidence' ? 'fail' : 'pass',
@@ -202,9 +316,9 @@ describe('release readiness receipt checker', () => {
     }))
   })
 
-  it('fails when the GitHub App still has workflow write permission', () => {
+  it('fails when the GitHub App still has workflow write permission', async () => {
     const dir = tempDir()
-    writeBundle(dir, () => {
+    await writeBundle(dir, () => {
       writeJson(join(dir, 'github-app.json'), {
         permissions: {
           ...REQUIRED_APP_PERMISSIONS,
@@ -223,9 +337,9 @@ describe('release readiness receipt checker', () => {
     }))
   })
 
-  it('fails when the GitHub App has extra organization admin permissions', () => {
+  it('fails when the GitHub App has extra organization admin permissions', async () => {
     const dir = tempDir()
-    writeBundle(dir, () => {
+    await writeBundle(dir, () => {
       writeJson(join(dir, 'github-app.json'), {
         permissions: {
           ...REQUIRED_APP_PERMISSIONS,
@@ -244,9 +358,9 @@ describe('release readiness receipt checker', () => {
     }))
   })
 
-  it('fails when the installed GitHub App retained broader effective permissions', () => {
+  it('fails when the installed GitHub App retained broader effective permissions', async () => {
     const dir = tempDir()
-    writeBundle(dir, () => {
+    await writeBundle(dir, () => {
       writeJson(join(dir, 'github-installation.json'), {
         id: 789012,
         app_id: 123456,
@@ -270,9 +384,9 @@ describe('release readiness receipt checker', () => {
     }))
   })
 
-  it('fails when permission artifacts do not match the passing permission receipt', () => {
+  it('fails when permission artifacts do not match the passing permission receipt', async () => {
     const dir = tempDir()
-    writeBundle(dir, () => {
+    await writeBundle(dir, () => {
       const installation = JSON.parse(readFileSync(join(dir, 'github-installation.json'), 'utf8'))
       installation.updated_at = '2026-07-10T01:00:00.000Z'
       writeJson(join(dir, 'github-installation.json'), installation)
@@ -288,9 +402,9 @@ describe('release readiness receipt checker', () => {
     }))
   })
 
-  it('fails when the release-candidate PR metadata is from another PR', () => {
+  it('fails when the release-candidate PR metadata is from another PR', async () => {
     const dir = tempDir()
-    writeBundle(dir, () => {
+    await writeBundle(dir, () => {
       writeJson(join(dir, 'github-pr.json'), {
         number: 284,
         statusCheckRollup: REQUIRED_CHECKS.map((name) => ({
@@ -312,9 +426,9 @@ describe('release readiness receipt checker', () => {
     }))
   })
 
-  it('fails when the release-candidate PR rollup lacks a required passing check', () => {
+  it('fails when the release-candidate PR rollup lacks a required passing check', async () => {
     const dir = tempDir()
-    writeBundle(dir, () => {
+    await writeBundle(dir, () => {
       writeJson(join(dir, 'github-pr.json'), {
         number: 285,
         statusCheckRollup: REQUIRED_CHECKS.map((name) => ({

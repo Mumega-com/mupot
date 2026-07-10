@@ -9,6 +9,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { checkBundleManifest } from '../fleet-runtime/receipt-bundle.mjs'
 import {
   APP_FILE,
   CHECK_RECEIPT_TYPE as GITHUB_APP_PERMISSIONS_RECEIPT_TYPE,
@@ -146,6 +147,9 @@ export function formatPlan(opts = {}) {
   lines.push(`Goal: prove every v0.23.0 Trusted Runtime objective has passing evidence before publishing ${version}.`)
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', join(outDir, 'host-go')]))
+  lines.push('')
+  lines.push(`Copy the complete exported #274 attachable directory into ${join(outDir, 'host-go')}; include every manifest artifact and both sidecars, not only the four files listed below.`)
+  lines.push('The final checker reruns the read-only fleet manifest verifier against that copied directory.')
   lines.push('')
   lines.push('Copy or attach these passing receipt files into the aggregate directory:')
   for (const receipt of REQUIRED_RECEIPTS) {
@@ -381,6 +385,19 @@ export function checkBundle(opts = {}) {
       issue: required.issue,
     })
   }
+
+  const hostGoDir = join(outDir, 'host-go')
+  const hostGoVerification = checkBundleManifest({ outDir: hostGoDir })
+  const hostGoFailures = Array.isArray(hostGoVerification?.checks)
+    ? hostGoVerification.checks.filter((check) => check?.ok === false).slice(0, 20)
+    : []
+  pushCheck(checks, hostGoVerification?.status === 'pass', 'host_go_exported_bundle_reverified', {
+    directory: hostGoDir,
+    receipt_type: hostGoVerification?.receipt_type ?? null,
+    status: hostGoVerification?.status ?? null,
+    manifest_sha256: hostGoVerification?.manifest?.sha256 ?? null,
+    failures: hostGoFailures,
+  })
 
   const issuesPath = join(outDir, 'github-issues.json')
   const issuesJson = readJson(checks, issuesPath, 'github_issues')
