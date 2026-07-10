@@ -403,8 +403,6 @@ key readiness. Queue the live inbox probe and `start` control request without
 putting tokens on the command line, and save the redacted queue receipt:
 
 ```bash
-MUPOT_AGENT_TOKEN='<welded-sender-token>' \
-MUPOT_OWNER_TOKEN='<owner-token>' \
 node ~/.fleet/runtime/cutover-probe.mjs \
   --base-url https://YOUR-POT.example.com \
   --agent my-agent \
@@ -427,7 +425,6 @@ node ~/.fleet/runtime/receipt-bundle.mjs \
 Queue a `stop` control request and collect the second live control receipt:
 
 ```bash
-MUPOT_OWNER_TOKEN='<owner-token>' \
 node ~/.fleet/runtime/cutover-probe.mjs \
   --base-url https://YOUR-POT.example.com \
   --agent my-agent \
@@ -517,8 +514,9 @@ node ~/.fleet/runtime/receipt-bundle.mjs \
 ```
 
 The plan is read-only. It prints the installer, host receipt, probe, runtime,
-control, final verify, export, and copied-bundle check commands with
-`<agent-token>` and `<owner-token>` placeholders instead of secret values.
+control, final verify, export, and copied-bundle check commands. Probe commands
+name the required token environment variables without embedding token values in
+the copied command lines.
 
 To produce the clean attachable copy for #274, export from the working receipt
 directory into a fresh directory. The export command copies `manifest.json`, the

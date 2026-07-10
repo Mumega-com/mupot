@@ -76,8 +76,10 @@ function usage() {
     '  -h, --help                    show this help',
     '',
     'Examples:',
-    '  MUPOT_AGENT_TOKEN=... MUPOT_OWNER_TOKEN=... node ~/.fleet/runtime/cutover-probe.mjs --base-url https://mupot.example.com --agent my-agent --queue-inbox --control start',
-    '  MUPOT_OWNER_TOKEN=... node ~/.fleet/runtime/cutover-probe.mjs --base-url https://mupot.example.com --agent my-agent --control stop',
+    '  export MUPOT_AGENT_TOKEN',
+    '  export MUPOT_OWNER_TOKEN',
+    '  node ~/.fleet/runtime/cutover-probe.mjs --base-url https://mupot.example.com --agent my-agent --queue-inbox --control start',
+    '  node ~/.fleet/runtime/cutover-probe.mjs --base-url https://mupot.example.com --agent my-agent --control stop',
   ].join('\n')
 }
 
