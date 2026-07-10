@@ -92,10 +92,12 @@ Required proof:
   a passing `mupot-fresh-install/v1` evidence receipt.
 - One real runtime attached through signed identity with heartbeat, signed
   inbox, and lifecycle control evidence.
-- No unresolved P0/P1 security findings across tenant, squad RBAC, GitHub,
-  replay, webhook, and self-verdict surfaces, including GitHub App
-  least-privilege proof for #151 with a passing
-  `mupot-github-app-permissions/v1` evidence receipt.
+- No unresolved P0/P1 security findings in the v0.23 Mupot Trusted Runtime
+  scope across tenant, squad RBAC, GitHub, replay, webhook, and self-verdict
+  surfaces, including GitHub App least-privilege proof for #151 with a passing
+  `mupot-github-app-permissions/v1` evidence receipt. The SOS/MCP substrate
+  hardening backlog (#182, #184, #185, #188) remains open and explicitly
+  deferred with full SOS retirement.
 - One task lifecycle through the product: create -> execute -> approve ->
   complete -> audit, with a passing `mupot-work-lifecycle/v1` evidence receipt.
 - One external board -> Mupot task -> agent -> GitHub PR cycle with the PR
