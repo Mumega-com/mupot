@@ -189,13 +189,6 @@ function commandLine(parts, suffix = '') {
   return `${parts.map(shellQuote).join(' ')}${suffix}`
 }
 
-function envCommandLine(env, parts, suffix = '') {
-  const envPrefix = Object.entries(env)
-    .map(([key, value]) => `${key}=${shellQuote(value)}`)
-    .join(' ')
-  return `${envPrefix} ${commandLine(parts, suffix)}`
-}
-
 function requiredControlVerbArgs(requiredControlVerbs = []) {
   return ['--require-control-verb', requiredControlVerbs.join(',')]
 }
@@ -219,7 +212,7 @@ function formatHostGoPlan(opts = {}) {
   lines.push('Manual prerequisites before running the live receipt steps:')
   lines.push('- Edit ~/.fleet/daemon.json, ~/.fleet/inbox-handler.json, ~/.fleet/control.json, and ~/.fleet/flights.json for the real pot/tenant.')
   lines.push('- Place agent private keys with 0600-style permissions and install the panel public key as public material only.')
-  lines.push('- Export MUPOT_AGENT_TOKEN for inbox probes and MUPOT_OWNER_TOKEN for lifecycle control probes; do not paste token values into receipt files.')
+  lines.push('- Export MUPOT_AGENT_TOKEN for inbox probes and MUPOT_OWNER_TOKEN for lifecycle control probes, or inject them from a secret manager. Do not paste token values into copied commands or receipt files.')
   lines.push('')
   lines.push('0. Install/update the runtime layout and save the installer receipt:')
   lines.push(commandLine(['mkdir', '-p', '~/.fleet/receipts']))
@@ -245,14 +238,14 @@ function formatHostGoPlan(opts = {}) {
     requiredControlVerbs.forEach((verb, index) => {
       const probePath = join(outDir, `probe-${safeName(verb)}.json`)
       const queueArgs = ['node', '~/.fleet/runtime/cutover-probe.mjs', '--base-url', baseUrl, '--agent', agentId]
-      const env = index === 0
-        ? { MUPOT_AGENT_TOKEN: '<agent-token>', MUPOT_OWNER_TOKEN: '<owner-token>' }
-        : { MUPOT_OWNER_TOKEN: '<owner-token>' }
       if (index === 0) queueArgs.push('--queue-inbox')
       queueArgs.push('--control', verb)
 
       lines.push(`${index + 2}. Queue ${index === 0 ? 'inbox + ' : ''}${verb} evidence and collect the receipt:`)
-      lines.push(envCommandLine(env, queueArgs, ` > ${shellQuote(probePath)}`))
+      lines.push(index === 0
+        ? '# Requires MUPOT_AGENT_TOKEN and MUPOT_OWNER_TOKEN in the environment.'
+        : '# Requires MUPOT_OWNER_TOKEN in the environment.')
+      lines.push(commandLine(queueArgs, ` > ${shellQuote(probePath)}`))
       lines.push(commandLine([
         ...commonReceiptArgs,
         '--probe-receipt',
