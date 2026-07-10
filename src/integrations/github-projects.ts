@@ -41,10 +41,11 @@ interface ProjectsEnv {
 
 // ── GraphQL query (exported for tests) ──────────────────────────────────────────────
 
-export const PROJECT_ITEMS_QUERY = `query($owner:String!,$number:Int!){
+export const PROJECT_ITEMS_QUERY = `query($owner:String!,$number:Int!,$after:String){
   organization(login:$owner){
     projectV2(number:$number){
-      items(first:50){
+      items(first:100,after:$after){
+        pageInfo{ hasNextPage endCursor }
         nodes{
           id
           content{
@@ -165,27 +166,38 @@ export async function importProjectItems(
   if (!token) return { ...empty, error: 'no_token' }
   const doFetch = opts.fetchImpl ?? fetch
 
-  let data: unknown
-  try {
-    const res = await doFetch(`${GITHUB_API}/graphql`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: 'application/vnd.github+json',
-        'User-Agent': 'mupot',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ query: PROJECT_ITEMS_QUERY, variables: { owner: params.owner, number: params.projectNumber } }),
-    })
-    if (!res.ok) return { ...empty, error: res.status === 403 || res.status === 401 ? 'projects_unavailable' : `query_failed_${res.status}` }
-    const json = (await res.json()) as { data?: unknown; errors?: unknown }
-    if (json.errors || !json.data) return { ...empty, error: 'projects_unavailable' }
-    data = json.data
-  } catch {
-    return { ...empty, error: 'query_threw' }
+  const items: ProjectImportItem[] = []
+  let after: string | null = null
+  for (let page = 0; page < 20; page += 1) {
+    let data: unknown
+    try {
+      const res = await doFetch(`${GITHUB_API}/graphql`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.github+json',
+          'User-Agent': 'mupot',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query: PROJECT_ITEMS_QUERY, variables: { owner: params.owner, number: params.projectNumber, after } }),
+      })
+      if (!res.ok) return { ...empty, error: res.status === 403 || res.status === 401 ? 'projects_unavailable' : `query_failed_${res.status}` }
+      const json = (await res.json()) as { data?: unknown; errors?: unknown }
+      if (json.errors || !json.data) return { ...empty, error: 'projects_unavailable' }
+      data = json.data
+    } catch {
+      return { ...empty, error: 'query_threw' }
+    }
+
+    items.push(...parseProjectItems(data, agentField))
+    const pageInfo = (data as { organization?: { projectV2?: { items?: { pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } } } } })
+      ?.organization?.projectV2?.items?.pageInfo
+    if (pageInfo?.hasNextPage !== true) break
+    if (typeof pageInfo.endCursor !== 'string' || !pageInfo.endCursor) return { ...empty, error: 'projects_unavailable' }
+    after = pageInfo.endCursor
+    if (page === 19) return { ...empty, error: 'projects_pagination_limit' }
   }
 
-  const items = parseProjectItems(data, agentField)
   const kv = (env as unknown as ProjectsEnv).SESSIONS
   const result: ProjectImportResult = { ok: true, imported: 0, skipped: 0, items: [] }
 

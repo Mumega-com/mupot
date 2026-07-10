@@ -34,6 +34,16 @@ function projectData() {
   }
 }
 
+function paginatedProjectData() {
+  const first = projectData()
+  first.organization.projectV2.items.nodes = [first.organization.projectV2.items.nodes[1]]
+  ;(first.organization.projectV2.items as unknown as { pageInfo: unknown }).pageInfo = { hasNextPage: true, endCursor: 'cursor-1' }
+  const second = projectData()
+  second.organization.projectV2.items.nodes = [second.organization.projectV2.items.nodes[0]]
+  ;(second.organization.projectV2.items as unknown as { pageInfo: unknown }).pageInfo = { hasNextPage: false, endCursor: null }
+  return { first, second }
+}
+
 describe('parseProjectItems', () => {
   it('extracts items + the Agent field value (case-insensitive field name)', () => {
     const items = parseProjectItems(projectData(), 'Agent')
@@ -92,6 +102,20 @@ describe('importProjectItems', () => {
     const res = await importProjectItems(e, { owner: 'o', projectNumber: 1, dryRun: true }, { fetchImpl: gqlFetch(projectData()) })
     expect(res.imported).toBe(1)
     expect(tasks).toHaveLength(0)
+  })
+
+  it('imports an assigned item from a later Project page', async () => {
+    const { e, tasks } = env()
+    const { first, second } = paginatedProjectData()
+    const fetchImpl = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { variables?: { after?: string | null } }
+      return new Response(JSON.stringify({ data: body.variables?.after === 'cursor-1' ? second : first }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const res = await importProjectItems(e, { owner: 'Mumega-com', projectNumber: 1 }, { fetchImpl })
+    expect(res.imported).toBe(1)
+    expect(tasks).toHaveLength(1)
+    expect(res.items.find((item) => item.title === 'Fix the parser')?.status).toBe('created')
   })
 
   it('dedups already-imported items (idempotent)', async () => {
