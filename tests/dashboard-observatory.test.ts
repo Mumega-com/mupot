@@ -8,6 +8,8 @@ import {
   loadSwimlaneBars,
   loadRecentTasks,
   loadObservatory,
+  loadAgentRuntimeStates,
+  deriveAgentRuntimeState,
   buildHourlyTicks,
   agentGradient,
 } from '../src/dashboard/observatory'
@@ -254,7 +256,7 @@ describe('loadRecentTasks', () => {
 
 describe('loadObservatory', () => {
   it('returns all data sub-shapes', async () => {
-    // 4 prepare() calls: agents, loadAgentStats, loadSwimlaneBars, loadRecentTasks
+    // 5 prepare() calls: agents, stats, runtime states, swimlane bars, recent tasks
     const agentRow = {
       id: 'a1', squad_id: 's1', slug: 'scout', name: 'scout',
       role: 'research', model: 'llama', status: 'active', created_at: '2026-06-01T00:00:00Z',
@@ -262,6 +264,7 @@ describe('loadObservatory', () => {
     const { env } = makeMultiEnv([
       [agentRow],  // agents SELECT
       [],          // loadAgentStats (GROUP BY)
+      [],          // loadAgentRuntimeStates
       [],          // loadSwimlaneBars
       [],          // loadRecentTasks
     ])
@@ -270,10 +273,37 @@ describe('loadObservatory', () => {
     expect(data.agents).toHaveLength(1)
     expect(data.agents[0].id).toBe('a1')
     expect(data.stats).toBeInstanceOf(Map)
+    expect(data.runtimeStates).toBeInstanceOf(Map)
     expect(data.bars).toBeInstanceOf(Array)
     expect(data.ticks).toHaveLength(7) // 6 intervals + 'now'
     expect(data.ticks[data.ticks.length - 1]).toBe('now')
     expect(data.recentTasks).toBeInstanceOf(Array)
+  })
+})
+
+describe('runtime state', () => {
+  const NOW = new Date('2026-07-10T12:00:00.000Z').getTime()
+
+  it('never calls a configured-but-unkeyed agent live', () => {
+    expect(deriveAgentRuntimeState({ key_agent_id: null, fleet_status: 'running', last_reported_at: '2026-07-10 11:59:00' }, 180, NOW))
+      .toBe('unattached')
+  })
+
+  it('requires a fresh signed heartbeat after key registration', () => {
+    expect(deriveAgentRuntimeState({ key_agent_id: 'a1', fleet_status: null, last_reported_at: null }, 180, NOW))
+      .toBe('offline')
+    expect(deriveAgentRuntimeState({ key_agent_id: 'a1', fleet_status: 'running', last_reported_at: '2026-07-10 11:59:00' }, 180, NOW))
+      .toBe('live')
+    expect(deriveAgentRuntimeState({ key_agent_id: 'a1', fleet_status: 'running', last_reported_at: '2026-07-10 11:50:00' }, 180, NOW))
+      .toBe('stale')
+  })
+
+  it('loads key and presence evidence tenant-scoped', async () => {
+    const { env, calls } = makeSingleEnv([])
+    await loadAgentRuntimeStates(env)
+    expect(calls[0].sql).toContain('LEFT JOIN agent_keys')
+    expect(calls[0].sql).toContain('LEFT JOIN fleet_agents')
+    expect(calls[0].binds).toEqual(['test'])
   })
 })
 
