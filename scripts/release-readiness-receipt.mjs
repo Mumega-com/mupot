@@ -35,6 +35,7 @@ export const REQUIRED_RECEIPTS = [
   { objective: 4, issue: 283, file: 'work-lifecycle-check.json', receipt_type: 'mupot-work-lifecycle/v1' },
   { objective: 5, issue: 150, file: 'external-pr-cycle-check.json', receipt_type: 'mupot-external-pr-cycle/v1' },
   { objective: 7, issue: 279, file: 'staging-recovery-check.json', receipt_type: 'mupot-staging-recovery-rehearsal/v1' },
+  { objective: 10, issue: 323, file: 'release-candidate-check.json', receipt_type: 'mupot-release-candidate/v1' },
   { objective: 10, issue: 280, file: 'production-soak-check.json', receipt_type: 'mupot-production-soak/v1' },
   { objective: 9, issue: 281, file: 'release-integrity-check.json', receipt_type: 'mupot-release-integrity/v1' },
 ]
@@ -42,7 +43,7 @@ export const REQUIRED_RECEIPTS = [
 // #319 closes the live board/task-mirror/PR repository divergence found while
 // collecting #150 evidence. Keep it in the final release audit so that proof
 // cannot be treated as complete if its fail-closed guard is reopened.
-export const REQUIRED_ISSUES = [150, 151, 274, 277, 279, 280, 281, 282, 283, 319]
+export const REQUIRED_ISSUES = [150, 151, 274, 277, 279, 280, 281, 282, 283, 319, 323]
 
 export const REQUIRED_CHECKS = [
   'build',
