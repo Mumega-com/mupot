@@ -35,6 +35,10 @@ const JWT_TTL_SECONDS = 8 * 60 // span with skew = 540s, 60s headroom under the 
 // Evict cached installation tokens this many seconds before their stated expiry, so we
 // never hand a caller a token that expires mid-flight.
 const TOKEN_EVICT_MARGIN_SECONDS = 60
+// A degraded GitHub API must not indefinitely block callers that are trying to
+// mint an installation token. Keep this short: callers can safely fall back to
+// a configured legacy token or defer their GitHub-side work.
+export const GITHUB_APP_REQUEST_TIMEOUT_MS = 5_000
 
 // ── base64url ──────────────────────────────────────────────────────────────────
 
@@ -262,7 +266,7 @@ export async function resolveGitHubAppCreds(env: Env): Promise<GitHubAppCreds | 
  */
 export async function getInstallationToken(
   env: Env,
-  opts?: { nowMsOverride?: number; fetchImpl?: typeof fetch },
+  opts?: { nowMsOverride?: number; fetchImpl?: typeof fetch; timeoutMs?: number },
 ): Promise<string | null> {
   const creds = await resolveGitHubAppCreds(env)
   if (!creds) return null
@@ -276,6 +280,11 @@ export async function getInstallationToken(
 
   const doFetch = opts?.fetchImpl ?? fetch
   let res: Response
+  const controller = new AbortController()
+  const timer = setTimeout(
+    () => controller.abort(),
+    opts?.timeoutMs ?? GITHUB_APP_REQUEST_TIMEOUT_MS,
+  )
   try {
     res = await doFetch(
       `${GITHUB_API}/app/installations/${encodeURIComponent(creds.installationId)}/access_tokens`,
@@ -287,27 +296,26 @@ export async function getInstallationToken(
           'X-GitHub-Api-Version': '2022-11-28',
           'User-Agent': 'mupot',
         },
+        signal: controller.signal,
       },
     )
-  } catch {
-    return null // network failure → fail closed
-  }
+    if (!res.ok) return null // 401/404/422 etc. → fail closed, leak nothing
 
-  if (!res.ok) return null // 401/404/422 etc. → fail closed, leak nothing
+    // Keep the deadline armed through body parsing too. A peer that sends headers
+    // but never completes its body must not pin a task-creation request.
+    const body = (await res.json()) as { token?: string; expires_at?: string }
+    if (!body.token || !body.expires_at) return null
 
-  let body: { token?: string; expires_at?: string }
-  try {
-    body = (await res.json()) as { token?: string; expires_at?: string }
+    const expiresAtMs = Date.parse(body.expires_at)
+    if (Number.isFinite(expiresAtMs)) {
+      tokenCache.set(creds.installationId, { token: body.token, expiresAtMs })
+    }
+    return body.token
   } catch {
     return null
+  } finally {
+    clearTimeout(timer)
   }
-  if (!body.token || !body.expires_at) return null
-
-  const expiresAtMs = Date.parse(body.expires_at)
-  if (Number.isFinite(expiresAtMs)) {
-    tokenCache.set(creds.installationId, { token: body.token, expiresAtMs })
-  }
-  return body.token
 }
 
 /**
@@ -318,7 +326,7 @@ export async function getInstallationToken(
  */
 export async function resolveOutboundGitHubToken(
   env: Env,
-  opts?: { nowMsOverride?: number; fetchImpl?: typeof fetch },
+  opts?: { nowMsOverride?: number; fetchImpl?: typeof fetch; timeoutMs?: number },
 ): Promise<string | null> {
   const appToken = await getInstallationToken(env, opts)
   if (appToken) return appToken
