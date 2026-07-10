@@ -111,6 +111,7 @@ export function formatPlan(opts = {}) {
   const outDir = defaultOutDir({ ...opts, version: tag })
   const milestonePath = join(outDir, 'github-milestone.json')
   const releasePath = join(outDir, 'github-release.json')
+  const tagPath = join(outDir, 'github-tag.json')
   const lines = []
 
   lines.push('Mupot v0.23 release-integrity evidence plan')
@@ -139,6 +140,13 @@ export function formatPlan(opts = {}) {
     '--json',
     'tagName,name,isDraft,isPrerelease,url,targetCommitish,createdAt,publishedAt,body',
   ], ` > ${shellQuote(releasePath)}`))
+  lines.push(commandLine([
+    'gh',
+    'api',
+    `repos/${repo}/commits/${tag}`,
+    '--jq',
+    '{sha: .sha, html_url: .html_url}',
+  ], ` > ${shellQuote(tagPath)}`))
   lines.push('')
   lines.push('Check the release metadata:')
   lines.push(commandLine([
@@ -253,6 +261,7 @@ export function checkBundle(opts = {}) {
   const outDir = defaultOutDir({ ...opts, version: tag })
   const milestonePath = opts.milestoneJson || join(outDir, 'github-milestone.json')
   const releasePath = opts.releaseJson || join(outDir, 'github-release.json')
+  const githubTagPath = join(outDir, 'github-tag.json')
   const checks = []
   const artifacts = {}
 
@@ -302,6 +311,20 @@ export function checkBundle(opts = {}) {
   pushCheck(checks, Boolean(tagSha), 'git_tag_exists', { tag })
   pushCheck(checks, Boolean(tagSha && headSha && tagSha === headSha), 'git_tag_points_to_head', { tag, tag_sha: tagSha || null, head_sha: headSha || null })
 
+  // targetCommitish describes how GitHub would create a missing tag and may be
+  // a moving branch name. Resolve the published tag through GitHub instead.
+  const githubTag = parseJsonFile(checks, githubTagPath, 'github_tag')
+  artifacts.github_tag = artifactMeta(githubTagPath, githubTag ? JSON.stringify(githubTag) : null)
+  const githubTagSha = String(field(githubTag, 'sha') ?? '')
+  pushCheck(checks, /^[0-9a-f]{40}$/i.test(githubTagSha), 'github_tag_commit_sha_present', {
+    path: githubTagPath,
+    actual: githubTagSha || null,
+  })
+  pushCheck(checks, Boolean(tagSha && githubTagSha && githubTagSha === tagSha), 'github_tag_commit_matches_local_tag', {
+    expected: tagSha || null,
+    actual: githubTagSha || null,
+  })
+
   const milestoneJson = parseJsonFile(checks, milestonePath, 'github_milestone')
   artifacts.github_milestone = artifactMeta(milestonePath, milestoneJson ? JSON.stringify(milestoneJson) : null)
   const milestone = chooseMilestone(milestoneJson, tag, semver)
@@ -325,9 +348,8 @@ export function checkBundle(opts = {}) {
   pushCheck(checks, releaseName.includes(tag) || releaseName.includes(semver), 'github_release_name_matches_version', { expected: tag, actual: releaseName || null })
   pushCheck(checks, releaseDraft === false, 'github_release_is_not_draft', { actual: releaseDraft })
   pushCheck(checks, releasePrerelease === false, 'github_release_is_not_prerelease', { actual: releasePrerelease })
-  pushCheck(checks, !releaseTarget || releaseTarget === tagSha || releaseTarget === tag || releaseTarget === 'main', 'github_release_target_is_plausible', {
+  pushCheck(checks, Boolean(releaseTarget), 'github_release_target_recorded', {
     target_commitish: releaseTarget || null,
-    tag_sha: tagSha || null,
   })
 
   const failed = checks.filter((check) => check.ok === false)
@@ -345,6 +367,7 @@ export function checkBundle(opts = {}) {
       package_version: packageVersion || null,
       public_api_version: publicApiVersion || null,
       git_tag_sha: tagSha || null,
+      github_tag_sha: githubTagSha || null,
       git_head_sha: headSha || null,
       milestone_title: milestoneTitle || null,
       release_tag: releaseTag || null,
