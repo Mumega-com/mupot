@@ -10,8 +10,9 @@ vars for you to review. Substrate only: nothing here touches business content.
 
 - Node 18+ and the repo dependencies installed: `npm install`
 - A Cloudflare account, authenticated once: `wrangler login`
-- An OAuth app (Google or Telegram) for login — you'll need its client id +
-  secret. Set the redirect/callback URI to `https://<your-deployment>/auth/callback`.
+- Either an OAuth app (Google or Telegram) for dashboard login, or the one-time
+  bootstrap-owner ceremony for the first local owner. OAuth uses the callback URI
+  `https://<your-deployment>/auth/callback`.
 
 ## Local browser workflow smoke
 
@@ -107,7 +108,7 @@ bash scripts/setup.sh
 # 4. First deploy (creates the Worker so secrets can attach to it).
 npm run deploy
 
-# 5. Set your secrets (read silently — never echoed, never written to disk/git).
+# 5. Set dashboard OAuth secrets (read silently — never echoed, never written to disk/git).
 bash scripts/secrets.sh
 
 # 6. Re-deploy to pick the secrets up, then open your deployment and log in.
@@ -119,7 +120,9 @@ from there the in-app setup wizard walks you through seeding your org
 (departments → squads → agents). You're live.
 
 > Tip: if `secret put` complains the Worker doesn't exist yet, run `npm run deploy`
-> once first (step 4), then `bash scripts/secrets.sh`. Re-deploy afterward.
+> once first (step 4), then `bash scripts/secrets.sh`. Re-deploy afterward. For
+> an OAuth-free first owner, replace step 5 with `bash scripts/secrets.sh --bootstrap-owner`,
+> re-deploy, open `/auth/bootstrap`, and delete the bootstrap secret after claiming the owner session.
 
 For an additional isolated pot in the same checkout, use a slug instead of
 copying resource identifiers by hand:
@@ -130,6 +133,17 @@ npx wrangler deploy --config wrangler.acme.toml
 bash scripts/secrets.sh --pot acme
 npx wrangler deploy --config wrangler.acme.toml
 ```
+
+For an OAuth-free first owner on a new self-hosted pot, deploy once and run:
+
+```bash
+bash scripts/secrets.sh --pot acme --bootstrap-owner
+npx wrangler deploy --config wrangler.acme.toml
+```
+
+Open `<your-pot-url>/auth/bootstrap`, submit the printed token and the owner's
+email, then delete `BOOTSTRAP_OWNER_TOKEN` with Wrangler. The route is disabled
+when dashboard OAuth is configured and closes permanently after the first claim.
 
 ## What `setup.sh` does
 

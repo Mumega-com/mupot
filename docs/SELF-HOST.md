@@ -32,19 +32,33 @@ scripts/provision-pot.sh acme      # creates resources, writes wrangler.acme.tom
 ```
 
 The script writes tenant-scoped resource names and bindings into
-`wrangler.acme.toml`; no resource ID copying is required. Set secrets against
-that exact config, deploy once, set the secrets, then deploy again:
+`wrangler.acme.toml`; no resource ID copying is required. Deploy once, then choose
+one dashboard owner setup method against that exact config.
 
 ```bash
 npx wrangler deploy --config wrangler.acme.toml
+
+# Option A: Google dashboard login
 bash scripts/secrets.sh --pot acme
 npx wrangler deploy --config wrangler.acme.toml
+
+# Option B: no OAuth provider for the first owner
+bash scripts/secrets.sh --pot acme --bootstrap-owner
+npx wrangler deploy --config wrangler.acme.toml
+# Open https://<your-pot-url>/auth/bootstrap and enter your email plus the printed token.
+npx wrangler secret delete BOOTSTRAP_OWNER_TOKEN --config wrangler.acme.toml
 ```
+
+The bootstrap route is intentionally available only while dashboard OAuth is
+unconfigured. Its D1-backed singleton claim allows one owner session only; deleting
+the secret after use removes the remaining deployment credential.
 
 ## Secrets
 
 Secrets are Worker secrets (`wrangler secret put`), never in the toml.
 - `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` — dashboard login.
+- `BOOTSTRAP_OWNER_TOKEN` — generated only by `secrets.sh --bootstrap-owner` for a
+  one-time first owner when dashboard OAuth is intentionally absent. Remove it after use.
 - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` — optional MCP OAuth 2.1
   provider credentials when exposing the Google-backed OAuth flow.
 - Per-integration (optional): `GHL_API_KEY` / `GHL_LOCATION_ID` / `GHL_WEBHOOK_SECRET`.

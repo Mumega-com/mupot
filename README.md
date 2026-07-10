@@ -143,12 +143,15 @@ git clone https://github.com/<you>/mupot && cd mupot && npm install
 wrangler login
 bash scripts/setup.sh          # creates D1, Vectorize, Queues, KV, R2 + applies migrations
 
-# 3. Set your secrets (never in git)
+# 3. First deploy, then set your secrets (never in git)
+npm run deploy
 bash scripts/secrets.sh        # OAuth login + optional GitHub / AI Gateway
-
-# 4. Deploy
 npm run deploy
 ```
+
+For an OAuth-free first owner, use `bash scripts/secrets.sh --bootstrap-owner`
+after the first deploy, deploy again, and complete `/auth/bootstrap` with the
+printed one-time token. Delete `BOOTSTRAP_OWNER_TOKEN` afterward.
 
 Then open your deployment, **log in as owner**, and the **setup wizard** walks you through it:
 name your org → create departments + squads → connect the agent you already have → invite your

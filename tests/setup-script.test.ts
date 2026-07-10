@@ -74,6 +74,15 @@ describe('per-pot setup script', () => {
       const callsAfterSecrets = readFileSync(log, 'utf8')
       expect(callsAfterSecrets).toContain(`secret put OAUTH_CLIENT_ID --config ${config}`)
       expect(callsAfterSecrets).toContain(`secret put OAUTH_CLIENT_SECRET --config ${config}`)
+
+      const bootstrapOutput = execFileSync('bash', ['scripts/secrets.sh', '--pot', pot, '--bootstrap-owner'], {
+        cwd: repoRoot,
+        env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, FAKE_NPX_LOG: log },
+        input: '\n\n',
+        encoding: 'utf8',
+      })
+      expect(bootstrapOutput).toContain('/auth/bootstrap')
+      expect(readFileSync(log, 'utf8')).toContain(`secret put BOOTSTRAP_OWNER_TOKEN --config ${config}`)
     } finally {
       rmSync(config, { force: true })
       rmSync(temp, { recursive: true, force: true })

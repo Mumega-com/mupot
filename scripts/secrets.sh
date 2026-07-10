@@ -3,20 +3,23 @@
 #
 # Prompts for each secret and pipes it to `wrangler secret put`. Values are read
 # silently (read -r -s): nothing is echoed to the terminal, nothing is written to
-# any file, nothing is committed. The secret only ever travels stdin → wrangler →
-# Cloudflare. This is the ONLY place secrets enter the system; wrangler.toml and
-# git stay clean (this is a PUBLIC template repo).
+# any file, nothing is committed. The bootstrap-owner mode deliberately prints a
+# generated one-time token so the operator can enter it in the local pot. The
+# secret only ever travels stdin → wrangler → Cloudflare; wrangler.toml and git
+# stay clean (this is a PUBLIC template repo).
 #
 # Secrets (see src/types.ts Env):
 #   OAUTH_CLIENT_ID      (required) — your OAuth app client id     [Google/Telegram]
 #   OAUTH_CLIENT_SECRET  (required) — your OAuth app client secret
 #   GITHUB_TOKEN         (optional) — for mirroring tasks to GitHub Issues
 #   AI_GATEWAY_TOKEN     (optional) — for routing models via Cloudflare AI Gateway
+#   BOOTSTRAP_OWNER_TOKEN (one-time) — bootstrap the first dashboard owner without OAuth
 #
 # Usage:
 #   wrangler login         # once
 #   bash scripts/secrets.sh
 #   bash scripts/secrets.sh --pot acme
+#   bash scripts/secrets.sh --pot acme --bootstrap-owner
 #
 # Re-runnable: setting a secret again simply overwrites it.
 
@@ -25,12 +28,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 POT=""
+BOOTSTRAP_OWNER=0
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/secrets.sh [--pot <slug>]
+Usage: bash scripts/secrets.sh [--pot <slug>] [--bootstrap-owner]
 
 Without --pot, targets wrangler.toml. With --pot, targets wrangler.<slug>.toml.
+--bootstrap-owner skips dashboard OAuth and generates a one-time first-owner token.
 EOF
 }
 
@@ -40,6 +45,10 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { usage >&2; exit 1; }
       POT="$2"
       shift 2
+      ;;
+    --bootstrap-owner)
+      BOOTSTRAP_OWNER=1
+      shift
       ;;
     --help|-h)
       usage
@@ -124,14 +133,37 @@ put_secret() {
   unset value
 }
 
+put_secret_value() {
+  local name="$1" value="$2"
+  say "Setting ${name}…"
+  if printf '%s' "$value" | "${WRANGLER[@]}" secret put "$name" --config "${WRANGLER_TOML}" >/dev/null 2>&1; then
+    ok "${name} set."
+  else
+    die "Failed to set ${name}. Are you logged in and is the Worker deployed once? (wrangler deploy)"
+  fi
+}
+
 say "Setting mupot secrets for $(basename "${WRANGLER_TOML}")."
 printf 'Values are read silently and never written to disk or git.\n\n'
 
-put_secret OAUTH_CLIENT_ID     required
-put_secret OAUTH_CLIENT_SECRET required
+if [ "${BOOTSTRAP_OWNER}" -eq 1 ]; then
+  BOOTSTRAP_TOKEN="$(node -e "const { randomBytes } = require('node:crypto'); process.stdout.write(randomBytes(32).toString('base64url'))")" \
+    || die "Could not generate BOOTSTRAP_OWNER_TOKEN; Node.js is required."
+  printf 'One-time owner bootstrap token (record it now; it is not stored in this checkout):\n%s\n\n' "${BOOTSTRAP_TOKEN}"
+  put_secret_value BOOTSTRAP_OWNER_TOKEN "${BOOTSTRAP_TOKEN}"
+  unset BOOTSTRAP_TOKEN
+else
+  put_secret OAUTH_CLIENT_ID     required
+  put_secret OAUTH_CLIENT_SECRET required
+fi
+
 put_secret GITHUB_TOKEN        optional
 put_secret AI_GATEWAY_TOKEN    optional
 
 printf '\n'
 ok "Secrets configured."
 say "Deploy (or re-deploy) to pick them up:  npx wrangler deploy --config \"${WRANGLER_TOML}\""
+if [ "${BOOTSTRAP_OWNER}" -eq 1 ]; then
+  say "After deploy, open <your-pot-url>/auth/bootstrap and submit your email with the printed token."
+  say "After the owner session is created, remove the bootstrap secret:  npx wrangler secret delete BOOTSTRAP_OWNER_TOKEN --config \"${WRANGLER_TOML}\""
+fi

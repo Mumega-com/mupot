@@ -87,6 +87,9 @@ export interface Env {
   // secrets (present at runtime only)
   OAUTH_CLIENT_ID?: string
   OAUTH_CLIENT_SECRET?: string
+  // One-time self-hosted first-owner ceremony. Enabled only while dashboard OAuth
+  // is entirely unconfigured; the D1 singleton claim permanently closes it after use.
+  BOOTSTRAP_OWNER_TOKEN?: string
   // Local-only test login. Intended for `wrangler dev` smoke testing with a local D1/KV.
   // Never set this on a deployed pot; when unset, /auth/dev-login is disabled.
   LOCAL_TEST_AUTH?: string
