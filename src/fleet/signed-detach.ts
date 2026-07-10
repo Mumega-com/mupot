@@ -5,6 +5,7 @@
 // key-derived and is never accepted from the body.
 
 import type { Env } from '../types'
+import { loadActiveAgentKey } from './agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from './shared-nonce-ledger'
 
 export const DETACH_WINDOW_SEC = sharedNonceWindowSec('fleet-detach:v1')
@@ -61,7 +62,7 @@ async function importEd25519Pub(xB64url: string): Promise<CryptoKey | null> {
 export type SignedDetachOk = {
   ok: true
   agent_id: string
-  member_id: string | null
+  member_id: string
 }
 
 export type SignedDetachErr = {
@@ -106,11 +107,7 @@ export async function verifySignedDetach(
   }
 
   const tenant = env.TENANT_SLUG
-  const keyRow = await env.DB.prepare(
-    `SELECT pubkey, algo, member_id FROM agent_keys WHERE tenant = ?1 AND agent_id = ?2`,
-  )
-    .bind(tenant, agentId)
-    .first<{ pubkey: string; algo: string; member_id: string | null }>()
+  const keyRow = await loadActiveAgentKey(env, agentId)
 
   if (!keyRow || keyRow.algo !== 'Ed25519' || !PUBKEY_B64URL_RE.test(keyRow.pubkey)) {
     return { ok: false, status: 401, error: 'unauthorized', detail: 'signature verification failed' }
@@ -147,5 +144,5 @@ export async function verifySignedDetach(
     return { ok: false, status: 409, error: 'replay', detail: 'nonce already used' }
   }
 
-  return { ok: true, agent_id: agentId, member_id: keyRow.member_id ?? null }
+  return { ok: true, agent_id: agentId, member_id: keyRow.member_id }
 }

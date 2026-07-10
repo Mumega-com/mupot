@@ -18,6 +18,7 @@
 //     leaks key material.
 
 import type { Env } from '../types'
+import { loadActiveAgentKey } from './agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from './shared-nonce-ledger'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────
@@ -96,7 +97,7 @@ export type SignedAttachOk = {
   type: string
   runtime: string
   lifecycle: string
-  member_id: string | null
+  member_id: string
 }
 export type SignedAttachErr = {
   ok: false
@@ -171,11 +172,7 @@ export async function verifySignedAttach(
   // 3. Look up the registered PUBLIC key for THIS tenant + agent. No key → no signed
   //    attach (and crucially: no fallthrough to bearer; the route enforces that).
   const tenant = env.TENANT_SLUG
-  const keyRow = await env.DB.prepare(
-    `SELECT pubkey, algo, member_id FROM agent_keys WHERE tenant = ?1 AND agent_id = ?2`,
-  )
-    .bind(tenant, agentId)
-    .first<{ pubkey: string; algo: string; member_id: string | null }>()
+  const keyRow = await loadActiveAgentKey(env, agentId)
 
   if (!keyRow || keyRow.algo !== 'Ed25519' || !PUBKEY_B64URL_RE.test(keyRow.pubkey)) {
     // Indistinguishable from a bad signature to the caller — no key-existence oracle.
@@ -220,5 +217,5 @@ export async function verifySignedAttach(
     return { ok: false, status: 409, error: 'replay', detail: 'nonce already used' }
   }
 
-  return { ok: true, agent_id: agentId, type, runtime, lifecycle, member_id: keyRow.member_id ?? null }
+  return { ok: true, agent_id: agentId, type, runtime, lifecycle, member_id: keyRow.member_id }
 }

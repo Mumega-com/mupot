@@ -60,8 +60,8 @@ async function upsertRunning(
     .run()
 }
 
-/** Mark a fleet row stopped for the authenticated/key-bound identity. `memberId`
- *  may be null for legacy key rows; in that case only a null-owned row can stop. */
+/** Mark a fleet row stopped for the authenticated/key-bound identity. Signed
+ *  verifiers require an active bound member before calling this helper. */
 async function markStopped(env: Env, agentId: string, memberId: string | null): Promise<number> {
   const result = await env.DB.prepare(
     `UPDATE fleet_agents

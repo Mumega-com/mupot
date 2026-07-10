@@ -36,6 +36,12 @@ interface AgentKeyRow {
   member_id: string | null
 }
 
+export interface ActiveAgentKey {
+  pubkey: string
+  algo: string
+  member_id: string
+}
+
 export type RegisterAgentKeyResult =
   | { ok: true; status: 'registered' | 'bound' | 'already_registered'; memberId: string }
   | { ok: false; reason: 'identity_unminted' | 'identity_ambiguous' | 'key_conflict' }
@@ -46,6 +52,23 @@ async function loadKey(env: Env, agentId: string): Promise<AgentKeyRow | null> {
        FROM agent_keys
       WHERE tenant = ?1 AND agent_id = ?2`,
   ).bind(env.TENANT_SLUG, agentId).first<AgentKeyRow>()
+}
+
+/**
+ * Resolve a runtime key only when its identity binding remains valid. Signed
+ * endpoints must not authenticate legacy unbound keys, or keys whose member has
+ * since been disabled. The key row and member row are tenant-bound in the join.
+ */
+export async function loadActiveAgentKey(env: Env, agentId: string): Promise<ActiveAgentKey | null> {
+  return env.DB.prepare(
+    `SELECT k.pubkey, k.algo, k.member_id
+       FROM agent_keys k
+       JOIN members m ON m.id = k.member_id AND m.tenant = k.tenant
+      WHERE k.tenant = ?1
+        AND k.agent_id = ?2
+        AND k.member_id IS NOT NULL
+        AND m.status = 'active'`,
+  ).bind(env.TENANT_SLUG, agentId).first<ActiveAgentKey>()
 }
 
 /**

@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS agent_keys (
   algo       TEXT    NOT NULL DEFAULT 'Ed25519',
   member_id  TEXT,                             -- mupot member this key authenticates AS
                                                -- (the identity binding; set at registration,
-                                               -- the Hadi-gated moment). NULL = unbound key.
+                                               -- the Hadi-gated moment). NULL legacy rows
+                                               -- are rejected by signed endpoints until bound.
   created_at INTEGER NOT NULL,                 -- unix seconds
   PRIMARY KEY (tenant, agent_id)
 );

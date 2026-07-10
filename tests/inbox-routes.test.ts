@@ -29,6 +29,7 @@ interface KeyRow { pubkey: string; algo: string; member_id: string | null }
 function makeDb(
   agents: Array<{ id: string; squad_id: string; slug: string; name: string }>,
   keys: Record<string, KeyRow> = {},
+  memberStatuses: Record<string, string> = {},
 ) {
   const messages: MsgRow[] = []
   const nonces = new Set<string>()
@@ -50,6 +51,11 @@ function makeDb(
     throw new Error('unhandled run: ' + sql)
   }
   function runFirst(sql: string, b: unknown[]) {
+    if (sql.includes('FROM agent_keys k') && sql.includes('JOIN members m')) {
+      const [tenant, agentId] = b as [string, string]
+      const key = keys[`${tenant}:${agentId}`]
+      return key?.member_id && memberStatuses[key.member_id] !== 'inactive' ? key : null
+    }
     if (sql.includes('from_agent = ?2 AND request_id = ?3')) {
       const [tenant, from_agent, request_id] = b as [string, string, string]
       const m = messages.find((x) => x.tenant === tenant && x.from_agent === from_agent && x.request_id === request_id)
@@ -116,8 +122,9 @@ function makeDb(
 function env(
   agents: Array<{ id: string; squad_id: string; slug: string; name: string }> = [],
   keys: Record<string, KeyRow> = {},
+  memberStatuses: Record<string, string> = {},
 ): { env: Env; db: ReturnType<typeof makeDb> } {
-  const db = makeDb(agents, keys)
+  const db = makeDb(agents, keys, memberStatuses)
   return { env: { TENANT_SLUG: 't', DB: db } as unknown as Env, db }
 }
 
@@ -287,7 +294,7 @@ describe('POST /api/inbox/signed', () => {
 
   it('replay of the same signed inbox request is rejected', async () => {
     const { kp, pubX } = await genKey()
-    const { env: e } = env(AGENTS, { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: null } })
+    const { env: e } = env(AGENTS, { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-code' } })
     const body = await signedInboxBody(kp.privateKey, 'ag-code', { peek: true, limit: 10 })
     expect((await postSigned(body, e)).status).toBe(200)
     expect((await postSigned(body, e)).status).toBe(409)
@@ -295,7 +302,7 @@ describe('POST /api/inbox/signed', () => {
 
   it('tampered read mode after signing is rejected', async () => {
     const { kp, pubX } = await genKey()
-    const { env: e } = env(AGENTS, { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: null } })
+    const { env: e } = env(AGENTS, { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-code' } })
     const body = await signedInboxBody(kp.privateKey, 'ag-code', { peek: true, limit: 10 })
     ;(body as Record<string, unknown>).peek = false
     expect((await postSigned(body, e)).status).toBe(401)
@@ -305,5 +312,18 @@ describe('POST /api/inbox/signed', () => {
     const { kp } = await genKey()
     const { env: e } = env(AGENTS)
     expect((await postSigned(await signedInboxBody(kp.privateKey, 'ag-code'), e)).status).toBe(401)
+  })
+
+  it('unbound or disabled keys cannot read a signed inbox', async () => {
+    const { kp, pubX } = await genKey()
+    const unbound = env(AGENTS, { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: null } })
+    expect((await postSigned(await signedInboxBody(kp.privateKey, 'ag-code'), unbound.env)).status).toBe(401)
+
+    const disabled = env(
+      AGENTS,
+      { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-code' } },
+      { 'm-code': 'inactive' },
+    )
+    expect((await postSigned(await signedInboxBody(kp.privateKey, 'ag-code'), disabled.env)).status).toBe(401)
   })
 })
