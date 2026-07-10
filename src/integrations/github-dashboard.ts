@@ -85,6 +85,53 @@ ${raw(connectionCard)}
   </table>
 </div>
 
+<h2>Project intake</h2>
+<div class="card">
+  <p style="color:var(--muted);font-size:14px;margin:0 0 12px">
+    Import items assigned to a Mupot agent from a GitHub Project. The import is idempotent; preview it first when changing a board mapping.
+  </p>
+  <form method="post" action="/admin/github/import-project" onsubmit="return ghImportProject(event)">
+    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
+      <label>Organization
+        <input type="text" name="owner" id="ghProjectOwner" value="Mumega-com" required
+          style="font-family:monospace;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)">
+      </label>
+      <label>Project number
+        <input type="number" name="projectNumber" id="ghProjectNumber" min="1" required
+          style="width:92px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)">
+      </label>
+      <label>Agent field
+        <input type="text" name="agentField" id="ghProjectAgentField" value="Agent" required
+          style="width:110px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)">
+      </label>
+      <button class="btn sm secondary" type="button" onclick="ghImportProject(null, true)">Preview</button>
+      <button class="btn sm" type="submit">Import assigned items</button>
+    </div>
+  </form>
+  <pre id="ghProjectOut" style="margin-top:12px;font-size:12px;color:var(--muted);white-space:pre-wrap"></pre>
+</div>
+
+<h2>Task pull request</h2>
+<div class="card">
+  <p style="color:var(--muted);font-size:14px;margin:0 0 12px">
+    Publish one reviewed task result through the installed GitHub App. Mupot links the resulting pull request back to the task.
+  </p>
+  <form method="post" action="/admin/github/execute-task" onsubmit="return ghExecuteTask(event)">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px">
+      <label>Task ID<input type="text" id="ghTaskId" required style="width:100%;box-sizing:border-box;font-family:monospace;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)"></label>
+      <label>Repository<input type="text" id="ghTaskRepo" placeholder="owner/repo" required style="width:100%;box-sizing:border-box;font-family:monospace;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)"></label>
+      <label>Branch<input type="text" id="ghTaskBranch" placeholder="mupot/task-evidence" required style="width:100%;box-sizing:border-box;font-family:monospace;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)"></label>
+      <label>Base branch<input type="text" id="ghTaskBase" value="main" required style="width:100%;box-sizing:border-box;font-family:monospace;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)"></label>
+      <label>File path<input type="text" id="ghTaskPath" placeholder="docs/evidence.md" required style="width:100%;box-sizing:border-box;font-family:monospace;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)"></label>
+      <label>Title<input type="text" id="ghTaskTitle" required style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)"></label>
+    </div>
+    <label style="display:block;margin-top:8px">Pull request body<textarea id="ghTaskBody" rows="3" style="width:100%;box-sizing:border-box;margin-top:4px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)"></textarea></label>
+    <label style="display:block;margin-top:8px">File content<textarea id="ghTaskContent" rows="10" required style="width:100%;box-sizing:border-box;margin-top:4px;font-family:monospace;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)"></textarea></label>
+    <button class="btn sm" type="submit" style="margin-top:8px">Create task pull request</button>
+  </form>
+  <pre id="ghTaskOut" style="margin-top:12px;font-size:12px;color:var(--muted);white-space:pre-wrap"></pre>
+</div>
+
 <h2>Sync the fleet to GitHub</h2>
 <div class="card">
   <p style="color:var(--muted);font-size:14px;margin:0 0 12px">
@@ -115,6 +162,48 @@ async function ghSyncFleet(ev, dry) {
     const res = await fetch('/admin/github/sync-fleet', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ repo, dryRun: !!dry }),
+    });
+    out.textContent = JSON.stringify(await res.json(), null, 2);
+  } catch (e) { out.textContent = 'Error: ' + e; }
+  return false;
+}
+
+async function ghImportProject(ev, dry) {
+  if (ev) ev.preventDefault();
+  const owner = document.getElementById('ghProjectOwner').value.trim();
+  const projectNumber = Number(document.getElementById('ghProjectNumber').value);
+  const agentField = document.getElementById('ghProjectAgentField').value.trim();
+  const out = document.getElementById('ghProjectOut');
+  if (!owner || !Number.isInteger(projectNumber) || projectNumber < 1 || !agentField) { out.textContent = 'Enter an organization, project number, and agent field.'; return false; }
+  out.textContent = dry ? 'Previewing…' : 'Importing…';
+  try {
+    const res = await fetch('/admin/github/import-project', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ owner, projectNumber, agentField, dryRun: !!dry }),
+    });
+    out.textContent = JSON.stringify(await res.json(), null, 2);
+  } catch (e) { out.textContent = 'Error: ' + e; }
+  return false;
+}
+
+async function ghExecuteTask(ev) {
+  ev.preventDefault();
+  const field = (id) => document.getElementById(id).value.trim();
+  const taskId = field('ghTaskId');
+  const repo = field('ghTaskRepo');
+  const branchName = field('ghTaskBranch');
+  const baseBranch = field('ghTaskBase');
+  const path = field('ghTaskPath');
+  const title = field('ghTaskTitle');
+  const bodyText = document.getElementById('ghTaskBody').value;
+  const content = document.getElementById('ghTaskContent').value;
+  const out = document.getElementById('ghTaskOut');
+  if (!taskId || !repo || !branchName || !baseBranch || !path || !title || !content) { out.textContent = 'Complete every required field.'; return false; }
+  out.textContent = 'Creating pull request…';
+  try {
+    const res = await fetch('/admin/github/execute-task', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskId, repo, branchName, baseBranch, files: [{ path, content }], title, bodyText }),
     });
     out.textContent = JSON.stringify(await res.json(), null, 2);
   } catch (e) { out.textContent = 'Error: ' + e; }
