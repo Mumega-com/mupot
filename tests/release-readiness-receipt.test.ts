@@ -50,6 +50,23 @@ function writeBundle(dir: string, mutate?: (dir: string) => void) {
     link: `https://github.test/checks/${encodeURIComponent(name)}`,
   })))
 
+  writeJson(join(dir, 'github-pr.json'), {
+    number: 285,
+    url: 'https://github.test/pull/285',
+    state: 'OPEN',
+    isDraft: false,
+    headRefName: 'codex/v0.23-rc',
+    headRefOid: 'abc123',
+    baseRefName: 'main',
+    mergeStateStatus: 'CLEAN',
+    statusCheckRollup: REQUIRED_CHECKS.map((name) => ({
+      name,
+      conclusion: 'SUCCESS',
+      status: 'COMPLETED',
+      link: `https://github.test/checks/${encodeURIComponent(name)}`,
+    })),
+  })
+
   writeJson(join(dir, 'github-app.json'), {
     id: 123456,
     slug: 'mupot',
@@ -77,6 +94,8 @@ describe('release readiness receipt checker', () => {
     expect(plan).toContain('Mupot v0.23 final release-readiness evidence plan')
     expect(plan).toContain('fresh-install-check.json')
     expect(plan).toContain('github-issues.json')
+    expect(plan).toContain('github-pr.json')
+    expect(plan).toContain('gh pr view 285 --repo Mumega-com/mupot')
     expect(plan).toContain('github-checks.json')
     expect(plan).toContain('gh pr checks --repo Mumega-com/mupot 285')
     expect(plan).toContain('github-app.json')
@@ -88,7 +107,7 @@ describe('release readiness receipt checker', () => {
     const dir = tempDir()
     writeBundle(dir)
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
 
     expect(receipt.receipt_type).toBe(CHECK_RECEIPT_TYPE)
     expect(receipt.status).toBe('pass')
@@ -108,7 +127,7 @@ describe('release readiness receipt checker', () => {
       })
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
@@ -127,7 +146,7 @@ describe('release readiness receipt checker', () => {
       })))
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
@@ -147,7 +166,7 @@ describe('release readiness receipt checker', () => {
       })))
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
@@ -168,7 +187,7 @@ describe('release readiness receipt checker', () => {
       })
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
@@ -189,13 +208,60 @@ describe('release readiness receipt checker', () => {
       })
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
       check: 'github_app_has_no_extra_permissions',
       extras: [{ permission: 'members', actual: 'write' }],
+    }))
+  })
+
+  it('fails when the release-candidate PR metadata is from another PR', () => {
+    const dir = tempDir()
+    writeBundle(dir, () => {
+      writeJson(join(dir, 'github-pr.json'), {
+        number: 284,
+        statusCheckRollup: REQUIRED_CHECKS.map((name) => ({
+          name,
+          conclusion: 'SUCCESS',
+          status: 'COMPLETED',
+        })),
+      })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'checks_pr_number_matches_export',
+      expected: 285,
+      actual: 284,
+    }))
+  })
+
+  it('fails when the release-candidate PR rollup lacks a required passing check', () => {
+    const dir = tempDir()
+    writeBundle(dir, () => {
+      writeJson(join(dir, 'github-pr.json'), {
+        number: 285,
+        statusCheckRollup: REQUIRED_CHECKS.map((name) => ({
+          name,
+          conclusion: name === 'CodeQL' ? 'FAILURE' : 'SUCCESS',
+          status: 'COMPLETED',
+        })),
+      })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'required_pr_rollup_check_passed',
+      check_name: 'CodeQL',
     }))
   })
 })
