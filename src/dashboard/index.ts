@@ -2818,7 +2818,9 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
             var role = document.getElementById('footer-role');
             var av   = document.getElementById('footer-avatar');
             if (name) name.textContent = a.name || who;
-            if (role && a.capability) role.textContent = a.capability;
+            // /auth/me returns the authenticated org role. Older response shapes
+            // may expose capability, but must never leave an owner as "member".
+            if (role && (a.role || a.capability)) role.textContent = a.role || a.capability;
             if (av) {
               var initials = (a.name || who || '?').replace(/\s+/g, ' ').split(' ').map(function(w){ return w[0]; }).join('').substring(0, 2).toUpperCase();
               av.textContent = initials;
