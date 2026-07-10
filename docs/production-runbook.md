@@ -327,7 +327,9 @@ npm run receipt:fresh-install:plan -- \
   --out-dir "tmp/fresh-install/${POT}"
 ```
 
-The bundle directory must contain these redacted step receipts:
+The bundle directory must contain these redacted step receipts. Run them in the
+listed order without overlap; each step must start after the previous step
+completes:
 
 | File | Proves |
 |---|---|
@@ -365,6 +367,13 @@ Each step receipt must use:
   }
 }
 ```
+
+Every required evidence flag must be the JSON boolean `true`; descriptive
+strings do not satisfy a flag. `worker-deployed.json` is the exception for
+`evidence.deployed_url`, which must be an HTTP(S) URL exactly matching
+`target.base_url`. Every receipt must carry the same non-placeholder `pot`,
+`base_url`, `operator`, `cloudflare_account`, `worker`, `db`, and `config`, and
+must attest `evidence.no_manual_db_edits:true`.
 
 Check the completed bundle:
 

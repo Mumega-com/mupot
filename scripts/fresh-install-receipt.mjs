@@ -156,6 +156,8 @@ export function formatPlan(opts = {}) {
   lines.push('- Keep token values, cookies, private keys, OAuth client secrets, and provider credentials out of receipts.')
   lines.push('- Record command ids, command names, secret names, binding names, URLs, and redacted artifact paths only.')
   lines.push('- Do not repair setup by editing D1 rows manually. If manual DB edits are needed, the receipt must fail.')
+  lines.push('- Run every step in the printed order without overlap; each step must start after the previous step completes.')
+  lines.push('- Every step must attest no_manual_db_edits:true and identify the same account, Worker, D1 database, and config.')
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', outDir]))
   lines.push('')
@@ -305,6 +307,39 @@ function receiptTargetValue(receipt, field) {
   return typeof value === 'string' ? stripTrailingSlash(value.trim()) : ''
 }
 
+function receiptTargetValuePass(value) {
+  return Boolean(value) && !/^<[^>]+>$/.test(value)
+}
+
+function evidenceString(receipt, field) {
+  const value = receipt?.evidence?.[field]
+  return typeof value === 'string' ? stripTrailingSlash(value.trim()) : ''
+}
+
+function isHttpUrl(value) {
+  try {
+    const url = new URL(value)
+    return (url.protocol === 'http:' || url.protocol === 'https:') && Boolean(url.hostname)
+  } catch {
+    return false
+  }
+}
+
+function receiptTimes(receipt) {
+  const startedAt = typeof receipt?.started_at === 'string' ? receipt.started_at.trim() : ''
+  const completedAt = typeof receipt?.completed_at === 'string' ? receipt.completed_at.trim() : ''
+  const startedMs = startedAt ? Date.parse(startedAt) : NaN
+  const completedMs = completedAt ? Date.parse(completedAt) : NaN
+  return {
+    started_at: startedAt,
+    completed_at: completedAt,
+    started_ms: startedMs,
+    completed_ms: completedMs,
+    started_ok: Boolean(startedAt) && Number.isFinite(startedMs),
+    completed_ok: Boolean(completedAt) && Number.isFinite(completedMs),
+  }
+}
+
 function checkReceiptBasics(checks, receipt, path, step) {
   pushCheck(checks, receipt.receipt_type === STEP_RECEIPT_TYPE, 'receipt_type_matches', {
     path,
@@ -329,11 +364,8 @@ function commandText(command) {
 }
 
 function commandOk(command) {
-  if (typeof command === 'string') return true
   if (!command || typeof command !== 'object') return false
-  if ('ok' in command) return command.ok === true
-  if ('exit_code' in command) return command.exit_code === 0
-  return true
+  return command.ok === true && command.exit_code === 0
 }
 
 function commandShowsManualDbEdit(command) {
@@ -346,6 +378,7 @@ export function checkBundle(opts = {}) {
   const outDir = resolve(defaultOutDir(opts))
   const checks = []
   const artifacts = {}
+  const timeline = []
 
   pushCheck(checks, existsSync(outDir), 'evidence_directory_present', { out_dir: outDir })
   if (existsSync(outDir)) {
@@ -363,9 +396,31 @@ export function checkBundle(opts = {}) {
     receipts.push({ spec, path, receipt })
     checkReceiptBasics(checks, receipt, path, spec.step)
 
+    const times = receiptTimes(receipt)
+    pushCheck(checks, times.started_ok, 'receipt_started_at_parseable', {
+      path,
+      step: spec.step,
+      started_at: times.started_at || null,
+    })
+    pushCheck(checks, times.completed_ok, 'receipt_completed_at_parseable', {
+      path,
+      step: spec.step,
+      completed_at: times.completed_at || null,
+    })
+    pushCheck(checks, times.started_ok && times.completed_ok && times.completed_ms >= times.started_ms, 'receipt_time_order', {
+      path,
+      step: spec.step,
+      started_at: times.started_at || null,
+      completed_at: times.completed_at || null,
+    })
+    if (times.started_ok && times.completed_ok) {
+      timeline.push({ step: spec.step, ...times })
+    }
+
     for (const key of spec.evidence) {
       const value = receipt?.evidence?.[key]
-      pushCheck(checks, evidenceValuePass(value), 'required_evidence_present', {
+      const evidencePasses = key === 'deployed_url' ? evidenceValuePass(value) : value === true
+      pushCheck(checks, evidencePasses, 'required_evidence_present', {
         path,
         step: spec.step,
         evidence: key,
@@ -375,6 +430,12 @@ export function checkBundle(opts = {}) {
 
     const commands = Array.isArray(receipt.commands) ? receipt.commands : []
     pushCheck(checks, commands.length > 0, 'receipt_records_commands', { path, step: spec.step, count: commands.length })
+    const unnamedCommands = commands.map(commandText).filter((command) => !command.trim())
+    pushCheck(checks, unnamedCommands.length === 0, 'receipt_commands_named', {
+      path,
+      step: spec.step,
+      unnamed_count: unnamedCommands.length,
+    })
     const failedCommands = commands.filter((command) => !commandOk(command)).map(commandText)
     pushCheck(checks, failedCommands.length === 0, 'receipt_commands_succeeded', { path, step: spec.step, failed_commands: failedCommands })
     const manualDbCommands = commands.filter(commandShowsManualDbEdit).map(commandText)
@@ -385,10 +446,30 @@ export function checkBundle(opts = {}) {
     })
   }
 
-  const targetFields = ['pot', 'base_url', 'operator', 'cloudflare_account']
+  for (let index = 1; index < timeline.length; index += 1) {
+    const previous = timeline[index - 1]
+    const current = timeline[index]
+    pushCheck(checks, current.started_ms >= previous.completed_ms, 'install_steps_run_in_order_without_overlap', {
+      previous_step: previous.step,
+      previous_completed_at: previous.completed_at,
+      step: current.step,
+      started_at: current.started_at,
+    })
+  }
+
+  const targetFields = ['pot', 'base_url', 'operator', 'cloudflare_account', 'worker', 'db', 'config']
   const target = {}
   for (const field of targetFields) {
-    const values = [...new Set(receipts.map(({ receipt }) => receiptTargetValue(receipt, field)).filter(Boolean))]
+    for (const { spec, path, receipt } of receipts) {
+      const value = receiptTargetValue(receipt, field)
+      pushCheck(checks, receiptTargetValuePass(value), 'target_field_present', {
+        path,
+        step: spec.step,
+        field,
+        value: value || null,
+      })
+    }
+    const values = [...new Set(receipts.map(({ receipt }) => receiptTargetValue(receipt, field)).filter(receiptTargetValuePass))]
     pushCheck(checks, values.length === (receipts.length > 0 ? 1 : 0), 'target_field_consistent_across_receipts', {
       field,
       values,
@@ -398,14 +479,20 @@ export function checkBundle(opts = {}) {
 
   for (const { spec, path, receipt } of receipts) {
     const noManual = receipt?.evidence?.no_manual_db_edits
-    if (spec.step === 'owner_setup' || spec.step === 'post_setup_validation' || noManual !== undefined) {
-      pushCheck(checks, noManual === true, 'no_manual_db_edits_attested', {
-        path,
-        step: spec.step,
-        value: noManual ?? null,
-      })
-    }
+    pushCheck(checks, noManual === true, 'no_manual_db_edits_attested', {
+      path,
+      step: spec.step,
+      value: noManual ?? null,
+    })
   }
+
+  const deployedReceipt = receipts.find(({ spec }) => spec.step === 'worker_deployed')?.receipt
+  const deployedUrl = evidenceString(deployedReceipt, 'deployed_url')
+  pushCheck(checks, isHttpUrl(deployedUrl), 'deployed_url_is_http_url', { deployed_url: deployedUrl || null })
+  pushCheck(checks, Boolean(deployedUrl && target.base_url && deployedUrl === target.base_url), 'deployed_url_matches_target_base_url', {
+    deployed_url: deployedUrl || null,
+    target_base_url: target.base_url,
+  })
 
   if (opts.pot) pushCheck(checks, target.pot === opts.pot, 'target_pot_matches_expected', { expected: opts.pot, actual: target.pot })
   if (opts.baseUrl) pushCheck(checks, target.base_url === stripTrailingSlash(opts.baseUrl), 'target_base_url_matches_expected', { expected: stripTrailingSlash(opts.baseUrl), actual: target.base_url })
@@ -419,6 +506,7 @@ export function checkBundle(opts = {}) {
     checked_at: new Date().toISOString(),
     out_dir: outDir,
     target,
+    timeline: timeline.map(({ step, started_at, completed_at }) => ({ step, started_at, completed_at })),
     summary: {
       passed: passed.length,
       failed: failed.length,

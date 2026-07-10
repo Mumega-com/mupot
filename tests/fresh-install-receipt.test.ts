@@ -21,17 +21,27 @@ const TARGET = {
   config: 'wrangler.acme.toml',
 }
 
+const START = Date.parse('2026-07-09T20:00:00.000Z')
+const STEP_WINDOW_MS = 5 * 60 * 1000
+const STEP_DURATION_MS = 2 * 60 * 1000
+
+function iso(ms: number) {
+  return new Date(ms).toISOString()
+}
+
 function tempDir() {
   return mkdtempSync(join(tmpdir(), 'mupot-fresh-install-'))
 }
 
 function baseReceipt(step: string, evidence: Record<string, unknown>) {
+  const index = REQUIRED_STEPS.findIndex((entry) => entry.step === step)
+  const startedAt = START + index * STEP_WINDOW_MS
   return {
     receipt_type: STEP_RECEIPT_TYPE,
     step,
     status: 'pass',
-    started_at: '2026-07-09T20:00:00.000Z',
-    completed_at: '2026-07-09T20:01:00.000Z',
+    started_at: iso(startedAt),
+    completed_at: iso(startedAt + STEP_DURATION_MS),
     target: TARGET,
     commands: [
       { command: `run ${step}`, ok: true, exit_code: 0 },
@@ -46,7 +56,10 @@ function baseReceipt(step: string, evidence: Record<string, unknown>) {
 function evidenceFor(step: string) {
   const spec = REQUIRED_STEPS.find((entry) => entry.step === step)
   if (!spec) throw new Error(`unknown step: ${step}`)
-  return Object.fromEntries(spec.evidence.map((key) => [key, true]))
+  const evidence = Object.fromEntries(spec.evidence.map((key) => [key, true]))
+  evidence.no_manual_db_edits = true
+  if (step === 'worker_deployed') evidence.deployed_url = TARGET.base_url
+  return evidence
 }
 
 function writeBundle(dir: string, mutate?: (receipt: Record<string, unknown>, file: string) => void) {
@@ -94,6 +107,100 @@ describe('fresh install receipt checker', () => {
     expect(receipt.status).toBe('pass')
     expect(receipt.summary.step_receipts).toBe(REQUIRED_STEPS.length)
     expect(receipt.target.pot).toBe(TARGET.pot)
+    expect(receipt.timeline.map((step) => step.step)).toEqual(REQUIRED_STEPS.map((step) => step.step))
+  })
+
+  it('fails when install steps overlap or run out of order', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      if (file === 'secrets-configured.json') {
+        receipt.started_at = iso(START + STEP_DURATION_MS - 1)
+        receipt.completed_at = iso(START + STEP_WINDOW_MS)
+      }
+    })
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'install_steps_run_in_order_without_overlap',
+      previous_step: 'provision_resources',
+      step: 'secrets_configured',
+    }))
+  })
+
+  it('fails when the deployed URL does not match the target pot URL', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      if (file === 'worker-deployed.json') {
+        const evidence = receipt.evidence as Record<string, unknown>
+        evidence.deployed_url = 'https://other.mupot.test'
+      }
+    })
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'deployed_url_matches_target_base_url',
+    }))
+  })
+
+  it('requires the no-manual-DB-edit attestation on every step', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      if (file === 'provision-resources.json') {
+        const evidence = receipt.evidence as Record<string, unknown>
+        delete evidence.no_manual_db_edits
+      }
+    })
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'no_manual_db_edits_attested',
+      step: 'provision_resources',
+    }))
+  })
+
+  it('requires explicit successful command results', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      if (file === 'migrations-applied.json') receipt.commands = ['npm run migrate:remote']
+    })
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'receipt_commands_succeeded',
+      step: 'migrations_applied',
+    }))
+  })
+
+  it('fails when a required resource target is missing', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      if (file === 'post-setup-validation.json') {
+        const target = receipt.target as Record<string, unknown>
+        delete target.worker
+      }
+    })
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'target_field_present',
+      step: 'post_setup_validation',
+      field: 'worker',
+    }))
   })
 
   it('fails when owner setup did not prove first owner login', () => {
@@ -112,6 +219,27 @@ describe('fresh install receipt checker', () => {
       ok: false,
       check: 'required_evidence_present',
       evidence: 'first_login_became_owner',
+    }))
+  })
+
+  it('rejects non-boolean claims for required installation flags', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      if (file === 'owner-setup.json') {
+        const evidence = receipt.evidence as Record<string, unknown>
+        evidence.first_login_became_owner = 'no'
+      }
+    })
+
+    const receipt = checkBundle({ outDir: dir })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'required_evidence_present',
+      step: 'owner_setup',
+      evidence: 'first_login_became_owner',
+      value: 'no',
     }))
   })
 
