@@ -137,7 +137,7 @@ node scripts/github-app-permissions-receipt.mjs \
   --installation-id "$GITHUB_APP_INSTALLATION_ID" \
   --private-key-file /path/to/pkcs8-private-key.pem \
   --out-dir tmp/github-app-permissions/mupot
-npm run receipt:github-app-permissions:check -- \
+npm run --silent receipt:github-app-permissions:check -- \
   --app mupot \
   --installation-id "$GITHUB_APP_INSTALLATION_ID" \
   --out-dir tmp/github-app-permissions/mupot \

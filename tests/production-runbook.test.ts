@@ -59,7 +59,8 @@ describe('production self-hosting runbook', () => {
       'aws s3 sync "s3://${BUCKET}"',
       'npm run receipt:fresh-install:plan',
       'npm run receipt:staging-recovery:plan',
-      'npm run receipt:staging-recovery:check',
+      'npm run --silent receipt:fresh-install:check',
+      'npm run --silent receipt:staging-recovery:check',
     ]) {
       expect(runbook).toContain(command)
     }
@@ -93,6 +94,10 @@ describe('production self-hosting runbook', () => {
     expect(runbook).toContain('Do not include tokens, webhook secrets, private keys, cookies, or password')
     expect(pkg.scripts['receipt:staging-recovery:plan']).toBe('node scripts/staging-recovery-rehearsal.mjs --plan')
     expect(pkg.scripts['receipt:staging-recovery:check']).toBe('node scripts/staging-recovery-rehearsal.mjs --check')
+    expect(runbook.match(/npm run receipt:staging-recovery:check -- \\/g)).toHaveLength(1)
+    expect(runbook).toContain('npm run receipt:staging-recovery:check -- \\\n  --summary')
+    expect(runbook.match(/npm run receipt:fresh-install:check -- \\/g)).toHaveLength(1)
+    expect(runbook).toContain('npm run receipt:fresh-install:check -- \\\n  --summary')
   })
 
   it('covers the named incident classes from the tracker', () => {

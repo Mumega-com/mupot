@@ -18,6 +18,7 @@ import {
 } from '../scripts/github-app-permissions-receipt.mjs'
 
 const INSTALLATION_ID = '789012'
+const integrationDocs = readFileSync(new URL('../docs/github-app-integration.md', import.meta.url), 'utf8')
 
 function tempDir() {
   return mkdtempSync(join(tmpdir(), 'mupot-github-app-permissions-'))
@@ -72,6 +73,11 @@ describe('GitHub App permissions receipt checker', () => {
     expect(plan).toContain('--installation-id')
     expect(plan).toContain('github-app-permissions-check.json')
     expect(plan).toContain('workflows: none')
+  })
+
+  it('documents silent npm output when redirecting the JSON receipt', () => {
+    expect(integrationDocs).toContain('npm run --silent receipt:github-app-permissions:check -- \\\n')
+    expect(integrationDocs).not.toContain('npm run receipt:github-app-permissions:check -- \\\n')
   })
 
   it('creates an App JWT with bounded lifetime', () => {
