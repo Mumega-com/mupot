@@ -36,14 +36,21 @@ interface KeyRow { pubkey: string; algo: string; member_id: string | null }
 function makeDb(opts: {
   keys?: Record<string, KeyRow>            // `${tenant}:${agent_id}` → KeyRow
   tokens?: Record<string, { member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null }>
+  memberStatuses?: Record<string, string>
 } = {}) {
   const keys = opts.keys ?? {}
   const tokens = opts.tokens ?? {}
+  const memberStatuses = opts.memberStatuses ?? {}
   const nonces = new Map<string, number>()   // nonce → created_at (faithful: prune applies)
   const fleet = new Map<string, Record<string, unknown>>()
   const meta = { pruneCutoff: -1 }            // last DELETE cutoff (for the retention assertion)
 
   function first(sql: string, b: unknown[]) {
+    if (sql.includes('FROM agent_keys k') && sql.includes('JOIN members m')) {
+      const row = keys[`${b[0]}:${b[1]}`]
+      if (!row?.member_id || memberStatuses[row.member_id] === 'inactive') return null
+      return row
+    }
     if (sql.includes('FROM agent_keys WHERE tenant')) {
       // both the full SELECT (signed verify) and `SELECT 1 AS x` (downgrade check)
       const row = keys[`${b[0]}:${b[1]}`]
@@ -175,7 +182,7 @@ describe('signed attach', () => {
 
   it('replay (same nonce) → 409', async () => {
     const { kp, pubX } = await genKey()
-    const env = makeEnv(makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: null } } }))
+    const env = makeEnv(makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } } }))
     const body = freshBody('kasra', 'mumega')
     ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
 
@@ -200,6 +207,14 @@ describe('signed attach', () => {
     expect((await post(env, '/attach-signed', body)).status).toBe(401)
   })
 
+  it('unbound registered key cannot attach', async () => {
+    const { kp, pubX } = await genKey()
+    const env = makeEnv(makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: null } } }))
+    const body = freshBody('kasra', 'mumega')
+    ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+    expect((await post(env, '/attach-signed', body)).status).toBe(401)
+  })
+
   it('tampered runtime after signing → 401', async () => {
     const { kp, pubX } = await genKey()
     const env = makeEnv(makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: null } } }))
@@ -212,7 +227,7 @@ describe('signed attach', () => {
   it('cross-tenant: sig made for mumega, verified on viamar pot → 401', async () => {
     const { kp, pubX } = await genKey()
     // viamar pot has NO key for kasra → 401 regardless; also prove the bytes differ.
-    const env = makeEnv(makeDb({ keys: { 'viamar:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: null } } }), 'viamar')
+    const env = makeEnv(makeDb({ keys: { 'viamar:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } } }), 'viamar')
     const body = freshBody('kasra', 'mumega')              // signed FOR mumega
     ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
     // pot is viamar → canonical message uses tenant 'viamar' → signature mismatch
@@ -236,7 +251,7 @@ describe('signed attach', () => {
 
   it('P1: nonce retention horizon is 2×window (covers future-dated ts validity span)', async () => {
     const { kp, pubX } = await genKey()
-    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: null } } })
+    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } } })
     const env = makeEnv(db)
     const body = freshBody('kasra', 'mumega')
     ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
@@ -251,7 +266,7 @@ describe('signed attach', () => {
 
   it('tampered lifecycle after signing → 401 (lifecycle is signed)', async () => {
     const { kp, pubX } = await genKey()
-    const env = makeEnv(makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: null } } }))
+    const env = makeEnv(makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } } }))
     const body = freshBody('kasra', 'mumega')  // signed with lifecycle=on_demand
     ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
     ;(body as Record<string, unknown>).lifecycle = 'always_on'   // mutate AFTER signing
@@ -283,7 +298,7 @@ describe('signed detach', () => {
     expect(db._fleet.get('mumega:kasra')!.status).toBe('stopped')
   })
 
-  it('valid signature can stop a null-owned legacy key row', async () => {
+  it('unbound key is refused and cannot stop a legacy null-owned row', async () => {
     const { kp, pubX } = await genKey()
     const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: null } } })
     const env = makeEnv(db)
@@ -301,13 +316,13 @@ describe('signed detach', () => {
 
     const body = freshDetachBody('kasra')
     ;(body as Record<string, unknown>).sig = await signDetach(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
-    expect((await post(env, '/detach-signed', body)).status).toBe(200)
-    expect(db._fleet.get('mumega:kasra')!.status).toBe('stopped')
+    expect((await post(env, '/detach-signed', body)).status).toBe(401)
+    expect(db._fleet.get('mumega:kasra')!.status).toBe('running')
   })
 
   it('replay of the same signed detach body → 409', async () => {
     const { kp, pubX } = await genKey()
-    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: null } } })
+    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } } })
     const env = makeEnv(db)
     db._fleet.set('mumega:kasra', {
       agent_id: 'kasra',
@@ -315,9 +330,9 @@ describe('signed detach', () => {
       runtime: 'claude-code',
       lifecycle: 'on_demand',
       status: 'running',
-      reported_by: null,
+      reported_by: 'm-kasra',
       agent_type: 'builder',
-      member_id: null,
+      member_id: 'm-kasra',
       last_reported_at: 'before',
     })
     const body = freshDetachBody('kasra')
@@ -383,5 +398,18 @@ describe('signed detach', () => {
     const body = freshDetachBody('kasra')
     ;(body as Record<string, unknown>).sig = await signDetach(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
     expect((await post(env, '/detach-signed', body)).status).toBe(401)
+  })
+
+  it('disabled key member is refused before any fleet mutation', async () => {
+    const { kp, pubX } = await genKey()
+    const db = makeDb({
+      keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } },
+      memberStatuses: { 'm-kasra': 'inactive' },
+    })
+    const env = makeEnv(db)
+    const attach = freshBody('kasra', 'mumega')
+    ;(attach as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(attach as Record<string, string | number>), tenant: 'mumega' })
+    expect((await post(env, '/attach-signed', attach)).status).toBe(401)
+    expect(db._fleet.size).toBe(0)
   })
 })

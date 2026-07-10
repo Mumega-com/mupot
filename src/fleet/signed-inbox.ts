@@ -7,6 +7,7 @@
 // the nonce ledger is shared with signed attach so replay is still single-use.
 
 import type { Env } from '../types'
+import { loadActiveAgentKey } from './agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from './shared-nonce-ledger'
 
 export const INBOX_WINDOW_SEC = sharedNonceWindowSec('agent-inbox:v1')
@@ -71,7 +72,7 @@ export type SignedInboxOk = {
   agent_id: string
   peek: boolean
   limit: number
-  member_id: string | null
+  member_id: string
 }
 
 export type SignedInboxErr = {
@@ -126,11 +127,7 @@ export async function verifySignedInboxRead(
   }
 
   const tenant = env.TENANT_SLUG
-  const keyRow = await env.DB.prepare(
-    `SELECT pubkey, algo, member_id FROM agent_keys WHERE tenant = ?1 AND agent_id = ?2`,
-  )
-    .bind(tenant, agentId)
-    .first<{ pubkey: string; algo: string; member_id: string | null }>()
+  const keyRow = await loadActiveAgentKey(env, agentId)
 
   if (!keyRow || keyRow.algo !== 'Ed25519' || !PUBKEY_B64URL_RE.test(keyRow.pubkey)) {
     return { ok: false, status: 401, error: 'unauthorized', detail: 'signature verification failed' }
@@ -163,5 +160,5 @@ export async function verifySignedInboxRead(
     return { ok: false, status: 409, error: 'replay', detail: 'nonce already used' }
   }
 
-  return { ok: true, agent_id: agentId, peek, limit, member_id: keyRow.member_id ?? null }
+  return { ok: true, agent_id: agentId, peek, limit, member_id: keyRow.member_id }
 }
