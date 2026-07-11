@@ -237,10 +237,15 @@ describe('release readiness receipt checker', () => {
     expect(receipt.summary.required_app_permissions).toBe(Object.keys(REQUIRED_APP_PERMISSIONS).length)
     expect(REQUIRED_ISSUES).toContain(319)
     expect(REQUIRED_ISSUES).toContain(323)
+    expect(REQUIRED_ISSUES).not.toContain(280)
     expect(REQUIRED_RECEIPTS).toContainEqual(expect.objectContaining({
       issue: 323,
       file: 'release-candidate-check.json',
       receipt_type: 'mupot-release-candidate/v1',
+    }))
+    expect(REQUIRED_RECEIPTS).not.toContainEqual(expect.objectContaining({
+      issue: 280,
+      file: 'production-soak-check.json',
     }))
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: true,
