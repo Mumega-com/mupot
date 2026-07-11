@@ -33,7 +33,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'Operational reliability',
       'Automated release confidence',
       'Release integrity',
-      'Production soak',
+      'Active runtime verification',
     ]) {
       expect(releaseDoc).toContain(objective)
     }
@@ -44,7 +44,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       '#151',
       '#277',
       '#279',
-      '#280',
+      '#323',
       '#284',
       'fresh-install-check.json',
       'mupot-fresh-install/v1',
@@ -52,8 +52,6 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'mupot-work-lifecycle/v1',
       'external-pr-cycle-check.json',
       'mupot-external-pr-cycle/v1',
-      'production-soak-check.json',
-      'mupot-production-soak/v1',
       'manifest.json',
       'cutover-gate.json',
       'export-receipt.json',
@@ -61,7 +59,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'staging-recovery-check.json',
       'mupot-staging-recovery-rehearsal/v1',
       'v0.23.0-rc.1',
-      'seven-day production soak',
+      'Non-blocking development evidence',
       'package.json',
       'src/version.ts',
       'CHANGELOG.md',
@@ -78,6 +76,9 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     ]) {
       expect(releaseDoc).toContain(evidence)
     }
+
+    expect(releaseDoc).toContain('production-soak verifier remains available')
+    expect(releaseDoc).toContain('not a duration-based final-release gate')
   })
 
   it('keeps out-of-scope work out of the release definition', () => {
@@ -100,7 +101,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     expect(releaseDoc).toContain('The RC uses its own package/API version and prerelease evidence, never the final tag.')
   })
 
-  it('names the automated gates required for a release candidate', () => {
+  it('names the automated gates required for final release evidence', () => {
     for (const command of [
       'npm audit --audit-level=high',
       'npm run typecheck',
@@ -112,7 +113,6 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
       'npm run receipt:work-lifecycle:plan',
       'npm run receipt:external-pr-cycle:plan',
       'npm run receipt:staging-recovery:plan',
-      'npm run receipt:production-soak:plan',
       'npm run receipt:release-candidate:plan',
       'npm run receipt:release-integrity:plan',
       'npm run receipt:release-readiness:plan',
@@ -131,6 +131,8 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     expect(pkg.scripts['receipt:work-lifecycle:check']).toBe('node scripts/work-lifecycle-receipt.mjs --check')
     expect(pkg.scripts['receipt:external-pr-cycle:check']).toBe('node scripts/external-pr-cycle-receipt.mjs --check')
     expect(pkg.scripts['receipt:staging-recovery:check']).toBe('node scripts/staging-recovery-rehearsal.mjs --check')
+    // The soak verifier remains runnable for active-development evidence, but
+    // it is intentionally not a final-release command above.
     expect(pkg.scripts['receipt:production-soak:check']).toBe('node scripts/production-soak-receipt.mjs --check')
     expect(pkg.scripts['receipt:release-candidate:check']).toBe('node scripts/release-candidate-receipt.mjs --check')
     expect(pkg.scripts['receipt:release-integrity:check']).toBe('node scripts/release-integrity-receipt.mjs --check')
