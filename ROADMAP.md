@@ -112,9 +112,10 @@ Required proof:
 - Release metadata aligned across package version, public API version,
   changelog, roadmap, Git tag, milestone, and GitHub Release, with a passing
   `mupot-release-integrity/v1` evidence receipt.
-- `v0.23.0-rc.1` completes a seven-day real-agent soak without lost work,
-  duplicated effects, unauthorized actions, or critical failures, with a
-  passing `mupot-production-soak/v1` evidence receipt on #280.
+- Active-runtime evidence may be collected with `mupot-production-soak/v1`, but
+  it is a non-blocking development tool rather than a duration-based release
+  gate. Stable-release proof remains the signed host, lifecycle, external PR,
+  recovery, release-candidate, integrity, and aggregate-readiness evidence.
 - Final release readiness has a passing `mupot-v023-release-readiness/v1`
   aggregate receipt across all objective receipts, tracker issues, and required
   CI checks.
