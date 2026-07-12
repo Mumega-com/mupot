@@ -1,14 +1,38 @@
 import { describe, expect, it } from 'vitest'
-import { TOOLS, invokeTool } from '../src/mcp'
+import { mcpApp, TOOLS, invokeTool } from '../src/mcp'
 import type { AuthContext, Env } from '../src/types'
 import type { FlightRow } from '../src/flight/service'
 import { flushFlightEventOutbox } from '../src/flight/service'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 const TENANT = 'mumega'
 const MEMBER_ID = 'member-product'
 const AGENT_ID = 'agent-product'
 const SQUAD_ID = 'squad-mmhq'
 const OTHER_SQUAD_ID = 'squad-other'
+const PRODUCT_TOKEN = 'mupot-product-flight-token'
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+async function authenticatedTool(env: Env, tool: string, args: Record<string, unknown>) {
+  const response = await mcpApp.request(
+    'https://pot.example/',
+    {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${PRODUCT_TOKEN}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ tool, args }),
+    },
+    env,
+  )
+  expect(response.status, await response.clone().text()).toBe(200)
+  return response.json() as Promise<{ ok: boolean; result: Record<string, unknown> }>
+}
 
 const signals = {
   contextComplete: true,
@@ -656,5 +680,140 @@ describe('MCP flight tools', () => {
     }, 'https://pot.example')
     expect(second.ok).toBe(true)
     expect((second.result as { flights: FlightRow[] }).flights.map((flight) => flight.id)).toEqual(['visible-old'])
+  })
+})
+
+describe('MCP granted multi-squad flight lifecycle', () => {
+  it('re-authenticates the same Product bearer through dispatch, read, task completion, and landing', async () => {
+    const harness = createSqliteD1()
+    const events: unknown[] = []
+    try {
+      const productTokenHash = await sha256Hex(PRODUCT_TOKEN)
+      harness.sqlite.exec(`
+        CREATE TABLE departments (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL);
+        CREATE TABLE squads (
+          id TEXT PRIMARY KEY, department_id TEXT NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL,
+          charter TEXT, budget_cap_cents INTEGER, budget_window TEXT NOT NULL DEFAULT 'day',
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE agents (
+          id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'member', model TEXT NOT NULL DEFAULT 'test',
+          status TEXT NOT NULL DEFAULT 'active', budget_cap_cents INTEGER,
+          budget_window TEXT NOT NULL DEFAULT 'day', created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE members (
+          id TEXT PRIMARY KEY, email TEXT, display_name TEXT NOT NULL, telegram_chat_id TEXT,
+          status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          tenant TEXT NOT NULL
+        );
+        CREATE TABLE member_tokens (
+          id TEXT PRIMARY KEY, member_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+          label TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT 'workspace',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')), revoked_at TEXT,
+          agent_id TEXT, tenant TEXT NOT NULL
+        );
+        CREATE TABLE capabilities (
+          id TEXT PRIMARY KEY, member_id TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT,
+          capability TEXT NOT NULL CHECK (capability IN ('owner','admin','lead','member','observer')),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE (member_id, scope_type, scope_id)
+        );
+        CREATE TABLE channel_capability_grants (
+          id TEXT PRIMARY KEY, member_id TEXT NOT NULL, squad_id TEXT NOT NULL, capability TEXT NOT NULL
+        );
+        CREATE TABLE tasks (
+          id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+          done_when TEXT NOT NULL, status TEXT NOT NULL, assignee_agent_id TEXT, github_issue_url TEXT,
+          result TEXT, completed_at TEXT, gate_owner TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE task_verdicts (
+          id TEXT PRIMARY KEY, task_id TEXT NOT NULL, verdict TEXT NOT NULL, note TEXT,
+          decided_by TEXT NOT NULL, decided_at TEXT NOT NULL
+        );
+        CREATE TABLE flights (
+          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, agent TEXT NOT NULL, goal TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'preflight', trigger_source TEXT NOT NULL DEFAULT 'manual',
+          gate_verdict TEXT, gate_reason TEXT NOT NULL DEFAULT '', score REAL, budget_micro_usd INTEGER,
+          cost_micro_usd INTEGER NOT NULL DEFAULT 0, next_run_at INTEGER,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000), started_at INTEGER,
+          ended_at INTEGER, meta TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE flight_event_outbox (
+          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, flight_id TEXT NOT NULL, event_type TEXT NOT NULL,
+          actor_kind TEXT NOT NULL, actor_id TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL,
+          delivered_at TEXT, consumed_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+          UNIQUE (tenant, flight_id, event_type)
+        );
+
+        INSERT INTO departments VALUES ('dept-home', 'home', 'Home');
+        INSERT INTO departments VALUES ('dept-other', 'other', 'Other');
+        INSERT INTO squads (id, department_id, slug, name) VALUES ('${SQUAD_ID}', 'dept-home', 'mmhq', 'Mumega HQ');
+        INSERT INTO squads (id, department_id, slug, name) VALUES ('${OTHER_SQUAD_ID}', 'dept-other', 'other', 'Other');
+        INSERT INTO agents (id, squad_id, slug, name) VALUES ('${AGENT_ID}', '${SQUAD_ID}', 'product', 'Product');
+        INSERT INTO members (id, display_name, status, tenant)
+        VALUES ('${MEMBER_ID}', 'Product', 'active', '${TENANT}');
+        INSERT INTO members (id, display_name, status, tenant)
+        VALUES ('member-operator', 'Operator', 'active', '${TENANT}');
+        INSERT INTO member_tokens (id, member_id, token_hash, revoked_at, agent_id, tenant)
+        VALUES ('token-product', '${MEMBER_ID}', '${productTokenHash}', NULL, '${AGENT_ID}', '${TENANT}');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('grant-home', '${MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member');
+        INSERT INTO tasks
+          (id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url,
+           result, completed_at, gate_owner, created_at, updated_at)
+        VALUES
+          ('task-m000', '${OTHER_SQUAD_ID}', 'Cross-squad census', '', 'the census hash verifies',
+           'in_progress', '${AGENT_ID}', NULL, NULL, NULL, NULL,
+           '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z');
+      `)
+      const env = {
+        TENANT_SLUG: TENANT,
+        DB: harness.db,
+        BUS: { send: async (event: unknown) => { events.push(event) } },
+      } as unknown as Env
+      const operatorAuth = auth({
+        userId: 'member-operator',
+        memberId: 'member-operator',
+        boundAgentId: null,
+        role: 'admin',
+        capabilities: [{
+          member_id: 'member-operator', scope_type: 'org', scope_id: null, capability: 'admin',
+        }],
+      })
+
+      const granted = await invokeTool(operatorAuth, env, 'grant_agent_capability', {
+        agent: AGENT_ID,
+        squad: OTHER_SQUAD_ID,
+        capability: 'member',
+      }, 'https://pot.example')
+      expect(granted).toMatchObject({ ok: true, result: { result: 'created' } })
+
+      const lifecycleMeta = { ...meta, squad_ids: [SQUAD_ID, OTHER_SQUAD_ID] }
+      const dispatched = await authenticatedTool(env, 'flight_dispatch', {
+        ...dispatchArgs,
+        meta_json: JSON.stringify(lifecycleMeta),
+      })
+      expect(dispatched.ok).toBe(true)
+      const flightId = (dispatched.result.flight as FlightRow).id
+
+      const read = await authenticatedTool(env, 'flight_get', { flight_id: flightId })
+      expect(read).toMatchObject({ ok: true, result: { flight: { id: flightId, status: 'running' } } })
+
+      const completed = await authenticatedTool(env, 'task_update', {
+        task_id: 'task-m000',
+        status: 'done',
+      })
+      expect(completed).toMatchObject({ ok: true, result: { task: { id: 'task-m000', status: 'done' } } })
+      expect(harness.sqlite.prepare("SELECT status FROM tasks WHERE id = 'task-m000'").get()).toEqual({ status: 'done' })
+
+      const landed = await authenticatedTool(env, 'flight_land', {
+        flight_id: flightId,
+        cost_micro_usd: 0,
+      })
+      expect(landed).toMatchObject({ ok: true, result: { flight: { id: flightId, status: 'landed' } } })
+      expect(events).toContainEqual(expect.objectContaining({ type: 'flight.landed', agent_id: AGENT_ID }))
+    } finally {
+      harness.close()
+    }
   })
 })

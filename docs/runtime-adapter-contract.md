@@ -40,6 +40,27 @@ Agent identity and runtime binding are separate concepts.
 A runtime must not trust local config as proof of identity. Local config is only
 the input used to produce a bearer proof or signed attach proof.
 
+## MCP Provisioning
+
+`grant_agent_capability { agent, squad, capability }` grants an existing agent
+member identity access to an additional squad. `agent` and `squad` accept an
+exact ID or an unambiguous slug. `capability` is exactly one of `observer`,
+`member`, `lead`, or `admin`; `owner` is not grantable through this tool.
+
+The caller must hold `admin` on the resolved target squad through normal
+org/department/squad inheritance, and the requested capability cannot exceed
+the caller's effective capability on that squad. The target recipient is never
+read from request text: Mupot resolves the active, non-revoked token-welded
+member identity for the resolved agent. No active identity returns
+`agent_identity_unminted`; more than one distinct active identity returns
+`agent_identity_ambiguous`. Multiple active tokens for the same member remain a
+single valid identity.
+
+The response contains only resolved public IDs and the resulting grant outcome.
+The attributed `org.provisioned` event has kind `capability` and contains the
+target squad, agent, member, capability, and caller IDs. Neither surface mints,
+returns, logs, or includes a raw token, token hash, or any other credential.
+
 ## Attach, Detach, And Presence
 
 ### Signed Attach

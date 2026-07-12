@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { mcpApp } from '../src/mcp'
-import type { CapabilityGrant, Env } from '../src/types'
+import { callerCanGrantAgentCapability } from '../src/mcp/provision'
+import type { Capability, CapabilityGrant, Env } from '../src/types'
 
 // The provision tools (create_squad / create_agent / mint_agent_token) are the in-band
 // org-builder surface. These tests drive them through the JSON-RPC seam (tools/call) the
@@ -20,9 +21,14 @@ interface Opts {
   squadExists?: boolean
   agentExists?: boolean
   deptExists?: boolean
+  agentTokenMembers?: string[]
+  existingGrantCapabilities?: Capability[]
+  guardedGrantNoRow?: boolean
+  events?: unknown[]
 }
 
 const SQUAD = { id: 'squad-1', department_id: 'dept-1' }
+const TARGET_SQUAD = { id: 'squad-2', department_id: 'dept-2', slug: 'target-squad' }
 const AGENT = { id: 'agent-1', squad_id: 'squad-1', slug: 'growth-lead', name: 'Growth Lead' }
 
 function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
@@ -33,6 +39,8 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
   const squadExists = opts.squadExists ?? true
   const agentExists = opts.agentExists ?? true
   const deptExists = opts.deptExists ?? true
+  const agentTokenMembers = opts.agentTokenMembers ?? ['member-agent-1']
+  const existingGrantCapabilities = opts.existingGrantCapabilities ?? []
 
   const agentRow = { id: AGENT.id, squad_id: AGENT.squad_id, slug: AGENT.slug, name: AGENT.name }
 
@@ -65,9 +73,10 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
           }
           if (sql.includes('FROM squads') && byId) {
             // resolveSquad + resolveSquadDepartment (memberCanOnSquad) both key on id.
-            return squadExists && ref === SQUAD.id
-              ? { id: SQUAD.id, department_id: SQUAD.department_id }
-              : null
+            if (!squadExists) return null
+            if (ref === SQUAD.id) return { id: SQUAD.id, department_id: SQUAD.department_id }
+            if (ref === TARGET_SQUAD.id) return { id: TARGET_SQUAD.id, department_id: TARGET_SQUAD.department_id }
+            return null
           }
           if (sql.includes('FROM agents') && byId) {
             return agentExists && ref === AGENT.id ? agentRow : null
@@ -75,9 +84,41 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
           return null
         },
         async all() {
+          if (sql.includes('WITH active_identity AS MATERIALIZED')) {
+            const distinctMembers = [...new Set(agentTokenMembers)]
+            if (opts.guardedGrantNoRow || distinctMembers.length !== 1 || distinctMembers[0] !== args[2]) {
+              return { results: [] }
+            }
+            const createdId = args[3] as string
+            const updatedId = args[6] as string
+            const capability = args[5] as Capability
+            const returnedId = existingGrantCapabilities.length === 0
+              ? createdId
+              : existingGrantCapabilities.length === 1 && existingGrantCapabilities[0] === capability
+                ? 'existing-grant-id'
+                : updatedId
+            captured.push({
+              sql: 'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)',
+              args: [returnedId, args[2], 'squad', args[4], capability],
+            })
+            return {
+              results: [{
+                id: returnedId,
+                member_id: args[2],
+                scope_type: 'squad',
+                scope_id: args[4],
+                capability,
+              }],
+            }
+          }
+          if (sql.includes('SELECT capability FROM capabilities')) {
+            return { results: existingGrantCapabilities.map((capability) => ({ capability })) }
+          }
           if (sql.includes('FROM capabilities')) return { results: grants }
           if (sql.includes('SELECT DISTINCT t.member_id')) {
-            return { results: [{ member_id: 'member-agent-1' }] }
+            return {
+              results: [...new Set(agentTokenMembers)].slice(0, 2).map((member_id) => ({ member_id })),
+            }
           }
           // slug resolves: count matches. 'dup' deliberately matches TWO agents.
           if (sql.includes('FROM agents') && sql.includes('WHERE slug')) {
@@ -85,6 +126,9 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
             return agentExists && ref === AGENT.slug ? { results: [agentRow] } : { results: [] }
           }
           if (sql.includes('FROM squads') && sql.includes('WHERE slug')) {
+            if (squadExists && ref === TARGET_SQUAD.slug) {
+              return { results: [{ id: TARGET_SQUAD.id, department_id: TARGET_SQUAD.department_id }] }
+            }
             return squadExists && ref === 'squad-slug'
               ? { results: [{ id: SQUAD.id, department_id: SQUAD.department_id }] }
               : { results: [] }
@@ -115,7 +159,7 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
         return stmts.map(() => ({ meta: { changes: 1 } }))
       },
     },
-    BUS: { send: async () => {} },
+    BUS: { send: async (event: unknown) => { opts.events?.push(event) } },
   } as unknown as Env
 }
 
@@ -152,6 +196,33 @@ describe('provision tools — advertised', () => {
     expect(names).toContain('create_agent')
     expect(names).toContain('mint_agent_token')
     expect(names).toContain('register_agent_key')
+    expect(names).toContain('grant_agent_capability')
+  })
+
+  it('advertises grant_agent_capability with its exact schema', async () => {
+    const res = await mcpApp.request(
+      'https://agents.digid.ca/',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      },
+      makeEnv(),
+    )
+    const body = (await res.json()) as {
+      result: { tools: { name: string; inputSchema: unknown }[] }
+    }
+    const tool = body.result.tools.find(({ name }) => name === 'grant_agent_capability')
+    expect(tool?.inputSchema).toEqual({
+      type: 'object',
+      properties: {
+        agent: { type: 'string' },
+        squad: { type: 'string' },
+        capability: { type: 'string', enum: ['observer', 'member', 'lead', 'admin'] },
+      },
+      required: ['agent', 'squad', 'capability'],
+      additionalProperties: false,
+    })
   })
 })
 
@@ -458,5 +529,162 @@ describe('register_agent_key', () => {
     expect(aliasRes.status).toBe(400)
     expect(((await aliasRes.json()) as { error: { message: string } }).error.message).toBe('invalid_key_id')
     expect(aliasRows).toEqual([])
+  })
+})
+
+describe('grant_agent_capability', () => {
+  const args = { agent: AGENT.slug, squad: TARGET_SQUAD.slug, capability: 'member' }
+
+  it('grants a resolved active agent member on the target squad without exposing token fields', async () => {
+    const captured: Captured[] = []
+    const events: unknown[] = []
+    const res = await call('grant_agent_capability', args, makeEnv({ events }, captured))
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      result: {
+        structuredContent: {
+          agent: { id: string }
+          squad: { id: string }
+          member_id: string
+          grant: CapabilityGrant
+          result: string
+        }
+      }
+    }
+    expect(body.result.structuredContent).toEqual({
+      agent: { id: AGENT.id },
+      squad: { id: TARGET_SQUAD.id },
+      member_id: 'member-agent-1',
+      grant: {
+        member_id: 'member-agent-1',
+        scope_type: 'squad',
+        scope_id: TARGET_SQUAD.id,
+        capability: 'member',
+      },
+      result: 'created',
+    })
+    expect(captured.find((row) => row.sql.includes('INSERT INTO capabilities'))?.args).toEqual([
+      expect.any(String),
+      'member-agent-1',
+      'squad',
+      TARGET_SQUAD.id,
+      'member',
+    ])
+
+    expect(JSON.stringify(body.result.structuredContent)).not.toMatch(/token|raw|hash/i)
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      type: 'org.provisioned',
+      squad_id: TARGET_SQUAD.id,
+      agent_id: AGENT.id,
+      payload: { kind: 'capability', id: TARGET_SQUAD.id, by: 'member-operator' },
+    })
+    expect(JSON.stringify(events[0])).not.toMatch(/token|raw|hash/i)
+  })
+
+  it('reports unchanged when the target member already has the requested squad grant', async () => {
+    const res = await call(
+      'grant_agent_capability',
+      args,
+      makeEnv({ existingGrantCapabilities: ['member'] }),
+    )
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { result: { structuredContent: { result: string } } }
+    expect(body.result.structuredContent.result).toBe('unchanged')
+  })
+
+  it('accepts multiple active tokens welded to the same member identity', async () => {
+    const res = await call(
+      'grant_agent_capability',
+      args,
+      makeEnv({ agentTokenMembers: ['member-agent-1', 'member-agent-1'] }),
+    )
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { result: { structuredContent: { member_id: string } } }
+    expect(body.result.structuredContent.member_id).toBe('member-agent-1')
+  })
+
+  it('rejects an unminted agent identity before writing a grant', async () => {
+    const captured: Captured[] = []
+    const res = await call('grant_agent_capability', args, makeEnv({ agentTokenMembers: [] }, captured))
+    expect(res.status).toBe(409)
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe('agent_identity_unminted')
+    expect(captured).toEqual([])
+  })
+
+  it('rejects an agent with ambiguous active member identities before writing a grant', async () => {
+    const captured: Captured[] = []
+    const res = await call(
+      'grant_agent_capability',
+      args,
+      makeEnv({ agentTokenMembers: ['member-agent-1', 'member-agent-2'] }, captured),
+    )
+    expect(res.status).toBe(409)
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe('agent_identity_ambiguous')
+    expect(captured).toEqual([])
+  })
+
+  it('reports a receipt failure when the guarded write returns no row but identity is unchanged', async () => {
+    const captured: Captured[] = []
+    const res = await call(
+      'grant_agent_capability',
+      args,
+      makeEnv({ guardedGrantNoRow: true }, captured),
+    )
+    expect(res.status).toBe(500)
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe('receipt_failed')
+    expect(captured).toEqual([])
+  })
+
+  it('rejects capabilities outside the grantable allowlist', async () => {
+    const captured: Captured[] = []
+    const res = await call(
+      'grant_agent_capability',
+      { ...args, capability: 'owner' },
+      makeEnv({}, captured),
+    )
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe('invalid_capability')
+    expect(captured).toEqual([])
+  })
+
+  it('requires admin on the target squad rather than the agent home squad', async () => {
+    const grants: CapabilityGrant[] = [
+      { member_id: 'member-operator', scope_type: 'squad', scope_id: AGENT.squad_id, capability: 'admin' },
+    ]
+    const captured: Captured[] = []
+    const res = await call('grant_agent_capability', args, makeEnv({ grants }, captured))
+    expect(res.status).toBe(403)
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe('forbidden')
+    expect(captured).toEqual([])
+  })
+
+  it('retains the target-squad admin gate for a caller limited to lead', async () => {
+    const grants: CapabilityGrant[] = [
+      { member_id: 'member-operator', scope_type: 'squad', scope_id: TARGET_SQUAD.id, capability: 'lead' },
+    ]
+    const captured: Captured[] = []
+    const res = await call(
+      'grant_agent_capability',
+      { ...args, capability: 'admin' },
+      makeEnv({ grants }, captured),
+    )
+    expect(res.status).toBe(403)
+    expect(captured).toEqual([])
+  })
+})
+
+describe('grant_agent_capability authorization ceiling', () => {
+  it('evaluates requested capability against the caller effective target-squad grants', () => {
+    const leadGrants: CapabilityGrant[] = [
+      { member_id: 'member-operator', scope_type: 'squad', scope_id: TARGET_SQUAD.id, capability: 'lead' },
+    ]
+    const adminGrants: CapabilityGrant[] = [
+      { member_id: 'member-operator', scope_type: 'squad', scope_id: TARGET_SQUAD.id, capability: 'admin' },
+    ]
+
+    expect(callerCanGrantAgentCapability(leadGrants, TARGET_SQUAD, 'lead')).toBe(true)
+    expect(callerCanGrantAgentCapability(leadGrants, TARGET_SQUAD, 'admin')).toBe(false)
+    expect(callerCanGrantAgentCapability(adminGrants, TARGET_SQUAD, 'admin')).toBe(true)
   })
 })
