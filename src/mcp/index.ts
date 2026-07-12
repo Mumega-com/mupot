@@ -756,7 +756,7 @@ const toolTaskDispatch: ToolSpec = {
     if (!(await memberCanOnSquad(env, grants, task.squad_id, 'member'))) {
       return fail(404, 'task_not_found')
     }
-    if (task.status !== 'open' && task.status !== 'in_progress') {
+    if (task.status !== 'open' && task.status !== 'blocked' && task.status !== 'rejected') {
       return fail(409, 'task_not_runnable')
     }
     if (!task.assignee_agent_id) return fail(409, 'task_not_dispatchable')
@@ -771,8 +771,8 @@ const toolTaskDispatch: ToolSpec = {
     const dispatchedAt = new Date().toISOString()
     await env.DB.prepare(
       `INSERT INTO task_dispatch_receipts
-         (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at)
-       VALUES (?, ?, ?, ?, ?, 'member', ?, ?)`,
+         (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, attempts)
+       VALUES (?, ?, ?, ?, ?, 'member', ?, ?, 1)`,
     ).bind(
       receiptId,
       env.TENANT_SLUG,
@@ -794,16 +794,11 @@ const toolTaskDispatch: ToolSpec = {
     }
     try {
       await createBus(env).emit(event)
-      await env.DB.prepare(
-        `UPDATE task_dispatch_receipts
-            SET emitted_at = ?, attempts = attempts + 1
-          WHERE tenant = ? AND id = ?`,
-      ).bind(new Date().toISOString(), env.TENANT_SLUG, receiptId).run()
     } catch (error) {
       const message = error instanceof Error ? error.message.slice(0, 500) : 'dispatch_failed'
       await env.DB.prepare(
         `UPDATE task_dispatch_receipts
-            SET attempts = attempts + 1, last_error = ?
+            SET last_error = ?
           WHERE tenant = ? AND id = ?`,
       ).bind(message, env.TENANT_SLUG, receiptId).run()
       return fail(500, 'dispatch_failed', { receipt_id: receiptId })

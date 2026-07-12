@@ -75,9 +75,51 @@ describe('bus queue consumer', () => {
 
     await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
 
-    expect(run).toHaveBeenCalledOnce()
+    expect(run).toHaveBeenCalledTimes(2)
     expect(item.ack).toHaveBeenCalledOnce()
     expect(item.retry).not.toHaveBeenCalled()
+  })
+
+  it('deduplicates repeated task dispatch receipts before waking AgentDO', async () => {
+    let claimed = false
+    const run = vi.fn(async (sql: string) => {
+      if (sql.includes('SET claimed_at')) {
+        if (claimed) return { meta: { changes: 0 } }
+        claimed = true
+        return { meta: { changes: 1 } }
+      }
+      return { meta: { changes: 1 } }
+    })
+    const fetch = vi.fn(async () => new Response(null, { status: 200 }))
+    const env = {
+      AGENT: {
+        idFromName: vi.fn(() => 'agent-do-id'),
+        get: vi.fn(() => ({ fetch })),
+      },
+      DB: {
+        prepare: vi.fn((sql: string) => ({
+          bind: vi.fn(() => ({ run: () => run(sql) })),
+        })),
+      },
+    } as unknown as Env
+    const event: BusEvent = {
+      type: 'agent.wake',
+      tenant: 'test',
+      agent_id: 'agent-1',
+      actor: { kind: 'member', id: 'member-1' },
+      payload: { task_id: 'task-1', dispatch_receipt_id: 'receipt-1' },
+      ts: '2026-07-10T00:00:00.000Z',
+    }
+    const first = message(event)
+    const duplicate = message(event)
+
+    await handleQueue({ messages: [first, duplicate] } as unknown as MessageBatch<BusEvent>, env)
+
+    expect(fetch).toHaveBeenCalledOnce()
+    expect(first.ack).toHaveBeenCalledOnce()
+    expect(duplicate.ack).toHaveBeenCalledOnce()
+    expect(first.retry).not.toHaveBeenCalled()
+    expect(duplicate.retry).not.toHaveBeenCalled()
   })
 
   it('deduplicates concurrent terminal flight events by durable outbox id', async () => {

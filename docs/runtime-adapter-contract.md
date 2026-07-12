@@ -423,17 +423,19 @@ requires `member+` on the task squad and cannot provide or override an agent id.
 Mupot revalidates that the assigned agent is active and currently assignable on
 the task squad before emitting the canonical `agent.wake` event with
 `payload.task_id`; the execution engine checks the same authority again when the
-wake is consumed. Only `open` and `in_progress` tasks are dispatchable.
+wake is consumed. Only `open`, `blocked`, and `rejected` tasks are dispatchable;
+`in_progress` is a single-owner execution claim and duplicate wakes no-op.
 Unassigned, terminal, inactive, or no-longer-authorized assignments fail closed
 without emitting a wake event. Missing and caller-inaccessible task ids both
 return `task_not_found`.
 
 Each accepted dispatch inserts an append-only `task_dispatch_receipts` row before
 queue emission and returns its id, member dispatcher, and dispatch timestamp.
-The wake event carries `dispatch_receipt_id`; the Queue consumer stamps
-`consumed_at` only after the assigned AgentDO accepts the task-scoped wake.
-Emission failure leaves the receipt with an attempt count and bounded error for
-operator diagnosis.
+The wake event carries `dispatch_receipt_id`; the Queue consumer atomically claims
+that receipt before the AgentDO side effect, so duplicate and concurrent Queue
+deliveries cannot re-execute the task. It stamps `consumed_at` only after the
+assigned AgentDO accepts the task-scoped wake. Emission or wake failure leaves an
+attempt count and bounded error for operator diagnosis.
 
 Statuses:
 

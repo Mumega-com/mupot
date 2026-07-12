@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS task_dispatch_receipts (
   actor_kind    TEXT NOT NULL CHECK (actor_kind IN ('member', 'agent')),
   actor_id      TEXT NOT NULL,
   created_at    TEXT NOT NULL,
-  emitted_at    TEXT,
+  claimed_at    TEXT,
   consumed_at   TEXT,
   attempts      INTEGER NOT NULL DEFAULT 0,
   last_error    TEXT

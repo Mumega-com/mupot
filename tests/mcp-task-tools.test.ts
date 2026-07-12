@@ -359,7 +359,7 @@ describe('MCP task cutover tools', () => {
   })
 
   it('task_dispatch emits a canonical task-scoped wake for the stored assignee', async () => {
-    const { env, events } = makeEnv([task({ assignee_agent_id: AGENT_ID })])
+    const { env, events, updates } = makeEnv([task({ assignee_agent_id: AGENT_ID })])
 
     const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
 
@@ -392,6 +392,7 @@ describe('MCP task cutover tools', () => {
         },
       }),
     ])
+    expect(updates.filter((update) => update.sql.includes('task_dispatch_receipts'))).toHaveLength(1)
   })
 
   it('task_dispatch refuses an unassigned task without emitting a wake', async () => {
@@ -450,6 +451,17 @@ describe('MCP task cutover tools', () => {
 
   it('task_dispatch refuses terminal tasks', async () => {
     const { env, events } = makeEnv([task({ status: 'done', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'task_not_runnable' })
+    expect(events).toEqual([])
+  })
+
+  it('task_dispatch refuses an already in-progress task', async () => {
+    const { env, events } = makeEnv([
+      task({ status: 'in_progress', assignee_agent_id: AGENT_ID }),
+    ])
 
     const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
 

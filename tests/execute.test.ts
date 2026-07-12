@@ -305,7 +305,7 @@ describe('runTaskExecution — fail-closed scope (RBAC boundary)', () => {
 describe('runTaskExecution — idempotency / K6 no-op gate statuses', () => {
   // K6: execute no-ops for statuses outside {open, in_progress, blocked, rejected}.
   // 'done', 'review', 'approved' must never re-enter the execution loop.
-  const noOpStatuses: Task['status'][] = ['done', 'review', 'approved']
+  const noOpStatuses: Task['status'][] = ['in_progress', 'done', 'review', 'approved']
 
   for (const status of noOpStatuses) {
     it(`no-ops on status=${status} without any writes`, async () => {

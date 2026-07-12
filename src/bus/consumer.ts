@@ -34,13 +34,14 @@ async function wakeAgent(env: Env, agentId: string, event: BusEvent): Promise<vo
   }
 }
 
-async function consumeTaskDispatchReceipt(env: Env, event: BusEvent): Promise<void> {
+async function claimTaskDispatchReceipt(env: Env, event: BusEvent): Promise<boolean> {
   const payload = event.payload as { task_id?: unknown; dispatch_receipt_id?: unknown }
-  if (typeof payload?.dispatch_receipt_id !== 'string' || typeof payload.task_id !== 'string') return
+  if (typeof payload?.dispatch_receipt_id !== 'string' || typeof payload.task_id !== 'string') return true
   const result = await env.DB.prepare(
     `UPDATE task_dispatch_receipts
-        SET consumed_at = ?
-      WHERE tenant = ? AND id = ? AND task_id = ? AND agent_id = ? AND consumed_at IS NULL`,
+        SET claimed_at = ?
+      WHERE tenant = ? AND id = ? AND task_id = ? AND agent_id = ?
+        AND claimed_at IS NULL AND consumed_at IS NULL`,
   ).bind(
     new Date().toISOString(),
     event.tenant,
@@ -48,7 +49,30 @@ async function consumeTaskDispatchReceipt(env: Env, event: BusEvent): Promise<vo
     payload.task_id,
     event.agent_id,
   ).run()
-  if (result.meta?.changes !== 1) throw new Error('task dispatch receipt consume failed')
+  return result.meta?.changes === 1
+}
+
+async function releaseTaskDispatchReceipt(env: Env, event: BusEvent, error: unknown): Promise<void> {
+  const payload = event.payload as { task_id?: unknown; dispatch_receipt_id?: unknown }
+  if (typeof payload?.dispatch_receipt_id !== 'string' || typeof payload.task_id !== 'string') return
+  const message = error instanceof Error ? error.message.slice(0, 500) : 'agent_wake_failed'
+  await env.DB.prepare(
+    `UPDATE task_dispatch_receipts
+        SET claimed_at = NULL, attempts = attempts + 1, last_error = ?
+      WHERE tenant = ? AND id = ? AND task_id = ? AND agent_id = ? AND consumed_at IS NULL`,
+  ).bind(message, event.tenant, payload.dispatch_receipt_id, payload.task_id, event.agent_id).run()
+}
+
+async function consumeTaskDispatchReceipt(env: Env, event: BusEvent): Promise<boolean> {
+  const payload = event.payload as { task_id?: unknown; dispatch_receipt_id?: unknown }
+  if (typeof payload?.dispatch_receipt_id !== 'string' || typeof payload.task_id !== 'string') return true
+  const result = await env.DB.prepare(
+    `UPDATE task_dispatch_receipts
+        SET consumed_at = ?, last_error = NULL
+      WHERE tenant = ? AND id = ? AND task_id = ? AND agent_id = ?
+        AND claimed_at IS NOT NULL AND consumed_at IS NULL`,
+  ).bind(new Date().toISOString(), event.tenant, payload.dispatch_receipt_id, payload.task_id, event.agent_id).run()
+  return result.meta?.changes === 1
 }
 
 async function dispatchSquad(env: Env, squadId: string, event: BusEvent): Promise<void> {
@@ -83,8 +107,16 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         console.error('bus: agent.wake missing agent_id', { tenant: event.tenant })
         return true
       }
-      await wakeAgent(env, event.agent_id, event)
-      await consumeTaskDispatchReceipt(env, event)
+      if (!(await claimTaskDispatchReceipt(env, event))) return true
+      try {
+        await wakeAgent(env, event.agent_id, event)
+      } catch (error) {
+        await releaseTaskDispatchReceipt(env, event, error)
+        throw error
+      }
+      if (!(await consumeTaskDispatchReceipt(env, event))) {
+        throw new Error('task dispatch receipt consume failed')
+      }
       return true
     }
     case 'squad.dispatch': {

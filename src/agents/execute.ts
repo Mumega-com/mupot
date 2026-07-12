@@ -88,13 +88,13 @@ export async function runTaskExecution(
   // (review, approved) and done are no-ops. A re-wake must NOT resurrect an
   // approved or under-review task back to in_progress.
   //
-  // Workable: open | in_progress | blocked | rejected
-  // No-op:    done | review | approved
+  // Workable: open | blocked | rejected
+  // No-op:    in_progress | done | review | approved
   //
   // 'rejected' is workable — it means rework is authorised; the agent should
   // re-attempt the task. 'blocked' is workable — the caller may retry after
   // resolving the blocker.
-  const WORKABLE: ReadonlySet<Task['status']> = new Set(['open', 'in_progress', 'blocked', 'rejected'])
+  const WORKABLE: ReadonlySet<Task['status']> = new Set(['open', 'blocked', 'rejected'])
   if (!WORKABLE.has(task.status)) {
     return { ok: true, task_id: taskId, decided: `no_op:${task.status}`, task_status: task.status }
   }
