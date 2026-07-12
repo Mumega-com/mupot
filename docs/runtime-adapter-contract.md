@@ -329,6 +329,13 @@ to a declared flight squad. Both REST and MCP refuse unknown squads, missing tas
 references, and tasks outside the declared flight squads. The caller cannot assert an
 agent identity in arguments.
 
+Squad members may create zero-budget coordination flights. A positive
+`budget_micro_usd` allocation requires `lead` or higher on every referenced squad and
+must fit the active agent's configured budget cap and every referenced squad cap.
+Mupot replaces caller-supplied budget readiness signals with this server-derived
+allocation ceiling; actual model execution remains subject to the execution meter's
+windowed spend enforcement.
+
 `flight_get` and `flight_list` require `observer` or higher on every squad referenced
 by a returned flight and return parsed metadata. Legacy or malformed metadata is not
 projected or distinguishable from an absent row through the scoped MCP read surface.

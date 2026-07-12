@@ -12,8 +12,8 @@ const OTHER_SQUAD_ID = 'squad-other'
 const signals = {
   contextComplete: true,
   toolsReachable: true,
-  budgetRemainingMicroUsd: 1_000_000,
-  budgetEstimateMicroUsd: 100_000,
+  budgetRemainingMicroUsd: 999_000_000,
+  budgetEstimateMicroUsd: 999_000_000,
   recentProgress: 0.9,
   progressPerStep: 0.8,
   wastePerStep: 0.1,
@@ -56,12 +56,12 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
     ['task-m000', { id: 'task-m000', squad_id: SQUAD_ID }],
   ])
   const squads = new Map([
-    [SQUAD_ID, { id: SQUAD_ID, department_id: 'dept-1', slug: 'mmhq', name: 'Mumega HQ', charter: null, created_at: 'now' }],
-    [OTHER_SQUAD_ID, { id: OTHER_SQUAD_ID, department_id: 'dept-2', slug: 'other', name: 'Other', charter: null, created_at: 'now' }],
+    [SQUAD_ID, { id: SQUAD_ID, department_id: 'dept-1', slug: 'mmhq', name: 'Mumega HQ', charter: null, budget_cap_cents: 100, budget_window: 'day', created_at: 'now' }],
+    [OTHER_SQUAD_ID, { id: OTHER_SQUAD_ID, department_id: 'dept-2', slug: 'other', name: 'Other', charter: null, budget_cap_cents: 100, budget_window: 'day', created_at: 'now' }],
   ])
   const agents = new Map<string, { id: string; squad_id: string; slug: string; name: string; role: null; model: null; status: 'active' | 'paused'; created_at: string }>()
   if (agentStatus) {
-    agents.set(AGENT_ID, { id: AGENT_ID, squad_id: SQUAD_ID, slug: 'product', name: 'Product', role: null, model: null, status: agentStatus, created_at: 'now' })
+    agents.set(AGENT_ID, { id: AGENT_ID, squad_id: SQUAD_ID, slug: 'product', name: 'Product', role: null, model: null, status: agentStatus, budget_cap_cents: 100, budget_window: 'day', created_at: 'now' } as never)
   }
   const env = {
     TENANT_SLUG: TENANT,
@@ -105,6 +105,18 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
                 return { meta: { changes: 1 } }
               },
               async all<T>() {
+                if (sql.includes('FROM squads WHERE id IN')) {
+                  return { results: args.flatMap((id) => {
+                    const squad = squads.get(id as string)
+                    return squad ? [squad] : []
+                  }) as T[] }
+                }
+                if (sql.includes('SELECT id, squad_id FROM tasks WHERE id IN')) {
+                  return { results: args.flatMap((id) => {
+                    const task = tasks.get(id as string)
+                    return task ? [task] : []
+                  }) as T[] }
+                }
                 return { results: [...rows.values()] as T[] }
               },
             }
@@ -119,7 +131,7 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
 const dispatchArgs = {
   squad_id: SQUAD_ID,
   goal: 'Run the Mumega tenant-zero census',
-  budget_micro_usd: 200_000,
+  budget_micro_usd: 0,
   meta_json: JSON.stringify(meta),
   signals_json: JSON.stringify(signals),
 }
@@ -161,11 +173,34 @@ describe('MCP flight tools', () => {
     const { env } = makeEnv()
     const out = await invokeTool(auth(), env, 'flight_dispatch', {
       ...dispatchArgs,
-      squad_id: OTHER_SQUAD_ID,
-      meta_json: JSON.stringify({ ...meta, squad_ids: [OTHER_SQUAD_ID] }),
+      meta_json: JSON.stringify({ ...meta, squad_ids: [SQUAD_ID, OTHER_SQUAD_ID] }),
     }, 'https://pot.example')
     expect(out.ok).toBe(false)
     expect(out.error).toBe('forbidden')
+  })
+
+  it('requires lead authority for positive budget and enforces the server cap', async () => {
+    const { env } = makeEnv()
+    const positiveBudget = {
+      ...dispatchArgs,
+      budget_micro_usd: 500_000,
+    }
+    const member = await invokeTool(auth(), env, 'flight_dispatch', positiveBudget, 'https://pot.example')
+    expect(member.ok).toBe(false)
+    expect(member.error).toBe('flight_budget_forbidden')
+
+    const leadAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'lead' }],
+    })
+    const withinCap = await invokeTool(leadAuth, env, 'flight_dispatch', positiveBudget, 'https://pot.example')
+    expect(withinCap.ok).toBe(true)
+
+    const overCap = await invokeTool(leadAuth, env, 'flight_dispatch', {
+      ...positiveBudget,
+      budget_micro_usd: 1_000_001,
+    }, 'https://pot.example')
+    expect(overCap.ok).toBe(false)
+    expect(overCap.error).toBe('flight_budget_exceeds_cap')
   })
 
   it('refuses metadata that claims a missing task', async () => {

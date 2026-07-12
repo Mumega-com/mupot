@@ -1,3 +1,5 @@
+import type { Env, Squad } from '../types'
+
 export const FLIGHT_META_V1_SCHEMA = 'mupot.flight.meta/v1' as const
 
 export type FlightConfidentiality = 'private' | 'internal' | 'public-projection'
@@ -78,17 +80,30 @@ export type FlightMetaReferenceResult =
   | { ok: true }
   | { ok: false; error: 'flight_squad_not_found' | 'flight_task_not_found' | 'flight_task_scope_mismatch'; ref: string }
 
+export async function loadFlightSquads(env: Env, squadIds: string[]): Promise<Squad[]> {
+  const placeholders = squadIds.map((_, index) => `?${index + 1}`).join(',')
+  const rows = await env.DB.prepare(
+    `SELECT id, department_id, slug, name, charter, budget_cap_cents, budget_window, created_at
+       FROM squads WHERE id IN (${placeholders})`,
+  )
+    .bind(...squadIds)
+    .all<Squad>()
+  return rows.results ?? []
+}
+
 export async function validateFlightMetaReferences(env: Env, meta: FlightMetaV1): Promise<FlightMetaReferenceResult> {
-  for (const squadId of meta.squad_ids) {
-    const squad = await env.DB.prepare('SELECT id FROM squads WHERE id = ?1 LIMIT 1')
-      .bind(squadId)
-      .first<{ id: string }>()
-    if (!squad) return { ok: false, error: 'flight_squad_not_found', ref: squadId }
-  }
+  const squadRows = await loadFlightSquads(env, meta.squad_ids)
+  const foundSquads = new Set(squadRows.map((row) => row.id))
+  const missingSquad = meta.squad_ids.find((id) => !foundSquads.has(id))
+  if (missingSquad) return { ok: false, error: 'flight_squad_not_found', ref: missingSquad }
+
+  const taskPlaceholders = meta.task_ids.map((_, index) => `?${index + 1}`).join(',')
+  const taskRows = await env.DB.prepare(`SELECT id, squad_id FROM tasks WHERE id IN (${taskPlaceholders})`)
+    .bind(...meta.task_ids)
+    .all<{ id: string; squad_id: string }>()
+  const tasksById = new Map((taskRows.results ?? []).map((row) => [row.id, row]))
   for (const taskId of meta.task_ids) {
-    const task = await env.DB.prepare('SELECT id, squad_id FROM tasks WHERE id = ?1 LIMIT 1')
-      .bind(taskId)
-      .first<{ id: string; squad_id: string }>()
+    const task = tasksById.get(taskId)
     if (!task) return { ok: false, error: 'flight_task_not_found', ref: taskId }
     if (!meta.squad_ids.includes(task.squad_id)) {
       return { ok: false, error: 'flight_task_scope_mismatch', ref: taskId }
@@ -96,5 +111,3 @@ export async function validateFlightMetaReferences(env: Env, meta: FlightMetaV1)
   }
   return { ok: true }
 }
-import type { Env } from '../types'
-

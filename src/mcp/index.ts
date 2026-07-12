@@ -58,7 +58,7 @@ import { PROVISION_TOOLS } from './provision'
 import { dispatchFlight } from '../flight/dispatch'
 import { getFlight, listFlightsForSquad, type FlightRow } from '../flight/service'
 import { parseDispatchBody } from '../flight/routes'
-import { parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from '../flight/meta'
+import { loadFlightSquads, parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from '../flight/meta'
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
 // Vitest can import it without the CF runtime. See ./auth-header.ts.
 import { AUTH_CONTEXT_HEADER } from './auth-header'
@@ -247,7 +247,8 @@ export async function memberCanOnSquad(
 // ── d1 helpers (read-only lookups; allow-listed table names) ──────────────────
 async function loadSquad(env: Env, squadId: string): Promise<Squad | null> {
   const row = await env.DB.prepare(
-    `SELECT id, department_id, slug, name, charter, created_at FROM squads WHERE id = ?1 LIMIT 1`,
+    `SELECT id, department_id, slug, name, charter, budget_cap_cents, budget_window, created_at
+       FROM squads WHERE id = ?1 LIMIT 1`,
   )
     .bind(squadId)
     .first<Squad>()
@@ -256,7 +257,8 @@ async function loadSquad(env: Env, squadId: string): Promise<Squad | null> {
 
 async function loadAgent(env: Env, agentId: string): Promise<Agent | null> {
   const row = await env.DB.prepare(
-    `SELECT id, squad_id, slug, name, role, model, status, created_at FROM agents WHERE id = ?1 LIMIT 1`,
+    `SELECT id, squad_id, slug, name, role, model, status, budget_cap_cents, budget_window, created_at
+       FROM agents WHERE id = ?1 LIMIT 1`,
   )
     .bind(agentId)
     .first<Agent>()
@@ -769,13 +771,14 @@ const toolFlightDispatch: ToolSpec = {
     const squadId = str(args.squad_id)
     const goal = str(args.goal)
     if (!squadId || !goal) return fail(400, 'invalid_args')
+    const requestedBudget = args.budget_micro_usd == null ? 0 : args.budget_micro_usd
+    if (!Number.isSafeInteger(requestedBudget) || (requestedBudget as number) < 0) {
+      return fail(400, 'invalid_flight_budget')
+    }
 
     const squad = await loadSquad(env, squadId)
     if (!squad) return fail(404, 'squad_not_found')
     const grants = auth.capabilities ?? []
-    if (!(await memberCanOnSquad(env, grants, squad.id, 'member'))) {
-      return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
-    }
 
     const meta = parseFlightMetaV1(parseJsonArg(args.meta_json))
     if (!meta || !meta.squad_ids.includes(squad.id)) return fail(400, 'invalid_flight_meta')
@@ -784,11 +787,27 @@ const toolFlightDispatch: ToolSpec = {
     if (!references.ok) {
       return fail(references.error.endsWith('_not_found') ? 404 : 400, references.error, references.ref)
     }
-    for (const referencedSquadId of meta.squad_ids) {
-      const referencedSquad = await loadSquad(env, referencedSquadId)
-      if (!referencedSquad) return fail(404, 'squad_not_found', referencedSquadId)
-      if (!(await memberCanOnSquad(env, grants, referencedSquad.id, 'member'))) {
-        return fail(403, 'forbidden', { need: 'member', scope: 'squad', squad_id: referencedSquad.id })
+    const referencedSquads = await loadFlightSquads(env, meta.squad_ids)
+    const requiredCapability: Capability = (requestedBudget as number) > 0 ? 'lead' : 'member'
+    for (const referencedSquad of referencedSquads) {
+      if (!hasCapability(grants, 'squad', referencedSquad.id, requiredCapability, referencedSquad.department_id)) {
+        return fail(
+          403,
+          (requestedBudget as number) > 0 ? 'flight_budget_forbidden' : 'forbidden',
+          { need: requiredCapability, scope: 'squad', squad_id: referencedSquad.id },
+        )
+      }
+    }
+
+    let budgetCeilingMicroUsd = 0
+    if ((requestedBudget as number) > 0) {
+      const caps = [boundAgent.budget_cap_cents, ...referencedSquads.map((item) => item.budget_cap_cents)]
+      if (caps.some((cap) => typeof cap !== 'number' || !Number.isSafeInteger(cap) || cap <= 0)) {
+        return fail(409, 'flight_budget_policy_missing')
+      }
+      budgetCeilingMicroUsd = Math.min(...(caps as number[])) * 10_000
+      if ((requestedBudget as number) > budgetCeilingMicroUsd) {
+        return fail(409, 'flight_budget_exceeds_cap', { cap_micro_usd: budgetCeilingMicroUsd })
       }
     }
     const signals = parseJsonArg(args.signals_json)
@@ -796,11 +815,13 @@ const toolFlightDispatch: ToolSpec = {
       agent: auth.boundAgentId,
       goal,
       trigger_source: 'api',
-      budget_micro_usd: args.budget_micro_usd,
+      budget_micro_usd: requestedBudget,
       meta,
       signals,
     })
     if (!parsed.ok) return fail(400, parsed.error)
+    parsed.value.signals.budgetEstimateMicroUsd = requestedBudget as number
+    parsed.value.signals.budgetRemainingMicroUsd = budgetCeilingMicroUsd
 
     const preflight = await dispatchFlight(env, parsed.value.flight, parsed.value.signals, parsed.value.opts)
     const flight = await getFlight(env, preflight.id)

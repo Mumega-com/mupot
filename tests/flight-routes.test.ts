@@ -137,6 +137,7 @@ describe('REST flight dispatch reference integrity', () => {
                   if (sql.includes('FROM capabilities')) {
                     return { results: [{ member_id: 'admin-1', scope_type: 'org', scope_id: null, capability: 'admin' }] }
                   }
+                  if (sql.includes('FROM squads WHERE id IN')) return { results: [] }
                   throw new Error(`unexpected all query: ${sql}`)
                 },
                 async run() {

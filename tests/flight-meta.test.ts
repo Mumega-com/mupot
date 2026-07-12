@@ -32,6 +32,11 @@ function makeEnv(opts: { squad?: boolean; task?: boolean; taskSquad?: string } =
                 if (sql.includes('FROM tasks')) return task && id === 'task-1' ? { id, squad_id: taskSquad } : null
                 return null
               },
+              async all() {
+                if (sql.includes('FROM squads')) return { results: squad ? [{ id: 'squad-1' }] : [] }
+                if (sql.includes('FROM tasks')) return { results: task ? [{ id: 'task-1', squad_id: taskSquad }] : [] }
+                return { results: [] }
+              },
             }
           },
         }
@@ -63,5 +68,37 @@ describe('validateFlightMetaReferences', () => {
   it('rejects a task outside the declared flight squads', async () => {
     if (!validate) return
     await expect(validate(makeEnv({ taskSquad: 'squad-other' }), meta)).resolves.toMatchObject({ ok: false, error: 'flight_task_scope_mismatch' })
+  })
+
+  it('validates the maximum task set with at most two D1 reads', async () => {
+    if (!validate) return
+    let reads = 0
+    const env = {
+      TENANT_SLUG: 'test',
+      DB: {
+        prepare(sql: string) {
+          reads += 1
+          return {
+            bind(...ids: string[]) {
+              return {
+                async first() {
+                  const id = ids[0]
+                  return sql.includes('FROM squads') ? { id } : { id, squad_id: 'squad-1' }
+                },
+                async all() {
+                  return {
+                    results: ids.map((id) => sql.includes('FROM squads') ? { id } : { id, squad_id: 'squad-1' }),
+                  }
+                },
+              }
+            },
+          }
+        },
+      },
+    } as unknown as Env
+    const large = { ...meta, task_ids: Array.from({ length: 200 }, (_, index) => `task-${index}`) }
+
+    await expect(validate(env, large)).resolves.toEqual({ ok: true })
+    expect(reads).toBeLessThanOrEqual(2)
   })
 })
