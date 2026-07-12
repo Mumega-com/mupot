@@ -73,6 +73,17 @@ export function patchToDoneBypassesGate(
   return existingStatus !== 'approved' && existingStatus !== 'rejected'
 }
 
+export function stampTaskUpdate(
+  task: Task,
+  previousStatus: TaskStatus,
+  now: string,
+): void {
+  task.updated_at = now
+  if (previousStatus !== 'done' && task.status === 'done') {
+    task.completed_at = now
+  }
+}
+
 export interface CreateTaskInput {
   squad_id: string
   title: string

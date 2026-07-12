@@ -46,6 +46,7 @@ import {
   isDoneWhenValid,
   mirrorTaskUpdate,
   patchToDoneBypassesGate,
+  stampTaskUpdate,
 } from '../tasks/service'
 import type { TaskStatus } from '../tasks/service'
 import { buildOrient, renderBrief } from '../orient/service'
@@ -705,12 +706,12 @@ const toolTaskUpdate: ToolSpec = {
     }
     if (!changed) return fail(400, 'invalid_args', 'at least one update field is required')
 
-    next.updated_at = new Date().toISOString()
+    stampTaskUpdate(next, existing.status, new Date().toISOString())
     next.github_issue_url = await mirrorTaskUpdate(env, next)
 
     const res = await env.DB.prepare(
       `UPDATE tasks
-          SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, updated_at = ?
+          SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, completed_at = ?, updated_at = ?
         WHERE id = ?`,
     )
       .bind(
@@ -721,6 +722,7 @@ const toolTaskUpdate: ToolSpec = {
         next.assignee_agent_id,
         next.github_issue_url,
         next.gate_owner,
+        next.completed_at,
         next.updated_at,
         next.id,
       )
