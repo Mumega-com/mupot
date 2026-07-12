@@ -246,6 +246,13 @@ describe('shared execution authorization', () => {
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
+        CREATE TABLE engrams (
+          id TEXT PRIMARY KEY,
+          agent_id TEXT NOT NULL,
+          text TEXT NOT NULL,
+          concepts TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
 
         INSERT INTO squads (id, department_id, charter)
         VALUES ('squad-wf-home', 'department-home', 'Home charter.');
@@ -274,13 +281,13 @@ describe('shared execution authorization', () => {
 
       const aiRun = vi.fn()
       const busSend = vi.fn()
-      const vectorInsert = vi.fn()
+      const vectorUpsert = vi.fn()
       const env = {
         ...makeMinimalEnv(),
         DB: harness.db,
         AI: { run: aiRun },
         BUS: { send: busSend },
-        VEC: { insert: vectorInsert },
+        VEC: { upsert: vectorUpsert },
       } as unknown as Env
       const crossAgent: Agent = {
         ...AGENT,
@@ -312,9 +319,10 @@ describe('shared execution authorization', () => {
         detail: JSON.stringify({ ok: false }),
       }))
       expect(harness.sqlite.prepare('SELECT * FROM tasks WHERE id = ?').get(params.taskId)).toEqual(before)
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM engrams').get()).toEqual({ count: 0 })
       expect(aiRun).not.toHaveBeenCalled()
       expect(busSend).not.toHaveBeenCalled()
-      expect(vectorInsert).not.toHaveBeenCalled()
+      expect(vectorUpsert).not.toHaveBeenCalled()
     } finally {
       harness.close()
     }
