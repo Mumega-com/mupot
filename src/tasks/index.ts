@@ -15,7 +15,7 @@
 
 import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
-import type { Env, AuthContext, Task, Agent, Squad } from '../types'
+import type { Env, AuthContext, Task, Squad } from '../types'
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
@@ -25,6 +25,8 @@ import { requireAuth } from '../auth'
 import { resolveCapabilities, hasCapability, hasSurfaceCap } from '../auth/capability'
 import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate } from './service'
 import type { TaskStatus } from './service'
+import { resolveTaskAssignee } from './assignee'
+export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
 import { startTaskPipeline } from '../workflows/pipeline'
@@ -268,8 +270,8 @@ tasksApp.post('/', async (c) => {
   if (!squad) return c.json({ error: 'squad_not_found' }, 404)
 
   // RBAC: creating work in a squad requires member+ on that squad. (Fixes: any
-  // member tasking any squad.) The assignee is constrained to this same squad by
-  // resolveAssignee below, so this one check also covers the assignment.
+  // member tasking any squad.) The assignee is independently constrained to be
+  // assignable on the task squad, so this one check still gates the caller.
   if (!(await canActOnSquad(c.env, c.get('auth'), squad.id))) {
     return c.json({ error: 'forbidden', need: 'member' }, 403)
   }
@@ -291,8 +293,8 @@ tasksApp.post('/', async (c) => {
   }
   const status: TaskStatus = rawStatus
 
-  // assignee, if provided, must resolve to an agent in this same squad.
-  const assigneeCheck = await resolveAssignee(c.env, body.assignee_agent_id, squad.id)
+  // assignee, if provided, must resolve to an agent assignable on this task squad.
+  const assigneeCheck = await resolveTaskAssignee(c.env, body.assignee_agent_id, squad.id)
   if (assigneeCheck.error) return c.json({ error: assigneeCheck.error }, 400)
   const assigneeAgentId = assigneeCheck.value
 
@@ -327,8 +329,8 @@ tasksApp.post('/', async (c) => {
 
   // Dispatch: wake the assignee in execute mode. We require an assignee — there is
   // no "wake the whole squad to fight over one task". The assignee was already
-  // validated to belong to THIS squad (resolveAssignee → assignee_not_in_squad), so
-  // this fails closed: dispatch without a (valid, in-squad) assignee is rejected.
+  // validated as assignable on THIS task squad (resolveTaskAssignee →
+  // assignee_not_in_squad), so this fails closed without an authorized assignee.
   let dispatched = false
   if (body.dispatch === true) {
     if (!assigneeAgentId) {
@@ -369,8 +371,8 @@ tasksApp.patch('/:id', async (c) => {
   if (!existing) return c.json({ error: 'task_not_found' }, 404)
 
   // RBAC: mutating a task (status/assignee/title/body) requires member+ on the
-  // task's squad. Reassignment stays within this squad (resolveAssignee enforces
-  // assignee_not_in_squad), so this single check also gates the assignment.
+  // task's squad. Reassignment must remain assignable on that task squad
+  // (resolveTaskAssignee enforces assignee_not_in_squad), so this check gates caller authority.
   if (!(await canActOnSquad(c.env, c.get('auth'), existing.squad_id))) {
     return c.json({ error: 'forbidden', need: 'member' }, 403)
   }
@@ -443,7 +445,7 @@ tasksApp.patch('/:id', async (c) => {
     if (body.assignee_agent_id === null) {
       next.assignee_agent_id = null
     } else {
-      const check = await resolveAssignee(c.env, body.assignee_agent_id, existing.squad_id)
+      const check = await resolveTaskAssignee(c.env, body.assignee_agent_id, existing.squad_id)
       if (check.error) return c.json({ error: check.error }, 400)
       next.assignee_agent_id = check.value
     }
@@ -835,31 +837,6 @@ tasksApp.post('/:id/pipeline', async (c) => {
     throw err
   }
 })
-
-// ── assignee resolution ──────────────────────────────────────────────────────
-
-interface AssigneeResult {
-  value: string | null
-  error?: 'invalid_assignee' | 'assignee_not_in_squad'
-}
-
-// An assignee must be an existing agent whose squad matches the task's squad.
-// undefined/null -> unassigned. Exported for unit tests of the dispatch boundary
-// (dispatch requires a valid in-squad assignee; a cross-squad id is rejected).
-export async function resolveAssignee(
-  env: Env,
-  raw: unknown,
-  squadId: string,
-): Promise<AssigneeResult> {
-  if (raw === undefined || raw === null) return { value: null }
-  if (typeof raw !== 'string' || raw.length === 0) {
-    return { value: null, error: 'invalid_assignee' }
-  }
-  const agent = await getById<Agent>(env, 'agents', raw)
-  if (!agent) return { value: null, error: 'invalid_assignee' }
-  if (agent.squad_id !== squadId) return { value: null, error: 'assignee_not_in_squad' }
-  return { value: agent.id }
-}
 
 // ── POST /api/gates/grants — grant a gate capability to a principal (K3) ─────
 // ── DELETE /api/gates/grants — revoke a gate grant ───────────────────────────

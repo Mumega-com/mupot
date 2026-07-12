@@ -3,10 +3,10 @@ import { resolveAssignee } from '../src/tasks/index'
 import type { Agent } from '../src/types'
 
 // Dispatch (POST /api/tasks {dispatch:true}) waking an agent in execute mode is
-// gated on resolveAssignee: the assignee must be an existing agent that lives in
-// the SAME squad as the task. A cross-squad / unknown assignee is rejected before
-// any wake is emitted (the route turns these into a 4xx). These tests pin that
-// boundary directly so the wake can never fan to an agent outside the squad.
+// gated on resolveAssignee: the assignee must be an active agent assignable on the
+// task squad. A cross-squad agent without a bound member identity / unknown assignee
+// is rejected before any wake is emitted (the route turns these into a 4xx). These
+// tests pin that boundary directly so the wake can never fan to an unauthorized agent.
 
 const AGENT_IN_SQUAD: Agent = {
   id: 'agent-1',
@@ -30,6 +30,9 @@ function makeEnv(agent: Agent | null) {
               async first<T>() {
                 return (agent as unknown as T) ?? null
               },
+              async all<T>() {
+                return { results: [] as T[] }
+              },
             }
           },
         }
@@ -46,7 +49,13 @@ describe('resolveAssignee — dispatch boundary', () => {
     expect(r.value).toBe('agent-1')
   })
 
-  it('rejects an agent in a DIFFERENT squad (assignee_not_in_squad → 4xx)', async () => {
+  it('rejects an inactive home-squad agent (assignee_not_in_squad → 4xx)', async () => {
+    const r = await resolveAssignee(makeEnv({ ...AGENT_IN_SQUAD, status: 'paused' }), 'agent-1', 'squad-1')
+    expect(r.error).toBe('assignee_not_in_squad')
+    expect(r.value).toBeNull()
+  })
+
+  it('rejects an unminted agent in a DIFFERENT squad (assignee_not_in_squad → 4xx)', async () => {
     const r = await resolveAssignee(makeEnv({ ...AGENT_IN_SQUAD, squad_id: 'other-squad' }), 'agent-1', 'squad-1')
     expect(r.error).toBe('assignee_not_in_squad')
     expect(r.value).toBeNull()

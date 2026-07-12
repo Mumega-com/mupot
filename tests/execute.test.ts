@@ -230,6 +230,30 @@ describe('runTaskExecution — fail-closed scope (RBAC boundary)', () => {
     expect(model.chat).not.toHaveBeenCalled()
     expect(updates).toHaveLength(0) // nothing persisted for an out-of-scope task
   })
+
+  it('returns task_not_found with no effects when the task is assigned to another agent', async () => {
+    const { env, updates } = makeEnv({ task: makeTask({ assignee_agent_id: 'agent-2' }) })
+    const model = okModel('should never run')
+    const emit = vi.fn()
+    const remember = vi.fn()
+    const checkAndReserve = vi.fn()
+    const recordTokens = vi.fn()
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', {
+      model,
+      emit,
+      remember,
+      meter: { checkAndReserve, recordTokens },
+    })
+
+    expect(r).toMatchObject({ ok: false, task_id: 'task-1', error: 'task_not_found' })
+    expect(updates).toHaveLength(0)
+    expect(model.chat).not.toHaveBeenCalled()
+    expect(checkAndReserve).not.toHaveBeenCalled()
+    expect(recordTokens).not.toHaveBeenCalled()
+    expect(remember).not.toHaveBeenCalled()
+    expect(emit).not.toHaveBeenCalled()
+  })
 })
 
 describe('runTaskExecution — idempotency / K6 no-op gate statuses', () => {

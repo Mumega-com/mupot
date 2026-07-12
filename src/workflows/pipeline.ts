@@ -11,8 +11,9 @@
 //     signal only — readLatestVerdict re-reads D1 after every resume AND after
 //     a timeout.  A dropped event (sendEvent before waitForEvent, CF-level loss)
 //     cannot cause a silent wrong verdict because we never trust the payload.
-//   - The pipeline is ADDITIVE and OPT-IN.  The existing runTaskExecution path
-//     (AgentDO → direct execute) is unchanged.  Starting a pipeline is a
+//   - The pipeline is ADDITIVE and OPT-IN. It delegates task authorization and
+//     current capability rechecks to the shared runTaskExecution engine used by
+//     AgentDO. Starting a pipeline is a
 //     separate POST /api/tasks/:id/pipeline call; tasks without
 //     workflow_instance_id run exactly as before.
 //   - The pipeline NEVER flips task status or writes verdict receipts.  The
