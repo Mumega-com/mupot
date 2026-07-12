@@ -23,6 +23,7 @@ interface Opts {
   deptExists?: boolean
   agentTokenMembers?: string[]
   existingGrantCapabilities?: Capability[]
+  guardedGrantNoRow?: boolean
   events?: unknown[]
 }
 
@@ -85,7 +86,7 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
         async all() {
           if (sql.includes('WITH active_identity AS MATERIALIZED')) {
             const distinctMembers = [...new Set(agentTokenMembers)]
-            if (distinctMembers.length !== 1 || distinctMembers[0] !== args[2]) {
+            if (opts.guardedGrantNoRow || distinctMembers.length !== 1 || distinctMembers[0] !== args[2]) {
               return { results: [] }
             }
             const createdId = args[3] as string
@@ -620,6 +621,18 @@ describe('grant_agent_capability', () => {
     )
     expect(res.status).toBe(409)
     expect(((await res.json()) as { error: { message: string } }).error.message).toBe('agent_identity_ambiguous')
+    expect(captured).toEqual([])
+  })
+
+  it('reports a receipt failure when the guarded write returns no row but identity is unchanged', async () => {
+    const captured: Captured[] = []
+    const res = await call(
+      'grant_agent_capability',
+      args,
+      makeEnv({ guardedGrantNoRow: true }, captured),
+    )
+    expect(res.status).toBe(500)
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe('receipt_failed')
     expect(captured).toEqual([])
   })
 

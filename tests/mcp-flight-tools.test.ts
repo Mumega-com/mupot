@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { TOOLS, invokeTool } from '../src/mcp'
-import { resolveCapabilities } from '../src/auth/capability'
+import { mcpApp, TOOLS, invokeTool } from '../src/mcp'
 import type { AuthContext, Env } from '../src/types'
 import type { FlightRow } from '../src/flight/service'
 import { flushFlightEventOutbox } from '../src/flight/service'
@@ -11,6 +10,29 @@ const MEMBER_ID = 'member-product'
 const AGENT_ID = 'agent-product'
 const SQUAD_ID = 'squad-mmhq'
 const OTHER_SQUAD_ID = 'squad-other'
+const PRODUCT_TOKEN = 'mupot-product-flight-token'
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+async function authenticatedTool(env: Env, tool: string, args: Record<string, unknown>) {
+  const response = await mcpApp.request(
+    'https://pot.example/',
+    {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${PRODUCT_TOKEN}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ tool, args }),
+    },
+    env,
+  )
+  expect(response.status, await response.clone().text()).toBe(200)
+  return response.json() as Promise<{ ok: boolean; result: Record<string, unknown> }>
+}
 
 const signals = {
   contextComplete: true,
@@ -662,10 +684,11 @@ describe('MCP flight tools', () => {
 })
 
 describe('MCP granted multi-squad flight lifecycle', () => {
-  it('uses reloaded Product grants through dispatch, read, task completion, and landing', async () => {
+  it('re-authenticates the same Product bearer through dispatch, read, task completion, and landing', async () => {
     const harness = createSqliteD1()
     const events: unknown[] = []
     try {
+      const productTokenHash = await sha256Hex(PRODUCT_TOKEN)
       harness.sqlite.exec(`
         CREATE TABLE departments (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL);
         CREATE TABLE squads (
@@ -680,11 +703,15 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           budget_window TEXT NOT NULL DEFAULT 'day', created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE TABLE members (
-          id TEXT PRIMARY KEY, display_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', tenant TEXT NOT NULL
+          id TEXT PRIMARY KEY, email TEXT, display_name TEXT NOT NULL, telegram_chat_id TEXT,
+          status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          tenant TEXT NOT NULL
         );
         CREATE TABLE member_tokens (
           id TEXT PRIMARY KEY, member_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
-          agent_id TEXT, tenant TEXT NOT NULL, revoked_at TEXT
+          label TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT 'workspace',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')), revoked_at TEXT,
+          agent_id TEXT, tenant TEXT NOT NULL
         );
         CREATE TABLE capabilities (
           id TEXT PRIMARY KEY, member_id TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT,
@@ -723,9 +750,12 @@ describe('MCP granted multi-squad flight lifecycle', () => {
         INSERT INTO squads (id, department_id, slug, name) VALUES ('${SQUAD_ID}', 'dept-home', 'mmhq', 'Mumega HQ');
         INSERT INTO squads (id, department_id, slug, name) VALUES ('${OTHER_SQUAD_ID}', 'dept-other', 'other', 'Other');
         INSERT INTO agents (id, squad_id, slug, name) VALUES ('${AGENT_ID}', '${SQUAD_ID}', 'product', 'Product');
-        INSERT INTO members VALUES ('${MEMBER_ID}', 'Product', 'active', '${TENANT}');
-        INSERT INTO members VALUES ('member-operator', 'Operator', 'active', '${TENANT}');
-        INSERT INTO member_tokens VALUES ('token-product', '${MEMBER_ID}', 'hash-product', '${AGENT_ID}', '${TENANT}', NULL);
+        INSERT INTO members (id, display_name, status, tenant)
+        VALUES ('${MEMBER_ID}', 'Product', 'active', '${TENANT}');
+        INSERT INTO members (id, display_name, status, tenant)
+        VALUES ('member-operator', 'Operator', 'active', '${TENANT}');
+        INSERT INTO member_tokens (id, member_id, token_hash, revoked_at, agent_id, tenant)
+        VALUES ('token-product', '${MEMBER_ID}', '${productTokenHash}', NULL, '${AGENT_ID}', '${TENANT}');
         INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
         VALUES ('grant-home', '${MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member');
         INSERT INTO tasks
@@ -758,34 +788,28 @@ describe('MCP granted multi-squad flight lifecycle', () => {
       }, 'https://pot.example')
       expect(granted).toMatchObject({ ok: true, result: { result: 'created' } })
 
-      const reloadedCapabilities = await resolveCapabilities(env, MEMBER_ID)
-      expect(reloadedCapabilities).toEqual(expect.arrayContaining([
-        { member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'member' },
-        { member_id: MEMBER_ID, scope_type: 'squad', scope_id: OTHER_SQUAD_ID, capability: 'member' },
-      ]))
-      const productAuth = auth({ capabilities: reloadedCapabilities })
       const lifecycleMeta = { ...meta, squad_ids: [SQUAD_ID, OTHER_SQUAD_ID] }
-      const dispatched = await invokeTool(productAuth, env, 'flight_dispatch', {
+      const dispatched = await authenticatedTool(env, 'flight_dispatch', {
         ...dispatchArgs,
         meta_json: JSON.stringify(lifecycleMeta),
-      }, 'https://pot.example')
-      expect(dispatched.ok, JSON.stringify(dispatched)).toBe(true)
-      const flightId = (dispatched.result as { flight: FlightRow }).flight.id
+      })
+      expect(dispatched.ok).toBe(true)
+      const flightId = (dispatched.result.flight as FlightRow).id
 
-      const read = await invokeTool(productAuth, env, 'flight_get', { flight_id: flightId }, 'https://pot.example')
+      const read = await authenticatedTool(env, 'flight_get', { flight_id: flightId })
       expect(read).toMatchObject({ ok: true, result: { flight: { id: flightId, status: 'running' } } })
 
-      const completed = await invokeTool(productAuth, env, 'task_update', {
+      const completed = await authenticatedTool(env, 'task_update', {
         task_id: 'task-m000',
         status: 'done',
-      }, 'https://pot.example')
+      })
       expect(completed).toMatchObject({ ok: true, result: { task: { id: 'task-m000', status: 'done' } } })
       expect(harness.sqlite.prepare("SELECT status FROM tasks WHERE id = 'task-m000'").get()).toEqual({ status: 'done' })
 
-      const landed = await invokeTool(productAuth, env, 'flight_land', {
+      const landed = await authenticatedTool(env, 'flight_land', {
         flight_id: flightId,
         cost_micro_usd: 0,
-      }, 'https://pot.example')
+      })
       expect(landed).toMatchObject({ ok: true, result: { flight: { id: flightId, status: 'landed' } } })
       expect(events).toContainEqual(expect.objectContaining({ type: 'flight.landed', agent_id: AGENT_ID }))
     } finally {

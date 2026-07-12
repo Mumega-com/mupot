@@ -415,6 +415,9 @@ const toolGrantAgentCapability: ToolSpec = {
       if (currentIdentity === 'ambiguous') {
         return fail(409, 'agent_identity_ambiguous', 'revoke stale agent tokens until one active member identity remains')
       }
+      if (currentIdentity === agentMemberId) {
+        return fail(500, 'receipt_failed', 'capability grant returned no write receipt')
+      }
       return fail(409, 'agent_identity_changed', 'agent member binding changed; retry the grant')
     }
     await emitProvisioned(env, auth.memberId as string, 'capability', squad.id, {

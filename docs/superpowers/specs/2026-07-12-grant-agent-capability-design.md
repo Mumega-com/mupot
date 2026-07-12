@@ -25,7 +25,7 @@ grant_agent_capability {
 
 `agent` and `squad` accept an exact ID or an unambiguous slug. The response returns the resolved
 agent, target squad, bound member ID, resulting capability grant, and whether the operation
-created or updated the grant. It never returns or modifies a raw credential.
+created, updated, or left the grant unchanged. It never returns or modifies a raw credential.
 
 ## Identity Resolution
 
@@ -55,10 +55,11 @@ The caller's identity and capabilities remain server-derived from its bearer tok
 
 ## Persistence
 
-Move the capability grant write into a shared member service used by both the existing HTTP member
-admin route and the new MCP tool. The service performs an idempotent delete-then-insert D1 batch so
-SQLite `NULL` scope behavior cannot create duplicate grants. For this tool, scope is always the
-resolved target squad.
+Move capability grant writes into shared member-service operations. The existing HTTP member admin
+route uses an idempotent transactional delete-then-insert D1 batch so SQLite `NULL` org-scope
+behavior cannot create duplicate grants. The MCP tool always targets a resolved squad and uses a
+specialized identity-guarded CTE/upsert: the active agent binding, prior grant, write, and
+`created`/`updated`/`unchanged` outcome receipt are evaluated atomically by one SQLite statement.
 
 The operation emits an attributed `org.provisioned` event with kind `capability`, the target squad,
 agent, member, capability, and caller member ID. Event delivery is best-effort after the
@@ -73,8 +74,10 @@ authoritative D1 write, matching existing provision semantics.
 | Requested capability exceeds caller rank | `403 cannot_grant_above_own_rank` |
 | No active bound member identity | `409 agent_identity_unminted` |
 | Multiple active bound member identities | `409 agent_identity_ambiguous` |
+| Active member binding changes during the guarded write | `409 agent_identity_changed` |
 | Unsupported capability | `400 invalid_capability` |
-| D1 write does not commit | typed receipt/write failure; no success response |
+| Guarded D1 write returns no receipt while identity is unchanged | `500 receipt_failed` |
+| D1 write does not commit | typed write failure; no success response |
 
 ## Compatibility
 
