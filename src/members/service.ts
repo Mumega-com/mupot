@@ -236,45 +236,115 @@ export interface CapabilityGrantUpsertOutcome {
   result: 'created' | 'updated' | 'unchanged'
 }
 
-/** Replace a member's grant on one scope and report how it changed. */
+export interface ActiveAgentCapabilityGrantInput {
+  agentId: string
+  expectedMemberId: string
+  squadId: string
+  capability: Capability
+}
+
+/**
+ * Apply a squad grant only while the agent still has exactly the expected active
+ * member binding. Identity validation, conflict handling, and outcome evidence
+ * are evaluated by one SQLite statement.
+ */
+export async function upsertActiveAgentCapabilityGrant(
+  env: Env,
+  input: ActiveAgentCapabilityGrantInput,
+): Promise<CapabilityGrantUpsertOutcome | null> {
+  const createdId = crypto.randomUUID()
+  const updatedId = crypto.randomUUID()
+  const rows = await env.DB.prepare(
+    `WITH active_identity AS MATERIALIZED (
+       SELECT DISTINCT t.member_id
+         FROM member_tokens t
+         JOIN members m ON m.id = t.member_id
+        WHERE t.tenant = ?1
+          AND t.agent_id = ?2
+          AND t.revoked_at IS NULL
+          AND m.tenant = ?1
+          AND m.status = 'active'
+        ORDER BY t.member_id
+        LIMIT 2
+     ),
+     prior_grant AS MATERIALIZED (
+       SELECT id, capability
+         FROM capabilities
+        WHERE member_id = ?3
+          AND scope_type = 'squad'
+          AND scope_id = ?5
+     )
+     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+     SELECT CASE
+              WHEN NOT EXISTS (SELECT 1 FROM prior_grant) THEN ?4
+              WHEN (SELECT capability FROM prior_grant) = ?6 THEN (SELECT id FROM prior_grant)
+              ELSE ?7
+            END,
+            member_id, 'squad', ?5, ?6
+       FROM active_identity
+      WHERE member_id = ?3
+        AND (SELECT COUNT(*) FROM active_identity) = 1
+     ON CONFLICT(member_id, scope_type, scope_id) DO UPDATE SET
+       id = excluded.id,
+       capability = excluded.capability
+     RETURNING id, member_id, scope_type, scope_id, capability`,
+  )
+    .bind(
+      env.TENANT_SLUG,
+      input.agentId,
+      input.expectedMemberId,
+      createdId,
+      input.squadId,
+      input.capability,
+      updatedId,
+    )
+    .all<CapabilityGrant & { id: string }>()
+
+  const row = rows.results?.[0]
+  if (!row) return null
+  const result = row.id === createdId ? 'created' : row.id === updatedId ? 'updated' : 'unchanged'
+  return {
+    grant: {
+      member_id: row.member_id,
+      scope_type: row.scope_type,
+      scope_id: row.scope_id,
+      capability: row.capability,
+    },
+    result,
+  }
+}
+
+/** Replace a member's grant on one scope and report the transaction's actual prior state. */
 export async function upsertCapabilityGrant(
   env: Env,
   grant: CapabilityGrant,
 ): Promise<CapabilityGrantUpsertOutcome> {
-  const existingRows = grant.scope_id === null
-    ? await env.DB.prepare(
-        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id IS NULL',
-      )
-        .bind(grant.member_id, grant.scope_type)
-        .all<{ capability: Capability }>()
-    : await env.DB.prepare(
-        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id = ?',
-      )
-        .bind(grant.member_id, grant.scope_type, grant.scope_id)
-        .all<{ capability: Capability }>()
-
-  const existing = existingRows.results ?? []
-  const result = existing.length === 0
-    ? 'created'
-    : existing.length === 1 && existing[0].capability === grant.capability
-      ? 'unchanged'
-      : 'updated'
-
   const deleteStmt = grant.scope_id === null
     ? env.DB.prepare(
-        'DELETE FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id IS NULL',
+        `DELETE FROM capabilities
+          WHERE member_id = ? AND scope_type = ? AND scope_id IS NULL
+        RETURNING capability`,
       ).bind(grant.member_id, grant.scope_type)
     : env.DB.prepare(
-        'DELETE FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id = ?',
+        `DELETE FROM capabilities
+          WHERE member_id = ? AND scope_type = ? AND scope_id = ?
+        RETURNING capability`,
       ).bind(grant.member_id, grant.scope_type, grant.scope_id)
 
-  const writes = await env.DB.batch([
+  const writes = await env.DB.batch<{ capability: Capability }>([
     deleteStmt,
     env.DB.prepare(
       'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)',
     ).bind(crypto.randomUUID(), grant.member_id, grant.scope_type, grant.scope_id, grant.capability),
   ])
   assertBatchWritten([writes[1]], 'upsert_capability_grant', 1)
+
+  const existing = writes[0].results ?? []
+  const result = existing.length === 0
+    ? 'created'
+    : existing.length === 1 && existing[0].capability === grant.capability
+      ? 'unchanged'
+      : 'updated'
 
   return { grant, result }
 }

@@ -14,7 +14,7 @@ interface StatementRecord {
 interface ServiceDbOptions {
   identityRows?: { member_id: string }[]
   existingCapabilities?: Capability[]
-  batchResults?: { meta: { changes: number } }[]
+  batchResults?: { meta: { changes: number }; results?: { capability: Capability }[] }[]
 }
 
 function makeServiceDb(options: ServiceDbOptions = {}) {
@@ -54,7 +54,13 @@ function makeServiceDb(options: ServiceDbOptions = {}) {
     },
     async batch(batch: StatementRecord[]) {
       batches.push(batch)
-      return options.batchResults ?? [{ meta: { changes: 0 } }, { meta: { changes: 1 } }]
+      return options.batchResults ?? [
+        {
+          meta: { changes: options.existingCapabilities?.length ?? 0 },
+          results: (options.existingCapabilities ?? []).map((capability) => ({ capability })),
+        },
+        { meta: { changes: 1 }, results: [] },
+      ]
     },
   }
 
@@ -96,7 +102,13 @@ function makeGrantRouteEnv(existingCapabilities: Capability[]): Env {
       return statement
     },
     async batch(_statements: unknown[]) {
-      return [{ meta: { changes: 2 } }, { meta: { changes: 1 } }]
+      return [
+        {
+          meta: { changes: existingCapabilities.length },
+          results: existingCapabilities.map((capability) => ({ capability })),
+        },
+        { meta: { changes: 1 }, results: [] },
+      ]
     },
   }
 
@@ -221,7 +233,7 @@ describe('upsertCapabilityGrant', () => {
       scope_id: null,
       capability: 'member',
     }
-    const { env, statements, batches } = makeServiceDb({
+    const { env, batches } = makeServiceDb({
       existingCapabilities: ['member', 'observer'],
     })
 
@@ -230,10 +242,9 @@ describe('upsertCapabilityGrant', () => {
       result: 'updated',
     })
 
-    const read = statements.find(({ sql }) => sql.includes('SELECT capability FROM capabilities'))
-    expect(read?.sql).toContain('scope_id IS NULL')
-    expect(read?.sql).not.toContain('LIMIT 1')
     expect(batches).toHaveLength(1)
+    expect(batches[0][0].sql).toContain('scope_id IS NULL')
+    expect(batches[0][0].sql).toContain('RETURNING capability')
     expect(batches[0][0].values).toEqual(['member-1', 'org'])
   })
 })

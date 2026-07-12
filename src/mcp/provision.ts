@@ -30,7 +30,7 @@ import {
   mintAgentBoundToken,
   isAgentTokenCapability,
   resolveActiveAgentMember,
-  upsertCapabilityGrant,
+  upsertActiveAgentCapabilityGrant,
 } from '../members/service'
 import { mcpEndpoint, wakeContractForAgent } from '../dashboard/connect'
 import { createBus } from '../bus'
@@ -401,12 +401,22 @@ const toolGrantAgentCapability: ToolSpec = {
       return fail(409, 'agent_identity_ambiguous', 'revoke stale agent tokens until one active member identity remains')
     }
 
-    const outcome = await upsertCapabilityGrant(env, {
-      member_id: agentMemberId,
-      scope_type: 'squad',
-      scope_id: squad.id,
+    const outcome = await upsertActiveAgentCapabilityGrant(env, {
+      agentId: agent.id,
+      expectedMemberId: agentMemberId,
+      squadId: squad.id,
       capability,
     })
+    if (!outcome) {
+      const currentIdentity = await resolveActiveAgentMember(env, agent.id)
+      if (currentIdentity === 'unminted') {
+        return fail(409, 'agent_identity_unminted', 'call mint_agent_token before granting capabilities')
+      }
+      if (currentIdentity === 'ambiguous') {
+        return fail(409, 'agent_identity_ambiguous', 'revoke stale agent tokens until one active member identity remains')
+      }
+      return fail(409, 'agent_identity_changed', 'agent member binding changed; retry the grant')
+    }
     await emitProvisioned(env, auth.memberId as string, 'capability', squad.id, {
       squad_id: squad.id,
       agent_id: agent.id,

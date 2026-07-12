@@ -83,6 +83,33 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
           return null
         },
         async all() {
+          if (sql.includes('WITH active_identity AS MATERIALIZED')) {
+            const distinctMembers = [...new Set(agentTokenMembers)]
+            if (distinctMembers.length !== 1 || distinctMembers[0] !== args[2]) {
+              return { results: [] }
+            }
+            const createdId = args[3] as string
+            const updatedId = args[6] as string
+            const capability = args[5] as Capability
+            const returnedId = existingGrantCapabilities.length === 0
+              ? createdId
+              : existingGrantCapabilities.length === 1 && existingGrantCapabilities[0] === capability
+                ? 'existing-grant-id'
+                : updatedId
+            captured.push({
+              sql: 'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)',
+              args: [returnedId, args[2], 'squad', args[4], capability],
+            })
+            return {
+              results: [{
+                id: returnedId,
+                member_id: args[2],
+                scope_type: 'squad',
+                scope_id: args[4],
+                capability,
+              }],
+            }
+          }
           if (sql.includes('SELECT capability FROM capabilities')) {
             return { results: existingGrantCapabilities.map((capability) => ({ capability })) }
           }
