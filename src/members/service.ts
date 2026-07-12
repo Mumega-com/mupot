@@ -11,7 +11,7 @@
 // statement atomic batch (member envelope + escalation-guard capability + agent-weld
 // token) is written, so no logic lives in two places.
 
-import type { Env, MemberToken, ConnectionChannel } from '../types'
+import type { Env, MemberToken, ConnectionChannel, Capability, CapabilityGrant } from '../types'
 import { assertBatchWritten } from '../lib/receipt'
 
 const CHANNELS: readonly ConnectionChannel[] = ['workspace', 'im', 'dashboard']
@@ -203,4 +203,77 @@ export async function loadLiveTokens(env: Env): Promise<PublicMemberToken[]> {
     'SELECT id, member_id, label, channel, created_at, revoked_at FROM member_tokens WHERE tenant = ? AND revoked_at IS NULL ORDER BY created_at ASC',
   ).bind(env.TENANT_SLUG).all<PublicMemberToken>()
   return rows.results ?? []
+}
+
+/** Resolve the active member identity welded to an agent's live tokens. */
+export async function resolveActiveAgentMember(
+  env: Env,
+  agentId: string,
+): Promise<string | 'unminted' | 'ambiguous'> {
+  const rows = await env.DB.prepare(
+    `SELECT DISTINCT t.member_id
+       FROM member_tokens t
+       JOIN members m ON m.id = t.member_id
+      WHERE t.tenant = ?
+        AND t.agent_id = ?
+        AND t.revoked_at IS NULL
+        AND m.tenant = ?
+        AND m.status = 'active'
+      ORDER BY t.member_id
+      LIMIT 2`,
+  )
+    .bind(env.TENANT_SLUG, agentId, env.TENANT_SLUG)
+    .all<{ member_id: string }>()
+
+  const members = rows.results ?? []
+  if (members.length === 0) return 'unminted'
+  if (members.length === 1) return members[0].member_id
+  return 'ambiguous'
+}
+
+export interface CapabilityGrantUpsertOutcome {
+  grant: CapabilityGrant
+  result: 'created' | 'updated' | 'unchanged'
+}
+
+/** Replace a member's grant on one scope and report how it changed. */
+export async function upsertCapabilityGrant(
+  env: Env,
+  grant: CapabilityGrant,
+): Promise<CapabilityGrantUpsertOutcome> {
+  const existing = grant.scope_id === null
+    ? await env.DB.prepare(
+        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id IS NULL LIMIT 1',
+      )
+        .bind(grant.member_id, grant.scope_type)
+        .first<{ capability: Capability }>()
+    : await env.DB.prepare(
+        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id = ? LIMIT 1',
+      )
+        .bind(grant.member_id, grant.scope_type, grant.scope_id)
+        .first<{ capability: Capability }>()
+
+  const result = existing === null
+    ? 'created'
+    : existing.capability === grant.capability
+      ? 'unchanged'
+      : 'updated'
+
+  const deleteStmt = grant.scope_id === null
+    ? env.DB.prepare(
+        'DELETE FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id IS NULL',
+      ).bind(grant.member_id, grant.scope_type)
+    : env.DB.prepare(
+        'DELETE FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id = ?',
+      ).bind(grant.member_id, grant.scope_type, grant.scope_id)
+
+  const writes = await env.DB.batch([
+    deleteStmt,
+    env.DB.prepare(
+      'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)',
+    ).bind(crypto.randomUUID(), grant.member_id, grant.scope_type, grant.scope_id, grant.capability),
+  ])
+  assertBatchWritten([writes[1]], 'upsert_capability_grant', 1)
+
+  return { grant, result }
 }

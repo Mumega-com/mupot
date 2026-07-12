@@ -49,6 +49,7 @@ import {
   isChannel as isChannelService,
   sha256Hex,
   mintRawToken,
+  upsertCapabilityGrant,
 } from './service'
 
 // The validated invite payload, stashed by the parse middleware so the scope
@@ -570,28 +571,6 @@ membersApp.post('/members/:id/capabilities', requireCapability(orgScope, 'admin'
     capability,
   }
 
-  // Re-grant should UPDATE the level, not create a duplicate. NB: SQLite treats
-  // two NULLs as distinct in a UNIQUE index, so the schema's
-  // UNIQUE(member_id, scope_type, scope_id) does NOT dedupe org-wide grants
-  // (scope_id NULL). We therefore do an explicit delete-then-insert in one batch,
-  // matching null scope_id with IS NULL — uniform behaviour for org and scoped
-  // grants, and idempotent on re-grant. D1 is single-writer per DB so this batch
-  // is serialized.
-  const deleteStmt =
-    scopeId === null
-      ? c.env.DB.prepare(
-          'DELETE FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id IS NULL',
-        ).bind(grant.member_id, grant.scope_type)
-      : c.env.DB.prepare(
-          'DELETE FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id = ?',
-        ).bind(grant.member_id, grant.scope_type, grant.scope_id)
-
-  await c.env.DB.batch([
-    deleteStmt,
-    c.env.DB.prepare(
-      'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)',
-    ).bind(crypto.randomUUID(), grant.member_id, grant.scope_type, grant.scope_id, grant.capability),
-  ])
-
-  return c.json({ grant, action: 'grant' }, 201)
+  const outcome = await upsertCapabilityGrant(c.env, grant)
+  return c.json({ grant: outcome.grant, action: 'grant', result: outcome.result }, 201)
 })
