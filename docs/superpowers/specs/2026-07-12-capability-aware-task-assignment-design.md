@@ -78,8 +78,8 @@ assignment. No migration or multi-statement write transaction is required.
 
 ### HTTP
 
-Existing request and response shapes remain unchanged. Both `POST /api/tasks/tasks` and
-`PATCH /api/tasks/tasks/:id` accept cross-squad assignees under the shared policy.
+Existing request and response shapes remain unchanged. Both `POST /api/tasks` and
+`PATCH /api/tasks/:id` accept cross-squad assignees under the shared policy.
 
 ### MCP
 
