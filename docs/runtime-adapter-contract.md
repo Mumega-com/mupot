@@ -347,7 +347,9 @@ nonnegative integer and cannot exceed the flight's immutable declared budget. On
 verdict, budget, agent ownership, and in-air status are rechecked by the same atomic D1
 transition, so a concurrent terminal transition returns a conflict rather than false
 success. Governed REST landings use this same service path. A successful transition
-records the terminal flight row and emits an attributed `flight.landed` activity event.
+records the terminal flight row and an attributed `flight.landed` event in one D1 batch.
+Mupot attempts Queue delivery immediately; a pending outbox row survives an outage and
+the scheduled heartbeat retries it without reopening or falsely re-landing the flight.
 
 `flight_get` and `flight_list` require `observer` or higher on every squad referenced
 by a returned flight and return parsed metadata. Legacy or malformed metadata is not

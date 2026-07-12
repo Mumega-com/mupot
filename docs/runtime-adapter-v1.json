@@ -164,7 +164,8 @@
     },
     "taskCompletion": "done-and-latest-verdict-approved-when-gated",
     "budgetPolicy": "reported-cost-lte-immutable-declared-budget",
-    "terminalEvent": "flight.landed"
+    "terminalEvent": "flight.landed",
+    "eventDelivery": "transactional-d1-outbox-with-immediate-attempt-and-cron-retry"
   },
   "tasks": {
     "mcpTools": ["task_create", "task_list", "task_board", "task_update"],

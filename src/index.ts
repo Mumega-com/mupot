@@ -199,6 +199,7 @@ import { syncGitHubProject } from './integrations/github-projects'
 // Growth cron step — active-guarded, fail-soft collection of growth metrics each tick.
 import { runGrowthCollection } from './departments/collectors/growth-cron'
 import { runCroCollection } from './cro/collect'
+import { flushFlightEventOutbox } from './flight/service'
 
 export default {
   // The OAuth provider is the outer entry point. It handles OAuth paths and
@@ -210,7 +211,7 @@ export default {
   // Queue and scheduled handlers are preserved unchanged (spec §A.2).
   queue: handleQueue,
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Five independent heartbeats on the same */15 cron:
+    // Seven independent heartbeats on the same */15 cron:
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
     //     ("design loops, not prompts"; without this the v0.3.0 loop never fires).
@@ -225,11 +226,14 @@ export default {
     //  6. CRO ingest — pull EXTERNAL connector signal (PostHog, then GSC/Ads/CRM) into
     //     metric_points. Runs whatever sources are connected (graceful degradation); a
     //     missing/broken source never blocks. Fail-soft. Logic: src/cro/collect.ts.
+    //  7. Flight event outbox — retry attributed terminal events whose immediate
+    //     Queue delivery failed after the atomic landing receipt was committed.
     ctx.waitUntil(reconcileMembership(env))
     ctx.waitUntil(runMetabolism(env))
     ctx.waitUntil(runLoopsTick(env))
     ctx.waitUntil(syncGitHubProject(env).then(() => undefined))
     ctx.waitUntil(runGrowthCollection(env))
     ctx.waitUntil(runCroCollection(env).then(() => undefined))
+    ctx.waitUntil(flushFlightEventOutbox(env).then(() => undefined))
   },
 }

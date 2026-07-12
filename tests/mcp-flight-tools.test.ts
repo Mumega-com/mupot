@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { TOOLS, invokeTool } from '../src/mcp'
 import type { AuthContext, Env } from '../src/types'
 import type { FlightRow } from '../src/flight/service'
+import { flushFlightEventOutbox } from '../src/flight/service'
 
 const TENANT = 'mumega'
 const MEMBER_ID = 'member-product'
@@ -60,6 +61,11 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
   ])
   const verdicts = new Map<string, 'approved' | 'rejected'>()
   const events: unknown[] = []
+  const outbox = new Map<string, {
+    id: string; tenant: string; flight_id: string; event_type: 'flight.landed'; actor_kind: 'member' | 'agent';
+    actor_id: string; payload: string; created_at: string; delivered_at: string | null; attempts: number; last_error: string | null
+  }>()
+  let busFailure = false
   const squads = new Map([
     [SQUAD_ID, { id: SQUAD_ID, department_id: 'dept-1', slug: 'mmhq', name: 'Mumega HQ', charter: null, budget_cap_cents: 100, budget_window: 'day', created_at: 'now' }],
     [OTHER_SQUAD_ID, { id: OTHER_SQUAD_ID, department_id: 'dept-2', slug: 'other', name: 'Other', charter: null, budget_cap_cents: 100, budget_window: 'day', created_at: 'now' }],
@@ -96,11 +102,16 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
                   const row = rows.get(args[0] as string)
                   return (row?.tenant === args[1] ? row : null) as T | null
                 }
+                if (sql.includes('FROM flight_event_outbox')) {
+                  return ([...outbox.values()].find((row) => (
+                    row.tenant === args[0] && row.flight_id === args[1] && row.delivered_at === null
+                  )) ?? null) as T | null
+                }
                 return null
               },
               async run() {
                 let changes = 0
-                if (sql.includes('INSERT INTO flights')) {
+                if (sql.includes('INSERT INTO flights (')) {
                   const [id, tenant, agent, goal, trigger, budget, rawMeta] = args as [string, string, string, string, FlightRow['trigger_source'], number | null, string]
                   rows.set(id, {
                     id, tenant, agent, goal, trigger_source: trigger, budget_micro_usd: budget,
@@ -118,7 +129,7 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
                     row.started_at = args[3] as number
                     changes = 1
                   }
-                } else if (sql.includes("status='landed'")) {
+                } else if (sql.includes("UPDATE flights SET status='landed'")) {
                   beforeFlightLand?.()
                   beforeFlightLand = null
                   const row = rows.get(args[0] as string)
@@ -150,10 +161,42 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
                     row.ended_at = args[endedIndex] as number
                     changes = 1
                   }
+                } else if (sql.includes('INSERT INTO flight_event_outbox')) {
+                  const [id, tenant, flightId, actorKind, actorId, payload, createdAt, endedAt] = args as [
+                    string, string, string, 'member' | 'agent', string, string, string, number,
+                  ]
+                  const flight = rows.get(flightId)
+                  if (flight?.tenant === tenant && flight.status === 'landed' && flight.ended_at === endedAt) {
+                    outbox.set(flightId, {
+                      id, tenant, flight_id: flightId, event_type: 'flight.landed', actor_kind: actorKind,
+                      actor_id: actorId, payload, created_at: createdAt, delivered_at: null, attempts: 0, last_error: null,
+                    })
+                    changes = 1
+                  }
+                } else if (sql.includes('delivered_at = ?3')) {
+                  const row = outbox.get(args[1] as string)
+                  if (row?.tenant === args[0] && row.delivered_at === null) {
+                    row.delivered_at = args[2] as string
+                    row.attempts += 1
+                    changes = 1
+                  }
+                } else if (sql.includes('last_error = ?3')) {
+                  const row = outbox.get(args[1] as string)
+                  if (row?.tenant === args[0] && row.delivered_at === null) {
+                    row.last_error = args[2] as string
+                    row.attempts += 1
+                    changes = 1
+                  }
                 }
                 return { meta: { changes } }
               },
               async all<T>() {
+                if (sql.includes('FROM flight_event_outbox')) {
+                  const limit = args[1] as number
+                  return { results: [...outbox.values()].filter((row) => (
+                    row.tenant === args[0] && row.delivered_at === null
+                  )).slice(0, limit) as T[] }
+                }
                 if (sql.includes('FROM squads WHERE id IN')) {
                   return { results: args.flatMap((id) => {
                     const squad = squads.get(id as string)
@@ -199,8 +242,16 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
           },
         }
       },
+      async batch(statements: Array<{ run: () => Promise<unknown> }>) {
+        return Promise.all(statements.map((statement) => statement.run()))
+      },
     },
-    BUS: { async send(event: unknown) { events.push(event) } },
+    BUS: {
+      async send(event: unknown) {
+        if (busFailure) throw new Error('queue unavailable')
+        events.push(event)
+      },
+    },
   } as unknown as Env
   return {
     env,
@@ -208,6 +259,8 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
     tasks,
     verdicts,
     events,
+    outbox,
+    setBusFailure(value: boolean) { busFailure = value },
     beforeNextFlightLand(hook: () => void) { beforeFlightLand = hook },
   }
 }
@@ -229,7 +282,7 @@ describe('MCP flight tools', () => {
     const { env } = makeEnv()
     const out = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
 
-    expect(out.ok).toBe(true)
+    expect(out.ok, JSON.stringify(out)).toBe(true)
     const result = out.result as { flight: FlightRow & { meta: typeof meta } }
     expect(result.flight.agent).toBe(AGENT_ID)
     expect(result.flight.status).toBe('running')
@@ -356,7 +409,7 @@ describe('MCP flight tools', () => {
       score: 0.97,
     }, 'https://pot.example')
 
-    expect(out.ok).toBe(true)
+    expect(out.ok, JSON.stringify(out)).toBe(true)
     expect((out.result as { flight: FlightRow }).flight).toMatchObject({
       id,
       agent: AGENT_ID,
@@ -368,6 +421,26 @@ describe('MCP flight tools', () => {
       type: 'flight.landed', tenant: TENANT, squad_id: SQUAD_ID, agent_id: AGENT_ID,
       actor: { kind: 'agent', id: AGENT_ID },
     }))
+  })
+
+  it('persists a retryable terminal event when the Queue is unavailable', async () => {
+    const { env, tasks, verdicts, events, outbox, setBusFailure } = makeEnv()
+    const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
+    const id = (dispatched.result as { flight: FlightRow }).flight.id
+    tasks.get('task-m000')!.status = 'done'
+    verdicts.set('task-m000', 'approved')
+    setBusFailure(true)
+
+    const landed = await invokeTool(auth(), env, 'flight_land', { flight_id: id, cost_micro_usd: 0 }, 'https://pot.example')
+    expect(landed.ok, JSON.stringify(landed)).toBe(true)
+    expect(outbox.get(id)).toMatchObject({ delivered_at: null, attempts: 1 })
+    expect(events).toEqual([])
+
+    setBusFailure(false)
+    await flushFlightEventOutbox(env)
+    expect(outbox.get(id)).toMatchObject({ attempts: 2 })
+    expect(outbox.get(id)?.delivered_at).not.toBeNull()
+    expect(events).toContainEqual(expect.objectContaining({ type: 'flight.landed', agent_id: AGENT_ID }))
   })
 
   it('returns conflict when another terminal transition wins after the precheck', async () => {

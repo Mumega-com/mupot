@@ -20,7 +20,7 @@ import type { Env } from '../types'
 import { resolveOrgAdmin } from '../auth/member-bearer'
 import { dispatchFlight } from './dispatch'
 import {
-  emitFlightLanded,
+  deliverFlightLandedEvent,
   failFlight,
   getFlight,
   landFlight,
@@ -185,6 +185,9 @@ flightsApp.post('/:id/land', async (c) => {
     const transitioned = await landGovernedFlight(c.env, id, {
       cost_micro_usd: cost as number,
       score: score as number | undefined,
+      agent_id: existing.agent,
+      meta: governedMeta,
+      actor: { kind: 'member', id: auth.id.memberId },
     })
     if (!transitioned) {
       const incompleteTaskIds = await listIncompleteFlightTaskIds(c.env, governedMeta.task_ids)
@@ -195,7 +198,7 @@ flightsApp.post('/:id/land', async (c) => {
     }
     const landed = await getFlight(c.env, id)
     if (!landed || landed.status !== 'landed') return c.json({ error: 'flight_record_missing' }, 500)
-    await emitFlightLanded(c.env, landed, governedMeta, { kind: 'member', id: auth.id.memberId })
+    await deliverFlightLandedEvent(c.env, landed.id)
     return c.json({ ok: true, id, status: landed.status })
   }
 

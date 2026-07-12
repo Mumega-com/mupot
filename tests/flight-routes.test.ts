@@ -174,6 +174,10 @@ function makeGovernedLandEnv(taskStatus: 'done' | 'review', verdict: 'approved' 
     started_at: 1, ended_at: null, meta: JSON.stringify(goodMeta),
   }
   const events: unknown[] = []
+  let outbox: {
+    id: string; tenant: string; flight_id: string; event_type: 'flight.landed'; actor_kind: 'member' | 'agent';
+    actor_id: string; payload: string; created_at: string; delivered_at: string | null; attempts: number; last_error: string | null
+  } | null = null
   const env = {
     TENANT_SLUG: 'test',
     BUS: { async send(event: unknown) { events.push(event) } },
@@ -189,6 +193,7 @@ function makeGovernedLandEnv(taskStatus: 'done' | 'review', verdict: 'approved' 
                 if (sql.includes('SELECT * FROM flights WHERE id=')) {
                   return (flight.id === args[0] && flight.tenant === args[1] ? flight : null) as T | null
                 }
+                if (sql.includes('FROM flight_event_outbox')) return outbox as T | null
                 return null
               },
               async all<T>() {
@@ -204,7 +209,22 @@ function makeGovernedLandEnv(taskStatus: 'done' | 'review', verdict: 'approved' 
               },
               async run() {
                 let changes = 0
-                if (
+                if (sql.includes('INSERT INTO flight_event_outbox')) {
+                  const [id, tenant, flightId, actorKind, actorId, payload, createdAt, endedAt] = args as [
+                    string, string, string, 'member' | 'agent', string, string, string, number,
+                  ]
+                  if (flight.id === flightId && flight.status === 'landed' && flight.ended_at === endedAt) {
+                    outbox = {
+                      id, tenant, flight_id: flightId, event_type: 'flight.landed', actor_kind: actorKind,
+                      actor_id: actorId, payload, created_at: createdAt, delivered_at: null, attempts: 0, last_error: null,
+                    }
+                    changes = 1
+                  }
+                } else if (sql.includes('delivered_at = ?3') && outbox) {
+                  outbox.delivered_at = args[2] as string
+                  outbox.attempts += 1
+                  changes = 1
+                } else if (
                   sql.includes('json_each(flights.meta')
                   && flight.status === 'running'
                   && taskStatus === 'done'
@@ -222,6 +242,9 @@ function makeGovernedLandEnv(taskStatus: 'done' | 'review', verdict: 'approved' 
             }
           },
         }
+      },
+      async batch(statements: Array<{ run: () => Promise<unknown> }>) {
+        return Promise.all(statements.map((statement) => statement.run()))
       },
     },
   } as unknown as Env

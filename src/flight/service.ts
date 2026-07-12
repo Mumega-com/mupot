@@ -107,9 +107,28 @@ export async function landFlight(
 export async function landGovernedFlight(
   env: Env,
   id: string,
-  opts: { cost_micro_usd: number; score?: number; expected_agent?: string },
+  opts: {
+    cost_micro_usd: number
+    score?: number
+    expected_agent?: string
+    agent_id: string
+    meta: FlightMetaV1
+    actor: { kind: 'member' | 'agent'; id: string }
+  },
 ): Promise<boolean> {
-  const result = await env.DB.prepare(
+  const endedAt = Date.now()
+  const createdAt = new Date(endedAt).toISOString()
+  const eventId = crypto.randomUUID()
+  const payload = JSON.stringify({
+    outbox_id: eventId,
+    flight_id: id,
+    agent_id: opts.agent_id,
+    squad_ids: opts.meta.squad_ids,
+    task_ids: opts.meta.task_ids,
+    cost_micro_usd: opts.cost_micro_usd,
+    score: opts.score ?? null,
+  })
+  const transition = env.DB.prepare(
     `UPDATE flights SET status='landed', cost_micro_usd=?4, score=COALESCE(?5, score), ended_at=?6
      WHERE id=?1 AND tenant=?2
        AND (?3 IS NULL OR agent=?3)
@@ -141,10 +160,18 @@ export async function landGovernedFlight(
       opts.expected_agent ?? null,
       opts.cost_micro_usd,
       opts.score ?? null,
-      Date.now(),
+      endedAt,
     )
-    .run()
-  return result.meta?.changes === 1
+  const outbox = env.DB.prepare(
+    `INSERT INTO flight_event_outbox
+       (id, tenant, flight_id, event_type, actor_kind, actor_id, payload, created_at)
+     SELECT ?1, ?2, ?3, 'flight.landed', ?4, ?5, ?6, ?7
+       FROM flights
+      WHERE id=?3 AND tenant=?2 AND status='landed' AND ended_at=?8
+     ON CONFLICT (tenant, flight_id, event_type) DO NOTHING`,
+  ).bind(eventId, env.TENANT_SLUG, id, opts.actor.kind, opts.actor.id, payload, createdAt, endedAt)
+  const [transitionResult, outboxResult] = await env.DB.batch([transition, outbox])
+  return transitionResult.meta?.changes === 1 && outboxResult.meta?.changes === 1
 }
 
 interface FlightTaskCompletionRow {
@@ -173,31 +200,72 @@ export async function listIncompleteFlightTaskIds(env: Env, taskIds: string[]): 
   })
 }
 
-export async function emitFlightLanded(
-  env: Env,
-  flight: FlightRow,
-  meta: FlightMetaV1,
-  actor: { kind: 'member' | 'agent'; id: string },
-): Promise<void> {
+interface FlightEventOutboxRow {
+  id: string
+  tenant: string
+  flight_id: string
+  event_type: 'flight.landed'
+  actor_kind: 'member' | 'agent'
+  actor_id: string
+  payload: string
+  created_at: string
+  delivered_at: string | null
+  attempts: number
+  last_error: string | null
+}
+
+export async function deliverFlightLandedEvent(env: Env, flightId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT * FROM flight_event_outbox
+      WHERE tenant=?1 AND flight_id=?2 AND delivered_at IS NULL
+      LIMIT 1`,
+  ).bind(env.TENANT_SLUG, flightId).first<FlightEventOutboxRow>()
+  if (!row) return true
   try {
+    const payload = JSON.parse(row.payload) as { squad_ids?: unknown; [key: string]: unknown }
+    const squadIds = Array.isArray(payload.squad_ids)
+      ? payload.squad_ids.filter((value): value is string => typeof value === 'string')
+      : []
     await createBus(env).emit({
       type: 'flight.landed',
       tenant: env.TENANT_SLUG,
-      squad_id: meta.squad_ids[0],
-      agent_id: flight.agent,
-      actor,
-      payload: {
-        flight_id: flight.id,
-        squad_ids: meta.squad_ids,
-        task_ids: meta.task_ids,
-        cost_micro_usd: flight.cost_micro_usd,
-        score: flight.score,
-      },
+      squad_id: squadIds[0],
+      agent_id: typeof payload.agent_id === 'string' ? payload.agent_id : undefined,
+      actor: { kind: row.actor_kind, id: row.actor_id },
+      payload,
       ts: new Date().toISOString(),
     })
+    await env.DB.prepare(
+      `UPDATE flight_event_outbox
+          SET delivered_at = ?3, attempts = attempts + 1, last_error = NULL
+        WHERE tenant=?1 AND flight_id=?2 AND delivered_at IS NULL`,
+    ).bind(env.TENANT_SLUG, flightId, new Date().toISOString()).run()
+    return true
   } catch (error) {
-    console.error('flight.landed event emit failed', { flight_id: flight.id, error })
+    const message = (error instanceof Error ? error.message : 'unknown_error').slice(0, 500)
+    await env.DB.prepare(
+      `UPDATE flight_event_outbox
+          SET last_error = ?3, attempts = attempts + 1
+        WHERE tenant=?1 AND flight_id=?2 AND delivered_at IS NULL`,
+    ).bind(env.TENANT_SLUG, flightId, message).run()
+    console.error('flight.landed event delivery failed', { flight_id: flightId, error: message })
+    return false
   }
+}
+
+export async function flushFlightEventOutbox(env: Env, limit = 50): Promise<{ attempted: number; delivered: number }> {
+  const boundedLimit = Math.min(Math.max(Math.floor(limit), 1), 100)
+  const rows = await env.DB.prepare(
+    `SELECT * FROM flight_event_outbox
+      WHERE tenant=?1 AND delivered_at IS NULL
+      ORDER BY created_at ASC
+      LIMIT ?2`,
+  ).bind(env.TENANT_SLUG, boundedLimit).all<FlightEventOutboxRow>()
+  let delivered = 0
+  for (const row of rows.results ?? []) {
+    if (await deliverFlightLandedEvent(env, row.flight_id)) delivered += 1
+  }
+  return { attempted: rows.results?.length ?? 0, delivered }
 }
 
 // Fail a flight (errored). From any non-terminal state.

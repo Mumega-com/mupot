@@ -57,7 +57,7 @@ import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { PROVISION_TOOLS } from './provision'
 import { dispatchFlight } from '../flight/dispatch'
 import {
-  emitFlightLanded,
+  deliverFlightLandedEvent,
   getFlight,
   landGovernedFlight,
   listFlightsForSquad,
@@ -967,6 +967,9 @@ const toolFlightLand: ToolSpec = {
       cost_micro_usd: costMicroUsd as number,
       score: score as number | undefined,
       expected_agent: auth.boundAgentId,
+      agent_id: flight.agent,
+      meta,
+      actor: { kind: 'agent', id: auth.boundAgentId },
     })
     if (!transitioned) {
       const incompleteTaskIds = await listIncompleteFlightTaskIds(env, meta.task_ids)
@@ -977,7 +980,7 @@ const toolFlightLand: ToolSpec = {
     }
     const landed = await getFlight(env, flight.id)
     if (!landed || landed.status !== 'landed') return fail(500, 'flight_record_missing')
-    await emitFlightLanded(env, landed, meta, { kind: 'agent', id: auth.boundAgentId })
+    await deliverFlightLandedEvent(env, landed.id)
     return done({ flight: flightWithParsedMeta(landed, meta) })
   },
 }
