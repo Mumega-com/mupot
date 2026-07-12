@@ -176,7 +176,8 @@ function makeGovernedLandEnv(taskStatus: 'done' | 'review', verdict: 'approved' 
   const events: unknown[] = []
   let outbox: {
     id: string; tenant: string; flight_id: string; event_type: 'flight.landed'; actor_kind: 'member' | 'agent';
-    actor_id: string; payload: string; created_at: string; delivered_at: string | null; attempts: number; last_error: string | null
+    actor_id: string; payload: string; created_at: string; delivered_at: string | null; consumed_at: string | null;
+    attempts: number; last_error: string | null
   } | null = null
   const env = {
     TENANT_SLUG: 'test',
@@ -214,9 +215,13 @@ function makeGovernedLandEnv(taskStatus: 'done' | 'review', verdict: 'approved' 
                     string, string, string, 'member' | 'agent', string, string, string, number,
                   ]
                   if (flight.id === flightId && flight.status === 'landed' && flight.ended_at === endedAt) {
+                    const eventPayload = JSON.parse(payload) as Record<string, unknown>
+                    eventPayload.score = flight.score
+                    eventPayload.cost_micro_usd = flight.cost_micro_usd
                     outbox = {
                       id, tenant, flight_id: flightId, event_type: 'flight.landed', actor_kind: actorKind,
-                      actor_id: actorId, payload, created_at: createdAt, delivered_at: null, attempts: 0, last_error: null,
+                      actor_id: actorId, payload: JSON.stringify(eventPayload), created_at: createdAt,
+                      delivered_at: null, consumed_at: null, attempts: 0, last_error: null,
                     }
                     changes = 1
                   }

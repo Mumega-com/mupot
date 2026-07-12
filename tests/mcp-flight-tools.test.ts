@@ -63,7 +63,8 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
   const events: unknown[] = []
   const outbox = new Map<string, {
     id: string; tenant: string; flight_id: string; event_type: 'flight.landed'; actor_kind: 'member' | 'agent';
-    actor_id: string; payload: string; created_at: string; delivered_at: string | null; attempts: number; last_error: string | null
+    actor_id: string; payload: string; created_at: string; delivered_at: string | null; consumed_at: string | null;
+    attempts: number; last_error: string | null
   }>()
   let busFailure = false
   const squads = new Map([
@@ -167,9 +168,13 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
                   ]
                   const flight = rows.get(flightId)
                   if (flight?.tenant === tenant && flight.status === 'landed' && flight.ended_at === endedAt) {
+                    const eventPayload = JSON.parse(payload) as Record<string, unknown>
+                    eventPayload.score = flight.score
+                    eventPayload.cost_micro_usd = flight.cost_micro_usd
                     outbox.set(flightId, {
                       id, tenant, flight_id: flightId, event_type: 'flight.landed', actor_kind: actorKind,
-                      actor_id: actorId, payload, created_at: createdAt, delivered_at: null, attempts: 0, last_error: null,
+                      actor_id: actorId, payload: JSON.stringify(eventPayload), created_at: createdAt,
+                      delivered_at: null, consumed_at: null, attempts: 0, last_error: null,
                     })
                     changes = 1
                   }
@@ -424,9 +429,10 @@ describe('MCP flight tools', () => {
   })
 
   it('persists a retryable terminal event when the Queue is unavailable', async () => {
-    const { env, tasks, verdicts, events, outbox, setBusFailure } = makeEnv()
+    const { env, rows, tasks, verdicts, events, outbox, setBusFailure } = makeEnv()
     const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
     const id = (dispatched.result as { flight: FlightRow }).flight.id
+    const expectedScore = rows.get(id)!.score
     tasks.get('task-m000')!.status = 'done'
     verdicts.set('task-m000', 'approved')
     setBusFailure(true)
@@ -436,11 +442,15 @@ describe('MCP flight tools', () => {
     expect(outbox.get(id)).toMatchObject({ delivered_at: null, attempts: 1 })
     expect(events).toEqual([])
 
+    outbox.get(id)!.created_at = '2026-07-12T02:00:00.000Z'
     setBusFailure(false)
     await flushFlightEventOutbox(env)
     expect(outbox.get(id)).toMatchObject({ attempts: 2 })
     expect(outbox.get(id)?.delivered_at).not.toBeNull()
-    expect(events).toContainEqual(expect.objectContaining({ type: 'flight.landed', agent_id: AGENT_ID }))
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'flight.landed', agent_id: AGENT_ID, ts: '2026-07-12T02:00:00.000Z',
+      payload: expect.objectContaining({ score: expectedScore }),
+    }))
   })
 
   it('returns conflict when another terminal transition wins after the precheck', async () => {

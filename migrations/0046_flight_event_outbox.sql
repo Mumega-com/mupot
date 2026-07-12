@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS flight_event_outbox (
   payload       TEXT NOT NULL CHECK (json_valid(payload)),
   created_at    TEXT NOT NULL,
   delivered_at  TEXT,
+  consumed_at   TEXT,
   attempts      INTEGER NOT NULL DEFAULT 0,
   last_error    TEXT,
   UNIQUE (tenant, flight_id, event_type)

@@ -165,7 +165,8 @@ export async function landGovernedFlight(
   const outbox = env.DB.prepare(
     `INSERT INTO flight_event_outbox
        (id, tenant, flight_id, event_type, actor_kind, actor_id, payload, created_at)
-     SELECT ?1, ?2, ?3, 'flight.landed', ?4, ?5, ?6, ?7
+     SELECT ?1, ?2, ?3, 'flight.landed', ?4, ?5,
+            json_set(?6, '$.score', score, '$.cost_micro_usd', cost_micro_usd), ?7
        FROM flights
       WHERE id=?3 AND tenant=?2 AND status='landed' AND ended_at=?8
      ON CONFLICT (tenant, flight_id, event_type) DO NOTHING`,
@@ -210,6 +211,7 @@ interface FlightEventOutboxRow {
   payload: string
   created_at: string
   delivered_at: string | null
+  consumed_at: string | null
   attempts: number
   last_error: string | null
 }
@@ -233,7 +235,7 @@ export async function deliverFlightLandedEvent(env: Env, flightId: string): Prom
       agent_id: typeof payload.agent_id === 'string' ? payload.agent_id : undefined,
       actor: { kind: row.actor_kind, id: row.actor_id },
       payload,
-      ts: new Date().toISOString(),
+      ts: row.created_at,
     })
     await env.DB.prepare(
       `UPDATE flight_event_outbox

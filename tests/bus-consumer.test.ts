@@ -51,4 +51,34 @@ describe('bus queue consumer', () => {
     expect(item.retry).toHaveBeenCalledOnce()
     expect(item.ack).not.toHaveBeenCalled()
   })
+
+  it('deduplicates concurrent terminal flight events by durable outbox id', async () => {
+    let consumed = false
+    const run = vi.fn(async () => {
+      if (consumed) return { meta: { changes: 0 } }
+      consumed = true
+      return { meta: { changes: 1 } }
+    })
+    const env = {
+      DB: { prepare: vi.fn(() => ({ bind: vi.fn(() => ({ run })) })) },
+    } as unknown as Env
+    const event: BusEvent = {
+      type: 'flight.landed', tenant: 'test', agent_id: 'agent-product',
+      payload: { outbox_id: 'outbox-1', flight_id: 'flight-1' },
+      ts: '2026-07-10T00:00:00.000Z',
+    }
+    const first = message(event)
+    const duplicate = message(event)
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+
+    await handleQueue({ messages: [first, duplicate] } as unknown as MessageBatch<BusEvent>, env)
+
+    expect(run).toHaveBeenCalledTimes(2)
+    expect(log).toHaveBeenCalledTimes(1)
+    expect(first.ack).toHaveBeenCalledOnce()
+    expect(duplicate.ack).toHaveBeenCalledOnce()
+    expect(first.retry).not.toHaveBeenCalled()
+    expect(duplicate.retry).not.toHaveBeenCalled()
+    log.mockRestore()
+  })
 })

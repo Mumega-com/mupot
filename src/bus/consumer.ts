@@ -47,6 +47,17 @@ async function dispatchSquad(env: Env, squadId: string, event: BusEvent): Promis
   }
 }
 
+async function claimFlightEvent(env: Env, event: BusEvent): Promise<boolean> {
+  const payload = event.payload as { outbox_id?: unknown }
+  if (typeof payload?.outbox_id !== 'string' || payload.outbox_id.length === 0) return true
+  const result = await env.DB.prepare(
+    `UPDATE flight_event_outbox
+        SET consumed_at=?3
+      WHERE tenant=?1 AND id=?2 AND event_type='flight.landed' AND consumed_at IS NULL`,
+  ).bind(event.tenant, payload.outbox_id, new Date().toISOString()).run()
+  return result.meta?.changes === 1
+}
+
 async function routeEvent(env: Env, event: BusEvent): Promise<void> {
   switch (event.type) {
     case 'agent.wake': {
@@ -84,7 +95,6 @@ async function routeEvent(env: Env, event: BusEvent): Promise<void> {
     case 'task.review':   // K1: gated execution success — task awaits verdict; no DO wake
     case 'task.blocked':
     case 'task.verdict':
-    case 'flight.landed':
     case 'fleet.control.requested':
     case 'brain.directive.updated':
     case 'org.provisioned': {
@@ -92,6 +102,14 @@ async function routeEvent(env: Env, event: BusEvent): Promise<void> {
       // wake by default. Log for the activity feed (the agent-actor branch in
       // handleQueue surfaces task.completed/blocked into the squad's bound channel).
       console.log(`bus: ${event.type}`, {
+        tenant: event.tenant,
+        squad_id: event.squad_id,
+      })
+      return
+    }
+    case 'flight.landed': {
+      if (!(await claimFlightEvent(env, event))) return
+      console.log('bus: flight.landed', {
         tenant: event.tenant,
         squad_id: event.squad_id,
       })

@@ -350,6 +350,8 @@ success. Governed REST landings use this same service path. A successful transit
 records the terminal flight row and an attributed `flight.landed` event in one D1 batch.
 Mupot attempts Queue delivery immediately; a pending outbox row survives an outage and
 the scheduled heartbeat retries it without reopening or falsely re-landing the flight.
+Each event carries a stable `outbox_id` and landing timestamp; the queue consumer uses an
+atomic `consumed_at` claim so overlapping delivery attempts produce one activity record.
 
 `flight_get` and `flight_list` require `observer` or higher on every squad referenced
 by a returned flight and return parsed metadata. Legacy or malformed metadata is not

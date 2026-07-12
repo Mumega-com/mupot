@@ -67,6 +67,7 @@ const contract = JSON.parse(
     budgetPolicy: string
     terminalEvent: string
     eventDelivery: string
+    consumerDeduplication: string
   }
   tasks: {
     mcpTools: string[]
@@ -229,6 +230,7 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(contract.flights.budgetPolicy).toBe('reported-cost-lte-immutable-declared-budget')
     expect(contract.flights.terminalEvent).toBe('flight.landed')
     expect(contract.flights.eventDelivery).toBe('transactional-d1-outbox-with-immediate-attempt-and-cron-retry')
+    expect(contract.flights.consumerDeduplication).toBe('atomic-consumed-at-claim-by-outbox-id')
   })
 
   it('keeps Hermes and local smoke coverage on the same lifecycle language', () => {
