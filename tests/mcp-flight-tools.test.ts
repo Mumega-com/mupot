@@ -53,10 +53,13 @@ function auth(overrides: Partial<AuthContext> = {}): AuthContext {
 function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
   const rows = new Map<string, FlightRow>()
   const cursors = new Map<string, string>()
-  const tasks = new Map<string, { id: string; squad_id: string; status: 'in_progress' | 'review' | 'approved' | 'done' }>([
-    ['task-m000', { id: 'task-m000', squad_id: SQUAD_ID, status: 'in_progress' }],
-    ['task-other', { id: 'task-other', squad_id: OTHER_SQUAD_ID, status: 'in_progress' }],
+  let beforeFlightLand: (() => void) | null = null
+  const tasks = new Map<string, { id: string; squad_id: string; status: 'in_progress' | 'review' | 'approved' | 'done'; gate_owner: string | null }>([
+    ['task-m000', { id: 'task-m000', squad_id: SQUAD_ID, status: 'in_progress', gate_owner: 'gate:m0-census' }],
+    ['task-other', { id: 'task-other', squad_id: OTHER_SQUAD_ID, status: 'in_progress', gate_owner: null }],
   ])
+  const verdicts = new Map<string, 'approved' | 'rejected'>()
+  const events: unknown[] = []
   const squads = new Map([
     [SQUAD_ID, { id: SQUAD_ID, department_id: 'dept-1', slug: 'mmhq', name: 'Mumega HQ', charter: null, budget_cap_cents: 100, budget_window: 'day', created_at: 'now' }],
     [OTHER_SQUAD_ID, { id: OTHER_SQUAD_ID, department_id: 'dept-2', slug: 'other', name: 'Other', charter: null, budget_cap_cents: 100, budget_window: 'day', created_at: 'now' }],
@@ -116,12 +119,35 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
                     changes = 1
                   }
                 } else if (sql.includes("status='landed'")) {
+                  beforeFlightLand?.()
+                  beforeFlightLand = null
                   const row = rows.get(args[0] as string)
-                  if (row && row.tenant === args[1] && ['running', 'waiting', 'sleeping'].includes(row.status)) {
+                  const governed = sql.includes('json_each(flights.meta')
+                  const governedTasksComplete = !governed || (() => {
+                    if (!row) return false
+                    const taskIds = (JSON.parse(row.meta) as { task_ids: string[] }).task_ids
+                    return taskIds.every((taskId) => {
+                      const task = tasks.get(taskId)
+                      return task?.status === 'done' && (!task.gate_owner || verdicts.get(taskId) === 'approved')
+                    })
+                  })()
+                  const expectedAgent = governed ? args[2] as string | null : null
+                  const costIndex = governed ? 3 : 2
+                  const scoreIndex = governed ? 4 : 3
+                  const endedIndex = governed ? 5 : 4
+                  const governedBudgetValid = !governed || (
+                    typeof row?.budget_micro_usd === 'number' && (args[costIndex] as number) <= row.budget_micro_usd
+                  )
+                  if (
+                    row && row.tenant === args[1]
+                    && (!expectedAgent || row.agent === expectedAgent)
+                    && ['running', 'waiting', 'sleeping'].includes(row.status)
+                    && governedTasksComplete && governedBudgetValid
+                  ) {
                     row.status = 'landed'
-                    row.cost_micro_usd = args[2] as number
-                    row.score = (args[3] as number | null) ?? row.score
-                    row.ended_at = args[4] as number
+                    row.cost_micro_usd = args[costIndex] as number
+                    row.score = (args[scoreIndex] as number | null) ?? row.score
+                    row.ended_at = args[endedIndex] as number
                     changes = 1
                   }
                 }
@@ -140,10 +166,15 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
                     return task ? [task] : []
                   }) as T[] }
                 }
-                if (sql.includes('SELECT id, status FROM tasks WHERE id IN')) {
+                if (sql.includes('SELECT id, status') && sql.includes('FROM tasks WHERE id IN')) {
                   return { results: args.flatMap((id) => {
                     const task = tasks.get(id as string)
-                    return task ? [{ id: task.id, status: task.status }] : []
+                    return task ? [{
+                      id: task.id,
+                      status: task.status,
+                      gate_owner: task.gate_owner,
+                      latest_verdict: verdicts.get(task.id) ?? null,
+                    }] : []
                   }) as T[] }
                 }
                 if (sql.includes('json_each')) {
@@ -169,8 +200,16 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
         }
       },
     },
+    BUS: { async send(event: unknown) { events.push(event) } },
   } as unknown as Env
-  return { env, rows, tasks }
+  return {
+    env,
+    rows,
+    tasks,
+    verdicts,
+    events,
+    beforeNextFlightLand(hook: () => void) { beforeFlightLand = hook },
+  }
 }
 
 const dispatchArgs = {
@@ -305,10 +344,11 @@ describe('MCP flight tools', () => {
   })
 
   it('lands the bound agent own flight after every referenced task is done', async () => {
-    const { env, tasks } = makeEnv()
+    const { env, tasks, verdicts, events } = makeEnv()
     const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
     const id = (dispatched.result as { flight: FlightRow }).flight.id
     tasks.get('task-m000')!.status = 'done'
+    verdicts.set('task-m000', 'approved')
 
     const out = await invokeTool(auth(), env, 'flight_land', {
       flight_id: id,
@@ -324,6 +364,76 @@ describe('MCP flight tools', () => {
       cost_micro_usd: 0,
       score: 0.97,
     })
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'flight.landed', tenant: TENANT, squad_id: SQUAD_ID, agent_id: AGENT_ID,
+      actor: { kind: 'agent', id: AGENT_ID },
+    }))
+  })
+
+  it('returns conflict when another terminal transition wins after the precheck', async () => {
+    const { env, rows, tasks, verdicts, beforeNextFlightLand } = makeEnv()
+    const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
+    const id = (dispatched.result as { flight: FlightRow }).flight.id
+    tasks.get('task-m000')!.status = 'done'
+    verdicts.set('task-m000', 'approved')
+    beforeNextFlightLand(() => { rows.get(id)!.status = 'landed' })
+
+    const out = await invokeTool(auth(), env, 'flight_land', {
+      flight_id: id, cost_micro_usd: 0,
+    }, 'https://pot.example')
+
+    expect(out).toMatchObject({ ok: false, status: 409, error: 'flight_transition_conflict' })
+  })
+
+  it('refuses landing when a referenced task reopens at the transition', async () => {
+    const { env, rows, tasks, verdicts, beforeNextFlightLand } = makeEnv()
+    const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
+    const id = (dispatched.result as { flight: FlightRow }).flight.id
+    tasks.get('task-m000')!.status = 'done'
+    verdicts.set('task-m000', 'approved')
+    beforeNextFlightLand(() => { tasks.get('task-m000')!.status = 'in_progress' })
+
+    const out = await invokeTool(auth(), env, 'flight_land', {
+      flight_id: id, cost_micro_usd: 0,
+    }, 'https://pot.example')
+
+    expect(out).toMatchObject({
+      ok: false,
+      status: 409,
+      error: 'flight_tasks_incomplete',
+      detail: { task_ids: ['task-m000'] },
+    })
+    expect(rows.get(id)!.status).toBe('running')
+  })
+
+  it('does not treat rejected gated work marked done as successful completion', async () => {
+    const { env, tasks, verdicts } = makeEnv()
+    const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
+    const id = (dispatched.result as { flight: FlightRow }).flight.id
+    tasks.get('task-m000')!.status = 'done'
+    verdicts.set('task-m000', 'rejected')
+
+    const out = await invokeTool(auth(), env, 'flight_land', { flight_id: id, cost_micro_usd: 0 }, 'https://pot.example')
+    expect(out).toMatchObject({
+      ok: false, status: 409, error: 'flight_tasks_incomplete', detail: { task_ids: ['task-m000'] },
+    })
+  })
+
+  it('requires member write authority on every referenced flight squad', async () => {
+    const { env, tasks, verdicts } = makeEnv()
+    const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
+    const id = (dispatched.result as { flight: FlightRow }).flight.id
+    tasks.get('task-m000')!.status = 'done'
+    verdicts.set('task-m000', 'approved')
+    const observerOnly = auth({
+      capabilities: [
+        { member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'observer' },
+        { member_id: MEMBER_ID, scope_type: 'squad', scope_id: OTHER_SQUAD_ID, capability: 'member' },
+      ],
+    })
+
+    const out = await invokeTool(observerOnly, env, 'flight_land', { flight_id: id, cost_micro_usd: 0 }, 'https://pot.example')
+    expect(out).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
   })
 
   it('requires a bound active agent to land a flight', async () => {
@@ -370,10 +480,11 @@ describe('MCP flight tools', () => {
   })
 
   it('refuses cost above the declared flight budget', async () => {
-    const { env, tasks } = makeEnv()
+    const { env, tasks, verdicts } = makeEnv()
     const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
     const id = (dispatched.result as { flight: FlightRow }).flight.id
     tasks.get('task-m000')!.status = 'done'
+    verdicts.set('task-m000', 'approved')
 
     const out = await invokeTool(auth(), env, 'flight_land', {
       flight_id: id, cost_micro_usd: 1,
@@ -382,10 +493,11 @@ describe('MCP flight tools', () => {
   })
 
   it('refuses landing a flight outside an in-air state', async () => {
-    const { env, rows, tasks } = makeEnv()
+    const { env, rows, tasks, verdicts } = makeEnv()
     const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
     const id = (dispatched.result as { flight: FlightRow }).flight.id
     tasks.get('task-m000')!.status = 'done'
+    verdicts.set('task-m000', 'approved')
     rows.get(id)!.status = 'landed'
 
     const out = await invokeTool(auth(), env, 'flight_land', {

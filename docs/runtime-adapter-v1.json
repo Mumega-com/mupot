@@ -155,6 +155,17 @@
     "scope": "single-squad-roster",
     "presence": "latest-check-in-per-agent"
   },
+  "flights": {
+    "mcpTools": ["flight_dispatch", "flight_get", "flight_list", "flight_land"],
+    "identitySource": "auth.boundAgentId",
+    "authorization": {
+      "read": "observer-on-every-referenced-squad",
+      "land": "bound-agent-own-flight-and-member-on-every-referenced-squad"
+    },
+    "taskCompletion": "done-and-latest-verdict-approved-when-gated",
+    "budgetPolicy": "reported-cost-lte-immutable-declared-budget",
+    "terminalEvent": "flight.landed"
+  },
   "tasks": {
     "mcpTools": ["task_create", "task_list", "task_board", "task_update"],
     "defaultSquad": "agent-bound-token-may-derive-squad-from-auth.boundAgentId",

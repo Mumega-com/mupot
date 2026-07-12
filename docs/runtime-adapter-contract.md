@@ -339,12 +339,15 @@ windowed spend enforcement.
 
 `flight_land` is the executor's governed completion path. It requires an active,
 agent-bound token and only permits that bound agent to land its own visible flight.
-Every task referenced by the flight metadata must already be `done`; a gated task
-therefore has to pass the authoritative `/verdict` transition and then move from
-`approved` to `done` before the flight can land. Reported cost is a nonnegative integer
-and cannot exceed the flight's immutable declared budget. Only `running`, `waiting`,
-or `sleeping` flights can transition, and a concurrent terminal transition is returned
-as a conflict rather than a false success.
+Every task referenced by the flight metadata must already be `done`. For a gated task,
+the latest append-only verdict must also be `approved`; `rejected → done` represents
+abandonment and cannot satisfy successful flight completion. Reported cost is a
+nonnegative integer and cannot exceed the flight's immutable declared budget. Only
+`running`, `waiting`, or `sleeping` flights can transition. Task completion, latest
+verdict, budget, agent ownership, and in-air status are rechecked by the same atomic D1
+transition, so a concurrent terminal transition returns a conflict rather than false
+success. Governed REST landings use this same service path. A successful transition
+records the terminal flight row and emits an attributed `flight.landed` activity event.
 
 `flight_get` and `flight_list` require `observer` or higher on every squad referenced
 by a returned flight and return parsed metadata. Legacy or malformed metadata is not

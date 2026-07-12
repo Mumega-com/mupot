@@ -56,7 +56,14 @@ import { sendToRef, readAgentInbox, sendAgentMessage } from '../agents/messages'
 import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { PROVISION_TOOLS } from './provision'
 import { dispatchFlight } from '../flight/dispatch'
-import { getFlight, landFlight, listFlightsForSquad, type FlightRow } from '../flight/service'
+import {
+  emitFlightLanded,
+  getFlight,
+  landGovernedFlight,
+  listFlightsForSquad,
+  listIncompleteFlightTaskIds,
+  type FlightRow,
+} from '../flight/service'
 import { parseDispatchBody } from '../flight/routes'
 import { loadFlightSquads, parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from '../flight/meta'
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
@@ -774,15 +781,16 @@ async function issueFlightCursor(env: Env, auth: AuthContext, squadId: string, f
   return token
 }
 
-function memberCanReadFlight(
+function memberCanAccessFlight(
   auth: AuthContext,
   meta: FlightMetaV1,
   squadCache: Map<string, Squad | null>,
+  minimum: Capability,
 ): boolean {
   const grants = auth.capabilities ?? []
   for (const squadId of meta.squad_ids) {
     const squad = squadCache.get(squadId)
-    if (!squad || !hasCapability(grants, 'squad', squad.id, 'observer', squad.department_id)) return false
+    if (!squad || !hasCapability(grants, 'squad', squad.id, minimum, squad.department_id)) return false
   }
   return true
 }
@@ -899,7 +907,7 @@ const toolFlightGet: ToolSpec = {
     if (!meta) return fail(404, 'flight_not_found')
     const squads = await loadFlightSquads(env, meta.squad_ids)
     const squadCache = new Map<string, Squad | null>(squads.map((item) => [item.id, item]))
-    if (!memberCanReadFlight(auth, meta, squadCache)) return fail(404, 'flight_not_found')
+    if (!memberCanAccessFlight(auth, meta, squadCache, 'observer')) return fail(404, 'flight_not_found')
     return done({ flight: flightWithParsedMeta(flight, meta) })
   },
 }
@@ -941,7 +949,10 @@ const toolFlightLand: ToolSpec = {
     if (!meta) return fail(404, 'flight_not_found')
     const squads = await loadFlightSquads(env, meta.squad_ids)
     const squadCache = new Map<string, Squad | null>(squads.map((item) => [item.id, item]))
-    if (!memberCanReadFlight(auth, meta, squadCache)) return fail(404, 'flight_not_found')
+    if (!memberCanAccessFlight(auth, meta, squadCache, 'observer')) return fail(404, 'flight_not_found')
+    if (!memberCanAccessFlight(auth, meta, squadCache, 'member')) {
+      return fail(403, 'forbidden', { need: 'member', scope: 'flight squads' })
+    }
     if (!(['running', 'waiting', 'sleeping'] as const).includes(flight.status as 'running' | 'waiting' | 'sleeping')) {
       return fail(409, 'flight_not_in_air', { status: flight.status })
     }
@@ -952,19 +963,21 @@ const toolFlightLand: ToolSpec = {
       return fail(409, 'flight_budget_exceeded', { budget_micro_usd: flight.budget_micro_usd })
     }
 
-    const placeholders = meta.task_ids.map((_, index) => `?${index + 1}`).join(',')
-    const taskRows = await env.DB.prepare(
-      `SELECT id, status FROM tasks WHERE id IN (${placeholders})`,
-    ).bind(...meta.task_ids).all<Pick<Task, 'id' | 'status'>>()
-    const taskStatus = new Map((taskRows.results ?? []).map((task) => [task.id, task.status]))
-    const incompleteTaskIds = meta.task_ids.filter((taskId) => taskStatus.get(taskId) !== 'done')
-    if (incompleteTaskIds.length > 0) {
-      return fail(409, 'flight_tasks_incomplete', { task_ids: incompleteTaskIds })
+    const transitioned = await landGovernedFlight(env, flight.id, {
+      cost_micro_usd: costMicroUsd as number,
+      score: score as number | undefined,
+      expected_agent: auth.boundAgentId,
+    })
+    if (!transitioned) {
+      const incompleteTaskIds = await listIncompleteFlightTaskIds(env, meta.task_ids)
+      if (incompleteTaskIds.length > 0) {
+        return fail(409, 'flight_tasks_incomplete', { task_ids: incompleteTaskIds })
+      }
+      return fail(409, 'flight_transition_conflict')
     }
-
-    await landFlight(env, flight.id, { cost_micro_usd: costMicroUsd as number, score: score as number | undefined })
     const landed = await getFlight(env, flight.id)
-    if (!landed || landed.status !== 'landed') return fail(409, 'flight_transition_conflict')
+    if (!landed || landed.status !== 'landed') return fail(500, 'flight_record_missing')
+    await emitFlightLanded(env, landed, meta, { kind: 'agent', id: auth.boundAgentId })
     return done({ flight: flightWithParsedMeta(landed, meta) })
   },
 }
@@ -1021,7 +1034,7 @@ const toolFlightList: ToolSpec = {
         const flight = page[index]
         lastScanned = flight
         const meta = candidates[index].meta
-        if (meta?.squad_ids.includes(squad.id) && memberCanReadFlight(auth, meta, squadCache)) {
+        if (meta?.squad_ids.includes(squad.id) && memberCanAccessFlight(auth, meta, squadCache, 'observer')) {
           visible.push(flightWithParsedMeta(flight, meta))
         }
         if (visible.length >= limit) {

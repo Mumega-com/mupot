@@ -6,6 +6,7 @@
 // cannot be revived; a held/landed flight cannot be re-landed) — same discipline as loops.
 
 import type { Env } from '../types'
+import { createBus } from '../bus'
 import type { PreflightResult } from './preflight'
 import type { FlightMetaV1 } from './meta'
 
@@ -101,6 +102,102 @@ export async function landFlight(
   )
     .bind(id, env.TENANT_SLUG, opts.cost_micro_usd ?? 0, opts.score ?? null, Date.now())
     .run()
+}
+
+export async function landGovernedFlight(
+  env: Env,
+  id: string,
+  opts: { cost_micro_usd: number; score?: number; expected_agent?: string },
+): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `UPDATE flights SET status='landed', cost_micro_usd=?4, score=COALESCE(?5, score), ended_at=?6
+     WHERE id=?1 AND tenant=?2
+       AND (?3 IS NULL OR agent=?3)
+       AND status IN ('running','waiting','sleeping')
+       AND budget_micro_usd IS NOT NULL AND ?4 <= budget_micro_usd
+       AND json_valid(meta)
+       AND json_extract(meta, '$.schema') = 'mupot.flight.meta/v1'
+       AND NOT EXISTS (
+         SELECT 1
+           FROM json_each(flights.meta, '$.task_ids') AS task_ref
+           LEFT JOIN tasks AS task ON task.id = task_ref.value
+          WHERE task.id IS NULL
+             OR task.status <> 'done'
+             OR (
+               task.gate_owner IS NOT NULL
+               AND COALESCE((
+                 SELECT verdict
+                   FROM task_verdicts
+                  WHERE task_id = task.id
+                  ORDER BY decided_at DESC, id DESC
+                  LIMIT 1
+               ), '') <> 'approved'
+             )
+       )`,
+  )
+    .bind(
+      id,
+      env.TENANT_SLUG,
+      opts.expected_agent ?? null,
+      opts.cost_micro_usd,
+      opts.score ?? null,
+      Date.now(),
+    )
+    .run()
+  return result.meta?.changes === 1
+}
+
+interface FlightTaskCompletionRow {
+  id: string
+  status: string
+  gate_owner: string | null
+  latest_verdict: string | null
+}
+
+export async function listIncompleteFlightTaskIds(env: Env, taskIds: string[]): Promise<string[]> {
+  if (taskIds.length === 0) return []
+  const placeholders = taskIds.map(() => '?').join(',')
+  const rows = await env.DB.prepare(
+    `SELECT id, status, gate_owner,
+            (SELECT verdict
+               FROM task_verdicts
+              WHERE task_id = tasks.id
+              ORDER BY decided_at DESC, id DESC
+              LIMIT 1) AS latest_verdict
+       FROM tasks WHERE id IN (${placeholders})`,
+  ).bind(...taskIds).all<FlightTaskCompletionRow>()
+  const byId = new Map((rows.results ?? []).map((task) => [task.id, task]))
+  return taskIds.filter((taskId) => {
+    const task = byId.get(taskId)
+    return !task || task.status !== 'done' || (task.gate_owner !== null && task.latest_verdict !== 'approved')
+  })
+}
+
+export async function emitFlightLanded(
+  env: Env,
+  flight: FlightRow,
+  meta: FlightMetaV1,
+  actor: { kind: 'member' | 'agent'; id: string },
+): Promise<void> {
+  try {
+    await createBus(env).emit({
+      type: 'flight.landed',
+      tenant: env.TENANT_SLUG,
+      squad_id: meta.squad_ids[0],
+      agent_id: flight.agent,
+      actor,
+      payload: {
+        flight_id: flight.id,
+        squad_ids: meta.squad_ids,
+        task_ids: meta.task_ids,
+        cost_micro_usd: flight.cost_micro_usd,
+        score: flight.score,
+      },
+      ts: new Date().toISOString(),
+    })
+  } catch (error) {
+    console.error('flight.landed event emit failed', { flight_id: flight.id, error })
+  }
 }
 
 // Fail a flight (errored). From any non-terminal state.

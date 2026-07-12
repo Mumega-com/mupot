@@ -84,6 +84,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<void> {
     case 'task.review':   // K1: gated execution success — task awaits verdict; no DO wake
     case 'task.blocked':
     case 'task.verdict':
+    case 'flight.landed':
     case 'fleet.control.requested':
     case 'brain.directive.updated':
     case 'org.provisioned': {

@@ -315,6 +315,7 @@ export type BusEventType =
   | 'task.review'   // execution succeeded on a gated task — task now awaits verdict
   | 'task.blocked' // execution failed (model error/timeout) — short note persisted
   | 'task.verdict' // gate decision written — verdict + new task status in payload
+  | 'flight.landed' // governed flight completed with task, budget, and identity checks
   | 'agent.wake'
   | 'fleet.control.requested' // signed host-control request queued for the fleet daemon
   | 'brain.directive.updated' // owner-pinned directive changed for the brain decision loop

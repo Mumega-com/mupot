@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { flightsApp, parseDispatchBody, parseOutcomeQuery } from '../src/flight/routes'
 import type { Env } from '../src/types'
+import type { FlightRow } from '../src/flight/service'
 
 const goodSignals = {
   contextComplete: true,
@@ -162,5 +163,111 @@ describe('REST flight dispatch reference integrity', () => {
 
     expect(response.status).toBe(400)
     await expect(response.json()).resolves.toEqual({ error: 'flight_squad_not_found' })
+  })
+})
+
+function makeGovernedLandEnv(taskStatus: 'done' | 'review', verdict: 'approved' | 'rejected') {
+  const flight: FlightRow = {
+    id: 'flight-m000', tenant: 'test', agent: 'agent-product', goal: 'M000', status: 'running',
+    trigger_source: 'api', gate_verdict: 'go', gate_reason: '', score: 0.9,
+    budget_micro_usd: 0, cost_micro_usd: 0, next_run_at: null, created_at: 1,
+    started_at: 1, ended_at: null, meta: JSON.stringify(goodMeta),
+  }
+  const events: unknown[] = []
+  const env = {
+    TENANT_SLUG: 'test',
+    BUS: { async send(event: unknown) { events.push(event) } },
+    DB: {
+      prepare(sql: string) {
+        return {
+          bind(...args: unknown[]) {
+            return {
+              async first<T>() {
+                if (sql.includes('FROM member_tokens')) {
+                  return { member_id: 'admin-1', display_name: 'Admin', email: null, status: 'active', bound_agent_id: null } as T
+                }
+                if (sql.includes('SELECT * FROM flights WHERE id=')) {
+                  return (flight.id === args[0] && flight.tenant === args[1] ? flight : null) as T | null
+                }
+                return null
+              },
+              async all<T>() {
+                if (sql.includes('FROM capabilities')) {
+                  return { results: [{ member_id: 'admin-1', scope_type: 'org', scope_id: null, capability: 'admin' }] as T[] }
+                }
+                if (sql.includes('SELECT id, status') && sql.includes('FROM tasks WHERE id IN')) {
+                  return { results: [{
+                    id: 'task-m000', status: taskStatus, gate_owner: 'gate:m0-census', latest_verdict: verdict,
+                  }] as T[] }
+                }
+                return { results: [] as T[] }
+              },
+              async run() {
+                let changes = 0
+                if (
+                  sql.includes('json_each(flights.meta')
+                  && flight.status === 'running'
+                  && taskStatus === 'done'
+                  && verdict === 'approved'
+                  && (args[3] as number) <= (flight.budget_micro_usd ?? -1)
+                ) {
+                  flight.status = 'landed'
+                  flight.cost_micro_usd = args[3] as number
+                  flight.score = (args[4] as number | null) ?? flight.score
+                  flight.ended_at = args[5] as number
+                  changes = 1
+                }
+                return { meta: { changes } }
+              },
+            }
+          },
+        }
+      },
+    },
+  } as unknown as Env
+  return { env, flight, events }
+}
+
+describe('REST governed flight landing parity', () => {
+  it('lands approved completed work and emits an attributed terminal event', async () => {
+    const { env, flight, events } = makeGovernedLandEnv('done', 'approved')
+    const response = await flightsApp.request('https://pot.example/flight-m000/land', {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ score: 0.97 }),
+    }, env)
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({ ok: true, id: 'flight-m000', status: 'landed' })
+    expect(flight.cost_micro_usd).toBe(0)
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'flight.landed', actor: { kind: 'member', id: 'admin-1' }, agent_id: 'agent-product',
+    }))
+  })
+
+  it('refuses rejected gated work even when the task is marked done', async () => {
+    const { env, flight } = makeGovernedLandEnv('done', 'rejected')
+    const response = await flightsApp.request('https://pot.example/flight-m000/land', {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ cost_micro_usd: 0 }),
+    }, env)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toMatchObject({ error: 'flight_tasks_incomplete', task_ids: ['task-m000'] })
+    expect(flight.status).toBe('running')
+  })
+
+  it('refuses reported cost above the declared budget', async () => {
+    const { env, flight } = makeGovernedLandEnv('done', 'approved')
+    const response = await flightsApp.request('https://pot.example/flight-m000/land', {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ cost_micro_usd: 1 }),
+    }, env)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'flight_budget_exceeded', budget_micro_usd: 0 })
+    expect(flight.status).toBe('running')
   })
 })
