@@ -12,6 +12,20 @@ const goodSignals = {
   stepSeconds: 20,
 }
 
+const goodMeta = {
+  schema: 'mupot.flight.meta/v1',
+  goal_id: 'mumega-tenant-zero',
+  objective_id: 'm000-constitution-census',
+  squad_ids: ['squad-mmhq'],
+  task_ids: ['task-m000'],
+  done_when: ['the census hash verifies'],
+  artifact_refs: [],
+  receipt_refs: [],
+  confidentiality: 'internal',
+  publication_target: 'none',
+  parent_flight_id: null,
+}
+
 describe('parseDispatchBody', () => {
   it('accepts a full body + defaults trigger to api', () => {
     const r = parseDispatchBody({ agent: 'opus', goal: 'fix the loop', signals: goodSignals })
@@ -64,6 +78,20 @@ describe('parseDispatchBody', () => {
     expect(r.value.opts.scoreThreshold).toBe(1) // clamped 0..1
     expect(r.value.opts.cacheWindowSeconds).toBe(120)
     expect(r.value.opts.minProgressRatio).toBeUndefined()
+  })
+
+  it('preserves valid v1 metadata on the flight record', () => {
+    const r = parseDispatchBody({ agent: 'a', goal: 'g', signals: goodSignals, meta: goodMeta })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value.flight.meta).toEqual(goodMeta)
+  })
+
+  it('rejects malformed or unknown flight metadata', () => {
+    expect(parseDispatchBody({ agent: 'a', goal: 'g', signals: goodSignals, meta: { ...goodMeta, task_ids: [] } }))
+      .toEqual({ ok: false, error: 'invalid_flight_meta' })
+    expect(parseDispatchBody({ agent: 'a', goal: 'g', signals: goodSignals, meta: { ...goodMeta, hidden: 'data' } }))
+      .toEqual({ ok: false, error: 'invalid_flight_meta' })
   })
 })
 

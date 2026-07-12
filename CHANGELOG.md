@@ -6,6 +6,14 @@ All notable changes to mupot. Semver; pre-1.0 minor bumps may break.
 this changelog (shipped, dated) share version numbers and feed each other — a roadmap
 block collapses into a changelog entry when it ships.
 
+## [Unreleased]
+
+### Added
+
+- Scoped MCP flight tools: `flight_dispatch`, `flight_get`, and `flight_list`. Dispatch
+  derives the agent from the authenticated token binding, validates strict
+  `mupot.flight.meta/v1` metadata and referenced tasks, and enforces squad RBAC.
+
 ## [0.23.0-rc.1] — 2026-07-10
 
 Release candidate for **Trusted Runtime**. It packages the signed agent runtime,

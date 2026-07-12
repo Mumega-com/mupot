@@ -314,6 +314,25 @@ higher on that squad.
 `is_self`, and the latest presence check-in summary per agent. It does not expose
 a global agent directory and does not authorize cross-squad messaging.
 
+## Flight Lifecycle
+
+Stateful runtimes create and inspect governed flights through MCP:
+
+- `flight_dispatch { squad_id, goal, meta_json, signals_json, budget_micro_usd? }`
+- `flight_get { flight_id }`
+- `flight_list { squad_id, limit? }`
+
+`flight_dispatch` requires `member` capability on every squad named by the strict
+`mupot.flight.meta/v1` metadata and derives the flying agent from the authenticated
+token's stable `boundAgentId`. It refuses unbound identities, unknown squads, missing
+task references, and tasks outside the declared flight squads. The caller cannot
+assert an agent identity in arguments.
+
+`flight_get` and `flight_list` require `observer` or higher on a referenced squad and
+return parsed metadata. Legacy or malformed metadata is not projected through the
+scoped MCP read surface. The existing org-admin HTTP connector remains available for
+the external coherence brain; MCP is the tenant teammate surface.
+
 ## Task Lifecycle
 
 Tasks are the unit of durable work. All surfaces should use the shared task

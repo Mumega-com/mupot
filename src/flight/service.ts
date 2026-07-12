@@ -7,6 +7,7 @@
 
 import type { Env } from '../types'
 import type { PreflightResult } from './preflight'
+import type { FlightMetaV1 } from './meta'
 
 export type FlightStatus =
   | 'preflight'
@@ -43,7 +44,7 @@ export interface NewFlight {
   goal: string
   trigger_source?: TriggerSource
   budget_micro_usd?: number
-  meta?: Record<string, unknown>
+  meta?: FlightMetaV1
 }
 
 // Create a flight in `preflight` — it has not launched; the gate decides next.
