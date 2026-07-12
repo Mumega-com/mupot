@@ -321,6 +321,7 @@ Stateful runtimes create and inspect governed flights through MCP:
 - `flight_dispatch { squad_id, goal, meta_json, signals_json, budget_micro_usd? }`
 - `flight_get { flight_id }`
 - `flight_list { squad_id, limit?, cursor? }`
+- `flight_land { flight_id, cost_micro_usd, score? }`
 
 `flight_dispatch` requires `member` capability on every squad named by the strict
 `mupot.flight.meta/v1` metadata and derives the flying agent from the authenticated
@@ -335,6 +336,15 @@ must fit the active agent's configured budget cap and every referenced squad cap
 Mupot replaces caller-supplied budget readiness signals with this server-derived
 allocation ceiling; actual model execution remains subject to the execution meter's
 windowed spend enforcement.
+
+`flight_land` is the executor's governed completion path. It requires an active,
+agent-bound token and only permits that bound agent to land its own visible flight.
+Every task referenced by the flight metadata must already be `done`; a gated task
+therefore has to pass the authoritative `/verdict` transition and then move from
+`approved` to `done` before the flight can land. Reported cost is a nonnegative integer
+and cannot exceed the flight's immutable declared budget. Only `running`, `waiting`,
+or `sleeping` flights can transition, and a concurrent terminal transition is returned
+as a conflict rather than a false success.
 
 `flight_get` and `flight_list` require `observer` or higher on every squad referenced
 by a returned flight and return parsed metadata. Legacy or malformed metadata is not

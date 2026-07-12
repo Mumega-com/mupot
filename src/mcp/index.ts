@@ -56,7 +56,7 @@ import { sendToRef, readAgentInbox, sendAgentMessage } from '../agents/messages'
 import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { PROVISION_TOOLS } from './provision'
 import { dispatchFlight } from '../flight/dispatch'
-import { getFlight, listFlightsForSquad, type FlightRow } from '../flight/service'
+import { getFlight, landFlight, listFlightsForSquad, type FlightRow } from '../flight/service'
 import { parseDispatchBody } from '../flight/routes'
 import { loadFlightSquads, parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from '../flight/meta'
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
@@ -901,6 +901,71 @@ const toolFlightGet: ToolSpec = {
     const squadCache = new Map<string, Squad | null>(squads.map((item) => [item.id, item]))
     if (!memberCanReadFlight(auth, meta, squadCache)) return fail(404, 'flight_not_found')
     return done({ flight: flightWithParsedMeta(flight, meta) })
+  },
+}
+
+const toolFlightLand: ToolSpec = {
+  name: 'flight_land',
+  scope: 'self (bound agent own flight)',
+  min: 'member',
+  args: '{ flight_id: string, cost_micro_usd: number, score?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      flight_id: STRING_SCHEMA,
+      cost_micro_usd: OPTIONAL_NUMBER_SCHEMA,
+      score: OPTIONAL_NUMBER_SCHEMA,
+    },
+    required: ['flight_id', 'cost_micro_usd'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (!auth.boundAgentId) return fail(409, 'agent_binding_required')
+    const boundAgent = await loadAgent(env, auth.boundAgentId)
+    if (!boundAgent) return fail(409, 'agent_binding_invalid')
+    if (boundAgent.status !== 'active') return fail(409, 'agent_binding_inactive')
+
+    const flightId = str(args.flight_id)
+    const costMicroUsd = args.cost_micro_usd
+    const score = args.score
+    if (!flightId || !Number.isSafeInteger(costMicroUsd) || (costMicroUsd as number) < 0) {
+      return fail(400, 'invalid_args')
+    }
+    if (score !== undefined && (typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 1)) {
+      return fail(400, 'invalid_flight_score')
+    }
+
+    const flight = await getFlight(env, flightId)
+    if (!flight || flight.agent !== auth.boundAgentId) return fail(404, 'flight_not_found')
+    const meta = parseFlightMetaV1(parseJsonArg(flight.meta))
+    if (!meta) return fail(404, 'flight_not_found')
+    const squads = await loadFlightSquads(env, meta.squad_ids)
+    const squadCache = new Map<string, Squad | null>(squads.map((item) => [item.id, item]))
+    if (!memberCanReadFlight(auth, meta, squadCache)) return fail(404, 'flight_not_found')
+    if (!(['running', 'waiting', 'sleeping'] as const).includes(flight.status as 'running' | 'waiting' | 'sleeping')) {
+      return fail(409, 'flight_not_in_air', { status: flight.status })
+    }
+    if (!Number.isSafeInteger(flight.budget_micro_usd) || (flight.budget_micro_usd as number) < 0) {
+      return fail(409, 'flight_budget_policy_missing')
+    }
+    if ((costMicroUsd as number) > (flight.budget_micro_usd as number)) {
+      return fail(409, 'flight_budget_exceeded', { budget_micro_usd: flight.budget_micro_usd })
+    }
+
+    const placeholders = meta.task_ids.map((_, index) => `?${index + 1}`).join(',')
+    const taskRows = await env.DB.prepare(
+      `SELECT id, status FROM tasks WHERE id IN (${placeholders})`,
+    ).bind(...meta.task_ids).all<Pick<Task, 'id' | 'status'>>()
+    const taskStatus = new Map((taskRows.results ?? []).map((task) => [task.id, task.status]))
+    const incompleteTaskIds = meta.task_ids.filter((taskId) => taskStatus.get(taskId) !== 'done')
+    if (incompleteTaskIds.length > 0) {
+      return fail(409, 'flight_tasks_incomplete', { task_ids: incompleteTaskIds })
+    }
+
+    await landFlight(env, flight.id, { cost_micro_usd: costMicroUsd as number, score: score as number | undefined })
+    const landed = await getFlight(env, flight.id)
+    if (!landed || landed.status !== 'landed') return fail(409, 'flight_transition_conflict')
+    return done({ flight: flightWithParsedMeta(landed, meta) })
   },
 }
 
@@ -1849,6 +1914,7 @@ export const TOOLS: ToolSpec[] = [
   toolFlightDispatch,
   toolFlightGet,
   toolFlightList,
+  toolFlightLand,
   toolTaskCreate,
   toolTaskList,
   toolTaskBoard,
