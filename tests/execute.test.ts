@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
-import { runTaskExecution, resolveTaskId, capResult, MAX_RESULT_CHARS } from '../src/agents/execute'
+import {
+  runTaskExecution,
+  resolveTaskId,
+  resolveDispatchReceiptId,
+  capResult,
+  MAX_RESULT_CHARS,
+} from '../src/agents/execute'
 import type { Agent, Task, ModelPort, BusEvent } from '../src/types'
 
 // ── test doubles ───────────────────────────────────────────────────────────────
@@ -96,6 +102,17 @@ describe('resolveTaskId', () => {
   })
 })
 
+describe('resolveDispatchReceiptId', () => {
+  it('reads a receipt nested in a BusEvent payload', () => {
+    expect(resolveDispatchReceiptId({ payload: { dispatch_receipt_id: 'receipt-7' } })).toBe('receipt-7')
+  })
+
+  it('returns null for plain wakes and empty receipt ids', () => {
+    expect(resolveDispatchReceiptId({})).toBeNull()
+    expect(resolveDispatchReceiptId({ payload: { dispatch_receipt_id: '' } })).toBeNull()
+  })
+})
+
 describe('capResult', () => {
   it('passes short output through untouched', () => {
     expect(capResult('hello')).toBe('hello')
@@ -114,6 +131,7 @@ describe('runTaskExecution — success', () => {
     const remembered: string[] = []
 
     const r = await runTaskExecution(env, AGENT, 'task-1', {
+      executionReceiptId: 'dispatch-receipt-1',
       model: okModel('Here is the finished intro.'),
       emit: async (e) => {
         events.push(e)
@@ -129,8 +147,12 @@ describe('runTaskExecution — success', () => {
 
     // First UPDATE claims + flips to in_progress; the terminal UPDATE lands 'done'.
     expect(updates[0].sql).toContain("status = 'in_progress'")
+    expect(updates[0].sql).toContain('execution_receipt_id = ?')
+    expect(updates[0].args).toContain('dispatch-receipt-1')
     const terminal = updates[updates.length - 1]
     expect(terminal.sql).toContain('SET status = ?')
+    expect(terminal.sql).toContain('execution_receipt_id = ?')
+    expect(terminal.args).toContain('dispatch-receipt-1')
     expect(terminal.args[0]).toBe('done')
     expect(terminal.args[1]).toBe('Here is the finished intro.')
     expect(terminal.args[2]).not.toBeNull() // completed_at stamped
@@ -305,7 +327,7 @@ describe('runTaskExecution — fail-closed scope (RBAC boundary)', () => {
 describe('runTaskExecution — idempotency / K6 no-op gate statuses', () => {
   // K6: execute no-ops for statuses outside {open, in_progress, blocked, rejected}.
   // 'done', 'review', 'approved' must never re-enter the execution loop.
-  const noOpStatuses: Task['status'][] = ['in_progress', 'done', 'review', 'approved']
+  const noOpStatuses: Task['status'][] = ['done', 'review', 'approved']
 
   for (const status of noOpStatuses) {
     it(`no-ops on status=${status} without any writes`, async () => {
@@ -325,6 +347,57 @@ describe('runTaskExecution — idempotency / K6 no-op gate statuses', () => {
       expect(updates).toHaveLength(0)
     })
   }
+
+  it('executes a legacy unowned in_progress task', async () => {
+    const { env, updates } = makeEnv({
+      task: makeTask({ status: 'in_progress', execution_receipt_id: null, execution_claim_expires_at: null }),
+    })
+    const model = okModel('legacy dispatch completed')
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', {
+      executionReceiptId: 'receipt-new', model, emit: async () => {}, remember: async () => 'x',
+    })
+
+    expect(r.ok).toBe(true)
+    expect(model.chat).toHaveBeenCalledOnce()
+    expect(updates[0].args).toContain('receipt-new')
+  })
+
+  it('no-ops while the same receipt has an active execution lease', async () => {
+    const { env, updates } = makeEnv({
+      task: makeTask({
+        status: 'in_progress', execution_receipt_id: 'receipt-1',
+        execution_claim_expires_at: Date.now() + 30_000,
+      }),
+    })
+    const model = okModel('must not duplicate')
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', {
+      executionReceiptId: 'receipt-1', model, emit: async () => {}, remember: async () => 'x',
+    })
+
+    expect(r).toMatchObject({ ok: true, decided: 'no_op:in_progress' })
+    expect(model.chat).not.toHaveBeenCalled()
+    expect(updates).toHaveLength(0)
+  })
+
+  it('does not auto-resume an expired owned execution', async () => {
+    const { env, updates } = makeEnv({
+      task: makeTask({
+        status: 'in_progress', execution_receipt_id: 'receipt-1',
+        execution_claim_expires_at: Date.now() - 1,
+      }),
+    })
+    const model = okModel('resumed work')
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', {
+      executionReceiptId: 'receipt-1', model, emit: async () => {}, remember: async () => 'x',
+    })
+
+    expect(r).toMatchObject({ ok: true, decided: 'no_op:in_progress' })
+    expect(model.chat).not.toHaveBeenCalled()
+    expect(updates).toHaveLength(0)
+  })
 
   it('executes normally on rejected (rework authorised)', async () => {
     const { env, updates } = makeEnv({ task: makeTask({ status: 'rejected' }) })

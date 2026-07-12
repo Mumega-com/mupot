@@ -432,10 +432,20 @@ return `task_not_found`.
 Each accepted dispatch inserts an append-only `task_dispatch_receipts` row before
 queue emission and returns its id, member dispatcher, and dispatch timestamp.
 The wake event carries `dispatch_receipt_id`; the Queue consumer atomically claims
-that receipt before the AgentDO side effect, so duplicate and concurrent Queue
-deliveries cannot re-execute the task. It stamps `consumed_at` only after the
-assigned AgentDO accepts the task-scoped wake. Emission or wake failure leaves an
-attempt count and bounded error for operator diagnosis.
+that receipt with a bounded lease before the AgentDO side effect. An active lease
+causes another delivery to retry, while an expired lease can be reclaimed after an
+interrupted Worker invocation. AgentDO records the same receipt id in the task's
+atomic execution claim. A retry that finds that id consumes the dispatch receipt
+without waking AgentDO again after the task reaches a terminal state. While the
+task remains `in_progress`, an execution lease suppresses concurrent retries. The
+retry is delayed to the lease boundary so it does not exhaust the Queue retry
+budget. On expiry, Mupot atomically marks the task `blocked` with an interruption
+receipt instead of silently repeating model spend; recovery requires an explicit
+governed redispatch with a new receipt. An unowned legacy `in_progress` task remains
+runnable, while a different receipt cannot take over an active execution. The
+consumer stamps `consumed_at` only after the assigned AgentDO accepts
+the task-scoped wake. Emission or wake failure leaves an attempt count and bounded
+error for operator diagnosis.
 
 Statuses:
 
