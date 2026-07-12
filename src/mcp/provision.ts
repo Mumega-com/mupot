@@ -23,10 +23,15 @@
 //   mint_agent_token  — admin on the agent's squad (org/department inherit) → show-once raw
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
-import type { Env, BusEvent } from '../types'
+import type { Capability, Env, BusEvent } from '../types'
 import { hasCapability } from '../auth/capability'
 import { createDepartment, createSquad, createAgent } from '../org/service'
-import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
+import {
+  mintAgentBoundToken,
+  isAgentTokenCapability,
+  resolveActiveAgentMember,
+  upsertCapabilityGrant,
+} from '../members/service'
 import { mcpEndpoint, wakeContractForAgent } from '../dashboard/connect'
 import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
@@ -41,6 +46,7 @@ import {
 
 const STRING_SCHEMA = { type: 'string' }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
+const GRANTABLE_AGENT_CAPABILITIES = new Set<Capability>(['observer', 'member', 'lead', 'admin'])
 
 // Emit an attributed provision event so the activity feed/consumer knows a member
 // caused a structural change (kasra-review W2 — the mint was previously unattributed
@@ -48,17 +54,29 @@ const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
 async function emitProvisioned(
   env: Env,
   memberId: string,
-  kind: 'department' | 'squad' | 'agent' | 'token' | 'key',
+  kind: 'department' | 'squad' | 'agent' | 'token' | 'key' | 'capability',
   id: string,
-  extra: { squad_id?: string; agent_id?: string } = {},
+  extra: { squad_id?: string; agent_id?: string; member_id?: string; capability?: Capability } = {},
 ): Promise<void> {
-  const event: BusEvent<{ kind: string; id: string; by: string }> = {
+  const event: BusEvent<{
+    kind: string
+    id: string
+    by: string
+    member_id?: string
+    capability?: Capability
+  }> = {
     type: 'org.provisioned',
     tenant: env.TENANT_SLUG,
     squad_id: extra.squad_id,
     agent_id: extra.agent_id,
     actor: { kind: 'member', id: memberId },
-    payload: { kind, id, by: memberId },
+    payload: {
+      kind,
+      id,
+      by: memberId,
+      ...(extra.member_id ? { member_id: extra.member_id } : {}),
+      ...(extra.capability ? { capability: extra.capability } : {}),
+    },
     ts: new Date().toISOString(),
   }
   // The row is already committed; a bus failure must NOT 500 the caller and orphan a
@@ -321,6 +339,78 @@ const toolMintAgentToken: ToolSpec = {
   },
 }
 
+// ── grant_agent_capability ───────────────────────────────────────────────────
+// Grants the one active member identity welded to an existing agent a capability
+// on another squad. It never mints or returns a credential.
+const toolGrantAgentCapability: ToolSpec = {
+  name: 'grant_agent_capability',
+  scope: 'target squad',
+  min: 'admin',
+  args: '{ agent: string (id|slug), squad: string (id|slug), capability: "observer"|"member"|"lead"|"admin" }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent: STRING_SCHEMA, squad: STRING_SCHEMA, capability: STRING_SCHEMA },
+    required: ['agent', 'squad', 'capability'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const agentRef = str(args.agent)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+    const squadRef = str(args.squad)
+    if (!squadRef) return fail(400, 'invalid_args', 'squad required')
+    const requestedCapability = str(args.capability)
+    if (!requestedCapability || !GRANTABLE_AGENT_CAPABILITIES.has(requestedCapability as Capability)) {
+      return fail(400, 'invalid_capability', 'capability must be observer, member, lead, or admin')
+    }
+    const capability = requestedCapability as Capability
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const agent = agentResult.value
+
+    const squadResult = await resolveSquadRef(env, squadRef)
+    if (!squadResult.ok) return resolveFail(squadResult.reason, 'squad_not_found')
+    const squad = squadResult.value
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, squad.id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    }
+    if (!hasCapability(grants, 'squad', squad.id, capability, squad.department_id)) {
+      return fail(403, 'cannot_grant_above_own_rank')
+    }
+
+    const agentMemberId = await resolveActiveAgentMember(env, agent.id)
+    if (agentMemberId === 'unminted') {
+      return fail(409, 'agent_identity_unminted', 'call mint_agent_token before granting capabilities')
+    }
+    if (agentMemberId === 'ambiguous') {
+      return fail(409, 'agent_identity_ambiguous', 'revoke stale agent tokens until one active member identity remains')
+    }
+
+    const outcome = await upsertCapabilityGrant(env, {
+      member_id: agentMemberId,
+      scope_type: 'squad',
+      scope_id: squad.id,
+      capability,
+    })
+    await emitProvisioned(env, auth.memberId as string, 'capability', squad.id, {
+      squad_id: squad.id,
+      agent_id: agent.id,
+      member_id: agentMemberId,
+      capability,
+    })
+
+    return done({
+      agent: { id: agent.id },
+      squad: { id: squad.id },
+      member_id: agentMemberId,
+      grant: outcome.grant,
+      result: outcome.result,
+    })
+  },
+}
+
 // ── register_agent_key ────────────────────────────────────────────────────────
 // Stores only a host-generated Ed25519 PUBLIC key. The key is bound to the one
 // active member identity already welded to this agent by mint_agent_token.
@@ -393,5 +483,6 @@ export const PROVISION_TOOLS: ToolSpec[] = [
   toolCreateSquad,
   toolCreateAgent,
   toolMintAgentToken,
+  toolGrantAgentCapability,
   toolRegisterAgentKey,
 ]
