@@ -408,8 +408,10 @@ currently holds effective `member` capability on the task squad through normal
 inheritance. Assignment records responsibility only; it never grants authority.
 Every authenticated action reloads current capabilities, so an assignment does
 not let a runtime bypass a later grant revocation. At execution, the shared
-engine reloads the task by tenant-local ID and rechecks that its assigned agent
-is active, exactly bound to one active member identity, and still has effective
+engine reloads the task by tenant-local ID and requires its assigned agent to be
+active and match the executing agent. Home-squad execution remains
+token-independent. Cross-squad execution additionally requires exactly one
+active bound member identity whose current grants still provide effective
 `member` authority on the task squad. Assigned-other-agent and unassigned
 cross-squad execution fail closed as `task_not_found`; direct and Workflow
 pipeline execution use this same policy. `task_update` also uses the same

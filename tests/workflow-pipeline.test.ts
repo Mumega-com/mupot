@@ -28,6 +28,7 @@ import { runTaskPipeline, startTaskPipeline } from '../src/workflows/pipeline'
 import type { StepLike, TaskPipelineParams, PipelineDeps, VerdictRow } from '../src/workflows/pipeline'
 import type { Env, Agent, Task } from '../src/types'
 import type { ExecuteResult } from '../src/agents/execute'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 // ── Shared fixtures ───────────────────────────────────────────────────────────
 
@@ -198,6 +199,125 @@ describe('ungated task', () => {
 
     expect(summary.gated).toBe(false)
     expect(step.waitForEventNames).toHaveLength(0)
+  })
+})
+
+describe('shared execution authorization', () => {
+  it('uses the real engine and fails closed after a cross-squad capability revocation', async () => {
+    const harness = createSqliteD1()
+    try {
+      harness.sqlite.exec(`
+        CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL, charter TEXT);
+        CREATE TABLE agents (id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, status TEXT NOT NULL);
+        CREATE TABLE members (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, status TEXT NOT NULL);
+        CREATE TABLE member_tokens (
+          id TEXT PRIMARY KEY,
+          member_id TEXT NOT NULL,
+          agent_id TEXT NOT NULL,
+          tenant TEXT NOT NULL,
+          revoked_at TEXT
+        );
+        CREATE TABLE capabilities (
+          id TEXT PRIMARY KEY,
+          member_id TEXT NOT NULL,
+          scope_type TEXT NOT NULL,
+          scope_id TEXT,
+          capability TEXT NOT NULL
+        );
+        CREATE TABLE channel_capability_grants (
+          id TEXT PRIMARY KEY,
+          member_id TEXT NOT NULL,
+          squad_id TEXT NOT NULL,
+          capability TEXT NOT NULL
+        );
+        CREATE TABLE tasks (
+          id TEXT PRIMARY KEY,
+          squad_id TEXT NOT NULL,
+          title TEXT NOT NULL,
+          body TEXT NOT NULL,
+          done_when TEXT NOT NULL,
+          status TEXT NOT NULL,
+          assignee_agent_id TEXT,
+          github_issue_url TEXT,
+          result TEXT,
+          completed_at TEXT,
+          gate_owner TEXT,
+          cost_micro_usd INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        INSERT INTO squads (id, department_id, charter)
+        VALUES ('squad-wf-home', 'department-home', 'Home charter.');
+        INSERT INTO squads (id, department_id, charter)
+        VALUES ('squad-wf-target', 'department-target', 'Target charter.');
+        INSERT INTO agents (id, squad_id, status)
+        VALUES ('agent-wf-cross', 'squad-wf-home', 'active');
+        INSERT INTO members (id, tenant, status)
+        VALUES ('member-wf-cross', 'test', 'active');
+        INSERT INTO member_tokens (id, member_id, agent_id, tenant, revoked_at)
+        VALUES ('token-wf-cross', 'member-wf-cross', 'agent-wf-cross', 'test', NULL);
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('grant-wf-cross', 'member-wf-cross', 'squad', 'squad-wf-target', 'member');
+        INSERT INTO tasks (
+          id, squad_id, title, body, done_when, status, assignee_agent_id,
+          github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+        ) VALUES (
+          'task-wf-cross', 'squad-wf-target', 'Revoked workflow task', '',
+          'The task remains unchanged.', 'open', 'agent-wf-cross',
+          NULL, NULL, NULL, NULL, '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z'
+        );
+      `)
+
+      const before = harness.sqlite.prepare('SELECT * FROM tasks WHERE id = ?').get('task-wf-cross')
+      harness.sqlite.prepare('DELETE FROM capabilities WHERE id = ?').run('grant-wf-cross')
+
+      const aiRun = vi.fn()
+      const busSend = vi.fn()
+      const vectorInsert = vi.fn()
+      const env = {
+        ...makeMinimalEnv(),
+        DB: harness.db,
+        AI: { run: aiRun },
+        BUS: { send: busSend },
+        VEC: { insert: vectorInsert },
+      } as unknown as Env
+      const crossAgent: Agent = {
+        ...AGENT,
+        id: 'agent-wf-cross',
+        squad_id: 'squad-wf-home',
+      }
+      const params: TaskPipelineParams = {
+        taskId: 'task-wf-cross',
+        squadId: 'squad-wf-target',
+        agentId: crossAgent.id,
+      }
+      const receipts: ReceiptRow[] = []
+      const deps: PipelineDeps = {
+        loadAgent: vi.fn(async () => crossAgent),
+        writeReceipt: vi.fn(async (_env, row) => { receipts.push(row) }),
+      }
+
+      const summary = await runTaskPipeline(env, params, makeStep(), 'inst-cross-revoked', deps)
+
+      expect(summary).toMatchObject({
+        taskId: params.taskId,
+        finalStatus: null,
+        gated: false,
+        resolved: false,
+      })
+      expect(receipts).toContainEqual(expect.objectContaining({
+        stepName: 'execute',
+        status: 'ok',
+        detail: JSON.stringify({ ok: false }),
+      }))
+      expect(harness.sqlite.prepare('SELECT * FROM tasks WHERE id = ?').get(params.taskId)).toEqual(before)
+      expect(aiRun).not.toHaveBeenCalled()
+      expect(busSend).not.toHaveBeenCalled()
+      expect(vectorInsert).not.toHaveBeenCalled()
+    } finally {
+      harness.close()
+    }
   })
 })
 

@@ -71,9 +71,11 @@ avoids destructive background mutation.
 
 A capability can change between assignment validation and the task write. That race cannot confer
 authority because the shared execution engine reloads the task and rechecks the assigned agent's
-active state, exact active bound member identity, and current target-squad capability before any
-task mutation or model call. Assigned-other-agent and unassigned cross-squad execution fail closed
-as `task_not_found`. An assignment may briefly record an agent that has just lost access, which is
+active state and matching assignment before any task mutation or model call. Assigned home-squad
+execution remains token-independent. Assigned cross-squad execution additionally requires exactly
+one active bound member identity whose current grants still provide effective `member` capability
+on the task squad. Assigned-other-agent and unassigned cross-squad execution fail closed as
+`task_not_found`. An assignment may briefly record an agent that has just lost access, which is
 equivalent to revoking access after a completed assignment. No migration or multi-statement write
 transaction is required.
 
