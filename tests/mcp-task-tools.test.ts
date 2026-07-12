@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { TOOLS, invokeTool } from '../src/mcp'
-import type { AuthContext, Env, Task } from '../src/types'
+import type { AuthContext, Capability, CapabilityGrant, Env, Task } from '../src/types'
 
 const TENANT = 'test-tenant'
 const MEMBER_ID = 'member-1'
@@ -43,7 +43,12 @@ function task(overrides: Partial<Task> = {}): Task {
   }
 }
 
-function makeEnv(rows: Task[] = [task()]) {
+type CrossSquadAssignee = {
+  memberId?: string
+  capability?: Capability
+}
+
+function makeEnv(rows: Task[] = [task()], crossSquadAssignee: CrossSquadAssignee = {}) {
   const updates: { sql: string; args: unknown[] }[] = []
   const events: unknown[] = []
   const agents = new Map([
@@ -55,6 +60,20 @@ function makeEnv(rows: Task[] = [task()]) {
     [OTHER_SQUAD_ID, { id: OTHER_SQUAD_ID, department_id: 'dept-2', slug: 'squad-two', name: 'Squad Two', charter: null, created_at: 'now' }],
   ])
   const tasks = new Map(rows.map((r) => [r.id, r]))
+  const assigneeMemberId = crossSquadAssignee.memberId
+  const agentMembers = new Map<string, string[]>(
+    assigneeMemberId ? [['agent-other', [assigneeMemberId]]] : [],
+  )
+  const grants = new Map<string, CapabilityGrant[]>(
+    assigneeMemberId && crossSquadAssignee.capability
+      ? [[assigneeMemberId, [{
+        member_id: assigneeMemberId,
+        scope_type: 'squad',
+        scope_id: SQUAD_ID,
+        capability: crossSquadAssignee.capability,
+      }]]]
+      : [],
+  )
 
   const env = {
     TENANT_SLUG: TENANT,
@@ -78,6 +97,14 @@ function makeEnv(rows: Task[] = [task()]) {
                 return null
               },
               async all() {
+                if (sql.includes('SELECT DISTINCT t.member_id')) {
+                  return {
+                    results: (agentMembers.get(args[1] as string) ?? []).map((member_id) => ({ member_id })),
+                  }
+                }
+                if (sql.includes('FROM capabilities') && sql.includes('UNION ALL')) {
+                  return { results: grants.get(args[0] as string) ?? [] }
+                }
                 if (sql.includes('FROM tasks')) {
                   const squadId = args[0] as string
                   let result = rows.filter((r) => r.squad_id === squadId)
@@ -108,6 +135,36 @@ describe('MCP task cutover tools', () => {
   it('advertises task_list, task_board, and task_update on the MCP surface', () => {
     const names = TOOLS.map((t) => t.name)
     expect(names).toEqual(expect.arrayContaining(['task_create', 'task_list', 'task_board', 'task_update']))
+  })
+
+  it('advertises an optional task_create assignee', () => {
+    const taskCreate = TOOLS.find((tool) => tool.name === 'task_create')
+
+    expect(taskCreate?.inputSchema.properties).toMatchObject({
+      assignee_agent_id: { type: 'string' },
+    })
+  })
+
+  it('task_create passes a shared-policy-resolved assignee to createTask', async () => {
+    const { env, updates } = makeEnv([], { memberId: 'member-other', capability: 'member' })
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_create',
+      {
+        squad_id: SQUAD_ID,
+        title: 'Assign the shared-policy task',
+        done_when: 'MCP task tests pass',
+        assignee_agent_id: 'agent-other',
+      },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(true)
+    expect((res.result as { task: Task }).task.assignee_agent_id).toBe('agent-other')
+    expect(updates[0].sql).toContain('INSERT INTO tasks')
+    expect(updates[0].args[6]).toBe('agent-other')
   })
 
   it('task_list defaults an agent-bound token to its own squad and filters status', async () => {
@@ -178,6 +235,48 @@ describe('MCP task cutover tools', () => {
         actor: { kind: 'member', id: MEMBER_ID },
       }),
     ])
+  })
+
+  it('task_update accepts a cross-squad assignee with one active bound member and a target-squad member grant', async () => {
+    const { env } = makeEnv([task()], { memberId: 'member-other', capability: 'member' })
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: 'agent-other' },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: true, result: { task: { assignee_agent_id: 'agent-other' } } })
+  })
+
+  it('task_update fails closed for a cross-squad assignee without an active bound member', async () => {
+    const { env } = makeEnv()
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: 'agent-other' },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 400, error: 'assignee_not_in_squad' })
+  })
+
+  it('task_update fails closed for observer-only cross-squad authority', async () => {
+    const { env } = makeEnv([task()], { memberId: 'member-other', capability: 'observer' })
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: 'agent-other' },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 400, error: 'assignee_not_in_squad' })
   })
 
   it('task_update refuses cross-squad tasks even when the caller has a member grant elsewhere', async () => {

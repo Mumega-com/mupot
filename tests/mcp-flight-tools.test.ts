@@ -684,7 +684,7 @@ describe('MCP flight tools', () => {
 })
 
 describe('MCP granted multi-squad flight lifecycle', () => {
-  it('re-authenticates the same Product bearer through dispatch, read, task completion, and landing', async () => {
+  it('re-authenticates the same Product bearer through assignment, dispatch, read, task completion, and landing', async () => {
     const harness = createSqliteD1()
     const events: unknown[] = []
     try {
@@ -763,7 +763,7 @@ describe('MCP granted multi-squad flight lifecycle', () => {
            result, completed_at, gate_owner, created_at, updated_at)
         VALUES
           ('task-m000', '${OTHER_SQUAD_ID}', 'Cross-squad census', '', 'the census hash verifies',
-           'in_progress', '${AGENT_ID}', NULL, NULL, NULL, NULL,
+           'in_progress', NULL, NULL, NULL, NULL, NULL,
            '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z');
       `)
       const env = {
@@ -788,6 +788,15 @@ describe('MCP granted multi-squad flight lifecycle', () => {
       }, 'https://pot.example')
       expect(granted).toMatchObject({ ok: true, result: { result: 'created' } })
 
+      const assigned = await authenticatedTool(env, 'task_update', {
+        task_id: 'task-m000',
+        assignee_agent_id: AGENT_ID,
+      })
+      expect(assigned).toMatchObject({
+        ok: true,
+        result: { task: { assignee_agent_id: AGENT_ID } },
+      })
+
       const lifecycleMeta = { ...meta, squad_ids: [SQUAD_ID, OTHER_SQUAD_ID] }
       const dispatched = await authenticatedTool(env, 'flight_dispatch', {
         ...dispatchArgs,
@@ -804,7 +813,10 @@ describe('MCP granted multi-squad flight lifecycle', () => {
         status: 'done',
       })
       expect(completed).toMatchObject({ ok: true, result: { task: { id: 'task-m000', status: 'done' } } })
-      expect(harness.sqlite.prepare("SELECT status FROM tasks WHERE id = 'task-m000'").get()).toEqual({ status: 'done' })
+      expect(harness.sqlite.prepare("SELECT assignee_agent_id, status FROM tasks WHERE id = 'task-m000'").get()).toEqual({
+        assignee_agent_id: AGENT_ID,
+        status: 'done',
+      })
 
       const landed = await authenticatedTool(env, 'flight_land', {
         flight_id: flightId,

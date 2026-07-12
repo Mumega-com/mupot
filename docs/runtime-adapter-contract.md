@@ -394,16 +394,21 @@ service instead of writing rows directly.
 
 MCP tools:
 
-- `task_create { squad_id, title, done_when, body? }`
+- `task_create { squad_id, title, done_when, body?, assignee_agent_id? }`
 - `task_list { squad_id?, status?, assignee_agent_id?, limit? }`
 - `task_board { squad_id?, limit? }`
 - `task_update { task_id, title?, body?, done_when?, status?, assignee_agent_id?, gate_owner? }`
 
 Agent-bound tokens may omit `squad_id` for `task_list` and `task_board`; Mupot
 derives the caller's squad from the token's `auth.boundAgentId`. All task tools
-remain gated by `member` capability on the target squad. `task_update` uses the
-same transition, `done_when`, same-squad assignment, and verdict-bypass guards as
-the HTTP task route.
+remain gated by `member` capability on the target squad. Both `task_create` and
+`task_update` use capability-aware assignment: an active agent may be assigned in
+its home squad, or in another squad when its one active bound member identity
+currently holds effective `member` capability on the task squad through normal
+inheritance. Assignment records responsibility only; it never grants authority.
+Every authenticated action reloads current capabilities, so an assignment does
+not let a runtime bypass a later grant revocation. `task_update` also uses the
+same transition, `done_when`, and verdict-bypass guards as the HTTP task route.
 
 Statuses:
 

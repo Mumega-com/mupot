@@ -49,6 +49,7 @@ import {
   stampTaskUpdate,
 } from '../tasks/service'
 import type { TaskStatus } from '../tasks/service'
+import { resolveTaskAssignee } from '../tasks/assignee'
 import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
 import { classify, humanAge } from '../dashboard/fleet'
@@ -442,15 +443,6 @@ async function resolveScopedSquad(
   return { ok: true, squad }
 }
 
-async function resolveTaskAssignee(env: Env, raw: unknown, squadId: string): Promise<{ value: string | null; error?: string }> {
-  if (raw === undefined || raw === null) return { value: null }
-  if (typeof raw !== 'string' || raw.length === 0) return { value: null, error: 'invalid_assignee' }
-  const agent = await loadAgent(env, raw)
-  if (!agent) return { value: null, error: 'invalid_assignee' }
-  if (agent.squad_id !== squadId) return { value: null, error: 'assignee_not_in_squad' }
-  return { value: agent.id }
-}
-
 // task_create — create a task on a squad. cap: member+ on the TARGET squad.
 // #142 capsule keystone: done_when is required — a non-empty verifiable success
 // predicate (e.g. "test X passes", "GET /health returns 200").
@@ -458,7 +450,7 @@ const toolTaskCreate: ToolSpec = {
   name: 'task_create',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, title: string, done_when: string, body?: string }',
+  args: '{ squad_id: string, title: string, done_when: string, body?: string, assignee_agent_id?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -466,6 +458,7 @@ const toolTaskCreate: ToolSpec = {
       title: STRING_SCHEMA,
       done_when: { ...STRING_SCHEMA, description: 'Verifiable success predicate — a checkable condition that proves the task is complete.' },
       body: STRING_SCHEMA,
+      assignee_agent_id: STRING_SCHEMA,
     },
     required: ['squad_id', 'title', 'done_when'],
     additionalProperties: false,
@@ -496,6 +489,9 @@ const toolTaskCreate: ToolSpec = {
           : null
     if (body === null) return fail(400, 'invalid_args', 'body must be a string')
 
+    const assignee = await resolveTaskAssignee(env, args.assignee_agent_id, squad.id)
+    if (assignee.error) return fail(400, assignee.error)
+
     const task = await createTask(
       env,
       {
@@ -503,6 +499,7 @@ const toolTaskCreate: ToolSpec = {
         title: title.trim(),
         done_when: doneWhen,
         body,
+        assignee_agent_id: assignee.value,
       },
       { actor: memberActor(auth.memberId as string) },
     )
