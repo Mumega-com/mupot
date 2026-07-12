@@ -802,7 +802,7 @@ const toolFlightDispatch: ToolSpec = {
     }
 
     const squad = await loadSquad(env, squadId)
-    if (!squad) return fail(404, 'squad_not_found')
+    if (!squad) return fail(403, 'forbidden')
     const grants = auth.capabilities ?? []
 
     const meta = parseFlightMetaV1(parseJsonArg(args.meta_json))
@@ -899,7 +899,7 @@ const toolFlightList: ToolSpec = {
     const squadId = str(args.squad_id)
     if (!squadId) return fail(400, 'invalid_args')
     const squad = await loadSquad(env, squadId)
-    if (!squad) return fail(404, 'squad_not_found')
+    if (!squad) return fail(403, 'forbidden')
     const grants = auth.capabilities ?? []
     if (!(await memberCanOnSquad(env, grants, squad.id, 'observer'))) {
       return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })

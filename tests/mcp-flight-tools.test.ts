@@ -245,6 +245,27 @@ describe('MCP flight tools', () => {
     expect(crossSquadTask).toMatchObject({ ok: false, status: 404, error: 'flight_task_not_found' })
   })
 
+  it('does not distinguish missing primary squads from unauthorized squads', async () => {
+    const { env } = makeEnv()
+    const existingDispatch = await invokeTool(auth(), env, 'flight_dispatch', {
+      ...dispatchArgs,
+      squad_id: OTHER_SQUAD_ID,
+      meta_json: JSON.stringify({ ...meta, squad_ids: [SQUAD_ID, OTHER_SQUAD_ID] }),
+    }, 'https://pot.example')
+    const missingDispatch = await invokeTool(auth(), env, 'flight_dispatch', {
+      ...dispatchArgs,
+      squad_id: 'squad-missing',
+      meta_json: JSON.stringify({ ...meta, squad_ids: [SQUAD_ID, 'squad-missing'] }),
+    }, 'https://pot.example')
+    expect(existingDispatch).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+    expect(missingDispatch).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+
+    const existingList = await invokeTool(auth(), env, 'flight_list', { squad_id: OTHER_SQUAD_ID }, 'https://pot.example')
+    const missingList = await invokeTool(auth(), env, 'flight_list', { squad_id: 'squad-missing' }, 'https://pot.example')
+    expect(existingList).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+    expect(missingList).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+  })
+
   it('returns a visible flight with parsed metadata', async () => {
     const { env } = makeEnv()
     const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
