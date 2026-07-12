@@ -55,6 +55,31 @@ describe('bus queue consumer', () => {
     expect(item.ack).not.toHaveBeenCalled()
   })
 
+  it('marks a task dispatch receipt consumed after the assigned AgentDO accepts the wake', async () => {
+    const run = vi.fn(async () => ({ meta: { changes: 1 } }))
+    const env = {
+      AGENT: {
+        idFromName: vi.fn(() => 'agent-do-id'),
+        get: vi.fn(() => ({ fetch: vi.fn(async () => new Response(null, { status: 200 })) })),
+      },
+      DB: { prepare: vi.fn(() => ({ bind: vi.fn(() => ({ run })) })) },
+    } as unknown as Env
+    const item = message({
+      type: 'agent.wake',
+      tenant: 'test',
+      agent_id: 'agent-1',
+      actor: { kind: 'member', id: 'member-1' },
+      payload: { task_id: 'task-1', dispatch_receipt_id: 'receipt-1' },
+      ts: '2026-07-10T00:00:00.000Z',
+    })
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
+
+    expect(run).toHaveBeenCalledOnce()
+    expect(item.ack).toHaveBeenCalledOnce()
+    expect(item.retry).not.toHaveBeenCalled()
+  })
+
   it('deduplicates concurrent terminal flight events by durable outbox id', async () => {
     let consumed = false
     const run = vi.fn(async () => {

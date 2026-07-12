@@ -425,7 +425,15 @@ the task squad before emitting the canonical `agent.wake` event with
 `payload.task_id`; the execution engine checks the same authority again when the
 wake is consumed. Only `open` and `in_progress` tasks are dispatchable.
 Unassigned, terminal, inactive, or no-longer-authorized assignments fail closed
-without emitting a wake event.
+without emitting a wake event. Missing and caller-inaccessible task ids both
+return `task_not_found`.
+
+Each accepted dispatch inserts an append-only `task_dispatch_receipts` row before
+queue emission and returns its id, member dispatcher, and dispatch timestamp.
+The wake event carries `dispatch_receipt_id`; the Queue consumer stamps
+`consumed_at` only after the assigned AgentDO accepts the task-scoped wake.
+Emission failure leaves the receipt with an attempt count and bounded error for
+operator diagnosis.
 
 Statuses:
 

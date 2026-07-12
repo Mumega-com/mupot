@@ -370,8 +370,14 @@ describe('MCP task cutover tools', () => {
         task_id: 'task-1',
         agent_id: AGENT_ID,
         squad_id: SQUAD_ID,
+        receipt: {
+          id: expect.any(String),
+          dispatched_by: { kind: 'member', id: MEMBER_ID },
+          dispatched_at: expect.any(String),
+        },
       },
     })
+    const result = res.result as { receipt: { id: string } }
     expect(events).toEqual([
       expect.objectContaining({
         type: 'agent.wake',
@@ -379,7 +385,11 @@ describe('MCP task cutover tools', () => {
         squad_id: SQUAD_ID,
         agent_id: AGENT_ID,
         actor: { kind: 'member', id: MEMBER_ID },
-        payload: { task_id: 'task-1', by: MEMBER_ID },
+        payload: {
+          task_id: 'task-1',
+          by: MEMBER_ID,
+          dispatch_receipt_id: result.receipt.id,
+        },
       }),
     ])
   })
@@ -400,7 +410,7 @@ describe('MCP task cutover tools', () => {
 
     const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
 
-    expect(res).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+    expect(res).toMatchObject({ ok: false, status: 404, error: 'task_not_found' })
     expect(events).toEqual([])
   })
 

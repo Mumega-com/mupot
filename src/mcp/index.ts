@@ -754,7 +754,7 @@ const toolTaskDispatch: ToolSpec = {
 
     const grants = auth.capabilities ?? []
     if (!(await memberCanOnSquad(env, grants, task.squad_id, 'member'))) {
-      return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
+      return fail(404, 'task_not_found')
     }
     if (task.status !== 'open' && task.status !== 'in_progress') {
       return fail(409, 'task_not_runnable')
@@ -767,22 +767,58 @@ const toolTaskDispatch: ToolSpec = {
     }
 
     const memberId = auth.memberId as string
-    const event: BusEvent<{ task_id: string; by: string }> = {
+    const receiptId = crypto.randomUUID()
+    const dispatchedAt = new Date().toISOString()
+    await env.DB.prepare(
+      `INSERT INTO task_dispatch_receipts
+         (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at)
+       VALUES (?, ?, ?, ?, ?, 'member', ?, ?)`,
+    ).bind(
+      receiptId,
+      env.TENANT_SLUG,
+      task.id,
+      task.squad_id,
+      task.assignee_agent_id,
+      memberId,
+      dispatchedAt,
+    ).run()
+
+    const event: BusEvent<{ task_id: string; by: string; dispatch_receipt_id: string }> = {
       type: 'agent.wake',
       tenant: env.TENANT_SLUG,
       squad_id: task.squad_id,
       agent_id: task.assignee_agent_id,
       actor: memberActor(memberId),
-      payload: { task_id: task.id, by: memberId },
-      ts: new Date().toISOString(),
+      payload: { task_id: task.id, by: memberId, dispatch_receipt_id: receiptId },
+      ts: dispatchedAt,
     }
-    await createBus(env).emit(event)
+    try {
+      await createBus(env).emit(event)
+      await env.DB.prepare(
+        `UPDATE task_dispatch_receipts
+            SET emitted_at = ?, attempts = attempts + 1
+          WHERE tenant = ? AND id = ?`,
+      ).bind(new Date().toISOString(), env.TENANT_SLUG, receiptId).run()
+    } catch (error) {
+      const message = error instanceof Error ? error.message.slice(0, 500) : 'dispatch_failed'
+      await env.DB.prepare(
+        `UPDATE task_dispatch_receipts
+            SET attempts = attempts + 1, last_error = ?
+          WHERE tenant = ? AND id = ?`,
+      ).bind(message, env.TENANT_SLUG, receiptId).run()
+      return fail(500, 'dispatch_failed', { receipt_id: receiptId })
+    }
 
     return done({
       dispatched: true,
       task_id: task.id,
       agent_id: task.assignee_agent_id,
       squad_id: task.squad_id,
+      receipt: {
+        id: receiptId,
+        dispatched_by: memberActor(memberId),
+        dispatched_at: dispatchedAt,
+      },
     })
   },
 }

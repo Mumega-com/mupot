@@ -40,8 +40,9 @@ function makeTask(over: Partial<Task> = {}): Task {
 // A hand-mocked DB: returns a seeded task for the scoped SELECT, a seeded charter
 // for the squad SELECT, and records every UPDATE so the test can assert the row
 // transitions (in_progress → done|blocked) and never gets stuck.
-function makeEnv(opts: { task: Task | null; charter?: string | null }) {
+function makeEnv(opts: { task: Task | null; charter?: string | null; updateChanges?: number[] }) {
   const updates: { sql: string; args: unknown[] }[] = []
+  const updateChanges = [...(opts.updateChanges ?? [])]
   const env = {
     TENANT_SLUG: 'test-tenant',
     DB: {
@@ -51,11 +52,18 @@ function makeEnv(opts: { task: Task | null; charter?: string | null }) {
             return {
               async first<T>() {
                 if (sql.includes('FROM tasks')) return (opts.task as unknown as T) ?? null
+                if (sql.includes('FROM agents')) return (AGENT as unknown as T)
+                if (sql.includes('SELECT department_id FROM squads')) {
+                  return ({ department_id: 'dept-1' } as unknown as T)
+                }
                 if (sql.includes('FROM squads')) return ({ charter: opts.charter ?? null } as unknown as T)
                 return null as unknown as T
               },
               async run() {
-                if (sql.includes('UPDATE tasks')) updates.push({ sql, args })
+                if (sql.includes('UPDATE tasks')) {
+                  updates.push({ sql, args })
+                  return { meta: { changes: updateChanges.shift() ?? 1 } }
+                }
                 return { meta: { changes: 1 } }
               },
             }
@@ -253,6 +261,44 @@ describe('runTaskExecution — fail-closed scope (RBAC boundary)', () => {
     expect(recordTokens).not.toHaveBeenCalled()
     expect(remember).not.toHaveBeenCalled()
     expect(emit).not.toHaveBeenCalled()
+  })
+
+  it('does not execute when assignment or status changes before the atomic claim', async () => {
+    const { env, updates } = makeEnv({
+      task: makeTask({ assignee_agent_id: AGENT.id }),
+      updateChanges: [0],
+    })
+    const model = okModel('must not run')
+    const emit = vi.fn()
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', {
+      model,
+      emit,
+      remember: async () => 'x',
+    })
+
+    expect(r).toMatchObject({ ok: false, error: 'task_claim_lost' })
+    expect(model.chat).not.toHaveBeenCalled()
+    expect(emit).not.toHaveBeenCalled()
+    expect(updates).toHaveLength(1)
+  })
+
+  it('does not overwrite a task reassigned while the model was running', async () => {
+    const { env, updates } = makeEnv({
+      task: makeTask({ assignee_agent_id: AGENT.id }),
+      updateChanges: [1, 0],
+    })
+    const model = okModel('stale result')
+    const emit = vi.fn()
+    const remember = vi.fn()
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', { model, emit, remember })
+
+    expect(r).toMatchObject({ ok: false, error: 'task_claim_lost' })
+    expect(model.chat).toHaveBeenCalledOnce()
+    expect(emit).not.toHaveBeenCalled()
+    expect(remember).not.toHaveBeenCalled()
+    expect(updates).toHaveLength(2)
   })
 })
 

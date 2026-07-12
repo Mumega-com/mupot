@@ -79,7 +79,7 @@ export async function runTaskExecution(
 
   // Load within this tenant DB, then fail closed on assignment and current
   // authority. The coarse response intentionally does not reveal which check failed.
-  const task = await loadTaskById(env, taskId)
+  let task = await loadTaskById(env, taskId)
   if (!task || !(await canAgentExecuteTask(env, agent, task))) {
     return { ok: false, task_id: taskId, decided: `task ${taskId} not found`, error: 'task_not_found' }
   }
@@ -101,8 +101,15 @@ export async function runTaskExecution(
 
   // Claim + mark working before spending the model budget.
   const startedAt = new Date().toISOString()
-  const assignee = task.assignee_agent_id ?? agent.id
-  await setTaskProgress(env, task.id, assignee, startedAt)
+  const claimed = await claimTaskProgress(env, task, agent, startedAt)
+  if (!claimed) {
+    return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+  }
+  const claimedTask = await loadTaskById(env, task.id)
+  if (!claimedTask || !(await canAgentExecuteTask(env, agent, claimedTask))) {
+    return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+  }
+  task = claimedTask
 
   // ── Rate-limit check (issue #4): enforce per-agent daily dispatch + token caps ──
   // Runs AFTER claiming the task (so status is never left as stale 'open') but
@@ -128,7 +135,9 @@ export async function runTaskExecution(
       `Retry after ${meterResult.retryAfterSec}s (next UTC day resets the window).`,
     )
     const finishedAt = new Date().toISOString()
-    await finishTask(env, task.id, 'blocked', note, finishedAt)
+    if (!(await finishTask(env, task.id, agent.id, 'blocked', note, finishedAt))) {
+      return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+    }
     await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
     return {
       ok: false,
@@ -175,7 +184,9 @@ export async function runTaskExecution(
           `done_when_placeholder: cannot mark done — done_when is a placeholder sentinel ("${String(task.done_when).trim()}"). ` +
           'Update done_when to a real, checkable predicate before retrying.',
         )
-        await finishTask(env, task.id, 'blocked', note, finishedAt, cycleCostMicroUsd)
+        if (!(await finishTask(env, task.id, agent.id, 'blocked', note, finishedAt, cycleCostMicroUsd))) {
+          return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+        }
         await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
         return {
           ok: false,
@@ -186,7 +197,10 @@ export async function runTaskExecution(
         }
       }
     }
-    await finishTask(env, task.id, successStatus, result, finishedAt, cycleCostMicroUsd)
+    if (!(await finishTask(env, task.id, agent.id, successStatus, result, finishedAt, cycleCostMicroUsd))) {
+      await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd)
+      return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+    }
     // Emit task.completed for ungated (terminal); task.review for gated (awaiting verdict).
     const eventType = successStatus === 'done' ? 'task.completed' : 'task.review'
     await emitSafe(emit, executionEvent(eventType, env, agent, task, successStatus))
@@ -202,7 +216,10 @@ export async function runTaskExecution(
     const note = capResult(`Execution failed: ${msg}`)
     const finishedAt = new Date().toISOString()
     // NEVER leave in_progress stuck — land it in blocked with the error note.
-    await finishTask(env, task.id, 'blocked', note, finishedAt, cycleCostMicroUsd)
+    if (!(await finishTask(env, task.id, agent.id, 'blocked', note, finishedAt, cycleCostMicroUsd))) {
+      await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd)
+      return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+    }
     await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
     // Still count tokens + cost on model failure: the call was attempted.
     await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd)
@@ -242,17 +259,27 @@ async function loadSquadCharter(env: Env, squadId: string): Promise<string | nul
   return row?.charter ?? null
 }
 
-async function setTaskProgress(env: Env, taskId: string, assignee: string, updatedAt: string): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE tasks SET status = 'in_progress', assignee_agent_id = ?, updated_at = ? WHERE id = ?`,
-  )
-    .bind(assignee, updatedAt, taskId)
-    .run()
+async function claimTaskProgress(env: Env, task: Task, agent: Agent, updatedAt: string): Promise<boolean> {
+  const result = task.assignee_agent_id === null
+    ? await env.DB.prepare(
+      `UPDATE tasks
+          SET status = 'in_progress', assignee_agent_id = ?, updated_at = ?
+        WHERE id = ? AND squad_id = ? AND status = ? AND assignee_agent_id IS NULL
+          AND EXISTS (SELECT 1 FROM agents WHERE id = ? AND status = 'active')`,
+    ).bind(agent.id, updatedAt, task.id, agent.squad_id, task.status, agent.id).run()
+    : await env.DB.prepare(
+      `UPDATE tasks
+          SET status = 'in_progress', updated_at = ?
+        WHERE id = ? AND squad_id = ? AND status = ? AND assignee_agent_id = ?
+          AND EXISTS (SELECT 1 FROM agents WHERE id = ? AND status = 'active')`,
+    ).bind(updatedAt, task.id, task.squad_id, task.status, agent.id, agent.id).run()
+  return result.meta?.changes === 1
 }
 
 async function finishTask(
   env: Env,
   taskId: string,
+  agentId: string,
   // K1: 'review' is a valid success-landing for gated tasks (awaits verdict).
   status: 'done' | 'blocked' | 'review',
   result: string,
@@ -260,12 +287,15 @@ async function finishTask(
   // #15: cost of the cycle in micro-USD, stamped on the task for the per-task
   // cost chip. Defaults to 0 so non-execute callers stay unchanged.
   costMicroUsd = 0,
-): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE tasks SET status = ?, result = ?, completed_at = ?, updated_at = ?, cost_micro_usd = ? WHERE id = ?`,
+): Promise<boolean> {
+  const dbResult = await env.DB.prepare(
+    `UPDATE tasks
+        SET status = ?, result = ?, completed_at = ?, updated_at = ?, cost_micro_usd = ?
+      WHERE id = ? AND assignee_agent_id = ? AND status = 'in_progress'`,
   )
-    .bind(status, result, completedAt, completedAt, Math.max(0, Math.round(costMicroUsd)), taskId)
+    .bind(status, result, completedAt, completedAt, Math.max(0, Math.round(costMicroUsd)), taskId, agentId)
     .run()
+  return dbResult.meta?.changes === 1
 }
 
 // ── prompts ────────────────────────────────────────────────────────────────────

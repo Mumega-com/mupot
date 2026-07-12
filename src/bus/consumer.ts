@@ -34,6 +34,23 @@ async function wakeAgent(env: Env, agentId: string, event: BusEvent): Promise<vo
   }
 }
 
+async function consumeTaskDispatchReceipt(env: Env, event: BusEvent): Promise<void> {
+  const payload = event.payload as { task_id?: unknown; dispatch_receipt_id?: unknown }
+  if (typeof payload?.dispatch_receipt_id !== 'string' || typeof payload.task_id !== 'string') return
+  const result = await env.DB.prepare(
+    `UPDATE task_dispatch_receipts
+        SET consumed_at = ?
+      WHERE tenant = ? AND id = ? AND task_id = ? AND agent_id = ? AND consumed_at IS NULL`,
+  ).bind(
+    new Date().toISOString(),
+    event.tenant,
+    payload.dispatch_receipt_id,
+    payload.task_id,
+    event.agent_id,
+  ).run()
+  if (result.meta?.changes !== 1) throw new Error('task dispatch receipt consume failed')
+}
+
 async function dispatchSquad(env: Env, squadId: string, event: BusEvent): Promise<void> {
   const id = env.SQUAD.idFromName(squadId)
   const stub = env.SQUAD.get(id)
@@ -67,6 +84,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         return true
       }
       await wakeAgent(env, event.agent_id, event)
+      await consumeTaskDispatchReceipt(env, event)
       return true
     }
     case 'squad.dispatch': {
