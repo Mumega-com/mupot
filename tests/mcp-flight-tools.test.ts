@@ -54,6 +54,7 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
   const rows = new Map<string, FlightRow>()
   const tasks = new Map([
     ['task-m000', { id: 'task-m000', squad_id: SQUAD_ID }],
+    ['task-other', { id: 'task-other', squad_id: OTHER_SQUAD_ID }],
   ])
   const squads = new Map([
     [SQUAD_ID, { id: SQUAD_ID, department_id: 'dept-1', slug: 'mmhq', name: 'Mumega HQ', charter: null, budget_cap_cents: 100, budget_window: 'day', created_at: 'now' }],
@@ -116,6 +117,22 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
                     const task = tasks.get(id as string)
                     return task ? [task] : []
                   }) as T[] }
+                }
+                if (sql.includes('json_each')) {
+                  const [tenant, squadId, beforeAt, , beforeId, limit] = args as [string, string, number, number, string, number]
+                  const flights = [...rows.values()]
+                    .filter((row) => row.tenant === tenant)
+                    .filter((row) => {
+                      try {
+                        return (JSON.parse(row.meta) as { squad_ids?: string[] }).squad_ids?.includes(squadId) ?? false
+                      } catch {
+                        return false
+                      }
+                    })
+                    .filter((row) => row.created_at < beforeAt || (row.created_at === beforeAt && row.id < beforeId))
+                    .sort((a, b) => b.created_at - a.created_at || b.id.localeCompare(a.id))
+                    .slice(0, limit)
+                  return { results: flights as T[] }
                 }
                 return { results: [...rows.values()] as T[] }
               },
@@ -213,6 +230,21 @@ describe('MCP flight tools', () => {
     expect(out.error).toBe('flight_task_not_found')
   })
 
+  it('does not reveal a missing squad or a task outside declared squads', async () => {
+    const { env } = makeEnv()
+    const missingSquad = await invokeTool(auth(), env, 'flight_dispatch', {
+      ...dispatchArgs,
+      meta_json: JSON.stringify({ ...meta, squad_ids: [SQUAD_ID, 'squad-missing'] }),
+    }, 'https://pot.example')
+    expect(missingSquad).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+
+    const crossSquadTask = await invokeTool(auth(), env, 'flight_dispatch', {
+      ...dispatchArgs,
+      meta_json: JSON.stringify({ ...meta, task_ids: ['task-other'] }),
+    }, 'https://pot.example')
+    expect(crossSquadTask).toMatchObject({ ok: false, status: 404, error: 'flight_task_not_found' })
+  })
+
   it('returns a visible flight with parsed metadata', async () => {
     const { env } = makeEnv()
     const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
@@ -257,5 +289,26 @@ describe('MCP flight tools', () => {
     const absent = await invokeTool(auth(), env, 'flight_get', { flight_id: 'absent-flight' }, 'https://pot.example')
     expect(legacy).toMatchObject({ ok: false, status: 404, error: 'flight_not_found' })
     expect(absent).toMatchObject({ ok: false, status: 404, error: 'flight_not_found' })
+  })
+
+  it('paginates past newer flights hidden by multi-squad visibility', async () => {
+    const { env, rows } = makeEnv()
+    const makeRow = (id: string, createdAt: number, rowMeta: unknown): FlightRow => ({
+      id, tenant: TENANT, agent: AGENT_ID, goal: id, status: 'running', trigger_source: 'api',
+      gate_verdict: 'go', gate_reason: '', score: 1, budget_micro_usd: 0, cost_micro_usd: 0,
+      next_run_at: null, created_at: createdAt, started_at: createdAt, ended_at: null,
+      meta: JSON.stringify(rowMeta),
+    })
+    rows.set('visible-old', makeRow('visible-old', 1, meta))
+    for (let index = 0; index < 501; index += 1) {
+      rows.set(`hidden-${index}`, makeRow(`hidden-${index}`, index + 2, {
+        ...meta,
+        squad_ids: [SQUAD_ID, OTHER_SQUAD_ID],
+      }))
+    }
+
+    const out = await invokeTool(auth(), env, 'flight_list', { squad_id: SQUAD_ID, limit: 1 }, 'https://pot.example')
+    expect(out.ok).toBe(true)
+    expect((out.result as { flights: FlightRow[] }).flights.map((flight) => flight.id)).toEqual(['visible-old'])
   })
 })

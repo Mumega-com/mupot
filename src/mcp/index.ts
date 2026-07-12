@@ -734,10 +734,35 @@ function parseJsonArg(value: unknown): unknown | null {
   }
 }
 
-async function memberCanReadFlight(env: Env, auth: AuthContext, meta: FlightMetaV1): Promise<boolean> {
+function parseFlightCursor(value: unknown): { createdAt: number; id: string } | null | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string' || value.length > 256) return null
+  const separator = value.indexOf(':')
+  if (separator <= 0) return null
+  const createdAt = Number(value.slice(0, separator))
+  const id = value.slice(separator + 1)
+  if (!Number.isSafeInteger(createdAt) || createdAt < 0 || id.length === 0) return null
+  return { createdAt, id }
+}
+
+function flightCursor(flight: FlightRow): string {
+  return `${flight.created_at}:${flight.id}`
+}
+
+async function memberCanReadFlight(
+  env: Env,
+  auth: AuthContext,
+  meta: FlightMetaV1,
+  squadCache: Map<string, Squad | null> = new Map(),
+): Promise<boolean> {
   const grants = auth.capabilities ?? []
   for (const squadId of meta.squad_ids) {
-    if (!(await memberCanOnSquad(env, grants, squadId, 'observer'))) return false
+    let squad = squadCache.get(squadId)
+    if (squad === undefined) {
+      squad = await loadSquad(env, squadId)
+      squadCache.set(squadId, squad)
+    }
+    if (!squad || !hasCapability(grants, 'squad', squad.id, 'observer', squad.department_id)) return false
   }
   return true
 }
@@ -783,11 +808,8 @@ const toolFlightDispatch: ToolSpec = {
     const meta = parseFlightMetaV1(parseJsonArg(args.meta_json))
     if (!meta || !meta.squad_ids.includes(squad.id)) return fail(400, 'invalid_flight_meta')
     if (!meta.squad_ids.includes(boundAgent.squad_id)) return fail(400, 'agent_squad_not_in_flight')
-    const references = await validateFlightMetaReferences(env, meta)
-    if (!references.ok) {
-      return fail(references.error.endsWith('_not_found') ? 404 : 400, references.error, references.ref)
-    }
     const referencedSquads = await loadFlightSquads(env, meta.squad_ids)
+    if (referencedSquads.length !== meta.squad_ids.length) return fail(403, 'forbidden')
     const requiredCapability: Capability = (requestedBudget as number) > 0 ? 'lead' : 'member'
     for (const referencedSquad of referencedSquads) {
       if (!hasCapability(grants, 'squad', referencedSquad.id, requiredCapability, referencedSquad.department_id)) {
@@ -809,6 +831,13 @@ const toolFlightDispatch: ToolSpec = {
       if ((requestedBudget as number) > budgetCeilingMicroUsd) {
         return fail(409, 'flight_budget_exceeds_cap', { cap_micro_usd: budgetCeilingMicroUsd })
       }
+    }
+    const references = await validateFlightMetaReferences(env, meta)
+    if (!references.ok) {
+      const error = references.error === 'flight_task_scope_mismatch'
+        ? 'flight_task_not_found'
+        : references.error
+      return fail(error.endsWith('_not_found') ? 404 : 400, error, references.ref)
     }
     const signals = parseJsonArg(args.signals_json)
     const parsed = parseDispatchBody({
@@ -859,10 +888,10 @@ const toolFlightList: ToolSpec = {
   name: 'flight_list',
   scope: 'squad',
   min: 'observer',
-  args: '{ squad_id: string, limit?: number }',
+  args: '{ squad_id: string, limit?: number, cursor?: string }',
   inputSchema: {
     type: 'object',
-    properties: { squad_id: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA },
+    properties: { squad_id: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA, cursor: STRING_SCHEMA },
     required: ['squad_id'],
     additionalProperties: false,
   },
@@ -877,18 +906,42 @@ const toolFlightList: ToolSpec = {
     }
     const limit = readLimit(args.limit, 100, 500)
     if (typeof limit !== 'number') return limit
-    const flights = (await listFlightsForSquad(env, squad.id, 500)).flatMap((flight) => {
-      const meta = parseFlightMetaV1(parseJsonArg(flight.meta))
-      return meta?.squad_ids.includes(squad.id) ? [{ flight, meta }] : []
-    })
-    const visible = []
-    for (const candidate of flights) {
-      if (await memberCanReadFlight(env, auth, candidate.meta)) {
-        visible.push(flightWithParsedMeta(candidate.flight, candidate.meta))
-        if (visible.length >= limit) break
+    let before = parseFlightCursor(args.cursor)
+    if (before === null) return fail(400, 'invalid_flight_cursor')
+
+    const visible: Array<Omit<FlightRow, 'meta'> & { meta: FlightMetaV1 }> = []
+    const squadCache = new Map<string, Squad | null>([[squad.id, squad]])
+    const pageSize = Math.min(500, Math.max(100, limit))
+    let pages = 0
+    let lastScanned: FlightRow | null = null
+    let hasMore = false
+
+    scan: while (visible.length < limit && pages < 10) {
+      const page = await listFlightsForSquad(env, squad.id, pageSize, before)
+      pages += 1
+      if (page.length === 0) break
+      for (let index = 0; index < page.length; index += 1) {
+        const flight = page[index]
+        lastScanned = flight
+        const meta = parseFlightMetaV1(parseJsonArg(flight.meta))
+        if (meta?.squad_ids.includes(squad.id) && await memberCanReadFlight(env, auth, meta, squadCache)) {
+          visible.push(flightWithParsedMeta(flight, meta))
+        }
+        if (visible.length >= limit) {
+          hasMore = index < page.length - 1 || page.length === pageSize
+          break scan
+        }
       }
+      if (page.length < pageSize) break
+      before = { createdAt: page[page.length - 1].created_at, id: page[page.length - 1].id }
+      if (pages === 10) hasMore = true
     }
-    return done({ squad_id: squad.id, flights: visible })
+    return done({
+      squad_id: squad.id,
+      flights: visible,
+      cursor: hasMore && lastScanned ? flightCursor(lastScanned) : null,
+      has_more: hasMore,
+    })
   },
 }
 

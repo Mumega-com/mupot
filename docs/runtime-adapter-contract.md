@@ -320,7 +320,7 @@ Stateful runtimes create and inspect governed flights through MCP:
 
 - `flight_dispatch { squad_id, goal, meta_json, signals_json, budget_micro_usd? }`
 - `flight_get { flight_id }`
-- `flight_list { squad_id, limit? }`
+- `flight_list { squad_id, limit?, cursor? }`
 
 `flight_dispatch` requires `member` capability on every squad named by the strict
 `mupot.flight.meta/v1` metadata and derives the flying agent from the authenticated
@@ -342,6 +342,10 @@ projected or distinguishable from an absent row through the scoped MCP read surf
 Squad filtering happens in D1 before the result limit is applied. The existing
 org-admin HTTP connector remains available for the external coherence brain; MCP is
 the tenant teammate surface.
+
+`flight_list` scans bounded D1 pages after applying multi-squad visibility. When more
+rows remain it returns an opaque continuation `cursor` with `has_more: true`; callers
+must pass that cursor to continue rather than treating a bounded page as complete.
 
 ## Task Lifecycle
 

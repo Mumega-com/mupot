@@ -70,7 +70,9 @@ function makeEnv(tenant = 'digid'): { env: Env; rows: Map<string, FlightRow> } {
                 let out = [...rows.values()].filter((r) => r.tenant === t).sort((x, y) => y.created_at - x.created_at)
                 if (sql.includes('json_each')) {
                   const squadId = a[1] as string
-                  const limit = a[2] as number
+                  const beforeAt = a[2] as number
+                  const beforeId = a[4] as string
+                  const limit = a[5] as number
                   out = out.filter((r) => {
                     try {
                       const parsed = JSON.parse(r.meta) as { squad_ids?: string[] }
@@ -78,7 +80,9 @@ function makeEnv(tenant = 'digid'): { env: Env; rows: Map<string, FlightRow> } {
                     } catch {
                       return false
                     }
-                  }).slice(0, limit)
+                  }).filter((r) => r.created_at < beforeAt || (r.created_at === beforeAt && r.id < beforeId))
+                    .sort((x, y) => y.created_at - x.created_at || y.id.localeCompare(x.id))
+                    .slice(0, limit)
                 }
                 return { results: out as unknown as T[] }
               },
@@ -108,7 +112,7 @@ describe('createFlight', () => {
 describe('listFlightsForSquad', () => {
   it('filters by squad before applying the result limit', async () => {
     const listForSquad = (flightService as Record<string, unknown>).listFlightsForSquad as
-      | ((env: Env, squadId: string, limit?: number) => Promise<FlightRow[]>)
+      | ((env: Env, squadId: string, limit?: number, before?: { createdAt: number; id: string }) => Promise<FlightRow[]>)
       | undefined
     expect(typeof listForSquad).toBe('function')
     if (!listForSquad) return
@@ -127,6 +131,31 @@ describe('listFlightsForSquad', () => {
 
     const result = await listForSquad(env, 'squad-target', 10)
     expect(result.map((flight) => flight.id)).toEqual([targetId])
+  })
+
+  it('continues before a stable created-at and id cursor', async () => {
+    const listForSquad = (flightService as Record<string, unknown>).listFlightsForSquad as
+      | ((env: Env, squadId: string, limit?: number, before?: { createdAt: number; id: string }) => Promise<FlightRow[]>)
+      | undefined
+    expect(typeof listForSquad).toBe('function')
+    if (!listForSquad) return
+    const { env } = makeEnv()
+    const flightMeta = {
+      schema: 'mupot.flight.meta/v1' as const, goal_id: 'goal', objective_id: 'objective',
+      squad_ids: ['squad-target'], task_ids: ['task'], done_when: ['verified'], artifact_refs: [],
+      receipt_refs: [], confidentiality: 'internal' as const, publication_target: 'none' as const,
+      parent_flight_id: null,
+    }
+    const oldest = await createFlight(env, { agent: 'a', goal: 'oldest', meta: flightMeta })
+    await createFlight(env, { agent: 'a', goal: 'middle', meta: flightMeta })
+    await createFlight(env, { agent: 'a', goal: 'newest', meta: flightMeta })
+
+    const first = await listForSquad(env, 'squad-target', 2)
+    const second = await listForSquad(env, 'squad-target', 2, {
+      createdAt: first[1].created_at,
+      id: first[1].id,
+    })
+    expect(second.map((flight) => flight.id)).toEqual([oldest])
   })
 })
 
