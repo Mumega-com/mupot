@@ -8,6 +8,7 @@ import {
   getFlight,
   listFlights,
 } from '../src/flight/service'
+import * as flightService from '../src/flight/service'
 import type { FlightRow, FlightStatus } from '../src/flight/service'
 import { dispatchFlight } from '../src/flight/dispatch'
 import type { Env } from '../src/types'
@@ -66,7 +67,19 @@ function makeEnv(tenant = 'digid'): { env: Env; rows: Map<string, FlightRow> } {
               },
               async all<T>() {
                 const [t] = a as [string]
-                const out = [...rows.values()].filter((r) => r.tenant === t).sort((x, y) => y.created_at - x.created_at)
+                let out = [...rows.values()].filter((r) => r.tenant === t).sort((x, y) => y.created_at - x.created_at)
+                if (sql.includes('json_each')) {
+                  const squadId = a[1] as string
+                  const limit = a[2] as number
+                  out = out.filter((r) => {
+                    try {
+                      const parsed = JSON.parse(r.meta) as { squad_ids?: string[] }
+                      return parsed.squad_ids?.includes(squadId) ?? false
+                    } catch {
+                      return false
+                    }
+                  }).slice(0, limit)
+                }
                 return { results: out as unknown as T[] }
               },
             }
@@ -89,6 +102,31 @@ describe('createFlight', () => {
     expect(f?.status).toBe('preflight')
     expect(f?.agent).toBe('kasra')
     expect(f?.budget_micro_usd).toBe(1_000_000)
+  })
+})
+
+describe('listFlightsForSquad', () => {
+  it('filters by squad before applying the result limit', async () => {
+    const listForSquad = (flightService as Record<string, unknown>).listFlightsForSquad as
+      | ((env: Env, squadId: string, limit?: number) => Promise<FlightRow[]>)
+      | undefined
+    expect(typeof listForSquad).toBe('function')
+    if (!listForSquad) return
+
+    const { env } = makeEnv()
+    const flightMeta = (squadId: string) => ({
+      schema: 'mupot.flight.meta/v1' as const,
+      goal_id: 'goal', objective_id: 'objective', squad_ids: [squadId], task_ids: ['task'],
+      done_when: ['verified'], artifact_refs: [], receipt_refs: [], confidentiality: 'internal' as const,
+      publication_target: 'none' as const, parent_flight_id: null,
+    })
+    const targetId = await createFlight(env, { agent: 'target', goal: 'target', meta: flightMeta('squad-target') })
+    for (let i = 0; i < 501; i += 1) {
+      await createFlight(env, { agent: `other-${i}`, goal: 'other', meta: flightMeta('squad-other') })
+    }
+
+    const result = await listForSquad(env, 'squad-target', 10)
+    expect(result.map((flight) => flight.id)).toEqual([targetId])
   })
 })
 

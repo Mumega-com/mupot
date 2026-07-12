@@ -50,7 +50,7 @@ function auth(overrides: Partial<AuthContext> = {}): AuthContext {
   }
 }
 
-function makeEnv() {
+function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
   const rows = new Map<string, FlightRow>()
   const tasks = new Map([
     ['task-m000', { id: 'task-m000', squad_id: SQUAD_ID }],
@@ -59,6 +59,10 @@ function makeEnv() {
     [SQUAD_ID, { id: SQUAD_ID, department_id: 'dept-1', slug: 'mmhq', name: 'Mumega HQ', charter: null, created_at: 'now' }],
     [OTHER_SQUAD_ID, { id: OTHER_SQUAD_ID, department_id: 'dept-2', slug: 'other', name: 'Other', charter: null, created_at: 'now' }],
   ])
+  const agents = new Map<string, { id: string; squad_id: string; slug: string; name: string; role: null; model: null; status: 'active' | 'paused'; created_at: string }>()
+  if (agentStatus) {
+    agents.set(AGENT_ID, { id: AGENT_ID, squad_id: SQUAD_ID, slug: 'product', name: 'Product', role: null, model: null, status: agentStatus, created_at: 'now' })
+  }
   const env = {
     TENANT_SLUG: TENANT,
     DB: {
@@ -67,6 +71,7 @@ function makeEnv() {
           bind(...args: unknown[]) {
             return {
               async first<T>() {
+                if (sql.includes('FROM agents WHERE id = ?1')) return (agents.get(args[0] as string) ?? null) as T | null
                 if (sql.includes('FROM squads WHERE id = ?1')) return (squads.get(args[0] as string) ?? null) as T | null
                 if (sql.includes('SELECT department_id FROM squads')) {
                   const squad = squads.get(args[0] as string)
@@ -142,6 +147,16 @@ describe('MCP flight tools', () => {
     expect(out.error).toBe('agent_binding_required')
   })
 
+  it('refuses a missing or paused bound agent', async () => {
+    const missing = await invokeTool(auth(), makeEnv(null).env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
+    expect(missing.ok).toBe(false)
+    expect(missing.error).toBe('agent_binding_invalid')
+
+    const paused = await invokeTool(auth(), makeEnv('paused').env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
+    expect(paused.ok).toBe(false)
+    expect(paused.error).toBe('agent_binding_inactive')
+  })
+
   it('refuses dispatch into a squad outside the caller grant', async () => {
     const { env } = makeEnv()
     const out = await invokeTool(auth(), env, 'flight_dispatch', {
@@ -171,5 +186,41 @@ describe('MCP flight tools', () => {
     const out = await invokeTool(auth(), env, 'flight_get', { flight_id: id }, 'https://pot.example')
     expect(out.ok).toBe(true)
     expect((out.result as { flight: FlightRow & { meta: typeof meta } }).flight.meta).toEqual(meta)
+  })
+
+  it('requires read authority on every squad referenced by a flight', async () => {
+    const { env } = makeEnv()
+    const bothSquads = [
+      { member_id: MEMBER_ID, scope_type: 'squad' as const, scope_id: SQUAD_ID, capability: 'member' as const },
+      { member_id: MEMBER_ID, scope_type: 'squad' as const, scope_id: OTHER_SQUAD_ID, capability: 'member' as const },
+    ]
+    const dispatched = await invokeTool(auth({ capabilities: bothSquads }), env, 'flight_dispatch', {
+      ...dispatchArgs,
+      meta_json: JSON.stringify({ ...meta, squad_ids: [SQUAD_ID, OTHER_SQUAD_ID] }),
+    }, 'https://pot.example')
+    expect(dispatched.ok).toBe(true)
+    const id = (dispatched.result as { flight: FlightRow }).flight.id
+
+    const get = await invokeTool(auth(), env, 'flight_get', { flight_id: id }, 'https://pot.example')
+    expect(get.ok).toBe(false)
+    expect(get.error).toBe('forbidden')
+
+    const list = await invokeTool(auth(), env, 'flight_list', { squad_id: SQUAD_ID }, 'https://pot.example')
+    expect(list.ok).toBe(true)
+    expect((list.result as { flights: FlightRow[] }).flights).toEqual([])
+  })
+
+  it('does not reveal whether a probed flight has legacy metadata', async () => {
+    const { env, rows } = makeEnv()
+    rows.set('legacy-flight', {
+      id: 'legacy-flight', tenant: TENANT, agent: AGENT_ID, goal: 'legacy', status: 'landed',
+      trigger_source: 'manual', gate_verdict: 'go', gate_reason: '', score: 1,
+      budget_micro_usd: null, cost_micro_usd: 0, next_run_at: null, created_at: 1,
+      started_at: 1, ended_at: 2, meta: '{}',
+    })
+    const legacy = await invokeTool(auth(), env, 'flight_get', { flight_id: 'legacy-flight' }, 'https://pot.example')
+    const absent = await invokeTool(auth(), env, 'flight_get', { flight_id: 'absent-flight' }, 'https://pot.example')
+    expect(legacy).toMatchObject({ ok: false, status: 404, error: 'flight_not_found' })
+    expect(absent).toMatchObject({ ok: false, status: 404, error: 'flight_not_found' })
   })
 })

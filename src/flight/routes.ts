@@ -21,7 +21,7 @@ import { resolveOrgAdmin } from '../auth/member-bearer'
 import { dispatchFlight } from './dispatch'
 import { landFlight, failFlight, getFlight, listFlights, type FlightStatus, type TriggerSource } from './service'
 import type { FlightSignals, PreflightOptions } from './preflight'
-import { parseFlightMetaV1, type FlightMetaV1 } from './meta'
+import { parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from './meta'
 
 // ── input parsing (pure, exported for tests) ──────────────────────────────────
 
@@ -129,6 +129,10 @@ flightsApp.post('/', async (c) => {
   if (!parsed.ok) return c.json({ error: parsed.error }, 400)
 
   const { flight, signals, opts } = parsed.value
+  if (flight.meta) {
+    const references = await validateFlightMetaReferences(c.env, flight.meta)
+    if (!references.ok) return c.json({ error: references.error }, 400)
+  }
   const result = await dispatchFlight(c.env, flight, signals, opts)
   // 201 on launch (GO), 200 on a recorded NO-GO hold (not an error — the gate worked).
   return c.json(result, result.go ? 201 : 200)

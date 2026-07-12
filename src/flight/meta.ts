@@ -74,3 +74,27 @@ export function parseFlightMetaV1(raw: unknown): FlightMetaV1 | null {
   }
 }
 
+export type FlightMetaReferenceResult =
+  | { ok: true }
+  | { ok: false; error: 'flight_squad_not_found' | 'flight_task_not_found' | 'flight_task_scope_mismatch'; ref: string }
+
+export async function validateFlightMetaReferences(env: Env, meta: FlightMetaV1): Promise<FlightMetaReferenceResult> {
+  for (const squadId of meta.squad_ids) {
+    const squad = await env.DB.prepare('SELECT id FROM squads WHERE id = ?1 LIMIT 1')
+      .bind(squadId)
+      .first<{ id: string }>()
+    if (!squad) return { ok: false, error: 'flight_squad_not_found', ref: squadId }
+  }
+  for (const taskId of meta.task_ids) {
+    const task = await env.DB.prepare('SELECT id, squad_id FROM tasks WHERE id = ?1 LIMIT 1')
+      .bind(taskId)
+      .first<{ id: string; squad_id: string }>()
+    if (!task) return { ok: false, error: 'flight_task_not_found', ref: taskId }
+    if (!meta.squad_ids.includes(task.squad_id)) {
+      return { ok: false, error: 'flight_task_scope_mismatch', ref: taskId }
+    }
+  }
+  return { ok: true }
+}
+import type { Env } from '../types'
+

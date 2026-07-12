@@ -324,14 +324,17 @@ Stateful runtimes create and inspect governed flights through MCP:
 
 `flight_dispatch` requires `member` capability on every squad named by the strict
 `mupot.flight.meta/v1` metadata and derives the flying agent from the authenticated
-token's stable `boundAgentId`. It refuses unbound identities, unknown squads, missing
-task references, and tasks outside the declared flight squads. The caller cannot
-assert an agent identity in arguments.
+token's stable `boundAgentId`. The bound agent must still exist, be active, and belong
+to a declared flight squad. Both REST and MCP refuse unknown squads, missing task
+references, and tasks outside the declared flight squads. The caller cannot assert an
+agent identity in arguments.
 
-`flight_get` and `flight_list` require `observer` or higher on a referenced squad and
-return parsed metadata. Legacy or malformed metadata is not projected through the
-scoped MCP read surface. The existing org-admin HTTP connector remains available for
-the external coherence brain; MCP is the tenant teammate surface.
+`flight_get` and `flight_list` require `observer` or higher on every squad referenced
+by a returned flight and return parsed metadata. Legacy or malformed metadata is not
+projected or distinguishable from an absent row through the scoped MCP read surface.
+Squad filtering happens in D1 before the result limit is applied. The existing
+org-admin HTTP connector remains available for the external coherence brain; MCP is
+the tenant teammate surface.
 
 ## Task Lifecycle
 

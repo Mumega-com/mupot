@@ -137,3 +137,21 @@ export async function listFlights(env: Env, limit = 100): Promise<FlightRow[]> {
     .all<FlightRow>()
   return res.results ?? []
 }
+
+export async function listFlightsForSquad(env: Env, squadId: string, limit = 100): Promise<FlightRow[]> {
+  const boundedLimit = Math.min(Math.max(limit, 1), 500)
+  const res = await env.DB.prepare(
+    `SELECT f.* FROM flights f
+      WHERE f.tenant = ?1
+        AND EXISTS (
+          SELECT 1
+            FROM json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.squad_ids') AS squad_ref
+           WHERE squad_ref.value = ?2
+        )
+      ORDER BY f.created_at DESC
+      LIMIT ?3`,
+  )
+    .bind(env.TENANT_SLUG, squadId, boundedLimit)
+    .all<FlightRow>()
+  return res.results ?? []
+}

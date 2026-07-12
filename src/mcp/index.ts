@@ -56,9 +56,9 @@ import { sendToRef, readAgentInbox, sendAgentMessage } from '../agents/messages'
 import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { PROVISION_TOOLS } from './provision'
 import { dispatchFlight } from '../flight/dispatch'
-import { getFlight, listFlights, type FlightRow } from '../flight/service'
+import { getFlight, listFlightsForSquad, type FlightRow } from '../flight/service'
 import { parseDispatchBody } from '../flight/routes'
-import { parseFlightMetaV1, type FlightMetaV1 } from '../flight/meta'
+import { parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from '../flight/meta'
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
 // Vitest can import it without the CF runtime. See ./auth-header.ts.
 import { AUTH_CONTEXT_HEADER } from './auth-header'
@@ -735,9 +735,9 @@ function parseJsonArg(value: unknown): unknown | null {
 async function memberCanReadFlight(env: Env, auth: AuthContext, meta: FlightMetaV1): Promise<boolean> {
   const grants = auth.capabilities ?? []
   for (const squadId of meta.squad_ids) {
-    if (await memberCanOnSquad(env, grants, squadId, 'observer')) return true
+    if (!(await memberCanOnSquad(env, grants, squadId, 'observer'))) return false
   }
-  return false
+  return true
 }
 
 function flightWithParsedMeta(flight: FlightRow, meta: FlightMetaV1): Omit<FlightRow, 'meta'> & { meta: FlightMetaV1 } {
@@ -763,6 +763,9 @@ const toolFlightDispatch: ToolSpec = {
   },
   async run(auth, env, args) {
     if (!auth.boundAgentId) return fail(409, 'agent_binding_required')
+    const boundAgent = await loadAgent(env, auth.boundAgentId)
+    if (!boundAgent) return fail(409, 'agent_binding_invalid')
+    if (boundAgent.status !== 'active') return fail(409, 'agent_binding_inactive')
     const squadId = str(args.squad_id)
     const goal = str(args.goal)
     if (!squadId || !goal) return fail(400, 'invalid_args')
@@ -776,6 +779,11 @@ const toolFlightDispatch: ToolSpec = {
 
     const meta = parseFlightMetaV1(parseJsonArg(args.meta_json))
     if (!meta || !meta.squad_ids.includes(squad.id)) return fail(400, 'invalid_flight_meta')
+    if (!meta.squad_ids.includes(boundAgent.squad_id)) return fail(400, 'agent_squad_not_in_flight')
+    const references = await validateFlightMetaReferences(env, meta)
+    if (!references.ok) {
+      return fail(references.error.endsWith('_not_found') ? 404 : 400, references.error, references.ref)
+    }
     for (const referencedSquadId of meta.squad_ids) {
       const referencedSquad = await loadSquad(env, referencedSquadId)
       if (!referencedSquad) return fail(404, 'squad_not_found', referencedSquadId)
@@ -783,16 +791,6 @@ const toolFlightDispatch: ToolSpec = {
         return fail(403, 'forbidden', { need: 'member', scope: 'squad', squad_id: referencedSquad.id })
       }
     }
-    for (const taskId of meta.task_ids) {
-      const task = await env.DB.prepare('SELECT id, squad_id FROM tasks WHERE id = ?1 LIMIT 1')
-        .bind(taskId)
-        .first<{ id: string; squad_id: string }>()
-      if (!task) return fail(404, 'flight_task_not_found', taskId)
-      if (!meta.squad_ids.includes(task.squad_id)) {
-        return fail(400, 'flight_task_scope_mismatch', { task_id: task.id, squad_id: task.squad_id })
-      }
-    }
-
     const signals = parseJsonArg(args.signals_json)
     const parsed = parseDispatchBody({
       agent: auth.boundAgentId,
@@ -828,7 +826,7 @@ const toolFlightGet: ToolSpec = {
     const flight = await getFlight(env, flightId)
     if (!flight) return fail(404, 'flight_not_found')
     const meta = parseFlightMetaV1(parseJsonArg(flight.meta))
-    if (!meta) return fail(409, 'unsupported_flight_meta')
+    if (!meta) return fail(404, 'flight_not_found')
     if (!(await memberCanReadFlight(env, auth, meta))) {
       return fail(403, 'forbidden', { need: 'observer', scope: 'flight_squad' })
     }
@@ -858,11 +856,18 @@ const toolFlightList: ToolSpec = {
     }
     const limit = readLimit(args.limit, 100, 500)
     if (typeof limit !== 'number') return limit
-    const flights = (await listFlights(env, 500)).flatMap((flight) => {
+    const flights = (await listFlightsForSquad(env, squad.id, 500)).flatMap((flight) => {
       const meta = parseFlightMetaV1(parseJsonArg(flight.meta))
-      return meta?.squad_ids.includes(squad.id) ? [flightWithParsedMeta(flight, meta)] : []
-    }).slice(0, limit)
-    return done({ squad_id: squad.id, flights })
+      return meta?.squad_ids.includes(squad.id) ? [{ flight, meta }] : []
+    })
+    const visible = []
+    for (const candidate of flights) {
+      if (await memberCanReadFlight(env, auth, candidate.meta)) {
+        visible.push(flightWithParsedMeta(candidate.flight, candidate.meta))
+        if (visible.length >= limit) break
+      }
+    }
+    return done({ squad_id: squad.id, flights: visible })
   },
 }
 

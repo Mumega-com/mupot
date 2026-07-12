@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { parseDispatchBody, parseOutcomeQuery } from '../src/flight/routes'
+import { flightsApp, parseDispatchBody, parseOutcomeQuery } from '../src/flight/routes'
+import type { Env } from '../src/types'
 
 const goodSignals = {
   contextComplete: true,
@@ -113,5 +114,48 @@ describe('parseOutcomeQuery', () => {
     const q = parseOutcomeQuery(new URLSearchParams('since=-5'))
     expect(q.sinceMs).toBeNull()
     expect(q.limit).toBe(200)
+  })
+})
+
+describe('REST flight dispatch reference integrity', () => {
+  it('rejects missing metadata references before inserting a flight', async () => {
+    const env = {
+      TENANT_SLUG: 'test',
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind() {
+              return {
+                async first() {
+                  if (sql.includes('FROM member_tokens')) {
+                    return { member_id: 'admin-1', display_name: 'Admin', email: null, status: 'active', bound_agent_id: null }
+                  }
+                  if (sql.includes('SELECT id FROM squads')) return null
+                  throw new Error(`unexpected first query: ${sql}`)
+                },
+                async all() {
+                  if (sql.includes('FROM capabilities')) {
+                    return { results: [{ member_id: 'admin-1', scope_type: 'org', scope_id: null, capability: 'admin' }] }
+                  }
+                  throw new Error(`unexpected all query: ${sql}`)
+                },
+                async run() {
+                  throw new Error('flight insert must not run for invalid references')
+                },
+              }
+            },
+          }
+        },
+      },
+    } as unknown as Env
+
+    const response = await flightsApp.request('https://pot.example/', {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ agent: 'brain', goal: 'g', signals: goodSignals, meta: goodMeta }),
+    }, env)
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ error: 'flight_squad_not_found' })
   })
 })
