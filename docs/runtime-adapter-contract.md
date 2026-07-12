@@ -344,8 +344,10 @@ org-admin HTTP connector remains available for the external coherence brain; MCP
 the tenant teammate surface.
 
 `flight_list` scans bounded D1 pages after applying multi-squad visibility. When more
-rows remain it returns an opaque continuation `cursor` with `has_more: true`; callers
-must pass that cursor to continue rather than treating a bounded page as complete.
+rows remain it returns a short-lived opaque continuation `cursor` with `has_more:
+true`; the cursor is stored server-side and bound to the tenant, member, and squad, so
+it cannot expose or cross-read hidden row identifiers. Callers must pass that cursor to
+continue rather than treating a bounded page as complete.
 
 ## Task Lifecycle
 

@@ -52,7 +52,7 @@ export function parseFlightMetaV1(raw: unknown): FlightMetaV1 | null {
   if (meta.schema !== FLIGHT_META_V1_SCHEMA) return null
   if (!boundedString(meta.goal_id, 200)) return null
   if (!boundedString(meta.objective_id, 200)) return null
-  if (!boundedStrings(meta.squad_ids, { maxItems: 32, maxLength: 200, nonEmpty: true })) return null
+  if (!boundedStrings(meta.squad_ids, { maxItems: 8, maxLength: 200, nonEmpty: true })) return null
   if (!boundedStrings(meta.task_ids, { maxItems: 200, maxLength: 200, nonEmpty: true })) return null
   if (!boundedStrings(meta.done_when, { maxItems: 100, maxLength: 1000, nonEmpty: true })) return null
   if (!boundedStrings(meta.artifact_refs, { maxItems: 200, maxLength: 2000 })) return null
@@ -81,14 +81,19 @@ export type FlightMetaReferenceResult =
   | { ok: false; error: 'flight_squad_not_found' | 'flight_task_not_found' | 'flight_task_scope_mismatch'; ref: string }
 
 export async function loadFlightSquads(env: Env, squadIds: string[]): Promise<Squad[]> {
-  const placeholders = squadIds.map((_, index) => `?${index + 1}`).join(',')
-  const rows = await env.DB.prepare(
-    `SELECT id, department_id, slug, name, charter, budget_cap_cents, budget_window, created_at
-       FROM squads WHERE id IN (${placeholders})`,
-  )
-    .bind(...squadIds)
-    .all<Squad>()
-  return rows.results ?? []
+  const rows: Squad[] = []
+  for (let offset = 0; offset < squadIds.length; offset += 90) {
+    const chunk = squadIds.slice(offset, offset + 90)
+    const placeholders = chunk.map((_, index) => `?${index + 1}`).join(',')
+    const result = await env.DB.prepare(
+      `SELECT id, department_id, slug, name, charter, budget_cap_cents, budget_window, created_at
+         FROM squads WHERE id IN (${placeholders})`,
+    )
+      .bind(...chunk)
+      .all<Squad>()
+    rows.push(...(result.results ?? []))
+  }
+  return rows
 }
 
 export async function validateFlightMetaReferences(env: Env, meta: FlightMetaV1): Promise<FlightMetaReferenceResult> {

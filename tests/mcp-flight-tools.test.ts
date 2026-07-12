@@ -52,6 +52,7 @@ function auth(overrides: Partial<AuthContext> = {}): AuthContext {
 
 function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
   const rows = new Map<string, FlightRow>()
+  const cursors = new Map<string, string>()
   const tasks = new Map([
     ['task-m000', { id: 'task-m000', squad_id: SQUAD_ID }],
     ['task-other', { id: 'task-other', squad_id: OTHER_SQUAD_ID }],
@@ -66,6 +67,15 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
   }
   const env = {
     TENANT_SLUG: TENANT,
+    SESSIONS: {
+      async get(key: string, type?: string) {
+        const value = cursors.get(key) ?? null
+        return type === 'json' && value ? JSON.parse(value) : value
+      },
+      async put(key: string, value: string) {
+        cursors.set(key, value)
+      },
+    },
     DB: {
       prepare(sql: string) {
         return {
@@ -291,7 +301,7 @@ describe('MCP flight tools', () => {
 
     const get = await invokeTool(auth(), env, 'flight_get', { flight_id: id }, 'https://pot.example')
     expect(get.ok).toBe(false)
-    expect(get.error).toBe('forbidden')
+    expect(get).toMatchObject({ status: 404, error: 'flight_not_found' })
 
     const list = await invokeTool(auth(), env, 'flight_list', { squad_id: SQUAD_ID }, 'https://pot.example')
     expect(list.ok).toBe(true)
@@ -328,8 +338,20 @@ describe('MCP flight tools', () => {
       }))
     }
 
-    const out = await invokeTool(auth(), env, 'flight_list', { squad_id: SQUAD_ID, limit: 1 }, 'https://pot.example')
-    expect(out.ok).toBe(true)
-    expect((out.result as { flights: FlightRow[] }).flights.map((flight) => flight.id)).toEqual(['visible-old'])
+    const first = await invokeTool(auth(), env, 'flight_list', { squad_id: SQUAD_ID, limit: 1 }, 'https://pot.example')
+    expect(first.ok).toBe(true)
+    const firstResult = first.result as { flights: FlightRow[]; cursor: string; has_more: boolean }
+    expect(firstResult.flights).toEqual([])
+    expect(firstResult.has_more).toBe(true)
+    expect(firstResult.cursor).not.toContain('hidden')
+    expect(firstResult.cursor).not.toContain(':')
+
+    const second = await invokeTool(auth(), env, 'flight_list', {
+      squad_id: SQUAD_ID,
+      limit: 1,
+      cursor: firstResult.cursor,
+    }, 'https://pot.example')
+    expect(second.ok).toBe(true)
+    expect((second.result as { flights: FlightRow[] }).flights.map((flight) => flight.id)).toEqual(['visible-old'])
   })
 })

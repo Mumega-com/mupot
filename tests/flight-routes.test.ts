@@ -93,6 +93,10 @@ describe('parseDispatchBody', () => {
       .toEqual({ ok: false, error: 'invalid_flight_meta' })
     expect(parseDispatchBody({ agent: 'a', goal: 'g', signals: goodSignals, meta: { ...goodMeta, hidden: 'data' } }))
       .toEqual({ ok: false, error: 'invalid_flight_meta' })
+    expect(parseDispatchBody({
+      agent: 'a', goal: 'g', signals: goodSignals,
+      meta: { ...goodMeta, squad_ids: Array.from({ length: 9 }, (_, index) => `squad-${index}`) },
+    })).toEqual({ ok: false, error: 'invalid_flight_meta' })
   })
 })
 

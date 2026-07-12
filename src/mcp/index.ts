@@ -734,34 +734,54 @@ function parseJsonArg(value: unknown): unknown | null {
   }
 }
 
-function parseFlightCursor(value: unknown): { createdAt: number; id: string } | null | undefined {
-  if (value === undefined || value === null) return undefined
-  if (typeof value !== 'string' || value.length > 256) return null
-  const separator = value.indexOf(':')
-  if (separator <= 0) return null
-  const createdAt = Number(value.slice(0, separator))
-  const id = value.slice(separator + 1)
-  if (!Number.isSafeInteger(createdAt) || createdAt < 0 || id.length === 0) return null
-  return { createdAt, id }
+interface FlightCursorEnvelope {
+  tenant: string
+  member_id: string
+  squad_id: string
+  created_at: number
+  flight_id: string
 }
 
-function flightCursor(flight: FlightRow): string {
-  return `${flight.created_at}:${flight.id}`
-}
-
-async function memberCanReadFlight(
+async function resolveFlightCursor(
   env: Env,
   auth: AuthContext,
+  squadId: string,
+  value: unknown,
+): Promise<{ createdAt: number; id: string } | null | undefined> {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string' || !/^[0-9a-f-]{36}$/i.test(value)) return null
+  const digest = await sha256Short(value)
+  const cursor = await env.SESSIONS.get<FlightCursorEnvelope>(`flight-list-cursor:${digest}`, 'json')
+  const memberId = auth.memberId ?? auth.userId
+  if (!cursor || cursor.tenant !== env.TENANT_SLUG || cursor.member_id !== memberId || cursor.squad_id !== squadId) {
+    return null
+  }
+  if (!Number.isSafeInteger(cursor.created_at) || cursor.created_at < 0 || !cursor.flight_id) return null
+  return { createdAt: cursor.created_at, id: cursor.flight_id }
+}
+
+async function issueFlightCursor(env: Env, auth: AuthContext, squadId: string, flight: FlightRow): Promise<string> {
+  const token = crypto.randomUUID()
+  const digest = await sha256Short(token)
+  const cursor: FlightCursorEnvelope = {
+    tenant: env.TENANT_SLUG,
+    member_id: auth.memberId ?? auth.userId,
+    squad_id: squadId,
+    created_at: flight.created_at,
+    flight_id: flight.id,
+  }
+  await env.SESSIONS.put(`flight-list-cursor:${digest}`, JSON.stringify(cursor), { expirationTtl: 600 })
+  return token
+}
+
+function memberCanReadFlight(
+  auth: AuthContext,
   meta: FlightMetaV1,
-  squadCache: Map<string, Squad | null> = new Map(),
-): Promise<boolean> {
+  squadCache: Map<string, Squad | null>,
+): boolean {
   const grants = auth.capabilities ?? []
   for (const squadId of meta.squad_ids) {
-    let squad = squadCache.get(squadId)
-    if (squad === undefined) {
-      squad = await loadSquad(env, squadId)
-      squadCache.set(squadId, squad)
-    }
+    const squad = squadCache.get(squadId)
     if (!squad || !hasCapability(grants, 'squad', squad.id, 'observer', squad.department_id)) return false
   }
   return true
@@ -877,9 +897,9 @@ const toolFlightGet: ToolSpec = {
     if (!flight) return fail(404, 'flight_not_found')
     const meta = parseFlightMetaV1(parseJsonArg(flight.meta))
     if (!meta) return fail(404, 'flight_not_found')
-    if (!(await memberCanReadFlight(env, auth, meta))) {
-      return fail(403, 'forbidden', { need: 'observer', scope: 'flight_squad' })
-    }
+    const squads = await loadFlightSquads(env, meta.squad_ids)
+    const squadCache = new Map<string, Squad | null>(squads.map((item) => [item.id, item]))
+    if (!memberCanReadFlight(auth, meta, squadCache)) return fail(404, 'flight_not_found')
     return done({ flight: flightWithParsedMeta(flight, meta) })
   },
 }
@@ -906,12 +926,12 @@ const toolFlightList: ToolSpec = {
     }
     const limit = readLimit(args.limit, 100, 500)
     if (typeof limit !== 'number') return limit
-    let before = parseFlightCursor(args.cursor)
+    let before = await resolveFlightCursor(env, auth, squad.id, args.cursor)
     if (before === null) return fail(400, 'invalid_flight_cursor')
 
     const visible: Array<Omit<FlightRow, 'meta'> & { meta: FlightMetaV1 }> = []
     const squadCache = new Map<string, Squad | null>([[squad.id, squad]])
-    const pageSize = Math.min(500, Math.max(100, limit))
+    const pageSize = 50
     let pages = 0
     let lastScanned: FlightRow | null = null
     let hasMore = false
@@ -920,11 +940,23 @@ const toolFlightList: ToolSpec = {
       const page = await listFlightsForSquad(env, squad.id, pageSize, before)
       pages += 1
       if (page.length === 0) break
+      const candidates = page.map((flight) => ({ flight, meta: parseFlightMetaV1(parseJsonArg(flight.meta)) }))
+      const missingSquadIds = new Set<string>()
+      for (const candidate of candidates) {
+        for (const candidateSquadId of candidate.meta?.squad_ids ?? []) {
+          if (!squadCache.has(candidateSquadId)) missingSquadIds.add(candidateSquadId)
+        }
+      }
+      const loadedSquads = await loadFlightSquads(env, [...missingSquadIds])
+      for (const loadedSquad of loadedSquads) squadCache.set(loadedSquad.id, loadedSquad)
+      for (const missingSquadId of missingSquadIds) {
+        if (!squadCache.has(missingSquadId)) squadCache.set(missingSquadId, null)
+      }
       for (let index = 0; index < page.length; index += 1) {
         const flight = page[index]
         lastScanned = flight
-        const meta = parseFlightMetaV1(parseJsonArg(flight.meta))
-        if (meta?.squad_ids.includes(squad.id) && await memberCanReadFlight(env, auth, meta, squadCache)) {
+        const meta = candidates[index].meta
+        if (meta?.squad_ids.includes(squad.id) && memberCanReadFlight(auth, meta, squadCache)) {
           visible.push(flightWithParsedMeta(flight, meta))
         }
         if (visible.length >= limit) {
@@ -939,7 +971,7 @@ const toolFlightList: ToolSpec = {
     return done({
       squad_id: squad.id,
       flights: visible,
-      cursor: hasMore && lastScanned ? flightCursor(lastScanned) : null,
+      cursor: hasMore && lastScanned ? await issueFlightCursor(env, auth, squad.id, lastScanned) : null,
       has_more: hasMore,
     })
   },
