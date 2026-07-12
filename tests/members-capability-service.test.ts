@@ -3,6 +3,7 @@ import {
   resolveActiveAgentMember,
   upsertCapabilityGrant,
 } from '../src/members/service'
+import { membersApp } from '../src/members'
 import type { Capability, CapabilityGrant, Env } from '../src/types'
 
 interface StatementRecord {
@@ -12,7 +13,7 @@ interface StatementRecord {
 
 interface ServiceDbOptions {
   identityRows?: { member_id: string }[]
-  existingCapability?: Capability | null
+  existingCapabilities?: Capability[]
   batchResults?: { meta: { changes: number } }[]
 }
 
@@ -29,19 +30,23 @@ function makeServiceDb(options: ServiceDbOptions = {}) {
           record.values = values
           return {
             ...record,
+            async first<T>() {
+              if (sql.includes('SELECT capability FROM capabilities')) {
+                const capability = options.existingCapabilities?.[0]
+                return (capability === undefined ? null : { capability }) as T | null
+              }
+              throw new Error(`unexpected first query: ${sql}`)
+            },
             async all<T>() {
               if (sql.includes('FROM member_tokens t')) {
                 return { results: (options.identityRows ?? []) as T[] }
               }
-              throw new Error(`unexpected all query: ${sql}`)
-            },
-            async first<T>() {
               if (sql.includes('SELECT capability FROM capabilities')) {
-                return (options.existingCapability === undefined || options.existingCapability === null
-                  ? null
-                  : { capability: options.existingCapability }) as T | null
+                return {
+                  results: (options.existingCapabilities ?? []).map((capability) => ({ capability })) as T[],
+                }
               }
-              throw new Error(`unexpected first query: ${sql}`)
+              throw new Error(`unexpected all query: ${sql}`)
             },
           }
         },
@@ -58,6 +63,52 @@ function makeServiceDb(options: ServiceDbOptions = {}) {
     statements,
     batches,
   }
+}
+
+function makeGrantRouteEnv(existingCapabilities: Capability[]): Env {
+  const session = JSON.stringify({
+    userId: 'owner-user',
+    email: 'owner@example.test',
+    role: 'owner',
+    createdAt: '2026-07-12T00:00:00.000Z',
+  })
+  const db = {
+    prepare(sql: string) {
+      const statement = {
+        bind(..._values: unknown[]) {
+          return statement
+        },
+        async first<T>() {
+          if (sql.includes('SELECT id FROM members')) return { id: 'member-1' } as T
+          if (sql.includes('SELECT capability FROM capabilities')) {
+            const capability = existingCapabilities[0]
+            return (capability === undefined ? null : { capability }) as T | null
+          }
+          throw new Error(`unexpected first query: ${sql}`)
+        },
+        async all<T>() {
+          if (sql.includes('SELECT capability FROM capabilities')) {
+            return { results: existingCapabilities.map((capability) => ({ capability })) as T[] }
+          }
+          throw new Error(`unexpected all query: ${sql}`)
+        },
+      }
+      return statement
+    },
+    async batch(_statements: unknown[]) {
+      return [{ meta: { changes: 2 } }, { meta: { changes: 1 } }]
+    },
+  }
+
+  return {
+    TENANT_SLUG: 'tenant-a',
+    DB: db,
+    SESSIONS: {
+      get: async (key: string) => (key === 'sess:owner-session' ? session : null),
+      put: async () => undefined,
+      delete: async () => undefined,
+    },
+  } as unknown as Env
 }
 
 const squadGrant: CapabilityGrant = {
@@ -115,7 +166,7 @@ describe('resolveActiveAgentMember', () => {
 
 describe('upsertCapabilityGrant', () => {
   it('returns created and persists a missing grant with a single delete-then-insert batch', async () => {
-    const { env, batches } = makeServiceDb({ existingCapability: null })
+    const { env, batches } = makeServiceDb()
 
     await expect(upsertCapabilityGrant(env, squadGrant)).resolves.toEqual({
       grant: squadGrant,
@@ -136,7 +187,7 @@ describe('upsertCapabilityGrant', () => {
   })
 
   it('returns updated when the existing grant has a different capability', async () => {
-    const { env } = makeServiceDb({ existingCapability: 'observer' })
+    const { env } = makeServiceDb({ existingCapabilities: ['observer'] })
 
     await expect(upsertCapabilityGrant(env, squadGrant)).resolves.toEqual({
       grant: squadGrant,
@@ -145,7 +196,7 @@ describe('upsertCapabilityGrant', () => {
   })
 
   it('returns unchanged when the existing grant has the requested capability', async () => {
-    const { env } = makeServiceDb({ existingCapability: 'member' })
+    const { env } = makeServiceDb({ existingCapabilities: ['member'] })
 
     await expect(upsertCapabilityGrant(env, squadGrant)).resolves.toEqual({
       grant: squadGrant,
@@ -155,12 +206,63 @@ describe('upsertCapabilityGrant', () => {
 
   it('checks the inserted grant receipt without requiring the delete to remove a row', async () => {
     const { env } = makeServiceDb({
-      existingCapability: null,
       batchResults: [{ meta: { changes: 0 } }, { meta: { changes: 0 } }],
     })
 
     await expect(upsertCapabilityGrant(env, squadGrant)).rejects.toThrow(
       'receipt_failed: upsert_capability_grant[0]',
     )
+  })
+
+  it('returns updated while consolidating duplicate org grants that include the requested capability', async () => {
+    const orgGrant: CapabilityGrant = {
+      member_id: 'member-1',
+      scope_type: 'org',
+      scope_id: null,
+      capability: 'member',
+    }
+    const { env, statements, batches } = makeServiceDb({
+      existingCapabilities: ['member', 'observer'],
+    })
+
+    await expect(upsertCapabilityGrant(env, orgGrant)).resolves.toEqual({
+      grant: orgGrant,
+      result: 'updated',
+    })
+
+    const read = statements.find(({ sql }) => sql.includes('SELECT capability FROM capabilities'))
+    expect(read?.sql).toContain('scope_id IS NULL')
+    expect(read?.sql).not.toContain('LIMIT 1')
+    expect(batches).toHaveLength(1)
+    expect(batches[0][0].values).toEqual(['member-1', 'org'])
+  })
+})
+
+describe('POST /members/:id/capabilities', () => {
+  it('returns the shared upsert result after consolidating duplicate org grants', async () => {
+    const res = await membersApp.request(
+      '/members/member-1/capabilities',
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          cookie: 'mupot_session=owner-session',
+        },
+        body: JSON.stringify({ scope_type: 'org', capability: 'member' }),
+      },
+      makeGrantRouteEnv(['member', 'observer']),
+    )
+
+    expect(res.status).toBe(201)
+    await expect(res.json()).resolves.toEqual({
+      grant: {
+        member_id: 'member-1',
+        scope_type: 'org',
+        scope_id: null,
+        capability: 'member',
+      },
+      action: 'grant',
+      result: 'updated',
+    })
   })
 })

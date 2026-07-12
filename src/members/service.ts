@@ -241,21 +241,22 @@ export async function upsertCapabilityGrant(
   env: Env,
   grant: CapabilityGrant,
 ): Promise<CapabilityGrantUpsertOutcome> {
-  const existing = grant.scope_id === null
+  const existingRows = grant.scope_id === null
     ? await env.DB.prepare(
-        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id IS NULL LIMIT 1',
+        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id IS NULL',
       )
         .bind(grant.member_id, grant.scope_type)
-        .first<{ capability: Capability }>()
+        .all<{ capability: Capability }>()
     : await env.DB.prepare(
-        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id = ? LIMIT 1',
+        'SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id = ?',
       )
         .bind(grant.member_id, grant.scope_type, grant.scope_id)
-        .first<{ capability: Capability }>()
+        .all<{ capability: Capability }>()
 
-  const result = existing === null
+  const existing = existingRows.results ?? []
+  const result = existing.length === 0
     ? 'created'
-    : existing.capability === grant.capability
+    : existing.length === 1 && existing[0].capability === grant.capability
       ? 'unchanged'
       : 'updated'
 
