@@ -6,8 +6,9 @@
 // (cycle counter / last decision), not the execution itself.
 //
 // Contract (spec §2):
-//  - load the task fail-closed: it must exist AND belong to THIS agent's squad
-//    (env.DB is already this tenant's DB, so squad-scoping is the boundary);
+//  - load the task by ID from this tenant DB, then authorize execution before any
+//    mutation. Assigned tasks must still resolve to this active agent with current
+//    target-squad authority; unassigned tasks remain home-squad-only;
 //  - idempotent: a task already 'done' is left untouched (the bus may redeliver);
 //  - K6: execute no-ops for gate-terminal statuses (approved, review) and
 //    already-terminal statuses (done). Only {open, in_progress, blocked, rejected}
@@ -26,6 +27,7 @@
 
 import type { Env, Agent, Task, ModelMessage, ModelPort, BusEvent } from '../types'
 import { checkTransition, assertCompletableDoneWhen } from '../tasks/service'
+import { resolveTaskAssignee } from '../tasks/assignee'
 import { createModel } from '../model'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
@@ -75,10 +77,11 @@ export async function runTaskExecution(
     deps.remember ?? ((id: string, text: string, concepts?: string[]) => createMemory(env).remember(id, text, concepts))
   const meter = deps.meter ?? { checkAndReserve, recordTokens }
 
-  // Fail-closed scope: must exist AND be in this agent's squad.
-  const task = await loadTaskForSquad(env, taskId, agent.squad_id)
-  if (!task) {
-    return { ok: false, task_id: taskId, decided: `task ${taskId} not found in squad`, error: 'task_not_found' }
+  // Load within this tenant DB, then fail closed on assignment and current
+  // authority. The coarse response intentionally does not reveal which check failed.
+  const task = await loadTaskById(env, taskId)
+  if (!task || !(await canAgentExecuteTask(env, agent, task))) {
+    return { ok: false, task_id: taskId, decided: `task ${taskId} not found`, error: 'task_not_found' }
   }
 
   // K6: execute only drives tasks in workable statuses. Gate-terminal statuses
@@ -137,7 +140,7 @@ export async function runTaskExecution(
   }
 
   try {
-    const charter = await loadSquadCharter(env, agent.squad_id)
+    const charter = await loadSquadCharter(env, task.squad_id)
     const messages: ModelMessage[] = [
       { role: 'system', content: buildExecuteSystem(agent, charter) },
       { role: 'user', content: buildExecutePrompt(task) },
@@ -207,18 +210,29 @@ export async function runTaskExecution(
   }
 }
 
-// ── DB helpers (tenant DB is env.DB; squad-scoping is the boundary) ────────────
+// ── DB helpers (tenant DB is env.DB; execution policy is checked after load) ──
 
-async function loadTaskForSquad(env: Env, taskId: string, squadId: string): Promise<Task | null> {
+async function loadTaskById(env: Env, taskId: string): Promise<Task | null> {
   // K1: gate_owner is selected so execute knows whether to land 'review' or 'done'
-  // on success. K6: status is used to no-op on gate-terminal statuses.
+  // on success. K6: status is used to no-op on gate-terminal statuses. done_when
+  // is required by the completion gate before a direct-done write.
   const row = await env.DB.prepare(
-    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
-       FROM tasks WHERE id = ? AND squad_id = ? LIMIT 1`,
+    `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+       FROM tasks WHERE id = ? LIMIT 1`,
   )
-    .bind(taskId, squadId)
+    .bind(taskId)
     .first<Task>()
   return row ?? null
+}
+
+async function canAgentExecuteTask(env: Env, agent: Agent, task: Task): Promise<boolean> {
+  if (task.assignee_agent_id === null) {
+    return task.squad_id === agent.squad_id
+  }
+  if (task.assignee_agent_id !== agent.id) return false
+
+  const assignee = await resolveTaskAssignee(env, agent.id, task.squad_id)
+  return assignee.error === undefined && assignee.value === agent.id
 }
 
 async function loadSquadCharter(env: Env, squadId: string): Promise<string | null> {
