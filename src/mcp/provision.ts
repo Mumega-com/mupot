@@ -23,7 +23,7 @@
 //   mint_agent_token  — admin on the agent's squad (org/department inherit) → show-once raw
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
-import type { Capability, Env, BusEvent } from '../types'
+import type { Capability, CapabilityGrant, Env, BusEvent, Squad } from '../types'
 import { hasCapability } from '../auth/capability'
 import { createDepartment, createSquad, createAgent } from '../org/service'
 import {
@@ -111,6 +111,15 @@ function resolveFail(reason: 'not_found' | 'ambiguous', notFoundCode: string) {
 function createErrorToFail(error: string) {
   const status = error === 'slug_taken' ? 409 : 400
   return fail(status, error)
+}
+
+/** Check whether the caller's effective target-squad grant covers a requested capability. */
+export function callerCanGrantAgentCapability(
+  grants: CapabilityGrant[],
+  squad: Pick<Squad, 'id' | 'department_id'>,
+  capability: Capability,
+): boolean {
+  return hasCapability(grants, 'squad', squad.id, capability, squad.department_id)
 }
 
 // ── create_department ───────────────────────────────────────────────────────────
@@ -349,7 +358,11 @@ const toolGrantAgentCapability: ToolSpec = {
   args: '{ agent: string (id|slug), squad: string (id|slug), capability: "observer"|"member"|"lead"|"admin" }',
   inputSchema: {
     type: 'object',
-    properties: { agent: STRING_SCHEMA, squad: STRING_SCHEMA, capability: STRING_SCHEMA },
+    properties: {
+      agent: STRING_SCHEMA,
+      squad: STRING_SCHEMA,
+      capability: { type: 'string', enum: ['observer', 'member', 'lead', 'admin'] },
+    },
     required: ['agent', 'squad', 'capability'],
     additionalProperties: false,
   },
@@ -376,7 +389,7 @@ const toolGrantAgentCapability: ToolSpec = {
     if (!(await memberCanOnSquad(env, grants, squad.id, 'admin'))) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
     }
-    if (!hasCapability(grants, 'squad', squad.id, capability, squad.department_id)) {
+    if (!callerCanGrantAgentCapability(grants, squad, capability)) {
       return fail(403, 'cannot_grant_above_own_rank')
     }
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { mcpApp } from '../src/mcp'
+import { callerCanGrantAgentCapability } from '../src/mcp/provision'
 import type { Capability, CapabilityGrant, Env } from '../src/types'
 
 // The provision tools (create_squad / create_agent / mint_agent_token) are the in-band
@@ -189,7 +190,7 @@ describe('provision tools — advertised', () => {
       properties: {
         agent: { type: 'string' },
         squad: { type: 'string' },
-        capability: { type: 'string' },
+        capability: { type: 'string', enum: ['observer', 'member', 'lead', 'admin'] },
       },
       required: ['agent', 'squad', 'capability'],
       additionalProperties: false,
@@ -618,7 +619,7 @@ describe('grant_agent_capability', () => {
     expect(captured).toEqual([])
   })
 
-  it('rejects an admin grant above a caller limited to target-squad lead', async () => {
+  it('retains the target-squad admin gate for a caller limited to lead', async () => {
     const grants: CapabilityGrant[] = [
       { member_id: 'member-operator', scope_type: 'squad', scope_id: TARGET_SQUAD.id, capability: 'lead' },
     ]
@@ -630,5 +631,20 @@ describe('grant_agent_capability', () => {
     )
     expect(res.status).toBe(403)
     expect(captured).toEqual([])
+  })
+})
+
+describe('grant_agent_capability authorization ceiling', () => {
+  it('evaluates requested capability against the caller effective target-squad grants', () => {
+    const leadGrants: CapabilityGrant[] = [
+      { member_id: 'member-operator', scope_type: 'squad', scope_id: TARGET_SQUAD.id, capability: 'lead' },
+    ]
+    const adminGrants: CapabilityGrant[] = [
+      { member_id: 'member-operator', scope_type: 'squad', scope_id: TARGET_SQUAD.id, capability: 'admin' },
+    ]
+
+    expect(callerCanGrantAgentCapability(leadGrants, TARGET_SQUAD, 'lead')).toBe(true)
+    expect(callerCanGrantAgentCapability(leadGrants, TARGET_SQUAD, 'admin')).toBe(false)
+    expect(callerCanGrantAgentCapability(adminGrants, TARGET_SQUAD, 'admin')).toBe(true)
   })
 })
