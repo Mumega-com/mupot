@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from 'vitest'
 import type { MessageBatch } from '@cloudflare/workers-types'
 import { handleQueue } from '../src/bus/consumer'
 import type { BusEvent, Env } from '../src/types'
+import { postAgentActivity } from '../src/channels'
+
+vi.mock('../src/channels', () => ({ postAgentActivity: vi.fn(async () => undefined) }))
 
 function message(event: BusEvent) {
   return {
@@ -64,6 +67,7 @@ describe('bus queue consumer', () => {
     } as unknown as Env
     const event: BusEvent = {
       type: 'flight.landed', tenant: 'test', agent_id: 'agent-product',
+      actor: { kind: 'agent', id: 'agent-product' },
       payload: { outbox_id: 'outbox-1', flight_id: 'flight-1' },
       ts: '2026-07-10T00:00:00.000Z',
     }
@@ -75,6 +79,7 @@ describe('bus queue consumer', () => {
 
     expect(run).toHaveBeenCalledTimes(2)
     expect(log).toHaveBeenCalledTimes(1)
+    expect(postAgentActivity).toHaveBeenCalledTimes(1)
     expect(first.ack).toHaveBeenCalledOnce()
     expect(duplicate.ack).toHaveBeenCalledOnce()
     expect(first.retry).not.toHaveBeenCalled()

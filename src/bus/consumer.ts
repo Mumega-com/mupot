@@ -58,24 +58,24 @@ async function claimFlightEvent(env: Env, event: BusEvent): Promise<boolean> {
   return result.meta?.changes === 1
 }
 
-async function routeEvent(env: Env, event: BusEvent): Promise<void> {
+async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
   switch (event.type) {
     case 'agent.wake': {
       if (!event.agent_id) {
         // Nothing to wake — drop quietly (ack) rather than retry forever.
         console.error('bus: agent.wake missing agent_id', { tenant: event.tenant })
-        return
+        return true
       }
       await wakeAgent(env, event.agent_id, event)
-      return
+      return true
     }
     case 'squad.dispatch': {
       if (!event.squad_id) {
         console.error('bus: squad.dispatch missing squad_id', { tenant: event.tenant })
-        return
+        return true
       }
       await dispatchSquad(env, event.squad_id, event)
-      return
+      return true
     }
     case 'task.created':
     case 'lead.new': {
@@ -88,7 +88,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<void> {
           tenant: event.tenant,
         })
       }
-      return
+      return true
     }
     case 'task.updated':
     case 'task.completed':
@@ -105,22 +105,22 @@ async function routeEvent(env: Env, event: BusEvent): Promise<void> {
         tenant: event.tenant,
         squad_id: event.squad_id,
       })
-      return
+      return true
     }
     case 'flight.landed': {
-      if (!(await claimFlightEvent(env, event))) return
+      if (!(await claimFlightEvent(env, event))) return false
       console.log('bus: flight.landed', {
         tenant: event.tenant,
         squad_id: event.squad_id,
       })
-      return
+      return true
     }
     default: {
       // Exhaustiveness guard. Unknown types are acked (not retried) to avoid
       // poisoning the queue with events we will never understand.
       const _exhaustive: never = event.type
       console.error('bus: unknown event type', { type: _exhaustive, tenant: event.tenant })
-      return
+      return true
     }
   }
 }
@@ -132,11 +132,11 @@ async function routeEvent(env: Env, event: BusEvent): Promise<void> {
 export async function handleQueue(batch: MessageBatch<BusEvent>, env: Env): Promise<void> {
   for (const message of batch.messages as Message<BusEvent>[]) {
     try {
-      await routeEvent(env, message.body)
+      const routed = await routeEvent(env, message.body)
       // Best-effort live activity feed: surface agent actions into the squad's
       // bound channel. A feed-post failure must NOT retry the message (the work
       // already routed) — it is observability, not the action itself.
-      if (message.body.actor?.kind === 'agent') {
+      if (routed && message.body.actor?.kind === 'agent') {
         try {
           await postAgentActivity(env, message.body)
         } catch (e) {
