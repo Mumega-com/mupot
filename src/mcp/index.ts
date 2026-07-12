@@ -731,6 +731,62 @@ const toolTaskUpdate: ToolSpec = {
   },
 }
 
+// task_dispatch — wake the task's persisted assignee in execute mode. The caller
+// chooses only the task; the assignee and target squad are data-derived. Assignment
+// is revalidated immediately before emit, and runTaskExecution rechecks it again at
+// execution time so a queued wake cannot outlive a revoked cross-squad grant.
+const toolTaskDispatch: ToolSpec = {
+  name: 'task_dispatch',
+  scope: 'squad (of the task)',
+  min: 'member',
+  args: '{ task_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { task_id: STRING_SCHEMA },
+    required: ['task_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const taskId = str(args.task_id)
+    if (!taskId) return fail(400, 'invalid_args', 'task_id required')
+    const task = await loadTask(env, taskId)
+    if (!task) return fail(404, 'task_not_found')
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, task.squad_id, 'member'))) {
+      return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
+    }
+    if (task.status !== 'open' && task.status !== 'in_progress') {
+      return fail(409, 'task_not_runnable')
+    }
+    if (!task.assignee_agent_id) return fail(409, 'task_not_dispatchable')
+
+    const assignee = await resolveTaskAssignee(env, task.assignee_agent_id, task.squad_id)
+    if (assignee.error || assignee.value !== task.assignee_agent_id) {
+      return fail(409, 'task_not_dispatchable')
+    }
+
+    const memberId = auth.memberId as string
+    const event: BusEvent<{ task_id: string; by: string }> = {
+      type: 'agent.wake',
+      tenant: env.TENANT_SLUG,
+      squad_id: task.squad_id,
+      agent_id: task.assignee_agent_id,
+      actor: memberActor(memberId),
+      payload: { task_id: task.id, by: memberId },
+      ts: new Date().toISOString(),
+    }
+    await createBus(env).emit(event)
+
+    return done({
+      dispatched: true,
+      task_id: task.id,
+      agent_id: task.assignee_agent_id,
+      squad_id: task.squad_id,
+    })
+  },
+}
+
 function parseJsonArg(value: unknown): unknown | null {
   if (typeof value !== 'string' || value.length === 0 || value.length > 32_768) return null
   try {
@@ -1934,6 +1990,7 @@ export const TOOLS: ToolSpec[] = [
   toolTaskList,
   toolTaskBoard,
   toolTaskUpdate,
+  toolTaskDispatch,
   toolRemember,
   toolRecall,
   toolSquadRemember,
