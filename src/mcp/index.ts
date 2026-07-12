@@ -731,6 +731,93 @@ const toolTaskUpdate: ToolSpec = {
   },
 }
 
+// task_dispatch — wake the task's persisted assignee in execute mode. The caller
+// chooses only the task; the assignee and target squad are data-derived. Assignment
+// is revalidated immediately before emit, and runTaskExecution rechecks it again at
+// execution time so a queued wake cannot outlive a revoked cross-squad grant.
+const toolTaskDispatch: ToolSpec = {
+  name: 'task_dispatch',
+  scope: 'squad (of the task)',
+  min: 'member',
+  args: '{ task_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { task_id: STRING_SCHEMA },
+    required: ['task_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const taskId = str(args.task_id)
+    if (!taskId) return fail(400, 'invalid_args', 'task_id required')
+    const task = await loadTask(env, taskId)
+    if (!task) return fail(404, 'task_not_found')
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, task.squad_id, 'member'))) {
+      return fail(404, 'task_not_found')
+    }
+    if (task.status !== 'open' && task.status !== 'blocked' && task.status !== 'rejected') {
+      return fail(409, 'task_not_runnable')
+    }
+    if (!task.assignee_agent_id) return fail(409, 'task_not_dispatchable')
+
+    const assignee = await resolveTaskAssignee(env, task.assignee_agent_id, task.squad_id)
+    if (assignee.error || assignee.value !== task.assignee_agent_id) {
+      return fail(409, 'task_not_dispatchable')
+    }
+
+    const memberId = auth.memberId as string
+    const receiptId = crypto.randomUUID()
+    const dispatchedAt = new Date().toISOString()
+    await env.DB.prepare(
+      `INSERT INTO task_dispatch_receipts
+         (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, attempts)
+       VALUES (?, ?, ?, ?, ?, 'member', ?, ?, 1)`,
+    ).bind(
+      receiptId,
+      env.TENANT_SLUG,
+      task.id,
+      task.squad_id,
+      task.assignee_agent_id,
+      memberId,
+      dispatchedAt,
+    ).run()
+
+    const event: BusEvent<{ task_id: string; by: string; dispatch_receipt_id: string }> = {
+      type: 'agent.wake',
+      tenant: env.TENANT_SLUG,
+      squad_id: task.squad_id,
+      agent_id: task.assignee_agent_id,
+      actor: memberActor(memberId),
+      payload: { task_id: task.id, by: memberId, dispatch_receipt_id: receiptId },
+      ts: dispatchedAt,
+    }
+    try {
+      await createBus(env).emit(event)
+    } catch (error) {
+      const message = error instanceof Error ? error.message.slice(0, 500) : 'dispatch_failed'
+      await env.DB.prepare(
+        `UPDATE task_dispatch_receipts
+            SET last_error = ?
+          WHERE tenant = ? AND id = ?`,
+      ).bind(message, env.TENANT_SLUG, receiptId).run()
+      return fail(500, 'dispatch_failed', { receipt_id: receiptId })
+    }
+
+    return done({
+      dispatched: true,
+      task_id: task.id,
+      agent_id: task.assignee_agent_id,
+      squad_id: task.squad_id,
+      receipt: {
+        id: receiptId,
+        dispatched_by: memberActor(memberId),
+        dispatched_at: dispatchedAt,
+      },
+    })
+  },
+}
+
 function parseJsonArg(value: unknown): unknown | null {
   if (typeof value !== 'string' || value.length === 0 || value.length > 32_768) return null
   try {
@@ -1934,6 +2021,7 @@ export const TOOLS: ToolSpec[] = [
   toolTaskList,
   toolTaskBoard,
   toolTaskUpdate,
+  toolTaskDispatch,
   toolRemember,
   toolRecall,
   toolSquadRemember,

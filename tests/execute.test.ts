@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
-import { runTaskExecution, resolveTaskId, capResult, MAX_RESULT_CHARS } from '../src/agents/execute'
+import {
+  runTaskExecution,
+  resolveTaskId,
+  resolveDispatchReceiptId,
+  capResult,
+  MAX_RESULT_CHARS,
+} from '../src/agents/execute'
 import type { Agent, Task, ModelPort, BusEvent } from '../src/types'
 
 // ── test doubles ───────────────────────────────────────────────────────────────
@@ -40,8 +46,9 @@ function makeTask(over: Partial<Task> = {}): Task {
 // A hand-mocked DB: returns a seeded task for the scoped SELECT, a seeded charter
 // for the squad SELECT, and records every UPDATE so the test can assert the row
 // transitions (in_progress → done|blocked) and never gets stuck.
-function makeEnv(opts: { task: Task | null; charter?: string | null }) {
+function makeEnv(opts: { task: Task | null; charter?: string | null; updateChanges?: number[] }) {
   const updates: { sql: string; args: unknown[] }[] = []
+  const updateChanges = [...(opts.updateChanges ?? [])]
   const env = {
     TENANT_SLUG: 'test-tenant',
     DB: {
@@ -51,11 +58,18 @@ function makeEnv(opts: { task: Task | null; charter?: string | null }) {
             return {
               async first<T>() {
                 if (sql.includes('FROM tasks')) return (opts.task as unknown as T) ?? null
+                if (sql.includes('FROM agents')) return (AGENT as unknown as T)
+                if (sql.includes('SELECT department_id FROM squads')) {
+                  return ({ department_id: 'dept-1' } as unknown as T)
+                }
                 if (sql.includes('FROM squads')) return ({ charter: opts.charter ?? null } as unknown as T)
                 return null as unknown as T
               },
               async run() {
-                if (sql.includes('UPDATE tasks')) updates.push({ sql, args })
+                if (sql.includes('UPDATE tasks')) {
+                  updates.push({ sql, args })
+                  return { meta: { changes: updateChanges.shift() ?? 1 } }
+                }
                 return { meta: { changes: 1 } }
               },
             }
@@ -88,6 +102,17 @@ describe('resolveTaskId', () => {
   })
 })
 
+describe('resolveDispatchReceiptId', () => {
+  it('reads a receipt nested in a BusEvent payload', () => {
+    expect(resolveDispatchReceiptId({ payload: { dispatch_receipt_id: 'receipt-7' } })).toBe('receipt-7')
+  })
+
+  it('returns null for plain wakes and empty receipt ids', () => {
+    expect(resolveDispatchReceiptId({})).toBeNull()
+    expect(resolveDispatchReceiptId({ payload: { dispatch_receipt_id: '' } })).toBeNull()
+  })
+})
+
 describe('capResult', () => {
   it('passes short output through untouched', () => {
     expect(capResult('hello')).toBe('hello')
@@ -106,6 +131,7 @@ describe('runTaskExecution — success', () => {
     const remembered: string[] = []
 
     const r = await runTaskExecution(env, AGENT, 'task-1', {
+      executionReceiptId: 'dispatch-receipt-1',
       model: okModel('Here is the finished intro.'),
       emit: async (e) => {
         events.push(e)
@@ -121,8 +147,12 @@ describe('runTaskExecution — success', () => {
 
     // First UPDATE claims + flips to in_progress; the terminal UPDATE lands 'done'.
     expect(updates[0].sql).toContain("status = 'in_progress'")
+    expect(updates[0].sql).toContain('execution_receipt_id = ?')
+    expect(updates[0].args).toContain('dispatch-receipt-1')
     const terminal = updates[updates.length - 1]
     expect(terminal.sql).toContain('SET status = ?')
+    expect(terminal.sql).toContain('execution_receipt_id = ?')
+    expect(terminal.args).toContain('dispatch-receipt-1')
     expect(terminal.args[0]).toBe('done')
     expect(terminal.args[1]).toBe('Here is the finished intro.')
     expect(terminal.args[2]).not.toBeNull() // completed_at stamped
@@ -254,6 +284,44 @@ describe('runTaskExecution — fail-closed scope (RBAC boundary)', () => {
     expect(remember).not.toHaveBeenCalled()
     expect(emit).not.toHaveBeenCalled()
   })
+
+  it('does not execute when assignment or status changes before the atomic claim', async () => {
+    const { env, updates } = makeEnv({
+      task: makeTask({ assignee_agent_id: AGENT.id }),
+      updateChanges: [0],
+    })
+    const model = okModel('must not run')
+    const emit = vi.fn()
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', {
+      model,
+      emit,
+      remember: async () => 'x',
+    })
+
+    expect(r).toMatchObject({ ok: false, error: 'task_claim_lost' })
+    expect(model.chat).not.toHaveBeenCalled()
+    expect(emit).not.toHaveBeenCalled()
+    expect(updates).toHaveLength(1)
+  })
+
+  it('does not overwrite a task reassigned while the model was running', async () => {
+    const { env, updates } = makeEnv({
+      task: makeTask({ assignee_agent_id: AGENT.id }),
+      updateChanges: [1, 0],
+    })
+    const model = okModel('stale result')
+    const emit = vi.fn()
+    const remember = vi.fn()
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', { model, emit, remember })
+
+    expect(r).toMatchObject({ ok: false, error: 'task_claim_lost' })
+    expect(model.chat).toHaveBeenCalledOnce()
+    expect(emit).not.toHaveBeenCalled()
+    expect(remember).not.toHaveBeenCalled()
+    expect(updates).toHaveLength(2)
+  })
 })
 
 describe('runTaskExecution — idempotency / K6 no-op gate statuses', () => {
@@ -279,6 +347,57 @@ describe('runTaskExecution — idempotency / K6 no-op gate statuses', () => {
       expect(updates).toHaveLength(0)
     })
   }
+
+  it('executes a legacy unowned in_progress task', async () => {
+    const { env, updates } = makeEnv({
+      task: makeTask({ status: 'in_progress', execution_receipt_id: null, execution_claim_expires_at: null }),
+    })
+    const model = okModel('legacy dispatch completed')
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', {
+      executionReceiptId: 'receipt-new', model, emit: async () => {}, remember: async () => 'x',
+    })
+
+    expect(r.ok).toBe(true)
+    expect(model.chat).toHaveBeenCalledOnce()
+    expect(updates[0].args).toContain('receipt-new')
+  })
+
+  it('no-ops while the same receipt has an active execution lease', async () => {
+    const { env, updates } = makeEnv({
+      task: makeTask({
+        status: 'in_progress', execution_receipt_id: 'receipt-1',
+        execution_claim_expires_at: Date.now() + 30_000,
+      }),
+    })
+    const model = okModel('must not duplicate')
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', {
+      executionReceiptId: 'receipt-1', model, emit: async () => {}, remember: async () => 'x',
+    })
+
+    expect(r).toMatchObject({ ok: true, decided: 'no_op:in_progress' })
+    expect(model.chat).not.toHaveBeenCalled()
+    expect(updates).toHaveLength(0)
+  })
+
+  it('does not auto-resume an expired owned execution', async () => {
+    const { env, updates } = makeEnv({
+      task: makeTask({
+        status: 'in_progress', execution_receipt_id: 'receipt-1',
+        execution_claim_expires_at: Date.now() - 1,
+      }),
+    })
+    const model = okModel('resumed work')
+
+    const r = await runTaskExecution(env, AGENT, 'task-1', {
+      executionReceiptId: 'receipt-1', model, emit: async () => {}, remember: async () => 'x',
+    })
+
+    expect(r).toMatchObject({ ok: true, decided: 'no_op:in_progress' })
+    expect(model.chat).not.toHaveBeenCalled()
+    expect(updates).toHaveLength(0)
+  })
 
   it('executes normally on rejected (rework authorised)', async () => {
     const { env, updates } = makeEnv({ task: makeTask({ status: 'rejected' }) })

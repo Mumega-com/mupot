@@ -15,7 +15,7 @@ import type { Env, Agent, Task, MemoryPort, ModelMessage } from '../types'
 import { createMemory } from '../memory'
 import { createModel } from '../model'
 import { createTask } from '../tasks/service'
-import { runTaskExecution, resolveTaskId } from './execute'
+import { runTaskExecution, resolveTaskId, resolveDispatchReceiptId } from './execute'
 import { runGoalCycle } from './loop'
 import { COOLDOWN_EXTENSION_MS } from './observer'
 import { resolveAgentIdentity } from './identity'
@@ -162,7 +162,8 @@ export class AgentDO extends DurableObject<Env> {
     const taskId = resolveTaskId(input)
     if (taskId) {
       const cycle = this.getCycles() + 1
-      const r = await runTaskExecution(this.env, agent, taskId)
+      const executionReceiptId = resolveDispatchReceiptId(input) ?? undefined
+      const r = await runTaskExecution(this.env, agent, taskId, { executionReceiptId })
       this.recordCycle(cycle, `execute: ${r.decided || r.error || 'no-op'}`)
       return {
         ok: r.ok,

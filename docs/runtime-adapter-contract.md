@@ -398,6 +398,7 @@ MCP tools:
 - `task_list { squad_id?, status?, assignee_agent_id?, limit? }`
 - `task_board { squad_id?, limit? }`
 - `task_update { task_id, title?, body?, done_when?, status?, assignee_agent_id?, gate_owner? }`
+- `task_dispatch { task_id }`
 
 Agent-bound tokens may omit `squad_id` for `task_list` and `task_board`; Mupot
 derives the caller's squad from the token's `auth.boundAgentId`. All task tools
@@ -416,6 +417,35 @@ active bound member identity whose current grants still provide effective
 cross-squad execution fail closed as `task_not_found`; direct and Workflow
 pipeline execution use this same policy. `task_update` also uses the same
 transition, `done_when`, and verdict-bypass guards as the HTTP task route.
+
+`task_dispatch` wakes the task's persisted assignee in execute mode. The caller
+requires `member+` on the task squad and cannot provide or override an agent id.
+Mupot revalidates that the assigned agent is active and currently assignable on
+the task squad before emitting the canonical `agent.wake` event with
+`payload.task_id`; the execution engine checks the same authority again when the
+wake is consumed. Only `open`, `blocked`, and `rejected` tasks are dispatchable;
+`in_progress` is a single-owner execution claim and duplicate wakes no-op.
+Unassigned, terminal, inactive, or no-longer-authorized assignments fail closed
+without emitting a wake event. Missing and caller-inaccessible task ids both
+return `task_not_found`.
+
+Each accepted dispatch inserts an append-only `task_dispatch_receipts` row before
+queue emission and returns its id, member dispatcher, and dispatch timestamp.
+The wake event carries `dispatch_receipt_id`; the Queue consumer atomically claims
+that receipt with a bounded lease before the AgentDO side effect. An active lease
+causes another delivery to retry, while an expired lease can be reclaimed after an
+interrupted Worker invocation. AgentDO records the same receipt id in the task's
+atomic execution claim. A retry that finds that id consumes the dispatch receipt
+without waking AgentDO again after the task reaches a terminal state. While the
+task remains `in_progress`, an execution lease suppresses concurrent retries. The
+retry is delayed to the lease boundary so it does not exhaust the Queue retry
+budget. On expiry, Mupot atomically marks the task `blocked` with an interruption
+receipt instead of silently repeating model spend; recovery requires an explicit
+governed redispatch with a new receipt. An unowned legacy `in_progress` task remains
+runnable, while a different receipt cannot take over an active execution. The
+consumer stamps `consumed_at` only after the assigned AgentDO accepts
+the task-scoped wake. Emission or wake failure leaves an attempt count and bounded
+error for operator diagnosis.
 
 Statuses:
 

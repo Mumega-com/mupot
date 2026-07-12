@@ -410,11 +410,11 @@ export async function startTaskPipeline(
   squadId: string,
 ): Promise<{ instanceId: string }> {
   const task = await env.DB.prepare(
-    `SELECT id, squad_id, status, assignee_agent_id, workflow_instance_id
+    `SELECT id, squad_id, status, assignee_agent_id, workflow_instance_id, execution_receipt_id
        FROM tasks WHERE id = ? AND squad_id = ? LIMIT 1`,
   )
     .bind(taskId, squadId)
-    .first<Pick<Task, 'id' | 'squad_id' | 'status' | 'assignee_agent_id'> & { workflow_instance_id: string | null }>()
+    .first<Pick<Task, 'id' | 'squad_id' | 'status' | 'assignee_agent_id' | 'execution_receipt_id'> & { workflow_instance_id: string | null }>()
 
   if (!task) {
     throw Object.assign(new Error('task_not_found'), { code: 'task_not_found' as const })
@@ -428,7 +428,7 @@ export async function startTaskPipeline(
   }
 
   const RUNNABLE: ReadonlySet<Task['status']> = new Set(['open', 'in_progress', 'blocked', 'rejected'])
-  if (!RUNNABLE.has(task.status)) {
+  if (!RUNNABLE.has(task.status) || (task.status === 'in_progress' && task.execution_receipt_id)) {
     throw Object.assign(new Error('task_not_runnable'), {
       code: 'task_not_runnable' as const,
       status: task.status,

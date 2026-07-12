@@ -11,7 +11,7 @@
 //    target-squad authority; unassigned tasks remain home-squad-only;
 //  - idempotent: a task already 'done' is left untouched (the bus may redeliver);
 //  - K6: execute no-ops for gate-terminal statuses (approved, review) and
-//    already-terminal statuses (done). Only {open, in_progress, blocked, rejected}
+//    already-terminal statuses (done). Only {open, blocked, rejected}
 //    proceed to execution. This prevents a re-wake from resurrecting an approved or
 //    under-review task back to in_progress.
 //  - mark in_progress + claim the assignee (if unset) BEFORE the model call;
@@ -40,6 +40,9 @@ export const MAX_RESULT_CHARS = 16 * 1024
 // Tokens the execute call may spend. Conservative cap; the org's provider/model
 // choice still applies (createModel routes by org settings).
 export const EXECUTE_MAX_TOKENS = 2048
+// Long enough for a normal model cycle; bounded so a terminated AgentDO can be
+// resumed by the same receipt instead of leaving the task in_progress forever.
+export const EXECUTION_CLAIM_LEASE_MS = 15 * 60_000
 
 export interface ExecuteResult {
   ok: boolean
@@ -52,6 +55,9 @@ export interface ExecuteResult {
 // Injectable seams so the orchestration can be unit-tested without a DO or a
 // live model. Defaults wire the real model + bus.
 export interface ExecuteDeps {
+  // Durable ownership token for this execution attempt. Queue dispatch passes its
+  // receipt ID; direct callers get a fresh ID so concurrent claims remain isolated.
+  executionReceiptId?: string
   model?: ModelPort
   emit?: (event: BusEvent) => Promise<void>
   // Best-effort memory write on success so the agent's future recalls compound on
@@ -76,10 +82,11 @@ export async function runTaskExecution(
   const remember =
     deps.remember ?? ((id: string, text: string, concepts?: string[]) => createMemory(env).remember(id, text, concepts))
   const meter = deps.meter ?? { checkAndReserve, recordTokens }
+  const executionReceiptId = deps.executionReceiptId ?? crypto.randomUUID()
 
   // Load within this tenant DB, then fail closed on assignment and current
   // authority. The coarse response intentionally does not reveal which check failed.
-  const task = await loadTaskById(env, taskId)
+  let task = await loadTaskById(env, taskId)
   if (!task || !(await canAgentExecuteTask(env, agent, task))) {
     return { ok: false, task_id: taskId, decided: `task ${taskId} not found`, error: 'task_not_found' }
   }
@@ -88,21 +95,33 @@ export async function runTaskExecution(
   // (review, approved) and done are no-ops. A re-wake must NOT resurrect an
   // approved or under-review task back to in_progress.
   //
-  // Workable: open | in_progress | blocked | rejected
-  // No-op:    done | review | approved
+  // Workable: open | blocked | rejected
+  // No-op:    in_progress | done | review | approved
   //
   // 'rejected' is workable — it means rework is authorised; the agent should
   // re-attempt the task. 'blocked' is workable — the caller may retry after
   // resolving the blocker.
-  const WORKABLE: ReadonlySet<Task['status']> = new Set(['open', 'in_progress', 'blocked', 'rejected'])
-  if (!WORKABLE.has(task.status)) {
+  const WORKABLE: ReadonlySet<Task['status']> = new Set(['open', 'blocked', 'rejected'])
+  const now = Date.now()
+  const resumableInProgress = task.status === 'in_progress' && !task.execution_receipt_id
+  if (!WORKABLE.has(task.status) && !resumableInProgress) {
     return { ok: true, task_id: taskId, decided: `no_op:${task.status}`, task_status: task.status }
   }
 
   // Claim + mark working before spending the model budget.
   const startedAt = new Date().toISOString()
-  const assignee = task.assignee_agent_id ?? agent.id
-  await setTaskProgress(env, task.id, assignee, startedAt)
+  const executionClaimExpiresAt = now + EXECUTION_CLAIM_LEASE_MS
+  const claimed = await claimTaskProgress(
+    env, task, agent, startedAt, executionReceiptId, executionClaimExpiresAt,
+  )
+  if (!claimed) {
+    return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+  }
+  const claimedTask = await loadTaskById(env, task.id)
+  if (!claimedTask || !(await canAgentExecuteTask(env, agent, claimedTask))) {
+    return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+  }
+  task = claimedTask
 
   // ── Rate-limit check (issue #4): enforce per-agent daily dispatch + token caps ──
   // Runs AFTER claiming the task (so status is never left as stale 'open') but
@@ -128,7 +147,9 @@ export async function runTaskExecution(
       `Retry after ${meterResult.retryAfterSec}s (next UTC day resets the window).`,
     )
     const finishedAt = new Date().toISOString()
-    await finishTask(env, task.id, 'blocked', note, finishedAt)
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt))) {
+      return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+    }
     await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
     return {
       ok: false,
@@ -175,7 +196,9 @@ export async function runTaskExecution(
           `done_when_placeholder: cannot mark done — done_when is a placeholder sentinel ("${String(task.done_when).trim()}"). ` +
           'Update done_when to a real, checkable predicate before retrying.',
         )
-        await finishTask(env, task.id, 'blocked', note, finishedAt, cycleCostMicroUsd)
+        if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, cycleCostMicroUsd))) {
+          return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+        }
         await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
         return {
           ok: false,
@@ -186,7 +209,10 @@ export async function runTaskExecution(
         }
       }
     }
-    await finishTask(env, task.id, successStatus, result, finishedAt, cycleCostMicroUsd)
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, successStatus, result, finishedAt, cycleCostMicroUsd))) {
+      await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd)
+      return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+    }
     // Emit task.completed for ungated (terminal); task.review for gated (awaiting verdict).
     const eventType = successStatus === 'done' ? 'task.completed' : 'task.review'
     await emitSafe(emit, executionEvent(eventType, env, agent, task, successStatus))
@@ -202,7 +228,10 @@ export async function runTaskExecution(
     const note = capResult(`Execution failed: ${msg}`)
     const finishedAt = new Date().toISOString()
     // NEVER leave in_progress stuck — land it in blocked with the error note.
-    await finishTask(env, task.id, 'blocked', note, finishedAt, cycleCostMicroUsd)
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, cycleCostMicroUsd))) {
+      await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd)
+      return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+    }
     await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
     // Still count tokens + cost on model failure: the call was attempted.
     await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd)
@@ -217,7 +246,9 @@ async function loadTaskById(env: Env, taskId: string): Promise<Task | null> {
   // on success. K6: status is used to no-op on gate-terminal statuses. done_when
   // is required by the completion gate before a direct-done write.
   const row = await env.DB.prepare(
-    `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+    `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url,
+            result, completed_at, gate_owner, execution_receipt_id, execution_claim_expires_at,
+            created_at, updated_at
        FROM tasks WHERE id = ? LIMIT 1`,
   )
     .bind(taskId)
@@ -242,17 +273,47 @@ async function loadSquadCharter(env: Env, squadId: string): Promise<string | nul
   return row?.charter ?? null
 }
 
-async function setTaskProgress(env: Env, taskId: string, assignee: string, updatedAt: string): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE tasks SET status = 'in_progress', assignee_agent_id = ?, updated_at = ? WHERE id = ?`,
-  )
-    .bind(assignee, updatedAt, taskId)
-    .run()
+async function claimTaskProgress(
+  env: Env,
+  task: Task,
+  agent: Agent,
+  updatedAt: string,
+  executionReceiptId: string,
+  executionClaimExpiresAt: number,
+): Promise<boolean> {
+  const isResume = task.status === 'in_progress'
+  const executionCondition = isResume ? ' AND execution_receipt_id IS NULL' : ''
+  const result = task.assignee_agent_id === null
+    ? await env.DB.prepare(
+      `UPDATE tasks
+          SET status = 'in_progress', assignee_agent_id = ?, updated_at = ?,
+              execution_receipt_id = ?, execution_claim_expires_at = ?
+        WHERE id = ? AND squad_id = ? AND status = ? AND assignee_agent_id IS NULL
+          ${executionCondition}
+          AND EXISTS (SELECT 1 FROM agents WHERE id = ? AND status = 'active')`,
+    ).bind(
+      agent.id, updatedAt, executionReceiptId, executionClaimExpiresAt,
+      task.id, agent.squad_id, task.status, agent.id,
+    ).run()
+    : await env.DB.prepare(
+      `UPDATE tasks
+          SET status = 'in_progress', updated_at = ?, execution_receipt_id = ?,
+              execution_claim_expires_at = ?
+        WHERE id = ? AND squad_id = ? AND status = ? AND assignee_agent_id = ?
+          ${executionCondition}
+          AND EXISTS (SELECT 1 FROM agents WHERE id = ? AND status = 'active')`,
+    ).bind(
+      updatedAt, executionReceiptId, executionClaimExpiresAt,
+      task.id, task.squad_id, task.status, agent.id, agent.id,
+    ).run()
+  return result.meta?.changes === 1
 }
 
 async function finishTask(
   env: Env,
   taskId: string,
+  agentId: string,
+  executionReceiptId: string,
   // K1: 'review' is a valid success-landing for gated tasks (awaits verdict).
   status: 'done' | 'blocked' | 'review',
   result: string,
@@ -260,12 +321,19 @@ async function finishTask(
   // #15: cost of the cycle in micro-USD, stamped on the task for the per-task
   // cost chip. Defaults to 0 so non-execute callers stay unchanged.
   costMicroUsd = 0,
-): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE tasks SET status = ?, result = ?, completed_at = ?, updated_at = ?, cost_micro_usd = ? WHERE id = ?`,
+): Promise<boolean> {
+  const dbResult = await env.DB.prepare(
+    `UPDATE tasks
+        SET status = ?, result = ?, completed_at = ?, updated_at = ?, cost_micro_usd = ?,
+            execution_claim_expires_at = NULL
+      WHERE id = ? AND assignee_agent_id = ? AND execution_receipt_id = ? AND status = 'in_progress'`,
   )
-    .bind(status, result, completedAt, completedAt, Math.max(0, Math.round(costMicroUsd)), taskId)
+    .bind(
+      status, result, completedAt, completedAt, Math.max(0, Math.round(costMicroUsd)),
+      taskId, agentId, executionReceiptId,
+    )
     .run()
+  return dbResult.meta?.changes === 1
 }
 
 // ── prompts ────────────────────────────────────────────────────────────────────
@@ -367,6 +435,15 @@ export function resolveTaskId(input: { task_id?: unknown; payload?: unknown }): 
   if (payload && typeof payload === 'object' && 'task_id' in payload) {
     const v = (payload as Record<string, unknown>).task_id
     if (typeof v === 'string' && v.length > 0) return v
+  }
+  return null
+}
+
+export function resolveDispatchReceiptId(input: { payload?: unknown }): string | null {
+  const payload = input.payload
+  if (payload && typeof payload === 'object' && 'dispatch_receipt_id' in payload) {
+    const value = (payload as Record<string, unknown>).dispatch_receipt_id
+    if (typeof value === 'string' && value.length > 0) return value
   }
   return null
 }

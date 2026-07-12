@@ -243,6 +243,8 @@ describe('shared execution authorization', () => {
           completed_at TEXT,
           gate_owner TEXT,
           cost_micro_usd INTEGER NOT NULL DEFAULT 0,
+          execution_receipt_id TEXT,
+          execution_claim_expires_at INTEGER,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
@@ -606,6 +608,7 @@ describe('startTaskPipeline', () => {
                     status: opts.task.status ?? 'open',
                     assignee_agent_id: assigneeId,
                     workflow_instance_id: opts.task.workflow_instance_id ?? null,
+                    execution_receipt_id: opts.task.execution_receipt_id ?? null,
                   } as unknown as T
                 },
                 async run() {
@@ -671,6 +674,17 @@ describe('startTaskPipeline', () => {
     await expect(startTaskPipeline(env, 'task-wf-1', 'squad-wf-1')).rejects.toMatchObject({
       code: 'task_not_runnable',
     })
+  })
+
+  it('refuses to start another workflow for an actively owned in_progress task', async () => {
+    const { env } = makeStartEnv({
+      task: { status: 'in_progress', execution_receipt_id: 'receipt-active', workflow_instance_id: null },
+    })
+
+    await expect(startTaskPipeline(env, 'task-wf-1', 'squad-wf-1')).rejects.toMatchObject({
+      code: 'task_not_runnable',
+    })
+    expect(env.TASK_WORKFLOW!.create).not.toHaveBeenCalled()
   })
 
   it('refuses to start when task has no assignee', async () => {

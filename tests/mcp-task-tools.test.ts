@@ -48,12 +48,16 @@ type CrossSquadAssignee = {
   capability?: Capability
 }
 
-function makeEnv(rows: Task[] = [task()], crossSquadAssignee: CrossSquadAssignee = {}) {
+function makeEnv(
+  rows: Task[] = [task()],
+  crossSquadAssignee: CrossSquadAssignee = {},
+  agentStatuses: Partial<Record<string, string>> = {},
+) {
   const updates: { sql: string; args: unknown[] }[] = []
   const events: unknown[] = []
   const agents = new Map([
-    [AGENT_ID, { id: AGENT_ID, squad_id: SQUAD_ID, slug: 'agent-one', name: 'Agent One', role: null, model: null, status: 'active', created_at: 'now' }],
-    ['agent-other', { id: 'agent-other', squad_id: OTHER_SQUAD_ID, slug: 'other', name: 'Other', role: null, model: null, status: 'active', created_at: 'now' }],
+    [AGENT_ID, { id: AGENT_ID, squad_id: SQUAD_ID, slug: 'agent-one', name: 'Agent One', role: null, model: null, status: agentStatuses[AGENT_ID] ?? 'active', created_at: 'now' }],
+    ['agent-other', { id: 'agent-other', squad_id: OTHER_SQUAD_ID, slug: 'other', name: 'Other', role: null, model: null, status: agentStatuses['agent-other'] ?? 'active', created_at: 'now' }],
   ])
   const squads = new Map([
     [SQUAD_ID, { id: SQUAD_ID, department_id: 'dept-1', slug: 'squad-one', name: 'Squad One', charter: null, created_at: 'now' }],
@@ -132,9 +136,9 @@ function makeEnv(rows: Task[] = [task()], crossSquadAssignee: CrossSquadAssignee
 }
 
 describe('MCP task cutover tools', () => {
-  it('advertises task_list, task_board, and task_update on the MCP surface', () => {
+  it('advertises task_list, task_board, task_update, and task_dispatch on the MCP surface', () => {
     const names = TOOLS.map((t) => t.name)
-    expect(names).toEqual(expect.arrayContaining(['task_create', 'task_list', 'task_board', 'task_update']))
+    expect(names).toEqual(expect.arrayContaining(['task_create', 'task_list', 'task_board', 'task_update', 'task_dispatch']))
   })
 
   it('advertises an optional task_create assignee', () => {
@@ -352,5 +356,116 @@ describe('MCP task cutover tools', () => {
     const result = res.result as { task: Task }
     expect(result.task.completed_at).toBe(completedAt)
     expect(result.task.updated_at).not.toBe(task().updated_at)
+  })
+
+  it('task_dispatch emits a canonical task-scoped wake for the stored assignee', async () => {
+    const { env, events, updates } = makeEnv([task({ assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
+
+    expect(res).toMatchObject({
+      ok: true,
+      result: {
+        dispatched: true,
+        task_id: 'task-1',
+        agent_id: AGENT_ID,
+        squad_id: SQUAD_ID,
+        receipt: {
+          id: expect.any(String),
+          dispatched_by: { kind: 'member', id: MEMBER_ID },
+          dispatched_at: expect.any(String),
+        },
+      },
+    })
+    const result = res.result as { receipt: { id: string } }
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: 'agent.wake',
+        tenant: TENANT,
+        squad_id: SQUAD_ID,
+        agent_id: AGENT_ID,
+        actor: { kind: 'member', id: MEMBER_ID },
+        payload: {
+          task_id: 'task-1',
+          by: MEMBER_ID,
+          dispatch_receipt_id: result.receipt.id,
+        },
+      }),
+    ])
+    expect(updates.filter((update) => update.sql.includes('task_dispatch_receipts'))).toHaveLength(1)
+  })
+
+  it('task_dispatch refuses an unassigned task without emitting a wake', async () => {
+    const { env, events } = makeEnv([task()])
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'task_not_dispatchable' })
+    expect(events).toEqual([])
+  })
+
+  it('task_dispatch refuses a task outside the caller capability scope', async () => {
+    const { env, events } = makeEnv([
+      task({ squad_id: OTHER_SQUAD_ID, assignee_agent_id: 'agent-other' }),
+    ])
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
+
+    expect(res).toMatchObject({ ok: false, status: 404, error: 'task_not_found' })
+    expect(events).toEqual([])
+  })
+
+  it('task_dispatch revalidates cross-squad assignment before emitting a wake', async () => {
+    const { env, events } = makeEnv(
+      [task({ assignee_agent_id: 'agent-other' })],
+      { memberId: 'member-other', capability: 'member' },
+    )
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
+
+    expect(res).toMatchObject({ ok: true, result: { agent_id: 'agent-other' } })
+    expect(events).toHaveLength(1)
+  })
+
+  it('task_dispatch fails closed when cross-squad authority was revoked', async () => {
+    const { env, events } = makeEnv([task({ assignee_agent_id: 'agent-other' })])
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'task_not_dispatchable' })
+    expect(events).toEqual([])
+  })
+
+  it('task_dispatch fails closed when the assigned agent is inactive', async () => {
+    const { env, events } = makeEnv(
+      [task({ assignee_agent_id: AGENT_ID })],
+      {},
+      { [AGENT_ID]: 'paused' },
+    )
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'task_not_dispatchable' })
+    expect(events).toEqual([])
+  })
+
+  it('task_dispatch refuses terminal tasks', async () => {
+    const { env, events } = makeEnv([task({ status: 'done', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'task_not_runnable' })
+    expect(events).toEqual([])
+  })
+
+  it('task_dispatch refuses an already in-progress task', async () => {
+    const { env, events } = makeEnv([
+      task({ status: 'in_progress', assignee_agent_id: AGENT_ID }),
+    ])
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'task_not_runnable' })
+    expect(events).toEqual([])
   })
 })

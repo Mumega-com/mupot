@@ -236,6 +236,10 @@ export interface Task {
   // POST /api/tasks/:id/pipeline.  Null on the legacy direct-execute path.
   // Used by the verdict endpoint to best-effort resume the waiting instance.
   workflow_instance_id?: string | null
+  // At-most-once execution ownership. Dispatch receipts are retained after a
+  // terminal write for Queue recovery; the lease is cleared on completion.
+  execution_receipt_id?: string | null
+  execution_claim_expires_at?: number | null
   created_at: string
   updated_at: string
 }
