@@ -19,7 +19,17 @@ import { Hono } from 'hono'
 import type { Env } from '../types'
 import { resolveOrgAdmin } from '../auth/member-bearer'
 import { dispatchFlight } from './dispatch'
-import { landFlight, failFlight, getFlight, listFlights, type FlightStatus, type TriggerSource } from './service'
+import {
+  deliverFlightLandedEvent,
+  failFlight,
+  getFlight,
+  landFlight,
+  landGovernedFlight,
+  listFlights,
+  listIncompleteFlightTaskIds,
+  type FlightStatus,
+  type TriggerSource,
+} from './service'
 import type { FlightSignals, PreflightOptions } from './preflight'
 import { parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from './meta'
 
@@ -148,6 +158,50 @@ flightsApp.post('/:id/land', async (c) => {
   if (!existing) return c.json({ error: 'not_found' }, 404)
 
   const b = (await c.req.json().catch(() => ({}))) as Record<string, unknown>
+  let governedMeta: FlightMetaV1 | null = null
+  try {
+    governedMeta = parseFlightMetaV1(JSON.parse(existing.meta))
+  } catch {
+    governedMeta = null
+  }
+  if (governedMeta) {
+    const cost = b.cost_micro_usd == null ? 0 : b.cost_micro_usd
+    const score = b.score
+    if (!Number.isSafeInteger(cost) || (cost as number) < 0) {
+      return c.json({ error: 'invalid_flight_cost' }, 400)
+    }
+    if (score !== undefined && (typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 1)) {
+      return c.json({ error: 'invalid_flight_score' }, 400)
+    }
+    if (!['running', 'waiting', 'sleeping'].includes(existing.status)) {
+      return c.json({ error: 'flight_not_in_air', status: existing.status }, 409)
+    }
+    if (!Number.isSafeInteger(existing.budget_micro_usd) || (existing.budget_micro_usd as number) < 0) {
+      return c.json({ error: 'flight_budget_policy_missing' }, 409)
+    }
+    if ((cost as number) > (existing.budget_micro_usd as number)) {
+      return c.json({ error: 'flight_budget_exceeded', budget_micro_usd: existing.budget_micro_usd }, 409)
+    }
+    const transitioned = await landGovernedFlight(c.env, id, {
+      cost_micro_usd: cost as number,
+      score: score as number | undefined,
+      agent_id: existing.agent,
+      meta: governedMeta,
+      actor: { kind: 'member', id: auth.id.memberId },
+    })
+    if (!transitioned) {
+      const incompleteTaskIds = await listIncompleteFlightTaskIds(c.env, governedMeta.task_ids)
+      if (incompleteTaskIds.length > 0) {
+        return c.json({ error: 'flight_tasks_incomplete', task_ids: incompleteTaskIds }, 409)
+      }
+      return c.json({ error: 'flight_transition_conflict' }, 409)
+    }
+    const landed = await getFlight(c.env, id)
+    if (!landed || landed.status !== 'landed') return c.json({ error: 'flight_record_missing' }, 500)
+    await deliverFlightLandedEvent(c.env, landed.id)
+    return c.json({ ok: true, id, status: landed.status })
+  }
+
   const cost_micro_usd = b.cost_micro_usd == null ? undefined : asNum(b.cost_micro_usd, 0, 0)
   const score = b.score == null ? undefined : asNum(b.score, 0, 0, 1)
   await landFlight(c.env, id, { cost_micro_usd, score })

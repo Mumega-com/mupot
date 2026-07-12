@@ -59,6 +59,16 @@ const contract = JSON.parse(
     scope: string
     presence: string
   }
+  flights: {
+    mcpTools: string[]
+    identitySource: string
+    authorization: { read: string; land: string }
+    taskCompletion: string
+    budgetPolicy: string
+    terminalEvent: string
+    eventDelivery: string
+    consumerDeduplication: string
+  }
   tasks: {
     mcpTools: string[]
     defaultSquad: string
@@ -207,6 +217,20 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(contract.peerDiscovery.authorization).toBe('observer-on-target-squad')
     expect(contract.peerDiscovery.scope).toBe('single-squad-roster')
     expect(contract.peerDiscovery.presence).toBe('latest-check-in-per-agent')
+  })
+
+  it('tracks governed flight dispatch, visibility, and landing semantics', () => {
+    expect(contract.flights.mcpTools).toEqual(['flight_dispatch', 'flight_get', 'flight_list', 'flight_land'])
+    expect(contract.flights.identitySource).toBe('auth.boundAgentId')
+    expect(contract.flights.authorization).toEqual({
+      read: 'observer-on-every-referenced-squad',
+      land: 'bound-agent-own-flight-and-member-on-every-referenced-squad',
+    })
+    expect(contract.flights.taskCompletion).toBe('done-and-latest-verdict-approved-when-gated')
+    expect(contract.flights.budgetPolicy).toBe('reported-cost-lte-immutable-declared-budget')
+    expect(contract.flights.terminalEvent).toBe('flight.landed')
+    expect(contract.flights.eventDelivery).toBe('transactional-d1-outbox-with-immediate-attempt-and-cron-retry')
+    expect(contract.flights.consumerDeduplication).toBe('atomic-consumed-at-claim-by-outbox-id')
   })
 
   it('keeps Hermes and local smoke coverage on the same lifecycle language', () => {

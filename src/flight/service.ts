@@ -6,6 +6,7 @@
 // cannot be revived; a held/landed flight cannot be re-landed) — same discipline as loops.
 
 import type { Env } from '../types'
+import { createBus } from '../bus'
 import type { PreflightResult } from './preflight'
 import type { FlightMetaV1 } from './meta'
 
@@ -101,6 +102,172 @@ export async function landFlight(
   )
     .bind(id, env.TENANT_SLUG, opts.cost_micro_usd ?? 0, opts.score ?? null, Date.now())
     .run()
+}
+
+export async function landGovernedFlight(
+  env: Env,
+  id: string,
+  opts: {
+    cost_micro_usd: number
+    score?: number
+    expected_agent?: string
+    agent_id: string
+    meta: FlightMetaV1
+    actor: { kind: 'member' | 'agent'; id: string }
+  },
+): Promise<boolean> {
+  const endedAt = Date.now()
+  const createdAt = new Date(endedAt).toISOString()
+  const eventId = crypto.randomUUID()
+  const payload = JSON.stringify({
+    outbox_id: eventId,
+    flight_id: id,
+    agent_id: opts.agent_id,
+    squad_ids: opts.meta.squad_ids,
+    task_ids: opts.meta.task_ids,
+    cost_micro_usd: opts.cost_micro_usd,
+    score: opts.score ?? null,
+  })
+  const transition = env.DB.prepare(
+    `UPDATE flights SET status='landed', cost_micro_usd=?4, score=COALESCE(?5, score), ended_at=?6
+     WHERE id=?1 AND tenant=?2
+       AND (?3 IS NULL OR agent=?3)
+       AND status IN ('running','waiting','sleeping')
+       AND budget_micro_usd IS NOT NULL AND ?4 <= budget_micro_usd
+       AND json_valid(meta)
+       AND json_extract(meta, '$.schema') = 'mupot.flight.meta/v1'
+       AND NOT EXISTS (
+         SELECT 1
+           FROM json_each(flights.meta, '$.task_ids') AS task_ref
+           LEFT JOIN tasks AS task ON task.id = task_ref.value
+          WHERE task.id IS NULL
+             OR task.status <> 'done'
+             OR (
+               task.gate_owner IS NOT NULL
+               AND COALESCE((
+                 SELECT verdict
+                   FROM task_verdicts
+                  WHERE task_id = task.id
+                  ORDER BY decided_at DESC, id DESC
+                  LIMIT 1
+               ), '') <> 'approved'
+             )
+       )`,
+  )
+    .bind(
+      id,
+      env.TENANT_SLUG,
+      opts.expected_agent ?? null,
+      opts.cost_micro_usd,
+      opts.score ?? null,
+      endedAt,
+    )
+  const outbox = env.DB.prepare(
+    `INSERT INTO flight_event_outbox
+       (id, tenant, flight_id, event_type, actor_kind, actor_id, payload, created_at)
+     SELECT ?1, ?2, ?3, 'flight.landed', ?4, ?5,
+            json_set(?6, '$.score', score, '$.cost_micro_usd', cost_micro_usd), ?7
+       FROM flights
+      WHERE id=?3 AND tenant=?2 AND status='landed' AND ended_at=?8
+     ON CONFLICT (tenant, flight_id, event_type) DO NOTHING`,
+  ).bind(eventId, env.TENANT_SLUG, id, opts.actor.kind, opts.actor.id, payload, createdAt, endedAt)
+  const [transitionResult, outboxResult] = await env.DB.batch([transition, outbox])
+  return transitionResult.meta?.changes === 1 && outboxResult.meta?.changes === 1
+}
+
+interface FlightTaskCompletionRow {
+  id: string
+  status: string
+  gate_owner: string | null
+  latest_verdict: string | null
+}
+
+export async function listIncompleteFlightTaskIds(env: Env, taskIds: string[]): Promise<string[]> {
+  if (taskIds.length === 0) return []
+  const placeholders = taskIds.map(() => '?').join(',')
+  const rows = await env.DB.prepare(
+    `SELECT id, status, gate_owner,
+            (SELECT verdict
+               FROM task_verdicts
+              WHERE task_id = tasks.id
+              ORDER BY decided_at DESC, id DESC
+              LIMIT 1) AS latest_verdict
+       FROM tasks WHERE id IN (${placeholders})`,
+  ).bind(...taskIds).all<FlightTaskCompletionRow>()
+  const byId = new Map((rows.results ?? []).map((task) => [task.id, task]))
+  return taskIds.filter((taskId) => {
+    const task = byId.get(taskId)
+    return !task || task.status !== 'done' || (task.gate_owner !== null && task.latest_verdict !== 'approved')
+  })
+}
+
+interface FlightEventOutboxRow {
+  id: string
+  tenant: string
+  flight_id: string
+  event_type: 'flight.landed'
+  actor_kind: 'member' | 'agent'
+  actor_id: string
+  payload: string
+  created_at: string
+  delivered_at: string | null
+  consumed_at: string | null
+  attempts: number
+  last_error: string | null
+}
+
+export async function deliverFlightLandedEvent(env: Env, flightId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT * FROM flight_event_outbox
+      WHERE tenant=?1 AND flight_id=?2 AND delivered_at IS NULL
+      LIMIT 1`,
+  ).bind(env.TENANT_SLUG, flightId).first<FlightEventOutboxRow>()
+  if (!row) return true
+  try {
+    const payload = JSON.parse(row.payload) as { squad_ids?: unknown; [key: string]: unknown }
+    const squadIds = Array.isArray(payload.squad_ids)
+      ? payload.squad_ids.filter((value): value is string => typeof value === 'string')
+      : []
+    await createBus(env).emit({
+      type: 'flight.landed',
+      tenant: env.TENANT_SLUG,
+      squad_id: squadIds[0],
+      agent_id: typeof payload.agent_id === 'string' ? payload.agent_id : undefined,
+      actor: { kind: row.actor_kind, id: row.actor_id },
+      payload,
+      ts: row.created_at,
+    })
+    await env.DB.prepare(
+      `UPDATE flight_event_outbox
+          SET delivered_at = ?3, attempts = attempts + 1, last_error = NULL
+        WHERE tenant=?1 AND flight_id=?2 AND delivered_at IS NULL`,
+    ).bind(env.TENANT_SLUG, flightId, new Date().toISOString()).run()
+    return true
+  } catch (error) {
+    const message = (error instanceof Error ? error.message : 'unknown_error').slice(0, 500)
+    await env.DB.prepare(
+      `UPDATE flight_event_outbox
+          SET last_error = ?3, attempts = attempts + 1
+        WHERE tenant=?1 AND flight_id=?2 AND delivered_at IS NULL`,
+    ).bind(env.TENANT_SLUG, flightId, message).run()
+    console.error('flight.landed event delivery failed', { flight_id: flightId, error: message })
+    return false
+  }
+}
+
+export async function flushFlightEventOutbox(env: Env, limit = 50): Promise<{ attempted: number; delivered: number }> {
+  const boundedLimit = Math.min(Math.max(Math.floor(limit), 1), 100)
+  const rows = await env.DB.prepare(
+    `SELECT * FROM flight_event_outbox
+      WHERE tenant=?1 AND delivered_at IS NULL
+      ORDER BY created_at ASC
+      LIMIT ?2`,
+  ).bind(env.TENANT_SLUG, boundedLimit).all<FlightEventOutboxRow>()
+  let delivered = 0
+  for (const row of rows.results ?? []) {
+    if (await deliverFlightLandedEvent(env, row.flight_id)) delivered += 1
+  }
+  return { attempted: rows.results?.length ?? 0, delivered }
 }
 
 // Fail a flight (errored). From any non-terminal state.

@@ -321,6 +321,7 @@ Stateful runtimes create and inspect governed flights through MCP:
 - `flight_dispatch { squad_id, goal, meta_json, signals_json, budget_micro_usd? }`
 - `flight_get { flight_id }`
 - `flight_list { squad_id, limit?, cursor? }`
+- `flight_land { flight_id, cost_micro_usd, score? }`
 
 `flight_dispatch` requires `member` capability on every squad named by the strict
 `mupot.flight.meta/v1` metadata and derives the flying agent from the authenticated
@@ -335,6 +336,22 @@ must fit the active agent's configured budget cap and every referenced squad cap
 Mupot replaces caller-supplied budget readiness signals with this server-derived
 allocation ceiling; actual model execution remains subject to the execution meter's
 windowed spend enforcement.
+
+`flight_land` is the executor's governed completion path. It requires an active,
+agent-bound token and only permits that bound agent to land its own visible flight.
+Every task referenced by the flight metadata must already be `done`. For a gated task,
+the latest append-only verdict must also be `approved`; `rejected → done` represents
+abandonment and cannot satisfy successful flight completion. Reported cost is a
+nonnegative integer and cannot exceed the flight's immutable declared budget. Only
+`running`, `waiting`, or `sleeping` flights can transition. Task completion, latest
+verdict, budget, agent ownership, and in-air status are rechecked by the same atomic D1
+transition, so a concurrent terminal transition returns a conflict rather than false
+success. Governed REST landings use this same service path. A successful transition
+records the terminal flight row and an attributed `flight.landed` event in one D1 batch.
+Mupot attempts Queue delivery immediately; a pending outbox row survives an outage and
+the scheduled heartbeat retries it without reopening or falsely re-landing the flight.
+Each event carries a stable `outbox_id` and landing timestamp; the queue consumer uses an
+atomic `consumed_at` claim so overlapping delivery attempts produce one activity record.
 
 `flight_get` and `flight_list` require `observer` or higher on every squad referenced
 by a returned flight and return parsed metadata. Legacy or malformed metadata is not
