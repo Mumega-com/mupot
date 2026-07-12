@@ -167,6 +167,7 @@ describe('MCP task cutover tools', () => {
       AGENT_ID,
       null,
       null,
+      null,
       result.task.updated_at,
       'task-1',
     ])
@@ -195,5 +196,62 @@ describe('MCP task cutover tools', () => {
 
     expect(res.ok).toBe(false)
     expect(res.error).toBe('invalid_transition')
+  })
+
+  it('task_update records completion time when an approved task transitions to done', async () => {
+    const { env, updates } = makeEnv([
+      task({ status: 'approved', gate_owner: 'gate:m0-census' }),
+    ])
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', status: 'done' },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(true)
+    const result = res.result as { task: Task }
+    expect(result.task.completed_at).toBe(result.task.updated_at)
+    expect(result.task.completed_at).not.toBeNull()
+    expect(updates[0].sql).toContain('completed_at = ?')
+    expect(updates[0].args).toContain(result.task.completed_at)
+  })
+
+  it('task_update records completion time for an ordinary in-progress task', async () => {
+    const { env } = makeEnv([task({ status: 'in_progress' })])
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', status: 'done' },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(true)
+    const result = res.result as { task: Task }
+    expect(result.task.completed_at).toBe(result.task.updated_at)
+  })
+
+  it('task_update preserves completion time when editing an already-completed task', async () => {
+    const completedAt = '2026-07-08T01:00:00.000Z'
+    const { env } = makeEnv([
+      task({ status: 'done', completed_at: completedAt }),
+    ])
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', title: 'Clarify the completed task' },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(true)
+    const result = res.result as { task: Task }
+    expect(result.task.completed_at).toBe(completedAt)
+    expect(result.task.updated_at).not.toBe(task().updated_at)
   })
 })

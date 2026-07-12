@@ -23,7 +23,7 @@ import { requireAuth } from '../auth'
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap } from '../auth/capability'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate } from './service'
 import type { TaskStatus } from './service'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
@@ -464,7 +464,7 @@ tasksApp.patch('/:id', async (c) => {
     }
   }
 
-  next.updated_at = new Date().toISOString()
+  stampTaskUpdate(next, existing.status, new Date().toISOString())
 
   // Mirror the update to GitHub. Non-fatal: if it has an issue URL we PATCH it; if
   // it never got mirrored (no repo earlier) we attempt a create now.
@@ -472,7 +472,7 @@ tasksApp.patch('/:id', async (c) => {
 
   await c.env.DB.prepare(
     `UPDATE tasks
-        SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, updated_at = ?
+        SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, completed_at = ?, updated_at = ?
       WHERE id = ?`,
   )
     .bind(
@@ -483,6 +483,7 @@ tasksApp.patch('/:id', async (c) => {
       next.assignee_agent_id,
       next.github_issue_url,
       next.gate_owner,
+      next.completed_at,
       next.updated_at,
       next.id,
     )
