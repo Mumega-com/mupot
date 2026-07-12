@@ -314,6 +314,41 @@ higher on that squad.
 `is_self`, and the latest presence check-in summary per agent. It does not expose
 a global agent directory and does not authorize cross-squad messaging.
 
+## Flight Lifecycle
+
+Stateful runtimes create and inspect governed flights through MCP:
+
+- `flight_dispatch { squad_id, goal, meta_json, signals_json, budget_micro_usd? }`
+- `flight_get { flight_id }`
+- `flight_list { squad_id, limit?, cursor? }`
+
+`flight_dispatch` requires `member` capability on every squad named by the strict
+`mupot.flight.meta/v1` metadata and derives the flying agent from the authenticated
+token's stable `boundAgentId`. The bound agent must still exist, be active, and belong
+to a declared flight squad. Both REST and MCP refuse unknown squads, missing task
+references, and tasks outside the declared flight squads. The caller cannot assert an
+agent identity in arguments.
+
+Squad members may create zero-budget coordination flights. A positive
+`budget_micro_usd` allocation requires `lead` or higher on every referenced squad and
+must fit the active agent's configured budget cap and every referenced squad cap.
+Mupot replaces caller-supplied budget readiness signals with this server-derived
+allocation ceiling; actual model execution remains subject to the execution meter's
+windowed spend enforcement.
+
+`flight_get` and `flight_list` require `observer` or higher on every squad referenced
+by a returned flight and return parsed metadata. Legacy or malformed metadata is not
+projected or distinguishable from an absent row through the scoped MCP read surface.
+Squad filtering happens in D1 before the result limit is applied. The existing
+org-admin HTTP connector remains available for the external coherence brain; MCP is
+the tenant teammate surface.
+
+`flight_list` scans bounded D1 pages after applying multi-squad visibility. When more
+rows remain it returns a short-lived opaque continuation `cursor` with `has_more:
+true`; the cursor is stored server-side and bound to the tenant, member, and squad, so
+it cannot expose or cross-read hidden row identifiers. Callers must pass that cursor to
+continue rather than treating a bounded page as complete.
+
 ## Task Lifecycle
 
 Tasks are the unit of durable work. All surfaces should use the shared task

@@ -7,6 +7,7 @@
 
 import type { Env } from '../types'
 import type { PreflightResult } from './preflight'
+import type { FlightMetaV1 } from './meta'
 
 export type FlightStatus =
   | 'preflight'
@@ -43,7 +44,7 @@ export interface NewFlight {
   goal: string
   trigger_source?: TriggerSource
   budget_micro_usd?: number
-  meta?: Record<string, unknown>
+  meta?: FlightMetaV1
 }
 
 // Create a flight in `preflight` — it has not launched; the gate decides next.
@@ -133,6 +134,32 @@ export async function getFlight(env: Env, id: string): Promise<FlightRow | null>
 export async function listFlights(env: Env, limit = 100): Promise<FlightRow[]> {
   const res = await env.DB.prepare(`SELECT * FROM flights WHERE tenant=?1 ORDER BY created_at DESC LIMIT ?2`)
     .bind(env.TENANT_SLUG, Math.min(Math.max(limit, 1), 500))
+    .all<FlightRow>()
+  return res.results ?? []
+}
+
+export async function listFlightsForSquad(
+  env: Env,
+  squadId: string,
+  limit = 100,
+  before?: { createdAt: number; id: string },
+): Promise<FlightRow[]> {
+  const boundedLimit = Math.min(Math.max(limit, 1), 500)
+  const beforeCreatedAt = before?.createdAt ?? Number.MAX_SAFE_INTEGER
+  const beforeId = before?.id ?? '\uffff'
+  const res = await env.DB.prepare(
+    `SELECT f.* FROM flights f
+      WHERE f.tenant = ?1
+        AND EXISTS (
+          SELECT 1
+            FROM json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.squad_ids') AS squad_ref
+           WHERE squad_ref.value = ?2
+        )
+        AND (f.created_at < ?3 OR (f.created_at = ?4 AND f.id < ?5))
+      ORDER BY f.created_at DESC, f.id DESC
+      LIMIT ?6`,
+  )
+    .bind(env.TENANT_SLUG, squadId, beforeCreatedAt, beforeCreatedAt, beforeId, boundedLimit)
     .all<FlightRow>()
   return res.results ?? []
 }

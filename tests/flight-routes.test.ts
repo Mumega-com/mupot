@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { parseDispatchBody, parseOutcomeQuery } from '../src/flight/routes'
+import { flightsApp, parseDispatchBody, parseOutcomeQuery } from '../src/flight/routes'
+import type { Env } from '../src/types'
 
 const goodSignals = {
   contextComplete: true,
@@ -10,6 +11,20 @@ const goodSignals = {
   progressPerStep: 0.5,
   wastePerStep: 0.1,
   stepSeconds: 20,
+}
+
+const goodMeta = {
+  schema: 'mupot.flight.meta/v1',
+  goal_id: 'mumega-tenant-zero',
+  objective_id: 'm000-constitution-census',
+  squad_ids: ['squad-mmhq'],
+  task_ids: ['task-m000'],
+  done_when: ['the census hash verifies'],
+  artifact_refs: [],
+  receipt_refs: [],
+  confidentiality: 'internal',
+  publication_target: 'none',
+  parent_flight_id: null,
 }
 
 describe('parseDispatchBody', () => {
@@ -65,6 +80,24 @@ describe('parseDispatchBody', () => {
     expect(r.value.opts.cacheWindowSeconds).toBe(120)
     expect(r.value.opts.minProgressRatio).toBeUndefined()
   })
+
+  it('preserves valid v1 metadata on the flight record', () => {
+    const r = parseDispatchBody({ agent: 'a', goal: 'g', signals: goodSignals, meta: goodMeta })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value.flight.meta).toEqual(goodMeta)
+  })
+
+  it('rejects malformed or unknown flight metadata', () => {
+    expect(parseDispatchBody({ agent: 'a', goal: 'g', signals: goodSignals, meta: { ...goodMeta, task_ids: [] } }))
+      .toEqual({ ok: false, error: 'invalid_flight_meta' })
+    expect(parseDispatchBody({ agent: 'a', goal: 'g', signals: goodSignals, meta: { ...goodMeta, hidden: 'data' } }))
+      .toEqual({ ok: false, error: 'invalid_flight_meta' })
+    expect(parseDispatchBody({
+      agent: 'a', goal: 'g', signals: goodSignals,
+      meta: { ...goodMeta, squad_ids: Array.from({ length: 9 }, (_, index) => `squad-${index}`) },
+    })).toEqual({ ok: false, error: 'invalid_flight_meta' })
+  })
 })
 
 describe('parseOutcomeQuery', () => {
@@ -85,5 +118,49 @@ describe('parseOutcomeQuery', () => {
     const q = parseOutcomeQuery(new URLSearchParams('since=-5'))
     expect(q.sinceMs).toBeNull()
     expect(q.limit).toBe(200)
+  })
+})
+
+describe('REST flight dispatch reference integrity', () => {
+  it('rejects missing metadata references before inserting a flight', async () => {
+    const env = {
+      TENANT_SLUG: 'test',
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind() {
+              return {
+                async first() {
+                  if (sql.includes('FROM member_tokens')) {
+                    return { member_id: 'admin-1', display_name: 'Admin', email: null, status: 'active', bound_agent_id: null }
+                  }
+                  if (sql.includes('SELECT id FROM squads')) return null
+                  throw new Error(`unexpected first query: ${sql}`)
+                },
+                async all() {
+                  if (sql.includes('FROM capabilities')) {
+                    return { results: [{ member_id: 'admin-1', scope_type: 'org', scope_id: null, capability: 'admin' }] }
+                  }
+                  if (sql.includes('FROM squads WHERE id IN')) return { results: [] }
+                  throw new Error(`unexpected all query: ${sql}`)
+                },
+                async run() {
+                  throw new Error('flight insert must not run for invalid references')
+                },
+              }
+            },
+          }
+        },
+      },
+    } as unknown as Env
+
+    const response = await flightsApp.request('https://pot.example/', {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ agent: 'brain', goal: 'g', signals: goodSignals, meta: goodMeta }),
+    }, env)
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ error: 'flight_squad_not_found' })
   })
 })

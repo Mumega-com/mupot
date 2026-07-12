@@ -21,6 +21,7 @@ import { resolveOrgAdmin } from '../auth/member-bearer'
 import { dispatchFlight } from './dispatch'
 import { landFlight, failFlight, getFlight, listFlights, type FlightStatus, type TriggerSource } from './service'
 import type { FlightSignals, PreflightOptions } from './preflight'
+import { parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from './meta'
 
 // ── input parsing (pure, exported for tests) ──────────────────────────────────
 
@@ -40,7 +41,7 @@ function asStr(v: unknown, max: number): string {
 }
 
 export interface DispatchBody {
-  flight: { agent: string; goal: string; trigger_source?: TriggerSource; budget_micro_usd?: number }
+  flight: { agent: string; goal: string; trigger_source?: TriggerSource; budget_micro_usd?: number; meta?: FlightMetaV1 }
   signals: FlightSignals
   opts: PreflightOptions
 }
@@ -62,6 +63,8 @@ export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody
 
   const trigger = typeof b.trigger_source === 'string' && TRIGGERS.has(b.trigger_source) ? (b.trigger_source as TriggerSource) : 'api'
   const budget = b.budget_micro_usd == null ? undefined : asNum(b.budget_micro_usd, 0, 0)
+  const meta = b.meta == null ? undefined : parseFlightMetaV1(b.meta)
+  if (b.meta != null && !meta) return { ok: false, error: 'invalid_flight_meta' }
 
   const signals: FlightSignals = {
     contextComplete: asBool(s.contextComplete),
@@ -82,7 +85,7 @@ export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody
 
   return {
     ok: true,
-    value: { flight: { agent, goal, trigger_source: trigger, budget_micro_usd: budget }, signals, opts },
+    value: { flight: { agent, goal, trigger_source: trigger, budget_micro_usd: budget, meta: meta ?? undefined }, signals, opts },
   }
 }
 
@@ -126,6 +129,10 @@ flightsApp.post('/', async (c) => {
   if (!parsed.ok) return c.json({ error: parsed.error }, 400)
 
   const { flight, signals, opts } = parsed.value
+  if (flight.meta) {
+    const references = await validateFlightMetaReferences(c.env, flight.meta)
+    if (!references.ok) return c.json({ error: references.error }, 400)
+  }
   const result = await dispatchFlight(c.env, flight, signals, opts)
   // 201 on launch (GO), 200 on a recorded NO-GO hold (not an error — the gate worked).
   return c.json(result, result.go ? 201 : 200)
