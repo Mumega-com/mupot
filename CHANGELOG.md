@@ -8,6 +8,15 @@ block collapses into a changelog entry when it ships.
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-07-13
+
+**Trusted Runtime.** Mupot now binds agent identity, scoped authority, governed
+flight execution, external work artifacts, and release evidence into one
+installable Cloudflare-native runtime. The stable release preserves the
+independently verified host, recovery, GitHub, browser, and active-runtime
+evidence from the release candidate while removing the duration-based soak as a
+publication requirement.
+
 ### Added
 
 - Scoped MCP flight tools: `flight_dispatch`, `flight_get`, and `flight_list`. Dispatch
@@ -15,6 +24,18 @@ block collapses into a changelog entry when it ships.
   `mupot.flight.meta/v1` metadata and referenced tasks, and enforces squad RBAC.
   Members can record zero-budget coordination flights; positive allocations require
   squad-lead authority plus configured agent and squad budget ceilings.
+- Exact-commit stable deployment and two-phase release-readiness receipts. The
+  final package, public API, live `/health` response, GitHub checks, tag, release,
+  and milestone must resolve to one immutable commit before v0.23.0 can ship.
+- Fail-closed browser evidence and tracked-text secret scanning in local and
+  GitHub release gates.
+
+### Verified
+
+- Reproducible installation, signed host runtime, scoped GitHub App authority,
+  complete task-to-PR work lifecycle, copied receipt-bundle verification,
+  staging recovery, browser workflows, runtime conformance, and independent
+  Kasra plus VPS Codex review.
 
 ## [0.23.0-rc.1] — 2026-07-10
 

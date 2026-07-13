@@ -7,6 +7,8 @@ const releaseDoc = read('../docs/releases/v0.23.0-trusted-runtime.md')
 const roadmap = read('../ROADMAP.md')
 const controlRoadmap = read('../docs/control-plane-roadmap.md')
 const readme = read('../README.md')
+const changelog = read('../CHANGELOG.md')
+const publicApiVersion = read('../src/version.ts')
 const pkg = JSON.parse(read('../package.json')) as { version: string; scripts: Record<string, string> }
 const workflow = read('../.github/workflows/ci.yml')
 
@@ -95,9 +97,11 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     }
   })
 
-  it('allows a bounded RC without treating the final release as shipped', () => {
-    expect(pkg.version).not.toBe('0.23.0')
-    expect(pkg.version).toBe('0.23.0-rc.1')
+  it('publishes final stable metadata while retaining the RC evidence boundary', () => {
+    expect(pkg.version).toBe('0.23.0')
+    expect(publicApiVersion).toContain("MUPOT_PUBLIC_API_VERSION = '0.23.0'")
+    expect(changelog).toContain('## [0.23.0] — 2026-07-13')
+    expect(changelog).toContain('## [0.23.0-rc.1] — 2026-07-10')
     expect(releaseDoc).toContain('The RC uses its own package/API version and prerelease evidence, never the final tag.')
   })
 
