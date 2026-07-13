@@ -2,13 +2,20 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { buildBundle, checkBundleManifest, exportBundle, formatHostGoPlan, formatStatusSummary, inspectBundleStatus, parseArgs, safeName } from './receipt-bundle.mjs'
 
 const POT_URL = 'https://pot.example.org'
 const POT_TENANT = 'tenant-a'
+const HEARTBEAT_DEFINITION = '[Service]\nExecStart=heartbeat\n'
+const CONTROL_DEFINITION = '[Service]\nExecStart=control\n'
+const STARTER_MANIFEST = '{"version":1,"tenant":"tenant-a"}\n'
+const digest = (value) => createHash('sha256').update(value).digest('hex')
+const HEARTBEAT_SHA = digest(HEARTBEAT_DEFINITION)
+const CONTROL_SHA = digest(CONTROL_DEFINITION)
+const STARTER_SHA = digest(STARTER_MANIFEST)
 const HOST_PANEL_PUBLIC_KEY_CHECK = {
   ok: true,
   component: 'fleet-control-daemon',
@@ -137,15 +144,19 @@ function serviceReceipt(status = 'pass') {
     service_manager: 'systemd',
     action: 'status',
     definitions: [
-      { service: 'heartbeat', path: '/home/operator/.config/systemd/user/fleet-daemon.service', sha256: 'a'.repeat(64) },
-      { service: 'control', path: '/home/operator/.config/systemd/user/fleet-control-daemon.service', sha256: 'b'.repeat(64) },
+      { service: 'heartbeat', path: '/home/operator/.config/systemd/user/fleet-daemon.service', sha256: HEARTBEAT_SHA },
+      { service: 'control', path: '/home/operator/.config/systemd/user/fleet-control-daemon.service', sha256: CONTROL_SHA },
     ],
     services: [
       { key: 'heartbeat', name: 'fleet-daemon.service', loaded: true, enabled: true, running: true, pid: 101 },
       { key: 'control', name: 'fleet-control-daemon.service', loaded: true, enabled: true, running: true, pid: 102 },
     ],
     linger: { enabled: true, raw: 'yes' },
-    commands: [],
+    commands: [
+      { executable: 'systemctl', argv: ['--user', 'show', 'fleet-daemon.service', '--property=LoadState,UnitFileState,ActiveState,MainPID', '--value'], code: 0, stdout_summary: '', stderr_summary: '' },
+      { executable: 'systemctl', argv: ['--user', 'show', 'fleet-control-daemon.service', '--property=LoadState,UnitFileState,ActiveState,MainPID', '--value'], code: 0, stdout_summary: '', stderr_summary: '' },
+      { executable: 'loginctl', argv: ['show-user', 'operator', '-p', 'Linger', '--value'], code: 0, stdout_summary: 'yes', stderr_summary: '' },
+    ],
     preserved_data: { configs: true, private_keys: true, runtime: true, inbox: true, receipts: true },
     next_steps: [],
     checks: [
@@ -156,6 +167,7 @@ function serviceReceipt(status = 'pass') {
 }
 
 function continuousReceipt(status = 'pass') {
+  const service = serviceReceipt()
   return {
     receipt_type: 'mupot-fleet-continuous-runtime-receipt/v1',
     generated_at: '2026-07-13T20:04:00.000Z',
@@ -165,38 +177,71 @@ function continuousReceipt(status = 'pass') {
       started_at: '2026-07-13T20:03:00.000Z',
       deadline_at: '2026-07-13T20:05:00.000Z',
       timed_out: false,
-      heartbeat: { tick: { before: 40, after: 43 } },
-      control: { poll: { before: 70, after: 72 } },
+      heartbeat: { schema: 'mupot-fleet-daemon-state/v1', pid: 101, started_at: '2026-07-13T20:00:00.000Z', last_tick_at: '2026-07-13T20:04:00.000Z', interval_sec: 15, tick: { before: 40, after: 43 } },
+      control: { schema: 'mupot-fleet-control-state/v1', pid: 102, started_at: '2026-07-13T20:00:00.000Z', last_poll_at: '2026-07-13T20:04:00.000Z', poll_sec: 2, last_outcome: { agent_id: null, verb: null, accepted: true, result: 'idle' }, poll: { before: 70, after: 72 } },
     },
-    service: { status: 'pass', service_manager: 'systemd', services: [], linger: { enabled: true, raw: 'yes' }, checks: [] },
+    service: { status: 'pass', service_manager: 'systemd', services: service.services, linger: service.linger, checks: service.checks.map(({ check, ok }) => ({ check, ok })) },
     next_steps: [],
-    checks: [{ check: 'services_running', ok: status === 'pass' }],
+    checks: [
+      { check: 'linger_enabled', ok: status === 'pass' },
+      { check: 'observation_completed_before_deadline', ok: status === 'pass' },
+      { check: 'services_running', ok: status === 'pass' },
+      { check: 'heartbeat_tick_advanced', ok: status === 'pass' },
+      { check: 'control_poll_advanced', ok: status === 'pass' },
+      { check: 'agent_probe_alive', ok: status === 'pass' },
+      { check: 'signed_heartbeat_2xx', ok: status === 'pass' },
+      { check: 'heartbeat_fresh_under_ttl', ok: status === 'pass' },
+      { check: 'inbox_consume_not_failed', ok: status === 'pass' },
+    ],
   }
 }
 
 function starterReceipt(status = 'pass') {
+  const roles = ['starter_manifest', 'install', 'service', 'host', 'continuous', 'runtime_inbox', 'lifecycle_control', 'receipt_bundle_manifest']
+  const checks = [
+    'starter_manifest_valid', 'install_receipt_pass', 'service_receipt_pass', 'host_receipt_pass',
+    'continuous_receipt_pass', 'runtime_inbox_receipts_pass', 'lifecycle_control_receipts_pass',
+    'receipt_bundle_manifest_pass', 'artifact_paths_portable', 'artifact_digests_valid',
+  ]
   return {
     receipt_type: 'mupot-fleet-starter-receipt/v1',
     generated_at: '2026-07-13T20:05:00.000Z',
     status,
     manifest: {
-      path: '/workspace/starter.example.json',
-      sha256: 'c'.repeat(64),
+      path: 'starter.example.json',
+      sha256: STARTER_SHA,
     },
-    checks: [{ check: 'starter_manifest_valid', ok: status === 'pass' }],
+    artifacts: roles.map((role, index) => ({ role, path: `${role}.json`, sha256: String(index + 1).repeat(64).slice(0, 64) })),
+    checks: checks.map((check) => ({ check, ok: status === 'pass' })),
   }
 }
 
 function serviceAwareHostReceipt() {
-  return hostReceipt('pass', {
+  const service = serviceReceipt()
+  const definitionEvidence = service.definitions.map((definition) => ({
+    service: definition.service,
+    path: definition.path,
+    expected_sha256: definition.sha256,
+    rendered_sha256: definition.sha256,
+    actual_sha256: definition.sha256,
+    argv: ['/usr/bin/node', definition.service === 'heartbeat' ? '/runtime/fleet-daemon.mjs' : '/runtime/fleet-control-daemon.mjs', definition.service === 'heartbeat' ? '/config/daemon.json' : '/config/control.json'],
+    expected_argv: ['/usr/bin/node', definition.service === 'heartbeat' ? '/runtime/fleet-daemon.mjs' : '/runtime/fleet-control-daemon.mjs', definition.service === 'heartbeat' ? '/config/daemon.json' : '/config/control.json'],
+    ok: true,
+  }))
+  const receipt = hostReceipt('pass', {
     checks: [
       HOST_PANEL_PUBLIC_KEY_CHECK,
-      { ok: true, component: 'host-services', check: 'service_definitions_current' },
-      { ok: true, component: 'host-services', check: 'heartbeat_service_running' },
-      { ok: true, component: 'host-services', check: 'control_service_running' },
-      { ok: true, component: 'host-services', check: 'systemd_linger_enabled' },
+      { ok: true, component: 'host-services', check: 'service_definitions_current', service_manager: 'systemd', definition_dir: '/home/operator/.config/systemd/user', definitions: definitionEvidence },
+      { ok: true, component: 'host-services', check: 'heartbeat_service_running', service: service.services[0] },
+      { ok: true, component: 'host-services', check: 'control_service_running', service: service.services[1] },
+      { ok: true, component: 'host-services', check: 'systemd_linger_enabled', service_manager: 'systemd', applicable: true, linger: service.linger },
     ],
   })
+  receipt.inputs = {
+    daemon_config: '/config/daemon.json', inbox_handler_config: '/config/inbox.json', control_config: '/config/control.json',
+    exec_probes: false, service_manager: 'systemd', service_definition_dir: '/home/operator/.config/systemd/user',
+  }
+  return receipt
 }
 
 function seedCutoverEvidence(outDir, host = hostReceipt()) {
@@ -209,12 +254,28 @@ function seedCutoverEvidence(outDir, host = hostReceipt()) {
 
 function starterPaths(overrides = {}) {
   const sourceDir = tmpDir()
+  const service = overrides.service ?? serviceReceipt()
+  if (!overrides.service) {
+    service.definitions[0].path = join(sourceDir, 'fleet-daemon.service')
+    service.definitions[1].path = join(sourceDir, 'fleet-control-daemon.service')
+    writeFileSync(service.definitions[0].path, HEARTBEAT_DEFINITION)
+    writeFileSync(service.definitions[1].path, CONTROL_DEFINITION)
+  }
+  const starter = overrides.starter ?? starterReceipt()
+  if (!overrides.starter) writeFileSync(join(sourceDir, starter.manifest.path), STARTER_MANIFEST)
   return {
     sourceDir,
-    serviceReceiptPath: writeJson(join(sourceDir, 'service-source.json'), overrides.service ?? serviceReceipt()),
+    serviceReceiptPath: writeJson(join(sourceDir, 'service-source.json'), service),
     continuousReceiptPath: writeJson(join(sourceDir, 'continuous-source.json'), overrides.continuous ?? continuousReceipt()),
-    starterReceiptPath: writeJson(join(sourceDir, 'starter-source.json'), overrides.starter ?? starterReceipt()),
+    starterReceiptPath: writeJson(join(sourceDir, 'starter-source.json'), starter),
   }
+}
+
+function absoluteStrings(value, found = []) {
+  if (typeof value === 'string' && value.startsWith('/')) found.push(value)
+  else if (Array.isArray(value)) value.forEach((entry) => absoluteStrings(entry, found))
+  else if (value && typeof value === 'object') Object.values(value).forEach((entry) => absoluteStrings(entry, found))
+  return found
 }
 
 test('receipt bundle writes host, runtime, control, cutover gate, and manifest', async () => {
@@ -297,18 +358,19 @@ test('starter-ready bundle requires, exports, and summarizes service continuity 
   const compact = formatStatusSummary(status)
   assert.equal(status.starter_ready.service_manager, 'systemd')
   assert.deepEqual(status.starter_ready.definition_hashes, {
-    heartbeat: 'a'.repeat(64),
-    control: 'b'.repeat(64),
+    heartbeat: HEARTBEAT_SHA,
+    control: CONTROL_SHA,
   })
   assert.deepEqual(status.starter_ready.observed_deltas, { heartbeat_tick: 3, control_poll: 2 })
-  assert.equal(status.starter_ready.starter_manifest_sha256, 'c'.repeat(64))
+  assert.equal(status.starter_ready.starter_manifest_sha256, STARTER_SHA)
   assert.match(compact, /Service manager: systemd/)
-  assert.match(compact, new RegExp(`Definition hashes: heartbeat=${'a'.repeat(64)}, control=${'b'.repeat(64)}`))
+  assert.match(compact, new RegExp(`Definition hashes: heartbeat=${HEARTBEAT_SHA}, control=${CONTROL_SHA}`))
   assert.match(compact, /Observed deltas: heartbeat tick=3, control poll=2/)
-  assert.match(compact, new RegExp(`Starter manifest: ${'c'.repeat(64)}`))
+  assert.match(compact, new RegExp(`Starter manifest: ${STARTER_SHA}`))
 
   const exportDir = tmpDir()
-  assert.equal(exportBundle({ outDir, exportDir }).status, 'pass')
+  const exportReceipt = exportBundle({ outDir, exportDir })
+  assert.equal(exportReceipt.status, 'pass', JSON.stringify(exportReceipt.checks.filter((check) => check.ok === false), null, 2))
   rmSync(outDir, { recursive: true })
   rmSync(sources.sourceDir, { recursive: true })
   const copiedCheck = checkBundleManifest({ outDir: exportDir })
@@ -318,18 +380,68 @@ test('starter-ready bundle requires, exports, and summarizes service continuity 
     ['service.json', 'continuous.json', 'starter.json'].map((name) => existsSync(join(exportDir, name))),
     [true, true, true],
   )
+  const copiedService = JSON.parse(readFileSync(join(exportDir, 'service.json'), 'utf8'))
+  for (const definition of copiedService.definitions) {
+    assert.equal(sha256(join(exportDir, definition.path)), definition.sha256)
+  }
+  const copiedStarter = JSON.parse(readFileSync(join(exportDir, 'starter.json'), 'utf8'))
+  assert.equal(sha256(join(exportDir, copiedStarter.manifest.path)), copiedStarter.manifest.sha256)
+  for (const name of readdirSync(exportDir).filter((entry) => entry.endsWith('.json'))) {
+    assert.deepEqual(absoluteStrings(JSON.parse(readFileSync(join(exportDir, name), 'utf8'))), [], name)
+  }
+  assert.deepEqual(absoluteStrings(copiedCheck), [])
+  assert.deepEqual(absoluteStrings(inspectBundleStatus({ outDir: exportDir })), [])
+})
+
+test('starter-ready validates complete producer contracts and cross-receipt bindings', async (t) => {
+  const cases = [
+    ['negative heartbeat delta', { continuous: (() => { const r = continuousReceipt(); r.observation.heartbeat.tick.after = 39; return r })() }],
+    ['zero control delta', { continuous: (() => { const r = continuousReceipt(); r.observation.control.poll.after = 70; return r })() }],
+    ['wrong continuous agent', { continuous: (() => { const r = continuousReceipt(); r.agent.agent_id = 'other'; return r })() }],
+    ['wrong manager', { continuous: (() => { const r = continuousReceipt(); r.service.service_manager = 'launchd'; r.service.linger = null; return r })() }],
+    ['stopped service', { service: (() => { const r = serviceReceipt(); r.services[0].running = false; r.services[0].pid = null; return r })() }],
+    ['duplicate definition', { service: (() => { const r = serviceReceipt(); r.definitions[1] = { ...r.definitions[0] }; return r })() }],
+    ['unknown service field', { service: { ...serviceReceipt(), fabricated: true } }],
+    ['unknown continuous field', { continuous: { ...continuousReceipt(), fabricated: true } }],
+    ['arbitrary manifest digest', { starter: (() => { const r = starterReceipt(); r.manifest.sha256 = 'digest'; return r })() }],
+    ['absolute starter artifact', { starter: (() => { const r = starterReceipt(); r.artifacts[0].path = '/tmp/starter.json'; return r })() }],
+    ['duplicate starter artifact role', { starter: (() => { const r = starterReceipt(); r.artifacts[1].role = r.artifacts[0].role; return r })() }],
+    ['unknown starter field', { starter: { ...starterReceipt(), fabricated: true } }],
+  ]
+  for (const [name, overrides] of cases) {
+    await t.test(name, async () => {
+      const outDir = tmpDir()
+      seedCutoverEvidence(outDir, serviceAwareHostReceipt())
+      const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...starterPaths(overrides) })
+      assert.equal(bundle.status, 'fail')
+    })
+  }
+
+  await t.test('host definition hash mismatch', async () => {
+    const host = serviceAwareHostReceipt()
+    host.checks.find((check) => check.check === 'service_definitions_current').definitions[0].actual_sha256 = 'f'.repeat(64)
+    const outDir = tmpDir()
+    seedCutoverEvidence(outDir, host)
+    const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...starterPaths() })
+    assert.equal(bundle.status, 'fail')
+  })
+})
+
+test('starter option validation rejects malformed and partial roles before creating output', async () => {
+  assert.throws(() => parseArgs(['--service-receipt', '--status']), /requires a value/)
+  assert.throws(() => parseArgs(['--service-receipt', '']), /requires a value/)
+  assert.throws(() => parseArgs(['--service-receipt', './service.json']), /exactly all three/)
+  const parent = tmpDir()
+  const outDir = join(parent, 'must-not-exist')
+  await assert.rejects(
+    buildBundle({ outDir, agents: ['agent-one'], serviceReceiptPath: join(parent, 'service.json') }),
+    /exactly all three/,
+  )
+  assert.equal(existsSync(outDir), false)
 })
 
 test('starter-ready mode fails unless all three exact passing secret-free receipts are supplied', async (t) => {
   const cases = [
-    {
-      name: 'missing continuous and starter roles',
-      paths: () => {
-        const sourceDir = tmpDir()
-        return { serviceReceiptPath: writeJson(join(sourceDir, 'service.json'), serviceReceipt()) }
-      },
-      failedCheck: 'continuous_receipt_present',
-    },
     {
       name: 'wrong service receipt type',
       paths: () => starterPaths({ service: { ...serviceReceipt(), receipt_type: 'mupot-fleet-continuous-runtime-receipt/v1' } }),
@@ -547,6 +659,7 @@ test('manifest check verifies copied bundle hashes without rewriting files', asy
   const copiedDir = tmpDir()
   for (const name of readdirSync(outDir).filter((entry) => entry.endsWith('.json'))) {
     copyFileSync(join(outDir, name), join(copiedDir, name))
+    chmodSync(join(copiedDir, name), 0o600)
   }
 
   const manifestPath = join(copiedDir, 'manifest.json')
@@ -673,7 +786,7 @@ test('export writes a clean self-contained attachable bundle', async () => {
   const receipt = exportBundle({ outDir, exportDir })
 
   assert.equal(receipt.receipt_type, 'mupot-fleet-receipt-bundle-export/v1')
-  assert.equal(receipt.status, 'pass')
+  assert.equal(receipt.status, 'pass', JSON.stringify(receipt.checks.filter((check) => check.ok === false), null, 2))
   assert.equal(receipt.manifest_check.status, 'pass')
   assert.ok(receipt.artifacts.copied.some((artifact) => artifact.label === 'manifest'))
   assert.deepEqual(
@@ -737,6 +850,13 @@ test('export writes a clean self-contained attachable bundle', async () => {
     c.sidecar === 'manifest-check.json' &&
     c.ok === true
   ))
+  const exportSidecarPath = join(exportDir, 'export-receipt.json')
+  const exportSidecar = JSON.parse(readFileSync(exportSidecarPath, 'utf8'))
+  exportSidecar.fabricated = true
+  writeJson(exportSidecarPath, exportSidecar)
+  const tamperedSidecar = checkBundleManifest({ outDir: exportDir })
+  assert.equal(tamperedSidecar.status, 'fail')
+  assert.ok(tamperedSidecar.checks.some((check) => check.check === 'export_sidecar_receipt_json_read' && check.sidecar === 'export-receipt.json' && check.ok === false))
   assert.equal(checkBundleManifest({ outDir }).status, 'fail')
 })
 
@@ -757,7 +877,8 @@ test('manifest check fails when exported bundle sidecar receipts are missing', a
   })
 
   const exportDir = tmpDir()
-  assert.equal(exportBundle({ outDir, exportDir }).status, 'pass')
+  const exported = exportBundle({ outDir, exportDir })
+  assert.equal(exported.status, 'pass', JSON.stringify(exported.checks.filter((check) => check.ok === false), null, 2))
   rmSync(join(exportDir, 'export-receipt.json'))
 
   const check = checkBundleManifest({ outDir: exportDir })
@@ -1127,6 +1248,64 @@ test('manifest check fails when next_steps contradict readiness', async () => {
   ))
 })
 
+test('manifest check enforces a closed ordered next_steps policy', async () => {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir)
+  await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.next_steps.push('leave SOS wiring installed forever')
+  writeJson(manifestPath, manifest)
+
+  const check = checkBundleManifest({ outDir })
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((entry) => entry.check.startsWith('next_steps_') && entry.ok === false))
+})
+
+test('legacy SOS-only manifest check preserves the pre-Task-7 check surface', async () => {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir)
+  const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
+  const check = checkBundleManifest({ outDir })
+
+  assert.equal(Object.hasOwn(bundle.inputs, 'bundle_mode'), false)
+  assert.equal(Object.hasOwn(bundle.artifacts, 'service'), false)
+  assert.equal(check.checks.some((entry) => ['bundle_mode_valid', 'bundle_mode_matches_artifacts', 'artifact_role_paths_unique', 'manifest_schema_exact', 'manifest_permissions_0600', 'artifact_permissions_0600', 'bundle_directory_permissions_0700', 'next_steps_exact_policy'].includes(entry.check)), false)
+})
+
+test('manifest checking fails closed for malformed arrays and unknown artifact roles without throwing', async () => {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir, serviceAwareHostReceipt())
+  await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...starterPaths() })
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.probes = { fabricated: true }
+  manifest.artifacts.unknown_role = { path: 'unknown.json', sha256: 'a'.repeat(64), receipt_type: 'unknown/v1', status: 'pass' }
+  writeJson(manifestPath, manifest)
+
+  let check
+  assert.doesNotThrow(() => { check = checkBundleManifest({ outDir }) })
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((entry) => entry.check === 'manifest_schema_exact' && entry.ok === false))
+})
+
+test('bundle and export permissions are repaired and permissive drift fails verification', async () => {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir, serviceAwareHostReceipt())
+  chmodSync(outDir, 0o755)
+  chmodSync(join(outDir, 'host.json'), 0o644)
+  await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, force: true, ...starterPaths() })
+  assert.equal(statSync(outDir).mode & 0o777, 0o700)
+  for (const name of readdirSync(outDir).filter((entry) => entry.endsWith('.json'))) {
+    assert.equal(statSync(join(outDir, name)).mode & 0o777, 0o600, name)
+  }
+
+  chmodSync(join(outDir, 'host.json'), 0o644)
+  const check = checkBundleManifest({ outDir })
+  assert.equal(check.status, 'fail')
+  assert.ok(check.checks.some((entry) => entry.check === 'artifact_permissions_0600' && entry.ok === false))
+})
+
 test('manifest check fails when cutover gate inputs disagree with manifest evidence', async () => {
   const outDir = tmpDir()
   writeJson(join(outDir, 'probe-start.json'), probeReceipt())
@@ -1423,7 +1602,7 @@ test('parseArgs rejects contradictory starter modes and duplicate artifact roles
     /artifact roles require distinct receipt paths/,
   )
   assert.throws(
-    () => parseArgs(['--service-receipt', './service.json', '--status']),
+    () => parseArgs(['--service-receipt', './service.json', '--continuous-receipt', './continuous.json', '--starter-receipt', './starter.json', '--status']),
     /starter receipt flags cannot be combined with read-only or plan modes/,
   )
 })

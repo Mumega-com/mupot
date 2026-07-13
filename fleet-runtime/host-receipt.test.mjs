@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { buildReceipt, hasPlaceholder, parseArgs, summarize } from './host-receipt.mjs'
 import { createServiceContext } from './service-context.mjs'
+import { renderLaunchd } from './launchd-service-manager.mjs'
 import { renderSystemd } from './systemd-service-manager.mjs'
 
 const PANEL_PUBLIC_JWK = {
@@ -90,14 +91,16 @@ function fixture(overrides = {}) {
 
 function serviceFixture(overrides = {}) {
   const f = fixture()
+  const manager = overrides.manager ?? 'systemd'
+  const platformName = manager === 'launchd' ? 'darwin' : 'linux'
   const runtimeDir = join(f.root, 'runtime')
-  const definitionDir = join(f.root, 'systemd')
+  const definitionDir = join(f.root, manager)
   mkdirSync(runtimeDir)
   mkdirSync(definitionDir)
   const nodePath = '/usr/local/bin/node'
   const context = createServiceContext({
-    manager: 'systemd',
-    platformName: 'linux',
+    manager,
+    platformName,
     homeDir: f.root,
     prefix: f.root,
     runtimeDir,
@@ -106,14 +109,14 @@ function serviceFixture(overrides = {}) {
     uid: 501,
     username: 'operator',
   })
-  const rendered = renderSystemd(context)
+  const rendered = manager === 'launchd' ? renderLaunchd(context) : renderSystemd(context)
   for (const definition of rendered) writeFileSync(definition.path, definition.content)
   const receipt = {
     receipt_type: 'mupot-fleet-service-receipt/v1',
     generated_at: '2026-07-13T20:00:00.000Z',
     status: 'pass',
-    platform: 'linux',
-    service_manager: 'systemd',
+    platform: platformName,
+    service_manager: manager,
     action: 'status',
     definitions: rendered.map((definition) => ({
       service: definition.key,
@@ -128,8 +131,13 @@ function serviceFixture(overrides = {}) {
       running: true,
       pid: service.key === 'heartbeat' ? 101 : 102,
     })),
-    linger: { enabled: true, raw: 'yes' },
-    commands: [],
+    linger: manager === 'systemd' ? { enabled: true, raw: 'yes' } : null,
+    commands: manager === 'systemd'
+      ? [
+          ...context.services.map((service) => ({ executable: 'systemctl', argv: ['--user', 'show', service.systemdUnit, '--property=LoadState,UnitFileState,ActiveState,MainPID', '--value'], code: 0, stdout_summary: '', stderr_summary: '' })),
+          { executable: 'loginctl', argv: ['show-user', 'operator', '-p', 'Linger', '--value'], code: 0, stdout_summary: 'yes', stderr_summary: '' },
+        ]
+      : context.services.map((service) => ({ executable: 'launchctl', argv: ['print', `${context.domain}/${service.launchdLabel}`], code: 0, stdout_summary: '', stderr_summary: '' })),
     preserved_data: { configs: true, private_keys: true, runtime: true, inbox: true, receipts: true },
     next_steps: [],
     checks: [
@@ -150,6 +158,8 @@ function serviceFixture(overrides = {}) {
 }
 
 async function requiredServiceReceipt(f) {
+  const manager = f.context.manager
+  const platformName = manager === 'launchd' ? 'darwin' : 'linux'
   return buildReceipt({
     daemonPath: f.daemonPath,
     inboxPath: f.inboxPath,
@@ -159,14 +169,17 @@ async function requiredServiceReceipt(f) {
     execProbes: false,
     keyPathFor: f.keyPathFor,
     requireServices: true,
-    serviceManager: 'systemd',
+    serviceManager: manager,
     serviceDefinitionDir: f.definitionDir,
     runtimeDir: f.runtimeDir,
     nodePath: f.nodePath,
-    platformName: 'linux',
+    homeDir: f.root,
+    uid: 501,
+    username: 'operator',
+    platformName,
     buildServiceReceipt: async (opts) => {
       assert.equal(opts.action, 'status')
-      assert.equal(opts.serviceManager, 'systemd')
+      assert.equal(opts.serviceManager, manager)
       return f.receipt
     },
   })
@@ -185,7 +198,7 @@ test('host receipt passes for a complete local host layout without executing pro
   })
 
   assert.equal(receipt.receipt_type, 'mupot-fleet-host-receipt/v1')
-  assert.equal(receipt.status, 'pass')
+  assert.equal(receipt.status, 'pass', JSON.stringify(receipt.checks.filter((check) => check.component === 'host-services'), null, 2))
   assert.equal(receipt.summary.failed, 0)
   assert.deepEqual(receipt.target, {
     base_url: 'https://pot.example.org',
@@ -200,6 +213,58 @@ test('host receipt passes for a complete local host layout without executing pro
   assert.ok(receipt.checks.some((c) => c.component === 'host-receipt' && c.check === 'daemon_control_base_url_match' && c.ok))
   assert.ok(receipt.checks.some((c) => c.component === 'host-receipt' && c.check === 'daemon_control_tenant_match' && c.ok))
   assert.equal(receipt.checks.some((c) => c.check === 'service_definitions_current'), false)
+  assert.deepEqual(receipt.inputs, {
+    daemon_config: f.daemonPath,
+    inbox_handler_config: f.inboxPath,
+    control_config: f.controlPath,
+    exec_probes: false,
+  })
+})
+
+test('host service proof accepts exact current launchd definitions and status', async () => {
+  const f = serviceFixture({ manager: 'launchd' })
+  const receipt = await requiredServiceReceipt(f)
+
+  assert.equal(receipt.status, 'pass', JSON.stringify(receipt.checks.filter((check) => check.component === 'host-services'), null, 2))
+  assert.deepEqual(
+    receipt.checks.filter((check) => check.component === 'host-services').map((check) => check.check),
+    ['service_definitions_current', 'heartbeat_service_running', 'control_service_running', 'systemd_linger_enabled'],
+  )
+})
+
+test('host service proof rejects semantic renderer drift even when argv and receipt hashes match disk', async () => {
+  const f = serviceFixture({
+    mutateDefinitions({ receipt, rendered }) {
+      const changed = rendered[0].content.replace('Restart=on-failure', 'Restart=always')
+      writeFileSync(rendered[0].path, changed)
+      receipt.definitions[0].sha256 = createHash('sha256').update(changed).digest('hex')
+    },
+  })
+
+  const receipt = await requiredServiceReceipt(f)
+  assert.equal(receipt.status, 'fail')
+  assert.equal(receipt.checks.find((check) => check.check === 'service_definitions_current').ok, false)
+})
+
+test('host service proof rejects malformed, fabricated, duplicate, extra, and secret-bearing envelopes', async (t) => {
+  const cases = [
+    ['wrong manager/platform', (receipt) => { receipt.service_manager = 'launchd'; receipt.platform = 'darwin' }],
+    ['duplicate service', (receipt) => { receipt.services[1] = { ...receipt.services[0] } }],
+    ['extra service', (receipt) => { receipt.services.push({ key: 'other', name: 'other.service', loaded: true, enabled: true, running: true, pid: 103 }) }],
+    ['non-positive pid', (receipt) => { receipt.services[0].pid = 0 }],
+    ['unknown field', (receipt) => { receipt.fabricated = true }],
+    ['secret field', (receipt) => { receipt.authorization = 'Bearer abcdefghijklmnopqrstuvwxyz' }],
+    ['fabricated producer check', (receipt) => { receipt.checks.push({ ok: true, check: 'fabricated' }) }],
+    ['extra command record', (receipt) => { receipt.commands.push({ executable: 'true', argv: [], code: 0, stdout_summary: '', stderr_summary: '' }) }],
+  ]
+  for (const [name, mutateReceipt] of cases) {
+    await t.test(name, async () => {
+      const f = serviceFixture({ mutateReceipt })
+      const receipt = await requiredServiceReceipt(f)
+      assert.equal(receipt.status, 'fail')
+      assert.equal(receipt.checks.filter((check) => check.component === 'host-services').every((check) => check.ok === false), true)
+    })
+  }
 })
 
 test('host receipt requires current running services and enabled systemd linger', async () => {
@@ -303,6 +368,12 @@ test('host receipt parses and documents service requirement options', () => {
   assert.match(help, /--service-manager <auto\|systemd\|launchd>/)
   assert.match(help, /--service-definition-dir <path>/)
   assert.throws(() => parseArgs(['--service-manager', 'none']), /auto\|systemd\|launchd/)
+  assert.throws(() => parseArgs(['--service-manager']), /requires a value/)
+  assert.throws(() => parseArgs(['--service-manager', '']), /requires a value/)
+  assert.throws(() => parseArgs(['--service-definition-dir', '--skip-control']), /requires a value/)
+  assert.throws(() => parseArgs(['--service-manager', 'systemd']), /require --require-services/)
+  assert.throws(() => parseArgs(['--service-definition-dir', './systemd']), /require --require-services/)
+  assert.throws(() => parseArgs(['--require-services', '--skip-control']), /conflicts with --skip-control/)
 })
 
 test('host receipt fails when daemon inbox agents have no handler config', async () => {

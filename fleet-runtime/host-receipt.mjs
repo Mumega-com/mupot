@@ -17,7 +17,9 @@ import { validateConfig as validateControlConfig } from './fleet-control-daemon.
 import { keyPathFor } from './fleet-sign.mjs'
 import { importPanelPublicKey } from './control-request.mjs'
 import { buildServiceReceipt as buildDefaultServiceReceipt } from './service-manager.mjs'
-import { createServiceContext, resolveServiceManager } from './service-context.mjs'
+import { createServiceContext, resolveServiceManager, SECRET_VALUE_PATTERNS } from './service-context.mjs'
+import { renderLaunchd } from './launchd-service-manager.mjs'
+import { renderSystemd } from './systemd-service-manager.mjs'
 
 function expandHome(path) {
   return typeof path === 'string' && path.startsWith('~/') ? join(homedir(), path.slice(2)) : path
@@ -48,11 +50,12 @@ function parseArgs(argv) {
     serviceManager: 'auto',
     serviceDefinitionDir: null,
   }
+  let serviceOptionUsed = false
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
     const nextValue = () => {
       i += 1
-      if (i >= argv.length) throw new Error(`${arg} requires a value`)
+      if (i >= argv.length || argv[i] === '' || argv[i].startsWith('-')) throw new Error(`${arg} requires a value`)
       return argv[i]
     }
     const next = () => pathArg(nextValue())
@@ -64,15 +67,21 @@ function parseArgs(argv) {
     else if (arg === '--exec-probes') opts.execProbes = true
     else if (arg === '--require-services') opts.requireServices = true
     else if (arg === '--service-manager') {
+      serviceOptionUsed = true
       opts.serviceManager = nextValue()
       if (!['auto', 'systemd', 'launchd'].includes(opts.serviceManager)) {
         throw new Error('--service-manager requires auto|systemd|launchd')
       }
     }
-    else if (arg === '--service-definition-dir') opts.serviceDefinitionDir = next()
+    else if (arg === '--service-definition-dir') {
+      serviceOptionUsed = true
+      opts.serviceDefinitionDir = next()
+    }
     else if (arg === '--help' || arg === '-h') opts.help = true
     else throw new Error(`unknown argument: ${arg}`)
   }
+  if (serviceOptionUsed && !opts.requireServices) throw new Error('service-manager/definition flags require --require-services')
+  if (opts.requireServices && opts.skipControl) throw new Error('--require-services conflicts with --skip-control')
   return opts
 }
 
@@ -324,6 +333,23 @@ function sha256(value) {
   return createHash('sha256').update(value).digest('hex')
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function hasExactKeys(value, keys) {
+  return isPlainObject(value) &&
+    Object.keys(value).length === keys.length &&
+    keys.every((key) => Object.hasOwn(value, key))
+}
+
+function containsCanonicalSecret(value) {
+  if (typeof value === 'string') return SECRET_VALUE_PATTERNS.some(([, pattern]) => pattern.test(value))
+  if (Array.isArray(value)) return value.some(containsCanonicalSecret)
+  if (isPlainObject(value)) return Object.values(value).some(containsCanonicalSecret)
+  return false
+}
+
 function decodeXml(value) {
   return value
     .replaceAll('&lt;', '<')
@@ -380,14 +406,12 @@ function parseSystemdArguments(content) {
 
 function definitionEvidence(context, serviceReceipt, configPaths) {
   const definitions = Array.isArray(serviceReceipt?.definitions) ? serviceReceipt.definitions : []
-  const uniqueDefinitions = new Map()
-  let duplicate = false
-  for (const definition of definitions) {
-    if (uniqueDefinitions.has(definition?.service)) duplicate = true
-    uniqueDefinitions.set(definition?.service, definition)
-  }
+  const uniqueDefinitions = new Map(definitions.map((definition) => [definition?.service, definition]))
+  const rendered = (context.manager === 'launchd' ? renderLaunchd(context) : renderSystemd(context))
+  const renderedByKey = new Map(rendered.map((definition) => [definition.key, definition]))
   const evidence = context.services.map((service) => {
     const definition = uniqueDefinitions.get(service.key)
+    const current = renderedByKey.get(service.key)
     let content = null
     try {
       content = readFileSync(service.definitionPath, 'utf8')
@@ -395,17 +419,20 @@ function definitionEvidence(context, serviceReceipt, configPaths) {
       // The evidence below records the definition as unreadable.
     }
     const actualSha256 = content === null ? null : sha256(content)
+    const renderedSha256 = current ? sha256(current.content) : null
     const argv = content === null
       ? null
       : context.manager === 'launchd' ? parseLaunchdArguments(content) : parseSystemdArguments(content)
     const expectedArgv = [context.nodePath, service.scriptPath, configPaths[service.key]]
-    const pathMatches = typeof definition?.path === 'string' && resolve(definition.path) === service.definitionPath
-    const hashMatches = /^[a-f0-9]{64}$/.test(definition?.sha256 ?? '') && actualSha256 === definition.sha256
+    const pathMatches = definition?.path === service.definitionPath && current?.path === service.definitionPath
+    const hashMatches = /^[a-f0-9]{64}$/.test(definition?.sha256 ?? '') &&
+      actualSha256 === renderedSha256 && renderedSha256 === definition.sha256
     const argumentsMatch = Array.isArray(argv) && JSON.stringify(argv) === JSON.stringify(expectedArgv)
     return {
       service: service.key,
       path: service.definitionPath,
       expected_sha256: definition?.sha256 ?? null,
+      rendered_sha256: renderedSha256,
       actual_sha256: actualSha256,
       argv,
       expected_argv: expectedArgv,
@@ -413,7 +440,7 @@ function definitionEvidence(context, serviceReceipt, configPaths) {
     }
   })
   return {
-    ok: !duplicate && definitions.length === context.services.length && evidence.every((entry) => entry.ok),
+    ok: definitions.length === context.services.length && uniqueDefinitions.size === context.services.length && evidence.every((entry) => entry.ok),
     definitions: evidence,
   }
 }
@@ -424,9 +451,55 @@ function serviceStateEvidence(context, serviceReceipt, key) {
   const expected = context.services.find((service) => service.key === key)
   const service = matches[0]
   return {
-    ok: matches.length === 1 && service?.name === expected?.name && service?.loaded === true && service?.running === true,
+    ok: matches.length === 1 && service?.name === expected?.name && service?.loaded === true &&
+      service?.enabled === true && service?.running === true && Number.isInteger(service?.pid) && service.pid > 0,
     service: service ?? null,
   }
+}
+
+function validServiceReceiptEnvelope(receipt, context, platformName) {
+  const topKeys = ['receipt_type', 'generated_at', 'status', 'platform', 'service_manager', 'action', 'definitions', 'services', 'linger', 'commands', 'preserved_data', 'next_steps', 'checks']
+  if (!hasExactKeys(receipt, topKeys) || containsCanonicalSecret(receipt)) return false
+  if (receipt.receipt_type !== 'mupot-fleet-service-receipt/v1' || receipt.status !== 'pass' || receipt.action !== 'status') return false
+  if (receipt.service_manager !== context.manager || receipt.platform !== platformName || Number.isNaN(Date.parse(receipt.generated_at))) return false
+  if (!Array.isArray(receipt.definitions) || receipt.definitions.length !== context.services.length) return false
+  const definitionKeys = new Set()
+  for (const definition of receipt.definitions) {
+    if (!hasExactKeys(definition, ['service', 'path', 'sha256']) || definitionKeys.has(definition.service)) return false
+    const expected = context.services.find((service) => service.key === definition.service)
+    if (!expected || definition.path !== expected.definitionPath || !/^[a-f0-9]{64}$/.test(definition.sha256)) return false
+    definitionKeys.add(definition.service)
+  }
+  if (!Array.isArray(receipt.services) || receipt.services.length !== context.services.length) return false
+  const serviceKeys = new Set()
+  for (const service of receipt.services) {
+    if (!hasExactKeys(service, ['key', 'name', 'loaded', 'enabled', 'running', 'pid']) || serviceKeys.has(service.key)) return false
+    const expected = context.services.find((entry) => entry.key === service.key)
+    if (!expected || service.name !== expected.name || service.loaded !== true || service.enabled !== true ||
+      service.running !== true || !Number.isInteger(service.pid) || service.pid <= 0) return false
+    serviceKeys.add(service.key)
+  }
+  if (!Array.isArray(receipt.commands) || receipt.commands.some((command) =>
+    !hasExactKeys(command, ['executable', 'argv', 'code', 'stdout_summary', 'stderr_summary']) ||
+    typeof command.executable !== 'string' || command.executable.length === 0 || !Array.isArray(command.argv) ||
+    command.argv.some((arg) => typeof arg !== 'string') || !Number.isInteger(command.code) ||
+    typeof command.stdout_summary !== 'string' || typeof command.stderr_summary !== 'string')) return false
+  const expectedCommands = context.manager === 'systemd'
+    ? [
+        ...context.services.map((service) => ['systemctl', ['--user', 'show', service.systemdUnit, '--property=LoadState,UnitFileState,ActiveState,MainPID', '--value']]),
+        ['loginctl', ['show-user', context.username, '-p', 'Linger', '--value']],
+      ]
+    : context.services.map((service) => ['launchctl', ['print', `${context.domain}/${service.launchdLabel}`]])
+  if (receipt.commands.length !== expectedCommands.length || receipt.commands.some((command, index) =>
+    command.executable !== expectedCommands[index][0] || JSON.stringify(command.argv) !== JSON.stringify(expectedCommands[index][1]) || command.code !== 0)) return false
+  const preservedKeys = ['configs', 'private_keys', 'runtime', 'inbox', 'receipts']
+  if (!hasExactKeys(receipt.preserved_data, preservedKeys) || preservedKeys.some((key) => receipt.preserved_data[key] !== true)) return false
+  if (!Array.isArray(receipt.next_steps) || receipt.next_steps.length !== 0) return false
+  if (!Array.isArray(receipt.checks) || receipt.checks.length !== 2 ||
+    !hasExactKeys(receipt.checks[0], ['ok', 'check']) || receipt.checks[0].ok !== true || receipt.checks[0].check !== 'services_loaded_and_running' ||
+    !hasExactKeys(receipt.checks[1], ['ok', 'check']) || receipt.checks[1].ok !== true || receipt.checks[1].check !== 'command_output_secret_free') return false
+  if (context.manager === 'systemd') return hasExactKeys(receipt.linger, ['enabled', 'raw']) && receipt.linger.enabled === true && receipt.linger.raw === 'yes'
+  return receipt.linger === null
 }
 
 async function collectServiceChecks(opts, checks) {
@@ -460,18 +533,16 @@ async function collectServiceChecks(opts, checks) {
       prefix: context.prefix,
       runtimeDir: context.runtimeDir,
       nodePath: context.nodePath,
+      homeDir: context.homeDir,
+      uid: context.uid,
+      username: context.username,
       ...definitionOption,
     }, { platformName, ...(opts.serviceDeps ?? {}) })
   } catch (error) {
     failure = String(error?.message ?? error)
   }
 
-  const metadataOk = serviceReceipt?.receipt_type === 'mupot-fleet-service-receipt/v1' &&
-    serviceReceipt?.status === 'pass' &&
-    serviceReceipt?.action === 'status' &&
-    serviceReceipt?.service_manager === manager &&
-    serviceReceipt?.platform === platformName &&
-    (serviceReceipt?.checks ?? []).some((check) => check?.check === 'command_output_secret_free' && check?.ok === true)
+  const metadataOk = validServiceReceiptEnvelope(serviceReceipt, context, platformName)
   const definitions = definitionEvidence(context, serviceReceipt, {
     heartbeat: resolve(opts.daemonPath),
     control: resolve(opts.controlPath),
@@ -510,11 +581,7 @@ export async function buildReceipt(opts) {
   collectInboxChecks(opts, checks, daemonCfg)
   const controlCfg = await collectControlChecks(opts, checks)
   addHostTargetConsistencyChecks(checks, daemonCfg, controlCfg)
-  let serviceInputs = {
-    manager: opts.serviceManager ?? 'auto',
-    definitionDir: opts.serviceDefinitionDir ?? null,
-  }
-
+  let serviceInputs = null
   if (opts.requireServices) serviceInputs = await collectServiceChecks(opts, checks)
 
   if (opts.execProbes && daemonCfg) {
@@ -535,8 +602,10 @@ export async function buildReceipt(opts) {
       inbox_handler_config: opts.skipInbox ? null : opts.inboxPath,
       control_config: opts.skipControl ? null : opts.controlPath,
       exec_probes: opts.execProbes,
-      service_manager: serviceInputs.manager,
-      service_definition_dir: serviceInputs.definitionDir,
+      ...(opts.requireServices ? {
+        service_manager: serviceInputs.manager,
+        service_definition_dir: serviceInputs.definitionDir,
+      } : {}),
     },
     target: {
       base_url: daemonCfg?.baseUrl ?? controlCfg?.baseUrl ?? null,
