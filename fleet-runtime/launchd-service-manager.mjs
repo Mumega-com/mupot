@@ -47,6 +47,26 @@ async function restoreDefinition(path, previous) {
   await atomicWrite(path, previous.content)
 }
 
+async function bootstrapPriorLoaded(context, indexes, previous, runner) {
+  const recovered = new Map()
+  for (const index of indexes) {
+    if (previous[index].content === null) {
+      recovered.set(index, false)
+      continue
+    }
+    const response = await runner(['launchctl', 'bootstrap', context.domain, context.services[index].definitionPath])
+    recovered.set(index, response.code === 0)
+  }
+  return recovered
+}
+
+async function bootoutServices(context, indexes, runner) {
+  for (const index of indexes) {
+    const response = await runner(['launchctl', 'bootout', launchctlTarget(context, context.services[index])])
+    if (response.code !== 0 && response.code !== 113) continue
+  }
+}
+
 function parseTopLevelPid(stdout) {
   let depth = 0
   for (const line of String(stdout).split(/\r?\n/)) {
@@ -150,37 +170,60 @@ export async function reloadLaunchd(context, runner) {
   const previous = await Promise.all(definitions.map((definition) => readDefinition(definition.path)))
   const statuses = await statusLaunchd(context, runner)
   const services = []
+  if (statuses.some((status) => status.loaded === null)) {
+    return {
+      ok: false,
+      services: statuses.map((status, index) => ({
+        ...status,
+        definitionSha256: previous[index].sha256,
+        bootstrapped: false,
+      })),
+    }
+  }
+
+  const previouslyLoaded = []
 
   for (const [index, service] of context.services.entries()) {
     if (!statuses[index].loaded) continue
     const response = await runner(['launchctl', 'bootout', launchctlTarget(context, service)])
     if (response.code !== 0) {
-      services.push({ ...statuses[index], bootedOut: false, error: response.stderr || response.stdout || `launchctl bootout exited ${response.code}` })
+      const recovered = await bootstrapPriorLoaded(context, previouslyLoaded, previous, runner)
+      services.push(...statuses.map((status, statusIndex) => ({
+        ...status,
+        definitionSha256: previous[statusIndex].sha256,
+        bootedOut: statusIndex === index ? false : previouslyLoaded.includes(statusIndex),
+        rollback: previouslyLoaded.includes(statusIndex) ? recovered.get(statusIndex) : undefined,
+        error: statusIndex === index ? (response.stderr || response.stdout || `launchctl bootout exited ${response.code}`) : undefined,
+      })))
       return { ok: false, services }
     }
+    previouslyLoaded.push(index)
   }
 
   for (const definition of definitions) await atomicWrite(definition.path, definition.content)
 
+  const newlyBootstrapped = []
   for (const [index, service] of context.services.entries()) {
     const response = await runner(['launchctl', 'bootstrap', context.domain, service.definitionPath])
     if (response.code === 0) {
+      newlyBootstrapped.push(index)
       services.push({ ...statuses[index], bootstrapped: true, definitionSha256: definitionSha256(definitions[index].content) })
       continue
     }
 
+    await bootoutServices(context, [...new Set([...newlyBootstrapped, index])], runner)
     await Promise.all(definitions.map((definition, definitionIndex) => restoreDefinition(definition.path, previous[definitionIndex])))
-    const rollback = previous[index].content === null
-      ? null
-      : await runner(['launchctl', 'bootstrap', context.domain, service.definitionPath])
-    services.push({
-      ...statuses[index],
-      bootstrapped: false,
-      definitionSha256: previous[index].sha256,
-      error: response.stderr || response.stdout || `launchctl bootstrap exited ${response.code}`,
-      rollback: rollback?.code === 0,
-    })
-    return { ok: false, services }
+    const recovered = await bootstrapPriorLoaded(context, previouslyLoaded, previous, runner)
+    return {
+      ok: false,
+      services: statuses.map((status, statusIndex) => ({
+        ...status,
+        definitionSha256: previous[statusIndex].sha256,
+        bootstrapped: statusIndex === index ? false : undefined,
+        rollback: previouslyLoaded.includes(statusIndex) ? recovered.get(statusIndex) : undefined,
+        error: statusIndex === index ? (response.stderr || response.stdout || `launchctl bootstrap exited ${response.code}`) : undefined,
+      })),
+    }
   }
 
   return { ok: true, services }
@@ -188,6 +231,12 @@ export async function reloadLaunchd(context, runner) {
 
 export async function uninstallLaunchd(context, runner) {
   const statuses = await statusLaunchd(context, runner)
+  if (statuses.some((status) => status.loaded === null)) {
+    return {
+      ok: false,
+      services: statuses.map((status) => ({ ...status, removed: false })),
+    }
+  }
   const services = []
   for (const [index, service] of context.services.entries()) {
     const status = statuses[index]
