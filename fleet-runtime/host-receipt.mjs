@@ -7,14 +7,17 @@
 // fleet-control-daemon, checks local prerequisite files, and emits a redacted JSON
 // receipt operators can attach to a cutover record.
 
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { validateConfig as validateDaemonConfig, runProbe } from './fleet-daemon.mjs'
 import { validateConfig as validateInboxHandlerConfig } from './inbox-handler.mjs'
 import { validateConfig as validateControlConfig } from './fleet-control-daemon.mjs'
 import { keyPathFor } from './fleet-sign.mjs'
 import { importPanelPublicKey } from './control-request.mjs'
+import { buildServiceReceipt as buildDefaultServiceReceipt } from './service-manager.mjs'
+import { createServiceContext, resolveServiceManager } from './service-context.mjs'
 
 function expandHome(path) {
   return typeof path === 'string' && path.startsWith('~/') ? join(homedir(), path.slice(2)) : path
@@ -41,20 +44,32 @@ function parseArgs(argv) {
     skipInbox: false,
     skipControl: false,
     execProbes: false,
+    requireServices: false,
+    serviceManager: 'auto',
+    serviceDefinitionDir: null,
   }
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
-    const next = () => {
+    const nextValue = () => {
       i += 1
-      if (i >= argv.length) throw new Error(`${arg} requires a path`)
-      return pathArg(argv[i])
+      if (i >= argv.length) throw new Error(`${arg} requires a value`)
+      return argv[i]
     }
+    const next = () => pathArg(nextValue())
     if (arg === '--daemon') opts.daemonPath = next()
     else if (arg === '--inbox') opts.inboxPath = next()
     else if (arg === '--control') opts.controlPath = next()
     else if (arg === '--skip-inbox') opts.skipInbox = true
     else if (arg === '--skip-control') opts.skipControl = true
     else if (arg === '--exec-probes') opts.execProbes = true
+    else if (arg === '--require-services') opts.requireServices = true
+    else if (arg === '--service-manager') {
+      opts.serviceManager = nextValue()
+      if (!['auto', 'systemd', 'launchd'].includes(opts.serviceManager)) {
+        throw new Error('--service-manager requires auto|systemd|launchd')
+      }
+    }
+    else if (arg === '--service-definition-dir') opts.serviceDefinitionDir = next()
     else if (arg === '--help' || arg === '-h') opts.help = true
     else throw new Error(`unknown argument: ${arg}`)
   }
@@ -72,6 +87,11 @@ function usage() {
     '  --skip-inbox          do not require inbox-handler config',
     '  --skip-control        do not require fleet-control config',
     '  --exec-probes         run daemon probe commands and include alive/dead results',
+    '  --require-services    require current definitions and running heartbeat/control services',
+    '  --service-manager <auto|systemd|launchd>',
+    '                        service manager to inspect (default: auto)',
+    '  --service-definition-dir <path>',
+    '                        launchd/systemd user definition directory',
     '  -h, --help            show this help',
   ].join('\n')
 }
@@ -300,12 +320,202 @@ function addHostTargetConsistencyChecks(checks, daemonCfg, controlCfg) {
   })
 }
 
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function decodeXml(value) {
+  return value
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&apos;', "'")
+    .replaceAll('&amp;', '&')
+}
+
+function parseLaunchdArguments(content) {
+  const array = String(content).match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)
+  if (!array) return null
+  const values = [...array[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map((match) => decodeXml(match[1]))
+  return values.length > 0 ? values : null
+}
+
+function parseSystemdArguments(content) {
+  const line = String(content).split(/\r?\n/).find((entry) => entry.startsWith('ExecStart='))
+  if (!line) return null
+  const input = line.slice('ExecStart='.length)
+  const values = []
+  let index = 0
+  while (index < input.length) {
+    while (/\s/.test(input[index] ?? '')) index += 1
+    if (index >= input.length) break
+    let quoted = false
+    if (input[index] === '"') {
+      quoted = true
+      index += 1
+    }
+    let value = ''
+    while (index < input.length) {
+      const character = input[index]
+      if (quoted && character === '"') {
+        index += 1
+        break
+      }
+      if (!quoted && /\s/.test(character)) break
+      if (character === '\\' && index + 1 < input.length) {
+        const escaped = input[index + 1]
+        value += escaped === 'n' ? '\n' : escaped === 'r' ? '\r' : escaped === 't' ? '\t' : escaped
+        index += 2
+        continue
+      }
+      value += character
+      index += 1
+    }
+    if (quoted && input[index - 1] !== '"') return null
+    values.push(value.replaceAll('%%', '%').replaceAll('$$', '$'))
+    while (/\s/.test(input[index] ?? '')) index += 1
+  }
+  return values.length > 0 ? values : null
+}
+
+function definitionEvidence(context, serviceReceipt, configPaths) {
+  const definitions = Array.isArray(serviceReceipt?.definitions) ? serviceReceipt.definitions : []
+  const uniqueDefinitions = new Map()
+  let duplicate = false
+  for (const definition of definitions) {
+    if (uniqueDefinitions.has(definition?.service)) duplicate = true
+    uniqueDefinitions.set(definition?.service, definition)
+  }
+  const evidence = context.services.map((service) => {
+    const definition = uniqueDefinitions.get(service.key)
+    let content = null
+    try {
+      content = readFileSync(service.definitionPath, 'utf8')
+    } catch {
+      // The evidence below records the definition as unreadable.
+    }
+    const actualSha256 = content === null ? null : sha256(content)
+    const argv = content === null
+      ? null
+      : context.manager === 'launchd' ? parseLaunchdArguments(content) : parseSystemdArguments(content)
+    const expectedArgv = [context.nodePath, service.scriptPath, configPaths[service.key]]
+    const pathMatches = typeof definition?.path === 'string' && resolve(definition.path) === service.definitionPath
+    const hashMatches = /^[a-f0-9]{64}$/.test(definition?.sha256 ?? '') && actualSha256 === definition.sha256
+    const argumentsMatch = Array.isArray(argv) && JSON.stringify(argv) === JSON.stringify(expectedArgv)
+    return {
+      service: service.key,
+      path: service.definitionPath,
+      expected_sha256: definition?.sha256 ?? null,
+      actual_sha256: actualSha256,
+      argv,
+      expected_argv: expectedArgv,
+      ok: pathMatches && hashMatches && argumentsMatch,
+    }
+  })
+  return {
+    ok: !duplicate && definitions.length === context.services.length && evidence.every((entry) => entry.ok),
+    definitions: evidence,
+  }
+}
+
+function serviceStateEvidence(context, serviceReceipt, key) {
+  const services = Array.isArray(serviceReceipt?.services) ? serviceReceipt.services : []
+  const matches = services.filter((service) => service?.key === key)
+  const expected = context.services.find((service) => service.key === key)
+  const service = matches[0]
+  return {
+    ok: matches.length === 1 && service?.name === expected?.name && service?.loaded === true && service?.running === true,
+    service: service ?? null,
+  }
+}
+
+async function collectServiceChecks(opts, checks) {
+  const requestedManager = opts.serviceManager ?? 'auto'
+  const platformName = opts.platformName ?? process.platform
+  const manager = resolveServiceManager(requestedManager, platformName)
+  const prefix = resolve(opts.prefix ?? dirname(opts.daemonPath))
+  const runtimeDir = resolve(opts.runtimeDir ?? join(prefix, 'runtime'))
+  const nodePath = resolve(opts.nodePath ?? process.execPath)
+  const context = createServiceContext({
+    manager,
+    platformName,
+    homeDir: opts.homeDir,
+    prefix,
+    runtimeDir,
+    definitionDir: opts.serviceDefinitionDir ?? undefined,
+    nodePath,
+    uid: opts.uid,
+    username: opts.username,
+  })
+  const definitionOption = manager === 'launchd'
+    ? { launchdDir: context.definitionDir }
+    : { systemdDir: context.definitionDir }
+  let serviceReceipt = null
+  let failure = null
+  try {
+    const builder = opts.buildServiceReceipt ?? buildDefaultServiceReceipt
+    serviceReceipt = await builder({
+      action: 'status',
+      serviceManager: manager,
+      prefix: context.prefix,
+      runtimeDir: context.runtimeDir,
+      nodePath: context.nodePath,
+      ...definitionOption,
+    }, { platformName, ...(opts.serviceDeps ?? {}) })
+  } catch (error) {
+    failure = String(error?.message ?? error)
+  }
+
+  const metadataOk = serviceReceipt?.receipt_type === 'mupot-fleet-service-receipt/v1' &&
+    serviceReceipt?.status === 'pass' &&
+    serviceReceipt?.action === 'status' &&
+    serviceReceipt?.service_manager === manager &&
+    serviceReceipt?.platform === platformName &&
+    (serviceReceipt?.checks ?? []).some((check) => check?.check === 'command_output_secret_free' && check?.ok === true)
+  const definitions = definitionEvidence(context, serviceReceipt, {
+    heartbeat: resolve(opts.daemonPath),
+    control: resolve(opts.controlPath),
+  })
+  const heartbeat = serviceStateEvidence(context, serviceReceipt, 'heartbeat')
+  const control = serviceStateEvidence(context, serviceReceipt, 'control')
+  const lingerOk = manager === 'systemd'
+    ? serviceReceipt?.linger?.enabled === true && serviceReceipt?.linger?.raw === 'yes'
+    : serviceReceipt?.linger === null
+
+  checks.push({
+    ok: metadataOk && definitions.ok,
+    component: 'host-services',
+    check: 'service_definitions_current',
+    service_manager: manager,
+    definition_dir: context.definitionDir,
+    definitions: definitions.definitions,
+    ...(failure ? { reason: failure } : {}),
+  })
+  checks.push({ ok: metadataOk && heartbeat.ok, component: 'host-services', check: 'heartbeat_service_running', service: heartbeat.service })
+  checks.push({ ok: metadataOk && control.ok, component: 'host-services', check: 'control_service_running', service: control.service })
+  checks.push({
+    ok: metadataOk && lingerOk,
+    component: 'host-services',
+    check: 'systemd_linger_enabled',
+    service_manager: manager,
+    applicable: manager === 'systemd',
+    linger: serviceReceipt?.linger ?? null,
+  })
+  return { manager, definitionDir: context.definitionDir }
+}
+
 export async function buildReceipt(opts) {
   const checks = []
   const daemonCfg = collectDaemonChecks(opts, checks)
   collectInboxChecks(opts, checks, daemonCfg)
   const controlCfg = await collectControlChecks(opts, checks)
   addHostTargetConsistencyChecks(checks, daemonCfg, controlCfg)
+  let serviceInputs = {
+    manager: opts.serviceManager ?? 'auto',
+    definitionDir: opts.serviceDefinitionDir ?? null,
+  }
+
+  if (opts.requireServices) serviceInputs = await collectServiceChecks(opts, checks)
 
   if (opts.execProbes && daemonCfg) {
     for (const agent of daemonCfg.agents) {
@@ -325,6 +535,8 @@ export async function buildReceipt(opts) {
       inbox_handler_config: opts.skipInbox ? null : opts.inboxPath,
       control_config: opts.skipControl ? null : opts.controlPath,
       exec_probes: opts.execProbes,
+      service_manager: serviceInputs.manager,
+      service_definition_dir: serviceInputs.definitionDir,
     },
     target: {
       base_url: daemonCfg?.baseUrl ?? controlCfg?.baseUrl ?? null,

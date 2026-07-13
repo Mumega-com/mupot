@@ -22,7 +22,16 @@ const EXPECTED = {
   runtime: 'mupot-fleet-runtime-receipt/v1',
   control: 'mupot-fleet-control-receipt/v1',
   cutover_gate: 'mupot-sos-cutover-gate/v1',
+  service: 'mupot-fleet-service-receipt/v1',
+  continuous: 'mupot-fleet-continuous-runtime-receipt/v1',
+  starter: 'mupot-fleet-starter-receipt/v1',
 }
+
+const STARTER_RECEIPT_ROLES = Object.freeze([
+  Object.freeze({ role: 'service', option: 'serviceReceiptPath', file: 'service.json' }),
+  Object.freeze({ role: 'continuous', option: 'continuousReceiptPath', file: 'continuous.json' }),
+  Object.freeze({ role: 'starter', option: 'starterReceiptPath', file: 'starter.json' }),
+])
 
 const NEXT_STEP_ATTACH = 'attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)'
 const NEXT_STEP_HOLD = 'do not remove SOS wiring yet; rerun until manifest.json and cutover-gate.json are status pass'
@@ -70,6 +79,16 @@ function safeName(v) {
   return String(v).replace(/[^A-Za-z0-9_.-]+/g, '_')
 }
 
+function validateStarterReceiptOptions(opts, { rejectReadOnlyModes = false } = {}) {
+  const starterPaths = STARTER_RECEIPT_ROLES.map(({ option }) => opts[option]).filter(Boolean)
+  if (new Set(starterPaths.map((path) => resolve(path))).size !== starterPaths.length) {
+    throw new Error('starter artifact roles require distinct receipt paths')
+  }
+  if (rejectReadOnlyModes && starterPaths.length > 0 && (opts.status || opts.hostGoPlan || opts.checkManifest || opts.export || opts.exportDir)) {
+    throw new Error('starter receipt flags cannot be combined with read-only or plan modes')
+  }
+}
+
 function parseArgs(argv) {
   const opts = {
     agents: [],
@@ -78,6 +97,9 @@ function parseArgs(argv) {
     controlPath: join(homedir(), '.fleet', 'control.json'),
     installReceiptPath: '',
     probeReceiptPaths: [],
+    serviceReceiptPath: '',
+    continuousReceiptPath: '',
+    starterReceiptPath: '',
     outDir: '',
     exportDir: '',
     controlLabel: '',
@@ -89,6 +111,10 @@ function parseArgs(argv) {
     verifyOnly: false,
     execProbes: false,
     force: false,
+  }
+  const setReceiptPath = (option, flag, value) => {
+    if (opts[option]) throw new Error(`duplicate ${flag}`)
+    opts[option] = pathArg(value)
   }
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
@@ -103,6 +129,9 @@ function parseArgs(argv) {
     else if (arg === '--control') opts.controlPath = pathArg(next())
     else if (arg === '--install-receipt') opts.installReceiptPath = pathArg(next())
     else if (arg === '--probe-receipt') opts.probeReceiptPaths.push(...splitValues(next()).map(pathArg))
+    else if (arg === '--service-receipt') setReceiptPath('serviceReceiptPath', arg, next())
+    else if (arg === '--continuous-receipt') setReceiptPath('continuousReceiptPath', arg, next())
+    else if (arg === '--starter-receipt') setReceiptPath('starterReceiptPath', arg, next())
     else if (arg === '--out-dir') opts.outDir = pathArg(next())
     else if (arg === '--export-dir') opts.exportDir = pathArg(next())
     else if (arg === '--control-label') opts.controlLabel = safeName(next())
@@ -136,6 +165,7 @@ function parseArgs(argv) {
     else if (arg === '--help' || arg === '-h') opts.help = true
     else throw new Error(`unknown argument: ${arg}`)
   }
+  validateStarterReceiptOptions(opts, { rejectReadOnlyModes: true })
   return opts
 }
 
@@ -151,6 +181,9 @@ function usage() {
     '  --control <path>              fleet-control-daemon config (default: ~/.fleet/control.json)',
     '  --install-receipt <path>      optional install.mjs receipt to copy into install.json',
     '  --probe-receipt <path>        optional cutover-probe.mjs receipt; repeat or comma-separate',
+    '  --service-receipt <path>      service status receipt for starter-ready mode',
+    '  --continuous-receipt <path>   continuous runtime receipt for starter-ready mode',
+    '  --starter-receipt <path>      starter verification receipt for starter-ready mode',
     '  --export-dir <path>           write a clean attachable copy, then check the copied manifest',
     '  --control-label <label>       filename label for this live control receipt, e.g. start or stop',
     '  --manifest <path>             manifest path for --check-manifest',
@@ -436,6 +469,14 @@ function manifestPathForCheck(opts) {
   return ''
 }
 
+function starterModeSelected(opts = {}) {
+  return STARTER_RECEIPT_ROLES.some(({ option }) => Boolean(opts[option]))
+}
+
+function manifestStarterMode(manifest) {
+  return manifest?.inputs?.bundle_mode === 'starter-ready'
+}
+
 function resolveArtifactPath(manifestDir, declaredPath) {
   if (typeof declaredPath !== 'string' || declaredPath.length === 0) return ''
   const localPath = join(manifestDir, basename(declaredPath))
@@ -460,6 +501,9 @@ function bundleArtifactEntries(manifest) {
 
   add('install', artifacts.install)
   for (const [index, probe] of (artifacts.probes ?? []).entries()) add(`probe:${index + 1}`, probe)
+  add('service', artifacts.service)
+  add('continuous', artifacts.continuous)
+  add('starter', artifacts.starter)
   add('host', artifacts.host)
   for (const [index, runtime] of (artifacts.runtimes ?? []).entries()) add(`runtime:${index + 1}`, runtime)
   for (const [index, control] of (artifacts.controls ?? []).entries()) add(`control:${index + 1}`, control)
@@ -471,6 +515,9 @@ function expectedArtifactType(label) {
   if (label === 'install') return EXPECTED.install
   if (label.startsWith('probe:')) return EXPECTED.probe
   if (label === 'host') return EXPECTED.host
+  if (label === 'service') return EXPECTED.service
+  if (label === 'continuous') return EXPECTED.continuous
+  if (label === 'starter') return EXPECTED.starter
   if (label.startsWith('runtime:')) return EXPECTED.runtime
   if (label.startsWith('control:')) return EXPECTED.control
   if (label === 'cutover_gate') return EXPECTED.cutover_gate
@@ -783,6 +830,51 @@ function addRequiredEvidenceChecks(checks, manifestPath, entries, agents) {
   }
 }
 
+function addBundleModeChecks(checks, manifestPath, manifest, entries) {
+  const declaredMode = manifest?.inputs?.bundle_mode
+  const starterEntries = entries.filter((entry) => STARTER_RECEIPT_ROLES.some(({ role }) => role === entry.label))
+  const hasStarterArtifacts = starterEntries.length > 0
+  const validMode = declaredMode === undefined || declaredMode === 'starter-ready'
+  checks.push({
+    ok: validMode,
+    component: 'receipt-bundle-check',
+    check: 'bundle_mode_valid',
+    path: manifestPath,
+    actual: declaredMode ?? null,
+    accepted: [null, 'starter-ready'],
+  })
+  checks.push({
+    ok: validMode && ((declaredMode === 'starter-ready') === hasStarterArtifacts),
+    component: 'receipt-bundle-check',
+    check: 'bundle_mode_matches_artifacts',
+    path: manifestPath,
+    declared_mode: declaredMode ?? null,
+    starter_artifacts: starterEntries.map((entry) => entry.label),
+  })
+
+  const declaredPaths = entries
+    .map((entry) => typeof entry.path === 'string' && entry.path.length > 0 ? basename(entry.path) : null)
+    .filter(Boolean)
+  checks.push({
+    ok: new Set(declaredPaths).size === declaredPaths.length,
+    component: 'receipt-bundle-check',
+    check: 'artifact_role_paths_unique',
+    path: manifestPath,
+    artifact_paths: declaredPaths,
+  })
+
+  if (declaredMode !== 'starter-ready' && !hasStarterArtifacts) return
+  for (const { role } of STARTER_RECEIPT_ROLES) {
+    checks.push({
+      ok: entries.filter((entry) => entry.label === role).length === 1,
+      component: 'receipt-bundle-check',
+      check: 'required_artifact_present',
+      path: manifestPath,
+      artifact: role,
+    })
+  }
+}
+
 function addBundleDirectoryScopeChecks(checks, manifestPath, manifestDir, entries) {
   const allowed = new Set(['manifest.json'])
   for (const entry of entries) {
@@ -1087,6 +1179,7 @@ function checkBundleManifest(opts = {}) {
       path: manifestPath,
       count: entries.length,
     })
+    addBundleModeChecks(checks, manifestPath, manifest, entries)
     addRequiredEvidenceChecks(checks, manifestPath, entries, agents)
     addBundleDirectoryScopeChecks(checks, manifestPath, manifestDir, entries)
     addExportSidecarChecks(checks, manifestPath, manifestDir, manifest, opts)
@@ -1568,6 +1661,31 @@ function firstMeta(path) {
   return existsSync(path) ? receiptMeta(path) : null
 }
 
+function starterEvidence(artifacts) {
+  const service = artifacts.service?.path ? readReceipt(artifacts.service.path) : null
+  const continuous = artifacts.continuous?.path ? readReceipt(artifacts.continuous.path) : null
+  const starter = artifacts.starter?.path ? readReceipt(artifacts.starter.path) : null
+  const definitionHashes = {}
+  for (const definition of service?.definitions ?? []) {
+    if (typeof definition?.service === 'string' && /^[a-f0-9]{64}$/.test(definition?.sha256 ?? '')) {
+      definitionHashes[definition.service] = definition.sha256
+    }
+  }
+  const heartbeatBefore = continuous?.observation?.heartbeat?.tick?.before
+  const heartbeatAfter = continuous?.observation?.heartbeat?.tick?.after
+  const controlBefore = continuous?.observation?.control?.poll?.before
+  const controlAfter = continuous?.observation?.control?.poll?.after
+  return {
+    service_manager: service?.service_manager ?? continuous?.service?.service_manager ?? null,
+    definition_hashes: definitionHashes,
+    observed_deltas: {
+      heartbeat_tick: Number.isFinite(heartbeatBefore) && Number.isFinite(heartbeatAfter) ? heartbeatAfter - heartbeatBefore : null,
+      control_poll: Number.isFinite(controlBefore) && Number.isFinite(controlAfter) ? controlAfter - controlBefore : null,
+    },
+    starter_manifest_sha256: starter?.manifest?.sha256 ?? starter?.manifest_sha256 ?? starter?.artifacts?.manifest?.sha256 ?? null,
+  }
+}
+
 function statusCheck(checks, check, ok, extra = {}) {
   checks.push({ ok, component: 'receipt-bundle-status', check, ...extra })
 }
@@ -1827,6 +1945,15 @@ function formatStatusSummary(receipt) {
   lines.push(`Bundle: ${receipt?.inputs?.out_dir ?? '<none>'}`)
   lines.push(`Agents: ${(receipt?.inputs?.agents ?? []).join(', ') || '<none>'}`)
   lines.push(`Required controls: ${(receipt?.inputs?.required_control_verbs ?? []).join(', ') || '<none>'}`)
+  if (receipt?.starter_ready) {
+    const definitionHashes = Object.entries(receipt.starter_ready.definition_hashes ?? {})
+      .map(([service, digest]) => `${service}=${digest}`)
+      .join(', ') || '<none>'
+    lines.push(`Service manager: ${receipt.starter_ready.service_manager ?? '<none>'}`)
+    lines.push(`Definition hashes: ${definitionHashes}`)
+    lines.push(`Observed deltas: heartbeat tick=${receipt.starter_ready.observed_deltas?.heartbeat_tick ?? '<none>'}, control poll=${receipt.starter_ready.observed_deltas?.control_poll ?? '<none>'}`)
+    lines.push(`Starter manifest: ${receipt.starter_ready.starter_manifest_sha256 ?? '<none>'}`)
+  }
   lines.push('')
   lines.push('Checklist:')
   for (const item of receipt?.host_go_checklist ?? []) {
@@ -1852,6 +1979,8 @@ function inspectBundleStatus(opts = {}) {
 
   const manifestPath = outDir ? join(outDir, 'manifest.json') : ''
   const manifest = manifestPath && existsSync(manifestPath) ? readReceipt(manifestPath) : null
+  const starterFilesPresent = outDir && STARTER_RECEIPT_ROLES.some(({ file }) => existsSync(join(outDir, file)))
+  const starterMode = manifestStarterMode(manifest) || Boolean(starterFilesPresent)
   const artifacts = {
     out_dir: outDir || null,
     install: outDir ? firstMeta(join(outDir, 'install.json')) : null,
@@ -1861,6 +1990,11 @@ function inspectBundleStatus(opts = {}) {
     controls: outDir ? listReceiptFiles(outDir, 'control-').map(receiptMeta) : [],
     cutover_gate: outDir ? firstMeta(join(outDir, 'cutover-gate.json')) : null,
     manifest: outDir ? firstMeta(manifestPath) : null,
+    ...(starterMode ? {
+      service: outDir ? firstMeta(join(outDir, 'service.json')) : null,
+      continuous: outDir ? firstMeta(join(outDir, 'continuous.json')) : null,
+      starter: outDir ? firstMeta(join(outDir, 'starter.json')) : null,
+    } : {}),
   }
   const agents = inferStatusAgents(opts, manifest, artifacts)
   const gateReceipt = outDir ? readReceipt(join(outDir, 'cutover-gate.json')) : null
@@ -1888,6 +2022,19 @@ function inspectBundleStatus(opts = {}) {
     receipt: hostReceipt,
     extra: { path: artifacts.host?.path ?? join(outDir || '<out-dir>', 'host.json') },
   })
+  if (starterMode) {
+    statusCheck(checks, 'bundle_mode_starter_ready', manifestStarterMode(manifest), {
+      actual: manifest?.inputs?.bundle_mode ?? null,
+    })
+    for (const { role } of STARTER_RECEIPT_ROLES) {
+      const meta = artifacts[role]
+      statusCheck(checks, `${role}_receipt_pass`, meta?.receipt_type === EXPECTED[role] && meta?.status === 'pass', {
+        path: meta?.path ?? join(outDir || '<out-dir>', `${role}.json`),
+        receipt_type: meta?.receipt_type ?? null,
+        status: meta?.status ?? null,
+      })
+    }
+  }
   statusCheck(checks, 'probe_receipt_pass_present', passingMetaCount(artifacts.probes, EXPECTED.probe) > 0, {
     count: artifacts.probes.length,
     passing: passingMetaCount(artifacts.probes, EXPECTED.probe),
@@ -1972,6 +2119,7 @@ function inspectBundleStatus(opts = {}) {
       manifest: manifestCheck.manifest,
     } : null,
     host_go_checklist: hostGoChecklist,
+    ...(starterMode ? { starter_ready: starterEvidence(artifacts) } : {}),
     next_steps: next,
     checks,
   }
@@ -2072,6 +2220,49 @@ function includeInstallReceipt(outDir, opts, checks) {
   if (!wrote) return existsSync(dest) ? receiptMeta(dest) : { path: dest, receipt_type: null, status: null }
   addInstallReceiptStatusChecks(checks, dest, receipt)
   return receiptMeta(dest)
+}
+
+function includeStarterReceipt(outDir, opts, checks, roleSpec) {
+  const { role, option, file } = roleSpec
+  const source = opts[option] ? pathArg(opts[option]) : ''
+  const dest = join(outDir, file)
+  checks.push({
+    ok: Boolean(source),
+    component: 'receipt-bundle',
+    check: `${role}_receipt_present`,
+    path: source || null,
+  })
+  if (!source) return null
+
+  const receipt = readReceipt(source)
+  checks.push({
+    ok: Boolean(receipt),
+    component: 'receipt-bundle',
+    check: `${role}_receipt_read`,
+    path: source,
+  })
+  if (!receipt) {
+    addReceiptStatusCheck(checks, role, source, null, EXPECTED[role])
+    checks.push({ ok: false, component: 'receipt-bundle', check: `${role}_receipt_no_secret_material`, path: source, findings: [], finding_count: 0 })
+    return { path: dest, receipt_type: null, status: null, sha256: null }
+  }
+
+  if (resolve(source) === resolve(dest)) {
+    checks.push({ ok: true, component: 'receipt-bundle', check: `${role}_receipt_reused`, path: dest })
+  } else {
+    writeJson(dest, receipt, opts, checks, role)
+  }
+  addReceiptStatusCheck(checks, role, source, receipt, EXPECTED[role])
+  const secretFindings = findSecretMaterial(receipt)
+  checks.push({
+    ok: secretFindings.length === 0,
+    component: 'receipt-bundle',
+    check: `${role}_receipt_no_secret_material`,
+    path: source,
+    findings: secretFindingSummary(secretFindings),
+    finding_count: secretFindings.length,
+  })
+  return existsSync(dest) ? receiptMeta(dest) : { path: dest, receipt_type: null, status: null, sha256: null }
 }
 
 function probeDestPath(outDir, source, index) {
@@ -2237,11 +2428,13 @@ function buildNextSteps({ artifacts, agents, gateReceipt, outDir, bundleStatus, 
 }
 
 async function buildBundle(opts) {
+  validateStarterReceiptOptions(opts)
   const checks = []
   const stamp = opts.stamp ?? defaultStamp()
   const outDir = opts.outDir ? pathArg(opts.outDir) : join(homedir(), '.fleet', 'receipts', stamp)
   const agents = [...new Set(opts.agents ?? [])]
   const verifyOnly = Boolean(opts.verifyOnly)
+  const starterMode = starterModeSelected(opts)
   const skipHost = Boolean(opts.skipHost || verifyOnly)
   const skipRuntime = Boolean(opts.skipRuntime || verifyOnly)
   const skipControl = Boolean(opts.skipControl || verifyOnly)
@@ -2262,10 +2455,17 @@ async function buildBundle(opts) {
     controls: [],
     cutover_gate: null,
     manifest: join(outDir, 'manifest.json'),
+    ...(starterMode ? { service: null, continuous: null, starter: null } : {}),
   }
 
   artifacts.install = includeInstallReceipt(outDir, opts, checks)
   artifacts.probes = includeProbeReceipts(outDir, opts, checks)
+  if (starterMode) {
+    checks.push({ ok: true, component: 'receipt-bundle', check: 'starter_ready_mode_selected' })
+    for (const roleSpec of STARTER_RECEIPT_ROLES) {
+      artifacts[roleSpec.role] = includeStarterReceipt(outDir, opts, checks, roleSpec)
+    }
+  }
   checks.push({
     ok: artifacts.probes.some((probe) => probe?.status === 'pass'),
     component: 'receipt-bundle',
@@ -2382,6 +2582,7 @@ async function buildBundle(opts) {
       skip_host: skipHost,
       skip_runtime: skipRuntime,
       skip_control: skipControl,
+      ...(starterMode ? { bundle_mode: 'starter-ready' } : {}),
     },
     artifacts,
     next_steps: [],

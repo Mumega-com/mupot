@@ -1,10 +1,15 @@
 // node --test host-receipt.test.mjs
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { buildReceipt, hasPlaceholder, summarize } from './host-receipt.mjs'
+import { fileURLToPath } from 'node:url'
+import { buildReceipt, hasPlaceholder, parseArgs, summarize } from './host-receipt.mjs'
+import { createServiceContext } from './service-context.mjs'
+import { renderSystemd } from './systemd-service-manager.mjs'
 
 const PANEL_PUBLIC_JWK = {
   kty: 'OKP',
@@ -83,6 +88,90 @@ function fixture(overrides = {}) {
   }
 }
 
+function serviceFixture(overrides = {}) {
+  const f = fixture()
+  const runtimeDir = join(f.root, 'runtime')
+  const definitionDir = join(f.root, 'systemd')
+  mkdirSync(runtimeDir)
+  mkdirSync(definitionDir)
+  const nodePath = '/usr/local/bin/node'
+  const context = createServiceContext({
+    manager: 'systemd',
+    platformName: 'linux',
+    homeDir: f.root,
+    prefix: f.root,
+    runtimeDir,
+    definitionDir,
+    nodePath,
+    uid: 501,
+    username: 'operator',
+  })
+  const rendered = renderSystemd(context)
+  for (const definition of rendered) writeFileSync(definition.path, definition.content)
+  const receipt = {
+    receipt_type: 'mupot-fleet-service-receipt/v1',
+    generated_at: '2026-07-13T20:00:00.000Z',
+    status: 'pass',
+    platform: 'linux',
+    service_manager: 'systemd',
+    action: 'status',
+    definitions: rendered.map((definition) => ({
+      service: definition.key,
+      path: definition.path,
+      sha256: createHash('sha256').update(definition.content).digest('hex'),
+    })),
+    services: context.services.map((service) => ({
+      key: service.key,
+      name: service.name,
+      loaded: true,
+      enabled: true,
+      running: true,
+      pid: service.key === 'heartbeat' ? 101 : 102,
+    })),
+    linger: { enabled: true, raw: 'yes' },
+    commands: [],
+    preserved_data: { configs: true, private_keys: true, runtime: true, inbox: true, receipts: true },
+    next_steps: [],
+    checks: [
+      { ok: true, check: 'services_loaded_and_running' },
+      { ok: true, check: 'command_output_secret_free' },
+    ],
+  }
+  if (overrides.mutateReceipt) overrides.mutateReceipt(receipt)
+  if (overrides.mutateDefinitions) overrides.mutateDefinitions({ context, receipt, rendered })
+  return {
+    ...f,
+    runtimeDir,
+    definitionDir,
+    nodePath,
+    context,
+    receipt,
+  }
+}
+
+async function requiredServiceReceipt(f) {
+  return buildReceipt({
+    daemonPath: f.daemonPath,
+    inboxPath: f.inboxPath,
+    controlPath: f.controlPath,
+    skipInbox: false,
+    skipControl: false,
+    execProbes: false,
+    keyPathFor: f.keyPathFor,
+    requireServices: true,
+    serviceManager: 'systemd',
+    serviceDefinitionDir: f.definitionDir,
+    runtimeDir: f.runtimeDir,
+    nodePath: f.nodePath,
+    platformName: 'linux',
+    buildServiceReceipt: async (opts) => {
+      assert.equal(opts.action, 'status')
+      assert.equal(opts.serviceManager, 'systemd')
+      return f.receipt
+    },
+  })
+}
+
 test('host receipt passes for a complete local host layout without executing probes', async () => {
   const f = fixture()
   const receipt = await buildReceipt({
@@ -110,6 +199,110 @@ test('host receipt passes for a complete local host layout without executing pro
   assert.ok(receipt.checks.some((c) => c.component === 'fleet-control-daemon' && c.check === 'panel_public_key_public_only' && c.ok))
   assert.ok(receipt.checks.some((c) => c.component === 'host-receipt' && c.check === 'daemon_control_base_url_match' && c.ok))
   assert.ok(receipt.checks.some((c) => c.component === 'host-receipt' && c.check === 'daemon_control_tenant_match' && c.ok))
+  assert.equal(receipt.checks.some((c) => c.check === 'service_definitions_current'), false)
+})
+
+test('host receipt requires current running services and enabled systemd linger', async () => {
+  const receipt = await requiredServiceReceipt(serviceFixture())
+
+  assert.equal(receipt.status, 'pass')
+  assert.equal(receipt.inputs.service_manager, 'systemd')
+  assert.ok(receipt.inputs.service_definition_dir.endsWith('/systemd'))
+  assert.deepEqual(
+    receipt.checks.filter((check) => check.component === 'host-services').map((check) => check.check),
+    ['service_definitions_current', 'heartbeat_service_running', 'control_service_running', 'systemd_linger_enabled'],
+  )
+  assert.equal(receipt.checks.filter((check) => check.component === 'host-services').every((check) => check.ok === true), true)
+})
+
+test('host receipt fails closed for missing, stale, or misconfigured service definitions', async (t) => {
+  const cases = [
+    {
+      name: 'missing definition',
+      mutateDefinitions: ({ rendered }) => rmSync(rendered[0].path),
+    },
+    {
+      name: 'definition hash mismatch',
+      mutateDefinitions: ({ rendered }) => writeFileSync(rendered[0].path, `${rendered[0].content}\n# drift\n`),
+    },
+    {
+      name: 'wrong node execution argument',
+      mutateDefinitions: ({ receipt, rendered }) => {
+        const content = rendered[0].content.replace('/usr/local/bin/node', '/wrong/node')
+        writeFileSync(rendered[0].path, content)
+        receipt.definitions[0].sha256 = createHash('sha256').update(content).digest('hex')
+      },
+    },
+    {
+      name: 'wrong runtime execution argument',
+      mutateDefinitions: ({ receipt, rendered }) => {
+        const content = rendered[0].content.replace('/runtime/fleet-daemon.mjs', '/other/fleet-daemon.mjs')
+        writeFileSync(rendered[0].path, content)
+        receipt.definitions[0].sha256 = createHash('sha256').update(content).digest('hex')
+      },
+    },
+    {
+      name: 'wrong config execution argument',
+      mutateDefinitions: ({ receipt, rendered }) => {
+        const content = rendered[1].content.replace('/control.json', '/wrong-control.json')
+        writeFileSync(rendered[1].path, content)
+        receipt.definitions[1].sha256 = createHash('sha256').update(content).digest('hex')
+      },
+    },
+  ]
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const receipt = await requiredServiceReceipt(serviceFixture(entry))
+      assert.equal(receipt.status, 'fail')
+      assert.ok(receipt.checks.some((check) => check.check === 'service_definitions_current' && check.ok === false))
+    })
+  }
+})
+
+test('host receipt fails required mode for unloaded or stopped services and disabled linger', async (t) => {
+  const cases = [
+    {
+      name: 'unloaded heartbeat',
+      check: 'heartbeat_service_running',
+      mutateReceipt: (receipt) => { receipt.services[0].loaded = false },
+    },
+    {
+      name: 'stopped control',
+      check: 'control_service_running',
+      mutateReceipt: (receipt) => { receipt.services[1].running = false },
+    },
+    {
+      name: 'disabled systemd linger',
+      check: 'systemd_linger_enabled',
+      mutateReceipt: (receipt) => { receipt.linger = { enabled: false, raw: 'no' } },
+    },
+  ]
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const receipt = await requiredServiceReceipt(serviceFixture(entry))
+      assert.equal(receipt.status, 'fail')
+      assert.ok(receipt.checks.some((check) => check.check === entry.check && check.ok === false))
+    })
+  }
+})
+
+test('host receipt parses and documents service requirement options', () => {
+  const opts = parseArgs([
+    '--require-services',
+    '--service-manager', 'launchd',
+    '--service-definition-dir', './LaunchAgents',
+  ])
+  const help = execFileSync(process.execPath, [fileURLToPath(new URL('./host-receipt.mjs', import.meta.url)), '--help'], { encoding: 'utf8' })
+
+  assert.equal(opts.requireServices, true)
+  assert.equal(opts.serviceManager, 'launchd')
+  assert.ok(opts.serviceDefinitionDir.endsWith('/LaunchAgents'))
+  assert.match(help, /--require-services/)
+  assert.match(help, /--service-manager <auto\|systemd\|launchd>/)
+  assert.match(help, /--service-definition-dir <path>/)
+  assert.throws(() => parseArgs(['--service-manager', 'none']), /auto\|systemd\|launchd/)
 })
 
 test('host receipt fails when daemon inbox agents have no handler config', async () => {

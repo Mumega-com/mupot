@@ -128,6 +128,95 @@ function controlReceipt(agentId, verb, status = 'pass') {
   }
 }
 
+function serviceReceipt(status = 'pass') {
+  return {
+    receipt_type: 'mupot-fleet-service-receipt/v1',
+    generated_at: '2026-07-13T20:03:00.000Z',
+    status,
+    platform: 'linux',
+    service_manager: 'systemd',
+    action: 'status',
+    definitions: [
+      { service: 'heartbeat', path: '/home/operator/.config/systemd/user/fleet-daemon.service', sha256: 'a'.repeat(64) },
+      { service: 'control', path: '/home/operator/.config/systemd/user/fleet-control-daemon.service', sha256: 'b'.repeat(64) },
+    ],
+    services: [
+      { key: 'heartbeat', name: 'fleet-daemon.service', loaded: true, enabled: true, running: true, pid: 101 },
+      { key: 'control', name: 'fleet-control-daemon.service', loaded: true, enabled: true, running: true, pid: 102 },
+    ],
+    linger: { enabled: true, raw: 'yes' },
+    commands: [],
+    preserved_data: { configs: true, private_keys: true, runtime: true, inbox: true, receipts: true },
+    next_steps: [],
+    checks: [
+      { ok: true, check: 'services_loaded_and_running' },
+      { ok: true, check: 'command_output_secret_free' },
+    ],
+  }
+}
+
+function continuousReceipt(status = 'pass') {
+  return {
+    receipt_type: 'mupot-fleet-continuous-runtime-receipt/v1',
+    generated_at: '2026-07-13T20:04:00.000Z',
+    status,
+    agent: { agent_id: 'agent-one', probe: 'alive', heartbeat_status: 204, inbox_count: 1, consume: 'consumed' },
+    observation: {
+      started_at: '2026-07-13T20:03:00.000Z',
+      deadline_at: '2026-07-13T20:05:00.000Z',
+      timed_out: false,
+      heartbeat: { tick: { before: 40, after: 43 } },
+      control: { poll: { before: 70, after: 72 } },
+    },
+    service: { status: 'pass', service_manager: 'systemd', services: [], linger: { enabled: true, raw: 'yes' }, checks: [] },
+    next_steps: [],
+    checks: [{ check: 'services_running', ok: status === 'pass' }],
+  }
+}
+
+function starterReceipt(status = 'pass') {
+  return {
+    receipt_type: 'mupot-fleet-starter-receipt/v1',
+    generated_at: '2026-07-13T20:05:00.000Z',
+    status,
+    manifest: {
+      path: '/workspace/starter.example.json',
+      sha256: 'c'.repeat(64),
+    },
+    checks: [{ check: 'starter_manifest_valid', ok: status === 'pass' }],
+  }
+}
+
+function serviceAwareHostReceipt() {
+  return hostReceipt('pass', {
+    checks: [
+      HOST_PANEL_PUBLIC_KEY_CHECK,
+      { ok: true, component: 'host-services', check: 'service_definitions_current' },
+      { ok: true, component: 'host-services', check: 'heartbeat_service_running' },
+      { ok: true, component: 'host-services', check: 'control_service_running' },
+      { ok: true, component: 'host-services', check: 'systemd_linger_enabled' },
+    ],
+  })
+}
+
+function seedCutoverEvidence(outDir, host = hostReceipt()) {
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
+  writeJson(join(outDir, 'host.json'), host)
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), controlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), controlReceipt('agent-one', 'stop'))
+}
+
+function starterPaths(overrides = {}) {
+  const sourceDir = tmpDir()
+  return {
+    sourceDir,
+    serviceReceiptPath: writeJson(join(sourceDir, 'service-source.json'), overrides.service ?? serviceReceipt()),
+    continuousReceiptPath: writeJson(join(sourceDir, 'continuous-source.json'), overrides.continuous ?? continuousReceipt()),
+    starterReceiptPath: writeJson(join(sourceDir, 'starter-source.json'), overrides.starter ?? starterReceipt()),
+  }
+}
+
 test('receipt bundle writes host, runtime, control, cutover gate, and manifest', async () => {
   const outDir = tmpDir()
   const installPath = writeJson(join(tmpDir(), 'install.json'), installReceipt())
@@ -180,6 +269,137 @@ test('receipt bundle writes host, runtime, control, cutover gate, and manifest',
   assert.ok(manifest.checks.some((c) => c.check === 'probe_receipt_status_pass' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'cutover_gate_status_pass' && c.ok === true))
   assert.ok(manifest.checks.some((c) => c.check === 'manifest_written' && c.ok === true))
+})
+
+test('starter-ready bundle requires, exports, and summarizes service continuity evidence', async () => {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir, serviceAwareHostReceipt())
+  writeJson(join(outDir, 'install.json'), installReceipt('pass'))
+  const sources = starterPaths()
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+    ...sources,
+  })
+
+  assert.equal(bundle.status, 'pass')
+  assert.equal(bundle.inputs.bundle_mode, 'starter-ready')
+  assert.equal(bundle.artifacts.service.receipt_type, 'mupot-fleet-service-receipt/v1')
+  assert.equal(bundle.artifacts.continuous.receipt_type, 'mupot-fleet-continuous-runtime-receipt/v1')
+  assert.equal(bundle.artifacts.starter.receipt_type, 'mupot-fleet-starter-receipt/v1')
+  assert.equal(checkBundleManifest({ outDir }).status, 'pass')
+
+  const status = inspectBundleStatus({ outDir })
+  const compact = formatStatusSummary(status)
+  assert.equal(status.starter_ready.service_manager, 'systemd')
+  assert.deepEqual(status.starter_ready.definition_hashes, {
+    heartbeat: 'a'.repeat(64),
+    control: 'b'.repeat(64),
+  })
+  assert.deepEqual(status.starter_ready.observed_deltas, { heartbeat_tick: 3, control_poll: 2 })
+  assert.equal(status.starter_ready.starter_manifest_sha256, 'c'.repeat(64))
+  assert.match(compact, /Service manager: systemd/)
+  assert.match(compact, new RegExp(`Definition hashes: heartbeat=${'a'.repeat(64)}, control=${'b'.repeat(64)}`))
+  assert.match(compact, /Observed deltas: heartbeat tick=3, control poll=2/)
+  assert.match(compact, new RegExp(`Starter manifest: ${'c'.repeat(64)}`))
+
+  const exportDir = tmpDir()
+  assert.equal(exportBundle({ outDir, exportDir }).status, 'pass')
+  rmSync(outDir, { recursive: true })
+  rmSync(sources.sourceDir, { recursive: true })
+  const copiedCheck = checkBundleManifest({ outDir: exportDir })
+  assert.equal(copiedCheck.status, 'pass')
+  assert.equal(readFileSync(join(exportDir, 'manifest.json'), 'utf8').includes(outDir), false)
+  assert.deepEqual(
+    ['service.json', 'continuous.json', 'starter.json'].map((name) => existsSync(join(exportDir, name))),
+    [true, true, true],
+  )
+})
+
+test('starter-ready mode fails unless all three exact passing secret-free receipts are supplied', async (t) => {
+  const cases = [
+    {
+      name: 'missing continuous and starter roles',
+      paths: () => {
+        const sourceDir = tmpDir()
+        return { serviceReceiptPath: writeJson(join(sourceDir, 'service.json'), serviceReceipt()) }
+      },
+      failedCheck: 'continuous_receipt_present',
+    },
+    {
+      name: 'wrong service receipt type',
+      paths: () => starterPaths({ service: { ...serviceReceipt(), receipt_type: 'mupot-fleet-continuous-runtime-receipt/v1' } }),
+      failedCheck: 'service_receipt_type',
+    },
+    {
+      name: 'failed continuous receipt',
+      paths: () => starterPaths({ continuous: continuousReceipt('fail') }),
+      failedCheck: 'continuous_receipt_status_pass',
+    },
+    {
+      name: 'secret-bearing starter receipt',
+      paths: () => starterPaths({
+        starter: {
+          ...starterReceipt(),
+          leaked: { authorization: 'Bearer starter_secret_abcdefghijklmnopqrstuvwxyz' },
+        },
+      }),
+      failedCheck: 'starter_receipt_no_secret_material',
+    },
+  ]
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const outDir = tmpDir()
+      seedCutoverEvidence(outDir, serviceAwareHostReceipt())
+      const bundle = await buildBundle({
+        outDir,
+        agents: ['agent-one'],
+        daemonPath: '/tmp/daemon.json',
+        inboxPath: '/tmp/inbox.json',
+        controlPath: '/tmp/control.json',
+        verifyOnly: true,
+        ...entry.paths(),
+      })
+
+      assert.equal(bundle.status, 'fail')
+      assert.ok(bundle.checks.some((check) => check.check === entry.failedCheck && check.ok === false))
+    })
+  }
+})
+
+test('starter-ready manifest check rejects hash drift and fabricated mode metadata', async () => {
+  const outDir = tmpDir()
+  seedCutoverEvidence(outDir, serviceAwareHostReceipt())
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+    ...starterPaths(),
+  })
+  assert.equal(bundle.status, 'pass')
+
+  const servicePath = join(outDir, 'service.json')
+  writeJson(servicePath, { ...serviceReceipt(), generated_at: '2026-07-13T21:00:00.000Z' })
+  const drift = checkBundleManifest({ outDir })
+  assert.equal(drift.status, 'fail')
+  assert.ok(drift.checks.some((check) => check.check === 'artifact_sha256_match' && check.artifact === 'service' && check.ok === false))
+
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  manifest.artifacts.service.sha256 = sha256(servicePath)
+  delete manifest.inputs.bundle_mode
+  writeJson(manifestPath, manifest)
+  const fabricated = checkBundleManifest({ outDir })
+  assert.equal(fabricated.status, 'fail')
+  assert.ok(fabricated.checks.some((check) => check.check === 'bundle_mode_matches_artifacts' && check.ok === false))
 })
 
 test('receipt bundle fails when an included probe receipt did not queue inputs', async () => {
@@ -1178,6 +1398,34 @@ test('parseArgs accepts bundle controls and safe filenames', () => {
   assert.equal(opts.execProbes, true)
   assert.equal(opts.force, true)
   assert.equal(safeName('a/b c'), 'a_b_c')
+})
+
+test('parseArgs accepts one receipt per starter-ready artifact role', () => {
+  const opts = parseArgs([
+    '--agent', 'agent-one',
+    '--service-receipt', './service.json',
+    '--continuous-receipt', './continuous.json',
+    '--starter-receipt', './starter.json',
+  ])
+
+  assert.ok(opts.serviceReceiptPath.endsWith('/service.json'))
+  assert.ok(opts.continuousReceiptPath.endsWith('/continuous.json'))
+  assert.ok(opts.starterReceiptPath.endsWith('/starter.json'))
+})
+
+test('parseArgs rejects contradictory starter modes and duplicate artifact roles', () => {
+  assert.throws(
+    () => parseArgs(['--service-receipt', './service-a.json', '--service-receipt', './service-b.json']),
+    /duplicate --service-receipt/,
+  )
+  assert.throws(
+    () => parseArgs(['--service-receipt', './same.json', '--continuous-receipt', './same.json']),
+    /artifact roles require distinct receipt paths/,
+  )
+  assert.throws(
+    () => parseArgs(['--service-receipt', './service.json', '--status']),
+    /starter receipt flags cannot be combined with read-only or plan modes/,
+  )
 })
 
 test('parseArgs expands --verify-only to read-only reuse flags', () => {
