@@ -390,6 +390,7 @@ test('deadline expiry cannot pass even when the final evidence shows both counte
       reads.set(path, count)
       return states[Math.min(count - 1, states.length - 1)]
     },
+    serviceDeps: { platformName: 'darwin' },
     buildServiceReceipt: async () => serviceReceipt(),
   })
 

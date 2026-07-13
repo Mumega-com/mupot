@@ -257,4 +257,26 @@ Final result: exit 0 with no output after the complete report append.
 ### Final Post-report Whitespace Verification
 
 - `git diff --check`
-  - Exit 0 with no output after this append and before commit.
+- Exit 0 with no output after this append and before commit.
+
+## Task 6 Portability Finding Fix
+
+### Delivered
+
+- Injected `serviceDeps: { platformName: 'darwin' }` into the standalone explicit launchd deadline fixture so its Darwin/launchd service receipt is host-independent.
+- Production code was unchanged.
+
+### Verification
+
+- `node --test fleet-runtime/continuous-runtime-receipt.test.mjs`
+  - Exit 0; 137 passed, 0 failed, 0 skipped; 129.401375 ms.
+- `node --test fleet-runtime/*.test.mjs`
+  - Exit 0; 316 passed, 0 failed, 0 skipped; 588.221917 ms.
+- `npm test`
+  - Exit 0; 168 test files passed and 2,703 tests passed; 6.78 s. Node emitted the existing experimental SQLite warnings only.
+- `git diff --check`
+  - Exit 0 with no output.
+
+### Concerns
+
+- No live launchd or systemd service observation was performed; coverage remains deterministic and producer-shaped.
