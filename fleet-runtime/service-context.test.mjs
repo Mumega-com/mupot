@@ -24,6 +24,50 @@ test('legacy and manager-specific options fail closed', () => {
   assert.throws(() => validateServiceOptions({ serviceManager: 'launchd', enableLinger: true }), /enable-linger/)
 })
 
+test('auto defers manager-specific validation until a manager is resolved', () => {
+  const launchd = validateServiceOptions({ serviceManager: 'auto', launchdDirExplicit: true })
+  const systemd = validateServiceOptions({ serviceManager: 'auto', systemdDirExplicit: true, enableLinger: true })
+
+  assert.equal(launchd.serviceManager, 'auto')
+  assert.equal(systemd.serviceManager, 'auto')
+  assert.doesNotThrow(() => validateServiceOptions(launchd, 'launchd'))
+  assert.throws(() => validateServiceOptions(launchd, 'systemd'), /launchd-dir/)
+  assert.doesNotThrow(() => validateServiceOptions(systemd, 'systemd'))
+  assert.throws(() => validateServiceOptions(systemd, 'launchd'), /systemd-dir|enable-linger/)
+})
+
+test('direct option validation infers supplied values without overriding explicit false metadata', () => {
+  const direct = validateServiceOptions({ serviceManager: 'auto', launchdDir: '/tmp/LaunchAgents', systemdDir: undefined })
+  assert.equal(direct.serviceManagerExplicit, true)
+  assert.equal(direct.launchdDirExplicit, true)
+  assert.equal(direct.systemdDirExplicit, false)
+  assert.equal(validateServiceOptions({ serviceManager: 'auto', serviceManagerExplicit: false }).serviceManagerExplicit, false)
+  assert.equal(validateServiceOptions({ launchdDir: '/tmp/default', launchdDirExplicit: false }).launchdDirExplicit, false)
+  assert.throws(() => validateServiceOptions({ skipSystemd: true, serviceManager: 'launchd' }), /conflicts/)
+})
+
+test('configured paths reject all repository secret value patterns without echoing values', () => {
+  const markers = [
+    'Bearer abcdefghijklmnop',
+    'mupot_abcdefghijklmnop',
+    'sk-proj-abcdefghijklmnopqrst',
+    'ghp_abcdefghijklmnopqrst',
+    '-----BEGIN PRIVATE KEY-----',
+    'eyJabcdefghijk.abcdefghijk.abcdefghijk',
+  ]
+
+  for (const marker of markers) {
+    assert.throws(
+      () => validateServiceOptions({ prefix: `/tmp/${marker}` }),
+      (error) => error.message === 'configured path contains a prohibited secret-like value' && !error.message.includes(marker),
+    )
+  }
+  assert.throws(
+    () => createServiceContext({ manager: 'launchd', definitionDir: '/tmp/mupot_abcdefghijklmnop' }),
+    (error) => error.message === 'configured path contains a prohibited secret-like value',
+  )
+})
+
 test('context contains only absolute non-secret execution paths', () => {
   const context = createServiceContext({
     manager: 'launchd',

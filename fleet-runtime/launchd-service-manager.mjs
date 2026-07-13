@@ -1,8 +1,6 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
-import { definitionSha256 } from './service-context.mjs'
-
-const PATH = '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+import { MINIMAL_SERVICE_PATH, definitionSha256 } from './service-context.mjs'
 let temporaryFileNumber = 0
 
 function xml(value) {
@@ -93,7 +91,7 @@ function resultFor(service, state, extra = {}) {
 }
 
 export function renderLaunchd(context) {
-  const environment = Object.freeze({ HOME: context.homeDir, PATH })
+  const environment = Object.freeze({ HOME: context.homeDir, PATH: MINIMAL_SERVICE_PATH })
   return context.services.map((service) => {
     const content = [
       '<?xml version="1.0" encoding="UTF-8"?>',

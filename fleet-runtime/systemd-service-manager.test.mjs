@@ -61,6 +61,8 @@ test('renderSystemd emits escaped absolute user-unit definitions', async () => {
     assert.equal(definition.path.startsWith('/'), true)
     assert.match(definition.content, new RegExp(`WorkingDirectory="${context.runtimeDir}"`))
     assert.match(definition.content, new RegExp(`ExecStart="${context.nodePath}" "${service.scriptPath}" "${service.configPath}"`))
+    assert.match(definition.content, new RegExp(`Environment="HOME=${context.homeDir}"`))
+    assert.match(definition.content, /Environment="PATH=\/usr\/local\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin"/)
     assert.match(definition.content, /Restart=on-failure/)
     assert.match(definition.content, /RestartSec=10/)
     assert.match(definition.content, /NoNewPrivileges=true/)
@@ -72,7 +74,7 @@ test('renderSystemd emits escaped absolute user-unit definitions', async () => {
 test('renderSystemd preserves literal systemd specifiers and ExecStart dollar paths', () => {
   const context = createServiceContext({
     manager: 'systemd',
-    homeDir: '/tmp/systemd literals',
+    homeDir: '/tmp/home %u ${HOME} "quoted" \\path',
     prefix: '/tmp/fleet %u ${HOME}',
     runtimeDir: '/tmp/runtime %u ${HOME}',
     definitionDir: '/tmp/definitions %u ${HOME}',
@@ -88,6 +90,8 @@ test('renderSystemd preserves literal systemd specifiers and ExecStart dollar pa
   for (const [index, definition] of renderSystemd(context).entries()) {
     assert.equal(definition.content.split('\n').find((line) => line.startsWith('WorkingDirectory=')), 'WorkingDirectory="/tmp/runtime %%u ${HOME}"')
     assert.equal(definition.content.split('\n').find((line) => line.startsWith('ExecStart=')), expectedExecStarts[index])
+    assert.equal(definition.content.split('\n').find((line) => line.startsWith('Environment="HOME=')), 'Environment="HOME=/tmp/home %%u ${HOME} \\"quoted\\" \\\\path"')
+    assert.equal(definition.content.split('\n').find((line) => line.startsWith('Environment="PATH=')), 'Environment="PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"')
   }
 })
 
@@ -141,6 +145,36 @@ test('statusSystemd reports failed systemctl and loginctl queries without a succ
   assert.equal(lingerFailure.ok, false)
   assert.deepEqual(lingerFailure.linger, { enabled: null, raw: null, error: 'linger failed' })
   assert.deepEqual(lingerFailure.next_steps, [])
+})
+
+test('statusSystemd normalizes only confirmed absent units as unloaded', async () => {
+  const context = await fixtureContext()
+  const absent = recordingRunner({
+    respond: (argv) => argv[0] === 'systemctl' && argv[2] === 'show'
+      ? argv[3] === 'fleet-daemon.service'
+        ? response('not-found\ndisabled\ninactive\n0\n', 4, `Unit ${argv[3]} could not be found.`)
+        : response('', 4, `Unit ${argv[3]} could not be found.`)
+      : undefined,
+  })
+
+  const absentStatus = await statusSystemd(context, absent.runner)
+
+  assert.equal(absentStatus.ok, true)
+  assert.deepEqual(absentStatus.services.map(({ loaded, enabled, running, pid }) => ({ loaded, enabled, running, pid })), [
+    { loaded: false, enabled: false, running: false, pid: null },
+    { loaded: false, enabled: false, running: false, pid: null },
+  ])
+
+  const unrelatedFailure = recordingRunner({
+    respond: (argv) => argv[0] === 'systemctl' && argv[2] === 'show'
+      ? response('', 4, 'Failed to connect to bus: Permission denied')
+      : undefined,
+  })
+
+  const failedStatus = await statusSystemd(context, unrelatedFailure.runner)
+
+  assert.equal(failedStatus.ok, false)
+  assert.equal(failedStatus.services.every((service) => service.loaded === null), true)
 })
 
 test('installSystemd writes both units, activates them, and only enables linger explicitly', async () => {

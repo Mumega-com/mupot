@@ -7,6 +7,50 @@ export const SERVICE_SPECS = Object.freeze([
   Object.freeze({ key: 'control', launchdLabel: 'com.mumega.mupot-fleet-control', systemdUnit: 'fleet-control-daemon.service', script: 'fleet-control-daemon.mjs', config: 'control.json' }),
 ])
 
+export const MINIMAL_SERVICE_PATH = '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+
+export const SECRET_VALUE_PATTERNS = Object.freeze([
+  ['bearer_token', /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/i],
+  ['mupot_token', /\bmupot_[A-Za-z0-9._-]{12,}\b/],
+  ['openai_api_key', /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/],
+  ['github_token', /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b/],
+  ['private_key', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
+  ['jwt', /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/],
+].map(Object.freeze))
+
+const CONFIGURED_PATH_FIELDS = Object.freeze([
+  'sourceDir',
+  'prefix',
+  'launchdDir',
+  'systemdDir',
+  'definitionDir',
+  'nodePath',
+  'runtimeDir',
+  'logsDir',
+  'stateDir',
+  'homeDir',
+])
+
+export function redactSecretValues(value) {
+  let text = String(value ?? '')
+  let secretFound = false
+  for (const [kind, pattern] of SECRET_VALUE_PATTERNS) {
+    if (pattern.test(text)) {
+      secretFound = true
+      text = text.replace(new RegExp(pattern.source, `${pattern.flags}g`), `[REDACTED:${kind}]`)
+    }
+  }
+  return { text, secretFound }
+}
+
+export function validateConfiguredPaths(input = {}) {
+  for (const field of CONFIGURED_PATH_FIELDS) {
+    if (input[field] !== undefined && redactSecretValues(input[field]).secretFound) {
+      throw new Error('configured path contains a prohibited secret-like value')
+    }
+  }
+}
+
 export function resolveServiceManager(requested = 'auto', platformName = platform()) {
   if (!['auto', 'systemd', 'launchd', 'none'].includes(requested)) throw new Error(`unsupported service manager: ${requested}`)
   if (requested !== 'auto') return requested
@@ -15,14 +59,20 @@ export function resolveServiceManager(requested = 'auto', platformName = platfor
   throw new Error(`unsupported platform for automatic service manager: ${platformName}`)
 }
 
-export function validateServiceOptions(input = {}) {
-  const explicit = input.serviceManagerExplicit === true
+export function validateServiceOptions(input = {}, resolvedServiceManager = null) {
+  validateConfiguredPaths(input)
+  const serviceManagerExplicit = input.serviceManagerExplicit ?? input.serviceManager !== undefined
+  const launchdDirExplicit = input.launchdDirExplicit ?? input.launchdDir !== undefined
+  const systemdDirExplicit = input.systemdDirExplicit ?? input.systemdDir !== undefined
+  const explicit = serviceManagerExplicit === true
   if (input.skipSystemd && explicit && input.serviceManager !== 'none') throw new Error('--skip-systemd conflicts with an explicit non-none --service-manager')
   const serviceManager = input.skipSystemd ? 'none' : (input.serviceManager ?? 'auto')
-  if (serviceManager !== 'systemd' && input.systemdDirExplicit) throw new Error('--systemd-dir requires systemd')
-  if (serviceManager !== 'launchd' && input.launchdDirExplicit) throw new Error('--launchd-dir requires launchd')
-  if (serviceManager !== 'systemd' && input.enableLinger) throw new Error('--enable-linger requires systemd')
-  return { ...input, serviceManager }
+  const managerForValidation = resolvedServiceManager ?? serviceManager
+  if (managerForValidation !== 'auto' && managerForValidation !== 'systemd' && systemdDirExplicit) throw new Error('--systemd-dir requires systemd')
+  if (managerForValidation !== 'auto' && managerForValidation !== 'launchd' && launchdDirExplicit) throw new Error('--launchd-dir requires launchd')
+  if (managerForValidation !== 'auto' && managerForValidation !== 'systemd' && input.enableLinger) throw new Error('--enable-linger requires systemd')
+  if (input.nodePath !== undefined && (typeof input.nodePath !== 'string' || !input.nodePath.startsWith('/'))) throw new Error('--node requires an absolute path')
+  return { ...input, serviceManager, serviceManagerExplicit, launchdDirExplicit, systemdDirExplicit }
 }
 
 function resolvePath(path, name, homeDir) {
@@ -54,6 +104,7 @@ function freezeService(service) {
 }
 
 export function createServiceContext(opts = {}) {
+  validateConfiguredPaths(opts)
   const platformName = opts.platformName ?? platform()
   const manager = resolveServiceManager(opts.manager ?? opts.serviceManager ?? 'auto', platformName)
   const resolvedHomeDir = resolvePath(opts.homeDir ?? homedir(), 'homeDir', homedir())

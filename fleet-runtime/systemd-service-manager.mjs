@@ -1,6 +1,6 @@
 import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
-import { definitionSha256 } from './service-context.mjs'
+import { MINIMAL_SERVICE_PATH, definitionSha256 } from './service-context.mjs'
 
 let temporaryFileNumber = 0
 
@@ -34,10 +34,13 @@ async function atomicWrite(path, content) {
 }
 
 function parseServiceState(response) {
+  const [loadState = '', unitFileState = '', activeState = '', mainPid = ''] = String(response.stdout).trimEnd().split(/\r?\n/)
+  const unitNotFound = loadState === 'not-found'
+    || (response.code === 4 && /\bUnit\s+.+\s+(?:could not be found|not found|does not exist)\.?$/i.test(String(response.stderr).trim()))
+  if (unitNotFound) return { loaded: false, enabled: false, running: false, pid: null }
   if (response.code !== 0) {
     return { loaded: null, enabled: null, running: null, pid: null, error: errorMessage(response, 'systemctl show') }
   }
-  const [loadState = '', unitFileState = '', activeState = '', mainPid = ''] = String(response.stdout).trimEnd().split(/\r?\n/)
   const loaded = loadState === 'loaded'
   const enabled = unitFileState === 'enabled'
   const pid = /^[1-9][0-9]*$/.test(mainPid) ? Number(mainPid) : null
@@ -76,6 +79,8 @@ export function renderSystemd(context) {
       'Type=simple',
       `WorkingDirectory=${systemdDirectiveArgument(context.runtimeDir)}`,
       `ExecStart=${service.argv.map(systemdExecArgument).join(' ')}`,
+      `Environment=${systemdDirectiveArgument(`HOME=${context.homeDir}`)}`,
+      `Environment=${systemdDirectiveArgument(`PATH=${MINIMAL_SERVICE_PATH}`)}`,
       'Restart=on-failure',
       'RestartSec=10',
       'NoNewPrivileges=true',
