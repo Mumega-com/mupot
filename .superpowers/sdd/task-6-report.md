@@ -167,3 +167,51 @@ None.
   - Pending final command after this append.
 
 Final result: exit 0 with no output after the complete report append.
+
+---
+
+## Final Independent Review Compatibility Fixes
+
+### Delivered
+
+- Captured heartbeat and control advancement flags at the observed deadline before the best-effort final reread. Final rereads still refresh emitted after-evidence, but timeout classification now remains bound to deadline evidence.
+- Accepted producer-valid heartbeat status `0` alongside `null` and HTTP statuses `100..599`, allowing network failures to fail `signed_heartbeat_2xx` as `heartbeat_not_2xx`.
+- Kept passing service receipts strict while accepting failed receipts from `buildFailedServiceReceipt` that include safe diagnostic check prefixes before the canonical `service_operation_failed` and `command_output_secret_free` tail. The full raw envelope remains recursively scanned; unrecognized diagnostics are not projected.
+- Added injected `auto` manager coverage for darwin/launchd and linux/systemd, including exact manager-specific definition options supplied to `buildServiceReceipt`.
+
+### TDD Evidence
+
+1. Added regressions for one-sided late final rereads, producer network heartbeat status `0`, exported failed-service diagnostic prefixes, malformed/secret diagnostic prefixes, and deterministic auto-manager resolution before changing runtime behavior.
+2. Red run: 131 tests total, 126 passed and 5 failed. The failures were the two mutable timeout classifications, status `0` malformed classification, and failed-service diagnostic envelope rejection; the auto-manager coverage passed against the existing injection path.
+3. Implemented immutable deadline flags, producer-compatible status validation, and canonical failed-service tail validation. A focused run exposed the existing ordinary failed status-envelope shape, so validation was narrowed to accept that strict canonical form alongside the exported exception envelope.
+4. Added explicit malformed and secret-bearing diagnostic-prefix guards. Final focused suite reached 134 passing tests.
+
+### Verification
+
+- `node --test fleet-runtime/continuous-runtime-receipt.test.mjs`
+  - Exit 0; 134 passed, 0 failed, 0 skipped; 120.905375 ms.
+- `npm run receipt:continuous-runtime -- --help`
+  - Exit 0; usage lists `--agent`, both state paths, `--service-manager`, `--definition-dir`, TTL, grace, polling, repeatable `--require-control`, and help.
+- `node --test fleet-runtime/*.test.mjs`
+  - Exit 0; 313 passed, 0 failed, 0 skipped; 745.911791 ms.
+- `npm test`
+  - Exit 0; 168 test files passed and 2,703 tests passed; 8.68 s. Node emitted the existing experimental SQLite warnings only.
+- `git diff --check`
+  - Exit 0 with no output before this report append; final post-append result recorded below.
+
+### Self-Review
+
+- Deadline classification uses explicit pre-reread advancement flags. Valid late evidence changes only projected after counters, never timeout versus one-stalled-counter reasoning. Throwing and malformed final rereads remain covered.
+- Heartbeat status `0` is schema-valid but cannot satisfy the 2xx assertion, matching the signed network-failure producer path.
+- Service validation recursively scans the full raw envelope, validates all diagnostic prefixes structurally and secret-free, validates the canonical tail, and projects only canonical checks. Passing status envelopes remain exactly two strict checks; ordinary failed status envelopes remain supported.
+- Auto-manager tests depend solely on injected `serviceDeps.platformName`; no host manager or platform detection is used.
+- Scope is limited to the two assigned runtime files and this append-only report.
+
+### Concerns
+
+- No live launchd or systemd service observation was performed. Coverage is deterministic and producer-shaped, including injected darwin and linux resolution.
+
+### Final Post-report Whitespace Verification
+
+- `git diff --check`
+  - Exit 0 with no output after this append.

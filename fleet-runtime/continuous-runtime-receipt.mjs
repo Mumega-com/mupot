@@ -46,7 +46,6 @@ const CONSUME_VALUES = new Set([
   'not_attempted_heartbeat_failed',
 ])
 const CONSUME_FAILURES = new Set(['inbox_peek_fail', 'inbox_handler_fail', 'inbox_consume_fail'])
-const SERVICE_CHECKS = new Set(['services_loaded_and_running', 'service_operation_failed', 'command_output_secret_free'])
 const SERVICE_NAMES = Object.freeze({
   launchd: Object.freeze({ heartbeat: 'com.mumega.mupot-fleet-daemon', control: 'com.mumega.mupot-fleet-control' }),
   systemd: Object.freeze({ heartbeat: 'fleet-daemon.service', control: 'fleet-control-daemon.service' }),
@@ -179,7 +178,7 @@ function isNonNegativeInteger(value) {
 }
 
 function nullableHttpStatus(value) {
-  return value === null || (Number.isInteger(value) && value >= 100 && value <= 599)
+  return value === null || value === 0 || (Number.isInteger(value) && value >= 100 && value <= 599)
 }
 
 function nullableBoolean(value) {
@@ -359,12 +358,20 @@ export async function observeAdvance(input, deps = {}) {
   let afterControl = beforeControl
   let completedMs = startedMs
   let timedOut = false
+  let heartbeatAdvancedBeforeDeadline = null
+  let controlAdvancedBeforeDeadline = null
+
+  const captureDeadlineAdvancement = () => {
+    heartbeatAdvancedBeforeDeadline = stateHasAdvance(beforeHeartbeat.tick, afterHeartbeat.tick)
+    controlAdvancedBeforeDeadline = stateHasAdvance(beforeControl.poll, afterControl.poll)
+  }
 
   for (let iteration = 0; iteration < maxIterations; iteration += 1) {
     const beforeReadMs = readNow()
     if (beforeReadMs >= deadlineMs) {
       completedMs = beforeReadMs
       timedOut = true
+      captureDeadlineAdvancement()
       break
     }
     afterHeartbeat = readState(readRuntimeState, opts.heartbeatStatePath, 'heartbeat')
@@ -372,6 +379,7 @@ export async function observeAdvance(input, deps = {}) {
     completedMs = readNow()
     if (completedMs >= deadlineMs) {
       timedOut = true
+      captureDeadlineAdvancement()
       break
     }
     if (stateHasAdvance(beforeHeartbeat.tick, afterHeartbeat.tick) && stateHasAdvance(beforeControl.poll, afterControl.poll)) break
@@ -398,6 +406,8 @@ export async function observeAdvance(input, deps = {}) {
     deadline_ms: deadlineMs,
     completed_ms: completedMs,
     timed_out: timedOut,
+    heartbeat_advanced_before_deadline: heartbeatAdvancedBeforeDeadline,
+    control_advanced_before_deadline: controlAdvancedBeforeDeadline,
     heartbeat: { before: beforeHeartbeat, after: afterHeartbeat },
     control: { before: beforeControl, after: afterControl },
   }
@@ -417,6 +427,27 @@ function hasExactKeys(value, expected) {
 function safeNonEmptyString(value) {
   const safe = safeString(value)
   return safe !== null && safe.length > 0 ? safe : null
+}
+
+function validDiagnosticCheck(entry) {
+  return isPlainObject(entry) &&
+    Object.hasOwn(entry, 'check') &&
+    Object.hasOwn(entry, 'ok') &&
+    safeNonEmptyString(entry.check) !== null &&
+    (typeof entry.ok === 'boolean' || entry.ok === null)
+}
+
+function serviceOperationFailureCheck(entry) {
+  return hasExactKeys(entry, ['ok', 'check', 'reason']) &&
+    entry.check === 'service_operation_failed' &&
+    entry.ok === false &&
+    safeNonEmptyString(entry.reason) !== null
+}
+
+function commandOutputSecretFreeCheck(entry) {
+  return hasExactKeys(entry, ['ok', 'check']) &&
+    entry.check === 'command_output_secret_free' &&
+    entry.ok === true
 }
 
 function normalizeServiceReceipt(receipt, expectedManager) {
@@ -464,19 +495,44 @@ function normalizeServiceReceipt(receipt, expectedManager) {
   if (!hasExactKeys(receipt.preserved_data, PRESERVED_DATA_KEYS) || PRESERVED_DATA_KEYS.some((key) => receipt.preserved_data[key] !== true)) serviceReceiptMalformed()
   if (!Array.isArray(receipt.next_steps) || receipt.next_steps.some((step) => safeNonEmptyString(step) === null)) serviceReceiptMalformed()
 
-  if (!Array.isArray(receipt.checks) || receipt.checks.length !== 2) serviceReceiptMalformed()
-  const checks = []
-  for (const entry of receipt.checks) {
-    const allowedKeys = entry?.check === 'service_operation_failed' ? ['ok', 'check', 'reason'] : ['ok', 'check']
-    if (!hasExactKeys(entry, allowedKeys) || !SERVICE_CHECKS.has(entry.check) || typeof entry.ok !== 'boolean') serviceReceiptMalformed()
-    if (entry.check === 'service_operation_failed' && (entry.ok !== false || safeNonEmptyString(entry.reason) === null)) serviceReceiptMalformed()
-    checks.push({ check: entry.check, ok: entry.ok })
+  if (!Array.isArray(receipt.checks)) serviceReceiptMalformed()
+  let checks
+  let operationalCheck
+  let secretCheck
+  if (receipt.status === 'pass') {
+    if (receipt.checks.length !== 2) serviceReceiptMalformed()
+    operationalCheck = receipt.checks[0]
+    secretCheck = receipt.checks[1]
+    if (!hasExactKeys(operationalCheck, ['ok', 'check']) || operationalCheck.check !== 'services_loaded_and_running' || operationalCheck.ok !== true) serviceReceiptMalformed()
+    if (!commandOutputSecretFreeCheck(secretCheck)) serviceReceiptMalformed()
+    checks = [
+      { check: 'services_loaded_and_running', ok: true },
+      { check: 'command_output_secret_free', ok: true },
+    ]
+  } else {
+    if (receipt.checks.length === 2) {
+      operationalCheck = receipt.checks[0]
+      secretCheck = receipt.checks[1]
+      if (hasExactKeys(operationalCheck, ['ok', 'check']) && operationalCheck.check === 'services_loaded_and_running' && operationalCheck.ok === false && commandOutputSecretFreeCheck(secretCheck)) {
+        checks = [
+          { check: 'services_loaded_and_running', ok: false },
+          { check: 'command_output_secret_free', ok: true },
+        ]
+      }
+    }
+    if (checks === undefined) {
+      if (receipt.checks.length < 2) serviceReceiptMalformed()
+      const diagnostics = receipt.checks.slice(0, -2)
+      const operationFailureCheck = receipt.checks.at(-2)
+      secretCheck = receipt.checks.at(-1)
+      if (!serviceOperationFailureCheck(operationFailureCheck) || !commandOutputSecretFreeCheck(secretCheck)) serviceReceiptMalformed()
+      if (diagnostics.some((entry) => !validDiagnosticCheck(entry) || ['service_operation_failed', 'command_output_secret_free'].includes(entry.check))) serviceReceiptMalformed()
+      checks = [
+        { check: 'service_operation_failed', ok: false },
+        { check: 'command_output_secret_free', ok: true },
+      ]
+    }
   }
-  if (new Set(checks.map((entry) => entry.check)).size !== checks.length) serviceReceiptMalformed()
-  const operationalCheck = checks.find((entry) => entry.check === 'services_loaded_and_running')
-  const operationFailureCheck = checks.find((entry) => entry.check === 'service_operation_failed')
-  const secretCheck = checks.find((entry) => entry.check === 'command_output_secret_free')
-  if (secretCheck === undefined || (operationalCheck === undefined) === (operationFailureCheck === undefined)) serviceReceiptMalformed()
 
   const services = SERVICE_KEYS.flatMap((key) => servicesByKey.has(key) ? [servicesByKey.get(key)] : [])
   if (receipt.status === 'pass') {
@@ -640,6 +696,8 @@ export async function buildContinuousRuntimeReceipt(input, deps = {}) {
     const agent = selectedAgent(heartbeatAfter, opts.agentId)
     const heartbeatAdvanced = stateHasAdvance(heartbeatBefore.tick, heartbeatAfter.tick)
     const controlAdvanced = stateHasAdvance(controlBefore.poll, controlAfter.poll)
+    const deadlineHeartbeatAdvanced = observation.timed_out ? observation.heartbeat_advanced_before_deadline : heartbeatAdvanced
+    const deadlineControlAdvanced = observation.timed_out ? observation.control_advanced_before_deadline : controlAdvanced
     const ageMs = observation.completed_ms - Date.parse(heartbeatAfter.last_tick_at)
     const heartbeatFresh = Number.isFinite(ageMs) && ageMs <= opts.ttlSec * 1_000
     const requiredControlOk = opts.requireControl.length === 0 || (
@@ -648,7 +706,7 @@ export async function buildContinuousRuntimeReceipt(input, deps = {}) {
       opts.requireControl.includes(controlAfter.last_outcome.verb)
     )
     const lingerDisabled = services.service_manager === 'systemd' && services.linger?.enabled === false
-    const deadlineFailure = timeoutReason(observation.timed_out, heartbeatAdvanced, controlAdvanced)
+    const deadlineFailure = timeoutReason(observation.timed_out, deadlineHeartbeatAdvanced, deadlineControlAdvanced)
     const checks = [
       check('linger_enabled', !lingerDisabled, 'linger_disabled'),
       check('observation_completed_before_deadline', !observation.timed_out, deadlineFailure),

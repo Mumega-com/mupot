@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { buildContinuousRuntimeReceipt, main, observeAdvance, parseArgs } from './continuous-runtime-receipt.mjs'
+import { buildFailedServiceReceipt } from './service-manager.mjs'
 
 const LINGER_NEXT_STEP = 'run loginctl enable-linger <username> with suitable host privileges, then rerun status'
 const startedAt = '2026-07-13T12:00:00.000Z'
@@ -467,6 +468,34 @@ test('post-timeout reread failures preserve the last valid timeout evidence', as
   }
 })
 
+test('post-timeout valid rereads update evidence without changing the deadline reason', async (t) => {
+  const cases = [
+    {
+      name: 'only heartbeat advances late',
+      heartbeatStates: [heartbeat(), heartbeat(), heartbeat(), heartbeat({ tick: 8 })],
+      controlStates: [control(), control(), control(), control()],
+      expected: { heartbeatTick: 8, controlPoll: 12 },
+    },
+    {
+      name: 'only control advances late',
+      heartbeatStates: [heartbeat(), heartbeat(), heartbeat(), heartbeat()],
+      controlStates: [control(), control(), control(), control({ poll: 13 })],
+      expected: { heartbeatTick: 7, controlPoll: 13 },
+    },
+  ]
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const { receipt } = await buildCase({ ...scenario, pollMs: 10_000 })
+      assert.equal(receipt.status, 'fail')
+      assert.equal(receipt.reason, 'timeout')
+      assert.equal(receipt.observation.timed_out, true)
+      assert.equal(receipt.observation.heartbeat.tick.after, scenario.expected.heartbeatTick)
+      assert.equal(receipt.observation.control.poll.after, scenario.expected.controlPoll)
+    })
+  }
+})
+
 test('non-timeout success still fails closed when its final evidence is malformed', async () => {
   const { receipt } = await buildCase({
     heartbeatStates: [heartbeat(), heartbeat({ tick: 8 }), { schema: 'wrong' }],
@@ -496,6 +525,18 @@ test('actual heartbeat producer consume failures fail while all non-failure valu
       assert.equal(receipt.checks.find((entry) => entry.check === 'inbox_consume_not_failed')?.ok, true)
     })
   }
+})
+
+test('producer network heartbeat status zero is valid failing evidence', async () => {
+  const { receipt } = await buildCase({
+    heartbeatStates: [heartbeat(), heartbeat({ tick: 8, agent: { heartbeat_status: 0 } })],
+    controlStates: [control(), control({ poll: 13 })],
+  })
+
+  assert.equal(receipt.status, 'fail')
+  assert.equal(receipt.reason, 'heartbeat_not_2xx')
+  assert.equal(receipt.agent.heartbeat_status, 0)
+  assert.equal(receipt.checks.find((entry) => entry.check === 'signed_heartbeat_2xx')?.ok, false)
 })
 
 test('systemd unknown linger evidence retains a valid failed service projection', async () => {
@@ -542,6 +583,123 @@ test('service validation accepts producer-shaped launchd and systemd pass and fa
       assert.equal(receipt.status, scenario.expected)
       if (scenario.expected === 'fail') assert.equal(receipt.reason, 'services_not_running')
       assert.notEqual(receipt.reason, 'service_receipt_malformed')
+    })
+  }
+})
+
+test('service validation accepts a safe diagnostic prefix from buildFailedServiceReceipt', async () => {
+  const service = buildFailedServiceReceipt({
+    platformName: 'darwin',
+    serviceManager: 'launchd',
+    action: 'status',
+    checks: [{ ok: false, check: 'adapter_evidence', reason: 'status adapter failed' }],
+    error: new Error('status failed'),
+  })
+  const { receipt } = await buildCase({
+    heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
+    controlStates: [control(), control({ poll: 13 })],
+    service,
+  })
+
+  assert.equal(receipt.status, 'fail')
+  assert.equal(receipt.reason, 'services_not_running')
+  assert.deepEqual(receipt.service.checks, [
+    { check: 'service_operation_failed', ok: false },
+    { check: 'command_output_secret_free', ok: true },
+  ])
+  assert.doesNotMatch(JSON.stringify(receipt), /adapter_evidence|status adapter failed/)
+})
+
+test('service diagnostic prefixes fail closed when malformed or secret-bearing', async (t) => {
+  const cases = [
+    {
+      name: 'malformed diagnostic',
+      checks: [{ ok: 'no', check: 'adapter_evidence' }],
+      error: new Error('status failed'),
+    },
+    {
+      name: 'secret-bearing diagnostic',
+      checks: [{ ok: false, check: 'adapter_evidence', reason: 'Bearer abcdefghijklmnop' }],
+      error: new Error('status failed'),
+    },
+  ]
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const service = buildFailedServiceReceipt({
+        platformName: 'darwin',
+        serviceManager: 'launchd',
+        action: 'status',
+        checks: scenario.checks,
+        error: scenario.error,
+      })
+      const { receipt } = await buildCase({
+        heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
+        controlStates: [control(), control({ poll: 13 })],
+        service,
+      })
+      assert.equal(receipt.status, 'fail')
+      assert.equal(receipt.reason, 'service_receipt_malformed')
+      assert.doesNotMatch(JSON.stringify(receipt), /abcdefghijklmnop/)
+    })
+  }
+})
+
+test('auto manager uses injected platform resolution and manager-specific definition options', async (t) => {
+  const cases = [
+    {
+      name: 'darwin launchd',
+      platformName: 'darwin',
+      service: serviceReceipt({ serviceManager: 'launchd' }),
+      definitionDir: '/Users/test/Library/LaunchAgents',
+      expectedOptions: {
+        action: 'status',
+        serviceManager: 'auto',
+        launchdDir: '/Users/test/Library/LaunchAgents',
+      },
+    },
+    {
+      name: 'linux systemd',
+      platformName: 'linux',
+      service: serviceReceipt({ serviceManager: 'systemd', linger: { enabled: true, raw: 'yes' } }),
+      definitionDir: '/home/test/.config/systemd/user',
+      expectedOptions: {
+        action: 'status',
+        serviceManager: 'auto',
+        systemdDir: '/home/test/.config/systemd/user',
+      },
+    },
+  ]
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const f = fixture({
+        heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
+        controlStates: [control(), control({ poll: 13 })],
+        service: scenario.service,
+      })
+      let receivedOptions = null
+      const receipt = await buildContinuousRuntimeReceipt({
+        agentId: 'hermes-manager',
+        heartbeatStatePath: '/heartbeat.json',
+        controlStatePath: '/control.json',
+        serviceManager: 'auto',
+        definitionDir: scenario.definitionDir,
+        ttlSec: 30,
+        graceSec: 2,
+        pollMs: 1_000,
+        requireControl: [],
+      }, {
+        ...f.deps,
+        buildServiceReceipt: async (options) => {
+          receivedOptions = options
+          return scenario.service
+        },
+        serviceDeps: { platformName: scenario.platformName },
+      })
+
+      assert.equal(receipt.status, 'pass')
+      assert.deepEqual(receivedOptions, scenario.expectedOptions)
     })
   }
 })
