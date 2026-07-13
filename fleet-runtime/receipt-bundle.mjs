@@ -27,13 +27,14 @@ import {
 import { createHash, randomBytes } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { buildReceipt as buildHostReceipt } from './host-receipt.mjs'
+import { buildReceipt as buildHostReceipt, normalizePassingHostReceipt } from './host-receipt.mjs'
 import { buildReceipt as buildRuntimeReceipt } from './runtime-receipt.mjs'
 import { buildReceipt as buildControlReceipt } from './control-receipt.mjs'
 import { buildReceipt as buildCutoverReceipt, controlRuns } from './cutover-receipt.mjs'
 import {
   STARTER_ARTIFACT_ROLES,
   STARTER_RECEIPT_TYPE,
+  isPortableStarterPath,
   normalizeStarterManifest,
   normalizeStarterReceipt,
 } from './starter-contract.mjs'
@@ -467,81 +468,162 @@ function normalizeContinuousReceipt(receipt, agents, service) {
   return { agent_id: receipt.agent.agent_id, heartbeat_delta: heartbeatDelta, control_delta: controlDelta }
 }
 
-const HOST_CHECK_KEYS = new Map([
-  ['fleet-daemon:config_valid', ['ok', 'component', 'check', 'path']],
-  ['fleet-daemon:base_url_real', ['ok', 'component', 'kind', 'check']],
-  ['fleet-daemon:tenant_real', ['ok', 'component', 'kind', 'check']],
-  ['fleet-daemon:heartbeat_cadence_under_ttl', ['ok', 'component', 'check', 'interval_sec']],
-  ['fleet-daemon:agent_private_key_present_0600', ['ok', 'component', 'check', 'agent_id', 'label', 'path', 'mode', 'size']],
-  ['fleet-daemon:probe_configured', ['ok', 'component', 'check', 'agent_id', 'probe']],
-  ['inbox-handler:config_valid', ['ok', 'component', 'check', 'path']],
-  ['inbox-handler:daemon_inbox_agent_has_handler_config', ['ok', 'component', 'check', 'agent_id']],
-  ['inbox-handler:spool_dir_configured', ['ok', 'component', 'check', 'agent_id', 'spool_dir', 'command_configured']],
-  ['fleet-control-daemon:config_valid', ['ok', 'component', 'check', 'path']],
-  ['fleet-control-daemon:base_url_real', ['ok', 'component', 'kind', 'check']],
-  ['fleet-control-daemon:tenant_real', ['ok', 'component', 'kind', 'check']],
-  ['fleet-control-daemon:consumer_private_key_present_0600', ['ok', 'component', 'check', 'agent_id', 'label', 'path', 'mode', 'size']],
-  ['fleet-control-daemon:panel_public_key_present', ['ok', 'component', 'check', 'label', 'path', 'mode', 'size']],
-  ['fleet-control-daemon:panel_public_key_public_only', ['ok', 'component', 'check', 'path']],
-  ['fleet-control-daemon:flights_config_present', ['ok', 'component', 'check', 'label', 'path', 'mode', 'size']],
-  ['fleet-control-daemon:flight_script_present', ['ok', 'component', 'check', 'label', 'path', 'mode', 'size']],
-  ['host-receipt:daemon_control_base_url_match', ['ok', 'component', 'check', 'daemon_base_url', 'control_base_url']],
-  ['host-receipt:daemon_control_tenant_match', ['ok', 'component', 'check', 'daemon_tenant', 'control_tenant']],
-  ['host-services:service_definitions_current', ['ok', 'component', 'check', 'service_manager', 'definition_dir', 'definitions']],
-  ['host-services:heartbeat_service_running', ['ok', 'component', 'check', 'service']],
-  ['host-services:control_service_running', ['ok', 'component', 'check', 'service']],
-  ['host-services:systemd_linger_enabled', ['ok', 'component', 'check', 'service_manager', 'applicable', 'linger']],
-  ['host-services:launchd_linger_not_applicable', ['ok', 'component', 'check', 'service_manager', 'applicable', 'linger']],
-])
-
 function normalizeHostReceipt(receipt, service, agents) {
-  if (!service || !hasExactKeys(receipt, ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'target', 'checks']) ||
-    receipt.receipt_type !== EXPECTED.host || receipt.status !== 'pass' || !validTimestamp(receipt.generated_at) ||
-    !hasExactKeys(receipt.summary, ['status', 'passed', 'failed', 'warnings']) || !Array.isArray(receipt.checks) || !sameSummary(receipt.summary, summarize(receipt.checks))) return null
-  if (!hasExactKeys(receipt.inputs, ['daemon_config', 'inbox_handler_config', 'control_config', 'exec_probes', 'service_manager', 'service_definition_dir']) ||
-    receipt.inputs.service_manager !== service.manager || typeof receipt.inputs.exec_probes !== 'boolean' ||
-    ['daemon_config', 'inbox_handler_config', 'control_config', 'service_definition_dir'].some((key) => typeof receipt.inputs[key] !== 'string' || receipt.inputs[key].length === 0)) return null
-  if (!hasExactKeys(receipt.target, ['base_url', 'tenant', 'daemon_agents', 'control_consumer_agent']) ||
-    typeof receipt.target.base_url !== 'string' || typeof receipt.target.tenant !== 'string' || typeof receipt.target.control_consumer_agent !== 'string' ||
-    !Array.isArray(receipt.target.daemon_agents) || new Set(receipt.target.daemon_agents).size !== receipt.target.daemon_agents.length || agents.some((agent) => !receipt.target.daemon_agents.includes(agent))) return null
-
-  const indexed = new Map()
-  for (const check of receipt.checks) {
-    const id = `${check?.component}:${check?.check}`
-    const keys = HOST_CHECK_KEYS.get(id)
-    if (!keys || !hasExactKeys(check, keys) || check.ok !== true || indexed.has(id)) return null
-    indexed.set(id, check)
-  }
-  for (const required of HOST_CHECK_KEYS.keys()) {
-    if (required === 'host-services:launchd_linger_not_applicable' || required === 'host-services:systemd_linger_enabled') continue
-    if (!indexed.has(required)) return null
-  }
-  const lingerId = service.manager === 'systemd' ? 'host-services:systemd_linger_enabled' : 'host-services:launchd_linger_not_applicable'
-  if (!indexed.has(lingerId)) return null
-
-  const definitionsCheck = indexed.get('host-services:service_definitions_current')
-  if (definitionsCheck.service_manager !== service.manager || definitionsCheck.definition_dir !== receipt.inputs.service_definition_dir ||
-    !Array.isArray(definitionsCheck.definitions) || definitionsCheck.definitions.length !== SERVICE_KEYS.length) return null
-  const hashes = {}
-  for (const definition of definitionsCheck.definitions) {
-    if (!hasExactKeys(definition, ['service', 'path', 'expected_sha256', 'rendered_sha256', 'actual_sha256', 'argv', 'expected_argv', 'ok']) ||
-      !SERVICE_KEYS.includes(definition.service) || hashes[definition.service] || definition.ok !== true ||
-      definition.expected_sha256 !== service.definitions[definition.service] || definition.rendered_sha256 !== definition.expected_sha256 || definition.actual_sha256 !== definition.expected_sha256 ||
-      !Array.isArray(definition.argv) || definition.argv.some((arg) => typeof arg !== 'string') || JSON.stringify(definition.argv) !== JSON.stringify(definition.expected_argv)) return null
-    hashes[definition.service] = definition.actual_sha256
-  }
-  for (const [key, checkName] of [['heartbeat', 'heartbeat_service_running'], ['control', 'control_service_running']]) {
-    const check = indexed.get(`host-services:${checkName}`)
-    if (JSON.stringify(check.service) !== JSON.stringify(service.services[key])) return null
-  }
-  const linger = indexed.get(lingerId)
-  if (linger.service_manager !== service.manager || JSON.stringify(linger.linger) !== JSON.stringify(service.linger)) return null
-  return { target: receipt.target, definition_hashes: hashes }
+  return normalizePassingHostReceipt(receipt, service, agents)
 }
 
 function exactSummaryEnvelope(receipt, keys) {
   return hasExactKeys(receipt, keys) && validTimestamp(receipt.generated_at) && hasExactKeys(receipt.summary, ['status', 'passed', 'failed', 'warnings']) &&
-    Array.isArray(receipt.checks) && sameSummary(receipt.summary, summarize(receipt.checks))
+    Array.isArray(receipt.checks) && receipt.status === receipt.summary.status && sameSummary(receipt.summary, summarize(receipt.checks))
+}
+
+function nonEmptyString(value) {
+  return typeof value === 'string' && value.length > 0
+}
+
+function exactStringArray(value, { nonEmpty = false, unique = false } = {}) {
+  return Array.isArray(value) && (!nonEmpty || value.length > 0) && value.every(nonEmptyString) && (!unique || new Set(value).size === value.length)
+}
+
+function exactArtifactMeta(value, expectedType = null, requirePass = true) {
+  return hasExactKeys(value, ['path', 'receipt_type', 'status', 'sha256']) && nonEmptyString(value.path) &&
+    nonEmptyString(value.receipt_type) && (!expectedType || value.receipt_type === expectedType) &&
+    (!requirePass || value.status === 'pass') && SHA256_RE.test(value.sha256 ?? '')
+}
+
+function serviceActivationSchemaExact(receipt, manager) {
+  const keys = ['receipt_type', 'generated_at', 'status', 'platform', 'service_manager', 'action', 'definitions', 'services', 'linger', 'commands', 'preserved_data', 'next_steps', 'checks']
+  if (!hasExactKeys(receipt, keys) || receipt.receipt_type !== EXPECTED.service || receipt.status !== 'pass' || receipt.action !== 'install' ||
+    !validTimestamp(receipt.generated_at) || receipt.service_manager !== manager || receipt.platform !== (manager === 'launchd' ? 'darwin' : 'linux') ||
+    !Array.isArray(receipt.definitions) || receipt.definitions.length !== 2 || !Array.isArray(receipt.services) || receipt.services.length !== 2 ||
+    !Array.isArray(receipt.commands) || !exactStringArray(receipt.next_steps) || !Array.isArray(receipt.checks)) return false
+  const definitionServices = new Set()
+  for (const definition of receipt.definitions) {
+    if (!hasExactKeys(definition, ['service', 'path', 'sha256']) || !SERVICE_KEYS.includes(definition.service) || definitionServices.has(definition.service) ||
+      !nonEmptyString(definition.path) || !SHA256_RE.test(definition.sha256 ?? '')) return false
+    definitionServices.add(definition.service)
+  }
+  if (!SERVICE_KEYS.every((key) => receipt.services.some((service) => validServiceState(service, manager, key)))) return false
+  if (receipt.commands.some((command) => !hasExactKeys(command, ['executable', 'argv', 'code', 'stdout_summary', 'stderr_summary']) ||
+    !nonEmptyString(command.executable) || !exactStringArray(command.argv) || !Number.isInteger(command.code) ||
+    typeof command.stdout_summary !== 'string' || typeof command.stderr_summary !== 'string')) return false
+  if (!hasExactKeys(receipt.preserved_data, ['configs', 'private_keys', 'runtime', 'inbox', 'receipts']) ||
+    Object.values(receipt.preserved_data).some((value) => value !== true)) return false
+  if (manager === 'systemd') {
+    if (!hasExactKeys(receipt.linger, ['enabled', 'raw']) || receipt.linger.enabled !== true || receipt.linger.raw !== 'yes') return false
+  } else if (receipt.linger !== null) return false
+  return receipt.checks.length === 2 && receipt.checks.every((check, index) =>
+    hasExactKeys(check, ['ok', 'check']) && check.ok === true && check.check === ['services_loaded_and_running', 'command_output_secret_free'][index])
+}
+
+function installCheckSchemaExact(check, manager) {
+  if (!isPlainObject(check) || check.ok !== true || check.component !== 'fleet-install' || typeof check.check !== 'string') return false
+  if (check.check === 'source_dir_present') return hasExactKeys(check, ['ok', 'component', 'check', 'path']) && nonEmptyString(check.path)
+  if (check.check.endsWith('_dir_ready')) {
+    const labels = new Set(['fleet_home', 'runtime', 'agents', 'handlers', 'inbox', 'logs', 'state', 'receipts', `${manager}_definition`])
+    return labels.has(check.check.slice(0, -'_dir_ready'.length)) && hasExactKeys(check, ['ok', 'component', 'check', 'path', 'mode', 'existed', 'dry_run']) &&
+      nonEmptyString(check.path) && check.mode === '700' && typeof check.existed === 'boolean' && check.dry_run === false
+  }
+  if (check.check === 'runtime_files_discovered') return hasExactKeys(check, ['ok', 'component', 'check', 'count']) && Number.isInteger(check.count) && check.count > 0
+  if (check.check === 'runtime_file_copied') return hasExactKeys(check, ['ok', 'component', 'check', 'source', 'path', 'mode', 'dry_run']) &&
+    nonEmptyString(check.source) && nonEmptyString(check.path) && check.mode === '644' && check.dry_run === false
+  if (check.check === 'config_preserved') return hasExactKeys(check, ['ok', 'component', 'check', 'source', 'path']) && nonEmptyString(check.source) && nonEmptyString(check.path)
+  if (check.check === 'service_definition_rendered') return hasExactKeys(check, ['ok', 'component', 'check', 'service', 'path', 'sha256', 'mode', 'dry_run']) &&
+    SERVICE_KEYS.includes(check.service) && nonEmptyString(check.path) && SHA256_RE.test(check.sha256 ?? '') && check.mode === '644' && check.dry_run === false
+  if (check.check === 'service_activation') return hasExactKeys(check, ['ok', 'component', 'check', 'service_receipt']) && check.service_receipt === EXPECTED.service
+  return false
+}
+
+function normalizePassingInstallReceipt(receipt) {
+  const topKeys = ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'outputs', 'activation', 'next_steps', 'checks']
+  if (!exactSummaryEnvelope(receipt, topKeys) || receipt.receipt_type !== EXPECTED.install || receipt.status !== 'pass' ||
+    !hasExactKeys(receipt.inputs, ['source_dir', 'prefix', 'systemd_dir', 'skip_systemd', 'force_config', 'dry_run', 'node_path', 'service_manager', 'service_definition_dir', 'activation_requested', 'activation_performed', 'enable_linger']) ||
+    !hasExactKeys(receipt.outputs, ['runtime_dir', 'agents_dir', 'handlers_dir', 'inbox_dir', 'logs_dir', 'state_dir', 'receipts_dir', 'runtime_files', 'service_definitions']) ||
+    !exactStringArray(receipt.next_steps, { nonEmpty: true }) || receipt.inputs.dry_run !== false) return null
+  const manager = receipt.inputs.service_manager?.resolved
+  if (!hasExactKeys(receipt.inputs.service_manager, ['requested', 'resolved']) || !['systemd', 'launchd'].includes(manager) ||
+    !['auto', manager].includes(receipt.inputs.service_manager.requested) || typeof receipt.inputs.skip_systemd !== 'boolean' ||
+    typeof receipt.inputs.force_config !== 'boolean' || typeof receipt.inputs.activation_requested !== 'boolean' ||
+    typeof receipt.inputs.activation_performed !== 'boolean' || typeof receipt.inputs.enable_linger !== 'boolean' ||
+    !['source_dir', 'prefix', 'node_path', 'service_definition_dir'].every((key) => nonEmptyString(receipt.inputs[key])) ||
+    (manager === 'systemd' ? !nonEmptyString(receipt.inputs.systemd_dir) : receipt.inputs.systemd_dir !== null)) return null
+  const outputPaths = ['runtime_dir', 'agents_dir', 'handlers_dir', 'inbox_dir', 'logs_dir', 'state_dir', 'receipts_dir']
+  if (!outputPaths.every((key) => nonEmptyString(receipt.outputs[key])) || !exactStringArray(receipt.outputs.runtime_files, { nonEmpty: true, unique: true }) ||
+    !Array.isArray(receipt.outputs.service_definitions) || receipt.outputs.service_definitions.length !== 2) return null
+  const definitions = new Map()
+  for (const definition of receipt.outputs.service_definitions) {
+    if (!hasExactKeys(definition, ['service', 'path', 'sha256']) || !SERVICE_KEYS.includes(definition.service) || definitions.has(definition.service) ||
+      !nonEmptyString(definition.path) || !SHA256_RE.test(definition.sha256 ?? '')) return null
+    definitions.set(definition.service, definition)
+  }
+  if (receipt.checks.some((check) => !installCheckSchemaExact(check, manager))) return null
+  const requiredDirs = ['fleet_home', 'runtime', 'agents', 'handlers', 'inbox', 'logs', 'state', 'receipts', `${manager}_definition`]
+  if (!requiredDirs.every((label) => receipt.checks.filter((check) => check.check === `${label}_dir_ready`).length === 1) ||
+    receipt.checks.filter((check) => check.check === 'source_dir_present').length !== 1 ||
+    receipt.checks.filter((check) => check.check === 'runtime_files_discovered').length !== 1 ||
+    receipt.checks.filter((check) => check.check === 'runtime_file_copied').length !== receipt.outputs.runtime_files.length ||
+    receipt.checks.filter((check) => check.check === 'config_preserved').length !== 4) return null
+  for (const [service, definition] of definitions) {
+    const rendered = receipt.checks.filter((check) => check.check === 'service_definition_rendered' && check.service === service)
+    if (rendered.length !== 1 || rendered[0].path !== definition.path || rendered[0].sha256 !== definition.sha256) return null
+  }
+  if (receipt.inputs.activation_performed !== (receipt.activation !== null) || receipt.inputs.activation_performed !== receipt.inputs.activation_requested) return null
+  if (receipt.activation !== null && !serviceActivationSchemaExact(receipt.activation, manager)) return null
+  return { manager, definitions }
+}
+
+function probeResponseSchemaExact(value) {
+  if (!isPlainObject(value) || value.ok !== true) return false
+  const visit = (entry) => {
+    if (entry === null || ['string', 'boolean'].includes(typeof entry) || (typeof entry === 'number' && Number.isFinite(entry))) return true
+    if (Array.isArray(entry)) return entry.every(visit)
+    return isPlainObject(entry) && Object.values(entry).every(visit)
+  }
+  return visit(value)
+}
+
+function normalizePassingProbeReceipt(receipt) {
+  const topKeys = ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'actions', 'checks']
+  if (!exactSummaryEnvelope(receipt, topKeys) || receipt.receipt_type !== EXPECTED.probe || receipt.status !== 'pass' ||
+    !hasExactKeys(receipt.inputs, ['base_url', 'agent', 'queue_inbox', 'control_verbs', 'inbox_kind', 'agent_token_env', 'owner_token_env']) ||
+    !nonEmptyString(receipt.inputs.base_url) || !nonEmptyString(receipt.inputs.agent) || typeof receipt.inputs.queue_inbox !== 'boolean' ||
+    !exactStringArray(receipt.inputs.control_verbs, { unique: true }) || receipt.inputs.control_verbs.some((verb) => !CONTROL_VERBS.has(verb)) ||
+    !nonEmptyString(receipt.inputs.inbox_kind) || !nonEmptyString(receipt.inputs.agent_token_env) || !nonEmptyString(receipt.inputs.owner_token_env) ||
+    (!receipt.inputs.queue_inbox && receipt.inputs.control_verbs.length === 0) || !Array.isArray(receipt.actions)) return null
+  const expectedChecks = [
+    ['base_url_valid', ['ok', 'component', 'check']],
+    ['target_agent_present', ['ok', 'component', 'check', 'agent']],
+    ['probe_action_selected', ['ok', 'component', 'check']],
+    ...(receipt.inputs.queue_inbox ? [
+      ['agent_token_present', ['ok', 'component', 'check', 'env']],
+      ['inbox_probe_queued', ['ok', 'component', 'check', 'status', 'response_ok']],
+    ] : []),
+    ...(receipt.inputs.control_verbs.length > 0 ? [['owner_token_present', ['ok', 'component', 'check', 'env']]] : []),
+    ...receipt.inputs.control_verbs.map(() => ['control_request_queued', ['ok', 'component', 'check', 'agent_id', 'verb', 'status', 'response_ok']]),
+  ]
+  if (receipt.checks.length !== expectedChecks.length) return null
+  for (let index = 0; index < expectedChecks.length; index += 1) {
+    const check = receipt.checks[index]
+    const [name, keys] = expectedChecks[index]
+    if (!hasExactKeys(check, keys) || check.ok !== true || check.component !== 'cutover-probe' || check.check !== name) return null
+    if (Object.hasOwn(check, 'status') && (!Number.isInteger(check.status) || check.status < 200 || check.status >= 300 || check.response_ok !== true)) return null
+  }
+  if (receipt.checks[1].agent !== receipt.inputs.agent) return null
+  const actions = []
+  if (receipt.inputs.queue_inbox) actions.push({ kind: 'inbox_probe' })
+  for (const verb of receipt.inputs.control_verbs) actions.push({ kind: 'control_request', verb })
+  if (receipt.actions.length !== actions.length) return null
+  for (let index = 0; index < actions.length; index += 1) {
+    const expected = actions[index]
+    const action = receipt.actions[index]
+    const keys = expected.kind === 'inbox_probe'
+      ? ['kind', 'target_agent', 'request_id', 'status', 'ok', 'response']
+      : ['kind', 'target_agent', 'verb', 'status', 'ok', 'nonce', 'response']
+    if (!hasExactKeys(action, keys) || action.kind !== expected.kind || action.target_agent !== receipt.inputs.agent || action.ok !== true ||
+      !Number.isInteger(action.status) || action.status < 200 || action.status >= 300 || !probeResponseSchemaExact(action.response)) return null
+    if (expected.kind === 'inbox_probe' ? !nonEmptyString(action.request_id) : action.verb !== expected.verb || !nonEmptyString(action.nonce)) return null
+  }
+  return receipt
 }
 
 const RUNTIME_CHECK_KEYS = new Map([
@@ -561,7 +643,7 @@ const RUNTIME_CHECK_KEYS = new Map([
 
 function runtimeCheckSchemaExact(check) {
   const variants = RUNTIME_CHECK_KEYS.get(`${check?.component}:${check?.check}`)
-  return Boolean(variants?.some((keys) => hasExactKeys(check, keys)))
+  return Boolean(variants?.some((keys) => hasExactKeys(check, keys))) && check.ok === true && !Object.hasOwn(check, 'reason')
 }
 
 function normalizeRuntimeInboxReceipt(receipt, agentId, hostTarget) {
@@ -569,11 +651,28 @@ function normalizeRuntimeInboxReceipt(receipt, agentId, hostTarget) {
     receipt.receipt_type !== EXPECTED.runtime || receipt.status !== 'pass' ||
     !hasExactKeys(receipt.inputs, ['daemon_config', 'selected_agents']) || JSON.stringify(receipt.inputs.selected_agents) !== JSON.stringify([agentId]) ||
     !hasExactKeys(receipt.target, ['base_url', 'tenant', 'agents']) || receipt.target.base_url !== hostTarget.base_url || receipt.target.tenant !== hostTarget.tenant || JSON.stringify(receipt.target.agents) !== JSON.stringify([agentId]) ||
-    receipt.checks.some((check) => !runtimeCheckSchemaExact(check)) || !Array.isArray(receipt.agents) || receipt.agents.length !== 1) return null
+    receipt.checks.some((check) => !runtimeCheckSchemaExact(check)) || receipt.checks.length !== 6 || !Array.isArray(receipt.agents) || receipt.agents.length !== 1) return null
+  const expectedChecks = [
+    ['runtime-receipt', 'daemon_config_valid'],
+    ['runtime-receipt', 'agent_configured'],
+    ['runtime-receipt', 'agent_private_key_loaded'],
+    ['fleet-daemon', 'probe_alive'],
+    ['fleet-daemon', 'signed_attach_ok'],
+    ['fleet-daemon', 'signed_inbox_handoff_consumed'],
+  ]
+  if (receipt.checks.some((check, index) => check.component !== expectedChecks[index][0] || check.check !== expectedChecks[index][1] ||
+    (Object.hasOwn(check, 'agent_id') && check.agent_id !== agentId))) return null
+  if (!nonEmptyString(receipt.inputs.daemon_config) || receipt.checks[0].path !== receipt.inputs.daemon_config ||
+    !Number.isInteger(receipt.checks[4].status) || receipt.checks[4].status < 200 || receipt.checks[4].status >= 300 ||
+    receipt.checks[5].action !== 'inbox_consumed' || !Number.isInteger(receipt.checks[5].status) || receipt.checks[5].status < 200 || receipt.checks[5].status >= 300 ||
+    !Number.isInteger(receipt.checks[5].messages) || receipt.checks[5].messages <= 0) return null
   const result = receipt.agents[0]
   if (!hasExactKeys(result, ['agent', 'probe', 'heartbeat', 'inbox']) || result.agent !== agentId || result.probe !== 'alive' ||
-    !hasExactKeys(result.heartbeat, ['ok', 'status']) || result.heartbeat.ok !== true || result.heartbeat.status < 200 || result.heartbeat.status >= 300 ||
-    !hasExactKeys(result.inbox, ['agent', 'ok', 'action', 'status', 'messages', 'remaining', 'consumed']) || result.inbox.agent !== agentId || result.inbox.ok !== true || result.inbox.consumed !== true) return null
+    !hasExactKeys(result.heartbeat, ['ok', 'status']) || result.heartbeat.ok !== true || !Number.isInteger(result.heartbeat.status) || result.heartbeat.status < 200 || result.heartbeat.status >= 300 ||
+    !hasExactKeys(result.inbox, ['agent', 'ok', 'action', 'status', 'messages', 'remaining', 'consumed']) || result.inbox.agent !== agentId || result.inbox.ok !== true || result.inbox.consumed !== true ||
+    result.inbox.action !== 'inbox_consumed' || !Number.isInteger(result.inbox.status) || result.inbox.status < 200 || result.inbox.status >= 300 ||
+    !Number.isInteger(result.inbox.messages) || result.inbox.messages <= 0 || !Number.isInteger(result.inbox.remaining) || result.inbox.remaining < 0 ||
+    result.heartbeat.status !== receipt.checks[4].status || result.inbox.status !== receipt.checks[5].status || result.inbox.messages !== receipt.checks[5].messages) return null
   return receipt
 }
 
@@ -593,15 +692,106 @@ function legacyRuntimeInboxReceiptSchemaExact(receipt, agentId, hostTarget) {
 function normalizeLifecycleReceipt(receipt, agentId, verb, hostTarget) {
   if (!exactSummaryEnvelope(receipt, ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'target', 'checks', 'poll']) ||
     receipt.receipt_type !== EXPECTED.control || receipt.status !== 'pass' || !hasExactKeys(receipt.inputs, ['control_config', 'consumer_agent']) ||
+    !nonEmptyString(receipt.inputs.control_config) || !nonEmptyString(receipt.inputs.consumer_agent) ||
     !hasExactKeys(receipt.target, ['base_url', 'tenant', 'consumer_agent', 'executed_agents']) || receipt.target.base_url !== hostTarget.base_url || receipt.target.tenant !== hostTarget.tenant ||
     receipt.target.consumer_agent !== receipt.inputs.consumer_agent || receipt.target.consumer_agent !== hostTarget.control_consumer_agent || JSON.stringify(receipt.target.executed_agents) !== JSON.stringify([agentId]) ||
     !hasExactKeys(receipt.poll, ['ok', 'action', 'request']) || receipt.poll.ok !== true || !hasExactKeys(receipt.poll.request, ['agent_id', 'verb']) ||
     receipt.poll.request.agent_id !== agentId || receipt.poll.request.verb !== verb) return null
-  const expectedAction = verb === 'start' ? 'open' : 'close'
+  const expectedAction = verb === 'start' ? 'open' : verb === 'stop' ? 'close' : 'restart_open'
   if (receipt.poll.action !== expectedAction) return null
-  const execution = receipt.checks.filter((check) => check?.component === 'fleet-control-daemon' && check?.check === 'control_request_executed')
-  if (execution.length !== 1 || execution[0].ok !== true || execution[0].agent_id !== agentId || execution[0].verb !== verb || execution[0].action !== expectedAction) return null
+  const expectedChecks = [
+    ['control-receipt', 'control_config_valid', ['ok', 'component', 'check', 'path']],
+    ['control-receipt', 'consumer_private_key_loaded', ['ok', 'component', 'check', 'agent_id']],
+    ['control-receipt', 'panel_public_key_loaded', ['ok', 'component', 'check', 'path']],
+    ['fleet-control-daemon', 'control_request_executed', ['ok', 'component', 'check', 'agent_id', 'verb', 'action', 'status', 'retry']],
+  ]
+  if (receipt.checks.length !== expectedChecks.length || receipt.checks.some((check, index) => {
+    const [component, name, keys] = expectedChecks[index]
+    return !hasExactKeys(check, keys) || check.ok !== true || check.component !== component || check.check !== name
+  })) return null
+  if (receipt.checks[0].path !== receipt.inputs.control_config || receipt.checks[1].agent_id !== receipt.inputs.consumer_agent || !nonEmptyString(receipt.checks[2].path)) return null
+  const execution = receipt.checks[3]
+  if (execution.agent_id !== agentId || execution.verb !== verb || execution.action !== expectedAction ||
+    (execution.status !== null && !Number.isInteger(execution.status)) || (execution.retry !== null && typeof execution.retry !== 'boolean')) return null
   return receipt
+}
+
+function normalizePassingCutoverReceipt(receipt) {
+  const topKeys = ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'checks']
+  if (!exactSummaryEnvelope(receipt, topKeys) || receipt.receipt_type !== EXPECTED.cutover_gate || receipt.status !== 'pass' ||
+    !hasExactKeys(receipt.inputs, ['agents', 'host_receipt', 'runtime_receipts', 'control_receipts', 'required_control_verbs']) ||
+    !exactStringArray(receipt.inputs.agents, { nonEmpty: true, unique: true }) || !nonEmptyString(receipt.inputs.host_receipt) ||
+    !exactStringArray(receipt.inputs.runtime_receipts, { nonEmpty: true, unique: true }) ||
+    !exactStringArray(receipt.inputs.control_receipts, { nonEmpty: true, unique: true }) ||
+    !exactStringArray(receipt.inputs.required_control_verbs, { nonEmpty: true, unique: true }) ||
+    receipt.inputs.required_control_verbs.some((verb) => !CONTROL_VERBS.has(verb))) return null
+  let index = 0
+  const take = (keys, name) => {
+    const check = receipt.checks[index++]
+    return hasExactKeys(check, keys) && check.ok === true && check.component === 'cutover-receipt' && check.check === name ? check : null
+  }
+  const receiptEvidence = (label, path, type) => {
+    const read = take(['ok', 'component', 'check', 'path'], `${label}_receipt_read`)
+    const typed = take(['ok', 'component', 'check', 'path', 'expected', 'actual'], `${label}_receipt_type`)
+    const passed = take(['ok', 'component', 'check', 'path', 'actual'], `${label}_receipt_status_pass`)
+    return Boolean(read && typed && passed && read.path === path && typed.path === path && passed.path === path &&
+      typed.expected === type && typed.actual === type && passed.actual === 'pass')
+  }
+  if (!receiptEvidence('host', receipt.inputs.host_receipt, EXPECTED.host)) return null
+  for (const path of receipt.inputs.runtime_receipts) if (!receiptEvidence('runtime', path, EXPECTED.runtime)) return null
+  for (const path of receipt.inputs.control_receipts) if (!receiptEvidence('control', path, EXPECTED.control)) return null
+  for (const agentId of receipt.inputs.agents) {
+    const runtime = take(['ok', 'component', 'check', 'agent_id', 'path'], 'runtime_receipt_for_agent')
+    const attach = take(['ok', 'component', 'check', 'agent_id', 'path'], 'runtime_signed_attach_for_agent')
+    const inbox = take(['ok', 'component', 'check', 'agent_id', 'path'], 'runtime_inbox_handoff_for_agent')
+    if (!runtime || !attach || !inbox || runtime.agent_id !== agentId || attach.agent_id !== agentId || inbox.agent_id !== agentId ||
+      !receipt.inputs.runtime_receipts.includes(runtime.path) || attach.path !== runtime.path || inbox.path !== runtime.path) return null
+    for (const requiredVerb of receipt.inputs.required_control_verbs) {
+      const control = take(['ok', 'component', 'check', 'agent_id', 'required_verb', 'matched_verb', 'matched_action'], 'control_verb_for_agent')
+      const matched = requiredVerb === 'start'
+        ? ['start', 'restart'].includes(control?.matched_verb)
+        : requiredVerb === 'stop'
+          ? ['stop', 'restart'].includes(control?.matched_verb)
+          : control?.matched_verb === requiredVerb
+      const action = control?.matched_verb === 'start' ? 'open' : control?.matched_verb === 'stop' ? 'close' : 'restart_open'
+      if (!control || control.agent_id !== agentId || control.required_verb !== requiredVerb || !matched || control.matched_action !== action) return null
+    }
+  }
+  return index === receipt.checks.length ? receipt : null
+}
+
+function priorBundleManifestPasses(prior, starter, agentId, admittedDigests = null) {
+  const topKeys = ['receipt_type', 'generated_at', 'status', 'summary', 'integrity', 'inputs', 'artifacts', 'next_steps', 'checks']
+  if (!exactSummaryEnvelope(prior, topKeys) || !manifestSchemaExact(prior) || prior.receipt_type !== 'mupot-fleet-receipt-bundle/v1' || prior.status !== 'pass' ||
+    prior.integrity.algorithm !== 'sha256' || !exactStringArray(prior.next_steps, { nonEmpty: true }) ||
+    !exactStringArray(prior.inputs.agents, { nonEmpty: true, unique: true }) || !prior.inputs.agents.includes(agentId)) return false
+  const artifacts = prior.artifacts
+  if (!exactArtifactMeta(artifacts.install, EXPECTED.install) || !exactArtifactMeta(artifacts.host, EXPECTED.host) ||
+    !exactArtifactMeta(artifacts.cutover_gate, EXPECTED.cutover_gate) || !Array.isArray(artifacts.probes) || artifacts.probes.length === 0 ||
+    artifacts.probes.some((meta) => !exactArtifactMeta(meta, EXPECTED.probe)) || !Array.isArray(artifacts.runtimes) || artifacts.runtimes.length === 0 ||
+    artifacts.runtimes.some((meta) => !exactArtifactMeta(meta, EXPECTED.runtime)) || !Array.isArray(artifacts.controls) || artifacts.controls.length < 2 ||
+    artifacts.controls.some((meta) => !exactArtifactMeta(meta, EXPECTED.control))) return false
+  const starterDigests = admittedDigests ?? new Map(starter.artifacts.map((artifact) => [artifact.role, artifact.sha256]))
+  if (artifacts.install.sha256 !== starterDigests.get('install') || artifacts.host.sha256 !== starterDigests.get('host') ||
+    !artifacts.runtimes.some((meta) => meta.sha256 === starterDigests.get('runtime_inbox')) ||
+    !artifacts.controls.some((meta) => meta.sha256 === starterDigests.get('lifecycle_control_start')) ||
+    !artifacts.controls.some((meta) => meta.sha256 === starterDigests.get('lifecycle_control_stop'))) return false
+  const requiredChecks = new Map([
+    ['selected_agents_present', (check) => hasExactKeys(check, ['ok', 'component', 'check', 'agents']) && exactStringArray(check.agents, { nonEmpty: true }) && check.agents.includes(agentId)],
+    ['install_receipt_status_non_fail', (check) => hasExactKeys(check, ['ok', 'component', 'check', 'path', 'accepted', 'actual']) && check.actual === 'pass'],
+    ['probe_receipt_present', (check) => hasExactKeys(check, ['ok', 'component', 'check', 'count']) && check.count > 0],
+    ['host_candidate_selected', (check) => hasExactKeys(check, ['ok', 'component', 'check', 'path'])],
+    ['runtime_candidate_selected', (check) => hasExactKeys(check, ['ok', 'component', 'check', 'path'])],
+    ['control_candidate_selected', (check) => hasExactKeys(check, ['ok', 'component', 'check', 'path'])],
+    ['cutover_gate_status_pass', (check) => hasExactKeys(check, ['ok', 'component', 'check', 'path', 'actual']) && check.actual === 'pass'],
+    ['manifest_written', (check) => hasExactKeys(check, ['ok', 'component', 'check', 'path'])],
+  ])
+  for (const check of prior.checks) {
+    const validate = requiredChecks.get(check?.check)
+    if (!validate || check.ok !== true || check.component !== 'receipt-bundle' || !validate(check)) return false
+  }
+  return [...requiredChecks.keys()].every((name) => prior.checks.some((check) => check.check === name)) &&
+    prior.checks.filter((check) => check.check === 'control_candidate_selected').length >= 2
 }
 
 function roleReceiptPath(starterPath, reference) {
@@ -629,15 +819,18 @@ function normalizeStarterEvidence({ serviceReceipt, continuousReceipt, starterRe
     starterManifest.control_consumer_agent_id !== host.target.control_consumer_agent) return null
 
   const roleReceipts = {}
+  const admittedDigests = new Map()
   for (const artifact of starter.artifacts) {
     const path = roleReceiptPath(starterPath, artifact.path)
     if (!path || fileSha256(path, dirname(starterPath)) !== artifact.sha256) return null
     if (artifact.role === 'receipt_bundle_manifest' && (basename(path) === 'manifest.json' || (outerManifestPath && resolve(path) === resolve(outerManifestPath)))) return null
-    const receipt = projectionContent(readReceipt(path, dirname(starterPath)))
+    const raw = readReceipt(path, dirname(starterPath))
+    const receipt = projectionContent(raw)
     if (!receipt) return null
+    admittedDigests.set(artifact.role, projectionSchemaExact(raw) ? raw.source_sha256 : artifact.sha256)
     roleReceipts[artifact.role] = receipt
   }
-  if (roleReceipts.install?.receipt_type !== EXPECTED.install || !['pass', 'warn'].includes(roleReceipts.install.status) ||
+  if (!normalizePassingInstallReceipt(roleReceipts.install) ||
     roleReceipts.service?.receipt_type !== EXPECTED.service || JSON.stringify(roleReceipts.service) !== JSON.stringify(serviceReceipt) ||
     roleReceipts.host?.receipt_type !== EXPECTED.host || JSON.stringify(roleReceipts.host) !== JSON.stringify(hostReceipt) ||
     roleReceipts.continuous?.receipt_type !== EXPECTED.continuous || JSON.stringify(roleReceipts.continuous) !== JSON.stringify(continuousReceipt)) return null
@@ -645,8 +838,7 @@ function normalizeStarterEvidence({ serviceReceipt, continuousReceipt, starterRe
     !normalizeLifecycleReceipt(roleReceipts.lifecycle_control_start, continuous.agent_id, 'start', host.target) ||
     !normalizeLifecycleReceipt(roleReceipts.lifecycle_control_stop, continuous.agent_id, 'stop', host.target)) return null
   const prior = roleReceipts.receipt_bundle_manifest
-  if (!manifestSchemaExact(prior) || prior.receipt_type !== 'mupot-fleet-receipt-bundle/v1' || prior.status !== 'pass' ||
-    !sameSummary(prior.summary, summarize(prior.checks))) return null
+  if (!priorBundleManifestPasses(prior, starter, continuous.agent_id, admittedDigests)) return null
   return { service_manager: service.manager, platform: service.platform, definition_hashes: service.definitions, observed_deltas: { heartbeat_tick: continuous.heartbeat_delta, control_poll: continuous.control_delta }, starter_manifest_sha256: starter.manifest.sha256, agent_id: continuous.agent_id, tenant: hostReceipt.target?.tenant ?? null }
 }
 
@@ -676,6 +868,27 @@ function pathContainedBy(path, root) {
     return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
   } catch {
     return false
+  }
+}
+
+function ensureContainedParent(root, destination) {
+  if (!regularDirectoryStat(root)) throw new Error('bundle root is not a regular directory')
+  const rel = relative(resolve(root), resolve(destination))
+  if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error('destination escapes bundle root')
+  const parentRel = dirname(rel)
+  if (parentRel === '.') return
+  let current = resolve(root)
+  for (const segment of parentRel.split(sep)) {
+    if (!segment || segment === '.' || segment === '..') throw new Error('destination parent is not normalized')
+    current = join(current, segment)
+    if (existsSync(current)) {
+      if (!regularDirectoryStat(current)) throw new Error('destination parent is a symbolic link or non-directory')
+    } else {
+      mkdirSync(current, { mode: 0o700 })
+      if (!regularDirectoryStat(current)) throw new Error('destination parent could not be created safely')
+    }
+    chmodSync(current, 0o700)
+    if (!pathContainedBy(current, root)) throw new Error('destination parent escapes bundle root')
   }
 }
 
@@ -946,6 +1159,29 @@ function artifactStatusOk(label, status) {
   return status === 'pass'
 }
 
+function starterArtifactSchemaExact(label, receipt, receiptRecords, agents) {
+  if (label === 'install') return Boolean(normalizePassingInstallReceipt(receipt))
+  if (label.startsWith('probe:')) return Boolean(normalizePassingProbeReceipt(receipt))
+  if (label === 'service') return Boolean(normalizePassingServiceReceipt(receipt))
+  if (label === 'starter') return Boolean(normalizeStarterReceipt(receipt))
+  const serviceReceipt = receiptRecords.find((record) => record.label === 'service')?.receipt
+  const service = normalizePassingServiceReceipt(serviceReceipt)
+  if (label === 'continuous') return Boolean(normalizeContinuousReceipt(receipt, agents, service))
+  if (label === 'host') return Boolean(normalizeHostReceipt(receipt, service, agents))
+  const hostTarget = receiptRecords.find((record) => record.label === 'host')?.receipt?.target
+  if (label.startsWith('runtime:')) {
+    const selected = receipt?.inputs?.selected_agents
+    return Array.isArray(selected) && selected.length === 1 && Boolean(hostTarget && normalizeRuntimeInboxReceipt(receipt, selected[0], hostTarget))
+  }
+  if (label.startsWith('control:')) {
+    const request = receipt?.poll?.request
+    return Boolean(hostTarget && hasExactKeys(request, ['agent_id', 'verb']) && CONTROL_VERBS.has(request.verb) &&
+      normalizeLifecycleReceipt(receipt, request.agent_id, request.verb, hostTarget))
+  }
+  if (label === 'cutover_gate') return Boolean(normalizePassingCutoverReceipt(receipt))
+  return false
+}
+
 function receiptBaseUrl(label, receipt) {
   if (label.startsWith('probe:')) return receipt?.inputs?.base_url ?? null
   return receipt?.target?.base_url ?? null
@@ -963,24 +1199,24 @@ function receiptTargetAgents(label, receipt) {
   }
   if (label.startsWith('probe:')) {
     add(receipt?.inputs?.agent)
-    for (const action of receipt?.actions ?? []) {
+    for (const action of (Array.isArray(receipt?.actions) ? receipt.actions : [])) {
       add(action?.target_agent)
       add(action?.agent_id)
     }
   } else if (label.startsWith('runtime:')) {
-    for (const agent of receipt?.target?.agents ?? []) add(agent)
-    for (const agent of receipt?.inputs?.selected_agents ?? []) add(agent)
-    for (const result of receipt?.agents ?? []) add(result?.agent)
+    for (const agent of (Array.isArray(receipt?.target?.agents) ? receipt.target.agents : [])) add(agent)
+    for (const agent of (Array.isArray(receipt?.inputs?.selected_agents) ? receipt.inputs.selected_agents : [])) add(agent)
+    for (const result of (Array.isArray(receipt?.agents) ? receipt.agents : [])) add(result?.agent)
   } else if (label.startsWith('control:')) {
-    for (const agent of receipt?.target?.executed_agents ?? []) add(agent)
+    for (const agent of (Array.isArray(receipt?.target?.executed_agents) ? receipt.target.executed_agents : [])) add(agent)
     add(receipt?.poll?.request?.agent_id)
-    for (const check of receipt?.checks ?? []) {
+    for (const check of (Array.isArray(receipt?.checks) ? receipt.checks : [])) {
       if (check?.component === 'fleet-control-daemon' && check?.check === 'control_request_executed') {
         add(check?.agent_id)
       }
     }
   } else if (label === 'host') {
-    for (const agent of receipt?.target?.daemon_agents ?? []) add(agent)
+    for (const agent of (Array.isArray(receipt?.target?.daemon_agents) ? receipt.target.daemon_agents : [])) add(agent)
   }
   return sortStrings(agents)
 }
@@ -1102,44 +1338,46 @@ function sameSummary(actual, expected) {
 }
 
 function nextSteps(manifest) {
-  return Array.isArray(manifest?.next_steps) ? manifest.next_steps.filter((step) => typeof step === 'string') : []
+  return Array.isArray(manifest?.next_steps) && manifest.next_steps.every((step) => typeof step === 'string')
+    ? manifest.next_steps
+    : null
 }
 
 function addNextStepChecks(checks, manifestPath, manifest, hardGateSummary) {
   const steps = nextSteps(manifest)
   const ready = hardGateSummary?.status === 'pass'
   const expectedSteps = ready ? [NEXT_STEP_ATTACH] : [NEXT_STEP_HOLD]
-  const exactPolicy = JSON.stringify(steps) === JSON.stringify(expectedSteps)
+  const exactPolicy = Array.isArray(steps) && JSON.stringify(steps) === JSON.stringify(expectedSteps)
   checks.push({
-    ok: Array.isArray(manifest?.next_steps),
+    ok: Array.isArray(steps),
     component: 'receipt-bundle-check',
     check: 'next_steps_present',
     path: manifestPath,
-    count: steps.length,
+    count: steps?.length ?? 0,
   })
   checks.push({
-    ok: !ready || steps.includes(NEXT_STEP_ATTACH),
+    ok: Array.isArray(steps) && (!ready || steps.includes(NEXT_STEP_ATTACH)),
     component: 'receipt-bundle-check',
     check: 'next_steps_attach_when_ready',
     path: manifestPath,
     ready,
   })
   checks.push({
-    ok: ready || !steps.includes(NEXT_STEP_ATTACH),
+    ok: Array.isArray(steps) && (ready || !steps.includes(NEXT_STEP_ATTACH)),
     component: 'receipt-bundle-check',
     check: 'next_steps_no_attach_when_not_ready',
     path: manifestPath,
     ready,
   })
   checks.push({
-    ok: ready || steps.includes(NEXT_STEP_HOLD),
+    ok: Array.isArray(steps) && (ready || steps.includes(NEXT_STEP_HOLD)),
     component: 'receipt-bundle-check',
     check: 'next_steps_hold_when_not_ready',
     path: manifestPath,
     ready,
   })
   checks.push({
-    ok: (!ready || !steps.includes(NEXT_STEP_HOLD)) && (!ready || exactPolicy),
+    ok: Array.isArray(steps) && (!ready || !steps.includes(NEXT_STEP_HOLD)) && (!ready || exactPolicy),
     component: 'receipt-bundle-check',
     check: 'next_steps_no_hold_when_ready',
     path: manifestPath,
@@ -1790,6 +2028,7 @@ function checkBundleManifest(opts = {}) {
       const projection = manifest?.provenance ? rawReceipt : null
       const receipt = projectionSchemaExact(projection) ? projection.content : rawReceipt
       if (receipt) receiptRecords.push({ label: entry.label, receipt, checkedPath })
+      const starterSchemaExact = !manifestStarterMode(manifest) || starterArtifactSchemaExact(entry.label, receipt, receiptRecords, agents)
       const actual = checkedPath ? fileSha256(checkedPath) : null
       const expectedOk = typeof entry.sha256 === 'string' && /^[a-f0-9]{64}$/.test(entry.sha256)
       const expectedType = expectedArtifactType(entry.label)
@@ -1861,7 +2100,7 @@ function checkBundleManifest(opts = {}) {
         actual,
       })
       checks.push({
-        ok: Boolean(receipt),
+        ok: Boolean(receipt) && starterSchemaExact,
         component: 'receipt-bundle-check',
         check: 'artifact_receipt_json_read',
         artifact: entry.label,
@@ -1914,14 +2153,16 @@ function checkBundleManifest(opts = {}) {
         actual: receipt?.status ?? null,
       })
       checks.push({
-        ok: artifactStatusOk(entry.label, receipt?.status),
+        ok: manifestStarterMode(manifest)
+          ? receipt?.status === 'pass' && starterSchemaExact
+          : artifactStatusOk(entry.label, receipt?.status),
         component: 'receipt-bundle-check',
         check: 'artifact_status_cutover_ready',
         artifact: entry.label,
         declared_path: entry.path ?? null,
         checked_path: checkedPath || null,
         actual: receipt?.status ?? null,
-        accepted: entry.label === 'install' ? ['pass', 'warn'] : ['pass'],
+        accepted: entry.label === 'install' && !manifestStarterMode(manifest) ? ['pass', 'warn'] : ['pass'],
       })
       const secretFindings = receipt ? findSecretMaterial(receipt) : []
       checks.push({
@@ -2169,6 +2410,14 @@ function finalizePortableStarterExport(sourceManifest, sourceDir, exportDir, cop
         if (support) {
           definition.path = basename(support.path)
           definition.sha256 = support.sha256
+        }
+      }
+      for (const check of content.checks ?? []) {
+        if (check?.component !== 'fleet-install' || check?.check !== 'service_definition_rendered') continue
+        const support = projected.get(`service_definition_${check.service}`)?.item
+        if (support) {
+          check.path = basename(support.path)
+          check.sha256 = support.sha256
         }
       }
     }
@@ -2974,7 +3223,7 @@ function addReceiptStatusCheck(checks, label, path, receipt, expectedType) {
   })
 }
 
-function addInstallReceiptStatusChecks(checks, path, receipt) {
+function addInstallReceiptStatusChecks(checks, path, receipt, { requirePass = false } = {}) {
   checks.push({
     ok: receipt?.receipt_type === EXPECTED.install,
     component: 'receipt-bundle',
@@ -2984,16 +3233,16 @@ function addInstallReceiptStatusChecks(checks, path, receipt) {
     actual: receipt?.receipt_type ?? null,
   })
   checks.push({
-    ok: receipt?.status === 'pass' || receipt?.status === 'warn',
+    ok: requirePass ? Boolean(normalizePassingInstallReceipt(receipt)) : receipt?.status === 'pass' || receipt?.status === 'warn',
     component: 'receipt-bundle',
     check: 'install_receipt_status_non_fail',
     path,
-    accepted: ['pass', 'warn'],
+    accepted: requirePass ? ['pass'] : ['pass', 'warn'],
     actual: receipt?.status ?? null,
   })
 }
 
-function addProbeReceiptStatusChecks(checks, path, receipt) {
+function addProbeReceiptStatusChecks(checks, path, receipt, { exact = false } = {}) {
   checks.push({
     ok: receipt?.receipt_type === EXPECTED.probe,
     component: 'receipt-bundle',
@@ -3003,7 +3252,7 @@ function addProbeReceiptStatusChecks(checks, path, receipt) {
     actual: receipt?.receipt_type ?? null,
   })
   checks.push({
-    ok: receipt?.status === 'pass',
+    ok: exact ? Boolean(normalizePassingProbeReceipt(receipt)) : receipt?.status === 'pass',
     component: 'receipt-bundle',
     check: 'probe_receipt_status_pass',
     path,
@@ -3030,7 +3279,7 @@ function includeInstallReceipt(outDir, opts, checks) {
     if (!existsSync(dest)) return null
     const receipt = readReceipt(dest)
     checks.push({ ok: true, component: 'receipt-bundle', check: 'install_receipt_reused', path: dest })
-    addInstallReceiptStatusChecks(checks, dest, receipt)
+    addInstallReceiptStatusChecks(checks, dest, receipt, { requirePass: starterModeSelected(opts) })
     return receiptMeta(dest)
   }
 
@@ -3044,13 +3293,13 @@ function includeInstallReceipt(outDir, opts, checks) {
 
   if (resolve(source) === resolve(dest)) {
     checks.push({ ok: true, component: 'receipt-bundle', check: 'install_receipt_reused', path: dest })
-    addInstallReceiptStatusChecks(checks, dest, receipt)
+    addInstallReceiptStatusChecks(checks, dest, receipt, { requirePass: starterModeSelected(opts) })
     return receiptMeta(dest)
   }
 
   const wrote = writeJson(dest, receipt, opts, checks, 'install')
   if (!wrote) return existsSync(dest) ? receiptMeta(dest) : { path: dest, receipt_type: null, status: null }
-  addInstallReceiptStatusChecks(checks, dest, receipt)
+  addInstallReceiptStatusChecks(checks, dest, receipt, { requirePass: starterModeSelected(opts) })
   return receiptMeta(dest)
 }
 
@@ -3084,9 +3333,19 @@ function includeStarterReceipt(outDir, opts, checks, roleSpec) {
     checks.push({ ok: digestOk, component: 'receipt-bundle', check: `${label}_source_sha256_match`, path: supportSource || null })
     if (!digestOk) return false
     if (existsSync(supportDest)) {
-      const reused = Boolean(regularFileStat(supportDest) && fileSha256(supportDest) === digest)
+      let reused = Boolean(regularFileStat(supportDest) && pathContainedBy(supportDest, outDir) && fileSha256(supportDest, outDir) === digest)
+      if (reused && opts.force) {
+        chmodSync(supportDest, 0o600)
+        reused = Boolean(regularFileStat(supportDest) && (lstatSync(supportDest).mode & 0o777) === 0o600)
+      }
       checks.push({ ok: reused, component: 'receipt-bundle', check: `${label}_reused`, path: supportDest })
       return reused
+    }
+    try {
+      ensureContainedParent(outDir, supportDest)
+    } catch (err) {
+      checks.push({ ok: false, component: 'receipt-bundle', check: `${label}_copied`, source: supportSource, path: supportDest, reason: String(err?.message ?? err) })
+      return false
     }
     return copyEvidenceFile(supportSource, supportDest, opts, checks, label)
   }
@@ -3147,7 +3406,7 @@ function includeProbeReceipts(outDir, opts, checks) {
     for (const path of listReceiptFiles(outDir, 'probe-')) {
       const receipt = readReceipt(path)
       checks.push({ ok: true, component: 'receipt-bundle', check: 'probe_receipt_reused', path })
-      addProbeReceiptStatusChecks(checks, path, receipt)
+      addProbeReceiptStatusChecks(checks, path, receipt, { exact: starterModeSelected(opts) })
       metas.push(receiptMeta(path))
     }
     return metas
@@ -3165,13 +3424,13 @@ function includeProbeReceipts(outDir, opts, checks) {
 
     if (resolve(source) === resolve(dest)) {
       checks.push({ ok: true, component: 'receipt-bundle', check: 'probe_receipt_reused', path: dest })
-      addProbeReceiptStatusChecks(checks, dest, receipt)
+      addProbeReceiptStatusChecks(checks, dest, receipt, { exact: starterModeSelected(opts) })
       metas.push(receiptMeta(dest))
       return
     }
 
     const wrote = writeJson(dest, receipt, opts, checks, 'probe')
-    if (wrote) addProbeReceiptStatusChecks(checks, dest, receipt)
+    if (wrote) addProbeReceiptStatusChecks(checks, dest, receipt, { exact: starterModeSelected(opts) })
     metas.push(existsSync(dest) ? receiptMeta(dest) : { path: dest, receipt_type: null, status: null })
   })
   return metas
@@ -3445,7 +3704,7 @@ async function buildBundle(opts) {
   })
   writeJson(gatePath, gateReceipt, { ...opts, force: true }, checks, 'cutover')
   checks.push({
-    ok: gateReceipt.status === 'pass',
+    ok: gateReceipt.status === 'pass' && (!starterMode || Boolean(normalizePassingCutoverReceipt(gateReceipt))),
     component: 'receipt-bundle',
     check: 'cutover_gate_status_pass',
     path: gatePath,

@@ -226,3 +226,62 @@ with the full recursive schema.
 
 No residual blocking concern. `npm test` emits the repository's existing Node
 experimental SQLite warnings, with no test failures.
+
+---
+
+## Task 7 Cumulative-Review Remediation
+
+### Result
+
+The cumulative review package now accepts the actual launchd and systemd
+Host-Go producer contracts, including repeated per-agent key/probe checks,
+optional exec-probe checks, and the launchd
+`host-services:systemd_linger_enabled` record with `applicable: false`.
+Starter readiness requires recomputed passing install, runtime, lifecycle,
+probe, cutover, and prior-bundle evidence. Top-level status is bound to the
+exact recomputed summary, malformed collections fail closed, and non-string
+`next_steps` cannot be filtered into an accepted policy.
+
+Nested starter paths are created one contained parent at a time. Symlinked or
+traversing parents are rejected, and `--force` repairs hash-matching reused
+support files to mode 0600 only after regular-file containment checks. The
+legacy SOS-only serialized check/count/summary surface remains unchanged.
+
+### Provenance Decision
+
+Portability applies only to relative filesystem references used by the live
+portable checker. Immutable source observations remain segregated from those
+live references: projected wrappers bind the admitted source SHA-256 and the
+projected payload SHA-256, while outer starter and manifest bindings are
+recomputed after projection. Original source observations are never treated as
+portable filesystem paths.
+
+### Verification
+
+- `node --test fleet-runtime/starter-contract.test.mjs fleet-runtime/host-receipt.test.mjs fleet-runtime/receipt-bundle.test.mjs`
+  - 149 passed, 0 failed (clean checkpoint rerun supplied by the operator).
+- `node --test fleet-runtime/*.test.mjs`
+  - 428 passed, 0 failed.
+- `npm test`
+  - 168 test files passed; 2703 tests passed.
+- `git diff --check`
+  - Passed with no whitespace errors.
+
+### Changed Files
+
+- `fleet-runtime/host-receipt.mjs`
+- `fleet-runtime/receipt-bundle.mjs`
+- `fleet-runtime/receipt-bundle.test.mjs`
+- `fleet-runtime/starter-contract.test.mjs`
+- `.superpowers/sdd/task-7-report.md`
+- `.superpowers/sdd/task-7-final-review.md` (retained as the durable review
+  input)
+
+### Concerns
+
+No test or whitespace failures remain. `npm test` continues to emit Node's
+existing experimental SQLite warnings. The portable representation retains
+cryptographic source-byte digests and projected evidence, but does not embed a
+second copy of every admitted source file; independent verification therefore
+establishes the typed digest/projection chain rather than reconstructing the
+discarded source checkout byte-for-byte.

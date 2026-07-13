@@ -6,6 +6,10 @@ import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync,
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { buildBundle, checkBundleManifest, exportBundle, formatHostGoPlan, formatStatusSummary, inspectBundleStatus, parseArgs, safeName } from './receipt-bundle.mjs'
+import { buildReceipt as buildHostReceipt } from './host-receipt.mjs'
+import { createServiceContext } from './service-context.mjs'
+import { renderLaunchd } from './launchd-service-manager.mjs'
+import { renderSystemd } from './systemd-service-manager.mjs'
 import { STARTER_ARTIFACT_ROLES, STARTER_CHECKS } from './starter-contract.mjs'
 
 const POT_URL = 'https://pot.example.org'
@@ -49,19 +53,54 @@ function sha256(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex')
 }
 
+function summarizeFixture(checks) {
+  const failed = checks.filter((check) => check.ok === false).length
+  const warnings = checks.filter((check) => check.ok === null).length
+  return {
+    status: failed > 0 ? 'fail' : warnings > 0 ? 'warn' : 'pass',
+    passed: checks.length - failed - warnings,
+    failed,
+    warnings,
+  }
+}
+
 function checklistById(status, id) {
   return status.host_go_checklist.find((item) => item.id === id)
 }
 
 function installReceipt(status = 'warn') {
-  const checks = [
-    { ok: status === 'warn' ? null : true, component: 'fleet-install', check: 'config_needs_edit', path: '/home/operator/.fleet/daemon.json', reason: 'template_contains_placeholders' },
-  ]
+  const checks = status === 'pass'
+    ? [
+        { ok: true, component: 'fleet-install', check: 'source_dir_present', path: '/checkout/fleet-runtime' },
+        ...['fleet_home', 'runtime', 'agents', 'handlers', 'inbox', 'logs', 'state', 'receipts', 'systemd_definition'].map((label) => ({
+          ok: true,
+          component: 'fleet-install',
+          check: `${label}_dir_ready`,
+          path: label === 'systemd_definition' ? '/home/operator/.config/systemd/user' : `/home/operator/.fleet/${label === 'fleet_home' ? '' : label}`,
+          mode: '700',
+          existed: true,
+          dry_run: false,
+        })),
+        { ok: true, component: 'fleet-install', check: 'runtime_files_discovered', count: 1 },
+        { ok: true, component: 'fleet-install', check: 'runtime_file_copied', source: '/checkout/fleet-runtime/host-receipt.mjs', path: '/home/operator/.fleet/runtime/host-receipt.mjs', mode: '644', dry_run: false },
+        ...['daemon.json', 'inbox-handler.json', 'control.json', 'flights.json'].map((name) => ({
+          ok: true,
+          component: 'fleet-install',
+          check: 'config_preserved',
+          source: `/checkout/fleet-runtime/${name}`,
+          path: `/home/operator/.fleet/${name}`,
+        })),
+        { ok: true, component: 'fleet-install', check: 'service_definition_rendered', service: 'heartbeat', path: '/home/operator/.config/systemd/user/fleet-daemon.service', sha256: HEARTBEAT_SHA, mode: '644', dry_run: false },
+        { ok: true, component: 'fleet-install', check: 'service_definition_rendered', service: 'control', path: '/home/operator/.config/systemd/user/fleet-control-daemon.service', sha256: CONTROL_SHA, mode: '644', dry_run: false },
+      ]
+    : [
+        { ok: null, component: 'fleet-install', check: 'config_needs_edit', path: '/home/operator/.fleet/daemon.json', reason: 'template_contains_placeholders' },
+      ]
   return {
     receipt_type: 'mupot-fleet-install-receipt/v1',
     generated_at: '2026-07-08T00:00:00.000Z',
     status,
-    summary: { status, passed: status === 'warn' ? 0 : 1, failed: 0, warnings: status === 'warn' ? 1 : 0 },
+    summary: summarizeFixture(checks),
     inputs: {
       source_dir: '/checkout/fleet-runtime', prefix: '/home/operator/.fleet', systemd_dir: '/home/operator/.config/systemd/user',
       skip_systemd: false, force_config: false, dry_run: false, node_path: '/usr/bin/node',
@@ -246,7 +285,7 @@ function continuousReceipt(status = 'pass', sourceService = serviceReceipt()) {
       heartbeat: { schema: 'mupot-fleet-daemon-state/v1', pid: 101, started_at: '2026-07-13T20:00:00.000Z', last_tick_at: '2026-07-13T20:04:00.000Z', interval_sec: 15, tick: { before: 40, after: 43 } },
       control: { schema: 'mupot-fleet-control-state/v1', pid: 102, started_at: '2026-07-13T20:00:00.000Z', last_poll_at: '2026-07-13T20:04:00.000Z', poll_sec: 2, last_outcome: { agent_id: null, verb: null, accepted: true, result: 'idle' }, poll: { before: 70, after: 72 } },
     },
-    service: { status: 'pass', service_manager: 'systemd', services: service.services, linger: service.linger, checks: service.checks.map(({ check, ok }) => ({ check, ok })) },
+    service: { status: 'pass', service_manager: service.service_manager, services: service.services, linger: service.linger, checks: service.checks.map(({ check, ok }) => ({ check, ok })) },
     next_steps: [],
     checks: [
       { check: 'linger_enabled', ok: status === 'pass' },
@@ -333,20 +372,44 @@ function serviceAwareHostReceipt(sourceService = serviceReceipt()) {
   return receipt
 }
 
-function priorBundleManifest(status = 'pass') {
-  const checks = [{ ok: status === 'pass', component: 'receipt-bundle', check: 'manifest_written', path: 'manifest.json' }]
+function priorBundleManifest(status = 'pass', artifactDigests = {}) {
+  const ok = status === 'pass'
+  const meta = (path, receiptType, sha256 = digest(`prior:${path}`)) => ({ path, receipt_type: receiptType, status, sha256 })
+  const checks = [
+    { ok, component: 'receipt-bundle', check: 'selected_agents_present', agents: ['agent-one'] },
+    { ok, component: 'receipt-bundle', check: 'install_receipt_status_non_fail', path: 'install.json', accepted: ['pass', 'warn'], actual: status },
+    { ok, component: 'receipt-bundle', check: 'probe_receipt_present', count: 1 },
+    { ok, component: 'receipt-bundle', check: 'host_candidate_selected', path: 'host.json' },
+    { ok, component: 'receipt-bundle', check: 'runtime_candidate_selected', path: 'runtime-agent-one.json' },
+    { ok, component: 'receipt-bundle', check: 'control_candidate_selected', path: 'control-start.json' },
+    { ok, component: 'receipt-bundle', check: 'control_candidate_selected', path: 'control-stop.json' },
+    { ok, component: 'receipt-bundle', check: 'cutover_gate_status_pass', path: 'cutover-gate.json', actual: status },
+    { ok, component: 'receipt-bundle', check: 'manifest_written', path: 'manifest.json' },
+  ]
   return {
     receipt_type: 'mupot-fleet-receipt-bundle/v1',
     generated_at: '2026-07-13T20:04:30.000Z',
     status,
-    summary: { status, passed: status === 'pass' ? 1 : 0, failed: status === 'pass' ? 0 : 1, warnings: 0 },
+    summary: { status, passed: ok ? checks.length : 0, failed: ok ? 0 : checks.length, warnings: 0 },
     integrity: { algorithm: 'sha256', covers: 'receipt artifact files', excludes: ['manifest.json'] },
     inputs: {
       agents: ['agent-one'], out_dir: '.', daemon_config: 'daemon.json', inbox_handler_config: 'inbox.json', control_config: 'control.json',
       install_receipt: 'install.json', probe_receipts: ['probe-start.json'], control_label: null, required_control_verbs: ['start', 'stop'],
       exec_probes: false, verify_only: true, skip_host: true, skip_runtime: true, skip_control: true,
     },
-    artifacts: { out_dir: '.', install: null, probes: [], host: null, runtimes: [], controls: [], cutover_gate: null, manifest: 'manifest.json' },
+    artifacts: {
+      out_dir: '.',
+      install: meta('install.json', 'mupot-fleet-install-receipt/v1', artifactDigests.install),
+      probes: [meta('probe-start.json', 'mupot-fleet-cutover-probe/v1')],
+      host: meta('host.json', 'mupot-fleet-host-receipt/v1', artifactDigests.host),
+      runtimes: [meta('runtime-agent-one.json', 'mupot-fleet-runtime-receipt/v1', artifactDigests.runtime_inbox)],
+      controls: [
+        meta('control-start.json', 'mupot-fleet-control-receipt/v1', artifactDigests.lifecycle_control_start),
+        meta('control-stop.json', 'mupot-fleet-control-receipt/v1', artifactDigests.lifecycle_control_stop),
+      ],
+      cutover_gate: meta('cutover-gate.json', 'mupot-sos-cutover-gate/v1'),
+      manifest: 'manifest.json',
+    },
     next_steps: ['attach manifest.json and cutover-gate.json to the cutover record; SOS removal is permitted only for the proven agent(s)'],
     checks,
   }
@@ -361,16 +424,16 @@ function seedCutoverEvidence(outDir, host = hostReceipt()) {
 }
 
 function starterPaths(overrides = {}) {
-  const sourceDir = tmpDir()
+  const sourceDir = overrides.sourceDir ?? tmpDir()
   const service = overrides.service ?? serviceReceipt()
   if (Array.isArray(service.definitions)) {
     for (const definition of service.definitions) {
       if (definition?.service === 'heartbeat') {
-        definition.path = join(sourceDir, 'fleet-daemon.service')
-        writeFileSync(definition.path, HEARTBEAT_DEFINITION)
+        if (!overrides.preserveServiceDefinitions) definition.path = join(sourceDir, 'fleet-daemon.service')
+        if (!existsSync(definition.path)) writeFileSync(definition.path, HEARTBEAT_DEFINITION)
       } else if (definition?.service === 'control') {
-        definition.path = join(sourceDir, 'fleet-control-daemon.service')
-        writeFileSync(definition.path, CONTROL_DEFINITION)
+        if (!overrides.preserveServiceDefinitions) definition.path = join(sourceDir, 'fleet-control-daemon.service')
+        if (!existsSync(definition.path)) writeFileSync(definition.path, CONTROL_DEFINITION)
       }
     }
   }
@@ -380,7 +443,6 @@ function starterPaths(overrides = {}) {
   const runtime = overrides.runtime ?? runtimeReceipt('agent-one')
   const controlStart = overrides.controlStart ?? controlReceipt('agent-one', 'start')
   const controlStop = overrides.controlStop ?? controlReceipt('agent-one', 'stop')
-  const priorManifest = overrides.priorManifest ?? priorBundleManifest()
   writeFileSync(join(sourceDir, 'starter.example.json'), STARTER_MANIFEST)
   const evidencePaths = {
     install: writeJson(join(sourceDir, 'install.json'), install),
@@ -390,8 +452,10 @@ function starterPaths(overrides = {}) {
     runtime_inbox: writeJson(join(sourceDir, 'runtime-agent-one.json'), runtime),
     lifecycle_control_start: writeJson(join(sourceDir, 'control-start.json'), controlStart),
     lifecycle_control_stop: writeJson(join(sourceDir, 'control-stop.json'), controlStop),
-    receipt_bundle_manifest: writeJson(join(sourceDir, 'prior-bundle-manifest.json'), priorManifest),
   }
+  const initialDigests = Object.fromEntries(Object.entries(evidencePaths).map(([role, path]) => [role, sha256(path)]))
+  const priorManifest = overrides.priorManifest ?? priorBundleManifest('pass', initialDigests)
+  evidencePaths.receipt_bundle_manifest = writeJson(join(sourceDir, 'prior-bundle-manifest.json'), priorManifest)
   const artifactDigests = Object.fromEntries(Object.entries(evidencePaths).map(([role, path]) => [role, sha256(path)]))
   const starter = overrides.starter ?? starterReceipt('pass', artifactDigests)
   return {
@@ -401,6 +465,144 @@ function starterPaths(overrides = {}) {
     continuousReceiptPath: evidencePaths.continuous,
     starterReceiptPath: writeJson(join(sourceDir, 'starter.json'), starter),
   }
+}
+
+async function actualProducerStarterPaths(manager) {
+  const sourceDir = tmpDir()
+  const platformName = manager === 'launchd' ? 'darwin' : 'linux'
+  const keysDir = join(sourceDir, 'keys')
+  const runtimeDir = join(sourceDir, 'runtime')
+  const definitionDir = join(sourceDir, manager)
+  const spoolDir = join(sourceDir, 'spool')
+  for (const path of [keysDir, runtimeDir, definitionDir, spoolDir]) mkdirSync(path)
+
+  const daemonPath = writeJson(join(sourceDir, 'daemon.json'), {
+    base_url: POT_URL,
+    tenant: POT_TENANT,
+    interval_sec: 15,
+    agents: [
+      { agent_id: 'agent-one', type: 'builder', runtime: 'codex', probe: 'true', inbox: { command: 'node inbox-handler.mjs', limit: 20 } },
+      { agent_id: 'fleet-consumer', type: 'manager', runtime: 'hermes', probe: 'true', inbox: { command: 'node inbox-handler.mjs', limit: 20 } },
+    ],
+  })
+  const inboxPath = writeJson(join(sourceDir, 'inbox-handler.json'), {
+    spool_dir: spoolDir,
+    agents: [
+      { agent_id: 'agent-one', command: 'true', run_for: ['request'] },
+      { agent_id: 'fleet-consumer', command: 'true', run_for: ['request'] },
+    ],
+  })
+  const panelPublicKeyPath = writeJson(join(sourceDir, 'panel.pub.jwk'), {
+    kty: 'OKP',
+    crv: 'Ed25519',
+    x: 'bqjg1QCM1_F1Oe4xxjDidrEkNzkgwbAUk65dJUYFaLI',
+  })
+  const flightsPath = writeJson(join(sourceDir, 'flights.json'), { flights: [] })
+  const flightScriptPath = join(sourceDir, 'flight.mjs')
+  writeFileSync(flightScriptPath, 'export default {}\n')
+  chmodSync(flightScriptPath, 0o755)
+  const controlPath = writeJson(join(sourceDir, 'control.json'), {
+    base_url: POT_URL,
+    tenant: POT_TENANT,
+    consumer_agent_id: 'fleet-consumer',
+    panel_public_key: panelPublicKeyPath,
+    flights_config: flightsPath,
+    flight_script: flightScriptPath,
+  })
+  for (const agentId of ['agent-one', 'fleet-consumer']) {
+    const path = join(keysDir, `${agentId}.key`)
+    writeFileSync(path, '{}\n')
+    chmodSync(path, 0o600)
+  }
+
+  const context = createServiceContext({
+    manager,
+    platformName,
+    homeDir: sourceDir,
+    prefix: sourceDir,
+    runtimeDir,
+    definitionDir,
+    nodePath: process.execPath,
+    uid: 501,
+    username: 'operator',
+  })
+  const rendered = manager === 'launchd' ? renderLaunchd(context) : renderSystemd(context)
+  for (const definition of rendered) writeFileSync(definition.path, definition.content)
+  const service = {
+    receipt_type: 'mupot-fleet-service-receipt/v1',
+    generated_at: '2026-07-13T20:03:00.000Z',
+    status: 'pass',
+    platform: platformName,
+    service_manager: manager,
+    action: 'status',
+    definitions: rendered.map((definition) => ({ service: definition.key, path: definition.path, sha256: digest(definition.content) })),
+    services: context.services.map((serviceEntry, index) => ({
+      key: serviceEntry.key,
+      name: serviceEntry.name,
+      loaded: true,
+      enabled: true,
+      running: true,
+      pid: 101 + index,
+    })),
+    linger: manager === 'systemd' ? { enabled: true, raw: 'yes' } : null,
+    commands: manager === 'systemd'
+      ? [
+          ...context.services.map((serviceEntry) => ({ executable: 'systemctl', argv: ['--user', 'show', serviceEntry.systemdUnit, '--property=LoadState,UnitFileState,ActiveState,MainPID', '--value'], code: 0, stdout_summary: '', stderr_summary: '' })),
+          { executable: 'loginctl', argv: ['show-user', 'operator', '-p', 'Linger', '--value'], code: 0, stdout_summary: 'yes', stderr_summary: '' },
+        ]
+      : context.services.map((serviceEntry) => ({ executable: 'launchctl', argv: ['print', `${context.domain}/${serviceEntry.launchdLabel}`], code: 0, stdout_summary: '', stderr_summary: '' })),
+    preserved_data: { configs: true, private_keys: true, runtime: true, inbox: true, receipts: true },
+    next_steps: [],
+    checks: [{ ok: true, check: 'services_loaded_and_running' }, { ok: true, check: 'command_output_secret_free' }],
+  }
+  const host = await buildHostReceipt({
+    daemonPath,
+    inboxPath,
+    controlPath,
+    skipInbox: false,
+    skipControl: false,
+    execProbes: true,
+    keyPathFor: (agentId) => join(keysDir, `${agentId}.key`),
+    requireServices: true,
+    serviceManager: manager,
+    serviceDefinitionDir: definitionDir,
+    runtimeDir,
+    nodePath: process.execPath,
+    homeDir: sourceDir,
+    uid: 501,
+    username: 'operator',
+    platformName,
+    buildServiceReceipt: async () => service,
+  })
+  assert.equal(host.status, 'pass', JSON.stringify(host.checks, null, 2))
+
+  const install = installReceipt('pass')
+  install.inputs.systemd_dir = manager === 'systemd' ? definitionDir : null
+  install.inputs.node_path = process.execPath
+  install.inputs.service_manager = { requested: manager, resolved: manager }
+  install.inputs.service_definition_dir = definitionDir
+  install.outputs.runtime_dir = runtimeDir
+  install.outputs.service_definitions = service.definitions
+  for (const check of install.checks) {
+    if (check.check === 'systemd_definition_dir_ready') {
+      check.check = `${manager}_definition_dir_ready`
+      check.path = definitionDir
+    }
+    if (check.check === 'service_definition_rendered') {
+      const definition = service.definitions.find((entry) => entry.service === check.service)
+      check.path = definition.path
+      check.sha256 = definition.sha256
+    }
+  }
+
+  return starterPaths({
+    sourceDir,
+    preserveServiceDefinitions: true,
+    service,
+    host,
+    install,
+    continuous: continuousReceipt('pass', service),
+  })
 }
 
 function seedStarterEvidence(outDir, sources) {
@@ -445,6 +647,32 @@ function rewriteStarterEvidence(sources, role) {
   writeJson(path, value)
   sources.evidence.starter.artifacts.find((artifact) => artifact.role === role).sha256 = sha256(path)
   rewriteStarterReceipt(sources)
+}
+
+function nestStarterSources(sources) {
+  const manifestDir = join(sources.sourceDir, 'manifest')
+  const evidenceDir = join(sources.sourceDir, 'evidence')
+  mkdirSync(manifestDir)
+  mkdirSync(evidenceDir)
+
+  const oldManifestPath = join(sources.sourceDir, sources.evidence.starter.manifest.path)
+  const newManifestPath = join(manifestDir, 'starter.example.json')
+  copyFileSync(oldManifestPath, newManifestPath)
+  rmSync(oldManifestPath)
+  sources.evidence.starter.manifest.path = 'manifest/starter.example.json'
+
+  for (const artifact of sources.evidence.starter.artifacts) {
+    const oldPath = join(sources.sourceDir, artifact.path)
+    const newRelativePath = `evidence/${artifact.path}`
+    const newPath = join(sources.sourceDir, newRelativePath)
+    copyFileSync(oldPath, newPath)
+    rmSync(oldPath)
+    artifact.path = newRelativePath
+    if (artifact.role === 'service') sources.serviceReceiptPath = newPath
+    if (artifact.role === 'continuous') sources.continuousReceiptPath = newPath
+  }
+  rewriteStarterReceipt(sources)
+  return sources
 }
 
 function absoluteStrings(value, found = []) {
@@ -598,6 +826,96 @@ test('starter-ready bundle requires, exports, and summarizes service continuity 
   }
   assert.deepEqual(absoluteStrings(copiedCheck), [])
   assert.deepEqual(absoluteStrings(inspectBundleStatus({ outDir: exportDir })), [])
+})
+
+test('starter-ready consumes actual systemd and launchd Host-Go producer receipts', async (t) => {
+  for (const manager of ['systemd', 'launchd']) {
+    await t.test(manager, async () => {
+      const outDir = tmpDir()
+      const sources = await actualProducerStarterPaths(manager)
+      seedStarterEvidence(outDir, sources)
+
+      const bundle = await buildBundle({
+        outDir,
+        agents: ['agent-one'],
+        verifyOnly: true,
+        ...sources,
+      })
+      const host = sources.evidence.host
+      const hostCheckNames = host.checks.filter((check) => check.component === 'host-services').map((check) => check.check)
+
+      assert.equal(bundle.status, 'pass', JSON.stringify(bundle.checks.filter((check) => check.ok === false), null, 2))
+      assert.deepEqual(hostCheckNames, ['service_definitions_current', 'heartbeat_service_running', 'control_service_running', 'systemd_linger_enabled'])
+      assert.equal(host.checks.filter((check) => check.check === 'agent_private_key_present_0600').length, 2)
+      assert.equal(host.checks.filter((check) => check.check === 'probe_configured').length, 2)
+      assert.equal(host.checks.filter((check) => check.check === 'probe_exec_alive').length, 2)
+      const linger = host.checks.find((check) => check.check === 'systemd_linger_enabled')
+      assert.equal(linger.applicable, manager === 'systemd')
+      assert.equal(linger.linger, manager === 'systemd' ? sources.evidence.service.linger : null)
+
+      const checked = checkBundleManifest({ outDir })
+      assert.equal(checked.status, 'pass', JSON.stringify(checked.checks.filter((check) => check.ok === false), null, 2))
+    })
+  }
+})
+
+test('starter-ready requires recomputed passing evidence for every Task 8 category', async (t) => {
+  const cases = [
+    ['warning install receipt', (sources) => {
+      sources.evidence.install = installReceipt('warn')
+      rewriteStarterEvidence(sources, 'install')
+    }],
+    ['runtime top-level pass over failing summary', (sources) => {
+      const receipt = sources.evidence.runtime
+      receipt.checks[0] = { ...receipt.checks[0], ok: false, reason: 'fabricated_failure' }
+      receipt.summary = summarizeFixture(receipt.checks)
+      rewriteStarterEvidence(sources, 'runtime_inbox')
+    }],
+    ['lifecycle control top-level pass over failing summary', (sources) => {
+      const receipt = sources.evidence.controlStart
+      receipt.checks[0] = { ...receipt.checks[0], ok: false, reason: 'fabricated_failure' }
+      receipt.summary = summarizeFixture(receipt.checks)
+      rewriteStarterEvidence(sources, 'lifecycle_control_start')
+    }],
+    ['prior bundle top-level pass over failing summary', (sources) => {
+      const receipt = sources.evidence.priorManifest
+      receipt.checks[0].ok = false
+      receipt.summary = summarizeFixture(receipt.checks)
+      rewriteStarterEvidence(sources, 'receipt_bundle_manifest')
+    }],
+    ['self-authored empty prior bundle', (sources) => {
+      const receipt = sources.evidence.priorManifest
+      receipt.artifacts = { out_dir: '.', install: null, probes: [], host: null, runtimes: [], controls: [], cutover_gate: null, manifest: 'manifest.json' }
+      receipt.checks = [{ ok: true, component: 'receipt-bundle', check: 'manifest_written', path: 'manifest.json' }]
+      receipt.summary = summarizeFixture(receipt.checks)
+      rewriteStarterEvidence(sources, 'receipt_bundle_manifest')
+    }],
+  ]
+
+  for (const [name, mutate] of cases) {
+    await t.test(name, async () => {
+      const outDir = tmpDir()
+      const sources = starterPaths()
+      mutate(sources)
+      seedStarterEvidence(outDir, sources)
+      const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...sources })
+      assert.equal(bundle.status, 'fail', JSON.stringify(bundle.checks.filter((check) => check.ok === false), null, 2))
+      assert.ok(bundle.checks.some((check) => check.check === 'starter_evidence_contracts_valid' && check.ok === false))
+    })
+  }
+
+  await t.test('probe top-level pass over failing summary', async () => {
+    const outDir = tmpDir()
+    const sources = starterPaths()
+    seedStarterEvidence(outDir, sources)
+    const probe = probeReceipt()
+    probe.checks[0].ok = false
+    probe.summary = summarizeFixture(probe.checks)
+    writeJson(join(outDir, 'probe-start.json'), probe)
+
+    const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...sources })
+    assert.equal(bundle.status, 'fail', JSON.stringify(bundle.checks.filter((check) => check.ok === false), null, 2))
+  })
 })
 
 test('starter-ready validates complete producer contracts and cross-receipt bindings', async (t) => {
@@ -1645,6 +1963,36 @@ test('bundle and export permissions are repaired and permissive drift fails veri
   const check = checkBundleManifest({ outDir })
   assert.equal(check.status, 'fail')
   assert.ok(check.checks.some((entry) => entry.check === 'artifact_permissions_0600' && entry.ok === false))
+})
+
+test('starter packaging creates safe nested parents and force repairs reused support files', async (t) => {
+  await t.test('nested relative support paths', async () => {
+    const outDir = tmpDir()
+    const sources = nestStarterSources(starterPaths())
+    seedStarterEvidence(outDir, sources)
+
+    const first = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...sources })
+    assert.equal(first.status, 'pass', JSON.stringify(first.checks.filter((check) => check.ok === false), null, 2))
+    assert.equal(statSync(join(outDir, 'manifest', 'starter.example.json')).mode & 0o777, 0o600)
+    assert.equal(statSync(join(outDir, 'evidence', 'install.json')).mode & 0o777, 0o600)
+
+    chmodSync(join(outDir, 'evidence', 'install.json'), 0o644)
+    const repaired = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, force: true, ...sources })
+    assert.equal(repaired.status, 'pass', JSON.stringify(repaired.checks.filter((check) => check.ok === false), null, 2))
+    assert.equal(statSync(join(outDir, 'evidence', 'install.json')).mode & 0o777, 0o600)
+  })
+
+  await t.test('symlinked nested parent', async () => {
+    const outDir = tmpDir()
+    const external = tmpDir()
+    const sources = nestStarterSources(starterPaths())
+    seedStarterEvidence(outDir, sources)
+    symlinkSync(external, join(outDir, 'evidence'), 'dir')
+
+    const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, force: true, ...sources })
+    assert.equal(bundle.status, 'fail')
+    assert.deepEqual(readdirSync(external), [])
+  })
 })
 
 test('manifest verification rejects symlinked artifact files and bundle directories', async (t) => {

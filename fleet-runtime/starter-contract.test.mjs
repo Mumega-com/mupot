@@ -110,6 +110,17 @@ test('shared starter contract rejects absolute and traversing paths', () => {
   assert.equal(normalizeStarterReceipt(absoluteManifest), null)
 })
 
+test('shared starter contract accepts normalized nested relative paths', () => {
+  const receipt = starterReceipt()
+  receipt.manifest.path = 'manifest/starter.example.json'
+  receipt.artifacts = receipt.artifacts.map((artifact) => ({
+    ...artifact,
+    path: `evidence/${artifact.path}`,
+  }))
+
+  assert.deepEqual(normalizeStarterReceipt(receipt), receipt)
+})
+
 test('shared starter contract rejects malformed digests and check records', () => {
   const badDigest = starterReceipt()
   badDigest.artifacts[0].sha256 = 'A'.repeat(64)

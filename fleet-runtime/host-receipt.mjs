@@ -343,6 +343,146 @@ function hasExactKeys(value, keys) {
     keys.every((key) => Object.hasOwn(value, key))
 }
 
+function sameJson(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function nonEmptyString(value) {
+  return typeof value === 'string' && value.length > 0
+}
+
+function passingPathCheck(check, component, name, extraKeys = []) {
+  return hasExactKeys(check, ['ok', 'component', 'check', ...extraKeys, 'label', 'path', 'mode', 'size']) &&
+    check.ok === true && check.component === component && check.check === name &&
+    nonEmptyString(check.label) && nonEmptyString(check.path) && /^[0-7]{3,4}$/.test(check.mode) &&
+    Number.isInteger(check.size) && check.size >= 0
+}
+
+function passingHostSummary(receipt) {
+  if (!hasExactKeys(receipt?.summary, ['status', 'passed', 'failed', 'warnings']) || !Array.isArray(receipt?.checks)) return false
+  const expected = summarize(receipt.checks)
+  return receipt.status === 'pass' && receipt.status === receipt.summary.status && sameJson(receipt.summary, expected)
+}
+
+function validateDefinitionEvidence(check, service) {
+  if (!hasExactKeys(check, ['ok', 'component', 'check', 'service_manager', 'definition_dir', 'definitions']) ||
+    check.ok !== true || check.component !== 'host-services' || check.check !== 'service_definitions_current' ||
+    check.service_manager !== service.manager || !nonEmptyString(check.definition_dir) ||
+    !Array.isArray(check.definitions) || check.definitions.length !== 2) return null
+  const hashes = {}
+  for (const definition of check.definitions) {
+    if (!hasExactKeys(definition, ['service', 'path', 'expected_sha256', 'rendered_sha256', 'actual_sha256', 'argv', 'expected_argv', 'ok']) ||
+      !['heartbeat', 'control'].includes(definition.service) || Object.hasOwn(hashes, definition.service) || definition.ok !== true ||
+      !nonEmptyString(definition.path) || !/^[a-f0-9]{64}$/.test(definition.expected_sha256 ?? '') ||
+      definition.expected_sha256 !== service.definitions?.[definition.service] ||
+      definition.rendered_sha256 !== definition.expected_sha256 || definition.actual_sha256 !== definition.expected_sha256 ||
+      !Array.isArray(definition.argv) || definition.argv.length === 0 || definition.argv.some((arg) => typeof arg !== 'string') ||
+      !Array.isArray(definition.expected_argv) || !sameJson(definition.argv, definition.expected_argv)) return null
+    hashes[definition.service] = definition.actual_sha256
+  }
+  return hashes
+}
+
+/** Validate the exact successful shape emitted by buildReceipt with service checks enabled. */
+export function normalizePassingHostReceipt(receipt, service, selectedAgents = []) {
+  const topKeys = ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'target', 'checks']
+  if (!service || !hasExactKeys(receipt, topKeys) || receipt.receipt_type !== 'mupot-fleet-host-receipt/v1' ||
+    !nonEmptyString(receipt.generated_at) || Number.isNaN(Date.parse(receipt.generated_at)) || !passingHostSummary(receipt)) return null
+  if (!hasExactKeys(receipt.inputs, ['daemon_config', 'inbox_handler_config', 'control_config', 'exec_probes', 'service_manager', 'service_definition_dir']) ||
+    !['daemon_config', 'inbox_handler_config', 'control_config', 'service_definition_dir'].every((key) => nonEmptyString(receipt.inputs[key])) ||
+    typeof receipt.inputs.exec_probes !== 'boolean' || receipt.inputs.service_manager !== service.manager) return null
+  const target = receipt.target
+  if (!hasExactKeys(target, ['base_url', 'tenant', 'daemon_agents', 'control_consumer_agent']) ||
+    !nonEmptyString(target.base_url) || !nonEmptyString(target.tenant) || !nonEmptyString(target.control_consumer_agent) ||
+    !Array.isArray(target.daemon_agents) || target.daemon_agents.length === 0 ||
+    target.daemon_agents.some((agent) => !nonEmptyString(agent)) || new Set(target.daemon_agents).size !== target.daemon_agents.length ||
+    !Array.isArray(selectedAgents) || selectedAgents.some((agent) => !target.daemon_agents.includes(agent))) return null
+
+  const checks = receipt.checks
+  let index = 0
+  const take = () => checks[index++]
+  let check = take()
+  if (!hasExactKeys(check, ['ok', 'component', 'check', 'path']) || check.ok !== true || check.component !== 'fleet-daemon' || check.check !== 'config_valid' || !nonEmptyString(check.path)) return null
+  for (const name of ['base_url_real', 'tenant_real']) {
+    check = take()
+    if (!hasExactKeys(check, ['component', 'ok', 'kind', 'check']) || check.ok !== true || check.component !== 'fleet-daemon' || check.kind !== 'fleet-daemon' || check.check !== name) return null
+  }
+  check = take()
+  if (!hasExactKeys(check, ['ok', 'component', 'check', 'interval_sec']) || check.ok !== true || check.component !== 'fleet-daemon' ||
+    check.check !== 'heartbeat_cadence_under_ttl' || !Number.isFinite(check.interval_sec) || check.interval_sec < 15 || check.interval_sec > 120) return null
+  for (const agentId of target.daemon_agents) {
+    check = take()
+    if (!passingPathCheck(check, 'fleet-daemon', 'agent_private_key_present_0600', ['agent_id']) || check.agent_id !== agentId || check.mode !== '600') return null
+    check = take()
+    if (!hasExactKeys(check, ['ok', 'component', 'check', 'agent_id', 'probe']) || check.ok !== true || check.component !== 'fleet-daemon' ||
+      check.check !== 'probe_configured' || check.agent_id !== agentId || !nonEmptyString(check.probe)) return null
+  }
+
+  check = take()
+  if (!hasExactKeys(check, ['ok', 'component', 'check', 'path']) || check.ok !== true || check.component !== 'inbox-handler' || check.check !== 'config_valid' || !nonEmptyString(check.path)) return null
+  const inboxAgents = new Set()
+  while (checks[index]?.component === 'inbox-handler' && checks[index]?.check === 'daemon_inbox_agent_has_handler_config') {
+    check = take()
+    if (!hasExactKeys(check, ['ok', 'component', 'check', 'agent_id']) || check.ok !== true || !target.daemon_agents.includes(check.agent_id) || inboxAgents.has(check.agent_id)) return null
+    inboxAgents.add(check.agent_id)
+  }
+  const spoolAgents = new Set()
+  while (checks[index]?.component === 'inbox-handler' && checks[index]?.check === 'spool_dir_configured') {
+    check = take()
+    if (!hasExactKeys(check, ['ok', 'component', 'check', 'agent_id', 'spool_dir', 'command_configured']) || check.ok !== true ||
+      !nonEmptyString(check.agent_id) || !nonEmptyString(check.spool_dir) || typeof check.command_configured !== 'boolean' || spoolAgents.has(check.agent_id)) return null
+    spoolAgents.add(check.agent_id)
+  }
+  if ([...inboxAgents].some((agent) => !spoolAgents.has(agent))) return null
+
+  check = take()
+  if (!hasExactKeys(check, ['ok', 'component', 'check', 'path']) || check.ok !== true || check.component !== 'fleet-control-daemon' || check.check !== 'config_valid' || !nonEmptyString(check.path)) return null
+  for (const name of ['base_url_real', 'tenant_real']) {
+    check = take()
+    if (!hasExactKeys(check, ['component', 'ok', 'kind', 'check']) || check.ok !== true || check.component !== 'fleet-control-daemon' || check.kind !== 'fleet-control-daemon' || check.check !== name) return null
+  }
+  check = take()
+  if (!passingPathCheck(check, 'fleet-control-daemon', 'consumer_private_key_present_0600', ['agent_id']) || check.agent_id !== target.control_consumer_agent || check.mode !== '600') return null
+  check = take()
+  if (!passingPathCheck(check, 'fleet-control-daemon', 'panel_public_key_present')) return null
+  const panelPath = check.path
+  check = take()
+  if (!hasExactKeys(check, ['ok', 'component', 'check', 'path']) || check.ok !== true || check.component !== 'fleet-control-daemon' || check.check !== 'panel_public_key_public_only' || check.path !== panelPath) return null
+  for (const name of ['flights_config_present', 'flight_script_present']) {
+    check = take()
+    if (!passingPathCheck(check, 'fleet-control-daemon', name)) return null
+  }
+  check = take()
+  if (!hasExactKeys(check, ['ok', 'component', 'check', 'daemon_base_url', 'control_base_url']) || check.ok !== true || check.component !== 'host-receipt' ||
+    check.check !== 'daemon_control_base_url_match' || check.daemon_base_url !== target.base_url || check.control_base_url !== target.base_url) return null
+  check = take()
+  if (!hasExactKeys(check, ['ok', 'component', 'check', 'daemon_tenant', 'control_tenant']) || check.ok !== true || check.component !== 'host-receipt' ||
+    check.check !== 'daemon_control_tenant_match' || check.daemon_tenant !== target.tenant || check.control_tenant !== target.tenant) return null
+
+  check = take()
+  const hashes = validateDefinitionEvidence(check, service)
+  if (!hashes || check.definition_dir !== receipt.inputs.service_definition_dir) return null
+  for (const [key, name] of [['heartbeat', 'heartbeat_service_running'], ['control', 'control_service_running']]) {
+    check = take()
+    if (!hasExactKeys(check, ['ok', 'component', 'check', 'service']) || check.ok !== true || check.component !== 'host-services' ||
+      check.check !== name || !sameJson(check.service, service.services?.[key])) return null
+  }
+  check = take()
+  if (!hasExactKeys(check, ['ok', 'component', 'check', 'service_manager', 'applicable', 'linger']) || check.ok !== true ||
+    check.component !== 'host-services' || check.check !== 'systemd_linger_enabled' || check.service_manager !== service.manager ||
+    check.applicable !== (service.manager === 'systemd') || !sameJson(check.linger, service.linger)) return null
+
+  if (receipt.inputs.exec_probes) {
+    for (const agentId of target.daemon_agents) {
+      check = take()
+      if (!hasExactKeys(check, ['ok', 'component', 'check', 'agent_id']) || check.ok !== true || check.component !== 'fleet-daemon' ||
+        check.check !== 'probe_exec_alive' || check.agent_id !== agentId) return null
+    }
+  }
+  if (index !== checks.length) return null
+  return { target, definition_hashes: hashes }
+}
+
 function containsCanonicalSecret(value) {
   if (typeof value === 'string') return SECRET_VALUE_PATTERNS.some(([, pattern]) => pattern.test(value))
   if (Array.isArray(value)) return value.some(containsCanonicalSecret)
