@@ -118,7 +118,8 @@ export function formatPlan(opts = {}) {
   lines.push('')
   lines.push(`Goal: prove package version, public API version, changelog, roadmap, Git tag, milestone, and GitHub Release all agree on ${tag}.`)
   lines.push('')
-  lines.push('Run only after host, external PR cycle, staging recovery, and production soak receipts are passing.')
+  lines.push('Run only after the prepublication readiness receipt passes and the exact release commit is tagged and published.')
+  lines.push('Remove release-control trackers #281, #284, and #345 from the product milestone, then close that milestone only after its product-objective issue count reaches zero.')
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', outDir]))
   lines.push('')
@@ -266,6 +267,7 @@ export function checkBundle(opts = {}) {
   const artifacts = {}
 
   const packagePath = repoPath(repoRoot, 'package.json')
+  const packageLockPath = repoPath(repoRoot, 'package-lock.json')
   const versionPath = repoPath(repoRoot, 'src/version.ts')
   const mcpPath = repoPath(repoRoot, 'src/mcp/index.ts')
   const changelogPath = repoPath(repoRoot, 'CHANGELOG.md')
@@ -273,6 +275,7 @@ export function checkBundle(opts = {}) {
   const releaseDocPath = repoPath(repoRoot, 'docs/releases/v0.23.0-trusted-runtime.md')
 
   const packageText = readText(checks, packagePath, 'package')
+  const packageLockText = readText(checks, packageLockPath, 'package_lock')
   const versionSource = readText(checks, versionPath, 'public_api_version')
   const mcpSource = readText(checks, mcpPath, 'mcp_public_api_surface')
   const changelog = readText(checks, changelogPath, 'changelog')
@@ -280,6 +283,7 @@ export function checkBundle(opts = {}) {
   const releaseDoc = readText(checks, releaseDocPath, 'release_doc')
 
   artifacts.package = artifactMeta(packagePath, packageText)
+  artifacts.package_lock = artifactMeta(packageLockPath, packageLockText)
   artifacts.public_api_version = artifactMeta(versionPath, versionSource)
   artifacts.mcp_public_api_surface = artifactMeta(mcpPath, mcpSource)
   artifacts.changelog = artifactMeta(changelogPath, changelog)
@@ -296,6 +300,30 @@ export function checkBundle(opts = {}) {
     }
   }
   pushCheck(checks, packageVersion === semver, 'package_version_matches_expected', { expected: semver, actual: packageVersion || null })
+
+  let packageLockVersion = ''
+  let packageLockRootVersion = ''
+  if (packageLockText) {
+    try {
+      const packageLock = JSON.parse(packageLockText)
+      packageLockVersion = packageLock?.version || ''
+      packageLockRootVersion = packageLock?.packages?.['']?.version || ''
+      pushCheck(checks, true, 'package_lock_json_parseable', { path: packageLockPath })
+    } catch (err) {
+      pushCheck(checks, false, 'package_lock_json_parseable', {
+        path: packageLockPath,
+        reason: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+  pushCheck(checks, packageLockVersion === semver, 'package_lock_version_matches_expected', {
+    expected: semver,
+    actual: packageLockVersion || null,
+  })
+  pushCheck(checks, packageLockRootVersion === semver, 'package_lock_root_version_matches_expected', {
+    expected: semver,
+    actual: packageLockRootVersion || null,
+  })
 
   const publicApiVersion = versionSource ? extractPublicApiVersion(versionSource) : ''
   pushCheck(checks, publicApiVersion === semver, 'public_api_version_matches_expected', { expected: semver, actual: publicApiVersion || null })
@@ -343,13 +371,18 @@ export function checkBundle(opts = {}) {
   const releaseDraft = Boolean(field(release, 'draft', 'isDraft'))
   const releasePrerelease = Boolean(field(release, 'prerelease', 'isPrerelease'))
   const releaseTarget = String(field(release, 'target_commitish', 'targetCommitish') ?? '')
+  const releasePublishedAt = String(field(release, 'published_at', 'publishedAt') ?? '')
   pushCheck(checks, Boolean(release), 'github_release_present_for_version', { path: releasePath })
   pushCheck(checks, releaseTag === tag, 'github_release_tag_matches_expected', { expected: tag, actual: releaseTag || null })
   pushCheck(checks, releaseName.includes(tag) || releaseName.includes(semver), 'github_release_name_matches_version', { expected: tag, actual: releaseName || null })
   pushCheck(checks, releaseDraft === false, 'github_release_is_not_draft', { actual: releaseDraft })
   pushCheck(checks, releasePrerelease === false, 'github_release_is_not_prerelease', { actual: releasePrerelease })
-  pushCheck(checks, Boolean(releaseTarget), 'github_release_target_recorded', {
-    target_commitish: releaseTarget || null,
+  pushCheck(checks, Boolean(tagSha && releaseTarget === tagSha), 'github_release_target_matches_tag_commit', {
+    expected: tagSha || null,
+    actual: releaseTarget || null,
+  })
+  pushCheck(checks, Boolean(releasePublishedAt && !Number.isNaN(Date.parse(releasePublishedAt))), 'github_release_published_at_present', {
+    actual: releasePublishedAt || null,
   })
 
   const failed = checks.filter((check) => check.ok === false)
@@ -365,6 +398,8 @@ export function checkBundle(opts = {}) {
       version: semver,
       tag,
       package_version: packageVersion || null,
+      package_lock_version: packageLockVersion || null,
+      package_lock_root_version: packageLockRootVersion || null,
       public_api_version: publicApiVersion || null,
       git_tag_sha: tagSha || null,
       github_tag_sha: githubTagSha || null,
@@ -380,8 +415,10 @@ export function checkBundle(opts = {}) {
     artifacts,
     checks,
     next_steps: failed.length === 0
-      ? ['attach release-integrity-check.json to the v0.23 release tracker before publishing the stable release']
-      : ['align failing release metadata, export fresh GitHub milestone/release JSON, then rerun release-integrity-receipt --check'],
+      ? ['attach release-integrity-check.json to #281, close #281, then run final release readiness']
+      : milestoneState !== 'closed' || milestoneOpenIssues !== 0
+        ? ['remove release-control trackers #281, #284, and #345 from the product milestone, close the zero-open product milestone, then rerun']
+        : ['align failing release metadata, export fresh GitHub milestone/release JSON, then rerun release-integrity-receipt --check'],
   }
 }
 

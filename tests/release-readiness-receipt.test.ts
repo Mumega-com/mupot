@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { buildBundle, exportBundle } from '../fleet-runtime/receipt-bundle.mjs'
 import {
   CHECK_RECEIPT_TYPE,
+  PREPUBLICATION_CHECK_RECEIPT_TYPE,
   REQUIRED_APP_PERMISSIONS,
   REQUIRED_CHECKS,
   REQUIRED_ISSUES,
@@ -30,6 +31,7 @@ function sha256(path: string) {
 
 const HOST_BASE_URL = 'https://pot.example.org'
 const HOST_TENANT = 'tenant-a'
+const RELEASE_SHA = 'a'.repeat(40)
 
 function hostProbeReceipt() {
   return {
@@ -147,17 +149,31 @@ async function writeBundle(dir: string, mutate?: (dir: string) => void) {
   writeJson(join(dir, 'github-pr.json'), {
     number: 285,
     url: 'https://github.test/pull/285',
-    state: 'OPEN',
+    state: 'MERGED',
     isDraft: false,
     headRefName: 'codex/v0.23-rc',
-    headRefOid: 'abc123',
+    headRefOid: 'b'.repeat(40),
     baseRefName: 'main',
     mergeStateStatus: 'CLEAN',
+    mergeCommit: { oid: RELEASE_SHA },
     statusCheckRollup: REQUIRED_CHECKS.map((name) => ({
       name,
       conclusion: 'SUCCESS',
       status: 'COMPLETED',
       link: `https://github.test/checks/${encodeURIComponent(name)}`,
+    })),
+  })
+
+  writeJson(join(dir, 'github-commit.json'), {
+    sha: RELEASE_SHA,
+    html_url: `https://github.test/commit/${RELEASE_SHA}`,
+  })
+  writeJson(join(dir, 'github-commit-checks.json'), {
+    check_runs: REQUIRED_CHECKS.map((name) => ({
+      name,
+      conclusion: 'success',
+      status: 'completed',
+      html_url: `https://github.test/checks/${encodeURIComponent(name)}`,
     })),
   })
 
@@ -194,6 +210,8 @@ describe('release readiness receipt checker', () => {
     expect(parseArgs(['--plan', '--version', 'v0.23.0']).plan).toBe(true)
     expect(parseArgs(['--check', '--out-dir', './tmp/release-readiness']).check).toBe(true)
     expect(parseArgs(['--plan', '--checks-pr', '285']).checksPr).toBe('285')
+    expect(parseArgs(['--plan', '--release-sha', RELEASE_SHA]).releaseSha).toBe(RELEASE_SHA)
+    expect(parseArgs(['--plan', '--phase', 'prepublication']).phase).toBe('prepublication')
   })
 
   it('prints the final release-readiness evidence plan', () => {
@@ -202,6 +220,7 @@ describe('release readiness receipt checker', () => {
       version: 'v0.23.0',
       repo: 'Mumega-com/mupot',
       checksPr: '285',
+      releaseSha: RELEASE_SHA,
     })
 
     expect(plan).toContain('Mupot v0.23 final release-readiness evidence plan')
@@ -211,8 +230,12 @@ describe('release readiness receipt checker', () => {
     expect(plan).toContain('github-issues.json')
     expect(plan).toContain('github-pr.json')
     expect(plan).toContain('gh pr view 285 --repo Mumega-com/mupot')
+    expect(plan).toContain('mergeCommit')
     expect(plan).toContain('github-checks.json')
     expect(plan).toContain('gh pr checks --repo Mumega-com/mupot 285')
+    expect(plan).toContain(`repos/Mumega-com/mupot/commits/${RELEASE_SHA}`)
+    expect(plan).toContain('github-commit.json')
+    expect(plan).toContain('github-commit-checks.json')
     expect(plan).toContain('github-app.json')
     expect(plan).toContain('github-installation.json')
     expect(plan).toContain('--installation-id')
@@ -227,7 +250,7 @@ describe('release readiness receipt checker', () => {
     const dir = tempDir()
     await writeBundle(dir)
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
 
     expect(receipt.receipt_type).toBe(CHECK_RECEIPT_TYPE)
     expect(receipt.status).toBe('pass')
@@ -254,6 +277,94 @@ describe('release readiness receipt checker', () => {
     }))
   })
 
+  it('passes prepublication readiness without the postpublication integrity receipt', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      rmSync(join(dir, 'release-integrity-check.json'))
+      writeJson(join(dir, 'stable-deployment-check.json'), {
+        receipt_type: 'mupot-stable-deployment/v1',
+        status: 'pass',
+        target: {
+          version: 'v0.23.0',
+          commit: RELEASE_SHA,
+        },
+      })
+      writeJson(join(dir, 'github-issues.json'), [
+        ...REQUIRED_ISSUES.filter((number) => number !== 281).map((number) => ({
+          number,
+          state: 'CLOSED',
+        })),
+        { number: 281, state: 'OPEN' },
+        { number: 284, state: 'OPEN' },
+      ])
+    })
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase: 'prepublication',
+    })
+
+    expect(receipt.receipt_type).toBe(PREPUBLICATION_CHECK_RECEIPT_TYPE)
+    expect(receipt.phase).toBe('prepublication')
+    expect(receipt.status).toBe('pass')
+    expect(receipt.required.receipts).not.toContainEqual(expect.objectContaining({ issue: 281 }))
+    expect(receipt.required.receipts).toContainEqual(expect.objectContaining({
+      file: 'stable-deployment-check.json',
+      receipt_type: 'mupot-stable-deployment/v1',
+    }))
+  })
+
+  it('fails prepublication readiness when the stable deployment is from another commit', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      rmSync(join(dir, 'release-integrity-check.json'))
+      writeJson(join(dir, 'stable-deployment-check.json'), {
+        receipt_type: 'mupot-stable-deployment/v1',
+        status: 'pass',
+        target: {
+          version: 'v0.23.0',
+          commit: 'e'.repeat(40),
+        },
+      })
+    })
+
+    const receipt = checkBundle({
+      outDir: dir,
+      version: 'v0.23.0',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase: 'prepublication',
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'stable_deployment_commit_matches_release_sha',
+      expected: RELEASE_SHA,
+      actual: 'e'.repeat(40),
+    }))
+  })
+
+  it('prints a prepublication plan that excludes final integrity and requires stable deployment', () => {
+    const plan = formatPlan({
+      outDir: 'tmp/release-readiness/v0.23.0',
+      version: 'v0.23.0',
+      repo: 'Mumega-com/mupot',
+      checksPr: '285',
+      releaseSha: RELEASE_SHA,
+      phase: 'prepublication',
+    })
+
+    expect(plan).toContain('prepublication-readiness evidence plan')
+    expect(plan).toContain('stable-deployment-check.json')
+    expect(plan).not.toContain('release-integrity-check.json')
+    expect(plan).toContain('--phase prepublication')
+    expect(plan).toContain('prepublication-readiness-check.json')
+  })
+
   it('fails when an artifact in the copied host bundle is changed after export', async () => {
     const dir = tempDir()
     await writeBundle(dir)
@@ -262,7 +373,7 @@ describe('release readiness receipt checker', () => {
     host.generated_at = '2026-07-10T02:00:00.000Z'
     writeJson(hostPath, host)
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
@@ -282,7 +393,7 @@ describe('release readiness receipt checker', () => {
       })
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
@@ -301,7 +412,7 @@ describe('release readiness receipt checker', () => {
       })))
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
@@ -321,7 +432,7 @@ describe('release readiness receipt checker', () => {
       })))
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
@@ -342,7 +453,7 @@ describe('release readiness receipt checker', () => {
       })
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
@@ -363,7 +474,7 @@ describe('release readiness receipt checker', () => {
       })
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
@@ -389,7 +500,7 @@ describe('release readiness receipt checker', () => {
       })
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
@@ -407,7 +518,7 @@ describe('release readiness receipt checker', () => {
       writeJson(join(dir, 'github-installation.json'), installation)
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
@@ -430,7 +541,7 @@ describe('release readiness receipt checker', () => {
       })
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
@@ -454,13 +565,85 @@ describe('release readiness receipt checker', () => {
       })
     })
 
-    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285' })
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
 
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
       check: 'required_pr_rollup_check_passed',
       check_name: 'CodeQL',
+    }))
+  })
+
+  it('fails when the named release PR did not merge to the release SHA on main', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'github-pr.json'), {
+        number: 285,
+        state: 'MERGED',
+        isDraft: false,
+        baseRefName: 'develop',
+        mergeCommit: { oid: 'c'.repeat(40) },
+        statusCheckRollup: REQUIRED_CHECKS.map((name) => ({
+          name,
+          conclusion: 'SUCCESS',
+          status: 'COMPLETED',
+        })),
+      })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'release_pr_targets_main',
+    }))
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'release_pr_merge_commit_matches_release_sha',
+      expected: RELEASE_SHA,
+    }))
+  })
+
+  it('fails when passing checks were exported from a different commit', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'github-commit.json'), {
+        sha: 'd'.repeat(40),
+      })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'github_commit_matches_release_sha',
+      expected: RELEASE_SHA,
+      actual: 'd'.repeat(40),
+    }))
+  })
+
+  it('fails when a required check did not pass on the exact release commit', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'github-commit-checks.json'), {
+        check_runs: REQUIRED_CHECKS.map((name) => ({
+          name,
+          conclusion: name === 'local-evidence' ? 'failure' : 'success',
+          status: 'completed',
+        })),
+      })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'required_release_commit_check_passed',
+      check_name: 'local-evidence',
     }))
   })
 })

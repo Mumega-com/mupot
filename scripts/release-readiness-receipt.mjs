@@ -21,6 +21,7 @@ import {
 export { REQUIRED_APP_PERMISSIONS } from './github-app-permissions-receipt.mjs'
 
 export const CHECK_RECEIPT_TYPE = 'mupot-v023-release-readiness/v1'
+export const PREPUBLICATION_CHECK_RECEIPT_TYPE = 'mupot-v023-prepublication-readiness/v1'
 
 const DEFAULT_VERSION = 'v0.23.0'
 const DEFAULT_REPO = 'Mumega-com/mupot'
@@ -39,10 +40,16 @@ export const REQUIRED_RECEIPTS = [
   { objective: 9, issue: 281, file: 'release-integrity-check.json', receipt_type: 'mupot-release-integrity/v1' },
 ]
 
+export const PREPUBLICATION_REQUIRED_RECEIPTS = [
+  ...REQUIRED_RECEIPTS.filter((receipt) => receipt.issue !== 281),
+  { objective: 11, issue: 345, file: 'stable-deployment-check.json', receipt_type: 'mupot-stable-deployment/v1' },
+]
+
 // #319 closes the live board/task-mirror/PR repository divergence found while
 // collecting #150 evidence. Keep it in the final release audit so that proof
 // cannot be treated as complete if its fail-closed guard is reopened.
 export const REQUIRED_ISSUES = [150, 151, 274, 277, 279, 281, 282, 283, 319, 323]
+export const PREPUBLICATION_REQUIRED_ISSUES = REQUIRED_ISSUES.filter((issue) => issue !== 281)
 
 export const REQUIRED_CHECKS = [
   'build',
@@ -72,6 +79,8 @@ export function parseArgs(argv) {
     version: DEFAULT_VERSION,
     repo: DEFAULT_REPO,
     checksPr: '',
+    releaseSha: '',
+    phase: 'final',
     plan: false,
     check: false,
     summary: false,
@@ -90,6 +99,8 @@ export function parseArgs(argv) {
     else if (arg === '--version') opts.version = normalizeTag(next())
     else if (arg === '--repo') opts.repo = next()
     else if (arg === '--checks-pr') opts.checksPr = next()
+    else if (arg === '--release-sha') opts.releaseSha = next()
+    else if (arg === '--phase') opts.phase = normalizePhase(next())
     else if (arg === '--plan') opts.plan = true
     else if (arg === '--check') opts.check = true
     else if (arg === '--summary') opts.summary = true
@@ -112,6 +123,8 @@ export function usage() {
     '  --version <version> expected version; default v0.23.0',
     '  --repo <owner/repo> GitHub repo; default Mumega-com/mupot',
     '  --checks-pr <number> PR number whose required checks prove this release candidate',
+    '  --release-sha <sha>  exact merged release commit whose checks must pass',
+    '  --phase <phase>       prepublication or final; default final',
     '  -h, --help          show this help',
   ].join('\n')
 }
@@ -133,6 +146,14 @@ function normalizeTag(version) {
   return `v${semver}`
 }
 
+function normalizePhase(phase) {
+  const value = String(phase || 'final').trim().toLowerCase()
+  if (value !== 'prepublication' && value !== 'final') {
+    throw new Error(`expected phase prepublication or final, got ${phase}`)
+  }
+  return value
+}
+
 function defaultOutDir(opts) {
   const tag = normalizeTag(opts.version || DEFAULT_VERSION)
   return opts.outDir || `tmp/release-readiness/${tag}`
@@ -142,12 +163,20 @@ export function formatPlan(opts = {}) {
   const version = normalizeTag(opts.version || DEFAULT_VERSION)
   const repo = opts.repo || DEFAULT_REPO
   const checksPr = opts.checksPr || '<release-pr-number>'
+  const releaseSha = opts.releaseSha || '<release-commit-sha>'
+  const phase = normalizePhase(opts.phase)
+  const requiredReceipts = phase === 'prepublication' ? PREPUBLICATION_REQUIRED_RECEIPTS : REQUIRED_RECEIPTS
+  const outputFile = phase === 'prepublication' ? 'prepublication-readiness-check.json' : 'release-readiness-check.json'
   const outDir = defaultOutDir({ ...opts, version })
   const lines = []
 
-  lines.push('Mupot v0.23 final release-readiness evidence plan')
+  lines.push(phase === 'prepublication'
+    ? 'Mupot v0.23 prepublication-readiness evidence plan'
+    : 'Mupot v0.23 final release-readiness evidence plan')
   lines.push('')
-  lines.push(`Goal: prove every v0.23.0 Trusted Runtime objective has passing evidence before publishing ${version}.`)
+  lines.push(phase === 'prepublication'
+    ? `Goal: prove the exact merged and deployed ${version} commit is safe to publish.`
+    : `Goal: prove every v0.23.0 Trusted Runtime objective has passing postpublication evidence.`)
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', join(outDir, 'host-go')]))
   lines.push('')
@@ -155,11 +184,11 @@ export function formatPlan(opts = {}) {
   lines.push('The final checker reruns the read-only fleet manifest verifier against that copied directory.')
   lines.push('')
   lines.push('Copy or attach these passing receipt files into the aggregate directory:')
-  for (const receipt of REQUIRED_RECEIPTS) {
+  for (const receipt of requiredReceipts) {
     lines.push(`- ${receipt.file} (${receipt.receipt_type}, issue #${receipt.issue}, objective ${receipt.objective})`)
   }
   lines.push('')
-  lines.push('Export GitHub issue state and checks from the release-candidate PR:')
+  lines.push('Export GitHub issue state, the release PR, and checks from the exact merged release commit:')
   lines.push(commandLine([
     'gh',
     'issue',
@@ -181,7 +210,7 @@ export function formatPlan(opts = {}) {
     '--repo',
     repo,
     '--json',
-    'number,url,state,isDraft,headRefName,headRefOid,baseRefName,mergeStateStatus,statusCheckRollup',
+    'number,url,state,isDraft,headRefName,headRefOid,baseRefName,mergeStateStatus,mergeCommit,statusCheckRollup',
   ], ` > ${shellQuote(join(outDir, GITHUB_PR_FILE))}`))
   lines.push(commandLine([
     'gh',
@@ -193,6 +222,18 @@ export function formatPlan(opts = {}) {
     '--json',
     'name,state,link,bucket',
   ], ` > ${shellQuote(join(outDir, 'github-checks.json'))}`))
+  lines.push(commandLine([
+    'gh',
+    'api',
+    `repos/${repo}/commits/${releaseSha}`,
+    '--jq',
+    '{sha: .sha, html_url: .html_url}',
+  ], ` > ${shellQuote(join(outDir, 'github-commit.json'))}`))
+  lines.push(commandLine([
+    'gh',
+    'api',
+    `repos/${repo}/commits/${releaseSha}/check-runs?per_page=100`,
+  ], ` > ${shellQuote(join(outDir, 'github-commit-checks.json'))}`))
   lines.push('')
   lines.push('Export the live GitHub App definition and re-accepted installation after #151 is remediated with the authenticated GitHub CLI. The final release plan deliberately does not read, copy, print, or rotate the Worker-confined App private key:')
   lines.push(`The export command writes ${join(outDir, APP_FILE)} and ${join(outDir, INSTALLATION_FILE)}.`)
@@ -244,7 +285,11 @@ export function formatPlan(opts = {}) {
     outDir,
     '--checks-pr',
     checksPr,
-  ], ` > ${shellQuote(join(outDir, 'release-readiness-check.json'))}`))
+    '--release-sha',
+    releaseSha,
+    '--phase',
+    phase,
+  ], ` > ${shellQuote(join(outDir, outputFile))}`))
   lines.push(commandLine([
     'node',
     'scripts/release-readiness-receipt.mjs',
@@ -258,6 +303,10 @@ export function formatPlan(opts = {}) {
     outDir,
     '--checks-pr',
     checksPr,
+    '--release-sha',
+    releaseSha,
+    '--phase',
+    phase,
   ]))
   return `${lines.join('\n')}\n`
 }
@@ -315,6 +364,7 @@ function issueEntries(parsed) {
 function checkEntries(parsed) {
   if (Array.isArray(parsed)) return parsed
   if (Array.isArray(parsed?.checks)) return parsed.checks
+  if (Array.isArray(parsed?.check_runs)) return parsed.check_runs
   if (Array.isArray(parsed?.statusCheckRollup)) return parsed.statusCheckRollup
   return []
 }
@@ -324,6 +374,11 @@ function expectedPrNumber(checksPr) {
   if (!raw) return null
   const number = Number(raw)
   return Number.isInteger(number) && number > 0 ? number : null
+}
+
+function expectedReleaseSha(releaseSha) {
+  const raw = String(releaseSha ?? '').trim().toLowerCase()
+  return /^[0-9a-f]{40}$/.test(raw) ? raw : null
 }
 
 function checkSucceeded(entry) {
@@ -358,16 +413,21 @@ function pushPermissionChecks(checks, parsed, prefix) {
 
 export function checkBundle(opts = {}) {
   const version = normalizeTag(opts.version || DEFAULT_VERSION)
+  const phase = normalizePhase(opts.phase)
   const outDir = resolve(defaultOutDir({ ...opts, version }))
   const checksPr = expectedPrNumber(opts.checksPr)
+  const releaseSha = expectedReleaseSha(opts.releaseSha)
   const checks = []
   const artifacts = {}
   const receiptValues = new Map()
+  const requiredReceipts = phase === 'prepublication' ? PREPUBLICATION_REQUIRED_RECEIPTS : REQUIRED_RECEIPTS
+  const requiredIssues = phase === 'prepublication' ? PREPUBLICATION_REQUIRED_ISSUES : REQUIRED_ISSUES
 
   pushCheck(checks, existsSync(outDir), 'evidence_directory_present', { out_dir: outDir })
   pushCheck(checks, checksPr !== null, 'checks_pr_specified', { actual: opts.checksPr ?? null })
+  pushCheck(checks, releaseSha !== null, 'release_sha_specified', { actual: opts.releaseSha ?? null })
 
-  for (const required of REQUIRED_RECEIPTS) {
+  for (const required of requiredReceipts) {
     const path = join(outDir, required.file)
     const receipt = readJson(checks, path, required.file)
     receiptValues.set(required.file, receipt)
@@ -384,6 +444,20 @@ export function checkBundle(opts = {}) {
       actual: receipt?.status ?? null,
       objective: required.objective,
       issue: required.issue,
+    })
+  }
+
+  if (phase === 'prepublication') {
+    const stableDeployment = receiptValues.get('stable-deployment-check.json')
+    const stableCommit = String(stableDeployment?.target?.commit ?? stableDeployment?.target?.release_sha ?? '').toLowerCase()
+    const stableVersion = String(stableDeployment?.target?.version ?? stableDeployment?.target?.tag ?? '')
+    pushCheck(checks, Boolean(releaseSha && stableCommit === releaseSha), 'stable_deployment_commit_matches_release_sha', {
+      expected: releaseSha,
+      actual: stableCommit || null,
+    })
+    pushCheck(checks, stableVersion === version, 'stable_deployment_version_matches_release', {
+      expected: version,
+      actual: stableVersion || null,
     })
   }
 
@@ -404,7 +478,7 @@ export function checkBundle(opts = {}) {
   const issuesJson = readJson(checks, issuesPath, 'github_issues')
   artifacts['github-issues.json'] = artifactMeta(issuesPath, issuesJson)
   const issues = issueEntries(issuesJson)
-  for (const issueNumber of REQUIRED_ISSUES) {
+  for (const issueNumber of requiredIssues) {
     const issue = issues.find((entry) => Number(entry?.number) === issueNumber)
     pushCheck(checks, Boolean(issue), 'required_issue_exported', { issue: issueNumber })
     pushCheck(checks, String(issue?.state ?? '').toUpperCase() === 'CLOSED', 'required_issue_closed', {
@@ -438,6 +512,21 @@ export function checkBundle(opts = {}) {
     expected: checksPr,
     actual: prJson?.number ?? null,
   })
+  pushCheck(checks, String(prJson?.state ?? '').toUpperCase() === 'MERGED', 'release_pr_is_merged', {
+    actual: prJson?.state ?? null,
+  })
+  pushCheck(checks, prJson?.isDraft === false, 'release_pr_is_not_draft', {
+    actual: prJson?.isDraft ?? null,
+  })
+  pushCheck(checks, prJson?.baseRefName === 'main', 'release_pr_targets_main', {
+    expected: 'main',
+    actual: prJson?.baseRefName ?? null,
+  })
+  const mergeCommitSha = String(prJson?.mergeCommit?.oid ?? '').toLowerCase()
+  pushCheck(checks, Boolean(releaseSha && mergeCommitSha === releaseSha), 'release_pr_merge_commit_matches_release_sha', {
+    expected: releaseSha,
+    actual: mergeCommitSha || null,
+  })
   const prChecks = checkEntries(prJson)
   for (const requiredName of REQUIRED_CHECKS) {
     const matching = prChecks.filter((entry) => String(entry?.name ?? '') === requiredName)
@@ -449,6 +538,32 @@ export function checkBundle(opts = {}) {
         conclusion: entry?.conclusion ?? null,
         state: entry?.state ?? entry?.status ?? null,
         bucket: entry?.bucket ?? null,
+      })),
+    })
+  }
+
+  const commitPath = join(outDir, 'github-commit.json')
+  const commitJson = readJson(checks, commitPath, 'github_commit')
+  artifacts['github-commit.json'] = artifactMeta(commitPath, commitJson)
+  const exportedCommitSha = String(commitJson?.sha ?? '').toLowerCase()
+  pushCheck(checks, Boolean(releaseSha && exportedCommitSha === releaseSha), 'github_commit_matches_release_sha', {
+    expected: releaseSha,
+    actual: exportedCommitSha || null,
+  })
+
+  const commitChecksPath = join(outDir, 'github-commit-checks.json')
+  const commitChecksJson = readJson(checks, commitChecksPath, 'github_commit_checks')
+  artifacts['github-commit-checks.json'] = artifactMeta(commitChecksPath, commitChecksJson)
+  const releaseCommitChecks = checkEntries(commitChecksJson)
+  for (const requiredName of REQUIRED_CHECKS) {
+    const matching = releaseCommitChecks.filter((entry) => String(entry?.name ?? '') === requiredName)
+    pushCheck(checks, matching.length > 0, 'required_release_commit_check_exported', { check_name: requiredName })
+    pushCheck(checks, matching.some(checkSucceeded), 'required_release_commit_check_passed', {
+      check_name: requiredName,
+      observed: matching.map((entry) => ({
+        name: entry?.name ?? null,
+        conclusion: entry?.conclusion ?? null,
+        state: entry?.state ?? entry?.status ?? null,
       })),
     })
   }
@@ -490,33 +605,38 @@ export function checkBundle(opts = {}) {
   const failed = checks.filter((check) => check.ok === false)
   const passed = checks.filter((check) => check.ok === true)
   return {
-    receipt_type: CHECK_RECEIPT_TYPE,
+    receipt_type: phase === 'prepublication' ? PREPUBLICATION_CHECK_RECEIPT_TYPE : CHECK_RECEIPT_TYPE,
     status: failed.length === 0 ? 'pass' : 'fail',
+    phase,
     checked_at: new Date().toISOString(),
     version,
     repo: opts.repo || DEFAULT_REPO,
     checks_pr: checksPr,
+    release_sha: releaseSha,
     out_dir: outDir,
     summary: {
       passed: passed.length,
       failed: failed.length,
       total: checks.length,
-      required_receipts: REQUIRED_RECEIPTS.length,
-      required_issues: REQUIRED_ISSUES.length,
+      required_receipts: requiredReceipts.length,
+      required_issues: requiredIssues.length,
       required_ci_checks: REQUIRED_CHECKS.length,
       required_app_permissions: Object.keys(REQUIRED_APP_PERMISSIONS).length,
     },
     required: {
-      receipts: REQUIRED_RECEIPTS,
-      issues: REQUIRED_ISSUES,
+      receipts: requiredReceipts,
+      issues: requiredIssues,
       ci_checks: REQUIRED_CHECKS,
       checks_pr: checksPr,
+      release_sha: releaseSha,
       app_permissions: REQUIRED_APP_PERMISSIONS,
     },
     artifacts,
     checks,
     next_steps: failed.length === 0
-      ? ['publish v0.23.0 only after attaching this aggregate release-readiness receipt to the release tracker']
+      ? [phase === 'prepublication'
+          ? 'publish only this exact release SHA, then run postpublication integrity and final readiness'
+          : 'attach this final aggregate release-readiness receipt to the release tracker']
       : ['collect or fix the failing objective evidence, export fresh GitHub state, then rerun release-readiness-receipt --check'],
   }
 }

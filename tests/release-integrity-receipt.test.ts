@@ -33,6 +33,17 @@ function writeRepo(mutate?: (repo: string, outDir: string) => void) {
     name: 'mupot',
     version: VERSION,
   }, null, 2))
+  writeFileSync(join(repo, 'package-lock.json'), JSON.stringify({
+    name: 'mupot',
+    version: VERSION,
+    lockfileVersion: 3,
+    packages: {
+      '': {
+        name: 'mupot',
+        version: VERSION,
+      },
+    },
+  }, null, 2))
   writeFileSync(join(repo, 'src', 'version.ts'), `export const MUPOT_PUBLIC_API_VERSION = '${VERSION}' as const\n`)
   writeFileSync(join(repo, 'src', 'mcp', 'index.ts'), [
     "import { MUPOT_PUBLIC_API_VERSION } from '../version'",
@@ -52,10 +63,9 @@ function writeRepo(mutate?: (repo: string, outDir: string) => void) {
     name: `${TAG} - Trusted Runtime`,
     isDraft: false,
     isPrerelease: false,
-    targetCommitish: 'main',
+    targetCommitish: 'pending',
+    publishedAt: '2026-07-13T00:00:00Z',
   }, null, 2))
-
-  mutate?.(repo, outDir)
 
   execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' })
   git(repo, ['add', '.'])
@@ -66,6 +76,16 @@ function writeRepo(mutate?: (repo: string, outDir: string) => void) {
     sha: tagSha,
     html_url: `https://github.test/commit/${tagSha}`,
   }, null, 2))
+  writeFileSync(join(outDir, 'github-release.json'), JSON.stringify({
+    tagName: TAG,
+    name: `${TAG} - Trusted Runtime`,
+    isDraft: false,
+    isPrerelease: false,
+    targetCommitish: tagSha,
+    publishedAt: '2026-07-13T00:00:00Z',
+  }, null, 2))
+
+  mutate?.(repo, outDir)
 
   return { repo, outDir }
 }
@@ -85,11 +105,13 @@ describe('release integrity receipt checker', () => {
     })
 
     expect(plan).toContain('Mupot v0.23 release-integrity evidence plan')
+    expect(plan).toContain('Remove release-control trackers #281, #284, and #345 from the product milestone')
     expect(plan).toContain('gh api repos/Mumega-com/mupot/milestones')
     expect(plan).toContain('gh release view v0.23.0')
     expect(plan).toContain('repos/Mumega-com/mupot/commits/v0.23.0')
     expect(plan).toContain('github-tag.json')
     expect(plan).toContain('release-integrity-check.json')
+    expect(plan).not.toContain('production soak')
   })
 
   it('passes when local metadata, git tag, milestone, and release agree', () => {
@@ -108,6 +130,9 @@ describe('release integrity receipt checker', () => {
     expect(receipt.target.public_api_version).toBe(VERSION)
     expect(receipt.target.release_tag).toBe(TAG)
     expect(receipt.target.github_tag_sha).toBe(receipt.target.git_tag_sha)
+    expect(receipt.next_steps).toContain(
+      'attach release-integrity-check.json to #281, close #281, then run final release readiness',
+    )
   })
 
   it('fails when package and public API versions are not aligned', () => {
@@ -132,6 +157,34 @@ describe('release integrity receipt checker', () => {
     }))
   })
 
+  it('fails when the lockfile root versions do not match the stable package', () => {
+    const { repo, outDir } = writeRepo((repoRoot) => {
+      writeFileSync(join(repoRoot, 'package-lock.json'), JSON.stringify({
+        name: 'mupot',
+        version: '0.23.0-rc.1',
+        lockfileVersion: 3,
+        packages: {
+          '': {
+            name: 'mupot',
+            version: '0.23.0-rc.1',
+          },
+        },
+      }, null, 2))
+    })
+
+    const receipt = checkBundle({ repoRoot: repo, outDir, version: TAG })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'package_lock_version_matches_expected',
+    }))
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'package_lock_root_version_matches_expected',
+    }))
+  })
+
   it('fails when the GitHub milestone still has open issues', () => {
     const { repo, outDir } = writeRepo((_, evidenceDir) => {
       writeFileSync(join(evidenceDir, 'github-milestone.json'), JSON.stringify({
@@ -152,6 +205,9 @@ describe('release integrity receipt checker', () => {
       ok: false,
       check: 'github_milestone_has_no_open_issues',
     }))
+    expect(receipt.next_steps).toContain(
+      'remove release-control trackers #281, #284, and #345 from the product milestone, close the zero-open product milestone, then rerun',
+    )
   })
 
   it('fails when the stable GitHub release evidence is missing', () => {
@@ -170,6 +226,30 @@ describe('release integrity receipt checker', () => {
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
       check: 'github_release_tag_matches_expected',
+    }))
+  })
+
+  it('fails when the stable release is unpublished or targets another commit', () => {
+    const { repo, outDir } = writeRepo()
+    writeFileSync(join(outDir, 'github-release.json'), JSON.stringify({
+      tagName: TAG,
+      name: `${TAG} - Trusted Runtime`,
+      isDraft: false,
+      isPrerelease: false,
+      targetCommitish: 'f'.repeat(40),
+      publishedAt: null,
+    }, null, 2))
+
+    const receipt = checkBundle({ repoRoot: repo, outDir, version: TAG })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'github_release_published_at_present',
+    }))
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'github_release_target_matches_tag_commit',
     }))
   })
 

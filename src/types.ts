@@ -62,6 +62,8 @@ export interface Env {
   TENANT_SLUG: string
   BRAND: string
   OAUTH_PROVIDER: 'google' | 'telegram'
+  // Immutable git commit for the deployed build, supplied by the release deploy.
+  RELEASE_SHA?: string
   // The pot's canonical public origin (e.g. https://agents.digid.ca). When set, the
   // orient brief pins its MCP endpoint to THIS instead of echoing the request Host
   // header (which is client-influenceable and renders into a DIRECTIVE surface). #88.

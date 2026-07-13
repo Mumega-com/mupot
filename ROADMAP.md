@@ -109,16 +109,24 @@ Required proof:
   behavior, and failure reporting.
 - CI gates for typecheck, unit tests, fleet tests, plugin tests, migration
   tests, dependency/security checks, browser smoke, and runtime conformance.
+- A named stable release PR merged to `main`, all required checks rerun on
+  that exact merged SHA, and a passing `mupot-stable-deployment/v1` receipt
+  proving public health serves the same final version and commit.
+- A passing `mupot-v023-prepublication-readiness/v1` receipt bound to the
+  merged PR, exact release SHA, stable deployment, objective receipts, and
+  scoped GitHub App before the stable tag or Release is published.
 - Release metadata aligned across package version, public API version,
-  changelog, roadmap, Git tag, milestone, and GitHub Release, with a passing
-  `mupot-release-integrity/v1` evidence receipt.
+  lockfile, changelog, roadmap, Git tag, milestone, and published GitHub
+  Release, with a passing postpublication `mupot-release-integrity/v1`
+  evidence receipt.
 - Active-runtime evidence may be collected with `mupot-production-soak/v1`, but
   it is a non-blocking development tool rather than a duration-based release
   gate. Stable-release proof remains the signed host, lifecycle, external PR,
   recovery, release-candidate, integrity, and aggregate-readiness evidence.
-- Final release readiness has a passing `mupot-v023-release-readiness/v1`
-  aggregate receipt across all objective receipts, tracker issues, and required
-  CI checks.
+- Final postpublication release readiness has a passing
+  `mupot-v023-release-readiness/v1` aggregate receipt across all objective
+  receipts, tracker issues, the named merged release PR, and required CI checks
+  on the exact release SHA.
 
 Deferred from this version: marketplace/economy expansion, new departments,
 full SOS retirement, GCP portability, and autonomous-brain expansion.
