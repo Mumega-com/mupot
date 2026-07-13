@@ -175,6 +175,10 @@ Record the merged commit SHA. If merge strategy changes the SHA, all tag and rel
 
 Deploy the merged release SHA and generate `stable-deployment-check.json`. Public health must report stable `0.23.0` and the same commit.
 
+Pass the immutable commit at deploy time with
+`npm run deploy -- --var RELEASE_SHA:<merged-release-sha>`. An unset or invalid
+`RELEASE_SHA` appears as `commit:null` on `/health` and must fail this gate.
+
 - [ ] **Step 2: Run prepublication readiness**
 
 ```bash

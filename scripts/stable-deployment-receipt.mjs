@@ -91,7 +91,7 @@ function defaultOutDir(opts) {
 function shellQuote(value) {
   const raw = String(value)
   if (/^[A-Za-z0-9_./:=@%+~,#<>-]+$/.test(raw)) return raw
-  return `'${raw.replace(/'/g, `'\''`)}'`
+  return `'${raw.replace(/'/g, `'\\''`)}'`
 }
 
 function command(parts, suffix = '') {
@@ -126,10 +126,10 @@ export function formatPlan(opts = {}) {
     command(['mkdir', '-p', outDir]),
     '',
     'Capture a redacted live deployment observation:',
-    command(['curl', '-fsS', '<base-url>/health'], ` > ${outDir}/health.json`),
+    command(['curl', '-fsS', '<base-url>/health'], ` > ${shellQuote(join(outDir, 'health.json'))}`),
     `Write deployment.json with receipt_type "${CHECK_RECEIPT_TYPE}", observed_at, target { base_url, version: "${tag}", tag: "${tag}", commit: "${releaseSha}" }, and health from the public response ({ version: "${semver}", commit: "${releaseSha}" }).`,
     '',
-    command(checkCommand, ` > ${join(outDir, 'stable-deployment-check.json')}`),
+    command(checkCommand, ` > ${shellQuote(join(outDir, 'stable-deployment-check.json'))}`),
     command([...checkCommand, '--summary']),
     '',
   ].join('\n')
@@ -164,18 +164,28 @@ export function checkBundle(opts = {}) {
   const outDir = resolve(defaultOutDir({ ...opts, version: tag }))
   const head = git(['rev-parse', 'HEAD'], root)
   const packagePath = join(root, 'package.json')
+  const packageLockPath = join(root, 'package-lock.json')
   const versionPath = join(root, 'src', 'version.ts')
   const deploymentPath = opts.deploymentJson || join(outDir, 'deployment.json')
   const checks = []
   const releaseSha = String(opts.releaseSha || '').trim().toLowerCase()
   let packageVersion = ''
+  let packageLockVersion = ''
+  let packageLockRootVersion = ''
   let deployment = null
   let packageText = ''
+  let packageLockText = ''
   let deploymentText = ''
 
   try {
     packageText = readFileSync(packagePath, 'utf8')
     packageVersion = JSON.parse(packageText).version || ''
+  } catch {}
+  try {
+    packageLockText = readFileSync(packageLockPath, 'utf8')
+    const packageLock = JSON.parse(packageLockText)
+    packageLockVersion = packageLock.version || ''
+    packageLockRootVersion = packageLock.packages?.['']?.version || ''
   } catch {}
   try {
     deploymentText = readFileSync(deploymentPath, 'utf8')
@@ -187,8 +197,11 @@ export function checkBundle(opts = {}) {
   const health = deployment?.health ?? {}
 
   push(checks, packageVersion === semver, 'package_version_matches_expected', { expected: semver, actual: packageVersion || null })
+  push(checks, packageLockVersion === semver, 'package_lock_version_matches_expected', { expected: semver, actual: packageLockVersion || null })
+  push(checks, packageLockRootVersion === semver, 'package_lock_root_version_matches_expected', { expected: semver, actual: packageLockRootVersion || null })
   push(checks, apiVersion === semver, 'public_api_version_matches_expected', { expected: semver, actual: apiVersion || null })
   push(checks, Boolean(packageText) && !hasSecretMaterial(packageText), 'artifact_has_no_secret_material', { label: 'package', path: packagePath })
+  push(checks, Boolean(packageLockText) && !hasSecretMaterial(packageLockText), 'artifact_has_no_secret_material', { label: 'package-lock', path: packageLockPath })
   push(checks, /^[0-9a-f]{40}$/.test(releaseSha), 'expected_release_sha_is_40_hex', { release_sha: releaseSha || null })
   push(checks, Boolean(head), 'git_head_resolved', { head_commit: head || null })
   push(checks, Boolean(releaseSha) && releaseSha === head, 'expected_release_sha_matches_local_head', { expected: releaseSha || null, actual: head || null })
@@ -218,6 +231,7 @@ export function checkBundle(opts = {}) {
     },
     artifacts: {
       package: existsSync(packagePath) ? { path: packagePath } : null,
+      package_lock: existsSync(packageLockPath) ? { path: packageLockPath } : null,
       public_api_version: versionText ? { path: versionPath } : null,
       deployment: deployment ? { path: deploymentPath } : null,
     },

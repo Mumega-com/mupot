@@ -63,7 +63,7 @@ export { McpOAuthApiHandler }
 
 const app = new Hono<{ Bindings: Env }>()
 
-app.get('/health', (c) => c.json(publicHealth(c.env.TENANT_SLUG)))
+app.get('/health', (c) => c.json(publicHealth(c.env.TENANT_SLUG, c.env.RELEASE_SHA)))
 
 app.route(ROUTES.auth, authApp)
 app.route(ROUTES.org, orgApp)
