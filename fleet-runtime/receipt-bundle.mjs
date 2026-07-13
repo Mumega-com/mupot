@@ -1055,7 +1055,8 @@ function secretScanChecks(manifestCheck) {
   return (manifestCheck?.checks ?? []).filter((check) =>
     check?.check === 'manifest_no_secret_material' ||
     check?.check === 'artifact_no_secret_material' ||
-    check?.check === 'export_sidecar_no_secret_material'
+    check?.check === 'export_sidecar_no_secret_material' ||
+    check?.check === 'provenance_source_no_secret_material'
   )
 }
 
@@ -1066,7 +1067,9 @@ function hasSecretScanFailures(manifestCheck) {
 function bundleScopeChecks(manifestCheck) {
   return (manifestCheck?.checks ?? []).filter((check) =>
     check?.check === 'bundle_directory_only_manifest_artifacts' ||
-    check?.check === 'artifact_file_in_bundle_dir'
+    check?.check === 'artifact_file_in_bundle_dir' ||
+    check?.check === 'provenance_directory_exact' ||
+    check?.check === 'provenance_role_directory_exact'
   )
 }
 
@@ -1397,16 +1400,22 @@ function manifestSchemaExact(manifest) {
     !hasExactKeys(manifest.integrity, ['algorithm', 'covers', 'excludes']) || !hasExactKeys(manifest.inputs, inputKeys) || !hasExactKeys(manifest.artifacts, artifactKeys) ||
     !Array.isArray(manifest.next_steps) || !Array.isArray(manifest.checks) || !Array.isArray(manifest.artifacts.probes) || !Array.isArray(manifest.artifacts.runtimes) || !Array.isArray(manifest.artifacts.controls)) return false
   if (portable) {
-    if (!starter || !hasExactKeys(manifest.provenance, ['schema', 'projections']) || manifest.provenance.schema !== PROVENANCE_SCHEMA || !Array.isArray(manifest.provenance.projections) || manifest.provenance.projections.length === 0) return false
+    if (!starter || !hasExactKeys(manifest.provenance, ['schema', 'source_path', 'source_sha256', 'projections']) ||
+      manifest.provenance.schema !== PROVENANCE_SCHEMA || typeof manifest.provenance.source_path !== 'string' ||
+      !isPortableStarterPath(manifest.provenance.source_path) || !SHA256_RE.test(manifest.provenance.source_sha256) ||
+      !Array.isArray(manifest.provenance.projections) || manifest.provenance.projections.length === 0) return false
     const roles = new Set()
     const paths = new Set()
+    const sourcePaths = new Set()
     for (const entry of manifest.provenance.projections) {
-      if (!hasExactKeys(entry, ['role', 'path', 'source_receipt_type', 'source_sha256', 'projection_sha256', 'artifact_sha256']) ||
+      if (!hasExactKeys(entry, ['role', 'path', 'source_receipt_type', 'source_path', 'source_sha256', 'projection_sha256', 'artifact_sha256']) ||
         typeof entry.role !== 'string' || entry.role.length === 0 || typeof entry.path !== 'string' || basename(entry.path) !== entry.path ||
+        typeof entry.source_path !== 'string' || !isPortableStarterPath(entry.source_path) ||
         typeof entry.source_receipt_type !== 'string' || !SHA256_RE.test(entry.source_sha256) || !SHA256_RE.test(entry.projection_sha256) || !SHA256_RE.test(entry.artifact_sha256) ||
-        roles.has(entry.role) || paths.has(entry.path)) return false
+        roles.has(entry.role) || paths.has(entry.path) || sourcePaths.has(entry.source_path)) return false
       roles.add(entry.role)
       paths.add(entry.path)
+      sourcePaths.add(entry.source_path)
     }
   }
   const metas = [manifest.artifacts.install, ...manifest.artifacts.probes, manifest.artifacts.host, ...manifest.artifacts.runtimes, ...manifest.artifacts.controls, manifest.artifacts.cutover_gate,
@@ -1583,6 +1592,8 @@ function addBundleModeChecks(checks, manifestPath, manifest, entries) {
 
 function addBundleDirectoryScopeChecks(checks, manifestPath, manifestDir, entries) {
   const allowed = new Set(['manifest.json'])
+  const manifest = readReceipt(manifestPath, manifestDir)
+  if (manifest?.provenance) allowed.add('provenance')
   for (const entry of entries) {
     if (typeof entry.path === 'string' && entry.path.length > 0) allowed.add(basename(entry.path))
   }
@@ -1643,12 +1654,99 @@ function supportingEvidenceEntries(bundleDir, manifest) {
   return entries
 }
 
+function projectionLabelForRole(role, path, sourceManifest) {
+  if (role.startsWith('service_definition_')) return `definition:${role.slice('service_definition_'.length)}`
+  if (role === 'starter_manifest' || role === 'receipt_bundle_manifest') return role
+  const entry = bundleArtifactEntries(sourceManifest).find((candidate) => basename(candidate.path ?? '') === path)
+  return entry?.label ?? role
+}
+
+function addPortableProvenanceChecks(checks, manifestPath, manifestDir, manifest) {
+  if (!manifest?.provenance) return
+  const provenanceDir = join(manifestDir, 'provenance')
+  let provenanceMode = null
+  try { provenanceMode = lstatSync(provenanceDir).mode & 0o777 } catch {}
+  checks.push({ ok: Boolean(regularDirectoryStat(provenanceDir) && pathContainedBy(provenanceDir, manifestDir)), component: 'receipt-bundle-check', check: 'provenance_directory_regular', path: provenanceDir })
+  checks.push({ ok: provenanceMode === 0o700, component: 'receipt-bundle-check', check: 'provenance_directory_permissions_0700', path: provenanceDir, mode: provenanceMode })
+
+  const mappings = Array.isArray(manifest.provenance.projections) ? manifest.provenance.projections : []
+  const outerPath = provenanceSourcePath(manifestDir, manifest.provenance.source_path, 'outer_manifest')
+  const outerBytes = outerPath ? readRegularBytes(outerPath, manifestDir) : null
+  const outerFindings = outerBytes ? secretFindingsForBytes(outerBytes) : [{ path: '$', reason: 'unreadable_preimage' }]
+  let outerMode = null
+  try { outerMode = lstatSync(outerPath).mode & 0o777 } catch {}
+  checks.push({ ok: Boolean(outerBytes && sha256Bytes(outerBytes) === manifest.provenance.source_sha256), component: 'receipt-bundle-check', check: 'provenance_source_sha256_match', artifact: 'outer_manifest', path: outerPath || null, source_path: manifest.provenance.source_path })
+  checks.push({ ok: outerMode === 0o600, component: 'receipt-bundle-check', check: 'provenance_source_permissions_0600', artifact: 'outer_manifest', path: outerPath || null, mode: outerMode })
+  checks.push({ ok: outerFindings.length === 0, component: 'receipt-bundle-check', check: 'provenance_source_no_secret_material', artifact: 'outer_manifest', path: outerPath || null, findings: secretFindingSummary(outerFindings), finding_count: outerFindings.length })
+
+  const sourceManifest = outerBytes ? parseJsonBytes(outerBytes) : null
+  const items = []
+  for (const mapping of mappings) {
+    const sourcePath = provenanceSourcePath(manifestDir, mapping?.source_path, mapping?.role)
+    const sourceBytes = sourcePath ? readRegularBytes(sourcePath, manifestDir) : null
+    const findings = sourceBytes ? secretFindingsForBytes(sourceBytes) : [{ path: '$', reason: 'unreadable_preimage' }]
+    let sourceMode = null
+    try { sourceMode = lstatSync(sourcePath).mode & 0o777 } catch {}
+    const parsed = sourceBytes && !mapping?.role?.startsWith('service_definition_') ? parseJsonBytes(sourceBytes) : null
+    const expectedType = sourceTypeForRole(mapping?.role ?? '', parsed)
+    checks.push({ ok: Boolean(sourceBytes && sha256Bytes(sourceBytes) === mapping?.source_sha256), component: 'receipt-bundle-check', check: 'provenance_source_sha256_match', artifact: mapping?.role ?? null, path: sourcePath || null, source_path: mapping?.source_path ?? null })
+    checks.push({ ok: sourceMode === 0o600, component: 'receipt-bundle-check', check: 'provenance_source_permissions_0600', artifact: mapping?.role ?? null, path: sourcePath || null, mode: sourceMode })
+    checks.push({ ok: findings.length === 0, component: 'receipt-bundle-check', check: 'provenance_source_no_secret_material', artifact: mapping?.role ?? null, path: sourcePath || null, findings: secretFindingSummary(findings), finding_count: findings.length })
+    checks.push({ ok: Boolean(sourceBytes && mapping?.source_receipt_type === expectedType), component: 'receipt-bundle-check', check: 'provenance_source_type_match', artifact: mapping?.role ?? null, path: sourcePath || null, expected: expectedType, actual: mapping?.source_receipt_type ?? null })
+    if (sourceBytes) {
+      items.push({
+        label: projectionLabelForRole(mapping.role, mapping.path, sourceManifest ?? {}),
+        role: mapping.role,
+        path: join(manifestDir, mapping.path),
+        sourcePath: mapping.source_path,
+        sourceBytes,
+        mapping,
+      })
+    }
+  }
+
+  const records = buildPortableProjectionRecords(items)
+  checks.push({ ok: records.size === mappings.length, component: 'receipt-bundle-check', check: 'provenance_projection_set_complete', path: manifestPath, count: records.size, expected: mappings.length })
+  for (const item of items) {
+    const record = records.get(item.role)
+    const wrapperBytes = readRegularBytes(item.path, manifestDir)
+    const wrapper = wrapperBytes ? parseJsonBytes(wrapperBytes) : null
+    const expectedBytes = record ? jsonBytes(record.envelope) : null
+    checks.push({ ok: Boolean(record && wrapper && JSON.stringify(wrapper) === JSON.stringify(record.envelope)), component: 'receipt-bundle-check', check: 'projection_derived_from_retained_source', artifact: item.role, path: item.path })
+    checks.push({ ok: Boolean(record && expectedBytes && sha256Bytes(expectedBytes) === item.mapping.artifact_sha256 && fileSha256(item.path, manifestDir) === item.mapping.artifact_sha256), component: 'receipt-bundle-check', check: 'projection_artifact_sha256_match', artifact: item.role, path: item.path, expected: record?.artifactSha256 ?? null, actual: item.mapping.artifact_sha256 })
+  }
+
+  if (sourceManifest && records.size === mappings.length) {
+    const expectedManifest = portableOuterManifest(sourceManifest, items, records, manifest.provenance.source_path, manifest.provenance.source_sha256)
+    checks.push({ ok: JSON.stringify(expectedManifest) === JSON.stringify(manifest), component: 'receipt-bundle-check', check: 'portable_manifest_derived_from_retained_source', path: manifestPath })
+  } else {
+    checks.push({ ok: false, component: 'receipt-bundle-check', check: 'portable_manifest_derived_from_retained_source', path: manifestPath })
+  }
+
+  const expectedRoleDirs = new Set(['outer_manifest', ...mappings.map((mapping) => safeName(mapping.role))])
+  let actualRoleDirs = []
+  try { actualRoleDirs = readdirSync(provenanceDir).sort() } catch {}
+  const unexpectedRoleDirs = actualRoleDirs.filter((name) => !expectedRoleDirs.has(name))
+  checks.push({ ok: unexpectedRoleDirs.length === 0 && actualRoleDirs.length === expectedRoleDirs.size, component: 'receipt-bundle-check', check: 'provenance_directory_exact', path: provenanceDir, expected: [...expectedRoleDirs].sort(), actual: actualRoleDirs, unexpected: unexpectedRoleDirs })
+  const expectedSources = [{ role: 'outer_manifest', source_path: manifest.provenance.source_path }, ...mappings]
+  for (const source of expectedSources) {
+    const roleDir = join(provenanceDir, safeName(source.role))
+    const expectedFiles = [basename(source.source_path ?? '')].filter(Boolean)
+    let actualFiles = []
+    let roleMode = null
+    try { actualFiles = readdirSync(roleDir).sort() } catch {}
+    try { roleMode = lstatSync(roleDir).mode & 0o777 } catch {}
+    const unexpected = actualFiles.filter((name) => !expectedFiles.includes(name))
+    checks.push({ ok: Boolean(regularDirectoryStat(roleDir) && roleMode === 0o700 && actualFiles.length === expectedFiles.length && unexpected.length === 0), component: 'receipt-bundle-check', check: 'provenance_role_directory_exact', artifact: source.role, path: roleDir, expected: expectedFiles, actual: actualFiles, unexpected, mode: roleMode })
+  }
+}
+
 const SIDECAR_CHECK_RECORD_KEYS = new Set([
   'ok', 'component', 'check', 'path', 'reason', 'source', 'sha256', 'artifact', 'declared_path', 'file_name',
   'export_dir', 'status', 'sidecar', 'export_receipt', 'manifest_check', 'source_dir', 'actual', 'expected', 'count',
   'directory', 'allowed', 'unexpected', 'findings', 'finding_count', 'agents', 'declared_mode', 'starter_artifacts',
   'artifact_paths', 'mode', 'checked_path', 'expected_path', 'accepted', 'required_component', 'required_check',
-  'base_url', 'base_urls', 'tenant', 'artifacts', 'tenants', 'selected_agents', 'agent_id', 'expected_file', 'ready',
+  'base_url', 'base_urls', 'tenant', 'artifacts', 'tenants', 'selected_agents', 'agent_id', 'expected_file', 'ready', 'source_path',
 ])
 
 function summarySchemaExact(value) {
@@ -1679,15 +1777,16 @@ function sidecarManifestSchemaExact(value) {
 function copiedEntrySchemaExact(value) {
   if (!isPlainObject(value)) return false
   const artifactMeta = Object.hasOwn(value, 'receipt_type') || Object.hasOwn(value, 'status')
-  const provenance = ['source_sha256', 'projection_sha256', 'source_receipt_type', 'role'].some((key) => Object.hasOwn(value, key))
+  const provenance = ['source_path', 'source_sha256', 'projection_sha256', 'source_receipt_type', 'role'].some((key) => Object.hasOwn(value, key))
   const keys = [
     'label', 'source', 'path', 'sha256',
     ...(artifactMeta ? ['receipt_type', 'status'] : []),
-    ...(provenance ? ['source_sha256', 'projection_sha256', 'source_receipt_type', 'role'] : []),
+    ...(provenance ? ['source_path', 'source_sha256', 'projection_sha256', 'source_receipt_type', 'role'] : []),
   ]
   if (!hasExactKeys(value, keys) || typeof value.label !== 'string' || typeof value.source !== 'string' || typeof value.path !== 'string' || !SHA256_RE.test(value.sha256 ?? '')) return false
   if (artifactMeta && (typeof value.receipt_type !== 'string' || typeof value.status !== 'string')) return false
-  return !provenance || (SHA256_RE.test(value.source_sha256 ?? '') && SHA256_RE.test(value.projection_sha256 ?? '') &&
+  return !provenance || (typeof value.source_path === 'string' && isPortableStarterPath(value.source_path) &&
+    SHA256_RE.test(value.source_sha256 ?? '') && SHA256_RE.test(value.projection_sha256 ?? '') &&
     typeof value.source_receipt_type === 'string' && typeof value.role === 'string')
 }
 
@@ -1995,6 +2094,7 @@ function checkBundleManifest(opts = {}) {
     }
     addRequiredEvidenceChecks(checks, manifestPath, entries, agents)
     addBundleDirectoryScopeChecks(checks, manifestPath, manifestDir, entries)
+    addPortableProvenanceChecks(checks, manifestPath, manifestDir, manifest)
     addExportSidecarChecks(checks, manifestPath, manifestDir, manifest, opts)
     if (manifestStarterMode(manifest)) {
       const supports = supportingEvidenceEntries(manifestDir, manifest)
@@ -2010,7 +2110,7 @@ function checkBundleManifest(opts = {}) {
           const mapping = manifest.provenance.projections.find((entry) => entry.role === role)
           const contentSha = projectionSchemaExact(raw) ? sha256Bytes(jsonBytes(raw.content)) : null
           checks.push({ ok: Boolean(projectionSchemaExact(raw) && contentSha === raw.projection_sha256), component: 'receipt-bundle-check', check: 'projection_content_sha256_match', artifact: support.label, path: support.path })
-          checks.push({ ok: Boolean(mapping && projectionSchemaExact(raw) && mapping.path === basename(support.path) && mapping.role === raw.role && mapping.role === role && mapping.source_receipt_type === raw.source_receipt_type && mapping.source_sha256 === raw.source_sha256 && mapping.projection_sha256 === raw.projection_sha256 && mapping.artifact_sha256 === fileSha256(support.path)), component: 'receipt-bundle-check', check: 'projection_chain_valid', artifact: support.label, path: support.path })
+          checks.push({ ok: Boolean(mapping && projectionSchemaExact(raw) && mapping.path === basename(support.path) && mapping.role === raw.role && mapping.role === role && mapping.source_receipt_type === raw.source_receipt_type && mapping.source_path === raw.source_path && mapping.source_sha256 === raw.source_sha256 && mapping.projection_sha256 === raw.projection_sha256 && mapping.artifact_sha256 === fileSha256(support.path)), component: 'receipt-bundle-check', check: 'projection_chain_valid', artifact: support.label, path: support.path })
         }
       }
     }
@@ -2046,7 +2146,7 @@ function checkBundleManifest(opts = {}) {
         })
         checks.push({
           ok: Boolean(mapping && projectionSchemaExact(projection) && mapping.role === projection.role && mapping.role === projectionRole(entry.label, receipt) &&
-            mapping.source_receipt_type === projection.source_receipt_type && mapping.source_receipt_type === entry.receipt_type && mapping.source_sha256 === projection.source_sha256 &&
+            mapping.source_receipt_type === projection.source_receipt_type && mapping.source_receipt_type === entry.receipt_type && mapping.source_path === projection.source_path && mapping.source_sha256 === projection.source_sha256 &&
             mapping.projection_sha256 === projection.projection_sha256 && mapping.artifact_sha256 === actual),
           component: 'receipt-bundle-check',
           check: 'projection_chain_valid',
@@ -2302,12 +2402,13 @@ function sha256Bytes(bytes) {
   return createHash('sha256').update(bytes).digest('hex')
 }
 
-function projectionEnvelope(role, sourceReceiptType, sourceSha256, content) {
+function projectionEnvelope(role, sourceReceiptType, sourcePath, sourceSha256, content) {
   const projectionSha256 = sha256Bytes(jsonBytes(content))
   return {
     receipt_type: PROJECTION_RECEIPT_TYPE,
     role,
     source_receipt_type: sourceReceiptType,
+    source_path: sourcePath,
     source_sha256: sourceSha256,
     projection_sha256: projectionSha256,
     content,
@@ -2315,9 +2416,11 @@ function projectionEnvelope(role, sourceReceiptType, sourceSha256, content) {
 }
 
 function projectionSchemaExact(value) {
-  return hasExactKeys(value, ['receipt_type', 'role', 'source_receipt_type', 'source_sha256', 'projection_sha256', 'content']) &&
+  return hasExactKeys(value, ['receipt_type', 'role', 'source_receipt_type', 'source_path', 'source_sha256', 'projection_sha256', 'content']) &&
     value.receipt_type === PROJECTION_RECEIPT_TYPE && typeof value.role === 'string' && value.role.length > 0 &&
-    typeof value.source_receipt_type === 'string' && value.source_receipt_type.length > 0 && SHA256_RE.test(value.source_sha256) && SHA256_RE.test(value.projection_sha256)
+    typeof value.source_receipt_type === 'string' && value.source_receipt_type.length > 0 &&
+    typeof value.source_path === 'string' && isPortableStarterPath(value.source_path) &&
+    SHA256_RE.test(value.source_sha256) && SHA256_RE.test(value.projection_sha256)
 }
 
 function projectionContent(receipt) {
@@ -2335,116 +2438,155 @@ function projectionRole(label, receipt) {
   return label
 }
 
-function projectionSourceType(item, receipt) {
-  if (item.label.startsWith('definition:')) return 'mupot-fleet-service-definition/v1'
-  if (item.label === 'starter_manifest') return 'mupot-fleet-starter-manifest/v1'
-  return receipt?.receipt_type ?? 'application/json'
-}
-
 function portableReceiptContent(receipt) {
   return portableKnownPathProjection(receipt)
 }
 
-function finalizePortableStarterExport(sourceManifest, sourceDir, exportDir, copied) {
-  const projected = new Map()
-  const manifestItem = copied.find((item) => item.label === 'manifest')
-  const projectionItems = copied.filter((item) => item.label !== 'manifest')
-  const writeProjection = (item, role, sourceType, sourceSha256, content) => {
-    const envelope = projectionEnvelope(role, sourceType, sourceSha256, content)
-    atomicWriteFile(item.path, jsonBytes(envelope), { force: true })
-    item.sha256 = fileSha256(item.path)
-    item.source_sha256 = sourceSha256
-    item.projection_sha256 = envelope.projection_sha256
-    item.source_receipt_type = sourceType
-    item.role = role
-    projected.set(role, { item, envelope })
-    return envelope
+function parseJsonBytes(bytes) {
+  try {
+    return JSON.parse(bytes.toString('utf8'))
+  } catch {
+    return null
+  }
+}
+
+function secretFindingsForBytes(bytes) {
+  const parsed = parseJsonBytes(bytes)
+  return findSecretMaterial(parsed ?? bytes.toString('utf8'))
+}
+
+function provenanceRelativePath(role, source) {
+  return join('provenance', safeName(role), basename(source))
+}
+
+function provenanceSourcePath(root, declaredPath, role) {
+  if (typeof declaredPath !== 'string' || !isPortableStarterPath(declaredPath)) return ''
+  const parts = declaredPath.split('/')
+  if (parts.length !== 3 || parts[0] !== 'provenance' || parts[1] !== safeName(role) || basename(parts[2]) !== parts[2]) return ''
+  const roleDir = join(root, 'provenance', parts[1])
+  const path = join(roleDir, parts[2])
+  return regularDirectoryStat(join(root, 'provenance')) && regularDirectoryStat(roleDir) && regularFileStat(path) && pathContainedBy(path, root) ? path : ''
+}
+
+function sourceTypeForRole(role, receipt) {
+  if (role.startsWith('service_definition_')) return 'mupot-fleet-service-definition/v1'
+  if (role === 'starter_manifest') return 'mupot-fleet-starter-manifest/v1'
+  return receipt?.receipt_type ?? 'application/json'
+}
+
+function buildPortableProjectionRecords(items) {
+  const records = new Map()
+  const add = (item, role, sourceType, content) => {
+    if (records.has(role) || !item?.sourceBytes || !item?.sourcePath) return null
+    const envelope = projectionEnvelope(role, sourceType, item.sourcePath, sha256Bytes(item.sourceBytes), content)
+    const record = { item, envelope, artifactSha256: sha256Bytes(jsonBytes(envelope)) }
+    records.set(role, record)
+    return record
   }
 
-  for (const item of projectionItems.filter((candidate) => candidate.label.startsWith('definition:'))) {
-    const bytes = readRegularBytes(item.source)
-    if (!bytes) continue
-    const content = { encoding: 'base64', data: bytes.toString('base64') }
-    writeProjection(item, `service_definition_${item.label.split(':')[1]}`, 'mupot-fleet-service-definition/v1', sha256Bytes(bytes), content)
+  for (const item of items.filter((candidate) => candidate.role.startsWith('service_definition_'))) {
+    add(item, item.role, 'mupot-fleet-service-definition/v1', { encoding: 'base64', data: item.sourceBytes.toString('base64') })
   }
-  const starterManifestItem = projectionItems.find((item) => item.label === 'starter_manifest')
+
+  const starterManifestItem = items.find((item) => item.role === 'starter_manifest')
   if (starterManifestItem) {
-    const sourceReceipt = readReceipt(starterManifestItem.source)
-    writeProjection(starterManifestItem, 'starter_manifest', 'mupot-fleet-starter-manifest/v1', fileSha256(starterManifestItem.source), normalizeStarterManifest(sourceReceipt) ?? sourceReceipt)
-  }
-  const priorItem = projectionItems.find((item) => item.label === 'receipt_bundle_manifest')
-  if (priorItem) {
-    const sourceReceipt = readReceipt(priorItem.source)
-    writeProjection(priorItem, 'receipt_bundle_manifest', sourceReceipt?.receipt_type ?? 'application/json', fileSha256(priorItem.source), portableReceiptContent(sourceReceipt))
+    const source = parseJsonBytes(starterManifestItem.sourceBytes)
+    const content = normalizeStarterManifest(source) ?? source
+    if (content) add(starterManifestItem, 'starter_manifest', 'mupot-fleet-starter-manifest/v1', content)
   }
 
-  for (const item of projectionItems.filter((candidate) => !candidate.label.startsWith('definition:') && !['starter_manifest', 'receipt_bundle_manifest', 'starter'].includes(candidate.label))) {
-    const sourceReceipt = readReceipt(item.source)
-    if (!sourceReceipt) continue
-    const role = projectionRole(item.label, sourceReceipt)
-    const content = portableReceiptContent(sourceReceipt)
-    if (sourceReceipt.receipt_type === EXPECTED.service) {
+  const priorItem = items.find((item) => item.role === 'receipt_bundle_manifest')
+  if (priorItem) {
+    const source = parseJsonBytes(priorItem.sourceBytes)
+    if (source) add(priorItem, 'receipt_bundle_manifest', sourceTypeForRole('receipt_bundle_manifest', source), portableReceiptContent(source))
+  }
+
+  for (const item of items.filter((candidate) => !candidate.role.startsWith('service_definition_') && !['starter_manifest', 'receipt_bundle_manifest', 'starter'].includes(candidate.role))) {
+    const source = parseJsonBytes(item.sourceBytes)
+    if (!source) continue
+    const content = portableReceiptContent(source)
+    if (source.receipt_type === EXPECTED.service) {
       for (const definition of content.definitions ?? []) {
-        const support = projected.get(`service_definition_${definition.service}`)?.item
+        const support = records.get(`service_definition_${definition.service}`)
         if (support) {
-          definition.path = basename(support.path)
-          definition.sha256 = support.sha256
+          definition.path = basename(support.item.path)
+          definition.sha256 = support.artifactSha256
         }
       }
     }
-    if (sourceReceipt.receipt_type === EXPECTED.host) {
+    if (source.receipt_type === EXPECTED.host) {
       const definitions = content.checks?.find((check) => check?.component === 'host-services' && check?.check === 'service_definitions_current')?.definitions ?? []
       for (const definition of definitions) {
-        const support = projected.get(`service_definition_${definition.service}`)?.item
+        const support = records.get(`service_definition_${definition.service}`)
         if (support) {
-          definition.path = basename(support.path)
-          definition.expected_sha256 = support.sha256
-          definition.rendered_sha256 = support.sha256
-          definition.actual_sha256 = support.sha256
+          definition.path = basename(support.item.path)
+          definition.expected_sha256 = support.artifactSha256
+          definition.rendered_sha256 = support.artifactSha256
+          definition.actual_sha256 = support.artifactSha256
         }
       }
     }
-    if (sourceReceipt.receipt_type === EXPECTED.install) {
+    if (source.receipt_type === EXPECTED.install) {
       for (const definition of content.outputs?.service_definitions ?? []) {
-        const support = projected.get(`service_definition_${definition.service}`)?.item
+        const support = records.get(`service_definition_${definition.service}`)
         if (support) {
-          definition.path = basename(support.path)
-          definition.sha256 = support.sha256
+          definition.path = basename(support.item.path)
+          definition.sha256 = support.artifactSha256
         }
       }
       for (const check of content.checks ?? []) {
         if (check?.component !== 'fleet-install' || check?.check !== 'service_definition_rendered') continue
-        const support = projected.get(`service_definition_${check.service}`)?.item
+        const support = records.get(`service_definition_${check.service}`)
         if (support) {
-          check.path = basename(support.path)
-          check.sha256 = support.sha256
+          check.path = basename(support.item.path)
+          check.sha256 = support.artifactSha256
         }
       }
     }
-    writeProjection(item, role, projectionSourceType(item, sourceReceipt), fileSha256(item.source), content)
+    add(item, item.role, sourceTypeForRole(item.role, source), content)
   }
 
-  const starterItem = projectionItems.find((item) => item.label === 'starter')
+  const starterItem = items.find((item) => item.role === 'starter')
   if (starterItem) {
-    const sourceStarter = normalizeStarterReceipt(readReceipt(starterItem.source))
-    if (sourceStarter) {
-      const content = portableReceiptContent(sourceStarter)
-      const manifestProjection = projected.get('starter_manifest')?.item
+    const source = normalizeStarterReceipt(parseJsonBytes(starterItem.sourceBytes))
+    if (source) {
+      const content = portableReceiptContent(source)
+      const manifestProjection = records.get('starter_manifest')
       if (manifestProjection) {
-        content.manifest.path = basename(manifestProjection.path)
-        content.manifest.sha256 = manifestProjection.sha256
+        content.manifest.path = basename(manifestProjection.item.path)
+        content.manifest.sha256 = manifestProjection.artifactSha256
       }
       for (const artifact of content.artifacts) {
-        const evidence = projected.get(artifact.role)?.item
+        const evidence = records.get(artifact.role)
         if (evidence) {
-          artifact.path = basename(evidence.path)
-          artifact.sha256 = evidence.sha256
+          artifact.path = basename(evidence.item.path)
+          artifact.sha256 = evidence.artifactSha256
         }
       }
-      writeProjection(starterItem, 'starter', STARTER_RECEIPT_TYPE, fileSha256(starterItem.source), content)
+      add(starterItem, 'starter', STARTER_RECEIPT_TYPE, content)
     }
   }
+  return records
+}
 
+function portableProvenance(records, sourcePath, sourceSha256) {
+  return {
+    schema: PROVENANCE_SCHEMA,
+    source_path: sourcePath,
+    source_sha256: sourceSha256,
+    projections: [...records.values()].map(({ item, envelope, artifactSha256 }) => ({
+      role: envelope.role,
+      path: basename(item.path),
+      source_receipt_type: envelope.source_receipt_type,
+      source_path: envelope.source_path,
+      source_sha256: envelope.source_sha256,
+      projection_sha256: envelope.projection_sha256,
+      artifact_sha256: artifactSha256,
+    })),
+  }
+}
+
+function portableOuterManifest(sourceManifest, copied, records, sourcePath, sourceSha256) {
   const manifest = portableKnownPathProjection(sourceManifest)
   manifest.inputs.out_dir = '.'
   manifest.artifacts.out_dir = '.'
@@ -2452,24 +2594,59 @@ function finalizePortableStarterExport(sourceManifest, sourceDir, exportDir, cop
   for (const entry of bundleArtifactEntries(manifest)) {
     const item = copied.find((candidate) => candidate.label === entry.label)
     const meta = artifactMetaForLabel(manifest, entry.label)
-    if (item && meta) {
+    const record = item ? [...records.values()].find((candidate) => candidate.item === item) : null
+    if (item && meta && record) {
       meta.path = basename(item.path)
-      meta.sha256 = item.sha256
+      meta.sha256 = record.artifactSha256
     }
   }
-  manifest.provenance = {
-    schema: PROVENANCE_SCHEMA,
-    projections: [...projected.values()].map(({ item, envelope }) => ({
-      role: envelope.role,
-      path: basename(item.path),
-      source_receipt_type: envelope.source_receipt_type,
-      source_sha256: envelope.source_sha256,
-      projection_sha256: envelope.projection_sha256,
-      artifact_sha256: item.sha256,
-    })),
+  manifest.provenance = portableProvenance(records, sourcePath, sourceSha256)
+  return manifest
+}
+
+function finalizePortableStarterExport(sourceManifest, exportDir, copied) {
+  const manifestItem = copied.find((item) => item.label === 'manifest')
+  const projectionItems = copied.filter((item) => item.label !== 'manifest')
+  for (const item of projectionItems) {
+    const sourceReceipt = item.label.startsWith('definition:') ? null : readReceipt(item.source)
+    item.role = item.label.startsWith('definition:')
+      ? `service_definition_${item.label.split(':')[1]}`
+      : projectionRole(item.label, sourceReceipt)
+    item.sourceBytes = readRegularBytes(item.source)
+    item.sourcePath = provenanceRelativePath(item.role, item.source)
+    if (!item.sourceBytes || secretFindingsForBytes(item.sourceBytes).length > 0) throw new Error(`unsafe or unreadable provenance source: ${item.label}`)
+    const retainedPath = join(exportDir, item.sourcePath)
+    ensureContainedParent(exportDir, retainedPath)
+    atomicWriteFile(retainedPath, item.sourceBytes, { force: true })
   }
+
+  if (!manifestItem) throw new Error('portable source manifest is missing')
+  const manifestSourceBytes = readRegularBytes(manifestItem.source)
+  if (!manifestSourceBytes || secretFindingsForBytes(manifestSourceBytes).length > 0) throw new Error('unsafe or unreadable source manifest')
+  const manifestSourcePath = provenanceRelativePath('outer_manifest', manifestItem.source)
+  const retainedManifestPath = join(exportDir, manifestSourcePath)
+  ensureContainedParent(exportDir, retainedManifestPath)
+  atomicWriteFile(retainedManifestPath, manifestSourceBytes, { force: true })
+
+  const records = buildPortableProjectionRecords(projectionItems)
+  if (records.size !== projectionItems.length) throw new Error('portable projection set is incomplete')
+  for (const { item, envelope, artifactSha256 } of records.values()) {
+    atomicWriteFile(item.path, jsonBytes(envelope), { force: true })
+    item.sha256 = artifactSha256
+    item.source_path = envelope.source_path
+    item.source_sha256 = envelope.source_sha256
+    item.projection_sha256 = envelope.projection_sha256
+    item.source_receipt_type = envelope.source_receipt_type
+    item.role = envelope.role
+  }
+
+  const manifest = portableOuterManifest(sourceManifest, copied, records, manifestSourcePath, sha256Bytes(manifestSourceBytes))
   const manifestPath = join(exportDir, 'manifest.json')
   atomicWriteFile(manifestPath, jsonBytes(manifest), { force: true })
+  for (const item of projectionItems) {
+    delete item.sourceBytes
+    delete item.sourcePath
+  }
   if (manifestItem) manifestItem.sha256 = fileSha256(manifestPath)
   return manifest.provenance.projections
 }
@@ -2681,7 +2858,7 @@ function exportBundle(opts = {}) {
         }
       }
     }
-    if (manifestStarterMode(manifest)) finalizePortableStarterExport(manifest, sourceDir, exportDir, copied)
+    if (manifestStarterMode(manifest)) finalizePortableStarterExport(manifest, exportDir, copied)
   }
 
   let manifestCheck = exportDirReady ? checkBundleManifest({ outDir: exportDir, allowMissingSidecars: true, skipExportSidecars: true }) : null

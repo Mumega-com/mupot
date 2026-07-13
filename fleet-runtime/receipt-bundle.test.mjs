@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { buildBundle, checkBundleManifest, exportBundle, formatHostGoPlan, formatStatusSummary, inspectBundleStatus, parseArgs, safeName } from './receipt-bundle.mjs'
 import { buildReceipt as buildHostReceipt } from './host-receipt.mjs'
 import { createServiceContext } from './service-context.mjs'
@@ -783,12 +783,33 @@ test('starter-ready bundle requires, exports, and summarizes service continuity 
   assert.match(compact, new RegExp(`Starter manifest: ${STARTER_SHA}`))
 
   const sourceManifest = JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8'))
+  const admittedSourcePaths = [
+    join(outDir, 'manifest.json'),
+    sourceManifest.artifacts.install.path,
+    ...sourceManifest.artifacts.probes.map((artifact) => artifact.path),
+    sourceManifest.artifacts.service.path,
+    sourceManifest.artifacts.continuous.path,
+    sourceManifest.artifacts.starter.path,
+    sourceManifest.artifacts.host.path,
+    ...sourceManifest.artifacts.runtimes.map((artifact) => artifact.path),
+    ...sourceManifest.artifacts.controls.map((artifact) => artifact.path),
+    sourceManifest.artifacts.cutover_gate.path,
+    join(outDir, 'fleet-daemon.service'),
+    join(outDir, 'fleet-control-daemon.service'),
+    join(outDir, 'starter.example.json'),
+    join(outDir, 'prior-bundle-manifest.json'),
+  ]
+  const admittedSourceBytes = new Map(admittedSourcePaths.map((path) => [basename(path), readFileSync(path)]))
   const sourceHashes = Object.fromEntries(
     ['install', 'service', 'host', 'continuous', 'starter'].map((role) => [role, sourceManifest.artifacts[role].sha256]),
   )
   const exportDir = tmpDir()
   const exportReceipt = exportBundle({ outDir, exportDir })
-  assert.equal(exportReceipt.status, 'pass', JSON.stringify(exportReceipt.checks.filter((check) => check.ok === false), null, 2))
+  const exportDebugCheck = checkBundleManifest({ outDir: exportDir })
+  assert.equal(exportReceipt.status, 'pass', JSON.stringify({
+    export: exportReceipt.checks.filter((check) => check.ok === false),
+    manifest: exportDebugCheck.checks.filter((check) => check.ok === false),
+  }, null, 2))
   for (const [path, before] of sourceBytes) assert.deepEqual(readFileSync(path), before, path)
   rmSync(outDir, { recursive: true })
   rmSync(sources.sourceDir, { recursive: true })
@@ -801,9 +822,24 @@ test('starter-ready bundle requires, exports, and summarizes service continuity 
   )
   const exportedManifest = JSON.parse(readFileSync(join(exportDir, 'manifest.json'), 'utf8'))
   assert.equal(exportedManifest.provenance.schema, 'mupot-fleet-portable-provenance/v1')
+  assert.match(exportedManifest.provenance.source_path, /^provenance\/outer_manifest\/[^/]+$/)
+  assert.equal(exportedManifest.provenance.source_sha256, digest(admittedSourceBytes.get('manifest.json')))
+  assert.deepEqual(readFileSync(join(exportDir, exportedManifest.provenance.source_path)), admittedSourceBytes.get('manifest.json'))
   assert.ok(exportedManifest.provenance.projections.length >= 13)
+  assert.equal(statSync(join(exportDir, 'provenance')).mode & 0o777, 0o700)
+  for (const mapping of exportedManifest.provenance.projections) {
+    assert.match(mapping.source_path, new RegExp(`^provenance/${mapping.role.replace(/[^A-Za-z0-9_.-]+/g, '_')}/[^/]+$`), mapping.role)
+    const retainedPath = join(exportDir, mapping.source_path)
+    assert.equal(lstatSync(retainedPath).isSymbolicLink(), false, mapping.role)
+    assert.equal(statSync(dirname(retainedPath)).mode & 0o777, 0o700, mapping.role)
+    assert.equal(statSync(retainedPath).mode & 0o777, 0o600, mapping.role)
+    assert.deepEqual(readFileSync(retainedPath), admittedSourceBytes.get(mapping.path), mapping.role)
+    const wrapper = JSON.parse(readFileSync(join(exportDir, mapping.path), 'utf8'))
+    assert.equal(wrapper.source_path, mapping.source_path, mapping.role)
+    assert.equal(wrapper.source_sha256, digest(readFileSync(retainedPath)), mapping.role)
+  }
   const copiedService = JSON.parse(readFileSync(join(exportDir, 'service.json'), 'utf8'))
-  assert.deepEqual(Object.keys(copiedService), ['receipt_type', 'role', 'source_receipt_type', 'source_sha256', 'projection_sha256', 'content'])
+  assert.deepEqual(Object.keys(copiedService), ['receipt_type', 'role', 'source_receipt_type', 'source_path', 'source_sha256', 'projection_sha256', 'content'])
   assert.equal(copiedService.receipt_type, 'mupot-fleet-portable-evidence-projection/v1')
   assert.equal(copiedService.source_receipt_type, 'mupot-fleet-service-receipt/v1')
   assert.equal(copiedService.source_sha256, sourceHashes.service)
@@ -2179,6 +2215,71 @@ test('portable checker rejects source and projection chain tampering', async (t)
     const check = checkBundleManifest({ outDir: exportDir })
     assert.equal(check.status, 'fail')
     assert.ok(check.checks.some((entry) => entry.check === 'projection_content_sha256_match' && entry.artifact === 'continuous' && entry.ok === false))
+  })
+
+  await t.test('retained source preimage tampering', async () => {
+    const exportDir = await exportedStarterBundle()
+    const manifest = JSON.parse(readFileSync(join(exportDir, 'manifest.json'), 'utf8'))
+    const mapping = manifest.provenance.projections.find((entry) => entry.role === 'service')
+    const sourcePath = join(exportDir, mapping.source_path)
+    const source = JSON.parse(readFileSync(sourcePath, 'utf8'))
+    source.generated_at = '2026-07-13T23:59:59.000Z'
+    writeJson(sourcePath, source)
+
+    const check = checkBundleManifest({ outDir: exportDir })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) => entry.check === 'provenance_source_sha256_match' && entry.artifact === 'service' && entry.ok === false))
+    assert.ok(check.checks.some((entry) => entry.check === 'projection_derived_from_retained_source' && entry.artifact === 'service' && entry.ok === false))
+  })
+
+  await t.test('coordinated source hash fields cannot replace projection derivation', async () => {
+    const exportDir = await exportedStarterBundle()
+    const manifestPath = join(exportDir, 'manifest.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    const mapping = manifest.provenance.projections.find((entry) => entry.role === 'service')
+    const sourcePath = join(exportDir, mapping.source_path)
+    const source = JSON.parse(readFileSync(sourcePath, 'utf8'))
+    source.generated_at = '2026-07-13T23:59:58.000Z'
+    writeJson(sourcePath, source)
+    const changedSourceSha = sha256(sourcePath)
+    mapping.source_sha256 = changedSourceSha
+    const wrapperPath = join(exportDir, mapping.path)
+    const wrapper = JSON.parse(readFileSync(wrapperPath, 'utf8'))
+    wrapper.source_sha256 = changedSourceSha
+    writeJson(wrapperPath, wrapper)
+    mapping.artifact_sha256 = sha256(wrapperPath)
+    manifest.artifacts.service.sha256 = mapping.artifact_sha256
+    writeJson(manifestPath, manifest)
+
+    const check = checkBundleManifest({ outDir: exportDir })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) => entry.check === 'projection_derived_from_retained_source' && entry.artifact === 'service' && entry.ok === false))
+  })
+
+  await t.test('symlinked retained preimage is rejected', async () => {
+    const exportDir = await exportedStarterBundle()
+    const manifest = JSON.parse(readFileSync(join(exportDir, 'manifest.json'), 'utf8'))
+    const mapping = manifest.provenance.projections.find((entry) => entry.role === 'service')
+    const sourcePath = join(exportDir, mapping.source_path)
+    const external = join(tmpDir(), 'service-source.json')
+    copyFileSync(sourcePath, external)
+    rmSync(sourcePath)
+    symlinkSync(external, sourcePath)
+
+    const check = checkBundleManifest({ outDir: exportDir })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) => entry.check === 'provenance_source_sha256_match' && entry.artifact === 'service' && entry.ok === false))
+  })
+
+  await t.test('permissive provenance directory mode is rejected', async () => {
+    const exportDir = await exportedStarterBundle()
+    const manifest = JSON.parse(readFileSync(join(exportDir, 'manifest.json'), 'utf8'))
+    const mapping = manifest.provenance.projections.find((entry) => entry.role === 'service')
+    chmodSync(dirname(join(exportDir, mapping.source_path)), 0o755)
+
+    const check = checkBundleManifest({ outDir: exportDir })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) => entry.check === 'provenance_role_directory_exact' && entry.artifact === 'service' && entry.ok === false))
   })
 })
 

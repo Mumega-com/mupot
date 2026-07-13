@@ -229,6 +229,50 @@ experimental SQLite warnings, with no test failures.
 
 ---
 
+## Task 7 Final Provenance Correction
+
+### Result
+
+Portable starter exports now retain an exact immutable preimage for every
+projected receipt, manifest, and service definition under a contained
+`provenance/<role>/` directory. Export rejects secret-bearing preimages instead
+of rewriting them. Projection wrappers bind the retained relative path and
+source digest, and the checker independently rebuilds every typed projection
+and the outer manifest from retained bytes after the original source tree has
+been deleted.
+
+Portability applies to filesystem references: every manifest and wrapper path
+is contained and relative. Immutable secret-free preimages preserve original
+machine observations verbatim but are never used as live filesystem inputs.
+
+### Verification
+
+- `node --test fleet-runtime/starter-contract.test.mjs fleet-runtime/host-receipt.test.mjs fleet-runtime/receipt-bundle.test.mjs`
+  - 153 passed, 0 failed.
+- `node --test fleet-runtime/*.test.mjs`
+  - 432 passed, 0 failed.
+- `npm test`
+  - 168 test files passed; 2703 tests passed.
+- `git diff --check`
+  - Passed with no whitespace errors.
+
+### Adversarial Coverage
+
+- Direct retained-preimage tampering fails source digest and derivation checks.
+- Coordinated edits to retained bytes plus copied source digest fields still
+  fail deterministic projection derivation.
+- Symlinked preimages and permissive provenance directories fail closed.
+- Provenance directories are exact, contained, mode `0700`; retained files are
+  regular, mode `0600`, source-digest bound, and secret scanned.
+
+### Concerns
+
+No blocking concern. SHA-256 proves bundle integrity and deterministic
+derivation, not publisher authenticity; signed provenance is intentionally
+outside this task. `npm test` retains the existing experimental SQLite warning.
+
+---
+
 ## Task 7 Cumulative-Review Remediation
 
 ### Result
