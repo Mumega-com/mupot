@@ -12,6 +12,14 @@ const rules = [
     pattern: /ghp_[A-Za-z0-9]{20,}/,
   },
   {
+    label: 'GitHub token',
+    pattern: /(?:gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}/,
+  },
+  {
+    label: 'JWT',
+    pattern: /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
+  },
+  {
     label: 'private key',
     pattern: new RegExp(['BEGIN', '(?:RSA|EC|OPENSSH)', 'PRIVATE KEY'].join(' ')),
   },

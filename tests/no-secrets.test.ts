@@ -70,6 +70,31 @@ describe('no-secrets scanner', () => {
     expect(result.stderr).not.toContain(privateKey)
   })
 
+  it('detects modern GitHub and JWT shapes', () => {
+    const githubFineGrained = ['github', 'pat', 'A'.repeat(24)].join('_')
+    const githubOauth = ['gho', 'B'.repeat(24)].join('_')
+    const jwt = [
+      `eyJ${'D'.repeat(14)}`,
+      'E'.repeat(16),
+      'F'.repeat(16),
+    ].join('.')
+    const root = createRepo({
+      'github-pat.txt': githubFineGrained,
+      'github-oauth.txt': githubOauth,
+      'session.txt': jwt,
+    })
+
+    const result = runScanner(root)
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('github-pat.txt:1: GitHub token')
+    expect(result.stderr).toContain('github-oauth.txt:1: GitHub token')
+    expect(result.stderr).toContain('session.txt:1: JWT')
+    for (const value of [githubFineGrained, githubOauth, jwt]) {
+      expect(result.stderr).not.toContain(value)
+    }
+  })
+
   it('ignores untracked files and safely skips tracked binaries', () => {
     const token = `sk-${'C'.repeat(24)}`
     const binary = Buffer.concat([Buffer.from([0, 1, 2]), Buffer.from(token)])
