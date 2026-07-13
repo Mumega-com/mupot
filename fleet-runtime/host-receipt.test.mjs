@@ -3,7 +3,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -185,6 +185,29 @@ async function requiredServiceReceipt(f) {
   })
 }
 
+function requiredServiceOptions(f, overrides = {}) {
+  return {
+    daemonPath: f.daemonPath,
+    inboxPath: f.inboxPath,
+    controlPath: f.controlPath,
+    skipInbox: false,
+    skipControl: false,
+    execProbes: false,
+    keyPathFor: f.keyPathFor,
+    requireServices: true,
+    serviceManager: f.context.manager,
+    serviceDefinitionDir: f.definitionDir,
+    runtimeDir: f.runtimeDir,
+    nodePath: f.nodePath,
+    homeDir: f.root,
+    uid: 501,
+    username: 'operator',
+    platformName: f.context.manager === 'launchd' ? 'darwin' : 'linux',
+    buildServiceReceipt: async () => f.receipt,
+    ...overrides,
+  }
+}
+
 test('host receipt passes for a complete local host layout without executing probes', async () => {
   const f = fixture()
   const receipt = await buildReceipt({
@@ -230,6 +253,64 @@ test('host service proof accepts exact current launchd definitions and status', 
     receipt.checks.filter((check) => check.component === 'host-services').map((check) => check.check),
     ['service_definitions_current', 'heartbeat_service_running', 'control_service_running', 'systemd_linger_enabled'],
   )
+})
+
+test('host service proof rejects explicit cross-platform managers before status collection', async (t) => {
+  for (const [manager, platformName] of [['launchd', 'linux'], ['systemd', 'darwin']]) {
+    await t.test(`${manager} on ${platformName}`, async () => {
+      const f = serviceFixture({ manager })
+      let statusCalls = 0
+      await assert.rejects(
+        buildReceipt(requiredServiceOptions(f, {
+          serviceManager: manager,
+          platformName,
+          buildServiceReceipt: async () => {
+            statusCalls += 1
+            return f.receipt
+          },
+        })),
+        /requires (?:darwin|linux)/,
+      )
+      assert.equal(statusCalls, 0)
+    })
+  }
+})
+
+test('host service proof accepts producer-valid running but disabled services', async () => {
+  const f = serviceFixture({
+    mutateReceipt(receipt) {
+      for (const service of receipt.services) service.enabled = false
+    },
+  })
+
+  const receipt = await requiredServiceReceipt(f)
+  assert.equal(receipt.status, 'pass', JSON.stringify(receipt.checks.filter((check) => check.component === 'host-services'), null, 2))
+})
+
+test('host service proof rejects symlinked definition files and directories', async (t) => {
+  await t.test('definition file symlink', async () => {
+    const f = serviceFixture()
+    const definition = f.receipt.definitions[0]
+    const external = join(tmp(), 'external.service')
+    writeFileSync(external, readFileSync(definition.path))
+    rmSync(definition.path)
+    symlinkSync(external, definition.path)
+
+    const receipt = await requiredServiceReceipt(f)
+    assert.equal(receipt.status, 'fail')
+    assert.equal(receipt.checks.find((check) => check.check === 'service_definitions_current').ok, false)
+  })
+
+  await t.test('definition directory symlink', async () => {
+    const f = serviceFixture()
+    const alias = join(f.root, 'systemd-link')
+    symlinkSync(f.definitionDir, alias, 'dir')
+    for (const definition of f.receipt.definitions) definition.path = join(alias, definition.path.split('/').at(-1))
+
+    const receipt = await buildReceipt(requiredServiceOptions(f, { serviceDefinitionDir: alias }))
+    assert.equal(receipt.status, 'fail')
+    assert.equal(receipt.checks.find((check) => check.check === 'service_definitions_current').ok, false)
+  })
 })
 
 test('host service proof rejects semantic renderer drift even when argv and receipt hashes match disk', async () => {

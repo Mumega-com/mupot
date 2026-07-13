@@ -174,3 +174,55 @@ No blocking concerns. The starter validator intentionally implements the
 anticipated Task 8 v1 producer contract supplied with this task; Task 8 must
 emit that exact contract. `npm test` continues to emit the repository's existing
 Node experimental SQLite warnings, with no failures.
+
+---
+
+## Task 7 Recovery: Portable Starter Evidence
+
+### Result
+
+Recovered the interrupted Task 7 remediation while preserving the shared
+starter contract and typed projection/provenance chain. Manifest verification
+again exposes the legacy hash-drift and self-contained-bundle checks, legacy
+export remains compatible with working files beside the source bundle, and
+portable export sidecars fail closed on unknown nested copied-entry, sidecar,
+summary, and check-record fields.
+
+Runtime artifact validation now accepts the two explicit supported contracts:
+the current producer envelope and the compact pre-Task-7 legacy envelope. Both
+paths require exact nested keys, so fabricated runtime target fields fail the
+`artifact_receipt_schema_exact` check. Force re-export skips stale sidecars only
+during the pre-write manifest check, then validates both regenerated sidecars
+with the full recursive schema.
+
+### Verification
+
+- `node --test fleet-runtime/starter-contract.test.mjs fleet-runtime/host-receipt.test.mjs fleet-runtime/receipt-bundle.test.mjs`
+  - 135 passed, 0 failed.
+- `node --test fleet-runtime/*.test.mjs`
+  - 414 passed, 0 failed.
+- `npm test`
+  - 168 test files passed; 2703 tests passed.
+- `git diff --check`
+  - Passed with no whitespace errors.
+
+### Implementation Summary
+
+- Restored checker-derived readiness in `addNextStepChecks`, preserving legacy
+  `next_steps_no_attach_when_not_ready` and `next_steps_hold_when_not_ready`
+  drift reporting.
+- Restored read-only legacy external artifact reporting in
+  `resolveArtifactPath` while keeping starter-ready artifacts contained.
+- Kept legacy export ungated by source-directory extras; starter-ready export
+  still requires a passing source manifest check.
+- Added exact runtime check/envelope validation and explicit current/legacy
+  runtime contract branches.
+- Added recursive typed validation for export copied records, sidecar records,
+  summaries, manifest references, secret findings, and checker records.
+- Preserved final portable projection/provenance digest and sidecar validation;
+  only the force-repair pre-write check ignores stale sidecars.
+
+### Concerns
+
+No residual blocking concern. `npm test` emits the repository's existing Node
+experimental SQLite warnings, with no test failures.

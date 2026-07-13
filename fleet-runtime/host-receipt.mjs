@@ -8,9 +8,9 @@
 // receipt operators can attach to a cutover record.
 
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { validateConfig as validateDaemonConfig, runProbe } from './fleet-daemon.mjs'
 import { validateConfig as validateInboxHandlerConfig } from './inbox-handler.mjs'
 import { validateConfig as validateControlConfig } from './fleet-control-daemon.mjs'
@@ -409,12 +409,25 @@ function definitionEvidence(context, serviceReceipt, configPaths) {
   const uniqueDefinitions = new Map(definitions.map((definition) => [definition?.service, definition]))
   const rendered = (context.manager === 'launchd' ? renderLaunchd(context) : renderSystemd(context))
   const renderedByKey = new Map(rendered.map((definition) => [definition.key, definition]))
+  let definitionRoot = null
+  try {
+    const dirStat = lstatSync(context.definitionDir)
+    if (!dirStat.isSymbolicLink() && dirStat.isDirectory()) definitionRoot = realpathSync(context.definitionDir)
+  } catch {
+    // Each definition below records the directory as unsafe/unreadable.
+  }
   const evidence = context.services.map((service) => {
     const definition = uniqueDefinitions.get(service.key)
     const current = renderedByKey.get(service.key)
     let content = null
+    let regularContainedFile = false
     try {
-      content = readFileSync(service.definitionPath, 'utf8')
+      const fileStat = lstatSync(service.definitionPath)
+      const realPath = realpathSync(service.definitionPath)
+      const fromRoot = definitionRoot === null ? '..' : relative(definitionRoot, realPath)
+      regularContainedFile = !fileStat.isSymbolicLink() && fileStat.isFile() &&
+        fromRoot !== '..' && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot)
+      if (regularContainedFile) content = readFileSync(service.definitionPath, 'utf8')
     } catch {
       // The evidence below records the definition as unreadable.
     }
@@ -436,7 +449,7 @@ function definitionEvidence(context, serviceReceipt, configPaths) {
       actual_sha256: actualSha256,
       argv,
       expected_argv: expectedArgv,
-      ok: pathMatches && hashMatches && argumentsMatch,
+      ok: regularContainedFile && pathMatches && hashMatches && argumentsMatch,
     }
   })
   return {
@@ -452,7 +465,7 @@ function serviceStateEvidence(context, serviceReceipt, key) {
   const service = matches[0]
   return {
     ok: matches.length === 1 && service?.name === expected?.name && service?.loaded === true &&
-      service?.enabled === true && service?.running === true && Number.isInteger(service?.pid) && service.pid > 0,
+      service?.running === true && Number.isInteger(service?.pid) && service.pid > 0,
     service: service ?? null,
   }
 }
@@ -475,7 +488,7 @@ function validServiceReceiptEnvelope(receipt, context, platformName) {
   for (const service of receipt.services) {
     if (!hasExactKeys(service, ['key', 'name', 'loaded', 'enabled', 'running', 'pid']) || serviceKeys.has(service.key)) return false
     const expected = context.services.find((entry) => entry.key === service.key)
-    if (!expected || service.name !== expected.name || service.loaded !== true || service.enabled !== true ||
+    if (!expected || service.name !== expected.name || service.loaded !== true || typeof service.enabled !== 'boolean' ||
       service.running !== true || !Number.isInteger(service.pid) || service.pid <= 0) return false
     serviceKeys.add(service.key)
   }
@@ -505,6 +518,8 @@ function validServiceReceiptEnvelope(receipt, context, platformName) {
 async function collectServiceChecks(opts, checks) {
   const requestedManager = opts.serviceManager ?? 'auto'
   const platformName = opts.platformName ?? process.platform
+  if (requestedManager === 'launchd' && platformName !== 'darwin') throw new Error('launchd requires darwin')
+  if (requestedManager === 'systemd' && platformName !== 'linux') throw new Error('systemd requires linux')
   const manager = resolveServiceManager(requestedManager, platformName)
   const prefix = resolve(opts.prefix ?? dirname(opts.daemonPath))
   const runtimeDir = resolve(opts.runtimeDir ?? join(prefix, 'runtime'))

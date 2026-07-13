@@ -6,14 +6,37 @@
 // for the live host rollout where start/stop control receipts may be gathered in
 // separate operator steps.
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
-import { createHash } from 'node:crypto'
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fchmodSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
 import { homedir } from 'node:os'
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { buildReceipt as buildHostReceipt } from './host-receipt.mjs'
 import { buildReceipt as buildRuntimeReceipt } from './runtime-receipt.mjs'
 import { buildReceipt as buildControlReceipt } from './control-receipt.mjs'
 import { buildReceipt as buildCutoverReceipt, controlRuns } from './cutover-receipt.mjs'
+import {
+  STARTER_ARTIFACT_ROLES,
+  STARTER_RECEIPT_TYPE,
+  normalizeStarterManifest,
+  normalizeStarterReceipt,
+} from './starter-contract.mjs'
 
 const EXPECTED = {
   install: 'mupot-fleet-install-receipt/v1',
@@ -24,7 +47,7 @@ const EXPECTED = {
   cutover_gate: 'mupot-sos-cutover-gate/v1',
   service: 'mupot-fleet-service-receipt/v1',
   continuous: 'mupot-fleet-continuous-runtime-receipt/v1',
-  starter: 'mupot-fleet-starter-receipt/v1',
+  starter: STARTER_RECEIPT_TYPE,
 }
 
 const STARTER_RECEIPT_ROLES = Object.freeze([
@@ -39,9 +62,9 @@ const EXPORT_RECEIPT_FILE = 'export-receipt.json'
 const MANIFEST_CHECK_RECEIPT_FILE = 'manifest-check.json'
 const SHA256_RE = /^[a-f0-9]{64}$/
 const SERVICE_KEYS = ['heartbeat', 'control']
-const STARTER_ARTIFACT_ROLES = ['starter_manifest', 'install', 'service', 'host', 'continuous', 'runtime_inbox', 'lifecycle_control', 'receipt_bundle_manifest']
-const STARTER_CHECKS = ['starter_manifest_valid', 'install_receipt_pass', 'service_receipt_pass', 'host_receipt_pass', 'continuous_receipt_pass', 'runtime_inbox_receipts_pass', 'lifecycle_control_receipts_pass', 'receipt_bundle_manifest_pass', 'artifact_paths_portable', 'artifact_digests_valid']
 const CONTINUOUS_CHECKS = ['linger_enabled', 'observation_completed_before_deadline', 'services_running', 'heartbeat_tick_advanced', 'control_poll_advanced', 'agent_probe_alive', 'signed_heartbeat_2xx', 'heartbeat_fresh_under_ttl', 'inbox_consume_not_failed']
+const PROJECTION_RECEIPT_TYPE = 'mupot-fleet-portable-evidence-projection/v1'
+const PROVENANCE_SCHEMA = 'mupot-fleet-portable-provenance/v1'
 
 const REQUIRED_HOST_RECEIPT_CHECKS = [
   { component: 'fleet-control-daemon', check: 'panel_public_key_public_only' },
@@ -342,7 +365,7 @@ function validServiceState(value, manager, key) {
     ? { heartbeat: 'fleet-daemon.service', control: 'fleet-control-daemon.service' }
     : { heartbeat: 'com.mumega.mupot-fleet-daemon', control: 'com.mumega.mupot-fleet-control' }
   return hasExactKeys(value, ['key', 'name', 'loaded', 'enabled', 'running', 'pid']) && value.key === key && value.name === names[key] &&
-    value.loaded === true && value.enabled === true && value.running === true && Number.isInteger(value.pid) && value.pid > 0
+    value.loaded === true && typeof value.enabled === 'boolean' && value.running === true && Number.isInteger(value.pid) && value.pid > 0
 }
 
 function normalizePassingServiceReceipt(receipt) {
@@ -404,16 +427,27 @@ function normalizeContinuousReceipt(receipt, agents, service) {
   if (!hasExactKeys(observation, ['started_at', 'deadline_at', 'timed_out', 'heartbeat', 'control']) || !validTimestamp(observation.started_at) || !validTimestamp(observation.deadline_at) || observation.timed_out !== false) return null
   if (!hasExactKeys(observation.heartbeat, ['schema', 'pid', 'started_at', 'last_tick_at', 'interval_sec', 'tick']) || observation.heartbeat.schema !== 'mupot-fleet-daemon-state/v1' ||
     !Number.isInteger(observation.heartbeat.pid) || observation.heartbeat.pid <= 0 || !validTimestamp(observation.heartbeat.started_at) || !validTimestamp(observation.heartbeat.last_tick_at) ||
-    !Number.isFinite(observation.heartbeat.interval_sec) || observation.heartbeat.interval_sec <= 0 || !hasExactKeys(observation.heartbeat.tick, ['before', 'after'])) return null
+    !Number.isFinite(observation.heartbeat.interval_sec) || observation.heartbeat.interval_sec < 15 || observation.heartbeat.interval_sec > 120 || !hasExactKeys(observation.heartbeat.tick, ['before', 'after'])) return null
   if (!hasExactKeys(observation.control, ['schema', 'pid', 'started_at', 'last_poll_at', 'poll_sec', 'last_outcome', 'poll']) || observation.control.schema !== 'mupot-fleet-control-state/v1' ||
     !Number.isInteger(observation.control.pid) || observation.control.pid <= 0 || !validTimestamp(observation.control.started_at) || !validTimestamp(observation.control.last_poll_at) ||
-    !Number.isFinite(observation.control.poll_sec) || observation.control.poll_sec <= 0 || !hasExactKeys(observation.control.poll, ['before', 'after']) || !hasExactKeys(observation.control.last_outcome, ['agent_id', 'verb', 'accepted', 'result'])) return null
+    !Number.isFinite(observation.control.poll_sec) || observation.control.poll_sec < 2 || observation.control.poll_sec > 120 || !hasExactKeys(observation.control.poll, ['before', 'after']) || !hasExactKeys(observation.control.last_outcome, ['agent_id', 'verb', 'accepted', 'result'])) return null
   const outcome = observation.control.last_outcome
   const acceptedResults = { start: 'open', stop: 'close', restart: 'restart_open', status: 'status_noop' }
+  const requestlessFailures = new Set(['peek_failed', 'consume_failed', 'invalid_json', 'request_not_object', 'bad_agent_id', 'bad_verb', 'bad_nonce', 'bad_ts', 'bad_sig', 'stale', 'bad_signature', 'replay'])
+  const requestFailures = {
+    start: new Set(['consume_failed', 'flight_command_failed']),
+    stop: new Set(['consume_failed', 'flight_command_failed']),
+    restart: new Set(['consume_failed', 'flight_command_failed']),
+    status: new Set(['consume_failed']),
+  }
   const outcomeValid = (outcome.agent_id === null && outcome.verb === null && outcome.accepted === true && outcome.result === 'idle') ||
     (typeof outcome.agent_id === 'string' && Object.hasOwn(acceptedResults, outcome.verb) && outcome.accepted === true && outcome.result === acceptedResults[outcome.verb]) ||
-    (outcome.accepted === false && typeof outcome.result === 'string' && ((outcome.agent_id === null && outcome.verb === null) || (typeof outcome.agent_id === 'string' && Object.hasOwn(acceptedResults, outcome.verb))))
+    (outcome.accepted === false && outcome.agent_id === null && outcome.verb === null && requestlessFailures.has(outcome.result)) ||
+    (outcome.accepted === false && typeof outcome.agent_id === 'string' && Object.hasOwn(requestFailures, outcome.verb) && requestFailures[outcome.verb].has(outcome.result))
   if (!outcomeValid) return null
+  if (observation.heartbeat.pid !== service.services.heartbeat.pid || observation.control.pid !== service.services.control.pid) return null
+  const counters = [observation.heartbeat.tick.before, observation.heartbeat.tick.after, observation.control.poll.before, observation.control.poll.after]
+  if (counters.some((counter) => !Number.isInteger(counter) || counter < 0)) return null
   const heartbeatDelta = observation.heartbeat.tick.after - observation.heartbeat.tick.before
   const controlDelta = observation.control.poll.after - observation.control.poll.before
   if (!Number.isFinite(heartbeatDelta) || heartbeatDelta <= 0 || !Number.isFinite(controlDelta) || controlDelta <= 0) return null
@@ -433,53 +467,283 @@ function normalizeContinuousReceipt(receipt, agents, service) {
   return { agent_id: receipt.agent.agent_id, heartbeat_delta: heartbeatDelta, control_delta: controlDelta }
 }
 
-function normalizeStarterReceipt(receipt) {
-  if (!hasExactKeys(receipt, ['receipt_type', 'generated_at', 'status', 'manifest', 'artifacts', 'checks']) || receipt.receipt_type !== EXPECTED.starter || receipt.status !== 'pass' || !validTimestamp(receipt.generated_at)) return null
-  if (!hasExactKeys(receipt.manifest, ['path', 'sha256']) || typeof receipt.manifest.path !== 'string' || receipt.manifest.path.length === 0 || isAbsolute(receipt.manifest.path) || !SHA256_RE.test(receipt.manifest.sha256)) return null
-  if (!Array.isArray(receipt.artifacts) || receipt.artifacts.length !== STARTER_ARTIFACT_ROLES.length) return null
-  const roles = new Set()
-  for (const artifact of receipt.artifacts) {
-    if (!hasExactKeys(artifact, ['role', 'path', 'sha256']) || !STARTER_ARTIFACT_ROLES.includes(artifact.role) || roles.has(artifact.role) ||
-      typeof artifact.path !== 'string' || artifact.path.length === 0 || isAbsolute(artifact.path) || artifact.path.includes('..') || !SHA256_RE.test(artifact.sha256)) return null
-    roles.add(artifact.role)
+const HOST_CHECK_KEYS = new Map([
+  ['fleet-daemon:config_valid', ['ok', 'component', 'check', 'path']],
+  ['fleet-daemon:base_url_real', ['ok', 'component', 'kind', 'check']],
+  ['fleet-daemon:tenant_real', ['ok', 'component', 'kind', 'check']],
+  ['fleet-daemon:heartbeat_cadence_under_ttl', ['ok', 'component', 'check', 'interval_sec']],
+  ['fleet-daemon:agent_private_key_present_0600', ['ok', 'component', 'check', 'agent_id', 'label', 'path', 'mode', 'size']],
+  ['fleet-daemon:probe_configured', ['ok', 'component', 'check', 'agent_id', 'probe']],
+  ['inbox-handler:config_valid', ['ok', 'component', 'check', 'path']],
+  ['inbox-handler:daemon_inbox_agent_has_handler_config', ['ok', 'component', 'check', 'agent_id']],
+  ['inbox-handler:spool_dir_configured', ['ok', 'component', 'check', 'agent_id', 'spool_dir', 'command_configured']],
+  ['fleet-control-daemon:config_valid', ['ok', 'component', 'check', 'path']],
+  ['fleet-control-daemon:base_url_real', ['ok', 'component', 'kind', 'check']],
+  ['fleet-control-daemon:tenant_real', ['ok', 'component', 'kind', 'check']],
+  ['fleet-control-daemon:consumer_private_key_present_0600', ['ok', 'component', 'check', 'agent_id', 'label', 'path', 'mode', 'size']],
+  ['fleet-control-daemon:panel_public_key_present', ['ok', 'component', 'check', 'label', 'path', 'mode', 'size']],
+  ['fleet-control-daemon:panel_public_key_public_only', ['ok', 'component', 'check', 'path']],
+  ['fleet-control-daemon:flights_config_present', ['ok', 'component', 'check', 'label', 'path', 'mode', 'size']],
+  ['fleet-control-daemon:flight_script_present', ['ok', 'component', 'check', 'label', 'path', 'mode', 'size']],
+  ['host-receipt:daemon_control_base_url_match', ['ok', 'component', 'check', 'daemon_base_url', 'control_base_url']],
+  ['host-receipt:daemon_control_tenant_match', ['ok', 'component', 'check', 'daemon_tenant', 'control_tenant']],
+  ['host-services:service_definitions_current', ['ok', 'component', 'check', 'service_manager', 'definition_dir', 'definitions']],
+  ['host-services:heartbeat_service_running', ['ok', 'component', 'check', 'service']],
+  ['host-services:control_service_running', ['ok', 'component', 'check', 'service']],
+  ['host-services:systemd_linger_enabled', ['ok', 'component', 'check', 'service_manager', 'applicable', 'linger']],
+  ['host-services:launchd_linger_not_applicable', ['ok', 'component', 'check', 'service_manager', 'applicable', 'linger']],
+])
+
+function normalizeHostReceipt(receipt, service, agents) {
+  if (!service || !hasExactKeys(receipt, ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'target', 'checks']) ||
+    receipt.receipt_type !== EXPECTED.host || receipt.status !== 'pass' || !validTimestamp(receipt.generated_at) ||
+    !hasExactKeys(receipt.summary, ['status', 'passed', 'failed', 'warnings']) || !Array.isArray(receipt.checks) || !sameSummary(receipt.summary, summarize(receipt.checks))) return null
+  if (!hasExactKeys(receipt.inputs, ['daemon_config', 'inbox_handler_config', 'control_config', 'exec_probes', 'service_manager', 'service_definition_dir']) ||
+    receipt.inputs.service_manager !== service.manager || typeof receipt.inputs.exec_probes !== 'boolean' ||
+    ['daemon_config', 'inbox_handler_config', 'control_config', 'service_definition_dir'].some((key) => typeof receipt.inputs[key] !== 'string' || receipt.inputs[key].length === 0)) return null
+  if (!hasExactKeys(receipt.target, ['base_url', 'tenant', 'daemon_agents', 'control_consumer_agent']) ||
+    typeof receipt.target.base_url !== 'string' || typeof receipt.target.tenant !== 'string' || typeof receipt.target.control_consumer_agent !== 'string' ||
+    !Array.isArray(receipt.target.daemon_agents) || new Set(receipt.target.daemon_agents).size !== receipt.target.daemon_agents.length || agents.some((agent) => !receipt.target.daemon_agents.includes(agent))) return null
+
+  const indexed = new Map()
+  for (const check of receipt.checks) {
+    const id = `${check?.component}:${check?.check}`
+    const keys = HOST_CHECK_KEYS.get(id)
+    if (!keys || !hasExactKeys(check, keys) || check.ok !== true || indexed.has(id)) return null
+    indexed.set(id, check)
   }
-  if (!Array.isArray(receipt.checks) || receipt.checks.length !== STARTER_CHECKS.length || receipt.checks.some((check, index) => !hasExactKeys(check, ['check', 'ok']) || check.check !== STARTER_CHECKS[index] || check.ok !== true)) return null
-  return { manifest_sha256: receipt.manifest.sha256 }
+  for (const required of HOST_CHECK_KEYS.keys()) {
+    if (required === 'host-services:launchd_linger_not_applicable' || required === 'host-services:systemd_linger_enabled') continue
+    if (!indexed.has(required)) return null
+  }
+  const lingerId = service.manager === 'systemd' ? 'host-services:systemd_linger_enabled' : 'host-services:launchd_linger_not_applicable'
+  if (!indexed.has(lingerId)) return null
+
+  const definitionsCheck = indexed.get('host-services:service_definitions_current')
+  if (definitionsCheck.service_manager !== service.manager || definitionsCheck.definition_dir !== receipt.inputs.service_definition_dir ||
+    !Array.isArray(definitionsCheck.definitions) || definitionsCheck.definitions.length !== SERVICE_KEYS.length) return null
+  const hashes = {}
+  for (const definition of definitionsCheck.definitions) {
+    if (!hasExactKeys(definition, ['service', 'path', 'expected_sha256', 'rendered_sha256', 'actual_sha256', 'argv', 'expected_argv', 'ok']) ||
+      !SERVICE_KEYS.includes(definition.service) || hashes[definition.service] || definition.ok !== true ||
+      definition.expected_sha256 !== service.definitions[definition.service] || definition.rendered_sha256 !== definition.expected_sha256 || definition.actual_sha256 !== definition.expected_sha256 ||
+      !Array.isArray(definition.argv) || definition.argv.some((arg) => typeof arg !== 'string') || JSON.stringify(definition.argv) !== JSON.stringify(definition.expected_argv)) return null
+    hashes[definition.service] = definition.actual_sha256
+  }
+  for (const [key, checkName] of [['heartbeat', 'heartbeat_service_running'], ['control', 'control_service_running']]) {
+    const check = indexed.get(`host-services:${checkName}`)
+    if (JSON.stringify(check.service) !== JSON.stringify(service.services[key])) return null
+  }
+  const linger = indexed.get(lingerId)
+  if (linger.service_manager !== service.manager || JSON.stringify(linger.linger) !== JSON.stringify(service.linger)) return null
+  return { target: receipt.target, definition_hashes: hashes }
 }
 
-function normalizeStarterEvidence({ serviceReceipt, continuousReceipt, starterReceipt, hostReceipt, agents }) {
+function exactSummaryEnvelope(receipt, keys) {
+  return hasExactKeys(receipt, keys) && validTimestamp(receipt.generated_at) && hasExactKeys(receipt.summary, ['status', 'passed', 'failed', 'warnings']) &&
+    Array.isArray(receipt.checks) && sameSummary(receipt.summary, summarize(receipt.checks))
+}
+
+const RUNTIME_CHECK_KEYS = new Map([
+  ['runtime-receipt:daemon_config_read', [['ok', 'component', 'check', 'path', 'reason']]],
+  ['runtime-receipt:daemon_config_valid', [['ok', 'component', 'check', 'path'], ['ok', 'component', 'check', 'path', 'reason']]],
+  ['runtime-receipt:agent_configured', [['ok', 'component', 'check', 'agent_id']]],
+  ['runtime-receipt:agent_private_key_loaded', [['ok', 'component', 'check', 'agent_id'], ['ok', 'component', 'check', 'agent_id', 'reason']]],
+  ['runtime-receipt:selected_agents_present', [['ok', 'component', 'check']]],
+  ['runtime-receipt:runnable_agents_present', [['ok', 'component', 'check']]],
+  ['fleet-daemon:probe_alive', [['ok', 'component', 'check', 'agent_id']]],
+  ['fleet-daemon:signed_attach_ok', [['ok', 'component', 'check', 'agent_id', 'status']]],
+  ['fleet-daemon:inbox_not_configured', [['ok', 'component', 'check', 'agent_id']]],
+  ['fleet-daemon:signed_inbox_peek_ok', [['ok', 'component', 'check', 'agent_id', 'status']]],
+  ['fleet-daemon:inbox_no_messages_to_handoff', [['ok', 'component', 'check', 'agent_id']]],
+  ['fleet-daemon:signed_inbox_handoff_consumed', [['ok', 'component', 'check', 'agent_id', 'action', 'status', 'messages']]],
+])
+
+function runtimeCheckSchemaExact(check) {
+  const variants = RUNTIME_CHECK_KEYS.get(`${check?.component}:${check?.check}`)
+  return Boolean(variants?.some((keys) => hasExactKeys(check, keys)))
+}
+
+function normalizeRuntimeInboxReceipt(receipt, agentId, hostTarget) {
+  if (!exactSummaryEnvelope(receipt, ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'target', 'checks', 'agents']) ||
+    receipt.receipt_type !== EXPECTED.runtime || receipt.status !== 'pass' ||
+    !hasExactKeys(receipt.inputs, ['daemon_config', 'selected_agents']) || JSON.stringify(receipt.inputs.selected_agents) !== JSON.stringify([agentId]) ||
+    !hasExactKeys(receipt.target, ['base_url', 'tenant', 'agents']) || receipt.target.base_url !== hostTarget.base_url || receipt.target.tenant !== hostTarget.tenant || JSON.stringify(receipt.target.agents) !== JSON.stringify([agentId]) ||
+    receipt.checks.some((check) => !runtimeCheckSchemaExact(check)) || !Array.isArray(receipt.agents) || receipt.agents.length !== 1) return null
+  const result = receipt.agents[0]
+  if (!hasExactKeys(result, ['agent', 'probe', 'heartbeat', 'inbox']) || result.agent !== agentId || result.probe !== 'alive' ||
+    !hasExactKeys(result.heartbeat, ['ok', 'status']) || result.heartbeat.ok !== true || result.heartbeat.status < 200 || result.heartbeat.status >= 300 ||
+    !hasExactKeys(result.inbox, ['agent', 'ok', 'action', 'status', 'messages', 'remaining', 'consumed']) || result.inbox.agent !== agentId || result.inbox.ok !== true || result.inbox.consumed !== true) return null
+  return receipt
+}
+
+function legacyRuntimeInboxReceiptSchemaExact(receipt, agentId, hostTarget) {
+  if (!hasExactKeys(receipt, ['receipt_type', 'generated_at', 'status', 'inputs', 'target', 'agents', 'checks']) ||
+    receipt.receipt_type !== EXPECTED.runtime || receipt.status !== 'pass' || !validTimestamp(receipt.generated_at) ||
+    !hasExactKeys(receipt.inputs, ['selected_agents']) || JSON.stringify(receipt.inputs.selected_agents) !== JSON.stringify([agentId]) ||
+    !hasExactKeys(receipt.target, ['base_url', 'tenant', 'agents']) || receipt.target.base_url !== hostTarget.base_url ||
+    receipt.target.tenant !== hostTarget.tenant || JSON.stringify(receipt.target.agents) !== JSON.stringify([agentId]) ||
+    !Array.isArray(receipt.agents) || receipt.agents.length !== 1 || !hasExactKeys(receipt.agents[0], ['agent']) || receipt.agents[0].agent !== agentId ||
+    !Array.isArray(receipt.checks) || receipt.checks.length !== 2) return false
+  return receipt.checks.every((check, index) =>
+    hasExactKeys(check, ['ok', 'component', 'check', 'agent_id']) && check.ok === true && check.component === 'fleet-daemon' &&
+    check.check === ['signed_attach_ok', 'signed_inbox_handoff_consumed'][index] && check.agent_id === agentId)
+}
+
+function normalizeLifecycleReceipt(receipt, agentId, verb, hostTarget) {
+  if (!exactSummaryEnvelope(receipt, ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'target', 'checks', 'poll']) ||
+    receipt.receipt_type !== EXPECTED.control || receipt.status !== 'pass' || !hasExactKeys(receipt.inputs, ['control_config', 'consumer_agent']) ||
+    !hasExactKeys(receipt.target, ['base_url', 'tenant', 'consumer_agent', 'executed_agents']) || receipt.target.base_url !== hostTarget.base_url || receipt.target.tenant !== hostTarget.tenant ||
+    receipt.target.consumer_agent !== receipt.inputs.consumer_agent || receipt.target.consumer_agent !== hostTarget.control_consumer_agent || JSON.stringify(receipt.target.executed_agents) !== JSON.stringify([agentId]) ||
+    !hasExactKeys(receipt.poll, ['ok', 'action', 'request']) || receipt.poll.ok !== true || !hasExactKeys(receipt.poll.request, ['agent_id', 'verb']) ||
+    receipt.poll.request.agent_id !== agentId || receipt.poll.request.verb !== verb) return null
+  const expectedAction = verb === 'start' ? 'open' : 'close'
+  if (receipt.poll.action !== expectedAction) return null
+  const execution = receipt.checks.filter((check) => check?.component === 'fleet-control-daemon' && check?.check === 'control_request_executed')
+  if (execution.length !== 1 || execution[0].ok !== true || execution[0].agent_id !== agentId || execution[0].verb !== verb || execution[0].action !== expectedAction) return null
+  return receipt
+}
+
+function roleReceiptPath(starterPath, reference) {
+  if (typeof reference !== 'string' || isAbsolute(reference)) return ''
+  const candidate = resolve(dirname(starterPath), reference)
+  return regularFileStat(candidate) && pathContainedBy(candidate, dirname(starterPath)) ? candidate : ''
+}
+
+function normalizeStarterEvidence({ serviceReceipt, continuousReceipt, starterReceipt, hostReceipt, agents, starterPath = '', outerManifestPath = '' }) {
   const service = normalizePassingServiceReceipt(serviceReceipt)
   const continuous = normalizeContinuousReceipt(continuousReceipt, agents, service)
   const starter = normalizeStarterReceipt(starterReceipt)
-  const requiredHostChecks = ['service_definitions_current', 'heartbeat_service_running', 'control_service_running', 'systemd_linger_enabled']
-  const hostChecks = Array.isArray(hostReceipt?.checks) ? hostReceipt.checks : []
-  const hostServiceChecks = requiredHostChecks.map((name) => hostChecks.filter((check) => check?.component === 'host-services' && check?.check === name && check?.ok === true))
-  const definitionsCheck = hostServiceChecks[0]?.[0]
-  const hostHashes = {}
-  for (const definition of definitionsCheck?.definitions ?? []) {
-    if (SERVICE_KEYS.includes(definition?.service) && definition?.ok === true && definition.actual_sha256 === definition.rendered_sha256 && definition.rendered_sha256 === definition.expected_sha256) hostHashes[definition.service] = definition.actual_sha256
+  const host = normalizeHostReceipt(hostReceipt, service, agents)
+  if (!service || !continuous || !starter || !host || !starterPath || agents.length !== 1 || continuous.agent_id !== agents[0]) return null
+  for (const definition of serviceReceipt.definitions) {
+    const localDefinition = resolve(dirname(starterPath), basename(definition.path))
+    if (!regularFileStat(localDefinition) || !pathContainedBy(localDefinition, dirname(starterPath)) || fileSha256(localDefinition, dirname(starterPath)) !== definition.sha256) return null
   }
-  const hostValid = hostReceipt?.receipt_type === EXPECTED.host && hostReceipt?.status === 'pass' && hostServiceChecks.every((matches) => matches.length === 1) &&
-    definitionsCheck?.service_manager === service?.manager && SERVICE_KEYS.every((key) => hostHashes[key] === service?.definitions[key]) &&
-    agents.every((agent) => hostReceipt?.target?.daemon_agents?.includes(agent))
-  if (!service || !continuous || !starter || !hostValid) return null
-  return { service_manager: service.manager, platform: service.platform, definition_hashes: service.definitions, observed_deltas: { heartbeat_tick: continuous.heartbeat_delta, control_poll: continuous.control_delta }, starter_manifest_sha256: starter.manifest_sha256, agent_id: continuous.agent_id, tenant: hostReceipt.target?.tenant ?? null }
+
+  const manifestPath = roleReceiptPath(starterPath, starter.manifest.path)
+  if (!manifestPath || fileSha256(manifestPath, dirname(starterPath)) !== starter.manifest.sha256) return null
+  const starterManifest = normalizeStarterManifest(projectionContent(readReceipt(manifestPath, dirname(starterPath))))
+  if (!starterManifest || starterManifest.tenant !== host.target.tenant || starterManifest.base_url !== host.target.base_url ||
+    !['auto', service.manager].includes(starterManifest.service_manager) || !starterManifest.agents.some((agent) => agent.agent_id === continuous.agent_id) ||
+    starterManifest.control_consumer_agent_id !== host.target.control_consumer_agent) return null
+
+  const roleReceipts = {}
+  for (const artifact of starter.artifacts) {
+    const path = roleReceiptPath(starterPath, artifact.path)
+    if (!path || fileSha256(path, dirname(starterPath)) !== artifact.sha256) return null
+    if (artifact.role === 'receipt_bundle_manifest' && (basename(path) === 'manifest.json' || (outerManifestPath && resolve(path) === resolve(outerManifestPath)))) return null
+    const receipt = projectionContent(readReceipt(path, dirname(starterPath)))
+    if (!receipt) return null
+    roleReceipts[artifact.role] = receipt
+  }
+  if (roleReceipts.install?.receipt_type !== EXPECTED.install || !['pass', 'warn'].includes(roleReceipts.install.status) ||
+    roleReceipts.service?.receipt_type !== EXPECTED.service || JSON.stringify(roleReceipts.service) !== JSON.stringify(serviceReceipt) ||
+    roleReceipts.host?.receipt_type !== EXPECTED.host || JSON.stringify(roleReceipts.host) !== JSON.stringify(hostReceipt) ||
+    roleReceipts.continuous?.receipt_type !== EXPECTED.continuous || JSON.stringify(roleReceipts.continuous) !== JSON.stringify(continuousReceipt)) return null
+  if (!normalizeRuntimeInboxReceipt(roleReceipts.runtime_inbox, continuous.agent_id, host.target) ||
+    !normalizeLifecycleReceipt(roleReceipts.lifecycle_control_start, continuous.agent_id, 'start', host.target) ||
+    !normalizeLifecycleReceipt(roleReceipts.lifecycle_control_stop, continuous.agent_id, 'stop', host.target)) return null
+  const prior = roleReceipts.receipt_bundle_manifest
+  if (!manifestSchemaExact(prior) || prior.receipt_type !== 'mupot-fleet-receipt-bundle/v1' || prior.status !== 'pass' ||
+    !sameSummary(prior.summary, summarize(prior.checks))) return null
+  return { service_manager: service.manager, platform: service.platform, definition_hashes: service.definitions, observed_deltas: { heartbeat_tick: continuous.heartbeat_delta, control_poll: continuous.control_delta }, starter_manifest_sha256: starter.manifest.sha256, agent_id: continuous.agent_id, tenant: hostReceipt.target?.tenant ?? null }
+}
+
+function regularFileStat(path) {
+  try {
+    const stat = lstatSync(path)
+    return !stat.isSymbolicLink() && stat.isFile() ? stat : null
+  } catch {
+    return null
+  }
+}
+
+function regularDirectoryStat(path) {
+  try {
+    const stat = lstatSync(path)
+    return !stat.isSymbolicLink() && stat.isDirectory() ? stat : null
+  } catch {
+    return null
+  }
+}
+
+function pathContainedBy(path, root) {
+  try {
+    const rootReal = realpathSync(root)
+    const pathReal = realpathSync(path)
+    const rel = relative(rootReal, pathReal)
+    return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
+  } catch {
+    return false
+  }
+}
+
+function readRegularBytes(path, root = '') {
+  if (!regularFileStat(path) || (root && !pathContainedBy(path, root))) return null
+  try {
+    return readFileSync(path)
+  } catch {
+    return null
+  }
+}
+
+function atomicWriteFile(path, bytes, { force = false } = {}) {
+  const parent = dirname(path)
+  if (!regularDirectoryStat(parent)) throw new Error('destination directory is not a regular directory')
+  let existing = null
+  try { existing = lstatSync(path) } catch {}
+  if (existing && (!force || existing.isSymbolicLink() || !existing.isFile())) {
+    throw new Error(existing.isSymbolicLink() ? 'destination is a symbolic link' : !existing.isFile() ? 'destination is not a regular file' : 'destination already exists')
+  }
+
+  const temp = join(parent, `.${basename(path)}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`)
+  let fd = null
+  try {
+    const noFollow = fsConstants.O_NOFOLLOW ?? 0
+    fd = openSync(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollow, 0o600)
+    writeFileSync(fd, bytes)
+    fchmodSync(fd, 0o600)
+    fsyncSync(fd)
+    closeSync(fd)
+    fd = null
+    let current = null
+    try { current = lstatSync(path) } catch {}
+    if (current && (current.isSymbolicLink() || !current.isFile())) throw new Error('destination changed to a non-regular file')
+    if (current && !force) throw new Error('destination already exists')
+    renameSync(temp, path)
+    const written = lstatSync(path)
+    if (written.isSymbolicLink() || !written.isFile()) throw new Error('destination did not become a regular file')
+  } catch (err) {
+    if (fd !== null) {
+      try { closeSync(fd) } catch {}
+    }
+    try { unlinkSync(temp) } catch {}
+    throw err
+  }
 }
 
 function ensureDir(path, checks) {
   try {
-    mkdirSync(path, { recursive: true, mode: 0o700 })
+    if (existsSync(path)) {
+      if (!regularDirectoryStat(path)) throw new Error('path is a symbolic link or non-directory')
+    } else {
+      mkdirSync(path, { recursive: true, mode: 0o700 })
+      if (!regularDirectoryStat(path)) throw new Error('created path is not a regular directory')
+    }
     chmodSync(path, 0o700)
+    if ((lstatSync(path).mode & 0o777) !== 0o700) throw new Error('directory permissions are not 0700')
     checks.push({ ok: true, component: 'receipt-bundle', check: 'out_dir_ready', path })
+    return true
   } catch (err) {
     checks.push({ ok: false, component: 'receipt-bundle', check: 'out_dir_ready', path, reason: String(err && err.message ? err.message : err) })
+    return false
   }
 }
 
 function writeJson(path, value, opts, checks, label) {
   try {
-    writeFileSync(path, JSON.stringify(value, null, 2) + '\n', { mode: 0o600, flag: opts.force ? 'w' : 'wx' })
-    chmodSync(path, 0o600)
+    atomicWriteFile(path, JSON.stringify(value, null, 2) + '\n', opts)
     checks.push({ ok: true, component: 'receipt-bundle', check: `${label}_receipt_written`, path })
     return true
   } catch (err) {
@@ -489,13 +753,13 @@ function writeJson(path, value, opts, checks, label) {
 }
 
 function writeJsonUnchecked(path, value, opts) {
-  writeFileSync(path, JSON.stringify(value, null, 2) + '\n', { mode: 0o600, flag: opts.force ? 'w' : 'wx' })
-  chmodSync(path, 0o600)
+  atomicWriteFile(path, JSON.stringify(value, null, 2) + '\n', opts)
 }
 
-function readReceipt(path) {
+function readReceipt(path, root = '') {
   try {
-    return JSON.parse(readFileSync(path, 'utf8'))
+    const bytes = readRegularBytes(path, root)
+    return bytes ? JSON.parse(bytes.toString('utf8')) : null
   } catch {
     return null
   }
@@ -597,12 +861,9 @@ function hasBundleScopeFailures(manifestCheck) {
   return bundleScopeChecks(manifestCheck).some((check) => check.ok === false)
 }
 
-function fileSha256(path) {
-  try {
-    return createHash('sha256').update(readFileSync(path)).digest('hex')
-  } catch {
-    return null
-  }
+function fileSha256(path, root = '') {
+  const bytes = readRegularBytes(path, root)
+  return bytes ? createHash('sha256').update(bytes).digest('hex') : null
 }
 
 function receiptMeta(path) {
@@ -629,12 +890,16 @@ function manifestStarterMode(manifest) {
   return manifest?.inputs?.bundle_mode === 'starter-ready'
 }
 
-function resolveArtifactPath(manifestDir, declaredPath) {
+function resolveArtifactPath(manifestDir, declaredPath, { allowExternal = false } = {}) {
   if (typeof declaredPath !== 'string' || declaredPath.length === 0) return ''
-  const localPath = join(manifestDir, basename(declaredPath))
-  if (existsSync(localPath)) return localPath
-  if (declaredPath.startsWith('~/') || isAbsolute(declaredPath)) return pathArg(declaredPath)
-  return resolve(manifestDir, declaredPath)
+  const local = join(manifestDir, basename(declaredPath))
+  if (regularFileStat(local) && pathContainedBy(local, manifestDir)) return local
+  if (declaredPath.startsWith('~/') || isAbsolute(declaredPath)) {
+    const external = pathArg(declaredPath)
+    return allowExternal && regularFileStat(external) ? external : ''
+  }
+  const candidate = resolve(manifestDir, declaredPath)
+  return regularFileStat(candidate) && pathContainedBy(candidate, manifestDir) ? candidate : ''
 }
 
 function bundleArtifactEntries(manifest) {
@@ -843,13 +1108,8 @@ function nextSteps(manifest) {
 function addNextStepChecks(checks, manifestPath, manifest, hardGateSummary) {
   const steps = nextSteps(manifest)
   const ready = hardGateSummary?.status === 'pass'
-  const readySteps = []
-  if (!manifest?.artifacts?.install) {
-    const installPath = manifest?.inputs?.out_dir === '.' ? './install.json' : join(manifest?.inputs?.out_dir ?? '', 'install.json')
-    readySteps.push(`optional: save installer output as ${installPath} and pass --install-receipt so install evidence travels with the bundle`)
-  }
-  readySteps.push(NEXT_STEP_ATTACH)
-  const exactPolicy = ready ? JSON.stringify(steps) === JSON.stringify(readySteps) : steps.at(-1) === NEXT_STEP_HOLD
+  const expectedSteps = ready ? [NEXT_STEP_ATTACH] : [NEXT_STEP_HOLD]
+  const exactPolicy = JSON.stringify(steps) === JSON.stringify(expectedSteps)
   checks.push({
     ok: Array.isArray(manifest?.next_steps),
     component: 'receipt-bundle-check',
@@ -885,30 +1145,52 @@ function addNextStepChecks(checks, manifestPath, manifest, hardGateSummary) {
     path: manifestPath,
     ready,
   })
-  if (manifestStarterMode(manifest)) checks.push({ ok: exactPolicy, component: 'receipt-bundle-check', check: 'next_steps_exact_policy', path: manifestPath, ready })
+  if (manifestStarterMode(manifest) || !exactPolicy) checks.push({ ok: exactPolicy, component: 'receipt-bundle-check', check: 'next_steps_exact_policy', path: manifestPath, ready })
 }
 
 function manifestSchemaExact(manifest) {
   const starter = manifestStarterMode(manifest)
-  const topKeys = ['receipt_type', 'generated_at', 'status', 'summary', 'integrity', 'inputs', 'artifacts', 'next_steps', 'checks']
+  const portable = Object.hasOwn(manifest ?? {}, 'provenance')
+  const topKeys = ['receipt_type', 'generated_at', 'status', 'summary', 'integrity', 'inputs', 'artifacts', 'next_steps', 'checks', ...(portable ? ['provenance'] : [])]
   const inputKeys = ['agents', 'out_dir', 'daemon_config', 'inbox_handler_config', 'control_config', 'install_receipt', 'probe_receipts', 'control_label', 'required_control_verbs', 'exec_probes', 'verify_only', 'skip_host', 'skip_runtime', 'skip_control', ...(starter ? ['bundle_mode'] : [])]
   const artifactKeys = ['out_dir', 'install', 'probes', 'host', 'runtimes', 'controls', 'cutover_gate', 'manifest', ...(starter ? ['service', 'continuous', 'starter'] : [])]
   const metaKeys = ['path', 'receipt_type', 'status', 'sha256']
   if (!hasExactKeys(manifest, topKeys) || !hasExactKeys(manifest.summary, ['status', 'passed', 'failed', 'warnings']) ||
     !hasExactKeys(manifest.integrity, ['algorithm', 'covers', 'excludes']) || !hasExactKeys(manifest.inputs, inputKeys) || !hasExactKeys(manifest.artifacts, artifactKeys) ||
     !Array.isArray(manifest.next_steps) || !Array.isArray(manifest.checks) || !Array.isArray(manifest.artifacts.probes) || !Array.isArray(manifest.artifacts.runtimes) || !Array.isArray(manifest.artifacts.controls)) return false
+  if (portable) {
+    if (!starter || !hasExactKeys(manifest.provenance, ['schema', 'projections']) || manifest.provenance.schema !== PROVENANCE_SCHEMA || !Array.isArray(manifest.provenance.projections) || manifest.provenance.projections.length === 0) return false
+    const roles = new Set()
+    const paths = new Set()
+    for (const entry of manifest.provenance.projections) {
+      if (!hasExactKeys(entry, ['role', 'path', 'source_receipt_type', 'source_sha256', 'projection_sha256', 'artifact_sha256']) ||
+        typeof entry.role !== 'string' || entry.role.length === 0 || typeof entry.path !== 'string' || basename(entry.path) !== entry.path ||
+        typeof entry.source_receipt_type !== 'string' || !SHA256_RE.test(entry.source_sha256) || !SHA256_RE.test(entry.projection_sha256) || !SHA256_RE.test(entry.artifact_sha256) ||
+        roles.has(entry.role) || paths.has(entry.path)) return false
+      roles.add(entry.role)
+      paths.add(entry.path)
+    }
+  }
   const metas = [manifest.artifacts.install, ...manifest.artifacts.probes, manifest.artifacts.host, ...manifest.artifacts.runtimes, ...manifest.artifacts.controls, manifest.artifacts.cutover_gate,
     ...(starter ? [manifest.artifacts.service, manifest.artifacts.continuous, manifest.artifacts.starter] : [])].filter((meta) => meta !== null)
   return metas.every((meta) => hasExactKeys(meta, metaKeys))
 }
 
 function addStarterEvidenceValidation(checks, component, artifacts, agents, extra = {}) {
+  const starterPath = artifacts.starter?.path ?? ''
+  const outerManifestPath = typeof extra.path === 'string'
+    ? extra.path
+    : typeof artifacts.manifest === 'string'
+      ? artifacts.manifest
+      : artifacts.manifest?.path ?? ''
   const evidence = normalizeStarterEvidence({
-    serviceReceipt: artifacts.service?.path ? readReceipt(artifacts.service.path) : null,
-    continuousReceipt: artifacts.continuous?.path ? readReceipt(artifacts.continuous.path) : null,
-    starterReceipt: artifacts.starter?.path ? readReceipt(artifacts.starter.path) : null,
-    hostReceipt: artifacts.host?.path ? readReceipt(artifacts.host.path) : null,
+    serviceReceipt: artifacts.service?.path ? projectionContent(readReceipt(artifacts.service.path)) : null,
+    continuousReceipt: artifacts.continuous?.path ? projectionContent(readReceipt(artifacts.continuous.path)) : null,
+    starterReceipt: starterPath ? projectionContent(readReceipt(starterPath)) : null,
+    hostReceipt: artifacts.host?.path ? projectionContent(readReceipt(artifacts.host.path)) : null,
     agents,
+    starterPath,
+    outerManifestPath,
   })
   checks.push({ ok: Boolean(evidence), component, check: 'starter_evidence_contracts_valid', ...extra })
   return evidence
@@ -1110,18 +1392,86 @@ function supportingEvidenceEntries(bundleDir, manifest) {
   const entries = []
   const serviceMeta = manifest?.artifacts?.service
   const servicePath = serviceMeta?.path ? resolveArtifactPath(bundleDir, serviceMeta.path) : ''
-  const service = servicePath ? readReceipt(servicePath) : null
+  const service = servicePath ? projectionContent(readReceipt(servicePath)) : null
   for (const definition of Array.isArray(service?.definitions) ? service.definitions : []) {
     if (SERVICE_KEYS.includes(definition?.service) && typeof definition.path === 'string') entries.push({ label: `definition:${definition.service}`, path: resolveArtifactPath(bundleDir, definition.path), sha256: definition.sha256 })
   }
   const starterMeta = manifest?.artifacts?.starter
   const starterPath = starterMeta?.path ? resolveArtifactPath(bundleDir, starterMeta.path) : ''
-  const starter = starterPath ? readReceipt(starterPath) : null
+  const starter = starterPath ? projectionContent(readReceipt(starterPath)) : null
   if (typeof starter?.manifest?.path === 'string') entries.push({ label: 'starter_manifest', path: resolveArtifactPath(bundleDir, starter.manifest.path), sha256: starter.manifest.sha256 })
+  const prior = starter?.artifacts?.find((artifact) => artifact?.role === 'receipt_bundle_manifest')
+  if (typeof prior?.path === 'string') entries.push({ label: 'receipt_bundle_manifest', path: resolveArtifactPath(bundleDir, prior.path), sha256: prior.sha256 })
   return entries
 }
 
+const SIDECAR_CHECK_RECORD_KEYS = new Set([
+  'ok', 'component', 'check', 'path', 'reason', 'source', 'sha256', 'artifact', 'declared_path', 'file_name',
+  'export_dir', 'status', 'sidecar', 'export_receipt', 'manifest_check', 'source_dir', 'actual', 'expected', 'count',
+  'directory', 'allowed', 'unexpected', 'findings', 'finding_count', 'agents', 'declared_mode', 'starter_artifacts',
+  'artifact_paths', 'mode', 'checked_path', 'expected_path', 'accepted', 'required_component', 'required_check',
+  'base_url', 'base_urls', 'tenant', 'artifacts', 'tenants', 'selected_agents', 'agent_id', 'expected_file', 'ready',
+])
+
+function summarySchemaExact(value) {
+  return hasExactKeys(value, ['status', 'passed', 'failed', 'warnings']) &&
+    ['pass', 'warn', 'fail'].includes(value.status) &&
+    [value.passed, value.failed, value.warnings].every((count) => Number.isInteger(count) && count >= 0)
+}
+
+function sidecarCheckRecordSchemaExact(value) {
+  if (!isPlainObject(value) || ![true, false, null].includes(value.ok) || typeof value.component !== 'string' || typeof value.check !== 'string') return false
+  if (Object.keys(value).some((key) => !SIDECAR_CHECK_RECORD_KEYS.has(key))) return false
+  for (const key of ['expected', 'actual']) {
+    if (isPlainObject(value[key]) && !summarySchemaExact(value[key])) return false
+  }
+  if (Object.hasOwn(value, 'findings') && (!Array.isArray(value.findings) || value.findings.some((finding) => {
+    const keys = Object.hasOwn(finding ?? {}, 'field') ? ['path', 'reason', 'field'] : ['path', 'reason']
+    return !hasExactKeys(finding, keys)
+  }))) return false
+  return true
+}
+
+function sidecarManifestSchemaExact(value) {
+  return value === null || (hasExactKeys(value, ['path', 'receipt_type', 'status', 'generated_at', 'sha256']) &&
+    typeof value.path === 'string' && typeof value.receipt_type === 'string' && typeof value.status === 'string' &&
+    validTimestamp(value.generated_at) && SHA256_RE.test(value.sha256 ?? ''))
+}
+
+function copiedEntrySchemaExact(value) {
+  if (!isPlainObject(value)) return false
+  const artifactMeta = Object.hasOwn(value, 'receipt_type') || Object.hasOwn(value, 'status')
+  const provenance = ['source_sha256', 'projection_sha256', 'source_receipt_type', 'role'].some((key) => Object.hasOwn(value, key))
+  const keys = [
+    'label', 'source', 'path', 'sha256',
+    ...(artifactMeta ? ['receipt_type', 'status'] : []),
+    ...(provenance ? ['source_sha256', 'projection_sha256', 'source_receipt_type', 'role'] : []),
+  ]
+  if (!hasExactKeys(value, keys) || typeof value.label !== 'string' || typeof value.source !== 'string' || typeof value.path !== 'string' || !SHA256_RE.test(value.sha256 ?? '')) return false
+  if (artifactMeta && (typeof value.receipt_type !== 'string' || typeof value.status !== 'string')) return false
+  return !provenance || (SHA256_RE.test(value.source_sha256 ?? '') && SHA256_RE.test(value.projection_sha256 ?? '') &&
+    typeof value.source_receipt_type === 'string' && typeof value.role === 'string')
+}
+
+function exportSidecarSchemaExact(receipt, file) {
+  if (!summarySchemaExact(receipt?.summary) || !validTimestamp(receipt?.generated_at) || !Array.isArray(receipt?.checks) ||
+    receipt.checks.some((check) => !sidecarCheckRecordSchemaExact(check)) || receipt.status !== receipt.summary.status) return false
+  if (file === MANIFEST_CHECK_RECEIPT_FILE) {
+    return hasExactKeys(receipt, ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'manifest', 'checks']) &&
+      hasExactKeys(receipt.inputs, ['manifest', 'out_dir']) && sidecarManifestSchemaExact(receipt.manifest)
+  }
+  return hasExactKeys(receipt, ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'artifacts', 'manifest_check', 'next_steps', 'checks']) &&
+    hasExactKeys(receipt.inputs, ['manifest', 'out_dir', 'export_dir']) && hasExactKeys(receipt.artifacts, ['copied', 'sidecars']) &&
+    Array.isArray(receipt.artifacts.copied) && receipt.artifacts.copied.every(copiedEntrySchemaExact) &&
+    Array.isArray(receipt.artifacts.sidecars) && receipt.artifacts.sidecars.every((sidecar) =>
+      hasExactKeys(sidecar, ['label', 'path', 'receipt_type']) && typeof sidecar.label === 'string' && typeof sidecar.path === 'string' && typeof sidecar.receipt_type === 'string') &&
+    hasExactKeys(receipt.manifest_check, ['status', 'summary', 'manifest']) && typeof receipt.manifest_check.status === 'string' &&
+    summarySchemaExact(receipt.manifest_check.summary) && sidecarManifestSchemaExact(receipt.manifest_check.manifest) &&
+    Array.isArray(receipt.next_steps) && receipt.next_steps.every((step) => typeof step === 'string')
+}
+
 function addExportSidecarChecks(checks, manifestPath, manifestDir, manifest, opts = {}) {
+  if (opts.skipExportSidecars) return
   const requireSidecars = isPortableExportManifest(manifest) && !opts.allowMissingSidecars
   const manifestHash = fileSha256(manifestPath)
 
@@ -1141,13 +1491,7 @@ function addExportSidecarChecks(checks, manifestPath, manifestDir, manifest, opt
     if (!present) continue
 
     const receipt = readReceipt(path)
-    const expectedKeys = sidecar.file === MANIFEST_CHECK_RECEIPT_FILE
-      ? ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'manifest', 'checks']
-      : ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'artifacts', 'manifest_check', 'next_steps', 'checks']
-    const nestedSchemaOk = sidecar.file === MANIFEST_CHECK_RECEIPT_FILE
-      ? hasExactKeys(receipt?.inputs, ['manifest', 'out_dir']) && (receipt?.manifest === null || hasExactKeys(receipt?.manifest, ['path', 'receipt_type', 'status', 'generated_at', 'sha256']))
-      : hasExactKeys(receipt?.inputs, ['manifest', 'out_dir', 'export_dir']) && hasExactKeys(receipt?.artifacts, ['copied', 'sidecars']) && Array.isArray(receipt?.next_steps)
-    const schemaExact = hasExactKeys(receipt, expectedKeys) && nestedSchemaOk
+    const schemaExact = exportSidecarSchemaExact(receipt, sidecar.file)
     if (manifestStarterMode(manifest)) checks.push({ ok: schemaExact, component: 'receipt-bundle-check', check: 'export_sidecar_schema_exact', path: manifestPath, sidecar: sidecar.file, checked_path: path })
     let sidecarMode = null
     try { sidecarMode = statSync(path).mode & 0o777 } catch {}
@@ -1316,6 +1660,11 @@ function checkBundleManifest(opts = {}) {
     path: manifestPath || null,
   })
 
+  const bundleDirectoryRegular = Boolean(manifestDir && regularDirectoryStat(manifestDir))
+  if (manifestDir && !bundleDirectoryRegular) {
+    checks.push({ ok: false, component: 'receipt-bundle-check', check: 'bundle_directory_regular', path: manifestDir })
+  }
+
   if (manifestPath) {
     manifest = readReceipt(manifestPath)
     checks.push({
@@ -1327,6 +1676,10 @@ function checkBundleManifest(opts = {}) {
   }
 
   if (manifest) {
+    if (manifestStarterMode(manifest)) {
+      checks.push({ ok: bundleDirectoryRegular, component: 'receipt-bundle-check', check: 'bundle_directory_regular', path: manifestDir })
+      checks.push({ ok: Boolean(regularFileStat(manifestPath) && pathContainedBy(manifestPath, manifestDir)), component: 'receipt-bundle-check', check: 'manifest_regular_file', path: manifestPath })
+    }
     const schemaExact = manifestSchemaExact(manifest)
     if (manifestStarterMode(manifest)) checks.push({ ok: schemaExact, component: 'receipt-bundle-check', check: 'manifest_schema_exact', path: manifestPath })
     let manifestMode = null
@@ -1407,12 +1760,20 @@ function checkBundleManifest(opts = {}) {
     addExportSidecarChecks(checks, manifestPath, manifestDir, manifest, opts)
     if (manifestStarterMode(manifest)) {
       const supports = supportingEvidenceEntries(manifestDir, manifest)
-      checks.push({ ok: supports.length === 3, component: 'receipt-bundle-check', check: 'portable_supporting_evidence_complete', path: manifestPath, count: supports.length })
+      checks.push({ ok: supports.length === 4, component: 'receipt-bundle-check', check: 'portable_supporting_evidence_complete', path: manifestPath, count: supports.length })
       for (const support of supports) {
         let mode = null
-        try { mode = statSync(support.path).mode & 0o777 } catch {}
+        try { mode = lstatSync(support.path).mode & 0o777 } catch {}
         checks.push({ ok: SHA256_RE.test(support.sha256 ?? '') && fileSha256(support.path) === support.sha256, component: 'receipt-bundle-check', check: 'supporting_evidence_sha256_match', artifact: support.label, path: support.path })
         checks.push({ ok: mode === 0o600, component: 'receipt-bundle-check', check: 'supporting_evidence_permissions_0600', artifact: support.label, mode })
+        if (manifest.provenance) {
+          const raw = readReceipt(support.path, manifestDir)
+          const role = support.label.startsWith('definition:') ? `service_definition_${support.label.split(':')[1]}` : support.label
+          const mapping = manifest.provenance.projections.find((entry) => entry.role === role)
+          const contentSha = projectionSchemaExact(raw) ? sha256Bytes(jsonBytes(raw.content)) : null
+          checks.push({ ok: Boolean(projectionSchemaExact(raw) && contentSha === raw.projection_sha256), component: 'receipt-bundle-check', check: 'projection_content_sha256_match', artifact: support.label, path: support.path })
+          checks.push({ ok: Boolean(mapping && projectionSchemaExact(raw) && mapping.path === basename(support.path) && mapping.role === raw.role && mapping.role === role && mapping.source_receipt_type === raw.source_receipt_type && mapping.source_sha256 === raw.source_sha256 && mapping.projection_sha256 === raw.projection_sha256 && mapping.artifact_sha256 === fileSha256(support.path)), component: 'receipt-bundle-check', check: 'projection_chain_valid', artifact: support.label, path: support.path })
+        }
       }
     }
 
@@ -1420,12 +1781,40 @@ function checkBundleManifest(opts = {}) {
       const expectedLocalPath = typeof entry.path === 'string' && entry.path.length > 0
         ? join(manifestDir, basename(entry.path))
         : ''
-      const checkedPath = resolveArtifactPath(manifestDir, entry.path)
-      const receipt = checkedPath ? readReceipt(checkedPath) : null
+      const checkedPath = resolveArtifactPath(manifestDir, entry.path, { allowExternal: !manifestStarterMode(manifest) })
+      const artifactRegular = Boolean(checkedPath && regularFileStat(checkedPath) && pathContainedBy(checkedPath, manifestDir))
+      if (manifestStarterMode(manifest) || !artifactRegular) {
+        checks.push({ ok: artifactRegular, component: 'receipt-bundle-check', check: 'artifact_regular_file', artifact: entry.label, path: checkedPath || null })
+      }
+      const rawReceipt = checkedPath ? readReceipt(checkedPath, manifestDir) : null
+      const projection = manifest?.provenance ? rawReceipt : null
+      const receipt = projectionSchemaExact(projection) ? projection.content : rawReceipt
       if (receipt) receiptRecords.push({ label: entry.label, receipt, checkedPath })
       const actual = checkedPath ? fileSha256(checkedPath) : null
       const expectedOk = typeof entry.sha256 === 'string' && /^[a-f0-9]{64}$/.test(entry.sha256)
       const expectedType = expectedArtifactType(entry.label)
+      if (manifest?.provenance) {
+        const mapping = manifest.provenance.projections.find((candidate) => candidate.path === basename(entry.path ?? ''))
+        const projectionContentSha = projectionSchemaExact(projection) ? sha256Bytes(jsonBytes(projection.content)) : null
+        checks.push({
+          ok: Boolean(projectionSchemaExact(projection) && projectionContentSha === projection.projection_sha256),
+          component: 'receipt-bundle-check',
+          check: 'projection_content_sha256_match',
+          artifact: entry.label,
+          path: checkedPath || null,
+          expected: projection?.projection_sha256 ?? null,
+          actual: projectionContentSha,
+        })
+        checks.push({
+          ok: Boolean(mapping && projectionSchemaExact(projection) && mapping.role === projection.role && mapping.role === projectionRole(entry.label, receipt) &&
+            mapping.source_receipt_type === projection.source_receipt_type && mapping.source_receipt_type === entry.receipt_type && mapping.source_sha256 === projection.source_sha256 &&
+            mapping.projection_sha256 === projection.projection_sha256 && mapping.artifact_sha256 === actual),
+          component: 'receipt-bundle-check',
+          check: 'projection_chain_valid',
+          artifact: entry.label,
+          path: checkedPath || null,
+        })
+      }
       checks.push({
         ok: typeof entry.path === 'string' && entry.path.length > 0,
         component: 'receipt-bundle-check',
@@ -1479,6 +1868,21 @@ function checkBundleManifest(opts = {}) {
         declared_path: entry.path ?? null,
         checked_path: checkedPath || null,
       })
+      if (entry.label.startsWith('runtime:')) {
+        const runtimeAgent = Array.isArray(receipt?.inputs?.selected_agents) && receipt.inputs.selected_agents.length === 1
+          ? receipt.inputs.selected_agents[0]
+          : null
+        const hostTarget = receiptRecords.find((record) => record.label === 'host')?.receipt?.target
+        checks.push({
+          ok: Boolean(runtimeAgent && agents.includes(runtimeAgent) && hostTarget &&
+            (normalizeRuntimeInboxReceipt(receipt, runtimeAgent, hostTarget) || legacyRuntimeInboxReceiptSchemaExact(receipt, runtimeAgent, hostTarget))),
+          component: 'receipt-bundle-check',
+          check: 'artifact_receipt_schema_exact',
+          artifact: entry.label,
+          declared_path: entry.path ?? null,
+          checked_path: checkedPath || null,
+        })
+      }
       checks.push({
         ok: receipt?.receipt_type === entry.receipt_type,
         component: 'receipt-bundle-check',
@@ -1584,13 +1988,14 @@ function checkBundleManifest(opts = {}) {
     } : null,
     checks,
   }
-  return isPortableExportManifest(manifest) ? portableEvidenceValue(receipt, [manifestDir]) : receipt
+  return isPortableExportManifest(manifest) ? portableKnownPathProjection(receipt) : receipt
 }
 
 function copyEvidenceFile(source, dest, opts, checks, label) {
   try {
-    writeFileSync(dest, readFileSync(source), { mode: 0o600, flag: opts.force ? 'w' : 'wx' })
-    chmodSync(dest, 0o600)
+    const bytes = readRegularBytes(source)
+    if (!bytes) throw new Error('source is a symlink, non-regular file, or unreadable')
+    atomicWriteFile(dest, bytes, opts)
     checks.push({
       ok: true,
       component: 'receipt-bundle-export',
@@ -1613,47 +2018,6 @@ function copyEvidenceFile(source, dest, opts, checks, label) {
   }
 }
 
-function localPathField(key) {
-  if (key === 'receipt_type' || String(key).endsWith('_type')) return false
-  return /(^|_)(path|dir|directory|config|receipt|receipts|source|manifest)(_|$)/i.test(String(key))
-}
-
-function portablePathValue(value, key) {
-  if (typeof value !== 'string') return value
-  if (key === 'out_dir' || key === 'directory' || key === 'source_dir' || key === 'export_dir') return value ? '.' : value
-  if (!localPathField(key)) return value
-  if (!value || value === '.' || value.startsWith('<')) return value
-  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)) return value
-  if (value.includes('/') || value.startsWith('~')) return basename(value)
-  return value
-}
-
-function portableManifestValue(value, key = '') {
-  if (Array.isArray(value)) return value.map((item) => portableManifestValue(item, key))
-  if (value && typeof value === 'object') {
-    const out = {}
-    for (const [childKey, childValue] of Object.entries(value)) {
-      out[childKey] = portableManifestValue(childValue, childKey)
-    }
-    return out
-  }
-  return portablePathValue(value, key)
-}
-
-function portableEvidenceValue(value, sourcePrefixes = []) {
-  if (Array.isArray(value)) return value.map((item) => portableEvidenceValue(item, sourcePrefixes))
-  if (value && typeof value === 'object') {
-    const out = {}
-    for (const [key, child] of Object.entries(value)) out[key] = portableEvidenceValue(child, sourcePrefixes)
-    return out
-  }
-  if (typeof value !== 'string' || /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)) return value
-  let projected = value
-  for (const prefix of sourcePrefixes.filter(Boolean)) projected = projected.split(prefix).join('.')
-  if (isAbsolute(projected) || projected.startsWith('~/')) return basename(projected)
-  return projected
-}
-
 function artifactMetaForLabel(manifest, label) {
   if (label.startsWith('probe:')) return manifest.artifacts.probes[Number(label.split(':')[1]) - 1]
   if (label.startsWith('runtime:')) return manifest.artifacts.runtimes[Number(label.split(':')[1]) - 1]
@@ -1661,17 +2025,181 @@ function artifactMetaForLabel(manifest, label) {
   return manifest.artifacts[label]
 }
 
-function finalizePortableStarterExport(sourceManifest, sourceDir, exportDir, copied) {
-  for (const item of copied) {
-    if (item.label === 'manifest' || !item.path?.endsWith('.json')) continue
-    const receipt = readReceipt(item.path)
-    if (!receipt?.receipt_type) continue
-    const portable = portableEvidenceValue(receipt, [sourceDir, exportDir])
-    writeFileSync(item.path, JSON.stringify(portable, null, 2) + '\n', { mode: 0o600, flag: 'w' })
-    chmodSync(item.path, 0o600)
-    item.sha256 = fileSha256(item.path)
+const PORTABLE_PATH_FIELDS = new Set([
+  'path', 'checked_path', 'expected_path', 'declared_path', 'source', 'directory', 'out_dir', 'source_dir', 'prefix', 'systemd_dir',
+  'node_path', 'service_definition_dir', 'runtime_dir', 'agents_dir', 'handlers_dir', 'inbox_dir', 'logs_dir', 'state_dir', 'receipts_dir',
+  'daemon_config', 'inbox_handler_config', 'control_config', 'install_receipt', 'export_dir', 'definition_dir', 'spool_dir', 'host_receipt',
+  'manifest', 'export_receipt', 'manifest_check',
+])
+const PORTABLE_PATH_ARRAY_FIELDS = new Set(['runtime_files', 'probe_receipts', 'runtime_receipts', 'control_receipts', 'argv', 'expected_argv'])
+
+function portableKnownPath(value) {
+  if (typeof value !== 'string' || value.length === 0 || value === '.' || value.startsWith('<') || /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)) return value
+  return isAbsolute(value) || value.startsWith('~/') || value.includes('/') ? basename(value) : value
+}
+
+function portableKnownPathProjection(value, key = '') {
+  if (Array.isArray(value)) {
+    return PORTABLE_PATH_ARRAY_FIELDS.has(key)
+      ? value.map((entry) => typeof entry === 'string' ? portableKnownPath(entry) : portableKnownPathProjection(entry))
+      : value.map((entry) => portableKnownPathProjection(entry))
   }
-  const manifest = portableManifestForExport(sourceManifest, sourceDir)
+  if (isPlainObject(value)) {
+    const projected = {}
+    for (const [childKey, child] of Object.entries(value)) projected[childKey] = portableKnownPathProjection(child, childKey)
+    return projected
+  }
+  if (PORTABLE_PATH_FIELDS.has(key)) return portableKnownPath(value)
+  return value
+}
+
+function jsonBytes(value) {
+  return Buffer.from(`${JSON.stringify(value, null, 2)}\n`)
+}
+
+function sha256Bytes(bytes) {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+function projectionEnvelope(role, sourceReceiptType, sourceSha256, content) {
+  const projectionSha256 = sha256Bytes(jsonBytes(content))
+  return {
+    receipt_type: PROJECTION_RECEIPT_TYPE,
+    role,
+    source_receipt_type: sourceReceiptType,
+    source_sha256: sourceSha256,
+    projection_sha256: projectionSha256,
+    content,
+  }
+}
+
+function projectionSchemaExact(value) {
+  return hasExactKeys(value, ['receipt_type', 'role', 'source_receipt_type', 'source_sha256', 'projection_sha256', 'content']) &&
+    value.receipt_type === PROJECTION_RECEIPT_TYPE && typeof value.role === 'string' && value.role.length > 0 &&
+    typeof value.source_receipt_type === 'string' && value.source_receipt_type.length > 0 && SHA256_RE.test(value.source_sha256) && SHA256_RE.test(value.projection_sha256)
+}
+
+function projectionContent(receipt) {
+  return projectionSchemaExact(receipt) ? receipt.content : receipt
+}
+
+function projectionRole(label, receipt) {
+  if (label.startsWith('runtime:')) return 'runtime_inbox'
+  if (label.startsWith('control:')) {
+    const verb = receipt?.poll?.request?.verb
+    if (verb === 'start') return 'lifecycle_control_start'
+    if (verb === 'stop') return 'lifecycle_control_stop'
+    return `lifecycle_control_${safeName(verb ?? label.split(':')[1])}`
+  }
+  return label
+}
+
+function projectionSourceType(item, receipt) {
+  if (item.label.startsWith('definition:')) return 'mupot-fleet-service-definition/v1'
+  if (item.label === 'starter_manifest') return 'mupot-fleet-starter-manifest/v1'
+  return receipt?.receipt_type ?? 'application/json'
+}
+
+function portableReceiptContent(receipt) {
+  return portableKnownPathProjection(receipt)
+}
+
+function finalizePortableStarterExport(sourceManifest, sourceDir, exportDir, copied) {
+  const projected = new Map()
+  const manifestItem = copied.find((item) => item.label === 'manifest')
+  const projectionItems = copied.filter((item) => item.label !== 'manifest')
+  const writeProjection = (item, role, sourceType, sourceSha256, content) => {
+    const envelope = projectionEnvelope(role, sourceType, sourceSha256, content)
+    atomicWriteFile(item.path, jsonBytes(envelope), { force: true })
+    item.sha256 = fileSha256(item.path)
+    item.source_sha256 = sourceSha256
+    item.projection_sha256 = envelope.projection_sha256
+    item.source_receipt_type = sourceType
+    item.role = role
+    projected.set(role, { item, envelope })
+    return envelope
+  }
+
+  for (const item of projectionItems.filter((candidate) => candidate.label.startsWith('definition:'))) {
+    const bytes = readRegularBytes(item.source)
+    if (!bytes) continue
+    const content = { encoding: 'base64', data: bytes.toString('base64') }
+    writeProjection(item, `service_definition_${item.label.split(':')[1]}`, 'mupot-fleet-service-definition/v1', sha256Bytes(bytes), content)
+  }
+  const starterManifestItem = projectionItems.find((item) => item.label === 'starter_manifest')
+  if (starterManifestItem) {
+    const sourceReceipt = readReceipt(starterManifestItem.source)
+    writeProjection(starterManifestItem, 'starter_manifest', 'mupot-fleet-starter-manifest/v1', fileSha256(starterManifestItem.source), normalizeStarterManifest(sourceReceipt) ?? sourceReceipt)
+  }
+  const priorItem = projectionItems.find((item) => item.label === 'receipt_bundle_manifest')
+  if (priorItem) {
+    const sourceReceipt = readReceipt(priorItem.source)
+    writeProjection(priorItem, 'receipt_bundle_manifest', sourceReceipt?.receipt_type ?? 'application/json', fileSha256(priorItem.source), portableReceiptContent(sourceReceipt))
+  }
+
+  for (const item of projectionItems.filter((candidate) => !candidate.label.startsWith('definition:') && !['starter_manifest', 'receipt_bundle_manifest', 'starter'].includes(candidate.label))) {
+    const sourceReceipt = readReceipt(item.source)
+    if (!sourceReceipt) continue
+    const role = projectionRole(item.label, sourceReceipt)
+    const content = portableReceiptContent(sourceReceipt)
+    if (sourceReceipt.receipt_type === EXPECTED.service) {
+      for (const definition of content.definitions ?? []) {
+        const support = projected.get(`service_definition_${definition.service}`)?.item
+        if (support) {
+          definition.path = basename(support.path)
+          definition.sha256 = support.sha256
+        }
+      }
+    }
+    if (sourceReceipt.receipt_type === EXPECTED.host) {
+      const definitions = content.checks?.find((check) => check?.component === 'host-services' && check?.check === 'service_definitions_current')?.definitions ?? []
+      for (const definition of definitions) {
+        const support = projected.get(`service_definition_${definition.service}`)?.item
+        if (support) {
+          definition.path = basename(support.path)
+          definition.expected_sha256 = support.sha256
+          definition.rendered_sha256 = support.sha256
+          definition.actual_sha256 = support.sha256
+        }
+      }
+    }
+    if (sourceReceipt.receipt_type === EXPECTED.install) {
+      for (const definition of content.outputs?.service_definitions ?? []) {
+        const support = projected.get(`service_definition_${definition.service}`)?.item
+        if (support) {
+          definition.path = basename(support.path)
+          definition.sha256 = support.sha256
+        }
+      }
+    }
+    writeProjection(item, role, projectionSourceType(item, sourceReceipt), fileSha256(item.source), content)
+  }
+
+  const starterItem = projectionItems.find((item) => item.label === 'starter')
+  if (starterItem) {
+    const sourceStarter = normalizeStarterReceipt(readReceipt(starterItem.source))
+    if (sourceStarter) {
+      const content = portableReceiptContent(sourceStarter)
+      const manifestProjection = projected.get('starter_manifest')?.item
+      if (manifestProjection) {
+        content.manifest.path = basename(manifestProjection.path)
+        content.manifest.sha256 = manifestProjection.sha256
+      }
+      for (const artifact of content.artifacts) {
+        const evidence = projected.get(artifact.role)?.item
+        if (evidence) {
+          artifact.path = basename(evidence.path)
+          artifact.sha256 = evidence.sha256
+        }
+      }
+      writeProjection(starterItem, 'starter', STARTER_RECEIPT_TYPE, fileSha256(starterItem.source), content)
+    }
+  }
+
+  const manifest = portableKnownPathProjection(sourceManifest)
+  manifest.inputs.out_dir = '.'
+  manifest.artifacts.out_dir = '.'
+  manifest.artifacts.manifest = 'manifest.json'
   for (const entry of bundleArtifactEntries(manifest)) {
     const item = copied.find((candidate) => candidate.label === entry.label)
     const meta = artifactMetaForLabel(manifest, entry.label)
@@ -1680,29 +2208,25 @@ function finalizePortableStarterExport(sourceManifest, sourceDir, exportDir, cop
       meta.sha256 = item.sha256
     }
   }
-  const manifestPath = join(exportDir, 'manifest.json')
-  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n', { mode: 0o600, flag: 'w' })
-  chmodSync(manifestPath, 0o600)
-  const manifestItem = copied.find((item) => item.label === 'manifest')
-  if (manifestItem) manifestItem.sha256 = fileSha256(manifestPath)
-}
-
-function replaceStringValue(value, needle, replacement) {
-  if (Array.isArray(value)) return value.map((item) => replaceStringValue(item, needle, replacement))
-  if (value && typeof value === 'object') {
-    const out = {}
-    for (const [childKey, childValue] of Object.entries(value)) {
-      out[childKey] = replaceStringValue(childValue, needle, replacement)
-    }
-    return out
+  manifest.provenance = {
+    schema: PROVENANCE_SCHEMA,
+    projections: [...projected.values()].map(({ item, envelope }) => ({
+      role: envelope.role,
+      path: basename(item.path),
+      source_receipt_type: envelope.source_receipt_type,
+      source_sha256: envelope.source_sha256,
+      projection_sha256: envelope.projection_sha256,
+      artifact_sha256: item.sha256,
+    })),
   }
-  if (typeof value === 'string' && needle) return value.split(needle).join(replacement)
-  return value
+  const manifestPath = join(exportDir, 'manifest.json')
+  atomicWriteFile(manifestPath, jsonBytes(manifest), { force: true })
+  if (manifestItem) manifestItem.sha256 = fileSha256(manifestPath)
+  return manifest.provenance.projections
 }
 
 function portableManifestForExport(manifest, sourceDir = '') {
-  let portable = portableManifestValue(manifest)
-  if (sourceDir) portable = replaceStringValue(portable, sourceDir, '.')
+  const portable = portableKnownPathProjection(manifest)
   if (portable?.artifacts && typeof portable.artifacts === 'object') {
     portable.artifacts.out_dir = '.'
     portable.artifacts.manifest = 'manifest.json'
@@ -1716,8 +2240,7 @@ function portableManifestForExport(manifest, sourceDir = '') {
 function writeExportManifest(sourceManifest, dest, opts, checks) {
   const portable = portableManifestForExport(sourceManifest, opts.sourceDir)
   try {
-    writeFileSync(dest, JSON.stringify(portable, null, 2) + '\n', { mode: 0o600, flag: opts.force ? 'w' : 'wx' })
-    chmodSync(dest, 0o600)
+    atomicWriteFile(dest, jsonBytes(portable), opts)
     checks.push({
       ok: true,
       component: 'receipt-bundle-export',
@@ -1741,17 +2264,13 @@ function writeExportManifest(sourceManifest, dest, opts, checks) {
 }
 
 function portableExportSidecarReceipt(receipt, opts = {}) {
-  let portable = portableManifestValue(receipt)
-  if (opts.sourceDir) portable = replaceStringValue(portable, opts.sourceDir, '.')
-  if (opts.exportDir) portable = replaceStringValue(portable, opts.exportDir, '.')
-  return portable
+  return portableKnownPathProjection(receipt)
 }
 
 function writeExportSidecar(path, receipt, opts, checks, label) {
   try {
     const portable = portableExportSidecarReceipt(receipt, opts)
-    writeFileSync(path, JSON.stringify(portable, null, 2) + '\n', { mode: 0o600, flag: opts.force ? 'w' : 'wx' })
-    chmodSync(path, 0o600)
+    atomicWriteFile(path, jsonBytes(portable), opts)
     checks.push({
       ok: true,
       component: 'receipt-bundle-export',
@@ -1776,8 +2295,7 @@ function writeExportSidecar(path, receipt, opts, checks, label) {
 
 function overwriteExportSidecar(path, receipt, opts = {}) {
   const portable = portableExportSidecarReceipt(receipt, opts)
-  writeFileSync(path, JSON.stringify(portable, null, 2) + '\n', { mode: 0o600, flag: 'w' })
-  chmodSync(path, 0o600)
+  atomicWriteFile(path, jsonBytes(portable), { force: true })
 }
 
 function makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck }) {
@@ -1826,6 +2344,8 @@ function exportBundle(opts = {}) {
   const sourceDir = manifestPath ? dirname(manifestPath) : ''
   const exportDir = opts.exportDir ? pathArg(opts.exportDir) : ''
   let manifest = null
+  let sourceCheck = null
+  let exportDirReady = false
   const copied = []
 
   checks.push({
@@ -1856,11 +2376,15 @@ function exportBundle(opts = {}) {
       check: 'source_manifest_read',
       path: manifestPath,
     })
+    if (manifest && manifestStarterMode(manifest)) {
+      sourceCheck = checkBundleManifest({ manifestPath })
+      checks.push({ ok: sourceCheck.status === 'pass', component: 'receipt-bundle-export', check: 'source_manifest_check_pass', path: manifestPath, status: sourceCheck.status })
+    }
   }
 
-  if (exportDir) ensureDir(exportDir, checks)
+  if (exportDir) exportDirReady = ensureDir(exportDir, checks)
 
-  if (manifest && exportDir && sourceDir && resolve(sourceDir) !== resolve(exportDir)) {
+  if (manifest && (!manifestStarterMode(manifest) || sourceCheck?.status === 'pass') && exportDirReady && sourceDir && resolve(sourceDir) !== resolve(exportDir)) {
     const manifestDest = join(exportDir, 'manifest.json')
     if (writeExportManifest(manifest, manifestDest, { ...opts, sourceDir }, checks)) {
       copied.push({ label: 'manifest', source: manifestPath, path: manifestDest, sha256: fileSha256(manifestDest) })
@@ -1911,7 +2435,7 @@ function exportBundle(opts = {}) {
     if (manifestStarterMode(manifest)) finalizePortableStarterExport(manifest, sourceDir, exportDir, copied)
   }
 
-  let manifestCheck = exportDir ? checkBundleManifest({ outDir: exportDir, allowMissingSidecars: true }) : null
+  let manifestCheck = exportDirReady ? checkBundleManifest({ outDir: exportDir, allowMissingSidecars: true, skipExportSidecars: true }) : null
   checks.push({
     ok: manifestCheck?.status === 'pass',
     component: 'receipt-bundle-export',
@@ -1922,7 +2446,7 @@ function exportBundle(opts = {}) {
 
   const exportReceiptPath = exportDir ? join(exportDir, EXPORT_RECEIPT_FILE) : ''
   const manifestCheckPath = exportDir ? join(exportDir, MANIFEST_CHECK_RECEIPT_FILE) : ''
-  if (exportDir && manifestCheck) {
+  if (exportDirReady && manifestCheck) {
     const baseReceipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck })
     const sidecarOpts = { ...opts, sourceDir, exportDir }
     writeExportSidecar(manifestCheckPath, manifestCheck, sidecarOpts, checks, 'manifest_check')
@@ -1938,7 +2462,7 @@ function exportBundle(opts = {}) {
   }
 
   let receipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck })
-  if (exportDir && manifestCheck) {
+  if (exportDirReady && manifestCheck) {
     const sidecarOpts = { ...opts, sourceDir, exportDir }
     try {
       overwriteExportSidecar(manifestCheckPath, manifestCheck, sidecarOpts)
@@ -1968,7 +2492,7 @@ function exportBundle(opts = {}) {
     }
   }
 
-  return manifestStarterMode(manifest) ? portableEvidenceValue(receipt, [sourceDir, exportDir]) : receipt
+  return manifestStarterMode(manifest) ? portableKnownPathProjection(receipt) : receipt
 }
 
 function firstMeta(path) {
@@ -1976,11 +2500,19 @@ function firstMeta(path) {
 }
 
 function starterEvidence(artifacts, agents) {
-  const service = artifacts.service?.path ? readReceipt(artifacts.service.path) : null
-  const continuous = artifacts.continuous?.path ? readReceipt(artifacts.continuous.path) : null
-  const starter = artifacts.starter?.path ? readReceipt(artifacts.starter.path) : null
-  const host = artifacts.host?.path ? readReceipt(artifacts.host.path) : null
-  return normalizeStarterEvidence({ serviceReceipt: service, continuousReceipt: continuous, starterReceipt: starter, hostReceipt: host, agents })
+  const service = artifacts.service?.path ? projectionContent(readReceipt(artifacts.service.path)) : null
+  const continuous = artifacts.continuous?.path ? projectionContent(readReceipt(artifacts.continuous.path)) : null
+  const starter = artifacts.starter?.path ? projectionContent(readReceipt(artifacts.starter.path)) : null
+  const host = artifacts.host?.path ? projectionContent(readReceipt(artifacts.host.path)) : null
+  return normalizeStarterEvidence({
+    serviceReceipt: service,
+    continuousReceipt: continuous,
+    starterReceipt: starter,
+    hostReceipt: host,
+    agents,
+    starterPath: artifacts.starter?.path ?? '',
+    outerManifestPath: typeof artifacts.manifest === 'string' ? artifacts.manifest : artifacts.manifest?.path ?? '',
+  })
 }
 
 function statusCheck(checks, check, ok, extra = {}) {
@@ -2388,7 +2920,7 @@ function inspectBundleStatus(opts = {}) {
   })
 
   const summary = summarize(checks)
-  const next = buildNextSteps({
+  const next = buildDetailedNextSteps({
     artifacts,
     agents,
     gateReceipt,
@@ -2421,7 +2953,7 @@ function inspectBundleStatus(opts = {}) {
     next_steps: next,
     checks,
   }
-  return isPortableExportManifest(manifest) ? portableEvidenceValue(receipt, [outDir]) : receipt
+  return isPortableExportManifest(manifest) ? portableKnownPathProjection(receipt) : receipt
 }
 
 function addReceiptStatusCheck(checks, label, path, receipt, expectedType) {
@@ -2534,7 +3066,7 @@ function includeStarterReceipt(outDir, opts, checks, roleSpec) {
   })
   if (!source) return null
 
-  let receipt = readReceipt(source)
+  const receipt = readReceipt(source)
   checks.push({
     ok: Boolean(receipt),
     component: 'receipt-bundle',
@@ -2547,30 +3079,46 @@ function includeStarterReceipt(outDir, opts, checks, roleSpec) {
     return { path: dest, receipt_type: null, status: null, sha256: null }
   }
 
+  const copySupport = (supportSource, supportDest, digest, label) => {
+    const digestOk = Boolean(supportSource && regularFileStat(supportSource) && fileSha256(supportSource) === digest)
+    checks.push({ ok: digestOk, component: 'receipt-bundle', check: `${label}_source_sha256_match`, path: supportSource || null })
+    if (!digestOk) return false
+    if (existsSync(supportDest)) {
+      const reused = Boolean(regularFileStat(supportDest) && fileSha256(supportDest) === digest)
+      checks.push({ ok: reused, component: 'receipt-bundle', check: `${label}_reused`, path: supportDest })
+      return reused
+    }
+    return copyEvidenceFile(supportSource, supportDest, opts, checks, label)
+  }
+
   if (role === 'service' && Array.isArray(receipt.definitions)) {
-    const definitions = receipt.definitions.map((definition) => {
+    for (const definition of receipt.definitions) {
       const supportSource = typeof definition?.path === 'string' ? pathArg(definition.path) : ''
       const supportDest = supportSource ? join(outDir, basename(supportSource)) : ''
-      const digestOk = Boolean(supportSource && fileSha256(supportSource) === definition.sha256)
-      checks.push({ ok: digestOk, component: 'receipt-bundle', check: 'service_definition_source_sha256_match', service: definition?.service ?? null, path: supportSource || null })
-      if (digestOk) copyEvidenceFile(supportSource, supportDest, { ...opts, force: true }, checks, `service_definition_${safeName(definition.service)}`)
-      return { ...definition, path: supportDest ? basename(supportDest) : definition.path }
-    })
-    receipt = { ...receipt, definitions }
+      copySupport(supportSource, supportDest, definition?.sha256, `service_definition_${safeName(definition?.service ?? 'unknown')}`)
+    }
   }
-  if (role === 'starter' && typeof receipt.manifest?.path === 'string') {
-    const supportSource = resolve(dirname(source), receipt.manifest.path)
-    const supportDest = join(outDir, basename(receipt.manifest.path))
-    const digestOk = fileSha256(supportSource) === receipt.manifest.sha256
-    checks.push({ ok: digestOk, component: 'receipt-bundle', check: 'starter_manifest_source_sha256_match', path: supportSource })
-    if (digestOk) copyEvidenceFile(supportSource, supportDest, { ...opts, force: true }, checks, 'starter_manifest')
-    receipt = { ...receipt, manifest: { ...receipt.manifest, path: basename(receipt.manifest.path) } }
+  if (role === 'starter') {
+    const normalized = normalizeStarterReceipt(receipt)
+    checks.push({ ok: Boolean(normalized), component: 'receipt-bundle', check: 'starter_receipt_schema_exact', path: source })
+    if (normalized) {
+      const supportSource = roleReceiptPath(source, normalized.manifest.path)
+      const supportDest = join(outDir, normalized.manifest.path)
+      const copiedManifest = copySupport(supportSource, supportDest, normalized.manifest.sha256, 'starter_manifest')
+      const manifest = copiedManifest ? normalizeStarterManifest(readReceipt(supportDest, outDir)) : null
+      checks.push({ ok: Boolean(manifest), component: 'receipt-bundle', check: 'starter_manifest_schema_exact', path: supportDest })
+      for (const artifact of normalized.artifacts) {
+        const artifactSource = roleReceiptPath(source, artifact.path)
+        const artifactDest = join(outDir, artifact.path)
+        copySupport(artifactSource, artifactDest, artifact.sha256, `starter_artifact_${safeName(artifact.role)}`)
+      }
+    }
   }
 
   if (resolve(source) === resolve(dest)) {
-    checks.push({ ok: true, component: 'receipt-bundle', check: `${role}_receipt_reused`, path: dest })
+    checks.push({ ok: Boolean(regularFileStat(dest)), component: 'receipt-bundle', check: `${role}_receipt_reused`, path: dest })
   } else {
-    writeJson(dest, receipt, opts, checks, role)
+    copyEvidenceFile(source, dest, opts, checks, `${role}_receipt`)
   }
   addReceiptStatusCheck(checks, role, source, receipt, EXPECTED[role])
   const secretFindings = findSecretMaterial(receipt)
@@ -2637,12 +3185,25 @@ function listReceiptFiles(outDir, prefix) {
     .sort()
 }
 
-function secureBundleJsonFiles(outDir) {
-  if (!existsSync(outDir)) return
-  chmodSync(outDir, 0o700)
-  for (const name of readdirSync(outDir)) {
-    if (name.endsWith('.json')) chmodSync(join(outDir, name), 0o600)
+function secureBundleJsonFiles(outDir, checks = []) {
+  if (!regularDirectoryStat(outDir)) {
+    checks.push({ ok: false, component: 'receipt-bundle', check: 'bundle_directory_regular', path: outDir })
+    return false
   }
+  chmodSync(outDir, 0o700)
+  let ok = true
+  for (const name of readdirSync(outDir)) {
+    if (!name.endsWith('.json')) continue
+    const path = join(outDir, name)
+    if (!regularFileStat(path) || !pathContainedBy(path, outDir)) {
+      ok = false
+      checks.push({ ok: false, component: 'receipt-bundle', check: 'bundle_json_regular_file', path })
+      continue
+    }
+    chmodSync(path, 0o600)
+  }
+  if (!ok) checks.push({ ok: false, component: 'receipt-bundle', check: 'bundle_json_permissions_repaired', path: outDir })
+  return ok
 }
 
 function passPaths(paths, expectedType, checks, label) {
@@ -2697,7 +3258,7 @@ function missingControlVerbs(gateReceipt) {
   return [...new Set(missing)].sort()
 }
 
-function buildNextSteps({ artifacts, agents, gateReceipt, outDir, bundleStatus, requiredControlVerbs, controlEvidence }) {
+function buildDetailedNextSteps({ artifacts, agents, gateReceipt, outDir, bundleStatus, requiredControlVerbs, controlEvidence }) {
   const steps = []
   const add = (text) => {
     if (!steps.includes(text)) steps.push(text)
@@ -2755,6 +3316,10 @@ function buildNextSteps({ artifacts, agents, gateReceipt, outDir, bundleStatus, 
   return steps
 }
 
+function buildNextSteps({ bundleStatus, gateReceipt }) {
+  return bundleStatus === 'pass' && gateReceipt?.status === 'pass' ? [NEXT_STEP_ATTACH] : [NEXT_STEP_HOLD]
+}
+
 async function buildBundle(opts) {
   validateStarterReceiptOptions(opts, { rejectReadOnlyModes: true })
   const checks = []
@@ -2763,6 +3328,9 @@ async function buildBundle(opts) {
   const agents = [...new Set(opts.agents ?? [])]
   const verifyOnly = Boolean(opts.verifyOnly)
   const starterMode = starterModeSelected(opts)
+  const daemonPath = opts.daemonPath ?? join(homedir(), '.fleet', 'daemon.json')
+  const inboxPath = opts.inboxPath ?? join(homedir(), '.fleet', 'inbox-handler.json')
+  const controlPath = opts.controlPath ?? join(homedir(), '.fleet', 'control.json')
   const skipHost = Boolean(opts.skipHost || verifyOnly)
   const skipRuntime = Boolean(opts.skipRuntime || verifyOnly)
   const skipControl = Boolean(opts.skipControl || verifyOnly)
@@ -2804,9 +3372,9 @@ async function buildBundle(opts) {
   if (!skipHost) {
     const path = join(outDir, 'host.json')
     const result = await runAndWrite('host', path, hostBuilder, {
-      daemonPath: opts.daemonPath,
-      inboxPath: opts.inboxPath,
-      controlPath: opts.controlPath,
+      daemonPath,
+      inboxPath,
+      controlPath,
       skipInbox: false,
       skipControl: false,
       execProbes: Boolean(opts.execProbes),
@@ -2822,7 +3390,7 @@ async function buildBundle(opts) {
     for (const agentId of agents) {
       const path = join(outDir, `runtime-${safeName(agentId)}.json`)
       const result = await runAndWrite('runtime', path, runtimeBuilder, {
-        daemonPath: opts.daemonPath,
+        daemonPath,
         agents: [agentId],
         ...(opts.runtimeOptions ?? {}),
       }, opts, checks)
@@ -2836,7 +3404,7 @@ async function buildBundle(opts) {
     const label = opts.controlLabel ? safeName(opts.controlLabel) : stamp
     const path = join(outDir, `control-${label}.json`)
     const result = await runAndWrite('control', path, controlBuilder, {
-      controlPath: opts.controlPath,
+      controlPath,
       ...(opts.controlOptions ?? {}),
     }, opts, checks)
     artifacts.controls.push({ label, ...receiptMeta(result.path) })
@@ -2884,7 +3452,7 @@ async function buildBundle(opts) {
     actual: gateReceipt.status,
   })
   artifacts.cutover_gate = receiptMeta(gatePath)
-  secureBundleJsonFiles(outDir)
+  secureBundleJsonFiles(outDir, checks)
 
   const summary = summarize(checks)
   const bundle = {
@@ -2900,9 +3468,9 @@ async function buildBundle(opts) {
     inputs: {
       agents,
       out_dir: outDir,
-      daemon_config: opts.daemonPath,
-      inbox_handler_config: opts.inboxPath,
-      control_config: opts.controlPath,
+      daemon_config: daemonPath,
+      inbox_handler_config: inboxPath,
+      control_config: controlPath,
       install_receipt: opts.installReceiptPath || null,
       probe_receipts: opts.probeReceiptPaths ?? [],
       control_label: opts.controlLabel || null,
