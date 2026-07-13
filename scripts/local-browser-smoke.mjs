@@ -3,6 +3,7 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
+import { pathToFileURL } from 'node:url'
 import { chromium } from 'playwright'
 
 const baseUrl = (process.env.MUPOT_LOCAL_URL || process.argv[2] || 'http://127.0.0.1:8787').replace(/\/$/, '')
@@ -63,16 +64,27 @@ function fail(message, details) {
   throw err
 }
 
-await mkdir(artifactsDir, { recursive: true })
+export function validateRouteEvidence({ route, expectedUrl, finalUrl, errors, bodyText }) {
+  if (errors.length > 0) {
+    fail(`browser errors recorded for route: ${route}`, { errors })
+  }
 
-const browser = await chromium.launch({ headless: true })
-const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } })
-const page = await context.newPage()
+  const expected = new URL(expectedUrl)
+  const actual = new URL(finalUrl)
+  if (actual.origin !== expected.origin || actual.pathname !== expected.pathname) {
+    fail(`route redirected unexpectedly: ${route}`, { expectedUrl, finalUrl })
+  }
+
+  const normalizedText = bodyText.replace(/\s+/g, ' ').trim()
+  if (normalizedText.length < 12 || /^(?:loading|please wait)[.!]*$/i.test(normalizedText)) {
+    fail(`route did not render meaningful content: ${route}`, { bodyText })
+  }
+}
+
+let browser
+let context
+let page
 const consoleErrors = []
-page.on('console', (msg) => {
-  if (msg.type() === 'error') consoleErrors.push(msg.text())
-})
-page.on('pageerror', (err) => consoleErrors.push(err.message))
 
 const results = []
 const workflows = []
@@ -344,73 +356,97 @@ async function runHermesDirectiveWorkflow(hermes) {
   })
 }
 
-try {
-  const login = await page.goto(`${baseUrl}/auth/dev-login`, { waitUntil: 'networkidle', timeout: 20_000 })
-  if (!login || login.status() >= 400) fail('dev login failed', { status: login?.status() })
-  await runLoginWorkflow()
+export async function runLocalBrowserSmoke() {
+  await mkdir(artifactsDir, { recursive: true })
 
-  for (const route of pages) {
-    const beforeErrors = consoleErrors.length
-    const response = await page.goto(`${baseUrl}${route}`, { waitUntil: 'networkidle', timeout: 20_000 })
-    const status = response?.status() ?? 0
-    const bodyText = await textSnippet(page.locator('body'))
-    const newErrors = consoleErrors.slice(beforeErrors)
-    results.push({ route, status, finalUrl: page.url(), errors: newErrors, bodyText })
-
-    if (status >= 400) fail(`page failed: ${route}`, { status, bodyText })
-    if (/oauth_not_configured|unauthenticated/i.test(bodyText)) {
-      fail(`page rendered auth failure: ${route}`, { status, bodyText })
-    }
-  }
-
-  await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' })
-  await page.screenshot({ path: path.join(artifactsDir, 'home.png'), fullPage: true })
-  await page.goto(`${baseUrl}/fleet`, { waitUntil: 'networkidle' })
-  await page.screenshot({ path: path.join(artifactsDir, 'fleet.png'), fullPage: true })
-  await page.goto(`${baseUrl}/ops`, { waitUntil: 'networkidle' })
-  await page.screenshot({ path: path.join(artifactsDir, 'ops-health.png'), fullPage: true })
-
-  await runSendTaskWorkflow()
-  await runApprovalWorkflow()
-
-  const hermes = []
-  await runHermesApprovalWorkflow(hermes)
-  await runHermesDirectiveWorkflow(hermes)
-  for (const msg of hermesMessages) {
-    await postHermesMessage(hermes, msg)
-  }
-
-  await page.goto(`${baseUrl}/squads/sq-growth`, { waitUntil: 'networkidle', timeout: 20_000 })
-  const squadText = await textSnippet(page.locator('body'), 2000)
-  if (!squadText.includes(hermesTaskTitle)) {
-    fail('Hermes-created task did not appear on the squad dashboard', { hermesTaskTitle, squadText })
-  }
-  await page.screenshot({ path: path.join(artifactsDir, 'hermes-dashboard-update.png'), fullPage: true })
-  workflows.push({
-    name: 'Hermes webhook dashboard update',
-    status: 'passed',
-    title: hermesTaskTitle,
+  browser = await chromium.launch({ headless: true })
+  context = await browser.newContext({ viewport: { width: 1440, height: 1000 } })
+  page = await context.newPage()
+  page.on('console', (msg) => {
+    if (msg.type() === 'error') consoleErrors.push(msg.text())
   })
+  page.on('pageerror', (err) => consoleErrors.push(err.message))
 
-  const report = { baseUrl, contract: runtimeContract, hermesLifecycle, pages: results, workflows, hermes, screenshots: artifactsDir, reportPath }
-  await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n')
-  console.log(JSON.stringify(report, null, 2))
-} catch (err) {
-  const failureStamp = Date.now()
-  const failurePath = path.join(artifactsDir, `failure-${failureStamp}.png`)
-  const failureReportPath = path.join(artifactsDir, `failure-${failureStamp}.json`)
-  await page.screenshot({ path: failurePath, fullPage: true }).catch(() => undefined)
-  const failureReport = {
-    error: err instanceof Error ? err.message : String(err),
-    details: err instanceof Error && 'details' in err ? err.details : undefined,
-    workflows,
-    pagesChecked: results.length,
-    failureScreenshot: failurePath,
-    failureReportPath,
+  try {
+    const login = await page.goto(`${baseUrl}/auth/dev-login`, { waitUntil: 'networkidle', timeout: 20_000 })
+    if (!login || login.status() >= 400) fail('dev login failed', { status: login?.status() })
+    await runLoginWorkflow()
+
+    for (const route of pages) {
+      const beforeErrors = consoleErrors.length
+      const response = await page.goto(`${baseUrl}${route}`, { waitUntil: 'networkidle', timeout: 20_000 })
+      const status = response?.status() ?? 0
+      const bodyText = await textSnippet(page.locator('body'))
+      const newErrors = consoleErrors.slice(beforeErrors)
+      results.push({ route, status, finalUrl: page.url(), errors: newErrors, bodyText })
+      validateRouteEvidence({
+        route,
+        expectedUrl: `${baseUrl}${route}`,
+        finalUrl: page.url(),
+        errors: newErrors,
+        bodyText,
+      })
+
+      if (status >= 400) fail(`page failed: ${route}`, { status, bodyText })
+      if (/oauth_not_configured|unauthenticated/i.test(bodyText)) {
+        fail(`page rendered auth failure: ${route}`, { status, bodyText })
+      }
+    }
+
+    await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' })
+    await page.screenshot({ path: path.join(artifactsDir, 'home.png'), fullPage: true })
+    await page.goto(`${baseUrl}/fleet`, { waitUntil: 'networkidle' })
+    await page.screenshot({ path: path.join(artifactsDir, 'fleet.png'), fullPage: true })
+    await page.goto(`${baseUrl}/ops`, { waitUntil: 'networkidle' })
+    await page.screenshot({ path: path.join(artifactsDir, 'ops-health.png'), fullPage: true })
+
+    await runSendTaskWorkflow()
+    await runApprovalWorkflow()
+
+    const hermes = []
+    await runHermesApprovalWorkflow(hermes)
+    await runHermesDirectiveWorkflow(hermes)
+    for (const msg of hermesMessages) {
+      await postHermesMessage(hermes, msg)
+    }
+
+    await page.goto(`${baseUrl}/squads/sq-growth`, { waitUntil: 'networkidle', timeout: 20_000 })
+    const squadText = await textSnippet(page.locator('body'), 2000)
+    if (!squadText.includes(hermesTaskTitle)) {
+      fail('Hermes-created task did not appear on the squad dashboard', { hermesTaskTitle, squadText })
+    }
+    await page.screenshot({ path: path.join(artifactsDir, 'hermes-dashboard-update.png'), fullPage: true })
+    workflows.push({
+      name: 'Hermes webhook dashboard update',
+      status: 'passed',
+      title: hermesTaskTitle,
+    })
+
+    const report = { baseUrl, contract: runtimeContract, hermesLifecycle, pages: results, workflows, hermes, screenshots: artifactsDir, reportPath }
+    await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n')
+    console.log(JSON.stringify(report, null, 2))
+  } catch (err) {
+    const failureStamp = Date.now()
+    const failurePath = path.join(artifactsDir, `failure-${failureStamp}.png`)
+    const failureReportPath = path.join(artifactsDir, `failure-${failureStamp}.json`)
+    await page.screenshot({ path: failurePath, fullPage: true }).catch(() => undefined)
+    const failureReport = {
+      error: err instanceof Error ? err.message : String(err),
+      details: err instanceof Error && 'details' in err ? err.details : undefined,
+      workflows,
+      pagesChecked: results.length,
+      failureScreenshot: failurePath,
+      failureReportPath,
+    }
+    await writeFile(failureReportPath, JSON.stringify(failureReport, null, 2) + '\n').catch(() => undefined)
+    console.error(JSON.stringify(failureReport, null, 2))
+    throw err
+  } finally {
+    await browser.close()
   }
-  await writeFile(failureReportPath, JSON.stringify(failureReport, null, 2) + '\n').catch(() => undefined)
-  console.error(JSON.stringify(failureReport, null, 2))
-  throw err
-} finally {
-  await browser.close()
 }
+
+const isDirectRun = process.argv[1]
+  && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
+
+if (isDirectRun) await runLocalBrowserSmoke()
