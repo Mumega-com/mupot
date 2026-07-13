@@ -1,7 +1,7 @@
 // node --test fleet-daemon.test.mjs   (node >= 18 built-in runner, no deps)
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { validateConfig, runProbe, runInboxCommand, detachAgents, runDaemonOnce } from './fleet-daemon.mjs'
+import { validateConfig, runProbe, runInboxCommand, detachAgents, runDaemonOnce, publishHeartbeatState } from './fleet-daemon.mjs'
 
 const okCfg = () => ({
   base_url: 'https://your-pot.example.com',
@@ -15,6 +15,11 @@ test('validateConfig: normalizes a valid config', () => {
   assert.equal(c.tenant, 'acme')
   assert.equal(c.intervalSec, 75)
   assert.equal(c.agents.length, 1)
+})
+
+test('validateConfig: uses an optional state_file or the runtime state default', () => {
+  assert.equal(validateConfig(okCfg()).statePath, `${process.env.HOME}/.fleet/state/fleet-daemon.json`)
+  assert.equal(validateConfig({ ...okCfg(), state_file: '/tmp/test-state.json' }).statePath, '/tmp/test-state.json')
 })
 
 test('validateConfig: STERILE — tenant is required (no default)', () => {
@@ -186,4 +191,47 @@ test('runDaemonOnce: dead probe skips heartbeat and inbox', async () => {
     heartbeat: { ok: false, skipped: true },
     inbox: { ok: null, action: 'not_attempted_probe_dead', messages: 0, consumed: false },
   }])
+})
+
+test('publishHeartbeatState: writes only completed tick results and keeps successful tick results on write failure', () => {
+  const cfg = validateConfig({ ...okCfg(), interval_sec: 75, state_file: '/tmp/daemon-state.json' })
+  const results = [{
+    agent: 'agent-one',
+    probe: 'alive',
+    heartbeat: { ok: true, status: 200 },
+    inbox: { messages: 1, action: 'inbox_consumed' },
+  }]
+  const writes = []
+  const logs = []
+  const first = publishHeartbeatState(cfg, results, 1, {
+    statePath: '/tmp/daemon-state.json',
+    pid: 123,
+    startedAt: '2026-07-13T12:00:00.000Z',
+    now: () => new Date('2026-07-13T12:01:00.000Z'),
+    writeRuntimeState: (path, state) => writes.push({ path, state }),
+    log: (entry) => logs.push(entry),
+  })
+  const second = publishHeartbeatState(cfg, results, 2, {
+    statePath: '/tmp/daemon-state.json',
+    pid: 123,
+    startedAt: '2026-07-13T12:00:00.000Z',
+    now: () => new Date('2026-07-13T12:01:15.000Z'),
+    writeRuntimeState: (path, state) => writes.push({ path, state }),
+    log: (entry) => logs.push(entry),
+  })
+  const third = publishHeartbeatState(cfg, results, 3, {
+    statePath: '/tmp/daemon-state.json',
+    pid: 123,
+    startedAt: '2026-07-13T12:00:00.000Z',
+    now: () => new Date('2026-07-13T12:02:30.000Z'),
+    writeRuntimeState: () => { throw new Error('disk full') },
+    log: (entry) => logs.push(entry),
+  })
+
+  assert.equal(first, results)
+  assert.equal(second, results)
+  assert.equal(third, results)
+  assert.deepEqual(writes.map((write) => write.state.tick), [1, 2])
+  assert.equal(logs.at(-1).event, 'state_write_failed')
+  assert.equal(logs.at(-1).state_path, '/tmp/daemon-state.json')
 })

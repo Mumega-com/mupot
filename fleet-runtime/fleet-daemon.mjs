@@ -21,6 +21,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { loadPrivKey, signedAttach, signedDetach, signedInbox } from './fleet-sign.mjs'
+import { heartbeatState, writeRuntimeState } from './runtime-state.mjs'
 
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 const PROBE_TIMEOUT_MS = 10_000
@@ -28,6 +29,10 @@ const INBOX_COMMAND_TIMEOUT_MS = 30_000
 
 function log(obj) {
   console.log(JSON.stringify({ t: new Date().toISOString(), ...obj }))
+}
+
+function expandHome(path) {
+  return typeof path === 'string' && path.startsWith('~/') ? join(homedir(), path.slice(2)) : path
 }
 
 /** Validate + normalize the daemon config. Throws on a fatal shape error (fail-fast).
@@ -42,6 +47,10 @@ export function validateConfig(raw) {
     throw new Error('config.tenant is required (this runtime hardcodes no tenant — set yours)')
   }
   const tenant = raw.tenant
+  const statePath = raw.state_file === undefined
+    ? join(homedir(), '.fleet', 'state', 'fleet-daemon.json')
+    : expandHome(raw.state_file)
+  if (typeof statePath !== 'string' || !statePath.trim()) throw new Error('config.state_file must be a non-empty path')
   // Floor 15s (anti-spam) → else default 75. CEILING 120s: the cadence must stay well under
   // the pot's presence TTL (default 180s) or a live agent is heartbeated too slowly to ever
   // read `live` — a quiet misconfig that silently defeats truthful presence.
@@ -78,7 +87,27 @@ export function validateConfig(raw) {
       inbox,
     }
   })
-  return { baseUrl, tenant, intervalSec, agents }
+  return { baseUrl, tenant, intervalSec, statePath, agents }
+}
+
+export function publishHeartbeatState(cfg, results, tick, opts = {}) {
+  const statePath = opts.statePath ?? cfg.statePath
+  const now = opts.now ?? (() => new Date())
+  const logFn = opts.log ?? log
+  const state = heartbeatState({
+    pid: opts.pid ?? process.pid,
+    startedAt: opts.startedAt ?? new Date().toISOString(),
+    tick,
+    lastTickAt: now().toISOString(),
+    intervalSec: cfg.intervalSec,
+    results,
+  })
+  try {
+    ;(opts.writeRuntimeState ?? writeRuntimeState)(statePath, state)
+  } catch (error) {
+    logFn({ event: 'state_write_failed', state_path: statePath, error: String(error?.message ?? error) })
+  }
+  return results
 }
 
 /** Run a probe shell command; resolve true iff it exits 0 within the timeout. Never throws.
@@ -275,11 +304,15 @@ async function main() {
   let timer = null
   let activeTick = null
   const liveAgents = new Set()
+  const startedAt = new Date().toISOString()
+  let tick = 0
   const loop = async () => {
     if (stopping) return
     try {
       activeTick = runDaemonOnce(cfg, keys, liveAgents)
-      await activeTick
+      const results = await activeTick
+      tick += 1
+      publishHeartbeatState(cfg, results, tick, { startedAt })
     } catch (e) {
       log({ event: 'tick_error', error: String(e && e.message ? e.message : e) })
     } finally {

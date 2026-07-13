@@ -6,6 +6,7 @@ import { canonicalControlMessage, importPanelPublicKey } from './control-request
 import {
   handleControlMessage,
   pollOnce,
+  publishControlState,
   runFlightVerb,
   validateConfig,
 } from './fleet-control-daemon.mjs'
@@ -62,6 +63,11 @@ test('validateConfig: normalizes a valid control daemon config', () => {
   assert.equal(cfg.pollSec, 5)
   assert.equal(cfg.commandTimeoutMs, 600_000)
   assert.ok(cfg.panelPublicKeyPath.endsWith('panel.pub.jwk'))
+})
+
+test('validateConfig: uses an optional state_file or the runtime state default', () => {
+  assert.equal(validateConfig(baseRaw()).statePath, `${process.env.HOME}/.fleet/state/fleet-control.json`)
+  assert.equal(validateConfig({ ...baseRaw(), state_file: '/tmp/control-state.json' }).statePath, '/tmp/control-state.json')
 })
 
 test('validateConfig: rejects malformed critical fields', () => {
@@ -149,4 +155,47 @@ test('pollOnce: peeks one message, executes, then consumes one message', async (
   })
   assert.equal(res.ok, true)
   assert.deepEqual(calls, [{ peek: true, limit: 1 }, { peek: false, limit: 1 }])
+})
+
+test('publishControlState: writes reduced completed poll outcomes and preserves poll results on write failure', () => {
+  const cfg = validateConfig({ ...baseRaw(), state_file: '/tmp/control-state.json' })
+  const outcome = {
+    ok: true,
+    action: 'open',
+    request: { agent_id: 'agent-one', verb: 'start', nonce: 'nonce-123', sig: 'signature-123' },
+  }
+  const writes = []
+  const logs = []
+  const first = publishControlState(cfg, outcome, 1, {
+    statePath: '/tmp/control-state.json',
+    pid: 456,
+    startedAt: '2026-07-13T12:00:00.000Z',
+    now: () => new Date('2026-07-13T12:01:00.000Z'),
+    writeRuntimeState: (path, state) => writes.push({ path, state }),
+    log: (entry) => logs.push(entry),
+  })
+  const second = publishControlState(cfg, outcome, 2, {
+    statePath: '/tmp/control-state.json',
+    pid: 456,
+    startedAt: '2026-07-13T12:00:00.000Z',
+    now: () => new Date('2026-07-13T12:01:05.000Z'),
+    writeRuntimeState: (path, state) => writes.push({ path, state }),
+    log: (entry) => logs.push(entry),
+  })
+  const third = publishControlState(cfg, outcome, 3, {
+    statePath: '/tmp/control-state.json',
+    pid: 456,
+    startedAt: '2026-07-13T12:00:00.000Z',
+    now: () => new Date('2026-07-13T12:01:10.000Z'),
+    writeRuntimeState: () => { throw new Error('disk full') },
+    log: (entry) => logs.push(entry),
+  })
+
+  assert.equal(first, outcome)
+  assert.equal(second, outcome)
+  assert.equal(third, outcome)
+  assert.deepEqual(writes.map((write) => write.state.poll), [1, 2])
+  assert.doesNotMatch(JSON.stringify(writes[0].state), /nonce|signature|token/i)
+  assert.equal(logs.at(-1).event, 'state_write_failed')
+  assert.equal(logs.at(-1).state_path, '/tmp/control-state.json')
 })
