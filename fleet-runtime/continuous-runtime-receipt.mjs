@@ -450,12 +450,12 @@ function commandOutputSecretFreeCheck(entry) {
     entry.ok === true
 }
 
-function normalizeServiceReceipt(receipt, expectedManager) {
+function normalizeServiceReceipt(receipt, expectedManager, expectedPlatform) {
   const topLevelKeys = ['receipt_type', 'generated_at', 'status', 'platform', 'service_manager', 'action', 'definitions', 'services', 'linger', 'commands', 'preserved_data', 'next_steps', 'checks']
   const rawScan = sanitizeReceiptValue(receipt)
   if (rawScan.secretFound || !hasExactKeys(receipt, topLevelKeys)) serviceReceiptMalformed()
   if (receipt.receipt_type !== SERVICE_RECEIPT_TYPE || receipt.action !== 'status') serviceReceiptMalformed()
-  if (!['pass', 'fail'].includes(receipt.status) || receipt.service_manager !== expectedManager) serviceReceiptMalformed()
+  if (!['pass', 'fail'].includes(receipt.status) || receipt.service_manager !== expectedManager || receipt.platform !== expectedPlatform) serviceReceiptMalformed()
   if (safeNonEmptyString(receipt.platform) === null || normalizeTimestamp(receipt.generated_at) === null) serviceReceiptMalformed()
 
   if (!Array.isArray(receipt.definitions) || receipt.definitions.length > SERVICE_KEYS.length) serviceReceiptMalformed()
@@ -688,7 +688,7 @@ export async function buildContinuousRuntimeReceipt(input, deps = {}) {
     } catch {
       throw new ReceiptFailure('service_status_failed', 'service_status_readable')
     }
-    const services = normalizeServiceReceipt(rawServiceReceipt, expectedServiceManager)
+    const services = normalizeServiceReceipt(rawServiceReceipt, expectedServiceManager, servicePlatform)
     const heartbeatBefore = observation.heartbeat.before
     const heartbeatAfter = observation.heartbeat.after
     const controlBefore = observation.control.before

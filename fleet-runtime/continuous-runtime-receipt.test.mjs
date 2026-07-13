@@ -122,7 +122,10 @@ async function buildCase({ heartbeatStates, controlStates, service, requireContr
     pollMs,
     requireControl,
     serviceManager,
-  }, f.deps)
+  }, {
+    ...f.deps,
+    serviceDeps: { platformName: serviceManager === 'systemd' ? 'linux' : 'darwin' },
+  })
   return { receipt, reads: f.reads }
 }
 
@@ -700,6 +703,53 @@ test('auto manager uses injected platform resolution and manager-specific defini
 
       assert.equal(receipt.status, 'pass')
       assert.deepEqual(receivedOptions, scenario.expectedOptions)
+    })
+  }
+})
+
+test('auto manager rejects pass receipts whose platform differs from the injected platform', async (t) => {
+  const cases = [
+    {
+      name: 'darwin launchd receipt declares linux',
+      platformName: 'darwin',
+      service: serviceReceipt({ serviceManager: 'launchd' }),
+      wrongPlatform: 'linux',
+    },
+    {
+      name: 'linux systemd receipt declares darwin',
+      platformName: 'linux',
+      service: serviceReceipt({ serviceManager: 'systemd', linger: { enabled: true, raw: 'yes' } }),
+      wrongPlatform: 'darwin',
+    },
+  ]
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const service = structuredClone(scenario.service)
+      service.platform = scenario.wrongPlatform
+      const f = fixture({
+        heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
+        controlStates: [control(), control({ poll: 13 })],
+        service,
+      })
+      const receipt = await buildContinuousRuntimeReceipt({
+        agentId: 'hermes-manager',
+        heartbeatStatePath: '/heartbeat.json',
+        controlStatePath: '/control.json',
+        serviceManager: 'auto',
+        definitionDir: null,
+        ttlSec: 30,
+        graceSec: 2,
+        pollMs: 1_000,
+        requireControl: [],
+      }, {
+        ...f.deps,
+        serviceDeps: { platformName: scenario.platformName },
+      })
+
+      assert.equal(receipt.status, 'fail')
+      assert.equal(receipt.reason, 'service_receipt_malformed')
+      assert.notEqual(receipt.status, 'pass')
     })
   }
 })

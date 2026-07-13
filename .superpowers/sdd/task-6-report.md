@@ -215,3 +215,46 @@ Final result: exit 0 with no output after the complete report append.
 
 - `git diff --check`
   - Exit 0 with no output after this append.
+
+## Task 6 Important Finding Fix
+
+### Delivered
+
+- Bound normalized service evidence to both the authoritative service manager and the authoritative service platform used to resolve and invoke the service producer.
+- Added darwin/launchd and linux/systemd `serviceManager: 'auto'` regressions proving that an otherwise valid pass receipt with the opposite platform returns `service_receipt_malformed` and never passes.
+- Kept explicit manager tests producer-compatible by injecting the matching platform into their deterministic service dependencies. Producer failure envelopes remain accepted as typed `services_not_running` evidence when their platform and manager match.
+
+### TDD Evidence
+
+1. Added both cross-platform pass-receipt regressions before the production change.
+2. Red run: 137 tests total, 134 passed and 3 failed. Both new cases incorrectly returned `status: 'pass'`, confirming the platform-binding defect.
+3. Passed `servicePlatform` into `normalizeServiceReceipt` and required exact platform equality alongside manager equality.
+4. Green focused run: 137 passed, 0 failed.
+
+### Verification
+
+- `node --test fleet-runtime/continuous-runtime-receipt.test.mjs`
+  - Exit 0; 137 passed, 0 failed, 0 skipped.
+- `npm run receipt:continuous-runtime -- --help`
+  - Exit 0; printed usage and all required options, including repeatable `--require-control` with `start`, `stop`, `restart`, and `status`.
+- `node --test fleet-runtime/*.test.mjs`
+  - Exit 0; 316 passed, 0 failed, 0 skipped; 753.567792 ms.
+- `npm test`
+  - Exit 0; 168 test files passed and 2,703 tests passed; 6.49 s. Node emitted the existing experimental SQLite warnings only.
+- `git diff --check`
+  - Exit 0 with no output before this report append.
+
+### Self-Review
+
+- `normalizeServiceReceipt` now receives the same `servicePlatform` used by `resolveServiceManager` and `buildServiceReceipt`, so both explicit and auto paths validate manager/platform compatibility against one authoritative value.
+- Matching launchd/darwin and systemd/linux pass and failure envelopes remain covered. Wrong-platform pass envelopes fail closed as `service_receipt_malformed` and cannot produce a passing continuous-runtime receipt.
+- The change is limited to the requested runtime module, its focused regression tests, and this append-only report. No producer or unrelated worktree files changed.
+
+### Concerns
+
+- No live launchd or systemd observation was performed; coverage remains deterministic and producer-shaped. Host integration is unchanged and unverified.
+
+### Final Post-report Whitespace Verification
+
+- `git diff --check`
+  - Exit 0 with no output after this append and before commit.
