@@ -105,6 +105,7 @@ describe('release integrity receipt checker', () => {
     })
 
     expect(plan).toContain('Mupot v0.23 release-integrity evidence plan')
+    expect(plan).toContain('Remove release-control trackers #281, #284, and #345 from the product milestone')
     expect(plan).toContain('gh api repos/Mumega-com/mupot/milestones')
     expect(plan).toContain('gh release view v0.23.0')
     expect(plan).toContain('repos/Mumega-com/mupot/commits/v0.23.0')
@@ -129,6 +130,9 @@ describe('release integrity receipt checker', () => {
     expect(receipt.target.public_api_version).toBe(VERSION)
     expect(receipt.target.release_tag).toBe(TAG)
     expect(receipt.target.github_tag_sha).toBe(receipt.target.git_tag_sha)
+    expect(receipt.next_steps).toContain(
+      'attach release-integrity-check.json to #281, close #281, then run final release readiness',
+    )
   })
 
   it('fails when package and public API versions are not aligned', () => {
@@ -201,6 +205,9 @@ describe('release integrity receipt checker', () => {
       ok: false,
       check: 'github_milestone_has_no_open_issues',
     }))
+    expect(receipt.next_steps).toContain(
+      'remove release-control trackers #281, #284, and #345 from the product milestone, close the zero-open product milestone, then rerun',
+    )
   })
 
   it('fails when the stable GitHub release evidence is missing', () => {

@@ -119,6 +119,7 @@ export function formatPlan(opts = {}) {
   lines.push(`Goal: prove package version, public API version, changelog, roadmap, Git tag, milestone, and GitHub Release all agree on ${tag}.`)
   lines.push('')
   lines.push('Run only after the prepublication readiness receipt passes and the exact release commit is tagged and published.')
+  lines.push('Remove release-control trackers #281, #284, and #345 from the product milestone, then close that milestone only after its product-objective issue count reaches zero.')
   lines.push('')
   lines.push(commandLine(['mkdir', '-p', outDir]))
   lines.push('')
@@ -414,8 +415,10 @@ export function checkBundle(opts = {}) {
     artifacts,
     checks,
     next_steps: failed.length === 0
-      ? ['attach release-integrity-check.json to the v0.23 release tracker before publishing the stable release']
-      : ['align failing release metadata, export fresh GitHub milestone/release JSON, then rerun release-integrity-receipt --check'],
+      ? ['attach release-integrity-check.json to #281, close #281, then run final release readiness']
+      : milestoneState !== 'closed' || milestoneOpenIssues !== 0
+        ? ['remove release-control trackers #281, #284, and #345 from the product milestone, close the zero-open product milestone, then rerun']
+        : ['align failing release metadata, export fresh GitHub milestone/release JSON, then rerun release-integrity-receipt --check'],
   }
 }
 

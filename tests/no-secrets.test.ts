@@ -85,6 +85,21 @@ describe('no-secrets scanner', () => {
     expect(result.stderr).not.toContain(privateKey)
   })
 
+  it('detects encrypted PKCS#8 private-key material', () => {
+    const privateKey = [
+      '-----BEGIN ENCRYPTED PRIVATE KEY-----',
+      'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=',
+      '-----END ENCRYPTED PRIVATE KEY-----',
+    ].join('\n')
+    const root = createRepo({ 'encrypted-key.pem': privateKey })
+
+    const result = runScanner(root)
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('encrypted-key.pem:1: private key')
+    expect(result.stderr).not.toContain(privateKey)
+  })
+
   it('detects modern GitHub and JWT shapes', () => {
     const githubFineGrained = ['github', 'pat', 'A'.repeat(24)].join('_')
     const githubOauth = ['gho', 'B'.repeat(24)].join('_')
