@@ -47,7 +47,7 @@ bash scripts/ci-local-evidence.sh
 
 Expected: every command passes from the isolated worktree. Record exact test and workflow counts in the PR.
 
-- [ ] **Step 3: Commit the flight contract**
+- [x] **Step 3: Commit the flight contract**
 
 ```bash
 git add docs/superpowers/plans/2026-07-13-mupot-stable-vnext-flight.md
@@ -63,7 +63,7 @@ git commit -m "docs: plan v0.23 stable release flight"
 - SOS request/ACK IDs for `hadi-codex-cli` and `kasra`
 - Mupot flight/task IDs when the authenticated local/live surface is available
 
-- [ ] **Step 1: Create one release-flight issue**
+- [x] **Step 1: Create one release-flight issue**
 
 The issue must name the goal, branch, roles, acceptance gates, evidence locations, and rollback boundary. It must not duplicate #281 or #284.
 
@@ -71,7 +71,7 @@ The issue must name the goal, branch, roles, acceptance gates, evidence location
 
 Ask `hadi-codex-cli` to retrieve and validate objective receipts. Ask `kasra` to independently review sequencing and the final PR. Require protocol ACKs and keep request IDs in the flight issue.
 
-- [ ] **Step 3: Record substrate limitations**
+- [x] **Step 3: Record substrate limitations**
 
 If SOS can message peers but cannot create cross-tenant tasks, record the exact `cross_tenant_agent_access` result and use Mupot/GitHub as the task ledger. Do not bypass RBAC.
 
@@ -165,21 +165,35 @@ Kasra must review the exact PR head SHA. Address findings with focused tests and
 
 - [ ] **Step 3: Merge without rewriting release evidence**
 
-Record the merged commit SHA. If merge strategy changes the SHA, all tag and release evidence must use the resulting release commit, not the pre-merge PR head.
+Record the merged commit SHA. If merge strategy changes the SHA, all tag and release evidence must use the resulting release commit, not the pre-merge PR head. Wait for the push-to-`main` checks on that exact SHA.
 
 ---
 
-### Task 6: Publish Stable Metadata and Run Final Gates
+### Task 6: Run Prepublication and Postpublication Gates
 
-- [ ] **Step 1: Create the stable tag and non-prerelease GitHub Release at the release commit**
+- [ ] **Step 1: Deploy and prove the exact merged stable commit**
 
-Use `v0.23.0`. The release must not be draft or prerelease. Keep the milestone open until the integrity evidence is collected.
+Deploy the merged release SHA and generate `stable-deployment-check.json`. Public health must report stable `0.23.0` and the same commit.
 
-- [ ] **Step 2: Close milestone prerequisites and export release state**
+- [ ] **Step 2: Run prepublication readiness**
 
-Close #281 only after generating a passing integrity receipt. The milestone must contain zero open issues and be closed before the final integrity export; if the verifier creates a circular dependency, stop and fix the policy in a reviewed PR rather than falsifying state.
+```bash
+npm run receipt:release-readiness:check -- \
+  --phase prepublication \
+  --version v0.23.0 \
+  --repo Mumega-com/mupot \
+  --out-dir tmp/release-readiness/v0.23.0 \
+  --checks-pr <release-pr-number> \
+  --release-sha <merged-release-sha>
+```
 
-- [ ] **Step 3: Run release integrity**
+Expected: `receipt_type:"mupot-v023-prepublication-readiness/v1"` and `status:"pass"`. Do not publish without it.
+
+- [ ] **Step 3: Close product milestone and publish the exact SHA**
+
+Release-control trackers #281, #284, and #345 do not count as product-objective milestone work. Remove them from milestone 6, close the milestone only after its remaining issue count is zero, then create tag `v0.23.0` and a non-draft, non-prerelease GitHub Release at the prepublication SHA.
+
+- [ ] **Step 4: Run postpublication release integrity**
 
 ```bash
 npm run receipt:release-integrity:plan -- \
@@ -196,16 +210,18 @@ npm run receipt:release-integrity:check -- \
 
 Attach `release-integrity-check.json` to #281, record its digest, then close #281.
 
-- [ ] **Step 4: Run aggregate readiness against the named release PR**
+- [ ] **Step 5: Run final aggregate readiness against the named release SHA**
 
 Export fresh issue, PR, and check state, include the passing integrity receipt, then run:
 
 ```bash
 npm run receipt:release-readiness:check -- \
+  --phase final \
   --version v0.23.0 \
   --repo Mumega-com/mupot \
   --out-dir tmp/release-readiness/v0.23.0 \
-  --checks-pr <release-pr-number>
+  --checks-pr <release-pr-number> \
+  --release-sha <merged-release-sha>
 ```
 
 Expected: `receipt_type:"mupot-v023-release-readiness/v1"` and `status:"pass"`. Attach the receipt to #284 and close it.
