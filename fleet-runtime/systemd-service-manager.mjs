@@ -9,7 +9,7 @@ function systemdDirectiveArgument(value) {
 }
 
 function systemdExecArgument(value) {
-  return systemdDirectiveArgument(value).replaceAll('$', '$$')
+  return systemdDirectiveArgument(value).replaceAll('$', () => '$$')
 }
 
 function resultFor(service, state, extra = {}) {

@@ -81,13 +81,13 @@ test('renderSystemd preserves literal systemd specifiers and ExecStart dollar pa
     username: 'fleet',
   })
 
+  const expectedExecStarts = [
+    'ExecStart="/tmp/bin %%u $${HOME}/node" "/tmp/runtime %%u $${HOME}/fleet-daemon.mjs" "/tmp/fleet %%u $${HOME}/daemon.json"',
+    'ExecStart="/tmp/bin %%u $${HOME}/node" "/tmp/runtime %%u $${HOME}/fleet-control-daemon.mjs" "/tmp/fleet %%u $${HOME}/control.json"',
+  ]
   for (const [index, definition] of renderSystemd(context).entries()) {
-    const service = context.services[index]
-    assert.equal(definition.content.split('\n').find((line) => line.startsWith('WorkingDirectory=')), `WorkingDirectory="${context.runtimeDir.replaceAll('%', '%%')}"`)
-    assert.equal(
-      definition.content.split('\n').find((line) => line.startsWith('ExecStart=')),
-      `ExecStart="${context.nodePath.replaceAll('%', '%%').replaceAll('$', '$$')}" "${service.scriptPath.replaceAll('%', '%%').replaceAll('$', '$$')}" "${service.configPath.replaceAll('%', '%%').replaceAll('$', '$$')}"`,
-    )
+    assert.equal(definition.content.split('\n').find((line) => line.startsWith('WorkingDirectory=')), 'WorkingDirectory="/tmp/runtime %%u ${HOME}"')
+    assert.equal(definition.content.split('\n').find((line) => line.startsWith('ExecStart=')), expectedExecStarts[index])
   }
 })
 
