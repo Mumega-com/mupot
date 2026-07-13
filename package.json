@@ -18,6 +18,7 @@
     "receipt:host": "node fleet-runtime/host-receipt.mjs",
     "receipt:runtime": "node fleet-runtime/runtime-receipt.mjs",
     "receipt:control": "node fleet-runtime/control-receipt.mjs",
+    "receipt:continuous-runtime": "node fleet-runtime/continuous-runtime-receipt.mjs",
     "receipt:cutover": "node fleet-runtime/cutover-receipt.mjs",
     "receipt:bundle": "node fleet-runtime/receipt-bundle.mjs",
     "receipt:bundle:plan": "node fleet-runtime/receipt-bundle.mjs --host-go-plan",
