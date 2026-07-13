@@ -51,7 +51,7 @@ export const PREPUBLICATION_REQUIRED_RECEIPTS = [
 export const REQUIRED_ISSUES = [150, 151, 274, 277, 279, 281, 282, 283, 319, 323]
 export const PREPUBLICATION_REQUIRED_ISSUES = REQUIRED_ISSUES.filter((issue) => issue !== 281)
 
-export const REQUIRED_CHECKS = [
+export const REQUIRED_PR_CHECKS = [
   'build',
   'plugin',
   'no-secrets',
@@ -61,6 +61,14 @@ export const REQUIRED_CHECKS = [
   'Analyze (javascript-typescript)',
   'Analyze (python)',
 ]
+
+// GitHub's default CodeQL setup emits the aggregate `CodeQL` check only for
+// pull requests. Pushes still run the three named analyses, so exact-commit
+// evidence requires those real push checks without inventing an aggregate.
+export const REQUIRED_COMMIT_CHECKS = REQUIRED_PR_CHECKS.filter((name) => name !== 'CodeQL')
+
+// Backward-compatible name for callers and receipts that mean PR/CI checks.
+export const REQUIRED_CHECKS = REQUIRED_PR_CHECKS
 
 const GITHUB_PR_FILE = 'github-pr.json'
 
@@ -555,7 +563,7 @@ export function checkBundle(opts = {}) {
   const commitChecksJson = readJson(checks, commitChecksPath, 'github_commit_checks')
   artifacts['github-commit-checks.json'] = artifactMeta(commitChecksPath, commitChecksJson)
   const releaseCommitChecks = checkEntries(commitChecksJson)
-  for (const requiredName of REQUIRED_CHECKS) {
+  for (const requiredName of REQUIRED_COMMIT_CHECKS) {
     const matching = releaseCommitChecks.filter((entry) => String(entry?.name ?? '') === requiredName)
     pushCheck(checks, matching.length > 0, 'required_release_commit_check_exported', { check_name: requiredName })
     pushCheck(checks, matching.some(checkSucceeded), 'required_release_commit_check_passed', {
@@ -621,12 +629,14 @@ export function checkBundle(opts = {}) {
       required_receipts: requiredReceipts.length,
       required_issues: requiredIssues.length,
       required_ci_checks: REQUIRED_CHECKS.length,
+      required_commit_checks: REQUIRED_COMMIT_CHECKS.length,
       required_app_permissions: Object.keys(REQUIRED_APP_PERMISSIONS).length,
     },
     required: {
       receipts: requiredReceipts,
       issues: requiredIssues,
       ci_checks: REQUIRED_CHECKS,
+      commit_checks: REQUIRED_COMMIT_CHECKS,
       checks_pr: checksPr,
       release_sha: releaseSha,
       app_permissions: REQUIRED_APP_PERMISSIONS,

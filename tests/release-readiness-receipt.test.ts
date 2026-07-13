@@ -9,6 +9,7 @@ import {
   PREPUBLICATION_CHECK_RECEIPT_TYPE,
   REQUIRED_APP_PERMISSIONS,
   REQUIRED_CHECKS,
+  REQUIRED_COMMIT_CHECKS,
   REQUIRED_ISSUES,
   REQUIRED_RECEIPTS,
   checkBundle,
@@ -169,7 +170,7 @@ async function writeBundle(dir: string, mutate?: (dir: string) => void) {
     html_url: `https://github.test/commit/${RELEASE_SHA}`,
   })
   writeJson(join(dir, 'github-commit-checks.json'), {
-    check_runs: REQUIRED_CHECKS.map((name) => ({
+    check_runs: REQUIRED_COMMIT_CHECKS.map((name) => ({
       name,
       conclusion: 'success',
       status: 'completed',
@@ -257,6 +258,7 @@ describe('release readiness receipt checker', () => {
     expect(receipt.summary.required_receipts).toBe(REQUIRED_RECEIPTS.length)
     expect(receipt.summary.required_issues).toBe(REQUIRED_ISSUES.length)
     expect(receipt.summary.required_ci_checks).toBe(REQUIRED_CHECKS.length)
+    expect(receipt.summary.required_commit_checks).toBe(REQUIRED_COMMIT_CHECKS.length)
     expect(receipt.summary.required_app_permissions).toBe(Object.keys(REQUIRED_APP_PERMISSIONS).length)
     expect(REQUIRED_ISSUES).toContain(319)
     expect(REQUIRED_ISSUES).toContain(323)
@@ -629,7 +631,7 @@ describe('release readiness receipt checker', () => {
     const dir = tempDir()
     await writeBundle(dir, () => {
       writeJson(join(dir, 'github-commit-checks.json'), {
-        check_runs: REQUIRED_CHECKS.map((name) => ({
+        check_runs: REQUIRED_COMMIT_CHECKS.map((name) => ({
           name,
           conclusion: name === 'local-evidence' ? 'failure' : 'success',
           status: 'completed',
@@ -644,6 +646,54 @@ describe('release readiness receipt checker', () => {
       ok: false,
       check: 'required_release_commit_check_passed',
       check_name: 'local-evidence',
+    }))
+  })
+
+  it('does not require the pull-request-only CodeQL aggregate on the merge commit', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'github-commit-checks.json'), {
+        check_runs: REQUIRED_COMMIT_CHECKS.map((name) => ({
+          name,
+          conclusion: 'success',
+          status: 'completed',
+        })),
+      })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
+
+    expect(REQUIRED_CHECKS).toContain('CodeQL')
+    expect(REQUIRED_COMMIT_CHECKS).not.toContain('CodeQL')
+    expect(REQUIRED_COMMIT_CHECKS).toEqual(expect.arrayContaining([
+      'Analyze (actions)',
+      'Analyze (javascript-typescript)',
+      'Analyze (python)',
+    ]))
+    expect(receipt.status).toBe('pass')
+  })
+
+  it('still requires every CodeQL analysis on the exact merge commit', async () => {
+    const dir = tempDir()
+    await writeBundle(dir, () => {
+      writeJson(join(dir, 'github-commit-checks.json'), {
+        check_runs: REQUIRED_COMMIT_CHECKS
+          .filter((name) => name !== 'Analyze (javascript-typescript)')
+          .map((name) => ({
+            name,
+            conclusion: 'success',
+            status: 'completed',
+          })),
+      })
+    })
+
+    const receipt = checkBundle({ outDir: dir, version: 'v0.23.0', checksPr: '285', releaseSha: RELEASE_SHA })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'required_release_commit_check_passed',
+      check_name: 'Analyze (javascript-typescript)',
     }))
   })
 })
