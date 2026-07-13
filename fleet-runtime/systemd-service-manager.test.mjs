@@ -35,10 +35,12 @@ function runnerReturning(stdout) {
   return async () => response(stdout)
 }
 
-function recordingRunner({ show = 'loaded\nenabled\nactive\n123\n', linger = 'yes\n' } = {}) {
+function recordingRunner({ show = 'loaded\nenabled\nactive\n123\n', linger = 'yes\n', respond } = {}) {
   const calls = []
   const runner = async (argv) => {
     calls.push(argv)
+    const customResponse = respond?.(argv, calls)
+    if (customResponse) return customResponse
     if (argv[0] === 'systemctl' && argv[2] === 'show') return response(show)
     if (argv[0] === 'loginctl' && argv[1] === 'show-user') return response(linger)
     return response()
@@ -64,6 +66,28 @@ test('renderSystemd emits escaped absolute user-unit definitions', async () => {
     assert.match(definition.content, /NoNewPrivileges=true/)
     assert.match(definition.content, /WantedBy=default.target/)
     assert.doesNotMatch(definition.content, /token|secret|password|private[_-]?key|authorization/i)
+  }
+})
+
+test('renderSystemd preserves literal systemd specifiers and ExecStart dollar paths', () => {
+  const context = createServiceContext({
+    manager: 'systemd',
+    homeDir: '/tmp/systemd literals',
+    prefix: '/tmp/fleet %u ${HOME}',
+    runtimeDir: '/tmp/runtime %u ${HOME}',
+    definitionDir: '/tmp/definitions %u ${HOME}',
+    nodePath: '/tmp/bin %u ${HOME}/node',
+    uid: 1001,
+    username: 'fleet',
+  })
+
+  for (const [index, definition] of renderSystemd(context).entries()) {
+    const service = context.services[index]
+    assert.equal(definition.content.split('\n').find((line) => line.startsWith('WorkingDirectory=')), `WorkingDirectory="${context.runtimeDir.replaceAll('%', '%%')}"`)
+    assert.equal(
+      definition.content.split('\n').find((line) => line.startsWith('ExecStart=')),
+      `ExecStart="${context.nodePath.replaceAll('%', '%%').replaceAll('$', '$$')}" "${service.scriptPath.replaceAll('%', '%%').replaceAll('$', '$$')}" "${service.configPath.replaceAll('%', '%%').replaceAll('$', '$$')}"`,
+    )
   }
 })
 
@@ -93,6 +117,32 @@ test('statusSystemd normalizes user service state without treating inactive serv
   assert.equal(calls.some((call) => call[0] === 'sudo'), false)
 })
 
+test('statusSystemd reports failed systemctl and loginctl queries without a successful status result', async () => {
+  const context = await fixtureContext()
+  const failedShow = recordingRunner({
+    respond: (argv) => argv[0] === 'systemctl' && argv[2] === 'show' ? response('', 1, 'show failed') : undefined,
+  })
+
+  const serviceFailure = await statusSystemd(context, failedShow.runner)
+
+  assert.equal(serviceFailure.ok, false)
+  assert.deepEqual(serviceFailure.services.map(({ loaded, enabled, running, pid, error }) => ({ loaded, enabled, running, pid, error })), [
+    { loaded: null, enabled: null, running: null, pid: null, error: 'show failed' },
+    { loaded: null, enabled: null, running: null, pid: null, error: 'show failed' },
+  ])
+  assert.deepEqual(serviceFailure.linger, { enabled: true, raw: 'yes' })
+
+  const failedLinger = recordingRunner({
+    respond: (argv) => argv[0] === 'loginctl' && argv[1] === 'show-user' ? response('', 1, 'linger failed') : undefined,
+  })
+
+  const lingerFailure = await statusSystemd(context, failedLinger.runner)
+
+  assert.equal(lingerFailure.ok, false)
+  assert.deepEqual(lingerFailure.linger, { enabled: null, raw: null, error: 'linger failed' })
+  assert.deepEqual(lingerFailure.next_steps, [])
+})
+
 test('installSystemd writes both units, activates them, and only enables linger explicitly', async () => {
   const context = await fixtureContext()
   const withoutLinger = recordingRunner()
@@ -111,12 +161,49 @@ test('installSystemd writes both units, activates them, and only enables linger 
   }
 
   const withLinger = recordingRunner()
-  await installSystemd(context, withLinger.runner, { enableLinger: true })
+  const withLingerResult = await installSystemd(context, withLinger.runner, { enableLinger: true })
   assert.deepEqual(withLinger.calls.filter((call) => call[0] === 'loginctl'), [
     ['loginctl', 'enable-linger', 'fleet'],
     ['loginctl', 'show-user', 'fleet', '-p', 'Linger', '--value'],
   ])
+  assert.deepEqual(withLingerResult.linger_enable, {
+    attempted: true,
+    command_succeeded: true,
+    confirmed_enabled: true,
+    error: null,
+  })
   for (const calls of [withoutLinger.calls, withLinger.calls]) assert.equal(calls.some((call) => call[0] === 'sudo'), false)
+})
+
+test('installSystemd fails requested linger enablement unless command and confirmation both succeed', async () => {
+  const context = await fixtureContext()
+  const commandFailure = recordingRunner({
+    linger: 'no\n',
+    respond: (argv) => argv[0] === 'loginctl' && argv[1] === 'enable-linger' ? response('', 1, 'permission denied') : undefined,
+  })
+
+  const failedCommand = await installSystemd(context, commandFailure.runner, { enableLinger: true })
+
+  assert.equal(failedCommand.ok, false)
+  assert.deepEqual(failedCommand.linger, { enabled: false, raw: 'no' })
+  assert.deepEqual(failedCommand.linger_enable, {
+    attempted: true,
+    command_succeeded: false,
+    confirmed_enabled: false,
+    error: 'permission denied',
+  })
+  assert.deepEqual(failedCommand.next_steps, ['run loginctl enable-linger <username> with suitable host privileges, then rerun status'])
+
+  const missingConfirmation = recordingRunner({ linger: 'no\n' })
+  const unconfirmed = await installSystemd(context, missingConfirmation.runner, { enableLinger: true })
+
+  assert.equal(unconfirmed.ok, false)
+  assert.deepEqual(unconfirmed.linger_enable, {
+    attempted: true,
+    command_succeeded: true,
+    confirmed_enabled: false,
+    error: null,
+  })
 })
 
 test('reloadSystemd restarts both units and uninstallSystemd disables both units', async () => {
@@ -142,4 +229,56 @@ test('reloadSystemd restarts both units and uninstallSystemd disables both units
     ['systemctl', '--user', 'daemon-reload'],
   ])
   for (const calls of [reload.calls, uninstall.calls]) assert.equal(calls.some((call) => call[0] === 'sudo'), false)
+})
+
+test('lifecycle operations report daemon-reload and partial mutation failures', async () => {
+  const context = await fixtureContext()
+  const failedReload = recordingRunner({
+    respond: (argv) => argv[0] === 'systemctl' && argv[2] === 'daemon-reload' ? response('', 1, 'reload failed') : undefined,
+  })
+
+  const reloadFailure = await installSystemd(context, failedReload.runner)
+
+  assert.equal(reloadFailure.ok, false)
+  assert.deepEqual(reloadFailure.services.map(({ enabled, error }) => ({ enabled, error })), [
+    { enabled: false, error: 'reload failed' },
+    { enabled: false, error: 'reload failed' },
+  ])
+  assert.equal(failedReload.calls.some((call) => call[2] === 'enable'), false)
+
+  const partialEnable = recordingRunner({
+    respond: (argv) => argv[0] === 'systemctl' && argv[2] === 'enable' && argv[4] === 'fleet-control-daemon.service'
+      ? response('', 1, 'enable failed')
+      : undefined,
+  })
+  const enableFailure = await installSystemd(context, partialEnable.runner)
+  assert.equal(enableFailure.ok, false)
+  assert.deepEqual(enableFailure.services.map(({ enabled, error }) => ({ enabled, error })), [
+    { enabled: true, error: undefined },
+    { enabled: false, error: 'enable failed' },
+  ])
+
+  const partialRestart = recordingRunner({
+    respond: (argv) => argv[0] === 'systemctl' && argv[2] === 'restart' && argv[3] === 'fleet-control-daemon.service'
+      ? response('', 1, 'restart failed')
+      : undefined,
+  })
+  const restartFailure = await reloadSystemd(context, partialRestart.runner)
+  assert.equal(restartFailure.ok, false)
+  assert.deepEqual(restartFailure.services.map(({ restarted, error }) => ({ restarted, error })), [
+    { restarted: true, error: undefined },
+    { restarted: false, error: 'restart failed' },
+  ])
+
+  const partialDisable = recordingRunner({
+    respond: (argv) => argv[0] === 'systemctl' && argv[2] === 'disable' && argv[4] === 'fleet-control-daemon.service'
+      ? response('', 1, 'disable failed')
+      : undefined,
+  })
+  const disableFailure = await uninstallSystemd(context, partialDisable.runner)
+  assert.equal(disableFailure.ok, false)
+  assert.deepEqual(disableFailure.services.map(({ removed, error }) => ({ removed, error })), [
+    { removed: true, error: undefined },
+    { removed: false, error: 'disable failed' },
+  ])
 })

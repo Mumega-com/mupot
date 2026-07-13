@@ -4,8 +4,12 @@ import { definitionSha256 } from './service-context.mjs'
 
 let temporaryFileNumber = 0
 
-function systemdArgument(value) {
-  return `"${String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('\n', '\\n').replaceAll('\r', '\\r').replaceAll('\t', '\\t')}"`
+function systemdDirectiveArgument(value) {
+  return `"${String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('\n', '\\n').replaceAll('\r', '\\r').replaceAll('\t', '\\t').replaceAll('%', '%%')}"`
+}
+
+function systemdExecArgument(value) {
+  return systemdDirectiveArgument(value).replaceAll('$', '$$')
 }
 
 function resultFor(service, state, extra = {}) {
@@ -47,6 +51,16 @@ function nextSteps(linger) {
     : []
 }
 
+function lingerEnableResult(response, linger) {
+  if (response === null) return null
+  return {
+    attempted: true,
+    command_succeeded: response.code === 0,
+    confirmed_enabled: linger.enabled === true,
+    error: response.code === 0 ? null : errorMessage(response, 'loginctl enable-linger'),
+  }
+}
+
 export function renderSystemd(context) {
   return context.services.map((service) => Object.freeze({
     key: service.key,
@@ -60,8 +74,8 @@ export function renderSystemd(context) {
       '',
       '[Service]',
       'Type=simple',
-      `WorkingDirectory=${systemdArgument(context.runtimeDir)}`,
-      `ExecStart=${service.argv.map(systemdArgument).join(' ')}`,
+      `WorkingDirectory=${systemdDirectiveArgument(context.runtimeDir)}`,
+      `ExecStart=${service.argv.map(systemdExecArgument).join(' ')}`,
       'Restart=on-failure',
       'RestartSec=10',
       'NoNewPrivileges=true',
@@ -94,7 +108,12 @@ export async function statusSystemd(context, runner) {
     services.push(resultFor(service, parseServiceState(response)))
   }
   const linger = await readLingerState(context, runner)
-  return { ok: services.every((service) => service.loaded !== null), services, linger, next_steps: nextSteps(linger) }
+  return {
+    ok: services.every((service) => service.loaded !== null) && linger.enabled !== null,
+    services,
+    linger,
+    next_steps: nextSteps(linger),
+  }
 }
 
 function lifecycleResult(service, response, operation, definition) {
@@ -118,12 +137,18 @@ export async function installSystemd(context, runner, opts = {}) {
     services.push(lifecycleResult(service, response, 'enabled', definitions[index]))
   }
 
-  if (opts.enableLinger === true) await runner(['loginctl', 'enable-linger', context.username])
+  const enableLinger = opts.enableLinger === true
+    ? await runner(['loginctl', 'enable-linger', context.username])
+    : null
   const linger = await readLingerState(context, runner)
+  const linger_enable = lingerEnableResult(enableLinger, linger)
   return {
-    ok: reloaded.code === 0 && services.every((service) => service.enabled),
+    ok: reloaded.code === 0
+      && services.every((service) => service.enabled)
+      && (linger_enable === null || (linger_enable.command_succeeded && linger_enable.confirmed_enabled)),
     services,
     linger,
+    linger_enable,
     next_steps: nextSteps(linger),
   }
 }
