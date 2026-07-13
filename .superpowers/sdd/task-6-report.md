@@ -110,3 +110,60 @@ None.
 
 - `git diff --check`
   - Exit 0 with no output after appending the hardening report.
+
+---
+
+## Fresh Re-review Remediation
+
+### Delivered
+
+- Replaced regex-based control result acceptance with the exact tuples produced by `fleet-control-daemon.mjs`, `control-request.mjs`, and `runtime-state.mjs`. Normal `idle`, all four successful verb/result mappings, all requestless failure reasons, and the request-bound failure mappings are explicit; failed outcomes cannot satisfy required control.
+- Replaced the fabricated `started` fixture with `start/open`. Added exhaustive producer tuple coverage, wrong-tuple rejection, non-string required-field rejection, and an arbitrary scanner-clean result regression proving the value is neither accepted nor emitted.
+- Validated the complete `buildServiceReceipt`/`buildFailedServiceReceipt` status envelope, including exact top-level fields and safe nested definitions, services, commands, preservation claims, next steps, checks, and linger evidence. The full raw receipt is recursively scanned with the canonical repository secret scanner before evidence is accepted.
+- Required passing service receipts to match the resolved requested manager, contain both canonical loaded/running services and definitions, and carry successful operational and secret-output checks. Canonical failures with zero or partial services remain typed service evidence and produce `services_not_running` instead of `service_receipt_malformed`.
+- Made the iteration cap a clock/progress failure. Only an observed clock value at or beyond the derived deadline can set `timed_out`; a monotonically but too-slow clock with no-op sleep returns bounded `invalid_clock`.
+- Made final post-timeout reads best effort and independent. Valid evidence may update, while read or schema failures retain the last valid state and preserve timeout or one-stalled-counter classification. Non-timeout final evidence remains fail closed.
+- Removed exact state-read-count assertions. Tests now assert returned start/deadline/completion timestamps, timeout state, status, reasons, and observable bounded termination.
+
+### TDD Evidence
+
+1. Baseline focused suite: 70 passed, 0 failed.
+2. Added producer compatibility, service envelope, slow-clock, final-reread, and test-quality regressions before production changes.
+3. First red run: 102 tests, 81 passed and 21 failed. Failures matched idle rejection, arbitrary result acceptance, premature timeout, final-reread replacement, incomplete/unsafe service acceptance, wrong-manager acceptance, and canonical failure misclassification.
+4. First green implementation run left only the legacy impossible `stop/open` fixture failing; corrected it to producer-realistic `stop/close`.
+5. Expanded all finite producer control failure tuples and added incompatible tuple rejection; focused suite reached 122 passed.
+6. Self-review added a non-string requestless `agent_id` regression. The targeted red run failed as expected, then strict required-field typing made the final focused suite 123 passed.
+
+### Verification
+
+- `node --test fleet-runtime/continuous-runtime-receipt.test.mjs`
+  - Exit 0; 123 passed, 0 failed, 0 skipped; 98.84325 ms.
+- `npm run receipt:continuous-runtime -- --help`
+  - Exit 0; printed all required options and `start`, `stop`, `restart`, `status` for repeatable `--require-control`.
+- `node --test fleet-runtime/*.test.mjs`
+  - Exit 0; 302 passed, 0 failed, 0 skipped; 608.09525 ms.
+- `npm test`
+  - Exit 0; 168 test files passed and 2,703 tests passed; 6.05 s. Only the existing experimental SQLite warnings were emitted.
+- `git diff --check`
+  - Exit 0 with no output before this append; final post-report result recorded below.
+
+### Self-Review
+
+- Critical control compatibility: accepted evidence is limited to `idle`, `start/open`, `stop/close`, `restart/restart_open`, and `status/status_noop`. The finite producer failure vocabulary is modeled by request presence and verb; arbitrary scanner-clean results fail as `control_state_malformed` without projection.
+- Critical service compatibility: every producer-required envelope field and nested safe type is validated after a full recursive secret scan. Launchd/systemd pass fixtures, zero/partial-service failure fixtures, wrong-manager receipts, incomplete passes, and a Bearer-bearing command are covered.
+- Important idle behavior: `accepted: true`, null agent/verb, and `result: idle` is valid polling evidence but does not satisfy `--require-control`.
+- Important deadline behavior: the safety cap cannot create a timeout before the clock reaches the deadline. Frozen and slowly advancing clocks terminate as `invalid_clock`.
+- Important final reread behavior: timeout plus final read throw/malformed cases cover both-stalled and one-stalled observations. The prior valid evidence, timeout flag, deadline, completion timestamp, and reason are retained.
+- Minor test brittleness: no assertion constrains exact state read counts. The original 70-case matrix remains present and the expanded 123-case focused suite stays under one second.
+- Scope review: only the two owned runtime files and this append-only report changed. No package, producer, or unrelated workspace changes were modified.
+
+### Concerns
+
+- No live launchd/systemd host observation was performed. Compatibility was verified against the unchanged producer implementations, producer-shaped launchd/systemd fixtures, the 302-case fleet-runtime suite, and the repository-wide suite.
+
+### Final Post-report Whitespace Verification
+
+- `git diff --check`
+  - Pending final command after this append.
+
+Final result: exit 0 with no output after the complete report append.

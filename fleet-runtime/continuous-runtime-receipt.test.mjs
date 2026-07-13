@@ -37,7 +37,7 @@ function control({ poll = 12, outcome = {} } = {}) {
       agent_id: 'hermes-manager',
       verb: 'start',
       accepted: true,
-      result: 'started',
+      result: 'open',
       nonce: 'nonce-123',
       signature: 'signature-123',
       ...outcome,
@@ -45,25 +45,44 @@ function control({ poll = 12, outcome = {} } = {}) {
   }
 }
 
-function serviceReceipt({ status = 'pass', running = true, linger = null, nextSteps = [] } = {}) {
-  const serviceManager = linger ? 'systemd' : 'launchd'
+function serviceReceipt({
+  status = 'pass',
+  running = true,
+  linger = null,
+  nextSteps = [],
+  serviceManager = linger ? 'systemd' : 'launchd',
+  services,
+  checks,
+  commands = [],
+} = {}) {
+  const names = serviceManager === 'systemd'
+    ? { heartbeat: 'fleet-daemon.service', control: 'fleet-control-daemon.service' }
+    : { heartbeat: 'com.mumega.mupot-fleet-daemon', control: 'com.mumega.mupot-fleet-control' }
+  const definitionDir = serviceManager === 'systemd' ? '/home/test/.config/systemd/user' : '/Users/test/Library/LaunchAgents'
+  const defaultServices = [
+    { key: 'heartbeat', name: names.heartbeat, loaded: true, enabled: true, running, pid: 101 },
+    { key: 'control', name: names.control, loaded: true, enabled: true, running, pid: 102 },
+  ]
   return {
     receipt_type: 'mupot-fleet-service-receipt/v1',
     generated_at: startedAt,
     status,
+    platform: serviceManager === 'systemd' ? 'linux' : 'darwin',
     service_manager: serviceManager,
     action: 'status',
-    services: [
-      { key: 'heartbeat', name: serviceManager === 'systemd' ? 'fleet-daemon.service' : 'com.mumega.mupot-fleet-daemon', loaded: true, enabled: true, running, pid: 101 },
-      { key: 'control', name: serviceManager === 'systemd' ? 'fleet-control-daemon.service' : 'com.mumega.mupot-fleet-control', loaded: true, enabled: true, running, pid: 102 },
+    definitions: [
+      { service: 'heartbeat', path: `${definitionDir}/${names.heartbeat}${serviceManager === 'launchd' ? '.plist' : ''}`, sha256: 'a'.repeat(64) },
+      { service: 'control', path: `${definitionDir}/${names.control}${serviceManager === 'launchd' ? '.plist' : ''}`, sha256: 'b'.repeat(64) },
     ],
+    services: services ?? defaultServices,
     linger,
+    commands,
+    preserved_data: { configs: true, private_keys: true, runtime: true, inbox: true, receipts: true },
     next_steps: nextSteps,
-    checks: [
+    checks: checks ?? [
       { check: 'services_loaded_and_running', ok: status === 'pass' },
       { check: 'command_output_secret_free', ok: true },
     ],
-    commands: [{ stdout_summary: 'Bearer abcdefghijklmnop' }],
   }
 }
 
@@ -81,7 +100,9 @@ function fixture({ heartbeatStates, controlStates, service = serviceReceipt(), n
       readRuntimeState: (path) => {
         reads.set(path, (reads.get(path) ?? 0) + 1)
         const states = sequences.get(path)
-        return states[Math.min((reads.get(path) ?? 1) - 1, states.length - 1)]
+        const state = states[Math.min((reads.get(path) ?? 1) - 1, states.length - 1)]
+        if (state instanceof Error) throw state
+        return state
       },
       buildServiceReceipt: async () => service,
     },
@@ -89,7 +110,7 @@ function fixture({ heartbeatStates, controlStates, service = serviceReceipt(), n
   }
 }
 
-async function buildCase({ heartbeatStates, controlStates, service, requireControl, now }) {
+async function buildCase({ heartbeatStates, controlStates, service, requireControl, now, pollMs = 1_000, serviceManager = 'launchd' }) {
   const f = fixture({ heartbeatStates, controlStates, service, now })
   const receipt = await buildContinuousRuntimeReceipt({
     agentId: 'hermes-manager',
@@ -97,14 +118,15 @@ async function buildCase({ heartbeatStates, controlStates, service, requireContr
     controlStatePath: '/control.json',
     ttlSec: 30,
     graceSec: 2,
-    pollMs: 1_000,
+    pollMs,
     requireControl,
+    serviceManager,
   }, f.deps)
   return { receipt, reads: f.reads }
 }
 
 test('continuous runtime receipt proves both daemon counters advance for the selected agent', async () => {
-  const { receipt, reads } = await buildCase({
+  const { receipt } = await buildCase({
     heartbeatStates: [heartbeat(), heartbeat({ tick: 8, lastTickAt: '2026-07-13T12:00:01.000Z' })],
     controlStates: [control(), control({ poll: 13 })],
   })
@@ -118,9 +140,100 @@ test('continuous runtime receipt proves both daemon counters advance for the sel
   assert.equal(receipt.agent.agent_id, 'hermes-manager')
   assert.equal(receipt.agent.probe, 'alive')
   assert.equal(receipt.agent.heartbeat_status, 200)
-  assert.equal(reads.get('/heartbeat.json'), 3)
-  assert.equal(reads.get('/control.json'), 3)
+  assert.equal(receipt.generated_at, startedAt)
+  assert.equal(receipt.observation.started_at, startedAt)
+  assert.equal(receipt.observation.deadline_at, '2026-07-13T12:00:17.000Z')
+  assert.equal(receipt.observation.timed_out, false)
   assert.doesNotMatch(JSON.stringify(receipt), /abcdefghijklmnop|nonce|signature|token/i)
+})
+
+test('control outcomes accept only exact producer tuples, including normal idle', async (t) => {
+  const tuples = [
+    { name: 'idle', outcome: { agent_id: null, verb: null, accepted: true, result: 'idle' }, requireControl: [] },
+    { name: 'start', outcome: { agent_id: 'hermes-manager', verb: 'start', accepted: true, result: 'open' }, requireControl: ['start'] },
+    { name: 'stop', outcome: { agent_id: 'hermes-manager', verb: 'stop', accepted: true, result: 'close' }, requireControl: ['stop'] },
+    { name: 'restart', outcome: { agent_id: 'hermes-manager', verb: 'restart', accepted: true, result: 'restart_open' }, requireControl: ['restart'] },
+    { name: 'status', outcome: { agent_id: 'hermes-manager', verb: 'status', accepted: true, result: 'status_noop' }, requireControl: ['status'] },
+  ]
+
+  for (const tuple of tuples) {
+    await t.test(tuple.name, async () => {
+      const { receipt } = await buildCase({
+        heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
+        controlStates: [control({ outcome: tuple.outcome }), control({ poll: 13, outcome: tuple.outcome })],
+        requireControl: tuple.requireControl,
+      })
+      assert.equal(receipt.status, 'pass')
+      assert.deepEqual(receipt.observation.control.last_outcome, tuple.outcome)
+    })
+  }
+})
+
+test('producer failure outcomes are valid evidence but never satisfy required control', async (t) => {
+  const requestlessResults = [
+    'peek_failed',
+    'consume_failed',
+    'invalid_json',
+    'request_not_object',
+    'bad_agent_id',
+    'bad_verb',
+    'bad_nonce',
+    'bad_ts',
+    'bad_sig',
+    'stale',
+    'bad_signature',
+    'replay',
+  ]
+  const outcomes = [
+    ...requestlessResults.map((result) => ({ name: `requestless ${result}`, agent_id: null, verb: null, accepted: false, result })),
+    ...['start', 'stop', 'restart', 'status'].map((verb) => ({ name: `${verb} consume_failed`, agent_id: 'hermes-manager', verb, accepted: false, result: 'consume_failed' })),
+    ...['start', 'stop', 'restart'].map((verb) => ({ name: `${verb} flight_command_failed`, agent_id: 'hermes-manager', verb, accepted: false, result: 'flight_command_failed' })),
+  ]
+  for (const outcome of outcomes) {
+    await t.test(outcome.name, async () => {
+      const { name, ...producerOutcome } = outcome
+      const { receipt } = await buildCase({
+        heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
+        controlStates: [control({ outcome: producerOutcome }), control({ poll: 13, outcome: producerOutcome })],
+        requireControl: ['start'],
+      })
+      assert.equal(receipt.status, 'fail')
+      assert.equal(receipt.reason, 'required_control_not_accepted')
+      assert.deepEqual(receipt.observation.control.last_outcome, producerOutcome)
+    })
+  }
+})
+
+test('producer-incompatible control tuples fail closed', async (t) => {
+  const outcomes = [
+    { agent_id: 'hermes-manager', verb: 'start', accepted: true, result: 'close' },
+    { agent_id: 'hermes-manager', verb: 'status', accepted: false, result: 'flight_command_failed' },
+    { agent_id: 'hermes-manager', verb: null, accepted: false, result: 'consume_failed' },
+    { agent_id: 42, verb: null, accepted: false, result: 'peek_failed' },
+  ]
+  for (const outcome of outcomes) {
+    await t.test(`${outcome.accepted}-${outcome.verb}-${outcome.result}`, async () => {
+      const { receipt } = await buildCase({
+        heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
+        controlStates: [control(), control({ poll: 13, outcome })],
+      })
+      assert.equal(receipt.status, 'fail')
+      assert.equal(receipt.reason, 'control_state_malformed')
+    })
+  }
+})
+
+test('arbitrary scanner-clean control results fail closed and are not emitted', async () => {
+  const result = 's3cr3tvalue'
+  const { receipt } = await buildCase({
+    heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
+    controlStates: [control(), control({ poll: 13, outcome: { result } })],
+    requireControl: ['start'],
+  })
+
+  assert.equal(receipt.status, 'fail')
+  assert.equal(receipt.reason, 'control_state_malformed')
+  assert.doesNotMatch(JSON.stringify(receipt), new RegExp(result))
 })
 
 test('observeAdvance expires at the heartbeat-derived deadline without real waiting', async () => {
@@ -136,6 +249,9 @@ test('observeAdvance expires at the heartbeat-derived deadline without real wait
   }, f.deps)
 
   assert.equal(result.timed_out, true)
+  assert.equal(result.started_ms, Date.parse(startedAt))
+  assert.equal(result.deadline_ms, Date.parse('2026-07-13T12:00:17.000Z'))
+  assert.equal(result.completed_ms, result.deadline_ms)
   assert.equal(result.heartbeat.after.tick, 7)
   assert.equal(result.control.after.poll, 12)
 })
@@ -190,13 +306,14 @@ test('continuous runtime receipt preserves distinct failure evidence for the det
       heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
       controlStates: [control(), control({ poll: 13 })],
       service: serviceReceipt({ linger: { enabled: false, raw: 'no' }, nextSteps: [LINGER_NEXT_STEP] }),
+      serviceManager: 'systemd',
       reason: 'linger_disabled',
       nextStep: LINGER_NEXT_STEP,
     },
     {
       name: 'required control start mismatch',
       heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
-      controlStates: [control(), control({ poll: 13, outcome: { verb: 'stop' } })],
+      controlStates: [control(), control({ poll: 13, outcome: { verb: 'stop', result: 'close' } })],
       requireControl: ['start'],
       reason: 'required_control_not_accepted',
     },
@@ -308,6 +425,58 @@ test('timeout reason matrix distinguishes one stalled counter from both stalled 
   }
 })
 
+test('post-timeout reread failures preserve the last valid timeout evidence', async (t) => {
+  const malformedHeartbeat = { schema: 'wrong' }
+  const malformedControl = { schema: 'wrong' }
+  const cases = [
+    {
+      name: 'both stalled and final heartbeat read throws',
+      heartbeatStates: [heartbeat(), heartbeat(), heartbeat(), new Error('final heartbeat read failed')],
+      controlStates: [control(), control(), control(), control()],
+      reason: 'timeout',
+    },
+    {
+      name: 'both stalled and final heartbeat is malformed',
+      heartbeatStates: [heartbeat(), heartbeat(), heartbeat(), malformedHeartbeat],
+      controlStates: [control(), control(), control(), control()],
+      reason: 'timeout',
+    },
+    {
+      name: 'control stalled and final heartbeat read throws',
+      heartbeatStates: [heartbeat(), heartbeat({ tick: 8 }), heartbeat({ tick: 8 }), new Error('final heartbeat read failed')],
+      controlStates: [control(), control(), control(), control()],
+      reason: 'control_poll_not_advanced',
+    },
+    {
+      name: 'heartbeat stalled and final control is malformed',
+      heartbeatStates: [heartbeat(), heartbeat(), heartbeat(), heartbeat()],
+      controlStates: [control(), control({ poll: 13 }), control({ poll: 13 }), malformedControl],
+      reason: 'heartbeat_tick_not_advanced',
+    },
+  ]
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const { receipt } = await buildCase({ ...scenario, pollMs: 10_000 })
+      assert.equal(receipt.status, 'fail')
+      assert.equal(receipt.reason, scenario.reason)
+      assert.equal(receipt.observation.timed_out, true)
+      assert.equal(receipt.observation.deadline_at, '2026-07-13T12:00:17.000Z')
+      assert.equal(receipt.generated_at, receipt.observation.deadline_at)
+    })
+  }
+})
+
+test('non-timeout success still fails closed when its final evidence is malformed', async () => {
+  const { receipt } = await buildCase({
+    heartbeatStates: [heartbeat(), heartbeat({ tick: 8 }), { schema: 'wrong' }],
+    controlStates: [control(), control({ poll: 13 }), control({ poll: 13 })],
+  })
+
+  assert.equal(receipt.status, 'fail')
+  assert.equal(receipt.reason, 'heartbeat_state_malformed')
+})
+
 test('actual heartbeat producer consume failures fail while all non-failure values remain accepted', async (t) => {
   for (const consume of ['inbox_peek_fail', 'inbox_consume_fail', 'inbox_handler_fail']) {
     await t.test(`rejects ${consume}`, async () => {
@@ -334,11 +503,76 @@ test('systemd unknown linger evidence retains a valid failed service projection'
     heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
     controlStates: [control(), control({ poll: 13 })],
     service: serviceReceipt({ status: 'fail', linger: { enabled: null, raw: null } }),
+    serviceManager: 'systemd',
   })
 
   assert.equal(receipt.status, 'fail')
   assert.equal(receipt.reason, 'services_not_running')
   assert.deepEqual(receipt.service.linger, { enabled: null, raw: null })
+})
+
+test('service validation accepts producer-shaped launchd and systemd pass and failure envelopes', async (t) => {
+  const launchdFailure = serviceReceipt({
+    status: 'fail',
+    running: false,
+    services: [],
+    nextSteps: ["'/usr/bin/node' service-manager.mjs 'status'"],
+    checks: [
+      { ok: false, check: 'service_operation_failed', reason: 'status failed' },
+      { ok: true, check: 'command_output_secret_free' },
+    ],
+  })
+  const systemdFailure = serviceReceipt({ status: 'fail', running: false, serviceManager: 'systemd' })
+  systemdFailure.services = systemdFailure.services.slice(0, 1)
+
+  const cases = [
+    { name: 'launchd pass', service: serviceReceipt(), serviceManager: 'launchd', expected: 'pass' },
+    { name: 'systemd pass', service: serviceReceipt({ serviceManager: 'systemd', linger: { enabled: true, raw: 'yes' } }), serviceManager: 'systemd', expected: 'pass' },
+    { name: 'launchd producer failure with zero services', service: launchdFailure, serviceManager: 'launchd', expected: 'fail' },
+    { name: 'systemd producer failure with partial services', service: systemdFailure, serviceManager: 'systemd', expected: 'fail' },
+  ]
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const { receipt } = await buildCase({
+        heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
+        controlStates: [control(), control({ poll: 13 })],
+        service: scenario.service,
+        serviceManager: scenario.serviceManager,
+      })
+      assert.equal(receipt.status, scenario.expected)
+      if (scenario.expected === 'fail') assert.equal(receipt.reason, 'services_not_running')
+      assert.notEqual(receipt.reason, 'service_receipt_malformed')
+    })
+  }
+})
+
+test('service validation rejects wrong-manager and incomplete or unsafe passing envelopes', async (t) => {
+  const cases = [
+    { name: 'wrong manager', service: serviceReceipt({ serviceManager: 'systemd' }), serviceManager: 'launchd' },
+    { name: 'missing platform', mutate: (value) => { delete value.platform } },
+    { name: 'missing definitions', mutate: (value) => { delete value.definitions } },
+    { name: 'partial definitions', mutate: (value) => { value.definitions.pop() } },
+    { name: 'partial services', mutate: (value) => { value.services.pop() } },
+    { name: 'malformed commands', mutate: (value) => { value.commands = [{}] } },
+    { name: 'incomplete preservation claim', mutate: (value) => { delete value.preserved_data.private_keys } },
+    { name: 'malformed next steps', mutate: (value) => { value.next_steps = 'none' } },
+    { name: 'secret in ignored command field', mutate: (value) => { value.commands = [{ executable: '/bin/echo', argv: [], code: 0, stdout_summary: 'Bearer abcdefghijklmnop', stderr_summary: '' }] } },
+  ]
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const service = structuredClone(scenario.service ?? serviceReceipt())
+      scenario.mutate?.(service)
+      const { receipt } = await buildCase({
+        heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
+        controlStates: [control(), control({ poll: 13 })],
+        service,
+        serviceManager: scenario.serviceManager ?? 'launchd',
+      })
+      assert.equal(receipt.status, 'fail')
+      assert.equal(receipt.reason, 'service_receipt_malformed')
+      assert.doesNotMatch(JSON.stringify(receipt), /abcdefghijklmnop/)
+    })
+  }
 })
 
 test('malformed and exceptional evidence returns distinct v1 failure receipts instead of rejecting', async (t) => {
@@ -446,7 +680,7 @@ test('exact v1 evidence validation rejects wrong schemas, invalid ranges, and in
   }
 })
 
-test('library option and clock validation fails quickly and a frozen clock has a derived iteration bound', async (t) => {
+test('library option and clock validation fails quickly and bounded polling rejects clocks without enough progress', async (t) => {
   const valid = {
     agentId: 'hermes-manager',
     heartbeatStatePath: '/heartbeat.json',
@@ -486,16 +720,26 @@ test('library option and clock validation fails quickly and a frozen clock has a
   assert.equal(invalidClock.reason, 'invalid_clock')
   assert.equal(invalidClock.checks[0].check, 'clock_valid')
 
-  let reads = 0
   const frozen = fixture({ heartbeatStates: [heartbeat()], controlStates: [control()] })
   frozen.deps.now = () => Date.parse(startedAt)
   frozen.deps.sleep = async () => {}
-  const originalRead = frozen.deps.readRuntimeState
-  frozen.deps.readRuntimeState = (path) => { reads += 1; return originalRead(path) }
   const bounded = await buildContinuousRuntimeReceipt(valid, frozen.deps)
+  assert.equal(bounded.status, 'fail')
   assert.equal(bounded.reason, 'invalid_clock')
   assert.equal(bounded.checks[0].check, 'clock_valid')
-  assert.ok(reads <= 6, `expected frozen clock to fail quickly, got ${reads} reads`)
+
+  let slowlyAdvancingClock = Date.parse(startedAt)
+  const slow = fixture({ heartbeatStates: [heartbeat()], controlStates: [control()] })
+  slow.deps.now = () => {
+    const current = slowlyAdvancingClock
+    slowlyAdvancingClock += 1
+    return current
+  }
+  slow.deps.sleep = async () => {}
+  const capped = await buildContinuousRuntimeReceipt(valid, slow.deps)
+  assert.equal(capped.status, 'fail')
+  assert.equal(capped.reason, 'invalid_clock')
+  assert.equal(capped.checks[0].check, 'clock_valid')
 })
 
 test('injected CLI main preserves exit codes and emits actionable canonical redaction', async (t) => {

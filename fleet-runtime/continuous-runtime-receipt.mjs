@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { homedir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
+import { basename, isAbsolute, join, resolve } from 'node:path'
 import { readRuntimeState as defaultReadRuntimeState } from './runtime-state.mjs'
 import { buildServiceReceipt as defaultBuildServiceReceipt } from './service-manager.mjs'
 import { redactSecretValues, resolveServiceManager } from './service-context.mjs'
@@ -11,8 +11,28 @@ const HEARTBEAT_SCHEMA = 'mupot-fleet-daemon-state/v1'
 const CONTROL_SCHEMA = 'mupot-fleet-control-state/v1'
 const SERVICE_RECEIPT_TYPE = 'mupot-fleet-service-receipt/v1'
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
-const RESULT_RE = /^[a-z][a-z0-9_]{0,63}$/
 const CONTROL_VERBS = new Set(['start', 'stop', 'restart', 'status'])
+const ACCEPTED_CONTROL_RESULTS = Object.freeze({ start: 'open', stop: 'close', restart: 'restart_open', status: 'status_noop' })
+const REQUESTLESS_CONTROL_FAILURES = new Set([
+  'peek_failed',
+  'consume_failed',
+  'invalid_json',
+  'request_not_object',
+  'bad_agent_id',
+  'bad_verb',
+  'bad_nonce',
+  'bad_ts',
+  'bad_sig',
+  'stale',
+  'bad_signature',
+  'replay',
+])
+const REQUEST_CONTROL_FAILURES = Object.freeze({
+  start: new Set(['consume_failed', 'flight_command_failed']),
+  stop: new Set(['consume_failed', 'flight_command_failed']),
+  restart: new Set(['consume_failed', 'flight_command_failed']),
+  status: new Set(['consume_failed']),
+})
 const PROBE_VALUES = new Set(['alive', 'dead'])
 const CONSUME_VALUES = new Set([
   'consumed',
@@ -31,6 +51,9 @@ const SERVICE_NAMES = Object.freeze({
   launchd: Object.freeze({ heartbeat: 'com.mumega.mupot-fleet-daemon', control: 'com.mumega.mupot-fleet-control' }),
   systemd: Object.freeze({ heartbeat: 'fleet-daemon.service', control: 'fleet-control-daemon.service' }),
 })
+const SERVICE_KEYS = Object.freeze(['heartbeat', 'control'])
+const PRESERVED_DATA_KEYS = Object.freeze(['configs', 'private_keys', 'runtime', 'inbox', 'receipts'])
+const SHA256_RE = /^[a-f0-9]{64}$/
 const MAX_TTL_SEC = 86_400
 const MAX_GRACE_SEC = 3_600
 const MAX_POLL_MS = 60_000
@@ -244,15 +267,29 @@ function normalizeControlState(state) {
   if (!isNonNegativeInteger(state.poll) || !Number.isFinite(state.poll_sec) || state.poll_sec < 2 || state.poll_sec > 120) {
     throw new Error('invalid control cadence')
   }
-  if (!isPlainObject(state.last_outcome) || typeof state.last_outcome.accepted !== 'boolean') throw new Error('invalid control outcome')
-  const rawAgentId = state.last_outcome.agent_id
+  const outcome = state.last_outcome
+  if (!isPlainObject(outcome) || ['agent_id', 'verb', 'accepted', 'result'].some((key) => !Object.hasOwn(outcome, key)) || typeof outcome.accepted !== 'boolean') {
+    throw new Error('invalid control outcome')
+  }
+  const rawAgentId = outcome.agent_id
+  if (rawAgentId !== null && typeof rawAgentId !== 'string') throw new Error('invalid control agent id')
   const agentId = rawAgentId === null ? null : safeString(rawAgentId)
   if (agentId !== null && !AGENT_ID_RE.test(agentId)) throw new Error('invalid control agent id')
-  const verb = state.last_outcome.verb
+  const verb = outcome.verb
   if (verb !== null && !CONTROL_VERBS.has(verb)) throw new Error('invalid control verb')
-  const result = safeString(state.last_outcome.result)
-  if (result === null || !RESULT_RE.test(result)) throw new Error('invalid control result')
-  if (state.last_outcome.accepted && (agentId === null || verb === null)) throw new Error('incomplete accepted control outcome')
+  const result = safeString(outcome.result)
+  if (result === null) throw new Error('invalid control result')
+  const accepted = outcome.accepted
+  let validTuple = false
+  if (accepted) {
+    validTuple = agentId === null && verb === null && result === 'idle'
+    if (agentId !== null && verb !== null) validTuple = ACCEPTED_CONTROL_RESULTS[verb] === result
+  } else if (agentId === null && verb === null) {
+    validTuple = REQUESTLESS_CONTROL_FAILURES.has(result)
+  } else if (agentId !== null && verb !== null) {
+    validTuple = REQUEST_CONTROL_FAILURES[verb].has(result)
+  }
+  if (!validTuple) throw new Error('invalid control outcome tuple')
   return {
     schema: CONTROL_SCHEMA,
     pid: state.pid,
@@ -260,7 +297,7 @@ function normalizeControlState(state) {
     poll: state.poll,
     last_poll_at: lastPollAt,
     poll_sec: state.poll_sec,
-    last_outcome: { agent_id: agentId, verb, accepted: state.last_outcome.accepted, result },
+    last_outcome: { agent_id: agentId, verb, accepted, result },
   }
 }
 
@@ -339,8 +376,7 @@ export async function observeAdvance(input, deps = {}) {
     }
     if (stateHasAdvance(beforeHeartbeat.tick, afterHeartbeat.tick) && stateHasAdvance(beforeControl.poll, afterControl.poll)) break
     if (iteration === maxIterations - 1) {
-      timedOut = true
-      break
+      throw new ReceiptFailure('invalid_clock', 'clock_valid')
     }
     const sleepStartedMs = completedMs
     await sleep(Math.min(opts.pollMs, deadlineMs - completedMs))
@@ -348,9 +384,14 @@ export async function observeAdvance(input, deps = {}) {
     if (completedMs <= sleepStartedMs) throw new ReceiptFailure('invalid_clock', 'clock_valid')
   }
 
-  // Preserve the latest evidence without allowing a post-deadline read to prove success.
-  afterHeartbeat = readState(readRuntimeState, opts.heartbeatStatePath, 'heartbeat')
-  afterControl = readState(readRuntimeState, opts.controlStatePath, 'control')
+  // A timeout is already established; final read failures cannot replace its last valid evidence.
+  if (timedOut) {
+    try { afterHeartbeat = readState(readRuntimeState, opts.heartbeatStatePath, 'heartbeat') } catch { /* retain prior evidence */ }
+    try { afterControl = readState(readRuntimeState, opts.controlStatePath, 'control') } catch { /* retain prior evidence */ }
+  } else {
+    afterHeartbeat = readState(readRuntimeState, opts.heartbeatStatePath, 'heartbeat')
+    afterControl = readState(readRuntimeState, opts.controlStatePath, 'control')
+  }
 
   return {
     started_ms: startedMs,
@@ -362,26 +403,47 @@ export async function observeAdvance(input, deps = {}) {
   }
 }
 
-function normalizeServiceReceipt(receipt) {
-  if (!isPlainObject(receipt) || receipt.receipt_type !== SERVICE_RECEIPT_TYPE || receipt.action !== 'status') {
-    throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
+function serviceReceiptMalformed() {
+  throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
+}
+
+function hasExactKeys(value, expected) {
+  if (!isPlainObject(value)) return false
+  const actual = Object.keys(value).sort()
+  const sortedExpected = [...expected].sort()
+  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index])
+}
+
+function safeNonEmptyString(value) {
+  const safe = safeString(value)
+  return safe !== null && safe.length > 0 ? safe : null
+}
+
+function normalizeServiceReceipt(receipt, expectedManager) {
+  const topLevelKeys = ['receipt_type', 'generated_at', 'status', 'platform', 'service_manager', 'action', 'definitions', 'services', 'linger', 'commands', 'preserved_data', 'next_steps', 'checks']
+  const rawScan = sanitizeReceiptValue(receipt)
+  if (rawScan.secretFound || !hasExactKeys(receipt, topLevelKeys)) serviceReceiptMalformed()
+  if (receipt.receipt_type !== SERVICE_RECEIPT_TYPE || receipt.action !== 'status') serviceReceiptMalformed()
+  if (!['pass', 'fail'].includes(receipt.status) || receipt.service_manager !== expectedManager) serviceReceiptMalformed()
+  if (safeNonEmptyString(receipt.platform) === null || normalizeTimestamp(receipt.generated_at) === null) serviceReceiptMalformed()
+
+  if (!Array.isArray(receipt.definitions) || receipt.definitions.length > SERVICE_KEYS.length) serviceReceiptMalformed()
+  const definitions = new Set()
+  for (const definition of receipt.definitions) {
+    if (!hasExactKeys(definition, ['service', 'path', 'sha256']) || !SERVICE_KEYS.includes(definition.service) || definitions.has(definition.service)) serviceReceiptMalformed()
+    const path = safeNonEmptyString(definition.path)
+    const expectedFile = expectedManager === 'launchd' ? `${SERVICE_NAMES.launchd[definition.service]}.plist` : SERVICE_NAMES.systemd[definition.service]
+    if (path === null || !isAbsolute(path) || basename(path) !== expectedFile || !SHA256_RE.test(definition.sha256)) serviceReceiptMalformed()
+    definitions.add(definition.service)
   }
-  if (!['pass', 'fail'].includes(receipt.status) || !['launchd', 'systemd'].includes(receipt.service_manager)) {
-    throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
-  }
-  if (normalizeTimestamp(receipt.generated_at) === null || !Array.isArray(receipt.services) || receipt.services.length !== 2) {
-    throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
-  }
-  const expectedNames = SERVICE_NAMES[receipt.service_manager]
+
+  if (!Array.isArray(receipt.services) || receipt.services.length > SERVICE_KEYS.length) serviceReceiptMalformed()
+  const expectedNames = SERVICE_NAMES[expectedManager]
   const servicesByKey = new Map()
   for (const service of receipt.services) {
-    if (!isPlainObject(service) || !['heartbeat', 'control'].includes(service.key) || servicesByKey.has(service.key)) {
-      throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
-    }
-    if (safeString(service.name) !== expectedNames[service.key] || !nullableBoolean(service.loaded) || !nullableBoolean(service.enabled) || !nullableBoolean(service.running)) {
-      throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
-    }
-    if (service.pid !== null && !isPositiveInteger(service.pid)) throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
+    if (!hasExactKeys(service, ['key', 'name', 'loaded', 'enabled', 'running', 'pid']) || !SERVICE_KEYS.includes(service.key) || servicesByKey.has(service.key)) serviceReceiptMalformed()
+    if (safeString(service.name) !== expectedNames[service.key] || !nullableBoolean(service.loaded) || !nullableBoolean(service.enabled) || !nullableBoolean(service.running)) serviceReceiptMalformed()
+    if (service.pid !== null && !isPositiveInteger(service.pid)) serviceReceiptMalformed()
     servicesByKey.set(service.key, {
       key: service.key,
       name: expectedNames[service.key],
@@ -391,42 +453,57 @@ function normalizeServiceReceipt(receipt) {
       pid: service.pid,
     })
   }
-  if (!Array.isArray(receipt.checks) || receipt.checks.length !== 2 || receipt.checks.some((entry) => !isPlainObject(entry) || !SERVICE_CHECKS.has(entry.check) || typeof entry.ok !== 'boolean')) {
-    throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
+
+  if (!Array.isArray(receipt.commands)) serviceReceiptMalformed()
+  for (const command of receipt.commands) {
+    if (!hasExactKeys(command, ['executable', 'argv', 'code', 'stdout_summary', 'stderr_summary'])) serviceReceiptMalformed()
+    if (safeNonEmptyString(command.executable) === null || !Array.isArray(command.argv) || command.argv.some((arg) => safeString(arg) === null)) serviceReceiptMalformed()
+    if (!Number.isInteger(command.code) || safeString(command.stdout_summary) === null || safeString(command.stderr_summary) === null) serviceReceiptMalformed()
   }
-  const checks = receipt.checks.map((entry) => ({ check: entry.check, ok: entry.ok }))
-  if (new Set(checks.map((entry) => entry.check)).size !== checks.length) {
-    throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
+
+  if (!hasExactKeys(receipt.preserved_data, PRESERVED_DATA_KEYS) || PRESERVED_DATA_KEYS.some((key) => receipt.preserved_data[key] !== true)) serviceReceiptMalformed()
+  if (!Array.isArray(receipt.next_steps) || receipt.next_steps.some((step) => safeNonEmptyString(step) === null)) serviceReceiptMalformed()
+
+  if (!Array.isArray(receipt.checks) || receipt.checks.length !== 2) serviceReceiptMalformed()
+  const checks = []
+  for (const entry of receipt.checks) {
+    const allowedKeys = entry?.check === 'service_operation_failed' ? ['ok', 'check', 'reason'] : ['ok', 'check']
+    if (!hasExactKeys(entry, allowedKeys) || !SERVICE_CHECKS.has(entry.check) || typeof entry.ok !== 'boolean') serviceReceiptMalformed()
+    if (entry.check === 'service_operation_failed' && (entry.ok !== false || safeNonEmptyString(entry.reason) === null)) serviceReceiptMalformed()
+    checks.push({ check: entry.check, ok: entry.ok })
   }
+  if (new Set(checks.map((entry) => entry.check)).size !== checks.length) serviceReceiptMalformed()
   const operationalCheck = checks.find((entry) => entry.check === 'services_loaded_and_running')
+  const operationFailureCheck = checks.find((entry) => entry.check === 'service_operation_failed')
   const secretCheck = checks.find((entry) => entry.check === 'command_output_secret_free')
-  const services = ['heartbeat', 'control'].map((key) => servicesByKey.get(key))
-  if (services.some((service) => service === undefined)) throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
-  if (receipt.status === 'pass' && (
-    services.some((service) => service.loaded !== true || service.running !== true) ||
-    operationalCheck?.ok !== true ||
-    secretCheck?.ok !== true
-  )) {
-    throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
+  if (secretCheck === undefined || (operationalCheck === undefined) === (operationFailureCheck === undefined)) serviceReceiptMalformed()
+
+  const services = SERVICE_KEYS.flatMap((key) => servicesByKey.has(key) ? [servicesByKey.get(key)] : [])
+  if (receipt.status === 'pass') {
+    if (definitions.size !== SERVICE_KEYS.length || services.length !== SERVICE_KEYS.length) serviceReceiptMalformed()
+    if (services.some((service) => service.loaded !== true || service.running !== true) || operationalCheck?.ok !== true || secretCheck.ok !== true) serviceReceiptMalformed()
+  } else if (!checks.some((entry) => entry.ok === false)) {
+    serviceReceiptMalformed()
   }
+
   let linger = null
-  if (receipt.linger !== null && receipt.linger !== undefined) {
-    if (receipt.service_manager !== 'systemd' || !isPlainObject(receipt.linger)) {
-      throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
-    }
+  if (receipt.linger !== null) {
+    if (expectedManager !== 'systemd' || !hasExactKeys(receipt.linger, ['enabled', 'raw'])) serviceReceiptMalformed()
     if (receipt.linger.enabled === null && receipt.linger.raw === null) linger = { enabled: null, raw: null }
     else {
-      if (typeof receipt.linger.enabled !== 'boolean') throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
+      if (typeof receipt.linger.enabled !== 'boolean') serviceReceiptMalformed()
       const expectedRaw = receipt.linger.enabled ? 'yes' : 'no'
-      if (receipt.linger.raw !== expectedRaw) throw new ReceiptFailure('service_receipt_malformed', 'service_receipt_v1')
+      if (receipt.linger.raw !== expectedRaw) serviceReceiptMalformed()
       linger = { enabled: receipt.linger.enabled, raw: expectedRaw }
     }
+  } else if (expectedManager === 'systemd' && receipt.status === 'pass') {
+    serviceReceiptMalformed()
   }
-  return { status: receipt.status, service_manager: receipt.service_manager, services, linger, checks }
+  return { status: receipt.status, service_manager: expectedManager, services, linger, checks }
 }
 
-function serviceOptions(opts) {
-  const manager = resolveServiceManager(opts.serviceManager, process.platform)
+function serviceOptions(opts, platformName) {
+  const manager = resolveServiceManager(opts.serviceManager, platformName)
   const options = { action: 'status', serviceManager: opts.serviceManager }
   if (opts.definitionDir) {
     if (manager === 'launchd') options.launchdDir = opts.definitionDir
@@ -547,13 +624,15 @@ export async function buildContinuousRuntimeReceipt(input, deps = {}) {
     const observation = await observeAdvance(opts, deps)
     const buildServiceReceipt = deps.buildServiceReceipt ?? defaultBuildServiceReceipt
     if (typeof buildServiceReceipt !== 'function') throw new ReceiptFailure('invalid_options', 'options_valid')
+    const servicePlatform = deps.serviceDeps?.platformName ?? process.platform
+    const expectedServiceManager = resolveServiceManager(opts.serviceManager, servicePlatform)
     let rawServiceReceipt
     try {
-      rawServiceReceipt = await buildServiceReceipt(serviceOptions(opts), deps.serviceDeps ?? {})
+      rawServiceReceipt = await buildServiceReceipt(serviceOptions(opts, servicePlatform), deps.serviceDeps ?? {})
     } catch {
       throw new ReceiptFailure('service_status_failed', 'service_status_readable')
     }
-    const services = normalizeServiceReceipt(rawServiceReceipt)
+    const services = normalizeServiceReceipt(rawServiceReceipt, expectedServiceManager)
     const heartbeatBefore = observation.heartbeat.before
     const heartbeatAfter = observation.heartbeat.after
     const controlBefore = observation.control.before
