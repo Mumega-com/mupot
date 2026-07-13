@@ -1,6 +1,13 @@
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { lstatSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+
+// Public, throwaway PKCS#8 fixture in tests/github-app.test.ts. Any other
+// generic PKCS#8 block is treated as credential material.
+const KNOWN_PUBLIC_TEST_KEY_SHA256 = new Set([
+  '528f37bab2201aaa04fad5091400c73743ebc566bef8eb556316bd2f25b44e80',
+])
 
 const rules = [
   {
@@ -53,6 +60,20 @@ function displayPath(path) {
   return path.replaceAll('\r', '\\r').replaceAll('\n', '\\n')
 }
 
+function genericPrivateKeyFindings(text, path) {
+  const findings = []
+  const pattern = /^-----BEGIN (ENCRYPTED )?PRIVATE KEY-----\r?\n([A-Za-z0-9+/=\r\n]+?)^-----END \1PRIVATE KEY-----$/gm
+  for (const match of text.matchAll(pattern)) {
+    const body = match[2].replace(/\s/g, '')
+    const fingerprint = createHash('sha256').update(Buffer.from(body, 'base64')).digest('hex')
+    if (KNOWN_PUBLIC_TEST_KEY_SHA256.has(fingerprint)) continue
+
+    const line = text.slice(0, match.index).split(/\r?\n/).length
+    findings.push(`${displayPath(path)}:${line}: private key`)
+  }
+  return findings
+}
+
 function scan(root) {
   const findings = []
 
@@ -62,6 +83,8 @@ function scan(root) {
 
     const text = decodeText(readFileSync(absolutePath))
     if (text === null) continue
+
+    findings.push(...genericPrivateKeyFindings(text, path))
 
     const lines = text.split(/\r?\n/)
     for (const [index, line] of lines.entries()) {
