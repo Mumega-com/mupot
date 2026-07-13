@@ -8,11 +8,11 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { SECRET_VALUE_PATTERNS } from './service-context.mjs'
 
-const SECRET_FIELD_RE = /(?:^|_)(?:authorization|bearer|token|access_token|refresh_token|secret|password|passwd|api_key|private_key|client_secret|cookie|signature|sig|nonce)(?:$|_)/i
+const SECRET_FIELD_RE = /(?:^|_)(?:authorization|bearer|token|access_token|refresh_token|secret|password|passwd|api_key|private_key|client_secret|cookie|credential|credentials|signature|sig|nonce)(?:$|_)/i
 
 function normalizedFieldName(key) {
   return String(key)
@@ -49,6 +49,14 @@ function defaultTempName(target) {
   return `.${basename(target)}.tmp-${process.pid}-${randomUUID()}`
 }
 
+function serializeSecretFreeState(value) {
+  const serialized = JSON.stringify(value)
+  if (typeof serialized !== 'string') throw new Error('runtime state must serialize to JSON')
+  const serializedValue = JSON.parse(serialized)
+  assertSecretFree(serializedValue)
+  return `${serialized}\n`
+}
+
 function consumeState(inbox) {
   if (inbox?.action === 'inbox_consumed') return 'consumed'
   if (inbox?.action === 'inbox_not_configured' || inbox === null) return 'not_configured'
@@ -57,7 +65,17 @@ function consumeState(inbox) {
 }
 
 export function writeRuntimeState(path, value, deps = {}) {
-  assertSecretFree(value)
+  const targetPath = resolve(path)
+  const parent = dirname(targetPath)
+  const tempName = (deps.tempName ?? defaultTempName)(targetPath)
+  if (typeof tempName !== 'string' || !tempName || tempName === '.' || tempName === '..' || basename(tempName) !== tempName) {
+    throw new Error('runtime state temporary name must be a filename')
+  }
+  const tempPath = resolve(parent, tempName)
+  if (dirname(tempPath) !== parent || tempPath === targetPath) {
+    throw new Error('runtime state temporary name must be a distinct child of the target parent')
+  }
+  const json = serializeSecretFreeState(value)
   const fs = {
     closeSync,
     fsyncSync,
@@ -69,7 +87,6 @@ export function writeRuntimeState(path, value, deps = {}) {
     writeFileSync,
     ...(deps.fs ?? deps),
   }
-  const parent = dirname(path)
   let parentStats
   try {
     parentStats = fs.statSync(parent)
@@ -78,26 +95,24 @@ export function writeRuntimeState(path, value, deps = {}) {
   }
   if (!parentStats.isDirectory()) throw new Error(`runtime state parent is not a directory: ${parent}`)
 
-  const tempName = (deps.tempName ?? defaultTempName)(path)
-  if (typeof tempName !== 'string' || !tempName || basename(tempName) !== tempName) {
-    throw new Error('runtime state temporary name must be a filename')
-  }
-  const tempPath = join(parent, tempName)
-  const json = `${JSON.stringify(value)}\n`
   let fd = null
+  let created = false
   let closed = false
   try {
     fd = fs.openSync(tempPath, 'wx', 0o600)
+    created = true
     fs.writeFileSync(fd, json)
     fs.fsyncSync(fd)
     fs.closeSync(fd)
     closed = true
-    fs.renameSync(tempPath, path)
+    fs.renameSync(tempPath, targetPath)
   } catch (error) {
     if (fd !== null && !closed) {
       try { fs.closeSync(fd) } catch { /* preserve the original error */ }
     }
-    try { fs.unlinkSync(tempPath) } catch { /* temp file was not created or already removed */ }
+    if (created) {
+      try { fs.unlinkSync(tempPath) } catch { /* temp file was already removed */ }
+    }
     throw error
   }
 }

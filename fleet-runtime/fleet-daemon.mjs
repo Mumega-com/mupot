@@ -110,6 +110,13 @@ export function publishHeartbeatState(cfg, results, tick, opts = {}) {
   return results
 }
 
+export async function runHeartbeatCycle(cfg, keys, liveAgents, state, opts = {}) {
+  const runDaemonOnceFn = opts.runDaemonOnce ?? runDaemonOnce
+  const results = await runDaemonOnceFn(cfg, keys, liveAgents, opts)
+  state.tick += 1
+  return publishHeartbeatState(cfg, results, state.tick, opts)
+}
+
 /** Run a probe shell command; resolve true iff it exits 0 within the timeout. Never throws.
  *  detached:true makes the child its own process-group leader so a timeout SIGKILLs the WHOLE
  *  group (the `sh` AND any grandchildren it forked). Killing only the `sh` parent would orphan
@@ -305,14 +312,12 @@ async function main() {
   let activeTick = null
   const liveAgents = new Set()
   const startedAt = new Date().toISOString()
-  let tick = 0
+  const state = { tick: 0 }
   const loop = async () => {
     if (stopping) return
     try {
-      activeTick = runDaemonOnce(cfg, keys, liveAgents)
-      const results = await activeTick
-      tick += 1
-      publishHeartbeatState(cfg, results, tick, { startedAt })
+      activeTick = runHeartbeatCycle(cfg, keys, liveAgents, state, { startedAt })
+      await activeTick
     } catch (e) {
       log({ event: 'tick_error', error: String(e && e.message ? e.message : e) })
     } finally {

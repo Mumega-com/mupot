@@ -6,7 +6,7 @@ import { canonicalControlMessage, importPanelPublicKey } from './control-request
 import {
   handleControlMessage,
   pollOnce,
-  publishControlState,
+  runControlCycle,
   runFlightVerb,
   validateConfig,
 } from './fleet-control-daemon.mjs'
@@ -157,7 +157,7 @@ test('pollOnce: peeks one message, executes, then consumes one message', async (
   assert.deepEqual(calls, [{ peek: true, limit: 1 }, { peek: false, limit: 1 }])
 })
 
-test('publishControlState: writes reduced completed poll outcomes and preserves poll results on write failure', () => {
+test('runControlCycle: publishes completed polls in order and survives state write failures', async () => {
   const cfg = validateConfig({ ...baseRaw(), state_file: '/tmp/control-state.json' })
   const outcome = {
     ok: true,
@@ -166,35 +166,48 @@ test('publishControlState: writes reduced completed poll outcomes and preserves 
   }
   const writes = []
   const logs = []
-  const first = publishControlState(cfg, outcome, 1, {
+  const events = []
+  const state = { poll: 0 }
+  let finishFirst
+  const firstOperation = new Promise((resolve) => { finishFirst = resolve })
+  const pollOnceFn = async () => {
+    events.push('poll')
+    return firstOperation
+  }
+  const options = {
     statePath: '/tmp/control-state.json',
     pid: 456,
     startedAt: '2026-07-13T12:00:00.000Z',
     now: () => new Date('2026-07-13T12:01:00.000Z'),
-    writeRuntimeState: (path, state) => writes.push({ path, state }),
+    pollOnce: pollOnceFn,
+    writeRuntimeState: (path, published) => {
+      events.push(`write:${published.poll}`)
+      writes.push({ path, state: published })
+    },
     log: (entry) => logs.push(entry),
-  })
-  const second = publishControlState(cfg, outcome, 2, {
-    statePath: '/tmp/control-state.json',
-    pid: 456,
-    startedAt: '2026-07-13T12:00:00.000Z',
-    now: () => new Date('2026-07-13T12:01:05.000Z'),
-    writeRuntimeState: (path, state) => writes.push({ path, state }),
-    log: (entry) => logs.push(entry),
-  })
-  const third = publishControlState(cfg, outcome, 3, {
-    statePath: '/tmp/control-state.json',
-    pid: 456,
-    startedAt: '2026-07-13T12:00:00.000Z',
-    now: () => new Date('2026-07-13T12:01:10.000Z'),
-    writeRuntimeState: () => { throw new Error('disk full') },
-    log: (entry) => logs.push(entry),
-  })
+  }
+  const firstCycle = runControlCycle(cfg, 'consumer-key', null, null, state, options)
+  await Promise.resolve()
+  assert.deepEqual(events, ['poll'])
+  finishFirst(outcome)
+  assert.equal(await firstCycle, outcome)
+  assert.equal(state.poll, 1)
 
-  assert.equal(first, outcome)
-  assert.equal(second, outcome)
-  assert.equal(third, outcome)
-  assert.deepEqual(writes.map((write) => write.state.poll), [1, 2])
+  options.now = () => new Date('2026-07-13T12:01:05.000Z')
+  options.writeRuntimeState = () => { throw new Error('disk full') }
+  assert.equal(await runControlCycle(cfg, 'consumer-key', null, null, state, options), outcome)
+  assert.equal(state.poll, 2)
+
+  options.now = () => new Date('2026-07-13T12:01:10.000Z')
+  options.writeRuntimeState = (path, published) => {
+    events.push(`write:${published.poll}`)
+    writes.push({ path, state: published })
+  }
+  assert.equal(await runControlCycle(cfg, 'consumer-key', null, null, state, options), outcome)
+
+  assert.deepEqual(events, ['poll', 'write:1', 'poll', 'poll', 'write:3'])
+  assert.deepEqual(writes.map((write) => write.state.poll), [1, 3])
+  assert.equal(state.poll, 3)
   assert.doesNotMatch(JSON.stringify(writes[0].state), /nonce|signature|token/i)
   assert.equal(logs.at(-1).event, 'state_write_failed')
   assert.equal(logs.at(-1).state_path, '/tmp/control-state.json')

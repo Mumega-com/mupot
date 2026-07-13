@@ -89,6 +89,13 @@ export function publishControlState(cfg, outcome, poll, opts = {}) {
   return outcome
 }
 
+export async function runControlCycle(cfg, consumerKey, publicKey, ledger, state, opts = {}) {
+  const pollOnceFn = opts.pollOnce ?? pollOnce
+  const outcome = await pollOnceFn(cfg, consumerKey, publicKey, ledger, opts)
+  state.poll += 1
+  return publishControlState(cfg, outcome, state.poll, opts)
+}
+
 export function runCommand(argv, timeoutMs = DEFAULT_TIMEOUT_MS, spawnImpl = spawn) {
   return new Promise((resolveDone) => {
     let done = false
@@ -212,13 +219,11 @@ async function main() {
 
   let stopping = false
   const startedAt = new Date().toISOString()
-  let poll = 0
+  const state = { poll: 0 }
   const loop = async () => {
     while (!stopping) {
       try {
-        const outcome = await pollOnce(cfg, consumerKey, publicKey, ledger)
-        poll += 1
-        publishControlState(cfg, outcome, poll, { startedAt })
+        await runControlCycle(cfg, consumerKey, publicKey, ledger, state, { startedAt })
       } catch (e) { log({ event: 'control_tick_error', error: String(e && e.message ? e.message : e) }) }
       if (!stopping) await new Promise((resolveTimer) => setTimeout(resolveTimer, cfg.pollSec * 1000))
     }

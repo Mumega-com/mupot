@@ -81,12 +81,50 @@ test('writeRuntimeState preserves a prior state when rename fails and cleans its
   assert.deepEqual(fs.calls.at(-1), ['unlink', '/state/.daemon.json.tmp'])
 })
 
+test('writeRuntimeState leaves an existing temporary collision untouched when exclusive open fails', () => {
+  const fs = recordingFs()
+  fs.files.set('/state/.daemon.json.tmp', 'previous temporary state')
+  fs.openSync = (path, flag, mode) => {
+    fs.calls.push(['open', path, flag, mode])
+    throw new Error('EEXIST')
+  }
+
+  assert.throws(
+    () => writeRuntimeState('/state/daemon.json', { tick: 2 }, { fs, tempName: () => '.daemon.json.tmp' }),
+    /EEXIST/,
+  )
+  assert.equal(fs.files.get('/state/.daemon.json.tmp'), 'previous temporary state')
+  assert.equal(fs.calls.some(([operation]) => operation === 'unlink'), false)
+})
+
+test('writeRuntimeState rejects a temporary path that aliases the target before filesystem effects', () => {
+  for (const tempName of ['daemon.json', '.', '..']) {
+    const fs = recordingFs()
+    assert.throws(
+      () => writeRuntimeState('/state/daemon.json', { tick: 2 }, { fs, tempName: () => tempName }),
+      /temporary name/,
+    )
+    assert.equal(fs.calls.length, 0)
+  }
+})
+
 test('writeRuntimeState rejects secret-looking field names and canonical secret values before creating a file', () => {
   for (const state of [
     { ['author' + 'ization']: 'Be' + 'arer abcdefghijklmnop' },
     { nested: { ['private' + '_key']: 'not-a-key' } },
     { token: 'mupot_abcdefghijklmnop' },
+    { credentials: { username: 'operator', password: 'not-a-password' } },
     { result: 'Bearer abcdefghijklmnop' },
+    {
+      toJSON() {
+        return { credentials: 'not-a-secret' }
+      },
+    },
+    {
+      toJSON() {
+        return { result: 'Bearer abcdefghijklmnop' }
+      },
+    },
   ]) {
     const fs = recordingFs()
     assert.throws(() => writeRuntimeState('/state/daemon.json', state, { fs }), /prohibited secret-like material/)
