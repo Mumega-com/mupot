@@ -2,6 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
@@ -11,6 +12,7 @@ import { createServiceContext } from './service-context.mjs'
 import { renderLaunchd } from './launchd-service-manager.mjs'
 import { renderSystemd } from './systemd-service-manager.mjs'
 import { STARTER_ARTIFACT_ROLES, STARTER_CHECKS } from './starter-contract.mjs'
+import { verifyStarterBundle } from './starter-manifest.mjs'
 
 const POT_URL = 'https://pot.example.org'
 const POT_TENANT = 'tenant-a'
@@ -868,6 +870,46 @@ test('starter-ready bundle requires, exports, and summarizes service continuity 
   }
   assert.deepEqual(absoluteStrings(copiedCheck), [])
   assert.deepEqual(absoluteStrings(inspectBundleStatus({ outDir: exportDir })), [])
+})
+
+test('starter verifier shares the starter-ready deep evidence contract and CLI manifest default', async () => {
+  const outDir = tmpDir()
+  const sources = starterPaths()
+  seedStarterEvidence(outDir, sources)
+  const bundle = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    verifyOnly: true,
+    ...sources,
+  })
+  assert.equal(bundle.status, 'pass')
+
+  const artifacts = {
+    install: 'install.json',
+    service: 'service.json',
+    host: 'host.json',
+    continuous: 'continuous.json',
+    runtime_inbox: 'runtime-agent-one.json',
+    lifecycle_control_start: 'control-start.json',
+    lifecycle_control_stop: 'control-stop.json',
+    receipt_bundle_manifest: 'prior-bundle-manifest.json',
+  }
+  const receipt = verifyStarterBundle({
+    bundleDir: outDir,
+    artifacts,
+    now: () => new Date('2026-07-13T20:06:00.000Z'),
+  })
+  assert.equal(receipt.receipt_type, 'mupot-fleet-starter-receipt/v1')
+  assert.equal(receipt.status, 'pass')
+
+  const args = ['fleet-runtime/starter-manifest.mjs', '--verify', '--bundle-dir', outDir]
+  for (const [role, path] of Object.entries(artifacts)) args.push('--artifact', `${role}=${path}`)
+  const cli = spawnSync(process.execPath, args, { encoding: 'utf8' })
+  assert.equal(cli.status, 0, cli.stderr)
+  assert.equal(JSON.parse(cli.stdout).status, 'pass')
 })
 
 test('portable export preserves activated install evidence after source deletion', async () => {

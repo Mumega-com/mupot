@@ -1,7 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createHash } from 'node:crypto'
-import { mkdtempSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -13,9 +12,6 @@ import {
 } from './starter-manifest.mjs'
 import {
   STARTER_ARTIFACT_ROLES,
-  STARTER_CHECKS,
-  STARTER_RECEIPT_TYPE,
-  validateStarterReceipt,
 } from './starter-contract.mjs'
 
 const EXPECTED_TYPES = Object.freeze({
@@ -49,10 +45,6 @@ function tempDir() {
 
 function writeJson(path, value) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`)
-}
-
-function sha256(path) {
-  return createHash('sha256').update(readFileSync(path)).digest('hex')
 }
 
 function seedBundle(overrides = {}) {
@@ -100,14 +92,27 @@ test('starter manifest validates and renders co-resident and distributed host pl
 })
 
 test('starter plan covers the credential-free install, proof, export, rollback, and recovery lifecycle', () => {
-  const plan = renderStarterPlan(sterileManifest(), { agents: ['manager'] })
+  const plan = renderStarterPlan(sterileManifest(), {
+    agents: ['manager'],
+    manifestPath: 'customer starter.json',
+  })
   for (const required of [
-    'fleet-runtime/install.mjs',
+    'fleet-runtime/install.mjs --service-manager auto > ~/.fleet/receipts/install.json',
     'edit ~/.fleet/daemon.json',
     'fleet-runtime/trust-bootstrap.mjs',
     'fleet-runtime/service-manager.mjs install',
     'fleet-runtime/host-receipt.mjs',
+    'fleet-runtime/cutover-probe.mjs --base-url https://pot.customer.example --agent manager --agent-token-env MUPOT_AGENT_TOKEN_MANAGER --queue-inbox --control start',
+    'fleet-runtime/cutover-probe.mjs --base-url https://pot.customer.example --agent manager --control stop',
     'fleet-runtime/continuous-runtime-receipt.mjs',
+    'prior-bundle-manifest.json',
+    "cp 'customer starter.json' ~/.fleet/receipts/manager/starter.example.json",
+    'for(const d of r.definitions)',
+    'fleet-runtime/starter-manifest.mjs --verify',
+    '--artifact receipt_bundle_manifest=prior-bundle-manifest.json',
+    '--service-receipt ~/.fleet/receipts/manager/service.json',
+    '--continuous-receipt ~/.fleet/receipts/manager/continuous.json',
+    '--starter-receipt ~/.fleet/receipts/manager/starter-receipt.json',
     'fleet-runtime/receipt-bundle.mjs --export',
     'fleet-runtime/receipt-bundle.mjs --check-manifest',
     'fleet-runtime/service-manager.mjs uninstall',
@@ -119,6 +124,15 @@ test('starter plan covers the credential-free install, proof, export, rollback, 
   assert.doesNotMatch(plan, /Bearer\s+[A-Za-z0-9._-]{12,}/i)
   assert.doesNotMatch(plan, /-----BEGIN [A-Z ]*PRIVATE KEY-----/)
   assert.doesNotMatch(plan, /mupot_[A-Za-z0-9._-]{12,}/)
+})
+
+test('starter plan shell-quotes manifest-derived URL values', () => {
+  const manifest = sterileManifest()
+  manifest.base_url = 'https://pot.customer.example/;printf-INJECTED'
+  const plan = renderStarterPlan(manifest, { agents: ['manager'] })
+
+  assert.match(plan, /--base-url 'https:\/\/pot\.customer\.example\/;printf-INJECTED'/)
+  assert.doesNotMatch(plan, /--base-url https:\/\/pot\.customer\.example\/;printf-INJECTED/)
 })
 
 test('starter planning rejects invalid topology and unknown host filters', () => {
@@ -134,26 +148,13 @@ test('starter planning rejects invalid topology and unknown host filters', () =>
   assert.throws(() => renderStarterPlan(sterileManifest(), { agents: ['unknown'] }), /unknown agent/i)
 })
 
-test('starter bundle verification returns the exact portable shared receipt', () => {
+test('starter bundle verification rejects self-asserted passing envelopes', () => {
   const fixture = seedBundle()
-  const receipt = verifyStarterBundle({
+  assert.throws(() => verifyStarterBundle({
     bundleDir: fixture.bundleDir,
     manifestPath: 'starter.example.json',
     artifacts: fixture.artifacts,
-    now: () => new Date('2026-07-13T20:06:00.000Z'),
-  })
-
-  assert.equal(receipt.receipt_type, STARTER_RECEIPT_TYPE)
-  assert.equal(receipt.status, 'pass')
-  assert.equal(receipt.generated_at, '2026-07-13T20:06:00.000Z')
-  assert.deepEqual(receipt.manifest, {
-    path: 'starter.example.json',
-    sha256: sha256(join(fixture.bundleDir, 'starter.example.json')),
-  })
-  assert.deepEqual(receipt.artifacts.map((artifact) => artifact.role), STARTER_ARTIFACT_ROLES)
-  assert.deepEqual(receipt.artifacts.map((artifact) => artifact.path), STARTER_ARTIFACT_ROLES.map((role) => fixture.artifacts[role]))
-  assert.deepEqual(receipt.checks, STARTER_CHECKS.map((check) => ({ check, ok: true })))
-  assert.deepEqual(validateStarterReceipt(receipt), receipt)
+  }), /contracts|cross-bindings/i)
 })
 
 test('starter bundle verification rejects failed, wrong-type, external, linked, and secret-bearing evidence', () => {

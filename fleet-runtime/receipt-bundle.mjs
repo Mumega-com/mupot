@@ -4304,4 +4304,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   await main()
 }
 
-export { buildBundle, checkBundleManifest, defaultStamp, exportBundle, formatHostGoPlan, formatStatusSummary, inspectBundleStatus, parseArgs, safeName, summarize }
+export { buildBundle, checkBundleManifest, defaultStamp, exportBundle, formatHostGoPlan, formatStatusSummary, inspectBundleStatus, normalizeStarterEvidence, parseArgs, safeName, summarize }
