@@ -429,3 +429,47 @@ path no longer passes.
 No blocking concern. The final export receipt deliberately does not claim a
 digest for an overwritten intermediate sidecar; only retained or
 independently reconstructible evidence is represented as verifiable.
+
+---
+
+## Task 7 Third Cumulative-Review Remediation
+
+### Result
+
+Starter readiness now binds each install output and activated definition to
+the exact path and digest observed by the live service receipt. Malformed
+portable projection entries fail closed before any field access. Forced bundle
+repair restores reused nested evidence directories to mode `0700`, while
+non-force verification rejects permissive parents without mutating them.
+
+Export receipt verification now reconstructs the exact ordered copied-artifact
+and sidecar arrays from the manifest, retained provenance, and current file
+digests. Reordering entries, duplicating sidecar labels, or adding fabricated
+receipt metadata to support files invalidates the evidence.
+
+### Verification
+
+- `node --test fleet-runtime/starter-contract.test.mjs fleet-runtime/host-receipt.test.mjs fleet-runtime/receipt-bundle.test.mjs`
+  - 160 passed, 0 failed.
+- `node --test fleet-runtime/*.test.mjs`
+  - 439 passed, 0 failed.
+- `npm test`
+  - 168 files passed; 2703 tests passed.
+- `npm run typecheck`
+  - Passed with no TypeScript errors.
+- `git diff --check`
+  - Passed with no whitespace errors.
+
+### Review Findings Closed
+
+- A portable provenance array containing `null` fails without throwing.
+- Matching install output and activation hashes cannot mask definition paths
+  that differ from the observed service paths.
+- Reordered copied artifacts, fabricated support metadata, reordered sidecars,
+  and duplicate sidecar labels are rejected by canonical reconstruction.
+- `--force` repairs reused nested directory modes as well as file modes.
+
+### Concerns
+
+No blocking concern. Structural equality treats JSON object key order as
+irrelevant while preserving exact array order and exact object fields.
