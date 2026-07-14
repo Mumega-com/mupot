@@ -53,6 +53,7 @@ import type {
 import { composeDeptMetricDescriptors, deepFreezeChannels, getChannelWorkTypes } from './channels/compose'
 import type { GatedWorkType } from './channels/contract'
 import { inkwellContentWrite, InkwellExecutorError } from './executors/inkwell'
+import { wpContentWrite, WpExecutorError } from './executors/mcpwp'
 
 // Re-export types so registry.ts only needs to import from kernel.ts.
 export type { KernelHandle, DepartmentCtx } from './ctx'
@@ -536,10 +537,11 @@ function _mintCtxInternal(
   // in-memory content stub). Durable content (a proposal row read across requests)
   // lands when real adapters wire; the APPROVAL gate is already real (DB verdict).
   //
-  // STUB ADAPTERS: both 'inkwell-content' and 'mcpwp' adapters return
-  //   { executed: false, reason: 'executor_not_wired' }
-  // with no fetch, no external write, no credentials. The PORT + the dispatch
-  // routing + the fail-closed authority check is the S4 deliverable.
+  // ADAPTERS: both 'inkwell-content' and 'mcpwp' (#370) dispatch to a real adapter
+  // when the Worker boundary resolved the matching connector config into
+  // handle.executorEnv. Absent config → { executed: false, reason: 'executor_not_wired' }
+  // with no fetch, no external write, no credentials — identical stub behavior to S4.
+  // The PORT + the dispatch routing + the fail-closed authority check is unchanged.
 
   // Closure-private content store (proposal action/payload + tenant/dept binding).
   // Holds NO approval flag — approval lives in task_verdicts (see _hasApprovedVerdict).
@@ -642,13 +644,28 @@ function _mintCtxInternal(
           }
         }
       } else if (executorHint === 'mcpwp') {
-        // STUB: mcpwp adapter (MCPWP-managed WordPress write path — not wired at S4).
-        // Full-impl: call MCPWP MCP tool with the proposal payload.
-        // Requires: Hadi-go, MCPWP credentials, per-pot WordPress connection.
-        outcome = {
-          executed: false,
-          reason: 'executor_not_wired',
-          adapter: 'mcpwp',
+        // mcpwp adapter — real WordPress content write (#370). Structural twin of
+        // the inkwell-content branch above. FAIL-CLOSED: only fires when the Worker
+        // boundary resolved the per-pot 'mcpwp' connector credential into
+        // handle.executorEnv.mcpwp. Absent → executor_not_wired. The payload is the
+        // STORED record's (content-bound), never caller-supplied.
+        //
+        // NOTE (#370 scope): this writes directly to the WordPress REST API
+        // (wp-json/wp/v2/posts), not through the mumcp MCP server — see the
+        // FOLLOW-UP comment in executors/mcpwp.ts.
+        const wpCfg = handle.executorEnv?.mcpwp
+        if (!wpCfg) {
+          outcome = { executed: false, reason: 'executor_not_wired', adapter: 'mcpwp' }
+        } else {
+          try {
+            const written = await wpContentWrite(wpCfg, storedPayload)
+            outcome = { executed: true, adapter: 'mcpwp', artifactUrl: written.artifactUrl }
+          } catch (e) {
+            // Fail-closed on any adapter error (config/payload/HTTP) — never throw out
+            // of execute(); surface the reason for the receipt/console.
+            const reason = e instanceof WpExecutorError ? e.reason : 'mcpwp_error'
+            outcome = { executed: false, reason, adapter: 'mcpwp' }
+          }
         }
       } else {
         // Unknown or unspecified executor hint — still fails safe (no write).

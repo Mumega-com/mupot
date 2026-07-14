@@ -36,6 +36,7 @@ import type { Capability } from '../types'
 import type { MetricDescriptor } from './contract'
 import type { EmitOutcome } from '../metrics/pulse'
 import type { InkwellExecutorConfig } from './executors/inkwell'
+import type { WpExecutorConfig } from './executors/mcpwp'
 
 // ── KernelHandle ──────────────────────────────────────────────────────────────
 //
@@ -54,6 +55,13 @@ export interface KernelHandle {
    */
   executorEnv?: {
     inkwell?: InkwellExecutorConfig
+    /**
+     * #370: WordPress ACT executor config. Same fail-closed discipline as inkwell —
+     * optional + absent at every call site that does not resolve a 'mcpwp' connector.
+     * Absent → adapter stays `executor_not_wired`. Populated by the Worker boundary
+     * from the per-pot 'mcpwp' connector (Hadi-go), never by department code.
+     */
+    mcpwp?: WpExecutorConfig
   }
 }
 
@@ -167,11 +175,13 @@ export interface BusPort {
 //   substitute action, payload, or executor — those come from the approved record.
 //   This closes the approve-A/execute-B substitution attack.
 //
-// Adapters are STUBBED at S4 — each returns
-//   { executed: false, reason: 'executor_not_wired' }
-// with NO external writes, NO fetch, NO credentials. The port + the dispatch +
-// the fail-closed authority surface is the S4 build; real adapters (inkwell-content,
-// mcpwp) are a later connector increment.
+// Both 'inkwell-content' and 'mcpwp' (#370) are now REAL adapters — each dispatches
+// to a live external write ONLY when the Worker boundary resolved the matching
+// connector credential into handle.executorEnv. Absent config → the adapter stays
+// STUBBED: { executed: false, reason: 'executor_not_wired' }, with NO external
+// writes, NO fetch, NO credentials. Any other/unrecognized executor hint also stays
+// stubbed. The port + the dispatch + the fail-closed authority surface is unchanged;
+// wiring a real config in is strictly additive per adapter.
 //
 // S-LOOP SEAM (auto-act policy — NOT built at S4):
 //   The S-loop's policy engine (auto-act low-risk within envelope vs always-gate)

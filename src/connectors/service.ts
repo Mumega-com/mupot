@@ -400,6 +400,63 @@ export async function resolveConnector(
   }
 }
 
+/**
+ * Resolve a connector credential AND its non-secret `meta` field together.
+ *
+ * Same scope-priority query + fail-closed discipline as resolveConnector() (agent >
+ * squad > pot; no master key or no row or decrypt-failure → null) — added (#370) for
+ * connector types whose adapter needs more than one field (e.g. 'mcpwp': the WordPress
+ * application-password is the encrypted secret, but siteUrl + username are non-secret
+ * per-connector config carried in `meta`, exactly like the Telegram connector's
+ * allowed_chats). resolveConnector() itself is UNTOUCHED — this is an additive sibling,
+ * not a replacement, so every existing single-secret caller (inkwell, telegram, …) is
+ * unaffected.
+ *
+ * @returns { secret, meta } or null if unavailable (same null conditions as resolveConnector).
+ */
+export async function resolveConnectorWithMeta(
+  env: Env,
+  agentOrSquadId: string,
+  type: ConnectorType,
+): Promise<{ secret: string; meta: string | null } | null> {
+  if (!isConnectorType(type)) return null
+
+  const masterKey = env.CONNECTOR_MASTER_KEY
+  if (!masterKey) return null // fail-closed: no key = no decrypt
+
+  // Identical scope-priority query to resolveConnector(), plus `meta` in the SELECT.
+  const row = await env.DB.prepare(
+    `SELECT id, type, encrypted_secret, meta
+       FROM connectors
+      WHERE tenant = ?1
+        AND type = ?2
+        AND revoked_at IS NULL
+        AND (
+              (scope_type = 'agent' AND scope_id = ?3)
+           OR (scope_type = 'squad' AND scope_id = ?3)
+           OR  scope_type = 'pot'
+            )
+      ORDER BY CASE scope_type
+                 WHEN 'agent' THEN 1
+                 WHEN 'squad' THEN 2
+                 ELSE 3
+               END
+      LIMIT 1`,
+  )
+    .bind(env.TENANT_SLUG, type, agentOrSquadId)
+    .first<{ id: string; type: ConnectorType; encrypted_secret: string; meta: string | null }>()
+
+  if (!row) return null
+
+  try {
+    const secret = await decryptConnectorSecret(masterKey, row.id, row.type, row.encrypted_secret)
+    return { secret, meta: row.meta }
+  } catch {
+    // Decryption failure is fatal (corrupted ciphertext, wrong key, etc.).
+    return null
+  }
+}
+
 // ── Telegram helpers ─────────────────────────────────────────────────────────
 
 /**
