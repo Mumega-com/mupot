@@ -36,6 +36,7 @@ import { mcpEndpoint, wakeContractForAgent } from '../dashboard/connect'
 import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
 import { isValidEd25519PublicX, registerAgentPublicKey } from '../fleet/agent-keys'
+import { assertWritten, rowsWritten } from '../lib/receipt'
 import {
   type ToolSpec,
   fail,
@@ -54,9 +55,9 @@ const GRANTABLE_AGENT_CAPABILITIES = new Set<Capability>(['observer', 'member', 
 async function emitProvisioned(
   env: Env,
   memberId: string,
-  kind: 'department' | 'squad' | 'agent' | 'token' | 'key' | 'capability',
+  kind: 'department' | 'squad' | 'agent' | 'token' | 'key' | 'capability' | 'agent_deactivated',
   id: string,
-  extra: { squad_id?: string; agent_id?: string; member_id?: string; capability?: Capability } = {},
+  extra: { squad_id?: string; agent_id?: string; member_id?: string; capability?: Capability; reason?: string } = {},
 ): Promise<void> {
   const event: BusEvent<{
     kind: string
@@ -64,6 +65,7 @@ async function emitProvisioned(
     by: string
     member_id?: string
     capability?: Capability
+    reason?: string
   }> = {
     type: 'org.provisioned',
     tenant: env.TENANT_SLUG,
@@ -76,6 +78,7 @@ async function emitProvisioned(
       by: memberId,
       ...(extra.member_id ? { member_id: extra.member_id } : {}),
       ...(extra.capability ? { capability: extra.capability } : {}),
+      ...(extra.reason ? { reason: extra.reason } : {}),
     },
     ts: new Date().toISOString(),
   }
@@ -504,6 +507,136 @@ const toolRegisterAgentKey: ToolSpec = {
   },
 }
 
+// ── deactivate_agent ──────────────────────────────────────────────────────────
+// The inverse of create_agent: retires a dead/junk agent (or a duplicate
+// identity) auditably, without a raw-D1 hand-edit. SOFT delete only —
+// agents.status flips to 'inactive' (migration 0049 widened the CHECK; a hard
+// DELETE FROM agents would cascade/null out task and membership history that
+// should survive retirement, and forecloses ever reversing the call). But a
+// status flip alone would be cosmetic: the agent must actually lose the
+// ability to ACT, so this also revokes every live member_tokens row welded to
+// it (it can no longer authenticate as itself), clears its fleet_agents
+// presence row(s) (drops off the fleet/radar roster), and removes its
+// signed-runtime public key(s) (agent_keys — a future signed-attach fails
+// closed with no key to verify against).
+const toolDeactivateAgent: ToolSpec = {
+  name: 'deactivate_agent',
+  scope: "agent's squad",
+  min: 'admin',
+  args: '{ agent: string (id|slug), reason?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent: STRING_SCHEMA, reason: STRING_SCHEMA },
+    required: ['agent'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const agentRef = str(args.agent)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const agent = agentResult.value
+
+    // Gate: admin on the agent's squad (org/department admin inherit) — same
+    // rank as mint/register; retiring a credentialed identity is an org-trust
+    // act, not a routine edit.
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, agent.squad_id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    }
+
+    // HARD GUARD: the pot's own fleet-control identities are load-bearing —
+    // deactivating the consumer daemon or the ops agent breaks fleet control
+    // for every other agent on the pot. Fleet's identifier space is the SLUG,
+    // not the uuid (see the id↔slug bridge note in src/fleet/registry.ts), so
+    // match the env-configured identity against both.
+    const consumerAgent = env.FLEET_CONSUMER_AGENT?.trim()
+    if (consumerAgent && (consumerAgent === agent.id || consumerAgent === agent.slug)) {
+      return fail(409, 'protected_agent', { reason: 'fleet_consumer_agent', agent: agent.slug })
+    }
+    const opsAgent = env.FLEET_OPS_AGENT?.trim()
+    if (opsAgent && (opsAgent === agent.id || opsAgent === agent.slug)) {
+      return fail(409, 'protected_agent', { reason: 'fleet_ops_agent', agent: agent.slug })
+    }
+
+    // HARD GUARD: an agent-bound token cannot deactivate the very agent it is
+    // bound to — the caller would be cutting off its own credential mid-call.
+    if (auth.boundAgentId && auth.boundAgentId === agent.id) {
+      return fail(409, 'cannot_deactivate_self')
+    }
+
+    const reason = str(args.reason) ?? undefined
+
+    // fleet_agents / agent_keys rows may be keyed by agent.id OR agent.slug
+    // (external runtimes attach/report under the human-readable slug — see the
+    // bridge note in src/fleet/registry.ts). Sweeping by the bare slug is only
+    // SAFE when it names this one agent tenant-wide: agents.slug is
+    // UNIQUE(squad_id, slug), NOT globally unique, so two agents in different
+    // squads can share a slug (the exact self-poisoning class the 2026-07-14
+    // fleet bridge fix addressed). Ambiguous → skip the slug-keyed cleanup;
+    // the id-keyed cleanup below still always runs.
+    const dupes = await env.DB.prepare('SELECT COUNT(*) AS n FROM agents WHERE slug = ?1')
+      .bind(agent.slug)
+      .first<{ n: number }>()
+    const safeSlug = Number(dupes?.n ?? 0) === 1 ? agent.slug : null
+
+    const now = new Date().toISOString()
+    const stmts = [
+      // 1) SOFT retire — reversible flag, never a hard delete.
+      env.DB.prepare(`UPDATE agents SET status = 'inactive' WHERE id = ?1`).bind(agent.id),
+      // 2) Revoke every live credential welded to this agent (tenant-scoped;
+      //    member_tokens.agent_id is the mint_agent_token weld).
+      env.DB.prepare(
+        `UPDATE member_tokens SET revoked_at = ?1 WHERE tenant = ?2 AND agent_id = ?3 AND revoked_at IS NULL`,
+      ).bind(now, env.TENANT_SLUG, agent.id),
+      // 3) Drop its fleet/radar presence row, id-keyed.
+      env.DB.prepare(`DELETE FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2`).bind(env.TENANT_SLUG, agent.id),
+      // 4) Remove its signed-runtime public key, id-keyed — signed-attach fails closed.
+      env.DB.prepare(`DELETE FROM agent_keys WHERE tenant = ?1 AND agent_id = ?2`).bind(env.TENANT_SLUG, agent.id),
+    ]
+    if (safeSlug) {
+      stmts.push(
+        env.DB.prepare(`DELETE FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2`).bind(env.TENANT_SLUG, safeSlug),
+        env.DB.prepare(`DELETE FROM agent_keys WHERE tenant = ?1 AND agent_id = ?2`).bind(env.TENANT_SLUG, safeSlug),
+      )
+    }
+
+    const results = await env.DB.batch(stmts)
+    // The agent row itself MUST flip — a 0-row UPDATE means the id vanished
+    // between resolve and write (TOCTOU); nothing else in this batch is safe
+    // to report as effective if that happened.
+    assertWritten(results[0], 'deactivate_agent.agents', 1)
+
+    const tokensRevoked = rowsWritten(results[1])
+    const detached = rowsWritten(results[2]) + (safeSlug ? rowsWritten(results[4]) : 0)
+    const keysRemoved = rowsWritten(results[3]) + (safeSlug ? rowsWritten(results[5]) : 0)
+
+    await emitProvisioned(env, auth.memberId as string, 'agent_deactivated', agent.id, {
+      squad_id: agent.squad_id,
+      agent_id: agent.id,
+      ...(reason ? { reason } : {}),
+    })
+
+    return done({
+      status: 'deactivated',
+      agent: { id: agent.id, slug: agent.slug, name: agent.name },
+      detached,
+      tokens_revoked: tokensRevoked,
+      keys_removed: keysRemoved,
+      // Ambiguous slug (shared with an agent in another squad) → the
+      // slug-keyed fleet_agents/agent_keys sweep above was skipped on
+      // purpose (never sweep another agent's row). That means a signed
+      // runtime key or fleet presence row registered under the bare slug
+      // (see the id↔slug bridge note in src/fleet/registry.ts) can survive
+      // this deactivation and let the retired agent still attach. Surface
+      // it so the operator knows manual cleanup is needed — this must not
+      // be silently invisible in the tool result.
+      ...(safeSlug ? {} : { slug_sweep_skipped: true }),
+    })
+  },
+}
+
 export const PROVISION_TOOLS: ToolSpec[] = [
   toolCreateDepartment,
   toolCreateSquad,
@@ -511,4 +644,5 @@ export const PROVISION_TOOLS: ToolSpec[] = [
   toolMintAgentToken,
   toolGrantAgentCapability,
   toolRegisterAgentKey,
+  toolDeactivateAgent,
 ]
