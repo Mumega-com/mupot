@@ -411,6 +411,26 @@ tasksApp.patch('/:id', async (c) => {
     // Enforce the transition matrix.
     const transitionErr = checkTransition(existing.status, body.status)
     if (transitionErr) return c.json(transitionErr, 400)
+    // GATE-EXIT GUARD: a task may only enter 'review' with a gate_owner. The only
+    // legal exits from review are approved|rejected via the verdict endpoint, and
+    // that endpoint 409s 'no_gate' without a gate_owner — so an ungated review task
+    // is a zombie with no legal exit. Refuse to create one. gate_owner may be set
+    // in this same PATCH (existing.status is pre-review, so the gate isn't locked
+    // yet), so evaluate the EFFECTIVE value after applying body.gate_owner.
+    if (body.status === 'review') {
+      const effectiveGateOwner =
+        body.gate_owner === undefined
+          ? existing.gate_owner
+          : typeof body.gate_owner === 'string' && body.gate_owner.trim().length > 0
+            ? body.gate_owner.trim()
+            : null
+      if (!effectiveGateOwner) {
+        return c.json(
+          { error: 'gate_required_for_review', detail: 'a task can only enter review with a gate_owner set' },
+          409,
+        )
+      }
+    }
     // GATE BYPASS GUARD (adversarial P0, 2026-06-07): the gate guards the
     // verdict endpoint, but PATCH is a second write path to 'done'. A gated
     // task (gate_owner set) must NOT reach 'done' from a pre-/non-verdict
