@@ -105,6 +105,43 @@ test('service receipt resolves platform, records hashes, and requires running se
   assert.equal(receipt.commands[0].executable, 'manager')
 })
 
+test('reload receipt waits for bounded post-bootstrap service readiness', async () => {
+  const context = fixtureContext()
+  const delays = []
+  let statusCalls = 0
+  const launchd = adapter()
+  launchd.status = async (current) => {
+    statusCalls += 1
+    const running = statusCalls >= 3
+    return {
+      ok: true,
+      services: current.services.map((service, index) => ({
+        key: service.key,
+        name: service.name,
+        definitionPath: service.definitionPath,
+        loaded: true,
+        enabled: true,
+        running,
+        pid: running ? index + 20 : null,
+      })),
+      linger: null,
+      next_steps: [],
+    }
+  }
+
+  const receipt = await buildServiceReceipt({ action: 'reload', serviceManager: 'launchd' }, {
+    platformName: 'darwin',
+    createServiceContext: () => context,
+    launchd,
+    runner: async () => ({ code: 0, stdout: '', stderr: '' }),
+    sleep: async (milliseconds) => { delays.push(milliseconds) },
+  })
+
+  assert.equal(receipt.status, 'pass')
+  assert.equal(statusCalls, 3)
+  assert.deepEqual(delays, [250, 750])
+})
+
 test('service receipt redacts secret-looking command output and fails closed', async () => {
   const context = fixtureContext()
   const receipt = await buildServiceReceipt({ action: 'status', serviceManager: 'launchd' }, {
