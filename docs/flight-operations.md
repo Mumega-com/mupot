@@ -132,8 +132,25 @@ Two presence sources, by agent tier:
   its trend (the early-warning).
 - **#62** sleeping / schedule-aware presence + vocab adoption.
 
+**ATC tower — clearance gate (advisory, v1):**
+- Cross-flight collision detection. Preflight asks "is THIS flight ready"; clearance asks
+  "does this flight's airspace overlap a flight already in the air." `dispatchFlight`
+  combines both: a flight departs only if `preflight.go && clearance.cleared`.
+- HOLD (blocks) on shared `task_ids` or `artifact_refs` (same work / same file). WARN
+  (surfaces, never blocks) on shared objective/goal/squad only (normal co-work). Read-only
+  view: `GET /api/flights/collisions`.
+- **This is an ADVISORY tower, NOT an authoritative atomic anti-double-work lock.** Known
+  v1 limits (see `src/flight/clearance.ts` header): (a) TOCTOU — read-then-insert with no
+  DB transaction, so sub-second concurrent dispatches can both CLEAR (safe for the
+  hours/days-apart collisions this targets; a DB-level task-claim guard is a tracked
+  follow-up before CLEAR is treated as authoritative); (b) refs are matched by exact
+  string — declare canonical repo-relative paths / issue refs or overlaps are missed;
+  (c) a flight declaring no scope is invisible to the tower (ceiling of self-declared scope).
+
 **Future (post-0.19):**
 - ATC / dispatch — multi-flight sequencing + automatic departure scheduling (routines).
+- Atomic clearance — DB-level task-claim guard closing the TOCTOU race so CLEAR is a hard
+  no-double-work guarantee, not just an advisory signal.
 - Cache-warm automation — the harness actively keeps the cache hot for the flight's
   duration; abort/relaunch policy on cache expiry.
 - Cascade / model routing — cheap router handles the easy legs, escalates only the hard

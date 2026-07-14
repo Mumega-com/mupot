@@ -35,6 +35,27 @@
 // hide a genuinely malformed flight from operators). Opaque-but-logged is the middle
 // path: no phantom HOLDs, but the malformation is visible.
 //
+// KNOWN LIMITATIONS (v1 — this is an ADVISORY tower, NOT an authoritative atomic
+// anti-double-work mutex). Do not treat a CLEAR as a hard guarantee that no other
+// flight will touch the same work; it is a coordination signal, not a lock.
+//   - ADVISORY / TOCTOU (F1): dispatch.ts reads live flights, checks clearance, then
+//     inserts — three separate D1 calls, no transaction/unique-constraint. Two
+//     dispatches within the read→insert window both read a set that excludes the other
+//     and both CLEAR. Harmless for the real use case (collisions that unfold over
+//     hours/days — the first row exists well before the second dispatch, so the HOLD
+//     fires; and a lost race degrades to exactly the pre-clearance behavior, no
+//     corruption). It is NOT safe as a real-time mutex for sub-second concurrent
+//     dispatch. A DB-level task-claim guard is required before any workflow relies on
+//     CLEAR as authoritative — tracked as a follow-up.
+//   - NO REF NORMALIZATION (F3): overlap is exact-string equality. 'src/x.ts' vs
+//     './src/x.ts' vs 'SRC/X.TS' do NOT collide. Callers MUST declare canonical refs
+//     (repo-relative POSIX paths, canonical issue/PR refs) or the tower silently misses
+//     the overlap.
+//   - META-OMISSION BYPASS (F4): a flight that declares no scope (empty/absent meta) is
+//     opaque and collides with nothing — an agent can do colliding work while declaring
+//     no task_ids/artifact_refs and never be HELD. Inherent ceiling of self-declared
+//     scope; the tower only sees what flights honestly declare.
+//
 // Pure, no I/O — same "derivation exported for tests, thin DB read at the call site"
 // discipline as board.ts. See docs/flight-operations.md.
 
