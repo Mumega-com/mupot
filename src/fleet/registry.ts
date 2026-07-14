@@ -216,6 +216,137 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
   return skipped > 0 ? { ok: true, count: written, skipped } : { ok: true, count: written }
 }
 
+// ── agents.id ↔ fleet_agents.agent_id identifier-space bridge ──────────────────────────────
+//
+// `task.assignee_agent_id` (and therefore the `event.agent_id` a task_dispatch wake carries) is
+// ALWAYS `agents.id` — the UUID primary key that also names the AgentDO (resolveTaskAssignee,
+// src/tasks/assignee.ts, resolves and stores exactly that column). But the fleet-attach surface
+// (fleetAttachApp /attach + /attach-signed, src/fleet/attach-routes.ts) and the signed-inbox
+// read path (agent_keys.agent_id, src/fleet/signed-attach.ts / signed-inbox.ts) are both keyed
+// by the human-readable SLUG — confirmed against the live mumega tenant DB (2026-07-14): kasra's
+// `agents.id` is a uuid, `agents.slug='kasra'`, and its `fleet_agents.agent_id` /
+// `agent_keys.agent_id` are BOTH `'kasra'`, never the uuid. A fleet-row read keyed directly on
+// `event.agent_id` would therefore NEVER match a real external runtime's row — the route
+// decision would be silently dead code in production.
+//
+// BLOCK (v2 re-gate, 2026-07-14): a first attempt bridged this with a single `LEFT JOIN
+// fleet_agents ON fa.agent_id = a.id OR fa.agent_id = a.slug` + `ORDER BY last_reported_at DESC`.
+// That is UNSAFE: `agents.slug` is `UNIQUE(squad_id, slug)` (migration 0001_init.sql) — unique
+// PER SQUAD, not tenant-wide. Two different agents in two different squads can share a slug (the
+// repro: agent A in squad S1 with slug 'kasra' has a live fleet_agents row; agent B in squad S2
+// ALSO has slug 'kasra'; a dispatch to B resolves `fa.agent_id = a.slug` against B's OWN slug
+// ('kasra') and matches A's row — B's task gets delivered into A's inbox: wrong executor, B's
+// task content disclosed to A, B's dispatch wrongly marked delivered/stranded). Worse, the
+// `ORDER BY last_reported_at DESC` let a slug match outrank an EXACT id match purely on recency.
+//
+// Fix: two sequential, ordered lookups, mirroring the established ambiguity-refusal pattern this
+// codebase already uses for exactly this class of problem (src/org/resolve.ts
+// resolveByIdThenSlug: "resolve by id first; on a slug, COUNT matches and REFUSE an ambiguous
+// one"):
+//   1. Exact match on `fleet_agents.agent_id = agentId` (the PK column). fleet_agents' PK is
+//      (tenant, agent_id), so this is UNAMBIGUOUS by construction — it ALWAYS wins, unconditional
+//      on recency, and no slug lookup is attempted at all when it hits.
+//   2. Only when (1) finds nothing: resolve `agentId`'s OWN slug, then COUNT how many agents
+//      TENANT-WIDE share that slug (this tenant's `agents` table has no explicit tenant column —
+//      the deployment model is one D1 per tenant, so a plain COUNT is already tenant-scoped).
+//      Exactly 1 (only the caller's own agent) → safe to match `fleet_agents.agent_id = slug`,
+//      because no other real agent could be the one that row's attach call meant. More than 1 (a
+//      same-slug agent exists in a different squad) → the slug cannot be safely attributed to
+//      THIS agent → refuse the fallback entirely (return null, same as "no fleet row" → the
+//      caller falls back to the in-Worker route, which is always a safe default). This has the
+//      same effect as scoping the slug match to the agent's own squad — agents.slug's actual
+//      invariant is UNIQUE(squad_id, slug), so "unique tenant-wide" is the necessary and
+//      sufficient condition for a bare slug to unambiguously identify one specific agent.
+async function readFleetAgentRow(
+  env: Env,
+  agentId: string,
+): Promise<{ agent_id: string; runtime: string | null; status: string | null; last_reported_at: string | null } | null> {
+  type Row = { agent_id: string; runtime: string | null; status: string | null; last_reported_at: string | null }
+
+  // 1. Exact id match — unambiguous (fleet_agents PK is (tenant, agent_id)), always wins.
+  const byId = await env.DB.prepare(
+    `SELECT agent_id, runtime, status, last_reported_at FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
+  )
+    .bind(env.TENANT_SLUG, agentId)
+    .first<Row>()
+  if (byId) return byId
+
+  // 2. Slug fallback — ONLY when no id-keyed row exists, and ONLY when the slug is unique
+  // tenant-wide (ambiguity-refusal, mirroring resolveByIdThenSlug).
+  const self = await env.DB.prepare(`SELECT slug FROM agents WHERE id = ?1 LIMIT 1`)
+    .bind(agentId)
+    .first<{ slug: string | null }>()
+  if (!self?.slug) return null // no such agent, or no slug on record — nothing to fall back to
+
+  const dupes = await env.DB.prepare(`SELECT COUNT(*) AS n FROM agents WHERE slug = ?1`)
+    .bind(self.slug)
+    .first<{ n: number }>()
+  if (Number(dupes?.n ?? 0) !== 1) return null // 0 is impossible (self counts), >1 is ambiguous — refuse either way
+
+  return await env.DB.prepare(
+    `SELECT agent_id, runtime, status, last_reported_at FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
+  )
+    .bind(env.TENANT_SLUG, self.slug)
+    .first<Row>()
+}
+
+/**
+ * getFleetAgentRuntime — single-row, tenant-scoped runtime lookup keyed on `agents.id` (the
+ * identifier task_dispatch always carries), resolved through `agents.slug` to find the matching
+ * `fleet_agents` row (see readFleetAgentRow). Returns '' when the agent has no fleet_agents row,
+ * or its runtime column is empty — BOTH mean "no external runtime; the in-Worker AgentDO is the
+ * only delivery path for this agent." The runtime value itself was already validated against
+ * RUNTIMES/VALID_RUNTIMES at write time (reportFleetAgents / upsertRunning), so a non-empty read
+ * here is sufficient proof of "externally hosted" without re-validating the set.
+ */
+export async function getFleetAgentRuntime(env: Env, agentId: string): Promise<string> {
+  const row = await readFleetAgentRow(env, agentId)
+  return row?.runtime ? String(row.runtime) : ''
+}
+
+export interface FleetAgentRouteInfo {
+  /** Non-empty runtime slug, or '' when no fleet row / no runtime is reported. */
+  runtime: string
+  /** True iff `runtime` is non-empty AND the row's derived Presence (see `derivePresence`,
+   *  the SAME classifier the dashboard/#agent-bus feed already uses) is 'live'. A 'stale' or
+   *  'offline' runtime is deliberately NOT live — a dead/unreachable external runtime must not
+   *  be handed a dispatch it will never pick up (that would strand the task). */
+  live: boolean
+  /**
+   * The IDENTITY the matched fleet_agents row is actually keyed under (its own `agent_id`
+   * column — a uuid or a slug, whichever that runtime's own attach/report call declared), or ''
+   * when no row matched. THIS, not the caller's input `agentId`, is what an inbox delivery must
+   * address: it is the one identity guaranteed to be the identity that runtime's own signed-
+   * inbox / bearer-inbox poll queries by, because the row's own attach call is what wrote it.
+   * Using the caller's `agentId` (agents.id, uuid) instead would silently misaddress delivery
+   * for any runtime — like kasra's live signed-attach today — that reports under its slug.
+   */
+  agentId: string
+}
+
+/**
+ * getFleetAgentLiveness — the single read the dispatch-bridge route decision needs: is this
+ * agent's runtime EXTERNAL (fleet_agents.runtime non-empty), and is it LIVE right now (recent
+ * heartbeat within `presenceTtlSec`)? Reuses the EXISTING `derivePresence` / `presenceTtlSec`
+ * classifiers verbatim (S353 v2 gate note: do not invent a second liveness notion — this is the
+ * same presence definition `listFleetAgentRuntimeView`/`getAgentView` already use for the
+ * dashboard/#agent-bus feed), read through the agents.id → fleet_agents.agent_id bridge above.
+ */
+export async function getFleetAgentLiveness(
+  env: Env,
+  agentId: string,
+  nowMs = Date.now(),
+): Promise<FleetAgentRouteInfo> {
+  const row = await readFleetAgentRow(env, agentId)
+  const runtime = row?.runtime ? String(row.runtime) : ''
+  if (!runtime) return { runtime: '', live: false, agentId: '' }
+  const ttlSec = presenceTtlSec(env)
+  const status = String(row?.status ?? 'unknown')
+  const lastReportedAt = String(row?.last_reported_at ?? '')
+  const live = derivePresence(status, lastReportedAt, ttlSec, nowMs) === 'live'
+  return { runtime, live, agentId: String(row?.agent_id ?? '') }
+}
+
 export async function listFleetAgents(env: Env): Promise<FleetAgentRow[]> {
   const rows = await env.DB.prepare(
     `SELECT agent_id, display, runtime, squads, lifecycle, provider_contract, status, reported_by, last_reported_at, agent_type, member_id
