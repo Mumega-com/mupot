@@ -48,6 +48,7 @@
     "receipt:release-readiness:check": "node scripts/release-readiness-receipt.mjs --check",
     "probe:cutover": "node fleet-runtime/cutover-probe.mjs",
     "fleet:install": "node fleet-runtime/install.mjs",
+    "fleet:starter": "node fleet-runtime/starter-manifest.mjs",
     "fleet:service": "node fleet-runtime/service-manager.mjs",
     "fleet:trust:bootstrap": "node fleet-runtime/trust-bootstrap.mjs",
     "migrate:remote": "wrangler d1 migrations apply mupot --remote",
