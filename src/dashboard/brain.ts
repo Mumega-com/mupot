@@ -242,7 +242,10 @@ export function isSparseSnapshot(p: PhysicsSnapshot): boolean {
   return false
 }
 
-function regimeBadgeClass(regime: string): string {
+// Exported so other views (the shared shell's header regime chip, index.ts) can
+// reuse the SAME regime→CSS-class mapping instead of re-deriving it. Pure lookup,
+// no data access — safe to reuse anywhere a `PhysicsSnapshot.regime` needs a color.
+export function regimeBadgeClass(regime: string): string {
   switch (regime) {
     case 'flow':     return 'regime-flow'
     case 'chaos':    return 'regime-chaos'

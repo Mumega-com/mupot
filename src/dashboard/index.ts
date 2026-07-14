@@ -111,7 +111,8 @@ import { buildBoard } from '../flight/board'
 import type { FlightCard } from '../flight/board'
 import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
-import { loadBrainView, brainBody } from './brain'
+import { loadBrainView, brainBody, regimeBadgeClass } from './brain'
+import type { PhysicsSnapshot } from './brain'
 import { loadGrowthView, growthBody } from './growth'
 import { setLoopControl, isLoopControlAction } from '../loops/decisions'
 import { getLoop } from '../loops/service'
@@ -270,7 +271,13 @@ dashboardApp.get('/services', async (c) => {
 // outer middleware. Separate from the pot's internal burn gauge.
 dashboardApp.get('/economy', async (c) => {
   const data = await loadEconomy(c.env)
-  return c.html(shell(c.env.BRAND, 'Economy', economyBody(data)))
+  // Header spend chip reuses this SAME loadEconomy() call — no extra D1 round
+  // trip, and the chip is guaranteed to agree with the "Today" card below it.
+  return c.html(
+    shell(c.env.BRAND, 'Economy', economyBody(data), {
+      costToday: { configured: data.configured, todayUsdMicro: data.today_usd_micro },
+    }),
+  )
 })
 
 // ── economy/billing — current plan + tier from org_settings (no secrets) ─────
@@ -332,7 +339,11 @@ dashboardApp.get('/audit', async (c) => {
 dashboardApp.get('/brain', async (c) => {
   const auth = c.get('auth')
   const view = await loadBrainView(c.env)
-  return c.html(shell(c.env.BRAND, 'Brain', brainBody(view, isAdmin(auth))))
+  // Header regime chip reuses this SAME loadBrainView() call (it already fetched
+  // the KV physics snapshot for the coherence panel below) — no extra KV read.
+  return c.html(
+    shell(c.env.BRAND, 'Brain', brainBody(view, isAdmin(auth)), { physics: view.physics }),
+  )
 })
 
 // ── departments/growth (Marketing & Sales console view) ─────────────────────
@@ -1740,6 +1751,89 @@ const TASK_LANES: ReadonlyArray<{ key: Task['status']; label: string }> = [
   { key: 'done', label: 'Done' },
 ]
 
+// ── topbar header chips (regime + spend) ────────────────────────────────────
+//
+// Both chips were static placeholders (regime: display:none; spend: never
+// rendered at all). Wired live, but ONLY on the routes that already load the
+// backing data for their own page — so wiring costs ZERO extra reads and is
+// GUARANTEED to agree with what that page shows elsewhere:
+//   - regime chip: /brain already calls loadBrainView, which fetches the KV
+//     physics snapshot for its own coherence panel (loadBrainPhysics). We pass
+//     that SAME already-loaded `view.physics` into shell()'s header param —
+//     no second KV read.
+//   - spend chip: /economy already calls loadEconomy for its own stat cards.
+//     We pass that SAME already-loaded `data.{configured,today_usd_micro}` —
+//     no second D1 round-trip, and the header figure is BY CONSTRUCTION the
+//     same number as the Economy page's "Today" card (same source, same call).
+// Every other route omits the 4th shell() argument, so `header` defaults to
+// `{}` and both chips render in their pre-existing honest-empty state (regime:
+// hidden; spend: "no data") — NOT a regression, just not wired there yet.
+// Extending live wiring to more routes only means passing more `header` data
+// from a handler that already has it — never re-deriving regime or spend logic.
+
+/** Header-chip data a route MAY pass into shell(). Everything optional; when a
+ *  field is omitted the corresponding chip shows its honest-empty state. */
+interface HeaderChips {
+  /** Latest coherence physics snapshot (from loadBrainView), or null when KV is
+   *  genuinely empty. Omit entirely on routes that don't load physics. */
+  physics?: PhysicsSnapshot | null
+  /** Today's spend, straight from loadEconomy's own fields. `configured: false`
+   *  means cc_spend_daily has never been pushed to (never fabricate a number in
+   *  that case); `configured: true` with `todayUsdMicro: 0` is an honest $0.00 —
+   *  spend WAS tracked today, it was just zero. */
+  costToday?: { configured: boolean; todayUsdMicro: number } | null
+}
+
+/** Regime label shown in the compact header chip — just Title-Cases the raw
+ *  `physics.regime` string (already computed by the sovereign daemon; this is
+ *  formatting, not regime derivation). The longer descriptive label + color
+ *  class live in brain.ts (regimeLabel / regimeBadgeClass) for the full panel. */
+function shortRegimeLabel(regime: string): string {
+  return regime.length > 0 ? regime.charAt(0).toUpperCase() + regime.slice(1) : regime
+}
+
+/** Render the topbar regime chip. Reuses brain.ts's regimeBadgeClass() for the
+ *  color mapping (flow/chaos/coercion/stall → ok/warn2/accent/danger) instead of
+ *  re-deriving it. `physics` undefined/null → honest hidden "no data" state,
+ *  identical to the pre-wire placeholder — never fabricates a regime. */
+export function regimeChipHtml(physics: PhysicsSnapshot | null | undefined) {
+  if (!physics) {
+    return html`<div class="regime-chip" id="regime-chip" style="display:none" title="Coherence regime — no physics snapshot yet.">
+      <span class="regime-dot" id="regime-dot"></span>
+      <span class="regime-label" id="regime-label">—</span>
+      <span class="regime-ct" id="regime-ct">C(t) —</span>
+    </div>`
+  }
+  const cls = regimeBadgeClass(physics.regime)
+  return html`<div class="regime-chip ${raw(cls)}" id="regime-chip" title="Coherence regime — brain physics from KV (sovereign daemon).">
+    <span class="regime-dot" id="regime-dot"></span>
+    <span class="regime-label" id="regime-label">${shortRegimeLabel(physics.regime)}</span>
+    <span class="regime-ct" id="regime-ct">C(t) ${physics.C.toFixed(3)}</span>
+  </div>`
+}
+
+/** Render the topbar spend chip. `cost` undefined/null → this route hasn't
+ *  wired spend data (hidden, same shape as before). `configured: false` → an
+ *  honest "no spend yet" (cc_spend_daily has never been pushed to — never show
+ *  $0.00 as if spend were tracked and happened to be zero). Otherwise renders
+ *  formatUsd(todayUsdMicro) — the SAME formatter + SAME field the Economy page
+ *  uses for its "Today" stat card. */
+export function spendChipHtml(cost: { configured: boolean; todayUsdMicro: number } | null | undefined) {
+  if (!cost) {
+    return html`<div class="spend-chip" id="spend-chip" style="display:none" title="Today's spend — not loaded on this page.">
+      <span class="spend-chip-dot">◆</span><span id="spend-chip-value">—</span>
+    </div>`
+  }
+  if (!cost.configured) {
+    return html`<div class="spend-chip" id="spend-chip" title="No Claude Code spend has been pushed to this pot yet.">
+      <span class="spend-chip-dot">◆</span><span id="spend-chip-value">no spend yet</span>
+    </div>`
+  }
+  return html`<div class="spend-chip" id="spend-chip" title="Today's Claude Code spend (Anthropic list price) — same figure as the Economy page's Today card.">
+    <span class="spend-chip-dot">◆</span><span id="spend-chip-value">${raw(formatUsd(cost.todayUsdMicro))} today</span>
+  </div>`
+}
+
 /** Outer HTML document with inline CSS (no framework, no build step).
  *
  * Theme: light by default, dark toggled via [data-theme="dark"] on <html>.
@@ -1747,7 +1841,12 @@ const TASK_LANES: ReadonlyArray<{ key: Task['status']; label: string }> = [
  * Fonts: Instrument Serif (headings/metrics) · Hanken Grotesk (body) · JetBrains Mono (IDs/badges).
  * Sidebar: Stripe-style with collapsible sections that remember open/closed state.
  */
-function shell(brand: string, title: string, body: HtmlEscapedString | Promise<HtmlEscapedString>) {
+function shell(
+  brand: string,
+  title: string,
+  body: HtmlEscapedString | Promise<HtmlEscapedString>,
+  header: HeaderChips = {},
+) {
   return html`<!doctype html>
 <html lang="en">
   <head>
@@ -1988,14 +2087,23 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       .regime-chip .regime-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--primary); flex: none; }
       .regime-chip .regime-label { font-weight: 700; color: var(--primary); }
       .regime-chip .regime-ct { font-family: var(--font-mono); font-size: 11px; color: var(--dim); }
+      /* regime-dot color per regime — SAME regime→color mapping as brain.ts's
+       * .regime-badge classes (regimeBadgeClass, reused not reinvented): flow=ok,
+       * chaos=warn2, coercion=accent, stall=danger. --danger/--warn2 are defined
+       * further down (Observatory section) but CSS custom properties resolve by
+       * cascade, not declaration order, so this is safe. */
+      .regime-chip.regime-flow     .regime-dot { background: var(--ok, #16a34a); }
+      .regime-chip.regime-chaos    .regime-dot { background: var(--warn2, #d29922); }
+      .regime-chip.regime-coercion .regime-dot { background: var(--accent); }
+      .regime-chip.regime-stall    .regime-dot { background: var(--danger, #c0392b); }
       .topbar-spacer { flex: 1; }
-      .cloud-pill {
+      .cloud-pill, .spend-chip {
         display: flex; align-items: center; gap: 7px;
         padding: 6px 11px; border: 1px solid var(--border); border-radius: 8px;
         background: var(--surface);
         font-family: var(--font-mono); font-size: 11px; color: var(--text2);
       }
-      .cloud-pill-dot { color: var(--primary); }
+      .cloud-pill-dot, .spend-chip-dot { color: var(--primary); }
       .topbar-invite {
         padding: 7px 14px; border: none; border-radius: 8px;
         background: var(--primary); color: #fff; cursor: pointer;
@@ -2714,13 +2822,9 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
             <span class="topbar-crumb-sep">/</span>
             <span class="topbar-crumb-view" id="crumb-view">Overview</span>
           </div>
-          <!-- regime chip: static placeholder — live value requires KV at request time; shown on /brain only -->
-          <div class="regime-chip" id="regime-chip" style="display:none;" title="Coherence regime — brain physics from KV. Labeled static placeholder until live KV read is wired per-request.">
-            <span class="regime-dot" id="regime-dot"></span>
-            <span class="regime-label" id="regime-label">—</span>
-            <span class="regime-ct" id="regime-ct">C(t) —</span>
-          </div>
+          ${regimeChipHtml(header.physics)}
           <div class="topbar-spacer"></div>
+          ${spendChipHtml(header.costToday)}
           <div class="cloud-pill">
             <span class="cloud-pill-dot">◆</span> YOUR CLOUD · CF
           </div>
