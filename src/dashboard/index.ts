@@ -435,6 +435,32 @@ dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
   })
   try {
     const outcome = await ctx.executor.execute(gateId)
+    if (outcome.executed) {
+      // Close the loop (flight-1): a content-publish proposal minted through
+      // runTaskExecution (src/agents/execute.ts finishContentProposal) uses
+      // idGen: () => task.id, so gateId === the originating task's own id.
+      // This route previously returned the outcome and never touched `tasks`,
+      // stranding that row at 'approved' forever — invisible as a receipt.
+      // Flip it to 'done' now that a real write has happened. approved → done
+      // is a legal transition (src/tasks/service.ts TRANSITIONS). Self-scoping
+      // / harmless no-op for every OTHER gate.propose() work-type this kernel
+      // serves (seo-audit-proposal, seo-meta-fix, …): their gateId is a random
+      // UUID with no matching task row, or the row isn't 'approved' — either
+      // way this UPDATE only ever touches a row that is genuinely this pot's
+      // own approved content-publish task.
+      const now = new Date().toISOString()
+      await c.env.DB.prepare(
+        `UPDATE tasks SET status = 'done', result = ?, completed_at = ?, updated_at = ?
+           WHERE id = ? AND status = 'approved'`,
+      )
+        .bind(
+          `Published via ${outcome.adapter ?? 'unknown'}${outcome.artifactUrl ? `: ${outcome.artifactUrl}` : ''}`,
+          now,
+          now,
+          gateId,
+        )
+        .run()
+    }
     return c.json(outcome, outcome.executed ? 200 : 422)
   } catch (e) {
     // execute() throws CtxError on not_approved / capability / cross-tenant.
