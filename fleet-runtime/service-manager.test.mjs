@@ -142,6 +142,44 @@ test('reload receipt waits for bounded post-bootstrap service readiness', async 
   assert.deepEqual(delays, [250, 750])
 })
 
+test('uninstall receipt waits for launchd to report every service absent', async () => {
+  const context = fixtureContext()
+  for (const path of [context.runtimeDir, join(context.prefix, 'agents'), join(context.prefix, 'handlers'), join(context.prefix, 'inbox'), context.logsDir, context.stateDir, join(context.prefix, 'receipts')]) mkdirSync(path, { recursive: true })
+  const delays = []
+  let statusCalls = 0
+  const launchd = adapter()
+  launchd.status = async (current) => {
+    statusCalls += 1
+    const absent = statusCalls >= 3
+    return {
+      ok: true,
+      services: current.services.map((service) => ({
+        key: service.key,
+        name: service.name,
+        definitionPath: service.definitionPath,
+        loaded: !absent,
+        enabled: !absent,
+        running: false,
+        pid: null,
+      })),
+      linger: null,
+      next_steps: [],
+    }
+  }
+
+  const receipt = await buildServiceReceipt({ action: 'uninstall', serviceManager: 'launchd' }, {
+    platformName: 'darwin',
+    createServiceContext: () => context,
+    launchd,
+    runner: async () => ({ code: 0, stdout: '', stderr: '' }),
+    sleep: async (milliseconds) => { delays.push(milliseconds) },
+  })
+
+  assert.equal(receipt.status, 'pass')
+  assert.equal(statusCalls, 3)
+  assert.deepEqual(delays, [250, 750])
+})
+
 test('service receipt redacts secret-looking command output and fails closed', async () => {
   const context = fixtureContext()
   const receipt = await buildServiceReceipt({ action: 'status', serviceManager: 'launchd' }, {
