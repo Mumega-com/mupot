@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { MINIMAL_SERVICE_PATH, definitionSha256 } from './service-context.mjs'
 let temporaryFileNumber = 0
-const BOOTSTRAP_RETRY_DELAYS_MS = Object.freeze([250, 750, 1500])
+const UNREGISTER_POLL_DELAYS_MS = Object.freeze([100, 250, 500, 1000, 1500, 2500])
 
 function defaultSleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
@@ -53,12 +53,15 @@ async function restoreDefinition(path, previous) {
 async function bootstrapService(context, service, runner, options = {}) {
   const sleep = options.sleep ?? defaultSleep
   let response = await runner(['launchctl', 'bootstrap', context.domain, service.definitionPath])
-  for (const delay of BOOTSTRAP_RETRY_DELAYS_MS) {
-    if (response.code !== 5) break
+  if (response.code !== 5) return response
+  let status = await runner(['launchctl', 'print', launchctlTarget(context, service)])
+  for (const delay of UNREGISTER_POLL_DELAYS_MS) {
+    if (status.code === 113) break
     await sleep(delay)
-    response = await runner(['launchctl', 'bootstrap', context.domain, service.definitionPath])
+    status = await runner(['launchctl', 'print', launchctlTarget(context, service)])
   }
-  return response
+  if (status.code !== 113) return response
+  return runner(['launchctl', 'bootstrap', context.domain, service.definitionPath])
 }
 
 async function bootstrapPriorLoaded(context, indexes, previous, runner, options = {}) {
