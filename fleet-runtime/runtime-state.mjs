@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { basename, dirname, resolve } from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { SECRET_VALUE_PATTERNS } from './service-context.mjs'
 
 const SECRET_FIELD_RE = /(?:^|_)(?:authorization|bearer|token|access_token|refresh_token|secret|password|passwd|api_key|private_key|client_secret|cookie|credential|credentials|signature|sig|nonce)(?:$|_)/i
@@ -140,7 +140,23 @@ export function heartbeatState({ pid, startedAt, tick, lastTickAt, intervalSec, 
   }
 }
 
-export function controlState({ pid, startedAt, poll, lastPollAt, pollSec, outcome }) {
+function requestRef(outcome) {
+  const nonce = outcome?.request?.nonce
+  return typeof nonce === 'string' && nonce.length > 0
+    ? createHash('sha256').update(nonce).digest('hex')
+    : null
+}
+
+export function controlState({ pid, startedAt, poll, lastPollAt, pollSec, outcome, lastAccepted = null }) {
+  const accepted = outcome?.ok === true && outcome?.request?.agent_id && outcome?.request?.verb && outcome?.action !== 'idle'
+    ? {
+        agent_id: outcome.request.agent_id,
+        verb: outcome.request.verb,
+        result: outcome.action,
+        request_ref: requestRef(outcome),
+        observed_at: lastPollAt,
+      }
+    : lastAccepted
   return {
     schema: 'mupot-fleet-control-state/v1',
     pid,
@@ -154,5 +170,6 @@ export function controlState({ pid, startedAt, poll, lastPollAt, pollSec, outcom
       accepted: outcome?.ok === true,
       result: outcome?.action ?? 'unknown',
     },
+    last_accepted: accepted,
   }
 }

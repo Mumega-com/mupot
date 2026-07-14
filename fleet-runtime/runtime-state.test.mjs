@@ -185,6 +185,35 @@ test('controlState retains only a reduced non-secret outcome', () => {
     last_poll_at: '2026-07-13T12:01:15.000Z',
     poll_sec: 5,
     last_outcome: { agent_id: 'agent-one', verb: 'start', accepted: true, result: 'open' },
+    last_accepted: {
+      agent_id: 'agent-one',
+      verb: 'start',
+      result: 'open',
+      request_ref: '1d9664478addbe4ee7186c19b2a2c98e461a77dc1e183654f36916bf9fb51cba',
+      observed_at: '2026-07-13T12:01:15.000Z',
+    },
   })
   assert.doesNotMatch(JSON.stringify(state), /nonce|signature|token/i)
+})
+
+test('controlState preserves the last accepted request while later polls are idle', () => {
+  const lastAccepted = {
+    agent_id: 'agent-one',
+    verb: 'start',
+    result: 'open',
+    request_ref: 'a'.repeat(64),
+    observed_at: '2026-07-13T12:00:05.000Z',
+  }
+  const state = controlState({
+    pid: 456,
+    startedAt: '2026-07-13T12:00:00.000Z',
+    poll: 3,
+    lastPollAt: '2026-07-13T12:00:10.000Z',
+    pollSec: 5,
+    outcome: { ok: true, action: 'idle' },
+    lastAccepted,
+  })
+
+  assert.deepEqual(state.last_accepted, lastAccepted)
+  assert.deepEqual(state.last_outcome, { agent_id: null, verb: null, accepted: true, result: 'idle' })
 })

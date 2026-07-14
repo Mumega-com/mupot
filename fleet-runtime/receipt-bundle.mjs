@@ -238,8 +238,8 @@ function usage() {
     '',
     'Typical sequence:',
     '  node ~/.fleet/runtime/receipt-bundle.mjs --agent my-agent --out-dir ~/.fleet/receipts/my-agent --install-receipt ~/.fleet/receipts/install.json --skip-runtime --skip-control',
-    '  queue inbox + start with cutover-probe.mjs > ~/.fleet/receipts/my-agent/probe-start.json, then rerun with --probe-receipt ~/.fleet/receipts/my-agent/probe-start.json --skip-host --control-label start',
-    '  queue stop with cutover-probe.mjs > ~/.fleet/receipts/my-agent/probe-stop.json, then rerun with --probe-receipt ~/.fleet/receipts/my-agent/probe-stop.json --skip-host --skip-runtime --control-label stop',
+    '  queue inbox + start with cutover-probe.mjs, observe it with control-receipt.mjs --observe-state, then rerun with --probe-receipt and --skip-host --skip-control',
+    '  queue stop with cutover-probe.mjs, observe it with control-receipt.mjs --observe-state, then rerun with --probe-receipt and --skip-host --skip-runtime --skip-control',
     '  node ~/.fleet/runtime/receipt-bundle.mjs --out-dir ~/.fleet/receipts/my-agent --export-dir ~/.fleet/receipts/my-agent-attach --export',
     '  node ~/.fleet/runtime/receipt-bundle.mjs --out-dir ~/.fleet/receipts/my-agent --check-manifest',
     '  npm run receipt:bundle:plan -- --agent my-agent --base-url https://mupot.example.com',
@@ -304,6 +304,7 @@ function formatHostGoPlan(opts = {}) {
 
     requiredControlVerbs.forEach((verb, index) => {
       const probePath = join(outDir, `probe-${safeName(verb)}.json`)
+      const controlReceiptPath = join(outDir, `control-${safeName(verb)}.json`)
       const queueArgs = ['node', '~/.fleet/runtime/cutover-probe.mjs', '--base-url', baseUrl, '--agent', agentId]
       if (index === 0) queueArgs.push('--queue-inbox')
       queueArgs.push('--control', verb)
@@ -314,13 +315,15 @@ function formatHostGoPlan(opts = {}) {
         : '# Requires MUPOT_OWNER_TOKEN in the environment.')
       lines.push(commandLine(queueArgs, ` > ${shellQuote(probePath)}`))
       lines.push(commandLine([
+        'node', '~/.fleet/runtime/control-receipt.mjs', '--observe-state', '--probe-receipt', probePath, '--verb', verb,
+      ], ` > ${shellQuote(controlReceiptPath)}`))
+      lines.push(commandLine([
         ...commonReceiptArgs,
         '--probe-receipt',
         probePath,
         '--skip-host',
         ...(index === 0 ? [] : ['--skip-runtime']),
-        '--control-label',
-        safeName(verb),
+        '--skip-control',
       ]))
       lines.push(commandLine(['node', '~/.fleet/runtime/receipt-bundle.mjs', ...agentArgs, '--out-dir', outDir, '--status', '--status-summary', ...requiredControlVerbArgs(requiredControlVerbs)]))
       lines.push('')
@@ -433,7 +436,9 @@ function normalizeContinuousReceipt(receipt, agents, service) {
   if (!hasExactKeys(observation.heartbeat, ['schema', 'pid', 'started_at', 'last_tick_at', 'interval_sec', 'tick']) || observation.heartbeat.schema !== 'mupot-fleet-daemon-state/v1' ||
     !Number.isInteger(observation.heartbeat.pid) || observation.heartbeat.pid <= 0 || !validTimestamp(observation.heartbeat.started_at) || !validTimestamp(observation.heartbeat.last_tick_at) ||
     !Number.isFinite(observation.heartbeat.interval_sec) || observation.heartbeat.interval_sec < 15 || observation.heartbeat.interval_sec > 120 || !hasExactKeys(observation.heartbeat.tick, ['before', 'after'])) return null
-  if (!hasExactKeys(observation.control, ['schema', 'pid', 'started_at', 'last_poll_at', 'poll_sec', 'last_outcome', 'poll']) || observation.control.schema !== 'mupot-fleet-control-state/v1' ||
+  const controlKeys = ['schema', 'pid', 'started_at', 'last_poll_at', 'poll_sec', 'last_outcome', 'poll']
+  const durableControlKeys = [...controlKeys, 'last_accepted']
+  if (!(hasExactKeys(observation.control, controlKeys) || hasExactKeys(observation.control, durableControlKeys)) || observation.control.schema !== 'mupot-fleet-control-state/v1' ||
     !Number.isInteger(observation.control.pid) || observation.control.pid <= 0 || !validTimestamp(observation.control.started_at) || !validTimestamp(observation.control.last_poll_at) ||
     !Number.isFinite(observation.control.poll_sec) || observation.control.poll_sec < 2 || observation.control.poll_sec > 120 || !hasExactKeys(observation.control.poll, ['before', 'after']) || !hasExactKeys(observation.control.last_outcome, ['agent_id', 'verb', 'accepted', 'result'])) return null
   const outcome = observation.control.last_outcome
@@ -450,6 +455,11 @@ function normalizeContinuousReceipt(receipt, agents, service) {
     (outcome.accepted === false && outcome.agent_id === null && outcome.verb === null && requestlessFailures.has(outcome.result)) ||
     (outcome.accepted === false && typeof outcome.agent_id === 'string' && Object.hasOwn(requestFailures, outcome.verb) && requestFailures[outcome.verb].has(outcome.result))
   if (!outcomeValid) return null
+  if (Object.hasOwn(observation.control, 'last_accepted')) {
+    const durable = observation.control.last_accepted
+    if (durable !== null && (!hasExactKeys(durable, ['agent_id', 'verb', 'result', 'request_ref', 'observed_at']) || !nonEmptyString(durable.agent_id) ||
+      !Object.hasOwn(acceptedResults, durable.verb) || durable.result !== acceptedResults[durable.verb] || !SHA256_RE.test(durable.request_ref ?? '') || !validTimestamp(durable.observed_at))) return null
+  }
   if (observation.heartbeat.pid !== service.services.heartbeat.pid || observation.control.pid !== service.services.control.pid) return null
   const counters = [observation.heartbeat.tick.before, observation.heartbeat.tick.after, observation.control.poll.before, observation.control.poll.after]
   if (counters.some((counter) => !Number.isInteger(counter) || counter < 0)) return null
@@ -469,7 +479,7 @@ function normalizeContinuousReceipt(receipt, agents, service) {
   if (!Array.isArray(receipt.next_steps) || receipt.next_steps.length !== 0 || !Array.isArray(receipt.checks) || ![CONTINUOUS_CHECKS.length, CONTINUOUS_CHECKS.length + 1].includes(receipt.checks.length) ||
     receipt.checks.slice(0, CONTINUOUS_CHECKS.length).some((check, index) => !hasExactKeys(check, ['check', 'ok']) || check.check !== CONTINUOUS_CHECKS[index] || check.ok !== true) ||
     (receipt.checks.length > CONTINUOUS_CHECKS.length && (!hasExactKeys(receipt.checks.at(-1), ['check', 'ok']) || receipt.checks.at(-1).check !== 'required_control_accepted' || receipt.checks.at(-1).ok !== true))) return null
-  return { agent_id: receipt.agent.agent_id, heartbeat_delta: heartbeatDelta, control_delta: controlDelta }
+  return { agent_id: receipt.agent.agent_id, heartbeat_delta: heartbeatDelta, control_delta: controlDelta, control_pid: observation.control.pid }
 }
 
 function normalizeHostReceipt(receipt, service, agents) {
@@ -700,14 +710,60 @@ function legacyRuntimeInboxReceiptSchemaExact(receipt, agentId, hostTarget) {
 
 function normalizeLifecycleReceipt(receipt, agentId, verb, hostTarget) {
   if (!exactSummaryEnvelope(receipt, ['receipt_type', 'generated_at', 'status', 'summary', 'inputs', 'target', 'checks', 'poll']) ||
-    receipt.receipt_type !== EXPECTED.control || receipt.status !== 'pass' || !hasExactKeys(receipt.inputs, ['control_config', 'consumer_agent']) ||
-    !nonEmptyString(receipt.inputs.control_config) || !nonEmptyString(receipt.inputs.consumer_agent) ||
+    receipt.receipt_type !== EXPECTED.control || receipt.status !== 'pass' ||
     !hasExactKeys(receipt.target, ['base_url', 'tenant', 'consumer_agent', 'executed_agents']) || receipt.target.base_url !== hostTarget.base_url || receipt.target.tenant !== hostTarget.tenant ||
-    receipt.target.consumer_agent !== receipt.inputs.consumer_agent || receipt.target.consumer_agent !== hostTarget.control_consumer_agent || JSON.stringify(receipt.target.executed_agents) !== JSON.stringify([agentId]) ||
-    !hasExactKeys(receipt.poll, ['ok', 'action', 'request']) || receipt.poll.ok !== true || !hasExactKeys(receipt.poll.request, ['agent_id', 'verb']) ||
-    receipt.poll.request.agent_id !== agentId || receipt.poll.request.verb !== verb) return null
+    receipt.target.consumer_agent !== receipt.inputs?.consumer_agent || receipt.target.consumer_agent !== hostTarget.control_consumer_agent || JSON.stringify(receipt.target.executed_agents) !== JSON.stringify([agentId])) return null
   const expectedAction = verb === 'start' ? 'open' : verb === 'stop' ? 'close' : 'restart_open'
-  if (receipt.poll.action !== expectedAction) return null
+  if (receipt.inputs.evidence_mode === 'daemon_state') {
+    const inputKeys = ['control_config', 'consumer_agent', 'evidence_mode', 'control_state', 'probe_receipt', 'probe_generated_at', 'request_ref']
+    if (!hasExactKeys(receipt.inputs, inputKeys) || !nonEmptyString(receipt.inputs.control_config) || !nonEmptyString(receipt.inputs.consumer_agent) ||
+      !nonEmptyString(receipt.inputs.control_state) || !nonEmptyString(receipt.inputs.probe_receipt) || !SHA256_RE.test(receipt.inputs.request_ref ?? '') ||
+      !validTimestamp(receipt.inputs.probe_generated_at) ||
+      !hasExactKeys(receipt.poll, ['ok', 'action', 'request', 'state']) || receipt.poll.ok !== true || receipt.poll.action !== expectedAction ||
+      !hasExactKeys(receipt.poll.request, ['agent_id', 'verb', 'request_ref']) || receipt.poll.request.agent_id !== agentId || receipt.poll.request.verb !== verb ||
+      receipt.poll.request.request_ref !== receipt.inputs.request_ref) return null
+    const state = receipt.poll.state
+    const lastOutcome = state?.last_outcome
+    const knownControlResults = new Set(['idle', 'open', 'close', 'restart_open', 'status_noop', 'peek_failed', 'consume_failed', 'invalid_json', 'request_not_object', 'bad_agent_id', 'bad_verb', 'bad_nonce', 'bad_ts', 'bad_sig', 'stale', 'bad_signature', 'replay', 'flight_command_failed'])
+    if (!hasExactKeys(state, ['schema', 'pid', 'started_at', 'poll', 'last_poll_at', 'poll_sec', 'last_outcome', 'last_accepted']) ||
+      state.schema !== 'mupot-fleet-control-state/v1' || !Number.isInteger(state.pid) || state.pid <= 0 || !validTimestamp(state.started_at) ||
+      !Number.isInteger(state.poll) || state.poll < 0 || !validTimestamp(state.last_poll_at) || !Number.isFinite(state.poll_sec) || state.poll_sec < 2 || state.poll_sec > 120 ||
+      !hasExactKeys(lastOutcome, ['agent_id', 'verb', 'accepted', 'result']) || typeof lastOutcome.accepted !== 'boolean' || !knownControlResults.has(lastOutcome.result) ||
+      (lastOutcome.agent_id !== null && !nonEmptyString(lastOutcome.agent_id)) || (lastOutcome.verb !== null && !new Set([...CONTROL_VERBS, 'status']).has(lastOutcome.verb)) ||
+      !hasExactKeys(state.last_accepted, ['agent_id', 'verb', 'result', 'request_ref', 'observed_at']) || state.last_accepted.agent_id !== agentId ||
+      state.last_accepted.verb !== verb || state.last_accepted.result !== expectedAction || state.last_accepted.request_ref !== receipt.inputs.request_ref ||
+      !validTimestamp(state.last_accepted.observed_at)) return null
+    const probeGeneratedMs = Date.parse(receipt.inputs.probe_generated_at)
+    const observedMs = Date.parse(state.last_accepted.observed_at)
+    const receiptGeneratedMs = Date.parse(receipt.generated_at)
+    if (observedMs < probeGeneratedMs || observedMs > receiptGeneratedMs || receiptGeneratedMs - probeGeneratedMs > 600_000) return null
+    const expectedChecks = [
+      ['control-receipt', 'control_config_valid', ['ok', 'component', 'check', 'path']],
+      ['control-receipt', 'probe_receipt_valid', ['ok', 'component', 'check', 'path', 'agent_id', 'verb', 'request_ref']],
+      ['control-receipt', 'control_state_read', ['ok', 'component', 'check', 'path', 'pid', 'poll']],
+      ['fleet-control-daemon', 'control_request_observed', ['ok', 'component', 'check', 'agent_id', 'verb', 'action', 'pid', 'poll', 'request_ref']],
+    ]
+    if (receipt.checks.length !== expectedChecks.length || receipt.checks.some((check, index) => {
+      const [component, name, keys] = expectedChecks[index]
+      return !hasExactKeys(check, keys) || check.ok !== true || check.component !== component || check.check !== name
+    })) return null
+    const [configCheck, probeCheck, stateCheck, observedCheck] = receipt.checks
+    if (configCheck.path !== receipt.inputs.control_config || probeCheck.path !== receipt.inputs.probe_receipt || probeCheck.agent_id !== agentId || probeCheck.verb !== verb ||
+      probeCheck.request_ref !== receipt.inputs.request_ref || stateCheck.path !== receipt.inputs.control_state || stateCheck.pid !== state.pid || stateCheck.poll !== state.poll ||
+      observedCheck.agent_id !== agentId || observedCheck.verb !== verb || observedCheck.action !== expectedAction || observedCheck.pid !== state.pid ||
+      observedCheck.poll !== state.poll || observedCheck.request_ref !== receipt.inputs.request_ref) return null
+    return {
+      receipt,
+      evidence_mode: 'daemon_state',
+      control_pid: state.pid,
+      request_ref: receipt.inputs.request_ref,
+      probe_generated_at: receipt.inputs.probe_generated_at,
+      observed_at: state.last_accepted.observed_at,
+    }
+  }
+  if (!hasExactKeys(receipt.inputs, ['control_config', 'consumer_agent']) || !nonEmptyString(receipt.inputs.control_config) || !nonEmptyString(receipt.inputs.consumer_agent) ||
+    !hasExactKeys(receipt.poll, ['ok', 'action', 'request']) || receipt.poll.ok !== true || !hasExactKeys(receipt.poll.request, ['agent_id', 'verb']) ||
+    receipt.poll.request.agent_id !== agentId || receipt.poll.request.verb !== verb || receipt.poll.action !== expectedAction) return null
   const expectedChecks = [
     ['control-receipt', 'control_config_valid', ['ok', 'component', 'check', 'path']],
     ['control-receipt', 'consumer_private_key_loaded', ['ok', 'component', 'check', 'agent_id']],
@@ -722,7 +778,7 @@ function normalizeLifecycleReceipt(receipt, agentId, verb, hostTarget) {
   const execution = receipt.checks[3]
   if (execution.agent_id !== agentId || execution.verb !== verb || execution.action !== expectedAction ||
     (execution.status !== null && !Number.isInteger(execution.status)) || (execution.retry !== null && typeof execution.retry !== 'boolean')) return null
-  return receipt
+  return { receipt, evidence_mode: 'direct_poll', control_pid: null, request_ref: null }
 }
 
 function normalizePassingCutoverReceipt(receipt) {
@@ -817,6 +873,18 @@ function priorBundleManifestPasses(prior, starter, agentId, admittedDigests = nu
         return hasExactKeys(check, ['ok', 'component', 'check', 'required_component', 'required_check', 'path']) &&
           check.required_component === 'fleet-control-daemon' && check.required_check === 'panel_public_key_public_only' && nonEmptyString(check.path)
       }
+      if (check.check === 'control_evidence_contract_valid') {
+        return hasExactKeys(check, ['ok', 'component', 'check', 'path']) && nonEmptyString(check.path)
+      }
+      if (check.check === 'control_probe_binding_valid') {
+        return hasExactKeys(check, ['ok', 'component', 'check', 'path', 'agent_id', 'verb', 'probe_path']) && check.agent_id === agentId &&
+          CONTROL_VERBS.has(check.verb) && nonEmptyString(check.path) && nonEmptyString(check.probe_path)
+      }
+      if (check.check === 'control_observed_service_pid_match') {
+        return hasExactKeys(check, ['ok', 'component', 'check', 'path', 'agent_id', 'verb', 'observed_pid', 'service_pid']) && check.agent_id === agentId &&
+          CONTROL_VERBS.has(check.verb) && nonEmptyString(check.path) && Number.isInteger(check.observed_pid) && check.observed_pid > 0 &&
+          check.observed_pid === check.service_pid
+      }
       return false
     }
     if (check.component !== 'receipt-bundle-check' || !nonEmptyString(check.path)) return false
@@ -844,11 +912,25 @@ function priorBundleManifestPasses(prior, starter, agentId, admittedDigests = nu
     }
     return false
   }
+  const seenChecks = new Set()
   for (const check of prior.checks) {
     if (!producerCheckPasses(check)) return false
+    const identity = JSON.stringify([
+      check.component,
+      check.check,
+      check.path ?? null,
+      check.artifact ?? null,
+      check.agent_id ?? null,
+      check.required_component ?? null,
+      check.required_check ?? null,
+    ])
+    if (seenChecks.has(identity)) return false
+    seenChecks.add(identity)
   }
-  return [...requiredChecks.keys()].every((name) => prior.checks.some((check) => check.check === name)) &&
-    prior.checks.filter((check) => check.check === 'control_candidate_selected').length >= 2
+  return [...requiredChecks.keys()].every((name) => {
+    const count = prior.checks.filter((check) => check.check === name).length
+    return name === 'control_candidate_selected' ? count >= 2 : count === 1
+  })
 }
 
 function roleReceiptPath(starterPath, reference) {
@@ -895,11 +977,15 @@ function normalizeStarterEvidence({ serviceReceipt, continuousReceipt, starterRe
     roleReceipts.service?.receipt_type !== EXPECTED.service || JSON.stringify(roleReceipts.service) !== JSON.stringify(serviceReceipt) ||
     roleReceipts.host?.receipt_type !== EXPECTED.host || JSON.stringify(roleReceipts.host) !== JSON.stringify(hostReceipt) ||
     roleReceipts.continuous?.receipt_type !== EXPECTED.continuous || JSON.stringify(roleReceipts.continuous) !== JSON.stringify(continuousReceipt)) return null
-  if (!normalizeRuntimeInboxReceipt(roleReceipts.runtime_inbox, continuous.agent_id, host.target) ||
-    !normalizeLifecycleReceipt(roleReceipts.lifecycle_control_start, continuous.agent_id, 'start', host.target) ||
-    !normalizeLifecycleReceipt(roleReceipts.lifecycle_control_stop, continuous.agent_id, 'stop', host.target)) return null
+  const lifecycleStart = normalizeLifecycleReceipt(roleReceipts.lifecycle_control_start, continuous.agent_id, 'start', host.target)
+  const lifecycleStop = normalizeLifecycleReceipt(roleReceipts.lifecycle_control_stop, continuous.agent_id, 'stop', host.target)
+  if (!normalizeRuntimeInboxReceipt(roleReceipts.runtime_inbox, continuous.agent_id, host.target) || !lifecycleStart || !lifecycleStop ||
+    [lifecycleStart, lifecycleStop].some((lifecycle) => lifecycle.control_pid !== null && lifecycle.control_pid !== continuous.control_pid)) return null
   const prior = roleReceipts.receipt_bundle_manifest
   if (!priorBundleManifestPasses(prior, starter, continuous.agent_id, admittedDigests)) return null
+  const probePaths = prior.artifacts.probes.map((meta) => admittedPriorArtifactPath(starterPath, meta))
+  if (probePaths.some((path) => !path) || [lifecycleStart, lifecycleStop].some((lifecycle) =>
+    lifecycle.evidence_mode === 'daemon_state' && !admittedProbeBinding(probePaths, lifecycle, dirname(starterPath)))) return null
   return { service_manager: service.manager, platform: service.platform, definition_hashes: service.definitions, observed_deltas: { heartbeat_tick: continuous.heartbeat_delta, control_poll: continuous.control_delta }, starter_manifest_sha256: starter.manifest.sha256, agent_id: continuous.agent_id, tenant: hostReceipt.target?.tenant ?? null }
 }
 
@@ -1317,6 +1403,80 @@ function receiptHasPassingCheck(receipt, required) {
 
 function hostReceiptRequiredChecksPass(receipt) {
   return REQUIRED_HOST_RECEIPT_CHECKS.every((required) => receiptHasPassingCheck(receipt, required))
+}
+
+function normalizeServiceAwareHostReceipt(receipt, agents) {
+  const definitions = receipt?.checks?.find((check) => check?.component === 'host-services' && check?.check === 'service_definitions_current')
+  const heartbeat = receipt?.checks?.find((check) => check?.component === 'host-services' && check?.check === 'heartbeat_service_running')
+  const control = receipt?.checks?.find((check) => check?.component === 'host-services' && check?.check === 'control_service_running')
+  const linger = receipt?.checks?.find((check) => check?.component === 'host-services' && check?.check === 'systemd_linger_enabled')
+  if (!definitions || !heartbeat || !control || !linger) return null
+  const definitionHashes = Object.fromEntries((definitions.definitions ?? []).map((entry) => [entry?.service, entry?.expected_sha256]))
+  return normalizePassingHostReceipt(receipt, {
+    manager: receipt.inputs?.service_manager,
+    definitions: definitionHashes,
+    services: { heartbeat: heartbeat.service, control: control.service },
+    linger: linger.linger,
+  }, agents)
+}
+
+function admittedProbeBinding(probePaths, lifecycle, root = '') {
+  const matches = []
+  for (const path of probePaths) {
+    const raw = readReceipt(path, root)
+    if (projectionSchemaExact(raw) && raw.projection_sha256 !== sha256Bytes(jsonBytes(raw.content))) continue
+    const receipt = normalizePassingProbeReceipt(projectionContent(raw))
+    if (!receipt || receipt.inputs.agent !== lifecycle.receipt.poll.request.agent_id || receipt.generated_at !== lifecycle.probe_generated_at) continue
+    const action = receipt.actions.find((entry) => entry.kind === 'control_request' && entry.verb === lifecycle.receipt.poll.request.verb && entry.ok === true)
+    if (!action) continue
+    const requestRef = createHash('sha256').update(action.nonce).digest('hex')
+    if (requestRef === lifecycle.request_ref) matches.push(path)
+  }
+  return matches.length === 1 ? matches[0] : null
+}
+
+function admittedPriorArtifactPath(starterPath, meta) {
+  if (!exactArtifactMeta(meta, EXPECTED.probe)) return ''
+  const root = dirname(starterPath)
+  const candidate = isAbsolute(meta.path) ? resolve(meta.path) : resolve(root, meta.path)
+  if (!regularFileStat(candidate) || !pathContainedBy(candidate, root)) return ''
+  const raw = readReceipt(candidate, root)
+  const actualSha = fileSha256(candidate, root)
+  const digestMatches = actualSha === meta.sha256 ||
+    (projectionSchemaExact(raw) && raw.source_sha256 === meta.sha256 && raw.projection_sha256 === sha256Bytes(jsonBytes(raw.content)))
+  return digestMatches ? candidate : ''
+}
+
+function validateStateObservedControls(controlPaths, probePaths, hostPath, agents, checks) {
+  const hostReceipt = readReceipt(hostPath)
+  const host = normalizeServiceAwareHostReceipt(hostReceipt, agents)
+  const controlPid = host
+    ? hostReceipt.checks.find((check) => check.component === 'host-services' && check.check === 'control_service_running')?.service?.pid
+    : null
+  const selected = []
+  for (const path of controlPaths) {
+    const receipt = readReceipt(path)
+    if (receipt?.inputs?.evidence_mode !== 'daemon_state') {
+      selected.push(path)
+      continue
+    }
+    const request = receipt?.poll?.request
+    const lifecycle = hostReceipt?.target && nonEmptyString(request?.agent_id) && CONTROL_VERBS.has(request?.verb)
+      ? normalizeLifecycleReceipt(receipt, request.agent_id, request.verb, hostReceipt?.target)
+      : null
+    if (!lifecycle) {
+      checks.push({ ok: false, component: 'receipt-bundle', check: 'control_evidence_contract_valid', path })
+      continue
+    }
+    checks.push({ ok: true, component: 'receipt-bundle', check: 'control_evidence_contract_valid', path })
+    const probePath = admittedProbeBinding(probePaths, lifecycle)
+    const probeOk = Boolean(probePath)
+    const pidOk = Number.isInteger(controlPid) && controlPid > 0 && lifecycle.control_pid === controlPid
+    checks.push({ ok: probeOk, component: 'receipt-bundle', check: 'control_probe_binding_valid', path, agent_id: request.agent_id, verb: request.verb, probe_path: probePath })
+    checks.push({ ok: pidOk, component: 'receipt-bundle', check: 'control_observed_service_pid_match', path, agent_id: request.agent_id, verb: request.verb, observed_pid: lifecycle.control_pid, service_pid: controlPid })
+    if (probeOk && pidOk) selected.push(path)
+  }
+  return selected
 }
 
 function addHostReceiptRequiredChecks(checks, { component, receipt, extra = {} }) {
@@ -3423,9 +3583,9 @@ function addHostGoStatusNextSteps(steps, { outDir, artifacts, agents, gateReceip
   }
   const missingControls = missingControlEvidenceForAgents({ agents, requiredControlVerbs, controlEvidence })
   if (missingControls.length > 0) {
-    add(`queue missing lifecycle control evidence (${missingControls.join(', ')}) with cutover-probe.mjs, then rerun receipt-bundle with --probe-receipt and --control-label`)
+    add(`queue missing lifecycle control evidence (${missingControls.join(', ')}) with cutover-probe.mjs, observe it with control-receipt.mjs --observe-state, then rerun receipt-bundle with --probe-receipt and --skip-control`)
   } else if (passingMetaCount(artifacts.controls, EXPECTED.control) === 0) {
-    add('queue start and stop lifecycle controls with cutover-probe.mjs, then collect control receipts with --control-label start/stop')
+    add('queue start and stop lifecycle controls with cutover-probe.mjs, then collect each control receipt with control-receipt.mjs --observe-state')
   }
   if (artifacts.cutover_gate?.receipt_type !== EXPECTED.cutover_gate || gateReceipt?.status !== 'pass') {
     add('run receipt-bundle --verify-only after host/runtime/control receipts are present so cutover-gate.json is rebuilt')
@@ -3517,7 +3677,7 @@ function hostGoStatusChecklist({ outDir, artifacts, agents, gateReceipt, manifes
       'control_receipts_passed_for_required_verbs',
       'Lifecycle control receipt evidence covers every required agent/verb',
       (agents ?? []).length > 0 && missingControls.length === 0,
-      'Queue missing lifecycle controls with cutover-probe.mjs, then collect control receipts with --control-label.',
+      'Queue missing lifecycle controls with cutover-probe.mjs, then collect control receipts with control-receipt.mjs --observe-state.',
       { required_control_verbs: requiredControlVerbs, missing: missingControls },
     ),
     hostGoChecklistItem(
@@ -4099,9 +4259,9 @@ function buildDetailedNextSteps({ artifacts, agents, gateReceipt, outDir, bundle
     ...missingControlEvidenceForAgents({ agents, requiredControlVerbs, controlEvidence }),
   ])
   if (missingControls.length > 0) {
-    add(`queue missing lifecycle control evidence (${missingControls.join(', ')}) with cutover-probe.mjs, then rerun receipt-bundle with --probe-receipt and --control-label`)
+    add(`queue missing lifecycle control evidence (${missingControls.join(', ')}) with cutover-probe.mjs, observe it with control-receipt.mjs --observe-state, then rerun receipt-bundle with --probe-receipt and --skip-control`)
   } else if ((artifacts.controls ?? []).length === 0) {
-    add('queue lifecycle control with cutover-probe.mjs and rerun receipt-bundle with --control-label start/stop, or one restart receipt when acceptable')
+    add('queue lifecycle control with cutover-probe.mjs and collect it with control-receipt.mjs --observe-state, or use one restart receipt when acceptable')
   }
 
   if (bundleStatus !== 'pass' || gateReceipt?.status !== 'pass') {
@@ -4177,6 +4337,7 @@ async function buildBundle(opts) {
       skipInbox: false,
       skipControl: false,
       execProbes: Boolean(opts.execProbes),
+      requireServices: true,
       ...(opts.hostOptions ?? {}),
     }, opts, checks)
     artifacts.host = receiptMeta(result.path)
@@ -4213,7 +4374,14 @@ async function buildBundle(opts) {
 
   const hostPaths = passPaths([join(outDir, 'host.json')].filter(existsSync), EXPECTED.host, checks, 'host')
   const runtimePaths = passPaths(listReceiptFiles(outDir, 'runtime-'), EXPECTED.runtime, checks, 'runtime')
-  const controlPaths = passPaths(listReceiptFiles(outDir, 'control-'), EXPECTED.control, checks, 'control')
+  const controlCandidates = passPaths(listReceiptFiles(outDir, 'control-'), EXPECTED.control, checks, 'control')
+  const controlPaths = validateStateObservedControls(
+    controlCandidates,
+    listReceiptFiles(outDir, 'probe-'),
+    hostPaths[0] ?? '',
+    agents,
+    checks,
+  )
   artifacts.host = receiptMeta(join(outDir, 'host.json'))
   artifacts.runtimes = listReceiptFiles(outDir, 'runtime-').map((path) => {
     const meta = receiptMeta(path)

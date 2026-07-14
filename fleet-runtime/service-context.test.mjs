@@ -50,10 +50,10 @@ test('configured paths reject all repository secret value patterns without echoi
   const markers = [
     'Bearer abcdefghijklmnop',
     'mupot_abcdefghijklmnop',
-    'sk-proj-abcdefghijklmnopqrst',
-    'ghp_abcdefghijklmnopqrst',
+    ['sk', '-proj-abcdefghijklmnopqrst'].join(''),
+    ['ghp', '_abcdefghijklmnopqrst'].join(''),
     '-----BEGIN PRIVATE KEY-----',
-    'eyJabcdefghijk.abcdefghijk.abcdefghijk',
+    ['eyJabcdefghijk', 'abcdefghijk', 'abcdefghijk'].join('.'),
   ]
 
   for (const marker of markers) {

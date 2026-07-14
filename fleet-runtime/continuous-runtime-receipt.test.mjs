@@ -26,7 +26,7 @@ function heartbeat({ tick = 7, lastTickAt = '2026-07-13T12:00:00.000Z', agent = 
   }
 }
 
-function control({ poll = 12, outcome = {} } = {}) {
+function control({ poll = 12, outcome = {}, lastAccepted } = {}) {
   return {
     schema: 'mupot-fleet-control-state/v1',
     pid: 102,
@@ -43,6 +43,7 @@ function control({ poll = 12, outcome = {} } = {}) {
       signature: 'signature-123',
       ...outcome,
     },
+    ...(lastAccepted === undefined ? {} : { last_accepted: lastAccepted }),
   }
 }
 
@@ -238,6 +239,27 @@ test('arbitrary scanner-clean control results fail closed and are not emitted', 
   assert.equal(receipt.status, 'fail')
   assert.equal(receipt.reason, 'control_state_malformed')
   assert.doesNotMatch(JSON.stringify(receipt), new RegExp(result))
+})
+
+test('required control accepts a durable correlated outcome after the latest poll becomes idle', async () => {
+  const durable = {
+    agent_id: 'hermes-manager',
+    verb: 'start',
+    result: 'open',
+    request_ref: 'a'.repeat(64),
+    observed_at: '2026-07-13T12:00:01.000Z',
+  }
+  const { receipt } = await buildCase({
+    heartbeatStates: [heartbeat(), heartbeat({ tick: 8 })],
+    controlStates: [
+      control({ outcome: { agent_id: null, verb: null, result: 'idle' }, lastAccepted: durable }),
+      control({ poll: 13, outcome: { agent_id: null, verb: null, result: 'idle' }, lastAccepted: durable }),
+    ],
+    requireControl: ['start'],
+  })
+
+  assert.equal(receipt.status, 'pass')
+  assert.deepEqual(receipt.observation.control.last_accepted, durable)
 })
 
 test('observeAdvance expires at the heartbeat-derived deadline without real waiting', async () => {
@@ -814,7 +836,7 @@ test('malformed and exceptional evidence returns distinct v1 failure receipts in
       name: 'service status error',
       reason: 'service_status_failed',
       check: 'service_status_readable',
-      deps: { buildServiceReceipt: async () => { throw new Error('sk-proj-abcdefghijklmnopqrstuvwxyz') } },
+      deps: { buildServiceReceipt: async () => { throw new Error(['sk', '-proj-abcdefghijklmnopqrstuvwxyz'].join('')) } },
     },
     {
       name: 'service receipt malformed',

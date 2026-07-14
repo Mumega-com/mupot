@@ -289,6 +289,28 @@ function normalizeControlState(state) {
     validTuple = REQUEST_CONTROL_FAILURES[verb].has(result)
   }
   if (!validTuple) throw new Error('invalid control outcome tuple')
+  let lastAccepted
+  if (Object.hasOwn(state, 'last_accepted')) {
+    const durable = state.last_accepted
+    if (durable === null) lastAccepted = null
+    else {
+      if (!isPlainObject(durable) || !hasExactKeys(durable, ['agent_id', 'verb', 'result', 'request_ref', 'observed_at'])) throw new Error('invalid durable control outcome')
+      const durableAgent = safeString(durable.agent_id)
+      const durableResult = safeString(durable.result)
+      const durableObservedAt = normalizeTimestamp(durable.observed_at)
+      if (durableAgent === null || !AGENT_ID_RE.test(durableAgent) || !CONTROL_VERBS.has(durable.verb) ||
+        durableResult !== ACCEPTED_CONTROL_RESULTS[durable.verb] || !SHA256_RE.test(durable.request_ref) || durableObservedAt === null) {
+        throw new Error('invalid durable control outcome')
+      }
+      lastAccepted = {
+        agent_id: durableAgent,
+        verb: durable.verb,
+        result: durableResult,
+        request_ref: durable.request_ref,
+        observed_at: durableObservedAt,
+      }
+    }
+  }
   return {
     schema: CONTROL_SCHEMA,
     pid: state.pid,
@@ -297,6 +319,7 @@ function normalizeControlState(state) {
     last_poll_at: lastPollAt,
     poll_sec: state.poll_sec,
     last_outcome: { agent_id: agentId, verb, accepted, result },
+    ...(Object.hasOwn(state, 'last_accepted') ? { last_accepted: lastAccepted } : {}),
   }
 }
 
@@ -599,6 +622,7 @@ function controlProjection(state) {
     last_poll_at: state.last_poll_at,
     poll_sec: state.poll_sec,
     last_outcome: state.last_outcome,
+    ...(Object.hasOwn(state, 'last_accepted') ? { last_accepted: state.last_accepted } : {}),
   }
 }
 
@@ -700,10 +724,11 @@ export async function buildContinuousRuntimeReceipt(input, deps = {}) {
     const deadlineControlAdvanced = observation.timed_out ? observation.control_advanced_before_deadline : controlAdvanced
     const ageMs = observation.completed_ms - Date.parse(heartbeatAfter.last_tick_at)
     const heartbeatFresh = Number.isFinite(ageMs) && ageMs <= opts.ttlSec * 1_000
+    const acceptedControl = controlAfter.last_accepted ?? controlAfter.last_outcome
     const requiredControlOk = opts.requireControl.length === 0 || (
-      controlAfter.last_outcome.agent_id === opts.agentId &&
-      controlAfter.last_outcome.accepted === true &&
-      opts.requireControl.includes(controlAfter.last_outcome.verb)
+      acceptedControl.agent_id === opts.agentId &&
+      (acceptedControl.accepted === undefined || acceptedControl.accepted === true) &&
+      opts.requireControl.includes(acceptedControl.verb)
     )
     const lingerDisabled = services.service_manager === 'systemd' && services.linger?.enabled === false
     const deadlineFailure = timeoutReason(observation.timed_out, deadlineHeartbeatAdvanced, deadlineControlAdvanced)

@@ -104,6 +104,7 @@ test('starter plan covers the credential-free install, proof, export, rollback, 
     'fleet-runtime/host-receipt.mjs',
     'fleet-runtime/cutover-probe.mjs --base-url https://pot.customer.example --agent manager --agent-token-env MUPOT_AGENT_TOKEN_MANAGER --queue-inbox --control start',
     'fleet-runtime/cutover-probe.mjs --base-url https://pot.customer.example --agent manager --control stop',
+    'fleet-runtime/control-receipt.mjs --observe-state',
     'fleet-runtime/continuous-runtime-receipt.mjs',
     'prior-bundle-manifest.json',
     "cp 'customer starter.json' ~/.fleet/receipts/manager/starter.example.json",
@@ -136,10 +137,13 @@ test('starter plan covers the credential-free install, proof, export, rollback, 
   const stopProbe = plan.indexOf('--control stop')
   assert.ok(startProbe < continuous)
   assert.ok(continuous < stopProbe)
-  assert.doesNotMatch(plan, /--skip-host --skip-runtime --skip-control/)
+  assert.match(plan, /control-receipt\.mjs --observe-state[\s\S]*--skip-host --skip-runtime --skip-control/)
   assert.match(plan, /--require-control-verb start --install-receipt ~\/\.fleet\/receipts\/install\.json --probe-receipt/)
   assert.match(plan, /--require-control-verb start,stop --probe-receipt .*probe-stop\.json/)
   assert.match(plan, /Requires MUPOT_AGENT_TOKEN_MANAGER and MUPOT_OWNER_TOKEN/)
+  assert.doesNotMatch(plan, /--control-label/)
+  assert.match(plan, /control-receipt\.mjs --observe-state --probe-receipt .*probe-start\.json --verb start/)
+  assert.match(plan, /control-receipt\.mjs --observe-state --probe-receipt .*probe-stop\.json --verb stop/)
 
   const recovery = plan.indexOf('8. Recovery reinstall')
   const recoveryInstall = plan.indexOf('install.mjs --activate', recovery)

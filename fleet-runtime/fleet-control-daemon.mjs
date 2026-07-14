@@ -80,7 +80,9 @@ export function publishControlState(cfg, outcome, poll, opts = {}) {
     lastPollAt: now().toISOString(),
     pollSec: cfg.pollSec,
     outcome,
+    lastAccepted: opts.stateTracker?.lastAccepted ?? null,
   })
+  if (opts.stateTracker) opts.stateTracker.lastAccepted = state.last_accepted
   try {
     ;(opts.writeRuntimeState ?? writeRuntimeState)(statePath, state)
   } catch (error) {
@@ -93,7 +95,7 @@ export async function runControlCycle(cfg, consumerKey, publicKey, ledger, state
   const pollOnceFn = opts.pollOnce ?? pollOnce
   const outcome = await pollOnceFn(cfg, consumerKey, publicKey, ledger, opts)
   state.poll += 1
-  return publishControlState(cfg, outcome, state.poll, opts)
+  return publishControlState(cfg, outcome, state.poll, { ...opts, stateTracker: state })
 }
 
 export function runCommand(argv, timeoutMs = DEFAULT_TIMEOUT_MS, spawnImpl = spawn) {

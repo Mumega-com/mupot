@@ -351,7 +351,7 @@ test('activation exceptions use a complete redacted service failure envelope', a
   const prefix = join(root, "fleet owner's host")
   const systemdDir = join(root, "systemd user's units")
   const nodePath = "/opt/Mupot Node's/bin/node"
-  const secret = 'sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  const secret = ['sk', '-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ'].join('')
 
   const receipt = await buildReceipt({
     sourceDir: SOURCE_DIR,

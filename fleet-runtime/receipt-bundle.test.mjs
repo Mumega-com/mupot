@@ -124,8 +124,9 @@ function installReceipt(status = 'warn') {
   }
 }
 
-function probeReceipt(status = 'pass') {
+function probeReceipt(status = 'pass', verb = 'start') {
   const ok = status === 'pass'
+  const nonce = `nonce-${verb}`
   const checks = [
     { ok: true, component: 'cutover-probe', check: 'base_url_valid' },
     { ok: true, component: 'cutover-probe', check: 'target_agent_present', agent: 'agent-one' },
@@ -133,7 +134,7 @@ function probeReceipt(status = 'pass') {
     { ok: true, component: 'cutover-probe', check: 'agent_token_present', env: 'MUPOT_AGENT_TOKEN' },
     { ok, component: 'cutover-probe', check: 'inbox_probe_queued', status: ok ? 202 : 500, response_ok: ok, error: ok ? undefined : 'failed', detail: undefined },
     { ok: true, component: 'cutover-probe', check: 'owner_token_present', env: 'MUPOT_OWNER_TOKEN' },
-    { ok, component: 'cutover-probe', check: 'control_request_queued', agent_id: 'agent-one', verb: 'start', status: ok ? 202 : 500, response_ok: ok, error: ok ? undefined : 'failed', detail: undefined },
+    { ok, component: 'cutover-probe', check: 'control_request_queued', agent_id: 'agent-one', verb, status: ok ? 202 : 500, response_ok: ok, error: ok ? undefined : 'failed', detail: undefined },
   ]
   return {
     receipt_type: 'mupot-fleet-cutover-probe/v1',
@@ -144,14 +145,14 @@ function probeReceipt(status = 'pass') {
       base_url: POT_URL,
       agent: 'agent-one',
       queue_inbox: true,
-      control_verbs: ['start'],
+      control_verbs: [verb],
       inbox_kind: 'request',
       agent_token_env: 'MUPOT_AGENT_TOKEN',
       owner_token_env: 'MUPOT_OWNER_TOKEN',
     },
     actions: [
       { kind: 'inbox_probe', target_agent: 'agent-one', request_id: 'probe-1-inbox', status: ok ? 202 : 500, ok, response: { ok } },
-      { kind: 'control_request', target_agent: 'agent-one', verb: 'start', status: ok ? 202 : 500, ok, nonce: ok ? 'nonce-1' : null, response: { ok } },
+      { kind: 'control_request', target_agent: 'agent-one', verb, status: ok ? 202 : 500, ok, nonce: ok ? nonce : null, response: { ok } },
     ],
     checks,
   }
@@ -239,6 +240,44 @@ function controlReceipt(agentId, verb, status = 'pass') {
     },
     checks,
     poll: { ok: true, action, request: { agent_id: agentId, verb } },
+  }
+}
+
+function stateControlReceipt(agentId, verb, pid = 102, overrides = {}) {
+  const action = verb === 'start' ? 'open' : verb === 'stop' ? 'close' : 'restart_open'
+  const probeGeneratedAt = overrides.probeGeneratedAt ?? '2026-07-08T00:00:30.000Z'
+  const requestRef = overrides.requestRef ?? digest(`nonce-${verb}`)
+  const observedAt = overrides.observedAt ?? '2026-07-08T00:00:35.000Z'
+  const generatedAt = overrides.generatedAt ?? '2026-07-08T00:00:40.000Z'
+  const probePath = overrides.probePath ?? `/evidence/probe-${verb}.json`
+  const state = {
+    schema: 'mupot-fleet-control-state/v1',
+    pid,
+    started_at: '2026-07-13T20:00:00.000Z',
+    poll: verb === 'start' ? 71 : 75,
+    last_poll_at: '2026-07-13T20:04:00.000Z',
+    poll_sec: 2,
+    last_outcome: { agent_id: null, verb: null, accepted: true, result: 'idle' },
+    last_accepted: { agent_id: agentId, verb, result: action, request_ref: requestRef, observed_at: observedAt },
+  }
+  const checks = [
+    { ok: true, component: 'control-receipt', check: 'control_config_valid', path: '/config/control.json' },
+    { ok: true, component: 'control-receipt', check: 'probe_receipt_valid', path: probePath, agent_id: agentId, verb, request_ref: requestRef },
+    { ok: true, component: 'control-receipt', check: 'control_state_read', path: '/state/fleet-control.json', pid, poll: state.poll },
+    { ok: true, component: 'fleet-control-daemon', check: 'control_request_observed', agent_id: agentId, verb, action, pid, poll: state.poll, request_ref: requestRef },
+  ]
+  return {
+    receipt_type: 'mupot-fleet-control-receipt/v1',
+    generated_at: generatedAt,
+    status: 'pass',
+    summary: { status: 'pass', passed: 4, failed: 0, warnings: 0 },
+    inputs: {
+      control_config: '/config/control.json', consumer_agent: 'fleet-consumer', evidence_mode: 'daemon_state',
+      control_state: '/state/fleet-control.json', probe_receipt: probePath, probe_generated_at: probeGeneratedAt, request_ref: requestRef,
+    },
+    target: { base_url: POT_URL, tenant: POT_TENANT, consumer_agent: 'fleet-consumer', executed_agents: [agentId] },
+    checks,
+    poll: { ok: true, action, request: { agent_id: agentId, verb, request_ref: requestRef }, state },
   }
 }
 
@@ -380,7 +419,7 @@ function priorBundleManifest(status = 'pass', artifactDigests = {}) {
   const checks = [
     { ok, component: 'receipt-bundle', check: 'selected_agents_present', agents: ['agent-one'] },
     { ok, component: 'receipt-bundle', check: 'install_receipt_status_non_fail', path: 'install.json', accepted: ['pass', 'warn'], actual: status },
-    { ok, component: 'receipt-bundle', check: 'probe_receipt_present', count: 1 },
+    { ok, component: 'receipt-bundle', check: 'probe_receipt_present', count: 2 },
     { ok, component: 'receipt-bundle', check: 'host_candidate_selected', path: 'host.json' },
     { ok, component: 'receipt-bundle', check: 'runtime_candidate_selected', path: 'runtime-agent-one.json' },
     { ok, component: 'receipt-bundle', check: 'control_candidate_selected', path: 'control-start.json' },
@@ -396,13 +435,16 @@ function priorBundleManifest(status = 'pass', artifactDigests = {}) {
     integrity: { algorithm: 'sha256', covers: 'receipt artifact files', excludes: ['manifest.json'] },
     inputs: {
       agents: ['agent-one'], out_dir: '.', daemon_config: 'daemon.json', inbox_handler_config: 'inbox.json', control_config: 'control.json',
-      install_receipt: 'install.json', probe_receipts: ['probe-start.json'], control_label: null, required_control_verbs: ['start', 'stop'],
+      install_receipt: 'install.json', probe_receipts: ['probe-start.json', 'probe-stop.json'], control_label: null, required_control_verbs: ['start', 'stop'],
       exec_probes: false, verify_only: true, skip_host: true, skip_runtime: true, skip_control: true,
     },
     artifacts: {
       out_dir: '.',
       install: meta('install.json', 'mupot-fleet-install-receipt/v1', artifactDigests.install),
-      probes: [meta('probe-start.json', 'mupot-fleet-cutover-probe/v1')],
+      probes: [
+        meta('probe-start.json', 'mupot-fleet-cutover-probe/v1', artifactDigests.probe_start),
+        meta('probe-stop.json', 'mupot-fleet-cutover-probe/v1', artifactDigests.probe_stop),
+      ],
       host: meta('host.json', 'mupot-fleet-host-receipt/v1', artifactDigests.host),
       runtimes: [meta('runtime-agent-one.json', 'mupot-fleet-runtime-receipt/v1', artifactDigests.runtime_inbox)],
       controls: [
@@ -455,8 +497,12 @@ function starterPaths(overrides = {}) {
   const runtime = overrides.runtime ?? runtimeReceipt('agent-one')
   const controlStart = overrides.controlStart ?? controlReceipt('agent-one', 'start')
   const controlStop = overrides.controlStop ?? controlReceipt('agent-one', 'stop')
+  const probeStart = overrides.probeStart ?? probeReceipt('pass', 'start')
+  const probeStop = overrides.probeStop ?? probeReceipt('pass', 'stop')
   writeFileSync(join(sourceDir, 'starter.example.json'), STARTER_MANIFEST)
   const evidencePaths = {
+    probe_start: writeJson(join(sourceDir, 'probe-start.json'), probeStart),
+    probe_stop: writeJson(join(sourceDir, 'probe-stop.json'), probeStop),
     install: writeJson(join(sourceDir, 'install.json'), install),
     service: writeJson(join(sourceDir, 'service.json'), service),
     host: writeJson(join(sourceDir, 'host.json'), host),
@@ -472,7 +518,7 @@ function starterPaths(overrides = {}) {
   const starter = overrides.starter ?? starterReceipt('pass', artifactDigests)
   return {
     sourceDir,
-    evidence: { install, service, host, continuous, runtime, controlStart, controlStop, priorManifest, starter },
+    evidence: { probeStart, probeStop, install, service, host, continuous, runtime, controlStart, controlStop, priorManifest, starter },
     serviceReceiptPath: evidencePaths.service,
     continuousReceiptPath: evidencePaths.continuous,
     starterReceiptPath: writeJson(join(sourceDir, 'starter.json'), starter),
@@ -620,7 +666,8 @@ async function actualProducerStarterPaths(manager) {
 function seedStarterEvidence(outDir, sources) {
   const evidence = sources.evidence
   writeJson(join(outDir, 'install.json'), evidence.install)
-  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
+  writeJson(join(outDir, 'probe-start.json'), evidence.probeStart)
+  writeJson(join(outDir, 'probe-stop.json'), evidence.probeStop)
   writeJson(join(outDir, 'host.json'), evidence.host)
   writeJson(join(outDir, 'runtime-agent-one.json'), evidence.runtime)
   writeJson(join(outDir, 'control-start.json'), evidence.controlStart)
@@ -870,6 +917,51 @@ test('starter-ready bundle requires, exports, and summarizes service continuity 
   }
   assert.deepEqual(absoluteStrings(copiedCheck), [])
   assert.deepEqual(absoluteStrings(inspectBundleStatus({ outDir: exportDir })), [])
+})
+
+test('starter-ready accepts daemon-state lifecycle receipts and binds them to the running control service', async () => {
+  const outDir = tmpDir()
+  const sources = starterPaths({
+    controlStart: stateControlReceipt('agent-one', 'start'),
+    controlStop: stateControlReceipt('agent-one', 'stop'),
+  })
+  seedStarterEvidence(outDir, sources)
+
+  const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...sources })
+  assert.equal(bundle.status, 'pass', JSON.stringify(bundle.checks.filter((check) => check.ok === false), null, 2))
+
+  const badOutDir = tmpDir()
+  const mismatched = starterPaths({
+    controlStart: stateControlReceipt('agent-one', 'start', 999),
+    controlStop: stateControlReceipt('agent-one', 'stop'),
+  })
+  seedStarterEvidence(badOutDir, mismatched)
+  const failed = await buildBundle({ outDir: badOutDir, agents: ['agent-one'], verifyOnly: true, ...mismatched })
+  assert.equal(failed.status, 'fail')
+
+  const forgedProbe = probeReceipt('pass', 'start')
+  forgedProbe.actions.find((action) => action.kind === 'control_request').nonce = 'forged-start-nonce'
+  const forgedOutDir = tmpDir()
+  const forgedSources = starterPaths({
+    probeStart: forgedProbe,
+    controlStart: stateControlReceipt('agent-one', 'start'),
+    controlStop: stateControlReceipt('agent-one', 'stop'),
+  })
+  seedStarterEvidence(forgedOutDir, forgedSources)
+  for (const name of ['starter.example.json', 'service.json', 'continuous.json', 'prior-bundle-manifest.json']) {
+    copyFileSync(join(forgedSources.sourceDir, name), join(forgedOutDir, name))
+  }
+  for (const definition of forgedSources.evidence.service.definitions) {
+    copyFileSync(definition.path, join(forgedOutDir, basename(definition.path)))
+  }
+  assert.throws(() => verifyStarterBundle({
+    bundleDir: forgedOutDir,
+    artifacts: {
+      install: 'install.json', service: 'service.json', host: 'host.json', continuous: 'continuous.json',
+      runtime_inbox: 'runtime-agent-one.json', lifecycle_control_start: 'control-start.json',
+      lifecycle_control_stop: 'control-stop.json', receipt_bundle_manifest: 'prior-bundle-manifest.json',
+    },
+  }), /contracts|cross-bindings/i)
 })
 
 test('starter verifier shares the starter-ready deep evidence contract and CLI manifest default', async () => {
@@ -1233,6 +1325,15 @@ test('starter-ready enforces PID, identity, cadence, counter, outcome, and prior
     ['runtime targets another agent', 'runtime_inbox', (sources) => { sources.evidence.runtime.target.agents = ['other-agent']; sources.evidence.runtime.inputs.selected_agents = ['other-agent']; sources.evidence.runtime.agents[0].agent = 'other-agent' }],
     ['start control targets another agent', 'lifecycle_control_start', (sources) => { sources.evidence.controlStart.target.executed_agents = ['other-agent']; sources.evidence.controlStart.poll.request.agent_id = 'other-agent'; sources.evidence.controlStart.checks.at(-1).agent_id = 'other-agent' }],
     ['prior bundle reports fail', 'receipt_bundle_manifest', (sources) => { sources.evidence.priorManifest.status = 'fail'; sources.evidence.priorManifest.summary = { status: 'fail', passed: 0, failed: 1, warnings: 0 }; sources.evidence.priorManifest.checks[0].ok = false }],
+    ['prior bundle duplicates a recognized optional check', 'receipt_bundle_manifest', (sources) => {
+      const duplicate = { ok: true, component: 'receipt-bundle', check: 'out_dir_ready', path: '.' }
+      sources.evidence.priorManifest.checks.push(duplicate, { ...duplicate })
+      sources.evidence.priorManifest.summary = summarizeFixture(sources.evidence.priorManifest.checks)
+    }],
+    ['prior bundle duplicates a recognized required check', 'receipt_bundle_manifest', (sources) => {
+      sources.evidence.priorManifest.checks.push({ ...sources.evidence.priorManifest.checks.find((check) => check.check === 'selected_agents_present') })
+      sources.evidence.priorManifest.summary = summarizeFixture(sources.evidence.priorManifest.checks)
+    }],
   ]
 
   for (const [name, role, mutate] of cases) {
@@ -1435,6 +1536,52 @@ test('receipt bundle can reuse existing host, runtime, and control receipts', as
   assert.ok(bundle.checks.some((c) => c.check === 'host_receipt_reused' && c.ok === true))
   assert.ok(bundle.checks.some((c) => c.check === 'runtime_receipts_reused' && c.ok === true))
   assert.ok(bundle.checks.some((c) => c.check === 'control_receipts_reused' && c.ok === true))
+})
+
+function seedStateObservedCutoverEvidence(outDir, overrides = {}) {
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt('pass', 'start'))
+  writeJson(join(outDir, 'probe-stop.json'), probeReceipt('pass', 'stop'))
+  writeJson(join(outDir, 'host.json'), serviceAwareHostReceipt())
+  writeJson(join(outDir, 'runtime-agent-one.json'), runtimeReceipt('agent-one'))
+  writeJson(join(outDir, 'control-start.json'), overrides.start ?? stateControlReceipt('agent-one', 'start'))
+  writeJson(join(outDir, 'control-stop.json'), overrides.stop ?? stateControlReceipt('agent-one', 'stop'))
+}
+
+test('generic Host-Go rejects daemon-state control evidence from another service PID', async () => {
+  const outDir = tmpDir()
+  seedStateObservedCutoverEvidence(outDir, { start: stateControlReceipt('agent-one', 'start', 999) })
+
+  const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
+
+  assert.equal(bundle.status, 'fail')
+  assert.equal(bundle.artifacts.cutover_gate.status, 'fail')
+  assert.ok(bundle.checks.some((check) => check.check === 'control_observed_service_pid_match' && check.ok === false))
+})
+
+test('generic Host-Go rejects daemon-state control evidence that predates its admitted probe', async () => {
+  const outDir = tmpDir()
+  seedStateObservedCutoverEvidence(outDir, {
+    start: stateControlReceipt('agent-one', 'start', 102, { observedAt: '2026-07-08T00:00:20.000Z' }),
+  })
+
+  const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
+
+  assert.equal(bundle.status, 'fail')
+  assert.equal(bundle.artifacts.cutover_gate.status, 'fail')
+  assert.ok(bundle.checks.some((check) => check.check === 'control_evidence_contract_valid' && check.ok === false))
+})
+
+test('generic Host-Go recomputes daemon-state request binding from admitted probe bytes', async () => {
+  const outDir = tmpDir()
+  seedStateObservedCutoverEvidence(outDir, {
+    start: stateControlReceipt('agent-one', 'start', 102, { requestRef: 'a'.repeat(64) }),
+  })
+
+  const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true })
+
+  assert.equal(bundle.status, 'fail')
+  assert.equal(bundle.artifacts.cutover_gate.status, 'fail')
+  assert.ok(bundle.checks.some((check) => check.check === 'control_probe_binding_valid' && check.ok === false))
 })
 
 test('receipt bundle fails when reused host receipt lacks public-only panel key evidence', async () => {
@@ -3014,8 +3161,11 @@ test('formatHostGoPlan prints the full #274 live-host command sequence without t
   assert.ok(plan.includes('node ~/.fleet/runtime/receipt-bundle.mjs --agent agent-one --out-dir ~/.fleet/receipts/agent-one --require-control-verb start,stop --install-receipt ~/.fleet/receipts/install.json --skip-runtime --skip-control'))
   assert.ok(plan.includes('# Requires MUPOT_AGENT_TOKEN and MUPOT_OWNER_TOKEN in the environment.'))
   assert.ok(plan.includes('node ~/.fleet/runtime/cutover-probe.mjs --base-url https://pot.example.org --agent agent-one --queue-inbox --control start > ~/.fleet/receipts/agent-one/probe-start.json'))
+  assert.ok(plan.includes('node ~/.fleet/runtime/control-receipt.mjs --observe-state --probe-receipt ~/.fleet/receipts/agent-one/probe-start.json --verb start > ~/.fleet/receipts/agent-one/control-start.json'))
   assert.ok(plan.includes('# Requires MUPOT_OWNER_TOKEN in the environment.'))
   assert.ok(plan.includes('node ~/.fleet/runtime/cutover-probe.mjs --base-url https://pot.example.org --agent agent-one --control stop > ~/.fleet/receipts/agent-one/probe-stop.json'))
+  assert.ok(plan.includes('node ~/.fleet/runtime/control-receipt.mjs --observe-state --probe-receipt ~/.fleet/receipts/agent-one/probe-stop.json --verb stop > ~/.fleet/receipts/agent-one/control-stop.json'))
+  assert.doesNotMatch(plan, /--control-label/)
   assert.doesNotMatch(plan, /MUPOT_(?:AGENT|OWNER)_TOKEN=/)
   assert.ok(plan.includes('--verify-only'))
   assert.ok(plan.includes('--export-dir ~/.fleet/receipts/agent-one-attach --export'))

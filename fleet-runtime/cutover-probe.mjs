@@ -140,6 +140,7 @@ export async function buildReceipt(opts) {
   const fetchImpl = opts.fetchImpl ?? fetch
   const env = opts.env ?? process.env
   const now = opts.now ?? (() => new Date().toISOString())
+  const generatedAt = now()
   const requestIdBase = opts.requestId || `cutover-probe-${randomUUID()}`
   const normalized = normalizeBaseUrl(opts.baseUrl)
 
@@ -264,7 +265,7 @@ export async function buildReceipt(opts) {
   const summary = summarize(checks)
   return {
     receipt_type: 'mupot-fleet-cutover-probe/v1',
-    generated_at: now(),
+    generated_at: generatedAt,
     status: summary.status,
     summary,
     inputs: {

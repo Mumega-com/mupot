@@ -212,3 +212,27 @@ test('runControlCycle: publishes completed polls in order and survives state wri
   assert.equal(logs.at(-1).event, 'state_write_failed')
   assert.equal(logs.at(-1).state_path, '/tmp/control-state.json')
 })
+
+test('runControlCycle keeps correlated accepted evidence across later idle polls', async () => {
+  const cfg = validateConfig({ ...baseRaw(), state_file: '/tmp/control-state.json' })
+  const outcomes = [
+    { ok: true, action: 'open', request: { agent_id: 'agent-one', verb: 'start', nonce: 'nonce-123' } },
+    { ok: true, action: 'idle' },
+  ]
+  const writes = []
+  const state = { poll: 0 }
+  const options = {
+    pid: 456,
+    startedAt: '2026-07-13T12:00:00.000Z',
+    now: () => new Date('2026-07-13T12:01:00.000Z'),
+    pollOnce: async () => outcomes.shift(),
+    writeRuntimeState: (_path, published) => writes.push(published),
+  }
+
+  await runControlCycle(cfg, 'consumer-key', null, null, state, options)
+  await runControlCycle(cfg, 'consumer-key', null, null, state, options)
+
+  assert.equal(writes[1].last_outcome.result, 'idle')
+  assert.deepEqual(writes[1].last_accepted, writes[0].last_accepted)
+  assert.match(writes[1].last_accepted.request_ref, /^[a-f0-9]{64}$/)
+})
