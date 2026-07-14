@@ -195,6 +195,33 @@ test('uninstallLaunchd is idempotent and unlinks only known plist paths', async 
   assert.equal(calls.some((call) => call[1] === 'bootout'), false)
 })
 
+test('reloadLaunchd retries transient launchctl bootstrap error 5 with bounded delays', async () => {
+  const context = await fixtureContext()
+  const definitions = renderLaunchd(context)
+  await mkdir(context.definitionDir, { recursive: true })
+  for (const definition of definitions) await writeFile(definition.path, definition.content)
+  let heartbeatBootstraps = 0
+  const delays = []
+  const { runner } = recordingRunner({
+    print: () => ({ code: 0, stdout: 'service = {\n\tstate = running\n\tpid = 7\n}', stderr: '' }),
+    bootstrap: (argv) => {
+      if (!argv[3].endsWith(context.services[0].launchdLabel + '.plist')) return { code: 0, stdout: '', stderr: '' }
+      heartbeatBootstraps += 1
+      return heartbeatBootstraps < 3
+        ? { code: 5, stdout: '', stderr: 'Input/output error' }
+        : { code: 0, stdout: '', stderr: '' }
+    },
+  })
+
+  const result = await reloadLaunchd(context, runner, {
+    sleep: async (milliseconds) => { delays.push(milliseconds) },
+  })
+
+  assert.equal(result.ok, true)
+  assert.equal(heartbeatBootstraps, 3)
+  assert.deepEqual(delays, [250, 750])
+})
+
 test('reloadLaunchd restores prior definition bytes before retrying bootstrap after failure', async () => {
   const context = await fixtureContext()
   const definitions = renderLaunchd(context)
