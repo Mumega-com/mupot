@@ -33,6 +33,10 @@ import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import { checkAndReserve, recordTokens } from './meter'
 import { costMicroUsd } from './cost'
+import { detectContentIntent } from './content-intent'
+import type { ContentIntent } from './content-intent'
+import { getRegistered, kernelMintCtx } from '../departments/registry'
+import { CtxError } from '../departments/ctx'
 
 // Hard ceiling on a persisted result (chars). Keeps a runaway model answer from
 // bloating the row / GitHub mirror. ~16KB.
@@ -122,6 +126,19 @@ export async function runTaskExecution(
     return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
   }
   task = claimedTask
+
+  // ── Content-intent short-circuit (flight-1: task → gated content-write) ──
+  //
+  // A task whose title matches the "publish:" convention (detectContentIntent,
+  // ./content-intent.ts) is a content-write REQUEST, not a question — route it
+  // to the department kernel's gate.propose() instead of spending a model call
+  // on a freeform answer nobody reads. This runs BEFORE the meter reservation
+  // below: no model.chat happens on this path, so no token budget is spent and
+  // none should be reserved.
+  const contentIntent = detectContentIntent(task)
+  if (contentIntent) {
+    return finishContentProposal(env, task, agent, executionReceiptId, contentIntent, emit)
+  }
 
   // ── Rate-limit check (issue #4): enforce per-agent daily dispatch + token caps ──
   // Runs AFTER claiming the task (so status is never left as stale 'open') but
@@ -332,6 +349,166 @@ async function finishTask(
       status, result, completedAt, completedAt, Math.max(0, Math.round(costMicroUsd)),
       taskId, agentId, executionReceiptId,
     )
+    .run()
+  return dbResult.meta?.changes === 1
+}
+
+// ── content-intent proposal (flight-1) ────────────────────────────────────────
+//
+// The gate-owner capability namespace stamped on a content-publish task. Mirrors
+// LOOP_GATE_OWNER = 'gate:loops' in src/loops/gate.ts — owner/admin always see and
+// verdict every gate_owner (src/dashboard/approvals.ts isOwnerAdmin bypass); a
+// delegated non-admin reviewer would need an explicit gate_grants row for this
+// capability string, same mechanism as loop-gated tasks.
+export const CONTENT_GATE_OWNER = 'gate:content'
+
+// The department that owns the content-publish work-type today (WordpressChannel,
+// composed under GrowthModule alongside SeoChannel — src/departments/modules/growth.ts).
+// A single hardcoded department key is a deliberate flight-1 simplification: there is
+// exactly one department in this codebase that declares 'content-publish'.
+const CONTENT_DEPARTMENT_KEY = 'growth'
+
+/**
+ * Turn a detected content intent into a GATED department proposal and land the
+ * task at 'review' — never spends a model call, never writes past the gate.
+ *
+ * THE SEAM: ctx is minted with idGen: () => task.id, so ctx.gate.propose()'s
+ * internally-generated gateId (kernel.ts: `const gateId = idFn()`) equals this
+ * task's own id. That means the SAME `tasks` row IS the gate record that
+ * executor.execute()'s _hasApprovedVerdict (kernel.ts) reads via task_verdicts
+ * WHERE task_id = gateId — no new table, no new UI. The proposal shows at
+ * GET /approvals and is verdicted through the existing POST /api/tasks/:id/verdict
+ * exactly like any other gated task, with zero changes to either surface.
+ *
+ * Fail-closed: any propose-time error (department not registered, capability
+ * denied, undeclared work-type) lands the task 'blocked' with a clear reason —
+ * the same "never leave in_progress stuck" invariant runTaskExecution's model
+ * path already guarantees.
+ */
+async function finishContentProposal(
+  env: Env,
+  task: Task,
+  agent: Agent,
+  executionReceiptId: string,
+  intent: ContentIntent,
+  emit: (event: BusEvent) => Promise<void>,
+): Promise<ExecuteResult> {
+  const finishedAt = new Date().toISOString()
+
+  const module = getRegistered(CONTENT_DEPARTMENT_KEY)
+  if (!module) {
+    const note = capResult(
+      `content_proposal_failed: department '${CONTENT_DEPARTMENT_KEY}' is not registered — cannot propose a content-publish gate.`,
+    )
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt))) {
+      return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+    }
+    await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
+    return { ok: false, task_id: task.id, decided: '', task_status: 'blocked', error: 'department_not_registered' }
+  }
+
+  // This whole block (propose → transition-invariant check → claim-scoped write)
+  // is wrapped in ONE try/catch. finishContentProposal is called OUTSIDE
+  // runTaskExecution's own top-level try/catch (it runs before the meter
+  // reservation), so it must be self-contained: no exception may escape this
+  // function, or the task would be left stuck 'in_progress' — the exact bug
+  // class the model path's own try/catch (below, in runTaskExecution) exists
+  // to prevent.
+  try {
+    // capabilities: ['lead'] — the minimum WordpressChannel's 'content-publish'
+    // work-type requires (src/departments/channels/wordpress-channel.ts). The
+    // REAL human authority boundary is the /approvals verdict + the separate
+    // owner/admin-gated execute route (src/dashboard/index.ts) that follows —
+    // this capability is a structural floor inside the kernel, not the gate.
+    const ctx = kernelMintCtx(
+      { db: env.DB },
+      {
+        tenantId: env.TENANT_SLUG,
+        departmentKey: CONTENT_DEPARTMENT_KEY,
+        module,
+        capabilities: ['lead'],
+        idGen: () => task.id,
+      },
+    )
+    const proposal = await ctx.gate.propose({
+      action: 'content-publish',
+      payload: {
+        executor: intent.executor,
+        title: intent.title,
+        content: intent.content,
+        // Defence-in-depth: the Inkwell internal endpoint server-forces draft
+        // regardless (workers/inkwell-api/src/routes/internal-content.ts), but
+        // this proposal is explicit about it too — nothing here ever asks for
+        // 'published'.
+        status: 'draft',
+      },
+    })
+    const gateId = proposal.gateId
+
+    // gateId === task.id by construction (idGen above) — the propose call above
+    // cannot itself have changed task.status (it only touched
+    // department_proposals + the in-memory pending store), so the claim-scoped
+    // WHERE guard in finishContentProposalWrite still finds the row at
+    // 'in_progress'.
+    //
+    // Enforce the transition at the service write layer, same discipline as the
+    // model path below (in_progress → review is legal per the matrix regardless
+    // of this branch; this only guards against future misuse of this function).
+    const transitionErr = checkTransition('in_progress', 'review')
+    if (transitionErr) {
+      throw new Error('content_proposal_transition_invariant_violated: in_progress → review')
+    }
+
+    const note = capResult(
+      `Proposed content-publish ("${intent.title}") to ${intent.executor} — awaiting approval at /approvals.`,
+    )
+    if (!(await finishContentProposalWrite(env, gateId, agent.id, executionReceiptId, note, finishedAt))) {
+      return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+    }
+    await emitSafe(emit, executionEvent('task.review', env, agent, task, 'review'))
+    await rememberSafe(
+      (id, text, concepts) => createMemory(env).remember(id, text, concepts),
+      agent.id,
+      `Proposed content-publish "${intent.title}" (gate ${gateId}).`,
+    )
+    return { ok: true, task_id: task.id, decided: `content_proposed: ${intent.title}`, task_status: 'review' }
+  } catch (err) {
+    const reason = err instanceof CtxError ? err.code : 'propose_failed'
+    const msg = err instanceof Error ? err.message : 'propose_failed'
+    const note = capResult(`content_proposal_failed: ${msg}`)
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt))) {
+      return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
+    }
+    await emitSafe(emit, executionEvent('task.blocked', env, agent, task, 'blocked'))
+    return { ok: false, task_id: task.id, decided: '', task_status: 'blocked', error: reason }
+  }
+}
+
+// Claim-scoped write for the content-proposal path — structurally the same
+// optimistic-concurrency guard as finishTask, but ALSO stamps gate_owner
+// (a content-publish task typically starts ungated, gate_owner = null, since
+// the operator's IM/console/POST /api/tasks entry point creates it like any
+// other task; the gating decision is made HERE, at execution time, once the
+// title is known to be a "publish:" request) and forces status='review'
+// unconditionally rather than the model path's `task.gate_owner ? 'review' : 'done'`
+// ternary — a content proposal is ALWAYS gated, never auto-'done'.
+// COALESCE preserves an operator-set gate_owner (e.g. a delegated reviewer
+// capability) if one was already present on the row.
+async function finishContentProposalWrite(
+  env: Env,
+  taskId: string,
+  agentId: string,
+  executionReceiptId: string,
+  result: string,
+  completedAt: string,
+): Promise<boolean> {
+  const dbResult = await env.DB.prepare(
+    `UPDATE tasks
+        SET status = 'review', result = ?, completed_at = ?, updated_at = ?,
+            gate_owner = COALESCE(gate_owner, ?), execution_claim_expires_at = NULL
+      WHERE id = ? AND assignee_agent_id = ? AND execution_receipt_id = ? AND status = 'in_progress'`,
+  )
+    .bind(result, completedAt, completedAt, CONTENT_GATE_OWNER, taskId, agentId, executionReceiptId)
     .run()
   return dbResult.meta?.changes === 1
 }
