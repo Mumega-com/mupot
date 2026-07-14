@@ -66,6 +66,7 @@ import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
 import { loadApprovals, resultPreview } from './approvals'
 import { loadLoopsView, loopsBody } from './loops'
 import { loadEconomy, economyBody } from './economy'
+import { loadDeployment, deploymentBody } from './deployment'
 import { loadVerifications, verificationsBody } from './verifications'
 import { loadAudit, auditBody } from './audit'
 import { loadBilling, billingBody } from './billing'
@@ -233,6 +234,21 @@ dashboardApp.get('/ops', async (c) => {
   }
   const data = await loadOpsHealth(c.env)
   return c.html(shell(c.env.BRAND, 'Operations', opsHealthBody(data)))
+})
+
+// ── deployment (SOVEREIGNTY: the pot's actual live deployment identity) ──────
+// GET /deployment — replaces the old mislabeled "Deployment" nav item that used
+// to point at /setup (the first-run onboarding wizard). Read-only: version,
+// RELEASE_SHA/commit, tenant, and liveness straight from the same publicHealth()
+// GET /health uses, plus honest (non-clickable) redeploy guidance. Owner/admin
+// only, like the other SOVEREIGNTY pages (/admin/keys, /ops).
+dashboardApp.get('/deployment', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(shell(c.env.BRAND, 'Deployment', errorBody('Deployment requires owner or admin.')), 403)
+  }
+  const data = await loadDeployment(c.env)
+  return c.html(shell(c.env.BRAND, 'Deployment', deploymentBody(data)))
 })
 
 // ── loops (watch goal-seeking work-units + the outreach funnel) ──────────────
@@ -2649,8 +2665,8 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
           <!-- SOVEREIGNTY section label -->
           <div class="nav-sovereignty-label">SOVEREIGNTY</div>
 
-          <!-- Deployment -->
-          <a class="nav-link" href="/setup">
+          <!-- Deployment (live deployment identity — NOT the setup wizard; see /deployment) -->
+          <a class="nav-link" href="/deployment">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" width="17" height="17"><rect x="3.5" y="4" width="13" height="5" rx="1.3"/><rect x="3.5" y="11" width="13" height="5" rx="1.3"/><circle cx="6.6" cy="6.5" r=".8" fill="currentColor" stroke="none"/><circle cx="6.6" cy="13.5" r=".8" fill="currentColor" stroke="none"/></svg>
             <span class="nav-label">Deployment</span>
           </a>
