@@ -1946,9 +1946,9 @@ function exportSidecarSchemaExact(receipt, file) {
 
 function manifestCheckSidecarSemanticsExact(receipt, expected) {
   if (!receipt || !expected) return false
-  const actualComparable = { ...portableKnownPathProjection(receipt), generated_at: null }
+  const actualComparable = { ...receipt, generated_at: null }
   const expectedComparable = { ...portableKnownPathProjection(expected), generated_at: null }
-  return JSON.stringify(actualComparable) === JSON.stringify(expectedComparable)
+  return isDeepStrictEqual(actualComparable, expectedComparable)
 }
 
 function expectedExportCopiedArtifacts(manifestDir, manifest) {
@@ -2829,7 +2829,11 @@ function buildPortableProjectionRecords(items) {
       }
     }
     if (source.receipt_type === EXPECTED.install) {
-      for (const definition of content.outputs?.service_definitions ?? []) {
+      const projectedDefinitions = [
+        ...(content.outputs?.service_definitions ?? []),
+        ...(content.activation?.definitions ?? []),
+      ]
+      for (const definition of projectedDefinitions) {
         const support = records.get(`service_definition_${definition.service}`)
         if (support) {
           definition.path = basename(support.item.path)
@@ -3821,7 +3825,7 @@ function includeStarterReceipt(outDir, opts, checks, roleSpec) {
     if (!digestOk) return false
     const destinationExists = existsSync(supportDest)
     try {
-      ensureContainedParent(outDir, supportDest, { repair: opts.force || !destinationExists })
+      ensureContainedParent(outDir, supportDest, { repair: Boolean(opts.force) })
     } catch (err) {
       checks.push({ ok: false, component: 'receipt-bundle', check: `${label}_${destinationExists ? 'reused' : 'copied'}`, source: supportSource, path: supportDest, reason: String(err?.message ?? err) })
       return false

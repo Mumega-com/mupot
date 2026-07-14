@@ -870,6 +870,31 @@ test('starter-ready bundle requires, exports, and summarizes service continuity 
   assert.deepEqual(absoluteStrings(inspectBundleStatus({ outDir: exportDir })), [])
 })
 
+test('portable export preserves activated install evidence after source deletion', async () => {
+  const outDir = tmpDir()
+  const service = serviceReceipt()
+  const install = installReceipt('pass')
+  install.inputs.activation_requested = true
+  install.inputs.activation_performed = true
+  install.activation = structuredClone(service)
+  install.activation.action = 'install'
+  install.checks.push({ ok: true, component: 'fleet-install', check: 'service_activation', service_receipt: 'mupot-fleet-service-receipt/v1' })
+  install.summary = summarizeFixture(install.checks)
+  const sources = starterPaths({ service, install })
+  seedStarterEvidence(outDir, sources)
+
+  const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...sources })
+  assert.equal(bundle.status, 'pass', JSON.stringify(bundle.checks.filter((check) => check.ok === false), null, 2))
+  const exportDir = tmpDir()
+  const exported = exportBundle({ outDir, exportDir })
+  assert.equal(exported.status, 'pass', JSON.stringify(exported.checks.filter((check) => check.ok === false), null, 2))
+  rmSync(outDir, { recursive: true })
+  rmSync(sources.sourceDir, { recursive: true })
+
+  const copiedCheck = checkBundleManifest({ outDir: exportDir })
+  assert.equal(copiedCheck.status, 'pass', JSON.stringify(copiedCheck.checks.filter((check) => check.ok === false), null, 2))
+})
+
 test('starter-ready consumes actual systemd and launchd Host-Go producer receipts', async (t) => {
   for (const manager of ['systemd', 'launchd']) {
     await t.test(manager, async () => {
@@ -2066,6 +2091,19 @@ test('bundle and export permissions are repaired and permissive drift fails veri
 })
 
 test('starter packaging creates safe nested parents and force repairs reused support files', async (t) => {
+  await t.test('non-force rejects a permissive existing parent without mutation', async () => {
+    const outDir = tmpDir()
+    const sources = nestStarterSources(starterPaths())
+    seedStarterEvidence(outDir, sources)
+    mkdirSync(join(outDir, 'evidence'), { mode: 0o755 })
+    chmodSync(join(outDir, 'evidence'), 0o755)
+
+    const bundle = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, ...sources })
+    assert.equal(bundle.status, 'fail')
+    assert.equal(statSync(join(outDir, 'evidence')).mode & 0o777, 0o755)
+    assert.equal(existsSync(join(outDir, 'evidence', 'install.json')), false)
+  })
+
   await t.test('nested relative support paths', async () => {
     const outDir = tmpDir()
     const sources = nestStarterSources(starterPaths())
@@ -2253,6 +2291,15 @@ test('recursive artifact and sidecar schemas reject unknown nested fields', asyn
     const substitutedManifestCheck = JSON.parse(readFileSync(checkPath, 'utf8'))
     substitutedManifestCheck.checks[0] = { ...substitutedManifestCheck.checks[1] }
     writeJson(checkPath, substitutedManifestCheck)
+    check = checkBundleManifest({ outDir: exportDir })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) => entry.check === 'export_sidecar_semantics_complete' && entry.sidecar === 'manifest-check.json' && entry.ok === false))
+
+    assert.equal(exportBundle({ outDir, exportDir, force: true }).status, 'pass')
+    const traversingManifestCheck = JSON.parse(readFileSync(checkPath, 'utf8'))
+    const manifestPathCheck = traversingManifestCheck.checks.find((entry) => entry.path === 'manifest.json')
+    manifestPathCheck.path = '../manifest.json'
+    writeJson(checkPath, traversingManifestCheck)
     check = checkBundleManifest({ outDir: exportDir })
     assert.equal(check.status, 'fail')
     assert.ok(check.checks.some((entry) => entry.check === 'export_sidecar_semantics_complete' && entry.sidecar === 'manifest-check.json' && entry.ok === false))

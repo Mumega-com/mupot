@@ -473,3 +473,49 @@ receipt metadata to support files invalidates the evidence.
 
 No blocking concern. Structural equality treats JSON object key order as
 irrelevant while preserving exact array order and exact object fields.
+
+---
+
+## Task 7 Fourth Cumulative-Review Remediation
+
+### Result
+
+Portable projection now rewrites activated install definitions together with
+installer outputs and rendered-definition checks, so activated evidence remains
+valid after export and deletion of both source trees. Existing nested parent
+directories are never permission-repaired without `--force`; normal packaging
+may create missing `0700` parents but rejects permissive retained parents
+without mutation.
+
+Manifest-check sidecar verification projects only the independently generated
+expected receipt. The stored receipt is compared verbatim, so traversal paths
+cannot be hidden by basename normalization. Host-Go definition evidence now
+uses one `O_NOFOLLOW` descriptor and confirms containment plus device/inode
+identity before reading from that descriptor.
+
+### Verification
+
+- `node --test fleet-runtime/starter-contract.test.mjs fleet-runtime/host-receipt.test.mjs fleet-runtime/receipt-bundle.test.mjs`
+  - 163 passed, 0 failed.
+- `node --test fleet-runtime/*.test.mjs`
+  - 442 passed, 0 failed.
+- `npm test`
+  - 168 files passed; 2703 tests passed.
+- `npm run typecheck`
+  - Passed with no TypeScript errors.
+- `git diff --check`
+  - Passed with no whitespace errors.
+
+### Review Findings Closed
+
+- Activated install receipts survive portable export and source deletion.
+- Non-force packaging rejects a retained `0755` parent without chmod or copy.
+- A canonical manifest-check path changed to `../manifest.json` is rejected.
+- Replacing a definition pathname after descriptor open invalidates Host-Go
+  service evidence.
+
+### Concerns
+
+No blocking concern. The dependency injection used by the deterministic race
+regression is limited to definition-read filesystem operations; production
+defaults remain Node's no-follow descriptor APIs.

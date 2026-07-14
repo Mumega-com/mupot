@@ -8,7 +8,7 @@
 // receipt operators can attach to a cutover record.
 
 import { createHash } from 'node:crypto'
-import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { validateConfig as validateDaemonConfig, runProbe } from './fleet-daemon.mjs'
@@ -544,7 +544,37 @@ function parseSystemdArguments(content) {
   return values.length > 0 ? values : null
 }
 
-function definitionEvidence(context, serviceReceipt, configPaths) {
+function readContainedDefinition(path, definitionRoot, deps = {}) {
+  if (definitionRoot === null) return null
+  const open = deps.openSync ?? openSync
+  const close = deps.closeSync ?? closeSync
+  const fstat = deps.fstatSync ?? fstatSync
+  const lstat = deps.lstatSync ?? lstatSync
+  const realpath = deps.realpathSync ?? realpathSync
+  const stat = deps.statSync ?? statSync
+  const read = deps.readFileSync ?? readFileSync
+  let fd = null
+  try {
+    fd = open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+    const opened = fstat(fd)
+    const named = lstat(path)
+    if (!opened.isFile() || named.isSymbolicLink() || !named.isFile() || opened.dev !== named.dev || opened.ino !== named.ino) return null
+    const realPath = realpath(path)
+    const fromRoot = relative(definitionRoot, realPath)
+    if (fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) return null
+    const confirmed = stat(path)
+    if (!confirmed.isFile() || opened.dev !== confirmed.dev || opened.ino !== confirmed.ino) return null
+    return read(fd, 'utf8')
+  } catch {
+    return null
+  } finally {
+    if (fd !== null) {
+      try { close(fd) } catch {}
+    }
+  }
+}
+
+function definitionEvidence(context, serviceReceipt, configPaths, readDeps = {}) {
   const definitions = Array.isArray(serviceReceipt?.definitions) ? serviceReceipt.definitions : []
   const uniqueDefinitions = new Map(definitions.map((definition) => [definition?.service, definition]))
   const rendered = (context.manager === 'launchd' ? renderLaunchd(context) : renderSystemd(context))
@@ -559,18 +589,8 @@ function definitionEvidence(context, serviceReceipt, configPaths) {
   const evidence = context.services.map((service) => {
     const definition = uniqueDefinitions.get(service.key)
     const current = renderedByKey.get(service.key)
-    let content = null
-    let regularContainedFile = false
-    try {
-      const fileStat = lstatSync(service.definitionPath)
-      const realPath = realpathSync(service.definitionPath)
-      const fromRoot = definitionRoot === null ? '..' : relative(definitionRoot, realPath)
-      regularContainedFile = !fileStat.isSymbolicLink() && fileStat.isFile() &&
-        fromRoot !== '..' && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot)
-      if (regularContainedFile) content = readFileSync(service.definitionPath, 'utf8')
-    } catch {
-      // The evidence below records the definition as unreadable.
-    }
+    const content = readContainedDefinition(service.definitionPath, definitionRoot, readDeps)
+    const regularContainedFile = content !== null
     const actualSha256 = content === null ? null : sha256(content)
     const renderedSha256 = current ? sha256(current.content) : null
     const argv = content === null
@@ -701,7 +721,7 @@ async function collectServiceChecks(opts, checks) {
   const definitions = definitionEvidence(context, serviceReceipt, {
     heartbeat: resolve(opts.daemonPath),
     control: resolve(opts.controlPath),
-  })
+  }, opts.definitionReadDeps)
   const heartbeat = serviceStateEvidence(context, serviceReceipt, 'heartbeat')
   const control = serviceStateEvidence(context, serviceReceipt, 'control')
   const lingerOk = manager === 'systemd'

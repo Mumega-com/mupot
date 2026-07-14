@@ -3,7 +3,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, mkdirSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -311,6 +311,32 @@ test('host service proof rejects symlinked definition files and directories', as
     assert.equal(receipt.status, 'fail')
     assert.equal(receipt.checks.find((check) => check.check === 'service_definitions_current').ok, false)
   })
+})
+
+test('host service proof rejects a definition path replaced after descriptor open', async () => {
+  const f = serviceFixture()
+  const target = f.receipt.definitions[0].path
+  const external = join(tmp(), 'replacement.service')
+  writeFileSync(external, readFileSync(target))
+  let replaced = false
+
+  const receipt = await buildReceipt(requiredServiceOptions(f, {
+    definitionReadDeps: {
+      openSync(path, flags) {
+        const fd = openSync(path, flags)
+        if (!replaced && path === target) {
+          rmSync(path)
+          symlinkSync(external, path)
+          replaced = true
+        }
+        return fd
+      },
+    },
+  }))
+
+  assert.equal(replaced, true)
+  assert.equal(receipt.status, 'fail')
+  assert.equal(receipt.checks.find((check) => check.check === 'service_definitions_current').ok, false)
 })
 
 test('host service proof rejects semantic renderer drift even when argv and receipt hashes match disk', async () => {
