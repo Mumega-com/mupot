@@ -152,6 +152,8 @@ export function renderStarterPlan(rawManifest, opts = {}) {
     '',
     '2. edit ~/.fleet/daemon.json, ~/.fleet/inbox-handler.json, ~/.fleet/control.json, and ~/.fleet/flights.json for this tenant and only the selected host agents.',
     commandLine(['node', 'fleet-runtime/trust-bootstrap.mjs', '--base-url', manifest.base_url]),
+    'Re-run the non-destructive installer after editing the templates so install.json records a passing configured layout:',
+    commandLine(['node', 'fleet-runtime/install.mjs', '--service-manager', manager], ' > ~/.fleet/receipts/install.json'),
     '',
     '3. Activate user services and collect current service status:',
     commandLine(['node', 'fleet-runtime/service-manager.mjs', 'install', '--service-manager', manager]),

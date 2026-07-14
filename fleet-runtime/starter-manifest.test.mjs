@@ -124,6 +124,12 @@ test('starter plan covers the credential-free install, proof, export, rollback, 
   assert.doesNotMatch(plan, /Bearer\s+[A-Za-z0-9._-]{12,}/i)
   assert.doesNotMatch(plan, /-----BEGIN [A-Z ]*PRIVATE KEY-----/)
   assert.doesNotMatch(plan, /mupot_[A-Za-z0-9._-]{12,}/)
+
+  const installReceiptCommand = 'node fleet-runtime/install.mjs --service-manager auto > ~/.fleet/receipts/install.json'
+  assert.notEqual(plan.indexOf(installReceiptCommand), plan.lastIndexOf(installReceiptCommand))
+  assert.ok(plan.indexOf('edit ~/.fleet/daemon.json') < plan.lastIndexOf(installReceiptCommand))
+  assert.ok(plan.indexOf('fleet-runtime/trust-bootstrap.mjs') < plan.lastIndexOf(installReceiptCommand))
+  assert.ok(plan.lastIndexOf(installReceiptCommand) < plan.indexOf('fleet-runtime/service-manager.mjs install'))
 })
 
 test('starter plan shell-quotes manifest-derived URL values', () => {
