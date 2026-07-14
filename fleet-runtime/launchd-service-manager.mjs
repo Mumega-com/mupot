@@ -2,6 +2,11 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { MINIMAL_SERVICE_PATH, definitionSha256 } from './service-context.mjs'
 let temporaryFileNumber = 0
+const BOOTSTRAP_RETRY_DELAYS_MS = Object.freeze([250, 750, 1500])
+
+function defaultSleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
 
 function xml(value) {
   return String(value)
@@ -45,14 +50,25 @@ async function restoreDefinition(path, previous) {
   await atomicWrite(path, previous.content)
 }
 
-async function bootstrapPriorLoaded(context, indexes, previous, runner) {
+async function bootstrapService(context, service, runner, options = {}) {
+  const sleep = options.sleep ?? defaultSleep
+  let response = await runner(['launchctl', 'bootstrap', context.domain, service.definitionPath])
+  for (const delay of BOOTSTRAP_RETRY_DELAYS_MS) {
+    if (response.code !== 5) break
+    await sleep(delay)
+    response = await runner(['launchctl', 'bootstrap', context.domain, service.definitionPath])
+  }
+  return response
+}
+
+async function bootstrapPriorLoaded(context, indexes, previous, runner, options = {}) {
   const recovered = new Map()
   for (const index of indexes) {
     if (previous[index].content === null) {
       recovered.set(index, false)
       continue
     }
-    const response = await runner(['launchctl', 'bootstrap', context.domain, context.services[index].definitionPath])
+    const response = await bootstrapService(context, context.services[index], runner, options)
     recovered.set(index, response.code === 0)
   }
   return recovered
@@ -149,7 +165,7 @@ export async function statusLaunchd(context, runner) {
   return states
 }
 
-export async function installLaunchd(context, runner) {
+export async function installLaunchd(context, runner, options = {}) {
   const definitions = renderLaunchd(context)
   for (const definition of definitions) await atomicWrite(definition.path, definition.content)
 
@@ -165,7 +181,7 @@ export async function installLaunchd(context, runner) {
       })
       continue
     }
-    const response = await runner(['launchctl', 'bootstrap', context.domain, service.definitionPath])
+    const response = await bootstrapService(context, service, runner, options)
     services.push({
       ...status,
       definitionSha256: definitionSha256(definitions[index].content),
@@ -176,7 +192,7 @@ export async function installLaunchd(context, runner) {
   return { ok: services.every((service) => service.bootstrapped !== false), services }
 }
 
-export async function reloadLaunchd(context, runner) {
+export async function reloadLaunchd(context, runner, options = {}) {
   const definitions = renderLaunchd(context)
   const previous = await Promise.all(definitions.map((definition) => readDefinition(definition.path)))
   const statuses = await statusLaunchd(context, runner)
@@ -198,7 +214,7 @@ export async function reloadLaunchd(context, runner) {
     if (!statuses[index].loaded) continue
     const response = await runner(['launchctl', 'bootout', launchctlTarget(context, service)])
     if (response.code !== 0) {
-      const recovered = await bootstrapPriorLoaded(context, previouslyLoaded, previous, runner)
+      const recovered = await bootstrapPriorLoaded(context, previouslyLoaded, previous, runner, options)
       services.push(...statuses.map((status, statusIndex) => ({
         ...status,
         definitionSha256: previous[statusIndex].sha256,
@@ -215,7 +231,7 @@ export async function reloadLaunchd(context, runner) {
 
   const newlyBootstrapped = []
   for (const [index, service] of context.services.entries()) {
-    const response = await runner(['launchctl', 'bootstrap', context.domain, service.definitionPath])
+    const response = await bootstrapService(context, service, runner, options)
     if (response.code === 0) {
       newlyBootstrapped.push(index)
       services.push({ ...statuses[index], bootstrapped: true, definitionSha256: definitionSha256(definitions[index].content) })
@@ -224,7 +240,7 @@ export async function reloadLaunchd(context, runner) {
 
     await bootoutServices(context, [...new Set([...newlyBootstrapped, index])], runner)
     await Promise.all(definitions.map((definition, definitionIndex) => restoreDefinition(definition.path, previous[definitionIndex])))
-    const recovered = await bootstrapPriorLoaded(context, previouslyLoaded, previous, runner)
+    const recovered = await bootstrapPriorLoaded(context, previouslyLoaded, previous, runner, options)
     return {
       ok: false,
       services: statuses.map((status, statusIndex) => ({
