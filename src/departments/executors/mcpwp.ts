@@ -145,11 +145,32 @@ export async function wpContentWrite(
         authorization: authHeader,
       },
       body: JSON.stringify(body),
+      // SSRF defense-in-depth (LOW-1, adversarial gate): assertSafeSiteUrl only
+      // validates siteUrl at PARSE time. Without redirect:'manual', a default
+      // 'follow' fetch would silently chase a 3xx from cfg.siteUrl to an
+      // arbitrary Location — including an internal host — and this function would
+      // never see it (it only inspects the FINAL response). redirect:'manual'
+      // stops at the first hop so the check below can refuse it outright.
+      redirect: 'manual',
     })
   } catch {
     // Do not interpolate the raw error — it may echo the request (incl. auth header
     // in some fetch implementations' error strings). Stable, leak-safe reason only.
     throw new WpExecutorError('mcpwp_unreachable', 'fetch to WordPress site failed')
+  }
+
+  // Refuse any redirect outright — never follow. Covers both the explicit 3xx-status
+  // shape (what Cloudflare Workers' fetch actually returns for redirect:'manual') and
+  // the browser-style opaqueredirect shape (status 0, type 'opaqueredirect'), so this
+  // holds regardless of runtime. No Location is ever read or logged — we don't need
+  // it to refuse.
+  // `as string`: @cloudflare/workers-types narrows Response.type to "default"|"error"
+  // (Workers' redirect:'manual' never produces an opaque redirect — it returns the
+  // real 3xx), but this file also runs under vitest/undici in tests, where a mocked
+  // Response can carry 'opaqueredirect'. Widen the comparison rather than the type.
+  const resType = res.type as string
+  if (resType === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
+    throw new WpExecutorError('mcpwp_redirect_blocked', 'refusing to follow a redirect from siteUrl')
   }
 
   if (!res.ok) {

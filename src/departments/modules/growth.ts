@@ -32,6 +32,7 @@ import type { DepartmentModule } from '../contract'
 import { register } from '../registry'
 import { OutboundChannel } from '../channels/outbound-channel'
 import { SeoChannel } from '../channels/seo-channel'
+import { WordpressChannel } from '../channels/wordpress-channel'
 
 export const GrowthModule: DepartmentModule = {
   key: 'growth',
@@ -114,7 +115,15 @@ export const GrowthModule: DepartmentModule = {
   // S3: SeoChannel adds 5 SEO/AEO metric descriptors + 4 gated work-types.
   // The SEO collector (seo-collector.ts) emits from 'first-party' source (pot's
   // own pulse spine). PostHog and GSC connectors are declared as intent (not live).
-  channels: [OutboundChannel, SeoChannel],
+  //
+  // #370: WordpressChannel adds ZERO metrics (it is a publish surface, not an
+  // analytics source — metricDescriptors: []) and ONE executable work-type
+  // ('content-publish'), making WordPress a selectable content-publish surface for
+  // Growth — the department that already owns SEO/content publishing via SeoChannel's
+  // executor selection. No metric-key or work-type-key collision with
+  // OutboundChannel/SeoChannel (composeDeptMetricDescriptors / getChannelWorkTypes
+  // fail closed on any duplicate — verified by the full suite staying green).
+  channels: [OutboundChannel, SeoChannel, WordpressChannel],
 }
 
 // Auto-register when this module is imported.

@@ -100,6 +100,33 @@ describe('wpContentWrite — fail-closed', () => {
     expect(err).toBeInstanceOf(WpExecutorError)
   })
 
+  // ── SSRF defense-in-depth: refuse redirects, never follow (LOW-1) ──────────
+  it('301/302/307/308 from siteUrl → mcpwp_redirect_blocked, and fetchImpl was called with redirect:"manual"', async () => {
+    for (const status of [301, 302, 307, 308]) {
+      const f = vi.fn(async () => new Response(null, { status, headers: { location: 'http://169.254.169.254/' } })) as unknown as typeof fetch
+      await expect(wpContentWrite(cfg, payload, f)).rejects.toMatchObject({ reason: 'mcpwp_redirect_blocked' })
+      const call = (f as unknown as ReturnType<typeof vi.fn>).mock.calls[0]
+      expect((call[1] as RequestInit).redirect).toBe('manual')
+    }
+  })
+  it('browser-style opaqueredirect response → mcpwp_redirect_blocked', async () => {
+    const opaque = { type: 'opaqueredirect', status: 0, ok: false } as unknown as Response
+    const f = vi.fn(async () => opaque) as unknown as typeof fetch
+    await expect(wpContentWrite(cfg, payload, f)).rejects.toMatchObject({ reason: 'mcpwp_redirect_blocked' })
+  })
+  it('a redirect response never reaches the .json() success path (no follow)', async () => {
+    let jsonCalled = false
+    const f = vi.fn(async () => {
+      const r = new Response(null, { status: 302, headers: { location: 'https://internal.example/' } })
+      const origJson = r.json.bind(r)
+      r.json = async () => { jsonCalled = true; return origJson() }
+      return r
+    }) as unknown as typeof fetch
+    await expect(wpContentWrite(cfg, payload, f)).rejects.toMatchObject({ reason: 'mcpwp_redirect_blocked' })
+    expect(jsonCalled).toBe(false)
+    expect(f).toHaveBeenCalledOnce() // no second (followed) request was ever made
+  })
+
   // ── SSRF guard ────────────────────────────────────────────────────────────
   it.each([
     ['http://example.com', 'non-https'],
@@ -275,5 +302,50 @@ describe('execute() — mcpwp adapter dispatch', () => {
     expect(outcome.reason).toBe('executor_not_wired')
     expect(outcome.adapter).toBe('mcpwp')
     expect(spy).not.toHaveBeenCalled()
+  })
+})
+
+// ── C. WordpressChannel registration (#370 LOW-2) ──────────────────────────────
+//
+// Prior to this fix, WordpressChannel existed but was never attached to any
+// DepartmentModule.channels — 'content-publish' was NOT a declared work-type
+// anywhere, so every test above had to route through SeoChannel's 'seo-meta-fix'
+// as a workaround action. These tests prove the REAL 'content-publish' work-type
+// (WordpressChannel, now composed into GrowthModule.channels) is reachable
+// end-to-end through gate.propose → approve → execute, with no workaround.
+
+describe('WordpressChannel is registered on GrowthModule and reachable via its own work-type', () => {
+  it('GrowthModule.channels includes WordpressChannel', () => {
+    const keys = (GrowthModule.channels ?? []).map((c) => c.key)
+    expect(keys).toContain('wordpress')
+  })
+
+  it("gate.propose({action:'content-publish'}) succeeds (no longer work_type_not_declared)", async () => {
+    const db = makeStubDb()
+    const ctx = mintCtx({ db })
+    const { gateId } = await ctx.gate.propose({
+      action: 'content-publish',
+      payload: { executor: 'mcpwp', title: 'Real Work-Type', content: '<p>no workaround needed</p>' },
+    })
+    expect(gateId).toBeTruthy()
+  })
+
+  it('full propose → approve → execute via the REAL content-publish work-type, executed:true', async () => {
+    vi.stubGlobal('fetch', okFetch(99, 'https://example.com/?p=99'))
+    const db = makeStubDb()
+    const ctx = mintCtx({
+      db,
+      executorEnv: { mcpwp: { siteUrl: 'https://example.com', username: 'agent', appPassword: 'pw' } },
+    })
+    const { gateId } = await ctx.gate.propose({
+      action: 'content-publish',
+      payload: { executor: 'mcpwp', title: 'Real Work-Type', content: '<p>no workaround needed</p>' },
+    })
+    await approve(db, gateId)
+    const outcome = await ctx.executor.execute(gateId)
+    expect(outcome.executed).toBe(true)
+    expect(outcome.adapter).toBe('mcpwp')
+    expect(outcome.artifactUrl).toBe('https://example.com/?p=99')
+    vi.unstubAllGlobals()
   })
 })

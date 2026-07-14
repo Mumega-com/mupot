@@ -122,9 +122,29 @@ export async function inkwellContentWrite(
         authorization: `Bearer ${cfg.token}`,
       },
       body: JSON.stringify(internalBody),
+      // SSRF defense-in-depth (LOW-1, adversarial gate, mupot#370 delta): assertSafeInkwellUrl
+      // only validates apiUrl at PARSE time. Without redirect:'manual', a default 'follow'
+      // fetch would silently chase a 3xx from cfg.apiUrl to an arbitrary Location — including
+      // an internal host — and this function would never see it (it only inspects the FINAL
+      // response). redirect:'manual' stops at the first hop so the check below can refuse it.
+      redirect: 'manual',
     })
   } catch (e) {
     throw new InkwellExecutorError('inkwell_unreachable', String(e))
+  }
+
+  // Refuse any redirect outright — never follow. Covers both the explicit 3xx-status
+  // shape (what Cloudflare Workers' fetch actually returns for redirect:'manual') and
+  // the browser-style opaqueredirect shape (status 0, type 'opaqueredirect'), so this
+  // holds regardless of runtime. No Location is ever read or logged — we don't need
+  // it to refuse.
+  // `as string`: @cloudflare/workers-types narrows Response.type to "default"|"error"
+  // (Workers' redirect:'manual' never produces an opaque redirect — it returns the
+  // real 3xx), but this file also runs under vitest/undici in tests, where a mocked
+  // Response can carry 'opaqueredirect'. Widen the comparison rather than the type.
+  const resType = res.type as string
+  if (resType === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
+    throw new InkwellExecutorError('inkwell_redirect_blocked', 'refusing to follow a redirect from apiUrl')
   }
 
   if (!res.ok) {
