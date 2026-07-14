@@ -670,6 +670,22 @@ const toolTaskUpdate: ToolSpec = {
       if (!isPatchableStatus(args.status)) return fail(400, 'invalid_status')
       const transitionErr = checkTransition(existing.status, args.status)
       if (transitionErr) return fail(400, 'invalid_transition', transitionErr)
+      // GATE-EXIT GUARD (mirror of PATCH /api/tasks/:id): entering 'review'
+      // requires a gate_owner, else the task is a zombie with no legal exit
+      // (verdict 409s no_gate; review→open|in_progress is forbidden). Evaluate the
+      // EFFECTIVE gate_owner after applying args.gate_owner — pre-review the gate
+      // isn't locked, so it may be set in this same call.
+      if (args.status === 'review') {
+        const effectiveGateOwner =
+          args.gate_owner === undefined
+            ? existing.gate_owner
+            : typeof args.gate_owner === 'string' && args.gate_owner.trim().length > 0
+              ? args.gate_owner.trim()
+              : null
+        if (!effectiveGateOwner) {
+          return fail(409, 'gate_required_for_review', 'a task can only enter review with a gate_owner set')
+        }
+      }
       if (patchToDoneBypassesGate(existing.status, existing.gate_owner, args.status)) {
         return fail(409, 'gate_open', 'gated task must be approved via verdict before it can be marked done')
       }

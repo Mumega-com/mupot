@@ -301,6 +301,29 @@ describe('MCP task cutover tools', () => {
     expect(res.error).toBe('invalid_transition')
   })
 
+  it('task_update refuses in_progress → review with no gate_owner (would be a zombie)', async () => {
+    const { env, updates } = makeEnv([task({ status: 'in_progress', gate_owner: null })])
+    const res = await invokeTool(auth(), env, 'task_update', { task_id: 'task-1', status: 'review' }, 'https://pot.example')
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('gate_required_for_review')
+    expect(updates).toHaveLength(0)
+  })
+
+  it('task_update allows in_progress → review when gate_owner is set in the same call', async () => {
+    const { env } = makeEnv([task({ status: 'in_progress', gate_owner: null })])
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', status: 'review', gate_owner: 'gate:content' },
+      'https://pot.example',
+    )
+    expect(res.ok).toBe(true)
+    const result = res.result as { task: Task }
+    expect(result.task.status).toBe('review')
+    expect(result.task.gate_owner).toBe('gate:content')
+  })
+
   it('task_update records completion time when an approved task transitions to done', async () => {
     const { env, updates } = makeEnv([
       task({ status: 'approved', gate_owner: 'gate:m0-census' }),
