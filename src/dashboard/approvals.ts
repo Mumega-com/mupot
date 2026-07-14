@@ -27,6 +27,11 @@ export interface ApprovalItem {
   created_at: string
 }
 
+// The gate queue only lists tasks that CAN be verdicted. A review task with a
+// NULL gate_owner has no legal exit — the verdict endpoint 409s 'no_gate' and
+// the state machine forbids review→open/in_progress — so surfacing it with an
+// Approve button just hands the operator a 409. Filter it out at the source
+// (both the owner/admin path and the gate-grant path inherit this).
 const BASE_SELECT = `
   SELECT t.id, t.squad_id, s.name AS squad_name, t.title, t.body, t.gate_owner,
          t.assignee_agent_id, a.name AS agent_name, t.result, t.completed_at,
@@ -34,7 +39,8 @@ const BASE_SELECT = `
     FROM tasks t
     LEFT JOIN squads s ON s.id = t.squad_id
     LEFT JOIN agents a ON a.id = t.assignee_agent_id
-   WHERE t.status = 'review'`
+   WHERE t.status = 'review'
+     AND t.gate_owner IS NOT NULL`
 
 function isOwnerAdmin(auth: AuthContext): boolean {
   return auth.role === 'owner' || auth.role === 'admin'
@@ -70,7 +76,6 @@ export async function loadApprovals(env: Env, auth: AuthContext): Promise<Approv
 
   const rs = await env.DB.prepare(
     `${BASE_SELECT}
-       AND t.gate_owner IS NOT NULL
        AND EXISTS (
          SELECT 1 FROM gate_grants g
           WHERE g.capability     = t.gate_owner

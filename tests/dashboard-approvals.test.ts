@@ -47,19 +47,23 @@ function auth(over: Partial<AuthContext> = {}): AuthContext {
 // ── loadApprovals ─────────────────────────────────────────────────────────────
 
 describe('loadApprovals', () => {
-  it('owner sees every review task (no gate_grants filter)', async () => {
+  it('owner sees every review task (no gate_grants filter) but only verdictable (gated) ones', async () => {
     const rows = [{ id: 't1' }, { id: 't2' }]
     const { env, calls } = makeEnv(rows)
     const out = await loadApprovals(env, auth({ role: 'owner' }))
     expect(out).toHaveLength(2)
     expect(calls[0].sql).toContain("t.status = 'review'")
     expect(calls[0].sql).not.toContain('gate_grants')
+    // ungated review tasks are unverdictable zombies — the queue must not offer
+    // an Approve button that would 409 'no_gate'.
+    expect(calls[0].sql).toContain('t.gate_owner IS NOT NULL')
   })
 
-  it('admin gets the same unfiltered query', async () => {
+  it('admin gets the same query — unfiltered by grants, filtered to gated tasks', async () => {
     const { env, calls } = makeEnv([])
     await loadApprovals(env, auth({ role: 'admin' }))
     expect(calls[0].sql).not.toContain('gate_grants')
+    expect(calls[0].sql).toContain('t.gate_owner IS NOT NULL')
   })
 
   it('member is filtered through gate_grants with member principal', async () => {
