@@ -213,7 +213,11 @@ export const SeoChannel: ChannelDescriptor = {
     // ── S4 executable work-types ──────────────────────────────────────────
     {
       key: 'seo-meta-fix',
-      name: 'SEO Meta Fix',
+      // Board/task-panel display name deliberately spells out the destructive
+      // consequence (full-body replace + draft-demotion, see
+      // collectors/seo-meta-fix.ts DESTRUCTIVE SEMANTICS doc) — a bare "SEO Meta
+      // Fix" label reads like a harmless meta-tag tweak, which it is not.
+      name: 'SEO Meta Fix (replaces full article body, sets draft)',
       // proposesOnly=false: this work-type produces a gated record + can be
       // executed after human approval via ctx.executor.execute().
       proposesOnly: false,

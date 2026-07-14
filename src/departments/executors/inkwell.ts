@@ -37,7 +37,19 @@ export interface InkwellWriteResult {
   url: string
 }
 
-/** Body accepted by Inkwell's POST /api/content/publish. */
+/**
+ * Body accepted by Inkwell's POST /api/internal/content/publish.
+ *
+ * ⚠ `overwrite` IS INERT SERVER-SIDE. The real sink (workers/inkwell-api/src/
+ * routes/internal-content.ts → lib/tenant-content.ts putContent()) never reads
+ * this field. Every write is an UNCONDITIONAL full replace of (tenant, slug):
+ * an unguarded `kv.put(post:slug, markdown)` plus `INSERT OR REPLACE INTO
+ * content_index`, regardless of what `overwrite` says or whether it's present at
+ * all. There is no partial update and no create-vs-update distinction at the
+ * sink. This field exists only so a caller can document intent in the stored
+ * payload/request body — it grants ZERO protection. Do not write code, comments,
+ * or tests that treat it as a safety/protective mechanism.
+ */
 interface PublishBody {
   title: string
   content: string
@@ -46,13 +58,18 @@ interface PublishBody {
   tags: string[]
   description: string
   status: 'draft' | 'published' | 'archived'
+  /** Advisory/inert — see the doc comment on PublishBody above. */
   overwrite: boolean
 }
 
 /**
  * Map an opaque stored proposal payload to a publish body. Returns null when the
  * required fields (title + content) are absent — the caller must fail-closed.
- * Defaults are conservative: status 'draft' (never auto-publish), overwrite false.
+ * `status` defaults conservatively to 'draft' (never auto-publish; the sink also
+ * force-overrides to 'draft' regardless, see internal-content.ts). `overwrite`
+ * defaults to false here only as a payload-shape default — it has no effect on
+ * what the sink does (see PublishBody doc above); every write is a full replace
+ * either way.
  */
 export function toPublishBody(payload: unknown): PublishBody | null {
   if (payload === null || typeof payload !== 'object') return null
@@ -80,10 +97,16 @@ export function toPublishBody(payload: unknown): PublishBody | null {
  *   - REQUIRES slug. toPublishBody treats slug as optional and auto-derives one
  *     from the title when absent — correct for "create new content", wrong for
  *     "fix this existing item's meta". A meta-fix with no target slug must never
- *     silently fall through to slug-from-title and create a stray duplicate.
- *   - FORCES overwrite=true unconditionally, regardless of what the stored
- *     payload set (or omitted). seo-meta-fix is definitionally an update to an
- *     EXISTING item — there is no "create" branch for this action.
+ *     silently fall through to slug-from-title and create a stray duplicate. This
+ *     is the ONE real, enforced invariant this function contributes — a required
+ *     slug, checked in code, on the request path.
+ *   - Sets overwrite=true unconditionally, regardless of what the stored payload
+ *     set (or omitted). This is advisory only: the sink (see PublishBody doc
+ *     above / internal-content.ts) does not read `overwrite` and performs an
+ *     unconditional full replace on EVERY write it accepts, slug-required or
+ *     not. Setting it true here just keeps the stored/sent payload's stated
+ *     intent consistent with what always actually happens — it does not add any
+ *     protection beyond the slug check.
  *
  * Returns null (fail-closed) when toPublishBody itself would (missing/blank
  * title or content) OR when slug is absent — the caller must refuse to write.

@@ -10,7 +10,15 @@
 //      'member'-only ctx is denied.
 //   3. A valid intent proposes successfully and returns a gateId; the persisted
 //      payload always carries overwrite:true regardless of the intent shape.
-//   4. executor defaults to 'inkwell-content' when the intent omits it.
+//      NOTE: overwrite:true documents caller INTENT ONLY — the Inkwell internal
+//      publish endpoint never reads this field and unconditionally full-replaces
+//      (tenant, slug) on every write it accepts (see collectors/seo-meta-fix.ts
+//      ⚠ REAL SINK CONTRACT note). It is not a write-time protection.
+//   4. executor defaults to 'inkwell-content' when the intent omits it;
+//      executor:'mcpwp' is a HARD REFUSAL (SeoMetaFixProposeError
+//      'mcpwp_unsupported') — WordPress has no update-by-slug REST surface, so
+//      an mcpwp meta-fix could only ever execute as a wrong-result duplicate
+//      create. No gate record is minted for it.
 //
 // The full propose→approve→execute→real-write loop against REAL SQLite lives in
 // tests/seo-meta-fix-loop-sqlite.test.ts (the hard-constraint deliverable) — this
@@ -138,12 +146,12 @@ describe('proposeSeoMetaFix — persisted payload contract', () => {
     })
   })
 
-  it('honours an explicit executor:"mcpwp" (caller opts in knowingly — see SCOPE note)', async () => {
+  it('hard-refuses executor:"mcpwp" — no gate record persisted (see SCOPE note)', async () => {
     const { db, proposalInserts } = makeStubDb()
-    await proposeSeoMetaFix({ db }, TENANT, { ...validIntent, executor: 'mcpwp' }, { idGen: makeId })
-    const payload = JSON.parse(proposalInserts[0][4] as string)
-    expect(payload.executor).toBe('mcpwp')
-    expect(payload.overwrite).toBe(true) // still forced, regardless of adapter
+    await expect(
+      proposeSeoMetaFix({ db }, TENANT, { ...validIntent, executor: 'mcpwp' }, { idGen: makeId }),
+    ).rejects.toMatchObject({ reason: 'mcpwp_unsupported' })
+    expect(proposalInserts.length).toBe(0)
   })
 
   it('two proposals produce distinct gateIds', async () => {

@@ -20,8 +20,16 @@
 //      content-publish. No kernel.ts change was needed for this — see the
 //      design note in departments/collectors/seo-meta-fix.ts.
 //   4. The real HTTP write body sent to Inkwell's internal publish endpoint
-//      carries slug + overwrite:true (the seo-meta-fix invariant: this is always
-//      an UPDATE to the existing item, never a create), server-forced draft.
+//      carries slug + overwrite:true (the STATED intent — this record documents
+//      an update to an existing item, never a create) and server-forced draft.
+//      ⚠ overwrite:true is advisory/inert server-side: the internal publish
+//      endpoint (workers/inkwell-api/src/routes/internal-content.ts →
+//      lib/tenant-content.ts putContent()) never reads the overwrite field — it
+//      performs an UNCONDITIONAL full replace of (tenant, slug) on every write it
+//      accepts. The real, enforced contract is: this is a full-body replace of
+//      whatever slug is targeted, with no create-vs-update branch and no partial
+//      update, regardless of the overwrite flag's value. Do not read the
+//      assertion below as proof of a write-time protection — there isn't one.
 
 import { beforeEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -56,7 +64,7 @@ describe('seo-meta-fix loop — real SQLite, propose → approve → execute →
     createSchema(harness.sqlite)
   })
 
-  it('closes the entire loop end to end, writing an OVERWRITE update to the target slug', async () => {
+  it('closes the entire loop end to end, writing a full-body-replace update to the target slug', async () => {
     // ── Step 1: proposeSeoMetaFix records intent (real INSERT) ────────────────
     const { gateId } = await proposeSeoMetaFix(
       { db: harness.db },
@@ -146,8 +154,14 @@ describe('seo-meta-fix loop — real SQLite, propose → approve → execute →
     expect(fetchedBody).toMatchObject({
       title: 'mupot closes the loop (AEO-optimised title)',
       slug: 'mupot-closes-the-loop',
-      overwrite: true, // THE invariant: seo-meta-fix always overwrites the target slug
-      status: 'draft', // server-forced-draft, defence in depth
+      // overwrite:true is the STATED intent this producer always sends — but it
+      // is advisory/inert server-side (see file header). The TRUE, enforced
+      // contract at the sink is: every write to this endpoint is an
+      // unconditional full replace of (tenant, slug), whether overwrite is true,
+      // false, or absent. This assertion documents what the wire body contains,
+      // not a write-time safety guarantee.
+      overwrite: true,
+      status: 'draft', // server-forced-draft regardless of caller intent
       tenant_slug: TENANT,
     })
   })
