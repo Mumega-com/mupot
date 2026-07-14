@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { loadApprovals, resultPreview } from '../src/dashboard/approvals'
+import { loadApprovals, loadPublishable, resultPreview } from '../src/dashboard/approvals'
+import { CONTENT_GATE_OWNER } from '../src/agents/execute'
 import type { Env, AuthContext } from '../src/types'
 
 // ── D1 mock: records sql + binds, returns canned rows ────────────────────────
@@ -79,6 +80,45 @@ describe('loadApprovals', () => {
   it('no principal id → empty list, no query', async () => {
     const { env, calls } = makeEnv([{ id: 'should-not-appear' }])
     const out = await loadApprovals(env, auth({ role: 'member', memberId: undefined, userId: undefined }))
+    expect(out).toEqual([])
+    expect(calls).toHaveLength(0)
+  })
+})
+
+// ── loadPublishable (flight-1 gap fix: the "Ready to publish" list) ───────────
+// Approved (status='approved') content-publish (gate_owner='gate:content') tasks,
+// admin/owner-only visibility — this feeds the Publish button, which fires a real
+// external write, so the query itself is gated, not just the button's render.
+
+describe('loadPublishable', () => {
+  it('owner sees approved gate:content tasks, queried by status+gate_owner', async () => {
+    const rows = [{ id: 't1', gate_owner: CONTENT_GATE_OWNER }]
+    const { env, calls } = makeEnv(rows)
+    const out = await loadPublishable(env, auth({ role: 'owner' }))
+    expect(out).toHaveLength(1)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].sql).toContain("t.status = 'approved'")
+    expect(calls[0].sql).toContain('t.gate_owner = ?1')
+    expect(calls[0].binds).toEqual([CONTENT_GATE_OWNER])
+  })
+
+  it('admin gets the same query as owner', async () => {
+    const { env, calls } = makeEnv([{ id: 't1' }])
+    const out = await loadPublishable(env, auth({ role: 'admin' }))
+    expect(out).toHaveLength(1)
+    expect(calls).toHaveLength(1)
+  })
+
+  it('member (non-admin) gets an empty list WITHOUT hitting the DB — the gate is server-side, not just a hidden button', async () => {
+    const { env, calls } = makeEnv([{ id: 'should-not-appear' }])
+    const out = await loadPublishable(env, auth({ role: 'member', memberId: 'm-9', userId: 'm-9' }))
+    expect(out).toEqual([])
+    expect(calls).toHaveLength(0)
+  })
+
+  it('agent token (member role, no admin) also gets an empty list, no query', async () => {
+    const { env, calls } = makeEnv([{ id: 'should-not-appear' }])
+    const out = await loadPublishable(env, auth({ role: 'member', memberId: undefined, userId: 'agent-7' }))
     expect(out).toEqual([])
     expect(calls).toHaveLength(0)
   })

@@ -63,7 +63,8 @@ import { resolveAgentRef } from '../org/resolve'
 
 // Connect-config builders (pure) for the Connect card.
 import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
-import { loadApprovals, resultPreview } from './approvals'
+import { loadApprovals, loadPublishable, resultPreview } from './approvals'
+import { CONTENT_DEPARTMENT_KEY } from '../agents/execute'
 import { loadLoopsView, loopsBody } from './loops'
 import { loadEconomy, economyBody, loadTodaySpendScalar } from './economy'
 import { loadDeployment, deploymentBody } from './deployment'
@@ -235,9 +236,20 @@ dashboardApp.get('/send', async (c) => {
 // verdict (owner/admin: all; others: gate_grants visibility == authority).
 // Buttons POST to the existing RBAC'd /api/tasks/:id/verdict — this page adds
 // no new write path.
+//
+// Also renders a "Ready to publish" section (flight-1 gap fix): tasks that
+// already cleared the gate (status='approved', gate_owner='gate:content') sat
+// invisible with no operator control to fire the real write. loadPublishable
+// is admin/owner-gated server-side, so the section — and its Publish button —
+// simply doesn't render for non-admins; the button POSTs to the existing
+// admin-gated POST /admin/departments/:dept/execute/:gateId, no new write path.
 dashboardApp.get('/approvals', async (c) => {
-  const items = await loadApprovals(c.env, c.get('auth'))
-  return c.html(shell(c.env.BRAND, 'Approvals', approvalsBody(items)))
+  const auth = c.get('auth')
+  const [items, publishable] = await Promise.all([
+    loadApprovals(c.env, auth),
+    loadPublishable(c.env, auth),
+  ])
+  return c.html(shell(c.env.BRAND, 'Approvals', approvalsBody(items, publishable)))
 })
 
 // GET /ops — owner/admin health and observability console.
@@ -2501,6 +2513,7 @@ function shell(
       .btn-reject { background: transparent; color: var(--warn2); border: 1px solid var(--warn2); }
       .appr-status { font-size: 13px; color: var(--dim); }
       .approval.decided { opacity: .55; }
+      .publish.decided { opacity: .55; }
 
       /* recent tasks table */
       .recent-tasks { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -3919,11 +3932,31 @@ function sendScript() {
 // The inline <style> block for .appr-* classes was moved into shell() to avoid
 // duplication across pages.
 
-function approvalsBody(items: ApprovalItem[]) {
+function approvalsBody(items: ApprovalItem[], publishable: ApprovalItem[] = []) {
   // Re-use the shared card renderer. Wrap in a named container so the script can
   // scope its querySelectorAll without touching #obs-queue on the home page.
   const cards = items.map((t) => approvalCardHtml(t)).join('')
   const n = items.length
+
+  // "Ready to publish" (flight-1 gap fix): tasks already past the gate
+  // (status='approved', gate:content) with no operator control to fire the real
+  // write. loadPublishable is admin/owner-gated server-side — publishable is
+  // always [] for a non-admin caller, so this whole section (and its button)
+  // is simply absent from their HTML, not just disabled.
+  const pubCards = publishable.map((t) => publishCardHtml(t)).join('')
+  const pn = publishable.length
+  const publishSection = pn
+    ? html`
+        ${pageHeader({
+          crumbs: '',
+          title: 'Ready to publish',
+          sub: 'Approved content, waiting on the separate Publish action. Approving a proposal and publishing it are two distinct human steps — this button is the second one.',
+          badge: `${String(pn)} approved`,
+          badgeTone: 'ok',
+        })}
+        ${raw(`<div id="publish-list">${pubCards}</div>`)}
+        ${publishScript()}`
+    : html``
 
   return html`
     ${pageHeader({
@@ -3934,7 +3967,77 @@ function approvalsBody(items: ApprovalItem[]) {
       badgeTone: n ? 'warn' : 'ok',
     })}
     ${n ? raw(`<div id="approvals-list">${cards}</div>`) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
-    ${n ? approvalsScript() : html``}`
+    ${n ? approvalsScript() : html``}
+    ${publishSection}`
+}
+
+/**
+ * Render one approved content-publish task as a Publish card. Only ever
+ * populated by loadPublishable (admin/owner + status='approved' + gate:content),
+ * so no client-side role check is needed here — the data itself is the gate.
+ */
+function publishCardHtml(t: ApprovalItem): string {
+  const agentLabel = escHtml(t.agent_name ?? t.assignee_agent_id ?? 'unassigned')
+  const squadLabel = escHtml(t.squad_name ?? t.squad_id)
+  const when = escHtml((t.completed_at ?? t.created_at).slice(0, 16).replace('T', ' '))
+  return `
+    <div class="card publish" data-task="${escAttr(t.id)}" style="border-left:3px solid var(--ok)">
+      <div class="appr-head">
+        <div>
+          <div class="appr-title">${escHtml(t.title)}</div>
+          <div class="appr-meta">${agentLabel} · ${squadLabel} · approved ${when}</div>
+        </div>
+      </div>
+      <div class="appr-body">${escHtml(t.body)}</div>
+      <div class="appr-actions">
+        <button class="btn appr-publish">Publish</button>
+        <span class="appr-status"></span>
+      </div>
+    </div>`
+}
+
+/**
+ * Vanilla JS wiring the Publish button. Targets the EXISTING admin-gated
+ * POST /admin/departments/:dept/execute/:gateId (src/dashboard/index.ts) —
+ * dept is hardcoded to CONTENT_DEPARTMENT_KEY ('growth', the same key
+ * finishContentProposal used to mint the gate — src/agents/execute.ts), gateId
+ * is the task id (THE SEAM: gateId === task.id for content-publish proposals).
+ * No new write path. Server re-checks isAdmin + the approved verdict; this is
+ * purely the UI trigger the loop was missing.
+ */
+function publishScript() {
+  return raw(`
+    <script>
+      (function () {
+        var list = document.getElementById('publish-list');
+        if (!list) return;
+        list.querySelectorAll('.publish').forEach(function (card) {
+          var id = card.getAttribute('data-task');
+          var status = card.querySelector('.appr-status');
+          var btn = card.querySelector('.appr-publish');
+          btn.addEventListener('click', function () {
+            btn.disabled = true;
+            status.textContent = 'publishing…';
+            fetch('/admin/departments/${CONTENT_DEPARTMENT_KEY}/execute/' + encodeURIComponent(id), {
+              method: 'POST', credentials: 'same-origin'
+            }).then(function (res) {
+              return res.json().then(function (data) { return { ok: res.ok, data: data }; });
+            }).then(function (r) {
+              if (r.ok && r.data && r.data.executed) {
+                status.textContent = r.data.artifactUrl ? ('published ✓ ' + r.data.artifactUrl) : 'published ✓';
+                card.classList.add('decided');
+              } else {
+                status.textContent = (r.data && (r.data.reason || r.data.error)) || 'publish failed';
+                btn.disabled = false;
+              }
+            }).catch(function () {
+              status.textContent = 'network error — try again';
+              btn.disabled = false;
+            });
+          });
+        });
+      })();
+    </script>`)
 }
 
 function approvalsScript() {

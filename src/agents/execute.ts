@@ -366,7 +366,9 @@ export const CONTENT_GATE_OWNER = 'gate:content'
 // composed under GrowthModule alongside SeoChannel — src/departments/modules/growth.ts).
 // A single hardcoded department key is a deliberate flight-1 simplification: there is
 // exactly one department in this codebase that declares 'content-publish'.
-const CONTENT_DEPARTMENT_KEY = 'growth'
+// Exported so the dashboard's Publish button (POST /admin/departments/:dept/execute/:gateId)
+// targets the same dept key this module used to propose the gate — one source of truth.
+export const CONTENT_DEPARTMENT_KEY = 'growth'
 
 /**
  * Turn a detected content intent into a GATED department proposal and land the
