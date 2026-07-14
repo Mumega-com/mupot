@@ -122,6 +122,66 @@ describe('parseOutcomeQuery', () => {
   })
 })
 
+describe('GET /collisions — read-only tower view', () => {
+  function makeCollisionsEnv(flights: FlightRow[]) {
+    const env = {
+      TENANT_SLUG: 'test',
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(...args: unknown[]) {
+              return {
+                async first<T>() {
+                  if (sql.includes('FROM member_tokens')) {
+                    return { member_id: 'admin-1', display_name: 'Admin', email: null, status: 'active', bound_agent_id: null } as T
+                  }
+                  return null
+                },
+                async all<T>() {
+                  if (sql.includes('FROM capabilities')) {
+                    return { results: [{ member_id: 'admin-1', scope_type: 'org', scope_id: null, capability: 'admin' }] as T[] }
+                  }
+                  if (sql.includes('FROM flights WHERE tenant=')) {
+                    return { results: flights.filter((f) => f.tenant === args[0]) as unknown as T[] }
+                  }
+                  return { results: [] as T[] }
+                },
+              }
+            },
+          }
+        },
+      },
+    } as unknown as Env
+    return env
+  }
+
+  const flightRow = (id: string, agent: string, meta: unknown): FlightRow => ({
+    id, tenant: 'test', agent, goal: 'g', status: 'running', trigger_source: 'api',
+    gate_verdict: 'go', gate_reason: '', score: 1, budget_micro_usd: null, cost_micro_usd: 0,
+    next_run_at: null, created_at: 1, started_at: 1, ended_at: null, meta: JSON.stringify(meta),
+  })
+
+  it('rejects without org-admin auth', async () => {
+    const env = makeCollisionsEnv([])
+    const response = await flightsApp.request('https://pot.example/collisions', {}, env)
+    expect(response.status).toBe(401)
+  })
+
+  it('returns the current HOLD/WARN split for live flights', async () => {
+    const flightK = flightRow('flight-k', 'kasra', { ...goodMeta, objective_id: 'obj-254', artifact_refs: ['seam.ts'] })
+    const flightC = flightRow('flight-c', 'codex', { ...goodMeta, goal_id: 'goal-c', objective_id: 'obj-254', task_ids: ['task-other'], artifact_refs: ['seam.ts'] })
+    const env = makeCollisionsEnv([flightK, flightC])
+
+    const response = await flightsApp.request('https://pot.example/collisions', {
+      headers: { authorization: 'Bearer test-token' },
+    }, env)
+    expect(response.status).toBe(200)
+    const body = await response.json() as { holds: unknown[]; warns: unknown[] }
+    expect(body.holds).toHaveLength(1) // shared artifact_ref
+    expect(body.warns).toHaveLength(0) // hold takes priority over the also-shared objective
+  })
+})
+
 describe('REST flight dispatch reference integrity', () => {
   it('rejects missing metadata references before inserting a flight', async () => {
     const env = {

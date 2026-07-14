@@ -32,6 +32,7 @@ import {
 } from './service'
 import type { FlightSignals, PreflightOptions } from './preflight'
 import { parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from './meta'
+import { deriveActiveCollisions } from './board'
 
 // ── input parsing (pure, exported for tests) ──────────────────────────────────
 
@@ -250,4 +251,15 @@ flightsApp.get('/', async (c) => {
   // cursor = max ended_at/created_at seen, so the brain can poll incrementally.
   const cursor = flights.reduce((m, f) => Math.max(m, f.ended_at ?? f.created_at), q.sinceMs ?? 0)
   return c.json({ flights, cursor })
+})
+
+// Collisions — the ATC tower's current cross-flight HOLD/WARN view (read-only,
+// tenant-scoped via listFlights, same auth as the other flight reads).
+flightsApp.get('/collisions', async (c) => {
+  const auth = await requireOrgAdmin(c.env, c.req.header('authorization'))
+  if (!auth.ok) return c.json({ error: auth.status === 401 ? 'unauthorized' : 'forbidden' }, auth.status)
+
+  const flights = await listFlights(c.env, 500)
+  const { holds, warns } = deriveActiveCollisions(flights)
+  return c.json({ holds, warns })
 })
