@@ -135,7 +135,7 @@ wizardApp.get('/', async (c) => {
   const owner = await isOwner(c)
   if (!owner) {
     return c.html(
-      shell(
+      wizardShell(
         c.env.BRAND,
         'Setup',
         notOwnerBody(),
@@ -152,7 +152,7 @@ wizardApp.get('/', async (c) => {
     // to the admin surfaces where each part is now editable.
     const brand = parseBrand(settings.get(SETTINGS_KEYS.orgName), settings.get(SETTINGS_KEYS.brand))
     return c.html(
-      shell(
+      wizardShell(
         c.env.BRAND,
         'Setup · done',
         doneSummaryBody({
@@ -179,7 +179,7 @@ wizardApp.get('/', async (c) => {
     imChannel: settings.get(SETTINGS_KEYS.imChannel) ?? '',
   }
   return c.html(
-    shell(c.env.BRAND, 'Setup', wizardBody(c.env.BRAND, auth, step, prefill)),
+    wizardShell(c.env.BRAND, 'Setup', wizardBody(c.env.BRAND, auth, step, prefill)),
   )
 })
 
@@ -418,40 +418,80 @@ function parseBrand(orgName: string | undefined, brand: string | undefined): Bra
 
 // ── views ────────────────────────────────────────────────────────────────────
 
-/** Outer document — same dark inline-CSS style as the dashboard shell, with a few
- *  wizard-specific additions (stepper, panels). No framework, no build step. */
-function shell(brand: string, title: string, body: HtmlEscapedString | Promise<HtmlEscapedString>) {
+// THEME RESKIN (deployment-page fix, second half — see deployment.ts for the
+// nav-label half): the wizard used to ship its own bespoke DARK-ONLY inline
+// document shell that was never touched when the rest of the console was
+// reskinned to "Console Light" — so an owner clicking the SOVEREIGNTY nav landed
+// on a stale, wrong-theme dead end (worse: the nav pointed here at all, which is
+// the bug deployment.ts's new /deployment page + nav change fix).
+//
+// First attempt was to import dashboard/index.ts's shared `shell()` directly so
+// this page is byte-for-byte the same chrome as every other console page. That
+// broke at runtime: index.ts does `dashboardApp.route('/setup', wizardApp)` at
+// module top level, and wizard.ts importing `shell` back from index.ts closes an
+// ES-module cycle — whichever module a caller imports FIRST ends up importing the
+// other mid-evaluation, before its exports are initialized (proven by
+// tests/wizard-seed-agent.test.ts, which imports wizard.ts directly: `wizardApp`
+// resolves to `undefined` inside index.ts, and `dashboardApp.route()` throws).
+// Fix: keep the wizard's shell self-contained (no cross-import), but reskin its
+// tokens/fonts/header to be VISUALLY IDENTICAL to the shared shell — same palette
+// values, same fonts, same theme-toggle key, so switching theme anywhere in the
+// console is consistent everywhere. If a future refactor wants byte-identical
+// chrome, extract `shell()` out of index.ts into its own module FIRST (so neither
+// index.ts nor wizard.ts imports the other) — don't reintroduce this cycle.
+function wizardShell(brand: string, title: string, body: HtmlEscapedString | Promise<HtmlEscapedString>) {
   return html`<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>${title} · ${brand}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Hanken+Grotesk:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
     <style>
+      /* Same token VALUES as dashboard/index.ts's shell() — kept in sync by hand
+       * since this file can't import that one (see cycle note above). */
       :root {
-        --bg: #0e1116; --surface: #161b22; --surface2: #1c2230; --border: #2a3140;
-        --text: #e6edf3; --muted: #9aa7b5; --dim: #6b7685; --accent: #d4a017; --accent2: #06b6d4;
-        --ok: #3fb950; --warn: #d29922; --radius: 10px;
+        --bg: #f6f7f6; --surface: #fff; --text: #171b19; --text2: #454c48; --dim: #7a827d;
+        --primary: #96780A; --primary-soft: #f7f1dd; --border: #e7e9e7; --hover: #f4f6f4;
+        --surface2: #f4f6f4; --muted: #7a827d; --accent: #96780A; --accent2: #06b6d4;
+        --ok: #16a34a; --warn: #ca8a04; --radius: 10px;
+        --font-display: 'Instrument Serif', Georgia, serif;
+        --font-body: 'Hanken Grotesk', system-ui, -apple-system, sans-serif;
+        --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      [data-theme="dark"] {
+        --bg: #0e1116; --surface: #161b22; --text: #e6edf3; --text2: #9aa7b5; --dim: #6b7685;
+        --primary: #d4a017; --primary-soft: #2e2812; --border: #2a3140; --hover: #1c2230;
+        --surface2: #1c2230; --muted: #9aa7b5; --accent: #d4a017; --accent2: #06b6d4;
+        --ok: #3fb950; --warn: #d29922;
       }
       * { box-sizing: border-box; }
       body {
         margin: 0; background: var(--bg); color: var(--text);
-        font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        font-family: var(--font-body); font-size: 15px; line-height: 1.55;
+        -webkit-font-smoothing: antialiased;
       }
-      a { color: var(--accent2); text-decoration: none; }
+      a { color: var(--primary); text-decoration: none; }
       a:hover { text-decoration: underline; }
-      code { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px;
-        padding: 1px 6px; font-size: 13px; color: var(--text); }
       header.top {
         display: flex; align-items: center; justify-content: space-between;
         padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--surface);
         position: sticky; top: 0; z-index: 5;
       }
-      header.top .brand { font-weight: 700; letter-spacing: .3px; color: var(--text); }
-      header.top .brand b { color: var(--accent); }
-      header.top nav a { margin-left: 18px; color: var(--muted); font-size: 14px; }
+      header.top .brand { font-family: var(--font-display); font-size: 18px; color: var(--text); }
+      header.top .brand b { color: var(--primary); font-weight: 400; }
+      header.top nav { display: flex; align-items: center; gap: 16px; }
+      header.top nav a { color: var(--muted); font-size: 14px; }
+      header.top .theme-btn {
+        width: 30px; height: 30px; border: 1px solid var(--border); border-radius: 8px;
+        background: transparent; cursor: pointer; display: flex; align-items: center;
+        justify-content: center; color: var(--dim); font-size: 14px;
+      }
+      header.top .theme-btn:hover { background: var(--hover); color: var(--text); }
       main { max-width: 760px; margin: 0 auto; padding: 28px 24px 64px; }
-      h1 { font-size: 22px; margin: 0 0 4px; }
+      h1 { font-family: var(--font-display); font-weight: 400; font-size: 28px; margin: 0 0 4px; }
       h2 { font-size: 16px; margin: 0 0 12px; color: var(--text); }
       p.sub { color: var(--muted); font-size: 14px; margin: 0 0 20px; }
       .card {
@@ -459,6 +499,12 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         border-radius: var(--radius); padding: 20px 22px; margin: 16px 0;
       }
       .empty { color: var(--dim); font-size: 14px; }
+      .kv { display: grid; grid-template-columns: 150px 1fr; gap: 8px 14px; font-size: 14px; }
+      .kv dt { color: var(--muted); } .kv dd { margin: 0; }
+      code {
+        background: var(--surface2); border: 1px solid var(--border); border-radius: 6px;
+        padding: 1px 6px; font-size: 13px; color: var(--text); font-family: var(--font-mono);
+      }
       /* stepper */
       .stepper { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 22px; padding: 0; list-style: none; }
       .stepper li {
@@ -471,19 +517,19 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       form.wz { display: flex; flex-direction: column; gap: 14px; }
       label.fld { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
       input, select, textarea {
-        font: inherit; padding: 9px 11px; border-radius: 8px; border: 1px solid var(--border);
-        background: var(--bg); color: var(--text); width: 100%;
+        font: inherit; font-family: var(--font-body); padding: 9px 11px; border-radius: 8px;
+        border: 1px solid var(--border); background: var(--bg); color: var(--text); width: 100%;
       }
       textarea { min-height: 70px; resize: vertical; }
       .row { display: flex; flex-wrap: wrap; gap: 12px; }
       .row > label.fld { flex: 1; min-width: 160px; }
       .btn {
-        appearance: none; cursor: pointer; font: inherit; font-weight: 600;
-        padding: 9px 18px; border-radius: 8px; border: 1px solid var(--accent);
-        background: var(--accent); color: #1b1402;
+        appearance: none; cursor: pointer; font-family: var(--font-body); font-weight: 600;
+        padding: 9px 18px; border-radius: 8px; border: 1px solid var(--primary);
+        background: var(--primary); color: #fff;
       }
       .btn:disabled { opacity: .5; cursor: not-allowed; }
-      .btn.secondary { background: transparent; color: var(--accent); }
+      .btn.secondary { background: transparent; color: var(--primary); }
       .btn.ghost { background: transparent; color: var(--muted); border-color: var(--border); }
       .actions { display: flex; gap: 10px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
       .status-line { font-size: 13px; color: var(--muted); min-height: 18px; }
@@ -503,8 +549,6 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
         border-radius: 8px; padding: 12px 14px; font-size: 13px; color: var(--muted); margin-top: 4px;
       }
       .step-panel[hidden] { display: none; }
-      .kv { display: grid; grid-template-columns: 150px 1fr; gap: 8px 14px; font-size: 14px; }
-      .kv dt { color: var(--muted); } .kv dd { margin: 0; }
     </style>
   </head>
   <body>
@@ -513,9 +557,40 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       <nav>
         <a href="/">Overview</a>
         <a href="/auth/logout">Sign out</a>
+        <button class="theme-btn" id="wz-theme-toggle" title="Toggle theme" aria-label="Toggle light/dark theme">
+          <span id="wz-theme-icon">☀</span>
+        </button>
       </nav>
     </header>
     <main>${body}</main>
+    <script>
+      (function () {
+        // Same localStorage key + data-theme attribute as the main dashboard shell
+        // (dashboard/index.ts), so a theme choice made anywhere in the console is
+        // respected here too.
+        var THEME_KEY = 'mupot-theme';
+        var htmlEl = document.documentElement;
+        var icon = document.getElementById('wz-theme-icon');
+        function applyTheme(t) {
+          if (t === 'dark') {
+            htmlEl.setAttribute('data-theme', 'dark');
+            if (icon) icon.textContent = '☾';
+          } else {
+            htmlEl.removeAttribute('data-theme');
+            if (icon) icon.textContent = '☀';
+          }
+        }
+        applyTheme(localStorage.getItem(THEME_KEY) || 'light');
+        var btn = document.getElementById('wz-theme-toggle');
+        if (btn) {
+          btn.addEventListener('click', function () {
+            var next = htmlEl.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+            localStorage.setItem(THEME_KEY, next);
+            applyTheme(next);
+          });
+        }
+      })();
+    </script>
   </body>
 </html>`
 }

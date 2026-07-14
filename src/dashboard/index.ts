@@ -65,7 +65,8 @@ import { resolveAgentRef } from '../org/resolve'
 import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
 import { loadApprovals, resultPreview } from './approvals'
 import { loadLoopsView, loopsBody } from './loops'
-import { loadEconomy, economyBody } from './economy'
+import { loadEconomy, economyBody, loadTodaySpendScalar } from './economy'
+import { loadDeployment, deploymentBody } from './deployment'
 import { loadVerifications, verificationsBody } from './verifications'
 import { loadAudit, auditBody } from './audit'
 import { loadBilling, billingBody } from './billing'
@@ -110,7 +111,8 @@ import { buildBoard } from '../flight/board'
 import type { FlightCard } from '../flight/board'
 import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
-import { loadBrainView, brainBody } from './brain'
+import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './brain'
+import type { PhysicsSnapshot } from './brain'
 import { loadGrowthView, growthBody } from './growth'
 import { setLoopControl, isLoopControlAction } from '../loops/decisions'
 import { getLoop } from '../loops/service'
@@ -193,15 +195,29 @@ dashboardApp.get('/', async (c) => {
   if ((auth.role === 'owner' || hasOrgOwnerCapability(auth)) && !(await isOnboardingComplete(c.env))) {
     return c.redirect('/setup')
   }
-  // Load observatory data (agents, stats, bars, ticks, recentTasks) and the
-  // operator queue (existing loadApprovals, same RBAC as the /approvals page)
-  // in parallel — they hit independent D1 tables.
-  const [obsData, approvals] = await Promise.all([
+  // Load observatory data (agents, stats, bars, ticks, recentTasks), the
+  // operator queue (existing loadApprovals, same RBAC as the /approvals page),
+  // and the two LIGHT header-chip reads, in parallel — independent KV/D1 reads,
+  // one round-trip cluster. Overview is the highest-traffic page (the owner's
+  // landing page), so this deliberately uses the light single-read helpers, NOT
+  // loadBrainView (loops + up to 100 decisions) or loadEconomy (5 aggregation
+  // queries: by-model/by-agent/14-day/totals/latest) those other pages need:
+  //   - loadBrainPhysics: the SAME bare KV .get() brain.ts's coherence panel
+  //     reads (no D1 at all).
+  //   - loadTodaySpendScalar: ONE D1 round trip (today's sum + an EXISTS check),
+  //     vs loadEconomy's 5 parallel queries — see economy.ts for why "configured"
+  //     is defined identically so the two never disagree.
+  const [obsData, approvals, physics, spend] = await Promise.all([
     loadObservatory(c.env),
     loadApprovals(c.env, auth),
+    loadBrainPhysics(c.env),
+    loadTodaySpendScalar(c.env),
   ])
   return c.html(
-    shell(c.env.BRAND, 'Overview', observatoryBody(c.env.BRAND, obsData, approvals, auth)),
+    shell(c.env.BRAND, 'Overview', observatoryBody(c.env.BRAND, obsData, approvals, auth), {
+      physics,
+      costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
+    }),
   )
 })
 
@@ -235,6 +251,21 @@ dashboardApp.get('/ops', async (c) => {
   return c.html(shell(c.env.BRAND, 'Operations', opsHealthBody(data)))
 })
 
+// ── deployment (SOVEREIGNTY: the pot's actual live deployment identity) ──────
+// GET /deployment — replaces the old mislabeled "Deployment" nav item that used
+// to point at /setup (the first-run onboarding wizard). Read-only: version,
+// RELEASE_SHA/commit, tenant, and liveness straight from the same publicHealth()
+// GET /health uses, plus honest (non-clickable) redeploy guidance. Owner/admin
+// only, like the other SOVEREIGNTY pages (/admin/keys, /ops).
+dashboardApp.get('/deployment', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(shell(c.env.BRAND, 'Deployment', errorBody('Deployment requires owner or admin.')), 403)
+  }
+  const data = await loadDeployment(c.env)
+  return c.html(shell(c.env.BRAND, 'Deployment', deploymentBody(data)))
+})
+
 // ── loops (watch goal-seeking work-units + the outreach funnel) ──────────────
 dashboardApp.get('/loops', async (c) => {
   const view = await loadLoopsView(c.env)
@@ -254,7 +285,13 @@ dashboardApp.get('/services', async (c) => {
 // outer middleware. Separate from the pot's internal burn gauge.
 dashboardApp.get('/economy', async (c) => {
   const data = await loadEconomy(c.env)
-  return c.html(shell(c.env.BRAND, 'Economy', economyBody(data)))
+  // Header spend chip reuses this SAME loadEconomy() call — no extra D1 round
+  // trip, and the chip is guaranteed to agree with the "Today" card below it.
+  return c.html(
+    shell(c.env.BRAND, 'Economy', economyBody(data), {
+      costToday: { configured: data.configured, todayUsdMicro: data.today_usd_micro },
+    }),
+  )
 })
 
 // ── economy/billing — current plan + tier from org_settings (no secrets) ─────
@@ -316,7 +353,11 @@ dashboardApp.get('/audit', async (c) => {
 dashboardApp.get('/brain', async (c) => {
   const auth = c.get('auth')
   const view = await loadBrainView(c.env)
-  return c.html(shell(c.env.BRAND, 'Brain', brainBody(view, isAdmin(auth))))
+  // Header regime chip reuses this SAME loadBrainView() call (it already fetched
+  // the KV physics snapshot for the coherence panel below) — no extra KV read.
+  return c.html(
+    shell(c.env.BRAND, 'Brain', brainBody(view, isAdmin(auth)), { physics: view.physics }),
+  )
 })
 
 // ── departments/growth (Marketing & Sales console view) ─────────────────────
@@ -466,9 +507,20 @@ dashboardApp.get('/fleet', async (c) => {
   // No company-bus connection → show the POT-NATIVE flock instead of an empty
   // notice: agents that checked in to THIS pot (inbound, no egress). This is the
   // tenant-pot path (Digid); the bus path below is the company/HQ window.
+  // Trivially-cheap header wiring on both return paths (same light reads as
+  // Overview — bare KV get + one-row D1 scalar).
   if (!fleetScoped(c.env)) {
-    const presence = await listPresence(c.env, Date.now())
-    return c.html(shell(c.env.BRAND, 'Fleet', html`${hostPanel}${potFleetBody(presence)}`))
+    const [presence, physics, spend] = await Promise.all([
+      listPresence(c.env, Date.now()),
+      loadBrainPhysics(c.env),
+      loadTodaySpendScalar(c.env),
+    ])
+    return c.html(
+      shell(c.env.BRAND, 'Fleet', html`${hostPanel}${potFleetBody(presence)}`, {
+        physics,
+        costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
+      }),
+    )
   }
   let rows: FleetRow[] = []
   let error: string | null = null
@@ -477,7 +529,13 @@ dashboardApp.get('/fleet', async (c) => {
   } catch (e) {
     error = e instanceof Error ? e.message : 'bus_unreachable'
   }
-  return c.html(shell(c.env.BRAND, 'Fleet', html`${hostPanel}${fleetBody(rows, error)}`))
+  const [physics, spend] = await Promise.all([loadBrainPhysics(c.env), loadTodaySpendScalar(c.env)])
+  return c.html(
+    shell(c.env.BRAND, 'Fleet', html`${hostPanel}${fleetBody(rows, error)}`, {
+      physics,
+      costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
+    }),
+  )
 })
 
 // POST /fleet/host-control — start|stop|restart a HOST agent via the SIGNED control plane (mupot
@@ -559,13 +617,22 @@ dashboardApp.get('/coordination', async (c) => {
 
 // GET /agents — the management table: all agents across squads, plus an Add form.
 dashboardApp.get('/agents', async (c) => {
-  const [agents, squadOptions] = await Promise.all([
+  // Trivially-cheap header wiring (same light reads as Overview — bare KV get +
+  // one-row D1 scalar, not the full loadBrainView/loadEconomy).
+  const [agents, squadOptions, physics, spend] = await Promise.all([
     loadAllAgents(c.env),
     loadSquadOptions(c.env),
+    loadBrainPhysics(c.env),
+    loadTodaySpendScalar(c.env),
   ])
   const auth = c.get('auth')
   const canManage = isAdmin(auth)
-  return c.html(shell(c.env.BRAND, 'Agents', agentsBody(agents, squadOptions, canManage)))
+  return c.html(
+    shell(c.env.BRAND, 'Agents', agentsBody(agents, squadOptions, canManage), {
+      physics,
+      costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
+    }),
+  )
 })
 
 // POST /agents — create an agent (owner/admin only).
@@ -1724,6 +1791,89 @@ const TASK_LANES: ReadonlyArray<{ key: Task['status']; label: string }> = [
   { key: 'done', label: 'Done' },
 ]
 
+// ── topbar header chips (regime + spend) ────────────────────────────────────
+//
+// Both chips were static placeholders (regime: display:none; spend: never
+// rendered at all). Wired live, but ONLY on the routes that already load the
+// backing data for their own page — so wiring costs ZERO extra reads and is
+// GUARANTEED to agree with what that page shows elsewhere:
+//   - regime chip: /brain already calls loadBrainView, which fetches the KV
+//     physics snapshot for its own coherence panel (loadBrainPhysics). We pass
+//     that SAME already-loaded `view.physics` into shell()'s header param —
+//     no second KV read.
+//   - spend chip: /economy already calls loadEconomy for its own stat cards.
+//     We pass that SAME already-loaded `data.{configured,today_usd_micro}` —
+//     no second D1 round-trip, and the header figure is BY CONSTRUCTION the
+//     same number as the Economy page's "Today" card (same source, same call).
+// Every other route omits the 4th shell() argument, so `header` defaults to
+// `{}` and both chips render in their pre-existing honest-empty state (regime:
+// hidden; spend: "no data") — NOT a regression, just not wired there yet.
+// Extending live wiring to more routes only means passing more `header` data
+// from a handler that already has it — never re-deriving regime or spend logic.
+
+/** Header-chip data a route MAY pass into shell(). Everything optional; when a
+ *  field is omitted the corresponding chip shows its honest-empty state. */
+interface HeaderChips {
+  /** Latest coherence physics snapshot (from loadBrainView), or null when KV is
+   *  genuinely empty. Omit entirely on routes that don't load physics. */
+  physics?: PhysicsSnapshot | null
+  /** Today's spend, straight from loadEconomy's own fields. `configured: false`
+   *  means cc_spend_daily has never been pushed to (never fabricate a number in
+   *  that case); `configured: true` with `todayUsdMicro: 0` is an honest $0.00 —
+   *  spend WAS tracked today, it was just zero. */
+  costToday?: { configured: boolean; todayUsdMicro: number } | null
+}
+
+/** Regime label shown in the compact header chip — just Title-Cases the raw
+ *  `physics.regime` string (already computed by the sovereign daemon; this is
+ *  formatting, not regime derivation). The longer descriptive label + color
+ *  class live in brain.ts (regimeLabel / regimeBadgeClass) for the full panel. */
+function shortRegimeLabel(regime: string): string {
+  return regime.length > 0 ? regime.charAt(0).toUpperCase() + regime.slice(1) : regime
+}
+
+/** Render the topbar regime chip. Reuses brain.ts's regimeBadgeClass() for the
+ *  color mapping (flow/chaos/coercion/stall → ok/warn2/accent/danger) instead of
+ *  re-deriving it. `physics` undefined/null → honest hidden "no data" state,
+ *  identical to the pre-wire placeholder — never fabricates a regime. */
+export function regimeChipHtml(physics: PhysicsSnapshot | null | undefined) {
+  if (!physics) {
+    return html`<div class="regime-chip" id="regime-chip" style="display:none" title="Coherence regime — no physics snapshot yet.">
+      <span class="regime-dot" id="regime-dot"></span>
+      <span class="regime-label" id="regime-label">—</span>
+      <span class="regime-ct" id="regime-ct">C(t) —</span>
+    </div>`
+  }
+  const cls = regimeBadgeClass(physics.regime)
+  return html`<div class="regime-chip ${raw(cls)}" id="regime-chip" title="Coherence regime — brain physics from KV (sovereign daemon).">
+    <span class="regime-dot" id="regime-dot"></span>
+    <span class="regime-label" id="regime-label">${shortRegimeLabel(physics.regime)}</span>
+    <span class="regime-ct" id="regime-ct">C(t) ${physics.C.toFixed(3)}</span>
+  </div>`
+}
+
+/** Render the topbar spend chip. `cost` undefined/null → this route hasn't
+ *  wired spend data (hidden, same shape as before). `configured: false` → an
+ *  honest "no spend yet" (cc_spend_daily has never been pushed to — never show
+ *  $0.00 as if spend were tracked and happened to be zero). Otherwise renders
+ *  formatUsd(todayUsdMicro) — the SAME formatter + SAME field the Economy page
+ *  uses for its "Today" stat card. */
+export function spendChipHtml(cost: { configured: boolean; todayUsdMicro: number } | null | undefined) {
+  if (!cost) {
+    return html`<div class="spend-chip" id="spend-chip" style="display:none" title="Today's spend — not loaded on this page.">
+      <span class="spend-chip-dot">◆</span><span id="spend-chip-value">—</span>
+    </div>`
+  }
+  if (!cost.configured) {
+    return html`<div class="spend-chip" id="spend-chip" title="No Claude Code spend has been pushed to this pot yet.">
+      <span class="spend-chip-dot">◆</span><span id="spend-chip-value">no spend yet</span>
+    </div>`
+  }
+  return html`<div class="spend-chip" id="spend-chip" title="Today's Claude Code spend (Anthropic list price) — same figure as the Economy page's Today card.">
+    <span class="spend-chip-dot">◆</span><span id="spend-chip-value">${raw(formatUsd(cost.todayUsdMicro))} today</span>
+  </div>`
+}
+
 /** Outer HTML document with inline CSS (no framework, no build step).
  *
  * Theme: light by default, dark toggled via [data-theme="dark"] on <html>.
@@ -1731,7 +1881,12 @@ const TASK_LANES: ReadonlyArray<{ key: Task['status']; label: string }> = [
  * Fonts: Instrument Serif (headings/metrics) · Hanken Grotesk (body) · JetBrains Mono (IDs/badges).
  * Sidebar: Stripe-style with collapsible sections that remember open/closed state.
  */
-function shell(brand: string, title: string, body: HtmlEscapedString | Promise<HtmlEscapedString>) {
+function shell(
+  brand: string,
+  title: string,
+  body: HtmlEscapedString | Promise<HtmlEscapedString>,
+  header: HeaderChips = {},
+) {
   return html`<!doctype html>
 <html lang="en">
   <head>
@@ -1972,14 +2127,23 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
       .regime-chip .regime-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--primary); flex: none; }
       .regime-chip .regime-label { font-weight: 700; color: var(--primary); }
       .regime-chip .regime-ct { font-family: var(--font-mono); font-size: 11px; color: var(--dim); }
+      /* regime-dot color per regime — SAME regime→color mapping as brain.ts's
+       * .regime-badge classes (regimeBadgeClass, reused not reinvented): flow=ok,
+       * chaos=warn2, coercion=accent, stall=danger. --danger/--warn2 are defined
+       * further down (Observatory section) but CSS custom properties resolve by
+       * cascade, not declaration order, so this is safe. */
+      .regime-chip.regime-flow     .regime-dot { background: var(--ok, #16a34a); }
+      .regime-chip.regime-chaos    .regime-dot { background: var(--warn2, #d29922); }
+      .regime-chip.regime-coercion .regime-dot { background: var(--accent); }
+      .regime-chip.regime-stall    .regime-dot { background: var(--danger, #c0392b); }
       .topbar-spacer { flex: 1; }
-      .cloud-pill {
+      .cloud-pill, .spend-chip {
         display: flex; align-items: center; gap: 7px;
         padding: 6px 11px; border: 1px solid var(--border); border-radius: 8px;
         background: var(--surface);
         font-family: var(--font-mono); font-size: 11px; color: var(--text2);
       }
-      .cloud-pill-dot { color: var(--primary); }
+      .cloud-pill-dot, .spend-chip-dot { color: var(--primary); }
       .topbar-invite {
         padding: 7px 14px; border: none; border-radius: 8px;
         background: var(--primary); color: #fff; cursor: pointer;
@@ -2649,8 +2813,8 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
           <!-- SOVEREIGNTY section label -->
           <div class="nav-sovereignty-label">SOVEREIGNTY</div>
 
-          <!-- Deployment -->
-          <a class="nav-link" href="/setup">
+          <!-- Deployment (live deployment identity — NOT the setup wizard; see /deployment) -->
+          <a class="nav-link" href="/deployment">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" width="17" height="17"><rect x="3.5" y="4" width="13" height="5" rx="1.3"/><rect x="3.5" y="11" width="13" height="5" rx="1.3"/><circle cx="6.6" cy="6.5" r=".8" fill="currentColor" stroke="none"/><circle cx="6.6" cy="13.5" r=".8" fill="currentColor" stroke="none"/></svg>
             <span class="nav-label">Deployment</span>
           </a>
@@ -2698,13 +2862,9 @@ function shell(brand: string, title: string, body: HtmlEscapedString | Promise<H
             <span class="topbar-crumb-sep">/</span>
             <span class="topbar-crumb-view" id="crumb-view">Overview</span>
           </div>
-          <!-- regime chip: static placeholder — live value requires KV at request time; shown on /brain only -->
-          <div class="regime-chip" id="regime-chip" style="display:none;" title="Coherence regime — brain physics from KV. Labeled static placeholder until live KV read is wired per-request.">
-            <span class="regime-dot" id="regime-dot"></span>
-            <span class="regime-label" id="regime-label">—</span>
-            <span class="regime-ct" id="regime-ct">C(t) —</span>
-          </div>
+          ${regimeChipHtml(header.physics)}
           <div class="topbar-spacer"></div>
+          ${spendChipHtml(header.costToday)}
           <div class="cloud-pill">
             <span class="cloud-pill-dot">◆</span> YOUR CLOUD · CF
           </div>

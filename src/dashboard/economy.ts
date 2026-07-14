@@ -115,6 +115,36 @@ export async function loadEconomy(env: Env): Promise<EconomyData> {
   }
 }
 
+/**
+ * loadTodaySpendScalar — the LIGHT read for high-traffic pages (Overview's
+ * header chip) that only need "how much today, and has spend ever been
+ * configured at all" — NOT the full by-model/by-agent/14-day breakdown
+ * loadEconomy() computes for the /economy page itself.
+ *
+ * ONE D1 round trip (a single .first() call, two correlated subqueries against
+ * the same cc_spend_daily table loadEconomy reads) instead of loadEconomy's 5
+ * parallel queries. `configured` mirrors loadEconomy's definition exactly
+ * (true iff any row has ever been written, not just today) so a caller never
+ * has to reconcile two different "configured" meanings.
+ */
+export async function loadTodaySpendScalar(
+  env: Env,
+): Promise<{ configured: boolean; today_usd_micro: number }> {
+  const today = todayUtc()
+  const row = await env.DB.prepare(
+    `SELECT
+       COALESCE((SELECT SUM(usd_micro) FROM cc_spend_daily WHERE date = ?1), 0) AS today_usd_micro,
+       EXISTS(SELECT 1 FROM cc_spend_daily) AS has_any`,
+  )
+    .bind(today)
+    .first<{ today_usd_micro: number; has_any: number }>()
+
+  return {
+    configured: (row?.has_any ?? 0) > 0,
+    today_usd_micro: row?.today_usd_micro ?? 0,
+  }
+}
+
 // ── view ──────────────────────────────────────────────────────────────────────
 
 function usd(micro: number): string {
