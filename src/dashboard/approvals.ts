@@ -11,6 +11,7 @@
 // so the queue UI cannot widen the gate's authority.
 
 import type { Env, Task, AuthContext } from '../types'
+import { CONTENT_GATE_OWNER } from '../agents/execute'
 
 export interface ApprovalItem {
   id: string
@@ -39,6 +40,21 @@ function isOwnerAdmin(auth: AuthContext): boolean {
   return auth.role === 'owner' || auth.role === 'admin'
 }
 
+// Tasks that cleared their gate (status='approved') and are content-publish work —
+// awaiting the SEPARATE admin "Publish" action (flight-1 gap fix). Deliberately
+// admin/owner-only visibility: this list feeds a button that fires a real external
+// write (POST /admin/departments/:dept/execute/:gateId, which already enforces
+// isAdmin server-side — src/dashboard/index.ts). Gating the query too means a
+// non-admin never even sees the control, not just can't click it.
+const PUBLISHABLE_SELECT = `
+  SELECT t.id, t.squad_id, s.name AS squad_name, t.title, t.body, t.gate_owner,
+         t.assignee_agent_id, a.name AS agent_name, t.result, t.completed_at,
+         t.created_at
+    FROM tasks t
+    LEFT JOIN squads s ON s.id = t.squad_id
+    LEFT JOIN agents a ON a.id = t.assignee_agent_id
+   WHERE t.status = 'approved' AND t.gate_owner = ?1`
+
 export async function loadApprovals(env: Env, auth: AuthContext): Promise<ApprovalItem[]> {
   if (isOwnerAdmin(auth)) {
     const rs = await env.DB.prepare(`${BASE_SELECT} ORDER BY t.created_at ASC`).all<ApprovalItem>()
@@ -64,6 +80,18 @@ export async function loadApprovals(env: Env, auth: AuthContext): Promise<Approv
      ORDER BY t.created_at ASC`,
   )
     .bind(principalType, principalId)
+    .all<ApprovalItem>()
+  return rs.results ?? []
+}
+
+// Approved content-publish tasks awaiting the admin's separate Publish click.
+// Admin/owner only — see PUBLISHABLE_SELECT comment above. Non-admin callers get
+// an empty list (not a 403): the page still renders, the section just stays empty,
+// same shape as loadApprovals' non-admin path.
+export async function loadPublishable(env: Env, auth: AuthContext): Promise<ApprovalItem[]> {
+  if (!isOwnerAdmin(auth)) return []
+  const rs = await env.DB.prepare(`${PUBLISHABLE_SELECT} ORDER BY t.created_at ASC`)
+    .bind(CONTENT_GATE_OWNER)
     .all<ApprovalItem>()
   return rs.results ?? []
 }
