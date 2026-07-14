@@ -66,6 +66,7 @@ describe('runtime starter documentation', () => {
 
   it('never overwrites the configured control file before reload', () => {
     expect(readme).not.toContain('cp fleet-runtime/control.example.json ~/.fleet/control.json')
+    expect(readme).not.toContain('cp fleet-runtime/inbox-handler.example.json ~/.fleet/inbox-handler.json')
     expectOrdered(readme, ['trust-bootstrap.mjs', 'service-manager.mjs reload --service-manager auto'])
   })
 

@@ -189,10 +189,10 @@ The command receives one JSON object on stdin:
 }
 ```
 
-Configure the handler:
+The installer already created `~/.fleet/inbox-handler.json`. Edit that configured file in
+place, then create the handler directory:
 
 ```bash
-cp fleet-runtime/inbox-handler.example.json ~/.fleet/inbox-handler.json
 mkdir -p ~/.fleet/handlers
 ```
 
