@@ -6,6 +6,8 @@
 // dashboard renders it and tests cover it without a Worker. See docs/flight-operations.md.
 
 import type { FlightRow, FlightStatus } from './service'
+import { detectFlightCollisions } from './clearance'
+import type { FlightCollision } from './clearance'
 
 // The board metaphor (plain mupot language): running=flying, waiting=holding (at a
 // human gate), sleeping=between flights. preflight/held/landed/failed keep their names.
@@ -111,4 +113,23 @@ export function buildBoard(rows: FlightRow[], nowMs: number): FlightCard[] {
       age: `${humanDur(nowMs - row.created_at)} ago`,
     }
   })
+}
+
+// The tower's current cross-flight view (flight/clearance.ts): HOLD-level (hard
+// conflict — shared task_ids/artifact_refs) and WARN-level (soft — shared
+// objective/goal/squad only) collisions among the currently active flights.
+// detectFlightCollisions already filters to live statuses + same-tenant pairs — this
+// is a thin split-by-severity presentation wrapper, same "pure derivation" discipline
+// as buildBoard above.
+export interface ActiveCollisions {
+  holds: FlightCollision[]
+  warns: FlightCollision[]
+}
+
+export function deriveActiveCollisions(flights: FlightRow[]): ActiveCollisions {
+  const collisions = detectFlightCollisions(flights)
+  return {
+    holds: collisions.filter((c) => c.severity === 'hold'),
+    warns: collisions.filter((c) => c.severity === 'warn'),
+  }
 }
