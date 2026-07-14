@@ -203,17 +203,18 @@ function normalizeStatus(result) {
   }
 }
 
-function servicesOperational(status, expectedCount) {
-  return status.services.length === expectedCount &&
-    status.services.every((service) => service.loaded === true && service.running === true)
+function lifecycleStateReached(status, expectedCount, action) {
+  if (status.services.length !== expectedCount) return false
+  if (action === 'uninstall') return status.services.every((service) => service.loaded === false)
+  return status.services.every((service) => service.loaded === true && service.running === true)
 }
 
 async function readLifecycleStatus(adapter, context, runner, deps, manager, action, lifecycle) {
   let status = normalizeStatus(await adapter.status(context, runner))
-  if (manager !== 'launchd' || !['install', 'reload'].includes(action) || lifecycle.ok === false) return status
+  if (manager !== 'launchd' || !['install', 'reload', 'uninstall'].includes(action) || lifecycle.ok === false) return status
   const sleep = deps.sleep ?? defaultSleep
   for (const delay of READINESS_RETRY_DELAYS_MS) {
-    if (servicesOperational(status, context.services.length)) break
+    if (lifecycleStateReached(status, context.services.length, action)) break
     await sleep(delay)
     status = normalizeStatus(await adapter.status(context, runner))
   }
