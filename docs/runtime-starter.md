@@ -52,6 +52,7 @@ Run lifecycle commands as the logged-in user. No `sudo` is required:
 
 ```bash
 node fleet-runtime/service-manager.mjs install --service-manager launchd \
+  --node "$(command -v node)" \
   > "$HOME/.fleet/receipts/service-install.json"
 node "$HOME/.fleet/runtime/service-manager.mjs" status --service-manager launchd \
   > "$HOME/.fleet/receipts/service.json"
@@ -61,7 +62,7 @@ node "$HOME/.fleet/runtime/host-receipt.mjs" \
 ```
 
 The equivalent one-command install path is
-`node fleet-runtime/install.mjs --activate --service-manager launchd`, but the
+`node fleet-runtime/install.mjs --activate --service-manager launchd --node "$(command -v node)"`, but the
 separate install and activation steps are preferable when collecting proof.
 
 ## Linux With systemd
@@ -70,6 +71,7 @@ Install and query the systemd user services first:
 
 ```bash
 node fleet-runtime/service-manager.mjs install --service-manager systemd \
+  --node "$(command -v node)" \
   > "$HOME/.fleet/receipts/service-install.json"
 node "$HOME/.fleet/runtime/service-manager.mjs" status --service-manager systemd \
   > "$HOME/.fleet/receipts/service.json"
@@ -88,7 +90,7 @@ node "$HOME/.fleet/runtime/host-receipt.mjs" \
 ```
 
 The installer can activate explicitly with
-`node fleet-runtime/install.mjs --activate --service-manager systemd --enable-linger`
+`node fleet-runtime/install.mjs --activate --service-manager systemd --enable-linger --node "$(command -v node)"`
 only when the operator has intentionally selected that policy. It never invokes
 `sudo`.
 
@@ -148,8 +150,8 @@ the PID recorded for the running control service.
 The supported service lifecycle is explicit:
 
 ```bash
-node fleet-runtime/service-manager.mjs install --service-manager auto
-node fleet-runtime/service-manager.mjs reload --service-manager auto
+node fleet-runtime/service-manager.mjs install --service-manager auto --node "$(command -v node)"
+node fleet-runtime/service-manager.mjs reload --service-manager auto --node "$(command -v node)"
 node fleet-runtime/service-manager.mjs status --service-manager auto
 node fleet-runtime/service-manager.mjs uninstall --service-manager auto
 ```
@@ -185,8 +187,10 @@ advancement. Old receipts do not prove a recovered process.
 
 ```bash
 node fleet-runtime/install.mjs --activate --service-manager auto \
+  --node "$(command -v node)" \
   > "$HOME/.fleet/receipts/recovery-install.json"
 node "$HOME/.fleet/runtime/service-manager.mjs" reload --service-manager auto \
+  --node "$(command -v node)" \
   > "$HOME/.fleet/receipts/recovery-reload.json"
 node "$HOME/.fleet/runtime/cutover-probe.mjs" \
   --base-url https://YOUR-POT.example.com \

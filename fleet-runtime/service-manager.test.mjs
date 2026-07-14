@@ -120,6 +120,47 @@ test('service receipt redacts secret-looking command output and fails closed', a
   assert.doesNotMatch(JSON.stringify(receipt), /abcdefghijklmnop/)
 })
 
+test('launchctl print receipts omit inherited environment values', async () => {
+  const context = fixtureContext()
+  const marker = 'opaque-environment-credential-value'
+  const launchd = adapter()
+  launchd.status = async (current, runner) => {
+    await runner([
+      'launchctl',
+      'print',
+      `${current.domain}/${current.services[0].launchdLabel}`,
+    ])
+    return {
+      ok: true,
+      services: current.services.map((service, index) => ({
+        key: service.key,
+        name: service.name,
+        definitionPath: service.definitionPath,
+        loaded: true,
+        enabled: true,
+        running: true,
+        pid: index + 11,
+      })),
+      linger: null,
+      next_steps: [],
+    }
+  }
+  const receipt = await buildServiceReceipt({ action: 'status', serviceManager: 'launchd' }, {
+    platformName: 'darwin',
+    createServiceContext: () => context,
+    launchd,
+    runner: async () => ({
+      code: 0,
+      stdout: `state = running\ninherited environment = {\n  API_KEY_21ST => ${marker}\n}\npid = 11\n`,
+      stderr: '',
+    }),
+  })
+
+  assert.equal(receipt.status, 'pass')
+  assert.equal(receipt.commands[0].stdout_summary, '[launchctl print output omitted]')
+  assert.doesNotMatch(JSON.stringify(receipt), new RegExp(marker))
+})
+
 test('service receipt caps ordinary command output summaries at 2000 characters', async () => {
   const context = fixtureContext()
   const receipt = await buildServiceReceipt({ action: 'status', serviceManager: 'launchd' }, {

@@ -138,6 +138,14 @@ function redactedSummary(value) {
   return { ...redacted, text: redacted.text.slice(0, 2000) }
 }
 
+function commandOutputSummary(argv, stream, value) {
+  const redacted = redactedSummary(value)
+  if (stream === 'stdout' && argv[0] === 'launchctl' && argv[1] === 'print') {
+    return { ...redacted, text: '[launchctl print output omitted]' }
+  }
+  return redacted
+}
+
 function sanitizeReceiptValue(value) {
   if (typeof value === 'string') {
     const redacted = redactSecretValues(value)
@@ -306,8 +314,8 @@ export async function buildServiceReceipt(opts = {}, deps = {}) {
     } catch (error) {
       response = { code: 1, stdout: '', stderr: error?.message ?? String(error) }
     }
-    const stdout = redactedSummary(response?.stdout)
-    const stderr = redactedSummary(response?.stderr)
+    const stdout = commandOutputSummary(argv, 'stdout', response?.stdout)
+    const stderr = commandOutputSummary(argv, 'stderr', response?.stderr)
     secretFound ||= stdout.secretFound || stderr.secretFound
     commands.push({
       executable: argv[0],

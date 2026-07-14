@@ -65,17 +65,29 @@ async function bootoutServices(context, indexes, runner) {
   }
 }
 
-function parseTopLevelPid(stdout) {
+function topLevelLines(stdout) {
   let depth = 0
+  const lines = []
   for (const line of String(stdout).split(/\r?\n/)) {
-    if (depth === 1) {
-      const match = line.match(/^\s*pid = ([0-9]+)\s*$/)
-      if (match) return Number(match[1])
-    }
-    for (const character of line) {
-      if (character === '{') depth += 1
-      if (character === '}') depth = Math.max(0, depth - 1)
-    }
+    if (depth === 1) lines.push(line)
+    if (/^\s*[^=]+ = \{\s*$/.test(line)) depth += 1
+    else if (/^\s*}\s*$/.test(line)) depth = Math.max(0, depth - 1)
+  }
+  return lines
+}
+
+function parseTopLevelPid(stdout) {
+  for (const line of topLevelLines(stdout)) {
+    const match = line.match(/^\s*pid = ([0-9]+)\s*$/)
+    if (match) return Number(match[1])
+  }
+  return null
+}
+
+function parseTopLevelState(stdout) {
+  for (const line of topLevelLines(stdout)) {
+    const match = line.match(/^\s*state = (\S+)\s*$/)
+    if (match) return match[1]
   }
   return null
 }
@@ -130,8 +142,9 @@ export async function statusLaunchd(context, runner) {
       states.push(resultFor(service, { loaded: null, enabled: null, running: null, pid: null, error: response.stderr || response.stdout || `launchctl print exited ${response.code}` }))
       continue
     }
-    const pid = parseTopLevelPid(response.stdout)
-    states.push(resultFor(service, { loaded: true, enabled: true, running: pid !== null, pid }))
+    const parsedPid = parseTopLevelPid(response.stdout)
+    const running = parseTopLevelState(response.stdout) === 'running' && parsedPid !== null
+    states.push(resultFor(service, { loaded: true, enabled: true, running, pid: running ? parsedPid : null }))
   }
   return states
 }
