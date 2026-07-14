@@ -5,10 +5,45 @@ import { makeCroReason, makeCroObserveKpi, DEFAULT_CONVERSION_FLOOR } from '../s
 import type { ReasonInput } from '../src/loops/runtime'
 import type { LoopManifest } from '../src/loops/manifest'
 import type { Env, ModelPort } from '../src/types'
+import type { D1Database } from '@cloudflare/workers-types'
 
 const ENV = { TENANT_SLUG: 't' } as unknown as Env
 
 const loop = { id: 'loop1', okr: 'lift signups', kpi: { signal: 'avg_conversion_bps', target: 200 } } as LoopManifest
+
+// ── In-memory metric_points mock (matches tests/pulse.test.ts's makeDb shape) ──
+// Only the SELECT path readSeries uses is needed here: filter by
+// (tenant_id, metric_key, occurred_at BETWEEN fromISO AND toISO).
+interface MpRow {
+  tenant_id: string
+  metric_key: string
+  value: number
+  occurred_at: string
+}
+
+function makeMetricPointsDb(rows: MpRow[]): D1Database {
+  return {
+    prepare() {
+      return {
+        bind(...args: unknown[]) {
+          return {
+            async all() {
+              const [tenantId, metricKey, fromISO, toISO] = args as [string, string, string, string]
+              const results = rows.filter(
+                (r) =>
+                  r.tenant_id === tenantId &&
+                  r.metric_key === metricKey &&
+                  r.occurred_at >= fromISO &&
+                  r.occurred_at <= toISO,
+              )
+              return { results, success: true, meta: { rows_read: results.length } }
+            },
+          }
+        },
+      }
+    },
+  } as unknown as D1Database
+}
 
 const okModel = (json: string): ModelPort => ({ chat: vi.fn(async () => json) })
 const REC = '{"recommendation":"Tighten the headline to the core benefit and move the CTA above the fold."}'
@@ -131,5 +166,74 @@ describe('makeCroObserveKpi', () => {
       },
     })
     expect(await observe(ENV, loop)).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// defaultReadSignal wiring — the real metric_points read (no readSignal override).
+// ---------------------------------------------------------------------------
+
+describe('makeCroObserveKpi — default readSignal (metric_points wiring)', () => {
+  const NOW = Date.now()
+  const inWindowISO = (hoursAgo: number) => new Date(NOW - hoursAgo * 60 * 60 * 1000).toISOString()
+  const outOfWindowISO = (daysAgo: number) => new Date(NOW - daysAgo * 24 * 60 * 60 * 1000).toISOString()
+
+  it('averages loop.kpi.signal points from metric_points for this tenant, in-window', async () => {
+    const env = {
+      TENANT_SLUG: 'tenant-x',
+      DB: makeMetricPointsDb([
+        // matches: tenant + metric_key = loop.kpi.signal, within the trailing window
+        { tenant_id: 'tenant-x', metric_key: 'avg_conversion_bps', value: 100, occurred_at: inWindowISO(1) },
+        { tenant_id: 'tenant-x', metric_key: 'avg_conversion_bps', value: 200, occurred_at: inWindowISO(2) },
+      ]),
+    } as unknown as Env
+    const observe = makeCroObserveKpi() // no override → defaultReadSignal
+    // avg(100, 200) = 150; target = 200 ⇒ 150/200*100 = 75
+    expect(await observe(env, loop)).toBe(75)
+  })
+
+  it('does not read another tenant\'s metric_points (tenant isolation)', async () => {
+    const env = {
+      TENANT_SLUG: 'tenant-x',
+      DB: makeMetricPointsDb([
+        { tenant_id: 'tenant-OTHER', metric_key: 'avg_conversion_bps', value: 999, occurred_at: inWindowISO(1) },
+      ]),
+    } as unknown as Env
+    const observe = makeCroObserveKpi()
+    expect(await observe(env, loop)).toBe(0)
+  })
+
+  it('does not read a different metric_key (only the loop\'s own kpi.signal)', async () => {
+    const env = {
+      TENANT_SLUG: 'tenant-x',
+      DB: makeMetricPointsDb([
+        { tenant_id: 'tenant-x', metric_key: 'growth.leads', value: 999, occurred_at: inWindowISO(1) },
+      ]),
+    } as unknown as Env
+    const observe = makeCroObserveKpi()
+    expect(await observe(env, loop)).toBe(0)
+  })
+
+  it('ignores points outside the trailing signal window', async () => {
+    const env = {
+      TENANT_SLUG: 'tenant-x',
+      DB: makeMetricPointsDb([
+        { tenant_id: 'tenant-x', metric_key: 'avg_conversion_bps', value: 500, occurred_at: outOfWindowISO(30) },
+      ]),
+    } as unknown as Env
+    const observe = makeCroObserveKpi()
+    expect(await observe(env, loop)).toBe(0)
+  })
+
+  it('no matching points ⇒ honest 0 (never fabricated)', async () => {
+    const env = { TENANT_SLUG: 'tenant-x', DB: makeMetricPointsDb([]) } as unknown as Env
+    const observe = makeCroObserveKpi()
+    expect(await observe(env, loop)).toBe(0)
+  })
+
+  it('no TENANT_SLUG bound ⇒ honest 0, never queries with an undefined tenant', async () => {
+    const env = { TENANT_SLUG: undefined, DB: makeMetricPointsDb([]) } as unknown as Env
+    const observe = makeCroObserveKpi()
+    expect(await observe(env, loop)).toBe(0)
   })
 })

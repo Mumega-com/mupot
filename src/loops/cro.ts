@@ -21,6 +21,7 @@ import type { Env, ModelPort, ModelMessage } from '../types'
 import type { ProposedAct, RuntimeDeps } from './runtime'
 import { createModel } from '../model'
 import type { ResourceItem } from './resources'
+import { readSeries } from '../metrics/pulse'
 
 // A page is an underperformer when its conversion rate is below this floor (fraction,
 // e.g. 0.02 = 2%). Overridable per call; a conservative default so the loop targets
@@ -240,14 +241,58 @@ async function defaultProposedSlugs(env: Env, loopId: string): Promise<Set<strin
 
 // ── KPI: conversion signal ÷ target ────────────────────────────────────────────
 
+/** Trailing window (days) the default readSignal averages over. Mirrors the WINDOW_DAYS
+ * convention used by content-metrics.ts's reporting snapshot on the mumega.com side. */
+const DEFAULT_SIGNAL_WINDOW_DAYS = 7
+
 export interface CroKpiDeps {
   /**
    * Read the current first-party conversion signal in the SAME unit as kpi.target
-   * (e.g. average conversion in basis points). Default returns 0 — the loop reports
-   * honest "no signal yet" until a first-party source is bound (the data-layer
-   * follow-on), rather than a fabricated number.
+   * (e.g. average conversion in basis points). Default (defaultReadSignal, below) reads
+   * the real metric_points series for loop.kpi.signal — honest "no signal yet" (0) only
+   * when the pot genuinely has no matching points, never a fabricated number.
    */
   readSignal?: (env: Env, loopId: string) => Promise<number>
+}
+
+/**
+ * defaultReadSignal — the CRO KPI seam's real read, wired to metric_points (the same
+ * kernel-level time-series table the console candlestick + first-party CRO source read;
+ * see src/cro/first-party.ts). Reuses `readSeries` (src/metrics/pulse.ts) rather than a
+ * parallel query — extend canonical, don't proliferate.
+ *
+ * metric_points has no loop_id column (tenant_id + metric_key is the addressable key), so
+ * a loop's OWN signal is selected by metric_key = loop.kpi.signal — the name the loop
+ * manifest itself declares (e.g. 'avg_conversion_bps'). `loopId` is accepted only for
+ * CroKpiDeps.readSignal signature compatibility (a test-injected override may still key on
+ * it); the default path does not use it.
+ *
+ * Averages every point in the trailing DEFAULT_SIGNAL_WINDOW_DAYS window rather than
+ * reading only the latest — a single noisy/late-arriving point can't swing the whole KPI.
+ * No points in the window ⇒ honest 0 (never stale-extrapolated, never fabricated).
+ *
+ * This is wireable NOW, independent of the S5b apply-bridge (docs/cro-system-epic.md):
+ * metric_points is already populated by existing collectors (department collectors +
+ * the CRO ingest cron, src/cro/collect.ts) regardless of whether an approved CRO content
+ * act has an auto-apply path yet. Observing the KPI and applying a proposed act are
+ * orthogonal — this slice only wires the former.
+ *
+ * GEO NOTE (future slice): this reads the raw signal series with no traffic-source
+ * segmentation. A before/after CRO comparison must first split AI-referral traffic
+ * (ChatGPT/Perplexity/AI-Overviews) from organic/direct or a traffic-mix shift is
+ * misread as a conversion change (the same Simpson's-paradox risk migrations/
+ * 0031_cro_events.sql documents for cro_events). Not built here.
+ */
+async function defaultReadSignal(env: Env, _loopId: string, metricKey: string): Promise<number> {
+  const tenantId = env.TENANT_SLUG
+  if (!tenantId || !metricKey) return 0
+  const toISO = new Date().toISOString()
+  const fromISO = new Date(Date.now() - DEFAULT_SIGNAL_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString()
+  const { points } = await readSeries(env.DB, tenantId, metricKey, fromISO, toISO)
+  if (points.length === 0) return 0
+  const finite = points.map((p) => p.value).filter((v) => Number.isFinite(v))
+  if (finite.length === 0) return 0
+  return finite.reduce((sum, v) => sum + v, 0) / finite.length
 }
 
 /**
@@ -256,9 +301,9 @@ export interface CroKpiDeps {
  * when no signal source is wired — honest, never invented.
  */
 export function makeCroObserveKpi(deps: CroKpiDeps = {}): NonNullable<RuntimeDeps['observeKpi']> {
-  const readSignal = deps.readSignal ?? (async () => 0)
   return async (env, loop) => {
     const target = loop.kpi.target > 0 ? loop.kpi.target : 1
+    const readSignal = deps.readSignal ?? ((e, id) => defaultReadSignal(e, id, loop.kpi.signal))
     let signal = 0
     try {
       signal = await readSignal(env, loop.id)
