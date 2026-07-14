@@ -4,6 +4,15 @@ Everything is built and deployed. This is the exact operator runbook to cross th
 gate: a real outreach send, approved by you, with a real reply moving the KPI. When this
 runs clean, the version is **v1.0.0**.
 
+## Runtime starter gate
+
+Before business traffic, complete [the cross-platform runtime starter](runtime-starter.md)
+for every local agent. The Mac launchd or Linux systemd service receipt, bounded
+continuous receipt, governed start/stop evidence, starter receipt, and independently
+checked copied bundle must all report `pass`. This gate supports co-resident and
+distributed hosts and preserves configs, keys, and receipts during rollback. Do not
+place bearer tokens or private keys in service environments or evidence files.
+
 Run against the pot you operate (examples use the Digid pot; swap the config/URL).
 
 ## 1. Set the GHL secrets (one time)

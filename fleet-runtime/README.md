@@ -26,22 +26,23 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `register-agent-key.sh` | register the **public** key in the pot (`agent_keys`) via wrangler |
 | `attach-signed.mjs` | one-shot signed attach (CLI) |
 | `fleet-sign.mjs` | shared signer core (no tenant default) |
-| `install.mjs` | non-destructive host installer for runtime scripts, templates, and systemd units |
+| `install.mjs` | non-destructive host installer for runtime scripts, templates, and launchd/systemd definitions |
+| `service-manager.mjs` | common install/reload/status/uninstall lifecycle CLI |
+| `continuous-runtime-receipt.mjs` | bounded daemon/service advancement proof |
+| `starter-manifest.mjs` | sterile co-resident or distributed two-agent starter plan and verifier |
 | `fleet-daemon.mjs` | presence heartbeat loop, optional signed inbox drain, signed shutdown detach |
 | `daemon.example.json` | config template (set base_url, tenant, agents, probes) |
-| `fleet-daemon.service` | systemd user unit |
 | `inbox-handler.mjs` | durable local handoff command for daemon inbox batches |
 | `inbox-handler.example.json` | per-agent spool + launch command config |
 | `fleet-control-daemon.mjs` | signed open/close/restart consumer for `POST /api/fleet/control` |
 | `control-request.mjs` | host verifier for `fleet-control.v1` requests |
 | `control.example.json` | control-daemon config template |
-| `fleet-control-daemon.service` | systemd user unit for host lifecycle control |
 | `host-receipt.mjs` | non-destructive local verifier that emits a redacted host-install receipt |
 | `runtime-receipt.mjs` | one-shot live daemon-cycle receipt for signed attach + inbox drain |
-| `control-receipt.mjs` | one-shot live control receipt for signed open/close/restart |
+| `control-receipt.mjs` | direct-poll or daemon-state lifecycle receipt |
 | `cutover-receipt.mjs` | verifies host/runtime/control receipts before SOS removal |
 | `cutover-probe.mjs` | queues inbox and lifecycle probes that live receipts must observe |
-| `receipt-bundle.mjs` | saves host/runtime/control receipts, final gate, and manifest in one directory |
+| `receipt-bundle.mjs` | saves host/runtime/control receipts, final gate, starter evidence, and manifest |
 
 ## Quickstart (per agent)
 
@@ -62,7 +63,7 @@ node fleet-runtime/attach-signed.mjs https://YOUR-POT my-agent --tenant <your-te
 
 ## Install on a host
 
-From a checkout, lay down the runtime scripts, systemd user units, editable
+From a checkout, lay down the runtime scripts, platform service definitions, editable
 config templates, and receipt directories:
 
 ```bash
@@ -82,6 +83,9 @@ The installer emits `receipt_type: "mupot-fleet-install-receipt/v1"`. A first
 install usually returns `status:"warn"` because `~/.fleet/*.json` was created
 from templates and must be edited. It preserves existing config files unless
 you pass `--force-config`, so rerunning it is safe for script/unit updates.
+
+For the complete launchd/systemd lifecycle, distributed topology, rollback, and
+starter evidence sequence, use [`docs/runtime-starter.md`](../docs/runtime-starter.md).
 
 To keep the install receipt with the later cutover evidence, save it as JSON
 before running the bundle:
@@ -136,10 +140,10 @@ stores only public material, and refuses silent key replacement.
 ## Run the daemon (continuous presence + optional inbox drain)
 
 ```bash
-systemctl --user daemon-reload
-loginctl enable-linger "$USER"                                # survive logout/reboot
-systemctl --user enable --now fleet-daemon.service
-journalctl --user -u fleet-daemon -f
+node fleet-runtime/service-manager.mjs install --service-manager systemd
+loginctl enable-linger "$USER" # explicit operator action for logout continuity
+node fleet-runtime/service-manager.mjs status --service-manager systemd
+journalctl --user -u fleet-daemon.service -u fleet-control-daemon.service -f
 ```
 
 **Probes must detect death, not past-life.** A probe is a shell command that exits 0 iff the
@@ -185,10 +189,10 @@ The command receives one JSON object on stdin:
 }
 ```
 
-Configure the handler:
+The installer already created `~/.fleet/inbox-handler.json`. Edit that configured file in
+place, then create the handler directory:
 
 ```bash
-cp fleet-runtime/inbox-handler.example.json ~/.fleet/inbox-handler.json
 mkdir -p ~/.fleet/handlers
 ```
 
@@ -216,11 +220,12 @@ with the panel **public** key, burns the nonce in `~/.fleet/control-nonces.json`
 node ~/.fleet/runtime/flight.mjs open|close <agent> ~/.fleet/flights.json
 ```
 
-Configure it:
+The installer already created `~/.fleet/control.json`. Edit that file in place,
+run the trust bootstrap above, then reload both user services without replacing
+the configured file:
 
 ```bash
-cp fleet-runtime/control.example.json ~/.fleet/control.json
-cp fleet-runtime/fleet-control-daemon.service ~/.config/systemd/user/
+node fleet-runtime/service-manager.mjs reload --service-manager auto
 ```
 
 `consumer_agent_id` must be the same agent as `FLEET_CONSUMER_AGENT` in the Worker. That
@@ -273,8 +278,7 @@ control-request → host control-daemon → runs the flight — is the ATC layer
 
 ## Control live receipt
 
-After the host receipt passes and an owner/admin has queued a control request
-from Mupot, run one live control poll:
+When no control service is active, a direct one-shot poll remains available:
 
 ```bash
 node ~/.fleet/runtime/control-receipt.mjs \
@@ -287,7 +291,17 @@ or from a checkout:
 npm run receipt:control
 ```
 
-The control receipt runs the same path as the control daemon once:
+For an activated host, keep the service daemon as the only inbox consumer. Queue
+the request with `cutover-probe.mjs`, then observe its redacted state:
+
+```bash
+node ~/.fleet/runtime/control-receipt.mjs --observe-state \
+  --probe-receipt ~/.fleet/receipts/my-agent/probe-start.json \
+  --verb start \
+  > ~/.fleet/receipts/my-agent/control-start.json
+```
+
+The direct mode runs the same path as the control daemon once:
 
 - signs `/api/inbox/signed` as the fleet consumer agent
 - verifies the queued `fleet-control.v1` request with the panel public key
@@ -442,15 +456,21 @@ node ~/.fleet/runtime/cutover-probe.mjs \
   > ~/.fleet/receipts/my-agent/probe-start.json
 ```
 
-Then collect the runtime handoff and `start` control receipts:
+Then observe the active control daemon without polling its inbox a second time,
+and collect the runtime handoff while reusing that control receipt:
 
 ```bash
+node ~/.fleet/runtime/control-receipt.mjs --observe-state \
+  --probe-receipt ~/.fleet/receipts/my-agent/probe-start.json \
+  --verb start \
+  > ~/.fleet/receipts/my-agent/control-start.json
+
 node ~/.fleet/runtime/receipt-bundle.mjs \
   --agent my-agent \
   --out-dir ~/.fleet/receipts/my-agent \
   --probe-receipt ~/.fleet/receipts/my-agent/probe-start.json \
   --skip-host \
-  --control-label start
+  --skip-control
 ```
 
 Queue a `stop` control request and collect the second live control receipt:
@@ -462,13 +482,18 @@ node ~/.fleet/runtime/cutover-probe.mjs \
   --control stop \
   > ~/.fleet/receipts/my-agent/probe-stop.json
 
+node ~/.fleet/runtime/control-receipt.mjs --observe-state \
+  --probe-receipt ~/.fleet/receipts/my-agent/probe-stop.json \
+  --verb stop \
+  > ~/.fleet/receipts/my-agent/control-stop.json
+
 node ~/.fleet/runtime/receipt-bundle.mjs \
   --agent my-agent \
   --out-dir ~/.fleet/receipts/my-agent \
   --probe-receipt ~/.fleet/receipts/my-agent/probe-stop.json \
   --skip-host \
   --skip-runtime \
-  --control-label stop
+  --skip-control
 ```
 
 To recheck an already gathered evidence directory without touching the live host

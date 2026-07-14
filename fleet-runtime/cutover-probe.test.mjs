@@ -56,6 +56,28 @@ test('cutover probe queues inbox and control requests without echoing tokens', a
   assert.equal(receipt.actions.filter((a) => a.kind === 'control_request').length, 2)
 })
 
+test('cutover probe timestamps the receipt before queueing control work', async () => {
+  const events = []
+  const receipt = await buildReceipt({
+    baseUrl: 'https://pot.example.org',
+    agent: 'agent-one',
+    queueInbox: false,
+    controls: ['start'],
+    env: { MUPOT_OWNER_TOKEN: 'owner-token' },
+    now: () => {
+      events.push('timestamp')
+      return '2026-07-08T00:00:00.000Z'
+    },
+    fetchImpl: async () => {
+      events.push('queue')
+      return jsonResponse({ ok: true, nonce: 'nonce-start', agent_id: 'agent-one', verb: 'start' })
+    },
+  })
+
+  assert.equal(receipt.status, 'pass')
+  assert.deepEqual(events, ['timestamp', 'queue'])
+})
+
 test('cutover probe fails before posting when required tokens are missing', async () => {
   let called = false
   const receipt = await buildReceipt({

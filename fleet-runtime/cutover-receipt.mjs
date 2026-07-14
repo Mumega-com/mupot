@@ -145,7 +145,7 @@ function controlRuns(receipts) {
   const runs = []
   for (const receipt of receipts) {
     for (const c of receipt?.checks ?? []) {
-      if (c?.ok !== true || c?.component !== 'fleet-control-daemon' || c?.check !== 'control_request_executed') continue
+      if (c?.ok !== true || c?.component !== 'fleet-control-daemon' || !['control_request_executed', 'control_request_observed'].includes(c?.check)) continue
       runs.push({
         agent_id: c.agent_id ?? receipt?.poll?.request?.agent_id ?? null,
         verb: c.verb ?? receipt?.poll?.request?.verb ?? null,

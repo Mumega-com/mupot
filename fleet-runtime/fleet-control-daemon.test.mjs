@@ -6,6 +6,7 @@ import { canonicalControlMessage, importPanelPublicKey } from './control-request
 import {
   handleControlMessage,
   pollOnce,
+  runControlCycle,
   runFlightVerb,
   validateConfig,
 } from './fleet-control-daemon.mjs'
@@ -62,6 +63,11 @@ test('validateConfig: normalizes a valid control daemon config', () => {
   assert.equal(cfg.pollSec, 5)
   assert.equal(cfg.commandTimeoutMs, 600_000)
   assert.ok(cfg.panelPublicKeyPath.endsWith('panel.pub.jwk'))
+})
+
+test('validateConfig: uses an optional state_file or the runtime state default', () => {
+  assert.equal(validateConfig(baseRaw()).statePath, `${process.env.HOME}/.fleet/state/fleet-control.json`)
+  assert.equal(validateConfig({ ...baseRaw(), state_file: '/tmp/control-state.json' }).statePath, '/tmp/control-state.json')
 })
 
 test('validateConfig: rejects malformed critical fields', () => {
@@ -149,4 +155,84 @@ test('pollOnce: peeks one message, executes, then consumes one message', async (
   })
   assert.equal(res.ok, true)
   assert.deepEqual(calls, [{ peek: true, limit: 1 }, { peek: false, limit: 1 }])
+})
+
+test('runControlCycle: publishes completed polls in order and survives state write failures', async () => {
+  const cfg = validateConfig({ ...baseRaw(), state_file: '/tmp/control-state.json' })
+  const outcome = {
+    ok: true,
+    action: 'open',
+    request: { agent_id: 'agent-one', verb: 'start', nonce: 'nonce-123', sig: 'signature-123' },
+  }
+  const writes = []
+  const logs = []
+  const events = []
+  const state = { poll: 0 }
+  let finishFirst
+  const firstOperation = new Promise((resolve) => { finishFirst = resolve })
+  const pollOnceFn = async () => {
+    events.push('poll')
+    return firstOperation
+  }
+  const options = {
+    statePath: '/tmp/control-state.json',
+    pid: 456,
+    startedAt: '2026-07-13T12:00:00.000Z',
+    now: () => new Date('2026-07-13T12:01:00.000Z'),
+    pollOnce: pollOnceFn,
+    writeRuntimeState: (path, published) => {
+      events.push(`write:${published.poll}`)
+      writes.push({ path, state: published })
+    },
+    log: (entry) => logs.push(entry),
+  }
+  const firstCycle = runControlCycle(cfg, 'consumer-key', null, null, state, options)
+  await Promise.resolve()
+  assert.deepEqual(events, ['poll'])
+  finishFirst(outcome)
+  assert.equal(await firstCycle, outcome)
+  assert.equal(state.poll, 1)
+
+  options.now = () => new Date('2026-07-13T12:01:05.000Z')
+  options.writeRuntimeState = () => { throw new Error('disk full') }
+  assert.equal(await runControlCycle(cfg, 'consumer-key', null, null, state, options), outcome)
+  assert.equal(state.poll, 2)
+
+  options.now = () => new Date('2026-07-13T12:01:10.000Z')
+  options.writeRuntimeState = (path, published) => {
+    events.push(`write:${published.poll}`)
+    writes.push({ path, state: published })
+  }
+  assert.equal(await runControlCycle(cfg, 'consumer-key', null, null, state, options), outcome)
+
+  assert.deepEqual(events, ['poll', 'write:1', 'poll', 'poll', 'write:3'])
+  assert.deepEqual(writes.map((write) => write.state.poll), [1, 3])
+  assert.equal(state.poll, 3)
+  assert.doesNotMatch(JSON.stringify(writes[0].state), /nonce|signature|token/i)
+  assert.equal(logs.at(-1).event, 'state_write_failed')
+  assert.equal(logs.at(-1).state_path, '/tmp/control-state.json')
+})
+
+test('runControlCycle keeps correlated accepted evidence across later idle polls', async () => {
+  const cfg = validateConfig({ ...baseRaw(), state_file: '/tmp/control-state.json' })
+  const outcomes = [
+    { ok: true, action: 'open', request: { agent_id: 'agent-one', verb: 'start', nonce: 'nonce-123' } },
+    { ok: true, action: 'idle' },
+  ]
+  const writes = []
+  const state = { poll: 0 }
+  const options = {
+    pid: 456,
+    startedAt: '2026-07-13T12:00:00.000Z',
+    now: () => new Date('2026-07-13T12:01:00.000Z'),
+    pollOnce: async () => outcomes.shift(),
+    writeRuntimeState: (_path, published) => writes.push(published),
+  }
+
+  await runControlCycle(cfg, 'consumer-key', null, null, state, options)
+  await runControlCycle(cfg, 'consumer-key', null, null, state, options)
+
+  assert.equal(writes[1].last_outcome.result, 'idle')
+  assert.deepEqual(writes[1].last_accepted, writes[0].last_accepted)
+  assert.match(writes[1].last_accepted.request_ref, /^[a-f0-9]{64}$/)
 })

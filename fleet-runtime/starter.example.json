@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "tenant": "customer-pot",
+  "base_url": "https://pot.customer.example",
+  "service_manager": "auto",
+  "agents": [
+    {
+      "agent_id": "manager",
+      "runtime": "hermes",
+      "probe": "pgrep -f hermes",
+      "handler": "node ~/.fleet/handlers/hermes.mjs"
+    },
+    {
+      "agent_id": "builder",
+      "runtime": "codex",
+      "probe": "pgrep -f codex",
+      "handler": "node ~/.fleet/handlers/codex.mjs"
+    }
+  ],
+  "control_consumer_agent_id": "manager"
+}

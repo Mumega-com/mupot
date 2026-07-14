@@ -158,3 +158,11 @@ test('controlRuns falls back to poll request metadata for older checks', () => {
   }])
   assert.deepEqual(runs, [{ agent_id: 'agent-one', verb: 'start', action: 'open' }])
 })
+
+test('controlRuns accepts a daemon-state observation without requiring another inbox poll', () => {
+  const runs = controlRuns([{
+    checks: [{ ok: true, component: 'fleet-control-daemon', check: 'control_request_observed', agent_id: 'agent-one', verb: 'stop', action: 'close' }],
+    poll: { request: { agent_id: 'agent-one', verb: 'stop', request_ref: 'a'.repeat(64) } },
+  }])
+  assert.deepEqual(runs, [{ agent_id: 'agent-one', verb: 'stop', action: 'close' }])
+})

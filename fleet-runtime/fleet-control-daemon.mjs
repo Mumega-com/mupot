@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import { loadPrivKey, signedInbox } from './fleet-sign.mjs'
 import { importPanelPublicKey, JsonNonceLedger, verifyControlRequest } from './control-request.mjs'
+import { controlState, writeRuntimeState } from './runtime-state.mjs'
 
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 const DEFAULT_TIMEOUT_MS = 120_000
@@ -51,6 +52,9 @@ export function validateConfig(raw) {
   let commandTimeoutMs = Number.isInteger(raw.command_timeout_ms) ? raw.command_timeout_ms : DEFAULT_TIMEOUT_MS
   if (commandTimeoutMs < 1_000) commandTimeoutMs = 1_000
   if (commandTimeoutMs > 600_000) commandTimeoutMs = 600_000
+  const statePath = raw.state_file === undefined
+    ? join(homedir(), '.fleet', 'state', 'fleet-control.json')
+    : requirePath(raw.state_file, 'config.state_file')
   return {
     baseUrl: raw.base_url,
     tenant: raw.tenant,
@@ -61,7 +65,37 @@ export function validateConfig(raw) {
     pollSec,
     commandTimeoutMs,
     flightScript: resolve(expandHome(typeof raw.flight_script === 'string' ? raw.flight_script : join(HERE, 'flight.mjs'))),
+    statePath,
   }
+}
+
+export function publishControlState(cfg, outcome, poll, opts = {}) {
+  const statePath = opts.statePath ?? cfg.statePath
+  const now = opts.now ?? (() => new Date())
+  const logFn = opts.log ?? log
+  const state = controlState({
+    pid: opts.pid ?? process.pid,
+    startedAt: opts.startedAt ?? new Date().toISOString(),
+    poll,
+    lastPollAt: now().toISOString(),
+    pollSec: cfg.pollSec,
+    outcome,
+    lastAccepted: opts.stateTracker?.lastAccepted ?? null,
+  })
+  if (opts.stateTracker) opts.stateTracker.lastAccepted = state.last_accepted
+  try {
+    ;(opts.writeRuntimeState ?? writeRuntimeState)(statePath, state)
+  } catch (error) {
+    logFn({ event: 'state_write_failed', state_path: statePath, error: String(error?.message ?? error) })
+  }
+  return outcome
+}
+
+export async function runControlCycle(cfg, consumerKey, publicKey, ledger, state, opts = {}) {
+  const pollOnceFn = opts.pollOnce ?? pollOnce
+  const outcome = await pollOnceFn(cfg, consumerKey, publicKey, ledger, opts)
+  state.poll += 1
+  return publishControlState(cfg, outcome, state.poll, { ...opts, stateTracker: state })
 }
 
 export function runCommand(argv, timeoutMs = DEFAULT_TIMEOUT_MS, spawnImpl = spawn) {
@@ -186,9 +220,13 @@ async function main() {
   log({ event: 'start', base_url: cfg.baseUrl, tenant: cfg.tenant, consumer_agent: cfg.consumerAgent, poll_sec: cfg.pollSec })
 
   let stopping = false
+  const startedAt = new Date().toISOString()
+  const state = { poll: 0 }
   const loop = async () => {
     while (!stopping) {
-      try { await pollOnce(cfg, consumerKey, publicKey, ledger) } catch (e) { log({ event: 'control_tick_error', error: String(e && e.message ? e.message : e) }) }
+      try {
+        await runControlCycle(cfg, consumerKey, publicKey, ledger, state, { startedAt })
+      } catch (e) { log({ event: 'control_tick_error', error: String(e && e.message ? e.message : e) }) }
       if (!stopping) await new Promise((resolveTimer) => setTimeout(resolveTimer, cfg.pollSec * 1000))
     }
   }
