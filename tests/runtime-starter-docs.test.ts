@@ -64,6 +64,11 @@ describe('runtime starter documentation', () => {
     expect(starter).toMatch(/preserves configs, keys, runtime files, handlers, inboxes,\s+logs, state, and receipts/i)
   })
 
+  it('never overwrites the configured control file before reload', () => {
+    expect(readme).not.toContain('cp fleet-runtime/control.example.json ~/.fleet/control.json')
+    expectOrdered(readme, ['trust-bootstrap.mjs', 'service-manager.mjs reload --service-manager auto'])
+  })
+
   it('keeps credentials out of files and service environments', () => {
     expect(docs).not.toMatch(/EnvironmentVariables[\s\S]{0,200}(?:TOKEN|SECRET|PRIVATE_KEY)/)
     expect(docs).not.toMatch(/Environment=(?:[^\n]*)(?:TOKEN|SECRET|PRIVATE_KEY)/)

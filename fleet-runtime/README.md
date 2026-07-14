@@ -220,10 +220,11 @@ with the panel **public** key, burns the nonce in `~/.fleet/control-nonces.json`
 node ~/.fleet/runtime/flight.mjs open|close <agent> ~/.fleet/flights.json
 ```
 
-Configure it:
+The installer already created `~/.fleet/control.json`. Edit that file in place,
+run the trust bootstrap above, then reload both user services without replacing
+the configured file:
 
 ```bash
-cp fleet-runtime/control.example.json ~/.fleet/control.json
 node fleet-runtime/service-manager.mjs reload --service-manager auto
 ```
 
