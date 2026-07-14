@@ -100,6 +100,7 @@ correlates each queued probe to the daemon's redacted state.
 
 ```bash
 AGENT_ID=manager
+AGENT_TOKEN_ENV=MUPOT_AGENT_TOKEN_MANAGER
 OUT="$HOME/.fleet/receipts/$AGENT_ID"
 mkdir -p "$OUT"
 node "$HOME/.fleet/runtime/host-receipt.mjs" \
@@ -108,7 +109,8 @@ node "$HOME/.fleet/runtime/host-receipt.mjs" \
 
 node "$HOME/.fleet/runtime/cutover-probe.mjs" \
   --base-url https://YOUR-POT.example.com \
-  --agent "$AGENT_ID" --queue-inbox --control start \
+  --agent "$AGENT_ID" --agent-token-env "$AGENT_TOKEN_ENV" \
+  --queue-inbox --control start \
   > "$OUT/probe-start.json"
 node "$HOME/.fleet/runtime/control-receipt.mjs" --observe-state \
   --probe-receipt "$OUT/probe-start.json" --verb start \
@@ -169,7 +171,7 @@ Attach only the copied bundle when `manifest.json`, `cutover-gate.json`,
 ## Data-Preserving Rollback And Recovery
 
 Uninstall unloads only the known user services and removes only their known
-definitions. It preserves configs, keys, runtime files, inboxes, job results,
+definitions. It preserves configs, keys, runtime files, handlers, inboxes,
 logs, state, and receipts under `$HOME/.fleet`.
 
 ```bash
@@ -186,6 +188,13 @@ node fleet-runtime/install.mjs --activate --service-manager auto \
   > "$HOME/.fleet/receipts/recovery-install.json"
 node "$HOME/.fleet/runtime/service-manager.mjs" reload --service-manager auto \
   > "$HOME/.fleet/receipts/recovery-reload.json"
+node "$HOME/.fleet/runtime/cutover-probe.mjs" \
+  --base-url https://YOUR-POT.example.com \
+  --agent "$AGENT_ID" --control start \
+  > "$OUT/probe-recovery-start.json"
+node "$HOME/.fleet/runtime/control-receipt.mjs" --observe-state \
+  --probe-receipt "$OUT/probe-recovery-start.json" --verb start \
+  > "$OUT/control-recovery-start.json"
 node "$HOME/.fleet/runtime/continuous-runtime-receipt.mjs" \
   --agent "$AGENT_ID" --service-manager auto --require-control start \
   > "$HOME/.fleet/receipts/recovery-continuous.json"

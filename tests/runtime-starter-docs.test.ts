@@ -8,6 +8,17 @@ const paths = [
 ]
 
 const docs = paths.map((path) => readFileSync(path, 'utf8')).join('\n')
+const starter = readFileSync('docs/runtime-starter.md', 'utf8')
+const readme = readFileSync('fleet-runtime/README.md', 'utf8')
+
+function expectOrdered(text: string, terms: string[]) {
+  let cursor = -1
+  for (const term of terms) {
+    const index = text.indexOf(term, cursor + 1)
+    expect(index, `missing or out of order: ${term}`).toBeGreaterThan(cursor)
+    cursor = index
+  }
+}
 
 describe('runtime starter documentation', () => {
   it.each([
@@ -34,8 +45,23 @@ describe('runtime starter documentation', () => {
   })
 
   it('collects service-aware host evidence inside the per-agent bundle', () => {
-    expect(docs).toContain('> "$OUT/host.json"')
-    expect(docs).toMatch(/host-receipt\.mjs[\s\S]{0,160}--require-services[\s\S]{0,160}> "\$OUT\/host\.json"/)
+    const governed = starter.slice(starter.indexOf('## Governed Start And Stop Evidence'))
+    expectOrdered(governed, ['--require-services --service-manager auto', '> "$OUT/host.json"', 'cutover-probe.mjs', 'receipt-bundle.mjs'])
+  })
+
+  it('passes the documented named token environment to the inbox probe', () => {
+    const governed = starter.slice(starter.indexOf('## Governed Start And Stop Evidence'))
+    expectOrdered(governed, ['AGENT_TOKEN_ENV=MUPOT_AGENT_TOKEN_MANAGER', 'cutover-probe.mjs', '--agent-token-env "$AGENT_TOKEN_ENV"', '--queue-inbox --control start'])
+  })
+
+  it('queues and observes a fresh start before recovery continuity proof', () => {
+    const recovery = starter.slice(starter.indexOf('## Data-Preserving Rollback And Recovery'))
+    expectOrdered(recovery, ['recovery-install.json', 'cutover-probe.mjs', '--control start', 'control-receipt.mjs', '--observe-state', 'continuous-runtime-receipt.mjs', '--require-control start'])
+  })
+
+  it('uses the unified service lifecycle and lists every preserved directory', () => {
+    expect(readme).not.toContain('systemctl --user enable --now fleet-daemon.service')
+    expect(starter).toMatch(/preserves configs, keys, runtime files, handlers, inboxes,\s+logs, state, and receipts/i)
   })
 
   it('keeps credentials out of files and service environments', () => {

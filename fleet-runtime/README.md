@@ -140,10 +140,10 @@ stores only public material, and refuses silent key replacement.
 ## Run the daemon (continuous presence + optional inbox drain)
 
 ```bash
-systemctl --user daemon-reload
-loginctl enable-linger "$USER"                                # survive logout/reboot
-systemctl --user enable --now fleet-daemon.service
-journalctl --user -u fleet-daemon -f
+node fleet-runtime/service-manager.mjs install --service-manager systemd
+loginctl enable-linger "$USER" # explicit operator action for logout continuity
+node fleet-runtime/service-manager.mjs status --service-manager systemd
+journalctl --user -u fleet-daemon.service -u fleet-control-daemon.service -f
 ```
 
 **Probes must detect death, not past-life.** A probe is a shell command that exits 0 iff the
@@ -224,7 +224,7 @@ Configure it:
 
 ```bash
 cp fleet-runtime/control.example.json ~/.fleet/control.json
-node fleet-runtime/install.mjs --service-manager auto
+node fleet-runtime/service-manager.mjs reload --service-manager auto
 ```
 
 `consumer_agent_id` must be the same agent as `FLEET_CONSUMER_AGENT` in the Worker. That
