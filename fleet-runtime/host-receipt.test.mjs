@@ -465,21 +465,26 @@ test('host receipt parses and documents service requirement options', () => {
     '--require-services',
     '--service-manager', 'launchd',
     '--service-definition-dir', './LaunchAgents',
+    '--node', '/usr/local/bin/node',
   ])
   const help = execFileSync(process.execPath, [fileURLToPath(new URL('./host-receipt.mjs', import.meta.url)), '--help'], { encoding: 'utf8' })
 
   assert.equal(opts.requireServices, true)
   assert.equal(opts.serviceManager, 'launchd')
   assert.ok(opts.serviceDefinitionDir.endsWith('/LaunchAgents'))
+  assert.equal(opts.nodePath, '/usr/local/bin/node')
   assert.match(help, /--require-services/)
   assert.match(help, /--service-manager <auto\|systemd\|launchd>/)
   assert.match(help, /--service-definition-dir <path>/)
+  assert.match(help, /--node <absolute-path>/)
   assert.throws(() => parseArgs(['--service-manager', 'none']), /auto\|systemd\|launchd/)
   assert.throws(() => parseArgs(['--service-manager']), /requires a value/)
   assert.throws(() => parseArgs(['--service-manager', '']), /requires a value/)
   assert.throws(() => parseArgs(['--service-definition-dir', '--skip-control']), /requires a value/)
   assert.throws(() => parseArgs(['--service-manager', 'systemd']), /require --require-services/)
   assert.throws(() => parseArgs(['--service-definition-dir', './systemd']), /require --require-services/)
+  assert.throws(() => parseArgs(['--node', '/usr/local/bin/node']), /require --require-services/)
+  assert.throws(() => parseArgs(['--require-services', '--node', './node']), /absolute path/)
   assert.throws(() => parseArgs(['--require-services', '--skip-control']), /conflicts with --skip-control/)
 })
 

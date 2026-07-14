@@ -58,6 +58,7 @@ node "$HOME/.fleet/runtime/service-manager.mjs" status --service-manager launchd
   > "$HOME/.fleet/receipts/service.json"
 node "$HOME/.fleet/runtime/host-receipt.mjs" \
   --require-services --service-manager launchd \
+  --node "$(command -v node)" \
   > "$HOME/.fleet/receipts/host.json"
 ```
 
@@ -86,6 +87,7 @@ node "$HOME/.fleet/runtime/service-manager.mjs" status --service-manager systemd
   > "$HOME/.fleet/receipts/service-after-linger.json"
 node "$HOME/.fleet/runtime/host-receipt.mjs" \
   --require-services --service-manager systemd \
+  --node "$(command -v node)" \
   > "$HOME/.fleet/receipts/host.json"
 ```
 
@@ -107,6 +109,7 @@ OUT="$HOME/.fleet/receipts/$AGENT_ID"
 mkdir -p "$OUT"
 node "$HOME/.fleet/runtime/host-receipt.mjs" \
   --require-services --service-manager auto \
+  --node "$(command -v node)" \
   > "$OUT/host.json"
 
 node "$HOME/.fleet/runtime/cutover-probe.mjs" \

@@ -77,6 +77,18 @@ describe('runtime starter documentation', () => {
     for (const command of mutating) expect(command).toContain('--node')
   })
 
+  it('passes the installed Node path to every service-aware host proof', () => {
+    const shell = [...docs.matchAll(/```bash\n([\s\S]*?)```/g)]
+      .map((match) => match[1].replace(/\\\n\s*/g, ' '))
+      .join('\n')
+    const hostProofs = shell.split('\n').filter((line) =>
+      /host-receipt\.mjs\b/.test(line) && /--require-services\b/.test(line),
+    )
+
+    expect(hostProofs.length).toBeGreaterThan(0)
+    for (const command of hostProofs) expect(command).toContain('--node')
+  })
+
   it('never overwrites the configured control file before reload', () => {
     expect(readme).not.toContain('cp fleet-runtime/control.example.json ~/.fleet/control.json')
     expect(readme).not.toContain('cp fleet-runtime/inbox-handler.example.json ~/.fleet/inbox-handler.json')
