@@ -324,15 +324,19 @@ describe('deactivate_agent — id/slug bridge ambiguity guard', () => {
       makeEnv({ slugDupeCount: 1, fleetSlugRowExists: true, keySlugRowExists: true }, captured),
     )
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { result: { structuredContent: { detached: number; keys_removed: number } } }
+    const body = (await res.json()) as {
+      result: { structuredContent: { detached: number; keys_removed: number; slug_sweep_skipped?: boolean } }
+    }
     // id-keyed (1) + slug-keyed (1) = 2 each
     expect(body.result.structuredContent.detached).toBe(2)
     expect(body.result.structuredContent.keys_removed).toBe(2)
     expect(captured.filter((c) => c.sql.includes('DELETE FROM fleet_agents'))).toHaveLength(2)
     expect(captured.filter((c) => c.sql.includes('DELETE FROM agent_keys'))).toHaveLength(2)
+    // slug was safe to sweep — no skip flag should be surfaced.
+    expect(body.result.structuredContent.slug_sweep_skipped).toBeUndefined()
   })
 
-  it('refuses the slug-keyed sweep when the slug is shared with another agent (ambiguous)', async () => {
+  it('refuses the slug-keyed sweep when the slug is shared with another agent (ambiguous), and says so', async () => {
     const captured: Captured[] = []
     const res = await call(
       'deactivate_agent',
@@ -340,13 +344,19 @@ describe('deactivate_agent — id/slug bridge ambiguity guard', () => {
       makeEnv({ slugDupeCount: 2, fleetSlugRowExists: true, keySlugRowExists: true }, captured),
     )
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { result: { structuredContent: { detached: number; keys_removed: number } } }
+    const body = (await res.json()) as {
+      result: { structuredContent: { detached: number; keys_removed: number; slug_sweep_skipped?: boolean } }
+    }
     // only the id-keyed row is swept; the slug-keyed row (which could belong to a
     // DIFFERENT agent in a different squad) is left untouched.
     expect(body.result.structuredContent.detached).toBe(1)
     expect(body.result.structuredContent.keys_removed).toBe(1)
     expect(captured.filter((c) => c.sql.includes('DELETE FROM fleet_agents'))).toHaveLength(1)
     expect(captured.filter((c) => c.sql.includes('DELETE FROM agent_keys'))).toHaveLength(1)
+    // the ambiguous-slug skip must be visible in the result, not silent —
+    // a signed runtime key or fleet row keyed by the bare slug can survive
+    // this deactivation and the operator needs to know to clean it up by hand.
+    expect(body.result.structuredContent.slug_sweep_skipped).toBe(true)
   })
 
   it('reports zero when the agent has no fleet presence / no key (still succeeds)', async () => {

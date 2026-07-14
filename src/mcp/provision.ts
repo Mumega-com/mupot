@@ -624,6 +624,15 @@ const toolDeactivateAgent: ToolSpec = {
       detached,
       tokens_revoked: tokensRevoked,
       keys_removed: keysRemoved,
+      // Ambiguous slug (shared with an agent in another squad) → the
+      // slug-keyed fleet_agents/agent_keys sweep above was skipped on
+      // purpose (never sweep another agent's row). That means a signed
+      // runtime key or fleet presence row registered under the bare slug
+      // (see the id↔slug bridge note in src/fleet/registry.ts) can survive
+      // this deactivation and let the retired agent still attach. Surface
+      // it so the operator knows manual cleanup is needed — this must not
+      // be silently invisible in the tool result.
+      ...(safeSlug ? {} : { slug_sweep_skipped: true }),
     })
   },
 }
