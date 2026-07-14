@@ -111,7 +111,7 @@ test('statusLaunchd parses a loaded service pid and an unloaded exit 113', async
   const context = await fixtureContext()
   const { runner } = recordingRunner({
     print: (argv) => argv[2].endsWith(context.services[0].launchdLabel)
-      ? { code: 0, stdout: 'gui/501/com.mumega.mupot-fleet-daemon = {\n\tpid = 4242\n}', stderr: '' }
+      ? { code: 0, stdout: 'gui/501/com.mumega.mupot-fleet-daemon = {\n\tstate = running\n\tpid = 4242\n}', stderr: '' }
       : { code: 113, stdout: '', stderr: 'not found' },
   })
 
@@ -120,6 +120,56 @@ test('statusLaunchd parses a loaded service pid and an unloaded exit 113', async
   assert.deepEqual(states.map(({ key, loaded, running, pid }) => ({ key, loaded, running, pid })), [
     { key: 'heartbeat', loaded: true, running: true, pid: 4242 },
     { key: 'control', loaded: false, running: false, pid: null },
+  ])
+})
+
+test('statusLaunchd does not report a SIGTERMed service as running from a stale pid', async () => {
+  const context = await fixtureContext()
+  const { runner } = recordingRunner({
+    print: () => ({ code: 0, stdout: 'service = {\n\tstate = SIGTERMed\n\tpid = 4242\n}', stderr: '' }),
+  })
+
+  const states = await statusLaunchd(context, runner)
+
+  assert.deepEqual(states.map(({ loaded, running, pid }) => ({ loaded, running, pid })), [
+    { loaded: true, running: false, pid: null },
+    { loaded: true, running: false, pid: null },
+  ])
+})
+
+test('statusLaunchd ignores brace characters inside environment values', async () => {
+  const context = await fixtureContext()
+  const { runner } = recordingRunner({
+    print: () => ({
+      code: 0,
+      stdout: 'service = {\n\tinherited environment = {\n\t\tVALUE => x{y\n\t}\n\tstate = running\n\tpid = 4242\n}',
+      stderr: '',
+    }),
+  })
+
+  const states = await statusLaunchd(context, runner)
+
+  assert.deepEqual(states.map(({ running, pid }) => ({ running, pid })), [
+    { running: true, pid: 4242 },
+    { running: true, pid: 4242 },
+  ])
+})
+
+test('statusLaunchd never promotes nested state and pid after a scalar closing brace', async () => {
+  const context = await fixtureContext()
+  const { runner } = recordingRunner({
+    print: () => ({
+      code: 0,
+      stdout: 'service = {\n\tnested = {\n\t\tVALUE => }\n\t\tstate = running\n\t\tpid = 999\n\t}\n\tstate = SIGTERMed\n\tpid = 4242\n}',
+      stderr: '',
+    }),
+  })
+
+  const states = await statusLaunchd(context, runner)
+
+  assert.deepEqual(states.map(({ running, pid }) => ({ running, pid })), [
+    { running: false, pid: null },
+    { running: false, pid: null },
   ])
 })
 

@@ -140,7 +140,7 @@ stores only public material, and refuses silent key replacement.
 ## Run the daemon (continuous presence + optional inbox drain)
 
 ```bash
-node fleet-runtime/service-manager.mjs install --service-manager systemd
+node fleet-runtime/service-manager.mjs install --service-manager systemd --node "$(command -v node)"
 loginctl enable-linger "$USER" # explicit operator action for logout continuity
 node fleet-runtime/service-manager.mjs status --service-manager systemd
 journalctl --user -u fleet-daemon.service -u fleet-control-daemon.service -f
@@ -225,7 +225,7 @@ run the trust bootstrap above, then reload both user services without replacing
 the configured file:
 
 ```bash
-node fleet-runtime/service-manager.mjs reload --service-manager auto
+node fleet-runtime/service-manager.mjs reload --service-manager auto --node "$(command -v node)"
 ```
 
 `consumer_agent_id` must be the same agent as `FLEET_CONSUMER_AGENT` in the Worker. That

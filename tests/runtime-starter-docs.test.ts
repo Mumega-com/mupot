@@ -64,6 +64,19 @@ describe('runtime starter documentation', () => {
     expect(starter).toMatch(/preserves configs, keys, runtime files, handlers, inboxes,\s+logs, state, and receipts/i)
   })
 
+  it('passes an explicit Node path to every mutating lifecycle example', () => {
+    const shell = [...docs.matchAll(/```bash\n([\s\S]*?)```/g)]
+      .map((match) => match[1].replace(/\\\n\s*/g, ' '))
+      .join('\n')
+    const mutating = shell.split('\n').filter((line) =>
+      /service-manager\.mjs (?:install|reload)\b/.test(line) ||
+      (/install\.mjs\b/.test(line) && /--activate\b/.test(line)),
+    )
+
+    expect(mutating.length).toBeGreaterThan(0)
+    for (const command of mutating) expect(command).toContain('--node')
+  })
+
   it('never overwrites the configured control file before reload', () => {
     expect(readme).not.toContain('cp fleet-runtime/control.example.json ~/.fleet/control.json')
     expect(readme).not.toContain('cp fleet-runtime/inbox-handler.example.json ~/.fleet/inbox-handler.json')
