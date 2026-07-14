@@ -417,7 +417,14 @@ dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
   if (c.env.INKWELL_API_URL) {
     const token = await resolveConnector(c.env, dept, 'inkwell')
     if (token) {
-      executorEnv.inkwell = { apiUrl: c.env.INKWELL_API_URL, token, tenantSlug: c.env.TENANT_SLUG }
+      executorEnv.inkwell = {
+        apiUrl: c.env.INKWELL_API_URL,
+        token,
+        tenantSlug: c.env.TENANT_SLUG,
+        // Same-zone Inkwell → route through the service binding to dodge the CF 522
+        // Worker→Worker edge loopback. Absent (cross-zone tenant) → public fetch.
+        fetcher: c.env.INKWELL_SVC,
+      }
     }
   }
 

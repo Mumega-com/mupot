@@ -49,6 +49,25 @@ describe('inkwellContentWrite — fail-closed', () => {
   const cfg = { apiUrl: 'https://inkwell.test', token: 'tok', tenantSlug: 'mumega' }
   const payload = { title: 't', content: 'c' }
 
+  it('routes through the service-binding fetcher when set and no explicit fetchImpl (same-zone 522 avoidance)', async () => {
+    const bound = okFetch('sb', '/blog/sb')
+    const fetcher = { fetch: bound } as unknown as Fetcher
+    // No explicit fetchImpl → the binding is used (never global fetch, which would
+    // hit the network and fail in the test runner).
+    const r = await inkwellContentWrite({ ...cfg, fetcher }, payload)
+    expect(r.slug).toBe('sb')
+    expect((bound as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1)
+  })
+
+  it('an explicit fetchImpl still wins over the service-binding fetcher', async () => {
+    const bound = okFetch('binding', '/blog/binding')
+    const fetcher = { fetch: bound } as unknown as Fetcher
+    const explicit = okFetch('explicit', '/blog/explicit')
+    const r = await inkwellContentWrite({ ...cfg, fetcher }, payload, explicit)
+    expect(r.slug).toBe('explicit')
+    expect((bound as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0)
+  })
+
   it('writes and returns the artifact on a good response', async () => {
     const f = okFetch('s1', '/blog/s1')
     const r = await inkwellContentWrite(cfg, payload, f)

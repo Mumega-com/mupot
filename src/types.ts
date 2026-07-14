@@ -131,6 +131,13 @@ export interface Env {
   // Non-secret; set in wrangler.toml [vars]. e.g. https://inkwell-api.mumega.com.
   // Must be https + a public host (executor SSRF-guards it). Absent ⇒ executor 503.
   INKWELL_API_URL?: string
+  // Optional service binding to the pot's Inkwell API worker. When the pot and its
+  // Inkwell live on the SAME Cloudflare zone, a public-edge fetch to INKWELL_API_URL
+  // loops back and times out (CF 522). This binding routes the content-write
+  // subrequest internally (worker→worker), bypassing the public edge. Absent ⇒ the
+  // executor falls back to a public-edge fetch (cross-zone tenants). Declared in
+  // wrangler.toml [[services]]; INKWELL_API_URL still supplies the request path.
+  INKWELL_SVC?: Fetcher
   // CRO data source — PostHog connector (CRO epic, slice 2). The first EXTERNAL source on
   // the data fabric. PROJECT_ID + HOST are non-secret (wrangler.toml [vars]); the personal
   // API key is a secret (`wrangler secret put POSTHOG_PERSONAL_API_KEY`). Fail-closed: the

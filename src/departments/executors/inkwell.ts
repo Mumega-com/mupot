@@ -20,6 +20,15 @@ export interface InkwellExecutorConfig {
    * The write is always a DRAFT (server-forced), pot-scoped.
    */
   tenantSlug: string
+  /**
+   * Optional service-binding Fetcher. When the pot's Inkwell lives on the SAME
+   * Cloudflare zone, a public-edge fetch loops back and times out (CF 522). A
+   * service binding routes the subrequest internally (worker→worker RPC), never
+   * touching the public edge. When set, the write goes through this Fetcher; the
+   * apiUrl still supplies the request PATH (the bound service ignores the host).
+   * Absent → public-edge fetch (cross-zone tenants, tests).
+   */
+  fetcher?: Fetcher
 }
 
 export interface InkwellWriteResult {
@@ -100,11 +109,15 @@ function assertSafeInkwellUrl(apiUrl: string): URL {
 export async function inkwellContentWrite(
   cfg: InkwellExecutorConfig,
   payload: unknown,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl?: typeof fetch,
 ): Promise<InkwellWriteResult> {
   if (!cfg || !cfg.apiUrl || !cfg.token || !cfg.tenantSlug) {
     throw new InkwellExecutorError('inkwell_not_configured', 'missing apiUrl, token, or tenantSlug')
   }
+  // Fetch precedence: an explicit fetchImpl (tests) wins; otherwise the service
+  // binding (cfg.fetcher) when present (same-zone 522 avoidance); else global fetch.
+  const doFetch: typeof fetch =
+    fetchImpl ?? (cfg.fetcher ? (cfg.fetcher.fetch.bind(cfg.fetcher) as typeof fetch) : fetch)
   const base = assertSafeInkwellUrl(cfg.apiUrl)
   const body = toPublishBody(payload)
   if (!body) {
@@ -115,7 +128,7 @@ export async function inkwellContentWrite(
 
   let res: Response
   try {
-    res = await fetchImpl(`${base.origin}/api/internal/content/publish`, {
+    res = await doFetch(`${base.origin}/api/internal/content/publish`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
