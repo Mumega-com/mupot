@@ -49,6 +49,7 @@ function parseArgs(argv) {
     requireServices: false,
     serviceManager: 'auto',
     serviceDefinitionDir: null,
+    nodePath: null,
   }
   let serviceOptionUsed = false
   for (let i = 0; i < argv.length; i += 1) {
@@ -77,6 +78,12 @@ function parseArgs(argv) {
       serviceOptionUsed = true
       opts.serviceDefinitionDir = next()
     }
+    else if (arg === '--node') {
+      serviceOptionUsed = true
+      const nodePath = expandHome(nextValue())
+      if (!isAbsolute(nodePath)) throw new Error('--node requires an absolute path')
+      opts.nodePath = resolve(nodePath)
+    }
     else if (arg === '--help' || arg === '-h') opts.help = true
     else throw new Error(`unknown argument: ${arg}`)
   }
@@ -101,6 +108,8 @@ function usage() {
     '                        service manager to inspect (default: auto)',
     '  --service-definition-dir <path>',
     '                        launchd/systemd user definition directory',
+    '  --node <absolute-path>',
+    '                        Node entrypoint used to render service definitions',
     '  -h, --help            show this help',
   ].join('\n')
 }
