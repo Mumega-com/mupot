@@ -381,3 +381,51 @@ receipt.
 No blocking concern. SHA-256 establishes deterministic bundle integrity, not
 publisher authenticity; signed provenance remains intentionally outside this
 task.
+
+---
+
+## Task 7 Second Cumulative-Review Remediation
+
+### Result
+
+The checker now treats malformed portable provenance as absent evidence and
+returns a failed receipt instead of dereferencing unchecked paths or arrays.
+Activated install receipts must bind both service definitions by manager,
+path, and digest to install outputs, which are already bound to observed
+service evidence. Every nested starter directory is checked at mode `0700` in
+addition to exact recursive tree membership.
+
+Export-receipt semantics are reconstructed check by check from the copied
+manifest, retained source provenance, copied artifacts, canonical manifest
+check, and current file hashes. The final receipt uses `.` for the discarded
+source directory and omits transient hashes for sidecar versions that are
+overwritten during finalization. A schema-valid check list with a substituted
+path no longer passes.
+
+### Verification
+
+- `node --test fleet-runtime/starter-contract.test.mjs fleet-runtime/host-receipt.test.mjs fleet-runtime/receipt-bundle.test.mjs`
+  - 158 passed, 0 failed.
+- `node --test fleet-runtime/*.test.mjs`
+  - 437 passed, 0 failed.
+- `npm test`
+  - 168 files passed; 2703 tests passed.
+- `npm run typecheck`
+  - Passed with no TypeScript errors.
+- `git diff --check`
+  - Passed with no whitespace errors.
+
+### Review Findings Closed
+
+- Malformed portable `provenance: {}` fails closed without throwing.
+- Embedded activation definitions cannot disagree with install output or the
+  selected service receipt.
+- Nested starter evidence directories with mode `0755` are rejected.
+- Substituting a passing export check's path is rejected by exact canonical
+  check reconstruction.
+
+### Concerns
+
+No blocking concern. The final export receipt deliberately does not claim a
+digest for an overwritten intermediate sidecar; only retained or
+independently reconstructible evidence is represented as verifiable.

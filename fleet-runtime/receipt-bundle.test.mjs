@@ -960,6 +960,15 @@ test('starter-ready validates complete producer contracts and cross-receipt bind
   mismatchedDefinitionInstall.outputs.service_definitions[0].sha256 = 'f'.repeat(64)
   mismatchedDefinitionInstall.checks.find((check) => check.check === 'service_definition_rendered' && check.service === 'heartbeat').sha256 = 'f'.repeat(64)
 
+  const mismatchedActivationInstall = installReceipt('pass')
+  mismatchedActivationInstall.inputs.activation_requested = true
+  mismatchedActivationInstall.inputs.activation_performed = true
+  mismatchedActivationInstall.activation = serviceReceipt('pass')
+  mismatchedActivationInstall.activation.action = 'install'
+  mismatchedActivationInstall.activation.definitions[0].sha256 = 'e'.repeat(64)
+  mismatchedActivationInstall.checks.push({ ok: true, component: 'fleet-install', check: 'service_activation', service_receipt: 'mupot-fleet-service-receipt/v1' })
+  mismatchedActivationInstall.summary = summarizeFixture(mismatchedActivationInstall.checks)
+
   const cases = [
     ['negative heartbeat delta', { continuous: (() => { const r = continuousReceipt(); r.observation.heartbeat.tick.after = 39; return r })() }],
     ['zero control delta', { continuous: (() => { const r = continuousReceipt(); r.observation.control.poll.after = 70; return r })() }],
@@ -975,6 +984,7 @@ test('starter-ready validates complete producer contracts and cross-receipt bind
     ['unknown starter field', { starter: { ...starterReceipt(), fabricated: true } }],
     ['install manager differs from observed service manager', { install: launchdInstall }],
     ['install definition hash differs from observed service definition', { install: mismatchedDefinitionInstall }],
+    ['install activation definition differs from observed service definition', { install: mismatchedActivationInstall }],
   ]
   for (const [name, overrides] of cases) {
     await t.test(name, async () => {
@@ -1982,6 +1992,7 @@ test('manifest checking fails closed for malformed arrays and unknown artifact r
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
   manifest.artifacts.probes = { fabricated: true }
   manifest.artifacts.unknown_role = { path: 'unknown.json', sha256: 'a'.repeat(64), receipt_type: 'unknown/v1', status: 'pass' }
+  manifest.provenance = {}
   writeJson(manifestPath, manifest)
 
   let check
@@ -2020,6 +2031,12 @@ test('starter packaging creates safe nested parents and force repairs reused sup
     assert.equal(statSync(join(outDir, 'evidence', 'install.json')).mode & 0o777, 0o600)
     const sourceCheck = checkBundleManifest({ outDir })
     assert.equal(sourceCheck.status, 'pass', JSON.stringify(sourceCheck.checks.filter((check) => check.ok === false), null, 2))
+
+    chmodSync(join(outDir, 'evidence'), 0o755)
+    const permissiveDirectoryCheck = checkBundleManifest({ outDir })
+    assert.equal(permissiveDirectoryCheck.status, 'fail')
+    assert.ok(permissiveDirectoryCheck.checks.some((check) => check.check === 'starter_directory_permissions_0700' && check.ok === false))
+    chmodSync(join(outDir, 'evidence'), 0o700)
 
     const exportDir = tmpDir()
     const exported = exportBundle({ outDir, exportDir })
@@ -2196,6 +2213,14 @@ test('recursive artifact and sidecar schemas reject unknown nested fields', asyn
     const incompleteExport = JSON.parse(readFileSync(exportPath, 'utf8'))
     incompleteExport.artifacts.copied.pop()
     writeJson(exportPath, incompleteExport)
+    check = checkBundleManifest({ outDir: exportDir })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) => entry.check === 'export_sidecar_semantics_complete' && entry.sidecar === 'export-receipt.json' && entry.ok === false))
+
+    assert.equal(exportBundle({ outDir, exportDir, force: true }).status, 'pass')
+    const substitutedExportCheck = JSON.parse(readFileSync(exportPath, 'utf8'))
+    substitutedExportCheck.checks.find((entry) => entry.check === 'source_manifest_selected').path = 'fabricated.json'
+    writeJson(exportPath, substitutedExportCheck)
     check = checkBundleManifest({ outDir: exportDir })
     assert.equal(check.status, 'fail')
     assert.ok(check.checks.some((entry) => entry.check === 'export_sidecar_semantics_complete' && entry.sidecar === 'export-receipt.json' && entry.ok === false))

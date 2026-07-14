@@ -570,6 +570,11 @@ function normalizePassingInstallReceipt(receipt) {
   }
   if (receipt.inputs.activation_performed !== (receipt.activation !== null) || receipt.inputs.activation_performed !== receipt.inputs.activation_requested) return null
   if (receipt.activation !== null && !serviceActivationSchemaExact(receipt.activation, manager)) return null
+  if (receipt.activation !== null && SERVICE_KEYS.some((key) => {
+    const output = definitions.get(key)
+    const activated = receipt.activation.definitions.filter((definition) => definition.service === key)
+    return activated.length !== 1 || activated[0].path !== output.path || activated[0].sha256 !== output.sha256
+  })) return null
   return { manager, definitions }
 }
 
@@ -1113,6 +1118,13 @@ function starterModeSelected(opts = {}) {
 
 function manifestStarterMode(manifest) {
   return manifest?.inputs?.bundle_mode === 'starter-ready'
+}
+
+function usablePortableProvenance(manifest) {
+  const provenance = manifest?.provenance
+  return isPlainObject(provenance) && typeof provenance.source_path === 'string' && Array.isArray(provenance.projections)
+    ? provenance
+    : null
 }
 
 function resolveArtifactPath(manifestDir, declaredPath, { allowExternal = false } = {}) {
@@ -1675,9 +1687,12 @@ function addBundleDirectoryScopeChecks(checks, manifestPath, manifestDir, entrie
     for (const entry of entries) addPath(resolveArtifactPath(manifestDir, entry.path))
     for (const support of supportingEvidenceEntries(manifestDir, manifest)) addPath(support.path)
     for (const path of starterReferencedEvidencePaths(manifestDir, manifest)) addPath(path)
-    if (manifest.provenance) {
-      addPath(join(manifestDir, manifest.provenance.source_path))
-      for (const mapping of manifest.provenance.projections) addPath(join(manifestDir, mapping.source_path))
+    const provenance = usablePortableProvenance(manifest)
+    if (provenance) {
+      addPath(join(manifestDir, provenance.source_path))
+      for (const mapping of provenance.projections) {
+        if (typeof mapping?.source_path === 'string') addPath(join(manifestDir, mapping.source_path))
+      }
     }
     const actual = new Set()
     const walk = (dir, prefix = '') => {
@@ -1687,7 +1702,10 @@ function addBundleDirectoryScopeChecks(checks, manifestPath, manifestDir, entrie
         if (!prefix && EXPORT_SIDECAR_RECEIPTS.some((sidecar) => sidecar.file === name)) continue
         const stat = lstatSync(path)
         actual.add(rel)
-        if (!stat.isSymbolicLink() && stat.isDirectory()) walk(path, rel)
+        if (!stat.isSymbolicLink() && stat.isDirectory()) {
+          checks.push({ ok: (stat.mode & 0o777) === 0o700, component: 'receipt-bundle-check', check: 'starter_directory_permissions_0700', path, mode: stat.mode & 0o777 })
+          walk(path, rel)
+        }
       }
     }
     try { walk(manifestDir) } catch {}
@@ -1765,20 +1783,21 @@ function retainedSourceGraphValid(sourceManifest, items) {
 }
 
 function addPortableProvenanceChecks(checks, manifestPath, manifestDir, manifest) {
-  if (!manifest?.provenance) return
+  const provenance = usablePortableProvenance(manifest)
+  if (!provenance) return
   const provenanceDir = join(manifestDir, 'provenance')
   let provenanceMode = null
   try { provenanceMode = lstatSync(provenanceDir).mode & 0o777 } catch {}
   checks.push({ ok: Boolean(regularDirectoryStat(provenanceDir) && pathContainedBy(provenanceDir, manifestDir)), component: 'receipt-bundle-check', check: 'provenance_directory_regular', path: provenanceDir })
   checks.push({ ok: provenanceMode === 0o700, component: 'receipt-bundle-check', check: 'provenance_directory_permissions_0700', path: provenanceDir, mode: provenanceMode })
 
-  const mappings = Array.isArray(manifest.provenance.projections) ? manifest.provenance.projections : []
-  const outerPath = provenanceSourcePath(manifestDir, manifest.provenance.source_path, 'outer_manifest')
+  const mappings = provenance.projections
+  const outerPath = provenanceSourcePath(manifestDir, provenance.source_path, 'outer_manifest')
   const outerBytes = outerPath ? readRegularBytes(outerPath, manifestDir) : null
   const outerFindings = outerBytes ? secretFindingsForBytes(outerBytes) : [{ path: '$', reason: 'unreadable_preimage' }]
   let outerMode = null
   try { outerMode = lstatSync(outerPath).mode & 0o777 } catch {}
-  checks.push({ ok: Boolean(outerBytes && sha256Bytes(outerBytes) === manifest.provenance.source_sha256), component: 'receipt-bundle-check', check: 'provenance_source_sha256_match', artifact: 'outer_manifest', path: outerPath || null, source_path: manifest.provenance.source_path })
+  checks.push({ ok: Boolean(outerBytes && sha256Bytes(outerBytes) === provenance.source_sha256), component: 'receipt-bundle-check', check: 'provenance_source_sha256_match', artifact: 'outer_manifest', path: outerPath || null, source_path: provenance.source_path })
   checks.push({ ok: outerMode === 0o600, component: 'receipt-bundle-check', check: 'provenance_source_permissions_0600', artifact: 'outer_manifest', path: outerPath || null, mode: outerMode })
   checks.push({ ok: outerFindings.length === 0, component: 'receipt-bundle-check', check: 'provenance_source_no_secret_material', artifact: 'outer_manifest', path: outerPath || null, findings: secretFindingSummary(outerFindings), finding_count: outerFindings.length })
 
@@ -1825,7 +1844,7 @@ function addPortableProvenanceChecks(checks, manifestPath, manifestDir, manifest
   }
 
   if (sourceGraphValid && records.size === mappings.length) {
-    const expectedManifest = portableOuterManifest(sourceManifest, items, records, manifest.provenance.source_path, manifest.provenance.source_sha256)
+    const expectedManifest = portableOuterManifest(sourceManifest, items, records, provenance.source_path, provenance.source_sha256)
     checks.push({ ok: JSON.stringify(expectedManifest) === JSON.stringify(manifest), component: 'receipt-bundle-check', check: 'portable_manifest_derived_from_retained_source', path: manifestPath })
   } else {
     checks.push({ ok: false, component: 'receipt-bundle-check', check: 'portable_manifest_derived_from_retained_source', path: manifestPath })
@@ -1836,7 +1855,7 @@ function addPortableProvenanceChecks(checks, manifestPath, manifestDir, manifest
   try { actualRoleDirs = readdirSync(provenanceDir).sort() } catch {}
   const unexpectedRoleDirs = actualRoleDirs.filter((name) => !expectedRoleDirs.has(name))
   checks.push({ ok: unexpectedRoleDirs.length === 0 && actualRoleDirs.length === expectedRoleDirs.size, component: 'receipt-bundle-check', check: 'provenance_directory_exact', path: provenanceDir, expected: [...expectedRoleDirs].sort(), actual: actualRoleDirs, unexpected: unexpectedRoleDirs })
-  const expectedSources = [{ role: 'outer_manifest', source_path: manifest.provenance.source_path }, ...mappings]
+  const expectedSources = [{ role: 'outer_manifest', source_path: provenance.source_path }, ...mappings]
   for (const source of expectedSources) {
     const roleDir = join(provenanceDir, safeName(source.role))
     const expectedFiles = [basename(source.source_path ?? '')].filter(Boolean)
@@ -1922,6 +1941,71 @@ function manifestCheckSidecarSemanticsExact(receipt, expected) {
   return JSON.stringify(actualComparable) === JSON.stringify(expectedComparable)
 }
 
+function expectedExportReceiptChecks(receipt, manifestDir, manifest, expectedManifestCheck) {
+  const provenance = usablePortableProvenance(manifest)
+  const copiedByLabel = new Map(receipt.artifacts.copied.map((entry) => [entry.label, entry]))
+  const manifestCopy = copiedByLabel.get('manifest')
+  if (!manifestCopy || !hasExactKeys(manifestCopy, ['label', 'source', 'path', 'sha256']) || manifestCopy.source !== 'manifest.json' || manifestCopy.path !== 'manifest.json' ||
+    receipt.inputs.manifest !== 'manifest.json' || receipt.inputs.export_dir !== basename(manifestDir) || receipt.inputs.out_dir !== '.' ||
+    JSON.stringify(receipt.next_steps) !== JSON.stringify([NEXT_STEP_ATTACH])) return null
+
+  let manifestCopySha = manifestCopy.sha256
+  if (provenance) {
+    const sourcePath = provenanceSourcePath(manifestDir, provenance.source_path, 'outer_manifest')
+    const sourceBytes = sourcePath ? readRegularBytes(sourcePath, manifestDir) : null
+    const sourceManifest = sourceBytes ? parseJsonBytes(sourceBytes) : null
+    if (!sourceManifest) return null
+    manifestCopySha = sha256Bytes(jsonBytes(portableManifestForExport(sourceManifest)))
+  }
+
+  const checks = [
+    { ok: true, component: 'receipt-bundle-export', check: 'source_manifest_selected', path: receipt.inputs.manifest },
+    { ok: true, component: 'receipt-bundle-export', check: 'export_dir_selected', path: receipt.inputs.export_dir },
+    { ok: true, component: 'receipt-bundle-export', check: 'export_dir_separate_from_source', source_dir: '.', export_dir: receipt.inputs.export_dir },
+    { ok: true, component: 'receipt-bundle-export', check: 'source_manifest_read', path: receipt.inputs.manifest },
+    ...(manifestStarterMode(manifest) ? [{ ok: true, component: 'receipt-bundle-export', check: 'source_manifest_check_pass', path: receipt.inputs.manifest, status: 'pass' }] : []),
+    { ok: true, component: 'receipt-bundle', check: 'out_dir_ready', path: receipt.inputs.export_dir },
+    { ok: true, component: 'receipt-bundle-export', check: 'manifest_copied', source: 'portable-manifest', path: 'manifest.json', sha256: manifestCopySha },
+  ]
+
+  for (const entry of bundleArtifactEntries(manifest)) {
+    const copied = copiedByLabel.get(entry.label)
+    const mapping = provenance?.projections.find((candidate) => candidate.path === basename(entry.path ?? ''))
+    const source = basename(mapping?.source_path ?? entry.path ?? '')
+    const path = basename(entry.path ?? '')
+    const sourceSha = mapping?.source_sha256 ?? copied?.sha256
+    if (!copied || !source || !path || copied.source !== source || copied.path !== path || copied.receipt_type !== entry.receipt_type || copied.status !== entry.status) return null
+    if (mapping && (copied.role !== mapping.role || copied.source_path !== mapping.source_path || copied.source_sha256 !== mapping.source_sha256 ||
+      copied.projection_sha256 !== mapping.projection_sha256 || copied.source_receipt_type !== mapping.source_receipt_type || copied.sha256 !== mapping.artifact_sha256)) return null
+    checks.push(
+      { ok: true, component: 'receipt-bundle-export', check: 'artifact_export_name_selected', artifact: entry.label, declared_path: path, file_name: path },
+      { ok: true, component: 'receipt-bundle-export', check: 'artifact_export_source_readable', artifact: entry.label, declared_path: path, source },
+      { ok: true, component: 'receipt-bundle-export', check: `artifact_${safeName(entry.label)}_copied`, source, path, sha256: sourceSha },
+    )
+  }
+
+  for (const support of supportingEvidenceEntries(manifestDir, manifest)) {
+    const copied = copiedByLabel.get(support.label)
+    const mapping = provenance?.projections.find((candidate) => candidate.path === basename(support.path))
+    const source = basename(mapping?.source_path ?? support.path)
+    const path = basename(support.path)
+    const sourceSha = mapping?.source_sha256 ?? copied?.sha256
+    if (!copied || copied.source !== source || copied.path !== path) return null
+    if (mapping && (copied.role !== mapping.role || copied.source_path !== mapping.source_path || copied.source_sha256 !== mapping.source_sha256 ||
+      copied.projection_sha256 !== mapping.projection_sha256 || copied.source_receipt_type !== mapping.source_receipt_type || copied.sha256 !== mapping.artifact_sha256)) return null
+    checks.push({ ok: true, component: 'receipt-bundle-export', check: `support_${safeName(support.label)}_copied`, source, path, sha256: sourceSha })
+  }
+
+  checks.push(
+    { ok: true, component: 'receipt-bundle-export', check: 'export_manifest_check_pass', export_dir: receipt.inputs.export_dir, status: expectedManifestCheck.status },
+    { ok: true, component: 'receipt-bundle-export', check: 'sidecar_receipt_written', sidecar: 'manifest_check', path: MANIFEST_CHECK_RECEIPT_FILE },
+    { ok: true, component: 'receipt-bundle-export', check: 'sidecar_receipt_written', sidecar: 'export_receipt', path: EXPORT_RECEIPT_FILE },
+    { ok: true, component: 'receipt-bundle-export', check: 'export_manifest_check_with_sidecars_pass', export_dir: receipt.inputs.export_dir, status: 'pass' },
+    { ok: true, component: 'receipt-bundle-export', check: 'sidecar_receipts_finalized', export_receipt: EXPORT_RECEIPT_FILE, manifest_check: MANIFEST_CHECK_RECEIPT_FILE },
+  )
+  return checks
+}
+
 function exportReceiptSidecarSemanticsExact(receipt, manifestDir, manifest, expectedManifestCheck) {
   if (!receipt || receipt.status !== 'pass' || !Array.isArray(receipt.artifacts?.copied) || !Array.isArray(receipt.checks)) return false
   const portableExpectedManifestCheck = portableKnownPathProjection(expectedManifestCheck)
@@ -1945,20 +2029,8 @@ function exportReceiptSidecarSemanticsExact(receipt, manifestDir, manifest, expe
   })) return false
   if (receipt.manifest_check?.status !== portableExpectedManifestCheck?.status || !sameSummary(receipt.manifest_check?.summary, portableExpectedManifestCheck?.summary) ||
     JSON.stringify(receipt.manifest_check?.manifest) !== JSON.stringify(portableExpectedManifestCheck?.manifest)) return false
-  const requiredCounts = new Map([
-    ['source_manifest_selected', 1],
-    ['export_dir_selected', 1],
-    ['export_dir_separate_from_source', 1],
-    ['source_manifest_read', 1],
-    ...(manifestStarterMode(manifest) ? [['source_manifest_check_pass', 1]] : []),
-    ['out_dir_ready', 1],
-    ['manifest_copied', 1],
-    ['export_manifest_check_pass', 1],
-    ['sidecar_receipt_written', 2],
-    ['export_manifest_check_with_sidecars_pass', 1],
-    ['sidecar_receipts_finalized', 1],
-  ])
-  return [...requiredCounts].every(([name, count]) => receipt.checks.filter((check) => check.check === name && check.ok === true).length === count)
+  const expectedChecks = expectedExportReceiptChecks(receipt, manifestDir, manifest, expectedManifestCheck)
+  return Boolean(expectedChecks && JSON.stringify(receipt.checks) === JSON.stringify(expectedChecks))
 }
 
 function addExportSidecarChecks(checks, manifestPath, manifestDir, manifest, opts = {}) {
@@ -2254,6 +2326,7 @@ function checkBundleManifest(opts = {}) {
     })
     const entries = bundleArtifactEntries(manifest)
     const agents = manifestAgents(manifest)
+    const provenance = usablePortableProvenance(manifest)
     const receiptRecords = []
     checks.push({
       ok: entries.length > 0,
@@ -2277,10 +2350,10 @@ function checkBundleManifest(opts = {}) {
         try { mode = lstatSync(support.path).mode & 0o777 } catch {}
         checks.push({ ok: SHA256_RE.test(support.sha256 ?? '') && fileSha256(support.path) === support.sha256, component: 'receipt-bundle-check', check: 'supporting_evidence_sha256_match', artifact: support.label, path: support.path })
         checks.push({ ok: mode === 0o600, component: 'receipt-bundle-check', check: 'supporting_evidence_permissions_0600', artifact: support.label, mode })
-        if (manifest.provenance) {
+        if (provenance) {
           const raw = readReceipt(support.path, manifestDir)
           const role = support.label.startsWith('definition:') ? `service_definition_${support.label.split(':')[1]}` : support.label
-          const mapping = manifest.provenance.projections.find((entry) => entry.role === role)
+          const mapping = provenance.projections.find((entry) => entry.role === role)
           const contentSha = projectionSchemaExact(raw) ? sha256Bytes(jsonBytes(raw.content)) : null
           checks.push({ ok: Boolean(projectionSchemaExact(raw) && contentSha === raw.projection_sha256), component: 'receipt-bundle-check', check: 'projection_content_sha256_match', artifact: support.label, path: support.path })
           checks.push({ ok: Boolean(mapping && projectionSchemaExact(raw) && mapping.path === basename(support.path) && mapping.role === raw.role && mapping.role === role && mapping.source_receipt_type === raw.source_receipt_type && mapping.source_path === raw.source_path && mapping.source_sha256 === raw.source_sha256 && mapping.projection_sha256 === raw.projection_sha256 && mapping.artifact_sha256 === fileSha256(support.path)), component: 'receipt-bundle-check', check: 'projection_chain_valid', artifact: support.label, path: support.path })
@@ -2300,15 +2373,15 @@ function checkBundleManifest(opts = {}) {
         checks.push({ ok: artifactRegular, component: 'receipt-bundle-check', check: 'artifact_regular_file', artifact: entry.label, path: checkedPath || null })
       }
       const rawReceipt = checkedPath ? readReceipt(checkedPath, manifestDir) : null
-      const projection = manifest?.provenance ? rawReceipt : null
+      const projection = provenance ? rawReceipt : null
       const receipt = projectionSchemaExact(projection) ? projection.content : rawReceipt
       if (receipt) receiptRecords.push({ label: entry.label, receipt, checkedPath })
       const starterSchemaExact = !manifestStarterMode(manifest) || starterArtifactSchemaExact(entry.label, receipt, receiptRecords, agents)
       const actual = checkedPath ? fileSha256(checkedPath) : null
       const expectedOk = typeof entry.sha256 === 'string' && /^[a-f0-9]{64}$/.test(entry.sha256)
       const expectedType = expectedArtifactType(entry.label)
-      if (manifest?.provenance) {
-        const mapping = manifest.provenance.projections.find((candidate) => candidate.path === basename(entry.path ?? ''))
+      if (provenance) {
+        const mapping = provenance.projections.find((candidate) => candidate.path === basename(entry.path ?? ''))
         const projectionContentSha = projectionSchemaExact(projection) ? sha256Bytes(jsonBytes(projection.content)) : null
         checks.push({
           ok: Boolean(projectionSchemaExact(projection) && projectionContentSha === projection.projection_sha256),
@@ -2900,7 +2973,14 @@ function overwriteExportSidecar(path, receipt, opts = {}) {
 }
 
 function makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck }) {
-  const checkSnapshot = JSON.parse(JSON.stringify(checks))
+  const checkSnapshot = JSON.parse(JSON.stringify(checks)).map((check) => {
+    if (check.check === 'export_dir_separate_from_source') return { ...check, source_dir: '.' }
+    if (check.check === 'sidecar_receipt_written') {
+      const { sha256: _discardedTransientDigest, ...stableCheck } = check
+      return stableCheck
+    }
+    return check
+  })
   const summary = summarize(checkSnapshot)
   return {
     receipt_type: 'mupot-fleet-receipt-bundle-export/v1',
@@ -2909,7 +2989,7 @@ function makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, mani
     summary,
     inputs: {
       manifest: manifestPath || null,
-      out_dir: opts.outDir ? pathArg(opts.outDir) : null,
+      out_dir: '.',
       export_dir: exportDir || null,
     },
     artifacts: {
