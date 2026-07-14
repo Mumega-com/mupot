@@ -439,14 +439,26 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
           task_status: receipt.taskStatus,
         }
       }
-      if (sql.includes('FROM agents a') && sql.includes('LEFT JOIN fleet_agents')) {
-        // getFleetAgentLiveness's id↔slug bridge join (src/fleet/registry.ts). This mock only
-        // ever models a single agent ('agent-1'), so it simplifies the join to a direct tenant
-        // match — the id↔slug resolution itself is covered by tests/fleet-agent-liveness.test.ts.
-        const [tenant, agentId] = b as [string, string]
-        if (agentId !== 'agent-1') return { agent_id: null, runtime: null, status: null, last_reported_at: null }
-        if (!fleet || tenant !== fleetTenant) return { agent_id: null, runtime: null, status: null, last_reported_at: null }
+      // readFleetAgentRow (src/fleet/registry.ts) now does up to 3 sequential queries instead of
+      // one JOIN: (1) exact fleet_agents.agent_id match, (2) this agent's own slug, (3) a
+      // tenant-wide slug-collision COUNT, (4) the slug-keyed fleet_agents match. (1) and (4) are
+      // the SAME sql text (only the bound agent_id differs), so both are handled by the first
+      // branch below. This mock models a single dispatched agent ('agent-1', standing in for
+      // agents.id) whose slug is 'agent-1-ext' — the id↔slug ambiguity-refusal logic itself is
+      // exercised for real (real SQLite, not this string-matched mock) in
+      // tests/fleet-agent-liveness.test.ts.
+      if (sql.includes('FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2')) {
+        const [tenant, agentIdParam] = b as [string, string]
+        if (!fleet || tenant !== fleetTenant || agentIdParam !== fleet.agentId) return null
         return { agent_id: fleet.agentId, runtime: fleet.runtime, status: fleet.status, last_reported_at: fleet.last_reported_at }
+      }
+      if (sql.includes('SELECT slug FROM agents WHERE id')) {
+        const [agentIdParam] = b as [string]
+        return agentIdParam === 'agent-1' ? { slug: 'agent-1-ext' } : null
+      }
+      if (sql.includes('SELECT COUNT(*) AS n FROM agents WHERE slug')) {
+        const [slugParam] = b as [string]
+        return slugParam === 'agent-1-ext' ? { n: 1 } : { n: 0 }
       }
       if (sql.includes('from_agent = ?2 AND request_id = ?3')) {
         const [tenant, fromAgent, requestId] = b as [string, string, string]
@@ -675,6 +687,54 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
 
     expect(fetch).toHaveBeenCalledOnce()
     expect(db._messages).toHaveLength(0)
+  })
+
+  it('WARN-1 (re-gate): a receiptId outside sendAgentMessage\'s request_id charset is rejected at the identity gate, not retried into a tight loop', async () => {
+    const db = makeWorld({ fleet: LIVE_RUNTIME })
+    const { env, fetch } = envWith(db)
+    // A space is outside [A-Za-z0-9_.:-] — would otherwise reach deliverDispatchToInbox and
+    // throw a plain Error (not InboxFullError) on every single retry attempt.
+    const item = message(dispatchEvent({ payload: { task_id: 'task-1', dispatch_receipt_id: 'bad receipt id' } }))
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
+
+    // Falls through to the generic agent.wake path — rejected once, up front, never enters the
+    // receipt state machine or the bridge at all.
+    expect(fetch).toHaveBeenCalledOnce()
+    expect(db._messages).toHaveLength(0)
+    expect(item.ack).toHaveBeenCalledOnce()
+    expect(item.retry).not.toHaveBeenCalled()
+  })
+
+  it('WARN-1 (re-gate): a receiptId that would push dispatch-inbox:<id> past sendAgentMessage\'s 128-char limit is rejected at the identity gate', async () => {
+    const db = makeWorld({ fleet: LIVE_RUNTIME })
+    const { env, fetch } = envWith(db)
+    // DISPATCH_INBOX_PREFIX ('dispatch-inbox:') is 15 chars, so a 114-char receiptId (1 over the
+    // 113-char headroom) would push the combined request_id to 129 chars — over RID_RE's cap.
+    const oversized = 'a'.repeat(114)
+    const item = message(dispatchEvent({ payload: { task_id: 'task-1', dispatch_receipt_id: oversized } }))
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
+
+    expect(fetch).toHaveBeenCalledOnce()
+    expect(db._messages).toHaveLength(0)
+    expect(item.ack).toHaveBeenCalledOnce()
+    expect(item.retry).not.toHaveBeenCalled()
+  })
+
+  it('WARN-1 (re-gate): a 113-char receiptId (exactly at the boundary) is accepted', async () => {
+    const db = makeWorld({ fleet: LIVE_RUNTIME })
+    const { env, fetch } = envWith(db)
+    const atBoundary = 'a'.repeat(113)
+    const item = message(dispatchEvent({ payload: { task_id: 'task-1', dispatch_receipt_id: atBoundary } }))
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
+
+    // Accepted as a real task dispatch identity — routes normally (external route here).
+    expect(fetch).not.toHaveBeenCalled()
+    expect(db._messages).toHaveLength(1)
+    expect(db._messages[0].request_id).toBe(`dispatch-inbox:${atBoundary}`)
+    expect(item.ack).toHaveBeenCalledOnce()
   })
 
   it('tenant isolation: a same-agent_id fleet row in a DIFFERENT tenant is not treated as external', async () => {

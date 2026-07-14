@@ -17,7 +17,7 @@ import type { MessageBatch, Message } from '@cloudflare/workers-types'
 import type { Env, BusEvent, Task } from '../types'
 import { postAgentActivity } from '../channels'
 import { getFleetAgentLiveness } from '../fleet/registry'
-import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError } from './fleet-bridge'
+import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
 
 // Internal origin for DO fetch routing. DO fetch ignores host; the path carries
 // the intent. The agents component routes these paths inside its DO classes.
@@ -26,6 +26,14 @@ const TASK_DISPATCH_LEASE_MS = 60_000
 // Backpressure backoff (WARN-2, #353 v2): when the bridge reports the recipient's inbox is at
 // capacity, back off instead of hot-looping an immediate retry against the same full inbox.
 const INBOX_FULL_RETRY_DELAY_SEC = 15
+// WARN-1 (#353 v2 re-gate): sendAgentMessage's request_id charset is [A-Za-z0-9_.:-]{1,128}
+// (RID_RE, src/agents/messages.ts). The bridge's idempotency key is
+// DISPATCH_INBOX_PREFIX + receiptId, so receiptId itself must fit that SAME charset within the
+// remaining headroom — otherwise deliverDispatchToInbox throws a plain Error (not
+// InboxFullError) on every single attempt, and since that throw releases the lease and
+// rethrows (not a RetryAfterError), a malformed receiptId would tight-loop retries until DLQ
+// instead of being rejected once, up front, at the identity gate.
+const RECEIPT_ID_RE = new RegExp(`^[A-Za-z0-9_.:-]{1,${128 - DISPATCH_INBOX_PREFIX.length}}$`)
 
 class RetryAfterError extends Error {
   constructor(message: string, readonly delaySeconds: number) {
@@ -59,10 +67,16 @@ interface TaskDispatchReceiptState {
 function taskDispatchIdentity(event: BusEvent): { taskId: string; receiptId: string } | null {
   const payload = event.payload as TaskDispatchPayload
   if (typeof payload?.dispatch_receipt_id !== 'string' || typeof payload.task_id !== 'string') return null
-  // WARN-1 (#353 v2): reject empty/whitespace-only ids. An empty receiptId would collapse the
-  // bridge's idempotency key to the constant 'dispatch-inbox:' for every such event — a false
-  // dedup that could mask an unrelated dispatch as already-delivered.
-  if (payload.task_id.trim().length === 0 || payload.dispatch_receipt_id.trim().length === 0) return null
+  // WARN-1 (#353 v2, extended at re-gate): reject empty/whitespace-only task_id, and reject a
+  // dispatch_receipt_id that isn't a well-formed, bounded token in sendAgentMessage's request_id
+  // charset. An empty receiptId would collapse the bridge's idempotency key to the constant
+  // prefix for every such event (false dedup); an out-of-charset or oversized one would fail
+  // sendAgentMessage's own validation on every retry (see RECEIPT_ID_RE above) — reject once,
+  // here, rather than tight-loop retries against a request that can never succeed. A malformed
+  // identity falls through to the generic agent.wake path below (same as "not a task dispatch"),
+  // never into the receipt state machine.
+  if (payload.task_id.trim().length === 0) return null
+  if (!RECEIPT_ID_RE.test(payload.dispatch_receipt_id)) return null
   return { taskId: payload.task_id, receiptId: payload.dispatch_receipt_id }
 }
 

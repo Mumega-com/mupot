@@ -29,11 +29,18 @@ import { sendAgentMessage } from '../agents/messages'
 // inbox (never invented as if some other real agent sent it).
 export const DISPATCH_BRIDGE_SENDER = 'mupot-dispatch'
 
+/** Idempotency-key prefix for a bridged dispatch delivery. Exported so a caller that must
+ *  validate a receiptId against sendAgentMessage's request_id charset/length limit (RID_RE,
+ *  `[A-Za-z0-9_.:-]{1,128}`, src/agents/messages.ts) can derive the correct headroom
+ *  (128 - DISPATCH_INBOX_PREFIX.length) without duplicating this literal (WARN-1, #353 v2
+ *  re-gate — see consumer.ts's taskDispatchIdentity). */
+export const DISPATCH_INBOX_PREFIX = 'dispatch-inbox:'
+
 /** The sendAgentMessage idempotency key for a given dispatch receipt. Single source — used both
  *  by the actual delivery (deliverDispatchToInbox) and by the sticky-route marker check
  *  (dispatchInboxDelivered) so the two can never drift apart. */
 export function dispatchInboxRequestId(receiptId: string): string {
-  return `dispatch-inbox:${receiptId}`
+  return `${DISPATCH_INBOX_PREFIX}${receiptId}`
 }
 
 export interface DispatchBridgeInput {

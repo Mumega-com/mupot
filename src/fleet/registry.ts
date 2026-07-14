@@ -227,25 +227,67 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
 // `agents.id` is a uuid, `agents.slug='kasra'`, and its `fleet_agents.agent_id` /
 // `agent_keys.agent_id` are BOTH `'kasra'`, never the uuid. A fleet-row read keyed directly on
 // `event.agent_id` would therefore NEVER match a real external runtime's row — the route
-// decision would be silently dead code in production. This resolves the uuid → slug bridge with
-// one JOIN so the caller can pass either identifier and land on the right row; ORDER BY
-// last_reported_at DESC is defense-in-depth in the unlikely case both an id-keyed and a
-// slug-keyed row exist for the same agent (prefer the most recently reported one).
+// decision would be silently dead code in production.
+//
+// BLOCK (v2 re-gate, 2026-07-14): a first attempt bridged this with a single `LEFT JOIN
+// fleet_agents ON fa.agent_id = a.id OR fa.agent_id = a.slug` + `ORDER BY last_reported_at DESC`.
+// That is UNSAFE: `agents.slug` is `UNIQUE(squad_id, slug)` (migration 0001_init.sql) — unique
+// PER SQUAD, not tenant-wide. Two different agents in two different squads can share a slug (the
+// repro: agent A in squad S1 with slug 'kasra' has a live fleet_agents row; agent B in squad S2
+// ALSO has slug 'kasra'; a dispatch to B resolves `fa.agent_id = a.slug` against B's OWN slug
+// ('kasra') and matches A's row — B's task gets delivered into A's inbox: wrong executor, B's
+// task content disclosed to A, B's dispatch wrongly marked delivered/stranded). Worse, the
+// `ORDER BY last_reported_at DESC` let a slug match outrank an EXACT id match purely on recency.
+//
+// Fix: two sequential, ordered lookups, mirroring the established ambiguity-refusal pattern this
+// codebase already uses for exactly this class of problem (src/org/resolve.ts
+// resolveByIdThenSlug: "resolve by id first; on a slug, COUNT matches and REFUSE an ambiguous
+// one"):
+//   1. Exact match on `fleet_agents.agent_id = agentId` (the PK column). fleet_agents' PK is
+//      (tenant, agent_id), so this is UNAMBIGUOUS by construction — it ALWAYS wins, unconditional
+//      on recency, and no slug lookup is attempted at all when it hits.
+//   2. Only when (1) finds nothing: resolve `agentId`'s OWN slug, then COUNT how many agents
+//      TENANT-WIDE share that slug (this tenant's `agents` table has no explicit tenant column —
+//      the deployment model is one D1 per tenant, so a plain COUNT is already tenant-scoped).
+//      Exactly 1 (only the caller's own agent) → safe to match `fleet_agents.agent_id = slug`,
+//      because no other real agent could be the one that row's attach call meant. More than 1 (a
+//      same-slug agent exists in a different squad) → the slug cannot be safely attributed to
+//      THIS agent → refuse the fallback entirely (return null, same as "no fleet row" → the
+//      caller falls back to the in-Worker route, which is always a safe default). This has the
+//      same effect as scoping the slug match to the agent's own squad — agents.slug's actual
+//      invariant is UNIQUE(squad_id, slug), so "unique tenant-wide" is the necessary and
+//      sufficient condition for a bare slug to unambiguously identify one specific agent.
 async function readFleetAgentRow(
   env: Env,
   agentId: string,
 ): Promise<{ agent_id: string; runtime: string | null; status: string | null; last_reported_at: string | null } | null> {
-  return await env.DB.prepare(
-    `SELECT fa.agent_id, fa.runtime, fa.status, fa.last_reported_at
-       FROM agents a
-       LEFT JOIN fleet_agents fa
-         ON fa.tenant = ?1 AND (fa.agent_id = a.id OR fa.agent_id = a.slug)
-      WHERE a.id = ?2
-      ORDER BY fa.last_reported_at DESC
-      LIMIT 1`,
+  type Row = { agent_id: string; runtime: string | null; status: string | null; last_reported_at: string | null }
+
+  // 1. Exact id match — unambiguous (fleet_agents PK is (tenant, agent_id)), always wins.
+  const byId = await env.DB.prepare(
+    `SELECT agent_id, runtime, status, last_reported_at FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
   )
     .bind(env.TENANT_SLUG, agentId)
-    .first<{ agent_id: string; runtime: string | null; status: string | null; last_reported_at: string | null }>()
+    .first<Row>()
+  if (byId) return byId
+
+  // 2. Slug fallback — ONLY when no id-keyed row exists, and ONLY when the slug is unique
+  // tenant-wide (ambiguity-refusal, mirroring resolveByIdThenSlug).
+  const self = await env.DB.prepare(`SELECT slug FROM agents WHERE id = ?1 LIMIT 1`)
+    .bind(agentId)
+    .first<{ slug: string | null }>()
+  if (!self?.slug) return null // no such agent, or no slug on record — nothing to fall back to
+
+  const dupes = await env.DB.prepare(`SELECT COUNT(*) AS n FROM agents WHERE slug = ?1`)
+    .bind(self.slug)
+    .first<{ n: number }>()
+  if (Number(dupes?.n ?? 0) !== 1) return null // 0 is impossible (self counts), >1 is ambiguous — refuse either way
+
+  return await env.DB.prepare(
+    `SELECT agent_id, runtime, status, last_reported_at FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
+  )
+    .bind(env.TENANT_SLUG, self.slug)
+    .first<Row>()
 }
 
 /**
