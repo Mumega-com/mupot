@@ -16,11 +16,16 @@
 import type { MessageBatch, Message } from '@cloudflare/workers-types'
 import type { Env, BusEvent, Task } from '../types'
 import { postAgentActivity } from '../channels'
+import { getFleetAgentLiveness } from '../fleet/registry'
+import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError } from './fleet-bridge'
 
 // Internal origin for DO fetch routing. DO fetch ignores host; the path carries
 // the intent. The agents component routes these paths inside its DO classes.
 const DO_ORIGIN = 'https://do.mupot.internal'
 const TASK_DISPATCH_LEASE_MS = 60_000
+// Backpressure backoff (WARN-2, #353 v2): when the bridge reports the recipient's inbox is at
+// capacity, back off instead of hot-looping an immediate retry against the same full inbox.
+const INBOX_FULL_RETRY_DELAY_SEC = 15
 
 class RetryAfterError extends Error {
   constructor(message: string, readonly delaySeconds: number) {
@@ -54,7 +59,24 @@ interface TaskDispatchReceiptState {
 function taskDispatchIdentity(event: BusEvent): { taskId: string; receiptId: string } | null {
   const payload = event.payload as TaskDispatchPayload
   if (typeof payload?.dispatch_receipt_id !== 'string' || typeof payload.task_id !== 'string') return null
+  // WARN-1 (#353 v2): reject empty/whitespace-only ids. An empty receiptId would collapse the
+  // bridge's idempotency key to the constant 'dispatch-inbox:' for every such event — a false
+  // dedup that could mask an unrelated dispatch as already-delivered.
+  if (payload.task_id.trim().length === 0 || payload.dispatch_receipt_id.trim().length === 0) return null
   return { taskId: payload.task_id, receiptId: payload.dispatch_receipt_id }
+}
+
+// The dispatching principal, for the fleet-bridge's sender attribution (fleet-bridge.ts). Prefers
+// the structured `actor` field (the same "who caused this" attribution the activity feed already
+// trusts) and falls back to the task_dispatch payload's `by` field, which carries the same member
+// id (src/mcp/index.ts toolTaskDispatch sets both from the same `memberId`). Never fabricates a
+// specific identity — 'system' is the fail-closed default when neither is present.
+function dispatchMemberId(event: BusEvent): string {
+  if (event.actor?.kind === 'member' && typeof event.actor.id === 'string' && event.actor.id) {
+    return event.actor.id
+  }
+  const payload = event.payload as { by?: unknown }
+  return typeof payload?.by === 'string' && payload.by ? payload.by : 'system'
 }
 
 async function readTaskDispatchReceipt(env: Env, event: BusEvent): Promise<TaskDispatchReceiptState | null> {
@@ -206,6 +228,58 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         }
         return true
       }
+
+      // execution_receipt_id is null: this dispatch has NOT committed to the IN-WORKER route.
+      // Two possibilities remain, and they must be told apart WITHOUT re-deciding a route that
+      // was already chosen (BLOCK-2 fix, #353 v2):
+      //   (a) a prior attempt already committed to the EXTERNAL route (inbox delivery landed)
+      //       but crashed/threw before consuming the dispatch receipt — STICKY: finish that
+      //       route, never fall through to in-Worker.
+      //   (b) no route has been decided yet — a genuinely fresh dispatch.
+      // (a) is checked first via durable state (an agent_messages row for this receipt), not an
+      // in-memory flag, so it survives across Queue redeliveries and worker restarts.
+      //
+      // Both branches below resolve `route.agentId` — NOT `event.agent_id` — as the inbox
+      // delivery target. `event.agent_id` is always `agents.id` (the uuid task assignment
+      // uses), but the fleet-attach/signed-inbox surface a real external runtime polls under is
+      // keyed by WHATEVER identifier that runtime's own attach call declared (confirmed against
+      // the live mumega tenant DB, 2026-07-14: kasra's fleet_agents.agent_id/agent_keys.agent_id
+      // are both its slug 'kasra', never its uuid). Delivering to `event.agent_id` would write a
+      // message no real signed-inbox poll ever asks for — silently unreachable, formally
+      // "delivered." `getFleetAgentLiveness` resolves the bridge (src/fleet/registry.ts); using
+      // its `agentId` here is what makes delivery actually reach the runtime's own poll query.
+      const route = await getFleetAgentLiveness(env, event.agent_id)
+      const deliveryTarget = route.agentId || event.agent_id
+      if (await dispatchInboxDelivered(env, identity.receiptId)) {
+        try {
+          await deliverDispatchToInbox(env, {
+            agentId: deliveryTarget,
+            squadId: event.squad_id ?? '',
+            taskId: identity.taskId,
+            receiptId: identity.receiptId,
+            dispatchedByMemberId: dispatchMemberId(event),
+          })
+        } catch (error) {
+          if (error instanceof InboxFullError) {
+            throw new RetryAfterError(error.message, INBOX_FULL_RETRY_DELAY_SEC)
+          }
+          throw error
+        }
+        if (!(await consumeTaskDispatchReceipt(env, event))) {
+          throw new Error('external dispatch receipt consume failed')
+        }
+        return true
+      }
+
+      // (b) Fresh decision point. Claim the dispatch lease BEFORE acting on the route (not just
+      // before wakeAgent, as v1 did) — this serializes concurrent redeliveries of the SAME event
+      // so only the lease-holder decides AND acts. Without this, two in-flight attempts could
+      // independently pick DIFFERENT routes for the same receipt (one sees a live runtime, the
+      // other — racing right at the presence TTL boundary — sees it stale) and both act: one
+      // delivers externally, the other wakes in-Worker. That split-route race is the same class
+      // of double execution as BLOCK-2, just via true concurrency instead of sequential retry;
+      // claiming the lease first closes it the same way the pre-existing code already closed the
+      // sequential-retry case for wakeAgent alone.
       const leaseExpiresAt = await claimTaskDispatchReceipt(env, event, Date.now())
       if (leaseExpiresAt === null) {
         const current = await readTaskDispatchReceipt(env, event)
@@ -216,10 +290,33 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         }
         throw new Error('task dispatch receipt lease busy')
       }
+
       try {
-        await wakeAgent(env, event.agent_id, event)
+        if (route.runtime && route.live) {
+          // EXTERNAL route: deliver to inbox only. Deliberately do NOT wake-execute in-Worker
+          // and do NOT set execution_receipt_id — a failed delivery genuinely re-reaches
+          // delivery on retry via the (a) branch above, not the execution-receipt recovery
+          // branch (BLOCK-1 fix: no recovery-branch bypass, because execution_receipt_id is
+          // never touched by this route at all).
+          await deliverDispatchToInbox(env, {
+            agentId: deliveryTarget,
+            squadId: event.squad_id ?? '',
+            taskId: identity.taskId,
+            receiptId: identity.receiptId,
+            dispatchedByMemberId: dispatchMemberId(event),
+          })
+        } else {
+          // IN-WORKER route (fallback: no fleet row, empty runtime, or stale/dead presence) —
+          // today's behavior, unchanged. This is the only path that executes in-Worker, so a
+          // dead external runtime can never strand the task (BLOCK-2 fix: exactly one route is
+          // chosen and acted on per lease-holder).
+          await wakeAgent(env, event.agent_id, event)
+        }
       } catch (error) {
         await releaseTaskDispatchReceipt(env, event, leaseExpiresAt, error)
+        if (error instanceof InboxFullError) {
+          throw new RetryAfterError(error.message, INBOX_FULL_RETRY_DELAY_SEC)
+        }
         throw error
       }
       if (!(await consumeTaskDispatchReceipt(env, event, leaseExpiresAt))) {

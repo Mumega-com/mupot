@@ -216,6 +216,95 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
   return skipped > 0 ? { ok: true, count: written, skipped } : { ok: true, count: written }
 }
 
+// ── agents.id ↔ fleet_agents.agent_id identifier-space bridge ──────────────────────────────
+//
+// `task.assignee_agent_id` (and therefore the `event.agent_id` a task_dispatch wake carries) is
+// ALWAYS `agents.id` — the UUID primary key that also names the AgentDO (resolveTaskAssignee,
+// src/tasks/assignee.ts, resolves and stores exactly that column). But the fleet-attach surface
+// (fleetAttachApp /attach + /attach-signed, src/fleet/attach-routes.ts) and the signed-inbox
+// read path (agent_keys.agent_id, src/fleet/signed-attach.ts / signed-inbox.ts) are both keyed
+// by the human-readable SLUG — confirmed against the live mumega tenant DB (2026-07-14): kasra's
+// `agents.id` is a uuid, `agents.slug='kasra'`, and its `fleet_agents.agent_id` /
+// `agent_keys.agent_id` are BOTH `'kasra'`, never the uuid. A fleet-row read keyed directly on
+// `event.agent_id` would therefore NEVER match a real external runtime's row — the route
+// decision would be silently dead code in production. This resolves the uuid → slug bridge with
+// one JOIN so the caller can pass either identifier and land on the right row; ORDER BY
+// last_reported_at DESC is defense-in-depth in the unlikely case both an id-keyed and a
+// slug-keyed row exist for the same agent (prefer the most recently reported one).
+async function readFleetAgentRow(
+  env: Env,
+  agentId: string,
+): Promise<{ agent_id: string; runtime: string | null; status: string | null; last_reported_at: string | null } | null> {
+  return await env.DB.prepare(
+    `SELECT fa.agent_id, fa.runtime, fa.status, fa.last_reported_at
+       FROM agents a
+       LEFT JOIN fleet_agents fa
+         ON fa.tenant = ?1 AND (fa.agent_id = a.id OR fa.agent_id = a.slug)
+      WHERE a.id = ?2
+      ORDER BY fa.last_reported_at DESC
+      LIMIT 1`,
+  )
+    .bind(env.TENANT_SLUG, agentId)
+    .first<{ agent_id: string; runtime: string | null; status: string | null; last_reported_at: string | null }>()
+}
+
+/**
+ * getFleetAgentRuntime — single-row, tenant-scoped runtime lookup keyed on `agents.id` (the
+ * identifier task_dispatch always carries), resolved through `agents.slug` to find the matching
+ * `fleet_agents` row (see readFleetAgentRow). Returns '' when the agent has no fleet_agents row,
+ * or its runtime column is empty — BOTH mean "no external runtime; the in-Worker AgentDO is the
+ * only delivery path for this agent." The runtime value itself was already validated against
+ * RUNTIMES/VALID_RUNTIMES at write time (reportFleetAgents / upsertRunning), so a non-empty read
+ * here is sufficient proof of "externally hosted" without re-validating the set.
+ */
+export async function getFleetAgentRuntime(env: Env, agentId: string): Promise<string> {
+  const row = await readFleetAgentRow(env, agentId)
+  return row?.runtime ? String(row.runtime) : ''
+}
+
+export interface FleetAgentRouteInfo {
+  /** Non-empty runtime slug, or '' when no fleet row / no runtime is reported. */
+  runtime: string
+  /** True iff `runtime` is non-empty AND the row's derived Presence (see `derivePresence`,
+   *  the SAME classifier the dashboard/#agent-bus feed already uses) is 'live'. A 'stale' or
+   *  'offline' runtime is deliberately NOT live — a dead/unreachable external runtime must not
+   *  be handed a dispatch it will never pick up (that would strand the task). */
+  live: boolean
+  /**
+   * The IDENTITY the matched fleet_agents row is actually keyed under (its own `agent_id`
+   * column — a uuid or a slug, whichever that runtime's own attach/report call declared), or ''
+   * when no row matched. THIS, not the caller's input `agentId`, is what an inbox delivery must
+   * address: it is the one identity guaranteed to be the identity that runtime's own signed-
+   * inbox / bearer-inbox poll queries by, because the row's own attach call is what wrote it.
+   * Using the caller's `agentId` (agents.id, uuid) instead would silently misaddress delivery
+   * for any runtime — like kasra's live signed-attach today — that reports under its slug.
+   */
+  agentId: string
+}
+
+/**
+ * getFleetAgentLiveness — the single read the dispatch-bridge route decision needs: is this
+ * agent's runtime EXTERNAL (fleet_agents.runtime non-empty), and is it LIVE right now (recent
+ * heartbeat within `presenceTtlSec`)? Reuses the EXISTING `derivePresence` / `presenceTtlSec`
+ * classifiers verbatim (S353 v2 gate note: do not invent a second liveness notion — this is the
+ * same presence definition `listFleetAgentRuntimeView`/`getAgentView` already use for the
+ * dashboard/#agent-bus feed), read through the agents.id → fleet_agents.agent_id bridge above.
+ */
+export async function getFleetAgentLiveness(
+  env: Env,
+  agentId: string,
+  nowMs = Date.now(),
+): Promise<FleetAgentRouteInfo> {
+  const row = await readFleetAgentRow(env, agentId)
+  const runtime = row?.runtime ? String(row.runtime) : ''
+  if (!runtime) return { runtime: '', live: false, agentId: '' }
+  const ttlSec = presenceTtlSec(env)
+  const status = String(row?.status ?? 'unknown')
+  const lastReportedAt = String(row?.last_reported_at ?? '')
+  const live = derivePresence(status, lastReportedAt, ttlSec, nowMs) === 'live'
+  return { runtime, live, agentId: String(row?.agent_id ?? '') }
+}
+
 export async function listFleetAgents(env: Env): Promise<FleetAgentRow[]> {
   const rows = await env.DB.prepare(
     `SELECT agent_id, display, runtime, squads, lifecycle, provider_contract, status, reported_by, last_reported_at, agent_type, member_id
