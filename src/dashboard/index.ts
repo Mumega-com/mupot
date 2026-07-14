@@ -65,7 +65,7 @@ import { resolveAgentRef } from '../org/resolve'
 import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
 import { loadApprovals, resultPreview } from './approvals'
 import { loadLoopsView, loopsBody } from './loops'
-import { loadEconomy, economyBody } from './economy'
+import { loadEconomy, economyBody, loadTodaySpendScalar } from './economy'
 import { loadDeployment, deploymentBody } from './deployment'
 import { loadVerifications, verificationsBody } from './verifications'
 import { loadAudit, auditBody } from './audit'
@@ -111,7 +111,7 @@ import { buildBoard } from '../flight/board'
 import type { FlightCard } from '../flight/board'
 import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
-import { loadBrainView, brainBody, regimeBadgeClass } from './brain'
+import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './brain'
 import type { PhysicsSnapshot } from './brain'
 import { loadGrowthView, growthBody } from './growth'
 import { setLoopControl, isLoopControlAction } from '../loops/decisions'
@@ -195,15 +195,29 @@ dashboardApp.get('/', async (c) => {
   if ((auth.role === 'owner' || hasOrgOwnerCapability(auth)) && !(await isOnboardingComplete(c.env))) {
     return c.redirect('/setup')
   }
-  // Load observatory data (agents, stats, bars, ticks, recentTasks) and the
-  // operator queue (existing loadApprovals, same RBAC as the /approvals page)
-  // in parallel — they hit independent D1 tables.
-  const [obsData, approvals] = await Promise.all([
+  // Load observatory data (agents, stats, bars, ticks, recentTasks), the
+  // operator queue (existing loadApprovals, same RBAC as the /approvals page),
+  // and the two LIGHT header-chip reads, in parallel — independent KV/D1 reads,
+  // one round-trip cluster. Overview is the highest-traffic page (the owner's
+  // landing page), so this deliberately uses the light single-read helpers, NOT
+  // loadBrainView (loops + up to 100 decisions) or loadEconomy (5 aggregation
+  // queries: by-model/by-agent/14-day/totals/latest) those other pages need:
+  //   - loadBrainPhysics: the SAME bare KV .get() brain.ts's coherence panel
+  //     reads (no D1 at all).
+  //   - loadTodaySpendScalar: ONE D1 round trip (today's sum + an EXISTS check),
+  //     vs loadEconomy's 5 parallel queries — see economy.ts for why "configured"
+  //     is defined identically so the two never disagree.
+  const [obsData, approvals, physics, spend] = await Promise.all([
     loadObservatory(c.env),
     loadApprovals(c.env, auth),
+    loadBrainPhysics(c.env),
+    loadTodaySpendScalar(c.env),
   ])
   return c.html(
-    shell(c.env.BRAND, 'Overview', observatoryBody(c.env.BRAND, obsData, approvals, auth)),
+    shell(c.env.BRAND, 'Overview', observatoryBody(c.env.BRAND, obsData, approvals, auth), {
+      physics,
+      costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
+    }),
   )
 })
 
@@ -493,9 +507,20 @@ dashboardApp.get('/fleet', async (c) => {
   // No company-bus connection → show the POT-NATIVE flock instead of an empty
   // notice: agents that checked in to THIS pot (inbound, no egress). This is the
   // tenant-pot path (Digid); the bus path below is the company/HQ window.
+  // Trivially-cheap header wiring on both return paths (same light reads as
+  // Overview — bare KV get + one-row D1 scalar).
   if (!fleetScoped(c.env)) {
-    const presence = await listPresence(c.env, Date.now())
-    return c.html(shell(c.env.BRAND, 'Fleet', html`${hostPanel}${potFleetBody(presence)}`))
+    const [presence, physics, spend] = await Promise.all([
+      listPresence(c.env, Date.now()),
+      loadBrainPhysics(c.env),
+      loadTodaySpendScalar(c.env),
+    ])
+    return c.html(
+      shell(c.env.BRAND, 'Fleet', html`${hostPanel}${potFleetBody(presence)}`, {
+        physics,
+        costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
+      }),
+    )
   }
   let rows: FleetRow[] = []
   let error: string | null = null
@@ -504,7 +529,13 @@ dashboardApp.get('/fleet', async (c) => {
   } catch (e) {
     error = e instanceof Error ? e.message : 'bus_unreachable'
   }
-  return c.html(shell(c.env.BRAND, 'Fleet', html`${hostPanel}${fleetBody(rows, error)}`))
+  const [physics, spend] = await Promise.all([loadBrainPhysics(c.env), loadTodaySpendScalar(c.env)])
+  return c.html(
+    shell(c.env.BRAND, 'Fleet', html`${hostPanel}${fleetBody(rows, error)}`, {
+      physics,
+      costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
+    }),
+  )
 })
 
 // POST /fleet/host-control — start|stop|restart a HOST agent via the SIGNED control plane (mupot
@@ -586,13 +617,22 @@ dashboardApp.get('/coordination', async (c) => {
 
 // GET /agents — the management table: all agents across squads, plus an Add form.
 dashboardApp.get('/agents', async (c) => {
-  const [agents, squadOptions] = await Promise.all([
+  // Trivially-cheap header wiring (same light reads as Overview — bare KV get +
+  // one-row D1 scalar, not the full loadBrainView/loadEconomy).
+  const [agents, squadOptions, physics, spend] = await Promise.all([
     loadAllAgents(c.env),
     loadSquadOptions(c.env),
+    loadBrainPhysics(c.env),
+    loadTodaySpendScalar(c.env),
   ])
   const auth = c.get('auth')
   const canManage = isAdmin(auth)
-  return c.html(shell(c.env.BRAND, 'Agents', agentsBody(agents, squadOptions, canManage)))
+  return c.html(
+    shell(c.env.BRAND, 'Agents', agentsBody(agents, squadOptions, canManage), {
+      physics,
+      costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
+    }),
+  )
 })
 
 // POST /agents — create an agent (owner/admin only).
