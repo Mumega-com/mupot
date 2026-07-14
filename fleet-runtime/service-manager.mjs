@@ -29,6 +29,11 @@ import {
 
 const SERVICE_ACTIONS = Object.freeze(['install', 'reload', 'status', 'uninstall'])
 const LINGER_NEXT_STEP = 'run loginctl enable-linger <username> with suitable host privileges, then rerun status'
+const READINESS_RETRY_DELAYS_MS = Object.freeze([250, 750, 1500, 2500])
+
+function defaultSleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
 
 function pathArg(value) {
   return resolve(value === '~' ? homedir() : value.startsWith('~/') ? join(homedir(), value.slice(2)) : value)
@@ -198,6 +203,23 @@ function normalizeStatus(result) {
   }
 }
 
+function servicesOperational(status, expectedCount) {
+  return status.services.length === expectedCount &&
+    status.services.every((service) => service.loaded === true && service.running === true)
+}
+
+async function readLifecycleStatus(adapter, context, runner, deps, manager, action, lifecycle) {
+  let status = normalizeStatus(await adapter.status(context, runner))
+  if (manager !== 'launchd' || !['install', 'reload'].includes(action) || lifecycle.ok === false) return status
+  const sleep = deps.sleep ?? defaultSleep
+  for (const delay of READINESS_RETRY_DELAYS_MS) {
+    if (servicesOperational(status, context.services.length)) break
+    await sleep(delay)
+    status = normalizeStatus(await adapter.status(context, runner))
+  }
+  return status
+}
+
 function projectLinger(linger) {
   if (linger === null || linger === undefined) return null
   return {
@@ -349,7 +371,7 @@ export async function buildServiceReceipt(opts = {}, deps = {}) {
       status = normalizeStatus(await adapter.status(context, runner))
     } else {
       lifecycle = await adapter[opts.action](context, runner, { enableLinger: opts.enableLinger === true })
-      status = normalizeStatus(await adapter.status(context, runner))
+      status = await readLifecycleStatus(adapter, context, runner, deps, manager, opts.action, lifecycle)
     }
   } catch (error) {
     return buildFailedServiceReceipt({
