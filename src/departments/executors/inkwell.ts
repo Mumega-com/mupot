@@ -120,6 +120,11 @@ export async function inkwellContentWrite(
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${cfg.token}`,
+        // Worker→Worker subrequests carry no default User-Agent; the mumega.com
+        // zone WAF 403s (error 1010) a UA-less/bot-looking request, surfacing as
+        // inkwell_http_error even with a valid secret + payload. An explicit UA
+        // clears the managed rule (same fix the fleet report hook needed).
+        'user-agent': 'mupot-executor/1.0',
       },
       body: JSON.stringify(internalBody),
       // SSRF defense-in-depth (LOW-1, adversarial gate, mupot#370 delta): assertSafeInkwellUrl

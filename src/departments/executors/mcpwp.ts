@@ -143,6 +143,10 @@ export async function wpContentWrite(
       headers: {
         'content-type': 'application/json',
         authorization: authHeader,
+        // Worker→origin subrequests carry no default User-Agent; many WAF/security
+        // plugins (and the mumega.com zone rule) 403 a UA-less request. Explicit UA
+        // for parity with the inkwell adapter.
+        'user-agent': 'mupot-executor/1.0',
       },
       body: JSON.stringify(body),
       // SSRF defense-in-depth (LOW-1, adversarial gate): assertSafeSiteUrl only
