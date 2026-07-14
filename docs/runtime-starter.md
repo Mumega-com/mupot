@@ -102,6 +102,9 @@ correlates each queued probe to the daemon's redacted state.
 AGENT_ID=manager
 OUT="$HOME/.fleet/receipts/$AGENT_ID"
 mkdir -p "$OUT"
+node "$HOME/.fleet/runtime/host-receipt.mjs" \
+  --require-services --service-manager auto \
+  > "$OUT/host.json"
 
 node "$HOME/.fleet/runtime/cutover-probe.mjs" \
   --base-url https://YOUR-POT.example.com \

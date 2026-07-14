@@ -33,6 +33,11 @@ describe('runtime starter documentation', () => {
     expect(docs).toMatch(/Linux[\s\S]{0,120}systemd/i)
   })
 
+  it('collects service-aware host evidence inside the per-agent bundle', () => {
+    expect(docs).toContain('> "$OUT/host.json"')
+    expect(docs).toMatch(/host-receipt\.mjs[\s\S]{0,160}--require-services[\s\S]{0,160}> "\$OUT\/host\.json"/)
+  })
+
   it('keeps credentials out of files and service environments', () => {
     expect(docs).not.toMatch(/EnvironmentVariables[\s\S]{0,200}(?:TOKEN|SECRET|PRIVATE_KEY)/)
     expect(docs).not.toMatch(/Environment=(?:[^\n]*)(?:TOKEN|SECRET|PRIVATE_KEY)/)
