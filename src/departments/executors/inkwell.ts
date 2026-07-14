@@ -73,6 +73,27 @@ export function toPublishBody(payload: unknown): PublishBody | null {
   }
 }
 
+/**
+ * Map an opaque stored proposal payload to a publish body for an UPDATE-EXISTING
+ * action (mupot Flight 2 slice 1: seo-meta-fix). Mirrors toPublishBody, but:
+ *
+ *   - REQUIRES slug. toPublishBody treats slug as optional and auto-derives one
+ *     from the title when absent — correct for "create new content", wrong for
+ *     "fix this existing item's meta". A meta-fix with no target slug must never
+ *     silently fall through to slug-from-title and create a stray duplicate.
+ *   - FORCES overwrite=true unconditionally, regardless of what the stored
+ *     payload set (or omitted). seo-meta-fix is definitionally an update to an
+ *     EXISTING item — there is no "create" branch for this action.
+ *
+ * Returns null (fail-closed) when toPublishBody itself would (missing/blank
+ * title or content) OR when slug is absent — the caller must refuse to write.
+ */
+export function toMetaFixPublishBody(payload: unknown): PublishBody | null {
+  const body = toPublishBody(payload)
+  if (!body || !body.slug) return null
+  return { ...body, overwrite: true }
+}
+
 export class InkwellExecutorError extends Error {
   constructor(public readonly reason: string, message?: string) {
     super(message ?? reason)
