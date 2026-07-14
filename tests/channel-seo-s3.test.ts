@@ -466,11 +466,12 @@ describe('4. SeoChannel composes into GrowthModule — 3 outbound + 5 seo = 8 to
     }).not.toThrow()
   })
 
-  it('GrowthModule.channels has 2 channels (OutboundChannel + SeoChannel)', () => {
-    expect(GrowthModule.channels).toHaveLength(2)
+  it('GrowthModule.channels has 3 channels (OutboundChannel + SeoChannel + WordpressChannel, #370)', () => {
+    expect(GrowthModule.channels).toHaveLength(3)
     const channelKeys = GrowthModule.channels?.map((c) => c.key) ?? []
     expect(channelKeys).toContain('outbound')
     expect(channelKeys).toContain('seo')
+    expect(channelKeys).toContain('wordpress')
   })
 })
 
@@ -824,13 +825,14 @@ describe('9. Regression: GrowthModule with SeoChannel — outbound keys intact, 
     expect(uniqueKeys.size).toBe(keys.length)
   })
 
-  it('7 work-types total (1 outbound + 6 seo = 4 propose-only + 2 executable), no duplicates', () => {
+  it('8 work-types total (1 outbound + 6 seo + 1 wordpress), no duplicates', () => {
     // S3: 1 outbound + 4 seo = 5. S4 adds 2 executable seo work-types → 7 total.
+    // #370: WordpressChannel adds 1 executable work-type (content-publish) → 8 total.
     const wts = getChannelWorkTypes(GrowthModule.channels ?? [])
-    expect(wts).toHaveLength(7)
+    expect(wts).toHaveLength(8)
     const keys = wts.map((w) => w.key)
     const uniqueKeys = new Set(keys)
-    expect(uniqueKeys.size).toBe(7)
+    expect(uniqueKeys.size).toBe(8)
   })
 
   it('registered GrowthModule channels are frozen (deepFreezeClone covers channels)', () => {

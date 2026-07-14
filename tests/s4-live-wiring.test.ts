@@ -1,26 +1,39 @@
 // tests/s4-live-wiring.test.ts — S4 live-wire: SSRF guard + the owner-only execute route.
 //
-// A. SSRF (WARN-1): inkwellContentWrite must reject non-https / internal / metadata
-//    apiUrl BEFORE any fetch.
+// A. SSRF (WARN-1): inkwellContentWrite / wpContentWrite must reject non-https /
+//    internal / metadata URLs BEFORE any fetch.
 // B. POST /admin/departments/:dept/execute/:gateId — owner/admin gate + fail-closed
-//    wiring (no INKWELL_API_URL → 503, no connector → 503, unknown dept → 404,
-//    unapproved proposal → 409). The full executed:true path is covered at the kernel
-//    level (executor-inkwell-s4 / department-proposals-durability).
+//    wiring. #370: this route now resolves BOTH adapters additively (neither is
+//    fatal alone — only "neither resolves" is fatal), since the route cannot know
+//    which adapter the approved record targets (content-bound, kernel-internal).
+//    unknown dept → 404, unapproved proposal → 409. The full executed:true path is
+//    covered at the kernel level (executor-inkwell-s4 / executor-mcpwp-s4 /
+//    department-proposals-durability).
 
 import { describe, it, expect, vi } from 'vitest'
 
-// Mock only resolveConnector; keep the rest of the connector service intact.
+// Mock resolveConnector + resolveConnectorWithMeta; keep the rest of the connector
+// service intact. Both are made type-aware so inkwell and mcpwp resolution can be
+// controlled independently per test.
 vi.mock('../src/connectors/service', async (orig) => ({
   ...(await orig<typeof import('../src/connectors/service')>()),
   resolveConnector: vi.fn(),
+  resolveConnectorWithMeta: vi.fn(),
 }))
 
 import { dashboardApp } from '../src/dashboard/index'
-import { resolveConnector } from '../src/connectors/service'
+import { resolveConnector, resolveConnectorWithMeta } from '../src/connectors/service'
 import { inkwellContentWrite } from '../src/departments/executors/inkwell'
+import { wpContentWrite } from '../src/departments/executors/mcpwp'
 import type { Env } from '../src/types'
 
 const mockResolve = vi.mocked(resolveConnector)
+const mockResolveWithMeta = vi.mocked(resolveConnectorWithMeta)
+
+// Default: no mcpwp connector configured, unless a test overrides it. Declared here
+// (not per-test) so every pre-existing inkwell-focused test keeps its original,
+// single-adapter behavior without having to know mcpwp now exists.
+mockResolveWithMeta.mockResolvedValue(null)
 
 // ── A. SSRF guard ─────────────────────────────────────────────────────────────
 describe('inkwellContentWrite — SSRF guard on apiUrl', () => {
@@ -60,6 +73,33 @@ describe('inkwellContentWrite — SSRF guard on apiUrl', () => {
   it('allows a public https host', async () => {
     const ok = vi.fn(async () => new Response(JSON.stringify({ ok: true, slug: 's', url: '/blog/s' }), { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch
     const r = await inkwellContentWrite({ apiUrl: 'https://inkwell-api.mumega.com', token: 'tok', tenantSlug: 'mumega' }, payload, ok)
+    expect(r.ok).toBe(true)
+    expect(ok).toHaveBeenCalledOnce()
+  })
+})
+
+// #370: wpContentWrite reuses the SAME shared guard (src/lib/ssrf.ts) — a smaller
+// spot-check here; the full private-host matrix is exercised above for inkwell and
+// unit-tested directly in tests/executor-mcpwp-s4.test.ts.
+describe('wpContentWrite — SSRF guard on siteUrl', () => {
+  const payload = { title: 't', content: 'c' }
+  const neverFetch = vi.fn(async () => new Response('{}')) as unknown as typeof fetch
+  const cfg = { username: 'agent', appPassword: 'pw' }
+
+  it.each([
+    ['http://example.com', 'non-https'],
+    ['https://169.254.169.254', 'metadata'],
+    ['https://localhost', 'localhost'],
+  ])('rejects %s (%s) with mcpwp_bad_siteurl, no fetch', async (siteUrl) => {
+    await expect(wpContentWrite({ ...cfg, siteUrl }, payload, neverFetch)).rejects.toMatchObject({
+      reason: 'mcpwp_bad_siteurl',
+    })
+    expect(neverFetch).not.toHaveBeenCalled()
+  })
+
+  it('allows a public https host', async () => {
+    const ok = vi.fn(async () => new Response(JSON.stringify({ id: 1, link: 'https://example.com/?p=1' }), { status: 201, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch
+    const r = await wpContentWrite({ ...cfg, siteUrl: 'https://example.com' }, payload, ok)
     expect(r.ok).toBe(true)
     expect(ok).toHaveBeenCalledOnce()
   })
@@ -106,25 +146,55 @@ describe('POST /admin/departments/:dept/execute/:gateId', () => {
     expect(res.status).toBe(404)
   })
 
-  it('no INKWELL_API_URL → 503 executor_not_configured', async () => {
+  it('no INKWELL_API_URL and no mcpwp connector → 503 executor_not_configured', async () => {
+    mockResolveWithMeta.mockResolvedValue(null)
     const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g1'), envForRole('owner'))
     expect(res.status).toBe(503)
     expect(((await res.json()) as { error: string }).error).toBe('executor_not_configured')
   })
 
-  it('no inkwell connector (resolveConnector null) → 503 connector_not_configured', async () => {
+  // #370: neither adapter resolves (inkwell connector missing, no mcpwp connector
+  // either) → still 503. The specific per-adapter 'connector_not_configured' error
+  // code is gone now that the route resolves multiple adapters additively — see the
+  // route's header comment in src/dashboard/index.ts for why (content-bound dispatch
+  // means the route can't know in advance which single adapter the record needs).
+  it('inkwell connector missing AND no mcpwp connector → 503 executor_not_configured', async () => {
     mockResolve.mockResolvedValue(null)
+    mockResolveWithMeta.mockResolvedValue(null)
     const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g1'), envForRole('owner', INKWELL))
     expect(res.status).toBe(503)
-    expect(((await res.json()) as { error: string }).error).toBe('connector_not_configured')
+    expect(((await res.json()) as { error: string }).error).toBe('executor_not_configured')
   })
 
   it('connector present but proposal not approved → 409 not_executable (gate holds)', async () => {
     mockResolve.mockResolvedValue('tok')
+    mockResolveWithMeta.mockResolvedValue(null)
     const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), envForRole('owner', INKWELL))
     expect(res.status).toBe(409)
     const body = (await res.json()) as { executed: boolean; reason: string }
     expect(body.executed).toBe(false)
     expect(body.reason).toMatch(/not_approved/)
+  })
+
+  // ── #370: mcpwp resolution at the route level ──────────────────────────────
+
+  it('mcpwp-only pot (no INKWELL_API_URL, valid mcpwp connector) reaches execute() — not blocked by 503', async () => {
+    mockResolveWithMeta.mockResolvedValue({
+      secret: 'app-pw-123',
+      meta: JSON.stringify({ siteUrl: 'https://example.com', username: 'agent' }),
+    })
+    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), envForRole('owner'))
+    // Reaches the kernel's fail-closed not_approved check (409), NOT the route's
+    // 503 executor_not_configured — proving the mcpwp connector alone satisfies the gate.
+    expect(res.status).toBe(409)
+    const body = (await res.json()) as { executed: boolean; reason: string }
+    expect(body.reason).toMatch(/not_approved/)
+  })
+
+  it('mcpwp connector present but meta malformed, and no inkwell → 503 executor_not_configured', async () => {
+    mockResolveWithMeta.mockResolvedValue({ secret: 'app-pw-123', meta: 'not json' })
+    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g1'), envForRole('owner'))
+    expect(res.status).toBe(503)
+    expect(((await res.json()) as { error: string }).error).toBe('executor_not_configured')
   })
 })

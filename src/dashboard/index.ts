@@ -131,7 +131,8 @@ import { executeTaskAsPR } from '../integrations/github-execute'
 import { importProjectItems } from '../integrations/github-projects'
 import { githubStatusBody } from '../integrations/github-dashboard'
 import { connectorsPageBody, connectorAddedBody, connectorRotatedBody } from '../connectors/dashboard'
-import { resolveConnector } from '../connectors/service'
+import { resolveConnector, resolveConnectorWithMeta } from '../connectors/service'
+import { parseWpConnectorConfig } from '../departments/executors/mcpwp'
 import { kernelMintCtx, getRegistered } from '../departments/registry'
 import type { KernelHandle } from '../departments/ctx'
 import '../departments/modules/growth' // side-effect: register GrowthModule so getRegistered('growth') resolves
@@ -371,11 +372,19 @@ dashboardApp.get('/departments/growth', async (c) => {
 })
 
 // POST /admin/departments/:dept/execute/:gateId — owner/admin-triggered execution
-// of an ALREADY-APPROVED department proposal (S4 live-wire). Human-in-the-loop:
-// the owner approves via /approvals (writes the task_verdicts row), then fires this
-// to perform the real Inkwell write. The kernel re-checks the approval + tenant/dept
-// binding; this route only resolves the per-pot connector credential and mints the
-// ctx. Fail-closed: no INKWELL_API_URL or no 'inkwell' connector → 503 (inert).
+// of an ALREADY-APPROVED department proposal (S4 live-wire; WordPress adapter #370).
+// Human-in-the-loop: the owner approves via /approvals (writes the task_verdicts row),
+// then fires this to perform the real content write. The kernel re-checks the approval
+// + tenant/dept binding; this route only resolves the per-pot connector credential(s)
+// and mints the ctx.
+//
+// #370: this route does NOT know which adapter the approved record targets — that is
+// content-bound, resolved inside kernel.ts from the stored payload's `executor` hint
+// (see ctx.ts CONTENT-BOUND EXECUTION). So the route resolves EVERY adapter it knows
+// about, additively and non-fatally: whichever connector(s) are configured for this
+// pot populate handle.executorEnv; the kernel dispatches to whichever one the stored
+// record names. Fail-closed: if NEITHER 'inkwell' nor 'mcpwp' resolves to a usable
+// config → 503 executor_not_configured (inert; nothing wired for this pot at all).
 dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
@@ -386,19 +395,38 @@ dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
   }
   const moduleDef = getRegistered(dept)
   if (!moduleDef) return c.json({ error: 'department_not_found' }, 404)
-  if (!c.env.INKWELL_API_URL) {
-    return c.json({ error: 'executor_not_configured', reason: 'INKWELL_API_URL unset' }, 503)
+
+  const executorEnv: NonNullable<KernelHandle['executorEnv']> = {}
+
+  // Inkwell: pot-scoped 'inkwell' connector. resolveConnector fails closed (null)
+  // when no CONNECTOR_MASTER_KEY or no row. Additive + non-fatal here — a pot with
+  // no INKWELL_API_URL / no inkwell connector simply doesn't get inkwell wired,
+  // it is not an error unless NO adapter resolves at all (checked below).
+  if (c.env.INKWELL_API_URL) {
+    const token = await resolveConnector(c.env, dept, 'inkwell')
+    if (token) {
+      executorEnv.inkwell = { apiUrl: c.env.INKWELL_API_URL, token, tenantSlug: c.env.TENANT_SLUG }
+    }
   }
-  // Pot-scoped 'inkwell' connector. resolveConnector fails closed (null) when no
-  // CONNECTOR_MASTER_KEY or no row — the executor stays inert.
-  const token = await resolveConnector(c.env, dept, 'inkwell')
-  if (!token) {
-    return c.json({ error: 'connector_not_configured', reason: 'no inkwell connector for this pot' }, 503)
+
+  // WordPress (#370): pot-scoped 'mcpwp' connector. secret = the WordPress
+  // application password (the actual credential); meta = non-secret JSON
+  // { siteUrl, username } — same secret+meta split as the Telegram connector's
+  // allowed_chats (src/connectors/service.ts). Additive + non-fatal.
+  const wp = await resolveConnectorWithMeta(c.env, dept, 'mcpwp')
+  if (wp) {
+    const wpCfg = parseWpConnectorConfig(wp.secret, wp.meta)
+    if (wpCfg) executorEnv.mcpwp = wpCfg
   }
-  const handle: KernelHandle = {
-    db: c.env.DB,
-    executorEnv: { inkwell: { apiUrl: c.env.INKWELL_API_URL, token, tenantSlug: c.env.TENANT_SLUG } },
+
+  if (!executorEnv.inkwell && !executorEnv.mcpwp) {
+    return c.json(
+      { error: 'executor_not_configured', reason: 'no inkwell or mcpwp adapter is configured for this pot' },
+      503,
+    )
   }
+
+  const handle: KernelHandle = { db: c.env.DB, executorEnv }
   const ctx = kernelMintCtx(handle, {
     tenantId: c.env.TENANT_SLUG,
     departmentKey: dept,

@@ -790,10 +790,11 @@ describe('11. S3 regression — proposesOnly=true still holds for original work-
 // ── 12. S3 regression: channel/dept/growth/pulse conformance green ────────────
 
 describe('12. S3 regression — channel composition + work-type count still correct', () => {
-  it('getChannelWorkTypes(GrowthModule.channels) now returns 7 work-types (1 outbound + 6 seo)', () => {
+  it('getChannelWorkTypes(GrowthModule.channels) now returns 8 work-types (1 outbound + 6 seo + 1 wordpress)', () => {
     const wts = getChannelWorkTypes(GrowthModule.channels ?? [])
     // outbound-channel had 1 work-type (outreach-send), seo-channel now has 6.
-    expect(wts).toHaveLength(7)
+    // #370: wordpress-channel adds 1 (content-publish) → 8 total.
+    expect(wts).toHaveLength(8)
   })
 
   it('no duplicate work-type keys across outbound + seo channels', () => {

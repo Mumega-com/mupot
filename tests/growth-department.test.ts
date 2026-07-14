@@ -327,17 +327,20 @@ describe('A. GrowthModule registration + activation', () => {
     expect(GrowthModule.metricsEmitted).toHaveLength(0)
   })
 
-  it('GrowthModule has OutboundChannel + SeoChannel in channels (S2+S3)', () => {
+  it('GrowthModule has OutboundChannel + SeoChannel + WordpressChannel in channels (S2+S3+#370)', () => {
     expect(GrowthModule.channels).toBeDefined()
-    // S3: SeoChannel was added alongside OutboundChannel → 2 channels total.
-    expect(GrowthModule.channels).toHaveLength(2)
+    // S3: SeoChannel was added alongside OutboundChannel. #370: WordpressChannel
+    // added (0 metrics, 1 executable work-type) → 3 channels total.
+    expect(GrowthModule.channels).toHaveLength(3)
     const keys = GrowthModule.channels!.map((c) => c.key)
     expect(keys).toContain('outbound')
     expect(keys).toContain('seo')
+    expect(keys).toContain('wordpress')
   })
 
   it('GrowthModule composed metric set has 8 descriptors (3 outbound + 5 seo via channels, S3)', () => {
     // S3: growth.channels = [OutboundChannel (3), SeoChannel (5)] → 8 total.
+    // #370: WordpressChannel adds 0 metrics (metricDescriptors: []) — count unchanged.
     const channelMetrics = GrowthModule.channels?.flatMap((ch) => ch.metricDescriptors) ?? []
     const allMetrics = [...GrowthModule.metricsEmitted, ...channelMetrics]
     expect(allMetrics).toHaveLength(8)
