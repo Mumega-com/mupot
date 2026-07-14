@@ -805,11 +805,7 @@ test('starter-ready bundle requires, exports, and summarizes service continuity 
   )
   const exportDir = tmpDir()
   const exportReceipt = exportBundle({ outDir, exportDir })
-  const exportDebugCheck = checkBundleManifest({ outDir: exportDir })
-  assert.equal(exportReceipt.status, 'pass', JSON.stringify({
-    export: exportReceipt.checks.filter((check) => check.ok === false),
-    manifest: exportDebugCheck.checks.filter((check) => check.ok === false),
-  }, null, 2))
+  assert.equal(exportReceipt.status, 'pass', JSON.stringify(exportReceipt.checks.filter((check) => check.ok === false), null, 2))
   for (const [path, before] of sourceBytes) assert.deepEqual(readFileSync(path), before, path)
   rmSync(outDir, { recursive: true })
   rmSync(sources.sourceDir, { recursive: true })
@@ -955,6 +951,15 @@ test('starter-ready requires recomputed passing evidence for every Task 8 catego
 })
 
 test('starter-ready validates complete producer contracts and cross-receipt bindings', async (t) => {
+  const launchdInstall = installReceipt('pass')
+  launchdInstall.inputs.systemd_dir = null
+  launchdInstall.inputs.service_manager = { requested: 'launchd', resolved: 'launchd' }
+  launchdInstall.checks.find((check) => check.check === 'systemd_definition_dir_ready').check = 'launchd_definition_dir_ready'
+
+  const mismatchedDefinitionInstall = installReceipt('pass')
+  mismatchedDefinitionInstall.outputs.service_definitions[0].sha256 = 'f'.repeat(64)
+  mismatchedDefinitionInstall.checks.find((check) => check.check === 'service_definition_rendered' && check.service === 'heartbeat').sha256 = 'f'.repeat(64)
+
   const cases = [
     ['negative heartbeat delta', { continuous: (() => { const r = continuousReceipt(); r.observation.heartbeat.tick.after = 39; return r })() }],
     ['zero control delta', { continuous: (() => { const r = continuousReceipt(); r.observation.control.poll.after = 70; return r })() }],
@@ -968,6 +973,8 @@ test('starter-ready validates complete producer contracts and cross-receipt bind
     ['absolute starter artifact', { starter: (() => { const r = starterReceipt(); r.artifacts[0].path = '/tmp/starter.json'; return r })() }],
     ['duplicate starter artifact role', { starter: (() => { const r = starterReceipt(); r.artifacts[1].role = r.artifacts[0].role; return r })() }],
     ['unknown starter field', { starter: { ...starterReceipt(), fabricated: true } }],
+    ['install manager differs from observed service manager', { install: launchdInstall }],
+    ['install definition hash differs from observed service definition', { install: mismatchedDefinitionInstall }],
   ]
   for (const [name, overrides] of cases) {
     await t.test(name, async () => {
@@ -1501,7 +1508,7 @@ test('export writes a clean self-contained attachable bundle', async () => {
   assert.equal(exportedManifestText.includes(outDir), false)
   assert.equal(existsSync(join(exportDir, 'daemon.json')), false)
   const copiedCheck = checkBundleManifest({ outDir: exportDir })
-  assert.equal(copiedCheck.status, 'pass')
+  assert.equal(copiedCheck.status, 'pass', JSON.stringify(copiedCheck.checks.filter((check) => check.ok === false), null, 2))
   assert.ok(copiedCheck.checks.some((c) =>
     c.check === 'export_sidecar_receipt_present' &&
     c.sidecar === 'export-receipt.json' &&
@@ -2011,6 +2018,14 @@ test('starter packaging creates safe nested parents and force repairs reused sup
     assert.equal(first.status, 'pass', JSON.stringify(first.checks.filter((check) => check.ok === false), null, 2))
     assert.equal(statSync(join(outDir, 'manifest', 'starter.example.json')).mode & 0o777, 0o600)
     assert.equal(statSync(join(outDir, 'evidence', 'install.json')).mode & 0o777, 0o600)
+    const sourceCheck = checkBundleManifest({ outDir })
+    assert.equal(sourceCheck.status, 'pass', JSON.stringify(sourceCheck.checks.filter((check) => check.ok === false), null, 2))
+
+    const exportDir = tmpDir()
+    const exported = exportBundle({ outDir, exportDir })
+    assert.equal(exported.status, 'pass', JSON.stringify(exported.checks.filter((check) => check.ok === false), null, 2))
+    const exportCheck = checkBundleManifest({ outDir: exportDir })
+    assert.equal(exportCheck.status, 'pass', JSON.stringify(exportCheck.checks.filter((check) => check.ok === false), null, 2))
 
     chmodSync(join(outDir, 'evidence', 'install.json'), 0o644)
     const repaired = await buildBundle({ outDir, agents: ['agent-one'], verifyOnly: true, force: true, ...sources })
@@ -2168,6 +2183,22 @@ test('recursive artifact and sidecar schemas reject unknown nested fields', asyn
     check = checkBundleManifest({ outDir: exportDir })
     assert.equal(check.status, 'fail')
     assert.ok(check.checks.some((entry) => entry.check === 'export_sidecar_schema_exact' && entry.sidecar === 'manifest-check.json' && entry.ok === false))
+
+    assert.equal(exportBundle({ outDir, exportDir, force: true }).status, 'pass')
+    const substitutedManifestCheck = JSON.parse(readFileSync(checkPath, 'utf8'))
+    substitutedManifestCheck.checks[0] = { ...substitutedManifestCheck.checks[1] }
+    writeJson(checkPath, substitutedManifestCheck)
+    check = checkBundleManifest({ outDir: exportDir })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) => entry.check === 'export_sidecar_semantics_complete' && entry.sidecar === 'manifest-check.json' && entry.ok === false))
+
+    assert.equal(exportBundle({ outDir, exportDir, force: true }).status, 'pass')
+    const incompleteExport = JSON.parse(readFileSync(exportPath, 'utf8'))
+    incompleteExport.artifacts.copied.pop()
+    writeJson(exportPath, incompleteExport)
+    check = checkBundleManifest({ outDir: exportDir })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) => entry.check === 'export_sidecar_semantics_complete' && entry.sidecar === 'export-receipt.json' && entry.ok === false))
   })
 })
 
@@ -2254,6 +2285,55 @@ test('portable checker rejects source and projection chain tampering', async (t)
     const check = checkBundleManifest({ outDir: exportDir })
     assert.equal(check.status, 'fail')
     assert.ok(check.checks.some((entry) => entry.check === 'projection_derived_from_retained_source' && entry.artifact === 'service' && entry.ok === false))
+  })
+
+  await t.test('coordinated definition replacement remains anchored to original source receipts', async () => {
+    const exportDir = await exportedStarterBundle()
+    const manifestPath = join(exportDir, 'manifest.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    const mapping = manifest.provenance.projections.find((entry) => entry.role === 'service_definition_heartbeat')
+    const sourcePath = join(exportDir, mapping.source_path)
+    const changedDefinition = '[Service]\nExecStart=changed-heartbeat\n'
+    writeFileSync(sourcePath, changedDefinition)
+
+    const sourceSha = sha256(sourcePath)
+    const content = { encoding: 'base64', data: Buffer.from(changedDefinition).toString('base64') }
+    const projectionSha = digest(`${JSON.stringify(content, null, 2)}\n`)
+    const wrapper = {
+      receipt_type: 'mupot-fleet-portable-projection/v1',
+      role: mapping.role,
+      source_receipt_type: mapping.source_receipt_type,
+      source_path: mapping.source_path,
+      source_sha256: sourceSha,
+      projection_sha256: projectionSha,
+      content,
+    }
+    const wrapperPath = join(exportDir, mapping.path)
+    writeJson(wrapperPath, wrapper)
+    mapping.source_sha256 = sourceSha
+    mapping.projection_sha256 = projectionSha
+    mapping.artifact_sha256 = sha256(wrapperPath)
+    writeJson(manifestPath, manifest)
+
+    const check = checkBundleManifest({ outDir: exportDir })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) => entry.check === 'provenance_source_digest_graph_valid' && entry.ok === false))
+  })
+
+  await t.test('malformed retained outer manifest fails closed without throwing', async () => {
+    const exportDir = await exportedStarterBundle()
+    const manifestPath = join(exportDir, 'manifest.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    const sourcePath = join(exportDir, manifest.provenance.source_path)
+    writeJson(sourcePath, {})
+    manifest.provenance.source_sha256 = sha256(sourcePath)
+    writeJson(manifestPath, manifest)
+
+    let check
+    assert.doesNotThrow(() => { check = checkBundleManifest({ outDir: exportDir }) })
+    assert.equal(check.status, 'fail')
+    assert.ok(check.checks.some((entry) => entry.check === 'provenance_source_manifest_schema_exact' && entry.ok === false))
+    assert.ok(check.checks.some((entry) => entry.check === 'provenance_source_digest_graph_valid' && entry.ok === false))
   })
 
   await t.test('symlinked retained preimage is rejected', async () => {

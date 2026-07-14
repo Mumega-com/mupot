@@ -329,3 +329,55 @@ cryptographic source-byte digests and projected evidence, but does not embed a
 second copy of every admitted source file; independent verification therefore
 establishes the typed digest/projection chain rather than reconstructing the
 discarded source checkout byte-for-byte.
+
+---
+
+## Task 7 Final Source-Graph And Sidecar Remediation
+
+### Result
+
+Portable starter verification now anchors every retained preimage to the
+original outer manifest's digest graph. Service definitions must agree with
+the retained service, install, and Host-Go receipts; install manager and
+definition hashes must also agree with observed service evidence. Malformed
+outer preimages fail closed without throwing, and provenance reads use one
+no-follow file descriptor from type check through byte read.
+
+Starter directory verification supports contained nested evidence paths and
+checks the exact recursive tree. Canonical export sidecars are independent of
+the sidecar files themselves, and both legacy and starter exports require
+semantic evidence completeness rather than accepting any schema-valid passing
+receipt.
+
+### Verification
+
+- `node --test fleet-runtime/starter-contract.test.mjs fleet-runtime/host-receipt.test.mjs fleet-runtime/receipt-bundle.test.mjs`
+  - 157 passed, 0 failed.
+- `node --test fleet-runtime/*.test.mjs`
+  - 436 passed, 0 failed.
+- `npm test`
+  - Passed with exit code 0; only the repository's existing experimental
+    SQLite warnings were emitted.
+- `npm run typecheck`
+  - Passed with no TypeScript errors.
+- `git diff --check`
+  - Passed with no whitespace errors.
+
+### Adversarial Coverage
+
+- Coordinated replacement of a retained service definition and its projection
+  still fails the original source digest graph.
+- A hash-matched malformed retained outer manifest fails closed without an
+  exception.
+- Passing install evidence with a different manager or definition digest is
+  rejected.
+- Nested source evidence passes source check, export, and exported-bundle
+  verification end to end.
+- Schema-valid sidecars with substituted checks or omitted copied evidence are
+  rejected by semantic completeness checks.
+
+### Concerns
+
+No blocking concern. SHA-256 establishes deterministic bundle integrity, not
+publisher authenticity; signed provenance remains intentionally outside this
+task.

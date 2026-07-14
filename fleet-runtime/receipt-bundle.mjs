@@ -12,6 +12,7 @@ import {
   constants as fsConstants,
   existsSync,
   fchmodSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -830,7 +831,8 @@ function normalizeStarterEvidence({ serviceReceipt, continuousReceipt, starterRe
     admittedDigests.set(artifact.role, projectionSchemaExact(raw) ? raw.source_sha256 : artifact.sha256)
     roleReceipts[artifact.role] = receipt
   }
-  if (!normalizePassingInstallReceipt(roleReceipts.install) ||
+  const install = normalizePassingInstallReceipt(roleReceipts.install)
+  if (!install || install.manager !== service.manager || SERVICE_KEYS.some((key) => install.definitions.get(key)?.sha256 !== service.definitions[key]) ||
     roleReceipts.service?.receipt_type !== EXPECTED.service || JSON.stringify(roleReceipts.service) !== JSON.stringify(serviceReceipt) ||
     roleReceipts.host?.receipt_type !== EXPECTED.host || JSON.stringify(roleReceipts.host) !== JSON.stringify(hostReceipt) ||
     roleReceipts.continuous?.receipt_type !== EXPECTED.continuous || JSON.stringify(roleReceipts.continuous) !== JSON.stringify(continuousReceipt)) return null
@@ -894,10 +896,17 @@ function ensureContainedParent(root, destination) {
 
 function readRegularBytes(path, root = '') {
   if (!regularFileStat(path) || (root && !pathContainedBy(path, root))) return null
+  let fd = null
   try {
-    return readFileSync(path)
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+    if (!fstatSync(fd).isFile()) return null
+    return readFileSync(fd)
   } catch {
     return null
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd) } catch {}
+    }
   }
 }
 
@@ -1108,6 +1117,10 @@ function manifestStarterMode(manifest) {
 
 function resolveArtifactPath(manifestDir, declaredPath, { allowExternal = false } = {}) {
   if (typeof declaredPath !== 'string' || declaredPath.length === 0) return ''
+  if (!isAbsolute(declaredPath) && isPortableStarterPath(declaredPath)) {
+    const nested = resolve(manifestDir, declaredPath)
+    if (regularFileStat(nested) && pathContainedBy(nested, manifestDir)) return nested
+  }
   const local = join(manifestDir, basename(declaredPath))
   if (regularFileStat(local) && pathContainedBy(local, manifestDir)) return local
   if (declaredPath.startsWith('~/') || isAbsolute(declaredPath)) {
@@ -1594,25 +1607,39 @@ function addBundleDirectoryScopeChecks(checks, manifestPath, manifestDir, entrie
   const allowed = new Set(['manifest.json'])
   const manifest = readReceipt(manifestPath, manifestDir)
   if (manifest?.provenance) allowed.add('provenance')
+  const rootName = (path) => {
+    if (manifestStarterMode(manifest) && typeof path === 'string') {
+      const resolved = isAbsolute(path) && regularFileStat(path) && pathContainedBy(path, manifestDir)
+        ? path
+        : resolveArtifactPath(manifestDir, path)
+      if (resolved) return relative(realpathSync(manifestDir), realpathSync(resolved)).split(sep)[0]
+    }
+    return basename(path ?? '')
+  }
   for (const entry of entries) {
-    if (typeof entry.path === 'string' && entry.path.length > 0) allowed.add(basename(entry.path))
+    if (typeof entry.path === 'string' && entry.path.length > 0) allowed.add(rootName(entry.path))
   }
   for (const sidecar of EXPORT_SIDECAR_RECEIPTS) allowed.add(sidecar.file)
   for (const support of supportingEvidenceEntries(manifestDir, { artifacts: Object.fromEntries(entries.filter((entry) => ['service', 'starter'].includes(entry.label)).map((entry) => [entry.label, entry])) })) {
-    allowed.add(basename(support.path))
+    allowed.add(rootName(support.path))
   }
+  for (const path of starterReferencedEvidencePaths(manifestDir, manifest)) allowed.add(rootName(path))
 
   let names = []
   try {
     names = readdirSync(manifestDir).sort()
+    const scopedNames = manifestStarterMode(manifest) || isPortableExportManifest(manifest)
+      ? names.filter((name) => !EXPORT_SIDECAR_RECEIPTS.some((sidecar) => sidecar.file === name))
+      : names
     checks.push({
       ok: true,
       component: 'receipt-bundle-check',
       check: 'bundle_directory_read',
       path: manifestPath,
       directory: manifestDir,
-      count: names.length,
+      count: scopedNames.length,
     })
+    names = scopedNames
   } catch (err) {
     checks.push({
       ok: false,
@@ -1635,6 +1662,50 @@ function addBundleDirectoryScopeChecks(checks, manifestPath, manifestDir, entrie
     allowed: [...allowed].sort(),
     unexpected,
   })
+
+  if (manifestStarterMode(manifest)) {
+    const expected = new Set(['manifest.json'])
+    const addPath = (path) => {
+      if (!path || !pathContainedBy(path, manifestDir)) return
+      const rel = relative(realpathSync(manifestDir), realpathSync(path))
+      if (!rel || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return
+      const parts = rel.split(sep)
+      for (let index = 1; index <= parts.length; index += 1) expected.add(parts.slice(0, index).join('/'))
+    }
+    for (const entry of entries) addPath(resolveArtifactPath(manifestDir, entry.path))
+    for (const support of supportingEvidenceEntries(manifestDir, manifest)) addPath(support.path)
+    for (const path of starterReferencedEvidencePaths(manifestDir, manifest)) addPath(path)
+    if (manifest.provenance) {
+      addPath(join(manifestDir, manifest.provenance.source_path))
+      for (const mapping of manifest.provenance.projections) addPath(join(manifestDir, mapping.source_path))
+    }
+    const actual = new Set()
+    const walk = (dir, prefix = '') => {
+      for (const name of readdirSync(dir)) {
+        const path = join(dir, name)
+        const rel = prefix ? `${prefix}/${name}` : name
+        if (!prefix && EXPORT_SIDECAR_RECEIPTS.some((sidecar) => sidecar.file === name)) continue
+        const stat = lstatSync(path)
+        actual.add(rel)
+        if (!stat.isSymbolicLink() && stat.isDirectory()) walk(path, rel)
+      }
+    }
+    try { walk(manifestDir) } catch {}
+    const missing = [...expected].filter((path) => !actual.has(path)).sort()
+    const extra = [...actual].filter((path) => !expected.has(path)).sort()
+    checks.push({ ok: missing.length === 0 && extra.length === 0, component: 'receipt-bundle-check', check: 'starter_directory_tree_exact', path: manifestDir, expected: [...expected].sort(), actual: [...actual].sort(), unexpected: extra, missing })
+  }
+}
+
+function starterReferencedEvidencePaths(bundleDir, manifest) {
+  const starterEntry = bundleArtifactEntries(manifest).find((entry) => entry.label === 'starter')
+  const starterPath = starterEntry ? resolveArtifactPath(bundleDir, starterEntry.path) : ''
+  const starter = starterPath ? normalizeStarterReceipt(projectionContent(readReceipt(starterPath, bundleDir))) : null
+  if (!starter) return []
+  const references = [starter.manifest.path, ...starter.artifacts.map((artifact) => artifact.path)]
+  return references
+    .map((reference) => resolveArtifactPath(dirname(starterPath), reference))
+    .filter((path) => path && pathContainedBy(path, bundleDir))
 }
 
 function supportingEvidenceEntries(bundleDir, manifest) {
@@ -1661,6 +1732,38 @@ function projectionLabelForRole(role, path, sourceManifest) {
   return entry?.label ?? role
 }
 
+function retainedSourceGraphValid(sourceManifest, items) {
+  if (!manifestStarterMode(sourceManifest) || !manifestSchemaExact(sourceManifest)) return false
+  const byLabel = new Map(items.map((item) => [item.label, item]))
+  const byRole = new Map(items.map((item) => [item.role, item]))
+  for (const entry of bundleArtifactEntries(sourceManifest)) {
+    const item = byLabel.get(entry.label)
+    if (!item || sha256Bytes(item.sourceBytes) !== entry.sha256) return false
+  }
+
+  const starter = normalizeStarterReceipt(parseJsonBytes(byRole.get('starter')?.sourceBytes ?? Buffer.alloc(0)))
+  if (!starter || starter.manifest.sha256 !== sha256Bytes(byRole.get('starter_manifest')?.sourceBytes ?? Buffer.alloc(0))) return false
+  for (const artifact of starter.artifacts) {
+    const item = byRole.get(artifact.role)
+    if (!item || artifact.sha256 !== sha256Bytes(item.sourceBytes)) return false
+  }
+
+  const definitionDigests = Object.fromEntries(SERVICE_KEYS.map((key) => [key, sha256Bytes(byRole.get(`service_definition_${key}`)?.sourceBytes ?? Buffer.alloc(0))]))
+  const service = parseJsonBytes(byRole.get('service')?.sourceBytes ?? Buffer.alloc(0))
+  if (!service || !Array.isArray(service.definitions) || SERVICE_KEYS.some((key) => service.definitions.filter((definition) => definition?.service === key).length !== 1 ||
+    service.definitions.find((definition) => definition.service === key).sha256 !== definitionDigests[key])) return false
+  const install = parseJsonBytes(byRole.get('install')?.sourceBytes ?? Buffer.alloc(0))
+  if (!install || !Array.isArray(install.outputs?.service_definitions) || SERVICE_KEYS.some((key) => install.outputs.service_definitions.filter((definition) => definition?.service === key).length !== 1 ||
+    install.outputs.service_definitions.find((definition) => definition.service === key).sha256 !== definitionDigests[key])) return false
+  const host = parseJsonBytes(byRole.get('host')?.sourceBytes ?? Buffer.alloc(0))
+  const hostDefinitions = host?.checks?.find((check) => check?.component === 'host-services' && check?.check === 'service_definitions_current')?.definitions
+  return Array.isArray(hostDefinitions) && SERVICE_KEYS.every((key) => {
+    const matches = hostDefinitions.filter((definition) => definition?.service === key)
+    return matches.length === 1 && matches[0].expected_sha256 === definitionDigests[key] &&
+      matches[0].rendered_sha256 === definitionDigests[key] && matches[0].actual_sha256 === definitionDigests[key]
+  })
+}
+
 function addPortableProvenanceChecks(checks, manifestPath, manifestDir, manifest) {
   if (!manifest?.provenance) return
   const provenanceDir = join(manifestDir, 'provenance')
@@ -1680,6 +1783,8 @@ function addPortableProvenanceChecks(checks, manifestPath, manifestDir, manifest
   checks.push({ ok: outerFindings.length === 0, component: 'receipt-bundle-check', check: 'provenance_source_no_secret_material', artifact: 'outer_manifest', path: outerPath || null, findings: secretFindingSummary(outerFindings), finding_count: outerFindings.length })
 
   const sourceManifest = outerBytes ? parseJsonBytes(outerBytes) : null
+  const sourceManifestValid = Boolean(sourceManifest && manifestStarterMode(sourceManifest) && manifestSchemaExact(sourceManifest))
+  checks.push({ ok: sourceManifestValid, component: 'receipt-bundle-check', check: 'provenance_source_manifest_schema_exact', artifact: 'outer_manifest', path: outerPath || null })
   const items = []
   for (const mapping of mappings) {
     const sourcePath = provenanceSourcePath(manifestDir, mapping?.source_path, mapping?.role)
@@ -1705,7 +1810,10 @@ function addPortableProvenanceChecks(checks, manifestPath, manifestDir, manifest
     }
   }
 
-  const records = buildPortableProjectionRecords(items)
+  const sourceGraphValid = sourceManifestValid && retainedSourceGraphValid(sourceManifest, items)
+  checks.push({ ok: sourceGraphValid, component: 'receipt-bundle-check', check: 'provenance_source_digest_graph_valid', path: manifestPath })
+  let records = new Map()
+  try { records = sourceGraphValid ? buildPortableProjectionRecords(items) : new Map() } catch {}
   checks.push({ ok: records.size === mappings.length, component: 'receipt-bundle-check', check: 'provenance_projection_set_complete', path: manifestPath, count: records.size, expected: mappings.length })
   for (const item of items) {
     const record = records.get(item.role)
@@ -1716,7 +1824,7 @@ function addPortableProvenanceChecks(checks, manifestPath, manifestDir, manifest
     checks.push({ ok: Boolean(record && expectedBytes && sha256Bytes(expectedBytes) === item.mapping.artifact_sha256 && fileSha256(item.path, manifestDir) === item.mapping.artifact_sha256), component: 'receipt-bundle-check', check: 'projection_artifact_sha256_match', artifact: item.role, path: item.path, expected: record?.artifactSha256 ?? null, actual: item.mapping.artifact_sha256 })
   }
 
-  if (sourceManifest && records.size === mappings.length) {
+  if (sourceGraphValid && records.size === mappings.length) {
     const expectedManifest = portableOuterManifest(sourceManifest, items, records, manifest.provenance.source_path, manifest.provenance.source_sha256)
     checks.push({ ok: JSON.stringify(expectedManifest) === JSON.stringify(manifest), component: 'receipt-bundle-check', check: 'portable_manifest_derived_from_retained_source', path: manifestPath })
   } else {
@@ -1744,7 +1852,7 @@ function addPortableProvenanceChecks(checks, manifestPath, manifestDir, manifest
 const SIDECAR_CHECK_RECORD_KEYS = new Set([
   'ok', 'component', 'check', 'path', 'reason', 'source', 'sha256', 'artifact', 'declared_path', 'file_name',
   'export_dir', 'status', 'sidecar', 'export_receipt', 'manifest_check', 'source_dir', 'actual', 'expected', 'count',
-  'directory', 'allowed', 'unexpected', 'findings', 'finding_count', 'agents', 'declared_mode', 'starter_artifacts',
+  'directory', 'allowed', 'unexpected', 'missing', 'findings', 'finding_count', 'agents', 'declared_mode', 'starter_artifacts',
   'artifact_paths', 'mode', 'checked_path', 'expected_path', 'accepted', 'required_component', 'required_check',
   'base_url', 'base_urls', 'tenant', 'artifacts', 'tenants', 'selected_agents', 'agent_id', 'expected_file', 'ready', 'source_path',
 ])
@@ -1807,10 +1915,57 @@ function exportSidecarSchemaExact(receipt, file) {
     Array.isArray(receipt.next_steps) && receipt.next_steps.every((step) => typeof step === 'string')
 }
 
+function manifestCheckSidecarSemanticsExact(receipt, expected) {
+  if (!receipt || !expected) return false
+  const actualComparable = { ...portableKnownPathProjection(receipt), generated_at: null }
+  const expectedComparable = { ...portableKnownPathProjection(expected), generated_at: null }
+  return JSON.stringify(actualComparable) === JSON.stringify(expectedComparable)
+}
+
+function exportReceiptSidecarSemanticsExact(receipt, manifestDir, manifest, expectedManifestCheck) {
+  if (!receipt || receipt.status !== 'pass' || !Array.isArray(receipt.artifacts?.copied) || !Array.isArray(receipt.checks)) return false
+  const portableExpectedManifestCheck = portableKnownPathProjection(expectedManifestCheck)
+  const expectedLabels = new Set(['manifest', ...bundleArtifactEntries(manifest).map((entry) => entry.label), ...supportingEvidenceEntries(manifestDir, manifest).map((entry) => entry.label)])
+  const copiedLabels = receipt.artifacts.copied.map((entry) => entry.label)
+  if (copiedLabels.length !== expectedLabels.size || new Set(copiedLabels).size !== copiedLabels.length || copiedLabels.some((label) => !expectedLabels.has(label))) return false
+  for (const entry of receipt.artifacts.copied) {
+    const path = join(manifestDir, basename(entry.path ?? ''))
+    if (!regularFileStat(path) || !pathContainedBy(path, manifestDir) || fileSha256(path, manifestDir) !== entry.sha256) return false
+    if (entry.label === 'manifest' && basename(path) !== 'manifest.json') return false
+    if (entry.role) {
+      const mapping = manifest.provenance?.projections?.find((candidate) => candidate.role === entry.role)
+      if (!mapping || mapping.path !== basename(path) || mapping.source_path !== entry.source_path || mapping.source_sha256 !== entry.source_sha256 ||
+        mapping.projection_sha256 !== entry.projection_sha256 || mapping.source_receipt_type !== entry.source_receipt_type || mapping.artifact_sha256 !== entry.sha256) return false
+    }
+  }
+  const expectedSidecars = new Map(EXPORT_SIDECAR_RECEIPTS.map((entry) => [entry.file === EXPORT_RECEIPT_FILE ? 'export_receipt' : 'manifest_check', entry]))
+  if (receipt.artifacts.sidecars.length !== expectedSidecars.size || receipt.artifacts.sidecars.some((entry) => {
+    const expected = expectedSidecars.get(entry.label)
+    return !expected || basename(entry.path) !== expected.file || entry.receipt_type !== expected.receipt_type
+  })) return false
+  if (receipt.manifest_check?.status !== portableExpectedManifestCheck?.status || !sameSummary(receipt.manifest_check?.summary, portableExpectedManifestCheck?.summary) ||
+    JSON.stringify(receipt.manifest_check?.manifest) !== JSON.stringify(portableExpectedManifestCheck?.manifest)) return false
+  const requiredCounts = new Map([
+    ['source_manifest_selected', 1],
+    ['export_dir_selected', 1],
+    ['export_dir_separate_from_source', 1],
+    ['source_manifest_read', 1],
+    ...(manifestStarterMode(manifest) ? [['source_manifest_check_pass', 1]] : []),
+    ['out_dir_ready', 1],
+    ['manifest_copied', 1],
+    ['export_manifest_check_pass', 1],
+    ['sidecar_receipt_written', 2],
+    ['export_manifest_check_with_sidecars_pass', 1],
+    ['sidecar_receipts_finalized', 1],
+  ])
+  return [...requiredCounts].every(([name, count]) => receipt.checks.filter((check) => check.check === name && check.ok === true).length === count)
+}
+
 function addExportSidecarChecks(checks, manifestPath, manifestDir, manifest, opts = {}) {
   if (opts.skipExportSidecars) return
   const requireSidecars = isPortableExportManifest(manifest) && !opts.allowMissingSidecars
   const manifestHash = fileSha256(manifestPath)
+  const expectedManifestCheck = requireSidecars ? checkBundleManifest({ outDir: manifestDir, skipExportSidecars: true }) : null
 
   for (const sidecar of EXPORT_SIDECAR_RECEIPTS) {
     const path = join(manifestDir, sidecar.file)
@@ -1915,6 +2070,14 @@ function addExportSidecarChecks(checks, manifestPath, manifestDir, manifest, opt
         expected: manifestHash,
         actual: receipt?.manifest?.sha256 ?? null,
       })
+      checks.push({
+        ok: manifestCheckSidecarSemanticsExact(receipt, expectedManifestCheck),
+        component: 'receipt-bundle-check',
+        check: 'export_sidecar_semantics_complete',
+        path: manifestPath,
+        sidecar: sidecar.file,
+        checked_path: path,
+      })
     }
     if (sidecar.file === EXPORT_RECEIPT_FILE) {
       checks.push({
@@ -1926,6 +2089,16 @@ function addExportSidecarChecks(checks, manifestPath, manifestDir, manifest, opt
         checked_path: path,
         actual: receipt?.manifest_check?.status ?? null,
       })
+      if (!opts.allowIncompleteExportReceipt) {
+        checks.push({
+          ok: exportReceiptSidecarSemanticsExact(receipt, manifestDir, manifest, expectedManifestCheck),
+          component: 'receipt-bundle-check',
+          check: 'export_sidecar_semantics_complete',
+          path: manifestPath,
+          sidecar: sidecar.file,
+          checked_path: path,
+        })
+      }
     }
   }
 }
@@ -2117,7 +2290,9 @@ function checkBundleManifest(opts = {}) {
 
     for (const entry of entries) {
       const expectedLocalPath = typeof entry.path === 'string' && entry.path.length > 0
-        ? join(manifestDir, basename(entry.path))
+        ? (manifestStarterMode(manifest) && !isAbsolute(entry.path) && isPortableStarterPath(entry.path)
+            ? resolve(manifestDir, entry.path)
+            : join(manifestDir, basename(entry.path)))
         : ''
       const checkedPath = resolveArtifactPath(manifestDir, entry.path, { allowExternal: !manifestStarterMode(manifest) })
       const artifactRegular = Boolean(checkedPath && regularFileStat(checkedPath) && pathContainedBy(checkedPath, manifestDir))
@@ -2862,6 +3037,7 @@ function exportBundle(opts = {}) {
   }
 
   let manifestCheck = exportDirReady ? checkBundleManifest({ outDir: exportDir, allowMissingSidecars: true, skipExportSidecars: true }) : null
+  const canonicalManifestCheck = manifestCheck
   checks.push({
     ok: manifestCheck?.status === 'pass',
     component: 'receipt-bundle-export',
@@ -2877,7 +3053,7 @@ function exportBundle(opts = {}) {
     const sidecarOpts = { ...opts, sourceDir, exportDir }
     writeExportSidecar(manifestCheckPath, manifestCheck, sidecarOpts, checks, 'manifest_check')
     writeExportSidecar(exportReceiptPath, baseReceipt, sidecarOpts, checks, 'export_receipt')
-    manifestCheck = checkBundleManifest({ outDir: exportDir })
+    manifestCheck = checkBundleManifest({ outDir: exportDir, allowIncompleteExportReceipt: true })
     checks.push({
       ok: manifestCheck?.status === 'pass',
       component: 'receipt-bundle-export',
@@ -2887,11 +3063,11 @@ function exportBundle(opts = {}) {
     })
   }
 
-  let receipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck })
+  let receipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck: canonicalManifestCheck })
   if (exportDirReady && manifestCheck) {
     const sidecarOpts = { ...opts, sourceDir, exportDir }
     try {
-      overwriteExportSidecar(manifestCheckPath, manifestCheck, sidecarOpts)
+      overwriteExportSidecar(manifestCheckPath, canonicalManifestCheck, sidecarOpts)
       overwriteExportSidecar(exportReceiptPath, receipt, sidecarOpts)
       checks.push({
         ok: true,
@@ -2910,7 +3086,7 @@ function exportBundle(opts = {}) {
         reason: String(err && err.message ? err.message : err),
       })
     }
-    receipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck })
+    receipt = makeExportReceipt({ checks, manifestPath, opts, exportDir, copied, manifestCheck: canonicalManifestCheck })
     try {
       overwriteExportSidecar(exportReceiptPath, receipt, sidecarOpts)
     } catch {
