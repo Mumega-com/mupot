@@ -795,9 +795,57 @@ function priorBundleManifestPasses(prior, starter, agentId, admittedDigests = nu
     ['cutover_gate_status_pass', (check) => hasExactKeys(check, ['ok', 'component', 'check', 'path', 'actual']) && check.actual === 'pass'],
     ['manifest_written', (check) => hasExactKeys(check, ['ok', 'component', 'check', 'path'])],
   ])
+  const exactPathCheck = (check) => hasExactKeys(check, ['ok', 'component', 'check', 'path']) && nonEmptyString(check.path)
+  const producerCheckPasses = (check) => {
+    const required = requiredChecks.get(check?.check)
+    if (required) return check.ok === true && check.component === 'receipt-bundle' && required(check)
+    if (!isPlainObject(check) || check.ok !== true || typeof check.check !== 'string') return false
+    if (check.component === 'receipt-bundle') {
+      if (check.check === 'out_dir_ready' || check.check === 'install_receipt_read' || check.check === 'install_receipt_reused' ||
+        check.check === 'probe_receipt_read' || check.check === 'probe_receipt_reused' || check.check === 'cutover_receipt_written') return exactPathCheck(check)
+      if (check.check === 'install_receipt_type' || check.check === 'probe_receipt_type') {
+        return hasExactKeys(check, ['ok', 'component', 'check', 'path', 'expected', 'actual']) && nonEmptyString(check.path) && check.expected === check.actual &&
+          [EXPECTED.install, EXPECTED.probe].includes(check.actual)
+      }
+      if (check.check === 'probe_receipt_status_pass') {
+        return hasExactKeys(check, ['ok', 'component', 'check', 'path', 'actual']) && nonEmptyString(check.path) && check.actual === 'pass'
+      }
+      if (['host_receipt_reused', 'runtime_receipts_reused', 'control_receipts_reused'].includes(check.check)) {
+        return hasExactKeys(check, ['ok', 'component', 'check'])
+      }
+      if (check.check === 'host_receipt_required_check_pass') {
+        return hasExactKeys(check, ['ok', 'component', 'check', 'required_component', 'required_check', 'path']) &&
+          check.required_component === 'fleet-control-daemon' && check.required_check === 'panel_public_key_public_only' && nonEmptyString(check.path)
+      }
+      return false
+    }
+    if (check.component !== 'receipt-bundle-check' || !nonEmptyString(check.path)) return false
+    if (check.check === 'artifact_target_base_url_recorded') {
+      return hasExactKeys(check, ['ok', 'component', 'check', 'path', 'artifact', 'base_url']) && nonEmptyString(check.artifact) && nonEmptyString(check.base_url)
+    }
+    if (check.check === 'artifact_target_tenant_recorded') {
+      return hasExactKeys(check, ['ok', 'component', 'check', 'path', 'artifact', 'tenant']) && nonEmptyString(check.artifact) && nonEmptyString(check.tenant)
+    }
+    if (check.check === 'artifact_target_base_urls_match') {
+      return hasExactKeys(check, ['ok', 'component', 'check', 'path', 'base_urls', 'artifacts']) && exactStringArray(check.base_urls, { nonEmpty: true, unique: true }) &&
+        check.base_urls.length === 1 && exactStringArray(check.artifacts, { nonEmpty: true, unique: true })
+    }
+    if (check.check === 'artifact_target_tenants_match') {
+      return hasExactKeys(check, ['ok', 'component', 'check', 'path', 'tenants', 'artifacts']) && exactStringArray(check.tenants, { nonEmpty: true, unique: true }) &&
+        check.tenants.length === 1 && exactStringArray(check.artifacts, { nonEmpty: true, unique: true })
+    }
+    if (check.check === 'artifact_target_agents_selected') {
+      return hasExactKeys(check, ['ok', 'component', 'check', 'path', 'artifact', 'agents', 'selected_agents']) && nonEmptyString(check.artifact) &&
+        exactStringArray(check.agents, { nonEmpty: true, unique: true }) && exactStringArray(check.selected_agents, { nonEmpty: true, unique: true }) &&
+        check.agents.includes(agentId) && check.selected_agents.includes(agentId)
+    }
+    if (check.check === 'probe_artifact_for_agent') {
+      return hasExactKeys(check, ['ok', 'component', 'check', 'path', 'agent_id']) && check.agent_id === agentId
+    }
+    return false
+  }
   for (const check of prior.checks) {
-    const validate = requiredChecks.get(check?.check)
-    if (!validate || check.ok !== true || check.component !== 'receipt-bundle' || !validate(check)) return false
+    if (!producerCheckPasses(check)) return false
   }
   return [...requiredChecks.keys()].every((name) => prior.checks.some((check) => check.check === name)) &&
     prior.checks.filter((check) => check.check === 'control_candidate_selected').length >= 2

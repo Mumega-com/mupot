@@ -912,6 +912,99 @@ test('starter verifier shares the starter-ready deep evidence contract and CLI m
   assert.equal(JSON.parse(cli.stdout).status, 'pass')
 })
 
+test('starter verifier accepts a real producer prior manifest and feeds the final consumer', async () => {
+  const outDir = tmpDir()
+  const sources = starterPaths()
+  seedStarterEvidence(outDir, sources)
+  const prior = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    installReceiptPath: join(outDir, 'install.json'),
+    probeReceiptPaths: [join(outDir, 'probe-start.json')],
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    requiredControlVerbs: ['start', 'stop'],
+    verifyOnly: true,
+  })
+  assert.equal(prior.status, 'pass')
+  copyFileSync(join(outDir, 'manifest.json'), join(outDir, 'prior-bundle-manifest.json'))
+  copyFileSync(join(sources.sourceDir, 'starter.example.json'), join(outDir, 'starter.example.json'))
+  writeJson(join(outDir, 'service.json'), sources.evidence.service)
+  writeJson(join(outDir, 'continuous.json'), sources.evidence.continuous)
+  for (const definition of sources.evidence.service.definitions) {
+    copyFileSync(definition.path, join(outDir, basename(definition.path)))
+  }
+
+  const artifacts = {
+    install: 'install.json',
+    service: 'service.json',
+    host: 'host.json',
+    continuous: 'continuous.json',
+    runtime_inbox: 'runtime-agent-one.json',
+    lifecycle_control_start: 'control-start.json',
+    lifecycle_control_stop: 'control-stop.json',
+    receipt_bundle_manifest: 'prior-bundle-manifest.json',
+  }
+  const forged = structuredClone(prior)
+  forged.checks.push({ ok: true, component: 'receipt-bundle', check: 'fabricated_ready' })
+  forged.summary.passed += 1
+  writeJson(join(outDir, 'prior-bundle-manifest.json'), forged)
+  assert.throws(() => verifyStarterBundle({ bundleDir: outDir, artifacts }), /contracts|cross-bindings/i)
+  writeJson(join(outDir, 'prior-bundle-manifest.json'), prior)
+
+  const receipt = verifyStarterBundle({ bundleDir: outDir, artifacts })
+  const starterReceiptPath = writeJson(join(outDir, 'starter-receipt.json'), receipt)
+  const final = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    serviceReceiptPath: join(outDir, 'service.json'),
+    continuousReceiptPath: join(outDir, 'continuous.json'),
+    starterReceiptPath,
+    daemonPath: '/tmp/daemon.json',
+    inboxPath: '/tmp/inbox.json',
+    controlPath: '/tmp/control.json',
+    requiredControlVerbs: ['start', 'stop'],
+    verifyOnly: true,
+    force: true,
+  })
+  assert.equal(final.status, 'pass', JSON.stringify(final.checks.filter((check) => check.ok === false), null, 2))
+})
+
+test('start and stop bundle stages each pass with controlled producer receipts', async () => {
+  const outDir = tmpDir()
+  const sources = starterPaths()
+  writeJson(join(outDir, 'install.json'), sources.evidence.install)
+  writeJson(join(outDir, 'host.json'), sources.evidence.host)
+  writeJson(join(outDir, 'probe-start.json'), probeReceipt())
+  writeJson(join(outDir, 'probe-stop.json'), probeReceipt())
+
+  const start = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    installReceiptPath: join(outDir, 'install.json'),
+    probeReceiptPaths: [join(outDir, 'probe-start.json')],
+    skipHost: true,
+    controlLabel: 'start',
+    requiredControlVerbs: ['start'],
+    runtimeBuilder: async () => sources.evidence.runtime,
+    controlBuilder: async () => sources.evidence.controlStart,
+  })
+  assert.equal(start.status, 'pass', JSON.stringify(start.checks.filter((check) => check.ok === false), null, 2))
+
+  const stop = await buildBundle({
+    outDir,
+    agents: ['agent-one'],
+    probeReceiptPaths: [join(outDir, 'probe-stop.json')],
+    skipHost: true,
+    skipRuntime: true,
+    controlLabel: 'stop',
+    requiredControlVerbs: ['start', 'stop'],
+    controlBuilder: async () => sources.evidence.controlStop,
+  })
+  assert.equal(stop.status, 'pass', JSON.stringify(stop.checks.filter((check) => check.ok === false), null, 2))
+})
+
 test('portable export preserves activated install evidence after source deletion', async () => {
   const outDir = tmpDir()
   const service = serviceReceipt()

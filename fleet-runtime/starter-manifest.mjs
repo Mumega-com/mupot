@@ -128,6 +128,22 @@ function commandLine(parts, suffix = '') {
   return `${parts.map(shellQuote).join(' ')}${suffix}`
 }
 
+function activatedServiceCommand(manager) {
+  if (manager === 'systemd') return commandLine(['node', 'fleet-runtime/service-manager.mjs', 'install', '--service-manager', manager, '--enable-linger'])
+  if (manager === 'launchd') return commandLine(['node', 'fleet-runtime/service-manager.mjs', 'install', '--service-manager', manager])
+  const linux = commandLine(['node', 'fleet-runtime/service-manager.mjs', 'install', '--service-manager', 'systemd', '--enable-linger'])
+  const darwin = commandLine(['node', 'fleet-runtime/service-manager.mjs', 'install', '--service-manager', 'launchd'])
+  return `case "$(uname -s)" in Linux) ${linux} ;; Darwin) ${darwin} ;; *) echo "unsupported platform" >&2; exit 1 ;; esac`
+}
+
+function recoveryInstallCommand(manager) {
+  if (manager === 'systemd') return commandLine(['node', 'fleet-runtime/install.mjs', '--activate', '--service-manager', manager, '--enable-linger'])
+  if (manager === 'launchd') return commandLine(['node', 'fleet-runtime/install.mjs', '--activate', '--service-manager', manager])
+  const linux = commandLine(['node', 'fleet-runtime/install.mjs', '--activate', '--service-manager', 'systemd', '--enable-linger'])
+  const darwin = commandLine(['node', 'fleet-runtime/install.mjs', '--activate', '--service-manager', 'launchd'])
+  return `case "$(uname -s)" in Linux) ${linux} ;; Darwin) ${darwin} ;; *) echo "unsupported platform" >&2; exit 1 ;; esac`
+}
+
 export function renderStarterPlan(rawManifest, opts = {}) {
   const manifest = validateStarterManifest(rawManifest)
   const agents = selectedAgents(manifest, opts.agents)
@@ -156,7 +172,7 @@ export function renderStarterPlan(rawManifest, opts = {}) {
     commandLine(['node', 'fleet-runtime/install.mjs', '--service-manager', manager], ' > ~/.fleet/receipts/install.json'),
     '',
     '3. Activate user services and collect current service status:',
-    commandLine(['node', 'fleet-runtime/service-manager.mjs', 'install', '--service-manager', manager]),
+    activatedServiceCommand(manager),
     commandLine(['node', 'fleet-runtime/service-manager.mjs', 'status', '--service-manager', manager], ' > ~/.fleet/receipts/service.json'),
   ]
 
@@ -165,7 +181,9 @@ export function renderStarterPlan(rawManifest, opts = {}) {
     const agentTokenEnv = `MUPOT_AGENT_TOKEN_${envSuffix(agentId)}`
     const outDir = `~/.fleet/receipts/${agentId}`
     const exportDir = `${outDir}-attach`
-    const commonBundle = ['node', 'fleet-runtime/receipt-bundle.mjs', '--agent', agentId, '--out-dir', outDir, '--require-control-verb', 'start,stop']
+    const bundleBase = ['node', 'fleet-runtime/receipt-bundle.mjs', '--agent', agentId, '--out-dir', outDir]
+    const startBundle = [...bundleBase, '--require-control-verb', 'start']
+    const finalBundle = [...bundleBase, '--require-control-verb', 'start,stop']
     const copyDefinitions = [
       'const fs=require("node:fs"),p=require("node:path"),r=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));',
       'for(const d of r.definitions)fs.copyFileSync(d.path,p.join(process.argv[2],p.basename(d.path)))',
@@ -186,23 +204,22 @@ export function renderStarterPlan(rawManifest, opts = {}) {
       `4. Collect governed Host-Go evidence for ${agentId}:`,
       commandLine(['mkdir', '-p', outDir]),
       commandLine(['node', 'fleet-runtime/host-receipt.mjs', '--require-services', '--service-manager', manager], ` > ${shellQuote(`${outDir}/host.json`)}`),
-      commandLine([...commonBundle, '--install-receipt', '~/.fleet/receipts/install.json', '--skip-host', '--skip-runtime', '--skip-control']),
-      '# Requires MUPOT_AGENT_TOKEN and MUPOT_OWNER_TOKEN in the environment.',
+      `# Requires ${agentTokenEnv} and MUPOT_OWNER_TOKEN in the environment.`,
       commandLine(['node', 'fleet-runtime/cutover-probe.mjs', '--base-url', manifest.base_url, '--agent', agentId, '--agent-token-env', agentTokenEnv, '--queue-inbox', '--control', 'start'], ` > ${shellQuote(`${outDir}/probe-start.json`)}`),
-      commandLine([...commonBundle, '--probe-receipt', `${outDir}/probe-start.json`, '--skip-host', '--control-label', 'start']),
+      commandLine([...startBundle, '--install-receipt', '~/.fleet/receipts/install.json', '--probe-receipt', `${outDir}/probe-start.json`, '--skip-host', '--control-label', 'start']),
+      commandLine(['node', 'fleet-runtime/continuous-runtime-receipt.mjs', '--agent', agentId, '--service-manager', manager, '--require-control', 'start'], ` > ${shellQuote(`${outDir}/continuous.json`)}`),
       '# Requires MUPOT_OWNER_TOKEN in the environment.',
       commandLine(['node', 'fleet-runtime/cutover-probe.mjs', '--base-url', manifest.base_url, '--agent', agentId, '--control', 'stop'], ` > ${shellQuote(`${outDir}/probe-stop.json`)}`),
-      commandLine([...commonBundle, '--probe-receipt', `${outDir}/probe-stop.json`, '--skip-host', '--skip-runtime', '--control-label', 'stop']),
-      commandLine([...commonBundle, '--verify-only']),
+      commandLine([...finalBundle, '--probe-receipt', `${outDir}/probe-stop.json`, '--skip-host', '--skip-runtime', '--control-label', 'stop']),
+      commandLine([...finalBundle, '--verify-only']),
       commandLine(['cp', `${outDir}/manifest.json`, `${outDir}/prior-bundle-manifest.json`]),
       '',
       `5. Bind ${agentId}'s complete evidence into a verified starter receipt:`,
       commandLine(['cp', manifestPath, `${outDir}/starter.example.json`]),
       commandLine(['cp', '~/.fleet/receipts/service.json', `${outDir}/service.json`]),
       commandLine(['node', '-e', copyDefinitions, `${outDir}/service.json`, outDir]),
-      commandLine(['node', 'fleet-runtime/continuous-runtime-receipt.mjs', '--agent', agentId, '--service-manager', manager, '--require-control', 'start', '--require-control', 'stop'], ` > ${shellQuote(`${outDir}/continuous.json`)}`),
       commandLine(['node', 'fleet-runtime/starter-manifest.mjs', '--verify', '--bundle-dir', outDir, ...artifactArgs], ` > ${shellQuote(`${outDir}/starter-receipt.json`)}`),
-      commandLine([...commonBundle, '--service-receipt', `${outDir}/service.json`, '--continuous-receipt', `${outDir}/continuous.json`, '--starter-receipt', `${outDir}/starter-receipt.json`, '--verify-only', '--force']),
+      commandLine([...finalBundle, '--service-receipt', `${outDir}/service.json`, '--continuous-receipt', `${outDir}/continuous.json`, '--starter-receipt', `${outDir}/starter-receipt.json`, '--verify-only', '--force']),
       '',
       `6. Export and independently check ${agentId}'s attachable starter:`,
       commandLine(['node', 'fleet-runtime/receipt-bundle.mjs', '--export', '--out-dir', outDir, '--export-dir', exportDir]),
@@ -216,8 +233,12 @@ export function renderStarterPlan(rawManifest, opts = {}) {
     commandLine(['node', 'fleet-runtime/service-manager.mjs', 'uninstall', '--service-manager', manager]),
     '',
     '8. Recovery reinstall and fresh advancement proof:',
-    commandLine(['node', 'fleet-runtime/install.mjs', '--activate', '--service-manager', manager]),
-    ...agents.map((agent) => commandLine(['node', 'fleet-runtime/continuous-runtime-receipt.mjs', '--agent', agent.agent_id, '--service-manager', manager, '--require-control', 'start', '--require-control', 'stop'])),
+    recoveryInstallCommand(manager),
+    ...agents.flatMap((agent) => [
+      '# Requires MUPOT_OWNER_TOKEN in the environment.',
+      commandLine(['node', 'fleet-runtime/cutover-probe.mjs', '--base-url', manifest.base_url, '--agent', agent.agent_id, '--control', 'start'], ` > ${shellQuote(`~/.fleet/receipts/${agent.agent_id}/recovery-start.json`)}`),
+      commandLine(['node', 'fleet-runtime/continuous-runtime-receipt.mjs', '--agent', agent.agent_id, '--service-manager', manager]),
+    ]),
   )
   return `${lines.join('\n')}\n`
 }

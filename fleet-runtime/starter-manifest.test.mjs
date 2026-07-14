@@ -130,6 +130,40 @@ test('starter plan covers the credential-free install, proof, export, rollback, 
   assert.ok(plan.indexOf('edit ~/.fleet/daemon.json') < plan.lastIndexOf(installReceiptCommand))
   assert.ok(plan.indexOf('fleet-runtime/trust-bootstrap.mjs') < plan.lastIndexOf(installReceiptCommand))
   assert.ok(plan.lastIndexOf(installReceiptCommand) < plan.indexOf('fleet-runtime/service-manager.mjs install'))
+
+  const startProbe = plan.indexOf('--queue-inbox --control start')
+  const continuous = plan.indexOf('fleet-runtime/continuous-runtime-receipt.mjs')
+  const stopProbe = plan.indexOf('--control stop')
+  assert.ok(startProbe < continuous)
+  assert.ok(continuous < stopProbe)
+  assert.doesNotMatch(plan, /--skip-host --skip-runtime --skip-control/)
+  assert.match(plan, /--require-control-verb start --install-receipt ~\/\.fleet\/receipts\/install\.json --probe-receipt/)
+  assert.match(plan, /--require-control-verb start,stop --probe-receipt .*probe-stop\.json/)
+  assert.match(plan, /Requires MUPOT_AGENT_TOKEN_MANAGER and MUPOT_OWNER_TOKEN/)
+
+  const recovery = plan.indexOf('8. Recovery reinstall')
+  const recoveryInstall = plan.indexOf('install.mjs --activate', recovery)
+  const recoveryStart = plan.indexOf('--control start', recovery)
+  const recoveryContinuous = plan.indexOf('continuous-runtime-receipt.mjs', recovery)
+  assert.ok(recoveryInstall < recoveryStart)
+  assert.ok(recoveryStart < recoveryContinuous)
+})
+
+test('starter plan enables systemd linger without applying the flag to launchd', () => {
+  const systemd = sterileManifest()
+  systemd.service_manager = 'systemd'
+  const systemdPlan = renderStarterPlan(systemd, { agents: ['manager'] })
+  assert.match(systemdPlan, /service-manager\.mjs install --service-manager systemd --enable-linger/)
+  assert.match(systemdPlan, /install\.mjs --activate --service-manager systemd --enable-linger/)
+
+  const launchd = sterileManifest()
+  launchd.service_manager = 'launchd'
+  const launchdPlan = renderStarterPlan(launchd, { agents: ['manager'] })
+  assert.doesNotMatch(launchdPlan, /--enable-linger/)
+
+  const automatic = renderStarterPlan(sterileManifest(), { agents: ['manager'] })
+  assert.match(automatic, /Linux\) node fleet-runtime\/service-manager\.mjs install --service-manager systemd --enable-linger ;;/)
+  assert.match(automatic, /Darwin\) node fleet-runtime\/service-manager\.mjs install --service-manager launchd ;;/)
 })
 
 test('starter plan shell-quotes manifest-derived URL values', () => {
