@@ -42,6 +42,7 @@ import { fleetCheckinApp } from './fleet/checkin-routes'
 import { fleetControlApp } from './fleet/control-routes'
 import { fleetAttachApp } from './fleet/attach-routes'
 import { flightsApp } from './flight/routes'
+import { radarApp } from './dashboard/radar-routes'
 import { orientApp } from './orient/routes'
 import { handleOAuthAuthorize, resolveExternalToken as memberKeyResolver } from './mcp/oauth-authorize'
 import { McpOAuthApiHandler } from './mcp/oauth-api-handler'
@@ -100,6 +101,10 @@ app.route('/api/fleet', fleetAttachApp)
 // Coherence-loop connector (#70): the brain dispatches gated flights + pulls outcomes,
 // inbound (the pot stays sealed). Org-admin via member-token. Before the '/' catch-all.
 app.route('/api/flights', flightsApp)
+// Fleet radar (#23): read-only fleet/squad awareness feed for the brain's ATC tower —
+// the aggregation of already-existing liveness/presence/flight signals into one census.
+// Org-admin via member-token, same auth shape as /api/flights. Before the '/' catch-all.
+app.route('/api/radar', radarApp)
 // Orient seam (#digid-hybrid S1): an agent reads its basin-drop packet; the mind pushes
 // per-agent field state inbound. Before the '/' catch-all. See docs/superpowers/specs.
 app.route('/api/orient', orientApp)
