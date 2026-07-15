@@ -107,6 +107,7 @@ const TOP_LEVEL_KEYS = [
 
 const KEY_PATTERN = /^[a-z0-9-]{3,64}$/
 const SEMVER_PATTERN = /^\d+\.\d+\.\d+$/
+const MAX_ARRAY_INDEX = 2 ** 32 - 1
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -133,12 +134,38 @@ function validateCanonicalRecord(value: unknown, keys: readonly string[], path: 
   return missing === undefined ? null : fail('missing_field', `${path}.${missing}`)
 }
 
+function isArrayIndex(key: string): boolean {
+  const index = Number(key)
+  return Number.isInteger(index) && index >= 0 && index < MAX_ARRAY_INDEX && String(index) === key
+}
+
+function validateCanonicalArray(value: unknown[], path: string): AddonValidationResult | null {
+  if (Object.getPrototypeOf(value) !== Array.prototype) return fail('invalid_array', path)
+
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
+    if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return fail('invalid_array', `${path}[${index}]`)
+  }
+
+  for (const key of Reflect.ownKeys(value)) {
+    if (key === 'length') continue
+    if (typeof key !== 'string' || !isArrayIndex(key)) return fail('invalid_array', path)
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return fail('invalid_array', `${path}[${key}]`)
+  }
+
+  return null
+}
+
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
 }
 
 function isStringArray(value: unknown, path: string): AddonValidationResult | null {
-  if (!Array.isArray(value) || value.some((entry) => !isNonEmptyString(entry))) return fail('invalid_string_array', path)
+  if (!Array.isArray(value)) return fail('invalid_string_array', path)
+  const arrayError = validateCanonicalArray(value, path)
+  if (arrayError) return arrayError
+  if (value.some((entry) => !isNonEmptyString(entry))) return fail('invalid_string_array', path)
   if (new Set(value).size !== value.length) return fail('duplicate_entry', path)
   return null
 }
@@ -157,6 +184,8 @@ function isScopeType(value: unknown): value is CapabilityScopeType {
 
 function validateDepartments(value: unknown): AddonValidationResult | null {
   if (!Array.isArray(value)) return fail('invalid_array', 'departments')
+  const arrayError = validateCanonicalArray(value, 'departments')
+  if (arrayError) return arrayError
   const keys = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `departments[${index}]`
@@ -172,6 +201,8 @@ function validateDepartments(value: unknown): AddonValidationResult | null {
 
 function validateAgentTemplates(value: unknown): AddonValidationResult | null {
   if (!Array.isArray(value)) return fail('invalid_array', 'agentTemplates')
+  const arrayError = validateCanonicalArray(value, 'agentTemplates')
+  if (arrayError) return arrayError
   const keys = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `agentTemplates[${index}]`
@@ -189,6 +220,8 @@ function validateAgentTemplates(value: unknown): AddonValidationResult | null {
 
 function validateConnectorRequirements(value: unknown): AddonValidationResult | null {
   if (!Array.isArray(value)) return fail('invalid_array', 'connectorRequirements')
+  const arrayError = validateCanonicalArray(value, 'connectorRequirements')
+  if (arrayError) return arrayError
   const slots = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `connectorRequirements[${index}]`
@@ -213,6 +246,10 @@ function validateAuthorityRequests(value: unknown): AddonValidationResult | null
   const objectError = validateCanonicalRecord(value, ['rankGrants', 'surfaceGrants'], 'authorityRequests')
   if (objectError) return objectError
   if (!Array.isArray(value.rankGrants) || !Array.isArray(value.surfaceGrants)) return fail('invalid_array', 'authorityRequests')
+  const rankGrantsError = validateCanonicalArray(value.rankGrants, 'authorityRequests.rankGrants')
+  if (rankGrantsError) return rankGrantsError
+  const surfaceGrantsError = validateCanonicalArray(value.surfaceGrants, 'authorityRequests.surfaceGrants')
+  if (surfaceGrantsError) return surfaceGrantsError
 
   const rankKeys = new Set<string>()
   for (const [index, entry] of value.rankGrants.entries()) {
@@ -248,6 +285,8 @@ function validateAuthorityRequests(value: unknown): AddonValidationResult | null
 
 function validateMetrics(value: unknown): AddonValidationResult | null {
   if (!Array.isArray(value)) return fail('invalid_array', 'metrics')
+  const arrayError = validateCanonicalArray(value, 'metrics')
+  if (arrayError) return arrayError
   const keys = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `metrics[${index}]`
@@ -262,6 +301,8 @@ function validateMetrics(value: unknown): AddonValidationResult | null {
 
 function validatePlaybooks(value: unknown): AddonValidationResult | null {
   if (!Array.isArray(value)) return fail('invalid_array', 'playbooks')
+  const arrayError = validateCanonicalArray(value, 'playbooks')
+  if (arrayError) return arrayError
   const keys = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `playbooks[${index}]`
@@ -277,6 +318,8 @@ function validatePlaybooks(value: unknown): AddonValidationResult | null {
 
 function validateLoops(value: unknown): AddonValidationResult | null {
   if (!Array.isArray(value)) return fail('invalid_array', 'loops')
+  const arrayError = validateCanonicalArray(value, 'loops')
+  if (arrayError) return arrayError
   const keys = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `loops[${index}]`
@@ -293,6 +336,8 @@ function validateLoops(value: unknown): AddonValidationResult | null {
 
 function validateConsoleSections(value: unknown): AddonValidationResult | null {
   if (!Array.isArray(value)) return fail('invalid_array', 'consoleSections')
+  const arrayError = validateCanonicalArray(value, 'consoleSections')
+  if (arrayError) return arrayError
   const renderers = new Set<string>()
   const paths = new Set<string>()
   for (const [index, entry] of value.entries()) {
@@ -311,6 +356,8 @@ function validateConsoleSections(value: unknown): AddonValidationResult | null {
 
 function validateApprovalPolicies(value: unknown): AddonValidationResult | null {
   if (!Array.isArray(value)) return fail('invalid_array', 'approvalPolicies')
+  const arrayError = validateCanonicalArray(value, 'approvalPolicies')
+  if (arrayError) return arrayError
   const actions = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `approvalPolicies[${index}]`

@@ -106,6 +106,43 @@ describe('addon contract', () => {
     expect(validateAddonManifest(manifestWithRankGrant('squad', null))).toMatchObject({ ok: false })
   })
 
+  it('rejects sparse and non-canonical arrays throughout the manifest', () => {
+    const sparseStringArray = cloneFixture()
+    sparseStringArray.eventSubscriptions = ['addon.installed']
+    sparseStringArray.eventSubscriptions.length = 2
+    expect(validateAddonManifest(sparseStringArray)).toMatchObject({ ok: false })
+
+    const sparseNestedStringArray = cloneFixture()
+    sparseNestedStringArray.connectorRequirements = [{
+      slot: 'source',
+      accepts: ['native'],
+      required: true,
+      capability: 'read',
+      bindingKind: 'either',
+    }]
+    sparseNestedStringArray.connectorRequirements[0].accepts.length = 2
+    expect(validateAddonManifest(sparseNestedStringArray)).toMatchObject({ ok: false })
+
+    const sparseRecordArray = cloneFixture()
+    sparseRecordArray.departments.length = 2
+    expect(validateAddonManifest(sparseRecordArray)).toMatchObject({ ok: false })
+
+    const accessorRecordArray = cloneFixture()
+    Object.defineProperty(accessorRecordArray.departments, '0', {
+      enumerable: true,
+      get: () => fixture.departments[0],
+    })
+    expect(validateAddonManifest(accessorRecordArray)).toMatchObject({ ok: false })
+
+    const symbolRecordArray = cloneFixture()
+    symbolRecordArray.departments[Symbol('hidden')] = true
+    expect(validateAddonManifest(symbolRecordArray)).toMatchObject({ ok: false })
+
+    const extraRecordArray = cloneFixture()
+    Object.defineProperty(extraRecordArray.departments, 'hidden', { enumerable: true, value: true })
+    expect(validateAddonManifest(extraRecordArray)).toMatchObject({ ok: false })
+  })
+
   it('produces a stable digest independent of object insertion order', async () => {
     const reordered = Object.fromEntries(Object.entries(fixture).reverse()) as AddonManifestV1
     expect(Object.keys(reordered)).toEqual([...Object.keys(fixture)].reverse())
