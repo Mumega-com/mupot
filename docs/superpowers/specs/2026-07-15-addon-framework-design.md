@@ -15,6 +15,11 @@ governance policies. The first addon composes Mupot's existing marketing primiti
 is activated on the Mumega pot. A later Accounting addon must use the same contract
 without requiring marketing-specific changes to the addon kernel.
 
+The product focus is Marketing and CRO. Accounting is only a portability check for the
+contract and is not a near-term delivery target. Repository visibility is an operator and
+commercial decision: Mupot may remain public or become private. Tenant safety must rely on
+identity, isolation, capabilities, gates, and secret handling, never on source secrecy.
+
 ## 2. Product Boundary
 
 Mupot core remains responsible for:
@@ -100,6 +105,14 @@ interface AddonManifestV1 {
     moduleKey: string
     required: boolean
   }>
+  agentTemplates: Array<{
+    key: string
+    name: string
+    role: string
+    departmentModuleKey: string
+    squadSlug: string
+    defaultStatus: 'inactive'
+  }>
   connectorRequirements: Array<{
     slot: string
     accepts: string[]
@@ -107,13 +120,20 @@ interface AddonManifestV1 {
     capability: 'read' | 'write'
     bindingKind: 'vault_connector' | 'internal_adapter' | 'either'
   }>
-  requestedCapabilities: Array<{
-    capability: Capability
-    scopeType: 'pot' | 'department' | 'squad' | 'agent'
-    scopeRef: string
-    ceiling: Capability
-    reason: string
-  }>
+  authorityRequests: {
+    rankGrants: Array<{
+      subjectRef: string
+      capability: Capability
+      scopeType: 'org' | 'department' | 'squad'
+      scopeRef: string | null
+      reason: string
+    }>
+    surfaceGrants: Array<{
+      subjectRef: string
+      capability: string
+      reason: string
+    }>
+  }
   metrics: Array<{
     descriptorKey: string
     ownerDepartment: string
@@ -220,13 +240,14 @@ Configuration preflight verifies:
 - every write action has an approval policy;
 - external MCP endpoints use HTTPS and pass the existing SSRF policy.
 
-Requested capabilities are presented as a separate authority proposal. An owner must
-approve each target scope and ceiling through the existing human gate. Approval writes a
-grant-specific receipt and addon-owned grant row; activation itself never silently grants
-authority. Pot-wide authority requires an explicit manifest declaration and owner
-approval. Blanket `mcp:*` grants are invalid. The activating actor cannot approve above
-their own grant ceiling, and self-approval remains prohibited where proposer and approver
-identities would coincide.
+Requested authority is presented as a separate proposal with scoped rank grants and named
+surface grants kept distinct, matching Mupot's existing `capabilities` and `gate_grants`
+boundaries. An owner must approve each target scope and named surface through the existing
+human gate. Approval writes a grant-specific receipt and addon-owned grant row; activation
+itself never silently grants authority. Org-wide authority requires an explicit manifest
+declaration and owner approval. Wildcard surface grants are invalid. The activating actor
+cannot approve above their own rank ceiling or grant an unregistered surface capability,
+and self-approval remains prohibited where proposer and approver identities coincide.
 
 ### 5.4 Activate
 
@@ -307,11 +328,12 @@ credential material.
 
 ### `addon_capability_grants`
 
-- `installation_id`, approved grant ID, target scope, capability, ceiling, approver,
-  approval receipt ID, active flag, and revoked timestamp;
+- `installation_id`, `grant_kind` (`rank` or `surface`), approved underlying grant ID,
+  subject, target scope when rank-scoped, capability, approver, approval receipt ID,
+  active flag, and revoked timestamp;
 - separate from human/manual and channel-derived grants so disable can revoke only
   addon-owned authority;
-- unique active grant per installation, target scope, and capability;
+- unique active grant per installation, grant kind, subject, target scope, and capability;
 - no grant exists until its distinct authority proposal receives a valid human verdict.
 
 ### `addon_resource_ownership`
