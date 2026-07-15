@@ -116,10 +116,21 @@ function fail(reason: string, path?: string): AddonValidationResult {
   return path === undefined ? { ok: false, reason } : { ok: false, reason, path }
 }
 
-function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[], path: string): AddonValidationResult | null {
+function validateCanonicalRecord(value: unknown, keys: readonly string[], path: string): AddonValidationResult | null {
+  if (!isRecord(value)) return fail('invalid_object', path)
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) return fail('invalid_object', path)
+
   const allowed = new Set(keys)
-  const unknown = Object.keys(value).find((key) => !allowed.has(key))
-  return unknown === undefined ? null : fail('unknown_field', `${path}.${unknown}`)
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string') return fail('invalid_object', path)
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return fail('invalid_object', `${path}.${key}`)
+    if (!allowed.has(key)) return fail('unknown_field', `${path}.${key}`)
+  }
+
+  const missing = keys.find((key) => !Object.hasOwn(value, key))
+  return missing === undefined ? null : fail('missing_field', `${path}.${missing}`)
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -149,8 +160,7 @@ function validateDepartments(value: unknown): AddonValidationResult | null {
   const keys = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `departments[${index}]`
-    if (!isRecord(entry)) return fail('invalid_object', path)
-    const keyError = hasOnlyKeys(entry, ['moduleKey', 'required'], path)
+    const keyError = validateCanonicalRecord(entry, ['moduleKey', 'required'], path)
     if (keyError) return keyError
     if (!isNonEmptyString(entry.moduleKey)) return fail('invalid_module_key', `${path}.moduleKey`)
     if (!isBoolean(entry.required)) return fail('invalid_boolean', `${path}.required`)
@@ -165,8 +175,7 @@ function validateAgentTemplates(value: unknown): AddonValidationResult | null {
   const keys = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `agentTemplates[${index}]`
-    if (!isRecord(entry)) return fail('invalid_object', path)
-    const keyError = hasOnlyKeys(entry, ['key', 'name', 'role', 'departmentModuleKey', 'squadSlug', 'defaultStatus'], path)
+    const keyError = validateCanonicalRecord(entry, ['key', 'name', 'role', 'departmentModuleKey', 'squadSlug', 'defaultStatus'], path)
     if (keyError) return keyError
     if (typeof entry.key !== 'string' || !KEY_PATTERN.test(entry.key)) return fail('invalid_key', `${path}.key`)
     if (!isNonEmptyString(entry.name) || !isNonEmptyString(entry.role)) return fail('invalid_string', path)
@@ -183,8 +192,7 @@ function validateConnectorRequirements(value: unknown): AddonValidationResult | 
   const slots = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `connectorRequirements[${index}]`
-    if (!isRecord(entry)) return fail('invalid_object', path)
-    const keyError = hasOnlyKeys(entry, ['slot', 'accepts', 'required', 'capability', 'bindingKind'], path)
+    const keyError = validateCanonicalRecord(entry, ['slot', 'accepts', 'required', 'capability', 'bindingKind'], path)
     if (keyError) return keyError
     if (!isNonEmptyString(entry.slot)) return fail('invalid_string', `${path}.slot`)
     const acceptsError = isStringArray(entry.accepts, `${path}.accepts`)
@@ -202,20 +210,23 @@ function validateConnectorRequirements(value: unknown): AddonValidationResult | 
 
 function validateAuthorityRequests(value: unknown): AddonValidationResult | null {
   if (!isRecord(value)) return fail('invalid_object', 'authorityRequests')
-  const objectError = hasOnlyKeys(value, ['rankGrants', 'surfaceGrants'], 'authorityRequests')
+  const objectError = validateCanonicalRecord(value, ['rankGrants', 'surfaceGrants'], 'authorityRequests')
   if (objectError) return objectError
   if (!Array.isArray(value.rankGrants) || !Array.isArray(value.surfaceGrants)) return fail('invalid_array', 'authorityRequests')
 
   const rankKeys = new Set<string>()
   for (const [index, entry] of value.rankGrants.entries()) {
     const path = `authorityRequests.rankGrants[${index}]`
-    if (!isRecord(entry)) return fail('invalid_object', path)
-    const keyError = hasOnlyKeys(entry, ['subjectRef', 'capability', 'scopeType', 'scopeRef', 'reason'], path)
+    const keyError = validateCanonicalRecord(entry, ['subjectRef', 'capability', 'scopeType', 'scopeRef', 'reason'], path)
     if (keyError) return keyError
     if (!isNonEmptyString(entry.subjectRef) || !isNonEmptyString(entry.reason)) return fail('invalid_string', path)
     if (!isCapability(entry.capability)) return fail('invalid_capability', `${path}.capability`)
     if (!isScopeType(entry.scopeType)) return fail('invalid_scope_type', `${path}.scopeType`)
-    if (entry.scopeRef !== null && !isNonEmptyString(entry.scopeRef)) return fail('invalid_scope_ref', `${path}.scopeRef`)
+    if (entry.scopeType === 'org') {
+      if (entry.scopeRef !== null) return fail('invalid_scope_ref', `${path}.scopeRef`)
+    } else if (!isNonEmptyString(entry.scopeRef)) {
+      return fail('invalid_scope_ref', `${path}.scopeRef`)
+    }
     const rankKey = `${entry.subjectRef}\u0000${entry.scopeType}\u0000${entry.scopeRef ?? ''}\u0000${entry.capability}`
     if (rankKeys.has(rankKey)) return fail('duplicate_key', path)
     rankKeys.add(rankKey)
@@ -224,8 +235,7 @@ function validateAuthorityRequests(value: unknown): AddonValidationResult | null
   const surfaceKeys = new Set<string>()
   for (const [index, entry] of value.surfaceGrants.entries()) {
     const path = `authorityRequests.surfaceGrants[${index}]`
-    if (!isRecord(entry)) return fail('invalid_object', path)
-    const keyError = hasOnlyKeys(entry, ['subjectRef', 'capability', 'reason'], path)
+    const keyError = validateCanonicalRecord(entry, ['subjectRef', 'capability', 'reason'], path)
     if (keyError) return keyError
     if (!isNonEmptyString(entry.subjectRef) || !isNonEmptyString(entry.capability) || !isNonEmptyString(entry.reason)) return fail('invalid_string', path)
     if (entry.capability.includes('*')) return fail('invalid_surface_capability', `${path}.capability`)
@@ -241,8 +251,7 @@ function validateMetrics(value: unknown): AddonValidationResult | null {
   const keys = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `metrics[${index}]`
-    if (!isRecord(entry)) return fail('invalid_object', path)
-    const keyError = hasOnlyKeys(entry, ['descriptorKey', 'ownerDepartment'], path)
+    const keyError = validateCanonicalRecord(entry, ['descriptorKey', 'ownerDepartment'], path)
     if (keyError) return keyError
     if (!isNonEmptyString(entry.descriptorKey) || !isNonEmptyString(entry.ownerDepartment)) return fail('invalid_string', path)
     if (keys.has(entry.descriptorKey)) return fail('duplicate_key', `${path}.descriptorKey`)
@@ -256,8 +265,7 @@ function validatePlaybooks(value: unknown): AddonValidationResult | null {
   const keys = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `playbooks[${index}]`
-    if (!isRecord(entry)) return fail('invalid_object', path)
-    const keyError = hasOnlyKeys(entry, ['key', 'version'], path)
+    const keyError = validateCanonicalRecord(entry, ['key', 'version'], path)
     if (keyError) return keyError
     if (typeof entry.key !== 'string' || !KEY_PATTERN.test(entry.key)) return fail('invalid_key', `${path}.key`)
     if (typeof entry.version !== 'string' || !SEMVER_PATTERN.test(entry.version)) return fail('invalid_version', `${path}.version`)
@@ -272,8 +280,7 @@ function validateLoops(value: unknown): AddonValidationResult | null {
   const keys = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `loops[${index}]`
-    if (!isRecord(entry)) return fail('invalid_object', path)
-    const keyError = hasOnlyKeys(entry, ['templateKey', 'defaultState', 'approvalRequired'], path)
+    const keyError = validateCanonicalRecord(entry, ['templateKey', 'defaultState', 'approvalRequired'], path)
     if (keyError) return keyError
     if (!isNonEmptyString(entry.templateKey)) return fail('invalid_string', `${path}.templateKey`)
     if (entry.defaultState !== 'disabled' && entry.defaultState !== 'active') return fail('invalid_loop_state', `${path}.defaultState`)
@@ -290,8 +297,7 @@ function validateConsoleSections(value: unknown): AddonValidationResult | null {
   const paths = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `consoleSections[${index}]`
-    if (!isRecord(entry)) return fail('invalid_object', path)
-    const keyError = hasOnlyKeys(entry, ['rendererKey', 'path', 'title', 'navIcon'], path)
+    const keyError = validateCanonicalRecord(entry, ['rendererKey', 'path', 'title', 'navIcon'], path)
     if (keyError) return keyError
     if (!isNonEmptyString(entry.rendererKey) || !isNonEmptyString(entry.title) || !isNonEmptyString(entry.navIcon)) return fail('invalid_string', path)
     if (!isNonEmptyString(entry.path) || !entry.path.startsWith('/')) return fail('invalid_path', `${path}.path`)
@@ -308,8 +314,7 @@ function validateApprovalPolicies(value: unknown): AddonValidationResult | null 
   const actions = new Set<string>()
   for (const [index, entry] of value.entries()) {
     const path = `approvalPolicies[${index}]`
-    if (!isRecord(entry)) return fail('invalid_object', path)
-    const keyError = hasOnlyKeys(entry, ['action', 'requiredCapability', 'selfApproval'], path)
+    const keyError = validateCanonicalRecord(entry, ['action', 'requiredCapability', 'selfApproval'], path)
     if (keyError) return keyError
     if (!isNonEmptyString(entry.action)) return fail('invalid_string', `${path}.action`)
     if (!isCapability(entry.requiredCapability)) return fail('invalid_capability', `${path}.requiredCapability`)
@@ -323,7 +328,7 @@ function validateApprovalPolicies(value: unknown): AddonValidationResult | null 
 export function validateAddonManifest(value: unknown): AddonValidationResult {
   try {
     if (!isRecord(value)) return fail('invalid_manifest')
-    const topLevelError = hasOnlyKeys(value, TOP_LEVEL_KEYS, 'manifest')
+    const topLevelError = validateCanonicalRecord(value, TOP_LEVEL_KEYS, 'manifest')
     if (topLevelError) return topLevelError
     if (value.schema !== 'mupot.addon/v1') return fail('invalid_schema', 'schema')
     if (typeof value.key !== 'string' || !KEY_PATTERN.test(value.key)) return fail('invalid_key', 'key')
@@ -358,7 +363,7 @@ export function validateAddonManifest(value: unknown): AddonValidationResult {
     if (healthError) return healthError
 
     if (!isRecord(value.retention)) return fail('invalid_object', 'retention')
-    const retentionError = hasOnlyKeys(value.retention, ['disablePreservesData', 'purgeRequiresOwner'], 'retention')
+    const retentionError = validateCanonicalRecord(value.retention, ['disablePreservesData', 'purgeRequiresOwner'], 'retention')
     if (retentionError) return retentionError
     if (value.retention.disablePreservesData !== true || value.retention.purgeRequiresOwner !== true) return fail('invalid_retention', 'retention')
 
