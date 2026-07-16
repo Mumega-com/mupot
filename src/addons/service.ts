@@ -446,6 +446,29 @@ async function loadRunningOperation(env: Env, installationId: string): Promise<O
   `).bind(env.TENANT_SLUG, installationId).first<OperationRow>()
 }
 
+async function loadFailedOperation(
+  env: Env,
+  installationId: string,
+  action: OperationAction,
+  targetState: OperationTargetState,
+): Promise<OperationRow | null> {
+  const operation = await env.DB.prepare(`
+    SELECT id, tenant, installation_id, action, target_state, current_step,
+           status, actor_id, lease_token, lease_expires_at, error_code, created_at, updated_at
+      FROM addon_operations
+     WHERE tenant = ?1 AND installation_id = ?2
+       AND action = ?3 AND target_state = ?4
+     ORDER BY updated_at DESC, created_at DESC, rowid DESC
+     LIMIT 1
+  `).bind(
+    env.TENANT_SLUG,
+    installationId,
+    action,
+    targetState,
+  ).first<OperationRow>()
+  return operation?.status === 'failed' ? operation : null
+}
+
 async function loadExactOperation(
   env: Env,
   operation: OperationRow,
@@ -479,15 +502,41 @@ async function lifecycleOperationFailure(
   error: unknown,
 ): Promise<AddonMutationFailure> {
   if (error instanceof FenceLostError) return lifecycleFailure(error)
-  const owned = await loadExactOperation(
-    env,
-    operation,
-    'running',
+  const errorCode = {
+    activate: 'activation_failed',
+    disable: 'disable_failed',
+    archive: 'archive_failed',
+  }[operation.action]
+  const failedAt = new Date().toISOString()
+  const result = await env.DB.prepare(`
+    UPDATE addon_operations
+       SET status = 'failed', error_code = ?1, updated_at = ?2
+     WHERE id = ?3 AND tenant = ?4 AND installation_id = ?5
+       AND action = ?6 AND target_state = ?7 AND current_step = ?8
+       AND status = 'running' AND actor_id = ?9 AND lease_token = ?10
+       AND lease_expires_at = ?11 AND lease_expires_at > ?2
+  `).bind(
+    errorCode,
+    failedAt,
+    operation.id,
+    env.TENANT_SLUG,
+    operation.installation_id,
+    operation.action,
+    operation.target_state,
     operation.current_step,
-  )
-  return !owned || !leaseIsLive(owned)
-    ? { ok: false, reason: 'fence_lost' }
-    : { ok: false, reason: 'write_failed' }
+    operation.actor_id,
+    operation.lease_token,
+    operation.lease_expires_at,
+  ).run()
+  if (!written(result)) return { ok: false, reason: 'fence_lost' }
+
+  operation.status = 'failed'
+  operation.error_code = errorCode
+  operation.updated_at = failedAt
+  const failed = await loadExactOperation(env, operation, 'failed', operation.current_step)
+  return failed
+    ? { ok: false, reason: 'write_failed' }
+    : { ok: false, reason: 'fence_lost' }
 }
 
 async function assertLiveOperationLease(env: Env, operation: OperationRow): Promise<void> {
@@ -561,6 +610,76 @@ async function acquireOperation(
     const selected = await loadExactOperation(env, operation, 'running', running.current_step)
     return selected
       ? { ok: true, operation: selected }
+      : { ok: false, reason: 'fence_lost' }
+  }
+
+  const failed = await loadFailedOperation(env, installationId, action, targetState)
+  const currentState = expectedStates[0]
+  const recoverable = failed && (
+    action === 'activate'
+    || (action === 'disable' && (
+      currentState === 'disabled' || failed.current_step === initialStep
+    ))
+    || (action === 'archive' && failed.current_step === initialStep)
+  )
+  if (failed && recoverable) {
+    try {
+      const recovered = await env.DB.prepare(`
+        UPDATE addon_operations
+           SET status = 'running', lease_token = ?1, lease_expires_at = ?2,
+               updated_at = ?3, error_code = NULL
+         WHERE id = ?4 AND tenant = ?5 AND installation_id = ?6
+           AND action = ?7 AND target_state = ?8 AND current_step = ?9
+           AND status = 'failed' AND actor_id = ?10 AND lease_token = ?11
+           AND error_code = ?12
+           AND EXISTS (
+             SELECT 1 FROM addon_installations AS installation
+              WHERE installation.id = addon_operations.installation_id
+                AND installation.tenant = addon_operations.tenant
+                AND installation.state IN (?13, ?14)
+           )
+      `).bind(
+        token,
+        expiresAt,
+        now,
+        failed.id,
+        env.TENANT_SLUG,
+        installationId,
+        action,
+        targetState,
+        failed.current_step,
+        failed.actor_id,
+        failed.lease_token,
+        failed.error_code,
+        expectedStates[0],
+        expectedStates[1],
+      ).run()
+      if (written(recovered)) {
+        const operation: OperationRow = {
+          ...failed,
+          status: 'running',
+          lease_token: token,
+          lease_expires_at: expiresAt,
+          error_code: null,
+          updated_at: now,
+        }
+        const selected = await loadExactOperation(
+          env,
+          operation,
+          'running',
+          operation.current_step,
+        )
+        return selected
+          ? { ok: true, operation: selected }
+          : { ok: false, reason: 'fence_lost' }
+      }
+    } catch {
+      // The one-running-operation constraint identifies a concurrent recovery winner.
+    }
+
+    const raced = await loadRunningOperation(env, installationId)
+    return raced
+      ? { ok: false, reason: 'operation_busy' }
       : { ok: false, reason: 'fence_lost' }
   }
 
@@ -1923,6 +2042,7 @@ export async function activateAddon(
     return { ok: false, reason: 'write_failed' }
   }
 
+  let operation: OperationRow | null = null
   try {
     const acquired = await acquireOperation(
       env,
@@ -1938,7 +2058,7 @@ export async function activateAddon(
         ? { ok: false, reason: acquired.reason, state: existing.state }
         : { ok: false, reason: acquired.reason }
     }
-    const operation = acquired.operation
+    operation = acquired.operation
 
     const claims: OwnershipRow[] = []
     for (const department of entry.manifest.departments) {
@@ -2095,10 +2215,14 @@ export async function activateAddon(
       return lifecycleOperationFailure(env, operation, error)
     }
   } catch (error) {
-    return lifecycleFailure(error)
+    return operation
+      ? lifecycleOperationFailure(env, operation, error)
+      : lifecycleFailure(error)
   }
 
-  return { ok: false, reason: 'write_failed' }
+  return operation
+    ? lifecycleOperationFailure(env, operation, new Error('activation did not complete'))
+    : { ok: false, reason: 'write_failed' }
 }
 
 export async function disableAddon(
@@ -2112,7 +2236,8 @@ export async function disableAddon(
   const { installation: existing } = context
 
   const running = await loadRunningOperation(env, existing.id)
-  if (existing.state === 'disabled' && !running) {
+  const failedDisable = await loadFailedOperation(env, existing.id, 'disable', 'disabled')
+  if (existing.state === 'disabled' && !running && !failedDisable) {
     try {
       const evidence = await loadCompletedDisableOperationEvidence(env, existing)
       if (!evidence) {
@@ -2147,6 +2272,7 @@ export async function disableAddon(
     }
   }
 
+  let operation: OperationRow | null = null
   try {
     const acquired = await acquireOperation(
       env,
@@ -2162,7 +2288,7 @@ export async function disableAddon(
         ? { ok: false, reason: acquired.reason, state: existing.state }
         : { ok: false, reason: acquired.reason }
     }
-    const operation = acquired.operation
+    operation = acquired.operation
 
     if (existing.state !== 'disabled') {
       if (operation.current_step !== 'disable_state') throw new FenceLostError()
@@ -2267,7 +2393,7 @@ export async function disableAddon(
           throw new FenceLostError()
         }
         const selected = selectedInstallation(results[3])
-        if (!selected) return { ok: false, reason: 'write_failed' }
+        if (!selected) throw new Error('disabled installation transition was not observable')
         operation.current_step = 'disable_teardown'
         operation.lease_expires_at = transitionTiming.expiresAt
         operation.updated_at = transitionTiming.now
@@ -2354,7 +2480,9 @@ export async function disableAddon(
 
     return { ok: true, state: completedInstallation.state, installation: completedInstallation }
   } catch (error) {
-    return lifecycleFailure(error)
+    return operation
+      ? lifecycleOperationFailure(env, operation, error)
+      : lifecycleFailure(error)
   }
 }
 
@@ -2392,6 +2520,7 @@ export async function archiveAddon(
   }
   if (!disableEvidence) return { ok: false, reason: 'fence_lost' }
 
+  let operation: OperationRow | null = null
   try {
     const acquired = await acquireOperation(
       env,
@@ -2407,7 +2536,7 @@ export async function archiveAddon(
         ? { ok: false, reason: acquired.reason, state: existing.state }
         : { ok: false, reason: acquired.reason }
     }
-    const operation = acquired.operation
+    operation = acquired.operation
 
     const receiptId = crypto.randomUUID()
     const transitionTiming = leaseWindow()
@@ -2575,8 +2704,12 @@ export async function archiveAddon(
       return lifecycleOperationFailure(env, operation, error)
     }
   } catch (error) {
-    return lifecycleFailure(error)
+    return operation
+      ? lifecycleOperationFailure(env, operation, error)
+      : lifecycleFailure(error)
   }
 
-  return { ok: false, reason: 'write_failed' }
+  return operation
+    ? lifecycleOperationFailure(env, operation, new Error('archive did not complete'))
+    : { ok: false, reason: 'write_failed' }
 }

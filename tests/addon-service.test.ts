@@ -1810,12 +1810,16 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     expect(db.resources()).toEqual([
       expect.objectContaining({ active: 1, resource_key: 'fixture' }),
     ])
-    expect(db.operations()).toEqual([
-      expect.objectContaining({ action: 'activate', current_step: 'activate_departments', status: 'running' }),
-    ])
+    const failedOperation = db.operations()[0]
+    expect(failedOperation).toMatchObject({
+      action: 'activate',
+      current_step: 'activate_departments',
+      status: 'failed',
+      error_code: 'activation_failed',
+    })
+    expect(JSON.stringify(failedOperation)).not.toContain('interrupt after department activation')
     expect(db.receipts().filter((receipt) => receipt.action === 'activate')).toHaveLength(0)
 
-    expireRunningLease(db, 'activate')
     expect(await activateAddon(db.env, admin, 'fixture-addon', deps)).toMatchObject({
       ok: true,
       state: 'active',
@@ -1824,8 +1828,16 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     expect(db.squads()).toHaveLength(1)
     expect(db.resources()).toHaveLength(1)
     expect(db.operations()).toEqual([
-      expect.objectContaining({ action: 'activate', current_step: 'completed', status: 'completed', actor_id: owner.id }),
+      expect.objectContaining({
+        id: failedOperation.id,
+        action: 'activate',
+        current_step: 'completed',
+        status: 'completed',
+        actor_id: owner.id,
+        error_code: null,
+      }),
     ])
+    expect(db.operations()[0].lease_token).not.toBe(failedOperation.lease_token)
     expect(db.receipts().filter((receipt) => receipt.action === 'activate')).toEqual([
       expect.objectContaining({ actor_id: owner.id, previous_state: 'configured', next_state: 'active' }),
     ])
@@ -1848,8 +1860,11 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     expect(await getActiveDepartments(db.env.DB)).toEqual([])
     expect(await getActiveConsoleSections(db.env.DB)).toEqual([])
     expect(await getActiveMetricDescriptors(db.env.DB)).toEqual([])
+    expect(db.operations()[0]).toMatchObject({
+      status: 'failed',
+      error_code: 'activation_failed',
+    })
 
-    expireRunningLease(db, 'activate')
     expect(await activateAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'active' })
     expect(await getActiveDepartments(db.env.DB)).toHaveLength(1)
     expect(await getActiveConsoleSections(db.env.DB)).toHaveLength(1)
@@ -2210,8 +2225,9 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     expect(db.resources()[0]).toMatchObject({ id: claimId, active: 1, released_at: null })
     expect(db.operations().find((operation) => operation.action === 'disable')).toMatchObject({
       current_step: 'disable_teardown',
-      status: 'running',
+      status: 'failed',
       actor_id: owner.id,
+      error_code: 'disable_failed',
     })
     expect(db.receipts().filter((receipt) => receipt.action === 'disable')).toEqual([
       expect.objectContaining({
@@ -2224,7 +2240,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       }),
     ])
 
-    expireRunningLease(db, 'disable')
+    const failedOperation = db.operations().find((operation) => operation.action === 'disable')
     expect(await disableAddon(db.env, admin, 'fixture-addon', deps)).toMatchObject({
       ok: true,
       state: 'disabled',
@@ -2237,7 +2253,10 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       current_step: 'completed',
       status: 'completed',
       actor_id: owner.id,
+      error_code: null,
     })
+    expect(db.operations().find((operation) => operation.action === 'disable')?.id).toBe(failedOperation?.id)
+    expect(db.operations().find((operation) => operation.action === 'disable')?.lease_token).not.toBe(failedOperation?.lease_token)
     expect(db.receipts().filter((receipt) => receipt.action === 'disable')).toHaveLength(1)
   })
 
@@ -2339,10 +2358,10 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     ])
     expect(db.operations().find((operation) => operation.action === 'disable')).toMatchObject({
       current_step: `disable_claim:${claimId}`,
-      status: 'running',
+      status: 'failed',
+      error_code: 'disable_failed',
     })
 
-    expireRunningLease(db, 'disable')
     expect(await disableAddon(db.env, admin, 'fixture-addon', deps)).toMatchObject({
       ok: true,
       state: 'disabled',
@@ -2506,10 +2525,10 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     ])
     expect(db.operations().find((operation) => operation.action === 'disable')).toMatchObject({
       current_step: `disable_claim:${firstClaimId}`,
-      status: 'running',
+      status: 'failed',
+      error_code: 'disable_failed',
     })
 
-    expireRunningLease(db, 'disable')
     expect(await disableAddon(db.env, admin, 'fixture-addon', deps)).toMatchObject({
       ok: true,
       state: 'disabled',
@@ -2579,7 +2598,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     compensationStarted = true
     barrier.release()
 
-    expect(await stale).toEqual({ ok: false, reason: 'write_failed' })
+    expect(await stale).toEqual({ ok: false, reason: 'fence_lost' })
     expect(failing.failures()).toBe(4)
     expect(db.departments()).toEqual([expect.objectContaining({ active: 1 })])
 
@@ -2618,7 +2637,11 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     })).toEqual({ ok: false, reason: 'write_failed' })
 
     const operation = db.operations().find((candidate) => candidate.action === 'disable')
-    expect(operation).toMatchObject({ current_step: 'disable_teardown', status: 'running' })
+    expect(operation).toMatchObject({
+      current_step: 'disable_teardown',
+      status: 'failed',
+      error_code: 'disable_failed',
+    })
     db.harness.sqlite.prepare(`
       DELETE FROM addon_operations WHERE id = ? AND tenant = ?
     `).run(operation?.id, db.env.TENANT_SLUG)
@@ -2730,13 +2753,11 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     })
     expect(await archiveAddon(db.env, admin, 'fixture-addon')).toEqual({
       ok: false,
-      reason: 'operation_busy',
-      state: 'disabled',
+      reason: 'fence_lost',
     })
     expect(db.receipts().filter((receipt) => receipt.action === 'archive')).toHaveLength(0)
 
     deps.afterInstallationDisabled = undefined
-    expireRunningLease(db, 'disable')
     await disableAddon(db.env, admin, 'fixture-addon', deps)
     const receiptCountBeforeArchive = db.receipts().length
     const archived = await archiveAddon(db.env, admin, 'fixture-addon')
@@ -2768,6 +2789,41 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     expect(await activateAddon(db.env, owner, 'fixture-addon')).toEqual({
       ok: false,
       reason: 'invalid_state',
+    })
+  })
+
+  it('durably fails and immediately retries an archive with redacted evidence', async () => {
+    await activateFixture()
+    await disableAddon(db.env, owner, 'fixture-addon')
+    db.harness.sqlite.exec(`
+      CREATE TRIGGER reject_archive_receipt
+      BEFORE INSERT ON addon_receipts
+      WHEN NEW.action = 'archive'
+      BEGIN SELECT RAISE(ABORT, 'archive secret detail'); END
+    `)
+
+    expect(await archiveAddon(db.env, admin, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'write_failed',
+    })
+    const failedOperation = db.operations().find((operation) => operation.action === 'archive')
+    expect(failedOperation).toMatchObject({
+      current_step: 'archive_transition',
+      status: 'failed',
+      error_code: 'archive_failed',
+    })
+    expect(JSON.stringify(failedOperation)).not.toContain('archive secret detail')
+
+    db.harness.sqlite.exec('DROP TRIGGER reject_archive_receipt')
+    expect(await archiveAddon(db.env, owner, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'archived',
+    })
+    expect(db.operations().find((operation) => operation.action === 'archive')).toMatchObject({
+      id: failedOperation?.id,
+      status: 'completed',
+      error_code: null,
+      actor_id: admin.id,
     })
   })
 
