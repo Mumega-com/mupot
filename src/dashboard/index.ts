@@ -315,13 +315,13 @@ dashboardApp.get('/services', async (c) => {
 dashboardApp.get('/addons', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
-    return c.html(shell(c.env.BRAND, 'Addons', errorBody('Addons requires owner or admin.')), 403)
+    return c.html(shell(c.env, 'Addons', errorBody('Addons requires owner or admin.')), 403)
   }
   try {
     const installations = await listAddonInstallations(c.env)
-    return c.html(shell(c.env.BRAND, 'Addons', addonsBody(listRegisteredAddons(), installations)))
+    return c.html(shell(c.env, 'Addons', addonsBody(listRegisteredAddons(), installations)))
   } catch {
-    return c.html(shell(c.env.BRAND, 'Addons', errorBody('Addon catalog is unavailable.')), 500)
+    return c.html(shell(c.env, 'Addons', errorBody('Addon catalog is unavailable.')), 500)
   }
 })
 
