@@ -394,6 +394,59 @@ describe('addon migration constraints', () => {
     expect(db.receipts()).toHaveLength(1)
   })
 
+  it('rolls back chained state updates when only the final transition receipt is inserted', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    const configuredReceiptId = crypto.randomUUID()
+    const activeReceiptId = crypto.randomUUID()
+    const now = new Date().toISOString()
+
+    await expect(db.env.DB.batch([
+      db.env.DB.prepare(`
+        UPDATE addon_installations
+           SET state = 'configured', latest_previous_state = 'installed',
+               latest_actor_id = ?1, latest_receipt_id = ?2, updated_at = ?3
+         WHERE id = ?4 AND tenant = ?5 AND state = 'installed'
+      `).bind(owner.id, configuredReceiptId, now, installation.id, db.env.TENANT_SLUG),
+      db.env.DB.prepare(`
+        UPDATE addon_installations
+           SET state = 'active', latest_previous_state = 'configured',
+               latest_actor_id = ?1, latest_receipt_id = ?2, updated_at = ?3
+         WHERE id = ?4 AND tenant = ?5 AND state = 'configured'
+      `).bind(owner.id, activeReceiptId, now, installation.id, db.env.TENANT_SLUG),
+      db.env.DB.prepare(`
+        INSERT INTO addon_receipts (
+          id, tenant, installation_id, action, previous_state, next_state,
+          addon_key, installed_version, publisher, trust_class,
+          mupot_compatibility, manifest_sha256, actor_id, outcome,
+          side_effect_ids, checks, created_at
+        ) VALUES (
+          ?1, ?2, ?3, 'activate', 'configured', 'active', ?4, ?5, ?6, ?7,
+          ?8, ?9, ?10, 'pass', '[]', '{}', ?11
+        )
+      `).bind(
+        activeReceiptId,
+        db.env.TENANT_SLUG,
+        installation.id,
+        db.installations()[0].addon_key,
+        db.installations()[0].installed_version,
+        db.installations()[0].publisher,
+        db.installations()[0].trust_class,
+        db.installations()[0].mupot_compatibility,
+        db.installations()[0].manifest_sha256,
+        owner.id,
+        now,
+      ),
+    ])).rejects.toThrow()
+
+    expect(db.installations().find((row) => row.id === installation.id)).toMatchObject({
+      state: 'installed',
+      latest_previous_state: null,
+      latest_receipt_id: installation.latestReceiptId,
+    })
+    expect(db.receipts()).toHaveLength(1)
+    expect(db.receipts().some((receipt) => receipt.id === activeReceiptId)).toBe(false)
+  })
+
   it('binds the latest receipt to the same installation and tenant', async () => {
     const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
     const foreign = await insertInstallationLifecycle(db, {
@@ -579,6 +632,46 @@ describe('addon migration constraints', () => {
     expect(() => insertNonTransitionReceipt(db, installation, { side_effect_ids: '[1]' })).toThrow()
     expect(() => insertNonTransitionReceipt(db, installation, { checks: '[]' })).toThrow()
     expect(() => insertNonTransitionReceipt(db, installation, { checks: '{' })).toThrow()
+  })
+
+  it('rejects INSERT OR REPLACE for an existing standalone receipt with recursive triggers off', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    const receiptId = crypto.randomUUID()
+    insertNonTransitionReceipt(db, db.installations()[0], { id: receiptId, actor_id: 'standalone-actor' })
+    const receipt = db.receipts().find((row) => row.id === receiptId)
+    if (!receipt) throw new Error('expected standalone receipt')
+
+    expect(db.harness.sqlite.prepare('PRAGMA recursive_triggers').get()).toMatchObject({ recursive_triggers: 0 })
+    expect(() => db.harness.sqlite.prepare(`
+      INSERT OR REPLACE INTO addon_receipts (
+        id, tenant, installation_id, action, previous_state, next_state,
+        addon_key, installed_version, publisher, trust_class,
+        mupot_compatibility, manifest_sha256, actor_id, outcome,
+        side_effect_ids, checks, error_code, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'rewritten-actor', ?, ?, ?, ?, ?)
+    `).run(
+      receipt.id,
+      receipt.tenant,
+      receipt.installation_id,
+      receipt.action,
+      receipt.previous_state,
+      receipt.next_state,
+      receipt.addon_key,
+      receipt.installed_version,
+      receipt.publisher,
+      receipt.trust_class,
+      receipt.mupot_compatibility,
+      receipt.manifest_sha256,
+      receipt.outcome,
+      receipt.side_effect_ids,
+      receipt.checks,
+      receipt.error_code,
+      receipt.created_at,
+    )).toThrow()
+
+    expect(db.receipts().find((row) => row.id === receiptId)).toMatchObject({
+      actor_id: 'standalone-actor',
+    })
   })
 
   it('rolls back a transition receipt whose identity snapshot does not match the installation', async () => {

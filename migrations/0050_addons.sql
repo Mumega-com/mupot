@@ -65,6 +65,22 @@ BEGIN
   SELECT RAISE(ABORT, 'addon state transition requires a new receipt');
 END;
 
+CREATE TRIGGER IF NOT EXISTS addon_installations_state_requires_stored_latest_receipt
+  BEFORE UPDATE OF state ON addon_installations
+  WHEN NEW.state <> OLD.state AND NOT EXISTS (
+    SELECT 1
+      FROM addon_receipts AS receipt
+     WHERE receipt.id = OLD.latest_receipt_id
+       AND receipt.installation_id = OLD.id
+       AND receipt.tenant = OLD.tenant
+       AND receipt.actor_id = OLD.latest_actor_id
+       AND receipt.previous_state IS OLD.latest_previous_state
+       AND receipt.next_state = OLD.state
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'addon state transition requires its prior receipt');
+END;
+
 CREATE TRIGGER IF NOT EXISTS addon_installations_state_requires_fresh_receipt
   BEFORE UPDATE OF state ON addon_installations
   WHEN NEW.state <> OLD.state AND EXISTS (
@@ -222,6 +238,13 @@ CREATE TABLE IF NOT EXISTS addon_receipts (
 
 CREATE INDEX IF NOT EXISTS idx_addon_receipts_installation
   ON addon_receipts (tenant, installation_id, created_at DESC);
+
+CREATE TRIGGER IF NOT EXISTS addon_receipts_no_duplicate_id
+  BEFORE INSERT ON addon_receipts
+  WHEN EXISTS (SELECT 1 FROM addon_receipts WHERE id = NEW.id)
+BEGIN
+  SELECT RAISE(ABORT, 'addon receipt IDs are immutable');
+END;
 
 CREATE TRIGGER IF NOT EXISTS addon_receipts_side_effect_ids_are_strings
   BEFORE INSERT ON addon_receipts
