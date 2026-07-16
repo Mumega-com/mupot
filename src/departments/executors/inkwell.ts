@@ -28,9 +28,31 @@
 // branch — kernel.ts's domain-agnostic dispatch discipline (see collectors/seo-meta-fix.ts
 // "WHY NO KERNEL.TS CHANGE") is preserved; kernel.ts still dispatches purely on
 // payload.executor === 'inkwell-content', now calling this one extra layer of indirection.
+//
+// #370 SLICE A (CMS-adapter port, behavior-identical refactor): the CMS-agnostic parts of
+// the merge logic above — the title/description/content branch logic, the fetch-then-merge
+// orchestration, and the redirect-refusing fetch wrapper — now live in
+// executors/shared/cms-adapter.ts as the CmsAdapter port + cmsContentApplyWrite
+// orchestrator. This file is a thin CmsAdapter implementation over that module:
+// fetchCurrentAdapter/applyChangeAdapter/writeAdapter below wire fetchInkwellContent /
+// mergeContentUpdate / postPublishBody (all still exported below, unchanged, still
+// directly tested) into the shared shape. Every export below keeps its exact name,
+// signature, and behavior — see PR/gate notes for the parity claim.
 
 import { assertPublicHttpsUrl } from '../../lib/ssrf'
 import { classifyChangeType, isKnownChangeType, type CroChangeType } from '../change-types'
+import {
+  cmsContentApplyWrite,
+  cmsFetch,
+  mergeByChangeType,
+  resolveCmsFetch,
+  type CmsAdapter,
+  type CmsChangeRequest,
+  type ContentMergeDiff,
+  type FetchedContent,
+} from './shared/cms-adapter'
+
+export type { ContentMergeDiff }
 
 export interface InkwellExecutorConfig {
   /** Inkwell API origin, e.g. https://inkwell-api.mumega.com (https, public host). */
@@ -171,10 +193,11 @@ function assertSafeInkwellUrl(apiUrl: string): URL {
 /**
  * Fetch precedence shared by every function in this file: an explicit fetchImpl
  * (tests) wins; otherwise the service binding (cfg.fetcher) when present (same-zone
- * 522 avoidance); else global fetch.
+ * 522 avoidance); else global fetch. Delegates to the shared resolveCmsFetch — #370
+ * Slice A: this precedence chain is CMS-agnostic, hoisted to shared/cms-adapter.ts.
  */
 function resolveFetch(cfg: InkwellExecutorConfig, fetchImpl?: typeof fetch): typeof fetch {
-  return fetchImpl ?? (cfg.fetcher ? (cfg.fetcher.fetch.bind(cfg.fetcher) as typeof fetch) : fetch)
+  return resolveCmsFetch(cfg.fetcher, fetchImpl)
 }
 
 /**
@@ -184,6 +207,11 @@ function resolveFetch(cfg: InkwellExecutorConfig, fetchImpl?: typeof fetch): typ
  * report hook needed), refuses redirects outright, and returns the raw Response for
  * the caller to interpret (a GET treats 404 as a valid "not found" outcome; a POST
  * treats any non-ok as a hard error) — never follows a redirect, never retries.
+ *
+ * #370 Slice A: the redirect-refusing fetch mechanics (redirect:'manual' +
+ * opaqueredirect/3xx refusal) now live in the shared cmsFetch helper
+ * (shared/cms-adapter.ts) — this function only supplies the inkwell-specific base
+ * URL, auth header, and error reasons/messages.
  */
 async function doInkwellFetch(
   cfg: InkwellExecutorConfig,
@@ -192,9 +220,11 @@ async function doInkwellFetch(
   init: { method: 'GET' | 'POST'; headers?: Record<string, string>; body?: string },
 ): Promise<Response> {
   const base = assertSafeInkwellUrl(cfg.apiUrl)
-  let res: Response
-  try {
-    res = await doFetch(`${base.origin}${path}`, {
+  return cmsFetch(
+    base.origin,
+    doFetch,
+    path,
+    {
       method: init.method,
       headers: {
         authorization: `Bearer ${cfg.token}`,
@@ -202,31 +232,13 @@ async function doInkwellFetch(
         ...init.headers,
       },
       body: init.body,
-      // SSRF defense-in-depth (LOW-1, adversarial gate, mupot#370 delta): assertSafeInkwellUrl
-      // only validates apiUrl at PARSE time. Without redirect:'manual', a default 'follow'
-      // fetch would silently chase a 3xx from cfg.apiUrl to an arbitrary Location — including
-      // an internal host — and this function would never see it (it only inspects the FINAL
-      // response). redirect:'manual' stops at the first hop so the check below can refuse it.
-      redirect: 'manual',
-    })
-  } catch (e) {
-    throw new InkwellExecutorError('inkwell_unreachable', String(e))
-  }
-
-  // Refuse any redirect outright — never follow. Covers both the explicit 3xx-status
-  // shape (what Cloudflare Workers' fetch actually returns for redirect:'manual') and
-  // the browser-style opaqueredirect shape (status 0, type 'opaqueredirect'), so this
-  // holds regardless of runtime. No Location is ever read or logged — we don't need
-  // it to refuse.
-  // `as string`: @cloudflare/workers-types narrows Response.type to "default"|"error"
-  // (Workers' redirect:'manual' never produces an opaque redirect — it returns the
-  // real 3xx), but this file also runs under vitest/undici in tests, where a mocked
-  // Response can carry 'opaqueredirect'. Widen the comparison rather than the type.
-  const resType = res.type as string
-  if (resType === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
-    throw new InkwellExecutorError('inkwell_redirect_blocked', 'refusing to follow a redirect from apiUrl')
-  }
-  return res
+    },
+    {
+      unreachable: (detail) => new InkwellExecutorError('inkwell_unreachable', detail),
+      redirectBlocked: () =>
+        new InkwellExecutorError('inkwell_redirect_blocked', 'refusing to follow a redirect from apiUrl'),
+    },
+  )
 }
 
 /** POST a fully-formed PublishBody and parse the standard { ok, slug, url } response. */
@@ -358,26 +370,9 @@ function toCroApplyMergePayload(payload: unknown): CroApplyMergePayload | null {
   return { executor: 'inkwell-content', mode: 'cro-apply-merge', slug, changeType: p.changeType, value, findText }
 }
 
-/** Records the audit-trail diff a CRO apply write produced — the RECEIPT's payload. */
-export interface ContentMergeDiff {
-  changeType: CroChangeType
-  field: 'title' | 'description' | 'content'
-  before: string
-  after: string
-}
-
-function countOccurrences(haystack: string, needle: string): number {
-  if (!needle) return 0
-  let count = 0
-  let idx = 0
-  for (;;) {
-    const found = haystack.indexOf(needle, idx)
-    if (found === -1) break
-    count += 1
-    idx = found + needle.length
-  }
-  return count
-}
+// ContentMergeDiff is now defined in shared/cms-adapter.ts and re-exported above
+// (`export type { ContentMergeDiff }`) — #370 Slice A. Same shape, same name, one
+// definition instead of a CMS-specific copy.
 
 /**
  * Apply ONE targeted field change from `merge` onto `current`, returning the FULL
@@ -387,6 +382,14 @@ function countOccurrences(haystack: string, needle: string): number {
  * receipt. PURE — no I/O, no throw on the happy path; throws InkwellExecutorError
  * only for an ambiguous/absent cta_text|internal_links replace target (fail-closed:
  * an ambiguous edit target must never silently pick "the first match").
+ *
+ * #370 Slice A: the branch logic itself (title/description/content merge by
+ * changeType, the fail-closed findText handling, the function-replacer fix) now
+ * lives in the shared, CMS-agnostic mergeByChangeType (shared/cms-adapter.ts). This
+ * function is the inkwell-specific glue: it supplies Inkwell's `base` write-body
+ * fields (slug/author/tags/status/overwrite) and InkwellExecutorError as the error
+ * constructor, so behavior — including exact .reason strings and messages — is
+ * unchanged.
  */
 export function mergeContentUpdate(
   current: FetchedInkwellContent,
@@ -400,77 +403,95 @@ export function mergeContentUpdate(
     status: current.status,
     overwrite: true as const,
   }
-
-  // meta_title / headline: both target Inkwell's single `title` field — see the
-  // SCHEMA NOTE in change-types.ts for why these two change-types collide on one
-  // field. The article body and every other field pass through UNTOUCHED.
-  if (merge.changeType === 'meta_title' || merge.changeType === 'headline') {
-    return {
-      body: { ...base, title: merge.value, content: current.content, description: current.description },
-      diff: { changeType: merge.changeType, field: 'title', before: current.title, after: merge.value },
-    }
+  const change: CmsChangeRequest = {
+    changeType: merge.changeType,
+    value: merge.value,
+    findText: merge.findText,
   }
-
-  if (merge.changeType === 'meta_description') {
-    return {
-      body: { ...base, title: current.title, content: current.content, description: merge.value },
-      diff: { changeType: merge.changeType, field: 'description', before: current.description, after: merge.value },
-    }
-  }
-
-  // body_copy: an intentional, full replace of the article body — this IS the whole
-  // field the change-type names (still merged: title/description/tags/author/status
-  // all pass through from `current` untouched).
-  if (merge.changeType === 'body_copy') {
-    return {
-      body: { ...base, title: current.title, content: merge.value, description: current.description },
-      diff: { changeType: merge.changeType, field: 'content', before: current.content, after: merge.value },
-    }
-  }
-
-  // cta_text / internal_links: a substring replace WITHIN the body (no separate field
-  // exists for either — see change-types.ts SCHEMA NOTE). Fail-closed on an absent or
-  // ambiguous target: never guess which occurrence, never no-op silently.
-  if (!merge.findText) {
-    throw new InkwellExecutorError(
-      'merge_target_missing',
-      `${merge.changeType} requires findText (the current substring to replace)`,
-    )
-  }
-  const occurrences = countOccurrences(current.content, merge.findText)
-  if (occurrences === 0) {
-    throw new InkwellExecutorError(
-      'merge_target_not_found',
-      `${merge.changeType}: findText not present in the current article body`,
-    )
-  }
-  if (occurrences > 1) {
-    throw new InkwellExecutorError(
-      'merge_target_ambiguous',
-      `${merge.changeType}: findText matches ${occurrences} locations in the body — refusing an ambiguous replace`,
-    )
-  }
-  // Function replacer (never a string replacer): a string second argument to
-  // String.replace interprets $$, $&, $`, $' as special replacement patterns —
-  // merge.value is caller/agent-composed content, not a regex-replacement
-  // template, so a value containing e.g. '$$' or '$`' would silently get
-  // pattern-expanded, corrupting the written body AND desyncing the receipt
-  // (the receipt records the raw merge.value in `diff.after`, but the article
-  // would carry the expanded string — an audit-integrity violation, canonical
-  // sensitive surface #3: audit chain integrity). A function replacer returns
-  // its value verbatim, no pattern interpretation, so what's written always
-  // equals what the receipt records.
-  const mergedContent = current.content.replace(merge.findText, () => merge.value)
-  return {
-    body: { ...base, title: current.title, content: mergedContent, description: current.description },
-    diff: { changeType: merge.changeType, field: 'content', before: merge.findText, after: merge.value },
-  }
+  return mergeByChangeType(base, current, change, (reason, message) => new InkwellExecutorError(reason, message))
 }
 
 // ── CRO apply-bridge: the merge write orchestrator ────────────────────────────
 
 export interface InkwellApplyWriteResult extends InkwellWriteResult {
   diff: ContentMergeDiff
+}
+
+/**
+ * Translate the real fetch result (FetchedInkwellContent, with Inkwell's
+ * author/tags fields) into the shared, CMS-agnostic FetchedContent shape. `ref`
+ * carries the slug forward — FetchedContent has no author/tags field of its own
+ * (those are CMS-specific), so they go in `raw` and applyChangeAdapter unpacks
+ * them back out via fetchedContentToInkwell below.
+ */
+async function fetchCurrentAdapter(
+  cfg: InkwellExecutorConfig,
+  ref: string,
+  fetchImpl?: typeof fetch,
+): Promise<FetchedContent | null> {
+  const current = await fetchInkwellContent(cfg, ref, fetchImpl)
+  if (!current) return null
+  return {
+    ref,
+    title: current.title,
+    description: current.description,
+    content: current.content,
+    status: current.status,
+    raw: { author: current.author, tags: current.tags },
+  }
+}
+
+/** Inverse of fetchCurrentAdapter's `raw` packing — reconstructs a FetchedInkwellContent so applyChangeAdapter can reuse mergeContentUpdate as the single source of merge truth. */
+function fetchedContentToInkwell(current: FetchedContent): FetchedInkwellContent {
+  const author = typeof current.raw?.author === 'string' ? current.raw.author : ''
+  const tags = Array.isArray(current.raw?.tags)
+    ? current.raw.tags.filter((t): t is string => typeof t === 'string')
+    : []
+  const status: FetchedInkwellContent['status'] =
+    current.status === 'published' || current.status === 'archived' ? current.status : 'draft'
+  return { title: current.title, description: current.description, author, tags, status, content: current.content }
+}
+
+/** CmsAdapter.applyChange for Inkwell — thin glue over mergeContentUpdate (kept as the single, directly-tested merge entry point). */
+function applyChangeAdapter(
+  current: FetchedContent,
+  change: CmsChangeRequest,
+): { body: PublishBody; diff: ContentMergeDiff } {
+  const merge: CroApplyMergePayload = {
+    executor: 'inkwell-content',
+    mode: 'cro-apply-merge',
+    slug: current.ref,
+    changeType: change.changeType,
+    value: change.value,
+    findText: change.findText,
+  }
+  return mergeContentUpdate(fetchedContentToInkwell(current), merge)
+}
+
+/** CmsAdapter.write for Inkwell — the merge write always full-replaces via postPublishBody, same as the create/full-replace path. `ref` is already carried inside `body.slug`. */
+async function writeAdapter(
+  cfg: InkwellExecutorConfig,
+  _ref: string,
+  body: PublishBody,
+  fetchImpl?: typeof fetch,
+): Promise<InkwellWriteResult> {
+  return postPublishBody(cfg, body, fetchImpl)
+}
+
+/**
+ * Builds the InkwellExecutorConfig CmsAdapter, closing over `fetchImpl` (the port's
+ * fetchCurrent/write signatures take no fetchImpl param — it's a test-only injection
+ * point, so it's captured in the closure per call instead of threaded through the
+ * generic port).
+ */
+function makeInkwellAdapter(
+  fetchImpl?: typeof fetch,
+): CmsAdapter<InkwellExecutorConfig, PublishBody, InkwellWriteResult> {
+  return {
+    fetchCurrent: (cfg, ref) => fetchCurrentAdapter(cfg, ref, fetchImpl),
+    applyChange: applyChangeAdapter,
+    write: (cfg, ref, body) => writeAdapter(cfg, ref, body, fetchImpl),
+  }
 }
 
 /**
@@ -485,6 +506,13 @@ export interface InkwellApplyWriteResult extends InkwellWriteResult {
  * should be structurally unreachable (toCroApplyMergePayload already gates on
  * isKnownChangeType), but the re-check costs nothing and closes the class of bug
  * regardless of how the payload got here.
+ *
+ * #370 Slice A: the fetch→refuse-on-missing→merge→write orchestration itself now
+ * lives in the shared cmsContentApplyWrite (shared/cms-adapter.ts); this function
+ * does the inkwell-specific config/payload/allowlist validation (unchanged, same
+ * order, same reasons/messages) and then dispatches through the shared orchestrator
+ * via makeInkwellAdapter — the concrete proof this is a real CmsAdapter, not just a
+ * same-shaped duplicate.
  */
 export async function inkwellContentApplyWrite(
   cfg: InkwellExecutorConfig,
@@ -505,21 +533,15 @@ export async function inkwellContentApplyWrite(
     )
   }
 
-  // FAIL-CLOSED FETCH-THEN-MERGE: a thrown fetch error propagates as-is (already an
-  // InkwellExecutorError); a 404 (null) refuses explicitly. Neither path reaches the
-  // write call below — there is no code path from "could not read current content"
-  // to "write anyway".
-  const current = await fetchInkwellContent(cfg, merge.slug, fetchImpl)
-  if (!current) {
-    throw new InkwellExecutorError(
+  const change: CmsChangeRequest = { changeType: merge.changeType, value: merge.value, findText: merge.findText }
+  return cmsContentApplyWrite(makeInkwellAdapter(fetchImpl), cfg, merge.slug, change, (ref) => {
+    // Matches the original inline throw exactly — same reason, same message shape
+    // (only the source of `ref` differs syntactically: it's `merge.slug` either way).
+    return new InkwellExecutorError(
       'merge_source_not_found',
-      `fetch-then-merge: no existing content at slug '${merge.slug}' to merge into`,
+      `fetch-then-merge: no existing content at slug '${ref}' to merge into`,
     )
-  }
-
-  const { body, diff } = mergeContentUpdate(current, merge)
-  const written = await postPublishBody(cfg, body, fetchImpl)
-  return { ...written, diff }
+  })
 }
 
 /**
