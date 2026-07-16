@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
   classify,
   humanAge,
@@ -7,6 +7,7 @@ import {
   resolveFleetSender,
   resolveFleetOpsAgent,
   fleetScoped,
+  loadFleet,
 } from '../src/dashboard/fleet'
 import type { Env } from '../src/types'
 
@@ -89,6 +90,41 @@ describe('resolveFleetOpsAgent', () => {
   })
   it('digid pot routes control to its own ops agent, never kasra', () => {
     expect(resolveFleetOpsAgent({ FLEET_OPS_AGENT: 'digid' } as Env)).not.toBe('kasra')
+  })
+})
+
+// ── env-overridable bus URL (de-mumega-ify #4: already correct pre-existing,
+// this locks it in with an explicit test). DEFAULT_BUS_URL is only a fallback —
+// env.BUS_URL, when set, wins; unset ⇒ byte-identical default host.
+describe('loadFleet — bus URL resolution', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('hits the default bus.mumega.com host when BUS_URL is unset', async () => {
+    const calls: string[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        calls.push(String(url))
+        return new Response(JSON.stringify({ fleet: [] }), { status: 200 })
+      }),
+    )
+    await loadFleet({ BUS_TOKEN: 'x' } as Env, 0)
+    expect(calls).toEqual(['https://bus.mumega.com/fleet'])
+  })
+
+  it('hits the fork-provided BUS_URL when set', async () => {
+    const calls: string[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        calls.push(String(url))
+        return new Response(JSON.stringify({ fleet: [] }), { status: 200 })
+      }),
+    )
+    await loadFleet({ BUS_TOKEN: 'x', BUS_URL: 'https://bus.forkedpot.example/' } as Env, 0)
+    expect(calls).toEqual(['https://bus.forkedpot.example/fleet'])
   })
 })
 

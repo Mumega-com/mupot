@@ -78,6 +78,24 @@ export interface Env {
   // against its OWN hostname. Unset ⇒ default HANDOFF_AUD ('mupot.mumega.com'),
   // correct only for mumega#0. Every other pot MUST set this to its host.
   MUPOT_HANDOFF_AUD?: string
+  // The login-handoff issuer THIS pot trusts. Unset ⇒ default HANDOFF_ISS
+  // ('https://mumega.com'). ONLY set this if you also run your own handoff-claim
+  // MINTING side (a different issuer) with a matching public key — overriding
+  // this without matching the minting side breaks handoff (every claim gets
+  // rejected as wrong_iss; fails safe, never permissive).
+  MUPOT_HANDOFF_ISS?: string
+  // Sidebar "Switch pot →" cross-tenant picker link. Unset ⇒ mumega's own
+  // console (byte-identical to pre-#de-mumega-ify behavior). A forked pot
+  // MUST set this to its own picker/home, or unset it entirely if it has
+  // none — otherwise its users get sent to mumega's site.
+  CONSOLE_SWITCH_POT_URL?: string
+  // Domain for an agent-authored commit's email local part (baked into the
+  // CUSTOMER's git history via github-execute.ts). Unset ⇒ 'agents.mumega.com'.
+  AGENT_COMMIT_EMAIL_DOMAIN?: string
+  // Reseller-pot owner-walk link host suffix (src/reseller/provision.ts's
+  // DEFAULT_POT_HOST_SUFFIX), passed as a planner opt — never read from client
+  // request input. Unset ⇒ 'mupot.mumega.com'.
+  DEFAULT_POT_HOST_SUFFIX?: string
   // fleet window: SOS bus bridge REST
   BUS_URL?: string
   // fleet scoping (Flock #43): which bus project this pot's fleet addresses, and

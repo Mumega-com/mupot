@@ -75,7 +75,7 @@ resellerApp.post('/provision-plan', async (c) => {
     )
   }
 
-  const result = planResellerTenant(body)
+  const result = planResellerTenant(body, { potHostSuffix: c.env.DEFAULT_POT_HOST_SUFFIX })
   if (!result.ok) {
     return c.json({ ok: false, reason: result.reason, detail: result.detail }, 422)
   }

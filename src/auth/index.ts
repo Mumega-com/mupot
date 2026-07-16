@@ -444,11 +444,13 @@ authApp.get('/handoff', async (c) => {
   // aud: mumega mints the claim with aud = THIS pot's dashboard_url hostname
   // (#yp-aud-gap), so we verify against our own MUPOT_HANDOFF_AUD. Passing undefined
   // (var unset) falls through to the HANDOFF_AUD default — correct for mumega#0 only.
+  // iss: same shape via MUPOT_HANDOFF_ISS — unset falls through to HANDOFF_ISS.
   const res = await verifyHandoffClaim(
     env.MUPOT_HANDOFF_PUBLIC_KEY,
     token,
     undefined,
     env.MUPOT_HANDOFF_AUD,
+    env.MUPOT_HANDOFF_ISS,
   )
   if (!res.ok || !res.claim) return c.redirect('/auth/login')
 
@@ -510,7 +512,13 @@ authApp.get('/presence', async (c) => {
   const token = c.req.query('token')
   if (!token) return c.json({ ok: false }, 401)
   const expectedAud = `presence:${c.env.TENANT_SLUG}`
-  const res = await verifyHandoffClaim(c.env.MUPOT_HANDOFF_PUBLIC_KEY, token, undefined, expectedAud)
+  const res = await verifyHandoffClaim(
+    c.env.MUPOT_HANDOFF_PUBLIC_KEY,
+    token,
+    undefined,
+    expectedAud,
+    c.env.MUPOT_HANDOFF_ISS,
+  )
   if (!res.ok || !res.claim) return c.json({ ok: false }, 401)
   const raw = await c.env.SESSIONS.get(await presenceKey(res.claim.email))
   let since: number | null = null

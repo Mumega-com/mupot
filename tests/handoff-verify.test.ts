@@ -3,7 +3,7 @@
 // mumega in prod), and asserts the pot accepts a good claim + rejects every bad path.
 
 import { describe, expect, it, beforeAll } from 'vitest'
-import { verifyHandoffClaim, HANDOFF_AUD } from '../src/auth/handoff-verify'
+import { verifyHandoffClaim, HANDOFF_AUD, HANDOFF_ISS } from '../src/auth/handoff-verify'
 
 const NOW = 1_800_000_000
 
@@ -196,6 +196,59 @@ describe('pot handoff-verify', () => {
       const r = await verifyHandoffClaim(pubJwk, t, NOW + 1, VIAMAR_AUD)
       expect(r.ok).toBe(false)
       expect(r.reason).toBe('wrong_aud')
+    })
+  })
+
+  // ── env-overridable issuer (de-mumega-ify #5): a fork that runs its own mumega-
+  // equivalent minting service must be able to point handoff-verify at ITS issuer.
+  // These lock the same safety shape already proven for aud: unset/empty override
+  // ⇒ current hardcoded default, byte-identical to pre-change behavior — NEVER
+  // "accept any issuer".
+  describe('env-overridable issuer (MUPOT_HANDOFF_ISS)', () => {
+    const FORK_ISS = 'https://console.forkedpot.example'
+
+    it('mumega#0 still verifies under the default iss when MUPOT_HANDOFF_ISS is unset (byte-identical)', async () => {
+      // The route passes env.MUPOT_HANDOFF_ISS; undefined ⇒ default HANDOFF_ISS.
+      const t = await sign(priv, baseClaim())
+      const r = await verifyHandoffClaim(pubJwk, t, NOW + 1, undefined, undefined)
+      expect(r.ok).toBe(true)
+    })
+
+    it('rejects the default-iss claim once a fork overrides expectedIss (mismatched mint/verify)', async () => {
+      const t = await sign(priv, baseClaim({ iss: HANDOFF_ISS }))
+      const r = await verifyHandoffClaim(pubJwk, t, NOW + 1, undefined, FORK_ISS)
+      expect(r.ok).toBe(false)
+      expect(r.reason).toBe('wrong_iss')
+    })
+
+    it('accepts a fork-issuer claim when expectedIss = MUPOT_HANDOFF_ISS (mint/verify match)', async () => {
+      const t = await sign(priv, baseClaim({ iss: FORK_ISS }))
+      const r = await verifyHandoffClaim(pubJwk, t, NOW + 1, undefined, FORK_ISS)
+      expect(r.ok).toBe(true)
+    })
+
+    it('an empty-string override falls back to the default iss, never accept-any', async () => {
+      // A misconfigured '' (as opposed to genuinely unset) must NOT disable the iss check.
+      const evilClaim = await sign(priv, baseClaim({ iss: 'https://attacker.example' }))
+      const r1 = await verifyHandoffClaim(pubJwk, evilClaim, NOW + 1, undefined, '')
+      expect(r1.ok).toBe(false)
+      expect(r1.reason).toBe('wrong_iss')
+
+      // And the real default-issuer claim still verifies under the '' → default fallback.
+      const goodClaim = await sign(priv, baseClaim({ iss: HANDOFF_ISS }))
+      const r2 = await verifyHandoffClaim(pubJwk, goodClaim, NOW + 1, undefined, '')
+      expect(r2.ok).toBe(true)
+    })
+
+    it('an empty-string aud override falls back to the default aud, never accept-any', async () => {
+      const evilClaim = await sign(priv, baseClaim({ aud: 'anything-attacker-picks' }))
+      const r1 = await verifyHandoffClaim(pubJwk, evilClaim, NOW + 1, '')
+      expect(r1.ok).toBe(false)
+      expect(r1.reason).toBe('wrong_aud')
+
+      const goodClaim = await sign(priv, baseClaim({ aud: HANDOFF_AUD }))
+      const r2 = await verifyHandoffClaim(pubJwk, goodClaim, NOW + 1, '')
+      expect(r2.ok).toBe(true)
     })
   })
 })
