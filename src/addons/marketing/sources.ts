@@ -153,7 +153,7 @@ function captureInputArray(input: unknown, maxLength: number): CapturedInputArra
   }
 }
 
-function cloneObservationValue(value: unknown): unknown {
+function cloneObservationValue(value: unknown, source: SourceIdentity): unknown {
   if (typeof value !== 'object' || value === null || isArrayIntrinsic(value)) return value
   const observation = value as Record<string, unknown>
   return freezeIntrinsic({
@@ -164,6 +164,8 @@ function cloneObservationValue(value: unknown): unknown {
     unit: observation.unit,
     authority: observation.authority,
     observedAt: observation.observedAt,
+    sourceKey: source.key,
+    sourceSlot: source.slot,
   })
 }
 
@@ -567,7 +569,7 @@ export async function collectMarketingSnapshots(
       const clonedObservations: unknown[] = []
       let observationFailure: ObservationFailureReason | null = null
       for (let index = 0; index < copiedObservations.length; index += 1) {
-        const cloned = cloneObservationValue(copiedObservations[index])
+        const cloned = cloneObservationValue(copiedObservations[index], sourceIdentity)
         const failure = observationFailureReason(cloned, bounds, bindingAuthority)
         if (failure) {
           observationFailure = failure

@@ -95,7 +95,7 @@ export interface ResolvedAddonBinding {
   readonly connectorId: string | null
 }
 
-export interface MonitorObservation {
+export interface SourceObservation {
   readonly id: string
   readonly runId: string
   readonly metricKey: MarketingMonitorMetricKey
@@ -105,11 +105,16 @@ export interface MonitorObservation {
   readonly observedAt: string
 }
 
+export interface MonitorObservation extends SourceObservation {
+  readonly sourceKey: string
+  readonly sourceSlot: string
+}
+
 export type SourceStatus = 'available' | 'unavailable' | 'failed'
 
 export interface SourceSnapshot {
   readonly status: SourceStatus
-  readonly observations: readonly MonitorObservation[]
+  readonly observations: readonly SourceObservation[]
   readonly reason?: string
 }
 
@@ -144,4 +149,28 @@ export interface MarketingOutcomes {
   readonly leads: OutcomeValue
   readonly conversion: OutcomeValue
   readonly revenue: OutcomeValue
+}
+
+export interface MarketingMonitorRunSource {
+  readonly key: string
+  readonly slot: string
+  readonly status: SourceStatus
+  readonly reason?: string
+  readonly observationCount: number
+}
+
+export interface MarketingMonitorRun {
+  readonly id: string
+  readonly programVersion: string
+  readonly status: 'completed'
+  readonly window: MonitorWindow
+  readonly sourceCount: number
+  readonly observationCount: number
+  readonly rawObservationCount: number
+  readonly sources: readonly MarketingMonitorRunSource[]
+  readonly observations: readonly MonitorObservation[]
+  readonly outcomes: MarketingOutcomes
+  readonly evidenceDigest: string
+  readonly createdAt: string
+  readonly completedAt: string
 }

@@ -85,6 +85,8 @@ function observation(overrides: Partial<MonitorObservation> = {}): MonitorObserv
     unit: 'count',
     authority: 'first-party',
     observedAt: '2026-07-16T12:00:00.000Z',
+    sourceKey: 'analytics',
+    sourceSlot: 'web_analytics',
     ...overrides,
   }
 }
@@ -200,7 +202,7 @@ describe('collectMarketingSnapshots', () => {
 
     const snapshot = await collectMarketingSnapshots(env, bindings, window, [failed, healthy])
 
-    expect(snapshot.observations).toEqual([observation({ id: 'evidence-2' })])
+    expect(snapshot.observations).toEqual([observation({ id: 'evidence-2', sourceKey: 'second' })])
     expect(snapshot.sources).toEqual([
       { key: 'analytics', slot: 'web_analytics', status: 'failed', reason: 'source_read_failed', observationCount: 0 },
       { key: 'second', slot: 'web_analytics', status: 'available', observationCount: 1 },
@@ -425,7 +427,7 @@ describe('collectMarketingSnapshots', () => {
       { key: 'source_config_0', slot: 'unconfigured', status: 'failed', reason: 'invalid_source_configuration', observationCount: 0 },
       { key: 'healthy', slot: 'web_analytics', status: 'available', observationCount: 1 },
     ])
-    expect(snapshot.observations).toEqual([observation({ id: 'healthy-evidence' })])
+    expect(snapshot.observations).toEqual([observation({ id: 'healthy-evidence', sourceKey: 'healthy' })])
     expect(JSON.stringify(snapshot)).not.toContain('index secret')
   })
 
@@ -691,7 +693,7 @@ describe('collectMarketingSnapshots', () => {
       { key: 'observation-getter', slot: 'web_analytics', status: 'failed', reason: 'invalid_source_snapshot', observationCount: 0 },
       { key: 'healthy', slot: 'web_analytics', status: 'available', observationCount: 1 },
     ])
-    expect(snapshot.observations).toEqual([observation({ id: 'healthy-evidence' })])
+    expect(snapshot.observations).toEqual([observation({ id: 'healthy-evidence', sourceKey: 'healthy' })])
     expect(JSON.stringify(snapshot)).not.toContain('secret')
   })
 
@@ -788,7 +790,7 @@ describe('collectMarketingSnapshots', () => {
       { key: 'source_config_2', slot: 'unconfigured', status: 'failed', reason: 'invalid_source_configuration', observationCount: 0 },
       { key: 'healthy', slot: 'web_analytics', status: 'available', observationCount: 1 },
     ])
-    expect(snapshot.observations).toEqual([observation({ id: 'healthy-evidence' })])
+    expect(snapshot.observations).toEqual([observation({ id: 'healthy-evidence', sourceKey: 'healthy' })])
     expect(JSON.stringify(snapshot)).not.toContain('getter secret')
   })
 
@@ -1190,12 +1192,47 @@ describe('collectMarketingSnapshots', () => {
     ])
 
     expect(snapshot.runId).toBe('run-1')
-    expect(snapshot.observations).toEqual([observation({ id: 'global-id' })])
+    expect(snapshot.observations).toEqual([observation({ id: 'global-id', sourceKey: 'first' })])
     expect(snapshot.sources[1]).toMatchObject({
       status: 'failed',
       reason: 'duplicate_observation_id',
       observationCount: 0,
     })
+  })
+
+  it('adds collector-owned source attribution to normalized observations', async () => {
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      source('attributed_source', 'web_analytics', async () => available([
+        observation({ id: 'attributed' }),
+      ])),
+    ])
+
+    expect(snapshot.observations).toEqual([
+      expect.objectContaining({
+        id: 'attributed',
+        sourceKey: 'attributed_source',
+        sourceSlot: 'web_analytics',
+      }),
+    ])
+  })
+
+  it('does not let raw source values assert normalized source attribution', async () => {
+    const raw = {
+      ...observation({ id: 'spoofed-attribution' }),
+      sourceKey: 'forged_source',
+      sourceSlot: 'crm',
+    }
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      source('trusted_source', 'web_analytics', async () => available([raw])),
+    ])
+
+    expect(snapshot.observations[0]).toEqual(expect.objectContaining({
+      sourceKey: 'trusted_source',
+      sourceSlot: 'web_analytics',
+    }))
+    expect(snapshot.observations[0]).not.toEqual(expect.objectContaining({
+      sourceKey: 'forged_source',
+    }))
   })
 
   it('rejects a source with a different runId as a whole without partial acceptance', async () => {
@@ -1208,7 +1245,7 @@ describe('collectMarketingSnapshots', () => {
     ])
 
     expect(snapshot.runId).toBe('run-1')
-    expect(snapshot.observations).toEqual([observation({ id: 'first-id' })])
+    expect(snapshot.observations).toEqual([observation({ id: 'first-id', sourceKey: 'first' })])
     expect(snapshot.sources[1]).toMatchObject({
       status: 'failed',
       reason: 'run_id_mismatch',

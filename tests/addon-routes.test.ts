@@ -18,6 +18,7 @@ const migrations = [
   '../migrations/0043_member_tokens_tenant.sql',
   '../migrations/0050_addons.sql',
   '../migrations/0052_addon_bindings.sql',
+  '../migrations/0053_marketing_monitor_runs.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 function envForRole(harness: SqliteD1Harness, role: 'owner' | 'admin' | 'member', tenant = 'tenant-a'): Env {
@@ -386,6 +387,83 @@ describe('addon lifecycle routes', () => {
     )
     expect(rejected.status).toBe(400)
     await expect(rejected.json()).resolves.toEqual({ error: 'invalid_body' })
+  })
+
+  it('exposes stable owner/admin monitor run, latest, and list routes with strict bodies', async () => {
+    const ownerEnv = envForRole(harness, 'owner')
+    harness.sqlite.prepare(`
+      INSERT INTO org_settings (key, value) VALUES ('billing_state', ?)
+    `).run(JSON.stringify({ tier: 'scale', event_id: 'route-monitor', effective_at: '2026-07-16T00:00:00.000Z' }))
+    for (const [action, body] of [
+      ['install', undefined],
+      ['configure', JSON.stringify({ bindings: [
+        { slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' },
+      ] })],
+      ['activate', undefined],
+    ] as const) {
+      const response = await addonsApp.fetch(request(`/marketing-cro-monitor/${action}`, 'POST', { body }), ownerEnv)
+      expect(response.status).toBeLessThan(300)
+    }
+
+    const monitorBody = JSON.stringify({ window: {
+      start: '2026-07-01T00:00:00.000Z',
+      end: '2026-07-01T23:59:59.999Z',
+    } })
+    const created = await addonsApp.fetch(
+      request('/marketing-cro-monitor/monitor', 'POST', { body: monitorBody }),
+      ownerEnv,
+    )
+    expect(created.status).toBe(201)
+    const createdBody = await created.json() as Record<string, unknown>
+    expect(createdBody).toEqual(expect.objectContaining({ ok: true, idempotent: false, run: expect.any(Object) }))
+
+    const latest = await addonsApp.fetch(request('/marketing-cro-monitor/monitor/latest', 'GET'), ownerEnv)
+    expect(latest.status).toBe(200)
+    const latestBody = await latest.json() as Record<string, unknown>
+    expect(latestBody).toEqual(expect.objectContaining({ run: expect.any(Object) }))
+
+    const listed = await addonsApp.fetch(request('/marketing-cro-monitor/monitor?limit=1', 'GET'), ownerEnv)
+    expect(listed.status).toBe(200)
+    const listedBody = await listed.json() as Record<string, unknown>
+    expect(listedBody).toEqual(expect.objectContaining({ runs: expect.any(Array) }))
+
+    const serialized = JSON.stringify({ createdBody, latestBody, listedBody })
+    for (const forbidden of ['connectorId', 'connector_id', 'configuredBy', 'actorId', 'rawPayload', 'secret', 'building']) {
+      expect(serialized).not.toContain(forbidden)
+    }
+  })
+
+  it.each([
+    ['configure body reuse', { bindings: [] }],
+    ['unknown root key', { window: { start: '2026-07-01T00:00:00.000Z', end: '2026-07-01T01:00:00.000Z' }, extra: true }],
+    ['non-canonical timestamp', { window: { start: '2026-07-01T00:00:00Z', end: '2026-07-01T01:00:00.000Z' } }],
+  ])('rejects malformed monitor payloads: %s', async (_label, payload) => {
+    const res = await addonsApp.fetch(
+      request('/marketing-cro-monitor/monitor', 'POST', { body: JSON.stringify(payload) }),
+      envForRole(harness, 'owner'),
+    )
+    expect(res.status).toBe(400)
+    await expect(res.json()).resolves.toEqual({ error: 'invalid_body' })
+  })
+
+  it('rejects member monitor writes and reads and invalid list limits', async () => {
+    const memberEnv = envForRole(harness, 'member')
+    for (const [path, method] of [
+      ['/marketing-cro-monitor/monitor', 'POST'],
+      ['/marketing-cro-monitor/monitor', 'GET'],
+      ['/marketing-cro-monitor/monitor/latest', 'GET'],
+    ] as const) {
+      const res = await addonsApp.fetch(request(path, method), memberEnv)
+      expect(res.status).toBe(403)
+      await expect(res.json()).resolves.toEqual({ error: 'forbidden', detail: 'owner/admin only' })
+    }
+
+    const invalidLimit = await addonsApp.fetch(
+      request('/marketing-cro-monitor/monitor?limit=51', 'GET'),
+      envForRole(harness, 'owner'),
+    )
+    expect(invalidLimit.status).toBe(400)
+    await expect(invalidLimit.json()).resolves.toEqual({ error: 'invalid_limit' })
   })
 
   it.each([

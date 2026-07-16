@@ -22,6 +22,15 @@ import {
   type AddonMutationResult,
   type AddonReceipt,
 } from './service'
+import {
+  MAX_MARKETING_MONITOR_RUN_LIST,
+  canonicalMarketingMonitorWindow,
+  getLatestMarketingMonitorRun,
+  listMarketingMonitorRuns,
+  runMarketingMonitor,
+  type MarketingMonitorFailureReason,
+} from './marketing/service'
+import type { MonitorWindow } from './marketing/types'
 
 const MAX_BODY_BYTES = 8192
 
@@ -176,6 +185,52 @@ function parseConfigureBody(
   return { ok: true, bindings }
 }
 
+function parseMonitorBody(raw: string): { ok: true; window: MonitorWindow } | { ok: false } {
+  if (raw.length === 0) return { ok: false }
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return { ok: false }
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false }
+  const body = value as Record<string, unknown>
+  if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'window')) return { ok: false }
+  const window = canonicalMarketingMonitorWindow(body.window)
+  return window ? { ok: true, window } : { ok: false }
+}
+
+function parseMonitorLimit(url: string): number | null {
+  const parameters = new URL(url).searchParams
+  const keys = [...parameters.keys()]
+  if (keys.some((key) => key !== 'limit') || parameters.getAll('limit').length > 1) return null
+  const raw = parameters.get('limit')
+  if (raw === null) return 20
+  if (!/^[1-9]\d*$/.test(raw)) return null
+  const limit = Number(raw)
+  return Number.isInteger(limit) && limit <= MAX_MARKETING_MONITOR_RUN_LIST ? limit : null
+}
+
+function monitorError(reason: MarketingMonitorFailureReason) {
+  switch (reason) {
+    case 'not_authorized':
+      return { status: 403 as const, body: { error: 'forbidden', detail: 'owner/admin only' } }
+    case 'invalid_window':
+    case 'invalid_limit':
+      return { status: 400 as const, body: { error: reason } }
+    case 'addon_not_active':
+    case 'addon_identity_mismatch':
+    case 'binding_generation_not_live':
+    case 'collection_invalid':
+    case 'fence_lost':
+      return { status: 409 as const, body: { error: reason } }
+    case 'collection_failed':
+    case 'stored_run_invalid':
+    case 'write_failed':
+      return { status: 500 as const, body: { error: reason } }
+  }
+}
+
 function mutationError(result: Extract<AddonMutationResult, { ok: false }>) {
   switch (result.reason) {
     case 'addon_not_registered':
@@ -299,6 +354,50 @@ addonsApp.get('/', async (c) => {
   } catch {
     return c.json({ error: 'read_failed' }, 500)
   }
+})
+
+addonsApp.post('/marketing-cro-monitor/monitor', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdminPlus(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  const body = await readBoundedBody(c)
+  if (!body.ok) return c.json({ error: body.status === 413 ? 'payload_too_large' : 'invalid_body' }, body.status)
+  const parsed = parseMonitorBody(body.raw)
+  if (!parsed.ok) return c.json({ error: 'invalid_body' }, 400)
+
+  const result = await runMarketingMonitor(
+    c.env,
+    { id: auth.userId, role: auth.role },
+    { window: parsed.window },
+  )
+  if (!result.ok) {
+    const error = monitorError(result.reason)
+    return c.json(error.body, error.status)
+  }
+  return c.json(result, result.idempotent ? 200 : 201)
+})
+
+addonsApp.get('/marketing-cro-monitor/monitor/latest', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdminPlus(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  const result = await getLatestMarketingMonitorRun(c.env, { id: auth.userId, role: auth.role })
+  if (!result.ok) {
+    const error = monitorError(result.reason)
+    return c.json(error.body, error.status)
+  }
+  return c.json({ run: result.run })
+})
+
+addonsApp.get('/marketing-cro-monitor/monitor', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdminPlus(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  const limit = parseMonitorLimit(c.req.url)
+  if (limit === null) return c.json({ error: 'invalid_limit' }, 400)
+  const result = await listMarketingMonitorRuns(c.env, { id: auth.userId, role: auth.role }, { limit })
+  if (!result.ok) {
+    const error = monitorError(result.reason)
+    return c.json(error.body, error.status)
+  }
+  return c.json({ runs: result.runs })
 })
 
 addonsApp.post('/:key/install', (c) => mutate(c, 'install'))
