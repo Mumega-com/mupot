@@ -171,7 +171,7 @@ CREATE UNIQUE INDEX idx_addon_live_binding_slot
   WHERE revoked_at IS NULL;
 ```
 
-Add append-only/no-update guards except the single `revoked_at NULL -> timestamp` transition. Add a trigger preventing live bindings on archived installations.
+Add append-only/no-update guards except the single `revoked_at NULL -> timestamp` transition. Add triggers preventing live bindings on archived installations and preventing a vault binding unless its connector belongs to the same tenant. Database constraints are the final tenant-isolation boundary; application validation provides the stable public error contract.
 
 - [ ] **Step 4: Implement validation and lifecycle integration**
 
@@ -190,11 +190,21 @@ export type AddonBindingPreflight =
       'capability_mismatch' | 'manifest_digest_drift' }
 ```
 
-`first_party` is the only initial internal adapter. Vault validation selects only safe connector columns by exact ID + `env.TENANT_SLUG`, rejects revoked rows, and compares type to adapter. Configuration writes the new binding generation and the lifecycle receipt in one `env.DB.batch()`. Empty configuration remains valid for zero-requirement fixture addons. Activation re-runs preflight. Disable preserves bindings; archive revokes them.
+`first_party` is the only initial internal adapter. Vault validation selects only safe connector columns by exact ID + `env.TENANT_SLUG`, rejects revoked rows, and compares type to adapter. Configuration writes the new binding generation and its lifecycle receipt in one `env.DB.batch()`.
+
+Configuration semantics are explicit:
+
+- The first valid configuration of an `installed` addon creates bindings, advances it to `configured`, and appends the normal `configure` lifecycle receipt.
+- Repeating the same normalized configuration while `configured` or `disabled` is idempotent and writes no receipt.
+- A changed configuration while `configured` or `disabled` atomically revokes the previous live generation, inserts the replacement generation, leaves lifecycle state unchanged, and appends a `preflight` receipt with null previous/next state.
+- An `active` addon must be disabled before its bindings can change.
+- Empty configuration remains valid for zero-requirement fixture addons.
+
+Activation re-runs binding preflight. Disable preserves bindings; archive revokes them atomically with the archive transition. Replace any zero-authority shortcut so connector requirements are not mistaken for authority grants: activation requires no rank/surface grants and a successful binding preflight.
 
 - [ ] **Step 5: Add bounded route parsing**
 
-Accept either an empty body for legacy zero-requirement addons or JSON `{ "bindings": [...] }` up to 8 KiB. Reject unknown keys, duplicate slots, non-string fields, and bodies on non-configure lifecycle actions.
+Accept either an empty body for legacy zero-requirement addons or JSON `{ "bindings": [...] }` up to 8 KiB. Reject unknown keys, duplicate slots, non-string fields, more bindings than the manifest declares (and an absolute maximum of 16), and bodies on non-configure lifecycle actions.
 
 - [ ] **Step 6: Run focused tests and typecheck**
 
