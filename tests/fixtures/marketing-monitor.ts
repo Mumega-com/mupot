@@ -37,7 +37,7 @@ export function createMarketingMonitorFixtureSource(
           metricKey,
           value,
           unit,
-          authority: 'first_party',
+          authority: 'first-party',
           observedAt: input.observedAt,
         })),
       }

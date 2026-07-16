@@ -1,7 +1,9 @@
 import type { Env } from '../../types'
 import {
-  MARKETING_MONITOR_METRIC_KEYS,
+  MARKETING_MONITOR_ADAPTER_AUTHORITIES,
+  MARKETING_MONITOR_METRIC_CONTRACT,
   type CollectedSourceStatus,
+  type MarketingMonitorMetricKey,
   type MarketingMonitorSource,
   type MarketingSnapshotCollection,
   type MonitorObservation,
@@ -13,7 +15,6 @@ import {
 export const MAX_OBSERVATIONS_PER_SOURCE = 100
 export const MAX_OBSERVATIONS_PER_RUN = 200
 
-const DECLARED_METRIC_KEYS = new Set<string>(MARKETING_MONITOR_METRIC_KEYS)
 const STABLE_SOURCE_REASONS = new Set([
   'authoritative_source_missing',
   'binding_not_configured',
@@ -26,9 +27,9 @@ const STABLE_SOURCE_REASONS = new Set([
 function isIsoTimestamp(value: unknown): value is string {
   if (typeof value !== 'string' || value.trim() === '') return false
   const timestamp = Date.parse(value)
-  if (!Number.isFinite(timestamp) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value)) return false
-  const canonical = value.includes('.') ? value : value.replace('Z', '.000Z')
-  return new Date(timestamp).toISOString() === canonical
+  return Number.isFinite(timestamp)
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
+    && new Date(timestamp).toISOString() === value
 }
 
 function windowBounds(window: MonitorWindow): { start: number; end: number } | null {
@@ -42,46 +43,75 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
 
-function validObservation(observation: unknown, bounds: { start: number; end: number }): observation is MonitorObservation {
-  if (typeof observation !== 'object' || observation === null || Array.isArray(observation)) return false
+function cloneObservationValue(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return value
+  const observation = value as Record<string, unknown>
+  return Object.freeze({
+    id: observation.id,
+    runId: observation.runId,
+    metricKey: observation.metricKey,
+    value: observation.value,
+    unit: observation.unit,
+    authority: observation.authority,
+    observedAt: observation.observedAt,
+  })
+}
+
+type ObservationFailureReason =
+  | 'invalid_observation'
+  | 'observation_authority_mismatch'
+  | 'metric_authority_not_allowed'
+
+function observationFailureReason(
+  observation: unknown,
+  bounds: { start: number; end: number },
+  bindingAuthority: string,
+): ObservationFailureReason | null {
+  if (typeof observation !== 'object' || observation === null || Array.isArray(observation)) return 'invalid_observation'
   const value = observation as Record<string, unknown>
   if (
     !isNonEmptyString(value.id)
     || !isNonEmptyString(value.runId)
     || !isNonEmptyString(value.metricKey)
-    || !DECLARED_METRIC_KEYS.has(value.metricKey)
+    || !Object.prototype.hasOwnProperty.call(MARKETING_MONITOR_METRIC_CONTRACT, value.metricKey)
     || typeof value.value !== 'number'
     || !Number.isFinite(value.value)
     || !isNonEmptyString(value.unit)
     || !isNonEmptyString(value.authority)
     || !isIsoTimestamp(value.observedAt)
-  ) return false
+  ) return 'invalid_observation'
 
   const observedAt = Date.parse(value.observedAt)
-  return observedAt >= bounds.start && observedAt <= bounds.end
+  if (observedAt < bounds.start || observedAt > bounds.end) return 'invalid_observation'
+  if (value.authority !== bindingAuthority) return 'observation_authority_mismatch'
+
+  const metric = MARKETING_MONITOR_METRIC_CONTRACT[value.metricKey as MarketingMonitorMetricKey]
+  return (metric.authorities as readonly string[]).includes(bindingAuthority)
+    ? null
+    : 'metric_authority_not_allowed'
 }
 
 function failedStatus(
   source: MarketingMonitorSource,
   reason: string,
 ): CollectedSourceStatus {
-  return {
+  return Object.freeze({
     key: source.key,
     slot: source.slot,
     status: 'failed',
     reason,
     observationCount: 0,
-  }
+  })
 }
 
 function unavailableStatus(source: MarketingMonitorSource, reason: string): CollectedSourceStatus {
-  return {
+  return Object.freeze({
     key: source.key,
     slot: source.slot,
     status: 'unavailable',
     reason,
     observationCount: 0,
-  }
+  })
 }
 
 function stableSnapshotReason(snapshot: SourceSnapshot): string {
@@ -106,11 +136,20 @@ export async function collectMarketingSnapshots(
 
   const sourceStatuses: CollectedSourceStatus[] = []
   const observations: MonitorObservation[] = []
+  const observationIds = new Set<string>()
+  let runId: string | null = null
 
   for (const source of sources) {
     const binding = bindingsBySlot.get(source.slot)
     if (!binding) {
       sourceStatuses.push(unavailableStatus(source, 'binding_not_configured'))
+      continue
+    }
+    const bindingAuthority = MARKETING_MONITOR_ADAPTER_AUTHORITIES[
+      binding.adapter as keyof typeof MARKETING_MONITOR_ADAPTER_AUTHORITIES
+    ]
+    if (!bindingAuthority) {
+      sourceStatuses.push(failedStatus(source, 'binding_adapter_not_supported'))
       continue
     }
 
@@ -122,52 +161,90 @@ export async function collectMarketingSnapshots(
       continue
     }
 
-    if (!snapshot || typeof snapshot !== 'object' || !Array.isArray(snapshot.observations)) {
+    try {
+      if (!snapshot || typeof snapshot !== 'object' || !Array.isArray(snapshot.observations)) {
+        sourceStatuses.push(failedStatus(source, 'invalid_source_snapshot'))
+        continue
+      }
+      const sourceObservations = snapshot.observations
+
+      if (sourceObservations.length > MAX_OBSERVATIONS_PER_SOURCE) {
+        sourceStatuses.push(failedStatus(source, 'source_observation_limit_exceeded'))
+        continue
+      }
+
+      if (observations.length + sourceObservations.length > MAX_OBSERVATIONS_PER_RUN) {
+        sourceStatuses.push(failedStatus(source, 'run_observation_limit_exceeded'))
+        continue
+      }
+
+      if (snapshot.status === 'unavailable') {
+        sourceStatuses.push(sourceObservations.length === 0
+          ? unavailableStatus(source, stableSnapshotReason(snapshot))
+          : failedStatus(source, 'invalid_source_snapshot'))
+        continue
+      }
+
+      if (snapshot.status === 'failed') {
+        sourceStatuses.push(sourceObservations.length === 0
+          ? failedStatus(source, stableSnapshotReason(snapshot))
+          : failedStatus(source, 'invalid_source_snapshot'))
+        continue
+      }
+
+      if (snapshot.status !== 'available') {
+        sourceStatuses.push(failedStatus(source, 'invalid_source_snapshot'))
+        continue
+      }
+
+      const clonedObservations = sourceObservations.map(cloneObservationValue)
+      const observationFailure = clonedObservations
+        .map((observation) => observationFailureReason(observation, bounds, bindingAuthority))
+        .find((reason) => reason !== null)
+      if (observationFailure) {
+        sourceStatuses.push(failedStatus(source, observationFailure))
+        continue
+      }
+      const acceptedSourceObservations = clonedObservations as MonitorObservation[]
+
+      const sourceIds = new Set<string>()
+      let duplicateId = false
+      for (const observation of acceptedSourceObservations) {
+        if (sourceIds.has(observation.id) || observationIds.has(observation.id)) {
+          duplicateId = true
+          break
+        }
+        sourceIds.add(observation.id)
+      }
+      if (duplicateId) {
+        sourceStatuses.push(failedStatus(source, 'duplicate_observation_id'))
+        continue
+      }
+
+      const sourceRunIds = new Set(acceptedSourceObservations.map((observation) => observation.runId))
+      const sourceRunId = acceptedSourceObservations[0]?.runId ?? null
+      if (sourceRunIds.size > 1 || (sourceRunId !== null && runId !== null && sourceRunId !== runId)) {
+        sourceStatuses.push(failedStatus(source, 'run_id_mismatch'))
+        continue
+      }
+
+      observations.push(...acceptedSourceObservations)
+      for (const id of sourceIds) observationIds.add(id)
+      if (runId === null && sourceRunId !== null) runId = sourceRunId
+      sourceStatuses.push(Object.freeze({
+        key: source.key,
+        slot: source.slot,
+        status: 'available',
+        observationCount: sourceObservations.length,
+      }))
+    } catch {
       sourceStatuses.push(failedStatus(source, 'invalid_source_snapshot'))
-      continue
     }
-
-    if (snapshot.status === 'unavailable') {
-      sourceStatuses.push(unavailableStatus(source, stableSnapshotReason(snapshot)))
-      continue
-    }
-
-    if (snapshot.status === 'failed') {
-      sourceStatuses.push(failedStatus(source, stableSnapshotReason(snapshot)))
-      continue
-    }
-
-    if (snapshot.status !== 'available') {
-      sourceStatuses.push(failedStatus(source, 'invalid_source_snapshot'))
-      continue
-    }
-
-    if (snapshot.observations.length > MAX_OBSERVATIONS_PER_SOURCE) {
-      sourceStatuses.push(failedStatus(source, 'source_observation_limit_exceeded'))
-      continue
-    }
-
-    if (!snapshot.observations.every((observation) => validObservation(observation, bounds))) {
-      sourceStatuses.push(failedStatus(source, 'invalid_observation'))
-      continue
-    }
-
-    if (observations.length + snapshot.observations.length > MAX_OBSERVATIONS_PER_RUN) {
-      sourceStatuses.push(failedStatus(source, 'run_observation_limit_exceeded'))
-      continue
-    }
-
-    observations.push(...snapshot.observations)
-    sourceStatuses.push({
-      key: source.key,
-      slot: source.slot,
-      status: 'available',
-      observationCount: snapshot.observations.length,
-    })
   }
 
-  return {
-    sources: sourceStatuses,
-    observations,
-  }
+  return Object.freeze({
+    runId,
+    sources: Object.freeze([...sourceStatuses]),
+    observations: Object.freeze([...observations]),
+  })
 }

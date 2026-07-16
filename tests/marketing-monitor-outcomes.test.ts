@@ -32,10 +32,10 @@ describe('deriveMarketingOutcomes', () => {
   it('maps the five fixture metrics to available outcomes without fabricating revenue', async () => {
     const outcomes = deriveMarketingOutcomes(await fixtureObservations())
 
-    expect(outcomes.visibility).toMatchObject({ status: 'available', value: 8, unit: 'count', source: 'first_party' })
-    expect(outcomes.qualifiedTraffic).toMatchObject({ status: 'available', value: 240, unit: 'count', source: 'first_party' })
-    expect(outcomes.leads).toMatchObject({ status: 'available', value: 12, unit: 'count', source: 'first_party' })
-    expect(outcomes.conversion).toMatchObject({ status: 'available', value: 0.05, unit: 'ratio', source: 'first_party' })
+    expect(outcomes.visibility).toMatchObject({ status: 'available', value: 8, unit: 'count', source: 'first-party' })
+    expect(outcomes.qualifiedTraffic).toMatchObject({ status: 'available', value: 240, unit: 'count', source: 'first-party' })
+    expect(outcomes.leads).toMatchObject({ status: 'available', value: 12, unit: 'count', source: 'first-party' })
+    expect(outcomes.conversion).toMatchObject({ status: 'available', value: 0.05, unit: 'ratio', source: 'first-party' })
     expect(outcomes.revenue).toEqual({ status: 'unavailable', reason: 'authoritative_source_missing' })
   })
 
@@ -54,7 +54,7 @@ describe('deriveMarketingOutcomes', () => {
       metricKey: 'seo.ai_citations',
       value: 0,
       unit: 'count',
-      authority: 'first_party',
+      authority: 'first-party',
       observedAt: '2026-07-16T12:00:00.000Z',
     }]
     Object.freeze(observations)
@@ -71,13 +71,83 @@ describe('deriveMarketingOutcomes', () => {
     const outcomes = deriveMarketingOutcomes([{
       id: 'evidence-revenue',
       runId: 'run-1',
-      metricKey: 'growth.revenue',
+      metricKey: 'finance.revenue' as MonitorObservation['metricKey'],
       value: 500,
       unit: 'usd',
-      authority: 'first_party',
+      authority: 'first-party',
       observedAt: '2026-07-16T12:00:00.000Z',
     }])
 
     expect(outcomes.revenue).toEqual({ status: 'unavailable', reason: 'authoritative_source_missing' })
+  })
+
+  it('uses finance revenue from a supported CRM authority', () => {
+    const outcomes = deriveMarketingOutcomes([{
+      id: 'evidence-revenue',
+      runId: 'run-1',
+      metricKey: 'finance.revenue' as MonitorObservation['metricKey'],
+      value: 500,
+      unit: 'usd',
+      authority: 'ghl',
+      observedAt: '2026-07-16T12:00:00.000Z',
+    }])
+
+    expect(outcomes.revenue).toEqual({
+      status: 'available',
+      value: 500,
+      unit: 'usd',
+      source: 'ghl',
+      observedAt: '2026-07-16T12:00:00.000Z',
+    })
+  })
+
+  it('selects the latest observedAt instead of the last input observation', () => {
+    const outcomes = deriveMarketingOutcomes([
+      {
+        id: 'latest-evidence',
+        runId: 'run-1',
+        metricKey: 'seo.ai_citations',
+        value: 9,
+        unit: 'count',
+        authority: 'first-party',
+        observedAt: '2026-07-16T18:00:00.000Z',
+      },
+      {
+        id: 'older-evidence',
+        runId: 'run-1',
+        metricKey: 'seo.ai_citations',
+        value: 2,
+        unit: 'count',
+        authority: 'first-party',
+        observedAt: '2026-07-16T08:00:00.000Z',
+      },
+    ])
+
+    expect(outcomes.visibility).toMatchObject({ value: 9, observedAt: '2026-07-16T18:00:00.000Z' })
+  })
+
+  it('breaks equal observedAt ties by greatest observation ID', () => {
+    const outcomes = deriveMarketingOutcomes([
+      {
+        id: 'z-evidence',
+        runId: 'run-1',
+        metricKey: 'seo.ai_citations',
+        value: 9,
+        unit: 'count',
+        authority: 'first-party',
+        observedAt: '2026-07-16T12:00:00.000Z',
+      },
+      {
+        id: 'a-evidence',
+        runId: 'run-1',
+        metricKey: 'seo.ai_citations',
+        value: 2,
+        unit: 'count',
+        authority: 'first-party',
+        observedAt: '2026-07-16T12:00:00.000Z',
+      },
+    ])
+
+    expect(outcomes.visibility).toMatchObject({ value: 9, observedAt: '2026-07-16T12:00:00.000Z' })
   })
 })

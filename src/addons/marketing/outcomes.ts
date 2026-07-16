@@ -1,14 +1,18 @@
-import type { MarketingOutcomes, MonitorObservation, OutcomeValue } from './types'
+import {
+  MARKETING_MONITOR_METRIC_CONTRACT,
+  type MarketingMonitorMetricKey,
+  type MarketingOutcomes,
+  type MonitorObservation,
+  type OutcomeValue,
+} from './types'
 
 const OUTCOME_METRICS = {
   visibility: 'seo.ai_citations',
   qualifiedTraffic: 'seo.organic_sessions',
   leads: 'growth.leads',
   conversion: 'seo.conversion_rate',
-  revenue: 'growth.revenue',
+  revenue: 'finance.revenue',
 } as const
-
-const REVENUE_AUTHORITIES = new Set(['commerce', 'crm', 'ghl', 'stripe'])
 
 function unavailable(): OutcomeValue {
   return { status: 'unavailable', reason: 'authoritative_source_missing' }
@@ -16,13 +20,19 @@ function unavailable(): OutcomeValue {
 
 function outcomeFor(
   observations: readonly MonitorObservation[],
-  metricKey: string,
+  metricKey: MarketingMonitorMetricKey,
 ): OutcomeValue {
   let matching: MonitorObservation | undefined
+  const authorities = MARKETING_MONITOR_METRIC_CONTRACT[metricKey].authorities as readonly string[]
   for (const observation of observations) {
     if (
       observation.metricKey === metricKey
-      && (metricKey !== OUTCOME_METRICS.revenue || REVENUE_AUTHORITIES.has(observation.authority))
+      && authorities.includes(observation.authority)
+      && (
+        matching === undefined
+        || observation.observedAt > matching.observedAt
+        || (observation.observedAt === matching.observedAt && observation.id > matching.id)
+      )
     ) matching = observation
   }
   if (!matching) return unavailable()

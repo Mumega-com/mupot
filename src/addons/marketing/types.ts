@@ -1,15 +1,45 @@
 import type { Env } from '../../types'
 
-export const MARKETING_MONITOR_METRIC_KEYS = [
-  'seo.ai_citations',
-  'seo.organic_sessions',
-  'growth.leads',
-  'growth.replies',
-  'seo.conversion_rate',
-  'growth.revenue',
-] as const
+export const MARKETING_MONITOR_ADAPTER_AUTHORITIES = Object.freeze({
+  first_party: 'first-party',
+  posthog: 'posthog',
+  google_search_console: 'gsc',
+  ghl: 'ghl',
+  crm: 'crm',
+  mcpwp: 'mcpwp',
+  inkwell: 'inkwell',
+  ai_visibility: 'ai_visibility',
+} as const)
 
-export type MarketingMonitorMetricKey = (typeof MARKETING_MONITOR_METRIC_KEYS)[number]
+export type MarketingMonitorAuthority =
+  (typeof MARKETING_MONITOR_ADAPTER_AUTHORITIES)[keyof typeof MARKETING_MONITOR_ADAPTER_AUTHORITIES]
+
+export const MARKETING_MONITOR_METRIC_CONTRACT = Object.freeze({
+  'seo.ai_citations': Object.freeze({
+    authorities: Object.freeze(['first-party', 'ai_visibility'] as const),
+  }),
+  'seo.organic_sessions': Object.freeze({
+    authorities: Object.freeze(['first-party', 'posthog'] as const),
+  }),
+  'growth.leads': Object.freeze({
+    authorities: Object.freeze(['first-party', 'ghl', 'crm'] as const),
+  }),
+  'growth.replies': Object.freeze({
+    authorities: Object.freeze(['first-party', 'ghl', 'crm'] as const),
+  }),
+  'seo.conversion_rate': Object.freeze({
+    authorities: Object.freeze(['first-party', 'posthog'] as const),
+  }),
+  'finance.revenue': Object.freeze({
+    authorities: Object.freeze(['ghl', 'crm'] as const),
+  }),
+} as const)
+
+export type MarketingMonitorMetricKey = keyof typeof MARKETING_MONITOR_METRIC_CONTRACT
+
+export const MARKETING_MONITOR_METRIC_KEYS = Object.freeze(
+  Object.keys(MARKETING_MONITOR_METRIC_CONTRACT) as MarketingMonitorMetricKey[],
+)
 
 export interface MonitorWindow {
   readonly start: string
@@ -62,6 +92,7 @@ export interface CollectedSourceStatus {
 }
 
 export interface MarketingSnapshotCollection {
+  readonly runId: string | null
   readonly sources: readonly CollectedSourceStatus[]
   readonly observations: readonly MonitorObservation[]
 }
