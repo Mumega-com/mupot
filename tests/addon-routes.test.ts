@@ -130,6 +130,7 @@ describe('addon lifecycle routes', () => {
       'businessStateSha256',
       'installedVersion',
       'manifestSha256',
+      'mupotCompatibility',
       'publisher',
       'trustClass',
     ])
@@ -137,6 +138,7 @@ describe('addon lifecycle routes', () => {
     expect(beforeBody.manifestSha256).toMatch(/^[a-f0-9]{64}$/)
     expect(beforeBody).toMatchObject({
       installedVersion: '1.0.0',
+      mupotCompatibility: '^0.23.0',
       publisher: 'mumega',
       trustClass: 'native_reviewed',
     })
@@ -456,11 +458,14 @@ describe('addon lifecycle routes', () => {
     expect(body).not.toHaveProperty('checks')
     expect(body).not.toHaveProperty('tenant')
     expect(body).not.toHaveProperty('installationId')
-    expect(body.receipts[0]).toEqual(expect.objectContaining({ action: 'install', addonKey: 'fixture-addon' }))
+    expect(body.receipts[0]).toEqual(expect.objectContaining({
+      action: 'install',
+      addonKey: 'fixture-addon',
+      manifestSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      mupotCompatibility: '^0.23.0',
+    }))
     expect(body.receipts[0]).not.toHaveProperty('tenant')
     expect(body.receipts[0]).not.toHaveProperty('installationId')
-    expect(body.receipts[0]).not.toHaveProperty('manifestSha256')
-    expect(body.receipts[0]).not.toHaveProperty('mupotCompatibility')
     expect(body.receipts[0]).not.toHaveProperty('sideEffectIds')
     expect(body.receipts[0]).not.toHaveProperty('checks')
   })

@@ -242,6 +242,7 @@ function deployedEvidence(body) {
     || typeof body.manifestSha256 !== 'string'
     || !SHA256_RE.test(body.manifestSha256)
     || !isNonEmptyString(body.installedVersion)
+    || !isNonEmptyString(body.mupotCompatibility)
     || !isNonEmptyString(body.publisher)
     || body.trustClass !== 'native_reviewed') {
     throw new LifecycleFailure('deployed_evidence_invalid')
@@ -250,6 +251,7 @@ function deployedEvidence(body) {
     businessStateSha256: body.businessStateSha256,
     manifestSha256: body.manifestSha256,
     installedVersion: body.installedVersion,
+    mupotCompatibility: body.mupotCompatibility,
     publisher: body.publisher,
     trustClass: body.trustClass,
   }
@@ -258,6 +260,7 @@ function deployedEvidence(body) {
 function sameDeployment(left, right) {
   return left.manifestSha256 === right.manifestSha256
     && left.installedVersion === right.installedVersion
+    && left.mupotCompatibility === right.mupotCompatibility
     && left.publisher === right.publisher
     && left.trustClass === right.trustClass
 }
@@ -271,6 +274,8 @@ function receiptFingerprint(receipt) {
     receipt.nextState,
     receipt.addonKey,
     receipt.installedVersion,
+    receipt.manifestSha256,
+    receipt.mupotCompatibility,
     receipt.publisher,
     receipt.trustClass,
     receipt.actorId,
@@ -291,6 +296,8 @@ function validateObservedReceipt(receipt, expected, deployment, prior, bearer) {
     || receipt.nextState !== expected.state
     || receipt.addonKey !== ADDON_KEY
     || receipt.installedVersion !== deployment.installedVersion
+    || receipt.manifestSha256 !== deployment.manifestSha256
+    || receipt.mupotCompatibility !== deployment.mupotCompatibility
     || receipt.publisher !== deployment.publisher
     || receipt.trustClass !== deployment.trustClass
     || !isNonEmptyString(receipt.actorId)

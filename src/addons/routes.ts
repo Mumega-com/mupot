@@ -74,6 +74,8 @@ function redactedReceipt(receipt: AddonReceipt) {
     nextState: receipt.nextState,
     addonKey: receipt.addonKey,
     installedVersion: receipt.installedVersion,
+    manifestSha256: receipt.manifestSha256,
+    mupotCompatibility: receipt.mupotCompatibility,
     publisher: receipt.publisher,
     trustClass: receipt.trustClass,
     actorId: receipt.actorId,
@@ -198,6 +200,7 @@ addonsApp.get('/:key/evidence', async (c) => {
       businessStateSha256: await getBusinessStateSha256(c.env),
       manifestSha256: entry.manifestSha256,
       installedVersion: entry.manifest.version,
+      mupotCompatibility: entry.manifest.mupotCompatibility,
       publisher: entry.manifest.publisher,
       trustClass: entry.manifest.trustClass,
     })

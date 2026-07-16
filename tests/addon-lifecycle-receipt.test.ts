@@ -12,6 +12,7 @@ import {
 } from '../scripts/addon-lifecycle-receipt.mjs'
 
 const TEST_MANIFEST_SHA256 = 'd'.repeat(64)
+const TEST_MUPOT_COMPATIBILITY = '^0.23.0'
 
 function validReceipt() {
   return {
@@ -68,6 +69,7 @@ function createLifecycleFetch(options: {
   beforeBusinessStateSha256?: unknown
   afterBusinessStateSha256?: unknown
   manifestSha256?: string
+  mupotCompatibility?: string
   receiptMutator?: (receipt: Record<string, unknown>, index: number) => Record<string, unknown>
 } = {}) {
   const receipts: Array<Record<string, unknown>> = []
@@ -114,6 +116,7 @@ function createLifecycleFetch(options: {
               ? DEPARTMENT_STATE_SHA256
               : 'b'.repeat(64)),
         manifestSha256: options.manifestSha256 ?? TEST_MANIFEST_SHA256,
+        mupotCompatibility: options.mupotCompatibility ?? TEST_MUPOT_COMPATIBILITY,
         installedVersion: '1.0.0',
         publisher: 'mumega',
         trustClass: 'native_reviewed',
@@ -148,6 +151,8 @@ function createLifecycleFetch(options: {
         nextState: expected[1],
         addonKey: ADDON_KEY,
         installedVersion: '1.0.0',
+        manifestSha256: options.manifestSha256 ?? TEST_MANIFEST_SHA256,
+        mupotCompatibility: options.mupotCompatibility ?? TEST_MUPOT_COMPATIBILITY,
         publisher: 'mumega',
         trustClass: 'native_reviewed',
         actorId: 'owner-actor',
@@ -382,6 +387,12 @@ describe('addon lifecycle receipt checker', () => {
     )],
     ['trust class', (receipt: Record<string, unknown>, index: number) => (
       index === 1 ? { ...receipt, trustClass: 'external_isolated' } : receipt
+    )],
+    ['manifest digest', (receipt: Record<string, unknown>, index: number) => (
+      index === 1 ? { ...receipt, manifestSha256: 'e'.repeat(64) } : receipt
+    )],
+    ['Mupot compatibility', (receipt: Record<string, unknown>, index: number) => (
+      index === 1 ? { ...receipt, mupotCompatibility: '^99.0.0' } : receipt
     )],
     ['chronology', (receipt: Record<string, unknown>, index: number) => (
       index === 1 ? { ...receipt, createdAt: '2025-01-01T00:00:00.000Z' } : receipt
