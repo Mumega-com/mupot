@@ -33,6 +33,11 @@ export interface AddonReceipt {
   action: string
   previousState: AddonState | null
   nextState: AddonState | null
+  addonKey: string
+  installedVersion: string
+  publisher: string
+  trustClass: 'native_reviewed'
+  mupotCompatibility: string
   manifestSha256: string
   actorId: string
   outcome: 'pass' | 'fail'
@@ -89,6 +94,11 @@ interface ReceiptRow {
   action: string
   previous_state: AddonState | null
   next_state: AddonState | null
+  addon_key: string
+  installed_version: string
+  publisher: string
+  trust_class: 'native_reviewed'
+  mupot_compatibility: string
   manifest_sha256: string
   actor_id: string
   outcome: 'pass' | 'fail'
@@ -130,23 +140,29 @@ function installationFromRow(row: InstallationRow): AddonInstallation {
 }
 
 function parseStringArray(value: string): string[] {
+  let parsed: unknown
   try {
-    const parsed: unknown = JSON.parse(value)
-    return Array.isArray(parsed) && parsed.every((entry) => typeof entry === 'string') ? parsed : []
+    parsed = JSON.parse(value)
   } catch {
-    return []
+    throw new Error('invalid addon receipt JSON')
   }
+  if (!Array.isArray(parsed) || !parsed.every((entry) => typeof entry === 'string')) {
+    throw new Error('invalid addon receipt JSON')
+  }
+  return parsed
 }
 
 function parseChecks(value: string): Record<string, unknown> {
+  let parsed: unknown
   try {
-    const parsed: unknown = JSON.parse(value)
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {}
+    parsed = JSON.parse(value)
   } catch {
-    return {}
+    throw new Error('invalid addon receipt JSON')
   }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('invalid addon receipt JSON')
+  }
+  return parsed as Record<string, unknown>
 }
 
 function receiptFromRow(row: ReceiptRow): AddonReceipt {
@@ -157,6 +173,11 @@ function receiptFromRow(row: ReceiptRow): AddonReceipt {
     action: row.action,
     previousState: row.previous_state,
     nextState: row.next_state,
+    addonKey: row.addon_key,
+    installedVersion: row.installed_version,
+    publisher: row.publisher,
+    trustClass: row.trust_class,
+    mupotCompatibility: row.mupot_compatibility,
     manifestSha256: row.manifest_sha256,
     actorId: row.actor_id,
     outcome: row.outcome,
@@ -181,11 +202,13 @@ function written(result: { success: boolean; meta?: { changes?: number } }): boo
   return result.success && result.meta?.changes === 1
 }
 
-async function loadInstallation(env: Env, key: string): Promise<AddonInstallation | null> {
+async function loadLiveInstallation(env: Env, key: string): Promise<AddonInstallation | null> {
   const row = await env.DB.prepare(`
     SELECT ${INSTALLATION_COLUMNS}
       FROM addon_installations
      WHERE tenant = ?1 AND addon_key = ?2
+       AND state <> 'archived'
+     ORDER BY installed_at DESC, id DESC
      LIMIT 1
   `).bind(env.TENANT_SLUG, key).first<InstallationRow>()
   return row ? installationFromRow(row) : null
@@ -204,8 +227,9 @@ export async function listAddonInstallations(env: Env): Promise<AddonInstallatio
 export async function getAddonReceipts(env: Env, installationId: string): Promise<AddonReceipt[]> {
   const result = await env.DB.prepare(`
     SELECT id, tenant, installation_id, action, previous_state, next_state,
-           manifest_sha256, actor_id, outcome, side_effect_ids, checks,
-           error_code, created_at
+           addon_key, installed_version, publisher, trust_class,
+           mupot_compatibility, manifest_sha256, actor_id, outcome,
+           side_effect_ids, checks, error_code, created_at
       FROM addon_receipts
      WHERE tenant = ?1 AND installation_id = ?2
      ORDER BY created_at DESC, id DESC
@@ -222,7 +246,7 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
     return { ok: false, reason: 'invalid_state' }
   }
 
-  const existing = await loadInstallation(env, key)
+  const existing = await loadLiveInstallation(env, key)
   if (existing) {
     if (existing.manifestSha256 !== entry.manifestSha256) {
       return { ok: false, reason: 'manifest_digest_drift' }
@@ -259,14 +283,32 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
       env.DB.prepare(`
         INSERT INTO addon_receipts (
           id, tenant, installation_id, action, previous_state, next_state,
-          manifest_sha256, actor_id, outcome, side_effect_ids, checks, created_at
-        ) VALUES (?1, ?2, ?3, 'install', NULL, 'installed', ?4, ?5, 'pass', '[]', ?6, ?7)
-      `).bind(receiptId, env.TENANT_SLUG, installationId, entry.manifestSha256, actor.id, checks, createdAt),
+          addon_key, installed_version, publisher, trust_class,
+          mupot_compatibility, manifest_sha256, actor_id, outcome,
+          side_effect_ids, checks, created_at
+        ) VALUES (
+          ?1, ?2, ?3, 'install', NULL, 'installed', ?4, ?5, ?6, ?7,
+          ?8, ?9, ?10, 'pass', '[]', ?11, ?12
+        )
+      `).bind(
+        receiptId,
+        env.TENANT_SLUG,
+        installationId,
+        entry.manifest.key,
+        entry.manifest.version,
+        entry.manifest.publisher,
+        entry.manifest.trustClass,
+        entry.manifest.mupotCompatibility,
+        entry.manifestSha256,
+        actor.id,
+        checks,
+        createdAt,
+      ),
     ])
 
     if (!written(results[0]) || !written(results[1])) return { ok: false, reason: 'write_failed' }
   } catch {
-    const raced = await loadInstallation(env, key)
+    const raced = await loadLiveInstallation(env, key)
     if (!raced) return { ok: false, reason: 'write_failed' }
     if (raced.manifestSha256 !== entry.manifestSha256) {
       return { ok: false, reason: 'manifest_digest_drift' }
@@ -274,7 +316,7 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
     return { ok: true, state: raced.state, installation: raced, idempotent: true }
   }
 
-  const installation = await loadInstallation(env, key)
+  const installation = await loadLiveInstallation(env, key)
   if (!installation) return { ok: false, reason: 'write_failed' }
   return { ok: true, state: installation.state, installation, created: true }
 }
@@ -285,7 +327,7 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
   const entry = getRegisteredAddon(key)
   if (!entry) return { ok: false, reason: 'addon_not_registered' }
 
-  const existing = await loadInstallation(env, key)
+  const existing = await loadLiveInstallation(env, key)
   if (!existing) return { ok: false, reason: 'invalid_state' }
   if (existing.manifestSha256 !== entry.manifestSha256) {
     return { ok: false, reason: 'manifest_digest_drift' }
@@ -313,32 +355,38 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
       env.DB.prepare(`
         INSERT INTO addon_receipts (
           id, tenant, installation_id, action, previous_state, next_state,
-          manifest_sha256, actor_id, outcome, side_effect_ids, checks, created_at
+          addon_key, installed_version, publisher, trust_class,
+          mupot_compatibility, manifest_sha256, actor_id, outcome,
+          side_effect_ids, checks, created_at
         )
-        SELECT ?1, ?2, id, 'configure', 'installed', 'configured',
-               ?3, ?4, 'pass', '[]', ?5, ?6
-          FROM addon_installations
-         WHERE id = ?7 AND tenant = ?2 AND state = 'configured'
-           AND manifest_sha256 = ?3 AND latest_receipt_id = ?1
+        VALUES (
+          ?1, ?2, ?3, 'configure', 'installed', 'configured',
+          ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pass', '[]', ?11, ?12
+        )
       `).bind(
         receiptId,
         env.TENANT_SLUG,
-        entry.manifestSha256,
+        existing.id,
+        existing.addonKey,
+        existing.installedVersion,
+        existing.publisher,
+        existing.trustClass,
+        existing.mupotCompatibility,
+        existing.manifestSha256,
         actor.id,
         checks,
         configuredAt,
-        existing.id,
       ),
     ])
 
     if (written(results[0]) && written(results[1])) {
-      const configured = await loadInstallation(env, key)
+      const configured = await loadLiveInstallation(env, key)
       return configured
         ? { ok: true, state: configured.state, installation: configured }
         : { ok: false, reason: 'write_failed' }
     }
   } catch {
-    const current = await loadInstallation(env, key)
+    const current = await loadLiveInstallation(env, key)
     if (!current || current.state === 'installed') return { ok: false, reason: 'write_failed' }
     if (current.manifestSha256 !== entry.manifestSha256) {
       return { ok: false, reason: 'manifest_digest_drift' }
@@ -349,7 +397,7 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
     return { ok: false, reason: 'invalid_state', state: current.state }
   }
 
-  const current = await loadInstallation(env, key)
+  const current = await loadLiveInstallation(env, key)
   if (!current) return { ok: false, reason: 'write_failed' }
   if (current.manifestSha256 !== entry.manifestSha256) {
     return { ok: false, reason: 'manifest_digest_drift' }
