@@ -413,6 +413,89 @@ function withPreBatchRace(
   return { ...db.env, DB: racingDb }
 }
 
+function withPostRunRace(
+  db: Db,
+  matches: (sql: string) => boolean,
+  race: () => Promise<void>,
+): Env {
+  const originalDb = db.env.DB
+  let pending = true
+
+  const wrap = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => (
+    new Proxy(statement, {
+      get(target, property, receiver) {
+        if (property === 'bind') {
+          return (...values: unknown[]) => wrap(target.bind(...values), sql)
+        }
+        if (property === 'run') {
+          return async () => {
+            const result = await target.run()
+            if (pending && matches(sql)) {
+              pending = false
+              await race()
+            }
+            return result
+          }
+        }
+        const value = Reflect.get(target, property, receiver)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+  )
+
+  const racingDb = {
+    prepare(sql: string) {
+      return wrap(originalDb.prepare(sql), sql)
+    },
+    batch<T = unknown>(statements: D1PreparedStatement[]) {
+      return originalDb.batch<T>(statements)
+    },
+  } as Env['DB']
+
+  return { ...db.env, DB: racingDb }
+}
+
+function withPreFirstRace(
+  db: Db,
+  matches: (sql: string) => boolean,
+  race: () => Promise<void>,
+): Env {
+  const originalDb = db.env.DB
+  let pending = true
+
+  const wrap = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => (
+    new Proxy(statement, {
+      get(target, property, receiver) {
+        if (property === 'bind') {
+          return (...values: unknown[]) => wrap(target.bind(...values), sql)
+        }
+        if (property === 'first') {
+          return async (columnName?: string) => {
+            if (pending && matches(sql)) {
+              pending = false
+              await race()
+            }
+            return target.first(columnName)
+          }
+        }
+        const value = Reflect.get(target, property, receiver)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+  )
+
+  const racingDb = {
+    prepare(sql: string) {
+      return wrap(originalDb.prepare(sql), sql)
+    },
+    batch<T = unknown>(statements: D1PreparedStatement[]) {
+      return originalDb.batch<T>(statements)
+    },
+  } as Env['DB']
+
+  return { ...db.env, DB: racingDb }
+}
+
 describe('addon migration constraints', () => {
   let db: Db
 
@@ -1756,6 +1839,151 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     expect(db.receipts().filter((receipt) => receipt.action === 'activate')).toHaveLength(1)
   })
 
+  it('reconciles ownership released during fence-loss corrective activation', async () => {
+    await configureFixture()
+    const coOwner = await insertInstallationLifecycle(db, { addonKey: 'fixture-addon-corrective-activate' })
+    await transitionInstallation(db, coOwner.id, 'configure', 'installed', 'configured')
+    await transitionInstallation(db, coOwner.id, 'activate', 'configured', 'active')
+    const activated = await activateDepartment(db.env.DB, 'fixture')
+    if (!activated.ok) throw new Error(`fixture activation failed: ${activated.reason}`)
+    insertOwnership(db, 'corrective-activate-owner', coOwner.id, activated.departmentId, 'co_owner')
+
+    const barrier = createBarrier()
+    const racingEnv = withPostRunRace(
+      db,
+      (sql) => (
+        sql.includes('UPDATE departments')
+        && sql.includes('SET active = 1')
+        && db.operations().some((operation) => (
+          operation.action === 'activate'
+          && operation.status === 'running'
+          && operation.lease_expires_at === '2000-01-01T00:00:00.000Z'
+        ))
+      ),
+      () => barrier.wait(),
+    )
+    let expired = false
+    const stale = activateAddon(racingEnv, owner, 'fixture-addon', {
+      afterDepartmentActivated() {
+        if (expired) return
+        expired = true
+        expireRunningLease(db, 'activate')
+      },
+    })
+
+    await barrier.arrived
+    db.harness.sqlite.prepare(`
+      UPDATE addon_resource_ownership
+         SET active = 0, released_at = ?
+       WHERE id = 'corrective-activate-owner'
+    `).run(new Date().toISOString())
+    barrier.release()
+
+    expect(await stale).toEqual({ ok: false, reason: 'fence_lost' })
+    expect(db.resources().every((claim) => claim.active === 0)).toBe(true)
+    expect(db.departments()).toEqual([
+      expect.objectContaining({ id: activated.departmentId, active: 0 }),
+    ])
+  })
+
+  it('reconciles ownership added during fence-loss corrective deactivation', async () => {
+    await configureFixture()
+    const coOwner = await insertInstallationLifecycle(db, { addonKey: 'fixture-addon-corrective-deactivate' })
+    await transitionInstallation(db, coOwner.id, 'configure', 'installed', 'configured')
+    await transitionInstallation(db, coOwner.id, 'activate', 'configured', 'active')
+
+    const barrier = createBarrier()
+    const racingEnv = withPostRunRace(
+      db,
+      (sql) => sql.includes('UPDATE departments SET active = 0'),
+      () => barrier.wait(),
+    )
+    let expired = false
+    const stale = activateAddon(racingEnv, owner, 'fixture-addon', {
+      afterDepartmentActivated() {
+        if (expired) return
+        expired = true
+        expireRunningLease(db, 'activate')
+      },
+    })
+
+    await barrier.arrived
+    const departmentId = db.departments()[0].id as string
+    insertOwnership(db, 'corrective-deactivate-owner', coOwner.id, departmentId, 'co_owner')
+    barrier.release()
+
+    expect(await stale).toEqual({ ok: false, reason: 'fence_lost' })
+    expect(db.resources()).toEqual([
+      expect.objectContaining({ id: 'corrective-deactivate-owner', active: 1 }),
+    ])
+    expect(db.departments()).toEqual([
+      expect.objectContaining({ id: departmentId, active: 1 }),
+    ])
+  })
+
+  it('fences a stale activation before its post-step active idempotent branch', async () => {
+    await configureFixture()
+    let takeover: AddonMutationResult | undefined
+    const racingEnv = withPreFirstRace(
+      db,
+      (sql) => (
+        sql.includes('FROM addon_installations')
+        && db.operations().some((operation) => (
+          operation.action === 'activate'
+          && operation.current_step === 'activate_transition'
+          && operation.status === 'running'
+        ))
+      ),
+      async () => {
+        expireRunningLease(db, 'activate')
+        takeover = await activateAddon(db.env, admin, 'fixture-addon')
+      },
+    )
+
+    expect(await activateAddon(racingEnv, owner, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'fence_lost',
+    })
+    expect(takeover).toMatchObject({ ok: true, state: 'active' })
+    expect(db.installations()).toEqual([expect.objectContaining({ state: 'active' })])
+  })
+
+  it('fences a stale activation before its post-step invalid-state branch', async () => {
+    await configureFixture()
+    const racingEnv = withPreFirstRace(
+      db,
+      (sql) => (
+        sql.includes('FROM addon_installations')
+        && db.operations().some((operation) => (
+          operation.action === 'activate'
+          && operation.current_step === 'activate_transition'
+          && operation.status === 'running'
+        ))
+      ),
+      async () => {
+        expireRunningLease(db, 'activate')
+        expect(await activateAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+          ok: true,
+          state: 'active',
+        })
+        expect(await disableAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+          ok: true,
+          state: 'disabled',
+        })
+        expect(await archiveAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+          ok: true,
+          state: 'archived',
+        })
+      },
+    )
+
+    expect(await activateAddon(racingEnv, owner, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'fence_lost',
+    })
+    expect(db.installations()).toEqual([expect.objectContaining({ state: 'archived' })])
+  })
+
   it('reports fence loss when takeover completes immediately before activation transition', async () => {
     await configureFixture()
     let takeover: AddonMutationResult | undefined
@@ -2174,6 +2402,85 @@ describe('addon activation, disable, reactivation, and archive service', () => {
 
     expect(result).toEqual({ ok: false, reason: 'fence_lost' })
     expect(db.operations().filter((operation) => operation.action === 'disable')).toHaveLength(0)
+  })
+
+  it('rejects disabled idempotency when the state-first disable operation is missing', async () => {
+    await activateFixture()
+    let interrupted = false
+    expect(await disableAddon(db.env, owner, 'fixture-addon', {
+      afterInstallationDisabled() {
+        if (interrupted) return
+        interrupted = true
+        throw new Error('interrupt after state-first disable')
+      },
+    })).toEqual({ ok: false, reason: 'write_failed' })
+
+    const operation = db.operations().find((candidate) => candidate.action === 'disable')
+    expect(operation).toMatchObject({ current_step: 'disable_teardown', status: 'running' })
+    db.harness.sqlite.prepare(`
+      DELETE FROM addon_operations WHERE id = ? AND tenant = ?
+    `).run(operation?.id, db.env.TENANT_SLUG)
+
+    expect(await disableAddon(db.env, admin, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'fence_lost',
+    })
+    expect(db.installations()).toEqual([expect.objectContaining({ state: 'disabled' })])
+    expect(db.resources()).toEqual([expect.objectContaining({ active: 1 })])
+  })
+
+  it('rejects disabled idempotency when latest completed disable evidence is missing', async () => {
+    await activateFixture()
+    expect(await disableAddon(db.env, owner, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'disabled',
+    })
+    const operation = db.operations().find((candidate) => candidate.action === 'disable')
+    expect(operation).toMatchObject({ current_step: 'completed', status: 'completed' })
+    db.harness.sqlite.prepare(`
+      DELETE FROM addon_operations WHERE id = ? AND tenant = ?
+    `).run(operation?.id, db.env.TENANT_SLUG)
+
+    expect(await disableAddon(db.env, admin, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'fence_lost',
+    })
+  })
+
+  it('rejects disabled idempotency when teardown no longer has zero active claims', async () => {
+    await activateFixture()
+    expect(await disableAddon(db.env, owner, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'disabled',
+    })
+    db.harness.sqlite.prepare(`
+      UPDATE addon_resource_ownership
+         SET active = 1, released_at = NULL
+       WHERE installation_id = ?
+    `).run(db.installations()[0].id)
+
+    expect(await disableAddon(db.env, admin, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'write_failed',
+    })
+    expect(db.resources()).toEqual([expect.objectContaining({ active: 1, released_at: null })])
+  })
+
+  it('requires one active canonical co-owner claim per manifest department before disable', async () => {
+    await activateFixture()
+    db.harness.sqlite.prepare(`
+      UPDATE addon_resource_ownership
+         SET active = 0, released_at = ?
+       WHERE installation_id = ?
+    `).run(new Date().toISOString(), db.installations()[0].id)
+
+    expect(await disableAddon(db.env, admin, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'write_failed',
+    })
+    expect(db.installations()).toEqual([expect.objectContaining({ state: 'active' })])
+    expect(db.operations().filter((operation) => operation.action === 'disable')).toHaveLength(0)
+    expect(db.receipts().filter((receipt) => receipt.action === 'disable')).toHaveLength(0)
   })
 
   it('archives only after disable teardown, deletes nothing, and cannot reactivate the archived lifecycle', async () => {
