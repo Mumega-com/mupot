@@ -192,6 +192,20 @@ export interface BusPort {
 //   The fail-closed check here (real approval required) always holds — the S-loop
 //   adapter must produce a real record, not a bypass.
 
+/**
+ * The audit-trail diff a fetch-then-merge write produced (CRO apply-bridge, S5b —
+ * see executors/inkwell.ts ContentMergeDiff, which this type structurally matches).
+ * Present only for a merge-mode write (a targeted field/substring change); absent
+ * for a full-replace write (plain content-publish, seo-meta-fix) — those have no
+ * single-field diff to report, the whole body is the "after".
+ */
+export interface ExecuteDiff {
+  changeType: string
+  field: string
+  before: string
+  after: string
+}
+
 export interface ExecuteOutcome {
   /** True only when a real adapter performed an external write. */
   executed: boolean
@@ -201,6 +215,8 @@ export interface ExecuteOutcome {
   adapter?: string
   /** URL/path of the artifact created on a successful write (e.g. /blog/<slug>). */
   artifactUrl?: string
+  /** The merged field diff, when the adapter performed a fetch-then-merge write. */
+  diff?: ExecuteDiff
 }
 
 export interface ExecutorPort {

@@ -22,8 +22,20 @@ A CRO system that **handles conversion optimization proactively** and that Hadi 
 - Plan tiers enforce (S6a) — can gate data-source counts by tier
 
 ## Slices (each dyad-gated Opus + Codex, shipped live)
-- [ ] **S5b — apply bridge** — an approved CRO/content act auto-applies via the S4 executor (draft).
-      Closes the loop's apply leg. *Most sensitive: writes on policy → full adversarial gate.*
+- [~] **S5b — apply bridge** — BUILT, PR open, not yet dyad-gated/merged/deployed.
+      `kasra/cro-apply-bridge` (mupot) + `kasra/cro-apply-read-endpoint` (mumega.com,
+      companion PR adding the missing internal read-by-slug endpoint). Closes the
+      loop's apply leg with a FETCH-THEN-MERGE write (never full-replace) behind a
+      change-type allowlist (`src/departments/change-types.ts`): meta_title/
+      meta_description/cta_text/internal_links auto-proposable, body_copy/headline
+      flagged for extra human review, layout/forms/offer/pricing/brand_voice + any
+      unrecognized type hard-refused before a gate record exists. Still goes through
+      the SAME S4 propose→approve→execute gate — no auto-publish. *Most sensitive:
+      writes on policy → needs the full adversarial gate before merge, per the epic's
+      own note below.* Open gap: this slice does not yet wire `src/loops/cro.ts`'s
+      `reason()` output (a freeform `recommendation` string) into a structured
+      `{changeType, value, findText}` intent — that mapping is a product/NLP decision
+      left for the next slice, not fabricated here.
 - [x] **CRO data fabric — foundation** ✅ (PR #214, live) — `src/cro/sources.ts` (`CroSource` adapter
       interface + `collectFromSources` graceful degradation + `MAX_POINTS_PER_SOURCE` cap) +
       `src/cro/first-party.ts` (zero-cred floor over `metric_points`) + connector types (posthog/gsc/

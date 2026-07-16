@@ -470,16 +470,21 @@ dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
       // way this UPDATE only ever touches a row that is genuinely this pot's
       // own approved content-publish task.
       const now = new Date().toISOString()
+      // CRO apply-bridge (S5b): when the adapter performed a fetch-then-merge write
+      // (outcome.diff present — see executors/inkwell.ts ContentMergeDiff /
+      // ctx.ts ExecuteDiff), fold the change-type + before/after into this SAME
+      // receipt string rather than adding a second persistence path. Today this
+      // UPDATE is a harmless no-op for cro-apply's random-UUID gateId (same as it
+      // already is for seo-meta-fix — see the comment above); this stays ready for
+      // a future flow that mints gateId === task.id for a cro-apply proposal too.
+      const receiptResult = outcome.diff
+        ? `Applied ${outcome.diff.changeType} via ${outcome.adapter ?? 'unknown'}${outcome.artifactUrl ? `: ${outcome.artifactUrl}` : ''} — ${outcome.diff.field}: ${JSON.stringify(outcome.diff.before)} -> ${JSON.stringify(outcome.diff.after)}`
+        : `Published via ${outcome.adapter ?? 'unknown'}${outcome.artifactUrl ? `: ${outcome.artifactUrl}` : ''}`
       await c.env.DB.prepare(
         `UPDATE tasks SET status = 'done', result = ?, completed_at = ?, updated_at = ?
            WHERE id = ? AND status = 'approved'`,
       )
-        .bind(
-          `Published via ${outcome.adapter ?? 'unknown'}${outcome.artifactUrl ? `: ${outcome.artifactUrl}` : ''}`,
-          now,
-          now,
-          gateId,
-        )
+        .bind(receiptResult, now, now, gateId)
         .run()
     }
     return c.json(outcome, outcome.executed ? 200 : 422)
