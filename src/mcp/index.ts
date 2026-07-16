@@ -50,6 +50,17 @@ import {
 } from '../tasks/service'
 import type { TaskStatus } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
+// #22 v1 ATC ranking: pure scorer + the radar's existing agent runtime-state
+// loader (dashboard/radar.ts already uses this same loader for the fleet
+// view — not a new query shape).
+import {
+  rankTasks,
+  excludeFromRanking,
+  actionableStatusInSql,
+  terminalStatusInSql,
+  actionableStatusOrderSql,
+} from '../tasks/ranking'
+import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/observatory'
 import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
 import { classify, humanAge } from '../dashboard/fleet'
@@ -540,29 +551,79 @@ const toolTaskList: ToolSpec = {
     const limit = readLimit(args.limit, 25, 100)
     if (typeof limit !== 'number') return limit
 
-    const clauses = ['squad_id = ?1']
-    const binds: unknown[] = [squadRes.squad.id]
-    if (status) {
-      clauses.push(`status = ?${binds.length + 1}`)
-      binds.push(status)
-    }
+    const baseClauses = ['squad_id = ?1']
+    const baseBinds: unknown[] = [squadRes.squad.id]
     if (typeof assignee === 'string' && assignee.trim()) {
-      clauses.push(`assignee_agent_id = ?${binds.length + 1}`)
-      binds.push(assignee.trim())
+      baseClauses.push(`assignee_agent_id = ?${baseBinds.length + 1}`)
+      baseBinds.push(assignee.trim())
     }
-    binds.push(limit)
 
-    const rows = await env.DB.prepare(
-      `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
-         FROM tasks
-        WHERE ${clauses.join(' AND ')}
-        ORDER BY created_at DESC
-        LIMIT ?${binds.length}`,
-    )
-      .bind(...binds)
-      .all<Task>()
+    // #22 v1 ATC ranking (src/tasks/ranking.ts). Fetch is SPLIT and BOUNDED
+    // at the SQL layer, not just reordered in JS after an unbounded read —
+    // see ranking.ts's "SQL fetch-boundary helpers" section for the full P1
+    // writeup (2026-07-16 adversarial finding): fetching unbounded rows
+    // (there is no real "D1 1000-row cap" backstopping that — a prior draft
+    // of this comment falsely claimed there was) ordered by raw recency lets
+    // a squad with lots of `done`/gate-pipeline history fill the fetch
+    // window entirely with terminal rows, hiding genuinely old, actionable,
+    // high-priority work before rankTasks ever runs.
+    const taskRows: Task[] = []
 
-    return done({ squad_id: squadRes.squad.id, tasks: rows.results ?? [] })
+    if (status) {
+      // Explicit ?status filter: one bounded query for that single status.
+      // Actionable statuses fetch oldest-first (anti-starvation matters even
+      // within one status); terminal statuses fetch newest-first (a caller
+      // filtering to done/review/etc. wants the recent ones).
+      const isActionable = !excludeFromRanking(status)
+      const clauses = [...baseClauses, `status = ?${baseBinds.length + 1}`]
+      const binds = [...baseBinds, status]
+      const rows = await env.DB.prepare(
+        `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+           FROM tasks
+          WHERE ${clauses.join(' AND ')}
+          ORDER BY created_at ${isActionable ? 'ASC' : 'DESC'}
+          LIMIT ${limit}`,
+      )
+        .bind(...binds)
+        .all<Task>()
+      taskRows.push(...(rows.results ?? []))
+    } else {
+      // No status filter: actionable rows get first claim on the entire
+      // `limit` budget, fetched in the SAME band+age priority order rankTasks
+      // uses (so a limit that does bind never crowds out a higher-priority
+      // row). Terminal rows only fill whatever's left over — they can never
+      // compete with actionable rows for the same slots (the P1 finding's
+      // core failure mode).
+      const actionableRows = await env.DB.prepare(
+        `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+           FROM tasks
+          WHERE ${[...baseClauses, actionableStatusInSql()].join(' AND ')}
+          ORDER BY ${actionableStatusOrderSql()}, created_at ASC
+          LIMIT ${limit}`,
+      )
+        .bind(...baseBinds)
+        .all<Task>()
+      taskRows.push(...(actionableRows.results ?? []))
+
+      const remaining = limit - taskRows.length
+      if (remaining > 0) {
+        const terminalRows = await env.DB.prepare(
+          `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+             FROM tasks
+            WHERE ${[...baseClauses, terminalStatusInSql()].join(' AND ')}
+            ORDER BY created_at DESC
+            LIMIT ${remaining}`,
+        )
+          .bind(...baseBinds)
+          .all<Task>()
+        taskRows.push(...(terminalRows.results ?? []))
+      }
+    }
+
+    const agentStates: ReadonlyMap<string, AgentRuntimeState> =
+      taskRows.length > 0 ? await loadAgentRuntimeStates(env) : new Map()
+
+    return done({ squad_id: squadRes.squad.id, tasks: rankTasks(taskRows, agentStates) })
   },
 }
 
