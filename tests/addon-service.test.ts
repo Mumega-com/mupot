@@ -411,6 +411,28 @@ describe('addon migration constraints', () => {
     })
   })
 
+  it('rejects a lifecycle transition that reuses its original install receipt', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    await configureAddon(db.env, owner, 'fixture-addon')
+    const installReceipt = db.receipts().find((receipt) => receipt.action === 'install')
+    const configured = db.installations().find((row) => row.id === installation.id)
+    if (!installReceipt || !configured) throw new Error('expected configured addon lifecycle')
+
+    await expect(db.env.DB.batch([
+      db.env.DB.prepare(`
+        UPDATE addon_installations
+           SET state = 'active', latest_actor_id = ?1, latest_receipt_id = ?2
+         WHERE id = ?3 AND tenant = ?4 AND state = 'configured'
+      `).bind(owner.id, installReceipt.id, installation.id, db.env.TENANT_SLUG),
+    ])).rejects.toThrow()
+
+    expect(db.installations().find((row) => row.id === installation.id)).toMatchObject({
+      state: 'configured',
+      latest_receipt_id: configured.latest_receipt_id,
+    })
+    expect(db.receipts()).toHaveLength(2)
+  })
+
   it('keeps receipts append-only and constrains action, states, outcome, digest, and JSON', async () => {
     await installAddon(db.env, owner, 'fixture-addon')
     const installation = db.installations()[0]

@@ -16,7 +16,7 @@ export interface AddonInstallation {
   state: AddonState
   installedBy: string
   latestActorId: string
-  latestReceiptId: string | null
+  latestReceiptId: string
   installedAt: string
   configuredAt: string | null
   activatedAt: string | null
@@ -77,7 +77,7 @@ interface InstallationRow {
   state: AddonState
   installed_by: string
   latest_actor_id: string
-  latest_receipt_id: string | null
+  latest_receipt_id: string
   installed_at: string
   configured_at: string | null
   activated_at: string | null

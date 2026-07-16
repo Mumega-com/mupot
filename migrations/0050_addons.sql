@@ -47,6 +47,15 @@ BEGIN
   SELECT RAISE(ABORT, 'addon state transition requires a new receipt');
 END;
 
+CREATE TRIGGER IF NOT EXISTS addon_installations_state_requires_fresh_receipt
+  BEFORE UPDATE OF state ON addon_installations
+  WHEN NEW.state <> OLD.state AND EXISTS (
+    SELECT 1 FROM addon_receipts WHERE id = NEW.latest_receipt_id
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'addon state transition requires a fresh receipt');
+END;
+
 CREATE TRIGGER IF NOT EXISTS addon_installations_latest_receipt_requires_state
   BEFORE UPDATE OF latest_receipt_id ON addon_installations
   WHEN NEW.latest_receipt_id <> OLD.latest_receipt_id AND NEW.state = OLD.state
