@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
+import { html } from 'hono/html'
 import { addonsBody } from '../src/dashboard/addons'
 import { dashboardApp } from '../src/dashboard/index'
-import type { AddonCatalogEntry } from '../src/addons/registry'
+import { getRegisteredAddon, registerAddon, type AddonCatalogEntry } from '../src/addons/registry'
+import { registerAddonConsoleRenderer } from '../src/addons/console-registry'
 import type { AddonInstallation, AddonState } from '../src/addons/service'
 import { FixtureAddon } from '../src/addons/modules/fixture'
 import { MarketingCroMonitorAddon } from '../src/addons/modules/marketing-cro-monitor'
@@ -184,6 +186,40 @@ describe('addonsBody', () => {
       .not.toContain('href="/addons/marketing-cro-monitor"')
   })
 
+  it('links a valid manifest section whose path and renderer key differ from the addon key', () => {
+    expect(rendered()).not.toContain('href="/departments/fixture"')
+    expect(renderedEntry(fixtureEntry, [{
+      ...installation('configured'),
+      manifestSha256: fixtureEntry.manifestSha256,
+    }])).toContain('href="/departments/fixture"')
+  })
+
+  it('does not advertise a console path claimed by more than one manifest', () => {
+    const collisionEntry: AddonCatalogEntry = {
+      manifest: {
+        ...FixtureAddon,
+        key: 'fixture-card-collision',
+        name: 'Fixture Card Collision',
+      },
+      manifestSha256: 'c'.repeat(64),
+    }
+    const fixtureInstallation = {
+      ...installation('configured'),
+      manifestSha256: fixtureEntry.manifestSha256,
+    }
+    const collisionInstallation = {
+      ...installation('configured'),
+      id: 'installation-2',
+      addonKey: collisionEntry.manifest.key,
+      manifestSha256: collisionEntry.manifestSha256,
+    }
+
+    expect(String(addonsBody(
+      [fixtureEntry, collisionEntry],
+      [fixtureInstallation, collisionInstallation],
+    ))).not.toContain('href="/departments/fixture"')
+  })
+
   it.each([
     ['installed', ['Configure', 'Disable'], ['Install', 'Activate', 'Uninstall', 'Reinstall']],
     ['configured', ['Activate', 'Disable'], ['Configure', 'Uninstall', 'Reinstall']],
@@ -359,7 +395,7 @@ describe('GET /addons', () => {
   })
 })
 
-describe('GET /addons/:key', () => {
+describe('registered addon console paths', () => {
   const marketingInstallation = (state: AddonState): AddonInstallation => ({
     ...installation(state),
     addonKey: MarketingCroMonitorAddon.key,
@@ -370,7 +406,7 @@ describe('GET /addons/:key', () => {
   })
 
   it.each(['owner', 'admin'] as const)('renders an installed console for %s from its manifest renderer', async (role) => {
-    const registered = (await import('../src/addons/registry')).getRegisteredAddon(MarketingCroMonitorAddon.key)
+    const registered = getRegisteredAddon(MarketingCroMonitorAddon.key)
     const live = { ...marketingInstallation('configured'), manifestSha256: registered?.manifestSha256 ?? '' }
     const response = await dashboardApp.fetch(
       new Request('https://pot.test/addons/marketing-cro-monitor', {
@@ -383,6 +419,21 @@ describe('GET /addons/:key', () => {
     expect(response.status).toBe(200)
     expect(html).toContain('Marketing &amp; CRO')
     expect(html).toContain('Source health')
+  })
+
+  it('serves a noncanonical fixture path whose renderer key differs from its addon key', async () => {
+    const registered = getRegisteredAddon(FixtureAddon.key)
+    const live = { ...installation('configured'), manifestSha256: registered?.manifestSha256 ?? '' }
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/departments/fixture', {
+        headers: { Cookie: 'mupot_session=session-1' },
+      }),
+      dashboardEnv('owner', [live]),
+    )
+    const body = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(body).toContain('<p>Fixture</p>')
   })
 
   it('blocks members before resolving or loading an addon renderer', async () => {
@@ -407,6 +458,71 @@ describe('GET /addons/:key', () => {
         headers: { Cookie: 'mupot_session=session-1' },
       }),
       dashboardEnv('owner', [...installations]),
+    )
+
+    expect(response.status).toBe(404)
+    expect(await response.text()).toContain('Addon console not found.')
+  })
+
+  it('fails closed when the current installation identity differs from the registered manifest', async () => {
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/addons/marketing-cro-monitor', {
+        headers: { Cookie: 'mupot_session=session-1' },
+      }),
+      dashboardEnv('owner', [{ ...marketingInstallation('active'), manifestSha256: 'd'.repeat(64) }]),
+    )
+
+    expect(response.status).toBe(404)
+    expect(await response.text()).toContain('Addon console not found.')
+  })
+
+  it('does not let a registered addon section shadow an existing dashboard route', async () => {
+    registerAddonConsoleRenderer({
+      key: 'growth-collision-renderer',
+      path: '/departments/growth',
+      title: 'Collision',
+      navIcon: 'beaker',
+      render: async () => html`<p>Must not shadow growth</p>`,
+    })
+    await registerAddon({
+      ...FixtureAddon,
+      key: 'growth-collision-addon',
+      name: 'Growth Collision',
+      consoleSections: [{
+        rendererKey: 'growth-collision-renderer',
+        path: '/departments/growth',
+        title: 'Collision',
+        navIcon: 'beaker',
+      }],
+    })
+
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/departments/growth', {
+        headers: { Cookie: 'mupot_session=session-1' },
+      }),
+      dashboardEnv('owner'),
+    )
+    const body = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(body).toContain('Marketing &amp; Sales')
+    expect(body).not.toContain('Must not shadow growth')
+  })
+
+  it('fails closed when multiple manifests claim the same generic console path', async () => {
+    await registerAddon({
+      ...FixtureAddon,
+      key: 'fixture-collision-addon',
+      name: 'Fixture Collision',
+    })
+    const registered = getRegisteredAddon(FixtureAddon.key)
+    const live = { ...installation('configured'), manifestSha256: registered?.manifestSha256 ?? '' }
+
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/departments/fixture', {
+        headers: { Cookie: 'mupot_session=session-1' },
+      }),
+      dashboardEnv('owner', [live]),
     )
 
     expect(response.status).toBe(404)

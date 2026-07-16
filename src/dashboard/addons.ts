@@ -1,4 +1,5 @@
 import { html } from 'hono/html'
+import { getAddonConsoleRenderer, type AddonConsoleRenderer } from '../addons/console-registry'
 import type { AddonCatalogEntry } from '../addons/registry'
 import type { AddonInstallation, AddonState } from '../addons/service'
 import { pageHeader, pill } from './ui'
@@ -11,6 +12,55 @@ type LifecycleAction = 'install' | 'configure' | 'activate' | 'disable' | 'archi
 interface LifecycleCommand {
   action: LifecycleAction
   label: string
+}
+
+type AddonConsoleSection = AddonCatalogEntry['manifest']['consoleSections'][number]
+
+export interface ResolvedAddonConsolePath {
+  entry: AddonCatalogEntry
+  section: AddonConsoleSection
+  renderer: AddonConsoleRenderer
+}
+
+function matchingRenderer(section: AddonConsoleSection): AddonConsoleRenderer | null {
+  const renderer = getAddonConsoleRenderer(section.rendererKey)
+  return renderer
+    && renderer.key === section.rendererKey
+    && renderer.path === section.path
+    && renderer.title === section.title
+    && renderer.navIcon === section.navIcon
+    ? renderer
+    : null
+}
+
+export function resolveAddonConsolePath(
+  entries: readonly AddonCatalogEntry[],
+  path: string,
+): ResolvedAddonConsolePath | null {
+  let resolved: ResolvedAddonConsolePath | null = null
+  for (const entry of entries) {
+    for (const section of entry.manifest.consoleSections) {
+      if (section.path !== path) continue
+      const renderer = matchingRenderer(section)
+      if (!renderer || resolved) return null
+      resolved = { entry, section, renderer }
+    }
+  }
+  return resolved
+}
+
+export function installedAddonIdentityMatches(
+  entry: AddonCatalogEntry,
+  installation: AddonInstallation | undefined,
+): installation is AddonInstallation {
+  if (!installation) return false
+  return installation.state !== 'archived'
+    && installation.addonKey === entry.manifest.key
+    && installation.installedVersion === entry.manifest.version
+    && installation.publisher === entry.manifest.publisher
+    && installation.trustClass === entry.manifest.trustClass
+    && installation.mupotCompatibility === entry.manifest.mupotCompatibility
+    && installation.manifestSha256 === entry.manifestSha256
 }
 
 export function latestInstallationByKey(installations: AddonInstallation[]): Map<string, AddonInstallation> {
@@ -78,9 +128,12 @@ export function addonsBody(entries: AddonCatalogEntry[], installations: AddonIns
     const digest = (installation?.manifestSha256 ?? entry.manifestSha256).slice(-12)
     const commands = commandsForState(state)
     const receiptsHref = `/api/addons/${encodeURIComponent(entry.manifest.key)}/receipts`
-    const consoleSection = installation && installation.state !== 'archived'
-      ? entry.manifest.consoleSections.find((section) => section.path === `/addons/${entry.manifest.key}`)
-      : undefined
+    const consoleSections = installedAddonIdentityMatches(entry, installation)
+      ? entry.manifest.consoleSections.filter((section) => {
+          const resolved = resolveAddonConsolePath(entries, section.path)
+          return resolved?.entry === entry
+        })
+      : []
 
     return html`
       <section class="addon-card" data-addon-card>
@@ -103,12 +156,11 @@ export function addonsBody(entries: AddonCatalogEntry[], installations: AddonIns
           <div class="addon-fact addon-fact-wide"><span>Requested</span><strong>${requestedSummary(entry)}</strong></div>
         </div>
         <div class="addon-actions">
-          ${consoleSection
-            ? html`<a class="addon-console" href="${consoleSection.path}">
+          ${consoleSections.map((section) => html`
+              <a class="addon-console" href="${section.path}">
                 <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
-                Open console
-              </a>`
-            : ''}
+                ${consoleSections.length === 1 ? 'Open console' : `Open ${section.title}`}
+              </a>`)}
           <a class="addon-receipts" href="${receiptsHref}">Receipts</a>
           <div class="addon-command-list">
             ${commands.map((command) => html`<button class="btn secondary sm addon-command" type="button" data-addon-key="${entry.manifest.key}" data-addon-action="${command.action}">${command.label}</button>`)}

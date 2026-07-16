@@ -177,8 +177,8 @@ export async function loadMarketingCroMonitorView(
   const readRuns = deps.listRuns ?? listMarketingMonitorRuns
   const [bindingsResult, latestResult, runsResult] = await Promise.allSettled([
     readBindings(env, installation.id),
-    readLatest(env, actor),
-    readRuns(env, actor, { limit: RUN_LIST_LIMIT }),
+    readLatest(env, actor, { installationId: installation.id }),
+    readRuns(env, actor, { limit: RUN_LIST_LIMIT, installationId: installation.id }),
   ])
 
   const latestRead = latestResult.status === 'fulfilled' && latestResult.value.ok

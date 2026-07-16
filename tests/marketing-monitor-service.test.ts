@@ -7,7 +7,7 @@ import {
   runMarketingMonitor,
   type MarketingMonitorSourceFactory,
 } from '../src/addons/marketing/service'
-import { activateAddon, configureAddon, disableAddon, installAddon } from '../src/addons/service'
+import { activateAddon, configureAddon, disableAddon, installAddon, type AddonInstallation } from '../src/addons/service'
 import { archiveAddon } from '../src/addons/service'
 import type { Env } from '../src/types'
 import { createMarketingMonitorFixtureSource } from './fixtures/marketing-monitor'
@@ -36,17 +36,36 @@ const window = {
   start: '2026-07-01T00:00:00.000Z',
   end: '2026-07-01T23:59:59.999Z',
 }
+const nextWindow = {
+  start: '2026-07-02T00:00:00.000Z',
+  end: '2026-07-02T23:59:59.999Z',
+}
 
 function envFor(harness: SqliteD1Harness, tenant = 'tenant-a'): Env {
   return { DB: harness.db, TENANT_SLUG: tenant } as Env
 }
 
-async function activateMarketing(env: Env) {
-  expect(await installAddon(env, owner, 'marketing-cro-monitor')).toEqual(expect.objectContaining({ ok: true }))
+async function activateMarketing(env: Env): Promise<AddonInstallation> {
+  const installed = await installAddon(env, owner, 'marketing-cro-monitor')
+  expect(installed).toEqual(expect.objectContaining({ ok: true }))
+  if (!installed.ok) throw new Error(`install failed: ${installed.reason}`)
   expect(await configureAddon(env, owner, 'marketing-cro-monitor', {
     bindings: [{ slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' }],
   })).toEqual(expect.objectContaining({ ok: true }))
   expect(await activateAddon(env, owner, 'marketing-cro-monitor')).toEqual(expect.objectContaining({ ok: true }))
+  return installed.installation
+}
+
+function insertPosthogConnector(harness: SqliteD1Harness): string {
+  const id = crypto.randomUUID()
+  harness.sqlite.prepare(`
+    INSERT INTO connectors (
+      id, tenant, type, label, encrypted_secret, meta, scope_type,
+      scope_id, created_by, created_at, revoked_at
+    ) VALUES (?, 'tenant-a', 'posthog', 'Monitor read scope', 'opaque-ciphertext',
+      '{}', 'pot', NULL, 'owner-1', '2026-07-16T00:00:00.000Z', NULL)
+  `).run(id)
+  return id
 }
 
 function fixtureFactory(
@@ -290,6 +309,62 @@ describe('marketing monitor service', () => {
     for (const forbidden of ['connectorId', 'connector_id', 'configuredBy', 'actorId', 'rawPayload', 'building']) {
       expect(serialized).not.toContain(forbidden)
     }
+  })
+
+  it('reads only runs from the current live binding generation after reconfiguration', async () => {
+    const installation = await activateMarketing(env)
+    const oldRun = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(oldRun.ok).toBe(true)
+
+    expect(await disableAddon(env, owner, 'marketing-cro-monitor')).toEqual(expect.objectContaining({ ok: true }))
+    const connectorId = insertPosthogConnector(harness)
+    expect(await configureAddon(env, owner, 'marketing-cro-monitor', {
+      bindings: [{ slot: 'web_analytics', adapter: 'posthog', bindingKind: 'vault_connector', connectorId }],
+    })).toEqual(expect.objectContaining({ ok: true }))
+
+    const generations = harness.sqlite.prepare(`
+      SELECT id, revoked_at FROM addon_binding_generations
+       WHERE installation_id = ? ORDER BY configured_at, id
+    `).all(installation.id) as Array<{ id: string; revoked_at: string | null }>
+    expect(generations).toHaveLength(2)
+    expect(generations[0].revoked_at).toEqual(expect.any(String))
+    expect(generations[1].revoked_at).toBeNull()
+    expect(await getLatestMarketingMonitorRun(env, owner, { installationId: installation.id }))
+      .toEqual({ ok: true, run: null })
+    expect(await listMarketingMonitorRuns(env, owner, { limit: 10, installationId: installation.id }))
+      .toEqual({ ok: true, runs: [] })
+
+    expect(await activateAddon(env, owner, 'marketing-cro-monitor')).toEqual(expect.objectContaining({ ok: true }))
+    const newRun = await runMarketingMonitor(env, owner, { window: nextWindow }, { sourceFactory: fixtureFactory() })
+    expect(newRun.ok).toBe(true)
+    expect(await listMarketingMonitorRuns(env, owner, { limit: 10, installationId: installation.id }))
+      .toEqual({
+        ok: true,
+        runs: [expect.objectContaining({ id: newRun.ok ? newRun.run.id : '' })],
+      })
+  })
+
+  it('does not expose archived installation runs after reinstalling the addon', async () => {
+    const oldInstallation = await activateMarketing(env)
+    const oldRun = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(oldRun.ok).toBe(true)
+    expect(await disableAddon(env, owner, 'marketing-cro-monitor')).toEqual(expect.objectContaining({ ok: true }))
+    expect(await archiveAddon(env, owner, 'marketing-cro-monitor')).toEqual(expect.objectContaining({ ok: true }))
+
+    const newInstallation = await activateMarketing(env)
+    expect(newInstallation.id).not.toBe(oldInstallation.id)
+    expect(await getLatestMarketingMonitorRun(env, owner, { installationId: newInstallation.id }))
+      .toEqual({ ok: true, run: null })
+    expect(await listMarketingMonitorRuns(env, owner, { limit: 10, installationId: newInstallation.id }))
+      .toEqual({ ok: true, runs: [] })
+
+    const newRun = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(newRun.ok).toBe(true)
+    expect(await getLatestMarketingMonitorRun(env, owner, { installationId: newInstallation.id }))
+      .toEqual({
+        ok: true,
+        run: expect.objectContaining({ id: newRun.ok ? newRun.run.id : '' }),
+      })
   })
 
   it('computes the canonical versioned evidence digest over ordered public evidence', async () => {
