@@ -183,6 +183,17 @@ dashboardApp.use('*', async (c, next) => {
   await next()
 })
 
+// Addon discoverability is part of the server-rendered shell, not a client-side
+// privilege hint. Keep the shell template role-agnostic and reveal this one
+// operator-only entry after the authenticated route response has been rendered.
+dashboardApp.use('*', async (c, next) => {
+  await next()
+  if (!isAdmin(c.get('auth')) || !c.res.headers.get('content-type')?.includes('text/html')) return
+
+  const body = await c.res.text()
+  c.res = new Response(body.replace('id="nav-addons" hidden', 'id="nav-addons"'), c.res)
+})
+
 // ── setup wizard ─────────────────────────────────────────────────────────────
 // Mounted on the authenticated, tenant-guarded dashboard app. The wizard enforces
 // its own owner-only gate (org role 'owner' OR org-capability 'owner') internally.
@@ -306,7 +317,7 @@ dashboardApp.get('/addons', async (c) => {
   }
   try {
     const installations = await listAddonInstallations(c.env)
-    return c.html(shell(c.env.BRAND, 'Addons', addonsBody(listRegisteredAddons(), installations), { showAddons: true }))
+    return c.html(shell(c.env.BRAND, 'Addons', addonsBody(listRegisteredAddons(), installations)))
   } catch {
     return c.html(shell(c.env.BRAND, 'Addons', errorBody('Addon catalog is unavailable.')), 500)
   }
@@ -1915,8 +1926,6 @@ interface HeaderChips {
    *  that case); `configured: true` with `todayUsdMicro: 0` is an honest $0.00 —
    *  spend WAS tracked today, it was just zero. */
   costToday?: { configured: boolean; todayUsdMicro: number } | null
-  /** Render the owner/admin Addons entry immediately; other shell views reveal it after /auth/me. */
-  showAddons?: boolean
 }
 
 /** Regime label shown in the compact header chip — just Title-Cases the raw
@@ -2867,7 +2876,7 @@ function shell(
             <span class="nav-label">Health</span>
           </a>
 
-          <a class="nav-link" href="/addons" id="nav-addons"${header.showAddons ? raw('') : raw(' hidden')}>
+          <a class="nav-link" href="/addons" id="nav-addons" hidden>
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M7.2 3.5v3.1a2.1 2.1 0 1 0 2.1 2.1h3.2v-2a1.9 1.9 0 1 1 3.8 0v2H17v6.1H9.3a2.1 2.1 0 1 0-2.1 2.1v-2.1H3.5V9h2.1a2.1 2.1 0 1 0 1.6-3.4V3.5z"/></svg>
             <span class="nav-label">Addons</span>
           </a>
@@ -3082,9 +3091,6 @@ function shell(
             // /auth/me returns the authenticated org role. Older response shapes
             // may expose capability, but must never leave an owner as "member".
             if (role && (a.role || a.capability)) role.textContent = a.role || a.capability;
-            var operatorRole = a.role || a.capability;
-            var addonsNav = document.getElementById('nav-addons');
-            if (addonsNav && (operatorRole === 'owner' || operatorRole === 'admin')) addonsNav.removeAttribute('hidden');
             if (av) {
               var initials = (a.name || who || '?').replace(/\s+/g, ' ').split(' ').map(function(w){ return w[0]; }).join('').substring(0, 2).toUpperCase();
               av.textContent = initials;

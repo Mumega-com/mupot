@@ -40,6 +40,47 @@ function rendered(state: AddonState | null = null): string {
   return String(addonsBody([fixtureEntry], state ? [installation(state)] : []))
 }
 
+function renderedEntry(entry: AddonCatalogEntry, installations: AddonInstallation[] = []): string {
+  return String(addonsBody([entry], installations))
+}
+
+function lifecycleScript(markup: string): string {
+  const script = markup.match(/<script>\s*([\s\S]*?)\s*<\/script>/)
+  if (!script) throw new Error('addon lifecycle script was not rendered')
+  return script[1]
+}
+
+function lifecycleHarness(key = 'fixture-addon') {
+  let click: (() => Promise<void>) | undefined
+  const status = { textContent: '' }
+  const card = { querySelector: (selector: string) => selector === '.addon-status' ? status : null }
+  const button = {
+    dataset: { addonKey: key, addonAction: 'install' },
+    disabled: false,
+    closest: (selector: string) => selector === '[data-addon-card]' ? card : null,
+    addEventListener: (event: string, listener: () => Promise<void>) => {
+      if (event === 'click') click = listener
+    },
+  }
+  const document = {
+    querySelectorAll: (selector: string) => selector === '[data-addon-action][data-addon-key]' ? [button] : [],
+  }
+  let reloads = 0
+  const window = { location: { reload: () => { reloads += 1 } } }
+
+  return {
+    button,
+    status,
+    document,
+    window,
+    click: async () => {
+      if (!click) throw new Error('lifecycle click listener was not attached')
+      await click()
+    },
+    reloads: () => reloads,
+  }
+}
+
 function dashboardEnv(role: 'owner' | 'admin' | 'member'): Env {
   const statement = {
     bind: (..._args: unknown[]) => statement,
@@ -113,6 +154,90 @@ describe('addonsBody', () => {
     expect(html).toContain("status.textContent = data.error || 'request_failed'")
     expect(html).toContain('window.location.reload()')
   })
+
+  it('escapes hostile display values and encodes the receipt path from renderer DTOs', () => {
+    const hostileEntry: AddonCatalogEntry = {
+      ...fixtureEntry,
+      manifest: {
+        ...FixtureAddon,
+        key: 'receipt/key?x=1',
+        name: '<img src=x onerror=alert(1)>',
+        description: '<svg onload=alert(2)>',
+        publisher: '<b onclick=alert(3)>',
+      },
+    }
+
+    const html = renderedEntry(hostileEntry)
+
+    expect(html).toContain('href="/api/addons/receipt%2Fkey%3Fx%3D1/receipts"')
+    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;')
+    expect(html).toContain('&lt;svg onload=alert(2)&gt;')
+    expect(html).toContain('&lt;b onclick=alert(3)&gt;')
+    expect(html).not.toContain('<img src=x onerror=alert(1)>')
+    expect(html).not.toContain('<svg onload=alert(2)>')
+    expect(html).not.toContain('<b onclick=alert(3)>')
+  })
+
+  it('prefers a live installation over archived history in the renderer selection', () => {
+    const archived = { ...installation('archived'), id: 'archived', manifestSha256: 'a'.repeat(64), archivedAt: '2026-07-03T00:00:00.000Z' }
+    const live = { ...installation('disabled'), id: 'live', manifestSha256: 'b'.repeat(64), updatedAt: '2026-07-01T00:00:00.000Z' }
+
+    const html = renderedEntry(fixtureEntry, [archived, live])
+
+    expect(html).toContain('Disabled')
+    expect(html).toContain('b'.repeat(12))
+    expect(html).not.toContain('Archived')
+  })
+
+  it('selects the newest archive when no live installation remains', () => {
+    const older = { ...installation('archived'), id: 'older', manifestSha256: 'a'.repeat(64), archivedAt: '2026-07-01T00:00:00.000Z' }
+    const newer = { ...installation('archived'), id: 'newer', manifestSha256: 'b'.repeat(64), archivedAt: '2026-07-03T00:00:00.000Z' }
+
+    const html = renderedEntry(fixtureEntry, [older, newer])
+
+    expect(html).toContain('Archived')
+    expect(html).toContain('b'.repeat(12))
+  })
+
+  it('executes plain browser JavaScript and preserves a stable lifecycle error', async () => {
+    const harness = lifecycleHarness('fixture/addon?x=1')
+    const script = lifecycleScript(rendered())
+    let requestPath = ''
+    let resolveResponse: ((response: { ok: boolean; json: () => Promise<{ error: string }> }) => void) | undefined
+    const response = new Promise<{ ok: boolean; json: () => Promise<{ error: string }> }>((resolve) => { resolveResponse = resolve })
+    const fetch = (path: string) => {
+      requestPath = path
+      return response
+    }
+
+    new Function('document', 'fetch', 'window', script)(harness.document, fetch, harness.window)
+    const click = harness.click()
+
+    expect(requestPath).toBe('/api/addons/fixture%2Faddon%3Fx%3D1/install')
+    expect(harness.button.disabled).toBe(true)
+    expect(harness.status.textContent).toBe('Working...')
+
+    resolveResponse?.({ ok: false, json: async () => ({ error: 'invalid_state' }) })
+    await click
+
+    expect(harness.button.disabled).toBe(false)
+    expect(harness.status.textContent).toBe('invalid_state')
+    expect(harness.reloads()).toBe(0)
+  })
+
+  it('reloads after a successful lifecycle action', async () => {
+    const harness = lifecycleHarness()
+    const script = lifecycleScript(rendered())
+
+    new Function('document', 'fetch', 'window', script)(
+      harness.document,
+      async () => ({ ok: true, json: async () => ({}) }),
+      harness.window,
+    )
+    await harness.click()
+
+    expect(harness.reloads()).toBe(1)
+  })
 })
 
 describe('GET /addons', () => {
@@ -133,6 +258,28 @@ describe('GET /addons', () => {
     expect(response.status).toBe(403)
     expect(html).toContain('Addons requires owner or admin.')
     expect(html).toContain('id="nav-addons" hidden')
-    expect(html).toContain("operatorRole === 'owner' || operatorRole === 'admin'")
+    expect(html).not.toContain("operatorRole === 'owner' || operatorRole === 'admin'")
+  })
+
+  it.each(['owner', 'admin'] as const)('server-renders the Addons nav entry across shell responses for %s', async (role) => {
+    const response = await dashboardApp.fetch(new Request('https://pot.test/services', {
+      headers: { Cookie: 'mupot_session=session-1' },
+    }), dashboardEnv(role))
+    const html = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(html).toContain('id="nav-addons">')
+    expect(html).not.toContain('id="nav-addons" hidden')
+    expect(html).not.toContain("operatorRole === 'owner' || operatorRole === 'admin'")
+  })
+
+  it('keeps the Addons nav entry hidden for members across shell responses', async () => {
+    const response = await dashboardApp.fetch(new Request('https://pot.test/services', {
+      headers: { Cookie: 'mupot_session=session-1' },
+    }), dashboardEnv('member'))
+    const html = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(html).toContain('id="nav-addons" hidden')
   })
 })

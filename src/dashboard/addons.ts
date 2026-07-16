@@ -145,7 +145,7 @@ export function addonsBody(entries: AddonCatalogEntry[], installations: AddonIns
             if (status) status.textContent = 'Working...';
             try {
               var response = await fetch('/api/addons/' + encodeURIComponent(key) + '/' + action, { method: 'POST' });
-              var data: { error?: string } = {};
+              var data = {};
               try { data = await response.json(); } catch (_) {}
               if (!response.ok) {
                 if (status) status.textContent = data.error || 'request_failed';
