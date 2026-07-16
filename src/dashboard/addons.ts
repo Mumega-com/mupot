@@ -46,14 +46,20 @@ function stateTone(state: ConsoleState): 'primary' | 'ok' | 'warn' | 'dim' {
 function commandsForState(state: ConsoleState): LifecycleCommand[] {
   switch (state) {
     case 'available': return [{ action: 'install', label: 'Install' }]
-    case 'installed': return [{ action: 'configure', label: 'Configure' }]
-    case 'configured': return [{ action: 'activate', label: 'Activate' }]
+    case 'installed': return [
+      { action: 'configure', label: 'Configure' },
+      { action: 'disable', label: 'Disable' },
+    ]
+    case 'configured': return [
+      { action: 'activate', label: 'Activate' },
+      { action: 'disable', label: 'Disable' },
+    ]
     case 'active': return [{ action: 'disable', label: 'Disable' }]
     case 'disabled': return [
       { action: 'activate', label: 'Activate' },
       { action: 'archive', label: 'Uninstall' },
     ]
-    case 'archived': return []
+    case 'archived': return [{ action: 'install', label: 'Reinstall' }]
   }
 }
 
@@ -99,6 +105,9 @@ export function addonsBody(entries: AddonCatalogEntry[], installations: AddonIns
             ${commands.map((command) => html`<button class="btn secondary sm addon-command" type="button" data-addon-key="${entry.manifest.key}" data-addon-action="${command.action}">${command.label}</button>`)}
           </div>
           <span class="addon-status" role="status" aria-live="polite"></span>
+          ${state === 'disabled'
+            ? html`<p class="addon-retention">Uninstall retains tasks, flights, metrics, audit records, and receipts.</p>`
+            : ''}
         </div>
       </section>`
   })
@@ -123,6 +132,7 @@ export function addonsBody(entries: AddonCatalogEntry[], installations: AddonIns
       .addon-command-list { display: flex; gap: 8px; flex-wrap: wrap; }
       .addon-command { min-width: 92px; height: 32px; margin: 0; padding: 0 10px; }
       .addon-status { color: var(--dim); font-size: 12px; min-height: 18px; overflow-wrap: anywhere; }
+      .addon-retention { color: var(--dim); flex-basis: 100%; font-size: 11.5px; line-height: 1.4; margin: 0; }
       @media (max-width: 680px) {
         .addon-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .addon-actions { align-items: flex-start; flex-wrap: wrap; }

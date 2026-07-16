@@ -119,8 +119,8 @@ describe('addonsBody', () => {
   })
 
   it.each([
-    ['installed', ['Configure'], ['Install', 'Activate', 'Disable', 'Uninstall']],
-    ['configured', ['Activate'], ['Configure', 'Disable', 'Uninstall']],
+    ['installed', ['Configure', 'Disable'], ['Install', 'Activate', 'Uninstall', 'Reinstall']],
+    ['configured', ['Activate', 'Disable'], ['Configure', 'Uninstall', 'Reinstall']],
     ['active', ['Disable'], ['Configure', 'Activate', 'Uninstall']],
     ['disabled', ['Activate', 'Uninstall'], ['Configure', 'Disable']],
   ] as const)('renders only valid lifecycle commands for %s addons', (state, present, absent) => {
@@ -130,11 +130,20 @@ describe('addonsBody', () => {
     for (const label of absent) expect(html).not.toContain(`>${label}</button>`)
   })
 
-  it('renders archived addons without a lifecycle mutation button', () => {
+  it('renders archived addons with a reinstall command', () => {
     const html = rendered('archived')
 
     expect(html).toContain('Archived')
-    expect(html).not.toMatch(/<button[^>]+data-addon-action=/)
+    expect(html).toMatch(/<button[^>]+data-addon-action="install"[^>]*>Reinstall<\/button>/)
+    expect(html).not.toMatch(/data-addon-action="(?:configure|activate|disable|archive)"/)
+  })
+
+  it('explains retained operational data beside uninstall without nesting cards', () => {
+    const html = rendered('disabled')
+
+    expect(html).toContain('Uninstall retains tasks, flights, metrics, audit records, and receipts.')
+    expect(html.match(/class="addon-card"/g)).toHaveLength(1)
+    expect(html).not.toMatch(/class="addon-card"[^]*class="addon-card"/)
   })
 
   it('binds every lifecycle command to addon data rather than a rendered action URL', () => {
