@@ -19,7 +19,7 @@ export const FixtureAddon: AddonManifestV1 = {
   metrics: [{ descriptorKey: 'fixture.pings', ownerDepartment: 'fixture' }],
   playbooks: [],
   loops: [],
-  consoleSections: [{ rendererKey: 'fixture', path: '/departments/fixture', title: 'Fixture', navIcon: 'flask-conical' }],
+  consoleSections: [{ rendererKey: 'fixture', path: '/departments/fixture', title: 'Fixture', navIcon: 'beaker' }],
   eventSubscriptions: [],
   approvalPolicies: [],
   healthChecks: [],

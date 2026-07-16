@@ -49,6 +49,38 @@ describe('addon lifecycle routes', () => {
 
   afterEach(() => harness.close())
 
+  it.each([undefined, 'https://sibling.pot.test'])(
+    'rejects cookie-authenticated lifecycle mutations with origin %s',
+    async (origin) => {
+      const headers = new Headers({
+        Cookie: 'mupot_session=session-1',
+        'Content-Type': 'application/json',
+      })
+      if (origin) headers.set('Origin', origin)
+
+      const res = await addonsApp.fetch(new Request('https://pot.test/fixture-addon/install', {
+        method: 'POST',
+        headers,
+      }), envForRole(harness, 'owner'))
+
+      expect(res.status).toBe(403)
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM addon_installations').get()).toEqual({ count: 0 })
+    },
+  )
+
+  it('leaves bearer-only requests to the existing authentication path', async () => {
+    const res = await addonsApp.fetch(new Request('https://pot.test/fixture-addon/install', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer machine-token',
+        'Content-Type': 'application/json',
+      },
+    }), envForRole(harness, 'owner'))
+
+    expect(res.status).toBe(401)
+    await expect(res.json()).resolves.toEqual({ error: 'unauthenticated' })
+  })
+
   it.each(['install', 'configure', 'activate', 'disable', 'archive'] as const)(
     'rejects member %s commands with the owner/admin envelope',
     async (action) => {

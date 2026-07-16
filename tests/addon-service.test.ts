@@ -6,6 +6,9 @@ import { getRegisteredAddon } from '../src/addons/registry'
 import {
   activate as activateDepartment,
   deactivate as deactivateDepartment,
+  getActive as getActiveDepartments,
+  getActiveConsoleSections,
+  getActiveMetricDescriptors,
 } from '../src/departments/registry'
 import {
   activateAddon,
@@ -1804,7 +1807,9 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     expect(db.installations()[0].state).toBe('configured')
     expect(db.departments()).toHaveLength(1)
     expect(db.squads()).toHaveLength(1)
-    expect(db.resources()).toHaveLength(0)
+    expect(db.resources()).toEqual([
+      expect.objectContaining({ active: 1, resource_key: 'fixture' }),
+    ])
     expect(db.operations()).toEqual([
       expect.objectContaining({ action: 'activate', current_step: 'activate_departments', status: 'running' }),
     ])
@@ -1823,6 +1828,40 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     ])
     expect(db.receipts().filter((receipt) => receipt.action === 'activate')).toEqual([
       expect.objectContaining({ actor_id: owner.id, previous_state: 'configured', next_state: 'active' }),
+    ])
+  })
+
+  it('fences addon-managed runtime discovery until the installation is active', async () => {
+    await configureFixture()
+    let interrupted = false
+
+    expect(await activateAddon(db.env, owner, 'fixture-addon', {
+      afterDepartmentActivated() {
+        if (interrupted) return
+        interrupted = true
+        throw new Error('interrupt before activation transition')
+      },
+    })).toEqual({ ok: false, reason: 'write_failed' })
+
+    expect(db.installations()).toEqual([expect.objectContaining({ state: 'configured' })])
+    expect(db.departments()).toEqual([expect.objectContaining({ active: 1 })])
+    expect(await getActiveDepartments(db.env.DB)).toEqual([])
+    expect(await getActiveConsoleSections(db.env.DB)).toEqual([])
+    expect(await getActiveMetricDescriptors(db.env.DB)).toEqual([])
+
+    expireRunningLease(db, 'activate')
+    expect(await activateAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'active' })
+    expect(await getActiveDepartments(db.env.DB)).toHaveLength(1)
+    expect(await getActiveConsoleSections(db.env.DB)).toHaveLength(1)
+    expect(await getActiveMetricDescriptors(db.env.DB)).toHaveLength(2)
+  })
+
+  it('preserves ordinary active departments outside addon ownership', async () => {
+    const activated = await activateDepartment(db.env.DB, 'fixture')
+    expect(activated).toMatchObject({ ok: true })
+
+    expect(await getActiveDepartments(db.env.DB)).toEqual([
+      expect.objectContaining({ id: activated.ok ? activated.departmentId : '', active: 1 }),
     ])
   })
 
@@ -1957,9 +1996,14 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     barrier.release()
 
     expect(await stale).toEqual({ ok: false, reason: 'fence_lost' })
-    expect(db.resources()).toEqual([
+    const staleInstallation = db.installations().find((installation) => (
+      installation.addon_key === 'fixture-addon'
+    ))
+    expect(db.resources()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ installation_id: staleInstallation?.id, active: 0 }),
       expect.objectContaining({ id: 'corrective-deactivate-owner', active: 1 }),
-    ])
+    ]))
+    expect(db.resources()).toHaveLength(2)
     expect(db.departments()).toEqual([
       expect.objectContaining({ id: departmentId, active: 1 }),
     ])
@@ -2195,6 +2239,80 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       actor_id: owner.id,
     })
     expect(db.receipts().filter((receipt) => receipt.action === 'disable')).toHaveLength(1)
+  })
+
+  it('fences runtime discovery immediately after state-first disable', async () => {
+    await activateFixture()
+
+    expect(await disableAddon(db.env, owner, 'fixture-addon', {
+      afterInstallationDisabled() {
+        throw new Error('interrupt after execution fence')
+      },
+    })).toEqual({ ok: false, reason: 'write_failed' })
+
+    expect(db.installations()).toEqual([expect.objectContaining({ state: 'disabled' })])
+    expect(db.departments()).toEqual([expect.objectContaining({ active: 1 })])
+    expect(db.resources()).toEqual([expect.objectContaining({ active: 1 })])
+    expect(await getActiveDepartments(db.env.DB)).toEqual([])
+    expect(await getActiveConsoleSections(db.env.DB)).toEqual([])
+    expect(await getActiveMetricDescriptors(db.env.DB)).toEqual([])
+  })
+
+  it.each(['installed', 'configured'] as const)(
+    'disables and archives directly from %s without activating resources',
+    async (state) => {
+      await installAddon(db.env, owner, 'fixture-addon')
+      if (state === 'configured') await configureAddon(db.env, owner, 'fixture-addon')
+
+      expect(await disableAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+        ok: true,
+        state: 'disabled',
+        installation: { latestPreviousState: state },
+      })
+      expect(await archiveAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+        ok: true,
+        state: 'archived',
+      })
+      expect(db.departments()).toEqual([])
+      expect(db.squads()).toEqual([])
+      expect(db.resources()).toEqual([])
+      expect(db.receipts().filter((receipt) => receipt.action === 'disable')).toEqual([
+        expect.objectContaining({ previous_state: state, next_state: 'disabled' }),
+      ])
+    },
+  )
+
+  it('uses persisted installation and claim evidence to disable and archive after registry drift', async () => {
+    await activateFixture()
+    const persistedDigest = db.installations()[0].manifest_sha256
+    db.harness.sqlite.exec('DROP TRIGGER addon_installations_identity_is_immutable')
+    db.harness.sqlite.prepare(`
+      UPDATE addon_installations SET manifest_sha256 = ? WHERE addon_key = 'fixture-addon'
+    `).run('b'.repeat(64))
+
+    expect(await disableAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'disabled' })
+    expect(await archiveAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'archived' })
+    expect(db.resources()).toEqual([expect.objectContaining({ active: 0 })])
+    expect(db.departments()).toEqual([expect.objectContaining({ active: 0 })])
+    expect(db.receipts().filter((receipt) => ['disable', 'archive'].includes(receipt.action))).toEqual([
+      expect.objectContaining({ action: 'disable', manifest_sha256: 'b'.repeat(64) }),
+      expect.objectContaining({ action: 'archive', manifest_sha256: 'b'.repeat(64) }),
+    ])
+    expect(persistedDigest).not.toBe('b'.repeat(64))
+  })
+
+  it('uses persisted claims to tear down an addon removed from the current registry', async () => {
+    const installation = await insertInstallationLifecycle(db, { addonKey: 'retired-addon' })
+    await transitionInstallation(db, installation.id, 'configure', 'installed', 'configured')
+    const department = await activateDepartment(db.env.DB, 'fixture')
+    if (!department.ok) throw new Error(`fixture activation failed: ${department.reason}`)
+    insertOwnership(db, 'retired-addon-claim', installation.id, department.departmentId, 'co_owner')
+    await transitionInstallation(db, installation.id, 'activate', 'configured', 'active')
+
+    expect(await disableAddon(db.env, owner, 'retired-addon')).toMatchObject({ ok: true, state: 'disabled' })
+    expect(await archiveAddon(db.env, owner, 'retired-addon')).toMatchObject({ ok: true, state: 'archived' })
+    expect(db.resources()).toEqual([expect.objectContaining({ id: 'retired-addon-claim', active: 0 })])
+    expect(db.departments()).toEqual([expect.objectContaining({ id: department.departmentId, active: 0 })])
   })
 
   it('resumes interruption after deactivation and before claim release', async () => {

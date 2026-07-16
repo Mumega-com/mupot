@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { csrf } from 'hono/csrf'
 import type { Context } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { requireAuth } from '../auth'
@@ -148,6 +149,17 @@ async function mutate(c: Context<AppEnv>, action: LifecycleAction) {
 
 export const addonsApp = new Hono<AppEnv>()
 
+addonsApp.use('*', csrf())
+addonsApp.use('*', async (c, next) => {
+  if (c.req.method === 'GET' || c.req.method === 'HEAD') return next()
+  const cookie = c.req.header('cookie') ?? ''
+  if (!/(?:^|;\s*)mupot_session=/.test(cookie)) return next()
+
+  const sameOrigin = c.req.header('origin') === new URL(c.req.url).origin
+    || c.req.header('sec-fetch-site') === 'same-origin'
+  if (!sameOrigin) return c.text('Forbidden', 403)
+  return next()
+})
 addonsApp.use('*', requireAuth)
 
 addonsApp.get('/', async (c) => {

@@ -6,7 +6,11 @@ import {
   getRegistered as getRegisteredDepartment,
 } from '../departments/registry'
 import './modules/fixture'
-import { getRegisteredAddon, type AddonCatalogEntry } from './registry'
+import {
+  assertAddonRuntimeContract,
+  getRegisteredAddon,
+  type AddonCatalogEntry,
+} from './registry'
 
 export type AddonState = 'installed' | 'configured' | 'active' | 'disabled' | 'archived'
 
@@ -301,6 +305,20 @@ function matchesRegisteredIdentity(installation: AddonInstallation, entry: Addon
     && installation.mupotCompatibility === entry.manifest.mupotCompatibility
 }
 
+function matchesPersistedIdentity(
+  installation: AddonInstallation,
+  expected: AddonInstallation,
+): boolean {
+  return installation.id === expected.id
+    && installation.tenant === expected.tenant
+    && installation.addonKey === expected.addonKey
+    && installation.installedVersion === expected.installedVersion
+    && installation.publisher === expected.publisher
+    && installation.trustClass === expected.trustClass
+    && installation.manifestSha256 === expected.manifestSha256
+    && installation.mupotCompatibility === expected.mupotCompatibility
+}
+
 function written(result: { success: boolean; meta?: { changes?: number } }): boolean {
   return result.success && result.meta?.changes === 1
 }
@@ -361,6 +379,31 @@ async function loadLifecycleMutationContext(
   }
 
   return { ok: true, entry, installation }
+}
+
+async function loadTeardownMutationContext(
+  env: Env,
+  actor: AddonActor,
+  key: string,
+): Promise<
+  | { ok: true; installation: AddonInstallation }
+  | { ok: false; result: AddonMutationFailure }
+> {
+  if (!authorized(actor)) {
+    return { ok: false, result: { ok: false, reason: 'not_authorized' } }
+  }
+
+  const installation = await loadLiveInstallation(env, key)
+  if (!installation) {
+    return {
+      ok: false,
+      result: getRegisteredAddon(key)
+        ? { ok: false, reason: 'invalid_state' }
+        : { ok: false, reason: 'addon_not_registered' },
+    }
+  }
+
+  return { ok: true, installation }
 }
 
 const OPERATION_LEASE_MS = 30_000
@@ -789,9 +832,16 @@ async function countOtherActiveClaims(
 ): Promise<number> {
   const row = await env.DB.prepare(`
     SELECT COUNT(*) AS count
-      FROM addon_resource_ownership
-     WHERE tenant = ?1 AND resource_type = ?2 AND resource_id = ?3
-       AND installation_id <> ?4 AND active = 1
+      FROM addon_resource_ownership AS other_claim
+      JOIN addon_installations AS installation
+        ON installation.id = other_claim.installation_id
+       AND installation.tenant = other_claim.tenant
+     WHERE other_claim.tenant = ?1
+       AND other_claim.resource_type = ?2
+       AND other_claim.resource_id = ?3
+       AND other_claim.installation_id <> ?4
+       AND other_claim.active = 1
+       AND installation.state = 'active'
   `).bind(
     env.TENANT_SLUG,
     claim.resource_type,
@@ -818,6 +868,7 @@ async function countActiveClaimsForDepartment(
          SELECT 1 FROM addon_installations AS installation
           WHERE installation.id = claim.installation_id
             AND installation.tenant = claim.tenant
+            AND installation.state = 'active'
        )
   `).bind(
     env.TENANT_SLUG,
@@ -857,14 +908,40 @@ async function loadCanonicalDepartment(
   return row
 }
 
+async function departmentIdForClaim(
+  env: Env,
+  moduleKey: string,
+): Promise<string> {
+  if (!getRegisteredDepartment(moduleKey)) {
+    throw new Error('addon department module is not registered')
+  }
+  const result = await env.DB.prepare(`
+    SELECT id, slug, template_key
+      FROM departments
+     WHERE slug = ?1
+     ORDER BY id ASC
+  `).bind(moduleKey).all<Pick<DepartmentRow, 'id' | 'slug' | 'template_key'>>()
+  const rows = result.results ?? []
+  if (rows.length > 1) throw new Error('addon department canonical row is ambiguous')
+  const row = rows[0]
+  if (!row) return crypto.randomUUID()
+  if (row.slug !== moduleKey || (row.template_key !== null && row.template_key !== moduleKey)) {
+    throw new Error('addon department canonical row mismatch')
+  }
+  return row.id
+}
+
 async function activateCanonicalDepartment(
   env: Env,
   moduleKey: string,
   expectedDepartmentId?: string,
 ): Promise<DepartmentRow> {
-  let result = await activateDepartment(env.DB, moduleKey)
+  const options = expectedDepartmentId
+    ? { idGen: () => expectedDepartmentId }
+    : undefined
+  let result = await activateDepartment(env.DB, moduleKey, options)
   if (!result.ok && result.reason === 'db_error') {
-    result = await activateDepartment(env.DB, moduleKey)
+    result = await activateDepartment(env.DB, moduleKey, options)
   }
   if (!result.ok) throw new Error(`department activation failed: ${result.reason}`)
   if (expectedDepartmentId && result.departmentId !== expectedDepartmentId) {
@@ -889,6 +966,24 @@ function validateDepartmentClaim(
     || claim.ownership_mode !== 'co_owner'
   ) {
     throw new Error('addon department ownership identity mismatch')
+  }
+}
+
+function validatePersistedDepartmentClaimIdentity(
+  env: Env,
+  installationId: string,
+  claim: OwnershipRow,
+): void {
+  if (
+    claim.tenant !== env.TENANT_SLUG
+    || claim.installation_id !== installationId
+    || claim.resource_type !== 'department'
+    || claim.resource_id.length === 0
+    || claim.resource_key.length === 0
+    || claim.ownership_mode !== 'co_owner'
+    || !getRegisteredDepartment(claim.resource_key)
+  ) {
+    throw new Error('addon persisted department ownership identity mismatch')
   }
 }
 
@@ -957,42 +1052,79 @@ async function validateActiveDepartmentClaims(
   return claims
 }
 
-async function validateDisabledDepartmentClaims(
+async function validatePersistedActiveDepartmentClaims(
   env: Env,
   installation: AddonInstallation,
-  entry: AddonCatalogEntry,
 ): Promise<OwnershipRow[]> {
-  const claims = await loadDepartmentClaims(env, installation.id)
-  if (claims.some((claim) => claim.active === 1)) {
-    throw new Error('active addon ownership remains after disable')
-  }
-  await validateDepartmentClaimSet(env, installation, entry, claims, true, null)
+  const claims = await loadDepartmentClaims(env, installation.id, true)
+  const resourceKeys = new Set<string>()
   for (const claim of claims) {
-    const activeClaims = await countActiveClaimsForDepartment(
+    validatePersistedDepartmentClaimIdentity(env, installation.id, claim)
+    if (resourceKeys.has(claim.resource_key)) {
+      throw new Error('addon persisted department ownership is duplicated')
+    }
+    resourceKeys.add(claim.resource_key)
+    const department = await loadCanonicalDepartment(
       env,
       claim.resource_key,
       claim.resource_id,
+      installation.state === 'active' ? 1 : null,
     )
-    await loadCanonicalDepartment(
-      env,
-      claim.resource_key,
-      claim.resource_id,
-      activeClaims > 0 ? 1 : 0,
-    )
+    validateDepartmentClaim(env, installation.id, claim.resource_key, department, claim)
+  }
+  if (installation.state === 'active') {
+    const receipt = await env.DB.prepare(`
+      SELECT side_effect_ids, checks
+        FROM addon_receipts
+       WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
+         AND action = 'activate' AND previous_state = ?5 AND next_state = 'active'
+         AND actor_id = ?4 AND outcome = 'pass'
+       LIMIT 1
+    `).bind(
+      installation.latestReceiptId,
+      env.TENANT_SLUG,
+      installation.id,
+      installation.latestActorId,
+      installation.latestPreviousState,
+    ).first<Pick<ReceiptRow, 'side_effect_ids' | 'checks'>>()
+    if (!receipt) throw new Error('addon activation receipt evidence is missing')
+    if (typeof parseChecks(receipt.checks).operationId === 'string') {
+      const expectedClaimIds = parseStringArray(receipt.side_effect_ids).sort()
+      const activeClaimIds = claims.map((claim) => claim.id).sort()
+      if (
+        expectedClaimIds.length !== activeClaimIds.length
+        || expectedClaimIds.some((id, index) => id !== activeClaimIds[index])
+      ) {
+        throw new Error('addon active claims do not match persisted activation evidence')
+      }
+    }
   }
   return claims
 }
 
-async function loadStructurallyValidDisabledDepartmentClaims(
+async function loadPersistedDisabledDepartmentClaims(
   env: Env,
   installation: AddonInstallation,
-  entry: AddonCatalogEntry,
 ): Promise<OwnershipRow[]> {
   const claims = await loadDepartmentClaims(env, installation.id)
   if (claims.some((claim) => claim.active === 1)) {
     throw new Error('active addon ownership remains after disable')
   }
-  await validateDepartmentClaimSet(env, installation, entry, claims, true, null)
+  const resourceKeys = new Set<string>()
+  for (const claim of claims) {
+    validatePersistedDepartmentClaimIdentity(env, installation.id, claim)
+    if (resourceKeys.has(claim.resource_key)) {
+      throw new Error('addon persisted department ownership is duplicated')
+    }
+    resourceKeys.add(claim.resource_key)
+    const department = await loadCanonicalDepartment(
+      env,
+      claim.resource_key,
+      claim.resource_id,
+      null,
+    )
+    validateDepartmentClaim(env, installation.id, claim.resource_key, department, claim)
+  }
   return claims
 }
 
@@ -1002,9 +1134,9 @@ async function loadCompletedDisableOperationEvidence(
 ): Promise<OperationRow | null> {
   const receipt = await env.DB.prepare(`
     SELECT id, actor_id, checks, created_at
-      FROM addon_receipts
+     FROM addon_receipts
      WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
-       AND action = 'disable' AND previous_state = 'active' AND next_state = 'disabled'
+       AND action = 'disable' AND previous_state = ?11 AND next_state = 'disabled'
        AND addon_key = ?4 AND installed_version = ?5 AND publisher = ?6
        AND trust_class = ?7 AND mupot_compatibility = ?8 AND manifest_sha256 = ?9
        AND actor_id = ?10 AND outcome = 'pass'
@@ -1020,6 +1152,7 @@ async function loadCompletedDisableOperationEvidence(
     installation.mupotCompatibility,
     installation.manifestSha256,
     installation.latestActorId,
+    installation.latestPreviousState,
   ).first<Pick<ReceiptRow, 'id' | 'actor_id' | 'checks' | 'created_at'>>()
   if (!receipt) return null
 
@@ -1115,16 +1248,15 @@ async function compensateDepartmentForOwnership(
   await reconcileDepartmentForOwnership(env, moduleKey, departmentId)
 }
 
-async function repairAndValidateDisabledDepartmentClaims(
+async function repairAndValidatePersistedDisabledDepartmentClaims(
   env: Env,
   installation: AddonInstallation,
-  entry: AddonCatalogEntry,
   options: {
     operation?: OperationRow
     expectedStates?: readonly [AddonState, AddonState]
   } = {},
 ): Promise<OwnershipRow[]> {
-  const claims = await loadStructurallyValidDisabledDepartmentClaims(env, installation, entry)
+  const claims = await loadPersistedDisabledDepartmentClaims(env, installation)
   for (const claim of claims) {
     await reconcileDepartmentForOwnership(
       env,
@@ -1133,7 +1265,22 @@ async function repairAndValidateDisabledDepartmentClaims(
       options,
     )
   }
-  return validateDisabledDepartmentClaims(env, installation, entry)
+
+  const confirmed = await loadPersistedDisabledDepartmentClaims(env, installation)
+  for (const claim of confirmed) {
+    const activeClaims = await countActiveClaimsForDepartment(
+      env,
+      claim.resource_key,
+      claim.resource_id,
+    )
+    await loadCanonicalDepartment(
+      env,
+      claim.resource_key,
+      claim.resource_id,
+      activeClaims > 0 ? 1 : 0,
+    )
+  }
+  return confirmed
 }
 
 async function renewAfterRegistryCall(
@@ -1142,11 +1289,46 @@ async function renewAfterRegistryCall(
   expectedStates: readonly [AddonState, AddonState],
   moduleKey: string,
   departmentId: string,
+  pendingActivationClaim?: OwnershipRow,
 ): Promise<void> {
   try {
     await renewOperationLease(env, operation, expectedStates)
   } catch (error) {
     if (error instanceof FenceLostError) {
+      if (pendingActivationClaim) {
+        const releasedAt = leaseWindow().now
+        await env.DB.prepare(`
+          UPDATE addon_resource_ownership
+             SET active = 0, released_at = ?1
+           WHERE id = ?2 AND tenant = ?3 AND installation_id = ?4
+             AND resource_type = 'department' AND resource_id = ?5
+             AND resource_key = ?6 AND ownership_mode = 'co_owner' AND active = 1
+             AND EXISTS (
+               SELECT 1 FROM addon_operations AS operation
+                WHERE operation.id = ?7 AND operation.tenant = ?3
+                  AND operation.installation_id = ?4
+                  AND operation.action = 'activate' AND operation.target_state = 'active'
+                  AND operation.current_step = ?8 AND operation.status = 'running'
+                  AND operation.actor_id = ?9 AND operation.lease_token = ?10
+             )
+             AND EXISTS (
+               SELECT 1 FROM addon_installations AS installation
+                WHERE installation.id = ?4 AND installation.tenant = ?3
+                  AND installation.state <> 'active'
+             )
+        `).bind(
+          releasedAt,
+          pendingActivationClaim.id,
+          env.TENANT_SLUG,
+          operation.installation_id,
+          pendingActivationClaim.resource_id,
+          pendingActivationClaim.resource_key,
+          operation.id,
+          operation.current_step,
+          operation.actor_id,
+          operation.lease_token,
+        ).run()
+      }
       await compensateDepartmentForOwnership(env, moduleKey, departmentId)
     }
     throw error
@@ -1303,20 +1485,11 @@ async function ensureDepartmentClaim(
 ): Promise<OwnershipRow> {
   const expectedStates = [installation.state, installation.state] as const
   await renewOperationLease(env, operation, expectedStates)
-  const activated = await activateCanonicalDepartment(env, moduleKey)
-  await deps.afterDepartmentActivated?.({
-    installationId: installation.id,
-    operationId: operation.id,
-    moduleKey,
-    departmentId: activated.id,
-  })
-  await renewAfterRegistryCall(env, operation, expectedStates, moduleKey, activated.id)
-
   const existing = await loadDepartmentClaim(env, installation.id, moduleKey)
   let claim: OwnershipRow
 
   if (existing) {
-    validateDepartmentClaim(env, installation.id, moduleKey, activated, existing)
+    validatePersistedDepartmentClaimIdentity(env, installation.id, existing)
     if (existing.active === 1) {
       claim = existing
     } else {
@@ -1359,6 +1532,7 @@ async function ensureDepartmentClaim(
     }
   } else {
     const claimId = crypto.randomUUID()
+    const resourceId = await departmentIdForClaim(env, moduleKey)
     const createdAt = leaseWindow().now
     const result = await env.DB.prepare(`
       INSERT INTO addon_resource_ownership (
@@ -1383,7 +1557,7 @@ async function ensureDepartmentClaim(
       claimId,
       env.TENANT_SLUG,
       installation.id,
-      activated.id,
+      resourceId,
       moduleKey,
       createdAt,
       operation.id,
@@ -1400,7 +1574,7 @@ async function ensureDepartmentClaim(
       tenant: env.TENANT_SLUG,
       installation_id: installation.id,
       resource_type: 'department',
-      resource_id: activated.id,
+      resource_id: resourceId,
       resource_key: moduleKey,
       ownership_mode: 'co_owner',
       active: 1,
@@ -1410,8 +1584,18 @@ async function ensureDepartmentClaim(
   }
 
   await renewOperationLease(env, operation, expectedStates)
-  const confirmed = await activateCanonicalDepartment(env, moduleKey, activated.id)
-  await renewAfterRegistryCall(env, operation, expectedStates, moduleKey, confirmed.id)
+  const activated = await activateCanonicalDepartment(env, moduleKey, claim.resource_id)
+  validateDepartmentClaim(env, installation.id, moduleKey, activated, claim)
+  await deps.afterDepartmentActivated?.({
+    installationId: installation.id,
+    operationId: operation.id,
+    moduleKey,
+    departmentId: activated.id,
+  })
+  await renewAfterRegistryCall(env, operation, expectedStates, moduleKey, activated.id, claim)
+
+  const confirmed = await activateCanonicalDepartment(env, moduleKey, claim.resource_id)
+  await renewAfterRegistryCall(env, operation, expectedStates, moduleKey, confirmed.id, claim)
   validateDepartmentClaim(env, installation.id, moduleKey, confirmed, claim)
   return claim
 }
@@ -1511,6 +1695,11 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
 
   const entry = getRegisteredAddon(key)
   if (!entry) return { ok: false, reason: 'addon_not_registered' }
+  try {
+    assertAddonRuntimeContract(entry.manifest)
+  } catch {
+    return { ok: false, reason: 'invalid_state' }
+  }
   if (entry.manifest.kind !== 'native' || entry.manifest.trustClass !== 'native_reviewed') {
     return { ok: false, reason: 'invalid_state' }
   }
@@ -1603,6 +1792,11 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
 
   const entry = getRegisteredAddon(key)
   if (!entry) return { ok: false, reason: 'addon_not_registered' }
+  try {
+    assertAddonRuntimeContract(entry.manifest)
+  } catch {
+    return { ok: false, reason: 'invalid_state' }
+  }
 
   const existing = await loadLiveInstallation(env, key)
   if (!existing) return { ok: false, reason: 'invalid_state' }
@@ -1704,6 +1898,11 @@ export async function activateAddon(
   const context = await loadLifecycleMutationContext(env, actor, key)
   if (!context.ok) return context.result
   const { entry, installation: existing } = context
+  try {
+    assertAddonRuntimeContract(entry.manifest)
+  } catch {
+    return { ok: false, reason: 'invalid_state', state: existing.state }
+  }
   if (existing.state === 'active') {
     try {
       await validateActiveDepartmentClaims(env, existing, entry)
@@ -1908,9 +2107,9 @@ export async function disableAddon(
   key: string,
   deps: AddonLifecycleDeps = {},
 ): Promise<AddonMutationResult> {
-  const context = await loadLifecycleMutationContext(env, actor, key)
+  const context = await loadTeardownMutationContext(env, actor, key)
   if (!context.ok) return context.result
-  const { entry, installation: existing } = context
+  const { installation: existing } = context
 
   const running = await loadRunningOperation(env, existing.id)
   if (existing.state === 'disabled' && !running) {
@@ -1919,7 +2118,7 @@ export async function disableAddon(
       if (!evidence) {
         return { ok: false, reason: 'fence_lost' }
       }
-      await repairAndValidateDisabledDepartmentClaims(env, existing, entry)
+      await repairAndValidatePersistedDisabledDepartmentClaims(env, existing)
       const confirmedEvidence = await loadCompletedDisableOperationEvidence(env, existing)
       if (!confirmedEvidence || confirmedEvidence.id !== evidence.id) {
         return { ok: false, reason: 'fence_lost' }
@@ -1929,15 +2128,20 @@ export async function disableAddon(
       return { ok: false, reason: 'write_failed' }
     }
   }
-  if (existing.state !== 'active' && existing.state !== 'disabled') {
+  if (
+    existing.state !== 'installed'
+    && existing.state !== 'configured'
+    && existing.state !== 'active'
+    && existing.state !== 'disabled'
+  ) {
     return { ok: false, reason: 'invalid_state', state: existing.state }
   }
   if (running && (running.action !== 'disable' || running.target_state !== 'disabled')) {
     return { ok: false, reason: 'operation_busy', state: existing.state }
   }
-  if (existing.state === 'active') {
+  if (existing.state !== 'disabled') {
     try {
-      await validateActiveDepartmentClaims(env, existing, entry, true)
+      await validatePersistedActiveDepartmentClaims(env, existing)
     } catch {
       return { ok: false, reason: 'write_failed' }
     }
@@ -1960,9 +2164,10 @@ export async function disableAddon(
     }
     const operation = acquired.operation
 
-    if (existing.state === 'active') {
+    if (existing.state !== 'disabled') {
       if (operation.current_step !== 'disable_state') throw new FenceLostError()
-      const activeClaims = await validateActiveDepartmentClaims(env, existing, entry, true)
+      const previousState = existing.state
+      const activeClaims = await validatePersistedActiveDepartmentClaims(env, existing)
       const receiptId = crypto.randomUUID()
       const transitionTiming = leaseWindow()
       const disabledAt = transitionTiming.now
@@ -1978,10 +2183,10 @@ export async function disableAddon(
           env.DB.prepare(`
             UPDATE addon_installations
                SET state = 'disabled', disabled_at = ?1, updated_at = ?1,
-                   latest_previous_state = 'active', latest_actor_id = ?2,
+                   latest_previous_state = ?15, latest_actor_id = ?2,
                    latest_receipt_id = ?3, last_error = NULL
              WHERE id = ?4 AND tenant = ?5 AND addon_key = ?6
-               AND state = 'active' AND manifest_sha256 = ?7 AND latest_receipt_id = ?8
+               AND state = ?15 AND manifest_sha256 = ?7 AND latest_receipt_id = ?8
                AND EXISTS (
                  SELECT 1 FROM addon_operations AS operation
                   WHERE operation.id = ?9
@@ -2021,7 +2226,7 @@ export async function disableAddon(
             existing.id,
             env.TENANT_SLUG,
             key,
-            entry.manifestSha256,
+            existing.manifestSha256,
             existing.latestReceiptId,
             operation.id,
             operation.actor_id,
@@ -2029,11 +2234,12 @@ export async function disableAddon(
             disabledAt,
             activeClaims.length,
             serializedClaimIdentities(activeClaims),
+            previousState,
           ),
           transitionReceiptStatement(env, existing, operation, {
             id: receiptId,
             action: 'disable',
-            previousState: 'active',
+            previousState,
             nextState: 'disabled',
             sideEffectIds,
             checks,
@@ -2051,7 +2257,7 @@ export async function disableAddon(
             env,
             existing.id,
             operation,
-            'active',
+            previousState,
             'disabled',
             receiptId,
           ),
@@ -2121,7 +2327,7 @@ export async function disableAddon(
       )
     }
 
-    await repairAndValidateDisabledDepartmentClaims(env, existing, entry, {
+    await repairAndValidatePersistedDisabledDepartmentClaims(env, existing, {
       operation,
       expectedStates: ['disabled', 'disabled'],
     })
@@ -2136,13 +2342,13 @@ export async function disableAddon(
     if (
       !completedInstallation
       || completedInstallation.state !== 'disabled'
-      || !matchesRegisteredIdentity(completedInstallation, entry)
+      || !matchesPersistedIdentity(completedInstallation, existing)
     ) {
       throw new FenceLostError()
     }
     const evidence = await loadCompletedDisableOperationEvidence(env, completedInstallation)
     if (!evidence || evidence.id !== completedOperation.id) throw new FenceLostError()
-    await repairAndValidateDisabledDepartmentClaims(env, completedInstallation, entry)
+    await repairAndValidatePersistedDisabledDepartmentClaims(env, completedInstallation)
     const confirmedEvidence = await loadCompletedDisableOperationEvidence(env, completedInstallation)
     if (!confirmedEvidence || confirmedEvidence.id !== completedOperation.id) throw new FenceLostError()
 
@@ -2157,9 +2363,9 @@ export async function archiveAddon(
   actor: AddonActor,
   key: string,
 ): Promise<AddonMutationResult> {
-  const context = await loadLifecycleMutationContext(env, actor, key)
+  const context = await loadTeardownMutationContext(env, actor, key)
   if (!context.ok) return context.result
-  const { entry, installation: existing } = context
+  const { installation: existing } = context
   if (existing.state !== 'disabled') {
     return { ok: false, reason: 'invalid_state', state: existing.state }
   }
@@ -2175,7 +2381,7 @@ export async function archiveAddon(
     if (!evidence) {
       return { ok: false, reason: 'fence_lost' }
     }
-    retainedClaims = await repairAndValidateDisabledDepartmentClaims(env, existing, entry)
+    retainedClaims = await repairAndValidatePersistedDisabledDepartmentClaims(env, existing)
     const confirmedEvidence = await loadCompletedDisableOperationEvidence(env, existing)
     if (!confirmedEvidence || confirmedEvidence.id !== evidence.id) {
       return { ok: false, reason: 'fence_lost' }
@@ -2253,7 +2459,7 @@ export async function archiveAddon(
                   AND disable_receipt.tenant = addon_installations.tenant
                   AND disable_receipt.installation_id = addon_installations.id
                   AND disable_receipt.action = 'disable'
-                  AND disable_receipt.previous_state = 'active'
+                  AND disable_receipt.previous_state = ?21
                   AND disable_receipt.next_state = 'disabled'
                   AND disable_receipt.actor_id = ?14
                   AND disable_receipt.outcome = 'pass'
@@ -2309,7 +2515,7 @@ export async function archiveAddon(
           existing.id,
           env.TENANT_SLUG,
           key,
-          entry.manifestSha256,
+          existing.manifestSha256,
           existing.latestReceiptId,
           operation.id,
           operation.actor_id,
@@ -2323,6 +2529,7 @@ export async function archiveAddon(
           disableEvidence.updated_at,
           retainedClaims.length,
           serializedClaimIdentities(retainedClaims),
+          existing.latestPreviousState,
         ),
         transitionReceiptStatement(env, existing, operation, {
           id: receiptId,

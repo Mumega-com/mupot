@@ -293,11 +293,34 @@ export function createDepartmentRegistry(): DepartmentRegistry {
   async function getActive(db: D1Database): Promise<ActivatedDepartmentRow[]> {
     const result = await db
       .prepare(
-        `SELECT id, slug, name, template_key, template_version, activated_at, active, seed_receipt, created_at
-           FROM departments
-          WHERE active = 1
-            AND template_key IS NOT NULL
-          ORDER BY activated_at ASC`,
+        `SELECT department.id, department.slug, department.name,
+                department.template_key, department.template_version,
+                department.activated_at, department.active,
+                department.seed_receipt, department.created_at
+           FROM departments AS department
+          WHERE department.active = 1
+            AND department.template_key IS NOT NULL
+            AND (
+              NOT EXISTS (
+                SELECT 1
+                  FROM addon_resource_ownership AS claim
+                 WHERE claim.resource_type = 'department'
+                   AND claim.resource_id = department.id
+              )
+              OR EXISTS (
+                SELECT 1
+                  FROM addon_resource_ownership AS claim
+                  JOIN addon_installations AS installation
+                    ON installation.id = claim.installation_id
+                   AND installation.tenant = claim.tenant
+                 WHERE claim.resource_type = 'department'
+                   AND claim.resource_id = department.id
+                   AND claim.resource_key = department.template_key
+                   AND claim.active = 1
+                   AND installation.state = 'active'
+              )
+            )
+          ORDER BY department.activated_at ASC`,
       )
       .all<ActivatedDepartmentRow>()
     return result.results ?? []
