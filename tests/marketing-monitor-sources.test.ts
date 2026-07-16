@@ -203,6 +203,219 @@ describe('collectMarketingSnapshots', () => {
     expect(JSON.stringify(snapshot)).not.toContain('top-secret')
   })
 
+  it('never invokes a caller-owned sources map', async () => {
+    let mapCalls = 0
+    let reads = 0
+    const forgedSource = source('forged-source', 'web_analytics', async () => {
+      reads += 1
+      return available([observation({ id: 'forged-source-evidence' })])
+    })
+    const hostileSources: MarketingMonitorSource[] = []
+    Object.defineProperty(hostileSources, 'map', {
+      value: (callback: (entry: MarketingMonitorSource, index: number) => unknown) => {
+        mapCalls += 1
+        return [callback(forgedSource, 0)]
+      },
+    })
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, hostileSources)
+
+    expect(mapCalls).toBe(0)
+    expect(reads).toBe(0)
+    expect(snapshot.sources).toEqual([])
+    expect(snapshot.observations).toEqual([])
+  })
+
+  it('never invokes a caller-owned bindings iterator', async () => {
+    let iteratorCalls = 0
+    let reads = 0
+    const hostileBindings: ResolvedAddonBinding[] = []
+    Object.defineProperty(hostileBindings, Symbol.iterator, {
+      value: function* () {
+        iteratorCalls += 1
+        yield bindings[0]
+      },
+    })
+
+    const snapshot = await collectMarketingSnapshots(env, hostileBindings, window, [
+      source('analytics', 'web_analytics', async () => {
+        reads += 1
+        return available([observation()])
+      }),
+    ])
+
+    expect(iteratorCalls).toBe(0)
+    expect(reads).toBe(0)
+    expect(snapshot.sources[0]).toMatchObject({
+      status: 'unavailable',
+      reason: 'binding_not_configured',
+    })
+  })
+
+  it('invokes captured reads with Reflect.apply instead of a function-owned call override', async () => {
+    let bodyCalls = 0
+    let callOverrideCalls = 0
+    const read = async () => {
+      bodyCalls += 1
+      return available([observation({ id: 'trusted-read-evidence' })])
+    }
+    Object.defineProperty(read, 'call', {
+      value: () => {
+        callOverrideCalls += 1
+        return available([observation({ id: 'forged-call-evidence' })])
+      },
+    })
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      source('analytics', 'web_analytics', read),
+    ])
+
+    expect(callOverrideCalls).toBe(0)
+    expect(bodyCalls).toBe(1)
+    expect(snapshot.observations).toEqual([observation({ id: 'trusted-read-evidence' })])
+  })
+
+  it('rejects more than 16 source declarations without reading them', async () => {
+    let reads = 0
+    const tooManySources = Array.from({ length: 17 }, (_, index) => source(
+      `source-${index}`,
+      'web_analytics',
+      async () => {
+        reads += 1
+        return available([])
+      },
+    ))
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, tooManySources)
+
+    expect(reads).toBe(0)
+    expect(snapshot.sources).toEqual([
+      { key: 'source_config_0', slot: 'unconfigured', status: 'failed', reason: 'invalid_source_configuration', observationCount: 0 },
+    ])
+  })
+
+  it.each([
+    {} as unknown,
+    new Proxy([], {
+      get(target, property, receiver) {
+        if (property === 'length') return 1.5
+        return Reflect.get(target, property, receiver)
+      },
+    }),
+  ])('rejects non-array or non-integer source inputs with a stable configuration failure', async (sourceInputs) => {
+    const snapshot = await collectMarketingSnapshots(
+      env,
+      bindings,
+      window,
+      sourceInputs as readonly MarketingMonitorSource[],
+    )
+
+    expect(snapshot.sources).toEqual([
+      { key: 'source_config_0', slot: 'unconfigured', status: 'failed', reason: 'invalid_source_configuration', observationCount: 0 },
+    ])
+  })
+
+  it('rejects more than 16 bindings before reading safely identified sources', async () => {
+    let reads = 0
+    const tooManyBindings = new Proxy(Array.from({ length: 17 }, (_, index) => ({
+      ...bindings[0],
+      id: `binding-${index}`,
+    })), {
+      get(target, property, receiver) {
+        if (property === '0') throw new Error('over-limit binding secret')
+        return Reflect.get(target, property, receiver)
+      },
+    })
+
+    const snapshot = await collectMarketingSnapshots(env, tooManyBindings, window, [
+      source('analytics', 'web_analytics', async () => {
+        reads += 1
+        return available([])
+      }),
+    ])
+
+    expect(reads).toBe(0)
+    expect(snapshot.sources[0]).toMatchObject({
+      status: 'failed',
+      reason: 'invalid_binding_configuration',
+    })
+  })
+
+  it.each([
+    {} as unknown,
+    new Proxy([], {
+      get(target, property, receiver) {
+        if (property === 'length') return 1.5
+        return Reflect.get(target, property, receiver)
+      },
+    }),
+  ])('rejects non-array or non-integer binding inputs before source reads', async (bindingInputs) => {
+    let reads = 0
+    const snapshot = await collectMarketingSnapshots(
+      env,
+      bindingInputs as readonly ResolvedAddonBinding[],
+      window,
+      [source('analytics', 'web_analytics', async () => {
+        reads += 1
+        return available([])
+      })],
+    )
+
+    expect(reads).toBe(0)
+    expect(snapshot.sources[0]).toMatchObject({
+      status: 'failed',
+      reason: 'invalid_binding_configuration',
+    })
+  })
+
+  it('isolates a throwing source index getter and continues later sources', async () => {
+    const sourceInputs = new Proxy([
+      source('unreachable', 'web_analytics', async () => available([])),
+      source('healthy', 'web_analytics', async () => available([observation({ id: 'healthy-evidence' })])),
+    ], {
+      get(target, property, receiver) {
+        if (property === '0') throw new Error('source index secret')
+        return Reflect.get(target, property, receiver)
+      },
+    })
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, sourceInputs)
+
+    expect(snapshot.sources).toEqual([
+      { key: 'source_config_0', slot: 'unconfigured', status: 'failed', reason: 'invalid_source_configuration', observationCount: 0 },
+      { key: 'healthy', slot: 'web_analytics', status: 'available', observationCount: 1 },
+    ])
+    expect(snapshot.observations).toEqual([observation({ id: 'healthy-evidence' })])
+    expect(JSON.stringify(snapshot)).not.toContain('index secret')
+  })
+
+  it('fails safely identified sources closed when a binding index getter throws', async () => {
+    let reads = 0
+    const bindingInputs = new Proxy([
+      bindings[0],
+      bindings[0],
+    ], {
+      get(target, property, receiver) {
+        if (property === '0') throw new Error('binding index secret')
+        return Reflect.get(target, property, receiver)
+      },
+    })
+
+    const snapshot = await collectMarketingSnapshots(env, bindingInputs, window, [
+      source('analytics', 'web_analytics', async () => {
+        reads += 1
+        return available([])
+      }),
+    ])
+
+    expect(reads).toBe(0)
+    expect(snapshot.sources[0]).toMatchObject({
+      status: 'failed',
+      reason: 'invalid_binding_configuration',
+    })
+    expect(JSON.stringify(snapshot)).not.toContain('index secret')
+  })
+
   it('re-resolves a vault binding and rejects a GHL adapter backed by a PostHog connector before read', async () => {
     let reads = 0
     const queries: string[] = []

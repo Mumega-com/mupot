@@ -16,7 +16,10 @@ import {
 
 export const MAX_OBSERVATIONS_PER_SOURCE = 100
 export const MAX_OBSERVATIONS_PER_RUN = 200
+export const MAX_MARKETING_MONITOR_BINDINGS = 16
+export const MAX_MARKETING_MONITOR_SOURCES = 16
 const MAX_JS_ARRAY_LENGTH = 2 ** 32 - 1
+const INPUT_ENTRY_FAILURE = Symbol('input_entry_failure')
 
 const collectedMarketingSnapshots = new WeakSet<object>()
 
@@ -68,6 +71,35 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
 
+interface CapturedInputArray {
+  readonly valid: boolean
+  readonly entryFailure: boolean
+  readonly entries: readonly unknown[]
+}
+
+function captureInputArray(input: unknown, maxLength: number): CapturedInputArray {
+  try {
+    if (!Array.isArray(input)) return { valid: false, entryFailure: false, entries: [] }
+    const length = Reflect.get(input, 'length')
+    if (!Number.isInteger(length) || length < 0 || length > maxLength) {
+      return { valid: false, entryFailure: false, entries: [] }
+    }
+    const entries: unknown[] = []
+    let entryFailure = false
+    for (let index = 0; index < length; index += 1) {
+      try {
+        entries.push(Reflect.get(input, index))
+      } catch {
+        entryFailure = true
+        entries.push(INPUT_ENTRY_FAILURE)
+      }
+    }
+    return { valid: true, entryFailure, entries }
+  } catch {
+    return { valid: false, entryFailure: false, entries: [] }
+  }
+}
+
 function cloneObservationValue(value: unknown): unknown {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return value
   const observation = value as Record<string, unknown>
@@ -99,7 +131,7 @@ function observationFailureReason(
     !isNonEmptyString(value.id)
     || !isNonEmptyString(value.runId)
     || !isNonEmptyString(value.metricKey)
-    || !Object.prototype.hasOwnProperty.call(MARKETING_MONITOR_METRIC_CONTRACT, value.metricKey)
+    || !Object.hasOwn(MARKETING_MONITOR_METRIC_CONTRACT, value.metricKey)
     || typeof value.value !== 'number'
     || !Number.isFinite(value.value)
     || !isNonEmptyString(value.unit)
@@ -143,14 +175,18 @@ function isCanonicalSourceKey(value: unknown): value is string {
   return isCanonicalSourceIdentifier(value) && !value.startsWith('source_config_')
 }
 
-function sourceDeclaration(source: MarketingMonitorSource, sourceIndex: number): SourceDeclaration {
+function sourceDeclaration(sourceValue: unknown, sourceIndex: number): SourceDeclaration {
   try {
-    const key = source.key
-    const slot = source.slot
-    const read = source.read
+    if ((typeof sourceValue !== 'object' && typeof sourceValue !== 'function') || sourceValue === null) {
+      throw new Error('invalid_source_configuration')
+    }
+    const key = Reflect.get(sourceValue, 'key')
+    const slot = Reflect.get(sourceValue, 'slot')
+    const read = Reflect.get(sourceValue, 'read')
     if (!isCanonicalSourceKey(key) || !isCanonicalSourceIdentifier(slot) || typeof read !== 'function') {
       throw new Error('invalid_source_configuration')
     }
+    const source = sourceValue as MarketingMonitorSource
     return { valid: true, source, identity: { key, slot }, read }
   } catch {
     return {
@@ -164,21 +200,24 @@ type BindingEntry =
   | { readonly valid: true; readonly binding: ResolvedAddonBinding }
   | { readonly valid: false }
 
-function validatedBindingEntry(binding: ResolvedAddonBinding): {
+function validatedBindingEntry(bindingValue: unknown): {
   readonly slot: string | null
   readonly entry: BindingEntry
 } {
   let slot: unknown = null
   try {
-    slot = binding.slot
-    const id = binding.id
-    const adapter = binding.adapter
-    const bindingKind = binding.bindingKind
-    const capability = binding.capability
-    const connectorId = binding.connectorId
+    if ((typeof bindingValue !== 'object' && typeof bindingValue !== 'function') || bindingValue === null) {
+      return { slot: null, entry: { valid: false } }
+    }
+    slot = Reflect.get(bindingValue, 'slot')
+    const id = Reflect.get(bindingValue, 'id')
+    const adapter = Reflect.get(bindingValue, 'adapter')
+    const bindingKind = Reflect.get(bindingValue, 'bindingKind')
+    const capability = Reflect.get(bindingValue, 'capability')
+    const connectorId = Reflect.get(bindingValue, 'connectorId')
     if (
       typeof slot !== 'string'
-      || !Object.prototype.hasOwnProperty.call(MARKETING_MONITOR_BINDING_CONTRACT, slot)
+      || !Object.hasOwn(MARKETING_MONITOR_BINDING_CONTRACT, slot)
     ) return { slot: null, entry: { valid: false } }
 
     const slotContract = MARKETING_MONITOR_BINDING_CONTRACT[
@@ -210,7 +249,7 @@ function validatedBindingEntry(binding: ResolvedAddonBinding): {
   } catch {
     return {
       slot: typeof slot === 'string'
-        && Object.prototype.hasOwnProperty.call(MARKETING_MONITOR_BINDING_CONTRACT, slot)
+        && Object.hasOwn(MARKETING_MONITOR_BINDING_CONTRACT, slot)
         ? slot
         : null,
       entry: { valid: false },
@@ -239,6 +278,28 @@ function unavailableStatus(source: SourceIdentity, reason: string): CollectedSou
     reason,
     observationCount: 0,
   })
+}
+
+function freezeLocalArray<T>(values: readonly T[]): readonly T[] {
+  const copy: T[] = []
+  for (let index = 0; index < values.length; index += 1) copy.push(values[index])
+  return Object.freeze(copy)
+}
+
+function finalizeCollection(
+  runId: string | null,
+  rawObservationCount: number,
+  sourceStatuses: readonly CollectedSourceStatus[],
+  observations: readonly MonitorObservation[],
+): MarketingSnapshotCollection {
+  const collection = Object.freeze({
+    runId,
+    rawObservationCount,
+    sources: freezeLocalArray(sourceStatuses),
+    observations: freezeLocalArray(observations),
+  })
+  collectedMarketingSnapshots.add(collection)
+  return collection
 }
 
 function stableSnapshotReason(reason: unknown): string {
@@ -273,18 +334,34 @@ export async function collectMarketingSnapshots(
   if (!canonical) throw new Error('invalid_monitor_window')
   const { bounds, window: sourceWindow } = canonical
 
-  const bindingsBySlot = new Map<string, BindingEntry>()
-  for (const binding of bindings) {
-    const validated = validatedBindingEntry(binding)
-    if (validated.slot === null) continue
-    bindingsBySlot.set(validated.slot, bindingsBySlot.has(validated.slot)
-      ? { valid: false }
-      : validated.entry)
+  const sourceInput = captureInputArray(sources, MAX_MARKETING_MONITOR_SOURCES)
+  if (!sourceInput.valid) {
+    return finalizeCollection(null, 0, [failedStatus(
+      { key: 'source_config_0', slot: 'unconfigured' },
+      'invalid_source_configuration',
+    )], [])
+  }
+  const sourceDeclarations: SourceDeclaration[] = []
+  for (let index = 0; index < sourceInput.entries.length; index += 1) {
+    sourceDeclarations.push(sourceDeclaration(sourceInput.entries[index], index))
   }
 
-  const sourceDeclarations = sources.map(sourceDeclaration)
+  const bindingInput = captureInputArray(bindings, MAX_MARKETING_MONITOR_BINDINGS)
+  const bindingInputInvalid = !bindingInput.valid || bindingInput.entryFailure
+  const bindingsBySlot = new Map<string, BindingEntry>()
+  if (!bindingInputInvalid) {
+    for (let index = 0; index < bindingInput.entries.length; index += 1) {
+      const validated = validatedBindingEntry(bindingInput.entries[index])
+      if (validated.slot === null) continue
+      bindingsBySlot.set(validated.slot, bindingsBySlot.has(validated.slot)
+        ? { valid: false }
+        : validated.entry)
+    }
+  }
+
   const sourceKeyCounts = new Map<string, number>()
-  for (const declaration of sourceDeclarations) {
+  for (let index = 0; index < sourceDeclarations.length; index += 1) {
+    const declaration = sourceDeclarations[index]
     if (!declaration.valid) continue
     sourceKeyCounts.set(declaration.identity.key, (sourceKeyCounts.get(declaration.identity.key) ?? 0) + 1)
   }
@@ -296,7 +373,8 @@ export async function collectMarketingSnapshots(
   let runId: string | null = null
   let rawObservationCount = 0
 
-  for (const declaration of sourceDeclarations) {
+  for (let sourceIndex = 0; sourceIndex < sourceDeclarations.length; sourceIndex += 1) {
+    const declaration = sourceDeclarations[sourceIndex]
     const sourceIdentity = declaration.identity
     if (!declaration.valid) {
       sourceStatuses.push(failedStatus(sourceIdentity, 'invalid_source_configuration'))
@@ -307,6 +385,10 @@ export async function collectMarketingSnapshots(
         emittedDuplicateKeys.add(sourceIdentity.key)
         sourceStatuses.push(failedStatus(sourceIdentity, 'duplicate_source_identity'))
       }
+      continue
+    }
+    if (bindingInputInvalid) {
+      sourceStatuses.push(failedStatus(sourceIdentity, 'invalid_binding_configuration'))
       continue
     }
     const source = declaration.source
@@ -342,7 +424,7 @@ export async function collectMarketingSnapshots(
 
     let snapshot: SourceSnapshot
     try {
-      snapshot = await readSource.call(source, env, binding, sourceWindow)
+      snapshot = await Reflect.apply(readSource, source, [env, binding, sourceWindow])
     } catch {
       sourceStatuses.push(failedStatus(sourceIdentity, 'source_read_failed'))
       continue
@@ -471,12 +553,5 @@ export async function collectMarketingSnapshots(
     }
   }
 
-  const collection = Object.freeze({
-    runId,
-    rawObservationCount,
-    sources: Object.freeze([...sourceStatuses]),
-    observations: Object.freeze([...observations]),
-  })
-  collectedMarketingSnapshots.add(collection)
-  return collection
+  return finalizeCollection(runId, rawObservationCount, sourceStatuses, observations)
 }
