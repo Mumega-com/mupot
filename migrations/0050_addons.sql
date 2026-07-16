@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS addon_installations (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL PRIMARY KEY,
   tenant TEXT NOT NULL,
   addon_key TEXT NOT NULL,
   installed_version TEXT NOT NULL,
@@ -141,7 +141,7 @@ BEGIN
 END;
 
 CREATE TABLE IF NOT EXISTS addon_operations (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL PRIMARY KEY,
   tenant TEXT NOT NULL,
   installation_id TEXT NOT NULL,
   action TEXT NOT NULL CHECK (action IN ('activate','disable','archive')),
@@ -167,7 +167,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_addon_one_running_operation
   ON addon_operations (tenant, installation_id) WHERE status = 'running';
 
 CREATE TABLE IF NOT EXISTS addon_resource_ownership (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL PRIMARY KEY,
   tenant TEXT NOT NULL,
   installation_id TEXT NOT NULL,
   resource_type TEXT NOT NULL,
@@ -190,6 +190,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_addon_exclusive_resource
 CREATE INDEX IF NOT EXISTS idx_addon_active_resource_claims
   ON addon_resource_ownership (tenant, resource_type, resource_id, installation_id)
   WHERE active = 1;
+
+CREATE TRIGGER IF NOT EXISTS addon_resource_ownership_no_duplicate_identity
+  BEFORE INSERT ON addon_resource_ownership
+  WHEN EXISTS (
+    SELECT 1
+      FROM addon_resource_ownership AS claim
+     WHERE claim.id = NEW.id
+        OR (
+          claim.tenant = NEW.tenant
+          AND claim.installation_id = NEW.installation_id
+          AND claim.resource_type = NEW.resource_type
+          AND claim.resource_id = NEW.resource_id
+        )
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'addon ownership claim identity already exists');
+END;
 
 CREATE TRIGGER IF NOT EXISTS addon_resource_ownership_no_mixed_insert
   BEFORE INSERT ON addon_resource_ownership
@@ -239,6 +256,38 @@ BEGIN
   SELECT RAISE(ABORT, 'addon ownership identity is immutable');
 END;
 
+CREATE TRIGGER IF NOT EXISTS addon_resource_ownership_no_delete
+  BEFORE DELETE ON addon_resource_ownership
+BEGIN
+  SELECT RAISE(ABORT, 'addon ownership claims are evidence and cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS addon_resource_ownership_active_insert_requires_live_installation
+  BEFORE INSERT ON addon_resource_ownership
+  WHEN NEW.active = 1 AND EXISTS (
+    SELECT 1
+      FROM addon_installations AS installation
+     WHERE installation.id = NEW.installation_id
+       AND installation.tenant = NEW.tenant
+       AND installation.state = 'archived'
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'archived addon installations cannot have active ownership claims');
+END;
+
+CREATE TRIGGER IF NOT EXISTS addon_resource_ownership_reactivation_requires_live_installation
+  BEFORE UPDATE OF active ON addon_resource_ownership
+  WHEN OLD.active = 0 AND NEW.active = 1 AND EXISTS (
+    SELECT 1
+      FROM addon_installations AS installation
+     WHERE installation.id = OLD.installation_id
+       AND installation.tenant = OLD.tenant
+       AND installation.state = 'archived'
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'archived addon installations cannot have active ownership claims');
+END;
+
 CREATE TRIGGER IF NOT EXISTS addon_installations_archive_requires_released_ownership
   BEFORE UPDATE OF state ON addon_installations
   WHEN NEW.state = 'archived' AND OLD.state <> 'archived' AND EXISTS (
@@ -253,7 +302,7 @@ BEGIN
 END;
 
 CREATE TABLE IF NOT EXISTS addon_receipts (
-  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT CHECK (sequence > 0),
   id TEXT NOT NULL UNIQUE,
   tenant TEXT NOT NULL,
   installation_id TEXT NOT NULL,
@@ -304,6 +353,15 @@ CREATE TABLE IF NOT EXISTS addon_receipts (
 
 CREATE INDEX IF NOT EXISTS idx_addon_receipts_installation
   ON addon_receipts (tenant, installation_id, sequence DESC);
+
+CREATE TRIGGER IF NOT EXISTS addon_receipts_no_duplicate_sequence
+  BEFORE INSERT ON addon_receipts
+  WHEN NEW.sequence > 0 AND EXISTS (
+    SELECT 1 FROM addon_receipts WHERE sequence = NEW.sequence
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'addon receipt sequences are immutable');
+END;
 
 CREATE TRIGGER IF NOT EXISTS addon_receipts_no_duplicate_id
   BEFORE INSERT ON addon_receipts

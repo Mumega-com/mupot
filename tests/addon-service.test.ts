@@ -392,6 +392,41 @@ describe('addon migration constraints', () => {
     expect(db.receipts()).toHaveLength(0)
   })
 
+  it('rejects a null installation ID before it can bypass the deferred receipt foreign key', () => {
+    const now = new Date().toISOString()
+
+    expect(() => db.harness.sqlite.prepare(`
+      INSERT INTO addon_installations (
+        id, tenant, addon_key, installed_version, publisher, trust_class,
+        manifest_sha256, mupot_compatibility, state, latest_previous_state,
+        installed_by, latest_actor_id, latest_receipt_id, installed_at, updated_at
+      ) VALUES (
+        NULL, ?, 'null-id-addon', '1.0.0', 'Mupot', 'native_reviewed',
+        ?, '^0.23.0', 'installed', NULL, ?, ?, 'missing-receipt', ?, ?
+      )
+    `).run(db.env.TENANT_SLUG, 'a'.repeat(64), owner.id, owner.id, now, now)).toThrow()
+
+    expect(db.installations()).toHaveLength(0)
+  })
+
+  it('declares every text identity primary key as not null', () => {
+    for (const table of [
+      'addon_installations',
+      'addon_operations',
+      'addon_resource_ownership',
+      'addon_receipts',
+    ]) {
+      const columns = db.harness.sqlite.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+        name: string
+        notnull: number
+      }>
+      const id = columns.find((column) => column.name === 'id')
+
+      expect(id, `${table}.id must exist`).toBeDefined()
+      expect(id?.notnull, `${table}.id must be NOT NULL`).toBe(1)
+    }
+  })
+
   it('anchors operation, ownership, and receipt tenants to their installation', async () => {
     const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
     const now = new Date().toISOString()
@@ -513,6 +548,91 @@ describe('addon migration constraints', () => {
        WHERE id = 'claim-a'
     `).run(releasedAt)).not.toThrow()
     expect(db.resources()[0]).toMatchObject({ active: 0, released_at: releasedAt })
+
+    expect(() => db.harness.sqlite.prepare(`
+      UPDATE addon_resource_ownership
+         SET active = 1, released_at = NULL
+       WHERE id = 'claim-a'
+    `).run()).not.toThrow()
+    expect(db.resources()[0]).toMatchObject({ active: 1, released_at: null })
+  })
+
+  it('keeps ownership evidence when direct deletion is attempted', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    insertOwnership(db, 'claim-delete', installation.id, 'dept-delete', 'co_owner')
+    const before = db.resources()[0]
+
+    expect(() => db.harness.sqlite.prepare(
+      'DELETE FROM addon_resource_ownership WHERE id = ?',
+    ).run('claim-delete')).toThrow('addon ownership claims are evidence and cannot be deleted')
+
+    expect(db.resources()[0]).toEqual(before)
+  })
+
+  it('rejects ownership ID reuse through INSERT OR REPLACE with recursive triggers off', async () => {
+    const first = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    const second = await insertInstallationLifecycle(db, { addonKey: 'fixture-addon-two' })
+    insertOwnership(db, 'claim-reuse', first.id, 'dept-original', 'co_owner')
+    const before = db.resources()[0]
+
+    expect(db.harness.sqlite.prepare('PRAGMA recursive_triggers').get()).toMatchObject({ recursive_triggers: 0 })
+    expect(() => db.harness.sqlite.prepare(`
+      INSERT OR REPLACE INTO addon_resource_ownership (
+        id, tenant, installation_id, resource_type, resource_id,
+        resource_key, ownership_mode, active, created_at
+      ) VALUES (?, ?, ?, 'department', 'dept-reparented', 'replacement', 'co_owner', 1, ?)
+    `).run('claim-reuse', db.env.TENANT_SLUG, second.id, new Date().toISOString()))
+      .toThrow('addon ownership claim identity already exists')
+
+    expect(db.resources()[0]).toEqual(before)
+  })
+
+  it('rejects replacing an ownership claim ID through its identity tuple', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    insertOwnership(db, 'claim-original', installation.id, 'dept-original', 'co_owner')
+    const before = db.resources()[0]
+
+    expect(() => db.harness.sqlite.prepare(`
+      INSERT OR REPLACE INTO addon_resource_ownership (
+        id, tenant, installation_id, resource_type, resource_id,
+        resource_key, ownership_mode, active, created_at
+      ) VALUES (?, ?, ?, 'department', 'dept-original', 'replacement', 'co_owner', 1, ?)
+    `).run('claim-replacement', db.env.TENANT_SLUG, installation.id, new Date().toISOString()))
+      .toThrow('addon ownership claim identity already exists')
+
+    expect(db.resources()[0]).toEqual(before)
+  })
+
+  it('rejects active ownership inserts for archived installations but retains inactive history', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    await transitionInstallation(db, installation.id, 'disable', 'installed', 'disabled')
+    await transitionInstallation(db, installation.id, 'archive', 'disabled', 'archived')
+
+    expect(() => insertOwnership(
+      db, 'active-archived-claim', installation.id, 'dept-active', 'co_owner',
+    )).toThrow('archived addon installations cannot have active ownership claims')
+    expect(() => insertOwnership(
+      db, 'inactive-archived-claim', installation.id, 'dept-inactive', 'co_owner', 0,
+    )).not.toThrow()
+    expect(db.resources()).toEqual([
+      expect.objectContaining({ id: 'inactive-archived-claim', active: 0 }),
+    ])
+  })
+
+  it('rejects reactivating historical ownership for an archived installation', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    insertOwnership(db, 'historical-claim', installation.id, 'dept-historical', 'co_owner', 0)
+    await transitionInstallation(db, installation.id, 'disable', 'installed', 'disabled')
+    await transitionInstallation(db, installation.id, 'archive', 'disabled', 'archived')
+    const before = db.resources()[0]
+
+    expect(() => db.harness.sqlite.prepare(`
+      UPDATE addon_resource_ownership
+         SET active = 1, released_at = NULL
+       WHERE id = 'historical-claim'
+    `).run()).toThrow('archived addon installations cannot have active ownership claims')
+
+    expect(db.resources()[0]).toEqual(before)
   })
 
   it('rejects archive while active ownership claims remain', async () => {
@@ -961,6 +1081,61 @@ describe('addon migration constraints', () => {
     expect(db.receipts().find((row) => row.id === receiptId)).toMatchObject({
       actor_id: 'standalone-actor',
     })
+  })
+
+  it('rejects INSERT OR REPLACE for an existing receipt sequence with a fresh ID', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    const receiptId = crypto.randomUUID()
+    insertNonTransitionReceipt(db, db.installations()[0], { id: receiptId, actor_id: 'original-actor' })
+    const receipt = db.receipts().find((row) => row.id === receiptId)
+    if (!receipt?.sequence) throw new Error('expected standalone receipt sequence')
+
+    const replacementId = crypto.randomUUID()
+    expect(db.harness.sqlite.prepare('PRAGMA recursive_triggers').get()).toMatchObject({ recursive_triggers: 0 })
+    expect(() => db.harness.sqlite.prepare(`
+      INSERT OR REPLACE INTO addon_receipts (
+        sequence, id, tenant, installation_id, action, previous_state, next_state,
+        addon_key, installed_version, publisher, trust_class,
+        mupot_compatibility, manifest_sha256, actor_id, outcome,
+        side_effect_ids, checks, error_code, created_at
+      )
+      SELECT ?, ?, tenant, installation_id, action, previous_state, next_state,
+             addon_key, installed_version, publisher, trust_class,
+             mupot_compatibility, manifest_sha256, 'replacement-actor', outcome,
+             side_effect_ids, checks, error_code, created_at
+        FROM addon_receipts
+       WHERE id = ?
+    `).run(receipt.sequence, replacementId, receipt.id))
+      .toThrow('addon receipt sequences are immutable')
+
+    expect(db.receipts().find((row) => row.id === receipt.id)).toMatchObject({
+      sequence: receipt.sequence,
+      actor_id: 'original-actor',
+    })
+    expect(db.receipts().some((row) => row.id === replacementId)).toBe(false)
+    expect(installation.id).toBe(receipt.installation_id)
+  })
+
+  it('requires positive receipt sequences while preserving omitted autoincrement inserts', async () => {
+    await installAddon(db.env, owner, 'fixture-addon')
+    const receipt = db.receipts()[0]
+    if (!receipt?.sequence) throw new Error('expected install receipt sequence')
+
+    expect(receipt.sequence).toBeGreaterThan(0)
+    expect(() => db.harness.sqlite.prepare(`
+      INSERT INTO addon_receipts (
+        sequence, id, tenant, installation_id, action, previous_state, next_state,
+        addon_key, installed_version, publisher, trust_class,
+        mupot_compatibility, manifest_sha256, actor_id, outcome,
+        side_effect_ids, checks, error_code, created_at
+      )
+      SELECT 0, ?, tenant, installation_id, 'health', next_state, next_state,
+             addon_key, installed_version, publisher, trust_class,
+             mupot_compatibility, manifest_sha256, actor_id, outcome,
+             side_effect_ids, checks, error_code, created_at
+        FROM addon_receipts
+       WHERE id = ?
+    `).run(crypto.randomUUID(), receipt.id)).toThrow()
   })
 
   it('rolls back a transition receipt whose identity snapshot does not match the installation', async () => {
