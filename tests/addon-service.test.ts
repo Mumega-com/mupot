@@ -84,6 +84,20 @@ interface InstallationRow {
   updated_at: string
 }
 
+interface OperationFailureRow {
+  id: string
+  tenant: string
+  installation_id: string
+  operation_id: string
+  action: string
+  target_state: string
+  current_step: string
+  actor_id: string
+  lease_token: string
+  error_code: string
+  failed_at: string
+}
+
 function makeDb(tenant = 'tenant-a') {
   const harness = createSqliteD1()
   for (const migration of migrations) harness.sqlite.exec(migration)
@@ -94,6 +108,9 @@ function makeDb(tenant = 'tenant-a') {
     departments: () => harness.sqlite.prepare('SELECT * FROM departments ORDER BY id').all(),
     squads: () => harness.sqlite.prepare('SELECT * FROM squads ORDER BY id').all(),
     operations: () => harness.sqlite.prepare('SELECT * FROM addon_operations ORDER BY created_at, id').all(),
+    operationFailures: () => harness.sqlite.prepare(
+      'SELECT * FROM addon_operation_failures ORDER BY failed_at, id',
+    ).all() as OperationFailureRow[],
     resources: () => harness.sqlite.prepare('SELECT * FROM addon_resource_ownership ORDER BY id').all(),
     receipts: () => harness.sqlite.prepare('SELECT * FROM addon_receipts ORDER BY created_at, id').all() as ReceiptRow[],
     installations: () => harness.sqlite.prepare('SELECT * FROM addon_installations ORDER BY installed_at, id').all() as InstallationRow[],
@@ -1885,6 +1902,55 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     ])
   })
 
+  it('retains immutable failure evidence after a reused operation retries successfully', async () => {
+    await configureFixture()
+    let interrupted = false
+    const deps: AddonLifecycleDeps = {
+      afterDepartmentActivated() {
+        if (interrupted) return
+        interrupted = true
+        throw new Error('secret activation detail')
+      },
+    }
+
+    expect(await activateAddon(db.env, owner, 'fixture-addon', deps)).toEqual({
+      ok: false,
+      reason: 'write_failed',
+    })
+    const failedOperation = db.operations()[0]
+    const originalEvidence = db.operationFailures()
+    expect(originalEvidence).toEqual([expect.objectContaining({
+      tenant: db.env.TENANT_SLUG,
+      installation_id: failedOperation.installation_id,
+      operation_id: failedOperation.id,
+      action: 'activate',
+      target_state: 'active',
+      current_step: 'activate_departments',
+      actor_id: owner.id,
+      lease_token: failedOperation.lease_token,
+      error_code: 'activation_failed',
+    })])
+    expect(JSON.stringify(originalEvidence)).not.toContain('secret activation detail')
+
+    expect(await activateAddon(db.env, admin, 'fixture-addon', deps)).toMatchObject({
+      ok: true,
+      state: 'active',
+    })
+    expect(db.operations()[0]).toMatchObject({
+      id: failedOperation.id,
+      status: 'completed',
+      error_code: null,
+    })
+    expect(db.operationFailures()).toEqual(originalEvidence)
+    expect(() => db.harness.sqlite.prepare(
+      'UPDATE addon_operation_failures SET error_code = ? WHERE id = ?',
+    ).run('replacement_failure', originalEvidence[0].id)).toThrow('addon operation failures are append-only')
+    expect(() => db.harness.sqlite.prepare(
+      'DELETE FROM addon_operation_failures WHERE id = ?',
+    ).run(originalEvidence[0].id)).toThrow('addon operation failures are append-only')
+    expect(db.operationFailures()).toEqual(originalEvidence)
+  })
+
   it('fences addon-managed runtime discovery until the installation is active', async () => {
     await configureFixture()
     let interrupted = false
@@ -2003,6 +2069,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     expect(db.departments()).toEqual([expect.objectContaining({ slug: 'fixture', active: 0 })])
     expect(db.resources()).toEqual([expect.objectContaining({ active: 0 })])
     expect(db.receipts().filter((receipt) => receipt.action === 'activate')).toHaveLength(1)
+    expect(db.operationFailures()).toEqual([])
   })
 
   it('reconciles ownership released during fence-loss corrective activation', async () => {

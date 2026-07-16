@@ -170,6 +170,67 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_addon_one_running_operation
 CREATE UNIQUE INDEX IF NOT EXISTS idx_addon_operation_lease_token
   ON addon_operations (lease_token);
 
+CREATE TABLE IF NOT EXISTS addon_operation_failures (
+  id TEXT NOT NULL PRIMARY KEY,
+  tenant TEXT NOT NULL,
+  installation_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('activate','disable','archive')),
+  target_state TEXT NOT NULL CHECK (target_state IN ('active','disabled','archived')),
+  current_step TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  lease_token TEXT NOT NULL,
+  error_code TEXT NOT NULL CHECK (
+    error_code IN ('activation_failed','disable_failed','archive_failed')
+  ),
+  failed_at TEXT NOT NULL,
+  UNIQUE (operation_id, lease_token),
+  CHECK (
+    (action = 'activate' AND target_state = 'active' AND error_code = 'activation_failed')
+    OR (action = 'disable' AND target_state = 'disabled' AND error_code = 'disable_failed')
+    OR (action = 'archive' AND target_state = 'archived' AND error_code = 'archive_failed')
+  ),
+  FOREIGN KEY (installation_id, tenant)
+    REFERENCES addon_installations (id, tenant)
+    ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_addon_operation_failures_installation
+  ON addon_operation_failures (tenant, installation_id, failed_at, id);
+
+CREATE TRIGGER IF NOT EXISTS addon_operation_failures_match_failed_attempt
+  BEFORE INSERT ON addon_operation_failures
+  WHEN NOT EXISTS (
+    SELECT 1
+      FROM addon_operations AS operation
+     WHERE operation.id = NEW.operation_id
+       AND operation.tenant = NEW.tenant
+       AND operation.installation_id = NEW.installation_id
+       AND operation.action = NEW.action
+       AND operation.target_state = NEW.target_state
+       AND operation.current_step = NEW.current_step
+       AND operation.status = 'failed'
+       AND operation.actor_id = NEW.actor_id
+       AND operation.lease_token = NEW.lease_token
+       AND operation.error_code = NEW.error_code
+       AND operation.updated_at = NEW.failed_at
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'addon operation failure must match the failed attempt');
+END;
+
+CREATE TRIGGER IF NOT EXISTS addon_operation_failures_no_update
+  BEFORE UPDATE ON addon_operation_failures
+BEGIN
+  SELECT RAISE(ABORT, 'addon operation failures are append-only: UPDATE is forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS addon_operation_failures_no_delete
+  BEFORE DELETE ON addon_operation_failures
+BEGIN
+  SELECT RAISE(ABORT, 'addon operation failures are append-only: DELETE is forbidden');
+END;
+
 CREATE TABLE IF NOT EXISTS addon_resource_ownership (
   id TEXT NOT NULL PRIMARY KEY,
   tenant TEXT NOT NULL,

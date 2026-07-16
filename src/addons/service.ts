@@ -521,33 +521,83 @@ async function lifecycleOperationFailure(
     archive: 'archive_failed',
   }[operation.action]
   const failedAt = new Date().toISOString()
-  const result = await env.DB.prepare(`
-    UPDATE addon_operations
-       SET status = 'failed', error_code = ?1, updated_at = ?2
-     WHERE id = ?3 AND tenant = ?4 AND installation_id = ?5
-       AND action = ?6 AND target_state = ?7 AND current_step = ?8
-       AND status = 'running' AND actor_id = ?9 AND lease_token = ?10
-       AND lease_expires_at = ?11 AND lease_expires_at > ?2
-  `).bind(
-    errorCode,
-    failedAt,
-    operation.id,
-    env.TENANT_SLUG,
-    operation.installation_id,
-    operation.action,
-    operation.target_state,
-    operation.current_step,
-    operation.actor_id,
-    operation.lease_token,
-    operation.lease_expires_at,
-  ).run()
-  if (!written(result)) return { ok: false, reason: 'fence_lost' }
+  const failureId = crypto.randomUUID()
+  try {
+    const results = await env.DB.batch([
+      env.DB.prepare(`
+        UPDATE addon_operations
+           SET status = 'failed', error_code = ?1, updated_at = ?2
+         WHERE id = ?3 AND tenant = ?4 AND installation_id = ?5
+           AND action = ?6 AND target_state = ?7 AND current_step = ?8
+           AND status = 'running' AND actor_id = ?9 AND lease_token = ?10
+           AND lease_expires_at = ?11 AND lease_expires_at > ?2
+      `).bind(
+        errorCode,
+        failedAt,
+        operation.id,
+        env.TENANT_SLUG,
+        operation.installation_id,
+        operation.action,
+        operation.target_state,
+        operation.current_step,
+        operation.actor_id,
+        operation.lease_token,
+        operation.lease_expires_at,
+      ),
+      env.DB.prepare(`
+        INSERT INTO addon_operation_failures (
+          id, tenant, installation_id, operation_id, action, target_state,
+          current_step, actor_id, lease_token, error_code, failed_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+      `).bind(
+        failureId,
+        env.TENANT_SLUG,
+        operation.installation_id,
+        operation.id,
+        operation.action,
+        operation.target_state,
+        operation.current_step,
+        operation.actor_id,
+        operation.lease_token,
+        errorCode,
+        failedAt,
+      ),
+    ])
+    if (!written(results[0]) || !written(results[1])) {
+      return { ok: false, reason: 'fence_lost' }
+    }
+  } catch {
+    return { ok: false, reason: 'fence_lost' }
+  }
 
   operation.status = 'failed'
   operation.error_code = errorCode
   operation.updated_at = failedAt
-  const failed = await loadExactOperation(env, operation, 'failed', operation.current_step)
-  return failed
+  const [failed, evidence] = await Promise.all([
+    loadExactOperation(env, operation, 'failed', operation.current_step),
+    env.DB.prepare(`
+      SELECT id
+        FROM addon_operation_failures
+       WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
+         AND operation_id = ?4 AND action = ?5 AND target_state = ?6
+         AND current_step = ?7 AND actor_id = ?8 AND lease_token = ?9
+         AND error_code = ?10 AND failed_at = ?11
+       LIMIT 1
+    `).bind(
+      failureId,
+      env.TENANT_SLUG,
+      operation.installation_id,
+      operation.id,
+      operation.action,
+      operation.target_state,
+      operation.current_step,
+      operation.actor_id,
+      operation.lease_token,
+      errorCode,
+      failedAt,
+    ).first<{ id: string }>(),
+  ])
+  return failed && evidence?.id === failureId
     ? { ok: false, reason: 'write_failed' }
     : { ok: false, reason: 'fence_lost' }
 }
@@ -1855,6 +1905,7 @@ export async function getDepartmentStateSha256(env: Env): Promise<string> {
 
 const ADDON_INTERNAL_TABLES = new Set([
   'addon_installations',
+  'addon_operation_failures',
   'addon_operations',
   'addon_resource_ownership',
   'addon_receipts',
