@@ -433,6 +433,54 @@ describe('addon migration constraints', () => {
     expect(db.receipts()).toHaveLength(2)
   })
 
+  it('rejects a fresh non-lifecycle receipt bound to a lifecycle state transition', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    const installed = db.installations().find((row) => row.id === installation.id)
+    if (!installed) throw new Error('expected installed addon lifecycle')
+
+    expect(() => insertNonTransitionReceipt(db, installed)).not.toThrow()
+    const receiptId = crypto.randomUUID()
+    const now = new Date().toISOString()
+
+    await expect(db.env.DB.batch([
+      db.env.DB.prepare(`
+        UPDATE addon_installations
+           SET state = 'configured', latest_actor_id = ?1, latest_receipt_id = ?2, updated_at = ?3
+         WHERE id = ?4 AND tenant = ?5 AND state = 'installed'
+      `).bind(owner.id, receiptId, now, installation.id, db.env.TENANT_SLUG),
+      db.env.DB.prepare(`
+        INSERT INTO addon_receipts (
+          id, tenant, installation_id, action, previous_state, next_state,
+          addon_key, installed_version, publisher, trust_class,
+          mupot_compatibility, manifest_sha256, actor_id, outcome,
+          side_effect_ids, checks, created_at
+        ) VALUES (
+          ?1, ?2, ?3, 'health', 'installed', 'configured', ?4, ?5, ?6, ?7,
+          ?8, ?9, ?10, 'pass', '[]', '{}', ?11
+        )
+      `).bind(
+        receiptId,
+        db.env.TENANT_SLUG,
+        installation.id,
+        installed.addon_key,
+        installed.installed_version,
+        installed.publisher,
+        installed.trust_class,
+        installed.mupot_compatibility,
+        installed.manifest_sha256,
+        owner.id,
+        now,
+      ),
+    ])).rejects.toThrow()
+
+    expect(db.installations().find((row) => row.id === installation.id)).toMatchObject({
+      state: 'installed',
+      latest_receipt_id: installation.latestReceiptId,
+    })
+    expect(db.receipts()).toHaveLength(2)
+    expect(db.receipts().some((receipt) => receipt.id === receiptId)).toBe(false)
+  })
+
   it('keeps receipts append-only and constrains action, states, outcome, digest, and JSON', async () => {
     await installAddon(db.env, owner, 'fixture-addon')
     const installation = db.installations()[0]

@@ -234,7 +234,16 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS addon_transition_receipts_match_installation
   BEFORE INSERT ON addon_receipts
-  WHEN NEW.action IN ('install','configure','activate','disable','archive') AND NOT EXISTS (
+  WHEN (
+    NEW.action IN ('install','configure','activate','disable','archive')
+    OR EXISTS (
+      SELECT 1
+        FROM addon_installations AS installation
+       WHERE installation.id = NEW.installation_id
+         AND installation.tenant = NEW.tenant
+         AND installation.latest_receipt_id = NEW.id
+    )
+  ) AND NOT EXISTS (
     SELECT 1
       FROM addon_installations AS installation
      WHERE installation.id = NEW.installation_id
@@ -242,6 +251,13 @@ CREATE TRIGGER IF NOT EXISTS addon_transition_receipts_match_installation
        AND installation.latest_receipt_id = NEW.id
        AND installation.latest_actor_id = NEW.actor_id
        AND installation.state = NEW.next_state
+       AND (
+         (NEW.action = 'install' AND NEW.previous_state IS NULL AND NEW.next_state = 'installed')
+         OR (NEW.action = 'configure' AND NEW.previous_state = 'installed' AND NEW.next_state = 'configured')
+         OR (NEW.action = 'activate' AND NEW.previous_state IN ('configured','disabled') AND NEW.next_state = 'active')
+         OR (NEW.action = 'disable' AND NEW.previous_state IN ('installed','configured','active') AND NEW.next_state = 'disabled')
+         OR (NEW.action = 'archive' AND NEW.previous_state = 'disabled' AND NEW.next_state = 'archived')
+       )
   )
 BEGIN
   SELECT RAISE(ABORT, 'addon transition receipt does not match installation state');
