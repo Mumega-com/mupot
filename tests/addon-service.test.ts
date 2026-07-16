@@ -3,7 +3,10 @@ import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { Env } from '../src/types'
 import { getRegisteredAddon } from '../src/addons/registry'
-import { deactivate as deactivateDepartment } from '../src/departments/registry'
+import {
+  activate as activateDepartment,
+  deactivate as deactivateDepartment,
+} from '../src/departments/registry'
 import {
   activateAddon,
   archiveAddon,
@@ -98,6 +101,30 @@ type Db = ReturnType<typeof makeDb>
 function successfulInstallation(result: AddonMutationResult) {
   if (!result.ok) throw new Error(`expected successful addon mutation, received ${result.reason}`)
   return result.installation
+}
+
+function expireRunningLease(db: Db, action: 'activate' | 'disable' | 'archive') {
+  const result = db.harness.sqlite.prepare(`
+    UPDATE addon_operations
+       SET lease_expires_at = '2000-01-01T00:00:00.000Z'
+     WHERE tenant = ? AND action = ? AND status = 'running'
+  `).run(db.env.TENANT_SLUG, action)
+  expect(result.changes).toBe(1)
+}
+
+function createBarrier() {
+  let arrive!: () => void
+  let release!: () => void
+  const arrived = new Promise<void>((resolve) => { arrive = resolve })
+  const released = new Promise<void>((resolve) => { release = resolve })
+  return {
+    arrived,
+    release,
+    async wait() {
+      arrive()
+      await released
+    },
+  }
 }
 
 async function insertInstallationLifecycle(
@@ -471,9 +498,12 @@ describe('addon migration constraints', () => {
     expect(() => db.harness.sqlite.prepare(`
       INSERT INTO addon_operations (
         id, tenant, installation_id, action, target_state, current_step,
-        status, actor_id, created_at, updated_at
-      ) VALUES (?, 'tenant-b', ?, 'activate', 'active', 'start', 'running', ?, ?, ?)
-    `).run('cross-tenant-operation', installation.id, owner.id, now, now)).toThrow()
+        status, actor_id, lease_token, lease_expires_at, created_at, updated_at
+      ) VALUES (?, 'tenant-b', ?, 'activate', 'active', 'start', 'running', ?, ?, ?, ?, ?)
+    `).run(
+      'cross-tenant-operation', installation.id, owner.id,
+      'cross-tenant-token', now, now, now,
+    )).toThrow()
 
     expect(() => db.harness.sqlite.prepare(`
       INSERT INTO addon_resource_ownership (
@@ -492,16 +522,47 @@ describe('addon migration constraints', () => {
     const insert = db.harness.sqlite.prepare(`
       INSERT INTO addon_operations (
         id, tenant, installation_id, action, target_state, current_step,
-        status, actor_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'active', 'start', ?, ?, ?, ?)
+        status, actor_id, lease_token, lease_expires_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'active', 'start', ?, ?, ?, ?, ?, ?)
     `)
 
     expect(() => insert.run(
-      'bad-action', db.env.TENANT_SLUG, installation.id, 'install', 'running', owner.id, now, now,
+      'bad-action', db.env.TENANT_SLUG, installation.id, 'install', 'running', owner.id,
+      'bad-action-token', now, now, now,
     )).toThrow()
-    insert.run('op-a', db.env.TENANT_SLUG, installation.id, 'activate', 'running', owner.id, now, now)
+    insert.run(
+      'op-a', db.env.TENANT_SLUG, installation.id, 'activate', 'running', owner.id,
+      'op-a-token', now, now, now,
+    )
     expect(() => insert.run(
-      'op-b', db.env.TENANT_SLUG, installation.id, 'disable', 'running', owner.id, now, now,
+      'op-b', db.env.TENANT_SLUG, installation.id, 'disable', 'running', owner.id,
+      'op-b-token', now, now, now,
+    )).toThrow()
+  })
+
+  it('requires unique non-null operation lease tokens and expiries', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    const columns = db.harness.sqlite.prepare('PRAGMA table_info(addon_operations)').all() as Array<{
+      name: string
+      notnull: number
+    }>
+    expect(columns.find((column) => column.name === 'lease_token')?.notnull).toBe(1)
+    expect(columns.find((column) => column.name === 'lease_expires_at')?.notnull).toBe(1)
+
+    const now = new Date().toISOString()
+    const insert = db.harness.sqlite.prepare(`
+      INSERT INTO addon_operations (
+        id, tenant, installation_id, action, target_state, current_step,
+        status, actor_id, lease_token, lease_expires_at, created_at, updated_at
+      ) VALUES (?, ?, ?, 'activate', 'active', 'done', 'completed', ?, ?, ?, ?, ?)
+    `)
+    insert.run(
+      'lease-a', db.env.TENANT_SLUG, installation.id, owner.id,
+      'unique-lease-token', now, now, now,
+    )
+    expect(() => insert.run(
+      'lease-b', db.env.TENANT_SLUG, installation.id, owner.id,
+      'unique-lease-token', now, now, now,
     )).toThrow()
   })
 
@@ -519,8 +580,8 @@ describe('addon migration constraints', () => {
     expect(() => db.harness.sqlite.prepare(`
       INSERT INTO addon_operations (
         id, tenant, installation_id, action, target_state, current_step,
-        status, actor_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, 'done', 'completed', ?, ?, ?)
+        status, actor_id, lease_token, lease_expires_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'done', 'completed', ?, ?, ?, ?, ?)
     `).run(
       `contradictory-${action}-${targetState}`,
       db.env.TENANT_SLUG,
@@ -528,6 +589,8 @@ describe('addon migration constraints', () => {
       action,
       targetState,
       owner.id,
+      `contradictory-${action}-${targetState}-token`,
+      now,
       now,
       now,
     )).toThrow()
@@ -1620,6 +1683,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     ])
     expect(db.receipts().filter((receipt) => receipt.action === 'activate')).toHaveLength(0)
 
+    expireRunningLease(db, 'activate')
     expect(await activateAddon(db.env, admin, 'fixture-addon', deps)).toMatchObject({
       ok: true,
       state: 'active',
@@ -1633,6 +1697,174 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     expect(db.receipts().filter((receipt) => receipt.action === 'activate')).toEqual([
       expect.objectContaining({ actor_id: owner.id, previous_state: 'configured', next_state: 'active' }),
     ])
+  })
+
+  it('refuses an unexpired foreign activation lease', async () => {
+    await configureFixture()
+    const barrier = createBarrier()
+    let paused = false
+    const first = activateAddon(db.env, owner, 'fixture-addon', {
+      async afterDepartmentActivated() {
+        if (paused) return
+        paused = true
+        await barrier.wait()
+      },
+    })
+    await barrier.arrived
+    const leased = db.operations()[0]
+
+    expect(await activateAddon(db.env, admin, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'operation_busy',
+      state: 'configured',
+    })
+    expect(db.operations()[0]).toMatchObject({
+      id: leased.id,
+      lease_token: leased.lease_token,
+      status: 'running',
+    })
+
+    barrier.release()
+    expect(await first).toMatchObject({ ok: true, state: 'active' })
+  })
+
+  it('fences a stale activation after takeover, disable, and archive', async () => {
+    await configureFixture()
+    const barrier = createBarrier()
+    let paused = false
+    const stale = activateAddon(db.env, owner, 'fixture-addon', {
+      async afterDepartmentActivated() {
+        if (paused) return
+        paused = true
+        await barrier.wait()
+      },
+    })
+    await barrier.arrived
+    const staleToken = db.operations()[0].lease_token
+    expireRunningLease(db, 'activate')
+
+    expect(await activateAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'active' })
+    expect(db.operations()[0].lease_token).not.toBe(staleToken)
+    expect(await disableAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'disabled' })
+    expect(await archiveAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'archived' })
+
+    barrier.release()
+    expect(await stale).toEqual({ ok: false, reason: 'fence_lost' })
+    expect(db.installations()).toEqual([expect.objectContaining({ state: 'archived' })])
+    expect(db.departments()).toEqual([expect.objectContaining({ slug: 'fixture', active: 0 })])
+    expect(db.resources()).toEqual([expect.objectContaining({ active: 0 })])
+    expect(db.receipts().filter((receipt) => receipt.action === 'activate')).toHaveLength(1)
+  })
+
+  it('reports fence loss when takeover completes immediately before activation transition', async () => {
+    await configureFixture()
+    let takeover: AddonMutationResult | undefined
+    const racingEnv = withPreBatchRace(
+      db,
+      (sql) => sql.includes("SET state = 'active'"),
+      async () => {
+        expireRunningLease(db, 'activate')
+        takeover = await activateAddon(db.env, admin, 'fixture-addon')
+      },
+    )
+
+    expect(await activateAddon(racingEnv, owner, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'fence_lost',
+    })
+    expect(takeover).toMatchObject({ ok: true, state: 'active' })
+    expect(db.installations()).toEqual([expect.objectContaining({ state: 'active' })])
+    expect(db.resources()).toHaveLength(1)
+    expect(db.receipts().filter((receipt) => receipt.action === 'activate')).toHaveLength(1)
+  })
+
+  it('reactivates canonically after a co-owner deactivates between registry activation and claim', async () => {
+    await configureFixture()
+    const coOwner = await insertInstallationLifecycle(db, { addonKey: 'fixture-addon-race-owner' })
+    await transitionInstallation(db, coOwner.id, 'configure', 'installed', 'configured')
+    await transitionInstallation(db, coOwner.id, 'activate', 'configured', 'active')
+    let raced = false
+
+    const result = await activateAddon(db.env, owner, 'fixture-addon', {
+      async afterDepartmentActivated(event) {
+        if (raced) return
+        raced = true
+        insertOwnership(db, 'activation-window-co-owner', coOwner.id, event.departmentId, 'co_owner')
+        db.harness.sqlite.prepare(`
+          UPDATE addon_resource_ownership
+             SET active = 0, released_at = ?
+           WHERE id = 'activation-window-co-owner'
+        `).run(new Date().toISOString())
+        expect(await deactivateDepartment(db.env.DB, event.moduleKey)).toEqual({ ok: true })
+      },
+    })
+
+    expect(result).toMatchObject({ ok: true, state: 'active' })
+    expect(raced).toBe(true)
+    expect(db.departments()).toEqual([
+      expect.objectContaining({
+        id: db.resources().find((claim) => claim.active === 1)?.resource_id,
+        slug: 'fixture',
+        template_key: 'fixture',
+        active: 1,
+      }),
+    ])
+    expect(db.squads()).toHaveLength(1)
+  })
+
+  it('fails closed when an existing active claim has non-canonical immutable fields', async () => {
+    await configureFixture()
+    const installation = db.installations()[0]
+    const activated = await activateDepartment(db.env.DB, 'fixture')
+    if (!activated.ok) throw new Error(`fixture activation failed: ${activated.reason}`)
+    insertOwnership(db, 'malformed-active-claim', installation.id, activated.departmentId, 'exclusive')
+
+    expect(await activateAddon(db.env, owner, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'write_failed',
+    })
+    expect(db.installations()[0]).toMatchObject({ id: installation.id, state: 'configured' })
+    expect(db.receipts().filter((receipt) => receipt.action === 'activate')).toHaveLength(0)
+  })
+
+  it('fails closed when an active claim hides behind a foreign resource key and ID', async () => {
+    await configureFixture()
+    const installation = db.installations()[0]
+    db.harness.sqlite.prepare(`
+      INSERT INTO addon_resource_ownership (
+        id, tenant, installation_id, resource_type, resource_id,
+        resource_key, ownership_mode, active, created_at
+      ) VALUES (?, ?, ?, 'department', 'foreign-department-id',
+                'foreign-module', 'co_owner', 1, ?)
+    `).run(
+      'hidden-malformed-active-claim',
+      db.env.TENANT_SLUG,
+      installation.id,
+      new Date().toISOString(),
+    )
+
+    expect(await activateAddon(db.env, owner, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'write_failed',
+    })
+    expect(db.installations()[0]).toMatchObject({ id: installation.id, state: 'configured' })
+    expect(db.resources()).toEqual([expect.objectContaining({ id: 'hidden-malformed-active-claim' })])
+  })
+
+  it('revalidates active claims before returning active idempotently', async () => {
+    await activateFixture()
+    db.harness.sqlite.exec('DROP TRIGGER addon_resource_ownership_identity_is_immutable')
+    db.harness.sqlite.prepare(`
+      UPDATE addon_resource_ownership
+         SET ownership_mode = 'exclusive'
+       WHERE installation_id = ?
+    `).run(db.installations()[0].id)
+
+    expect(await activateAddon(db.env, admin, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'write_failed',
+    })
+    expect(db.installations()[0].state).toBe('active')
   })
 
   it('changes state and writes the exact disable receipt before resumable teardown', async () => {
@@ -1676,6 +1908,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       }),
     ])
 
+    expireRunningLease(db, 'disable')
     expect(await disableAddon(db.env, admin, 'fixture-addon', deps)).toMatchObject({
       ok: true,
       state: 'disabled',
@@ -1719,6 +1952,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       status: 'running',
     })
 
+    expireRunningLease(db, 'disable')
     expect(await disableAddon(db.env, admin, 'fixture-addon', deps)).toMatchObject({
       ok: true,
       state: 'disabled',
@@ -1816,12 +2050,11 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     await transitionInstallation(db, second.id, 'activate', 'configured', 'active')
     let injected = false
     const deps: AddonLifecycleDeps = {
-      async deactivateDepartment(database, moduleKey) {
+      afterDepartmentDeactivated() {
         if (!injected) {
           injected = true
           insertOwnership(db, 'late-co-owner-claim', second.id, departmentId, 'co_owner')
         }
-        return deactivateDepartment(database, moduleKey)
       },
     }
 
@@ -1886,6 +2119,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       status: 'running',
     })
 
+    expireRunningLease(db, 'disable')
     expect(await disableAddon(db.env, admin, 'fixture-addon', deps)).toMatchObject({
       ok: true,
       state: 'disabled',
@@ -1899,6 +2133,47 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       status: 'completed',
       actor_id: owner.id,
     })
+  })
+
+  it('fences a stale disable after takeover and reactivation', async () => {
+    await activateFixture()
+    const barrier = createBarrier()
+    let paused = false
+    const stale = disableAddon(db.env, owner, 'fixture-addon', {
+      async afterDepartmentDeactivated() {
+        if (paused) return
+        paused = true
+        await barrier.wait()
+      },
+    })
+    await barrier.arrived
+    const staleToken = db.operations().find((operation) => operation.action === 'disable')?.lease_token
+    expireRunningLease(db, 'disable')
+
+    expect(await disableAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'disabled' })
+    expect(db.operations().find((operation) => operation.action === 'disable')?.lease_token).not.toBe(staleToken)
+    expect(await activateAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'active' })
+
+    barrier.release()
+    expect(await stale).toEqual({ ok: false, reason: 'fence_lost' })
+    expect(db.installations()).toEqual([expect.objectContaining({ state: 'active' })])
+    expect(db.departments()).toEqual([expect.objectContaining({ slug: 'fixture', active: 1 })])
+    expect(db.resources()).toEqual([expect.objectContaining({ active: 1, released_at: null })])
+  })
+
+  it('requires one exact completed disable operation before returning success', async () => {
+    await activateFixture()
+    const result = await disableAddon(db.env, owner, 'fixture-addon', {
+      beforeOperationCompleted(event) {
+        db.harness.sqlite.prepare(`
+          DELETE FROM addon_operations
+           WHERE id = ? AND tenant = ? AND action = 'disable' AND status = 'running'
+        `).run(event.operationId, db.env.TENANT_SLUG)
+      },
+    })
+
+    expect(result).toEqual({ ok: false, reason: 'fence_lost' })
+    expect(db.operations().filter((operation) => operation.action === 'disable')).toHaveLength(0)
   })
 
   it('archives only after disable teardown, deletes nothing, and cannot reactivate the archived lifecycle', async () => {
@@ -1915,12 +2190,13 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     })
     expect(await archiveAddon(db.env, admin, 'fixture-addon')).toEqual({
       ok: false,
-      reason: 'invalid_state',
+      reason: 'operation_busy',
       state: 'disabled',
     })
     expect(db.receipts().filter((receipt) => receipt.action === 'archive')).toHaveLength(0)
 
     deps.afterInstallationDisabled = undefined
+    expireRunningLease(db, 'disable')
     await disableAddon(db.env, admin, 'fixture-addon', deps)
     const receiptCountBeforeArchive = db.receipts().length
     const archived = await archiveAddon(db.env, admin, 'fixture-addon')
@@ -1955,6 +2231,33 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     })
   })
 
+  it('reinstalls an archived addon through activation with a distinct retained claim and one seed', async () => {
+    const first = successfulInstallation(await activateFixture())
+    const firstClaim = db.resources()[0]
+    expect(await disableAddon(db.env, owner, 'fixture-addon')).toMatchObject({ ok: true, state: 'disabled' })
+    expect(await archiveAddon(db.env, owner, 'fixture-addon')).toMatchObject({ ok: true, state: 'archived' })
+
+    const second = successfulInstallation(await installAddon(db.env, admin, 'fixture-addon'))
+    expect(second.id).not.toBe(first.id)
+    expect(await configureAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'configured' })
+    expect(await activateAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'active' })
+
+    expect(db.installations()).toEqual([
+      expect.objectContaining({ id: first.id, state: 'archived' }),
+      expect.objectContaining({ id: second.id, state: 'active' }),
+    ])
+    expect(db.resources()).toHaveLength(2)
+    expect(db.resources().find((claim) => claim.installation_id === first.id)).toMatchObject({
+      id: firstClaim.id,
+      active: 0,
+    })
+    const secondClaim = db.resources().find((claim) => claim.installation_id === second.id)
+    expect(secondClaim).toMatchObject({ active: 1 })
+    expect(secondClaim?.id).not.toBe(firstClaim.id)
+    expect(db.departments()).toEqual([expect.objectContaining({ active: 1 })])
+    expect(db.squads()).toHaveLength(1)
+  })
+
   it('serializes concurrent activation and disable without duplicate claims or lifecycle receipts', async () => {
     await configureFixture()
 
@@ -1963,7 +2266,11 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       activateAddon(db.env, admin, 'fixture-addon'),
     ])
 
-    expect(activations.every((result) => result.ok && result.state === 'active')).toBe(true)
+    expect(activations.some((result) => result.ok && result.state === 'active')).toBe(true)
+    expect(activations.every((result) => (
+      result.ok ? result.state === 'active' : result.reason === 'operation_busy'
+    ))).toBe(true)
+    expect(await activateAddon(db.env, owner, 'fixture-addon')).toMatchObject({ ok: true, state: 'active' })
     expect(db.departments()).toHaveLength(1)
     expect(db.squads()).toHaveLength(1)
     expect(db.resources()).toHaveLength(1)
@@ -1975,7 +2282,11 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       disableAddon(db.env, admin, 'fixture-addon'),
     ])
 
-    expect(disables.every((result) => result.ok && result.state === 'disabled')).toBe(true)
+    expect(disables.some((result) => result.ok && result.state === 'disabled')).toBe(true)
+    expect(disables.every((result) => (
+      result.ok ? result.state === 'disabled' : result.reason === 'operation_busy'
+    ))).toBe(true)
+    expect(await disableAddon(db.env, owner, 'fixture-addon')).toMatchObject({ ok: true, state: 'disabled' })
     expect(db.resources()).toEqual([expect.objectContaining({ active: 0 })])
     expect(db.receipts().filter((receipt) => receipt.action === 'disable')).toHaveLength(1)
     expect(db.operations().filter((operation) => operation.action === 'disable')).toHaveLength(1)
@@ -1996,7 +2307,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
 
     expect(await activateAddon(racingEnv, owner, 'fixture-addon')).toEqual({
       ok: false,
-      reason: 'write_failed',
+      reason: 'fence_lost',
     })
     expect(db.installations()[0]).toMatchObject({
       state: 'configured',
@@ -2025,7 +2336,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
 
     expect(await disableAddon(racingEnv, owner, 'fixture-addon')).toEqual({
       ok: false,
-      reason: 'write_failed',
+      reason: 'fence_lost',
     })
     expect(db.installations()[0]).toMatchObject({
       state: 'active',
@@ -2051,7 +2362,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
 
     expect(await archiveAddon(racingEnv, admin, 'fixture-addon')).toEqual({
       ok: false,
-      reason: 'write_failed',
+      reason: 'fence_lost',
     })
     expect(db.installations()[0]).toMatchObject({
       state: 'disabled',

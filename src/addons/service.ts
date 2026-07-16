@@ -3,6 +3,7 @@ import type { Env } from '../types'
 import {
   activate as activateDepartment,
   deactivate as deactivateDepartment,
+  getRegistered as getRegisteredDepartment,
 } from '../departments/registry'
 import './modules/fixture'
 import { getRegisteredAddon, type AddonCatalogEntry } from './registry'
@@ -70,18 +71,19 @@ export interface AddonOwnershipLifecycleEvent extends AddonDepartmentLifecycleEv
   claimId: string
 }
 
+export interface AddonOperationLifecycleEvent {
+  installationId: string
+  operationId: string
+}
+
 export interface AddonLifecycleDeps {
-  activateDepartment?: typeof activateDepartment
-  deactivateDepartment?: typeof deactivateDepartment
   afterDepartmentActivated?: (event: AddonDepartmentLifecycleEvent) => void | Promise<void>
-  afterInstallationDisabled?: (event: {
-    installationId: string
-    operationId: string
-  }) => void | Promise<void>
+  afterInstallationDisabled?: (event: AddonOperationLifecycleEvent) => void | Promise<void>
   beforeDepartmentDeactivated?: (event: AddonDepartmentLifecycleEvent) => void | Promise<void>
   afterDepartmentDeactivated?: (event: AddonDepartmentLifecycleEvent) => void | Promise<void>
   beforeOwnershipReleased?: (event: AddonOwnershipLifecycleEvent) => void | Promise<void>
   afterOwnershipReleased?: (event: AddonOwnershipLifecycleEvent) => void | Promise<void>
+  beforeOperationCompleted?: (event: AddonOperationLifecycleEvent) => void | Promise<void>
 }
 
 export type AddonFailureReason =
@@ -90,6 +92,8 @@ export type AddonFailureReason =
   | 'invalid_state'
   | 'write_failed'
   | 'not_authorized'
+  | 'operation_busy'
+  | 'fence_lost'
 
 export type AddonMutationResult =
   | { ok: true; state: AddonState; installation: AddonInstallation; created: true; idempotent?: never }
@@ -156,7 +160,8 @@ interface OperationRow {
   current_step: string
   status: 'running' | 'completed' | 'failed' | 'compensated'
   actor_id: string
-  lease_expires_at: string | null
+  lease_token: string
+  lease_expires_at: string
   error_code: string | null
   created_at: string
   updated_at: string
@@ -173,6 +178,14 @@ interface OwnershipRow {
   active: 0 | 1
   created_at: string
   released_at: string | null
+}
+
+interface DepartmentRow {
+  id: string
+  slug: string
+  template_key: string | null
+  template_version: string | null
+  active: 0 | 1
 }
 
 const INSTALLATION_COLUMNS = `
@@ -338,37 +351,164 @@ async function loadLifecycleMutationContext(
   return { ok: true, entry, installation }
 }
 
+const OPERATION_LEASE_MS = 30_000
+
+class FenceLostError extends Error {
+  constructor() {
+    super('addon operation fence lost')
+  }
+}
+
+type OperationAcquireResult =
+  | { ok: true; operation: OperationRow }
+  | { ok: false; reason: 'operation_busy' | 'fence_lost' }
+
+function leaseWindow(nowMs = Date.now()): { now: string; expiresAt: string } {
+  return {
+    now: new Date(nowMs).toISOString(),
+    expiresAt: new Date(nowMs + OPERATION_LEASE_MS).toISOString(),
+  }
+}
+
+function leaseIsLive(operation: OperationRow, nowMs = Date.now()): boolean {
+  return Date.parse(operation.lease_expires_at) > nowMs
+}
+
+function lifecycleFailure(error: unknown): AddonMutationFailure {
+  return {
+    ok: false,
+    reason: error instanceof FenceLostError ? 'fence_lost' : 'write_failed',
+  }
+}
+
 async function loadRunningOperation(env: Env, installationId: string): Promise<OperationRow | null> {
   return env.DB.prepare(`
     SELECT id, tenant, installation_id, action, target_state, current_step,
-           status, actor_id, lease_expires_at, error_code, created_at, updated_at
+           status, actor_id, lease_token, lease_expires_at, error_code, created_at, updated_at
       FROM addon_operations
      WHERE tenant = ?1 AND installation_id = ?2 AND status = 'running'
      LIMIT 1
   `).bind(env.TENANT_SLUG, installationId).first<OperationRow>()
 }
 
-async function beginOrResumeOperation(
+async function loadExactOperation(
+  env: Env,
+  operation: OperationRow,
+  status: OperationRow['status'],
+  step: string,
+): Promise<OperationRow | null> {
+  return env.DB.prepare(`
+    SELECT id, tenant, installation_id, action, target_state, current_step,
+           status, actor_id, lease_token, lease_expires_at, error_code, created_at, updated_at
+      FROM addon_operations
+     WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
+       AND action = ?4 AND target_state = ?5 AND actor_id = ?6
+       AND lease_token = ?7 AND status = ?8 AND current_step = ?9
+     LIMIT 1
+  `).bind(
+    operation.id,
+    env.TENANT_SLUG,
+    operation.installation_id,
+    operation.action,
+    operation.target_state,
+    operation.actor_id,
+    operation.lease_token,
+    status,
+    step,
+  ).first<OperationRow>()
+}
+
+async function lifecycleOperationFailure(
+  env: Env,
+  operation: OperationRow,
+  error: unknown,
+): Promise<AddonMutationFailure> {
+  if (error instanceof FenceLostError) return lifecycleFailure(error)
+  const owned = await loadExactOperation(
+    env,
+    operation,
+    'running',
+    operation.current_step,
+  )
+  return !owned || !leaseIsLive(owned)
+    ? { ok: false, reason: 'fence_lost' }
+    : { ok: false, reason: 'write_failed' }
+}
+
+async function acquireOperation(
   env: Env,
   installationId: string,
   actorId: string,
   action: OperationAction,
   targetState: OperationTargetState,
   initialStep: string,
-): Promise<OperationRow | null> {
+  expectedStates: readonly [AddonState, AddonState],
+): Promise<OperationAcquireResult> {
   const running = await loadRunningOperation(env, installationId)
+  const token = crypto.randomUUID()
+  const { now, expiresAt } = leaseWindow()
+
   if (running) {
-    return running.action === action && running.target_state === targetState ? running : null
+    if (leaseIsLive(running)) return { ok: false, reason: 'operation_busy' }
+    if (running.action !== action || running.target_state !== targetState) {
+      return { ok: false, reason: 'operation_busy' }
+    }
+
+    const claimed = await env.DB.prepare(`
+      UPDATE addon_operations
+         SET lease_token = ?1, lease_expires_at = ?2, updated_at = ?3, error_code = NULL
+       WHERE id = ?4 AND tenant = ?5 AND installation_id = ?6
+         AND action = ?7 AND target_state = ?8 AND current_step = ?9
+         AND status = 'running' AND actor_id = ?10
+         AND lease_token = ?11 AND lease_expires_at = ?12 AND lease_expires_at <= ?3
+         AND EXISTS (
+           SELECT 1 FROM addon_installations AS installation
+            WHERE installation.id = addon_operations.installation_id
+              AND installation.tenant = addon_operations.tenant
+              AND installation.state IN (?13, ?14)
+         )
+    `).bind(
+      token,
+      expiresAt,
+      now,
+      running.id,
+      env.TENANT_SLUG,
+      installationId,
+      action,
+      targetState,
+      running.current_step,
+      running.actor_id,
+      running.lease_token,
+      running.lease_expires_at,
+      expectedStates[0],
+      expectedStates[1],
+    ).run()
+    if (!written(claimed)) {
+      const raced = await loadRunningOperation(env, installationId)
+      return raced && leaseIsLive(raced)
+        ? { ok: false, reason: 'operation_busy' }
+        : { ok: false, reason: 'fence_lost' }
+    }
+
+    const operation = { ...running, lease_token: token, lease_expires_at: expiresAt, updated_at: now }
+    const selected = await loadExactOperation(env, operation, 'running', running.current_step)
+    return selected
+      ? { ok: true, operation: selected }
+      : { ok: false, reason: 'fence_lost' }
   }
 
   const id = crypto.randomUUID()
-  const createdAt = new Date().toISOString()
   try {
-    const result = await env.DB.prepare(`
+    const inserted = await env.DB.prepare(`
       INSERT INTO addon_operations (
         id, tenant, installation_id, action, target_state, current_step,
-        status, actor_id, created_at, updated_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?8)
+        status, actor_id, lease_token, lease_expires_at, created_at, updated_at
+      )
+      SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?9, ?10, ?10
+       WHERE EXISTS (
+         SELECT 1 FROM addon_installations
+          WHERE id = ?3 AND tenant = ?2 AND state IN (?11, ?12)
+       )
     `).bind(
       id,
       env.TENANT_SLUG,
@@ -377,11 +517,14 @@ async function beginOrResumeOperation(
       targetState,
       initialStep,
       actorId,
-      createdAt,
+      token,
+      expiresAt,
+      now,
+      expectedStates[0],
+      expectedStates[1],
     ).run()
-
-    if (written(result)) {
-      return {
+    if (written(inserted)) {
+      const operation: OperationRow = {
         id,
         tenant: env.TENANT_SLUG,
         installation_id: installationId,
@@ -390,47 +533,113 @@ async function beginOrResumeOperation(
         current_step: initialStep,
         status: 'running',
         actor_id: actorId,
-        lease_expires_at: null,
+        lease_token: token,
+        lease_expires_at: expiresAt,
         error_code: null,
-        created_at: createdAt,
-        updated_at: createdAt,
+        created_at: now,
+        updated_at: now,
       }
+      return { ok: true, operation }
     }
   } catch {
-    // A concurrent caller may have won the one-running-operation constraint.
+    // The running-operation or lease-token uniqueness constraint identifies the winner.
   }
 
   const raced = await loadRunningOperation(env, installationId)
-  return raced?.action === action && raced.target_state === targetState ? raced : null
+  return raced ? { ok: false, reason: 'operation_busy' } : { ok: false, reason: 'fence_lost' }
 }
 
 function operationStepStatement(
   env: Env,
   operation: OperationRow,
   step: string,
-  updatedAt: string,
-  status: 'running' | 'completed' = 'running',
+  status: 'running' | 'completed',
+  expectedStates: readonly [AddonState, AddonState],
+  timing = leaseWindow(),
 ): D1PreparedStatement {
   return env.DB.prepare(`
     UPDATE addon_operations
-       SET current_step = ?1, status = ?2, updated_at = ?3, error_code = NULL
-     WHERE id = ?4 AND tenant = ?5 AND installation_id = ?6
-       AND action = ?7 AND target_state = ?8 AND status = 'running'
+       SET current_step = ?1, status = ?2, lease_expires_at = ?3,
+           updated_at = ?4, error_code = NULL
+     WHERE id = ?5 AND tenant = ?6 AND installation_id = ?7
+       AND action = ?8 AND target_state = ?9 AND actor_id = ?10
+       AND lease_token = ?11 AND current_step = ?12 AND status = 'running'
+       AND lease_expires_at > ?4
+       AND EXISTS (
+         SELECT 1 FROM addon_installations AS installation
+          WHERE installation.id = addon_operations.installation_id
+            AND installation.tenant = addon_operations.tenant
+            AND installation.state IN (?13, ?14)
+       )
   `).bind(
     step,
     status,
-    updatedAt,
+    timing.expiresAt,
+    timing.now,
     operation.id,
     env.TENANT_SLUG,
     operation.installation_id,
     operation.action,
     operation.target_state,
+    operation.actor_id,
+    operation.lease_token,
+    operation.current_step,
+    expectedStates[0],
+    expectedStates[1],
   )
 }
 
-async function setOperationStep(env: Env, operation: OperationRow, step: string): Promise<void> {
-  const updatedAt = new Date().toISOString()
-  await operationStepStatement(env, operation, step, updatedAt).run()
+async function setOperationStep(
+  env: Env,
+  operation: OperationRow,
+  step: string,
+  expectedStates: readonly [AddonState, AddonState],
+): Promise<void> {
+  const timing = leaseWindow()
+  const result = await operationStepStatement(
+    env,
+    operation,
+    step,
+    'running',
+    expectedStates,
+    timing,
+  ).run()
+  if (!written(result)) throw new FenceLostError()
+  operation.current_step = step
+  operation.lease_expires_at = timing.expiresAt
+  operation.updated_at = timing.now
+}
+
+async function renewOperationLease(
+  env: Env,
+  operation: OperationRow,
+  expectedStates: readonly [AddonState, AddonState],
+): Promise<void> {
+  await setOperationStep(env, operation, operation.current_step, expectedStates)
+}
+
+async function completeOperation(
+  env: Env,
+  operation: OperationRow,
+  expectedState: AddonState,
+): Promise<OperationRow> {
+  const timing = leaseWindow()
+  const result = await operationStepStatement(
+    env,
+    operation,
+    'completed',
+    'completed',
+    [expectedState, expectedState],
+    timing,
+  ).run()
+  if (!written(result)) throw new FenceLostError()
+  operation.current_step = 'completed'
+  operation.status = 'completed'
+  operation.lease_expires_at = timing.expiresAt
+  operation.updated_at = timing.now
+  const completed = await loadExactOperation(env, operation, 'completed', 'completed')
+  if (!completed) throw new FenceLostError()
+  return completed
 }
 
 function transitionReceiptStatement(
@@ -512,10 +721,10 @@ async function loadDepartmentClaims(
     SELECT id, tenant, installation_id, resource_type, resource_id,
            resource_key, ownership_mode, active, created_at, released_at
       FROM addon_resource_ownership
-     WHERE tenant = ?1 AND installation_id = ?2 AND resource_type = 'department'
+     WHERE installation_id = ?1
        ${activePredicate}
      ORDER BY resource_key ASC, id ASC
-  `).bind(env.TENANT_SLUG, installationId).all<OwnershipRow>()
+  `).bind(installationId).all<OwnershipRow>()
   return result.results ?? []
 }
 
@@ -528,10 +737,9 @@ async function loadDepartmentClaim(
     SELECT id, tenant, installation_id, resource_type, resource_id,
            resource_key, ownership_mode, active, created_at, released_at
       FROM addon_resource_ownership
-     WHERE tenant = ?1 AND installation_id = ?2
-       AND resource_type = 'department' AND resource_key = ?3
+     WHERE installation_id = ?1 AND resource_key = ?2
      ORDER BY id ASC
-  `).bind(env.TENANT_SLUG, installationId, moduleKey).all<OwnershipRow>()
+  `).bind(installationId, moduleKey).all<OwnershipRow>()
   const rows = result.results ?? []
   if (rows.length > 1) throw new Error('duplicate addon department ownership')
   return rows[0] ?? null
@@ -546,10 +754,9 @@ async function loadOwnershipClaimById(
     SELECT id, tenant, installation_id, resource_type, resource_id,
            resource_key, ownership_mode, active, created_at, released_at
       FROM addon_resource_ownership
-     WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
-       AND resource_type = 'department'
+     WHERE id = ?1 AND installation_id = ?2
      LIMIT 1
-  `).bind(claimId, env.TENANT_SLUG, installationId).first<OwnershipRow>()
+  `).bind(claimId, installationId).first<OwnershipRow>()
 }
 
 async function countOtherActiveClaims(
@@ -570,18 +777,146 @@ async function countOtherActiveClaims(
   return Number(row?.count ?? 0)
 }
 
-async function activateRegisteredDepartment(
+async function countActiveClaimsForDepartment(
+  env: Env,
+  departmentId: string,
+): Promise<number> {
+  const row = await env.DB.prepare(`
+    SELECT COUNT(*) AS count
+      FROM addon_resource_ownership
+     WHERE tenant = ?1 AND resource_type = 'department'
+       AND resource_id = ?2 AND active = 1
+  `).bind(env.TENANT_SLUG, departmentId).first<{ count: number }>()
+  return Number(row?.count ?? 0)
+}
+
+async function loadCanonicalDepartment(
   env: Env,
   moduleKey: string,
-  deps: AddonLifecycleDeps,
-): Promise<{ departmentId: string }> {
-  const activate = deps.activateDepartment ?? activateDepartment
-  let result = await activate(env.DB, moduleKey)
+  departmentId: string,
+  expectedActive: 0 | 1 | null,
+): Promise<DepartmentRow> {
+  const module = getRegisteredDepartment(moduleKey)
+  if (!module) throw new Error('addon department module is not registered')
+  const result = await env.DB.prepare(`
+    SELECT id, slug, template_key, template_version, active
+      FROM departments
+     WHERE id = ?1 OR slug = ?2
+     ORDER BY id ASC
+  `).bind(departmentId, moduleKey).all<DepartmentRow>()
+  const rows = result.results ?? []
+  if (rows.length !== 1) throw new Error('addon department canonical row is ambiguous')
+  const row = rows[0]
+  if (
+    row.id !== departmentId
+    || row.slug !== moduleKey
+    || row.template_key !== module.key
+    || row.template_version !== module.version
+    || (expectedActive !== null && row.active !== expectedActive)
+  ) {
+    throw new Error('addon department canonical row mismatch')
+  }
+  return row
+}
+
+async function activateCanonicalDepartment(
+  env: Env,
+  moduleKey: string,
+  expectedDepartmentId?: string,
+): Promise<DepartmentRow> {
+  let result = await activateDepartment(env.DB, moduleKey)
   if (!result.ok && result.reason === 'db_error') {
-    result = await activate(env.DB, moduleKey)
+    result = await activateDepartment(env.DB, moduleKey)
   }
   if (!result.ok) throw new Error(`department activation failed: ${result.reason}`)
-  return result
+  if (expectedDepartmentId && result.departmentId !== expectedDepartmentId) {
+    throw new Error('department activation changed canonical ID')
+  }
+  return loadCanonicalDepartment(env, moduleKey, result.departmentId, 1)
+}
+
+function validateDepartmentClaim(
+  env: Env,
+  installationId: string,
+  moduleKey: string,
+  department: DepartmentRow,
+  claim: OwnershipRow,
+): void {
+  if (
+    claim.tenant !== env.TENANT_SLUG
+    || claim.installation_id !== installationId
+    || claim.resource_type !== 'department'
+    || claim.resource_key !== moduleKey
+    || claim.resource_id !== department.id
+    || claim.ownership_mode !== 'co_owner'
+  ) {
+    throw new Error('addon department ownership identity mismatch')
+  }
+}
+
+async function validateActiveDepartmentClaims(
+  env: Env,
+  installation: AddonInstallation,
+  entry: AddonCatalogEntry,
+): Promise<void> {
+  const claims = await loadDepartmentClaims(env, installation.id, true)
+  for (const claim of claims) {
+    const declared = entry.manifest.departments.find(
+      (department) => department.moduleKey === claim.resource_key,
+    )
+    if (!declared) throw new Error('active addon claim is not declared by the manifest')
+    const department = await loadCanonicalDepartment(
+      env,
+      declared.moduleKey,
+      claim.resource_id,
+      installation.state === 'active' ? 1 : null,
+    )
+    validateDepartmentClaim(env, installation.id, declared.moduleKey, department, claim)
+  }
+
+  if (installation.state === 'active') {
+    for (const department of entry.manifest.departments) {
+      const matches = claims.filter((claim) => claim.resource_key === department.moduleKey)
+      if (matches.length !== 1) {
+        throw new Error('active addon department claim is missing or duplicated')
+      }
+    }
+  }
+}
+
+async function compensateDepartmentForOwnership(
+  env: Env,
+  moduleKey: string,
+  departmentId: string,
+): Promise<void> {
+  try {
+    if (await countActiveClaimsForDepartment(env, departmentId) > 0) {
+      await activateCanonicalDepartment(env, moduleKey, departmentId)
+      return
+    }
+    const result = await deactivateDepartment(env.DB, moduleKey)
+    if (!result.ok && result.reason !== 'not_found') return
+    await loadCanonicalDepartment(env, moduleKey, departmentId, 0)
+  } catch {
+    // The caller still fails closed with fence_lost; retries reconcile authoritative state.
+  }
+}
+
+async function renewAfterRegistryCall(
+  env: Env,
+  operation: OperationRow,
+  expectedStates: readonly [AddonState, AddonState],
+  moduleKey: string,
+  departmentId: string,
+): Promise<void> {
+  try {
+    await renewOperationLease(env, operation, expectedStates)
+  } catch (error) {
+    if (error instanceof FenceLostError) {
+      await compensateDepartmentForOwnership(env, moduleKey, departmentId)
+    }
+    throw error
+  }
 }
 
 async function deactivateIfUnowned(
@@ -591,6 +926,13 @@ async function deactivateIfUnowned(
   claim: OwnershipRow,
   deps: AddonLifecycleDeps,
 ): Promise<boolean> {
+  const department = await loadCanonicalDepartment(
+    env,
+    claim.resource_key,
+    claim.resource_id,
+    null,
+  )
+  validateDepartmentClaim(env, installationId, claim.resource_key, department, claim)
   if (await countOtherActiveClaims(env, claim) > 0) return false
 
   await deps.beforeDepartmentDeactivated?.({
@@ -599,15 +941,13 @@ async function deactivateIfUnowned(
     moduleKey: claim.resource_key,
     departmentId: claim.resource_id,
   })
+  await renewOperationLease(env, operation, ['disabled', 'disabled'])
   if (await countOtherActiveClaims(env, claim) > 0) return false
 
-  const deactivate = deps.deactivateDepartment ?? deactivateDepartment
-  const deactivated = await deactivate(env.DB, claim.resource_key)
+  await renewOperationLease(env, operation, ['disabled', 'disabled'])
+  const deactivated = await deactivateDepartment(env.DB, claim.resource_key)
   if (!deactivated.ok && deactivated.reason !== 'not_found') {
     throw new Error(`department deactivation failed: ${deactivated.reason}`)
-  }
-  if (await countOtherActiveClaims(env, claim) > 0) {
-    await activateRegisteredDepartment(env, claim.resource_key, deps)
   }
   await deps.afterDepartmentDeactivated?.({
     installationId,
@@ -615,6 +955,18 @@ async function deactivateIfUnowned(
     moduleKey: claim.resource_key,
     departmentId: claim.resource_id,
   })
+  await renewAfterRegistryCall(
+    env,
+    operation,
+    ['disabled', 'disabled'],
+    claim.resource_key,
+    claim.resource_id,
+  )
+  if (await countOtherActiveClaims(env, claim) > 0) {
+    await activateCanonicalDepartment(env, claim.resource_key, claim.resource_id)
+    return false
+  }
+  await loadCanonicalDepartment(env, claim.resource_key, claim.resource_id, 0)
   return true
 }
 
@@ -625,6 +977,13 @@ async function releaseDepartmentClaim(
   claim: OwnershipRow,
   deps: AddonLifecycleDeps,
 ): Promise<void> {
+  const department = await loadCanonicalDepartment(
+    env,
+    claim.resource_key,
+    claim.resource_id,
+    null,
+  )
+  validateDepartmentClaim(env, installationId, claim.resource_key, department, claim)
   await deps.beforeOwnershipReleased?.({
     installationId,
     operationId: operation.id,
@@ -632,25 +991,48 @@ async function releaseDepartmentClaim(
     moduleKey: claim.resource_key,
     departmentId: claim.resource_id,
   })
+  await renewOperationLease(env, operation, ['disabled', 'disabled'])
 
+  const now = leaseWindow().now
   const result = await env.DB.prepare(`
     UPDATE addon_resource_ownership
        SET active = 0, released_at = ?1
      WHERE id = ?2 AND tenant = ?3 AND installation_id = ?4
        AND resource_type = ?5 AND resource_id = ?6
        AND resource_key = ?7 AND ownership_mode = 'co_owner' AND active = 1
+       AND EXISTS (
+         SELECT 1 FROM addon_operations AS operation
+          WHERE operation.id = ?8 AND operation.tenant = ?3
+            AND operation.installation_id = ?4
+            AND operation.action = 'disable' AND operation.target_state = 'disabled'
+            AND operation.current_step = ?9 AND operation.status = 'running'
+            AND operation.actor_id = ?10 AND operation.lease_token = ?11
+            AND operation.lease_expires_at > ?12
+       )
+       AND EXISTS (
+         SELECT 1 FROM addon_installations AS installation
+          WHERE installation.id = ?4 AND installation.tenant = ?3
+            AND installation.state = 'disabled'
+       )
   `).bind(
-    new Date().toISOString(),
+    now,
     claim.id,
     env.TENANT_SLUG,
     installationId,
     claim.resource_type,
     claim.resource_id,
     claim.resource_key,
+    operation.id,
+    operation.current_step,
+    operation.actor_id,
+    operation.lease_token,
+    now,
   ).run()
   if (!written(result)) {
+    await renewOperationLease(env, operation, ['disabled', 'disabled'])
     const raced = await loadOwnershipClaimById(env, installationId, claim.id)
     if (!raced || raced.active !== 0) throw new Error('addon department ownership release failed')
+    validateDepartmentClaim(env, installationId, claim.resource_key, department, raced)
   }
 
   await deps.afterOwnershipReleased?.({
@@ -660,6 +1042,13 @@ async function releaseDepartmentClaim(
     moduleKey: claim.resource_key,
     departmentId: claim.resource_id,
   })
+  await renewAfterRegistryCall(
+    env,
+    operation,
+    ['disabled', 'disabled'],
+    claim.resource_key,
+    claim.resource_id,
+  )
 }
 
 async function ensureDepartmentClaim(
@@ -669,84 +1058,119 @@ async function ensureDepartmentClaim(
   moduleKey: string,
   deps: AddonLifecycleDeps,
 ): Promise<OwnershipRow> {
-  const existing = await loadDepartmentClaim(env, installation.id, moduleKey)
-  if (existing?.active === 1) return existing
-
-  const activated = await activateRegisteredDepartment(env, moduleKey, deps)
+  const expectedStates = [installation.state, installation.state] as const
+  await renewOperationLease(env, operation, expectedStates)
+  const activated = await activateCanonicalDepartment(env, moduleKey)
   await deps.afterDepartmentActivated?.({
     installationId: installation.id,
     operationId: operation.id,
     moduleKey,
-    departmentId: activated.departmentId,
+    departmentId: activated.id,
   })
+  await renewAfterRegistryCall(env, operation, expectedStates, moduleKey, activated.id)
+
+  const existing = await loadDepartmentClaim(env, installation.id, moduleKey)
+  let claim: OwnershipRow
 
   if (existing) {
-    if (existing.ownership_mode !== 'co_owner' || existing.resource_id !== activated.departmentId) {
-      throw new Error('addon department ownership does not match activation')
+    validateDepartmentClaim(env, installation.id, moduleKey, activated, existing)
+    if (existing.active === 1) {
+      claim = existing
+    } else {
+      const now = leaseWindow().now
+      const result = await env.DB.prepare(`
+        UPDATE addon_resource_ownership
+           SET active = 1, released_at = NULL
+         WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
+           AND resource_type = 'department' AND resource_id = ?4
+           AND resource_key = ?5 AND ownership_mode = 'co_owner' AND active = 0
+           AND EXISTS (
+             SELECT 1 FROM addon_operations AS fenced
+              WHERE fenced.id = ?6 AND fenced.tenant = ?2 AND fenced.installation_id = ?3
+                AND fenced.action = 'activate' AND fenced.target_state = 'active'
+                AND fenced.current_step = ?7 AND fenced.status = 'running'
+                AND fenced.actor_id = ?8 AND fenced.lease_token = ?9
+                AND fenced.lease_expires_at > ?10
+           )
+           AND EXISTS (
+             SELECT 1 FROM addon_installations AS installation
+              WHERE installation.id = ?3 AND installation.tenant = ?2
+                AND installation.state IN (?11, ?12)
+           )
+      `).bind(
+        existing.id,
+        env.TENANT_SLUG,
+        installation.id,
+        existing.resource_id,
+        moduleKey,
+        operation.id,
+        operation.current_step,
+        operation.actor_id,
+        operation.lease_token,
+        now,
+        expectedStates[0],
+        expectedStates[1],
+      ).run()
+      if (!written(result)) throw new FenceLostError()
+      claim = { ...existing, active: 1, released_at: null }
     }
-    const result = await env.DB.prepare(`
-      UPDATE addon_resource_ownership
-         SET active = 1, released_at = NULL
-       WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
-         AND resource_type = 'department' AND resource_id = ?4
-         AND resource_key = ?5 AND ownership_mode = 'co_owner' AND active = 0
-    `).bind(
-      existing.id,
-      env.TENANT_SLUG,
-      installation.id,
-      existing.resource_id,
-      moduleKey,
-    ).run()
-    if (written(result)) return { ...existing, active: 1, released_at: null }
-
-    const raced = await loadDepartmentClaim(env, installation.id, moduleKey)
-    if (raced?.active === 1 && raced.resource_id === activated.departmentId) return raced
-    throw new Error('addon department ownership reactivation failed')
-  }
-
-  const claimId = crypto.randomUUID()
-  const createdAt = new Date().toISOString()
-  try {
+  } else {
+    const claimId = crypto.randomUUID()
+    const createdAt = leaseWindow().now
     const result = await env.DB.prepare(`
       INSERT INTO addon_resource_ownership (
         id, tenant, installation_id, resource_type, resource_id,
         resource_key, ownership_mode, active, created_at
-      ) VALUES (?1, ?2, ?3, 'department', ?4, ?5, 'co_owner', 1, ?6)
+      )
+      SELECT ?1, ?2, ?3, 'department', ?4, ?5, 'co_owner', 1, ?6
+       WHERE EXISTS (
+         SELECT 1 FROM addon_operations AS fenced
+          WHERE fenced.id = ?7 AND fenced.tenant = ?2 AND fenced.installation_id = ?3
+            AND fenced.action = 'activate' AND fenced.target_state = 'active'
+            AND fenced.current_step = ?8 AND fenced.status = 'running'
+            AND fenced.actor_id = ?9 AND fenced.lease_token = ?10
+            AND fenced.lease_expires_at > ?11
+       )
+       AND EXISTS (
+         SELECT 1 FROM addon_installations AS installation
+          WHERE installation.id = ?3 AND installation.tenant = ?2
+            AND installation.state IN (?12, ?13)
+       )
     `).bind(
       claimId,
       env.TENANT_SLUG,
       installation.id,
-      activated.departmentId,
+      activated.id,
       moduleKey,
       createdAt,
+      operation.id,
+      operation.current_step,
+      operation.actor_id,
+      operation.lease_token,
+      createdAt,
+      expectedStates[0],
+      expectedStates[1],
     ).run()
-    if (written(result)) {
-      return {
-        id: claimId,
-        tenant: env.TENANT_SLUG,
-        installation_id: installation.id,
-        resource_type: 'department',
-        resource_id: activated.departmentId,
-        resource_key: moduleKey,
-        ownership_mode: 'co_owner',
-        active: 1,
-        created_at: createdAt,
-        released_at: null,
-      }
+    if (!written(result)) throw new FenceLostError()
+    claim = {
+      id: claimId,
+      tenant: env.TENANT_SLUG,
+      installation_id: installation.id,
+      resource_type: 'department',
+      resource_id: activated.id,
+      resource_key: moduleKey,
+      ownership_mode: 'co_owner',
+      active: 1,
+      created_at: createdAt,
+      released_at: null,
     }
-  } catch {
-    // A concurrent retry can persist the same installation/resource claim first.
   }
 
-  const raced = await loadDepartmentClaim(env, installation.id, moduleKey)
-  if (
-    raced?.active === 1
-    && raced.ownership_mode === 'co_owner'
-    && raced.resource_id === activated.departmentId
-  ) {
-    return raced
-  }
-  throw new Error('addon department ownership write failed')
+  await renewOperationLease(env, operation, expectedStates)
+  const confirmed = await activateCanonicalDepartment(env, moduleKey, activated.id)
+  await renewAfterRegistryCall(env, operation, expectedStates, moduleKey, confirmed.id)
+  validateDepartmentClaim(env, installation.id, moduleKey, confirmed, claim)
+  return claim
 }
 
 export async function listAddonInstallations(env: Env): Promise<AddonInstallation[]> {
@@ -971,6 +1395,11 @@ export async function activateAddon(
   if (!context.ok) return context.result
   const { entry, installation: existing } = context
   if (existing.state === 'active') {
+    try {
+      await validateActiveDepartmentClaims(env, existing, entry)
+    } catch {
+      return { ok: false, reason: 'write_failed' }
+    }
     return { ok: true, state: existing.state, installation: existing, idempotent: true }
   }
   if (
@@ -979,17 +1408,28 @@ export async function activateAddon(
   ) {
     return { ok: false, reason: 'invalid_state', state: existing.state }
   }
+  try {
+    await validateActiveDepartmentClaims(env, existing, entry)
+  } catch {
+    return { ok: false, reason: 'write_failed' }
+  }
 
   try {
-    const operation = await beginOrResumeOperation(
+    const acquired = await acquireOperation(
       env,
       existing.id,
       actor.id,
       'activate',
       'active',
       'activate_departments',
+      [existing.state, existing.state],
     )
-    if (!operation) return { ok: false, reason: 'invalid_state', state: existing.state }
+    if (!acquired.ok) {
+      return acquired.reason === 'operation_busy'
+        ? { ok: false, reason: acquired.reason, state: existing.state }
+        : { ok: false, reason: acquired.reason }
+    }
+    const operation = acquired.operation
 
     const claims: OwnershipRow[] = []
     for (const department of entry.manifest.departments) {
@@ -1002,7 +1442,12 @@ export async function activateAddon(
       ))
     }
 
-    await setOperationStep(env, operation, 'activate_transition')
+    await setOperationStep(
+      env,
+      operation,
+      'activate_transition',
+      [existing.state, existing.state],
+    )
     const current = await loadInstallationById(env, existing.id)
     if (!current) return { ok: false, reason: 'write_failed' }
     if (!matchesRegisteredIdentity(current, entry)) {
@@ -1016,7 +1461,8 @@ export async function activateAddon(
     }
 
     const receiptId = crypto.randomUUID()
-    const activatedAt = new Date().toISOString()
+    const transitionTiming = leaseWindow()
+    const activatedAt = transitionTiming.now
     const sideEffectIds = JSON.stringify(claims.map((claim) => claim.id))
     const checks = JSON.stringify({
       authorityRequests: 'empty',
@@ -1047,6 +1493,7 @@ export async function activateAddon(
                   AND operation.action = 'activate' AND operation.target_state = 'active'
                   AND operation.current_step = 'activate_transition'
                   AND operation.status = 'running' AND operation.actor_id = ?12
+                  AND operation.lease_token = ?13 AND operation.lease_expires_at > ?14
              )
         `).bind(
           activatedAt,
@@ -1061,6 +1508,8 @@ export async function activateAddon(
           current.latestReceiptId,
           operation.id,
           operation.actor_id,
+          operation.lease_token,
+          activatedAt,
         ),
         transitionReceiptStatement(env, current, operation, {
           id: receiptId,
@@ -1071,7 +1520,14 @@ export async function activateAddon(
           checks,
           createdAt: activatedAt,
         }),
-        operationStepStatement(env, operation, 'completed', activatedAt, 'completed'),
+        operationStepStatement(
+          env,
+          operation,
+          'completed',
+          'completed',
+          ['active', 'active'],
+          transitionTiming,
+        ),
         selectTransitionStatement(
           env,
           current.id,
@@ -1083,26 +1539,25 @@ export async function activateAddon(
       ])
 
       if (written(results[0]) && written(results[1]) && written(results[2])) {
+        operation.current_step = 'completed'
+        operation.status = 'completed'
+        operation.lease_expires_at = transitionTiming.expiresAt
+        operation.updated_at = transitionTiming.now
+        if (!await loadExactOperation(env, operation, 'completed', 'completed')) {
+          throw new FenceLostError()
+        }
         const activated = selectedInstallation(results[3])
         return activated
           ? { ok: true, state: activated.state, installation: activated }
           : { ok: false, reason: 'write_failed' }
       }
-    } catch {
-      const raced = await loadInstallationById(env, current.id)
-      if (raced && matchesRegisteredIdentity(raced, entry) && raced.state === 'active') {
-        return { ok: true, state: raced.state, installation: raced, idempotent: true }
-      }
-      return { ok: false, reason: 'write_failed' }
+    } catch (error) {
+      return lifecycleOperationFailure(env, operation, error)
     }
-  } catch {
-    return { ok: false, reason: 'write_failed' }
+  } catch (error) {
+    return lifecycleFailure(error)
   }
 
-  const current = await loadInstallationById(env, existing.id)
-  if (current && matchesRegisteredIdentity(current, entry) && current.state === 'active') {
-    return { ok: true, state: current.state, installation: current, idempotent: true }
-  }
   return { ok: false, reason: 'write_failed' }
 }
 
@@ -1124,25 +1579,41 @@ export async function disableAddon(
     return { ok: false, reason: 'invalid_state', state: existing.state }
   }
   if (running && (running.action !== 'disable' || running.target_state !== 'disabled')) {
-    return { ok: false, reason: 'invalid_state', state: existing.state }
+    return { ok: false, reason: 'operation_busy', state: existing.state }
   }
 
   try {
-    const operation = running ?? await beginOrResumeOperation(
+    const acquired = await acquireOperation(
       env,
       existing.id,
       actor.id,
       'disable',
       'disabled',
       'disable_state',
+      [existing.state, existing.state],
     )
-    if (!operation) return { ok: false, reason: 'invalid_state', state: existing.state }
+    if (!acquired.ok) {
+      return acquired.reason === 'operation_busy'
+        ? { ok: false, reason: acquired.reason, state: existing.state }
+        : { ok: false, reason: acquired.reason }
+    }
+    const operation = acquired.operation
 
-    let disabled = existing
     if (existing.state === 'active') {
+      if (operation.current_step !== 'disable_state') throw new FenceLostError()
       const activeClaims = await loadDepartmentClaims(env, existing.id, true)
+      for (const claim of activeClaims) {
+        const department = await loadCanonicalDepartment(
+          env,
+          claim.resource_key,
+          claim.resource_id,
+          null,
+        )
+        validateDepartmentClaim(env, existing.id, claim.resource_key, department, claim)
+      }
       const receiptId = crypto.randomUUID()
-      const disabledAt = new Date().toISOString()
+      const transitionTiming = leaseWindow()
+      const disabledAt = transitionTiming.now
       const sideEffectIds = JSON.stringify(activeClaims.map((claim) => claim.id))
       const checks = JSON.stringify({
         activeClaims: activeClaims.length,
@@ -1167,6 +1638,7 @@ export async function disableAddon(
                     AND operation.action = 'disable' AND operation.target_state = 'disabled'
                     AND operation.current_step = 'disable_state'
                     AND operation.status = 'running' AND operation.actor_id = ?10
+                    AND operation.lease_token = ?11 AND operation.lease_expires_at > ?12
                )
           `).bind(
             disabledAt,
@@ -1179,6 +1651,8 @@ export async function disableAddon(
             existing.latestReceiptId,
             operation.id,
             operation.actor_id,
+            operation.lease_token,
+            disabledAt,
           ),
           transitionReceiptStatement(env, existing, operation, {
             id: receiptId,
@@ -1189,7 +1663,14 @@ export async function disableAddon(
             checks,
             createdAt: disabledAt,
           }),
-          operationStepStatement(env, operation, 'disable_teardown', disabledAt),
+          operationStepStatement(
+            env,
+            operation,
+            'disable_teardown',
+            'running',
+            ['disabled', 'disabled'],
+            transitionTiming,
+          ),
           selectTransitionStatement(
             env,
             existing.id,
@@ -1201,23 +1682,22 @@ export async function disableAddon(
         ])
 
         if (!written(results[0]) || !written(results[1]) || !written(results[2])) {
-          return { ok: false, reason: 'write_failed' }
+          throw new FenceLostError()
         }
         const selected = selectedInstallation(results[3])
         if (!selected) return { ok: false, reason: 'write_failed' }
-        disabled = selected
-      } catch {
-        const raced = await loadInstallationById(env, existing.id)
-        if (!raced || !matchesRegisteredIdentity(raced, entry) || raced.state !== 'disabled') {
-          return { ok: false, reason: 'write_failed' }
-        }
-        disabled = raced
+        operation.current_step = 'disable_teardown'
+        operation.lease_expires_at = transitionTiming.expiresAt
+        operation.updated_at = transitionTiming.now
+      } catch (error) {
+        return lifecycleOperationFailure(env, operation, error)
       }
 
       await deps.afterInstallationDisabled?.({
         installationId: existing.id,
         operationId: operation.id,
       })
+      await renewOperationLease(env, operation, ['disabled', 'disabled'])
     }
 
     if (operation.current_step.startsWith('disable_claim:')) {
@@ -1226,15 +1706,26 @@ export async function disableAddon(
         existing.id,
         operation.current_step.slice('disable_claim:'.length),
       )
-      if (pendingClaim?.active === 0) {
+      if (!pendingClaim) throw new Error('pending addon ownership claim is missing')
+      if (pendingClaim.active === 0) {
         await deactivateIfUnowned(env, existing.id, operation, pendingClaim, deps)
-        await setOperationStep(env, operation, 'disable_teardown')
+        await setOperationStep(
+          env,
+          operation,
+          'disable_teardown',
+          ['disabled', 'disabled'],
+        )
       }
     }
 
     const claims = await loadDepartmentClaims(env, existing.id, true)
     for (const claim of claims) {
-      await setOperationStep(env, operation, `disable_claim:${claim.id}`)
+      await setOperationStep(
+        env,
+        operation,
+        `disable_claim:${claim.id}`,
+        ['disabled', 'disabled'],
+      )
       const deactivatedBeforeRelease = await deactivateIfUnowned(
         env,
         existing.id,
@@ -1246,19 +1737,36 @@ export async function disableAddon(
       if (!deactivatedBeforeRelease) {
         await deactivateIfUnowned(env, existing.id, operation, claim, deps)
       }
-      await setOperationStep(env, operation, 'disable_teardown')
+      await setOperationStep(
+        env,
+        operation,
+        'disable_teardown',
+        ['disabled', 'disabled'],
+      )
     }
 
     if ((await loadDepartmentClaims(env, existing.id, true)).length > 0) {
-      return { ok: false, reason: 'write_failed' }
+      throw new Error('active addon ownership remains after disable')
     }
 
-    const completedAt = new Date().toISOString()
-    await operationStepStatement(env, operation, 'completed', completedAt, 'completed').run()
+    await deps.beforeOperationCompleted?.({
+      installationId: existing.id,
+      operationId: operation.id,
+    })
+    await completeOperation(env, operation, 'disabled')
 
-    return { ok: true, state: disabled.state, installation: disabled }
-  } catch {
-    return { ok: false, reason: 'write_failed' }
+    const completedInstallation = await loadInstallationById(env, existing.id)
+    if (
+      !completedInstallation
+      || completedInstallation.state !== 'disabled'
+      || !matchesRegisteredIdentity(completedInstallation, entry)
+    ) {
+      throw new FenceLostError()
+    }
+
+    return { ok: true, state: completedInstallation.state, installation: completedInstallation }
+  } catch (error) {
+    return lifecycleFailure(error)
   }
 }
 
@@ -1276,25 +1784,32 @@ export async function archiveAddon(
 
   const running = await loadRunningOperation(env, existing.id)
   if (running && (running.action !== 'archive' || running.target_state !== 'archived')) {
-    return { ok: false, reason: 'invalid_state', state: existing.state }
+    return { ok: false, reason: 'operation_busy', state: existing.state }
   }
   if ((await loadDepartmentClaims(env, existing.id, true)).length > 0) {
     return { ok: false, reason: 'invalid_state', state: existing.state }
   }
 
   try {
-    const operation = running ?? await beginOrResumeOperation(
+    const acquired = await acquireOperation(
       env,
       existing.id,
       actor.id,
       'archive',
       'archived',
       'archive_transition',
+      ['disabled', 'disabled'],
     )
-    if (!operation) return { ok: false, reason: 'invalid_state', state: existing.state }
+    if (!acquired.ok) {
+      return acquired.reason === 'operation_busy'
+        ? { ok: false, reason: acquired.reason, state: existing.state }
+        : { ok: false, reason: acquired.reason }
+    }
+    const operation = acquired.operation
 
     const receiptId = crypto.randomUUID()
-    const archivedAt = new Date().toISOString()
+    const transitionTiming = leaseWindow()
+    const archivedAt = transitionTiming.now
     const checks = JSON.stringify({
       activeClaims: 0,
       deletes: 0,
@@ -1319,6 +1834,7 @@ export async function archiveAddon(
                   AND operation.action = 'archive' AND operation.target_state = 'archived'
                   AND operation.current_step = 'archive_transition'
                   AND operation.status = 'running' AND operation.actor_id = ?10
+                  AND operation.lease_token = ?11 AND operation.lease_expires_at > ?12
              )
              AND NOT EXISTS (
                SELECT 1 FROM addon_resource_ownership AS claim
@@ -1337,6 +1853,8 @@ export async function archiveAddon(
           existing.latestReceiptId,
           operation.id,
           operation.actor_id,
+          operation.lease_token,
+          archivedAt,
         ),
         transitionReceiptStatement(env, existing, operation, {
           id: receiptId,
@@ -1347,7 +1865,14 @@ export async function archiveAddon(
           checks,
           createdAt: archivedAt,
         }),
-        operationStepStatement(env, operation, 'completed', archivedAt, 'completed'),
+        operationStepStatement(
+          env,
+          operation,
+          'completed',
+          'completed',
+          ['archived', 'archived'],
+          transitionTiming,
+        ),
         selectTransitionStatement(
           env,
           existing.id,
@@ -1359,20 +1884,23 @@ export async function archiveAddon(
       ])
 
       if (written(results[0]) && written(results[1]) && written(results[2])) {
+        operation.current_step = 'completed'
+        operation.status = 'completed'
+        operation.lease_expires_at = transitionTiming.expiresAt
+        operation.updated_at = transitionTiming.now
+        if (!await loadExactOperation(env, operation, 'completed', 'completed')) {
+          throw new FenceLostError()
+        }
         const archived = selectedInstallation(results[3])
         return archived
           ? { ok: true, state: archived.state, installation: archived }
           : { ok: false, reason: 'write_failed' }
       }
-    } catch {
-      const raced = await loadInstallationById(env, existing.id)
-      if (raced && matchesRegisteredIdentity(raced, entry) && raced.state === 'archived') {
-        return { ok: true, state: raced.state, installation: raced, idempotent: true }
-      }
-      return { ok: false, reason: 'write_failed' }
+    } catch (error) {
+      return lifecycleOperationFailure(env, operation, error)
     }
-  } catch {
-    return { ok: false, reason: 'write_failed' }
+  } catch (error) {
+    return lifecycleFailure(error)
   }
 
   return { ok: false, reason: 'write_failed' }

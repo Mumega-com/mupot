@@ -149,7 +149,8 @@ CREATE TABLE IF NOT EXISTS addon_operations (
   current_step TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('running','completed','failed','compensated')),
   actor_id TEXT NOT NULL,
-  lease_expires_at TEXT,
+  lease_token TEXT NOT NULL,
+  lease_expires_at TEXT NOT NULL,
   error_code TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -165,6 +166,9 @@ CREATE TABLE IF NOT EXISTS addon_operations (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_addon_one_running_operation
   ON addon_operations (tenant, installation_id) WHERE status = 'running';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_addon_operation_lease_token
+  ON addon_operations (lease_token);
 
 CREATE TABLE IF NOT EXISTS addon_resource_ownership (
   id TEXT NOT NULL PRIMARY KEY,
