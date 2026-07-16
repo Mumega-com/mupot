@@ -296,8 +296,11 @@ git commit -m "feat(marketing): normalize monitor evidence"
 **Files:**
 - Create: `migrations/0053_marketing_monitor_runs.sql`
 - Create: `src/addons/marketing/service.ts`
+- Modify: `src/addons/marketing/types.ts`
+- Modify: `src/addons/marketing/sources.ts`
 - Modify: `src/addons/routes.ts`
 - Test: `tests/marketing-monitor-service.test.ts`
+- Test: `tests/marketing-monitor-sources.test.ts`
 - Test: `tests/addon-routes.test.ts`
 
 **Interfaces:**
@@ -326,11 +329,19 @@ Expected: FAIL because monitor persistence and routes do not exist.
 
 - [ ] **Step 3: Add immutable run tables**
 
-Create `marketing_monitor_runs`, `marketing_monitor_sources`, and `marketing_monitor_observations`. Bind every row to tenant + installation + evidence window. Add a unique dedup index on `(tenant, installation_id, program_version, window_start, window_end)`, JSON validity checks, source/observation caps enforced by service, and no-update/no-delete triggers.
+Create `marketing_monitor_runs`, `marketing_monitor_sources`, and `marketing_monitor_observations`. Bind every row to tenant + installation + binding generation + evidence window. Add a unique dedup index on `(tenant, installation_id, program_version, window_start, window_end)`, JSON validity checks, source/observation caps enforced by service, and no-delete triggers.
+
+Every normalized observation must carry collector-derived `sourceKey` and `sourceSlot`; source output cannot assert or override them. Observation rows reference the matching `(run, source)` identity so durable evidence remains attributable.
+
+Runs start in a private `building` state inside the D1 batch. The only permitted run update is `building -> completed`, guarded by triggers that verify source and observation counts, exact tenant/installation/generation identity, and a still-active addon installation whose same binding generation remains live. Completed runs, source rows, and observation rows are append-only. APIs never return `building` rows.
 
 - [ ] **Step 4: Implement run persistence and redacted APIs**
 
-Use one bounded D1 batch for the run, source statuses, observations, and final digest. Insert bounded source and observation arrays through validated JSON-to-row statements instead of creating one prepared statement per observation. APIs return normalized outcomes, stable source statuses, evidence IDs, and timestamps only. They never return connector IDs, connector metadata, upstream payloads, or secrets. POST requires owner/admin and an active installation; GET is owner/admin read-only.
+Use one bounded D1 batch for the building run, source statuses, observations, finalization, and final select. Insert bounded source and observation arrays through validated JSON-to-row statements instead of creating one prepared statement per observation. A uniqueness race rolls back and returns the already-completed exact-window run as idempotent; it never returns another tenant or installation's row.
+
+`runMarketingMonitor()` loads an active installation and its exact live binding generation, mints the run ID before source construction, and asks an injected source factory for sources bound to that run ID and canonical window. Before persistence, any non-empty normalized collection must match the minted run ID. The D1 finalize fence rejects disable/archive/generation drift that occurs during collection.
+
+The evidence digest is SHA-256 over a versioned canonical object containing program version, canonical window, ordered source statuses, ordered normalized observations, and derived outcomes. APIs return normalized outcomes, stable source statuses, evidence IDs, source keys, units, authorities, digest, and timestamps only. They never return connector IDs, connector metadata, upstream payloads, actor internals, or secrets. POST requires owner/admin and an active installation; GET is owner/admin read-only. Request bodies, list limits, and returned row counts are bounded.
 
 - [ ] **Step 5: Run focused tests and typecheck**
 
