@@ -1,4 +1,6 @@
 import { FixtureModule } from '../../departments/modules/fixture'
+import { html } from 'hono/html'
+import { registerAddonConsoleRenderer } from '../console-registry'
 import type { AddonManifestV1 } from '../contract'
 import { registerAddon } from '../registry'
 
@@ -25,5 +27,13 @@ export const FixtureAddon: AddonManifestV1 = {
   healthChecks: [],
   retention: { disablePreservesData: true, purgeRequiresOwner: true },
 }
+
+registerAddonConsoleRenderer({
+  key: 'fixture',
+  path: '/departments/fixture',
+  title: 'Fixture',
+  navIcon: 'beaker',
+  render: async () => html`<p>Fixture</p>`,
+})
 
 await registerAddon(FixtureAddon)

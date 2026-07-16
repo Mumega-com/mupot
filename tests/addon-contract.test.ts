@@ -5,6 +5,7 @@ import {
   validateAddonManifest,
   type AddonManifestV1,
 } from '../src/addons/contract'
+import { MarketingCroMonitorAddon } from '../src/addons/modules/marketing-cro-monitor'
 
 const fixture: AddonManifestV1 = {
   schema: 'mupot.addon/v1',
@@ -50,6 +51,15 @@ function manifestWithRankGrant(
 describe('addon contract', () => {
   it('accepts the zero-authority fixture', () => {
     expect(validateAddonManifest(fixture)).toEqual({ ok: true, manifest: fixture })
+  })
+
+  it('registers the read-only marketing monitor manifest', () => {
+    expect(MarketingCroMonitorAddon.connectorRequirements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ slot: 'web_analytics', capability: 'read', required: true }),
+      expect.objectContaining({ slot: 'content_surface', capability: 'read', required: false }),
+    ]))
+    expect(MarketingCroMonitorAddon.authorityRequests).toEqual({ rankGrants: [], surfaceGrants: [] })
+    expect(Object.isFrozen(MarketingCroMonitorAddon)).toBe(true)
   })
 
   it('rejects unknown fields and wildcard surfaces', () => {

@@ -6,6 +6,7 @@ import {
 import { MUPOT_PUBLIC_API_VERSION } from '../version'
 import { composeDeptMetricDescriptors } from '../departments/channels/compose'
 import { getRegistered as getRegisteredDepartment } from '../departments/registry'
+import { getAddonConsoleRenderer } from './console-registry'
 
 export interface AddonCatalogEntry {
   manifest: AddonManifestV1
@@ -83,11 +84,10 @@ export function assertAddonRuntimeContract(manifest: AddonManifestV1): void {
   }
 
   for (const section of manifest.consoleSections) {
-    const owner = declaredDepartments.get(section.rendererKey)
-    if (!owner) throw new Error('addon_renderer_not_registered')
-    const registered = owner.consoleSection
+    const registered = getAddonConsoleRenderer(section.rendererKey)
     if (
-      registered.id !== section.rendererKey
+      !registered
+      || registered.key !== section.rendererKey
       || registered.path !== section.path
       || registered.title !== section.title
       || registered.navIcon !== section.navIcon

@@ -3,7 +3,7 @@ import type { AddonCatalogEntry } from '../addons/registry'
 import type { AddonInstallation, AddonState } from '../addons/service'
 import { pageHeader, pill } from './ui'
 
-import '../addons/modules/fixture'
+import '../addons/modules'
 
 type ConsoleState = AddonState | 'available'
 type LifecycleAction = 'install' | 'configure' | 'activate' | 'disable' | 'archive'

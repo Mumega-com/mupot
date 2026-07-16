@@ -4,7 +4,7 @@ import type { Context } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { requireAuth } from '../auth'
 import { resolveOrgAdmin } from '../auth/member-bearer'
-import './modules/fixture'
+import './modules'
 import { getRegisteredAddon, listRegisteredAddons } from './registry'
 import {
   activateAddon,
