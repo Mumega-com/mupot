@@ -33,7 +33,12 @@ export interface RankedTask extends Task {
 // ── status → priority band ───────────────────────────────────────────────────
 //
 // Only statuses that represent ACTIONABLE-OR-BLOCKED work participate in
-// ranking. Lower band number = worked first.
+// ranking. Array position = band (lower = worked first). This array is the
+// SINGLE SOURCE OF TRUTH: STATUS_BAND (below) and the SQL-fetch helpers
+// (actionableStatusInSql / actionableStatusOrderSql, further down) are all
+// derived from it, so "which statuses rank" and "which statuses a fetch
+// treats as actionable, and in what SQL order" can never silently drift
+// apart from each other.
 //
 //   0. in_progress — an agent already has hands on it. Finishing what's
 //      started beats picking up something new: context-switching mid-task
@@ -47,14 +52,14 @@ export interface RankedTask extends Task {
 //      above open/in_progress work would waste attention on something
 //      nobody can act on yet.
 //
-// Any status NOT in this table (done, review, approved, rejected) is a
+// Any status NOT in this array (done, review, approved, rejected) is a
 // terminal or gate-pipeline state, not "what should I work on next" — see
 // excludeFromRanking below.
-const STATUS_BAND: Readonly<Record<string, number>> = {
-  in_progress: 0,
-  open: 1,
-  blocked: 2,
-}
+export const ACTIONABLE_STATUSES = ['in_progress', 'open', 'blocked'] as const
+
+const STATUS_BAND: Readonly<Record<string, number>> = Object.fromEntries(
+  ACTIONABLE_STATUSES.map((status, i) => [status, i]),
+)
 
 // True for any task status rankTasks does not score (done + the gate states
 // review/approved/rejected). Exported so both call sites can reason about the
@@ -67,6 +72,62 @@ const STATUS_BAND: Readonly<Record<string, number>> = {
 // "excluded entirely" means excluded from SCORING, not from the response.
 export function excludeFromRanking(status: Task['status']): boolean {
   return !(status in STATUS_BAND)
+}
+
+// ── SQL fetch-boundary helpers ───────────────────────────────────────────────
+//
+// P1 adversarial finding (2026-07-16): the original wiring at both call sites
+// fetched rows with a plain `ORDER BY created_at DESC` (or, briefly, no bound
+// at all) and justified it with a comment claiming a "D1 1000-row .all() cap"
+// that does not exist anywhere in this codebase. Two real failure modes that
+// created:
+//   1. Recency ordering discards the OLDEST rows first if any cap ever does
+//      apply — exactly inverting the anti-starvation goal this feature exists
+//      to serve.
+//   2. Actionable and terminal-status (done/review/approved/rejected) rows
+//      sharing one fetch window meant a squad with a lot of `done` history
+//      could fill the window entirely with terminal rows, hiding genuinely
+//      old, open, high-priority work — BEFORE rankTasks ever runs, so its
+//      never-drop guarantee can't protect the caller from never seeing them.
+//
+// Fix: fetch actionable and terminal rows in SEPARATE, independently-bounded
+// queries (see src/tasks/index.ts and src/mcp/index.ts), so terminal volume
+// can never crowd actionable rows out of the fetch window — and order the
+// actionable fetch by this SAME band+age priority, not raw recency, so if a
+// cap is ever hit it drops the LOWEST-priority actionable rows, never the
+// oldest/most-urgent ones.
+//
+// Real pot scale is small (this codebase repeatedly notes "O(tens) of
+// agents" per pot) — the caps below are a backstop against a pathological
+// squad, not an active pagination mechanism; they should essentially never
+// bind in normal operation. A pot that legitimately needs more is a signal
+// for real pagination (follow-up), not silent truncation.
+export const ACTIONABLE_FETCH_CAP = 500
+export const PASSTHROUGH_FETCH_CAP = 100
+
+// `column IN ('in_progress', 'open', 'blocked')` — no caller input is ever
+// interpolated here; the literals come only from the fixed ACTIONABLE_STATUSES
+// array above, so this is not a SQL-injection surface.
+export function actionableStatusInSql(column = 'status'): string {
+  return `${column} IN (${ACTIONABLE_STATUSES.map((s) => `'${s}'`).join(', ')})`
+}
+
+// The complement of actionableStatusInSql — every terminal/gate status
+// (done, review, approved, rejected), without hand-listing them a second
+// time (avoids the two lists ever drifting apart).
+export function terminalStatusInSql(column = 'status'): string {
+  return `${column} NOT IN (${ACTIONABLE_STATUSES.map((s) => `'${s}'`).join(', ')})`
+}
+
+// SQL CASE expression matching STATUS_BAND exactly (lower = worked first).
+// Combine with `, created_at ASC` in an ORDER BY so a LIMIT on the actionable
+// fetch keeps the SAME highest-priority rows rankTasks itself would choose —
+// band first, then oldest first within a band — instead of an unqualified
+// `ORDER BY created_at` that could let a large pile of old `blocked` rows
+// crowd a fresher `open` row out of the fetch window.
+export function actionableStatusOrderSql(column = 'status'): string {
+  const whens = ACTIONABLE_STATUSES.map((s, i) => `WHEN '${s}' THEN ${i}`).join(' ')
+  return `CASE ${column} ${whens} END`
 }
 
 /**

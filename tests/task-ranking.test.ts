@@ -5,11 +5,24 @@
 // Part B: a light integration check that the dashboard GET /api/tasks route
 // (src/tasks/index.ts) actually applies rankTasks end-to-end, including
 // wiring in agent runtime states from the existing radar query.
+// Part C: P1 adversarial-gate regression (2026-07-16) — a squad with a large
+// volume of terminal-status (done/review/approved/rejected) tasks must never
+// starve genuinely old, actionable work out of task_list's fetch window. The
+// original wiring shared one recency-ordered, effectively-unbounded query
+// across both status classes; terminal volume could fill the whole window
+// before rankTasks ever ran. Fixed by fetching actionable and terminal rows
+// in separate, independently-bounded queries (src/tasks/ranking.ts's SQL
+// fetch-boundary helpers) — these tests exercise BOTH wired call sites
+// (MCP task_list, dashboard GET /api/tasks) against mocks that actually
+// honor ORDER BY direction and LIMIT, so a regression back to a single
+// shared-budget query would fail these tests even though it might still
+// pass Part A/B (which don't stress the fetch boundary).
 
 import { describe, expect, it, vi } from 'vitest'
 import { rankTasks, excludeFromRanking } from '../src/tasks/ranking'
 import { tasksApp } from '../src/tasks'
-import type { Env, Task } from '../src/types'
+import { invokeTool } from '../src/mcp'
+import type { Env, Task, AuthContext } from '../src/types'
 import type { AgentRuntimeState } from '../src/dashboard/observatory'
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
@@ -231,7 +244,18 @@ describe('GET /api/tasks — ranked output, wired end-to-end', () => {
                 },
                 async all<T>() {
                   if (sql.includes('FROM tasks')) {
-                    return { results: [...rows] } as { results: T[] }
+                    // #22 v1 ATC ranking (P1 fix, 2026-07-16): GET / issues
+                    // TWO bounded queries when no explicit ?status filter is
+                    // given — actionable vs terminal — never one unbounded
+                    // recency-only fetch. Mirror that split here.
+                    let filtered = [...rows]
+                    const actionable = new Set(['in_progress', 'open', 'blocked'])
+                    if (sql.includes('status IN (')) {
+                      filtered = filtered.filter((t) => actionable.has(t.status))
+                    } else if (sql.includes('status NOT IN (')) {
+                      filtered = filtered.filter((t) => !actionable.has(t.status))
+                    }
+                    return { results: filtered } as { results: T[] }
                   }
                   // Agent runtime-state radar query (dashboard/observatory.ts
                   // loadAgentRuntimeStates): agent-dead is attached but its
@@ -277,5 +301,231 @@ describe('GET /api/tasks — ranked output, wired end-to-end', () => {
     expect(byId['task-in-progress-old'].stale_assignee).toBe(true) // agent-dead → offline
     expect(byId['task-open-old'].stale_assignee).toBe(false) // agent-live → live
     expect(byId['task-open-new'].stale_assignee).toBe(false) // unassigned
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Part C — P1 regression: terminal-status volume must not starve actionable
+// rows out of the fetch window (both wired call sites)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const ACTIONABLE_SET = new Set(['in_progress', 'open', 'blocked'])
+const BAND: Record<string, number> = { in_progress: 0, open: 1, blocked: 2 }
+
+function cmp(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0
+}
+
+// Mimics enough of real D1's ORDER BY + LIMIT behavior for the two query
+// shapes ranking.ts's SQL helpers produce, so a regression back to a single
+// unbounded/recency-only query — or dropping the LIMIT — would make these
+// tests fail even though the fixture only has a handful of distinct rows.
+function applyOrderAndLimit(rows: Task[], sql: string): Task[] {
+  let result = [...rows]
+  if (sql.includes('CASE status')) {
+    result.sort((a, b) => BAND[a.status] - BAND[b.status] || cmp(a.created_at, b.created_at))
+  } else if (/ORDER BY created_at ASC/.test(sql)) {
+    result.sort((a, b) => cmp(a.created_at, b.created_at))
+  } else if (/ORDER BY created_at DESC/.test(sql)) {
+    result.sort((a, b) => -cmp(a.created_at, b.created_at))
+  }
+  const limitMatch = sql.match(/LIMIT (\d+)/)
+  if (limitMatch) result = result.slice(0, Number(limitMatch[1]))
+  return result
+}
+
+function filterByStatusClause(rows: Task[], sql: string, args: readonly unknown[]): Task[] {
+  if (sql.includes('status IN (')) return rows.filter((t) => ACTIONABLE_SET.has(t.status))
+  if (sql.includes('status NOT IN (')) return rows.filter((t) => !ACTIONABLE_SET.has(t.status))
+  if (sql.includes('status = ?')) {
+    const wanted = args[args.length - 1]
+    return rows.filter((t) => t.status === wanted)
+  }
+  return rows
+}
+
+describe('P1 regression (2026-07-16) — terminal volume never starves actionable rows', () => {
+  const SQUAD_ID = 'squad-starve'
+  const AGENT_ID = 'agent-starve'
+
+  // 200 terminal ('done') tasks, all created RECENTLY — under the original
+  // (buggy) single shared-budget, recency-DESC-ordered fetch, these alone
+  // would have filled any modest LIMIT window on their own.
+  function buildStarvationRows(): Task[] {
+    const rows: Task[] = []
+    for (let i = 0; i < 200; i++) {
+      rows.push(
+        task({
+          id: `done-${i}`,
+          squad_id: SQUAD_ID,
+          status: 'done',
+          created_at: `2026-07-15T${String(i % 24).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}:00.000Z`,
+        }),
+      )
+    }
+    // 2 actionable 'open' tasks, OLD — exactly the genuinely high-priority
+    // work the anti-starvation rule exists to protect.
+    rows.push(task({ id: 'old-open-1', squad_id: SQUAD_ID, status: 'open', created_at: '2026-01-01T00:00:00.000Z' }))
+    rows.push(task({ id: 'old-open-2', squad_id: SQUAD_ID, status: 'open', created_at: '2026-01-02T00:00:00.000Z' }))
+    return rows
+  }
+
+  describe('MCP task_list', () => {
+    function auth(): AuthContext {
+      return {
+        userId: 'member-starve',
+        memberId: 'member-starve',
+        email: null,
+        role: 'member',
+        tenant: 'test-tenant',
+        channel: 'workspace',
+        boundAgentId: AGENT_ID,
+        capabilities: [
+          { member_id: 'member-starve', scope_type: 'squad', scope_id: SQUAD_ID, capability: 'member' },
+        ],
+      }
+    }
+
+    function makeEnv(rows: Task[]) {
+      const env = {
+        TENANT_SLUG: 'test-tenant',
+        DB: {
+          prepare(sql: string) {
+            return {
+              bind(...args: unknown[]) {
+                return {
+                  async first<T>() {
+                    if (sql.includes('FROM agents WHERE id = ?1')) {
+                      return {
+                        id: AGENT_ID,
+                        squad_id: SQUAD_ID,
+                        slug: 'agent-starve',
+                        name: 'Agent Starve',
+                        role: null,
+                        model: null,
+                        status: 'active',
+                        created_at: 'now',
+                      } as T
+                    }
+                    if (sql.includes('SELECT department_id FROM squads')) return { department_id: 'dept-starve' } as T
+                    if (sql.includes('FROM squads WHERE id = ?1')) {
+                      return {
+                        id: SQUAD_ID,
+                        department_id: 'dept-starve',
+                        slug: 'squad-starve',
+                        name: 'Squad Starve',
+                        charter: null,
+                        created_at: 'now',
+                      } as T
+                    }
+                    return null as T
+                  },
+                  async all<T>() {
+                    if (sql.includes('FROM capabilities') && sql.includes('UNION ALL')) return { results: [] } as { results: T[] }
+                    if (sql.includes('SELECT DISTINCT t.member_id')) return { results: [] } as { results: T[] }
+                    if (sql.includes('FROM tasks')) {
+                      const squadId = args[0] as string
+                      let result = rows.filter((r) => r.squad_id === squadId)
+                      result = filterByStatusClause(result, sql, args)
+                      result = applyOrderAndLimit(result, sql)
+                      return { results: result } as { results: T[] }
+                    }
+                    return { results: [] } as { results: T[] }
+                  },
+                }
+              },
+            }
+          },
+        },
+      } as unknown as Env
+      return env
+    }
+
+    it('still surfaces both old actionable tasks despite 200 recent terminal tasks and a limit of 5', async () => {
+      const env = makeEnv(buildStarvationRows())
+
+      const res = await invokeTool(auth(), env, 'task_list', { limit: 5 }, 'https://pot.example')
+
+      expect(res.ok).toBe(true)
+      const result = res.result as { tasks: Task[] }
+      const ids = result.tasks.map((t) => t.id)
+
+      // The core P1 assertion: neither old actionable task is starved out,
+      // even though there are 200 terminal rows and the caller asked for
+      // only 5 results total.
+      expect(ids).toContain('old-open-1')
+      expect(ids).toContain('old-open-2')
+      expect(result.tasks.length).toBeLessThanOrEqual(5)
+      // Actionable rows get first claim on the limit budget — both surface,
+      // never displaced by terminal volume.
+      expect(result.tasks.filter((t) => t.status === 'open')).toHaveLength(2)
+    })
+  })
+
+  describe('dashboard GET /api/tasks', () => {
+    function makeEnv(rows: Task[]) {
+      const env = {
+        TENANT_SLUG: 'test',
+        BRAND: 'Test',
+        SESSIONS: {
+          get: vi.fn(async (key: string) => {
+            if (key !== 'sess:sess1') return null
+            return JSON.stringify({
+              userId: 'owner-1',
+              email: 'owner@test.example',
+              role: 'owner',
+              createdAt: '2026-07-09T00:00:00.000Z',
+            })
+          }),
+          delete: vi.fn(async () => undefined),
+        },
+        DB: {
+          prepare(sql: string) {
+            return {
+              bind(..._args: unknown[]) {
+                return {
+                  async first<T>() {
+                    return null as T
+                  },
+                  async all<T>() {
+                    if (sql.includes('FROM tasks')) {
+                      let result = filterByStatusClause(rows, sql, _args)
+                      result = applyOrderAndLimit(result, sql)
+                      return { results: result } as { results: T[] }
+                    }
+                    return { results: [] } as { results: T[] }
+                  },
+                }
+              },
+            }
+          },
+        },
+      } as unknown as Env
+      return env
+    }
+
+    it('still surfaces both old actionable tasks despite 200 recent terminal tasks (owner, unfiltered list)', async () => {
+      const rows = buildStarvationRows().map((t) => ({ ...t, squad_id: 'squad-starve-dashboard' }))
+      const env = makeEnv(rows)
+
+      const res = await tasksApp.fetch(
+        new Request('https://pot.test/', { headers: { Cookie: 'mupot_session=sess1' } }),
+        env,
+      )
+      const body = (await res.json()) as { tasks: Task[] }
+
+      expect(res.status).toBe(200)
+      const ids = body.tasks.map((t) => t.id)
+      expect(ids).toContain('old-open-1')
+      expect(ids).toContain('old-open-2')
+      // Both actionable tasks rank ahead of every terminal (done) task in the
+      // response — never crowded to the back or dropped by the 200-row
+      // terminal volume.
+      const openIndex1 = ids.indexOf('old-open-1')
+      const openIndex2 = ids.indexOf('old-open-2')
+      const firstDoneIndex = ids.findIndex((id) => id.startsWith('done-'))
+      expect(openIndex1).toBeLessThan(firstDoneIndex)
+      expect(openIndex2).toBeLessThan(firstDoneIndex)
+    })
   })
 })

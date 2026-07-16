@@ -33,7 +33,15 @@ import { startTaskPipeline } from '../workflows/pipeline'
 // #22 v1 ATC ranking: pure scorer (no I/O) + the existing radar's agent
 // runtime-state loader (already a single cheap D1 query — dashboard/radar.ts
 // uses the same loader for the fleet view, so this is not a new query shape).
-import { rankTasks } from './ranking'
+import {
+  rankTasks,
+  excludeFromRanking,
+  actionableStatusInSql,
+  terminalStatusInSql,
+  actionableStatusOrderSql,
+  ACTIONABLE_FETCH_CAP,
+  PASSTHROUGH_FETCH_CAP,
+} from './ranking'
 import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/observatory'
 
 // ── validation helpers ───────────────────────────────────────────────────────
@@ -203,28 +211,72 @@ tasksApp.get('/', async (c) => {
       binds.push(...readable)
     }
   }
+  // #22 v1 ATC ranking (src/tasks/ranking.ts). Fetch is SPLIT and BOUNDED at
+  // the SQL layer, not just reordered in JS after an unbounded read — see
+  // ranking.ts's "SQL fetch-boundary helpers" section for the full P1
+  // writeup (2026-07-16 adversarial finding) of why an unbounded or
+  // recency-ordered fetch defeats the anti-starvation point of ranking
+  // before rankTasks ever runs.
+  const base = clauses.join(' AND ')
+  const taskRows: Task[] = []
+
   if (status !== undefined) {
-    clauses.push('status = ?')
-    binds.push(status)
+    // Explicit ?status= filter: a single bounded query for that one status.
+    // Direction depends on which side of the actionable/terminal line it's
+    // on — actionable statuses go oldest-first (anti-starvation matters even
+    // within one status); terminal statuses go newest-first (a "recently
+    // completed/gated" view is what a caller filtering to done/review/etc.
+    // actually wants).
+    const isActionable = !excludeFromRanking(status)
+    const statusClauses = [...clauses, 'status = ?']
+    const statusBinds = [...binds, status]
+    const cap = isActionable ? ACTIONABLE_FETCH_CAP : PASSTHROUGH_FETCH_CAP
+    const rows = await c.env.DB.prepare(
+      `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+         FROM tasks
+        WHERE ${statusClauses.join(' AND ')}
+        ORDER BY created_at ${isActionable ? 'ASC' : 'DESC'}
+        LIMIT ${cap}`,
+    )
+      .bind(...statusBinds)
+      .all<Task>()
+    taskRows.push(...(rows.results ?? []))
+  } else {
+    // No status filter: fetch actionable and terminal rows in SEPARATE,
+    // independently-bounded queries so a squad with lots of `done` history
+    // can never crowd genuinely old/high-priority actionable work out of the
+    // fetch window (the P1 finding's core failure mode). The actionable
+    // query orders by the SAME band+age priority rankTasks itself uses, so a
+    // LIMIT here (if it ever binds) drops the lowest-priority actionable
+    // rows, never the oldest/most-urgent ones.
+    const actionableWhere = base
+      ? `WHERE ${base} AND ${actionableStatusInSql()}`
+      : `WHERE ${actionableStatusInSql()}`
+    const terminalWhere = base
+      ? `WHERE ${base} AND ${terminalStatusInSql()}`
+      : `WHERE ${terminalStatusInSql()}`
+
+    const [actionableRows, terminalRows] = await Promise.all([
+      c.env.DB.prepare(
+        `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+           FROM tasks ${actionableWhere}
+           ORDER BY ${actionableStatusOrderSql()}, created_at ASC
+           LIMIT ${ACTIONABLE_FETCH_CAP}`,
+      )
+        .bind(...binds)
+        .all<Task>(),
+      c.env.DB.prepare(
+        `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+           FROM tasks ${terminalWhere}
+           ORDER BY created_at DESC
+           LIMIT ${PASSTHROUGH_FETCH_CAP}`,
+      )
+        .bind(...binds)
+        .all<Task>(),
+    ])
+    taskRows.push(...(actionableRows.results ?? []), ...(terminalRows.results ?? []))
   }
-  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
 
-  const rows = await c.env.DB.prepare(
-    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
-       FROM tasks ${where}
-       ORDER BY created_at DESC`,
-  )
-    .bind(...binds)
-    .all<Task>()
-  const taskRows = rows.results ?? []
-
-  // #22 v1 ATC ranking: recency alone starved older work behind a stream of
-  // freshly filed tasks and never distinguished "an agent has hands on this"
-  // from "an agent is assigned but has gone dark." rankTasks (pure, see
-  // ./ranking.ts for the full heuristic + tie-break doc) reorders in JS; the
-  // SQL ORDER BY above is kept only as a stable pre-sort for the passthrough
-  // (done/review/approved/rejected) tail rankTasks does not score.
-  //
   // agentStates comes from the SAME radar classifier dashboard/radar.ts uses
   // for the fleet view (loadAgentRuntimeStates — one JOIN query, agents x
   // agent_keys x members x fleet_agents), so this is not a new query shape.
