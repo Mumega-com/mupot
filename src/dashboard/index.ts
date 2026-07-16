@@ -72,6 +72,9 @@ import { loadVerifications, verificationsBody } from './verifications'
 import { loadAudit, auditBody } from './audit'
 import { loadBilling, billingBody } from './billing'
 import { servicesBody } from './services'
+import { addonsBody } from './addons'
+import { listRegisteredAddons } from '../addons/registry'
+import { listAddonInstallations } from '../addons/service'
 import {
   pageHeader,
   notConnected,
@@ -290,6 +293,23 @@ dashboardApp.get('/loops', async (c) => {
 // outer middleware. Draft prices live in src/services/catalog.ts.
 dashboardApp.get('/services', async (c) => {
   return c.html(shell(c.env.BRAND, 'Services', servicesBody()))
+})
+
+// ── addons — owner/admin lifecycle console ──────────────────────────────────
+// The catalog is registered at process startup; installation state stays tenant
+// scoped in D1. Lifecycle writes remain owned by /api/addons and are re-gated
+// there, so this route only renders the existing API contract.
+dashboardApp.get('/addons', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(shell(c.env.BRAND, 'Addons', errorBody('Addons requires owner or admin.')), 403)
+  }
+  try {
+    const installations = await listAddonInstallations(c.env)
+    return c.html(shell(c.env.BRAND, 'Addons', addonsBody(listRegisteredAddons(), installations), { showAddons: true }))
+  } catch {
+    return c.html(shell(c.env.BRAND, 'Addons', errorBody('Addon catalog is unavailable.')), 500)
+  }
 })
 
 // ── economy (squad Anthropic spend — #179) ───────────────────────────────────
@@ -1895,6 +1915,8 @@ interface HeaderChips {
    *  that case); `configured: true` with `todayUsdMicro: 0` is an honest $0.00 —
    *  spend WAS tracked today, it was just zero. */
   costToday?: { configured: boolean; todayUsdMicro: number } | null
+  /** Render the owner/admin Addons entry immediately; other shell views reveal it after /auth/me. */
+  showAddons?: boolean
 }
 
 /** Regime label shown in the compact header chip — just Title-Cases the raw
@@ -2845,6 +2867,11 @@ function shell(
             <span class="nav-label">Health</span>
           </a>
 
+          <a class="nav-link" href="/addons" id="nav-addons"${header.showAddons ? raw('') : raw(' hidden')}>
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M7.2 3.5v3.1a2.1 2.1 0 1 0 2.1 2.1h3.2v-2a1.9 1.9 0 1 1 3.8 0v2H17v6.1H9.3a2.1 2.1 0 1 0-2.1 2.1v-2.1H3.5V9h2.1a2.1 2.1 0 1 0 1.6-3.4V3.5z"/></svg>
+            <span class="nav-label">Addons</span>
+          </a>
+
           <!-- Control Tower (coordination departures board) -->
           <a class="nav-link" href="/coordination">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 2v6M6 5l8 0M5 17l5-9 5 9M7.5 13h5"/></svg>
@@ -3055,6 +3082,9 @@ function shell(
             // /auth/me returns the authenticated org role. Older response shapes
             // may expose capability, but must never leave an owner as "member".
             if (role && (a.role || a.capability)) role.textContent = a.role || a.capability;
+            var operatorRole = a.role || a.capability;
+            var addonsNav = document.getElementById('nav-addons');
+            if (addonsNav && (operatorRole === 'owner' || operatorRole === 'admin')) addonsNav.removeAttribute('hidden');
             if (av) {
               var initials = (a.name || who || '?').replace(/\s+/g, ' ').split(' ').map(function(w){ return w[0]; }).join('').substring(0, 2).toUpperCase();
               av.textContent = initials;
