@@ -62,6 +62,20 @@ describe('addon lifecycle routes', () => {
     },
   )
 
+  it('rejects a member catalog read with the owner/admin envelope', async () => {
+    const res = await addonsApp.fetch(request('/', 'GET'), envForRole(harness, 'member'))
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toEqual({ error: 'forbidden', detail: 'owner/admin only' })
+  })
+
+  it('rejects a member receipt read before resolving the addon or reading receipts', async () => {
+    const res = await addonsApp.fetch(request('/missing-addon/receipts', 'GET'), envForRole(harness, 'member'))
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toEqual({ error: 'forbidden', detail: 'owner/admin only' })
+  })
+
   it('returns the UI catalog joined with this tenant installation state without manifest internals', async () => {
     const ownerEnv = envForRole(harness, 'owner')
     await addonsApp.fetch(request('/fixture-addon/install', 'POST'), ownerEnv)
@@ -214,6 +228,44 @@ describe('addon lifecycle routes', () => {
     const body = await res.json() as { addons: Array<{ key: string; state: string | null }> }
 
     expect(body.addons.find((addon) => addon.key === 'fixture-addon')?.state).toBe('installed')
+  })
+
+  it('uses the most recently archived lifecycle for receipts when no live installation exists', async () => {
+    const ownerEnv = envForRole(harness, 'owner')
+    for (const action of ['install', 'configure', 'activate', 'disable', 'archive', 'install', 'configure', 'activate', 'disable', 'archive'] as const) {
+      await addonsApp.fetch(request(`/fixture-addon/${action}`, 'POST'), ownerEnv)
+    }
+
+    const archivedInstallations = harness.sqlite.prepare(`
+      SELECT id FROM addon_installations
+       WHERE tenant = 'tenant-a' AND addon_key = 'fixture-addon' AND state = 'archived'
+       ORDER BY installed_at ASC
+    `).all() as Array<{ id: string }>
+    expect(archivedInstallations).toHaveLength(2)
+
+    const [older, newer] = archivedInstallations
+    harness.sqlite.prepare(`
+      UPDATE addon_installations
+         SET archived_at = CASE id
+           WHEN ? THEN '2026-01-01T00:00:00.000Z'
+           WHEN ? THEN '2026-01-02T00:00:00.000Z'
+         END,
+             updated_at = CASE id
+           WHEN ? THEN '2026-01-01T00:00:00.000Z'
+           WHEN ? THEN '2026-01-02T00:00:00.000Z'
+         END
+       WHERE id IN (?, ?)
+    `).run(older.id, newer.id, older.id, newer.id, older.id, newer.id)
+    const newestArchiveReceipt = harness.sqlite.prepare(`
+      SELECT sequence FROM addon_receipts
+       WHERE installation_id = ? AND action = 'archive'
+    `).get(newer.id) as { sequence: number }
+
+    const res = await addonsApp.fetch(request('/fixture-addon/receipts', 'GET'), ownerEnv)
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as { receipts: Array<{ action: string; sequence: number }> }
+    expect(body.receipts.find((receipt) => receipt.action === 'archive')?.sequence).toBe(newestArchiveReceipt.sequence)
   })
 
   it('returns only redacted tenant-scoped receipt fields', async () => {

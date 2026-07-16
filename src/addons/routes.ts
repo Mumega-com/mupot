@@ -26,11 +26,22 @@ function isAdminPlus(auth: AuthContext): boolean {
   return auth.role === 'owner' || auth.role === 'admin'
 }
 
+function archivedLifecycleTimestamp(installation: AddonInstallation): string {
+  return installation.archivedAt ?? installation.updatedAt
+}
+
 function latestInstallationsByKey(installations: AddonInstallation[]): Map<string, AddonInstallation> {
   const byKey = new Map<string, AddonInstallation>()
   for (const installation of installations) {
     const current = byKey.get(installation.addonKey)
-    if (!current || (current.state === 'archived' && installation.state !== 'archived')) {
+    if (!current || (
+      current.state === 'archived' && (
+        installation.state !== 'archived' || (
+          installation.state === 'archived' &&
+          archivedLifecycleTimestamp(installation) > archivedLifecycleTimestamp(current)
+        )
+      )
+    )) {
       byKey.set(installation.addonKey, installation)
     }
   }
@@ -138,6 +149,8 @@ export const addonsApp = new Hono<AppEnv>()
 addonsApp.use('*', requireAuth)
 
 addonsApp.get('/', async (c) => {
+  if (!isAdminPlus(c.get('auth'))) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+
   try {
     const installations = latestInstallationsByKey(await listAddonInstallations(c.env))
     return c.json({ addons: listRegisteredAddons().map((entry) => catalogAddon(entry, installations.get(entry.manifest.key))) })
@@ -153,6 +166,8 @@ addonsApp.post('/:key/disable', (c) => mutate(c, 'disable'))
 addonsApp.post('/:key/archive', (c) => mutate(c, 'archive'))
 
 addonsApp.get('/:key/receipts', async (c) => {
+  if (!isAdminPlus(c.get('auth'))) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+
   if (!getRegisteredAddon(c.req.param('key'))) return c.json({ error: 'addon_not_registered' }, 404)
   try {
     const installation = latestInstallationsByKey(await listAddonInstallations(c.env)).get(c.req.param('key'))
