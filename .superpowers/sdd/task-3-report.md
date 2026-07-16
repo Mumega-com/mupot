@@ -84,13 +84,18 @@ fractional-length repros, the authoritative RED run recorded 11 failed, 53 passe
 - non-array and non-integer-length inputs escaped stable configuration handling; and
 - source/binding index getter failures escaped collection instead of remaining isolated.
 
+The final two findings were addressed with one additional RED run: 3 failed, 64 passed. A
+stateful `Symbol.toPrimitive` adapter was coerced twice and widened the normalized authority;
+an observation index getter could change connector type after the final check; and an observation
+property getter could revoke the connector after that check while evidence was still accepted.
+
 ## GREEN Evidence
 
 ```sh
 npx vitest run tests/marketing-monitor-sources.test.ts tests/marketing-monitor-outcomes.test.ts
 ```
 
-Result after parent self-review fixes: 2 passed files, 73 passed tests.
+Result after the final fixes: 2 passed files, 76 passed tests.
 
 ```sh
 npm run typecheck
@@ -109,6 +114,10 @@ The final review implementation checkpoint completed with 62 passing focused tes
 The parent self-review checkpoint completed with 73 passing focused tests, successful
 `tsc --noEmit`, and a source audit finding no caller/source-owned array method, iterator, spread,
 or function `.call` invocation in the collector.
+
+The final checkpoint completed with 76 passing focused Task 3 tests, 21 passing addon binding
+tests, successful `tsc --noEmit`, and an acceptance-order audit confirming no source-controlled
+callback or accessor runs after the final vault safe-metadata resolution.
 
 ## Changed Files
 
@@ -131,6 +140,8 @@ or function `.call` invocation in the collector.
 `2a0b59495a863438f109c97d863a9777bce44745` (`fix(marketing): secure source collection boundary`)
 
 `bfd865b9ed5e5e342acf284afba8980b0ce1d7a0` (`fix(marketing): bound collector inputs`)
+
+`42528e440b61d8bbe4035650fe0195ce97009dd0` (`fix(marketing): finalize trusted binding acceptance`)
 
 ## Re-review Changed Files
 
@@ -155,6 +166,12 @@ or function `.call` invocation in the collector.
 - `tests/marketing-monitor-sources.test.ts`
 - `.superpowers/sdd/task-3-report.md`
 
+## Final Binding Review Changed Files
+
+- `src/addons/marketing/sources.ts`
+- `tests/marketing-monitor-sources.test.ts`
+- `.superpowers/sdd/task-3-report.md`
+
 ## Residual Risks
 
 - Task 4 must bind these in-memory snapshots to immutable, tenant-scoped runs and API redaction.
@@ -174,3 +191,5 @@ or function `.call` invocation in the collector.
   close source-execution drift; Task 6 should account for that bounded read cost.
 - The collector intentionally caps one run configuration at 16 bindings and 16 sources. A future
   increase must preserve indexed intrinsic-only capture and receive a separate boundedness review.
+- Vault evidence acceptance intentionally incurs a final safe-metadata lookup after all source
+  accessors and local validation. Future source processing must not add untrusted work after it.
