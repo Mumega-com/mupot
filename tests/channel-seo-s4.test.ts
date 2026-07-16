@@ -767,16 +767,19 @@ describe('11. S3 regression — proposesOnly=true still holds for original work-
     expect(keys).toContain('content-refresh-proposal')
   })
 
-  it('S4 adds exactly 2 executable work-types (proposesOnly=false)', () => {
+  it('S4/S5b adds exactly 3 executable work-types (proposesOnly=false)', () => {
     const executableTypes = SeoChannel.workTypes.filter((w) => !w.proposesOnly)
-    expect(executableTypes).toHaveLength(2)
+    expect(executableTypes).toHaveLength(3)
     const keys = executableTypes.map((w) => w.key)
     expect(keys).toContain('seo-meta-fix')
     expect(keys).toContain('seo-internal-links')
+    // CRO apply-bridge (S5b, collectors/cro-apply.ts) — the only new executable
+    // work-type this slice adds. See its doc comment above for why it lives here.
+    expect(keys).toContain('cro-apply')
   })
 
-  it('total SeoChannel work-types count is now 6 (4 propose-only + 2 executable)', () => {
-    expect(SeoChannel.workTypes).toHaveLength(6)
+  it('total SeoChannel work-types count is now 7 (4 propose-only + 3 executable)', () => {
+    expect(SeoChannel.workTypes).toHaveLength(7)
   })
 
   it('seo-meta-fix and seo-internal-links both have requiredCapability=lead', () => {
@@ -790,11 +793,12 @@ describe('11. S3 regression — proposesOnly=true still holds for original work-
 // ── 12. S3 regression: channel/dept/growth/pulse conformance green ────────────
 
 describe('12. S3 regression — channel composition + work-type count still correct', () => {
-  it('getChannelWorkTypes(GrowthModule.channels) now returns 8 work-types (1 outbound + 6 seo + 1 wordpress)', () => {
+  it('getChannelWorkTypes(GrowthModule.channels) now returns 9 work-types (1 outbound + 7 seo + 1 wordpress)', () => {
     const wts = getChannelWorkTypes(GrowthModule.channels ?? [])
-    // outbound-channel had 1 work-type (outreach-send), seo-channel now has 6.
-    // #370: wordpress-channel adds 1 (content-publish) → 8 total.
-    expect(wts).toHaveLength(8)
+    // outbound-channel had 1 work-type (outreach-send), seo-channel now has 7
+    // (S5b's cro-apply, collectors/cro-apply.ts, is the +1 over the prior 6).
+    // #370: wordpress-channel adds 1 (content-publish) → 9 total.
+    expect(wts).toHaveLength(9)
   })
 
   it('no duplicate work-type keys across outbound + seo channels', () => {

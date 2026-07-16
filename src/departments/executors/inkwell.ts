@@ -6,8 +6,31 @@
 // the Worker boundary which resolves the connector credential (Hadi-go) and passes
 // the narrow config in. This keeps the kernel pure + unit-testable, and means the
 // adapter is inert unless the Worker explicitly supplies a credential.
+//
+// CRO APPLY-BRIDGE (S5b) ADDITION — fetch-then-merge, never full-replace:
+//
+// The plain create/seo-meta-fix path above is a full-body REPLACE by design (see the
+// PublishBody ⚠ note) — correct for "create new" and for a human-composed meta-fix that
+// already has the current body in hand (collectors/seo-meta-fix.ts), wrong for an agent-
+// proposed, narrowly-scoped CRO change (a meta_title/description/CTA/link tweak) where
+// the caller has NOT read the current article and must never silently clobber it.
+//
+// fetchInkwellContent + mergeContentUpdate + inkwellContentApplyWrite add a SECOND write
+// path: read the current post (GET /api/internal/content/:slug, mumega.com PR — same
+// tenant-bound-secret trust model as POST /publish), patch ONLY the targeted field, and
+// write the merged whole back. FAIL-CLOSED at every step: a fetch error, a missing
+// article (404), or an ambiguous/absent find-target all throw BEFORE any write — there is
+// no path from a failed read to a partial/blank write.
+//
+// inkwellContentDispatch is the new kernel.ts call site: it inspects the stored payload's
+// `mode` field and routes to the merge path or the existing full-replace path. This is a
+// payload-SHAPE branch (like toPublishBody vs toMetaFixPublishBody), not an action-string
+// branch — kernel.ts's domain-agnostic dispatch discipline (see collectors/seo-meta-fix.ts
+// "WHY NO KERNEL.TS CHANGE") is preserved; kernel.ts still dispatches purely on
+// payload.executor === 'inkwell-content', now calling this one extra layer of indirection.
 
 import { assertPublicHttpsUrl } from '../../lib/ssrf'
+import { classifyChangeType, isKnownChangeType, type CroChangeType } from '../change-types'
 
 export interface InkwellExecutorConfig {
   /** Inkwell API origin, e.g. https://inkwell-api.mumega.com (https, public host). */
@@ -146,44 +169,39 @@ function assertSafeInkwellUrl(apiUrl: string): URL {
 }
 
 /**
- * Write one content artifact to Inkwell. Throws InkwellExecutorError (fail-closed)
- * on missing config, unmappable payload, or a non-ok response. `fetchImpl` is
- * injectable for tests.
+ * Fetch precedence shared by every function in this file: an explicit fetchImpl
+ * (tests) wins; otherwise the service binding (cfg.fetcher) when present (same-zone
+ * 522 avoidance); else global fetch.
  */
-export async function inkwellContentWrite(
-  cfg: InkwellExecutorConfig,
-  payload: unknown,
-  fetchImpl?: typeof fetch,
-): Promise<InkwellWriteResult> {
-  if (!cfg || !cfg.apiUrl || !cfg.token || !cfg.tenantSlug) {
-    throw new InkwellExecutorError('inkwell_not_configured', 'missing apiUrl, token, or tenantSlug')
-  }
-  // Fetch precedence: an explicit fetchImpl (tests) wins; otherwise the service
-  // binding (cfg.fetcher) when present (same-zone 522 avoidance); else global fetch.
-  const doFetch: typeof fetch =
-    fetchImpl ?? (cfg.fetcher ? (cfg.fetcher.fetch.bind(cfg.fetcher) as typeof fetch) : fetch)
-  const base = assertSafeInkwellUrl(cfg.apiUrl)
-  const body = toPublishBody(payload)
-  if (!body) {
-    throw new InkwellExecutorError('invalid_payload', 'stored payload lacks title/content')
-  }
-  // tenant-explicit, pot-scoped, server-forced-draft internal endpoint.
-  const internalBody = { ...body, tenant_slug: cfg.tenantSlug }
+function resolveFetch(cfg: InkwellExecutorConfig, fetchImpl?: typeof fetch): typeof fetch {
+  return fetchImpl ?? (cfg.fetcher ? (cfg.fetcher.fetch.bind(cfg.fetcher) as typeof fetch) : fetch)
+}
 
+/**
+ * Shared low-level request: resolves the safe base URL, attaches the Bearer +
+ * User-Agent (Worker→Worker subrequests carry no default UA; the mumega.com zone WAF
+ * 403s a UA-less/bot-looking request otherwise — error 1010, same fix the fleet
+ * report hook needed), refuses redirects outright, and returns the raw Response for
+ * the caller to interpret (a GET treats 404 as a valid "not found" outcome; a POST
+ * treats any non-ok as a hard error) — never follows a redirect, never retries.
+ */
+async function doInkwellFetch(
+  cfg: InkwellExecutorConfig,
+  doFetch: typeof fetch,
+  path: string,
+  init: { method: 'GET' | 'POST'; headers?: Record<string, string>; body?: string },
+): Promise<Response> {
+  const base = assertSafeInkwellUrl(cfg.apiUrl)
   let res: Response
   try {
-    res = await doFetch(`${base.origin}/api/internal/content/publish`, {
-      method: 'POST',
+    res = await doFetch(`${base.origin}${path}`, {
+      method: init.method,
       headers: {
-        'content-type': 'application/json',
         authorization: `Bearer ${cfg.token}`,
-        // Worker→Worker subrequests carry no default User-Agent; the mumega.com
-        // zone WAF 403s (error 1010) a UA-less/bot-looking request, surfacing as
-        // inkwell_http_error even with a valid secret + payload. An explicit UA
-        // clears the managed rule (same fix the fleet report hook needed).
         'user-agent': 'mupot-executor/1.0',
+        ...init.headers,
       },
-      body: JSON.stringify(internalBody),
+      body: init.body,
       // SSRF defense-in-depth (LOW-1, adversarial gate, mupot#370 delta): assertSafeInkwellUrl
       // only validates apiUrl at PARSE time. Without redirect:'manual', a default 'follow'
       // fetch would silently chase a 3xx from cfg.apiUrl to an arbitrary Location — including
@@ -208,7 +226,23 @@ export async function inkwellContentWrite(
   if (resType === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
     throw new InkwellExecutorError('inkwell_redirect_blocked', 'refusing to follow a redirect from apiUrl')
   }
+  return res
+}
 
+/** POST a fully-formed PublishBody and parse the standard { ok, slug, url } response. */
+async function postPublishBody(
+  cfg: InkwellExecutorConfig,
+  body: PublishBody,
+  fetchImpl?: typeof fetch,
+): Promise<InkwellWriteResult> {
+  const doFetch = resolveFetch(cfg, fetchImpl)
+  // tenant-explicit, pot-scoped, server-forced-draft internal endpoint.
+  const internalBody = { ...body, tenant_slug: cfg.tenantSlug }
+  const res = await doInkwellFetch(cfg, doFetch, '/api/internal/content/publish', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(internalBody),
+  })
   if (!res.ok) {
     throw new InkwellExecutorError('inkwell_http_error', `status ${res.status}`)
   }
@@ -217,4 +251,281 @@ export async function inkwellContentWrite(
     throw new InkwellExecutorError('inkwell_bad_response', 'response missing ok/slug/url')
   }
   return { ok: true, slug: json.slug, url: json.url }
+}
+
+/**
+ * Write one content artifact to Inkwell. Throws InkwellExecutorError (fail-closed)
+ * on missing config, unmappable payload, or a non-ok response. `fetchImpl` is
+ * injectable for tests.
+ */
+export async function inkwellContentWrite(
+  cfg: InkwellExecutorConfig,
+  payload: unknown,
+  fetchImpl?: typeof fetch,
+): Promise<InkwellWriteResult> {
+  if (!cfg || !cfg.apiUrl || !cfg.token || !cfg.tenantSlug) {
+    throw new InkwellExecutorError('inkwell_not_configured', 'missing apiUrl, token, or tenantSlug')
+  }
+  const body = toPublishBody(payload)
+  if (!body) {
+    throw new InkwellExecutorError('invalid_payload', 'stored payload lacks title/content')
+  }
+  return postPublishBody(cfg, body, fetchImpl)
+}
+
+// ── CRO apply-bridge: fetch (GET /api/internal/content/:slug) ────────────────────
+
+/** The current article's editable fields, as read back from Inkwell. */
+export interface FetchedInkwellContent {
+  title: string
+  description: string
+  author: string
+  tags: string[]
+  status: 'draft' | 'published' | 'archived'
+  /** Frontmatter-stripped body — the exact shape PublishBody.content expects. */
+  content: string
+}
+
+/**
+ * Read the current content for `slug` under cfg.tenantSlug. FAIL-CLOSED: any config
+ * problem, network error, redirect, or malformed response THROWS InkwellExecutorError
+ * — this function never returns a partial/blank result to paper over a failure.
+ * Returns null ONLY for a genuine 404 (no content stored at this slug for this
+ * tenant) — the caller (inkwellContentApplyWrite) treats null as "cannot merge,
+ * refuse to write", never as "start from empty".
+ */
+export async function fetchInkwellContent(
+  cfg: InkwellExecutorConfig,
+  slug: string,
+  fetchImpl?: typeof fetch,
+): Promise<FetchedInkwellContent | null> {
+  if (!cfg || !cfg.apiUrl || !cfg.token || !cfg.tenantSlug) {
+    throw new InkwellExecutorError('inkwell_not_configured', 'missing apiUrl, token, or tenantSlug')
+  }
+  if (!slug) {
+    throw new InkwellExecutorError('invalid_payload', 'fetch requires a non-empty slug')
+  }
+  const doFetch = resolveFetch(cfg, fetchImpl)
+  const path = `/api/internal/content/${encodeURIComponent(slug)}?tenant_slug=${encodeURIComponent(cfg.tenantSlug)}`
+  const res = await doInkwellFetch(cfg, doFetch, path, { method: 'GET' })
+  if (res.status === 404) return null
+  if (!res.ok) {
+    throw new InkwellExecutorError('inkwell_fetch_http_error', `status ${res.status}`)
+  }
+  const json = (await res.json().catch(() => null)) as Record<string, unknown> | null
+  if (!json || json.ok !== true || typeof json.content !== 'string') {
+    throw new InkwellExecutorError('inkwell_fetch_bad_response', 'fetch response missing ok/content')
+  }
+  return {
+    title: typeof json.title === 'string' ? json.title : '',
+    description: typeof json.description === 'string' ? json.description : '',
+    author: typeof json.author === 'string' ? json.author : '',
+    tags: Array.isArray(json.tags) ? json.tags.filter((t): t is string => typeof t === 'string') : [],
+    status: json.status === 'published' || json.status === 'archived' ? json.status : 'draft',
+    content: json.content,
+  }
+}
+
+// ── CRO apply-bridge: merge ────────────────────────────────────────────────────
+
+/** The stored gate-record shape a CRO apply produces (collectors/cro-apply.ts). */
+export interface CroApplyMergePayload {
+  executor: 'inkwell-content'
+  mode: 'cro-apply-merge'
+  slug: string
+  changeType: CroChangeType
+  /** The new value for the targeted field (or the replacement text for a substring change). */
+  value: string
+  /**
+   * REQUIRED for 'cta_text' | 'internal_links' — the exact current substring in the
+   * article body to replace. Inkwell's content schema has no separate CTA/internal-
+   * links field (see change-types.ts SCHEMA NOTE), so these change-types target a
+   * substring within `content` rather than a whole field.
+   */
+  findText?: string
+}
+
+function toCroApplyMergePayload(payload: unknown): CroApplyMergePayload | null {
+  if (payload === null || typeof payload !== 'object') return null
+  const p = payload as Record<string, unknown>
+  if (p.mode !== 'cro-apply-merge') return null
+  const slug = typeof p.slug === 'string' ? p.slug.trim() : ''
+  if (!slug) return null
+  if (!isKnownChangeType(p.changeType)) return null
+  const value = typeof p.value === 'string' ? p.value : ''
+  if (!value) return null
+  const findText = typeof p.findText === 'string' && p.findText ? p.findText : undefined
+  return { executor: 'inkwell-content', mode: 'cro-apply-merge', slug, changeType: p.changeType, value, findText }
+}
+
+/** Records the audit-trail diff a CRO apply write produced — the RECEIPT's payload. */
+export interface ContentMergeDiff {
+  changeType: CroChangeType
+  field: 'title' | 'description' | 'content'
+  before: string
+  after: string
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0
+  let count = 0
+  let idx = 0
+  for (;;) {
+    const found = haystack.indexOf(needle, idx)
+    if (found === -1) break
+    count += 1
+    idx = found + needle.length
+  }
+  return count
+}
+
+/**
+ * Apply ONE targeted field change from `merge` onto `current`, returning the FULL
+ * merged PublishBody (Inkwell's sink has no partial-update surface — see the
+ * PublishBody ⚠ note — so every field the sink accepts must be present, sourced from
+ * `current` except the one field this change-type touches) plus the diff for the
+ * receipt. PURE — no I/O, no throw on the happy path; throws InkwellExecutorError
+ * only for an ambiguous/absent cta_text|internal_links replace target (fail-closed:
+ * an ambiguous edit target must never silently pick "the first match").
+ */
+export function mergeContentUpdate(
+  current: FetchedInkwellContent,
+  merge: CroApplyMergePayload,
+): { body: PublishBody; diff: ContentMergeDiff } {
+  const author = current.author || 'mupot'
+  const base = {
+    slug: merge.slug,
+    author,
+    tags: current.tags,
+    status: current.status,
+    overwrite: true as const,
+  }
+
+  // meta_title / headline: both target Inkwell's single `title` field — see the
+  // SCHEMA NOTE in change-types.ts for why these two change-types collide on one
+  // field. The article body and every other field pass through UNTOUCHED.
+  if (merge.changeType === 'meta_title' || merge.changeType === 'headline') {
+    return {
+      body: { ...base, title: merge.value, content: current.content, description: current.description },
+      diff: { changeType: merge.changeType, field: 'title', before: current.title, after: merge.value },
+    }
+  }
+
+  if (merge.changeType === 'meta_description') {
+    return {
+      body: { ...base, title: current.title, content: current.content, description: merge.value },
+      diff: { changeType: merge.changeType, field: 'description', before: current.description, after: merge.value },
+    }
+  }
+
+  // body_copy: an intentional, full replace of the article body — this IS the whole
+  // field the change-type names (still merged: title/description/tags/author/status
+  // all pass through from `current` untouched).
+  if (merge.changeType === 'body_copy') {
+    return {
+      body: { ...base, title: current.title, content: merge.value, description: current.description },
+      diff: { changeType: merge.changeType, field: 'content', before: current.content, after: merge.value },
+    }
+  }
+
+  // cta_text / internal_links: a substring replace WITHIN the body (no separate field
+  // exists for either — see change-types.ts SCHEMA NOTE). Fail-closed on an absent or
+  // ambiguous target: never guess which occurrence, never no-op silently.
+  if (!merge.findText) {
+    throw new InkwellExecutorError(
+      'merge_target_missing',
+      `${merge.changeType} requires findText (the current substring to replace)`,
+    )
+  }
+  const occurrences = countOccurrences(current.content, merge.findText)
+  if (occurrences === 0) {
+    throw new InkwellExecutorError(
+      'merge_target_not_found',
+      `${merge.changeType}: findText not present in the current article body`,
+    )
+  }
+  if (occurrences > 1) {
+    throw new InkwellExecutorError(
+      'merge_target_ambiguous',
+      `${merge.changeType}: findText matches ${occurrences} locations in the body — refusing an ambiguous replace`,
+    )
+  }
+  const mergedContent = current.content.replace(merge.findText, merge.value)
+  return {
+    body: { ...base, title: current.title, content: mergedContent, description: current.description },
+    diff: { changeType: merge.changeType, field: 'content', before: merge.findText, after: merge.value },
+  }
+}
+
+// ── CRO apply-bridge: the merge write orchestrator ────────────────────────────
+
+export interface InkwellApplyWriteResult extends InkwellWriteResult {
+  diff: ContentMergeDiff
+}
+
+/**
+ * The full fetch-then-merge write: read the current article (fail-closed on any
+ * fetch problem or a missing article), apply ONLY the targeted field via
+ * mergeContentUpdate, and write the merged whole back. Re-validates the change-type
+ * allowlist at this SINK layer even though the proposer (collectors/cro-apply.ts)
+ * already refused a bad change-type before minting a gate record — "a safety flag
+ * the producer sets and the server never re-checks is defensive theater; enforce
+ * invariants at the SINK, not just the producer" (the lesson mupot commit 10846b4
+ * drew from the adversarial gate on this same content-write surface). This branch
+ * should be structurally unreachable (toCroApplyMergePayload already gates on
+ * isKnownChangeType), but the re-check costs nothing and closes the class of bug
+ * regardless of how the payload got here.
+ */
+export async function inkwellContentApplyWrite(
+  cfg: InkwellExecutorConfig,
+  payload: unknown,
+  fetchImpl?: typeof fetch,
+): Promise<InkwellApplyWriteResult> {
+  if (!cfg || !cfg.apiUrl || !cfg.token || !cfg.tenantSlug) {
+    throw new InkwellExecutorError('inkwell_not_configured', 'missing apiUrl, token, or tenantSlug')
+  }
+  const merge = toCroApplyMergePayload(payload)
+  if (!merge) {
+    throw new InkwellExecutorError('invalid_payload', 'stored payload is not a valid cro-apply-merge intent')
+  }
+  if (classifyChangeType(merge.changeType) === 'refused') {
+    throw new InkwellExecutorError(
+      'change_type_refused',
+      `${merge.changeType} is not an allowlisted CRO change-type`,
+    )
+  }
+
+  // FAIL-CLOSED FETCH-THEN-MERGE: a thrown fetch error propagates as-is (already an
+  // InkwellExecutorError); a 404 (null) refuses explicitly. Neither path reaches the
+  // write call below — there is no code path from "could not read current content"
+  // to "write anyway".
+  const current = await fetchInkwellContent(cfg, merge.slug, fetchImpl)
+  if (!current) {
+    throw new InkwellExecutorError(
+      'merge_source_not_found',
+      `fetch-then-merge: no existing content at slug '${merge.slug}' to merge into`,
+    )
+  }
+
+  const { body, diff } = mergeContentUpdate(current, merge)
+  const written = await postPublishBody(cfg, body, fetchImpl)
+  return { ...written, diff }
+}
+
+/**
+ * kernel.ts's inkwell-content call site. Branches on the stored payload's SHAPE
+ * (mode === 'cro-apply-merge'), not on any action string — kernel.ts still dispatches
+ * purely on payload.executor === 'inkwell-content' (see file-header note). Every
+ * existing caller (content-publish, seo-meta-fix) has no `mode` field and is
+ * unaffected — routes to the unchanged full-replace path.
+ */
+export async function inkwellContentDispatch(
+  cfg: InkwellExecutorConfig,
+  payload: unknown,
+  fetchImpl?: typeof fetch,
+): Promise<InkwellWriteResult & { diff?: ContentMergeDiff }> {
+  if (payload !== null && typeof payload === 'object' && (payload as Record<string, unknown>).mode === 'cro-apply-merge') {
+    return inkwellContentApplyWrite(cfg, payload, fetchImpl)
+  }
+  return inkwellContentWrite(cfg, payload, fetchImpl)
 }

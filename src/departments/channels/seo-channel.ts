@@ -233,6 +233,27 @@ export const SeoChannel: ChannelDescriptor = {
       // requiredCapability='lead': same reasoning.
       requiredCapability: 'lead' as const,
     },
+    {
+      // CRO apply-bridge (CRO epic S5b) — collectors/cro-apply.ts's proposeCroApply is
+      // the ONLY producer for this action. Unlike seo-meta-fix's full-body-replace
+      // write, this action's executor path (executors/inkwell.ts
+      // inkwellContentApplyWrite, dispatched via kernel.ts's inkwellContentDispatch)
+      // is a FETCH-THEN-MERGE write: it reads the current article and patches ONLY
+      // the change-type's targeted field, never clobbering the rest of the post.
+      // Change-type is enforced allowlist-style (change-types.ts) inside
+      // proposeCroApply BEFORE any gate record is minted — a destructive change-type
+      // (layout/forms/offer/pricing/brand_voice) or anything unrecognized never
+      // reaches this work-type at all.
+      key: 'cro-apply',
+      name: 'CRO Content Apply (targeted field, fetch-then-merge)',
+      // proposesOnly=false: produces a gated record; executes only after human
+      // approval via ctx.executor.execute() — same S4 invariant as every other
+      // executable work-type here.
+      proposesOnly: false,
+      // requiredCapability='lead': same reasoning as seo-meta-fix — an executable
+      // content-write action is not a bare-member capability.
+      requiredCapability: 'lead' as const,
+    },
   ],
 
   // ── renderHints ───────────────────────────────────────────────────────────

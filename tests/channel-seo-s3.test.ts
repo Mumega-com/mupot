@@ -825,14 +825,15 @@ describe('9. Regression: GrowthModule with SeoChannel — outbound keys intact, 
     expect(uniqueKeys.size).toBe(keys.length)
   })
 
-  it('8 work-types total (1 outbound + 6 seo + 1 wordpress), no duplicates', () => {
+  it('9 work-types total (1 outbound + 7 seo + 1 wordpress), no duplicates', () => {
     // S3: 1 outbound + 4 seo = 5. S4 adds 2 executable seo work-types → 7 total.
     // #370: WordpressChannel adds 1 executable work-type (content-publish) → 8 total.
+    // S5b (CRO apply-bridge, collectors/cro-apply.ts) adds 1 more ('cro-apply') → 9 total.
     const wts = getChannelWorkTypes(GrowthModule.channels ?? [])
-    expect(wts).toHaveLength(8)
+    expect(wts).toHaveLength(9)
     const keys = wts.map((w) => w.key)
     const uniqueKeys = new Set(keys)
-    expect(uniqueKeys.size).toBe(8)
+    expect(uniqueKeys.size).toBe(9)
   })
 
   it('registered GrowthModule channels are frozen (deepFreezeClone covers channels)', () => {
