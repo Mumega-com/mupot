@@ -2,9 +2,11 @@ import {
   MARKETING_MONITOR_METRIC_CONTRACT,
   type MarketingMonitorMetricKey,
   type MarketingOutcomes,
+  type MarketingSnapshotCollection,
   type MonitorObservation,
   type OutcomeValue,
 } from './types'
+import { isCollectedMarketingSnapshot } from './sources'
 
 const OUTCOME_METRICS = {
   visibility: 'seo.ai_citations',
@@ -46,8 +48,12 @@ function outcomeFor(
 }
 
 export function deriveMarketingOutcomes(
-  observations: readonly MonitorObservation[],
+  collection: MarketingSnapshotCollection,
 ): MarketingOutcomes {
+  if (!isCollectedMarketingSnapshot(collection)) {
+    throw new Error('unnormalized_marketing_snapshot')
+  }
+  const observations = collection.observations
   return {
     visibility: outcomeFor(observations, OUTCOME_METRICS.visibility),
     qualifiedTraffic: outcomeFor(observations, OUTCOME_METRICS.qualifiedTraffic),

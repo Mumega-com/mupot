@@ -14,23 +14,62 @@ export const MARKETING_MONITOR_ADAPTER_AUTHORITIES = Object.freeze({
 export type MarketingMonitorAuthority =
   (typeof MARKETING_MONITOR_ADAPTER_AUTHORITIES)[keyof typeof MARKETING_MONITOR_ADAPTER_AUTHORITIES]
 
+const internalBinding = () => Object.freeze({
+  capability: 'read',
+  bindingKind: 'internal_adapter',
+  connectorId: 'null',
+} as const)
+
+const vaultBinding = () => Object.freeze({
+  capability: 'read',
+  bindingKind: 'vault_connector',
+  connectorId: 'required',
+} as const)
+
+export const MARKETING_MONITOR_BINDING_CONTRACT = Object.freeze({
+  web_analytics: Object.freeze({
+    first_party: internalBinding(),
+    posthog: vaultBinding(),
+  }),
+  content_surface: Object.freeze({
+    inkwell: vaultBinding(),
+    mcpwp: vaultBinding(),
+  }),
+  search_performance: Object.freeze({
+    google_search_console: vaultBinding(),
+  }),
+  crm: Object.freeze({
+    ghl: vaultBinding(),
+    crm: vaultBinding(),
+  }),
+  ai_visibility: Object.freeze({
+    ai_visibility: vaultBinding(),
+  }),
+} as const)
+
 export const MARKETING_MONITOR_METRIC_CONTRACT = Object.freeze({
   'seo.ai_citations': Object.freeze({
+    unit: 'count',
     authorities: Object.freeze(['first-party', 'ai_visibility'] as const),
   }),
   'seo.organic_sessions': Object.freeze({
+    unit: 'count',
     authorities: Object.freeze(['first-party', 'posthog'] as const),
   }),
   'growth.leads': Object.freeze({
+    unit: 'count',
     authorities: Object.freeze(['first-party', 'ghl', 'crm'] as const),
   }),
   'growth.replies': Object.freeze({
+    unit: 'count',
     authorities: Object.freeze(['first-party', 'ghl', 'crm'] as const),
   }),
   'seo.conversion_rate': Object.freeze({
+    unit: 'ratio',
     authorities: Object.freeze(['first-party', 'posthog'] as const),
   }),
   'finance.revenue': Object.freeze({
+    unit: 'usd',
     authorities: Object.freeze(['ghl', 'crm'] as const),
   }),
 } as const)
@@ -93,6 +132,7 @@ export interface CollectedSourceStatus {
 
 export interface MarketingSnapshotCollection {
   readonly runId: string | null
+  readonly rawObservationCount: number
   readonly sources: readonly CollectedSourceStatus[]
   readonly observations: readonly MonitorObservation[]
 }

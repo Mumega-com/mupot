@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import { createMarketingMonitorFixtureSource } from './fixtures/marketing-monitor'
 import { deriveMarketingOutcomes } from '../src/addons/marketing/outcomes'
-import type { MonitorObservation, MonitorWindow, ResolvedAddonBinding } from '../src/addons/marketing/types'
+import { collectMarketingSnapshots } from '../src/addons/marketing/sources'
+import type {
+  MarketingMonitorSource,
+  MarketingSnapshotCollection,
+  MonitorObservation,
+  MonitorWindow,
+  ResolvedAddonBinding,
+} from '../src/addons/marketing/types'
 import type { Env } from '../src/types'
 
 const env = { TENANT_SLUG: 'tenant-a' } as Env
@@ -9,7 +16,7 @@ const window: MonitorWindow = {
   start: '2026-07-16T00:00:00.000Z',
   end: '2026-07-16T23:59:59.999Z',
 }
-const binding: ResolvedAddonBinding = {
+const firstPartyBinding: ResolvedAddonBinding = {
   id: 'binding-web-analytics',
   slot: 'web_analytics',
   adapter: 'first_party',
@@ -17,20 +24,54 @@ const binding: ResolvedAddonBinding = {
   capability: 'read',
   connectorId: null,
 }
+const ghlBinding: ResolvedAddonBinding = {
+  id: 'binding-crm',
+  slot: 'crm',
+  adapter: 'ghl',
+  bindingKind: 'vault_connector',
+  capability: 'read',
+  connectorId: 'connector-ghl',
+}
 
-async function fixtureObservations(): Promise<readonly MonitorObservation[]> {
+function observation(overrides: Partial<MonitorObservation> = {}): MonitorObservation {
+  return {
+    id: 'evidence-visibility',
+    runId: 'run-1',
+    metricKey: 'seo.ai_citations',
+    value: 1,
+    unit: 'count',
+    authority: 'first-party',
+    observedAt: '2026-07-16T12:00:00.000Z',
+    ...overrides,
+  }
+}
+
+async function collectObservations(
+  observations: readonly MonitorObservation[],
+  binding: ResolvedAddonBinding = firstPartyBinding,
+): Promise<MarketingSnapshotCollection> {
+  const source: MarketingMonitorSource = {
+    key: 'outcome-source',
+    slot: binding.slot,
+    async read() {
+      return { status: 'available', observations }
+    },
+  }
+  return collectMarketingSnapshots(env, [binding], window, [source])
+}
+
+async function fixtureCollection(): Promise<MarketingSnapshotCollection> {
   const source = createMarketingMonitorFixtureSource({
     runId: 'run-1',
     observedAt: '2026-07-16T12:00:00.000Z',
     window,
   })
-  const snapshot = await source.read(env, binding, window)
-  return snapshot.observations
+  return collectMarketingSnapshots(env, [firstPartyBinding], window, [source])
 }
 
 describe('deriveMarketingOutcomes', () => {
   it('maps the five fixture metrics to available outcomes without fabricating revenue', async () => {
-    const outcomes = deriveMarketingOutcomes(await fixtureObservations())
+    const outcomes = deriveMarketingOutcomes(await fixtureCollection())
 
     expect(outcomes.visibility).toMatchObject({ status: 'available', value: 8, unit: 'count', source: 'first-party' })
     expect(outcomes.qualifiedTraffic).toMatchObject({ status: 'available', value: 240, unit: 'count', source: 'first-party' })
@@ -39,27 +80,19 @@ describe('deriveMarketingOutcomes', () => {
     expect(outcomes.revenue).toEqual({ status: 'unavailable', reason: 'authoritative_source_missing' })
   })
 
-  it('does not render missing revenue as zero', () => {
-    const outcomes = deriveMarketingOutcomes([])
+  it('does not render missing revenue as zero', async () => {
+    const outcomes = deriveMarketingOutcomes(await collectObservations([]))
 
     expect(outcomes.revenue).toEqual({ status: 'unavailable', reason: 'authoritative_source_missing' })
     expect(outcomes.revenue).not.toMatchObject({ value: 0 })
     expect(outcomes.visibility).toEqual({ status: 'unavailable', reason: 'authoritative_source_missing' })
   })
 
-  it('does not mutate or convert an absent authoritative metric to zero', () => {
-    const observations: MonitorObservation[] = [{
-      id: 'evidence-visibility',
-      runId: 'run-1',
-      metricKey: 'seo.ai_citations',
-      value: 0,
-      unit: 'count',
-      authority: 'first-party',
-      observedAt: '2026-07-16T12:00:00.000Z',
-    }]
+  it('does not mutate or convert an absent authoritative metric to zero', async () => {
+    const observations = [observation({ value: 0 })]
     Object.freeze(observations)
 
-    const outcomes = deriveMarketingOutcomes(observations)
+    const outcomes = deriveMarketingOutcomes(await collectObservations(observations))
 
     expect(outcomes.visibility).toMatchObject({ status: 'available', value: 0 })
     expect(outcomes.revenue).toEqual({ status: 'unavailable', reason: 'authoritative_source_missing' })
@@ -67,32 +100,31 @@ describe('deriveMarketingOutcomes', () => {
     expect(observations[0].metricKey).toBe('seo.ai_citations')
   })
 
-  it('does not use revenue evidence from a non-authoritative source', () => {
-    const outcomes = deriveMarketingOutcomes([{
+  it('does not use revenue evidence from a non-authoritative source', async () => {
+    const collection = await collectObservations([observation({
       id: 'evidence-revenue',
-      runId: 'run-1',
-      metricKey: 'finance.revenue' as MonitorObservation['metricKey'],
+      metricKey: 'finance.revenue',
       value: 500,
       unit: 'usd',
       authority: 'first-party',
-      observedAt: '2026-07-16T12:00:00.000Z',
-    }])
+    })])
 
-    expect(outcomes.revenue).toEqual({ status: 'unavailable', reason: 'authoritative_source_missing' })
+    expect(deriveMarketingOutcomes(collection).revenue).toEqual({
+      status: 'unavailable',
+      reason: 'authoritative_source_missing',
+    })
   })
 
-  it('uses finance revenue from a supported CRM authority', () => {
-    const outcomes = deriveMarketingOutcomes([{
+  it('uses finance revenue from a supported CRM authority', async () => {
+    const collection = await collectObservations([observation({
       id: 'evidence-revenue',
-      runId: 'run-1',
-      metricKey: 'finance.revenue' as MonitorObservation['metricKey'],
+      metricKey: 'finance.revenue',
       value: 500,
       unit: 'usd',
       authority: 'ghl',
-      observedAt: '2026-07-16T12:00:00.000Z',
-    }])
+    })], ghlBinding)
 
-    expect(outcomes.revenue).toEqual({
+    expect(deriveMarketingOutcomes(collection).revenue).toEqual({
       status: 'available',
       value: 500,
       unit: 'usd',
@@ -101,53 +133,52 @@ describe('deriveMarketingOutcomes', () => {
     })
   })
 
-  it('selects the latest observedAt instead of the last input observation', () => {
-    const outcomes = deriveMarketingOutcomes([
-      {
+  it('selects the latest observedAt instead of the last input observation', async () => {
+    const collection = await collectObservations([
+      observation({
         id: 'latest-evidence',
-        runId: 'run-1',
-        metricKey: 'seo.ai_citations',
         value: 9,
-        unit: 'count',
-        authority: 'first-party',
         observedAt: '2026-07-16T18:00:00.000Z',
-      },
-      {
+      }),
+      observation({
         id: 'older-evidence',
-        runId: 'run-1',
-        metricKey: 'seo.ai_citations',
         value: 2,
-        unit: 'count',
-        authority: 'first-party',
         observedAt: '2026-07-16T08:00:00.000Z',
-      },
+      }),
     ])
 
-    expect(outcomes.visibility).toMatchObject({ value: 9, observedAt: '2026-07-16T18:00:00.000Z' })
+    expect(deriveMarketingOutcomes(collection).visibility).toMatchObject({
+      value: 9,
+      observedAt: '2026-07-16T18:00:00.000Z',
+    })
   })
 
-  it('breaks equal observedAt ties by greatest observation ID', () => {
-    const outcomes = deriveMarketingOutcomes([
-      {
-        id: 'z-evidence',
-        runId: 'run-1',
-        metricKey: 'seo.ai_citations',
-        value: 9,
-        unit: 'count',
-        authority: 'first-party',
-        observedAt: '2026-07-16T12:00:00.000Z',
-      },
-      {
-        id: 'a-evidence',
-        runId: 'run-1',
-        metricKey: 'seo.ai_citations',
-        value: 2,
-        unit: 'count',
-        authority: 'first-party',
-        observedAt: '2026-07-16T12:00:00.000Z',
-      },
+  it('breaks equal observedAt ties by greatest observation ID', async () => {
+    const collection = await collectObservations([
+      observation({ id: 'z-evidence', value: 9 }),
+      observation({ id: 'a-evidence', value: 2 }),
     ])
 
-    expect(outcomes.visibility).toMatchObject({ value: 9, observedAt: '2026-07-16T12:00:00.000Z' })
+    expect(deriveMarketingOutcomes(collection).visibility).toMatchObject({
+      value: 9,
+      observedAt: '2026-07-16T12:00:00.000Z',
+    })
+  })
+
+  it('rejects a forged collection with a stable provenance error', () => {
+    const forged = Object.freeze({
+      runId: 'run-1',
+      rawObservationCount: 1,
+      sources: Object.freeze([]),
+      observations: Object.freeze([observation()]),
+    }) as MarketingSnapshotCollection
+
+    expect(() => deriveMarketingOutcomes(forged)).toThrow('unnormalized_marketing_snapshot')
+  })
+
+  it('rejects raw observations instead of bypassing collector normalization', () => {
+    const raw = [observation()] as unknown as MarketingSnapshotCollection
+
+    expect(() => deriveMarketingOutcomes(raw)).toThrow('unnormalized_marketing_snapshot')
   })
 })

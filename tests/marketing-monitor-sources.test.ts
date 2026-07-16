@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { createMarketingMonitorFixtureSource } from './fixtures/marketing-monitor'
 import { collectMarketingSnapshots, MAX_OBSERVATIONS_PER_RUN, MAX_OBSERVATIONS_PER_SOURCE } from '../src/addons/marketing/sources'
+import { MARKETING_MONITOR_METRIC_CONTRACT } from '../src/addons/marketing/types'
+import * as MarketingTypes from '../src/addons/marketing/types'
 import type {
   MarketingMonitorSource,
   MonitorObservation,
@@ -50,6 +52,46 @@ function available(observations: readonly MonitorObservation[]): SourceSnapshot 
 }
 
 describe('collectMarketingSnapshots', () => {
+  it('declares the immutable canonical monitor binding contract', () => {
+    const contract = (MarketingTypes as Record<string, unknown>).MARKETING_MONITOR_BINDING_CONTRACT
+    expect(contract).toEqual({
+      web_analytics: {
+        first_party: { capability: 'read', bindingKind: 'internal_adapter', connectorId: 'null' },
+        posthog: { capability: 'read', bindingKind: 'vault_connector', connectorId: 'required' },
+      },
+      content_surface: {
+        inkwell: { capability: 'read', bindingKind: 'vault_connector', connectorId: 'required' },
+        mcpwp: { capability: 'read', bindingKind: 'vault_connector', connectorId: 'required' },
+      },
+      search_performance: {
+        google_search_console: { capability: 'read', bindingKind: 'vault_connector', connectorId: 'required' },
+      },
+      crm: {
+        ghl: { capability: 'read', bindingKind: 'vault_connector', connectorId: 'required' },
+        crm: { capability: 'read', bindingKind: 'vault_connector', connectorId: 'required' },
+      },
+      ai_visibility: {
+        ai_visibility: { capability: 'read', bindingKind: 'vault_connector', connectorId: 'required' },
+      },
+    })
+    expect(Object.isFrozen(contract)).toBe(true)
+  })
+
+  it('declares immutable exact units for every monitor metric', () => {
+    expect(Object.fromEntries(Object.entries(MARKETING_MONITOR_METRIC_CONTRACT).map(
+      ([metricKey, contract]) => [metricKey, (contract as { unit?: string }).unit],
+    ))).toEqual({
+      'seo.ai_citations': 'count',
+      'seo.organic_sessions': 'count',
+      'growth.leads': 'count',
+      'growth.replies': 'count',
+      'seo.conversion_rate': 'ratio',
+      'finance.revenue': 'usd',
+    })
+    expect(Object.isFrozen(MARKETING_MONITOR_METRIC_CONTRACT)).toBe(true)
+    expect(Object.values(MARKETING_MONITOR_METRIC_CONTRACT).every(Object.isFrozen)).toBe(true)
+  })
+
   it('keeps healthy source evidence when an optional source fails', async () => {
     const healthyFixture = createMarketingMonitorFixtureSource({
       runId: 'run-1',
@@ -124,6 +166,85 @@ describe('collectMarketingSnapshots', () => {
     expect(JSON.stringify(snapshot)).not.toContain('secret')
   })
 
+  it('isolates source key, slot, and read getter failures with synthetic identities', async () => {
+    const hostileSource = (field: 'key' | 'slot' | 'read'): MarketingMonitorSource => {
+      const candidate: Record<string, unknown> = {
+        key: `${field}-source`,
+        slot: 'web_analytics',
+        read: async () => available([]),
+      }
+      Object.defineProperty(candidate, field, {
+        enumerable: true,
+        get: () => { throw new Error(`${field} getter secret`) },
+      })
+      return candidate as unknown as MarketingMonitorSource
+    }
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      hostileSource('key'),
+      hostileSource('slot'),
+      hostileSource('read'),
+      source('healthy', 'web_analytics', async () => available([observation({ id: 'healthy-evidence' })])),
+    ])
+
+    expect(snapshot.sources).toEqual([
+      { key: 'source_config_0', slot: 'unconfigured', status: 'failed', reason: 'invalid_source_configuration', observationCount: 0 },
+      { key: 'source_config_1', slot: 'unconfigured', status: 'failed', reason: 'invalid_source_configuration', observationCount: 0 },
+      { key: 'source_config_2', slot: 'unconfigured', status: 'failed', reason: 'invalid_source_configuration', observationCount: 0 },
+      { key: 'healthy', slot: 'web_analytics', status: 'available', observationCount: 1 },
+    ])
+    expect(snapshot.observations).toEqual([observation({ id: 'healthy-evidence' })])
+    expect(JSON.stringify(snapshot)).not.toContain('getter secret')
+  })
+
+  it('rejects noncanonical source keys and slots with synthetic configuration failures', async () => {
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      source('Bad Key', 'web_analytics', async () => available([])),
+      source('valid-key', 'Web Analytics', async () => available([])),
+      source('healthy', 'web_analytics', async () => available([observation({ id: 'healthy-evidence' })])),
+    ])
+
+    expect(snapshot.sources).toEqual([
+      { key: 'source_config_0', slot: 'unconfigured', status: 'failed', reason: 'invalid_source_configuration', observationCount: 0 },
+      { key: 'source_config_1', slot: 'unconfigured', status: 'failed', reason: 'invalid_source_configuration', observationCount: 0 },
+      { key: 'healthy', slot: 'web_analytics', status: 'available', observationCount: 1 },
+    ])
+  })
+
+  it('reserves synthetic source keys so declarations cannot collide with failure identities', async () => {
+    const hostile = { key: 'hostile', read: async () => available([]) } as Record<string, unknown>
+    Object.defineProperty(hostile, 'slot', {
+      enumerable: true,
+      get: () => { throw new Error('slot secret') },
+    })
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      hostile as unknown as MarketingMonitorSource,
+      source('source_config_0', 'web_analytics', async () => available([])),
+    ])
+
+    expect(snapshot.sources.map((entry) => entry.key)).toEqual(['source_config_0', 'source_config_1'])
+    expect(snapshot.sources.every((entry) => entry.reason === 'invalid_source_configuration')).toBe(true)
+  })
+
+  it('collapses duplicate source keys into one failure without reading either declaration', async () => {
+    let reads = 0
+    const duplicate = (slot: string) => source('duplicate-source', slot, async () => {
+      reads += 1
+      return available([])
+    })
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      duplicate('web_analytics'),
+      duplicate('content_surface'),
+    ])
+
+    expect(reads).toBe(0)
+    expect(snapshot.sources).toEqual([
+      { key: 'duplicate-source', slot: 'web_analytics', status: 'failed', reason: 'duplicate_source_identity', observationCount: 0 },
+    ])
+  })
+
   it('normalizes adapter-supplied unavailable reasons instead of returning arbitrary text', async () => {
     const snapshot = await collectMarketingSnapshots(env, bindings, window, [
       source('analytics', 'web_analytics', async () => ({
@@ -172,6 +293,69 @@ describe('collectMarketingSnapshots', () => {
     expect(snapshot.sources[0]).toMatchObject({
       status: 'failed',
       reason: 'metric_authority_not_allowed',
+    })
+  })
+
+  it('rejects a slot-adapter mismatch before a source can fabricate revenue', async () => {
+    let reads = 0
+    const mismatchedBinding = {
+      ...bindings[0],
+      adapter: 'ghl',
+      bindingKind: 'vault_connector',
+      connectorId: 'connector-ghl',
+    } as ResolvedAddonBinding
+
+    const snapshot = await collectMarketingSnapshots(env, [mismatchedBinding], window, [
+      source('analytics', 'web_analytics', async () => {
+        reads += 1
+        return available([observation({
+          metricKey: 'finance.revenue',
+          unit: 'usd',
+          authority: 'ghl',
+        })])
+      }),
+    ])
+
+    expect(reads).toBe(0)
+    expect(snapshot.observations).toEqual([])
+    expect(snapshot.sources[0]).toMatchObject({
+      status: 'failed',
+      reason: 'invalid_binding_configuration',
+    })
+  })
+
+  it.each([
+    { ...bindings[0], id: '' },
+    { ...bindings[0], capability: 'write' },
+    { ...bindings[0], bindingKind: 'vault_connector', connectorId: 'connector-first-party' },
+    { ...bindings[0], adapter: 'posthog', bindingKind: 'vault_connector', connectorId: null },
+  ] as unknown as ResolvedAddonBinding[])('rejects malformed binding metadata before reading a source', async (binding) => {
+    let reads = 0
+    const snapshot = await collectMarketingSnapshots(env, [binding], window, [
+      source('analytics', 'web_analytics', async () => {
+        reads += 1
+        return available([])
+      }),
+    ])
+
+    expect(reads).toBe(0)
+    expect(snapshot.sources[0]).toMatchObject({
+      status: 'failed',
+      reason: 'invalid_binding_configuration',
+    })
+  })
+
+  it('rejects a nonempty unit that differs from the metric contract', async () => {
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      source('analytics', 'web_analytics', async () => available([
+        observation({ metricKey: 'seo.ai_citations', unit: 'ratio' }),
+      ])),
+    ])
+
+    expect(snapshot.observations).toEqual([])
+    expect(snapshot.sources[0]).toMatchObject({
+      status: 'failed',
+      reason: 'observation_unit_mismatch',
     })
   })
 
@@ -274,6 +458,80 @@ describe('collectMarketingSnapshots', () => {
       status: 'failed',
       reason: 'run_observation_limit_exceeded',
       observationCount: 0,
+    })
+  })
+
+  it('charges failed and unavailable observation arrays to the raw run budget', async () => {
+    const rejected = Array.from({ length: MAX_OBSERVATIONS_PER_SOURCE }, (_, index) => observation({
+      id: `rejected-${index}`,
+    }))
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      source('unavailable-source', 'web_analytics', async () => ({
+        status: 'unavailable',
+        observations: rejected,
+      })),
+      source('failed-source', 'web_analytics', async () => ({
+        status: 'failed',
+        observations: rejected,
+      })),
+      source('overflow-source', 'web_analytics', async () => available([
+        observation({ id: 'overflow-evidence' }),
+      ])),
+      source('later-source', 'web_analytics', async () => ({
+        status: 'unavailable',
+        observations: [],
+      })),
+    ])
+
+    expect(snapshot.rawObservationCount).toBe(201)
+    expect(snapshot.observations).toEqual([])
+    expect(snapshot.sources.map((entry) => entry.reason)).toEqual([
+      'invalid_source_snapshot',
+      'invalid_source_snapshot',
+      'run_observation_limit_exceeded',
+      'run_observation_limit_exceeded',
+    ])
+  })
+
+  it('charges an over-source-cap array before rejecting later sources on the run cap', async () => {
+    const overSourceCap = Array.from({ length: MAX_OBSERVATIONS_PER_SOURCE + 1 }, (_, index) => observation({
+      id: `over-source-${index}`,
+    }))
+    const next = Array.from({ length: MAX_OBSERVATIONS_PER_SOURCE }, (_, index) => observation({
+      id: `next-${index}`,
+    }))
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      source('over-source', 'web_analytics', async () => available(overSourceCap)),
+      source('next-source', 'web_analytics', async () => available(next)),
+    ])
+
+    expect(snapshot.rawObservationCount).toBe(201)
+    expect(snapshot.sources.map((entry) => entry.reason)).toEqual([
+      'source_observation_limit_exceeded',
+      'run_observation_limit_exceeded',
+    ])
+  })
+
+  it('keeps the raw run cap latched for later sources before binding checks', async () => {
+    const overflow = Array.from({ length: MAX_OBSERVATIONS_PER_SOURCE + 1 }, (_, index) => observation({
+      id: `overflow-${index}`,
+    }))
+    const fill = Array.from({ length: MAX_OBSERVATIONS_PER_SOURCE }, (_, index) => observation({
+      id: `fill-${index}`,
+    }))
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      source('overflow-source', 'web_analytics', async () => available(overflow)),
+      source('fill-source', 'web_analytics', async () => available(fill)),
+      source('unbound-later-source', 'content_surface', async () => available([])),
+    ])
+
+    expect(snapshot.rawObservationCount).toBe(201)
+    expect(snapshot.sources[2]).toMatchObject({
+      status: 'failed',
+      reason: 'run_observation_limit_exceeded',
     })
   })
 
