@@ -73,13 +73,24 @@ After production enforcement, the outcomes suite recorded 1 failed, 8 passed bec
 fixture had no D1 connector metadata. A safe metadata-only D1 fixture was added; production
 continues to call `resolveConnectorByIdWithMeta` directly with no injectable bypass.
 
+The parent self-review findings were addressed with a final test-first cycle. The first RED run
+recorded 6 failed, 54 passed; the 17-binding test already failed closed through duplicate-slot
+validation, so it was tightened to throw on index access. After adding direct non-array and
+fractional-length repros, the authoritative RED run recorded 11 failed, 53 passed. It proved:
+
+- caller-owned `sources.map` and the `bindings` iterator were invoked;
+- a function-owned `read.call` override replaced the captured read body;
+- inputs above 16 entries were processed;
+- non-array and non-integer-length inputs escaped stable configuration handling; and
+- source/binding index getter failures escaped collection instead of remaining isolated.
+
 ## GREEN Evidence
 
 ```sh
 npx vitest run tests/marketing-monitor-sources.test.ts tests/marketing-monitor-outcomes.test.ts
 ```
 
-Result after final review fixes: 2 passed files, 62 passed tests.
+Result after parent self-review fixes: 2 passed files, 73 passed tests.
 
 ```sh
 npm run typecheck
@@ -94,6 +105,10 @@ the same 50 passing tests and a successful `tsc --noEmit`.
 
 The final review implementation checkpoint completed with 62 passing focused tests, successful
 `tsc --noEmit`, and a clean `git diff --check`.
+
+The parent self-review checkpoint completed with 73 passing focused tests, successful
+`tsc --noEmit`, and a source audit finding no caller/source-owned array method, iterator, spread,
+or function `.call` invocation in the collector.
 
 ## Changed Files
 
@@ -115,6 +130,8 @@ The final review implementation checkpoint completed with 62 passing focused tes
 
 `2a0b59495a863438f109c97d863a9777bce44745` (`fix(marketing): secure source collection boundary`)
 
+`bfd865b9ed5e5e342acf284afba8980b0ce1d7a0` (`fix(marketing): bound collector inputs`)
+
 ## Re-review Changed Files
 
 - `src/addons/marketing/types.ts`
@@ -130,6 +147,12 @@ The final review implementation checkpoint completed with 62 passing focused tes
 - `src/addons/marketing/sources.ts`
 - `tests/marketing-monitor-sources.test.ts`
 - `tests/marketing-monitor-outcomes.test.ts`
+- `.superpowers/sdd/task-3-report.md`
+
+## Parent Self-review Changed Files
+
+- `src/addons/marketing/sources.ts`
+- `tests/marketing-monitor-sources.test.ts`
 - `.superpowers/sdd/task-3-report.md`
 
 ## Residual Risks
@@ -149,3 +172,5 @@ The final review implementation checkpoint completed with 62 passing focused tes
   absent from the effective Task 3 binding contract until a supported `ConnectorType` exists.
 - Accepted vault sources perform two safe-metadata D1 resolutions per run. This is deliberate to
   close source-execution drift; Task 6 should account for that bounded read cost.
+- The collector intentionally caps one run configuration at 16 bindings and 16 sources. A future
+  increase must preserve indexed intrinsic-only capture and receive a separate boundedness review.
