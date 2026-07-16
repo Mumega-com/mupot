@@ -309,6 +309,50 @@ export interface ConnectorListRow {
   revoked_at: string | null
 }
 
+export interface ConnectorSafeMeta {
+  id: string
+  type: ConnectorType
+  label: string
+  meta: string | null
+  scopeType: ConnectorScopeType
+  scopeId: string | null
+  createdAt: string
+}
+
+interface ConnectorSafeMetaRow {
+  id: string
+  type: ConnectorType
+  label: string
+  meta: string | null
+  scope_type: ConnectorScopeType
+  scope_id: string | null
+  created_at: string
+}
+
+/** Resolve non-secret metadata for one active connector by exact tenant-local ID. */
+export async function resolveConnectorByIdWithMeta(
+  env: Env,
+  connectorId: string,
+): Promise<ConnectorSafeMeta | null> {
+  if (!connectorId) return null
+  const row = await env.DB.prepare(`
+    SELECT id, type, label, meta, scope_type, scope_id, created_at
+      FROM connectors
+     WHERE id = ?1 AND tenant = ?2 AND revoked_at IS NULL
+     LIMIT 1
+  `).bind(connectorId, env.TENANT_SLUG).first<ConnectorSafeMetaRow>()
+  if (!row || !isConnectorType(row.type) || !isConnectorScopeType(row.scope_type)) return null
+  return {
+    id: row.id,
+    type: row.type,
+    label: row.label,
+    meta: row.meta,
+    scopeType: row.scope_type,
+    scopeId: row.scope_id,
+    createdAt: row.created_at,
+  }
+}
+
 /**
  * List active (non-revoked) connectors for this pot.
  * encrypted_secret is NEVER selected. This is enforced in the SQL query.

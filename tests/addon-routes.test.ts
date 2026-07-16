@@ -12,10 +12,12 @@ const migrations = [
   '../migrations/0005_channel_capability_grants.sql',
   '../migrations/0016_presence.sql',
   '../migrations/0019_agent_token_binding.sql',
+  '../migrations/0023_connectors.sql',
   '../migrations/0029_department_microkernel.sql',
   '../migrations/0040_members_tenant.sql',
   '../migrations/0043_member_tokens_tenant.sql',
   '../migrations/0050_addons.sql',
+  '../migrations/0052_addon_bindings.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 function envForRole(harness: SqliteD1Harness, role: 'owner' | 'admin' | 'member', tenant = 'tenant-a'): Env {
@@ -358,6 +360,73 @@ describe('addon lifecycle routes', () => {
 
     expect(res.status).toBe(400)
     await expect(res.json()).resolves.toEqual({ error: 'invalid_body' })
+  })
+
+  it('accepts a bounded binding payload only for configure', async () => {
+    const ownerEnv = envForRole(harness, 'owner')
+    await addonsApp.fetch(request('/marketing-cro-monitor/install', 'POST'), ownerEnv)
+    const body = JSON.stringify({
+      bindings: [{ slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' }],
+    })
+
+    const configured = await addonsApp.fetch(
+      request('/marketing-cro-monitor/configure', 'POST', { body }),
+      ownerEnv,
+    )
+    expect(configured.status).toBe(200)
+    await expect(configured.json()).resolves.toEqual(expect.objectContaining({
+      ok: true,
+      key: 'marketing-cro-monitor',
+      state: 'configured',
+    }))
+
+    const rejected = await addonsApp.fetch(
+      request('/marketing-cro-monitor/activate', 'POST', { body }),
+      ownerEnv,
+    )
+    expect(rejected.status).toBe(400)
+    await expect(rejected.json()).resolves.toEqual({ error: 'invalid_body' })
+  })
+
+  it.each([
+    ['unknown root key', { bindings: [], unexpected: true }],
+    ['duplicate slots', { bindings: [
+      { slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' },
+      { slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' },
+    ] }],
+    ['unknown binding key', { bindings: [
+      { slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter', secret: 'forbidden' },
+    ] }],
+    ['non-string field', { bindings: [
+      { slot: 'web_analytics', adapter: 7, bindingKind: 'internal_adapter' },
+    ] }],
+    ['more bindings than declared', { bindings: Array.from({ length: 6 }, (_, index) => ({
+      slot: `slot-${index}`, adapter: 'first_party', bindingKind: 'internal_adapter',
+    })) }],
+  ])('rejects malformed configure payloads: %s', async (_case, payload) => {
+    const ownerEnv = envForRole(harness, 'owner')
+    await addonsApp.fetch(request('/marketing-cro-monitor/install', 'POST'), ownerEnv)
+
+    const res = await addonsApp.fetch(
+      request('/marketing-cro-monitor/configure', 'POST', { body: JSON.stringify(payload) }),
+      ownerEnv,
+    )
+
+    expect(res.status).toBe(400)
+    await expect(res.json()).resolves.toEqual({ error: 'invalid_body' })
+  })
+
+  it('returns a stable preflight error for missing required bindings', async () => {
+    const ownerEnv = envForRole(harness, 'owner')
+    await addonsApp.fetch(request('/marketing-cro-monitor/install', 'POST'), ownerEnv)
+
+    const res = await addonsApp.fetch(
+      request('/marketing-cro-monitor/configure', 'POST', { body: '{"bindings":[]}' }),
+      ownerEnv,
+    )
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toEqual({ error: 'missing_required_slot', state: 'installed' })
   })
 
   it('rejects lifecycle payloads over 8 KiB by declared and actual UTF-8 length', async () => {

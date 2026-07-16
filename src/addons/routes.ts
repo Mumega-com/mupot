@@ -6,6 +6,7 @@ import { requireAuth } from '../auth'
 import { resolveOrgAdmin } from '../auth/member-bearer'
 import './modules'
 import { getRegisteredAddon, listRegisteredAddons } from './registry'
+import type { AddonBindingInput } from './bindings'
 import {
   activateAddon,
   archiveAddon,
@@ -86,7 +87,7 @@ function redactedReceipt(receipt: AddonReceipt) {
   }
 }
 
-async function readEmptyBody(c: { req: { header(name: string): string | undefined; text(): Promise<string> } }) {
+async function readBoundedBody(c: { req: { header(name: string): string | undefined; text(): Promise<string> } }) {
   const declaredLength = Number(c.req.header('content-length') ?? '0')
   if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) return { ok: false as const, status: 413 as const }
 
@@ -97,7 +98,56 @@ async function readEmptyBody(c: { req: { header(name: string): string | undefine
     return { ok: false as const, status: 400 as const }
   }
   if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) return { ok: false as const, status: 413 as const }
-  return raw.length === 0 ? { ok: true as const } : { ok: false as const, status: 400 as const }
+  return { ok: true as const, raw }
+}
+
+function parseConfigureBody(
+  raw: string,
+  maximumBindings: number,
+): { ok: true; bindings: AddonBindingInput[] } | { ok: false } {
+  if (raw.length === 0) return { ok: true, bindings: [] }
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return { ok: false }
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false }
+  const body = value as Record<string, unknown>
+  if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'bindings') || !Array.isArray(body.bindings)) {
+    return { ok: false }
+  }
+  if (body.bindings.length > Math.min(maximumBindings, 16)) return { ok: false }
+
+  const bindings: AddonBindingInput[] = []
+  const slots = new Set<string>()
+  for (const value of body.bindings) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false }
+    const binding = value as Record<string, unknown>
+    const keys = Object.keys(binding)
+    if (keys.some((key) => !['slot', 'adapter', 'bindingKind', 'connectorId'].includes(key))) return { ok: false }
+    if (
+      typeof binding.slot !== 'string'
+      || binding.slot.length === 0
+      || typeof binding.adapter !== 'string'
+      || binding.adapter.length === 0
+      || (binding.bindingKind !== 'internal_adapter' && binding.bindingKind !== 'vault_connector')
+      || (Object.hasOwn(binding, 'connectorId') && (
+        typeof binding.connectorId !== 'string' || binding.connectorId.length === 0
+      ))
+      || slots.has(binding.slot)
+    ) {
+      return { ok: false }
+    }
+    slots.add(binding.slot)
+    bindings.push({
+      slot: binding.slot,
+      adapter: binding.adapter,
+      bindingKind: binding.bindingKind,
+      ...(typeof binding.connectorId === 'string' ? { connectorId: binding.connectorId } : {}),
+    })
+  }
+  return { ok: true, bindings }
 }
 
 function mutationError(result: Extract<AddonMutationResult, { ok: false }>) {
@@ -108,6 +158,13 @@ function mutationError(result: Extract<AddonMutationResult, { ok: false }>) {
       return { status: 403 as const, body: { error: 'forbidden', detail: 'owner/admin only' } }
     case 'invalid_state':
     case 'manifest_digest_drift':
+    case 'missing_required_slot':
+    case 'unknown_slot':
+    case 'adapter_not_allowed':
+    case 'binding_kind_mismatch':
+    case 'connector_not_available':
+    case 'adapter_type_mismatch':
+    case 'capability_mismatch':
     case 'operation_busy':
     case 'fence_lost':
       return { status: 409 as const, body: { error: result.reason, state: result.state ?? null } }
@@ -120,23 +177,34 @@ async function mutate(c: Context<AppEnv>, action: LifecycleAction) {
   const auth = c.get('auth')
   if (!isAdminPlus(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
 
-  const body = await readEmptyBody(c)
-  if (!body.ok) return c.json({ error: body.status === 413 ? 'payload_too_large' : 'invalid_body' }, body.status)
-
   const key = c.req.param('key')
   if (!key) return c.json({ error: 'addon_not_registered' }, 404)
+  const entry = getRegisteredAddon(key)
+  if (!entry) return c.json({ error: 'addon_not_registered' }, 404)
+
+  const body = await readBoundedBody(c)
+  if (!body.ok) return c.json({ error: body.status === 413 ? 'payload_too_large' : 'invalid_body' }, body.status)
+  let configureInput: { bindings: AddonBindingInput[] } | undefined
+  if (action === 'configure') {
+    const parsed = parseConfigureBody(body.raw, entry.manifest.connectorRequirements.length)
+    if (!parsed.ok) return c.json({ error: 'invalid_body' }, 400)
+    configureInput = { bindings: parsed.bindings }
+  } else if (body.raw.length !== 0) {
+    return c.json({ error: 'invalid_body' }, 400)
+  }
+
   const actor = { id: auth.userId, role: auth.role }
-  const execute = {
-    install: installAddon,
-    configure: configureAddon,
-    activate: activateAddon,
-    disable: disableAddon,
-    archive: archiveAddon,
-  }[action]
 
   let result: AddonMutationResult
   try {
-    result = await execute(c.env, actor, key)
+    result = action === 'configure'
+      ? await configureAddon(c.env, actor, key, configureInput)
+      : await {
+          install: installAddon,
+          activate: activateAddon,
+          disable: disableAddon,
+          archive: archiveAddon,
+        }[action](c.env, actor, key)
   } catch {
     return c.json({ error: 'write_failed' }, 500)
   }

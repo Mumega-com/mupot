@@ -10,6 +10,13 @@ import {
   getRegisteredAddon,
   type AddonCatalogEntry,
 } from './registry'
+import {
+  addonBindingConfigurationMatches,
+  configureAddonBindings,
+  preflightAddonBindings,
+  type AddonBindingFailureReason,
+  type AddonBindingInput,
+} from './bindings'
 
 export type AddonState = 'installed' | 'configured' | 'active' | 'disabled' | 'archived'
 
@@ -97,6 +104,7 @@ export type AddonFailureReason =
   | 'not_authorized'
   | 'operation_busy'
   | 'fence_lost'
+  | AddonBindingFailureReason
 
 export type AddonMutationResult =
   | { ok: true; state: AddonState; installation: AddonInstallation; created: true; idempotent?: never }
@@ -304,9 +312,8 @@ function authorized(actor: AddonActor): boolean {
   return actor.role === 'owner' || actor.role === 'admin'
 }
 
-function isZeroAuthority(entry: AddonCatalogEntry): boolean {
-  return entry.manifest.connectorRequirements.length === 0
-    && entry.manifest.authorityRequests.rankGrants.length === 0
+function hasNoAuthorityGrants(entry: AddonCatalogEntry): boolean {
+  return entry.manifest.authorityRequests.rankGrants.length === 0
     && entry.manifest.authorityRequests.surfaceGrants.length === 0
 }
 
@@ -2025,6 +2032,7 @@ export async function getDepartmentStateSha256(env: Env): Promise<string> {
 }
 
 const ADDON_INTERNAL_TABLES = new Set([
+  'addon_connector_bindings',
   'addon_installations',
   'addon_operation_failures',
   'addon_operations',
@@ -2259,7 +2267,16 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
   }
 }
 
-export async function configureAddon(env: Env, actor: AddonActor, key: string): Promise<AddonMutationResult> {
+export interface AddonConfigureInput {
+  bindings?: AddonBindingInput[]
+}
+
+export async function configureAddon(
+  env: Env,
+  actor: AddonActor,
+  key: string,
+  input: AddonConfigureInput = {},
+): Promise<AddonMutationResult> {
   if (!authorized(actor)) return { ok: false, reason: 'not_authorized' }
 
   const entry = getRegisteredAddon(key)
@@ -2275,67 +2292,127 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
   if (!matchesRegisteredIdentity(existing, entry)) {
     return { ok: false, reason: 'manifest_digest_drift' }
   }
-  if (existing.state === 'configured') {
-    return { ok: true, state: existing.state, installation: existing, idempotent: true }
-  }
-  if (existing.state !== 'installed' || !isZeroAuthority(entry)) {
+  if (!hasNoAuthorityGrants(entry) || !['installed', 'configured', 'disabled'].includes(existing.state)) {
     return { ok: false, reason: 'invalid_state', state: existing.state }
   }
 
+  const requestedBindings = input.bindings ?? []
   const receiptId = crypto.randomUUID()
   const configuredAt = new Date().toISOString()
-  const checks = JSON.stringify({ connectorRequirements: 'empty', authorityRequests: 'empty' })
+  const firstConfiguration = existing.state === 'installed'
+  const checks = JSON.stringify({
+    authorityRequests: 'empty',
+    connectorRequirements: 'preflight_passed',
+    bindingCount: requestedBindings.length,
+  })
+  const lifecycleStatements = firstConfiguration
+    ? [
+        env.DB.prepare(`
+          UPDATE addon_installations
+             SET state = 'configured', configured_at = ?1, updated_at = ?1,
+                 latest_previous_state = 'installed',
+                 latest_actor_id = ?2, latest_receipt_id = ?3, last_error = NULL
+           WHERE id = ?4 AND tenant = ?5 AND addon_key = ?6
+             AND state = 'installed' AND manifest_sha256 = ?7 AND latest_receipt_id = ?8
+        `).bind(
+          configuredAt,
+          actor.id,
+          receiptId,
+          existing.id,
+          env.TENANT_SLUG,
+          key,
+          entry.manifestSha256,
+          existing.latestReceiptId,
+        ),
+        env.DB.prepare(`
+          INSERT INTO addon_receipts (
+            id, tenant, installation_id, action, previous_state, next_state,
+            addon_key, installed_version, publisher, trust_class,
+            mupot_compatibility, manifest_sha256, actor_id, outcome,
+            side_effect_ids, checks, created_at
+          ) VALUES (
+            ?1, ?2, ?3, 'configure', 'installed', 'configured',
+            ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pass', '[]', ?11, ?12
+          )
+        `).bind(
+          receiptId,
+          env.TENANT_SLUG,
+          existing.id,
+          existing.addonKey,
+          existing.installedVersion,
+          existing.publisher,
+          existing.trustClass,
+          existing.mupotCompatibility,
+          existing.manifestSha256,
+          actor.id,
+          checks,
+          configuredAt,
+        ),
+        env.DB.prepare(`
+          SELECT ${INSTALLATION_COLUMNS}
+            FROM addon_installations
+           WHERE id = ?1 AND tenant = ?2
+             AND state = 'configured' AND latest_previous_state = 'installed'
+             AND latest_actor_id = ?3 AND latest_receipt_id = ?4
+           LIMIT 1
+        `).bind(existing.id, env.TENANT_SLUG, actor.id, receiptId),
+      ]
+    : [
+        env.DB.prepare(`
+          INSERT INTO addon_receipts (
+            id, tenant, installation_id, action, previous_state, next_state,
+            addon_key, installed_version, publisher, trust_class,
+            mupot_compatibility, manifest_sha256, actor_id, outcome,
+            side_effect_ids, checks, created_at
+          ) VALUES (
+            ?1, ?2, ?3, 'preflight', NULL, NULL,
+            ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pass', '[]', ?11, ?12
+          )
+        `).bind(
+          receiptId,
+          env.TENANT_SLUG,
+          existing.id,
+          existing.addonKey,
+          existing.installedVersion,
+          existing.publisher,
+          existing.trustClass,
+          existing.mupotCompatibility,
+          existing.manifestSha256,
+          actor.id,
+          checks,
+          configuredAt,
+        ),
+      ]
 
   try {
-    const results = await env.DB.batch<InstallationRow>([
-      env.DB.prepare(`
-        UPDATE addon_installations
-           SET state = 'configured', configured_at = ?1, updated_at = ?1,
-               latest_previous_state = 'installed',
-               latest_actor_id = ?2, latest_receipt_id = ?3, last_error = NULL
-         WHERE id = ?4 AND tenant = ?5 AND addon_key = ?6
-           AND state = 'installed' AND manifest_sha256 = ?7
-      `).bind(configuredAt, actor.id, receiptId, existing.id, env.TENANT_SLUG, key, entry.manifestSha256),
-      env.DB.prepare(`
-        INSERT INTO addon_receipts (
-          id, tenant, installation_id, action, previous_state, next_state,
-          addon_key, installed_version, publisher, trust_class,
-          mupot_compatibility, manifest_sha256, actor_id, outcome,
-          side_effect_ids, checks, created_at
-        )
-        VALUES (
-          ?1, ?2, ?3, 'configure', 'installed', 'configured',
-          ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pass', '[]', ?11, ?12
-        )
-      `).bind(
-        receiptId,
-        env.TENANT_SLUG,
-        existing.id,
-        existing.addonKey,
-        existing.installedVersion,
-        existing.publisher,
-        existing.trustClass,
-        existing.mupotCompatibility,
-        existing.manifestSha256,
-        actor.id,
-        checks,
-        configuredAt,
-      ),
-      env.DB.prepare(`
-        SELECT ${INSTALLATION_COLUMNS}
-          FROM addon_installations
-         WHERE id = ?1 AND tenant = ?2
-           AND state = 'configured' AND latest_previous_state = 'installed'
-           AND latest_actor_id = ?3 AND latest_receipt_id = ?4
-         LIMIT 1
-      `).bind(existing.id, env.TENANT_SLUG, actor.id, receiptId),
-    ])
+    const configuredBindings = await configureAddonBindings(
+      env,
+      existing,
+      entry.manifest,
+      actor.id,
+      requestedBindings,
+      lifecycleStatements,
+      firstConfiguration,
+    )
+    if (!configuredBindings.ok) {
+      return { ok: false, reason: configuredBindings.reason, state: existing.state }
+    }
+    if (!configuredBindings.changed && !firstConfiguration) {
+      return { ok: true, state: existing.state, installation: existing, idempotent: true }
+    }
 
-    if (written(results[0]) && written(results[1])) {
-      const configured = selectedInstallation(results[2])
+    const offset = configuredBindings.bindingStatementCount
+    if (firstConfiguration) {
+      if (!written(configuredBindings.results[offset]) || !written(configuredBindings.results[offset + 1])) {
+        return { ok: false, reason: 'write_failed' }
+      }
+      const configured = selectedInstallation(configuredBindings.results[offset + 2] as { success: boolean; results?: InstallationRow[] })
       return configured
         ? { ok: true, state: configured.state, installation: configured }
         : { ok: false, reason: 'write_failed' }
+    }
+    if (written(configuredBindings.results[offset])) {
+      return { ok: true, state: existing.state, installation: existing }
     }
   } catch {
     const current = await loadInstallationById(env, existing.id)
@@ -2344,8 +2421,20 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
       return { ok: false, reason: 'manifest_digest_drift' }
     }
     if (current.state === 'installed') return { ok: false, reason: 'write_failed' }
-    if (current.state === 'configured') {
-      return { ok: true, state: current.state, installation: current, idempotent: true }
+    if (current.state === 'configured' || current.state === 'disabled') {
+      try {
+        const raced = await addonBindingConfigurationMatches(
+          env,
+          current,
+          entry.manifest,
+          requestedBindings,
+        )
+        if (raced.ok && raced.matches) {
+          return { ok: true, state: current.state, installation: current, idempotent: true }
+        }
+      } catch {
+        return { ok: false, reason: 'write_failed' }
+      }
     }
     return { ok: false, reason: 'invalid_state', state: current.state }
   }
@@ -2355,8 +2444,15 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
   if (!matchesRegisteredIdentity(current, entry)) {
     return { ok: false, reason: 'manifest_digest_drift' }
   }
-  if (current.state === 'configured') {
-    return { ok: true, state: current.state, installation: current, idempotent: true }
+  if (current.state === 'configured' || current.state === 'disabled') {
+    try {
+      const raced = await addonBindingConfigurationMatches(env, current, entry.manifest, requestedBindings)
+      if (raced.ok && raced.matches) {
+        return { ok: true, state: current.state, installation: current, idempotent: true }
+      }
+    } catch {
+      return { ok: false, reason: 'write_failed' }
+    }
   }
   return { ok: false, reason: 'invalid_state', state: current.state }
 }
@@ -2375,6 +2471,18 @@ export async function activateAddon(
   } catch {
     return { ok: false, reason: 'invalid_state', state: existing.state }
   }
+  if (!hasNoAuthorityGrants(entry)) {
+    return { ok: false, reason: 'invalid_state', state: existing.state }
+  }
+  let bindingPreflight: Awaited<ReturnType<typeof preflightAddonBindings>>
+  try {
+    bindingPreflight = await preflightAddonBindings(env, existing, entry.manifest)
+  } catch {
+    return { ok: false, reason: 'write_failed' }
+  }
+  if (!bindingPreflight.ok) {
+    return { ok: false, reason: bindingPreflight.reason, state: existing.state }
+  }
   if (existing.state === 'active') {
     try {
       await validateActiveDepartmentClaims(env, existing, entry)
@@ -2384,8 +2492,7 @@ export async function activateAddon(
     return { ok: true, state: existing.state, installation: existing, idempotent: true }
   }
   if (
-    (existing.state !== 'configured' && existing.state !== 'disabled')
-    || !isZeroAuthority(entry)
+    existing.state !== 'configured' && existing.state !== 'disabled'
   ) {
     return { ok: false, reason: 'invalid_state', state: existing.state }
   }
@@ -2455,7 +2562,8 @@ export async function activateAddon(
     const sideEffectIds = JSON.stringify(claims.map((claim) => claim.id))
     const checks = JSON.stringify({
       authorityRequests: 'empty',
-      connectorRequirements: 'empty',
+      connectorRequirements: 'preflight_passed',
+      bindingCount: bindingPreflight.bindings.length,
       departments: claims.map((claim) => ({
         claimId: claim.id,
         departmentId: claim.resource_id,
@@ -2923,6 +3031,11 @@ export async function archiveAddon(
     try {
       const results = await env.DB.batch<InstallationRow>([
         env.DB.prepare(`
+          UPDATE addon_connector_bindings
+             SET revoked_at = ?1
+           WHERE tenant = ?2 AND installation_id = ?3 AND revoked_at IS NULL
+        `).bind(archivedAt, env.TENANT_SLUG, existing.id),
+        env.DB.prepare(`
           UPDATE addon_installations
              SET state = 'archived', archived_at = ?1, updated_at = ?1,
                  latest_previous_state = 'disabled', latest_actor_id = ?2,
@@ -3061,7 +3174,7 @@ export async function archiveAddon(
         ),
       ])
 
-      if (written(results[0]) && written(results[1]) && written(results[2])) {
+      if (results[0].success && written(results[1]) && written(results[2]) && written(results[3])) {
         operation.current_step = 'completed'
         operation.status = 'completed'
         operation.lease_expires_at = transitionTiming.expiresAt
@@ -3069,7 +3182,7 @@ export async function archiveAddon(
         if (!await loadExactOperation(env, operation, 'completed', 'completed')) {
           throw new FenceLostError()
         }
-        const archived = selectedInstallation(results[3])
+        const archived = selectedInstallation(results[4])
         return archived
           ? { ok: true, state: archived.state, installation: archived }
           : { ok: false, reason: 'write_failed' }
