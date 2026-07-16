@@ -310,18 +310,44 @@ describe('addon lifecycle routes', () => {
       addons: Array<Record<string, unknown>>
     }
     expect(body.addons).toEqual([
-      expect.objectContaining({
+      {
         key: 'fixture-addon',
         name: 'Fixture Addon',
         version: '1.0.0',
+        publisher: 'mumega',
+        trustClass: 'native_reviewed',
+        kind: 'native',
+        description: 'Lifecycle fixture with no authority.',
         state: 'installed',
-      }),
+      },
+      {
+        key: 'marketing-cro-monitor',
+        name: 'Marketing & CRO Monitor',
+        version: '1.0.0',
+        publisher: 'mumega',
+        trustClass: 'native_reviewed',
+        kind: 'native',
+        description: 'Read-only marketing and conversion monitoring.',
+        state: null,
+      },
     ])
-    expect(body.addons[0]).not.toHaveProperty('manifest')
-    expect(body.addons[0]).not.toHaveProperty('manifestSha256')
-    expect(body.addons[0]).not.toHaveProperty('connectorRequirements')
-    expect(body.addons[0]).not.toHaveProperty('authorityRequests')
-    expect(body.addons[0]).not.toHaveProperty('installationId')
+    for (const addon of body.addons) {
+      expect(Object.keys(addon).sort()).toEqual([
+        'description',
+        'key',
+        'kind',
+        'name',
+        'publisher',
+        'state',
+        'trustClass',
+        'version',
+      ])
+      expect(addon).not.toHaveProperty('manifest')
+      expect(addon).not.toHaveProperty('manifestSha256')
+      expect(addon).not.toHaveProperty('connectorRequirements')
+      expect(addon).not.toHaveProperty('authorityRequests')
+      expect(addon).not.toHaveProperty('installationId')
+    }
   })
 
   it.each(['{}', '{"unexpected":true}'])('rejects non-empty lifecycle body %j', async (body) => {

@@ -54,9 +54,21 @@ describe('addon contract', () => {
   })
 
   it('registers the read-only marketing monitor manifest', () => {
+    expect(MarketingCroMonitorAddon.connectorRequirements.map((connector) => connector.slot)).toEqual([
+      'web_analytics',
+      'content_surface',
+      'search_performance',
+      'crm',
+      'ai_visibility',
+    ])
+    expect(MarketingCroMonitorAddon.connectorRequirements).not.toHaveLength(0)
+    expect(MarketingCroMonitorAddon.connectorRequirements.every((connector) => connector.capability === 'read')).toBe(true)
     expect(MarketingCroMonitorAddon.connectorRequirements).toEqual(expect.arrayContaining([
-      expect.objectContaining({ slot: 'web_analytics', capability: 'read', required: true }),
-      expect.objectContaining({ slot: 'content_surface', capability: 'read', required: false }),
+      expect.objectContaining({ slot: 'web_analytics', required: true }),
+      expect.objectContaining({ slot: 'content_surface', required: false }),
+      expect.objectContaining({ slot: 'search_performance', required: false }),
+      expect.objectContaining({ slot: 'crm', required: false }),
+      expect.objectContaining({ slot: 'ai_visibility', required: false }),
     ]))
     expect(MarketingCroMonitorAddon.authorityRequests).toEqual({ rankGrants: [], surfaceGrants: [] })
     expect(Object.isFrozen(MarketingCroMonitorAddon)).toBe(true)

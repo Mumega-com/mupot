@@ -112,3 +112,54 @@ Passed: `tsc --noEmit` exited successfully.
 ### Follow-Up Commit
 
 `fix(addons): harden task 1 renderer registration`
+
+## Review Follow-Up (July 16, 2026, Task 1 remaining findings)
+
+Closed the remaining Task 1 review findings in the scoped files only:
+
+- `tests/addon-routes.test.ts` now asserts both public catalog entries
+  (`fixture-addon` and `marketing-cro-monitor`) and verifies the route still
+  redacts manifest internals from every addon card payload.
+- `tests/addon-contract.test.ts` now asserts every
+  `MarketingCroMonitorAddon.connectorRequirements` entry keeps capability exactly
+  `read`, while still pinning the expected connector slots and required flags.
+
+### RED Evidence
+
+Used the existing failing route regression as the RED proof and ran:
+
+```text
+npx vitest run tests/addon-routes.test.ts
+```
+
+The command failed for the intended reason:
+
+- `tests/addon-routes.test.ts`: the catalog assertion expected only
+  `fixture-addon`, but the production-safe catalog correctly returned both
+  `fixture-addon` and `marketing-cro-monitor`.
+
+### GREEN Evidence
+
+After updating the scoped tests, ran:
+
+```text
+npx vitest run tests/addon-routes.test.ts tests/addon-service.test.ts tests/dashboard-addons.test.ts tests/addon-registry.test.ts tests/addon-contract.test.ts tests/addon-console-registry.test.ts
+```
+
+Passed: 6 test files, 192 tests.
+
+```text
+npm run typecheck
+```
+
+Passed: `tsc --noEmit` exited successfully.
+
+### Files Changed
+
+- `tests/addon-routes.test.ts`
+- `tests/addon-contract.test.ts`
+- `.superpowers/sdd/task-1-report.md`
+
+### Concerns
+
+None.
