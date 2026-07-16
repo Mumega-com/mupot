@@ -791,16 +791,28 @@ async function countOtherActiveClaims(
 
 async function countActiveClaimsForDepartment(
   env: Env,
+  moduleKey: string,
   departmentId: string,
   excludedInstallationId: string | null = null,
 ): Promise<number> {
   const row = await env.DB.prepare(`
     SELECT COUNT(*) AS count
-      FROM addon_resource_ownership
-     WHERE tenant = ?1 AND resource_type = 'department'
-       AND resource_id = ?2 AND active = 1
-       AND (?3 IS NULL OR installation_id <> ?3)
-  `).bind(env.TENANT_SLUG, departmentId, excludedInstallationId).first<{ count: number }>()
+      FROM addon_resource_ownership AS claim
+     WHERE claim.tenant = ?1 AND claim.resource_type = 'department'
+       AND claim.resource_key = ?2 AND claim.resource_id = ?3
+       AND claim.ownership_mode = 'co_owner' AND claim.active = 1
+       AND (?4 IS NULL OR claim.installation_id <> ?4)
+       AND EXISTS (
+         SELECT 1 FROM addon_installations AS installation
+          WHERE installation.id = claim.installation_id
+            AND installation.tenant = claim.tenant
+       )
+  `).bind(
+    env.TENANT_SLUG,
+    moduleKey,
+    departmentId,
+    excludedInstallationId,
+  ).first<{ count: number }>()
   return Number(row?.count ?? 0)
 }
 
@@ -943,6 +955,32 @@ async function validateDisabledDepartmentClaims(
     throw new Error('active addon ownership remains after disable')
   }
   await validateDepartmentClaimSet(env, installation, entry, claims, true, null)
+  for (const claim of claims) {
+    const activeClaims = await countActiveClaimsForDepartment(
+      env,
+      claim.resource_key,
+      claim.resource_id,
+    )
+    await loadCanonicalDepartment(
+      env,
+      claim.resource_key,
+      claim.resource_id,
+      activeClaims > 0 ? 1 : 0,
+    )
+  }
+  return claims
+}
+
+async function loadStructurallyValidDisabledDepartmentClaims(
+  env: Env,
+  installation: AddonInstallation,
+  entry: AddonCatalogEntry,
+): Promise<OwnershipRow[]> {
+  const claims = await loadDepartmentClaims(env, installation.id)
+  if (claims.some((claim) => claim.active === 1)) {
+    throw new Error('active addon ownership remains after disable')
+  }
+  await validateDepartmentClaimSet(env, installation, entry, claims, true, null)
   return claims
 }
 
@@ -1008,19 +1046,27 @@ async function reconcileDepartmentForOwnership(
 ): Promise<void> {
   let shouldBeActive = await countActiveClaimsForDepartment(
     env,
+    moduleKey,
     departmentId,
     options.excludedInstallationId ?? null,
   ) > 0
 
+  let lastRegistryError: Error | null = null
   for (let attempt = 0; attempt < MAX_DEPARTMENT_RECONCILIATION_ATTEMPTS; attempt += 1) {
-    if (shouldBeActive) {
-      await activateCanonicalDepartment(env, moduleKey, departmentId)
-    } else {
-      const result = await deactivateDepartment(env.DB, moduleKey)
-      if (!result.ok && result.reason !== 'not_found') {
-        throw new Error(`department deactivation failed: ${result.reason}`)
+    try {
+      if (shouldBeActive) {
+        await activateCanonicalDepartment(env, moduleKey, departmentId)
+      } else {
+        const result = await deactivateDepartment(env.DB, moduleKey)
+        if (!result.ok && result.reason !== 'not_found') {
+          throw new Error(`department deactivation failed: ${result.reason}`)
+        }
+        await loadCanonicalDepartment(env, moduleKey, departmentId, 0)
       }
-      await loadCanonicalDepartment(env, moduleKey, departmentId, 0)
+      lastRegistryError = null
+    } catch (error) {
+      lastRegistryError = error instanceof Error ? error : new Error(String(error))
+      continue
     }
 
     if (options.operation && options.expectedStates) {
@@ -1036,6 +1082,7 @@ async function reconcileDepartmentForOwnership(
 
     const activeClaims = await countActiveClaimsForDepartment(
       env,
+      moduleKey,
       departmentId,
       options.excludedInstallationId ?? null,
     )
@@ -1044,6 +1091,7 @@ async function reconcileDepartmentForOwnership(
     if (department.active === (shouldBeActive ? 1 : 0)) return
   }
 
+  if (lastRegistryError) throw lastRegistryError
   throw new Error('addon department ownership did not stabilize')
 }
 
@@ -1052,11 +1100,28 @@ async function compensateDepartmentForOwnership(
   moduleKey: string,
   departmentId: string,
 ): Promise<void> {
-  try {
-    await reconcileDepartmentForOwnership(env, moduleKey, departmentId)
-  } catch {
-    // The caller still fails closed with fence_lost; retries reconcile authoritative state.
+  await reconcileDepartmentForOwnership(env, moduleKey, departmentId)
+}
+
+async function repairAndValidateDisabledDepartmentClaims(
+  env: Env,
+  installation: AddonInstallation,
+  entry: AddonCatalogEntry,
+  options: {
+    operation?: OperationRow
+    expectedStates?: readonly [AddonState, AddonState]
+  } = {},
+): Promise<OwnershipRow[]> {
+  const claims = await loadStructurallyValidDisabledDepartmentClaims(env, installation, entry)
+  for (const claim of claims) {
+    await reconcileDepartmentForOwnership(
+      env,
+      claim.resource_key,
+      claim.resource_id,
+      options,
+    )
   }
+  return validateDisabledDepartmentClaims(env, installation, entry)
 }
 
 async function renewAfterRegistryCall(
@@ -1775,7 +1840,7 @@ export async function disableAddon(
       if (!evidence) {
         return { ok: false, reason: 'fence_lost' }
       }
-      await validateDisabledDepartmentClaims(env, existing, entry)
+      await repairAndValidateDisabledDepartmentClaims(env, existing, entry)
       const confirmedEvidence = await loadCompletedDisableOperationEvidence(env, existing)
       if (!confirmedEvidence || confirmedEvidence.id !== evidence.id) {
         return { ok: false, reason: 'fence_lost' }
@@ -1977,18 +2042,10 @@ export async function disableAddon(
       )
     }
 
-    const retainedClaims = await validateDisabledDepartmentClaims(env, existing, entry)
-    for (const claim of retainedClaims) {
-      await reconcileDepartmentForOwnership(
-        env,
-        claim.resource_key,
-        claim.resource_id,
-        {
-          operation,
-          expectedStates: ['disabled', 'disabled'],
-        },
-      )
-    }
+    await repairAndValidateDisabledDepartmentClaims(env, existing, entry, {
+      operation,
+      expectedStates: ['disabled', 'disabled'],
+    })
 
     await deps.beforeOperationCompleted?.({
       installationId: existing.id,
@@ -2006,7 +2063,9 @@ export async function disableAddon(
     }
     const evidence = await loadCompletedDisableOperationEvidence(env, completedInstallation)
     if (!evidence || evidence.id !== completedOperation.id) throw new FenceLostError()
-    await validateDisabledDepartmentClaims(env, completedInstallation, entry)
+    await repairAndValidateDisabledDepartmentClaims(env, completedInstallation, entry)
+    const confirmedEvidence = await loadCompletedDisableOperationEvidence(env, completedInstallation)
+    if (!confirmedEvidence || confirmedEvidence.id !== completedOperation.id) throw new FenceLostError()
 
     return { ok: true, state: completedInstallation.state, installation: completedInstallation }
   } catch (error) {
@@ -2030,19 +2089,23 @@ export async function archiveAddon(
   if (running && (running.action !== 'archive' || running.target_state !== 'archived')) {
     return { ok: false, reason: 'operation_busy', state: existing.state }
   }
+  let disableEvidence: OperationRow | null = null
+  let retainedClaims: OwnershipRow[] = []
   try {
     const evidence = await loadCompletedDisableOperationEvidence(env, existing)
     if (!evidence) {
       return { ok: false, reason: 'fence_lost' }
     }
-    await validateDisabledDepartmentClaims(env, existing, entry)
+    retainedClaims = await repairAndValidateDisabledDepartmentClaims(env, existing, entry)
     const confirmedEvidence = await loadCompletedDisableOperationEvidence(env, existing)
     if (!confirmedEvidence || confirmedEvidence.id !== evidence.id) {
       return { ok: false, reason: 'fence_lost' }
     }
+    disableEvidence = confirmedEvidence
   } catch {
     return { ok: false, reason: 'write_failed' }
   }
+  if (!disableEvidence) return { ok: false, reason: 'fence_lost' }
 
   try {
     const acquired = await acquireOperation(
@@ -2090,6 +2153,70 @@ export async function archiveAddon(
                   AND operation.status = 'running' AND operation.actor_id = ?10
                   AND operation.lease_token = ?11 AND operation.lease_expires_at > ?12
              )
+             AND EXISTS (
+               SELECT 1 FROM addon_operations AS disable_operation
+                WHERE disable_operation.id = ?13
+                  AND disable_operation.tenant = addon_installations.tenant
+                  AND disable_operation.installation_id = addon_installations.id
+                  AND disable_operation.action = 'disable'
+                  AND disable_operation.target_state = 'disabled'
+                  AND disable_operation.current_step = 'completed'
+                  AND disable_operation.status = 'completed'
+                  AND disable_operation.actor_id = ?14
+                  AND disable_operation.lease_token = ?15
+                  AND disable_operation.lease_expires_at = ?16
+                  AND disable_operation.created_at = ?17
+                  AND disable_operation.updated_at = ?18
+             )
+             AND EXISTS (
+               SELECT 1 FROM addon_receipts AS disable_receipt
+                WHERE disable_receipt.id = addon_installations.latest_receipt_id
+                  AND disable_receipt.tenant = addon_installations.tenant
+                  AND disable_receipt.installation_id = addon_installations.id
+                  AND disable_receipt.action = 'disable'
+                  AND disable_receipt.previous_state = 'active'
+                  AND disable_receipt.next_state = 'disabled'
+                  AND disable_receipt.actor_id = ?14
+                  AND disable_receipt.outcome = 'pass'
+                  AND json_extract(disable_receipt.checks, '$.operationId') = ?13
+             )
+             AND (
+               SELECT COUNT(*) FROM addon_resource_ownership AS claim
+                WHERE claim.tenant = addon_installations.tenant
+                  AND claim.installation_id = addon_installations.id
+             ) = ?19
+             AND NOT EXISTS (
+               SELECT 1 FROM addon_resource_ownership AS claim
+                WHERE claim.tenant = addon_installations.tenant
+                  AND claim.installation_id = addon_installations.id
+                  AND (
+                    claim.active <> 0
+                    OR NOT EXISTS (
+                      SELECT 1 FROM json_each(?20) AS expected
+                       WHERE json_extract(expected.value, '$.id') = claim.id
+                         AND json_extract(expected.value, '$.tenant') = claim.tenant
+                         AND json_extract(expected.value, '$.installationId') = claim.installation_id
+                         AND json_extract(expected.value, '$.resourceType') = claim.resource_type
+                         AND json_extract(expected.value, '$.resourceId') = claim.resource_id
+                         AND json_extract(expected.value, '$.resourceKey') = claim.resource_key
+                         AND json_extract(expected.value, '$.ownershipMode') = claim.ownership_mode
+                    )
+                  )
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM json_each(?20) AS expected
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM addon_resource_ownership AS claim
+                   WHERE claim.id = json_extract(expected.value, '$.id')
+                     AND claim.tenant = json_extract(expected.value, '$.tenant')
+                     AND claim.installation_id = json_extract(expected.value, '$.installationId')
+                     AND claim.resource_type = json_extract(expected.value, '$.resourceType')
+                     AND claim.resource_id = json_extract(expected.value, '$.resourceId')
+                     AND claim.resource_key = json_extract(expected.value, '$.resourceKey')
+                     AND claim.ownership_mode = json_extract(expected.value, '$.ownershipMode')
+                     AND claim.active = 0
+                )
+             )
              AND NOT EXISTS (
                SELECT 1 FROM addon_resource_ownership AS claim
                 WHERE claim.tenant = addon_installations.tenant
@@ -2109,6 +2236,14 @@ export async function archiveAddon(
           operation.actor_id,
           operation.lease_token,
           archivedAt,
+          disableEvidence.id,
+          disableEvidence.actor_id,
+          disableEvidence.lease_token,
+          disableEvidence.lease_expires_at,
+          disableEvidence.created_at,
+          disableEvidence.updated_at,
+          retainedClaims.length,
+          serializedClaimIdentities(retainedClaims),
         ),
         transitionReceiptStatement(env, existing, operation, {
           id: receiptId,
