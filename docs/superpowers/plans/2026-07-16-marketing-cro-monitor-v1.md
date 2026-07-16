@@ -270,7 +270,7 @@ export type OutcomeValue =
   | { status: 'unavailable'; reason: string }
 ```
 
-Cap each source at 200 observations before validation. Accept only declared metric keys, finite values, non-empty units/authorities, and ISO timestamps within the requested window. Run sources sequentially for stable evidence order. Return source statuses `available`, `unavailable`, or `failed` with stable non-secret reasons.
+Cap each source at 100 observations before validation and cap the collected run at 200 observations total across all sources. Reject source output beyond either boundary rather than silently truncating evidence. Accept only declared metric keys, finite values, non-empty units/authorities, and ISO timestamps within the requested window. Run sources sequentially for stable evidence order. Return source statuses `available`, `unavailable`, or `failed` with stable non-secret reasons.
 
 - [ ] **Step 4: Add deterministic fixture evidence**
 
@@ -330,7 +330,7 @@ Create `marketing_monitor_runs`, `marketing_monitor_sources`, and `marketing_mon
 
 - [ ] **Step 4: Implement run persistence and redacted APIs**
 
-Use one D1 batch for the run, source statuses, observations, and final digest. APIs return normalized outcomes, stable source statuses, evidence IDs, and timestamps only. They never return connector IDs, connector metadata, upstream payloads, or secrets. POST requires owner/admin and an active installation; GET is owner/admin read-only.
+Use one bounded D1 batch for the run, source statuses, observations, and final digest. Insert bounded source and observation arrays through validated JSON-to-row statements instead of creating one prepared statement per observation. APIs return normalized outcomes, stable source statuses, evidence IDs, and timestamps only. They never return connector IDs, connector metadata, upstream payloads, or secrets. POST requires owner/admin and an active installation; GET is owner/admin read-only.
 
 - [ ] **Step 5: Run focused tests and typecheck**
 
