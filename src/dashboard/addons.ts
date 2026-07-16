@@ -13,7 +13,7 @@ interface LifecycleCommand {
   label: string
 }
 
-function latestInstallationByKey(installations: AddonInstallation[]): Map<string, AddonInstallation> {
+export function latestInstallationByKey(installations: AddonInstallation[]): Map<string, AddonInstallation> {
   const byKey = new Map<string, AddonInstallation>()
   for (const installation of installations) {
     const current = byKey.get(installation.addonKey)
@@ -78,6 +78,9 @@ export function addonsBody(entries: AddonCatalogEntry[], installations: AddonIns
     const digest = (installation?.manifestSha256 ?? entry.manifestSha256).slice(-12)
     const commands = commandsForState(state)
     const receiptsHref = `/api/addons/${encodeURIComponent(entry.manifest.key)}/receipts`
+    const consoleSection = installation && installation.state !== 'archived'
+      ? entry.manifest.consoleSections.find((section) => section.path === `/addons/${entry.manifest.key}`)
+      : undefined
 
     return html`
       <section class="addon-card" data-addon-card>
@@ -100,6 +103,12 @@ export function addonsBody(entries: AddonCatalogEntry[], installations: AddonIns
           <div class="addon-fact addon-fact-wide"><span>Requested</span><strong>${requestedSummary(entry)}</strong></div>
         </div>
         <div class="addon-actions">
+          ${consoleSection
+            ? html`<a class="addon-console" href="${consoleSection.path}">
+                <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
+                Open console
+              </a>`
+            : ''}
           <a class="addon-receipts" href="${receiptsHref}">Receipts</a>
           <div class="addon-command-list">
             ${commands.map((command) => html`<button class="btn secondary sm addon-command" type="button" data-addon-key="${entry.manifest.key}" data-addon-action="${command.action}">${command.label}</button>`)}
@@ -129,6 +138,8 @@ export function addonsBody(entries: AddonCatalogEntry[], installations: AddonIns
       .addon-fact-wide { grid-column: 1 / -1; }
       .addon-actions { min-height: 50px; display: flex; align-items: center; gap: 10px; padding: 8px 16px; border-top: 1px solid var(--border-soft); }
       .addon-receipts { font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+      .addon-console { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+      .addon-console svg { flex: none; }
       .addon-command-list { display: flex; gap: 8px; flex-wrap: wrap; }
       .addon-command { min-width: 92px; height: 32px; margin: 0; padding: 0 10px; }
       .addon-status { color: var(--dim); font-size: 12px; min-height: 18px; overflow-wrap: anywhere; }

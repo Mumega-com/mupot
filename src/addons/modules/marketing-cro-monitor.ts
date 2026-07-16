@@ -1,10 +1,15 @@
-import { html } from 'hono/html'
 import { AgencyModule } from '../../departments/modules/agency'
 import { GrowthModule } from '../../departments/modules/growth'
 import { WebOpsModule } from '../../departments/modules/web-ops'
+import {
+  loadMarketingCroMonitorView,
+  marketingCroMonitorBody,
+} from '../../dashboard/marketing-cro-monitor'
 import type { AddonManifestV1 } from '../contract'
 import { registerAddonConsoleRenderer } from '../console-registry'
 import { registerAddon } from '../registry'
+
+const DASHBOARD_READER = { id: 'addon-console', role: 'admin' as const }
 
 function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -55,7 +60,11 @@ registerAddonConsoleRenderer({
   path: '/addons/marketing-cro-monitor',
   title: 'Marketing & CRO',
   navIcon: 'chart-no-axes-combined',
-  render: async () => html`<p>Unavailable until configured</p>`,
+  render: async (env, installation) => {
+    if (!installation) throw new Error('addon_console_installation_required')
+    const view = await loadMarketingCroMonitorView(env, installation, DASHBOARD_READER)
+    return marketingCroMonitorBody(view)
+  },
 })
 
 await registerAddon(MarketingCroMonitorAddon)

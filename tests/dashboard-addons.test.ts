@@ -4,6 +4,7 @@ import { dashboardApp } from '../src/dashboard/index'
 import type { AddonCatalogEntry } from '../src/addons/registry'
 import type { AddonInstallation, AddonState } from '../src/addons/service'
 import { FixtureAddon } from '../src/addons/modules/fixture'
+import { MarketingCroMonitorAddon } from '../src/addons/modules/marketing-cro-monitor'
 import type { Env } from '../src/types'
 
 const fixtureEntry: AddonCatalogEntry = {
@@ -86,15 +87,51 @@ function lifecycleHarness(key = 'fixture-addon') {
   }
 }
 
-function dashboardEnv(role: 'owner' | 'admin' | 'member'): Env {
-  const statement = {
-    bind: (..._args: unknown[]) => statement,
-    all: async () => ({ results: [] }),
+function installationRow(value: AddonInstallation) {
+  return {
+    id: value.id,
+    tenant: value.tenant,
+    addon_key: value.addonKey,
+    installed_version: value.installedVersion,
+    publisher: value.publisher,
+    trust_class: value.trustClass,
+    manifest_sha256: value.manifestSha256,
+    mupot_compatibility: value.mupotCompatibility,
+    state: value.state,
+    latest_previous_state: value.latestPreviousState,
+    installed_by: value.installedBy,
+    latest_actor_id: value.latestActorId,
+    latest_receipt_id: value.latestReceiptId,
+    installed_at: value.installedAt,
+    configured_at: value.configuredAt,
+    activated_at: value.activatedAt,
+    disabled_at: value.disabledAt,
+    archived_at: value.archivedAt,
+    updated_at: value.updatedAt,
+    last_error: value.lastError,
+  }
+}
+
+function dashboardEnv(
+  role: 'owner' | 'admin' | 'member',
+  addonInstallations: AddonInstallation[] = [],
+): Env {
+  const prepare = (query: string) => {
+    const statement = {
+      bind: (..._args: unknown[]) => statement,
+      all: async () => ({
+        results: query.includes('FROM addon_installations')
+          ? addonInstallations.map(installationRow)
+          : [],
+      }),
+      first: async () => null,
+    }
+    return statement
   }
   return {
     TENANT_SLUG: 'tenant-a',
     BRAND: 'Test',
-    DB: { prepare: () => statement },
+    DB: { prepare, batch: async () => [] },
     SESSIONS: {
       get: async () => JSON.stringify({
         userId: `${role}-1`, email: `${role}@example.test`, role, createdAt: '2026-07-01T00:00:00.000Z',
@@ -125,6 +162,26 @@ describe('addonsBody', () => {
     expect(html).toContain('href="/api/addons/fixture-addon/receipts"')
     expect(html).not.toContain('Upgrade')
     expect(html).not.toContain('Delete data')
+  })
+
+  it('links a registered operational console only while its addon is installed', () => {
+    const entry: AddonCatalogEntry = {
+      manifest: MarketingCroMonitorAddon,
+      manifestSha256: 'a'.repeat(64),
+    }
+    const live = {
+      ...installation('configured'),
+      addonKey: MarketingCroMonitorAddon.key,
+      installedVersion: MarketingCroMonitorAddon.version,
+      publisher: MarketingCroMonitorAddon.publisher,
+      manifestSha256: entry.manifestSha256,
+      mupotCompatibility: MarketingCroMonitorAddon.mupotCompatibility,
+    }
+
+    expect(renderedEntry(entry)).not.toContain('href="/addons/marketing-cro-monitor"')
+    expect(renderedEntry(entry, [live])).toContain('href="/addons/marketing-cro-monitor"')
+    expect(renderedEntry(entry, [{ ...live, state: 'archived', archivedAt: live.updatedAt }]))
+      .not.toContain('href="/addons/marketing-cro-monitor"')
   })
 
   it.each([
@@ -299,5 +356,60 @@ describe('GET /addons', () => {
 
     expect(response.status).toBe(200)
     expect(html).toContain('id="nav-addons" hidden')
+  })
+})
+
+describe('GET /addons/:key', () => {
+  const marketingInstallation = (state: AddonState): AddonInstallation => ({
+    ...installation(state),
+    addonKey: MarketingCroMonitorAddon.key,
+    installedVersion: MarketingCroMonitorAddon.version,
+    publisher: MarketingCroMonitorAddon.publisher,
+    manifestSha256: 'c38dc3e120f7328d76d3051f695f0f43cb54c0b4600a1b4fdc0aecec73c59e42',
+    mupotCompatibility: MarketingCroMonitorAddon.mupotCompatibility,
+  })
+
+  it.each(['owner', 'admin'] as const)('renders an installed console for %s from its manifest renderer', async (role) => {
+    const registered = (await import('../src/addons/registry')).getRegisteredAddon(MarketingCroMonitorAddon.key)
+    const live = { ...marketingInstallation('configured'), manifestSha256: registered?.manifestSha256 ?? '' }
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/addons/marketing-cro-monitor', {
+        headers: { Cookie: 'mupot_session=session-1' },
+      }),
+      dashboardEnv(role, [live]),
+    )
+    const html = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(html).toContain('Marketing &amp; CRO')
+    expect(html).toContain('Source health')
+  })
+
+  it('blocks members before resolving or loading an addon renderer', async () => {
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/addons/marketing-cro-monitor', {
+        headers: { Cookie: 'mupot_session=session-1' },
+      }),
+      dashboardEnv('member', [marketingInstallation('active')]),
+    )
+
+    expect(response.status).toBe(403)
+    expect(await response.text()).toContain('Addon consoles require owner or admin.')
+  })
+
+  it.each([
+    ['not-registered', []],
+    ['marketing-cro-monitor', []],
+    ['marketing-cro-monitor', [marketingInstallation('archived')]],
+  ] as const)('fails closed for unknown, uninstalled, and archived addon state: %s', async (key, installations) => {
+    const response = await dashboardApp.fetch(
+      new Request(`https://pot.test/addons/${key}`, {
+        headers: { Cookie: 'mupot_session=session-1' },
+      }),
+      dashboardEnv('owner', [...installations]),
+    )
+
+    expect(response.status).toBe(404)
+    expect(await response.text()).toContain('Addon console not found.')
   })
 })

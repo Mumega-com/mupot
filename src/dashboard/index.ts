@@ -72,8 +72,9 @@ import { loadVerifications, verificationsBody } from './verifications'
 import { loadAudit, auditBody } from './audit'
 import { loadBilling, billingBody } from './billing'
 import { servicesBody } from './services'
-import { addonsBody } from './addons'
-import { listRegisteredAddons } from '../addons/registry'
+import { addonsBody, latestInstallationByKey } from './addons'
+import { getRegisteredAddon, listRegisteredAddons } from '../addons/registry'
+import { getAddonConsoleRenderer } from '../addons/console-registry'
 import { listAddonInstallations } from '../addons/service'
 import {
   pageHeader,
@@ -322,6 +323,50 @@ dashboardApp.get('/addons', async (c) => {
     return c.html(shell(c.env, 'Addons', addonsBody(listRegisteredAddons(), installations)))
   } catch {
     return c.html(shell(c.env, 'Addons', errorBody('Addon catalog is unavailable.')), 500)
+  }
+})
+
+dashboardApp.get('/addons/:key', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(shell(c.env, 'Addon console', errorBody('Addon consoles require owner or admin.')), 403)
+  }
+
+  const entry = getRegisteredAddon(c.req.param('key'))
+  if (!entry) {
+    return c.html(shell(c.env, 'Addon console', errorBody('Addon console not found.')), 404)
+  }
+
+  try {
+    const installation = latestInstallationByKey(await listAddonInstallations(c.env)).get(entry.manifest.key)
+    const section = entry.manifest.consoleSections.find((candidate) => candidate.path === c.req.path)
+    const renderer = section ? getAddonConsoleRenderer(section.rendererKey) : undefined
+    const liveState = installation?.state === 'installed'
+      || installation?.state === 'configured'
+      || installation?.state === 'active'
+      || installation?.state === 'disabled'
+    const identityMatches = installation
+      && installation.addonKey === entry.manifest.key
+      && installation.installedVersion === entry.manifest.version
+      && installation.publisher === entry.manifest.publisher
+      && installation.trustClass === entry.manifest.trustClass
+      && installation.mupotCompatibility === entry.manifest.mupotCompatibility
+      && installation.manifestSha256 === entry.manifestSha256
+    const rendererMatches = renderer
+      && section
+      && renderer.key === section.rendererKey
+      && renderer.path === section.path
+      && renderer.title === section.title
+      && renderer.navIcon === section.navIcon
+
+    if (!liveState || !identityMatches || !rendererMatches) {
+      return c.html(shell(c.env, 'Addon console', errorBody('Addon console not found.')), 404)
+    }
+
+    const body = await renderer.render(c.env, installation)
+    return c.html(shell(c.env, section.title, body))
+  } catch {
+    return c.html(shell(c.env, 'Addon console', errorBody('Addon console is unavailable.')), 500)
   }
 })
 
