@@ -70,6 +70,25 @@ const unavailableOutcomes = JSON.stringify({
   revenue: { status: 'unavailable', reason: 'authoritative_source_missing' },
 })
 
+async function canonicalEvidenceDigest(evidence: {
+  readonly programVersion: string
+  readonly window: unknown
+  readonly sources: unknown
+  readonly observations: unknown
+  readonly outcomes: unknown
+}): Promise<string> {
+  const canonical = JSON.stringify({
+    schema: 'mupot.marketing-monitor-evidence/v1',
+    programVersion: evidence.programVersion,
+    window: evidence.window,
+    sources: evidence.sources,
+    observations: evidence.observations,
+    outcomes: evidence.outcomes,
+  })
+  const bytes = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical)))
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
 function directRunValues(harness: SqliteD1Harness, overrides: Partial<Record<string, unknown>> = {}) {
   const installation = harness.sqlite.prepare(`
     SELECT id, tenant, addon_key, installed_version, publisher, trust_class,
@@ -509,6 +528,100 @@ describe('marketing monitor service', () => {
     expect(created.ok).toBe(true)
     harness.sqlite.exec('DROP TRIGGER marketing_monitor_runs_finalize_only; PRAGMA ignore_check_constraints = ON;')
     harness.sqlite.prepare(`UPDATE marketing_monitor_runs SET outcomes_json = '{bad'`).run()
+
+    expect(await getLatestMarketingMonitorRun(env, owner)).toEqual({ ok: false, reason: 'stored_run_invalid' })
+    expect(await listMarketingMonitorRuns(env, owner, { limit: 10 })).toEqual({ ok: false, reason: 'stored_run_invalid' })
+  })
+
+  it('fails closed on semantically fabricated outcomes even with a matching evidence digest', async () => {
+    await activateMarketing(env)
+    const created = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    const outcomes = {
+      ...created.run.outcomes,
+      revenue: structuredClone(created.run.outcomes.visibility),
+    }
+    const evidenceDigest = await canonicalEvidenceDigest({ ...created.run, outcomes })
+    harness.sqlite.exec('DROP TRIGGER marketing_monitor_runs_finalize_only')
+    harness.sqlite.prepare(`
+      UPDATE marketing_monitor_runs SET outcomes_json = ?, evidence_digest = ? WHERE id = ?
+    `).run(JSON.stringify(outcomes), evidenceDigest, created.run.id)
+
+    expect(await getLatestMarketingMonitorRun(env, owner)).toEqual({ ok: false, reason: 'stored_run_invalid' })
+    expect(await listMarketingMonitorRuns(env, owner, { limit: 10 })).toEqual({ ok: false, reason: 'stored_run_invalid' })
+  })
+
+  it('fails closed on a fabricated evidence digest', async () => {
+    await activateMarketing(env)
+    const created = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    harness.sqlite.exec('DROP TRIGGER marketing_monitor_runs_finalize_only')
+    harness.sqlite.prepare(`
+      UPDATE marketing_monitor_runs SET evidence_digest = ? WHERE id = ?
+    `).run('f'.repeat(64), created.run.id)
+
+    expect(await getLatestMarketingMonitorRun(env, owner)).toEqual({ ok: false, reason: 'stored_run_invalid' })
+    expect(await listMarketingMonitorRuns(env, owner, { limit: 10 })).toEqual({ ok: false, reason: 'stored_run_invalid' })
+  })
+
+  it('fails closed when stored evidence falls outside its run window with matching outcomes and digest', async () => {
+    await activateMarketing(env)
+    const created = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    const outsideWindow = '2026-07-02T00:00:00.000Z'
+    const observations = created.run.observations.map((observation) => (
+      observation.metricKey === 'seo.ai_citations' ? { ...observation, observedAt: outsideWindow } : observation
+    ))
+    const outcomes = {
+      ...created.run.outcomes,
+      visibility: created.run.outcomes.visibility.status === 'available'
+        ? { ...created.run.outcomes.visibility, observedAt: outsideWindow }
+        : created.run.outcomes.visibility,
+    }
+    const evidenceDigest = await canonicalEvidenceDigest({ ...created.run, observations, outcomes })
+    harness.sqlite.exec(`
+      DROP TRIGGER marketing_monitor_observations_no_update;
+      DROP TRIGGER marketing_monitor_runs_finalize_only;
+    `)
+    harness.sqlite.prepare(`
+      UPDATE marketing_monitor_observations SET observed_at = ?
+       WHERE run_id = ? AND metric_key = 'seo.ai_citations'
+    `).run(outsideWindow, created.run.id)
+    harness.sqlite.prepare(`
+      UPDATE marketing_monitor_runs SET outcomes_json = ?, evidence_digest = ? WHERE id = ?
+    `).run(JSON.stringify(outcomes), evidenceDigest, created.run.id)
+
+    expect(await getLatestMarketingMonitorRun(env, owner)).toEqual({ ok: false, reason: 'stored_run_invalid' })
+    expect(await listMarketingMonitorRuns(env, owner, { limit: 10 })).toEqual({ ok: false, reason: 'stored_run_invalid' })
+  })
+
+  it('fails closed on a stored observation ID beyond the persistence limit even with a matching digest', async () => {
+    await activateMarketing(env)
+    const created = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    const oversizedId = 'z'.repeat(257)
+    const target = created.run.observations.at(-1)
+    expect(target).toBeDefined()
+    if (!target) return
+    const observations = created.run.observations.map((observation) => (
+      observation.id === target.id ? { ...observation, id: oversizedId } : observation
+    ))
+    const evidenceDigest = await canonicalEvidenceDigest({ ...created.run, observations })
+    harness.sqlite.exec(`
+      DROP TRIGGER marketing_monitor_observations_no_update;
+      DROP TRIGGER marketing_monitor_runs_finalize_only;
+      PRAGMA ignore_check_constraints = ON;
+    `)
+    harness.sqlite.prepare(`
+      UPDATE marketing_monitor_observations SET id = ? WHERE run_id = ? AND id = ?
+    `).run(oversizedId, created.run.id, target.id)
+    harness.sqlite.prepare(`
+      UPDATE marketing_monitor_runs SET evidence_digest = ? WHERE id = ?
+    `).run(evidenceDigest, created.run.id)
 
     expect(await getLatestMarketingMonitorRun(env, owner)).toEqual({ ok: false, reason: 'stored_run_invalid' })
     expect(await listMarketingMonitorRuns(env, owner, { limit: 10 })).toEqual({ ok: false, reason: 'stored_run_invalid' })

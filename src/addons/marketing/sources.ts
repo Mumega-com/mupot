@@ -42,6 +42,7 @@ import {
 
 export const MAX_OBSERVATIONS_PER_SOURCE = 100
 export const MAX_OBSERVATIONS_PER_RUN = 200
+export const MAX_MARKETING_MONITOR_OBSERVATION_ID_LENGTH = 256
 export const MAX_MARKETING_MONITOR_BINDINGS = 16
 export const MAX_MARKETING_MONITOR_SOURCES = 16
 const MAX_JS_ARRAY_LENGTH = 2 ** 32 - 1
@@ -184,6 +185,7 @@ function observationFailureReason(
   const value = observation as Record<string, unknown>
   if (
     !isNonEmptyString(value.id)
+    || value.id.length > MAX_MARKETING_MONITOR_OBSERVATION_ID_LENGTH
     || !isNonEmptyString(value.runId)
     || !isNonEmptyString(value.metricKey)
     || !hasOwnIntrinsic(MARKETING_MONITOR_METRIC_CONTRACT, value.metricKey)

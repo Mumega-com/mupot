@@ -3,7 +3,12 @@ import type { Env } from '../../types'
 import type { AddonActor } from '../service'
 import { getRegisteredAddon } from '../registry'
 import '../modules'
-import { collectMarketingSnapshots, MAX_MARKETING_MONITOR_SOURCES, MAX_OBSERVATIONS_PER_RUN } from './sources'
+import {
+  collectMarketingSnapshots,
+  MAX_MARKETING_MONITOR_OBSERVATION_ID_LENGTH,
+  MAX_MARKETING_MONITOR_SOURCES,
+  MAX_OBSERVATIONS_PER_RUN,
+} from './sources'
 import { deriveMarketingOutcomes } from './outcomes'
 import {
   MARKETING_MONITOR_METRIC_CONTRACT,
@@ -69,6 +74,13 @@ const STABLE_SOURCE_REASONS = new Set([
 ])
 const OUTCOME_SOURCES = new Set(['first-party', 'posthog', 'gsc', 'ghl', 'crm', 'mcpwp', 'inkwell', 'ai_visibility'])
 const OUTCOME_UNITS = new Set(['count', 'ratio', 'usd'])
+const STORED_OUTCOME_METRICS = {
+  visibility: 'seo.ai_citations',
+  qualifiedTraffic: 'seo.organic_sessions',
+  leads: 'growth.leads',
+  conversion: 'seo.conversion_rate',
+  revenue: 'finance.revenue',
+} as const
 
 interface InstallationRow {
   id: string
@@ -418,14 +430,18 @@ function parseSources(value: unknown): MarketingMonitorRunSource[] | null {
   return sources
 }
 
-function parseObservations(value: unknown, runId: string): MonitorObservation[] | null {
+function parseObservations(value: unknown, runId: string, window: MonitorWindow): MonitorObservation[] | null {
   if (!Array.isArray(value) || value.length > MAX_OBSERVATIONS_PER_RUN) return null
+  const windowStart = dateParseIntrinsic(window.start)
+  const windowEnd = dateParseIntrinsic(window.end)
   const observations: MonitorObservation[] = []
   const ids = new Set<string>()
   for (const entry of value) {
     if (!isObject(entry) || objectKeysIntrinsic(entry).length !== 9) return null
     if (
-      typeof entry.id !== 'string' || entry.id.length === 0 || setHasCaptured(ids, entry.id)
+      typeof entry.id !== 'string' || entry.id.length === 0
+      || entry.id.length > MAX_MARKETING_MONITOR_OBSERVATION_ID_LENGTH
+      || setHasCaptured(ids, entry.id)
       || entry.runId !== runId
       || typeof entry.metricKey !== 'string' || !Object.hasOwn(MARKETING_MONITOR_METRIC_CONTRACT, entry.metricKey)
       || typeof entry.value !== 'number' || !numberIsFiniteIntrinsic(entry.value)
@@ -434,27 +450,98 @@ function parseObservations(value: unknown, runId: string): MonitorObservation[] 
       || typeof entry.sourceKey !== 'string' || typeof entry.sourceSlot !== 'string'
     ) return null
     const metric = MARKETING_MONITOR_METRIC_CONTRACT[entry.metricKey as keyof typeof MARKETING_MONITOR_METRIC_CONTRACT]
-    if (entry.unit !== metric.unit || !includesCaptured(metric.authorities as readonly string[], entry.authority)) return null
+    const observedAt = dateParseIntrinsic(entry.observedAt as string)
+    if (
+      observedAt < windowStart || observedAt > windowEnd
+      || entry.unit !== metric.unit
+      || !includesCaptured(metric.authorities as readonly string[], entry.authority)
+    ) return null
     setAddCaptured(ids, entry.id)
     pushCaptured(observations, entry as unknown as MonitorObservation)
   }
   return observations
 }
 
-function parseStoredRun(row: StoredRunRow): MarketingMonitorRun | null {
+function deriveStoredOutcomes(observations: readonly MonitorObservation[]): MarketingOutcomes {
+  const outcomeFor = (metricKey: keyof typeof MARKETING_MONITOR_METRIC_CONTRACT): OutcomeValue => {
+    let matching: MonitorObservation | undefined
+    for (let index = 0; index < observations.length; index += 1) {
+      const observation = observations[index]
+      if (
+        observation.metricKey === metricKey
+        && (
+          matching === undefined
+          || observation.observedAt > matching.observedAt
+          || (observation.observedAt === matching.observedAt && observation.id > matching.id)
+        )
+      ) matching = observation
+    }
+    return matching
+      ? {
+          status: 'available',
+          value: matching.value,
+          unit: matching.unit,
+          source: matching.authority,
+          observedAt: matching.observedAt,
+        }
+      : { status: 'unavailable', reason: 'authoritative_source_missing' }
+  }
+  return {
+    visibility: outcomeFor(STORED_OUTCOME_METRICS.visibility),
+    qualifiedTraffic: outcomeFor(STORED_OUTCOME_METRICS.qualifiedTraffic),
+    leads: outcomeFor(STORED_OUTCOME_METRICS.leads),
+    conversion: outcomeFor(STORED_OUTCOME_METRICS.conversion),
+    revenue: outcomeFor(STORED_OUTCOME_METRICS.revenue),
+  }
+}
+
+function outcomesEqual(left: MarketingOutcomes, right: MarketingOutcomes): boolean {
+  const keys = objectKeysIntrinsic(STORED_OUTCOME_METRICS) as Array<keyof MarketingOutcomes>
+  for (let index = 0; index < keys.length; index += 1) {
+    const leftOutcome = left[keys[index]]
+    const rightOutcome = right[keys[index]]
+    if (leftOutcome.status !== rightOutcome.status) return false
+    if (leftOutcome.status === 'unavailable' || rightOutcome.status === 'unavailable') {
+      if (
+        leftOutcome.status !== 'unavailable'
+        || rightOutcome.status !== 'unavailable'
+        || leftOutcome.reason !== rightOutcome.reason
+      ) return false
+      continue
+    }
+    if (
+      leftOutcome.value !== rightOutcome.value
+      || leftOutcome.unit !== rightOutcome.unit
+      || leftOutcome.source !== rightOutcome.source
+      || leftOutcome.observedAt !== rightOutcome.observedAt
+    ) return false
+  }
+  return true
+}
+
+function isCanonicalOrder<T>(values: readonly T[], compare: (left: T, right: T) => number): boolean {
+  for (let index = 1; index < values.length; index += 1) {
+    if (compare(values[index - 1], values[index]) > 0) return false
+  }
+  return true
+}
+
+async function parseStoredRun(row: StoredRunRow): Promise<MarketingMonitorRun | null> {
   try {
     if (
       row.status !== 'completed'
       || row.program_version !== MARKETING_MONITOR_PROGRAM_VERSION
       || !canonicalTimestamp(row.window_start) || !canonicalTimestamp(row.window_end)
+      || dateParseIntrinsic(row.window_start) > dateParseIntrinsic(row.window_end)
       || !canonicalTimestamp(row.created_at) || !canonicalTimestamp(row.completed_at)
       || !HEX_SHA256.test(row.evidence_digest)
       || !numberIsIntegerIntrinsic(row.source_count) || row.source_count < 0 || row.source_count > MAX_MARKETING_MONITOR_SOURCES
       || !numberIsIntegerIntrinsic(row.observation_count) || row.observation_count < 0 || row.observation_count > MAX_OBSERVATIONS_PER_RUN
       || !numberIsIntegerIntrinsic(row.raw_observation_count) || row.raw_observation_count < row.observation_count
     ) return null
+    const window = { start: row.window_start, end: row.window_end }
     const sources = parseSources(jsonParseIntrinsic(row.sources_json))
-    const observations = parseObservations(jsonParseIntrinsic(row.observations_json), row.id)
+    const observations = parseObservations(jsonParseIntrinsic(row.observations_json), row.id, window)
     const outcomes = jsonParseIntrinsic(row.outcomes_json)
     if (!sources || !observations || !validOutcomes(outcomes)) return null
     if (sources.length !== row.source_count || observations.length !== row.observation_count) return null
@@ -466,17 +553,31 @@ function parseStoredRun(row: StoredRunRow): MarketingMonitorRun | null {
       if (count !== source.observationCount) return null
     }
     if (observations.some((observation) => sourceByKey.get(observation.sourceKey)?.slot !== observation.sourceSlot)) return null
+    if (!isCanonicalOrder(sources, compareSource) || !isCanonicalOrder(observations, compareObservation)) return null
+
+    // Stored rows are not branded as fresh Task 3 collections; verify the same deterministic outcome contract directly.
+    const expectedOutcomes = deriveStoredOutcomes(observations)
+    if (!outcomesEqual(outcomes, expectedOutcomes)) return null
+    const expectedDigest = await sha256Json({
+      schema: EVIDENCE_SCHEMA,
+      programVersion: row.program_version,
+      window,
+      sources,
+      observations,
+      outcomes: expectedOutcomes,
+    })
+    if (expectedDigest !== row.evidence_digest) return null
     return {
       id: row.id,
       programVersion: row.program_version,
       status: 'completed',
-      window: { start: row.window_start, end: row.window_end },
+      window,
       sourceCount: row.source_count,
       observationCount: row.observation_count,
       rawObservationCount: row.raw_observation_count,
       sources,
       observations,
-      outcomes,
+      outcomes: expectedOutcomes,
       evidenceDigest: row.evidence_digest,
       createdAt: row.created_at,
       completedAt: row.completed_at,
@@ -502,7 +603,7 @@ async function loadExactCompleted(
     window.end,
   ).first<StoredRunRow>()
   if (!row) return { state: 'none' }
-  const run = parseStoredRun(row)
+  const run = await parseStoredRun(row)
   return run ? { state: 'valid', run } : { state: 'invalid' }
 }
 
@@ -638,7 +739,7 @@ export async function runMarketingMonitor(
     const results = await captured.db.batch<StoredRunRow>(batch)
     if (!resultsWritten(results[0]) || !resultsWritten(results[3])) throw new Error('monitor_batch_not_written')
     const row = results[4]?.results?.[0]
-    const run = row ? parseStoredRun(row) : null
+    const run = row ? await parseStoredRun(row) : null
     return run
       ? { ok: true, idempotent: false, run }
       : { ok: false, reason: 'stored_run_invalid' }
@@ -693,7 +794,7 @@ export async function getLatestMarketingMonitorRun(
     const row = await captured.db.prepare(runSelect(readIdentityWhere(), 'LIMIT 1'))
       .bind(...readIdentityBindings(captured)).first<StoredRunRow>()
     if (!row) return { ok: true, run: null }
-    const run = parseStoredRun(row)
+    const run = await parseStoredRun(row)
     return run ? { ok: true, run } : { ok: false, reason: 'stored_run_invalid' }
   } catch {
     return { ok: false, reason: 'write_failed' }
@@ -716,7 +817,7 @@ export async function listMarketingMonitorRuns(
       .bind(...readIdentityBindings(captured), input.limit).all<StoredRunRow>()
     const runs: MarketingMonitorRun[] = []
     for (const row of result.results ?? []) {
-      const run = parseStoredRun(row)
+      const run = await parseStoredRun(row)
       if (!run) return { ok: false, reason: 'stored_run_invalid' }
       pushCaptured(runs, run)
     }

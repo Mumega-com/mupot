@@ -1270,6 +1270,25 @@ describe('collectMarketingSnapshots', () => {
     expect(snapshot.sources[0]).toMatchObject({ status: 'failed', reason: 'invalid_observation' })
   })
 
+  it('accepts 256-character observation IDs and rejects longer IDs as invalid observations', async () => {
+    const acceptedId = 'a'.repeat(256)
+    const oversizedId = 'b'.repeat(257)
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      source('accepted', 'web_analytics', async () => available([observation({ id: acceptedId })])),
+      source('oversized', 'web_analytics', async () => available([observation({
+        id: oversizedId,
+        metricKey: 'seo.organic_sessions',
+      })])),
+    ])
+
+    expect(snapshot.observations).toEqual([observation({ id: acceptedId, sourceKey: 'accepted' })])
+    expect(snapshot.sources[1]).toMatchObject({
+      status: 'failed',
+      reason: 'invalid_observation',
+      observationCount: 0,
+    })
+  })
+
   it('rejects monitor windows that omit canonical millisecond precision', async () => {
     await expect(collectMarketingSnapshots(env, bindings, {
       start: '2026-07-16T00:00:00Z',
