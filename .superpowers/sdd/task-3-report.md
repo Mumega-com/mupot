@@ -95,6 +95,11 @@ replacing `Array.prototype[Symbol.iterator]` stopped outcome traversal; and repl
 `Array.prototype.includes`, `Object.freeze`, and `WeakSet.prototype.add` during source execution
 allowed invalid first-party revenue and mutable, unbranded evidence.
 
+The mutable Env verification finding was addressed with one additional RED run: 2 failed,
+79 passed. A source could revoke the real connector and redirect final verification either by
+replacing `env.DB` plus `env.TENANT_SLUG` or by replacing the original DB object's `prepare`
+property, causing revoked GHL revenue evidence to be accepted.
+
 ## GREEN Evidence
 
 ```sh
@@ -130,6 +135,11 @@ addon binding tests, successful `tsc --noEmit`, and `git diff --check`. A static
 dynamic calls to the reviewed mutable intrinsics or array iterators in `sources.ts` or
 `outcomes.ts`; all such operations route through module-load captures.
 
+The mutable Env checkpoint completed with 81 passing focused Task 3 tests, 21 passing addon
+binding tests, successful `tsc --noEmit`, and `git diff --check`. An Env-access audit confirmed
+that tenant, DB receiver, and `prepare` capability are captured before source execution and that
+both vault resolutions use the private frozen verification wrapper.
+
 ## Changed Files
 
 - `src/addons/marketing/types.ts`
@@ -155,6 +165,8 @@ dynamic calls to the reviewed mutable intrinsics or array iterators in `sources.
 `42528e440b61d8bbe4035650fe0195ce97009dd0` (`fix(marketing): finalize trusted binding acceptance`)
 
 `49356f9c8bc10c5889bab723e227f8cd12557721` (`fix(marketing): capture trusted intrinsics`)
+
+`a1a4d970bfb51d7f0b08b5c8a1d334654287b5d8` (`fix(marketing): pin vault verification environment`)
 
 ## Re-review Changed Files
 
@@ -192,6 +204,12 @@ dynamic calls to the reviewed mutable intrinsics or array iterators in `sources.
 - `src/addons/marketing/outcomes.ts`
 - `tests/marketing-monitor-sources.test.ts`
 - `tests/marketing-monitor-outcomes.test.ts`
+- `.superpowers/sdd/task-3-report.md`
+
+## Mutable Env Review Changed Files
+
+- `src/addons/marketing/sources.ts`
+- `tests/marketing-monitor-sources.test.ts`
 - `.superpowers/sdd/task-3-report.md`
 
 ## Residual Risks
