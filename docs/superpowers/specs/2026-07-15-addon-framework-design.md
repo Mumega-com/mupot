@@ -215,7 +215,9 @@ available -> installed -> configured -> active
 Every persisted transition uses compare-and-set on the prior state and records actor,
 timestamp, and receipt ID. `active` requires configured slots, approved grants, matching
 manifest digest, and a completed activation journal. An archived installation cannot be
-reactivated; the operator creates a new installation lifecycle.
+reactivated; the operator creates a new installation lifecycle with a new installation ID.
+Archived receipts and ownership history remain immutable, and no prior grant or active
+resource claim carries into the replacement lifecycle.
 
 ### 5.2 Install
 
@@ -308,10 +310,14 @@ The initial framework adds:
 - `id`, `tenant`, `addon_key`, `installed_version`, `publisher`, `trust_class`;
 - `manifest_sha256`, `mupot_compatibility`, and `state`;
 - `installed_by`, `installed_at`, `configured_at`, `activated_at`, `disabled_at`;
-- `updated_at`, `latest_receipt_id`, and actor for the latest transition;
+- `updated_at`, `latest_receipt_id`, exact prior-state snapshot, and actor for the latest
+  transition;
 - `configuration` containing non-secret addon settings;
 - `last_health`, `last_health_at`, and `last_error`;
-- unique `(tenant, addon_key)`.
+- one non-archived installation per `(tenant, addon_key)`; archived rows are unlimited and
+  remain historical evidence;
+- immutable installation identity, digest, publisher, compatibility, tenant, and installer
+  fields after insert.
 
 ### `addon_connector_bindings`
 
@@ -342,13 +348,16 @@ credential material.
 - tracks which addon seeded each department, loop, grant, playbook, or subscription;
 - tenant-scoped unique constraints prevent two exclusive owners for one resource;
 - `shared` and `co_owner` modes allow declared composition without last-writer-wins;
-- prevents disabling one addon from deactivating a resource shared by another.
+- prevents disabling one addon from deactivating a resource shared by another;
+- claim identity is immutable and undeletable; archive requires every claim to be inactive,
+  and archived installations cannot acquire or reactivate claims.
 
 ### `addon_operations`
 
 - durable journal for activate, disable, uninstall, and upgrade operations;
 - records operation ID, target version/state, current step, status, lease expiry, and
   redacted error code;
+- action and target state are constrained as one pair;
 - supports crash recovery, bounded retries, compensation, and exactly-one active
   lifecycle operation per installation.
 
@@ -356,9 +365,15 @@ credential material.
 
 - append-only lifecycle receipts for install, configure, activate, disable, archive,
   upgrade, health, and failed preflight;
+- deterministic database sequence establishes receipt chronology independently of clock
+  ties or random IDs;
 - includes action, previous/next state, actor, addon/version, publisher/trust class,
   manifest SHA-256, requested authority, grant receipt IDs, affected resource IDs,
   recomputed checks, outcome, and a redacted error or compensation code;
+- a state-authorizing receipt must be fresh, successful, actor-matched, and attest the exact
+  prior and next states; failed lifecycle receipts remain valid evidence only when they do
+  not authorize a state change;
+- database triggers prevent update, delete, ID replacement, and sequence replacement;
 - never contains connector secrets or bearer values.
 
 Addon manifests cannot contain arbitrary SQL. Native addon schema changes ship through

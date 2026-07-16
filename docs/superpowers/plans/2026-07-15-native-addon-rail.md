@@ -325,6 +325,26 @@ CREATE INDEX IF NOT EXISTS idx_addon_receipts_installation
   ON addon_receipts (tenant, installation_id, created_at DESC);
 ```
 
+**Binding persistence adjudication (supersedes the illustrative SQL above):** Kasra's
+2026-07-16 review established that the production migration must enforce the stronger
+product invariants implemented in `migrations/0050_addons.sql`:
+
+- one live installation per tenant/addon with unlimited immutable archived lifecycles;
+- composite tenant/installation foreign keys on every child table;
+- immutable, undeletable resource claims with exclusive/co-owner conflict protection and
+  no active claim for an archived installation;
+- fresh, successful, exact-prior-state lifecycle receipts atomically bound to each state
+  transition, while standalone failed lifecycle receipts remain evidence without changing
+  state;
+- append-only identity-snapshot receipts protected from update, delete, ID replacement,
+  and sequence replacement, with deterministic database chronology;
+- immutable installation identity/digest/installer fields and transition-only actor changes;
+- action/target consistency in the operation journal and fail-closed receipt JSON parsing.
+
+The adversarial service tests and fresh local D1 migration probes are part of Task 3's
+completion evidence. Do not reintroduce the weaker uniqueness or receipt rules from the
+illustrative first draft.
+
 - [ ] **Step 2: Write failing service tests**
 
 Use the repository's D1 mock pattern from `tests/department-conformance.test.ts`. Assert:
