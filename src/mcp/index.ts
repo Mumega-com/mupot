@@ -50,6 +50,11 @@ import {
 } from '../tasks/service'
 import type { TaskStatus } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
+// #22 v1 ATC ranking: pure scorer + the radar's existing agent runtime-state
+// loader (dashboard/radar.ts already uses this same loader for the fleet
+// view — not a new query shape).
+import { rankTasks } from '../tasks/ranking'
+import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/observatory'
 import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin } from '../dashboard/connect'
 import { classify, humanAge } from '../dashboard/fleet'
@@ -550,19 +555,31 @@ const toolTaskList: ToolSpec = {
       clauses.push(`assignee_agent_id = ?${binds.length + 1}`)
       binds.push(assignee.trim())
     }
-    binds.push(limit)
 
+    // #22 v1 ATC ranking: LIMIT is applied AFTER ranking, not in SQL. This is
+    // the surface agents actually claim work through (this MCP tool, not the
+    // cookie-session dashboard route) — if the SQL LIMIT clipped to the newest
+    // N rows before scoring, a genuinely-highest-priority OLD open task
+    // sitting just past the limit window would never surface, no matter how
+    // stale it got. Fetching the full (squad + filter)-scoped match set here
+    // is safe: it is already bounded by squad_id (+ optional status/assignee)
+    // and by D1's own 1000-row .all() cap (see dashboard/observatory.ts) —
+    // the same bound the unfiltered dashboard GET /api/tasks route already
+    // relies on with no LIMIT at all.
     const rows = await env.DB.prepare(
       `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
          FROM tasks
         WHERE ${clauses.join(' AND ')}
-        ORDER BY created_at DESC
-        LIMIT ?${binds.length}`,
+        ORDER BY created_at DESC`,
     )
       .bind(...binds)
       .all<Task>()
+    const taskRows = rows.results ?? []
 
-    return done({ squad_id: squadRes.squad.id, tasks: rows.results ?? [] })
+    const agentStates: ReadonlyMap<string, AgentRuntimeState> =
+      taskRows.length > 0 ? await loadAgentRuntimeStates(env) : new Map()
+
+    return done({ squad_id: squadRes.squad.id, tasks: rankTasks(taskRows, agentStates).slice(0, limit) })
   },
 }
 

@@ -30,6 +30,11 @@ export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
 import { startTaskPipeline } from '../workflows/pipeline'
+// #22 v1 ATC ranking: pure scorer (no I/O) + the existing radar's agent
+// runtime-state loader (already a single cheap D1 query — dashboard/radar.ts
+// uses the same loader for the fleet view, so this is not a new query shape).
+import { rankTasks } from './ranking'
+import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/observatory'
 
 // ── validation helpers ───────────────────────────────────────────────────────
 type TaskActor = NonNullable<BusEvent['actor']>
@@ -211,8 +216,24 @@ tasksApp.get('/', async (c) => {
   )
     .bind(...binds)
     .all<Task>()
+  const taskRows = rows.results ?? []
 
-  return c.json({ tasks: rows.results ?? [] })
+  // #22 v1 ATC ranking: recency alone starved older work behind a stream of
+  // freshly filed tasks and never distinguished "an agent has hands on this"
+  // from "an agent is assigned but has gone dark." rankTasks (pure, see
+  // ./ranking.ts for the full heuristic + tie-break doc) reorders in JS; the
+  // SQL ORDER BY above is kept only as a stable pre-sort for the passthrough
+  // (done/review/approved/rejected) tail rankTasks does not score.
+  //
+  // agentStates comes from the SAME radar classifier dashboard/radar.ts uses
+  // for the fleet view (loadAgentRuntimeStates — one JOIN query, agents x
+  // agent_keys x members x fleet_agents), so this is not a new query shape.
+  // Skipped entirely when there are no rows to rank — no reason to pay for it
+  // on an empty result.
+  const agentStates: ReadonlyMap<string, AgentRuntimeState> =
+    taskRows.length > 0 ? await loadAgentRuntimeStates(c.env) : new Map()
+
+  return c.json({ tasks: rankTasks(taskRows, agentStates) })
 })
 
 // ── GET /:id — single task read (for the /send poller) ───────────────────────
