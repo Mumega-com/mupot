@@ -42,9 +42,6 @@ export const MARKETING_MONITOR_BINDING_CONTRACT = Object.freeze({
     ghl: vaultBinding(),
     crm: vaultBinding(),
   }),
-  ai_visibility: Object.freeze({
-    ai_visibility: vaultBinding(),
-  }),
 } as const)
 
 export const MARKETING_MONITOR_METRIC_CONTRACT = Object.freeze({

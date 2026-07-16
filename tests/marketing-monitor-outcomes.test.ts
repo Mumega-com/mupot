@@ -33,6 +33,34 @@ const ghlBinding: ResolvedAddonBinding = {
   connectorId: 'connector-ghl',
 }
 
+const envWithGhlConnector = {
+  ...env,
+  DB: {
+    prepare() {
+      let values: unknown[] = []
+      const statement = {
+        bind(...bound: unknown[]) {
+          values = bound
+          return statement
+        },
+        async first() {
+          if (values[0] !== 'connector-ghl' || values[1] !== 'tenant-a') return null
+          return {
+            id: 'connector-ghl',
+            type: 'ghl',
+            label: 'Safe GHL fixture',
+            meta: null,
+            scope_type: 'pot',
+            scope_id: null,
+            created_at: '2026-07-16T00:00:00.000Z',
+          }
+        },
+      }
+      return statement
+    },
+  } as Env['DB'],
+} as Env
+
 function observation(overrides: Partial<MonitorObservation> = {}): MonitorObservation {
   return {
     id: 'evidence-visibility',
@@ -57,7 +85,12 @@ async function collectObservations(
       return { status: 'available', observations }
     },
   }
-  return collectMarketingSnapshots(env, [binding], window, [source])
+  return collectMarketingSnapshots(
+    binding.bindingKind === 'vault_connector' ? envWithGhlConnector : env,
+    [binding],
+    window,
+    [source],
+  )
 }
 
 async function fixtureCollection(): Promise<MarketingSnapshotCollection> {

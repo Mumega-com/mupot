@@ -26,6 +26,51 @@ const bindings: readonly ResolvedAddonBinding[] = [{
   connectorId: null,
 }]
 
+interface TestConnector {
+  id: string
+  type: string
+  tenant?: string
+  revoked?: boolean
+  resolvedId?: string
+}
+
+function envWithConnectors(connectors: TestConnector[], queries: string[] = []): Env {
+  return {
+    ...env,
+    DB: {
+      prepare(sql: string) {
+        queries.push(sql)
+        let values: unknown[] = []
+        const statement = {
+          bind(...bound: unknown[]) {
+            values = bound
+            return statement
+          },
+          async first() {
+            const [connectorId, tenant] = values
+            const connector = connectors.find((candidate) => (
+              candidate.id === connectorId
+              && (candidate.tenant ?? 'tenant-a') === tenant
+              && !candidate.revoked
+            ))
+            if (!connector) return null
+            return {
+              id: connector.resolvedId ?? connector.id,
+              type: connector.type,
+              label: 'Safe connector fixture',
+              meta: null,
+              scope_type: 'pot',
+              scope_id: null,
+              created_at: '2026-07-16T00:00:00.000Z',
+            }
+          },
+        }
+        return statement
+      },
+    } as Env['DB'],
+  }
+}
+
 function observation(overrides: Partial<MonitorObservation> = {}): MonitorObservation {
   return {
     id: 'evidence-1',
@@ -70,11 +115,30 @@ describe('collectMarketingSnapshots', () => {
         ghl: { capability: 'read', bindingKind: 'vault_connector', connectorId: 'required' },
         crm: { capability: 'read', bindingKind: 'vault_connector', connectorId: 'required' },
       },
-      ai_visibility: {
-        ai_visibility: { capability: 'read', bindingKind: 'vault_connector', connectorId: 'required' },
-      },
     })
     expect(Object.isFrozen(contract)).toBe(true)
+  })
+
+  it('keeps future ai_visibility bindings unreachable and never reads their source', async () => {
+    let reads = 0
+    const snapshot = await collectMarketingSnapshots(env, [{
+      id: 'binding-ai-visibility',
+      slot: 'ai_visibility',
+      adapter: 'ai_visibility',
+      bindingKind: 'vault_connector',
+      capability: 'read',
+      connectorId: 'connector-ai-visibility',
+    }], window, [source('ai-source', 'ai_visibility', async () => {
+      reads += 1
+      return available([observation({ authority: 'ai_visibility' })])
+    })])
+
+    expect(reads).toBe(0)
+    expect(snapshot.observations).toEqual([])
+    expect(snapshot.sources[0]).toMatchObject({
+      status: 'unavailable',
+      reason: 'binding_not_configured',
+    })
   })
 
   it('declares immutable exact units for every monitor metric', () => {
@@ -102,7 +166,9 @@ describe('collectMarketingSnapshots', () => {
       throw new Error('upstream token=secret should never escape')
     })
 
-    const snapshot = await collectMarketingSnapshots(env, [
+    const snapshot = await collectMarketingSnapshots(envWithConnectors([
+      { id: 'connector-content', type: 'inkwell' },
+    ]), [
       ...bindings,
       {
         id: 'binding-content',
@@ -137,6 +203,83 @@ describe('collectMarketingSnapshots', () => {
     expect(JSON.stringify(snapshot)).not.toContain('top-secret')
   })
 
+  it('re-resolves a vault binding and rejects a GHL adapter backed by a PostHog connector before read', async () => {
+    let reads = 0
+    const queries: string[] = []
+    const ghlBinding: ResolvedAddonBinding = {
+      id: 'binding-crm',
+      slot: 'crm',
+      adapter: 'ghl',
+      bindingKind: 'vault_connector',
+      capability: 'read',
+      connectorId: 'connector-crm',
+    }
+
+    const snapshot = await collectMarketingSnapshots(envWithConnectors([
+      { id: 'connector-crm', type: 'posthog' },
+    ], queries), [ghlBinding], window, [source('crm-source', 'crm', async () => {
+      reads += 1
+      return available([observation({
+        metricKey: 'finance.revenue',
+        unit: 'usd',
+        authority: 'ghl',
+      })])
+    })])
+
+    expect(reads).toBe(0)
+    expect(snapshot.observations).toEqual([])
+    expect(snapshot.sources[0]).toMatchObject({ status: 'failed', reason: 'adapter_type_mismatch' })
+    expect(queries).toHaveLength(1)
+    expect(queries[0]).not.toContain('encrypted_secret')
+  })
+
+  it.each([
+    [{ id: 'connector-crm', type: 'ghl', resolvedId: 'different-id' }],
+    [{ id: 'connector-crm', type: 'ghl', tenant: 'tenant-b' }],
+    [{ id: 'connector-crm', type: 'ghl', revoked: true }],
+  ] as TestConnector[][])('rejects vault connectors unavailable by exact ID, tenant, or active status', async (connectors) => {
+    let reads = 0
+    const snapshot = await collectMarketingSnapshots(envWithConnectors(connectors), [{
+      id: 'binding-crm',
+      slot: 'crm',
+      adapter: 'ghl',
+      bindingKind: 'vault_connector',
+      capability: 'read',
+      connectorId: 'connector-crm',
+    }], window, [source('crm-source', 'crm', async () => {
+      reads += 1
+      return available([])
+    })])
+
+    expect(reads).toBe(0)
+    expect(snapshot.sources[0]).toMatchObject({ status: 'failed', reason: 'connector_not_available' })
+  })
+
+  it.each([
+    ['changes type', (connector: TestConnector) => { connector.type = 'posthog' }, 'adapter_type_mismatch'],
+    ['is revoked', (connector: TestConnector) => { connector.revoked = true }, 'connector_not_available'],
+  ] as const)('re-resolves a vault connector after read when it %s', async (_label, mutate, reason) => {
+    const connector: TestConnector = { id: 'connector-crm', type: 'ghl' }
+    const snapshot = await collectMarketingSnapshots(envWithConnectors([connector]), [{
+      id: 'binding-crm',
+      slot: 'crm',
+      adapter: 'ghl',
+      bindingKind: 'vault_connector',
+      capability: 'read',
+      connectorId: 'connector-crm',
+    }], window, [source('crm-source', 'crm', async () => {
+      mutate(connector)
+      return available([observation({
+        metricKey: 'finance.revenue',
+        unit: 'usd',
+        authority: 'ghl',
+      })])
+    })])
+
+    expect(snapshot.observations).toEqual([])
+    expect(snapshot.sources[0]).toMatchObject({ status: 'failed', reason })
+  })
+
   it('isolates post-read snapshot and observation getter failures per source', async () => {
     const hostileSnapshot = { status: 'available' } as Record<string, unknown>
     Object.defineProperty(hostileSnapshot, 'observations', {
@@ -164,6 +307,72 @@ describe('collectMarketingSnapshots', () => {
     ])
     expect(snapshot.observations).toEqual([observation({ id: 'healthy-evidence' })])
     expect(JSON.stringify(snapshot)).not.toContain('secret')
+  })
+
+  it('never invokes a source-owned map that forges invalid revenue from a zero-length array', async () => {
+    const forgedRevenue = [observation({
+      id: 'forged-revenue',
+      metricKey: 'finance.revenue',
+      unit: 'usd',
+      authority: 'first-party',
+    })]
+    Object.defineProperty(forgedRevenue, 'map', {
+      value: () => [null],
+    })
+    const hostileObservations: MonitorObservation[] = []
+    Object.defineProperty(hostileObservations, 'map', {
+      value: () => forgedRevenue,
+    })
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      source('hostile-array', 'web_analytics', async () => available(hostileObservations)),
+    ])
+
+    expect(snapshot.rawObservationCount).toBe(0)
+    expect(snapshot.observations).toEqual([])
+    expect(snapshot.sources).toEqual([
+      { key: 'hostile-array', slot: 'web_analytics', status: 'available', observationCount: 0 },
+    ])
+  })
+
+  it('never accepts 201 observations returned by source-owned array methods after zero-length cap checks', async () => {
+    const forged = Array.from({ length: MAX_OBSERVATIONS_PER_RUN + 1 }, (_, index) => observation({
+      id: `forged-${index}`,
+    }))
+    Object.defineProperty(forged, 'map', {
+      value: () => [null],
+    })
+    const hostileObservations: MonitorObservation[] = []
+    Object.defineProperty(hostileObservations, 'map', {
+      value: () => forged,
+    })
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      source('hostile-array', 'web_analytics', async () => available(hostileObservations)),
+    ])
+
+    expect(snapshot.rawObservationCount).toBe(0)
+    expect(snapshot.observations).toEqual([])
+    expect(snapshot.sources[0]).toMatchObject({ status: 'available', observationCount: 0 })
+  })
+
+  it.each([1.5, 2 ** 32])('rejects an untrusted array length outside JS array bounds: %s', async (length) => {
+    const hostileObservations = new Proxy([], {
+      get(target, property, receiver) {
+        if (property === 'length') return length
+        return Reflect.get(target, property, receiver)
+      },
+    }) as MonitorObservation[]
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, window, [
+      source('hostile-length', 'web_analytics', async () => available(hostileObservations)),
+    ])
+
+    expect(snapshot.rawObservationCount).toBe(0)
+    expect(snapshot.sources[0]).toMatchObject({
+      status: 'failed',
+      reason: 'invalid_source_snapshot',
+    })
   })
 
   it('isolates source key, slot, and read getter failures with synthetic identities', async () => {
@@ -609,6 +818,48 @@ describe('collectMarketingSnapshots', () => {
       start: '2026-07-16T00:00:00Z',
       end: '2026-07-16T23:59:59.999Z',
     }, [])).rejects.toThrow('invalid_monitor_window')
+  })
+
+  it('reads window boundaries once and passes an immutable canonical clone to every source', async () => {
+    let startReads = 0
+    let endReads = 0
+    const callerWindow = {} as MonitorWindow
+    Object.defineProperties(callerWindow, {
+      start: {
+        enumerable: true,
+        get() {
+          startReads += 1
+          return window.start
+        },
+      },
+      end: {
+        enumerable: true,
+        get() {
+          endReads += 1
+          return window.end
+        },
+      },
+    })
+    const receivedWindows: MonitorWindow[] = []
+    const readsWindow = (key: string, id: string) => source(key, 'web_analytics', async (_env, _binding, received) => {
+      receivedWindows.push(received)
+      Reflect.set(received as unknown as Record<string, unknown>, 'start', '2020-01-01T00:00:00.000Z')
+      return available([observation({ id })])
+    })
+
+    const snapshot = await collectMarketingSnapshots(env, bindings, callerWindow, [
+      readsWindow('first', 'first-evidence'),
+      readsWindow('second', 'second-evidence'),
+    ])
+
+    expect(startReads).toBe(1)
+    expect(endReads).toBe(1)
+    expect(receivedWindows).toHaveLength(2)
+    expect(receivedWindows[0]).toBe(receivedWindows[1])
+    expect(receivedWindows[0]).not.toBe(callerWindow)
+    expect(receivedWindows[0]).toEqual(window)
+    expect(Object.isFrozen(receivedWindows[0])).toBe(true)
+    expect(snapshot.observations.map((entry) => entry.id)).toEqual(['first-evidence', 'second-evidence'])
   })
 
   it('rejects observation timestamps that omit canonical millisecond precision', async () => {
