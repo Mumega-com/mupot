@@ -198,6 +198,47 @@ describe('deriveMarketingOutcomes', () => {
     })
   })
 
+  it('derives from a genuine collection after WeakSet methods are replaced', async () => {
+    const collection = await fixtureCollection()
+    const originalHas = WeakSet.prototype.has
+    const originalAdd = WeakSet.prototype.add
+    let outcomes: ReturnType<typeof deriveMarketingOutcomes> | undefined
+
+    try {
+      WeakSet.prototype.has = () => false
+      WeakSet.prototype.add = function () { throw new Error('mutated WeakSet add') }
+      outcomes = deriveMarketingOutcomes(collection)
+    } finally {
+      WeakSet.prototype.has = originalHas
+      WeakSet.prototype.add = originalAdd
+    }
+
+    expect(outcomes?.visibility).toMatchObject({ status: 'available', value: 8 })
+  })
+
+  it('uses indexed traversal and captured includes/freeze after intrinsic replacement', async () => {
+    const collection = await fixtureCollection()
+    const originalIterator = Array.prototype[Symbol.iterator]
+    const originalIncludes = Array.prototype.includes
+    const originalFreeze = Object.freeze
+    let outcomes: ReturnType<typeof deriveMarketingOutcomes> | undefined
+
+    try {
+      Array.prototype[Symbol.iterator] = function () { throw new Error('mutated array iterator') }
+      Array.prototype.includes = () => false
+      Object.freeze = ((value: unknown) => value) as typeof Object.freeze
+      outcomes = deriveMarketingOutcomes(collection)
+    } finally {
+      Array.prototype[Symbol.iterator] = originalIterator
+      Array.prototype.includes = originalIncludes
+      Object.freeze = originalFreeze
+    }
+
+    expect(outcomes?.visibility).toMatchObject({ status: 'available', value: 8 })
+    expect(Object.isFrozen(outcomes)).toBe(true)
+    expect(Object.isFrozen(outcomes?.visibility)).toBe(true)
+  })
+
   it('rejects a forged collection with a stable provenance error', () => {
     const forged = Object.freeze({
       runId: 'run-1',

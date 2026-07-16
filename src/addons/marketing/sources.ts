@@ -1,6 +1,32 @@
 import type { Env } from '../../types'
 import { resolveConnectorByIdWithMeta } from '../../connectors/service'
 import {
+  applyIntrinsic,
+  createMap,
+  createSet,
+  createWeakSet,
+  dateToISOStringIntrinsic,
+  freezeIntrinsic,
+  getIntrinsic,
+  hasOwnIntrinsic,
+  includesIntrinsic,
+  isArrayIntrinsic,
+  isFiniteIntrinsic,
+  isIntegerIntrinsic,
+  mapGetIntrinsic,
+  mapHasIntrinsic,
+  mapSetIntrinsic,
+  parseDateIntrinsic,
+  pushIntrinsic,
+  setAddIntrinsic,
+  setHasIntrinsic,
+  startsWithIntrinsic,
+  testIntrinsic,
+  trimIntrinsic,
+  weakSetAddIntrinsic,
+  weakSetHasIntrinsic,
+} from './intrinsics'
+import {
   MARKETING_MONITOR_ADAPTER_AUTHORITIES,
   MARKETING_MONITOR_BINDING_CONTRACT,
   MARKETING_MONITOR_METRIC_CONTRACT,
@@ -21,29 +47,30 @@ export const MAX_MARKETING_MONITOR_SOURCES = 16
 const MAX_JS_ARRAY_LENGTH = 2 ** 32 - 1
 const INPUT_ENTRY_FAILURE = Symbol('input_entry_failure')
 
-const collectedMarketingSnapshots = new WeakSet<object>()
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
+const SOURCE_IDENTIFIER = /^[a-z0-9][a-z0-9_-]{0,63}$/
+const collectedMarketingSnapshots = createWeakSet<object>()
 
 export function isCollectedMarketingSnapshot(value: unknown): value is MarketingSnapshotCollection {
   return typeof value === 'object'
     && value !== null
-    && collectedMarketingSnapshots.has(value)
+    && weakSetHasIntrinsic(collectedMarketingSnapshots, value)
 }
 
-const STABLE_SOURCE_REASONS = new Set([
-  'authoritative_source_missing',
-  'binding_not_configured',
-  'connector_not_configured',
-  'connector_revoked',
-  'source_unavailable',
-  'window_mismatch',
-])
+const STABLE_SOURCE_REASONS = createSet<string>()
+setAddIntrinsic(STABLE_SOURCE_REASONS, 'authoritative_source_missing')
+setAddIntrinsic(STABLE_SOURCE_REASONS, 'binding_not_configured')
+setAddIntrinsic(STABLE_SOURCE_REASONS, 'connector_not_configured')
+setAddIntrinsic(STABLE_SOURCE_REASONS, 'connector_revoked')
+setAddIntrinsic(STABLE_SOURCE_REASONS, 'source_unavailable')
+setAddIntrinsic(STABLE_SOURCE_REASONS, 'window_mismatch')
 
 function isIsoTimestamp(value: unknown): value is string {
-  if (typeof value !== 'string' || value.trim() === '') return false
-  const timestamp = Date.parse(value)
-  return Number.isFinite(timestamp)
-    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
-    && new Date(timestamp).toISOString() === value
+  if (typeof value !== 'string' || trimIntrinsic(value) === '') return false
+  const timestamp = parseDateIntrinsic(value)
+  return isFiniteIntrinsic(timestamp)
+    && testIntrinsic(ISO_TIMESTAMP, value)
+    && dateToISOStringIntrinsic(timestamp) === value
 }
 
 function canonicalWindow(input: MonitorWindow): {
@@ -52,15 +79,15 @@ function canonicalWindow(input: MonitorWindow): {
 } | null {
   try {
     if (typeof input !== 'object' || input === null) return null
-    const startValue = Reflect.get(input, 'start')
-    const endValue = Reflect.get(input, 'end')
+    const startValue = getIntrinsic(input, 'start')
+    const endValue = getIntrinsic(input, 'end')
     if (!isIsoTimestamp(startValue) || !isIsoTimestamp(endValue)) return null
-    const start = Date.parse(startValue)
-    const end = Date.parse(endValue)
+    const start = parseDateIntrinsic(startValue)
+    const end = parseDateIntrinsic(endValue)
     if (start > end) return null
     return {
-      window: Object.freeze({ start: startValue, end: endValue }),
-      bounds: Object.freeze({ start, end }),
+      window: freezeIntrinsic({ start: startValue, end: endValue }),
+      bounds: freezeIntrinsic({ start, end }),
     }
   } catch {
     return null
@@ -68,7 +95,7 @@ function canonicalWindow(input: MonitorWindow): {
 }
 
 function isNonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.trim().length > 0
+  return typeof value === 'string' && trimIntrinsic(value).length > 0
 }
 
 interface CapturedInputArray {
@@ -79,19 +106,19 @@ interface CapturedInputArray {
 
 function captureInputArray(input: unknown, maxLength: number): CapturedInputArray {
   try {
-    if (!Array.isArray(input)) return { valid: false, entryFailure: false, entries: [] }
-    const length = Reflect.get(input, 'length')
-    if (!Number.isInteger(length) || length < 0 || length > maxLength) {
+    if (!isArrayIntrinsic(input)) return { valid: false, entryFailure: false, entries: [] }
+    const length = getIntrinsic(input, 'length')
+    if (!isIntegerIntrinsic(length) || (length as number) < 0 || (length as number) > maxLength) {
       return { valid: false, entryFailure: false, entries: [] }
     }
     const entries: unknown[] = []
     let entryFailure = false
-    for (let index = 0; index < length; index += 1) {
+    for (let index = 0; index < (length as number); index += 1) {
       try {
-        entries.push(Reflect.get(input, index))
+        pushIntrinsic(entries, getIntrinsic(input, index))
       } catch {
         entryFailure = true
-        entries.push(INPUT_ENTRY_FAILURE)
+        pushIntrinsic(entries, INPUT_ENTRY_FAILURE)
       }
     }
     return { valid: true, entryFailure, entries }
@@ -101,9 +128,9 @@ function captureInputArray(input: unknown, maxLength: number): CapturedInputArra
 }
 
 function cloneObservationValue(value: unknown): unknown {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return value
+  if (typeof value !== 'object' || value === null || isArrayIntrinsic(value)) return value
   const observation = value as Record<string, unknown>
-  return Object.freeze({
+  return freezeIntrinsic({
     id: observation.id,
     runId: observation.runId,
     metricKey: observation.metricKey,
@@ -125,26 +152,26 @@ function observationFailureReason(
   bounds: { start: number; end: number },
   bindingAuthority: string,
 ): ObservationFailureReason | null {
-  if (typeof observation !== 'object' || observation === null || Array.isArray(observation)) return 'invalid_observation'
+  if (typeof observation !== 'object' || observation === null || isArrayIntrinsic(observation)) return 'invalid_observation'
   const value = observation as Record<string, unknown>
   if (
     !isNonEmptyString(value.id)
     || !isNonEmptyString(value.runId)
     || !isNonEmptyString(value.metricKey)
-    || !Object.hasOwn(MARKETING_MONITOR_METRIC_CONTRACT, value.metricKey)
+    || !hasOwnIntrinsic(MARKETING_MONITOR_METRIC_CONTRACT, value.metricKey)
     || typeof value.value !== 'number'
-    || !Number.isFinite(value.value)
+    || !isFiniteIntrinsic(value.value)
     || !isNonEmptyString(value.unit)
     || !isNonEmptyString(value.authority)
     || !isIsoTimestamp(value.observedAt)
   ) return 'invalid_observation'
 
-  const observedAt = Date.parse(value.observedAt)
+  const observedAt = parseDateIntrinsic(value.observedAt)
   if (observedAt < bounds.start || observedAt > bounds.end) return 'invalid_observation'
   if (value.authority !== bindingAuthority) return 'observation_authority_mismatch'
 
   const metric = MARKETING_MONITOR_METRIC_CONTRACT[value.metricKey as MarketingMonitorMetricKey]
-  if (!(metric.authorities as readonly string[]).includes(bindingAuthority)) {
+  if (!includesIntrinsic(metric.authorities as readonly string[], bindingAuthority)) {
     return 'metric_authority_not_allowed'
   }
   return value.unit === metric.unit ? null : 'observation_unit_mismatch'
@@ -168,11 +195,11 @@ type SourceDeclaration =
     }
 
 function isCanonicalSourceIdentifier(value: unknown): value is string {
-  return typeof value === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(value)
+  return typeof value === 'string' && testIntrinsic(SOURCE_IDENTIFIER, value)
 }
 
 function isCanonicalSourceKey(value: unknown): value is string {
-  return isCanonicalSourceIdentifier(value) && !value.startsWith('source_config_')
+  return isCanonicalSourceIdentifier(value) && !startsWithIntrinsic(value, 'source_config_')
 }
 
 function sourceDeclaration(sourceValue: unknown, sourceIndex: number): SourceDeclaration {
@@ -180,14 +207,19 @@ function sourceDeclaration(sourceValue: unknown, sourceIndex: number): SourceDec
     if ((typeof sourceValue !== 'object' && typeof sourceValue !== 'function') || sourceValue === null) {
       throw new Error('invalid_source_configuration')
     }
-    const key = Reflect.get(sourceValue, 'key')
-    const slot = Reflect.get(sourceValue, 'slot')
-    const read = Reflect.get(sourceValue, 'read')
+    const key = getIntrinsic(sourceValue, 'key')
+    const slot = getIntrinsic(sourceValue, 'slot')
+    const read = getIntrinsic(sourceValue, 'read')
     if (!isCanonicalSourceKey(key) || !isCanonicalSourceIdentifier(slot) || typeof read !== 'function') {
       throw new Error('invalid_source_configuration')
     }
     const source = sourceValue as MarketingMonitorSource
-    return { valid: true, source, identity: { key, slot }, read }
+    return {
+      valid: true,
+      source,
+      identity: { key, slot },
+      read: read as MarketingMonitorSource['read'],
+    }
   } catch {
     return {
       valid: false,
@@ -209,15 +241,15 @@ function validatedBindingEntry(bindingValue: unknown): {
     if ((typeof bindingValue !== 'object' && typeof bindingValue !== 'function') || bindingValue === null) {
       return { slot: null, entry: { valid: false } }
     }
-    slot = Reflect.get(bindingValue, 'slot')
-    const id = Reflect.get(bindingValue, 'id')
-    const adapter = Reflect.get(bindingValue, 'adapter')
-    const bindingKind = Reflect.get(bindingValue, 'bindingKind')
-    const capability = Reflect.get(bindingValue, 'capability')
-    const connectorId = Reflect.get(bindingValue, 'connectorId')
+    slot = getIntrinsic(bindingValue, 'slot')
+    const id = getIntrinsic(bindingValue, 'id')
+    const adapter = getIntrinsic(bindingValue, 'adapter')
+    const bindingKind = getIntrinsic(bindingValue, 'bindingKind')
+    const capability = getIntrinsic(bindingValue, 'capability')
+    const connectorId = getIntrinsic(bindingValue, 'connectorId')
     if (
       !isNonEmptyString(slot)
-      || !Object.hasOwn(MARKETING_MONITOR_BINDING_CONTRACT, slot)
+      || !hasOwnIntrinsic(MARKETING_MONITOR_BINDING_CONTRACT, slot)
     ) return { slot: null, entry: { valid: false } }
 
     const slotContract = MARKETING_MONITOR_BINDING_CONTRACT[
@@ -227,7 +259,7 @@ function validatedBindingEntry(bindingValue: unknown): {
       bindingKind: 'internal_adapter' | 'vault_connector'
       connectorId: 'null' | 'required'
     }>>>
-    if (!isNonEmptyString(adapter) || !Object.hasOwn(slotContract, adapter)) {
+    if (!isNonEmptyString(adapter) || !hasOwnIntrinsic(slotContract, adapter)) {
       return { slot, entry: { valid: false } }
     }
     const rule = slotContract[adapter]
@@ -242,18 +274,28 @@ function validatedBindingEntry(bindingValue: unknown): {
       || bindingKind !== rule.bindingKind
       || !validConnector
     ) return { slot, entry: { valid: false } }
+    const normalizedConnectorId = rule.connectorId === 'null'
+      ? null
+      : connectorId as string
 
     return {
       slot,
       entry: {
         valid: true,
-        binding: Object.freeze({ id, slot, adapter, bindingKind, capability, connectorId }),
+        binding: freezeIntrinsic({
+          id,
+          slot,
+          adapter,
+          bindingKind,
+          capability,
+          connectorId: normalizedConnectorId,
+        }),
       },
     }
   } catch {
     return {
       slot: typeof slot === 'string'
-        && Object.hasOwn(MARKETING_MONITOR_BINDING_CONTRACT, slot)
+        && hasOwnIntrinsic(MARKETING_MONITOR_BINDING_CONTRACT, slot)
         ? slot
         : null,
       entry: { valid: false },
@@ -265,7 +307,7 @@ function failedStatus(
   source: SourceIdentity,
   reason: string,
 ): CollectedSourceStatus {
-  return Object.freeze({
+  return freezeIntrinsic({
     key: source.key,
     slot: source.slot,
     status: 'failed',
@@ -275,7 +317,7 @@ function failedStatus(
 }
 
 function unavailableStatus(source: SourceIdentity, reason: string): CollectedSourceStatus {
-  return Object.freeze({
+  return freezeIntrinsic({
     key: source.key,
     slot: source.slot,
     status: 'unavailable',
@@ -286,8 +328,8 @@ function unavailableStatus(source: SourceIdentity, reason: string): CollectedSou
 
 function freezeLocalArray<T>(values: readonly T[]): readonly T[] {
   const copy: T[] = []
-  for (let index = 0; index < values.length; index += 1) copy.push(values[index])
-  return Object.freeze(copy)
+  for (let index = 0; index < values.length; index += 1) pushIntrinsic(copy, values[index])
+  return freezeIntrinsic(copy)
 }
 
 function finalizeCollection(
@@ -296,18 +338,18 @@ function finalizeCollection(
   sourceStatuses: readonly CollectedSourceStatus[],
   observations: readonly MonitorObservation[],
 ): MarketingSnapshotCollection {
-  const collection = Object.freeze({
+  const collection = freezeIntrinsic({
     runId,
     rawObservationCount,
     sources: freezeLocalArray(sourceStatuses),
     observations: freezeLocalArray(observations),
   })
-  collectedMarketingSnapshots.add(collection)
+  weakSetAddIntrinsic(collectedMarketingSnapshots, collection)
   return collection
 }
 
 function stableSnapshotReason(reason: unknown): string {
-  return isNonEmptyString(reason) && STABLE_SOURCE_REASONS.has(reason)
+  return isNonEmptyString(reason) && setHasIntrinsic(STABLE_SOURCE_REASONS, reason)
     ? reason
     : 'source_unavailable'
 }
@@ -347,33 +389,37 @@ export async function collectMarketingSnapshots(
   }
   const sourceDeclarations: SourceDeclaration[] = []
   for (let index = 0; index < sourceInput.entries.length; index += 1) {
-    sourceDeclarations.push(sourceDeclaration(sourceInput.entries[index], index))
+    pushIntrinsic(sourceDeclarations, sourceDeclaration(sourceInput.entries[index], index))
   }
 
   const bindingInput = captureInputArray(bindings, MAX_MARKETING_MONITOR_BINDINGS)
   const bindingInputInvalid = !bindingInput.valid || bindingInput.entryFailure
-  const bindingsBySlot = new Map<string, BindingEntry>()
+  const bindingsBySlot = createMap<string, BindingEntry>()
   if (!bindingInputInvalid) {
     for (let index = 0; index < bindingInput.entries.length; index += 1) {
       const validated = validatedBindingEntry(bindingInput.entries[index])
       if (validated.slot === null) continue
-      bindingsBySlot.set(validated.slot, bindingsBySlot.has(validated.slot)
+      mapSetIntrinsic(bindingsBySlot, validated.slot, mapHasIntrinsic(bindingsBySlot, validated.slot)
         ? { valid: false }
         : validated.entry)
     }
   }
 
-  const sourceKeyCounts = new Map<string, number>()
+  const sourceKeyCounts = createMap<string, number>()
   for (let index = 0; index < sourceDeclarations.length; index += 1) {
     const declaration = sourceDeclarations[index]
     if (!declaration.valid) continue
-    sourceKeyCounts.set(declaration.identity.key, (sourceKeyCounts.get(declaration.identity.key) ?? 0) + 1)
+    mapSetIntrinsic(
+      sourceKeyCounts,
+      declaration.identity.key,
+      (mapGetIntrinsic(sourceKeyCounts, declaration.identity.key) ?? 0) + 1,
+    )
   }
-  const emittedDuplicateKeys = new Set<string>()
+  const emittedDuplicateKeys = createSet<string>()
 
   const sourceStatuses: CollectedSourceStatus[] = []
   const observations: MonitorObservation[] = []
-  const observationIds = new Set<string>()
+  const observationIds = createSet<string>()
   let runId: string | null = null
   let rawObservationCount = 0
 
@@ -381,35 +427,35 @@ export async function collectMarketingSnapshots(
     const declaration = sourceDeclarations[sourceIndex]
     const sourceIdentity = declaration.identity
     if (!declaration.valid) {
-      sourceStatuses.push(failedStatus(sourceIdentity, 'invalid_source_configuration'))
+      pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'invalid_source_configuration'))
       continue
     }
-    if ((sourceKeyCounts.get(sourceIdentity.key) ?? 0) > 1) {
-      if (!emittedDuplicateKeys.has(sourceIdentity.key)) {
-        emittedDuplicateKeys.add(sourceIdentity.key)
-        sourceStatuses.push(failedStatus(sourceIdentity, 'duplicate_source_identity'))
+    if ((mapGetIntrinsic(sourceKeyCounts, sourceIdentity.key) ?? 0) > 1) {
+      if (!setHasIntrinsic(emittedDuplicateKeys, sourceIdentity.key)) {
+        setAddIntrinsic(emittedDuplicateKeys, sourceIdentity.key)
+        pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'duplicate_source_identity'))
       }
       continue
     }
     if (bindingInputInvalid) {
-      sourceStatuses.push(failedStatus(sourceIdentity, 'invalid_binding_configuration'))
+      pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'invalid_binding_configuration'))
       continue
     }
     const source = declaration.source
     const readSource = declaration.read
 
     if (rawObservationCount > MAX_OBSERVATIONS_PER_RUN) {
-      sourceStatuses.push(failedStatus(sourceIdentity, 'run_observation_limit_exceeded'))
+      pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'run_observation_limit_exceeded'))
       continue
     }
 
-    const bindingEntry = bindingsBySlot.get(sourceIdentity.slot)
+    const bindingEntry = mapGetIntrinsic(bindingsBySlot, sourceIdentity.slot)
     if (!bindingEntry) {
-      sourceStatuses.push(unavailableStatus(sourceIdentity, 'binding_not_configured'))
+      pushIntrinsic(sourceStatuses, unavailableStatus(sourceIdentity, 'binding_not_configured'))
       continue
     }
     if (!bindingEntry.valid) {
-      sourceStatuses.push(failedStatus(sourceIdentity, 'invalid_binding_configuration'))
+      pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'invalid_binding_configuration'))
       continue
     }
     const binding = bindingEntry.binding
@@ -417,77 +463,78 @@ export async function collectMarketingSnapshots(
       binding.adapter as keyof typeof MARKETING_MONITOR_ADAPTER_AUTHORITIES
     ]
     if (!bindingAuthority) {
-      sourceStatuses.push(failedStatus(sourceIdentity, 'binding_adapter_not_supported'))
+      pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'binding_adapter_not_supported'))
       continue
     }
     const preReadBindingFailure = await vaultBindingFailureReason(env, binding)
     if (preReadBindingFailure) {
-      sourceStatuses.push(failedStatus(sourceIdentity, preReadBindingFailure))
+      pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, preReadBindingFailure))
       continue
     }
 
     let snapshot: SourceSnapshot
     try {
-      snapshot = await Reflect.apply(readSource, source, [env, binding, sourceWindow])
+      snapshot = await applyIntrinsic(readSource, source, [env, binding, sourceWindow])
     } catch {
-      sourceStatuses.push(failedStatus(sourceIdentity, 'source_read_failed'))
+      pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'source_read_failed'))
       continue
     }
 
     try {
       if (!snapshot || typeof snapshot !== 'object') {
-        sourceStatuses.push(failedStatus(sourceIdentity, 'invalid_source_snapshot'))
+        pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'invalid_source_snapshot'))
         continue
       }
-      const sourceObservations = Reflect.get(snapshot, 'observations')
-      if (!Array.isArray(sourceObservations)) {
-        sourceStatuses.push(failedStatus(sourceIdentity, 'invalid_source_snapshot'))
+      const sourceObservations = getIntrinsic(snapshot, 'observations')
+      if (!isArrayIntrinsic(sourceObservations)) {
+        pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'invalid_source_snapshot'))
         continue
       }
-      const sourceObservationCount = Reflect.get(sourceObservations, 'length')
+      const sourceObservationCount = getIntrinsic(sourceObservations, 'length')
       if (
-        !Number.isInteger(sourceObservationCount)
-        || sourceObservationCount < 0
-        || sourceObservationCount > MAX_JS_ARRAY_LENGTH
+        !isIntegerIntrinsic(sourceObservationCount)
+        || (sourceObservationCount as number) < 0
+        || (sourceObservationCount as number) > MAX_JS_ARRAY_LENGTH
       ) {
-        sourceStatuses.push(failedStatus(sourceIdentity, 'invalid_source_snapshot'))
+        pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'invalid_source_snapshot'))
         continue
       }
-      rawObservationCount += sourceObservationCount
+      const acceptedSourceObservationCount = sourceObservationCount as number
+      rawObservationCount += acceptedSourceObservationCount
 
-      if (sourceObservationCount > MAX_OBSERVATIONS_PER_SOURCE) {
-        sourceStatuses.push(failedStatus(sourceIdentity, 'source_observation_limit_exceeded'))
+      if (acceptedSourceObservationCount > MAX_OBSERVATIONS_PER_SOURCE) {
+        pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'source_observation_limit_exceeded'))
         continue
       }
 
       if (rawObservationCount > MAX_OBSERVATIONS_PER_RUN) {
-        sourceStatuses.push(failedStatus(sourceIdentity, 'run_observation_limit_exceeded'))
+        pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'run_observation_limit_exceeded'))
         continue
       }
 
-      const snapshotStatus = Reflect.get(snapshot, 'status')
+      const snapshotStatus = getIntrinsic(snapshot, 'status')
       if (snapshotStatus === 'unavailable') {
-        sourceStatuses.push(sourceObservationCount === 0
-          ? unavailableStatus(sourceIdentity, stableSnapshotReason(Reflect.get(snapshot, 'reason')))
+        pushIntrinsic(sourceStatuses, acceptedSourceObservationCount === 0
+          ? unavailableStatus(sourceIdentity, stableSnapshotReason(getIntrinsic(snapshot, 'reason')))
           : failedStatus(sourceIdentity, 'invalid_source_snapshot'))
         continue
       }
 
       if (snapshotStatus === 'failed') {
-        sourceStatuses.push(sourceObservationCount === 0
-          ? failedStatus(sourceIdentity, stableSnapshotReason(Reflect.get(snapshot, 'reason')))
+        pushIntrinsic(sourceStatuses, acceptedSourceObservationCount === 0
+          ? failedStatus(sourceIdentity, stableSnapshotReason(getIntrinsic(snapshot, 'reason')))
           : failedStatus(sourceIdentity, 'invalid_source_snapshot'))
         continue
       }
 
       if (snapshotStatus !== 'available') {
-        sourceStatuses.push(failedStatus(sourceIdentity, 'invalid_source_snapshot'))
+        pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'invalid_source_snapshot'))
         continue
       }
 
       const copiedObservations: unknown[] = []
-      for (let index = 0; index < sourceObservationCount; index += 1) {
-        copiedObservations.push(Reflect.get(sourceObservations, index))
+      for (let index = 0; index < acceptedSourceObservationCount; index += 1) {
+        pushIntrinsic(copiedObservations, getIntrinsic(sourceObservations, index))
       }
       const clonedObservations: unknown[] = []
       let observationFailure: ObservationFailureReason | null = null
@@ -498,26 +545,26 @@ export async function collectMarketingSnapshots(
           observationFailure = failure
           break
         }
-        clonedObservations.push(cloned)
+        pushIntrinsic(clonedObservations, cloned)
       }
       if (observationFailure) {
-        sourceStatuses.push(failedStatus(sourceIdentity, observationFailure))
+        pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, observationFailure))
         continue
       }
       const acceptedSourceObservations = clonedObservations as MonitorObservation[]
 
-      const sourceIds = new Set<string>()
+      const sourceIds = createSet<string>()
       let duplicateId = false
       for (let index = 0; index < acceptedSourceObservations.length; index += 1) {
         const observation = acceptedSourceObservations[index]
-        if (sourceIds.has(observation.id) || observationIds.has(observation.id)) {
+        if (setHasIntrinsic(sourceIds, observation.id) || setHasIntrinsic(observationIds, observation.id)) {
           duplicateId = true
           break
         }
-        sourceIds.add(observation.id)
+        setAddIntrinsic(sourceIds, observation.id)
       }
       if (duplicateId) {
-        sourceStatuses.push(failedStatus(sourceIdentity, 'duplicate_observation_id'))
+        pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'duplicate_observation_id'))
         continue
       }
 
@@ -530,30 +577,30 @@ export async function collectMarketingSnapshots(
         }
       }
       if (sourceRunMismatch || (sourceRunId !== null && runId !== null && sourceRunId !== runId)) {
-        sourceStatuses.push(failedStatus(sourceIdentity, 'run_id_mismatch'))
+        pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'run_id_mismatch'))
         continue
       }
 
       const postReadBindingFailure = await vaultBindingFailureReason(env, binding)
       if (postReadBindingFailure) {
-        sourceStatuses.push(failedStatus(sourceIdentity, postReadBindingFailure))
+        pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, postReadBindingFailure))
         continue
       }
 
       for (let index = 0; index < acceptedSourceObservations.length; index += 1) {
         const observation = acceptedSourceObservations[index]
-        observations.push(observation)
-        observationIds.add(observation.id)
+        pushIntrinsic(observations, observation)
+        setAddIntrinsic(observationIds, observation.id)
       }
       if (runId === null && sourceRunId !== null) runId = sourceRunId
-      sourceStatuses.push(Object.freeze({
+      pushIntrinsic(sourceStatuses, freezeIntrinsic({
         key: sourceIdentity.key,
         slot: sourceIdentity.slot,
         status: 'available',
-        observationCount: sourceObservationCount,
+        observationCount: acceptedSourceObservationCount,
       }))
     } catch {
-      sourceStatuses.push(failedStatus(sourceIdentity, 'invalid_source_snapshot'))
+      pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'invalid_source_snapshot'))
     }
   }
 

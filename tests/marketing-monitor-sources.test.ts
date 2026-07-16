@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { createMarketingMonitorFixtureSource } from './fixtures/marketing-monitor'
-import { collectMarketingSnapshots, MAX_OBSERVATIONS_PER_RUN, MAX_OBSERVATIONS_PER_SOURCE } from '../src/addons/marketing/sources'
+import {
+  collectMarketingSnapshots,
+  isCollectedMarketingSnapshot,
+  MAX_OBSERVATIONS_PER_RUN,
+  MAX_OBSERVATIONS_PER_SOURCE,
+} from '../src/addons/marketing/sources'
 import { MARKETING_MONITOR_METRIC_CONTRACT } from '../src/addons/marketing/types'
 import * as MarketingTypes from '../src/addons/marketing/types'
 import type {
@@ -273,6 +278,41 @@ describe('collectMarketingSnapshots', () => {
     expect(callOverrideCalls).toBe(0)
     expect(bodyCalls).toBe(1)
     expect(snapshot.observations).toEqual([observation({ id: 'trusted-read-evidence' })])
+  })
+
+  it('uses module-captured includes, freeze, and WeakSet add after source execution', async () => {
+    const originalIncludes = Array.prototype.includes
+    const originalFreeze = Object.freeze
+    const originalWeakSetAdd = WeakSet.prototype.add
+    let snapshot: Awaited<ReturnType<typeof collectMarketingSnapshots>> | undefined
+
+    try {
+      snapshot = await collectMarketingSnapshots(env, bindings, window, [
+        source('intrinsic-mutator', 'web_analytics', async () => {
+          Array.prototype.includes = () => true
+          Object.freeze = ((value: unknown) => value) as typeof Object.freeze
+          WeakSet.prototype.add = function () { return this }
+          return available([observation({
+            metricKey: 'finance.revenue',
+            unit: 'usd',
+            authority: 'first-party',
+          })])
+        }),
+      ])
+    } finally {
+      Array.prototype.includes = originalIncludes
+      Object.freeze = originalFreeze
+      WeakSet.prototype.add = originalWeakSetAdd
+    }
+
+    expect(snapshot?.observations).toEqual([])
+    expect(snapshot?.sources[0]).toMatchObject({
+      status: 'failed',
+      reason: 'metric_authority_not_allowed',
+    })
+    expect(Object.isFrozen(snapshot)).toBe(true)
+    expect(Object.isFrozen(snapshot?.sources[0])).toBe(true)
+    expect(isCollectedMarketingSnapshot(snapshot)).toBe(true)
   })
 
   it('rejects more than 16 source declarations without reading them', async () => {

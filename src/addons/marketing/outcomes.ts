@@ -7,6 +7,7 @@ import {
   type OutcomeValue,
 } from './types'
 import { isCollectedMarketingSnapshot } from './sources'
+import { freezeIntrinsic, includesIntrinsic } from './intrinsics'
 
 const OUTCOME_METRICS = {
   visibility: 'seo.ai_citations',
@@ -17,7 +18,7 @@ const OUTCOME_METRICS = {
 } as const
 
 function unavailable(): OutcomeValue {
-  return { status: 'unavailable', reason: 'authoritative_source_missing' }
+  return freezeIntrinsic({ status: 'unavailable', reason: 'authoritative_source_missing' })
 }
 
 function outcomeFor(
@@ -26,10 +27,11 @@ function outcomeFor(
 ): OutcomeValue {
   let matching: MonitorObservation | undefined
   const authorities = MARKETING_MONITOR_METRIC_CONTRACT[metricKey].authorities as readonly string[]
-  for (const observation of observations) {
+  for (let index = 0; index < observations.length; index += 1) {
+    const observation = observations[index]
     if (
       observation.metricKey === metricKey
-      && authorities.includes(observation.authority)
+      && includesIntrinsic(authorities, observation.authority)
       && (
         matching === undefined
         || observation.observedAt > matching.observedAt
@@ -38,13 +40,13 @@ function outcomeFor(
     ) matching = observation
   }
   if (!matching) return unavailable()
-  return {
+  return freezeIntrinsic({
     status: 'available',
     value: matching.value,
     unit: matching.unit,
     source: matching.authority,
     observedAt: matching.observedAt,
-  }
+  })
 }
 
 export function deriveMarketingOutcomes(
@@ -54,11 +56,11 @@ export function deriveMarketingOutcomes(
     throw new Error('unnormalized_marketing_snapshot')
   }
   const observations = collection.observations
-  return {
+  return freezeIntrinsic({
     visibility: outcomeFor(observations, OUTCOME_METRICS.visibility),
     qualifiedTraffic: outcomeFor(observations, OUTCOME_METRICS.qualifiedTraffic),
     leads: outcomeFor(observations, OUTCOME_METRICS.leads),
     conversion: outcomeFor(observations, OUTCOME_METRICS.conversion),
     revenue: outcomeFor(observations, OUTCOME_METRICS.revenue),
-  }
+  })
 }
