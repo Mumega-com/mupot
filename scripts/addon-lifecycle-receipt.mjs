@@ -100,10 +100,10 @@ export function formatPlan(opts = {}) {
     '',
     'This mode performs no writes. Run the following check against a fresh fixture-addon lifecycle.',
     `1. Read the bearer only from environment variable ${tokenEnv}; never print it.`,
-    '2. GET /api/org/departments and record the existing department IDs.',
+    '2. GET /api/org/departments and record complete normalized department records.',
     '3. POST /api/addons/fixture-addon/install -> 201.',
-    '4. GET /api/org/departments and require zero added department rows.',
-    '5. GET /api/addons/fixture-addon/receipts and record the install receipt ID.',
+    '4. GET /api/org/departments and require no added, deleted, or mutated department records.',
+    '5. GET /api/addons/fixture-addon/receipts and require ownershipClaimCount is exactly zero before recording the install receipt ID.',
     '6. POST /api/addons/fixture-addon/configure -> 200; record its receipt ID.',
     '7. POST /api/addons/fixture-addon/activate -> 200; record its receipt ID.',
     '8. POST /api/addons/fixture-addon/disable -> 200; record its receipt ID.',
@@ -111,7 +111,7 @@ export function formatPlan(opts = {}) {
     '10. POST /api/addons/fixture-addon/disable -> 200; record its receipt ID.',
     '11. POST /api/addons/fixture-addon/archive -> 200; record its receipt ID.',
     '12. POST /api/addons/fixture-addon/activate -> 409 after archive.',
-    '13. Re-read receipts and require that archived reactivation created no receipt.',
+    '13. GET /api/addons and require fixture-addon remains archived; re-read receipts and require the exact seven validated lifecycle receipts.',
     '14. Emit one redacted mupot-addon-lifecycle/v1 JSON receipt.',
     '',
     `node scripts/addon-lifecycle-receipt.mjs --check --base-url ${shellQuote(baseUrl)} --token-env ${shellQuote(tokenEnv)}`,
@@ -133,6 +133,59 @@ function hasSensitiveKey(value, path = []) {
     if (hasSensitiveKey(child, [...path, key])) return true
   }
   return false
+}
+
+function hasCredentialValue(value, credential) {
+  if (typeof value === 'string') return value.includes(credential)
+  if (Array.isArray(value)) return value.some((entry) => hasCredentialValue(entry, credential))
+  if (!isRecord(value)) return false
+  return Object.values(value).some((entry) => hasCredentialValue(entry, credential))
+}
+
+function normalizeJson(value) {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (Array.isArray(value)) return value.map(normalizeJson)
+  if (isRecord(value)) {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, normalizeJson(value[key])]))
+  }
+  throw new LifecycleFailure('departments_response_invalid')
+}
+
+function normalizedDepartmentRecords(body) {
+  if (!isRecord(body) || !Array.isArray(body.departments)) throw new LifecycleFailure('departments_response_invalid')
+  const records = new Map()
+  for (const department of body.departments) {
+    if (!isRecord(department) || typeof department.id !== 'string' || department.id.length === 0) {
+      throw new LifecycleFailure('departments_response_invalid')
+    }
+    if (records.has(department.id)) throw new LifecycleFailure('departments_response_invalid')
+    records.set(department.id, JSON.stringify(normalizeJson(department)))
+  }
+  return records
+}
+
+function departmentDiffCount(before, after) {
+  let count = 0
+  for (const [id, record] of before) {
+    if (!after.has(id) || after.get(id) !== record) count += 1
+  }
+  for (const id of after.keys()) {
+    if (!before.has(id)) count += 1
+  }
+  return count
+}
+
+function ownershipClaimCount(body) {
+  if (!isRecord(body) || !Number.isSafeInteger(body.ownershipClaimCount) || body.ownershipClaimCount < 0) {
+    throw new LifecycleFailure('ownership_claim_count_invalid')
+  }
+  return body.ownershipClaimCount
+}
+
+function isReceiptId(value) {
+  return typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
 }
 
 function sameTransitions(actual) {
@@ -185,29 +238,46 @@ function checkedBaseUrl(raw) {
   return stripTrailingSlash(url.href)
 }
 
-function departmentIds(body) {
-  if (!isRecord(body) || !Array.isArray(body.departments)) throw new LifecycleFailure('departments_response_invalid')
-  const ids = body.departments.map((department) => isRecord(department) ? department.id : null)
-  if (ids.some((id) => typeof id !== 'string' || id.length === 0)) {
-    throw new LifecycleFailure('departments_response_invalid')
-  }
-  return new Set(ids)
-}
-
 function receiptList(body) {
   if (!isRecord(body) || !Array.isArray(body.receipts)) throw new LifecycleFailure('receipts_response_invalid')
   return body.receipts
 }
 
-function findNewReceipt(receipts, seenIds, expected) {
-  return receipts.find((receipt) => isRecord(receipt)
-    && typeof receipt.id === 'string'
-    && receipt.id.length > 0
-    && !seenIds.has(receipt.id)
+function receiptMatchesExpected(receipt, expected, bearer) {
+  return isRecord(receipt)
+    && isReceiptId(receipt.id)
+    && !receipt.id.includes(bearer)
     && receipt.action === expected.action
     && receipt.nextState === expected.state
     && receipt.addonKey === ADDON_KEY
-    && receipt.outcome === 'pass')
+    && receipt.outcome === 'pass'
+}
+
+function findNewReceipt(receipts, seenIds, expected, bearer) {
+  return receipts.find((receipt) => isRecord(receipt)
+    && receiptMatchesExpected(receipt, expected, bearer)
+    && !seenIds.has(receipt.id)
+  )
+}
+
+function archivedCatalogStateIsValid(body) {
+  if (!isRecord(body) || !Array.isArray(body.addons)) return false
+  const matching = body.addons.filter((addon) => isRecord(addon) && addon.key === ADDON_KEY)
+  return matching.length === 1 && matching[0].state === 'archived'
+}
+
+function finalReceiptsAreExact(receipts, expectedReceipts, bearer) {
+  if (receipts.length !== expectedReceipts.size) return false
+  const finalIds = new Set()
+  for (const receipt of receipts) {
+    if (!isRecord(receipt) || !isReceiptId(receipt.id) || receipt.id.includes(bearer) || finalIds.has(receipt.id)) {
+      return false
+    }
+    const expected = expectedReceipts.get(receipt.id)
+    if (!expected || !receiptMatchesExpected(receipt, expected, bearer)) return false
+    finalIds.add(receipt.id)
+  }
+  return finalIds.size === expectedReceipts.size
 }
 
 export async function runLifecycleCheck(opts, deps = {}) {
@@ -226,6 +296,7 @@ export async function runLifecycleCheck(opts, deps = {}) {
   const transitions = []
   const receiptIds = []
   const seenReceiptIds = new Set()
+  const expectedReceipts = new Map()
   const httpStatuses = []
   let installSideEffectCount = -1
   let secretsPresent = false
@@ -255,7 +326,7 @@ export async function runLifecycleCheck(opts, deps = {}) {
     } catch {
       throw new LifecycleFailure(`${step}_response_invalid`)
     }
-    if (hasSensitiveKey(body)) secretsPresent = true
+    if (hasSensitiveKey(body) || hasCredentialValue(body, bearer)) secretsPresent = true
     return { status: response.status, body }
   }
 
@@ -266,7 +337,7 @@ export async function runLifecycleCheck(opts, deps = {}) {
   try {
     const before = await request('departments_before_install', '/api/org/departments')
     requireStatus(before.status, 200, 'departments_before_install')
-    const beforeIds = departmentIds(before.body)
+    const beforeDepartments = normalizedDepartmentRecords(before.body)
 
     for (const expected of LIFECYCLE) {
       const mutation = await request(expected.action, `/api/addons/${ADDON_KEY}/${expected.action}`, 'POST')
@@ -282,15 +353,25 @@ export async function runLifecycleCheck(opts, deps = {}) {
       if (expected.action === 'install') {
         const after = await request('departments_after_install', '/api/org/departments')
         requireStatus(after.status, 200, 'departments_after_install')
-        const afterIds = departmentIds(after.body)
-        installSideEffectCount = [...afterIds].filter((id) => !beforeIds.has(id)).length
+        const afterDepartments = normalizedDepartmentRecords(after.body)
+        const receiptResponse = await request('install_receipts', `/api/addons/${ADDON_KEY}/receipts`)
+        requireStatus(receiptResponse.status, 200, 'install_receipts')
+        installSideEffectCount = departmentDiffCount(beforeDepartments, afterDepartments)
+          + ownershipClaimCount(receiptResponse.body)
+        const receipt = findNewReceipt(receiptList(receiptResponse.body), seenReceiptIds, expected, bearer)
+        if (!receipt) throw new LifecycleFailure('install_receipt_missing')
+        seenReceiptIds.add(receipt.id)
+        expectedReceipts.set(receipt.id, expected)
+        receiptIds.push(receipt.id)
+        continue
       }
 
       const receiptResponse = await request(`${expected.action}_receipts`, `/api/addons/${ADDON_KEY}/receipts`)
       requireStatus(receiptResponse.status, 200, `${expected.action}_receipts`)
-      const receipt = findNewReceipt(receiptList(receiptResponse.body), seenReceiptIds, expected)
+      const receipt = findNewReceipt(receiptList(receiptResponse.body), seenReceiptIds, expected, bearer)
       if (!receipt) throw new LifecycleFailure(`${expected.action}_receipt_missing`)
       seenReceiptIds.add(receipt.id)
+      expectedReceipts.set(receipt.id, expected)
       receiptIds.push(receipt.id)
     }
 
@@ -304,14 +385,14 @@ export async function runLifecycleCheck(opts, deps = {}) {
       throw new LifecycleFailure('archived_reactivation_response_invalid')
     }
 
+    const catalog = await request('archived_catalog', '/api/addons')
+    requireStatus(catalog.status, 200, 'archived_catalog')
+    if (!archivedCatalogStateIsValid(catalog.body)) failureCodes.push('archived_catalog_state_invalid')
+
     const finalReceipts = await request('archived_receipts', `/api/addons/${ADDON_KEY}/receipts`)
     requireStatus(finalReceipts.status, 200, 'archived_receipts')
-    const finalIds = receiptList(finalReceipts.body)
-      .filter(isRecord)
-      .map((receipt) => receipt.id)
-      .filter((id) => typeof id === 'string')
-    if (finalIds.some((id) => !seenReceiptIds.has(id))) {
-      throw new LifecycleFailure('archived_reactivation_created_receipt')
+    if (!finalReceiptsAreExact(receiptList(finalReceipts.body), expectedReceipts, bearer)) {
+      failureCodes.push('archived_receipts_invalid')
     }
   } catch (error) {
     failureCodes.push(error instanceof LifecycleFailure ? error.code : 'lifecycle_check_failed')

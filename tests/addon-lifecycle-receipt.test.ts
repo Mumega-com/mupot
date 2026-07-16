@@ -24,6 +24,91 @@ function validReceipt() {
   }
 }
 
+const FIXTURE_RECEIPT_IDS = Object.freeze([
+  '00000000-0000-4000-8000-000000000001',
+  '00000000-0000-4000-8000-000000000002',
+  '00000000-0000-4000-8000-000000000003',
+  '00000000-0000-4000-8000-000000000004',
+  '00000000-0000-4000-8000-000000000005',
+  '00000000-0000-4000-8000-000000000006',
+  '00000000-0000-4000-8000-000000000007',
+])
+
+const LIFECYCLE_TRANSITIONS = Object.freeze([
+  ['install', 'installed', 201],
+  ['configure', 'configured', 200],
+  ['activate', 'active', 200],
+  ['disable', 'disabled', 200],
+  ['activate', 'active', 200],
+  ['disable', 'disabled', 200],
+  ['archive', 'archived', 200],
+])
+
+function createLifecycleFetch(options: {
+  beforeDepartments?: Array<Record<string, unknown>>
+  afterDepartments?: Array<Record<string, unknown>>
+  ownershipClaimCount?: unknown
+  receiptIds?: readonly string[]
+  receiptExtra?: Record<string, unknown>
+  finalReceipts?: Array<Record<string, unknown>>
+  catalogState?: string
+} = {}) {
+  const receipts: Array<Record<string, unknown>> = []
+  const calls: Array<{ path: string; method: string; authorization: string | null; cookie: string | null }> = []
+  const beforeDepartments = options.beforeDepartments ?? [{ id: 'existing', slug: 'existing' }]
+  const afterDepartments = options.afterDepartments ?? beforeDepartments
+  let transitionIndex = 0
+  let departmentReadCount = 0
+  let receiptReadCount = 0
+
+  const fetch = async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url)
+    const headers = new Headers(init?.headers)
+    const method = init?.method ?? 'GET'
+    calls.push({
+      path: url.pathname,
+      method,
+      authorization: headers.get('authorization'),
+      cookie: headers.get('cookie'),
+    })
+
+    if (url.pathname === '/api/org/departments') {
+      return Response.json({ departments: departmentReadCount++ === 0 ? beforeDepartments : afterDepartments })
+    }
+    if (url.pathname === '/api/addons') {
+      return Response.json({ addons: [{ key: ADDON_KEY, state: options.catalogState ?? 'archived' }] })
+    }
+    if (url.pathname === '/api/addons/fixture-addon/receipts') {
+      const listed = receiptReadCount++ === LIFECYCLE_TRANSITIONS.length
+        ? options.finalReceipts ?? [...receipts].reverse()
+        : [...receipts].reverse()
+      return Response.json({ receipts: listed, ownershipClaimCount: options.ownershipClaimCount ?? 0 })
+    }
+    if (url.pathname.startsWith('/api/addons/fixture-addon/')) {
+      const action = url.pathname.split('/').at(-1)
+      if (transitionIndex === LIFECYCLE_TRANSITIONS.length && action === 'activate') {
+        return Response.json({ error: 'invalid_state', state: null }, { status: 409 })
+      }
+      const expected = LIFECYCLE_TRANSITIONS[transitionIndex]
+      if (!expected || action !== expected[0]) return Response.json({ error: 'unexpected_test_action' }, { status: 500 })
+      transitionIndex += 1
+      receipts.push({
+        sequence: transitionIndex,
+        id: options.receiptIds?.[transitionIndex - 1] ?? FIXTURE_RECEIPT_IDS[transitionIndex - 1],
+        action,
+        nextState: expected[1],
+        addonKey: ADDON_KEY,
+        outcome: 'pass',
+        ...options.receiptExtra,
+      })
+      return Response.json({ ok: true, key: ADDON_KEY, state: expected[1] }, { status: expected[2] })
+    }
+    return Response.json({ error: 'not_found' }, { status: 404 })
+  }
+
+  return { fetch, calls }
+}
+
 describe('addon lifecycle receipt checker', () => {
   it('provides exact package plan and check commands', () => {
     const pkg = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8'))
@@ -151,76 +236,86 @@ describe('addon lifecycle receipt checker', () => {
     },
   )
 
-  it('performs the API lifecycle, records statuses and receipt IDs, and emits no bearer', async () => {
-    const transitions = [
-      ['install', 'installed', 201],
-      ['configure', 'configured', 200],
-      ['activate', 'active', 200],
-      ['disable', 'disabled', 200],
-      ['activate', 'active', 200],
-      ['disable', 'disabled', 200],
-      ['archive', 'archived', 200],
-    ] as const
-    const receipts: Array<Record<string, unknown>> = []
-    const calls: Array<{ path: string; method: string; authorization: string | null; cookie: string | null }> = []
-    let transitionIndex = 0
-
-    const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
-      const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url)
-      const headers = new Headers(init?.headers)
-      const method = init?.method ?? 'GET'
-      calls.push({
-        path: url.pathname,
-        method,
-        authorization: headers.get('authorization'),
-        cookie: headers.get('cookie'),
-      })
-
-      if (url.pathname === '/api/org/departments') {
-        return Response.json({ departments: [{ id: 'existing', slug: 'existing' }] })
-      }
-      if (url.pathname === '/api/addons/fixture-addon/receipts') {
-        return Response.json({ receipts: [...receipts].reverse() })
-      }
-      if (url.pathname.startsWith('/api/addons/fixture-addon/')) {
-        const action = url.pathname.split('/').at(-1)
-        if (transitionIndex === transitions.length && action === 'activate') {
-          return Response.json({ error: 'invalid_state', state: null }, { status: 409 })
-        }
-        const expected = transitions[transitionIndex]
-        if (!expected || action !== expected[0]) {
-          return Response.json({ error: 'unexpected_test_action' }, { status: 500 })
-        }
-        transitionIndex += 1
-        receipts.push({
-          sequence: transitionIndex,
-          id: `receipt-${transitionIndex}`,
-          action,
-          nextState: expected[1],
-          addonKey: ADDON_KEY,
-          outcome: 'pass',
-        })
-        return Response.json({ ok: true, key: ADDON_KEY, state: expected[1] }, { status: expected[2] })
-      }
-      return Response.json({ error: 'not_found' }, { status: 404 })
-    }
-
-    const bearer = 'owner-bearer-value-that-must-never-appear'
+  it('fails when install mutates a complete department record or reports ownership claims', async () => {
+    const { fetch } = createLifecycleFetch({
+      beforeDepartments: [{ id: 'existing', slug: 'existing', active: true }],
+      afterDepartments: [{ id: 'existing', slug: 'renamed', active: true }],
+      ownershipClaimCount: 1,
+    })
     const receipt = await runLifecycleCheck(
       { baseUrl: 'https://pot.test', tokenEnv: 'MUPOT_OWNER_BEARER' },
-      { fetch: fetchImpl, env: { MUPOT_OWNER_BEARER: bearer } },
+      { fetch, env: { MUPOT_OWNER_BEARER: 'owner-bearer-value' } },
+    )
+
+    expect(receipt).toEqual(expect.objectContaining({
+      status: 'fail',
+      install_side_effect_count: 2,
+      failure_codes: expect.arrayContaining(['install_side_effect_count_nonzero']),
+    }))
+  })
+
+  it.each([
+    ['receipt id', (bearer: string) => ({ receiptIds: [bearer, ...FIXTURE_RECEIPT_IDS.slice(1)] })],
+    ['innocuous receipt field', (bearer: string) => ({ receiptExtra: { observed: bearer } })],
+  ])('fails closed without emitting a credential reflected through %s', async (_location, optionsForBearer) => {
+    const bearer = 'owner-bearer-value-that-must-never-appear'
+    const { fetch } = createLifecycleFetch(optionsForBearer(bearer))
+    const receipt = await runLifecycleCheck(
+      { baseUrl: 'https://pot.test', tokenEnv: 'MUPOT_OWNER_BEARER' },
+      { fetch, env: { MUPOT_OWNER_BEARER: bearer } },
+    )
+
+    expect(receipt).toEqual(expect.objectContaining({
+      status: 'fail',
+      secrets_present: true,
+    }))
+    expect(JSON.stringify(receipt)).not.toContain(bearer)
+  })
+
+  it('fails when archived catalog state or final receipt evidence is incomplete', async () => {
+    const { fetch } = createLifecycleFetch({
+      catalogState: 'disabled',
+      finalReceipts: [
+        ...FIXTURE_RECEIPT_IDS.slice(0, 6).map((id, index) => ({
+          sequence: index + 1,
+          id,
+          action: LIFECYCLE_TRANSITIONS[index][0],
+          nextState: LIFECYCLE_TRANSITIONS[index][1],
+          addonKey: ADDON_KEY,
+          outcome: 'pass',
+        })),
+        {
+          sequence: 8,
+          id: FIXTURE_RECEIPT_IDS[0],
+          action: 'install',
+          nextState: 'installed',
+          addonKey: ADDON_KEY,
+          outcome: 'pass',
+        },
+      ],
+    })
+    const receipt = await runLifecycleCheck(
+      { baseUrl: 'https://pot.test', tokenEnv: 'MUPOT_OWNER_BEARER' },
+      { fetch, env: { MUPOT_OWNER_BEARER: 'owner-bearer-value' } },
+    )
+
+    expect(receipt).toEqual(expect.objectContaining({ status: 'fail' }))
+    expect(receipt.failure_codes).toEqual(expect.arrayContaining([
+      'archived_catalog_state_invalid',
+      'archived_receipts_invalid',
+    ]))
+  })
+
+  it('performs the API lifecycle, records statuses and receipt IDs, and emits no bearer', async () => {
+    const bearer = 'owner-bearer-value-that-must-never-appear'
+    const { fetch, calls } = createLifecycleFetch()
+    const receipt = await runLifecycleCheck(
+      { baseUrl: 'https://pot.test', tokenEnv: 'MUPOT_OWNER_BEARER' },
+      { fetch, env: { MUPOT_OWNER_BEARER: bearer } },
     )
 
     expect(receipt).toEqual(expect.objectContaining(validReceipt()))
-    expect(receipt.receipt_ids).toEqual([
-      'receipt-1',
-      'receipt-2',
-      'receipt-3',
-      'receipt-4',
-      'receipt-5',
-      'receipt-6',
-      'receipt-7',
-    ])
+    expect(receipt.receipt_ids).toEqual(FIXTURE_RECEIPT_IDS)
     expect(receipt.http_statuses).toEqual(expect.arrayContaining([
       { step: 'install', status: 201 },
       { step: 'archived_reactivation', status: 409 },
@@ -229,6 +324,7 @@ describe('addon lifecycle receipt checker', () => {
       { path: '/api/org/departments', method: 'GET' },
       { path: '/api/addons/fixture-addon/install', method: 'POST' },
       { path: '/api/addons/fixture-addon/receipts', method: 'GET' },
+      { path: '/api/addons', method: 'GET' },
     ]))
     expect(calls.every((call) => call.authorization === `Bearer ${bearer}`)).toBe(true)
     expect(calls.every((call) => call.cookie === `mupot_session=${encodeURIComponent(bearer)}`)).toBe(true)

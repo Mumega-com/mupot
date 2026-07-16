@@ -210,7 +210,7 @@ describe('addon lifecycle routes', () => {
     expect(catalogBody.addons.find((addon) => addon.key === 'fixture-addon')?.state).toBeNull()
 
     const receipts = await addonsApp.fetch(request('/fixture-addon/receipts', 'GET'), ownerEnv)
-    await expect(receipts.json()).resolves.toEqual({ receipts: [] })
+    await expect(receipts.json()).resolves.toEqual({ receipts: [], ownershipClaimCount: 0 })
   })
 
   it('prefers a live reinstall over archived history in the catalog state', async () => {
@@ -268,15 +268,34 @@ describe('addon lifecycle routes', () => {
     expect(body.receipts.find((receipt) => receipt.action === 'archive')?.sequence).toBe(newestArchiveReceipt.sequence)
   })
 
-  it('returns only redacted tenant-scoped receipt fields', async () => {
+  it('returns only redacted tenant-scoped receipt fields and an aggregate ownership count', async () => {
     const ownerEnv = envForRole(harness, 'owner')
     await addonsApp.fetch(request('/fixture-addon/install', 'POST'), ownerEnv)
+    const installation = harness.sqlite.prepare(`
+      SELECT id FROM addon_installations
+       WHERE tenant = 'tenant-a' AND addon_key = 'fixture-addon'
+    `).get() as { id: string }
+    const now = new Date().toISOString()
+    harness.sqlite.prepare(`
+      INSERT INTO addon_resource_ownership (
+        id, tenant, installation_id, resource_type, resource_id,
+        resource_key, ownership_mode, active, created_at, released_at
+      ) VALUES
+        ('active-claim', 'tenant-a', ?, 'department', 'department-active', 'active-module', 'co_owner', 1, ?, NULL),
+        ('inactive-claim', 'tenant-a', ?, 'department', 'department-inactive', 'inactive-module', 'co_owner', 0, ?, ?)
+    `).run(installation.id, now, installation.id, now, now)
 
     const res = await addonsApp.fetch(request('/fixture-addon/receipts', 'GET'), ownerEnv)
 
     expect(res.status).toBe(200)
-    const body = await res.json() as { receipts: Array<Record<string, unknown>> }
+    const body = await res.json() as { receipts: Array<Record<string, unknown>>; ownershipClaimCount: unknown }
     expect(body.receipts).toHaveLength(1)
+    expect(body.ownershipClaimCount).toBe(2)
+    expect(body).not.toHaveProperty('claimIds')
+    expect(body).not.toHaveProperty('sideEffectIds')
+    expect(body).not.toHaveProperty('checks')
+    expect(body).not.toHaveProperty('tenant')
+    expect(body).not.toHaveProperty('installationId')
     expect(body.receipts[0]).toEqual(expect.objectContaining({ action: 'install', addonKey: 'fixture-addon' }))
     expect(body.receipts[0]).not.toHaveProperty('tenant')
     expect(body.receipts[0]).not.toHaveProperty('installationId')

@@ -1427,6 +1427,15 @@ export async function getAddonReceipts(env: Env, installationId: string): Promis
   return (result.results ?? []).map(receiptFromRow)
 }
 
+export async function countAddonOwnershipClaims(env: Env, installationId: string): Promise<number> {
+  const row = await env.DB.prepare(`
+    SELECT COUNT(*) AS count
+      FROM addon_resource_ownership
+     WHERE tenant = ?1 AND installation_id = ?2
+  `).bind(env.TENANT_SLUG, installationId).first<{ count: number }>()
+  return Number(row?.count ?? 0)
+}
+
 export async function installAddon(env: Env, actor: AddonActor, key: string): Promise<AddonMutationResult> {
   if (!authorized(actor)) return { ok: false, reason: 'not_authorized' }
 

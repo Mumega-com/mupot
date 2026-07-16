@@ -7,6 +7,7 @@ import { getRegisteredAddon, listRegisteredAddons } from './registry'
 import {
   activateAddon,
   archiveAddon,
+  countAddonOwnershipClaims,
   configureAddon,
   disableAddon,
   getAddonReceipts,
@@ -171,8 +172,11 @@ addonsApp.get('/:key/receipts', async (c) => {
   if (!getRegisteredAddon(c.req.param('key'))) return c.json({ error: 'addon_not_registered' }, 404)
   try {
     const installation = latestInstallationsByKey(await listAddonInstallations(c.env)).get(c.req.param('key'))
-    if (!installation) return c.json({ receipts: [] })
-    return c.json({ receipts: (await getAddonReceipts(c.env, installation.id)).map(redactedReceipt) })
+    if (!installation) return c.json({ receipts: [], ownershipClaimCount: 0 })
+    return c.json({
+      receipts: (await getAddonReceipts(c.env, installation.id)).map(redactedReceipt),
+      ownershipClaimCount: await countAddonOwnershipClaims(c.env, installation.id),
+    })
   } catch {
     return c.json({ error: 'receipt_unavailable' }, 500)
   }
