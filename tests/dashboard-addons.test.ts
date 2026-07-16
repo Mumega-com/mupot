@@ -45,9 +45,14 @@ function renderedEntry(entry: AddonCatalogEntry, installations: AddonInstallatio
 }
 
 function lifecycleScript(markup: string): string {
-  const script = markup.match(/<script>\s*([\s\S]*?)\s*<\/script>/)
-  if (!script) throw new Error('addon lifecycle script was not rendered')
-  return script[1]
+  const normalized = markup.toLowerCase()
+  const openStart = normalized.indexOf('<script')
+  const openEnd = normalized.indexOf('>', openStart)
+  const closeStart = normalized.indexOf('</script>', openEnd)
+  if (openStart < 0 || openEnd < 0 || closeStart < 0) {
+    throw new Error('addon lifecycle script was not rendered')
+  }
+  return markup.slice(openEnd + 1, closeStart).trim()
 }
 
 function lifecycleHarness(key = 'fixture-addon') {
@@ -104,6 +109,10 @@ function addonsRequest(): Request {
 }
 
 describe('addonsBody', () => {
+  it('extracts the lifecycle script without assuming lowercase HTML tags', () => {
+    expect(lifecycleScript('<SCRIPT type="module">window.ready = true</SCRIPT>')).toBe('window.ready = true')
+  })
+
   it('renders the available fixture catalog with its operational metadata', () => {
     const html = rendered()
 
