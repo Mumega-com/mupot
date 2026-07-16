@@ -98,6 +98,32 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && trimIntrinsic(value).length > 0
 }
 
+function captureVaultVerificationEnv(env: Env): Env | null {
+  try {
+    if (typeof env !== 'object' || env === null) return null
+    const tenantSlug = getIntrinsic(env, 'TENANT_SLUG')
+    const database = getIntrinsic(env, 'DB')
+    if (
+      !isNonEmptyString(tenantSlug)
+      || ((typeof database !== 'object' && typeof database !== 'function') || database === null)
+    ) return null
+    const prepare = getIntrinsic(database, 'prepare')
+    if (typeof prepare !== 'function') return null
+
+    const verificationDatabase = freezeIntrinsic({
+      prepare(sql: string) {
+        return applyIntrinsic(prepare as Env['DB']['prepare'], database, [sql])
+      },
+    }) as unknown as Env['DB']
+    return freezeIntrinsic({
+      DB: verificationDatabase,
+      TENANT_SLUG: tenantSlug,
+    }) as Env
+  } catch {
+    return null
+  }
+}
+
 interface CapturedInputArray {
   readonly valid: boolean
   readonly entryFailure: boolean
@@ -355,14 +381,15 @@ function stableSnapshotReason(reason: unknown): string {
 }
 
 async function vaultBindingFailureReason(
-  env: Env,
+  verificationEnv: Env | null,
   binding: ResolvedAddonBinding,
 ): Promise<'connector_not_available' | 'adapter_type_mismatch' | null> {
   if (binding.bindingKind !== 'vault_connector') return null
+  if (!verificationEnv) return 'connector_not_available'
   const connectorId = binding.connectorId
   if (!connectorId) return 'connector_not_available'
   try {
-    const connector = await resolveConnectorByIdWithMeta(env, connectorId)
+    const connector = await resolveConnectorByIdWithMeta(verificationEnv, connectorId)
     if (!connector || connector.id !== connectorId) return 'connector_not_available'
     return connector.type === binding.adapter ? null : 'adapter_type_mismatch'
   } catch {
@@ -379,6 +406,7 @@ export async function collectMarketingSnapshots(
   const canonical = canonicalWindow(window)
   if (!canonical) throw new Error('invalid_monitor_window')
   const { bounds, window: sourceWindow } = canonical
+  const verificationEnv = captureVaultVerificationEnv(env)
 
   const sourceInput = captureInputArray(sources, MAX_MARKETING_MONITOR_SOURCES)
   if (!sourceInput.valid) {
@@ -466,7 +494,7 @@ export async function collectMarketingSnapshots(
       pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, 'binding_adapter_not_supported'))
       continue
     }
-    const preReadBindingFailure = await vaultBindingFailureReason(env, binding)
+    const preReadBindingFailure = await vaultBindingFailureReason(verificationEnv, binding)
     if (preReadBindingFailure) {
       pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, preReadBindingFailure))
       continue
@@ -581,7 +609,7 @@ export async function collectMarketingSnapshots(
         continue
       }
 
-      const postReadBindingFailure = await vaultBindingFailureReason(env, binding)
+      const postReadBindingFailure = await vaultBindingFailureReason(verificationEnv, binding)
       if (postReadBindingFailure) {
         pushIntrinsic(sourceStatuses, failedStatus(sourceIdentity, postReadBindingFailure))
         continue

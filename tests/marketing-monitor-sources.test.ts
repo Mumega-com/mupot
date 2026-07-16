@@ -533,6 +533,81 @@ describe('collectMarketingSnapshots', () => {
     expect(snapshot.sources[0]).toMatchObject({ status: 'failed', reason })
   })
 
+  it('uses the captured tenant and DB when final vault verification runs', async () => {
+    const realConnector: TestConnector = { id: 'connector-crm', type: 'ghl' }
+    const mutableEnv = envWithConnectors([realConnector])
+    const fakeEnv = envWithConnectors([
+      { id: 'connector-crm', type: 'ghl', tenant: 'tenant-b' },
+    ])
+    const originalDB = mutableEnv.DB
+    const originalTenant = mutableEnv.TENANT_SLUG
+    let snapshot: Awaited<ReturnType<typeof collectMarketingSnapshots>> | undefined
+
+    try {
+      snapshot = await collectMarketingSnapshots(mutableEnv, [{
+        id: 'binding-crm',
+        slot: 'crm',
+        adapter: 'ghl',
+        bindingKind: 'vault_connector',
+        capability: 'read',
+        connectorId: 'connector-crm',
+      }], window, [source('crm-source', 'crm', async () => {
+        realConnector.revoked = true
+        mutableEnv.DB = fakeEnv.DB
+        mutableEnv.TENANT_SLUG = 'tenant-b'
+        return available([observation({
+          metricKey: 'finance.revenue',
+          unit: 'usd',
+          authority: 'ghl',
+        })])
+      })])
+    } finally {
+      mutableEnv.DB = originalDB
+      mutableEnv.TENANT_SLUG = originalTenant
+    }
+
+    expect(snapshot?.observations).toEqual([])
+    expect(snapshot?.sources[0]).toMatchObject({
+      status: 'failed',
+      reason: 'connector_not_available',
+    })
+  })
+
+  it('uses the captured prepare function and original DB receiver for final verification', async () => {
+    const realConnector: TestConnector = { id: 'connector-crm', type: 'ghl' }
+    const mutableEnv = envWithConnectors([realConnector])
+    const fakeEnv = envWithConnectors([{ id: 'connector-crm', type: 'ghl' }])
+    const originalPrepare = mutableEnv.DB.prepare
+    let snapshot: Awaited<ReturnType<typeof collectMarketingSnapshots>> | undefined
+
+    try {
+      snapshot = await collectMarketingSnapshots(mutableEnv, [{
+        id: 'binding-crm',
+        slot: 'crm',
+        adapter: 'ghl',
+        bindingKind: 'vault_connector',
+        capability: 'read',
+        connectorId: 'connector-crm',
+      }], window, [source('crm-source', 'crm', async () => {
+        realConnector.revoked = true
+        mutableEnv.DB.prepare = fakeEnv.DB.prepare
+        return available([observation({
+          metricKey: 'finance.revenue',
+          unit: 'usd',
+          authority: 'ghl',
+        })])
+      })])
+    } finally {
+      mutableEnv.DB.prepare = originalPrepare
+    }
+
+    expect(snapshot?.observations).toEqual([])
+    expect(snapshot?.sources[0]).toMatchObject({
+      status: 'failed',
+      reason: 'connector_not_available',
+    })
+  })
+
   it('performs the final connector type check after an observation index getter runs', async () => {
     const connector: TestConnector = { id: 'connector-crm', type: 'ghl' }
     const observations = new Array<MonitorObservation>(1)
