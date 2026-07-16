@@ -13,6 +13,7 @@ import {
 import {
   addonBindingConfigurationMatches,
   configureAddonBindings,
+  loadLiveAddonBindingGeneration,
   preflightAddonBindings,
   type AddonBindingFailureReason,
   type AddonBindingInput,
@@ -2391,6 +2392,7 @@ export async function configureAddon(
       entry.manifest,
       actor.id,
       requestedBindings,
+      configuredAt,
       lifecycleStatements,
       firstConfiguration,
     )
@@ -2412,7 +2414,11 @@ export async function configureAddon(
         : { ok: false, reason: 'write_failed' }
     }
     if (written(configuredBindings.results[offset])) {
-      return { ok: true, state: existing.state, installation: existing }
+      return configuredBindings.initializedGeneration
+        && existing.state === 'disabled'
+        && requestedBindings.length === 0
+        ? { ok: true, state: existing.state, installation: existing, idempotent: true }
+        : { ok: true, state: existing.state, installation: existing }
     }
   } catch {
     const current = await loadInstallationById(env, existing.id)
@@ -2483,6 +2489,7 @@ export async function activateAddon(
   if (!bindingPreflight.ok) {
     return { ok: false, reason: bindingPreflight.reason, state: existing.state }
   }
+  if (!bindingPreflight.generation) return { ok: false, reason: 'write_failed' }
   if (existing.state === 'active') {
     try {
       await validateActiveDepartmentClaims(env, existing, entry)
@@ -2615,6 +2622,37 @@ export async function activateAddon(
                        AND json_extract(expected.value, '$.preserveOnRelease') = claim.preserve_on_release
                   )
              )
+             AND EXISTS (
+               SELECT 1 FROM addon_binding_generations AS generation
+                WHERE generation.id = ?17
+                  AND generation.tenant = addon_installations.tenant
+                  AND generation.installation_id = addon_installations.id
+                  AND generation.manifest_sha256 = addon_installations.manifest_sha256
+                  AND generation.binding_count = ?18
+                  AND generation.revoked_at IS NULL
+                  AND (
+                    SELECT COUNT(*) FROM addon_connector_bindings AS binding
+                     WHERE binding.generation_id = generation.id
+                       AND binding.tenant = generation.tenant
+                       AND binding.installation_id = generation.installation_id
+                       AND binding.revoked_at IS NULL
+                  ) = generation.binding_count
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM addon_connector_bindings AS binding
+                WHERE binding.generation_id = ?17
+                  AND binding.tenant = addon_installations.tenant
+                  AND binding.installation_id = addon_installations.id
+                  AND binding.revoked_at IS NULL
+                  AND binding.binding_kind = 'vault_connector'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM connectors AS connector
+                     WHERE connector.id = binding.connector_id
+                       AND connector.tenant = binding.tenant
+                       AND connector.revoked_at IS NULL
+                       AND connector.type = binding.adapter
+                  )
+             )
         `).bind(
           activatedAt,
           current.state,
@@ -2632,6 +2670,8 @@ export async function activateAddon(
           activatedAt,
           claims.length,
           serializedClaimIdentities(claims),
+          bindingPreflight.generation.id,
+          bindingPreflight.bindings.length,
         ),
         transitionReceiptStatement(env, current, operation, {
           id: receiptId,
@@ -3018,6 +3058,8 @@ export async function archiveAddon(
     }
     operation = acquired.operation
 
+    const bindingGeneration = await loadLiveAddonBindingGeneration(env, existing.id)
+
     const receiptId = crypto.randomUUID()
     const transitionTiming = leaseWindow()
     const archivedAt = transitionTiming.now
@@ -3031,10 +3073,29 @@ export async function archiveAddon(
     try {
       const results = await env.DB.batch<InstallationRow>([
         env.DB.prepare(`
+          UPDATE addon_binding_generations
+             SET revoked_at = ?1
+           WHERE id = ?2 AND tenant = ?3 AND installation_id = ?4
+             AND revoked_at IS NULL
+             AND EXISTS (
+               SELECT 1 FROM addon_installations AS installation
+                WHERE installation.id = ?4 AND installation.tenant = ?3
+                  AND installation.state = 'disabled'
+                  AND installation.latest_receipt_id = ?5
+             )
+        `).bind(
+          archivedAt,
+          bindingGeneration?.id ?? null,
+          env.TENANT_SLUG,
+          existing.id,
+          existing.latestReceiptId,
+        ),
+        env.DB.prepare(`
           UPDATE addon_connector_bindings
              SET revoked_at = ?1
-           WHERE tenant = ?2 AND installation_id = ?3 AND revoked_at IS NULL
-        `).bind(archivedAt, env.TENANT_SLUG, existing.id),
+           WHERE tenant = ?2 AND installation_id = ?3 AND generation_id = ?4
+             AND revoked_at IS NULL
+        `).bind(archivedAt, env.TENANT_SLUG, existing.id, bindingGeneration?.id ?? null),
         env.DB.prepare(`
           UPDATE addon_installations
              SET state = 'archived', archived_at = ?1, updated_at = ?1,
@@ -3174,7 +3235,13 @@ export async function archiveAddon(
         ),
       ])
 
-      if (results[0].success && written(results[1]) && written(results[2]) && written(results[3])) {
+      if (
+        results[0].success
+        && results[1].success
+        && written(results[2])
+        && written(results[3])
+        && written(results[4])
+      ) {
         operation.current_step = 'completed'
         operation.status = 'completed'
         operation.lease_expires_at = transitionTiming.expiresAt
@@ -3182,7 +3249,7 @@ export async function archiveAddon(
         if (!await loadExactOperation(env, operation, 'completed', 'completed')) {
           throw new FenceLostError()
         }
-        const archived = selectedInstallation(results[4])
+        const archived = selectedInstallation(results[5])
         return archived
           ? { ok: true, state: archived.state, installation: archived }
           : { ok: false, reason: 'write_failed' }

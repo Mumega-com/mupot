@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   listAddonBindings,
@@ -55,6 +56,57 @@ function insertConnector(
   return id
 }
 
+function withPreBatchHook(
+  env: Env,
+  matches: (sql: string) => boolean,
+  hook: () => Promise<void>,
+): Env {
+  const originalDb = env.DB
+  let pending = true
+  return {
+    ...env,
+    DB: {
+      prepare(sql: string) {
+        return originalDb.prepare(sql)
+      },
+      async batch<T = unknown>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
+        if (pending && statements.some((statement) => matches(
+          (statement as D1PreparedStatement & { sql: string }).sql,
+        ))) {
+          pending = false
+          await hook()
+        }
+        return originalDb.batch<T>(statements)
+      },
+    } as Env['DB'],
+  }
+}
+
+function withConcurrentPreflightBatches(env: Env): Env {
+  const originalDb = env.DB
+  let arrivals = 0
+  let release!: () => void
+  const released = new Promise<void>((resolve) => { release = resolve })
+  return {
+    ...env,
+    DB: {
+      prepare(sql: string) {
+        return originalDb.prepare(sql)
+      },
+      async batch<T = unknown>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
+        if (statements.some((statement) => (
+          (statement as D1PreparedStatement & { sql: string }).sql.includes("'preflight'")
+        ))) {
+          arrivals += 1
+          if (arrivals === 2) release()
+          await released
+        }
+        return originalDb.batch<T>(statements)
+      },
+    } as Env['DB'],
+  }
+}
+
 async function installMarketing(env: Env): Promise<AddonInstallation> {
   const result = await installAddon(env, owner, 'marketing-cro-monitor')
   if (!result.ok) throw new Error(`install failed: ${result.reason}`)
@@ -97,6 +149,23 @@ describe('addon connector bindings', () => {
     const columns = harness.sqlite.prepare('PRAGMA table_info(addon_connector_bindings)').all()
     expect(columns.map((column) => column.name)).not.toContain('encrypted_secret')
     expect(JSON.stringify(await listAddonBindings(env, installation.id))).not.toContain('opaque-ciphertext')
+  })
+
+  it('creates one live generation even for an empty fixture configuration', async () => {
+    const installed = await installAddon(env, owner, 'fixture-addon')
+    if (!installed.ok) throw new Error(`install failed: ${installed.reason}`)
+
+    await expect(configureAddon(env, owner, 'fixture-addon')).resolves.toMatchObject({
+      ok: true,
+      state: 'configured',
+    })
+    expect(harness.sqlite.prepare(`
+      SELECT installation_id, revoked_at FROM addon_binding_generations
+       WHERE tenant = 'tenant-a' AND installation_id = ?
+    `).all(installed.installation.id)).toEqual([
+      { installation_id: installed.installation.id, revoked_at: null },
+    ])
+    expect(await listAddonBindings(env, installed.installation.id)).toEqual([])
   })
 
   it('resolves safe connector metadata by exact tenant-local ID without selecting a secret', async () => {
@@ -200,6 +269,68 @@ describe('addon connector bindings', () => {
     ])
   })
 
+  it('does not reconfigure when activation commits after configuration reads state', async () => {
+    const installation = await installMarketing(env)
+    const connectorId = insertConnector(harness)
+    await configureAddon(env, owner, 'marketing-cro-monitor', { bindings: [firstPartyBinding] })
+    const racingEnv = withPreBatchHook(
+      env,
+      (sql) => sql.includes("'preflight'"),
+      async () => {
+        await expect(activateAddon(env, owner, 'marketing-cro-monitor')).resolves.toMatchObject({
+          ok: true,
+          state: 'active',
+        })
+      },
+    )
+
+    await expect(configureAddon(racingEnv, owner, 'marketing-cro-monitor', {
+      bindings: [{
+        slot: 'web_analytics', adapter: 'posthog', bindingKind: 'vault_connector', connectorId,
+      }],
+    })).resolves.toMatchObject({ ok: false, reason: 'invalid_state', state: 'active' })
+    expect(await listAddonBindings(env, installation.id)).toEqual([
+      expect.objectContaining({ adapter: 'first_party', revokedAt: null }),
+    ])
+    expect((await getAddonReceipts(env, installation.id)).filter(({ action }) => action === 'preflight')).toEqual([])
+  })
+
+  it('makes one concurrent identical reconfiguration generation and receipt authoritative', async () => {
+    const installation = await installMarketing(env)
+    const connectorId = insertConnector(harness)
+    await configureAddon(env, owner, 'marketing-cro-monitor', { bindings: [firstPartyBinding] })
+    const racingEnv = withConcurrentPreflightBatches(env)
+    const desired = { bindings: [{
+      slot: 'web_analytics' as const,
+      adapter: 'posthog' as const,
+      bindingKind: 'vault_connector' as const,
+      connectorId,
+    }] }
+
+    const results = await Promise.all([
+      configureAddon(racingEnv, owner, 'marketing-cro-monitor', desired),
+      configureAddon(racingEnv, owner, 'marketing-cro-monitor', desired),
+    ])
+
+    expect(results.filter((result) => result.ok && result.idempotent === true)).toHaveLength(1)
+    expect(results.filter((result) => result.ok && result.idempotent !== true)).toHaveLength(1)
+    expect((await getAddonReceipts(env, installation.id)).filter(({ action }) => action === 'preflight')).toHaveLength(1)
+    expect(harness.sqlite.prepare(`
+      SELECT configuration_sha256, revoked_at FROM addon_binding_generations
+       WHERE installation_id = ? ORDER BY configured_at, id
+    `).all(installation.id)).toEqual([
+      { configuration_sha256: expect.any(String), revoked_at: expect.any(String) },
+      { configuration_sha256: expect.any(String), revoked_at: null },
+    ])
+    expect(harness.sqlite.prepare(`
+      SELECT adapter, revoked_at FROM addon_connector_bindings
+       WHERE installation_id = ? ORDER BY configured_at, id
+    `).all(installation.id)).toEqual([
+      { adapter: 'first_party', revoked_at: expect.any(String) },
+      { adapter: 'posthog', revoked_at: null },
+    ])
+  })
+
   it('reconfigures while disabled, preserves bindings on disable, and rejects changes while active', async () => {
     const installation = await installMarketing(env)
     const connectorId = insertConnector(harness)
@@ -255,6 +386,63 @@ describe('addon connector bindings', () => {
     `).get(installation.id)).toEqual({ revoked_at: expect.any(String) })
   })
 
+  it('fences activation when the preflighted connector is revoked before transition', async () => {
+    const installation = await installMarketing(env)
+    const connectorId = insertConnector(harness)
+    await configureAddon(env, owner, 'marketing-cro-monitor', {
+      bindings: [{
+        slot: 'web_analytics', adapter: 'posthog', bindingKind: 'vault_connector', connectorId,
+      }],
+    })
+    const racingEnv = withPreBatchHook(
+      env,
+      (sql) => sql.includes("SET state = 'active'"),
+      async () => {
+        harness.sqlite.prepare('UPDATE connectors SET revoked_at = ? WHERE id = ?').run(
+          '2026-07-16T01:00:00.000Z', connectorId,
+        )
+      },
+    )
+
+    await expect(activateAddon(racingEnv, owner, 'marketing-cro-monitor')).resolves.toMatchObject({
+      ok: false,
+      reason: 'write_failed',
+    })
+    expect(harness.sqlite.prepare('SELECT state FROM addon_installations WHERE id = ?').get(installation.id)).toEqual({
+      state: 'configured',
+    })
+  })
+
+  it('fences activation when reconfiguration replaces the preflighted generation', async () => {
+    const installation = await installMarketing(env)
+    const connectorId = insertConnector(harness)
+    await configureAddon(env, owner, 'marketing-cro-monitor', {
+      bindings: [{
+        slot: 'web_analytics', adapter: 'posthog', bindingKind: 'vault_connector', connectorId,
+      }],
+    })
+    const racingEnv = withPreBatchHook(
+      env,
+      (sql) => sql.includes("SET state = 'active'"),
+      async () => {
+        await expect(configureAddon(env, owner, 'marketing-cro-monitor', {
+          bindings: [firstPartyBinding],
+        })).resolves.toMatchObject({ ok: true, state: 'configured' })
+      },
+    )
+
+    await expect(activateAddon(racingEnv, owner, 'marketing-cro-monitor')).resolves.toMatchObject({
+      ok: false,
+      reason: 'write_failed',
+    })
+    expect(harness.sqlite.prepare('SELECT state FROM addon_installations WHERE id = ?').get(installation.id)).toEqual({
+      state: 'configured',
+    })
+    expect(await listAddonBindings(env, installation.id)).toEqual([
+      expect.objectContaining({ adapter: 'first_party', revokedAt: null }),
+    ])
+  })
+
   it('rolls back bindings when the configure receipt fails and enforces tenant matching in D1', async () => {
     const installation = await installMarketing(env)
     const crossTenantConnector = insertConnector(harness, { tenant: 'tenant-b' })
@@ -295,12 +483,61 @@ describe('addon connector bindings', () => {
     expect(() => harness.sqlite.prepare(`
       UPDATE addon_connector_bindings SET revoked_at = '' WHERE id = ?
     `).run(binding.id)).toThrow()
+    expect(() => harness.sqlite.prepare(`
+      UPDATE addon_connector_bindings SET revoked_at = '2026-07-16 01:00:00' WHERE id = ?
+    `).run(binding.id)).toThrow()
+    expect(() => harness.sqlite.prepare(`
+      UPDATE addon_connector_bindings SET revoked_at = '2000-01-01T00:00:00.000Z' WHERE id = ?
+    `).run(binding.id)).toThrow()
 
     expect(harness.sqlite.prepare(`
       UPDATE addon_connector_bindings SET revoked_at = ? WHERE id = ?
-    `).run('2026-07-16T01:00:00.000Z', binding.id).changes).toBe(1)
+    `).run(binding.configuredAt, binding.id).changes).toBe(1)
     expect(() => harness.sqlite.prepare(`
       UPDATE addon_connector_bindings SET revoked_at = ? WHERE id = ?
-    `).run('2026-07-16T02:00:00.000Z', binding.id)).toThrow()
+    `).run(new Date(Date.parse(binding.configuredAt) + 1).toISOString(), binding.id)).toThrow()
+  })
+
+  it('requires new generations and bindings to start live with canonical evidence', async () => {
+    const installation = await installMarketing(env)
+    const entry = getRegisteredAddon('marketing-cro-monitor')
+    if (!entry) throw new Error('marketing addon missing')
+
+    expect(() => harness.sqlite.prepare(`
+      INSERT INTO addon_binding_generations (
+        id, tenant, installation_id, configuration_sha256, manifest_sha256,
+        configured_by, configured_at, revoked_at, previous_generation_id,
+        expected_installation_state, base_receipt_id
+      ) VALUES (?, 'tenant-a', ?, ?, ?, 'owner-1', ?, ?, NULL, 'installed', ?)
+    `).run(
+      crypto.randomUUID(),
+      installation.id,
+      'a'.repeat(64),
+      entry.manifestSha256,
+      '2026-07-16T00:00:00.000Z',
+      '2026-07-16T01:00:00.000Z',
+      installation.latestReceiptId,
+    )).toThrow(/start live/)
+  })
+
+  it('uses a composite connector foreign key that blocks tenant changes and deletion', async () => {
+    const installation = await installMarketing(env)
+    const connectorId = insertConnector(harness)
+    await configureAddon(env, owner, 'marketing-cro-monitor', {
+      bindings: [{
+        slot: 'web_analytics', adapter: 'posthog', bindingKind: 'vault_connector', connectorId,
+      }],
+    })
+
+    const foreignKeys = harness.sqlite.prepare('PRAGMA foreign_key_list(addon_connector_bindings)').all()
+    expect(foreignKeys).toEqual(expect.arrayContaining([
+      expect.objectContaining({ table: 'connectors', from: 'connector_id', to: 'id' }),
+      expect.objectContaining({ table: 'connectors', from: 'tenant', to: 'tenant' }),
+    ]))
+    expect(() => harness.sqlite.prepare('UPDATE connectors SET tenant = ? WHERE id = ?').run(
+      'tenant-b', connectorId,
+    )).toThrow()
+    expect(() => harness.sqlite.prepare('DELETE FROM connectors WHERE id = ?').run(connectorId)).toThrow()
+    expect(await listAddonBindings(env, installation.id)).toHaveLength(1)
   })
 })

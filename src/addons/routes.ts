@@ -87,18 +87,41 @@ function redactedReceipt(receipt: AddonReceipt) {
   }
 }
 
-async function readBoundedBody(c: { req: { header(name: string): string | undefined; text(): Promise<string> } }) {
+async function readBoundedBody(c: Context<AppEnv>) {
   const declaredLength = Number(c.req.header('content-length') ?? '0')
   if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) return { ok: false as const, status: 413 as const }
 
-  let raw: string
+  const stream = c.req.raw.body
+  if (!stream) return { ok: true as const, raw: '' }
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+  let byteLength = 0
   try {
-    raw = await c.req.text()
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      byteLength += value.byteLength
+      if (byteLength > MAX_BODY_BYTES) {
+        await reader.cancel()
+        return { ok: false as const, status: 413 as const }
+      }
+      chunks.push(value)
+    }
   } catch {
     return { ok: false as const, status: 400 as const }
   }
-  if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) return { ok: false as const, status: 413 as const }
-  return { ok: true as const, raw }
+
+  const body = new Uint8Array(byteLength)
+  let offset = 0
+  for (const chunk of chunks) {
+    body.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  try {
+    return { ok: true as const, raw: new TextDecoder('utf-8', { fatal: true }).decode(body) }
+  } catch {
+    return { ok: false as const, status: 400 as const }
+  }
 }
 
 function parseConfigureBody(

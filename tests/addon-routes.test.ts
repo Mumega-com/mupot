@@ -448,6 +448,39 @@ describe('addon lifecycle routes', () => {
     await expect(actual.json()).resolves.toEqual({ error: 'payload_too_large' })
   })
 
+  it('cancels an omitted-length chunked body as soon as it crosses 8 KiB', async () => {
+    let cancelled = false
+    let offset = 0
+    const chunks = [new Uint8Array(4096), new Uint8Array(4097)]
+    const body = new ReadableStream<Uint8Array>({
+      type: 'bytes',
+      pull(controller) {
+        const chunk = chunks[offset++]
+        if (chunk) controller.enqueue(chunk)
+        else controller.close()
+      },
+      cancel() {
+        cancelled = true
+      },
+    })
+    const requestWithStream = new Request('https://pot.test/fixture-addon/install', {
+      method: 'POST',
+      headers: {
+        Cookie: 'mupot_session=session-1',
+        Origin: 'https://pot.test',
+        'Content-Type': 'application/json',
+      },
+      body,
+      duplex: 'half',
+    } as RequestInit & { duplex: 'half' })
+
+    const res = await addonsApp.fetch(requestWithStream, envForRole(harness, 'owner'))
+
+    expect(res.status).toBe(413)
+    await expect(res.json()).resolves.toEqual({ error: 'payload_too_large' })
+    expect(cancelled).toBe(true)
+  })
+
   it('maps an invalid transition to the current state', async () => {
     const res = await addonsApp.fetch(
       request('/fixture-addon/configure', 'POST'),

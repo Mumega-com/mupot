@@ -17,6 +17,7 @@ export interface AddonBinding {
   id: string
   tenant: string
   installationId: string
+  generationId: string
   slot: string
   adapter: string
   bindingKind: AddonBindingKind
@@ -39,13 +40,44 @@ export type AddonBindingFailureReason =
   | 'manifest_digest_drift'
 
 export type AddonBindingPreflight =
-  | { ok: true; bindings: AddonBinding[] }
+  | { ok: true; bindings: AddonBinding[]; generation: AddonBindingGeneration | null }
   | { ok: false; reason: AddonBindingFailureReason }
+
+export interface AddonBindingGeneration {
+  id: string
+  tenant: string
+  installationId: string
+  configurationSha256: string
+  bindingCount: number
+  manifestSha256: string
+  configuredBy: string
+  configuredAt: string
+  revokedAt: string | null
+  previousGenerationId: string | null
+  expectedInstallationState: 'installed' | 'configured' | 'disabled'
+  baseReceiptId: string
+}
+
+interface GenerationRow {
+  id: string
+  tenant: string
+  installation_id: string
+  configuration_sha256: string
+  binding_count: number
+  manifest_sha256: string
+  configured_by: string
+  configured_at: string
+  revoked_at: string | null
+  previous_generation_id: string | null
+  expected_installation_state: 'installed' | 'configured' | 'disabled'
+  base_receipt_id: string
+}
 
 interface BindingRow {
   id: string
   tenant: string
   installation_id: string
+  generation_id: string
   slot: string
   adapter: string
   binding_kind: AddonBindingKind
@@ -65,6 +97,7 @@ export type ConfigureAddonBindingsResult =
       changed: boolean
       results: D1Result<unknown>[]
       bindingStatementCount: number
+      initializedGeneration: boolean
     }
 
 export type AddonBindingConfigurationMatch =
@@ -78,6 +111,7 @@ function bindingFromRow(row: BindingRow): AddonBinding {
     id: row.id,
     tenant: row.tenant,
     installationId: row.installation_id,
+    generationId: row.generation_id,
     slot: row.slot,
     adapter: row.adapter,
     bindingKind: row.binding_kind,
@@ -90,13 +124,53 @@ function bindingFromRow(row: BindingRow): AddonBinding {
   }
 }
 
+function generationFromRow(row: GenerationRow): AddonBindingGeneration {
+  return {
+    id: row.id,
+    tenant: row.tenant,
+    installationId: row.installation_id,
+    configurationSha256: row.configuration_sha256,
+    bindingCount: row.binding_count,
+    manifestSha256: row.manifest_sha256,
+    configuredBy: row.configured_by,
+    configuredAt: row.configured_at,
+    revokedAt: row.revoked_at,
+    previousGenerationId: row.previous_generation_id,
+    expectedInstallationState: row.expected_installation_state,
+    baseReceiptId: row.base_receipt_id,
+  }
+}
+
+export async function loadLiveAddonBindingGeneration(
+  env: Env,
+  installationId: string,
+): Promise<AddonBindingGeneration | null> {
+  const row = await env.DB.prepare(`
+    SELECT id, tenant, installation_id, configuration_sha256, binding_count,
+           manifest_sha256, configured_by, configured_at, revoked_at,
+           previous_generation_id, expected_installation_state, base_receipt_id
+      FROM addon_binding_generations
+     WHERE tenant = ?1 AND installation_id = ?2 AND revoked_at IS NULL
+     LIMIT 1
+  `).bind(env.TENANT_SLUG, installationId).first<GenerationRow>()
+  return row ? generationFromRow(row) : null
+}
+
 export async function listAddonBindings(env: Env, installationId: string): Promise<AddonBinding[]> {
   const result = await env.DB.prepare(`
-    SELECT id, tenant, installation_id, slot, adapter, binding_kind, capability,
-           connector_id, manifest_sha256, configured_by, configured_at, revoked_at
-      FROM addon_connector_bindings
-     WHERE tenant = ?1 AND installation_id = ?2 AND revoked_at IS NULL
-     ORDER BY slot, id
+    SELECT binding.id, binding.tenant, binding.installation_id, binding.generation_id,
+           binding.slot, binding.adapter, binding.binding_kind, binding.capability,
+           binding.connector_id, binding.manifest_sha256, binding.configured_by,
+           binding.configured_at, binding.revoked_at
+      FROM addon_connector_bindings AS binding
+      JOIN addon_binding_generations AS generation
+        ON generation.id = binding.generation_id
+       AND generation.installation_id = binding.installation_id
+       AND generation.tenant = binding.tenant
+       AND generation.revoked_at IS NULL
+     WHERE binding.tenant = ?1 AND binding.installation_id = ?2
+       AND binding.revoked_at IS NULL
+     ORDER BY binding.slot, binding.id
   `).bind(env.TENANT_SLUG, installationId).all<BindingRow>()
   return (result.results ?? []).map(bindingFromRow)
 }
@@ -129,8 +203,30 @@ export async function addonBindingConfigurationMatches(
 ): Promise<AddonBindingConfigurationMatch> {
   const preflight = await preflightAddonBindings(env, installation, manifest, requestedBindings)
   if (!preflight.ok) return preflight
+  const generation = await loadLiveAddonBindingGeneration(env, installation.id)
+  if (!generation) return { ok: true, matches: false }
   const current = await listAddonBindings(env, installation.id)
-  return { ok: true, matches: sameConfiguration(current, preflight.bindings.map(inputFromBinding)) }
+  const inputs = preflight.bindings.map(inputFromBinding)
+  return {
+    ok: true,
+    matches: generation.configurationSha256 === await configurationSha256(inputs)
+      && generation.bindingCount === inputs.length
+      && sameConfiguration(current, inputs),
+  }
+}
+
+async function configurationSha256(inputs: readonly AddonBindingInput[]): Promise<string> {
+  const normalized = inputs.map((input) => ({
+    slot: input.slot,
+    adapter: input.adapter,
+    bindingKind: input.bindingKind,
+    connectorId: input.connectorId ?? null,
+  }))
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(JSON.stringify(normalized)),
+  )
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
 function validInput(value: unknown): value is AddonBindingInput {
@@ -161,9 +257,18 @@ export async function preflightAddonBindings(
     return { ok: false, reason: 'manifest_digest_drift' }
   }
 
+  const generation = requestedBindings === undefined
+    ? await loadLiveAddonBindingGeneration(env, installation.id)
+    : null
+  if (requestedBindings === undefined && !generation) {
+    throw new Error('addon binding generation is missing')
+  }
   const persisted = requestedBindings === undefined
     ? await listAddonBindings(env, installation.id)
     : null
+  if (generation && persisted && generation.bindingCount !== persisted.length) {
+    throw new Error('addon binding generation count mismatch')
+  }
   const rawBindings: unknown = requestedBindings ?? persisted?.map(inputFromBinding) ?? []
   if (!Array.isArray(rawBindings) || !rawBindings.every(validInput)) {
     return { ok: false, reason: 'binding_kind_mismatch' }
@@ -209,6 +314,7 @@ export async function preflightAddonBindings(
       id: '',
       tenant: env.TENANT_SLUG,
       installationId: installation.id,
+      generationId: generation?.id ?? '',
       slot: input.slot,
       adapter: input.adapter,
       bindingKind: input.bindingKind,
@@ -220,7 +326,7 @@ export async function preflightAddonBindings(
       revokedAt: null,
     })
   }
-  return { ok: true, bindings: normalized }
+  return { ok: true, bindings: normalized, generation }
 }
 
 export async function configureAddonBindings(
@@ -229,6 +335,7 @@ export async function configureAddonBindings(
   manifest: AddonManifestV1,
   actorId: string,
   requestedBindings: readonly AddonBindingInput[],
+  configuredAt: string,
   lifecycleStatements: D1PreparedStatement[] = [],
   runLifecycleWhenUnchanged = false,
 ): Promise<ConfigureAddonBindingsResult> {
@@ -237,38 +344,91 @@ export async function configureAddonBindings(
 
   const current = await listAddonBindings(env, installation.id)
   const inputs = preflight.bindings.map(inputFromBinding)
-  if (sameConfiguration(current, inputs)) {
+  const currentGeneration = await loadLiveAddonBindingGeneration(env, installation.id)
+  const desiredConfigurationSha256 = await configurationSha256(inputs)
+  if (
+    currentGeneration
+    && currentGeneration.configurationSha256 === desiredConfigurationSha256
+    && currentGeneration.bindingCount === inputs.length
+    && sameConfiguration(current, inputs)
+  ) {
     const results = runLifecycleWhenUnchanged
       ? await env.DB.batch(lifecycleStatements) as D1Result<unknown>[]
       : []
-    return { ok: true, bindings: current, changed: false, results, bindingStatementCount: 0 }
+    return {
+      ok: true,
+      bindings: current,
+      changed: false,
+      results,
+      bindingStatementCount: 0,
+      initializedGeneration: false,
+    }
   }
 
-  const configuredAt = new Date().toISOString()
+  const generationId = crypto.randomUUID()
   const bindings = preflight.bindings.map((binding) => ({
     ...binding,
     id: crypto.randomUUID(),
+    generationId,
     configuredBy: actorId,
     configuredAt,
   }))
   const statements: D1PreparedStatement[] = []
-  if (current.length > 0) {
+  if (currentGeneration) {
+    statements.push(env.DB.prepare(`
+      UPDATE addon_binding_generations
+         SET revoked_at = ?1
+       WHERE id = ?2 AND tenant = ?3 AND installation_id = ?4 AND revoked_at IS NULL
+         AND EXISTS (
+           SELECT 1 FROM addon_installations AS installation
+            WHERE installation.id = ?4 AND installation.tenant = ?3
+              AND installation.state = ?5 AND installation.latest_receipt_id = ?6
+         )
+    `).bind(
+      configuredAt,
+      currentGeneration.id,
+      env.TENANT_SLUG,
+      installation.id,
+      installation.state,
+      installation.latestReceiptId,
+    ))
     statements.push(env.DB.prepare(`
       UPDATE addon_connector_bindings
          SET revoked_at = ?1
-       WHERE tenant = ?2 AND installation_id = ?3 AND revoked_at IS NULL
-    `).bind(configuredAt, env.TENANT_SLUG, installation.id))
+       WHERE tenant = ?2 AND installation_id = ?3 AND generation_id = ?4
+         AND revoked_at IS NULL
+    `).bind(configuredAt, env.TENANT_SLUG, installation.id, currentGeneration.id))
   }
+  statements.push(env.DB.prepare(`
+    INSERT INTO addon_binding_generations (
+      id, tenant, installation_id, configuration_sha256, binding_count,
+      manifest_sha256, configured_by, configured_at, revoked_at,
+      previous_generation_id, expected_installation_state, base_receipt_id
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11)
+  `).bind(
+    generationId,
+    env.TENANT_SLUG,
+    installation.id,
+    desiredConfigurationSha256,
+    bindings.length,
+    installation.manifestSha256,
+    actorId,
+    configuredAt,
+    currentGeneration?.id ?? null,
+    installation.state,
+    installation.latestReceiptId,
+  ))
   for (const binding of bindings) {
     statements.push(env.DB.prepare(`
       INSERT INTO addon_connector_bindings (
-        id, tenant, installation_id, slot, adapter, binding_kind, capability,
+        id, tenant, installation_id, generation_id, slot, adapter, binding_kind, capability,
         connector_id, manifest_sha256, configured_by, configured_at, revoked_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'read', ?7, ?8, ?9, ?10, NULL)
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'read', ?8, ?9, ?10, ?11, NULL)
     `).bind(
       binding.id,
       binding.tenant,
       binding.installationId,
+      binding.generationId,
       binding.slot,
       binding.adapter,
       binding.bindingKind,
@@ -280,5 +440,12 @@ export async function configureAddonBindings(
   }
   const bindingStatementCount = statements.length
   const results = await env.DB.batch([...statements, ...lifecycleStatements]) as D1Result<unknown>[]
-  return { ok: true, bindings, changed: true, results, bindingStatementCount }
+  return {
+    ok: true,
+    bindings,
+    changed: true,
+    results,
+    bindingStatementCount,
+    initializedGeneration: currentGeneration === null,
+  }
 }

@@ -267,6 +267,18 @@ async function transitionInstallation(
   const outcome = options.outcome ?? 'pass'
 
   return db.env.DB.batch([
+    ...(action === 'archive' ? [
+      db.env.DB.prepare(`
+        UPDATE addon_binding_generations
+           SET revoked_at = ?1
+         WHERE tenant = ?2 AND installation_id = ?3 AND revoked_at IS NULL
+      `).bind(now, db.env.TENANT_SLUG, installationId),
+      db.env.DB.prepare(`
+        UPDATE addon_connector_bindings
+           SET revoked_at = ?1
+         WHERE tenant = ?2 AND installation_id = ?3 AND revoked_at IS NULL
+      `).bind(now, db.env.TENANT_SLUG, installationId),
+    ] : []),
     db.env.DB.prepare(`
       UPDATE addon_installations
          SET state = ?1, latest_previous_state = ?2,
