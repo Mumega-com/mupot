@@ -115,6 +115,8 @@ import { isOnboardingComplete } from './settings'
 import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './brain'
 import type { PhysicsSnapshot } from './brain'
 import { loadGrowthView, growthBody } from './growth'
+import { loadFleetRadar } from './radar'
+import { radarPageBody } from './radar-view'
 import { setLoopControl, isLoopControlAction } from '../loops/decisions'
 import { getLoop } from '../loops/service'
 import {
@@ -561,6 +563,34 @@ dashboardApp.get('/flights', async (c) => {
   const rows = await listFlights(c.env)
   const cards = buildBoard(rows, Date.now())
   return c.html(shell(c.env.BRAND, 'Flights', flightsBody(cards)))
+})
+
+// ── radar (visual fleet + squad awareness — #21 slice 1, VIEW LAYER ONLY) ────
+// GET /radar — agent character-sheet cards + a compact fleet-map "brain image"
+// rendered from the SAME FleetRadar the brain's ATC tower already reads at the
+// bearer-gated GET /api/radar JSON feed (dashboard/radar-routes.ts, #23) — zero
+// new data, zero migration, reuses loadFleetRadar/buildFleetRadar as-is.
+//
+// Auth: this route lives on dashboardApp (session-cookie, requireAuth via the
+// outer middleware) and is admin-gated with the SAME isAdmin() check every
+// other org-admin dashboard page uses (/ops, /deployment, /audit) — matching
+// the org-admin authorization LEVEL that GET /api/radar's bearer-token
+// resolveOrgAdmin check requires, via the mechanism this cookie-authed
+// dashboard already uses everywhere else. GET /api/radar's own bearer check
+// (src/auth/member-bearer.ts resolveOrgAdmin) is NOT touched by this route —
+// it stays the canonical JSON surface for the brain / programmatic callers.
+// ?format=json (or an Accept: application/json request) returns the identical
+// FleetRadar JSON through this session-authed path for convenience.
+dashboardApp.get('/radar', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(shell(c.env.BRAND, 'Radar', errorBody('Fleet radar requires owner or admin.')), 403)
+  }
+  const radar = await loadFleetRadar(c.env)
+  const accept = c.req.header('accept') ?? ''
+  const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
+  if (wantsJson) return c.json(radar)
+  return c.html(shell(c.env.BRAND, 'Radar', radarPageBody(radar)))
 })
 
 // ── fleet (company-wide agent roster over the SOS bus) ───────────────────────
@@ -2837,6 +2867,12 @@ function shell(
           <a class="nav-link" href="/fleet">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" width="17" height="17"><circle cx="10" cy="10" r="6.2"/><circle cx="10" cy="10" r="1.7" fill="currentColor" stroke="none"/></svg>
             <span class="nav-label">Fleet</span>
+          </a>
+
+          <!-- Radar (fleet + squad awareness map — #21/#23) -->
+          <a class="nav-link" href="/radar">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="10" cy="10" r="7"/><circle cx="10" cy="10" r="1.4" fill="currentColor" stroke="none"/><path d="M10 3v2M10 15v2M3 10h2M15 10h2"/></svg>
+            <span class="nav-label">Radar</span>
           </a>
 
           <!-- Health (operator console) -->
