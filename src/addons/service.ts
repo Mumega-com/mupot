@@ -1942,6 +1942,7 @@ export async function getBusinessStateSha256(env: Env): Promise<string> {
     }
     seenTables.add(table.name)
     return !table.name.startsWith('sqlite_')
+      && !table.name.toLowerCase().startsWith('_cf_')
       && table.name !== 'd1_migrations'
       && !ADDON_INTERNAL_TABLES.has(table.name)
   })

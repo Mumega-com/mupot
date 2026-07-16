@@ -121,6 +121,8 @@ describe('addon lifecycle routes', () => {
       INSERT INTO evidence_business_values (id, value) VALUES ('sensitive-business-row', 1);
       CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT);
       INSERT INTO d1_migrations (id, name) VALUES (1, 'initial-migration');
+      CREATE TABLE _cf_internal_state (id INTEGER PRIMARY KEY, value TEXT);
+      INSERT INTO _cf_internal_state (id, value) VALUES (1, 'provider-state');
     `)
 
     const before = await addonsApp.fetch(request('/fixture-addon/evidence', 'GET'), ownerEnv)
@@ -148,6 +150,9 @@ describe('addon lifecycle routes', () => {
     expect((await addonsApp.fetch(request('/fixture-addon/install', 'POST'), ownerEnv)).status).toBe(201)
     harness.sqlite.prepare(`
       UPDATE d1_migrations SET name = 'ignored-migration-change' WHERE id = 1
+    `).run()
+    harness.sqlite.prepare(`
+      UPDATE _cf_internal_state SET value = 'ignored-provider-change' WHERE id = 1
     `).run()
     const afterInstall = await addonsApp.fetch(request('/fixture-addon/evidence', 'GET'), ownerEnv)
     const afterInstallBody = await afterInstall.json() as Record<string, unknown>

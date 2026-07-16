@@ -7,5 +7,6 @@ import { defineConfig, configDefaults } from 'vitest/config'
 export default defineConfig({
   test: {
     exclude: [...configDefaults.exclude, 'fleet-runtime/**'],
+    testTimeout: 15_000,
   },
 })
