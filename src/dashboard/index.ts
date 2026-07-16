@@ -72,6 +72,9 @@ import { loadVerifications, verificationsBody } from './verifications'
 import { loadAudit, auditBody } from './audit'
 import { loadBilling, billingBody } from './billing'
 import { servicesBody } from './services'
+import { addonsBody } from './addons'
+import { listRegisteredAddons } from '../addons/registry'
+import { listAddonInstallations } from '../addons/service'
 import {
   pageHeader,
   notConnected,
@@ -180,6 +183,17 @@ dashboardApp.use('*', async (c, next) => {
     return c.html(shell(c.env, 'Forbidden', errorBody('This session is not scoped to this org.')), 403)
   }
   await next()
+})
+
+// Addon discoverability is part of the server-rendered shell, not a client-side
+// privilege hint. Keep the shell template role-agnostic and reveal this one
+// operator-only entry after the authenticated route response has been rendered.
+dashboardApp.use('*', async (c, next) => {
+  await next()
+  if (!isAdmin(c.get('auth')) || !c.res.headers.get('content-type')?.includes('text/html')) return
+
+  const body = await c.res.text()
+  c.res = new Response(body.replace('id="nav-addons" hidden', 'id="nav-addons"'), c.res)
 })
 
 // ── setup wizard ─────────────────────────────────────────────────────────────
@@ -292,6 +306,23 @@ dashboardApp.get('/loops', async (c) => {
 // outer middleware. Draft prices live in src/services/catalog.ts.
 dashboardApp.get('/services', async (c) => {
   return c.html(shell(c.env, 'Services', servicesBody()))
+})
+
+// ── addons — owner/admin lifecycle console ──────────────────────────────────
+// The catalog is registered at process startup; installation state stays tenant
+// scoped in D1. Lifecycle writes remain owned by /api/addons and are re-gated
+// there, so this route only renders the existing API contract.
+dashboardApp.get('/addons', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(shell(c.env, 'Addons', errorBody('Addons requires owner or admin.')), 403)
+  }
+  try {
+    const installations = await listAddonInstallations(c.env)
+    return c.html(shell(c.env, 'Addons', addonsBody(listRegisteredAddons(), installations)))
+  } catch {
+    return c.html(shell(c.env, 'Addons', errorBody('Addon catalog is unavailable.')), 500)
+  }
 })
 
 // ── economy (squad Anthropic spend — #179) ───────────────────────────────────
@@ -2897,6 +2928,11 @@ function shell(
           <a class="nav-link" href="/ops">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 2v4"/><path d="M10 14v4"/><path d="M4.3 4.3l2.8 2.8"/><path d="m12.9 12.9 2.8 2.8"/><path d="M2 10h4"/><path d="M14 10h4"/><path d="m4.3 15.7 2.8-2.8"/><path d="m12.9 7.1 2.8-2.8"/><circle cx="10" cy="10" r="3"/></svg>
             <span class="nav-label">Health</span>
+          </a>
+
+          <a class="nav-link" href="/addons" id="nav-addons" hidden>
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M7.2 3.5v3.1a2.1 2.1 0 1 0 2.1 2.1h3.2v-2a1.9 1.9 0 1 1 3.8 0v2H17v6.1H9.3a2.1 2.1 0 1 0-2.1 2.1v-2.1H3.5V9h2.1a2.1 2.1 0 1 0 1.6-3.4V3.5z"/></svg>
+            <span class="nav-label">Addons</span>
           </a>
 
           <!-- Control Tower (coordination departures board) -->
