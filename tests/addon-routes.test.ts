@@ -73,7 +73,6 @@ describe('addon lifecycle routes', () => {
       method: 'POST',
       headers: {
         Authorization: 'Bearer machine-token',
-        'Content-Type': 'application/json',
       },
     }), envForRole(harness, 'owner'))
 

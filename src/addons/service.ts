@@ -2203,19 +2203,19 @@ export async function activateAddon(
     const current = await loadInstallationById(env, existing.id)
     if (!current) {
       await assertLiveOperationLease(env, operation)
-      return { ok: false, reason: 'write_failed' }
+      throw new Error('addon installation read failed after activation step')
     }
     if (!matchesRegisteredIdentity(current, entry)) {
       await assertLiveOperationLease(env, operation)
-      return { ok: false, reason: 'manifest_digest_drift' }
+      throw new Error('addon installation identity changed after activation step')
     }
     if (current.state === 'active') {
       await assertLiveOperationLease(env, operation)
-      return { ok: true, state: current.state, installation: current, idempotent: true }
+      throw new Error('addon installation changed outside the owned activation')
     }
     if (current.state !== 'configured' && current.state !== 'disabled') {
       await assertLiveOperationLease(env, operation)
-      return { ok: false, reason: 'invalid_state', state: current.state }
+      throw new Error('addon installation entered an invalid activation state')
     }
 
     const receiptId = crypto.randomUUID()

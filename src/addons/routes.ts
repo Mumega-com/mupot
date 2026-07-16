@@ -150,14 +150,22 @@ async function mutate(c: Context<AppEnv>, action: LifecycleAction) {
 
 export const addonsApp = new Hono<AppEnv>()
 
-addonsApp.use('*', csrf())
+const cookieCsrf = csrf()
+function hasSessionCookie(c: Context<AppEnv>): boolean {
+  return /(?:^|;\s*)mupot_session=/.test(c.req.header('cookie') ?? '')
+}
+
+addonsApp.use('*', (c, next) => (
+  hasSessionCookie(c) ? cookieCsrf(c, next) : next()
+))
 addonsApp.use('*', async (c, next) => {
   if (c.req.method === 'GET' || c.req.method === 'HEAD') return next()
-  const cookie = c.req.header('cookie') ?? ''
-  if (!/(?:^|;\s*)mupot_session=/.test(cookie)) return next()
+  if (!hasSessionCookie(c)) return next()
 
-  const sameOrigin = c.req.header('origin') === new URL(c.req.url).origin
-    || c.req.header('sec-fetch-site') === 'same-origin'
+  const origin = c.req.header('origin')
+  const sameOrigin = origin === undefined
+    ? c.req.header('sec-fetch-site') === 'same-origin'
+    : origin === new URL(c.req.url).origin
   if (!sameOrigin) return c.text('Forbidden', 403)
   return next()
 })

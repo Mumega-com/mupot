@@ -499,6 +499,44 @@ function withPreFirstRace(
   return { ...db.env, DB: racingDb }
 }
 
+function withFirstNullOnce(db: Db, matches: (sql: string) => boolean): Env {
+  const originalDb = db.env.DB
+  let pending = true
+
+  const wrap = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => (
+    new Proxy(statement, {
+      get(target, property, receiver) {
+        if (property === 'bind') {
+          return (...values: unknown[]) => wrap(target.bind(...values), sql)
+        }
+        if (property === 'first') {
+          return async (columnName?: string) => {
+            if (pending && matches(sql)) {
+              pending = false
+              return null
+            }
+            return target.first(columnName)
+          }
+        }
+        const value = Reflect.get(target, property, receiver)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+  )
+
+  return {
+    ...db.env,
+    DB: {
+      prepare(sql: string) {
+        return wrap(originalDb.prepare(sql), sql)
+      },
+      batch<T = unknown>(statements: D1PreparedStatement[]) {
+        return originalDb.batch<T>(statements)
+      },
+    } as Env['DB'],
+  }
+}
+
 function withRunFailures(
   db: Db,
   matches: (sql: string) => boolean,
@@ -1869,6 +1907,32 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     expect(await getActiveDepartments(db.env.DB)).toHaveLength(1)
     expect(await getActiveConsoleSections(db.env.DB)).toHaveLength(1)
     expect(await getActiveMetricDescriptors(db.env.DB)).toHaveLength(2)
+  })
+
+  it('durably fails a live activation when its post-step installation read is unavailable', async () => {
+    await configureFixture()
+    const failingEnv = withFirstNullOnce(db, (sql) => (
+      sql.includes('FROM addon_installations')
+      && db.operations().some((operation) => (
+        operation.action === 'activate'
+        && operation.current_step === 'activate_transition'
+        && operation.status === 'running'
+      ))
+    ))
+
+    expect(await activateAddon(failingEnv, owner, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'write_failed',
+    })
+    expect(db.operations()[0]).toMatchObject({
+      current_step: 'activate_transition',
+      status: 'failed',
+      error_code: 'activation_failed',
+    })
+    expect(await activateAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'active',
+    })
   })
 
   it('preserves ordinary active departments outside addon ownership', async () => {
