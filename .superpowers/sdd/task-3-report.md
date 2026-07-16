@@ -89,6 +89,12 @@ stateful `Symbol.toPrimitive` adapter was coerced twice and widened the normaliz
 an observation index getter could change connector type after the final check; and an observation
 property getter could revoke the connector after that check while evidence was still accepted.
 
+The final intrinsic-mutation findings were addressed with one additional RED run: 3 failed,
+76 passed. Replacing `WeakSet.prototype.has` made a genuine collection fail provenance;
+replacing `Array.prototype[Symbol.iterator]` stopped outcome traversal; and replacing
+`Array.prototype.includes`, `Object.freeze`, and `WeakSet.prototype.add` during source execution
+allowed invalid first-party revenue and mutable, unbranded evidence.
+
 ## GREEN Evidence
 
 ```sh
@@ -119,6 +125,11 @@ The final checkpoint completed with 76 passing focused Task 3 tests, 21 passing 
 tests, successful `tsc --noEmit`, and an acceptance-order audit confirming no source-controlled
 callback or accessor runs after the final vault safe-metadata resolution.
 
+The intrinsic-mutation checkpoint completed with 79 passing focused Task 3 tests, 21 passing
+addon binding tests, successful `tsc --noEmit`, and `git diff --check`. A static audit found no
+dynamic calls to the reviewed mutable intrinsics or array iterators in `sources.ts` or
+`outcomes.ts`; all such operations route through module-load captures.
+
 ## Changed Files
 
 - `src/addons/marketing/types.ts`
@@ -142,6 +153,8 @@ callback or accessor runs after the final vault safe-metadata resolution.
 `bfd865b9ed5e5e342acf284afba8980b0ce1d7a0` (`fix(marketing): bound collector inputs`)
 
 `42528e440b61d8bbe4035650fe0195ce97009dd0` (`fix(marketing): finalize trusted binding acceptance`)
+
+`49356f9c8bc10c5889bab723e227f8cd12557721` (`fix(marketing): capture trusted intrinsics`)
 
 ## Re-review Changed Files
 
@@ -170,6 +183,15 @@ callback or accessor runs after the final vault safe-metadata resolution.
 
 - `src/addons/marketing/sources.ts`
 - `tests/marketing-monitor-sources.test.ts`
+- `.superpowers/sdd/task-3-report.md`
+
+## Final Intrinsic Review Changed Files
+
+- `src/addons/marketing/intrinsics.ts`
+- `src/addons/marketing/sources.ts`
+- `src/addons/marketing/outcomes.ts`
+- `tests/marketing-monitor-sources.test.ts`
+- `tests/marketing-monitor-outcomes.test.ts`
 - `.superpowers/sdd/task-3-report.md`
 
 ## Residual Risks
