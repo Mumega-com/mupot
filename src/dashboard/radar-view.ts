@@ -22,12 +22,14 @@
 // ── Honest gaps (documented, not fabricated — see feedback_safety_flag_server_ignores
 //    and the project's "no fake green" discipline) ──────────────────────────────
 //
-//   1. HOST ATTRIBUTION (physical machine — Mac / Hetzner / cloud): there is no
-//      hostname signal anywhere in presence/registry/AgentCard today. Do NOT
-//      render a host/machine column here, and don't add one later without a
-//      real signal behind it. Slice 2: agents report hostname on
-//      attach/heartbeat (fleet/registry.ts + fleet/presence.ts), radar.ts
-//      threads it into AgentCard, then this view can show it.
+//   1. HOST ATTRIBUTION (physical machine — Mac / Hetzner / cloud): CLOSED, #21 slice 2.
+//      Agents self-report `os.hostname()` in the fleet-report/attach(-signed) payload
+//      (fleet-runtime/fleet-sign.mjs, fleet-runtime/attach-signed.mjs,
+//      fleet-runtime/fleet-daemon.mjs); fleet/registry.ts + fleet/attach-routes.ts write
+//      it into fleet_agents.host (migrations/0051_fleet_agents_host.sql); radar.ts
+//      threads it into AgentCard.host. It is UNTRUSTED, agent-controlled, DISPLAY-ONLY
+//      (never auth/routing) — '' means "never reported" (old runtime, or no fleet row
+//      yet), rendered honestly as "unknown", never fabricated as a specific machine name.
 //
 //   2. MODEL TIER / ROLE / DOMAIN: AgentCard does not carry model, role, or
 //      domain — loadFleetRadar's `agents` SELECT reads those columns off the
@@ -57,8 +59,19 @@ import type { AgentRuntimeState } from './observatory'
 // ── small pure helpers (self-contained — no cross-module CSS-class deps, so
 //    renderAgentCard/renderBrainImage stay usable/testable standalone) ─────────
 
+// Hardened (#21 slice 2 gate note): ' and / added to the replace chain. host is a NEW
+// agent-controlled, untrusted string rendered here (see honest-gaps note 1 above) — an
+// attribute-breakout payload like `" onmouseover="..."` or a `</script>`-style close-tag
+// trick through a bare '/' both needed closing. & MUST stay first so the entities this
+// function itself inserts are never re-escaped.
 function escHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/\//g, '&#x2F;')
 }
 
 /**
@@ -151,18 +164,21 @@ export interface AgentCardRenderOpts {
  * remaining, stale badge). Pure string builder: no I/O, no template-engine
  * dependency, trivially unit-testable by substring assertion.
  *
- * Deliberately omits model/role/domain/host/runtime-type — see the module
- * header's "honest gaps" section for why.
+ * Deliberately omits model/role/domain/runtime-type — see the module header's
+ * "honest gaps" section for why. Host (#21 slice 2) IS shown now — see honest-gaps
+ * note 1: it has a real signal behind it (agent self-report), rendered honestly
+ * as "unknown" when '' (never reported).
  */
 export function renderAgentCard(card: AgentCard, opts: AgentCardRenderOpts = {}): string {
   const nowMs = opts.nowMs ?? Date.now()
   const squadLabel = opts.squadName ? escHtml(opts.squadName) : 'unassigned'
   const state = card.runtime_state
+  const hostLabel = card.host ? escHtml(card.host) : 'unknown'
   const staleBadge = card.airworthiness.stale
     ? `<span style="font-size:10px;font-weight:700;color:var(--warn2);border:1px solid color-mix(in srgb,var(--warn2) 40%,var(--border));border-radius:999px;padding:1px 7px;margin-left:6px">stale data</span>`
     : ''
 
-  return `<div class="card" style="padding:14px 16px" data-agent-id="${escHtml(card.agent_id)}" data-runtime-state="${state}">
+  return `<div class="card" style="padding:14px 16px" data-agent-id="${escHtml(card.agent_id)}" data-runtime-state="${escHtml(state)}">
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
       ${statusDotHtml(state)}
       <span style="font-weight:700;font-size:14px;color:var(--text)">${escHtml(card.display)}</span>
@@ -171,6 +187,7 @@ export function renderAgentCard(card: AgentCard, opts: AgentCardRenderOpts = {})
     </div>
     <div style="font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:4px">
       <div><span style="color:var(--dim)">Squad</span> ${squadLabel}</div>
+      <div><span style="color:var(--dim)">Host</span> ${hostLabel}</div>
       <div><span style="color:var(--dim)">Flight</span> ${flightSummary(card.current_flight)}</div>
       <div><span style="color:var(--dim)">Last seen</span> ${relativeAge(nowMs, card.last_seen_ms)}</div>
       <div><span style="color:var(--dim)">Tasks</span> ${card.recent_activity.tasks_done} done · ${
@@ -192,6 +209,55 @@ const RUNTIME_GROUPS: { state: AgentRuntimeState; label: string }[] = [
   { state: 'offline', label: 'Offline' },
   { state: 'unattached', label: 'Unattached' },
 ]
+
+/**
+ * agentRowHtml — the single-line roster row shared by BOTH grouping schemes below
+ * (runtime-state and, #21 slice 2, host). Factored out so the two groupings can't drift
+ * in what a "row" shows; status dot uses the agent's OWN runtime_state (not the group's
+ * label), so a host bucket mixing live/stale agents still renders each one honestly.
+ */
+function agentRowHtml(a: AgentCard, squadNameByAgent: Map<string, string>, nowMs: number): string {
+  const squadLabel = squadNameByAgent.has(a.agent_id) ? escHtml(squadNameByAgent.get(a.agent_id)!) : 'unassigned'
+  return `<div style="display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid var(--border);flex-wrap:wrap">
+        ${statusDotHtml(a.runtime_state)}
+        <span style="font-weight:600;color:var(--text);min-width:120px">${escHtml(a.display)}</span>
+        <span style="color:var(--dim);font-size:12px;min-width:100px">${squadLabel}</span>
+        <span style="font-size:12px">${flightSummary(a.current_flight)}</span>
+        <span style="color:var(--dim);font-size:11px;margin-left:auto">${relativeAge(nowMs, a.last_seen_ms)}</span>
+      </div>`
+}
+
+/**
+ * renderHostGroups — buckets agents by their self-reported `host` (#21 slice 2: "some on
+ * my Mac, some on this server" picture). '' (never reported — old runtime, or no fleet
+ * row yet) buckets under "unknown host", sorted LAST so real machines are seen first;
+ * known hosts are alpha-sorted for a stable, deterministic render (no Date.now()/Map-
+ * iteration-order dependence). Untrusted, agent-controlled string: always through
+ * escHtml, never used to key anything auth-relevant.
+ */
+function renderHostGroups(agents: AgentCard[], squadNameByAgent: Map<string, string>, nowMs: number): string {
+  const buckets = new Map<string, AgentCard[]>()
+  for (const a of agents) {
+    const key = a.host || ''
+    const bucket = buckets.get(key)
+    if (bucket) bucket.push(a)
+    else buckets.set(key, [a])
+  }
+  const knownHosts = [...buckets.keys()].filter((h) => h !== '').sort((x, y) => x.localeCompare(y))
+  const orderedKeys = buckets.has('') ? [...knownHosts, ''] : knownHosts
+
+  return orderedKeys
+    .map((hostKey) => {
+      const rows = buckets.get(hostKey)!
+      const label = hostKey ? escHtml(hostKey) : 'unknown host'
+      const rowsHtml = rows.map((a) => agentRowHtml(a, squadNameByAgent, nowMs)).join('')
+      return `<div style="margin-bottom:14px">
+      <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);font-weight:600;margin-bottom:4px">${label} (${rows.length})</div>
+      ${rowsHtml}
+    </div>`
+    })
+    .join('')
+}
 
 function renderStaleSignals(signals: StaleSignal[], openCollisions: number): string {
   if (signals.length === 0 && openCollisions === 0) {
@@ -221,13 +287,15 @@ function renderStaleSignals(signals: StaleSignal[], openCollisions: number): str
 }
 
 /**
- * renderBrainImage — the compact fleet map. Groups agents by runtime_state
- * (live / stale / offline / unattached — the SAME 4-state classifier radar.ts
- * derives, not a second liveness definition). Per agent: status dot, name,
- * squad, current flight. Surfaces `summary.stale_signals` PROMINENTLY at the
- * top — that's the airworthiness alarm, the whole point of a radar: you
- * check it before a collision, not after (mupot #353's kasra/codex collision
- * shape is exactly the case this alarm exists to catch early).
+ * renderBrainImage — the compact fleet map. Groups agents TWO ways:
+ *   1. By runtime_state (live / stale / offline / unattached — the SAME 4-state
+ *      classifier radar.ts derives, not a second liveness definition) — "who's on".
+ *   2. By host (#21 slice 2) — "some on my Mac, some on this server, some in the
+ *      cloud", the physical-machine picture a token alone can't give the pot.
+ * Per agent: status dot, name, squad, current flight. Surfaces `summary.stale_signals`
+ * PROMINENTLY at the top — that's the airworthiness alarm, the whole point of a radar:
+ * you check it before a collision, not after (mupot #353's kasra/codex collision shape
+ * is exactly the case this alarm exists to catch early).
  *
  * Pure: nowMs defaults to radar.generated_at_ms (no Date.now() call), so this
  * function never needs a runtime clock — see module header.
@@ -241,23 +309,14 @@ export function renderBrainImage(radar: FleetRadar, nowMs: number = radar.genera
   const groupSections = RUNTIME_GROUPS.map(({ state, label }) => {
     const rows = radar.agents.filter((a) => a.runtime_state === state)
     if (rows.length === 0) return ''
-    const rowsHtml = rows
-      .map((a) => {
-        const squadLabel = squadNameByAgent.has(a.agent_id) ? escHtml(squadNameByAgent.get(a.agent_id)!) : 'unassigned'
-        return `<div style="display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid var(--border);flex-wrap:wrap">
-        ${statusDotHtml(state)}
-        <span style="font-weight:600;color:var(--text);min-width:120px">${escHtml(a.display)}</span>
-        <span style="color:var(--dim);font-size:12px;min-width:100px">${squadLabel}</span>
-        <span style="font-size:12px">${flightSummary(a.current_flight)}</span>
-        <span style="color:var(--dim);font-size:11px;margin-left:auto">${relativeAge(nowMs, a.last_seen_ms)}</span>
-      </div>`
-      })
-      .join('')
+    const rowsHtml = rows.map((a) => agentRowHtml(a, squadNameByAgent, nowMs)).join('')
     return `<div style="margin-bottom:14px">
       <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);font-weight:600;margin-bottom:4px">${label} (${rows.length})</div>
       ${rowsHtml}
     </div>`
   }).join('')
+
+  const hostSections = renderHostGroups(radar.agents, squadNameByAgent, nowMs)
 
   const summaryLine = `<div style="display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-bottom:14px">
     <span><strong style="color:var(--text)">${radar.summary.agents_total}</strong> agents</span>
@@ -268,10 +327,21 @@ export function renderBrainImage(radar: FleetRadar, nowMs: number = radar.genera
     <span><strong style="color:var(--text)">${radar.summary.active_flights}</strong> active flights</span>
   </div>`
 
+  const groupedBody = radar.agents.length
+    ? `<div style="margin-bottom:18px">
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:700;margin-bottom:8px">By runtime state</div>
+        ${groupSections}
+      </div>
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:700;margin-bottom:8px">By host</div>
+        ${hostSections}
+      </div>`
+    : '<p style="color:var(--dim);font-size:13px">No agents on the fleet yet.</p>'
+
   return `<div class="card" style="padding:16px 18px">
     ${renderStaleSignals(radar.summary.stale_signals, radar.summary.open_collisions_count)}
     ${summaryLine}
-    ${groupSections || '<p style="color:var(--dim);font-size:13px">No agents on the fleet yet.</p>'}
+    ${groupedBody}
   </div>`
 }
 

@@ -1,6 +1,7 @@
 // node --test fleet-daemon.test.mjs   (node >= 18 built-in runner, no deps)
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { hostname } from 'node:os'
 import { validateConfig, runProbe, runInboxCommand, detachAgents, runDaemonOnce, runHeartbeatCycle } from './fleet-daemon.mjs'
 
 const okCfg = () => ({
@@ -141,7 +142,7 @@ test('runDaemonOnce: alive agent heartbeats, drains inbox, and marks live', asyn
     log: () => {},
     runProbe: async (cmd) => cmd === 'probe-alive',
     signedAttach: async (baseUrl, agentId, opts) => {
-      calls.push({ type: 'attach', baseUrl, agentId, tenant: opts.tenant, key: opts.privKey })
+      calls.push({ type: 'attach', baseUrl, agentId, tenant: opts.tenant, key: opts.privKey, host: opts.host })
       return { ok: true, status: 200, json: { ok: true } }
     },
     signedInbox: async (baseUrl, agentId, opts) => {
@@ -171,6 +172,8 @@ test('runDaemonOnce: alive agent heartbeats, drains inbox, and marks live', asyn
   assert.equal(calls[0].type, 'attach')
   assert.deepEqual(calls.map((c) => c.type), ['attach', 'inbox', 'handler', 'inbox'])
   assert.equal(calls[2].payload.messages[0].body, 'wake')
+  // #21 slice 2: each heartbeat self-reports THIS machine's hostname.
+  assert.equal(calls[0].host, hostname())
 })
 
 test('runDaemonOnce: dead probe skips heartbeat and inbox', async () => {

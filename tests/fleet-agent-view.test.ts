@@ -25,7 +25,7 @@ async function sha256Hex(s: string): Promise<string> {
 interface FleetRow {
   agent_id: string; tenant: string; display: string; runtime: string; squads: string
   lifecycle: string; provider_contract: string | null; status: string; reported_by: string
-  last_reported_at: string; agent_type: string; member_id: string | null
+  last_reported_at: string; agent_type: string; member_id: string | null; host?: string
 }
 
 // tenant is nullable — migration 0040 adds it as nullable, and NULL is the
@@ -108,11 +108,12 @@ function makeDb(opts: MockDbOpts = {}) {
 
   function run(sql: string, b: unknown[]) {
     if (sql.includes('INSERT INTO fleet_agents')) {
-      const [agent_id, tenant, display, runtime, squads, lifecycle, pc, status, reported_by, agent_type, member_id] = b as Array<string | null>
+      const [agent_id, tenant, display, runtime, squads, lifecycle, pc, status, reported_by, agent_type, member_id, host] = b as Array<string | null>
       fleet.set(`${tenant}:${agent_id}`, {
         agent_id: agent_id!, tenant: tenant!, display: display!, runtime: runtime!, squads: squads!,
         lifecycle: lifecycle!, provider_contract: pc ?? null, status: status!, reported_by: reported_by!,
         last_reported_at: 'now', agent_type: agent_type ?? 'generic', member_id: member_id ?? null,
+        host: host ?? '',
       })
       return { meta: { changes: 1 } }
     }
@@ -379,6 +380,7 @@ describe('listFleetAgentRuntimeView', () => {
       presence: 'live',
       lifecycle: 'always_on',
       last_seen: '2026-07-08 00:59:00',
+      host: '', // never self-reported in this fixture's raw db._fleet row (#21 slice 2)
     }])
     expect(views[0]).not.toHaveProperty('member')
     expect(views[0]).not.toHaveProperty('capabilities')

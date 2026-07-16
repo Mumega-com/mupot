@@ -86,10 +86,11 @@ function makeDb(opts: {
       return { meta: { changes: 1 } }
     }
     if (sql.includes('INSERT INTO fleet_agents')) {
-      const [agent_id, tenant, runtime, lifecycle, reported_by, agent_type, member_id] = b as Array<string | null>
+      const [agent_id, tenant, runtime, lifecycle, reported_by, agent_type, member_id, host] = b as Array<string | null>
       fleet.set(`${tenant}:${agent_id}`, {
         agent_id, tenant, runtime, lifecycle, status: 'running',
         reported_by, agent_type, member_id: member_id ?? null, last_reported_at: 'now',
+        host: host ?? '',
       })
       return { meta: { changes: 1 } }
     }
@@ -271,6 +272,57 @@ describe('signed attach', () => {
     ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
     ;(body as Record<string, unknown>).lifecycle = 'always_on'   // mutate AFTER signing
     expect((await post(env, '/attach-signed', body)).status).toBe(401)
+  })
+
+  // ── host (#21 slice 2) — UNTRUSTED, NOT part of the signed bytes ────────────
+  it('host: an unsigned host field in the body is written to the fleet row', async () => {
+    const { kp, pubX } = await genKey()
+    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } } })
+    const env = makeEnv(db)
+    const body = freshBody('kasra', 'mumega')
+    ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+    ;(body as Record<string, unknown>).host = 'hetzner-1'   // NOT part of the signed canonical message
+
+    const res = await post(env, '/attach-signed', body)
+    expect(res.status).toBe(200)
+    expect(db._fleet.get('mumega:kasra')!.host).toBe('hetzner-1')
+  })
+
+  it('host: absent in the body defaults to "" (backward compatible with old runtimes)', async () => {
+    const { kp, pubX } = await genKey()
+    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } } })
+    const env = makeEnv(db)
+    const body = freshBody('kasra', 'mumega')   // no host field
+    ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+
+    expect((await post(env, '/attach-signed', body)).status).toBe(200)
+    expect(db._fleet.get('mumega:kasra')!.host).toBe('')
+  })
+
+  it('host: trimmed + capped at 64 chars, never rejects the request', async () => {
+    const { kp, pubX } = await genKey()
+    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } } })
+    const env = makeEnv(db)
+    const body = freshBody('kasra', 'mumega')
+    ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+    const long = 'y'.repeat(100)
+    ;(body as Record<string, unknown>).host = `  ${long}  `
+
+    expect((await post(env, '/attach-signed', body)).status).toBe(200)
+    expect(db._fleet.get('mumega:kasra')!.host).toBe(long.slice(0, 64))
+  })
+
+  it('host: changing it AFTER signing does NOT invalidate the signature (untrusted, unsigned by design)', async () => {
+    const { kp, pubX } = await genKey()
+    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } } })
+    const env = makeEnv(db)
+    const body = freshBody('kasra', 'mumega', { host: 'host-at-sign-time' })
+    ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+    ;(body as Record<string, unknown>).host = 'host-mutated-after-signing'   // unlike runtime/lifecycle, this must NOT 401
+
+    const res = await post(env, '/attach-signed', body)
+    expect(res.status).toBe(200)   // contrast with the 'tampered runtime/lifecycle' tests above, which 401
+    expect(db._fleet.get('mumega:kasra')!.host).toBe('host-mutated-after-signing')
   })
 })
 

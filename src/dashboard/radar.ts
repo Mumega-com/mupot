@@ -81,6 +81,11 @@ export interface AgentCard {
   current_flight: RadarFlightRef | null // buildBoard(...).live flight for this agent (flight/board.ts)
   recent_activity: AgentCardRecentActivity
   airworthiness: AgentAirworthiness
+  // Self-reported physical-machine signal (#21 slice 2) — fleet_agents.host via
+  // listFleetAgentRuntimeView (fleet/registry.ts). UNTRUSTED, agent-controlled,
+  // display-only. '' when unknown (no fleet_agents row, or the row's host is unreported —
+  // both mean "we were never told", not "definitely no host").
+  host: string
 }
 
 export interface SquadRadarView {
@@ -176,8 +181,12 @@ export function buildFleetRadar(inputs: FleetRadarInputs): FleetRadar {
 
   // last_seen_ms per agent_id, from the fleet_agents heartbeat row (registry.ts).
   const lastSeenByAgent = new Map<string, number | null>()
+  // host per agent_id, from the SAME fleet_agents row (#21 slice 2) — no second SQL query,
+  // just widening the projection off data already fetched for last_seen_ms.
+  const hostByAgent = new Map<string, string>()
   for (const row of fleetRuntimeRows) {
     lastSeenByAgent.set(row.agent_id, sqliteUtcToMs(row.last_seen || null))
+    hostByAgent.set(row.agent_id, row.host || '')
   }
 
   // presence (flock check-in) keyed by bound agent_id. Rows arrive last_seen_at DESC
@@ -295,6 +304,7 @@ export function buildFleetRadar(inputs: FleetRadarInputs): FleetRadar {
         budget_remaining_micro_usd,
         stale: runtime_state !== 'live',
       },
+      host: hostByAgent.get(a.id) ?? '',
     }
   })
 

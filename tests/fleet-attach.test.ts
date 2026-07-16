@@ -24,6 +24,7 @@ interface FleetRow {
   agent_id: string; tenant: string; display: string; runtime: string; squads: string
   lifecycle: string; provider_contract: string | null; status: string; reported_by: string
   last_reported_at: string; updated_at: string; agent_type: string; member_id: string | null
+  host?: string
 }
 
 interface TokenRow {
@@ -94,11 +95,11 @@ function makeDb(opts: MockOpts = {}) {
 
   function run(sql: string, binds: unknown[]) {
     // fleet_agents INSERT ON CONFLICT upsert (attach).
-    // Only 7 bound params: agent_id(?1), tenant(?2), runtime(?3),
-    // lifecycle(?4), reported_by(?5), agent_type(?6), member_id(?7).
+    // 8 bound params: agent_id(?1), tenant(?2), runtime(?3), lifecycle(?4),
+    // reported_by(?5), agent_type(?6), member_id(?7), host(?8) (#21 slice 2).
     // SQL literals: display='', squads='[]', provider_contract=NULL, status='running'.
     if (sql.includes('INSERT INTO fleet_agents')) {
-      const [agent_id, tenant, runtime, lifecycle, reported_by, agent_type, member_id]
+      const [agent_id, tenant, runtime, lifecycle, reported_by, agent_type, member_id, host]
         = binds as Array<string | null>
       const key = `${tenant}:${agent_id}`
       const existing = fleet.get(key)
@@ -109,6 +110,7 @@ function makeDb(opts: MockOpts = {}) {
         existing.reported_by = reported_by!
         existing.agent_type = agent_type!
         existing.member_id = member_id ?? null
+        existing.host = host ?? ''
         existing.last_reported_at = 'now'
         existing.updated_at = 'now'
       } else {
@@ -117,7 +119,7 @@ function makeDb(opts: MockOpts = {}) {
           runtime: runtime!, squads: '[]', lifecycle: lifecycle!,
           provider_contract: null, status: 'running', reported_by: reported_by!,
           last_reported_at: 'now', updated_at: 'now',
-          agent_type: agent_type!, member_id: member_id ?? null,
+          agent_type: agent_type!, member_id: member_id ?? null, host: host ?? '',
         })
       }
       return { meta: { changes: 1 } }
@@ -363,6 +365,44 @@ describe('POST /attach', () => {
     const json = (await res.json()) as { error: string }
     expect(json.error).toBe('payload_too_large')
     expect(db._fleet.size).toBe(0) // no mutation before cap check
+  })
+
+  // ── host (#21 slice 2) — untrusted, agent-controlled, display-only ────────────
+
+  it('host: an optional host field in the body is written to the fleet row', async () => {
+    const db = defaultDb()
+    const res = await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code', host: 'hetzner-1' }, makeEnv(db))
+    expect(res.status).toBe(200)
+    expect(db._fleet.get('t:kasra')!.host).toBe('hetzner-1')
+  })
+
+  it('host: absent in the body defaults to "" (backward compatible)', async () => {
+    const db = defaultDb()
+    await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code' }, makeEnv(db))
+    expect(db._fleet.get('t:kasra')!.host).toBe('')
+  })
+
+  it('host: trimmed + capped at 64 chars, never rejects the request', async () => {
+    const db = defaultDb()
+    const long = 'z'.repeat(100)
+    const res = await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code', host: `  ${long}  ` }, makeEnv(db))
+    expect(res.status).toBe(200)
+    expect(db._fleet.get('t:kasra')!.host).toBe(long.slice(0, 64))
+  })
+
+  it('host: re-attach with a new host overwrites the old one (current machine wins)', async () => {
+    const db = defaultDb()
+    const e = makeEnv(db)
+    await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code', host: 'old-box' }, e)
+    await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code', host: 'new-box' }, e)
+    expect(db._fleet.get('t:kasra')!.host).toBe('new-box')
+  })
+
+  it('host: a non-string value is ignored (defaults to "")', async () => {
+    const db = defaultDb()
+    const res = await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'claude-code', host: 42 }, makeEnv(db))
+    expect(res.status).toBe(200)
+    expect(db._fleet.get('t:kasra')!.host).toBe('')
   })
 })
 
