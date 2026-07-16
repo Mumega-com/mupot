@@ -201,6 +201,15 @@ function isZeroAuthority(entry: AddonCatalogEntry): boolean {
     && entry.manifest.authorityRequests.surfaceGrants.length === 0
 }
 
+function matchesRegisteredIdentity(installation: AddonInstallation, entry: AddonCatalogEntry): boolean {
+  return installation.addonKey === entry.manifest.key
+    && installation.installedVersion === entry.manifest.version
+    && installation.publisher === entry.manifest.publisher
+    && installation.trustClass === entry.manifest.trustClass
+    && installation.manifestSha256 === entry.manifestSha256
+    && installation.mupotCompatibility === entry.manifest.mupotCompatibility
+}
+
 function written(result: { success: boolean; meta?: { changes?: number } }): boolean {
   return result.success && result.meta?.changes === 1
 }
@@ -251,7 +260,7 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
 
   const existing = await loadLiveInstallation(env, key)
   if (existing) {
-    if (existing.manifestSha256 !== entry.manifestSha256) {
+    if (!matchesRegisteredIdentity(existing, entry)) {
       return { ok: false, reason: 'manifest_digest_drift' }
     }
     return { ok: true, state: existing.state, installation: existing, idempotent: true }
@@ -313,7 +322,7 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
   } catch {
     const raced = await loadLiveInstallation(env, key)
     if (!raced) return { ok: false, reason: 'write_failed' }
-    if (raced.manifestSha256 !== entry.manifestSha256) {
+    if (!matchesRegisteredIdentity(raced, entry)) {
       return { ok: false, reason: 'manifest_digest_drift' }
     }
     return { ok: true, state: raced.state, installation: raced, idempotent: true }
@@ -332,7 +341,7 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
 
   const existing = await loadLiveInstallation(env, key)
   if (!existing) return { ok: false, reason: 'invalid_state' }
-  if (existing.manifestSha256 !== entry.manifestSha256) {
+  if (!matchesRegisteredIdentity(existing, entry)) {
     return { ok: false, reason: 'manifest_digest_drift' }
   }
   if (existing.state === 'configured') {
@@ -391,10 +400,11 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
     }
   } catch {
     const current = await loadLiveInstallation(env, key)
-    if (!current || current.state === 'installed') return { ok: false, reason: 'write_failed' }
-    if (current.manifestSha256 !== entry.manifestSha256) {
+    if (!current) return { ok: false, reason: 'write_failed' }
+    if (!matchesRegisteredIdentity(current, entry)) {
       return { ok: false, reason: 'manifest_digest_drift' }
     }
+    if (current.state === 'installed') return { ok: false, reason: 'write_failed' }
     if (current.state === 'configured') {
       return { ok: true, state: current.state, installation: current, idempotent: true }
     }
@@ -403,7 +413,7 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
 
   const current = await loadLiveInstallation(env, key)
   if (!current) return { ok: false, reason: 'write_failed' }
-  if (current.manifestSha256 !== entry.manifestSha256) {
+  if (!matchesRegisteredIdentity(current, entry)) {
     return { ok: false, reason: 'manifest_digest_drift' }
   }
   if (current.state === 'configured') {

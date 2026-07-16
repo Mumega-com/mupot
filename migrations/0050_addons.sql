@@ -44,6 +44,30 @@ BEGIN
   SELECT RAISE(ABORT, 'addon installation must start installed with no previous state');
 END;
 
+CREATE TRIGGER IF NOT EXISTS addon_installations_installer_is_initial_actor
+  BEFORE INSERT ON addon_installations
+  WHEN NEW.installed_by IS NOT NEW.latest_actor_id
+BEGIN
+  SELECT RAISE(ABORT, 'addon installer must be the initial latest actor');
+END;
+
+CREATE TRIGGER IF NOT EXISTS addon_installations_identity_is_immutable
+  BEFORE UPDATE OF id, tenant, addon_key, installed_version, publisher,
+    trust_class, manifest_sha256, mupot_compatibility, installed_by
+  ON addon_installations
+  WHEN NEW.id IS NOT OLD.id
+    OR NEW.tenant IS NOT OLD.tenant
+    OR NEW.addon_key IS NOT OLD.addon_key
+    OR NEW.installed_version IS NOT OLD.installed_version
+    OR NEW.publisher IS NOT OLD.publisher
+    OR NEW.trust_class IS NOT OLD.trust_class
+    OR NEW.manifest_sha256 IS NOT OLD.manifest_sha256
+    OR NEW.mupot_compatibility IS NOT OLD.mupot_compatibility
+    OR NEW.installed_by IS NOT OLD.installed_by
+BEGIN
+  SELECT RAISE(ABORT, 'addon installation identity is immutable');
+END;
+
 CREATE TRIGGER IF NOT EXISTS addon_installations_state_snapshots_previous
   BEFORE UPDATE OF state ON addon_installations
   WHEN NEW.state <> OLD.state AND NEW.latest_previous_state IS NOT OLD.state
@@ -95,6 +119,13 @@ CREATE TRIGGER IF NOT EXISTS addon_installations_latest_receipt_requires_state
   WHEN NEW.latest_receipt_id <> OLD.latest_receipt_id AND NEW.state = OLD.state
 BEGIN
   SELECT RAISE(ABORT, 'addon latest receipt requires a state transition');
+END;
+
+CREATE TRIGGER IF NOT EXISTS addon_installations_latest_actor_requires_state
+  BEFORE UPDATE OF latest_actor_id ON addon_installations
+  WHEN NEW.latest_actor_id IS NOT OLD.latest_actor_id AND NEW.state = OLD.state
+BEGIN
+  SELECT RAISE(ABORT, 'addon latest actor requires a state transition');
 END;
 
 CREATE TRIGGER IF NOT EXISTS addon_installations_valid_state_transition
@@ -273,9 +304,20 @@ BEGIN
   SELECT RAISE(ABORT, 'addon receipt identity does not match installation');
 END;
 
+CREATE TRIGGER IF NOT EXISTS addon_transition_receipts_require_pass
+  BEFORE INSERT ON addon_receipts
+  WHEN NEW.action IN ('install','configure','activate','disable','archive')
+    AND NEW.outcome <> 'pass'
+BEGIN
+  SELECT RAISE(ABORT, 'failed addon receipt cannot authorize lifecycle state');
+END;
+
 CREATE TRIGGER IF NOT EXISTS addon_transition_receipts_match_installation
   BEFORE INSERT ON addon_receipts
-  WHEN (
+  WHEN NOT (
+    NEW.action IN ('install','configure','activate','disable','archive')
+    AND NEW.outcome <> 'pass'
+  ) AND (
     NEW.action IN ('install','configure','activate','disable','archive')
     OR EXISTS (
       SELECT 1

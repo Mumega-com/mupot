@@ -14,6 +14,17 @@ import { createSqliteD1 } from './helpers/sqlite-d1'
 const migration = readFileSync(new URL('../migrations/0050_addons.sql', import.meta.url), 'utf8')
 const owner = { id: 'owner-1', role: 'owner' } as const
 const admin = { id: 'admin-1', role: 'admin' } as const
+const immutableInstallationUpdates = [
+  ['id', 'replacement-installation'],
+  ['tenant', 'tenant-b'],
+  ['addon_key', 'replacement-addon'],
+  ['installed_version', '9.9.9'],
+  ['publisher', 'replacement-publisher'],
+  ['trust_class', 'external_isolated'],
+  ['manifest_sha256', 'b'.repeat(64)],
+  ['mupot_compatibility', '^99.0.0'],
+  ['installed_by', 'replacement-installer'],
+] as const
 
 interface ReceiptRow {
   id: string
@@ -83,9 +94,16 @@ async function insertInstallationLifecycle(
     receiptId: string
     tenant: string
     addonKey: string
+    installedVersion: string
+    publisher: string
     trustClass: string
     manifestSha256: string
+    mupotCompatibility: string
     state: string
+    installedBy: string
+    latestActorId: string
+    receiptActorId: string
+    outcome: 'pass' | 'fail'
   }> = {},
 ) {
   const catalog = getRegisteredAddon('fixture-addon')
@@ -95,9 +113,16 @@ async function insertInstallationLifecycle(
   const receiptId = overrides.receiptId ?? crypto.randomUUID()
   const tenant = overrides.tenant ?? db.env.TENANT_SLUG
   const addonKey = overrides.addonKey ?? `fixture-${id}`
+  const installedVersion = overrides.installedVersion ?? catalog.manifest.version
+  const publisher = overrides.publisher ?? catalog.manifest.publisher
   const trustClass = overrides.trustClass ?? catalog.manifest.trustClass
   const digest = overrides.manifestSha256 ?? catalog.manifestSha256
+  const mupotCompatibility = overrides.mupotCompatibility ?? catalog.manifest.mupotCompatibility
   const state = overrides.state ?? 'installed'
+  const installedBy = overrides.installedBy ?? owner.id
+  const latestActorId = overrides.latestActorId ?? installedBy
+  const receiptActorId = overrides.receiptActorId ?? latestActorId
+  const outcome = overrides.outcome ?? 'pass'
   const now = new Date().toISOString()
 
   await db.env.DB.batch([
@@ -106,18 +131,19 @@ async function insertInstallationLifecycle(
         id, tenant, addon_key, installed_version, publisher, trust_class,
         manifest_sha256, mupot_compatibility, state, latest_previous_state, installed_by,
         latest_actor_id, latest_receipt_id, installed_at, updated_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10, ?11, ?12, ?12)
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12, ?13, ?13)
     `).bind(
       id,
       tenant,
       addonKey,
-      catalog.manifest.version,
-      catalog.manifest.publisher,
+      installedVersion,
+      publisher,
       trustClass,
       digest,
-      catalog.manifest.mupotCompatibility,
+      mupotCompatibility,
       state,
-      owner.id,
+      installedBy,
+      latestActorId,
       receiptId,
       now,
     ),
@@ -129,19 +155,20 @@ async function insertInstallationLifecycle(
         side_effect_ids, checks, created_at
       ) VALUES (
         ?1, ?2, ?3, 'install', NULL, 'installed', ?4, ?5, ?6, ?7,
-        ?8, ?9, ?10, 'pass', '[]', '{}', ?11
+        ?8, ?9, ?10, ?11, '[]', '{}', ?12
       )
     `).bind(
       receiptId,
       tenant,
       id,
       addonKey,
-      catalog.manifest.version,
-      catalog.manifest.publisher,
+      installedVersion,
+      publisher,
       trustClass,
-      catalog.manifest.mupotCompatibility,
+      mupotCompatibility,
       digest,
-      owner.id,
+      receiptActorId,
+      outcome,
       now,
     ),
   ])
@@ -159,6 +186,8 @@ async function transitionInstallation(
     whereState?: string
     publisher?: string
     actorId?: string
+    receiptActorId?: string
+    outcome?: 'pass' | 'fail'
   } = {},
 ) {
   const installation = db.installations().find((row) => row.id === installationId)
@@ -167,6 +196,8 @@ async function transitionInstallation(
   const receiptId = crypto.randomUUID()
   const now = new Date().toISOString()
   const actorId = options.actorId ?? owner.id
+  const receiptActorId = options.receiptActorId ?? actorId
+  const outcome = options.outcome ?? 'pass'
 
   return db.env.DB.batch([
     db.env.DB.prepare(`
@@ -192,7 +223,7 @@ async function transitionInstallation(
         side_effect_ids, checks, created_at
       ) VALUES (
         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-        ?11, ?12, ?13, 'pass', '[]', '{}', ?14
+        ?11, ?12, ?13, ?14, '[]', '{}', ?15
       )
     `).bind(
       receiptId,
@@ -207,7 +238,8 @@ async function transitionInstallation(
       installation.trust_class,
       installation.mupot_compatibility,
       installation.manifest_sha256,
-      actorId,
+      receiptActorId,
+      outcome,
       now,
     ),
   ])
@@ -304,6 +336,30 @@ describe('addon migration constraints', () => {
     await expect(insertInstallationLifecycle(db, { tenant: 'tenant-b', addonKey: 'same-addon' })).resolves.toBeDefined()
   })
 
+  it.each(immutableInstallationUpdates)('keeps installation identity column %s immutable', async (column, value) => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    const before = db.installations()[0]
+
+    expect(() => db.harness.sqlite.prepare(
+      `UPDATE addon_installations SET ${column} = ? WHERE id = ?`,
+    ).run(value, installation.id)).toThrow('addon installation identity is immutable')
+
+    expect(db.installations()[0]).toEqual(before)
+    expect(db.receipts()).toHaveLength(1)
+  })
+
+  it('requires the installer to be the initial latest actor', async () => {
+    await expect(insertInstallationLifecycle(db, {
+      addonKey: 'actor-mismatch-addon',
+      installedBy: owner.id,
+      latestActorId: admin.id,
+      receiptActorId: admin.id,
+    })).rejects.toThrow('addon installer must be the initial latest actor')
+
+    expect(db.installations()).toHaveLength(0)
+    expect(db.receipts()).toHaveLength(0)
+  })
+
   it('anchors operation, ownership, and receipt tenants to their installation', async () => {
     const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
     const now = new Date().toISOString()
@@ -391,6 +447,114 @@ describe('addon migration constraints', () => {
       { whereState: 'configured' },
     )).rejects.toThrow()
     expect(db.installations()[0].state).toBe('installed')
+    expect(db.receipts()).toHaveLength(1)
+  })
+
+  it('rolls back failed install receipts instead of authorizing installed state', async () => {
+    await expect(insertInstallationLifecycle(db, {
+      addonKey: 'failed-install-addon',
+      outcome: 'fail',
+    })).rejects.toThrow('failed addon receipt cannot authorize lifecycle state')
+
+    expect(db.installations()).toHaveLength(0)
+    expect(db.receipts()).toHaveLength(0)
+  })
+
+  it('rolls back failed transition receipts instead of authorizing successful state', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    const before = db.installations()[0]
+
+    await expect(transitionInstallation(
+      db,
+      installation.id,
+      'configure',
+      'installed',
+      'configured',
+      { outcome: 'fail' },
+    )).rejects.toThrow('failed addon receipt cannot authorize lifecycle state')
+
+    expect(db.installations()[0]).toEqual(before)
+    expect(db.receipts()).toHaveLength(1)
+  })
+
+  it('retains standalone failed preflight and health receipts', async () => {
+    await installAddon(db.env, owner, 'fixture-addon')
+    const installation = db.installations()[0]
+
+    expect(() => insertNonTransitionReceipt(db, installation, {
+      action: 'preflight',
+      outcome: 'fail',
+      error_code: 'preflight_failed',
+    })).not.toThrow()
+    expect(() => insertNonTransitionReceipt(db, installation, {
+      action: 'health',
+      outcome: 'fail',
+      error_code: 'health_failed',
+    })).not.toThrow()
+
+    expect(db.receipts().filter((receipt) => receipt.outcome === 'fail')).toHaveLength(2)
+    expect(db.installations()[0]).toEqual(installation)
+  })
+
+  it('rejects latest actor changes without a state transition', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+
+    expect(() => db.harness.sqlite.prepare(`
+      UPDATE addon_installations
+         SET latest_actor_id = ?
+       WHERE id = ? AND tenant = ?
+    `).run(admin.id, installation.id, db.env.TENANT_SLUG)).toThrow(
+      'addon latest actor requires a state transition',
+    )
+
+    expect(db.installations()[0].latest_actor_id).toBe(owner.id)
+    expect(db.receipts()).toHaveLength(1)
+  })
+
+  it('prevents rewriting the state-changing actor before inserting its fresh receipt', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    const before = db.installations()[0]
+    const receiptId = crypto.randomUUID()
+    const now = new Date().toISOString()
+
+    await expect(db.env.DB.batch([
+      db.env.DB.prepare(`
+        UPDATE addon_installations
+           SET state = 'configured', latest_previous_state = 'installed',
+               latest_actor_id = ?1, latest_receipt_id = ?2, updated_at = ?3
+         WHERE id = ?4 AND tenant = ?5 AND state = 'installed'
+      `).bind(admin.id, receiptId, now, installation.id, db.env.TENANT_SLUG),
+      db.env.DB.prepare(`
+        UPDATE addon_installations
+           SET latest_actor_id = ?1
+         WHERE id = ?2 AND tenant = ?3 AND state = 'configured'
+      `).bind(owner.id, installation.id, db.env.TENANT_SLUG),
+      db.env.DB.prepare(`
+        INSERT INTO addon_receipts (
+          id, tenant, installation_id, action, previous_state, next_state,
+          addon_key, installed_version, publisher, trust_class,
+          mupot_compatibility, manifest_sha256, actor_id, outcome,
+          side_effect_ids, checks, created_at
+        ) VALUES (
+          ?1, ?2, ?3, 'configure', 'installed', 'configured', ?4, ?5, ?6, ?7,
+          ?8, ?9, ?10, 'pass', '[]', '{}', ?11
+        )
+      `).bind(
+        receiptId,
+        db.env.TENANT_SLUG,
+        installation.id,
+        before.addon_key,
+        before.installed_version,
+        before.publisher,
+        before.trust_class,
+        before.mupot_compatibility,
+        before.manifest_sha256,
+        owner.id,
+        now,
+      ),
+    ])).rejects.toThrow('addon latest actor requires a state transition')
+
+    expect(db.installations()[0]).toEqual(before)
     expect(db.receipts()).toHaveLength(1)
   })
 
@@ -807,6 +971,21 @@ describe('addon install and configure service', () => {
     })
   })
 
+  it.each([
+    ['installed version', { installedVersion: '9.9.9' }],
+    ['publisher', { publisher: 'forged-publisher' }],
+    ['MuPot compatibility', { mupotCompatibility: '^99.0.0' }],
+  ] as const)('configure rejects stored %s drift even when the digest matches', async (_field, overrides) => {
+    await insertInstallationLifecycle(db, { addonKey: 'fixture-addon', ...overrides })
+
+    expect(await configureAddon(db.env, owner, 'fixture-addon')).toEqual({
+      ok: false,
+      reason: 'manifest_digest_drift',
+    })
+    expect(db.installations()[0].state).toBe('installed')
+    expect(db.receipts()).toHaveLength(1)
+  })
+
   it('concurrent configure commits one transition receipt and returns one idempotent result', async () => {
     await installAddon(db.env, owner, 'fixture-addon')
 
@@ -856,9 +1035,10 @@ describe('addon install and configure service', () => {
   })
 
   it('rejects manifest digest drift without writing another receipt', async () => {
-    await installAddon(db.env, owner, 'fixture-addon')
-    db.harness.sqlite.prepare('UPDATE addon_installations SET manifest_sha256 = ? WHERE tenant = ? AND addon_key = ?')
-      .run('b'.repeat(64), 'tenant-a', 'fixture-addon')
+    await insertInstallationLifecycle(db, {
+      addonKey: 'fixture-addon',
+      manifestSha256: 'b'.repeat(64),
+    })
 
     expect(await installAddon(db.env, owner, 'fixture-addon')).toEqual({
       ok: false,
