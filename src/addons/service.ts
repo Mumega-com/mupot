@@ -178,6 +178,7 @@ interface OwnershipRow {
   resource_id: string
   resource_key: string
   ownership_mode: 'exclusive' | 'co_owner'
+  preserve_on_release: 0 | 1
   active: 0 | 1
   created_at: string
   released_at: string | null
@@ -351,6 +352,17 @@ async function loadLiveInstallation(env: Env, key: string): Promise<AddonInstall
      WHERE tenant = ?1 AND addon_key = ?2
        AND state <> 'archived'
      ORDER BY installed_at DESC, id DESC
+     LIMIT 1
+  `).bind(env.TENANT_SLUG, key).first<InstallationRow>()
+  return row ? installationFromRow(row) : null
+}
+
+async function loadLatestArchivedInstallation(env: Env, key: string): Promise<AddonInstallation | null> {
+  const row = await env.DB.prepare(`
+    SELECT ${INSTALLATION_COLUMNS}
+      FROM addon_installations
+     WHERE tenant = ?1 AND addon_key = ?2 AND state = 'archived'
+     ORDER BY archived_at DESC, updated_at DESC, id DESC
      LIMIT 1
   `).bind(env.TENANT_SLUG, key).first<InstallationRow>()
   return row ? installationFromRow(row) : null
@@ -968,7 +980,7 @@ async function loadDepartmentClaims(
   const activePredicate = activeOnly ? 'AND active = 1' : ''
   const result = await env.DB.prepare(`
     SELECT id, tenant, installation_id, resource_type, resource_id,
-           resource_key, ownership_mode, active, created_at, released_at
+           resource_key, ownership_mode, preserve_on_release, active, created_at, released_at
       FROM addon_resource_ownership
      WHERE installation_id = ?1
        ${activePredicate}
@@ -984,7 +996,7 @@ async function loadDepartmentClaim(
 ): Promise<OwnershipRow | null> {
   const result = await env.DB.prepare(`
     SELECT id, tenant, installation_id, resource_type, resource_id,
-           resource_key, ownership_mode, active, created_at, released_at
+           resource_key, ownership_mode, preserve_on_release, active, created_at, released_at
       FROM addon_resource_ownership
      WHERE installation_id = ?1 AND resource_key = ?2
      ORDER BY id ASC
@@ -1001,7 +1013,7 @@ async function loadOwnershipClaimById(
 ): Promise<OwnershipRow | null> {
   return env.DB.prepare(`
     SELECT id, tenant, installation_id, resource_type, resource_id,
-           resource_key, ownership_mode, active, created_at, released_at
+           resource_key, ownership_mode, preserve_on_release, active, created_at, released_at
       FROM addon_resource_ownership
      WHERE id = ?1 AND installation_id = ?2
      LIMIT 1
@@ -1185,6 +1197,7 @@ function validateDepartmentClaim(
     || claim.resource_key !== moduleKey
     || claim.resource_id !== department.id
     || claim.ownership_mode !== 'co_owner'
+    || (claim.preserve_on_release !== 0 && claim.preserve_on_release !== 1)
   ) {
     throw new Error('addon department ownership identity mismatch')
   }
@@ -1212,6 +1225,7 @@ function serializedClaimIdentities(claims: OwnershipRow[]): string {
     id: claim.id,
     installationId: claim.installation_id,
     ownershipMode: claim.ownership_mode,
+    preserveOnRelease: claim.preserve_on_release,
     resourceId: claim.resource_id,
     resourceKey: claim.resource_key,
     resourceType: claim.resource_type,
@@ -1397,6 +1411,53 @@ async function loadCompletedDisableOperationEvidence(
   ).first<OperationRow>()
 }
 
+async function loadCompletedArchiveOperationEvidence(
+  env: Env,
+  installation: AddonInstallation,
+): Promise<OperationRow | null> {
+  const receipt = await env.DB.prepare(`
+    SELECT id, actor_id, checks, created_at
+      FROM addon_receipts
+     WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
+       AND action = 'archive' AND previous_state = 'disabled' AND next_state = 'archived'
+       AND addon_key = ?4 AND installed_version = ?5 AND publisher = ?6
+       AND trust_class = ?7 AND mupot_compatibility = ?8 AND manifest_sha256 = ?9
+       AND actor_id = ?10 AND outcome = 'pass'
+     LIMIT 1
+  `).bind(
+    installation.latestReceiptId,
+    env.TENANT_SLUG,
+    installation.id,
+    installation.addonKey,
+    installation.installedVersion,
+    installation.publisher,
+    installation.trustClass,
+    installation.mupotCompatibility,
+    installation.manifestSha256,
+    installation.latestActorId,
+  ).first<Pick<ReceiptRow, 'id' | 'actor_id' | 'checks' | 'created_at'>>()
+  if (!receipt) return null
+
+  const operationId = parseChecks(receipt.checks).operationId
+  if (typeof operationId !== 'string' || operationId.length === 0) return null
+  return env.DB.prepare(`
+    SELECT id, tenant, installation_id, action, target_state, current_step,
+           status, actor_id, lease_token, lease_expires_at, error_code, created_at, updated_at
+      FROM addon_operations
+     WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
+       AND action = 'archive' AND target_state = 'archived'
+       AND current_step = 'completed' AND status = 'completed'
+       AND actor_id = ?4 AND created_at <= ?5 AND updated_at >= ?5
+     LIMIT 1
+  `).bind(
+    operationId,
+    env.TENANT_SLUG,
+    installation.id,
+    receipt.actor_id,
+    receipt.created_at,
+  ).first<OperationRow>()
+}
+
 const MAX_DEPARTMENT_RECONCILIATION_ATTEMPTS = 4
 
 async function reconcileDepartmentForOwnership(
@@ -1405,6 +1466,7 @@ async function reconcileDepartmentForOwnership(
   departmentId: string,
   options: {
     excludedInstallationId?: string
+    preserveWhenUnowned?: boolean
     operation?: OperationRow
     expectedStates?: readonly [AddonState, AddonState]
   } = {},
@@ -1415,6 +1477,11 @@ async function reconcileDepartmentForOwnership(
     departmentId,
     options.excludedInstallationId ?? null,
   ) > 0
+
+  if (!shouldBeActive && options.preserveWhenUnowned) {
+    await loadPersistedClaimedDepartment(env, moduleKey, departmentId, null)
+    return
+  }
 
   let lastRegistryError: Error | null = null
   for (let attempt = 0; attempt < MAX_DEPARTMENT_RECONCILIATION_ATTEMPTS; attempt += 1) {
@@ -1435,7 +1502,12 @@ async function reconcileDepartmentForOwnership(
         await renewOperationLease(env, options.operation, options.expectedStates)
       } catch (error) {
         if (error instanceof FenceLostError) {
-          await compensateDepartmentForOwnership(env, moduleKey, departmentId)
+          await compensateDepartmentForOwnership(
+            env,
+            moduleKey,
+            departmentId,
+            options.preserveWhenUnowned ?? false,
+          )
         }
         throw error
       }
@@ -1449,6 +1521,7 @@ async function reconcileDepartmentForOwnership(
     )
     const department = await loadPersistedClaimedDepartment(env, moduleKey, departmentId, null)
     shouldBeActive = activeClaims > 0
+    if (!shouldBeActive && options.preserveWhenUnowned) return
     if (department.active === (shouldBeActive ? 1 : 0)) return
   }
 
@@ -1460,8 +1533,9 @@ async function compensateDepartmentForOwnership(
   env: Env,
   moduleKey: string,
   departmentId: string,
+  preserveWhenUnowned = false,
 ): Promise<void> {
-  await reconcileDepartmentForOwnership(env, moduleKey, departmentId)
+  await reconcileDepartmentForOwnership(env, moduleKey, departmentId, { preserveWhenUnowned })
 }
 
 async function repairAndValidatePersistedDisabledDepartmentClaims(
@@ -1478,7 +1552,11 @@ async function repairAndValidatePersistedDisabledDepartmentClaims(
       env,
       claim.resource_key,
       claim.resource_id,
-      options,
+      {
+        ...options,
+        // A tenant-owned department is outside addon teardown authority.
+        ...(claim.preserve_on_release === 1 ? { preserveWhenUnowned: true } : {}),
+      },
     )
   }
 
@@ -1489,12 +1567,8 @@ async function repairAndValidatePersistedDisabledDepartmentClaims(
       claim.resource_key,
       claim.resource_id,
     )
-    await loadPersistedClaimedDepartment(
-      env,
-      claim.resource_key,
-      claim.resource_id,
-      activeClaims > 0 ? 1 : 0,
-    )
+    await loadPersistedClaimedDepartment(env, claim.resource_key, claim.resource_id,
+      activeClaims > 0 ? 1 : claim.preserve_on_release === 1 ? null : 0)
   }
   return confirmed
 }
@@ -1545,7 +1619,12 @@ async function renewAfterRegistryCall(
           operation.lease_token,
         ).run()
       }
-      await compensateDepartmentForOwnership(env, moduleKey, departmentId)
+      await compensateDepartmentForOwnership(
+        env,
+        moduleKey,
+        departmentId,
+        pendingActivationClaim?.preserve_on_release === 1,
+      )
     }
     throw error
   }
@@ -1565,6 +1644,7 @@ async function deactivateIfUnowned(
     null,
   )
   validateDepartmentClaim(env, installationId, claim.resource_key, department, claim)
+  if (claim.preserve_on_release === 1) return false
   if (await countOtherActiveClaims(env, claim) > 0) return false
 
   await deps.beforeDepartmentDeactivated?.({
@@ -1686,6 +1766,7 @@ async function releaseDepartmentClaim(
     ['disabled', 'disabled'],
     claim.resource_key,
     claim.resource_id,
+    claim,
   )
 }
 
@@ -1709,7 +1790,31 @@ async function ensureDepartmentClaim(
       const now = leaseWindow().now
       const result = await env.DB.prepare(`
         UPDATE addon_resource_ownership
-           SET active = 1, released_at = NULL
+           SET active = 1, released_at = NULL,
+               preserve_on_release = CASE
+                 WHEN EXISTS (
+                   SELECT 1 FROM departments AS department
+                    WHERE department.id = ?4 AND department.slug = ?5
+                      AND department.template_key = ?5 AND department.active = 1
+                 ) AND (
+                   NOT EXISTS (
+                     SELECT 1 FROM addon_resource_ownership AS other_claim
+                      WHERE other_claim.tenant = ?2
+                        AND other_claim.resource_type = 'department'
+                        AND other_claim.resource_id = ?4
+                        AND other_claim.id <> ?1
+                        AND other_claim.active = 1
+                   ) OR EXISTS (
+                     SELECT 1 FROM addon_resource_ownership AS preserving_claim
+                      WHERE preserving_claim.tenant = ?2
+                        AND preserving_claim.resource_type = 'department'
+                        AND preserving_claim.resource_id = ?4
+                        AND preserving_claim.id <> ?1
+                        AND preserving_claim.active = 1
+                        AND preserving_claim.preserve_on_release = 1
+                   )
+                 ) THEN 1 ELSE 0
+               END
          WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
            AND resource_type = 'department' AND resource_id = ?4
            AND resource_key = ?5 AND ownership_mode = 'co_owner' AND active = 0
@@ -1741,7 +1846,9 @@ async function ensureDepartmentClaim(
         expectedStates[1],
       ).run()
       if (!written(result)) throw new FenceLostError()
-      claim = { ...existing, active: 1, released_at: null }
+      const reactivated = await loadOwnershipClaimById(env, installation.id, existing.id)
+      if (!reactivated || reactivated.active !== 1) throw new FenceLostError()
+      claim = reactivated
     }
   } else {
     const claimId = crypto.randomUUID()
@@ -1750,9 +1857,32 @@ async function ensureDepartmentClaim(
     const result = await env.DB.prepare(`
       INSERT INTO addon_resource_ownership (
         id, tenant, installation_id, resource_type, resource_id,
-        resource_key, ownership_mode, active, created_at
+        resource_key, ownership_mode, preserve_on_release, active, created_at
       )
-      SELECT ?1, ?2, ?3, 'department', ?4, ?5, 'co_owner', 1, ?6
+      SELECT ?1, ?2, ?3, 'department', ?4, ?5, 'co_owner',
+             CASE
+               WHEN EXISTS (
+                 SELECT 1 FROM departments AS department
+                  WHERE department.id = ?4 AND department.slug = ?5
+                    AND department.template_key = ?5 AND department.active = 1
+               ) AND (
+                 NOT EXISTS (
+                   SELECT 1 FROM addon_resource_ownership AS other_claim
+                    WHERE other_claim.tenant = ?2
+                      AND other_claim.resource_type = 'department'
+                      AND other_claim.resource_id = ?4
+                      AND other_claim.active = 1
+                 ) OR EXISTS (
+                   SELECT 1 FROM addon_resource_ownership AS preserving_claim
+                    WHERE preserving_claim.tenant = ?2
+                      AND preserving_claim.resource_type = 'department'
+                      AND preserving_claim.resource_id = ?4
+                      AND preserving_claim.active = 1
+                      AND preserving_claim.preserve_on_release = 1
+                 )
+               ) THEN 1 ELSE 0
+             END,
+             1, ?6
        WHERE EXISTS (
          SELECT 1 FROM addon_operations AS fenced
           WHERE fenced.id = ?7 AND fenced.tenant = ?2 AND fenced.installation_id = ?3
@@ -1782,18 +1912,9 @@ async function ensureDepartmentClaim(
       expectedStates[1],
     ).run()
     if (!written(result)) throw new FenceLostError()
-    claim = {
-      id: claimId,
-      tenant: env.TENANT_SLUG,
-      installation_id: installation.id,
-      resource_type: 'department',
-      resource_id: resourceId,
-      resource_key: moduleKey,
-      ownership_mode: 'co_owner',
-      active: 1,
-      created_at: createdAt,
-      released_at: null,
-    }
+    const inserted = await loadOwnershipClaimById(env, installation.id, claimId)
+    if (!inserted || inserted.active !== 1) throw new FenceLostError()
+    claim = inserted
   }
 
   await renewOperationLease(env, operation, expectedStates)
@@ -1928,6 +2049,17 @@ function validBusinessColumn(value: unknown): value is BusinessColumnRow {
     && Number.isSafeInteger(column.hidden)
 }
 
+const BUSINESS_EVIDENCE_PAGE_SIZE = 128
+const EMPTY_SHA256 = '0'.repeat(64)
+
+async function sha256Json(value: unknown): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(JSON.stringify(value)),
+  )
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
 export async function getBusinessStateSha256(env: Env): Promise<string> {
   const tableResult = await env.DB.prepare(`
     SELECT name
@@ -1947,7 +2079,8 @@ export async function getBusinessStateSha256(env: Env): Promise<string> {
       && !ADDON_INTERNAL_TABLES.has(table.name)
   })
 
-  const canonicalTables: unknown[] = []
+  let databaseChain = EMPTY_SHA256
+  let tableCount = 0
   for (const table of tables) {
     const identifier = quotedSqlIdentifier(table.name)
     const columnResult = await env.DB.prepare(`PRAGMA table_xinfo(${identifier})`)
@@ -1974,10 +2107,21 @@ export async function getBusinessStateSha256(env: Env): Promise<string> {
          END AS ${quotedSqlIdentifier(`__value_${index}`)}`,
       ]
     })
-    const rowResult = await env.DB.prepare(`SELECT ${projections.join(', ')} FROM ${identifier}`)
-      .all<Record<string, unknown>>()
-    const rows = (rowResult.results ?? []).map((row) => {
-      const values = columns.map((_, index) => {
+    const orderBy = columns.flatMap((_, index) => [
+      quotedSqlIdentifier(`__type_${index}`),
+      quotedSqlIdentifier(`__value_${index}`),
+    ]).join(', ')
+    let rowChain = EMPTY_SHA256
+    let rowCount = 0
+    let offset = 0
+    while (true) {
+      const rowResult = await env.DB.prepare(`
+        SELECT ${projections.join(', ')}
+          FROM ${identifier}
+         ORDER BY ${orderBy}
+         LIMIT ?1 OFFSET ?2
+      `).bind(BUSINESS_EVIDENCE_PAGE_SIZE, offset).all<Record<string, unknown>>()
+      const page = (rowResult.results ?? []).map((row) => columns.map((_, index) => {
         const storageType = row[`__type_${index}`]
         const value = row[`__value_${index}`]
         if (
@@ -1987,11 +2131,17 @@ export async function getBusinessStateSha256(env: Env): Promise<string> {
           throw new Error('invalid business table row')
         }
         return [storageType, value]
-      })
-      return JSON.stringify(values)
-    }).sort()
+      }))
+      if (page.length === 0) break
 
-    canonicalTables.push({
+      const pageDigest = await sha256Json(page)
+      rowChain = await sha256Json([rowChain, pageDigest, page.length])
+      rowCount += page.length
+      offset += page.length
+      if (page.length < BUSINESS_EVIDENCE_PAGE_SIZE) break
+    }
+
+    const tableDigest = await sha256Json({
       name: table.name,
       columns: columns.map((column) => [
         column.cid,
@@ -2002,15 +2152,14 @@ export async function getBusinessStateSha256(env: Env): Promise<string> {
         column.pk,
         column.hidden,
       ]),
-      rows,
+      rowCount,
+      rowChain,
     })
+    databaseChain = await sha256Json([databaseChain, tableDigest])
+    tableCount += 1
   }
 
-  const digest = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(JSON.stringify(canonicalTables)),
-  )
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+  return sha256Json({ algorithm: 'mupot-business-state-v2', tableCount, databaseChain })
 }
 
 export async function installAddon(env: Env, actor: AddonActor, key: string): Promise<AddonMutationResult> {
@@ -2355,6 +2504,7 @@ export async function activateAddon(
                        AND json_extract(expected.value, '$.resourceId') = claim.resource_id
                        AND json_extract(expected.value, '$.resourceKey') = claim.resource_key
                        AND json_extract(expected.value, '$.ownershipMode') = claim.ownership_mode
+                       AND json_extract(expected.value, '$.preserveOnRelease') = claim.preserve_on_release
                   )
              )
         `).bind(
@@ -2547,6 +2697,7 @@ export async function disableAddon(
                          AND json_extract(expected.value, '$.resourceId') = claim.resource_id
                          AND json_extract(expected.value, '$.resourceKey') = claim.resource_key
                          AND json_extract(expected.value, '$.ownershipMode') = claim.ownership_mode
+                         AND json_extract(expected.value, '$.preserveOnRelease') = claim.preserve_on_release
                     )
                )
           `).bind(
@@ -2695,6 +2846,23 @@ export async function archiveAddon(
   actor: AddonActor,
   key: string,
 ): Promise<AddonMutationResult> {
+  if (!authorized(actor)) return { ok: false, reason: 'not_authorized' }
+
+  const live = await loadLiveInstallation(env, key)
+  if (!live) {
+    const archived = await loadLatestArchivedInstallation(env, key)
+    if (archived) {
+      try {
+        const evidence = await loadCompletedArchiveOperationEvidence(env, archived)
+        return evidence
+          ? { ok: true, state: 'archived', installation: archived, idempotent: true }
+          : { ok: false, reason: 'fence_lost' }
+      } catch {
+        return { ok: false, reason: 'write_failed' }
+      }
+    }
+  }
+
   const context = await loadTeardownMutationContext(env, actor, key)
   if (!context.ok) return context.result
   const { installation: existing } = context
@@ -2818,6 +2986,7 @@ export async function archiveAddon(
                          AND json_extract(expected.value, '$.resourceId') = claim.resource_id
                          AND json_extract(expected.value, '$.resourceKey') = claim.resource_key
                          AND json_extract(expected.value, '$.ownershipMode') = claim.ownership_mode
+                         AND json_extract(expected.value, '$.preserveOnRelease') = claim.preserve_on_release
                     )
                   )
              )
@@ -2832,6 +3001,7 @@ export async function archiveAddon(
                      AND claim.resource_id = json_extract(expected.value, '$.resourceId')
                      AND claim.resource_key = json_extract(expected.value, '$.resourceKey')
                      AND claim.ownership_mode = json_extract(expected.value, '$.ownershipMode')
+                     AND claim.preserve_on_release = json_extract(expected.value, '$.preserveOnRelease')
                      AND claim.active = 0
                 )
              )

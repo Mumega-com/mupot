@@ -239,6 +239,7 @@ CREATE TABLE IF NOT EXISTS addon_resource_ownership (
   resource_id TEXT NOT NULL,
   resource_key TEXT NOT NULL,
   ownership_mode TEXT NOT NULL CHECK (ownership_mode IN ('exclusive','co_owner')),
+  preserve_on_release INTEGER NOT NULL DEFAULT 0 CHECK (preserve_on_release IN (0,1)),
   active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
   created_at TEXT NOT NULL,
   released_at TEXT,
@@ -319,6 +320,14 @@ CREATE TRIGGER IF NOT EXISTS addon_resource_ownership_identity_is_immutable
     OR NEW.created_at IS NOT OLD.created_at
 BEGIN
   SELECT RAISE(ABORT, 'addon ownership identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS addon_resource_ownership_preservation_changes_only_on_reactivation
+  BEFORE UPDATE OF preserve_on_release ON addon_resource_ownership
+  WHEN NEW.preserve_on_release IS NOT OLD.preserve_on_release
+   AND NOT (OLD.active = 0 AND NEW.active = 1)
+BEGIN
+  SELECT RAISE(ABORT, 'addon ownership preservation changes only on reactivation');
 END;
 
 CREATE TRIGGER IF NOT EXISTS addon_resource_ownership_no_delete

@@ -480,7 +480,7 @@ describe('addon lifecycle receipt checker', () => {
       { path: '/api/addons', method: 'GET' },
     ]))
     expect(calls.every((call) => call.authorization === `Bearer ${bearer}`)).toBe(true)
-    expect(calls.every((call) => call.cookie === `mupot_session=${encodeURIComponent(bearer)}`)).toBe(true)
+    expect(calls.every((call) => call.cookie === null)).toBe(true)
     expect(calls.every((call) => call.origin === 'https://pot.test')).toBe(true)
     expect(JSON.stringify(receipt)).not.toContain(bearer)
     expect(validateReceipt(receipt)).toEqual({ ok: true, errors: [] })

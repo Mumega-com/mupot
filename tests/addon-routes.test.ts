@@ -6,8 +6,15 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const migrations = [
   '../migrations/0001_init.sql',
+  '../migrations/0002_members.sql',
   '../migrations/0003_settings.sql',
+  '../migrations/0004_channels.sql',
+  '../migrations/0005_channel_capability_grants.sql',
+  '../migrations/0016_presence.sql',
+  '../migrations/0019_agent_token_binding.sql',
   '../migrations/0029_department_microkernel.sql',
+  '../migrations/0040_members_tenant.sql',
+  '../migrations/0043_member_tokens_tenant.sql',
   '../migrations/0050_addons.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
@@ -68,16 +75,42 @@ describe('addon lifecycle routes', () => {
     },
   )
 
-  it('leaves bearer-only requests to the existing authentication path', async () => {
+  it('accepts an org-admin member bearer without a session cookie', async () => {
+    const rawToken = 'machine-token'
+    const tokenHash = Array.from(new Uint8Array(await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(rawToken),
+    )), (byte) => byte.toString(16).padStart(2, '0')).join('')
+    harness.sqlite.prepare(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+      VALUES (?, ?, ?, 'active', ?)
+    `).run('machine-member', 'machine@example.test', 'Machine Operator', 'tenant-a')
+    harness.sqlite.prepare(`
+      INSERT INTO member_tokens (
+        id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id, tenant
+      ) VALUES (?, ?, ?, ?, 'workspace', ?, NULL, NULL, ?)
+    `).run('machine-token-id', 'machine-member', tokenHash, 'addon receipt', '2026-01-01T00:00:00Z', 'tenant-a')
+    harness.sqlite.prepare(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES (?, ?, 'org', NULL, 'admin')
+    `).run('machine-admin-capability', 'machine-member')
+
     const res = await addonsApp.fetch(new Request('https://pot.test/fixture-addon/install', {
       method: 'POST',
       headers: {
-        Authorization: 'Bearer machine-token',
+        Authorization: `Bearer ${rawToken}`,
       },
     }), envForRole(harness, 'owner'))
 
-    expect(res.status).toBe(401)
-    await expect(res.json()).resolves.toEqual({ error: 'unauthenticated' })
+    expect(res.status).toBe(201)
+    await expect(res.json()).resolves.toEqual(expect.objectContaining({
+      ok: true,
+      key: 'fixture-addon',
+      state: 'installed',
+    }))
+    expect(harness.sqlite.prepare(`
+      SELECT installed_by, latest_actor_id FROM addon_installations
+    `).get()).toEqual({ installed_by: 'machine-member', latest_actor_id: 'machine-member' })
   })
 
   it.each(['install', 'configure', 'activate', 'disable', 'archive'] as const)(
@@ -168,6 +201,36 @@ describe('addon lifecycle routes', () => {
     expect(afterTypeChangeBody).not.toHaveProperty('tables')
     expect(afterTypeChangeBody).not.toHaveProperty('rows')
     expect(afterTypeChangeBody).not.toHaveProperty('rowCount')
+  })
+
+  it('reads large business tables in bounded pages', async () => {
+    harness.sqlite.exec(`
+      CREATE TABLE evidence_many_rows (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+      WITH RECURSIVE sequence(value) AS (
+        SELECT 1
+        UNION ALL
+        SELECT value + 1 FROM sequence WHERE value < 300
+      )
+      INSERT INTO evidence_many_rows (id, value)
+      SELECT value, printf('row-%04d', value) FROM sequence;
+    `)
+    const observed: string[] = []
+    const trackedDb = new Proxy(harness.db, {
+      get(target, property, receiver) {
+        if (property !== 'prepare') return Reflect.get(target, property, receiver)
+        return (sql: string) => {
+          if (sql.includes('FROM "evidence_many_rows"')) observed.push(sql)
+          return target.prepare(sql)
+        }
+      },
+    })
+    const env = { ...envForRole(harness, 'owner'), DB: trackedDb }
+
+    const res = await addonsApp.fetch(request('/fixture-addon/evidence', 'GET'), env)
+
+    expect(res.status).toBe(200)
+    expect(observed.length).toBeGreaterThanOrEqual(3)
+    expect(observed.every((sql) => /\bLIMIT\s+\?/i.test(sql))).toBe(true)
   })
 
   it('maps unknown addon business-state evidence to not found', async () => {

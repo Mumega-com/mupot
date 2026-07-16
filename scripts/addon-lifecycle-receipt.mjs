@@ -394,7 +394,6 @@ export async function runLifecycleCheck(opts, deps = {}) {
         headers: {
           accept: 'application/json',
           authorization: `Bearer ${bearer}`,
-          cookie: `mupot_session=${encodeURIComponent(bearer)}`,
           origin: requestOrigin,
         },
       })

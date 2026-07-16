@@ -3,6 +3,7 @@ import { csrf } from 'hono/csrf'
 import type { Context } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { requireAuth } from '../auth'
+import { resolveOrgAdmin } from '../auth/member-bearer'
 import './modules/fixture'
 import { getRegisteredAddon, listRegisteredAddons } from './registry'
 import {
@@ -171,7 +172,29 @@ addonsApp.use('*', async (c, next) => {
   if (!sameOrigin) return c.text('Forbidden', 403)
   return next()
 })
-addonsApp.use('*', requireAuth)
+addonsApp.use('*', async (c, next) => {
+  if (hasSessionCookie(c)) return requireAuth(c, next)
+
+  let resolved: Awaited<ReturnType<typeof resolveOrgAdmin>>
+  try {
+    resolved = await resolveOrgAdmin(c.env, c.req.header('authorization'))
+  } catch {
+    return c.json({ error: 'unauthenticated' }, 401)
+  }
+  if (!resolved.ok) {
+    return c.json({ error: resolved.status === 401 ? 'unauthenticated' : 'forbidden' }, resolved.status)
+  }
+  c.set('auth', {
+    userId: resolved.id.memberId,
+    memberId: resolved.id.memberId,
+    email: resolved.id.email,
+    role: 'admin',
+    tenant: c.env.TENANT_SLUG,
+    channel: 'workspace',
+    boundAgentId: resolved.id.boundAgentId,
+  })
+  return next()
+})
 
 addonsApp.get('/', async (c) => {
   if (!isAdminPlus(c.get('auth'))) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)

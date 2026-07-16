@@ -316,13 +316,23 @@ function insertOwnership(
   resourceId: string,
   mode: 'exclusive' | 'co_owner',
   active = 1,
+  preserveOnRelease = 0,
 ) {
   return db.harness.sqlite.prepare(`
     INSERT INTO addon_resource_ownership (
       id, tenant, installation_id, resource_type, resource_id,
-      resource_key, ownership_mode, active, created_at
-    ) VALUES (?, ?, ?, 'department', ?, 'fixture', ?, ?, ?)
-  `).run(id, db.env.TENANT_SLUG, installationId, resourceId, mode, active, new Date().toISOString())
+      resource_key, ownership_mode, preserve_on_release, active, created_at
+    ) VALUES (?, ?, ?, 'department', ?, 'fixture', ?, ?, ?, ?)
+  `).run(
+    id,
+    db.env.TENANT_SLUG,
+    installationId,
+    resourceId,
+    mode,
+    preserveOnRelease,
+    active,
+    new Date().toISOString(),
+  )
 }
 
 function insertNonTransitionReceipt(
@@ -2014,6 +2024,116 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     ])
   })
 
+  it('preserves a tenant-owned active department when its addon claim is released', async () => {
+    const activated = await activateDepartment(db.env.DB, 'fixture')
+    expect(activated).toMatchObject({ ok: true })
+
+    await activateFixture()
+    expect(db.resources()).toEqual([
+      expect.objectContaining({ preserve_on_release: 1, active: 1 }),
+    ])
+
+    expect(await disableAddon(db.env, owner, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'disabled',
+    })
+    expect(db.departments()).toEqual([expect.objectContaining({ active: 1 })])
+    expect(await getActiveDepartments(db.env.DB)).toEqual([
+      expect.objectContaining({ id: activated.ok ? activated.departmentId : '', active: 1 }),
+    ])
+  })
+
+  it('shows an explicitly reactivated department after its addon claim was released', async () => {
+    await activateFixture()
+    await disableAddon(db.env, owner, 'fixture-addon')
+    expect(await getActiveDepartments(db.env.DB)).toEqual([])
+
+    const reactivated = await activateDepartment(db.env.DB, 'fixture')
+
+    expect(reactivated).toMatchObject({ ok: true })
+    expect(await getActiveDepartments(db.env.DB)).toHaveLength(1)
+    expect(await getActiveConsoleSections(db.env.DB)).toHaveLength(1)
+    expect(await getActiveMetricDescriptors(db.env.DB)).toHaveLength(2)
+  })
+
+  it('preserves a department reclaimed by the tenant between addon activation cycles', async () => {
+    await activateFixture()
+    await disableAddon(db.env, owner, 'fixture-addon')
+    expect(await activateDepartment(db.env.DB, 'fixture')).toMatchObject({ ok: true })
+
+    expect(await activateAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'active',
+    })
+    expect(db.resources()).toEqual([
+      expect.objectContaining({ preserve_on_release: 1, active: 1 }),
+    ])
+
+    expect(await disableAddon(db.env, owner, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'disabled',
+    })
+    expect(db.departments()).toEqual([expect.objectContaining({ active: 1 })])
+    expect(await getActiveDepartments(db.env.DB)).toHaveLength(1)
+  })
+
+  it('propagates tenant ownership across active co-owner claims before teardown', async () => {
+    const activated = await activateDepartment(db.env.DB, 'fixture')
+    if (!activated.ok) throw new Error(`fixture activation failed: ${activated.reason}`)
+    const firstOwner = await insertInstallationLifecycle(db, { addonKey: 'fixture-addon-first-owner' })
+    await transitionInstallation(db, firstOwner.id, 'configure', 'installed', 'configured')
+    await transitionInstallation(db, firstOwner.id, 'activate', 'configured', 'active')
+    insertOwnership(
+      db,
+      'first-preserving-owner',
+      firstOwner.id,
+      activated.departmentId,
+      'co_owner',
+      1,
+      1,
+    )
+
+    await activateFixture()
+    const fixtureClaim = db.resources().find((claim) => claim.installation_id !== firstOwner.id)
+    expect(fixtureClaim).toEqual(expect.objectContaining({ preserve_on_release: 1, active: 1 }))
+
+    db.harness.sqlite.prepare(`
+      UPDATE addon_resource_ownership
+         SET active = 0, released_at = ?
+       WHERE id = 'first-preserving-owner'
+    `).run(new Date().toISOString())
+
+    expect(await disableAddon(db.env, owner, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'disabled',
+    })
+    expect(db.departments()).toEqual([expect.objectContaining({ active: 1 })])
+  })
+
+  it('does not let a historical preserving claim bypass a later activation fence', async () => {
+    expect(await activateDepartment(db.env.DB, 'fixture')).toMatchObject({ ok: true })
+    await activateFixture()
+    await disableAddon(db.env, owner, 'fixture-addon')
+    await archiveAddon(db.env, owner, 'fixture-addon')
+    expect(await deactivateDepartment(db.env.DB, 'fixture')).toEqual({ ok: true })
+
+    await installAddon(db.env, owner, 'fixture-addon')
+    await configureAddon(db.env, owner, 'fixture-addon')
+    expect(await activateAddon(db.env, owner, 'fixture-addon', {
+      afterDepartmentActivated() {
+        throw new Error('interrupt later activation')
+      },
+    })).toEqual({ ok: false, reason: 'write_failed' })
+
+    expect(db.resources()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ preserve_on_release: 1, active: 0 }),
+      expect.objectContaining({ preserve_on_release: 0, active: 1 }),
+    ]))
+    expect(await getActiveDepartments(db.env.DB)).toEqual([])
+    expect(await getActiveConsoleSections(db.env.DB)).toEqual([])
+    expect(await getActiveMetricDescriptors(db.env.DB)).toEqual([])
+  })
+
   it('refuses an unexpired foreign activation lease', async () => {
     await configureFixture()
     const barrier = createBarrier()
@@ -2986,6 +3106,17 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       ok: false,
       reason: 'invalid_state',
     })
+
+    const operationCount = db.operations().length
+    const receiptCount = db.receipts().length
+    expect(await archiveAddon(db.env, owner, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'archived',
+      idempotent: true,
+      installation: { id: active.id },
+    })
+    expect(db.operations()).toHaveLength(operationCount)
+    expect(db.receipts()).toHaveLength(receiptCount)
   })
 
   it('durably fails and immediately retries an archive with redacted evidence', async () => {

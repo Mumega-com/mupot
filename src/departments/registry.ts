@@ -301,11 +301,22 @@ export function createDepartmentRegistry(): DepartmentRegistry {
           WHERE department.active = 1
             AND department.template_key IS NOT NULL
             AND (
+              EXISTS (
+                SELECT 1
+                  FROM addon_resource_ownership AS claim
+                 WHERE claim.resource_type = 'department'
+                   AND claim.resource_id = department.id
+                   AND claim.resource_key = department.template_key
+                   AND claim.active = 1
+                   AND claim.preserve_on_release = 1
+              )
+              OR
               NOT EXISTS (
                 SELECT 1
                   FROM addon_resource_ownership AS claim
                  WHERE claim.resource_type = 'department'
                    AND claim.resource_id = department.id
+                   AND claim.active = 1
               )
               OR EXISTS (
                 SELECT 1
