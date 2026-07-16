@@ -60,13 +60,26 @@ The accepted re-review findings were addressed in eight further test-first cycle
 8. Synthetic identity namespace: 1 failed, 40 passed. A declared `source_config_0` key collided
    with the deterministic metadata-failure identity.
 
+The final accepted review findings were addressed with two recorded RED runs:
+
+1. Untrusted arrays and canonical windows: 5 failed, 41 passed. Source-owned `map` methods
+   forged invalid revenue and 201 accepted observations from a zero-length array; fractional
+   and out-of-bounds lengths polluted the raw counter; and window getters were read repeatedly.
+2. Effective bindings and connector re-resolution: 13 failed, 40 passed. `ai_visibility`
+   remained reachable, vault bindings were trusted without tenant-local active connector
+   metadata, connector type/ID mismatches reached source reads, and post-read drift was accepted.
+
+After production enforcement, the outcomes suite recorded 1 failed, 8 passed because its GHL
+fixture had no D1 connector metadata. A safe metadata-only D1 fixture was added; production
+continues to call `resolveConnectorByIdWithMeta` directly with no injectable bypass.
+
 ## GREEN Evidence
 
 ```sh
 npx vitest run tests/marketing-monitor-sources.test.ts tests/marketing-monitor-outcomes.test.ts
 ```
 
-Result after re-review fixes: 2 passed files, 50 passed tests.
+Result after final review fixes: 2 passed files, 62 passed tests.
 
 ```sh
 npm run typecheck
@@ -78,6 +91,9 @@ Result: both commands exited successfully.
 The final focused checkpoint was run from implementation commit
 `10625866b409329425ea5ef24502ddb1afaa0446` and completed with
 the same 50 passing tests and a successful `tsc --noEmit`.
+
+The final review implementation checkpoint completed with 62 passing focused tests, successful
+`tsc --noEmit`, and a clean `git diff --check`.
 
 ## Changed Files
 
@@ -97,11 +113,21 @@ the same 50 passing tests and a successful `tsc --noEmit`.
 
 `10625866b409329425ea5ef24502ddb1afaa0446` (`fix(marketing): close monitor normalization boundary`)
 
+`2a0b59495a863438f109c97d863a9777bce44745` (`fix(marketing): secure source collection boundary`)
+
 ## Re-review Changed Files
 
 - `src/addons/marketing/types.ts`
 - `src/addons/marketing/sources.ts`
 - `src/addons/marketing/outcomes.ts`
+- `tests/marketing-monitor-sources.test.ts`
+- `tests/marketing-monitor-outcomes.test.ts`
+- `.superpowers/sdd/task-3-report.md`
+
+## Final Review Changed Files
+
+- `src/addons/marketing/types.ts`
+- `src/addons/marketing/sources.ts`
 - `tests/marketing-monitor-sources.test.ts`
 - `tests/marketing-monitor-outcomes.test.ts`
 - `.superpowers/sdd/task-3-report.md`
@@ -119,3 +145,7 @@ the same 50 passing tests and a successful `tsc --noEmit`.
   observations to this boundary.
 - The collector provenance brand is local to this module instance. Any future persistence
   rehydration path must re-enter a trusted normalization boundary rather than forge a collection.
+- `ai_visibility` remains a future optional manifest and metric authority but is intentionally
+  absent from the effective Task 3 binding contract until a supported `ConnectorType` exists.
+- Accepted vault sources perform two safe-metadata D1 resolutions per run. This is deliberate to
+  close source-execution drift; Task 6 should account for that bounded read cost.
