@@ -28,6 +28,7 @@ export interface AddonInstallation {
 }
 
 export interface AddonReceipt {
+  sequence: number
   id: string
   tenant: string
   installationId: string
@@ -90,6 +91,7 @@ interface InstallationRow {
 }
 
 interface ReceiptRow {
+  sequence: number
   id: string
   tenant: string
   installation_id: string
@@ -170,6 +172,7 @@ function parseChecks(value: string): Record<string, unknown> {
 
 function receiptFromRow(row: ReceiptRow): AddonReceipt {
   return {
+    sequence: row.sequence,
     id: row.id,
     tenant: row.tenant,
     installationId: row.installation_id,
@@ -214,6 +217,14 @@ function written(result: { success: boolean; meta?: { changes?: number } }): boo
   return result.success && result.meta?.changes === 1
 }
 
+function selectedInstallation(
+  result: { success: boolean; results?: InstallationRow[] } | undefined,
+): AddonInstallation | null {
+  if (!result?.success) return null
+  const row = result.results?.[0]
+  return row ? installationFromRow(row) : null
+}
+
 async function loadLiveInstallation(env: Env, key: string): Promise<AddonInstallation | null> {
   const row = await env.DB.prepare(`
     SELECT ${INSTALLATION_COLUMNS}
@@ -223,6 +234,16 @@ async function loadLiveInstallation(env: Env, key: string): Promise<AddonInstall
      ORDER BY installed_at DESC, id DESC
      LIMIT 1
   `).bind(env.TENANT_SLUG, key).first<InstallationRow>()
+  return row ? installationFromRow(row) : null
+}
+
+async function loadInstallationById(env: Env, installationId: string): Promise<AddonInstallation | null> {
+  const row = await env.DB.prepare(`
+    SELECT ${INSTALLATION_COLUMNS}
+      FROM addon_installations
+     WHERE tenant = ?1 AND id = ?2
+     LIMIT 1
+  `).bind(env.TENANT_SLUG, installationId).first<InstallationRow>()
   return row ? installationFromRow(row) : null
 }
 
@@ -238,13 +259,13 @@ export async function listAddonInstallations(env: Env): Promise<AddonInstallatio
 
 export async function getAddonReceipts(env: Env, installationId: string): Promise<AddonReceipt[]> {
   const result = await env.DB.prepare(`
-    SELECT id, tenant, installation_id, action, previous_state, next_state,
+    SELECT sequence, id, tenant, installation_id, action, previous_state, next_state,
            addon_key, installed_version, publisher, trust_class,
            mupot_compatibility, manifest_sha256, actor_id, outcome,
            side_effect_ids, checks, error_code, created_at
       FROM addon_receipts
      WHERE tenant = ?1 AND installation_id = ?2
-     ORDER BY created_at DESC, id DESC
+     ORDER BY sequence DESC
   `).bind(env.TENANT_SLUG, installationId).all<ReceiptRow>()
   return (result.results ?? []).map(receiptFromRow)
 }
@@ -272,7 +293,7 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
   const checks = JSON.stringify({ manifestDigest: 'matched', inert: true })
 
   try {
-    const results = await env.DB.batch([
+    const results = await env.DB.batch<InstallationRow>([
       env.DB.prepare(`
         INSERT INTO addon_installations (
           id, tenant, addon_key, installed_version, publisher, trust_class,
@@ -316,9 +337,21 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
         checks,
         createdAt,
       ),
+      env.DB.prepare(`
+        SELECT ${INSTALLATION_COLUMNS}
+          FROM addon_installations
+         WHERE id = ?1 AND tenant = ?2
+           AND state = 'installed' AND latest_previous_state IS NULL
+           AND latest_actor_id = ?3 AND latest_receipt_id = ?4
+         LIMIT 1
+      `).bind(installationId, env.TENANT_SLUG, actor.id, receiptId),
     ])
 
     if (!written(results[0]) || !written(results[1])) return { ok: false, reason: 'write_failed' }
+    const installation = selectedInstallation(results[2])
+    return installation
+      ? { ok: true, state: installation.state, installation, created: true }
+      : { ok: false, reason: 'write_failed' }
   } catch {
     const raced = await loadLiveInstallation(env, key)
     if (!raced) return { ok: false, reason: 'write_failed' }
@@ -327,10 +360,6 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
     }
     return { ok: true, state: raced.state, installation: raced, idempotent: true }
   }
-
-  const installation = await loadLiveInstallation(env, key)
-  if (!installation) return { ok: false, reason: 'write_failed' }
-  return { ok: true, state: installation.state, installation, created: true }
 }
 
 export async function configureAddon(env: Env, actor: AddonActor, key: string): Promise<AddonMutationResult> {
@@ -356,7 +385,7 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
   const checks = JSON.stringify({ connectorRequirements: 'empty', authorityRequests: 'empty' })
 
   try {
-    const results = await env.DB.batch([
+    const results = await env.DB.batch<InstallationRow>([
       env.DB.prepare(`
         UPDATE addon_installations
            SET state = 'configured', configured_at = ?1, updated_at = ?1,
@@ -390,16 +419,24 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
         checks,
         configuredAt,
       ),
+      env.DB.prepare(`
+        SELECT ${INSTALLATION_COLUMNS}
+          FROM addon_installations
+         WHERE id = ?1 AND tenant = ?2
+           AND state = 'configured' AND latest_previous_state = 'installed'
+           AND latest_actor_id = ?3 AND latest_receipt_id = ?4
+         LIMIT 1
+      `).bind(existing.id, env.TENANT_SLUG, actor.id, receiptId),
     ])
 
     if (written(results[0]) && written(results[1])) {
-      const configured = await loadLiveInstallation(env, key)
+      const configured = selectedInstallation(results[2])
       return configured
         ? { ok: true, state: configured.state, installation: configured }
         : { ok: false, reason: 'write_failed' }
     }
   } catch {
-    const current = await loadLiveInstallation(env, key)
+    const current = await loadInstallationById(env, existing.id)
     if (!current) return { ok: false, reason: 'write_failed' }
     if (!matchesRegisteredIdentity(current, entry)) {
       return { ok: false, reason: 'manifest_digest_drift' }
@@ -411,7 +448,7 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
     return { ok: false, reason: 'invalid_state', state: current.state }
   }
 
-  const current = await loadLiveInstallation(env, key)
+  const current = await loadInstallationById(env, existing.id)
   if (!current) return { ok: false, reason: 'write_failed' }
   if (!matchesRegisteredIdentity(current, entry)) {
     return { ok: false, reason: 'manifest_digest_drift' }

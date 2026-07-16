@@ -153,6 +153,11 @@ CREATE TABLE IF NOT EXISTS addon_operations (
   error_code TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  CHECK (
+    (action = 'activate' AND target_state = 'active')
+    OR (action = 'disable' AND target_state = 'disabled')
+    OR (action = 'archive' AND target_state = 'archived')
+  ),
   FOREIGN KEY (installation_id, tenant)
     REFERENCES addon_installations (id, tenant)
     ON DELETE RESTRICT
@@ -218,8 +223,38 @@ BEGIN
   SELECT RAISE(ABORT, 'active exclusive and co-owner claims cannot coexist');
 END;
 
+CREATE TRIGGER IF NOT EXISTS addon_resource_ownership_identity_is_immutable
+  BEFORE UPDATE OF id, tenant, installation_id, resource_type, resource_id,
+    resource_key, ownership_mode, created_at
+  ON addon_resource_ownership
+  WHEN NEW.id IS NOT OLD.id
+    OR NEW.tenant IS NOT OLD.tenant
+    OR NEW.installation_id IS NOT OLD.installation_id
+    OR NEW.resource_type IS NOT OLD.resource_type
+    OR NEW.resource_id IS NOT OLD.resource_id
+    OR NEW.resource_key IS NOT OLD.resource_key
+    OR NEW.ownership_mode IS NOT OLD.ownership_mode
+    OR NEW.created_at IS NOT OLD.created_at
+BEGIN
+  SELECT RAISE(ABORT, 'addon ownership identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS addon_installations_archive_requires_released_ownership
+  BEFORE UPDATE OF state ON addon_installations
+  WHEN NEW.state = 'archived' AND OLD.state <> 'archived' AND EXISTS (
+    SELECT 1
+      FROM addon_resource_ownership AS claim
+     WHERE claim.tenant = OLD.tenant
+       AND claim.installation_id = OLD.id
+       AND claim.active = 1
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'active addon ownership must be released before archive');
+END;
+
 CREATE TABLE IF NOT EXISTS addon_receipts (
-  id TEXT PRIMARY KEY,
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
   tenant TEXT NOT NULL,
   installation_id TEXT NOT NULL,
   action TEXT NOT NULL CHECK (
@@ -268,7 +303,7 @@ CREATE TABLE IF NOT EXISTS addon_receipts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_addon_receipts_installation
-  ON addon_receipts (tenant, installation_id, created_at DESC);
+  ON addon_receipts (tenant, installation_id, sequence DESC);
 
 CREATE TRIGGER IF NOT EXISTS addon_receipts_no_duplicate_id
   BEFORE INSERT ON addon_receipts
@@ -306,18 +341,20 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS addon_transition_receipts_require_pass
   BEFORE INSERT ON addon_receipts
-  WHEN NEW.action IN ('install','configure','activate','disable','archive')
-    AND NEW.outcome <> 'pass'
+  WHEN NEW.outcome <> 'pass' AND EXISTS (
+    SELECT 1
+      FROM addon_installations AS installation
+     WHERE installation.id = NEW.installation_id
+       AND installation.tenant = NEW.tenant
+       AND installation.latest_receipt_id = NEW.id
+  )
 BEGIN
   SELECT RAISE(ABORT, 'failed addon receipt cannot authorize lifecycle state');
 END;
 
 CREATE TRIGGER IF NOT EXISTS addon_transition_receipts_match_installation
   BEFORE INSERT ON addon_receipts
-  WHEN NOT (
-    NEW.action IN ('install','configure','activate','disable','archive')
-    AND NEW.outcome <> 'pass'
-  ) AND (
+  WHEN NEW.outcome = 'pass' AND (
     NEW.action IN ('install','configure','activate','disable','archive')
     OR EXISTS (
       SELECT 1

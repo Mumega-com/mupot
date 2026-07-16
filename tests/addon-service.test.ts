@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { Env } from '../src/types'
 import { getRegisteredAddon } from '../src/addons/registry'
@@ -27,6 +28,7 @@ const immutableInstallationUpdates = [
 ] as const
 
 interface ReceiptRow {
+  sequence?: number
   id: string
   tenant: string
   installation_id: string
@@ -104,6 +106,7 @@ async function insertInstallationLifecycle(
     latestActorId: string
     receiptActorId: string
     outcome: 'pass' | 'fail'
+    createdAt: string
   }> = {},
 ) {
   const catalog = getRegisteredAddon('fixture-addon')
@@ -123,7 +126,7 @@ async function insertInstallationLifecycle(
   const latestActorId = overrides.latestActorId ?? installedBy
   const receiptActorId = overrides.receiptActorId ?? latestActorId
   const outcome = overrides.outcome ?? 'pass'
-  const now = new Date().toISOString()
+  const now = overrides.createdAt ?? new Date().toISOString()
 
   await db.env.DB.batch([
     db.env.DB.prepare(`
@@ -188,13 +191,15 @@ async function transitionInstallation(
     actorId?: string
     receiptActorId?: string
     outcome?: 'pass' | 'fail'
+    receiptId?: string
+    createdAt?: string
   } = {},
 ) {
   const installation = db.installations().find((row) => row.id === installationId)
   if (!installation) throw new Error('installation not found')
 
-  const receiptId = crypto.randomUUID()
-  const now = new Date().toISOString()
+  const receiptId = options.receiptId ?? crypto.randomUUID()
+  const now = options.createdAt ?? new Date().toISOString()
   const actorId = options.actorId ?? owner.id
   const receiptActorId = options.receiptActorId ?? actorId
   const outcome = options.outcome ?? 'pass'
@@ -317,6 +322,33 @@ function insertNonTransitionReceipt(
   )
 }
 
+function withPostBatchRace(
+  db: Db,
+  matches: (sql: string) => boolean,
+  race: () => Promise<void>,
+): Env {
+  const originalDb = db.env.DB
+  let pending = true
+
+  const racingDb = {
+    prepare(sql: string) {
+      return originalDb.prepare(sql)
+    },
+    async batch<T = unknown>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
+      const results = await originalDb.batch<T>(statements)
+      if (pending && statements.some((statement) => matches(
+        (statement as D1PreparedStatement & { sql: string }).sql,
+      ))) {
+        pending = false
+        await race()
+      }
+      return results
+    },
+  } as Env['DB']
+
+  return { ...db.env, DB: racingDb }
+}
+
 describe('addon migration constraints', () => {
   let db: Db
 
@@ -401,6 +433,34 @@ describe('addon migration constraints', () => {
     )).toThrow()
   })
 
+  it.each([
+    ['activate', 'disabled'],
+    ['activate', 'archived'],
+    ['disable', 'active'],
+    ['disable', 'archived'],
+    ['archive', 'active'],
+    ['archive', 'disabled'],
+  ] as const)('rejects contradictory %s operations targeting %s', async (action, targetState) => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    const now = new Date().toISOString()
+
+    expect(() => db.harness.sqlite.prepare(`
+      INSERT INTO addon_operations (
+        id, tenant, installation_id, action, target_state, current_step,
+        status, actor_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'done', 'completed', ?, ?, ?)
+    `).run(
+      `contradictory-${action}-${targetState}`,
+      db.env.TENANT_SLUG,
+      installation.id,
+      action,
+      targetState,
+      owner.id,
+      now,
+      now,
+    )).toThrow()
+  })
+
   it('rejects active exclusive and co-owner claims in both insert and update orders', async () => {
     const first = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
     const second = await insertInstallationLifecycle(db, { addonKey: 'fixture-addon-two' })
@@ -422,6 +482,68 @@ describe('addon migration constraints', () => {
     expect(() => db.harness.sqlite.prepare(
       'UPDATE addon_resource_ownership SET active = 1 WHERE id = ?',
     ).run('co-inactive')).toThrow()
+  })
+
+  it('keeps ownership identity immutable while allowing release lifecycle updates', async () => {
+    const first = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    const second = await insertInstallationLifecycle(db, { addonKey: 'fixture-addon-two' })
+    insertOwnership(db, 'claim-a', first.id, 'dept-a', 'co_owner')
+    const before = db.resources()[0]
+
+    for (const [column, value] of [
+      ['id', 'claim-rewritten'],
+      ['tenant', 'tenant-b'],
+      ['installation_id', second.id],
+      ['resource_type', 'connector'],
+      ['resource_id', 'dept-b'],
+      ['resource_key', 'replacement-key'],
+      ['ownership_mode', 'exclusive'],
+      ['created_at', '2099-01-01T00:00:00.000Z'],
+    ] as const) {
+      expect(() => db.harness.sqlite.prepare(
+        `UPDATE addon_resource_ownership SET ${column} = ? WHERE id = 'claim-a'`,
+      ).run(value)).toThrow('addon ownership identity is immutable')
+      expect(db.resources()[0]).toEqual(before)
+    }
+
+    const releasedAt = new Date().toISOString()
+    expect(() => db.harness.sqlite.prepare(`
+      UPDATE addon_resource_ownership
+         SET active = 0, released_at = ?
+       WHERE id = 'claim-a'
+    `).run(releasedAt)).not.toThrow()
+    expect(db.resources()[0]).toMatchObject({ active: 0, released_at: releasedAt })
+  })
+
+  it('rejects archive while active ownership claims remain', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    insertOwnership(db, 'active-claim', installation.id, 'dept-a', 'co_owner')
+    await transitionInstallation(db, installation.id, 'disable', 'installed', 'disabled')
+    const before = db.installations()[0]
+
+    await expect(transitionInstallation(
+      db,
+      installation.id,
+      'archive',
+      'disabled',
+      'archived',
+    )).rejects.toThrow('active addon ownership must be released before archive')
+
+    expect(db.installations()[0]).toEqual(before)
+    expect(db.receipts()).toHaveLength(2)
+
+    db.harness.sqlite.prepare(`
+      UPDATE addon_resource_ownership
+         SET active = 0, released_at = ?
+       WHERE id = 'active-claim'
+    `).run(new Date().toISOString())
+    await expect(transitionInstallation(
+      db,
+      installation.id,
+      'archive',
+      'disabled',
+      'archived',
+    )).resolves.toBeDefined()
   })
 
   it('rejects state without its receipt and a receipt for a zero-row transition', async () => {
@@ -477,19 +599,22 @@ describe('addon migration constraints', () => {
     expect(db.receipts()).toHaveLength(1)
   })
 
-  it('retains standalone failed preflight and health receipts', async () => {
+  it('retains standalone failed activate and preflight receipts without changing state', async () => {
     await installAddon(db.env, owner, 'fixture-addon')
+    await configureAddon(db.env, owner, 'fixture-addon')
     const installation = db.installations()[0]
 
+    expect(() => insertNonTransitionReceipt(db, installation, {
+      action: 'activate',
+      previous_state: 'configured',
+      next_state: 'active',
+      outcome: 'fail',
+      error_code: 'activation_failed',
+    })).not.toThrow()
     expect(() => insertNonTransitionReceipt(db, installation, {
       action: 'preflight',
       outcome: 'fail',
       error_code: 'preflight_failed',
-    })).not.toThrow()
-    expect(() => insertNonTransitionReceipt(db, installation, {
-      action: 'health',
-      outcome: 'fail',
-      error_code: 'health_failed',
     })).not.toThrow()
 
     expect(db.receipts().filter((receipt) => receipt.outcome === 'fail')).toHaveLength(2)
@@ -936,6 +1061,35 @@ describe('addon install and configure service', () => {
     expect(db.receipts()).toHaveLength(0)
   })
 
+  it('returns the exact committed install when it is archived and replaced after its batch', async () => {
+    let committedId = ''
+    let committedReceiptId = ''
+    let replacementId = ''
+    const racingEnv = withPostBatchRace(
+      db,
+      (sql) => sql.includes('INSERT INTO addon_installations'),
+      async () => {
+        const committed = db.installations()[0]
+        committedId = committed.id
+        committedReceiptId = committed.latest_receipt_id
+        await transitionInstallation(db, committed.id, 'disable', 'installed', 'disabled')
+        await transitionInstallation(db, committed.id, 'archive', 'disabled', 'archived')
+        replacementId = successfulInstallation(await installAddon(db.env, admin, 'fixture-addon')).id
+      },
+    )
+
+    const result = await installAddon(racingEnv, owner, 'fixture-addon')
+    const returned = successfulInstallation(result)
+
+    expect(result).toMatchObject({ ok: true, state: 'installed', created: true })
+    expect(returned).toMatchObject({
+      id: committedId,
+      state: 'installed',
+      latestReceiptId: committedReceiptId,
+    })
+    expect(returned.id).not.toBe(replacementId)
+  })
+
   it('configure CAS advances only an installed matching digest and stays inert', async () => {
     await installAddon(db.env, owner, 'fixture-addon')
 
@@ -999,6 +1153,34 @@ describe('addon install and configure service', () => {
     expect(db.installations()).toHaveLength(1)
     expect(db.receipts().filter((receipt) => receipt.action === 'configure')).toHaveLength(1)
     expect(db.receipts()).toHaveLength(2)
+  })
+
+  it('returns the exact configured lifecycle when it is archived and replaced after its batch', async () => {
+    const original = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    let configuredReceiptId = ''
+    let replacementId = ''
+    const racingEnv = withPostBatchRace(
+      db,
+      (sql) => sql.includes("SET state = 'configured'"),
+      async () => {
+        configuredReceiptId = db.installations()[0].latest_receipt_id
+        await transitionInstallation(db, original.id, 'disable', 'configured', 'disabled')
+        await transitionInstallation(db, original.id, 'archive', 'disabled', 'archived')
+        replacementId = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon')).id
+      },
+    )
+
+    const result = await configureAddon(racingEnv, admin, 'fixture-addon')
+    const returned = successfulInstallation(result)
+
+    expect(result).toMatchObject({ ok: true, state: 'configured' })
+    expect(returned).toMatchObject({
+      id: original.id,
+      state: 'configured',
+      latestPreviousState: 'installed',
+      latestReceiptId: configuredReceiptId,
+    })
+    expect(returned.id).not.toBe(replacementId)
   })
 
   it('rolls configure state back when its receipt write fails', async () => {
@@ -1080,6 +1262,31 @@ describe('addon install and configure service', () => {
     const otherEnv = { ...db.env, TENANT_SLUG: 'tenant-b' }
     expect(await listAddonInstallations(otherEnv)).toEqual([])
     expect(await getAddonReceipts(otherEnv, installed.id)).toEqual([])
+  })
+
+  it('orders same-millisecond receipts by persisted lifecycle sequence rather than receipt ID', async () => {
+    const createdAt = '2026-07-16T00:00:00.000Z'
+    const installation = await insertInstallationLifecycle(db, {
+      addonKey: 'same-time-addon',
+      receiptId: 'z-install-receipt',
+      createdAt,
+    })
+    await transitionInstallation(
+      db,
+      installation.id,
+      'configure',
+      'installed',
+      'configured',
+      { receiptId: 'a-configure-receipt', createdAt },
+    )
+
+    const receipts = await getAddonReceipts(db.env, installation.id)
+
+    expect(receipts.map((receipt) => receipt.id)).toEqual([
+      'a-configure-receipt',
+      'z-install-receipt',
+    ])
+    expect(receipts.map((receipt) => receipt.sequence)).toEqual([2, 1])
   })
 
   it('fails closed when stored receipt JSON is malformed', async () => {
