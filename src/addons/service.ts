@@ -4,7 +4,7 @@ import {
   activate as activateDepartment,
   getRegistered as getRegisteredDepartment,
 } from '../departments/registry'
-import './modules/fixture'
+import './modules'
 import {
   assertAddonRuntimeContract,
   getRegisteredAddon,

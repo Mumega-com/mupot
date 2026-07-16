@@ -609,6 +609,12 @@ function withRunFailures(
   }
 }
 
+describe('addon service module registration', () => {
+  it('registers the marketing monitor when the service module is imported directly', () => {
+    expect(getRegisteredAddon('marketing-cro-monitor')?.manifest.key).toBe('marketing-cro-monitor')
+  })
+})
+
 describe('addon migration constraints', () => {
   let db: Db
 

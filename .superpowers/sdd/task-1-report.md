@@ -72,3 +72,43 @@ Passed: `tsc --noEmit` exited successfully.
 ## Concerns
 
 None.
+
+## Review Follow-Up (July 16, 2026)
+
+Addressed the two Important findings from review package `86386af..e9acb0c` without
+touching unrelated Task 1 work.
+
+### RED Evidence
+
+Added the review regressions first and ran:
+
+```text
+npx vitest run tests/addon-console-registry.test.ts tests/addon-service.test.ts
+```
+
+The command failed for the intended reasons:
+
+- `tests/addon-console-registry.test.ts`: expected accessor-backed/noncanonical
+  renderer registration to throw, but the registry accepted it.
+- `tests/addon-service.test.ts`: `getRegisteredAddon('marketing-cro-monitor')`
+  was `undefined` on direct service import.
+
+### GREEN Evidence
+
+After fixing `src/addons/console-registry.ts` and `src/addons/service.ts`, ran:
+
+```text
+npx vitest run tests/addon-console-registry.test.ts tests/addon-registry.test.ts tests/addon-contract.test.ts tests/dashboard-addons.test.ts tests/addon-service.test.ts
+```
+
+Passed: 5 test files, 163 tests.
+
+```text
+npm run typecheck
+```
+
+Passed: `tsc --noEmit` exited successfully.
+
+### Follow-Up Commit
+
+`fix(addons): harden task 1 renderer registration`
