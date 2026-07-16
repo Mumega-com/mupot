@@ -2,7 +2,6 @@ import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../types'
 import {
   activate as activateDepartment,
-  deactivate as deactivateDepartment,
   getRegistered as getRegisteredDepartment,
 } from '../departments/registry'
 import './modules/fixture'
@@ -1041,6 +1040,45 @@ async function loadCanonicalDepartment(
   return row
 }
 
+async function loadPersistedClaimedDepartment(
+  env: Env,
+  moduleKey: string,
+  departmentId: string,
+  expectedActive: 0 | 1 | null,
+): Promise<DepartmentRow> {
+  const row = await env.DB.prepare(`
+    SELECT id, slug, template_key, template_version, active
+      FROM departments
+     WHERE id = ?1
+     LIMIT 1
+  `).bind(departmentId).first<DepartmentRow>()
+  if (
+    !row
+    || row.id !== departmentId
+    || row.slug !== moduleKey
+    || row.template_key !== moduleKey
+    || (expectedActive !== null && row.active !== expectedActive)
+  ) {
+    throw new Error('addon persisted department row identity mismatch')
+  }
+  return row
+}
+
+async function setPersistedClaimedDepartmentActive(
+  env: Env,
+  moduleKey: string,
+  departmentId: string,
+  active: 0 | 1,
+): Promise<void> {
+  await loadPersistedClaimedDepartment(env, moduleKey, departmentId, null)
+  const sql = active === 1
+    ? 'UPDATE departments SET active = 1 WHERE id = ?1 AND slug = ?2 AND template_key = ?2 AND active <> 1'
+    : 'UPDATE departments SET active = 0 WHERE id = ?1 AND slug = ?2 AND template_key = ?2 AND active <> 0'
+  const result = await env.DB.prepare(sql).bind(departmentId, moduleKey).run()
+  if (!result.success) throw new Error('addon persisted department reconciliation failed')
+  await loadPersistedClaimedDepartment(env, moduleKey, departmentId, active)
+}
+
 async function departmentIdForClaim(
   env: Env,
   moduleKey: string,
@@ -1114,7 +1152,6 @@ function validatePersistedDepartmentClaimIdentity(
     || claim.resource_id.length === 0
     || claim.resource_key.length === 0
     || claim.ownership_mode !== 'co_owner'
-    || !getRegisteredDepartment(claim.resource_key)
   ) {
     throw new Error('addon persisted department ownership identity mismatch')
   }
@@ -1197,7 +1234,7 @@ async function validatePersistedActiveDepartmentClaims(
       throw new Error('addon persisted department ownership is duplicated')
     }
     resourceKeys.add(claim.resource_key)
-    const department = await loadCanonicalDepartment(
+    const department = await loadPersistedClaimedDepartment(
       env,
       claim.resource_key,
       claim.resource_id,
@@ -1250,7 +1287,7 @@ async function loadPersistedDisabledDepartmentClaims(
       throw new Error('addon persisted department ownership is duplicated')
     }
     resourceKeys.add(claim.resource_key)
-    const department = await loadCanonicalDepartment(
+    const department = await loadPersistedClaimedDepartment(
       env,
       claim.resource_key,
       claim.resource_id,
@@ -1333,13 +1370,9 @@ async function reconcileDepartmentForOwnership(
   for (let attempt = 0; attempt < MAX_DEPARTMENT_RECONCILIATION_ATTEMPTS; attempt += 1) {
     try {
       if (shouldBeActive) {
-        await activateCanonicalDepartment(env, moduleKey, departmentId)
+        await setPersistedClaimedDepartmentActive(env, moduleKey, departmentId, 1)
       } else {
-        const result = await deactivateDepartment(env.DB, moduleKey)
-        if (!result.ok && result.reason !== 'not_found') {
-          throw new Error(`department deactivation failed: ${result.reason}`)
-        }
-        await loadCanonicalDepartment(env, moduleKey, departmentId, 0)
+        await setPersistedClaimedDepartmentActive(env, moduleKey, departmentId, 0)
       }
       lastRegistryError = null
     } catch (error) {
@@ -1364,7 +1397,7 @@ async function reconcileDepartmentForOwnership(
       departmentId,
       options.excludedInstallationId ?? null,
     )
-    const department = await loadCanonicalDepartment(env, moduleKey, departmentId, null)
+    const department = await loadPersistedClaimedDepartment(env, moduleKey, departmentId, null)
     shouldBeActive = activeClaims > 0
     if (department.active === (shouldBeActive ? 1 : 0)) return
   }
@@ -1406,7 +1439,7 @@ async function repairAndValidatePersistedDisabledDepartmentClaims(
       claim.resource_key,
       claim.resource_id,
     )
-    await loadCanonicalDepartment(
+    await loadPersistedClaimedDepartment(
       env,
       claim.resource_key,
       claim.resource_id,
@@ -1475,7 +1508,7 @@ async function deactivateIfUnowned(
   claim: OwnershipRow,
   deps: AddonLifecycleDeps,
 ): Promise<boolean> {
-  const department = await loadCanonicalDepartment(
+  const department = await loadPersistedClaimedDepartment(
     env,
     claim.resource_key,
     claim.resource_id,
@@ -1494,10 +1527,7 @@ async function deactivateIfUnowned(
   if (await countOtherActiveClaims(env, claim) > 0) return false
 
   await renewOperationLease(env, operation, ['disabled', 'disabled'])
-  const deactivated = await deactivateDepartment(env.DB, claim.resource_key)
-  if (!deactivated.ok && deactivated.reason !== 'not_found') {
-    throw new Error(`department deactivation failed: ${deactivated.reason}`)
-  }
+  await setPersistedClaimedDepartmentActive(env, claim.resource_key, claim.resource_id, 0)
   await deps.afterDepartmentDeactivated?.({
     installationId,
     operationId: operation.id,
@@ -1524,7 +1554,7 @@ async function deactivateIfUnowned(
     )
     return false
   }
-  await loadCanonicalDepartment(env, claim.resource_key, claim.resource_id, 0)
+  await loadPersistedClaimedDepartment(env, claim.resource_key, claim.resource_id, 0)
   return true
 }
 
@@ -1535,7 +1565,7 @@ async function releaseDepartmentClaim(
   claim: OwnershipRow,
   deps: AddonLifecycleDeps,
 ): Promise<void> {
-  const department = await loadCanonicalDepartment(
+  const department = await loadPersistedClaimedDepartment(
     env,
     claim.resource_key,
     claim.resource_id,

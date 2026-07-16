@@ -1,8 +1,9 @@
 import { readFileSync } from 'node:fs'
 import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Env } from '../src/types'
 import { getRegisteredAddon } from '../src/addons/registry'
+import * as departmentRegistry from '../src/departments/registry'
 import {
   activate as activateDepartment,
   deactivate as deactivateDepartment,
@@ -1753,7 +1754,10 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     db = makeDb()
   })
 
-  afterEach(() => db.harness.close())
+  afterEach(() => {
+    vi.restoreAllMocks()
+    db.harness.close()
+  })
 
   async function configureFixture(actor = owner) {
     await installAddon(db.env, actor, 'fixture-addon')
@@ -2396,6 +2400,67 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     expect(await archiveAddon(db.env, owner, 'retired-addon')).toMatchObject({ ok: true, state: 'archived' })
     expect(db.resources()).toEqual([expect.objectContaining({ id: 'retired-addon-claim', active: 0 })])
     expect(db.departments()).toEqual([expect.objectContaining({ id: department.departmentId, active: 0 })])
+  })
+
+  it('tears down only the claimed department when its current module is removed', async () => {
+    const active = successfulInstallation(await activateFixture())
+    const claimedDepartment = db.departments()[0]
+    db.harness.sqlite.prepare(`
+      INSERT INTO departments (
+        id, slug, name, template_key, template_version, activated_at, active, created_at
+      ) VALUES ('unclaimed-department', 'unclaimed', 'Unclaimed', 'unclaimed', '1.0.0', ?, 1, ?)
+    `).run(new Date().toISOString(), new Date().toISOString())
+    vi.spyOn(departmentRegistry, 'getRegistered').mockImplementation((key) => (
+      key === 'fixture' ? undefined : departmentRegistry.getRegistered(key)
+    ))
+
+    expect(await disableAddon(db.env, owner, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'disabled',
+      installation: { id: active.id },
+    })
+    expect(await archiveAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'archived',
+      installation: { id: active.id },
+    })
+    expect(db.resources()).toEqual([expect.objectContaining({
+      installation_id: active.id,
+      resource_id: claimedDepartment.id,
+      active: 0,
+    })])
+    expect(db.departments()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: claimedDepartment.id, active: 0 }),
+      expect.objectContaining({ id: 'unclaimed-department', active: 1 }),
+    ]))
+  })
+
+  it('tears down a persisted department without requiring the replacement module version', async () => {
+    const active = successfulInstallation(await activateFixture())
+    const claimedDepartment = db.departments()[0]
+    const registered = departmentRegistry.getRegistered('fixture')
+    if (!registered) throw new Error('fixture department is not registered')
+    vi.spyOn(departmentRegistry, 'getRegistered').mockImplementation((key) => (
+      key === 'fixture'
+        ? { ...registered, version: '9.9.9', name: 'Replacement Fixture' }
+        : departmentRegistry.getRegistered(key)
+    ))
+
+    expect(await disableAddon(db.env, owner, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'disabled',
+      installation: { id: active.id },
+    })
+    expect(await archiveAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'archived',
+      installation: { id: active.id },
+    })
+    expect(db.departments()).toEqual([expect.objectContaining({
+      id: claimedDepartment.id,
+      template_version: claimedDepartment.template_version,
+      active: 0,
+    })])
   })
 
   it('resumes interruption after deactivation and before claim release', async () => {
