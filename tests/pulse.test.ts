@@ -45,6 +45,8 @@ function makeDb(opts: { phantomZeroOnInsert?: boolean } = {}): {
   rows: () => StoredRow[]
 } {
   const store: StoredRow[] = []
+  const ids = new Set<string>()
+  const uniqueMetricPoints = new Set<string>()
 
   const db = {
     prepare(sql: string) {
@@ -60,20 +62,13 @@ function makeDb(opts: { phantomZeroOnInsert?: boolean } = {}): {
                   args as [string, string, string, number, string, string, string]
 
                 // PK UNIQUE (id) — checked first, like SQLite does
-                const pkDup = store.some((r) => r.id === id)
-                if (pkDup) {
+                if (ids.has(id)) {
                   throw new Error('D1_ERROR: UNIQUE constraint failed: metric_points.id')
                 }
 
                 // UNIQUE(tenant_id, metric_key, occurred_at, source) — throw like real D1
-                const dup = store.some(
-                  (r) =>
-                    r.tenant_id === tenant_id &&
-                    r.metric_key === metric_key &&
-                    r.occurred_at === occurred_at &&
-                    r.source === source,
-                )
-                if (dup) {
+                const uniqueMetricPoint = JSON.stringify([tenant_id, metric_key, occurred_at, source])
+                if (uniqueMetricPoints.has(uniqueMetricPoint)) {
                   throw new Error('D1_ERROR: UNIQUE constraint failed: metric_points.tenant_id, metric_points.metric_key, metric_points.occurred_at, metric_points.source')
                 }
 
@@ -85,6 +80,8 @@ function makeDb(opts: { phantomZeroOnInsert?: boolean } = {}): {
                 }
 
                 store.push({ id, tenant_id, metric_key, value, occurred_at, source, created_at })
+                ids.add(id)
+                uniqueMetricPoints.add(uniqueMetricPoint)
                 return { success: true, meta: { changes: 1 } }
               }
               return { success: true, meta: { changes: 0 } }
@@ -746,5 +743,5 @@ describe('FIX-A — readSeries truncation detection (>READ_SERIES_LIMIT rows in 
     // Points are the FIRST READ_SERIES_LIMIT readings (oldest), ordered ASC
     expect(result.points[0].value).toBe(0)
     expect(result.points[READ_SERIES_LIMIT - 1].value).toBe(READ_SERIES_LIMIT - 1)
-  }, 15_000)
+  })
 })

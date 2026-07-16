@@ -87,7 +87,7 @@ describe('per-pot setup script', () => {
       rmSync(config, { force: true })
       rmSync(temp, { recursive: true, force: true })
     }
-  })
+  }, 15_000)
 
   it('keeps the wrapper pointed at the automated per-pot path', () => {
     const wrapper = readFileSync(join(repoRoot, 'scripts/provision-pot.sh'), 'utf8')

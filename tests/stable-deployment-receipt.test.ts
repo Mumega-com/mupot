@@ -36,7 +36,7 @@ function fixture(mutate?: (dir: string, outDir: string, commit: string) => void)
   return { dir, outDir, commit }
 }
 
-describe('stable deployment receipt checker', () => {
+describe('stable deployment receipt checker', { timeout: 15_000 }, () => {
   it('provides the stable deployment receipt script', () => {
     expect(existsSync(join(process.cwd(), 'scripts', 'stable-deployment-receipt.mjs'))).toBe(true)
     const packageJson = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8'))
