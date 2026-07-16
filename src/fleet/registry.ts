@@ -17,6 +17,10 @@ const AGENT_TYPES = new Set(['builder', 'reviewer', 'weaver', 'brain', 'comms', 
 const MAX_AGENTS = 200
 const MAX_SQUADS = 16
 const MAX_STR = 200
+// Host is UNTRUSTED, agent-controlled, DISPLAY-ONLY (#21 slice 2) — a short cap keeps a
+// hostile/garbage value from bloating the row or the rendered radar; truncate, never reject
+// the batch over it (host is cosmetic, not a correctness gate).
+const MAX_HOST = 64
 
 export interface FleetAgentReport {
   agent_id: string
@@ -29,6 +33,10 @@ export interface FleetAgentReport {
   // Optional identity fields — Step 1 of "agent running on mupot".
   agent_type?: string      // builder|reviewer|weaver|brain|comms|generic; defaults 'generic'
   member_id?: string | null  // mupot members.id; validated to exist if supplied
+  // Optional physical-machine signal — Step 2 of "agent running on mupot" (#21 slice 2).
+  // UNTRUSTED, agent-controlled (os.hostname() on the runtime host): display-only, never
+  // used for auth/routing. Absent (old runtimes) → '' (backward compatible).
+  host?: string
 }
 
 export interface FleetAgentRow {
@@ -56,6 +64,9 @@ export interface FleetAgentRuntimeView {
   presence: Presence                     // DERIVED liveness from last_seen age vs TTL (live|stale|offline)
   lifecycle: string
   last_seen: string                      // last_reported_at
+  // Self-reported physical-machine signal (#21 slice 2). UNTRUSTED, agent-controlled,
+  // display-only — '' means unknown/not yet reported (old runtime, or never attached).
+  host: string
 }
 
 // Unified admin/API view: runtime row + identity (member) + capabilities.
@@ -134,7 +145,12 @@ function validReport(a: unknown): FleetAgentReport | null {
     if (typeof r.member_id !== 'string' || !AGENT_ID_RE.test(r.member_id)) return null
     member_id = r.member_id
   }
-  return { agent_id: r.agent_id, display: cleanStr(r.display), runtime, squads, lifecycle, provider_contract: pc, status: r.status, agent_type, member_id }
+  // host: UNTRUSTED, agent-controlled (#21 slice 2). Trim + cap — never reject the batch
+  // over it (cosmetic, not a correctness gate). Absent/non-string (old runtimes, or a
+  // hostile non-string value) → '' — backward compatible, fail-open to "unknown", not
+  // fail-closed on the whole report.
+  const host = typeof r.host === 'string' ? r.host.trim().slice(0, MAX_HOST) : ''
+  return { agent_id: r.agent_id, display: cleanStr(r.display), runtime, squads, lifecycle, provider_contract: pc, status: r.status, agent_type, member_id, host }
 }
 
 /** Backfill tenant on any members row whose tenant is NULL. Idempotent — WHERE tenant IS NULL
@@ -200,16 +216,17 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
   let written = 0
   for (const v of toWrite) {
     await env.DB.prepare(
-      `INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status, reported_by, agent_type, member_id, last_reported_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'), datetime('now'))
+      `INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status, reported_by, agent_type, member_id, host, last_reported_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), datetime('now'))
        ON CONFLICT(tenant, agent_id) DO UPDATE SET
             display=excluded.display, runtime=excluded.runtime, squads=excluded.squads,
             lifecycle=excluded.lifecycle, provider_contract=excluded.provider_contract,
             status=excluded.status, reported_by=excluded.reported_by,
             agent_type=excluded.agent_type, member_id=excluded.member_id,
+            host=excluded.host,
             last_reported_at=excluded.last_reported_at, updated_at=excluded.updated_at`,
     )
-      .bind(v.agent_id, env.TENANT_SLUG, v.display, v.runtime, JSON.stringify(v.squads), v.lifecycle, v.provider_contract, v.status, reportedBy, v.agent_type ?? 'generic', v.member_id ?? null)
+      .bind(v.agent_id, env.TENANT_SLUG, v.display, v.runtime, JSON.stringify(v.squads), v.lifecycle, v.provider_contract, v.status, reportedBy, v.agent_type ?? 'generic', v.member_id ?? null, v.host ?? '')
       .run()
     written++
   }
@@ -371,7 +388,7 @@ export async function listFleetAgents(env: Env): Promise<FleetAgentRow[]> {
 
 export async function listFleetAgentRuntimeView(env: Env, nowMs = Date.now()): Promise<FleetAgentRuntimeView[]> {
   const rows = await env.DB.prepare(
-    `SELECT agent_id, display, runtime, squads, lifecycle, status, last_reported_at
+    `SELECT agent_id, display, runtime, squads, lifecycle, status, last_reported_at, host
        FROM fleet_agents WHERE tenant = ?1 ORDER BY agent_id ASC`,
   )
     .bind(env.TENANT_SLUG)
@@ -390,6 +407,7 @@ export async function listFleetAgentRuntimeView(env: Env, nowMs = Date.now()): P
       presence: derivePresence(status, lastSeen, ttlSec, nowMs),
       lifecycle: String(r.lifecycle ?? ''),
       last_seen: lastSeen,
+      host: String(r.host ?? ''),
     }
   })
 }
@@ -406,7 +424,7 @@ export async function listFleetAgentRuntimeView(env: Env, nowMs = Date.now()): P
  *
  * SQL shape:
  *   SELECT fa.agent_id, fa.display, fa.agent_type, fa.runtime, fa.squads, fa.status, fa.lifecycle,
- *          fa.last_reported_at, fa.member_id,
+ *          fa.last_reported_at, fa.member_id, fa.host,
  *          m.id AS m_id, m.email AS m_email, m.display_name AS m_display
  *   FROM fleet_agents fa
  *   LEFT JOIN members m ON m.id = fa.member_id AND m.tenant = fa.tenant
@@ -419,7 +437,7 @@ export async function getAgentView(env: Env): Promise<AgentView[]> {
 
   const rows = await env.DB.prepare(
     `SELECT fa.agent_id, fa.display, fa.agent_type, fa.runtime, fa.squads, fa.status, fa.lifecycle,
-            fa.last_reported_at, fa.member_id,
+            fa.last_reported_at, fa.member_id, fa.host,
             m.id AS m_id, m.email AS m_email, m.display_name AS m_display
        FROM fleet_agents fa
        LEFT JOIN members m ON m.id = fa.member_id AND m.tenant = fa.tenant
@@ -457,6 +475,7 @@ export async function getAgentView(env: Env): Promise<AgentView[]> {
       presence: derivePresence(status, lastSeen, ttlSec, nowMs),
       lifecycle: String(r.lifecycle ?? ''),
       last_seen: lastSeen,
+      host: String(r.host ?? ''),
       member: joinedId == null ? null : {
         id: joinedId,
         email: r.m_email == null ? null : String(r.m_email),

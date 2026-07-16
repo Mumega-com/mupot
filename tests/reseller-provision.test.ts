@@ -70,6 +70,30 @@ describe('planResellerTenant — happy path', () => {
     if (!r.ok) return
     expect(r.tier).toBe('scale')
   })
+
+  it('opts.potHostSuffix overrides the owner-walk host (de-mumega-ify #3)', () => {
+    const r = planResellerTenant(
+      { resellerDomain: 'example.com' },
+      { potHostSuffix: 'mupot.forkedpot.example' },
+    )
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ownerWalk.url).toBe('https://example.mupot.forkedpot.example/setup')
+  })
+
+  it('an empty-string potHostSuffix falls back to the default (never a bare/empty host)', () => {
+    const r = planResellerTenant({ resellerDomain: 'example.com' }, { potHostSuffix: '' })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ownerWalk.url).toBe('https://example.mupot.mumega.com/setup')
+  })
+
+  it('omitted opts is byte-identical to the pre-#de-mumega-ify default', () => {
+    const withOpts = planResellerTenant({ resellerDomain: 'example.com' }, {})
+    const noOpts = planResellerTenant({ resellerDomain: 'example.com' })
+    expect(withOpts).toEqual(noOpts)
+    expect(noOpts.ok && noOpts.ownerWalk.url).toBe('https://example.mupot.mumega.com/setup')
+  })
 })
 
 describe('planResellerTenant — validation (fail-closed)', () => {

@@ -14,10 +14,16 @@ import { createBranch, putFile, openPullRequest, isValidRepoPath, type CommitIde
 import { githubCan } from './github-capabilities'
 import { isValidRepo } from './github-repo-write'
 
+/** Domain for an agent-authored commit's email local part (`slug@<this>`), baked into the
+ *  CUSTOMER's git history. `env.AGENT_COMMIT_EMAIL_DOMAIN` overrides it; unset ⇒ this default,
+ *  so mumega's own deploy is byte-identical. */
+export const DEFAULT_AGENT_COMMIT_EMAIL_DOMAIN = 'agents.mumega.com'
+
 /**
  * Resolve a named pot agent's git commit identity (#21). The agent authors its own commits as
- * `Name <slug@agents.mumega.com>`. Returns undefined if the agent can't be resolved (commit
- * then falls back to the App identity). slug is sanitized to a safe email local-part.
+ * `Name <slug@agents.mumega.com>` by default (env-overridable via AGENT_COMMIT_EMAIL_DOMAIN, e.g.
+ * for a forked pot). Returns undefined if the agent can't be resolved (commit then falls back to
+ * the App identity). slug is sanitized to a safe email local-part.
  */
 export async function resolveAgentIdentity(env: Env, agentId: string): Promise<CommitIdentity | undefined> {
   const row = await env.DB.prepare(`SELECT slug, name FROM agents WHERE id = ?1 LIMIT 1`)
@@ -26,7 +32,8 @@ export async function resolveAgentIdentity(env: Env, agentId: string): Promise<C
   if (!row) return undefined
   const local = (row.slug || '').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40)
   if (!local) return undefined
-  return { name: row.name?.trim() || row.slug, email: `${local}@agents.mumega.com` }
+  const domain = env.AGENT_COMMIT_EMAIL_DOMAIN || DEFAULT_AGENT_COMMIT_EMAIL_DOMAIN
+  return { name: row.name?.trim() || row.slug, email: `${local}@${domain}` }
 }
 
 export interface ExecuteFile {

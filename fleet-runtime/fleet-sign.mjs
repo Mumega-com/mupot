@@ -76,13 +76,22 @@ function nonce() {
  *  {ok, status, json}. Never throws on HTTP failure (returns ok:false) so a daemon loop
  *  survives transient errors; a missing/bad key OR a missing tenant throws.
  *
- *  STERILE: `tenant` is REQUIRED — there is no default. The pot is multi-tenant-neutral. */
+ *  STERILE: `tenant` is REQUIRED — there is no default. The pot is multi-tenant-neutral.
+ *
+ *  `host` (#21 slice 2) is the self-reported physical-machine signal (os.hostname() on
+ *  the calling runtime — see attach-signed.mjs / fleet-daemon.mjs). It is UNTRUSTED,
+ *  display-only, and deliberately NOT part of the signed canonicalMessage bytes: a
+ *  cosmetic string needs no signature-covered integrity, and keeping it out of the
+ *  signed message means no re-signing-scheme change on either side. Defaults to '' (an
+ *  older caller that never passes opts.host still round-trips fine — the pot treats
+ *  missing/empty host as "unknown", never a hard failure). */
 export async function signedAttach(baseUrl, agentId, opts = {}) {
   const {
     type = 'generic',
     runtime = 'claude-code',
     tenant,
     lifecycle = 'on_demand',
+    host = '',
     privKey,
     fetchImpl = fetch,
   } = opts
@@ -95,7 +104,7 @@ export async function signedAttach(baseUrl, agentId, opts = {}) {
   const message = canonicalMessage({ tenant, agentId, type, runtime, lifecycle, ts, nonce: requestNonce })
   const sigBuf = await w.subtle.sign({ name: 'Ed25519' }, key, new TextEncoder().encode(message))
   const sig = Buffer.from(sigBuf).toString('base64url')
-  const body = { agent_id: agentId, type, runtime, lifecycle, ts, nonce: requestNonce, sig }
+  const body = { agent_id: agentId, type, runtime, lifecycle, ts, nonce: requestNonce, sig, host: typeof host === 'string' ? host : '' }
 
   try {
     const res = await fetchImpl(`${baseUrl.replace(/\/$/, '')}/api/fleet/attach-signed`, {

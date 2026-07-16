@@ -13,7 +13,7 @@ async function sha256Hex(s: string): Promise<string> {
 interface FleetRow {
   agent_id: string; tenant: string; display: string; runtime: string; squads: string
   lifecycle: string; provider_contract: string | null; status: string; reported_by: string
-  last_reported_at: string; agent_type: string; member_id: string | null
+  last_reported_at: string; agent_type: string; member_id: string | null; host: string
 }
 interface TokenRow { member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null }
 interface CapRow { member_id: string; scope_type: string; scope_id: string | null; capability: string }
@@ -49,8 +49,8 @@ function makeDb(tokens: Record<string, TokenRow> = {}, caps: Record<string, CapR
   function run(sql: string, b: unknown[]) {
     if (sql.includes('INSERT INTO fleet_agents')) {
       // Params: agent_id(?1) tenant(?2) display(?3) runtime(?4) squads(?5) lifecycle(?6)
-      //         provider_contract(?7) status(?8) reported_by(?9) agent_type(?10) member_id(?11)
-      const [agent_id, tenant, display, runtime, squads, lifecycle, pc, status, reported_by, agent_type, member_id] = b as Array<string | null>
+      //         provider_contract(?7) status(?8) reported_by(?9) agent_type(?10) member_id(?11) host(?12)
+      const [agent_id, tenant, display, runtime, squads, lifecycle, pc, status, reported_by, agent_type, member_id, host] = b as Array<string | null>
       // faithful to the composite PK (tenant, agent_id): keyed by both, so a different tenant's same
       // agent_id is a SEPARATE row (ON CONFLICT(tenant, agent_id)).
       fleet.set(`${tenant}:${agent_id}`, {
@@ -58,6 +58,7 @@ function makeDb(tokens: Record<string, TokenRow> = {}, caps: Record<string, CapR
         lifecycle: lifecycle!, provider_contract: (pc as string | null) ?? null,
         status: status!, reported_by: reported_by!,
         last_reported_at: 'now', agent_type: agent_type ?? 'generic', member_id: member_id ?? null,
+        host: host ?? '',
       })
       return { meta: { changes: 1 } }
     }
@@ -132,6 +133,46 @@ describe('reportFleetAgents / listFleetAgents', () => {
     const db = makeDb()
     const many = Array.from({ length: 201 }, (_, i) => ({ agent_id: `a${i}`, status: 'unknown' }))
     expect((await reportFleetAgents(env(db), 'c', many)).ok).toBe(false)
+  })
+
+  // ── host (#21 slice 2) — untrusted, agent-controlled, display-only ─────────────
+  it('host: defaults to "" when absent — old runtimes that never self-report still succeed', async () => {
+    const db = makeDb()
+    const r = await reportFleetAgents(env(db), 'fleet-consumer', [GOOD])
+    expect(r).toEqual({ ok: true, count: 1 })
+    expect(db._fleet.get('t:image-gen')!.host).toBe('')
+  })
+
+  it('host: trims + caps at 64 chars — truncates, never rejects the batch', async () => {
+    const db = makeDb()
+    const long = 'x'.repeat(100)
+    const r = await reportFleetAgents(env(db), 'fleet-consumer', [{ ...GOOD, host: `  ${long}  ` }])
+    expect(r).toEqual({ ok: true, count: 1 })
+    const stored = db._fleet.get('t:image-gen')!.host
+    expect(stored).toBe(long.slice(0, 64))
+    expect(stored.length).toBe(64)
+  })
+
+  it('host: a hostile string (quotes/slashes/angle-brackets) is stored verbatim — escaping is a RENDER concern, never an ingest one', async () => {
+    const db = makeDb()
+    const hostile = `<img src=x onerror=alert(1)> "'/`
+    const r = await reportFleetAgents(env(db), 'fleet-consumer', [{ ...GOOD, host: hostile }])
+    expect(r).toEqual({ ok: true, count: 1 })
+    expect(db._fleet.get('t:image-gen')!.host).toBe(hostile)
+  })
+
+  it('host: a non-string value is ignored (defaults to "") — never rejects the batch', async () => {
+    const db = makeDb()
+    const r = await reportFleetAgents(env(db), 'fleet-consumer', [{ ...GOOD, host: 12345 }])
+    expect(r).toEqual({ ok: true, count: 1 })
+    expect(db._fleet.get('t:image-gen')!.host).toBe('')
+  })
+
+  it('host: updates on a second report (latest self-report wins, like runtime/lifecycle)', async () => {
+    const db = makeDb()
+    await reportFleetAgents(env(db), 'fleet-consumer', [{ ...GOOD, host: 'mac-mini' }])
+    await reportFleetAgents(env(db), 'fleet-consumer', [{ ...GOOD, host: 'hetzner-1' }])
+    expect(db._fleet.get('t:image-gen')!.host).toBe('hetzner-1')
   })
 
   it('keys by (tenant, agent_id) — tenant B cannot overwrite tenant A (BLOCK-1)', async () => {

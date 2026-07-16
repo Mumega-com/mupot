@@ -52,7 +52,7 @@ import type {
 } from './ctx'
 import { composeDeptMetricDescriptors, deepFreezeChannels, getChannelWorkTypes } from './channels/compose'
 import type { GatedWorkType } from './channels/contract'
-import { inkwellContentWrite, InkwellExecutorError } from './executors/inkwell'
+import { inkwellContentDispatch, InkwellExecutorError } from './executors/inkwell'
 import { wpContentWrite, WpExecutorError } from './executors/mcpwp'
 
 // Re-export types so registry.ts only needs to import from kernel.ts.
@@ -629,13 +629,27 @@ function _mintCtxInternal(
         // 'inkwell' connector credential (Hadi-go) into handle.executorEnv.inkwell.
         // Absent → executor_not_wired (every current call site). The payload is the
         // STORED record's (content-bound), never caller-supplied.
+        //
+        // CRO apply-bridge (S5b): inkwellContentDispatch replaces the direct
+        // inkwellContentWrite call — it inspects the stored payload's SHAPE
+        // (mode === 'cro-apply-merge') and routes to the fetch-then-merge path when
+        // present, else the unchanged full-replace path. This dispatch stays on
+        // payload.executor === 'inkwell-content' exactly as before (no new
+        // action-string branch here) — see executors/inkwell.ts file-header note.
         const inkwellCfg = handle.executorEnv?.inkwell
         if (!inkwellCfg) {
           outcome = { executed: false, reason: 'executor_not_wired', adapter: 'inkwell-content' }
         } else {
           try {
-            const written = await inkwellContentWrite(inkwellCfg, storedPayload)
-            outcome = { executed: true, adapter: 'inkwell-content', artifactUrl: written.url }
+            const written = await inkwellContentDispatch(inkwellCfg, storedPayload)
+            outcome = {
+              executed: true,
+              adapter: 'inkwell-content',
+              artifactUrl: written.url,
+              // Only a merge-mode write carries a diff (ContentMergeDiff structurally
+              // matches ExecuteDiff) — a plain full-replace write has none to report.
+              ...(written.diff ? { diff: written.diff } : {}),
+            }
           } catch (e) {
             // Fail-closed on any adapter error (config/payload/HTTP) — never throw out
             // of execute(); surface the reason for the receipt/console.

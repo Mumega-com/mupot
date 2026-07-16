@@ -7,6 +7,13 @@
 // Reads the host-held Ed25519 private key from ~/.fleet/agents/<agent_id>.key (0600), signs a
 // tenant-bound, time-boxed, single-use message, and POSTs it to /api/fleet/attach-signed. The
 // key is used only to sign — never sent, never logged. STERILE: tenant is required.
+//
+// Also self-reports this machine's hostname (#21 slice 2) so the pot's /radar brain-image
+// can group agents by physical host (Mac vs a server vs the cloud) — it cannot detect this
+// on its own; it only sees a token/signature, never the box the runtime is on. UNTRUSTED,
+// display-only: os.hostname() is whatever the local machine calls itself, never used for
+// auth or routing (see fleet-sign.mjs's signedAttach doc + src/dashboard/radar-view.ts).
+import { hostname } from 'node:os'
 import { signedAttach } from './fleet-sign.mjs'
 
 function arg(flag, def) {
@@ -28,6 +35,7 @@ const res = await signedAttach(baseUrl, agentId, {
   runtime: arg('--runtime', 'claude-code'),
   tenant,
   lifecycle: arg('--lifecycle', 'on_demand'),
+  host: hostname(),
 }).catch((e) => {
   console.error(String(e && e.message ? e.message : e))
   process.exit(3)

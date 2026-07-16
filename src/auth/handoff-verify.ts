@@ -57,11 +57,21 @@ async function importPublicKey(jwkJson: string): Promise<CryptoKey> {
  * consume `claim.jti` once in KV (replay defense) before trusting it.
  * `nowSeconds` injectable for tests.
  */
+/**
+ * `expectedAud`/`expectedIss` are the pot's own override (e.g. `env.MUPOT_HANDOFF_AUD` /
+ * `env.MUPOT_HANDOFF_ISS`) for a forked deploy. FAIL SAFE (do not weaken without re-reading
+ * this): both an `undefined` (unset var) AND an empty-string override fall back to the current
+ * hardcoded default — never to "accept any". A fork that overrides one side of a handoff must
+ * override BOTH consistently: the issuer it mints claims with (mumega-side minting config) and
+ * the audience/issuer it checks here must agree, or every handoff will be rejected (safe
+ * failure) rather than silently accepting a mismatched party.
+ */
 export async function verifyHandoffClaim(
   publicKeyJwkJson: string | undefined,
   token: string,
   nowSeconds: number = Math.floor(Date.now() / 1000),
   expectedAud: string = HANDOFF_AUD,
+  expectedIss: string = HANDOFF_ISS,
 ): Promise<VerifyResult> {
   if (!publicKeyJwkJson) return { ok: false, reason: 'unconfigured' }
   const parts = token.split('.')
@@ -89,10 +99,17 @@ export async function verifyHandoffClaim(
     new TextEncoder().encode(`${h}.${p}`),
   )
   if (!valid) return { ok: false, reason: 'bad_signature' }
-  if (claim.aud !== expectedAud) return { ok: false, reason: 'wrong_aud' }
+  // Falsy (unset OR empty-string) override ⇒ the hardcoded default. Never treat a missing
+  // override as "match anything" — that would turn a misconfigured fork into an open relay
+  // for whatever aud/iss happens to be in an attacker-crafted (but validly signed by a
+  // DIFFERENT issuer's key — impossible here since we verify with mumega's public key only,
+  // but keep this explicit rather than relying on that alone) claim.
+  const aud = expectedAud || HANDOFF_AUD
+  const iss = expectedIss || HANDOFF_ISS
+  if (claim.aud !== aud) return { ok: false, reason: 'wrong_aud' }
   // Defense in depth: pin the issuer. Signature already binds the key, but checking
   // iss guards against keypair reuse / a two-pot misconfig accepting a foreign issuer.
-  if (claim.iss !== HANDOFF_ISS) return { ok: false, reason: 'wrong_iss' }
+  if (claim.iss !== iss) return { ok: false, reason: 'wrong_iss' }
   if (claim.email_verified !== true) return { ok: false, reason: 'email_not_verified' }
   if (typeof claim.exp !== 'number' || claim.exp <= nowSeconds) return { ok: false, reason: 'expired' }
   const email = (claim.email ?? '').trim().toLowerCase()

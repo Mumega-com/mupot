@@ -90,8 +90,8 @@ const STATS = new Map<string, AgentStat>([
 ])
 
 const FLEET_RUNTIME_ROWS: FleetAgentRuntimeView[] = [
-  { agent_id: 'agent-hermes', display: 'Hermes', runtime: 'hermes-cron', squads: ['squad-core'], status: 'running', presence: 'live', lifecycle: 'always_on', last_seen: sqliteStamp(NOW - 30_000) },
-  { agent_id: 'agent-kasra', display: 'Kasra', runtime: 'claude-code', squads: ['squad-core'], status: 'running', presence: 'stale', lifecycle: 'on_demand', last_seen: sqliteStamp(NOW - 900_000) },
+  { agent_id: 'agent-hermes', display: 'Hermes', runtime: 'hermes-cron', squads: ['squad-core'], status: 'running', presence: 'live', lifecycle: 'always_on', last_seen: sqliteStamp(NOW - 30_000), host: 'hetzner-1' },
+  { agent_id: 'agent-kasra', display: 'Kasra', runtime: 'claude-code', squads: ['squad-core'], status: 'running', presence: 'stale', lifecycle: 'on_demand', last_seen: sqliteStamp(NOW - 900_000), host: '' },
 ]
 
 const PRESENCE: PresenceView[] = [
@@ -137,6 +137,20 @@ describe('buildFleetRadar — per-agent cards', () => {
     expect(hermes.airworthiness.error_rate).toBeCloseTo(0.1) // 1 - 90/100
     expect(hermes.airworthiness.stale).toBe(false)
     expect(hermes.last_seen_ms).toBe(NOW - 30_000)
+  })
+
+  it('host (#21 slice 2): threaded from FleetAgentRuntimeView.host, one field wider off the same fetched rows — no new SQL', () => {
+    const radar = buildFleetRadar(baseInputs())
+    const hermes = radar.agents.find((a) => a.agent_id === 'agent-hermes')!
+    expect(hermes.host).toBe('hetzner-1')
+    // kasra's fleet_agents row exists but its host is '' (never self-reported) — honest
+    // "unknown", not fabricated.
+    const kasra = radar.agents.find((a) => a.agent_id === 'agent-kasra')!
+    expect(kasra.host).toBe('')
+    // codex has NO fleet_agents row at all (unattached, no signing key) — same '' result,
+    // for the same reason: absence of a signal is absence, never a guess.
+    const codex = radar.agents.find((a) => a.agent_id === 'agent-codex')!
+    expect(codex.host).toBe('')
   })
 
   it('stale agent: flagged in stale_signals, airworthiness.stale=true', () => {
@@ -220,7 +234,7 @@ describe('buildFleetRadar — tenant isolation (structural)', () => {
     }
     const foreignRuntimeRow: FleetAgentRuntimeView = {
       agent_id: 'agent-foreign-tenant', display: 'Foreign', runtime: 'codex', squads: [],
-      status: 'running', presence: 'live', lifecycle: 'on_demand', last_seen: sqliteStamp(NOW),
+      status: 'running', presence: 'live', lifecycle: 'on_demand', last_seen: sqliteStamp(NOW), host: 'foreign-box',
     }
     const radar = buildFleetRadar(
       baseInputs({

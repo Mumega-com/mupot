@@ -16,8 +16,13 @@
 //
 // Heartbeat cadence must be comfortably under the pot's presence TTL (default 180s); default
 // interval 75s gives ~2.4 beats/window. Private keys are loaded once at startup (fail-fast).
+//
+// Each heartbeat also self-reports THIS machine's hostname (#21 slice 2, os.hostname()) —
+// UNTRUSTED, display-only, never auth/routing — so the pot's /radar brain-image can group
+// the fleet by physical host. The daemon can't be told this by the pot; the pot has no way
+// to see it on its own (see src/dashboard/radar-view.ts's honest-gaps note).
 import { readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, hostname } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { loadPrivKey, signedAttach, signedDetach, signedInbox } from './fleet-sign.mjs'
@@ -264,6 +269,7 @@ export async function runDaemonOnce(cfg, keys, liveAgents = new Set(), opts = {}
     }
     const res = await signedAttachFn(cfg.baseUrl, a.agent_id, {
       type: a.type, runtime: a.runtime, tenant: cfg.tenant, lifecycle: a.lifecycle, privKey: keys.get(a.agent_id),
+      host: hostname(),
     })
     logFn({ agent: a.agent_id, probe: 'alive', action: res.ok ? 'heartbeat_ok' : 'heartbeat_fail', status: res.status })
     const result = {

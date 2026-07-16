@@ -30,9 +30,24 @@ import { verifySignedDetach } from './signed-detach'
 
 // ── shared upsert ───────────────────────────────────────────────────────────────────
 
+// Host is UNTRUSTED, agent-controlled, DISPLAY-ONLY (#21 slice 2 — same posture as the
+// daemon /report path's `host`, src/fleet/registry.ts). It is deliberately NOT part of the
+// signed-attach canonical message (signed-attach.ts canonicalAttachMessage): a display
+// string needs no signature-covered integrity, and keeping it out of the signed bytes means
+// no re-signing-scheme change is needed on either side. Trim + cap; never reject the request
+// over it. Re-declared locally rather than imported from registry.ts — same "keeps
+// validation explicit, avoids coupling to the daemon-report path" rule as AGENT_ID_RE above.
+const MAX_HOST = 64
+function cleanHost(v: unknown): string {
+  return typeof v === 'string' ? v.trim().slice(0, MAX_HOST) : ''
+}
+
 /** Upsert a fleet_agents row to status='running'. Shared by the bearer (/attach) and the
  *  signed (/attach-signed) paths so both produce identical registry rows. member_id is the
- *  caller-authenticated identity (token-derived for bearer; key-bound for signed). */
+ *  caller-authenticated identity (token-derived for bearer; key-bound for signed). `host` is
+ *  always written (INSERT and UPDATE) — unlike display/squads/provider_contract, which are
+ *  intentionally preserved on UPDATE for the daemon-populated case, host reflects the
+ *  CURRENT physical machine, so a fresh self-report should always overwrite a stale one. */
 async function upsertRunning(
   env: Env,
   agentId: string,
@@ -40,12 +55,13 @@ async function upsertRunning(
   lifecycle: string,
   agentType: string,
   memberId: string | null,
+  host: string,
 ): Promise<void> {
   await env.DB.prepare(
     `INSERT INTO fleet_agents
           (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract,
-           status, reported_by, agent_type, member_id, last_reported_at, updated_at)
-     VALUES (?1, ?2, '', ?3, '[]', ?4, NULL, 'running', ?5, ?6, ?7, datetime('now'), datetime('now'))
+           status, reported_by, agent_type, member_id, host, last_reported_at, updated_at)
+     VALUES (?1, ?2, '', ?3, '[]', ?4, NULL, 'running', ?5, ?6, ?7, ?8, datetime('now'), datetime('now'))
      ON CONFLICT(tenant, agent_id) DO UPDATE SET
           runtime          = excluded.runtime,
           lifecycle        = excluded.lifecycle,
@@ -53,10 +69,11 @@ async function upsertRunning(
           reported_by      = excluded.reported_by,
           agent_type       = excluded.agent_type,
           member_id        = excluded.member_id,
+          host             = excluded.host,
           last_reported_at = excluded.last_reported_at,
           updated_at       = excluded.updated_at`,
   )
-    .bind(agentId, env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId)
+    .bind(agentId, env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId, host)
     .run()
 }
 
@@ -200,9 +217,13 @@ fleetAttachApp.post('/attach', async (c) => {
   //    Any b.member_id in the request is silently discarded.
   const memberId = id.memberId
 
+  // host: UNTRUSTED, agent-controlled, optional, display-only (#21 slice 2). Absent →
+  // '' (backward compatible with runtimes that don't self-report yet).
+  const host = cleanHost(b.host)
+
   // 7. Upsert (shared with the signed path). display + squads + provider_contract default
   //    on INSERT and are NOT overwritten on UPDATE (preserve any daemon-populated value).
-  await upsertRunning(c.env, agentId, runtime, lifecycle, agentType, memberId)
+  await upsertRunning(c.env, agentId, runtime, lifecycle, agentType, memberId, host)
 
   // 8. Boot-ack: return the full getAgentView row so the runtime confirms its identity,
   //    type, and capabilities as mupot sees them after the upsert.
@@ -241,9 +262,15 @@ fleetAttachApp.post('/attach-signed', async (c) => {
   const v = await verifySignedAttach(c.env, b, VALID_TYPES, VALID_RUNTIMES, VALID_LIFECYCLES)
   if (!v.ok) return c.json({ error: v.error, detail: v.detail }, v.status as 400 | 401 | 409)
 
-  // 3. Upsert — EVERY written field is signature-covered: agent_id/type/runtime/lifecycle
-  //    are in the signed bytes; member_id is key-bound (from agent_keys), never the body.
-  await upsertRunning(c.env, v.agent_id, v.runtime, v.lifecycle, v.type, v.member_id)
+  // host: UNTRUSTED, agent-controlled, optional, display-only (#21 slice 2). Deliberately
+  // read from the raw body, NOT from `v` — it is not part of the signed canonical message
+  // (see cleanHost's comment above), so it carries no identity/auth weight either way.
+  const host = cleanHost(b.host)
+
+  // 3. Upsert — every AUTH-RELEVANT field is signature-covered: agent_id/type/runtime/
+  //    lifecycle are in the signed bytes; member_id is key-bound (from agent_keys), never
+  //    the body. `host` is the one unsigned, display-only exception (untrusted by design).
+  await upsertRunning(c.env, v.agent_id, v.runtime, v.lifecycle, v.type, v.member_id, host)
 
   // 4. Boot-ack.
   const views = await getAgentView(c.env)

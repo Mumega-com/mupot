@@ -42,7 +42,12 @@ export const MAX_PLATFORM_FEE_PCT = 50
 export const DEFAULT_RESELLER_TIER: PotTier = 'pro'
 
 /** The default-channel host suffix mupot pots get before a sovereign custom domain is wired.
- *  The owner-walk link uses `<slug>.<this>` until the reseller's own domain is assigned at deploy. */
+ *  The owner-walk link uses `<slug>.<this>` until the reseller's own domain is assigned at deploy.
+ *  A forked deploy overrides this via the `potHostSuffix` planner option (sourced from
+ *  `env.DEFAULT_POT_HOST_SUFFIX` at the call site, NOT read from client request input — see
+ *  `planResellerTenant`'s `opts` param); unset ⇒ this default, so mumega's own deploy is
+ *  byte-identical. Kept as a plain constant (not an env read) to preserve this module's purity
+ *  contract (see file header). */
 export const DEFAULT_POT_HOST_SUFFIX = 'mupot.mumega.com'
 
 /** The department template every reseller pot activates. */
@@ -183,12 +188,25 @@ const GHL_REF_RE = /^[a-zA-Z0-9_-]{1,128}$/
 
 // ── the planner ─────────────────────────────────────────────────────────────────────────
 
+/** Deploy-level planner options — distinct from `input`, which is untrusted client request
+ *  body. `potHostSuffix` must come from the CALLER's own env (e.g. `env.DEFAULT_POT_HOST_SUFFIX`),
+ *  never from request JSON — otherwise any admin-plus caller could redirect the owner-walk link
+ *  to an arbitrary host per-request. Still keeps the function pure: no env read happens inside
+ *  this module, only an explicit argument. */
+export interface ResellerPlannerOpts {
+  /** Overrides DEFAULT_POT_HOST_SUFFIX. Falsy (unset/empty) ⇒ the default. */
+  potHostSuffix?: string
+}
+
 /**
  * Compute the complete, deterministic reseller-pot stand-up recipe. Pure: no I/O, no clock,
  * no randomness. Returns {ok:false, reason, detail} on any invalid input (fail-closed) so the
  * caller never has to guess; returns the full plan on success. NOTHING is executed.
  */
-export function planResellerTenant(input: ResellerProvisionInput): ResellerProvisionResult {
+export function planResellerTenant(
+  input: ResellerProvisionInput,
+  opts: ResellerPlannerOpts = {},
+): ResellerProvisionResult {
   if (input === null || typeof input !== 'object') {
     return { ok: false, reason: 'invalid_input', detail: 'input must be an object' }
   }
@@ -280,7 +298,7 @@ export function planResellerTenant(input: ResellerProvisionInput): ResellerProvi
   }
 
   // ── assemble the plan (deterministic) ─────────────────────────────────────────────────
-  const potHost = `${slug}.${DEFAULT_POT_HOST_SUFFIX}`
+  const potHost = `${slug}.${opts.potHostSuffix || DEFAULT_POT_HOST_SUFFIX}`
   const squads: PlannedSquad[] = AgencyModule.defaultSquads.map((s) => ({ slug: s.slug, name: s.name }))
   // DEEP-COPY into the plan — the returned plan must OWN its data. `o.tiers` is a reference
   // into the shared SERVICE_CATALOG singleton (a top-level-readonly array, NOT deep-frozen);

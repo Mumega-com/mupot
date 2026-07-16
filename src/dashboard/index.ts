@@ -118,6 +118,8 @@ import { isOnboardingComplete } from './settings'
 import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './brain'
 import type { PhysicsSnapshot } from './brain'
 import { loadGrowthView, growthBody } from './growth'
+import { loadFleetRadar } from './radar'
+import { radarPageBody } from './radar-view'
 import { setLoopControl, isLoopControlAction } from '../loops/decisions'
 import { getLoop } from '../loops/service'
 import {
@@ -178,7 +180,7 @@ dashboardApp.use('*', async (c, next) => {
   // never render another pot's structure.
   const auth = c.get('auth')
   if (auth.tenant !== c.env.TENANT_SLUG) {
-    return c.html(shell(c.env.BRAND, 'Forbidden', errorBody('This session is not scoped to this org.')), 403)
+    return c.html(shell(c.env, 'Forbidden', errorBody('This session is not scoped to this org.')), 403)
   }
   await next()
 })
@@ -230,7 +232,7 @@ dashboardApp.get('/', async (c) => {
     loadTodaySpendScalar(c.env),
   ])
   return c.html(
-    shell(c.env.BRAND, 'Overview', observatoryBody(c.env.BRAND, obsData, approvals, auth), {
+    shell(c.env, 'Overview', observatoryBody(c.env.BRAND, obsData, approvals, auth), {
       physics,
       costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
     }),
@@ -243,7 +245,7 @@ dashboardApp.get('/', async (c) => {
 // + CSRF + no-store/Referrer-Policy come from the dashboard middleware above.
 dashboardApp.get('/send', async (c) => {
   const agents = await loadActiveAgentsWithSquad(c.env)
-  return c.html(shell(c.env.BRAND, 'Send a task', sendPageBody(agents)))
+  return c.html(shell(c.env, 'Send a task', sendPageBody(agents)))
 })
 
 // GET /approvals — the gate queue (#6). Tasks in 'review' the caller may
@@ -263,7 +265,7 @@ dashboardApp.get('/approvals', async (c) => {
     loadApprovals(c.env, auth),
     loadPublishable(c.env, auth),
   ])
-  return c.html(shell(c.env.BRAND, 'Approvals', approvalsBody(items, publishable)))
+  return c.html(shell(c.env, 'Approvals', approvalsBody(items, publishable)))
 })
 
 // GET /ops — owner/admin health and observability console.
@@ -272,10 +274,10 @@ dashboardApp.get('/approvals', async (c) => {
 dashboardApp.get('/ops', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
-    return c.html(shell(c.env.BRAND, 'Operations', errorBody('Operations health requires owner or admin.')), 403)
+    return c.html(shell(c.env, 'Operations', errorBody('Operations health requires owner or admin.')), 403)
   }
   const data = await loadOpsHealth(c.env)
-  return c.html(shell(c.env.BRAND, 'Operations', opsHealthBody(data)))
+  return c.html(shell(c.env, 'Operations', opsHealthBody(data)))
 })
 
 // ── deployment (SOVEREIGNTY: the pot's actual live deployment identity) ──────
@@ -287,23 +289,23 @@ dashboardApp.get('/ops', async (c) => {
 dashboardApp.get('/deployment', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
-    return c.html(shell(c.env.BRAND, 'Deployment', errorBody('Deployment requires owner or admin.')), 403)
+    return c.html(shell(c.env, 'Deployment', errorBody('Deployment requires owner or admin.')), 403)
   }
   const data = await loadDeployment(c.env)
-  return c.html(shell(c.env.BRAND, 'Deployment', deploymentBody(data)))
+  return c.html(shell(c.env, 'Deployment', deploymentBody(data)))
 })
 
 // ── loops (watch goal-seeking work-units + the outreach funnel) ──────────────
 dashboardApp.get('/loops', async (c) => {
   const view = await loadLoopsView(c.env)
-  return c.html(shell(c.env.BRAND, 'Loops', loopsBody(view)))
+  return c.html(shell(c.env, 'Loops', loopsBody(view)))
 })
 
 // ── services (the priced "basket of services" the reseller sells) ────────────
 // GET /services — read-only render of SERVICE_CATALOG (config). requireAuth via the
 // outer middleware. Draft prices live in src/services/catalog.ts.
 dashboardApp.get('/services', async (c) => {
-  return c.html(shell(c.env.BRAND, 'Services', servicesBody()))
+  return c.html(shell(c.env, 'Services', servicesBody()))
 })
 
 // ── addons — owner/admin lifecycle console ──────────────────────────────────
@@ -332,7 +334,7 @@ dashboardApp.get('/economy', async (c) => {
   // Header spend chip reuses this SAME loadEconomy() call — no extra D1 round
   // trip, and the chip is guaranteed to agree with the "Today" card below it.
   return c.html(
-    shell(c.env.BRAND, 'Economy', economyBody(data), {
+    shell(c.env, 'Economy', economyBody(data), {
       costToday: { configured: data.configured, todayUsdMicro: data.today_usd_micro },
     }),
   )
@@ -341,7 +343,7 @@ dashboardApp.get('/economy', async (c) => {
 // ── economy/billing — current plan + tier from org_settings (no secrets) ─────
 dashboardApp.get('/economy/billing', async (c) => {
   const model = await loadBilling(c.env, c.get('auth'))
-  return c.html(shell(c.env.BRAND, 'Billing', billingBody(model)))
+  return c.html(shell(c.env, 'Billing', billingBody(model)))
 })
 
 // ── economy/wallet + marketplace — honest-empty (greenfield, no backing model) ─
@@ -350,7 +352,7 @@ dashboardApp.get('/economy/billing', async (c) => {
 dashboardApp.get('/economy/wallet', (c) =>
   c.html(
     shell(
-      c.env.BRAND,
+      c.env,
       'Wallet',
       html`${pageHeader({ crumbs: 'Overview / Economy / Wallet', title: 'Wallet' })}
       ${notConnected(
@@ -363,7 +365,7 @@ dashboardApp.get('/economy/wallet', (c) =>
 dashboardApp.get('/economy/marketplace', (c) =>
   c.html(
     shell(
-      c.env.BRAND,
+      c.env,
       'Marketplace',
       html`${pageHeader({ crumbs: 'Overview / Economy / Marketplace', title: 'Marketplace' })}
       ${notConnected(
@@ -378,7 +380,7 @@ dashboardApp.get('/economy/marketplace', (c) =>
 // Read-only. Visibility mirrors /approvals (owner/admin all; others gate-scoped).
 dashboardApp.get('/verifications', async (c) => {
   const items = await loadVerifications(c.env, c.get('auth'))
-  return c.html(shell(c.env.BRAND, 'Verifications', verificationsBody(items)))
+  return c.html(shell(c.env, 'Verifications', verificationsBody(items)))
 })
 
 // ── audit — immutable trail (connector actions + gate decisions). Owner/admin. ─
@@ -387,7 +389,7 @@ dashboardApp.get('/audit', async (c) => {
   // WARN-1 (Codex): a non-admin gets a real 403, not a 200-with-empty. The body
   // still renders the restricted state; the status makes the denial monitorable.
   const status = result.forbidden ? 403 : 200
-  return c.html(shell(c.env.BRAND, 'Audit log', auditBody(result)), status)
+  return c.html(shell(c.env, 'Audit log', auditBody(result)), status)
 })
 
 // ── brain (per-pot brain panel — decision feed + governor) ───────────────────
@@ -400,7 +402,7 @@ dashboardApp.get('/brain', async (c) => {
   // Header regime chip reuses this SAME loadBrainView() call (it already fetched
   // the KV physics snapshot for the coherence panel below) — no extra KV read.
   return c.html(
-    shell(c.env.BRAND, 'Brain', brainBody(view, isAdmin(auth)), { physics: view.physics }),
+    shell(c.env, 'Brain', brainBody(view, isAdmin(auth)), { physics: view.physics }),
   )
 })
 
@@ -411,7 +413,7 @@ dashboardApp.get('/brain', async (c) => {
 dashboardApp.get('/departments/growth', async (c) => {
   const auth = c.get('auth')
   const view = await loadGrowthView(c.env, auth)
-  return c.html(shell(c.env.BRAND, 'Marketing & Sales', growthBody(view)))
+  return c.html(shell(c.env, 'Marketing & Sales', growthBody(view)))
 })
 
 // POST /admin/departments/:dept/execute/:gateId — owner/admin-triggered execution
@@ -499,16 +501,21 @@ dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
       // way this UPDATE only ever touches a row that is genuinely this pot's
       // own approved content-publish task.
       const now = new Date().toISOString()
+      // CRO apply-bridge (S5b): when the adapter performed a fetch-then-merge write
+      // (outcome.diff present — see executors/inkwell.ts ContentMergeDiff /
+      // ctx.ts ExecuteDiff), fold the change-type + before/after into this SAME
+      // receipt string rather than adding a second persistence path. Today this
+      // UPDATE is a harmless no-op for cro-apply's random-UUID gateId (same as it
+      // already is for seo-meta-fix — see the comment above); this stays ready for
+      // a future flow that mints gateId === task.id for a cro-apply proposal too.
+      const receiptResult = outcome.diff
+        ? `Applied ${outcome.diff.changeType} via ${outcome.adapter ?? 'unknown'}${outcome.artifactUrl ? `: ${outcome.artifactUrl}` : ''} — ${outcome.diff.field}: ${JSON.stringify(outcome.diff.before)} -> ${JSON.stringify(outcome.diff.after)}`
+        : `Published via ${outcome.adapter ?? 'unknown'}${outcome.artifactUrl ? `: ${outcome.artifactUrl}` : ''}`
       await c.env.DB.prepare(
         `UPDATE tasks SET status = 'done', result = ?, completed_at = ?, updated_at = ?
            WHERE id = ? AND status = 'approved'`,
       )
-        .bind(
-          `Published via ${outcome.adapter ?? 'unknown'}${outcome.artifactUrl ? `: ${outcome.artifactUrl}` : ''}`,
-          now,
-          now,
-          gateId,
-        )
+        .bind(receiptResult, now, now, gateId)
         .run()
     }
     return c.json(outcome, outcome.executed ? 200 : 422)
@@ -591,7 +598,35 @@ dashboardApp.post('/brain/loops/:id/control', async (c) => {
 dashboardApp.get('/flights', async (c) => {
   const rows = await listFlights(c.env)
   const cards = buildBoard(rows, Date.now())
-  return c.html(shell(c.env.BRAND, 'Flights', flightsBody(cards)))
+  return c.html(shell(c.env, 'Flights', flightsBody(cards)))
+})
+
+// ── radar (visual fleet + squad awareness — #21 slice 1, VIEW LAYER ONLY) ────
+// GET /radar — agent character-sheet cards + a compact fleet-map "brain image"
+// rendered from the SAME FleetRadar the brain's ATC tower already reads at the
+// bearer-gated GET /api/radar JSON feed (dashboard/radar-routes.ts, #23) — zero
+// new data, zero migration, reuses loadFleetRadar/buildFleetRadar as-is.
+//
+// Auth: this route lives on dashboardApp (session-cookie, requireAuth via the
+// outer middleware) and is admin-gated with the SAME isAdmin() check every
+// other org-admin dashboard page uses (/ops, /deployment, /audit) — matching
+// the org-admin authorization LEVEL that GET /api/radar's bearer-token
+// resolveOrgAdmin check requires, via the mechanism this cookie-authed
+// dashboard already uses everywhere else. GET /api/radar's own bearer check
+// (src/auth/member-bearer.ts resolveOrgAdmin) is NOT touched by this route —
+// it stays the canonical JSON surface for the brain / programmatic callers.
+// ?format=json (or an Accept: application/json request) returns the identical
+// FleetRadar JSON through this session-authed path for convenience.
+dashboardApp.get('/radar', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(shell(c.env, 'Radar', errorBody('Fleet radar requires owner or admin.')), 403)
+  }
+  const radar = await loadFleetRadar(c.env)
+  const accept = c.req.header('accept') ?? ''
+  const wantsJson = c.req.query('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))
+  if (wantsJson) return c.json(radar)
+  return c.html(shell(c.env, 'Radar', radarPageBody(radar)))
 })
 
 // ── fleet (company-wide agent roster over the SOS bus) ───────────────────────
@@ -620,7 +655,7 @@ dashboardApp.get('/fleet', async (c) => {
       loadTodaySpendScalar(c.env),
     ])
     return c.html(
-      shell(c.env.BRAND, 'Fleet', html`${hostPanel}${potFleetBody(presence)}`, {
+      shell(c.env, 'Fleet', html`${hostPanel}${potFleetBody(presence)}`, {
         physics,
         costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
       }),
@@ -635,7 +670,7 @@ dashboardApp.get('/fleet', async (c) => {
   }
   const [physics, spend] = await Promise.all([loadBrainPhysics(c.env), loadTodaySpendScalar(c.env)])
   return c.html(
-    shell(c.env.BRAND, 'Fleet', html`${hostPanel}${fleetBody(rows, error)}`, {
+    shell(c.env, 'Fleet', html`${hostPanel}${fleetBody(rows, error)}`, {
       physics,
       costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
     }),
@@ -711,7 +746,7 @@ dashboardApp.get('/coordination', async (c) => {
   } catch {
     cards = []
   }
-  return c.html(shell(c.env.BRAND, 'Control Tower', controlTowerBody(cards)))
+  return c.html(shell(c.env, 'Control Tower', controlTowerBody(cards)))
 })
 
 // ── /agents — unified agent management ───────────────────────────────────────
@@ -732,7 +767,7 @@ dashboardApp.get('/agents', async (c) => {
   const auth = c.get('auth')
   const canManage = isAdmin(auth)
   return c.html(
-    shell(c.env.BRAND, 'Agents', agentsBody(agents, squadOptions, canManage), {
+    shell(c.env, 'Agents', agentsBody(agents, squadOptions, canManage), {
       physics,
       costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
     }),
@@ -743,17 +778,17 @@ dashboardApp.get('/agents', async (c) => {
 dashboardApp.post('/agents', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
-    return c.html(shell(c.env.BRAND, 'Agents', errorBody('Creating an agent requires owner or admin.')), 403)
+    return c.html(shell(c.env, 'Agents', errorBody('Creating an agent requires owner or admin.')), 403)
   }
   const form = await c.req.parseBody()
   const squadId = typeof form.squad_id === 'string' ? form.squad_id.trim() : ''
   if (!squadId) {
-    return c.html(shell(c.env.BRAND, 'Agents', errorBody('Pick a squad for the agent.')), 400)
+    return c.html(shell(c.env, 'Agents', errorBody('Pick a squad for the agent.')), 400)
   }
   // Validate the squad exists in this pot before writing.
   const squad = await getById<Squad>(c.env, 'squads', squadId)
   if (!squad) {
-    return c.html(shell(c.env.BRAND, 'Agents', errorBody('Squad not found.')), 404)
+    return c.html(shell(c.env, 'Agents', errorBody('Squad not found.')), 404)
   }
   const result = await createAgent(c.env, squadId, {
     slug: form.slug,
@@ -764,7 +799,7 @@ dashboardApp.post('/agents', async (c) => {
   if (!result.ok) {
     const [agents, squadOptions] = await Promise.all([loadAllAgents(c.env), loadSquadOptions(c.env)])
     return c.html(
-      shell(c.env.BRAND, 'Agents', agentsBody(agents, squadOptions, true, `Could not add agent: ${result.error}.`)),
+      shell(c.env, 'Agents', agentsBody(agents, squadOptions, true, `Could not add agent: ${result.error}.`)),
       result.error === 'slug_taken' ? 409 : 400,
     )
   }
@@ -841,7 +876,7 @@ dashboardApp.get('/squads/:id', async (c) => {
   const squadId = c.req.param('id')
   const squad = await getById<Squad>(c.env, 'squads', squadId)
   if (!squad) {
-    return c.html(shell(c.env.BRAND, 'Squad', errorBody('Squad not found.')), 404)
+    return c.html(shell(c.env, 'Squad', errorBody('Squad not found.')), 404)
   }
   const [agents, tasks] = await Promise.all([
     c.env.DB.prepare(
@@ -861,7 +896,7 @@ dashboardApp.get('/squads/:id', async (c) => {
   const canManage = isAdmin(auth)
   return c.html(
     shell(
-      c.env.BRAND,
+      c.env,
       `Squad · ${squad.name}`,
       squadBoardBody(squad, agents.results ?? [], tasks.results ?? [], canAddAgent, canManage),
     ),
@@ -873,7 +908,7 @@ dashboardApp.get('/agents/:id', async (c) => {
   const agentId = c.req.param('id')
   const agent = await getById<Agent>(c.env, 'agents', agentId)
   if (!agent) {
-    return c.html(shell(c.env.BRAND, 'Agent', errorBody('Agent not found.')), 404)
+    return c.html(shell(c.env, 'Agent', errorBody('Agent not found.')), 404)
   }
   const squad = await getById<Squad>(c.env, 'squads', agent.squad_id)
   const auth = c.get('auth')
@@ -881,7 +916,7 @@ dashboardApp.get('/agents/:id', async (c) => {
   // see a working button — the API re-checks server-side either way.
   const canWake = await canOnSquad(c.env, auth, agent.squad_id)
   return c.html(
-    shell(c.env.BRAND, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake)),
+    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake)),
   )
 })
 
@@ -899,7 +934,7 @@ dashboardApp.get('/admin/members', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
     return c.html(
-      shell(c.env.BRAND, 'People & Access', errorBody('People & Access admin requires owner or admin.')),
+      shell(c.env, 'People & Access', errorBody('People & Access admin requires owner or admin.')),
       403,
     )
   }
@@ -912,7 +947,7 @@ dashboardApp.get('/admin/members', async (c) => {
   const scopeNames = await loadScopeNames(c.env)
   return c.html(
     shell(
-      c.env.BRAND,
+      c.env,
       'People & Access',
       membersAdminBody(members, grants, channels, depts, scopeNames, auth),
     ),
@@ -925,7 +960,7 @@ dashboardApp.get('/admin/divisions', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
     return c.html(
-      shell(c.env.BRAND, 'Organization', errorBody('Organization admin requires owner or admin.')),
+      shell(c.env, 'Organization', errorBody('Organization admin requires owner or admin.')),
       403,
     )
   }
@@ -936,7 +971,7 @@ dashboardApp.get('/admin/divisions', async (c) => {
     loadMembers(c.env),
   ])
   return c.html(
-    shell(c.env.BRAND, 'Organization', divisionsAdminBody(depts, squads, grants, members, auth)),
+    shell(c.env, 'Organization', divisionsAdminBody(depts, squads, grants, members, auth)),
   )
 })
 
@@ -958,12 +993,12 @@ dashboardApp.get('/admin/keys', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
     return c.html(
-      shell(c.env.BRAND, 'Scoped Keys', errorBody('Scoped key management requires owner or admin.')),
+      shell(c.env, 'Scoped Keys', errorBody('Scoped key management requires owner or admin.')),
       403,
     )
   }
   const view = await loadKeysView(c.env)
-  return c.html(shell(c.env.BRAND, 'Scoped API Keys', keysPageBody(view)))
+  return c.html(shell(c.env, 'Scoped API Keys', keysPageBody(view)))
 })
 
 // POST /admin/keys/mint — mint + show-once
@@ -971,7 +1006,7 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
     return c.html(
-      shell(c.env.BRAND, 'Scoped Keys', errorBody('Minting a scoped key requires owner or admin.')),
+      shell(c.env, 'Scoped Keys', errorBody('Minting a scoped key requires owner or admin.')),
       403,
     )
   }
@@ -985,14 +1020,14 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
   if (!isValidPresetId(presetIdRaw)) {
     const view = await loadKeysView(c.env)
     return c.html(
-      shell(c.env.BRAND, 'Scoped API Keys', keysPageBody(view, undefined, undefined, 'Unknown preset.')),
+      shell(c.env, 'Scoped API Keys', keysPageBody(view, undefined, undefined, 'Unknown preset.')),
       400,
     )
   }
   if (!memberIdRaw) {
     const view = await loadKeysView(c.env)
     return c.html(
-      shell(c.env.BRAND, 'Scoped API Keys', keysPageBody(view, presetIdRaw, scopeIdRaw ?? undefined, 'Pick a member.')),
+      shell(c.env, 'Scoped API Keys', keysPageBody(view, presetIdRaw, scopeIdRaw ?? undefined, 'Pick a member.')),
       400,
     )
   }
@@ -1027,7 +1062,7 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
       : `Mint failed: ${result.error}`
     const statusCode = result.error === 'rank_ceiling' ? 403 : 400
     return c.html(
-      shell(c.env.BRAND, 'Scoped API Keys', keysPageBody(view, presetIdRaw, scopeIdRaw ?? undefined, msg)),
+      shell(c.env, 'Scoped API Keys', keysPageBody(view, presetIdRaw, scopeIdRaw ?? undefined, msg)),
       statusCode,
     )
   }
@@ -1046,7 +1081,7 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
   // dashboard-wide middleware above.
   return c.html(
     shell(
-      c.env.BRAND,
+      c.env,
       'Key provisioned',
       keysMintedBody(memberName, result.label, preset.label, result.raw, result.grantUnchanged),
     ),
@@ -1075,12 +1110,12 @@ dashboardApp.get('/admin/agent-token', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
     return c.html(
-      shell(c.env.BRAND, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
+      shell(c.env, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
       403,
     )
   }
   const view = await loadAgentTokenView(c.env)
-  return c.html(shell(c.env.BRAND, 'Mint agent token', agentTokenPageBody(view)))
+  return c.html(shell(c.env, 'Mint agent token', agentTokenPageBody(view)))
 })
 
 // POST /admin/agent-token/mint
@@ -1088,7 +1123,7 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
     return c.html(
-      shell(c.env.BRAND, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
+      shell(c.env, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
       403,
     )
   }
@@ -1103,21 +1138,21 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   if (!agentIdRaw) {
     const view = await loadAgentTokenView(c.env)
     return c.html(
-      shell(c.env.BRAND, 'Mint agent token', agentTokenPageBody(view, 'Pick an agent.')),
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Pick an agent.')),
       400,
     )
   }
   if (labelRaw.length > 64) {
     const view = await loadAgentTokenView(c.env)
     return c.html(
-      shell(c.env.BRAND, 'Mint agent token', agentTokenPageBody(view, 'Label too long (max 64 chars).')),
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Label too long (max 64 chars).')),
       400,
     )
   }
   if (!isAgentTokenCapability(capabilityRaw)) {
     const view = await loadAgentTokenView(c.env)
     return c.html(
-      shell(c.env.BRAND, 'Mint agent token', agentTokenPageBody(view, 'Grant must be observer or member.')),
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Grant must be observer or member.')),
       400,
     )
   }
@@ -1132,7 +1167,7 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
       : 'Agent not found in this pot.'
     const status = agentResult.reason === 'ambiguous' ? 409 : 404
     return c.html(
-      shell(c.env.BRAND, 'Mint agent token', agentTokenPageBody(view, msg)),
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, msg)),
       status,
     )
   }
@@ -1153,7 +1188,7 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   // dashboard-wide middleware above.
   return c.html(
     shell(
-      c.env.BRAND,
+      c.env,
       'Agent token minted',
       agentTokenMintedBody(
         agent.name,
@@ -1186,12 +1221,12 @@ dashboardApp.get('/admin/connectors', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
     return c.html(
-      shell(c.env.BRAND, 'Connectors', errorBody('Connector management requires owner or admin.')),
+      shell(c.env, 'Connectors', errorBody('Connector management requires owner or admin.')),
       403,
     )
   }
   const rows = await listConnectors(c.env)
-  return c.html(shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows)))
+  return c.html(shell(c.env, 'Connector Credentials', connectorsPageBody(rows)))
 })
 
 // POST /admin/connectors — add a new connector (encrypt + store)
@@ -1199,7 +1234,7 @@ dashboardApp.post('/admin/connectors', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
     return c.html(
-      shell(c.env.BRAND, 'Connectors', errorBody('Adding a connector requires owner or admin.')),
+      shell(c.env, 'Connectors', errorBody('Adding a connector requires owner or admin.')),
       403,
     )
   }
@@ -1219,14 +1254,14 @@ dashboardApp.post('/admin/connectors', async (c) => {
   if (!isConnectorType(type)) {
     const rows = await listConnectors(c.env)
     return c.html(
-      shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows, 'Unknown connector type.')),
+      shell(c.env, 'Connector Credentials', connectorsPageBody(rows, 'Unknown connector type.')),
       400,
     )
   }
   if (!isConnectorScopeType(scopeType)) {
     const rows = await listConnectors(c.env)
     return c.html(
-      shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows, 'Invalid scope type.')),
+      shell(c.env, 'Connector Credentials', connectorsPageBody(rows, 'Invalid scope type.')),
       400,
     )
   }
@@ -1251,7 +1286,7 @@ dashboardApp.post('/admin/connectors', async (c) => {
       result.error === 'agent_not_found'   ? 'Agent not found in this pot.' :
       `Add failed: ${result.error}`
     return c.html(
-      shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows, msg)),
+      shell(c.env, 'Connector Credentials', connectorsPageBody(rows, msg)),
       400,
     )
   }
@@ -1260,7 +1295,7 @@ dashboardApp.post('/admin/connectors', async (c) => {
   // Cache-Control: no-store is set by the dashboard-wide middleware.
   return c.html(
     shell(
-      c.env.BRAND,
+      c.env,
       'Connector added',
       connectorAddedBody(result.connector.type, result.connector.label, result.connector.hint, result.connector.id),
     ),
@@ -1281,7 +1316,7 @@ dashboardApp.post('/admin/connectors/:id/rotate', async (c) => {
   if (!newSecret.trim()) {
     const rows = await listConnectors(c.env)
     return c.html(
-      shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows, 'New secret cannot be empty.')),
+      shell(c.env, 'Connector Credentials', connectorsPageBody(rows, 'New secret cannot be empty.')),
       400,
     )
   }
@@ -1294,14 +1329,14 @@ dashboardApp.post('/admin/connectors/:id/rotate', async (c) => {
       result.error === 'already_revoked' ? 'Cannot rotate a revoked connector.' :
       `Rotate failed: ${result.error}`
     return c.html(
-      shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows, msg)),
+      shell(c.env, 'Connector Credentials', connectorsPageBody(rows, msg)),
       result.error === 'not_found' ? 404 : 400,
     )
   }
 
   return c.html(
     shell(
-      c.env.BRAND,
+      c.env,
       'Secret rotated',
       connectorRotatedBody(result.connector.type, result.connector.label, result.connector.hint, result.connector.id),
     ),
@@ -1320,7 +1355,7 @@ dashboardApp.post('/admin/connectors/:id/revoke', async (c) => {
   if (!revoked) {
     const rows = await listConnectors(c.env)
     return c.html(
-      shell(c.env.BRAND, 'Connector Credentials', connectorsPageBody(rows, 'Connector not found or already revoked.')),
+      shell(c.env, 'Connector Credentials', connectorsPageBody(rows, 'Connector not found or already revoked.')),
       404,
     )
   }
@@ -1347,13 +1382,13 @@ dashboardApp.get('/admin/github/status', async (c) => {
 dashboardApp.get('/admin/github', async (c) => {
   const auth = c.get('auth')
   if (!isAdmin(auth)) {
-    return c.html(shell(c.env.BRAND, 'GitHub', errorBody('GitHub management requires owner or admin.')), 403)
+    return c.html(shell(c.env, 'GitHub', errorBody('GitHub management requires owner or admin.')), 403)
   }
   const snapshot = await githubCapabilitySnapshot(c.env)
   const installationId = await getInstallationId(c.env)
   return c.html(
     shell(
-      c.env.BRAND,
+      c.env,
       'GitHub',
       githubStatusBody({ ...snapshot, connected: installationId !== null, installationId }),
     ),
@@ -1497,13 +1532,13 @@ dashboardApp.get('/connect/github/callback', async (c) => {
   // CSRF: state must match a stored, tenant-bound token. Single-use (deleted after read).
   const boundTenant = state ? await c.env.SESSIONS.get(`ghstate:${state}`) : null
   if (!boundTenant || boundTenant !== c.env.TENANT_SLUG) {
-    return c.html(shell(c.env.BRAND, 'Connect GitHub', errorBody('Invalid or expired connect request.')), 400)
+    return c.html(shell(c.env, 'Connect GitHub', errorBody('Invalid or expired connect request.')), 400)
   }
   await c.env.SESSIONS.delete(`ghstate:${state}`)
 
   const parsed = parseInstallCallback(url)
   if (!parsed) {
-    return c.html(shell(c.env.BRAND, 'Connect GitHub', errorBody('GitHub did not return a valid installation.')), 400)
+    return c.html(shell(c.env, 'Connect GitHub', errorBody('GitHub did not return a valid installation.')), 400)
   }
   await storeInstallation(c.env, parsed.installationId, url.searchParams.get('account_login'))
   return c.redirect('/admin/github/status')
@@ -1527,7 +1562,7 @@ dashboardApp.get('/members', async (c) => {
     loadLiveTokens(c.env),
   ])
   return c.html(
-    shell(c.env.BRAND, 'Access Tokens', membersPageBody(members, channels, tokens, canManage, auth)),
+    shell(c.env, 'Access Tokens', membersPageBody(members, channels, tokens, canManage, auth)),
   )
 })
 
@@ -1536,31 +1571,31 @@ dashboardApp.get('/members', async (c) => {
 dashboardApp.post('/members/:id/tokens', async (c) => {
   const auth = c.get('auth')
   if (!(await canOnOrg(c.env, auth, 'admin'))) {
-    return c.html(shell(c.env.BRAND, 'Access Tokens', errorBody('Provisioning a token requires admin.')), 403)
+    return c.html(shell(c.env, 'Access Tokens', errorBody('Provisioning a token requires admin.')), 403)
   }
   const memberId = c.req.param('id')
   const member = await c.env.DB.prepare('SELECT id, display_name FROM members WHERE id = ? LIMIT 1')
     .bind(memberId)
     .first<{ id: string; display_name: string }>()
   if (!member) {
-    return c.html(shell(c.env.BRAND, 'Access Tokens', errorBody('Person not found.')), 404)
+    return c.html(shell(c.env, 'Access Tokens', errorBody('Person not found.')), 404)
   }
 
   const form = await c.req.parseBody()
   const labelRaw = typeof form.label === 'string' ? form.label : ''
   if (labelRaw.length > 64) {
-    return c.html(shell(c.env.BRAND, 'Access Tokens', errorBody('Label too long (max 64 chars).')), 400)
+    return c.html(shell(c.env, 'Access Tokens', errorBody('Label too long (max 64 chars).')), 400)
   }
   const channelRaw = typeof form.channel === 'string' ? form.channel : 'workspace'
   if (!isChannel(channelRaw)) {
-    return c.html(shell(c.env.BRAND, 'Access Tokens', errorBody('Invalid channel.')), 400)
+    return c.html(shell(c.env, 'Access Tokens', errorBody('Invalid channel.')), 400)
   }
 
   // Shared mint path — raw returned once, only the hash persisted.
   const minted = await mintMemberToken(c.env, memberId, labelRaw, channelRaw)
   const origin = new URL(c.req.url).origin
   return c.html(
-    shell(c.env.BRAND, 'Token provisioned', tokenShowOnceBody(c.env.TENANT_SLUG, origin, member.display_name, minted)),
+    shell(c.env, 'Token provisioned', tokenShowOnceBody(c.env.TENANT_SLUG, origin, member.display_name, minted)),
   )
 })
 
@@ -1568,7 +1603,7 @@ dashboardApp.post('/members/:id/tokens', async (c) => {
 dashboardApp.post('/members/:id/tokens/:tid/revoke', async (c) => {
   const auth = c.get('auth')
   if (!(await canOnOrg(c.env, auth, 'admin'))) {
-    return c.html(shell(c.env.BRAND, 'Access Tokens', errorBody('Revoking a token requires admin.')), 403)
+    return c.html(shell(c.env, 'Access Tokens', errorBody('Revoking a token requires admin.')), 403)
   }
   await revokeMemberToken(c.env, c.req.param('id'), c.req.param('tid'))
   // Idempotent — whether or not a live token matched, land back on the roster.
@@ -1583,13 +1618,13 @@ dashboardApp.post('/members/:id/tokens/:tid/revoke', async (c) => {
 dashboardApp.post('/departments', async (c) => {
   const auth = c.get('auth')
   if (!(await canOnOrg(c.env, auth, 'admin'))) {
-    return c.html(shell(c.env.BRAND, 'Overview', errorBody('Creating a department requires admin.')), 403)
+    return c.html(shell(c.env, 'Overview', errorBody('Creating a department requires admin.')), 403)
   }
   const form = await c.req.parseBody()
   const result = await createDepartment(c.env, { slug: form.slug, name: form.name })
   if (!result.ok) {
     return c.html(
-      shell(c.env.BRAND, 'Overview', errorBody(`Could not create department: ${result.error}.`)),
+      shell(c.env, 'Overview', errorBody(`Could not create department: ${result.error}.`)),
       result.error === 'slug_taken' ? 409 : 400,
     )
   }
@@ -1602,15 +1637,15 @@ dashboardApp.post('/squads', async (c) => {
   const form = await c.req.parseBody()
   const departmentId = typeof form.department_id === 'string' ? form.department_id : ''
   if (!departmentId) {
-    return c.html(shell(c.env.BRAND, 'Overview', errorBody('Pick a department for the squad.')), 400)
+    return c.html(shell(c.env, 'Overview', errorBody('Pick a department for the squad.')), 400)
   }
   const dept = await getById<Department>(c.env, 'departments', departmentId)
   if (!dept) {
-    return c.html(shell(c.env.BRAND, 'Overview', errorBody('Department not found.')), 404)
+    return c.html(shell(c.env, 'Overview', errorBody('Department not found.')), 404)
   }
   if (!(await canOnDepartment(c.env, auth, departmentId))) {
     return c.html(
-      shell(c.env.BRAND, 'Overview', errorBody('Creating a squad requires admin on that department.')),
+      shell(c.env, 'Overview', errorBody('Creating a squad requires admin on that department.')),
       403,
     )
   }
@@ -1621,7 +1656,7 @@ dashboardApp.post('/squads', async (c) => {
   })
   if (!result.ok) {
     return c.html(
-      shell(c.env.BRAND, 'Overview', errorBody(`Could not create squad: ${result.error}.`)),
+      shell(c.env, 'Overview', errorBody(`Could not create squad: ${result.error}.`)),
       result.error === 'slug_taken' ? 409 : 400,
     )
   }
@@ -1637,7 +1672,7 @@ dashboardApp.post('/squads/packs/:key', async (c) => {
   const auth = c.get('auth')
   const key = c.req.param('key')
   if (!SQUAD_PACKS.some((p) => p.key === key)) {
-    return c.html(shell(c.env.BRAND, 'Overview', errorBody('Unknown squad pack.')), 404)
+    return c.html(shell(c.env, 'Overview', errorBody('Unknown squad pack.')), 404)
   }
 
   const form = await c.req.parseBody()
@@ -1650,15 +1685,15 @@ dashboardApp.post('/squads/packs/:key', async (c) => {
     departmentId = first?.id ?? ''
   }
   if (!departmentId) {
-    return c.html(shell(c.env.BRAND, 'Overview', errorBody('Create a department first.')), 400)
+    return c.html(shell(c.env, 'Overview', errorBody('Create a department first.')), 400)
   }
   const dept = await getById<Department>(c.env, 'departments', departmentId)
   if (!dept) {
-    return c.html(shell(c.env.BRAND, 'Overview', errorBody('Department not found.')), 404)
+    return c.html(shell(c.env, 'Overview', errorBody('Department not found.')), 404)
   }
   if (!(await canOnDepartment(c.env, auth, departmentId))) {
     return c.html(
-      shell(c.env.BRAND, 'Overview', errorBody('Seeding a squad pack requires admin on that department.')),
+      shell(c.env, 'Overview', errorBody('Seeding a squad pack requires admin on that department.')),
       403,
     )
   }
@@ -1666,7 +1701,7 @@ dashboardApp.post('/squads/packs/:key', async (c) => {
   const result = await seedSquadPack(c.env, departmentId, key)
   if (!result.ok) {
     return c.html(
-      shell(c.env.BRAND, 'Overview', errorBody(`Could not seed pack: ${result.error}.`)),
+      shell(c.env, 'Overview', errorBody(`Could not seed pack: ${result.error}.`)),
       result.error === 'slug_taken' ? 409 : 400,
     )
   }
@@ -1680,11 +1715,11 @@ dashboardApp.post('/squads/:id/agents', async (c) => {
   const squadId = c.req.param('id')
   const squad = await getById<Squad>(c.env, 'squads', squadId)
   if (!squad) {
-    return c.html(shell(c.env.BRAND, 'Squad', errorBody('Squad not found.')), 404)
+    return c.html(shell(c.env, 'Squad', errorBody('Squad not found.')), 404)
   }
   if (!(await canOnSquad(c.env, auth, squadId))) {
     return c.html(
-      shell(c.env.BRAND, `Squad · ${squad.name}`, errorBody('Adding an agent requires lead on this squad.')),
+      shell(c.env, `Squad · ${squad.name}`, errorBody('Adding an agent requires lead on this squad.')),
       403,
     )
   }
@@ -1698,7 +1733,7 @@ dashboardApp.post('/squads/:id/agents', async (c) => {
   if (!result.ok) {
     return c.html(
       shell(
-        c.env.BRAND,
+        c.env,
         `Squad · ${squad.name}`,
         errorBody(`Could not add agent: ${result.error}.`),
       ),
@@ -1978,6 +2013,17 @@ export function spendChipHtml(cost: { configured: boolean; todayUsdMicro: number
   </div>`
 }
 
+/** Where the sidebar's "Switch pot →" link sends a checked-in user (the
+ *  cross-tenant pot picker). Hardcoded to mumega's own console for every
+ *  forked pot until #de-mumega-ify: a customer's users would land on OUR
+ *  site. `env.CONSOLE_SWITCH_POT_URL` overrides it; unset ⇒ this default,
+ *  so mumega's own deploy is byte-identical. */
+export const DEFAULT_CONSOLE_SWITCH_POT_URL = 'https://mumega.com/dashboard/pots'
+
+export function resolveSwitchPotUrl(env: Env): string {
+  return env.CONSOLE_SWITCH_POT_URL || DEFAULT_CONSOLE_SWITCH_POT_URL
+}
+
 /** Outer HTML document with inline CSS (no framework, no build step).
  *
  * Theme: light by default, dark toggled via [data-theme="dark"] on <html>.
@@ -1986,11 +2032,13 @@ export function spendChipHtml(cost: { configured: boolean; todayUsdMicro: number
  * Sidebar: Stripe-style with collapsible sections that remember open/closed state.
  */
 function shell(
-  brand: string,
+  env: Env,
   title: string,
   body: HtmlEscapedString | Promise<HtmlEscapedString>,
   header: HeaderChips = {},
 ) {
+  const brand = env.BRAND
+  const switchPotUrl = resolveSwitchPotUrl(env)
   return html`<!doctype html>
 <html lang="en">
   <head>
@@ -2805,7 +2853,7 @@ function shell(
             <div class="switcher-menu">
               <div class="switcher-menu-label">YOUR POTS</div>
               <div class="switcher-whoami" id="switcher-whoami">Checked in</div>
-              <a href="https://mumega.com/dashboard/pots">Switch pot →</a>
+              <a href="${switchPotUrl}">Switch pot →</a>
               <a href="/auth/logout" class="switcher-checkout">Check out ↩</a>
             </div>
           </details>
@@ -2868,6 +2916,12 @@ function shell(
           <a class="nav-link" href="/fleet">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" width="17" height="17"><circle cx="10" cy="10" r="6.2"/><circle cx="10" cy="10" r="1.7" fill="currentColor" stroke="none"/></svg>
             <span class="nav-label">Fleet</span>
+          </a>
+
+          <!-- Radar (fleet + squad awareness map — #21/#23) -->
+          <a class="nav-link" href="/radar">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="10" cy="10" r="7"/><circle cx="10" cy="10" r="1.4" fill="currentColor" stroke="none"/><path d="M10 3v2M10 15v2M3 10h2M15 10h2"/></svg>
+            <span class="nav-label">Radar</span>
           </a>
 
           <!-- Health (operator console) -->

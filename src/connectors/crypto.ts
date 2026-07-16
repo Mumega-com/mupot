@@ -38,6 +38,11 @@ export type ConnectorType =
   | 'google_ads'
   | 'facebook_ads'
   | 'crm'
+  // Coordination-port / task-manager sources (2026-07-16): mirrors the CMS-
+  // adapter uniform-port principle applied to task/issue managers — Linear is
+  // the first adapter, GitHub Projects v2 (github-projects.ts) is a parallel,
+  // pre-existing coordination surface not yet unified under this same type.
+  | 'linear'
   | 'custom'
 export type ConnectorScopeType = 'squad' | 'agent' | 'pot'
 
@@ -54,6 +59,7 @@ const VALID_TYPES: readonly ConnectorType[] = [
   'google_ads',
   'facebook_ads',
   'crm',
+  'linear',
   'custom',
 ]
 const VALID_SCOPE_TYPES: readonly ConnectorScopeType[] = ['squad', 'agent', 'pot']
