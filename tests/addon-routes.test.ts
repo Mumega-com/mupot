@@ -108,6 +108,69 @@ describe('addon lifecycle routes', () => {
     await expect(res.json()).resolves.toEqual({ error: 'forbidden', detail: 'owner/admin only' })
   })
 
+  it('rejects a member business-state evidence read before resolving the addon', async () => {
+    const res = await addonsApp.fetch(request('/missing-addon/evidence', 'GET'), envForRole(harness, 'member'))
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toEqual({ error: 'forbidden', detail: 'owner/admin only' })
+  })
+
+  it('returns on-demand type-preserving business evidence without rows or addon state', async () => {
+    const ownerEnv = envForRole(harness, 'owner')
+    harness.sqlite.exec(`
+      CREATE TABLE evidence_business_values (id TEXT PRIMARY KEY, value);
+      INSERT INTO evidence_business_values (id, value) VALUES ('sensitive-business-row', 1);
+      CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT);
+      INSERT INTO d1_migrations (id, name) VALUES (1, 'initial-migration');
+    `)
+
+    const before = await addonsApp.fetch(request('/fixture-addon/evidence', 'GET'), ownerEnv)
+    expect(before.status).toBe(200)
+    const beforeBody = await before.json() as Record<string, unknown>
+    expect(Object.keys(beforeBody).sort()).toEqual([
+      'businessStateSha256',
+      'installedVersion',
+      'manifestSha256',
+      'publisher',
+      'trustClass',
+    ])
+    expect(beforeBody.businessStateSha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(beforeBody.manifestSha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(beforeBody).toMatchObject({
+      installedVersion: '1.0.0',
+      publisher: 'mumega',
+      trustClass: 'native_reviewed',
+    })
+    expect(JSON.stringify(beforeBody)).not.toContain('sensitive-business-row')
+    expect(JSON.stringify(beforeBody)).not.toContain('evidence_business_values')
+
+    expect((await addonsApp.fetch(request('/fixture-addon/install', 'POST'), ownerEnv)).status).toBe(201)
+    harness.sqlite.prepare(`
+      UPDATE d1_migrations SET name = 'ignored-migration-change' WHERE id = 1
+    `).run()
+    const afterInstall = await addonsApp.fetch(request('/fixture-addon/evidence', 'GET'), ownerEnv)
+    const afterInstallBody = await afterInstall.json() as Record<string, unknown>
+    expect(afterInstallBody.businessStateSha256).toBe(beforeBody.businessStateSha256)
+
+    harness.sqlite.prepare(`
+      UPDATE evidence_business_values SET value = CAST(value AS TEXT) WHERE id = 'sensitive-business-row'
+    `).run()
+    const afterTypeChange = await addonsApp.fetch(request('/fixture-addon/evidence', 'GET'), ownerEnv)
+    const afterTypeChangeBody = await afterTypeChange.json() as Record<string, unknown>
+    expect(afterTypeChangeBody.businessStateSha256).not.toBe(beforeBody.businessStateSha256)
+    expect(JSON.stringify(afterTypeChangeBody)).not.toContain('sensitive-business-row')
+    expect(afterTypeChangeBody).not.toHaveProperty('tables')
+    expect(afterTypeChangeBody).not.toHaveProperty('rows')
+    expect(afterTypeChangeBody).not.toHaveProperty('rowCount')
+  })
+
+  it('maps unknown addon business-state evidence to not found', async () => {
+    const res = await addonsApp.fetch(request('/missing-addon/evidence', 'GET'), envForRole(harness, 'owner'))
+
+    expect(res.status).toBe(404)
+    await expect(res.json()).resolves.toEqual({ error: 'addon_not_registered' })
+  })
+
   it('returns only a digest of complete department state and changes it on a hidden-column mutation', async () => {
     const ownerEnv = envForRole(harness, 'owner')
     harness.sqlite.prepare(`

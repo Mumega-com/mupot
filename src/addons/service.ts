@@ -204,6 +204,20 @@ interface DepartmentStateRow {
   seed_receipt: string | null
 }
 
+interface BusinessTableRow {
+  name: string
+}
+
+interface BusinessColumnRow {
+  cid: number
+  name: string
+  type: string
+  notnull: number
+  dflt_value: string | null
+  pk: number
+  hidden: number
+}
+
 const INSTALLATION_COLUMNS = `
   id, tenant, addon_key, installed_version, publisher, trust_class,
   manifest_sha256, mupot_compatibility, state, latest_previous_state, installed_by,
@@ -1805,6 +1819,114 @@ export async function getDepartmentStateSha256(env: Env): Promise<string> {
   const digest = await crypto.subtle.digest(
     'SHA-256',
     new TextEncoder().encode(JSON.stringify(canonicalRows)),
+  )
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+const ADDON_INTERNAL_TABLES = new Set([
+  'addon_installations',
+  'addon_operations',
+  'addon_resource_ownership',
+  'addon_receipts',
+])
+
+function quotedSqlIdentifier(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`
+}
+
+function validBusinessColumn(value: unknown): value is BusinessColumnRow {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const column = value as Record<string, unknown>
+  return Number.isSafeInteger(column.cid)
+    && typeof column.name === 'string'
+    && column.name.length > 0
+    && typeof column.type === 'string'
+    && (column.notnull === 0 || column.notnull === 1)
+    && (column.dflt_value === null || typeof column.dflt_value === 'string')
+    && Number.isSafeInteger(column.pk)
+    && Number.isSafeInteger(column.hidden)
+}
+
+export async function getBusinessStateSha256(env: Env): Promise<string> {
+  const tableResult = await env.DB.prepare(`
+    SELECT name
+      FROM sqlite_schema
+     WHERE type = 'table'
+     ORDER BY name ASC
+  `).all<BusinessTableRow>()
+  const seenTables = new Set<string>()
+  const tables = (tableResult.results ?? []).filter((table) => {
+    if (typeof table.name !== 'string' || table.name.length === 0 || seenTables.has(table.name)) {
+      throw new Error('invalid business table registry')
+    }
+    seenTables.add(table.name)
+    return !table.name.startsWith('sqlite_')
+      && table.name !== 'd1_migrations'
+      && !ADDON_INTERNAL_TABLES.has(table.name)
+  })
+
+  const canonicalTables: unknown[] = []
+  for (const table of tables) {
+    const identifier = quotedSqlIdentifier(table.name)
+    const columnResult = await env.DB.prepare(`PRAGMA table_xinfo(${identifier})`)
+      .all<BusinessColumnRow>()
+    const columns = (columnResult.results ?? []).sort((left, right) => left.cid - right.cid)
+    if (columns.length === 0 || columns.some((column) => !validBusinessColumn(column))) {
+      throw new Error('invalid business table schema')
+    }
+    const columnNames = new Set<string>()
+    for (const column of columns) {
+      if (columnNames.has(column.name)) throw new Error('duplicate business table column')
+      columnNames.add(column.name)
+    }
+
+    const projections = columns.flatMap((column, index) => {
+      const columnIdentifier = quotedSqlIdentifier(column.name)
+      return [
+        `typeof(${columnIdentifier}) AS ${quotedSqlIdentifier(`__type_${index}`)}`,
+        `CASE typeof(${columnIdentifier})
+           WHEN 'null' THEN NULL
+           WHEN 'blob' THEN lower(hex(${columnIdentifier}))
+           WHEN 'real' THEN printf('%!.17g', ${columnIdentifier})
+           ELSE CAST(${columnIdentifier} AS TEXT)
+         END AS ${quotedSqlIdentifier(`__value_${index}`)}`,
+      ]
+    })
+    const rowResult = await env.DB.prepare(`SELECT ${projections.join(', ')} FROM ${identifier}`)
+      .all<Record<string, unknown>>()
+    const rows = (rowResult.results ?? []).map((row) => {
+      const values = columns.map((_, index) => {
+        const storageType = row[`__type_${index}`]
+        const value = row[`__value_${index}`]
+        if (
+          !['null', 'integer', 'real', 'text', 'blob'].includes(String(storageType))
+          || (storageType === 'null' ? value !== null : typeof value !== 'string')
+        ) {
+          throw new Error('invalid business table row')
+        }
+        return [storageType, value]
+      })
+      return JSON.stringify(values)
+    }).sort()
+
+    canonicalTables.push({
+      name: table.name,
+      columns: columns.map((column) => [
+        column.cid,
+        column.name,
+        column.type,
+        column.notnull,
+        column.dflt_value,
+        column.pk,
+        column.hidden,
+      ]),
+      rows,
+    })
+  }
+
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(JSON.stringify(canonicalTables)),
   )
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }

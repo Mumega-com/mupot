@@ -4,13 +4,14 @@ import { describe, expect, it } from 'vitest'
 import {
   ADDON_KEY,
   EXPECTED_TRANSITIONS,
-  FIXTURE_MANIFEST_SHA256,
   RECEIPT_TYPE,
   formatPlan,
   parseArgs,
   runLifecycleCheck,
   validateReceipt,
 } from '../scripts/addon-lifecycle-receipt.mjs'
+
+const TEST_MANIFEST_SHA256 = 'd'.repeat(64)
 
 function validReceipt() {
   return {
@@ -19,8 +20,17 @@ function validReceipt() {
     addon_key: ADDON_KEY,
     transitions: [...EXPECTED_TRANSITIONS],
     install_side_effect_count: 0,
-    manifest_sha256: FIXTURE_MANIFEST_SHA256,
+    manifest_sha256: TEST_MANIFEST_SHA256,
+    installed_version: '1.0.0',
+    publisher: 'mumega',
+    trust_class: 'native_reviewed',
+    actor_id: 'owner-actor',
     secrets_present: false,
+    receipt_ids: [...FIXTURE_RECEIPT_IDS],
+    receipt_sequences: [1, 2, 3, 4, 5, 6, 7],
+    receipt_created_at: [1, 2, 3, 4, 5, 6, 7].map((second) => (
+      `2026-01-01T00:00:0${second}.000Z`
+    )),
   }
 }
 
@@ -55,9 +65,19 @@ function createLifecycleFetch(options: {
   catalogState?: string
   beforeDepartmentStateSha256?: unknown
   afterDepartmentStateSha256?: unknown
+  beforeBusinessStateSha256?: unknown
+  afterBusinessStateSha256?: unknown
+  manifestSha256?: string
+  receiptMutator?: (receipt: Record<string, unknown>, index: number) => Record<string, unknown>
 } = {}) {
   const receipts: Array<Record<string, unknown>> = []
-  const calls: Array<{ path: string; method: string; authorization: string | null; cookie: string | null }> = []
+  const calls: Array<{
+    path: string
+    method: string
+    authorization: string | null
+    cookie: string | null
+    origin: string | null
+  }> = []
   const beforeDepartments = options.beforeDepartments ?? [{ id: 'existing', slug: 'existing' }]
   const afterDepartments = options.afterDepartments ?? beforeDepartments
   let transitionIndex = 0
@@ -73,6 +93,7 @@ function createLifecycleFetch(options: {
       method,
       authorization: headers.get('authorization'),
       cookie: headers.get('cookie'),
+      origin: headers.get('origin'),
     })
 
     if (url.pathname === '/api/org/departments') {
@@ -81,13 +102,30 @@ function createLifecycleFetch(options: {
     if (url.pathname === '/api/addons') {
       return Response.json({ addons: [{ key: ADDON_KEY, state: options.catalogState ?? 'archived' }] })
     }
+    if (url.pathname === '/api/addons/fixture-addon/evidence') {
+      return Response.json({
+        businessStateSha256: transitionIndex === 0
+          ? options.beforeBusinessStateSha256 ?? options.beforeDepartmentStateSha256 ?? DEPARTMENT_STATE_SHA256
+          : options.afterBusinessStateSha256
+            ?? options.afterDepartmentStateSha256
+            ?? options.beforeBusinessStateSha256
+            ?? options.beforeDepartmentStateSha256
+            ?? (JSON.stringify(afterDepartments) === JSON.stringify(beforeDepartments)
+              ? DEPARTMENT_STATE_SHA256
+              : 'b'.repeat(64)),
+        manifestSha256: options.manifestSha256 ?? TEST_MANIFEST_SHA256,
+        installedVersion: '1.0.0',
+        publisher: 'mumega',
+        trustClass: 'native_reviewed',
+      })
+    }
     if (url.pathname === '/api/addons/fixture-addon/receipts') {
       const listed = archivedReactivationSeen
         ? options.finalReceipts ?? [...receipts].reverse()
         : [...receipts].reverse()
       return Response.json({
         receipts: listed,
-        ownershipClaimCount: options.ownershipClaimCount ?? 0,
+        ownershipClaimCount: transitionIndex === 0 ? 0 : options.ownershipClaimCount ?? 0,
         departmentStateSha256: transitionIndex === 0
           ? options.beforeDepartmentStateSha256 ?? DEPARTMENT_STATE_SHA256
           : options.afterDepartmentStateSha256 ?? options.beforeDepartmentStateSha256 ?? DEPARTMENT_STATE_SHA256,
@@ -102,15 +140,23 @@ function createLifecycleFetch(options: {
       const expected = LIFECYCLE_TRANSITIONS[transitionIndex]
       if (!expected || action !== expected[0]) return Response.json({ error: 'unexpected_test_action' }, { status: 500 })
       transitionIndex += 1
-      receipts.push({
+      const receipt = {
         sequence: transitionIndex,
         id: options.receiptIds?.[transitionIndex - 1] ?? FIXTURE_RECEIPT_IDS[transitionIndex - 1],
         action,
+        previousState: [null, 'installed', 'configured', 'active', 'disabled', 'active', 'disabled'][transitionIndex - 1],
         nextState: expected[1],
         addonKey: ADDON_KEY,
+        installedVersion: '1.0.0',
+        publisher: 'mumega',
+        trustClass: 'native_reviewed',
+        actorId: 'owner-actor',
         outcome: 'pass',
+        errorCode: null,
+        createdAt: `2026-01-01T00:00:0${transitionIndex}.000Z`,
         ...options.receiptExtra,
-      })
+      }
+      receipts.push(options.receiptMutator?.(receipt, transitionIndex - 1) ?? receipt)
       return Response.json({ ok: true, key: ADDON_KEY, state: expected[1] }, { status: expected[2] })
     }
     return Response.json({ error: 'not_found' }, { status: 404 })
@@ -158,11 +204,11 @@ describe('addon lifecycle receipt checker', () => {
     })
 
     expect(plan).toContain('Mupot native addon lifecycle evidence plan')
-    expect(plan).toContain('GET /api/org/departments')
+    expect(plan).toContain('GET /api/addons/fixture-addon/evidence')
     expect(plan).toContain('POST /api/addons/fixture-addon/install')
     expect(plan).toContain('POST /api/addons/fixture-addon/archive')
     expect(plan).toContain('POST /api/addons/fixture-addon/activate -> 409 after archive')
-    expect(plan).toContain('departmentStateSha256')
+    expect(plan).toContain('business-state digest')
     expect(plan).toContain('--token-env MUPOT_OWNER_BEARER')
     expect(plan).not.toContain('Bearer ')
   })
@@ -290,6 +336,66 @@ describe('addon lifecycle receipt checker', () => {
     }))
   })
 
+  it('uses the deployed evidence digest instead of a checker constant', async () => {
+    const deployedDigest = 'c'.repeat(64)
+    const { fetch } = createLifecycleFetch({ manifestSha256: deployedDigest })
+    const receipt = await runLifecycleCheck(
+      { baseUrl: 'https://pot.test', tokenEnv: 'MUPOT_OWNER_BEARER' },
+      { fetch, env: { MUPOT_OWNER_BEARER: 'owner-bearer-value' } },
+    )
+
+    expect(receipt).toMatchObject({ status: 'pass', manifest_sha256: deployedDigest })
+  })
+
+  it('fails when install mutates non-department business state', async () => {
+    const { fetch } = createLifecycleFetch({
+      beforeBusinessStateSha256: 'a'.repeat(64),
+      afterBusinessStateSha256: 'b'.repeat(64),
+    })
+    const receipt = await runLifecycleCheck(
+      { baseUrl: 'https://pot.test', tokenEnv: 'MUPOT_OWNER_BEARER' },
+      { fetch, env: { MUPOT_OWNER_BEARER: 'owner-bearer-value' } },
+    )
+
+    expect(receipt).toEqual(expect.objectContaining({
+      status: 'fail',
+      install_side_effect_count: 1,
+      failure_codes: expect.arrayContaining(['install_side_effect_count_nonzero']),
+    }))
+  })
+
+  it.each([
+    ['prior edge', (receipt: Record<string, unknown>, index: number) => (
+      index === 1 ? { ...receipt, previousState: 'disabled' } : receipt
+    )],
+    ['sequence', (receipt: Record<string, unknown>, index: number) => (
+      index === 1 ? { ...receipt, sequence: 1 } : receipt
+    )],
+    ['actor', (receipt: Record<string, unknown>, index: number) => (
+      index === 1 ? { ...receipt, actorId: 'different-actor' } : receipt
+    )],
+    ['installed version', (receipt: Record<string, unknown>, index: number) => (
+      index === 1 ? { ...receipt, installedVersion: '9.9.9' } : receipt
+    )],
+    ['publisher', (receipt: Record<string, unknown>, index: number) => (
+      index === 1 ? { ...receipt, publisher: 'other-publisher' } : receipt
+    )],
+    ['trust class', (receipt: Record<string, unknown>, index: number) => (
+      index === 1 ? { ...receipt, trustClass: 'external_isolated' } : receipt
+    )],
+    ['chronology', (receipt: Record<string, unknown>, index: number) => (
+      index === 1 ? { ...receipt, createdAt: '2025-01-01T00:00:00.000Z' } : receipt
+    )],
+  ])('fails closed on inconsistent receipt %s', async (_field, receiptMutator) => {
+    const { fetch } = createLifecycleFetch({ receiptMutator })
+    const receipt = await runLifecycleCheck(
+      { baseUrl: 'https://pot.test', tokenEnv: 'MUPOT_OWNER_BEARER' },
+      { fetch, env: { MUPOT_OWNER_BEARER: 'owner-bearer-value' } },
+    )
+
+    expect(receipt.status).toBe('fail')
+  })
+
   it.each([
     ['receipt id', (bearer: string) => ({ receiptIds: [bearer, ...FIXTURE_RECEIPT_IDS.slice(1)] })],
     ['innocuous receipt field', (bearer: string) => ({ receiptExtra: { observed: bearer } })],
@@ -357,13 +463,14 @@ describe('addon lifecycle receipt checker', () => {
       { step: 'archived_reactivation', status: 409 },
     ]))
     expect(calls.map(({ path, method }) => ({ path, method }))).toEqual(expect.arrayContaining([
-      { path: '/api/org/departments', method: 'GET' },
+      { path: '/api/addons/fixture-addon/evidence', method: 'GET' },
       { path: '/api/addons/fixture-addon/install', method: 'POST' },
       { path: '/api/addons/fixture-addon/receipts', method: 'GET' },
       { path: '/api/addons', method: 'GET' },
     ]))
     expect(calls.every((call) => call.authorization === `Bearer ${bearer}`)).toBe(true)
     expect(calls.every((call) => call.cookie === `mupot_session=${encodeURIComponent(bearer)}`)).toBe(true)
+    expect(calls.every((call) => call.origin === 'https://pot.test')).toBe(true)
     expect(JSON.stringify(receipt)).not.toContain(bearer)
     expect(validateReceipt(receipt)).toEqual({ ok: true, errors: [] })
   })

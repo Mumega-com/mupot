@@ -12,6 +12,7 @@ import {
   configureAddon,
   disableAddon,
   getAddonReceipts,
+  getBusinessStateSha256,
   getDepartmentStateSha256,
   installAddon,
   listAddonInstallations,
@@ -178,6 +179,24 @@ addonsApp.post('/:key/configure', (c) => mutate(c, 'configure'))
 addonsApp.post('/:key/activate', (c) => mutate(c, 'activate'))
 addonsApp.post('/:key/disable', (c) => mutate(c, 'disable'))
 addonsApp.post('/:key/archive', (c) => mutate(c, 'archive'))
+
+addonsApp.get('/:key/evidence', async (c) => {
+  if (!isAdminPlus(c.get('auth'))) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  const entry = getRegisteredAddon(c.req.param('key'))
+  if (!entry) return c.json({ error: 'addon_not_registered' }, 404)
+
+  try {
+    return c.json({
+      businessStateSha256: await getBusinessStateSha256(c.env),
+      manifestSha256: entry.manifestSha256,
+      installedVersion: entry.manifest.version,
+      publisher: entry.manifest.publisher,
+      trustClass: entry.manifest.trustClass,
+    })
+  } catch {
+    return c.json({ error: 'evidence_unavailable' }, 500)
+  }
+})
 
 addonsApp.get('/:key/receipts', async (c) => {
   if (!isAdminPlus(c.get('auth'))) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)

@@ -14,19 +14,19 @@ export const EXPECTED_TRANSITIONS = Object.freeze([
   'disabled',
   'archived',
 ])
-export const FIXTURE_MANIFEST_SHA256 = 'daad3a1ced50ec6789d788b7112fbb4de4cb6d20fc1eee11f366de4ef8c6598a'
 
 const LIFECYCLE = Object.freeze([
-  { action: 'install', state: 'installed', status: 201 },
-  { action: 'configure', state: 'configured', status: 200 },
-  { action: 'activate', state: 'active', status: 200 },
-  { action: 'disable', state: 'disabled', status: 200 },
-  { action: 'activate', state: 'active', status: 200 },
-  { action: 'disable', state: 'disabled', status: 200 },
-  { action: 'archive', state: 'archived', status: 200 },
+  { action: 'install', previousState: null, state: 'installed', status: 201 },
+  { action: 'configure', previousState: 'installed', state: 'configured', status: 200 },
+  { action: 'activate', previousState: 'configured', state: 'active', status: 200 },
+  { action: 'disable', previousState: 'active', state: 'disabled', status: 200 },
+  { action: 'activate', previousState: 'disabled', state: 'active', status: 200 },
+  { action: 'disable', previousState: 'active', state: 'disabled', status: 200 },
+  { action: 'archive', previousState: 'disabled', state: 'archived', status: 200 },
 ])
 
 const SENSITIVE_KEY_RE = /authorization|token|secret|password/i
+const SHA256_RE = /^[a-f0-9]{64}$/
 
 function stripTrailingSlash(value) {
   return String(value || '').replace(/\/+$/, '')
@@ -100,19 +100,15 @@ export function formatPlan(opts = {}) {
     '',
     'This mode performs no writes. Run the following check against a fresh fixture-addon lifecycle.',
     `1. Read the bearer only from environment variable ${tokenEnv}; never print it.`,
-    '2. GET /api/addons/fixture-addon/receipts and record a valid departmentStateSha256, then GET /api/org/departments and record its public records.',
-    '3. POST /api/addons/fixture-addon/install -> 201.',
-    '4. GET /api/org/departments and require no added, deleted, or mutated public department records.',
-    '5. GET /api/addons/fixture-addon/receipts and require departmentStateSha256 is unchanged and ownershipClaimCount is exactly zero before recording the install receipt ID.',
-    '6. POST /api/addons/fixture-addon/configure -> 200; record its receipt ID.',
-    '7. POST /api/addons/fixture-addon/activate -> 200; record its receipt ID.',
-    '8. POST /api/addons/fixture-addon/disable -> 200; record its receipt ID.',
-    '9. POST /api/addons/fixture-addon/activate -> 200; record its receipt ID.',
-    '10. POST /api/addons/fixture-addon/disable -> 200; record its receipt ID.',
-    '11. POST /api/addons/fixture-addon/archive -> 200; record its receipt ID.',
-    '12. POST /api/addons/fixture-addon/activate -> 409 after archive.',
-    '13. GET /api/addons and require fixture-addon remains archived; re-read receipts and require the exact seven validated lifecycle receipts.',
-    '14. Emit one redacted mupot-addon-lifecycle/v1 JSON receipt.',
+    '2. GET /api/addons/fixture-addon/evidence and record the deployed manifest plus full business-state digest.',
+    '3. GET /api/addons/fixture-addon/receipts and require empty fresh-lifecycle evidence with zero ownership claims.',
+    '4. POST /api/addons/fixture-addon/install -> 201.',
+    '5. Re-read evidence and require the business-state digest is unchanged; require ownershipClaimCount is zero.',
+    '6. Validate the install receipt identity, exact state edge, sequence, actor, ID, and chronology.',
+    '7. POST configure, activate, disable, activate, disable, then POST /api/addons/fixture-addon/archive; validate each exact receipt edge.',
+    '8. POST /api/addons/fixture-addon/activate -> 409 after archive.',
+    '9. Require fixture-addon remains archived and the final seven receipts exactly match the observed journal.',
+    '10. Emit one redacted mupot-addon-lifecycle/v1 JSON receipt.',
     '',
     `node scripts/addon-lifecycle-receipt.mjs --check --base-url ${shellQuote(baseUrl)} --token-env ${shellQuote(tokenEnv)}`,
   ]
@@ -142,54 +138,8 @@ function hasCredentialValue(value, credential) {
   return Object.values(value).some((entry) => hasCredentialValue(entry, credential))
 }
 
-function normalizeJson(value) {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
-  if (typeof value === 'number' && Number.isFinite(value)) return value
-  if (Array.isArray(value)) return value.map(normalizeJson)
-  if (isRecord(value)) {
-    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, normalizeJson(value[key])]))
-  }
-  throw new LifecycleFailure('departments_response_invalid')
-}
-
-function normalizedDepartmentRecords(body) {
-  if (!isRecord(body) || !Array.isArray(body.departments)) throw new LifecycleFailure('departments_response_invalid')
-  const records = new Map()
-  for (const department of body.departments) {
-    if (!isRecord(department) || typeof department.id !== 'string' || department.id.length === 0) {
-      throw new LifecycleFailure('departments_response_invalid')
-    }
-    if (records.has(department.id)) throw new LifecycleFailure('departments_response_invalid')
-    records.set(department.id, JSON.stringify(normalizeJson(department)))
-  }
-  return records
-}
-
-function departmentDiffCount(before, after) {
-  let count = 0
-  for (const [id, record] of before) {
-    if (!after.has(id) || after.get(id) !== record) count += 1
-  }
-  for (const id of after.keys()) {
-    if (!before.has(id)) count += 1
-  }
-  return count
-}
-
-function ownershipClaimCount(body) {
-  if (!isRecord(body) || !Number.isSafeInteger(body.ownershipClaimCount) || body.ownershipClaimCount < 0) {
-    throw new LifecycleFailure('ownership_claim_count_invalid')
-  }
-  return body.ownershipClaimCount
-}
-
-function departmentStateSha256(body) {
-  if (!isRecord(body)
-    || typeof body.departmentStateSha256 !== 'string'
-    || !/^[a-f0-9]{64}$/.test(body.departmentStateSha256)) {
-    throw new LifecycleFailure('department_state_digest_invalid')
-  }
-  return body.departmentStateSha256
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.length > 0
 }
 
 function isReceiptId(value) {
@@ -201,6 +151,20 @@ function sameTransitions(actual) {
   return Array.isArray(actual)
     && actual.length === EXPECTED_TRANSITIONS.length
     && actual.every((state, index) => state === EXPECTED_TRANSITIONS[index])
+}
+
+function validSequenceEvidence(value) {
+  return Array.isArray(value)
+    && value.length === LIFECYCLE.length
+    && value.every((sequence) => Number.isSafeInteger(sequence) && sequence > 0)
+    && value.every((sequence, index) => index === 0 || sequence > value[index - 1])
+}
+
+function validChronologyEvidence(value) {
+  if (!Array.isArray(value) || value.length !== LIFECYCLE.length) return false
+  const times = value.map((entry) => typeof entry === 'string' ? Date.parse(entry) : Number.NaN)
+  return times.every(Number.isFinite)
+    && times.every((time, index) => index === 0 || time >= times[index - 1])
 }
 
 export function validateReceipt(value) {
@@ -218,9 +182,21 @@ export function validateReceipt(value) {
     }
   }
   if (value.install_side_effect_count !== 0) errors.push('install_side_effect_count_nonzero')
-  if (typeof value.manifest_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.manifest_sha256)) {
+  if (typeof value.manifest_sha256 !== 'string' || !SHA256_RE.test(value.manifest_sha256)) {
     errors.push('manifest_sha256_invalid')
   }
+  if (!isNonEmptyString(value.installed_version)) errors.push('installed_version_invalid')
+  if (!isNonEmptyString(value.publisher)) errors.push('publisher_invalid')
+  if (value.trust_class !== 'native_reviewed') errors.push('trust_class_invalid')
+  if (!isNonEmptyString(value.actor_id)) errors.push('actor_id_invalid')
+  if (!Array.isArray(value.receipt_ids)
+    || value.receipt_ids.length !== LIFECYCLE.length
+    || !value.receipt_ids.every(isReceiptId)
+    || new Set(value.receipt_ids).size !== value.receipt_ids.length) {
+    errors.push('receipt_ids_invalid')
+  }
+  if (!validSequenceEvidence(value.receipt_sequences)) errors.push('receipt_sequences_invalid')
+  if (!validChronologyEvidence(value.receipt_created_at)) errors.push('receipt_chronology_invalid')
   if (value.secrets_present !== false) errors.push('secrets_present')
   if (hasSensitiveKey(value)) errors.push('sensitive_key_present')
 
@@ -252,21 +228,99 @@ function receiptList(body) {
   return body.receipts
 }
 
-function receiptMatchesExpected(receipt, expected, bearer) {
-  return isRecord(receipt)
-    && isReceiptId(receipt.id)
-    && !receipt.id.includes(bearer)
-    && receipt.action === expected.action
-    && receipt.nextState === expected.state
-    && receipt.addonKey === ADDON_KEY
-    && receipt.outcome === 'pass'
+function ownershipClaimCount(body) {
+  if (!isRecord(body) || !Number.isSafeInteger(body.ownershipClaimCount) || body.ownershipClaimCount < 0) {
+    throw new LifecycleFailure('ownership_claim_count_invalid')
+  }
+  return body.ownershipClaimCount
 }
 
-function findNewReceipt(receipts, seenIds, expected, bearer) {
-  return receipts.find((receipt) => isRecord(receipt)
-    && receiptMatchesExpected(receipt, expected, bearer)
-    && !seenIds.has(receipt.id)
-  )
+function deployedEvidence(body) {
+  if (!isRecord(body)
+    || typeof body.businessStateSha256 !== 'string'
+    || !SHA256_RE.test(body.businessStateSha256)
+    || typeof body.manifestSha256 !== 'string'
+    || !SHA256_RE.test(body.manifestSha256)
+    || !isNonEmptyString(body.installedVersion)
+    || !isNonEmptyString(body.publisher)
+    || body.trustClass !== 'native_reviewed') {
+    throw new LifecycleFailure('deployed_evidence_invalid')
+  }
+  return {
+    businessStateSha256: body.businessStateSha256,
+    manifestSha256: body.manifestSha256,
+    installedVersion: body.installedVersion,
+    publisher: body.publisher,
+    trustClass: body.trustClass,
+  }
+}
+
+function sameDeployment(left, right) {
+  return left.manifestSha256 === right.manifestSha256
+    && left.installedVersion === right.installedVersion
+    && left.publisher === right.publisher
+    && left.trustClass === right.trustClass
+}
+
+function receiptFingerprint(receipt) {
+  return JSON.stringify([
+    receipt.sequence,
+    receipt.id,
+    receipt.action,
+    receipt.previousState,
+    receipt.nextState,
+    receipt.addonKey,
+    receipt.installedVersion,
+    receipt.publisher,
+    receipt.trustClass,
+    receipt.actorId,
+    receipt.outcome,
+    receipt.errorCode,
+    receipt.createdAt,
+  ])
+}
+
+function validateObservedReceipt(receipt, expected, deployment, prior, bearer) {
+  if (!isRecord(receipt)
+    || !Number.isSafeInteger(receipt.sequence)
+    || receipt.sequence <= 0
+    || !isReceiptId(receipt.id)
+    || receipt.id.includes(bearer)
+    || receipt.action !== expected.action
+    || receipt.previousState !== expected.previousState
+    || receipt.nextState !== expected.state
+    || receipt.addonKey !== ADDON_KEY
+    || receipt.installedVersion !== deployment.installedVersion
+    || receipt.publisher !== deployment.publisher
+    || receipt.trustClass !== deployment.trustClass
+    || !isNonEmptyString(receipt.actorId)
+    || receipt.outcome !== 'pass'
+    || receipt.errorCode !== null
+    || typeof receipt.createdAt !== 'string') {
+    return null
+  }
+  const createdAtMs = Date.parse(receipt.createdAt)
+  if (!Number.isFinite(createdAtMs)
+    || (prior.sequence !== null && receipt.sequence <= prior.sequence)
+    || (prior.createdAtMs !== null && createdAtMs < prior.createdAtMs)
+    || (prior.actorId !== null && receipt.actorId !== prior.actorId)) {
+    return null
+  }
+  return {
+    id: receipt.id,
+    sequence: receipt.sequence,
+    actorId: receipt.actorId,
+    createdAt: receipt.createdAt,
+    createdAtMs,
+    fingerprint: receiptFingerprint(receipt),
+  }
+}
+
+function onlyNewReceipt(receipts, seenIds) {
+  const candidates = receipts.filter((receipt) => (
+    !isRecord(receipt) || typeof receipt.id !== 'string' || !seenIds.has(receipt.id)
+  ))
+  return candidates.length === 1 ? candidates[0] : null
 }
 
 function archivedCatalogStateIsValid(body) {
@@ -275,22 +329,29 @@ function archivedCatalogStateIsValid(body) {
   return matching.length === 1 && matching[0].state === 'archived'
 }
 
-function finalReceiptsAreExact(receipts, expectedReceipts, bearer) {
-  if (receipts.length !== expectedReceipts.size) return false
-  const finalIds = new Set()
+function finalReceiptsAreExact(receipts, expectedFingerprints, receiptIds, bearer) {
+  if (receipts.length !== expectedFingerprints.size) return false
+  const sequences = []
+  const ids = new Set()
   for (const receipt of receipts) {
-    if (!isRecord(receipt) || !isReceiptId(receipt.id) || receipt.id.includes(bearer) || finalIds.has(receipt.id)) {
+    if (!isRecord(receipt)
+      || !isReceiptId(receipt.id)
+      || receipt.id.includes(bearer)
+      || ids.has(receipt.id)
+      || expectedFingerprints.get(receipt.id) !== receiptFingerprint(receipt)
+      || !Number.isSafeInteger(receipt.sequence)) {
       return false
     }
-    const expected = expectedReceipts.get(receipt.id)
-    if (!expected || !receiptMatchesExpected(receipt, expected, bearer)) return false
-    finalIds.add(receipt.id)
+    ids.add(receipt.id)
+    sequences.push({ id: receipt.id, sequence: receipt.sequence })
   }
-  return finalIds.size === expectedReceipts.size
+  sequences.sort((left, right) => left.sequence - right.sequence)
+  return sequences.every((entry, index) => entry.id === receiptIds[index])
 }
 
 export async function runLifecycleCheck(opts, deps = {}) {
   const baseUrl = checkedBaseUrl(opts.baseUrl)
+  const requestOrigin = new URL(baseUrl).origin
   const tokenEnv = String(opts.tokenEnv || '')
   if (!tokenEnv) throw new Error('--token-env is required')
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tokenEnv)) throw new Error('--token-env must name an environment variable')
@@ -304,12 +365,18 @@ export async function runLifecycleCheck(opts, deps = {}) {
 
   const transitions = []
   const receiptIds = []
+  const receiptSequences = []
+  const receiptCreatedAt = []
   const seenReceiptIds = new Set()
-  const expectedReceipts = new Map()
+  const expectedFingerprints = new Map()
   const httpStatuses = []
+  const failureCodes = []
   let installSideEffectCount = -1
   let secretsPresent = false
-  const failureCodes = []
+  let deployment = null
+  let actorId = null
+  let priorSequence = null
+  let priorCreatedAtMs = null
 
   const request = async (step, path, method = 'GET') => {
     let response
@@ -321,6 +388,7 @@ export async function runLifecycleCheck(opts, deps = {}) {
           accept: 'application/json',
           authorization: `Bearer ${bearer}`,
           cookie: `mupot_session=${encodeURIComponent(bearer)}`,
+          origin: requestOrigin,
         },
       })
     } catch {
@@ -344,12 +412,15 @@ export async function runLifecycleCheck(opts, deps = {}) {
   }
 
   try {
-    const before = await request('departments_before_install', '/api/org/departments')
-    requireStatus(before.status, 200, 'departments_before_install')
-    const beforeDepartments = normalizedDepartmentRecords(before.body)
+    const evidenceBefore = await request('evidence_before_install', `/api/addons/${ADDON_KEY}/evidence`)
+    requireStatus(evidenceBefore.status, 200, 'evidence_before_install')
+    deployment = deployedEvidence(evidenceBefore.body)
+
     const receiptsBefore = await request('receipts_before_install', `/api/addons/${ADDON_KEY}/receipts`)
     requireStatus(receiptsBefore.status, 200, 'receipts_before_install')
-    const beforeDepartmentStateSha256 = departmentStateSha256(receiptsBefore.body)
+    if (receiptList(receiptsBefore.body).length !== 0 || ownershipClaimCount(receiptsBefore.body) !== 0) {
+      throw new LifecycleFailure('fresh_lifecycle_evidence_not_empty')
+    }
 
     for (const expected of LIFECYCLE) {
       const mutation = await request(expected.action, `/api/addons/${ADDON_KEY}/${expected.action}`, 'POST')
@@ -362,37 +433,46 @@ export async function runLifecycleCheck(opts, deps = {}) {
       }
       transitions.push(mutation.body.state)
 
+      let receiptResponse
       if (expected.action === 'install') {
-        const after = await request('departments_after_install', '/api/org/departments')
-        requireStatus(after.status, 200, 'departments_after_install')
-        const afterDepartments = normalizedDepartmentRecords(after.body)
-        const receiptResponse = await request('install_receipts', `/api/addons/${ADDON_KEY}/receipts`)
+        const evidenceAfter = await request('evidence_after_install', `/api/addons/${ADDON_KEY}/evidence`)
+        requireStatus(evidenceAfter.status, 200, 'evidence_after_install')
+        const confirmedDeployment = deployedEvidence(evidenceAfter.body)
+        if (!sameDeployment(deployment, confirmedDeployment)) {
+          throw new LifecycleFailure('deployed_manifest_changed')
+        }
+        receiptResponse = await request('install_receipts', `/api/addons/${ADDON_KEY}/receipts`)
         requireStatus(receiptResponse.status, 200, 'install_receipts')
-        installSideEffectCount = departmentDiffCount(beforeDepartments, afterDepartments)
-          + ownershipClaimCount(receiptResponse.body)
-          + (departmentStateSha256(receiptResponse.body) === beforeDepartmentStateSha256 ? 0 : 1)
-        const receipt = findNewReceipt(receiptList(receiptResponse.body), seenReceiptIds, expected, bearer)
-        if (!receipt) throw new LifecycleFailure('install_receipt_missing')
-        seenReceiptIds.add(receipt.id)
-        expectedReceipts.set(receipt.id, expected)
-        receiptIds.push(receipt.id)
-        continue
+        installSideEffectCount = ownershipClaimCount(receiptResponse.body)
+          + (deployment.businessStateSha256 === confirmedDeployment.businessStateSha256 ? 0 : 1)
+      } else {
+        receiptResponse = await request(`${expected.action}_receipts`, `/api/addons/${ADDON_KEY}/receipts`)
+        requireStatus(receiptResponse.status, 200, `${expected.action}_receipts`)
       }
 
-      const receiptResponse = await request(`${expected.action}_receipts`, `/api/addons/${ADDON_KEY}/receipts`)
-      requireStatus(receiptResponse.status, 200, `${expected.action}_receipts`)
-      const receipt = findNewReceipt(receiptList(receiptResponse.body), seenReceiptIds, expected, bearer)
-      if (!receipt) throw new LifecycleFailure(`${expected.action}_receipt_missing`)
-      seenReceiptIds.add(receipt.id)
-      expectedReceipts.set(receipt.id, expected)
-      receiptIds.push(receipt.id)
+      const listedReceipts = receiptList(receiptResponse.body)
+      if (listedReceipts.length !== seenReceiptIds.size + 1) {
+        throw new LifecycleFailure(`${expected.action}_receipt_count_invalid`)
+      }
+      const candidate = onlyNewReceipt(listedReceipts, seenReceiptIds)
+      const observed = validateObservedReceipt(candidate, expected, deployment, {
+        actorId,
+        sequence: priorSequence,
+        createdAtMs: priorCreatedAtMs,
+      }, bearer)
+      if (!observed) throw new LifecycleFailure(`${expected.action}_receipt_invalid`)
+
+      actorId = observed.actorId
+      priorSequence = observed.sequence
+      priorCreatedAtMs = observed.createdAtMs
+      seenReceiptIds.add(observed.id)
+      expectedFingerprints.set(observed.id, observed.fingerprint)
+      receiptIds.push(observed.id)
+      receiptSequences.push(observed.sequence)
+      receiptCreatedAt.push(observed.createdAt)
     }
 
-    const rejected = await request(
-      'archived_reactivation',
-      `/api/addons/${ADDON_KEY}/activate`,
-      'POST',
-    )
+    const rejected = await request('archived_reactivation', `/api/addons/${ADDON_KEY}/activate`, 'POST')
     requireStatus(rejected.status, 409, 'archived_reactivation')
     if (!isRecord(rejected.body) || rejected.body.error !== 'invalid_state') {
       throw new LifecycleFailure('archived_reactivation_response_invalid')
@@ -404,7 +484,12 @@ export async function runLifecycleCheck(opts, deps = {}) {
 
     const finalReceipts = await request('archived_receipts', `/api/addons/${ADDON_KEY}/receipts`)
     requireStatus(finalReceipts.status, 200, 'archived_receipts')
-    if (!finalReceiptsAreExact(receiptList(finalReceipts.body), expectedReceipts, bearer)) {
+    if (!finalReceiptsAreExact(
+      receiptList(finalReceipts.body),
+      expectedFingerprints,
+      receiptIds,
+      bearer,
+    )) {
       failureCodes.push('archived_receipts_invalid')
     }
   } catch (error) {
@@ -417,10 +502,16 @@ export async function runLifecycleCheck(opts, deps = {}) {
     addon_key: ADDON_KEY,
     transitions,
     install_side_effect_count: installSideEffectCount,
-    manifest_sha256: FIXTURE_MANIFEST_SHA256,
+    manifest_sha256: deployment?.manifestSha256 ?? '',
+    installed_version: deployment?.installedVersion ?? '',
+    publisher: deployment?.publisher ?? '',
+    trust_class: deployment?.trustClass ?? '',
+    actor_id: actorId ?? '',
     secrets_present: secretsPresent,
     http_statuses: httpStatuses,
     receipt_ids: receiptIds,
+    receipt_sequences: receiptSequences,
+    receipt_created_at: receiptCreatedAt,
   }
   const validation = validateReceipt(receipt)
   if (failureCodes.length > 0 || !validation.ok) {
