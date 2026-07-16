@@ -118,7 +118,10 @@ async function readBoundedBody(c: Context<AppEnv>) {
     offset += chunk.byteLength
   }
   try {
-    return { ok: true as const, raw: new TextDecoder('utf-8', { fatal: true }).decode(body) }
+    return {
+      ok: true as const,
+      raw: new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(body),
+    }
   } catch {
     return { ok: false as const, status: 400 as const }
   }

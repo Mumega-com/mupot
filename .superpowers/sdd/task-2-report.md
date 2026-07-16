@@ -38,6 +38,14 @@ npx vitest run tests/addon-bindings.test.ts tests/addon-routes.test.ts --maxWork
 
 Result: `9` failed and `47` passed, exit `1`. The failures reproduced the configure/state race, activation generation and connector races, concurrent identical reconfiguration, unbounded chunked body consumption, non-canonical revocation evidence, missing live-generation records, and the missing composite connector foreign key.
 
+Fresh-parent typecheck RED evidence:
+
+```text
+src/addons/routes.ts:121 - new TextDecoder('utf-8', { fatal: true })
+```
+
+Result: the parent verifier's stricter `TextDecoderConstructorOptions` required `ignoreBOM`. The shared worktree's pre-fix typecheck passed under its ambient declarations, so the parent failure could not be reproduced there; the constructor options were made explicit without changing decoding behavior.
+
 ## GREEN Evidence
 
 Focused Task 2, migration, and lifecycle receipt coverage:
@@ -56,7 +64,9 @@ Typecheck:
 npm run typecheck
 ```
 
-Result: `tsc --noEmit` passed, exit `0`.
+Original shared-worktree result: `tsc --noEmit` passed, exit `0`. Fresh-parent verification later exposed the stricter constructor-options declaration described above.
+
+Post-fix result: `tsc --noEmit` passed, exit `0` with `{ fatal: true, ignoreBOM: false }`.
 
 Revocation hardening GREEN result: `1` selected test passed, `11` skipped, exit `0`.
 
