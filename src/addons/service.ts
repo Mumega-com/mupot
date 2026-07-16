@@ -14,6 +14,7 @@ export interface AddonInstallation {
   manifestSha256: string
   mupotCompatibility: string
   state: AddonState
+  latestPreviousState: AddonState | null
   installedBy: string
   latestActorId: string
   latestReceiptId: string
@@ -75,6 +76,7 @@ interface InstallationRow {
   manifest_sha256: string
   mupot_compatibility: string
   state: AddonState
+  latest_previous_state: AddonState | null
   installed_by: string
   latest_actor_id: string
   latest_receipt_id: string
@@ -110,7 +112,7 @@ interface ReceiptRow {
 
 const INSTALLATION_COLUMNS = `
   id, tenant, addon_key, installed_version, publisher, trust_class,
-  manifest_sha256, mupot_compatibility, state, installed_by,
+  manifest_sha256, mupot_compatibility, state, latest_previous_state, installed_by,
   latest_actor_id, latest_receipt_id, installed_at, configured_at,
   activated_at, disabled_at, archived_at, updated_at, last_error
 `
@@ -126,6 +128,7 @@ function installationFromRow(row: InstallationRow): AddonInstallation {
     manifestSha256: row.manifest_sha256,
     mupotCompatibility: row.mupot_compatibility,
     state: row.state,
+    latestPreviousState: row.latest_previous_state,
     installedBy: row.installed_by,
     latestActorId: row.latest_actor_id,
     latestReceiptId: row.latest_receipt_id,
@@ -264,9 +267,9 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
       env.DB.prepare(`
         INSERT INTO addon_installations (
           id, tenant, addon_key, installed_version, publisher, trust_class,
-          manifest_sha256, mupot_compatibility, state, installed_by,
+          manifest_sha256, mupot_compatibility, state, latest_previous_state, installed_by,
           latest_actor_id, latest_receipt_id, installed_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'installed', ?9, ?9, ?10, ?11, ?11)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'installed', NULL, ?9, ?9, ?10, ?11, ?11)
       `).bind(
         installationId,
         env.TENANT_SLUG,
@@ -348,6 +351,7 @@ export async function configureAddon(env: Env, actor: AddonActor, key: string): 
       env.DB.prepare(`
         UPDATE addon_installations
            SET state = 'configured', configured_at = ?1, updated_at = ?1,
+               latest_previous_state = 'installed',
                latest_actor_id = ?2, latest_receipt_id = ?3, last_error = NULL
          WHERE id = ?4 AND tenant = ?5 AND addon_key = ?6
            AND state = 'installed' AND manifest_sha256 = ?7

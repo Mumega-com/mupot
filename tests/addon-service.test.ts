@@ -46,6 +46,7 @@ interface InstallationRow {
   manifest_sha256: string
   mupot_compatibility: string
   state: string
+  latest_previous_state: string | null
   installed_by: string
   latest_actor_id: string
   latest_receipt_id: string
@@ -103,9 +104,9 @@ async function insertInstallationLifecycle(
     db.env.DB.prepare(`
       INSERT INTO addon_installations (
         id, tenant, addon_key, installed_version, publisher, trust_class,
-        manifest_sha256, mupot_compatibility, state, installed_by,
+        manifest_sha256, mupot_compatibility, state, latest_previous_state, installed_by,
         latest_actor_id, latest_receipt_id, installed_at, updated_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?12)
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10, ?11, ?12, ?12)
     `).bind(
       id,
       tenant,
@@ -170,10 +171,12 @@ async function transitionInstallation(
   return db.env.DB.batch([
     db.env.DB.prepare(`
       UPDATE addon_installations
-         SET state = ?1, latest_actor_id = ?2, latest_receipt_id = ?3, updated_at = ?4
-       WHERE id = ?5 AND tenant = ?6 AND state = ?7
+         SET state = ?1, latest_previous_state = ?2,
+             latest_actor_id = ?3, latest_receipt_id = ?4, updated_at = ?5
+       WHERE id = ?6 AND tenant = ?7 AND state = ?8
     `).bind(
       nextState,
+      options.whereState ?? previousState,
       actorId,
       receiptId,
       now,
@@ -371,7 +374,8 @@ describe('addon migration constraints', () => {
     await expect(db.env.DB.batch([
       db.env.DB.prepare(`
         UPDATE addon_installations
-           SET state = 'configured', latest_receipt_id = 'missing-receipt'
+           SET state = 'configured', latest_previous_state = 'installed',
+               latest_receipt_id = 'missing-receipt'
          WHERE id = ?1 AND tenant = ?2 AND state = 'installed'
       `).bind(installation.id, db.env.TENANT_SLUG),
     ])).rejects.toThrow()
@@ -400,7 +404,8 @@ describe('addon migration constraints', () => {
     await expect(db.env.DB.batch([
       db.env.DB.prepare(`
         UPDATE addon_installations
-           SET state = 'configured', latest_actor_id = ?1, latest_receipt_id = ?2
+           SET state = 'configured', latest_previous_state = 'installed',
+               latest_actor_id = ?1, latest_receipt_id = ?2
          WHERE id = ?3 AND tenant = ?4 AND state = 'installed'
       `).bind(owner.id, foreign.receiptId, installation.id, db.env.TENANT_SLUG),
     ])).rejects.toThrow()
@@ -421,7 +426,8 @@ describe('addon migration constraints', () => {
     await expect(db.env.DB.batch([
       db.env.DB.prepare(`
         UPDATE addon_installations
-           SET state = 'active', latest_actor_id = ?1, latest_receipt_id = ?2
+           SET state = 'active', latest_previous_state = 'configured',
+               latest_actor_id = ?1, latest_receipt_id = ?2
          WHERE id = ?3 AND tenant = ?4 AND state = 'configured'
       `).bind(owner.id, installReceipt.id, installation.id, db.env.TENANT_SLUG),
     ])).rejects.toThrow()
@@ -445,7 +451,8 @@ describe('addon migration constraints', () => {
     await expect(db.env.DB.batch([
       db.env.DB.prepare(`
         UPDATE addon_installations
-           SET state = 'configured', latest_actor_id = ?1, latest_receipt_id = ?2, updated_at = ?3
+           SET state = 'configured', latest_previous_state = 'installed',
+               latest_actor_id = ?1, latest_receipt_id = ?2, updated_at = ?3
          WHERE id = ?4 AND tenant = ?5 AND state = 'installed'
       `).bind(owner.id, receiptId, now, installation.id, db.env.TENANT_SLUG),
       db.env.DB.prepare(`
@@ -479,6 +486,76 @@ describe('addon migration constraints', () => {
     })
     expect(db.receipts()).toHaveLength(2)
     expect(db.receipts().some((receipt) => receipt.id === receiptId)).toBe(false)
+  })
+
+  it('rejects configured to active when the receipt falsely claims disabled', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    await configureAddon(db.env, owner, 'fixture-addon')
+    const before = db.installations().find((row) => row.id === installation.id)
+    if (!before) throw new Error('expected configured addon lifecycle')
+
+    await expect(transitionInstallation(
+      db,
+      installation.id,
+      'activate',
+      'disabled',
+      'active',
+      { whereState: 'configured' },
+    )).rejects.toThrow()
+
+    expect(db.installations().find((row) => row.id === installation.id)).toMatchObject({
+      state: 'configured',
+      latest_receipt_id: before.latest_receipt_id,
+      latest_previous_state: before.latest_previous_state,
+    })
+    expect(db.receipts()).toHaveLength(2)
+  })
+
+  it('rejects disabled to active when the receipt falsely claims configured', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    await transitionInstallation(db, installation.id, 'disable', 'installed', 'disabled')
+    const before = db.installations().find((row) => row.id === installation.id)
+    if (!before) throw new Error('expected disabled addon lifecycle')
+
+    await expect(transitionInstallation(
+      db,
+      installation.id,
+      'activate',
+      'configured',
+      'active',
+      { whereState: 'disabled' },
+    )).rejects.toThrow()
+
+    expect(db.installations().find((row) => row.id === installation.id)).toMatchObject({
+      state: 'disabled',
+      latest_receipt_id: before.latest_receipt_id,
+      latest_previous_state: before.latest_previous_state,
+    })
+    expect(db.receipts()).toHaveLength(2)
+  })
+
+  it('rejects active to disabled when the receipt falsely claims configured', async () => {
+    const installation = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
+    await configureAddon(db.env, owner, 'fixture-addon')
+    await transitionInstallation(db, installation.id, 'activate', 'configured', 'active')
+    const before = db.installations().find((row) => row.id === installation.id)
+    if (!before) throw new Error('expected active addon lifecycle')
+
+    await expect(transitionInstallation(
+      db,
+      installation.id,
+      'disable',
+      'configured',
+      'disabled',
+      { whereState: 'active' },
+    )).rejects.toThrow()
+
+    expect(db.installations().find((row) => row.id === installation.id)).toMatchObject({
+      state: 'active',
+      latest_receipt_id: before.latest_receipt_id,
+      latest_previous_state: before.latest_previous_state,
+    })
+    expect(db.receipts()).toHaveLength(3)
   })
 
   it('keeps receipts append-only and constrains action, states, outcome, digest, and JSON', async () => {
@@ -533,12 +610,18 @@ describe('addon install and configure service', () => {
     const result = await installAddon(db.env, owner, 'fixture-addon')
     const catalog = getRegisteredAddon('fixture-addon')
 
-    expect(result).toMatchObject({ ok: true, state: 'installed', created: true })
+    expect(result).toMatchObject({
+      ok: true,
+      state: 'installed',
+      created: true,
+      installation: { latestPreviousState: null },
+    })
     expect(db.departments()).toHaveLength(0)
     expect(db.resources()).toHaveLength(0)
     expect(db.installations()[0]).toMatchObject({
       tenant: 'tenant-a',
       addon_key: 'fixture-addon',
+      latest_previous_state: null,
       manifest_sha256: catalog?.manifestSha256,
       installed_by: owner.id,
       latest_actor_id: owner.id,
@@ -599,7 +682,11 @@ describe('addon install and configure service', () => {
   it('configure CAS advances only an installed matching digest and stays inert', async () => {
     await installAddon(db.env, owner, 'fixture-addon')
 
-    expect(await configureAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'configured' })
+    expect(await configureAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+      ok: true,
+      state: 'configured',
+      installation: { latestPreviousState: 'installed' },
+    })
     expect(await configureAddon(db.env, owner, 'fixture-addon')).toMatchObject({
       ok: true,
       state: 'configured',
@@ -607,7 +694,11 @@ describe('addon install and configure service', () => {
     })
     expect(db.departments()).toHaveLength(0)
     expect(db.resources()).toHaveLength(0)
-    expect(db.installations()[0]).toMatchObject({ state: 'configured', latest_actor_id: admin.id })
+    expect(db.installations()[0]).toMatchObject({
+      state: 'configured',
+      latest_previous_state: 'installed',
+      latest_actor_id: admin.id,
+    })
     expect(db.receipts()).toHaveLength(2)
     expect(db.receipts().find((receipt) => receipt.action === 'configure')).toMatchObject({
       action: 'configure',

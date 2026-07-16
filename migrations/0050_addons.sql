@@ -12,6 +12,10 @@ CREATE TABLE IF NOT EXISTS addon_installations (
   ),
   mupot_compatibility TEXT NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('installed','configured','active','disabled','archived')),
+  latest_previous_state TEXT CHECK (
+    latest_previous_state IS NULL
+    OR latest_previous_state IN ('installed','configured','active','disabled','archived')
+  ),
   installed_by TEXT NOT NULL,
   latest_actor_id TEXT NOT NULL,
   latest_receipt_id TEXT NOT NULL,
@@ -35,9 +39,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_addon_one_live_installation
 
 CREATE TRIGGER IF NOT EXISTS addon_installations_start_installed
   BEFORE INSERT ON addon_installations
-  WHEN NEW.state <> 'installed'
+  WHEN NEW.state <> 'installed' OR NEW.latest_previous_state IS NOT NULL
 BEGIN
-  SELECT RAISE(ABORT, 'addon installation must start installed');
+  SELECT RAISE(ABORT, 'addon installation must start installed with no previous state');
+END;
+
+CREATE TRIGGER IF NOT EXISTS addon_installations_state_snapshots_previous
+  BEFORE UPDATE OF state ON addon_installations
+  WHEN NEW.state <> OLD.state AND NEW.latest_previous_state IS NOT OLD.state
+BEGIN
+  SELECT RAISE(ABORT, 'addon state transition must snapshot its previous state');
+END;
+
+CREATE TRIGGER IF NOT EXISTS addon_installations_previous_state_requires_transition
+  BEFORE UPDATE OF latest_previous_state ON addon_installations
+  WHEN NEW.latest_previous_state IS NOT OLD.latest_previous_state AND NEW.state = OLD.state
+BEGIN
+  SELECT RAISE(ABORT, 'addon previous state snapshot requires a state transition');
 END;
 
 CREATE TRIGGER IF NOT EXISTS addon_installations_state_requires_new_receipt
@@ -251,6 +269,7 @@ CREATE TRIGGER IF NOT EXISTS addon_transition_receipts_match_installation
        AND installation.latest_receipt_id = NEW.id
        AND installation.latest_actor_id = NEW.actor_id
        AND installation.state = NEW.next_state
+       AND installation.latest_previous_state IS NEW.previous_state
        AND (
          (NEW.action = 'install' AND NEW.previous_state IS NULL AND NEW.next_state = 'installed')
          OR (NEW.action = 'configure' AND NEW.previous_state = 'installed' AND NEW.next_state = 'configured')
