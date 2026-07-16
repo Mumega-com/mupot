@@ -493,6 +493,64 @@ describe('collectMarketingSnapshots', () => {
     expect(snapshot.sources[0]).toMatchObject({ status: 'failed', reason })
   })
 
+  it('performs the final connector type check after an observation index getter runs', async () => {
+    const connector: TestConnector = { id: 'connector-crm', type: 'ghl' }
+    const observations = new Array<MonitorObservation>(1)
+    Object.defineProperty(observations, '0', {
+      enumerable: true,
+      get() {
+        connector.type = 'posthog'
+        return observation({
+          metricKey: 'finance.revenue',
+          unit: 'usd',
+          authority: 'ghl',
+        })
+      },
+    })
+
+    const snapshot = await collectMarketingSnapshots(envWithConnectors([connector]), [{
+      id: 'binding-crm',
+      slot: 'crm',
+      adapter: 'ghl',
+      bindingKind: 'vault_connector',
+      capability: 'read',
+      connectorId: 'connector-crm',
+    }], window, [source('crm-source', 'crm', async () => available(observations))])
+
+    expect(snapshot.observations).toEqual([])
+    expect(snapshot.sources[0]).toMatchObject({ status: 'failed', reason: 'adapter_type_mismatch' })
+  })
+
+  it('performs the final active connector check after observation property getters run', async () => {
+    const connector: TestConnector = { id: 'connector-crm', type: 'ghl' }
+    const hostileObservation = observation({
+      metricKey: 'finance.revenue',
+      unit: 'usd',
+      authority: 'ghl',
+    }) as unknown as Record<string, unknown>
+    Object.defineProperty(hostileObservation, 'authority', {
+      enumerable: true,
+      get() {
+        connector.revoked = true
+        return 'ghl'
+      },
+    })
+
+    const snapshot = await collectMarketingSnapshots(envWithConnectors([connector]), [{
+      id: 'binding-crm',
+      slot: 'crm',
+      adapter: 'ghl',
+      bindingKind: 'vault_connector',
+      capability: 'read',
+      connectorId: 'connector-crm',
+    }], window, [source('crm-source', 'crm', async () => available([
+      hostileObservation as unknown as MonitorObservation,
+    ]))])
+
+    expect(snapshot.observations).toEqual([])
+    expect(snapshot.sources[0]).toMatchObject({ status: 'failed', reason: 'connector_not_available' })
+  })
+
   it('isolates post-read snapshot and observation getter failures per source', async () => {
     const hostileSnapshot = { status: 'available' } as Record<string, unknown>
     Object.defineProperty(hostileSnapshot, 'observations', {
@@ -738,6 +796,40 @@ describe('collectMarketingSnapshots', () => {
       }),
     ])
 
+    expect(reads).toBe(0)
+    expect(snapshot.observations).toEqual([])
+    expect(snapshot.sources[0]).toMatchObject({
+      status: 'failed',
+      reason: 'invalid_binding_configuration',
+    })
+  })
+
+  it('rejects a stateful adapter object without invoking primitive coercion', async () => {
+    let coercions = 0
+    let reads = 0
+    const statefulAdapter = {
+      [Symbol.toPrimitive]() {
+        coercions += 1
+        return coercions === 1 ? 'first_party' : 'ghl'
+      },
+    }
+    const binding = {
+      ...bindings[0],
+      adapter: statefulAdapter,
+    } as unknown as ResolvedAddonBinding
+
+    const snapshot = await collectMarketingSnapshots(env, [binding], window, [
+      source('analytics', 'web_analytics', async () => {
+        reads += 1
+        return available([observation({
+          metricKey: 'finance.revenue',
+          unit: 'usd',
+          authority: 'ghl',
+        })])
+      }),
+    ])
+
+    expect(coercions).toBe(0)
     expect(reads).toBe(0)
     expect(snapshot.observations).toEqual([])
     expect(snapshot.sources[0]).toMatchObject({

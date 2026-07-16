@@ -216,7 +216,7 @@ function validatedBindingEntry(bindingValue: unknown): {
     const capability = Reflect.get(bindingValue, 'capability')
     const connectorId = Reflect.get(bindingValue, 'connectorId')
     if (
-      typeof slot !== 'string'
+      !isNonEmptyString(slot)
       || !Object.hasOwn(MARKETING_MONITOR_BINDING_CONTRACT, slot)
     ) return { slot: null, entry: { valid: false } }
 
@@ -227,14 +227,18 @@ function validatedBindingEntry(bindingValue: unknown): {
       bindingKind: 'internal_adapter' | 'vault_connector'
       connectorId: 'null' | 'required'
     }>>>
+    if (!isNonEmptyString(adapter) || !Object.hasOwn(slotContract, adapter)) {
+      return { slot, entry: { valid: false } }
+    }
     const rule = slotContract[adapter]
     const validConnector = rule?.connectorId === 'null'
       ? connectorId === null
       : isNonEmptyString(connectorId)
     if (
       !isNonEmptyString(id)
+      || !isNonEmptyString(bindingKind)
+      || !isNonEmptyString(capability)
       || capability !== 'read'
-      || !rule
       || bindingKind !== rule.bindingKind
       || !validConnector
     ) return { slot, entry: { valid: false } }
@@ -481,12 +485,6 @@ export async function collectMarketingSnapshots(
         continue
       }
 
-      const postReadBindingFailure = await vaultBindingFailureReason(env, binding)
-      if (postReadBindingFailure) {
-        sourceStatuses.push(failedStatus(sourceIdentity, postReadBindingFailure))
-        continue
-      }
-
       const copiedObservations: unknown[] = []
       for (let index = 0; index < sourceObservationCount; index += 1) {
         copiedObservations.push(Reflect.get(sourceObservations, index))
@@ -533,6 +531,12 @@ export async function collectMarketingSnapshots(
       }
       if (sourceRunMismatch || (sourceRunId !== null && runId !== null && sourceRunId !== runId)) {
         sourceStatuses.push(failedStatus(sourceIdentity, 'run_id_mismatch'))
+        continue
+      }
+
+      const postReadBindingFailure = await vaultBindingFailureReason(env, binding)
+      if (postReadBindingFailure) {
+        sourceStatuses.push(failedStatus(sourceIdentity, postReadBindingFailure))
         continue
       }
 
