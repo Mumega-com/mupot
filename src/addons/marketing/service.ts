@@ -31,11 +31,20 @@ const MARKETING_ADDON_KEY = 'marketing-cro-monitor'
 const EVIDENCE_SCHEMA = 'mupot.marketing-monitor-evidence/v1'
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
 const HEX_SHA256 = /^[a-f0-9]{64}$/
+const SOURCE_IDENTIFIER = /^[a-z0-9][a-z0-9_-]{0,63}$/
+const SYNTHETIC_SOURCE_KEY = /^source_config_(?:[0-9]|1[0-5])$/
+const RESERVED_SOURCE_KEY = /^source_config_/
 const DateIntrinsic = Date
+const SetIntrinsic = Set
+const Uint8ArrayIntrinsic = Uint8Array
+const TextEncoderIntrinsic = TextEncoder
 const reflectApplyIntrinsic = Reflect.apply
 const objectKeysIntrinsic = Object.keys
+const objectFreezeIntrinsic = Object.freeze
+const objectHasOwnIntrinsic = Object.hasOwn
 const numberIsFiniteIntrinsic = Number.isFinite
 const numberIsIntegerIntrinsic = Number.isInteger
+const arrayIsArrayIntrinsic = Array.isArray
 const arrayPushIntrinsic = Array.prototype.push
 const arrayIncludesIntrinsic = Array.prototype.includes
 const dateParseIntrinsic = Date.parse.bind(Date)
@@ -48,7 +57,10 @@ const arraySortIntrinsic = Array.prototype.sort
 const setHasIntrinsic = Set.prototype.has
 const setAddIntrinsic = Set.prototype.add
 const stringLocaleCompareIntrinsic = String.prototype.localeCompare
-const STABLE_SOURCE_REASONS = new Set([
+const regexpTestIntrinsic = RegExp.prototype.test
+const textEncoderIntrinsic = new TextEncoderIntrinsic()
+const textEncoderEncodeIntrinsic = TextEncoderIntrinsic.prototype.encode
+const STABLE_SOURCE_REASONS = new SetIntrinsic([
   'adapter_type_mismatch',
   'authoritative_source_missing',
   'binding_adapter_not_supported',
@@ -72,8 +84,16 @@ const STABLE_SOURCE_REASONS = new Set([
   'source_unavailable',
   'window_mismatch',
 ])
-const OUTCOME_SOURCES = new Set(['first-party', 'posthog', 'gsc', 'ghl', 'crm', 'mcpwp', 'inkwell', 'ai_visibility'])
-const OUTCOME_UNITS = new Set(['count', 'ratio', 'usd'])
+const OUTCOME_SOURCES = new SetIntrinsic(['first-party', 'posthog', 'gsc', 'ghl', 'crm', 'mcpwp', 'inkwell', 'ai_visibility'])
+const OUTCOME_UNITS = new SetIntrinsic(['count', 'ratio', 'usd'])
+const UNAVAILABLE_SOURCE_REASONS = new SetIntrinsic([
+  'authoritative_source_missing',
+  'binding_not_configured',
+  'connector_not_configured',
+  'connector_revoked',
+  'source_unavailable',
+  'window_mismatch',
+])
 const STORED_OUTCOME_METRICS = {
   visibility: 'seo.ai_citations',
   qualifiedTraffic: 'seo.organic_sessions',
@@ -172,6 +192,7 @@ export type ListMarketingMonitorRunsResult =
 interface CapturedDatabase {
   readonly db: D1Database
   readonly tenant: string
+  readonly env: Env
 }
 
 function captureDatabase(env: Env): CapturedDatabase | null {
@@ -183,7 +204,8 @@ function captureDatabase(env: Env): CapturedDatabase | null {
     const prepare = receiver?.prepare
     const batch = receiver?.batch
     if (typeof prepare !== 'function' || typeof batch !== 'function') return null
-    const db = Object.freeze({
+    const tenant = env.TENANT_SLUG
+    const db = objectFreezeIntrinsic({
       prepare(sql: string) {
         return reflectApplyIntrinsic(prepare, receiver, [sql])
       },
@@ -191,7 +213,8 @@ function captureDatabase(env: Env): CapturedDatabase | null {
         return reflectApplyIntrinsic(batch, receiver, [statements])
       },
     }) as unknown as D1Database
-    return Object.freeze({ db, tenant: env.TENANT_SLUG })
+    const pinnedEnv = objectFreezeIntrinsic({ DB: db, TENANT_SLUG: tenant }) as Env
+    return objectFreezeIntrinsic({ db, tenant, env: pinnedEnv })
   } catch {
     return null
   }
@@ -202,21 +225,25 @@ function isAdminPlus(actor: AddonActor): boolean {
 }
 
 function canonicalTimestamp(value: unknown): value is string {
-  if (typeof value !== 'string' || !ISO_TIMESTAMP.test(value)) return false
+  if (typeof value !== 'string' || !reflectApplyIntrinsic(regexpTestIntrinsic, ISO_TIMESTAMP, [value])) return false
   const milliseconds = dateParseIntrinsic(value)
   if (!numberIsFiniteIntrinsic(milliseconds)) return false
   return reflectApplyIntrinsic(dateToISOStringIntrinsic, new DateIntrinsic(milliseconds), []) === value
 }
 
 export function canonicalMarketingMonitorWindow(value: unknown): MonitorWindow | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  if (typeof value !== 'object' || value === null || arrayIsArrayIntrinsic(value)) return null
   const record = value as Record<string, unknown>
-  if (objectKeysIntrinsic(record).length !== 2 || !Object.hasOwn(record, 'start') || !Object.hasOwn(record, 'end')) return null
+  if (
+    objectKeysIntrinsic(record).length !== 2
+    || !objectHasOwnIntrinsic(record, 'start')
+    || !objectHasOwnIntrinsic(record, 'end')
+  ) return null
   if (!canonicalTimestamp(record.start) || !canonicalTimestamp(record.end)) return null
   const start = dateParseIntrinsic(record.start)
   const end = dateParseIntrinsic(record.end)
   if (start > end || end - start > MAX_MARKETING_MONITOR_WINDOW_MS) return null
-  return Object.freeze({ start: record.start, end: record.end })
+  return objectFreezeIntrinsic({ start: record.start, end: record.end })
 }
 
 function nowIso(): string {
@@ -264,14 +291,19 @@ async function loadLiveContext(captured: CapturedDatabase): Promise<
        AND revoked_at IS NULL
      ORDER BY slot, id
   `).bind(captured.tenant, installation.id, generation.id).all<BindingRow>()
-  const bindings = (rows.results ?? []).map((row) => ({
-    id: row.id,
-    slot: row.slot,
-    adapter: row.adapter,
-    bindingKind: row.binding_kind,
-    capability: row.capability,
-    connectorId: row.connector_id,
-  }))
+  const bindings: ResolvedAddonBinding[] = []
+  const bindingRows = rows.results ?? []
+  for (let index = 0; index < bindingRows.length; index += 1) {
+    const row = bindingRows[index]
+    pushCaptured(bindings, {
+      id: row.id,
+      slot: row.slot,
+      adapter: row.adapter,
+      bindingKind: row.binding_kind,
+      capability: row.capability,
+      connectorId: row.connector_id,
+    })
+  }
   if (generation.binding_count !== bindings.length) return { ok: false, reason: 'binding_generation_not_live' }
   return { ok: true, context: { installation, generation, bindings } }
 }
@@ -297,11 +329,43 @@ function sortedCopy<T>(values: readonly T[], compare: (left: T, right: T) => num
   return copy
 }
 
+function trustedJsonStringify(value: unknown): string {
+  if (value === null) return 'null'
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    const serialized = jsonStringifyIntrinsic(value)
+    if (typeof serialized !== 'string') throw new Error('unsupported_json_value')
+    return serialized
+  }
+  if (arrayIsArrayIntrinsic(value)) {
+    let serialized = '['
+    for (let index = 0; index < value.length; index += 1) {
+      if (index > 0) serialized += ','
+      serialized += trustedJsonStringify(value[index])
+    }
+    return `${serialized}]`
+  }
+  if (typeof value !== 'object') throw new Error('unsupported_json_value')
+  const record = value as Record<string, unknown>
+  const keys = objectKeysIntrinsic(record)
+  let serialized = '{'
+  for (let index = 0; index < keys.length; index += 1) {
+    if (index > 0) serialized += ','
+    const key = keys[index]
+    serialized += `${trustedJsonStringify(key)}:${trustedJsonStringify(record[key])}`
+  }
+  return `${serialized}}`
+}
+
 async function sha256Json(value: unknown): Promise<string> {
-  const encoded = new TextEncoder().encode(jsonStringifyIntrinsic(value))
-  const digest = new Uint8Array(await digestIntrinsic('SHA-256', encoded))
+  const canonicalJson = trustedJsonStringify(value)
+  const encoded = reflectApplyIntrinsic(textEncoderEncodeIntrinsic, textEncoderIntrinsic, [canonicalJson]) as Uint8Array
+  const digest = new Uint8ArrayIntrinsic(await digestIntrinsic('SHA-256', encoded))
+  const hexAlphabet = '0123456789abcdef'
   let hex = ''
-  for (let index = 0; index < digest.length; index += 1) hex += digest[index].toString(16).padStart(2, '0')
+  for (let index = 0; index < digest.length; index += 1) {
+    const byte = digest[index]
+    hex += hexAlphabet[byte >>> 4] + hexAlphabet[byte & 15]
+  }
   return hex
 }
 
@@ -353,7 +417,7 @@ function runSelect(whereClause: string, limitClause = ''): string {
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
+  return typeof value === 'object' && value !== null && !arrayIsArrayIntrinsic(value)
 }
 
 function includesCaptured<T>(values: readonly T[], value: unknown): boolean {
@@ -399,51 +463,79 @@ function validOutcomes(value: unknown): value is MarketingOutcomes {
 }
 
 function parseSources(value: unknown): MarketingMonitorRunSource[] | null {
-  if (!Array.isArray(value) || value.length > MAX_MARKETING_MONITOR_SOURCES) return null
+  if (!arrayIsArrayIntrinsic(value) || value.length > MAX_MARKETING_MONITOR_SOURCES) return null
   const sources: MarketingMonitorRunSource[] = []
-  const keys = new Set<string>()
-  for (const entry of value) {
+  const keys = new SetIntrinsic<string>()
+  for (let entryIndex = 0; entryIndex < value.length; entryIndex += 1) {
+    const entry = value[entryIndex]
     if (!isObject(entry)) return null
     const entryKeys = objectKeysIntrinsic(entry)
+    if (entryKeys.length !== 5) return null
     for (let index = 0; index < entryKeys.length; index += 1) {
       if (!includesCaptured(['key', 'slot', 'status', 'reason', 'observationCount'], entryKeys[index])) return null
     }
+    const synthetic = typeof entry.key === 'string'
+      && reflectApplyIntrinsic(regexpTestIntrinsic, SYNTHETIC_SOURCE_KEY, [entry.key]) as boolean
+    const canonicalKey = typeof entry.key === 'string'
+      && reflectApplyIntrinsic(regexpTestIntrinsic, SOURCE_IDENTIFIER, [entry.key]) as boolean
+      && !(reflectApplyIntrinsic(regexpTestIntrinsic, RESERVED_SOURCE_KEY, [entry.key]) as boolean)
+    const canonicalSlot = typeof entry.slot === 'string'
+      && reflectApplyIntrinsic(regexpTestIntrinsic, SOURCE_IDENTIFIER, [entry.slot]) as boolean
     if (
       typeof entry.key !== 'string' || typeof entry.slot !== 'string'
-      || !includesCaptured(['available', 'unavailable', 'failed'], String(entry.status))
+      || typeof entry.status !== 'string'
+      || !includesCaptured(['available', 'unavailable', 'failed'], entry.status)
       || !numberIsIntegerIntrinsic(entry.observationCount)
-      || Number(entry.observationCount) < 0 || Number(entry.observationCount) > 100
+      || (entry.observationCount as number) < 0 || (entry.observationCount as number) > 100
       || setHasCaptured(keys, entry.key)
-      || (entry.status === 'available'
-        ? entry.reason !== null
-        : typeof entry.reason !== 'string' || !setHasCaptured(STABLE_SOURCE_REASONS, entry.reason))
     ) return null
+    if (synthetic) {
+      if (
+        entry.slot !== 'unconfigured'
+        || entry.status !== 'failed'
+        || entry.reason !== 'invalid_source_configuration'
+        || entry.observationCount !== 0
+      ) return null
+    } else {
+      if (!canonicalKey || !canonicalSlot) return null
+      if (entry.status === 'available') {
+        if (entry.reason !== null) return null
+      } else if (
+        entry.observationCount !== 0
+        || typeof entry.reason !== 'string'
+        || (entry.status === 'unavailable'
+          ? !setHasCaptured(UNAVAILABLE_SOURCE_REASONS, entry.reason)
+          : entry.reason === 'invalid_source_configuration'
+            || !setHasCaptured(STABLE_SOURCE_REASONS, entry.reason))
+      ) return null
+    }
     setAddCaptured(keys, entry.key)
     pushCaptured(sources, {
       key: entry.key,
       slot: entry.slot,
       status: entry.status as SourceStatus,
       ...(typeof entry.reason === 'string' ? { reason: entry.reason } : {}),
-      observationCount: Number(entry.observationCount),
+      observationCount: entry.observationCount as number,
     })
   }
   return sources
 }
 
 function parseObservations(value: unknown, runId: string, window: MonitorWindow): MonitorObservation[] | null {
-  if (!Array.isArray(value) || value.length > MAX_OBSERVATIONS_PER_RUN) return null
+  if (!arrayIsArrayIntrinsic(value) || value.length > MAX_OBSERVATIONS_PER_RUN) return null
   const windowStart = dateParseIntrinsic(window.start)
   const windowEnd = dateParseIntrinsic(window.end)
   const observations: MonitorObservation[] = []
-  const ids = new Set<string>()
-  for (const entry of value) {
+  const ids = new SetIntrinsic<string>()
+  for (let entryIndex = 0; entryIndex < value.length; entryIndex += 1) {
+    const entry = value[entryIndex]
     if (!isObject(entry) || objectKeysIntrinsic(entry).length !== 9) return null
     if (
       typeof entry.id !== 'string' || entry.id.length === 0
       || entry.id.length > MAX_MARKETING_MONITOR_OBSERVATION_ID_LENGTH
       || setHasCaptured(ids, entry.id)
       || entry.runId !== runId
-      || typeof entry.metricKey !== 'string' || !Object.hasOwn(MARKETING_MONITOR_METRIC_CONTRACT, entry.metricKey)
+      || typeof entry.metricKey !== 'string' || !objectHasOwnIntrinsic(MARKETING_MONITOR_METRIC_CONTRACT, entry.metricKey)
       || typeof entry.value !== 'number' || !numberIsFiniteIntrinsic(entry.value)
       || typeof entry.unit !== 'string' || typeof entry.authority !== 'string'
       || !canonicalTimestamp(entry.observedAt)
@@ -533,8 +625,9 @@ async function parseStoredRun(row: StoredRunRow): Promise<MarketingMonitorRun | 
       || row.program_version !== MARKETING_MONITOR_PROGRAM_VERSION
       || !canonicalTimestamp(row.window_start) || !canonicalTimestamp(row.window_end)
       || dateParseIntrinsic(row.window_start) > dateParseIntrinsic(row.window_end)
+      || dateParseIntrinsic(row.window_end) - dateParseIntrinsic(row.window_start) > MAX_MARKETING_MONITOR_WINDOW_MS
       || !canonicalTimestamp(row.created_at) || !canonicalTimestamp(row.completed_at)
-      || !HEX_SHA256.test(row.evidence_digest)
+      || !(reflectApplyIntrinsic(regexpTestIntrinsic, HEX_SHA256, [row.evidence_digest]) as boolean)
       || !numberIsIntegerIntrinsic(row.source_count) || row.source_count < 0 || row.source_count > MAX_MARKETING_MONITOR_SOURCES
       || !numberIsIntegerIntrinsic(row.observation_count) || row.observation_count < 0 || row.observation_count > MAX_OBSERVATIONS_PER_RUN
       || !numberIsIntegerIntrinsic(row.raw_observation_count) || row.raw_observation_count < row.observation_count
@@ -545,14 +638,31 @@ async function parseStoredRun(row: StoredRunRow): Promise<MarketingMonitorRun | 
     const outcomes = jsonParseIntrinsic(row.outcomes_json)
     if (!sources || !observations || !validOutcomes(outcomes)) return null
     if (sources.length !== row.source_count || observations.length !== row.observation_count) return null
-    const sourceByKey = new Map(sources.map((source) => [source.key, source]))
-    for (const source of sources) {
-      const count = observations.filter((observation) => (
-        observation.sourceKey === source.key && observation.sourceSlot === source.slot
-      )).length
+    for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex += 1) {
+      const source = sources[sourceIndex]
+      let count = 0
+      for (let observationIndex = 0; observationIndex < observations.length; observationIndex += 1) {
+        const observation = observations[observationIndex]
+        if (observation.sourceKey === source.key && observation.sourceSlot === source.slot) count += 1
+      }
       if (count !== source.observationCount) return null
     }
-    if (observations.some((observation) => sourceByKey.get(observation.sourceKey)?.slot !== observation.sourceSlot)) return null
+    for (let observationIndex = 0; observationIndex < observations.length; observationIndex += 1) {
+      const observation = observations[observationIndex]
+      let attributed = false
+      for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex += 1) {
+        const source = sources[sourceIndex]
+        if (
+          source.status === 'available'
+          && source.key === observation.sourceKey
+          && source.slot === observation.sourceSlot
+        ) {
+          attributed = true
+          break
+        }
+      }
+      if (!attributed) return null
+    }
     if (!isCanonicalOrder(sources, compareSource) || !isCanonicalOrder(observations, compareObservation)) return null
 
     // Stored rows are not branded as fresh Task 3 collections; verify the same deterministic outcome contract directly.
@@ -647,7 +757,7 @@ export async function runMarketingMonitor(
   let collection
   try {
     const sources = await (deps.sourceFactory ?? emptySourceFactory)({ runId, window })
-    collection = await collectMarketingSnapshots(env, bindings, window, sources)
+    collection = await collectMarketingSnapshots(captured.env, bindings, window, sources)
   } catch {
     return { ok: false, reason: 'collection_failed' }
   }
@@ -673,9 +783,9 @@ export async function runMarketingMonitor(
     outcomes,
   })
   const completedAt = nowIso()
-  const sourcesJson = jsonStringifyIntrinsic(sources)
-  const observationsJson = jsonStringifyIntrinsic(observations)
-  const outcomesJson = jsonStringifyIntrinsic(outcomes)
+  const sourcesJson = trustedJsonStringify(sources)
+  const observationsJson = trustedJsonStringify(observations)
+  const outcomesJson = trustedJsonStringify(outcomes)
 
   const batch: D1PreparedStatement[] = [
     captured.db.prepare(`
@@ -816,7 +926,9 @@ export async function listMarketingMonitorRuns(
     const result = await captured.db.prepare(runSelect(readIdentityWhere(), 'LIMIT ?9'))
       .bind(...readIdentityBindings(captured), input.limit).all<StoredRunRow>()
     const runs: MarketingMonitorRun[] = []
-    for (const row of result.results ?? []) {
+    const rows = result.results ?? []
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index]
       const run = await parseStoredRun(row)
       if (!run) return { ok: false, reason: 'stored_run_invalid' }
       pushCaptured(runs, run)

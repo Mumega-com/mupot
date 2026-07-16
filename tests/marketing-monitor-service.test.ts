@@ -343,6 +343,146 @@ describe('marketing monitor service', () => {
     }))
   })
 
+  it('keeps persistence and digest canonical after post-load intrinsic poisoning', async () => {
+    await activateMarketing(env)
+    const originalDb = env.DB
+    const originals = {
+      encode: TextEncoder.prototype.encode,
+      map: Array.prototype.map,
+      filter: Array.prototype.filter,
+      some: Array.prototype.some,
+      toJSON: Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON'),
+    }
+    const safeBatchDb = {
+      prepare: originalDb.prepare.bind(originalDb),
+      async batch<T>(statements: Parameters<typeof originalDb.batch<T>>[0]) {
+        const poisoned = {
+          map: Array.prototype.map,
+          filter: Array.prototype.filter,
+          some: Array.prototype.some,
+        }
+        Array.prototype.map = originals.map
+        Array.prototype.filter = originals.filter
+        Array.prototype.some = originals.some
+        try {
+          return await originalDb.batch<T>(statements)
+        } finally {
+          Array.prototype.map = poisoned.map
+          Array.prototype.filter = poisoned.filter
+          Array.prototype.some = poisoned.some
+        }
+      },
+    } as Env['DB']
+    env = { ...env, DB: safeBatchDb }
+    let result: Awaited<ReturnType<typeof runMarketingMonitor>> | undefined
+
+    try {
+      result = await runMarketingMonitor(env, owner, { window }, {
+        sourceFactory: ({ runId }) => {
+          TextEncoder.prototype.encode = () => { throw new Error('poisoned TextEncoder.encode') }
+          Object.defineProperty(Object.prototype, 'toJSON', {
+            configurable: true,
+            value: () => ({ poisoned: true }),
+          })
+          Array.prototype.map = () => { throw new Error('poisoned map') }
+          Array.prototype.filter = () => { throw new Error('poisoned filter') }
+          Array.prototype.some = () => { throw new Error('poisoned some') }
+          return [{
+            key: 'intrinsic_fixture',
+            slot: 'web_analytics',
+            async read() {
+              return {
+                status: 'available',
+                observations: [{
+                  id: `${runId}:visibility`,
+                  runId,
+                  metricKey: 'seo.ai_citations',
+                  value: 4,
+                  unit: 'count',
+                  authority: 'first-party',
+                  observedAt: '2026-07-01T12:00:00.000Z',
+                }],
+              }
+            },
+          }]
+        },
+      })
+    } finally {
+      TextEncoder.prototype.encode = originals.encode
+      Array.prototype.map = originals.map
+      Array.prototype.filter = originals.filter
+      Array.prototype.some = originals.some
+      if (originals.toJSON) Object.defineProperty(Object.prototype, 'toJSON', originals.toJSON)
+      else delete (Object.prototype as { toJSON?: unknown }).toJSON
+    }
+
+    expect(result).toEqual(expect.objectContaining({
+      ok: true,
+      run: expect.objectContaining({ observationCount: 1 }),
+    }))
+    if (!result?.ok) return
+    expect(result.run.evidenceDigest).toBe(await canonicalEvidenceDigest(result.run))
+  })
+
+  it('pins a frozen collection environment before the injected source factory runs', async () => {
+    await activateMarketing(env)
+    const mutableEnv = env as unknown as { DB: Env['DB']; TENANT_SLUG: string }
+    const result = await runMarketingMonitor(env, owner, { window }, {
+      sourceFactory: ({ runId, window: requestedWindow }) => {
+        mutableEnv.TENANT_SLUG = 'redirected-tenant'
+        mutableEnv.DB = {
+          prepare() { throw new Error('redirected database') },
+          batch() { throw new Error('redirected database') },
+        } as unknown as Env['DB']
+        const fixture = createMarketingMonitorFixtureSource({
+          runId,
+          observedAt: '2026-07-01T12:00:00.000Z',
+          window: requestedWindow,
+        })
+        return [{
+          ...fixture,
+          async read(sourceEnv, binding, sourceWindow) {
+            if (sourceEnv.TENANT_SLUG !== 'tenant-a' || !Object.isFrozen(sourceEnv)) {
+              return { status: 'failed', reason: 'source_unavailable', observations: [] }
+            }
+            return fixture.read(sourceEnv, binding, sourceWindow)
+          },
+        }]
+      },
+    })
+
+    expect(result).toEqual(expect.objectContaining({
+      ok: true,
+      run: expect.objectContaining({ observationCount: 5 }),
+    }))
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM marketing_monitor_runs').get())
+      .toEqual({ count: 1 })
+  })
+
+  it('persists the exact collector-owned synthetic source configuration failure', async () => {
+    await activateMarketing(env)
+    const result = await runMarketingMonitor(env, owner, { window }, {
+      sourceFactory: () => [{
+        key: 'source_config_0',
+        slot: 'web_analytics',
+        async read() { return { status: 'available', observations: [] } },
+      }],
+    })
+
+    expect(result).toEqual(expect.objectContaining({
+      ok: true,
+      run: expect.objectContaining({
+        sources: [{
+          key: 'source_config_0',
+          slot: 'unconfigured',
+          status: 'failed',
+          reason: 'invalid_source_configuration',
+          observationCount: 0,
+        }],
+      }),
+    }))
+  })
+
   it('requires the exact registered identity and live binding generation before source construction', async () => {
     await activateMarketing(env)
     harness.sqlite.exec('DROP TRIGGER addon_installations_identity_is_immutable')
@@ -522,6 +662,46 @@ describe('marketing monitor service', () => {
       .toEqual({ status: 'building' })
   })
 
+  it('rejects direct run inserts whose canonical window exceeds 31 days by one millisecond', async () => {
+    await activateMarketing(env)
+    expect(() => insertDirectBuildingRun(harness, directRunValues(harness, {
+      window_end: '2026-08-01T00:00:00.000Z',
+    }))).not.toThrow()
+    expect(() => insertDirectBuildingRun(harness, directRunValues(harness, {
+      window_end: '2026-08-01T00:00:00.001Z',
+    }))).toThrow()
+  })
+
+  it.each([
+    ['source_config_0', 'web_analytics', 'available', null, 0],
+    ['normal_source', 'web_analytics', 'unavailable', 'binding_not_configured', 1],
+    ['normal_source', 'web_analytics', 'unavailable', 'invalid_observation', 0],
+    ['normal_source', 'web_analytics', 'failed', 'invalid_source_configuration', 0],
+  ] as const)(
+    'rejects direct source inserts outside the Task 3 status contract: %s/%s/%s/%s/%s',
+    async (sourceKey, sourceSlot, status, reason, observationCount) => {
+      await activateMarketing(env)
+      const run = directRunValues(harness, { source_count: 1 })
+      insertDirectBuildingRun(harness, run)
+      expect(() => harness.sqlite.prepare(`
+        INSERT INTO marketing_monitor_sources (
+          run_id, tenant, installation_id, binding_generation_id, position,
+          source_key, source_slot, status, reason, observation_count
+        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+      `).run(
+        run.id,
+        run.tenant,
+        run.installation_id,
+        run.binding_generation_id,
+        sourceKey,
+        sourceSlot,
+        status,
+        reason,
+        observationCount,
+      )).toThrow()
+    },
+  )
+
   it('fails closed when a completed stored row contains malformed JSON', async () => {
     await activateMarketing(env)
     const created = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
@@ -561,6 +741,22 @@ describe('marketing monitor service', () => {
     harness.sqlite.prepare(`
       UPDATE marketing_monitor_runs SET evidence_digest = ? WHERE id = ?
     `).run('f'.repeat(64), created.run.id)
+
+    expect(await getLatestMarketingMonitorRun(env, owner)).toEqual({ ok: false, reason: 'stored_run_invalid' })
+    expect(await listMarketingMonitorRuns(env, owner, { limit: 10 })).toEqual({ ok: false, reason: 'stored_run_invalid' })
+  })
+
+  it('fails closed on a stored canonical window over 31 days even with a matching digest', async () => {
+    await activateMarketing(env)
+    const created = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    const oversizedWindow = { ...created.run.window, end: '2026-08-01T00:00:00.001Z' }
+    const evidenceDigest = await canonicalEvidenceDigest({ ...created.run, window: oversizedWindow })
+    harness.sqlite.exec('DROP TRIGGER marketing_monitor_runs_finalize_only')
+    harness.sqlite.prepare(`
+      UPDATE marketing_monitor_runs SET window_end = ?, evidence_digest = ? WHERE id = ?
+    `).run(oversizedWindow.end, evidenceDigest, created.run.id)
 
     expect(await getLatestMarketingMonitorRun(env, owner)).toEqual({ ok: false, reason: 'stored_run_invalid' })
     expect(await listMarketingMonitorRuns(env, owner, { limit: 10 })).toEqual({ ok: false, reason: 'stored_run_invalid' })
@@ -625,6 +821,99 @@ describe('marketing monitor service', () => {
 
     expect(await getLatestMarketingMonitorRun(env, owner)).toEqual({ ok: false, reason: 'stored_run_invalid' })
     expect(await listMarketingMonitorRuns(env, owner, { limit: 10 })).toEqual({ ok: false, reason: 'stored_run_invalid' })
+  })
+
+  it.each([
+    ['reserved key with nonsynthetic semantics', 'source_config_0'],
+    ['noncanonical key', '_invalid'],
+  ])('fails closed on a stored source with %s and a matching digest', async (_name, sourceKey) => {
+    await activateMarketing(env)
+    const created = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    const originalSource = created.run.sources[0]
+    const sources = [{ ...originalSource, key: sourceKey }]
+    const observations = created.run.observations.map((observation) => ({ ...observation, sourceKey }))
+    const evidenceDigest = await canonicalEvidenceDigest({ ...created.run, sources, observations })
+    harness.sqlite.exec(`
+      DROP TRIGGER marketing_monitor_sources_no_update;
+      DROP TRIGGER marketing_monitor_observations_no_update;
+      DROP TRIGGER marketing_monitor_runs_finalize_only;
+      PRAGMA foreign_keys = OFF;
+      PRAGMA ignore_check_constraints = ON;
+    `)
+    harness.sqlite.prepare(`UPDATE marketing_monitor_sources SET source_key = ? WHERE run_id = ?`)
+      .run(sourceKey, created.run.id)
+    harness.sqlite.prepare(`UPDATE marketing_monitor_observations SET source_key = ? WHERE run_id = ?`)
+      .run(sourceKey, created.run.id)
+    harness.sqlite.prepare(`UPDATE marketing_monitor_runs SET evidence_digest = ? WHERE id = ?`)
+      .run(evidenceDigest, created.run.id)
+
+    expect(await getLatestMarketingMonitorRun(env, owner)).toEqual({ ok: false, reason: 'stored_run_invalid' })
+  })
+
+  it('fails closed when stored observations are attributed to an unavailable source', async () => {
+    await activateMarketing(env)
+    const created = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    const sources = created.run.sources.map((source) => ({
+      key: source.key,
+      slot: source.slot,
+      status: 'unavailable' as const,
+      reason: 'binding_not_configured',
+      observationCount: source.observationCount,
+    }))
+    const evidenceDigest = await canonicalEvidenceDigest({ ...created.run, sources })
+    harness.sqlite.exec(`
+      DROP TRIGGER marketing_monitor_sources_no_update;
+      DROP TRIGGER marketing_monitor_runs_finalize_only;
+      PRAGMA ignore_check_constraints = ON;
+    `)
+    harness.sqlite.prepare(`
+      UPDATE marketing_monitor_sources SET status = 'unavailable', reason = 'binding_not_configured'
+       WHERE run_id = ?
+    `).run(created.run.id)
+    harness.sqlite.prepare(`UPDATE marketing_monitor_runs SET evidence_digest = ? WHERE id = ?`)
+      .run(evidenceDigest, created.run.id)
+
+    expect(await getLatestMarketingMonitorRun(env, owner)).toEqual({ ok: false, reason: 'stored_run_invalid' })
+  })
+
+  it.each([
+    ['unavailable', 'invalid_observation'],
+    ['failed', 'invalid_source_configuration'],
+  ] as const)('fails closed on a stored %s source reason Task 3 cannot emit for that identity', async (status, reason) => {
+    await activateMarketing(env)
+    const sourceFactory: MarketingMonitorSourceFactory = () => [{
+      key: 'empty_fixture',
+      slot: 'web_analytics',
+      async read() { return { status: 'available', observations: [] } },
+    }]
+    const created = await runMarketingMonitor(env, owner, { window }, { sourceFactory })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    const sources = [{
+      key: created.run.sources[0].key,
+      slot: created.run.sources[0].slot,
+      status,
+      reason,
+      observationCount: created.run.sources[0].observationCount,
+    }]
+    const evidenceDigest = await canonicalEvidenceDigest({ ...created.run, sources })
+    harness.sqlite.exec(`
+      DROP TRIGGER marketing_monitor_sources_no_update;
+      DROP TRIGGER marketing_monitor_runs_finalize_only;
+      PRAGMA ignore_check_constraints = ON;
+    `)
+    harness.sqlite.prepare(`
+      UPDATE marketing_monitor_sources SET status = ?, reason = ?
+       WHERE run_id = ?
+    `).run(status, reason, created.run.id)
+    harness.sqlite.prepare(`UPDATE marketing_monitor_runs SET evidence_digest = ? WHERE id = ?`)
+      .run(evidenceDigest, created.run.id)
+
+    expect(await getLatestMarketingMonitorRun(env, owner)).toEqual({ ok: false, reason: 'stored_run_invalid' })
   })
 
   it('rejects arbitrary direct-write source reasons and fails closed on arbitrary outcome text', async () => {

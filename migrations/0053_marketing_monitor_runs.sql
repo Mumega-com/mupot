@@ -79,31 +79,63 @@ CREATE TABLE IF NOT EXISTS marketing_monitor_sources (
     REFERENCES marketing_monitor_runs (id, tenant, installation_id, binding_generation_id)
     ON DELETE RESTRICT,
   CHECK (
-    (status = 'available' AND reason IS NULL)
-    OR (status IN ('unavailable','failed') AND reason IN (
-      'adapter_type_mismatch',
-      'authoritative_source_missing',
-      'binding_adapter_not_supported',
-      'binding_not_configured',
-      'connector_not_available',
-      'connector_not_configured',
-      'connector_revoked',
-      'duplicate_observation_id',
-      'duplicate_source_identity',
-      'invalid_binding_configuration',
-      'invalid_observation',
-      'invalid_source_configuration',
-      'invalid_source_snapshot',
-      'metric_authority_not_allowed',
-      'observation_authority_mismatch',
-      'observation_unit_mismatch',
-      'run_id_mismatch',
-      'run_observation_limit_exceeded',
-      'source_observation_limit_exceeded',
-      'source_read_failed',
-      'source_unavailable',
-      'window_mismatch'
-    ))
+    (
+      source_key IN (
+        'source_config_0','source_config_1','source_config_2','source_config_3',
+        'source_config_4','source_config_5','source_config_6','source_config_7',
+        'source_config_8','source_config_9','source_config_10','source_config_11',
+        'source_config_12','source_config_13','source_config_14','source_config_15'
+      )
+      AND source_slot = 'unconfigured'
+      AND status = 'failed'
+      AND reason = 'invalid_source_configuration'
+      AND observation_count = 0
+    )
+    OR (
+      source_key NOT GLOB 'source_config_*'
+      AND (
+        (status = 'available' AND reason IS NULL)
+        OR (
+          status = 'unavailable'
+          AND observation_count = 0
+          AND reason IN (
+            'authoritative_source_missing',
+            'binding_not_configured',
+            'connector_not_configured',
+            'connector_revoked',
+            'source_unavailable',
+            'window_mismatch'
+          )
+        )
+        OR (
+          status = 'failed'
+          AND observation_count = 0
+          AND reason IN (
+            'adapter_type_mismatch',
+            'authoritative_source_missing',
+            'binding_adapter_not_supported',
+            'binding_not_configured',
+            'connector_not_available',
+            'connector_not_configured',
+            'connector_revoked',
+            'duplicate_observation_id',
+            'duplicate_source_identity',
+            'invalid_binding_configuration',
+            'invalid_observation',
+            'invalid_source_snapshot',
+            'metric_authority_not_allowed',
+            'observation_authority_mismatch',
+            'observation_unit_mismatch',
+            'run_id_mismatch',
+            'run_observation_limit_exceeded',
+            'source_observation_limit_exceeded',
+            'source_read_failed',
+            'source_unavailable',
+            'window_mismatch'
+          )
+        )
+      )
+    )
   )
 );
 
@@ -159,6 +191,12 @@ CREATE TRIGGER IF NOT EXISTS marketing_monitor_runs_insert_fence
     OR length(NEW.window_end) <> 24
     OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.window_end) IS NOT NEW.window_end
     OR NEW.window_start > NEW.window_end
+    OR (
+      CAST(strftime('%s', NEW.window_end) AS INTEGER) * 1000
+      + CAST(substr(NEW.window_end, 21, 3) AS INTEGER)
+      - CAST(strftime('%s', NEW.window_start) AS INTEGER) * 1000
+      - CAST(substr(NEW.window_start, 21, 3) AS INTEGER)
+    ) > 2678400000
     OR length(NEW.created_at) <> 24
     OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at
     OR NOT EXISTS (
