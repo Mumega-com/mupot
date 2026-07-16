@@ -2426,6 +2426,19 @@ export async function configureAddon(
     if (!matchesRegisteredIdentity(current, entry)) {
       return { ok: false, reason: 'manifest_digest_drift' }
     }
+    try {
+      const reconciledPreflight = await preflightAddonBindings(
+        env,
+        current,
+        entry.manifest,
+        requestedBindings,
+      )
+      if (!reconciledPreflight.ok) {
+        return { ok: false, reason: reconciledPreflight.reason, state: current.state }
+      }
+    } catch {
+      return { ok: false, reason: 'write_failed' }
+    }
     if (current.state === 'installed') return { ok: false, reason: 'write_failed' }
     if (current.state === 'configured' || current.state === 'disabled') {
       try {

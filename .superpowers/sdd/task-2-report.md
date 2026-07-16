@@ -46,6 +46,14 @@ src/addons/routes.ts:121 - new TextDecoder('utf-8', { fatal: true })
 
 Result: the parent verifier's stricter `TextDecoderConstructorOptions` required `ignoreBOM`. The shared worktree's pre-fix typecheck passed under its ambient declarations, so the parent failure could not be reproduced there; the constructor options were made explicit without changing decoding behavior.
 
+Connector insert-race RED command:
+
+```text
+npx vitest run tests/addon-bindings.test.ts -t "before first binding insert|before reconfiguration insert" --maxWorkers=1 --reporter=verbose
+```
+
+Result: `2` failed and `19` skipped, exit `1`. Connector revocation before first-configuration INSERT and connector type drift before reconfiguration INSERT both committed successfully instead of returning stable preflight failures.
+
 ## GREEN Evidence
 
 Focused Task 2, migration, and lifecycle receipt coverage:
@@ -57,6 +65,8 @@ npx vitest run tests/addon-bindings.test.ts tests/addon-service.test.ts tests/ad
 Initial result: `4` files passed, `203` tests passed, `0` failed, exit `0`.
 
 Independent review GREEN result: `4` files passed, `211` tests passed, `0` failed, exit `0`.
+
+Connector insert-race GREEN result: `4` files passed, `213` tests passed, `0` failed, exit `0`. The focused race selection passed `2` tests with `19` skipped.
 
 Typecheck:
 
@@ -89,11 +99,13 @@ Revocation hardening GREEN result: `1` selected test passed, `11` skipped, exit 
 - Added an explicit empty-capable binding generation head with one-live-generation uniqueness, exact predecessor fencing, configuration digests, and binding counts.
 - Added D1 tenant matching for vault connectors and live-binding rejection on archived installations.
 - Added a composite `(connector_id, tenant)` foreign key backed by a unique connector identity index, preventing connector tenant mutation or deletion while binding evidence exists.
+- Vault binding INSERT now independently requires the connector to remain same-tenant, live, and exactly type-matched at D1 commit time for both first configuration and reconfiguration.
 - Added tenant-scoped safe connector metadata resolution by exact connector ID without selecting credentials.
 - Added binding preflight for required slots, adapters, binding kinds, connector availability/type, read-only capability, and manifest drift.
 - Added first configuration, normalized idempotency, configured/disabled reconfiguration receipts, active-state rejection, activation preflight, and archive revocation.
 - Kept configuration and lifecycle receipts in the same D1 batch. Archive revocation is the first statement in the archive transition batch.
 - Reconfiguration now revokes only the observed generation, installs its replacement, writes bindings, and appends its receipt atomically. A stale identical request rolls back and returns idempotently after rereading the winner.
+- Configure error reconciliation reruns connector preflight after a D1 abort, returning `connector_not_available` or `adapter_type_mismatch` while preserving generation atomicity.
 - Activation commits only while the exact preflighted generation remains live and every vault connector remains same-tenant, active, and type-matched.
 - Archive revokes the exact observed generation and its bindings before the installation state update in the same batch.
 - Added bounded 8 KiB configure parsing, strict object keys/types, duplicate-slot rejection, manifest/absolute count limits, and non-configure body rejection.

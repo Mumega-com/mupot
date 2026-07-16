@@ -237,6 +237,69 @@ describe('addon connector bindings', () => {
     })
   })
 
+  it('returns connector_not_available when a connector is revoked before first binding insert', async () => {
+    const installation = await installMarketing(env)
+    const connectorId = insertConnector(harness)
+    const racingEnv = withPreBatchHook(
+      env,
+      (sql) => sql.includes('INSERT INTO addon_connector_bindings'),
+      async () => {
+        harness.sqlite.prepare('UPDATE connectors SET revoked_at = ? WHERE id = ?').run(
+          new Date().toISOString(),
+          connectorId,
+        )
+      },
+    )
+
+    await expect(configureAddon(racingEnv, owner, 'marketing-cro-monitor', {
+      bindings: [{
+        slot: 'web_analytics', adapter: 'posthog', bindingKind: 'vault_connector', connectorId,
+      }],
+    })).resolves.toEqual({
+      ok: false,
+      reason: 'connector_not_available',
+      state: 'installed',
+    })
+    expect(await listAddonBindings(env, installation.id)).toEqual([])
+    expect(harness.sqlite.prepare(`
+      SELECT id FROM addon_binding_generations WHERE installation_id = ?
+    `).all(installation.id)).toEqual([])
+    expect((await getAddonReceipts(env, installation.id)).map(({ action }) => action)).toEqual(['install'])
+  })
+
+  it('returns adapter_type_mismatch when connector type drifts before reconfiguration insert', async () => {
+    const installation = await installMarketing(env)
+    const connectorId = insertConnector(harness)
+    await configureAddon(env, owner, 'marketing-cro-monitor', { bindings: [firstPartyBinding] })
+    const racingEnv = withPreBatchHook(
+      env,
+      (sql) => sql.includes('INSERT INTO addon_connector_bindings'),
+      async () => {
+        harness.sqlite.prepare('UPDATE connectors SET type = ? WHERE id = ?').run('mcpwp', connectorId)
+      },
+    )
+
+    await expect(configureAddon(racingEnv, owner, 'marketing-cro-monitor', {
+      bindings: [{
+        slot: 'web_analytics', adapter: 'posthog', bindingKind: 'vault_connector', connectorId,
+      }],
+    })).resolves.toEqual({
+      ok: false,
+      reason: 'adapter_type_mismatch',
+      state: 'configured',
+    })
+    expect(await listAddonBindings(env, installation.id)).toEqual([
+      expect.objectContaining({ adapter: 'first_party', revokedAt: null }),
+    ])
+    expect(harness.sqlite.prepare(`
+      SELECT revoked_at FROM addon_binding_generations WHERE installation_id = ?
+    `).all(installation.id)).toEqual([{ revoked_at: null }])
+    expect((await getAddonReceipts(env, installation.id)).map(({ action }) => action)).toEqual([
+      'configure',
+      'install',
+    ])
+  })
+
   it('treats the same normalized configuration as idempotent and records changed generations as preflight', async () => {
     const installation = await installMarketing(env)
     const connectorId = insertConnector(harness)

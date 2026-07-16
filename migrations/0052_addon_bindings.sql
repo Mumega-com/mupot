@@ -197,16 +197,18 @@ BEGIN
   SELECT RAISE(ABORT, 'addon binding does not match live generation');
 END;
 
-CREATE TRIGGER IF NOT EXISTS addon_connector_bindings_connector_matches_tenant
+CREATE TRIGGER IF NOT EXISTS addon_connector_bindings_connector_is_live_and_type_matched
   BEFORE INSERT ON addon_connector_bindings
   WHEN NEW.binding_kind = 'vault_connector' AND NOT EXISTS (
     SELECT 1
       FROM connectors AS connector
      WHERE connector.id = NEW.connector_id
        AND connector.tenant = NEW.tenant
+       AND connector.revoked_at IS NULL
+       AND connector.type = NEW.adapter
   )
 BEGIN
-  SELECT RAISE(ABORT, 'addon binding connector must belong to the installation tenant');
+  SELECT RAISE(ABORT, 'addon binding connector must be tenant-local, live, and type-matched');
 END;
 
 CREATE TRIGGER IF NOT EXISTS addon_connector_bindings_revoke_only
