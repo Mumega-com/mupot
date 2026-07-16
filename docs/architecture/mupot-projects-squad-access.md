@@ -75,6 +75,40 @@ first checking whether the addon framework's connector-slot schema can express i
 coordinate with whoever owns that branch before implementation (same discipline as the CMS
 port build spec).
 
+## Research verdict (2026-07-16, comparables pass — full doc: mumega.com `docs/mupot-project-repo-squad-access-research-2026-07-16.md`)
+
+**The draft schema is validated, not naive.** `projects(tenant, github_repo)` +
+`project_squad_access(project_id, squad_id, access_level)` is the NIST Core RBAC canonical
+shape (`UA⊆USERS×ROLES`, `PA⊆PRMS×ROLES`), matches GCP IAM's "role binding" triple, and
+matches GitHub's own team↔repo model + Vercel/Replit's per-project ACL field-for-field.
+
+Comparables checked: GitHub (team→repo join, 5 levels: Read/Triage/Write/Maintain/Admin;
+Projects v2 board is deliberately NOT repo-bound, separate non-inheriting auth surface),
+Linear (weak fit — Members get workspace-wide access regardless of project; only Guests are
+team-restricted), Vercel (project 1:1 repo, but only Enterprise Contributor role gets true
+per-project scoping — Owner/Member/Developer bypass it entirely, an escape hatch to avoid),
+Replit (genuinely granular — per-App ACL, access is per-resource by default), GitHub Copilot
+coding agent (org-level repo allowlist, agent is structurally PR-only, can't merge — the ONLY
+public precedent for agent-narrower-than-human-access).
+
+**Four explicit decisions, not defaults:**
+1. **Don't replicate Vercel's escape hatch.** Keep the list of mupot roles allowed to bypass
+   `project_squad_access` short and explicit (tenant Owner only) — most of Vercel's roles
+   silently bypass project scoping, that's the failure mode to avoid.
+2. **Board access ≠ repo access, per GitHub's own deliberate design.** `github-projects.ts`'s
+   board-import bridge should NOT be assumed to inherit from `project_squad_access` — decide
+   explicitly whether it does.
+3. **Keep `access_level` to 3** (`read|write|admin`), not GitHub's 5-level ladder — role
+   explosion comes from too many variants, not from the table shape.
+4. **Agent principals need a capability narrower than the squad's nominal `access_level`.**
+   Squad holds `write`; agent MEMBERS of that squad are propose/PR-only, never merge — this
+   is the existing "ARMS NEVER PUBLISH/DEPLOY" rule (kasra/CLAUDE.md), independently confirmed
+   as the only real-world precedent (GitHub Copilot coding agent's repo-allowlist + PR-only
+   design). Encode this as a capability distinct from `access_level`, not folded into it.
+
+Hierarchical/cascading access (GitHub's parent→child team cascade, department→squad) is
+explicitly NOT required at mupot's current scale — v2 hook, not a v1 requirement.
+
 ## Open questions (for the research pass + Hadi)
 
 1. Access levels — read/write/admin, or simpler read/write only (matches GitHub's own
