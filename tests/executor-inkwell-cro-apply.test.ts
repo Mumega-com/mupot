@@ -205,6 +205,35 @@ describe('mergeContentUpdate — preserves every field except the targeted one',
     })
   })
 
+  it('P2 fix: a replacement value containing $-patterns ($$, $&, $`, $\') is written VERBATIM — never regex-expanded', () => {
+    // String.prototype.replace treats a STRING second argument as a replacement
+    // pattern ($$, $&, $`, $' are special) — a value composed by a caller/agent
+    // is plain content, not a replacement template. mergeContentUpdate must use
+    // a function replacer so the value is inserted byte-for-byte.
+    const dollarValue = 'Save $$ today — $& off, mentioned by $` and $\' too.'
+    const merge: CroApplyMergePayload = {
+      executor: 'inkwell-content',
+      mode: 'cro-apply-merge',
+      slug: 'existing-post',
+      changeType: 'cta_text',
+      findText: '[Book a call](https://example.com/book)',
+      value: dollarValue,
+    }
+    const { body, diff } = mergeContentUpdate(currentPost, merge)
+    const expectedBody = `The real article body — a CTA lives here: ${dollarValue}.`
+    expect(body.content).toBe(expectedBody)
+    // No expansion: $$ did NOT collapse to a single $, $& did NOT insert the
+    // matched substring, $` / $' did NOT insert the pre/post-match text.
+    expect(body.content).toContain('Save $$ today')
+    expect(body.content).toContain('$& off')
+    expect(body.content).toContain('mentioned by $` and $\' too')
+    expect(body.content).not.toContain('Book a call') // $` would have leaked the pre-match text if expanded
+    // The receipt's diff.after is the SAME raw value that was actually written —
+    // no audit-integrity desync between what's recorded and what's on the page.
+    expect(diff.after).toBe(dollarValue)
+    expect(body.content).toContain(diff.after)
+  })
+
   it('cta_text/internal_links: missing findText → merge_target_missing, fail-closed', () => {
     const merge = {
       executor: 'inkwell-content',

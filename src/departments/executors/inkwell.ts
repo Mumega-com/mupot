@@ -450,7 +450,17 @@ export function mergeContentUpdate(
       `${merge.changeType}: findText matches ${occurrences} locations in the body — refusing an ambiguous replace`,
     )
   }
-  const mergedContent = current.content.replace(merge.findText, merge.value)
+  // Function replacer (never a string replacer): a string second argument to
+  // String.replace interprets $$, $&, $`, $' as special replacement patterns —
+  // merge.value is caller/agent-composed content, not a regex-replacement
+  // template, so a value containing e.g. '$$' or '$`' would silently get
+  // pattern-expanded, corrupting the written body AND desyncing the receipt
+  // (the receipt records the raw merge.value in `diff.after`, but the article
+  // would carry the expanded string — an audit-integrity violation, canonical
+  // sensitive surface #3: audit chain integrity). A function replacer returns
+  // its value verbatim, no pattern interpretation, so what's written always
+  // equals what the receipt records.
+  const mergedContent = current.content.replace(merge.findText, () => merge.value)
   return {
     body: { ...base, title: current.title, content: mergedContent, description: current.description },
     diff: { changeType: merge.changeType, field: 'content', before: merge.findText, after: merge.value },
