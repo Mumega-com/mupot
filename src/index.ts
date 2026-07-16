@@ -52,6 +52,7 @@ import { ccSpendApp } from './economy/cc-spend'
 import { resellerApp } from './reseller/routes'
 import { inboxApp } from './agents/inbox-routes'
 import { coordinationApp } from './coordination/routes'
+import { addonsApp } from './addons/routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -137,6 +138,9 @@ app.route('/api/inbox', inboxApp)
 // departures board. Member-bearer auth, agent welded from the token. The rendered board page is
 // dashboard /coordination. Before the '/' catch-all.
 app.route('/api/coordination', coordinationApp)
+
+// Native addon catalog and lifecycle commands. Before the dashboard catch-all.
+app.route('/api/addons', addonsApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp
