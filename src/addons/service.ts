@@ -188,6 +188,18 @@ interface DepartmentRow {
   active: 0 | 1
 }
 
+interface DepartmentStateRow {
+  id: string
+  slug: string
+  name: string
+  created_at: string
+  template_key: string | null
+  template_version: string | null
+  activated_at: string | null
+  active: 0 | 1
+  seed_receipt: string | null
+}
+
 const INSTALLATION_COLUMNS = `
   id, tenant, addon_key, installed_version, publisher, trust_class,
   manifest_sha256, mupot_compatibility, state, latest_previous_state, installed_by,
@@ -1434,6 +1446,64 @@ export async function countAddonOwnershipClaims(env: Env, installationId: string
      WHERE tenant = ?1 AND installation_id = ?2
   `).bind(env.TENANT_SLUG, installationId).first<{ count: number }>()
   return Number(row?.count ?? 0)
+}
+
+function validDepartmentStateRow(value: unknown): value is DepartmentStateRow {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const row = value as Record<string, unknown>
+  const keys = [
+    'id',
+    'slug',
+    'name',
+    'created_at',
+    'template_key',
+    'template_version',
+    'activated_at',
+    'active',
+    'seed_receipt',
+  ]
+  const nullableStrings = ['template_key', 'template_version', 'activated_at', 'seed_receipt']
+  return Object.keys(row).length === keys.length
+    && keys.every((key) => Object.hasOwn(row, key))
+    && typeof row.id === 'string'
+    && typeof row.slug === 'string'
+    && typeof row.name === 'string'
+    && typeof row.created_at === 'string'
+    && nullableStrings.every((key) => row[key] === null || typeof row[key] === 'string')
+    && (row.active === 0 || row.active === 1)
+}
+
+export async function getDepartmentStateSha256(env: Env): Promise<string> {
+  const result = await env.DB.prepare(`
+    SELECT id, slug, name, created_at, template_key, template_version,
+           activated_at, active, seed_receipt
+      FROM departments
+     ORDER BY id ASC
+  `).all<DepartmentStateRow>()
+  const rows = result.results ?? []
+  const ids = new Set<string>()
+  const canonicalRows = rows.map((row) => {
+    if (!validDepartmentStateRow(row) || ids.has(row.id)) {
+      throw new Error('invalid department state row')
+    }
+    ids.add(row.id)
+    return [
+      row.id,
+      row.slug,
+      row.name,
+      row.created_at,
+      row.template_key,
+      row.template_version,
+      row.activated_at,
+      row.active,
+      row.seed_receipt,
+    ]
+  })
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(JSON.stringify(canonicalRows)),
+  )
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
 export async function installAddon(env: Env, actor: AddonActor, key: string): Promise<AddonMutationResult> {

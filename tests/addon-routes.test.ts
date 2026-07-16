@@ -76,6 +76,65 @@ describe('addon lifecycle routes', () => {
     await expect(res.json()).resolves.toEqual({ error: 'forbidden', detail: 'owner/admin only' })
   })
 
+  it('returns only a digest of complete department state and changes it on a hidden-column mutation', async () => {
+    const ownerEnv = envForRole(harness, 'owner')
+    harness.sqlite.prepare(`
+      INSERT INTO departments (
+        id, slug, name, created_at, template_key, template_version,
+        activated_at, active, seed_receipt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'hidden-department-id',
+      'hidden-department-slug',
+      'Hidden Department Name',
+      '2026-01-01T00:00:00.000Z',
+      'hidden-template-key',
+      '1.0.0',
+      null,
+      0,
+      null,
+    )
+
+    const before = await addonsApp.fetch(request('/fixture-addon/receipts', 'GET'), ownerEnv)
+    expect(before.status).toBe(200)
+    const beforeBody = await before.json() as Record<string, unknown>
+    expect(Object.keys(beforeBody).sort()).toEqual([
+      'departmentStateSha256',
+      'ownershipClaimCount',
+      'receipts',
+    ])
+    expect(beforeBody.departmentStateSha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(JSON.stringify(beforeBody)).not.toContain('hidden-department-id')
+    expect(JSON.stringify(beforeBody)).not.toContain('hidden-template-key')
+
+    harness.sqlite.prepare(`
+      UPDATE departments SET active = 1 WHERE id = 'hidden-department-id'
+    `).run()
+
+    const after = await addonsApp.fetch(request('/fixture-addon/receipts', 'GET'), ownerEnv)
+    expect(after.status).toBe(200)
+    const afterBody = await after.json() as Record<string, unknown>
+    expect(afterBody.departmentStateSha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(afterBody.departmentStateSha256).not.toBe(beforeBody.departmentStateSha256)
+    expect(JSON.stringify(afterBody)).not.toContain('Hidden Department Name')
+    expect(afterBody).not.toHaveProperty('departments')
+    expect(afterBody).not.toHaveProperty('active')
+    expect(afterBody).not.toHaveProperty('template_key')
+  })
+
+  it('fails closed when persisted department state has an invalid row shape', async () => {
+    const ownerEnv = envForRole(harness, 'owner')
+    harness.sqlite.prepare(`
+      INSERT INTO departments (id, slug, name, created_at, active)
+      VALUES ('invalid-department', 'invalid-department', 'Invalid Department', '2026-01-01T00:00:00.000Z', 2)
+    `).run()
+
+    const res = await addonsApp.fetch(request('/fixture-addon/receipts', 'GET'), ownerEnv)
+
+    expect(res.status).toBe(500)
+    await expect(res.json()).resolves.toEqual({ error: 'receipt_unavailable' })
+  })
+
   it('returns the UI catalog joined with this tenant installation state without manifest internals', async () => {
     const ownerEnv = envForRole(harness, 'owner')
     await addonsApp.fetch(request('/fixture-addon/install', 'POST'), ownerEnv)
@@ -210,7 +269,9 @@ describe('addon lifecycle routes', () => {
     expect(catalogBody.addons.find((addon) => addon.key === 'fixture-addon')?.state).toBeNull()
 
     const receipts = await addonsApp.fetch(request('/fixture-addon/receipts', 'GET'), ownerEnv)
-    await expect(receipts.json()).resolves.toEqual({ receipts: [], ownershipClaimCount: 0 })
+    const receiptsBody = await receipts.json() as Record<string, unknown>
+    expect(receiptsBody).toEqual(expect.objectContaining({ receipts: [], ownershipClaimCount: 0 }))
+    expect(receiptsBody.departmentStateSha256).toMatch(/^[a-f0-9]{64}$/)
   })
 
   it('prefers a live reinstall over archived history in the catalog state', async () => {
@@ -288,9 +349,14 @@ describe('addon lifecycle routes', () => {
     const res = await addonsApp.fetch(request('/fixture-addon/receipts', 'GET'), ownerEnv)
 
     expect(res.status).toBe(200)
-    const body = await res.json() as { receipts: Array<Record<string, unknown>>; ownershipClaimCount: unknown }
+    const body = await res.json() as {
+      receipts: Array<Record<string, unknown>>
+      ownershipClaimCount: unknown
+      departmentStateSha256: unknown
+    }
     expect(body.receipts).toHaveLength(1)
     expect(body.ownershipClaimCount).toBe(2)
+    expect(body.departmentStateSha256).toMatch(/^[a-f0-9]{64}$/)
     expect(body).not.toHaveProperty('claimIds')
     expect(body).not.toHaveProperty('sideEffectIds')
     expect(body).not.toHaveProperty('checks')

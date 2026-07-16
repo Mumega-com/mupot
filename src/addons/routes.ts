@@ -11,6 +11,7 @@ import {
   configureAddon,
   disableAddon,
   getAddonReceipts,
+  getDepartmentStateSha256,
   installAddon,
   listAddonInstallations,
   type AddonInstallation,
@@ -171,11 +172,13 @@ addonsApp.get('/:key/receipts', async (c) => {
 
   if (!getRegisteredAddon(c.req.param('key'))) return c.json({ error: 'addon_not_registered' }, 404)
   try {
+    const departmentStateSha256 = await getDepartmentStateSha256(c.env)
     const installation = latestInstallationsByKey(await listAddonInstallations(c.env)).get(c.req.param('key'))
-    if (!installation) return c.json({ receipts: [], ownershipClaimCount: 0 })
+    if (!installation) return c.json({ receipts: [], ownershipClaimCount: 0, departmentStateSha256 })
     return c.json({
       receipts: (await getAddonReceipts(c.env, installation.id)).map(redactedReceipt),
       ownershipClaimCount: await countAddonOwnershipClaims(c.env, installation.id),
+      departmentStateSha256,
     })
   } catch {
     return c.json({ error: 'receipt_unavailable' }, 500)

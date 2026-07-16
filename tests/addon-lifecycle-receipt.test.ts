@@ -33,6 +33,7 @@ const FIXTURE_RECEIPT_IDS = Object.freeze([
   '00000000-0000-4000-8000-000000000006',
   '00000000-0000-4000-8000-000000000007',
 ])
+const DEPARTMENT_STATE_SHA256 = 'a'.repeat(64)
 
 const LIFECYCLE_TRANSITIONS = Object.freeze([
   ['install', 'installed', 201],
@@ -52,6 +53,8 @@ function createLifecycleFetch(options: {
   receiptExtra?: Record<string, unknown>
   finalReceipts?: Array<Record<string, unknown>>
   catalogState?: string
+  beforeDepartmentStateSha256?: unknown
+  afterDepartmentStateSha256?: unknown
 } = {}) {
   const receipts: Array<Record<string, unknown>> = []
   const calls: Array<{ path: string; method: string; authorization: string | null; cookie: string | null }> = []
@@ -59,7 +62,7 @@ function createLifecycleFetch(options: {
   const afterDepartments = options.afterDepartments ?? beforeDepartments
   let transitionIndex = 0
   let departmentReadCount = 0
-  let receiptReadCount = 0
+  let archivedReactivationSeen = false
 
   const fetch = async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url)
@@ -79,14 +82,21 @@ function createLifecycleFetch(options: {
       return Response.json({ addons: [{ key: ADDON_KEY, state: options.catalogState ?? 'archived' }] })
     }
     if (url.pathname === '/api/addons/fixture-addon/receipts') {
-      const listed = receiptReadCount++ === LIFECYCLE_TRANSITIONS.length
+      const listed = archivedReactivationSeen
         ? options.finalReceipts ?? [...receipts].reverse()
         : [...receipts].reverse()
-      return Response.json({ receipts: listed, ownershipClaimCount: options.ownershipClaimCount ?? 0 })
+      return Response.json({
+        receipts: listed,
+        ownershipClaimCount: options.ownershipClaimCount ?? 0,
+        departmentStateSha256: transitionIndex === 0
+          ? options.beforeDepartmentStateSha256 ?? DEPARTMENT_STATE_SHA256
+          : options.afterDepartmentStateSha256 ?? options.beforeDepartmentStateSha256 ?? DEPARTMENT_STATE_SHA256,
+      })
     }
     if (url.pathname.startsWith('/api/addons/fixture-addon/')) {
       const action = url.pathname.split('/').at(-1)
       if (transitionIndex === LIFECYCLE_TRANSITIONS.length && action === 'activate') {
+        archivedReactivationSeen = true
         return Response.json({ error: 'invalid_state', state: null }, { status: 409 })
       }
       const expected = LIFECYCLE_TRANSITIONS[transitionIndex]
@@ -152,6 +162,7 @@ describe('addon lifecycle receipt checker', () => {
     expect(plan).toContain('POST /api/addons/fixture-addon/install')
     expect(plan).toContain('POST /api/addons/fixture-addon/archive')
     expect(plan).toContain('POST /api/addons/fixture-addon/activate -> 409 after archive')
+    expect(plan).toContain('departmentStateSha256')
     expect(plan).toContain('--token-env MUPOT_OWNER_BEARER')
     expect(plan).not.toContain('Bearer ')
   })
@@ -250,6 +261,31 @@ describe('addon lifecycle receipt checker', () => {
     expect(receipt).toEqual(expect.objectContaining({
       status: 'fail',
       install_side_effect_count: 2,
+      failure_codes: expect.arrayContaining(['install_side_effect_count_nonzero']),
+    }))
+  })
+
+  it('fails when hidden persisted department state changes behind identical public records', async () => {
+    const publicDepartments = [{
+      id: 'existing',
+      slug: 'existing',
+      name: 'Existing',
+      created_at: '2026-01-01T00:00:00.000Z',
+    }]
+    const { fetch } = createLifecycleFetch({
+      beforeDepartments: publicDepartments,
+      afterDepartments: publicDepartments,
+      beforeDepartmentStateSha256: 'a'.repeat(64),
+      afterDepartmentStateSha256: 'b'.repeat(64),
+    })
+    const receipt = await runLifecycleCheck(
+      { baseUrl: 'https://pot.test', tokenEnv: 'MUPOT_OWNER_BEARER' },
+      { fetch, env: { MUPOT_OWNER_BEARER: 'owner-bearer-value' } },
+    )
+
+    expect(receipt).toEqual(expect.objectContaining({
+      status: 'fail',
+      install_side_effect_count: 1,
       failure_codes: expect.arrayContaining(['install_side_effect_count_nonzero']),
     }))
   })

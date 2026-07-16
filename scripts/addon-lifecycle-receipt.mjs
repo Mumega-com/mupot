@@ -100,10 +100,10 @@ export function formatPlan(opts = {}) {
     '',
     'This mode performs no writes. Run the following check against a fresh fixture-addon lifecycle.',
     `1. Read the bearer only from environment variable ${tokenEnv}; never print it.`,
-    '2. GET /api/org/departments and record complete normalized department records.',
+    '2. GET /api/addons/fixture-addon/receipts and record a valid departmentStateSha256, then GET /api/org/departments and record its public records.',
     '3. POST /api/addons/fixture-addon/install -> 201.',
-    '4. GET /api/org/departments and require no added, deleted, or mutated department records.',
-    '5. GET /api/addons/fixture-addon/receipts and require ownershipClaimCount is exactly zero before recording the install receipt ID.',
+    '4. GET /api/org/departments and require no added, deleted, or mutated public department records.',
+    '5. GET /api/addons/fixture-addon/receipts and require departmentStateSha256 is unchanged and ownershipClaimCount is exactly zero before recording the install receipt ID.',
     '6. POST /api/addons/fixture-addon/configure -> 200; record its receipt ID.',
     '7. POST /api/addons/fixture-addon/activate -> 200; record its receipt ID.',
     '8. POST /api/addons/fixture-addon/disable -> 200; record its receipt ID.',
@@ -181,6 +181,15 @@ function ownershipClaimCount(body) {
     throw new LifecycleFailure('ownership_claim_count_invalid')
   }
   return body.ownershipClaimCount
+}
+
+function departmentStateSha256(body) {
+  if (!isRecord(body)
+    || typeof body.departmentStateSha256 !== 'string'
+    || !/^[a-f0-9]{64}$/.test(body.departmentStateSha256)) {
+    throw new LifecycleFailure('department_state_digest_invalid')
+  }
+  return body.departmentStateSha256
 }
 
 function isReceiptId(value) {
@@ -338,6 +347,9 @@ export async function runLifecycleCheck(opts, deps = {}) {
     const before = await request('departments_before_install', '/api/org/departments')
     requireStatus(before.status, 200, 'departments_before_install')
     const beforeDepartments = normalizedDepartmentRecords(before.body)
+    const receiptsBefore = await request('receipts_before_install', `/api/addons/${ADDON_KEY}/receipts`)
+    requireStatus(receiptsBefore.status, 200, 'receipts_before_install')
+    const beforeDepartmentStateSha256 = departmentStateSha256(receiptsBefore.body)
 
     for (const expected of LIFECYCLE) {
       const mutation = await request(expected.action, `/api/addons/${ADDON_KEY}/${expected.action}`, 'POST')
@@ -358,6 +370,7 @@ export async function runLifecycleCheck(opts, deps = {}) {
         requireStatus(receiptResponse.status, 200, 'install_receipts')
         installSideEffectCount = departmentDiffCount(beforeDepartments, afterDepartments)
           + ownershipClaimCount(receiptResponse.body)
+          + (departmentStateSha256(receiptResponse.body) === beforeDepartmentStateSha256 ? 0 : 1)
         const receipt = findNewReceipt(receiptList(receiptResponse.body), seenReceiptIds, expected, bearer)
         if (!receipt) throw new LifecycleFailure('install_receipt_missing')
         seenReceiptIds.add(receipt.id)
