@@ -1,4 +1,4 @@
-# SOS-Conformant Mupot Addon Packages Design
+# Mupot Microkernel Addon Packages Design
 
 **Status:** Approved direction
 **Date:** 2026-07-17
@@ -7,9 +7,8 @@
 
 ## 1. Goal
 
-Make the existing Mupot addon rail conform explicitly to the SOS plugin boundary and
-Mupot substrate contract without invalidating live tenant installations or their
-receipts.
+Make the existing Mupot addon rail conform explicitly to Mupot's own microkernel and
+substrate contract without invalidating live tenant installations or their receipts.
 
 The first deliverable is a package-level contract that:
 
@@ -23,11 +22,12 @@ The first deliverable is a package-level contract that:
 ## 2. Existing Contracts Remain Authoritative
 
 This design does not introduce a new kernel or lifecycle model. It composes contracts
-that already exist:
+that already exist inside Mupot:
 
-- SOS owns agent identity, capabilities, bus communication, audit, and runtime profiles.
-- Mupot owns tenant membership, addon lifecycle, connector bindings, flights, gates,
-  receipts, and the operator console.
+- the Mupot microkernel owns tenant identity, membership, capability RBAC, Cloudflare
+  pub/sub, audit, and versioned ports;
+- Mupot product services own addon lifecycle, connector bindings, tasks, flights, gates,
+  receipts, and the operator console;
 - `mupot.addon/v1` remains the tenant lifecycle and authority manifest.
 - department manifests remain the source of metric and organizational declarations.
 - connectors remain sealed host ports; packages name slots and adapter kinds, never
@@ -35,10 +35,11 @@ that already exist:
 - trusted host implementations resolve D1, Worker bindings, and connector credentials at
   execution boundaries. Package manifests cannot access those implementations directly.
 
-SOS host runtime profiles and Mupot addon packages remain separate concepts. A Hermes,
-Codex, Claude, or local-script profile describes a teammate runtime. An addon package
-describes a business capability installed in a pot. An addon may later require a runtime
-profile, but it does not own or redefine SOS onboarding.
+Agent runtime profiles and Mupot addon packages remain separate concepts. A Hermes,
+Codex, Claude, or local-script profile describes a teammate runtime connected through
+Mupot's ports. An addon package describes a business capability installed in a pot. An
+addon may later require a runtime capability, but it does not own or redefine agent
+onboarding or Cloudflare pub/sub.
 
 ## 3. Approaches Considered
 
@@ -49,11 +50,12 @@ SHA-256 stored on every installation, binding generation, monitor run, and recei
 live Marketing & CRO installation would fail digest checks because addon upgrade and
 receipt migration are intentionally not implemented yet.
 
-### 3.2 Replace Mupot manifests with the SOS plugin manifest
+### 3.2 Merge business addons with the agent runtime contract
 
 This would erase useful product semantics such as departments, connector slots, loops,
-approval policies, retention, and console sections. SOS and Mupot operate at different
-layers; forcing one schema to serve both would weaken both contracts.
+approval policies, retention, and console sections. Agent runtimes and business addons
+operate at different layers; forcing one schema to serve both would weaken both
+contracts.
 
 ### 3.3 Add a package manifest around the existing lifecycle manifest
 
@@ -190,13 +192,13 @@ registration happens before tenant installation is available.
 - changing live addon installation, binding, run, or receipt digests;
 - implementing addon upgrade, rollback, signature verification, or marketplace trust;
 - loading arbitrary third-party JavaScript into the Worker;
-- merging SOS runtime profiles with business addon manifests;
+- merging agent runtime profiles with business addon manifests;
 - refactoring trusted Marketing source and lifecycle services into a new execution model;
 - activating DME or adding write-capable Marketing/CRO operations.
 
-Signature and sandbox metadata from the SOS plugin draft can be added to a future package
-schema when external/community package distribution is enabled. They are not meaningful
-security controls for compiled native packages in this slice.
+Signature and sandbox metadata can be added to a future package schema when
+external/community package distribution is enabled. They are not meaningful security
+controls for compiled native packages in this slice.
 
 ## 11. Acceptance Criteria
 
