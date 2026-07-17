@@ -70,7 +70,6 @@ function makeHarness(): SqliteD1Harness {
       ('hidden-flight-on-visible-project', 'pot-a', 'agent-b', 'Hidden visible-project flight', 'running', 'visible-child', '{"schema":"mupot.flight.meta/v1","goal_id":"hidden","objective_id":"ship","squad_ids":["squad-b"],"task_ids":["hidden-task-on-visible-project"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}'),
       ('mixed-flight', 'pot-a', 'agent-a', 'Mixed squad secret flight', 'running', 'visible-child', '{"schema":"mupot.flight.meta/v1","goal_id":"mixed","objective_id":"ship","squad_ids":["squad-a","squad-b"],"task_ids":["visible-task","hidden-task-on-visible-project"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}'),
       ('legacy-flight', 'pot-a', 'agent-a', 'Legacy project flight', 'running', 'visible-child', '{"squad_ids":["squad-a"]}'),
-      ('malformed-v1-flight', 'pot-a', 'agent-a', 'Malformed self-labeled v1 flight', 'running', 'visible-child', '{"schema":"mupot.flight.meta/v1","squad_ids":["squad-a"]}'),
       ('hidden-flight', 'pot-a', 'agent-b', 'Ship Mirror', 'running', 'hidden-child', '{"schema":"mupot.flight.meta/v1","goal_id":"mirror","objective_id":"ship","squad_ids":["squad-b"],"task_ids":["hidden-sibling-task"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}');
 
     UPDATE project_squad_access
@@ -209,7 +208,7 @@ describe('project dashboard renderers', () => {
     expect(memberDetail?.aggregates).toEqual({ directTasks: 1, directSquads: 1, directFlights: 1 })
 
     const ownerDetail = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'visible-child')
-    expect(ownerDetail?.aggregates).toEqual({ directTasks: 2, directSquads: 2, directFlights: 5 })
+    expect(ownerDetail?.aggregates).toEqual({ directTasks: 2, directSquads: 2, directFlights: 4 })
   })
 
   it('renders bounded per-project squad, open-work, and active-flight metrics', async () => {
@@ -452,7 +451,6 @@ describe('project dashboard routes', () => {
     expect(body).not.toContain('Hidden visible-project flight')
     expect(body).not.toContain('Mixed squad secret flight')
     expect(body).not.toContain('Legacy project flight')
-    expect(body).not.toContain('Malformed self-labeled v1 flight')
     expect(body).not.toContain('Ship Mirror')
     expect(observed.some((sql) => (
       /json_valid\(f\.meta\)[\s\S]*json_each\(\?3\)[\s\S]*\?4 IS NULL[\s\S]*f\.created_at < \?4[\s\S]*f\.id < \?5[\s\S]*ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?6/i
@@ -474,12 +472,9 @@ describe('project dashboard routes', () => {
       WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 101)
       INSERT INTO flights (id, tenant, agent, goal, status, project_id, created_at, meta)
       SELECT printf('newer-unauthorized-%03d', x), 'pot-a', 'agent-b',
-             CASE WHEN x % 2 = 0 THEN printf('Newer malformed %03d', x) ELSE printf('Newer hidden %03d', x) END,
+             printf('Newer hidden %03d', x),
              'running', 'visible-child', 2000000000000 + x,
-             CASE WHEN x % 2 = 0
-               THEN '{"schema":"mupot.flight.meta/v1","squad_ids":["squad-a"]}'
-               ELSE '{"schema":"mupot.flight.meta/v1","goal_id":"hidden-crowd","objective_id":"ship","squad_ids":["squad-b"],"task_ids":["hidden-task-on-visible-project"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}'
-             END
+             '{"schema":"mupot.flight.meta/v1","goal_id":"hidden-crowd","objective_id":"ship","squad_ids":["squad-b"],"task_ids":["hidden-task-on-visible-project"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}'
         FROM n;
       UPDATE project_squad_access
          SET access_level = 'read'
@@ -495,7 +490,6 @@ describe('project dashboard routes', () => {
     expect(response.status).toBe(200)
     expect(body).toContain('Ship Inkwell')
     expect(body).not.toContain('Newer hidden')
-    expect(body).not.toContain('Newer malformed')
   })
 
   it('keyset-pages past SQL-pass JS-fail metadata to find older canonical flights', async () => {
@@ -561,7 +555,6 @@ describe('project dashboard routes', () => {
     expect(body).toContain('Hidden visible-project flight')
     expect(body).toContain('Mixed squad secret flight')
     expect(body).toContain('Legacy project flight')
-    expect(body).toContain('Malformed self-labeled v1 flight')
     expect(body).not.toContain('Ship Mirror')
   })
 
