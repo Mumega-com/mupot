@@ -84,6 +84,19 @@ BEGIN
   SELECT RAISE(ABORT, 'active child projects');
 END;
 
+CREATE TRIGGER validate_projects_restore_status
+BEFORE UPDATE OF status ON projects
+WHEN OLD.status = 'archived'
+ AND NEW.status <> 'archived'
+ AND NEW.parent_project_id IS NOT NULL
+ AND EXISTS (
+   SELECT 1 FROM projects
+   WHERE id = NEW.parent_project_id AND status = 'archived'
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'archived parent project');
+END;
+
 CREATE TRIGGER validate_project_squad_access_insert
 BEFORE INSERT ON project_squad_access
 WHEN EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived')

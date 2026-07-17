@@ -87,6 +87,10 @@ describe('0055_projects migration', () => {
         .toThrow(/project hierarchy cycle/)
       expect(() => sqlite.exec(`UPDATE projects SET parent_project_id = 'other-root' WHERE id = 'root'`))
         .toThrow(/project hierarchy depth/)
+      sqlite.exec(`UPDATE projects SET status = 'archived' WHERE id = 'child'`)
+      sqlite.exec(`UPDATE projects SET status = 'archived' WHERE id = 'root'`)
+      expect(() => sqlite.exec(`UPDATE projects SET status = 'active' WHERE id = 'child'`))
+        .toThrow(/archived parent project/)
 
       const indexesFor = (table: string) => sqlite.prepare('SELECT name FROM pragma_index_list(?)').all(table)
       expect(indexesFor('projects').map((row) => row.name)).toContain('idx_projects_parent_status')
