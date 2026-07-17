@@ -73,11 +73,13 @@ describe('createTask', () => {
     expect(task.title).toBe('Ship channel tasks')
     expect(task.done_when).toBe('channel tasks test passes')
     expect(task.github_issue_url).toBe('https://github.com/acme/widgets/issues/7')
+    expect(task.project_id).toBeNull()
 
     expect(inserts).toHaveLength(1)
     expect(inserts[0]).toEqual([
       task.id,
       'squad-1',
+      null, // project_id — legacy callers remain unassigned
       'Ship channel tasks',
       'durable work',
       'channel tasks test passes',
@@ -99,7 +101,7 @@ describe('createTask', () => {
         squad_id: 'squad-1',
         agent_id: 'agent-1',
         actor: { kind: 'agent', id: 'agent-1' },
-        payload: expect.objectContaining({ task_id: task.id, title: task.title }),
+        payload: expect.objectContaining({ task_id: task.id, title: task.title, project_id: null }),
       }),
     ])
   })
@@ -130,6 +132,7 @@ describe('mirrorTaskUpdate', () => {
   const baseTask = {
     id: 'task-1',
     squad_id: 'squad-1',
+    project_id: null,
     title: 'A task',
     body: '',
     done_when: 'task verified complete',
@@ -189,6 +192,7 @@ describe('mirrorTaskCreate timeout', () => {
       const pending = mirrorTaskCreate(env, {
         id: 'task-timeout',
         squad_id: 'squad-1',
+        project_id: null,
         title: 'Bound GitHub mirror',
         body: '',
         done_when: 'the request returns without hanging',

@@ -78,7 +78,7 @@ export function parseFlightMetaV1(raw: unknown): FlightMetaV1 | null {
 
 export type FlightMetaReferenceResult =
   | { ok: true }
-  | { ok: false; error: 'flight_squad_not_found' | 'flight_task_not_found' | 'flight_task_scope_mismatch'; ref: string }
+  | { ok: false; error: 'flight_squad_not_found' | 'flight_task_not_found' | 'flight_task_scope_mismatch' | 'flight_task_project_mismatch'; ref: string }
 
 export async function loadFlightSquads(env: Env, squadIds: string[]): Promise<Squad[]> {
   const rows: Squad[] = []
@@ -96,22 +96,29 @@ export async function loadFlightSquads(env: Env, squadIds: string[]): Promise<Sq
   return rows
 }
 
-export async function validateFlightMetaReferences(env: Env, meta: FlightMetaV1): Promise<FlightMetaReferenceResult> {
+export async function validateFlightMetaReferences(
+  env: Env,
+  meta: FlightMetaV1,
+  projectId?: string | null,
+): Promise<FlightMetaReferenceResult> {
   const squadRows = await loadFlightSquads(env, meta.squad_ids)
   const foundSquads = new Set(squadRows.map((row) => row.id))
   const missingSquad = meta.squad_ids.find((id) => !foundSquads.has(id))
   if (missingSquad) return { ok: false, error: 'flight_squad_not_found', ref: missingSquad }
 
   const taskPlaceholders = meta.task_ids.map((_, index) => `?${index + 1}`).join(',')
-  const taskRows = await env.DB.prepare(`SELECT id, squad_id FROM tasks WHERE id IN (${taskPlaceholders})`)
+  const taskRows = await env.DB.prepare(`SELECT id, squad_id, project_id FROM tasks WHERE id IN (${taskPlaceholders})`)
     .bind(...meta.task_ids)
-    .all<{ id: string; squad_id: string }>()
+    .all<{ id: string; squad_id: string; project_id: string | null }>()
   const tasksById = new Map((taskRows.results ?? []).map((row) => [row.id, row]))
   for (const taskId of meta.task_ids) {
     const task = tasksById.get(taskId)
     if (!task) return { ok: false, error: 'flight_task_not_found', ref: taskId }
     if (!meta.squad_ids.includes(task.squad_id)) {
       return { ok: false, error: 'flight_task_scope_mismatch', ref: taskId }
+    }
+    if (projectId != null && task.project_id !== projectId) {
+      return { ok: false, error: 'flight_task_project_mismatch', ref: taskId }
     }
   }
   return { ok: true }

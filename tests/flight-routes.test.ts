@@ -156,7 +156,7 @@ describe('GET /collisions — read-only tower view', () => {
   }
 
   const flightRow = (id: string, agent: string, meta: unknown): FlightRow => ({
-    id, tenant: 'test', agent, goal: 'g', status: 'running', trigger_source: 'api',
+    id, tenant: 'test', project_id: null, agent, goal: 'g', status: 'running', trigger_source: 'api',
     gate_verdict: 'go', gate_reason: '', score: 1, budget_micro_usd: null, cost_micro_usd: 0,
     next_run_at: null, created_at: 1, started_at: 1, ended_at: null, meta: JSON.stringify(meta),
   })
@@ -228,7 +228,7 @@ describe('REST flight dispatch reference integrity', () => {
 
 function makeGovernedLandEnv(taskStatus: 'done' | 'review', verdict: 'approved' | 'rejected') {
   const flight: FlightRow = {
-    id: 'flight-m000', tenant: 'test', agent: 'agent-product', goal: 'M000', status: 'running',
+    id: 'flight-m000', tenant: 'test', project_id: null, agent: 'agent-product', goal: 'M000', status: 'running',
     trigger_source: 'api', gate_verdict: 'go', gate_reason: '', score: 0.9,
     budget_micro_usd: 0, cost_micro_usd: 0, next_run_at: null, created_at: 1,
     started_at: 1, ended_at: null, meta: JSON.stringify(goodMeta),

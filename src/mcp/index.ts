@@ -408,7 +408,7 @@ function readConcepts(v: unknown): string[] | undefined | Extract<ToolOutcome, {
 
 async function loadTask(env: Env, taskId: string): Promise<Task | null> {
   const row = await env.DB.prepare(
-    `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+    `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
        FROM tasks WHERE id = ?1 LIMIT 1`,
   )
     .bind(taskId)
@@ -578,7 +578,7 @@ const toolTaskList: ToolSpec = {
       const clauses = [...baseClauses, `status = ?${baseBinds.length + 1}`]
       const binds = [...baseBinds, status]
       const rows = await env.DB.prepare(
-        `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+        `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
            FROM tasks
           WHERE ${clauses.join(' AND ')}
           ORDER BY created_at ${isActionable ? 'ASC' : 'DESC'}
@@ -595,7 +595,7 @@ const toolTaskList: ToolSpec = {
       // compete with actionable rows for the same slots (the P1 finding's
       // core failure mode).
       const actionableRows = await env.DB.prepare(
-        `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+        `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
            FROM tasks
           WHERE ${[...baseClauses, actionableStatusInSql()].join(' AND ')}
           ORDER BY ${actionableStatusOrderSql()}, created_at ASC
@@ -608,7 +608,7 @@ const toolTaskList: ToolSpec = {
       const remaining = limit - taskRows.length
       if (remaining > 0) {
         const terminalRows = await env.DB.prepare(
-          `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+          `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
              FROM tasks
             WHERE ${[...baseClauses, terminalStatusInSql()].join(' AND ')}
             ORDER BY created_at DESC
@@ -646,7 +646,7 @@ const toolTaskBoard: ToolSpec = {
     if (typeof limit !== 'number') return limit
 
     const rows = await env.DB.prepare(
-      `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+      `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
          FROM tasks
         WHERE squad_id = ?1
         ORDER BY created_at DESC

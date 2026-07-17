@@ -925,7 +925,7 @@ dashboardApp.get('/squads/:id', async (c) => {
       .bind(squadId)
       .all<Agent>(),
     c.env.DB.prepare(
-      `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
+      `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
          FROM tasks WHERE squad_id = ? ORDER BY updated_at DESC`,
     )
       .bind(squadId)

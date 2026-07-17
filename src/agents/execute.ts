@@ -263,7 +263,7 @@ async function loadTaskById(env: Env, taskId: string): Promise<Task | null> {
   // on success. K6: status is used to no-op on gate-terminal statuses. done_when
   // is required by the completion gate before a direct-done write.
   const row = await env.DB.prepare(
-    `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url,
+    `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url,
             result, completed_at, gate_owner, execution_receipt_id, execution_claim_expires_at,
             created_at, updated_at
        FROM tasks WHERE id = ? LIMIT 1`,
@@ -555,14 +555,14 @@ function executionEvent(
   agent: Agent,
   task: Task,
   status: Task['status'],
-): BusEvent<{ task_id: string; agent_id: string; status: Task['status']; title: string }> {
+): BusEvent<{ task_id: string; project_id: string | null; agent_id: string; status: Task['status']; title: string }> {
   return {
     type,
     tenant: env.TENANT_SLUG,
     squad_id: task.squad_id,
     agent_id: agent.id,
     actor: { kind: 'agent', id: agent.id },
-    payload: { task_id: task.id, agent_id: agent.id, status, title: task.title },
+    payload: { task_id: task.id, project_id: task.project_id, agent_id: agent.id, status, title: task.title },
     ts: new Date().toISOString(),
   }
 }

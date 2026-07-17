@@ -168,7 +168,7 @@ describe('MCP task cutover tools', () => {
     expect(res.ok).toBe(true)
     expect((res.result as { task: Task }).task.assignee_agent_id).toBe('agent-other')
     expect(updates[0].sql).toContain('INSERT INTO tasks')
-    expect(updates[0].args[6]).toBe('agent-other')
+    expect(updates[0].args[7]).toBe('agent-other')
   })
 
   it('task_list defaults an agent-bound token to its own squad and filters status', async () => {

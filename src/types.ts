@@ -247,6 +247,7 @@ export type Capability = 'owner' | 'admin' | 'lead' | 'member' | 'observer'
 export interface Task {
   id: string
   squad_id: string
+  project_id: string | null
   title: string
   body: string
   status: 'open' | 'in_progress' | 'blocked' | 'done' | 'review' | 'approved' | 'rejected'

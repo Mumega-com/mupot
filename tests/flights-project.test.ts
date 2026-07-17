@@ -1,0 +1,203 @@
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { Env } from '../src/types'
+import type { FlightRow } from '../src/flight/service'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+
+vi.mock('../src/auth/member-bearer', () => ({
+  resolveOrgAdmin: vi.fn(async () => ({ ok: true, id: { memberId: 'admin-1' } })),
+}))
+
+const { flightsApp, parseDispatchBody } = await import('../src/flight/routes')
+const { createFlight } = await import('../src/flight/service')
+const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
+
+const signals = {
+  contextComplete: true,
+  toolsReachable: true,
+  budgetRemainingMicroUsd: 1_000_000,
+  budgetEstimateMicroUsd: 200_000,
+  recentProgress: 0.8,
+  progressPerStep: 0.5,
+  wastePerStep: 0.1,
+  stepSeconds: 20,
+}
+
+const meta = {
+  schema: 'mupot.flight.meta/v1',
+  goal_id: 'goal-1',
+  objective_id: 'objective-1',
+  squad_ids: ['squad-a'],
+  task_ids: ['task-a'],
+  done_when: ['the task is done'],
+  artifact_refs: [],
+  receipt_refs: [],
+  confidentiality: 'internal',
+  publication_target: 'none',
+  parent_flight_id: null,
+}
+
+function makeHarness(): SqliteD1Harness {
+  const harness = createSqliteD1()
+  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
+    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+  }
+  harness.sqlite.exec(`
+    INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');
+    INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept-a', 'squad-a', 'Squad A');
+    INSERT INTO projects (id, slug, name, status) VALUES ('project-a', 'project-a', 'Project A', 'active');
+    INSERT INTO projects (id, slug, name, status) VALUES ('project-b', 'project-b', 'Project B', 'active');
+    INSERT INTO projects (id, slug, name, status) VALUES ('project-archived', 'project-archived', 'Archived', 'archived');
+    INSERT INTO tasks (id, squad_id, title, done_when, status, project_id) VALUES ('task-a', 'squad-a', 'Task A', 'done', 'open', 'project-a');
+    INSERT INTO tasks (id, squad_id, title, done_when, status, project_id) VALUES ('task-b', 'squad-a', 'Task B', 'done', 'open', 'project-b');
+    INSERT INTO tasks (id, squad_id, title, done_when, status) VALUES ('task-unassigned', 'squad-a', 'Unassigned', 'done', 'open');
+  `)
+  return harness
+}
+
+function envFor(harness: SqliteD1Harness, queries?: string[]): Env {
+  const db = queries
+    ? {
+        prepare(sql: string) {
+          queries.push(sql)
+          return harness.db.prepare(sql)
+        },
+        batch: harness.db.batch.bind(harness.db),
+      }
+    : harness.db
+  return { DB: db, TENANT_SLUG: 'pot-a' } as unknown as Env
+}
+
+function dispatchBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { agent: 'agent-a', goal: 'Ship project work', signals, ...overrides }
+}
+
+async function dispatch(harness: SqliteD1Harness, body: Record<string, unknown>): Promise<Response> {
+  return flightsApp.request('https://pot.test/', {
+    method: 'POST',
+    headers: { authorization: 'Bearer admin', 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  }, envFor(harness))
+}
+
+async function list(harness: SqliteD1Harness, query = '', queries?: string[]): Promise<Response> {
+  return flightsApp.request(`https://pot.test/${query}`, {
+    headers: { authorization: 'Bearer admin' },
+  }, envFor(harness, queries))
+}
+
+describe('flight project attribution', () => {
+  let harness: SqliteD1Harness | undefined
+
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+  })
+
+  it('parses project_id as a top-level field without adding it to FlightMetaV1', () => {
+    const parsed = parseDispatchBody(dispatchBody({ project_id: 'project-a', meta }))
+    expect(parsed.ok).toBe(true)
+    if (!parsed.ok) return
+    expect(parsed.value.flight.project_id).toBe('project-a')
+    expect(parsed.value.flight.meta).toEqual(meta)
+    expect(parsed.value.flight.meta).not.toHaveProperty('project_id')
+  })
+
+  it('rejects malformed project identifiers at the REST boundary', () => {
+    expect(parseDispatchBody(dispatchBody({ project_id: '' }))).toEqual({ ok: false, error: 'invalid_project_id' })
+    expect(parseDispatchBody(dispatchBody({ project_id: 42 }))).toEqual({ ok: false, error: 'invalid_project_id' })
+    expect(parseDispatchBody(dispatchBody({ project_id: 'x'.repeat(201) }))).toEqual({ ok: false, error: 'invalid_project_id' })
+  })
+
+  it('keeps legacy flight creation valid with null attribution', async () => {
+    harness = makeHarness()
+    const response = await dispatch(harness, dispatchBody())
+    expect(response.status).toBe(201)
+    const id = (await response.json() as { id: string }).id
+    expect(harness.sqlite.prepare('SELECT project_id FROM flights WHERE id = ?').get(id)).toEqual({ project_id: null })
+  })
+
+  it('persists an active project outside metadata', async () => {
+    harness = makeHarness()
+    const response = await dispatch(harness, dispatchBody({ project_id: 'project-a', meta }))
+    expect(response.status).toBe(201)
+    const id = (await response.json() as { id: string }).id
+    const row = harness.sqlite.prepare('SELECT project_id, meta FROM flights WHERE id = ?').get(id) as { project_id: string; meta: string }
+    expect(row.project_id).toBe('project-a')
+    expect(JSON.parse(row.meta)).toEqual(meta)
+  })
+
+  it('rejects missing and archived projects before insertion', async () => {
+    harness = makeHarness()
+    const missing = await dispatch(harness, dispatchBody({ project_id: 'missing' }))
+    expect(missing.status).toBe(404)
+    await expect(missing.json()).resolves.toEqual({ error: 'project_not_found' })
+
+    const archived = await dispatch(harness, dispatchBody({ project_id: 'project-archived' }))
+    expect(archived.status).toBe(400)
+    await expect(archived.json()).resolves.toEqual({ error: 'archived_project' })
+    expect(harness.sqlite.prepare('SELECT count(*) AS count FROM flights').get()).toEqual({ count: 0 })
+  })
+
+  it('rejects mixed and unassigned governed tasks before insertion', async () => {
+    harness = makeHarness()
+    for (const taskIds of [['task-a', 'task-b'], ['task-a', 'task-unassigned']]) {
+      const response = await dispatch(harness, dispatchBody({
+        project_id: 'project-a',
+        meta: { ...meta, task_ids: taskIds },
+      }))
+      expect(response.status).toBe(400)
+      await expect(response.json()).resolves.toEqual({ error: 'flight_task_project_mismatch' })
+    }
+    expect(harness.sqlite.prepare('SELECT count(*) AS count FROM flights').get()).toEqual({ count: 0 })
+  })
+
+  it('filters the bounded list query by project while preserving the absent-filter query', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO flights (id, tenant, agent, goal, status, project_id, created_at) VALUES ('flight-a', 'pot-a', 'a', 'A', 'landed', 'project-a', 3);
+      INSERT INTO flights (id, tenant, agent, goal, status, project_id, created_at) VALUES ('flight-b', 'pot-a', 'b', 'B', 'landed', 'project-b', 2);
+      INSERT INTO flights (id, tenant, agent, goal, status, created_at) VALUES ('flight-null', 'pot-a', 'c', 'C', 'landed', 1);
+    `)
+
+    const filteredQueries: string[] = []
+    const filtered = await list(harness, '?project_id=project-a', filteredQueries)
+    expect(filtered.status).toBe(200)
+    expect((await filtered.json() as { flights: FlightRow[] }).flights).toEqual([
+      expect.objectContaining({ id: 'flight-a', project_id: 'project-a' }),
+    ])
+    expect(filteredQueries.some((sql) => sql.includes('project_id=?2') && sql.includes('LIMIT ?3'))).toBe(true)
+
+    const legacyQueries: string[] = []
+    const legacy = await list(harness, '', legacyQueries)
+    expect((await legacy.json() as { flights: FlightRow[] }).flights.map((flight) => flight.id)).toEqual(['flight-a', 'flight-b', 'flight-null'])
+    expect(legacyQueries.some((sql) => sql.includes('FROM flights WHERE tenant=?1 ORDER BY created_at DESC LIMIT ?2'))).toBe(true)
+  })
+
+  it('maps a final unknown-project trigger failure to a stable service error', async () => {
+    const env = {
+      TENANT_SLUG: 'pot-a',
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind() {
+              return {
+                async first() {
+                  if (sql.includes('SELECT status FROM projects')) return { status: 'active' }
+                  return null
+                },
+                async run() {
+                  throw new Error('unknown project_id')
+                },
+              }
+            },
+          }
+        },
+      },
+    } as unknown as Env
+
+    await expect(createFlight(env, { agent: 'agent-a', goal: 'g', project_id: 'project-a' }))
+      .rejects.toMatchObject({ code: 'project_not_found' })
+  })
+})

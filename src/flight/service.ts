@@ -24,6 +24,7 @@ export type TriggerSource = 'manual' | 'schedule' | 'api' | 'event' | 'cron'
 export interface FlightRow {
   id: string
   tenant: string
+  project_id: string | null
   agent: string
   goal: string
   status: FlightStatus
@@ -43,28 +44,78 @@ export interface FlightRow {
 export interface NewFlight {
   agent: string
   goal: string
+  project_id?: string | null
   trigger_source?: TriggerSource
   budget_micro_usd?: number
   meta?: FlightMetaV1
 }
 
+export type FlightProjectErrorCode =
+  | 'invalid_project_id'
+  | 'project_not_found'
+  | 'archived_project'
+  | 'flight_task_project_mismatch'
+
+export class FlightProjectError extends Error {
+  constructor(readonly code: FlightProjectErrorCode) {
+    super(code)
+    this.name = 'FlightProjectError'
+  }
+}
+
+export async function validateFlightProjectAttribution(env: Env, flight: NewFlight): Promise<void> {
+  const projectId = flight.project_id ?? null
+  if (projectId === null) return
+  if (typeof projectId !== 'string' || projectId.trim().length === 0) {
+    throw new FlightProjectError('invalid_project_id')
+  }
+  const project = await env.DB.prepare('SELECT status FROM projects WHERE id = ?1')
+    .bind(projectId)
+    .first<{ status: string }>()
+  if (!project) throw new FlightProjectError('project_not_found')
+  if (project.status === 'archived') throw new FlightProjectError('archived_project')
+
+  if (flight.meta) {
+    const placeholders = flight.meta.task_ids.map((_, index) => `?${index + 1}`).join(',')
+    const rows = await env.DB.prepare(
+      `SELECT id, project_id FROM tasks WHERE id IN (${placeholders})`,
+    ).bind(...flight.meta.task_ids).all<{ id: string; project_id: string | null }>()
+    const tasks = new Map((rows.results ?? []).map((task) => [task.id, task]))
+    if (flight.meta.task_ids.some((taskId) => tasks.get(taskId)?.project_id !== projectId)) {
+      throw new FlightProjectError('flight_task_project_mismatch')
+    }
+  }
+}
+
+function mapFlightProjectInsertError(error: unknown): never {
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.includes('unknown project_id')) throw new FlightProjectError('project_not_found')
+  throw error
+}
+
 // Create a flight in `preflight` — it has not launched; the gate decides next.
 export async function createFlight(env: Env, f: NewFlight): Promise<string> {
+  await validateFlightProjectAttribution(env, f)
   const id = crypto.randomUUID()
-  await env.DB.prepare(
-    `INSERT INTO flights (id, tenant, agent, goal, status, trigger_source, budget_micro_usd, meta)
-     VALUES (?1, ?2, ?3, ?4, 'preflight', ?5, ?6, ?7)`,
-  )
-    .bind(
-      id,
-      env.TENANT_SLUG,
-      f.agent,
-      f.goal,
-      f.trigger_source ?? 'manual',
-      f.budget_micro_usd ?? null,
-      JSON.stringify(f.meta ?? {}),
+  try {
+    await env.DB.prepare(
+      `INSERT INTO flights (id, tenant, project_id, agent, goal, status, trigger_source, budget_micro_usd, meta)
+       VALUES (?1, ?2, ?3, ?4, ?5, 'preflight', ?6, ?7, ?8)`,
     )
-    .run()
+      .bind(
+        id,
+        env.TENANT_SLUG,
+        f.project_id ?? null,
+        f.agent,
+        f.goal,
+        f.trigger_source ?? 'manual',
+        f.budget_micro_usd ?? null,
+        JSON.stringify(f.meta ?? {}),
+      )
+      .run()
+  } catch (error) {
+    mapFlightProjectInsertError(error)
+  }
   return id
 }
 
@@ -298,9 +349,14 @@ export async function getFlight(env: Env, id: string): Promise<FlightRow | null>
   )
 }
 
-export async function listFlights(env: Env, limit = 100): Promise<FlightRow[]> {
-  const res = await env.DB.prepare(`SELECT * FROM flights WHERE tenant=?1 ORDER BY created_at DESC LIMIT ?2`)
-    .bind(env.TENANT_SLUG, Math.min(Math.max(limit, 1), 500))
+export async function listFlights(env: Env, limit = 100, projectId?: string): Promise<FlightRow[]> {
+  const boundedLimit = Math.min(Math.max(limit, 1), 500)
+  const statement = projectId === undefined
+    ? env.DB.prepare(`SELECT * FROM flights WHERE tenant=?1 ORDER BY created_at DESC LIMIT ?2`)
+      .bind(env.TENANT_SLUG, boundedLimit)
+    : env.DB.prepare(`SELECT * FROM flights WHERE tenant=?1 AND project_id=?2 ORDER BY created_at DESC LIMIT ?3`)
+      .bind(env.TENANT_SLUG, projectId, boundedLimit)
+  const res = await statement
     .all<FlightRow>()
   return res.results ?? []
 }

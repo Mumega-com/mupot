@@ -79,9 +79,9 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
   const rows = new Map<string, FlightRow>()
   const cursors = new Map<string, string>()
   let beforeFlightLand: (() => void) | null = null
-  const tasks = new Map<string, { id: string; squad_id: string; status: 'in_progress' | 'review' | 'approved' | 'done'; gate_owner: string | null }>([
-    ['task-m000', { id: 'task-m000', squad_id: SQUAD_ID, status: 'in_progress', gate_owner: 'gate:m0-census' }],
-    ['task-other', { id: 'task-other', squad_id: OTHER_SQUAD_ID, status: 'in_progress', gate_owner: null }],
+  const tasks = new Map<string, { id: string; squad_id: string; project_id: string | null; status: 'in_progress' | 'review' | 'approved' | 'done'; gate_owner: string | null }>([
+    ['task-m000', { id: 'task-m000', squad_id: SQUAD_ID, project_id: null, status: 'in_progress', gate_owner: 'gate:m0-census' }],
+    ['task-other', { id: 'task-other', squad_id: OTHER_SQUAD_ID, project_id: null, status: 'in_progress', gate_owner: null }],
   ])
   const verdicts = new Map<string, 'approved' | 'rejected'>()
   const events: unknown[] = []
@@ -122,7 +122,7 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
                   const squad = squads.get(args[0] as string)
                   return (squad ? { department_id: squad.department_id } : null) as T | null
                 }
-                if (sql.includes('SELECT id, squad_id FROM tasks')) return (tasks.get(args[0] as string) ?? null) as T | null
+                if (sql.includes('SELECT id, squad_id') && sql.includes('FROM tasks')) return (tasks.get(args[0] as string) ?? null) as T | null
                 if (sql.includes('SELECT * FROM flights WHERE id=')) {
                   const row = rows.get(args[0] as string)
                   return (row?.tenant === args[1] ? row : null) as T | null
@@ -137,9 +137,9 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
               async run() {
                 let changes = 0
                 if (sql.includes('INSERT INTO flights (')) {
-                  const [id, tenant, agent, goal, trigger, budget, rawMeta] = args as [string, string, string, string, FlightRow['trigger_source'], number | null, string]
+                  const [id, tenant, projectId, agent, goal, trigger, budget, rawMeta] = args as [string, string, string | null, string, string, FlightRow['trigger_source'], number | null, string]
                   rows.set(id, {
-                    id, tenant, agent, goal, trigger_source: trigger, budget_micro_usd: budget,
+                    id, tenant, project_id: projectId, agent, goal, trigger_source: trigger, budget_micro_usd: budget,
                     status: 'preflight', gate_verdict: null, gate_reason: '', score: null,
                     cost_micro_usd: 0, next_run_at: null, created_at: Date.now(), started_at: null,
                     ended_at: null, meta: rawMeta,
@@ -232,7 +232,7 @@ function makeEnv(agentStatus: 'active' | 'paused' | null = 'active') {
                     return squad ? [squad] : []
                   }) as T[] }
                 }
-                if (sql.includes('SELECT id, squad_id FROM tasks WHERE id IN')) {
+                if (sql.includes('SELECT id, squad_id') && sql.includes('FROM tasks WHERE id IN')) {
                   return { results: args.flatMap((id) => {
                     const task = tasks.get(id as string)
                     return task ? [task] : []
@@ -559,7 +559,7 @@ describe('MCP flight tools', () => {
   it('does not reveal another agent flight through landing', async () => {
     const { env, rows } = makeEnv()
     rows.set('other-flight', {
-      id: 'other-flight', tenant: TENANT, agent: 'agent-other', goal: 'other', status: 'running',
+      id: 'other-flight', tenant: TENANT, project_id: null, agent: 'agent-other', goal: 'other', status: 'running',
       trigger_source: 'api', gate_verdict: 'go', gate_reason: '', score: 1,
       budget_micro_usd: 0, cost_micro_usd: 0, next_run_at: null, created_at: 1,
       started_at: 1, ended_at: null, meta: JSON.stringify(meta),
@@ -638,7 +638,7 @@ describe('MCP flight tools', () => {
   it('does not reveal whether a probed flight has legacy metadata', async () => {
     const { env, rows } = makeEnv()
     rows.set('legacy-flight', {
-      id: 'legacy-flight', tenant: TENANT, agent: AGENT_ID, goal: 'legacy', status: 'landed',
+      id: 'legacy-flight', tenant: TENANT, project_id: null, agent: AGENT_ID, goal: 'legacy', status: 'landed',
       trigger_source: 'manual', gate_verdict: 'go', gate_reason: '', score: 1,
       budget_micro_usd: null, cost_micro_usd: 0, next_run_at: null, created_at: 1,
       started_at: 1, ended_at: 2, meta: '{}',
@@ -652,7 +652,7 @@ describe('MCP flight tools', () => {
   it('paginates past newer flights hidden by multi-squad visibility', async () => {
     const { env, rows } = makeEnv()
     const makeRow = (id: string, createdAt: number, rowMeta: unknown): FlightRow => ({
-      id, tenant: TENANT, agent: AGENT_ID, goal: id, status: 'running', trigger_source: 'api',
+      id, tenant: TENANT, project_id: null, agent: AGENT_ID, goal: id, status: 'running', trigger_source: 'api',
       gate_verdict: 'go', gate_reason: '', score: 1, budget_micro_usd: 0, cost_micro_usd: 0,
       next_run_at: null, created_at: createdAt, started_at: createdAt, ended_at: null,
       meta: JSON.stringify(rowMeta),
@@ -722,7 +722,7 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           id TEXT PRIMARY KEY, member_id TEXT NOT NULL, squad_id TEXT NOT NULL, capability TEXT NOT NULL
         );
         CREATE TABLE tasks (
-          id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+          id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, project_id TEXT, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
           done_when TEXT NOT NULL, status TEXT NOT NULL, assignee_agent_id TEXT, github_issue_url TEXT,
           result TEXT, completed_at TEXT, gate_owner TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
@@ -731,7 +731,7 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           decided_by TEXT NOT NULL, decided_at TEXT NOT NULL
         );
         CREATE TABLE flights (
-          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, agent TEXT NOT NULL, goal TEXT NOT NULL,
+          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, project_id TEXT, agent TEXT NOT NULL, goal TEXT NOT NULL,
           status TEXT NOT NULL DEFAULT 'preflight', trigger_source TEXT NOT NULL DEFAULT 'manual',
           gate_verdict TEXT, gate_reason TEXT NOT NULL DEFAULT '', score REAL, budget_micro_usd INTEGER,
           cost_micro_usd INTEGER NOT NULL DEFAULT 0, next_run_at INTEGER,
