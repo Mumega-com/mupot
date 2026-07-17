@@ -1,52 +1,41 @@
-# Task 6: Addons Console Report
+# Task 6 Report: Read-Only Marketing Source Adapters
 
-## Delivered
+## RED Evidence
 
-- Added the authenticated `/addons` operational console using the existing server-rendered dashboard shell.
-- Joined registered addon manifests to tenant-scoped installation state, showing state, digest tail, connector and authority requests, and receipt access.
-- Rendered only valid lifecycle commands: Install, Configure, Activate, Disable, and disabled-state Activate plus Uninstall. Archived addons have no mutation control.
-- Bound action buttons to `data-addon-key` and `data-addon-action`; the browser constructs fixed encoded API paths, disables the command while pending, renders stable error codes inline, and refreshes on success.
-- Added owner/admin protection for the page and navigation: the shell reveals the Addons entry for owner/admin sessions only, while members receive `403` and the entry stays hidden.
+- Added adapter tests before production implementation for first-party read-only mapping, exact-ID vault resolution, PostHog and Inkwell secret redaction, bounded read behavior, MCPWP request restrictions, and adapter registration.
+- Ran `npx vitest run tests/marketing-monitor-adapters.test.ts tests/cro-sources.test.ts tests/cro-posthog.test.ts tests/executor-mcpwp-s4.test.ts`.
+- RED result: 1 failed suite and 3 passed suites; the new adapter suite failed during import because `src/addons/marketing/adapters` did not exist. The 72 existing CRO and MCPWP tests passed.
 
-## Changed Files
+## Files Changed
 
-- `src/dashboard/addons.ts`
-- `src/dashboard/index.ts`
-- `tests/dashboard-addons.test.ts`
+- `src/addons/marketing/adapters/first-party.ts`
+- `src/addons/marketing/adapters/posthog.ts`
+- `src/addons/marketing/adapters/inkwell.ts`
+- `src/addons/marketing/adapters/mcpwp.ts`
+- `src/addons/marketing/adapters/index.ts`
+- `src/connectors/service.ts`
+- `tests/marketing-monitor-adapters.test.ts`
+- `.superpowers/sdd/task-6-report.md`
 
-## TDD Evidence
+## Commands and Results
 
-1. Added dashboard rendering tests before the module existed.
-   - `npx vitest run tests/dashboard-addons.test.ts` failed as expected with `Cannot find module '../src/dashboard/addons'`.
-2. Implemented the renderer.
-   - Focused test passed: 8 tests.
-3. Added `/addons` route authorization and nav tests before route wiring.
-   - Focused test failed as expected: owners/admins and members received `404`.
-4. Wired the guarded route and console nav entry.
-   - Focused test passed: 11 tests.
-5. Added the shell-wide hidden-nav/reveal regression before implementation.
-   - Focused test failed as expected because `nav-addons` was absent on member shells.
-6. Reused the existing `/auth/me` role resolution to reveal the nav entry for owner/admin sessions only.
-   - Focused test passed: 11 tests.
-
-## Verification
-
-- `npx vitest run tests/dashboard-addons.test.ts tests/dashboard-auth-shell.test.ts tests/dashboard-header-chips.test.ts tests/addon-routes.test.ts`
-  - Passed: 4 files, 41 tests.
-- `npx vitest run tests/addon-contract.test.ts tests/addon-registry.test.ts tests/addon-service.test.ts tests/addon-routes.test.ts tests/dashboard-addons.test.ts`
-  - Passed: 5 files, 146 tests.
+- `npx vitest run tests/marketing-monitor-adapters.test.ts`
+  - Passed: 1 test file and 10 tests.
+- `npx vitest run tests/marketing-monitor-adapters.test.ts tests/cro-sources.test.ts tests/cro-posthog.test.ts tests/executor-mcpwp-s4.test.ts tests/connectors.test.ts`
+  - Passed: 5 test files and 114 tests.
 - `npm run typecheck`
-  - Passed.
+  - Passed with no TypeScript errors.
+- `npx vitest run --maxWorkers=4 --reporter=dot`
+  - Passed: 209 test files and 3,495 tests.
 - `git diff --check`
   - Passed with no whitespace errors.
+- Staged patch safety scan
+  - Only the seven Task 6 implementation/test paths were staged; no unrelated changes were included.
 
-## Self-Review
+## Commit SHA
 
-- Lifecycle URLs are never interpolated into action markup. Commands carry only the addon key and allowlisted action as data; client code uses `encodeURIComponent(key)` against the fixed `/api/addons/` base path.
-- The server denies members before addon catalog reads. The lifecycle API remains the sole write path and independently enforces the same owner/admin boundary.
-- The renderer uses compact 8px cards, existing CSS variables, stable command dimensions, a puzzle icon, responsive fact layout, no nested cards, and no marketing content.
-- Archived selections follow the API's latest-installation rule, preferring live installations over archives and the most recent archive when no live installation remains.
+Implementation commit: `074f4806ce49f8d1d9323cac98ca399be536f99c`.
 
 ## Concerns
 
-None.
+No blocking concerns. Inkwell and MCPWP currently report content-source health with zero numeric observations because the existing marketing metric contract grants them no metric authority. PostHog maps the existing unique-users aggregate to `seo.organic_sessions`; any future channel-specific organic-session query should replace that coarse proxy without widening the adapter boundary.
