@@ -304,11 +304,11 @@ describe('marketing CRO monitor dashboard', () => {
 
     expect(html).toContain('Run monitor')
     expect(html).toContain('data-monitor-action="run"')
-    expect(html).toContain('data-monitor-window-start="2026-07-01T00:00:00.000Z"')
-    expect(html).toContain('data-monitor-window-end="2026-07-01T23:59:59.999Z"')
+    expect(html).not.toContain('data-monitor-window-start=')
+    expect(html).not.toContain('data-monitor-window-end=')
   })
 
-  it('posts the monitor run request as JSON and reloads after success', async () => {
+  it('posts the current UTC day monitor window as JSON and reloads after success', async () => {
     const html = String(marketingCroMonitorBody(await loadedView()))
     const script = lifecycleScript(html)
     let click: (() => Promise<void>) | undefined
@@ -319,8 +319,6 @@ describe('marketing CRO monitor dashboard', () => {
     const button = {
       dataset: {
         monitorAction: 'run',
-        monitorWindowStart: '2026-07-01T00:00:00.000Z',
-        monitorWindowEnd: '2026-07-01T23:59:59.999Z',
       },
       disabled: false,
       addEventListener: (event: string, listener: () => Promise<void>) => {
@@ -331,7 +329,18 @@ describe('marketing CRO monitor dashboard', () => {
       querySelector: (selector: string) => selector === '[data-monitor-status]' ? status : null,
       querySelectorAll: (selector: string) => selector === '[data-monitor-action="run"]' ? [button] : [],
     }
-    const window = { location: { reload: () => { reloads += 1 } } }
+    class FakeDate extends Date {
+      constructor(value?: string | number | Date) {
+        super(value ?? '2026-07-17T06:40:00.000Z')
+      }
+      static now() {
+        return new Date('2026-07-17T06:40:00.000Z').getTime()
+      }
+    }
+    const window = {
+      Date: FakeDate,
+      location: { reload: () => { reloads += 1 } },
+    }
 
     new Function('document', 'fetch', 'window', script)(
       document,
@@ -351,8 +360,8 @@ describe('marketing CRO monitor dashboard', () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         window: {
-          start: '2026-07-01T00:00:00.000Z',
-          end: '2026-07-01T23:59:59.999Z',
+          start: '2026-07-17T00:00:00.000Z',
+          end: '2026-07-17T23:59:59.999Z',
         },
       }),
     })
