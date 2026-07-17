@@ -81,7 +81,8 @@ import {
   listFlightsForSquad,
   listIncompleteFlightTaskIds,
   FlightProjectError,
-  validateFlightProjectAttribution,
+  validateFlightProjectTarget,
+  validateFlightTaskProjectConsistency,
   type FlightRow,
 } from '../flight/service'
 import { parseDispatchBody } from '../flight/routes'
@@ -1126,19 +1127,19 @@ const toolFlightDispatch: ToolSpec = {
       return fail(400, 'invalid_project_id')
     }
     try {
-      await validateFlightProjectAttribution(env, {
-        agent: auth.boundAgentId,
-        goal,
-        project_id: projectId,
-        budget_micro_usd: requestedBudget as number,
-        meta,
-      })
+      await validateFlightProjectTarget(env, projectId)
     } catch (error) {
       if (error instanceof FlightProjectError) return flightProjectFailure(error)
       throw error
     }
     if (projectId && !workspaceAdmin && !(await hasProjectWriteForSquads(env, projectId, meta.squad_ids))) {
       return fail(403, 'forbidden', { need: 'project_write', scope: 'project squads' })
+    }
+    try {
+      await validateFlightTaskProjectConsistency(env, projectId, meta)
+    } catch (error) {
+      if (error instanceof FlightProjectError) return flightProjectFailure(error)
+      throw error
     }
 
     let budgetCeilingMicroUsd = 0

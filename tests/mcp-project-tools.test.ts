@@ -339,7 +339,7 @@ describe('MCP project attribution parity', () => {
     expect(restrictedRead).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
   })
 
-  it('orders project existence and archive validation before project-edge denial', async () => {
+  it('orders project target, edge authorization, and task consistency checks', async () => {
     harness = makeHarness()
     const env = envFor(harness)
     harness.sqlite.exec(`
@@ -347,6 +347,8 @@ describe('MCP project attribution parity', () => {
       VALUES ('project-no-edge', '${SQUAD_ID}', 'write');
       INSERT INTO tasks (id, squad_id, title, done_when, status, project_id)
       VALUES ('task-no-edge', '${SQUAD_ID}', 'No edge', 'done', 'in_progress', 'project-no-edge');
+      INSERT INTO tasks (id, squad_id, title, done_when, status, project_id)
+      VALUES ('task-mismatch', '${SQUAD_ID}', 'Mismatch', 'done', 'in_progress', 'project-b');
       DELETE FROM project_squad_access
        WHERE project_id = 'project-no-edge' AND squad_id = '${SQUAD_ID}';
     `)
@@ -365,8 +367,11 @@ describe('MCP project attribution parity', () => {
     await expect(dispatchFor('project-archived', 'missing-task')).resolves.toMatchObject({
       ok: false, status: 400, error: 'archived_project',
     })
-    await expect(dispatchFor('project-no-edge', 'task-no-edge')).resolves.toMatchObject({
+    await expect(dispatchFor('project-read', 'task-mismatch')).resolves.toMatchObject({
       ok: false, status: 403, error: 'forbidden', detail: { need: 'project_write' },
+    })
+    await expect(dispatchFor('project-a', 'task-mismatch')).resolves.toMatchObject({
+      ok: false, status: 400, error: 'flight_task_project_mismatch',
     })
   })
 

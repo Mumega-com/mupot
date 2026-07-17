@@ -64,8 +64,11 @@ export class FlightProjectError extends Error {
   }
 }
 
-export async function validateFlightProjectAttribution(env: Env, flight: NewFlight): Promise<void> {
-  const projectId = flight.project_id ?? null
+export async function validateFlightProjectTarget(
+  env: Env,
+  projectId: NewFlight['project_id'],
+): Promise<void> {
+  projectId = projectId ?? null
   if (projectId === null) return
   if (typeof projectId !== 'string' || projectId.trim().length === 0) {
     throw new FlightProjectError('invalid_project_id')
@@ -75,17 +78,29 @@ export async function validateFlightProjectAttribution(env: Env, flight: NewFlig
     .first<{ status: string }>()
   if (!project) throw new FlightProjectError('project_not_found')
   if (project.status === 'archived') throw new FlightProjectError('archived_project')
+}
 
-  if (flight.meta) {
-    const placeholders = flight.meta.task_ids.map((_, index) => `?${index + 1}`).join(',')
+export async function validateFlightTaskProjectConsistency(
+  env: Env,
+  projectId: NewFlight['project_id'],
+  meta: NewFlight['meta'],
+): Promise<void> {
+  projectId = projectId ?? null
+  if (projectId !== null && meta) {
+    const placeholders = meta.task_ids.map((_, index) => `?${index + 1}`).join(',')
     const rows = await env.DB.prepare(
       `SELECT id, project_id FROM tasks WHERE id IN (${placeholders})`,
-    ).bind(...flight.meta.task_ids).all<{ id: string; project_id: string | null }>()
+    ).bind(...meta.task_ids).all<{ id: string; project_id: string | null }>()
     const tasks = new Map((rows.results ?? []).map((task) => [task.id, task]))
-    if (flight.meta.task_ids.some((taskId) => tasks.get(taskId)?.project_id !== projectId)) {
+    if (meta.task_ids.some((taskId) => tasks.get(taskId)?.project_id !== projectId)) {
       throw new FlightProjectError('flight_task_project_mismatch')
     }
   }
+}
+
+export async function validateFlightProjectAttribution(env: Env, flight: NewFlight): Promise<void> {
+  await validateFlightProjectTarget(env, flight.project_id)
+  await validateFlightTaskProjectConsistency(env, flight.project_id, flight.meta)
 }
 
 function mapFlightProjectInsertError(error: unknown): never {

@@ -183,7 +183,7 @@ BEGIN
 END;
 
 CREATE TRIGGER validate_flights_project_id_update
-BEFORE UPDATE ON flights
+BEFORE UPDATE OF project_id, meta ON flights
 BEGIN
   SELECT CASE WHEN NEW.project_id IS NOT NULL
     AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id)

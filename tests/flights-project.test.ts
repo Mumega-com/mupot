@@ -10,7 +10,7 @@ vi.mock('../src/auth/member-bearer', () => ({
 }))
 
 const { flightsApp, parseDispatchBody } = await import('../src/flight/routes')
-const { createFlight } = await import('../src/flight/service')
+const { applyPreflight, createFlight, failFlight, landFlight } = await import('../src/flight/service')
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 
 const signals = {
@@ -284,6 +284,38 @@ describe('flight project attribution', () => {
       meta: meta as never,
     })).rejects.toMatchObject({ code: 'project_access_forbidden' })
     expect(harness.sqlite.prepare(`SELECT count(*) AS count FROM flights`).get()).toEqual({ count: 0 })
+  })
+
+  it('allows authorized governed flights to settle after their project edge is revoked', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const landedId = await createFlight(env, {
+      agent: 'agent-a',
+      goal: 'Land after revoke',
+      project_id: 'project-a',
+      meta: meta as never,
+    })
+    const failedId = await createFlight(env, {
+      agent: 'agent-a',
+      goal: 'Fail after revoke',
+      project_id: 'project-a',
+      meta: meta as never,
+    })
+    harness.sqlite.exec(`
+      DELETE FROM project_squad_access
+       WHERE project_id = 'project-a' AND squad_id = 'squad-a'
+    `)
+
+    await applyPreflight(env, landedId, { go: true, score: 1, checks: {} as never, reasons: [] })
+    await landFlight(env, landedId, { cost_micro_usd: 25, score: 1 })
+    await failFlight(env, failedId, 'settled failure')
+
+    expect(harness.sqlite.prepare(`
+      SELECT status, cost_micro_usd FROM flights WHERE id = ?
+    `).get(landedId)).toEqual({ status: 'landed', cost_micro_usd: 25 })
+    expect(harness.sqlite.prepare(`
+      SELECT status, gate_reason FROM flights WHERE id = ?
+    `).get(failedId)).toEqual({ status: 'failed', gate_reason: 'settled failure' })
   })
 
   it('returns stable project_write denial when the durable route insert lacks an edge', async () => {

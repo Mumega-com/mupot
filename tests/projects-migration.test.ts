@@ -224,7 +224,7 @@ describe('0055_projects migration', () => {
     }
   })
 
-  it('rejects governed flight inserts and updates when a referenced project edge is revoked', () => {
+  it('rejects governed flight attribution changes but allows lifecycle updates after edge revocation', () => {
     const { sqlite, close } = createSqliteD1()
     try {
       applyPriorMigrations(sqlite)
@@ -232,7 +232,9 @@ describe('0055_projects migration', () => {
       sqlite.exec(`
         INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Department');
         INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'squad', 'Squad');
-        INSERT INTO projects (id, slug, name, status) VALUES ('project-a', 'a', 'A', 'active');
+        INSERT INTO projects (id, slug, name, status) VALUES
+          ('project-a', 'a', 'A', 'active'),
+          ('project-b', 'b', 'B', 'active');
         INSERT INTO project_squad_access (project_id, squad_id, access_level)
         VALUES ('project-a', 'squad-1', 'write');
         INSERT INTO tasks (id, squad_id, title, project_id)
@@ -258,10 +260,16 @@ describe('0055_projects migration', () => {
         INSERT INTO flights (id, tenant, agent, goal, meta, project_id)
         VALUES ('flight-after-revoke', 'tenant', 'agent', 'After revoke', ?, 'project-a')
       `).run(meta)).toThrow(/flight project access denied/)
-      expect(() => sqlite.exec(`UPDATE flights SET status = 'running' WHERE id = 'flight-before-revoke'`))
+      sqlite.exec(`
+        UPDATE flights SET status = 'running' WHERE id = 'flight-before-revoke';
+        UPDATE flights SET status = 'landed', cost_micro_usd = 25 WHERE id = 'flight-before-revoke';
+      `)
+      expect(sqlite.prepare(`SELECT status, cost_micro_usd FROM flights WHERE id = 'flight-before-revoke'`).get())
+        .toEqual({ status: 'landed', cost_micro_usd: 25 })
+      expect(() => sqlite.exec(`UPDATE flights SET meta = meta WHERE id = 'flight-before-revoke'`))
         .toThrow(/flight project access denied/)
-      expect(sqlite.prepare(`SELECT status FROM flights WHERE id = 'flight-before-revoke'`).get())
-        .toEqual({ status: 'preflight' })
+      expect(() => sqlite.exec(`UPDATE flights SET project_id = 'project-b' WHERE id = 'flight-before-revoke'`))
+        .toThrow(/flight project access denied/)
 
       // Nullable and non-governed legacy rows remain outside the project-edge invariant.
       sqlite.exec(`
