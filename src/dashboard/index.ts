@@ -323,11 +323,15 @@ dashboardApp.get('/addons', async (c) => {
     return c.html(shell(c.env, 'Addons', errorBody('Addons requires owner or admin.')), 403)
   }
   try {
-    const installations = await listAddonInstallations(c.env)
+    const [installations, connectors] = await Promise.all([
+      listAddonInstallations(c.env),
+      listConnectors(c.env),
+    ])
     return c.html(shell(c.env, 'Addons', addonsBody(
       listRegisteredAddons(),
       installations,
       dashboardBuiltInGetRoutes,
+      connectors,
     )))
   } catch {
     return c.html(shell(c.env, 'Addons', errorBody('Addon catalog is unavailable.')), 500)
