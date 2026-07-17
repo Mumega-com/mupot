@@ -136,6 +136,32 @@ describe('project domain service', () => {
       .resolves.toMatchObject({ ok: true, value: { status: 'active' } })
   })
 
+  it('rejects creating or reparenting a child under an archived parent', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const archivedRoot = await createRoot(env, 'archived-root')
+    const movableRoot = await createRoot(env, 'movable-root')
+    await updateProject(env, archivedRoot.id, { status: 'archived' })
+
+    await expect(createProject(env, { slug: 'under-archived', name: 'Under archived', parent_project_id: archivedRoot.id }))
+      .resolves.toEqual({ ok: false, error: 'archived_project' })
+    await expect(updateProject(env, movableRoot.id, { parent_project_id: archivedRoot.id }))
+      .resolves.toEqual({ ok: false, error: 'archived_project' })
+  })
+
+  it('rejects squad-access mutations on archived projects', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const root = await createRoot(env)
+    await upsertProjectSquadAccess(env, root.id, 'squad-1', 'write')
+    await updateProject(env, root.id, { status: 'archived' })
+
+    await expect(upsertProjectSquadAccess(env, root.id, 'squad-2', 'write'))
+      .resolves.toEqual({ ok: false, error: 'archived_project' })
+    await expect(removeProjectSquadAccess(env, root.id, 'squad-1'))
+      .resolves.toEqual({ ok: false, error: 'archived_project' })
+  })
+
   it('keeps squad access explicit per project and supports upsert and removal', async () => {
     harness = makeHarness()
     const env = envFor(harness)
@@ -169,5 +195,74 @@ describe('project domain service', () => {
 
     await expect(createProject(env, { slug: 'project', name: 'Project' }))
       .resolves.toEqual({ ok: false, error: 'receipt_failed' })
+  })
+
+  it('maps foreign-key races to stable project mutation errors', async () => {
+    const project = {
+      id: 'project-1', slug: 'project', name: 'Project', description: '', goal: '', status: 'active',
+      parent_project_id: null, target_date: null, created_at: '2026-07-17T00:00:00.000Z', updated_at: '2026-07-17T00:00:00.000Z',
+    }
+    const foreignKeyError = new Error('FOREIGN KEY constraint failed')
+    const createOrUpdateEnv = {
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(id: string) {
+              return {
+                first: async () => sql.includes('WHERE parent_project_id =') ? null : ({ ...project, id }),
+                run: async () => { throw foreignKeyError },
+              }
+            },
+          }
+        },
+      },
+    } as Env
+
+    await expect(createProject(createOrUpdateEnv, { slug: 'child', name: 'Child', parent_project_id: 'parent-1' }))
+      .resolves.toEqual({ ok: false, error: 'parent_not_found' })
+    await expect(updateProject(createOrUpdateEnv, 'project-1', { parent_project_id: 'parent-1' }))
+      .resolves.toEqual({ ok: false, error: 'parent_not_found' })
+
+    let projectLookups = 0
+    const upsertEnv = {
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind() {
+              return {
+                first: async () => {
+                  if (sql.includes('FROM projects')) return ++projectLookups === 1 ? project : null
+                  return { id: 'squad-1' }
+                },
+                run: async () => { throw foreignKeyError },
+              }
+            },
+          }
+        },
+      },
+    } as Env
+    await expect(upsertProjectSquadAccess(upsertEnv, 'project-1', 'squad-1', 'write'))
+      .resolves.toEqual({ ok: false, error: 'project_not_found' })
+
+    projectLookups = 0
+    const missingSquadEnv = {
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind() {
+              return {
+                first: async () => {
+                  if (sql.includes('FROM projects')) return project
+                  return ++projectLookups === 1 ? { id: 'squad-1' } : null
+                },
+                run: async () => { throw foreignKeyError },
+              }
+            },
+          }
+        },
+      },
+    } as Env
+    await expect(upsertProjectSquadAccess(missingSquadEnv, 'project-1', 'squad-1', 'write'))
+      .resolves.toEqual({ ok: false, error: 'squad_not_found' })
   })
 })

@@ -31,6 +31,47 @@ CREATE TABLE IF NOT EXISTS project_squad_access (
 ALTER TABLE tasks ADD COLUMN project_id TEXT;
 ALTER TABLE flights ADD COLUMN project_id TEXT;
 
+-- The service returns stable domain errors, but these triggers close the gap
+-- between its validation reads and the durable INSERT/UPDATE write.
+CREATE TRIGGER validate_projects_parent_insert
+BEFORE INSERT ON projects
+WHEN NEW.parent_project_id IS NOT NULL
+BEGIN
+  SELECT CASE WHEN NEW.parent_project_id = NEW.id
+    THEN RAISE(ABORT, 'project hierarchy cycle') END;
+  SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.parent_project_id)
+    THEN RAISE(ABORT, 'parent project not found') END;
+  SELECT CASE WHEN EXISTS (SELECT 1 FROM projects WHERE id = NEW.parent_project_id AND status = 'archived')
+    THEN RAISE(ABORT, 'archived parent project') END;
+  SELECT CASE WHEN EXISTS (SELECT 1 FROM projects WHERE id = NEW.parent_project_id AND parent_project_id IS NOT NULL)
+    THEN RAISE(ABORT, 'project hierarchy depth') END;
+END;
+
+CREATE TRIGGER validate_projects_parent_update
+BEFORE UPDATE OF parent_project_id ON projects
+WHEN NEW.parent_project_id IS NOT NULL
+BEGIN
+  SELECT CASE WHEN NEW.parent_project_id = NEW.id
+    THEN RAISE(ABORT, 'project hierarchy cycle') END;
+  SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.parent_project_id)
+    THEN RAISE(ABORT, 'parent project not found') END;
+  SELECT CASE WHEN EXISTS (SELECT 1 FROM projects WHERE id = NEW.parent_project_id AND status = 'archived')
+    THEN RAISE(ABORT, 'archived parent project') END;
+  SELECT CASE WHEN EXISTS (
+    WITH RECURSIVE ancestors(id, parent_project_id) AS (
+      SELECT id, parent_project_id FROM projects WHERE id = NEW.parent_project_id
+      UNION ALL
+      SELECT projects.id, projects.parent_project_id
+      FROM projects JOIN ancestors ON projects.id = ancestors.parent_project_id
+    )
+    SELECT 1 FROM ancestors WHERE id = NEW.id
+  ) THEN RAISE(ABORT, 'project hierarchy cycle') END;
+  SELECT CASE WHEN EXISTS (SELECT 1 FROM projects WHERE id = NEW.parent_project_id AND parent_project_id IS NOT NULL)
+    THEN RAISE(ABORT, 'project hierarchy depth') END;
+  SELECT CASE WHEN EXISTS (SELECT 1 FROM projects WHERE parent_project_id = NEW.id)
+    THEN RAISE(ABORT, 'project hierarchy depth') END;
+END;
+
 CREATE TRIGGER validate_tasks_project_id_insert
 BEFORE INSERT ON tasks
 WHEN NEW.project_id IS NOT NULL

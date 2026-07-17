@@ -60,12 +60,12 @@ function isUniqueViolation(error: unknown): boolean {
   return error instanceof Error && /UNIQUE constraint failed/i.test(error.message)
 }
 
-function wrote(result: D1Result<unknown>): boolean {
-  return Number(result.meta?.changes ?? 0) > 0
+function isForeignKeyViolation(error: unknown): boolean {
+  return error instanceof Error && /FOREIGN KEY constraint failed/i.test(error.message)
 }
 
-async function projectExists(env: Env, id: string): Promise<boolean> {
-  return (await env.DB.prepare('SELECT 1 FROM projects WHERE id = ?').bind(id).first()) !== null
+function wrote(result: D1Result<unknown>): boolean {
+  return Number(result.meta?.changes ?? 0) > 0
 }
 
 async function hasNonArchivedChildren(env: Env, projectId: string): Promise<boolean> {
@@ -88,9 +88,11 @@ async function validateParent(
   if (parentProjectId === null) return null
   if (typeof parentProjectId !== 'string' || !parentProjectId) return 'parent_not_found'
 
-  let parent = await getProject(env, parentProjectId)
-  if (!parent) return 'parent_not_found'
+  const directParent = await getProject(env, parentProjectId)
+  if (!directParent) return 'parent_not_found'
+  if (directParent.status === 'archived') return 'archived_project'
 
+  let parent: Project | null = directParent
   while (parent) {
     if (parent.id === projectId) return 'hierarchy_cycle'
     if (parent.parent_project_id === null) break
@@ -98,7 +100,6 @@ async function validateParent(
     if (!parent) return 'parent_not_found'
   }
 
-  const directParent = await getProject(env, parentProjectId)
   return directParent?.parent_project_id === null ? null : 'hierarchy_depth'
 }
 
@@ -156,6 +157,7 @@ export async function createProject(
     if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
   } catch (error) {
     if (isUniqueViolation(error)) return { ok: false, error: 'slug_taken' }
+    if (isForeignKeyViolation(error)) return { ok: false, error: 'parent_not_found' }
     throw error
   }
 
@@ -249,6 +251,7 @@ export async function updateProject(
     if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
   } catch (error) {
     if (isUniqueViolation(error)) return { ok: false, error: 'slug_taken' }
+    if (isForeignKeyViolation(error)) return { ok: false, error: 'parent_not_found' }
     throw error
   }
   return { ok: true, value: updated }
@@ -268,7 +271,9 @@ export async function upsertProjectSquadAccess(
   squadId: string,
   accessLevel: unknown,
 ): Promise<ProjectMutationResult<ProjectSquadAccess>> {
-  if (!await projectExists(env, projectId)) return { ok: false, error: 'project_not_found' }
+  const project = await getProject(env, projectId)
+  if (!project) return { ok: false, error: 'project_not_found' }
+  if (project.status === 'archived') return { ok: false, error: 'archived_project' }
   if ((await env.DB.prepare('SELECT 1 FROM squads WHERE id = ?').bind(squadId).first()) === null) {
     return { ok: false, error: 'squad_not_found' }
   }
@@ -283,6 +288,13 @@ export async function upsertProjectSquadAccess(
     ).bind(projectId, squadId, accessLevel, grantedAt).run()
     if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
   } catch (error) {
+    if (isForeignKeyViolation(error)) {
+      if (!await getProject(env, projectId)) return { ok: false, error: 'project_not_found' }
+      if ((await env.DB.prepare('SELECT 1 FROM squads WHERE id = ?').bind(squadId).first()) === null) {
+        return { ok: false, error: 'squad_not_found' }
+      }
+      return { ok: false, error: 'project_not_found' }
+    }
     throw error
   }
 
@@ -297,7 +309,9 @@ export async function removeProjectSquadAccess(
   projectId: string,
   squadId: string,
 ): Promise<ProjectMutationResult<void>> {
-  if (!await projectExists(env, projectId)) return { ok: false, error: 'project_not_found' }
+  const project = await getProject(env, projectId)
+  if (!project) return { ok: false, error: 'project_not_found' }
+  if (project.status === 'archived') return { ok: false, error: 'archived_project' }
   const result = await env.DB.prepare(
     'DELETE FROM project_squad_access WHERE project_id = ? AND squad_id = ?',
   ).bind(projectId, squadId).run()
