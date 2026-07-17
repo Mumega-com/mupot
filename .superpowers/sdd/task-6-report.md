@@ -77,3 +77,37 @@ Implementation commit: `14700edc2a2c0b985b6a82381b70beb3c47833d7`.
 ### Concerns
 
 No blocking concerns. The MCPWP 3xx regression test did not produce a RED phase because the reviewed implementation already rejected 3xx status responses; only the explicit response-level coverage was missing. PostHog intentionally remains availability-only until a channel-correct organic-session query is implemented.
+
+## Plaintext Boundary Review Fix
+
+### RED Evidence
+
+- Replaced the raw-secret callback tests before production changes with tests requiring an expiring `authenticatedFetch` capability and fresh remapping at both the fetch and connector-use boundaries.
+- Ran `npx vitest run tests/marketing-monitor-adapters.test.ts --maxWorkers=1 --reporter=dot`.
+- RED result: 1 failed file with 2 failed and 11 passed tests. The capability test failed with `connector_use_failed` because the callback still exposed `call(operation(secret))`; the error-boundary test received `resolved.authenticatedFetch is not a function` instead of the required stable `connector_fetch_failed`.
+
+### Files Changed
+
+- `src/connectors/service.ts`
+- `src/addons/marketing/adapters/posthog.ts`
+- `src/addons/marketing/adapters/inkwell.ts`
+- `src/addons/marketing/adapters/mcpwp.ts`
+- `tests/marketing-monitor-adapters.test.ts`
+- `.superpowers/sdd/task-6-report.md`
+
+### Commands and Results
+
+- `npx vitest run tests/marketing-monitor-adapters.test.ts tests/marketing-monitor-service.test.ts tests/cro-sources.test.ts tests/cro-posthog.test.ts tests/executor-mcpwp-s4.test.ts tests/connectors.test.ts --maxWorkers=1 --reporter=dot`
+  - Passed: 6 test files and 168 tests.
+- `npm run typecheck`
+  - Passed with no TypeScript errors.
+- `git diff --check`
+  - Passed with no whitespace errors.
+
+### Commit SHA
+
+Implementation commit: `ed2eff427d8ee9fbc721eac970f07604098fd8c8`.
+
+### Concerns
+
+No blocking concerns. Authenticated transport still receives the credential in the required HTTP authorization header, but adapter code receives only frozen non-secret metadata and a one-shot capability that expires when the callback returns. PostHog remains availability-only until a channel-correct organic-session query is implemented.
