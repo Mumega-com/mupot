@@ -105,17 +105,6 @@ const run: MarketingMonitorRun = {
 const env = { TENANT_SLUG: 'tenant-a' } as Env
 const actor = { id: 'owner-1', role: 'owner' as const }
 
-function lifecycleScript(markup: string): string {
-  const normalized = markup.toLowerCase()
-  const openStart = normalized.indexOf('<script')
-  const openEnd = normalized.indexOf('>', openStart)
-  const closeStart = normalized.indexOf('</script>', openEnd)
-  if (openStart < 0 || openEnd < 0 || closeStart < 0) {
-    throw new Error('monitor action script was not rendered')
-  }
-  return markup.slice(openEnd + 1, closeStart).trim()
-}
-
 async function loadedView() {
   return loadMarketingCroMonitorView(env, installation, actor, {
     listBindings: async () => [binding],
@@ -297,7 +286,7 @@ describe('marketing CRO monitor dashboard', () => {
     expect(html).toContain('minmax(0, 1fr)')
     expect(html).toContain('data-monitor-action="run"')
     expect(html).toContain('action="/addons/marketing-cro-monitor/run"')
-    expect(html).toContain('fetch(')
+    expect(html).not.toContain('fetch(')
   })
 
   it('renders a governed run action that posts a bounded evidence window', async () => {
@@ -309,70 +298,6 @@ describe('marketing CRO monitor dashboard', () => {
     expect(html).toContain('action="/addons/marketing-cro-monitor/run"')
     expect(html).not.toContain('data-monitor-window-start=')
     expect(html).not.toContain('data-monitor-window-end=')
-  })
-
-  it('posts the current UTC day monitor window as JSON and reloads after success', async () => {
-    const html = String(marketingCroMonitorBody(await loadedView()))
-    const script = lifecycleScript(html)
-    let click: ((event: { preventDefault: () => void }) => Promise<void>) | undefined
-    let prevented = false
-    let requestPath = ''
-    let requestOptions: RequestInit | undefined
-    let reloads = 0
-    const status = { textContent: '' }
-    const button = {
-      dataset: {
-        monitorAction: 'run',
-      },
-      disabled: false,
-      addEventListener: (event: string, listener: (event: { preventDefault: () => void }) => Promise<void>) => {
-        if (event === 'click') click = listener
-      },
-    }
-    const document = {
-      querySelector: (selector: string) => selector === '[data-monitor-status]' ? status : null,
-      querySelectorAll: (selector: string) => selector === '[data-monitor-action="run"]' ? [button] : [],
-    }
-    class FakeDate extends Date {
-      constructor(value?: string | number | Date) {
-        super(value ?? '2026-07-17T06:40:00.000Z')
-      }
-      static now() {
-        return new Date('2026-07-17T06:40:00.000Z').getTime()
-      }
-    }
-    const window = {
-      Date: FakeDate,
-      location: { reload: () => { reloads += 1 } },
-    }
-
-    new Function('document', 'fetch', 'window', script)(
-      document,
-      async (path: string, options: RequestInit) => {
-        requestPath = path
-        requestOptions = options
-        return { ok: true, json: async () => ({}) }
-      },
-      window,
-    )
-    if (!click) throw new Error('monitor click listener was not attached')
-    await click({ preventDefault: () => { prevented = true } })
-
-    expect(requestPath).toBe('/api/addons/marketing-cro-monitor/monitor')
-    expect(requestOptions).toEqual({
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        window: {
-          start: '2026-07-17T00:00:00.000Z',
-          end: '2026-07-17T23:59:59.999Z',
-        },
-      }),
-    })
-    expect(button.disabled).toBe(true)
-    expect(status.textContent).toBe('Running...')
-    expect(reloads).toBe(1)
-    expect(prevented).toBe(true)
   })
 
   it('preserves unavailable reads instead of converting them to empty or zero values', async () => {
