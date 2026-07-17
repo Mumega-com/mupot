@@ -513,47 +513,5 @@ export function marketingCroMonitorBody(view: MarketingCroMonitorView) {
       </div>`,
     })}
     ${sectionPanel({ title: 'Recent runs', body: recentRunsBody(view.recentRuns) })}
-    <script>
-      (function () {
-        var buttons = document.querySelectorAll('[data-monitor-action="run"]');
-        var status = document.querySelector('[data-monitor-status]');
-        function currentUtcWindow() {
-          var now = new window.Date();
-          var year = now.getUTCFullYear();
-          var month = now.getUTCMonth();
-          var day = now.getUTCDate();
-          return {
-            start: new window.Date(window.Date.UTC(year, month, day, 0, 0, 0, 0)).toISOString(),
-            end: new window.Date(window.Date.UTC(year, month, day, 23, 59, 59, 999)).toISOString(),
-          };
-        }
-        buttons.forEach(function (button) {
-          button.addEventListener('click', async function (event) {
-            event.preventDefault();
-            var windowRange = currentUtcWindow();
-            button.disabled = true;
-            if (status) status.textContent = 'Running...';
-            try {
-              var response = await fetch('/api/addons/${ADDON_KEY}/monitor', {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ window: windowRange }),
-              });
-              var data = {};
-              try { data = await response.json(); } catch (_) {}
-              if (!response.ok) {
-                if (status) status.textContent = data.error || 'request_failed';
-                button.disabled = false;
-                return;
-              }
-              window.location.reload();
-            } catch (_) {
-              if (status) status.textContent = 'network_error';
-              button.disabled = false;
-            }
-          });
-        });
-      })();
-    </script>
   `
 }
