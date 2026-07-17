@@ -44,6 +44,11 @@ const failed = (): SourceSnapshot => ({
   observations: [],
 })
 
+function isRedirect(response: Response): boolean {
+  return response.type as string === 'opaqueredirect'
+    || (response.status >= 300 && response.status < 400)
+}
+
 export function createPosthogMarketingSource(_runId: string): MarketingMonitorSource {
   return {
     key: 'posthog',
@@ -64,9 +69,10 @@ export function createPosthogMarketingSource(_runId: string): MarketingMonitorSo
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ query: { kind: 'HogQLQuery', query: HOGQL_24H_ROLLUP } }),
+            redirect: 'manual',
             signal: controller.signal,
           })
-          if (!response.ok) return failed()
+          if (isRedirect(response) || !response.ok) return failed()
           await response.json()
           return { status: 'available' as const, observations: [] }
         } catch {

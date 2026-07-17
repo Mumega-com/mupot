@@ -315,6 +315,7 @@ describe('PostHog marketing adapter', () => {
     const [url, init] = (fetchSpy as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit]
     expect(url).toBe('https://us.posthog.com/api/projects/436189/query/')
     expect(init.method).toBe('POST')
+    expect(init.redirect).toBe('manual')
     expect(String(init.body)).toContain('HogQLQuery')
     expect(new Headers(init.headers).get('authorization')).toBe(`Bearer ${secret}`)
     expect(url).not.toContain(secret)
@@ -354,6 +355,29 @@ describe('PostHog marketing adapter', () => {
     expect(failed).toEqual({ status: 'failed', reason: 'source_unavailable', observations: [] })
     expect(JSON.stringify(failed)).not.toContain(secret)
     expect(JSON.stringify(failed)).not.toContain('denied')
+  })
+
+  it('refuses PostHog redirects instead of following them past the SSRF guard', async () => {
+    const connector = await connectorFixture('posthog', 'posthog-redirect-secret', {
+      projectId: '436189',
+      host: 'https://us.posthog.com',
+    })
+    const fetchSpy = vi.fn(async () => new Response(null, {
+      status: 302,
+      headers: { location: 'https://169.254.169.254/latest/meta-data' },
+    })) as unknown as typeof fetch
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const snapshot = await createPosthogMarketingSource(RUN_ID).read(
+      vaultEnv([connector]),
+      vaultBinding('posthog'),
+      window,
+    )
+
+    expect(snapshot).toEqual({ status: 'failed', reason: 'source_unavailable', observations: [] })
+    expect(fetchSpy).toHaveBeenCalledOnce()
+    const [, init] = (fetchSpy as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit]
+    expect(init.redirect).toBe('manual')
   })
 })
 

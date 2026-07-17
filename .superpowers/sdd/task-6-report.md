@@ -111,3 +111,28 @@ Implementation commit: `ed2eff427d8ee9fbc721eac970f07604098fd8c8`.
 ### Concerns
 
 No blocking concerns. Authenticated transport still receives the credential in the required HTTP authorization header, but adapter code receives only frozen non-secret metadata and a one-shot capability that expires when the callback returns. PostHog remains availability-only until a channel-correct organic-session query is implemented.
+
+## PostHog Redirect Review Fix
+
+### RED Evidence
+
+- Added PostHog redirect coverage requiring `redirect: 'manual'` and stable failed output for an actual `302` response pointing at link-local metadata.
+- Ran `npx vitest run tests/marketing-monitor-adapters.test.ts --maxWorkers=1 --reporter=dot`.
+- RED result: 1 failed file with 2 failed and 12 passed tests. Existing PostHog fetches had `redirect` undefined.
+
+### Files Changed
+
+- `src/addons/marketing/adapters/posthog.ts`
+- `tests/marketing-monitor-adapters.test.ts`
+- `.superpowers/sdd/task-6-report.md`
+
+### Commands and Results
+
+- `npx vitest run tests/marketing-monitor-adapters.test.ts --maxWorkers=1 --reporter=dot`
+  - Passed: 1 test file and 14 tests.
+- `npx vitest run tests/marketing-monitor-adapters.test.ts tests/marketing-monitor-service.test.ts tests/cro-sources.test.ts tests/cro-posthog.test.ts tests/executor-mcpwp-s4.test.ts tests/connectors.test.ts --maxWorkers=1 --reporter=dot`
+  - Passed: 6 test files and 169 tests.
+
+### Concerns
+
+No blocking concerns. PostHog now matches MCPWP redirect discipline and remains availability-only until a channel-correct organic-session query is implemented.
