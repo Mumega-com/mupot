@@ -54,6 +54,7 @@ export interface NewFlight {
 
 export type FlightProjectErrorCode =
   | 'invalid_project_id'
+  | 'invalid_flight_meta'
   | 'project_not_found'
   | 'archived_project'
   | 'project_access_forbidden'
@@ -115,6 +116,7 @@ export async function validateFlightProjectAttribution(env: Env, flight: NewFlig
 
 function mapFlightProjectInsertError(error: unknown): never {
   const message = error instanceof Error ? error.message : String(error)
+  if (message.includes('flight meta invalid')) throw new FlightProjectError('invalid_flight_meta')
   if (message.includes('flight project not found')) throw new FlightProjectError('project_not_found')
   if (message.includes('flight project archived')) throw new FlightProjectError('archived_project')
   if (message.includes('flight project access denied')) {

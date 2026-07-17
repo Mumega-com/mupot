@@ -324,6 +324,7 @@ describe('flight project attribution', () => {
     for (const [message, code] of [
       ['flight project not found', 'project_not_found'],
       ['flight project archived', 'archived_project'],
+      ['flight meta invalid', 'invalid_flight_meta'],
       ['flight task not found', 'flight_task_not_found'],
       ['flight task project mismatch', 'flight_task_project_mismatch'],
       ['flight project access denied', 'project_access_forbidden'],

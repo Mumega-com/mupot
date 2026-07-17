@@ -177,6 +177,28 @@ BEGIN
     THEN RAISE(ABORT, 'flight project archived') END;
   SELECT CASE WHEN NEW.project_id IS NOT NULL
     AND json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+    AND (
+      json_type(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.squad_ids') IS NOT 'array'
+      OR COALESCE(json_array_length(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.squad_ids'), 0) NOT BETWEEN 1 AND 8
+      OR EXISTS (
+        SELECT 1
+        FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.squad_ids') AS squad_ref
+        WHERE squad_ref.type <> 'text'
+           OR length(squad_ref.value) NOT BETWEEN 1 AND 200
+           OR length(trim(squad_ref.value)) = 0
+      )
+      OR json_type(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.task_ids') IS NOT 'array'
+      OR COALESCE(json_array_length(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.task_ids'), 0) NOT BETWEEN 1 AND 200
+      OR EXISTS (
+        SELECT 1
+        FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.task_ids') AS task_ref
+        WHERE task_ref.type <> 'text'
+           OR length(task_ref.value) NOT BETWEEN 1 AND 200
+           OR length(trim(task_ref.value)) = 0
+      )
+    ) THEN RAISE(ABORT, 'flight meta invalid') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
     AND EXISTS (
       SELECT 1
       FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.squad_ids') AS squad_ref
@@ -215,6 +237,31 @@ BEGIN
       NEW.project_id IS NULL
       OR json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') IS NOT 'mupot.flight.meta/v1'
     ) THEN RAISE(ABORT, 'flight project attribution downgrade') END;
+  SELECT CASE WHEN (
+      json_extract(CASE WHEN json_valid(OLD.meta) THEN OLD.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+      OR json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+    )
+    AND (
+      NOT json_valid(NEW.meta)
+      OR json_type(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.squad_ids') IS NOT 'array'
+      OR COALESCE(json_array_length(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.squad_ids'), 0) NOT BETWEEN 1 AND 8
+      OR EXISTS (
+        SELECT 1
+        FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.squad_ids') AS squad_ref
+        WHERE squad_ref.type <> 'text'
+           OR length(squad_ref.value) NOT BETWEEN 1 AND 200
+           OR length(trim(squad_ref.value)) = 0
+      )
+      OR json_type(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.task_ids') IS NOT 'array'
+      OR COALESCE(json_array_length(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.task_ids'), 0) NOT BETWEEN 1 AND 200
+      OR EXISTS (
+        SELECT 1
+        FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.task_ids') AS task_ref
+        WHERE task_ref.type <> 'text'
+           OR length(task_ref.value) NOT BETWEEN 1 AND 200
+           OR length(trim(task_ref.value)) = 0
+      )
+    ) THEN RAISE(ABORT, 'flight meta invalid') END;
   SELECT CASE WHEN NEW.project_id IS NOT NULL
     AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id)
     THEN RAISE(ABORT, 'flight project not found') END;

@@ -258,7 +258,7 @@ describe('projectsApp', () => {
     )
     insertFlight.run('private-flight', flightMeta(['squad-b'], ['private-task']))
     insertFlight.run('mixed-flight', flightMeta(['squad-a', 'squad-b'], ['visible-task', 'private-task']))
-    insertFlight.run('malformed-flight', JSON.stringify({ schema: 'mupot.flight.meta/v1', squad_ids: ['squad-a'] }))
+    insertFlight.run('malformed-flight', JSON.stringify({ schema: 'mupot.flight.meta/v0', squad_ids: ['squad-a'] }))
     insertFlight.run('legacy-flight', JSON.stringify({ squad_ids: ['squad-a'] }))
     harness.sqlite.exec(`
       UPDATE project_squad_access SET access_level = 'read'

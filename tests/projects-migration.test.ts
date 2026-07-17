@@ -297,4 +297,96 @@ describe('0055_projects migration', () => {
       close()
     }
   })
+
+  it('rejects malformed governed attribution without restricting legacy flight updates', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      applyPriorMigrations(sqlite)
+      sqlite.exec(readFileSync(join(MIGRATIONS_DIR, PROJECTS_MIGRATION), 'utf8'))
+      sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Department');
+        INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'squad', 'Squad');
+        INSERT INTO projects (id, slug, name, status) VALUES
+          ('project-a', 'a', 'A', 'active'),
+          ('project-b', 'b', 'B', 'active');
+        INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+          ('project-a', 'squad-1', 'write'),
+          ('project-b', 'squad-1', 'write');
+        INSERT INTO tasks (id, squad_id, title, project_id) VALUES
+          ('task-a', 'squad-1', 'Task A', 'project-a'),
+          ('task-b', 'squad-1', 'Task B', 'project-b');
+        DELETE FROM project_squad_access WHERE project_id = 'project-b' AND squad_id = 'squad-1';
+      `)
+      const governedMeta = (taskId: string) => ({
+        schema: 'mupot.flight.meta/v1',
+        goal_id: 'goal-a',
+        objective_id: 'objective-a',
+        squad_ids: ['squad-1'],
+        task_ids: [taskId],
+        done_when: ['done'],
+        artifact_refs: [],
+      })
+      const metaA = JSON.stringify(governedMeta('task-a'))
+      const metaB = JSON.stringify(governedMeta('task-b'))
+      const malformed = [
+        { schema: 'mupot.flight.meta/v1' },
+        { ...governedMeta('task-a'), squad_ids: [] },
+        { ...governedMeta('task-a'), squad_ids: Array.from({ length: 9 }, () => 'squad-1') },
+        { ...governedMeta('task-a'), squad_ids: [''] },
+        { ...governedMeta('task-a'), squad_ids: ['s'.repeat(201)] },
+        { ...governedMeta('task-a'), task_ids: [] },
+        { ...governedMeta('task-a'), task_ids: Array.from({ length: 201 }, () => 'task-a') },
+        { ...governedMeta('task-a'), task_ids: [42] },
+        { ...governedMeta('task-a'), task_ids: ['t'.repeat(201)] },
+      ]
+
+      for (const [index, invalidMeta] of malformed.entries()) {
+        expect(() => sqlite.prepare(`
+          INSERT INTO flights (id, tenant, agent, goal, meta, project_id)
+          VALUES (?, 'tenant', 'agent', 'Malformed', ?, 'project-a')
+        `).run(`malformed-${index}`, JSON.stringify(invalidMeta))).toThrow(/flight meta invalid/)
+      }
+
+      sqlite.prepare(`
+        INSERT INTO flights (id, tenant, agent, goal, meta, project_id)
+        VALUES ('governed-a', 'tenant', 'agent', 'Governed', ?, 'project-a')
+      `).run(metaA)
+      for (const invalidMeta of malformed) {
+        expect(() => sqlite.prepare(`
+          UPDATE flights SET meta = ? WHERE id = 'governed-a'
+        `).run(JSON.stringify(invalidMeta))).toThrow(/flight meta invalid/)
+      }
+      expect(sqlite.prepare(`SELECT project_id, meta FROM flights WHERE id = 'governed-a'`).get())
+        .toEqual({ project_id: 'project-a', meta: metaA })
+      expect(() => sqlite.prepare(`
+        UPDATE flights SET project_id = 'project-b', meta = ? WHERE id = 'governed-a'
+      `).run(metaB)).toThrow(/flight project access denied/)
+
+      sqlite.exec(`
+        INSERT INTO project_squad_access (project_id, squad_id, access_level)
+        VALUES ('project-b', 'squad-1', 'admin')
+      `)
+      sqlite.prepare(`
+        UPDATE flights SET project_id = 'project-b', meta = ? WHERE id = 'governed-a'
+      `).run(metaB)
+      expect(sqlite.prepare(`SELECT project_id, meta FROM flights WHERE id = 'governed-a'`).get())
+        .toEqual({ project_id: 'project-b', meta: metaB })
+
+      sqlite.exec(`
+        INSERT INTO flights (id, tenant, agent, goal, meta, project_id)
+        VALUES ('legacy', 'tenant', 'agent', 'Legacy', '{}', 'project-a');
+        INSERT INTO flights (id, tenant, agent, goal, meta)
+        VALUES ('projectless-schema-only', 'tenant', 'agent', 'Projectless', '{"schema":"mupot.flight.meta/v1"}');
+        UPDATE flights
+           SET project_id = 'project-b', meta = '{"schema":"legacy/v0"}'
+         WHERE id = 'legacy';
+      `)
+      expect(sqlite.prepare(`SELECT project_id, meta FROM flights WHERE id = 'legacy'`).get())
+        .toEqual({ project_id: 'project-b', meta: '{"schema":"legacy/v0"}' })
+      expect(sqlite.prepare(`SELECT project_id FROM flights WHERE id = 'projectless-schema-only'`).get())
+        .toEqual({ project_id: null })
+    } finally {
+      close()
+    }
+  })
 })
