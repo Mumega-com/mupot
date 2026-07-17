@@ -105,6 +105,17 @@ const run: MarketingMonitorRun = {
 const env = { TENANT_SLUG: 'tenant-a' } as Env
 const actor = { id: 'owner-1', role: 'owner' as const }
 
+function lifecycleScript(markup: string): string {
+  const normalized = markup.toLowerCase()
+  const openStart = normalized.indexOf('<script')
+  const openEnd = normalized.indexOf('>', openStart)
+  const closeStart = normalized.indexOf('</script>', openEnd)
+  if (openStart < 0 || openEnd < 0 || closeStart < 0) {
+    throw new Error('monitor action script was not rendered')
+  }
+  return markup.slice(openEnd + 1, closeStart).trim()
+}
+
 async function loadedView() {
   return loadMarketingCroMonitorView(env, installation, actor, {
     listBindings: async () => [binding],
@@ -279,13 +290,75 @@ describe('marketing CRO monitor dashboard', () => {
     expect(html).toContain('href="/api/addons/marketing-cro-monitor/receipts"')
   })
 
-  it('keeps the monitor surface within a 390px viewport without client data loading', async () => {
+  it('keeps the monitor surface within a 390px viewport with one governed run action', async () => {
     const html = String(marketingCroMonitorBody(await loadedView()))
 
     expect(html).toContain('@media (max-width: 680px)')
     expect(html).toContain('minmax(0, 1fr)')
-    expect(html).not.toContain('<script')
-    expect(html).not.toContain('fetch(')
+    expect(html).toContain('data-monitor-action="run"')
+    expect(html).toContain('fetch(')
+  })
+
+  it('renders a governed run action that posts a bounded evidence window', async () => {
+    const html = String(marketingCroMonitorBody(await loadedView()))
+
+    expect(html).toContain('Run monitor')
+    expect(html).toContain('data-monitor-action="run"')
+    expect(html).toContain('data-monitor-window-start="2026-07-01T00:00:00.000Z"')
+    expect(html).toContain('data-monitor-window-end="2026-07-01T23:59:59.999Z"')
+  })
+
+  it('posts the monitor run request as JSON and reloads after success', async () => {
+    const html = String(marketingCroMonitorBody(await loadedView()))
+    const script = lifecycleScript(html)
+    let click: (() => Promise<void>) | undefined
+    let requestPath = ''
+    let requestOptions: RequestInit | undefined
+    let reloads = 0
+    const status = { textContent: '' }
+    const button = {
+      dataset: {
+        monitorAction: 'run',
+        monitorWindowStart: '2026-07-01T00:00:00.000Z',
+        monitorWindowEnd: '2026-07-01T23:59:59.999Z',
+      },
+      disabled: false,
+      addEventListener: (event: string, listener: () => Promise<void>) => {
+        if (event === 'click') click = listener
+      },
+    }
+    const document = {
+      querySelector: (selector: string) => selector === '[data-monitor-status]' ? status : null,
+      querySelectorAll: (selector: string) => selector === '[data-monitor-action="run"]' ? [button] : [],
+    }
+    const window = { location: { reload: () => { reloads += 1 } } }
+
+    new Function('document', 'fetch', 'window', script)(
+      document,
+      async (path: string, options: RequestInit) => {
+        requestPath = path
+        requestOptions = options
+        return { ok: true, json: async () => ({}) }
+      },
+      window,
+    )
+    if (!click) throw new Error('monitor click listener was not attached')
+    await click()
+
+    expect(requestPath).toBe('/api/addons/marketing-cro-monitor/monitor')
+    expect(requestOptions).toEqual({
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        window: {
+          start: '2026-07-01T00:00:00.000Z',
+          end: '2026-07-01T23:59:59.999Z',
+        },
+      }),
+    })
+    expect(button.disabled).toBe(true)
+    expect(status.textContent).toBe('Running...')
+    expect(reloads).toBe(1)
   })
 
   it('preserves unavailable reads instead of converting them to empty or zero values', async () => {
