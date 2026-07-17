@@ -34,7 +34,9 @@ const KEYS = new Set<keyof FlightMetaV1>([
 ])
 
 function boundedString(value: unknown, max: number): value is string {
-  return typeof value === 'string' && value.trim().length > 0 && value.length <= max
+  return typeof value === 'string'
+    && value.trim().length > 0
+    && new TextEncoder().encode(value).byteLength <= max
 }
 
 function boundedStrings(value: unknown, opts: { maxItems: number; maxLength: number; nonEmpty?: boolean }): value is string[] {
@@ -47,7 +49,7 @@ function boundedStrings(value: unknown, opts: { maxItems: number; maxLength: num
 export function parseFlightMetaV1(raw: unknown): FlightMetaV1 | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
   const meta = raw as Record<string, unknown>
-  if (JSON.stringify(meta).length > 16_384) return null
+  if (new TextEncoder().encode(JSON.stringify(meta)).byteLength > 16_384) return null
   if (Object.keys(meta).some((key) => !KEYS.has(key as keyof FlightMetaV1))) return null
   if (meta.schema !== FLIGHT_META_V1_SCHEMA) return null
   if (!boundedString(meta.goal_id, 200)) return null
