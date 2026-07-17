@@ -218,17 +218,7 @@ export async function loadMarketingCroMonitorView(
     return unavailableView(installation.state)
   }
   if (!generation) {
-    if (bindings.length > 0) return unavailableView(installation.state)
-    return {
-      installationState: installation.state,
-      monitorState: 'empty',
-      outcomes: null,
-      sourceHealth: healthFromBindings([], null),
-      recentRuns: [],
-      latestEvidenceDigest: null,
-      latestCompletedAt: null,
-      opportunity: opportunityFor('empty', null),
-    }
+    return unavailableView(installation.state)
   }
   if (!bindingSnapshotMatches(installation, generation, bindings)) {
     return unavailableView(installation.state)

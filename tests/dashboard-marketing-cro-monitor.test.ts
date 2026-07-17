@@ -229,6 +229,27 @@ describe('marketing CRO monitor dashboard', () => {
     expect(view.sourceHealth).toBeNull()
   })
 
+  it('fails unavailable when no live generation exists even if the binding read is empty', async () => {
+    let evidenceCalls = 0
+    const view = await loadMarketingCroMonitorView(env, installation, actor, {
+      listBindings: async () => [],
+      loadBindingGeneration: async () => null,
+      getLatestRun: async () => {
+        evidenceCalls += 1
+        return { ok: true, run: null }
+      },
+      listRuns: async () => {
+        evidenceCalls += 1
+        return { ok: true, runs: [] }
+      },
+    })
+
+    expect(evidenceCalls).toBe(0)
+    expect(view.monitorState).toBe('unavailable')
+    expect(view.sourceHealth).toBeNull()
+    expect(view.recentRuns).toBeNull()
+  })
+
   it('fails unavailable instead of combining latest and list results split by a lifecycle change', async () => {
     const view = await loadMarketingCroMonitorView(env, installation, actor, {
       listBindings: async () => [binding],

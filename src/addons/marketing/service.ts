@@ -901,24 +901,19 @@ function normalizedReadScope(input: MarketingMonitorReadScopeInput): MarketingMo
   }
 }
 
-function readIdentityWhere(): string {
+function scopedRunSelect(limitClause: string): string {
   const entry = getRegisteredAddon(MARKETING_ADDON_KEY)
-  if (!entry) return '0'
+  if (!entry) return 'SELECT NULL WHERE 0'
   return `
-    run.tenant = ?1 AND run.addon_key = ?2 AND run.installed_version = ?3
-    AND run.publisher = ?4 AND run.trust_class = ?5 AND run.mupot_compatibility = ?6
-    AND run.manifest_sha256 = ?7 AND run.program_version = ?8 AND run.status = 'completed'
-    AND EXISTS (
-      SELECT 1
+    WITH live_scope AS (
+      SELECT installation.id AS installation_id, generation.id AS generation_id
         FROM addon_installations AS installation
         JOIN addon_binding_generations AS generation
           ON generation.tenant = installation.tenant
          AND generation.installation_id = installation.id
-         AND generation.id = run.binding_generation_id
          AND generation.manifest_sha256 = installation.manifest_sha256
          AND generation.revoked_at IS NULL
-       WHERE installation.tenant = run.tenant
-         AND installation.id = run.installation_id
+       WHERE installation.tenant = ?1
          AND installation.addon_key = ?2
          AND installation.installed_version = ?3
          AND installation.publisher = ?4
@@ -943,6 +938,59 @@ function readIdentityWhere(): string {
            )
          )
     )
+    SELECT run.id, run.program_version, run.status, run.window_start, run.window_end,
+           run.source_count, run.observation_count, run.raw_observation_count,
+           run.outcomes_json, run.evidence_digest, run.created_at, run.completed_at,
+           COALESCE((
+             SELECT json_group_array(json_object(
+               'key', ordered.source_key,
+               'slot', ordered.source_slot,
+               'status', ordered.status,
+               'reason', ordered.reason,
+               'observationCount', ordered.observation_count
+             ))
+               FROM (
+                 SELECT source_key, source_slot, status, reason, observation_count
+                   FROM marketing_monitor_sources
+                  WHERE run_id = run.id
+                  ORDER BY position
+               ) AS ordered
+           ), '[]') AS sources_json,
+           COALESCE((
+             SELECT json_group_array(json_object(
+               'id', ordered.id,
+               'runId', ordered.run_id,
+               'metricKey', ordered.metric_key,
+               'value', ordered.value,
+               'unit', ordered.unit,
+               'authority', ordered.authority,
+               'observedAt', ordered.observed_at,
+               'sourceKey', ordered.source_key,
+               'sourceSlot', ordered.source_slot
+             ))
+               FROM (
+                 SELECT id, run_id, metric_key, value, unit, authority, observed_at,
+                        source_key, source_slot
+                   FROM marketing_monitor_observations
+                  WHERE run_id = run.id
+                  ORDER BY position
+               ) AS ordered
+           ), '[]') AS observations_json
+      FROM live_scope
+      LEFT JOIN marketing_monitor_runs AS run
+        ON run.tenant = ?1
+       AND run.installation_id = live_scope.installation_id
+       AND run.binding_generation_id = live_scope.generation_id
+       AND run.addon_key = ?2
+       AND run.installed_version = ?3
+       AND run.publisher = ?4
+       AND run.trust_class = ?5
+       AND run.mupot_compatibility = ?6
+       AND run.manifest_sha256 = ?7
+       AND run.program_version = ?8
+       AND run.status = 'completed'
+     ORDER BY run.completed_at DESC, run.id DESC
+     ${limitClause}
   `
 }
 
@@ -974,10 +1022,11 @@ export async function getLatestMarketingMonitorRun(
   if (!captured) return { ok: false, reason: 'write_failed' }
   try {
     const scope = normalizedReadScope(input)
-    if (scope === undefined) return { ok: true, run: null }
-    const row = await captured.db.prepare(runSelect(readIdentityWhere(), 'LIMIT 1'))
+    if (scope === undefined) return { ok: false, reason: 'fence_lost' }
+    const row = await captured.db.prepare(scopedRunSelect('LIMIT 1'))
       .bind(...readIdentityBindings(captured, scope)).first<StoredRunRow>()
-    if (!row) return { ok: true, run: null }
+    if (!row) return { ok: false, reason: 'fence_lost' }
+    if (row.id === null) return { ok: true, run: null }
     const run = await parseStoredRun(row)
     return run ? { ok: true, run } : { ok: false, reason: 'stored_run_invalid' }
   } catch {
@@ -998,13 +1047,17 @@ export async function listMarketingMonitorRuns(
   if (!captured) return { ok: false, reason: 'write_failed' }
   try {
     const scope = normalizedReadScope(input)
-    if (scope === undefined) return { ok: true, runs: [] }
-    const result = await captured.db.prepare(runSelect(readIdentityWhere(), 'LIMIT ?12'))
+    if (scope === undefined) return { ok: false, reason: 'fence_lost' }
+    const result = await captured.db.prepare(scopedRunSelect('LIMIT ?12'))
       .bind(...readIdentityBindings(captured, scope), input.limit).all<StoredRunRow>()
     const runs: MarketingMonitorRun[] = []
     const rows = result.results ?? []
+    if (rows.length === 0) return { ok: false, reason: 'fence_lost' }
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index]
+      if (row.id === null) return rows.length === 1
+        ? { ok: true, runs: [] }
+        : { ok: false, reason: 'stored_run_invalid' }
       const run = await parseStoredRun(row)
       if (!run) return { ok: false, reason: 'stored_run_invalid' }
       pushCaptured(runs, run)

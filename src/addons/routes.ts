@@ -30,7 +30,13 @@ import {
   runMarketingMonitor,
   type MarketingMonitorFailureReason,
 } from './marketing/service'
-import type { MonitorWindow } from './marketing/types'
+import type {
+  MarketingMonitorRun,
+  MarketingMonitorRunSource,
+  MarketingOutcomes,
+  MonitorWindow,
+  SourceStatus,
+} from './marketing/types'
 
 const MAX_BODY_BYTES = 8192
 
@@ -76,10 +82,44 @@ function catalogAddon(entry: ReturnType<typeof listRegisteredAddons>[number], in
   }
 }
 
-function redactedReceipt(receipt: AddonReceipt) {
+interface PublicAddonReceipt {
+  readonly sequence: number
+  readonly action: string
+  readonly previousState: AddonReceipt['previousState']
+  readonly nextState: AddonReceipt['nextState']
+  readonly addonKey: string
+  readonly installedVersion: string
+  readonly manifestSha256: string
+  readonly mupotCompatibility: string
+  readonly publisher: string
+  readonly trustClass: AddonReceipt['trustClass']
+  readonly outcome: AddonReceipt['outcome']
+  readonly errorCode: string | null
+  readonly createdAt: string
+}
+
+interface PublicMarketingMonitorSource {
+  readonly slot: string
+  readonly status: SourceStatus
+  readonly reason?: string
+  readonly observationCount: number
+}
+
+interface PublicMarketingMonitorRun {
+  readonly id: string
+  readonly status: 'completed'
+  readonly window: MonitorWindow
+  readonly sourceCount: number
+  readonly observationCount: number
+  readonly sources: readonly PublicMarketingMonitorSource[]
+  readonly outcomes: MarketingOutcomes
+  readonly evidenceDigest: string
+  readonly completedAt: string
+}
+
+function publicReceipt(receipt: AddonReceipt): PublicAddonReceipt {
   return {
     sequence: receipt.sequence,
-    id: receipt.id,
     action: receipt.action,
     previousState: receipt.previousState,
     nextState: receipt.nextState,
@@ -89,10 +129,32 @@ function redactedReceipt(receipt: AddonReceipt) {
     mupotCompatibility: receipt.mupotCompatibility,
     publisher: receipt.publisher,
     trustClass: receipt.trustClass,
-    actorId: receipt.actorId,
     outcome: receipt.outcome,
     errorCode: receipt.errorCode,
     createdAt: receipt.createdAt,
+  }
+}
+
+function publicMonitorSource(source: MarketingMonitorRunSource): PublicMarketingMonitorSource {
+  return {
+    slot: source.slot,
+    status: source.status,
+    ...(source.reason === undefined ? {} : { reason: source.reason }),
+    observationCount: source.observationCount,
+  }
+}
+
+function publicMonitorRun(run: MarketingMonitorRun): PublicMarketingMonitorRun {
+  return {
+    id: run.id,
+    status: run.status,
+    window: { start: run.window.start, end: run.window.end },
+    sourceCount: run.sourceCount,
+    observationCount: run.observationCount,
+    sources: run.sources.map(publicMonitorSource),
+    outcomes: run.outcomes,
+    evidenceDigest: run.evidenceDigest,
+    completedAt: run.completedAt,
   }
 }
 
@@ -373,7 +435,11 @@ addonsApp.post('/marketing-cro-monitor/monitor', async (c) => {
     const error = monitorError(result.reason)
     return c.json(error.body, error.status)
   }
-  return c.json(result, result.idempotent ? 200 : 201)
+  return c.json({
+    ok: true,
+    idempotent: result.idempotent,
+    run: publicMonitorRun(result.run),
+  }, result.idempotent ? 200 : 201)
 })
 
 addonsApp.get('/marketing-cro-monitor/monitor/latest', async (c) => {
@@ -384,7 +450,7 @@ addonsApp.get('/marketing-cro-monitor/monitor/latest', async (c) => {
     const error = monitorError(result.reason)
     return c.json(error.body, error.status)
   }
-  return c.json({ run: result.run })
+  return c.json({ run: result.run ? publicMonitorRun(result.run) : null })
 })
 
 addonsApp.get('/marketing-cro-monitor/monitor', async (c) => {
@@ -397,7 +463,7 @@ addonsApp.get('/marketing-cro-monitor/monitor', async (c) => {
     const error = monitorError(result.reason)
     return c.json(error.body, error.status)
   }
-  return c.json({ runs: result.runs })
+  return c.json({ runs: result.runs.map(publicMonitorRun) })
 })
 
 addonsApp.post('/:key/install', (c) => mutate(c, 'install'))
@@ -434,7 +500,7 @@ addonsApp.get('/:key/receipts', async (c) => {
     const installation = latestInstallationsByKey(await listAddonInstallations(c.env)).get(c.req.param('key'))
     if (!installation) return c.json({ receipts: [], ownershipClaimCount: 0, departmentStateSha256 })
     return c.json({
-      receipts: (await getAddonReceipts(c.env, installation.id)).map(redactedReceipt),
+      receipts: (await getAddonReceipts(c.env, installation.id)).map(publicReceipt),
       ownershipClaimCount: await countAddonOwnershipClaims(c.env, installation.id),
       departmentStateSha256,
     })

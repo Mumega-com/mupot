@@ -427,6 +427,30 @@ describe('addon lifecycle routes', () => {
     const listedBody = await listed.json() as Record<string, unknown>
     expect(listedBody).toEqual(expect.objectContaining({ runs: expect.any(Array) }))
 
+    const publicRunKeys = [
+      'completedAt',
+      'evidenceDigest',
+      'id',
+      'observationCount',
+      'outcomes',
+      'sourceCount',
+      'sources',
+      'status',
+      'window',
+    ]
+    const createdRun = createdBody.run as Record<string, unknown>
+    const latestRun = latestBody.run as Record<string, unknown>
+    const listedRun = (listedBody.runs as Array<Record<string, unknown>>)[0]
+    expect(Object.keys(createdRun).sort()).toEqual(publicRunKeys)
+    expect(Object.keys(latestRun).sort()).toEqual(publicRunKeys)
+    expect(Object.keys(listedRun).sort()).toEqual(publicRunKeys)
+    for (const publicRun of [createdRun, latestRun, listedRun]) {
+      expect(publicRun).not.toHaveProperty('observations')
+      expect(publicRun).not.toHaveProperty('rawObservationCount')
+      expect(publicRun).not.toHaveProperty('programVersion')
+      expect(publicRun).not.toHaveProperty('createdAt')
+    }
+
     const serialized = JSON.stringify({ createdBody, latestBody, listedBody })
     for (const forbidden of ['connectorId', 'connector_id', 'configuredBy', 'actorId', 'rawPayload', 'secret', 'building']) {
       expect(serialized).not.toContain(forbidden)
@@ -738,6 +762,23 @@ describe('addon lifecycle routes', () => {
       manifestSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       mupotCompatibility: '^0.23.0',
     }))
+    expect(Object.keys(body.receipts[0]).sort()).toEqual([
+      'action',
+      'addonKey',
+      'createdAt',
+      'errorCode',
+      'installedVersion',
+      'manifestSha256',
+      'mupotCompatibility',
+      'nextState',
+      'outcome',
+      'previousState',
+      'publisher',
+      'sequence',
+      'trustClass',
+    ])
+    expect(body.receipts[0]).not.toHaveProperty('id')
+    expect(body.receipts[0]).not.toHaveProperty('actorId')
     expect(body.receipts[0]).not.toHaveProperty('tenant')
     expect(body.receipts[0]).not.toHaveProperty('installationId')
     expect(body.receipts[0]).not.toHaveProperty('sideEffectIds')

@@ -1760,6 +1760,9 @@ export const dashboardBuiltInGetRoutes = Object.freeze(dashboardApp.routes
   .map((route) => Object.freeze({ method: route.method, path: route.path })))
 
 dashboardApp.get('*', async (c) => {
+  if (!isAdmin(c.get('auth'))) {
+    return c.html(shell(c.env, 'Addon console', errorBody('Addon consoles require owner or admin.')), 403)
+  }
   const resolved = createAddonConsoleResolver(
     listRegisteredAddons(),
     dashboardBuiltInGetRoutes,
@@ -1767,10 +1770,6 @@ dashboardApp.get('*', async (c) => {
   if (!resolved) {
     return c.html(shell(c.env, 'Addon console', errorBody('Addon console not found.')), 404)
   }
-  if (!isAdmin(c.get('auth'))) {
-    return c.html(shell(c.env, resolved.section.title, errorBody('Addon consoles require owner or admin.')), 403)
-  }
-
   try {
     const installation = latestInstallationByKey(await listAddonInstallations(c.env))
       .get(resolved.entry.manifest.key)

@@ -481,9 +481,12 @@ describe('registered addon console paths', () => {
     expect(body).toContain('<p>Fixture</p>')
   })
 
-  it('blocks members before resolving or loading an addon renderer', async () => {
+  it.each([
+    '/addons/marketing-cro-monitor',
+    '/addons/not-registered',
+  ])('blocks members before resolving addon console path %s', async (path) => {
     const response = await dashboardApp.fetch(
-      new Request('https://pot.test/addons/marketing-cro-monitor', {
+      new Request(`https://pot.test${path}`, {
         headers: { Cookie: 'mupot_session=session-1' },
       }),
       dashboardEnv('member', [marketingInstallation('active')]),
