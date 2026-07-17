@@ -20,6 +20,10 @@ import type { Html, Tone } from './ui'
 
 const ADDON_KEY = 'marketing-cro-monitor'
 const RUN_LIST_LIMIT = 10
+const DEFAULT_MONITOR_WINDOW = Object.freeze({
+  start: '2026-07-01T00:00:00.000Z',
+  end: '2026-07-01T23:59:59.999Z',
+})
 
 const SOURCE_SLOTS = [
   { slot: 'web_analytics', label: 'Web analytics' },
@@ -407,8 +411,10 @@ export function marketingCroMonitorBody(view: MarketingCroMonitorView) {
       .monitor-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
       .monitor-action { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text2); font-size: 12px; font-weight: 600; }
       .monitor-action:hover { background: var(--hover); color: var(--text); }
+      .monitor-action:disabled { cursor: wait; opacity: .68; }
       .monitor-action svg { flex: none; }
       .monitor-summary { color: var(--dim); font-size: 12px; margin: 6px 0 0; }
+      .monitor-status { color: var(--dim); flex-basis: 100%; font-size: 12px; min-height: 18px; overflow-wrap: anywhere; }
       .monitor-outcomes { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); margin: 18px 0; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); overflow: hidden; }
       .monitor-outcome { min-width: 0; padding: 13px 14px; border-right: 1px solid var(--border-soft); }
       .monitor-outcome:last-child { border-right: 0; }
@@ -461,6 +467,10 @@ export function marketingCroMonitorBody(view: MarketingCroMonitorView) {
         <p class="monitor-summary">${latestSummary}${view.latestEvidenceDigest ? ` · Evidence ${view.latestEvidenceDigest.slice(0, 12)}` : ''}</p>
       </div>
       <nav class="monitor-actions" aria-label="Addon evidence links">
+        <button class="monitor-action" type="button" data-monitor-action="run" data-monitor-window-start="${DEFAULT_MONITOR_WINDOW.start}" data-monitor-window-end="${DEFAULT_MONITOR_WINDOW.end}">
+          <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M5 3v18"/><path d="m19 12-14 9V3z"/></svg>
+          Run monitor
+        </button>
         <a class="monitor-action" href="/api/addons/${ADDON_KEY}/monitor/latest">
           <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5z"/><polyline points="14 2 14 8 20 8"/><path d="m9 15 2 2 4-4"/></svg>
           Latest evidence
@@ -469,6 +479,7 @@ export function marketingCroMonitorBody(view: MarketingCroMonitorView) {
           <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M15 12h-5"/><path d="M15 8h-5"/><path d="M19 17V5a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v12l3-2 2 2 2-2 2 2 2-2z"/></svg>
           Receipts
         </a>
+        <span class="monitor-status" data-monitor-status role="status" aria-live="polite"></span>
       </nav>
     </div>
     <div class="monitor-outcomes" aria-label="Latest outcomes">
@@ -503,5 +514,38 @@ export function marketingCroMonitorBody(view: MarketingCroMonitorView) {
       </div>`,
     })}
     ${sectionPanel({ title: 'Recent runs', body: recentRunsBody(view.recentRuns) })}
+    <script>
+      (function () {
+        var buttons = document.querySelectorAll('[data-monitor-action="run"]');
+        var status = document.querySelector('[data-monitor-status]');
+        buttons.forEach(function (button) {
+          button.addEventListener('click', async function () {
+            var start = button.dataset.monitorWindowStart;
+            var end = button.dataset.monitorWindowEnd;
+            if (!start || !end) return;
+            button.disabled = true;
+            if (status) status.textContent = 'Running...';
+            try {
+              var response = await fetch('/api/addons/${ADDON_KEY}/monitor', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ window: { start: start, end: end } }),
+              });
+              var data = {};
+              try { data = await response.json(); } catch (_) {}
+              if (!response.ok) {
+                if (status) status.textContent = data.error || 'request_failed';
+                button.disabled = false;
+                return;
+              }
+              window.location.reload();
+            } catch (_) {
+              if (status) status.textContent = 'network_error';
+              button.disabled = false;
+            }
+          });
+        });
+      })();
+    </script>
   `
 }
