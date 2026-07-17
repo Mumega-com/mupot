@@ -37,7 +37,7 @@
 
 - [ ] **Step 1: Write migration tests that apply migrations and assert the project tables, nullable task/flight attribution, foreign keys, checks, and indexes.**
 - [ ] **Step 2: Run `npx vitest run tests/projects-migration.test.ts` and confirm failure because migration 0055 is absent.**
-- [ ] **Step 3: Add `0055_projects.sql` using the approved SQL from the design, plus nullable `project_id` columns and indexes on `projects(parent_project_id,status)`, `project_squad_access(squad_id,project_id)`, `tasks(project_id,status)`, and `flights(project_id,status)`.**
+- [ ] **Step 3: Add `0055_projects.sql` using the approved SQL from the design, plus nullable text `project_id` columns, fail-closed unknown-project validation triggers, and indexes on `projects(parent_project_id,status)`, `project_squad_access(squad_id,project_id)`, `tasks(project_id,status)`, and `flights(project_id,status)`. Do not use `ALTER TABLE ... ADD COLUMN ... REFERENCES`.**
 - [ ] **Step 4: Re-run the migration test and confirm it passes.**
 - [ ] **Step 5: Write service tests for slug validation, duplicate slug mapping, root creation, child creation, depth rejection, cycle rejection, archive-with-active-child rejection, immutable archived rows, explicit squad edges, and write receipts.**
 - [ ] **Step 6: Run `npx vitest run tests/projects-service.test.ts` and confirm failures because the service does not exist.**
@@ -100,7 +100,7 @@ export type ProjectMutationResult<T> =
 - [ ] **Step 2: Run the task project tests and confirm they fail on missing attribution support.**
 - [ ] **Step 3: Add `project_id?: string | null` to task creation, include it in parameter-bound inserts/selects/events, and add project filtering without changing responses when the query is absent.**
 - [ ] **Step 4: Update existing task service fixtures for the new insert bind and run all task-focused tests.**
-- [ ] **Step 5: Write flight tests proving optional attribution, project existence, list filtering, and unchanged legacy flight creation.**
+- [ ] **Step 5: Write flight tests proving optional attribution, project existence, list filtering, same-project task references for governed flights, and unchanged legacy flight creation.**
 - [ ] **Step 6: Run the flight project tests and confirm they fail.**
 - [ ] **Step 7: Extend `NewFlight`, `FlightRow`, insert, list, and route validation with nullable `project_id`; reject inaccessible project attribution before creating a flight.**
 - [ ] **Step 8: Run `npx vitest run tests/tasks-project-filter.test.ts tests/flights-project.test.ts tests/tasks-service.test.ts tests/flight-routes.test.ts tests/mcp-flight-tools.test.ts` and `npm run typecheck`; confirm green.**

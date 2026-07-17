@@ -67,7 +67,7 @@ CREATE TABLE project_squad_access (
 );
 ```
 
-`tasks.project_id` and `flights.project_id` are nullable foreign keys using `ON DELETE SET NULL`. Existing work therefore remains valid and appears in the workspace-level Unassigned filter until deliberately classified.
+`tasks.project_id` and `flights.project_id` are nullable text columns because this repository does not rely on `ALTER TABLE ... ADD COLUMN ... REFERENCES` for existing SQLite tables. Validation triggers reject unknown project IDs on inserts and attribution updates. Existing work remains valid and appears in the workspace-level Unassigned filter until deliberately classified. Projects have no destructive delete route, so attribution cannot be orphaned through the supported API.
 
 Projects do not carry a tenant column because one D1 database is one pot. API authentication still hard-checks `AuthContext.tenant === env.TENANT_SLUG`.
 
@@ -82,7 +82,8 @@ Projects do not carry a tenant column because one D1 database is one pot. API au
 7. There is no destructive project delete route in v1.
 8. Aggregates are computed from children and attributed work; progress and cost are not duplicated onto parent rows.
 9. A task or flight may belong to at most one project in v1.
-10. SOS is neither a dependency nor a transport for this feature. Mupot continues to use its own Cloudflare runtime and pub/sub.
+10. A governed flight attributed to a project may reference only tasks attributed to that same project.
+11. SOS is neither a dependency nor a transport for this feature. Mupot continues to use its own Cloudflare runtime and pub/sub.
 
 ## Authorization
 
