@@ -1,5 +1,5 @@
 import { html, raw } from 'hono/html'
-import type { AuthContext, CapabilityGrant, Env, Project, ProjectAccessLevel, ProjectStatus } from '../types'
+import type { AuthContext, Env, Project, ProjectAccessLevel, ProjectStatus } from '../types'
 import { hasCapability, resolveCapabilities } from '../auth/capability'
 import { getProject } from '../projects/service'
 import { emptyState, kpiRow, pageHeader, pill, sectionPanel, statCard } from './ui'
@@ -13,7 +13,8 @@ type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_p
 
 interface ProjectAccess {
   workspaceAdmin: boolean
-  grants: CapabilityGrant[]
+  readableSquadIds: string[] | null
+  taskableSquadIds: string[] | null
 }
 
 export interface ProjectListMetrics {
@@ -66,6 +67,12 @@ export interface ProjectDetailView {
   squads: ProjectSquadRow[]
 }
 
+export interface ProjectWorkContext {
+  project: Project
+  readableSquadIds: string[] | null
+  taskableSquadIds: string[]
+}
+
 function legacyWorkspaceAdmin(auth: AuthContext): boolean {
   return auth.role === 'owner' || auth.role === 'admin'
 }
@@ -80,37 +87,51 @@ async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> 
 }
 
 async function projectAccess(env: Env, auth: AuthContext): Promise<ProjectAccess> {
-  if (legacyWorkspaceAdmin(auth)) return { workspaceAdmin: true, grants: [] }
+  if (legacyWorkspaceAdmin(auth)) {
+    return { workspaceAdmin: true, readableSquadIds: null, taskableSquadIds: null }
+  }
   const memberId = await memberIdFor(env, auth)
   const grants = memberId ? auth.capabilities ?? await resolveCapabilities(env, memberId) : []
+  if (hasCapability(grants, 'org', null, 'admin')) {
+    return { workspaceAdmin: true, readableSquadIds: null, taskableSquadIds: null }
+  }
+  const rows = grants.length
+    ? await env.DB.prepare('SELECT id, department_id FROM squads').all<{ id: string; department_id: string }>()
+    : { results: [] }
+  const squads = rows.results ?? []
   return {
-    workspaceAdmin: hasCapability(grants, 'org', null, 'admin'),
-    grants,
+    workspaceAdmin: false,
+    readableSquadIds: squads
+      .filter((squad) => hasCapability(grants, 'squad', squad.id, 'observer', squad.department_id))
+      .map((squad) => squad.id),
+    taskableSquadIds: squads
+      .filter((squad) => hasCapability(grants, 'squad', squad.id, 'member', squad.department_id))
+      .map((squad) => squad.id),
   }
 }
 
-function squadReadPredicate(access: ProjectAccess, squadAlias = 's'): { sql: string; binds: string[] } {
-  if (access.workspaceAdmin || hasCapability(access.grants, 'org', null, 'observer')) {
-    return { sql: '1 = 1', binds: [] }
-  }
-  const squadIds = new Set<string>()
-  const departmentIds = new Set<string>()
-  for (const grant of access.grants) {
-    if (!hasCapability([grant], grant.scope_type, grant.scope_id, 'observer')) continue
-    if (grant.scope_type === 'squad' && grant.scope_id) squadIds.add(grant.scope_id)
-    if (grant.scope_type === 'department' && grant.scope_id) departmentIds.add(grant.scope_id)
-  }
-  const conditions: string[] = []
-  const binds: string[] = []
-  if (squadIds.size) {
-    conditions.push(`${squadAlias}.id IN (${[...squadIds].map(() => '?').join(', ')})`)
-    binds.push(...squadIds)
-  }
-  if (departmentIds.size) {
-    conditions.push(`${squadAlias}.department_id IN (${[...departmentIds].map(() => '?').join(', ')})`)
-    binds.push(...departmentIds)
-  }
-  return { sql: conditions.length ? conditions.join(' OR ') : '0 = 1', binds }
+function jsonIds(ids: string[]): string {
+  return JSON.stringify([...new Set(ids)])
+}
+
+function readableFlightSql(flightAlias: string, readableIdsParam: string): string {
+  const safeMeta = `CASE WHEN json_valid(${flightAlias}.meta) THEN ${flightAlias}.meta ELSE '{}' END`
+  return `
+    AND json_extract(${safeMeta}, '$.schema') = 'mupot.flight.meta/v1'
+    AND json_type(${safeMeta}, '$.squad_ids') = 'array'
+    AND json_array_length(${safeMeta}, '$.squad_ids') BETWEEN 1 AND 8
+    AND NOT EXISTS (
+      SELECT 1
+        FROM json_each(${safeMeta}, '$.squad_ids') squad_ref
+       WHERE squad_ref.type <> 'text'
+          OR length(trim(CAST(squad_ref.value AS TEXT))) = 0
+          OR length(CAST(squad_ref.value AS TEXT)) > 200
+          OR NOT EXISTS (
+            SELECT 1
+              FROM json_each(${readableIdsParam}) readable_squad
+             WHERE CAST(readable_squad.value AS TEXT) = CAST(squad_ref.value AS TEXT)
+          )
+    )`
 }
 
 function safeParent(project: Project): ParentContext {
@@ -127,24 +148,31 @@ async function loadVisibleProjects(
   env: Env,
   access: ProjectAccess,
 ): Promise<{ projects: Project[]; capped: boolean }> {
-  const edge = squadReadPredicate(access)
-  const visibility = access.workspaceAdmin
-    ? '1 = 1'
-    : `EXISTS (
-        SELECT 1
-          FROM project_squad_access psa
-          JOIN squads s ON s.id = psa.squad_id
-         WHERE psa.project_id = p.id
-           AND (${edge.sql})
-      )`
-  const result = await env.DB.prepare(
-    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-            p.target_date, p.created_at, p.updated_at
-       FROM projects p
-      WHERE ${visibility}
-      ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
-      LIMIT ?`,
-  ).bind(...(access.workspaceAdmin ? [] : edge.binds), MAX_PROJECTS + 1).all<Project>()
+  if (!access.workspaceAdmin && access.readableSquadIds?.length === 0) {
+    return { projects: [], capped: false }
+  }
+  const statement = access.workspaceAdmin
+    ? env.DB.prepare(
+      `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
+              p.target_date, p.created_at, p.updated_at
+         FROM projects p
+        ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
+        LIMIT ?1`,
+    ).bind(MAX_PROJECTS + 1)
+    : env.DB.prepare(
+      `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
+              p.target_date, p.created_at, p.updated_at
+         FROM projects p
+        WHERE EXISTS (
+          SELECT 1
+            FROM project_squad_access psa
+           WHERE psa.project_id = p.id
+             AND psa.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
+        )
+        ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
+        LIMIT ?2`,
+    ).bind(jsonIds(access.readableSquadIds ?? []), MAX_PROJECTS + 1)
+  const result = await statement.all<Project>()
   const rows = result.results ?? []
   return { projects: rows.slice(0, MAX_PROJECTS), capped: rows.length > MAX_PROJECTS }
 }
@@ -154,28 +182,44 @@ async function loadParentContexts(env: Env, parentIds: string[]): Promise<Map<st
   const result = await env.DB.prepare(
     `SELECT id, slug, name, status, parent_project_id
        FROM projects
-      WHERE id IN (${parentIds.map(() => '?').join(', ')})
-      LIMIT ?`,
-  ).bind(...parentIds, MAX_PROJECTS).all<ParentContext>()
+      WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
+      LIMIT ?2`,
+  ).bind(jsonIds(parentIds), MAX_PROJECTS).all<ParentContext>()
   return new Map((result.results ?? []).map((parent) => [parent.id, parent]))
 }
 
-async function loadListMetrics(env: Env, projectIds: string[]): Promise<Map<string, ProjectListMetrics>> {
+async function loadListMetrics(
+  env: Env,
+  projectIds: string[],
+  access: ProjectAccess,
+): Promise<Map<string, ProjectListMetrics>> {
   if (!projectIds.length) return new Map()
+  const squadFilter = access.workspaceAdmin
+    ? ''
+    : ' AND squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
+  const flightFilter = access.workspaceAdmin ? '' : readableFlightSql('f', '?2')
+  const tenantParam = access.workspaceAdmin ? '?2' : '?3'
+  const limitParam = access.workspaceAdmin ? '?3' : '?4'
   const result = await env.DB.prepare(
     `SELECT p.id,
-            (SELECT COUNT(*) FROM project_squad_access psa WHERE psa.project_id = p.id) AS direct_squads,
-            (SELECT COUNT(*) FROM tasks t
-              WHERE t.project_id = p.id
-                AND t.status IN ('open', 'in_progress', 'blocked', 'review')) AS open_work,
+            (SELECT COUNT(*) FROM project_squad_access
+              WHERE project_id = p.id${squadFilter}) AS direct_squads,
+            (SELECT COUNT(*) FROM tasks
+              WHERE project_id = p.id${squadFilter}
+                AND status IN ('open', 'in_progress', 'blocked', 'review')) AS open_work,
             (SELECT COUNT(*) FROM flights f
               WHERE f.project_id = p.id
-                AND f.tenant = ?
-                AND f.status IN ('preflight', 'running', 'waiting', 'sleeping')) AS active_flights
+                AND f.tenant = ${tenantParam}
+                AND f.status IN ('preflight', 'running', 'waiting', 'sleeping')${flightFilter}) AS active_flights
        FROM projects p
-      WHERE p.id IN (${projectIds.map(() => '?').join(', ')})
-      LIMIT ?`,
-  ).bind(env.TENANT_SLUG, ...projectIds, MAX_PROJECTS).all<{
+      WHERE p.id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
+      LIMIT ${limitParam}`,
+  ).bind(
+    jsonIds(projectIds),
+    ...(access.workspaceAdmin ? [] : [jsonIds(access.readableSquadIds ?? [])]),
+    env.TENANT_SLUG,
+    MAX_PROJECTS,
+  ).all<{
     id: string
     direct_squads: number
     open_work: number
@@ -191,7 +235,7 @@ async function loadListMetrics(env: Env, projectIds: string[]): Promise<Map<stri
 export async function loadProjectsPage(env: Env, auth: AuthContext): Promise<ProjectsPageView> {
   const access = await projectAccess(env, auth)
   const { projects: displayed, capped } = await loadVisibleProjects(env, access)
-  const metrics = await loadListMetrics(env, displayed.map((project) => project.id))
+  const metrics = await loadListMetrics(env, displayed.map((project) => project.id), access)
   const visibleById = new Map(displayed.map((project) => [project.id, project]))
   const parentIds = [...new Set(displayed
     .map((project) => project.parent_project_id)
@@ -234,15 +278,14 @@ export async function loadProjectsPage(env: Env, auth: AuthContext): Promise<Pro
 
 async function isReadableProject(env: Env, projectId: string, access: ProjectAccess): Promise<boolean> {
   if (access.workspaceAdmin) return true
-  const visibility = squadReadPredicate(access)
+  if (!access.readableSquadIds?.length) return false
   const edge = await env.DB.prepare(
     `SELECT 1
        FROM project_squad_access psa
-       JOIN squads s ON s.id = psa.squad_id
       WHERE psa.project_id = ?
-        AND (${visibility.sql})
+        AND psa.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
       LIMIT 1`,
-  ).bind(projectId, ...visibility.binds).first()
+  ).bind(projectId, jsonIds(access.readableSquadIds)).first()
   return edge !== null
 }
 
@@ -251,16 +294,23 @@ async function loadReadableTasks(
   projectId: string,
   access: ProjectAccess,
 ): Promise<ProjectTaskRow[]> {
-  const visibility = squadReadPredicate(access)
+  if (!access.workspaceAdmin && !access.readableSquadIds?.length) return []
+  const filter = access.workspaceAdmin
+    ? ''
+    : ' AND t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
+  const limitParam = access.workspaceAdmin ? '?2' : '?3'
   const result = await env.DB.prepare(
     `SELECT t.id, t.title, t.status, t.squad_id, s.name AS squad_name, s.department_id
-       FROM tasks t
+      FROM tasks t
        JOIN squads s ON s.id = t.squad_id
-      WHERE t.project_id = ?
-        AND (${visibility.sql})
+      WHERE t.project_id = ?1${filter}
       ORDER BY t.created_at DESC, t.id
-      LIMIT ?`,
-  ).bind(projectId, ...visibility.binds, MAX_WORK_ROWS)
+      LIMIT ${limitParam}`,
+  ).bind(
+    projectId,
+    ...(access.workspaceAdmin ? [] : [jsonIds(access.readableSquadIds ?? [])]),
+    MAX_WORK_ROWS,
+  )
     .all<ProjectTaskRow & { squad_id: string; department_id: string }>()
   return (result.results ?? [])
     .map(({ id, title, status, squad_name }) => ({ id, title, status, squad_name }))
@@ -271,17 +321,52 @@ async function loadReadableSquads(
   projectId: string,
   access: ProjectAccess,
 ): Promise<ProjectSquadRow[]> {
-  const visibility = squadReadPredicate(access)
+  if (!access.workspaceAdmin && !access.readableSquadIds?.length) return []
+  const filter = access.workspaceAdmin
+    ? ''
+    : ' AND psa.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
+  const limitParam = access.workspaceAdmin ? '?2' : '?3'
   const result = await env.DB.prepare(
     `SELECT psa.project_id, psa.squad_id, psa.access_level, psa.granted_at, s.name AS squad_name
        FROM project_squad_access psa
        JOIN squads s ON s.id = psa.squad_id
-      WHERE psa.project_id = ?
-        AND (${visibility.sql})
+      WHERE psa.project_id = ?1${filter}
       ORDER BY psa.squad_id
-      LIMIT ?`,
-  ).bind(projectId, ...visibility.binds, MAX_SQUAD_ROWS).all<ProjectSquadRow>()
+      LIMIT ${limitParam}`,
+  ).bind(
+    projectId,
+    ...(access.workspaceAdmin ? [] : [jsonIds(access.readableSquadIds ?? [])]),
+    MAX_SQUAD_ROWS,
+  ).all<ProjectSquadRow>()
   return result.results ?? []
+}
+
+async function loadProjectAggregates(
+  env: Env,
+  projectId: string,
+  access: ProjectAccess,
+): Promise<ProjectDetailView['aggregates']> {
+  const squadFilter = access.workspaceAdmin
+    ? ''
+    : ' AND squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
+  const flightFilter = access.workspaceAdmin ? '' : readableFlightSql('f', '?2')
+  const tenantParam = access.workspaceAdmin ? '?2' : '?3'
+  const row = await env.DB.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM tasks WHERE project_id = ?1${squadFilter}) AS direct_tasks,
+       (SELECT COUNT(*) FROM project_squad_access WHERE project_id = ?1${squadFilter}) AS direct_squads,
+       (SELECT COUNT(*) FROM flights f
+         WHERE f.project_id = ?1 AND f.tenant = ${tenantParam}${flightFilter}) AS direct_flights`,
+  ).bind(
+    projectId,
+    ...(access.workspaceAdmin ? [] : [jsonIds(access.readableSquadIds ?? [])]),
+    env.TENANT_SLUG,
+  ).first<{ direct_tasks: number; direct_squads: number; direct_flights: number }>()
+  return {
+    directTasks: Number(row?.direct_tasks ?? 0),
+    directSquads: Number(row?.direct_squads ?? 0),
+    directFlights: Number(row?.direct_flights ?? 0),
+  }
 }
 
 export async function loadProjectDetail(
@@ -292,13 +377,8 @@ export async function loadProjectDetail(
   const [project, access] = await Promise.all([getProject(env, projectId), projectAccess(env, auth)])
   if (!project || !await isReadableProject(env, project.id, access)) return null
 
-  const [taskCount, squadCount, flightCount, tasks, squads, parent] = await Promise.all([
-    env.DB.prepare('SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?')
-      .bind(project.id).first<{ count: number }>(),
-    env.DB.prepare('SELECT COUNT(*) AS count FROM project_squad_access WHERE project_id = ?')
-      .bind(project.id).first<{ count: number }>(),
-    env.DB.prepare('SELECT COUNT(*) AS count FROM flights WHERE project_id = ? AND tenant = ?')
-      .bind(project.id, env.TENANT_SLUG).first<{ count: number }>(),
+  const [aggregates, tasks, squads, parent] = await Promise.all([
+    loadProjectAggregates(env, project.id, access),
     loadReadableTasks(env, project.id, access),
     loadReadableSquads(env, project.id, access),
     project.parent_project_id ? getProject(env, project.parent_project_id) : Promise.resolve(null),
@@ -307,13 +387,51 @@ export async function loadProjectDetail(
   return {
     project,
     parent: parent ? safeParent(parent) : null,
-    aggregates: {
-      directTasks: Number(taskCount?.count ?? 0),
-      directSquads: Number(squadCount?.count ?? 0),
-      directFlights: Number(flightCount?.count ?? 0),
-    },
+    aggregates,
     tasks,
     squads,
+  }
+}
+
+export async function loadProjectWorkContext(
+  env: Env,
+  auth: AuthContext,
+  projectId: string,
+): Promise<ProjectWorkContext | null> {
+  const [project, access] = await Promise.all([getProject(env, projectId), projectAccess(env, auth)])
+  if (!project || !await isReadableProject(env, project.id, access)) return null
+  const edges = await env.DB.prepare(
+    `SELECT squad_id, access_level
+       FROM project_squad_access
+      WHERE project_id = ?1
+      ORDER BY squad_id`,
+  ).bind(project.id).all<{ squad_id: string; access_level: ProjectAccessLevel }>()
+  const taskable = access.taskableSquadIds === null ? null : new Set(access.taskableSquadIds)
+  return {
+    project,
+    readableSquadIds: access.readableSquadIds,
+    taskableSquadIds: project.status === 'archived' ? [] : (edges.results ?? [])
+      .filter((edge) => edge.access_level === 'write' || edge.access_level === 'admin')
+      .filter((edge) => taskable === null || taskable.has(edge.squad_id))
+      .map((edge) => edge.squad_id),
+  }
+}
+
+export function projectFlightIsReadable(context: ProjectWorkContext, meta: string): boolean {
+  if (context.readableSquadIds === null) return true
+  const readable = new Set(context.readableSquadIds)
+  try {
+    const parsed = JSON.parse(meta) as { schema?: unknown; squad_ids?: unknown }
+    if (parsed.schema !== 'mupot.flight.meta/v1' || !Array.isArray(parsed.squad_ids)) return false
+    if (parsed.squad_ids.length === 0 || parsed.squad_ids.length > 8) return false
+    return parsed.squad_ids.every((id) => (
+      typeof id === 'string'
+      && id.trim().length > 0
+      && id.length <= 200
+      && readable.has(id)
+    ))
+  } catch {
+    return false
   }
 }
 
@@ -426,12 +544,25 @@ export function projectsPageBody(view: ProjectsPageView) {
 
 function projectTabs() {
   return html`<nav aria-label="Project sections" style="display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px;">
-    <a class="btn secondary sm" href="#overview" aria-current="page">Overview</a>
-    <a class="btn secondary sm" href="#work">Work</a>
-    <a class="btn secondary sm" href="#squads">Squads</a>
-    <a class="btn secondary sm" href="#activity">Activity</a>
-    <a class="btn secondary sm" href="#evidence">Evidence</a>
-  </nav>`
+    <a class="btn secondary sm" data-project-tab href="#overview" aria-current="page">Overview</a>
+    <a class="btn secondary sm" data-project-tab href="#work">Work</a>
+    <a class="btn secondary sm" data-project-tab href="#squads">Squads</a>
+    <a class="btn secondary sm" data-project-tab href="#activity">Activity</a>
+    <a class="btn secondary sm" data-project-tab href="#evidence">Evidence</a>
+  </nav>
+  <script>
+    (function () {
+      function syncProjectTab() {
+        var current = window.location.hash || '#overview';
+        document.querySelectorAll('[data-project-tab]').forEach(function (link) {
+          if (link.getAttribute('href') === current) link.setAttribute('aria-current', 'page');
+          else link.removeAttribute('aria-current');
+        });
+      }
+      window.addEventListener('hashchange', syncProjectTab);
+      syncProjectTab();
+    })();
+  </script>`
 }
 
 export function projectDetailBody(view: ProjectDetailView) {

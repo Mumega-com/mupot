@@ -43,6 +43,9 @@ function makeHarness(): SqliteD1Harness {
     INSERT INTO squads (id, department_id, slug, name) VALUES
       ('squad-a', 'dept-a', 'squad-a', 'Squad Alpha'),
       ('squad-b', 'dept-b', 'squad-b', 'Squad Beta');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
+      ('agent-a', 'squad-a', 'agent-a', 'Agent Alpha', 'Visible operator', 'test', 'active'),
+      ('agent-b', 'squad-b', 'agent-b', 'Agent Beta Secret', 'Hidden operator', 'test', 'active');
 
     INSERT INTO projects (id, slug, name, description, goal, status, target_date) VALUES
       ('root', 'mumega-products', 'Mumega Products', 'Product portfolio', 'Build durable products', 'active', '2026-12-31'),
@@ -62,13 +65,16 @@ function makeHarness(): SqliteD1Harness {
       ('hidden-task-on-visible-project', 'squad-b', 'Hidden squad task secret', 'open', 'visible-child'),
       ('hidden-sibling-task', 'squad-b', 'Hidden sibling task secret', 'open', 'hidden-child');
 
+    INSERT INTO flights (id, tenant, agent, goal, status, project_id, meta) VALUES
+      ('visible-flight', 'pot-a', 'agent-a', 'Ship Inkwell', 'running', 'visible-child', '{"schema":"mupot.flight.meta/v1","goal_id":"visible","objective_id":"ship","squad_ids":["squad-a"],"task_ids":["visible-task"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}'),
+      ('hidden-flight-on-visible-project', 'pot-a', 'agent-b', 'Hidden visible-project flight', 'running', 'visible-child', '{"schema":"mupot.flight.meta/v1","goal_id":"hidden","objective_id":"ship","squad_ids":["squad-b"],"task_ids":["hidden-task-on-visible-project"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}'),
+      ('mixed-flight', 'pot-a', 'agent-a', 'Mixed squad secret flight', 'running', 'visible-child', '{"schema":"mupot.flight.meta/v1","goal_id":"mixed","objective_id":"ship","squad_ids":["squad-a","squad-b"],"task_ids":["visible-task","hidden-task-on-visible-project"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}'),
+      ('legacy-flight', 'pot-a', 'agent-a', 'Legacy project flight', 'running', 'visible-child', '{"squad_ids":["squad-a"]}'),
+      ('hidden-flight', 'pot-a', 'agent-b', 'Ship Mirror', 'running', 'hidden-child', '{"schema":"mupot.flight.meta/v1","goal_id":"mirror","objective_id":"ship","squad_ids":["squad-b"],"task_ids":["hidden-sibling-task"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}');
+
     UPDATE project_squad_access
        SET access_level = 'read'
      WHERE project_id = 'visible-child' AND squad_id = 'squad-b';
-
-    INSERT INTO flights (id, tenant, agent, goal, status, project_id) VALUES
-      ('visible-flight', 'pot-a', 'agent-a', 'Ship Inkwell', 'running', 'visible-child'),
-      ('hidden-flight', 'pot-a', 'agent-b', 'Ship Mirror', 'running', 'hidden-child');
   `)
   return harness
 }
@@ -95,9 +101,34 @@ function memberA(): AuthContext {
   return actor({
     memberId: 'member-a',
     capabilities: [
-      { member_id: 'member-a', scope_type: 'department', scope_id: 'dept-a', capability: 'observer' },
+      { member_id: 'member-a', scope_type: 'department', scope_id: 'dept-a', capability: 'member' },
     ],
   })
+}
+
+function envWithBindBudget(harness: SqliteD1Harness, observed: number[]): Env {
+  const db = new Proxy(harness.db, {
+    get(target, property, receiver) {
+      if (property !== 'prepare') return Reflect.get(target, property, receiver)
+      return (sql: string) => {
+        const statement = target.prepare(sql)
+        return new Proxy(statement, {
+          get(statementTarget, statementProperty, statementReceiver) {
+            if (statementProperty !== 'bind') {
+              const value = Reflect.get(statementTarget, statementProperty, statementReceiver)
+              return typeof value === 'function' ? value.bind(statementTarget) : value
+            }
+            return (...values: unknown[]) => {
+              observed.push(values.length)
+              if (values.length > 100) throw new Error(`D1 bind budget exceeded: ${values.length}`)
+              return statement.bind(...values)
+            }
+          },
+        })
+      }
+    },
+  })
+  return { ...envFor(harness), DB: db }
 }
 
 async function render(value: unknown): Promise<string> {
@@ -129,9 +160,55 @@ describe('project dashboard renderers', () => {
       metrics: null,
       children: [{
         id: 'visible-child',
-        metrics: { directSquads: 2, openWork: 2, activeFlights: 1 },
+        metrics: { directSquads: 1, openWork: 1, activeFlights: 1 },
       }],
     })
+  })
+
+  it('keeps every production query within D1 bind limits for large project and capability sets', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 101)
+      INSERT INTO projects (id, slug, name, status)
+      SELECT printf('budget-%03d', x), printf('budget-%03d', x), printf('Budget %03d', x), 'planned'
+        FROM n;
+    `)
+    const observed: number[] = []
+    const env = envWithBindBudget(harness, observed)
+    const grants = [{
+      member_id: 'member-a',
+      scope_type: 'department' as const,
+      scope_id: 'dept-a',
+      capability: 'member' as const,
+    }, ...Array.from({ length: 150 }, (_, index) => ({
+      member_id: 'member-a',
+      scope_type: 'squad' as const,
+      scope_id: `grant-${index}`,
+      capability: 'observer' as const,
+    }))]
+    const auth = actor({ memberId: 'member-a', capabilities: grants })
+
+    await expect(loadProjectsPage(env, auth)).resolves.toBeDefined()
+    await expect(loadProjectDetail(env, auth, 'visible-child')).resolves.toBeDefined()
+    as(auth)
+    await expect(dashboardApp.fetch(new Request('https://pot.test/send?project_id=visible-child'), env)).resolves.toHaveProperty('status', 200)
+    await expect(dashboardApp.fetch(new Request('https://pot.test/flights?project_id=visible-child'), env)).resolves.toHaveProperty('status', 200)
+    await expect(loadProjectsPage(env, actor({ role: 'owner' }))).resolves.toBeDefined()
+    expect(Math.max(...observed)).toBeLessThanOrEqual(100)
+  })
+
+  it('shows only readable squad aggregates to members and all aggregates to owners', async () => {
+    harness = makeHarness()
+
+    const memberList = await loadProjectsPage(envFor(harness), memberA())
+    const memberChild = memberList.nodes[0]?.children[0]
+    expect(memberChild?.metrics).toEqual({ directSquads: 1, openWork: 1, activeFlights: 1 })
+
+    const memberDetail = await loadProjectDetail(envFor(harness), memberA(), 'visible-child')
+    expect(memberDetail?.aggregates).toEqual({ directTasks: 1, directSquads: 1, directFlights: 1 })
+
+    const ownerDetail = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'visible-child')
+    expect(ownerDetail?.aggregates).toEqual({ directTasks: 2, directSquads: 2, directFlights: 4 })
   })
 
   it('renders bounded per-project squad, open-work, and active-flight metrics', async () => {
@@ -221,6 +298,9 @@ describe('project dashboard renderers', () => {
     expect(body.match(/role="table"/g)).toHaveLength(3)
     expect(body).toContain('role="columnheader"')
     expect(body).toContain('role="cell"')
+    expect(body).toContain("window.addEventListener('hashchange', syncProjectTab)")
+    expect(body).toContain("link.setAttribute('aria-current', 'page')")
+    expect(body).toContain("link.removeAttribute('aria-current')")
   })
 
   it('filters task authorization before applying the bounded detail sample', async () => {
@@ -287,6 +367,56 @@ describe('project dashboard routes', () => {
     expect(body).not.toContain('Hidden sibling task secret')
 
     const hidden = await dashboardApp.fetch(new Request('https://pot.test/projects/hidden-child'), env)
+    expect(hidden.status).toBe(404)
+    expect(await hidden.text()).not.toContain('Hidden sibling secret')
+  })
+
+  it('validates project task context, filters the picker, and includes project_id in the task payload', async () => {
+    harness = makeHarness()
+    as(memberA())
+    const env = envFor(harness)
+
+    const response = await dashboardApp.fetch(new Request('https://pot.test/send?project_id=visible-child'), env)
+    const body = await response.text()
+    expect(response.status).toBe(200)
+    expect(body).toContain('Inkwell &lt;script&gt;alert(1)&lt;/script&gt;')
+    expect(body).toContain('Agent Alpha')
+    expect(body).not.toContain('Agent Beta Secret')
+    expect(body).toContain('var projectId = "visible-child"')
+    expect(body).toContain('payload.project_id = projectId')
+
+    const hidden = await dashboardApp.fetch(new Request('https://pot.test/send?project_id=hidden-child'), env)
+    expect(hidden.status).toBe(404)
+    expect(await hidden.text()).not.toContain('Hidden sibling secret')
+  })
+
+  it('passes validated project context to listFlights and excludes other or hidden-squad flights', async () => {
+    harness = makeHarness()
+    as(memberA())
+    const observed: string[] = []
+    const trackedDb = new Proxy(harness.db, {
+      get(target, property, receiver) {
+        if (property !== 'prepare') return Reflect.get(target, property, receiver)
+        return (sql: string) => {
+          if (/SELECT \* FROM flights/i.test(sql)) observed.push(sql)
+          return target.prepare(sql)
+        }
+      },
+    })
+    const env = { ...envFor(harness), DB: trackedDb }
+
+    const response = await dashboardApp.fetch(new Request('https://pot.test/flights?project_id=visible-child'), env)
+    const body = await response.text()
+    expect(response.status).toBe(200)
+    expect(body).toContain('Inkwell &lt;script&gt;alert(1)&lt;/script&gt;')
+    expect(body).toContain('Ship Inkwell')
+    expect(body).not.toContain('Hidden visible-project flight')
+    expect(body).not.toContain('Mixed squad secret flight')
+    expect(body).not.toContain('Legacy project flight')
+    expect(body).not.toContain('Ship Mirror')
+    expect(observed.some((sql) => sql.includes('project_id=?2'))).toBe(true)
+
+    const hidden = await dashboardApp.fetch(new Request('https://pot.test/flights?project_id=hidden-child'), env)
     expect(hidden.status).toBe(404)
     expect(await hidden.text()).not.toContain('Hidden sibling secret')
   })

@@ -1,5 +1,9 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { validateRouteEvidence } from '../scripts/local-browser-smoke.mjs'
+
+const browserSmokeSource = readFileSync(join(__dirname, '..', 'scripts', 'local-browser-smoke.mjs'), 'utf8')
 
 describe('local browser route evidence', () => {
   const cleanEvidence = {
@@ -37,4 +41,10 @@ describe('local browser route evidence', () => {
       })).toThrow(/meaningful content.*\/fleet/i)
     },
   )
+
+  it('exercises project-context send and flight pages and verifies task attribution', () => {
+    expect(browserSmokeSource).toContain("page.goto(`${baseUrl}/send?project_id=project-mupot`")
+    expect(browserSmokeSource).toContain("page.goto(`${baseUrl}/flights?project_id=project-mupot`")
+    expect(browserSmokeSource).toContain('submittedTask.project_id !== \'project-mupot\'')
+  })
 })

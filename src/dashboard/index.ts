@@ -31,6 +31,7 @@ import type {
   Squad,
   Agent,
   Task,
+  Project,
   Member,
   CapabilityGrant,
   Capability,
@@ -106,8 +107,10 @@ import type { AgentAdminRow, SquadOption } from './agents-admin'
 import { formatBurn, formatUsd } from '../agents/cost'
 import {
   loadProjectDetail,
+  loadProjectWorkContext,
   loadProjectsPage,
   projectDetailBody,
+  projectFlightIsReadable,
   projectNotFoundBody,
   projectsPageBody,
 } from './projects'
@@ -268,6 +271,13 @@ dashboardApp.get('/projects/:id', async (c) => {
 // the RBAC-gated /api/tasks (dispatch:true) and polls GET /api/tasks/:id. All auth
 // + CSRF + no-store/Referrer-Policy come from the dashboard middleware above.
 dashboardApp.get('/send', async (c) => {
+  const projectId = c.req.query('project_id')
+  if (projectId !== undefined) {
+    const context = await loadProjectWorkContext(c.env, c.get('auth'), projectId)
+    if (!context) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+    const agents = await loadActiveAgentsWithSquad(c.env, context.taskableSquadIds)
+    return c.html(shell(c.env, 'Send a task', sendPageBody(agents, context.project)))
+  }
   const agents = await loadActiveAgentsWithSquad(c.env)
   return c.html(shell(c.env, 'Send a task', sendPageBody(agents)))
 })
@@ -654,9 +664,19 @@ dashboardApp.post('/brain/loops/:id/control', async (c) => {
 // ── flights (the flight board — what is flying/sleeping + each flight's cost) ─
 // GET /flights — read the flights table (#61). Read-only; control stays on Fleet.
 dashboardApp.get('/flights', async (c) => {
-  const rows = await listFlights(c.env)
+  const projectId = c.req.query('project_id')
+  const context = projectId === undefined
+    ? null
+    : await loadProjectWorkContext(c.env, c.get('auth'), projectId)
+  if (projectId !== undefined && !context) {
+    return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  }
+  const listed = projectId === undefined
+    ? await listFlights(c.env)
+    : await listFlights(c.env, 100, projectId)
+  const rows = context ? listed.filter((flight) => projectFlightIsReadable(context, flight.meta)) : listed
   const cards = buildBoard(rows, Date.now())
-  return c.html(shell(c.env, 'Flights', flightsBody(cards)))
+  return c.html(shell(c.env, 'Flights', flightsBody(cards, context?.project)))
 })
 
 // ── radar (visual fleet + squad awareness — #21 slice 1, VIEW LAYER ONLY) ────
@@ -1991,13 +2011,20 @@ interface PickerAgent {
   squad_id: string
   squad_name: string
 }
-async function loadActiveAgentsWithSquad(env: Env): Promise<PickerAgent[]> {
-  const rows = await env.DB.prepare(
+async function loadActiveAgentsWithSquad(env: Env, squadIds?: string[]): Promise<PickerAgent[]> {
+  if (squadIds?.length === 0) return []
+  const filter = squadIds === undefined
+    ? ''
+    : ' AND a.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))'
+  const statement = env.DB.prepare(
     `SELECT a.id AS id, a.name AS name, a.role AS role, a.squad_id AS squad_id, s.name AS squad_name
        FROM agents a JOIN squads s ON s.id = a.squad_id
-      WHERE a.status = 'active'
+      WHERE a.status = 'active'${filter}
       ORDER BY s.name ASC, a.name ASC`,
-  ).all<PickerAgent>()
+  )
+  const rows = squadIds === undefined
+    ? await statement.all<PickerAgent>()
+    : await statement.bind(JSON.stringify([...new Set(squadIds)])).all<PickerAgent>()
   return rows.results ?? []
 }
 
@@ -3956,7 +3983,7 @@ function agentConsoleBody(agent: Agent, squad: Squad | null, canWake: boolean) {
 // squad. The option VALUE carries "agentId|squadId" so the client can post both
 // without a second lookup. The client posts to /api/tasks (dispatch:true) and then
 // polls /api/tasks/:id every 2s (cap 120s), rendering sent → working → done.
-function sendPageBody(agents: PickerAgent[]) {
+function sendPageBody(agents: PickerAgent[], project?: Project) {
   const hasAgents = agents.length > 0
   const options = agents
     .map(
@@ -3987,8 +4014,11 @@ function sendPageBody(agents: PickerAgent[]) {
         <a href="/">squad board</a> first, then come back to send it a task.</p></div>`
 
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / Send a task</p>
+    <p class="crumbs"><a href="/">Overview</a> / ${project ? html`<a href="/projects/${encodeURIComponent(project.id)}">${project.name}</a> / ` : ''}Send a task</p>
     <h1>Send a task</h1>
+    ${project ? html`<p class="empty" style="margin-top:0;max-width:640px">
+      Project context: <strong>${project.name}</strong>. Only writable project squads and their active agents are available.
+    </p>` : ''}
     <p class="empty" style="margin-top:0;max-width:640px">
       Write what you need in plain language and pick one of your agents. It does the
       work and the result appears below — no jargon, no setup.</p>
@@ -4007,15 +4037,16 @@ function sendPageBody(agents: PickerAgent[]) {
       .result-box .done-meta { color: var(--dim); font-size: 12px; margin-bottom: 10px; }
     </style>
     ${form}
-    ${hasAgents ? sendScript() : html``}`
+    ${hasAgents ? sendScript(project?.id) : html``}`
 }
 
-function sendScript() {
+function sendScript(projectId?: string) {
   // Vanilla, same-origin, credentialed. Title = first ~60 chars of the body. Polls
   // GET /api/tasks/:id every 2s up to 120s. CSRF + no-store handled by middleware.
   return raw(`
     <script>
       (function () {
+        var projectId = ${JSON.stringify(projectId ?? null).replace(/</g, '\\u003c')};
         var btn = document.getElementById('send-btn');
         var bodyEl = document.getElementById('send-body');
         var agentEl = document.getElementById('send-agent');
@@ -4089,18 +4120,20 @@ function sendScript() {
           status.textContent = 'Sending…';
           var title = text.slice(0, 60);
           try {
+            var payload = {
+              squad_id: squadId,
+              title: title,
+              done_when: 'The task result explains the completed work and names any follow-up needed.',
+              body: text,
+              assignee_agent_id: agentId,
+              dispatch: shouldDispatch()
+            };
+            if (projectId) payload.project_id = projectId;
             var res = await fetch('/api/tasks', {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
               credentials: 'same-origin',
-              body: JSON.stringify({
-                squad_id: squadId,
-                title: title,
-                done_when: 'The task result explains the completed work and names any follow-up needed.',
-                body: text,
-                assignee_agent_id: agentId,
-                dispatch: shouldDispatch()
-              })
+              body: JSON.stringify(payload)
             });
             if (res.status === 403) { status.textContent = 'You do not have permission to task that agent.'; return; }
             if (!res.ok) {
@@ -4289,7 +4322,7 @@ function approvalsScript() {
 // Pot-native flock: agents that checked in to THIS pot (no company bus). Read-only
 // inventory — who has access + who is in now. Control (wake/pause) is the bus path;
 // pot-native control is a later objective (#46).
-function flightsBody(cards: FlightCard[]) {
+function flightsBody(cards: FlightCard[], project?: Project) {
   const phaseColor = (p: string) =>
     p === 'flying' ? 'var(--ok)' : p === 'sleeping' ? 'var(--warn)' : p === 'holding' || p === 'preflight' ? 'var(--accent)' : p === 'failed' || p === 'held' ? '#e5534b' : 'var(--dim)'
   const arrow = (t: string | null) => (t === 'up' ? '▲' : t === 'down' ? '▼' : t === 'flat' ? '▬' : '')
@@ -4314,10 +4347,12 @@ function flightsBody(cards: FlightCard[]) {
        it appears here when a flight is created (preflight), and shows its accounted cost on land.</p>`
   return html`
     ${pageHeader({
-      crumbs: 'Overview / Flights',
+      crumbs: project ? `Projects / ${project.name} / Flights` : 'Overview / Flights',
       title: 'Flights',
       sub:
-        'Each flight is one bounded agent run toward a goal. Score is readiness at preflight / coherence on land, with its trend vs that agent’s last flight. Cost is metered (the black box). Read-only — control lives on Fleet.',
+        project
+          ? `Flights attributed to ${project.name}. Score, cost, and status remain read-only; control lives on Fleet.`
+          : 'Each flight is one bounded agent run toward a goal. Score is readiness at preflight / coherence on land, with its trend vs that agent’s last flight. Cost is metered (the black box). Read-only — control lives on Fleet.',
     })}
     ${kpiRow([
       statCard({ label: 'Flying', value: String(flying), subTone: flying > 0 ? 'ok' : 'dim' }),

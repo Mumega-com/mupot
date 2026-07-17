@@ -162,6 +162,17 @@ async function runProjectWorkspaceWorkflow() {
   }
   await page.screenshot({ path: path.join(artifactsDir, 'project-mupot.png'), fullPage: true })
 
+  await page.goto(`${baseUrl}/send?project_id=project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const projectSendText = await textSnippet(page.locator('body'), 3000)
+  if (!projectSendText.includes('Project context: Mupot') || await page.locator('#send-agent option').count() === 0) {
+    fail('project task context did not render an authorized picker', { projectSendText })
+  }
+  await page.goto(`${baseUrl}/flights?project_id=project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const projectFlightsText = await textSnippet(page.locator('body'), 3000)
+  if (!projectFlightsText.includes('Flights attributed to Mupot') || !projectFlightsText.includes('Run local browser smoke')) {
+    fail('project flight context did not render filtered flights', { projectFlightsText })
+  }
+
   await page.setViewportSize({ width: 390, height: 844 })
   await page.goto(`${baseUrl}/projects`, { waitUntil: 'networkidle', timeout: 20_000 })
   const horizontalOverflow = await page.evaluate(() => (
@@ -192,7 +203,7 @@ async function runSendTaskWorkflow() {
   await page.addInitScript(() => {
     window.__MUPOT_SMOKE_DISABLE_DISPATCH = true
   })
-  await page.goto(`${baseUrl}/send`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.goto(`${baseUrl}/send?project_id=project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
 
   await page.locator('#send-btn').click()
   const validationText = await textSnippet(page.locator('#send-status'))
@@ -213,6 +224,7 @@ async function runSendTaskWorkflow() {
   )
   await page.locator('#send-btn').click()
   const createResponse = await createResponsePromise
+  const submittedTask = createResponse.request().postDataJSON()
   const created = await createResponse.json().catch(() => null)
   const taskId = created?.task?.id
   if (createResponse.status() !== 201 || typeof taskId !== 'string') {
@@ -220,6 +232,9 @@ async function runSendTaskWorkflow() {
   }
   if (created?.dispatched !== false) {
     fail('send smoke task unexpectedly dispatched to runtime', { created })
+  }
+  if (submittedTask.project_id !== 'project-mupot') {
+    fail('send smoke task lost project context', { submittedTask })
   }
   if (typeof created?.task?.done_when !== 'string' || created.task.done_when.length === 0) {
     fail('send task create did not preserve done_when', { created })
