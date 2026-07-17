@@ -126,6 +126,7 @@ function commandsForState(state: ConsoleState): LifecycleCommand[] {
     ]
     case 'active': return [{ action: 'disable', label: 'Disable' }]
     case 'disabled': return [
+      { action: 'configure', label: 'Configure' },
       { action: 'activate', label: 'Activate' },
       { action: 'archive', label: 'Uninstall' },
     ]
