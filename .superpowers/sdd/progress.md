@@ -8,3 +8,4 @@ Task 1: complete (commits 86386af..1a2072a, review clean; 192 focused tests + ty
 Task 2: complete (commits 54d2816..f73fa79, review clean; 213 focused tests + typecheck passed; full regression 204 files / 3317 tests passed)
 Task 3: complete (commits 26fda84..59c2546, review clean; 102 focused binding/normalization tests + typecheck passed; full regression 206 files / 3400 tests passed)
 Task 4: complete (commits 56ad535..c33841b, final review approved; 166 fresh focused tests + typecheck passed; independent full regression 207 files / 3448 tests passed)
+Task 5: complete (commits 2f11980..896db34, review approved; 232 fresh focused tests + typecheck passed; full regression 208 files / 3485 tests passed)
