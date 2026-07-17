@@ -1,6 +1,8 @@
 import { html, raw } from 'hono/html'
 import type { AuthContext, Env, Project, ProjectAccessLevel, ProjectStatus } from '../types'
 import { hasCapability, resolveCapabilities } from '../auth/capability'
+import { parseFlightMetaV1 } from '../flight/meta'
+import type { FlightRow } from '../flight/service'
 import { getProject } from '../projects/service'
 import { emptyState, kpiRow, pageHeader, pill, sectionPanel, statCard } from './ui'
 import type { Html } from './ui'
@@ -114,19 +116,76 @@ function jsonIds(ids: string[]): string {
   return JSON.stringify([...new Set(ids)])
 }
 
-function readableFlightSql(flightAlias: string, readableIdsParam: string): string {
+function boundedFlightMetaTextSql(meta: string, path: string, maxLength: number): string {
+  return `
+    AND json_type(${meta}, '${path}') = 'text'
+    AND length(trim(CAST(json_extract(${meta}, '${path}') AS TEXT))) > 0
+    AND length(CAST(json_extract(${meta}, '${path}') AS TEXT)) <= ${maxLength}`
+}
+
+function boundedFlightMetaArraySql(
+  meta: string,
+  path: string,
+  alias: string,
+  maxItems: number,
+  maxLength: number,
+  nonEmpty: boolean,
+): string {
+  return `
+    AND json_type(${meta}, '${path}') = 'array'
+    AND json_array_length(${meta}, '${path}') ${nonEmpty ? 'BETWEEN 1 AND' : '<='} ${maxItems}
+    AND NOT EXISTS (
+      SELECT 1
+        FROM json_each(${meta}, '${path}') ${alias}
+       WHERE ${alias}.type <> 'text'
+          OR length(trim(CAST(${alias}.value AS TEXT))) = 0
+          OR length(CAST(${alias}.value AS TEXT)) > ${maxLength}
+    )`
+}
+
+function canonicalFlightMetaSql(flightAlias: string): string {
   const safeMeta = `CASE WHEN json_valid(${flightAlias}.meta) THEN ${flightAlias}.meta ELSE '{}' END`
   return `
+    AND json_valid(${flightAlias}.meta)
+    AND json_type(${safeMeta}) = 'object'
+    AND length(json(${safeMeta})) <= 16384
+    AND NOT EXISTS (
+      SELECT 1
+        FROM json_each(${safeMeta}) meta_key
+       WHERE meta_key.key NOT IN (
+         'schema', 'goal_id', 'objective_id', 'squad_ids', 'task_ids', 'done_when',
+         'artifact_refs', 'receipt_refs', 'confidentiality', 'publication_target', 'parent_flight_id'
+       )
+    )
     AND json_extract(${safeMeta}, '$.schema') = 'mupot.flight.meta/v1'
-    AND json_type(${safeMeta}, '$.squad_ids') = 'array'
-    AND json_array_length(${safeMeta}, '$.squad_ids') BETWEEN 1 AND 8
+    ${boundedFlightMetaTextSql(safeMeta, '$.goal_id', 200)}
+    ${boundedFlightMetaTextSql(safeMeta, '$.objective_id', 200)}
+    ${boundedFlightMetaArraySql(safeMeta, '$.squad_ids', 'squad_item', 8, 200, true)}
+    ${boundedFlightMetaArraySql(safeMeta, '$.task_ids', 'task_item', 200, 200, true)}
+    ${boundedFlightMetaArraySql(safeMeta, '$.done_when', 'done_item', 100, 1000, true)}
+    ${boundedFlightMetaArraySql(safeMeta, '$.artifact_refs', 'artifact_item', 200, 2000, false)}
+    ${boundedFlightMetaArraySql(safeMeta, '$.receipt_refs', 'receipt_item', 200, 2000, false)}
+    AND json_type(${safeMeta}, '$.confidentiality') = 'text'
+    AND json_extract(${safeMeta}, '$.confidentiality') IN ('private', 'internal', 'public-projection')
+    AND json_type(${safeMeta}, '$.publication_target') = 'text'
+    AND json_extract(${safeMeta}, '$.publication_target') IN ('none', 'inkwell-draft', 'mumega.com')
+    AND json_type(${safeMeta}, '$.parent_flight_id') IN ('null', 'text')
+    AND (
+      json_type(${safeMeta}, '$.parent_flight_id') = 'null'
+      OR (
+        length(trim(CAST(json_extract(${safeMeta}, '$.parent_flight_id') AS TEXT))) > 0
+        AND length(CAST(json_extract(${safeMeta}, '$.parent_flight_id') AS TEXT)) <= 200
+      )
+    )`
+}
+
+function readableFlightSql(flightAlias: string, readableIdsParam: string): string {
+  const safeMeta = `CASE WHEN json_valid(${flightAlias}.meta) THEN ${flightAlias}.meta ELSE '{}' END`
+  return `${canonicalFlightMetaSql(flightAlias)}
     AND NOT EXISTS (
       SELECT 1
         FROM json_each(${safeMeta}, '$.squad_ids') squad_ref
-       WHERE squad_ref.type <> 'text'
-          OR length(trim(CAST(squad_ref.value AS TEXT))) = 0
-          OR length(CAST(squad_ref.value AS TEXT)) > 200
-          OR NOT EXISTS (
+       WHERE NOT EXISTS (
             SELECT 1
               FROM json_each(${readableIdsParam}) readable_squad
              WHERE CAST(readable_squad.value AS TEXT) = CAST(squad_ref.value AS TEXT)
@@ -421,18 +480,38 @@ export function projectFlightIsReadable(context: ProjectWorkContext, meta: strin
   if (context.readableSquadIds === null) return true
   const readable = new Set(context.readableSquadIds)
   try {
-    const parsed = JSON.parse(meta) as { schema?: unknown; squad_ids?: unknown }
-    if (parsed.schema !== 'mupot.flight.meta/v1' || !Array.isArray(parsed.squad_ids)) return false
-    if (parsed.squad_ids.length === 0 || parsed.squad_ids.length > 8) return false
-    return parsed.squad_ids.every((id) => (
-      typeof id === 'string'
-      && id.trim().length > 0
-      && id.length <= 200
-      && readable.has(id)
-    ))
+    const parsed = parseFlightMetaV1(JSON.parse(meta))
+    return parsed !== null && parsed.squad_ids.every((id) => readable.has(id))
   } catch {
     return false
   }
+}
+
+export async function loadProjectFlights(
+  env: Env,
+  context: ProjectWorkContext,
+): Promise<FlightRow[]> {
+  const statement = context.readableSquadIds === null
+    ? env.DB.prepare(
+      `SELECT *
+         FROM flights
+        WHERE tenant = ?1 AND project_id = ?2
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?3`,
+    ).bind(env.TENANT_SLUG, context.project.id, 100)
+    : env.DB.prepare(
+      `SELECT *
+         FROM flights f
+        WHERE f.tenant = ?1 AND f.project_id = ?2
+          ${readableFlightSql('f', '?3')}
+        ORDER BY f.created_at DESC, f.id DESC
+        LIMIT ?4`,
+    ).bind(env.TENANT_SLUG, context.project.id, jsonIds(context.readableSquadIds), 100)
+  const result = await statement.all<FlightRow>()
+  const rows = result.results ?? []
+  return context.readableSquadIds === null
+    ? rows
+    : rows.filter((flight) => projectFlightIsReadable(context, flight.meta))
 }
 
 function statusTone(status: ProjectStatus): 'ok' | 'warn' | 'dim' | 'primary' {

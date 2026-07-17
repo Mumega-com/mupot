@@ -107,10 +107,10 @@ import type { AgentAdminRow, SquadOption } from './agents-admin'
 import { formatBurn, formatUsd } from '../agents/cost'
 import {
   loadProjectDetail,
+  loadProjectFlights,
   loadProjectWorkContext,
   loadProjectsPage,
   projectDetailBody,
-  projectFlightIsReadable,
   projectNotFoundBody,
   projectsPageBody,
 } from './projects'
@@ -671,10 +671,9 @@ dashboardApp.get('/flights', async (c) => {
   if (projectId !== undefined && !context) {
     return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
   }
-  const listed = projectId === undefined
-    ? await listFlights(c.env)
-    : await listFlights(c.env, 100, projectId)
-  const rows = context ? listed.filter((flight) => projectFlightIsReadable(context, flight.meta)) : listed
+  const rows = context
+    ? await loadProjectFlights(c.env, context)
+    : await listFlights(c.env)
   const cards = buildBoard(rows, Date.now())
   return c.html(shell(c.env, 'Flights', flightsBody(cards, context?.project)))
 })

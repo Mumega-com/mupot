@@ -70,6 +70,7 @@ function makeHarness(): SqliteD1Harness {
       ('hidden-flight-on-visible-project', 'pot-a', 'agent-b', 'Hidden visible-project flight', 'running', 'visible-child', '{"schema":"mupot.flight.meta/v1","goal_id":"hidden","objective_id":"ship","squad_ids":["squad-b"],"task_ids":["hidden-task-on-visible-project"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}'),
       ('mixed-flight', 'pot-a', 'agent-a', 'Mixed squad secret flight', 'running', 'visible-child', '{"schema":"mupot.flight.meta/v1","goal_id":"mixed","objective_id":"ship","squad_ids":["squad-a","squad-b"],"task_ids":["visible-task","hidden-task-on-visible-project"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}'),
       ('legacy-flight', 'pot-a', 'agent-a', 'Legacy project flight', 'running', 'visible-child', '{"squad_ids":["squad-a"]}'),
+      ('malformed-v1-flight', 'pot-a', 'agent-a', 'Malformed self-labeled v1 flight', 'running', 'visible-child', '{"schema":"mupot.flight.meta/v1","squad_ids":["squad-a"]}'),
       ('hidden-flight', 'pot-a', 'agent-b', 'Ship Mirror', 'running', 'hidden-child', '{"schema":"mupot.flight.meta/v1","goal_id":"mirror","objective_id":"ship","squad_ids":["squad-b"],"task_ids":["hidden-sibling-task"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}');
 
     UPDATE project_squad_access
@@ -208,7 +209,7 @@ describe('project dashboard renderers', () => {
     expect(memberDetail?.aggregates).toEqual({ directTasks: 1, directSquads: 1, directFlights: 1 })
 
     const ownerDetail = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'visible-child')
-    expect(ownerDetail?.aggregates).toEqual({ directTasks: 2, directSquads: 2, directFlights: 4 })
+    expect(ownerDetail?.aggregates).toEqual({ directTasks: 2, directSquads: 2, directFlights: 5 })
   })
 
   it('renders bounded per-project squad, open-work, and active-flight metrics', async () => {
@@ -390,7 +391,45 @@ describe('project dashboard routes', () => {
     expect(await hidden.text()).not.toContain('Hidden sibling secret')
   })
 
-  it('passes validated project context to listFlights and excludes other or hidden-squad flights', async () => {
+  it('excludes read-only project edges even when the member can task the squad', async () => {
+    harness = makeHarness()
+    as(actor({
+      memberId: 'member-b',
+      capabilities: [{
+        member_id: 'member-b', scope_type: 'department', scope_id: 'dept-b', capability: 'member',
+      }],
+    }))
+
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/send?project_id=visible-child'),
+      envFor(harness),
+    )
+    const body = await response.text()
+    expect(response.status).toBe(200)
+    expect(body).not.toContain('Agent Beta Secret')
+    expect(body).toContain('No active agents yet')
+  })
+
+  it('excludes writable project squads when the member is only an observer', async () => {
+    harness = makeHarness()
+    as(actor({
+      memberId: 'member-observer',
+      capabilities: [{
+        member_id: 'member-observer', scope_type: 'department', scope_id: 'dept-a', capability: 'observer',
+      }],
+    }))
+
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/send?project_id=visible-child'),
+      envFor(harness),
+    )
+    const body = await response.text()
+    expect(response.status).toBe(200)
+    expect(body).not.toContain('Agent Alpha')
+    expect(body).toContain('No active agents yet')
+  })
+
+  it('uses a pre-limit authorized project-flight query and excludes hidden or malformed flights', async () => {
     harness = makeHarness()
     as(memberA())
     const observed: string[] = []
@@ -398,7 +437,7 @@ describe('project dashboard routes', () => {
       get(target, property, receiver) {
         if (property !== 'prepare') return Reflect.get(target, property, receiver)
         return (sql: string) => {
-          if (/SELECT \* FROM flights/i.test(sql)) observed.push(sql)
+          if (/SELECT \*[\s\S]*FROM\s+flights/i.test(sql)) observed.push(sql)
           return target.prepare(sql)
         }
       },
@@ -413,12 +452,68 @@ describe('project dashboard routes', () => {
     expect(body).not.toContain('Hidden visible-project flight')
     expect(body).not.toContain('Mixed squad secret flight')
     expect(body).not.toContain('Legacy project flight')
+    expect(body).not.toContain('Malformed self-labeled v1 flight')
     expect(body).not.toContain('Ship Mirror')
-    expect(observed.some((sql) => sql.includes('project_id=?2'))).toBe(true)
+    expect(observed.some((sql) => (
+      /json_valid\(f\.meta\)[\s\S]*json_each\(\?3\)[\s\S]*ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?4/i
+        .test(sql)
+    ))).toBe(true)
 
     const hidden = await dashboardApp.fetch(new Request('https://pot.test/flights?project_id=hidden-child'), env)
     expect(hidden.status).toBe(404)
     expect(await hidden.text()).not.toContain('Hidden sibling secret')
+  })
+
+  it('authorizes project flights before ordering and limiting the visible sample', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      UPDATE project_squad_access
+         SET access_level = 'write'
+       WHERE project_id = 'visible-child' AND squad_id = 'squad-b';
+      UPDATE flights SET created_at = 1 WHERE id = 'visible-flight';
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 101)
+      INSERT INTO flights (id, tenant, agent, goal, status, project_id, created_at, meta)
+      SELECT printf('newer-unauthorized-%03d', x), 'pot-a', 'agent-b',
+             CASE WHEN x % 2 = 0 THEN printf('Newer malformed %03d', x) ELSE printf('Newer hidden %03d', x) END,
+             'running', 'visible-child', 2000000000000 + x,
+             CASE WHEN x % 2 = 0
+               THEN '{"schema":"mupot.flight.meta/v1","squad_ids":["squad-a"]}'
+               ELSE '{"schema":"mupot.flight.meta/v1","goal_id":"hidden-crowd","objective_id":"ship","squad_ids":["squad-b"],"task_ids":["hidden-task-on-visible-project"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}'
+             END
+        FROM n;
+      UPDATE project_squad_access
+         SET access_level = 'read'
+       WHERE project_id = 'visible-child' AND squad_id = 'squad-b';
+    `)
+    as(memberA())
+
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/flights?project_id=visible-child'),
+      envFor(harness),
+    )
+    const body = await response.text()
+    expect(response.status).toBe(200)
+    expect(body).toContain('Ship Inkwell')
+    expect(body).not.toContain('Newer hidden')
+    expect(body).not.toContain('Newer malformed')
+  })
+
+  it('lets workspace admins see canonical, mixed, legacy, and malformed project flights', async () => {
+    harness = makeHarness()
+    as(actor({ role: 'owner' }))
+
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/flights?project_id=visible-child'),
+      envFor(harness),
+    )
+    const body = await response.text()
+    expect(response.status).toBe(200)
+    expect(body).toContain('Ship Inkwell')
+    expect(body).toContain('Hidden visible-project flight')
+    expect(body).toContain('Mixed squad secret flight')
+    expect(body).toContain('Legacy project flight')
+    expect(body).toContain('Malformed self-labeled v1 flight')
+    expect(body).not.toContain('Ship Mirror')
   })
 
   it('uses mobile-safe semantic regions without fixed project layout widths', async () => {
