@@ -20,11 +20,6 @@ import type { Html, Tone } from './ui'
 
 const ADDON_KEY = 'marketing-cro-monitor'
 const RUN_LIST_LIMIT = 10
-const DEFAULT_MONITOR_WINDOW = Object.freeze({
-  start: '2026-07-01T00:00:00.000Z',
-  end: '2026-07-01T23:59:59.999Z',
-})
-
 const SOURCE_SLOTS = [
   { slot: 'web_analytics', label: 'Web analytics' },
   { slot: 'content_surface', label: 'Content surface' },
@@ -467,7 +462,7 @@ export function marketingCroMonitorBody(view: MarketingCroMonitorView) {
         <p class="monitor-summary">${latestSummary}${view.latestEvidenceDigest ? ` · Evidence ${view.latestEvidenceDigest.slice(0, 12)}` : ''}</p>
       </div>
       <nav class="monitor-actions" aria-label="Addon evidence links">
-        <button class="monitor-action" type="button" data-monitor-action="run" data-monitor-window-start="${DEFAULT_MONITOR_WINDOW.start}" data-monitor-window-end="${DEFAULT_MONITOR_WINDOW.end}">
+        <button class="monitor-action" type="button" data-monitor-action="run">
           <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M5 3v18"/><path d="m19 12-14 9V3z"/></svg>
           Run monitor
         </button>
@@ -518,18 +513,26 @@ export function marketingCroMonitorBody(view: MarketingCroMonitorView) {
       (function () {
         var buttons = document.querySelectorAll('[data-monitor-action="run"]');
         var status = document.querySelector('[data-monitor-status]');
+        function currentUtcWindow() {
+          var now = new window.Date();
+          var year = now.getUTCFullYear();
+          var month = now.getUTCMonth();
+          var day = now.getUTCDate();
+          return {
+            start: new window.Date(window.Date.UTC(year, month, day, 0, 0, 0, 0)).toISOString(),
+            end: new window.Date(window.Date.UTC(year, month, day, 23, 59, 59, 999)).toISOString(),
+          };
+        }
         buttons.forEach(function (button) {
           button.addEventListener('click', async function () {
-            var start = button.dataset.monitorWindowStart;
-            var end = button.dataset.monitorWindowEnd;
-            if (!start || !end) return;
+            var windowRange = currentUtcWindow();
             button.disabled = true;
             if (status) status.textContent = 'Running...';
             try {
               var response = await fetch('/api/addons/${ADDON_KEY}/monitor', {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ window: { start: start, end: end } }),
+                body: JSON.stringify({ window: windowRange }),
               });
               var data = {};
               try { data = await response.json(); } catch (_) {}
