@@ -434,16 +434,51 @@ async function resolveTaskSquad(
     args,
     'member',
     'squad_id required unless the token is agent-bound',
+    hasWorkspaceAdmin(auth),
   )
 }
 
-async function canReadProjectForSquad(env: Env, projectId: string, squadId: string): Promise<boolean> {
+function hasWorkspaceAdmin(auth: AuthContext): boolean {
+  if (auth.role === 'owner' || auth.role === 'admin') return true
+  return hasCapability(auth.capabilities ?? [], 'org', null, 'admin')
+}
+
+async function canReadProjectForSquad(
+  env: Env,
+  auth: AuthContext,
+  projectId: string,
+  squadId: string,
+): Promise<boolean> {
+  if (hasWorkspaceAdmin(auth)) {
+    return (await env.DB.prepare('SELECT 1 FROM projects WHERE id = ?1')
+      .bind(projectId)
+      .first()) !== null
+  }
   return (await env.DB.prepare(
-    `SELECT 1
-       FROM projects p
-       JOIN project_squad_access psa ON psa.project_id = p.id
-      WHERE p.id = ?1 AND psa.squad_id = ?2`,
+    `SELECT 1 FROM project_squad_access WHERE project_id = ?1 AND squad_id = ?2`,
   ).bind(projectId, squadId).first()) !== null
+}
+
+async function hasProjectWriteForSquads(
+  env: Env,
+  projectId: string,
+  squadIds: string[],
+): Promise<boolean> {
+  const uniqueSquadIds = [...new Set(squadIds)]
+  if (uniqueSquadIds.length === 0) return false
+  const placeholders = uniqueSquadIds.map((_, index) => `?${index + 2}`).join(', ')
+  const rows = await env.DB.prepare(
+    `SELECT squad_id, access_level
+       FROM project_squad_access
+      WHERE project_id = ?1
+        AND squad_id IN (${placeholders})`,
+  ).bind(projectId, ...uniqueSquadIds).all<{ squad_id: string; access_level: string }>()
+  const writable = new Set(
+    (rows.results ?? [])
+      .filter((row) => row.access_level === 'write' || row.access_level === 'admin')
+      .map((row) => row.squad_id),
+  )
+  return uniqueSquadIds.every((squadId) => writable.has(squadId))
 }
 
 function taskProjectFailure(error: TaskProjectError): ToolOutcome {
@@ -460,6 +495,7 @@ async function resolveScopedSquad(
   args: Record<string, unknown>,
   min: Capability,
   missingDetail: string,
+  workspaceAdminBypass = false,
 ): Promise<{ ok: true; squad: Squad } | Extract<ToolOutcome, { ok: false }>> {
   let squadId = str(args.squad_id)
   if (!squadId && auth.boundAgentId) {
@@ -472,7 +508,7 @@ async function resolveScopedSquad(
   if (!squad) return failOnly(404, 'squad_not_found')
 
   const grants = auth.capabilities ?? []
-  if (!(await memberCanOnSquad(env, grants, squad.id, min))) {
+  if (!workspaceAdminBypass && !(await memberCanOnSquad(env, grants, squad.id, min))) {
     return failOnly(403, 'forbidden', { need: min, scope: 'squad' })
   }
   return { ok: true, squad }
@@ -592,7 +628,7 @@ const toolTaskList: ToolSpec = {
     if (args.project_id != null && !parsedProjectId) return fail(400, 'invalid_project_id')
     const projectId = parsedProjectId ?? undefined
     if (projectId) {
-      if (!(await canReadProjectForSquad(env, projectId, squadRes.squad.id))) {
+      if (!(await canReadProjectForSquad(env, auth, projectId, squadRes.squad.id))) {
         return fail(404, 'project_not_found')
       }
       baseClauses.push(`project_id = ?${baseBinds.length + 1}`)
@@ -953,6 +989,7 @@ interface FlightCursorEnvelope {
   tenant: string
   member_id: string
   squad_id: string
+  project_id: string | null
   created_at: number
   flight_id: string
 }
@@ -961,6 +998,7 @@ async function resolveFlightCursor(
   env: Env,
   auth: AuthContext,
   squadId: string,
+  projectId: string | undefined,
   value: unknown,
 ): Promise<{ createdAt: number; id: string } | null | undefined> {
   if (value === undefined || value === null) return undefined
@@ -968,20 +1006,33 @@ async function resolveFlightCursor(
   const digest = await sha256Short(value)
   const cursor = await env.SESSIONS.get<FlightCursorEnvelope>(`flight-list-cursor:${digest}`, 'json')
   const memberId = auth.memberId ?? auth.userId
-  if (!cursor || cursor.tenant !== env.TENANT_SLUG || cursor.member_id !== memberId || cursor.squad_id !== squadId) {
+  if (
+    !cursor
+    || cursor.tenant !== env.TENANT_SLUG
+    || cursor.member_id !== memberId
+    || cursor.squad_id !== squadId
+    || cursor.project_id !== (projectId ?? null)
+  ) {
     return null
   }
   if (!Number.isSafeInteger(cursor.created_at) || cursor.created_at < 0 || !cursor.flight_id) return null
   return { createdAt: cursor.created_at, id: cursor.flight_id }
 }
 
-async function issueFlightCursor(env: Env, auth: AuthContext, squadId: string, flight: FlightRow): Promise<string> {
+async function issueFlightCursor(
+  env: Env,
+  auth: AuthContext,
+  squadId: string,
+  projectId: string | undefined,
+  flight: FlightRow,
+): Promise<string> {
   const token = crypto.randomUUID()
   const digest = await sha256Short(token)
   const cursor: FlightCursorEnvelope = {
     tenant: env.TENANT_SLUG,
     member_id: auth.memberId ?? auth.userId,
     squad_id: squadId,
+    project_id: projectId ?? null,
     created_at: flight.created_at,
     flight_id: flight.id,
   }
@@ -996,9 +1047,11 @@ function memberCanAccessFlight(
   minimum: Capability,
 ): boolean {
   const grants = auth.capabilities ?? []
+  const workspaceAdmin = hasWorkspaceAdmin(auth)
   for (const squadId of meta.squad_ids) {
     const squad = squadCache.get(squadId)
-    if (!squad || !hasCapability(grants, 'squad', squad.id, minimum, squad.department_id)) return false
+    if (!squad) return false
+    if (!workspaceAdmin && !hasCapability(grants, 'squad', squad.id, minimum, squad.department_id)) return false
   }
   return true
 }
@@ -1041,6 +1094,7 @@ const toolFlightDispatch: ToolSpec = {
     const squad = await loadSquad(env, squadId)
     if (!squad) return fail(403, 'forbidden')
     const grants = auth.capabilities ?? []
+    const workspaceAdmin = hasWorkspaceAdmin(auth)
 
     const meta = parseFlightMetaV1(parseJsonArg(args.meta_json))
     if (!meta || !meta.squad_ids.includes(squad.id)) return fail(400, 'invalid_flight_meta')
@@ -1049,7 +1103,7 @@ const toolFlightDispatch: ToolSpec = {
     if (referencedSquads.length !== meta.squad_ids.length) return fail(403, 'forbidden')
     const requiredCapability: Capability = (requestedBudget as number) > 0 ? 'lead' : 'member'
     for (const referencedSquad of referencedSquads) {
-      if (!hasCapability(grants, 'squad', referencedSquad.id, requiredCapability, referencedSquad.department_id)) {
+      if (!workspaceAdmin && !hasCapability(grants, 'squad', referencedSquad.id, requiredCapability, referencedSquad.department_id)) {
         return fail(
           403,
           (requestedBudget as number) > 0 ? 'flight_budget_forbidden' : 'forbidden',
@@ -1061,6 +1115,9 @@ const toolFlightDispatch: ToolSpec = {
     const projectId = args.project_id == null ? undefined : str(args.project_id)
     if (args.project_id != null && (!projectId || projectId.length > 200)) {
       return fail(400, 'invalid_project_id')
+    }
+    if (projectId && !workspaceAdmin && !(await hasProjectWriteForSquads(env, projectId, meta.squad_ids))) {
+      return fail(403, 'forbidden', { need: 'project_write', scope: 'project squads' })
     }
 
     let budgetCeilingMicroUsd = 0
@@ -1227,18 +1284,19 @@ const toolFlightList: ToolSpec = {
     const squad = await loadSquad(env, squadId)
     if (!squad) return fail(403, 'forbidden')
     const grants = auth.capabilities ?? []
-    if (!(await memberCanOnSquad(env, grants, squad.id, 'observer'))) {
+    const workspaceAdmin = hasWorkspaceAdmin(auth)
+    if (!workspaceAdmin && !(await memberCanOnSquad(env, grants, squad.id, 'observer'))) {
       return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
     }
     const parsedProjectId = args.project_id == null ? undefined : str(args.project_id)
     if (args.project_id != null && !parsedProjectId) return fail(400, 'invalid_project_id')
     const projectId = parsedProjectId ?? undefined
-    if (projectId && !(await canReadProjectForSquad(env, projectId, squad.id))) {
+    if (projectId && !(await canReadProjectForSquad(env, auth, projectId, squad.id))) {
       return fail(404, 'project_not_found')
     }
     const limit = readLimit(args.limit, 100, 500)
     if (typeof limit !== 'number') return limit
-    let before = await resolveFlightCursor(env, auth, squad.id, args.cursor)
+    let before = await resolveFlightCursor(env, auth, squad.id, projectId, args.cursor)
     if (before === null) return fail(400, 'invalid_flight_cursor')
 
     const visible: Array<Omit<FlightRow, 'meta'> & { meta: FlightMetaV1 }> = []
@@ -1283,7 +1341,7 @@ const toolFlightList: ToolSpec = {
     return done({
       squad_id: squad.id,
       flights: visible,
-      cursor: hasMore && lastScanned ? await issueFlightCursor(env, auth, squad.id, lastScanned) : null,
+      cursor: hasMore && lastScanned ? await issueFlightCursor(env, auth, squad.id, projectId, lastScanned) : null,
       has_more: hasMore,
     })
   },
@@ -2296,7 +2354,7 @@ export async function invokeTool(
   // can no longer fail-open if its handler omits the inline scope check: a caller
   // holding `min` on NO scope is rejected at the chokepoint. The handler still runs
   // its precise per-scope check (the floor is scope-agnostic — see capability.ts).
-  if (spec.min !== 'authenticated' && !holdsCapabilityFloor(auth, spec.min)) {
+  if (spec.min !== 'authenticated' && !hasWorkspaceAdmin(auth) && !holdsCapabilityFloor(auth, spec.min)) {
     return { ...fail(403, 'forbidden', { need: spec.min }), tool: spec.name }
   }
 
