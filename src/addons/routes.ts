@@ -27,7 +27,10 @@ import {
   canonicalMarketingMonitorWindow,
   getLatestMarketingMonitorRun,
   listMarketingMonitorRuns,
+  prepareMarketingRecommendation,
   runMarketingMonitor,
+  type MarketingRecommendation,
+  type MarketingRecommendationFailureReason,
   type MarketingMonitorFailureReason,
 } from './marketing/service'
 import type {
@@ -117,6 +120,26 @@ interface PublicMarketingMonitorRun {
   readonly completedAt: string
 }
 
+interface PublicMarketingRecommendation {
+  readonly kind: string
+  readonly target: string
+  readonly problem: string
+  readonly hypothesis: string
+  readonly primaryKpi: string
+  readonly kpiBaseline: MarketingRecommendation['kpiBaseline']
+  readonly limitingEvidence: MarketingRecommendation['limitingEvidence']
+  readonly evidenceDigest: string
+  readonly approval: MarketingRecommendation['approval']
+  readonly terminalAction: MarketingRecommendation['terminalAction']
+  readonly receiptDigest: string
+  readonly createdAt: string
+  readonly preparedAt: string
+  readonly links: {
+    readonly reviewTask: '/approvals'
+    readonly flightRecord: '/flights'
+  }
+}
+
 function publicReceipt(receipt: AddonReceipt): PublicAddonReceipt {
   return {
     sequence: receipt.sequence,
@@ -155,6 +178,28 @@ function publicMonitorRun(run: MarketingMonitorRun): PublicMarketingMonitorRun {
     outcomes: run.outcomes,
     evidenceDigest: run.evidenceDigest,
     completedAt: run.completedAt,
+  }
+}
+
+function publicRecommendation(recommendation: MarketingRecommendation): PublicMarketingRecommendation {
+  return {
+    kind: recommendation.kind,
+    target: recommendation.target,
+    problem: recommendation.problem,
+    hypothesis: recommendation.hypothesis,
+    primaryKpi: recommendation.primaryKpi,
+    kpiBaseline: recommendation.kpiBaseline,
+    limitingEvidence: recommendation.limitingEvidence,
+    evidenceDigest: recommendation.evidenceDigest,
+    approval: recommendation.approval,
+    terminalAction: recommendation.terminalAction,
+    receiptDigest: recommendation.receiptDigest,
+    createdAt: recommendation.createdAt,
+    preparedAt: recommendation.preparedAt,
+    links: {
+      reviewTask: '/approvals',
+      flightRecord: '/flights',
+    },
   }
 }
 
@@ -262,6 +307,22 @@ function parseMonitorBody(raw: string): { ok: true; window: MonitorWindow } | { 
   return window ? { ok: true, window } : { ok: false }
 }
 
+function parseRecommendationBody(raw: string): { ok: true; runId: string } | { ok: false } {
+  if (raw.length === 0) return { ok: false }
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return { ok: false }
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false }
+  const body = value as Record<string, unknown>
+  if (Object.keys(body).length !== 1 || typeof body.runId !== 'string' || body.runId.length === 0) {
+    return { ok: false }
+  }
+  return { ok: true, runId: body.runId }
+}
+
 function parseMonitorLimit(url: string): number | null {
   const parameters = new URL(url).searchParams
   const keys = [...parameters.keys()]
@@ -285,6 +346,31 @@ function monitorError(reason: MarketingMonitorFailureReason) {
     case 'binding_generation_not_live':
     case 'collection_invalid':
     case 'fence_lost':
+      return { status: 409 as const, body: { error: reason } }
+    case 'collection_failed':
+    case 'stored_run_invalid':
+    case 'write_failed':
+      return { status: 500 as const, body: { error: reason } }
+  }
+}
+
+function recommendationError(reason: MarketingRecommendationFailureReason) {
+  switch (reason) {
+    case 'not_authorized':
+      return { status: 403 as const, body: { error: 'forbidden', detail: 'owner/admin only' } }
+    case 'invalid_window':
+    case 'invalid_limit':
+      return { status: 400 as const, body: { error: reason } }
+    case 'addon_not_active':
+    case 'addon_identity_mismatch':
+    case 'binding_generation_not_live':
+    case 'collection_invalid':
+    case 'fence_lost':
+    case 'run_not_latest':
+    case 'no_opportunity':
+    case 'approval_policy_missing':
+    case 'web_operations_squad_not_found':
+    case 'recommendation_busy':
       return { status: 409 as const, body: { error: reason } }
     case 'collection_failed':
     case 'stored_run_invalid':
@@ -464,6 +550,30 @@ addonsApp.get('/marketing-cro-monitor/monitor', async (c) => {
     return c.json(error.body, error.status)
   }
   return c.json({ runs: result.runs.map(publicMonitorRun) })
+})
+
+addonsApp.post('/marketing-cro-monitor/recommendation', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdminPlus(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  const body = await readBoundedBody(c)
+  if (!body.ok) return c.json({ error: body.status === 413 ? 'payload_too_large' : 'invalid_body' }, body.status)
+  const parsed = parseRecommendationBody(body.raw)
+  if (!parsed.ok) return c.json({ error: 'invalid_body' }, 400)
+
+  const result = await prepareMarketingRecommendation(
+    c.env,
+    { id: auth.userId, role: auth.role },
+    parsed.runId,
+  )
+  if (!result.ok) {
+    const error = recommendationError(result.reason)
+    return c.json(error.body, error.status)
+  }
+  return c.json({
+    ok: true,
+    idempotent: result.idempotent,
+    recommendation: publicRecommendation(result.recommendation),
+  }, result.idempotent ? 200 : 201)
 })
 
 addonsApp.post('/:key/install', (c) => mutate(c, 'install'))

@@ -146,6 +146,20 @@ The fixture lifecycle must prove install, configure with `first_party`, activate
 identify one opportunity, disable, archive, reinstall, and repeat without duplicate
 bindings, tasks, flights, or receipts.
 
+The lifecycle proof is reproducible through:
+
+```bash
+npm run receipt:marketing-monitor:plan
+npm run receipt:marketing-monitor:check -- --base-url https://<pot-host> --token-env <ADMIN_BEARER_ENV> --session-cookie-env <SESSION_COOKIE_ENV>
+```
+
+The emitted `mupot-marketing-monitor-lifecycle/v1` receipt must pin the manifest digest,
+prove first-party binding configuration, prove latest/list monitor reads agree, prepare
+the bounded recommendation through the redacted public recommendation endpoint, verify the
+console exposes redacted task and flight references, reject unavailable outcomes rendered
+as numeric zero, require zero addon ownership claims after archive, and repeat the flow
+after reinstall.
+
 ## 8. Outcome Read Model
 
 The monitor exposes five outcome groups:

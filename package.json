@@ -32,6 +32,8 @@
     "receipt:work-lifecycle:check": "node scripts/work-lifecycle-receipt.mjs --check",
     "receipt:addon-lifecycle:plan": "node scripts/addon-lifecycle-receipt.mjs --plan",
     "receipt:addon-lifecycle:check": "node scripts/addon-lifecycle-receipt.mjs --check",
+    "receipt:marketing-monitor:plan": "node scripts/marketing-monitor-lifecycle-receipt.mjs --plan",
+    "receipt:marketing-monitor:check": "node scripts/marketing-monitor-lifecycle-receipt.mjs --check",
     "receipt:staging-recovery:plan": "node scripts/staging-recovery-rehearsal.mjs --plan",
     "receipt:staging-recovery:check": "node scripts/staging-recovery-rehearsal.mjs --check",
     "receipt:external-pr-cycle:plan": "node scripts/external-pr-cycle-receipt.mjs --plan",
