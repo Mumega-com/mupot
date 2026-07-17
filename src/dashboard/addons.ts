@@ -139,6 +139,18 @@ function requestedSummary(entry: AddonCatalogEntry): string {
   return `${connectors} connector request${connectors === 1 ? '' : 's'}; ${authority} authority requested`
 }
 
+function defaultConfigureBody(entry: AddonCatalogEntry): string | null {
+  const bindings = entry.manifest.connectorRequirements
+    .filter((requirement) => requirement.required && requirement.accepts.includes('first_party'))
+    .map((requirement) => ({
+      slot: requirement.slot,
+      adapter: 'first_party',
+      bindingKind: 'internal_adapter',
+    }))
+
+  return bindings.length > 0 ? JSON.stringify({ bindings }) : null
+}
+
 export function addonsBody(
   entries: AddonCatalogEntry[],
   installations: AddonInstallation[],
@@ -152,6 +164,7 @@ export function addonsBody(
     const digest = (installation?.manifestSha256 ?? entry.manifestSha256).slice(-12)
     const commands = commandsForState(state)
     const receiptsHref = `/api/addons/${encodeURIComponent(entry.manifest.key)}/receipts`
+    const configureBody = defaultConfigureBody(entry)
     const consoleSections = installedAddonIdentityMatches(entry, installation)
       ? entry.manifest.consoleSections.filter((section) => {
           const resolved = consoleResolver.resolve(section.path)
@@ -187,7 +200,7 @@ export function addonsBody(
               </a>`)}
           <a class="addon-receipts" href="${receiptsHref}">Receipts</a>
           <div class="addon-command-list">
-            ${commands.map((command) => html`<button class="btn secondary sm addon-command" type="button" data-addon-key="${entry.manifest.key}" data-addon-action="${command.action}">${command.label}</button>`)}
+            ${commands.map((command) => html`<button class="btn secondary sm addon-command" type="button" data-addon-key="${entry.manifest.key}" data-addon-action="${command.action}"${command.action === 'configure' && configureBody ? html` data-addon-configure-body="${configureBody}"` : ''}>${command.label}</button>`)}
           </div>
           <span class="addon-status" role="status" aria-live="polite"></span>
           ${state === 'disabled'
@@ -241,7 +254,12 @@ export function addonsBody(
             button.disabled = true;
             if (status) status.textContent = 'Working...';
             try {
-              var response = await fetch('/api/addons/' + encodeURIComponent(key) + '/' + action, { method: 'POST' });
+              var options = { method: 'POST' };
+              if (action === 'configure' && button.dataset.addonConfigureBody) {
+                options.headers = { 'content-type': 'application/json' };
+                options.body = button.dataset.addonConfigureBody;
+              }
+              var response = await fetch('/api/addons/' + encodeURIComponent(key) + '/' + action, options);
               var data = {};
               try { data = await response.json(); } catch (_) {}
               if (!response.ok) {

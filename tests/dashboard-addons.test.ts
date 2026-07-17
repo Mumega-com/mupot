@@ -82,12 +82,16 @@ function lifecycleScript(markup: string): string {
   return markup.slice(openEnd + 1, closeStart).trim()
 }
 
-function lifecycleHarness(key = 'fixture-addon') {
+function lifecycleHarness(
+  key = 'fixture-addon',
+  action: 'install' | 'configure' | 'activate' | 'disable' | 'archive' = 'install',
+  configureBody = '',
+) {
   let click: (() => Promise<void>) | undefined
   const status = { textContent: '' }
   const card = { querySelector: (selector: string) => selector === '.addon-status' ? status : null }
   const button = {
-    dataset: { addonKey: key, addonAction: 'install' },
+    dataset: { addonKey: key, addonAction: action, addonConfigureBody: configureBody },
     disabled: false,
     closest: (selector: string) => selector === '[data-addon-card]' ? card : null,
     addEventListener: (event: string, listener: () => Promise<void>) => {
@@ -302,6 +306,29 @@ describe('addonsBody', () => {
     expect(html).not.toMatch(/<form[^>]+action=|data-action-url=|onclick=/)
   })
 
+  it('renders a bounded first-party configure payload for required addon connector slots', () => {
+    const entry: AddonCatalogEntry = {
+      manifest: MarketingCroMonitorAddon,
+      manifestSha256: 'a'.repeat(64),
+    }
+    const live = {
+      ...installation('installed'),
+      addonKey: MarketingCroMonitorAddon.key,
+      installedVersion: MarketingCroMonitorAddon.version,
+      publisher: MarketingCroMonitorAddon.publisher,
+      manifestSha256: entry.manifestSha256,
+      mupotCompatibility: MarketingCroMonitorAddon.mupotCompatibility,
+    }
+    const body = renderedEntry(entry, [live])
+
+    expect(body).toContain('data-addon-action="configure"')
+    expect(body).toContain('&quot;slot&quot;:&quot;web_analytics&quot;')
+    expect(body).toContain('&quot;adapter&quot;:&quot;first_party&quot;')
+    expect(body).toContain('&quot;bindingKind&quot;:&quot;internal_adapter&quot;')
+    expect(body).not.toContain('&quot;slot&quot;:&quot;content_surface&quot;')
+    expect(body).not.toContain('&quot;slot&quot;:&quot;crm&quot;')
+  })
+
   it('includes loading, disabled, inline-error, and refresh behavior for lifecycle commands', () => {
     const html = rendered()
 
@@ -359,10 +386,12 @@ describe('addonsBody', () => {
     const harness = lifecycleHarness('fixture/addon?x=1')
     const script = lifecycleScript(rendered())
     let requestPath = ''
+    let requestOptions: RequestInit | undefined
     let resolveResponse: ((response: { ok: boolean; json: () => Promise<{ error: string }> }) => void) | undefined
     const response = new Promise<{ ok: boolean; json: () => Promise<{ error: string }> }>((resolve) => { resolveResponse = resolve })
-    const fetch = (path: string) => {
+    const fetch = (path: string, options: RequestInit) => {
       requestPath = path
+      requestOptions = options
       return response
     }
 
@@ -370,6 +399,7 @@ describe('addonsBody', () => {
     const click = harness.click()
 
     expect(requestPath).toBe('/api/addons/fixture%2Faddon%3Fx%3D1/install')
+    expect(requestOptions).toEqual({ method: 'POST' })
     expect(harness.button.disabled).toBe(true)
     expect(harness.status.textContent).toBe('Working...')
 
@@ -392,6 +422,35 @@ describe('addonsBody', () => {
     )
     await harness.click()
 
+    expect(harness.reloads()).toBe(1)
+  })
+
+  it('sends the rendered configure payload as JSON only for configure actions', async () => {
+    const configureBody = JSON.stringify({
+      bindings: [{ slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' }],
+    })
+    const harness = lifecycleHarness('marketing-cro-monitor', 'configure', configureBody)
+    const script = lifecycleScript(rendered())
+    let requestPath = ''
+    let requestOptions: RequestInit | undefined
+
+    new Function('document', 'fetch', 'window', script)(
+      harness.document,
+      async (path: string, options: RequestInit) => {
+        requestPath = path
+        requestOptions = options
+        return { ok: true, json: async () => ({}) }
+      },
+      harness.window,
+    )
+    await harness.click()
+
+    expect(requestPath).toBe('/api/addons/marketing-cro-monitor/configure')
+    expect(requestOptions).toEqual({
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: configureBody,
+    })
     expect(harness.reloads()).toBe(1)
   })
 })
