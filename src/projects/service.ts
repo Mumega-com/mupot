@@ -64,8 +64,26 @@ function isForeignKeyViolation(error: unknown): boolean {
   return error instanceof Error && /FOREIGN KEY constraint failed/i.test(error.message)
 }
 
+function triggerMutationError(error: unknown): ProjectMutationError | null {
+  if (!(error instanceof Error)) return null
+  if (error.message.includes('archived parent project') || error.message.includes('archived project squad access')) {
+    return 'archived_project'
+  }
+  if (error.message.includes('project hierarchy depth')) return 'hierarchy_depth'
+  if (error.message.includes('project hierarchy cycle')) return 'hierarchy_cycle'
+  if (error.message.includes('parent project not found')) return 'parent_not_found'
+  if (error.message.includes('active child projects')) return 'active_children'
+  return null
+}
+
 function wrote(result: D1Result<unknown>): boolean {
   return Number(result.meta?.changes ?? 0) > 0
+}
+
+function nextUpdatedAt(previous: string): string {
+  const previousMs = Date.parse(previous)
+  const floor = Number.isNaN(previousMs) ? Date.now() : previousMs + 1
+  return new Date(Math.max(Date.now(), floor)).toISOString()
 }
 
 async function hasNonArchivedChildren(env: Env, projectId: string): Promise<boolean> {
@@ -158,6 +176,8 @@ export async function createProject(
   } catch (error) {
     if (isUniqueViolation(error)) return { ok: false, error: 'slug_taken' }
     if (isForeignKeyViolation(error)) return { ok: false, error: 'parent_not_found' }
+    const mapped = triggerMutationError(error)
+    if (mapped) return { ok: false, error: mapped }
     throw error
   }
 
@@ -238,20 +258,26 @@ export async function updateProject(
     status: nextStatus,
     parent_project_id: nextParentProjectId as string | null,
     target_date: nextTargetDate,
-    updated_at: new Date().toISOString(),
+    updated_at: nextUpdatedAt(existing.updated_at),
   }
   try {
     const result = await env.DB.prepare(
       `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
-       target_date = ?, updated_at = ? WHERE id = ?`,
+       target_date = ?, updated_at = ? WHERE id = ? AND updated_at = ?`,
     ).bind(
       updated.slug, updated.name, updated.description, updated.goal, updated.status,
-      updated.parent_project_id, updated.target_date, updated.updated_at, updated.id,
+      updated.parent_project_id, updated.target_date, updated.updated_at, updated.id, existing.updated_at,
     ).run()
-    if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
+    if (!wrote(result)) {
+      const current = await getProject(env, id)
+      if (!current) return { ok: false, error: 'project_not_found' }
+      return { ok: false, error: current.status === 'archived' ? 'archived_project' : 'receipt_failed' }
+    }
   } catch (error) {
     if (isUniqueViolation(error)) return { ok: false, error: 'slug_taken' }
     if (isForeignKeyViolation(error)) return { ok: false, error: 'parent_not_found' }
+    const mapped = triggerMutationError(error)
+    if (mapped) return { ok: false, error: mapped }
     throw error
   }
   return { ok: true, value: updated }
@@ -288,6 +314,8 @@ export async function upsertProjectSquadAccess(
     ).bind(projectId, squadId, accessLevel, grantedAt).run()
     if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
   } catch (error) {
+    const mapped = triggerMutationError(error)
+    if (mapped) return { ok: false, error: mapped }
     if (isForeignKeyViolation(error)) {
       if (!await getProject(env, projectId)) return { ok: false, error: 'project_not_found' }
       if ((await env.DB.prepare('SELECT 1 FROM squads WHERE id = ?').bind(squadId).first()) === null) {
@@ -312,9 +340,15 @@ export async function removeProjectSquadAccess(
   const project = await getProject(env, projectId)
   if (!project) return { ok: false, error: 'project_not_found' }
   if (project.status === 'archived') return { ok: false, error: 'archived_project' }
-  const result = await env.DB.prepare(
-    'DELETE FROM project_squad_access WHERE project_id = ? AND squad_id = ?',
-  ).bind(projectId, squadId).run()
-  if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
+  try {
+    const result = await env.DB.prepare(
+      'DELETE FROM project_squad_access WHERE project_id = ? AND squad_id = ?',
+    ).bind(projectId, squadId).run()
+    if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
+  } catch (error) {
+    const mapped = triggerMutationError(error)
+    if (mapped) return { ok: false, error: mapped }
+    throw error
+  }
   return { ok: true, value: undefined }
 }

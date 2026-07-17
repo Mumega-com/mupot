@@ -72,6 +72,40 @@ BEGIN
     THEN RAISE(ABORT, 'project hierarchy depth') END;
 END;
 
+CREATE TRIGGER validate_projects_archive_status
+BEFORE UPDATE OF status ON projects
+WHEN NEW.status = 'archived'
+ AND OLD.status <> 'archived'
+ AND EXISTS (
+   SELECT 1 FROM projects
+   WHERE parent_project_id = NEW.id AND status <> 'archived'
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'active child projects');
+END;
+
+CREATE TRIGGER validate_project_squad_access_insert
+BEFORE INSERT ON project_squad_access
+WHEN EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived')
+BEGIN
+  SELECT RAISE(ABORT, 'archived project squad access');
+END;
+
+CREATE TRIGGER validate_project_squad_access_update
+BEFORE UPDATE ON project_squad_access
+WHEN EXISTS (SELECT 1 FROM projects WHERE id = OLD.project_id AND status = 'archived')
+  OR EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived')
+BEGIN
+  SELECT RAISE(ABORT, 'archived project squad access');
+END;
+
+CREATE TRIGGER validate_project_squad_access_delete
+BEFORE DELETE ON project_squad_access
+WHEN EXISTS (SELECT 1 FROM projects WHERE id = OLD.project_id AND status = 'archived')
+BEGIN
+  SELECT RAISE(ABORT, 'archived project squad access');
+END;
+
 CREATE TRIGGER validate_tasks_project_id_insert
 BEFORE INSERT ON tasks
 WHEN NEW.project_id IS NOT NULL

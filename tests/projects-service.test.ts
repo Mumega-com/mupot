@@ -265,4 +265,106 @@ describe('project domain service', () => {
     await expect(upsertProjectSquadAccess(missingSquadEnv, 'project-1', 'squad-1', 'write'))
       .resolves.toEqual({ ok: false, error: 'squad_not_found' })
   })
+
+  it('maps project and squad-access trigger aborts to stable mutation errors', async () => {
+    const project = {
+      id: 'project-1', slug: 'project', name: 'Project', description: '', goal: '', status: 'active',
+      parent_project_id: null, target_date: null, created_at: '2026-07-17T00:00:00.000Z', updated_at: '2026-07-17T00:00:00.000Z',
+    }
+    const triggerEnv = (message: string) => ({
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(id: string) {
+              return {
+                first: async () => sql.includes('WHERE parent_project_id =') ? null : ({ ...project, id }),
+                run: async () => { throw new Error(message) },
+              }
+            },
+          }
+        },
+      },
+    } as Env)
+
+    await expect(createProject(triggerEnv('archived parent project'), {
+      slug: 'child', name: 'Child', parent_project_id: 'project-1',
+    })).resolves.toEqual({ ok: false, error: 'archived_project' })
+    await expect(createProject(triggerEnv('parent project not found'), {
+      slug: 'child', name: 'Child', parent_project_id: 'project-1',
+    })).resolves.toEqual({ ok: false, error: 'parent_not_found' })
+    await expect(updateProject(triggerEnv('project hierarchy depth'), 'project-1', { parent_project_id: 'parent-1' }))
+      .resolves.toEqual({ ok: false, error: 'hierarchy_depth' })
+    await expect(updateProject(triggerEnv('project hierarchy cycle'), 'project-1', { parent_project_id: 'parent-1' }))
+      .resolves.toEqual({ ok: false, error: 'hierarchy_cycle' })
+    await expect(updateProject(triggerEnv('active child projects'), 'project-1', { status: 'archived' }))
+      .resolves.toEqual({ ok: false, error: 'active_children' })
+    await expect(upsertProjectSquadAccess(triggerEnv('archived project squad access'), 'project-1', 'squad-1', 'write'))
+      .resolves.toEqual({ ok: false, error: 'archived_project' })
+    await expect(removeProjectSquadAccess(triggerEnv('archived project squad access'), 'project-1', 'squad-1'))
+      .resolves.toEqual({ ok: false, error: 'archived_project' })
+  })
+
+  it('does not overwrite a project archived after the update read', async () => {
+    harness = makeHarness()
+    const project = await createRoot(envFor(harness))
+    let raced = false
+    const db = {
+      prepare(sql: string) {
+        const statement = harness!.db.prepare(sql)
+        return {
+          bind(...values: unknown[]) {
+            const bound = statement.bind(...values)
+            return {
+              first: bound.first.bind(bound),
+              all: bound.all.bind(bound),
+              run: async () => {
+                if (!raced && sql.startsWith('UPDATE projects SET')) {
+                  raced = true
+                  harness!.sqlite.prepare("UPDATE projects SET status = 'archived', updated_at = ? WHERE id = ?")
+                    .run('9999-01-01T00:00:00.000Z', project.id)
+                }
+                return bound.run()
+              },
+            }
+          },
+        }
+      },
+    } as Env['DB']
+
+    await expect(updateProject({ DB: db } as Env, project.id, { name: 'Stale rename' }))
+      .resolves.toEqual({ ok: false, error: 'archived_project' })
+    expect(await getProject(envFor(harness), project.id)).toMatchObject({ status: 'archived', name: 'Root project' })
+  })
+
+  it('does not overwrite a non-archive project change made after the update read', async () => {
+    harness = makeHarness()
+    const project = await createRoot(envFor(harness))
+    let raced = false
+    const db = {
+      prepare(sql: string) {
+        const statement = harness!.db.prepare(sql)
+        return {
+          bind(...values: unknown[]) {
+            const bound = statement.bind(...values)
+            return {
+              first: bound.first.bind(bound),
+              all: bound.all.bind(bound),
+              run: async () => {
+                if (!raced && sql.startsWith('UPDATE projects SET')) {
+                  raced = true
+                  harness!.sqlite.prepare('UPDATE projects SET name = ?, updated_at = ? WHERE id = ?')
+                    .run('Concurrent rename', '9999-01-01T00:00:00.000Z', project.id)
+                }
+                return bound.run()
+              },
+            }
+          },
+        }
+      },
+    } as Env['DB']
+
+    await expect(updateProject({ DB: db } as Env, project.id, { name: 'Stale rename' }))
+      .resolves.toEqual({ ok: false, error: 'receipt_failed' })
+    expect(await getProject(envFor(harness), project.id)).toMatchObject({ status: 'active', name: 'Concurrent rename' })
+  })
 })
