@@ -162,3 +162,75 @@ Passed with no whitespace errors.
 
 No blocking concerns. The Vitest runs emit Node's existing experimental SQLite
 warning; all requested tests pass.
+
+---
+
+## Review Fix: Persisted-Identity Recovery
+
+Review-fix implementation commit:
+`a961a57cfee635a35f0213c81ecb92a44e5e350f`
+
+### RED Evidence
+
+Command:
+
+```text
+npx vitest run tests/marketing-monitor-opportunities.test.ts --maxWorkers=1 --reporter=dot
+```
+
+RED: 1 test file failed; 4 tests failed and 11 passed. The failures proved:
+
+- a preparing claim retry returned `run_not_latest` after a newer completed
+  monitor run existed;
+- a preparing claim retry returned `run_not_latest` after the live binding
+  generation was reconfigured;
+- a retry returned `write_failed` after the canonical task transitioned from
+  `review` to `approved`; and
+- a retry returned `write_failed` after the canonical flight transitioned from
+  `preflight` to `running`.
+
+### Delivered
+
+- Split recovery from first-time claiming. A new claim still requires the
+  requested run to be the latest completed run in the active live binding
+  generation.
+- Recovered an existing claim through its persisted installation, run, binding
+  generation, evidence, candidate, dedup, squad, and immutable claim fields,
+  without consulting current latest-run or live-binding state.
+- Reused canonical tasks and flights after lifecycle transitions when their
+  squad, gate, body, done-when, goal, and exact `FlightMetaV1` still match.
+- Strengthened the finalization fence to validate canonical task body and all
+  flight metadata fields while allowing task and flight status transitions.
+- Preserved one recommendation, task, and flight across every interrupted retry.
+
+### Commands and Results
+
+```text
+npx vitest run tests/marketing-monitor-opportunities.test.ts tests/flight-service.test.ts tests/tasks-service.test.ts --maxWorkers=1 --reporter=dot
+```
+
+GREEN: 3 test files passed; 33 tests passed.
+
+```text
+npx vitest run tests/marketing-monitor-service.test.ts tests/dashboard-marketing-cro-monitor.test.ts tests/marketing-monitor-opportunities.test.ts --maxWorkers=1 --reporter=dot
+```
+
+GREEN: 3 test files passed; 75 tests passed.
+
+```text
+npm run typecheck
+```
+
+Passed: `tsc --noEmit` exited successfully.
+
+```text
+git diff --check
+git diff --cached --check
+```
+
+Passed with no whitespace errors.
+
+### Concerns
+
+No blocking concerns. Vitest emits Node's existing experimental SQLite warning;
+all requested tests pass.
