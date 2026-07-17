@@ -10,3 +10,4 @@ Task 3: complete (commits 26fda84..59c2546, review clean; 102 focused binding/no
 Task 4: complete (commits 56ad535..c33841b, final review approved; 166 fresh focused tests + typecheck passed; independent full regression 207 files / 3448 tests passed)
 Task 5: complete (commits 2f11980..896db34, review approved; 232 fresh focused tests + typecheck passed; full regression 208 files / 3485 tests passed)
 Task 6: complete (commits ae91025..f35f6ca, review approved; 169 fresh focused tests + typecheck passed; full regression 209 files / 3500 tests passed after rerunning isolated addon-bindings flake)
+Task 7: complete (commits 86e6415..c6dc83a, review approved; 33 fresh focused tests + 75 adjacent tests + typecheck passed; full regression 210 files / 3515 tests passed)
