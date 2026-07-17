@@ -137,12 +137,14 @@ async function readableSquadIds(env: Env, auth: AuthContext): Promise<string[] |
   }
 
   if (deptIds.size > 0) {
-    const ids = [...deptIds]
-    const placeholders = ids.map((_, i) => `?${i + 1}`).join(', ')
     const rows = await env.DB.prepare(
-      `SELECT id FROM squads WHERE department_id IN (${placeholders})`,
+      `SELECT id
+         FROM squads
+        WHERE department_id IN (
+          SELECT CAST(value AS TEXT) FROM json_each(?)
+        )`,
     )
-      .bind(...ids)
+      .bind(JSON.stringify([...deptIds]))
       .all<{ id: string }>()
     for (const row of rows.results ?? []) squadIds.add(row.id)
   }
@@ -170,7 +172,9 @@ async function canReadProjectForTaskList(
   if (squadIds !== null && squadIds.length === 0) return false
   const squadClause = squadIds === null
     ? ''
-    : ` AND psa.squad_id IN (${squadIds.map(() => '?').join(', ')})`
+    : ` AND psa.squad_id IN (
+          SELECT CAST(value AS TEXT) FROM json_each(?)
+        )`
   return (await env.DB.prepare(
     `SELECT 1
        FROM projects p
@@ -179,7 +183,7 @@ async function canReadProjectForTaskList(
           SELECT 1 FROM project_squad_access psa
            WHERE psa.project_id = p.id${squadClause}
         )`,
-  ).bind(projectId, ...(squadIds ?? [])).first()) !== null
+  ).bind(projectId, ...(squadIds === null ? [] : [JSON.stringify(squadIds)])).first()) !== null
 }
 
 function taskProjectErrorResponse(error: TaskProjectError): { body: { error: string; need?: string }; status: 400 | 403 | 404 } {
@@ -249,9 +253,10 @@ tasksApp.get('/', async (c) => {
     readable = await readableSquadIds(c.env, auth)
     if (readable !== null) {
       if (readable.length > 0) {
-        const placeholders = readable.map(() => '?').join(', ')
-        clauses.push(`squad_id IN (${placeholders})`)
-        binds.push(...readable)
+        clauses.push(`squad_id IN (
+          SELECT CAST(value AS TEXT) FROM json_each(?)
+        )`)
+        binds.push(JSON.stringify(readable))
       }
     }
   }

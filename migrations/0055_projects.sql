@@ -125,7 +125,22 @@ BEGIN
 END;
 
 CREATE TRIGGER validate_tasks_project_id_update
-BEFORE UPDATE ON tasks
+BEFORE UPDATE OF
+  squad_id,
+  project_id,
+  title,
+  body,
+  done_when,
+  status,
+  assignee_agent_id,
+  result,
+  completed_at,
+  gate_owner,
+  cost_micro_usd,
+  workflow_instance_id,
+  execution_receipt_id,
+  execution_claim_expires_at
+ON tasks
 BEGIN
   SELECT CASE WHEN OLD.project_id IS NOT NEW.project_id
     AND EXISTS (

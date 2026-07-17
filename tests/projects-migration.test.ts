@@ -142,6 +142,9 @@ describe('0055_projects migration', () => {
         .toThrow(/task project access denied/)
       expect(sqlite.prepare(`SELECT title FROM tasks WHERE id = 'task-write'`).get())
         .toEqual({ title: 'Write' })
+      sqlite.exec(`UPDATE tasks SET github_issue_url = 'https://github.com/acme/widgets/issues/1' WHERE id = 'task-write'`)
+      expect(sqlite.prepare(`SELECT github_issue_url FROM tasks WHERE id = 'task-write'`).get())
+        .toEqual({ github_issue_url: 'https://github.com/acme/widgets/issues/1' })
 
       sqlite.exec(`
         INSERT INTO project_squad_access (project_id, squad_id, access_level)
@@ -150,6 +153,9 @@ describe('0055_projects migration', () => {
       `)
       expect(() => sqlite.exec(`UPDATE tasks SET body = 'stale after archive' WHERE id = 'task-write'`))
         .toThrow(/task project archived/)
+      sqlite.exec(`UPDATE tasks SET github_issue_url = 'https://github.com/acme/widgets/issues/2' WHERE id = 'task-write'`)
+      expect(sqlite.prepare(`SELECT github_issue_url FROM tasks WHERE id = 'task-write'`).get())
+        .toEqual({ github_issue_url: 'https://github.com/acme/widgets/issues/2' })
     } finally {
       close()
     }

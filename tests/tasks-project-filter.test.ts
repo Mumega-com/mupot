@@ -2,6 +2,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, Env, Task } from '../src/types'
+import { createTask } from '../src/tasks/service'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
@@ -59,28 +60,42 @@ function envFor(
   harness: SqliteD1Harness,
   queries?: string[],
   beforeTaskUpdate?: () => void,
+  maxBinds?: number,
+  observedBinds?: number[],
 ): Env {
-  const db = queries
+  const instrumented = queries !== undefined || beforeTaskUpdate !== undefined || maxBinds !== undefined
+  const db = instrumented
     ? {
         prepare(sql: string) {
-          queries.push(sql)
-          return wrapTaskUpdate(harness.db.prepare(sql), sql, beforeTaskUpdate)
+          queries?.push(sql)
+          const statement = wrapTaskUpdate(harness.db.prepare(sql), sql, beforeTaskUpdate)
+          return maxBinds === undefined ? statement : wrapBindBudget(statement, maxBinds, observedBinds)
         },
         batch: harness.db.batch.bind(harness.db),
       }
-    : beforeTaskUpdate
-      ? {
-          prepare(sql: string) {
-            return wrapTaskUpdate(harness.db.prepare(sql), sql, beforeTaskUpdate)
-          },
-          batch: harness.db.batch.bind(harness.db),
-        }
-      : harness.db
+    : harness.db
   return {
     DB: db,
     TENANT_SLUG: 'pot-a',
     BUS: { send: vi.fn(async () => undefined) },
   } as unknown as Env
+}
+
+function wrapBindBudget<T extends object>(statement: T, maximum: number, observed?: number[]): T {
+  const wrap = (target: object): object => new Proxy(target, {
+    get(current, property) {
+      if (property === 'bind') {
+        return (...values: unknown[]) => {
+          observed?.push(values.length)
+          if (values.length > maximum) throw new Error(`D1 bind budget exceeded: ${values.length} > ${maximum}`)
+          return wrap((current as { bind(...args: unknown[]): object }).bind(...values))
+        }
+      }
+      const value = Reflect.get(current, property)
+      return typeof value === 'function' ? value.bind(current) : value
+    },
+  })
+  return wrap(statement) as T
 }
 
 function wrapTaskUpdate<T extends object>(statement: T, sql: string, beforeTaskUpdate?: () => void): T {
@@ -136,6 +151,7 @@ describe('task project attribution', () => {
 
   afterEach(() => {
     authState.current = null
+    vi.unstubAllGlobals()
     harness?.close()
     harness = undefined
   })
@@ -228,6 +244,82 @@ describe('task project attribution', () => {
     const legacy = await fetch(harness, '/', 'GET', undefined, legacyQueries)
     expect((await legacy.json() as { tasks: Task[] }).tasks.map((task) => task.id).sort()).toEqual(['task-read', 'task-unassigned', 'task-write'])
     expect(legacyQueries.filter((sql) => sql.includes('FROM tasks')).every((sql) => !sql.includes('project_id = ?'))).toBe(true)
+  })
+
+  it('keeps project-filtered task reads within the D1 bind budget for more than 150 inherited squads', async () => {
+    harness = makeHarness()
+    const capabilities: NonNullable<AuthContext['capabilities']> = []
+    for (let index = 0; index < 160; index += 1) {
+      const departmentId = `dept-many-${index}`
+      const squadId = `squad-many-${index}`
+      harness.sqlite.prepare('INSERT INTO departments (id, slug, name) VALUES (?, ?, ?)')
+        .run(departmentId, departmentId, `Department ${index}`)
+      harness.sqlite.prepare('INSERT INTO squads (id, department_id, slug, name) VALUES (?, ?, ?, ?)')
+        .run(squadId, departmentId, squadId, `Squad ${index}`)
+      harness.sqlite.prepare('INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES (?, ?, ?)')
+        .run('project-write', squadId, 'write')
+      capabilities.push({
+        member_id: 'member-a',
+        scope_type: 'department',
+        scope_id: departmentId,
+        capability: 'member',
+      })
+    }
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, done_when, status, project_id)
+      VALUES ('task-many', 'squad-many-159', 'Readable at scale', 'done', 'open', 'project-write')
+    `)
+    authState.current = actor({ capabilities })
+    const queries: string[] = []
+    const observedBinds: number[] = []
+
+    const response = await tasksApp.fetch(
+      request('/?project_id=project-write'),
+      envFor(harness, queries, undefined, 100, observedBinds),
+    )
+
+    expect(response.status).toBe(200)
+    expect((await response.json() as { tasks: Task[] }).tasks.map((task) => task.id)).toEqual(['task-many'])
+    expect(Math.max(...observedBinds)).toBeLessThanOrEqual(100)
+    expect(queries.filter((sql) => sql.includes('FROM tasks')).every((sql) => sql.includes('json_each'))).toBe(true)
+  })
+
+  it('settles a delayed GitHub receipt after project access is revoked and emits creation once', async () => {
+    harness = makeHarness()
+    let resolveMirror: ((response: Response) => void) | undefined
+    const mirrorResponse = new Promise<Response>((resolve) => { resolveMirror = resolve })
+    const fetchMock = vi.fn(() => mirrorResponse)
+    vi.stubGlobal('fetch', fetchMock)
+    const events: unknown[] = []
+    const env = envFor(harness)
+    env.GITHUB_TOKEN = 'gh-token'
+    env.GITHUB_REPO = 'acme/widgets'
+    env.BUS = { send: vi.fn(async (event: unknown) => { events.push(event) }) } as Env['BUS']
+
+    const pending = createTask(env, {
+      squad_id: 'squad-a',
+      project_id: 'project-write',
+      title: 'Mirror race',
+      done_when: 'the GitHub receipt is linked once',
+    })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce())
+    harness.sqlite.exec(`
+      DELETE FROM project_squad_access
+       WHERE project_id = 'project-write' AND squad_id = 'squad-a'
+    `)
+    resolveMirror?.(new Response(JSON.stringify({ html_url: 'https://github.com/acme/widgets/issues/42' }), { status: 201 }))
+
+    const task = await pending
+    expect(task.github_issue_url).toBe('https://github.com/acme/widgets/issues/42')
+    expect(harness.sqlite.prepare('SELECT github_issue_url FROM tasks WHERE id = ?').get(task.id))
+      .toEqual({ github_issue_url: 'https://github.com/acme/widgets/issues/42' })
+    expect(events).toHaveLength(1)
+    expect(events[0]).toEqual(expect.objectContaining({
+      type: 'task.created',
+      payload: expect.objectContaining({ task_id: task.id, project_id: 'project-write' }),
+    }))
+    expect(() => harness!.sqlite.prepare('UPDATE tasks SET title = ? WHERE id = ?').run('Forbidden mutation', task.id))
+      .toThrow(/task project access denied/)
   })
 
   it('returns the same 404 for unknown and inaccessible project filters', async () => {
