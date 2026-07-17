@@ -55,6 +55,7 @@ export type FlightProjectErrorCode =
   | 'project_not_found'
   | 'archived_project'
   | 'project_access_forbidden'
+  | 'flight_task_not_found'
   | 'flight_task_project_mismatch'
 
 export class FlightProjectError extends Error {
@@ -92,6 +93,9 @@ export async function validateFlightTaskProjectConsistency(
       `SELECT id, project_id FROM tasks WHERE id IN (${placeholders})`,
     ).bind(...meta.task_ids).all<{ id: string; project_id: string | null }>()
     const tasks = new Map((rows.results ?? []).map((task) => [task.id, task]))
+    if (meta.task_ids.some((taskId) => !tasks.has(taskId))) {
+      throw new FlightProjectError('flight_task_not_found')
+    }
     if (meta.task_ids.some((taskId) => tasks.get(taskId)?.project_id !== projectId)) {
       throw new FlightProjectError('flight_task_project_mismatch')
     }
@@ -109,6 +113,9 @@ function mapFlightProjectInsertError(error: unknown): never {
   if (message.includes('flight project archived')) throw new FlightProjectError('archived_project')
   if (message.includes('flight project access denied')) {
     throw new FlightProjectError('project_access_forbidden')
+  }
+  if (message.includes('flight task not found')) {
+    throw new FlightProjectError('flight_task_not_found')
   }
   if (message.includes('flight task project mismatch')) {
     throw new FlightProjectError('flight_task_project_mismatch')

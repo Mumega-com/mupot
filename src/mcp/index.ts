@@ -492,7 +492,9 @@ function taskProjectFailure(error: TaskProjectError): ToolOutcome {
 }
 
 function flightProjectFailure(error: FlightProjectError): ToolOutcome {
-  if (error.code === 'project_not_found') return fail(404, error.code)
+  if (error.code === 'project_not_found' || error.code === 'flight_task_not_found') {
+    return fail(404, error.code)
+  }
   if (error.code === 'project_access_forbidden') {
     return fail(403, 'forbidden', { need: 'project_write' })
   }

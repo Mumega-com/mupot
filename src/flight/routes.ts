@@ -150,14 +150,19 @@ flightsApp.post('/', async (c) => {
   const { flight, signals, opts } = parsed.value
   if (flight.meta) {
     const references = await validateFlightMetaReferences(c.env, flight.meta, flight.project_id)
-    if (!references.ok) return c.json({ error: references.error }, 400)
+    if (!references.ok) {
+      return c.json(
+        { error: references.error },
+        references.error === 'flight_task_not_found' ? 404 : 400,
+      )
+    }
   }
   let result
   try {
     result = await dispatchFlight(c.env, flight, signals, opts)
   } catch (error) {
     if (!(error instanceof FlightProjectError)) throw error
-    const status = error.code === 'project_not_found'
+    const status = error.code === 'project_not_found' || error.code === 'flight_task_not_found'
       ? 404
       : error.code === 'project_access_forbidden'
         ? 403

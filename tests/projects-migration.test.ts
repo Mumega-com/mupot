@@ -266,6 +266,10 @@ describe('0055_projects migration', () => {
       `)
       expect(sqlite.prepare(`SELECT status, cost_micro_usd FROM flights WHERE id = 'flight-before-revoke'`).get())
         .toEqual({ status: 'landed', cost_micro_usd: 25 })
+      expect(() => sqlite.exec(`UPDATE flights SET meta = '{}' WHERE id = 'flight-before-revoke'`))
+        .toThrow(/flight project attribution downgrade/)
+      expect(() => sqlite.exec(`UPDATE flights SET project_id = NULL WHERE id = 'flight-before-revoke'`))
+        .toThrow(/flight project attribution downgrade/)
       expect(() => sqlite.exec(`UPDATE flights SET meta = meta WHERE id = 'flight-before-revoke'`))
         .toThrow(/flight project access denied/)
       expect(() => sqlite.exec(`UPDATE flights SET project_id = 'project-b' WHERE id = 'flight-before-revoke'`))
@@ -277,7 +281,12 @@ describe('0055_projects migration', () => {
         VALUES ('legacy-project', 'tenant', 'agent', 'Legacy', '{}', 'project-a');
         INSERT INTO flights (id, tenant, agent, goal, meta)
         VALUES ('governed-null', 'tenant', 'agent', 'Null project', '${meta.replaceAll("'", "''")}');
+        UPDATE flights
+           SET project_id = 'project-b', meta = '{"schema":"legacy/v0"}'
+         WHERE id = 'legacy-project';
       `)
+      expect(sqlite.prepare(`SELECT project_id, meta FROM flights WHERE id = 'legacy-project'`).get())
+        .toEqual({ project_id: 'project-b', meta: '{"schema":"legacy/v0"}' })
     } finally {
       close()
     }

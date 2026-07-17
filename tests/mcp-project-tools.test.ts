@@ -370,6 +370,12 @@ describe('MCP project attribution parity', () => {
     await expect(dispatchFor('project-read', 'task-mismatch')).resolves.toMatchObject({
       ok: false, status: 403, error: 'forbidden', detail: { need: 'project_write' },
     })
+    await expect(dispatchFor('project-read', 'missing-task')).resolves.toMatchObject({
+      ok: false, status: 403, error: 'forbidden', detail: { need: 'project_write' },
+    })
+    await expect(dispatchFor('project-a', 'missing-task')).resolves.toMatchObject({
+      ok: false, status: 404, error: 'flight_task_not_found',
+    })
     await expect(dispatchFor('project-a', 'task-mismatch')).resolves.toMatchObject({
       ok: false, status: 400, error: 'flight_task_project_mismatch',
     })

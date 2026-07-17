@@ -186,6 +186,17 @@ describe('flight project attribution', () => {
     expect(harness.sqlite.prepare('SELECT count(*) AS count FROM flights').get()).toEqual({ count: 0 })
   })
 
+  it('returns flight_task_not_found for a missing governed task', async () => {
+    harness = makeHarness()
+    const response = await dispatch(harness, dispatchBody({
+      project_id: 'project-a',
+      meta: { ...meta, task_ids: ['missing-task'] },
+    }))
+    expect(response.status).toBe(404)
+    await expect(response.json()).resolves.toEqual({ error: 'flight_task_not_found' })
+    expect(harness.sqlite.prepare('SELECT count(*) AS count FROM flights').get()).toEqual({ count: 0 })
+  })
+
   it('filters the bounded list query by project while preserving the absent-filter query', async () => {
     harness = makeHarness()
     harness.sqlite.exec(`
@@ -212,6 +223,7 @@ describe('flight project attribution', () => {
     for (const [message, code] of [
       ['flight project not found', 'project_not_found'],
       ['flight project archived', 'archived_project'],
+      ['flight task not found', 'flight_task_not_found'],
       ['flight task project mismatch', 'flight_task_project_mismatch'],
       ['flight project access denied', 'project_access_forbidden'],
     ] as const) {
@@ -283,6 +295,21 @@ describe('flight project attribution', () => {
       project_id: 'project-a',
       meta: meta as never,
     })).rejects.toMatchObject({ code: 'project_access_forbidden' })
+    expect(harness.sqlite.prepare(`SELECT count(*) AS count FROM flights`).get()).toEqual({ count: 0 })
+  })
+
+  it('maps a task deleted after validation but before insert to stable task not found', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, undefined, () => {
+      harness!.sqlite.exec(`DELETE FROM tasks WHERE id = 'task-a'`)
+    })
+
+    await expect(createFlight(env, {
+      agent: 'agent-a',
+      goal: 'Deleted task race',
+      project_id: 'project-a',
+      meta: meta as never,
+    })).rejects.toMatchObject({ code: 'flight_task_not_found' })
     expect(harness.sqlite.prepare(`SELECT count(*) AS count FROM flights`).get()).toEqual({ count: 0 })
   })
 

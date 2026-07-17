@@ -178,13 +178,28 @@ BEGIN
       SELECT 1
       FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.task_ids') AS task_ref
       LEFT JOIN tasks ON tasks.id = task_ref.value
-      WHERE tasks.id IS NULL OR tasks.project_id IS NOT NEW.project_id
+      WHERE tasks.id IS NULL
+    ) THEN RAISE(ABORT, 'flight task not found') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND json_valid(NEW.meta)
+    AND json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+    AND EXISTS (
+      SELECT 1
+      FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.task_ids') AS task_ref
+      JOIN tasks ON tasks.id = task_ref.value
+      WHERE tasks.project_id IS NOT NEW.project_id
     ) THEN RAISE(ABORT, 'flight task project mismatch') END;
 END;
 
 CREATE TRIGGER validate_flights_project_id_update
 BEFORE UPDATE OF project_id, meta ON flights
 BEGIN
+  SELECT CASE WHEN OLD.project_id IS NOT NULL
+    AND json_extract(CASE WHEN json_valid(OLD.meta) THEN OLD.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+    AND (
+      NEW.project_id IS NULL
+      OR json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') IS NOT 'mupot.flight.meta/v1'
+    ) THEN RAISE(ABORT, 'flight project attribution downgrade') END;
   SELECT CASE WHEN NEW.project_id IS NOT NULL
     AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id)
     THEN RAISE(ABORT, 'flight project not found') END;
@@ -192,7 +207,10 @@ BEGIN
     AND EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived')
     THEN RAISE(ABORT, 'flight project archived') END;
   SELECT CASE WHEN NEW.project_id IS NOT NULL
-    AND json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+    AND (
+      json_extract(CASE WHEN json_valid(OLD.meta) THEN OLD.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+      OR json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+    )
     AND EXISTS (
       SELECT 1
       FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.squad_ids') AS squad_ref
@@ -203,13 +221,26 @@ BEGIN
       WHERE access.squad_id IS NULL
     ) THEN RAISE(ABORT, 'flight project access denied') END;
   SELECT CASE WHEN NEW.project_id IS NOT NULL
-    AND json_valid(NEW.meta)
-    AND json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+    AND (
+      json_extract(CASE WHEN json_valid(OLD.meta) THEN OLD.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+      OR json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+    )
     AND EXISTS (
       SELECT 1
       FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.task_ids') AS task_ref
       LEFT JOIN tasks ON tasks.id = task_ref.value
-      WHERE tasks.id IS NULL OR tasks.project_id IS NOT NEW.project_id
+      WHERE tasks.id IS NULL
+    ) THEN RAISE(ABORT, 'flight task not found') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND (
+      json_extract(CASE WHEN json_valid(OLD.meta) THEN OLD.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+      OR json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.task_ids') AS task_ref
+      JOIN tasks ON tasks.id = task_ref.value
+      WHERE tasks.project_id IS NOT NEW.project_id
     ) THEN RAISE(ABORT, 'flight task project mismatch') END;
 END;
 
