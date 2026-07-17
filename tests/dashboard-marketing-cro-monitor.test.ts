@@ -296,6 +296,7 @@ describe('marketing CRO monitor dashboard', () => {
     expect(html).toContain('@media (max-width: 680px)')
     expect(html).toContain('minmax(0, 1fr)')
     expect(html).toContain('data-monitor-action="run"')
+    expect(html).toContain('action="/addons/marketing-cro-monitor/run"')
     expect(html).toContain('fetch(')
   })
 
@@ -304,6 +305,8 @@ describe('marketing CRO monitor dashboard', () => {
 
     expect(html).toContain('Run monitor')
     expect(html).toContain('data-monitor-action="run"')
+    expect(html).toContain('method="post"')
+    expect(html).toContain('action="/addons/marketing-cro-monitor/run"')
     expect(html).not.toContain('data-monitor-window-start=')
     expect(html).not.toContain('data-monitor-window-end=')
   })
@@ -311,7 +314,8 @@ describe('marketing CRO monitor dashboard', () => {
   it('posts the current UTC day monitor window as JSON and reloads after success', async () => {
     const html = String(marketingCroMonitorBody(await loadedView()))
     const script = lifecycleScript(html)
-    let click: (() => Promise<void>) | undefined
+    let click: ((event: { preventDefault: () => void }) => Promise<void>) | undefined
+    let prevented = false
     let requestPath = ''
     let requestOptions: RequestInit | undefined
     let reloads = 0
@@ -321,7 +325,7 @@ describe('marketing CRO monitor dashboard', () => {
         monitorAction: 'run',
       },
       disabled: false,
-      addEventListener: (event: string, listener: () => Promise<void>) => {
+      addEventListener: (event: string, listener: (event: { preventDefault: () => void }) => Promise<void>) => {
         if (event === 'click') click = listener
       },
     }
@@ -352,7 +356,7 @@ describe('marketing CRO monitor dashboard', () => {
       window,
     )
     if (!click) throw new Error('monitor click listener was not attached')
-    await click()
+    await click({ preventDefault: () => { prevented = true } })
 
     expect(requestPath).toBe('/api/addons/marketing-cro-monitor/monitor')
     expect(requestOptions).toEqual({
@@ -368,6 +372,7 @@ describe('marketing CRO monitor dashboard', () => {
     expect(button.disabled).toBe(true)
     expect(status.textContent).toBe('Running...')
     expect(reloads).toBe(1)
+    expect(prevented).toBe(true)
   })
 
   it('preserves unavailable reads instead of converting them to empty or zero values', async () => {
