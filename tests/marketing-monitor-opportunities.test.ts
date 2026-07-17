@@ -61,6 +61,10 @@ const window = {
   start: '2026-07-01T00:00:00.000Z',
   end: '2026-07-01T23:59:59.999Z',
 }
+const nextWindow = {
+  start: '2026-07-02T00:00:00.000Z',
+  end: '2026-07-02T23:59:59.999Z',
+}
 
 function envFor(harness: SqliteD1Harness): Env {
   return {
@@ -77,6 +81,18 @@ function fixtureFactory(): MarketingMonitorSourceFactory {
     observedAt: '2026-07-01T12:00:00.000Z',
     window: requestedWindow,
   })]
+}
+
+function insertPosthogConnector(harness: SqliteD1Harness): string {
+  const id = crypto.randomUUID()
+  harness.sqlite.prepare(`
+    INSERT INTO connectors (
+      id, tenant, type, label, encrypted_secret, meta, scope_type,
+      scope_id, created_by, created_at, revoked_at
+    ) VALUES (?, 'tenant-a', 'posthog', 'Recovery read scope', 'opaque-ciphertext',
+      '{}', 'pot', NULL, 'owner-1', '2026-07-16T00:00:00.000Z', NULL)
+  `).run(id)
+  return id
 }
 
 async function createActiveRun(env: Env): Promise<MarketingMonitorRun> {
@@ -229,6 +245,124 @@ describe('marketing monitor opportunities', () => {
       .toEqual({ count: 1 })
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM flights').get())
       .toEqual({ count: 1 })
+  })
+
+  it('recovers a preparing claim after a newer monitor run exists', async () => {
+    const run = await createActiveRun(env)
+    const interruptAfterNewRun = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      const newer = await runMarketingMonitor(env, owner, { window: nextWindow }, {
+        sourceFactory: ({ runId, window: requestedWindow }) => [createMarketingMonitorFixtureSource({
+          runId,
+          observedAt: '2026-07-02T12:00:00.000Z',
+          window: requestedWindow,
+        })],
+      })
+      expect(newer).toEqual(expect.objectContaining({ ok: true }))
+      throw new Error('recommendation interrupted after a newer run completed')
+    }
+
+    expect(await prepareMarketingRecommendation(env, owner, run.id, {
+      createTask: interruptAfterNewRun,
+    })).toEqual({ ok: false, reason: 'write_failed' })
+    const claim = harness.sqlite.prepare(`
+      SELECT id FROM marketing_recommendations WHERE run_id = ? AND status = 'preparing'
+    `).get(run.id) as { id: string }
+
+    const retried = await prepareMarketingRecommendation(env, owner, run.id)
+
+    expect(retried).toEqual(expect.objectContaining({
+      ok: true,
+      recommendation: expect.objectContaining({ id: claim.id, runId: run.id }),
+    }))
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM tasks').get()).toEqual({ count: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM flights').get()).toEqual({ count: 1 })
+  })
+
+  it('recovers a preparing claim after bindings are reconfigured', async () => {
+    const run = await createActiveRun(env)
+    const interruptAfterReconfiguration = async () => {
+      expect(await disableAddon(env, owner, 'marketing-cro-monitor'))
+        .toEqual(expect.objectContaining({ ok: true }))
+      const connectorId = insertPosthogConnector(harness)
+      expect(await configureAddon(env, owner, 'marketing-cro-monitor', {
+        bindings: [{
+          slot: 'web_analytics',
+          adapter: 'posthog',
+          bindingKind: 'vault_connector',
+          connectorId,
+        }],
+      })).toEqual(expect.objectContaining({ ok: true }))
+      expect(await activateAddon(env, owner, 'marketing-cro-monitor'))
+        .toEqual(expect.objectContaining({ ok: true }))
+      throw new Error('recommendation interrupted after binding reconfiguration')
+    }
+
+    expect(await prepareMarketingRecommendation(env, owner, run.id, {
+      createTask: interruptAfterReconfiguration,
+    })).toEqual({ ok: false, reason: 'write_failed' })
+    const claim = harness.sqlite.prepare(`
+      SELECT id FROM marketing_recommendations WHERE run_id = ? AND status = 'preparing'
+    `).get(run.id) as { id: string }
+
+    const retried = await prepareMarketingRecommendation(env, owner, run.id)
+
+    expect(retried).toEqual(expect.objectContaining({
+      ok: true,
+      recommendation: expect.objectContaining({ id: claim.id, runId: run.id }),
+    }))
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM tasks').get()).toEqual({ count: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM flights').get()).toEqual({ count: 1 })
+  })
+
+  it('recovers the canonical task after it transitions from review', async () => {
+    const run = await createActiveRun(env)
+    const createTaskThenApprove = async (
+      taskEnv: Env,
+      input: CreateTaskInput,
+      options?: CreateTaskOptions,
+    ) => {
+      const task = await createTask(taskEnv, input, options)
+      harness.sqlite.prepare(`UPDATE tasks SET status = 'approved' WHERE id = ?`).run(task.id)
+      throw new Error(`recommendation interrupted after task ${task.id} was approved`)
+    }
+
+    expect(await prepareMarketingRecommendation(env, owner, run.id, {
+      createTask: createTaskThenApprove,
+    })).toEqual({ ok: false, reason: 'write_failed' })
+    const task = harness.sqlite.prepare('SELECT id FROM tasks').get() as { id: string }
+
+    const retried = await prepareMarketingRecommendation(env, owner, run.id)
+
+    expect(retried).toEqual(expect.objectContaining({
+      ok: true,
+      recommendation: expect.objectContaining({ taskId: task.id }),
+    }))
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM tasks').get()).toEqual({ count: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM flights').get()).toEqual({ count: 1 })
+  })
+
+  it('recovers the canonical flight after it transitions from preflight', async () => {
+    const run = await createActiveRun(env)
+    const createFlightThenStart = async (flightEnv: Env, input: NewFlight) => {
+      const flightId = await createFlight(flightEnv, input)
+      harness.sqlite.prepare(`UPDATE flights SET status = 'running' WHERE id = ?`).run(flightId)
+      throw new Error(`recommendation interrupted after flight ${flightId} started`)
+    }
+
+    expect(await prepareMarketingRecommendation(env, owner, run.id, {
+      createFlight: createFlightThenStart,
+    })).toEqual({ ok: false, reason: 'write_failed' })
+    const flight = harness.sqlite.prepare('SELECT id FROM flights').get() as { id: string }
+
+    const retried = await prepareMarketingRecommendation(env, owner, run.id)
+
+    expect(retried).toEqual(expect.objectContaining({
+      ok: true,
+      recommendation: expect.objectContaining({ flightId: flight.id }),
+    }))
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM tasks').get()).toEqual({ count: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM flights').get()).toEqual({ count: 1 })
   })
 
   it('never calls an external executor or task mirror', async () => {

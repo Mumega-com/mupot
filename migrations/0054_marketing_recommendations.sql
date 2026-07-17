@@ -155,17 +155,46 @@ CREATE TRIGGER IF NOT EXISTS marketing_recommendations_finalize_fence
          AND installation.state = 'active'
     )
     OR NOT EXISTS (
-      SELECT 1 FROM tasks AS task
+      SELECT 1
+        FROM tasks AS task
+        JOIN marketing_monitor_runs AS run
+          ON run.id = OLD.run_id
+         AND run.tenant = OLD.tenant
+         AND run.installation_id = OLD.installation_id
+         AND run.binding_generation_id = OLD.binding_generation_id
        WHERE task.id = NEW.task_id
          AND task.squad_id = OLD.squad_id
-         AND task.status = 'review'
+         AND task.title = 'Review CRO recommendation: ' || OLD.primary_kpi
+         AND task.body = json_object(
+           'schema', 'mupot.marketing-recommendation/v1',
+           'recommendation', json_object('id', OLD.id, 'dedupKey', OLD.dedup_key),
+           'target', OLD.target,
+           'problem', OLD.problem,
+           'hypothesis', OLD.hypothesis,
+           'primaryKpi', OLD.primary_kpi,
+           'kpiBaseline', json(OLD.kpi_baseline_json),
+           'limitingEvidence', json(OLD.limiting_evidence_json),
+           'evidence', json_object(
+             'programVersion', OLD.program_version,
+             'window', json_object('start', run.window_start, 'end', run.window_end),
+             'digest', OLD.evidence_digest
+           ),
+           'approval', json_object(
+             'required', json('true'),
+             'action', 'promote_recommendation',
+             'requiredCapability', 'owner',
+             'selfApproval', json('false')
+           )
+         )
+         AND task.done_when = 'An owner approves or rejects the recommendation; no external change is executed'
          AND task.gate_owner = 'gate:addons:marketing-cro-monitor:promote_recommendation'
     )
     OR NOT EXISTS (
       SELECT 1 FROM flights AS flight
        WHERE flight.id = NEW.flight_id
          AND flight.tenant = OLD.tenant
-         AND flight.status = 'preflight'
+         AND flight.agent = 'addon:marketing-cro-monitor'
+         AND flight.goal = 'Prepare ' || OLD.kind || ' for owner review'
          AND json_valid(flight.meta)
          AND json_type(flight.meta) = 'object'
          AND json_extract(flight.meta, '$.schema') = 'mupot.flight.meta/v1'
@@ -198,6 +227,21 @@ CREATE TRIGGER IF NOT EXISTS marketing_recommendations_finalize_fence
          AND EXISTS (
            SELECT 1 FROM json_each(flight.meta, '$.task_ids') AS task_ref
             WHERE task_ref.value = NEW.task_id
+         )
+         AND (SELECT count(*) FROM json_each(flight.meta, '$.done_when')) = 1
+         AND EXISTS (
+           SELECT 1 FROM json_each(flight.meta, '$.done_when') AS done_when
+            WHERE done_when.value = 'An owner approves or rejects the recommendation; no external change is executed'
+         )
+         AND (SELECT count(*) FROM json_each(flight.meta, '$.artifact_refs')) = 1
+         AND EXISTS (
+           SELECT 1 FROM json_each(flight.meta, '$.artifact_refs') AS artifact_ref
+            WHERE artifact_ref.value = 'marketing-recommendation:' || OLD.id
+         )
+         AND (SELECT count(*) FROM json_each(flight.meta, '$.receipt_refs')) = 1
+         AND EXISTS (
+           SELECT 1 FROM json_each(flight.meta, '$.receipt_refs') AS receipt_ref
+            WHERE receipt_ref.value = 'marketing-monitor-evidence:' || OLD.evidence_digest
          )
     )
 BEGIN

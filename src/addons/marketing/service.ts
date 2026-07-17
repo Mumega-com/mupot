@@ -212,13 +212,29 @@ interface RecommendationPreparationRow {
   program_version: string
   kind: MarketingOpportunityKind
   target: string
+  problem: string
+  hypothesis: string
+  primary_kpi: MarketingOpportunityKpi
+  kpi_baseline_json: string
+  limiting_evidence_json: string
   evidence_digest: string
   dedup_key: string
   squad_id: string
+  task_id: null
+  flight_id: null
+  approval_required: 1
+  approval_action: 'promote_recommendation'
+  required_capability: 'owner'
+  self_approval: 0
+  terminal_action: 'recommendation_ready'
+  receipt_digest: null
   created_by: string
   created_at: string
+  prepared_at: null
   status: 'preparing'
 }
+
+type PersistedRecommendationRow = RecommendationPreparationRow | StoredRecommendationRow
 
 export interface MarketingMonitorSourceFactoryContext {
   readonly runId: string
@@ -1329,6 +1345,60 @@ async function loadReadyRecommendationByDedup(
   return row ? recommendationFromRow(row) : null
 }
 
+async function loadPersistedRecommendationByRun(
+  captured: CapturedDatabase,
+  runId: string,
+): Promise<PersistedRecommendationRow | null> {
+  const result = await captured.db.prepare(`
+    SELECT ${RECOMMENDATION_COLUMNS}, binding_generation_id, squad_id, created_by
+      FROM marketing_recommendations
+     WHERE tenant = ?1 AND run_id = ?2
+     ORDER BY id
+     LIMIT 2
+  `).bind(captured.tenant, runId).all<PersistedRecommendationRow>()
+  const rows = result.results ?? []
+  if (rows.length > 1) throw new Error('ambiguous recommendation run identity')
+  return rows[0] ?? null
+}
+
+async function loadPersistedActiveInstallation(
+  captured: CapturedDatabase,
+  installationId: string,
+): Promise<
+  | { ok: true; installation: InstallationRow }
+  | { ok: false; reason: 'addon_not_active' | 'addon_identity_mismatch' }
+> {
+  const installation = await captured.db.prepare(`
+    SELECT id, tenant, addon_key, installed_version, publisher, trust_class,
+           mupot_compatibility, manifest_sha256, state
+      FROM addon_installations
+     WHERE id = ?1 AND tenant = ?2
+     LIMIT 1
+  `).bind(installationId, captured.tenant).first<InstallationRow>()
+  if (!installation || installation.state !== 'active') return { ok: false, reason: 'addon_not_active' }
+  if (!exactRegisteredIdentity(installation)) return { ok: false, reason: 'addon_identity_mismatch' }
+  return { ok: true, installation }
+}
+
+async function loadPersistedRecommendationRun(
+  captured: CapturedDatabase,
+  preparation: RecommendationPreparationRow,
+): Promise<MarketingMonitorRun | null> {
+  const row = await captured.db.prepare(runSelect(`
+    run.id = ?1 AND run.tenant = ?2 AND run.installation_id = ?3
+    AND run.binding_generation_id = ?4 AND run.program_version = ?5
+    AND run.evidence_digest = ?6 AND run.status = 'completed'
+  `, 'LIMIT 1')).bind(
+    preparation.run_id,
+    captured.tenant,
+    preparation.installation_id,
+    preparation.binding_generation_id,
+    preparation.program_version,
+    preparation.evidence_digest,
+  ).first<StoredRunRow>()
+  return row ? parseStoredRun(row) : null
+}
+
 async function resolveOwnedWebOperationsSquad(
   captured: CapturedDatabase,
   installationId: string,
@@ -1391,7 +1461,11 @@ async function loadRecommendationPreparation(
 ): Promise<RecommendationPreparationRow | null> {
   return captured.db.prepare(`
     SELECT id, installation_id, binding_generation_id, run_id, program_version,
-           kind, target, evidence_digest, dedup_key, squad_id, created_by, created_at, status
+           kind, target, problem, hypothesis, primary_kpi, kpi_baseline_json,
+           limiting_evidence_json, evidence_digest, dedup_key, squad_id,
+           task_id, flight_id, approval_required, approval_action, required_capability,
+           self_approval, terminal_action, receipt_digest, created_by, created_at,
+           prepared_at, status
       FROM marketing_recommendations
      WHERE tenant = ?1 AND installation_id = ?2 AND dedup_key = ?3 AND status = 'preparing'
      LIMIT 1
@@ -1400,21 +1474,36 @@ async function loadRecommendationPreparation(
 
 function validRecommendationPreparation(
   row: RecommendationPreparationRow,
-  context: LiveContext,
+  installationId: string,
   run: MarketingMonitorRun,
   candidate: MarketingOpportunityCandidate,
   dedupKey: string,
   squadId: string,
 ): boolean {
-  return row.installation_id === context.installation.id
-    && row.binding_generation_id === context.generation.id
+  return row.installation_id === installationId
     && row.run_id === run.id
     && row.program_version === run.programVersion
     && row.kind === candidate.kind
     && row.target === candidate.target
+    && row.problem === candidate.problem
+    && row.hypothesis === candidate.hypothesis
+    && row.primary_kpi === candidate.primaryKpi
+    && row.kpi_baseline_json === trustedJsonStringify(candidate.kpiBaseline)
+    && row.limiting_evidence_json === trustedJsonStringify(candidate.limitingEvidence)
     && row.evidence_digest === run.evidenceDigest
     && row.dedup_key === dedupKey
     && row.squad_id === squadId
+    && row.task_id === null
+    && row.flight_id === null
+    && row.approval_required === 1
+    && row.approval_action === 'promote_recommendation'
+    && row.required_capability === 'owner'
+    && row.self_approval === 0
+    && row.terminal_action === 'recommendation_ready'
+    && row.receipt_digest === null
+    && typeof row.created_by === 'string'
+    && row.created_by.length > 0
+    && row.prepared_at === null
     && row.status === 'preparing'
     && canonicalTimestamp(row.created_at)
 }
@@ -1433,7 +1522,6 @@ async function loadPreparedRecommendationTask(
        AND title = ?2
        AND body = ?3
        AND done_when = ?4
-       AND status = 'review'
        AND gate_owner = ?5
      LIMIT 1
   `).bind(
@@ -1447,6 +1535,7 @@ async function loadPreparedRecommendationTask(
 
 async function loadPreparedRecommendationFlight(
   captured: CapturedDatabase,
+  goal: string,
   goalId: string,
   expectedMeta: FlightMetaV1,
 ): Promise<string | null> {
@@ -1455,12 +1544,12 @@ async function loadPreparedRecommendationFlight(
       FROM flights
      WHERE tenant = ?1
        AND agent = 'addon:marketing-cro-monitor'
-       AND status = 'preflight'
+       AND goal = ?2
        AND json_valid(meta)
-       AND json_extract(meta, '$.schema') = ?2
-       AND json_extract(meta, '$.goal_id') = ?3
+       AND json_extract(meta, '$.schema') = ?3
+       AND json_extract(meta, '$.goal_id') = ?4
      LIMIT 1
-  `).bind(captured.tenant, FLIGHT_META_V1_SCHEMA, goalId).first<{ id: string; meta: string }>()
+  `).bind(captured.tenant, goal, FLIGHT_META_V1_SCHEMA, goalId).first<{ id: string; meta: string }>()
   if (!row) return null
   try {
     const parsed = parseFlightMetaV1(jsonParseIntrinsic(row.meta))
@@ -1483,26 +1572,6 @@ export async function prepareMarketingRecommendation(
   const captured = captureDatabase(env)
   if (!captured) return { ok: false, reason: 'write_failed' }
 
-  let context: LiveContext
-  try {
-    const loaded = await loadLiveContext(captured)
-    if (!loaded.ok) return loaded
-    context = loaded.context
-  } catch {
-    return { ok: false, reason: 'write_failed' }
-  }
-
-  const latestResult = await getLatestMarketingMonitorRun(captured.env, actor, {
-    installationId: context.installation.id,
-    generationId: context.generation.id,
-    bindingCount: context.generation.binding_count,
-  })
-  if (!latestResult.ok) return latestResult
-  if (!latestResult.run || latestResult.run.id !== runId) return { ok: false, reason: 'run_not_latest' }
-  const run = latestResult.run
-  const candidate = rankMarketingOpportunities(run)[0]
-  if (!candidate) return { ok: false, reason: 'no_opportunity' }
-
   const entry = getRegisteredAddon(MARKETING_ADDON_KEY)
   const approval = entry?.manifest.approvalPolicies.find(
     (policy) => policy.action === 'promote_recommendation',
@@ -1511,83 +1580,161 @@ export async function prepareMarketingRecommendation(
     return { ok: false, reason: 'approval_policy_missing' }
   }
 
-  let squadId: string | null
+  let installationId: string
+  let run: MarketingMonitorRun
+  let candidate: MarketingOpportunityCandidate
+  let squadId: string
+  let dedupKey: string
+  let recommendationId: string
+  let createdAt: string
+  let persisted: PersistedRecommendationRow | null
   try {
-    squadId = await resolveOwnedWebOperationsSquad(captured, context.installation.id)
-  } catch {
-    return { ok: false, reason: 'write_failed' }
-  }
-  if (!squadId) return { ok: false, reason: 'web_operations_squad_not_found' }
-
-  const dedupKey = await sha256Json({
-    schema: 'mupot.marketing-recommendation-dedup/v1',
-    tenant: captured.tenant,
-    installationId: context.installation.id,
-    programVersion: run.programVersion,
-    target: candidate.target,
-    window: run.window,
-    kind: candidate.kind,
-  })
-  let recommendationId = randomUUIDIntrinsic()
-  let createdAt = nowIso()
-  let claimed: D1Result<unknown>
-  try {
-    claimed = await captured.db.prepare(`
-      INSERT INTO marketing_recommendations (
-        id, tenant, installation_id, binding_generation_id, run_id, program_version,
-        kind, target, problem, hypothesis, primary_kpi, kpi_baseline_json,
-        limiting_evidence_json, evidence_digest, dedup_key, squad_id,
-        approval_required, approval_action, required_capability, self_approval,
-        terminal_action, status, created_by, created_at
-      ) VALUES (
-        ?1, ?2, ?3, ?4, ?5, ?6,
-        ?7, ?8, ?9, ?10, ?11, ?12,
-        ?13, ?14, ?15, ?16,
-        1, 'promote_recommendation', 'owner', 0,
-        'recommendation_ready', 'preparing', ?17, ?18
-      )
-      ON CONFLICT (tenant, dedup_key) DO NOTHING
-    `).bind(
-      recommendationId,
-      captured.tenant,
-      context.installation.id,
-      context.generation.id,
-      run.id,
-      run.programVersion,
-      candidate.kind,
-      candidate.target,
-      candidate.problem,
-      candidate.hypothesis,
-      candidate.primaryKpi,
-      trustedJsonStringify(candidate.kpiBaseline),
-      trustedJsonStringify(candidate.limitingEvidence),
-      run.evidenceDigest,
-      dedupKey,
-      squadId,
-      actor.id,
-      createdAt,
-    ).run()
+    persisted = await loadPersistedRecommendationByRun(captured, runId)
   } catch {
     return { ok: false, reason: 'write_failed' }
   }
 
-  if (!resultsWritten(claimed)) {
+  if (persisted) {
     try {
-      const existing = await loadReadyRecommendationByDedup(captured, context.installation.id, dedupKey)
-      if (existing) return { ok: true, idempotent: true, recommendation: existing }
-      const preparation = await loadRecommendationPreparation(captured, context.installation.id, dedupKey)
-      if (!preparation || !validRecommendationPreparation(
-        preparation,
-        context,
-        run,
-        candidate,
-        dedupKey,
-        squadId,
+      const active = await loadPersistedActiveInstallation(captured, persisted.installation_id)
+      if (!active.ok) return active
+      if (persisted.status === 'ready') {
+        const recommendation = recommendationFromRow(persisted)
+        return recommendation
+          ? { ok: true, idempotent: true, recommendation }
+          : { ok: false, reason: 'stored_run_invalid' }
+      }
+      const persistedRun = await loadPersistedRecommendationRun(captured, persisted)
+      if (!persistedRun) return { ok: false, reason: 'stored_run_invalid' }
+      const persistedCandidate = rankMarketingOpportunities(persistedRun)[0]
+      if (!persistedCandidate) return { ok: false, reason: 'no_opportunity' }
+      const persistedDedupKey = await sha256Json({
+        schema: 'mupot.marketing-recommendation-dedup/v1',
+        tenant: captured.tenant,
+        installationId: persisted.installation_id,
+        programVersion: persistedRun.programVersion,
+        target: persistedCandidate.target,
+        window: persistedRun.window,
+        kind: persistedCandidate.kind,
+      })
+      if (!validRecommendationPreparation(
+        persisted,
+        persisted.installation_id,
+        persistedRun,
+        persistedCandidate,
+        persistedDedupKey,
+        persisted.squad_id,
       )) return { ok: false, reason: 'fence_lost' }
-      recommendationId = preparation.id
-      createdAt = preparation.created_at
+      installationId = persisted.installation_id
+      run = persistedRun
+      candidate = persistedCandidate
+      squadId = persisted.squad_id
+      dedupKey = persistedDedupKey
+      recommendationId = persisted.id
+      createdAt = persisted.created_at
     } catch {
       return { ok: false, reason: 'write_failed' }
+    }
+  } else {
+    let context: LiveContext
+    try {
+      const loaded = await loadLiveContext(captured)
+      if (!loaded.ok) return loaded
+      context = loaded.context
+    } catch {
+      return { ok: false, reason: 'write_failed' }
+    }
+    const latestResult = await getLatestMarketingMonitorRun(captured.env, actor, {
+      installationId: context.installation.id,
+      generationId: context.generation.id,
+      bindingCount: context.generation.binding_count,
+    })
+    if (!latestResult.ok) return latestResult
+    if (!latestResult.run || latestResult.run.id !== runId) return { ok: false, reason: 'run_not_latest' }
+    run = latestResult.run
+    const ranked = rankMarketingOpportunities(run)[0]
+    if (!ranked) return { ok: false, reason: 'no_opportunity' }
+    candidate = ranked
+    installationId = context.installation.id
+    const bindingGenerationId = context.generation.id
+    let resolvedSquadId: string | null
+    try {
+      resolvedSquadId = await resolveOwnedWebOperationsSquad(captured, installationId)
+    } catch {
+      return { ok: false, reason: 'write_failed' }
+    }
+    if (!resolvedSquadId) return { ok: false, reason: 'web_operations_squad_not_found' }
+    squadId = resolvedSquadId
+    dedupKey = await sha256Json({
+      schema: 'mupot.marketing-recommendation-dedup/v1',
+      tenant: captured.tenant,
+      installationId,
+      programVersion: run.programVersion,
+      target: candidate.target,
+      window: run.window,
+      kind: candidate.kind,
+    })
+    recommendationId = randomUUIDIntrinsic()
+    createdAt = nowIso()
+    let claimed: D1Result<unknown>
+    try {
+      claimed = await captured.db.prepare(`
+        INSERT INTO marketing_recommendations (
+          id, tenant, installation_id, binding_generation_id, run_id, program_version,
+          kind, target, problem, hypothesis, primary_kpi, kpi_baseline_json,
+          limiting_evidence_json, evidence_digest, dedup_key, squad_id,
+          approval_required, approval_action, required_capability, self_approval,
+          terminal_action, status, created_by, created_at
+        ) VALUES (
+          ?1, ?2, ?3, ?4, ?5, ?6,
+          ?7, ?8, ?9, ?10, ?11, ?12,
+          ?13, ?14, ?15, ?16,
+          1, 'promote_recommendation', 'owner', 0,
+          'recommendation_ready', 'preparing', ?17, ?18
+        )
+        ON CONFLICT (tenant, dedup_key) DO NOTHING
+      `).bind(
+        recommendationId,
+        captured.tenant,
+        installationId,
+        bindingGenerationId,
+        run.id,
+        run.programVersion,
+        candidate.kind,
+        candidate.target,
+        candidate.problem,
+        candidate.hypothesis,
+        candidate.primaryKpi,
+        trustedJsonStringify(candidate.kpiBaseline),
+        trustedJsonStringify(candidate.limitingEvidence),
+        run.evidenceDigest,
+        dedupKey,
+        squadId,
+        actor.id,
+        createdAt,
+      ).run()
+    } catch {
+      return { ok: false, reason: 'write_failed' }
+    }
+
+    if (!resultsWritten(claimed)) {
+      try {
+        const existing = await loadReadyRecommendationByDedup(captured, installationId, dedupKey)
+        if (existing) return { ok: true, idempotent: true, recommendation: existing }
+        const preparation = await loadRecommendationPreparation(captured, installationId, dedupKey)
+        if (!preparation || !validRecommendationPreparation(
+          preparation,
+          installationId,
+          run,
+          candidate,
+          dedupKey,
+          squadId,
+        )) return { ok: false, reason: 'fence_lost' }
+        recommendationId = preparation.id
+        createdAt = preparation.created_at
+      } catch {
+        return { ok: false, reason: 'write_failed' }
+      }
     }
   }
 
@@ -1630,10 +1777,11 @@ export async function prepareMarketingRecommendation(
       publication_target: 'none',
       parent_flight_id: null,
     }
-    const existingFlightId = await loadPreparedRecommendationFlight(captured, goalId, flightMeta)
+    const flightGoal = `Prepare ${candidate.kind} for owner review`
+    const existingFlightId = await loadPreparedRecommendationFlight(captured, flightGoal, goalId, flightMeta)
     const flightId = existingFlightId ?? await doCreateFlight(env, {
       agent: 'addon:marketing-cro-monitor',
-      goal: `Prepare ${candidate.kind} for owner review`,
+      goal: flightGoal,
       trigger_source: 'event',
       budget_micro_usd: 0,
       meta: flightMeta,
@@ -1643,7 +1791,7 @@ export async function prepareMarketingRecommendation(
       schema: 'mupot.marketing-recommendation-receipt/v1',
       recommendationId,
       tenant: captured.tenant,
-      installationId: context.installation.id,
+      installationId,
       runId: run.id,
       programVersion: run.programVersion,
       window: run.window,
@@ -1676,18 +1824,18 @@ export async function prepareMarketingRecommendation(
       preparedAt,
       recommendationId,
       captured.tenant,
-      context.installation.id,
+      installationId,
       dedupKey,
     ).run()
     if (!resultsWritten(finalized)) {
-      const existing = await loadReadyRecommendationByDedup(captured, context.installation.id, dedupKey)
+      const existing = await loadReadyRecommendationByDedup(captured, installationId, dedupKey)
       return existing
         ? { ok: true, idempotent: true, recommendation: existing }
         : { ok: false, reason: 'fence_lost' }
     }
     const recommendation = await loadReadyRecommendationByDedup(
       captured,
-      context.installation.id,
+      installationId,
       dedupKey,
     )
     return recommendation
