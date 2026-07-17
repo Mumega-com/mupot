@@ -117,64 +117,83 @@ afterEach(() => {
 })
 
 describe('exact-ID connector use', () => {
-  it('decrypts only inside a one-shot call and returns a non-secret snapshot', async () => {
+  it('gives adapter code only an expiring authenticated-fetch capability', async () => {
     const secret = 'vault-only-posthog-key'
     const connector = await connectorFixture('posthog', secret, {
       projectId: '436189',
       host: 'https://us.posthog.com',
     })
-    let calledWithExpectedSecret = false
+    const fetchSpy = vi.fn(async () => new Response('{}', { status: 200 })) as unknown as typeof fetch
+    vi.stubGlobal('fetch', fetchSpy)
+    let retained: Parameters<Parameters<typeof useConnectorById>[3]>[0] | undefined
 
     const result = await useConnectorById(
       vaultEnv([connector]),
       connector.id,
       'posthog',
       async (resolved) => {
+        retained = resolved
         expect(Object.isFrozen(resolved)).toBe(true)
         expect('secret' in resolved).toBe(false)
-        return resolved.call(async (plaintext) => {
-          calledWithExpectedSecret = plaintext === secret
-          return { status: 'available' as const, observations: [] }
+        expect('call' in resolved).toBe(false)
+        expect('token' in resolved).toBe(false)
+        expect('appPassword' in resolved).toBe(false)
+        expect(Object.keys(resolved).sort()).toEqual(['authenticatedFetch', 'id', 'meta', 'type'])
+        expect(JSON.stringify(resolved)).not.toContain(secret)
+        await resolved.authenticatedFetch('https://us.posthog.com/api/projects/436189/query/', {
+          method: 'POST',
         })
+        return { status: 'available' as const, observations: [] }
       },
     )
 
-    expect(calledWithExpectedSecret).toBe(true)
     expect(result).toEqual({ status: 'available', observations: [] })
     expect(JSON.stringify(result)).not.toContain(secret)
+    expect(fetchSpy).toHaveBeenCalledOnce()
+    const init = (fetchSpy as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as RequestInit
+    expect(new Headers(init.headers).get('authorization')).toBe(`Bearer ${secret}`)
+    await expect(retained?.authenticatedFetch('https://us.posthog.com/after-return'))
+      .rejects.toThrow('connector_use_expired')
   })
 
-  it('rejects a callback result containing the plaintext secret', async () => {
-    const secret = 'vault-return-must-fail'
-    const connector = await connectorFixture('posthog', secret, null)
-
-    await expect(useConnectorById(
-      vaultEnv([connector]),
-      connector.id,
-      'posthog',
-      async (resolved) => resolved.call(async (plaintext) => plaintext as never),
-    )).rejects.toThrow('connector_result_contains_secret')
-  })
-
-  it('replaces secret-bearing callback errors with a stable non-secret error', async () => {
+  it('freshly remaps secret-bearing fetch errors even after adapter mutation', async () => {
     const secret = 'vault-error-must-be-scrubbed'
     const connector = await connectorFixture('posthog', secret, null)
+    const upstreamError = new Error(`upstream rejected Bearer ${secret}`)
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw upstreamError
+    }))
 
+    let capabilityError: unknown
+    let capabilityMessageBeforeMutation: string | undefined
     let thrown: unknown
     try {
       await useConnectorById(
         vaultEnv([connector]),
         connector.id,
         'posthog',
-        async (resolved) => resolved.call(async (plaintext) => {
-          throw new Error(`upstream rejected ${plaintext}`)
-        }),
+        async (resolved) => {
+          try {
+            await resolved.authenticatedFetch('https://us.posthog.com/api/projects/1/query/')
+          } catch (error) {
+            capabilityError = error
+            capabilityMessageBeforeMutation = error instanceof Error ? error.message : String(error)
+            if (error instanceof Error) error.message = `adapter rewrote error with ${secret}`
+            throw error
+          }
+          return { status: 'available' as const, observations: [] }
+        },
       )
     } catch (error) {
       thrown = error
     }
 
+    expect(capabilityError).not.toBe(upstreamError)
+    expect(capabilityMessageBeforeMutation).toBe('connector_fetch_failed')
+    expect(capabilityError).toEqual(new Error(`adapter rewrote error with ${secret}`))
     expect(thrown).toEqual(new Error('connector_use_failed'))
+    expect(thrown).not.toBe(capabilityError)
+    expect(thrown).not.toBe(upstreamError)
     expect(String(thrown)).not.toContain(secret)
   })
 
@@ -186,28 +205,6 @@ describe('exact-ID connector use', () => {
 
     await expect(useConnectorById(vaultEnv([connector]), connector.id, 'posthog', callback)).resolves.toBeNull()
     expect(callback).not.toHaveBeenCalled()
-  })
-
-  it('expires a retained accessor after the immediate callback returns', async () => {
-    const connector = await connectorFixture('posthog', 'retained-secret', null)
-    let retained: Parameters<Parameters<typeof useConnectorById>[3]>[0] | undefined
-
-    const result = await useConnectorById(
-      vaultEnv([connector]),
-      connector.id,
-      'posthog',
-      async (resolved) => {
-        retained = resolved
-        return resolved.call(async () => ({ status: 'available' as const, observations: [] }))
-      },
-    )
-
-    expect(result).toEqual({ status: 'available', observations: [] })
-    expect(retained).toBeDefined()
-    expect(Object.isFrozen(retained)).toBe(true)
-    expect('secret' in (retained as object)).toBe(false)
-    await expect(retained?.call(async () => ({ status: 'available', observations: [] })))
-      .rejects.toThrow('connector_use_expired')
   })
 
   it('returns null without decrypting or invoking the callback for tenant mismatch or revocation', async () => {
@@ -319,7 +316,7 @@ describe('PostHog marketing adapter', () => {
     expect(url).toBe('https://us.posthog.com/api/projects/436189/query/')
     expect(init.method).toBe('POST')
     expect(String(init.body)).toContain('HogQLQuery')
-    expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${secret}`)
+    expect(new Headers(init.headers).get('authorization')).toBe(`Bearer ${secret}`)
     expect(url).not.toContain(secret)
     expect(String(init.body)).not.toContain(secret)
     expect(JSON.stringify(snapshot)).not.toContain(secret)
@@ -386,9 +383,9 @@ describe('Inkwell marketing adapter', () => {
 
     expect(snapshot).toEqual({ status: 'available', observations: [] })
     const [url, init] = (fetchSpy as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit]
-    expect(url).toContain('/api/internal/content/home?tenant_slug=tenant-a')
+    expect(String(url)).toContain('/api/internal/content/home?tenant_slug=tenant-a')
     expect(init).toMatchObject({ method: 'GET', redirect: 'manual' })
-    expect((init.headers as Record<string, string>).authorization).toBe(`Bearer ${secret}`)
+    expect(new Headers(init.headers).get('authorization')).toBe(`Bearer ${secret}`)
     expect(JSON.stringify(snapshot)).not.toContain(secret)
   })
 
@@ -458,7 +455,7 @@ describe('MCPWP marketing adapter', () => {
     expect(url.searchParams.get('_fields')).not.toContain('excerpt')
     expect(init).toMatchObject({ method: 'GET', redirect: 'manual' })
     expect(init.body).toBeUndefined()
-    expect((init.headers as Record<string, string>).authorization).toBe(
+    expect(new Headers(init.headers).get('authorization')).toBe(
       `Basic ${btoa(`agent:${secret}`)}`,
     )
     expect(JSON.stringify(snapshot)).not.toContain(secret)

@@ -511,9 +511,7 @@ export interface ImmediateConnectorUse {
   readonly id: string
   readonly type: ConnectorType
   readonly meta: string | null
-  readonly call: <T extends ImmediateConnectorResult>(
-    operation: (secret: string) => T | Promise<T>,
-  ) => Promise<T>
+  readonly authenticatedFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 }
 
 class ImmediateConnectorError extends Error {}
@@ -561,10 +559,30 @@ function safeImmediateResult<T extends ImmediateConnectorResult>(value: T, secre
   }) as T
 }
 
+function basicAuthUsername(meta: string | null): string | null {
+  if (!meta) return null
+  try {
+    const value = JSON.parse(meta) as unknown
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    const username = (value as Record<string, unknown>).username
+    return typeof username === 'string' && username.trim() ? username.trim() : null
+  } catch {
+    return null
+  }
+}
+
+function authenticatedConnectorFetch(env: Env, type: ConnectorType): typeof fetch {
+  if (type === 'inkwell' && env.INKWELL_SVC) {
+    return env.INKWELL_SVC.fetch.bind(env.INKWELL_SVC) as typeof fetch
+  }
+  return fetch
+}
+
 /**
- * Resolve one active connector by exact tenant-local ID and use its plaintext only
- * inside the supplied callback. This is the vault boundary for addon adapters: it
- * does not perform scope fallback and never returns connector material itself.
+ * Resolve one active connector by exact tenant-local ID and expose only a one-shot,
+ * expiring authenticated-fetch capability. The vault owns auth-header construction;
+ * addon adapters never receive the decrypted credential. This does not perform scope
+ * fallback and never returns connector material itself.
  */
 export async function useConnectorById<T extends ImmediateConnectorResult>(
   env: Env,
@@ -603,19 +621,32 @@ export async function useConnectorById<T extends ImmediateConnectorResult>(
     id: row.id,
     type: row.type,
     meta: row.meta,
-    async call<R extends ImmediateConnectorResult>(operation: (secret: string) => R | Promise<R>): Promise<R> {
+    async authenticatedFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
       if (!active || secret === null) throw new ImmediateConnectorError('connector_use_expired')
       if (called) throw new ImmediateConnectorError('connector_use_already_called')
-      if (typeof operation !== 'function') throw new ImmediateConnectorError('connector_use_invalid')
       called = true
-      return safeImmediateResult(await operation(secret), secret)
+
+      try {
+        const headers = new Headers(init.headers)
+        if (row.type === 'posthog' || row.type === 'inkwell') {
+          headers.set('authorization', `Bearer ${secret}`)
+        } else if (row.type === 'mcpwp') {
+          const username = basicAuthUsername(row.meta)
+          if (!username) throw new Error('invalid connector auth config')
+          headers.set('authorization', `Basic ${btoa(`${username}:${secret}`)}`)
+        } else {
+          throw new Error('unsupported connector auth')
+        }
+        return await authenticatedConnectorFetch(env, row.type)(input, { ...init, headers })
+      } catch {
+        throw new ImmediateConnectorError('connector_fetch_failed')
+      }
     },
   })
 
   try {
     return safeImmediateResult(await use(accessor), secret)
-  } catch (error) {
-    if (error instanceof ImmediateConnectorError) throw error
+  } catch {
     throw new ImmediateConnectorError('connector_use_failed')
   } finally {
     active = false

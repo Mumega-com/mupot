@@ -1,5 +1,5 @@
 import { useConnectorById } from '../../../connectors/service'
-import { fetchInkwellContent } from '../../../departments/executors/inkwell'
+import { assertPublicHttpsUrl } from '../../../lib/ssrf'
 import type { MarketingMonitorSource, SourceSnapshot } from '../types'
 
 const INKWELL_TIMEOUT_MS = 8_000
@@ -28,6 +28,11 @@ const failed = (): SourceSnapshot => ({
   observations: [],
 })
 
+function isRedirect(response: Response): boolean {
+  return response.type as string === 'opaqueredirect'
+    || (response.status >= 300 && response.status < 400)
+}
+
 export function createInkwellMarketingSource(_runId: string): MarketingMonitorSource {
   return {
     key: 'inkwell',
@@ -37,30 +42,29 @@ export function createInkwellMarketingSource(_runId: string): MarketingMonitorSo
       const snapshot = await useConnectorById(env, binding.connectorId, 'inkwell', async (connector) => {
         const slug = parseSlug(connector.meta)
         if (!slug) return unavailable()
-        return connector.call(async (secret) => {
-          const controller = new AbortController()
-          const timer = setTimeout(() => controller.abort(), INKWELL_TIMEOUT_MS)
-          const baseFetch = env.INKWELL_SVC
-            ? env.INKWELL_SVC.fetch.bind(env.INKWELL_SVC) as typeof fetch
-            : fetch
-          const boundedFetch = ((input: RequestInfo | URL, init?: RequestInit) => baseFetch(input, {
-            ...init,
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), INKWELL_TIMEOUT_MS)
+        try {
+          const origin = assertPublicHttpsUrl(env.INKWELL_API_URL as string).origin
+          const endpoint = new URL(`/api/internal/content/${encodeURIComponent(slug)}`, origin)
+          endpoint.searchParams.set('tenant_slug', env.TENANT_SLUG)
+          const response = await connector.authenticatedFetch(endpoint, {
+            method: 'GET',
+            headers: { 'user-agent': 'mupot-executor/1.0' },
+            redirect: 'manual',
             signal: controller.signal,
-          })) as typeof fetch
-
-          try {
-            const content = await fetchInkwellContent({
-              apiUrl: env.INKWELL_API_URL as string,
-              token: secret,
-              tenantSlug: env.TENANT_SLUG,
-            }, slug, boundedFetch)
-            return content ? { status: 'available' as const, observations: [] } : unavailable()
-          } catch {
-            return failed()
-          } finally {
-            clearTimeout(timer)
-          }
-        })
+          })
+          if (isRedirect(response) || (!response.ok && response.status !== 404)) return failed()
+          if (response.status === 404) return unavailable()
+          const body = await response.json().catch(() => null) as Record<string, unknown> | null
+          return body?.ok === true && typeof body.content === 'string'
+            ? { status: 'available' as const, observations: [] }
+            : failed()
+        } catch {
+          return failed()
+        } finally {
+          clearTimeout(timer)
+        }
       })
       return snapshot ?? unavailable()
     },

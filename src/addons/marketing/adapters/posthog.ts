@@ -1,7 +1,14 @@
-import { posthogCroSource } from '../../../cro/posthog'
+import { POSTHOG_TIMEOUT_MS, posthogHost } from '../../../cro/posthog'
 import { useConnectorById } from '../../../connectors/service'
 import type { Env } from '../../../types'
 import type { MarketingMonitorSource, SourceSnapshot } from '../types'
+
+const HOGQL_24H_ROLLUP = `
+  SELECT count() AS events_24h, count(DISTINCT person_id) AS users_24h
+  FROM events
+  WHERE timestamp >= now() - INTERVAL 1 DAY
+  LIMIT 1
+`.trim()
 
 interface PosthogConnectorMeta {
   readonly projectId: string
@@ -46,23 +53,27 @@ export function createPosthogMarketingSource(_runId: string): MarketingMonitorSo
       const snapshot = await useConnectorById(env, binding.connectorId, 'posthog', async (connector) => {
         const meta = parsePosthogMeta(connector.meta)
         if (!meta) return unavailable()
-        return connector.call(async (secret) => {
-          const posthogEnv = {
-            POSTHOG_PERSONAL_API_KEY: secret,
-            POSTHOG_PROJECT_ID: meta.projectId,
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), POSTHOG_TIMEOUT_MS)
+        try {
+          const host = posthogHost({
             ...(meta.host ? { POSTHOG_HOST: meta.host } : {}),
-          } as Env
-
-          try {
-            await posthogCroSource.collect(posthogEnv)
-            return {
-              status: 'available' as const,
-              observations: [],
-            }
-          } catch {
-            return failed()
-          }
-        })
+          } as Env)
+          const endpoint = `${host}/api/projects/${encodeURIComponent(meta.projectId)}/query/`
+          const response = await connector.authenticatedFetch(endpoint, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ query: { kind: 'HogQLQuery', query: HOGQL_24H_ROLLUP } }),
+            signal: controller.signal,
+          })
+          if (!response.ok) return failed()
+          await response.json()
+          return { status: 'available' as const, observations: [] }
+        } catch {
+          return failed()
+        } finally {
+          clearTimeout(timer)
+        }
       })
       return snapshot ?? unavailable()
     },
