@@ -80,6 +80,7 @@ import {
 } from './addons'
 import { listRegisteredAddons } from '../addons/registry'
 import { listAddonInstallations } from '../addons/service'
+import { runMarketingMonitor } from '../addons/marketing/service'
 import {
   pageHeader,
   notConnected,
@@ -336,6 +337,32 @@ dashboardApp.get('/addons', async (c) => {
   } catch {
     return c.html(shell(c.env, 'Addons', errorBody('Addon catalog is unavailable.')), 500)
   }
+})
+
+function currentUtcMarketingWindow(now = new Date()) {
+  const year = now.getUTCFullYear()
+  const month = now.getUTCMonth()
+  const day = now.getUTCDate()
+  return {
+    start: new Date(Date.UTC(year, month, day, 0, 0, 0, 0)).toISOString(),
+    end: new Date(Date.UTC(year, month, day, 23, 59, 59, 999)).toISOString(),
+  }
+}
+
+dashboardApp.post('/addons/marketing-cro-monitor/run', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(shell(c.env, 'Marketing & CRO', errorBody('Running the monitor requires owner or admin.')), 403)
+  }
+  const result = await runMarketingMonitor(
+    c.env,
+    { id: auth.userId, role: auth.role },
+    { window: currentUtcMarketingWindow() },
+  )
+  if (!result.ok) {
+    return c.html(shell(c.env, 'Marketing & CRO', errorBody(`Monitor run failed: ${result.reason}.`)), 409)
+  }
+  return c.redirect('/addons/marketing-cro-monitor')
 })
 
 // ── economy (squad Anthropic spend — #179) ───────────────────────────────────

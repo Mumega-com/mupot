@@ -404,6 +404,7 @@ export function marketingCroMonitorBody(view: MarketingCroMonitorView) {
     <style>
       .monitor-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
       .monitor-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .monitor-action-form { margin: 0; display: inline-flex; }
       .monitor-action { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text2); font-size: 12px; font-weight: 600; }
       .monitor-action:hover { background: var(--hover); color: var(--text); }
       .monitor-action:disabled { cursor: wait; opacity: .68; }
@@ -440,6 +441,7 @@ export function marketingCroMonitorBody(view: MarketingCroMonitorView) {
       @media (max-width: 680px) {
         .monitor-head { align-items: flex-start; flex-direction: column; }
         .monitor-actions { width: 100%; }
+        .monitor-action-form { flex: 1 1 140px; }
         .monitor-action { flex: 1 1 140px; justify-content: center; }
         .monitor-outcomes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .monitor-outcome { border-right: 1px solid var(--border-soft); }
@@ -462,10 +464,12 @@ export function marketingCroMonitorBody(view: MarketingCroMonitorView) {
         <p class="monitor-summary">${latestSummary}${view.latestEvidenceDigest ? ` · Evidence ${view.latestEvidenceDigest.slice(0, 12)}` : ''}</p>
       </div>
       <nav class="monitor-actions" aria-label="Addon evidence links">
-        <button class="monitor-action" type="button" data-monitor-action="run">
-          <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M5 3v18"/><path d="m19 12-14 9V3z"/></svg>
-          Run monitor
-        </button>
+        <form class="monitor-action-form" method="post" action="/addons/marketing-cro-monitor/run">
+          <button class="monitor-action" type="submit" data-monitor-action="run">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M5 3v18"/><path d="m19 12-14 9V3z"/></svg>
+            Run monitor
+          </button>
+        </form>
         <a class="monitor-action" href="/api/addons/${ADDON_KEY}/monitor/latest">
           <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5z"/><polyline points="14 2 14 8 20 8"/><path d="m9 15 2 2 4-4"/></svg>
           Latest evidence
@@ -524,7 +528,8 @@ export function marketingCroMonitorBody(view: MarketingCroMonitorView) {
           };
         }
         buttons.forEach(function (button) {
-          button.addEventListener('click', async function () {
+          button.addEventListener('click', async function (event) {
+            event.preventDefault();
             var windowRange = currentUtcWindow();
             button.disabled = true;
             if (status) status.textContent = 'Running...';
