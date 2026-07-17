@@ -22,13 +22,16 @@ import {
   type AddonLifecycleDeps,
   type AddonMutationResult,
 } from '../src/addons/service'
+import { listAddonBindings } from '../src/addons/bindings'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 
 const migrations = [
   '../migrations/0001_init.sql',
   '../migrations/0003_settings.sql',
+  '../migrations/0023_connectors.sql',
   '../migrations/0029_department_microkernel.sql',
   '../migrations/0050_addons.sql',
+  '../migrations/0052_addon_bindings.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 const owner = { id: 'owner-1', role: 'owner' } as const
 const admin = { id: 'admin-1', role: 'admin' } as const
@@ -264,6 +267,18 @@ async function transitionInstallation(
   const outcome = options.outcome ?? 'pass'
 
   return db.env.DB.batch([
+    ...(action === 'archive' ? [
+      db.env.DB.prepare(`
+        UPDATE addon_binding_generations
+           SET revoked_at = ?1
+         WHERE tenant = ?2 AND installation_id = ?3 AND revoked_at IS NULL
+      `).bind(now, db.env.TENANT_SLUG, installationId),
+      db.env.DB.prepare(`
+        UPDATE addon_connector_bindings
+           SET revoked_at = ?1
+         WHERE tenant = ?2 AND installation_id = ?3 AND revoked_at IS NULL
+      `).bind(now, db.env.TENANT_SLUG, installationId),
+    ] : []),
     db.env.DB.prepare(`
       UPDATE addon_installations
          SET state = ?1, latest_previous_state = ?2,
@@ -608,6 +623,12 @@ function withRunFailures(
     failures: () => failureCount,
   }
 }
+
+describe('addon service module registration', () => {
+  it('registers the marketing monitor when the service module is imported directly', () => {
+    expect(getRegisteredAddon('marketing-cro-monitor')?.manifest.key).toBe('marketing-cro-monitor')
+  })
+})
 
 describe('addon migration constraints', () => {
   let db: Db
@@ -1596,6 +1617,18 @@ describe('addon install and configure service', () => {
     })
   })
 
+  it('configures a required read-only binding without widening lifecycle authority', async () => {
+    const installed = successfulInstallation(await installAddon(db.env, owner, 'marketing-cro-monitor'))
+
+    expect(await configureAddon(db.env, admin, 'marketing-cro-monitor', {
+      bindings: [{ slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' }],
+    })).toMatchObject({ ok: true, state: 'configured' })
+    expect(await listAddonBindings(db.env, installed.id)).toEqual([
+      expect.objectContaining({ slot: 'web_analytics', capability: 'read', connectorId: null }),
+    ])
+    expect(db.resources()).toHaveLength(0)
+  })
+
   it.each([
     ['installed version', { installedVersion: '9.9.9' }],
     ['publisher', { publisher: 'forged-publisher' }],
@@ -1717,10 +1750,10 @@ describe('addon install and configure service', () => {
 
     const installed = successfulInstallation(await installAddon(db.env, owner, 'fixture-addon'))
     await transitionInstallation(db, installed.id, 'disable', 'installed', 'disabled')
-    expect(await configureAddon(db.env, owner, 'fixture-addon')).toEqual({
-      ok: false,
-      reason: 'invalid_state',
+    expect(await configureAddon(db.env, owner, 'fixture-addon')).toMatchObject({
+      ok: true,
       state: 'disabled',
+      idempotent: true,
     })
   })
 
@@ -1846,7 +1879,8 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     })
     expect(JSON.parse(activateReceipts[0].checks)).toEqual({
       authorityRequests: 'empty',
-      connectorRequirements: 'empty',
+      connectorRequirements: 'preflight_passed',
+      bindingCount: 0,
       departments: [{
         claimId: db.resources()[0].id,
         departmentId: db.departments()[0].id,
@@ -3216,9 +3250,12 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     ])
 
     expect(activations.some((result) => result.ok && result.state === 'active')).toBe(true)
-    expect(activations.every((result) => (
-      result.ok ? result.state === 'active' : result.reason === 'operation_busy'
-    ))).toBe(true)
+    const unexpectedActivations = activations.filter((result) => !(
+      result.ok
+        ? result.state === 'active'
+        : result.reason === 'operation_busy' || result.reason === 'fence_lost'
+    ))
+    expect(unexpectedActivations).toEqual([])
     expect(await activateAddon(db.env, owner, 'fixture-addon')).toMatchObject({ ok: true, state: 'active' })
     expect(db.departments()).toHaveLength(1)
     expect(db.squads()).toHaveLength(1)

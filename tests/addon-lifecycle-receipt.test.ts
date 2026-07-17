@@ -79,6 +79,7 @@ function createLifecycleFetch(options: {
     authorization: string | null
     cookie: string | null
     origin: string | null
+    hasBody: boolean
   }> = []
   const beforeDepartments = options.beforeDepartments ?? [{ id: 'existing', slug: 'existing' }]
   const afterDepartments = options.afterDepartments ?? beforeDepartments
@@ -96,6 +97,7 @@ function createLifecycleFetch(options: {
       authorization: headers.get('authorization'),
       cookie: headers.get('cookie'),
       origin: headers.get('origin'),
+      hasBody: init?.body !== undefined && init.body !== null,
     })
 
     if (url.pathname === '/api/org/departments') {
@@ -482,6 +484,7 @@ describe('addon lifecycle receipt checker', () => {
     expect(calls.every((call) => call.authorization === `Bearer ${bearer}`)).toBe(true)
     expect(calls.every((call) => call.cookie === null)).toBe(true)
     expect(calls.every((call) => call.origin === 'https://pot.test')).toBe(true)
+    expect(calls.filter((call) => call.method === 'POST').every((call) => !call.hasBody)).toBe(true)
     expect(JSON.stringify(receipt)).not.toContain(bearer)
     expect(validateReceipt(receipt)).toEqual({ ok: true, errors: [] })
   })

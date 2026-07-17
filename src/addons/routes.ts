@@ -4,8 +4,9 @@ import type { Context } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { requireAuth } from '../auth'
 import { resolveOrgAdmin } from '../auth/member-bearer'
-import './modules/fixture'
+import './modules'
 import { getRegisteredAddon, listRegisteredAddons } from './registry'
+import type { AddonBindingInput } from './bindings'
 import {
   activateAddon,
   archiveAddon,
@@ -21,6 +22,24 @@ import {
   type AddonMutationResult,
   type AddonReceipt,
 } from './service'
+import {
+  MAX_MARKETING_MONITOR_RUN_LIST,
+  canonicalMarketingMonitorWindow,
+  getLatestMarketingMonitorRun,
+  listMarketingMonitorRuns,
+  prepareMarketingRecommendation,
+  runMarketingMonitor,
+  type MarketingRecommendation,
+  type MarketingRecommendationFailureReason,
+  type MarketingMonitorFailureReason,
+} from './marketing/service'
+import type {
+  MarketingMonitorRun,
+  MarketingMonitorRunSource,
+  MarketingOutcomes,
+  MonitorWindow,
+  SourceStatus,
+} from './marketing/types'
 
 const MAX_BODY_BYTES = 8192
 
@@ -66,10 +85,64 @@ function catalogAddon(entry: ReturnType<typeof listRegisteredAddons>[number], in
   }
 }
 
-function redactedReceipt(receipt: AddonReceipt) {
+interface PublicAddonReceipt {
+  readonly sequence: number
+  readonly action: string
+  readonly previousState: AddonReceipt['previousState']
+  readonly nextState: AddonReceipt['nextState']
+  readonly addonKey: string
+  readonly installedVersion: string
+  readonly manifestSha256: string
+  readonly mupotCompatibility: string
+  readonly publisher: string
+  readonly trustClass: AddonReceipt['trustClass']
+  readonly outcome: AddonReceipt['outcome']
+  readonly errorCode: string | null
+  readonly createdAt: string
+}
+
+interface PublicMarketingMonitorSource {
+  readonly slot: string
+  readonly status: SourceStatus
+  readonly reason?: string
+  readonly observationCount: number
+}
+
+interface PublicMarketingMonitorRun {
+  readonly id: string
+  readonly status: 'completed'
+  readonly window: MonitorWindow
+  readonly sourceCount: number
+  readonly observationCount: number
+  readonly sources: readonly PublicMarketingMonitorSource[]
+  readonly outcomes: MarketingOutcomes
+  readonly evidenceDigest: string
+  readonly completedAt: string
+}
+
+interface PublicMarketingRecommendation {
+  readonly kind: string
+  readonly target: string
+  readonly problem: string
+  readonly hypothesis: string
+  readonly primaryKpi: string
+  readonly kpiBaseline: MarketingRecommendation['kpiBaseline']
+  readonly limitingEvidence: MarketingRecommendation['limitingEvidence']
+  readonly evidenceDigest: string
+  readonly approval: MarketingRecommendation['approval']
+  readonly terminalAction: MarketingRecommendation['terminalAction']
+  readonly receiptDigest: string
+  readonly createdAt: string
+  readonly preparedAt: string
+  readonly links: {
+    readonly reviewTask: '/approvals'
+    readonly flightRecord: '/flights'
+  }
+}
+
+function publicReceipt(receipt: AddonReceipt): PublicAddonReceipt {
   return {
     sequence: receipt.sequence,
-    id: receipt.id,
     action: receipt.action,
     previousState: receipt.previousState,
     nextState: receipt.nextState,
@@ -79,25 +152,231 @@ function redactedReceipt(receipt: AddonReceipt) {
     mupotCompatibility: receipt.mupotCompatibility,
     publisher: receipt.publisher,
     trustClass: receipt.trustClass,
-    actorId: receipt.actorId,
     outcome: receipt.outcome,
     errorCode: receipt.errorCode,
     createdAt: receipt.createdAt,
   }
 }
 
-async function readEmptyBody(c: { req: { header(name: string): string | undefined; text(): Promise<string> } }) {
+function publicMonitorSource(source: MarketingMonitorRunSource): PublicMarketingMonitorSource {
+  return {
+    slot: source.slot,
+    status: source.status,
+    ...(source.reason === undefined ? {} : { reason: source.reason }),
+    observationCount: source.observationCount,
+  }
+}
+
+function publicMonitorRun(run: MarketingMonitorRun): PublicMarketingMonitorRun {
+  return {
+    id: run.id,
+    status: run.status,
+    window: { start: run.window.start, end: run.window.end },
+    sourceCount: run.sourceCount,
+    observationCount: run.observationCount,
+    sources: run.sources.map(publicMonitorSource),
+    outcomes: run.outcomes,
+    evidenceDigest: run.evidenceDigest,
+    completedAt: run.completedAt,
+  }
+}
+
+function publicRecommendation(recommendation: MarketingRecommendation): PublicMarketingRecommendation {
+  return {
+    kind: recommendation.kind,
+    target: recommendation.target,
+    problem: recommendation.problem,
+    hypothesis: recommendation.hypothesis,
+    primaryKpi: recommendation.primaryKpi,
+    kpiBaseline: recommendation.kpiBaseline,
+    limitingEvidence: recommendation.limitingEvidence,
+    evidenceDigest: recommendation.evidenceDigest,
+    approval: recommendation.approval,
+    terminalAction: recommendation.terminalAction,
+    receiptDigest: recommendation.receiptDigest,
+    createdAt: recommendation.createdAt,
+    preparedAt: recommendation.preparedAt,
+    links: {
+      reviewTask: '/approvals',
+      flightRecord: '/flights',
+    },
+  }
+}
+
+async function readBoundedBody(c: Context<AppEnv>) {
   const declaredLength = Number(c.req.header('content-length') ?? '0')
   if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) return { ok: false as const, status: 413 as const }
 
-  let raw: string
+  const stream = c.req.raw.body
+  if (!stream) return { ok: true as const, raw: '' }
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+  let byteLength = 0
   try {
-    raw = await c.req.text()
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      byteLength += value.byteLength
+      if (byteLength > MAX_BODY_BYTES) {
+        await reader.cancel()
+        return { ok: false as const, status: 413 as const }
+      }
+      chunks.push(value)
+    }
   } catch {
     return { ok: false as const, status: 400 as const }
   }
-  if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) return { ok: false as const, status: 413 as const }
-  return raw.length === 0 ? { ok: true as const } : { ok: false as const, status: 400 as const }
+
+  const body = new Uint8Array(byteLength)
+  let offset = 0
+  for (const chunk of chunks) {
+    body.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  try {
+    return {
+      ok: true as const,
+      raw: new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(body),
+    }
+  } catch {
+    return { ok: false as const, status: 400 as const }
+  }
+}
+
+function parseConfigureBody(
+  raw: string,
+  maximumBindings: number,
+): { ok: true; bindings: AddonBindingInput[] } | { ok: false } {
+  if (raw.length === 0) return { ok: true, bindings: [] }
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return { ok: false }
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false }
+  const body = value as Record<string, unknown>
+  if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'bindings') || !Array.isArray(body.bindings)) {
+    return { ok: false }
+  }
+  if (body.bindings.length > Math.min(maximumBindings, 16)) return { ok: false }
+
+  const bindings: AddonBindingInput[] = []
+  const slots = new Set<string>()
+  for (const value of body.bindings) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false }
+    const binding = value as Record<string, unknown>
+    const keys = Object.keys(binding)
+    if (keys.some((key) => !['slot', 'adapter', 'bindingKind', 'connectorId'].includes(key))) return { ok: false }
+    if (
+      typeof binding.slot !== 'string'
+      || binding.slot.length === 0
+      || typeof binding.adapter !== 'string'
+      || binding.adapter.length === 0
+      || (binding.bindingKind !== 'internal_adapter' && binding.bindingKind !== 'vault_connector')
+      || (Object.hasOwn(binding, 'connectorId') && (
+        typeof binding.connectorId !== 'string' || binding.connectorId.length === 0
+      ))
+      || slots.has(binding.slot)
+    ) {
+      return { ok: false }
+    }
+    slots.add(binding.slot)
+    bindings.push({
+      slot: binding.slot,
+      adapter: binding.adapter,
+      bindingKind: binding.bindingKind,
+      ...(typeof binding.connectorId === 'string' ? { connectorId: binding.connectorId } : {}),
+    })
+  }
+  return { ok: true, bindings }
+}
+
+function parseMonitorBody(raw: string): { ok: true; window: MonitorWindow } | { ok: false } {
+  if (raw.length === 0) return { ok: false }
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return { ok: false }
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false }
+  const body = value as Record<string, unknown>
+  if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'window')) return { ok: false }
+  const window = canonicalMarketingMonitorWindow(body.window)
+  return window ? { ok: true, window } : { ok: false }
+}
+
+function parseRecommendationBody(raw: string): { ok: true; runId: string } | { ok: false } {
+  if (raw.length === 0) return { ok: false }
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return { ok: false }
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false }
+  const body = value as Record<string, unknown>
+  if (Object.keys(body).length !== 1 || typeof body.runId !== 'string' || body.runId.length === 0) {
+    return { ok: false }
+  }
+  return { ok: true, runId: body.runId }
+}
+
+function parseMonitorLimit(url: string): number | null {
+  const parameters = new URL(url).searchParams
+  const keys = [...parameters.keys()]
+  if (keys.some((key) => key !== 'limit') || parameters.getAll('limit').length > 1) return null
+  const raw = parameters.get('limit')
+  if (raw === null) return 20
+  if (!/^[1-9]\d*$/.test(raw)) return null
+  const limit = Number(raw)
+  return Number.isInteger(limit) && limit <= MAX_MARKETING_MONITOR_RUN_LIST ? limit : null
+}
+
+function monitorError(reason: MarketingMonitorFailureReason) {
+  switch (reason) {
+    case 'not_authorized':
+      return { status: 403 as const, body: { error: 'forbidden', detail: 'owner/admin only' } }
+    case 'invalid_window':
+    case 'invalid_limit':
+      return { status: 400 as const, body: { error: reason } }
+    case 'addon_not_active':
+    case 'addon_identity_mismatch':
+    case 'binding_generation_not_live':
+    case 'collection_invalid':
+    case 'fence_lost':
+      return { status: 409 as const, body: { error: reason } }
+    case 'collection_failed':
+    case 'stored_run_invalid':
+    case 'write_failed':
+      return { status: 500 as const, body: { error: reason } }
+  }
+}
+
+function recommendationError(reason: MarketingRecommendationFailureReason) {
+  switch (reason) {
+    case 'not_authorized':
+      return { status: 403 as const, body: { error: 'forbidden', detail: 'owner/admin only' } }
+    case 'invalid_window':
+    case 'invalid_limit':
+      return { status: 400 as const, body: { error: reason } }
+    case 'addon_not_active':
+    case 'addon_identity_mismatch':
+    case 'binding_generation_not_live':
+    case 'collection_invalid':
+    case 'fence_lost':
+    case 'run_not_latest':
+    case 'no_opportunity':
+    case 'approval_policy_missing':
+    case 'web_operations_squad_not_found':
+    case 'recommendation_busy':
+      return { status: 409 as const, body: { error: reason } }
+    case 'collection_failed':
+    case 'stored_run_invalid':
+    case 'write_failed':
+      return { status: 500 as const, body: { error: reason } }
+  }
 }
 
 function mutationError(result: Extract<AddonMutationResult, { ok: false }>) {
@@ -108,6 +387,13 @@ function mutationError(result: Extract<AddonMutationResult, { ok: false }>) {
       return { status: 403 as const, body: { error: 'forbidden', detail: 'owner/admin only' } }
     case 'invalid_state':
     case 'manifest_digest_drift':
+    case 'missing_required_slot':
+    case 'unknown_slot':
+    case 'adapter_not_allowed':
+    case 'binding_kind_mismatch':
+    case 'connector_not_available':
+    case 'adapter_type_mismatch':
+    case 'capability_mismatch':
     case 'operation_busy':
     case 'fence_lost':
       return { status: 409 as const, body: { error: result.reason, state: result.state ?? null } }
@@ -120,23 +406,34 @@ async function mutate(c: Context<AppEnv>, action: LifecycleAction) {
   const auth = c.get('auth')
   if (!isAdminPlus(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
 
-  const body = await readEmptyBody(c)
-  if (!body.ok) return c.json({ error: body.status === 413 ? 'payload_too_large' : 'invalid_body' }, body.status)
-
   const key = c.req.param('key')
   if (!key) return c.json({ error: 'addon_not_registered' }, 404)
+  const entry = getRegisteredAddon(key)
+  if (!entry) return c.json({ error: 'addon_not_registered' }, 404)
+
+  const body = await readBoundedBody(c)
+  if (!body.ok) return c.json({ error: body.status === 413 ? 'payload_too_large' : 'invalid_body' }, body.status)
+  let configureInput: { bindings: AddonBindingInput[] } | undefined
+  if (action === 'configure') {
+    const parsed = parseConfigureBody(body.raw, entry.manifest.connectorRequirements.length)
+    if (!parsed.ok) return c.json({ error: 'invalid_body' }, 400)
+    configureInput = { bindings: parsed.bindings }
+  } else if (body.raw.length !== 0) {
+    return c.json({ error: 'invalid_body' }, 400)
+  }
+
   const actor = { id: auth.userId, role: auth.role }
-  const execute = {
-    install: installAddon,
-    configure: configureAddon,
-    activate: activateAddon,
-    disable: disableAddon,
-    archive: archiveAddon,
-  }[action]
 
   let result: AddonMutationResult
   try {
-    result = await execute(c.env, actor, key)
+    result = action === 'configure'
+      ? await configureAddon(c.env, actor, key, configureInput)
+      : await {
+          install: installAddon,
+          activate: activateAddon,
+          disable: disableAddon,
+          archive: archiveAddon,
+        }[action](c.env, actor, key)
   } catch {
     return c.json({ error: 'write_failed' }, 500)
   }
@@ -207,6 +504,78 @@ addonsApp.get('/', async (c) => {
   }
 })
 
+addonsApp.post('/marketing-cro-monitor/monitor', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdminPlus(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  const body = await readBoundedBody(c)
+  if (!body.ok) return c.json({ error: body.status === 413 ? 'payload_too_large' : 'invalid_body' }, body.status)
+  const parsed = parseMonitorBody(body.raw)
+  if (!parsed.ok) return c.json({ error: 'invalid_body' }, 400)
+
+  const result = await runMarketingMonitor(
+    c.env,
+    { id: auth.userId, role: auth.role },
+    { window: parsed.window },
+  )
+  if (!result.ok) {
+    const error = monitorError(result.reason)
+    return c.json(error.body, error.status)
+  }
+  return c.json({
+    ok: true,
+    idempotent: result.idempotent,
+    run: publicMonitorRun(result.run),
+  }, result.idempotent ? 200 : 201)
+})
+
+addonsApp.get('/marketing-cro-monitor/monitor/latest', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdminPlus(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  const result = await getLatestMarketingMonitorRun(c.env, { id: auth.userId, role: auth.role })
+  if (!result.ok) {
+    const error = monitorError(result.reason)
+    return c.json(error.body, error.status)
+  }
+  return c.json({ run: result.run ? publicMonitorRun(result.run) : null })
+})
+
+addonsApp.get('/marketing-cro-monitor/monitor', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdminPlus(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  const limit = parseMonitorLimit(c.req.url)
+  if (limit === null) return c.json({ error: 'invalid_limit' }, 400)
+  const result = await listMarketingMonitorRuns(c.env, { id: auth.userId, role: auth.role }, { limit })
+  if (!result.ok) {
+    const error = monitorError(result.reason)
+    return c.json(error.body, error.status)
+  }
+  return c.json({ runs: result.runs.map(publicMonitorRun) })
+})
+
+addonsApp.post('/marketing-cro-monitor/recommendation', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdminPlus(auth)) return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
+  const body = await readBoundedBody(c)
+  if (!body.ok) return c.json({ error: body.status === 413 ? 'payload_too_large' : 'invalid_body' }, body.status)
+  const parsed = parseRecommendationBody(body.raw)
+  if (!parsed.ok) return c.json({ error: 'invalid_body' }, 400)
+
+  const result = await prepareMarketingRecommendation(
+    c.env,
+    { id: auth.userId, role: auth.role },
+    parsed.runId,
+  )
+  if (!result.ok) {
+    const error = recommendationError(result.reason)
+    return c.json(error.body, error.status)
+  }
+  return c.json({
+    ok: true,
+    idempotent: result.idempotent,
+    recommendation: publicRecommendation(result.recommendation),
+  }, result.idempotent ? 200 : 201)
+})
+
 addonsApp.post('/:key/install', (c) => mutate(c, 'install'))
 addonsApp.post('/:key/configure', (c) => mutate(c, 'configure'))
 addonsApp.post('/:key/activate', (c) => mutate(c, 'activate'))
@@ -241,7 +610,7 @@ addonsApp.get('/:key/receipts', async (c) => {
     const installation = latestInstallationsByKey(await listAddonInstallations(c.env)).get(c.req.param('key'))
     if (!installation) return c.json({ receipts: [], ownershipClaimCount: 0, departmentStateSha256 })
     return c.json({
-      receipts: (await getAddonReceipts(c.env, installation.id)).map(redactedReceipt),
+      receipts: (await getAddonReceipts(c.env, installation.id)).map(publicReceipt),
       ownershipClaimCount: await countAddonOwnershipClaims(c.env, installation.id),
       departmentStateSha256,
     })

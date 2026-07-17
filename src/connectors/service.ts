@@ -309,6 +309,50 @@ export interface ConnectorListRow {
   revoked_at: string | null
 }
 
+export interface ConnectorSafeMeta {
+  id: string
+  type: ConnectorType
+  label: string
+  meta: string | null
+  scopeType: ConnectorScopeType
+  scopeId: string | null
+  createdAt: string
+}
+
+interface ConnectorSafeMetaRow {
+  id: string
+  type: ConnectorType
+  label: string
+  meta: string | null
+  scope_type: ConnectorScopeType
+  scope_id: string | null
+  created_at: string
+}
+
+/** Resolve non-secret metadata for one active connector by exact tenant-local ID. */
+export async function resolveConnectorByIdWithMeta(
+  env: Env,
+  connectorId: string,
+): Promise<ConnectorSafeMeta | null> {
+  if (!connectorId) return null
+  const row = await env.DB.prepare(`
+    SELECT id, type, label, meta, scope_type, scope_id, created_at
+      FROM connectors
+     WHERE id = ?1 AND tenant = ?2 AND revoked_at IS NULL
+     LIMIT 1
+  `).bind(connectorId, env.TENANT_SLUG).first<ConnectorSafeMetaRow>()
+  if (!row || !isConnectorType(row.type) || !isConnectorScopeType(row.scope_type)) return null
+  return {
+    id: row.id,
+    type: row.type,
+    label: row.label,
+    meta: row.meta,
+    scopeType: row.scope_type,
+    scopeId: row.scope_id,
+    createdAt: row.created_at,
+  }
+}
+
 /**
  * List active (non-revoked) connectors for this pot.
  * encrypted_secret is NEVER selected. This is enforced in the SQL query.
@@ -454,6 +498,159 @@ export async function resolveConnectorWithMeta(
   } catch {
     // Decryption failure is fatal (corrupted ciphertext, wrong key, etc.).
     return null
+  }
+}
+
+export interface ImmediateConnectorResult {
+  readonly status: 'available' | 'unavailable' | 'failed'
+  readonly observations: readonly unknown[]
+  readonly reason?: string
+}
+
+export interface ImmediateConnectorUse {
+  readonly id: string
+  readonly type: ConnectorType
+  readonly meta: string | null
+  readonly authenticatedFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+}
+
+class ImmediateConnectorError extends Error {}
+
+function cloneNonSecretResult(value: unknown, secret: string, seen: Set<object>): unknown {
+  if (typeof value === 'string') {
+    if (secret.length > 0 && value.includes(secret)) throw new ImmediateConnectorError('connector_result_contains_secret')
+    return value
+  }
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') return value
+  if (Array.isArray(value)) {
+    if (seen.has(value)) throw new ImmediateConnectorError('connector_result_invalid')
+    seen.add(value)
+    const copy = value.map((entry) => cloneNonSecretResult(entry, secret, seen))
+    seen.delete(value)
+    return Object.freeze(copy)
+  }
+  if (typeof value !== 'object') throw new ImmediateConnectorError('connector_result_invalid')
+  if (seen.has(value)) throw new ImmediateConnectorError('connector_result_invalid')
+  seen.add(value)
+  const copy: Record<string, unknown> = {}
+  for (const key of Object.keys(value)) {
+    copy[key] = cloneNonSecretResult((value as Record<string, unknown>)[key], secret, seen)
+  }
+  seen.delete(value)
+  return Object.freeze(copy)
+}
+
+function safeImmediateResult<T extends ImmediateConnectorResult>(value: T, secret: string): T {
+  const cloned = cloneNonSecretResult(value, secret, new Set())
+  if (!cloned || typeof cloned !== 'object' || Array.isArray(cloned)) {
+    throw new ImmediateConnectorError('connector_result_invalid')
+  }
+  const result = cloned as Record<string, unknown>
+  if (
+    (result.status !== 'available' && result.status !== 'unavailable' && result.status !== 'failed')
+    || !Array.isArray(result.observations)
+    || (result.reason !== undefined && typeof result.reason !== 'string')
+  ) throw new ImmediateConnectorError('connector_result_invalid')
+
+  return Object.freeze({
+    status: result.status,
+    ...(result.reason === undefined ? {} : { reason: result.reason }),
+    observations: result.observations,
+  }) as T
+}
+
+function basicAuthUsername(meta: string | null): string | null {
+  if (!meta) return null
+  try {
+    const value = JSON.parse(meta) as unknown
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    const username = (value as Record<string, unknown>).username
+    return typeof username === 'string' && username.trim() ? username.trim() : null
+  } catch {
+    return null
+  }
+}
+
+function authenticatedConnectorFetch(env: Env, type: ConnectorType): typeof fetch {
+  if (type === 'inkwell' && env.INKWELL_SVC) {
+    return env.INKWELL_SVC.fetch.bind(env.INKWELL_SVC) as typeof fetch
+  }
+  return fetch
+}
+
+/**
+ * Resolve one active connector by exact tenant-local ID and expose only a one-shot,
+ * expiring authenticated-fetch capability. The vault owns auth-header construction;
+ * addon adapters never receive the decrypted credential. This does not perform scope
+ * fallback and never returns connector material itself.
+ */
+export async function useConnectorById<T extends ImmediateConnectorResult>(
+  env: Env,
+  connectorId: string,
+  type: ConnectorType,
+  use: (connector: ImmediateConnectorUse) => T | Promise<T>,
+): Promise<T | null> {
+  if (!connectorId || !isConnectorType(type) || typeof use !== 'function') return null
+  const masterKey = env.CONNECTOR_MASTER_KEY
+  if (!masterKey) return null
+
+  const row = await env.DB.prepare(
+    `SELECT id, type, encrypted_secret, meta
+       FROM connectors
+      WHERE id = ?1
+        AND tenant = ?2
+        AND type = ?3
+        AND revoked_at IS NULL
+      LIMIT 1`,
+  )
+    .bind(connectorId, env.TENANT_SLUG, type)
+    .first<{ id: string; type: ConnectorType; encrypted_secret: string; meta: string | null }>()
+
+  if (!row || row.id !== connectorId || row.type !== type) return null
+
+  let secret: string | null
+  try {
+    secret = await decryptConnectorSecret(masterKey, row.id, row.type, row.encrypted_secret)
+  } catch {
+    return null
+  }
+
+  let active = true
+  let called = false
+  const accessor: ImmediateConnectorUse = Object.freeze({
+    id: row.id,
+    type: row.type,
+    meta: row.meta,
+    async authenticatedFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+      if (!active || secret === null) throw new ImmediateConnectorError('connector_use_expired')
+      if (called) throw new ImmediateConnectorError('connector_use_already_called')
+      called = true
+
+      try {
+        const headers = new Headers(init.headers)
+        if (row.type === 'posthog' || row.type === 'inkwell') {
+          headers.set('authorization', `Bearer ${secret}`)
+        } else if (row.type === 'mcpwp') {
+          const username = basicAuthUsername(row.meta)
+          if (!username) throw new Error('invalid connector auth config')
+          headers.set('authorization', `Basic ${btoa(`${username}:${secret}`)}`)
+        } else {
+          throw new Error('unsupported connector auth')
+        }
+        return await authenticatedConnectorFetch(env, row.type)(input, { ...init, headers })
+      } catch {
+        throw new ImmediateConnectorError('connector_fetch_failed')
+      }
+    },
+  })
+
+  try {
+    return safeImmediateResult(await use(accessor), secret)
+  } catch {
+    throw new ImmediateConnectorError('connector_use_failed')
+  } finally {
+    active = false
+    secret = null
   }
 }
 

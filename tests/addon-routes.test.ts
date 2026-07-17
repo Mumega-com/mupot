@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { addonsApp } from '../src/addons/routes'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -10,12 +10,28 @@ const migrations = [
   '../migrations/0003_settings.sql',
   '../migrations/0004_channels.sql',
   '../migrations/0005_channel_capability_grants.sql',
+  '../migrations/0006_task_results.sql',
+  '../migrations/0007_gates.sql',
+  '../migrations/0008_gate_grants.sql',
+  '../migrations/0009_work_unit.sql',
+  '../migrations/0010_execution_meter.sql',
+  '../migrations/0011_meter_cost.sql',
+  '../migrations/0012_workflow_pipeline.sql',
+  '../migrations/0013_outbound_acts.sql',
   '../migrations/0016_presence.sql',
+  '../migrations/0017_flights.sql',
   '../migrations/0019_agent_token_binding.sql',
+  '../migrations/0023_connectors.sql',
+  '../migrations/0026_task_done_when.sql',
+  '../migrations/0028_metric_points.sql',
   '../migrations/0029_department_microkernel.sql',
   '../migrations/0040_members_tenant.sql',
+  '../migrations/0042_task_status_gate_values.sql',
   '../migrations/0043_member_tokens_tenant.sql',
   '../migrations/0050_addons.sql',
+  '../migrations/0052_addon_bindings.sql',
+  '../migrations/0053_marketing_monitor_runs.sql',
+  '../migrations/0054_marketing_recommendations.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 function envForRole(harness: SqliteD1Harness, role: 'owner' | 'admin' | 'member', tenant = 'tenant-a'): Env {
@@ -23,6 +39,7 @@ function envForRole(harness: SqliteD1Harness, role: 'owner' | 'admin' | 'member'
     TENANT_SLUG: tenant,
     BRAND: 'Test',
     DB: harness.db,
+    BUS: { send: vi.fn(async () => undefined) },
     SESSIONS: {
       get: async () => JSON.stringify({ userId: `${role}-1`, email: `${role}@example.test`, role, createdAt: '2026-01-01T00:00:00Z' }),
       put: async () => undefined,
@@ -310,18 +327,44 @@ describe('addon lifecycle routes', () => {
       addons: Array<Record<string, unknown>>
     }
     expect(body.addons).toEqual([
-      expect.objectContaining({
+      {
         key: 'fixture-addon',
         name: 'Fixture Addon',
         version: '1.0.0',
+        publisher: 'mumega',
+        trustClass: 'native_reviewed',
+        kind: 'native',
+        description: 'Lifecycle fixture with no authority.',
         state: 'installed',
-      }),
+      },
+      {
+        key: 'marketing-cro-monitor',
+        name: 'Marketing & CRO Monitor',
+        version: '1.0.0',
+        publisher: 'mumega',
+        trustClass: 'native_reviewed',
+        kind: 'native',
+        description: 'Read-only marketing and conversion monitoring.',
+        state: null,
+      },
     ])
-    expect(body.addons[0]).not.toHaveProperty('manifest')
-    expect(body.addons[0]).not.toHaveProperty('manifestSha256')
-    expect(body.addons[0]).not.toHaveProperty('connectorRequirements')
-    expect(body.addons[0]).not.toHaveProperty('authorityRequests')
-    expect(body.addons[0]).not.toHaveProperty('installationId')
+    for (const addon of body.addons) {
+      expect(Object.keys(addon).sort()).toEqual([
+        'description',
+        'key',
+        'kind',
+        'name',
+        'publisher',
+        'state',
+        'trustClass',
+        'version',
+      ])
+      expect(addon).not.toHaveProperty('manifest')
+      expect(addon).not.toHaveProperty('manifestSha256')
+      expect(addon).not.toHaveProperty('connectorRequirements')
+      expect(addon).not.toHaveProperty('authorityRequests')
+      expect(addon).not.toHaveProperty('installationId')
+    }
   })
 
   it.each(['{}', '{"unexpected":true}'])('rejects non-empty lifecycle body %j', async (body) => {
@@ -332,6 +375,228 @@ describe('addon lifecycle routes', () => {
 
     expect(res.status).toBe(400)
     await expect(res.json()).resolves.toEqual({ error: 'invalid_body' })
+  })
+
+  it('accepts a bounded binding payload only for configure', async () => {
+    const ownerEnv = envForRole(harness, 'owner')
+    await addonsApp.fetch(request('/marketing-cro-monitor/install', 'POST'), ownerEnv)
+    const body = JSON.stringify({
+      bindings: [{ slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' }],
+    })
+
+    const configured = await addonsApp.fetch(
+      request('/marketing-cro-monitor/configure', 'POST', { body }),
+      ownerEnv,
+    )
+    expect(configured.status).toBe(200)
+    await expect(configured.json()).resolves.toEqual(expect.objectContaining({
+      ok: true,
+      key: 'marketing-cro-monitor',
+      state: 'configured',
+    }))
+
+    const rejected = await addonsApp.fetch(
+      request('/marketing-cro-monitor/activate', 'POST', { body }),
+      ownerEnv,
+    )
+    expect(rejected.status).toBe(400)
+    await expect(rejected.json()).resolves.toEqual({ error: 'invalid_body' })
+  })
+
+  it('exposes stable owner/admin monitor run, latest, and list routes with strict bodies', async () => {
+    const ownerEnv = envForRole(harness, 'owner')
+    harness.sqlite.prepare(`
+      INSERT INTO org_settings (key, value) VALUES ('billing_state', ?)
+    `).run(JSON.stringify({ tier: 'scale', event_id: 'route-monitor', effective_at: '2026-07-16T00:00:00.000Z' }))
+    for (const [id, metricKey, value] of [
+      ['route-point-sessions', 'seo.organic_sessions', 120],
+      ['route-point-leads', 'growth.leads', 9],
+      ['route-point-replies', 'growth.replies', 3],
+      ['route-point-conversion', 'seo.conversion_rate', 0.075],
+    ] as const) {
+      harness.sqlite.prepare(`
+        INSERT INTO metric_points (
+          id, tenant_id, metric_key, value, occurred_at, source, created_at
+        ) VALUES (?, 'tenant-a', ?, ?, '2026-07-01T12:00:00.000Z', 'first-party', '2026-07-01T12:00:00.000Z')
+      `).run(id, metricKey, value)
+    }
+    for (const [action, body] of [
+      ['install', undefined],
+      ['configure', JSON.stringify({ bindings: [
+        { slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' },
+      ] })],
+      ['activate', undefined],
+    ] as const) {
+      const response = await addonsApp.fetch(request(`/marketing-cro-monitor/${action}`, 'POST', { body }), ownerEnv)
+      expect(response.status).toBeLessThan(300)
+    }
+
+    const monitorBody = JSON.stringify({ window: {
+      start: '2026-07-01T00:00:00.000Z',
+      end: '2026-07-01T23:59:59.999Z',
+    } })
+    const created = await addonsApp.fetch(
+      request('/marketing-cro-monitor/monitor', 'POST', { body: monitorBody }),
+      ownerEnv,
+    )
+    expect(created.status).toBe(201)
+    const createdBody = await created.json() as Record<string, unknown>
+    expect(createdBody).toEqual(expect.objectContaining({ ok: true, idempotent: false, run: expect.any(Object) }))
+
+    const latest = await addonsApp.fetch(request('/marketing-cro-monitor/monitor/latest', 'GET'), ownerEnv)
+    expect(latest.status).toBe(200)
+    const latestBody = await latest.json() as Record<string, unknown>
+    expect(latestBody).toEqual(expect.objectContaining({ run: expect.any(Object) }))
+
+    const listed = await addonsApp.fetch(request('/marketing-cro-monitor/monitor?limit=1', 'GET'), ownerEnv)
+    expect(listed.status).toBe(200)
+    const listedBody = await listed.json() as Record<string, unknown>
+    expect(listedBody).toEqual(expect.objectContaining({ runs: expect.any(Array) }))
+    const createdRun = createdBody.run as Record<string, unknown>
+    const latestRun = latestBody.run as Record<string, unknown>
+    const listedRun = (listedBody.runs as Array<Record<string, unknown>>)[0]
+
+    const recommendation = await addonsApp.fetch(
+      request('/marketing-cro-monitor/recommendation', 'POST', { body: JSON.stringify({ runId: createdRun.id }) }),
+      ownerEnv,
+    )
+    expect(recommendation.status).toBe(201)
+    const recommendationBody = await recommendation.json() as Record<string, unknown>
+    expect(recommendationBody).toEqual(expect.objectContaining({
+      ok: true,
+      idempotent: false,
+      recommendation: expect.objectContaining({
+        approval: expect.objectContaining({ action: 'promote_recommendation' }),
+        links: { reviewTask: '/approvals', flightRecord: '/flights' },
+        terminalAction: 'recommendation_ready',
+      }),
+    }))
+
+    const publicRunKeys = [
+      'completedAt',
+      'evidenceDigest',
+      'id',
+      'observationCount',
+      'outcomes',
+      'sourceCount',
+      'sources',
+      'status',
+      'window',
+    ]
+    expect(Object.keys(createdRun).sort()).toEqual(publicRunKeys)
+    expect(Object.keys(latestRun).sort()).toEqual(publicRunKeys)
+    expect(Object.keys(listedRun).sort()).toEqual(publicRunKeys)
+    for (const publicRun of [createdRun, latestRun, listedRun]) {
+      expect(publicRun).not.toHaveProperty('observations')
+      expect(publicRun).not.toHaveProperty('rawObservationCount')
+      expect(publicRun).not.toHaveProperty('programVersion')
+      expect(publicRun).not.toHaveProperty('createdAt')
+    }
+
+    const serialized = JSON.stringify({ createdBody, latestBody, listedBody, recommendationBody })
+    for (const forbidden of [
+      'connectorId',
+      'connector_id',
+      'configuredBy',
+      'actorId',
+      'rawPayload',
+      'secret',
+      'building',
+      'taskId',
+      'flightId',
+      'dedupKey',
+      'task_id',
+      'flight_id',
+      'dedup_key',
+    ]) {
+      expect(serialized).not.toContain(forbidden)
+    }
+  })
+
+  it.each([
+    ['configure body reuse', { bindings: [] }],
+    ['unknown root key', { window: { start: '2026-07-01T00:00:00.000Z', end: '2026-07-01T01:00:00.000Z' }, extra: true }],
+    ['non-canonical timestamp', { window: { start: '2026-07-01T00:00:00Z', end: '2026-07-01T01:00:00.000Z' } }],
+  ])('rejects malformed monitor payloads: %s', async (_label, payload) => {
+    const res = await addonsApp.fetch(
+      request('/marketing-cro-monitor/monitor', 'POST', { body: JSON.stringify(payload) }),
+      envForRole(harness, 'owner'),
+    )
+    expect(res.status).toBe(400)
+    await expect(res.json()).resolves.toEqual({ error: 'invalid_body' })
+  })
+
+  it('rejects member monitor writes and reads and invalid list limits', async () => {
+    const memberEnv = envForRole(harness, 'member')
+    for (const [path, method] of [
+      ['/marketing-cro-monitor/monitor', 'POST'],
+      ['/marketing-cro-monitor/monitor', 'GET'],
+      ['/marketing-cro-monitor/monitor/latest', 'GET'],
+      ['/marketing-cro-monitor/recommendation', 'POST'],
+    ] as const) {
+      const res = await addonsApp.fetch(request(path, method), memberEnv)
+      expect(res.status).toBe(403)
+      await expect(res.json()).resolves.toEqual({ error: 'forbidden', detail: 'owner/admin only' })
+    }
+
+    const invalidLimit = await addonsApp.fetch(
+      request('/marketing-cro-monitor/monitor?limit=51', 'GET'),
+      envForRole(harness, 'owner'),
+    )
+    expect(invalidLimit.status).toBe(400)
+    await expect(invalidLimit.json()).resolves.toEqual({ error: 'invalid_limit' })
+  })
+
+  it('rejects malformed recommendation payloads', async () => {
+    const res = await addonsApp.fetch(
+      request('/marketing-cro-monitor/recommendation', 'POST', {
+        body: JSON.stringify({ runId: '', extra: true }),
+      }),
+      envForRole(harness, 'owner'),
+    )
+    expect(res.status).toBe(400)
+    await expect(res.json()).resolves.toEqual({ error: 'invalid_body' })
+  })
+
+  it.each([
+    ['unknown root key', { bindings: [], unexpected: true }],
+    ['duplicate slots', { bindings: [
+      { slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' },
+      { slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' },
+    ] }],
+    ['unknown binding key', { bindings: [
+      { slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter', secret: 'forbidden' },
+    ] }],
+    ['non-string field', { bindings: [
+      { slot: 'web_analytics', adapter: 7, bindingKind: 'internal_adapter' },
+    ] }],
+    ['more bindings than declared', { bindings: Array.from({ length: 6 }, (_, index) => ({
+      slot: `slot-${index}`, adapter: 'first_party', bindingKind: 'internal_adapter',
+    })) }],
+  ])('rejects malformed configure payloads: %s', async (_case, payload) => {
+    const ownerEnv = envForRole(harness, 'owner')
+    await addonsApp.fetch(request('/marketing-cro-monitor/install', 'POST'), ownerEnv)
+
+    const res = await addonsApp.fetch(
+      request('/marketing-cro-monitor/configure', 'POST', { body: JSON.stringify(payload) }),
+      ownerEnv,
+    )
+
+    expect(res.status).toBe(400)
+    await expect(res.json()).resolves.toEqual({ error: 'invalid_body' })
+  })
+
+  it('returns a stable preflight error for missing required bindings', async () => {
+    const ownerEnv = envForRole(harness, 'owner')
+    await addonsApp.fetch(request('/marketing-cro-monitor/install', 'POST'), ownerEnv)
+
+    const res = await addonsApp.fetch(
+      request('/marketing-cro-monitor/configure', 'POST', { body: '{"bindings":[]}' }),
+      ownerEnv,
+    )
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toEqual({ error: 'missing_required_slot', state: 'installed' })
   })
 
   it('rejects lifecycle payloads over 8 KiB by declared and actual UTF-8 length', async () => {
@@ -351,6 +616,39 @@ describe('addon lifecycle routes', () => {
     )
     expect(actual.status).toBe(413)
     await expect(actual.json()).resolves.toEqual({ error: 'payload_too_large' })
+  })
+
+  it('cancels an omitted-length chunked body as soon as it crosses 8 KiB', async () => {
+    let cancelled = false
+    let offset = 0
+    const chunks = [new Uint8Array(4096), new Uint8Array(4097)]
+    const body = new ReadableStream<Uint8Array>({
+      type: 'bytes',
+      pull(controller) {
+        const chunk = chunks[offset++]
+        if (chunk) controller.enqueue(chunk)
+        else controller.close()
+      },
+      cancel() {
+        cancelled = true
+      },
+    })
+    const requestWithStream = new Request('https://pot.test/fixture-addon/install', {
+      method: 'POST',
+      headers: {
+        Cookie: 'mupot_session=session-1',
+        Origin: 'https://pot.test',
+        'Content-Type': 'application/json',
+      },
+      body,
+      duplex: 'half',
+    } as RequestInit & { duplex: 'half' })
+
+    const res = await addonsApp.fetch(requestWithStream, envForRole(harness, 'owner'))
+
+    expect(res.status).toBe(413)
+    await expect(res.json()).resolves.toEqual({ error: 'payload_too_large' })
+    expect(cancelled).toBe(true)
   })
 
   it('maps an invalid transition to the current state', async () => {
@@ -532,6 +830,23 @@ describe('addon lifecycle routes', () => {
       manifestSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       mupotCompatibility: '^0.23.0',
     }))
+    expect(Object.keys(body.receipts[0]).sort()).toEqual([
+      'action',
+      'addonKey',
+      'createdAt',
+      'errorCode',
+      'installedVersion',
+      'manifestSha256',
+      'mupotCompatibility',
+      'nextState',
+      'outcome',
+      'previousState',
+      'publisher',
+      'sequence',
+      'trustClass',
+    ])
+    expect(body.receipts[0]).not.toHaveProperty('id')
+    expect(body.receipts[0]).not.toHaveProperty('actorId')
     expect(body.receipts[0]).not.toHaveProperty('tenant')
     expect(body.receipts[0]).not.toHaveProperty('installationId')
     expect(body.receipts[0]).not.toHaveProperty('sideEffectIds')

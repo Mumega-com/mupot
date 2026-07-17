@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createAddonRegistry } from '../src/addons/registry'
 import { FixtureAddon } from '../src/addons/modules/fixture'
+import { MarketingCroMonitorAddon } from '../src/addons/modules/marketing-cro-monitor'
 
 describe('addon registry', () => {
   it('registers a deep-frozen clone', async () => {
@@ -72,5 +73,18 @@ describe('addon registry', () => {
         navIcon: 'unregistered-icon',
       }],
     })).rejects.toThrow('addon_renderer_not_registered')
+  })
+
+  it('registers the marketing monitor against its pre-registered console renderer', async () => {
+    const registry = createAddonRegistry()
+
+    await registry.register(MarketingCroMonitorAddon)
+
+    expect(registry.get(MarketingCroMonitorAddon.key)?.manifest.consoleSections).toEqual([
+      expect.objectContaining({
+        rendererKey: 'marketing-cro-monitor',
+        path: '/addons/marketing-cro-monitor',
+      }),
+    ])
   })
 })

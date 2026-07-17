@@ -72,7 +72,12 @@ import { loadVerifications, verificationsBody } from './verifications'
 import { loadAudit, auditBody } from './audit'
 import { loadBilling, billingBody } from './billing'
 import { servicesBody } from './services'
-import { addonsBody } from './addons'
+import {
+  addonsBody,
+  createAddonConsoleResolver,
+  installedAddonIdentityMatches,
+  latestInstallationByKey,
+} from './addons'
 import { listRegisteredAddons } from '../addons/registry'
 import { listAddonInstallations } from '../addons/service'
 import {
@@ -319,7 +324,11 @@ dashboardApp.get('/addons', async (c) => {
   }
   try {
     const installations = await listAddonInstallations(c.env)
-    return c.html(shell(c.env, 'Addons', addonsBody(listRegisteredAddons(), installations)))
+    return c.html(shell(c.env, 'Addons', addonsBody(
+      listRegisteredAddons(),
+      installations,
+      dashboardBuiltInGetRoutes,
+    )))
   } catch {
     return c.html(shell(c.env, 'Addons', errorBody('Addon catalog is unavailable.')), 500)
   }
@@ -1741,6 +1750,37 @@ dashboardApp.post('/squads/:id/agents', async (c) => {
     )
   }
   return c.redirect(`/squads/${squadId}`)
+})
+
+// Capture the real Hono GET table before registering the addon wildcard. Catalog
+// links and fallback dispatch compile this same set of exact and parameterized
+// routes, so every advertised addon path is reachable by the fallback.
+export const dashboardBuiltInGetRoutes = Object.freeze(dashboardApp.routes
+  .filter((route) => route.method === 'GET')
+  .map((route) => Object.freeze({ method: route.method, path: route.path })))
+
+dashboardApp.get('*', async (c) => {
+  if (!isAdmin(c.get('auth'))) {
+    return c.html(shell(c.env, 'Addon console', errorBody('Addon consoles require owner or admin.')), 403)
+  }
+  const resolved = createAddonConsoleResolver(
+    listRegisteredAddons(),
+    dashboardBuiltInGetRoutes,
+  ).resolve(c.req.path)
+  if (!resolved) {
+    return c.html(shell(c.env, 'Addon console', errorBody('Addon console not found.')), 404)
+  }
+  try {
+    const installation = latestInstallationByKey(await listAddonInstallations(c.env))
+      .get(resolved.entry.manifest.key)
+    if (!installedAddonIdentityMatches(resolved.entry, installation)) {
+      return c.html(shell(c.env, resolved.section.title, errorBody('Addon console not found.')), 404)
+    }
+    const body = await resolved.renderer.render(c.env, installation)
+    return c.html(shell(c.env, resolved.section.title, body))
+  } catch {
+    return c.html(shell(c.env, resolved.section.title, errorBody('Addon console is unavailable.')), 500)
+  }
 })
 
 // ── config patch helper ───────────────────────────────────────────────────────
