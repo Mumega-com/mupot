@@ -223,4 +223,55 @@ describe('0055_projects migration', () => {
       close()
     }
   })
+
+  it('rejects governed flight inserts and updates when a referenced project edge is revoked', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      applyPriorMigrations(sqlite)
+      sqlite.exec(readFileSync(join(MIGRATIONS_DIR, PROJECTS_MIGRATION), 'utf8'))
+      sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Department');
+        INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'squad', 'Squad');
+        INSERT INTO projects (id, slug, name, status) VALUES ('project-a', 'a', 'A', 'active');
+        INSERT INTO project_squad_access (project_id, squad_id, access_level)
+        VALUES ('project-a', 'squad-1', 'write');
+        INSERT INTO tasks (id, squad_id, title, project_id)
+        VALUES ('task-a', 'squad-1', 'Task A', 'project-a');
+      `)
+      const meta = JSON.stringify({
+        schema: 'mupot.flight.meta/v1',
+        goal_id: 'goal-a',
+        objective_id: 'objective-a',
+        squad_ids: ['squad-1'],
+        task_ids: ['task-a'],
+        done_when: ['done'],
+        artifact_refs: [],
+      })
+
+      sqlite.prepare(`
+        INSERT INTO flights (id, tenant, agent, goal, meta, project_id)
+        VALUES ('flight-before-revoke', 'tenant', 'agent', 'Before revoke', ?, 'project-a')
+      `).run(meta)
+      sqlite.exec(`DELETE FROM project_squad_access WHERE project_id = 'project-a' AND squad_id = 'squad-1'`)
+
+      expect(() => sqlite.prepare(`
+        INSERT INTO flights (id, tenant, agent, goal, meta, project_id)
+        VALUES ('flight-after-revoke', 'tenant', 'agent', 'After revoke', ?, 'project-a')
+      `).run(meta)).toThrow(/flight project access denied/)
+      expect(() => sqlite.exec(`UPDATE flights SET status = 'running' WHERE id = 'flight-before-revoke'`))
+        .toThrow(/flight project access denied/)
+      expect(sqlite.prepare(`SELECT status FROM flights WHERE id = 'flight-before-revoke'`).get())
+        .toEqual({ status: 'preflight' })
+
+      // Nullable and non-governed legacy rows remain outside the project-edge invariant.
+      sqlite.exec(`
+        INSERT INTO flights (id, tenant, agent, goal, meta, project_id)
+        VALUES ('legacy-project', 'tenant', 'agent', 'Legacy', '{}', 'project-a');
+        INSERT INTO flights (id, tenant, agent, goal, meta)
+        VALUES ('governed-null', 'tenant', 'agent', 'Null project', '${meta.replaceAll("'", "''")}');
+      `)
+    } finally {
+      close()
+    }
+  })
 })

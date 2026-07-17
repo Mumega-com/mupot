@@ -161,6 +161,17 @@ BEGIN
     AND EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived')
     THEN RAISE(ABORT, 'flight project archived') END;
   SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+    AND EXISTS (
+      SELECT 1
+      FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.squad_ids') AS squad_ref
+      LEFT JOIN project_squad_access AS access
+        ON access.project_id = NEW.project_id
+       AND access.squad_id = squad_ref.value
+       AND access.access_level IN ('write', 'admin')
+      WHERE access.squad_id IS NULL
+    ) THEN RAISE(ABORT, 'flight project access denied') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
     AND json_valid(NEW.meta)
     AND json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
     AND EXISTS (
@@ -180,6 +191,17 @@ BEGIN
   SELECT CASE WHEN NEW.project_id IS NOT NULL
     AND EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived')
     THEN RAISE(ABORT, 'flight project archived') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+    AND EXISTS (
+      SELECT 1
+      FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.squad_ids') AS squad_ref
+      LEFT JOIN project_squad_access AS access
+        ON access.project_id = NEW.project_id
+       AND access.squad_id = squad_ref.value
+       AND access.access_level IN ('write', 'admin')
+      WHERE access.squad_id IS NULL
+    ) THEN RAISE(ABORT, 'flight project access denied') END;
   SELECT CASE WHEN NEW.project_id IS NOT NULL
     AND json_valid(NEW.meta)
     AND json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'

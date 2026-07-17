@@ -54,6 +54,7 @@ export type FlightProjectErrorCode =
   | 'invalid_project_id'
   | 'project_not_found'
   | 'archived_project'
+  | 'project_access_forbidden'
   | 'flight_task_project_mismatch'
 
 export class FlightProjectError extends Error {
@@ -91,6 +92,9 @@ function mapFlightProjectInsertError(error: unknown): never {
   const message = error instanceof Error ? error.message : String(error)
   if (message.includes('flight project not found')) throw new FlightProjectError('project_not_found')
   if (message.includes('flight project archived')) throw new FlightProjectError('archived_project')
+  if (message.includes('flight project access denied')) {
+    throw new FlightProjectError('project_access_forbidden')
+  }
   if (message.includes('flight task project mismatch')) {
     throw new FlightProjectError('flight_task_project_mismatch')
   }

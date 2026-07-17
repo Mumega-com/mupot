@@ -38,7 +38,8 @@ function makeHarness(): SqliteD1Harness {
       ('project-a', 'project-a', 'Project A', 'active'),
       ('project-b', 'project-b', 'Project B', 'active'),
       ('project-read', 'project-read', 'Project Read', 'active'),
-      ('project-no-edge', 'project-no-edge', 'Project No Edge', 'active');
+      ('project-no-edge', 'project-no-edge', 'Project No Edge', 'active'),
+      ('project-archived', 'project-archived', 'Project Archived', 'archived');
     INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
       ('project-a', '${SQUAD_ID}', 'write'),
       ('project-b', '${SQUAD_ID}', 'admin'),
@@ -259,9 +260,10 @@ describe('MCP project attribution parity', () => {
     expect(allReferencedEdges.ok, JSON.stringify(allReferencedEdges)).toBe(true)
   })
 
-  it('lets legacy owners and org admins dispatch and read projects without squad edges', async () => {
+  it('preserves legacy owner and org-admin bypass while restricting defined empty capabilities', async () => {
     harness = makeHarness()
     const env = envFor(harness)
+    const noEdgeMeta = JSON.stringify(flightMeta('task-owner')).replaceAll("'", "''")
     harness.sqlite.exec(`
       INSERT INTO project_squad_access (project_id, squad_id, access_level)
       VALUES ('project-no-edge', '${SQUAD_ID}', 'write');
@@ -269,18 +271,25 @@ describe('MCP project attribution parity', () => {
       VALUES ('task-owner', '${SQUAD_ID}', 'Owner', 'done', 'in_progress', 'project-no-edge');
       INSERT INTO tasks (id, squad_id, title, done_when, status, project_id)
       VALUES ('task-admin', '${SQUAD_ID}', 'Admin', 'done', 'in_progress', 'project-no-edge');
+      INSERT INTO tasks (id, squad_id, title, done_when, status, project_id)
+      VALUES ('task-owner-dispatch', '${SQUAD_ID}', 'Owner dispatch', 'done', 'in_progress', 'project-a');
+      INSERT INTO tasks (id, squad_id, title, done_when, status, project_id)
+      VALUES ('task-admin-dispatch', '${SQUAD_ID}', 'Admin dispatch', 'done', 'in_progress', 'project-a');
+      INSERT INTO flights (id, tenant, agent, goal, status, meta, project_id)
+      VALUES ('flight-no-edge', '${TENANT}', '${AGENT_ID}', 'No edge read', 'running', '${noEdgeMeta}', 'project-no-edge');
       DELETE FROM project_squad_access
        WHERE project_id = 'project-no-edge' AND squad_id = '${SQUAD_ID}';
     `)
-    const owner = auth({ role: 'owner', capabilities: [] })
+    const legacyOwner = auth({ role: 'owner', capabilities: undefined })
+    const restrictedOwner = auth({ role: 'owner', capabilities: [] })
     const orgAdmin = auth({
       capabilities: [{ member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' }],
     })
 
-    for (const [principal, taskId] of [[owner, 'task-owner'], [orgAdmin, 'task-admin']] as const) {
+    for (const [principal, taskId] of [[legacyOwner, 'task-owner-dispatch'], [orgAdmin, 'task-admin-dispatch']] as const) {
       const dispatched = await invokeTool(principal, env, 'flight_dispatch', {
         squad_id: SQUAD_ID,
-        project_id: 'project-no-edge',
+        project_id: 'project-a',
         goal: `Workspace bypass ${taskId}`,
         budget_micro_usd: 0,
         meta_json: JSON.stringify(flightMeta(taskId)),
@@ -299,8 +308,19 @@ describe('MCP project attribution parity', () => {
         squad_id: SQUAD_ID,
         project_id: 'project-no-edge',
       }, 'https://pot.test')
-      expect((flights.result as { flights: FlightRow[] }).flights.length).toBeGreaterThan(0)
+      expect((flights.result as { flights: FlightRow[] }).flights.map((flight) => flight.id))
+        .toContain('flight-no-edge')
     }
+
+    const restrictedDispatch = await invokeTool(restrictedOwner, env, 'flight_dispatch', {
+      squad_id: SQUAD_ID,
+      project_id: 'project-a',
+      goal: 'Restricted owner',
+      budget_micro_usd: 0,
+      meta_json: JSON.stringify(flightMeta('task-owner-dispatch')),
+      signals_json: JSON.stringify(signals),
+    }, 'https://pot.test')
+    expect(restrictedDispatch).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
 
     const memberTasks = await invokeTool(auth(), env, 'task_list', {
       squad_id: SQUAD_ID,
@@ -312,6 +332,42 @@ describe('MCP project attribution parity', () => {
       project_id: 'project-no-edge',
     }, 'https://pot.test')
     expect(memberFlights).toMatchObject({ ok: false, status: 404, error: 'project_not_found' })
+    const restrictedRead = await invokeTool(restrictedOwner, env, 'task_list', {
+      squad_id: SQUAD_ID,
+      project_id: 'project-no-edge',
+    }, 'https://pot.test')
+    expect(restrictedRead).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+  })
+
+  it('orders project existence and archive validation before project-edge denial', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    harness.sqlite.exec(`
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('project-no-edge', '${SQUAD_ID}', 'write');
+      INSERT INTO tasks (id, squad_id, title, done_when, status, project_id)
+      VALUES ('task-no-edge', '${SQUAD_ID}', 'No edge', 'done', 'in_progress', 'project-no-edge');
+      DELETE FROM project_squad_access
+       WHERE project_id = 'project-no-edge' AND squad_id = '${SQUAD_ID}';
+    `)
+    const dispatchFor = (projectId: string, taskId: string) => invokeTool(auth(), env, 'flight_dispatch', {
+      squad_id: SQUAD_ID,
+      project_id: projectId,
+      goal: `Validate ${projectId}`,
+      budget_micro_usd: 0,
+      meta_json: JSON.stringify(flightMeta(taskId)),
+      signals_json: JSON.stringify(signals),
+    }, 'https://pot.test')
+
+    await expect(dispatchFor('missing-project', 'missing-task')).resolves.toMatchObject({
+      ok: false, status: 404, error: 'project_not_found',
+    })
+    await expect(dispatchFor('project-archived', 'missing-task')).resolves.toMatchObject({
+      ok: false, status: 400, error: 'archived_project',
+    })
+    await expect(dispatchFor('project-no-edge', 'task-no-edge')).resolves.toMatchObject({
+      ok: false, status: 403, error: 'forbidden', detail: { need: 'project_write' },
+    })
   })
 
   it('dispatches and filters attributed flights while keeping project_id outside FlightMetaV1', async () => {

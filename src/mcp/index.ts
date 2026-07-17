@@ -81,6 +81,7 @@ import {
   listFlightsForSquad,
   listIncompleteFlightTaskIds,
   FlightProjectError,
+  validateFlightProjectAttribution,
   type FlightRow,
 } from '../flight/service'
 import { parseDispatchBody } from '../flight/routes'
@@ -439,8 +440,8 @@ async function resolveTaskSquad(
 }
 
 function hasWorkspaceAdmin(auth: AuthContext): boolean {
-  if (auth.role === 'owner' || auth.role === 'admin') return true
-  return hasCapability(auth.capabilities ?? [], 'org', null, 'admin')
+  if (auth.capabilities === undefined) return auth.role === 'owner' || auth.role === 'admin'
+  return hasCapability(auth.capabilities, 'org', null, 'admin')
 }
 
 async function canReadProjectForSquad(
@@ -482,6 +483,14 @@ async function hasProjectWriteForSquads(
 }
 
 function taskProjectFailure(error: TaskProjectError): ToolOutcome {
+  if (error.code === 'project_not_found') return fail(404, error.code)
+  if (error.code === 'project_access_forbidden') {
+    return fail(403, 'forbidden', { need: 'project_write' })
+  }
+  return fail(400, error.code)
+}
+
+function flightProjectFailure(error: FlightProjectError): ToolOutcome {
   if (error.code === 'project_not_found') return fail(404, error.code)
   if (error.code === 'project_access_forbidden') {
     return fail(403, 'forbidden', { need: 'project_write' })
@@ -1116,6 +1125,18 @@ const toolFlightDispatch: ToolSpec = {
     if (args.project_id != null && (!projectId || projectId.length > 200)) {
       return fail(400, 'invalid_project_id')
     }
+    try {
+      await validateFlightProjectAttribution(env, {
+        agent: auth.boundAgentId,
+        goal,
+        project_id: projectId,
+        budget_micro_usd: requestedBudget as number,
+        meta,
+      })
+    } catch (error) {
+      if (error instanceof FlightProjectError) return flightProjectFailure(error)
+      throw error
+    }
     if (projectId && !workspaceAdmin && !(await hasProjectWriteForSquads(env, projectId, meta.squad_ids))) {
       return fail(403, 'forbidden', { need: 'project_write', scope: 'project squads' })
     }
@@ -1157,7 +1178,7 @@ const toolFlightDispatch: ToolSpec = {
       preflight = await dispatchFlight(env, parsed.value.flight, parsed.value.signals, parsed.value.opts)
     } catch (error) {
       if (!(error instanceof FlightProjectError)) throw error
-      return fail(error.code === 'project_not_found' ? 404 : 400, error.code)
+      return flightProjectFailure(error)
     }
     const flight = await getFlight(env, preflight.id)
     if (!flight) return fail(500, 'flight_record_missing')

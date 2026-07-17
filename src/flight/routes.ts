@@ -157,7 +157,17 @@ flightsApp.post('/', async (c) => {
     result = await dispatchFlight(c.env, flight, signals, opts)
   } catch (error) {
     if (!(error instanceof FlightProjectError)) throw error
-    return c.json({ error: error.code }, error.code === 'project_not_found' ? 404 : 400)
+    const status = error.code === 'project_not_found'
+      ? 404
+      : error.code === 'project_access_forbidden'
+        ? 403
+        : 400
+    return c.json(
+      error.code === 'project_access_forbidden'
+        ? { error: 'forbidden', need: 'project_write' }
+        : { error: error.code },
+      status,
+    )
   }
   // 201 on launch (GO), 200 on a recorded NO-GO hold (not an error — the gate worked).
   return c.json(result, result.go ? 201 : 200)

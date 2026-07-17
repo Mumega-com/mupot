@@ -58,17 +58,48 @@ function makeHarness(): SqliteD1Harness {
   return harness
 }
 
-function envFor(harness: SqliteD1Harness, queries?: string[]): Env {
+function envFor(harness: SqliteD1Harness, queries?: string[], beforeFlightInsert?: () => void): Env {
   const db = queries
     ? {
         prepare(sql: string) {
           queries.push(sql)
-          return harness.db.prepare(sql)
+          return wrapFlightInsert(harness.db.prepare(sql), sql, beforeFlightInsert)
         },
         batch: harness.db.batch.bind(harness.db),
       }
-    : harness.db
+    : beforeFlightInsert
+      ? {
+          prepare(sql: string) {
+            return wrapFlightInsert(harness.db.prepare(sql), sql, beforeFlightInsert)
+          },
+          batch: harness.db.batch.bind(harness.db),
+        }
+      : harness.db
   return { DB: db, TENANT_SLUG: 'pot-a' } as unknown as Env
+}
+
+function wrapFlightInsert<T extends object>(statement: T, sql: string, beforeFlightInsert?: () => void): T {
+  if (!beforeFlightInsert || !sql.includes('INSERT INTO flights (')) return statement
+  let fired = false
+  const wrap = (target: object): object => new Proxy(target, {
+    get(current, property) {
+      if (property === 'bind') {
+        return (...values: unknown[]) => wrap((current as { bind(...args: unknown[]): object }).bind(...values))
+      }
+      if (property === 'run') {
+        return async () => {
+          if (!fired) {
+            fired = true
+            beforeFlightInsert()
+          }
+          return (current as { run(): Promise<unknown> }).run()
+        }
+      }
+      const value = Reflect.get(current, property)
+      return typeof value === 'function' ? value.bind(current) : value
+    },
+  })
+  return wrap(statement) as T
 }
 
 function dispatchBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -182,6 +213,7 @@ describe('flight project attribution', () => {
       ['flight project not found', 'project_not_found'],
       ['flight project archived', 'archived_project'],
       ['flight task project mismatch', 'flight_task_project_mismatch'],
+      ['flight project access denied', 'project_access_forbidden'],
     ] as const) {
       const env = {
         TENANT_SLUG: 'pot-a',
@@ -234,5 +266,36 @@ describe('flight project attribution', () => {
     })
     expect(harness.sqlite.prepare(`SELECT status FROM flights WHERE id = 'flight-drift'`).get())
       .toEqual({ status: 'running' })
+  })
+
+  it('maps an edge revoked after validation but before insert to stable project access denial', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, undefined, () => {
+      harness!.sqlite.exec(`
+        DELETE FROM project_squad_access
+         WHERE project_id = 'project-a' AND squad_id = 'squad-a'
+      `)
+    })
+
+    await expect(createFlight(env, {
+      agent: 'agent-a',
+      goal: 'Revoked edge race',
+      project_id: 'project-a',
+      meta: meta as never,
+    })).rejects.toMatchObject({ code: 'project_access_forbidden' })
+    expect(harness.sqlite.prepare(`SELECT count(*) AS count FROM flights`).get()).toEqual({ count: 0 })
+  })
+
+  it('returns stable project_write denial when the durable route insert lacks an edge', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      DELETE FROM project_squad_access
+       WHERE project_id = 'project-a' AND squad_id = 'squad-a'
+    `)
+
+    const response = await dispatch(harness, dispatchBody({ project_id: 'project-a', meta }))
+    expect(response.status).toBe(403)
+    await expect(response.json()).resolves.toEqual({ error: 'forbidden', need: 'project_write' })
+    expect(harness.sqlite.prepare(`SELECT count(*) AS count FROM flights`).get()).toEqual({ count: 0 })
   })
 })
