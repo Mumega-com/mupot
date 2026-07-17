@@ -491,27 +491,58 @@ export async function loadProjectFlights(
   env: Env,
   context: ProjectWorkContext,
 ): Promise<FlightRow[]> {
-  const statement = context.readableSquadIds === null
-    ? env.DB.prepare(
+  if (context.readableSquadIds === null) {
+    const result = await env.DB.prepare(
       `SELECT *
          FROM flights
         WHERE tenant = ?1 AND project_id = ?2
         ORDER BY created_at DESC, id DESC
         LIMIT ?3`,
-    ).bind(env.TENANT_SLUG, context.project.id, 100)
-    : env.DB.prepare(
+    ).bind(env.TENANT_SLUG, context.project.id, 100).all<FlightRow>()
+    return result.results ?? []
+  }
+
+  const flights: FlightRow[] = []
+  let cursorCreatedAt: number | null = null
+  let cursorId: string | null = null
+
+  while (flights.length < 100) {
+    const result: { results?: FlightRow[] } = await env.DB.prepare(
       `SELECT *
          FROM flights f
         WHERE f.tenant = ?1 AND f.project_id = ?2
           ${readableFlightSql('f', '?3')}
+          AND (
+            ?4 IS NULL
+            OR f.created_at < ?4
+            OR (f.created_at = ?4 AND f.id < ?5)
+          )
         ORDER BY f.created_at DESC, f.id DESC
-        LIMIT ?4`,
-    ).bind(env.TENANT_SLUG, context.project.id, jsonIds(context.readableSquadIds), 100)
-  const result = await statement.all<FlightRow>()
-  const rows = result.results ?? []
-  return context.readableSquadIds === null
-    ? rows
-    : rows.filter((flight) => projectFlightIsReadable(context, flight.meta))
+        LIMIT ?6`,
+    ).bind(
+      env.TENANT_SLUG,
+      context.project.id,
+      jsonIds(context.readableSquadIds),
+      cursorCreatedAt,
+      cursorId,
+      100,
+    ).all<FlightRow>()
+    const candidates: FlightRow[] = result.results ?? []
+
+    for (const flight of candidates) {
+      if (projectFlightIsReadable(context, flight.meta)) {
+        flights.push(flight)
+        if (flights.length === 100) break
+      }
+    }
+
+    if (candidates.length < 100 || flights.length === 100) break
+    const last: FlightRow = candidates[candidates.length - 1]!
+    cursorCreatedAt = last.created_at
+    cursorId = last.id
+  }
+
+  return flights
 }
 
 function statusTone(status: ProjectStatus): 'ok' | 'warn' | 'dim' | 'primary' {

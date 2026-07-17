@@ -455,7 +455,7 @@ describe('project dashboard routes', () => {
     expect(body).not.toContain('Malformed self-labeled v1 flight')
     expect(body).not.toContain('Ship Mirror')
     expect(observed.some((sql) => (
-      /json_valid\(f\.meta\)[\s\S]*json_each\(\?3\)[\s\S]*ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?4/i
+      /json_valid\(f\.meta\)[\s\S]*json_each\(\?3\)[\s\S]*\?4 IS NULL[\s\S]*f\.created_at < \?4[\s\S]*f\.id < \?5[\s\S]*ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?6/i
         .test(sql)
     ))).toBe(true)
 
@@ -496,6 +496,55 @@ describe('project dashboard routes', () => {
     expect(body).toContain('Ship Inkwell')
     expect(body).not.toContain('Newer hidden')
     expect(body).not.toContain('Newer malformed')
+  })
+
+  it('keyset-pages past SQL-pass JS-fail metadata to find older canonical flights', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      UPDATE flights SET created_at = 1 WHERE id = 'visible-flight';
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 101)
+      INSERT INTO flights (id, tenant, agent, goal, status, project_id, created_at, meta)
+      SELECT printf('newer-js-invalid-%03d', x), 'pot-a', 'agent-a', printf('SQL-pass JS-fail %03d', x),
+             'running', 'visible-child', 3000000000000 + x,
+             json_object(
+               'schema', 'mupot.flight.meta/v1',
+               'goal_id', char(160),
+               'objective_id', 'ship',
+               'squad_ids', json_array('squad-a'),
+               'task_ids', json_array('visible-task'),
+               'done_when', json_array('done'),
+               'artifact_refs', json_array(),
+               'receipt_refs', json_array(),
+               'confidentiality', 'internal',
+               'publication_target', 'none',
+               'parent_flight_id', NULL
+             )
+        FROM n;
+    `)
+    as(memberA())
+    const observed: string[] = []
+    const trackedDb = new Proxy(harness.db, {
+      get(target, property, receiver) {
+        if (property !== 'prepare') return Reflect.get(target, property, receiver)
+        return (sql: string) => {
+          if (/SELECT \*[\s\S]*FROM\s+flights f/i.test(sql)) observed.push(sql)
+          return target.prepare(sql)
+        }
+      },
+    })
+
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/flights?project_id=visible-child'),
+      { ...envFor(harness), DB: trackedDb },
+    )
+    const body = await response.text()
+    expect(response.status).toBe(200)
+    expect(body).toContain('Ship Inkwell')
+    expect(body).not.toContain('SQL-pass JS-fail')
+    expect(observed).toHaveLength(2)
+    expect(observed[0]).toMatch(/\?4 IS NULL[\s\S]*f\.created_at < \?4[\s\S]*f\.id < \?5/i)
+    expect(observed[0]).toMatch(/ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?6/i)
+    expect(observed[0]).not.toMatch(/\bOFFSET\b/i)
   })
 
   it('lets workspace admins see canonical, mixed, legacy, and malformed project flights', async () => {
