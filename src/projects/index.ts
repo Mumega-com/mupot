@@ -60,6 +60,10 @@ function nextCursor(page: Page, resultLength: number): string | null {
   return resultLength > page.limit && nextOffset <= MAX_PAGE_OFFSET ? String(nextOffset) : null
 }
 
+function jsonIds(ids: string[]): string {
+  return JSON.stringify([...new Set(ids)])
+}
+
 async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> {
   if (auth.memberId) return auth.memberId
   if (!auth.email) return null
@@ -102,17 +106,11 @@ async function projectReadAccess(env: Env, auth: AuthContext): Promise<ProjectRe
 
 function edgePredicate(access: ProjectReadAccess): { sql: string; binds: string[] } {
   if (access.org_read) return { sql: '1 = 1', binds: [] }
-  const conditions: string[] = []
-  const binds: string[] = []
-  if (access.squad_ids.length) {
-    conditions.push(`s.id IN (${access.squad_ids.map(() => '?').join(', ')})`)
-    binds.push(...access.squad_ids)
+  return {
+    sql: `(s.id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+      OR s.department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?)))`,
+    binds: [jsonIds(access.squad_ids), jsonIds(access.department_ids)],
   }
-  if (access.department_ids.length) {
-    conditions.push(`s.department_id IN (${access.department_ids.map(() => '?').join(', ')})`)
-    binds.push(...access.department_ids)
-  }
-  return { sql: conditions.length ? conditions.join(' OR ') : '0 = 1', binds }
 }
 
 function projectVisibilityClause(access: ProjectReadAccess): { sql: string; binds: string[] } {
@@ -142,6 +140,133 @@ async function readableProject(
       WHERE p.id = ?
         AND ${visibility.sql}`,
   ).bind(id, ...visibility.binds).first<Project>()
+}
+
+function boundedFlightMetaTextSql(meta: string, path: string, maxLength: number): string {
+  return `
+    AND json_type(${meta}, '${path}') = 'text'
+    AND length(trim(CAST(json_extract(${meta}, '${path}') AS TEXT))) > 0
+    AND length(CAST(json_extract(${meta}, '${path}') AS TEXT)) <= ${maxLength}`
+}
+
+function boundedFlightMetaArraySql(
+  meta: string,
+  path: string,
+  alias: string,
+  maxItems: number,
+  maxLength: number,
+  nonEmpty: boolean,
+): string {
+  return `
+    AND json_type(${meta}, '${path}') = 'array'
+    AND json_array_length(${meta}, '${path}') ${nonEmpty ? 'BETWEEN 1 AND' : '<='} ${maxItems}
+    AND NOT EXISTS (
+      SELECT 1
+        FROM json_each(${meta}, '${path}') ${alias}
+       WHERE ${alias}.type <> 'text'
+          OR length(trim(CAST(${alias}.value AS TEXT))) = 0
+          OR length(CAST(${alias}.value AS TEXT)) > ${maxLength}
+    )`
+}
+
+function canonicalFlightMetaSql(flightAlias: string): string {
+  const safeMeta = `CASE WHEN json_valid(${flightAlias}.meta) THEN ${flightAlias}.meta ELSE '{}' END`
+  return `
+    AND json_valid(${flightAlias}.meta)
+    AND json_type(${safeMeta}) = 'object'
+    AND length(json(${safeMeta})) <= 16384
+    AND NOT EXISTS (
+      SELECT 1
+        FROM json_each(${safeMeta}) meta_key
+       WHERE meta_key.key NOT IN (
+         'schema', 'goal_id', 'objective_id', 'squad_ids', 'task_ids', 'done_when',
+         'artifact_refs', 'receipt_refs', 'confidentiality', 'publication_target', 'parent_flight_id'
+       )
+    )
+    AND json_extract(${safeMeta}, '$.schema') = 'mupot.flight.meta/v1'
+    ${boundedFlightMetaTextSql(safeMeta, '$.goal_id', 200)}
+    ${boundedFlightMetaTextSql(safeMeta, '$.objective_id', 200)}
+    ${boundedFlightMetaArraySql(safeMeta, '$.squad_ids', 'squad_item', 8, 200, true)}
+    ${boundedFlightMetaArraySql(safeMeta, '$.task_ids', 'task_item', 200, 200, true)}
+    ${boundedFlightMetaArraySql(safeMeta, '$.done_when', 'done_item', 100, 1000, true)}
+    ${boundedFlightMetaArraySql(safeMeta, '$.artifact_refs', 'artifact_item', 200, 2000, false)}
+    ${boundedFlightMetaArraySql(safeMeta, '$.receipt_refs', 'receipt_item', 200, 2000, false)}
+    AND json_type(${safeMeta}, '$.confidentiality') = 'text'
+    AND json_extract(${safeMeta}, '$.confidentiality') IN ('private', 'internal', 'public-projection')
+    AND json_type(${safeMeta}, '$.publication_target') = 'text'
+    AND json_extract(${safeMeta}, '$.publication_target') IN ('none', 'inkwell-draft', 'mumega.com')
+    AND json_type(${safeMeta}, '$.parent_flight_id') IN ('null', 'text')
+    AND (
+      json_type(${safeMeta}, '$.parent_flight_id') = 'null'
+      OR (
+        length(trim(CAST(json_extract(${safeMeta}, '$.parent_flight_id') AS TEXT))) > 0
+        AND length(CAST(json_extract(${safeMeta}, '$.parent_flight_id') AS TEXT)) <= 200
+      )
+    )`
+}
+
+async function projectAggregates(
+  env: Env,
+  projectId: string,
+  access: ProjectReadAccess,
+): Promise<{ direct_tasks: number; direct_squads: number; direct_flights: number }> {
+  if (access.workspace_admin || access.org_read) {
+    const [tasks, squads, flights] = await Promise.all([
+      env.DB.prepare('SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?').bind(projectId).first<{ count: number }>(),
+      env.DB.prepare('SELECT COUNT(*) AS count FROM project_squad_access WHERE project_id = ?').bind(projectId).first<{ count: number }>(),
+      env.DB.prepare('SELECT COUNT(*) AS count FROM flights WHERE project_id = ? AND tenant = ?').bind(projectId, env.TENANT_SLUG).first<{ count: number }>(),
+    ])
+    return {
+      direct_tasks: Number(tasks?.count ?? 0),
+      direct_squads: Number(squads?.count ?? 0),
+      direct_flights: Number(flights?.count ?? 0),
+    }
+  }
+
+  const squadIds = jsonIds(access.squad_ids)
+  const departmentIds = jsonIds(access.department_ids)
+  const safeMeta = "CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END"
+  const [tasks, squads, flights] = await Promise.all([
+    env.DB.prepare(
+      `SELECT COUNT(*) AS count
+         FROM tasks t
+         JOIN squads s ON s.id = t.squad_id
+        WHERE t.project_id = ?1
+          AND (s.id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
+            OR s.department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))`,
+    ).bind(projectId, squadIds, departmentIds).first<{ count: number }>(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS count
+         FROM project_squad_access psa
+         JOIN squads s ON s.id = psa.squad_id
+        WHERE psa.project_id = ?1
+          AND (s.id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
+            OR s.department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))`,
+    ).bind(projectId, squadIds, departmentIds).first<{ count: number }>(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS count
+         FROM flights f
+        WHERE f.project_id = ?1
+          AND f.tenant = ?2
+          ${canonicalFlightMetaSql('f')}
+          AND NOT EXISTS (
+            SELECT 1
+              FROM json_each(${safeMeta}, '$.squad_ids') squad_ref
+             WHERE NOT EXISTS (
+               SELECT 1
+                 FROM squads s
+                WHERE s.id = CAST(squad_ref.value AS TEXT)
+                  AND (s.id IN (SELECT CAST(value AS TEXT) FROM json_each(?3))
+                    OR s.department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
+             )
+          )`,
+    ).bind(projectId, env.TENANT_SLUG, squadIds, departmentIds).first<{ count: number }>(),
+  ])
+  return {
+    direct_tasks: Number(tasks?.count ?? 0),
+    direct_squads: Number(squads?.count ?? 0),
+    direct_flights: Number(flights?.count ?? 0),
+  }
 }
 
 function mutationStatus(error: ProjectMutationError): 400 | 404 | 409 {
@@ -240,19 +365,11 @@ projectsApp.get('/:id', async (c) => {
   const access = await projectReadAccess(c.env, c.get('auth'))
   const project = await readableProject(c.env, c.req.param('id'), access)
   if (!project) return c.json({ error: 'project_not_found' }, 404)
-  const [tasks, squads, flights] = await Promise.all([
-    c.env.DB.prepare('SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?').bind(project.id).first<{ count: number }>(),
-    c.env.DB.prepare('SELECT COUNT(*) AS count FROM project_squad_access WHERE project_id = ?').bind(project.id).first<{ count: number }>(),
-    c.env.DB.prepare('SELECT COUNT(*) AS count FROM flights WHERE project_id = ? AND tenant = ?').bind(project.id, c.env.TENANT_SLUG).first<{ count: number }>(),
-  ])
+  const aggregates = await projectAggregates(c.env, project.id, access)
   const parent = project.parent_project_id ? await getProject(c.env, project.parent_project_id) : null
   return c.json({
     project,
-    aggregates: {
-      direct_tasks: Number(tasks?.count ?? 0),
-      direct_squads: Number(squads?.count ?? 0),
-      direct_flights: Number(flights?.count ?? 0),
-    },
+    aggregates,
     ...(parent ? { parent: safeParent(parent) } : {}),
   })
 })

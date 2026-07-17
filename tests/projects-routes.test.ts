@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -32,8 +33,33 @@ function makeHarness(): SqliteD1Harness {
   return harness
 }
 
+let bindBudget: number | undefined
+
+function bindBudgetDb(db: D1Database, maximum: number): D1Database {
+  return new Proxy(db, {
+    get(target, property, receiver) {
+      if (property !== 'prepare') return Reflect.get(target, property, receiver)
+      return (sql: string): D1PreparedStatement => {
+        const statement = target.prepare(sql)
+        return new Proxy(statement, {
+          get(statementTarget, statementProperty, statementReceiver) {
+            if (statementProperty !== 'bind') return Reflect.get(statementTarget, statementProperty, statementReceiver)
+            return (...values: unknown[]): D1PreparedStatement => {
+              if (values.length > maximum) {
+                throw new Error(`D1 bind budget exceeded: ${values.length} > ${maximum}`)
+              }
+              return statementTarget.bind(...values)
+            }
+          },
+        })
+      }
+    },
+  })
+}
+
 function envFor(harness: SqliteD1Harness): Env {
-  return { DB: harness.db, TENANT_SLUG: 'pot-a' } as Env
+  const db = bindBudget === undefined ? harness.db : bindBudgetDb(harness.db, bindBudget)
+  return { DB: db, TENANT_SLUG: 'pot-a' } as Env
 }
 
 function as(auth: AuthContext | null): void {
@@ -76,11 +102,32 @@ function seedProjects(harness: SqliteD1Harness): void {
     INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('other-root', 'squad-b', 'read');
     INSERT INTO tasks (id, squad_id, title, status, project_id) VALUES ('visible-task', 'squad-a', 'Visible work', 'open', 'visible-child');
     INSERT INTO tasks (id, squad_id, title, status, project_id) VALUES ('hidden-task', 'squad-b', 'Hidden work', 'open', 'hidden-child');
+  `)
+  const insertFlight = harness.sqlite.prepare(
+    "INSERT INTO flights (id, tenant, agent, goal, status, project_id, meta) VALUES (?, 'pot-a', ?, ?, 'running', ?, ?)",
+  )
+  insertFlight.run('visible-flight', 'agent-a', 'Visible flight', 'visible-child', flightMeta(['squad-a']))
+  insertFlight.run('hidden-flight', 'agent-b', 'Hidden flight', 'hidden-child', flightMeta(['squad-b'], ['hidden-task']))
+  harness.sqlite.exec(`
     UPDATE project_squad_access SET access_level = 'read'
      WHERE project_id IN ('visible-child', 'hidden-child');
-    INSERT INTO flights (id, tenant, agent, goal, status, project_id) VALUES ('visible-flight', 'pot-a', 'agent-a', 'Visible flight', 'running', 'visible-child');
-    INSERT INTO flights (id, tenant, agent, goal, status, project_id) VALUES ('hidden-flight', 'pot-a', 'agent-b', 'Hidden flight', 'running', 'hidden-child');
   `)
+}
+
+function flightMeta(squadIds: string[], taskIds = ['visible-task']): string {
+  return JSON.stringify({
+    schema: 'mupot.flight.meta/v1',
+    goal_id: 'goal-1',
+    objective_id: 'objective-1',
+    squad_ids: squadIds,
+    task_ids: taskIds,
+    done_when: ['Done'],
+    artifact_refs: [],
+    receipt_refs: [],
+    confidentiality: 'internal',
+    publication_target: 'none',
+    parent_flight_id: null,
+  })
 }
 
 describe('projectsApp', () => {
@@ -88,6 +135,7 @@ describe('projectsApp', () => {
 
   afterEach(() => {
     authState.current = null
+    bindBudget = undefined
     harness?.close()
     harness = undefined
   })
@@ -158,6 +206,85 @@ describe('projectsApp', () => {
     expect((await fetch(harness, '/hidden-child')).status).toBe(404)
     expect((await fetch(harness, '/other-root')).status).toBe(404)
     expect((await fetch(harness, '/hidden-child/squads')).status).toBe(404)
+  })
+
+  it('keeps REST visibility below the D1 bind budget with more than 150 squad and department grants', async () => {
+    harness = makeHarness()
+    seedProjects(harness)
+    bindBudget = 100
+    const capabilities = [
+      ...Array.from({ length: 160 }, (_, index) => ({
+        member_id: 'member-many',
+        scope_type: 'squad' as const,
+        scope_id: index === 159 ? 'squad-a' : `unused-squad-${index}`,
+        capability: 'observer' as const,
+      })),
+      ...Array.from({ length: 160 }, (_, index) => ({
+        member_id: 'member-many',
+        scope_type: 'department' as const,
+        scope_id: index === 159 ? 'dept-a' : `unused-department-${index}`,
+        capability: 'observer' as const,
+      })),
+    ]
+    as(actor({ memberId: 'member-many', capabilities }))
+
+    const list = await fetch(harness, '/')
+    expect(list.status).toBe(200)
+    await expect(list.json()).resolves.toMatchObject({
+      projects: [{ id: 'parent', parent_context: true }, { id: 'visible-child' }],
+    })
+    expect((await fetch(harness, '/visible-child')).status).toBe(200)
+    await expect((await fetch(harness, '/visible-child/squads')).json()).resolves.toMatchObject({
+      squads: [{ squad_id: 'squad-a' }],
+    })
+  })
+
+  it('scopes member aggregates to readable squads and canonical all-readable flights', async () => {
+    harness = makeHarness()
+    seedProjects(harness)
+    harness.sqlite.exec(`
+      UPDATE project_squad_access SET access_level = 'write'
+       WHERE project_id = 'visible-child' AND squad_id = 'squad-a';
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('visible-child', 'squad-b', 'write');
+      INSERT INTO tasks (id, squad_id, title, status, project_id)
+      VALUES ('private-task', 'squad-b', 'Private work', 'open', 'visible-child');
+    `)
+    harness.sqlite.prepare(
+      "UPDATE flights SET meta = ? WHERE id = 'visible-flight'",
+    ).run(flightMeta(['squad-a']))
+    const insertFlight = harness.sqlite.prepare(
+      "INSERT INTO flights (id, tenant, agent, goal, status, project_id, meta) VALUES (?, 'pot-a', 'agent-a', 'Aggregate test', 'running', 'visible-child', ?)",
+    )
+    insertFlight.run('private-flight', flightMeta(['squad-b'], ['private-task']))
+    insertFlight.run('mixed-flight', flightMeta(['squad-a', 'squad-b'], ['visible-task', 'private-task']))
+    insertFlight.run('malformed-flight', JSON.stringify({ schema: 'mupot.flight.meta/v1', squad_ids: ['squad-a'] }))
+    insertFlight.run('legacy-flight', JSON.stringify({ squad_ids: ['squad-a'] }))
+    harness.sqlite.exec(`
+      UPDATE project_squad_access SET access_level = 'read'
+       WHERE project_id = 'visible-child';
+    `)
+
+    as(actor({
+      memberId: 'member-a',
+      capabilities: [{ member_id: 'member-a', scope_type: 'squad', scope_id: 'squad-a', capability: 'observer' }],
+    }))
+    await expect((await fetch(harness, '/visible-child')).json()).resolves.toMatchObject({
+      aggregates: { direct_tasks: 1, direct_squads: 1, direct_flights: 1 },
+    })
+
+    as(actor({ role: 'admin' }))
+    await expect((await fetch(harness, '/visible-child')).json()).resolves.toMatchObject({
+      aggregates: { direct_tasks: 2, direct_squads: 2, direct_flights: 5 },
+    })
+
+    as(actor({
+      memberId: 'org-reader',
+      capabilities: [{ member_id: 'org-reader', scope_type: 'org', scope_id: null, capability: 'observer' }],
+    }))
+    await expect((await fetch(harness, '/visible-child')).json()).resolves.toMatchObject({
+      aggregates: { direct_tasks: 2, direct_squads: 2, direct_flights: 5 },
+    })
   })
 
   it('resolves a dashboard member from the authenticated email within this tenant', async () => {
