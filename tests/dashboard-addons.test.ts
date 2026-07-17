@@ -314,7 +314,7 @@ describe('addonsBody', () => {
     ['installed', ['Configure', 'Disable'], ['Install', 'Activate', 'Uninstall', 'Reinstall']],
     ['configured', ['Activate', 'Disable'], ['Configure', 'Uninstall', 'Reinstall']],
     ['active', ['Disable'], ['Configure', 'Activate', 'Uninstall']],
-    ['disabled', ['Activate', 'Uninstall'], ['Configure', 'Disable']],
+    ['disabled', ['Configure', 'Activate', 'Uninstall'], ['Disable']],
   ] as const)('renders only valid lifecycle commands for %s addons', (state, present, absent) => {
     const html = rendered(state)
 
