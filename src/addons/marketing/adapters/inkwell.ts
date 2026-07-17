@@ -37,29 +37,30 @@ export function createInkwellMarketingSource(_runId: string): MarketingMonitorSo
       const snapshot = await useConnectorById(env, binding.connectorId, 'inkwell', async (connector) => {
         const slug = parseSlug(connector.meta)
         if (!slug) return unavailable()
+        return connector.call(async (secret) => {
+          const controller = new AbortController()
+          const timer = setTimeout(() => controller.abort(), INKWELL_TIMEOUT_MS)
+          const baseFetch = env.INKWELL_SVC
+            ? env.INKWELL_SVC.fetch.bind(env.INKWELL_SVC) as typeof fetch
+            : fetch
+          const boundedFetch = ((input: RequestInfo | URL, init?: RequestInit) => baseFetch(input, {
+            ...init,
+            signal: controller.signal,
+          })) as typeof fetch
 
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), INKWELL_TIMEOUT_MS)
-        const baseFetch = env.INKWELL_SVC
-          ? env.INKWELL_SVC.fetch.bind(env.INKWELL_SVC) as typeof fetch
-          : fetch
-        const boundedFetch = ((input: RequestInfo | URL, init?: RequestInit) => baseFetch(input, {
-          ...init,
-          signal: controller.signal,
-        })) as typeof fetch
-
-        try {
-          const content = await fetchInkwellContent({
-            apiUrl: env.INKWELL_API_URL as string,
-            token: connector.secret,
-            tenantSlug: env.TENANT_SLUG,
-          }, slug, boundedFetch)
-          return content ? { status: 'available' as const, observations: [] } : unavailable()
-        } catch {
-          return failed()
-        } finally {
-          clearTimeout(timer)
-        }
+          try {
+            const content = await fetchInkwellContent({
+              apiUrl: env.INKWELL_API_URL as string,
+              token: secret,
+              tenantSlug: env.TENANT_SLUG,
+            }, slug, boundedFetch)
+            return content ? { status: 'available' as const, observations: [] } : unavailable()
+          } catch {
+            return failed()
+          } finally {
+            clearTimeout(timer)
+          }
+        })
       })
       return snapshot ?? unavailable()
     },

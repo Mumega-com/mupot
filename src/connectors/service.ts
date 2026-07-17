@@ -501,11 +501,64 @@ export async function resolveConnectorWithMeta(
   }
 }
 
+export interface ImmediateConnectorResult {
+  readonly status: 'available' | 'unavailable' | 'failed'
+  readonly observations: readonly unknown[]
+  readonly reason?: string
+}
+
 export interface ImmediateConnectorUse {
   readonly id: string
   readonly type: ConnectorType
   readonly meta: string | null
-  readonly secret: string
+  readonly call: <T extends ImmediateConnectorResult>(
+    operation: (secret: string) => T | Promise<T>,
+  ) => Promise<T>
+}
+
+class ImmediateConnectorError extends Error {}
+
+function cloneNonSecretResult(value: unknown, secret: string, seen: Set<object>): unknown {
+  if (typeof value === 'string') {
+    if (secret.length > 0 && value.includes(secret)) throw new ImmediateConnectorError('connector_result_contains_secret')
+    return value
+  }
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') return value
+  if (Array.isArray(value)) {
+    if (seen.has(value)) throw new ImmediateConnectorError('connector_result_invalid')
+    seen.add(value)
+    const copy = value.map((entry) => cloneNonSecretResult(entry, secret, seen))
+    seen.delete(value)
+    return Object.freeze(copy)
+  }
+  if (typeof value !== 'object') throw new ImmediateConnectorError('connector_result_invalid')
+  if (seen.has(value)) throw new ImmediateConnectorError('connector_result_invalid')
+  seen.add(value)
+  const copy: Record<string, unknown> = {}
+  for (const key of Object.keys(value)) {
+    copy[key] = cloneNonSecretResult((value as Record<string, unknown>)[key], secret, seen)
+  }
+  seen.delete(value)
+  return Object.freeze(copy)
+}
+
+function safeImmediateResult<T extends ImmediateConnectorResult>(value: T, secret: string): T {
+  const cloned = cloneNonSecretResult(value, secret, new Set())
+  if (!cloned || typeof cloned !== 'object' || Array.isArray(cloned)) {
+    throw new ImmediateConnectorError('connector_result_invalid')
+  }
+  const result = cloned as Record<string, unknown>
+  if (
+    (result.status !== 'available' && result.status !== 'unavailable' && result.status !== 'failed')
+    || !Array.isArray(result.observations)
+    || (result.reason !== undefined && typeof result.reason !== 'string')
+  ) throw new ImmediateConnectorError('connector_result_invalid')
+
+  return Object.freeze({
+    status: result.status,
+    ...(result.reason === undefined ? {} : { reason: result.reason }),
+    observations: result.observations,
+  }) as T
 }
 
 /**
@@ -513,7 +566,7 @@ export interface ImmediateConnectorUse {
  * inside the supplied callback. This is the vault boundary for addon adapters: it
  * does not perform scope fallback and never returns connector material itself.
  */
-export async function useConnectorById<T>(
+export async function useConnectorById<T extends ImmediateConnectorResult>(
   env: Env,
   connectorId: string,
   type: ConnectorType,
@@ -537,17 +590,36 @@ export async function useConnectorById<T>(
 
   if (!row || row.id !== connectorId || row.type !== type) return null
 
-  let secret: string
+  let secret: string | null
   try {
     secret = await decryptConnectorSecret(masterKey, row.id, row.type, row.encrypted_secret)
   } catch {
     return null
   }
 
+  let active = true
+  let called = false
+  const accessor: ImmediateConnectorUse = Object.freeze({
+    id: row.id,
+    type: row.type,
+    meta: row.meta,
+    async call<R extends ImmediateConnectorResult>(operation: (secret: string) => R | Promise<R>): Promise<R> {
+      if (!active || secret === null) throw new ImmediateConnectorError('connector_use_expired')
+      if (called) throw new ImmediateConnectorError('connector_use_already_called')
+      if (typeof operation !== 'function') throw new ImmediateConnectorError('connector_use_invalid')
+      called = true
+      return safeImmediateResult(await operation(secret), secret)
+    },
+  })
+
   try {
-    return await use({ id: row.id, type: row.type, meta: row.meta, secret })
+    return safeImmediateResult(await use(accessor), secret)
+  } catch (error) {
+    if (error instanceof ImmediateConnectorError) throw error
+    throw new ImmediateConnectorError('connector_use_failed')
   } finally {
-    secret = ''
+    active = false
+    secret = null
   }
 }
 

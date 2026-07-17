@@ -10,6 +10,7 @@ import {
   MAX_OBSERVATIONS_PER_RUN,
 } from './sources'
 import { deriveMarketingOutcomes } from './outcomes'
+import { MARKETING_MONITOR_ADAPTERS } from './adapters'
 import {
   MARKETING_MONITOR_METRIC_CONTRACT,
   type MarketingMonitorRun,
@@ -733,7 +734,22 @@ function resultsWritten(result: D1Result<unknown> | undefined): boolean {
   return Boolean(result?.success) && Number(result?.meta?.changes ?? 0) === 1
 }
 
-const emptySourceFactory: MarketingMonitorSourceFactory = () => []
+function createRegisteredSources(
+  runId: string,
+  bindings: readonly ResolvedAddonBinding[],
+): readonly MarketingMonitorSource[] {
+  const sources: MarketingMonitorSource[] = []
+  for (let bindingIndex = 0; bindingIndex < bindings.length; bindingIndex += 1) {
+    const binding = bindings[bindingIndex]
+    for (let adapterIndex = 0; adapterIndex < MARKETING_MONITOR_ADAPTERS.length; adapterIndex += 1) {
+      const registered = MARKETING_MONITOR_ADAPTERS[adapterIndex]
+      if (registered.adapter !== binding.adapter) continue
+      pushCaptured(sources, registered.create(runId))
+      break
+    }
+  }
+  return sources
+}
 
 export async function runMarketingMonitor(
   env: Env,
@@ -768,7 +784,9 @@ export async function runMarketingMonitor(
   const createdAt = nowIso()
   let collection
   try {
-    const sources = await (deps.sourceFactory ?? emptySourceFactory)({ runId, window })
+    const sources = deps.sourceFactory
+      ? await deps.sourceFactory({ runId, window })
+      : createRegisteredSources(runId, bindings)
     collection = await collectMarketingSnapshots(captured.env, bindings, window, sources)
   } catch {
     return { ok: false, reason: 'collection_failed' }

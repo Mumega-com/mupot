@@ -31,45 +31,47 @@ export function createMcpwpMarketingSource(_runId: string): MarketingMonitorSour
     async read(env, binding, window) {
       if (!binding.connectorId) return unavailable()
       const snapshot = await useConnectorById(env, binding.connectorId, 'mcpwp', async (connector) => {
-        const config = parseWpConnectorConfig(connector.secret, connector.meta)
-        if (!config) return unavailable()
+        return connector.call(async (secret) => {
+          const config = parseWpConnectorConfig(secret, connector.meta)
+          if (!config) return unavailable()
 
-        let origin: string
-        try {
-          origin = assertPublicHttpsUrl(config.siteUrl).origin
-        } catch {
-          return failed()
-        }
+          let origin: string
+          try {
+            origin = assertPublicHttpsUrl(config.siteUrl).origin
+          } catch {
+            return failed()
+          }
 
-        const endpoint = new URL('/wp-json/wp/v2/posts', origin)
-        endpoint.searchParams.set('status', 'publish')
-        endpoint.searchParams.set('_fields', WORDPRESS_POST_FIELDS)
-        endpoint.searchParams.set('per_page', String(MCPWP_MARKETING_PER_PAGE))
-        endpoint.searchParams.set('after', window.start)
-        endpoint.searchParams.set('before', window.end)
+          const endpoint = new URL('/wp-json/wp/v2/posts', origin)
+          endpoint.searchParams.set('status', 'publish')
+          endpoint.searchParams.set('_fields', WORDPRESS_POST_FIELDS)
+          endpoint.searchParams.set('per_page', String(MCPWP_MARKETING_PER_PAGE))
+          endpoint.searchParams.set('after', window.start)
+          endpoint.searchParams.set('before', window.end)
 
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), MCPWP_MARKETING_TIMEOUT_MS)
-        try {
-          const response = await fetch(endpoint.toString(), {
-            method: 'GET',
-            headers: {
-              authorization: `Basic ${btoa(`${config.username}:${config.appPassword}`)}`,
-              'user-agent': 'mupot-marketing-monitor/1.0',
-            },
-            redirect: 'manual',
-            signal: controller.signal,
-          })
-          if (isRedirect(response) || !response.ok) return failed()
-          const body = await response.json().catch(() => null)
-          return Array.isArray(body)
-            ? { status: 'available' as const, observations: [] }
-            : failed()
-        } catch {
-          return failed()
-        } finally {
-          clearTimeout(timer)
-        }
+          const controller = new AbortController()
+          const timer = setTimeout(() => controller.abort(), MCPWP_MARKETING_TIMEOUT_MS)
+          try {
+            const response = await fetch(endpoint.toString(), {
+              method: 'GET',
+              headers: {
+                authorization: `Basic ${btoa(`${config.username}:${config.appPassword}`)}`,
+                'user-agent': 'mupot-marketing-monitor/1.0',
+              },
+              redirect: 'manual',
+              signal: controller.signal,
+            })
+            if (isRedirect(response) || !response.ok) return failed()
+            const body = await response.json().catch(() => null)
+            return Array.isArray(body)
+              ? { status: 'available' as const, observations: [] }
+              : failed()
+          } catch {
+            return failed()
+          } finally {
+            clearTimeout(timer)
+          }
+        })
       })
       return snapshot ?? unavailable()
     },

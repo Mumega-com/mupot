@@ -23,6 +23,7 @@ const migrations = [
   '../migrations/0016_presence.sql',
   '../migrations/0019_agent_token_binding.sql',
   '../migrations/0023_connectors.sql',
+  '../migrations/0028_metric_points.sql',
   '../migrations/0029_department_microkernel.sql',
   '../migrations/0040_members_tenant.sql',
   '../migrations/0043_member_tokens_tenant.sql',
@@ -278,6 +279,55 @@ describe('marketing monitor service', () => {
     expect(calls[0]).toEqual({ runId: first.ok ? first.run.id : '', window })
     expect(harness.sqlite.prepare('SELECT status, COUNT(*) AS count FROM marketing_monitor_runs').get())
       .toEqual({ status: 'completed', count: 1 })
+  })
+
+  it('uses live bindings to construct registered sources when no factory is injected', async () => {
+    await activateMarketing(env)
+    harness.sqlite.prepare(`
+      INSERT INTO metric_points (
+        id, tenant_id, metric_key, value, occurred_at, source, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'point-first-party-1',
+      'tenant-a',
+      'seo.organic_sessions',
+      41,
+      '2026-07-01T12:00:00.000Z',
+      'first-party',
+      '2026-07-01T12:00:00.000Z',
+    )
+
+    const result = await runMarketingMonitor(env, owner, { window })
+
+    expect(result).toEqual(expect.objectContaining({
+      ok: true,
+      idempotent: false,
+      run: expect.objectContaining({
+        sourceCount: 1,
+        observationCount: 1,
+        sources: [{
+          key: 'first_party',
+          slot: 'web_analytics',
+          status: 'available',
+          observationCount: 1,
+        }],
+        observations: [expect.objectContaining({
+          sourceKey: 'first_party',
+          metricKey: 'seo.organic_sessions',
+          value: 41,
+          authority: 'first-party',
+        })],
+      }),
+    }))
+    expect(harness.sqlite.prepare(`
+      SELECT source_key, metric_key, value, authority
+        FROM marketing_monitor_observations
+    `).get()).toEqual({
+      source_key: 'first_party',
+      metric_key: 'seo.organic_sessions',
+      value: 41,
+      authority: 'first-party',
+    })
   })
 
   it.each(['missing', 'installed', 'configured', 'disabled', 'archived'] as const)(

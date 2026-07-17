@@ -117,27 +117,97 @@ afterEach(() => {
 })
 
 describe('exact-ID connector use', () => {
-  it('decrypts inside the immediate adapter callback without returning connector material', async () => {
+  it('decrypts only inside a one-shot call and returns a non-secret snapshot', async () => {
     const secret = 'vault-only-posthog-key'
     const connector = await connectorFixture('posthog', secret, {
       projectId: '436189',
       host: 'https://us.posthog.com',
     })
-    let callbackSecret = ''
+    let calledWithExpectedSecret = false
 
     const result = await useConnectorById(
       vaultEnv([connector]),
       connector.id,
       'posthog',
       async (resolved) => {
-        callbackSecret = resolved.secret
-        return { used: true, connectorId: resolved.id }
+        expect(Object.isFrozen(resolved)).toBe(true)
+        expect('secret' in resolved).toBe(false)
+        return resolved.call(async (plaintext) => {
+          calledWithExpectedSecret = plaintext === secret
+          return { status: 'available' as const, observations: [] }
+        })
       },
     )
 
-    expect(callbackSecret).toBe(secret)
-    expect(result).toEqual({ used: true, connectorId: connector.id })
+    expect(calledWithExpectedSecret).toBe(true)
+    expect(result).toEqual({ status: 'available', observations: [] })
     expect(JSON.stringify(result)).not.toContain(secret)
+  })
+
+  it('rejects a callback result containing the plaintext secret', async () => {
+    const secret = 'vault-return-must-fail'
+    const connector = await connectorFixture('posthog', secret, null)
+
+    await expect(useConnectorById(
+      vaultEnv([connector]),
+      connector.id,
+      'posthog',
+      async (resolved) => resolved.call(async (plaintext) => plaintext as never),
+    )).rejects.toThrow('connector_result_contains_secret')
+  })
+
+  it('replaces secret-bearing callback errors with a stable non-secret error', async () => {
+    const secret = 'vault-error-must-be-scrubbed'
+    const connector = await connectorFixture('posthog', secret, null)
+
+    let thrown: unknown
+    try {
+      await useConnectorById(
+        vaultEnv([connector]),
+        connector.id,
+        'posthog',
+        async (resolved) => resolved.call(async (plaintext) => {
+          throw new Error(`upstream rejected ${plaintext}`)
+        }),
+      )
+    } catch (error) {
+      thrown = error
+    }
+
+    expect(thrown).toEqual(new Error('connector_use_failed'))
+    expect(String(thrown)).not.toContain(secret)
+  })
+
+  it('returns null without invoking the callback for a wrong connector type', async () => {
+    const connector = await connectorFixture('inkwell', 'wrong-type-secret', null, {
+      id: 'wrong-type',
+    })
+    const callback = vi.fn()
+
+    await expect(useConnectorById(vaultEnv([connector]), connector.id, 'posthog', callback)).resolves.toBeNull()
+    expect(callback).not.toHaveBeenCalled()
+  })
+
+  it('expires a retained accessor after the immediate callback returns', async () => {
+    const connector = await connectorFixture('posthog', 'retained-secret', null)
+    let retained: Parameters<Parameters<typeof useConnectorById>[3]>[0] | undefined
+
+    const result = await useConnectorById(
+      vaultEnv([connector]),
+      connector.id,
+      'posthog',
+      async (resolved) => {
+        retained = resolved
+        return resolved.call(async () => ({ status: 'available' as const, observations: [] }))
+      },
+    )
+
+    expect(result).toEqual({ status: 'available', observations: [] })
+    expect(retained).toBeDefined()
+    expect(Object.isFrozen(retained)).toBe(true)
+    expect('secret' in (retained as object)).toBe(false)
+    await expect(retained?.call(async () => ({ status: 'available', observations: [] })))
+      .rejects.toThrow('connector_use_expired')
   })
 
   it('returns null without decrypting or invoking the callback for tenant mismatch or revocation', async () => {
@@ -220,7 +290,7 @@ describe('first-party marketing adapter', () => {
 })
 
 describe('PostHog marketing adapter', () => {
-  it('uses the existing bounded aggregate query with vault credentials and safe metadata', async () => {
+  it('uses the aggregate only as a health read and does not fabricate a marketing metric', async () => {
     const secret = 'posthog-vault-secret'
     const connector = await connectorFixture('posthog', secret, {
       projectId: '436189',
@@ -243,13 +313,7 @@ describe('PostHog marketing adapter', () => {
 
     expect(snapshot).toEqual({
       status: 'available',
-      observations: [expect.objectContaining({
-        runId: RUN_ID,
-        metricKey: 'seo.organic_sessions',
-        value: 56,
-        unit: 'count',
-        authority: 'posthog',
-      })],
+      observations: [],
     })
     const [url, init] = (fetchSpy as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit]
     expect(url).toBe('https://us.posthog.com/api/projects/436189/query/')
@@ -398,6 +462,27 @@ describe('MCPWP marketing adapter', () => {
       `Basic ${btoa(`agent:${secret}`)}`,
     )
     expect(JSON.stringify(snapshot)).not.toContain(secret)
+  })
+
+  it('refuses an actual 3xx response without following its location', async () => {
+    const connector = await connectorFixture('mcpwp', 'wordpress-redirect-secret', {
+      siteUrl: 'https://wordpress.example.com',
+      username: 'agent',
+    })
+    const fetchSpy = vi.fn(async () => new Response(null, {
+      status: 302,
+      headers: { location: 'https://redirect.example.com/posts' },
+    })) as unknown as typeof fetch
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const snapshot = await createMcpwpMarketingSource(RUN_ID).read(
+      vaultEnv([connector]),
+      vaultBinding('mcpwp'),
+      window,
+    )
+
+    expect(snapshot).toEqual({ status: 'failed', reason: 'source_unavailable', observations: [] })
+    expect(fetchSpy).toHaveBeenCalledOnce()
   })
 
   it('uses an eight-second timeout and never echoes response bodies or credentials', async () => {

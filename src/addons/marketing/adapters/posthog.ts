@@ -37,39 +37,32 @@ const failed = (): SourceSnapshot => ({
   observations: [],
 })
 
-export function createPosthogMarketingSource(runId: string): MarketingMonitorSource {
+export function createPosthogMarketingSource(_runId: string): MarketingMonitorSource {
   return {
     key: 'posthog',
     slot: 'web_analytics',
-    async read(env, binding, window) {
+    async read(env, binding, _window) {
       if (!binding.connectorId) return unavailable()
       const snapshot = await useConnectorById(env, binding.connectorId, 'posthog', async (connector) => {
         const meta = parsePosthogMeta(connector.meta)
         if (!meta) return unavailable()
-        const posthogEnv = {
-          POSTHOG_PERSONAL_API_KEY: connector.secret,
-          POSTHOG_PROJECT_ID: meta.projectId,
-          ...(meta.host ? { POSTHOG_HOST: meta.host } : {}),
-        } as Env
+        return connector.call(async (secret) => {
+          const posthogEnv = {
+            POSTHOG_PERSONAL_API_KEY: secret,
+            POSTHOG_PROJECT_ID: meta.projectId,
+            ...(meta.host ? { POSTHOG_HOST: meta.host } : {}),
+          } as Env
 
-        try {
-          const metrics = await posthogCroSource.collect(posthogEnv)
-          const users = metrics.find((metric) => metric.metric_key === 'cro.posthog.users_24h')
-          return {
-            status: 'available' as const,
-            observations: users ? [{
-              id: `${runId}:posthog:organic_sessions`,
-              runId,
-              metricKey: 'seo.organic_sessions' as const,
-              value: users.value,
-              unit: 'count',
-              authority: 'posthog',
-              observedAt: window.end,
-            }] : [],
+          try {
+            await posthogCroSource.collect(posthogEnv)
+            return {
+              status: 'available' as const,
+              observations: [],
+            }
+          } catch {
+            return failed()
           }
-        } catch {
-          return failed()
-        }
+        })
       })
       return snapshot ?? unavailable()
     },
