@@ -70,9 +70,10 @@ describe('validateFlightMetaReferences', () => {
     await expect(validate(makeEnv({ taskSquad: 'squad-other' }), meta)).resolves.toMatchObject({ ok: false, error: 'flight_task_scope_mismatch' })
   })
 
-  it('validates the maximum task set with at most two D1 reads', async () => {
+  it('validates the maximum task set without exceeding the D1 bind budget', async () => {
     if (!validate) return
     let reads = 0
+    const bindCounts: number[] = []
     const env = {
       TENANT_SLUG: 'test',
       DB: {
@@ -80,6 +81,8 @@ describe('validateFlightMetaReferences', () => {
           reads += 1
           return {
             bind(...ids: string[]) {
+              bindCounts.push(ids.length)
+              if (ids.length > 100) throw new Error(`D1 bind budget exceeded: ${ids.length}`)
               return {
                 async first() {
                   const id = ids[0]
@@ -99,6 +102,7 @@ describe('validateFlightMetaReferences', () => {
     const large = { ...meta, task_ids: Array.from({ length: 200 }, (_, index) => `task-${index}`) }
 
     await expect(validate(env, large)).resolves.toEqual({ ok: true })
-    expect(reads).toBeLessThanOrEqual(2)
+    expect(reads).toBe(4)
+    expect(Math.max(...bindCounts)).toBeLessThanOrEqual(90)
   })
 })

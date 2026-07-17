@@ -78,6 +78,87 @@ function envFor(harness: SqliteD1Harness, queries?: string[], beforeFlightInsert
   return { DB: db, TENANT_SLUG: 'pot-a' } as unknown as Env
 }
 
+interface BindObservation {
+  sql: string
+  count: number
+}
+
+function enforceBindBudget<T extends object>(
+  statement: T,
+  sql: string,
+  observations: BindObservation[],
+  maxBinds = 100,
+): T {
+  return new Proxy(statement, {
+    get(target, property) {
+      if (property === 'bind') {
+        return (...values: unknown[]) => {
+          observations.push({ sql, count: values.length })
+          if (values.length > maxBinds) throw new Error(`D1 bind budget exceeded: ${values.length}`)
+          const bound = (target as { bind(...args: unknown[]): object }).bind(...values)
+          return enforceBindBudget(bound, sql, observations, maxBinds)
+        }
+      }
+      const value = Reflect.get(target, property)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+}
+
+function envWithBindBudget(harness: SqliteD1Harness): { env: Env; observations: BindObservation[] } {
+  const observations: BindObservation[] = []
+  const db = {
+    prepare(sql: string) {
+      return enforceBindBudget(harness.db.prepare(sql), sql, observations)
+    },
+    batch: harness.db.batch.bind(harness.db),
+  }
+  return { env: { DB: db, TENANT_SLUG: 'pot-a' } as unknown as Env, observations }
+}
+
+function seedBulkTasks(
+  harness: SqliteD1Harness,
+  count: number,
+  override: (index: number) => Partial<{
+    projectId: string
+    status: string
+    gateOwner: string | null
+    verdict: 'approved' | 'rejected' | null
+  }> = () => ({}),
+): string[] {
+  const taskIds: string[] = []
+  for (let index = 0; index < count; index += 1) {
+    const id = `task-bulk-${String(index).padStart(3, '0')}`
+    const values = {
+      projectId: 'project-a',
+      status: 'done',
+      gateOwner: null as string | null,
+      verdict: null as 'approved' | 'rejected' | null,
+      ...override(index),
+    }
+    harness.sqlite.prepare(`
+      INSERT INTO tasks (id, squad_id, title, done_when, status, project_id, gate_owner)
+      VALUES (?, 'squad-a', ?, 'verified', ?, ?, ?)
+    `).run(id, `Bulk task ${index}`, values.status, values.projectId, values.gateOwner)
+    if (values.verdict) {
+      harness.sqlite.prepare(`
+        INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at)
+        VALUES (?, ?, ?, 'reviewer', ?)
+      `).run(`verdict-${id}`, id, values.verdict, `2026-07-17T00:${String(index).padStart(2, '0')}:00.000Z`)
+    }
+    taskIds.push(id)
+  }
+  return taskIds
+}
+
+function insertGovernedFlight(harness: SqliteD1Harness, id: string, taskIds: string[]): void {
+  harness.sqlite.exec('DROP TRIGGER validate_flights_project_id_insert')
+  harness.sqlite.prepare(`
+    INSERT INTO flights (id, tenant, agent, goal, status, budget_micro_usd, meta, project_id)
+    VALUES (?, 'pot-a', 'agent-a', 'Bulk governed flight', 'running', 10, ?, 'project-a')
+  `).run(id, JSON.stringify({ ...meta, task_ids: taskIds }))
+}
+
 function wrapFlightInsert<T extends object>(statement: T, sql: string, beforeFlightInsert?: () => void): T {
   if (!beforeFlightInsert || !sql.includes('INSERT INTO flights (')) return statement
   let fired = false
@@ -106,12 +187,16 @@ function dispatchBody(overrides: Record<string, unknown> = {}): Record<string, u
   return { agent: 'agent-a', goal: 'Ship project work', signals, ...overrides }
 }
 
-async function dispatch(harness: SqliteD1Harness, body: Record<string, unknown>): Promise<Response> {
+async function dispatch(
+  harness: SqliteD1Harness,
+  body: Record<string, unknown>,
+  env: Env = envFor(harness),
+): Promise<Response> {
   return flightsApp.request('https://pot.test/', {
     method: 'POST',
     headers: { authorization: 'Bearer admin', 'content-type': 'application/json' },
     body: JSON.stringify(body),
-  }, envFor(harness))
+  }, env)
 }
 
 async function list(harness: SqliteD1Harness, query = '', queries?: string[]): Promise<Response> {
@@ -159,6 +244,22 @@ describe('flight project attribution', () => {
     const row = harness.sqlite.prepare('SELECT project_id, meta FROM flights WHERE id = ?').get(id) as { project_id: string; meta: string }
     expect(row.project_id).toBe('project-a')
     expect(JSON.parse(row.meta)).toEqual(meta)
+  })
+
+  it('dispatches the maximum task set without exceeding the D1 bind budget', async () => {
+    harness = makeHarness()
+    const taskIds = seedBulkTasks(harness, 200)
+    const { env, observations } = envWithBindBudget(harness)
+
+    const response = await dispatch(harness, dispatchBody({
+      project_id: 'project-a',
+      meta: { ...meta, task_ids: taskIds },
+    }), env)
+
+    expect(response.status).toBe(201)
+    const taskReads = observations.filter(({ sql }) => sql.includes('FROM tasks WHERE id IN'))
+    expect(taskReads).toHaveLength(6)
+    expect(Math.max(...taskReads.map(({ count }) => count))).toBeLessThanOrEqual(90)
   })
 
   it('rejects missing and archived projects before insertion', async () => {
@@ -278,6 +379,59 @@ describe('flight project attribution', () => {
     })
     expect(harness.sqlite.prepare(`SELECT status FROM flights WHERE id = 'flight-drift'`).get())
       .toEqual({ status: 'running' })
+  })
+
+  it('reports large project-mismatch sets in input order within the D1 bind budget', async () => {
+    harness = makeHarness()
+    const mismatchIndexes = new Set([5, 150])
+    const taskIds = seedBulkTasks(harness, 200, (index) => (
+      mismatchIndexes.has(index) ? { projectId: 'project-b' } : {}
+    ))
+    insertGovernedFlight(harness, 'flight-bulk-mismatch', taskIds)
+    const { env, observations } = envWithBindBudget(harness)
+
+    const response = await flightsApp.request('https://pot.test/flight-bulk-mismatch/land', {
+      method: 'POST',
+      headers: { authorization: 'Bearer admin', 'content-type': 'application/json' },
+      body: JSON.stringify({ cost_micro_usd: 1 }),
+    }, env)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({
+      error: 'flight_task_project_conflict',
+      task_ids: [taskIds[5], taskIds[150]],
+    })
+    const taskReads = observations.filter(({ sql }) => sql.includes('SELECT id, project_id FROM tasks WHERE id IN'))
+    expect(taskReads).toHaveLength(3)
+    expect(Math.max(...taskReads.map(({ count }) => count))).toBeLessThanOrEqual(90)
+  })
+
+  it('reports large incomplete and gated task sets in input order within the D1 bind budget', async () => {
+    harness = makeHarness()
+    const taskIds = seedBulkTasks(harness, 200, (index) => {
+      if (index === 5) return { status: 'in_progress' }
+      if (index === 150) return { gateOwner: 'gate:bulk', verdict: 'rejected' }
+      return {}
+    })
+    insertGovernedFlight(harness, 'flight-bulk-incomplete', taskIds)
+    const { env, observations } = envWithBindBudget(harness)
+
+    const response = await flightsApp.request('https://pot.test/flight-bulk-incomplete/land', {
+      method: 'POST',
+      headers: { authorization: 'Bearer admin', 'content-type': 'application/json' },
+      body: JSON.stringify({ cost_micro_usd: 1 }),
+    }, env)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({
+      error: 'flight_tasks_incomplete',
+      task_ids: [taskIds[5], taskIds[150]],
+    })
+    const mismatchReads = observations.filter(({ sql }) => sql.includes('SELECT id, project_id FROM tasks WHERE id IN'))
+    const completionReads = observations.filter(({ sql }) => sql.includes('SELECT id, status, gate_owner'))
+    expect(mismatchReads).toHaveLength(3)
+    expect(completionReads).toHaveLength(3)
+    expect(Math.max(...[...mismatchReads, ...completionReads].map(({ count }) => count))).toBeLessThanOrEqual(90)
   })
 
   it('maps an edge revoked after validation but before insert to stable project access denial', async () => {

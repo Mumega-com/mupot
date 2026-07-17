@@ -10,6 +10,8 @@ import { createBus } from '../bus'
 import type { PreflightResult } from './preflight'
 import type { FlightMetaV1 } from './meta'
 
+const D1_TASK_ID_QUERY_CHUNK_SIZE = 90
+
 export type FlightStatus =
   | 'preflight'
   | 'held'
@@ -88,11 +90,15 @@ export async function validateFlightTaskProjectConsistency(
 ): Promise<void> {
   projectId = projectId ?? null
   if (projectId !== null && meta) {
-    const placeholders = meta.task_ids.map((_, index) => `?${index + 1}`).join(',')
-    const rows = await env.DB.prepare(
-      `SELECT id, project_id FROM tasks WHERE id IN (${placeholders})`,
-    ).bind(...meta.task_ids).all<{ id: string; project_id: string | null }>()
-    const tasks = new Map((rows.results ?? []).map((task) => [task.id, task]))
+    const tasks = new Map<string, { id: string; project_id: string | null }>()
+    for (let offset = 0; offset < meta.task_ids.length; offset += D1_TASK_ID_QUERY_CHUNK_SIZE) {
+      const chunk = meta.task_ids.slice(offset, offset + D1_TASK_ID_QUERY_CHUNK_SIZE)
+      const placeholders = chunk.map((_, index) => `?${index + 1}`).join(',')
+      const rows = await env.DB.prepare(
+        `SELECT id, project_id FROM tasks WHERE id IN (${placeholders})`,
+      ).bind(...chunk).all<{ id: string; project_id: string | null }>()
+      for (const task of rows.results ?? []) tasks.set(task.id, task)
+    }
     if (meta.task_ids.some((taskId) => !tasks.has(taskId))) {
       throw new FlightProjectError('flight_task_not_found')
     }
@@ -266,17 +272,21 @@ interface FlightTaskCompletionRow {
 
 export async function listIncompleteFlightTaskIds(env: Env, taskIds: string[]): Promise<string[]> {
   if (taskIds.length === 0) return []
-  const placeholders = taskIds.map(() => '?').join(',')
-  const rows = await env.DB.prepare(
-    `SELECT id, status, gate_owner,
-            (SELECT verdict
-               FROM task_verdicts
-              WHERE task_id = tasks.id
-              ORDER BY decided_at DESC, id DESC
-              LIMIT 1) AS latest_verdict
-       FROM tasks WHERE id IN (${placeholders})`,
-  ).bind(...taskIds).all<FlightTaskCompletionRow>()
-  const byId = new Map((rows.results ?? []).map((task) => [task.id, task]))
+  const byId = new Map<string, FlightTaskCompletionRow>()
+  for (let offset = 0; offset < taskIds.length; offset += D1_TASK_ID_QUERY_CHUNK_SIZE) {
+    const chunk = taskIds.slice(offset, offset + D1_TASK_ID_QUERY_CHUNK_SIZE)
+    const placeholders = chunk.map(() => '?').join(',')
+    const rows = await env.DB.prepare(
+      `SELECT id, status, gate_owner,
+              (SELECT verdict
+                 FROM task_verdicts
+                WHERE task_id = tasks.id
+                ORDER BY decided_at DESC, id DESC
+                LIMIT 1) AS latest_verdict
+         FROM tasks WHERE id IN (${placeholders})`,
+    ).bind(...chunk).all<FlightTaskCompletionRow>()
+    for (const task of rows.results ?? []) byId.set(task.id, task)
+  }
   return taskIds.filter((taskId) => {
     const task = byId.get(taskId)
     return !task || task.status !== 'done' || (task.gate_owner !== null && task.latest_verdict !== 'approved')
@@ -289,11 +299,15 @@ export async function listFlightProjectMismatchTaskIds(
   taskIds: string[],
 ): Promise<string[]> {
   if (projectId === null || taskIds.length === 0) return []
-  const placeholders = taskIds.map(() => '?').join(',')
-  const rows = await env.DB.prepare(
-    `SELECT id, project_id FROM tasks WHERE id IN (${placeholders})`,
-  ).bind(...taskIds).all<{ id: string; project_id: string | null }>()
-  const byId = new Map((rows.results ?? []).map((task) => [task.id, task.project_id]))
+  const byId = new Map<string, string | null>()
+  for (let offset = 0; offset < taskIds.length; offset += D1_TASK_ID_QUERY_CHUNK_SIZE) {
+    const chunk = taskIds.slice(offset, offset + D1_TASK_ID_QUERY_CHUNK_SIZE)
+    const placeholders = chunk.map(() => '?').join(',')
+    const rows = await env.DB.prepare(
+      `SELECT id, project_id FROM tasks WHERE id IN (${placeholders})`,
+    ).bind(...chunk).all<{ id: string; project_id: string | null }>()
+    for (const task of rows.results ?? []) byId.set(task.id, task.project_id)
+  }
   return taskIds.filter((taskId) => byId.has(taskId) && byId.get(taskId) !== projectId)
 }
 
