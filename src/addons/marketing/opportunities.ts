@@ -92,12 +92,11 @@ export function rankMarketingOpportunities(
 ): readonly MarketingOpportunityCandidate[] {
   if (run.status !== 'completed') return Object.freeze([])
   const limitingEvidence = Object.freeze(unavailableEvidence(run))
-  const ranked: MarketingOpportunityCandidate[] = []
   for (let index = 0; index < CANDIDATES.length; index += 1) {
     const definition = CANDIDATES[index]
     const baseline = run.outcomes[definition.primaryKpi]
     if (baseline.status !== 'available') continue
-    ranked.push(Object.freeze({
+    return Object.freeze([Object.freeze({
       rank: index + 1,
       kind: definition.kind,
       target: definition.target,
@@ -106,7 +105,7 @@ export function rankMarketingOpportunities(
       primaryKpi: definition.primaryKpi,
       kpiBaseline: Object.freeze({ ...baseline }),
       limitingEvidence,
-    }))
+    })])
   }
-  return Object.freeze(ranked)
+  return Object.freeze([])
 }

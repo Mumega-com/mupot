@@ -78,6 +78,17 @@ CREATE INDEX IF NOT EXISTS idx_marketing_recommendations_latest
   ON marketing_recommendations (tenant, installation_id, prepared_at DESC, id DESC)
   WHERE status = 'ready';
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_marketing_recommendation_task_dedup
+  ON tasks (json_extract(body, '$.recommendation.dedupKey'))
+  WHERE json_valid(body)
+    AND json_extract(body, '$.schema') = 'mupot.marketing-recommendation/v1';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_marketing_recommendation_flight_dedup
+  ON flights (tenant, json_extract(meta, '$.goal_id'))
+  WHERE agent = 'addon:marketing-cro-monitor'
+    AND json_valid(meta)
+    AND json_extract(meta, '$.schema') = 'mupot.flight.meta/v1';
+
 CREATE TRIGGER IF NOT EXISTS marketing_recommendations_insert_fence
   BEFORE INSERT ON marketing_recommendations
   WHEN NEW.status <> 'preparing'
@@ -156,8 +167,34 @@ CREATE TRIGGER IF NOT EXISTS marketing_recommendations_finalize_fence
          AND flight.tenant = OLD.tenant
          AND flight.status = 'preflight'
          AND json_valid(flight.meta)
-         AND json_extract(flight.meta, '$.terminal_action') = 'recommendation_ready'
-         AND json_extract(flight.meta, '$.executor') IS NULL
+         AND json_type(flight.meta) = 'object'
+         AND json_extract(flight.meta, '$.schema') = 'mupot.flight.meta/v1'
+         AND json_extract(flight.meta, '$.goal_id') = 'marketing-recommendation:' || OLD.id
+         AND json_extract(flight.meta, '$.objective_id') = OLD.kind
+         AND json_extract(flight.meta, '$.confidentiality') = 'internal'
+         AND json_extract(flight.meta, '$.publication_target') = 'none'
+         AND json_type(flight.meta, '$.parent_flight_id') = 'null'
+         AND json_type(flight.meta, '$.squad_ids') = 'array'
+         AND json_type(flight.meta, '$.task_ids') = 'array'
+         AND json_type(flight.meta, '$.done_when') = 'array'
+         AND json_type(flight.meta, '$.artifact_refs') = 'array'
+         AND json_type(flight.meta, '$.receipt_refs') = 'array'
+         AND (SELECT count(*) FROM json_each(flight.meta)) = 11
+         AND (SELECT count(DISTINCT field.key) FROM json_each(flight.meta) AS field) = 11
+         AND NOT EXISTS (
+           SELECT 1 FROM json_each(flight.meta) AS field
+            WHERE field.key NOT IN (
+              'schema', 'goal_id', 'objective_id', 'squad_ids', 'task_ids',
+              'done_when', 'artifact_refs', 'receipt_refs', 'confidentiality',
+              'publication_target', 'parent_flight_id'
+            )
+         )
+         AND (SELECT count(*) FROM json_each(flight.meta, '$.squad_ids')) = 1
+         AND EXISTS (
+           SELECT 1 FROM json_each(flight.meta, '$.squad_ids') AS squad_ref
+            WHERE squad_ref.value = OLD.squad_id
+         )
+         AND (SELECT count(*) FROM json_each(flight.meta, '$.task_ids')) = 1
          AND EXISTS (
            SELECT 1 FROM json_each(flight.meta, '$.task_ids') AS task_ref
             WHERE task_ref.value = NEW.task_id

@@ -1,7 +1,7 @@
 import type { D1Database, D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import type { Env } from '../../types'
 import { createFlight as canonicalCreateFlight } from '../../flight/service'
-import { FLIGHT_META_V1_SCHEMA, type FlightMetaV1 } from '../../flight/meta'
+import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, type FlightMetaV1 } from '../../flight/meta'
 import { createTask as canonicalCreateTask } from '../../tasks/service'
 import type { AddonActor } from '../service'
 import { getRegisteredAddon } from '../registry'
@@ -202,6 +202,22 @@ interface StoredRecommendationRow {
   status: 'ready'
   created_at: string
   prepared_at: string
+}
+
+interface RecommendationPreparationRow {
+  id: string
+  installation_id: string
+  binding_generation_id: string
+  run_id: string
+  program_version: string
+  kind: MarketingOpportunityKind
+  target: string
+  evidence_digest: string
+  dedup_key: string
+  squad_id: string
+  created_by: string
+  created_at: string
+  status: 'preparing'
 }
 
 export interface MarketingMonitorSourceFactoryContext {
@@ -1339,9 +1355,15 @@ async function resolveOwnedWebOperationsSquad(
 function recommendationTaskBody(
   run: MarketingMonitorRun,
   candidate: MarketingOpportunityCandidate,
+  recommendationId: string,
+  dedupKey: string,
 ): string {
   return trustedJsonStringify({
     schema: 'mupot.marketing-recommendation/v1',
+    recommendation: {
+      id: recommendationId,
+      dedupKey,
+    },
     target: candidate.target,
     problem: candidate.problem,
     hypothesis: candidate.hypothesis,
@@ -1359,9 +1381,95 @@ function recommendationTaskBody(
       requiredCapability: 'owner',
       selfApproval: false,
     },
-    terminalAction: 'recommendation_ready',
-    executor: null,
   })
+}
+
+async function loadRecommendationPreparation(
+  captured: CapturedDatabase,
+  installationId: string,
+  dedupKey: string,
+): Promise<RecommendationPreparationRow | null> {
+  return captured.db.prepare(`
+    SELECT id, installation_id, binding_generation_id, run_id, program_version,
+           kind, target, evidence_digest, dedup_key, squad_id, created_by, created_at, status
+      FROM marketing_recommendations
+     WHERE tenant = ?1 AND installation_id = ?2 AND dedup_key = ?3 AND status = 'preparing'
+     LIMIT 1
+  `).bind(captured.tenant, installationId, dedupKey).first<RecommendationPreparationRow>()
+}
+
+function validRecommendationPreparation(
+  row: RecommendationPreparationRow,
+  context: LiveContext,
+  run: MarketingMonitorRun,
+  candidate: MarketingOpportunityCandidate,
+  dedupKey: string,
+  squadId: string,
+): boolean {
+  return row.installation_id === context.installation.id
+    && row.binding_generation_id === context.generation.id
+    && row.run_id === run.id
+    && row.program_version === run.programVersion
+    && row.kind === candidate.kind
+    && row.target === candidate.target
+    && row.evidence_digest === run.evidenceDigest
+    && row.dedup_key === dedupKey
+    && row.squad_id === squadId
+    && row.status === 'preparing'
+    && canonicalTimestamp(row.created_at)
+}
+
+async function loadPreparedRecommendationTask(
+  captured: CapturedDatabase,
+  squadId: string,
+  title: string,
+  body: string,
+  doneWhen: string,
+): Promise<{ id: string } | null> {
+  return captured.db.prepare(`
+    SELECT id
+      FROM tasks
+     WHERE squad_id = ?1
+       AND title = ?2
+       AND body = ?3
+       AND done_when = ?4
+       AND status = 'review'
+       AND gate_owner = ?5
+     LIMIT 1
+  `).bind(
+    squadId,
+    title,
+    body,
+    doneWhen,
+    MARKETING_RECOMMENDATION_GATE_OWNER,
+  ).first<{ id: string }>()
+}
+
+async function loadPreparedRecommendationFlight(
+  captured: CapturedDatabase,
+  goalId: string,
+  expectedMeta: FlightMetaV1,
+): Promise<string | null> {
+  const row = await captured.db.prepare(`
+    SELECT id, meta
+      FROM flights
+     WHERE tenant = ?1
+       AND agent = 'addon:marketing-cro-monitor'
+       AND status = 'preflight'
+       AND json_valid(meta)
+       AND json_extract(meta, '$.schema') = ?2
+       AND json_extract(meta, '$.goal_id') = ?3
+     LIMIT 1
+  `).bind(captured.tenant, FLIGHT_META_V1_SCHEMA, goalId).first<{ id: string; meta: string }>()
+  if (!row) return null
+  try {
+    const parsed = parseFlightMetaV1(jsonParseIntrinsic(row.meta))
+    return parsed && trustedJsonStringify(parsed) === trustedJsonStringify(expectedMeta)
+      ? row.id
+      : null
+  } catch {
+    return null
+  }
 }
 
 export async function prepareMarketingRecommendation(
@@ -1420,8 +1528,8 @@ export async function prepareMarketingRecommendation(
     window: run.window,
     kind: candidate.kind,
   })
-  const recommendationId = randomUUIDIntrinsic()
-  const createdAt = nowIso()
+  let recommendationId = randomUUIDIntrinsic()
+  let createdAt = nowIso()
   let claimed: D1Result<unknown>
   try {
     claimed = await captured.db.prepare(`
@@ -1466,9 +1574,18 @@ export async function prepareMarketingRecommendation(
   if (!resultsWritten(claimed)) {
     try {
       const existing = await loadReadyRecommendationByDedup(captured, context.installation.id, dedupKey)
-      return existing
-        ? { ok: true, idempotent: true, recommendation: existing }
-        : { ok: false, reason: 'recommendation_busy' }
+      if (existing) return { ok: true, idempotent: true, recommendation: existing }
+      const preparation = await loadRecommendationPreparation(captured, context.installation.id, dedupKey)
+      if (!preparation || !validRecommendationPreparation(
+        preparation,
+        context,
+        run,
+        candidate,
+        dedupKey,
+        squadId,
+      )) return { ok: false, reason: 'fence_lost' }
+      recommendationId = preparation.id
+      createdAt = preparation.created_at
     } catch {
       return { ok: false, reason: 'write_failed' }
     }
@@ -1477,40 +1594,46 @@ export async function prepareMarketingRecommendation(
   const doCreateTask = deps.createTask ?? canonicalCreateTask
   const doCreateFlight = deps.createFlight ?? canonicalCreateFlight
   const doneWhen = 'An owner approves or rejects the recommendation; no external change is executed'
+  const taskTitle = `Review CRO recommendation: ${candidate.primaryKpi}`
+  const taskBody = recommendationTaskBody(run, candidate, recommendationId, dedupKey)
   try {
-    const task = await doCreateTask(
+    const existingTask = await loadPreparedRecommendationTask(
+      captured,
+      squadId,
+      taskTitle,
+      taskBody,
+      doneWhen,
+    )
+    const task = existingTask ?? await doCreateTask(
       env,
       {
         squad_id: squadId,
-        title: `Review CRO recommendation: ${candidate.primaryKpi}`,
-        body: recommendationTaskBody(run, candidate),
+        title: taskTitle,
+        body: taskBody,
         done_when: doneWhen,
         status: 'review',
         gate_owner: MARKETING_RECOMMENDATION_GATE_OWNER,
       },
       { actor: { kind: 'member', id: actor.id }, skipMirror: true },
     )
-    const flightMeta: FlightMetaV1 & {
-      terminal_action: 'recommendation_ready'
-      executor: null
-    } = {
+    const goalId = `marketing-recommendation:${recommendationId}`
+    const flightMeta: FlightMetaV1 = {
       schema: FLIGHT_META_V1_SCHEMA,
-      goal_id: `marketing-recommendation:${recommendationId}`,
+      goal_id: goalId,
       objective_id: candidate.kind,
       squad_ids: [squadId],
       task_ids: [task.id],
       done_when: [doneWhen],
-      artifact_refs: [`marketing-recommendation:${recommendationId}`],
+      artifact_refs: [goalId],
       receipt_refs: [`marketing-monitor-evidence:${run.evidenceDigest}`],
       confidentiality: 'internal',
       publication_target: 'none',
       parent_flight_id: null,
-      terminal_action: 'recommendation_ready',
-      executor: null,
     }
-    const flightId = await doCreateFlight(env, {
+    const existingFlightId = await loadPreparedRecommendationFlight(captured, goalId, flightMeta)
+    const flightId = existingFlightId ?? await doCreateFlight(env, {
       agent: 'addon:marketing-cro-monitor',
-      goal: `Prepare ${candidate.kind} for owner review; terminal action recommendation_ready`,
+      goal: `Prepare ${candidate.kind} for owner review`,
       trigger_source: 'event',
       budget_micro_usd: 0,
       meta: flightMeta,
@@ -1556,7 +1679,12 @@ export async function prepareMarketingRecommendation(
       context.installation.id,
       dedupKey,
     ).run()
-    if (!resultsWritten(finalized)) return { ok: false, reason: 'fence_lost' }
+    if (!resultsWritten(finalized)) {
+      const existing = await loadReadyRecommendationByDedup(captured, context.installation.id, dedupKey)
+      return existing
+        ? { ok: true, idempotent: true, recommendation: existing }
+        : { ok: false, reason: 'fence_lost' }
+    }
     const recommendation = await loadReadyRecommendationByDedup(
       captured,
       context.installation.id,

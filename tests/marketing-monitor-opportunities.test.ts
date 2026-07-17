@@ -6,6 +6,9 @@ import {
   type MarketingMonitorSourceFactory,
 } from '../src/addons/marketing/service'
 import { rankMarketingOpportunities } from '../src/addons/marketing/opportunities'
+import { createFlight, type NewFlight } from '../src/flight/service'
+import { parseFlightMetaV1 } from '../src/flight/meta'
+import { createTask, type CreateTaskInput, type CreateTaskOptions } from '../src/tasks/service'
 import {
   activateAddon,
   archiveAddon,
@@ -120,7 +123,7 @@ describe('marketing monitor opportunities', () => {
 
     expect(first).toEqual(second)
     expect(first.length).toBeGreaterThan(0)
-    expect(first.length).toBeLessThanOrEqual(5)
+    expect(first.length).toBeLessThanOrEqual(1)
     expect(first[0]).toMatchObject({
       kind: 'conversion_review',
       target: 'resource:web-ops/conversion-funnel',
@@ -143,6 +146,83 @@ describe('marketing monitor opportunities', () => {
         id: first.ok ? first.recommendation.id : '',
       }),
     }))
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM marketing_recommendations').get())
+      .toEqual({ count: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM tasks').get())
+      .toEqual({ count: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM flights').get())
+      .toEqual({ count: 1 })
+  })
+
+  it('recovers a task persisted before task creation reports failure', async () => {
+    const run = await createActiveRun(env)
+    let attempts = 0
+    const createTaskThenFail = async (
+      taskEnv: Env,
+      input: CreateTaskInput,
+      options?: CreateTaskOptions,
+    ) => {
+      attempts += 1
+      const task = await createTask(taskEnv, input, options)
+      throw new Error(`task creation interrupted after ${task.id}`)
+    }
+
+    expect(await prepareMarketingRecommendation(env, owner, run.id, {
+      createTask: createTaskThenFail,
+    })).toEqual({ ok: false, reason: 'write_failed' })
+    const retried = await prepareMarketingRecommendation(env, owner, run.id)
+
+    expect(attempts).toBe(1)
+    expect(retried).toEqual(expect.objectContaining({ ok: true }))
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM marketing_recommendations').get())
+      .toEqual({ count: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM tasks').get())
+      .toEqual({ count: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM flights').get())
+      .toEqual({ count: 1 })
+  })
+
+  it('recovers a flight persisted before flight creation reports failure', async () => {
+    const run = await createActiveRun(env)
+    let attempts = 0
+    const createFlightThenFail = async (flightEnv: Env, input: NewFlight) => {
+      attempts += 1
+      const flightId = await createFlight(flightEnv, input)
+      throw new Error(`flight creation interrupted after ${flightId}`)
+    }
+
+    expect(await prepareMarketingRecommendation(env, owner, run.id, {
+      createFlight: createFlightThenFail,
+    })).toEqual({ ok: false, reason: 'write_failed' })
+    const retried = await prepareMarketingRecommendation(env, owner, run.id)
+
+    expect(attempts).toBe(1)
+    expect(retried).toEqual(expect.objectContaining({ ok: true }))
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM marketing_recommendations').get())
+      .toEqual({ count: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM tasks').get())
+      .toEqual({ count: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM flights').get())
+      .toEqual({ count: 1 })
+  })
+
+  it('recovers existing task and flight after finalization fails', async () => {
+    const run = await createActiveRun(env)
+    const createFlightThenLoseFence = async (flightEnv: Env, input: NewFlight) => {
+      const flightId = await createFlight(flightEnv, input)
+      expect(await disableAddon(env, owner, 'marketing-cro-monitor'))
+        .toEqual(expect.objectContaining({ ok: true }))
+      return flightId
+    }
+
+    expect(await prepareMarketingRecommendation(env, owner, run.id, {
+      createFlight: createFlightThenLoseFence,
+    })).toEqual({ ok: false, reason: 'write_failed' })
+    expect(await activateAddon(env, owner, 'marketing-cro-monitor'))
+      .toEqual(expect.objectContaining({ ok: true }))
+    const retried = await prepareMarketingRecommendation(env, owner, run.id)
+
+    expect(retried).toEqual(expect.objectContaining({ ok: true }))
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM marketing_recommendations').get())
       .toEqual({ count: 1 })
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS count FROM tasks').get())
@@ -242,11 +322,24 @@ describe('marketing monitor opportunities', () => {
     }
     expect(flight.id).toBe(recommendation.flight_id)
     expect(flight.status).toBe('preflight')
-    expect(JSON.parse(flight.meta)).toMatchObject({
-      terminal_action: 'recommendation_ready',
-      executor: null,
-      task_ids: [recommendation.task_id],
-    })
+    const flightMeta = JSON.parse(flight.meta)
+    expect(parseFlightMetaV1(flightMeta)).toEqual(flightMeta)
+    expect(Object.keys(flightMeta).sort()).toEqual([
+      'artifact_refs',
+      'confidentiality',
+      'done_when',
+      'goal_id',
+      'objective_id',
+      'parent_flight_id',
+      'publication_target',
+      'receipt_refs',
+      'schema',
+      'squad_ids',
+      'task_ids',
+    ])
+    expect(flightMeta.task_ids).toEqual([recommendation.task_id])
+    expect(flightMeta).not.toHaveProperty('terminal_action')
+    expect(flightMeta).not.toHaveProperty('executor')
   })
 
   it('surfaces governed work through safe task and flight references without rendering raw IDs', async () => {
