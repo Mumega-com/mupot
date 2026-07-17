@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   MARKETING_MONITOR_PROGRAM_VERSION,
@@ -66,6 +67,72 @@ function insertPosthogConnector(harness: SqliteD1Harness): string {
       '{}', 'pot', NULL, 'owner-1', '2026-07-16T00:00:00.000Z', NULL)
   `).run(id)
   return id
+}
+
+function liveReadScope(harness: SqliteD1Harness): {
+  installationId: string
+  generationId: string
+  bindingCount: number
+} {
+  const row = harness.sqlite.prepare(`
+    SELECT installation.id AS installation_id, generation.id AS generation_id,
+           generation.binding_count
+      FROM addon_installations AS installation
+      JOIN addon_binding_generations AS generation
+        ON generation.installation_id = installation.id
+       AND generation.tenant = installation.tenant
+       AND generation.revoked_at IS NULL
+     WHERE installation.tenant = 'tenant-a'
+       AND installation.addon_key = 'marketing-cro-monitor'
+       AND installation.state <> 'archived'
+  `).get() as { installation_id: string; generation_id: string; binding_count: number } | undefined
+  if (!row) throw new Error('live marketing read scope not found')
+  return {
+    installationId: row.installation_id,
+    generationId: row.generation_id,
+    bindingCount: row.binding_count,
+  }
+}
+
+function envWithEvidenceInterleave(
+  harness: SqliteD1Harness,
+  beforeEvidenceQuery: () => Promise<void>,
+): Env {
+  let interleaved = false
+  const wrap = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => new Proxy(statement, {
+    get(target, property) {
+      if (property === 'bind') {
+        return (...values: unknown[]) => wrap(target.bind(...values), sql)
+      }
+      if (property === 'first') {
+        return async (columnName?: string) => {
+          if (!interleaved && sql.includes('FROM marketing_monitor_runs AS run')) {
+            interleaved = true
+            await beforeEvidenceQuery()
+          }
+          return target.first(columnName)
+        }
+      }
+      if (property === 'all') {
+        return async () => {
+          if (!interleaved && sql.includes('FROM marketing_monitor_runs AS run')) {
+            interleaved = true
+            await beforeEvidenceQuery()
+          }
+          return target.all()
+        }
+      }
+      const value = Reflect.get(target, property, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+  const db = {
+    prepare(sql: string) {
+      return wrap(harness.db.prepare(sql), sql)
+    },
+    batch: harness.db.batch.bind(harness.db),
+  } as unknown as D1Database
+  return { DB: db, TENANT_SLUG: 'tenant-a' } as Env
 }
 
 function fixtureFactory(
@@ -297,6 +364,7 @@ describe('marketing monitor service', () => {
 
     const latest = await getLatestMarketingMonitorRun(env, owner)
     const listed = await listMarketingMonitorRuns(env, owner, { limit: 1 })
+    const scope = liveReadScope(harness)
     expect(latest).toEqual(expect.objectContaining({
       ok: true,
       run: expect.objectContaining({ id: created.ok ? created.run.id : '' }),
@@ -306,7 +374,15 @@ describe('marketing monitor service', () => {
       runs: [expect.objectContaining({ id: created.ok ? created.run.id : '' })],
     }))
     const serialized = JSON.stringify({ latest, listed })
-    for (const forbidden of ['connectorId', 'connector_id', 'configuredBy', 'actorId', 'rawPayload', 'building']) {
+    for (const forbidden of [
+      'connectorId',
+      'connector_id',
+      'configuredBy',
+      'actorId',
+      'rawPayload',
+      'building',
+      scope.generationId,
+    ]) {
       expect(serialized).not.toContain(forbidden)
     }
   })
@@ -329,15 +405,16 @@ describe('marketing monitor service', () => {
     expect(generations).toHaveLength(2)
     expect(generations[0].revoked_at).toEqual(expect.any(String))
     expect(generations[1].revoked_at).toBeNull()
-    expect(await getLatestMarketingMonitorRun(env, owner, { installationId: installation.id }))
+    const newScope = liveReadScope(harness)
+    expect(await getLatestMarketingMonitorRun(env, owner, newScope))
       .toEqual({ ok: true, run: null })
-    expect(await listMarketingMonitorRuns(env, owner, { limit: 10, installationId: installation.id }))
+    expect(await listMarketingMonitorRuns(env, owner, { limit: 10, ...newScope }))
       .toEqual({ ok: true, runs: [] })
 
     expect(await activateAddon(env, owner, 'marketing-cro-monitor')).toEqual(expect.objectContaining({ ok: true }))
     const newRun = await runMarketingMonitor(env, owner, { window: nextWindow }, { sourceFactory: fixtureFactory() })
     expect(newRun.ok).toBe(true)
-    expect(await listMarketingMonitorRuns(env, owner, { limit: 10, installationId: installation.id }))
+    expect(await listMarketingMonitorRuns(env, owner, { limit: 10, ...newScope }))
       .toEqual({
         ok: true,
         runs: [expect.objectContaining({ id: newRun.ok ? newRun.run.id : '' })],
@@ -353,18 +430,79 @@ describe('marketing monitor service', () => {
 
     const newInstallation = await activateMarketing(env)
     expect(newInstallation.id).not.toBe(oldInstallation.id)
-    expect(await getLatestMarketingMonitorRun(env, owner, { installationId: newInstallation.id }))
+    const newScope = liveReadScope(harness)
+    expect(await getLatestMarketingMonitorRun(env, owner, newScope))
       .toEqual({ ok: true, run: null })
-    expect(await listMarketingMonitorRuns(env, owner, { limit: 10, installationId: newInstallation.id }))
+    expect(await listMarketingMonitorRuns(env, owner, { limit: 10, ...newScope }))
       .toEqual({ ok: true, runs: [] })
 
     const newRun = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
     expect(newRun.ok).toBe(true)
-    expect(await getLatestMarketingMonitorRun(env, owner, { installationId: newInstallation.id }))
+    expect(await getLatestMarketingMonitorRun(env, owner, newScope))
       .toEqual({
         ok: true,
         run: expect.objectContaining({ id: newRun.ok ? newRun.run.id : '' }),
       })
+  })
+
+  it('fences a scoped read when reconfiguration occurs immediately before evidence SQL executes', async () => {
+    await activateMarketing(env)
+    const oldRun = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(oldRun.ok).toBe(true)
+    const oldScope = liveReadScope(harness)
+    const racedEnv = envWithEvidenceInterleave(harness, async () => {
+      expect(await disableAddon(env, owner, 'marketing-cro-monitor'))
+        .toEqual(expect.objectContaining({ ok: true }))
+      const connectorId = insertPosthogConnector(harness)
+      expect(await configureAddon(env, owner, 'marketing-cro-monitor', {
+        bindings: [{ slot: 'web_analytics', adapter: 'posthog', bindingKind: 'vault_connector', connectorId }],
+      })).toEqual(expect.objectContaining({ ok: true }))
+    })
+
+    expect(await getLatestMarketingMonitorRun(racedEnv, owner, oldScope))
+      .toEqual({ ok: true, run: null })
+    expect(liveReadScope(harness).generationId).not.toBe(oldScope.generationId)
+  })
+
+  it('fences an unscoped read when reinstall occurs after context resolution but before evidence SQL', async () => {
+    const oldInstallation = await activateMarketing(env)
+    const oldRun = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(oldRun.ok).toBe(true)
+    const racedEnv = envWithEvidenceInterleave(harness, async () => {
+      expect(await disableAddon(env, owner, 'marketing-cro-monitor'))
+        .toEqual(expect.objectContaining({ ok: true }))
+      expect(await archiveAddon(env, owner, 'marketing-cro-monitor'))
+        .toEqual(expect.objectContaining({ ok: true }))
+      const replacement = await activateMarketing(env)
+      expect(replacement.id).not.toBe(oldInstallation.id)
+    })
+
+    expect(await listMarketingMonitorRuns(racedEnv, owner, { limit: 10 }))
+      .toEqual({ ok: true, runs: [] })
+  })
+
+  it('requires the scoped binding count to match the live generation at evidence query time', async () => {
+    await activateMarketing(env)
+    const created = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(created.ok).toBe(true)
+    const scope = liveReadScope(harness)
+
+    expect(await getLatestMarketingMonitorRun(env, owner, { ...scope, bindingCount: scope.bindingCount + 1 }))
+      .toEqual({ ok: true, run: null })
+  })
+
+  it('requires an unscoped read to recount live bindings in the evidence statement', async () => {
+    await activateMarketing(env)
+    const created = await runMarketingMonitor(env, owner, { window }, { sourceFactory: fixtureFactory() })
+    expect(created.ok).toBe(true)
+    harness.sqlite.prepare(`
+      UPDATE addon_connector_bindings
+         SET revoked_at = '2999-01-01T00:00:00.000Z'
+       WHERE generation_id = ?
+    `).run(liveReadScope(harness).generationId)
+
+    expect(await getLatestMarketingMonitorRun(env, owner)).toEqual({ ok: true, run: null })
+    expect(await listMarketingMonitorRuns(env, owner, { limit: 10 })).toEqual({ ok: true, runs: [] })
   })
 
   it('computes the canonical versioned evidence digest over ordered public evidence', async () => {

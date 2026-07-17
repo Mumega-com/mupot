@@ -1,6 +1,6 @@
 import { html } from 'hono/html'
-import type { AddonBinding } from '../addons/bindings'
-import { listAddonBindings } from '../addons/bindings'
+import type { AddonBinding, AddonBindingGeneration } from '../addons/bindings'
+import { listAddonBindings, loadLiveAddonBindingGeneration } from '../addons/bindings'
 import {
   getLatestMarketingMonitorRun,
   listMarketingMonitorRuns,
@@ -74,8 +74,41 @@ export interface MarketingCroMonitorView {
 
 export interface MarketingCroMonitorViewDeps {
   listBindings?: typeof listAddonBindings
+  loadBindingGeneration?: typeof loadLiveAddonBindingGeneration
   getLatestRun?: typeof getLatestMarketingMonitorRun
   listRuns?: typeof listMarketingMonitorRuns
+}
+
+function bindingSnapshotMatches(
+  installation: AddonInstallation,
+  generation: AddonBindingGeneration,
+  bindings: readonly AddonBinding[],
+): boolean {
+  return generation.tenant === installation.tenant
+    && generation.installationId === installation.id
+    && generation.manifestSha256 === installation.manifestSha256
+    && generation.revokedAt === null
+    && generation.bindingCount === bindings.length
+    && bindings.every((binding) => (
+      binding.tenant === installation.tenant
+      && binding.installationId === installation.id
+      && binding.generationId === generation.id
+      && binding.manifestSha256 === installation.manifestSha256
+      && binding.revokedAt === null
+    ))
+}
+
+function unavailableView(installationState: AddonState): MarketingCroMonitorView {
+  return {
+    installationState,
+    monitorState: 'unavailable',
+    outcomes: null,
+    sourceHealth: null,
+    recentRuns: null,
+    latestEvidenceDigest: null,
+    latestCompletedAt: null,
+    opportunity: opportunityFor('unavailable', null),
+  }
 }
 
 function sourceDetail(status: SourceStatus, observationCount: number, reason?: string): string {
@@ -173,33 +206,58 @@ export async function loadMarketingCroMonitorView(
   deps: MarketingCroMonitorViewDeps = {},
 ): Promise<MarketingCroMonitorView> {
   const readBindings = deps.listBindings ?? listAddonBindings
+  const readGeneration = deps.loadBindingGeneration ?? loadLiveAddonBindingGeneration
   const readLatest = deps.getLatestRun ?? getLatestMarketingMonitorRun
   const readRuns = deps.listRuns ?? listMarketingMonitorRuns
-  const [bindingsResult, latestResult, runsResult] = await Promise.allSettled([
-    readBindings(env, installation.id),
-    readLatest(env, actor, { installationId: installation.id }),
-    readRuns(env, actor, { limit: RUN_LIST_LIMIT, installationId: installation.id }),
-  ])
+  let bindings: AddonBinding[]
+  let generation: AddonBindingGeneration | null
+  try {
+    bindings = await readBindings(env, installation.id)
+    generation = await readGeneration(env, installation.id)
+  } catch {
+    return unavailableView(installation.state)
+  }
+  if (!generation) {
+    if (bindings.length > 0) return unavailableView(installation.state)
+    return {
+      installationState: installation.state,
+      monitorState: 'empty',
+      outcomes: null,
+      sourceHealth: healthFromBindings([], null),
+      recentRuns: [],
+      latestEvidenceDigest: null,
+      latestCompletedAt: null,
+      opportunity: opportunityFor('empty', null),
+    }
+  }
+  if (!bindingSnapshotMatches(installation, generation, bindings)) {
+    return unavailableView(installation.state)
+  }
 
-  const latestRead = latestResult.status === 'fulfilled' && latestResult.value.ok
-    ? latestResult.value
-    : null
-  const latest = latestRead?.run ?? null
-  const monitorState: MarketingCroMonitorView['monitorState'] = latestResult.status !== 'fulfilled'
+  const scope = {
+    installationId: installation.id,
+    generationId: generation.id,
+    bindingCount: generation.bindingCount,
+  }
+  const [latestResult, runsResult] = await Promise.allSettled([
+    readLatest(env, actor, scope),
+    readRuns(env, actor, { limit: RUN_LIST_LIMIT, ...scope }),
+  ])
+  if (
+    latestResult.status !== 'fulfilled'
     || !latestResult.value.ok
     || runsResult.status !== 'fulfilled'
     || !runsResult.value.ok
-    ? 'unavailable'
-    : latest
-      ? 'ready'
-      : 'empty'
-  const outcomes = monitorState === 'ready' && latest ? latest.outcomes : null
-  const recentRuns = runsResult.status === 'fulfilled' && runsResult.value.ok
-    ? runsResult.value.runs.map(runView)
-    : null
-  const sourceHealth = bindingsResult.status === 'fulfilled'
-    ? healthFromBindings(bindingsResult.value, latest)
-    : null
+  ) return unavailableView(installation.state)
+
+  const latest = latestResult.value.run
+  const runs = runsResult.value.runs
+  const readsAgree = latest === null ? runs.length === 0 : runs[0]?.id === latest.id
+  if (!readsAgree) return unavailableView(installation.state)
+  const monitorState: MarketingCroMonitorView['monitorState'] = latest ? 'ready' : 'empty'
+  const outcomes = latest?.outcomes ?? null
+  const recentRuns = runs.map(runView)
+  const sourceHealth = healthFromBindings(bindings, latest)
 
   return {
     installationState: installation.state,

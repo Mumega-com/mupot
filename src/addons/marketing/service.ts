@@ -189,9 +189,17 @@ export type ListMarketingMonitorRunsResult =
   | { readonly ok: true; readonly runs: readonly MarketingMonitorRun[] }
   | { readonly ok: false; readonly reason: MarketingMonitorFailureReason }
 
-export interface MarketingMonitorReadScopeInput {
-  readonly installationId?: string
-}
+export type MarketingMonitorReadScopeInput =
+  | {
+      readonly installationId?: undefined
+      readonly generationId?: undefined
+      readonly bindingCount?: undefined
+    }
+  | {
+      readonly installationId: string
+      readonly generationId: string
+      readonly bindingCount: number
+    }
 
 interface CapturedDatabase {
   readonly db: D1Database
@@ -875,38 +883,22 @@ export async function runMarketingMonitor(
 interface MarketingMonitorReadScope {
   readonly installationId: string
   readonly generationId: string
+  readonly bindingCount: number
 }
 
-async function loadMarketingMonitorReadScope(
-  captured: CapturedDatabase,
-  requestedInstallationId?: string,
-): Promise<
-  | { readonly ok: true; readonly scope: MarketingMonitorReadScope | null }
-  | { readonly ok: false; readonly reason: MarketingMonitorFailureReason }
-> {
-  const installation = await captured.db.prepare(`
-    SELECT id, tenant, addon_key, installed_version, publisher, trust_class,
-           mupot_compatibility, manifest_sha256, state
-      FROM addon_installations
-     WHERE tenant = ?1 AND addon_key = ?2 AND state <> 'archived'
-     LIMIT 1
-  `).bind(captured.tenant, MARKETING_ADDON_KEY).first<InstallationRow>()
-  if (!installation) return { ok: true, scope: null }
-  if (requestedInstallationId !== undefined && requestedInstallationId !== installation.id) {
-    return { ok: true, scope: null }
+function normalizedReadScope(input: MarketingMonitorReadScopeInput): MarketingMonitorReadScope | null | undefined {
+  const hasInstallation = typeof input.installationId === 'string'
+  const hasGeneration = typeof input.generationId === 'string'
+  const hasBindingCount = typeof input.bindingCount === 'number'
+    && numberIsIntegerIntrinsic(input.bindingCount)
+    && input.bindingCount >= 0
+  if (!hasInstallation && !hasGeneration && input.bindingCount === undefined) return null
+  if (!hasInstallation || !hasGeneration || !hasBindingCount) return undefined
+  return {
+    installationId: input.installationId,
+    generationId: input.generationId,
+    bindingCount: input.bindingCount,
   }
-  if (!exactRegisteredIdentity(installation)) return { ok: false, reason: 'addon_identity_mismatch' }
-
-  const generation = await captured.db.prepare(`
-    SELECT id, binding_count
-      FROM addon_binding_generations
-     WHERE tenant = ?1 AND installation_id = ?2
-       AND manifest_sha256 = ?3 AND revoked_at IS NULL
-     LIMIT 1
-  `).bind(captured.tenant, installation.id, installation.manifest_sha256).first<GenerationRow>()
-  return generation
-    ? { ok: true, scope: { installationId: installation.id, generationId: generation.id } }
-    : { ok: true, scope: null }
 }
 
 function readIdentityWhere(): string {
@@ -916,11 +908,45 @@ function readIdentityWhere(): string {
     run.tenant = ?1 AND run.addon_key = ?2 AND run.installed_version = ?3
     AND run.publisher = ?4 AND run.trust_class = ?5 AND run.mupot_compatibility = ?6
     AND run.manifest_sha256 = ?7 AND run.program_version = ?8 AND run.status = 'completed'
-    AND run.installation_id = ?9 AND run.binding_generation_id = ?10
+    AND EXISTS (
+      SELECT 1
+        FROM addon_installations AS installation
+        JOIN addon_binding_generations AS generation
+          ON generation.tenant = installation.tenant
+         AND generation.installation_id = installation.id
+         AND generation.id = run.binding_generation_id
+         AND generation.manifest_sha256 = installation.manifest_sha256
+         AND generation.revoked_at IS NULL
+       WHERE installation.tenant = run.tenant
+         AND installation.id = run.installation_id
+         AND installation.addon_key = ?2
+         AND installation.installed_version = ?3
+         AND installation.publisher = ?4
+         AND installation.trust_class = ?5
+         AND installation.mupot_compatibility = ?6
+         AND installation.manifest_sha256 = ?7
+         AND installation.state <> 'archived'
+         AND generation.binding_count = (
+           SELECT COUNT(*)
+             FROM addon_connector_bindings AS binding
+            WHERE binding.tenant = generation.tenant
+              AND binding.installation_id = generation.installation_id
+              AND binding.generation_id = generation.id
+              AND binding.manifest_sha256 = generation.manifest_sha256
+              AND binding.revoked_at IS NULL
+         )
+         AND (
+           ?9 IS NULL OR (
+             installation.id = ?9
+             AND generation.id = ?10
+             AND generation.binding_count = ?11
+           )
+         )
+    )
   `
 }
 
-function readIdentityBindings(captured: CapturedDatabase, scope: MarketingMonitorReadScope): unknown[] {
+function readIdentityBindings(captured: CapturedDatabase, scope: MarketingMonitorReadScope | null): unknown[] {
   const entry = getRegisteredAddon(MARKETING_ADDON_KEY)
   if (!entry) return []
   return [
@@ -932,8 +958,9 @@ function readIdentityBindings(captured: CapturedDatabase, scope: MarketingMonito
     entry.manifest.mupotCompatibility,
     entry.manifestSha256,
     MARKETING_MONITOR_PROGRAM_VERSION,
-    scope.installationId,
-    scope.generationId,
+    scope?.installationId ?? null,
+    scope?.generationId ?? null,
+    scope?.bindingCount ?? null,
   ]
 }
 
@@ -946,11 +973,10 @@ export async function getLatestMarketingMonitorRun(
   const captured = captureDatabase(env)
   if (!captured) return { ok: false, reason: 'write_failed' }
   try {
-    const scoped = await loadMarketingMonitorReadScope(captured, input.installationId)
-    if (!scoped.ok) return scoped
-    if (!scoped.scope) return { ok: true, run: null }
+    const scope = normalizedReadScope(input)
+    if (scope === undefined) return { ok: true, run: null }
     const row = await captured.db.prepare(runSelect(readIdentityWhere(), 'LIMIT 1'))
-      .bind(...readIdentityBindings(captured, scoped.scope)).first<StoredRunRow>()
+      .bind(...readIdentityBindings(captured, scope)).first<StoredRunRow>()
     if (!row) return { ok: true, run: null }
     const run = await parseStoredRun(row)
     return run ? { ok: true, run } : { ok: false, reason: 'stored_run_invalid' }
@@ -962,7 +988,7 @@ export async function getLatestMarketingMonitorRun(
 export async function listMarketingMonitorRuns(
   env: Env,
   actor: AddonActor,
-  input: { readonly limit: number; readonly installationId?: string },
+  input: { readonly limit: number } & MarketingMonitorReadScopeInput,
 ): Promise<ListMarketingMonitorRunsResult> {
   if (!isAdminPlus(actor)) return { ok: false, reason: 'not_authorized' }
   if (!numberIsIntegerIntrinsic(input.limit) || input.limit < 1 || input.limit > MAX_MARKETING_MONITOR_RUN_LIST) {
@@ -971,11 +997,10 @@ export async function listMarketingMonitorRuns(
   const captured = captureDatabase(env)
   if (!captured) return { ok: false, reason: 'write_failed' }
   try {
-    const scoped = await loadMarketingMonitorReadScope(captured, input.installationId)
-    if (!scoped.ok) return scoped
-    if (!scoped.scope) return { ok: true, runs: [] }
-    const result = await captured.db.prepare(runSelect(readIdentityWhere(), 'LIMIT ?11'))
-      .bind(...readIdentityBindings(captured, scoped.scope), input.limit).all<StoredRunRow>()
+    const scope = normalizedReadScope(input)
+    if (scope === undefined) return { ok: true, runs: [] }
+    const result = await captured.db.prepare(runSelect(readIdentityWhere(), 'LIMIT ?12'))
+      .bind(...readIdentityBindings(captured, scope), input.limit).all<StoredRunRow>()
     const runs: MarketingMonitorRun[] = []
     const rows = result.results ?? []
     for (let index = 0; index < rows.length; index += 1) {

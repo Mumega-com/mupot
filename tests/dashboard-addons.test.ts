@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { html } from 'hono/html'
 import { addonsBody } from '../src/dashboard/addons'
-import { dashboardApp } from '../src/dashboard/index'
+import { dashboardApp, dashboardBuiltInGetRoutes } from '../src/dashboard/index'
 import { getRegisteredAddon, registerAddon, type AddonCatalogEntry } from '../src/addons/registry'
 import { registerAddonConsoleRenderer } from '../src/addons/console-registry'
 import type { AddonInstallation, AddonState } from '../src/addons/service'
@@ -40,11 +40,35 @@ function installation(state: AddonState): AddonInstallation {
 }
 
 function rendered(state: AddonState | null = null): string {
-  return String(addonsBody([fixtureEntry], state ? [installation(state)] : []))
+  return String(addonsBody(
+    [fixtureEntry],
+    state ? [installation(state)] : [],
+    dashboardBuiltInGetRoutes,
+  ))
 }
 
 function renderedEntry(entry: AddonCatalogEntry, installations: AddonInstallation[] = []): string {
-  return String(addonsBody([entry], installations))
+  return String(addonsBody([entry], installations, dashboardBuiltInGetRoutes))
+}
+
+function consoleEntry(key: string, path: string): AddonCatalogEntry {
+  const rendererKey = `${key}-renderer`
+  registerAddonConsoleRenderer({
+    key: rendererKey,
+    path,
+    title: `${key} console`,
+    navIcon: 'beaker',
+    render: async () => html`<p>${key} renderer</p>`,
+  })
+  return {
+    manifest: {
+      ...FixtureAddon,
+      key,
+      name: key,
+      consoleSections: [{ rendererKey, path, title: `${key} console`, navIcon: 'beaker' }],
+    },
+    manifestSha256: key.padEnd(64, '0').slice(0, 64),
+  }
 }
 
 function lifecycleScript(markup: string): string {
@@ -217,7 +241,28 @@ describe('addonsBody', () => {
     expect(String(addonsBody(
       [fixtureEntry, collisionEntry],
       [fixtureInstallation, collisionInstallation],
+      dashboardBuiltInGetRoutes,
     ))).not.toContain('href="/departments/fixture"')
+  })
+
+  it.each([
+    ['exact built-in path', '/departments/growth'],
+    ['concrete parameterized match', '/agents/foo'],
+    ['literal parameterized pattern', '/agents/:id'],
+  ])('does not advertise a console that collides with an %s', (_label, path) => {
+    const entry = consoleEntry(`catalog-collision-${path.replaceAll(/[^a-z]/g, '-')}`, path)
+    const live = {
+      ...installation('configured'),
+      addonKey: entry.manifest.key,
+      installedVersion: entry.manifest.version,
+      publisher: entry.manifest.publisher,
+      manifestSha256: entry.manifestSha256,
+      mupotCompatibility: entry.manifest.mupotCompatibility,
+    }
+
+    const body = String(addonsBody([entry], [live], dashboardBuiltInGetRoutes))
+    expect(body).not.toContain(`href="${path}"`)
+    expect(body).not.toContain('Open console')
   })
 
   it.each([
@@ -495,6 +540,23 @@ describe('registered addon console paths', () => {
         navIcon: 'beaker',
       }],
     })
+    const registeredCollision = getRegisteredAddon('growth-collision-addon')
+    if (!registeredCollision) throw new Error('growth collision addon not registered')
+    const collisionInstallation = {
+      ...installation('configured'),
+      addonKey: registeredCollision.manifest.key,
+      installedVersion: registeredCollision.manifest.version,
+      publisher: registeredCollision.manifest.publisher,
+      manifestSha256: registeredCollision.manifestSha256,
+      mupotCompatibility: registeredCollision.manifest.mupotCompatibility,
+    }
+
+    const catalogResponse = await dashboardApp.fetch(
+      addonsRequest(),
+      dashboardEnv('owner', [collisionInstallation]),
+    )
+    expect(catalogResponse.status).toBe(200)
+    expect(await catalogResponse.text()).not.toContain('href="/departments/growth"')
 
     const response = await dashboardApp.fetch(
       new Request('https://pot.test/departments/growth', {
@@ -507,6 +569,52 @@ describe('registered addon console paths', () => {
     expect(response.status).toBe(200)
     expect(body).toContain('Marketing &amp; Sales')
     expect(body).not.toContain('Must not shadow growth')
+  })
+
+  it('rejects an addon path consumed by an earlier parameterized dashboard route', async () => {
+    registerAddonConsoleRenderer({
+      key: 'agent-param-collision-renderer',
+      path: '/agents/foo',
+      title: 'Agent collision',
+      navIcon: 'beaker',
+      render: async () => html`<p>Must not shadow agent</p>`,
+    })
+    await registerAddon({
+      ...FixtureAddon,
+      key: 'agent-param-collision-addon',
+      name: 'Agent Param Collision',
+      consoleSections: [{
+        rendererKey: 'agent-param-collision-renderer',
+        path: '/agents/foo',
+        title: 'Agent collision',
+        navIcon: 'beaker',
+      }],
+    })
+    const registeredCollision = getRegisteredAddon('agent-param-collision-addon')
+    if (!registeredCollision) throw new Error('agent collision addon not registered')
+    const collisionInstallation = {
+      ...installation('configured'),
+      addonKey: registeredCollision.manifest.key,
+      installedVersion: registeredCollision.manifest.version,
+      publisher: registeredCollision.manifest.publisher,
+      manifestSha256: registeredCollision.manifestSha256,
+      mupotCompatibility: registeredCollision.manifest.mupotCompatibility,
+    }
+
+    const catalogResponse = await dashboardApp.fetch(
+      addonsRequest(),
+      dashboardEnv('owner', [collisionInstallation]),
+    )
+    expect(catalogResponse.status).toBe(200)
+    expect(await catalogResponse.text()).not.toContain('href="/agents/foo"')
+
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/agents/foo', {
+        headers: { Cookie: 'mupot_session=session-1' },
+      }),
+      dashboardEnv('owner', [collisionInstallation]),
+    )
+    expect(await response.text()).not.toContain('Must not shadow agent')
   })
 
   it('fails closed when multiple manifests claim the same generic console path', async () => {

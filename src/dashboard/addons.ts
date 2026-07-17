@@ -1,4 +1,5 @@
 import { html } from 'hono/html'
+import { LinearRouter } from 'hono/router/linear-router'
 import { getAddonConsoleRenderer, type AddonConsoleRenderer } from '../addons/console-registry'
 import type { AddonCatalogEntry } from '../addons/registry'
 import type { AddonInstallation, AddonState } from '../addons/service'
@@ -22,6 +23,15 @@ export interface ResolvedAddonConsolePath {
   renderer: AddonConsoleRenderer
 }
 
+export interface DashboardRoutePattern {
+  readonly method: string
+  readonly path: string
+}
+
+export interface AddonConsoleResolver {
+  resolve(path: string): ResolvedAddonConsolePath | null
+}
+
 function matchingRenderer(section: AddonConsoleSection): AddonConsoleRenderer | null {
   const renderer = getAddonConsoleRenderer(section.rendererKey)
   return renderer
@@ -33,20 +43,29 @@ function matchingRenderer(section: AddonConsoleSection): AddonConsoleRenderer | 
     : null
 }
 
-export function resolveAddonConsolePath(
+export function createAddonConsoleResolver(
   entries: readonly AddonCatalogEntry[],
-  path: string,
-): ResolvedAddonConsolePath | null {
-  let resolved: ResolvedAddonConsolePath | null = null
-  for (const entry of entries) {
-    for (const section of entry.manifest.consoleSections) {
-      if (section.path !== path) continue
-      const renderer = matchingRenderer(section)
-      if (!renderer || resolved) return null
-      resolved = { entry, section, renderer }
+  builtInRoutes: readonly DashboardRoutePattern[],
+): AddonConsoleResolver {
+  const builtInRouter = new LinearRouter<true>()
+  for (const route of builtInRoutes) {
+    if (route.method === 'GET') builtInRouter.add('GET', route.path, true)
+  }
+  return {
+    resolve(path) {
+      if (builtInRouter.match('GET', path)[0].length > 0) return null
+      let resolved: ResolvedAddonConsolePath | null = null
+      for (const entry of entries) {
+        for (const section of entry.manifest.consoleSections) {
+          if (section.path !== path) continue
+          const renderer = matchingRenderer(section)
+          if (!renderer || resolved) return null
+          resolved = { entry, section, renderer }
+        }
+      }
+      return resolved
     }
   }
-  return resolved
 }
 
 export function installedAddonIdentityMatches(
@@ -120,8 +139,13 @@ function requestedSummary(entry: AddonCatalogEntry): string {
   return `${connectors} connector request${connectors === 1 ? '' : 's'}; ${authority} authority requested`
 }
 
-export function addonsBody(entries: AddonCatalogEntry[], installations: AddonInstallation[]) {
+export function addonsBody(
+  entries: AddonCatalogEntry[],
+  installations: AddonInstallation[],
+  builtInRoutes: readonly DashboardRoutePattern[],
+) {
   const installationsByKey = latestInstallationByKey(installations)
+  const consoleResolver = createAddonConsoleResolver(entries, builtInRoutes)
   const cards = entries.map((entry) => {
     const installation = installationsByKey.get(entry.manifest.key)
     const state: ConsoleState = installation?.state ?? 'available'
@@ -130,7 +154,7 @@ export function addonsBody(entries: AddonCatalogEntry[], installations: AddonIns
     const receiptsHref = `/api/addons/${encodeURIComponent(entry.manifest.key)}/receipts`
     const consoleSections = installedAddonIdentityMatches(entry, installation)
       ? entry.manifest.consoleSections.filter((section) => {
-          const resolved = resolveAddonConsolePath(entries, section.path)
+          const resolved = consoleResolver.resolve(section.path)
           return resolved?.entry === entry
         })
       : []

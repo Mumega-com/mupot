@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { AddonBinding } from '../src/addons/bindings'
+import type { AddonBinding, AddonBindingGeneration } from '../src/addons/bindings'
 import type { MarketingMonitorRun } from '../src/addons/marketing/types'
 import type { AddonInstallation } from '../src/addons/service'
 import {
@@ -41,10 +41,25 @@ const binding: AddonBinding = {
   bindingKind: 'internal_adapter',
   capability: 'read',
   connectorId: 'connector-secret',
-  manifestSha256: 'b'.repeat(64),
+  manifestSha256: installation.manifestSha256,
   configuredBy: 'operator-secret',
   configuredAt: '2026-07-01T00:01:00.000Z',
   revokedAt: null,
+}
+
+const generation: AddonBindingGeneration = {
+  id: binding.generationId,
+  tenant: installation.tenant,
+  installationId: installation.id,
+  configurationSha256: 'configuration-secret',
+  bindingCount: 1,
+  manifestSha256: installation.manifestSha256,
+  configuredBy: 'operator-secret',
+  configuredAt: binding.configuredAt,
+  revokedAt: null,
+  previousGenerationId: null,
+  expectedInstallationState: 'configured',
+  baseReceiptId: 'generation-receipt-secret',
 }
 
 const run: MarketingMonitorRun = {
@@ -93,6 +108,7 @@ const actor = { id: 'owner-1', role: 'owner' as const }
 async function loadedView() {
   return loadMarketingCroMonitorView(env, installation, actor, {
     listBindings: async () => [binding],
+    loadBindingGeneration: async () => generation,
     getLatestRun: async () => ({ ok: true, run }),
     listRuns: async () => ({ ok: true, runs: [run] }),
   })
@@ -118,9 +134,113 @@ describe('marketing CRO monitor dashboard', () => {
       'source-key-secret',
       'observation-secret',
       'receipt-secret',
+      'configuration-secret',
+      'generation-receipt-secret',
     ]) {
       expect(serialized).not.toContain(forbidden)
     }
+  })
+
+  it('passes the exact validated installation, generation, and binding count to both evidence reads', async () => {
+    const calls: string[] = []
+    const scopes: unknown[] = []
+    const view = await loadMarketingCroMonitorView(env, installation, actor, {
+      listBindings: async () => {
+        calls.push('bindings')
+        return [binding]
+      },
+      loadBindingGeneration: async () => {
+        calls.push('generation')
+        return generation
+      },
+      getLatestRun: async (_env, _actor, scope) => {
+        calls.push('latest')
+        scopes.push(scope)
+        return { ok: true, run }
+      },
+      listRuns: async (_env, _actor, input) => {
+        calls.push('list')
+        scopes.push(input)
+        return { ok: true, runs: [run] }
+      },
+    })
+
+    expect(calls.slice(0, 2)).toEqual(['bindings', 'generation'])
+    expect(calls.slice(2).sort()).toEqual(['latest', 'list'])
+    expect(scopes).toEqual(expect.arrayContaining([
+      {
+        installationId: installation.id,
+        generationId: generation.id,
+        bindingCount: 1,
+      },
+      {
+        limit: 10,
+        installationId: installation.id,
+        generationId: generation.id,
+        bindingCount: 1,
+      },
+    ]))
+    expect(view.monitorState).toBe('ready')
+    expect(JSON.stringify(view)).not.toContain(generation.id)
+  })
+
+  it('fails unavailable when reconfiguration changes generation between binding and identity reads', async () => {
+    let evidenceCalls = 0
+    const view = await loadMarketingCroMonitorView(env, installation, actor, {
+      listBindings: async () => [binding],
+      loadBindingGeneration: async () => ({
+        ...generation,
+        id: 'new-generation',
+        previousGenerationId: generation.id,
+      }),
+      getLatestRun: async () => {
+        evidenceCalls += 1
+        return { ok: true, run }
+      },
+      listRuns: async () => {
+        evidenceCalls += 1
+        return { ok: true, runs: [run] }
+      },
+    })
+
+    expect(evidenceCalls).toBe(0)
+    expect(view.monitorState).toBe('unavailable')
+    expect(view.outcomes).toBeNull()
+    expect(view.recentRuns).toBeNull()
+  })
+
+  it('fails unavailable when reinstall removes the binding generation before evidence reads', async () => {
+    let evidenceCalls = 0
+    const view = await loadMarketingCroMonitorView(env, installation, actor, {
+      listBindings: async () => [binding],
+      loadBindingGeneration: async () => null,
+      getLatestRun: async () => {
+        evidenceCalls += 1
+        return { ok: true, run }
+      },
+      listRuns: async () => {
+        evidenceCalls += 1
+        return { ok: true, runs: [run] }
+      },
+    })
+
+    expect(evidenceCalls).toBe(0)
+    expect(view.monitorState).toBe('unavailable')
+    expect(view.sourceHealth).toBeNull()
+  })
+
+  it('fails unavailable instead of combining latest and list results split by a lifecycle change', async () => {
+    const view = await loadMarketingCroMonitorView(env, installation, actor, {
+      listBindings: async () => [binding],
+      loadBindingGeneration: async () => generation,
+      getLatestRun: async () => ({ ok: true, run }),
+      listRuns: async () => ({ ok: true, runs: [] }),
+    })
+
+    expect(view.monitorState).toBe('unavailable')
+    expect(view.outcomes).toBeNull()
+    expect(view.recentRuns).toBeNull()
+    expect(view.sourceHealth).toBeNull()
   })
 
   it('renders outcomes, source health, runs, and unavailable revenue honestly', async () => {
@@ -150,6 +270,7 @@ describe('marketing CRO monitor dashboard', () => {
   it('preserves unavailable reads instead of converting them to empty or zero values', async () => {
     const view = await loadMarketingCroMonitorView(env, installation, actor, {
       listBindings: async () => { throw new Error('bindings offline') },
+      loadBindingGeneration: async () => { throw new Error('generation offline') },
       getLatestRun: async () => ({ ok: false, reason: 'write_failed' }),
       listRuns: async () => ({ ok: false, reason: 'write_failed' }),
     })
