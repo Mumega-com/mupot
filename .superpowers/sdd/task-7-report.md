@@ -90,3 +90,75 @@ interrupted after claiming a dedup key but before finalizing task/flight links,
 later calls return `recommendation_busy` instead of risking duplicate work.
 Automated reconciliation of a stale `preparing` claim is intentionally deferred
 because the canonical task and flight services allocate their own identifiers.
+
+---
+
+## Review Fix: Recoverable Preparation and Canonical Flights
+
+Review-fix implementation commit:
+`00046f3c6aecb6af53a9f54fe729893568d73154`
+
+### RED Evidence
+
+Command:
+
+```text
+npx vitest run tests/marketing-monitor-opportunities.test.ts --maxWorkers=1 --reporter=dot
+```
+
+RED: 1 test file failed; 5 tests failed and 6 passed. The failures proved:
+
+- ranking returned four candidates instead of at most one;
+- retries after post-persistence task creation failure, post-persistence flight
+  creation failure, and recommendation finalization failure returned
+  `recommendation_busy` instead of recovering the evidence window; and
+- `parseFlightMetaV1()` rejected the created flight metadata because it carried
+  the noncanonical `terminal_action` and `executor` keys.
+
+### Delivered
+
+- Added a recommendation ID and dedup key to the canonical task body, plus a
+  unique expression index, so retries recover the one task even when task
+  creation reports failure after persistence.
+- Added a tenant-scoped unique flight `goal_id` index and canonical metadata
+  recovery, so retries reuse the one flight after flight creation or
+  finalization interruption.
+- Reused the original preparation claim ID and timestamp on retry and made a
+  raced finalization return the existing ready recommendation idempotently.
+- Removed terminal action and executor fields from flight metadata. The
+  terminal action remains in the recommendation row and receipt, while tests
+  prove the flight parses as exact `FlightMetaV1` and no executor is called.
+- Changed deterministic opportunity ranking to return either an empty array or
+  one candidate.
+
+### Commands and Results
+
+```text
+npx vitest run tests/marketing-monitor-opportunities.test.ts tests/flight-service.test.ts tests/tasks-service.test.ts --maxWorkers=1 --reporter=dot
+```
+
+GREEN: 3 test files passed; 29 tests passed.
+
+```text
+npx vitest run tests/marketing-monitor-service.test.ts tests/dashboard-marketing-cro-monitor.test.ts tests/marketing-monitor-opportunities.test.ts --maxWorkers=1 --reporter=dot
+```
+
+GREEN: 3 test files passed; 71 tests passed.
+
+```text
+npm run typecheck
+```
+
+Passed: `tsc --noEmit` exited successfully.
+
+```text
+git diff --check
+git diff --cached --check
+```
+
+Passed with no whitespace errors.
+
+### Concerns
+
+No blocking concerns. The Vitest runs emit Node's existing experimental SQLite
+warning; all requested tests pass.
