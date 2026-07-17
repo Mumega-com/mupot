@@ -585,6 +585,7 @@ export const ROUTES = {
   org: '/api/org',
   agents: '/api/agents',
   tasks: '/api/tasks',
+  projects: '/api/projects',
   bus: '/api/bus',
   members: '/api/members',
   mcp: '/mcp',
