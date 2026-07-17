@@ -501,6 +501,56 @@ export async function resolveConnectorWithMeta(
   }
 }
 
+export interface ImmediateConnectorUse {
+  readonly id: string
+  readonly type: ConnectorType
+  readonly meta: string | null
+  readonly secret: string
+}
+
+/**
+ * Resolve one active connector by exact tenant-local ID and use its plaintext only
+ * inside the supplied callback. This is the vault boundary for addon adapters: it
+ * does not perform scope fallback and never returns connector material itself.
+ */
+export async function useConnectorById<T>(
+  env: Env,
+  connectorId: string,
+  type: ConnectorType,
+  use: (connector: ImmediateConnectorUse) => T | Promise<T>,
+): Promise<T | null> {
+  if (!connectorId || !isConnectorType(type) || typeof use !== 'function') return null
+  const masterKey = env.CONNECTOR_MASTER_KEY
+  if (!masterKey) return null
+
+  const row = await env.DB.prepare(
+    `SELECT id, type, encrypted_secret, meta
+       FROM connectors
+      WHERE id = ?1
+        AND tenant = ?2
+        AND type = ?3
+        AND revoked_at IS NULL
+      LIMIT 1`,
+  )
+    .bind(connectorId, env.TENANT_SLUG, type)
+    .first<{ id: string; type: ConnectorType; encrypted_secret: string; meta: string | null }>()
+
+  if (!row || row.id !== connectorId || row.type !== type) return null
+
+  let secret: string
+  try {
+    secret = await decryptConnectorSecret(masterKey, row.id, row.type, row.encrypted_secret)
+  } catch {
+    return null
+  }
+
+  try {
+    return await use({ id: row.id, type: row.type, meta: row.meta, secret })
+  } finally {
+    secret = ''
+  }
+}
+
 // ── Telegram helpers ─────────────────────────────────────────────────────────
 
 /**
