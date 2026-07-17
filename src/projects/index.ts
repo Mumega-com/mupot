@@ -6,8 +6,6 @@ import { hasCapability, resolveCapabilities } from '../auth/capability'
 import {
   createProject,
   getProject,
-  listProjectSquads,
-  listProjects,
   removeProjectSquadAccess,
   updateProject,
   upsertProjectSquadAccess,
@@ -15,9 +13,15 @@ import {
 import type { CreateProjectInput, ProjectMutationError, UpdateProjectInput } from './service'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
-type VisibleProject = Project & { parent_context?: true }
+type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
+type ContextProject = ParentContext & { parent_context: true }
+type ProjectReadAccess = { workspace_admin: boolean; org_read: boolean; squad_ids: string[]; department_ids: string[] }
+type Page = { limit: number; offset: number }
 
 const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'completed', 'archived']
+const DEFAULT_PAGE_SIZE = 100
+const MAX_PAGE_SIZE = 100
+const MAX_PAGE_OFFSET = 10_000
 
 function isProjectStatus(value: unknown): value is ProjectStatus {
   return typeof value === 'string' && (PROJECT_STATUSES as readonly string[]).includes(value)
@@ -29,6 +33,26 @@ function inTenantScope(auth: AuthContext, env: Env): boolean {
 
 function legacyWorkspaceAdmin(auth: AuthContext): boolean {
   return auth.role === 'owner' || auth.role === 'admin'
+}
+
+function safeParent(project: Project): ParentContext {
+  return {
+    id: project.id,
+    slug: project.slug,
+    name: project.name,
+    status: project.status,
+    parent_project_id: project.parent_project_id,
+  }
+}
+
+function parsePage(limitInput: string | undefined, cursorInput: string | undefined): Page | null {
+  if (limitInput !== undefined && !/^(0|[1-9]\d*)$/.test(limitInput)) return null
+  if (cursorInput !== undefined && !/^(0|[1-9]\d*)$/.test(cursorInput)) return null
+  const limit = limitInput === undefined ? DEFAULT_PAGE_SIZE : Number(limitInput)
+  const offset = cursorInput === undefined ? 0 : Number(cursorInput)
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE_SIZE) return null
+  if (!Number.isInteger(offset) || offset < 0 || offset > MAX_PAGE_OFFSET) return null
+  return { limit, offset }
 }
 
 async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> {
@@ -46,35 +70,73 @@ async function grantsFor(env: Env, auth: AuthContext): Promise<CapabilityGrant[]
   return auth.capabilities ?? resolveCapabilities(env, memberId)
 }
 
-async function isWorkspaceAdmin(env: Env, auth: AuthContext): Promise<boolean> {
-  if (legacyWorkspaceAdmin(auth)) return true
-  return hasCapability(await grantsFor(env, auth), 'org', null, 'admin')
-}
-
-async function visibleProjectIds(env: Env, auth: AuthContext): Promise<Set<string> | null> {
-  if (legacyWorkspaceAdmin(auth)) return null
-  if (!await memberIdFor(env, auth)) return new Set()
+async function projectReadAccess(env: Env, auth: AuthContext): Promise<ProjectReadAccess> {
+  if (legacyWorkspaceAdmin(auth)) {
+    return { workspace_admin: true, org_read: true, squad_ids: [], department_ids: [] }
+  }
 
   const grants = await grantsFor(env, auth)
-  const edges = await env.DB.prepare(
-    `SELECT psa.project_id, psa.squad_id, s.department_id
-       FROM project_squad_access psa
-       JOIN squads s ON s.id = psa.squad_id`,
-  ).all<{ project_id: string; squad_id: string; department_id: string | null }>()
-  const visible = new Set<string>()
-  for (const edge of edges.results ?? []) {
-    if (hasCapability(grants, 'squad', edge.squad_id, 'observer', edge.department_id)) {
-      visible.add(edge.project_id)
-    }
+  if (hasCapability(grants, 'org', null, 'admin')) {
+    return { workspace_admin: true, org_read: true, squad_ids: [], department_ids: [] }
   }
-  return visible
+
+  const squadIds = new Set<string>()
+  const departmentIds = new Set<string>()
+  for (const grant of grants) {
+    if (!hasCapability([grant], grant.scope_type, grant.scope_id, 'observer')) continue
+    if (grant.scope_type === 'squad' && grant.scope_id) squadIds.add(grant.scope_id)
+    if (grant.scope_type === 'department' && grant.scope_id) departmentIds.add(grant.scope_id)
+  }
+  return {
+    workspace_admin: false,
+    org_read: hasCapability(grants, 'org', null, 'observer'),
+    squad_ids: [...squadIds],
+    department_ids: [...departmentIds],
+  }
 }
 
-async function readableProject(env: Env, auth: AuthContext, id: string): Promise<Project | null> {
-  const project = await getProject(env, id)
-  if (!project) return null
-  const visible = await visibleProjectIds(env, auth)
-  return visible === null || visible.has(id) ? project : null
+function edgePredicate(access: ProjectReadAccess): { sql: string; binds: string[] } {
+  if (access.org_read) return { sql: '1 = 1', binds: [] }
+  const conditions: string[] = []
+  const binds: string[] = []
+  if (access.squad_ids.length) {
+    conditions.push(`s.id IN (${access.squad_ids.map(() => '?').join(', ')})`)
+    binds.push(...access.squad_ids)
+  }
+  if (access.department_ids.length) {
+    conditions.push(`s.department_id IN (${access.department_ids.map(() => '?').join(', ')})`)
+    binds.push(...access.department_ids)
+  }
+  return { sql: conditions.length ? conditions.join(' OR ') : '0 = 1', binds }
+}
+
+function projectVisibilityClause(access: ProjectReadAccess): { sql: string; binds: string[] } {
+  if (access.workspace_admin) return { sql: '1 = 1', binds: [] }
+  const edge = edgePredicate(access)
+  return {
+    sql: `EXISTS (
+      SELECT 1
+        FROM project_squad_access psa
+        JOIN squads s ON s.id = psa.squad_id
+       WHERE psa.project_id = p.id
+         AND (${edge.sql})
+    )`,
+    binds: edge.binds,
+  }
+}
+
+async function readableProject(
+  env: Env,
+  id: string,
+  access: ProjectReadAccess,
+): Promise<Project | null> {
+  const visibility = projectVisibilityClause(access)
+  return env.DB.prepare(
+    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date, p.created_at, p.updated_at
+       FROM projects p
+      WHERE p.id = ?
+        AND ${visibility.sql}`,
+  ).bind(id, ...visibility.binds).first<Project>()
 }
 
 function mutationStatus(error: ProjectMutationError): 400 | 404 | 409 {
@@ -94,8 +156,14 @@ async function jsonObject(c: { req: { json: () => Promise<unknown> } }): Promise
 
 export const projectsApp = new Hono<AppEnv>()
 
-projectsApp.get('/health', (c) => c.json({ ok: true, component: 'projects', tenant: c.env.TENANT_SLUG }))
 projectsApp.use('*', csrf())
+projectsApp.use('*', async (c, next) => {
+  if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(c.req.method)) {
+    const origin = c.req.header('origin')
+    if (origin && origin !== new URL(c.req.url).origin) return c.json({ error: 'forbidden', reason: 'csrf' }, 403)
+  }
+  await next()
+})
 projectsApp.use('*', requireAuth)
 projectsApp.use('*', async (c, next) => {
   if (!inTenantScope(c.get('auth'), c.env)) {
@@ -104,38 +172,58 @@ projectsApp.use('*', async (c, next) => {
   await next()
 })
 
+projectsApp.get('/health', (c) => c.json({ ok: true, component: 'projects', tenant: c.env.TENANT_SLUG }))
+
 projectsApp.get('/', async (c) => {
   const rawStatus = c.req.query('status')
   const parentId = c.req.query('parent_id')
+  const page = parsePage(c.req.query('limit'), c.req.query('cursor'))
   if (rawStatus !== undefined && !isProjectStatus(rawStatus)) return c.json({ error: 'invalid_status' }, 400)
   if (parentId !== undefined && !parentId.trim()) return c.json({ error: 'invalid_parent_id' }, 400)
+  if (!page) return c.json({ error: 'invalid_pagination' }, 400)
 
-  const options: { status?: ProjectStatus; parent_project_id?: string } = {}
-  if (rawStatus !== undefined) options.status = rawStatus
-  if (parentId !== undefined) options.parent_project_id = parentId
-  const projects = await listProjects(c.env, options)
-  const visible = await visibleProjectIds(c.env, c.get('auth'))
-  if (visible === null) return c.json({ projects })
-
-  const readable = projects.filter((project) => visible.has(project.id))
-  const included = new Set(readable.map((project) => project.id))
-  const parents = new Map<string, Project>()
-  for (const project of readable) {
-    if (!project.parent_project_id || included.has(project.parent_project_id)) continue
-    const parent = await getProject(c.env, project.parent_project_id)
-    if (parent) parents.set(parent.id, parent)
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  const visibility = projectVisibilityClause(access)
+  const clauses = [visibility.sql]
+  const binds: string[] = [...visibility.binds]
+  if (rawStatus !== undefined) {
+    clauses.push('p.status = ?')
+    binds.push(rawStatus)
   }
-  const rows: VisibleProject[] = [...readable, ...[...parents.values()].map((project) => ({ ...project, parent_context: true }))]
-  rows.sort((a, b) => {
-    if (a.parent_project_id === null && b.parent_project_id !== null) return -1
-    if (a.parent_project_id !== null && b.parent_project_id === null) return 1
-    return a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id)
+  if (parentId !== undefined) {
+    clauses.push('p.parent_project_id = ?')
+    binds.push(parentId)
+  }
+  const result = await c.env.DB.prepare(
+    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date, p.created_at, p.updated_at
+       FROM projects p
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
+      LIMIT ? OFFSET ?`,
+  ).bind(...binds, page.limit + 1, page.offset).all<Project>()
+  const resultRows = result.results ?? []
+  const projects = resultRows.slice(0, page.limit)
+  const ids = new Set(projects.map((project) => project.id))
+  const parentIds = [...new Set(projects.map((project) => project.parent_project_id).filter((id): id is string => id !== null && !ids.has(id)))]
+  let parentContexts: ContextProject[] = []
+  if (parentIds.length) {
+    const parents = await c.env.DB.prepare(
+      `SELECT id, slug, name, status, parent_project_id
+         FROM projects
+        WHERE id IN (${parentIds.map(() => '?').join(', ')})
+        ORDER BY created_at, id`,
+    ).bind(...parentIds).all<ParentContext>()
+    parentContexts = (parents.results ?? []).map((parent) => ({ ...parent, parent_context: true }))
+  }
+  return c.json({
+    projects: [...parentContexts, ...projects],
+    next_cursor: resultRows.length > page.limit ? String(page.offset + page.limit) : null,
   })
-  return c.json({ projects: rows })
 })
 
 projectsApp.post('/', async (c) => {
-  if (!await isWorkspaceAdmin(c.env, c.get('auth'))) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  if (!access.workspace_admin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const body = await jsonObject(c)
   if (!body) return c.json({ error: 'invalid_json' }, 400)
   const result = await createProject(c.env, body as CreateProjectInput)
@@ -144,7 +232,8 @@ projectsApp.post('/', async (c) => {
 })
 
 projectsApp.get('/:id', async (c) => {
-  const project = await readableProject(c.env, c.get('auth'), c.req.param('id'))
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  const project = await readableProject(c.env, c.req.param('id'), access)
   if (!project) return c.json({ error: 'project_not_found' }, 404)
   const [tasks, squads, flights] = await Promise.all([
     c.env.DB.prepare('SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?').bind(project.id).first<{ count: number }>(),
@@ -159,12 +248,13 @@ projectsApp.get('/:id', async (c) => {
       direct_squads: Number(squads?.count ?? 0),
       direct_flights: Number(flights?.count ?? 0),
     },
-    ...(parent ? { parent } : {}),
+    ...(parent ? { parent: safeParent(parent) } : {}),
   })
 })
 
 projectsApp.patch('/:id', async (c) => {
-  if (!await isWorkspaceAdmin(c.env, c.get('auth'))) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  if (!access.workspace_admin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const body = await jsonObject(c)
   if (!body) return c.json({ error: 'invalid_json' }, 400)
   const result = await updateProject(c.env, c.req.param('id'), body as UpdateProjectInput)
@@ -173,13 +263,31 @@ projectsApp.patch('/:id', async (c) => {
 })
 
 projectsApp.get('/:id/squads', async (c) => {
-  const project = await readableProject(c.env, c.get('auth'), c.req.param('id'))
+  const page = parsePage(c.req.query('limit'), c.req.query('cursor'))
+  if (!page) return c.json({ error: 'invalid_pagination' }, 400)
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  const project = await readableProject(c.env, c.req.param('id'), access)
   if (!project) return c.json({ error: 'project_not_found' }, 404)
-  return c.json({ squads: await listProjectSquads(c.env, project.id) })
+  const edge = edgePredicate(access)
+  const result = await c.env.DB.prepare(
+    `SELECT psa.project_id, psa.squad_id, psa.access_level, psa.granted_at
+       FROM project_squad_access psa
+       JOIN squads s ON s.id = psa.squad_id
+      WHERE psa.project_id = ?
+        AND (${access.workspace_admin ? '1 = 1' : edge.sql})
+      ORDER BY psa.squad_id
+      LIMIT ? OFFSET ?`,
+  ).bind(project.id, ...(access.workspace_admin ? [] : edge.binds), page.limit + 1, page.offset).all()
+  const squads = result.results ?? []
+  return c.json({
+    squads: squads.slice(0, page.limit),
+    next_cursor: squads.length > page.limit ? String(page.offset + page.limit) : null,
+  })
 })
 
 projectsApp.put('/:id/squads/:squadId', async (c) => {
-  if (!await isWorkspaceAdmin(c.env, c.get('auth'))) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  if (!access.workspace_admin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const body = await jsonObject(c)
   if (!body) return c.json({ error: 'invalid_json' }, 400)
   const result = await upsertProjectSquadAccess(c.env, c.req.param('id'), c.req.param('squadId'), body.access_level)
@@ -188,7 +296,8 @@ projectsApp.put('/:id/squads/:squadId', async (c) => {
 })
 
 projectsApp.delete('/:id/squads/:squadId', async (c) => {
-  if (!await isWorkspaceAdmin(c.env, c.get('auth'))) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  if (!access.workspace_admin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const projectId = c.req.param('id')
   const squadId = c.req.param('squadId')
   if (!await getProject(c.env, projectId)) return c.json({ error: 'project_not_found' }, 404)

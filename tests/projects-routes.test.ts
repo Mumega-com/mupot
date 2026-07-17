@@ -50,11 +50,11 @@ function actor(overrides: Partial<AuthContext> = {}): AuthContext {
   }
 }
 
-function request(path: string, method = 'GET', body?: unknown): Request {
+function request(path: string, method = 'GET', body?: unknown, origin = 'https://pot.test'): Request {
   return new Request(`https://pot.test${path}`, {
     method,
     headers: {
-      ...(method === 'GET' ? {} : { Origin: 'https://pot.test' }),
+      ...(method === 'GET' ? {} : { Origin: origin }),
       ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -93,11 +93,23 @@ describe('projectsApp', () => {
   it('rejects unauthenticated and cross-tenant requests before project access', async () => {
     harness = makeHarness()
     expect((await fetch(harness, '/')).status).toBe(401)
+    expect((await fetch(harness, '/health')).status).toBe(401)
 
     as(actor({ tenant: 'other-pot', role: 'owner' }))
     const response = await fetch(harness, '/')
     expect(response.status).toBe(403)
     await expect(response.json()).resolves.toEqual({ error: 'forbidden', reason: 'tenant_scope' })
+    expect((await fetch(harness, '/health')).status).toBe(403)
+  })
+
+  it('rejects cross-origin project mutations', async () => {
+    harness = makeHarness()
+    as(actor({ role: 'owner' }))
+    const response = await projectsApp.fetch(
+      request('/', 'POST', { slug: 'blocked-origin', name: 'Blocked origin' }, 'https://attacker.test'),
+      envFor(harness),
+    )
+    expect(response.status).toBe(403)
   })
 
   it('lets an owner list, create, update, and administer explicit squad edges', async () => {
@@ -128,6 +140,9 @@ describe('projectsApp', () => {
     const listed = await list.json() as { projects: Array<{ id: string; parent_context?: boolean }> }
     expect(listed.projects.map((project) => project.id)).toEqual(['parent', 'visible-child'])
     expect(listed.projects.find((project) => project.id === 'parent')).toMatchObject({ parent_context: true })
+    expect(listed.projects.find((project) => project.id === 'parent')).not.toHaveProperty('description')
+    expect(listed.projects.find((project) => project.id === 'parent')).not.toHaveProperty('goal')
+    expect(listed.projects.find((project) => project.id === 'parent')).not.toHaveProperty('target_date')
 
     const detail = await fetch(harness, '/visible-child')
     expect(detail.status).toBe(200)
@@ -136,6 +151,8 @@ describe('projectsApp', () => {
       aggregates: { direct_tasks: 1, direct_squads: 1, direct_flights: 1 },
       parent: { id: 'parent' },
     })
+    const detailBody = await (await fetch(harness, '/visible-child')).json() as { parent: Record<string, unknown> }
+    expect(detailBody.parent).toEqual({ id: 'parent', slug: 'parent', name: 'Parent', status: 'active', parent_project_id: null })
     expect((await fetch(harness, '/hidden-child')).status).toBe(404)
     expect((await fetch(harness, '/other-root')).status).toBe(404)
     expect((await fetch(harness, '/hidden-child/squads')).status).toBe(404)
@@ -167,6 +184,57 @@ describe('projectsApp', () => {
     expect((await fetch(harness, '/visible-child', 'PATCH', { goal: 'Only auth identity', member_id: 'someone-else' })).status).toBe(200)
     expect((await fetch(harness, '/visible-child/squads/squad-b', 'PUT', { access_level: 'admin', member_id: 'someone-else' })).status).toBe(200)
     expect((await fetch(harness, '/hidden-child')).status).toBe(200)
+  })
+
+  it('lets an authenticated org admin see all projects, including projects without squad edges', async () => {
+    harness = makeHarness()
+    seedProjects(harness)
+    harness.sqlite.exec("INSERT INTO projects (id, slug, name, status) VALUES ('ungoverned', 'ungoverned', 'Ungoverned', 'active')")
+    as(actor({
+      memberId: 'member-admin',
+      capabilities: [{ member_id: 'member-admin', scope_type: 'org', scope_id: null, capability: 'admin' }],
+    }))
+
+    const body = await (await fetch(harness, '/')).json() as { projects: Array<{ id: string }> }
+    expect(body.projects.map((project) => project.id)).toContain('ungoverned')
+  })
+
+  it('returns only readable squad edges to non-admins and all edges to workspace admins', async () => {
+    harness = makeHarness()
+    seedProjects(harness)
+    harness.sqlite.exec("INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('visible-child', 'squad-b', 'admin')")
+    as(actor({
+      memberId: 'member-a',
+      capabilities: [{ member_id: 'member-a', scope_type: 'squad', scope_id: 'squad-a', capability: 'observer' }],
+    }))
+    await expect((await fetch(harness, '/visible-child/squads')).json()).resolves.toMatchObject({
+      squads: [{ squad_id: 'squad-a', access_level: 'read' }],
+    })
+
+    as(actor({ role: 'admin' }))
+    const adminEdges = await (await fetch(harness, '/visible-child/squads')).json() as { squads: Array<{ squad_id: string }> }
+    expect(adminEdges.squads.map((edge) => edge.squad_id)).toEqual(['squad-a', 'squad-b'])
+  })
+
+  it('bounds list pagination with a capped cursor and stable next cursor', async () => {
+    harness = makeHarness()
+    seedProjects(harness)
+    as(actor({ role: 'owner' }))
+
+    const first = await fetch(harness, '/?limit=1')
+    const firstBody = await first.json() as { projects: Array<{ id: string }>; next_cursor: string | null }
+    expect(firstBody.projects).toHaveLength(1)
+    expect(firstBody.next_cursor).toBe('1')
+    expect((await fetch(harness, `/?limit=1&cursor=${firstBody.next_cursor}`)).status).toBe(200)
+    expect((await fetch(harness, '/?limit=101')).status).toBe(400)
+    expect((await fetch(harness, '/?cursor=10001')).status).toBe(400)
+    expect((await fetch(harness, '/?cursor=1e2')).status).toBe(400)
+  })
+
+  it('mounts projects before the dashboard catch-all', () => {
+    const root = readFileSync(join(__dirname, '..', 'src', 'index.ts'), 'utf8')
+    expect(root.indexOf('app.route(ROUTES.projects, projectsApp)')).toBeGreaterThan(-1)
+    expect(root.indexOf('app.route(ROUTES.projects, projectsApp)')).toBeLessThan(root.indexOf('app.route(ROUTES.dashboard, dashboardApp)'))
   })
 
   it('returns stable validation, forbidden, hidden, missing, and conflict responses', async () => {
