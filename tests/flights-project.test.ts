@@ -382,6 +382,26 @@ describe('flight project attribution', () => {
       .toEqual({ status: 'running' })
   })
 
+  it('fails closed when an existing v1 flight exceeds the newer UTF-8 contract', async () => {
+    harness = makeHarness()
+    const legacyUtf16Meta = { ...meta, goal_id: '\u06a9'.repeat(101) }
+    harness.sqlite.prepare(`
+      INSERT INTO flights (id, tenant, agent, goal, status, budget_micro_usd, meta, project_id)
+      VALUES ('flight-legacy-utf16', 'pot-a', 'agent-a', 'Legacy UTF-16 metadata', 'running', 10, ?, 'project-a')
+    `).run(JSON.stringify(legacyUtf16Meta))
+
+    const response = await flightsApp.request('https://pot.test/flight-legacy-utf16/land', {
+      method: 'POST',
+      headers: { authorization: 'Bearer admin', 'content-type': 'application/json' },
+      body: JSON.stringify({ cost_micro_usd: 1 }),
+    }, envFor(harness))
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'flight_meta_incompatible' })
+    expect(harness.sqlite.prepare(`SELECT status FROM flights WHERE id = 'flight-legacy-utf16'`).get())
+      .toEqual({ status: 'running' })
+  })
+
   it('reports large project-mismatch sets in input order within the D1 bind budget', async () => {
     harness = makeHarness()
     const mismatchIndexes = new Set([5, 150])

@@ -189,10 +189,19 @@ flightsApp.post('/:id/land', async (c) => {
 
   const b = (await c.req.json().catch(() => ({}))) as Record<string, unknown>
   let governedMeta: FlightMetaV1 | null = null
+  let storedMeta: unknown = null
   try {
-    governedMeta = parseFlightMetaV1(JSON.parse(existing.meta))
+    storedMeta = JSON.parse(existing.meta)
+    governedMeta = parseFlightMetaV1(storedMeta)
   } catch {
     governedMeta = null
+  }
+  const declaresGovernedV1 = typeof storedMeta === 'object'
+    && storedMeta !== null
+    && !Array.isArray(storedMeta)
+    && (storedMeta as Record<string, unknown>).schema === 'mupot.flight.meta/v1'
+  if (declaresGovernedV1 && !governedMeta) {
+    return c.json({ error: 'flight_meta_incompatible' }, 409)
   }
   if (governedMeta) {
     const cost = b.cost_micro_usd == null ? 0 : b.cost_micro_usd

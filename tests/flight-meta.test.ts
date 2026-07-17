@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import * as metaModule from '../src/flight/meta'
+import { canonicalFlightMetaSql } from '../src/flight/meta-sql'
 import type { Env } from '../src/types'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 const meta = {
   schema: 'mupot.flight.meta/v1' as const,
@@ -62,6 +64,27 @@ describe('parseFlightMetaV1', () => {
       ...meta,
       artifact_refs: Array.from({ length: 9 }, () => persianCharacter.repeat(1000)),
     })).toBeNull()
+  })
+
+  it('matches the SQL predicate at multilingual byte boundaries', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      sqlite.exec('CREATE TABLE flights (meta TEXT NOT NULL)')
+      const insert = sqlite.prepare('INSERT INTO flights (meta) VALUES (?)')
+      const accepted = { ...meta, goal_id: '\u06a9'.repeat(100) }
+      const rejected = { ...meta, goal_id: '\u06a9'.repeat(101) }
+      for (const [value, expected] of [[accepted, true], [rejected, false]] as const) {
+        sqlite.exec('DELETE FROM flights')
+        insert.run(JSON.stringify(value))
+        const row = sqlite.prepare(`
+          SELECT COUNT(*) AS count FROM flights f WHERE 1 = 1 ${canonicalFlightMetaSql('f')}
+        `).get() as { count: number }
+        expect(metaModule.parseFlightMetaV1(value) !== null).toBe(expected)
+        expect(row.count === 1).toBe(expected)
+      }
+    } finally {
+      close()
+    }
   })
 })
 
