@@ -402,6 +402,26 @@ describe('flight project attribution', () => {
       .toEqual({ status: 'running' })
   })
 
+  it('fails closed when duplicate schema keys disagree across JSON parsers', async () => {
+    harness = makeHarness()
+    const duplicateSchemaMeta = `${JSON.stringify(meta).slice(0, -1)},"schema":"legacy/v0"}`
+    harness.sqlite.prepare(`
+      INSERT INTO flights (id, tenant, agent, goal, status, budget_micro_usd, meta, project_id)
+      VALUES ('flight-duplicate-schema', 'pot-a', 'agent-a', 'Duplicate schema metadata', 'running', 10, ?, 'project-a')
+    `).run(duplicateSchemaMeta)
+
+    const response = await flightsApp.request('https://pot.test/flight-duplicate-schema/land', {
+      method: 'POST',
+      headers: { authorization: 'Bearer admin', 'content-type': 'application/json' },
+      body: JSON.stringify({ cost_micro_usd: 1 }),
+    }, envFor(harness))
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'flight_meta_incompatible' })
+    expect(harness.sqlite.prepare(`SELECT status FROM flights WHERE id = 'flight-duplicate-schema'`).get())
+      .toEqual({ status: 'running' })
+  })
+
   it('reports large project-mismatch sets in input order within the D1 bind budget', async () => {
     harness = makeHarness()
     const mismatchIndexes = new Set([5, 150])

@@ -33,7 +33,7 @@ import {
   type TriggerSource,
 } from './service'
 import type { FlightSignals, PreflightOptions } from './preflight'
-import { parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from './meta'
+import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from './meta'
 import { deriveActiveCollisions } from './board'
 
 // ── input parsing (pure, exported for tests) ──────────────────────────────────
@@ -187,6 +187,31 @@ flightsApp.post('/:id/land', async (c) => {
   const existing = await getFlight(c.env, id)
   if (!existing) return c.json({ error: 'not_found' }, 404)
 
+  const storedMetaShape = await c.env.DB.prepare(`
+    WITH parsed(meta) AS (
+      SELECT CASE
+        WHEN json_valid(?1) AND json_type(?1) = 'object' THEN ?1
+        ELSE '{}'
+      END
+    ), top_level AS (
+      SELECT key, type, value FROM parsed, json_each(parsed.meta)
+    )
+    SELECT COUNT(*) AS key_count,
+           COUNT(DISTINCT key) AS distinct_key_count,
+           COALESCE(SUM(CASE
+             WHEN key = 'schema' AND type = 'text' AND value = ?2 THEN 1
+             ELSE 0
+           END), 0) AS v1_schema_count
+      FROM top_level
+  `).bind(existing.meta, FLIGHT_META_V1_SCHEMA).first<{
+    key_count: number
+    distinct_key_count: number
+    v1_schema_count: number
+  }>()
+  const hasDuplicateMetaKeys = Number(storedMetaShape?.key_count ?? 0)
+    !== Number(storedMetaShape?.distinct_key_count ?? 0)
+  const declaresGovernedV1 = Number(storedMetaShape?.v1_schema_count ?? 0) > 0
+
   const b = (await c.req.json().catch(() => ({}))) as Record<string, unknown>
   let governedMeta: FlightMetaV1 | null = null
   let storedMeta: unknown = null
@@ -196,11 +221,7 @@ flightsApp.post('/:id/land', async (c) => {
   } catch {
     governedMeta = null
   }
-  const declaresGovernedV1 = typeof storedMeta === 'object'
-    && storedMeta !== null
-    && !Array.isArray(storedMeta)
-    && (storedMeta as Record<string, unknown>).schema === 'mupot.flight.meta/v1'
-  if (declaresGovernedV1 && !governedMeta) {
+  if (hasDuplicateMetaKeys || (declaresGovernedV1 && !governedMeta)) {
     return c.json({ error: 'flight_meta_incompatible' }, 409)
   }
   if (governedMeta) {
