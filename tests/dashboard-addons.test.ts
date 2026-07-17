@@ -86,10 +86,15 @@ function lifecycleHarness(
   key = 'fixture-addon',
   action: 'install' | 'configure' | 'activate' | 'disable' | 'archive' = 'install',
   configureBody = '',
+  bindingValues: string[] = [],
 ) {
   let click: (() => Promise<void>) | undefined
   const status = { textContent: '' }
-  const card = { querySelector: (selector: string) => selector === '.addon-status' ? status : null }
+  const selects = bindingValues.map((value) => ({ value }))
+  const card = {
+    querySelector: (selector: string) => selector === '.addon-status' ? status : null,
+    querySelectorAll: (selector: string) => selector === '[data-addon-binding-select]' ? selects : [],
+  }
   const button = {
     dataset: { addonKey: key, addonAction: action, addonConfigureBody: configureBody },
     disabled: false,
@@ -212,6 +217,42 @@ describe('addonsBody', () => {
     expect(renderedEntry(entry, [live])).toContain('href="/addons/marketing-cro-monitor"')
     expect(renderedEntry(entry, [{ ...live, state: 'archived', archivedAt: live.updatedAt }]))
       .not.toContain('href="/addons/marketing-cro-monitor"')
+  })
+
+  it('renders safe connector binding controls for addon configuration', () => {
+    const entry: AddonCatalogEntry = {
+      manifest: MarketingCroMonitorAddon,
+      manifestSha256: 'a'.repeat(64),
+    }
+    const body = String(addonsBody([entry], [], dashboardBuiltInGetRoutes, [{
+      id: 'connector-posthog-1',
+      type: 'posthog',
+      label: 'DME PostHog',
+      meta: '{"projectId":"436189"}',
+      scope_type: 'pot',
+      scope_id: null,
+      created_by: 'owner-1',
+      created_at: '2026-07-17T00:00:00.000Z',
+      revoked_at: null,
+    }, {
+      id: 'connector-mcpwp-1',
+      type: 'mcpwp',
+      label: 'DME WordPress',
+      meta: '{"siteUrl":"https://digitalmarketingexperts.ca","username":"agent"}',
+      scope_type: 'pot',
+      scope_id: null,
+      created_by: 'owner-1',
+      created_at: '2026-07-17T00:01:00.000Z',
+      revoked_at: null,
+    }]))
+
+    expect(body).toContain('data-addon-binding-select')
+    expect(body).toContain('First-party internal data')
+    expect(body).toContain('DME PostHog')
+    expect(body).toContain('DME WordPress')
+    expect(body).toContain('connector-posthog-1')
+    expect(body).toContain('connector-mcpwp-1')
+    expect(body).not.toContain('encrypted_secret')
   })
 
   it('links a valid manifest section whose path and renderer key differ from the addon key', () => {
@@ -452,6 +493,39 @@ describe('addonsBody', () => {
       body: configureBody,
     })
     expect(harness.reloads()).toBe(1)
+  })
+
+  it('builds a configure payload from selected connector bindings', async () => {
+    const firstParty = JSON.stringify({
+      slot: 'web_analytics',
+      adapter: 'first_party',
+      bindingKind: 'internal_adapter',
+    })
+    const mcpwp = JSON.stringify({
+      slot: 'content_surface',
+      adapter: 'mcpwp',
+      bindingKind: 'vault_connector',
+      connectorId: 'connector-mcpwp-1',
+    })
+    const harness = lifecycleHarness('marketing-cro-monitor', 'configure', '', [firstParty, mcpwp])
+    const script = lifecycleScript(rendered())
+    let requestOptions: RequestInit | undefined
+
+    new Function('document', 'fetch', 'window', script)(
+      harness.document,
+      async (_path: string, options: RequestInit) => {
+        requestOptions = options
+        return { ok: true, json: async () => ({}) }
+      },
+      harness.window,
+    )
+    await harness.click()
+
+    expect(requestOptions).toEqual({
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ bindings: [JSON.parse(firstParty), JSON.parse(mcpwp)] }),
+    })
   })
 })
 

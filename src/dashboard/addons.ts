@@ -3,6 +3,7 @@ import { LinearRouter } from 'hono/router/linear-router'
 import { getAddonConsoleRenderer, type AddonConsoleRenderer } from '../addons/console-registry'
 import type { AddonCatalogEntry } from '../addons/registry'
 import type { AddonInstallation, AddonState } from '../addons/service'
+import type { ConnectorListRow } from '../connectors/service'
 import { pageHeader, pill } from './ui'
 
 import '../addons/modules'
@@ -151,10 +152,64 @@ function defaultConfigureBody(entry: AddonCatalogEntry): string | null {
   return bindings.length > 0 ? JSON.stringify({ bindings }) : null
 }
 
+function bindingOptionValue(
+  slot: string,
+  adapter: string,
+  bindingKind: 'internal_adapter' | 'vault_connector',
+  connectorId?: string,
+): string {
+  return JSON.stringify({
+    slot,
+    adapter,
+    bindingKind,
+    ...(connectorId ? { connectorId } : {}),
+  })
+}
+
+function connectorSelectLabel(connector: ConnectorListRow): string {
+  const scope = connector.scope_type === 'pot' ? 'pot' : `${connector.scope_type}:${connector.scope_id ?? 'unknown'}`
+  return `${connector.label} (${connector.type}, ${scope})`
+}
+
+function connectorBindingControls(entry: AddonCatalogEntry, connectors: readonly ConnectorListRow[]) {
+  const requirements = entry.manifest.connectorRequirements
+  if (requirements.length === 0) return ''
+
+  return html`
+    <div class="addon-bindings" data-addon-bindings>
+      ${requirements.map((requirement) => {
+        const vaultConnectors = connectors.filter((connector) => requirement.accepts.includes(connector.type))
+        const hasFirstParty = requirement.accepts.includes('first_party')
+        return html`
+          <label class="addon-binding-row">
+            <span>
+              <strong>${requirement.slot}</strong>
+              <small>${requirement.required ? 'Required' : 'Optional'} read source</small>
+            </span>
+            <select data-addon-binding-select data-addon-binding-required="${requirement.required ? 'true' : 'false'}">
+              ${requirement.required ? '' : html`<option value="">No binding</option>`}
+              ${hasFirstParty
+                ? html`<option value="${bindingOptionValue(requirement.slot, 'first_party', 'internal_adapter')}" selected>First-party internal data</option>`
+                : ''}
+              ${vaultConnectors.map((connector) => html`
+                <option value="${bindingOptionValue(requirement.slot, connector.type, 'vault_connector', connector.id)}"${!hasFirstParty && connector.id === vaultConnectors[0]?.id ? ' selected' : ''}>
+                  ${connectorSelectLabel(connector)}
+                </option>
+              `)}
+              ${requirement.required && !hasFirstParty && vaultConnectors.length === 0
+                ? html`<option value="" selected>No matching connector available</option>`
+                : ''}
+            </select>
+          </label>`
+      })}
+    </div>`
+}
+
 export function addonsBody(
   entries: AddonCatalogEntry[],
   installations: AddonInstallation[],
   builtInRoutes: readonly DashboardRoutePattern[],
+  connectors: readonly ConnectorListRow[] = [],
 ) {
   const installationsByKey = latestInstallationByKey(installations)
   const consoleResolver = createAddonConsoleResolver(entries, builtInRoutes)
@@ -192,6 +247,7 @@ export function addonsBody(
           <div class="addon-fact"><span>Digest</span><code>${digest}</code></div>
           <div class="addon-fact addon-fact-wide"><span>Requested</span><strong>${requestedSummary(entry)}</strong></div>
         </div>
+        ${connectorBindingControls(entry, connectors)}
         <div class="addon-actions">
           ${consoleSections.map((section) => html`
               <a class="addon-console" href="${section.path}">
@@ -225,6 +281,12 @@ export function addonsBody(
       .addon-fact strong, .addon-fact code { color: var(--text2); font-size: 12.5px; font-weight: 600; overflow-wrap: anywhere; }
       .addon-fact code { font-family: var(--font-mono); }
       .addon-fact-wide { grid-column: 1 / -1; }
+      .addon-bindings { display: grid; gap: 8px; padding: 0 16px 14px; }
+      .addon-binding-row { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(220px, 2fr); gap: 10px; align-items: center; }
+      .addon-binding-row span { min-width: 0; }
+      .addon-binding-row strong { display: block; color: var(--text2); font-size: 12.5px; line-height: 1.35; overflow-wrap: anywhere; }
+      .addon-binding-row small { display: block; color: var(--dim); font-size: 11.5px; line-height: 1.3; }
+      .addon-binding-row select { min-width: 0; width: 100%; min-height: 32px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface2); color: var(--text); padding: 0 8px; }
       .addon-actions { min-height: 50px; display: flex; align-items: center; gap: 10px; padding: 8px 16px; border-top: 1px solid var(--border-soft); }
       .addon-receipts { font-size: 12.5px; font-weight: 600; white-space: nowrap; }
       .addon-console { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; white-space: nowrap; }
@@ -235,6 +297,7 @@ export function addonsBody(
       .addon-retention { color: var(--dim); flex-basis: 100%; font-size: 11.5px; line-height: 1.4; margin: 0; }
       @media (max-width: 680px) {
         .addon-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .addon-binding-row { grid-template-columns: 1fr; }
         .addon-actions { align-items: flex-start; flex-wrap: wrap; }
         .addon-status { width: 100%; }
       }
@@ -255,9 +318,22 @@ export function addonsBody(
             if (status) status.textContent = 'Working...';
             try {
               var options = { method: 'POST' };
-              if (action === 'configure' && button.dataset.addonConfigureBody) {
+              if (action === 'configure') {
+                var bindings = [];
+                var selects = card ? card.querySelectorAll('[data-addon-binding-select]') : [];
+                selects.forEach(function (select) {
+                  if (!select.value) return;
+                  try {
+                    bindings.push(JSON.parse(select.value));
+                  } catch (_) {}
+                });
+                if (bindings.length === 0 && button.dataset.addonConfigureBody) {
+                  try {
+                    bindings = JSON.parse(button.dataset.addonConfigureBody).bindings || [];
+                  } catch (_) {}
+                }
                 options.headers = { 'content-type': 'application/json' };
-                options.body = button.dataset.addonConfigureBody;
+                options.body = JSON.stringify({ bindings: bindings });
               }
               var response = await fetch('/api/addons/' + encodeURIComponent(key) + '/' + action, options);
               var data = {};
