@@ -2,9 +2,11 @@ import { html } from 'hono/html'
 import type { AddonBinding, AddonBindingGeneration } from '../addons/bindings'
 import { listAddonBindings, loadLiveAddonBindingGeneration } from '../addons/bindings'
 import {
+  getLatestMarketingRecommendation,
   getLatestMarketingMonitorRun,
   listMarketingMonitorRuns,
 } from '../addons/marketing/service'
+import type { MarketingRecommendation } from '../addons/marketing/service'
 import type {
   MarketingMonitorRun,
   MarketingOutcomes,
@@ -59,6 +61,9 @@ export interface MonitorOpportunityView {
   title: string
   detail: string
   tone: Tone
+  approvalRequired?: boolean
+  taskHref?: '/approvals'
+  flightHref?: '/flights'
 }
 
 export interface MarketingCroMonitorView {
@@ -77,6 +82,7 @@ export interface MarketingCroMonitorViewDeps {
   loadBindingGeneration?: typeof loadLiveAddonBindingGeneration
   getLatestRun?: typeof getLatestMarketingMonitorRun
   listRuns?: typeof listMarketingMonitorRuns
+  getLatestRecommendation?: typeof getLatestMarketingRecommendation
 }
 
 function bindingSnapshotMatches(
@@ -164,6 +170,7 @@ function runView(run: MarketingMonitorRun): MonitorRunView {
 function opportunityFor(
   monitorState: MarketingCroMonitorView['monitorState'],
   outcomes: MarketingOutcomes | null,
+  recommendation: MarketingRecommendation | null = null,
 ): MonitorOpportunityView {
   if (monitorState === 'unavailable') {
     return {
@@ -177,6 +184,18 @@ function opportunityFor(
       title: 'No opportunity evidence yet',
       detail: 'Complete a monitor run to establish measured outcomes before review.',
       tone: 'dim',
+    }
+  }
+
+  if (recommendation) {
+    const baseline = outcomeDisplay(recommendation.kpiBaseline)
+    return {
+      title: `Review ${humanize(recommendation.primaryKpi)} recommendation`,
+      detail: `${recommendation.problem} Hypothesis: ${recommendation.hypothesis} KPI baseline: ${baseline.value} (${baseline.detail}).`,
+      tone: 'warn',
+      approvalRequired: true,
+      taskHref: '/approvals',
+      flightHref: '/flights',
     }
   }
 
@@ -209,6 +228,7 @@ export async function loadMarketingCroMonitorView(
   const readGeneration = deps.loadBindingGeneration ?? loadLiveAddonBindingGeneration
   const readLatest = deps.getLatestRun ?? getLatestMarketingMonitorRun
   const readRuns = deps.listRuns ?? listMarketingMonitorRuns
+  const readRecommendation = deps.getLatestRecommendation ?? getLatestMarketingRecommendation
   let bindings: AddonBinding[]
   let generation: AddonBindingGeneration | null
   try {
@@ -248,6 +268,18 @@ export async function loadMarketingCroMonitorView(
   const outcomes = latest?.outcomes ?? null
   const recentRuns = runs.map(runView)
   const sourceHealth = healthFromBindings(bindings, latest)
+  let recommendation: MarketingRecommendation | null = null
+  if (latest) {
+    try {
+      const result = await readRecommendation(env, actor, {
+        installationId: installation.id,
+        runId: latest.id,
+      })
+      if (result.ok) recommendation = result.recommendation
+    } catch {
+      recommendation = null
+    }
+  }
 
   return {
     installationState: installation.state,
@@ -257,7 +289,7 @@ export async function loadMarketingCroMonitorView(
     recentRuns,
     latestEvidenceDigest: latest?.evidenceDigest ?? null,
     latestCompletedAt: latest?.completedAt ?? null,
-    opportunity: opportunityFor(monitorState, outcomes),
+    opportunity: opportunityFor(monitorState, outcomes, recommendation),
   }
 }
 
@@ -393,6 +425,8 @@ export function marketingCroMonitorBody(view: MarketingCroMonitorView) {
       .monitor-opportunity-icon { width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 7px; color: var(--primary); background: var(--primary-soft); }
       .monitor-opportunity strong { display: block; font-size: 13px; margin: 1px 0 4px; }
       .monitor-opportunity p { color: var(--dim); font-size: 12.5px; line-height: 1.5; margin: 0; }
+      .monitor-opportunity-links { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 9px; }
+      .monitor-opportunity-links a { color: var(--primary); font-size: 12px; font-weight: 600; }
       .monitor-run-row { display: grid; grid-template-columns: minmax(170px, 1.5fr) minmax(68px, .5fr) minmax(90px, .6fr) minmax(130px, .8fr); gap: 14px; align-items: center; padding: 11px 0; border-bottom: 1px solid var(--border-soft); }
       .monitor-run-row > div { min-width: 0; }
       .monitor-run-row span { display: block; color: var(--dim); font-size: 10.5px; }
@@ -448,12 +482,24 @@ export function marketingCroMonitorBody(view: MarketingCroMonitorView) {
     ${sectionPanel({ title: 'Source health', body: sourceHealthBody(view.sourceHealth) })}
     ${sectionPanel({
       title: 'Opportunity',
-      right: pill(view.monitorState === 'ready' ? 'Evidence based' : 'Pending evidence', view.opportunity.tone),
+      right: pill(
+        view.opportunity.approvalRequired
+          ? 'Owner approval required'
+          : view.monitorState === 'ready' ? 'Evidence based' : 'Pending evidence',
+        view.opportunity.tone,
+      ),
       body: html`<div class="monitor-opportunity">
         <span class="monitor-opportunity-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M15.09 14c.18-.68.66-1.12 1.18-1.75A6 6 0 1 0 7.73 12.25c.52.62 1 1.07 1.18 1.75"/></svg>
         </span>
-        <div><strong>${view.opportunity.title}</strong><p>${view.opportunity.detail}</p></div>
+        <div>
+          <strong>${view.opportunity.title}</strong><p>${view.opportunity.detail}</p>
+          ${view.opportunity.taskHref && view.opportunity.flightHref ? html`
+            <nav class="monitor-opportunity-links" aria-label="Recommendation references">
+              <a href="${view.opportunity.taskHref}">Review task</a>
+              <a href="${view.opportunity.flightHref}">Flight record</a>
+            </nav>` : ''}
+        </div>
       </div>`,
     })}
     ${sectionPanel({ title: 'Recent runs', body: recentRunsBody(view.recentRuns) })}

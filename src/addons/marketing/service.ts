@@ -1,5 +1,8 @@
 import type { D1Database, D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import type { Env } from '../../types'
+import { createFlight as canonicalCreateFlight } from '../../flight/service'
+import { FLIGHT_META_V1_SCHEMA, type FlightMetaV1 } from '../../flight/meta'
+import { createTask as canonicalCreateTask } from '../../tasks/service'
 import type { AddonActor } from '../service'
 import { getRegisteredAddon } from '../registry'
 import '../modules'
@@ -11,6 +14,13 @@ import {
 } from './sources'
 import { deriveMarketingOutcomes } from './outcomes'
 import { MARKETING_MONITOR_ADAPTERS } from './adapters'
+import {
+  rankMarketingOpportunities,
+  type LimitingMarketingEvidence,
+  type MarketingOpportunityCandidate,
+  type MarketingOpportunityKind,
+  type MarketingOpportunityKpi,
+} from './opportunities'
 import {
   MARKETING_MONITOR_METRIC_CONTRACT,
   type MarketingMonitorRun,
@@ -27,6 +37,7 @@ import {
 export const MARKETING_MONITOR_PROGRAM_VERSION = 'marketing-cro-monitor-v1'
 export const MAX_MARKETING_MONITOR_WINDOW_MS = 31 * 24 * 60 * 60 * 1000
 export const MAX_MARKETING_MONITOR_RUN_LIST = 50
+export const MARKETING_RECOMMENDATION_GATE_OWNER = 'gate:addons:marketing-cro-monitor:promote_recommendation'
 
 const MARKETING_ADDON_KEY = 'marketing-cro-monitor'
 const EVIDENCE_SCHEMA = 'mupot.marketing-monitor-evidence/v1'
@@ -87,6 +98,20 @@ const STABLE_SOURCE_REASONS = new SetIntrinsic([
 ])
 const OUTCOME_SOURCES = new SetIntrinsic(['first-party', 'posthog', 'gsc', 'ghl', 'crm', 'mcpwp', 'inkwell', 'ai_visibility'])
 const OUTCOME_UNITS = new SetIntrinsic(['count', 'ratio', 'usd'])
+const RECOMMENDATION_KINDS = new SetIntrinsic([
+  'conversion_review',
+  'revenue_review',
+  'lead_generation_review',
+  'organic_traffic_review',
+  'ai_visibility_review',
+])
+const RECOMMENDATION_KPIS = new SetIntrinsic([
+  'visibility',
+  'qualifiedTraffic',
+  'leads',
+  'conversion',
+  'revenue',
+])
 const UNAVAILABLE_SOURCE_REASONS = new SetIntrinsic([
   'authoritative_source_missing',
   'binding_not_configured',
@@ -152,6 +177,33 @@ interface LiveContext {
   bindings: ResolvedAddonBinding[]
 }
 
+interface StoredRecommendationRow {
+  id: string
+  installation_id: string
+  run_id: string
+  program_version: string
+  kind: MarketingOpportunityKind
+  target: string
+  problem: string
+  hypothesis: string
+  primary_kpi: MarketingOpportunityKpi
+  kpi_baseline_json: string
+  limiting_evidence_json: string
+  evidence_digest: string
+  dedup_key: string
+  task_id: string
+  flight_id: string
+  approval_required: 1
+  approval_action: 'promote_recommendation'
+  required_capability: 'owner'
+  self_approval: 0
+  terminal_action: 'recommendation_ready'
+  receipt_digest: string
+  status: 'ready'
+  created_at: string
+  prepared_at: string
+}
+
 export interface MarketingMonitorSourceFactoryContext {
   readonly runId: string
   readonly window: MonitorWindow
@@ -163,6 +215,39 @@ export type MarketingMonitorSourceFactory = (
 
 export interface MarketingMonitorServiceDeps {
   readonly sourceFactory?: MarketingMonitorSourceFactory
+}
+
+export interface MarketingRecommendationDeps {
+  readonly createTask?: typeof canonicalCreateTask
+  readonly createFlight?: typeof canonicalCreateFlight
+}
+
+export interface MarketingRecommendation {
+  readonly id: string
+  readonly installationId: string
+  readonly runId: string
+  readonly programVersion: string
+  readonly kind: MarketingOpportunityKind
+  readonly target: string
+  readonly problem: string
+  readonly hypothesis: string
+  readonly primaryKpi: MarketingOpportunityKpi
+  readonly kpiBaseline: OutcomeValue
+  readonly limitingEvidence: readonly LimitingMarketingEvidence[]
+  readonly evidenceDigest: string
+  readonly dedupKey: string
+  readonly taskId: string
+  readonly flightId: string
+  readonly approval: {
+    readonly required: true
+    readonly action: 'promote_recommendation'
+    readonly requiredCapability: 'owner'
+    readonly selfApproval: false
+  }
+  readonly terminalAction: 'recommendation_ready'
+  readonly receiptDigest: string
+  readonly createdAt: string
+  readonly preparedAt: string
 }
 
 export type MarketingMonitorFailureReason =
@@ -189,6 +274,22 @@ export type GetMarketingMonitorRunResult =
 export type ListMarketingMonitorRunsResult =
   | { readonly ok: true; readonly runs: readonly MarketingMonitorRun[] }
   | { readonly ok: false; readonly reason: MarketingMonitorFailureReason }
+
+export type MarketingRecommendationFailureReason =
+  | MarketingMonitorFailureReason
+  | 'run_not_latest'
+  | 'no_opportunity'
+  | 'approval_policy_missing'
+  | 'web_operations_squad_not_found'
+  | 'recommendation_busy'
+
+export type PrepareMarketingRecommendationResult =
+  | { readonly ok: true; readonly idempotent: boolean; readonly recommendation: MarketingRecommendation }
+  | { readonly ok: false; readonly reason: MarketingRecommendationFailureReason }
+
+export type GetMarketingRecommendationResult =
+  | { readonly ok: true; readonly recommendation: MarketingRecommendation | null }
+  | { readonly ok: false; readonly reason: MarketingRecommendationFailureReason }
 
 export type MarketingMonitorReadScopeInput =
   | {
@@ -1081,6 +1182,439 @@ export async function listMarketingMonitorRuns(
       pushCaptured(runs, run)
     }
     return { ok: true, runs }
+  } catch {
+    return { ok: false, reason: 'write_failed' }
+  }
+}
+
+function parseLimitingEvidence(value: unknown): readonly LimitingMarketingEvidence[] | null {
+  if (!arrayIsArrayIntrinsic(value) || value.length > 5) return null
+  const limiting: LimitingMarketingEvidence[] = []
+  for (let index = 0; index < value.length; index += 1) {
+    const item = value[index]
+    if (typeof item !== 'object' || item === null || arrayIsArrayIntrinsic(item)) return null
+    const record = item as Record<string, unknown>
+    if (
+      objectKeysIntrinsic(record).length !== 3
+      || !setHasCaptured(RECOMMENDATION_KPIS, record.outcome)
+      || record.status !== 'unavailable'
+      || typeof record.reason !== 'string'
+      || record.reason.length === 0
+    ) return null
+    reflectApplyIntrinsic(arrayPushIntrinsic, limiting, [objectFreezeIntrinsic({
+      outcome: record.outcome as MarketingOpportunityKpi,
+      status: 'unavailable' as const,
+      reason: record.reason,
+    })])
+  }
+  return objectFreezeIntrinsic(limiting)
+}
+
+function recommendationFromRow(row: StoredRecommendationRow): MarketingRecommendation | null {
+  try {
+    const baseline = jsonParseIntrinsic(row.kpi_baseline_json)
+    const limiting = parseLimitingEvidence(jsonParseIntrinsic(row.limiting_evidence_json))
+    if (
+      row.status !== 'ready'
+      || row.program_version !== MARKETING_MONITOR_PROGRAM_VERSION
+      || !setHasCaptured(RECOMMENDATION_KINDS, row.kind)
+      || !setHasCaptured(RECOMMENDATION_KPIS, row.primary_kpi)
+      || !validOutcome(baseline)
+      || !limiting
+      || !(reflectApplyIntrinsic(regexpTestIntrinsic, HEX_SHA256, [row.evidence_digest]) as boolean)
+      || !(reflectApplyIntrinsic(regexpTestIntrinsic, HEX_SHA256, [row.dedup_key]) as boolean)
+      || !(reflectApplyIntrinsic(regexpTestIntrinsic, HEX_SHA256, [row.receipt_digest]) as boolean)
+      || row.approval_required !== 1
+      || row.approval_action !== 'promote_recommendation'
+      || row.required_capability !== 'owner'
+      || row.self_approval !== 0
+      || row.terminal_action !== 'recommendation_ready'
+      || !canonicalTimestamp(row.created_at)
+      || !canonicalTimestamp(row.prepared_at)
+      || row.prepared_at < row.created_at
+    ) return null
+    return objectFreezeIntrinsic({
+      id: row.id,
+      installationId: row.installation_id,
+      runId: row.run_id,
+      programVersion: row.program_version,
+      kind: row.kind,
+      target: row.target,
+      problem: row.problem,
+      hypothesis: row.hypothesis,
+      primaryKpi: row.primary_kpi,
+      kpiBaseline: objectFreezeIntrinsic({ ...baseline }),
+      limitingEvidence: limiting,
+      evidenceDigest: row.evidence_digest,
+      dedupKey: row.dedup_key,
+      taskId: row.task_id,
+      flightId: row.flight_id,
+      approval: objectFreezeIntrinsic({
+        required: true as const,
+        action: 'promote_recommendation' as const,
+        requiredCapability: 'owner' as const,
+        selfApproval: false as const,
+      }),
+      terminalAction: 'recommendation_ready' as const,
+      receiptDigest: row.receipt_digest,
+      createdAt: row.created_at,
+      preparedAt: row.prepared_at,
+    })
+  } catch {
+    return null
+  }
+}
+
+const RECOMMENDATION_COLUMNS = `
+  id, installation_id, run_id, program_version, kind, target, problem, hypothesis,
+  primary_kpi, kpi_baseline_json, limiting_evidence_json, evidence_digest, dedup_key,
+  task_id, flight_id, approval_required, approval_action, required_capability,
+  self_approval, terminal_action, receipt_digest, status, created_at, prepared_at
+`
+
+const JOINED_RECOMMENDATION_COLUMNS = `
+  recommendation.id AS id,
+  recommendation.installation_id AS installation_id,
+  recommendation.run_id AS run_id,
+  recommendation.program_version AS program_version,
+  recommendation.kind AS kind,
+  recommendation.target AS target,
+  recommendation.problem AS problem,
+  recommendation.hypothesis AS hypothesis,
+  recommendation.primary_kpi AS primary_kpi,
+  recommendation.kpi_baseline_json AS kpi_baseline_json,
+  recommendation.limiting_evidence_json AS limiting_evidence_json,
+  recommendation.evidence_digest AS evidence_digest,
+  recommendation.dedup_key AS dedup_key,
+  recommendation.task_id AS task_id,
+  recommendation.flight_id AS flight_id,
+  recommendation.approval_required AS approval_required,
+  recommendation.approval_action AS approval_action,
+  recommendation.required_capability AS required_capability,
+  recommendation.self_approval AS self_approval,
+  recommendation.terminal_action AS terminal_action,
+  recommendation.receipt_digest AS receipt_digest,
+  recommendation.status AS status,
+  recommendation.created_at AS created_at,
+  recommendation.prepared_at AS prepared_at
+`
+
+async function loadReadyRecommendationByDedup(
+  captured: CapturedDatabase,
+  installationId: string,
+  dedupKey: string,
+): Promise<MarketingRecommendation | null> {
+  const row = await captured.db.prepare(`
+    SELECT ${RECOMMENDATION_COLUMNS}
+      FROM marketing_recommendations
+     WHERE tenant = ?1 AND installation_id = ?2 AND dedup_key = ?3 AND status = 'ready'
+     LIMIT 1
+  `).bind(captured.tenant, installationId, dedupKey).first<StoredRecommendationRow>()
+  return row ? recommendationFromRow(row) : null
+}
+
+async function resolveOwnedWebOperationsSquad(
+  captured: CapturedDatabase,
+  installationId: string,
+): Promise<string | null> {
+  const row = await captured.db.prepare(`
+    SELECT squad.id
+      FROM addon_resource_ownership AS claim
+      JOIN departments AS department
+        ON department.id = claim.resource_id
+       AND department.template_key = claim.resource_key
+       AND department.active = 1
+      JOIN squads AS squad ON squad.department_id = department.id
+     WHERE claim.tenant = ?1
+       AND claim.installation_id = ?2
+       AND claim.resource_type = 'department'
+       AND claim.resource_key = 'web-ops'
+       AND claim.active = 1
+     ORDER BY CASE WHEN squad.slug = 'strategy' THEN 0 ELSE 1 END, squad.slug, squad.id
+     LIMIT 1
+  `).bind(captured.tenant, installationId).first<{ id: string }>()
+  return row?.id ?? null
+}
+
+function recommendationTaskBody(
+  run: MarketingMonitorRun,
+  candidate: MarketingOpportunityCandidate,
+): string {
+  return trustedJsonStringify({
+    schema: 'mupot.marketing-recommendation/v1',
+    target: candidate.target,
+    problem: candidate.problem,
+    hypothesis: candidate.hypothesis,
+    primaryKpi: candidate.primaryKpi,
+    kpiBaseline: candidate.kpiBaseline,
+    limitingEvidence: candidate.limitingEvidence,
+    evidence: {
+      programVersion: run.programVersion,
+      window: run.window,
+      digest: run.evidenceDigest,
+    },
+    approval: {
+      required: true,
+      action: 'promote_recommendation',
+      requiredCapability: 'owner',
+      selfApproval: false,
+    },
+    terminalAction: 'recommendation_ready',
+    executor: null,
+  })
+}
+
+export async function prepareMarketingRecommendation(
+  env: Env,
+  actor: AddonActor,
+  runId: string,
+  deps: MarketingRecommendationDeps = {},
+): Promise<PrepareMarketingRecommendationResult> {
+  if (!isAdminPlus(actor)) return { ok: false, reason: 'not_authorized' }
+  if (typeof runId !== 'string' || runId.length === 0) return { ok: false, reason: 'run_not_latest' }
+  const captured = captureDatabase(env)
+  if (!captured) return { ok: false, reason: 'write_failed' }
+
+  let context: LiveContext
+  try {
+    const loaded = await loadLiveContext(captured)
+    if (!loaded.ok) return loaded
+    context = loaded.context
+  } catch {
+    return { ok: false, reason: 'write_failed' }
+  }
+
+  const latestResult = await getLatestMarketingMonitorRun(captured.env, actor, {
+    installationId: context.installation.id,
+    generationId: context.generation.id,
+    bindingCount: context.generation.binding_count,
+  })
+  if (!latestResult.ok) return latestResult
+  if (!latestResult.run || latestResult.run.id !== runId) return { ok: false, reason: 'run_not_latest' }
+  const run = latestResult.run
+  const candidate = rankMarketingOpportunities(run)[0]
+  if (!candidate) return { ok: false, reason: 'no_opportunity' }
+
+  const entry = getRegisteredAddon(MARKETING_ADDON_KEY)
+  const approval = entry?.manifest.approvalPolicies.find(
+    (policy) => policy.action === 'promote_recommendation',
+  )
+  if (!approval || approval.requiredCapability !== 'owner' || approval.selfApproval !== false) {
+    return { ok: false, reason: 'approval_policy_missing' }
+  }
+
+  let squadId: string | null
+  try {
+    squadId = await resolveOwnedWebOperationsSquad(captured, context.installation.id)
+  } catch {
+    return { ok: false, reason: 'write_failed' }
+  }
+  if (!squadId) return { ok: false, reason: 'web_operations_squad_not_found' }
+
+  const dedupKey = await sha256Json({
+    schema: 'mupot.marketing-recommendation-dedup/v1',
+    tenant: captured.tenant,
+    installationId: context.installation.id,
+    programVersion: run.programVersion,
+    target: candidate.target,
+    window: run.window,
+    kind: candidate.kind,
+  })
+  const recommendationId = randomUUIDIntrinsic()
+  const createdAt = nowIso()
+  let claimed: D1Result<unknown>
+  try {
+    claimed = await captured.db.prepare(`
+      INSERT INTO marketing_recommendations (
+        id, tenant, installation_id, binding_generation_id, run_id, program_version,
+        kind, target, problem, hypothesis, primary_kpi, kpi_baseline_json,
+        limiting_evidence_json, evidence_digest, dedup_key, squad_id,
+        approval_required, approval_action, required_capability, self_approval,
+        terminal_action, status, created_by, created_at
+      ) VALUES (
+        ?1, ?2, ?3, ?4, ?5, ?6,
+        ?7, ?8, ?9, ?10, ?11, ?12,
+        ?13, ?14, ?15, ?16,
+        1, 'promote_recommendation', 'owner', 0,
+        'recommendation_ready', 'preparing', ?17, ?18
+      )
+      ON CONFLICT (tenant, dedup_key) DO NOTHING
+    `).bind(
+      recommendationId,
+      captured.tenant,
+      context.installation.id,
+      context.generation.id,
+      run.id,
+      run.programVersion,
+      candidate.kind,
+      candidate.target,
+      candidate.problem,
+      candidate.hypothesis,
+      candidate.primaryKpi,
+      trustedJsonStringify(candidate.kpiBaseline),
+      trustedJsonStringify(candidate.limitingEvidence),
+      run.evidenceDigest,
+      dedupKey,
+      squadId,
+      actor.id,
+      createdAt,
+    ).run()
+  } catch {
+    return { ok: false, reason: 'write_failed' }
+  }
+
+  if (!resultsWritten(claimed)) {
+    try {
+      const existing = await loadReadyRecommendationByDedup(captured, context.installation.id, dedupKey)
+      return existing
+        ? { ok: true, idempotent: true, recommendation: existing }
+        : { ok: false, reason: 'recommendation_busy' }
+    } catch {
+      return { ok: false, reason: 'write_failed' }
+    }
+  }
+
+  const doCreateTask = deps.createTask ?? canonicalCreateTask
+  const doCreateFlight = deps.createFlight ?? canonicalCreateFlight
+  const doneWhen = 'An owner approves or rejects the recommendation; no external change is executed'
+  try {
+    const task = await doCreateTask(
+      env,
+      {
+        squad_id: squadId,
+        title: `Review CRO recommendation: ${candidate.primaryKpi}`,
+        body: recommendationTaskBody(run, candidate),
+        done_when: doneWhen,
+        status: 'review',
+        gate_owner: MARKETING_RECOMMENDATION_GATE_OWNER,
+      },
+      { actor: { kind: 'member', id: actor.id }, skipMirror: true },
+    )
+    const flightMeta: FlightMetaV1 & {
+      terminal_action: 'recommendation_ready'
+      executor: null
+    } = {
+      schema: FLIGHT_META_V1_SCHEMA,
+      goal_id: `marketing-recommendation:${recommendationId}`,
+      objective_id: candidate.kind,
+      squad_ids: [squadId],
+      task_ids: [task.id],
+      done_when: [doneWhen],
+      artifact_refs: [`marketing-recommendation:${recommendationId}`],
+      receipt_refs: [`marketing-monitor-evidence:${run.evidenceDigest}`],
+      confidentiality: 'internal',
+      publication_target: 'none',
+      parent_flight_id: null,
+      terminal_action: 'recommendation_ready',
+      executor: null,
+    }
+    const flightId = await doCreateFlight(env, {
+      agent: 'addon:marketing-cro-monitor',
+      goal: `Prepare ${candidate.kind} for owner review; terminal action recommendation_ready`,
+      trigger_source: 'event',
+      budget_micro_usd: 0,
+      meta: flightMeta,
+    })
+    const preparedAt = nowIso()
+    const receiptDigest = await sha256Json({
+      schema: 'mupot.marketing-recommendation-receipt/v1',
+      recommendationId,
+      tenant: captured.tenant,
+      installationId: context.installation.id,
+      runId: run.id,
+      programVersion: run.programVersion,
+      window: run.window,
+      evidenceDigest: run.evidenceDigest,
+      candidate,
+      dedupKey,
+      taskId: task.id,
+      flightId,
+      approval: {
+        required: true,
+        action: 'promote_recommendation',
+        requiredCapability: 'owner',
+        selfApproval: false,
+      },
+      terminalAction: 'recommendation_ready',
+      executor: null,
+      createdAt,
+      preparedAt,
+    })
+    const finalized = await captured.db.prepare(`
+      UPDATE marketing_recommendations
+         SET task_id = ?1, flight_id = ?2, receipt_digest = ?3,
+             prepared_at = ?4, status = 'ready'
+       WHERE id = ?5 AND tenant = ?6 AND installation_id = ?7
+         AND dedup_key = ?8 AND status = 'preparing'
+    `).bind(
+      task.id,
+      flightId,
+      receiptDigest,
+      preparedAt,
+      recommendationId,
+      captured.tenant,
+      context.installation.id,
+      dedupKey,
+    ).run()
+    if (!resultsWritten(finalized)) return { ok: false, reason: 'fence_lost' }
+    const recommendation = await loadReadyRecommendationByDedup(
+      captured,
+      context.installation.id,
+      dedupKey,
+    )
+    return recommendation
+      ? { ok: true, idempotent: false, recommendation }
+      : { ok: false, reason: 'stored_run_invalid' }
+  } catch {
+    return { ok: false, reason: 'write_failed' }
+  }
+}
+
+export async function getLatestMarketingRecommendation(
+  env: Env,
+  actor: AddonActor,
+  input: { readonly installationId: string; readonly runId?: string },
+): Promise<GetMarketingRecommendationResult> {
+  if (!isAdminPlus(actor)) return { ok: false, reason: 'not_authorized' }
+  const captured = captureDatabase(env)
+  if (!captured) return { ok: false, reason: 'write_failed' }
+  const entry = getRegisteredAddon(MARKETING_ADDON_KEY)
+  if (!entry) return { ok: false, reason: 'addon_identity_mismatch' }
+  try {
+    const row = await captured.db.prepare(`
+      SELECT ${JOINED_RECOMMENDATION_COLUMNS}
+        FROM marketing_recommendations AS recommendation
+        JOIN addon_installations AS installation
+          ON installation.id = recommendation.installation_id
+         AND installation.tenant = recommendation.tenant
+       WHERE recommendation.tenant = ?1
+         AND recommendation.installation_id = ?2
+         AND (?3 IS NULL OR recommendation.run_id = ?3)
+         AND recommendation.status = 'ready'
+         AND installation.addon_key = ?4
+         AND installation.installed_version = ?5
+         AND installation.publisher = ?6
+         AND installation.trust_class = ?7
+         AND installation.mupot_compatibility = ?8
+         AND installation.manifest_sha256 = ?9
+       ORDER BY recommendation.prepared_at DESC, recommendation.id DESC
+       LIMIT 1
+    `).bind(
+      captured.tenant,
+      input.installationId,
+      input.runId ?? null,
+      entry.manifest.key,
+      entry.manifest.version,
+      entry.manifest.publisher,
+      entry.manifest.trustClass,
+      entry.manifest.mupotCompatibility,
+      entry.manifestSha256,
+    ).first<StoredRecommendationRow>()
+    if (!row) return { ok: true, recommendation: null }
+    const recommendation = recommendationFromRow(row)
+    return recommendation
+      ? { ok: true, recommendation }
+      : { ok: false, reason: 'stored_run_invalid' }
   } catch {
     return { ok: false, reason: 'write_failed' }
   }
