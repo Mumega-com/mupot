@@ -231,6 +231,27 @@ describe('projectsApp', () => {
     expect((await fetch(harness, '/?cursor=1e2')).status).toBe(400)
   })
 
+  it('does not emit cursors beyond the maximum offset for project and squad pages', async () => {
+    harness = makeHarness()
+    seedProjects(harness)
+    harness.sqlite.exec(`
+      WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x + 1 FROM n WHERE x < 10100)
+      INSERT INTO projects (id, slug, name, status)
+      SELECT printf('page-%05d', x), printf('page-%05d', x), printf('Page %05d', x), 'active' FROM n;
+      WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x + 1 FROM n WHERE x < 10100)
+      INSERT INTO squads (id, department_id, slug, name)
+      SELECT printf('page-squad-%05d', x), 'dept-a', printf('page-squad-%05d', x), printf('Page squad %05d', x) FROM n;
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      SELECT 'visible-child', id, 'read' FROM squads WHERE id LIKE 'page-squad-%';
+    `)
+    as(actor({ role: 'owner' }))
+
+    const projects = await (await fetch(harness, '/?cursor=10000&limit=100')).json() as { next_cursor: string | null }
+    const squads = await (await fetch(harness, '/visible-child/squads?cursor=10000&limit=100')).json() as { next_cursor: string | null }
+    expect(projects.next_cursor).toBeNull()
+    expect(squads.next_cursor).toBeNull()
+  })
+
   it('mounts projects before the dashboard catch-all', () => {
     const root = readFileSync(join(__dirname, '..', 'src', 'index.ts'), 'utf8')
     expect(root.indexOf('app.route(ROUTES.projects, projectsApp)')).toBeGreaterThan(-1)

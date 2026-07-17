@@ -55,6 +55,11 @@ function parsePage(limitInput: string | undefined, cursorInput: string | undefin
   return { limit, offset }
 }
 
+function nextCursor(page: Page, resultLength: number): string | null {
+  const nextOffset = page.offset + page.limit
+  return resultLength > page.limit && nextOffset <= MAX_PAGE_OFFSET ? String(nextOffset) : null
+}
+
 async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> {
   if (auth.memberId) return auth.memberId
   if (!auth.email) return null
@@ -217,7 +222,7 @@ projectsApp.get('/', async (c) => {
   }
   return c.json({
     projects: [...parentContexts, ...projects],
-    next_cursor: resultRows.length > page.limit ? String(page.offset + page.limit) : null,
+    next_cursor: nextCursor(page, resultRows.length),
   })
 })
 
@@ -281,7 +286,7 @@ projectsApp.get('/:id/squads', async (c) => {
   const squads = result.results ?? []
   return c.json({
     squads: squads.slice(0, page.limit),
-    next_cursor: squads.length > page.limit ? String(page.offset + page.limit) : null,
+    next_cursor: nextCursor(page, squads.length),
   })
 })
 
