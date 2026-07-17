@@ -26,6 +26,7 @@ import {
   landFlight,
   landGovernedFlight,
   listFlights,
+  listFlightProjectMismatchTaskIds,
   listIncompleteFlightTaskIds,
   FlightProjectError,
   type FlightStatus,
@@ -204,6 +205,14 @@ flightsApp.post('/:id/land', async (c) => {
       actor: { kind: 'member', id: auth.id.memberId },
     })
     if (!transitioned) {
+      const projectMismatchTaskIds = await listFlightProjectMismatchTaskIds(
+        c.env,
+        existing.project_id,
+        governedMeta.task_ids,
+      )
+      if (projectMismatchTaskIds.length > 0) {
+        return c.json({ error: 'flight_task_project_conflict', task_ids: projectMismatchTaskIds }, 409)
+      }
       const incompleteTaskIds = await listIncompleteFlightTaskIds(c.env, governedMeta.task_ids)
       if (incompleteTaskIds.length > 0) {
         return c.json({ error: 'flight_tasks_incomplete', task_ids: incompleteTaskIds }, 409)

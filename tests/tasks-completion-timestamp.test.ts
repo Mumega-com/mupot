@@ -5,6 +5,7 @@ import type { Env, Task } from '../src/types'
 const approvedTask: Task = {
   id: 'task-approved',
   squad_id: 'squad-1',
+  project_id: null,
   title: 'Land the governed flight',
   body: 'Complete after the owner verdict.',
   done_when: 'The owner verdict is approved and the flight can land.',

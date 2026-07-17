@@ -55,21 +55,56 @@ function actor(overrides: Partial<AuthContext> = {}): AuthContext {
   }
 }
 
-function envFor(harness: SqliteD1Harness, queries?: string[]): Env {
+function envFor(
+  harness: SqliteD1Harness,
+  queries?: string[],
+  beforeTaskUpdate?: () => void,
+): Env {
   const db = queries
     ? {
         prepare(sql: string) {
           queries.push(sql)
-          return harness.db.prepare(sql)
+          return wrapTaskUpdate(harness.db.prepare(sql), sql, beforeTaskUpdate)
         },
         batch: harness.db.batch.bind(harness.db),
       }
-    : harness.db
+    : beforeTaskUpdate
+      ? {
+          prepare(sql: string) {
+            return wrapTaskUpdate(harness.db.prepare(sql), sql, beforeTaskUpdate)
+          },
+          batch: harness.db.batch.bind(harness.db),
+        }
+      : harness.db
   return {
     DB: db,
     TENANT_SLUG: 'pot-a',
     BUS: { send: vi.fn(async () => undefined) },
   } as unknown as Env
+}
+
+function wrapTaskUpdate<T extends object>(statement: T, sql: string, beforeTaskUpdate?: () => void): T {
+  if (!beforeTaskUpdate || !/^UPDATE tasks\s+SET title =/m.test(sql)) return statement
+  let fired = false
+  const wrap = (target: object): object => new Proxy(target, {
+    get(current, property) {
+      if (property === 'bind') {
+        return (...values: unknown[]) => wrap((current as { bind(...args: unknown[]): object }).bind(...values))
+      }
+      if (property === 'run') {
+        return async () => {
+          if (!fired) {
+            fired = true
+            beforeTaskUpdate()
+          }
+          return (current as { run(): Promise<unknown> }).run()
+        }
+      }
+      const value = Reflect.get(current, property)
+      return typeof value === 'function' ? value.bind(current) : value
+    },
+  })
+  return wrap(statement) as T
 }
 
 function request(path: string, method = 'GET', body?: unknown): Request {
@@ -170,10 +205,14 @@ describe('task project attribution', () => {
   it('filters inside the existing bounded readable-squad queries without changing the absent-filter path', async () => {
     harness = makeHarness()
     harness.sqlite.exec(`
+      UPDATE project_squad_access SET access_level = 'write'
+       WHERE project_id = 'project-read' AND squad_id = 'squad-a';
       INSERT INTO tasks (id, squad_id, title, done_when, status, project_id) VALUES ('task-write', 'squad-a', 'Write work', 'done', 'open', 'project-write');
       INSERT INTO tasks (id, squad_id, title, done_when, status, project_id) VALUES ('task-read', 'squad-a', 'Read work', 'done', 'open', 'project-read');
       INSERT INTO tasks (id, squad_id, title, done_when, status, project_id) VALUES ('task-hidden', 'squad-b', 'Hidden work', 'done', 'open', 'project-hidden');
       INSERT INTO tasks (id, squad_id, title, done_when, status) VALUES ('task-unassigned', 'squad-a', 'Unassigned', 'done', 'open');
+      UPDATE project_squad_access SET access_level = 'read'
+       WHERE project_id = 'project-read' AND squad_id = 'squad-a';
     `)
     authState.current = actor()
 
@@ -218,5 +257,69 @@ describe('task project attribution', () => {
     const removed = await fetch(harness, '/task-a', 'PATCH', { project_id: null })
     expect(removed.status).toBe(200)
     await expect(removed.json()).resolves.toMatchObject({ task: { id: 'task-a', project_id: null } })
+  })
+
+  it('returns a stable conflict and emits no event when a concurrent reassignment wins', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, done_when, status, project_id)
+      VALUES ('task-race', 'squad-a', 'Original', 'done', 'open', 'project-write')
+    `)
+    authState.current = actor()
+    const events: unknown[] = []
+    const env = envFor(harness, undefined, () => {
+      harness!.sqlite.exec(`
+        UPDATE tasks
+           SET project_id = NULL, updated_at = 'concurrent-update'
+         WHERE id = 'task-race'
+      `)
+    })
+    env.BUS = { send: vi.fn(async (event: unknown) => { events.push(event) }) } as Env['BUS']
+
+    const response = await tasksApp.fetch(request('/task-race', 'PATCH', { title: 'Stale title' }), env)
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'task_update_conflict' })
+    expect(harness.sqlite.prepare(`SELECT title, project_id FROM tasks WHERE id = 'task-race'`).get())
+      .toEqual({ title: 'Original', project_id: null })
+    expect(events).toEqual([])
+  })
+
+  it('revalidates the effective project on every patch and maps an archive race to conflict', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, done_when, status, project_id)
+      VALUES ('task-archive-race', 'squad-a', 'Original', 'done', 'open', 'project-write')
+    `)
+    authState.current = actor()
+    const env = envFor(harness, undefined, () => {
+      harness!.sqlite.exec(`UPDATE projects SET status = 'archived' WHERE id = 'project-write'`)
+    })
+
+    const response = await tasksApp.fetch(request('/task-archive-race', 'PATCH', { body: 'stale body' }), env)
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'task_update_conflict' })
+    expect(harness.sqlite.prepare(`SELECT body FROM tasks WHERE id = 'task-archive-race'`).get())
+      .toEqual({ body: '' })
+  })
+
+  it('maps durable attributed-flight task locks to a stable project conflict', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, done_when, status, project_id)
+      VALUES ('task-locked', 'squad-a', 'Locked', 'done', 'open', 'project-write');
+      INSERT INTO flights (id, tenant, agent, goal, meta, project_id)
+      VALUES (
+        'flight-lock', 'pot-a', 'agent', 'Lock task',
+        '{"schema":"mupot.flight.meta/v1","goal_id":"goal","objective_id":"objective","squad_ids":["squad-a"],"task_ids":["task-locked"],"done_when":["done"],"artifact_refs":[]}',
+        'project-write'
+      );
+    `)
+    authState.current = actor()
+
+    const response = await fetch(harness, '/task-locked', 'PATCH', { project_id: null })
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'task_project_locked' })
+    expect(harness.sqlite.prepare(`SELECT project_id FROM tasks WHERE id = 'task-locked'`).get())
+      .toEqual({ project_id: 'project-write' })
   })
 })

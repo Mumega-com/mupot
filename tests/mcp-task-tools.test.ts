@@ -28,6 +28,7 @@ function task(overrides: Partial<Task> = {}): Task {
   return {
     id: 'task-1',
     squad_id: SQUAD_ID,
+    project_id: null,
     title: 'Ship the adapter',
     body: 'wire the task tools',
     done_when: 'task tool tests pass',
@@ -229,8 +230,11 @@ describe('MCP task cutover tools', () => {
       null,
       null,
       null,
+      null,
       result.task.updated_at,
       'task-1',
+      '2026-07-08T00:00:00.000Z',
+      null,
     ])
     expect(events).toEqual([
       expect.objectContaining({

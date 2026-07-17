@@ -49,6 +49,8 @@ function makeHarness(): SqliteD1Harness {
     INSERT INTO projects (id, slug, name, status) VALUES ('project-a', 'project-a', 'Project A', 'active');
     INSERT INTO projects (id, slug, name, status) VALUES ('project-b', 'project-b', 'Project B', 'active');
     INSERT INTO projects (id, slug, name, status) VALUES ('project-archived', 'project-archived', 'Archived', 'archived');
+    INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('project-a', 'squad-a', 'write');
+    INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('project-b', 'squad-a', 'write');
     INSERT INTO tasks (id, squad_id, title, done_when, status, project_id) VALUES ('task-a', 'squad-a', 'Task A', 'done', 'open', 'project-a');
     INSERT INTO tasks (id, squad_id, title, done_when, status, project_id) VALUES ('task-b', 'squad-a', 'Task B', 'done', 'open', 'project-b');
     INSERT INTO tasks (id, squad_id, title, done_when, status) VALUES ('task-unassigned', 'squad-a', 'Unassigned', 'done', 'open');
@@ -175,29 +177,62 @@ describe('flight project attribution', () => {
     expect(legacyQueries.some((sql) => sql.includes('FROM flights WHERE tenant=?1 ORDER BY created_at DESC LIMIT ?2'))).toBe(true)
   })
 
-  it('maps a final unknown-project trigger failure to a stable service error', async () => {
-    const env = {
-      TENANT_SLUG: 'pot-a',
-      DB: {
-        prepare(sql: string) {
-          return {
-            bind() {
-              return {
-                async first() {
-                  if (sql.includes('SELECT status FROM projects')) return { status: 'active' }
-                  return null
-                },
-                async run() {
-                  throw new Error('unknown project_id')
-                },
-              }
-            },
-          }
+  it('maps final project trigger failures to stable service errors', async () => {
+    for (const [message, code] of [
+      ['flight project not found', 'project_not_found'],
+      ['flight project archived', 'archived_project'],
+      ['flight task project mismatch', 'flight_task_project_mismatch'],
+    ] as const) {
+      const env = {
+        TENANT_SLUG: 'pot-a',
+        DB: {
+          prepare(sql: string) {
+            return {
+              bind() {
+                return {
+                  async first() {
+                    if (sql.includes('SELECT status FROM projects')) return { status: 'active' }
+                    return null
+                  },
+                  async run() {
+                    throw new Error(message)
+                  },
+                }
+              },
+            }
+          },
         },
-      },
-    } as unknown as Env
+      } as unknown as Env
 
-    await expect(createFlight(env, { agent: 'agent-a', goal: 'g', project_id: 'project-a' }))
-      .rejects.toMatchObject({ code: 'project_not_found' })
+      await expect(createFlight(env, { agent: 'agent-a', goal: 'g', project_id: 'project-a' }))
+        .rejects.toMatchObject({ code })
+    }
+  })
+
+  it('refuses governed landing when a legacy drifted task no longer matches the flight project', async () => {
+    harness = makeHarness()
+    harness.sqlite.prepare(`
+      INSERT INTO flights (id, tenant, agent, goal, status, budget_micro_usd, meta, project_id)
+      VALUES ('flight-drift', 'pot-a', 'agent-a', 'Drifted', 'running', 10, ?, 'project-a')
+    `).run(JSON.stringify(meta))
+    // Model a legacy/directly-corrupted row that predates the durable task lock.
+    harness.sqlite.exec(`
+      DROP TRIGGER validate_tasks_project_id_update;
+      UPDATE tasks SET project_id = 'project-b', status = 'done' WHERE id = 'task-a';
+    `)
+
+    const response = await flightsApp.request('https://pot.test/flight-drift/land', {
+      method: 'POST',
+      headers: { authorization: 'Bearer admin', 'content-type': 'application/json' },
+      body: JSON.stringify({ cost_micro_usd: 1 }),
+    }, envFor(harness))
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({
+      error: 'flight_task_project_conflict',
+      task_ids: ['task-a'],
+    })
+    expect(harness.sqlite.prepare(`SELECT status FROM flights WHERE id = 'flight-drift'`).get())
+      .toEqual({ status: 'running' })
   })
 })

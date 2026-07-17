@@ -120,6 +120,15 @@ export class TaskProjectError extends Error {
   }
 }
 
+export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_project_locked'
+
+export class TaskUpdateConflictError extends Error {
+  constructor(readonly code: TaskUpdateConflictCode) {
+    super(code)
+    this.name = 'TaskUpdateConflictError'
+  }
+}
+
 export async function validateTaskProjectAttribution(
   env: Env,
   projectId: string | null,
@@ -143,8 +152,59 @@ export async function validateTaskProjectAttribution(
 
 function mapTaskProjectInsertError(error: unknown): never {
   const message = error instanceof Error ? error.message : String(error)
-  if (message.includes('unknown project_id')) throw new TaskProjectError('project_not_found')
+  if (message.includes('task project not found')) throw new TaskProjectError('project_not_found')
+  if (message.includes('task project archived')) throw new TaskProjectError('archived_project')
+  if (message.includes('task project access denied')) throw new TaskProjectError('project_access_forbidden')
   throw error
+}
+
+function mapTaskProjectUpdateError(error: unknown): never {
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.includes('task project locked by flight')) {
+    throw new TaskUpdateConflictError('task_project_locked')
+  }
+  if (
+    message.includes('task project not found')
+    || message.includes('task project archived')
+    || message.includes('task project access denied')
+  ) {
+    throw new TaskUpdateConflictError('task_update_conflict')
+  }
+  throw error
+}
+
+export async function persistTaskUpdate(
+  env: Env,
+  existing: Task,
+  next: Task,
+): Promise<void> {
+  let result
+  try {
+    result = await env.DB.prepare(
+      `UPDATE tasks
+          SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
+        WHERE id = ? AND updated_at = ? AND project_id IS ?`,
+    )
+      .bind(
+        next.title,
+        next.body,
+        next.done_when,
+        next.status,
+        next.assignee_agent_id,
+        next.github_issue_url,
+        next.gate_owner,
+        next.project_id,
+        next.completed_at,
+        next.updated_at,
+        next.id,
+        existing.updated_at,
+        existing.project_id,
+      )
+      .run()
+  } catch (error) {
+    mapTaskProjectUpdateError(error)
+  }
+  if (!result.meta?.changes) throw new TaskUpdateConflictError('task_update_conflict')
 }
 
 function isNonEmptyString(v: unknown): v is string {

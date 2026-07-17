@@ -46,7 +46,11 @@ import {
   isDoneWhenValid,
   mirrorTaskUpdate,
   patchToDoneBypassesGate,
+  persistTaskUpdate,
   stampTaskUpdate,
+  TaskProjectError,
+  TaskUpdateConflictError,
+  validateTaskProjectAttribution,
 } from '../tasks/service'
 import type { TaskStatus } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
@@ -73,8 +77,10 @@ import {
   deliverFlightLandedEvent,
   getFlight,
   landGovernedFlight,
+  listFlightProjectMismatchTaskIds,
   listFlightsForSquad,
   listIncompleteFlightTaskIds,
+  FlightProjectError,
   type FlightRow,
 } from '../flight/service'
 import { parseDispatchBody } from '../flight/routes'
@@ -368,6 +374,7 @@ type JsonSchema = {
 }
 
 const STRING_SCHEMA = { type: 'string' }
+const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
 const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
 const TASK_STATUSES: readonly TaskStatus[] = ['open', 'in_progress', 'blocked', 'done', 'review', 'approved', 'rejected']
@@ -430,6 +437,23 @@ async function resolveTaskSquad(
   )
 }
 
+async function canReadProjectForSquad(env: Env, projectId: string, squadId: string): Promise<boolean> {
+  return (await env.DB.prepare(
+    `SELECT 1
+       FROM projects p
+       JOIN project_squad_access psa ON psa.project_id = p.id
+      WHERE p.id = ?1 AND psa.squad_id = ?2`,
+  ).bind(projectId, squadId).first()) !== null
+}
+
+function taskProjectFailure(error: TaskProjectError): ToolOutcome {
+  if (error.code === 'project_not_found') return fail(404, error.code)
+  if (error.code === 'project_access_forbidden') {
+    return fail(403, 'forbidden', { need: 'project_write' })
+  }
+  return fail(400, error.code)
+}
+
 async function resolveScopedSquad(
   env: Env,
   auth: AuthContext,
@@ -461,11 +485,12 @@ const toolTaskCreate: ToolSpec = {
   name: 'task_create',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, title: string, done_when: string, body?: string, assignee_agent_id?: string }',
+  args: '{ squad_id: string, project_id?: string|null, title: string, done_when: string, body?: string, assignee_agent_id?: string }',
   inputSchema: {
     type: 'object',
     properties: {
       squad_id: STRING_SCHEMA,
+      project_id: NULLABLE_STRING_SCHEMA,
       title: STRING_SCHEMA,
       done_when: { ...STRING_SCHEMA, description: 'Verifiable success predicate — a checkable condition that proves the task is complete.' },
       body: STRING_SCHEMA,
@@ -503,17 +528,26 @@ const toolTaskCreate: ToolSpec = {
     const assignee = await resolveTaskAssignee(env, args.assignee_agent_id, squad.id)
     if (assignee.error) return fail(400, assignee.error)
 
-    const task = await createTask(
-      env,
-      {
-        squad_id: squad.id,
-        title: title.trim(),
-        done_when: doneWhen,
-        body,
-        assignee_agent_id: assignee.value,
-      },
-      { actor: memberActor(auth.memberId as string) },
-    )
+    const projectId = args.project_id == null ? null : str(args.project_id)
+    if (args.project_id != null && !projectId) return fail(400, 'invalid_project_id')
+    let task
+    try {
+      task = await createTask(
+        env,
+        {
+          squad_id: squad.id,
+          project_id: projectId,
+          title: title.trim(),
+          done_when: doneWhen,
+          body,
+          assignee_agent_id: assignee.value,
+        },
+        { actor: memberActor(auth.memberId as string) },
+      )
+    } catch (error) {
+      if (error instanceof TaskProjectError) return taskProjectFailure(error)
+      throw error
+    }
 
     return done({ task })
   },
@@ -526,11 +560,12 @@ const toolTaskList: ToolSpec = {
   name: 'task_list',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review"|"approved"|"rejected", assignee_agent_id?: string, limit?: number }',
+  args: '{ squad_id?: string, project_id?: string|null, status?: "open"|"in_progress"|"blocked"|"done"|"review"|"approved"|"rejected", assignee_agent_id?: string, limit?: number }',
   inputSchema: {
     type: 'object',
     properties: {
       squad_id: STRING_SCHEMA,
+      project_id: NULLABLE_STRING_SCHEMA,
       status: STRING_SCHEMA,
       assignee_agent_id: STRING_SCHEMA,
       limit: OPTIONAL_NUMBER_SCHEMA,
@@ -553,6 +588,16 @@ const toolTaskList: ToolSpec = {
 
     const baseClauses = ['squad_id = ?1']
     const baseBinds: unknown[] = [squadRes.squad.id]
+    const parsedProjectId = args.project_id == null ? undefined : str(args.project_id)
+    if (args.project_id != null && !parsedProjectId) return fail(400, 'invalid_project_id')
+    const projectId = parsedProjectId ?? undefined
+    if (projectId) {
+      if (!(await canReadProjectForSquad(env, projectId, squadRes.squad.id))) {
+        return fail(404, 'project_not_found')
+      }
+      baseClauses.push(`project_id = ?${baseBinds.length + 1}`)
+      baseBinds.push(projectId)
+    }
     if (typeof assignee === 'string' && assignee.trim()) {
       baseClauses.push(`assignee_agent_id = ?${baseBinds.length + 1}`)
       baseBinds.push(assignee.trim())
@@ -681,11 +726,12 @@ const toolTaskUpdate: ToolSpec = {
   name: 'task_update',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", assignee_agent_id?: string|null, gate_owner?: string|null }',
+  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", assignee_agent_id?: string|null, gate_owner?: string|null }',
   inputSchema: {
     type: 'object',
     properties: {
       task_id: STRING_SCHEMA,
+      project_id: NULLABLE_STRING_SCHEMA,
       title: STRING_SCHEMA,
       body: STRING_SCHEMA,
       done_when: STRING_SCHEMA,
@@ -778,30 +824,29 @@ const toolTaskUpdate: ToolSpec = {
       }
       changed = true
     }
+    if (args.project_id !== undefined) {
+      const projectId = args.project_id === null ? null : str(args.project_id)
+      if (args.project_id !== null && !projectId) return fail(400, 'invalid_project_id')
+      next.project_id = projectId
+      changed = true
+    }
     if (!changed) return fail(400, 'invalid_args', 'at least one update field is required')
 
-    stampTaskUpdate(next, existing.status, new Date().toISOString())
-    next.github_issue_url = await mirrorTaskUpdate(env, next)
+    try {
+      await validateTaskProjectAttribution(env, next.project_id, existing.squad_id)
+    } catch (error) {
+      if (error instanceof TaskProjectError) return taskProjectFailure(error)
+      throw error
+    }
 
-    const res = await env.DB.prepare(
-      `UPDATE tasks
-          SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, completed_at = ?, updated_at = ?
-        WHERE id = ?`,
-    )
-      .bind(
-        next.title,
-        next.body,
-        next.done_when,
-        next.status,
-        next.assignee_agent_id,
-        next.github_issue_url,
-        next.gate_owner,
-        next.completed_at,
-        next.updated_at,
-        next.id,
-      )
-      .run()
-    if (!res.meta?.changes) return fail(409, 'task_update_race')
+    stampTaskUpdate(next, existing.status, new Date().toISOString())
+    try {
+      await persistTaskUpdate(env, existing, next)
+    } catch (error) {
+      if (error instanceof TaskUpdateConflictError) return fail(409, error.code)
+      throw error
+    }
+    next.github_issue_url = await mirrorTaskUpdate(env, next)
 
     await emitTaskEvent(env, 'task.updated', next, memberActor(auth.memberId as string))
     return done({ task: next })
@@ -966,11 +1011,12 @@ const toolFlightDispatch: ToolSpec = {
   name: 'flight_dispatch',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, goal: string, meta_json: string, signals_json: string, budget_micro_usd?: number }',
+  args: '{ squad_id: string, project_id?: string|null, goal: string, meta_json: string, signals_json: string, budget_micro_usd?: number }',
   inputSchema: {
     type: 'object',
     properties: {
       squad_id: STRING_SCHEMA,
+      project_id: NULLABLE_STRING_SCHEMA,
       goal: STRING_SCHEMA,
       meta_json: STRING_SCHEMA,
       signals_json: STRING_SCHEMA,
@@ -1012,6 +1058,11 @@ const toolFlightDispatch: ToolSpec = {
       }
     }
 
+    const projectId = args.project_id == null ? undefined : str(args.project_id)
+    if (args.project_id != null && (!projectId || projectId.length > 200)) {
+      return fail(400, 'invalid_project_id')
+    }
+
     let budgetCeilingMicroUsd = 0
     if ((requestedBudget as number) > 0) {
       const caps = [boundAgent.budget_cap_cents, ...referencedSquads.map((item) => item.budget_cap_cents)]
@@ -1023,7 +1074,7 @@ const toolFlightDispatch: ToolSpec = {
         return fail(409, 'flight_budget_exceeds_cap', { cap_micro_usd: budgetCeilingMicroUsd })
       }
     }
-    const references = await validateFlightMetaReferences(env, meta)
+    const references = await validateFlightMetaReferences(env, meta, projectId)
     if (!references.ok) {
       const error = references.error === 'flight_task_scope_mismatch'
         ? 'flight_task_not_found'
@@ -1034,6 +1085,7 @@ const toolFlightDispatch: ToolSpec = {
     const parsed = parseDispatchBody({
       agent: auth.boundAgentId,
       goal,
+      project_id: projectId,
       trigger_source: 'api',
       budget_micro_usd: requestedBudget,
       meta,
@@ -1043,7 +1095,13 @@ const toolFlightDispatch: ToolSpec = {
     parsed.value.signals.budgetEstimateMicroUsd = requestedBudget as number
     parsed.value.signals.budgetRemainingMicroUsd = budgetCeilingMicroUsd
 
-    const preflight = await dispatchFlight(env, parsed.value.flight, parsed.value.signals, parsed.value.opts)
+    let preflight
+    try {
+      preflight = await dispatchFlight(env, parsed.value.flight, parsed.value.signals, parsed.value.opts)
+    } catch (error) {
+      if (!(error instanceof FlightProjectError)) throw error
+      return fail(error.code === 'project_not_found' ? 404 : 400, error.code)
+    }
     const flight = await getFlight(env, preflight.id)
     if (!flight) return fail(500, 'flight_record_missing')
     return done({ flight: flightWithParsedMeta(flight, meta), preflight })
@@ -1135,6 +1193,10 @@ const toolFlightLand: ToolSpec = {
       actor: { kind: 'agent', id: auth.boundAgentId },
     })
     if (!transitioned) {
+      const projectMismatchTaskIds = await listFlightProjectMismatchTaskIds(env, flight.project_id, meta.task_ids)
+      if (projectMismatchTaskIds.length > 0) {
+        return fail(409, 'flight_task_project_conflict', { task_ids: projectMismatchTaskIds })
+      }
       const incompleteTaskIds = await listIncompleteFlightTaskIds(env, meta.task_ids)
       if (incompleteTaskIds.length > 0) {
         return fail(409, 'flight_tasks_incomplete', { task_ids: incompleteTaskIds })
@@ -1152,10 +1214,10 @@ const toolFlightList: ToolSpec = {
   name: 'flight_list',
   scope: 'squad',
   min: 'observer',
-  args: '{ squad_id: string, limit?: number, cursor?: string }',
+  args: '{ squad_id: string, project_id?: string|null, limit?: number, cursor?: string }',
   inputSchema: {
     type: 'object',
-    properties: { squad_id: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA, cursor: STRING_SCHEMA },
+    properties: { squad_id: STRING_SCHEMA, project_id: NULLABLE_STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA, cursor: STRING_SCHEMA },
     required: ['squad_id'],
     additionalProperties: false,
   },
@@ -1167,6 +1229,12 @@ const toolFlightList: ToolSpec = {
     const grants = auth.capabilities ?? []
     if (!(await memberCanOnSquad(env, grants, squad.id, 'observer'))) {
       return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
+    }
+    const parsedProjectId = args.project_id == null ? undefined : str(args.project_id)
+    if (args.project_id != null && !parsedProjectId) return fail(400, 'invalid_project_id')
+    const projectId = parsedProjectId ?? undefined
+    if (projectId && !(await canReadProjectForSquad(env, projectId, squad.id))) {
+      return fail(404, 'project_not_found')
     }
     const limit = readLimit(args.limit, 100, 500)
     if (typeof limit !== 'number') return limit
@@ -1181,7 +1249,7 @@ const toolFlightList: ToolSpec = {
     let hasMore = false
 
     scan: while (visible.length < limit && pages < 10) {
-      const page = await listFlightsForSquad(env, squad.id, pageSize, before)
+      const page = await listFlightsForSquad(env, squad.id, pageSize, before, projectId)
       pages += 1
       if (page.length === 0) break
       const candidates = page.map((flight) => ({ flight, meta: parseFlightMetaV1(parseJsonArg(flight.meta)) }))

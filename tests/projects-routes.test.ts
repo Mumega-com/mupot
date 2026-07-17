@@ -71,11 +71,13 @@ function seedProjects(harness: SqliteD1Harness): void {
     INSERT INTO projects (id, slug, name, status, parent_project_id) VALUES ('visible-child', 'visible-child', 'Visible child', 'active', 'parent');
     INSERT INTO projects (id, slug, name, status, parent_project_id) VALUES ('hidden-child', 'hidden-child', 'Hidden child', 'active', 'parent');
     INSERT INTO projects (id, slug, name, status) VALUES ('other-root', 'other-root', 'Other root', 'active');
-    INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('visible-child', 'squad-a', 'read');
-    INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('hidden-child', 'squad-b', 'read');
+    INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('visible-child', 'squad-a', 'write');
+    INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('hidden-child', 'squad-b', 'write');
     INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('other-root', 'squad-b', 'read');
     INSERT INTO tasks (id, squad_id, title, status, project_id) VALUES ('visible-task', 'squad-a', 'Visible work', 'open', 'visible-child');
     INSERT INTO tasks (id, squad_id, title, status, project_id) VALUES ('hidden-task', 'squad-b', 'Hidden work', 'open', 'hidden-child');
+    UPDATE project_squad_access SET access_level = 'read'
+     WHERE project_id IN ('visible-child', 'hidden-child');
     INSERT INTO flights (id, tenant, agent, goal, status, project_id) VALUES ('visible-flight', 'pot-a', 'agent-a', 'Visible flight', 'running', 'visible-child');
     INSERT INTO flights (id, tenant, agent, goal, status, project_id) VALUES ('hidden-flight', 'pot-a', 'agent-b', 'Hidden flight', 'running', 'hidden-child');
   `)

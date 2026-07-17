@@ -52,12 +52,12 @@ describe('0055_projects migration', () => {
 
       expect(() => sqlite.exec(`INSERT INTO projects (id, slug, name, status) VALUES ('bad', 'bad', 'Bad', 'invalid')`)).toThrow()
       expect(() => sqlite.exec(`INSERT INTO projects (id, slug, name, parent_project_id) VALUES ('self', 'self', 'Self', 'self')`)).toThrow()
-      expect(() => sqlite.exec(`UPDATE tasks SET project_id = 'missing' WHERE id = 'task-legacy'`)).toThrow(/unknown project_id/)
-      expect(() => sqlite.exec(`UPDATE flights SET project_id = 'missing' WHERE id = 'flight-legacy'`)).toThrow(/unknown project_id/)
+      expect(() => sqlite.exec(`UPDATE tasks SET project_id = 'missing' WHERE id = 'task-legacy'`)).toThrow(/task project not found/)
+      expect(() => sqlite.exec(`UPDATE flights SET project_id = 'missing' WHERE id = 'flight-legacy'`)).toThrow(/flight project not found/)
       expect(() => sqlite.exec(`INSERT INTO tasks (id, squad_id, title, project_id) VALUES ('task-unknown', 'squad-1', 'Unknown project', 'missing')`))
-        .toThrow(/unknown project_id/)
+        .toThrow(/task project not found/)
       expect(() => sqlite.exec(`INSERT INTO flights (id, tenant, agent, goal, project_id) VALUES ('flight-unknown', 'tenant', 'agent-1', 'Unknown project', 'missing')`))
-        .toThrow(/unknown project_id/)
+        .toThrow(/flight project not found/)
       expect(() => sqlite.exec(`INSERT INTO projects (id, slug, name, parent_project_id) VALUES ('missing-parent', 'missing-parent', 'Missing parent', 'missing')`))
         .toThrow(/parent project not found/)
       sqlite.exec(`INSERT INTO projects (id, slug, name, status) VALUES ('root', 'root', 'Root', 'active')`)
@@ -93,6 +93,132 @@ describe('0055_projects migration', () => {
       expect(indexesFor('project_squad_access').map((row) => row.name)).toContain('idx_project_squad_access_squad_project')
       expect(indexesFor('tasks').map((row) => row.name)).toContain('idx_tasks_project_status')
       expect(indexesFor('flights').map((row) => row.name)).toContain('idx_flights_project_status')
+    } finally {
+      close()
+    }
+  })
+
+  it('atomically enforces active write-authorized task attribution on every write', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      applyPriorMigrations(sqlite)
+      sqlite.exec(readFileSync(join(MIGRATIONS_DIR, PROJECTS_MIGRATION), 'utf8'))
+      sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Department');
+        INSERT INTO squads (id, department_id, slug, name) VALUES
+          ('squad-1', 'dept-1', 'one', 'One'),
+          ('squad-2', 'dept-1', 'two', 'Two');
+        INSERT INTO projects (id, slug, name, status) VALUES
+          ('project-write', 'write', 'Write', 'active'),
+          ('project-read', 'read', 'Read', 'active'),
+          ('project-archived', 'archived', 'Archived', 'archived');
+        INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+          ('project-write', 'squad-1', 'write'),
+          ('project-read', 'squad-1', 'read');
+      `)
+
+      expect(() => sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, title, project_id)
+        VALUES ('task-read', 'squad-1', 'Read only', 'project-read')
+      `)).toThrow(/task project access denied/)
+      expect(() => sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, title, project_id)
+        VALUES ('task-archived', 'squad-1', 'Archived', 'project-archived')
+      `)).toThrow(/task project archived/)
+      expect(() => sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, title, project_id)
+        VALUES ('task-wrong-squad', 'squad-2', 'Wrong squad', 'project-write')
+      `)).toThrow(/task project access denied/)
+
+      sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, title, project_id)
+        VALUES ('task-write', 'squad-1', 'Write', 'project-write')
+      `)
+      sqlite.exec(`
+        DELETE FROM project_squad_access
+        WHERE project_id = 'project-write' AND squad_id = 'squad-1'
+      `)
+      expect(() => sqlite.exec(`UPDATE tasks SET title = 'stale mutation' WHERE id = 'task-write'`))
+        .toThrow(/task project access denied/)
+      expect(sqlite.prepare(`SELECT title FROM tasks WHERE id = 'task-write'`).get())
+        .toEqual({ title: 'Write' })
+
+      sqlite.exec(`
+        INSERT INTO project_squad_access (project_id, squad_id, access_level)
+        VALUES ('project-write', 'squad-1', 'admin');
+        UPDATE projects SET status = 'archived' WHERE id = 'project-write';
+      `)
+      expect(() => sqlite.exec(`UPDATE tasks SET body = 'stale after archive' WHERE id = 'task-write'`))
+        .toThrow(/task project archived/)
+    } finally {
+      close()
+    }
+  })
+
+  it('durably keeps governed flights and attributed tasks on the same project in both race orders', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      applyPriorMigrations(sqlite)
+      sqlite.exec(readFileSync(join(MIGRATIONS_DIR, PROJECTS_MIGRATION), 'utf8'))
+      sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Department');
+        INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'squad', 'Squad');
+        INSERT INTO projects (id, slug, name, status) VALUES
+          ('project-a', 'a', 'A', 'active'),
+          ('project-b', 'b', 'B', 'active'),
+          ('project-archived', 'archived', 'Archived', 'archived');
+        INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+          ('project-a', 'squad-1', 'write'),
+          ('project-b', 'squad-1', 'write');
+        INSERT INTO tasks (id, squad_id, title, project_id) VALUES
+          ('task-flight-first', 'squad-1', 'Flight first', 'project-a'),
+          ('task-task-first', 'squad-1', 'Task first', 'project-a'),
+          ('task-legacy-meta', 'squad-1', 'Legacy meta', 'project-a');
+        INSERT INTO flights (id, tenant, agent, goal, meta, project_id)
+        VALUES ('flight-legacy-meta', 'tenant', 'agent', 'Legacy meta', 'not-json', 'project-a');
+        UPDATE flights SET status = 'running' WHERE id = 'flight-legacy-meta';
+        UPDATE tasks SET project_id = 'project-b' WHERE id = 'task-legacy-meta';
+      `)
+
+      const flightFirstMeta = JSON.stringify({
+        schema: 'mupot.flight.meta/v1',
+        goal_id: 'goal-a',
+        objective_id: 'objective-a',
+        squad_ids: ['squad-1'],
+        task_ids: ['task-flight-first'],
+        done_when: ['done'],
+        artifact_refs: [],
+      })
+      sqlite.prepare(`
+        INSERT INTO flights (id, tenant, agent, goal, meta, project_id)
+        VALUES (?, 'tenant', 'agent', 'Flight first', ?, 'project-a')
+      `).run('flight-first', flightFirstMeta)
+      expect(() => sqlite.exec(`UPDATE tasks SET project_id = 'project-b' WHERE id = 'task-flight-first'`))
+        .toThrow(/task project locked by flight/)
+      expect(() => sqlite.exec(`UPDATE tasks SET project_id = NULL WHERE id = 'task-flight-first'`))
+        .toThrow(/task project locked by flight/)
+
+      sqlite.exec(`UPDATE tasks SET project_id = 'project-b' WHERE id = 'task-task-first'`)
+      const taskFirstMeta = JSON.stringify({
+        schema: 'mupot.flight.meta/v1',
+        goal_id: 'goal-b',
+        objective_id: 'objective-b',
+        squad_ids: ['squad-1'],
+        task_ids: ['task-task-first'],
+        done_when: ['done'],
+        artifact_refs: [],
+      })
+      expect(() => sqlite.prepare(`
+        INSERT INTO flights (id, tenant, agent, goal, meta, project_id)
+        VALUES (?, 'tenant', 'agent', 'Task first', ?, 'project-a')
+      `).run('task-first', taskFirstMeta)).toThrow(/flight task project mismatch/)
+
+      expect(() => sqlite.exec(`UPDATE flights SET project_id = 'project-b' WHERE id = 'flight-first'`))
+        .toThrow(/flight task project mismatch/)
+      expect(() => sqlite.exec(`
+        INSERT INTO flights (id, tenant, agent, goal, project_id)
+        VALUES ('archived-flight', 'tenant', 'agent', 'Archived', 'project-archived')
+      `)).toThrow(/flight project archived/)
     } finally {
       close()
     }

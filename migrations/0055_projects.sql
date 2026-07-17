@@ -108,34 +108,87 @@ END;
 
 CREATE TRIGGER validate_tasks_project_id_insert
 BEFORE INSERT ON tasks
-WHEN NEW.project_id IS NOT NULL
- AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id)
 BEGIN
-  SELECT RAISE(ABORT, 'unknown project_id');
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id)
+    THEN RAISE(ABORT, 'task project not found') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived')
+    THEN RAISE(ABORT, 'task project archived') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM project_squad_access
+      WHERE project_id = NEW.project_id
+        AND squad_id = NEW.squad_id
+        AND access_level IN ('write', 'admin')
+    ) THEN RAISE(ABORT, 'task project access denied') END;
 END;
 
 CREATE TRIGGER validate_tasks_project_id_update
-BEFORE UPDATE OF project_id ON tasks
-WHEN NEW.project_id IS NOT NULL
- AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id)
+BEFORE UPDATE ON tasks
 BEGIN
-  SELECT RAISE(ABORT, 'unknown project_id');
+  SELECT CASE WHEN OLD.project_id IS NOT NEW.project_id
+    AND EXISTS (
+      SELECT 1
+      FROM flights AS flight,
+           json_each(CASE WHEN json_valid(flight.meta) THEN flight.meta ELSE '{}' END, '$.task_ids') AS task_ref
+      WHERE flight.project_id IS NOT NULL
+        AND json_extract(CASE WHEN json_valid(flight.meta) THEN flight.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+        AND task_ref.value = OLD.id
+    ) THEN RAISE(ABORT, 'task project locked by flight') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id)
+    THEN RAISE(ABORT, 'task project not found') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived')
+    THEN RAISE(ABORT, 'task project archived') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM project_squad_access
+      WHERE project_id = NEW.project_id
+        AND squad_id = NEW.squad_id
+        AND access_level IN ('write', 'admin')
+    ) THEN RAISE(ABORT, 'task project access denied') END;
 END;
 
 CREATE TRIGGER validate_flights_project_id_insert
 BEFORE INSERT ON flights
-WHEN NEW.project_id IS NOT NULL
- AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id)
 BEGIN
-  SELECT RAISE(ABORT, 'unknown project_id');
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id)
+    THEN RAISE(ABORT, 'flight project not found') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived')
+    THEN RAISE(ABORT, 'flight project archived') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND json_valid(NEW.meta)
+    AND json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+    AND EXISTS (
+      SELECT 1
+      FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.task_ids') AS task_ref
+      LEFT JOIN tasks ON tasks.id = task_ref.value
+      WHERE tasks.id IS NULL OR tasks.project_id IS NOT NEW.project_id
+    ) THEN RAISE(ABORT, 'flight task project mismatch') END;
 END;
 
 CREATE TRIGGER validate_flights_project_id_update
-BEFORE UPDATE OF project_id ON flights
-WHEN NEW.project_id IS NOT NULL
- AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id)
+BEFORE UPDATE ON flights
 BEGIN
-  SELECT RAISE(ABORT, 'unknown project_id');
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id)
+    THEN RAISE(ABORT, 'flight project not found') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND status = 'archived')
+    THEN RAISE(ABORT, 'flight project archived') END;
+  SELECT CASE WHEN NEW.project_id IS NOT NULL
+    AND json_valid(NEW.meta)
+    AND json_extract(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+    AND EXISTS (
+      SELECT 1
+      FROM json_each(CASE WHEN json_valid(NEW.meta) THEN NEW.meta ELSE '{}' END, '$.task_ids') AS task_ref
+      LEFT JOIN tasks ON tasks.id = task_ref.value
+      WHERE tasks.id IS NULL OR tasks.project_id IS NOT NEW.project_id
+    ) THEN RAISE(ABORT, 'flight task project mismatch') END;
 END;
 
 CREATE INDEX IF NOT EXISTS idx_projects_parent_status

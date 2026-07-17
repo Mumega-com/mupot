@@ -23,7 +23,7 @@ import { requireAuth } from '../auth'
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap } from '../auth/capability'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, validateTaskProjectAttribution } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
@@ -633,41 +633,31 @@ tasksApp.patch('/:id', async (c) => {
         ? body.project_id.trim()
         : undefined
     if (projectId === undefined) return c.json({ error: 'invalid_project_id' }, 400)
-    try {
-      await validateTaskProjectAttribution(c.env, projectId, existing.squad_id)
-    } catch (error) {
-      if (!(error instanceof TaskProjectError)) throw error
-      const mapped = taskProjectErrorResponse(error)
-      return c.json(mapped.body, mapped.status)
-    }
     next.project_id = projectId
+  }
+
+  // Revalidate the effective attribution for every mutation. The migration
+  // trigger repeats this check at write time to close archive/edge races.
+  try {
+    await validateTaskProjectAttribution(c.env, next.project_id, existing.squad_id)
+  } catch (error) {
+    if (!(error instanceof TaskProjectError)) throw error
+    const mapped = taskProjectErrorResponse(error)
+    return c.json(mapped.body, mapped.status)
   }
 
   stampTaskUpdate(next, existing.status, new Date().toISOString())
 
-  // Mirror the update to GitHub. Non-fatal: if it has an issue URL we PATCH it; if
-  // it never got mirrored (no repo earlier) we attempt a create now.
-  next.github_issue_url = await mirrorTaskUpdate(c.env, next)
+  try {
+    await persistTaskUpdate(c.env, existing, next)
+  } catch (error) {
+    if (error instanceof TaskUpdateConflictError) return c.json({ error: error.code }, 409)
+    throw error
+  }
 
-  await c.env.DB.prepare(
-    `UPDATE tasks
-        SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
-      WHERE id = ?`,
-  )
-    .bind(
-      next.title,
-      next.body,
-      next.done_when,
-      next.status,
-      next.assignee_agent_id,
-      next.github_issue_url,
-      next.gate_owner,
-      next.project_id,
-      next.completed_at,
-      next.updated_at,
-      next.id,
-    )
-    .run()
+  // A stale update must never reach the external mirror. The mirror remains
+  // best-effort and update-only; project attribution does not alter its auth.
+  next.github_issue_url = await mirrorTaskUpdate(c.env, next)
 
   {
     const auth = c.get('auth')

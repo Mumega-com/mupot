@@ -12,6 +12,7 @@ import type { Env, Task } from '../src/types'
 const inProgressUngated: Task = {
   id: 'task-1',
   squad_id: 'squad-1',
+  project_id: null,
   title: 'Draft the thing',
   body: 'body',
   done_when: 'The thing is drafted and reviewable.',
