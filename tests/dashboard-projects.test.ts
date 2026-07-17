@@ -1,0 +1,313 @@
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { AuthContext, Env } from '../src/types'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+
+const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
+
+vi.mock('../src/auth', () => ({
+  requireAuth: async (
+    c: {
+      get: (key: 'auth') => AuthContext | undefined
+      set: (key: 'auth', value: AuthContext) => void
+      json: (body: unknown, status: 401) => Response
+    },
+    next: () => Promise<void>,
+  ) => {
+    if (!authState.current) return c.json({ error: 'unauthenticated' }, 401)
+    c.set('auth', authState.current)
+    await next()
+  },
+}))
+
+const {
+  loadProjectDetail,
+  loadProjectsPage,
+  projectDetailBody,
+  projectsPageBody,
+} = await import('../src/dashboard/projects')
+const { dashboardApp, dashboardBuiltInGetRoutes } = await import('../src/dashboard')
+
+const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
+
+function makeHarness(): SqliteD1Harness {
+  const harness = createSqliteD1()
+  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
+    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+  }
+  harness.sqlite.exec(`
+    INSERT INTO departments (id, slug, name) VALUES
+      ('dept-a', 'dept-a', 'Department A'),
+      ('dept-b', 'dept-b', 'Department B');
+    INSERT INTO squads (id, department_id, slug, name) VALUES
+      ('squad-a', 'dept-a', 'squad-a', 'Squad Alpha'),
+      ('squad-b', 'dept-b', 'squad-b', 'Squad Beta');
+
+    INSERT INTO projects (id, slug, name, description, goal, status, target_date) VALUES
+      ('root', 'mumega-products', 'Mumega Products', 'Product portfolio', 'Build durable products', 'active', '2026-12-31'),
+      ('other-root', 'other-root', 'Other Root', 'Hidden root detail', 'Hidden root goal', 'active', NULL);
+    INSERT INTO projects (id, slug, name, description, goal, status, parent_project_id, target_date) VALUES
+      ('visible-child', 'inkwell', 'Inkwell <script>alert(1)</script>', 'Safe <b>description</b>', 'Publish & verify', 'planned', 'root', '2026-09-30'),
+      ('hidden-child', 'mirror', 'Hidden sibling secret', 'Hidden sibling detail', 'Hidden sibling goal', 'active', 'root', NULL);
+
+    INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+      ('visible-child', 'squad-a', 'write'),
+      ('visible-child', 'squad-b', 'write'),
+      ('hidden-child', 'squad-b', 'admin'),
+      ('other-root', 'squad-b', 'read');
+
+    INSERT INTO tasks (id, squad_id, title, status, project_id) VALUES
+      ('visible-task', 'squad-a', 'Visible task <unsafe>', 'open', 'visible-child'),
+      ('hidden-task-on-visible-project', 'squad-b', 'Hidden squad task secret', 'open', 'visible-child'),
+      ('hidden-sibling-task', 'squad-b', 'Hidden sibling task secret', 'open', 'hidden-child');
+
+    UPDATE project_squad_access
+       SET access_level = 'read'
+     WHERE project_id = 'visible-child' AND squad_id = 'squad-b';
+
+    INSERT INTO flights (id, tenant, agent, goal, status, project_id) VALUES
+      ('visible-flight', 'pot-a', 'agent-a', 'Ship Inkwell', 'running', 'visible-child'),
+      ('hidden-flight', 'pot-a', 'agent-b', 'Ship Mirror', 'running', 'hidden-child');
+  `)
+  return harness
+}
+
+function envFor(harness: SqliteD1Harness): Env {
+  return { DB: harness.db, TENANT_SLUG: 'pot-a', BRAND: 'Mupot' } as Env
+}
+
+function actor(overrides: Partial<AuthContext> = {}): AuthContext {
+  return {
+    userId: 'user-1',
+    email: null,
+    role: 'member',
+    tenant: 'pot-a',
+    ...overrides,
+  }
+}
+
+function as(auth: AuthContext | null): void {
+  authState.current = auth
+}
+
+function memberA(): AuthContext {
+  return actor({
+    memberId: 'member-a',
+    capabilities: [
+      { member_id: 'member-a', scope_type: 'department', scope_id: 'dept-a', capability: 'observer' },
+    ],
+  })
+}
+
+async function render(value: unknown): Promise<string> {
+  return String(await value)
+}
+
+describe('project dashboard renderers', () => {
+  let harness: SqliteD1Harness | undefined
+
+  afterEach(() => {
+    authState.current = null
+    harness?.close()
+    harness = undefined
+  })
+
+  it('renders the root and one child level without exposing hidden sibling content', async () => {
+    harness = makeHarness()
+    const view = await loadProjectsPage(envFor(harness), memberA())
+    const body = await render(projectsPageBody(view))
+
+    expect(body).toContain('Mumega Products')
+    expect(body).toContain('Inkwell &lt;script&gt;alert(1)&lt;/script&gt;')
+    expect(body).not.toContain('Hidden sibling secret')
+    expect(body).not.toContain('Hidden sibling detail')
+    expect(body).not.toContain('Other Root')
+    expect(body).not.toContain('href="/projects/root"')
+    expect(view.nodes[0]).toMatchObject({
+      contextOnly: true,
+      metrics: null,
+      children: [{
+        id: 'visible-child',
+        metrics: { directSquads: 2, openWork: 2, activeFlights: 1 },
+      }],
+    })
+  })
+
+  it('renders bounded per-project squad, open-work, and active-flight metrics', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 101)
+      INSERT INTO projects (id, slug, name, status)
+      SELECT printf('bounded-%03d', x), printf('bounded-%03d', x), printf('Bounded %03d', x), 'planned'
+        FROM n;
+    `)
+    const body = await render(projectsPageBody(await loadProjectsPage(envFor(harness), actor({ role: 'owner' }))))
+
+    expect(body).toContain('Squads')
+    expect(body).toContain('Open work')
+    expect(body).toContain('Active flights')
+    expect(body).toContain('Showing the first')
+  })
+
+  it('bounds the project and edge result sets before rendering', async () => {
+    harness = makeHarness()
+    const observed: string[] = []
+    const trackedDb = new Proxy(harness.db, {
+      get(target, property, receiver) {
+        if (property !== 'prepare') return Reflect.get(target, property, receiver)
+        return (sql: string) => {
+          if (/\bFROM projects\b|\bFROM project_squad_access\b/i.test(sql)) observed.push(sql)
+          return target.prepare(sql)
+        }
+      },
+    })
+
+    await loadProjectsPage({ ...envFor(harness), DB: trackedDb }, memberA())
+
+    expect(observed.some((sql) => (
+      /SELECT p\.id, p\.slug[\s\S]*FROM projects p[\s\S]*LIMIT \?/i.test(sql)
+    ))).toBe(true)
+    expect(observed.some((sql) => (
+      /SELECT id, slug[\s\S]*FROM projects[\s\S]*ORDER BY[\s\S]*[^?]\s*$/i.test(sql)
+    ))).toBe(false)
+    expect(observed.some((sql) => (
+      /SELECT psa\.project_id[\s\S]*ORDER BY psa\.project_id, psa\.squad_id\s*$/i.test(sql)
+    ))).toBe(false)
+  })
+
+  it('renders an honest empty state when no project is readable', async () => {
+    harness = makeHarness()
+    const body = await render(projectsPageBody(await loadProjectsPage(envFor(harness), actor())))
+
+    expect(body).toContain('No projects available')
+    expect(body).toContain('No project data is fabricated')
+  })
+
+  it('renders escaped detail, bounded metrics, project work links, and only readable squad edges', async () => {
+    harness = makeHarness()
+    const view = await loadProjectDetail(envFor(harness), memberA(), 'visible-child')
+    expect(view).not.toBeNull()
+    const body = await render(projectDetailBody(view!))
+
+    expect(body).toContain('Inkwell &lt;script&gt;alert(1)&lt;/script&gt;')
+    expect(body).toContain('Safe &lt;b&gt;description&lt;/b&gt;')
+    expect(body).toContain('Publish &amp; verify')
+    expect(body).toContain('planned')
+    expect(body).toContain('2026-09-30')
+    expect(body).toContain('2')
+    expect(body).toContain('1')
+    expect(body).toContain('/send?project_id=visible-child')
+    expect(body).toContain('/flights?project_id=visible-child')
+    expect(body).toContain('Visible task &lt;unsafe&gt;')
+    expect(body).not.toContain('Hidden squad task secret')
+    expect(body).toContain('Squad Alpha')
+    expect(body).not.toContain('Squad Beta')
+  })
+
+  it('uses semantic anchor tabs and honest Activity and Evidence empty states', async () => {
+    harness = makeHarness()
+    const view = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'visible-child')
+    const body = await render(projectDetailBody(view!))
+
+    expect(body).toMatch(/<nav[^>]+aria-label="Project sections"/)
+    expect(body).toContain('href="#overview" aria-current="page"')
+    expect(body).toContain('href="#work"')
+    expect(body).toContain('href="#squads"')
+    expect(body).toContain('href="#activity"')
+    expect(body).toContain('href="#evidence"')
+    expect(body).toContain('No project activity yet')
+    expect(body).toContain('No project evidence yet')
+    expect(body.match(/role="table"/g)).toHaveLength(3)
+    expect(body).toContain('role="columnheader"')
+    expect(body).toContain('role="cell"')
+  })
+
+  it('filters task authorization before applying the bounded detail sample', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      UPDATE project_squad_access
+         SET access_level = 'write'
+       WHERE project_id = 'visible-child' AND squad_id = 'squad-b';
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 101)
+      INSERT INTO tasks (id, squad_id, title, status, project_id, created_at)
+      SELECT printf('zzz-hidden-%03d', x), 'squad-b', printf('Hidden crowd %03d', x), 'open',
+             'visible-child', '2030-01-01T00:00:00Z'
+        FROM n;
+      UPDATE project_squad_access
+         SET access_level = 'read'
+       WHERE project_id = 'visible-child' AND squad_id = 'squad-b';
+    `)
+
+    const view = await loadProjectDetail(envFor(harness), memberA(), 'visible-child')
+    expect(view?.tasks.map((task: { id: string }) => task.id)).toContain('visible-task')
+    expect(view?.tasks.some((task: { title: string }) => task.title.startsWith('Hidden crowd'))).toBe(false)
+  })
+})
+
+describe('project dashboard routes', () => {
+  let harness: SqliteD1Harness | undefined
+
+  afterEach(() => {
+    authState.current = null
+    harness?.close()
+    harness = undefined
+  })
+
+  it('registers project routes before the built-in route table is frozen', () => {
+    expect(dashboardBuiltInGetRoutes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ method: 'GET', path: '/projects' }),
+      expect.objectContaining({ method: 'GET', path: '/projects/:id' }),
+    ]))
+  })
+
+  it('redirects unauthenticated project pages and renders owner project detail', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    expect((await dashboardApp.fetch(new Request('https://pot.test/projects'), env)).status).toBe(302)
+
+    as(actor({ role: 'owner' }))
+    const response = await dashboardApp.fetch(new Request('https://pot.test/projects/visible-child'), env)
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('Mupot')
+  })
+
+  it('renders only member-visible projects with safe parent context and returns 404 for hidden detail', async () => {
+    harness = makeHarness()
+    as(memberA())
+    const env = envFor(harness)
+
+    const list = await dashboardApp.fetch(new Request('https://pot.test/projects'), env)
+    const body = await list.text()
+    expect(list.status).toBe(200)
+    expect(body).toContain('Mumega Products')
+    expect(body).toContain('Inkwell')
+    expect(body).not.toContain('Hidden sibling secret')
+    expect(body).not.toContain('Hidden sibling detail')
+    expect(body).not.toContain('Hidden sibling task secret')
+
+    const hidden = await dashboardApp.fetch(new Request('https://pot.test/projects/hidden-child'), env)
+    expect(hidden.status).toBe(404)
+    expect(await hidden.text()).not.toContain('Hidden sibling secret')
+  })
+
+  it('uses mobile-safe semantic regions without fixed project layout widths', async () => {
+    harness = makeHarness()
+    as(actor({ role: 'owner' }))
+    const response = await dashboardApp.fetch(new Request('https://pot.test/projects/visible-child'), envFor(harness))
+    const body = await response.text()
+    const list = await loadProjectsPage(envFor(harness), actor({ role: 'owner' }))
+    const listFragment = await render(projectsPageBody(list))
+    const view = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'visible-child')
+    const fragment = await render(projectDetailBody(view!))
+
+    expect(body).toContain('<main>')
+    expect(body).toContain('aria-label="Project sections"')
+    expect(listFragment.match(/role="region"[^>]+overflow-x:auto/g)).toHaveLength(1)
+    expect(listFragment).toContain('overflow-wrap:anywhere')
+    expect(listFragment).not.toMatch(/width:\s*\d+px/)
+    expect(fragment.match(/role="region"[^>]+overflow-x:auto/g)).toHaveLength(3)
+    expect(fragment).toContain('overflow-wrap:anywhere')
+    expect(fragment).not.toMatch(/width:\s*\d+px/)
+  })
+})

@@ -1,0 +1,535 @@
+import { html, raw } from 'hono/html'
+import type { AuthContext, CapabilityGrant, Env, Project, ProjectAccessLevel, ProjectStatus } from '../types'
+import { hasCapability, resolveCapabilities } from '../auth/capability'
+import { getProject } from '../projects/service'
+import { emptyState, kpiRow, pageHeader, pill, sectionPanel, statCard } from './ui'
+import type { Html } from './ui'
+
+const MAX_PROJECTS = 100
+const MAX_WORK_ROWS = 50
+const MAX_SQUAD_ROWS = 100
+
+type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
+
+interface ProjectAccess {
+  workspaceAdmin: boolean
+  grants: CapabilityGrant[]
+}
+
+export interface ProjectListMetrics {
+  directSquads: number
+  openWork: number
+  activeFlights: number
+}
+
+export type ProjectListChild = Project & {
+  metrics: ProjectListMetrics
+}
+
+export interface ProjectListNode {
+  project: Project | ParentContext
+  contextOnly: boolean
+  metrics: ProjectListMetrics | null
+  children: ProjectListChild[]
+}
+
+export interface ProjectsPageView {
+  nodes: ProjectListNode[]
+  visibleProjectCount: number
+  capped: boolean
+}
+
+export interface ProjectTaskRow {
+  id: string
+  title: string
+  status: string
+  squad_name: string
+}
+
+export interface ProjectSquadRow {
+  project_id: string
+  squad_id: string
+  access_level: ProjectAccessLevel
+  granted_at: string
+  squad_name: string
+}
+
+export interface ProjectDetailView {
+  project: Project
+  parent: ParentContext | null
+  aggregates: {
+    directTasks: number
+    directSquads: number
+    directFlights: number
+  }
+  tasks: ProjectTaskRow[]
+  squads: ProjectSquadRow[]
+}
+
+function legacyWorkspaceAdmin(auth: AuthContext): boolean {
+  return auth.role === 'owner' || auth.role === 'admin'
+}
+
+async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> {
+  if (auth.memberId) return auth.memberId
+  if (!auth.email) return null
+  const member = await env.DB.prepare(
+    "SELECT id FROM members WHERE email = ? AND tenant = ? AND status = 'active'",
+  ).bind(auth.email, env.TENANT_SLUG).first<{ id: string }>()
+  return member?.id ?? null
+}
+
+async function projectAccess(env: Env, auth: AuthContext): Promise<ProjectAccess> {
+  if (legacyWorkspaceAdmin(auth)) return { workspaceAdmin: true, grants: [] }
+  const memberId = await memberIdFor(env, auth)
+  const grants = memberId ? auth.capabilities ?? await resolveCapabilities(env, memberId) : []
+  return {
+    workspaceAdmin: hasCapability(grants, 'org', null, 'admin'),
+    grants,
+  }
+}
+
+function squadReadPredicate(access: ProjectAccess, squadAlias = 's'): { sql: string; binds: string[] } {
+  if (access.workspaceAdmin || hasCapability(access.grants, 'org', null, 'observer')) {
+    return { sql: '1 = 1', binds: [] }
+  }
+  const squadIds = new Set<string>()
+  const departmentIds = new Set<string>()
+  for (const grant of access.grants) {
+    if (!hasCapability([grant], grant.scope_type, grant.scope_id, 'observer')) continue
+    if (grant.scope_type === 'squad' && grant.scope_id) squadIds.add(grant.scope_id)
+    if (grant.scope_type === 'department' && grant.scope_id) departmentIds.add(grant.scope_id)
+  }
+  const conditions: string[] = []
+  const binds: string[] = []
+  if (squadIds.size) {
+    conditions.push(`${squadAlias}.id IN (${[...squadIds].map(() => '?').join(', ')})`)
+    binds.push(...squadIds)
+  }
+  if (departmentIds.size) {
+    conditions.push(`${squadAlias}.department_id IN (${[...departmentIds].map(() => '?').join(', ')})`)
+    binds.push(...departmentIds)
+  }
+  return { sql: conditions.length ? conditions.join(' OR ') : '0 = 1', binds }
+}
+
+function safeParent(project: Project): ParentContext {
+  return {
+    id: project.id,
+    slug: project.slug,
+    name: project.name,
+    status: project.status,
+    parent_project_id: project.parent_project_id,
+  }
+}
+
+async function loadVisibleProjects(
+  env: Env,
+  access: ProjectAccess,
+): Promise<{ projects: Project[]; capped: boolean }> {
+  const edge = squadReadPredicate(access)
+  const visibility = access.workspaceAdmin
+    ? '1 = 1'
+    : `EXISTS (
+        SELECT 1
+          FROM project_squad_access psa
+          JOIN squads s ON s.id = psa.squad_id
+         WHERE psa.project_id = p.id
+           AND (${edge.sql})
+      )`
+  const result = await env.DB.prepare(
+    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
+            p.target_date, p.created_at, p.updated_at
+       FROM projects p
+      WHERE ${visibility}
+      ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
+      LIMIT ?`,
+  ).bind(...(access.workspaceAdmin ? [] : edge.binds), MAX_PROJECTS + 1).all<Project>()
+  const rows = result.results ?? []
+  return { projects: rows.slice(0, MAX_PROJECTS), capped: rows.length > MAX_PROJECTS }
+}
+
+async function loadParentContexts(env: Env, parentIds: string[]): Promise<Map<string, ParentContext>> {
+  if (!parentIds.length) return new Map()
+  const result = await env.DB.prepare(
+    `SELECT id, slug, name, status, parent_project_id
+       FROM projects
+      WHERE id IN (${parentIds.map(() => '?').join(', ')})
+      LIMIT ?`,
+  ).bind(...parentIds, MAX_PROJECTS).all<ParentContext>()
+  return new Map((result.results ?? []).map((parent) => [parent.id, parent]))
+}
+
+async function loadListMetrics(env: Env, projectIds: string[]): Promise<Map<string, ProjectListMetrics>> {
+  if (!projectIds.length) return new Map()
+  const result = await env.DB.prepare(
+    `SELECT p.id,
+            (SELECT COUNT(*) FROM project_squad_access psa WHERE psa.project_id = p.id) AS direct_squads,
+            (SELECT COUNT(*) FROM tasks t
+              WHERE t.project_id = p.id
+                AND t.status IN ('open', 'in_progress', 'blocked', 'review')) AS open_work,
+            (SELECT COUNT(*) FROM flights f
+              WHERE f.project_id = p.id
+                AND f.tenant = ?
+                AND f.status IN ('preflight', 'running', 'waiting', 'sleeping')) AS active_flights
+       FROM projects p
+      WHERE p.id IN (${projectIds.map(() => '?').join(', ')})
+      LIMIT ?`,
+  ).bind(env.TENANT_SLUG, ...projectIds, MAX_PROJECTS).all<{
+    id: string
+    direct_squads: number
+    open_work: number
+    active_flights: number
+  }>()
+  return new Map((result.results ?? []).map((row) => [row.id, {
+    directSquads: Number(row.direct_squads ?? 0),
+    openWork: Number(row.open_work ?? 0),
+    activeFlights: Number(row.active_flights ?? 0),
+  }]))
+}
+
+export async function loadProjectsPage(env: Env, auth: AuthContext): Promise<ProjectsPageView> {
+  const access = await projectAccess(env, auth)
+  const { projects: displayed, capped } = await loadVisibleProjects(env, access)
+  const metrics = await loadListMetrics(env, displayed.map((project) => project.id))
+  const visibleById = new Map(displayed.map((project) => [project.id, project]))
+  const parentIds = [...new Set(displayed
+    .map((project) => project.parent_project_id)
+    .filter((id): id is string => id !== null && !visibleById.has(id)))]
+  const parentContexts = await loadParentContexts(env, parentIds)
+  const rootIds = new Set<string>()
+
+  for (const project of displayed) {
+    rootIds.add(project.parent_project_id ?? project.id)
+  }
+
+  const uncappedNodes = [...rootIds]
+    .map((rootId): ProjectListNode | null => {
+      const fullRoot = visibleById.get(rootId)
+      const root = fullRoot ?? parentContexts.get(rootId)
+      if (!root) return null
+      const children = displayed
+        .filter((project) => project.parent_project_id === rootId)
+        .map((project) => ({
+          ...project,
+          metrics: metrics.get(project.id) ?? { directSquads: 0, openWork: 0, activeFlights: 0 },
+        }))
+      return {
+        project: root,
+        contextOnly: !fullRoot,
+        metrics: fullRoot
+          ? metrics.get(fullRoot.id) ?? { directSquads: 0, openWork: 0, activeFlights: 0 }
+          : null,
+        children,
+      }
+    })
+    .filter((node): node is ProjectListNode => node !== null)
+
+  return {
+    nodes: uncappedNodes,
+    visibleProjectCount: displayed.length,
+    capped,
+  }
+}
+
+async function isReadableProject(env: Env, projectId: string, access: ProjectAccess): Promise<boolean> {
+  if (access.workspaceAdmin) return true
+  const visibility = squadReadPredicate(access)
+  const edge = await env.DB.prepare(
+    `SELECT 1
+       FROM project_squad_access psa
+       JOIN squads s ON s.id = psa.squad_id
+      WHERE psa.project_id = ?
+        AND (${visibility.sql})
+      LIMIT 1`,
+  ).bind(projectId, ...visibility.binds).first()
+  return edge !== null
+}
+
+async function loadReadableTasks(
+  env: Env,
+  projectId: string,
+  access: ProjectAccess,
+): Promise<ProjectTaskRow[]> {
+  const visibility = squadReadPredicate(access)
+  const result = await env.DB.prepare(
+    `SELECT t.id, t.title, t.status, t.squad_id, s.name AS squad_name, s.department_id
+       FROM tasks t
+       JOIN squads s ON s.id = t.squad_id
+      WHERE t.project_id = ?
+        AND (${visibility.sql})
+      ORDER BY t.created_at DESC, t.id
+      LIMIT ?`,
+  ).bind(projectId, ...visibility.binds, MAX_WORK_ROWS)
+    .all<ProjectTaskRow & { squad_id: string; department_id: string }>()
+  return (result.results ?? [])
+    .map(({ id, title, status, squad_name }) => ({ id, title, status, squad_name }))
+}
+
+async function loadReadableSquads(
+  env: Env,
+  projectId: string,
+  access: ProjectAccess,
+): Promise<ProjectSquadRow[]> {
+  const visibility = squadReadPredicate(access)
+  const result = await env.DB.prepare(
+    `SELECT psa.project_id, psa.squad_id, psa.access_level, psa.granted_at, s.name AS squad_name
+       FROM project_squad_access psa
+       JOIN squads s ON s.id = psa.squad_id
+      WHERE psa.project_id = ?
+        AND (${visibility.sql})
+      ORDER BY psa.squad_id
+      LIMIT ?`,
+  ).bind(projectId, ...visibility.binds, MAX_SQUAD_ROWS).all<ProjectSquadRow>()
+  return result.results ?? []
+}
+
+export async function loadProjectDetail(
+  env: Env,
+  auth: AuthContext,
+  projectId: string,
+): Promise<ProjectDetailView | null> {
+  const [project, access] = await Promise.all([getProject(env, projectId), projectAccess(env, auth)])
+  if (!project || !await isReadableProject(env, project.id, access)) return null
+
+  const [taskCount, squadCount, flightCount, tasks, squads, parent] = await Promise.all([
+    env.DB.prepare('SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?')
+      .bind(project.id).first<{ count: number }>(),
+    env.DB.prepare('SELECT COUNT(*) AS count FROM project_squad_access WHERE project_id = ?')
+      .bind(project.id).first<{ count: number }>(),
+    env.DB.prepare('SELECT COUNT(*) AS count FROM flights WHERE project_id = ? AND tenant = ?')
+      .bind(project.id, env.TENANT_SLUG).first<{ count: number }>(),
+    loadReadableTasks(env, project.id, access),
+    loadReadableSquads(env, project.id, access),
+    project.parent_project_id ? getProject(env, project.parent_project_id) : Promise.resolve(null),
+  ])
+
+  return {
+    project,
+    parent: parent ? safeParent(parent) : null,
+    aggregates: {
+      directTasks: Number(taskCount?.count ?? 0),
+      directSquads: Number(squadCount?.count ?? 0),
+      directFlights: Number(flightCount?.count ?? 0),
+    },
+    tasks,
+    squads,
+  }
+}
+
+function statusTone(status: ProjectStatus): 'ok' | 'warn' | 'dim' | 'primary' {
+  if (status === 'active' || status === 'completed') return 'ok'
+  if (status === 'planned' || status === 'paused') return 'warn'
+  if (status === 'archived') return 'dim'
+  return 'primary'
+}
+
+interface ProjectTableColumn {
+  label: string
+  width?: string
+}
+
+function safeTrack(width: string | undefined): string {
+  if (!width) return '1fr'
+  return /^(auto|[0-9]+(\.[0-9]+)?fr)$/.test(width) ? width : '1fr'
+}
+
+function semanticDataTable(opts: {
+  label: string
+  cols: ProjectTableColumn[]
+  rows: Html[][]
+  empty?: string
+}): Html {
+  const template = opts.cols.map((column) => safeTrack(column.width)).join(' ')
+  const head = html`<div class="ui-tr ui-thead" role="row" style="grid-template-columns:${raw(template)}">
+    ${opts.cols.map((column) => html`<div class="ui-th" role="columnheader">${column.label}</div>`)}
+  </div>`
+  const rows = opts.rows.length
+    ? opts.rows.map((cells) => html`<div class="ui-tr ui-row" role="row" style="grid-template-columns:${raw(template)}">
+        ${cells.map((cell) => html`<div class="ui-td" role="cell" style="overflow-wrap:anywhere;">${cell}</div>`)}
+      </div>`)
+    : html`<div class="ui-table-empty">${opts.empty ?? 'Nothing here yet.'}</div>`
+  return html`<div role="region" aria-label="${opts.label}" tabindex="0" style="max-width:100%;overflow-x:auto;">
+    <div class="ui-table" role="table" aria-label="${opts.label}" aria-colcount="${String(opts.cols.length)}">
+      ${head}${rows}
+    </div>
+  </div>`
+}
+
+export function projectsPageBody(view: ProjectsPageView) {
+  if (!view.nodes.length) {
+    return html`
+      ${pageHeader({
+        crumbs: 'Workspace / Projects',
+        title: 'Projects',
+        sub: 'Goals, squads, work, and evidence organized around durable outcomes.',
+      })}
+      ${emptyState({
+        title: 'No projects available',
+        detail: 'No project is currently visible to this account.',
+        hint: 'No project data is fabricated. Ask a workspace administrator to connect one of your squads.',
+      })}`
+  }
+
+  const rows = view.nodes.flatMap((node) => {
+    const rootGoal = node.contextOnly ? 'Parent context only' : (node.project as Project).goal || 'No goal set'
+    const rootTarget = node.contextOnly ? 'Context' : (node.project as Project).target_date ?? 'Not set'
+    const rootName = node.contextOnly
+      ? html`<span class="ui-agent-name">${node.project.name}</span>`
+      : html`<a class="ui-agent-name" href="/projects/${encodeURIComponent(node.project.id)}">${node.project.name}</a>`
+    return [
+      [
+        html`${rootName}
+          <span class="ui-agent-role">${node.contextOnly ? 'Parent context' : rootGoal}</span>`,
+        pill(node.project.status, statusTone(node.project.status)),
+        html`<span class="ui-mono-dim">${node.metrics?.directSquads ?? 'Context'}</span>`,
+        html`<span class="ui-mono-dim">${node.metrics?.openWork ?? 'Context'}</span>`,
+        html`<span class="ui-mono-dim">${node.metrics?.activeFlights ?? 'Context'}</span>`,
+        html`<span class="ui-mono-dim">${rootTarget}</span>`,
+      ],
+      ...node.children.map((child) => [
+        html`<span class="ui-panel-sub">Child project</span>
+          <a class="ui-agent-name" href="/projects/${encodeURIComponent(child.id)}">${child.name}</a>
+          <span class="ui-agent-role">${child.goal || 'No goal set'}</span>`,
+        pill(child.status, statusTone(child.status)),
+        html`<span class="ui-mono-dim">${child.metrics.directSquads}</span>`,
+        html`<span class="ui-mono-dim">${child.metrics.openWork}</span>`,
+        html`<span class="ui-mono-dim">${child.metrics.activeFlights}</span>`,
+        html`<span class="ui-mono-dim">${child.target_date ?? 'Not set'}</span>`,
+      ]),
+    ]
+  })
+
+  return html`
+    ${pageHeader({
+      crumbs: 'Workspace / Projects',
+      title: 'Projects',
+      sub: `${view.visibleProjectCount}${view.capped ? '+' : ''} visible project${view.visibleProjectCount === 1 ? '' : 's'} across root and child levels.`,
+    })}
+    ${sectionPanel({
+      title: 'Project workspace',
+      body: semanticDataTable({
+        label: 'Projects',
+        cols: [
+          { label: 'Project', width: '1.5fr' },
+          { label: 'Status', width: 'auto' },
+          { label: 'Squads', width: 'auto' },
+          { label: 'Open work', width: 'auto' },
+          { label: 'Active flights', width: 'auto' },
+          { label: 'Target', width: 'auto' },
+        ],
+        rows,
+      }),
+    })}
+    ${view.capped ? html`<p class="ui-panel-sub">Showing the first ${MAX_PROJECTS} visible projects.</p>` : ''}`
+}
+
+function projectTabs() {
+  return html`<nav aria-label="Project sections" style="display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px;">
+    <a class="btn secondary sm" href="#overview" aria-current="page">Overview</a>
+    <a class="btn secondary sm" href="#work">Work</a>
+    <a class="btn secondary sm" href="#squads">Squads</a>
+    <a class="btn secondary sm" href="#activity">Activity</a>
+    <a class="btn secondary sm" href="#evidence">Evidence</a>
+  </nav>`
+}
+
+export function projectDetailBody(view: ProjectDetailView) {
+  const { project, parent, aggregates } = view
+  const workLinks = html`<span style="display:flex;flex-wrap:wrap;gap:8px;">
+    <a class="ui-link" href="/send?project_id=${encodeURIComponent(project.id)}">Project tasks</a>
+    <a class="ui-link" href="/flights?project_id=${encodeURIComponent(project.id)}">Project flights</a>
+  </span>`
+
+  return html`
+    ${pageHeader({
+      crumbs: parent ? `Projects / ${parent.name}` : 'Projects',
+      title: project.name,
+      sub: project.description || 'No description set.',
+      badge: project.status,
+      badgeTone: statusTone(project.status),
+    })}
+    ${projectTabs()}
+    <section id="overview" aria-label="Overview">
+      ${sectionPanel({
+        title: 'Overview',
+        body: semanticDataTable({
+          label: 'Project overview',
+          cols: [
+            { label: 'Goal', width: '2fr' },
+            { label: 'Status', width: 'auto' },
+            { label: 'Target date', width: 'auto' },
+          ],
+          rows: [[
+            html`<span>${project.goal || 'No goal set'}</span>`,
+            pill(project.status, statusTone(project.status)),
+            html`<span class="ui-mono-dim">${project.target_date ?? 'Not set'}</span>`,
+          ]],
+        }),
+      })}
+      ${kpiRow([
+        statCard({ label: 'Direct tasks', value: String(aggregates.directTasks), sub: 'All work attributed to this project' }),
+        statCard({ label: 'Direct flights', value: String(aggregates.directFlights), sub: 'Governed runs attributed here' }),
+        statCard({ label: 'Squad edges', value: String(aggregates.directSquads), sub: 'Explicit project access edges' }),
+      ])}
+    </section>
+    <section id="work" aria-label="Work">
+      ${sectionPanel({
+        title: 'Work',
+        right: workLinks,
+        body: semanticDataTable({
+          label: 'Project work',
+          cols: [
+            { label: 'Task', width: '1.5fr' },
+            { label: 'Squad', width: '1fr' },
+            { label: 'Status', width: 'auto' },
+          ],
+          rows: view.tasks.map((task) => [
+            html`<span>${task.title}</span>`,
+            html`<span>${task.squad_name}</span>`,
+            html`<span class="ui-mono-dim">${task.status}</span>`,
+          ]),
+          empty: 'No readable tasks are attributed to this project yet.',
+        }),
+      })}
+    </section>
+    <section id="squads" aria-label="Squads">
+      ${sectionPanel({
+        title: 'Squads',
+        body: semanticDataTable({
+          label: 'Project squads',
+          cols: [
+            { label: 'Squad', width: '1fr' },
+            { label: 'Access', width: 'auto' },
+          ],
+          rows: view.squads.map((squad) => [
+            html`<a class="ui-link" href="/squads/${encodeURIComponent(squad.squad_id)}">${squad.squad_name}</a>`,
+            pill(squad.access_level, squad.access_level === 'read' ? 'dim' : 'primary'),
+          ]),
+          empty: 'No readable squad edges are connected to this project.',
+        }),
+      })}
+    </section>
+    <section id="activity" aria-label="Activity">
+      ${emptyState({
+        title: 'No project activity yet',
+        detail: 'A project activity feed is not connected in this version.',
+        hint: 'No timeline events are inferred from unrelated workspace data.',
+      })}
+    </section>
+    <section id="evidence" aria-label="Evidence">
+      ${emptyState({
+        title: 'No project evidence yet',
+        detail: 'Project-level evidence receipts are not connected in this version.',
+        hint: 'No evidence state is fabricated.',
+      })}
+    </section>`
+}
+
+export function projectNotFoundBody() {
+  return html`${pageHeader({ crumbs: 'Workspace / Projects', title: 'Project not found' })}
+    ${emptyState({
+      title: 'Project unavailable',
+      detail: 'This project does not exist or is not visible to this account.',
+    })}`
+}

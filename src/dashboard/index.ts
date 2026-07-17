@@ -104,6 +104,13 @@ import type { OpsHealthData, HealthTone } from './health'
 import { loadAllAgents, loadSquadOptions } from './agents-admin'
 import type { AgentAdminRow, SquadOption } from './agents-admin'
 import { formatBurn, formatUsd } from '../agents/cost'
+import {
+  loadProjectDetail,
+  loadProjectsPage,
+  projectDetailBody,
+  projectNotFoundBody,
+  projectsPageBody,
+} from './projects'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
@@ -243,6 +250,17 @@ dashboardApp.get('/', async (c) => {
       costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
     }),
   )
+})
+
+dashboardApp.get('/projects', async (c) => {
+  const view = await loadProjectsPage(c.env, c.get('auth'))
+  return c.html(shell(c.env, 'Projects', projectsPageBody(view)))
+})
+
+dashboardApp.get('/projects/:id', async (c) => {
+  const view = await loadProjectDetail(c.env, c.get('auth'), c.req.param('id'))
+  if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  return c.html(shell(c.env, view.project.name, projectDetailBody(view)))
 })
 
 // GET /send — the "Send a task" page. The last mile: a person writes a task,
@@ -2948,6 +2966,25 @@ function shell(
             <span class="nav-label">Home</span>
           </a>
 
+          <!-- Projects -->
+          <a class="nav-link" href="/projects">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M3.5 5.5h5l1.5 2h6.5v8.5h-13z"/><path d="M3.5 5.5V4h5l1.5 1.5"/></svg>
+            <span class="nav-label">Projects</span>
+          </a>
+
+          <!-- Work -->
+          <a class="nav-link" href="/send">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="5.5" cy="5.5" r="2"/><circle cx="5.5" cy="14.5" r="2"/><circle cx="14.5" cy="10" r="2"/><path d="M5.5 7.5v5M7.4 5.9 12.7 9.2M7.3 13.9 12.7 10.7"/></svg>
+            <span class="nav-label">Work</span>
+          </a>
+
+          <!-- Approvals (with live badge) -->
+          <a class="nav-link" href="/approvals" id="nav-approvals">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3 4.5 5.2v4.3c0 3.4 2.3 5.8 5.5 7 3.2-1.2 5.5-3.6 5.5-7V5.2z"/><path d="M7.6 10l1.7 1.7 3.1-3.4"/></svg>
+            <span class="nav-label">Approvals</span>
+            <span class="nav-badge" id="approvals-badge" style="display:none;">0</span>
+          </a>
+
           <!-- Organization (collapsible) -->
           <div class="nav-section">
             <button class="nav-section-toggle" data-section="org" onclick="navToggle('org')">
@@ -2962,11 +2999,11 @@ function shell(
             </div>
           </div>
 
-          <!-- Work (collapsible) -->
+          <!-- Work views (collapsible) -->
           <div class="nav-section">
             <button class="nav-section-toggle" data-section="work" onclick="navToggle('work')">
               <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="5.5" cy="5.5" r="2"/><circle cx="5.5" cy="14.5" r="2"/><circle cx="14.5" cy="10" r="2"/><path d="M5.5 7.5v5M7.4 5.9 12.7 9.2M7.3 13.9 12.7 10.7"/></svg>
-              <span class="nav-label">Work</span>
+              <span class="nav-label">Work views</span>
               <span class="nav-chevron" id="chev-work"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M6 4l4 4-4 4"/></svg></span>
             </button>
             <div class="nav-children" id="children-work">
@@ -2975,13 +3012,6 @@ function shell(
               <a class="nav-child" href="/verifications">Verifications</a>
             </div>
           </div>
-
-          <!-- Approvals (with live badge) -->
-          <a class="nav-link" href="/approvals" id="nav-approvals">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3 4.5 5.2v4.3c0 3.4 2.3 5.8 5.5 7 3.2-1.2 5.5-3.6 5.5-7V5.2z"/><path d="M7.6 10l1.7 1.7 3.1-3.4"/></svg>
-            <span class="nav-label">Approvals</span>
-            <span class="nav-badge" id="approvals-badge" style="display:none;">0</span>
-          </a>
 
           <!-- Fleet -->
           <a class="nav-link" href="/fleet">
