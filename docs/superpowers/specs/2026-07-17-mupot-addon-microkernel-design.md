@@ -71,15 +71,16 @@ The additive contract is intentionally small:
 ```ts
 interface AddonPackageManifestV1 {
   schema: 'mupot.addon-package/v1'
-  mupotPortVersion: '1'
+  mupotPortVersion: string
   addon: AddonManifestV1
 }
 ```
 
 `mupotPortVersion` identifies the sealed host-port contract available to the package. It
-is independent from `mupotCompatibility`, which remains the compatible Mupot product
-release range. Port v1 is additive-only. A breaking host-port change requires a new port
-version and a parent-owned migration shim before packages can register against it.
+must be a positive decimal string; the current host supports only `"1"`. It is independent
+from `mupotCompatibility`, which remains the compatible Mupot product release range. Port
+v1 is additive-only. A breaking host-port change requires a new port version and a
+parent-owned migration shim before packages can register against it.
 
 Validation follows the current fail-closed manifest discipline:
 
