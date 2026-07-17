@@ -671,11 +671,11 @@ dashboardApp.get('/flights', async (c) => {
   if (projectId !== undefined && !context) {
     return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
   }
-  const rows = context
+  const result = context
     ? await loadProjectFlights(c.env, context)
-    : await listFlights(c.env)
-  const cards = buildBoard(rows, Date.now())
-  return c.html(shell(c.env, 'Flights', flightsBody(cards, context?.project)))
+    : { rows: await listFlights(c.env), scanLimited: false }
+  const cards = buildBoard(result.rows, Date.now())
+  return c.html(shell(c.env, 'Flights', flightsBody(cards, context?.project, result.scanLimited)))
 })
 
 // ── radar (visual fleet + squad awareness — #21 slice 1, VIEW LAYER ONLY) ────
@@ -4321,7 +4321,7 @@ function approvalsScript() {
 // Pot-native flock: agents that checked in to THIS pot (no company bus). Read-only
 // inventory — who has access + who is in now. Control (wake/pause) is the bus path;
 // pot-native control is a later objective (#46).
-function flightsBody(cards: FlightCard[], project?: Project) {
+function flightsBody(cards: FlightCard[], project?: Project, scanLimited = false) {
   const phaseColor = (p: string) =>
     p === 'flying' ? 'var(--ok)' : p === 'sleeping' ? 'var(--warn)' : p === 'holding' || p === 'preflight' ? 'var(--accent)' : p === 'failed' || p === 'held' ? '#e5534b' : 'var(--dim)'
   const arrow = (t: string | null) => (t === 'up' ? '▲' : t === 'down' ? '▼' : t === 'flat' ? '▬' : '')
@@ -4357,6 +4357,9 @@ function flightsBody(cards: FlightCard[], project?: Project) {
       statCard({ label: 'Flying', value: String(flying), subTone: flying > 0 ? 'ok' : 'dim' }),
       statCard({ label: 'Sleeping', value: String(sleeping), subTone: 'dim' }),
     ])}
+    ${scanLimited ? html`<div class="card" role="status" style="border-color:var(--warn);margin-bottom:12px">
+      Flight history is partial because the project scan safety limit was reached.
+    </div>` : ''}
     <style>
       .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
       .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;

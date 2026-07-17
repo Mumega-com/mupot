@@ -492,7 +492,7 @@ describe('project dashboard routes', () => {
     expect(body).not.toContain('Newer hidden')
   })
 
-  it('keyset-pages past SQL-pass JS-fail metadata to find older canonical flights', async () => {
+  it('filters JavaScript-invalid whitespace metadata before limiting', async () => {
     harness = makeHarness()
     harness.sqlite.exec(`
       UPDATE flights SET created_at = 1 WHERE id = 'visible-flight';
@@ -535,10 +535,48 @@ describe('project dashboard routes', () => {
     expect(response.status).toBe(200)
     expect(body).toContain('Ship Inkwell')
     expect(body).not.toContain('SQL-pass JS-fail')
-    expect(observed).toHaveLength(2)
+    expect(observed).toHaveLength(1)
     expect(observed[0]).toMatch(/\?4 IS NULL[\s\S]*f\.created_at < \?4[\s\S]*f\.id < \?5/i)
     expect(observed[0]).toMatch(/ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?6/i)
     expect(observed[0]).not.toMatch(/\bOFFSET\b/i)
+  })
+
+  it('bounds defensive canonical scanning when a database adapter returns invalid candidates', async () => {
+    harness = makeHarness()
+    as(memberA())
+    let flightQueries = 0
+    const invalidCandidates = Array.from({ length: 100 }, (_, index) => ({
+      id: `adapter-invalid-${index}`,
+      tenant: 'pot-a',
+      project_id: 'visible-child',
+      agent: 'agent-a',
+      goal: 'Adapter invalid',
+      status: 'running',
+      created_at: 4000000000000 - index,
+      meta: '{}',
+    }))
+    const boundedDb = new Proxy(harness.db, {
+      get(target, property, receiver) {
+        if (property !== 'prepare') return Reflect.get(target, property, receiver)
+        return (sql: string) => {
+          if (!/SELECT \*[\s\S]*FROM\s+flights f/i.test(sql)) return target.prepare(sql)
+          flightQueries += 1
+          return {
+            bind: () => ({ all: async () => ({ results: invalidCandidates }) }),
+          }
+        }
+      },
+    })
+
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/flights?project_id=visible-child'),
+      { ...envFor(harness), DB: boundedDb as unknown as Env['DB'] },
+    )
+    const body = await response.text()
+    expect(response.status).toBe(200)
+    expect(flightQueries).toBe(10)
+    expect(body).toContain('Flight history is partial because the project scan safety limit was reached.')
+    expect(body).not.toContain('Adapter invalid')
   })
 
   it('lets workspace admins see canonical, mixed, legacy, and malformed project flights', async () => {

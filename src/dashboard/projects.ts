@@ -2,6 +2,7 @@ import { html, raw } from 'hono/html'
 import type { AuthContext, Env, Project, ProjectAccessLevel, ProjectStatus } from '../types'
 import { hasCapability, resolveCapabilities } from '../auth/capability'
 import { parseFlightMetaV1 } from '../flight/meta'
+import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import type { FlightRow } from '../flight/service'
 import { getProject } from '../projects/service'
 import { emptyState, kpiRow, pageHeader, pill, sectionPanel, statCard } from './ui'
@@ -10,6 +11,7 @@ import type { Html } from './ui'
 const MAX_PROJECTS = 100
 const MAX_WORK_ROWS = 50
 const MAX_SQUAD_ROWS = 100
+const MAX_FLIGHT_SCAN_PAGES = 10
 
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
 
@@ -75,6 +77,11 @@ export interface ProjectWorkContext {
   taskableSquadIds: string[]
 }
 
+export interface ProjectFlightsResult {
+  rows: FlightRow[]
+  scanLimited: boolean
+}
+
 function legacyWorkspaceAdmin(auth: AuthContext): boolean {
   return auth.role === 'owner' || auth.role === 'admin'
 }
@@ -114,69 +121,6 @@ async function projectAccess(env: Env, auth: AuthContext): Promise<ProjectAccess
 
 function jsonIds(ids: string[]): string {
   return JSON.stringify([...new Set(ids)])
-}
-
-function boundedFlightMetaTextSql(meta: string, path: string, maxLength: number): string {
-  return `
-    AND json_type(${meta}, '${path}') = 'text'
-    AND length(trim(CAST(json_extract(${meta}, '${path}') AS TEXT))) > 0
-    AND length(CAST(json_extract(${meta}, '${path}') AS TEXT)) <= ${maxLength}`
-}
-
-function boundedFlightMetaArraySql(
-  meta: string,
-  path: string,
-  alias: string,
-  maxItems: number,
-  maxLength: number,
-  nonEmpty: boolean,
-): string {
-  return `
-    AND json_type(${meta}, '${path}') = 'array'
-    AND json_array_length(${meta}, '${path}') ${nonEmpty ? 'BETWEEN 1 AND' : '<='} ${maxItems}
-    AND NOT EXISTS (
-      SELECT 1
-        FROM json_each(${meta}, '${path}') ${alias}
-       WHERE ${alias}.type <> 'text'
-          OR length(trim(CAST(${alias}.value AS TEXT))) = 0
-          OR length(CAST(${alias}.value AS TEXT)) > ${maxLength}
-    )`
-}
-
-function canonicalFlightMetaSql(flightAlias: string): string {
-  const safeMeta = `CASE WHEN json_valid(${flightAlias}.meta) THEN ${flightAlias}.meta ELSE '{}' END`
-  return `
-    AND json_valid(${flightAlias}.meta)
-    AND json_type(${safeMeta}) = 'object'
-    AND length(json(${safeMeta})) <= 16384
-    AND NOT EXISTS (
-      SELECT 1
-        FROM json_each(${safeMeta}) meta_key
-       WHERE meta_key.key NOT IN (
-         'schema', 'goal_id', 'objective_id', 'squad_ids', 'task_ids', 'done_when',
-         'artifact_refs', 'receipt_refs', 'confidentiality', 'publication_target', 'parent_flight_id'
-       )
-    )
-    AND json_extract(${safeMeta}, '$.schema') = 'mupot.flight.meta/v1'
-    ${boundedFlightMetaTextSql(safeMeta, '$.goal_id', 200)}
-    ${boundedFlightMetaTextSql(safeMeta, '$.objective_id', 200)}
-    ${boundedFlightMetaArraySql(safeMeta, '$.squad_ids', 'squad_item', 8, 200, true)}
-    ${boundedFlightMetaArraySql(safeMeta, '$.task_ids', 'task_item', 200, 200, true)}
-    ${boundedFlightMetaArraySql(safeMeta, '$.done_when', 'done_item', 100, 1000, true)}
-    ${boundedFlightMetaArraySql(safeMeta, '$.artifact_refs', 'artifact_item', 200, 2000, false)}
-    ${boundedFlightMetaArraySql(safeMeta, '$.receipt_refs', 'receipt_item', 200, 2000, false)}
-    AND json_type(${safeMeta}, '$.confidentiality') = 'text'
-    AND json_extract(${safeMeta}, '$.confidentiality') IN ('private', 'internal', 'public-projection')
-    AND json_type(${safeMeta}, '$.publication_target') = 'text'
-    AND json_extract(${safeMeta}, '$.publication_target') IN ('none', 'inkwell-draft', 'mumega.com')
-    AND json_type(${safeMeta}, '$.parent_flight_id') IN ('null', 'text')
-    AND (
-      json_type(${safeMeta}, '$.parent_flight_id') = 'null'
-      OR (
-        length(trim(CAST(json_extract(${safeMeta}, '$.parent_flight_id') AS TEXT))) > 0
-        AND length(CAST(json_extract(${safeMeta}, '$.parent_flight_id') AS TEXT)) <= 200
-      )
-    )`
 }
 
 function readableFlightSql(flightAlias: string, readableIdsParam: string): string {
@@ -490,7 +434,7 @@ export function projectFlightIsReadable(context: ProjectWorkContext, meta: strin
 export async function loadProjectFlights(
   env: Env,
   context: ProjectWorkContext,
-): Promise<FlightRow[]> {
+): Promise<ProjectFlightsResult> {
   if (context.readableSquadIds === null) {
     const result = await env.DB.prepare(
       `SELECT *
@@ -499,14 +443,14 @@ export async function loadProjectFlights(
         ORDER BY created_at DESC, id DESC
         LIMIT ?3`,
     ).bind(env.TENANT_SLUG, context.project.id, 100).all<FlightRow>()
-    return result.results ?? []
+    return { rows: result.results ?? [], scanLimited: false }
   }
 
   const flights: FlightRow[] = []
   let cursorCreatedAt: number | null = null
   let cursorId: string | null = null
 
-  while (flights.length < 100) {
+  for (let page = 0; page < MAX_FLIGHT_SCAN_PAGES; page += 1) {
     const result: { results?: FlightRow[] } = await env.DB.prepare(
       `SELECT *
          FROM flights f
@@ -536,13 +480,15 @@ export async function loadProjectFlights(
       }
     }
 
-    if (candidates.length < 100 || flights.length === 100) break
+    if (candidates.length < 100 || flights.length === 100) {
+      return { rows: flights, scanLimited: false }
+    }
     const last: FlightRow = candidates[candidates.length - 1]!
     cursorCreatedAt = last.created_at
     cursorId = last.id
   }
 
-  return flights
+  return { rows: flights, scanLimited: true }
 }
 
 function statusTone(status: ProjectStatus): 'ok' | 'warn' | 'dim' | 'primary' {

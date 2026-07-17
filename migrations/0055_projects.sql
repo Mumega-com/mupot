@@ -327,3 +327,5 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project_status
   ON tasks(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_flights_project_status
   ON flights(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_flights_tenant_project_created
+  ON flights(tenant, project_id, created_at DESC, id DESC);

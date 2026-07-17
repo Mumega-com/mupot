@@ -260,6 +260,10 @@ describe('projectsApp', () => {
     insertFlight.run('mixed-flight', flightMeta(['squad-a', 'squad-b'], ['visible-task', 'private-task']))
     insertFlight.run('malformed-flight', JSON.stringify({ schema: 'mupot.flight.meta/v0', squad_ids: ['squad-a'] }))
     insertFlight.run('legacy-flight', JSON.stringify({ squad_ids: ['squad-a'] }))
+    insertFlight.run('js-whitespace-flight', JSON.stringify({
+      ...JSON.parse(flightMeta(['squad-a'])),
+      goal_id: '\u00a0',
+    }))
     harness.sqlite.exec(`
       UPDATE project_squad_access SET access_level = 'read'
        WHERE project_id = 'visible-child';
@@ -275,7 +279,7 @@ describe('projectsApp', () => {
 
     as(actor({ role: 'admin' }))
     await expect((await fetch(harness, '/visible-child')).json()).resolves.toMatchObject({
-      aggregates: { direct_tasks: 2, direct_squads: 2, direct_flights: 5 },
+      aggregates: { direct_tasks: 2, direct_squads: 2, direct_flights: 6 },
     })
 
     as(actor({
@@ -283,7 +287,7 @@ describe('projectsApp', () => {
       capabilities: [{ member_id: 'org-reader', scope_type: 'org', scope_id: null, capability: 'observer' }],
     }))
     await expect((await fetch(harness, '/visible-child')).json()).resolves.toMatchObject({
-      aggregates: { direct_tasks: 2, direct_squads: 2, direct_flights: 5 },
+      aggregates: { direct_tasks: 2, direct_squads: 2, direct_flights: 6 },
     })
   })
 

@@ -97,6 +97,7 @@ describe('0055_projects migration', () => {
       expect(indexesFor('project_squad_access').map((row) => row.name)).toContain('idx_project_squad_access_squad_project')
       expect(indexesFor('tasks').map((row) => row.name)).toContain('idx_tasks_project_status')
       expect(indexesFor('flights').map((row) => row.name)).toContain('idx_flights_project_status')
+      expect(indexesFor('flights').map((row) => row.name)).toContain('idx_flights_tenant_project_created')
     } finally {
       close()
     }
