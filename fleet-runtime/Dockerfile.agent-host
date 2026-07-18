@@ -5,12 +5,13 @@ LABEL org.opencontainers.image.description="Credential-free base runtime for Mup
 
 RUN addgroup -g 10001 -S mupot \
     && adduser -u 10001 -S -D -H -G mupot mupot \
-    && mkdir -p /opt/mupot /var/lib/mupot/state \
-    && chown -R 10001:10001 /var/lib/mupot
+    && mkdir -p /opt/mupot /home/mupot/.fleet/agents /var/lib/mupot/state \
+    && chown -R 10001:10001 /home/mupot /var/lib/mupot
 
 COPY --chown=10001:10001 fleet-runtime/*.mjs /opt/mupot/
 
 USER 10001:10001
+ENV HOME=/home/mupot
 WORKDIR /var/lib/mupot
 
 EXPOSE 8080

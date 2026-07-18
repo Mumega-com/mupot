@@ -398,7 +398,9 @@ describe('project dashboard routes', () => {
     expect(activityResponse.status).toBe(200)
     const activity = await activityResponse.json() as { rows: Array<{ source_id: string }> }
     expect(activity.rows.some((row) => row.source_id === 'visible-task')).toBe(true)
-    expect(activity.rows.some((row) => row.source_id === 'project-message')).toBe(true)
+    // The message has only one squad-scoped endpoint, so exposing its body would
+    // leak a partially hidden conversation into this member projection.
+    expect(activity.rows.some((row) => row.source_id === 'project-message')).toBe(false)
     expect(activity.rows.some((row) => row.source_id === 'hidden-task-on-visible-project')).toBe(false)
     expect(activity.rows.some((row) => row.source_id === 'hidden-flight-on-visible-project')).toBe(false)
 

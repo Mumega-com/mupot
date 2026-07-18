@@ -45,12 +45,45 @@ describe('Kubernetes Agent Host deployment contract', () => {
   it('references a DME-owned Secret and never embeds credential material', () => {
     const source = readFileSync(deploymentPath, 'utf8')
     const deployment = documents(deploymentPath).find((doc) => doc.kind === 'Deployment')!
-    const secret = deployment.spec.template.spec.volumes.find((volume: any) => volume.name === 'agent-credential')
+    const pod = deployment.spec.template.spec
+    const container = pod.containers[0]
+    const secret = pod.volumes.find((volume: any) => volume.name === 'agent-signing-key')
 
-    expect(secret.secret.secretName).toBe('dme-hermes-mupot')
+    expect(pod.securityContext).toMatchObject({ runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001 })
+
+    expect(secret.secret).toMatchObject({
+      secretName: 'dme-hermes-signing-key',
+      defaultMode: 0o440,
+      items: [{ key: 'dme-hermes-k8s.key', path: 'dme-hermes-k8s.key' }],
+    })
+    expect(container.volumeMounts).toContainEqual(expect.objectContaining({
+      name: 'agent-signing-key',
+      mountPath: '/home/mupot/.fleet/agents',
+      readOnly: true,
+    }))
+    expect(container.env).toContainEqual({ name: 'HOME', value: '/home/mupot' })
+    expect(container.env.map((entry: any) => entry.name)).not.toContain('MUPOT_CONTROL_CONFIG')
     expect(source).not.toMatch(/Bearer\s+\S+|private[_-]?key\s*:/i)
     expect(source).not.toMatch(/\bmupot_[a-z0-9_-]{16,}\b/)
     expect(source).not.toContain('mupot.mumega.com')
+  })
+
+  it('mounts the exact daemon and inbox configs consumed by the on-demand runtime', () => {
+    const config = JSON.parse(readFileSync(configPath, 'utf8'))
+    const configMap = documents(deploymentPath).find((doc) => doc.kind === 'ConfigMap')!
+    const daemon = JSON.parse(configMap.data['daemon.json'])
+    const inbox = JSON.parse(configMap.data['inbox-handler.json'])
+
+    expect(config.credential_file).toBeUndefined()
+    expect(daemon).toEqual(config.daemon)
+    expect(inbox).toEqual(config.inbox)
+    expect(daemon.agents[0]).toMatchObject({
+      agent_id: 'dme-hermes-k8s',
+      lifecycle: 'on_demand',
+      inbox: {
+        command: 'node /opt/mupot/inbox-handler.mjs /etc/mupot/inbox-handler.json',
+      },
+    })
   })
 
   it('allows egress only to cluster DNS and a labeled trusted egress gateway', () => {
@@ -66,7 +99,10 @@ describe('Kubernetes Agent Host deployment contract', () => {
     const config = JSON.parse(readFileSync(configPath, 'utf8'))
     expect(config.tenant).toBe('dme')
     expect(config.project_id).toBe('replace-with-dme-project-id')
-    expect(normalizeAgentProfile(config.inbox.agents[0].profile)).not.toBeNull()
+    const profile = normalizeAgentProfile(config.inbox.agents[0].profile)
+    expect(profile?.allowed_project_ids).toEqual([config.project_id])
+    expect(config.daemon.base_url).toBe(config.base_url)
+    expect(config.daemon.tenant).toBe(config.tenant)
     expect(JSON.stringify(config)).not.toMatch(/Bearer\s+\S+|mupot_[A-Za-z0-9_-]{8,}/i)
   })
 
@@ -84,14 +120,14 @@ describe('Kubernetes Agent Host deployment contract', () => {
     const policy = join(dir, 'network-policy.yaml')
     const config = join(dir, 'config.json')
     const imageDigest = `sha256:${'a'.repeat(64)}`
-    writeFileSync(deployment, readFileSync(deploymentPath, 'utf8').replace(
-      'registry.example/mupot-agent-host-hermes:0.23.0',
-      `registry.example/mupot-agent-host-hermes@${imageDigest}`,
-    ))
+    writeFileSync(deployment, readFileSync(deploymentPath, 'utf8')
+      .replace('registry.example/mupot-agent-host-hermes:0.23.0', `registry.example/mupot-agent-host-hermes@${imageDigest}`)
+      .replaceAll('replace-with-dme-project-id', 'dme-delivery-project')
+      .replaceAll('https://mupot.dme.example', 'https://pot.dme.example'))
     writeFileSync(policy, readFileSync(networkPolicyPath, 'utf8'))
     writeFileSync(config, readFileSync(configPath, 'utf8')
-      .replace('replace-with-dme-project-id', 'dme-delivery-project')
-      .replace('https://mupot.dme.example', 'https://pot.dme.example'))
+      .replaceAll('replace-with-dme-project-id', 'dme-delivery-project')
+      .replaceAll('https://mupot.dme.example', 'https://pot.dme.example'))
 
     const receipt = buildKubernetesAgentHostReceipt({
       deploymentPath: deployment,
@@ -140,6 +176,16 @@ describe('Kubernetes Agent Host deployment contract', () => {
     expect(weak.failure_codes).toContain('ingress_not_denied')
   })
 
+  it('fails when the trusted Kubernetes key group differs from runtime GID 10001', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const deployment = join(dir, 'deployment.yaml')
+    writeFileSync(deployment, readFileSync(deploymentPath, 'utf8').replace('runAsGroup: 10001', 'runAsGroup: 20001'))
+
+    const receipt = buildKubernetesAgentHostReceipt({ deploymentPath: deployment, networkPolicyPath, configPath })
+
+    expect(receipt.failure_codes).toContain('key_permission_model_invalid')
+  })
+
   it('fails when the Kubernetes inbox adds an unverified agent or legacy command', () => {
     const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
     const config = JSON.parse(readFileSync(configPath, 'utf8'))
@@ -156,6 +202,201 @@ describe('Kubernetes Agent Host deployment contract', () => {
 
     expect(receipt.failure_codes).toContain('inbox_config_invalid')
     expect(JSON.stringify(receipt)).not.toContain('sh -c unverified')
+  })
+
+  it('fails when the declared project differs from the enforced profile project', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const config = JSON.parse(readFileSync(configPath, 'utf8'))
+    config.project_id = 'declared-project'
+    config.inbox.agents[0].profile.allowed_project_ids = ['different-project']
+    const configFile = join(dir, 'config.json')
+    writeFileSync(configFile, JSON.stringify(config))
+
+    const receipt = buildKubernetesAgentHostReceipt({
+      deploymentPath,
+      networkPolicyPath,
+      configPath: configFile,
+    })
+
+    expect(receipt.failure_codes).toContain('project_policy_mismatch')
+    expect(receipt.target.project_id).toBeNull()
+  })
+
+  it('recursively rejects private JWKs and credential-bearing fields without exposing values', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const config = JSON.parse(readFileSync(configPath, 'utf8'))
+    const privateScalar = 'private-scalar-must-not-appear'
+    const passwordValue = 'password-value-must-not-appear'
+    config.inbox.agents[0].profile.metadata = {
+      nested: [{ signing: { kty: 'OKP', crv: 'Ed25519', d: privateScalar, x: 'public' } }],
+      database_password: passwordValue,
+    }
+    const configFile = join(dir, 'config.json')
+    writeFileSync(configFile, JSON.stringify(config))
+
+    const receipt = buildKubernetesAgentHostReceipt({
+      deploymentPath,
+      networkPolicyPath,
+      configPath: configFile,
+    })
+    const serialized = JSON.stringify(receipt)
+
+    expect(receipt.failure_codes).toContain('config_schema_invalid')
+    expect(receipt.failure_codes).toContain('literal_credential_found')
+    expect(serialized).not.toContain(privateScalar)
+    expect(serialized).not.toContain(passwordValue)
+  })
+
+  it('rejects extra keys at every rendered config boundary', () => {
+    const mutators = [
+      (config: any) => { config.unexpected = true },
+      (config: any) => { config.daemon.unexpected = true },
+      (config: any) => { config.daemon.agents[0].unexpected = true },
+      (config: any) => { config.daemon.agents[0].inbox.unexpected = true },
+      (config: any) => { config.inbox.unexpected = true },
+      (config: any) => { config.inbox.agents[0].unexpected = true },
+    ]
+
+    for (const mutate of mutators) {
+      const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+      const config = JSON.parse(readFileSync(configPath, 'utf8'))
+      mutate(config)
+      const configFile = join(dir, 'config.json')
+      writeFileSync(configFile, JSON.stringify(config))
+      const receipt = buildKubernetesAgentHostReceipt({ deploymentPath, networkPolicyPath, configPath: configFile })
+      expect(receipt.failure_codes).toContain('config_schema_invalid')
+    }
+  })
+
+  it('recursively rejects a private JWK in an extra rendered ConfigMap entry', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const deployment = join(dir, 'deployment.yaml')
+    const privateScalar = 'rendered-private-scalar-must-not-appear'
+    writeFileSync(
+      deployment,
+      readFileSync(deploymentPath, 'utf8').replace(
+        '  daemon.json: |',
+        `  extra.json: |\n    {"nested":{"kty":"OKP","crv":"Ed25519","d":"${privateScalar}","x":"public"}}\n  daemon.json: |`,
+      ),
+    )
+
+    const receipt = buildKubernetesAgentHostReceipt({ deploymentPath: deployment, networkPolicyPath, configPath })
+    const serialized = JSON.stringify(receipt)
+
+    expect(receipt.failure_codes).toContain('config_schema_invalid')
+    expect(receipt.failure_codes).toContain('literal_credential_found')
+    expect(serialized).not.toContain(privateScalar)
+  })
+
+  it('recursively rejects an embedded private JWK in any rendered Kubernetes document', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const deployment = join(dir, 'deployment.yaml')
+    const privateScalar = 'deployment-private-scalar-must-not-appear'
+    writeFileSync(
+      deployment,
+      readFileSync(deploymentPath, 'utf8').replace(
+        `kind: Deployment\nmetadata:\n  name: dme-hermes-agent-host`,
+        `kind: Deployment\nmetadata:\n  name: dme-hermes-agent-host\n  annotations:\n    opaque: '{"kty":"OKP","crv":"Ed25519","d":"${privateScalar}","x":"public"}'`,
+      ),
+    )
+
+    const receipt = buildKubernetesAgentHostReceipt({ deploymentPath: deployment, networkPolicyPath, configPath })
+
+    expect(receipt.failure_codes).toContain('literal_credential_found')
+    expect(JSON.stringify(receipt)).not.toContain(privateScalar)
+  })
+
+  it('rejects unapproved container environment entries', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const deployment = join(dir, 'deployment.yaml')
+    const secretScalar = 'opaque-environment-value-must-not-appear'
+    writeFileSync(
+      deployment,
+      readFileSync(deploymentPath, 'utf8').replace(
+        `          env:\n            - name: HOME`,
+        `          env:\n            - name: API_TOKEN\n              value: ${secretScalar}\n            - name: HOME`,
+      ),
+    )
+
+    const receipt = buildKubernetesAgentHostReceipt({ deploymentPath: deployment, networkPolicyPath, configPath })
+
+    expect(receipt.failure_codes).toEqual(expect.arrayContaining([
+      'runtime_paths_invalid',
+      'literal_credential_found',
+    ]))
+    expect(JSON.stringify(receipt)).not.toContain(secretScalar)
+  })
+
+  it('rejects credential data in an additional rendered Kubernetes Secret', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const deployment = join(dir, 'deployment.yaml')
+    const secretScalar = 'rendered-secret-value-must-not-appear'
+    writeFileSync(
+      deployment,
+      `${readFileSync(deploymentPath, 'utf8')}\n---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: forbidden-inline-secret\nstringData:\n  API_KEY: ${secretScalar}\n`,
+    )
+
+    const receipt = buildKubernetesAgentHostReceipt({ deploymentPath: deployment, networkPolicyPath, configPath })
+
+    expect(receipt.failure_codes).toEqual(expect.arrayContaining([
+      'deployment_invalid',
+      'config_map_invalid',
+      'literal_credential_found',
+    ]))
+    expect(JSON.stringify(receipt)).not.toContain(secretScalar)
+  })
+
+  it('normalizes camelCase credential field names in rendered annotations', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const deployment = join(dir, 'deployment.yaml')
+    const secretScalar = 'camel-case-secret-value-must-not-appear'
+    writeFileSync(
+      deployment,
+      readFileSync(deploymentPath, 'utf8').replace(
+        `kind: Deployment\nmetadata:\n  name: dme-hermes-agent-host`,
+        `kind: Deployment\nmetadata:\n  name: dme-hermes-agent-host\n  annotations:\n    clientSecret: ${secretScalar}`,
+      ),
+    )
+
+    const receipt = buildKubernetesAgentHostReceipt({ deploymentPath: deployment, networkPolicyPath, configPath })
+
+    expect(receipt.failure_codes).toContain('literal_credential_found')
+    expect(JSON.stringify(receipt)).not.toContain(secretScalar)
+  })
+
+  it('limits Kubernetes credential-field exemptions to their pod-spec paths', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const deployment = join(dir, 'deployment.yaml')
+    writeFileSync(
+      deployment,
+      readFileSync(deploymentPath, 'utf8').replace(
+        `kind: Deployment\nmetadata:\n  name: dme-hermes-agent-host`,
+        `kind: Deployment\nmetadata:\n  name: dme-hermes-agent-host\n  annotations:\n    automountServiceAccountToken: forbidden-here`,
+      ),
+    )
+
+    const receipt = buildKubernetesAgentHostReceipt({ deploymentPath: deployment, networkPolicyPath, configPath })
+
+    expect(receipt.failure_codes).toContain('literal_credential_found')
+  })
+
+  it('allows the service-account token field only when the pod spec disables it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const deployment = join(dir, 'deployment.yaml')
+    writeFileSync(
+      deployment,
+      readFileSync(deploymentPath, 'utf8').replace(
+        '      automountServiceAccountToken: false',
+        '      automountServiceAccountToken: true',
+      ),
+    )
+
+    const receipt = buildKubernetesAgentHostReceipt({ deploymentPath: deployment, networkPolicyPath, configPath })
+
+    expect(receipt.failure_codes).toEqual(expect.arrayContaining([
+      'service_account_token_enabled',
+      'literal_credential_found',
+    ]))
   })
 
   it('parses the receipt CLI without accepting credential arguments', () => {

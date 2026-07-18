@@ -62,3 +62,14 @@ test('readiness requires at least one healthy agent result', () => {
     maxStaleMs: 120000,
   }), { ready: false, reasons: ['agent_unhealthy'] })
 })
+
+test('on-demand hosts do not require a control daemon state file', () => {
+  assert.deepEqual(evaluateContainerReadiness({
+    heartbeat,
+    control: null,
+    controlRequired: false,
+    childrenAlive: true,
+    nowMs: Date.parse('2026-07-18T20:01:00.000Z'),
+    maxStaleMs: 120000,
+  }), { ready: true, reasons: [] })
+})

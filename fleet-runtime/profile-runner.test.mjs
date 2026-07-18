@@ -11,6 +11,7 @@ function profile() {
     adapter: 'hermes',
     command: ['/opt/homebrew/bin/hermes', 'chat', '--toolsets', 'mumega_dme'],
     allowed_senders: ['hadi-codex-cli'],
+    allowed_project_ids: ['project-a'],
     run_for: ['request'],
     timeout_ms: 120000,
   }
@@ -79,4 +80,36 @@ test('rejects acknowledgement loops and non-allowlisted message kinds before spa
 test('rejects a batch addressed to another welded identity', async () => {
   const result = await runAgentProfile(profile(), batch({ agent_id: 'other-agent' }))
   assert.deepEqual(result, { ok: false, reason: 'agent_mismatch' })
+})
+
+test('rejects null and non-allowlisted projects before spawning', async () => {
+  let spawned = false
+  const nullProject = batch({ messages: [{ ...batch().messages[0], project_id: null }] })
+  const otherProject = batch({ messages: [{ ...batch().messages[0], project_id: 'project-b' }] })
+
+  assert.deepEqual(
+    await runAgentProfile(profile(), nullProject, { spawnImpl: () => { spawned = true } }),
+    { ok: false, reason: 'project_denied' },
+  )
+  assert.deepEqual(
+    await runAgentProfile(profile(), otherProject, { spawnImpl: () => { spawned = true } }),
+    { ok: false, reason: 'project_denied' },
+  )
+  assert.equal(spawned, false)
+})
+
+test('rejects the entire batch when any activated message is outside project policy', async () => {
+  let spawned = false
+  const mixed = batch({
+    messages: [
+      batch().messages[0],
+      { ...batch().messages[0], id: 'message-b', seq: 2, project_id: null },
+    ],
+  })
+
+  assert.deepEqual(
+    await runAgentProfile(profile(), mixed, { spawnImpl: () => { spawned = true } }),
+    { ok: false, reason: 'project_denied' },
+  )
+  assert.equal(spawned, false)
 })

@@ -1,3 +1,60 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dme-hermes-agent-host
+data:
+  daemon.json: |
+    {
+      "base_url": "https://mupot.dme.example",
+      "tenant": "dme",
+      "state_file": "/var/lib/mupot/state/fleet-daemon.json",
+      "interval_sec": 75,
+      "agents": [
+        {
+          "agent_id": "dme-hermes-k8s",
+          "type": "brain",
+          "runtime": "mupot-agent-host/hermes",
+          "lifecycle": "on_demand",
+          "probe": "test -x /usr/local/bin/hermes && kill -0 1",
+          "inbox": {
+            "command": "node /opt/mupot/inbox-handler.mjs /etc/mupot/inbox-handler.json",
+            "limit": 20
+          }
+        }
+      ]
+    }
+  inbox-handler.json: |
+    {
+      "spool_dir": "/var/lib/mupot/inbox",
+      "command_timeout_ms": 120000,
+      "agents": [
+        {
+          "agent_id": "dme-hermes-k8s",
+          "profile": {
+            "schema": "mupot.agent-profile/v1",
+            "agent_id": "dme-hermes-k8s",
+            "adapter": "hermes",
+            "command": [
+              "/usr/local/bin/hermes",
+              "chat",
+              "--toolsets",
+              "dme_mupot"
+            ],
+            "allowed_senders": [
+              "dme-project-link"
+            ],
+            "allowed_project_ids": [
+              "replace-with-dme-project-id"
+            ],
+            "run_for": [
+              "request"
+            ],
+            "timeout_ms": 120000
+          }
+        }
+      ]
+    }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,10 +93,10 @@ spec:
             - /usr/local/bin/node
             - /opt/mupot/container-entrypoint.mjs
           env:
+            - name: HOME
+              value: /home/mupot
             - name: MUPOT_DAEMON_CONFIG
               value: /etc/mupot/daemon.json
-            - name: MUPOT_CONTROL_CONFIG
-              value: /etc/mupot/control.json
             - name: MUPOT_STATE_DIR
               value: /var/lib/mupot/state
             - name: MUPOT_HEALTH_PORT
@@ -82,8 +139,8 @@ spec:
             - name: config
               mountPath: /etc/mupot
               readOnly: true
-            - name: agent-credential
-              mountPath: /var/run/secrets/mupot
+            - name: agent-signing-key
+              mountPath: /home/mupot/.fleet/agents
               readOnly: true
             - name: runtime-state
               mountPath: /var/lib/mupot
@@ -93,11 +150,14 @@ spec:
         - name: config
           configMap:
             name: dme-hermes-agent-host
-            defaultMode: 0440
-        - name: agent-credential
+            defaultMode: 288
+        - name: agent-signing-key
           secret:
-            secretName: dme-hermes-mupot
-            defaultMode: 0400
+            secretName: dme-hermes-signing-key
+            defaultMode: 288
+            items:
+              - key: dme-hermes-k8s.key
+                path: dme-hermes-k8s.key
         - name: runtime-state
           emptyDir: {}
         - name: temporary

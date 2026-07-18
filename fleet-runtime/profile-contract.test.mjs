@@ -14,6 +14,7 @@ function validProfile() {
     adapter: 'hermes',
     command: ['/opt/homebrew/bin/hermes', 'chat', '--toolsets', 'mumega_dme'],
     allowed_senders: ['hadi-codex-cli'],
+    allowed_project_ids: ['project-a'],
     run_for: ['request'],
     timeout_ms: 120000,
   }
@@ -51,4 +52,11 @@ test('rejects wildcard senders and invalid timeout bounds', () => {
   assert.equal(normalizeAgentProfile({ ...validProfile(), allowed_senders: ['*'] }), null)
   assert.equal(normalizeAgentProfile({ ...validProfile(), timeout_ms: 999 }), null)
   assert.equal(normalizeAgentProfile({ ...validProfile(), timeout_ms: 600001 }), null)
+})
+
+test('requires an exact non-wildcard project allowlist', () => {
+  assert.equal(normalizeAgentProfile({ ...validProfile(), allowed_project_ids: undefined }), null)
+  assert.equal(normalizeAgentProfile({ ...validProfile(), allowed_project_ids: [] }), null)
+  assert.equal(normalizeAgentProfile({ ...validProfile(), allowed_project_ids: ['*'] }), null)
+  assert.equal(normalizeAgentProfile({ ...validProfile(), allowed_project_ids: ['project-a', 'project-a'] }), null)
 })

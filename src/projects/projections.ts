@@ -1,7 +1,7 @@
 import type { Env } from '../types'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 
-export type ProjectActivitySource = 'task' | 'message' | 'flight'
+export type ProjectActivitySource = 'task' | 'message' | 'flight' | 'project_link'
 export type ProjectEvidenceSource =
   | 'task_result'
   | 'task_verdict'
@@ -9,6 +9,7 @@ export type ProjectEvidenceSource =
   | 'dispatch_receipt'
   | 'flight_receipt'
   | 'message_ack'
+  | 'project_link_receipt'
 
 export interface ProjectProjectionRow<T extends string = string> {
   source_type: T
@@ -94,6 +95,23 @@ function flightReadableSql(alias: string, idsParam: string): string {
     ))`
 }
 
+function messageReadableSql(alias: string, idsParam: string, adminParam: string): string {
+  const endpointIsReadable = (endpointAlias: string, field: 'from_agent' | 'to_agent') => `EXISTS (
+    SELECT 1 FROM agents ${endpointAlias}
+     WHERE ${endpointAlias}.id = ${alias}.${field}
+       AND (
+         ${adminParam} = 1
+         OR ${endpointAlias}.squad_id IN (
+           SELECT CAST(value AS TEXT) FROM json_each(${idsParam})
+         )
+       )
+  )`
+  return `(
+    ${endpointIsReadable('readable_sender', 'from_agent')}
+    AND ${endpointIsReadable('readable_recipient', 'to_agent')}
+  )`
+}
+
 export async function listProjectActivity(
   env: Env,
   input: ProjectProjectionInput,
@@ -104,7 +122,7 @@ export async function listProjectActivity(
   const ids = readableIds(input)
   const isAdmin = adminFlag(input)
 
-  const [taskRows, messageRows, flightRows] = await Promise.all([
+  const [taskRows, messageRows, flightRows, linkRows] = await Promise.all([
     env.DB.prepare(
       `SELECT t.id, t.title, t.status, t.assignee_agent_id, t.created_at, s.name AS squad_name
          FROM tasks t JOIN squads s ON s.id = t.squad_id
@@ -115,11 +133,12 @@ export async function listProjectActivity(
       id: string; title: string; status: string; assignee_agent_id: string | null; created_at: string; squad_name: string
     }>(),
     env.DB.prepare(
-      `SELECT id, from_agent, to_agent, kind, body, request_id, in_reply_to, created_at
-         FROM agent_messages
-        WHERE tenant = ?1 AND project_id = ?2
-        ORDER BY created_at DESC, seq DESC LIMIT ?3`,
-    ).bind(env.TENANT_SLUG, input.projectId, sourceLimit).all<{
+      `SELECT m.id, m.from_agent, m.to_agent, m.kind, m.body, m.request_id, m.in_reply_to, m.created_at
+        FROM agent_messages m
+       WHERE m.tenant = ?1 AND m.project_id = ?2
+          AND ${messageReadableSql('m', '?4', '?3')}
+        ORDER BY m.created_at DESC, m.seq DESC LIMIT ?5`,
+    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, sourceLimit).all<{
       id: string; from_agent: string; to_agent: string; kind: string; body: string
       request_id: string | null; in_reply_to: string | null; created_at: string
     }>(),
@@ -131,6 +150,19 @@ export async function listProjectActivity(
         ORDER BY f.created_at DESC, f.id DESC LIMIT ?5`,
     ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, sourceLimit).all<{
       id: string; agent: string; goal: string; status: string; created_at: number
+    }>(),
+    env.DB.prepare(
+      `SELECT id, remote_pot, remote_project_id, remote_agent_id, state,
+              last_success_at, last_failure_at, last_error, stale_after_seconds,
+              created_at, revoked_at
+         FROM project_links
+        WHERE tenant = ?1 AND local_project_id = ?2
+          AND (?3 = 1 OR local_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
+        ORDER BY COALESCE(last_success_at, last_failure_at, revoked_at, created_at) DESC, id DESC LIMIT ?5`,
+    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, sourceLimit).all<{
+      id: string; remote_pot: string; remote_project_id: string; remote_agent_id: string
+      state: 'active' | 'revoked'; last_success_at: string | null; last_failure_at: string | null
+      last_error: string | null; stale_after_seconds: number; created_at: string; revoked_at: string | null
     }>(),
   ])
 
@@ -165,6 +197,28 @@ export async function listProjectActivity(
       actor: row.agent,
       correlation_id: null,
     })),
+    ...(linkRows.results ?? []).map((row) => {
+      const occurredAt = row.last_success_at ?? row.last_failure_at ?? row.revoked_at ?? row.created_at
+      const status = row.state === 'revoked'
+        ? 'revoked'
+        : row.last_failure_at && (!row.last_success_at || Date.parse(row.last_failure_at) > Date.parse(row.last_success_at))
+          ? 'failed'
+          : !row.last_success_at
+            ? 'unknown'
+            : Date.now() - Date.parse(row.last_success_at) > row.stale_after_seconds * 1000
+              ? 'stale'
+              : 'healthy'
+      return {
+        source_type: 'project_link' as const,
+        source_id: row.id,
+        occurred_at: iso(occurredAt),
+        title: `Linked project: ${row.remote_pot} / ${row.remote_project_id}`,
+        detail: sanitizeProjectDetail(row.last_error ?? `source=${row.remote_pot}; last_sync=${row.last_success_at ?? 'unknown'}`),
+        status,
+        actor: row.remote_agent_id,
+        correlation_id: null,
+      }
+    }),
   ]
   const ordered = newest(rows)
   return { rows: ordered.slice(offset, offset + limit), hasMore: ordered.length > offset + limit }
@@ -230,14 +284,31 @@ export async function listProjectEvidence(
       delivered_at: string | null; consumed_at: string | null; last_error: string | null
     }>(),
     env.DB.prepare(
-      `SELECT id, from_agent, to_agent, body, in_reply_to, created_at
-         FROM agent_messages
-        WHERE tenant = ?1 AND project_id = ?2 AND kind = 'ack'
-        ORDER BY created_at DESC, seq DESC LIMIT ?3`,
-    ).bind(env.TENANT_SLUG, input.projectId, sourceLimit).all<{
+      `SELECT m.id, m.from_agent, m.to_agent, m.body, m.in_reply_to, m.created_at
+        FROM agent_messages m
+       WHERE m.tenant = ?1 AND m.project_id = ?2 AND m.kind = 'ack'
+          AND ${messageReadableSql('m', '?4', '?3')}
+        ORDER BY m.created_at DESC, m.seq DESC LIMIT ?5`,
+    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, sourceLimit).all<{
       id: string; from_agent: string; to_agent: string; body: string; in_reply_to: string | null; created_at: string
     }>(),
   ])
+  const linkReceipts = await env.DB.prepare(
+    `SELECT r.id, r.direction, r.correlation_id, r.shared_receipt_sha256,
+            r.envelope_sha256, r.evidence_sha256, r.remote_pot,
+            r.remote_project_id, r.source_agent_id, r.action_type,
+            r.action_id, r.receipt_key_id, r.receipt_signature, r.status, r.created_at
+       FROM project_link_receipts r
+       JOIN project_links l ON l.id = r.link_id AND l.tenant = r.tenant
+      WHERE r.tenant = ?1 AND r.local_project_id = ?2
+        AND (?3 = 1 OR l.local_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
+      ORDER BY r.created_at DESC, r.id DESC LIMIT ?5`,
+  ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, sourceLimit).all<{
+    id: string; direction: string; correlation_id: string; shared_receipt_sha256: string
+    envelope_sha256: string; evidence_sha256: string | null; remote_pot: string
+    remote_project_id: string; source_agent_id: string; action_type: string
+    action_id: string; receipt_key_id: string; receipt_signature: string; status: string; created_at: string
+  }>()
 
   const rows: ProjectProjectionRow<ProjectEvidenceSource>[] = [
     ...(results.results ?? []).map((row) => ({
@@ -277,6 +348,16 @@ export async function listProjectEvidence(
       occurred_at: iso(row.created_at), title: `${row.from_agent} -> ${row.to_agent}`,
       detail: sanitizeProjectDetail(row.body), status: 'ack',
       actor: row.from_agent, correlation_id: row.in_reply_to,
+    })),
+    ...(linkReceipts.results ?? []).map((row) => ({
+      source_type: 'project_link_receipt' as const,
+      source_id: row.id,
+      occurred_at: iso(row.created_at),
+      title: `${row.direction} ${row.action_type}: ${row.remote_pot} / ${row.remote_project_id}`,
+      detail: `receipt=${row.shared_receipt_sha256}; envelope=${row.envelope_sha256}${row.evidence_sha256 ? `; evidence=${row.evidence_sha256}` : ''}; key=${row.receipt_key_id}; signature=${row.receipt_signature}`,
+      status: row.status,
+      actor: row.source_agent_id,
+      correlation_id: row.correlation_id,
     })),
   ]
   const ordered = newest(rows)

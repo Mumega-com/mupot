@@ -8,6 +8,7 @@ const PROFILE_KEYS = Object.freeze([
   'adapter',
   'command',
   'allowed_senders',
+  'allowed_project_ids',
   'run_for',
   'timeout_ms',
 ])
@@ -41,8 +42,9 @@ export function normalizeAgentProfile(raw) {
   if (!ADAPTERS.has(raw.adapter)) return null
   const command = commandArgv(raw.command)
   const allowedSenders = uniqueRefs(raw.allowed_senders)
+  const allowedProjectIds = uniqueRefs(raw.allowed_project_ids)
   const runFor = uniqueRefs(raw.run_for, { min: 1, max: 2 })
-  if (!command || !allowedSenders || !runFor || runFor.some((kind) => !MESSAGE_KINDS.has(kind))) return null
+  if (!command || !allowedSenders || !allowedProjectIds || !runFor || runFor.some((kind) => !MESSAGE_KINDS.has(kind))) return null
   if (!Number.isInteger(raw.timeout_ms) || raw.timeout_ms < 1000 || raw.timeout_ms > 600000) return null
   return {
     schema: AGENT_PROFILE_SCHEMA,
@@ -50,6 +52,7 @@ export function normalizeAgentProfile(raw) {
     adapter: raw.adapter,
     command,
     allowed_senders: allowedSenders,
+    allowed_project_ids: allowedProjectIds,
     run_for: runFor,
     timeout_ms: raw.timeout_ms,
   }

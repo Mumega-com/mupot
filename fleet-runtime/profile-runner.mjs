@@ -14,11 +14,13 @@ function validateBatch(profile, batch) {
   if (batch.agent_id !== profile.agent_id) return 'agent_mismatch'
   if (!Array.isArray(batch.messages) || batch.messages.length < 1 || batch.messages.length > 100) return 'invalid_batch'
   const senders = new Set(profile.allowed_senders)
+  const projects = new Set(profile.allowed_project_ids)
   const kinds = new Set(profile.run_for)
   for (const message of batch.messages) {
     if (!message || typeof message !== 'object' || Array.isArray(message)) return 'invalid_batch'
     if (message.kind === 'ack') return 'ack_loop'
     if (!senders.has(message.from_agent)) return 'unauthorized_sender'
+    if (typeof message.project_id !== 'string' || !projects.has(message.project_id)) return 'project_denied'
     if (!kinds.has(message.kind)) return 'message_kind_denied'
   }
   return null

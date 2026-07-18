@@ -44,6 +44,7 @@ function policyProfile(agentId = 'manager') {
     adapter: agentId === 'manager' ? 'hermes' : 'codex',
     command: agentId === 'manager' ? ['/usr/local/bin/hermes', 'chat'] : ['/usr/local/bin/codex', 'exec'],
     allowed_senders: [agentId === 'manager' ? 'builder' : 'manager'],
+    allowed_project_ids: ['project-example'],
     run_for: ['request'],
     timeout_ms: 120000,
   }

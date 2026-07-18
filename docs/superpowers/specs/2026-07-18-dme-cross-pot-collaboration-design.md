@@ -119,28 +119,45 @@ The cross-pot adapter is an addon, not microkernel code. Its responsibilities ar
 
 - authenticate both pot endpoints independently;
 - map the paired project identifiers;
+- grant task-write and evidence-write independently per paired link;
 - validate and sign outbound envelopes;
-- enforce an allowlist of fields and evidence types;
+- enforce an allowlist of fields, evidence types, and evidence origins;
 - deduplicate delivery by idempotency key;
 - preserve source attribution;
 - retry transient delivery safely;
+- acquire one bounded outbound delivery lease with an authorization-guarded D1
+  write before any remote request;
 - expose link health and last successful synchronization; and
-- record a receipt in both pots.
+- return a destination-signed canonical receipt and record the verified receipt
+  atomically with delivery state in both pots.
 
 The adapter cannot mint identities, broaden capabilities, or read arbitrary source-pot data. Both projects must explicitly enable the link.
 
 ## Failure Handling
 
 - Invalid signatures, expired envelopes, unknown projects, and insufficient capability fail closed.
-- Duplicate envelopes return the original receipt without repeating the action.
+- Duplicate envelopes reauthorize the current link before returning the original
+  signed receipt without repeating the action.
 - A destination outage leaves the source item pending with bounded retry metadata.
-- Repeated failures move the envelope to a review queue and surface a project blocker.
+- Matching failed deliveries remain resumable with the same signed envelope and
+  cumulative attempt count; exhausted delivery is surfaced for operator review.
+- Every success, retry, and failure transition must present the active delivery
+  claim. A concurrent invocation cannot send, and a late failure cannot downgrade
+  a delivery already recorded as delivered.
 - Revoking either project link or runtime token stops future delivery without deleting prior receipts.
 - Remote status becomes stale when its freshness window expires.
 
 ## Security Boundary
 
-The DME pot remains the system of record for customer operations. Mumega receives only the minimum approved coordination state. Evidence URLs must be scoped, expiring, or independently authorized. No cross-pot action inherits the sender's local capability; the destination reauthorizes every requested operation against its own RBAC grants.
+The DME pot remains the system of record for customer operations. Mumega receives
+only the minimum approved coordination state. Evidence URLs are references only,
+must use an explicitly paired HTTPS origin, and carry no query or fragment. No
+cross-pot action inherits the sender's local capability; the destination
+reauthorizes every requested operation against its own RBAC grants immediately
+before the atomic write. Receipts are signed by the destination key registered in
+the paired link; matching hashes alone are not treated as authentication.
+Project messages are visible only when both endpoint identities resolve and both
+endpoint squads are readable; an absent identity never implies project-wide scope.
 
 ## Initial Backlog
 
@@ -163,7 +180,8 @@ The DME pot remains the system of record for customer operations. Mumega receive
 - Both can exchange direct messages and work from the same project-attributed task list.
 - The Kubernetes Hermes remains controlled by the DME pot and does not share its token.
 - A signed task envelope can cross between paired projects exactly once.
-- Both pots retain linked receipts with matching correlation and evidence hashes.
+- Both pots retain the same destination-signed linked receipt with matching
+  correlation, evidence, envelope, and canonical receipt hashes.
 - The Mumega project page shows source-labeled remote status and staleness.
 - Tests prove that prohibited customer fields, invalid signatures, revoked links, and unauthorized actions fail closed.
 

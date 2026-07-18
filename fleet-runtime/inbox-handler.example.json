@@ -11,6 +11,7 @@
         "adapter": "hermes",
         "command": ["/usr/local/bin/hermes", "chat", "--toolsets", "mupot"],
         "allowed_senders": ["agent-two"],
+        "allowed_project_ids": ["project-example"],
         "run_for": ["request"],
         "timeout_ms": 120000
       }
@@ -23,6 +24,7 @@
         "adapter": "codex",
         "command": ["/usr/local/bin/codex", "exec"],
         "allowed_senders": ["agent-one"],
+        "allowed_project_ids": ["project-example"],
         "run_for": ["request", "message"],
         "timeout_ms": 120000
       }

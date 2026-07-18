@@ -178,19 +178,27 @@ Attach only the copied bundle when `manifest.json`, `cutover-gate.json`,
 ## Kubernetes Agent Host
 
 The Kubernetes template is under `deploy/kubernetes/agent-host`. The repository
-does not create or retain the customer identity, agent token, model login, or
-cluster access. The DME operator owns those inputs and builds a derived image
-that adds the Hermes executable to the credential-free Agent Host base image.
+does not create or retain the customer identity, private signing key, model
+login, or cluster access. The DME operator owns those inputs and builds a
+derived image that adds the Hermes executable to the credential-free Agent Host
+base image.
 
 1. Build and publish the base image from `fleet-runtime/Dockerfile.agent-host`.
 2. Build a DME-owned derived image containing `/usr/local/bin/hermes` and pin the
    Deployment image by digest, not by tag.
 3. Replace the project and endpoint placeholders in a private copy of
    `config.example.json`.
-4. Create `dme-hermes-mupot` from the welded DME agent token using the cluster's
-   secret manager. Never pass the value on a command line or write it to Git.
-5. Create the `dme-hermes-agent-host` ConfigMap from the rendered daemon and
-   control configs, then apply the Deployment and NetworkPolicy.
+4. Register the welded agent's Ed25519 public key in its DME pot. Deliver only
+   the matching private JWK through the cluster secret manager as Secret
+   `dme-hermes-signing-key`, key `dme-hermes-k8s.key`. Never pass it on a command
+   line, place it in a ConfigMap, or write it to Git. The projected file must be
+   owned by `root:10001` with mode `0440`; the runtime accepts that exact trusted
+   group state (and owner-owned `0600` for non-Kubernetes hosts) and rejects all
+   other ownership/mode combinations.
+5. Render the `dme-hermes-agent-host` ConfigMap's `daemon.json` and
+   `inbox-handler.json` from `config.example.json`, then apply the ConfigMap,
+   Deployment, and NetworkPolicy. The Kubernetes package runs in on-demand Host
+   mode and deliberately does not start a second control-inbox consumer.
 
 Before rollout, generate a redacted receipt from the rendered files:
 
@@ -206,9 +214,12 @@ npm run --silent receipt:kubernetes-agent-host -- \
 The receipt fails unless the image is immutable, pod execution is non-root and
 read-only, privilege escalation and service-account token mounting are disabled,
 resources and health probes are bounded, ingress is denied, egress uses the
-trusted gateway, the DME Secret is referenced, the project is explicit, and the
-policy profile validates. It records only artifact and profile digests, never
-the profile command, sender list, credential path, or credential value.
+trusted gateway, the exact DME signing-key mount is referenced, rendered daemon
+and inbox configs match the declared package config, the project is explicit,
+the profile enforces that exact project for every activated message, and all
+rendered config objects use exact schemas without private JWKs or credential
+fields. It records only artifact and profile digests,
+never the profile command, sender list, private key path, or private key value.
 
 ## Data-Preserving Rollback And Recovery
 

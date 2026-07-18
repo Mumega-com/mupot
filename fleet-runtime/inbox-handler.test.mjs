@@ -35,6 +35,7 @@ const rawPayload = () => ({
     body: 'do the work',
     request_id: 'rid-1',
     in_reply_to: null,
+    project_id: 'project-example',
     created_at: 'now',
   }],
   remaining: 0,
@@ -123,6 +124,7 @@ test('handleBatch: productized profiles persist first and activate through the d
     adapter: 'hermes',
     command: ['/opt/homebrew/bin/hermes', 'chat', '--toolsets', 'mumega_dme'],
     allowed_senders: ['review'],
+    allowed_project_ids: ['project-example'],
     run_for: ['request'],
     timeout_ms: 120000,
   }
@@ -141,7 +143,7 @@ test('handleBatch: productized profiles persist first and activate through the d
   assert.equal(result.ok, true)
   assert.equal(result.command, 'profile:hermes')
   assert.equal(calls.length, 1)
-  assert.equal(calls[0].batch.messages[0].project_id, null)
+  assert.equal(calls[0].batch.messages[0].project_id, 'project-example')
 })
 
 test('runCommand: passes JSON stdin to a real child process', async () => {

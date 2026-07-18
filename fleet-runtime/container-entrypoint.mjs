@@ -13,7 +13,7 @@ function fresh(value, nowMs, maxStaleMs) {
   return Number.isFinite(timestamp) && timestamp <= nowMs && nowMs - timestamp <= maxStaleMs
 }
 
-export function evaluateContainerReadiness({ heartbeat, control, childrenAlive, nowMs = Date.now(), maxStaleMs = 120000 }) {
+export function evaluateContainerReadiness({ heartbeat, control, controlRequired = true, childrenAlive, nowMs = Date.now(), maxStaleMs = 120000 }) {
   const reasons = []
   if (!childrenAlive) reasons.push('child_not_running')
   if (!heartbeat || heartbeat.schema !== 'mupot-fleet-daemon-state/v1') {
@@ -25,10 +25,12 @@ export function evaluateContainerReadiness({ heartbeat, control, childrenAlive, 
       reasons.push('agent_unhealthy')
     }
   }
-  if (!control || control.schema !== 'mupot-fleet-control-state/v1') {
-    reasons.push('control_invalid')
-  } else if (!fresh(control.last_poll_at, nowMs, maxStaleMs)) {
-    reasons.push('control_stale')
+  if (controlRequired) {
+    if (!control || control.schema !== 'mupot-fleet-control-state/v1') {
+      reasons.push('control_invalid')
+    } else if (!fresh(control.last_poll_at, nowMs, maxStaleMs)) {
+      reasons.push('control_stale')
+    }
   }
   return { ready: reasons.length === 0, reasons }
 }
@@ -56,7 +58,7 @@ export async function main(options = {}) {
   const spawnImpl = options.spawnImpl ?? spawn
   const nodePath = options.nodePath ?? process.execPath
   const daemonConfig = env.MUPOT_DAEMON_CONFIG ?? '/etc/mupot/daemon.json'
-  const controlConfig = env.MUPOT_CONTROL_CONFIG ?? '/etc/mupot/control.json'
+  const controlConfig = env.MUPOT_CONTROL_CONFIG
   const stateDir = env.MUPOT_STATE_DIR ?? '/var/lib/mupot/state'
   const heartbeatPath = env.MUPOT_HEARTBEAT_STATE ?? join(stateDir, 'fleet-daemon.json')
   const controlPath = env.MUPOT_CONTROL_STATE ?? join(stateDir, 'fleet-control.json')
@@ -65,10 +67,10 @@ export async function main(options = {}) {
   if (!Number.isInteger(healthPort) || healthPort < 1 || healthPort > 65535) throw new Error('invalid MUPOT_HEALTH_PORT')
   if (!Number.isFinite(maxStaleMs) || maxStaleMs < 1000 || maxStaleMs > 600000) throw new Error('invalid MUPOT_MAX_STALE_MS')
 
-  const children = [
-    spawnImpl(nodePath, [join(HERE, 'fleet-daemon.mjs'), daemonConfig], { shell: false, stdio: 'inherit' }),
-    spawnImpl(nodePath, [join(HERE, 'fleet-control-daemon.mjs'), controlConfig], { shell: false, stdio: 'inherit' }),
-  ]
+  const children = [spawnImpl(nodePath, [join(HERE, 'fleet-daemon.mjs'), daemonConfig], { shell: false, stdio: 'inherit' })]
+  if (controlConfig) {
+    children.push(spawnImpl(nodePath, [join(HERE, 'fleet-control-daemon.mjs'), controlConfig], { shell: false, stdio: 'inherit' }))
+  }
   let shuttingDown = false
   const alive = new Set(children)
 
@@ -81,6 +83,7 @@ export async function main(options = {}) {
       const readiness = evaluateContainerReadiness({
         heartbeat: readJson(heartbeatPath),
         control: readJson(controlPath),
+        controlRequired: Boolean(controlConfig),
         childrenAlive: alive.size === children.length,
         maxStaleMs,
       })
