@@ -48,6 +48,13 @@ function multiSquadManagerAuth(): AuthContext {
   }
 }
 
+function workerManagerAuth(): AuthContext {
+  return {
+    ...managerAuth(),
+    boundAgentId: 'agent-worker',
+  }
+}
+
 function orgOnlyManagerAuth(): AuthContext {
   const auth = managerAuth()
   return {
@@ -128,7 +135,10 @@ function managerEnv(
                 if (sql.includes('SELECT COUNT(*) AS n FROM agents')) return { n: 0 }
                 if (sql.includes('FROM member_tokens') && sql.includes('JOIN agents')) {
                   if (args[0] === 'token-worker') {
-                    return { id: 'token-worker', member_id: 'member-worker-token', agent_id: 'agent-worker', squad_id: SQUAD_ID, revoked_at: null }
+                    return { id: 'token-worker', member_id: 'member-worker-token', agent_id: 'agent-worker', squad_id: SQUAD_ID, agent_role: 'member', revoked_at: null }
+                  }
+                  if (args[0] === 'token-admin') {
+                    return { id: 'token-admin', member_id: 'member-admin-token', agent_id: 'agent-manager', squad_id: SQUAD_ID, agent_role: 'admin', revoked_at: null }
                   }
                   if (args[0] === 'token-current') {
                     return { id: 'token-current', member_id: MEMBER_ID, agent_id: 'agent-manager', squad_id: SQUAD_ID, revoked_at: null }
@@ -421,6 +431,18 @@ describe('squad agent manager', () => {
     expect(outcome).toMatchObject({ ok: false, status: 409, error: 'self_management_forbidden' })
   })
 
+  it('cannot pause an admin or owner agent in the same squad', async () => {
+    const outcome = await invokeTool(
+      workerManagerAuth(),
+      managerEnv(),
+      'agent_manager_set_status',
+      { squad_id: SQUAD_ID, agent_id: 'agent-manager', status: 'paused' },
+      'https://mupot.example',
+    )
+
+    expect(outcome).toMatchObject({ ok: false, status: 403, error: 'privileged_agent_forbidden' })
+  })
+
   it('cannot pause an agent in another squad even when the manager belongs to both squads', async () => {
     const outcome = await invokeTool(
       multiSquadManagerAuth(),
@@ -549,6 +571,22 @@ describe('squad agent manager', () => {
     }
   })
 
+  it('cannot mint a credential for an admin or owner agent', async () => {
+    const outcome = await invokeTool(
+      workerManagerAuth(),
+      managerEnv(),
+      'agent_manager_mint_token',
+      {
+        squad_id: SQUAD_ID,
+        agent_id: 'agent-manager',
+        request_id: 'admin-runtime-001',
+      },
+      'https://mupot.example',
+    )
+
+    expect(outcome).toMatchObject({ ok: false, status: 403, error: 'privileged_agent_forbidden' })
+  })
+
   it('rejects attempts to choose a higher capability during manager mint', async () => {
     const outcome = await invokeTool(
       managerAuth(),
@@ -581,6 +619,18 @@ describe('squad agent manager', () => {
     expect(update?.args).toContain('member-worker-token')
     expect(update?.args).toContain('dme-temp')
     expect(captured.find(({ sql }) => /^\s*INSERT INTO agent_manager_audit/.test(sql))?.args).toContain('revoke_token')
+  })
+
+  it('cannot revoke a credential welded to an admin or owner agent', async () => {
+    const outcome = await invokeTool(
+      workerManagerAuth(),
+      managerEnv(),
+      'agent_manager_revoke_token',
+      { squad_id: SQUAD_ID, token_id: 'token-admin' },
+      'https://mupot.example',
+    )
+
+    expect(outcome).toMatchObject({ ok: false, status: 403, error: 'privileged_agent_forbidden' })
   })
 
   it('cannot revoke the credential backing its current authenticated member', async () => {

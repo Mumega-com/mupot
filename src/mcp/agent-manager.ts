@@ -143,6 +143,10 @@ function mintReplayOutcome(row: MintReplayRow): ReturnType<typeof done> {
   })
 }
 
+function isPrivilegedAgentRole(role: string): boolean {
+  return ['admin', 'administrator', 'owner'].includes(role.trim().toLowerCase())
+}
+
 async function hasExplicitSurfaceGrant(env: Env, memberId: string, surface: string): Promise<boolean> {
   const row = await env.DB.prepare(
     `SELECT 1 AS allowed
@@ -346,6 +350,9 @@ const toolAgentManagerSetStatus: ToolSpec = {
     if (resolved.value.id === auth.boundAgentId) {
       return fail(409, 'self_management_forbidden')
     }
+    if (isPrivilegedAgentRole(resolved.value.role)) {
+      return fail(403, 'privileged_agent_forbidden')
+    }
 
     const requestId = crypto.randomUUID()
     const updated = await setAgentStatus(env, resolved.value.id, args.status, [
@@ -404,6 +411,7 @@ const toolAgentManagerMintToken: ToolSpec = {
       return fail(resolved.reason === 'ambiguous' ? 409 : 404, resolved.reason === 'ambiguous' ? 'agent_ref_ambiguous' : 'agent_not_found')
     }
     if (resolved.value.squad_id !== authorization.squad.id) return fail(404, 'agent_not_found')
+    if (isPrivilegedAgentRole(resolved.value.role)) return fail(403, 'privileged_agent_forbidden')
 
     const label = str(args.label) ?? resolved.value.slug
     const prior = await findMintReplay(env, auth, requestId, authorization.squad.id)
@@ -459,6 +467,7 @@ interface ManagedTokenRow {
   member_id: string
   agent_id: string
   squad_id: string
+  agent_role: string
   revoked_at: string | null
 }
 
@@ -490,7 +499,7 @@ const toolAgentManagerRevokeToken: ToolSpec = {
     // The JOIN is a security boundary: only a token welded to a real agent can be
     // managed here. Human member tokens do not resolve through this query.
     const token = await env.DB.prepare(
-      `SELECT t.id, t.member_id, t.agent_id, a.squad_id, t.revoked_at
+      `SELECT t.id, t.member_id, t.agent_id, a.squad_id, a.role AS agent_role, t.revoked_at
          FROM member_tokens t
          JOIN agents a ON a.id = t.agent_id
         WHERE t.id = ?1 AND t.tenant = ?2
@@ -505,6 +514,9 @@ const toolAgentManagerRevokeToken: ToolSpec = {
     // Refuse to revoke it from underneath the current manager session.
     if (token.member_id === auth.memberId) {
       return fail(409, 'self_management_forbidden')
+    }
+    if (isPrivilegedAgentRole(token.agent_role)) {
+      return fail(403, 'privileged_agent_forbidden')
     }
 
     const requestId = crypto.randomUUID()

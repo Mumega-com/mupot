@@ -49,6 +49,6 @@ export function resolveSquadRef(
 export function resolveAgentRef(
   env: Env,
   ref: string,
-): Promise<ResolveResult<{ id: string; squad_id: string; slug: string; name: string }>> {
-  return resolveByIdThenSlug(env, 'id, squad_id, slug, name', 'agents', ref)
+): Promise<ResolveResult<{ id: string; squad_id: string; slug: string; name: string; role: string }>> {
+  return resolveByIdThenSlug(env, 'id, squad_id, slug, name, role', 'agents', ref)
 }
