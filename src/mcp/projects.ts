@@ -1,5 +1,6 @@
-import type { AuthContext, Env, Project, ProjectSquadAccess, ProjectStatus } from '../types'
+import type { AuthContext, BusEvent, Env, Project, ProjectSquadAccess, ProjectStatus } from '../types'
 import { hasCapability } from '../auth/capability'
+import { createBus } from '../bus'
 import {
   createProject,
   getProject,
@@ -22,6 +23,48 @@ type ProjectReadAccess = {
   orgRead: boolean
   squadIds: string[]
   departmentIds: string[]
+}
+
+type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'> & {
+  parent_context: true
+}
+
+type ProjectMutationOperation = 'created' | 'updated' | 'squad_access_set' | 'squad_access_removed'
+
+async function emitProjectMutation(
+  env: Env,
+  memberId: string,
+  operation: ProjectMutationOperation,
+  projectId: string,
+  extra: { squad_id?: string; status?: ProjectStatus } = {},
+): Promise<void> {
+  const event: BusEvent<{
+    operation: ProjectMutationOperation
+    project_id: string
+    squad_id?: string
+    status?: ProjectStatus
+  }> = {
+    type: 'project.mutated',
+    tenant: env.TENANT_SLUG,
+    squad_id: extra.squad_id,
+    actor: { kind: 'member', id: memberId },
+    payload: {
+      operation,
+      project_id: projectId,
+      ...(extra.squad_id ? { squad_id: extra.squad_id } : {}),
+      ...(extra.status ? { status: extra.status } : {}),
+    },
+    ts: new Date().toISOString(),
+  }
+  try {
+    await createBus(env).emit(event)
+  } catch {
+    console.error('project MCP audit event failed (non-fatal)', {
+      tenant: env.TENANT_SLUG,
+      operation,
+      project_id: projectId,
+    })
+  }
 }
 
 function workspaceAdmin(auth: AuthContext): boolean {
@@ -132,7 +175,9 @@ const toolProjectCreate: ToolSpec = {
     const denied = requireWorkspaceAdmin(auth)
     if (denied) return denied
     const result = await createProject(env, args)
-    return result.ok ? done({ project: result.value }) : mutationFailure(result.error)
+    if (!result.ok) return mutationFailure(result.error)
+    await emitProjectMutation(env, auth.memberId as string, 'created', result.value.id)
+    return done({ project: result.value })
   },
 }
 
@@ -186,8 +231,28 @@ const toolProjectList: ToolSpec = {
         ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
         LIMIT ? OFFSET ?`,
     ).bind(...binds, limit + 1, offset).all<Project>()
-    const projects = rows.results ?? []
-    return done({ projects: projects.slice(0, limit), next_cursor: nextCursor(offset, limit, projects.length) })
+    const resultRows = rows.results ?? []
+    const projects = resultRows.slice(0, limit)
+    const ids = new Set(projects.map(project => project.id))
+    const parentIds = [...new Set(
+      projects
+        .map(project => project.parent_project_id)
+        .filter((id): id is string => id !== null && !ids.has(id)),
+    )]
+    let parentContexts: ParentContext[] = []
+    if (parentIds.length > 0) {
+      const parents = await env.DB.prepare(
+        `SELECT id, slug, name, status, parent_project_id
+           FROM projects
+          WHERE id IN (${parentIds.map(() => '?').join(', ')})
+          ORDER BY created_at, id`,
+      ).bind(...parentIds).all<Omit<ParentContext, 'parent_context'>>()
+      parentContexts = (parents.results ?? []).map(parent => ({ ...parent, parent_context: true }))
+    }
+    return done({
+      projects: [...parentContexts, ...projects],
+      next_cursor: nextCursor(offset, limit, resultRows.length),
+    })
   },
 }
 
@@ -237,7 +302,9 @@ const toolProjectUpdate: ToolSpec = {
     if (!projectId) return fail(400, 'invalid_project_id')
     const { project_id: _projectId, ...input } = args
     const result = await updateProject(env, projectId, input)
-    return result.ok ? done({ project: result.value }) : mutationFailure(result.error)
+    if (!result.ok) return mutationFailure(result.error)
+    await emitProjectMutation(env, auth.memberId as string, 'updated', result.value.id, { status: result.value.status })
+    return done({ project: result.value })
   },
 }
 
@@ -301,7 +368,9 @@ const toolProjectSquadSet: ToolSpec = {
     if (!projectId) return fail(400, 'invalid_project_id')
     if (!squadId) return fail(400, 'invalid_squad_id')
     const result = await upsertProjectSquadAccess(env, projectId, squadId, args.access_level)
-    return result.ok ? done({ squad: result.value }) : mutationFailure(result.error)
+    if (!result.ok) return mutationFailure(result.error)
+    await emitProjectMutation(env, auth.memberId as string, 'squad_access_set', projectId, { squad_id: squadId })
+    return done({ squad: result.value })
   },
 }
 
@@ -329,7 +398,9 @@ const toolProjectSquadRemove: ToolSpec = {
     ).bind(projectId, squadId).first()
     if (!edge) return fail(404, 'project_squad_access_not_found')
     const result = await removeProjectSquadAccess(env, projectId, squadId)
-    return result.ok ? done({ project_id: projectId, squad_id: squadId, removed: true }) : mutationFailure(result.error)
+    if (!result.ok) return mutationFailure(result.error)
+    await emitProjectMutation(env, auth.memberId as string, 'squad_access_removed', projectId, { squad_id: squadId })
+    return done({ project_id: projectId, squad_id: squadId, removed: true })
   },
 }
 

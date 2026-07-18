@@ -64,12 +64,12 @@ function auth(overrides: Partial<AuthContext> = {}): AuthContext {
   }
 }
 
-function envFor(harness: SqliteD1Harness): Env {
+function envFor(harness: SqliteD1Harness, events?: unknown[]): Env {
   const sessions = new Map<string, string>()
   return {
     DB: harness.db,
     TENANT_SLUG: TENANT,
-    BUS: { send: vi.fn(async () => undefined) },
+    BUS: { send: vi.fn(async (event: unknown) => { events?.push(event) }) },
     SESSIONS: {
       async get(key: string, type?: string) {
         const value = sessions.get(key) ?? null
@@ -534,7 +534,8 @@ describe('MCP project lifecycle control', () => {
 
   it('lets an org admin control a project through archive, restore, and access changes', async () => {
     harness = makeHarness()
-    const env = envFor(harness)
+    const events: unknown[] = []
+    const env = envFor(harness, events)
     const admin = auth({
       capabilities: [{ member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' }],
     })
@@ -581,6 +582,14 @@ describe('MCP project lifecycle control', () => {
     }, 'https://pot.test')).resolves.toMatchObject({ ok: true, result: { removed: true } })
     await expect(invokeTool(auth(), env, 'project_get', { project_id: projectId }, 'https://pot.test'))
       .resolves.toMatchObject({ ok: false, status: 404, error: 'project_not_found' })
+
+    expect(events).toMatchObject([
+      { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'created', project_id: projectId } },
+      { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'squad_access_set', project_id: projectId, squad_id: SQUAD_ID } },
+      { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'updated', project_id: projectId, status: 'archived' } },
+      { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'updated', project_id: projectId, status: 'active' } },
+      { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'squad_access_removed', project_id: projectId, squad_id: SQUAD_ID } },
+    ])
   })
 
   it('keeps project mutations admin-only and project reads edge-scoped', async () => {
@@ -602,5 +611,31 @@ describe('MCP project lifecycle control', () => {
       .toEqual(['project-a', 'project-b', 'project-read'])
     await expect(invokeTool(auth(), env, 'project_get', { project_id: 'project-no-edge' }, 'https://pot.test'))
       .resolves.toMatchObject({ ok: false, status: 404, error: 'project_not_found' })
+  })
+
+  it('includes safe parent context for a visible nested project', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status)
+      VALUES ('context-parent', 'context-parent', 'Context Parent', 'active');
+      INSERT INTO projects (id, slug, name, status, parent_project_id)
+      VALUES ('context-child', 'context-child', 'Context Child', 'active', 'context-parent');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('context-child', '${SQUAD_ID}', 'read');
+    `)
+
+    const listed = await invokeTool(auth(), env, 'project_list', {
+      parent_project_id: 'context-parent',
+    }, 'https://pot.test')
+    expect(listed).toMatchObject({
+      ok: true,
+      result: {
+        projects: [
+          { id: 'context-parent', parent_context: true },
+          { id: 'context-child', parent_project_id: 'context-parent' },
+        ],
+      },
+    })
   })
 })
