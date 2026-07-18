@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dme-hermes-agent-host
+  labels:
+    app.kubernetes.io/name: mupot-agent-host
+    app.kubernetes.io/instance: dme-hermes
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mupot-agent-host
+      app.kubernetes.io/instance: dme-hermes
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mupot-agent-host
+        app.kubernetes.io/instance: dme-hermes
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent-host
+          image: registry.example/mupot-agent-host-hermes:0.23.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/node
+            - /opt/mupot/container-entrypoint.mjs
+          env:
+            - name: MUPOT_DAEMON_CONFIG
+              value: /etc/mupot/daemon.json
+            - name: MUPOT_CONTROL_CONFIG
+              value: /etc/mupot/control.json
+            - name: MUPOT_STATE_DIR
+              value: /var/lib/mupot/state
+            - name: MUPOT_HEALTH_PORT
+              value: "8080"
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mupot
+              readOnly: true
+            - name: agent-credential
+              mountPath: /var/run/secrets/mupot
+              readOnly: true
+            - name: runtime-state
+              mountPath: /var/lib/mupot
+            - name: temporary
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: dme-hermes-agent-host
+            defaultMode: 0440
+        - name: agent-credential
+          secret:
+            secretName: dme-hermes-mupot
+            defaultMode: 0400
+        - name: runtime-state
+          emptyDir: {}
+        - name: temporary
+          emptyDir: {}

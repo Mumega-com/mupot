@@ -1,0 +1,34 @@
+{
+  "schema": "mupot.kubernetes-agent-host/v1",
+  "tenant": "dme",
+  "project_id": "replace-with-dme-project-id",
+  "base_url": "https://mupot.dme.example",
+  "credential_file": "/var/run/secrets/mupot/agent-token",
+  "inbox": {
+    "spool_dir": "/var/lib/mupot/inbox",
+    "command_timeout_ms": 120000,
+    "agents": [
+      {
+        "agent_id": "dme-hermes-k8s",
+        "profile": {
+          "schema": "mupot.agent-profile/v1",
+          "agent_id": "dme-hermes-k8s",
+          "adapter": "hermes",
+          "command": [
+            "/usr/local/bin/hermes",
+            "chat",
+            "--toolsets",
+            "dme_mupot"
+          ],
+          "allowed_senders": [
+            "dme-project-link"
+          ],
+          "run_for": [
+            "request"
+          ],
+          "timeout_ms": 120000
+        }
+      }
+    ]
+  }
+}
