@@ -18,6 +18,7 @@ function makeEnv(row: Record<string, unknown> | null, seen: { sql?: string; bind
         seen.sql = sql
         return { bind: (...args: unknown[]) => ({ first: async () => {
           seen.binds = args
+          if (row?.bound_agent_id && row.bound_agent_status !== 'active') return null
           return row
         } }) }
       },
@@ -46,13 +47,21 @@ describe('resolveMemberByToken', () => {
     })
   })
   it('returns boundAgentId for an agent-scoped token (the weld)', async () => {
-    const env = makeEnv({ member_id: 'm1', display_name: 'content-writer', email: null, status: 'active', bound_agent_id: 'agent-7' })
+    const env = makeEnv({ member_id: 'm1', display_name: 'content-writer', email: null, status: 'active', bound_agent_id: 'agent-7', bound_agent_status: 'active' })
     expect(await resolveMemberByToken(env, 'sk-x')).toEqual({
       memberId: 'm1',
       displayName: 'content-writer',
       email: null,
       boundAgentId: 'agent-7',
     })
+  })
+  it('rejects a welded token when its agent is missing', async () => {
+    const env = makeEnv({ member_id: 'm1', display_name: 'worker', email: null, status: 'active', bound_agent_id: 'agent-missing', bound_agent_status: null })
+    expect(await resolveMemberByToken(env, 'sk-x')).toBeNull()
+  })
+  it('rejects a welded token when its agent is paused', async () => {
+    const env = makeEnv({ member_id: 'm1', display_name: 'worker', email: null, status: 'active', bound_agent_id: 'agent-paused', bound_agent_status: 'paused' })
+    expect(await resolveMemberByToken(env, 'sk-x')).toBeNull()
   })
   it('binds member token auth to the current tenant', async () => {
     const seen: { sql?: string; binds?: unknown[] } = {}
@@ -62,6 +71,8 @@ describe('resolveMemberByToken', () => {
 
     expect(seen.sql).toContain('t.tenant = ?2')
     expect(seen.sql).toContain('m.tenant = ?2')
+    expect(seen.sql).toContain('LEFT JOIN agents')
+    expect(seen.sql).toContain("a.status = 'active'")
     expect(seen.binds?.[1]).toBe('digid')
   })
 })

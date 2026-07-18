@@ -789,6 +789,7 @@ describe('MCP granted multi-squad flight lifecycle', () => {
       expect(granted).toMatchObject({ ok: true, result: { result: 'created' } })
 
       const assigned = await authenticatedTool(env, 'task_update', {
+        squad_id: OTHER_SQUAD_ID,
         task_id: 'task-m000',
         assignee_agent_id: AGENT_ID,
       })
@@ -809,6 +810,7 @@ describe('MCP granted multi-squad flight lifecycle', () => {
       expect(read).toMatchObject({ ok: true, result: { flight: { id: flightId, status: 'running' } } })
 
       const completed = await authenticatedTool(env, 'task_update', {
+        squad_id: OTHER_SQUAD_ID,
         task_id: 'task-m000',
         status: 'done',
       })

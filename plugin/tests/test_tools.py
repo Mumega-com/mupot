@@ -647,11 +647,17 @@ class TestPluginRegister:
         ctx.inject_message = MagicMock()
         return ctx
 
+    def _register_provisioner(self, ctx: MagicMock) -> None:
+        from plugin import register
+
+        with patch("plugin._load_plugin_settings", return_value={"mode": "provisioner"}):
+            register(ctx)
+
     def test_register_wires_all_three_tools(self) -> None:
         from plugin import register
 
         ctx = self._make_ctx()
-        register(ctx)
+        self._register_provisioner(ctx)
 
         registered_names = [
             call.args[0] if call.args else call.kwargs.get("name")
@@ -665,7 +671,7 @@ class TestPluginRegister:
         from plugin import register
 
         ctx = self._make_ctx()
-        register(ctx)
+        self._register_provisioner(ctx)
 
         hook_names = [
             call.args[0] if call.args else call.kwargs.get("name", call.args)
@@ -680,7 +686,7 @@ class TestPluginRegister:
         import os
 
         ctx = self._make_ctx()
-        register(ctx)
+        self._register_provisioner(ctx)
 
         # Extract the registered hook handler
         handler = ctx.on.call_args_list[0].args[1]
@@ -702,7 +708,7 @@ class TestPluginRegister:
         import os
 
         ctx = self._make_ctx()
-        register(ctx)
+        self._register_provisioner(ctx)
 
         handler = ctx.on.call_args_list[0].args[1]
 
@@ -719,7 +725,7 @@ class TestPluginRegister:
         import os
 
         ctx = self._make_ctx()
-        register(ctx)
+        self._register_provisioner(ctx)
 
         handler = ctx.on.call_args_list[0].args[1]
 

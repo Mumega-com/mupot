@@ -1,15 +1,21 @@
-"""
-mupot Hermes Plugin — register(ctx) entry point.
+"""Mupot Hermes backend plugin entry point.
 
-Hermes calls register(ctx) once on plugin load. ctx is the PluginContext
-(or a duck-typed test stand-in) that exposes .register_tool() and .on().
+The plugin has two intentionally separate modes:
+
+* ``provisioner`` keeps the human-controlled Cloudflare setup tools.
+* ``operator`` registers only the restricted, agent-bound Mupot action wrappers.
+
+A single Hermes profile never receives both surfaces.  DME production uses
+``operator`` mode; provisioning belongs in a separate human-controlled profile.
 """
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Any
+from typing import Any, Mapping
 
+from .operator import MupotOperatorClient, OperatorSettings, register_operator_tools
 from .schemas import (
     MUPOT_BRAIN_ENABLE_SCHEMA,
     MUPOT_PROVISION_SCHEMA,
@@ -18,74 +24,118 @@ from .schemas import (
 from .tools import mupot_brain_enable, mupot_provision, mupot_status
 
 
-def register(ctx: Any) -> None:
-    """
-    Wire the 3 mupot tools and the on_session_start hook into the Hermes ctx.
+def _load_plugin_settings() -> dict[str, Any]:
+    """Load non-secret Mupot settings from the active Hermes profile."""
 
-    ctx must support:
-      ctx.register_tool(name, fn, schema, description)
-      ctx.on(event_name, handler)
-    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
 
-    # ── Tool registrations ───────────────────────────────────────────────────
+        config = load_config()
+        value = cfg_get(config, "plugins", "entries", "mupot", "settings", default={})
+        if not isinstance(value, Mapping):
+            raise ValueError("plugins.entries.mupot.settings must be a mapping")
+        return dict(value)
+    except (ImportError, OSError, TypeError, ValueError) as exc:
+        raise RuntimeError("unable to load Mupot plugin settings; no tools were registered") from exc
 
-    ctx.register_tool(
-        name="mupot_provision",
-        fn=mupot_provision,
-        schema=MUPOT_PROVISION_SCHEMA,
-        description=(
-            "Idempotent mupot provisioner. Default (dry_run=True): emit a plan showing "
-            "what will be created without touching Cloudflare. Apply mode "
-            "(confirm=True + dry_run=False): uses MUPOT_CF_API_TOKEN + "
-            "MUPOT_CF_ACCOUNT_ID to create D1 + KV namespaces via the CF REST API "
-            "and writes wrangler.<slug>.toml with resolved IDs. Migration apply is "
-            "always emitted as a gated next_step — never auto-run (Risk 2)."
+
+def _tool_schema(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
+    return {"name": name, "description": description, "parameters": parameters}
+
+
+def _result(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _register_provisioner_tools(ctx: Any) -> None:
+    """Register the legacy human-controlled setup surface using the current API."""
+
+    def provision(args: dict[str, Any]) -> str:
+        values = dict(args)
+        values.setdefault("cf_account_id", os.environ.get("MUPOT_CF_ACCOUNT_ID", ""))
+        values.setdefault("cf_api_token", os.environ.get("MUPOT_CF_API_TOKEN", ""))
+        return _result(mupot_provision(**values))
+
+    def status(args: dict[str, Any]) -> str:
+        return _result(mupot_status(**args))
+
+    def brain_enable(args: dict[str, Any]) -> str:
+        return _result(mupot_brain_enable(**args))
+
+    registrations = (
+        (
+            "mupot_provision",
+            provision,
+            MUPOT_PROVISION_SCHEMA,
+            "Idempotently plan or provision a human-owned Mupot Cloudflare deployment.",
+        ),
+        (
+            "mupot_status",
+            status,
+            MUPOT_STATUS_SCHEMA,
+            "Probe a Mupot deployment health endpoint.",
+        ),
+        (
+            "mupot_brain_enable",
+            brain_enable,
+            MUPOT_BRAIN_ENABLE_SCHEMA,
+            "Plan a Mupot DMN brain profile and schedule.",
         ),
     )
+    for name, handler, parameters, description in registrations:
+        ctx.register_tool(
+            name=name,
+            handler=handler,
+            schema=_tool_schema(name, description, parameters),
+            toolset="mupot-provisioner",
+        )
 
-    ctx.register_tool(
-        name="mupot_status",
-        fn=mupot_status,
-        schema=MUPOT_STATUS_SCHEMA,
-        description="Probe a live mupot /health endpoint. Returns {ok, tenant, url}.",
-    )
 
-    ctx.register_tool(
-        name="mupot_brain_enable",
-        fn=mupot_brain_enable,
-        schema=MUPOT_BRAIN_ENABLE_SCHEMA,
-        description=(
-            "Emit the steps to wire the DMN brain for a provisioned mupot pot: "
-            "profile + config.yaml (qwen3.7-plus) + real-file cron + scoped token. "
-            "v0.1 emits a plan; does not execute against a live host."
-        ),
-    )
+def _register_provisioner_reminder(ctx: Any) -> None:
+    reminded: set[str] = set()
 
-    # ── on_session_start hook ────────────────────────────────────────────────
-
-    _session_reminded: set[str] = set()
-
-    def _on_session_start(session: Any) -> None:
-        """
-        Check if MUPOT_CF_ACCOUNT_ID is configured.
-        If not, inject a one-time reminder that mupot_provision is available.
-        The reminder fires at most once per session (tracked by session id).
-        """
-        session_id = getattr(session, "id", "default")
-        if session_id in _session_reminded:
+    def on_session_start(event: Any) -> None:
+        session_id = str(getattr(event, "session_id", getattr(event, "id", "default")))
+        if session_id in reminded:
             return
-
-        account_id = os.environ.get("MUPOT_CF_ACCOUNT_ID", "").strip()
-        if not account_id:
-            reminder = (
-                "[mupot] No Cloudflare account connected. "
-                "Run `mupot_provision` to set up your own mupot instance on Cloudflare. "
-                "You'll need a scoped CF API token — see README.md for the token-template link."
+        reminded.add(session_id)
+        if os.environ.get("MUPOT_CF_ACCOUNT_ID", "").strip():
+            return
+        inject = getattr(ctx, "inject_message", None)
+        if callable(inject):
+            inject(
+                "[mupot] Provisioner mode is active, but no Cloudflare account is configured. "
+                "Use mupot_provision after supplying a scoped Cloudflare credential."
             )
-            # ctx.inject_message is the Hermes API for surfacing plugin messages
-            if hasattr(ctx, "inject_message"):
-                ctx.inject_message(reminder, level="info")
 
-        _session_reminded.add(session_id)
+    register_hook = getattr(ctx, "register_hook", None)
+    if callable(register_hook):
+        register_hook("on_session_start", on_session_start)
+    legacy_on = getattr(ctx, "on", None)
+    if callable(legacy_on):
+        legacy_on("on_session_start", on_session_start)
 
-    ctx.on("on_session_start", _on_session_start)
+
+def register(ctx: Any) -> None:
+    settings = _load_plugin_settings()
+    configured_mode = settings.get("mode") or os.environ.get("MUPOT_PLUGIN_MODE")
+    if not isinstance(configured_mode, str) or not configured_mode.strip():
+        raise ValueError("Mupot plugin mode must be explicitly set to 'operator' or 'provisioner'")
+    mode = configured_mode.strip().lower()
+
+    if mode == "operator":
+        operator_value = settings.get("operator", settings)
+        if not isinstance(operator_value, Mapping):
+            raise ValueError("plugins.entries.mupot.settings.operator must be a mapping")
+        operator_settings = OperatorSettings.from_mapping(operator_value)
+        token = os.environ.get("MUPOT_AGENT_TOKEN", "")
+        client = MupotOperatorClient(operator_settings, token=token)
+        register_operator_tools(ctx, client)
+        return
+
+    if mode == "provisioner":
+        _register_provisioner_tools(ctx)
+        _register_provisioner_reminder(ctx)
+        return
+
+    raise ValueError("Mupot plugin mode must be 'operator' or 'provisioner'")

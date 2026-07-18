@@ -210,7 +210,7 @@ describe('MCP task cutover tools', () => {
       auth(),
       env,
       'task_update',
-      { task_id: 'task-1', status: 'in_progress', assignee_agent_id: AGENT_ID, body: 'updated' },
+      { squad_id: SQUAD_ID, task_id: 'task-1', status: 'in_progress', assignee_agent_id: AGENT_ID, body: 'updated' },
       'https://pot.example',
     )
 
@@ -248,7 +248,7 @@ describe('MCP task cutover tools', () => {
       auth(),
       env,
       'task_update',
-      { task_id: 'task-1', assignee_agent_id: 'agent-other' },
+      { squad_id: SQUAD_ID, task_id: 'task-1', assignee_agent_id: 'agent-other' },
       'https://pot.example',
     )
 
@@ -262,7 +262,7 @@ describe('MCP task cutover tools', () => {
       auth(),
       env,
       'task_update',
-      { task_id: 'task-1', assignee_agent_id: 'agent-other' },
+      { squad_id: SQUAD_ID, task_id: 'task-1', assignee_agent_id: 'agent-other' },
       'https://pot.example',
     )
 
@@ -276,7 +276,7 @@ describe('MCP task cutover tools', () => {
       auth(),
       env,
       'task_update',
-      { task_id: 'task-1', assignee_agent_id: 'agent-other' },
+      { squad_id: SQUAD_ID, task_id: 'task-1', assignee_agent_id: 'agent-other' },
       'https://pot.example',
     )
 
@@ -286,16 +286,15 @@ describe('MCP task cutover tools', () => {
   it('task_update refuses cross-squad tasks even when the caller has a member grant elsewhere', async () => {
     const { env } = makeEnv([task({ squad_id: OTHER_SQUAD_ID })])
 
-    const res = await invokeTool(auth(), env, 'task_update', { task_id: 'task-1', status: 'in_progress' }, 'https://pot.example')
+    const res = await invokeTool(auth(), env, 'task_update', { squad_id: SQUAD_ID, task_id: 'task-1', status: 'in_progress' }, 'https://pot.example')
 
-    expect(res.ok).toBe(false)
-    expect(res.error).toBe('forbidden')
+    expect(res).toMatchObject({ ok: false, status: 404, error: 'task_not_found' })
   })
 
   it('task_update refuses invalid lifecycle jumps', async () => {
     const { env } = makeEnv([task({ status: 'open' })])
 
-    const res = await invokeTool(auth(), env, 'task_update', { task_id: 'task-1', status: 'done' }, 'https://pot.example')
+    const res = await invokeTool(auth(), env, 'task_update', { squad_id: SQUAD_ID, task_id: 'task-1', status: 'done' }, 'https://pot.example')
 
     expect(res.ok).toBe(false)
     expect(res.error).toBe('invalid_transition')
@@ -303,7 +302,7 @@ describe('MCP task cutover tools', () => {
 
   it('task_update refuses in_progress → review with no gate_owner (would be a zombie)', async () => {
     const { env, updates } = makeEnv([task({ status: 'in_progress', gate_owner: null })])
-    const res = await invokeTool(auth(), env, 'task_update', { task_id: 'task-1', status: 'review' }, 'https://pot.example')
+    const res = await invokeTool(auth(), env, 'task_update', { squad_id: SQUAD_ID, task_id: 'task-1', status: 'review' }, 'https://pot.example')
     expect(res.ok).toBe(false)
     expect(res.error).toBe('gate_required_for_review')
     expect(updates).toHaveLength(0)
@@ -315,7 +314,7 @@ describe('MCP task cutover tools', () => {
       auth(),
       env,
       'task_update',
-      { task_id: 'task-1', status: 'review', gate_owner: 'gate:content' },
+      { squad_id: SQUAD_ID, task_id: 'task-1', status: 'review', gate_owner: 'gate:content' },
       'https://pot.example',
     )
     expect(res.ok).toBe(true)
@@ -333,7 +332,7 @@ describe('MCP task cutover tools', () => {
       auth(),
       env,
       'task_update',
-      { task_id: 'task-1', status: 'done' },
+      { squad_id: SQUAD_ID, task_id: 'task-1', status: 'done' },
       'https://pot.example',
     )
 
@@ -352,7 +351,7 @@ describe('MCP task cutover tools', () => {
       auth(),
       env,
       'task_update',
-      { task_id: 'task-1', status: 'done' },
+      { squad_id: SQUAD_ID, task_id: 'task-1', status: 'done' },
       'https://pot.example',
     )
 
@@ -371,7 +370,7 @@ describe('MCP task cutover tools', () => {
       auth(),
       env,
       'task_update',
-      { task_id: 'task-1', title: 'Clarify the completed task' },
+      { squad_id: SQUAD_ID, task_id: 'task-1', title: 'Clarify the completed task' },
       'https://pot.example',
     )
 

@@ -1,71 +1,75 @@
-# mupot Hermes Plugin v0.2 — REAL CF PROVISIONER
-# v0.2 ships a real Cloudflare provisioner using pure stdlib urllib (no extra deps).
-# When confirm=True and dry_run=False, the tool creates D1 databases and KV namespaces
-# via the CF REST API and writes wrangler.<slug>.toml with the resolved resource IDs.
-# Requires MUPOT_CF_API_TOKEN and MUPOT_CF_ACCOUNT_ID in the environment.
-# Install: git clone the mupot repo; the plugin lives at mupot/plugin/.
-#   (The `hermes plugins install Mumega-com/mupot-plugin` one-liner is the v0.3+ path,
-#    once the standalone repo is published.)
-# Docs: see README.md and skills/mupot-operator/SKILL.md
+# Mupot Hermes Plugin v0.3 — separated provisioner and restricted operator modes.
+# DME production must use operator mode with an agent-bound MUPOT_AGENT_TOKEN.
 
 name: mupot
-version: "0.2.0"
+version: "0.3.0"
 kind: backend
 description: >
-  Provision and operate your own mupot instance on Cloudflare (org/RBAC/board/memory +
-  an idempotent brain). v0.2 ships the REAL CF provisioner: confirm=True + dry_run=False
-  creates D1 databases + KV namespaces via the CF REST API and writes
-  wrangler.<slug>.toml with resolved IDs. Requires MUPOT_CF_API_TOKEN +
-  MUPOT_CF_ACCOUNT_ID. Default (dry_run=True) emits a plan without touching CF.
+  Integrate Hermes with Mupot in one of two isolated modes. Provisioner mode exposes
+  human-controlled Cloudflare setup tools. Operator mode exposes only a narrow,
+  agent-bound task, finding, presence and approval-request surface. A separately
+  authorized, explicitly enabled manager extension can manage member agents only
+  within the configured squad.
 
 provides_tools:
   - name: mupot_provision
-    description: >
-      Idempotent mupot provisioner. Default (dry_run=True or confirm=False): emit a plan
-      showing what WILL be created. Apply mode (confirm=True + dry_run=False): uses
-      MUPOT_CF_API_TOKEN + MUPOT_CF_ACCOUNT_ID to create D1 + KV namespaces via the CF
-      REST API (idempotent — skips resources that already exist) and writes
-      wrangler.<slug>.toml with resolved IDs. Migration apply is NEVER auto-run — always
-      emitted as a gated DRY-RUN-FIRST next_step (Risk 2: drift landmine).
+    description: Plan or provision a human-owned Mupot Cloudflare deployment.
   - name: mupot_status
-    description: >
-      Probe a live mupot deployment's /health endpoint.
-      Returns { ok, tenant, url } — no CF credentials required.
+    description: Probe a live Mupot deployment health endpoint.
   - name: mupot_brain_enable
-    description: >
-      Emit the steps to wire the idempotent DMN brain for a provisioned mupot:
-      copy the Hermes profile, write config.yaml (qwen3.7-plus), register a real
-      15-min cron file, and note the SCOPED token required (NOT mcp:*).
+    description: Plan a Mupot DMN brain profile and schedule.
+  - name: mupot_operator_status
+    description: Verify the configured restricted Mupot identity.
+  - name: mupot_operator_check_in
+    description: Record on-demand Hermes presence.
+  - name: mupot_operator_task_board
+    description: Read the configured squad task board.
+  - name: mupot_operator_task_create
+    description: Create a scoped task assigned to this Hermes identity.
+  - name: mupot_operator_task_claim
+    description: Claim a permitted task for this Hermes identity.
+  - name: mupot_operator_record_finding
+    description: Record evidence or findings without completing or approving work.
+  - name: mupot_operator_request_approval
+    description: Route findings to the configured human approval owner.
+  - name: mupot_operator_complete_task
+    description: Complete an ungated task; Mupot enforces unresolved gates.
+  - name: mupot_operator_send
+    description: Send a durable message to an explicitly allowlisted peer agent.
+  - name: mupot_operator_inbox
+    description: Peek or explicitly consume this agent's durable Mupot inbox.
+  - name: mupot_agent_manager_list
+    description: List agents and non-secret token metadata in the configured squad.
+  - name: mupot_agent_manager_create
+    description: Create an active member agent in the configured squad.
+  - name: mupot_agent_manager_set_status
+    description: Pause or resume a member agent in the configured squad.
+  - name: mupot_agent_manager_mint_token
+    description: Mint a show-once member credential welded to a configured-squad agent.
+  - name: mupot_agent_manager_revoke_token
+    description: Revoke a credential welded to a configured-squad agent.
 
 provides_hooks:
   - name: on_session_start
-    description: >
-      Checks if MUPOT_CF_ACCOUNT_ID is set. If not, injects a one-time reminder
-      that mupot_provision is available to get started.
+    description: Provisioner-mode configuration reminder only.
 
-# ── Environment variables ──────────────────────────────────────────────────────
-# Required for provisioning. Not needed for mupot_status.
-requires_env:
-  - name: MUPOT_CF_ACCOUNT_ID
-    description: >
-      Your Cloudflare account ID (visible at dash.cloudflare.com → right sidebar).
-  - name: MUPOT_CF_API_TOKEN
-    description: >
-      A scoped CF API token (NOT your Global API Key).
-      Minimum permissions: Workers Scripts:Edit, D1:Edit, Workers KV Storage:Edit,
-      Account Settings:Read. Use the token-template link in README.md.
-    secret: true
-
+# No credential is globally required because operator and provisioner profiles use
+# different credentials. Each mode validates its own requirements at registration.
 optional_env:
+  - name: MUPOT_AGENT_TOKEN
+    description: Agent-bound Mupot bearer token required in operator mode.
+    secret: true
+  - name: MUPOT_CF_ACCOUNT_ID
+    description: Cloudflare account ID used only in provisioner mode.
+  - name: MUPOT_CF_API_TOKEN
+    description: Scoped Cloudflare API token used only in provisioner mode.
+    secret: true
+  - name: MUPOT_PLUGIN_MODE
+    description: Compatibility override; prefer plugins.entries.mupot.settings.mode.
   - name: MUPOT_SLUG
-    description: Your pot slug (lowercase, no spaces). Default: derived from CF account name.
+    description: Default pot slug for provisioner workflows.
   - name: MUPOT_BRAND
-    description: Display brand name shown in the dashboard. Default: the slug capitalized.
+    description: Default display brand for provisioner workflows.
   - name: MUPOT_OAUTH_PROVIDER
-    description: "OAuth identity provider: google (default) or telegram."
+    description: OAuth identity provider used during provisioning.
     default: google
-
-# ── Companion installs ────────────────────────────────────────────────────────
-# cloudflare/skills provides the official CF skill tap (Workers/D1/KV/R2/Wrangler).
-# Install alongside mupot for richer CF context:
-#   hermes skills install cloudflare/skills

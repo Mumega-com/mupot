@@ -44,17 +44,20 @@ export async function resolveMemberByToken(env: Env, raw: string | null): Promis
   if (!raw) return null
   const tokenHash = await sha256Hex(raw)
   const row = await env.DB.prepare(
-    `SELECT m.id AS member_id, m.display_name AS display_name, m.email AS email, m.status AS status, t.agent_id AS bound_agent_id
+    `SELECT m.id AS member_id, m.display_name AS display_name, m.email AS email, m.status AS status,
+            t.agent_id AS bound_agent_id, a.status AS bound_agent_status
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
+       LEFT JOIN agents a ON a.id = t.agent_id
       WHERE t.token_hash = ?1
         AND t.tenant = ?2
         AND m.tenant = ?2
         AND t.revoked_at IS NULL
+        AND (t.agent_id IS NULL OR (a.id IS NOT NULL AND a.status = 'active'))
       LIMIT 1`,
   )
     .bind(tokenHash, env.TENANT_SLUG)
-    .first<{ member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null }>()
+    .first<{ member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null; bound_agent_status: string | null }>()
   if (!row || row.status !== 'active') return null
   return { memberId: row.member_id, displayName: row.display_name, email: row.email, boundAgentId: row.bound_agent_id ?? null }
 }

@@ -1,7 +1,64 @@
-# mupot Hermes Plugin
+# Mupot Hermes Plugin
 
-Provision and operate your own [mupot](https://github.com/Mumega-com/mupot) instance on
-Cloudflare — org/RBAC/board/memory with an optional idempotent brain — from inside Hermes.
+Provision a [Mupot](https://github.com/Mumega-com/mupot) deployment or attach Hermes as a
+restricted, agent-bound operator. Version 0.3 separates these trust zones by profile:
+
+- `provisioner` mode: human-controlled Cloudflare setup;
+- `operator` mode: a narrow Mupot task/evidence/approval-request surface, with an
+  optional squad-agent manager extension.
+
+Do not combine the modes in one Hermes profile.
+
+## DME operator mode
+
+The Digid × DME AI Visibility Engine uses `operator` mode. Copy
+`examples/dme-hermes-config.yaml` into an isolated Hermes profile, replace the tenant,
+squad and agent placeholders, and put the agent-bound secret in that profile's secret
+environment:
+
+```text
+MUPOT_AGENT_TOKEN=<agent-bound-token>
+```
+
+The plugin verifies the configured tenant and welded `bound_agent_id` before work and
+fails closed if the token has owner/admin ladder authority. By default it does not
+register permission, credential minting, verdict, publishing, spend, outbound
+communication, deletion, or generic HTTP tools. See
+`../docs/dme-hermes-mupot-integration.md` and the bundled
+`dme-ai-visibility-operator` skill.
+
+### Main-Hermes squad manager extension
+
+Only a trusted main Hermes profile should enable agent management:
+
+```yaml
+plugins:
+  entries:
+    mupot:
+      settings:
+        mode: operator
+        operator:
+          base_url: https://your-pot.example
+          expected_tenant: your-tenant
+          squad_id: squad-id
+          agent_id: manager-agent-id
+          approval_owner: human-owner-member-id
+          pubsub_peer_agent_ids:
+            - isolated-dme-agent-id
+          agent_manager_enabled: true
+```
+
+Enabling the setting only registers the local tools. Mupot independently requires the
+authenticated member to have both membership on that exact squad and the free-text
+surface grant `agents:manage`. Before every management action, the plugin verifies its
+normal welded identity and then calls the scoped `agent_manager_status` handshake. The
+requested action is not sent if either proof fails.
+
+Manager-created agents are always active `member` agents. Manager-minted credentials
+are always agent-bound, squad-scoped `member` credentials; the caller cannot choose a
+higher role or capability. Plaintext is returned once, hashes remain server-side, and
+list results include only token IDs and non-secret metadata. Lifecycle effects write
+append-only attributed audit receipts.
 
 > **v0.2 ships the real CF provisioner.** `mupot_provision` with `confirm=True, dry_run=False`
 > calls the Cloudflare API directly (pure stdlib urllib — no extra deps) to create D1 databases
@@ -47,13 +104,28 @@ For users who want to deploy a mupot instance directly:
 
 *(Reads `wrangler.example.toml`, provisions bindings, deploys. Zero-code path.)*
 
-## Three tools
+## Tool surfaces
 
-| Tool | What it does |
-|------|-------------|
-| `mupot_provision` | Idempotent provisioner. Default (dry_run=True): emit a plan. Apply (confirm=True + dry_run=False): create D1 + KV via CF API, write `wrangler.<slug>.toml`. |
-| `mupot_status` | Probe `/health` → `{ok, tenant, url}` |
-| `mupot_brain_enable` | Emit the steps to wire the DMN brain (qwen3.7-plus, 15-min scan, scoped token) |
+| Mode | Tool | What it does |
+|------|------|-------------|
+| provisioner | `mupot_provision` | Idempotent Cloudflare provisioner. |
+| provisioner | `mupot_status` | Probe `/health` → `{ok, tenant, url}`. |
+| provisioner | `mupot_brain_enable` | Plan the DMN brain profile and schedule. |
+| operator | `mupot_operator_status` | Verify tenant, welded identity, and restricted privilege. |
+| operator | `mupot_operator_check_in` | Record on-demand Hermes presence. |
+| operator | `mupot_operator_task_board` | Read only the configured squad board. |
+| operator | `mupot_operator_task_create` | Create a self-assigned scoped task. |
+| operator | `mupot_operator_task_claim` | Claim permitted work as the configured identity. |
+| operator | `mupot_operator_record_finding` | Record evidence while work is active or blocked. |
+| operator | `mupot_operator_request_approval` | Route findings to the configured human; cannot decide the verdict. |
+| operator | `mupot_operator_complete_task` | Complete ungated work; Mupot still enforces unresolved gates. |
+| operator | `mupot_operator_send` | Send a durable, idempotent mailbox message to an explicitly configured peer agent. |
+| operator | `mupot_operator_inbox` | Peek this welded agent's inbox; consume only when explicitly requested after acceptance. |
+| manager (opt-in) | `mupot_agent_manager_list` | List configured-squad agents and non-secret token metadata. |
+| manager (opt-in) | `mupot_agent_manager_create` | Create an active member agent in the configured squad. |
+| manager (opt-in) | `mupot_agent_manager_set_status` | Pause or resume an agent in the configured squad. |
+| manager (opt-in) | `mupot_agent_manager_mint_token` | Mint a show-once member token welded to an agent. |
+| manager (opt-in) | `mupot_agent_manager_revoke_token` | Revoke an agent-bound token by ID. |
 
 ## v0.2 scope / deferred
 
@@ -103,7 +175,9 @@ Minimum permissions required:
 ## Development
 
 ```bash
-# Run tests (no network, no CF account needed):
-cd plugin
-python3 -m pytest tests/ -v
+# Restricted operator tests use only the standard library:
+python3 -m unittest -q plugin.tests.test_operator
+
+# The complete plugin suite uses pytest in CI:
+python3 -m pytest plugin/tests -v
 ```

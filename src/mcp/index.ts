@@ -68,6 +68,7 @@ import { resolveAgentRef } from '../org/resolve'
 import { sendToRef, readAgentInbox, sendAgentMessage } from '../agents/messages'
 import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { PROVISION_TOOLS } from './provision'
+import { AGENT_MANAGER_TOOLS } from './agent-manager'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -202,13 +203,16 @@ async function authenticateMember(c: {
             m.status        AS status,
             m.created_at    AS created_at,
             t.channel       AS channel,
-            t.agent_id      AS bound_agent_id
+            t.agent_id      AS bound_agent_id,
+            a.status        AS bound_agent_status
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
+       LEFT JOIN agents a ON a.id = t.agent_id
       WHERE t.token_hash = ?1
         AND t.tenant = ?2
         AND m.tenant = ?2
         AND t.revoked_at IS NULL
+        AND (t.agent_id IS NULL OR (a.id IS NOT NULL AND a.status = 'active'))
       LIMIT 1`,
   )
     .bind(tokenHash, c.env.TENANT_SLUG)
@@ -221,6 +225,7 @@ async function authenticateMember(c: {
       created_at: string
       channel: AuthContext['channel']
       bound_agent_id: string | null
+      bound_agent_status: string | null
     }>()
 
   if (!row) return null
@@ -679,12 +684,13 @@ const toolTaskBoard: ToolSpec = {
 // endpoint; this tool can move work through open/in_progress/blocked/review/done.
 const toolTaskUpdate: ToolSpec = {
   name: 'task_update',
-  scope: 'squad (of the task)',
+  scope: 'configured squad (must equal the task squad)',
   min: 'member',
-  args: '{ task_id: string, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", assignee_agent_id?: string|null, gate_owner?: string|null }',
+  args: '{ squad_id: string, task_id: string, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", assignee_agent_id?: string|null, gate_owner?: string|null }',
   inputSchema: {
     type: 'object',
     properties: {
+      squad_id: STRING_SCHEMA,
       task_id: STRING_SCHEMA,
       title: STRING_SCHEMA,
       body: STRING_SCHEMA,
@@ -693,19 +699,17 @@ const toolTaskUpdate: ToolSpec = {
       assignee_agent_id: STRING_SCHEMA,
       gate_owner: STRING_SCHEMA,
     },
-    required: ['task_id'],
+    required: ['squad_id', 'task_id'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    if (!str(args.squad_id)) return fail(400, 'invalid_args', 'squad_id required')
+    const squadRes = await resolveTaskSquad(env, auth, args)
+    if (!squadRes.ok) return squadRes
     const taskId = str(args.task_id)
     if (!taskId) return fail(400, 'invalid_args', 'task_id required')
     const existing = await loadTask(env, taskId)
-    if (!existing) return fail(404, 'task_not_found')
-
-    const grants = auth.capabilities ?? []
-    if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'member'))) {
-      return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
-    }
+    if (!existing || existing.squad_id !== squadRes.squad.id) return fail(404, 'task_not_found')
 
     const next: Task = { ...existing }
     let changed = false
@@ -1796,10 +1800,11 @@ const toolStatus: ToolSpec = {
   async run(auth, env, args) {
     const agentId = str(args.agent_id)
     if (!agentId) {
-      // No agent specified → echo the member's own principal (who am I + caps).
       return done({
         member_id: auth.memberId,
         email: auth.email,
+        role: auth.role,
+        bound_agent_id: auth.boundAgentId,
         channel: auth.channel,
         tenant: auth.tenant,
         capabilities: auth.capabilities ?? [],
@@ -2115,6 +2120,7 @@ export const TOOLS: ToolSpec[] = [
   toolOrient,
   toolConnect,
   ...PROVISION_TOOLS,
+  ...AGENT_MANAGER_TOOLS,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))

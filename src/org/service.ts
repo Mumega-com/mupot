@@ -10,6 +10,9 @@
 import type { Env, Department, Squad, Agent, Effort, Autonomy, BudgetWindow } from '../types'
 import { isEffort, isAutonomy, isBudgetWindow } from '../types'
 import { checkCreateLimit } from '../billing/entitlement'
+import { assertBatchWritten } from '../lib/receipt'
+
+type D1Statement = ReturnType<Env['DB']['prepare']>
 
 // slugs are URL-safe identifiers: lowercase alphanumeric + single hyphens,
 // 1–48 chars, no leading/trailing/double hyphen.
@@ -227,6 +230,7 @@ export async function createAgent(
   env: Env,
   squadId: string,
   input: AgentInput,
+  atomicWrites?: (agent: Agent) => D1Statement[],
 ): Promise<CreateResult<Agent>> {
   if (!isValidSlug(input.slug)) return { ok: false, error: 'invalid_slug' }
   if (!isNonEmptyString(input.name)) return { ok: false, error: 'invalid_name' }
@@ -307,31 +311,36 @@ export async function createAgent(
   }
 
   try {
-    await env.DB.prepare(
+    const insert = env.DB.prepare(
       `INSERT INTO agents
         (id, squad_id, slug, name, role, model, status,
          okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
          created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      agent.id,
+      agent.squad_id,
+      agent.slug,
+      agent.name,
+      agent.role,
+      agent.model,
+      agent.status,
+      agent.okr,
+      agent.kpi_target,
+      agent.kpi_progress,
+      agent.effort,
+      agent.autonomy,
+      agent.budget_cap_cents,
+      agent.budget_window,
+      agent.created_at,
     )
-      .bind(
-        agent.id,
-        agent.squad_id,
-        agent.slug,
-        agent.name,
-        agent.role,
-        agent.model,
-        agent.status,
-        agent.okr,
-        agent.kpi_target,
-        agent.kpi_progress,
-        agent.effort,
-        agent.autonomy,
-        agent.budget_cap_cents,
-        agent.budget_window,
-        agent.created_at,
-      )
-      .run()
+    const extras = atomicWrites?.(agent) ?? []
+    if (extras.length > 0) {
+      const writes = await env.DB.batch([insert, ...extras])
+      assertBatchWritten(writes, 'create_agent_atomic', 1)
+    } else {
+      await insert.run()
+    }
   } catch (err) {
     if (isUniqueViolation(err)) return { ok: false, error: 'slug_taken' }
     throw err
@@ -487,10 +496,16 @@ export async function setAgentStatus(
   env: Env,
   agentId: string,
   status: AgentStatus,
+  atomicWrites: D1Statement[] = [],
 ): Promise<SetStatusResult> {
-  const result = await env.DB.prepare('UPDATE agents SET status = ? WHERE id = ?')
+  const update = env.DB.prepare('UPDATE agents SET status = ? WHERE id = ?')
     .bind(status, agentId)
-    .run()
+  if (atomicWrites.length > 0) {
+    const writes = await env.DB.batch([update, ...atomicWrites])
+    assertBatchWritten(writes, 'set_agent_status_atomic', 1)
+    return { ok: true }
+  }
+  const result = await update.run()
   if (!result.meta.changes) return { ok: false, error: 'not_found' }
   return { ok: true }
 }

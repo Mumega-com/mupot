@@ -14,6 +14,8 @@
 import type { Env, MemberToken, ConnectionChannel, Capability, CapabilityGrant } from '../types'
 import { assertBatchWritten } from '../lib/receipt'
 
+type D1Statement = ReturnType<Env['DB']['prepare']>
+
 const CHANNELS: readonly ConnectionChannel[] = ['workspace', 'im', 'dashboard']
 export function isChannel(v: unknown): v is ConnectionChannel {
   return typeof v === 'string' && (CHANNELS as readonly string[]).includes(v)
@@ -102,12 +104,18 @@ export async function revokeMemberToken(
   env: Env,
   memberId: string,
   tokenId: string,
+  atomicWrites: D1Statement[] = [],
 ): Promise<boolean> {
-  const res = await env.DB.prepare(
+  const update = env.DB.prepare(
     'UPDATE member_tokens SET revoked_at = ? WHERE id = ? AND member_id = ? AND tenant = ? AND revoked_at IS NULL',
   )
     .bind(new Date().toISOString(), tokenId, memberId, env.TENANT_SLUG)
-    .run()
+  if (atomicWrites.length > 0) {
+    const writes = await env.DB.batch([update, ...atomicWrites])
+    assertBatchWritten(writes, 'revoke_member_token_atomic', 1)
+    return true
+  }
+  const res = await update.run()
   return Boolean(res.meta && res.meta.changes > 0)
 }
 
@@ -138,7 +146,10 @@ export interface AgentMintResult {
   memberId: string
   createdAt: string
   grantCapability: AgentTokenCapability
+  label: string
 }
+
+export type AgentMintReceipt = Omit<AgentMintResult, 'raw'>
 
 /**
  * Atomically mint a DEDICATED member envelope + squad-scoped agent capability +
@@ -160,6 +171,7 @@ export async function mintAgentBoundToken(
   agent: AgentForMint,
   label: string,
   grantCapability: AgentTokenCapability = 'member',
+  atomicWrites?: (mint: AgentMintReceipt) => D1Statement[],
 ): Promise<AgentMintResult> {
   if (!isAgentTokenCapability(grantCapability)) {
     throw new Error('invalid agent token capability')
@@ -170,6 +182,13 @@ export async function mintAgentBoundToken(
   const tokenHash = await sha256Hex(rawToken)
   const createdAt = new Date().toISOString()
   const safeLabel = label.trim().slice(0, 64) || agent.slug
+  const receipt: AgentMintReceipt = {
+    tokenId,
+    memberId,
+    createdAt,
+    grantCapability,
+    label: safeLabel,
+  }
 
   const mintWrites = await env.DB.batch([
     // 1) Dedicated member envelope for the agent (no email, no IM).
@@ -188,12 +207,13 @@ export async function mintAgentBoundToken(
       `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
        VALUES (?, ?, ?, ?, 'workspace', ?, ?, ?)`,
     ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id, env.TENANT_SLUG),
+    ...(atomicWrites?.(receipt) ?? []),
   ])
   // Receipt: all three rows MUST land. A partial mint (e.g. token row without its
   // capability row) would hand out a show-once token bound to a broken identity.
   assertBatchWritten(mintWrites, 'mint_agent_bound_token', 1)
 
-  return { raw: rawToken, tokenId, memberId, createdAt, grantCapability }
+  return { raw: rawToken, ...receipt }
 }
 
 /** Live (non-revoked) tokens for every member — for the dashboard roster. The

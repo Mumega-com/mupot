@@ -30,6 +30,8 @@ function makeEnv(seen: { authSql?: string; authBinds?: unknown[] } = {}): Env {
                     status: 'active',
                     created_at: '2026-06-09 00:00:00',
                     channel: 'workspace',
+                    bound_agent_id: 'hermes-dme',
+                    bound_agent_status: 'active',
                   }
                 }
                 return null
@@ -94,9 +96,10 @@ describe('mcp JSON-RPC compatibility', () => {
     const res = await rpc('tools/call', { name: 'status', arguments: {} }, true)
     expect(res.status).toBe(200)
     const body = await res.json() as {
-      result: { structuredContent: { tenant: string; capabilities: CapabilityGrant[] } }
+      result: { structuredContent: { tenant: string; bound_agent_id: string; capabilities: CapabilityGrant[] } }
     }
     expect(body.result.structuredContent.tenant).toBe('digid')
+    expect(body.result.structuredContent.bound_agent_id).toBe('hermes-dme')
     expect(body.result.structuredContent.capabilities[0]).toMatchObject({
       scope_type: 'org',
       capability: 'admin',
