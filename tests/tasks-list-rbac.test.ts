@@ -6,6 +6,7 @@ const tasks: Task[] = [
   {
     id: 'task-growth',
     squad_id: 'sq-growth',
+    project_id: null,
     title: 'Growth task',
     body: '',
     done_when: 'growth work is complete',
@@ -21,6 +22,7 @@ const tasks: Task[] = [
   {
     id: 'task-ops',
     squad_id: 'sq-ops',
+    project_id: null,
     title: 'Ops task',
     body: '',
     done_when: 'ops work is complete',

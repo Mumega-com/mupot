@@ -34,7 +34,9 @@ const KEYS = new Set<keyof FlightMetaV1>([
 ])
 
 function boundedString(value: unknown, max: number): value is string {
-  return typeof value === 'string' && value.trim().length > 0 && value.length <= max
+  return typeof value === 'string'
+    && value.trim().length > 0
+    && new TextEncoder().encode(value).byteLength <= max
 }
 
 function boundedStrings(value: unknown, opts: { maxItems: number; maxLength: number; nonEmpty?: boolean }): value is string[] {
@@ -47,7 +49,7 @@ function boundedStrings(value: unknown, opts: { maxItems: number; maxLength: num
 export function parseFlightMetaV1(raw: unknown): FlightMetaV1 | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
   const meta = raw as Record<string, unknown>
-  if (JSON.stringify(meta).length > 16_384) return null
+  if (new TextEncoder().encode(JSON.stringify(meta)).byteLength > 16_384) return null
   if (Object.keys(meta).some((key) => !KEYS.has(key as keyof FlightMetaV1))) return null
   if (meta.schema !== FLIGHT_META_V1_SCHEMA) return null
   if (!boundedString(meta.goal_id, 200)) return null
@@ -78,12 +80,14 @@ export function parseFlightMetaV1(raw: unknown): FlightMetaV1 | null {
 
 export type FlightMetaReferenceResult =
   | { ok: true }
-  | { ok: false; error: 'flight_squad_not_found' | 'flight_task_not_found' | 'flight_task_scope_mismatch'; ref: string }
+  | { ok: false; error: 'flight_squad_not_found' | 'flight_task_not_found' | 'flight_task_scope_mismatch' | 'flight_task_project_mismatch'; ref: string }
+
+const D1_ID_QUERY_CHUNK_SIZE = 90
 
 export async function loadFlightSquads(env: Env, squadIds: string[]): Promise<Squad[]> {
   const rows: Squad[] = []
-  for (let offset = 0; offset < squadIds.length; offset += 90) {
-    const chunk = squadIds.slice(offset, offset + 90)
+  for (let offset = 0; offset < squadIds.length; offset += D1_ID_QUERY_CHUNK_SIZE) {
+    const chunk = squadIds.slice(offset, offset + D1_ID_QUERY_CHUNK_SIZE)
     const placeholders = chunk.map((_, index) => `?${index + 1}`).join(',')
     const result = await env.DB.prepare(
       `SELECT id, department_id, slug, name, charter, budget_cap_cents, budget_window, created_at
@@ -96,22 +100,34 @@ export async function loadFlightSquads(env: Env, squadIds: string[]): Promise<Sq
   return rows
 }
 
-export async function validateFlightMetaReferences(env: Env, meta: FlightMetaV1): Promise<FlightMetaReferenceResult> {
+export async function validateFlightMetaReferences(
+  env: Env,
+  meta: FlightMetaV1,
+  projectId?: string | null,
+): Promise<FlightMetaReferenceResult> {
   const squadRows = await loadFlightSquads(env, meta.squad_ids)
   const foundSquads = new Set(squadRows.map((row) => row.id))
   const missingSquad = meta.squad_ids.find((id) => !foundSquads.has(id))
   if (missingSquad) return { ok: false, error: 'flight_squad_not_found', ref: missingSquad }
 
-  const taskPlaceholders = meta.task_ids.map((_, index) => `?${index + 1}`).join(',')
-  const taskRows = await env.DB.prepare(`SELECT id, squad_id FROM tasks WHERE id IN (${taskPlaceholders})`)
-    .bind(...meta.task_ids)
-    .all<{ id: string; squad_id: string }>()
-  const tasksById = new Map((taskRows.results ?? []).map((row) => [row.id, row]))
+  const taskRows: Array<{ id: string; squad_id: string; project_id: string | null }> = []
+  for (let offset = 0; offset < meta.task_ids.length; offset += D1_ID_QUERY_CHUNK_SIZE) {
+    const chunk = meta.task_ids.slice(offset, offset + D1_ID_QUERY_CHUNK_SIZE)
+    const placeholders = chunk.map((_, index) => `?${index + 1}`).join(',')
+    const result = await env.DB.prepare(`SELECT id, squad_id, project_id FROM tasks WHERE id IN (${placeholders})`)
+      .bind(...chunk)
+      .all<{ id: string; squad_id: string; project_id: string | null }>()
+    taskRows.push(...(result.results ?? []))
+  }
+  const tasksById = new Map(taskRows.map((row) => [row.id, row]))
   for (const taskId of meta.task_ids) {
     const task = tasksById.get(taskId)
     if (!task) return { ok: false, error: 'flight_task_not_found', ref: taskId }
     if (!meta.squad_ids.includes(task.squad_id)) {
       return { ok: false, error: 'flight_task_scope_mismatch', ref: taskId }
+    }
+    if (projectId != null && task.project_id !== projectId) {
+      return { ok: false, error: 'flight_task_project_mismatch', ref: taskId }
     }
   }
   return { ok: true }

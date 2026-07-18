@@ -1,6 +1,15 @@
-# mupot Projects — repo-bound, squad-access-controlled (DRAFT, 2026-07-16)
+# mupot Projects — repo-bound, squad-access-controlled (SUPERSEDED, 2026-07-16)
 
-> Status: **design draft**, informed by a comparables research pass in flight. Not built.
+> Status: **superseded** by
+> `docs/superpowers/specs/2026-07-17-project-centered-workspace-design.md`.
+> This file remains as research history only. Do not implement its repo-bound project
+> model, missing hierarchy, or open authorization decisions as the current contract.
+>
+> The approved model makes Projects a cross-department organizing context, supports one
+> child-project level, uses explicit project-to-squad access edges, and keeps external task
+> managers and repositories behind provider integrations rather than making GitHub the
+> definition of a project.
+>
 > Origin: Hadi, 2026-07-16 — "mupot support projects, they should have squad access, squads
 > should be able to work projects... currently on codex desktop i handle it with folders and
 > for claude i handle it by a gh repo... mupots can have a gh repo for each project and squad

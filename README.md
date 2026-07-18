@@ -38,6 +38,29 @@ See the [control-plane roadmap](./docs/control-plane-roadmap.md), the
 [production runbook](./docs/production-runbook.md), and
 [what running an agent on Mupot means](./docs/agent-running-on-mupot.md).
 
+## Pots and projects
+
+A **pot** is the sovereign workspace and tenancy boundary. Inside it, **projects** organize
+goals, squads, tasks, flights, activity, and evidence around an outcome. The hierarchy is
+deliberately bounded to one child level: a root project or program can contain child projects,
+but child projects cannot contain more projects. Squad access is explicit on each project;
+parent access is not inherited.
+
+External task systems connect through provider-neutral adapters. Linear, GitHub, or another
+provider can synchronize work without becoming the owner of Mupot's project identity or data
+model. SOS can appear as a project in a portfolio, but **SOS is not an architectural dependency**:
+Mupot runs on its own Cloudflare runtime and pub/sub infrastructure.
+
+The local showcase seeds a Mumega portfolio with attributed project work after migrations:
+
+```bash
+npm run migrate:local:test
+npm run seed:local:test
+npm test -- tests/projects-local-smoke.test.ts
+# After starting the local Worker in another terminal:
+npm run smoke:local
+```
+
 ## Three things no one else gives you together
 
 1. **Agents as employees, not processes.** Every agent has an identity, a character sheet, and

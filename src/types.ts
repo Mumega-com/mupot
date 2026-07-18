@@ -247,6 +247,7 @@ export type Capability = 'owner' | 'admin' | 'lead' | 'member' | 'observer'
 export interface Task {
   id: string
   squad_id: string
+  project_id: string | null
   title: string
   body: string
   status: 'open' | 'in_progress' | 'blocked' | 'done' | 'review' | 'approved' | 'rejected'
@@ -269,6 +270,31 @@ export interface Task {
   execution_claim_expires_at?: number | null
   created_at: string
   updated_at: string
+}
+
+// ── Projects (migration 0055) ───────────────────────────────────────────────
+
+export type ProjectStatus = 'planned' | 'active' | 'paused' | 'completed' | 'archived'
+export type ProjectAccessLevel = 'read' | 'write' | 'admin'
+
+export interface Project {
+  id: string
+  slug: string
+  name: string
+  description: string
+  goal: string
+  status: ProjectStatus
+  parent_project_id: string | null
+  target_date: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ProjectSquadAccess {
+  project_id: string
+  squad_id: string
+  access_level: ProjectAccessLevel
+  granted_at: string
 }
 
 // Append-only verdict receipt — written by POST /api/tasks/:id/verdict.
@@ -560,6 +586,7 @@ export const ROUTES = {
   org: '/api/org',
   agents: '/api/agents',
   tasks: '/api/tasks',
+  projects: '/api/projects',
   bus: '/api/bus',
   members: '/api/members',
   mcp: '/mcp',

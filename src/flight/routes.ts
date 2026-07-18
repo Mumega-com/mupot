@@ -26,12 +26,14 @@ import {
   landFlight,
   landGovernedFlight,
   listFlights,
+  listFlightProjectMismatchTaskIds,
   listIncompleteFlightTaskIds,
+  FlightProjectError,
   type FlightStatus,
   type TriggerSource,
 } from './service'
 import type { FlightSignals, PreflightOptions } from './preflight'
-import { parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from './meta'
+import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from './meta'
 import { deriveActiveCollisions } from './board'
 
 // ── input parsing (pure, exported for tests) ──────────────────────────────────
@@ -52,7 +54,7 @@ function asStr(v: unknown, max: number): string {
 }
 
 export interface DispatchBody {
-  flight: { agent: string; goal: string; trigger_source?: TriggerSource; budget_micro_usd?: number; meta?: FlightMetaV1 }
+  flight: { agent: string; goal: string; project_id?: string | null; trigger_source?: TriggerSource; budget_micro_usd?: number; meta?: FlightMetaV1 }
   signals: FlightSignals
   opts: PreflightOptions
 }
@@ -74,6 +76,12 @@ export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody
 
   const trigger = typeof b.trigger_source === 'string' && TRIGGERS.has(b.trigger_source) ? (b.trigger_source as TriggerSource) : 'api'
   const budget = b.budget_micro_usd == null ? undefined : asNum(b.budget_micro_usd, 0, 0)
+  const projectId = b.project_id == null
+    ? undefined
+    : typeof b.project_id === 'string' && b.project_id.trim().length > 0 && b.project_id.length <= 200
+      ? b.project_id.trim()
+      : null
+  if (projectId === null) return { ok: false, error: 'invalid_project_id' }
   const meta = b.meta == null ? undefined : parseFlightMetaV1(b.meta)
   if (b.meta != null && !meta) return { ok: false, error: 'invalid_flight_meta' }
 
@@ -96,7 +104,7 @@ export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody
 
   return {
     ok: true,
-    value: { flight: { agent, goal, trigger_source: trigger, budget_micro_usd: budget, meta: meta ?? undefined }, signals, opts },
+    value: { flight: { agent, goal, project_id: projectId, trigger_source: trigger, budget_micro_usd: budget, meta: meta ?? undefined }, signals, opts },
   }
 }
 
@@ -141,10 +149,31 @@ flightsApp.post('/', async (c) => {
 
   const { flight, signals, opts } = parsed.value
   if (flight.meta) {
-    const references = await validateFlightMetaReferences(c.env, flight.meta)
-    if (!references.ok) return c.json({ error: references.error }, 400)
+    const references = await validateFlightMetaReferences(c.env, flight.meta, flight.project_id)
+    if (!references.ok) {
+      return c.json(
+        { error: references.error },
+        references.error === 'flight_task_not_found' ? 404 : 400,
+      )
+    }
   }
-  const result = await dispatchFlight(c.env, flight, signals, opts)
+  let result
+  try {
+    result = await dispatchFlight(c.env, flight, signals, opts)
+  } catch (error) {
+    if (!(error instanceof FlightProjectError)) throw error
+    const status = error.code === 'project_not_found' || error.code === 'flight_task_not_found'
+      ? 404
+      : error.code === 'project_access_forbidden'
+        ? 403
+        : 400
+    return c.json(
+      error.code === 'project_access_forbidden'
+        ? { error: 'forbidden', need: 'project_write' }
+        : { error: error.code },
+      status,
+    )
+  }
   // 201 on launch (GO), 200 on a recorded NO-GO hold (not an error — the gate worked).
   return c.json(result, result.go ? 201 : 200)
 })
@@ -158,12 +187,42 @@ flightsApp.post('/:id/land', async (c) => {
   const existing = await getFlight(c.env, id)
   if (!existing) return c.json({ error: 'not_found' }, 404)
 
+  const storedMetaShape = await c.env.DB.prepare(`
+    WITH parsed(meta) AS (
+      SELECT CASE
+        WHEN json_valid(?1) AND json_type(?1) = 'object' THEN ?1
+        ELSE '{}'
+      END
+    ), top_level AS (
+      SELECT key, type, value FROM parsed, json_each(parsed.meta)
+    )
+    SELECT COUNT(*) AS key_count,
+           COUNT(DISTINCT key) AS distinct_key_count,
+           COALESCE(SUM(CASE
+             WHEN key = 'schema' AND type = 'text' AND value = ?2 THEN 1
+             ELSE 0
+           END), 0) AS v1_schema_count
+      FROM top_level
+  `).bind(existing.meta, FLIGHT_META_V1_SCHEMA).first<{
+    key_count: number
+    distinct_key_count: number
+    v1_schema_count: number
+  }>()
+  const hasDuplicateMetaKeys = Number(storedMetaShape?.key_count ?? 0)
+    !== Number(storedMetaShape?.distinct_key_count ?? 0)
+  const declaresGovernedV1 = Number(storedMetaShape?.v1_schema_count ?? 0) > 0
+
   const b = (await c.req.json().catch(() => ({}))) as Record<string, unknown>
   let governedMeta: FlightMetaV1 | null = null
+  let storedMeta: unknown = null
   try {
-    governedMeta = parseFlightMetaV1(JSON.parse(existing.meta))
+    storedMeta = JSON.parse(existing.meta)
+    governedMeta = parseFlightMetaV1(storedMeta)
   } catch {
     governedMeta = null
+  }
+  if (hasDuplicateMetaKeys || (declaresGovernedV1 && !governedMeta)) {
+    return c.json({ error: 'flight_meta_incompatible' }, 409)
   }
   if (governedMeta) {
     const cost = b.cost_micro_usd == null ? 0 : b.cost_micro_usd
@@ -191,6 +250,14 @@ flightsApp.post('/:id/land', async (c) => {
       actor: { kind: 'member', id: auth.id.memberId },
     })
     if (!transitioned) {
+      const projectMismatchTaskIds = await listFlightProjectMismatchTaskIds(
+        c.env,
+        existing.project_id,
+        governedMeta.task_ids,
+      )
+      if (projectMismatchTaskIds.length > 0) {
+        return c.json({ error: 'flight_task_project_conflict', task_ids: projectMismatchTaskIds }, 409)
+      }
       const incompleteTaskIds = await listIncompleteFlightTaskIds(c.env, governedMeta.task_ids)
       if (incompleteTaskIds.length > 0) {
         return c.json({ error: 'flight_tasks_incomplete', task_ids: incompleteTaskIds }, 409)
@@ -231,8 +298,12 @@ flightsApp.get('/', async (c) => {
   const auth = await requireOrgAdmin(c.env, c.req.header('authorization'))
   if (!auth.ok) return c.json({ error: auth.status === 401 ? 'unauthorized' : 'forbidden' }, auth.status)
 
-  const q = parseOutcomeQuery(new URL(c.req.url).searchParams)
-  const all = await listFlights(c.env, 500)
+  const params = new URL(c.req.url).searchParams
+  const q = parseOutcomeQuery(params)
+  const rawProjectId = params.get('project_id')
+  const projectId = rawProjectId === null ? undefined : rawProjectId.trim()
+  if (projectId !== undefined && (projectId.length === 0 || projectId.length > 200)) return c.json({ error: 'invalid_project_id' }, 400)
+  const all = await listFlights(c.env, 500, projectId)
   const statusSet = q.statuses ? new Set<FlightStatus>(q.statuses) : null
   const flights = all
     .filter((f) => (statusSet ? statusSet.has(f.status) : true))
@@ -240,6 +311,7 @@ flightsApp.get('/', async (c) => {
     .slice(0, q.limit)
     .map((f) => ({
       id: f.id,
+      project_id: f.project_id,
       agent: f.agent,
       goal: f.goal,
       status: f.status,

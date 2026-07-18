@@ -117,10 +117,10 @@ describe('createTask — done_when required', () => {
     expect(inserts).toHaveLength(1)
     // done_when must be in the INSERT binds
     expect(inserts[0]).toContain('GET /health returns 200')
-    // done_when is at the 5th bind position (after id, squad_id, title, body)
-    // Bind order: id, squad_id, title, body, done_when, status, assignee_agent_id,
+    // done_when is at the 6th bind position (after id, squad_id, project_id, title, body)
+    // Bind order: id, squad_id, project_id, title, body, done_when, status, assignee_agent_id,
     //             github_issue_url, result, completed_at, gate_owner, created_at, updated_at
-    expect(inserts[0][4]).toBe('GET /health returns 200')
+    expect(inserts[0][5]).toBe('GET /health returns 200')
   })
 
   it('(b) trims leading/trailing whitespace from done_when before storing', async () => {

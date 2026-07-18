@@ -23,7 +23,7 @@ import { requireAuth } from '../auth'
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap } from '../auth/capability'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
@@ -137,17 +137,59 @@ async function readableSquadIds(env: Env, auth: AuthContext): Promise<string[] |
   }
 
   if (deptIds.size > 0) {
-    const ids = [...deptIds]
-    const placeholders = ids.map((_, i) => `?${i + 1}`).join(', ')
     const rows = await env.DB.prepare(
-      `SELECT id FROM squads WHERE department_id IN (${placeholders})`,
+      `SELECT id
+         FROM squads
+        WHERE department_id IN (
+          SELECT CAST(value AS TEXT) FROM json_each(?)
+        )`,
     )
-      .bind(...ids)
+      .bind(JSON.stringify([...deptIds]))
       .all<{ id: string }>()
     for (const row of rows.results ?? []) squadIds.add(row.id)
   }
 
   return [...squadIds]
+}
+
+async function canReadProjectForTaskList(
+  env: Env,
+  auth: AuthContext,
+  projectId: string,
+  readableSquads: string[] | null,
+  explicitSquadId?: string,
+): Promise<boolean> {
+  if (legacyOwnerAdmin(auth)) {
+    return (await env.DB.prepare('SELECT 1 FROM projects WHERE id = ?').bind(projectId).first()) !== null
+  }
+  if (!auth.memberId) return false
+  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
+  if (hasCapability(grants, 'org', null, 'admin')) {
+    return (await env.DB.prepare('SELECT 1 FROM projects WHERE id = ?').bind(projectId).first()) !== null
+  }
+
+  const squadIds = explicitSquadId ? [explicitSquadId] : readableSquads
+  if (squadIds !== null && squadIds.length === 0) return false
+  const squadClause = squadIds === null
+    ? ''
+    : ` AND psa.squad_id IN (
+          SELECT CAST(value AS TEXT) FROM json_each(?)
+        )`
+  return (await env.DB.prepare(
+    `SELECT 1
+       FROM projects p
+      WHERE p.id = ?
+        AND EXISTS (
+          SELECT 1 FROM project_squad_access psa
+           WHERE psa.project_id = p.id${squadClause}
+        )`,
+  ).bind(projectId, ...(squadIds === null ? [] : [JSON.stringify(squadIds)])).first()) !== null
+}
+
+function taskProjectErrorResponse(error: TaskProjectError): { body: { error: string; need?: string }; status: 400 | 403 | 404 } {
+  if (error.code === 'project_not_found') return { body: { error: error.code }, status: 404 }
+  if (error.code === 'project_access_forbidden') return { body: { error: 'forbidden', need: 'project_write' }, status: 403 }
+  return { body: { error: error.code }, status: 400 }
 }
 
 export function verdictPrincipal(auth: AuthContext): { id: string; type: 'member' | 'agent'; actor?: TaskActor } {
@@ -187,15 +229,20 @@ tasksApp.use('*', async (c, next) => {
 tasksApp.get('/', async (c) => {
   const squadId = c.req.query('squad_id')
   const status = c.req.query('status')
+  const projectId = c.req.query('project_id')
   const auth = c.get('auth')
 
   if (status !== undefined && !isTaskStatus(status)) {
     return c.json({ error: 'invalid_status' }, 400)
   }
+  if (projectId !== undefined && !isNonEmptyString(projectId)) {
+    return c.json({ error: 'invalid_project_id' }, 400)
+  }
 
   // Build the filter with bound params only — never interpolate caller input.
   const clauses: string[] = []
   const binds: string[] = []
+  let readable: string[] | null = null
   if (squadId !== undefined) {
     if (!(await canActOnSquad(c.env, auth, squadId))) {
       return c.json({ error: 'forbidden', need: 'member' }, 403)
@@ -203,14 +250,24 @@ tasksApp.get('/', async (c) => {
     clauses.push('squad_id = ?')
     binds.push(squadId)
   } else {
-    const readable = await readableSquadIds(c.env, auth)
+    readable = await readableSquadIds(c.env, auth)
     if (readable !== null) {
-      if (readable.length === 0) return c.json({ tasks: [] })
-      const placeholders = readable.map(() => '?').join(', ')
-      clauses.push(`squad_id IN (${placeholders})`)
-      binds.push(...readable)
+      if (readable.length > 0) {
+        clauses.push(`squad_id IN (
+          SELECT CAST(value AS TEXT) FROM json_each(?)
+        )`)
+        binds.push(JSON.stringify(readable))
+      }
     }
   }
+  if (projectId !== undefined) {
+    if (!(await canReadProjectForTaskList(c.env, auth, projectId, readable, squadId))) {
+      return c.json({ error: 'project_not_found' }, 404)
+    }
+    clauses.push('project_id = ?')
+    binds.push(projectId)
+  }
+  if (squadId === undefined && readable !== null && readable.length === 0) return c.json({ tasks: [] })
   // #22 v1 ATC ranking (src/tasks/ranking.ts). Fetch is SPLIT and BOUNDED at
   // the SQL layer, not just reordered in JS after an unbounded read — see
   // ranking.ts's "SQL fetch-boundary helpers" section for the full P1
@@ -232,7 +289,7 @@ tasksApp.get('/', async (c) => {
     const statusBinds = [...binds, status]
     const cap = isActionable ? ACTIONABLE_FETCH_CAP : PASSTHROUGH_FETCH_CAP
     const rows = await c.env.DB.prepare(
-      `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+      `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
          FROM tasks
         WHERE ${statusClauses.join(' AND ')}
         ORDER BY created_at ${isActionable ? 'ASC' : 'DESC'}
@@ -258,7 +315,7 @@ tasksApp.get('/', async (c) => {
 
     const [actionableRows, terminalRows] = await Promise.all([
       c.env.DB.prepare(
-        `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+        `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
            FROM tasks ${actionableWhere}
            ORDER BY ${actionableStatusOrderSql()}, created_at ASC
            LIMIT ${ACTIONABLE_FETCH_CAP}`,
@@ -266,7 +323,7 @@ tasksApp.get('/', async (c) => {
         .bind(...binds)
         .all<Task>(),
       c.env.DB.prepare(
-        `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+        `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
            FROM tasks ${terminalWhere}
            ORDER BY created_at DESC
            LIMIT ${PASSTHROUGH_FETCH_CAP}`,
@@ -294,7 +351,7 @@ tasksApp.get('/', async (c) => {
 tasksApp.get('/:id', async (c) => {
   const id = c.req.param('id')
   const task = await c.env.DB.prepare(
-    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+    `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
        FROM tasks WHERE id = ? LIMIT 1`,
   )
     .bind(id)
@@ -314,6 +371,7 @@ tasksApp.get('/:id', async (c) => {
 
 interface CreateTaskBody {
   squad_id?: unknown
+  project_id?: unknown
   title?: unknown
   // #142 capsule keystone: required — a verifiable success predicate.
   done_when?: unknown
@@ -388,17 +446,31 @@ tasksApp.post('/', async (c) => {
   }
 
   const auth = c.get('auth')
-  const task = await createTask(c.env, {
-    squad_id: squad.id,
-    title: body.title.trim(),
-    done_when: (body.done_when as string).trim(),
-    body: taskBody,
-    status,
-    assignee_agent_id: assigneeAgentId,
-    gate_owner: gateOwner,
-  }, {
-    actor: auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
-  })
+  const projectId = body.project_id === undefined || body.project_id === null
+    ? null
+    : isNonEmptyString(body.project_id)
+      ? body.project_id.trim()
+      : undefined
+  if (projectId === undefined) return c.json({ error: 'invalid_project_id' }, 400)
+  let task: Task
+  try {
+    task = await createTask(c.env, {
+      squad_id: squad.id,
+      project_id: projectId,
+      title: body.title.trim(),
+      done_when: (body.done_when as string).trim(),
+      body: taskBody,
+      status,
+      assignee_agent_id: assigneeAgentId,
+      gate_owner: gateOwner,
+    }, {
+      actor: auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
+    })
+  } catch (error) {
+    if (!(error instanceof TaskProjectError)) throw error
+    const mapped = taskProjectErrorResponse(error)
+    return c.json(mapped.body, mapped.status)
+  }
 
   // Dispatch: wake the assignee in execute mode. We require an assignee — there is
   // no "wake the whole squad to fight over one task". The assignee was already
@@ -436,6 +508,7 @@ interface UpdateTaskBody {
   status?: unknown
   assignee_agent_id?: unknown
   gate_owner?: unknown
+  project_id?: unknown
 }
 
 tasksApp.patch('/:id', async (c) => {
@@ -558,31 +631,38 @@ tasksApp.patch('/:id', async (c) => {
       return c.json({ error: 'invalid_gate_owner' }, 400)
     }
   }
+  if (body.project_id !== undefined) {
+    const projectId = body.project_id === null
+      ? null
+      : isNonEmptyString(body.project_id)
+        ? body.project_id.trim()
+        : undefined
+    if (projectId === undefined) return c.json({ error: 'invalid_project_id' }, 400)
+    next.project_id = projectId
+  }
+
+  // Revalidate the effective attribution for every mutation. The migration
+  // trigger repeats this check at write time to close archive/edge races.
+  try {
+    await validateTaskProjectAttribution(c.env, next.project_id, existing.squad_id)
+  } catch (error) {
+    if (!(error instanceof TaskProjectError)) throw error
+    const mapped = taskProjectErrorResponse(error)
+    return c.json(mapped.body, mapped.status)
+  }
 
   stampTaskUpdate(next, existing.status, new Date().toISOString())
 
-  // Mirror the update to GitHub. Non-fatal: if it has an issue URL we PATCH it; if
-  // it never got mirrored (no repo earlier) we attempt a create now.
-  next.github_issue_url = await mirrorTaskUpdate(c.env, next)
+  try {
+    await persistTaskUpdate(c.env, existing, next)
+  } catch (error) {
+    if (error instanceof TaskUpdateConflictError) return c.json({ error: error.code }, 409)
+    throw error
+  }
 
-  await c.env.DB.prepare(
-    `UPDATE tasks
-        SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, completed_at = ?, updated_at = ?
-      WHERE id = ?`,
-  )
-    .bind(
-      next.title,
-      next.body,
-      next.done_when,
-      next.status,
-      next.assignee_agent_id,
-      next.github_issue_url,
-      next.gate_owner,
-      next.completed_at,
-      next.updated_at,
-      next.id,
-    )
-    .run()
+  // A stale update must never reach the external mirror. The mirror remains
+  // best-effort and update-only; project attribution does not alter its auth.
+  next.github_issue_url = await mirrorTaskUpdate(c.env, next)
 
   {
     const auth = c.get('auth')

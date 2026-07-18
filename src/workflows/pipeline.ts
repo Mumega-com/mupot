@@ -410,11 +410,11 @@ export async function startTaskPipeline(
   squadId: string,
 ): Promise<{ instanceId: string }> {
   const task = await env.DB.prepare(
-    `SELECT id, squad_id, status, assignee_agent_id, workflow_instance_id, execution_receipt_id
+    `SELECT id, squad_id, project_id, status, assignee_agent_id, workflow_instance_id, execution_receipt_id
        FROM tasks WHERE id = ? AND squad_id = ? LIMIT 1`,
   )
     .bind(taskId, squadId)
-    .first<Pick<Task, 'id' | 'squad_id' | 'status' | 'assignee_agent_id' | 'execution_receipt_id'> & { workflow_instance_id: string | null }>()
+    .first<Pick<Task, 'id' | 'squad_id' | 'project_id' | 'status' | 'assignee_agent_id' | 'execution_receipt_id'> & { workflow_instance_id: string | null }>()
 
   if (!task) {
     throw Object.assign(new Error('task_not_found'), { code: 'task_not_found' as const })

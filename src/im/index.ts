@@ -535,7 +535,7 @@ function escapeLikePrefix(ref: string): string {
 
 async function resolveTaskRef(env: Env, ref: string): Promise<Task | 'ambiguous' | null> {
   const exact = await env.DB.prepare(
-    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at,
+    `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at,
             gate_owner, workflow_instance_id, created_at, updated_at
        FROM tasks WHERE id = ?1 LIMIT 1`,
   )
@@ -546,7 +546,7 @@ async function resolveTaskRef(env: Env, ref: string): Promise<Task | 'ambiguous'
   // Telegram is awkward for UUIDs; allow a unique prefix once it is specific enough.
   if (ref.length < 8) return null
   const rows = await env.DB.prepare(
-    `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at,
+    `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at,
             gate_owner, workflow_instance_id, created_at, updated_at
        FROM tasks WHERE id LIKE ?1 ESCAPE '\\' ORDER BY created_at DESC LIMIT 2`,
   )

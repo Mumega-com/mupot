@@ -10,6 +10,8 @@ import { createBus } from '../bus'
 import type { PreflightResult } from './preflight'
 import type { FlightMetaV1 } from './meta'
 
+const D1_TASK_ID_QUERY_CHUNK_SIZE = 90
+
 export type FlightStatus =
   | 'preflight'
   | 'held'
@@ -24,6 +26,7 @@ export type TriggerSource = 'manual' | 'schedule' | 'api' | 'event' | 'cron'
 export interface FlightRow {
   id: string
   tenant: string
+  project_id: string | null
   agent: string
   goal: string
   status: FlightStatus
@@ -43,28 +46,114 @@ export interface FlightRow {
 export interface NewFlight {
   agent: string
   goal: string
+  project_id?: string | null
   trigger_source?: TriggerSource
   budget_micro_usd?: number
   meta?: FlightMetaV1
 }
 
+export type FlightProjectErrorCode =
+  | 'invalid_project_id'
+  | 'invalid_flight_meta'
+  | 'project_not_found'
+  | 'archived_project'
+  | 'project_access_forbidden'
+  | 'flight_task_not_found'
+  | 'flight_task_project_mismatch'
+
+export class FlightProjectError extends Error {
+  constructor(readonly code: FlightProjectErrorCode) {
+    super(code)
+    this.name = 'FlightProjectError'
+  }
+}
+
+export async function validateFlightProjectTarget(
+  env: Env,
+  projectId: NewFlight['project_id'],
+): Promise<void> {
+  projectId = projectId ?? null
+  if (projectId === null) return
+  if (typeof projectId !== 'string' || projectId.trim().length === 0) {
+    throw new FlightProjectError('invalid_project_id')
+  }
+  const project = await env.DB.prepare('SELECT status FROM projects WHERE id = ?1')
+    .bind(projectId)
+    .first<{ status: string }>()
+  if (!project) throw new FlightProjectError('project_not_found')
+  if (project.status === 'archived') throw new FlightProjectError('archived_project')
+}
+
+export async function validateFlightTaskProjectConsistency(
+  env: Env,
+  projectId: NewFlight['project_id'],
+  meta: NewFlight['meta'],
+): Promise<void> {
+  projectId = projectId ?? null
+  if (projectId !== null && meta) {
+    const tasks = new Map<string, { id: string; project_id: string | null }>()
+    for (let offset = 0; offset < meta.task_ids.length; offset += D1_TASK_ID_QUERY_CHUNK_SIZE) {
+      const chunk = meta.task_ids.slice(offset, offset + D1_TASK_ID_QUERY_CHUNK_SIZE)
+      const placeholders = chunk.map((_, index) => `?${index + 1}`).join(',')
+      const rows = await env.DB.prepare(
+        `SELECT id, project_id FROM tasks WHERE id IN (${placeholders})`,
+      ).bind(...chunk).all<{ id: string; project_id: string | null }>()
+      for (const task of rows.results ?? []) tasks.set(task.id, task)
+    }
+    if (meta.task_ids.some((taskId) => !tasks.has(taskId))) {
+      throw new FlightProjectError('flight_task_not_found')
+    }
+    if (meta.task_ids.some((taskId) => tasks.get(taskId)?.project_id !== projectId)) {
+      throw new FlightProjectError('flight_task_project_mismatch')
+    }
+  }
+}
+
+export async function validateFlightProjectAttribution(env: Env, flight: NewFlight): Promise<void> {
+  await validateFlightProjectTarget(env, flight.project_id)
+  await validateFlightTaskProjectConsistency(env, flight.project_id, flight.meta)
+}
+
+function mapFlightProjectInsertError(error: unknown): never {
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.includes('flight meta invalid')) throw new FlightProjectError('invalid_flight_meta')
+  if (message.includes('flight project not found')) throw new FlightProjectError('project_not_found')
+  if (message.includes('flight project archived')) throw new FlightProjectError('archived_project')
+  if (message.includes('flight project access denied')) {
+    throw new FlightProjectError('project_access_forbidden')
+  }
+  if (message.includes('flight task not found')) {
+    throw new FlightProjectError('flight_task_not_found')
+  }
+  if (message.includes('flight task project mismatch')) {
+    throw new FlightProjectError('flight_task_project_mismatch')
+  }
+  throw error
+}
+
 // Create a flight in `preflight` — it has not launched; the gate decides next.
 export async function createFlight(env: Env, f: NewFlight): Promise<string> {
+  await validateFlightProjectAttribution(env, f)
   const id = crypto.randomUUID()
-  await env.DB.prepare(
-    `INSERT INTO flights (id, tenant, agent, goal, status, trigger_source, budget_micro_usd, meta)
-     VALUES (?1, ?2, ?3, ?4, 'preflight', ?5, ?6, ?7)`,
-  )
-    .bind(
-      id,
-      env.TENANT_SLUG,
-      f.agent,
-      f.goal,
-      f.trigger_source ?? 'manual',
-      f.budget_micro_usd ?? null,
-      JSON.stringify(f.meta ?? {}),
+  try {
+    await env.DB.prepare(
+      `INSERT INTO flights (id, tenant, project_id, agent, goal, status, trigger_source, budget_micro_usd, meta)
+       VALUES (?1, ?2, ?3, ?4, ?5, 'preflight', ?6, ?7, ?8)`,
     )
-    .run()
+      .bind(
+        id,
+        env.TENANT_SLUG,
+        f.project_id ?? null,
+        f.agent,
+        f.goal,
+        f.trigger_source ?? 'manual',
+        f.budget_micro_usd ?? null,
+        JSON.stringify(f.meta ?? {}),
+      )
+      .run()
+  } catch (error) {
+    mapFlightProjectInsertError(error)
+  }
   return id
 }
 
@@ -141,6 +230,7 @@ export async function landGovernedFlight(
            FROM json_each(flights.meta, '$.task_ids') AS task_ref
            LEFT JOIN tasks AS task ON task.id = task_ref.value
           WHERE task.id IS NULL
+             OR (flights.project_id IS NOT NULL AND task.project_id IS NOT flights.project_id)
              OR task.status <> 'done'
              OR (
                task.gate_owner IS NOT NULL
@@ -184,21 +274,43 @@ interface FlightTaskCompletionRow {
 
 export async function listIncompleteFlightTaskIds(env: Env, taskIds: string[]): Promise<string[]> {
   if (taskIds.length === 0) return []
-  const placeholders = taskIds.map(() => '?').join(',')
-  const rows = await env.DB.prepare(
-    `SELECT id, status, gate_owner,
-            (SELECT verdict
-               FROM task_verdicts
-              WHERE task_id = tasks.id
-              ORDER BY decided_at DESC, id DESC
-              LIMIT 1) AS latest_verdict
-       FROM tasks WHERE id IN (${placeholders})`,
-  ).bind(...taskIds).all<FlightTaskCompletionRow>()
-  const byId = new Map((rows.results ?? []).map((task) => [task.id, task]))
+  const byId = new Map<string, FlightTaskCompletionRow>()
+  for (let offset = 0; offset < taskIds.length; offset += D1_TASK_ID_QUERY_CHUNK_SIZE) {
+    const chunk = taskIds.slice(offset, offset + D1_TASK_ID_QUERY_CHUNK_SIZE)
+    const placeholders = chunk.map(() => '?').join(',')
+    const rows = await env.DB.prepare(
+      `SELECT id, status, gate_owner,
+              (SELECT verdict
+                 FROM task_verdicts
+                WHERE task_id = tasks.id
+                ORDER BY decided_at DESC, id DESC
+                LIMIT 1) AS latest_verdict
+         FROM tasks WHERE id IN (${placeholders})`,
+    ).bind(...chunk).all<FlightTaskCompletionRow>()
+    for (const task of rows.results ?? []) byId.set(task.id, task)
+  }
   return taskIds.filter((taskId) => {
     const task = byId.get(taskId)
     return !task || task.status !== 'done' || (task.gate_owner !== null && task.latest_verdict !== 'approved')
   })
+}
+
+export async function listFlightProjectMismatchTaskIds(
+  env: Env,
+  projectId: string | null,
+  taskIds: string[],
+): Promise<string[]> {
+  if (projectId === null || taskIds.length === 0) return []
+  const byId = new Map<string, string | null>()
+  for (let offset = 0; offset < taskIds.length; offset += D1_TASK_ID_QUERY_CHUNK_SIZE) {
+    const chunk = taskIds.slice(offset, offset + D1_TASK_ID_QUERY_CHUNK_SIZE)
+    const placeholders = chunk.map(() => '?').join(',')
+    const rows = await env.DB.prepare(
+      `SELECT id, project_id FROM tasks WHERE id IN (${placeholders})`,
+    ).bind(...chunk).all<{ id: string; project_id: string | null }>()
+    for (const task of rows.results ?? []) byId.set(task.id, task.project_id)
+  }
+  return taskIds.filter((taskId) => byId.has(taskId) && byId.get(taskId) !== projectId)
 }
 
 interface FlightEventOutboxRow {
@@ -298,9 +410,14 @@ export async function getFlight(env: Env, id: string): Promise<FlightRow | null>
   )
 }
 
-export async function listFlights(env: Env, limit = 100): Promise<FlightRow[]> {
-  const res = await env.DB.prepare(`SELECT * FROM flights WHERE tenant=?1 ORDER BY created_at DESC LIMIT ?2`)
-    .bind(env.TENANT_SLUG, Math.min(Math.max(limit, 1), 500))
+export async function listFlights(env: Env, limit = 100, projectId?: string): Promise<FlightRow[]> {
+  const boundedLimit = Math.min(Math.max(limit, 1), 500)
+  const statement = projectId === undefined
+    ? env.DB.prepare(`SELECT * FROM flights WHERE tenant=?1 ORDER BY created_at DESC LIMIT ?2`)
+      .bind(env.TENANT_SLUG, boundedLimit)
+    : env.DB.prepare(`SELECT * FROM flights WHERE tenant=?1 AND project_id=?2 ORDER BY created_at DESC LIMIT ?3`)
+      .bind(env.TENANT_SLUG, projectId, boundedLimit)
+  const res = await statement
     .all<FlightRow>()
   return res.results ?? []
 }
@@ -310,12 +427,14 @@ export async function listFlightsForSquad(
   squadId: string,
   limit = 100,
   before?: { createdAt: number; id: string },
+  projectId?: string,
 ): Promise<FlightRow[]> {
   const boundedLimit = Math.min(Math.max(limit, 1), 500)
   const beforeCreatedAt = before?.createdAt ?? Number.MAX_SAFE_INTEGER
   const beforeId = before?.id ?? '\uffff'
-  const res = await env.DB.prepare(
-    `SELECT f.* FROM flights f
+  const statement = projectId === undefined
+    ? env.DB.prepare(
+      `SELECT f.* FROM flights f
       WHERE f.tenant = ?1
         AND EXISTS (
           SELECT 1
@@ -325,8 +444,20 @@ export async function listFlightsForSquad(
         AND (f.created_at < ?3 OR (f.created_at = ?4 AND f.id < ?5))
       ORDER BY f.created_at DESC, f.id DESC
       LIMIT ?6`,
-  )
-    .bind(env.TENANT_SLUG, squadId, beforeCreatedAt, beforeCreatedAt, beforeId, boundedLimit)
-    .all<FlightRow>()
+    ).bind(env.TENANT_SLUG, squadId, beforeCreatedAt, beforeCreatedAt, beforeId, boundedLimit)
+    : env.DB.prepare(
+      `SELECT f.* FROM flights f
+      WHERE f.tenant = ?1
+        AND f.project_id = ?2
+        AND EXISTS (
+          SELECT 1
+            FROM json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.squad_ids') AS squad_ref
+           WHERE squad_ref.value = ?3
+        )
+        AND (f.created_at < ?4 OR (f.created_at = ?5 AND f.id < ?6))
+      ORDER BY f.created_at DESC, f.id DESC
+      LIMIT ?7`,
+    ).bind(env.TENANT_SLUG, projectId, squadId, beforeCreatedAt, beforeCreatedAt, beforeId, boundedLimit)
+  const res = await statement.all<FlightRow>()
   return res.results ?? []
 }

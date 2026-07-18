@@ -86,6 +86,7 @@ export function stampTaskUpdate(
 
 export interface CreateTaskInput {
   squad_id: string
+  project_id?: string | null
   title: string
   // #142 capsule keystone: a verifiable success predicate. Required and must be
   // a non-empty string — the application layer rejects blank/missing values before
@@ -104,6 +105,106 @@ export interface CreateTaskOptions {
   // redundant AND reflects attacker-influenced PR/CI fields out under our token (a loop
   // + mention/ref injection). Webhook-origin tasks are inbound-only.
   skipMirror?: boolean
+}
+
+export type TaskProjectErrorCode =
+  | 'invalid_project_id'
+  | 'project_not_found'
+  | 'archived_project'
+  | 'project_access_forbidden'
+
+export class TaskProjectError extends Error {
+  constructor(readonly code: TaskProjectErrorCode) {
+    super(code)
+    this.name = 'TaskProjectError'
+  }
+}
+
+export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_project_locked'
+
+export class TaskUpdateConflictError extends Error {
+  constructor(readonly code: TaskUpdateConflictCode) {
+    super(code)
+    this.name = 'TaskUpdateConflictError'
+  }
+}
+
+export async function validateTaskProjectAttribution(
+  env: Env,
+  projectId: string | null,
+  squadId: string,
+): Promise<void> {
+  if (projectId === null) return
+  if (!isNonEmptyString(projectId)) throw new TaskProjectError('invalid_project_id')
+  const row = await env.DB.prepare(
+    `SELECT p.status, psa.access_level
+       FROM projects p
+       LEFT JOIN project_squad_access psa
+         ON psa.project_id = p.id AND psa.squad_id = ?2
+      WHERE p.id = ?1`,
+  ).bind(projectId, squadId).first<{ status: string; access_level: string | null }>()
+  if (!row) throw new TaskProjectError('project_not_found')
+  if (row.status === 'archived') throw new TaskProjectError('archived_project')
+  if (row.access_level !== 'write' && row.access_level !== 'admin') {
+    throw new TaskProjectError('project_access_forbidden')
+  }
+}
+
+function mapTaskProjectInsertError(error: unknown): never {
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.includes('task project not found')) throw new TaskProjectError('project_not_found')
+  if (message.includes('task project archived')) throw new TaskProjectError('archived_project')
+  if (message.includes('task project access denied')) throw new TaskProjectError('project_access_forbidden')
+  throw error
+}
+
+function mapTaskProjectUpdateError(error: unknown): never {
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.includes('task project locked by flight')) {
+    throw new TaskUpdateConflictError('task_project_locked')
+  }
+  if (
+    message.includes('task project not found')
+    || message.includes('task project archived')
+    || message.includes('task project access denied')
+  ) {
+    throw new TaskUpdateConflictError('task_update_conflict')
+  }
+  throw error
+}
+
+export async function persistTaskUpdate(
+  env: Env,
+  existing: Task,
+  next: Task,
+): Promise<void> {
+  let result
+  try {
+    result = await env.DB.prepare(
+      `UPDATE tasks
+          SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
+        WHERE id = ? AND updated_at = ? AND project_id IS ?`,
+    )
+      .bind(
+        next.title,
+        next.body,
+        next.done_when,
+        next.status,
+        next.assignee_agent_id,
+        next.github_issue_url,
+        next.gate_owner,
+        next.project_id,
+        next.completed_at,
+        next.updated_at,
+        next.id,
+        existing.updated_at,
+        existing.project_id,
+      )
+      .run()
+  } catch (error) {
+    mapTaskProjectUpdateError(error)
+  }
+  if (!result.meta?.changes) throw new TaskUpdateConflictError('task_update_conflict')
 }
 
 function isNonEmptyString(v: unknown): v is string {
@@ -296,7 +397,7 @@ export async function emitTaskEvent(
     squad_id: task.squad_id,
     agent_id: eventAgentId(task, actor),
     actor,
-    payload: { task_id: task.id, status: task.status, title: task.title },
+    payload: { task_id: task.id, project_id: task.project_id, status: task.status, title: task.title },
     ts: new Date().toISOString(),
   })
 }
@@ -368,10 +469,14 @@ export async function createTask(
     throw new Error('done_when_required: task creation requires a non-empty verifiable success predicate')
   }
 
+  const projectId = input.project_id ?? null
+  await validateTaskProjectAttribution(env, projectId, input.squad_id)
+
   const now = new Date().toISOString()
   const task: Task = {
     id: crypto.randomUUID(),
     squad_id: input.squad_id,
+    project_id: projectId,
     title: input.title.trim(),
     body: input.body ?? '',
     done_when: input.done_when.trim(),
@@ -385,26 +490,32 @@ export async function createTask(
     updated_at: now,
   }
 
-  const taskInsert = await env.DB.prepare(
-    `INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(
-      task.id,
-      task.squad_id,
-      task.title,
-      task.body,
-      task.done_when,
-      task.status,
-      task.assignee_agent_id,
-      task.github_issue_url,
-      task.result,
-      task.completed_at,
-      task.gate_owner,
-      task.created_at,
-      task.updated_at,
+  let taskInsert
+  try {
+    taskInsert = await env.DB.prepare(
+      `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run()
+      .bind(
+        task.id,
+        task.squad_id,
+        task.project_id,
+        task.title,
+        task.body,
+        task.done_when,
+        task.status,
+        task.assignee_agent_id,
+        task.github_issue_url,
+        task.result,
+        task.completed_at,
+        task.gate_owner,
+        task.created_at,
+        task.updated_at,
+      )
+      .run()
+  } catch (error) {
+    mapTaskProjectInsertError(error)
+  }
   // Receipt (#186): a 0-row INSERT resolves without throwing — verify the row
   // actually landed before we emit "created" and return the task as success.
   assertWritten(taskInsert, 'tasks.insert')

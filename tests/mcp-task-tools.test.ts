@@ -28,6 +28,7 @@ function task(overrides: Partial<Task> = {}): Task {
   return {
     id: 'task-1',
     squad_id: SQUAD_ID,
+    project_id: null,
     title: 'Ship the adapter',
     body: 'wire the task tools',
     done_when: 'task tool tests pass',
@@ -168,7 +169,7 @@ describe('MCP task cutover tools', () => {
     expect(res.ok).toBe(true)
     expect((res.result as { task: Task }).task.assignee_agent_id).toBe('agent-other')
     expect(updates[0].sql).toContain('INSERT INTO tasks')
-    expect(updates[0].args[6]).toBe('agent-other')
+    expect(updates[0].args[7]).toBe('agent-other')
   })
 
   it('task_list defaults an agent-bound token to its own squad and filters status', async () => {
@@ -229,8 +230,11 @@ describe('MCP task cutover tools', () => {
       null,
       null,
       null,
+      null,
       result.task.updated_at,
       'task-1',
+      '2026-07-08T00:00:00.000Z',
+      null,
     ])
     expect(events).toEqual([
       expect.objectContaining({

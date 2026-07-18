@@ -237,11 +237,11 @@ describe('Hermes IM control', () => {
     expect(reply).toBe('Added to Growth Local: "Ship local smoke".')
     expect(inserts).toHaveLength(1)
     expect(inserts[0][1]).toBe('sq-growth')
-    expect(inserts[0][2]).toBe('Ship local smoke')
-    expect(inserts[0][4]).toBe(
+    expect(inserts[0][3]).toBe('Ship local smoke')
+    expect(inserts[0][5]).toBe(
       'A task result or linked artifact provides evidence that the requested IM task is complete.',
     )
-    expect(inserts[0][4]).not.toBe('(set via task update)')
+    expect(inserts[0][5]).not.toBe('(set via task update)')
     expect(busEvents).toEqual([
       expect.objectContaining({
         type: 'task.created',

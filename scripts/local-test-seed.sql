@@ -49,6 +49,95 @@ ON CONFLICT(id) DO UPDATE SET
   budget_cap_cents = excluded.budget_cap_cents,
   budget_window = excluded.budget_window;
 
+-- Local-only Mumega portfolio showcase. Projects are operational context inside
+-- this pot; they are not production defaults or migration-owned tenant data.
+INSERT INTO projects (
+  id, slug, name, description, goal, status, parent_project_id, target_date, created_at, updated_at
+) VALUES
+  (
+    'project-mumega-products', 'mumega-products', 'Mumega Products',
+    'Products developed and operated by the Mumega pot.',
+    'Grow a coherent portfolio of independently useful products.',
+    'active', NULL, NULL, datetime('now'), datetime('now')
+  ),
+  (
+    'project-marketing-infrastructure', 'marketing-infrastructure', 'Marketing Infrastructure',
+    'Shared marketing and conversion infrastructure for the Mumega portfolio.',
+    'Make measurable marketing operations reusable across products.',
+    'active', NULL, NULL, datetime('now'), datetime('now')
+  )
+ON CONFLICT(id) DO UPDATE SET
+  slug = excluded.slug,
+  name = excluded.name,
+  description = excluded.description,
+  goal = excluded.goal,
+  status = excluded.status,
+  parent_project_id = excluded.parent_project_id,
+  target_date = excluded.target_date,
+  updated_at = excluded.updated_at;
+
+INSERT INTO projects (
+  id, slug, name, description, goal, status, parent_project_id, target_date, created_at, updated_at
+) VALUES
+  (
+    'project-inkwell', 'inkwell', 'Inkwell',
+    'Mumega documentation and knowledge product.',
+    'Turn verified work into durable, reusable knowledge.',
+    'active', 'project-mumega-products', NULL, datetime('now'), datetime('now')
+  ),
+  (
+    'project-mirror', 'mirror', 'Mirror',
+    'Mumega reflection and evidence product.',
+    'Make product state and evidence legible to collaborators.',
+    'active', 'project-mumega-products', NULL, datetime('now'), datetime('now')
+  ),
+  (
+    'project-sos', 'sos', 'SOS',
+    'A separate Mumega product represented as portfolio context only.',
+    'Coordinate its own product outcomes without becoming a Mupot dependency.',
+    'active', 'project-mumega-products', NULL, datetime('now'), datetime('now')
+  ),
+  (
+    'project-mupot', 'mupot', 'Mupot',
+    'The project-centered agentic workspace and control plane.',
+    'Run stateful human and AI squads through governed, attributable work.',
+    'active', 'project-mumega-products', NULL, datetime('now'), datetime('now')
+  ),
+  (
+    'project-mcpwp', 'mcpwp', 'MCPWP',
+    'Provider-neutral WordPress integration work.',
+    'Connect measurable website work without owning project identity.',
+    'active', 'project-marketing-infrastructure', NULL, datetime('now'), datetime('now')
+  ),
+  (
+    'project-mumcp', 'mumcp', 'MumCP',
+    'Shared MCP integration infrastructure.',
+    'Expose governed marketing capabilities through portable adapters.',
+    'active', 'project-marketing-infrastructure', NULL, datetime('now'), datetime('now')
+  )
+ON CONFLICT(id) DO UPDATE SET
+  slug = excluded.slug,
+  name = excluded.name,
+  description = excluded.description,
+  goal = excluded.goal,
+  status = excluded.status,
+  parent_project_id = excluded.parent_project_id,
+  target_date = excluded.target_date,
+  updated_at = excluded.updated_at;
+
+INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
+VALUES
+  ('project-mumega-products', 'sq-growth', 'write', datetime('now')),
+  ('project-marketing-infrastructure', 'sq-growth', 'write', datetime('now')),
+  ('project-inkwell', 'sq-growth', 'write', datetime('now')),
+  ('project-mirror', 'sq-growth', 'write', datetime('now')),
+  ('project-sos', 'sq-growth', 'write', datetime('now')),
+  ('project-mupot', 'sq-growth', 'write', datetime('now')),
+  ('project-mcpwp', 'sq-growth', 'write', datetime('now')),
+  ('project-mumcp', 'sq-growth', 'write', datetime('now'))
+ON CONFLICT(project_id, squad_id) DO UPDATE SET
+  access_level = excluded.access_level;
+
 INSERT INTO agents (
   id, squad_id, slug, name, role, model, status, created_at, okr, kpi_target,
   kpi_progress, effort, autonomy, budget_cap_cents, budget_window
@@ -162,15 +251,16 @@ VALUES
 ON CONFLICT(capability, principal_type, principal_id) DO UPDATE SET granted_by = excluded.granted_by;
 
 INSERT INTO tasks (
-  id, squad_id, title, body, status, assignee_agent_id, github_issue_url,
+  id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url,
   created_at, updated_at, result, completed_at, gate_owner, cost_micro_usd,
   workflow_instance_id, done_when
 ) VALUES
-  ('task-open-local', 'sq-growth', 'Open local smoke task', 'Verify the local dashboard can be reached.', 'open', 'agent-hermes', NULL, datetime('now','-90 minutes'), datetime('now','-80 minutes'), NULL, NULL, NULL, 12000, NULL, 'The local dashboard home returns HTTP 200.'),
-  ('task-progress-local', 'sq-growth', 'In-progress local task', 'Exercise the browser crawl against authenticated pages.', 'in_progress', 'agent-hermes', NULL, datetime('now','-70 minutes'), datetime('now','-40 minutes'), NULL, NULL, NULL, 25000, NULL, 'The browser smoke report lists every dashboard page as passed.'),
-  ('task-review-local', 'sq-growth', 'Review local approval task', 'Seeded row for the approvals and gate queue.', 'review', 'agent-growth', NULL, datetime('now','-55 minutes'), datetime('now','-20 minutes'), 'Draft result ready for approval.', NULL, 'gate:local', 9000, NULL, 'A reviewer approves or rejects this seeded local task.'),
-  ('task-done-local', 'sq-growth', 'Done local task', 'Seeded completed task for observatory history.', 'done', 'agent-hermes', NULL, datetime('now','-4 hours'), datetime('now','-3 hours'), 'Completed local baseline.', datetime('now','-3 hours'), NULL, 43000, NULL, 'The local seed data is visible in the dashboard.')
+  ('task-open-local', 'sq-growth', NULL, 'Open local smoke task', 'Verify the local dashboard can be reached.', 'open', 'agent-hermes', NULL, datetime('now','-90 minutes'), datetime('now','-80 minutes'), NULL, NULL, NULL, 12000, NULL, 'The local dashboard home returns HTTP 200.'),
+  ('task-progress-local', 'sq-growth', 'project-mupot', 'In-progress local task', 'Exercise the browser crawl against authenticated pages.', 'in_progress', 'agent-hermes', NULL, datetime('now','-70 minutes'), datetime('now','-40 minutes'), NULL, NULL, NULL, 25000, NULL, 'The browser smoke report lists every dashboard page as passed.'),
+  ('task-review-local', 'sq-growth', NULL, 'Review local approval task', 'Seeded row for the approvals and gate queue.', 'review', 'agent-growth', NULL, datetime('now','-55 minutes'), datetime('now','-20 minutes'), 'Draft result ready for approval.', NULL, 'gate:local', 9000, NULL, 'A reviewer approves or rejects this seeded local task.'),
+  ('task-done-local', 'sq-growth', 'project-mupot', 'Done local task', 'Seeded completed task for observatory history.', 'done', 'agent-hermes', NULL, datetime('now','-4 hours'), datetime('now','-3 hours'), 'Completed local baseline.', datetime('now','-3 hours'), NULL, 43000, NULL, 'The local seed data is visible in the dashboard.')
 ON CONFLICT(id) DO UPDATE SET
+  project_id = excluded.project_id,
   title = excluded.title,
   body = excluded.body,
   status = excluded.status,
@@ -226,12 +316,12 @@ VALUES
   ('meter-growth-today', 'local:agent-growth:' || date('now'), 1, 4000, datetime('now','start of day'), 12000);
 
 INSERT OR REPLACE INTO flights (
-  id, tenant, agent, goal, status, trigger_source, gate_verdict, gate_reason,
+  id, tenant, project_id, agent, goal, status, trigger_source, gate_verdict, gate_reason,
   score, budget_micro_usd, cost_micro_usd, next_run_at, created_at, started_at, ended_at, meta
 ) VALUES
-  ('flight-running-local', 'local', 'agent-hermes', 'Run local browser smoke', 'running', 'manual', 'go', '', 0.82, 1000000, 220000, NULL, unixepoch('now','-30 minutes') * 1000, unixepoch('now','-29 minutes') * 1000, NULL, '{"source":"seed"}'),
-  ('flight-sleeping-local', 'local', 'agent-growth', 'Wait for next local check', 'sleeping', 'schedule', 'go', '', 0.74, 500000, 160000, (unixepoch('now','+30 minutes') * 1000), unixepoch('now','-2 hours') * 1000, unixepoch('now','-2 hours') * 1000, NULL, '{"source":"seed"}'),
-  ('flight-landed-local', 'local', 'agent-hermes', 'Complete local seed', 'landed', 'manual', 'go', '', 0.91, 750000, 330000, NULL, unixepoch('now','-5 hours') * 1000, unixepoch('now','-5 hours') * 1000, unixepoch('now','-4 hours') * 1000, '{"source":"seed"}');
+  ('flight-running-local', 'local', 'project-mupot', 'agent-hermes', 'Run local browser smoke', 'running', 'manual', 'go', '', 0.82, 1000000, 220000, NULL, unixepoch('now','-30 minutes') * 1000, unixepoch('now','-29 minutes') * 1000, NULL, '{"schema":"mupot.flight.meta/v1","goal_id":"goal-local-smoke","objective_id":"objective-browser-smoke","squad_ids":["sq-growth"],"task_ids":["task-progress-local"],"done_when":["The browser smoke report lists every dashboard page as passed."],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}'),
+  ('flight-sleeping-local', 'local', NULL, 'agent-growth', 'Wait for next local check', 'sleeping', 'schedule', 'go', '', 0.74, 500000, 160000, (unixepoch('now','+30 minutes') * 1000), unixepoch('now','-2 hours') * 1000, unixepoch('now','-2 hours') * 1000, NULL, '{"source":"seed"}'),
+  ('flight-landed-local', 'local', 'project-mupot', 'agent-hermes', 'Complete local seed', 'landed', 'manual', 'go', '', 0.91, 750000, 330000, NULL, unixepoch('now','-5 hours') * 1000, unixepoch('now','-5 hours') * 1000, unixepoch('now','-4 hours') * 1000, '{"schema":"mupot.flight.meta/v1","goal_id":"goal-local-seed","objective_id":"objective-project-showcase","squad_ids":["sq-growth"],"task_ids":["task-done-local"],"done_when":["The local seed data is visible in the dashboard."],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}');
 
 INSERT OR REPLACE INTO journeys (id, tenant, agent, project, goal, status, gate, departed_at, eta, arrived_at, created_at, updated_at)
 VALUES

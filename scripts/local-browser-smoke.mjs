@@ -20,6 +20,8 @@ const hermesDirectiveText = `Hold all outbound automation until local browser sm
 
 const pages = [
   '/',
+  '/projects',
+  '/projects/project-mupot',
   '/send',
   '/approvals',
   '/loops',
@@ -117,11 +119,91 @@ async function runLoginWorkflow() {
   })
 }
 
+async function runProjectWorkspaceWorkflow() {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  await page.goto(`${baseUrl}/projects`, { waitUntil: 'networkidle', timeout: 20_000 })
+
+  const portfolioText = await textSnippet(page.locator('body'), 6000)
+  const portfolioLabels = [
+    'Mumega Products',
+    'Inkwell',
+    'Mirror',
+    'SOS',
+    'Mupot',
+    'Marketing Infrastructure',
+    'MCPWP',
+    'MumCP',
+  ]
+  const missingPortfolioLabels = portfolioLabels.filter((label) => !portfolioText.includes(label))
+  if (missingPortfolioLabels.length > 0) {
+    fail('project portfolio labels missing', { missingPortfolioLabels, portfolioText })
+  }
+
+  const primaryNavigation = await page.locator('#app-nav > a.nav-link .nav-label').allInnerTexts()
+  const expectedPrimaryNavigation = ['Home', 'Projects', 'Work', 'Approvals']
+  if (JSON.stringify(primaryNavigation.slice(0, 4)) !== JSON.stringify(expectedPrimaryNavigation)) {
+    fail('primary navigation order changed', { primaryNavigation, expectedPrimaryNavigation })
+  }
+
+  const mupotLink = page.locator('a[href="/projects/project-mupot"]').first()
+  if (await mupotLink.count() !== 1) {
+    fail('nested Mupot project link missing', { portfolioText })
+  }
+  await mupotLink.click()
+  await page.waitForURL(`${baseUrl}/projects/project-mupot`, { timeout: 10_000 })
+  const detailText = await textSnippet(page.locator('body'), 6000)
+  if (!detailText.includes('Mupot') || !detailText.includes('Mumega Products')) {
+    fail('Mupot project detail did not render project and parent context', { detailText })
+  }
+  for (const href of ['/send?project_id=project-mupot', '/flights?project_id=project-mupot']) {
+    if (await page.locator(`a[href="${href}"]`).count() === 0) {
+      fail('project-filtered work link missing', { href, detailText })
+    }
+  }
+  await page.screenshot({ path: path.join(artifactsDir, 'project-mupot.png'), fullPage: true })
+
+  await page.goto(`${baseUrl}/send?project_id=project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const projectSendText = await textSnippet(page.locator('body'), 3000)
+  if (!projectSendText.includes('Project context: Mupot') || await page.locator('#send-agent option').count() === 0) {
+    fail('project task context did not render an authorized picker', { projectSendText })
+  }
+  await page.goto(`${baseUrl}/flights?project_id=project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const projectFlightsText = await textSnippet(page.locator('body'), 3000)
+  if (!projectFlightsText.includes('Flights attributed to Mupot') || !projectFlightsText.includes('Run local browser smoke')) {
+    fail('project flight context did not render filtered flights', { projectFlightsText })
+  }
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto(`${baseUrl}/projects`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const horizontalOverflow = await page.evaluate(() => (
+    document.documentElement.scrollWidth - document.documentElement.clientWidth
+  ))
+  if (horizontalOverflow > 1) {
+    fail('mobile project workspace has horizontal overflow', { horizontalOverflow })
+  }
+  await page.locator('#topbar-menu-btn').click()
+  const mobileNavigation = await page.locator('#app-nav > a.nav-link .nav-label').allInnerTexts()
+  if (JSON.stringify(mobileNavigation.slice(0, 4)) !== JSON.stringify(expectedPrimaryNavigation)) {
+    fail('mobile primary navigation order changed', { mobileNavigation, expectedPrimaryNavigation })
+  }
+  await page.screenshot({ path: path.join(artifactsDir, 'projects-mobile.png'), fullPage: true })
+  await page.setViewportSize({ width: 1440, height: 1000 })
+
+  workflows.push({
+    name: 'project-centered workspace desktop and mobile',
+    status: 'passed',
+    projectId: 'project-mupot',
+    viewport: { width: 390, height: 844 },
+    horizontalOverflow,
+    primaryNavigation: expectedPrimaryNavigation,
+  })
+}
+
 async function runSendTaskWorkflow() {
   await page.addInitScript(() => {
     window.__MUPOT_SMOKE_DISABLE_DISPATCH = true
   })
-  await page.goto(`${baseUrl}/send`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.goto(`${baseUrl}/send?project_id=project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
 
   await page.locator('#send-btn').click()
   const validationText = await textSnippet(page.locator('#send-status'))
@@ -142,6 +224,7 @@ async function runSendTaskWorkflow() {
   )
   await page.locator('#send-btn').click()
   const createResponse = await createResponsePromise
+  const submittedTask = createResponse.request().postDataJSON()
   const created = await createResponse.json().catch(() => null)
   const taskId = created?.task?.id
   if (createResponse.status() !== 201 || typeof taskId !== 'string') {
@@ -149,6 +232,9 @@ async function runSendTaskWorkflow() {
   }
   if (created?.dispatched !== false) {
     fail('send smoke task unexpectedly dispatched to runtime', { created })
+  }
+  if (submittedTask.project_id !== 'project-mupot') {
+    fail('send smoke task lost project context', { submittedTask })
   }
   if (typeof created?.task?.done_when !== 'string' || created.task.done_when.length === 0) {
     fail('send task create did not preserve done_when', { created })
@@ -400,6 +486,7 @@ export async function runLocalBrowserSmoke() {
     await page.goto(`${baseUrl}/ops`, { waitUntil: 'networkidle' })
     await page.screenshot({ path: path.join(artifactsDir, 'ops-health.png'), fullPage: true })
 
+    await runProjectWorkspaceWorkflow()
     await runSendTaskWorkflow()
     await runApprovalWorkflow()
 

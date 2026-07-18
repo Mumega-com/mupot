@@ -233,6 +233,7 @@ describe('shared execution authorization', () => {
         CREATE TABLE tasks (
           id TEXT PRIMARY KEY,
           squad_id TEXT NOT NULL,
+          project_id TEXT,
           title TEXT NOT NULL,
           body TEXT NOT NULL,
           done_when TEXT NOT NULL,

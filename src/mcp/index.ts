@@ -46,7 +46,11 @@ import {
   isDoneWhenValid,
   mirrorTaskUpdate,
   patchToDoneBypassesGate,
+  persistTaskUpdate,
   stampTaskUpdate,
+  TaskProjectError,
+  TaskUpdateConflictError,
+  validateTaskProjectAttribution,
 } from '../tasks/service'
 import type { TaskStatus } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
@@ -73,8 +77,12 @@ import {
   deliverFlightLandedEvent,
   getFlight,
   landGovernedFlight,
+  listFlightProjectMismatchTaskIds,
   listFlightsForSquad,
   listIncompleteFlightTaskIds,
+  FlightProjectError,
+  validateFlightProjectTarget,
+  validateFlightTaskProjectConsistency,
   type FlightRow,
 } from '../flight/service'
 import { parseDispatchBody } from '../flight/routes'
@@ -368,6 +376,7 @@ type JsonSchema = {
 }
 
 const STRING_SCHEMA = { type: 'string' }
+const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
 const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
 const TASK_STATUSES: readonly TaskStatus[] = ['open', 'in_progress', 'blocked', 'done', 'review', 'approved', 'rejected']
@@ -408,7 +417,7 @@ function readConcepts(v: unknown): string[] | undefined | Extract<ToolOutcome, {
 
 async function loadTask(env: Env, taskId: string): Promise<Task | null> {
   const row = await env.DB.prepare(
-    `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+    `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
        FROM tasks WHERE id = ?1 LIMIT 1`,
   )
     .bind(taskId)
@@ -427,7 +436,69 @@ async function resolveTaskSquad(
     args,
     'member',
     'squad_id required unless the token is agent-bound',
+    hasWorkspaceAdmin(auth),
   )
+}
+
+function hasWorkspaceAdmin(auth: AuthContext): boolean {
+  if (auth.capabilities === undefined) return auth.role === 'owner' || auth.role === 'admin'
+  return hasCapability(auth.capabilities, 'org', null, 'admin')
+}
+
+async function canReadProjectForSquad(
+  env: Env,
+  auth: AuthContext,
+  projectId: string,
+  squadId: string,
+): Promise<boolean> {
+  if (hasWorkspaceAdmin(auth)) {
+    return (await env.DB.prepare('SELECT 1 FROM projects WHERE id = ?1')
+      .bind(projectId)
+      .first()) !== null
+  }
+  return (await env.DB.prepare(
+    `SELECT 1 FROM project_squad_access WHERE project_id = ?1 AND squad_id = ?2`,
+  ).bind(projectId, squadId).first()) !== null
+}
+
+async function hasProjectWriteForSquads(
+  env: Env,
+  projectId: string,
+  squadIds: string[],
+): Promise<boolean> {
+  const uniqueSquadIds = [...new Set(squadIds)]
+  if (uniqueSquadIds.length === 0) return false
+  const placeholders = uniqueSquadIds.map((_, index) => `?${index + 2}`).join(', ')
+  const rows = await env.DB.prepare(
+    `SELECT squad_id, access_level
+       FROM project_squad_access
+      WHERE project_id = ?1
+        AND squad_id IN (${placeholders})`,
+  ).bind(projectId, ...uniqueSquadIds).all<{ squad_id: string; access_level: string }>()
+  const writable = new Set(
+    (rows.results ?? [])
+      .filter((row) => row.access_level === 'write' || row.access_level === 'admin')
+      .map((row) => row.squad_id),
+  )
+  return uniqueSquadIds.every((squadId) => writable.has(squadId))
+}
+
+function taskProjectFailure(error: TaskProjectError): ToolOutcome {
+  if (error.code === 'project_not_found') return fail(404, error.code)
+  if (error.code === 'project_access_forbidden') {
+    return fail(403, 'forbidden', { need: 'project_write' })
+  }
+  return fail(400, error.code)
+}
+
+function flightProjectFailure(error: FlightProjectError): ToolOutcome {
+  if (error.code === 'project_not_found' || error.code === 'flight_task_not_found') {
+    return fail(404, error.code)
+  }
+  if (error.code === 'project_access_forbidden') {
+    return fail(403, 'forbidden', { need: 'project_write' })
+  }
+  return fail(400, error.code)
 }
 
 async function resolveScopedSquad(
@@ -436,6 +507,7 @@ async function resolveScopedSquad(
   args: Record<string, unknown>,
   min: Capability,
   missingDetail: string,
+  workspaceAdminBypass = false,
 ): Promise<{ ok: true; squad: Squad } | Extract<ToolOutcome, { ok: false }>> {
   let squadId = str(args.squad_id)
   if (!squadId && auth.boundAgentId) {
@@ -448,7 +520,7 @@ async function resolveScopedSquad(
   if (!squad) return failOnly(404, 'squad_not_found')
 
   const grants = auth.capabilities ?? []
-  if (!(await memberCanOnSquad(env, grants, squad.id, min))) {
+  if (!workspaceAdminBypass && !(await memberCanOnSquad(env, grants, squad.id, min))) {
     return failOnly(403, 'forbidden', { need: min, scope: 'squad' })
   }
   return { ok: true, squad }
@@ -461,11 +533,12 @@ const toolTaskCreate: ToolSpec = {
   name: 'task_create',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, title: string, done_when: string, body?: string, assignee_agent_id?: string }',
+  args: '{ squad_id: string, project_id?: string|null, title: string, done_when: string, body?: string, assignee_agent_id?: string }',
   inputSchema: {
     type: 'object',
     properties: {
       squad_id: STRING_SCHEMA,
+      project_id: NULLABLE_STRING_SCHEMA,
       title: STRING_SCHEMA,
       done_when: { ...STRING_SCHEMA, description: 'Verifiable success predicate — a checkable condition that proves the task is complete.' },
       body: STRING_SCHEMA,
@@ -503,17 +576,26 @@ const toolTaskCreate: ToolSpec = {
     const assignee = await resolveTaskAssignee(env, args.assignee_agent_id, squad.id)
     if (assignee.error) return fail(400, assignee.error)
 
-    const task = await createTask(
-      env,
-      {
-        squad_id: squad.id,
-        title: title.trim(),
-        done_when: doneWhen,
-        body,
-        assignee_agent_id: assignee.value,
-      },
-      { actor: memberActor(auth.memberId as string) },
-    )
+    const projectId = args.project_id == null ? null : str(args.project_id)
+    if (args.project_id != null && !projectId) return fail(400, 'invalid_project_id')
+    let task
+    try {
+      task = await createTask(
+        env,
+        {
+          squad_id: squad.id,
+          project_id: projectId,
+          title: title.trim(),
+          done_when: doneWhen,
+          body,
+          assignee_agent_id: assignee.value,
+        },
+        { actor: memberActor(auth.memberId as string) },
+      )
+    } catch (error) {
+      if (error instanceof TaskProjectError) return taskProjectFailure(error)
+      throw error
+    }
 
     return done({ task })
   },
@@ -526,11 +608,12 @@ const toolTaskList: ToolSpec = {
   name: 'task_list',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review"|"approved"|"rejected", assignee_agent_id?: string, limit?: number }',
+  args: '{ squad_id?: string, project_id?: string|null, status?: "open"|"in_progress"|"blocked"|"done"|"review"|"approved"|"rejected", assignee_agent_id?: string, limit?: number }',
   inputSchema: {
     type: 'object',
     properties: {
       squad_id: STRING_SCHEMA,
+      project_id: NULLABLE_STRING_SCHEMA,
       status: STRING_SCHEMA,
       assignee_agent_id: STRING_SCHEMA,
       limit: OPTIONAL_NUMBER_SCHEMA,
@@ -553,6 +636,16 @@ const toolTaskList: ToolSpec = {
 
     const baseClauses = ['squad_id = ?1']
     const baseBinds: unknown[] = [squadRes.squad.id]
+    const parsedProjectId = args.project_id == null ? undefined : str(args.project_id)
+    if (args.project_id != null && !parsedProjectId) return fail(400, 'invalid_project_id')
+    const projectId = parsedProjectId ?? undefined
+    if (projectId) {
+      if (!(await canReadProjectForSquad(env, auth, projectId, squadRes.squad.id))) {
+        return fail(404, 'project_not_found')
+      }
+      baseClauses.push(`project_id = ?${baseBinds.length + 1}`)
+      baseBinds.push(projectId)
+    }
     if (typeof assignee === 'string' && assignee.trim()) {
       baseClauses.push(`assignee_agent_id = ?${baseBinds.length + 1}`)
       baseBinds.push(assignee.trim())
@@ -578,7 +671,7 @@ const toolTaskList: ToolSpec = {
       const clauses = [...baseClauses, `status = ?${baseBinds.length + 1}`]
       const binds = [...baseBinds, status]
       const rows = await env.DB.prepare(
-        `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+        `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
            FROM tasks
           WHERE ${clauses.join(' AND ')}
           ORDER BY created_at ${isActionable ? 'ASC' : 'DESC'}
@@ -595,7 +688,7 @@ const toolTaskList: ToolSpec = {
       // compete with actionable rows for the same slots (the P1 finding's
       // core failure mode).
       const actionableRows = await env.DB.prepare(
-        `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+        `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
            FROM tasks
           WHERE ${[...baseClauses, actionableStatusInSql()].join(' AND ')}
           ORDER BY ${actionableStatusOrderSql()}, created_at ASC
@@ -608,7 +701,7 @@ const toolTaskList: ToolSpec = {
       const remaining = limit - taskRows.length
       if (remaining > 0) {
         const terminalRows = await env.DB.prepare(
-          `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+          `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
              FROM tasks
             WHERE ${[...baseClauses, terminalStatusInSql()].join(' AND ')}
             ORDER BY created_at DESC
@@ -646,7 +739,7 @@ const toolTaskBoard: ToolSpec = {
     if (typeof limit !== 'number') return limit
 
     const rows = await env.DB.prepare(
-      `SELECT id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+      `SELECT id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
          FROM tasks
         WHERE squad_id = ?1
         ORDER BY created_at DESC
@@ -681,11 +774,12 @@ const toolTaskUpdate: ToolSpec = {
   name: 'task_update',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", assignee_agent_id?: string|null, gate_owner?: string|null }',
+  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", assignee_agent_id?: string|null, gate_owner?: string|null }',
   inputSchema: {
     type: 'object',
     properties: {
       task_id: STRING_SCHEMA,
+      project_id: NULLABLE_STRING_SCHEMA,
       title: STRING_SCHEMA,
       body: STRING_SCHEMA,
       done_when: STRING_SCHEMA,
@@ -778,30 +872,29 @@ const toolTaskUpdate: ToolSpec = {
       }
       changed = true
     }
+    if (args.project_id !== undefined) {
+      const projectId = args.project_id === null ? null : str(args.project_id)
+      if (args.project_id !== null && !projectId) return fail(400, 'invalid_project_id')
+      next.project_id = projectId
+      changed = true
+    }
     if (!changed) return fail(400, 'invalid_args', 'at least one update field is required')
 
-    stampTaskUpdate(next, existing.status, new Date().toISOString())
-    next.github_issue_url = await mirrorTaskUpdate(env, next)
+    try {
+      await validateTaskProjectAttribution(env, next.project_id, existing.squad_id)
+    } catch (error) {
+      if (error instanceof TaskProjectError) return taskProjectFailure(error)
+      throw error
+    }
 
-    const res = await env.DB.prepare(
-      `UPDATE tasks
-          SET title = ?, body = ?, done_when = ?, status = ?, assignee_agent_id = ?, github_issue_url = ?, gate_owner = ?, completed_at = ?, updated_at = ?
-        WHERE id = ?`,
-    )
-      .bind(
-        next.title,
-        next.body,
-        next.done_when,
-        next.status,
-        next.assignee_agent_id,
-        next.github_issue_url,
-        next.gate_owner,
-        next.completed_at,
-        next.updated_at,
-        next.id,
-      )
-      .run()
-    if (!res.meta?.changes) return fail(409, 'task_update_race')
+    stampTaskUpdate(next, existing.status, new Date().toISOString())
+    try {
+      await persistTaskUpdate(env, existing, next)
+    } catch (error) {
+      if (error instanceof TaskUpdateConflictError) return fail(409, error.code)
+      throw error
+    }
+    next.github_issue_url = await mirrorTaskUpdate(env, next)
 
     await emitTaskEvent(env, 'task.updated', next, memberActor(auth.memberId as string))
     return done({ task: next })
@@ -908,6 +1001,7 @@ interface FlightCursorEnvelope {
   tenant: string
   member_id: string
   squad_id: string
+  project_id: string | null
   created_at: number
   flight_id: string
 }
@@ -916,6 +1010,7 @@ async function resolveFlightCursor(
   env: Env,
   auth: AuthContext,
   squadId: string,
+  projectId: string | undefined,
   value: unknown,
 ): Promise<{ createdAt: number; id: string } | null | undefined> {
   if (value === undefined || value === null) return undefined
@@ -923,20 +1018,33 @@ async function resolveFlightCursor(
   const digest = await sha256Short(value)
   const cursor = await env.SESSIONS.get<FlightCursorEnvelope>(`flight-list-cursor:${digest}`, 'json')
   const memberId = auth.memberId ?? auth.userId
-  if (!cursor || cursor.tenant !== env.TENANT_SLUG || cursor.member_id !== memberId || cursor.squad_id !== squadId) {
+  if (
+    !cursor
+    || cursor.tenant !== env.TENANT_SLUG
+    || cursor.member_id !== memberId
+    || cursor.squad_id !== squadId
+    || cursor.project_id !== (projectId ?? null)
+  ) {
     return null
   }
   if (!Number.isSafeInteger(cursor.created_at) || cursor.created_at < 0 || !cursor.flight_id) return null
   return { createdAt: cursor.created_at, id: cursor.flight_id }
 }
 
-async function issueFlightCursor(env: Env, auth: AuthContext, squadId: string, flight: FlightRow): Promise<string> {
+async function issueFlightCursor(
+  env: Env,
+  auth: AuthContext,
+  squadId: string,
+  projectId: string | undefined,
+  flight: FlightRow,
+): Promise<string> {
   const token = crypto.randomUUID()
   const digest = await sha256Short(token)
   const cursor: FlightCursorEnvelope = {
     tenant: env.TENANT_SLUG,
     member_id: auth.memberId ?? auth.userId,
     squad_id: squadId,
+    project_id: projectId ?? null,
     created_at: flight.created_at,
     flight_id: flight.id,
   }
@@ -951,9 +1059,11 @@ function memberCanAccessFlight(
   minimum: Capability,
 ): boolean {
   const grants = auth.capabilities ?? []
+  const workspaceAdmin = hasWorkspaceAdmin(auth)
   for (const squadId of meta.squad_ids) {
     const squad = squadCache.get(squadId)
-    if (!squad || !hasCapability(grants, 'squad', squad.id, minimum, squad.department_id)) return false
+    if (!squad) return false
+    if (!workspaceAdmin && !hasCapability(grants, 'squad', squad.id, minimum, squad.department_id)) return false
   }
   return true
 }
@@ -966,11 +1076,12 @@ const toolFlightDispatch: ToolSpec = {
   name: 'flight_dispatch',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, goal: string, meta_json: string, signals_json: string, budget_micro_usd?: number }',
+  args: '{ squad_id: string, project_id?: string|null, goal: string, meta_json: string, signals_json: string, budget_micro_usd?: number }',
   inputSchema: {
     type: 'object',
     properties: {
       squad_id: STRING_SCHEMA,
+      project_id: NULLABLE_STRING_SCHEMA,
       goal: STRING_SCHEMA,
       meta_json: STRING_SCHEMA,
       signals_json: STRING_SCHEMA,
@@ -995,6 +1106,7 @@ const toolFlightDispatch: ToolSpec = {
     const squad = await loadSquad(env, squadId)
     if (!squad) return fail(403, 'forbidden')
     const grants = auth.capabilities ?? []
+    const workspaceAdmin = hasWorkspaceAdmin(auth)
 
     const meta = parseFlightMetaV1(parseJsonArg(args.meta_json))
     if (!meta || !meta.squad_ids.includes(squad.id)) return fail(400, 'invalid_flight_meta')
@@ -1003,13 +1115,33 @@ const toolFlightDispatch: ToolSpec = {
     if (referencedSquads.length !== meta.squad_ids.length) return fail(403, 'forbidden')
     const requiredCapability: Capability = (requestedBudget as number) > 0 ? 'lead' : 'member'
     for (const referencedSquad of referencedSquads) {
-      if (!hasCapability(grants, 'squad', referencedSquad.id, requiredCapability, referencedSquad.department_id)) {
+      if (!workspaceAdmin && !hasCapability(grants, 'squad', referencedSquad.id, requiredCapability, referencedSquad.department_id)) {
         return fail(
           403,
           (requestedBudget as number) > 0 ? 'flight_budget_forbidden' : 'forbidden',
           { need: requiredCapability, scope: 'squad', squad_id: referencedSquad.id },
         )
       }
+    }
+
+    const projectId = args.project_id == null ? undefined : str(args.project_id)
+    if (args.project_id != null && (!projectId || projectId.length > 200)) {
+      return fail(400, 'invalid_project_id')
+    }
+    try {
+      await validateFlightProjectTarget(env, projectId)
+    } catch (error) {
+      if (error instanceof FlightProjectError) return flightProjectFailure(error)
+      throw error
+    }
+    if (projectId && !workspaceAdmin && !(await hasProjectWriteForSquads(env, projectId, meta.squad_ids))) {
+      return fail(403, 'forbidden', { need: 'project_write', scope: 'project squads' })
+    }
+    try {
+      await validateFlightTaskProjectConsistency(env, projectId, meta)
+    } catch (error) {
+      if (error instanceof FlightProjectError) return flightProjectFailure(error)
+      throw error
     }
 
     let budgetCeilingMicroUsd = 0
@@ -1023,7 +1155,7 @@ const toolFlightDispatch: ToolSpec = {
         return fail(409, 'flight_budget_exceeds_cap', { cap_micro_usd: budgetCeilingMicroUsd })
       }
     }
-    const references = await validateFlightMetaReferences(env, meta)
+    const references = await validateFlightMetaReferences(env, meta, projectId)
     if (!references.ok) {
       const error = references.error === 'flight_task_scope_mismatch'
         ? 'flight_task_not_found'
@@ -1034,6 +1166,7 @@ const toolFlightDispatch: ToolSpec = {
     const parsed = parseDispatchBody({
       agent: auth.boundAgentId,
       goal,
+      project_id: projectId,
       trigger_source: 'api',
       budget_micro_usd: requestedBudget,
       meta,
@@ -1043,7 +1176,13 @@ const toolFlightDispatch: ToolSpec = {
     parsed.value.signals.budgetEstimateMicroUsd = requestedBudget as number
     parsed.value.signals.budgetRemainingMicroUsd = budgetCeilingMicroUsd
 
-    const preflight = await dispatchFlight(env, parsed.value.flight, parsed.value.signals, parsed.value.opts)
+    let preflight
+    try {
+      preflight = await dispatchFlight(env, parsed.value.flight, parsed.value.signals, parsed.value.opts)
+    } catch (error) {
+      if (!(error instanceof FlightProjectError)) throw error
+      return flightProjectFailure(error)
+    }
     const flight = await getFlight(env, preflight.id)
     if (!flight) return fail(500, 'flight_record_missing')
     return done({ flight: flightWithParsedMeta(flight, meta), preflight })
@@ -1135,6 +1274,10 @@ const toolFlightLand: ToolSpec = {
       actor: { kind: 'agent', id: auth.boundAgentId },
     })
     if (!transitioned) {
+      const projectMismatchTaskIds = await listFlightProjectMismatchTaskIds(env, flight.project_id, meta.task_ids)
+      if (projectMismatchTaskIds.length > 0) {
+        return fail(409, 'flight_task_project_conflict', { task_ids: projectMismatchTaskIds })
+      }
       const incompleteTaskIds = await listIncompleteFlightTaskIds(env, meta.task_ids)
       if (incompleteTaskIds.length > 0) {
         return fail(409, 'flight_tasks_incomplete', { task_ids: incompleteTaskIds })
@@ -1152,10 +1295,10 @@ const toolFlightList: ToolSpec = {
   name: 'flight_list',
   scope: 'squad',
   min: 'observer',
-  args: '{ squad_id: string, limit?: number, cursor?: string }',
+  args: '{ squad_id: string, project_id?: string|null, limit?: number, cursor?: string }',
   inputSchema: {
     type: 'object',
-    properties: { squad_id: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA, cursor: STRING_SCHEMA },
+    properties: { squad_id: STRING_SCHEMA, project_id: NULLABLE_STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA, cursor: STRING_SCHEMA },
     required: ['squad_id'],
     additionalProperties: false,
   },
@@ -1165,12 +1308,19 @@ const toolFlightList: ToolSpec = {
     const squad = await loadSquad(env, squadId)
     if (!squad) return fail(403, 'forbidden')
     const grants = auth.capabilities ?? []
-    if (!(await memberCanOnSquad(env, grants, squad.id, 'observer'))) {
+    const workspaceAdmin = hasWorkspaceAdmin(auth)
+    if (!workspaceAdmin && !(await memberCanOnSquad(env, grants, squad.id, 'observer'))) {
       return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
+    }
+    const parsedProjectId = args.project_id == null ? undefined : str(args.project_id)
+    if (args.project_id != null && !parsedProjectId) return fail(400, 'invalid_project_id')
+    const projectId = parsedProjectId ?? undefined
+    if (projectId && !(await canReadProjectForSquad(env, auth, projectId, squad.id))) {
+      return fail(404, 'project_not_found')
     }
     const limit = readLimit(args.limit, 100, 500)
     if (typeof limit !== 'number') return limit
-    let before = await resolveFlightCursor(env, auth, squad.id, args.cursor)
+    let before = await resolveFlightCursor(env, auth, squad.id, projectId, args.cursor)
     if (before === null) return fail(400, 'invalid_flight_cursor')
 
     const visible: Array<Omit<FlightRow, 'meta'> & { meta: FlightMetaV1 }> = []
@@ -1181,7 +1331,7 @@ const toolFlightList: ToolSpec = {
     let hasMore = false
 
     scan: while (visible.length < limit && pages < 10) {
-      const page = await listFlightsForSquad(env, squad.id, pageSize, before)
+      const page = await listFlightsForSquad(env, squad.id, pageSize, before, projectId)
       pages += 1
       if (page.length === 0) break
       const candidates = page.map((flight) => ({ flight, meta: parseFlightMetaV1(parseJsonArg(flight.meta)) }))
@@ -1215,7 +1365,7 @@ const toolFlightList: ToolSpec = {
     return done({
       squad_id: squad.id,
       flights: visible,
-      cursor: hasMore && lastScanned ? await issueFlightCursor(env, auth, squad.id, lastScanned) : null,
+      cursor: hasMore && lastScanned ? await issueFlightCursor(env, auth, squad.id, projectId, lastScanned) : null,
       has_more: hasMore,
     })
   },
@@ -2228,7 +2378,7 @@ export async function invokeTool(
   // can no longer fail-open if its handler omits the inline scope check: a caller
   // holding `min` on NO scope is rejected at the chokepoint. The handler still runs
   // its precise per-scope check (the floor is scope-agnostic — see capability.ts).
-  if (spec.min !== 'authenticated' && !holdsCapabilityFloor(auth, spec.min)) {
+  if (spec.min !== 'authenticated' && !hasWorkspaceAdmin(auth) && !holdsCapabilityFloor(auth, spec.min)) {
     return { ...fail(403, 'forbidden', { need: spec.min }), tool: spec.name }
   }
 

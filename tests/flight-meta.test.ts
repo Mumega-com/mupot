@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import * as metaModule from '../src/flight/meta'
+import { canonicalFlightMetaSql } from '../src/flight/meta-sql'
 import type { Env } from '../src/types'
+import { createSqliteD1 } from './helpers/sqlite-d1'
 
 const meta = {
   schema: 'mupot.flight.meta/v1' as const,
@@ -49,6 +51,43 @@ const validate = (metaModule as Record<string, unknown>).validateFlightMetaRefer
   | ((env: Env, value: typeof meta) => Promise<{ ok: boolean; error?: string }>)
   | undefined
 
+describe('parseFlightMetaV1', () => {
+  it('applies field limits in UTF-8 bytes', () => {
+    const persianCharacter = '\u06a9'
+    expect(metaModule.parseFlightMetaV1({ ...meta, goal_id: persianCharacter.repeat(100) })).not.toBeNull()
+    expect(metaModule.parseFlightMetaV1({ ...meta, goal_id: persianCharacter.repeat(101) })).toBeNull()
+  })
+
+  it('applies the canonical envelope limit in UTF-8 bytes', () => {
+    const persianCharacter = '\u06a9'
+    expect(metaModule.parseFlightMetaV1({
+      ...meta,
+      artifact_refs: Array.from({ length: 9 }, () => persianCharacter.repeat(1000)),
+    })).toBeNull()
+  })
+
+  it('matches the SQL predicate at multilingual byte boundaries', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      sqlite.exec('CREATE TABLE flights (meta TEXT NOT NULL)')
+      const insert = sqlite.prepare('INSERT INTO flights (meta) VALUES (?)')
+      const accepted = { ...meta, goal_id: '\u06a9'.repeat(100) }
+      const rejected = { ...meta, goal_id: '\u06a9'.repeat(101) }
+      for (const [value, expected] of [[accepted, true], [rejected, false]] as const) {
+        sqlite.exec('DELETE FROM flights')
+        insert.run(JSON.stringify(value))
+        const row = sqlite.prepare(`
+          SELECT COUNT(*) AS count FROM flights f WHERE 1 = 1 ${canonicalFlightMetaSql('f')}
+        `).get() as { count: number }
+        expect(metaModule.parseFlightMetaV1(value) !== null).toBe(expected)
+        expect(row.count === 1).toBe(expected)
+      }
+    } finally {
+      close()
+    }
+  })
+})
+
 describe('validateFlightMetaReferences', () => {
   it('is part of the flight domain contract', () => {
     expect(typeof validate).toBe('function')
@@ -70,9 +109,10 @@ describe('validateFlightMetaReferences', () => {
     await expect(validate(makeEnv({ taskSquad: 'squad-other' }), meta)).resolves.toMatchObject({ ok: false, error: 'flight_task_scope_mismatch' })
   })
 
-  it('validates the maximum task set with at most two D1 reads', async () => {
+  it('validates the maximum task set without exceeding the D1 bind budget', async () => {
     if (!validate) return
     let reads = 0
+    const bindCounts: number[] = []
     const env = {
       TENANT_SLUG: 'test',
       DB: {
@@ -80,6 +120,8 @@ describe('validateFlightMetaReferences', () => {
           reads += 1
           return {
             bind(...ids: string[]) {
+              bindCounts.push(ids.length)
+              if (ids.length > 100) throw new Error(`D1 bind budget exceeded: ${ids.length}`)
               return {
                 async first() {
                   const id = ids[0]
@@ -99,6 +141,7 @@ describe('validateFlightMetaReferences', () => {
     const large = { ...meta, task_ids: Array.from({ length: 200 }, (_, index) => `task-${index}`) }
 
     await expect(validate(env, large)).resolves.toEqual({ ok: true })
-    expect(reads).toBeLessThanOrEqual(2)
+    expect(reads).toBe(4)
+    expect(Math.max(...bindCounts)).toBeLessThanOrEqual(90)
   })
 })

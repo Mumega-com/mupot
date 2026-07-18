@@ -31,6 +31,7 @@ import type {
   Squad,
   Agent,
   Task,
+  Project,
   Member,
   CapabilityGrant,
   Capability,
@@ -104,6 +105,15 @@ import type { OpsHealthData, HealthTone } from './health'
 import { loadAllAgents, loadSquadOptions } from './agents-admin'
 import type { AgentAdminRow, SquadOption } from './agents-admin'
 import { formatBurn, formatUsd } from '../agents/cost'
+import {
+  loadProjectDetail,
+  loadProjectFlights,
+  loadProjectWorkContext,
+  loadProjectsPage,
+  projectDetailBody,
+  projectNotFoundBody,
+  projectsPageBody,
+} from './projects'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
@@ -245,11 +255,29 @@ dashboardApp.get('/', async (c) => {
   )
 })
 
+dashboardApp.get('/projects', async (c) => {
+  const view = await loadProjectsPage(c.env, c.get('auth'))
+  return c.html(shell(c.env, 'Projects', projectsPageBody(view)))
+})
+
+dashboardApp.get('/projects/:id', async (c) => {
+  const view = await loadProjectDetail(c.env, c.get('auth'), c.req.param('id'))
+  if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  return c.html(shell(c.env, view.project.name, projectDetailBody(view)))
+})
+
 // GET /send — the "Send a task" page. The last mile: a person writes a task,
 // picks one of their agents, submits, and watches it get done. The form POSTs to
 // the RBAC-gated /api/tasks (dispatch:true) and polls GET /api/tasks/:id. All auth
 // + CSRF + no-store/Referrer-Policy come from the dashboard middleware above.
 dashboardApp.get('/send', async (c) => {
+  const projectId = c.req.query('project_id')
+  if (projectId !== undefined) {
+    const context = await loadProjectWorkContext(c.env, c.get('auth'), projectId)
+    if (!context) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+    const agents = await loadActiveAgentsWithSquad(c.env, context.taskableSquadIds)
+    return c.html(shell(c.env, 'Send a task', sendPageBody(agents, context.project)))
+  }
   const agents = await loadActiveAgentsWithSquad(c.env)
   return c.html(shell(c.env, 'Send a task', sendPageBody(agents)))
 })
@@ -636,9 +664,18 @@ dashboardApp.post('/brain/loops/:id/control', async (c) => {
 // ── flights (the flight board — what is flying/sleeping + each flight's cost) ─
 // GET /flights — read the flights table (#61). Read-only; control stays on Fleet.
 dashboardApp.get('/flights', async (c) => {
-  const rows = await listFlights(c.env)
-  const cards = buildBoard(rows, Date.now())
-  return c.html(shell(c.env, 'Flights', flightsBody(cards)))
+  const projectId = c.req.query('project_id')
+  const context = projectId === undefined
+    ? null
+    : await loadProjectWorkContext(c.env, c.get('auth'), projectId)
+  if (projectId !== undefined && !context) {
+    return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  }
+  const result = context
+    ? await loadProjectFlights(c.env, context)
+    : { rows: await listFlights(c.env), scanLimited: false }
+  const cards = buildBoard(result.rows, Date.now())
+  return c.html(shell(c.env, 'Flights', flightsBody(cards, context?.project, result.scanLimited)))
 })
 
 // ── radar (visual fleet + squad awareness — #21 slice 1, VIEW LAYER ONLY) ────
@@ -925,7 +962,7 @@ dashboardApp.get('/squads/:id', async (c) => {
       .bind(squadId)
       .all<Agent>(),
     c.env.DB.prepare(
-      `SELECT id, squad_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
+      `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, created_at, updated_at
          FROM tasks WHERE squad_id = ? ORDER BY updated_at DESC`,
     )
       .bind(squadId)
@@ -1973,13 +2010,20 @@ interface PickerAgent {
   squad_id: string
   squad_name: string
 }
-async function loadActiveAgentsWithSquad(env: Env): Promise<PickerAgent[]> {
-  const rows = await env.DB.prepare(
+async function loadActiveAgentsWithSquad(env: Env, squadIds?: string[]): Promise<PickerAgent[]> {
+  if (squadIds?.length === 0) return []
+  const filter = squadIds === undefined
+    ? ''
+    : ' AND a.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))'
+  const statement = env.DB.prepare(
     `SELECT a.id AS id, a.name AS name, a.role AS role, a.squad_id AS squad_id, s.name AS squad_name
        FROM agents a JOIN squads s ON s.id = a.squad_id
-      WHERE a.status = 'active'
+      WHERE a.status = 'active'${filter}
       ORDER BY s.name ASC, a.name ASC`,
-  ).all<PickerAgent>()
+  )
+  const rows = squadIds === undefined
+    ? await statement.all<PickerAgent>()
+    : await statement.bind(JSON.stringify([...new Set(squadIds)])).all<PickerAgent>()
   return rows.results ?? []
 }
 
@@ -2948,6 +2992,25 @@ function shell(
             <span class="nav-label">Home</span>
           </a>
 
+          <!-- Projects -->
+          <a class="nav-link" href="/projects">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M3.5 5.5h5l1.5 2h6.5v8.5h-13z"/><path d="M3.5 5.5V4h5l1.5 1.5"/></svg>
+            <span class="nav-label">Projects</span>
+          </a>
+
+          <!-- Work -->
+          <a class="nav-link" href="/send">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="5.5" cy="5.5" r="2"/><circle cx="5.5" cy="14.5" r="2"/><circle cx="14.5" cy="10" r="2"/><path d="M5.5 7.5v5M7.4 5.9 12.7 9.2M7.3 13.9 12.7 10.7"/></svg>
+            <span class="nav-label">Work</span>
+          </a>
+
+          <!-- Approvals (with live badge) -->
+          <a class="nav-link" href="/approvals" id="nav-approvals">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3 4.5 5.2v4.3c0 3.4 2.3 5.8 5.5 7 3.2-1.2 5.5-3.6 5.5-7V5.2z"/><path d="M7.6 10l1.7 1.7 3.1-3.4"/></svg>
+            <span class="nav-label">Approvals</span>
+            <span class="nav-badge" id="approvals-badge" style="display:none;">0</span>
+          </a>
+
           <!-- Organization (collapsible) -->
           <div class="nav-section">
             <button class="nav-section-toggle" data-section="org" onclick="navToggle('org')">
@@ -2962,11 +3025,11 @@ function shell(
             </div>
           </div>
 
-          <!-- Work (collapsible) -->
+          <!-- Work views (collapsible) -->
           <div class="nav-section">
             <button class="nav-section-toggle" data-section="work" onclick="navToggle('work')">
               <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="5.5" cy="5.5" r="2"/><circle cx="5.5" cy="14.5" r="2"/><circle cx="14.5" cy="10" r="2"/><path d="M5.5 7.5v5M7.4 5.9 12.7 9.2M7.3 13.9 12.7 10.7"/></svg>
-              <span class="nav-label">Work</span>
+              <span class="nav-label">Work views</span>
               <span class="nav-chevron" id="chev-work"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M6 4l4 4-4 4"/></svg></span>
             </button>
             <div class="nav-children" id="children-work">
@@ -2975,13 +3038,6 @@ function shell(
               <a class="nav-child" href="/verifications">Verifications</a>
             </div>
           </div>
-
-          <!-- Approvals (with live badge) -->
-          <a class="nav-link" href="/approvals" id="nav-approvals">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3 4.5 5.2v4.3c0 3.4 2.3 5.8 5.5 7 3.2-1.2 5.5-3.6 5.5-7V5.2z"/><path d="M7.6 10l1.7 1.7 3.1-3.4"/></svg>
-            <span class="nav-label">Approvals</span>
-            <span class="nav-badge" id="approvals-badge" style="display:none;">0</span>
-          </a>
 
           <!-- Fleet -->
           <a class="nav-link" href="/fleet">
@@ -3926,7 +3982,7 @@ function agentConsoleBody(agent: Agent, squad: Squad | null, canWake: boolean) {
 // squad. The option VALUE carries "agentId|squadId" so the client can post both
 // without a second lookup. The client posts to /api/tasks (dispatch:true) and then
 // polls /api/tasks/:id every 2s (cap 120s), rendering sent → working → done.
-function sendPageBody(agents: PickerAgent[]) {
+function sendPageBody(agents: PickerAgent[], project?: Project) {
   const hasAgents = agents.length > 0
   const options = agents
     .map(
@@ -3957,8 +4013,11 @@ function sendPageBody(agents: PickerAgent[]) {
         <a href="/">squad board</a> first, then come back to send it a task.</p></div>`
 
   return html`
-    <p class="crumbs"><a href="/">Overview</a> / Send a task</p>
+    <p class="crumbs"><a href="/">Overview</a> / ${project ? html`<a href="/projects/${encodeURIComponent(project.id)}">${project.name}</a> / ` : ''}Send a task</p>
     <h1>Send a task</h1>
+    ${project ? html`<p class="empty" style="margin-top:0;max-width:640px">
+      Project context: <strong>${project.name}</strong>. Only writable project squads and their active agents are available.
+    </p>` : ''}
     <p class="empty" style="margin-top:0;max-width:640px">
       Write what you need in plain language and pick one of your agents. It does the
       work and the result appears below — no jargon, no setup.</p>
@@ -3977,15 +4036,16 @@ function sendPageBody(agents: PickerAgent[]) {
       .result-box .done-meta { color: var(--dim); font-size: 12px; margin-bottom: 10px; }
     </style>
     ${form}
-    ${hasAgents ? sendScript() : html``}`
+    ${hasAgents ? sendScript(project?.id) : html``}`
 }
 
-function sendScript() {
+function sendScript(projectId?: string) {
   // Vanilla, same-origin, credentialed. Title = first ~60 chars of the body. Polls
   // GET /api/tasks/:id every 2s up to 120s. CSRF + no-store handled by middleware.
   return raw(`
     <script>
       (function () {
+        var projectId = ${JSON.stringify(projectId ?? null).replace(/</g, '\\u003c')};
         var btn = document.getElementById('send-btn');
         var bodyEl = document.getElementById('send-body');
         var agentEl = document.getElementById('send-agent');
@@ -4059,18 +4119,20 @@ function sendScript() {
           status.textContent = 'Sending…';
           var title = text.slice(0, 60);
           try {
+            var payload = {
+              squad_id: squadId,
+              title: title,
+              done_when: 'The task result explains the completed work and names any follow-up needed.',
+              body: text,
+              assignee_agent_id: agentId,
+              dispatch: shouldDispatch()
+            };
+            if (projectId) payload.project_id = projectId;
             var res = await fetch('/api/tasks', {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
               credentials: 'same-origin',
-              body: JSON.stringify({
-                squad_id: squadId,
-                title: title,
-                done_when: 'The task result explains the completed work and names any follow-up needed.',
-                body: text,
-                assignee_agent_id: agentId,
-                dispatch: shouldDispatch()
-              })
+              body: JSON.stringify(payload)
             });
             if (res.status === 403) { status.textContent = 'You do not have permission to task that agent.'; return; }
             if (!res.ok) {
@@ -4259,7 +4321,7 @@ function approvalsScript() {
 // Pot-native flock: agents that checked in to THIS pot (no company bus). Read-only
 // inventory — who has access + who is in now. Control (wake/pause) is the bus path;
 // pot-native control is a later objective (#46).
-function flightsBody(cards: FlightCard[]) {
+function flightsBody(cards: FlightCard[], project?: Project, scanLimited = false) {
   const phaseColor = (p: string) =>
     p === 'flying' ? 'var(--ok)' : p === 'sleeping' ? 'var(--warn)' : p === 'holding' || p === 'preflight' ? 'var(--accent)' : p === 'failed' || p === 'held' ? '#e5534b' : 'var(--dim)'
   const arrow = (t: string | null) => (t === 'up' ? '▲' : t === 'down' ? '▼' : t === 'flat' ? '▬' : '')
@@ -4284,15 +4346,20 @@ function flightsBody(cards: FlightCard[]) {
        it appears here when a flight is created (preflight), and shows its accounted cost on land.</p>`
   return html`
     ${pageHeader({
-      crumbs: 'Overview / Flights',
+      crumbs: project ? `Projects / ${project.name} / Flights` : 'Overview / Flights',
       title: 'Flights',
       sub:
-        'Each flight is one bounded agent run toward a goal. Score is readiness at preflight / coherence on land, with its trend vs that agent’s last flight. Cost is metered (the black box). Read-only — control lives on Fleet.',
+        project
+          ? `Flights attributed to ${project.name}. Score, cost, and status remain read-only; control lives on Fleet.`
+          : 'Each flight is one bounded agent run toward a goal. Score is readiness at preflight / coherence on land, with its trend vs that agent’s last flight. Cost is metered (the black box). Read-only — control lives on Fleet.',
     })}
     ${kpiRow([
       statCard({ label: 'Flying', value: String(flying), subTone: flying > 0 ? 'ok' : 'dim' }),
       statCard({ label: 'Sleeping', value: String(sleeping), subTone: 'dim' }),
     ])}
+    ${scanLimited ? html`<div class="card" role="status" style="border-color:var(--warn);margin-bottom:12px">
+      Flight history is partial because the project scan safety limit was reached.
+    </div>` : ''}
     <style>
       .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
       .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;

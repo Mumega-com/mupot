@@ -27,11 +27,11 @@ function makeEnv(tenant = 'digid'): { env: Env; rows: Map<string, FlightRow> } {
             return {
               async run() {
                 if (sql.includes('INSERT INTO flights')) {
-                  const [id, t, agent, goal, trig, budget, meta] = a as [
-                    string, string, string, string, string, number | null, string,
+                  const [id, t, projectId, agent, goal, trig, budget, meta] = a as [
+                    string, string, string | null, string, string, string, number | null, string,
                   ]
                   rows.set(id, {
-                    id, tenant: t, agent, goal, status: 'preflight', trigger_source: trig as FlightRow['trigger_source'],
+                    id, tenant: t, project_id: projectId, agent, goal, status: 'preflight', trigger_source: trig as FlightRow['trigger_source'],
                     gate_verdict: null, gate_reason: '', score: null, budget_micro_usd: budget,
                     cost_micro_usd: 0, next_run_at: null, created_at: rows.size + 1, started_at: null,
                     ended_at: null, meta,
