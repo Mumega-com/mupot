@@ -104,6 +104,15 @@ On startup, each connected runtime:
 
 The Hermes development agent and Codex communicate directly through Mupot inbox messages and shared tasks. A local Codex CLI runtime may poll the inbox and activate work while the Mac is online. The desktop conversation itself is not treated as an always-on daemon.
 
+### Activation Modes
+
+The Hermes development identity supports two activation modes without changing its Mupot authority:
+
+1. **On demand:** a signed-in desktop Hermes session reads its Mupot inbox and project tasks when the operator requests it. MCP tools are discovered when the desktop session starts, so the session must be restarted after the connection is installed.
+2. **Supervised background activation:** a macOS LaunchAgent runs a narrow subscriber that peeks one durable inbox item, persists it before execution, invokes the welded Hermes profile, persists the response, sends a correlated reply, and consumes the inbox item only after the reply is durable.
+
+The subscriber is an activation adapter, not a second source of project state. It rejects unauthorized senders, suppresses acknowledgement loops, preserves `request_id` and `in_reply_to`, and tags the invoked Hermes session with its source. It does not inject messages into an existing desktop conversation. Mupot tasks, messages, flights, and receipts remain authoritative whether Hermes is activated on demand or in the background.
+
 ## Project-Link Adapter
 
 The cross-pot adapter is an addon, not microkernel code. Its responsibilities are:
