@@ -12,8 +12,9 @@
 import type { AuthContext, Env } from '../types'
 import { capabilityRank, resolveCapabilities } from '../auth/capability'
 import { resolveAgentRef, resolveSquadRef } from '../org/resolve'
-import { createAgent, isAgentStatus, setAgentStatus } from '../org/service'
+import { createAgent, isAgentStatus } from '../org/service'
 import { mintAgentBoundToken, revokeMemberToken } from '../members/service'
+import { assertBatchWritten } from '../lib/receipt'
 import { type ToolSpec, done, fail, str } from './index'
 
 export const AGENT_MANAGER_SURFACE = 'agents:manage'
@@ -22,6 +23,8 @@ export const AGENT_MANAGER_CREDENTIAL_SURFACE = 'agents:credentials'
 type AgentManagerAuditAction = 'create' | 'set_status' | 'mint_token' | 'revoke_token'
 
 type D1Statement = ReturnType<Env['DB']['prepare']>
+
+const NON_PRIVILEGED_AGENT_SQL = "LOWER(TRIM(role)) NOT IN ('admin', 'administrator', 'owner')"
 
 function managerAuditStatement(
   auth: AuthContext,
@@ -355,15 +358,23 @@ const toolAgentManagerSetStatus: ToolSpec = {
     }
 
     const requestId = crypto.randomUUID()
-    const updated = await setAgentStatus(env, resolved.value.id, args.status, [
-      managerAuditStatement(auth, env, requestId, resolved.value.squad_id, 'set_status', { agentId: resolved.value.id }, {
-        status: args.status,
-      }, {
-        sql: 'SELECT 1 FROM agents WHERE id = ? AND squad_id = ? AND status = ?',
-        binds: [resolved.value.id, resolved.value.squad_id, args.status],
-      }),
-    ])
-    if (!updated.ok) return fail(404, 'agent_not_found')
+    const update = env.DB.prepare(
+      `UPDATE agents SET status = ?1
+        WHERE id = ?2
+          AND squad_id = ?3
+          AND ${NON_PRIVILEGED_AGENT_SQL}`,
+    ).bind(args.status, resolved.value.id, resolved.value.squad_id)
+    const audit = managerAuditStatement(auth, env, requestId, resolved.value.squad_id, 'set_status', { agentId: resolved.value.id }, {
+      status: args.status,
+    }, {
+      sql: `SELECT 1 FROM agents
+             WHERE id = ? AND squad_id = ? AND status = ?
+               AND ${NON_PRIVILEGED_AGENT_SQL}`,
+      binds: [resolved.value.id, resolved.value.squad_id, args.status],
+    })
+    const writes = await env.DB.batch([update, audit])
+    if (!writes[0]?.meta?.changes) return fail(403, 'privileged_agent_forbidden')
+    assertBatchWritten(writes, 'manager_set_agent_status', 1)
 
     return done({
       agent: {

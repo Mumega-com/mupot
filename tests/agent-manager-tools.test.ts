@@ -75,6 +75,8 @@ function managerEnv(
     surfaceGrant?: boolean
     credentialSurfaceGrant?: boolean
     failAudit?: boolean
+    promoteBeforeMutation?: boolean
+    privilegedAgentRole?: string
     mintReplay?: { agent_id: string; token_id: string; detail: string; recorded_at: string }
   } = {},
   captured: Captured[] = [],
@@ -87,7 +89,7 @@ function managerEnv(
       squad_id: SQUAD_ID,
       slug: 'admin',
       name: 'Main Hermes Manager',
-      role: 'admin',
+      role: options.privilegedAgentRole ?? 'admin',
       model: 'gpt-5.6-sol',
       status: 'active',
       created_at: '2026-07-16T00:00:00Z',
@@ -191,7 +193,15 @@ function managerEnv(
           throw new Error('simulated audit persistence failure')
         }
         for (const statement of statements) captured.push({ sql: statement.sql, args: statement.args })
-        return statements.map(() => ({ meta: { changes: 1 } }))
+        return statements.map((statement) => {
+          const guardedStatusWrite = /^\s*UPDATE agents SET status/.test(statement.sql)
+            && statement.sql.includes('squad_id')
+            && statement.sql.includes("LOWER(TRIM(role)) NOT IN ('admin', 'administrator', 'owner')")
+          const guardedAudit = /^\s*INSERT INTO agent_manager_audit/.test(statement.sql)
+            && statement.sql.includes("LOWER(TRIM(role)) NOT IN ('admin', 'administrator', 'owner')")
+          const changes = options.promoteBeforeMutation && (guardedStatusWrite || guardedAudit) ? 0 : 1
+          return { meta: { changes } }
+        })
       },
     },
   } as unknown as Env
@@ -409,13 +419,15 @@ describe('squad agent manager', () => {
       tool: 'agent_manager_set_status',
       result: { agent: { id: 'agent-worker', squad_id: SQUAD_ID, status: 'paused' } },
     })
-    expect(captured).toContainEqual({
-      sql: 'UPDATE agents SET status = ? WHERE id = ?',
-      args: ['paused', 'agent-worker'],
-    })
+    const statusUpdate = captured.find(({ sql }) => /^\s*UPDATE agents SET status/.test(sql))
+    expect(statusUpdate?.args).toEqual(['paused', 'agent-worker', SQUAD_ID])
+    expect(statusUpdate?.sql).toContain('squad_id = ?3')
+    expect(statusUpdate?.sql).toContain("LOWER(TRIM(role)) NOT IN ('admin', 'administrator', 'owner')")
     const statusAudit = captured.find(({ sql }) => /^\s*INSERT INTO agent_manager_audit/.test(sql))
     expect(statusAudit?.args).toContain('set_status')
-    expect(statusAudit?.sql).toContain('WHERE EXISTS (SELECT 1 FROM agents WHERE id = ? AND squad_id = ? AND status = ?)')
+    expect(statusAudit?.sql).toContain('WHERE EXISTS (SELECT 1 FROM agents')
+    expect(statusAudit?.sql).toContain('WHERE id = ? AND squad_id = ? AND status = ?')
+    expect(statusAudit?.sql).toContain("LOWER(TRIM(role)) NOT IN ('admin', 'administrator', 'owner')")
     expect(statusAudit?.args.slice(-3)).toEqual(['agent-worker', SQUAD_ID, 'paused'])
   })
 
@@ -431,16 +443,36 @@ describe('squad agent manager', () => {
     expect(outcome).toMatchObject({ ok: false, status: 409, error: 'self_management_forbidden' })
   })
 
-  it('cannot pause an admin or owner agent in the same squad', async () => {
+  it('cannot pause admin, administrator, or owner agents with normalized role spelling', async () => {
+    for (const role of ['admin', 'OWNER', ' Administrator ']) {
+      const outcome = await invokeTool(
+        workerManagerAuth(),
+        managerEnv({ privilegedAgentRole: role }),
+        'agent_manager_set_status',
+        { squad_id: SQUAD_ID, agent_id: 'agent-manager', status: 'paused' },
+        'https://mupot.example',
+      )
+
+      expect(outcome).toMatchObject({ ok: false, status: 403, error: 'privileged_agent_forbidden' })
+    }
+  })
+
+  it('fails closed when a status target becomes privileged after preflight', async () => {
+    const captured: Captured[] = []
     const outcome = await invokeTool(
-      workerManagerAuth(),
-      managerEnv(),
+      managerAuth(),
+      managerEnv({ promoteBeforeMutation: true }, captured),
       'agent_manager_set_status',
-      { squad_id: SQUAD_ID, agent_id: 'agent-manager', status: 'paused' },
+      { squad_id: SQUAD_ID, agent_id: 'agent-worker', status: 'paused' },
       'https://mupot.example',
     )
 
     expect(outcome).toMatchObject({ ok: false, status: 403, error: 'privileged_agent_forbidden' })
+    const update = captured.find(({ sql }) => /^\s*UPDATE agents SET status/.test(sql))
+    expect(update?.sql).toContain('squad_id')
+    expect(update?.sql).toContain("LOWER(TRIM(role)) NOT IN ('admin', 'administrator', 'owner')")
+    const audit = captured.find(({ sql }) => /^\s*INSERT INTO agent_manager_audit/.test(sql))
+    expect(audit?.sql).toContain("LOWER(TRIM(role)) NOT IN ('admin', 'administrator', 'owner')")
   })
 
   it('cannot pause an agent in another squad even when the manager belongs to both squads', async () => {
