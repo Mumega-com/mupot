@@ -378,6 +378,7 @@ export type BusEventType =
   | 'brain.directive.updated' // owner-pinned directive changed for the brain decision loop
   | 'squad.dispatch'
   | 'org.provisioned' // a department/squad/agent/token was created in-band (payload.kind)
+  | 'project.mutated' // project lifecycle or project-to-squad access changed through MCP
 
 export interface BusEvent<T = unknown> {
   type: BusEventType

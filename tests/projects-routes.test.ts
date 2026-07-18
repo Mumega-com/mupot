@@ -332,6 +332,18 @@ describe('projectsApp', () => {
     expect(body.projects.map((project) => project.id)).toContain('ungoverned')
   })
 
+  it('does not let a coarse owner role override an explicit restricted capability set', async () => {
+    harness = makeHarness()
+    as(actor({ role: 'owner', capabilities: [] }))
+
+    const restricted = await fetch(harness, '/', 'POST', { slug: 'restricted-owner', name: 'Restricted owner' })
+    expect(restricted.status).toBe(403)
+    await expect(restricted.json()).resolves.toEqual({ error: 'forbidden', need: 'admin' })
+
+    as(actor({ role: 'owner', capabilities: undefined }))
+    expect((await fetch(harness, '/', 'POST', { slug: 'legacy-owner', name: 'Legacy owner' })).status).toBe(201)
+  })
+
   it('returns only readable squad edges to non-admins and all edges to workspace admins', async () => {
     harness = makeHarness()
     seedProjects(harness)

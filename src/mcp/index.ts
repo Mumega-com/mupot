@@ -72,6 +72,7 @@ import { resolveAgentRef } from '../org/resolve'
 import { sendToRef, readAgentInbox, sendAgentMessage } from '../agents/messages'
 import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { PROVISION_TOOLS } from './provision'
+import { PROJECT_TOOLS } from './projects'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -2264,6 +2265,7 @@ export const TOOLS: ToolSpec[] = [
   toolBootContext,
   toolOrient,
   toolConnect,
+  ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
 ]
 

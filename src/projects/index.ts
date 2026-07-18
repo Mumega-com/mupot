@@ -33,7 +33,7 @@ function inTenantScope(auth: AuthContext, env: Env): boolean {
 }
 
 function legacyWorkspaceAdmin(auth: AuthContext): boolean {
-  return auth.role === 'owner' || auth.role === 'admin'
+  return auth.capabilities === undefined && (auth.role === 'owner' || auth.role === 'admin')
 }
 
 function safeParent(project: Project): ParentContext {
