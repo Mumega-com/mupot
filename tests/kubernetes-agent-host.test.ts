@@ -1,8 +1,14 @@
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { parseAllDocuments } from 'yaml'
 import { normalizeAgentProfile } from '../fleet-runtime/profile-contract.mjs'
+import {
+  KUBERNETES_AGENT_HOST_RECEIPT_TYPE,
+  buildKubernetesAgentHostReceipt,
+  parseArgs,
+} from '../scripts/kubernetes-agent-host-receipt.mjs'
 
 const ROOT = join(__dirname, '..')
 const deploymentPath = join(ROOT, 'deploy/kubernetes/agent-host/deployment.yaml')
@@ -70,5 +76,96 @@ describe('Kubernetes Agent Host deployment contract', () => {
     expect(dockerfile).toContain('ENTRYPOINT ["/usr/local/bin/node", "/opt/mupot/container-entrypoint.mjs"]')
     expect(dockerfile).not.toMatch(/COPY\s+.*(?:token|secret|credential|\.env)/i)
     expect(dockerfile).not.toMatch(/Bearer\s+\S+/i)
+  })
+
+  it('emits a redacted passing receipt for an immutable rendered DME deployment', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const deployment = join(dir, 'deployment.yaml')
+    const policy = join(dir, 'network-policy.yaml')
+    const config = join(dir, 'config.json')
+    const imageDigest = `sha256:${'a'.repeat(64)}`
+    writeFileSync(deployment, readFileSync(deploymentPath, 'utf8').replace(
+      'registry.example/mupot-agent-host-hermes:0.23.0',
+      `registry.example/mupot-agent-host-hermes@${imageDigest}`,
+    ))
+    writeFileSync(policy, readFileSync(networkPolicyPath, 'utf8'))
+    writeFileSync(config, readFileSync(configPath, 'utf8')
+      .replace('replace-with-dme-project-id', 'dme-delivery-project')
+      .replace('https://mupot.dme.example', 'https://pot.dme.example'))
+
+    const receipt = buildKubernetesAgentHostReceipt({
+      deploymentPath: deployment,
+      networkPolicyPath: policy,
+      configPath: config,
+      expectedImageDigest: imageDigest,
+    })
+
+    expect(receipt).toMatchObject({
+      receipt_type: KUBERNETES_AGENT_HOST_RECEIPT_TYPE,
+      status: 'pass',
+      target: {
+        tenant: 'dme',
+        project_id: 'dme-delivery-project',
+        agent_id: 'dme-hermes-k8s',
+        image_digest: imageDigest,
+      },
+    })
+    expect(receipt.artifacts).toHaveLength(3)
+    expect(receipt.artifacts.every((artifact) => /^[a-f0-9]{64}$/.test(artifact.sha256))).toBe(true)
+    expect(JSON.stringify(receipt)).not.toMatch(/agent-token|allowed_senders|\/usr\/local\/bin\/hermes/)
+  })
+
+  it('fails closed on mutable images, weakened policy, placeholders, and digest mismatch', () => {
+    const mutable = buildKubernetesAgentHostReceipt({
+      deploymentPath,
+      networkPolicyPath,
+      configPath,
+      expectedImageDigest: `sha256:${'b'.repeat(64)}`,
+    })
+    expect(mutable.status).toBe('fail')
+    expect(mutable.failure_codes).toEqual(expect.arrayContaining([
+      'image_not_immutable',
+      'project_placeholder',
+      'image_digest_mismatch',
+    ]))
+
+    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const weakPolicy = join(dir, 'network-policy.yaml')
+    writeFileSync(weakPolicy, readFileSync(networkPolicyPath, 'utf8').replace('ingress: []', 'ingress:\n  - {}'))
+    const weak = buildKubernetesAgentHostReceipt({
+      deploymentPath,
+      networkPolicyPath: weakPolicy,
+      configPath,
+    })
+    expect(weak.failure_codes).toContain('ingress_not_denied')
+  })
+
+  it('fails when the Kubernetes inbox adds an unverified agent or legacy command', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const config = JSON.parse(readFileSync(configPath, 'utf8'))
+    config.inbox.agents[0].command = 'sh -c unverified'
+    config.inbox.agents.push({ agent_id: 'unverified-agent', command: 'true' })
+    const configFile = join(dir, 'config.json')
+    writeFileSync(configFile, JSON.stringify(config))
+
+    const receipt = buildKubernetesAgentHostReceipt({
+      deploymentPath,
+      networkPolicyPath,
+      configPath: configFile,
+    })
+
+    expect(receipt.failure_codes).toContain('inbox_config_invalid')
+    expect(JSON.stringify(receipt)).not.toContain('sh -c unverified')
+  })
+
+  it('parses the receipt CLI without accepting credential arguments', () => {
+    const opts = parseArgs([
+      '--deployment', deploymentPath,
+      '--network-policy', networkPolicyPath,
+      '--config', configPath,
+      '--image-digest', `sha256:${'c'.repeat(64)}`,
+    ])
+    expect(opts.expectedImageDigest).toBe(`sha256:${'c'.repeat(64)}`)
+    expect(() => parseArgs(['--token', 'nope'])).toThrow(/unknown argument/)
   })
 })

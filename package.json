@@ -50,6 +50,7 @@
     "receipt:stable-deployment:check": "node scripts/stable-deployment-receipt.mjs --check",
     "receipt:release-readiness:plan": "node scripts/release-readiness-receipt.mjs --plan",
     "receipt:release-readiness:check": "node scripts/release-readiness-receipt.mjs --check",
+    "receipt:kubernetes-agent-host": "node scripts/kubernetes-agent-host-receipt.mjs",
     "probe:cutover": "node fleet-runtime/cutover-probe.mjs",
     "fleet:install": "node fleet-runtime/install.mjs",
     "fleet:starter": "node fleet-runtime/starter-manifest.mjs",
@@ -69,7 +70,8 @@
     "playwright": "^1.61.1",
     "typescript": "^5.6.0",
     "vitest": "^4.1.8",
-    "wrangler": "^4.102.0"
+    "wrangler": "^4.102.0",
+    "yaml": "^2.9.0"
   },
   "license": "SEE LICENSE IN LICENSE.md"
 }

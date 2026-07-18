@@ -10,6 +10,8 @@ The starter supports two topologies:
 - **Co-resident:** Hermes and Codex run on one host under one pair of user services.
 - **Distributed:** each host filters the same starter manifest to its local agent;
   for example, Hermes on a Mac and Codex on a VPS.
+- **Kubernetes:** a customer-owned cluster runs the same profile and inbox
+  contracts behind a hardened pod supervisor.
 
 Generate the exact host plan instead of assembling a second command path:
 
@@ -172,6 +174,41 @@ node "$HOME/.fleet/runtime/receipt-bundle.mjs" \
 
 Attach only the copied bundle when `manifest.json`, `cutover-gate.json`,
 `export-receipt.json`, and `manifest-check.json` all report `pass`.
+
+## Kubernetes Agent Host
+
+The Kubernetes template is under `deploy/kubernetes/agent-host`. The repository
+does not create or retain the customer identity, agent token, model login, or
+cluster access. The DME operator owns those inputs and builds a derived image
+that adds the Hermes executable to the credential-free Agent Host base image.
+
+1. Build and publish the base image from `fleet-runtime/Dockerfile.agent-host`.
+2. Build a DME-owned derived image containing `/usr/local/bin/hermes` and pin the
+   Deployment image by digest, not by tag.
+3. Replace the project and endpoint placeholders in a private copy of
+   `config.example.json`.
+4. Create `dme-hermes-mupot` from the welded DME agent token using the cluster's
+   secret manager. Never pass the value on a command line or write it to Git.
+5. Create the `dme-hermes-agent-host` ConfigMap from the rendered daemon and
+   control configs, then apply the Deployment and NetworkPolicy.
+
+Before rollout, generate a redacted receipt from the rendered files:
+
+```bash
+npm run --silent receipt:kubernetes-agent-host -- \
+  --deployment ./rendered/deployment.yaml \
+  --network-policy ./rendered/network-policy.yaml \
+  --config ./rendered/config.json \
+  --image-digest sha256:REPLACE_WITH_IMAGE_DIGEST \
+  > ./receipts/kubernetes-agent-host.json
+```
+
+The receipt fails unless the image is immutable, pod execution is non-root and
+read-only, privilege escalation and service-account token mounting are disabled,
+resources and health probes are bounded, ingress is denied, egress uses the
+trusted gateway, the DME Secret is referenced, the project is explicit, and the
+policy profile validates. It records only artifact and profile digests, never
+the profile command, sender list, credential path, or credential value.
 
 ## Data-Preserving Rollback And Recovery
 
