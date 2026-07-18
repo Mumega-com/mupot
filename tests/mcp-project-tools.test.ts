@@ -505,3 +505,102 @@ describe('MCP project attribution parity', () => {
     expect(filteredReuse).toMatchObject({ ok: false, status: 400, error: 'invalid_flight_cursor' })
   })
 })
+
+describe('MCP project lifecycle control', () => {
+  let harness: SqliteD1Harness | undefined
+
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+  })
+
+  it('registers the complete project lifecycle and squad-access surface', () => {
+    const expected = [
+      'project_create',
+      'project_list',
+      'project_get',
+      'project_update',
+      'project_squad_list',
+      'project_squad_set',
+      'project_squad_remove',
+    ]
+
+    for (const name of expected) {
+      const tool = TOOLS.find((candidate) => candidate.name === name)
+      expect(tool, `${name} must be discoverable over MCP`).toBeDefined()
+      expect(tool?.inputSchema.additionalProperties).toBe(false)
+    }
+  })
+
+  it('lets an org admin control a project through archive, restore, and access changes', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const admin = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' }],
+    })
+
+    const created = await invokeTool(admin, env, 'project_create', {
+      slug: 'mcp-managed',
+      name: 'MCP Managed',
+      description: 'Controlled entirely through MCP',
+      goal: 'Prove control-plane parity',
+      status: 'planned',
+      target_date: '2026-08-31',
+    }, 'https://pot.test')
+    expect(created).toMatchObject({ ok: true, result: { project: { slug: 'mcp-managed', status: 'planned' } } })
+    const projectId = ((created.result as { project: { id: string } }).project).id
+
+    await expect(invokeTool(admin, env, 'project_squad_set', {
+      project_id: projectId,
+      squad_id: SQUAD_ID,
+      access_level: 'write',
+    }, 'https://pot.test')).resolves.toMatchObject({
+      ok: true,
+      result: { squad: { project_id: projectId, squad_id: SQUAD_ID, access_level: 'write' } },
+    })
+
+    const listed = await invokeTool(auth(), env, 'project_list', {}, 'https://pot.test')
+    expect((listed.result as { projects: Array<{ id: string }> }).projects.map(project => project.id)).toContain(projectId)
+    await expect(invokeTool(auth(), env, 'project_get', { project_id: projectId }, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: true, result: { project: { id: projectId } } })
+    await expect(invokeTool(auth(), env, 'project_squad_list', { project_id: projectId }, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: true, result: { squads: [{ squad_id: SQUAD_ID, access_level: 'write' }] } })
+
+    await expect(invokeTool(admin, env, 'project_update', {
+      project_id: projectId,
+      status: 'archived',
+    }, 'https://pot.test')).resolves.toMatchObject({ ok: true, result: { project: { status: 'archived' } } })
+    await expect(invokeTool(admin, env, 'project_update', {
+      project_id: projectId,
+      status: 'active',
+    }, 'https://pot.test')).resolves.toMatchObject({ ok: true, result: { project: { status: 'active' } } })
+
+    await expect(invokeTool(admin, env, 'project_squad_remove', {
+      project_id: projectId,
+      squad_id: SQUAD_ID,
+    }, 'https://pot.test')).resolves.toMatchObject({ ok: true, result: { removed: true } })
+    await expect(invokeTool(auth(), env, 'project_get', { project_id: projectId }, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: false, status: 404, error: 'project_not_found' })
+  })
+
+  it('keeps project mutations admin-only and project reads edge-scoped', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+
+    for (const [tool, args] of [
+      ['project_create', { slug: 'denied', name: 'Denied' }],
+      ['project_update', { project_id: 'project-a', name: 'Denied' }],
+      ['project_squad_set', { project_id: 'project-a', squad_id: OTHER_SQUAD_ID, access_level: 'read' }],
+      ['project_squad_remove', { project_id: 'project-a', squad_id: SQUAD_ID }],
+    ] as const) {
+      await expect(invokeTool(auth(), env, tool, args, 'https://pot.test'))
+        .resolves.toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+    }
+
+    const projects = await invokeTool(auth(), env, 'project_list', {}, 'https://pot.test')
+    expect((projects.result as { projects: Array<{ id: string }> }).projects.map(project => project.id).sort())
+      .toEqual(['project-a', 'project-b', 'project-read'])
+    await expect(invokeTool(auth(), env, 'project_get', { project_id: 'project-no-edge' }, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: false, status: 404, error: 'project_not_found' })
+  })
+})
