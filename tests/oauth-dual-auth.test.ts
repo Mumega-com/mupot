@@ -756,6 +756,7 @@ describe('TEST-2b — member API key convergence preserves workspace grants and 
                       token_id: TOKEN_ID,
                       channel: 'workspace',
                       bound_agent_id: AGENT_ID,
+                      bound_agent_status: 'active',
                     }
                   }
                   if (sql.includes('FROM squads WHERE id = ?1')) {
@@ -792,6 +793,8 @@ describe('TEST-2b — member API key convergence preserves workspace grants and 
     expect(resolved).not.toBeNull()
     expect(seen.externalSql).toContain('t.tenant = ?2')
     expect(seen.externalSql).toContain('m.tenant = ?2')
+    expect(seen.externalSql).toContain('LEFT JOIN agents a ON a.id = t.agent_id')
+    expect(seen.externalSql).toContain("a.status = 'active'")
     expect(seen.externalBinds?.[1]).toBe(TENANT)
     expect(resolved!.props).toMatchObject({
       memberId: MEMBER_ID,
@@ -804,6 +807,8 @@ describe('TEST-2b — member API key convergence preserves workspace grants and 
     expect(auth).not.toBeNull()
     expect(seen.recheckSql).toContain('t.tenant = ?3')
     expect(seen.recheckSql).toContain('m.tenant = ?3')
+    expect(seen.recheckSql).toContain('LEFT JOIN agents a ON a.id = t.agent_id')
+    expect(seen.recheckSql).toContain("a.status = 'active'")
     expect(seen.recheckBinds?.[2]).toBe(TENANT)
     expect(auth!.channel).toBe('workspace')
     expect(auth!.boundAgentId).toBe(AGENT_ID)
@@ -821,6 +826,77 @@ describe('TEST-2b — member API key convergence preserves workspace grants and 
     const inbox = await invokeTool(auth!, env, 'inbox', { peek: true }, 'https://pot.example')
     expect(inbox.ok).toBe(true)
     expect((inbox.result as { messages?: unknown[] }).messages).toEqual([])
+  })
+
+  it('resolveExternalToken rejects a workspace token welded to a paused agent', async () => {
+    const { resolveExternalToken } = await import('../src/mcp/oauth-authorize')
+    const env = {
+      TENANT_SLUG: TENANT,
+      DB: {
+        prepare() {
+          return {
+            bind() {
+              return {
+                async first() {
+                  return {
+                    member_id: 'member-paused',
+                    email: null,
+                    status: 'active',
+                    token_id: 'token-paused',
+                    channel: 'workspace',
+                    bound_agent_id: 'agent-paused',
+                    bound_agent_status: 'paused',
+                  }
+                },
+              }
+            },
+          }
+        },
+      },
+    } as unknown as Env
+
+    expect(await resolveExternalToken(env, 'mupot_paused_agent_key')).toBeNull()
+  })
+
+  it('buildAuthContextFromProps rejects a live token whose welded agent was paused', async () => {
+    const { buildAuthContextFromProps } = await import('../src/mcp/oauth-authorize')
+    const env = {
+      TENANT_SLUG: TENANT,
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind() {
+              return {
+                async first() {
+                  if (sql.includes('FROM member_tokens t')) {
+                    return {
+                      status: 'active',
+                      email: null,
+                      channel: 'workspace',
+                      bound_agent_id: 'agent-paused',
+                      bound_agent_status: 'paused',
+                    }
+                  }
+                  return null
+                },
+                async all() {
+                  return { results: [] }
+                },
+              }
+            },
+          }
+        },
+      },
+    } as unknown as Env
+
+    const auth = await buildAuthContextFromProps(env, {
+      memberId: 'member-paused',
+      tokenId: 'token-paused',
+      email: null,
+      channel: 'workspace',
+      boundAgentId: 'agent-paused',
+    })
+    expect(auth).toBeNull()
   })
 })
 

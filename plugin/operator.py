@@ -13,7 +13,6 @@ import json
 import os
 from pathlib import Path
 import re
-import uuid
 from typing import Any, Callable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
@@ -35,16 +34,23 @@ OPERATOR_ACTIONS = frozenset(
     }
 )
 
-MANAGER_ACTIONS = frozenset(
+MANAGER_LIFECYCLE_ACTIONS = frozenset(
     {
         "agent_manager_status",
         "agent_manager_list",
         "agent_manager_create",
         "agent_manager_set_status",
+    }
+)
+
+MANAGER_CREDENTIAL_ACTIONS = frozenset(
+    {
         "agent_manager_mint_token",
         "agent_manager_revoke_token",
     }
 )
+
+MANAGER_ACTIONS = MANAGER_LIFECYCLE_ACTIONS | MANAGER_CREDENTIAL_ACTIONS
 
 OPERATOR_TOOL_NAMES = (
     "mupot_operator_status",
@@ -59,13 +65,18 @@ OPERATOR_TOOL_NAMES = (
     "mupot_operator_inbox",
 )
 
-MANAGER_TOOL_NAMES = (
+MANAGER_LIFECYCLE_TOOL_NAMES = (
     "mupot_agent_manager_list",
     "mupot_agent_manager_create",
     "mupot_agent_manager_set_status",
+)
+
+MANAGER_CREDENTIAL_TOOL_NAMES = (
     "mupot_agent_manager_mint_token",
     "mupot_agent_manager_revoke_token",
 )
+
+MANAGER_TOOL_NAMES = MANAGER_LIFECYCLE_TOOL_NAMES + MANAGER_CREDENTIAL_TOOL_NAMES
 
 _SAFE_FINDING_STATUSES = frozenset({"in_progress", "blocked"})
 _OVERPRIVILEGED_CAPABILITIES = frozenset({"admin", "owner"})
@@ -88,6 +99,7 @@ class OperatorSettings:
     approval_owner: str
     pubsub_peer_agent_ids: tuple[str, ...] = ()
     agent_manager_enabled: bool = False
+    agent_manager_credentials_enabled: bool = False
     agent_manager_secret_dir: str = ""
     timeout: float = 20.0
 
@@ -101,6 +113,9 @@ class OperatorSettings:
         manager_enabled = value.get("agent_manager_enabled", False)
         if not isinstance(manager_enabled, bool):
             raise ValueError("operator agent_manager_enabled must be boolean")
+        credential_manager_enabled = value.get("agent_manager_credentials_enabled", False)
+        if not isinstance(credential_manager_enabled, bool):
+            raise ValueError("operator agent_manager_credentials_enabled must be boolean")
         raw_peers = value.get("pubsub_peer_agent_ids", [])
         if isinstance(raw_peers, str):
             raw_peers = [raw_peers]
@@ -116,6 +131,7 @@ class OperatorSettings:
             approval_owner=_required_setting(value, "approval_owner"),
             pubsub_peer_agent_ids=tuple(peer.strip() for peer in raw_peers),
             agent_manager_enabled=manager_enabled,
+            agent_manager_credentials_enabled=credential_manager_enabled,
             agent_manager_secret_dir=str(value.get("agent_manager_secret_dir", "")).strip(),
             timeout=timeout,
         )
@@ -143,9 +159,11 @@ class OperatorSettings:
                 raise ValueError("operator pubsub peer agent ID is invalid")
             if peer == self.agent_id:
                 raise ValueError("operator pubsub peer must not be the configured agent itself")
-        if self.agent_manager_enabled:
+        if self.agent_manager_credentials_enabled:
+            if not self.agent_manager_enabled:
+                raise ValueError("operator credential management requires agent_manager_enabled")
             if not self.agent_manager_secret_dir:
-                raise ValueError("operator agent_manager_secret_dir is required when agent manager is enabled")
+                raise ValueError("operator agent_manager_secret_dir is required when credential management is enabled")
             if not Path(self.agent_manager_secret_dir).expanduser().is_absolute():
                 raise ValueError("operator agent_manager_secret_dir must resolve to an absolute path")
 
@@ -248,6 +266,8 @@ class MupotOperatorClient:
         if action not in OPERATOR_ACTIONS and action not in MANAGER_ACTIONS:
             return {"ok": False, "error": "action_not_allowed", "action": action}
         if action in MANAGER_ACTIONS and not self.settings.agent_manager_enabled:
+            return {"ok": False, "error": "action_not_allowed", "action": action}
+        if action in MANAGER_CREDENTIAL_ACTIONS and not self.settings.agent_manager_credentials_enabled:
             return {"ok": False, "error": "action_not_allowed", "action": action}
         if action == "status":
             return self._invoke("status", {})
@@ -520,12 +540,15 @@ def build_operator_handlers(client: MupotOperatorClient) -> dict[str, Callable[[
 
     def manager_mint_token(args: dict[str, Any]) -> str:
         agent_id = _text(args, "agent_id")
-        if agent_id is None:
-            return _json_result({"ok": False, "error": "agent_id_required"})
+        operation_id = _text(args, "operation_id")
+        if agent_id is None or operation_id is None:
+            return _json_result({"ok": False, "error": "agent_id_and_operation_id_required"})
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", operation_id):
+            return _json_result({"ok": False, "error": "invalid_operation_id"})
         payload: JsonObject = {
             "squad_id": settings.squad_id,
             "agent_id": agent_id,
-            "request_id": str(uuid.uuid4()),
+            "request_id": operation_id,
         }
         label = _text(args, "label", required=False)
         if label is not None:
@@ -727,9 +750,15 @@ _TOOL_DEFINITIONS: dict[str, tuple[str, JsonObject]] = {
         _object_schema(
             {
                 "agent_id": {"type": "string"},
+                "operation_id": {
+                    "type": "string",
+                    "minLength": 8,
+                    "maxLength": 128,
+                    "description": "Stable caller-generated ID; reuse it for retries of the same mint operation.",
+                },
                 "label": {"type": "string", "maxLength": 64},
             },
-            ["agent_id"],
+            ["agent_id", "operation_id"],
         ),
     ),
     "mupot_agent_manager_revoke_token": (
@@ -741,9 +770,11 @@ _TOOL_DEFINITIONS: dict[str, tuple[str, JsonObject]] = {
 
 def register_operator_tools(ctx: PluginContextLike, client: MupotOperatorClient) -> None:
     handlers = build_operator_handlers(client)
-    names = OPERATOR_TOOL_NAMES + (
-        MANAGER_TOOL_NAMES if client.settings.agent_manager_enabled else ()
-    )
+    names = OPERATOR_TOOL_NAMES
+    if client.settings.agent_manager_enabled:
+        names += MANAGER_LIFECYCLE_TOOL_NAMES
+    if client.settings.agent_manager_credentials_enabled:
+        names += MANAGER_CREDENTIAL_TOOL_NAMES
     for name in names:
         description, parameters = _TOOL_DEFINITIONS[name]
         ctx.register_tool(

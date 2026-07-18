@@ -48,11 +48,32 @@ function multiSquadManagerAuth(): AuthContext {
   }
 }
 
+function orgOnlyManagerAuth(): AuthContext {
+  const auth = managerAuth()
+  return {
+    ...auth,
+    capabilities: [
+      {
+        member_id: MEMBER_ID,
+        scope_type: 'org',
+        scope_id: null,
+        capability: 'admin',
+      },
+    ],
+  }
+}
+
 function managerEnv(
-  options: { surfaceGrant?: boolean; failAudit?: boolean } = {},
+  options: {
+    surfaceGrant?: boolean
+    credentialSurfaceGrant?: boolean
+    failAudit?: boolean
+    mintReplay?: { agent_id: string; token_id: string; detail: string; recorded_at: string }
+  } = {},
   captured: Captured[] = [],
 ): Env {
   const surfaceGrant = options.surfaceGrant ?? true
+  const credentialSurfaceGrant = options.credentialSurfaceGrant ?? true
   const rows = [
     {
       id: 'agent-manager',
@@ -98,7 +119,12 @@ function managerEnv(
               sql,
               args,
               async first() {
-                if (sql.includes('FROM gate_grants')) return surfaceGrant ? { 1: 1 } : null
+                if (sql.includes('FROM gate_grants')) {
+                  if (args[1] === 'agents:manage') return surfaceGrant ? { 1: 1 } : null
+                  if (args[1] === 'agents:credentials') return credentialSurfaceGrant ? { 1: 1 } : null
+                  return null
+                }
+                if (sql.includes('FROM agent_manager_audit')) return options.mintReplay ?? null
                 if (sql.includes('SELECT COUNT(*) AS n FROM agents')) return { n: 0 }
                 if (sql.includes('FROM member_tokens') && sql.includes('JOIN agents')) {
                   if (args[0] === 'token-worker') {
@@ -225,6 +251,52 @@ describe('squad agent manager', () => {
     })
   })
 
+  it('does not let inherited org or department rank substitute for exact squad membership', async () => {
+    const outcome = await invokeTool(
+      orgOnlyManagerAuth(),
+      managerEnv(),
+      'agent_manager_list',
+      { squad_id: SQUAD_ID },
+      'https://mupot.example',
+    )
+
+    expect(outcome).toMatchObject({
+      ok: false,
+      status: 403,
+      error: 'forbidden',
+      detail: { need: 'member', scope: 'squad', exact: true },
+    })
+  })
+
+  it('requires a separate credential surface grant for mint and revoke', async () => {
+    const attempts: Array<{ tool: string; args: Record<string, unknown> }> = [
+      {
+        tool: 'agent_manager_mint_token',
+        args: { squad_id: SQUAD_ID, agent_id: 'agent-worker', request_id: 'credential-gate-001' },
+      },
+      {
+        tool: 'agent_manager_revoke_token',
+        args: { squad_id: SQUAD_ID, token_id: 'token-worker' },
+      },
+    ]
+
+    for (const attempt of attempts) {
+      const outcome = await invokeTool(
+        managerAuth(),
+        managerEnv({ credentialSurfaceGrant: false }),
+        attempt.tool,
+        attempt.args,
+        'https://mupot.example',
+      )
+      expect(outcome).toMatchObject({
+        ok: false,
+        status: 403,
+        error: 'forbidden',
+        detail: { need: 'agents:credentials' },
+      })
+    }
+  })
+
   it('does not let owner or admin rank bypass the explicit agents:manage grant', async () => {
     const elevated = { ...managerAuth(), role: 'owner' as const }
     const outcome = await invokeTool(
@@ -331,7 +403,10 @@ describe('squad agent manager', () => {
       sql: 'UPDATE agents SET status = ? WHERE id = ?',
       args: ['paused', 'agent-worker'],
     })
-    expect(captured.find(({ sql }) => /^\s*INSERT INTO agent_manager_audit/.test(sql))?.args).toContain('set_status')
+    const statusAudit = captured.find(({ sql }) => /^\s*INSERT INTO agent_manager_audit/.test(sql))
+    expect(statusAudit?.args).toContain('set_status')
+    expect(statusAudit?.sql).toContain('WHERE EXISTS (SELECT 1 FROM agents WHERE id = ? AND squad_id = ? AND status = ?)')
+    expect(statusAudit?.args.slice(-3)).toEqual(['agent-worker', SQUAD_ID, 'paused'])
   })
 
   it('cannot pause its own bound agent identity', async () => {
@@ -407,6 +482,71 @@ describe('squad agent manager', () => {
     const audit = captured.find(({ sql }) => /^\s*INSERT INTO agent_manager_audit/.test(sql))
     expect(audit?.args).toContain('mint_token')
     expect(JSON.stringify(audit?.args)).not.toContain(result.token.raw)
+  })
+
+  it('replays only safe metadata for an exact retry of a committed mint operation', async () => {
+    const outcome = await invokeTool(
+      managerAuth(),
+      managerEnv({
+        mintReplay: {
+          agent_id: 'agent-worker',
+          token_id: 'token-prior-worker',
+          detail: JSON.stringify({ label: 'worker-runtime', capability: 'member' }),
+          recorded_at: '2026-07-16T00:00:00Z',
+        },
+      }),
+      'agent_manager_mint_token',
+      {
+        squad_id: SQUAD_ID,
+        agent_id: 'agent-worker',
+        request_id: 'worker-runtime-001',
+        label: 'worker-runtime',
+      },
+      'https://mupot.example',
+    )
+
+    expect(outcome).toMatchObject({
+      ok: true,
+      result: {
+        replayed: true,
+        secret_available: false,
+        token: { id: 'token-prior-worker', agent_id: 'agent-worker', label: 'worker-runtime' },
+      },
+    })
+    expect(JSON.stringify(outcome)).not.toContain('raw')
+  })
+
+  it('rejects reuse of a mint operation ID for a different agent or label', async () => {
+    const conflicts = [
+      {
+        agent_id: 'agent-other',
+        token_id: 'token-prior-other',
+        detail: JSON.stringify({ label: 'worker-runtime', capability: 'member' }),
+        recorded_at: '2026-07-16T00:00:00Z',
+      },
+      {
+        agent_id: 'agent-worker',
+        token_id: 'token-prior-label',
+        detail: JSON.stringify({ label: 'different-label', capability: 'member' }),
+        recorded_at: '2026-07-16T00:00:00Z',
+      },
+    ]
+
+    for (const mintReplay of conflicts) {
+      const outcome = await invokeTool(
+        managerAuth(),
+        managerEnv({ mintReplay }),
+        'agent_manager_mint_token',
+        {
+          squad_id: SQUAD_ID,
+          agent_id: 'agent-worker',
+          request_id: 'worker-runtime-001',
+          label: 'worker-runtime',
+        },
+        'https://mupot.example',
+      )
+      expect(outcome).toMatchObject({ ok: false, status: 409, error: 'idempotency_conflict' })
+    }
   })
 
   it('rejects attempts to choose a higher capability during manager mint', async () => {

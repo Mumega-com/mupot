@@ -12,6 +12,8 @@ from unittest.mock import patch
 from typing import Any
 
 from plugin.operator import (
+    MANAGER_CREDENTIAL_TOOL_NAMES,
+    MANAGER_LIFECYCLE_TOOL_NAMES,
     MANAGER_TOOL_NAMES,
     OPERATOR_TOOL_NAMES,
     MupotOperatorClient,
@@ -413,7 +415,14 @@ class OperatorTests(unittest.TestCase):
         ctx = Context()
         register_operator_tools(ctx, client)
         names = {tool["name"] for tool in ctx.tools}
-        self.assertEqual(set(MANAGER_TOOL_NAMES), names - set(OPERATOR_TOOL_NAMES))
+        self.assertEqual(set(MANAGER_LIFECYCLE_TOOL_NAMES), names - set(OPERATOR_TOOL_NAMES))
+        self.assertTrue(set(MANAGER_CREDENTIAL_TOOL_NAMES).isdisjoint(names))
+
+        denied = client.call("agent_manager_mint_token", {"agent_id": "worker-2"})
+        self.assertEqual(
+            denied,
+            {"ok": False, "error": "action_not_allowed", "action": "agent_manager_mint_token"},
+        )
 
         handlers = build_operator_handlers(client)
         result = decoded(
@@ -467,13 +476,24 @@ class OperatorTests(unittest.TestCase):
                     }
                 return response
 
-        settings = replace(self.settings, agent_manager_enabled=True)
-        transport = MintTransport(surface_capabilities=("agents:manage",))
+        settings = replace(
+            self.settings,
+            agent_manager_enabled=True,
+            agent_manager_credentials_enabled=True,
+        )
+        transport = MintTransport(
+            surface_capabilities=("agents:manage", "agents:credentials")
+        )
         client = MupotOperatorClient(settings, token="mupot_test_agent_token", transport=transport)
         result = decoded(
             build_operator_handlers(client)["mupot_agent_manager_mint_token"],
-            {"agent_id": "worker-2"},
+            {"agent_id": "worker-2", "operation_id": "worker-2-runtime-001"},
         )
+
+        mint_call = next(
+            call for call in transport.calls if call["url"].endswith("/agent_manager_mint_token")
+        )
+        self.assertEqual(mint_call["payload"]["request_id"], "worker-2-runtime-001")
 
         serialized = json.dumps(result)
         self.assertNotIn(raw, serialized)
@@ -500,13 +520,19 @@ class OperatorTests(unittest.TestCase):
         secret_path = Path(self.settings.agent_manager_secret_dir) / f"{token_id}.token"
         secret_path.parent.mkdir(mode=0o700, exist_ok=True)
         secret_path.write_text("do-not-overwrite", encoding="utf-8")
-        settings = replace(self.settings, agent_manager_enabled=True)
-        transport = MintTransport(surface_capabilities=("agents:manage",))
+        settings = replace(
+            self.settings,
+            agent_manager_enabled=True,
+            agent_manager_credentials_enabled=True,
+        )
+        transport = MintTransport(
+            surface_capabilities=("agents:manage", "agents:credentials")
+        )
         client = MupotOperatorClient(settings, token="mupot_test_agent_token", transport=transport)
 
         result = decoded(
             build_operator_handlers(client)["mupot_agent_manager_mint_token"],
-            {"agent_id": "worker-2"},
+            {"agent_id": "worker-2", "operation_id": "worker-2-runtime-002"},
         )
 
         serialized = json.dumps(result)

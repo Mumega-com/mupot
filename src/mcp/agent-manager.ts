@@ -2,20 +2,22 @@
 //
 // This surface intentionally does NOT reuse the human owner/admin role. A caller
 // must hold BOTH:
-//   1. an exact/inherited member capability on the target squad, and
+//   1. an exact member-or-higher capability row on the target squad, and
 //   2. the explicit `agents:manage` surface grant on its authenticated member.
+// Credential mint/revoke additionally require `agents:credentials`.
 //
 // The combination lets a trusted autonomous manager operate agent lifecycle only
 // inside squads where it already belongs. Neither condition alone is sufficient.
 
 import type { AuthContext, Env } from '../types'
-import { hasCapability, resolveCapabilities } from '../auth/capability'
+import { capabilityRank, resolveCapabilities } from '../auth/capability'
 import { resolveAgentRef, resolveSquadRef } from '../org/resolve'
 import { createAgent, isAgentStatus, setAgentStatus } from '../org/service'
 import { mintAgentBoundToken, revokeMemberToken } from '../members/service'
 import { type ToolSpec, done, fail, str } from './index'
 
 export const AGENT_MANAGER_SURFACE = 'agents:manage'
+export const AGENT_MANAGER_CREDENTIAL_SURFACE = 'agents:credentials'
 
 type AgentManagerAuditAction = 'create' | 'set_status' | 'mint_token' | 'revoke_token'
 
@@ -29,16 +31,12 @@ function managerAuditStatement(
   action: AgentManagerAuditAction,
   target: { agentId?: string | null; tokenId?: string | null },
   detail: Record<string, unknown>,
+  condition?: { sql: string; binds: Array<string | number | null> },
 ): D1Statement {
   if (!auth.memberId || !auth.boundAgentId || !auth.channel) {
     throw new Error('manager audit requires a welded member credential with channel attribution')
   }
-  return env.DB.prepare(
-    `INSERT INTO agent_manager_audit
-       (id, tenant, actor_id, actor_agent_id, channel, request_id, squad_id,
-        agent_id, token_id, action, detail, recorded_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).bind(
+  const values = [
     crypto.randomUUID(),
     env.TENANT_SLUG,
     auth.memberId,
@@ -51,7 +49,14 @@ function managerAuditStatement(
     action,
     JSON.stringify(detail),
     new Date().toISOString(),
-  )
+  ]
+  const predicate = condition ? ` WHERE EXISTS (${condition.sql})` : ''
+  return env.DB.prepare(
+    `INSERT INTO agent_manager_audit
+       (id, tenant, actor_id, actor_agent_id, channel, request_id, squad_id,
+        agent_id, token_id, action, detail, recorded_at)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${predicate}`,
+  ).bind(...values, ...(condition?.binds ?? []))
 }
 
 interface ManagedAgentRow {
@@ -99,6 +104,22 @@ async function findMintReplay(
     .first<MintReplayRow>()
 }
 
+function mintReplayMatches(row: MintReplayRow, agentId: string, label: string): boolean {
+  if (row.agent_id !== agentId) return false
+  try {
+    const detail = JSON.parse(row.detail) as unknown
+    return Boolean(
+      detail
+      && typeof detail === 'object'
+      && !Array.isArray(detail)
+      && (detail as Record<string, unknown>).label === label
+      && (detail as Record<string, unknown>).capability === 'member',
+    )
+  } catch {
+    return false
+  }
+}
+
 function mintReplayOutcome(row: MintReplayRow): ReturnType<typeof done> {
   let detail: Record<string, unknown> = {}
   try {
@@ -122,7 +143,7 @@ function mintReplayOutcome(row: MintReplayRow): ReturnType<typeof done> {
   })
 }
 
-async function hasExplicitManagerGrant(env: Env, memberId: string): Promise<boolean> {
+async function hasExplicitSurfaceGrant(env: Env, memberId: string, surface: string): Promise<boolean> {
   const row = await env.DB.prepare(
     `SELECT 1 AS allowed
        FROM gate_grants
@@ -131,7 +152,7 @@ async function hasExplicitManagerGrant(env: Env, memberId: string): Promise<bool
         AND capability = ?2
       LIMIT 1`,
   )
-    .bind(memberId, AGENT_MANAGER_SURFACE)
+    .bind(memberId, surface)
     .first<{ allowed: number }>()
   return row !== null
 }
@@ -157,12 +178,17 @@ async function authorizeSquadManager(
   }
 
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-  if (!hasCapability(grants, 'squad', resolved.value.id, 'member', resolved.value.department_id)) {
-    return { ok: false, outcome: fail(403, 'forbidden', { need: 'member', scope: 'squad' }) }
+  const hasExactSquadMembership = grants.some(
+    (grant) => grant.scope_type === 'squad'
+      && grant.scope_id === resolved.value.id
+      && capabilityRank(grant.capability) >= capabilityRank('member'),
+  )
+  if (!hasExactSquadMembership) {
+    return { ok: false, outcome: fail(403, 'forbidden', { need: 'member', scope: 'squad', exact: true }) }
   }
   // The generic hasSurfaceCap helper lets owner/admin bypass named grants.
   // Autonomous manager authority must always be represented by an exact row.
-  if (!(await hasExplicitManagerGrant(env, auth.memberId))) {
+  if (!(await hasExplicitSurfaceGrant(env, auth.memberId, AGENT_MANAGER_SURFACE))) {
     return { ok: false, outcome: fail(403, 'forbidden', { need: AGENT_MANAGER_SURFACE }) }
   }
 
@@ -325,6 +351,9 @@ const toolAgentManagerSetStatus: ToolSpec = {
     const updated = await setAgentStatus(env, resolved.value.id, args.status, [
       managerAuditStatement(auth, env, requestId, resolved.value.squad_id, 'set_status', { agentId: resolved.value.id }, {
         status: args.status,
+      }, {
+        sql: 'SELECT 1 FROM agents WHERE id = ? AND squad_id = ? AND status = ?',
+        binds: [resolved.value.id, resolved.value.squad_id, args.status],
       }),
     ])
     if (!updated.ok) return fail(404, 'agent_not_found')
@@ -362,13 +391,13 @@ const toolAgentManagerMintToken: ToolSpec = {
     if (!squadRef || !agentRef || !requestId) {
       return fail(400, 'invalid_args', 'squad_id, agent_id, and request_id required')
     }
-    if (!/^[A-Za-z0-9:_-]{8,128}$/.test(requestId)) return fail(400, 'invalid_request_id')
+    if (!/^[A-Za-z0-9_.:-]{8,128}$/.test(requestId)) return fail(400, 'invalid_request_id')
 
     const authorization = await authorizeSquadManager(auth, env, squadRef)
     if (!authorization.ok) return authorization.outcome
-
-    const prior = await findMintReplay(env, auth, requestId, authorization.squad.id)
-    if (prior) return mintReplayOutcome(prior)
+    if (!auth.memberId || !(await hasExplicitSurfaceGrant(env, auth.memberId, AGENT_MANAGER_CREDENTIAL_SURFACE))) {
+      return fail(403, 'forbidden', { need: AGENT_MANAGER_CREDENTIAL_SURFACE })
+    }
 
     const resolved = await resolveAgentRef(env, agentRef)
     if (!resolved.ok) {
@@ -377,6 +406,14 @@ const toolAgentManagerMintToken: ToolSpec = {
     if (resolved.value.squad_id !== authorization.squad.id) return fail(404, 'agent_not_found')
 
     const label = str(args.label) ?? resolved.value.slug
+    const prior = await findMintReplay(env, auth, requestId, authorization.squad.id)
+    if (prior) {
+      if (!mintReplayMatches(prior, resolved.value.id, label)) {
+        return fail(409, 'idempotency_conflict')
+      }
+      return mintReplayOutcome(prior)
+    }
+
     let minted
     try {
       minted = await mintAgentBoundToken(env, resolved.value, label, 'member', (receipt) => [
@@ -392,7 +429,12 @@ const toolAgentManagerMintToken: ToolSpec = {
       // A concurrent retry may win the unique audit request key after our first
       // lookup. Return its safe receipt rather than minting again.
       const replay = await findMintReplay(env, auth, requestId, authorization.squad.id)
-      if (replay) return mintReplayOutcome(replay)
+      if (replay) {
+        if (!mintReplayMatches(replay, resolved.value.id, label)) {
+          return fail(409, 'idempotency_conflict')
+        }
+        return mintReplayOutcome(replay)
+      }
       throw error
     }
     return done({
@@ -441,6 +483,9 @@ const toolAgentManagerRevokeToken: ToolSpec = {
 
     const authorization = await authorizeSquadManager(auth, env, squadRef)
     if (!authorization.ok) return authorization.outcome
+    if (!auth.memberId || !(await hasExplicitSurfaceGrant(env, auth.memberId, AGENT_MANAGER_CREDENTIAL_SURFACE))) {
+      return fail(403, 'forbidden', { need: AGENT_MANAGER_CREDENTIAL_SURFACE })
+    }
 
     // The JOIN is a security boundary: only a token welded to a real agent can be
     // managed here. Human member tokens do not resolve through this query.

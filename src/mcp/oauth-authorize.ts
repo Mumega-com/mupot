@@ -175,13 +175,16 @@ export async function resolveExternalToken(
   const tokenHash = await sha256Hex(token)
   const row = await env.DB.prepare(
     `SELECT m.id AS member_id, m.email AS email, m.status AS status,
-            t.id AS token_id, t.channel AS channel, t.agent_id AS bound_agent_id
+            t.id AS token_id, t.channel AS channel, t.agent_id AS bound_agent_id,
+            a.status AS bound_agent_status
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
+       LEFT JOIN agents a ON a.id = t.agent_id
       WHERE t.token_hash = ?1
         AND t.tenant = ?2
         AND m.tenant = ?2
         AND t.revoked_at IS NULL
+        AND (t.agent_id IS NULL OR (a.id IS NOT NULL AND a.status = 'active'))
       LIMIT 1`,
   ).bind(tokenHash, env.TENANT_SLUG).first<{
     member_id: string
@@ -190,9 +193,11 @@ export async function resolveExternalToken(
     token_id: string
     channel: ConnectionChannel | null
     bound_agent_id: string | null
+    bound_agent_status: string | null
   }>()
 
   if (!row || row.status !== 'active') return null
+  if (row.bound_agent_id && row.bound_agent_status !== 'active') return null
 
   return {
     props: {
@@ -235,23 +240,28 @@ export async function buildAuthContextFromProps(
 ): Promise<AuthContext | null> {
   // Verify the referenced token is still live (not revoked since authorization).
   const tokenRow = await env.DB.prepare(
-    `SELECT m.status AS status, m.email AS email, t.channel AS channel, t.agent_id AS bound_agent_id
+    `SELECT m.status AS status, m.email AS email, t.channel AS channel,
+            t.agent_id AS bound_agent_id, a.status AS bound_agent_status
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
+       LEFT JOIN agents a ON a.id = t.agent_id
       WHERE t.id = ?1
         AND t.member_id = ?2
         AND t.tenant = ?3
         AND m.tenant = ?3
         AND t.revoked_at IS NULL
+        AND (t.agent_id IS NULL OR (a.id IS NOT NULL AND a.status = 'active'))
       LIMIT 1`,
   ).bind(props.tokenId, props.memberId, env.TENANT_SLUG).first<{
     status: string
     email: string | null
     channel?: ConnectionChannel | null
     bound_agent_id?: string | null
+    bound_agent_status?: string | null
   }>()
 
   if (!tokenRow || tokenRow.status !== 'active') return null
+  if (tokenRow.bound_agent_id && tokenRow.bound_agent_status !== 'active') return null
 
   // Re-resolve capabilities every request (C2: revocation propagates immediately).
   // The resolved grants are NOT used for the directory channel — see B1 comment above —
