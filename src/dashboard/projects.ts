@@ -5,6 +5,12 @@ import { parseFlightMetaV1 } from '../flight/meta'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import type { FlightRow } from '../flight/service'
 import { getProject } from '../projects/service'
+import { listProjectActivity, listProjectEvidence } from '../projects/projections'
+import type {
+  ProjectActivitySource,
+  ProjectEvidenceSource,
+  ProjectProjectionPage,
+} from '../projects/projections'
 import { emptyState, kpiRow, pageHeader, pill, sectionPanel, statCard } from './ui'
 import type { Html } from './ui'
 
@@ -69,6 +75,8 @@ export interface ProjectDetailView {
   }
   tasks: ProjectTaskRow[]
   squads: ProjectSquadRow[]
+  activity: ProjectProjectionPage<ProjectActivitySource>
+  evidence: ProjectProjectionPage<ProjectEvidenceSource>
 }
 
 export interface ProjectWorkContext {
@@ -380,11 +388,13 @@ export async function loadProjectDetail(
   const [project, access] = await Promise.all([getProject(env, projectId), projectAccess(env, auth)])
   if (!project || !await isReadableProject(env, project.id, access)) return null
 
-  const [aggregates, tasks, squads, parent] = await Promise.all([
+  const [aggregates, tasks, squads, parent, activity, evidence] = await Promise.all([
     loadProjectAggregates(env, project.id, access),
     loadReadableTasks(env, project.id, access),
     loadReadableSquads(env, project.id, access),
     project.parent_project_id ? getProject(env, project.parent_project_id) : Promise.resolve(null),
+    listProjectActivity(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
+    listProjectEvidence(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
   ])
 
   return {
@@ -393,6 +403,8 @@ export async function loadProjectDetail(
     aggregates,
     tasks,
     squads,
+    activity,
+    evidence,
   }
 }
 
@@ -698,17 +710,45 @@ export function projectDetailBody(view: ProjectDetailView) {
       })}
     </section>
     <section id="activity" aria-label="Activity">
-      ${emptyState({
-        title: 'No project activity yet',
-        detail: 'A project activity feed is not connected in this version.',
-        hint: 'No timeline events are inferred from unrelated workspace data.',
+      ${sectionPanel({
+        title: 'Activity',
+        body: html`${semanticDataTable({
+          label: 'Project activity',
+          cols: [
+            { label: 'When', width: 'auto' },
+            { label: 'Type', width: 'auto' },
+            { label: 'Item', width: '2fr' },
+            { label: 'Status', width: 'auto' },
+          ],
+          rows: view.activity.rows.map((event) => [
+            html`<span class="ui-mono-dim">${event.occurred_at}</span>`,
+            html`<span>${event.source_type}</span>`,
+            html`<span>${event.title}</span>${event.detail ? html`<span class="ui-agent-role">${event.detail}</span>` : ''}`,
+            pill(event.status, event.status === 'done' || event.status === 'landed' || event.status === 'ack' ? 'ok' : 'primary'),
+          ]),
+          empty: 'No task, message, or flight is attributed to this project yet.',
+        })}${view.activity.hasMore ? html`<p class="ui-panel-sub">Showing the newest 100 activity rows.</p>` : ''}`,
       })}
     </section>
     <section id="evidence" aria-label="Evidence">
-      ${emptyState({
-        title: 'No project evidence yet',
-        detail: 'Project-level evidence receipts are not connected in this version.',
-        hint: 'No evidence state is fabricated.',
+      ${sectionPanel({
+        title: 'Evidence',
+        body: html`${semanticDataTable({
+          label: 'Project evidence',
+          cols: [
+            { label: 'When', width: 'auto' },
+            { label: 'Receipt', width: 'auto' },
+            { label: 'Evidence', width: '2fr' },
+            { label: 'Status', width: 'auto' },
+          ],
+          rows: view.evidence.rows.map((receipt) => [
+            html`<span class="ui-mono-dim">${receipt.occurred_at}</span>`,
+            html`<span>${receipt.source_type.replaceAll('_', ' ')}</span>`,
+            html`<span>${receipt.title}</span>${receipt.detail ? html`<span class="ui-agent-role">${receipt.detail}</span>` : ''}`,
+            pill(receipt.status, receipt.status === 'ok' || receipt.status === 'approved' || receipt.status === 'delivered' || receipt.status === 'consumed' || receipt.status === 'done' ? 'ok' : 'primary'),
+          ]),
+          empty: 'No retained result or linked receipt exists for this project yet.',
+        })}${view.evidence.hasMore ? html`<p class="ui-panel-sub">Showing the newest 100 evidence rows.</p>` : ''}`,
       })}
     </section>`
 }

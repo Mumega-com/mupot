@@ -62,6 +62,7 @@ interface TaskDispatchReceiptState {
   execution_receipt_id: string | null
   execution_claim_expires_at: number | null
   task_status: Task['status'] | null
+  project_id: string | null
 }
 
 function taskDispatchIdentity(event: BusEvent): { taskId: string; receiptId: string } | null {
@@ -98,7 +99,7 @@ async function readTaskDispatchReceipt(env: Env, event: BusEvent): Promise<TaskD
   if (!identity || !event.agent_id) return null
   return await env.DB.prepare(
     `SELECT r.consumed_at, r.claim_expires_at, t.execution_receipt_id,
-            t.execution_claim_expires_at, t.status AS task_status
+            t.execution_claim_expires_at, t.status AS task_status, t.project_id
        FROM task_dispatch_receipts r
        LEFT JOIN tasks t ON t.id = r.task_id AND t.squad_id = r.squad_id
       WHERE r.tenant = ? AND r.id = ? AND r.task_id = ? AND r.agent_id = ?
@@ -272,6 +273,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
             taskId: identity.taskId,
             receiptId: identity.receiptId,
             dispatchedByMemberId: dispatchMemberId(event),
+            projectId: receipt.project_id,
           })
         } catch (error) {
           if (error instanceof InboxFullError) {
@@ -318,6 +320,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
             taskId: identity.taskId,
             receiptId: identity.receiptId,
             dispatchedByMemberId: dispatchMemberId(event),
+            projectId: receipt.project_id,
           })
         } else {
           // IN-WORKER route (fallback: no fleet row, empty runtime, or stale/dead presence) —

@@ -28,6 +28,7 @@ const {
   projectsPageBody,
 } = await import('../src/dashboard/projects')
 const { dashboardApp, dashboardBuiltInGetRoutes } = await import('../src/dashboard')
+const { projectsApp } = await import('../src/projects')
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 
@@ -71,6 +72,17 @@ function makeHarness(): SqliteD1Harness {
       ('mixed-flight', 'pot-a', 'agent-a', 'Mixed squad secret flight', 'running', 'visible-child', '{"schema":"mupot.flight.meta/v1","goal_id":"mixed","objective_id":"ship","squad_ids":["squad-a","squad-b"],"task_ids":["visible-task","hidden-task-on-visible-project"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}'),
       ('legacy-flight', 'pot-a', 'agent-a', 'Legacy project flight', 'running', 'visible-child', '{"squad_ids":["squad-a"]}'),
       ('hidden-flight', 'pot-a', 'agent-b', 'Ship Mirror', 'running', 'hidden-child', '{"schema":"mupot.flight.meta/v1","goal_id":"mirror","objective_id":"ship","squad_ids":["squad-b"],"task_ids":["hidden-sibling-task"],"done_when":["done"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}');
+
+    UPDATE tasks SET result = 'Verified & retained <result>', completed_at = '2026-07-18T20:05:00Z', execution_receipt_id = 'execution-visible'
+      WHERE id = 'visible-task';
+    INSERT INTO agent_messages
+      (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, project_id, created_at)
+    VALUES ('project-message', 'pot-a', 'agent-b', 'agent-a', 'member-a', 'request', 'Coordinate <safely>', 'project-request', 'visible-child', '2026-07-18T20:03:00Z');
+    INSERT INTO workflow_receipts (id, instance_id, task_id, step_name, status, detail, created_at)
+    VALUES ('project-workflow', 'instance-visible', 'visible-task', 'execute', 'ok', '{"proof":"retained"}', '2026-07-18T20:06:00Z');
+    INSERT INTO flight_event_outbox
+      (id, tenant, flight_id, event_type, actor_kind, actor_id, payload, created_at, delivered_at)
+    VALUES ('project-landing', 'pot-a', 'visible-flight', 'flight.landed', 'agent', 'agent-a', '{"status":"landed"}', '2026-07-18T20:07:00Z', '2026-07-18T20:07:01Z');
 
     UPDATE project_squad_access
        SET access_level = 'read'
@@ -282,7 +294,7 @@ describe('project dashboard renderers', () => {
     expect(body).not.toContain('Squad Beta')
   })
 
-  it('uses semantic anchor tabs and honest Activity and Evidence empty states', async () => {
+  it('uses semantic anchor tabs and renders authoritative Activity and Evidence projections', async () => {
     harness = makeHarness()
     const view = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'visible-child')
     const body = await render(projectDetailBody(view!))
@@ -293,9 +305,12 @@ describe('project dashboard renderers', () => {
     expect(body).toContain('href="#squads"')
     expect(body).toContain('href="#activity"')
     expect(body).toContain('href="#evidence"')
-    expect(body).toContain('No project activity yet')
-    expect(body).toContain('No project evidence yet')
-    expect(body.match(/role="table"/g)).toHaveLength(3)
+    expect(body).toContain('Coordinate &lt;safely&gt;')
+    expect(body).toContain('Verified &amp; retained &lt;result&gt;')
+    expect(body).toContain('workflow receipt')
+    expect(body).not.toContain('No project activity yet')
+    expect(body).not.toContain('No project evidence yet')
+    expect(body.match(/role="table"/g)).toHaveLength(5)
     expect(body).toContain('role="columnheader"')
     expect(body).toContain('role="cell"')
     expect(body).toContain("window.addEventListener('hashchange', syncProjectTab)")
@@ -369,6 +384,35 @@ describe('project dashboard routes', () => {
     const hidden = await dashboardApp.fetch(new Request('https://pot.test/projects/hidden-child'), env)
     expect(hidden.status).toBe(404)
     expect(await hidden.text()).not.toContain('Hidden sibling secret')
+  })
+
+  it('exposes project Activity and Evidence through authenticated project APIs without leaking hidden squads', async () => {
+    harness = makeHarness()
+    as(memberA())
+    const env = envFor(harness)
+
+    const activityResponse = await projectsApp.fetch(
+      new Request('https://pot.test/visible-child/activity?limit=20'),
+      env,
+    )
+    expect(activityResponse.status).toBe(200)
+    const activity = await activityResponse.json() as { rows: Array<{ source_id: string }> }
+    expect(activity.rows.some((row) => row.source_id === 'visible-task')).toBe(true)
+    expect(activity.rows.some((row) => row.source_id === 'project-message')).toBe(true)
+    expect(activity.rows.some((row) => row.source_id === 'hidden-task-on-visible-project')).toBe(false)
+    expect(activity.rows.some((row) => row.source_id === 'hidden-flight-on-visible-project')).toBe(false)
+
+    const evidenceResponse = await projectsApp.fetch(
+      new Request('https://pot.test/visible-child/evidence?limit=20'),
+      env,
+    )
+    expect(evidenceResponse.status).toBe(200)
+    const evidence = await evidenceResponse.json() as { rows: Array<{ source_id: string }> }
+    expect(evidence.rows.some((row) => row.source_id === 'visible-task')).toBe(true)
+    expect(evidence.rows.some((row) => row.source_id === 'project-workflow')).toBe(true)
+
+    const hidden = await projectsApp.fetch(new Request('https://pot.test/hidden-child/activity'), env)
+    expect(hidden.status).toBe(404)
   })
 
   it('validates project task context, filters the picker, and includes project_id in the task payload', async () => {
@@ -611,7 +655,7 @@ describe('project dashboard routes', () => {
     expect(listFragment.match(/role="region"[^>]+overflow-x:auto/g)).toHaveLength(1)
     expect(listFragment).toContain('overflow-wrap:anywhere')
     expect(listFragment).not.toMatch(/width:\s*\d+px/)
-    expect(fragment.match(/role="region"[^>]+overflow-x:auto/g)).toHaveLength(3)
+    expect(fragment.match(/role="region"[^>]+overflow-x:auto/g)).toHaveLength(5)
     expect(fragment).toContain('overflow-wrap:anywhere')
     expect(fragment).not.toMatch(/width:\s*\d+px/)
   })

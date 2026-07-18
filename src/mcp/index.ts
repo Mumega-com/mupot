@@ -1609,7 +1609,7 @@ const toolSend: ToolSpec = {
   name: 'send',
   scope: 'agent→agent (this pot); sender must be agent-bound',
   min: 'authenticated',
-  args: '{ to: string (agent id or unique slug), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string }',
+  args: '{ to: string (agent id or unique slug), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string, project_id?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1618,6 +1618,7 @@ const toolSend: ToolSpec = {
       kind: STRING_SCHEMA,
       request_id: STRING_SCHEMA,
       in_reply_to: STRING_SCHEMA,
+      project_id: STRING_SCHEMA,
     },
     required: ['to', 'body'],
     additionalProperties: false,
@@ -1635,6 +1636,8 @@ const toolSend: ToolSpec = {
       return fail(400, 'invalid_args', 'request_id must be a string')
     if (args.in_reply_to !== undefined && typeof args.in_reply_to !== 'string')
       return fail(400, 'invalid_args', 'in_reply_to must be a string')
+    if (args.project_id !== undefined && typeof args.project_id !== 'string')
+      return fail(400, 'invalid_args', 'project_id must be a string')
 
     const res = await sendToRef(env, {
       fromAgent,
@@ -1644,20 +1647,24 @@ const toolSend: ToolSpec = {
       kind: args.kind as 'message' | 'request' | 'ack' | undefined,
       requestId: typeof args.request_id === 'string' ? args.request_id : undefined,
       inReplyTo: typeof args.in_reply_to === 'string' ? args.in_reply_to : undefined,
+      projectId: typeof args.project_id === 'string' ? args.project_id : undefined,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
       const status =
-        res.reason === 'recipient_not_found'
+        res.reason === 'recipient_not_found' || res.reason === 'project_not_found'
           ? 404
+          : res.reason === 'project_access_denied'
+            ? 403
           : res.reason === 'recipient_ambiguous' ||
               res.reason === 'request_id_conflict' ||
-              res.reason === 'inbox_full'
+              res.reason === 'inbox_full' ||
+              res.reason === 'project_archived'
             ? 409
             : 400
       return fail(status, res.reason, res.detail)
     }
-    return done({ id: res.id, seq: res.seq, duplicate: res.duplicate, to: res.toAgent })
+    return done({ id: res.id, seq: res.seq, duplicate: res.duplicate, to: res.toAgent, project_id: typeof args.project_id === 'string' ? args.project_id : null })
   },
 }
 

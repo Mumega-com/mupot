@@ -40,6 +40,7 @@ export interface SendInput {
   kind?: MessageKind
   requestId?: string
   inReplyTo?: string
+  projectId?: string
 }
 
 export interface SendResult {
@@ -59,6 +60,7 @@ export interface InboxMessage {
   request_id: string | null
   in_reply_to: string | null
   created_at: string
+  project_id: string | null
 }
 
 export interface InboxResult {
@@ -77,6 +79,9 @@ export type SendFailure = {
     | 'invalid_kind'
     | 'invalid_request_id'
     | 'invalid_in_reply_to'
+    | 'project_not_found'
+    | 'project_archived'
+    | 'project_access_denied'
     | 'request_id_conflict'
     | 'inbox_full'
     | 'db_error'
@@ -94,6 +99,8 @@ interface Opts {
   idGen?: () => string
   /** Override the per-recipient unread cap (tests). Defaults to MAX_UNREAD_PER_RECIPIENT. */
   maxUnread?: number
+  /** Internal task-dispatch attribution has a system sender and is authorized by the task. */
+  systemProjectAttribution?: boolean
 }
 
 function isRef(v: string): boolean {
@@ -133,6 +140,20 @@ export async function sendAgentMessage(
   if (input.inReplyTo !== undefined && !RID_RE.test(input.inReplyTo))
     return { ok: false, reason: 'invalid_in_reply_to', detail: 'in_reply_to must match [A-Za-z0-9_.:-]{1,128}' }
 
+  if (input.projectId !== undefined) {
+    if (typeof input.projectId !== 'string' || !isRef(input.projectId)) {
+      return { ok: false, reason: 'project_not_found' }
+    }
+    const access = await validateMessageProjectAccess(
+      env,
+      input.projectId,
+      input.fromAgent,
+      input.toAgent,
+      opts.systemProjectAttribution === true,
+    )
+    if (access !== null) return { ok: false, reason: access }
+  }
+
   const now = opts.now ?? (() => new Date().toISOString())
   const idGen = opts.idGen ?? (() => crypto.randomUUID())
 
@@ -156,8 +177,8 @@ export async function sendAgentMessage(
   const createdAt = now()
   try {
     const result = await env.DB.prepare(
-      `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at)
-            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+      `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id)
+            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12
              WHERE (SELECT COUNT(*) FROM agent_messages
                      WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11`,
     )
@@ -173,6 +194,7 @@ export async function sendAgentMessage(
         input.inReplyTo ?? null,
         createdAt,
         maxUnread,
+        input.projectId ?? null,
       )
       .run()
     if ((result.meta?.changes ?? 0) === 0) {
@@ -208,6 +230,7 @@ interface ExistingMessage {
   kind: string
   body: string
   in_reply_to: string | null
+  project_id: string | null
 }
 
 /** A same-(tenant, from_agent, request_id) row: idempotent no-op iff every immutable field
@@ -222,7 +245,8 @@ function idempotentOrConflict(
     existing.to_agent === input.toAgent &&
     existing.kind === kind &&
     existing.body === input.body &&
-    (existing.in_reply_to ?? null) === (input.inReplyTo ?? null)
+    (existing.in_reply_to ?? null) === (input.inReplyTo ?? null) &&
+    (existing.project_id ?? null) === (input.projectId ?? null)
   return same
     ? { ok: true, id: existing.id, seq: Number(existing.seq), duplicate: true }
     : { ok: false, reason: 'request_id_conflict', detail: 'request_id reused with different content' }
@@ -235,7 +259,7 @@ async function findBySenderRequestId(
   requestId: string,
 ): Promise<ExistingMessage | null> {
   const row = await env.DB.prepare(
-    `SELECT id, seq, to_agent, kind, body, in_reply_to FROM agent_messages
+    `SELECT id, seq, to_agent, kind, body, in_reply_to, project_id FROM agent_messages
       WHERE tenant = ?1 AND from_agent = ?2 AND request_id = ?3 LIMIT 1`,
   )
     .bind(tenant, fromAgent, requestId)
@@ -266,7 +290,7 @@ export async function readAgentInbox(
   const peek = input.peek === true
   const now = opts.now ?? (() => new Date().toISOString())
 
-  const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at'
+  const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id'
   try {
     let messages: InboxMessage[]
     if (peek) {
@@ -305,6 +329,7 @@ export async function readAgentInbox(
 
     // normalize seq to number (D1 returns it as a number already, but be defensive)
     for (const m of messages) m.seq = Number(m.seq)
+    for (const m of messages) m.project_id = m.project_id ?? null
     return { ok: true, messages, remaining }
   } catch (err) {
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
@@ -329,6 +354,7 @@ export async function sendToRef(
     kind?: MessageKind
     requestId?: string
     inReplyTo?: string
+    projectId?: string
   },
   opts: Opts = {},
 ): Promise<SendToRefResult> {
@@ -346,9 +372,45 @@ export async function sendToRef(
       kind: input.kind,
       requestId: input.requestId,
       inReplyTo: input.inReplyTo,
+      projectId: input.projectId,
     },
     opts,
   )
   if (!res.ok) return res
   return { ok: true, id: res.id, seq: res.seq, duplicate: res.duplicate, toAgent: resolved.value.id }
+}
+
+type MessageProjectFailure = 'project_not_found' | 'project_archived' | 'project_access_denied'
+
+export async function validateMessageProjectAccess(
+  env: Env,
+  projectId: string,
+  fromAgent: string,
+  toAgent: string,
+  systemAttribution = false,
+): Promise<MessageProjectFailure | null> {
+  const project = await env.DB.prepare(
+    `SELECT status,
+            EXISTS (
+              SELECT 1 FROM memberships m
+              JOIN project_squad_access psa ON psa.squad_id = m.squad_id
+              WHERE psa.project_id = ?1 AND m.agent_id = ?2
+            ) AS sender_allowed,
+            EXISTS (
+              SELECT 1 FROM memberships m
+              JOIN project_squad_access psa ON psa.squad_id = m.squad_id
+              WHERE psa.project_id = ?1 AND m.agent_id = ?3
+            ) AS recipient_allowed
+       FROM projects WHERE id = ?1 LIMIT 1`,
+  ).bind(projectId, fromAgent, toAgent).first<{
+    status: string
+    sender_allowed: number
+    recipient_allowed: number
+  }>()
+  if (!project) return 'project_not_found'
+  if (project.status === 'archived') return 'project_archived'
+  if (!systemAttribution && (!project.sender_allowed || !project.recipient_allowed)) {
+    return 'project_access_denied'
+  }
+  return null
 }

@@ -53,6 +53,8 @@ export interface DispatchBridgeInput {
    *  in this codebase. Never invented; the caller derives this from the BusEvent, never trusts a
    *  caller-supplied field. */
   dispatchedByMemberId: string
+  /** Authoritative tasks.project_id inherited by the bus consumer. */
+  projectId?: string | null
 }
 
 export type BridgeResult = { delivered: true; seq: number; duplicate: boolean }
@@ -96,7 +98,8 @@ export async function deliverDispatchToInbox(env: Env, input: DispatchBridgeInpu
     kind: 'request',
     body,
     requestId: dispatchInboxRequestId(input.receiptId),
-  })
+    projectId: input.projectId ?? undefined,
+  }, { systemProjectAttribution: input.projectId != null })
 
   if (!res.ok) {
     if (res.reason === 'inbox_full') {

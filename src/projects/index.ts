@@ -4,6 +4,7 @@ import type { AuthContext, CapabilityGrant, Env, Project, ProjectStatus } from '
 import { requireAuth } from '../auth'
 import { hasCapability, resolveCapabilities } from '../auth/capability'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
+import { listProjectActivity, listProjectEvidence } from './projections'
 import {
   createProject,
   getProject,
@@ -141,6 +142,21 @@ async function readableProject(
       WHERE p.id = ?
         AND ${visibility.sql}`,
   ).bind(id, ...visibility.binds).first<Project>()
+}
+
+async function projectionReadableSquads(
+  env: Env,
+  access: ProjectReadAccess,
+): Promise<string[] | null> {
+  if (access.workspace_admin || access.org_read) return null
+  const rows = await env.DB.prepare(
+    `SELECT id FROM squads
+      WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
+         OR department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
+      ORDER BY id
+      LIMIT 1000`,
+  ).bind(jsonIds(access.squad_ids), jsonIds(access.department_ids)).all<{ id: string }>()
+  return (rows.results ?? []).map((row) => row.id)
 }
 
 async function projectAggregates(
@@ -309,6 +325,42 @@ projectsApp.get('/:id', async (c) => {
     project,
     aggregates,
     ...(parent ? { parent: safeParent(parent) } : {}),
+  })
+})
+
+projectsApp.get('/:id/activity', async (c) => {
+  const page = parsePage(c.req.query('limit'), c.req.query('cursor'))
+  if (!page) return c.json({ error: 'invalid_pagination' }, 400)
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  const project = await readableProject(c.env, c.req.param('id'), access)
+  if (!project) return c.json({ error: 'project_not_found' }, 404)
+  const rows = await listProjectActivity(c.env, {
+    projectId: project.id,
+    readableSquadIds: await projectionReadableSquads(c.env, access),
+    limit: page.limit,
+    offset: page.offset,
+  })
+  return c.json({
+    rows: rows.rows,
+    next_cursor: rows.hasMore ? String(page.offset + page.limit) : null,
+  })
+})
+
+projectsApp.get('/:id/evidence', async (c) => {
+  const page = parsePage(c.req.query('limit'), c.req.query('cursor'))
+  if (!page) return c.json({ error: 'invalid_pagination' }, 400)
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  const project = await readableProject(c.env, c.req.param('id'), access)
+  if (!project) return c.json({ error: 'project_not_found' }, 404)
+  const rows = await listProjectEvidence(c.env, {
+    projectId: project.id,
+    readableSquadIds: await projectionReadableSquads(c.env, access),
+    limit: page.limit,
+    offset: page.offset,
+  })
+  return c.json({
+    rows: rows.rows,
+    next_cursor: rows.hasMore ? String(page.offset + page.limit) : null,
   })
 })
 
