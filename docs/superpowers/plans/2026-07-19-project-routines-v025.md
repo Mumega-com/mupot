@@ -201,8 +201,8 @@ expect(message.body).not.toMatch(/token|credential|thread_id/i)
 - Produces `submitRoutineProposal(env, principal, proposal): Promise<RoutineProposalResult>`.
 - Produces `executeRoutineAction(env, runId, actionKey): Promise<RoutineActionResult>`.
 
-- [ ] **Step 1: Write adversarial parser tests for unknown keys, oversized text, wrong run/Project/digest, out-of-scope references, ineligible assignees, budget overflow, duplicate action keys, and unsupported action kinds.**
-- [ ] **Step 2: Write execution tests proving `propose` waits for review, `execute_internal` can only create Project Tasks or Flights, external writes enter the existing gate, `no_action` succeeds, and replay returns the same action result.**
+- [x] **Step 1: Write adversarial parser tests for unknown keys, oversized text, wrong run/Project/digest, out-of-scope references, ineligible assignees, budget overflow, duplicate action keys, and unsupported action kinds.**
+- [x] **Step 2: Write execution tests proving `propose` waits for review, `execute_internal` can only create Project Tasks or Flights, external writes enter the existing gate, `no_action` succeeds, and replay returns the same action result.**
 
 ```ts
 expect(await submitRoutineProposal(env, wrongAgent, proposal)).toEqual({
@@ -213,10 +213,10 @@ expect(await executeRoutineAction(env, run.id, 'action-1')).toEqual(
 )
 ```
 
-- [ ] **Step 3: Run both focused test files and verify imports fail.**
-- [ ] **Step 4: Implement strict parsing, live Situation digest recheck, action reservation, source-specific Task/Flight calls, waiting reasons, retry classification, cancellation, and server-side cost aggregation.**
-- [ ] **Step 5: Run focused tests plus existing task gate, Flight landing, receipt, and no-secrets suites.**
-- [ ] **Step 6: Commit with `git commit -m "feat: validate and execute routine proposals"`.**
+- [x] **Step 3: Run both focused test files and verify imports fail.**
+- [x] **Step 4: Implement strict parsing, live Situation digest recheck, action reservation, source-specific Task/Flight calls, waiting reasons, retry classification, cancellation, and server-side cost aggregation.**
+- [x] **Step 5: Run focused tests plus existing task gate, Flight landing, receipt, and no-secrets suites.**
+- [x] **Step 6: Commit with `git commit -m "feat: validate and execute routine proposals"`.**
 
 ### Task 7: Needs You Projection
 

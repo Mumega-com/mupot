@@ -28,3 +28,16 @@ Task 4: complete (commits 272d8dd..7cad70d; review approved; 95 focused tests + 
 Task 5: complete (commits f716ebb..efb4031; review approved after two correction rounds; 65 focused tests + typecheck passed; bounded team roster preserves squad edges, runtime identity/presence truth, and mobile readability)
 Task 6: complete (commits 7d24d82..5b6ad7e; review approved after parity/lifecycle/idempotence corrections; 92 focused + 12 runtime-contract + 3,796 full-suite tests passed; browser, REST, MCP, mobile, no-secrets, and 11-step runtime evidence passed from isolated state)
 Task 7: in progress
+
+---
+
+# Mupot v0.25 Project Routines Progress
+
+Plan: docs/superpowers/plans/2026-07-19-project-routines-v025.md
+Base: c83086f
+Target: v0.25.0 Project Routines and Needs You
+
+Tasks 1-5: complete (commits 714aa0a..7b7888b)
+Task 6: complete (commit f628e29; review approved after concurrency, governed lifecycle,
+retry, and cost-ordering remediation; 14 focused files / 269 tests + typecheck passed)
+Task 7: in progress
