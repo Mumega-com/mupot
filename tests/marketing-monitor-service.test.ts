@@ -185,10 +185,11 @@ function runIntrinsicPoisoningFixture(): Promise<unknown> {
     execFile(process.execPath, [runner], {
       cwd: root,
       encoding: 'utf8',
-      timeout: 15_000,
+      timeout: 10_000,
     }, (error, stdout, stderr) => {
       if (error) {
-        reject(new Error(`intrinsic poisoning fixture failed: ${stderr || error.message}`))
+        const detail = [error.message, stderr.trim()].filter(Boolean).join('\n')
+        reject(new Error(`intrinsic poisoning fixture failed: ${detail}`))
         return
       }
       try {
