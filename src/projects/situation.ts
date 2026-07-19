@@ -84,6 +84,12 @@ export interface ProjectSituation {
   next_action: ProjectSituationNextAction | null
 }
 
+export interface ProjectSituationOptions {
+  excludeTaskIds?: string[]
+  excludeFlightIds?: string[]
+  excludeMessageIds?: string[]
+}
+
 type SituationTaskRow = {
   id: string
   squad_id: string
@@ -219,9 +225,17 @@ export async function loadProjectSituation(
   env: Env,
   project: Project,
   readableSquadIds: string[] | null,
+  options: ProjectSituationOptions = {},
 ): Promise<ProjectSituation> {
   const ids = jsonIds(readableSquadIds)
   const unrestricted = readableFlag(readableSquadIds)
+  const excludedTaskIds = jsonIds(options.excludeTaskIds ?? [])
+  const excludedFlightIds = jsonIds(options.excludeFlightIds ?? [])
+  const excludedActivity = new Set([
+    ...(options.excludeTaskIds ?? []).map(id => `task:${id}`),
+    ...(options.excludeFlightIds ?? []).map(id => `flight:${id}`),
+    ...(options.excludeMessageIds ?? []).map(id => `message:${id}`),
+  ])
   const safeMeta = "CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END"
   const snapshotLimit = PROJECT_SITUATION_COUNT_CAP + 1
 
@@ -234,6 +248,7 @@ export async function loadProjectSituation(
            FROM tasks t
           WHERE t.project_id = ?1 AND t.status = 'blocked'
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND t.id NOT IN (SELECT CAST(value AS TEXT) FROM json_each(?6))
           ORDER BY t.updated_at, t.id LIMIT ?4
        ),
        review_rows AS (
@@ -242,6 +257,7 @@ export async function loadProjectSituation(
            FROM tasks t
           WHERE t.project_id = ?1 AND t.status = 'review'
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND t.id NOT IN (SELECT CAST(value AS TEXT) FROM json_each(?6))
           ORDER BY t.updated_at, t.id LIMIT ?4
        ),
        in_progress_rows AS (
@@ -250,6 +266,7 @@ export async function loadProjectSituation(
            FROM tasks t
           WHERE t.project_id = ?1 AND t.status = 'in_progress'
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND t.id NOT IN (SELECT CAST(value AS TEXT) FROM json_each(?6))
           ORDER BY t.updated_at, t.id LIMIT ?4
        ),
        open_rows AS (
@@ -258,6 +275,7 @@ export async function loadProjectSituation(
            FROM tasks t
           WHERE t.project_id = ?1 AND t.status = 'open'
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND t.id NOT IN (SELECT CAST(value AS TEXT) FROM json_each(?6))
           ORDER BY t.updated_at, t.id LIMIT ?4
        )
        SELECT * FROM review_rows
@@ -266,13 +284,14 @@ export async function loadProjectSituation(
        UNION ALL SELECT * FROM open_rows
        ORDER BY status_order, updated_at, id
        LIMIT ?5`,
-    ).bind(project.id, unrestricted, ids, snapshotLimit, snapshotLimit * 4).all<SituationTaskRow>(),
+    ).bind(project.id, unrestricted, ids, snapshotLimit, snapshotLimit * 4, excludedTaskIds).all<SituationTaskRow>(),
     env.DB.prepare(
       `SELECT f.id, f.agent, f.goal, f.status, f.created_at
          FROM flights f
         WHERE f.project_id = ?1
           AND f.tenant = ?2
           AND f.status IN ('preflight', 'running', 'waiting', 'sleeping')
+          AND f.id NOT IN (SELECT CAST(value AS TEXT) FROM json_each(?6))
           ${canonicalFlightMetaSql('f')}
           AND (?3 = 1 OR NOT EXISTS (
             SELECT 1
@@ -285,8 +304,12 @@ export async function loadProjectSituation(
           ))
         ORDER BY f.created_at, f.id
         LIMIT ?5`,
-    ).bind(project.id, env.TENANT_SLUG, unrestricted, ids, snapshotLimit).all<SituationFlightRow>(),
-    listProjectActivity(env, { projectId: project.id, readableSquadIds, limit: 1 }),
+    ).bind(project.id, env.TENANT_SLUG, unrestricted, ids, snapshotLimit, excludedFlightIds).all<SituationFlightRow>(),
+    listProjectActivity(env, {
+      projectId: project.id,
+      readableSquadIds,
+      limit: Math.min(100, excludedActivity.size + 1),
+    }),
   ])
 
   const taskRows = taskResult.results ?? []
@@ -352,7 +375,7 @@ export async function loadProjectSituation(
       || activeFlightCountTruncated
       || blockerDetailsTruncated
       || pendingReviewDetailsTruncated,
-    latest_activity: activity.rows[0] ?? null,
+    latest_activity: activity.rows.find(row => !excludedActivity.has(`${row.source_type}:${row.source_id}`)) ?? null,
     next_action: nextAction(project, pendingReviews, blockers, inProgress, open, flight),
   }
 }

@@ -181,6 +181,27 @@ describe('loadProjectSituation', () => {
     expect(situation.latest_activity).not.toBeNull()
   })
 
+  it('can exclude a Routine own control Task and Flight from its business Situation', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'routine-snapshot')
+    insertTask(harness, project.id, { id: 'business-task', status: 'open', updatedAt: '2026-07-19T01:00:00Z' })
+    insertTask(harness, project.id, { id: 'control-task', status: 'in_progress', updatedAt: '2026-07-19T03:00:00Z' })
+    insertFlight(harness, project.id, { id: 'control-flight', squadIds: ['squad-a'], taskIds: ['control-task'] })
+
+    const situation = await loadProjectSituation(envFor(harness), project, null, {
+      excludeTaskIds: ['control-task'],
+      excludeFlightIds: ['control-flight'],
+    })
+
+    expect(situation).toMatchObject({
+      task_counts: { open: 1, in_progress: 0 },
+      active_work_count: 1,
+      active_flight_count: 0,
+      latest_activity: { source_type: 'task', source_id: 'business-task' },
+      next_action: { type: 'start_task', task: { id: 'business-task' } },
+    })
+  })
+
   it('falls through from open work to flight monitoring', async () => {
     harness = makeHarness()
     const openProject = insertProject(harness, 'open-work')

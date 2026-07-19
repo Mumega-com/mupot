@@ -5,7 +5,7 @@ import { mcpEndpoint } from '../dashboard/connect'
 import { applyPreflight, createFlight, failFlight } from '../flight/service'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, type FlightMetaV1 } from '../flight/meta'
 import { getFleetAgentRuntimeStates } from '../fleet/registry'
-import { canonicalJson } from '../lib/canonical-json'
+import { canonicalJsonDigest, sha256Hex } from '../lib/canonical-json'
 import { loadProjectSituation } from '../projects/situation'
 import { createTask } from '../tasks/service'
 import type { CapabilityGrant, Env, Project, Task } from '../types'
@@ -103,11 +103,6 @@ function parsePolicy(value: string): RoutinePolicySnapshot | null {
   } catch {
     return null
   }
-}
-
-async function sha256Hex(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
-  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
 async function deterministicUuid(kind: string, runId: string): Promise<string> {
@@ -339,7 +334,7 @@ async function ensureTask(
   policy: RoutinePolicySnapshot,
   agentId: string,
 ): Promise<Task | null> {
-  const id = await deterministicUuid('task', run.id)
+  const id = await deterministicUuid('task', `${run.id}:${run.attempt}`)
   const existing = await existingTask(env, id)
   const matches = (task: Task): boolean => (
     task.project_id === run.project_id
@@ -373,7 +368,7 @@ async function ensureFlight(
   task: Task,
   budgetMicroUsd: number,
 ): Promise<string | null> {
-  const id = await deterministicUuid('flight', run.id)
+  const id = await deterministicUuid('flight', `${run.id}:${run.attempt}`)
   type ExistingFlight = { id: string; project_id: string | null; agent: string; status: string; budget_micro_usd: number | null; meta: string }
   const loadExisting = () => env.DB.prepare(
     'SELECT id, project_id, agent, status, budget_micro_usd, meta FROM flights WHERE id = ? AND tenant = ?',
@@ -482,8 +477,11 @@ export async function dispatchRoutineRun(
   if (!task) return { ok: false, error: 'run_not_dispatchable' }
   const flightId = await ensureFlight(env, run, policy, selected.agentId, task, remainingBudget)
   if (!flightId) return { ok: false, error: 'run_not_dispatchable' }
-  const situation = await loadProjectSituation(env, projectFrom(run), [policy.responsible_squad_id])
-  const situationDigest = await sha256Hex(canonicalJson(situation))
+  const situation = await loadProjectSituation(env, projectFrom(run), [policy.responsible_squad_id], {
+    excludeTaskIds: [task.id],
+    excludeFlightIds: [flightId],
+  })
+  const situationDigest = await canonicalJsonDigest(situation)
   const nowIso = now.toISOString()
   const observed = await env.DB.batch([
     env.DB.prepare(

@@ -198,6 +198,29 @@ export async function landFlight(
     .run()
 }
 
+function routineCostAggregationStatement(env: Env, flightId: string, updatedAt: string) {
+  return env.DB.prepare(
+    `UPDATE routine_runs
+        SET cost_micro_usd = (
+              SELECT COALESCE(SUM(f.cost_micro_usd), 0)
+                FROM flights f
+               WHERE f.tenant = routine_runs.tenant AND (
+                 f.id = routine_runs.flight_id OR f.id IN (
+                   SELECT ref_id FROM routine_run_refs
+                    WHERE run_id = routine_runs.id AND ref_type = 'flight'
+                 )
+               )
+            ),
+            updated_at = ?3
+      WHERE tenant = ?1
+        AND EXISTS (
+          SELECT 1 FROM routine_run_refs
+           WHERE tenant = ?1 AND run_id = routine_runs.id
+             AND ref_type = 'flight' AND ref_id = ?2
+        )`,
+  ).bind(env.TENANT_SLUG, flightId, updatedAt)
+}
+
 export async function landGovernedFlight(
   env: Env,
   id: string,
@@ -266,7 +289,13 @@ export async function landGovernedFlight(
       WHERE id=?3 AND tenant=?2 AND status='landed' AND ended_at=?8
      ON CONFLICT (tenant, flight_id, event_type) DO NOTHING`,
   ).bind(eventId, env.TENANT_SLUG, id, opts.actor.kind, opts.actor.id, payload, createdAt, endedAt)
-  const [transitionResult, outboxResult] = await env.DB.batch([transition, outbox])
+  const [transitionResult, outboxResult] = await env.DB.batch([
+    transition,
+    outbox,
+    ...(opts.meta.routine_run_id
+      ? [routineCostAggregationStatement(env, id, createdAt)]
+      : []),
+  ])
   return transitionResult.meta?.changes === 1 && outboxResult.meta?.changes === 1
 }
 
