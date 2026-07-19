@@ -444,7 +444,7 @@ describe('local project workspace showcase', () => {
     expect(smoke).toContain('Marketing Infrastructure')
     expect(smoke).toContain('/send?project_id=project-mupot')
     expect(smoke).toContain('/flights?project_id=project-mupot')
-    expect(smoke).toContain("['Home', 'Projects', 'Work', 'Approvals']")
+    expect(smoke).toContain("['Home', 'Projects', 'Work', 'Needs You', 'Approvals']")
     expect(smoke).toContain('width: 390, height: 844')
     expect(smoke).toMatch(/scrollWidth\s*-\s*document\.documentElement\.clientWidth/)
     expect(smoke).toContain('await runProjectWorkspaceWorkflow()')

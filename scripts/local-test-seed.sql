@@ -386,14 +386,3 @@ INSERT OR REPLACE INTO routines (
   'sq-growth', 'agent-hermes', 100000, 3, 300, 1,
   'usr-local-owner', datetime('now'), 'usr-local-owner', datetime('now'), datetime('now')
 );
-
-INSERT OR REPLACE INTO routine_runs (
-  id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key,
-  trigger_kind, status, attempt, assigned_agent_id, cost_micro_usd, created_at, updated_at
-) VALUES (
-  'run-local-waiting', 'local', 'project-mupot', 'routine-local-propose', 1,
-  '{"execution_mode":"propose","overlap_policy":"skip","responsible_squad_id":"sq-growth","preferred_agent_id":"agent-hermes","budget_micro_usd":100000,"max_attempts":3,"retry_backoff_seconds":300}',
-  'manual:local-smoke', 'manual', 'waiting', 1, 'agent-hermes', 0, datetime('now'), datetime('now')
-);
-
-UPDATE routine_runs SET waiting_reason = 'review' WHERE id = 'run-local-waiting';
