@@ -685,4 +685,26 @@ describe('project-link addon', () => {
     expect((await revokeProjectLink(env(mumega, 'mumega'), mumegaLink.id, { id: 'mumega-owner', role: 'owner' }, NOW)).ok).toBe(true)
     expect(await getProjectLinkStatus(env(mumega, 'mumega'), mumegaLink.id, NOW)).toMatchObject({ state: 'revoked' })
   })
+
+  it('uses durable UTC comparison for mixed timestamp status while preserving the explicit stale clock', async () => {
+    const previousTimezone = process.env.TZ
+    process.env.TZ = 'America/Toronto'
+    try {
+      mumega.sqlite.prepare(
+        `UPDATE project_links
+            SET last_success_at = ?, last_failure_at = ?, last_error = ?
+          WHERE id = ?`,
+      ).run('2026-07-18T22:00:00Z', '2026-07-18 20:13:00', 'earlier_failure', mumegaLink.id)
+
+      expect(await getProjectLinkStatus(
+        env(mumega, 'mumega'), mumegaLink.id, '2026-07-18T22:04:59Z',
+      )).toMatchObject({ state: 'healthy' })
+      expect(await getProjectLinkStatus(
+        env(mumega, 'mumega'), mumegaLink.id, '2026-07-18T22:05:01Z',
+      )).toMatchObject({ state: 'stale' })
+    } finally {
+      if (previousTimezone === undefined) delete process.env.TZ
+      else process.env.TZ = previousTimezone
+    }
+  })
 })

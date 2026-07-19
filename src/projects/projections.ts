@@ -1,5 +1,9 @@
 import type { Env } from '../types'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
+import {
+  projectLinkLatestEventMsSql,
+  projectLinkTimestampMsSql,
+} from '../addons/project-link/timestamps'
 import { DISPATCH_BRIDGE_SENDER, DISPATCH_INBOX_PREFIX } from '../bus/fleet-bridge'
 
 export type ProjectActivitySource = 'task' | 'message' | 'flight' | 'project_link'
@@ -329,12 +333,9 @@ export async function listProjectActivity(
   const taskAfter = afterClause(input, epochMs('t.created_at'), 't.id', 'task', 4)
   const messageAfter = afterClause(input, epochMs('m.created_at'), 'm.id', 'message', 7)
   const flightAfter = afterClause(input, 'f.created_at', 'f.id', 'flight', 5)
-  const linkOccurredAt = `CAST(ROUND((MAX(
-    julianday(created_at),
-    julianday(COALESCE(last_success_at, created_at)),
-    julianday(COALESCE(last_failure_at, created_at)),
-    julianday(COALESCE(revoked_at, created_at))
-  ) - 2440587.5) * 86400000) AS INTEGER)`
+  const linkOccurredAt = projectLinkLatestEventMsSql()
+  const linkSuccessAt = projectLinkTimestampMsSql('last_success_at')
+  const linkFailureAt = projectLinkTimestampMsSql('last_failure_at')
   const linkAfter = afterClause(input, linkOccurredAt, 'id', 'project_link', 5)
 
   const [taskRows, messageRows, flightRows, linkRows] = await Promise.all([
@@ -385,7 +386,9 @@ export async function listProjectActivity(
     env.DB.prepare(
       `SELECT id, remote_pot, remote_project_id, remote_agent_id, state,
               last_success_at, last_failure_at, last_error, stale_after_seconds,
-              created_at, revoked_at, ${linkOccurredAt} AS latest_event_at
+              created_at, revoked_at, ${linkOccurredAt} AS latest_event_at,
+              ${linkSuccessAt} AS success_event_at,
+              ${linkFailureAt} AS failure_event_at
          FROM project_links
         WHERE tenant = ?1 AND local_project_id = ?2
           AND (?3 = 1 OR local_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
@@ -395,7 +398,7 @@ export async function listProjectActivity(
       id: string; remote_pot: string; remote_project_id: string; remote_agent_id: string
       state: 'active' | 'revoked'; last_success_at: string | null; last_failure_at: string | null
       last_error: string | null; stale_after_seconds: number; created_at: string; revoked_at: string | null
-      latest_event_at: number
+      latest_event_at: number; success_event_at: number | null; failure_event_at: number | null
     }>(),
   ])
 
@@ -433,7 +436,12 @@ export async function listProjectActivity(
     ...(linkRows.results ?? []).map((row) => {
       const status = row.state === 'revoked'
         ? 'revoked'
-        : row.last_failure_at && (!row.last_success_at || Date.parse(row.last_failure_at) > Date.parse(row.last_success_at))
+        : row.last_failure_at && (
+          !row.last_success_at
+          || (row.failure_event_at !== null
+            && row.success_event_at !== null
+            && row.failure_event_at > row.success_event_at)
+        )
           ? 'failed'
           : !row.last_success_at
             ? 'unknown'

@@ -376,7 +376,11 @@ dashboardApp.get('/send', async (c) => {
     const context = await loadProjectWorkContext(c.env, c.get('auth'), projectId)
     if (!context) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
     const agents = await loadActiveAgentsWithSquad(c.env, context.taskableSquadIds)
-    return c.html(shell(c.env, 'Send a task', sendPageBody(agents, context.project)))
+    return c.html(shell(c.env, 'Send a task', sendPageBody(
+      agents,
+      context.project,
+      context.taskableSquadIdsTruncated,
+    )))
   }
   const agents = await loadActiveAgentsWithSquad(c.env)
   return c.html(shell(c.env, 'Send a task', sendPageBody(agents)))
@@ -4082,7 +4086,7 @@ function agentConsoleBody(agent: Agent, squad: Squad | null, canWake: boolean) {
 // squad. The option VALUE carries "agentId|squadId" so the client can post both
 // without a second lookup. The client posts to /api/tasks (dispatch:true) and then
 // polls /api/tasks/:id every 2s (cap 120s), rendering sent → working → done.
-function sendPageBody(agents: PickerAgent[], project?: Project) {
+function sendPageBody(agents: PickerAgent[], project?: Project, projectSquadsTruncated = false) {
   const hasAgents = agents.length > 0
   const options = agents
     .map(
@@ -4117,6 +4121,9 @@ function sendPageBody(agents: PickerAgent[], project?: Project) {
     <h1>Send a task</h1>
     ${project ? html`<p class="empty" style="margin-top:0;max-width:640px">
       Project context: <strong>${project.name}</strong>. Only writable project squads and their active agents are available.
+    </p>` : ''}
+    ${projectSquadsTruncated ? html`<p class="empty" style="margin-top:0;max-width:640px">
+      Only the first 100 project squad edges were evaluated; additional eligible agents may be omitted.
     </p>` : ''}
     <p class="empty" style="margin-top:0;max-width:640px">
       Write what you need in plain language and pick one of your agents. It does the

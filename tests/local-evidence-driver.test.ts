@@ -33,6 +33,7 @@ const serverProcesses: ChildProcess[] = []
 afterEach(() => {
   for (const child of serverProcesses.splice(0)) child.kill('SIGTERM')
   for (const root of fixtureRoots.splice(0)) rmSync(root, { recursive: true, force: true })
+  rmSync(join(TMP_ROOT, 'wrangler-dev.log'), { force: true })
 })
 
 function makeFixture(): DriverFixture {
@@ -184,6 +185,55 @@ function invocations(fixture: DriverFixture): string {
 }
 
 describe('local evidence driver ownership and artifact isolation', () => {
+  it('refuses equal browser and runtime artifact directories before running', async () => {
+    const fixture = makeFixture()
+    const port = await unusedPort()
+
+    const result = runDriver(fixture, port, { MUPOT_CONFORMANCE_ARTIFACTS: fixture.smoke })
+
+    expect(result.status).not.toBe(0)
+    expect(`${result.stdout}\n${result.stderr}`).toContain('artifact directories must be pairwise non-overlapping')
+    expect(invocations(fixture)).toBe('')
+  })
+
+  it('refuses an artifact directory nested under the evidence root before running', async () => {
+    const fixture = makeFixture()
+    const port = await unusedPort()
+
+    const result = runDriver(fixture, port, {
+      MUPOT_SMOKE_ARTIFACTS: join(fixture.evidence, 'browser'),
+    })
+
+    expect(result.status).not.toBe(0)
+    expect(`${result.stdout}\n${result.stderr}`).toContain('artifact directories must be pairwise non-overlapping')
+    expect(invocations(fixture)).toBe('')
+  })
+
+  it('refuses an existing unmarked custom evidence root without modifying it', async () => {
+    const fixture = makeFixture()
+    const port = await unusedPort()
+    mkdirSync(fixture.evidence)
+    writeFileSync(join(fixture.evidence, 'owner-data.txt'), 'retain me')
+
+    const result = runDriver(fixture, port)
+
+    expect(result.status).not.toBe(0)
+    expect(`${result.stdout}\n${result.stderr}`).toContain('refusing to clear unmarked artifact directory')
+    expect(readFileSync(join(fixture.evidence, 'owner-data.txt'), 'utf8')).toBe('retain me')
+    expect(invocations(fixture)).toBe('')
+  })
+
+  it('refuses the repository tmp directory as a custom evidence root', async () => {
+    const fixture = makeFixture()
+    const port = await unusedPort()
+
+    const result = runDriver(fixture, port, { MUPOT_LOCAL_EVIDENCE_DIR: TMP_ROOT })
+
+    expect(result.status).not.toBe(0)
+    expect(`${result.stdout}\n${result.stderr}`).toContain('refusing to clear unsafe artifact directory')
+    expect(invocations(fixture)).toBe('')
+  })
+
   it('refuses a preoccupied endpoint before migrations or Wrangler startup', async () => {
     const fixture = makeFixture()
     const port = await unusedPort()

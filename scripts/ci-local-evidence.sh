@@ -46,7 +46,7 @@ assert_endpoint_free() {
   fi
 }
 
-reset_artifact_dir() {
+validate_artifact_dir() {
   local target="$1"
   local trusted_default="$2"
 
@@ -62,16 +62,49 @@ reset_artifact_dir() {
     echo "refusing to clear unmarked artifact directory: ${target}" >&2
     exit 1
   fi
+}
 
+assert_artifact_dirs_non_overlapping() {
+  node -e '
+    const path = require("node:path")
+    const directories = [
+      ["evidence", process.argv[1]],
+      ["browser", process.argv[2]],
+      ["runtime", process.argv[3]],
+    ]
+    const contains = (parent, child) => {
+      const relative = path.relative(parent, child)
+      return relative === ""
+        || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+    }
+    for (let left = 0; left < directories.length; left += 1) {
+      for (let right = left + 1; right < directories.length; right += 1) {
+        const [leftName, leftPath] = directories[left]
+        const [rightName, rightPath] = directories[right]
+        if (contains(leftPath, rightPath) || contains(rightPath, leftPath)) {
+          console.error(`artifact directories must be pairwise non-overlapping: ${leftName}=${leftPath}; ${rightName}=${rightPath}`)
+          process.exit(1)
+        }
+      }
+    }
+  ' "${EVIDENCE_DIR}" "${SMOKE_DIR}" "${CONFORMANCE_DIR}"
+}
+
+reset_artifact_dir() {
+  local target="$1"
   rm -rf -- "${target}"
   mkdir -p -- "${target}"
   : >"${target}/${ARTIFACT_MARKER}"
 }
 
 assert_endpoint_free
-mkdir -p "${EVIDENCE_DIR}"
-reset_artifact_dir "${SMOKE_DIR}" "${DEFAULT_SMOKE_DIR}"
-reset_artifact_dir "${CONFORMANCE_DIR}" "${DEFAULT_CONFORMANCE_DIR}"
+validate_artifact_dir "${EVIDENCE_DIR}" "${DEFAULT_EVIDENCE_DIR}"
+validate_artifact_dir "${SMOKE_DIR}" "${DEFAULT_SMOKE_DIR}"
+validate_artifact_dir "${CONFORMANCE_DIR}" "${DEFAULT_CONFORMANCE_DIR}"
+assert_artifact_dirs_non_overlapping
+reset_artifact_dir "${EVIDENCE_DIR}"
+reset_artifact_dir "${SMOKE_DIR}"
+reset_artifact_dir "${CONFORMANCE_DIR}"
 STATE_DIR="$(mktemp -d "${EVIDENCE_DIR}/state.XXXXXX")"
 cd "${ROOT_DIR}"
 

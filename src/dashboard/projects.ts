@@ -1,5 +1,13 @@
 import { html, raw } from 'hono/html'
-import type { AuthContext, Env, Project, ProjectAccessLevel, ProjectStatus } from '../types'
+import type {
+  AuthContext,
+  Capability,
+  CapabilityGrant,
+  Env,
+  Project,
+  ProjectAccessLevel,
+  ProjectStatus,
+} from '../types'
 import { hasCapability, resolveCapabilities } from '../auth/capability'
 import { parseFlightMetaV1 } from '../flight/meta'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
@@ -18,6 +26,7 @@ import {
 } from '../projects/access'
 import { listProjectActivity, listProjectEvidence } from '../projects/projections'
 import { loadProjectSituation } from '../projects/situation'
+import { resolveAllSquadIds, resolveReadableSquadIds } from '../projects/readable-squads'
 import type {
   ProjectActivitySource,
   ProjectEvidenceSource,
@@ -185,6 +194,7 @@ export interface ProjectWorkContext {
   project: Project
   readableSquadIds: string[] | null
   taskableSquadIds: string[]
+  taskableSquadIdsTruncated: boolean
 }
 
 export interface ProjectFlightsResult {
@@ -205,23 +215,37 @@ async function projectAccess(env: Env, auth: AuthContext): Promise<ProjectAccess
   const memberId = await memberIdFor(env, auth)
   const grants = memberId ? auth.capabilities ?? await resolveCapabilities(env, memberId) : []
   const visibility = projectReadAccessFromGrants(auth, grants)
-  const rows = grants.length
-    ? await env.DB.prepare('SELECT id, department_id FROM squads').all<{ id: string; department_id: string }>()
-    : { results: [] }
-  const squads = rows.results ?? []
+  const [readableSquadIds, taskableSquadIds] = await Promise.all([
+    unrestrictedProjectRead(visibility)
+      ? Promise.resolve(null)
+      : resolveGrantedSquadIds(env, grants, 'observer'),
+    visibility.workspaceAdmin
+      ? Promise.resolve(null)
+      : resolveGrantedSquadIds(env, grants, 'member'),
+  ])
   return {
     ...visibility,
-    readableSquadIds: unrestrictedProjectRead(visibility)
-      ? null
-      : squads
-        .filter((squad) => hasCapability(grants, 'squad', squad.id, 'observer', squad.department_id))
-        .map((squad) => squad.id),
-    taskableSquadIds: visibility.workspaceAdmin
-      ? null
-      : squads
-        .filter((squad) => hasCapability(grants, 'squad', squad.id, 'member', squad.department_id))
-        .map((squad) => squad.id),
+    readableSquadIds,
+    taskableSquadIds,
   }
+}
+
+async function resolveGrantedSquadIds(
+  env: Env,
+  grants: CapabilityGrant[],
+  minimum: Capability,
+): Promise<string[]> {
+  if (hasCapability(grants, 'org', null, minimum)) return resolveAllSquadIds(env)
+
+  const squadIds: string[] = []
+  const departmentIds: string[] = []
+  for (const grant of grants) {
+    if (!grant.scope_id || !hasCapability([grant], grant.scope_type, grant.scope_id, minimum)) continue
+    if (grant.scope_type === 'squad') squadIds.push(grant.scope_id)
+    if (grant.scope_type === 'department') departmentIds.push(grant.scope_id)
+  }
+  if (!squadIds.length && !departmentIds.length) return []
+  return resolveReadableSquadIds(env, squadIds, departmentIds)
 }
 
 export async function canManageProjects(env: Env, auth: AuthContext): Promise<boolean> {
@@ -670,20 +694,36 @@ export async function loadProjectWorkContext(
 ): Promise<ProjectWorkContext | null> {
   const [project, access] = await Promise.all([getProject(env, projectId), projectAccess(env, auth)])
   if (!project || !await isReadableProject(env, project.id, access)) return null
+  if (project.status === 'archived' || access.taskableSquadIds?.length === 0) {
+    return {
+      project,
+      readableSquadIds: access.readableSquadIds,
+      taskableSquadIds: [],
+      taskableSquadIdsTruncated: false,
+    }
+  }
+  const taskableFilter = access.taskableSquadIds === null
+    ? ''
+    : ' AND squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
+  const limitParam = access.taskableSquadIds === null ? '?2' : '?3'
   const edges = await env.DB.prepare(
     `SELECT squad_id, access_level
        FROM project_squad_access
       WHERE project_id = ?1
-      ORDER BY squad_id`,
-  ).bind(project.id).all<{ squad_id: string; access_level: ProjectAccessLevel }>()
-  const taskable = access.taskableSquadIds === null ? null : new Set(access.taskableSquadIds)
+        AND access_level IN ('write', 'admin')${taskableFilter}
+      ORDER BY squad_id
+      LIMIT ${limitParam}`,
+  ).bind(
+    project.id,
+    ...(access.taskableSquadIds === null ? [] : [jsonIds(access.taskableSquadIds)]),
+    MAX_SQUAD_ROWS + 1,
+  ).all<{ squad_id: string; access_level: ProjectAccessLevel }>()
+  const candidates = edges.results ?? []
   return {
     project,
     readableSquadIds: access.readableSquadIds,
-    taskableSquadIds: project.status === 'archived' ? [] : (edges.results ?? [])
-      .filter((edge) => edge.access_level === 'write' || edge.access_level === 'admin')
-      .filter((edge) => taskable === null || taskable.has(edge.squad_id))
-      .map((edge) => edge.squad_id),
+    taskableSquadIds: candidates.slice(0, MAX_SQUAD_ROWS).map((edge) => edge.squad_id),
+    taskableSquadIdsTruncated: candidates.length > MAX_SQUAD_ROWS,
   }
 }
 

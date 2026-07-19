@@ -311,6 +311,33 @@ describe('project Activity and Evidence projections', () => {
     }
   })
 
+  it('uses SQLite UTC semantics for inverse mixed-format Project Link status', async () => {
+    const fixture = harness()
+    const previousTimezone = process.env.TZ
+    process.env.TZ = 'America/Toronto'
+    try {
+      fixture.sqlite.exec(`
+        UPDATE project_links
+           SET last_success_at = '2026-07-18T22:00:00Z',
+               last_failure_at = '2026-07-18 20:13:00',
+               last_error = 'earlier_failure'
+         WHERE id = 'link-a';
+      `)
+
+      const activity = await listProjectActivity(env(fixture.db), {
+        projectId: 'project', readableSquadIds: null, limit: 20,
+      })
+      expect(activity.rows.find((row) => row.source_id === 'link-a')).toMatchObject({
+        status: 'healthy',
+        occurred_at: '2026-07-18T22:00:00.000Z',
+      })
+    } finally {
+      if (previousTimezone === undefined) delete process.env.TZ
+      else process.env.TZ = previousTimezone
+      fixture.close()
+    }
+  })
+
   it('projects a revocation later than a retained success as the newest Project Link event', async () => {
     const fixture = harness()
     try {

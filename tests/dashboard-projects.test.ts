@@ -24,6 +24,7 @@ vi.mock('../src/auth', () => ({
 const {
   loadProjectDetail,
   loadProjectParentOptions,
+  loadProjectWorkContext,
   loadProjectsPage,
   projectCreateBody,
   projectDetailBody,
@@ -770,6 +771,79 @@ describe('project dashboard renderers', () => {
     expect(body).not.toContain('AAA omitted member')
     expect(body).toContain('Showing the first 100 readable squad edges.')
     expect(body).toContain('Showing the first 100 readable agent members.')
+  })
+
+  it('resolves capability-scoped dashboard squads through bounded SQL pages', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 501)
+      INSERT INTO squads (id, department_id, slug, name)
+      SELECT printf('paged-squad-%03d', x), 'dept-a', printf('paged-squad-%03d', x),
+             printf('Paged squad %03d', x)
+        FROM n;
+    `)
+    const squadQueries: string[] = []
+    const trackedDb = new Proxy(harness.db, {
+      get(target, property, receiver) {
+        if (property !== 'prepare') return Reflect.get(target, property, receiver)
+        return (sql: string) => {
+          if (/SELECT\s+id(?:\s*,\s*department_id)?\s+FROM\s+squads/i.test(sql)) squadQueries.push(sql)
+          return target.prepare(sql)
+        }
+      },
+    })
+
+    const context = await loadProjectWorkContext(
+      { ...envFor(harness), DB: trackedDb }, memberA(), 'visible-child',
+    )
+
+    expect(context?.taskableSquadIds).toEqual(['squad-a'])
+    expect(squadQueries.length).toBeGreaterThan(1)
+    expect(squadQueries.every((sql) => /\bLIMIT\b/i.test(sql))).toBe(true)
+  })
+
+  it('caps project work-context edges at 100 and reports the omitted tail', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      DELETE FROM project_squad_access WHERE project_id = 'visible-child';
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 101)
+      INSERT INTO squads (id, department_id, slug, name)
+      SELECT printf('work-edge-%03d', x), 'dept-a', printf('work-edge-%03d', x),
+             printf('Work edge %03d', x)
+        FROM n;
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 101)
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      SELECT 'visible-child', printf('work-edge-%03d', x), 'write'
+        FROM n;
+    `)
+    const edgeQueries: string[] = []
+    const trackedDb = new Proxy(harness.db, {
+      get(target, property, receiver) {
+        if (property !== 'prepare') return Reflect.get(target, property, receiver)
+        return (sql: string) => {
+          if (/FROM\s+project_squad_access\s+WHERE\s+project_id/i.test(sql)) edgeQueries.push(sql)
+          return target.prepare(sql)
+        }
+      },
+    })
+    const owner = actor({ role: 'owner' })
+
+    const context = await loadProjectWorkContext(
+      { ...envFor(harness), DB: trackedDb }, owner, 'visible-child',
+    )
+    expect(context?.taskableSquadIds).toHaveLength(100)
+    expect(context?.taskableSquadIdsTruncated).toBe(true)
+    expect(edgeQueries).toHaveLength(1)
+    expect(edgeQueries[0]).toMatch(/LIMIT\s+\?2/i)
+
+    as(owner)
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.test/send?project_id=visible-child'), envFor(harness),
+    )
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain(
+      'Only the first 100 project squad edges were evaluated; additional eligible agents may be omitted.',
+    )
   })
 
   it('renders truthful operating situations for review, blocked, active, and empty projects', async () => {

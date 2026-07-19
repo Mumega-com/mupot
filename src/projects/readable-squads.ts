@@ -36,3 +36,26 @@ export async function resolveReadableSquadIds(
 
   return resolved
 }
+
+export async function resolveAllSquadIds(env: Env): Promise<string[]> {
+  const resolved: string[] = []
+  let lastId = ''
+
+  while (true) {
+    const result = await env.DB.prepare(
+      `SELECT id FROM squads
+        WHERE id > ?1
+        ORDER BY id
+        LIMIT ?2`,
+    ).bind(lastId, READABLE_SQUAD_PAGE_SIZE).all<{ id: string }>()
+    const page = result.results ?? []
+    resolved.push(...page.map((row) => row.id))
+    if (page.length < READABLE_SQUAD_PAGE_SIZE) break
+
+    const nextLastId = page.at(-1)?.id
+    if (!nextLastId || nextLastId <= lastId) throw new Error('all_squad_pagination_stalled')
+    lastId = nextLastId
+  }
+
+  return resolved
+}

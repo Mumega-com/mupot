@@ -10,6 +10,7 @@ import {
   type ProjectLinkCapability,
   type SignedProjectLinkEnvelopeV1,
 } from './envelope'
+import { projectLinkTimestampMsSql } from './timestamps'
 
 export interface ProjectLinkActor { id: string; role: 'owner' | 'admin' | 'member' }
 
@@ -903,13 +904,36 @@ export async function getProjectLinkStatus(
   last_success_at?: string | null
   last_failure_at?: string | null
 }> {
-  const link = await loadLink(env, linkId)
+  const link = await env.DB.prepare(
+    `SELECT state, remote_pot, stale_after_seconds, last_success_at, last_failure_at,
+            ${projectLinkTimestampMsSql('last_success_at')} AS success_event_at,
+            ${projectLinkTimestampMsSql('last_failure_at')} AS failure_event_at,
+            ${projectLinkTimestampMsSql('?3')} AS now_event_at
+       FROM project_links
+      WHERE tenant = ?1 AND id = ?2`,
+  ).bind(env.TENANT_SLUG, linkId, now).first<{
+    state: 'active' | 'revoked'
+    remote_pot: string
+    stale_after_seconds: number
+    last_success_at: string | null
+    last_failure_at: string | null
+    success_event_at: number | null
+    failure_event_at: number | null
+    now_event_at: number | null
+  }>()
   if (!link) return { state: 'unknown' }
   if (link.state === 'revoked') return { state: 'revoked', source_pot: link.remote_pot, last_success_at: link.last_success_at, last_failure_at: link.last_failure_at }
   if (!link.last_success_at && !link.last_failure_at) return { state: 'unknown', source_pot: link.remote_pot, last_success_at: null, last_failure_at: null }
-  if (link.last_failure_at && (!link.last_success_at || Date.parse(link.last_failure_at) > Date.parse(link.last_success_at))) {
+  if (link.last_failure_at && (
+    !link.last_success_at
+    || (link.failure_event_at !== null
+      && link.success_event_at !== null
+      && link.failure_event_at > link.success_event_at)
+  )) {
     return { state: 'failed', source_pot: link.remote_pot, last_success_at: link.last_success_at, last_failure_at: link.last_failure_at }
   }
-  const stale = Date.parse(now) - Date.parse(link.last_success_at!) > link.stale_after_seconds * 1000
+  const stale = link.now_event_at !== null
+    && link.success_event_at !== null
+    && link.now_event_at - link.success_event_at > link.stale_after_seconds * 1000
   return { state: stale ? 'stale' : 'healthy', source_pot: link.remote_pot, last_success_at: link.last_success_at, last_failure_at: link.last_failure_at }
 }
