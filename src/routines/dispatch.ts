@@ -2,12 +2,12 @@ import type { D1Result } from '@cloudflare/workers-types'
 import { sendAgentMessage as sendMessage } from '../agents/messages'
 import { hasCapability } from '../auth/capability'
 import { mcpEndpoint } from '../dashboard/connect'
-import { applyPreflight, createFlight, failFlight } from '../flight/service'
+import { applyPreflight, createFlight, failFlight, FlightCreateFenceError } from '../flight/service'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, type FlightMetaV1 } from '../flight/meta'
 import { getFleetAgentRuntimeStates } from '../fleet/registry'
 import { canonicalJsonDigest, sha256Hex } from '../lib/canonical-json'
 import { loadProjectSituation } from '../projects/situation'
-import { createTask } from '../tasks/service'
+import { createTask, TaskCreateFenceError } from '../tasks/service'
 import type { CapabilityGrant, Env, Project, Task } from '../types'
 import type { RoutinePolicySnapshot } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
@@ -260,7 +260,7 @@ async function appendStateEvent(
       `UPDATE routine_runs SET status = ?, waiting_reason = ?, retry_at = ?,
               result_summary = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
         WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
-          AND ${sqlNotCancellationPending('id', 'tenant')}`,
+          AND ${sqlNotCancellationPending('routine_runs')}`,
     ).bind(
       input.status, input.waitingReason, input.retryAt, input.resultSummary,
       now, run.id, run.tenant,
@@ -354,8 +354,12 @@ async function ensureTask(
       done_when: `A correlated routine.proposal/v1 for RoutineRun ${run.id} is accepted.`,
       status: 'open',
       assignee_agent_id: agentId,
-    }, { id, skipMirror: true, skipEvent: true })
+    }, {
+      id, skipMirror: true, skipEvent: true,
+      routineRunFence: { runId: run.id, tenant: run.tenant },
+    })
   } catch (error) {
+    if (error instanceof TaskCreateFenceError) return null
     const raced = await existingTask(env, id)
     if (raced) return matches(raced) ? raced : null
     throw error
@@ -414,7 +418,8 @@ async function ensureFlight(
     trigger_source: 'schedule',
     budget_micro_usd: budgetMicroUsd,
     meta,
-  }, { id }).catch(async (error) => {
+  }, { id, routineRunFence: { runId: run.id, tenant: run.tenant } }).catch(async (error) => {
+    if (error instanceof FlightCreateFenceError) return null
     const raced = await loadExisting()
     if (raced) return matches(raced) ? raced.id : null
     throw error
@@ -471,7 +476,7 @@ export async function dispatchRoutineRun(
     `UPDATE routine_runs SET assigned_agent_id = ?, updated_at = ?
       WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
         AND (assigned_agent_id IS NULL OR assigned_agent_id = ?)
-        AND ${sqlNotCancellationPending('id', 'tenant')}`,
+        AND ${sqlNotCancellationPending('routine_runs')}`,
   ).bind(selected.agentId, now.toISOString(), run.id, run.tenant, selected.agentId).run()
   if (!wrote(reserved)) return { ok: false, error: 'run_not_dispatchable' }
   run.assigned_agent_id = selected.agentId
@@ -492,7 +497,7 @@ export async function dispatchRoutineRun(
               flight_id = ?, situation_digest = ?, updated_at = ?
         WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
           AND assigned_agent_id = ?
-          AND ${sqlNotCancellationPending('id', 'tenant')}`,
+          AND ${sqlNotCancellationPending('routine_runs')}`,
     ).bind(
       selected.agentId, task.id, flightId, situationDigest, nowIso,
       run.id, run.tenant, selected.agentId,
@@ -539,8 +544,12 @@ export async function dispatchRoutineRun(
     kind: 'request',
     requestId: `routine-run:${run.id}`,
     projectId: run.project_id,
-  }, { systemProjectAttribution: true })
+  }, {
+    systemProjectAttribution: true,
+    routineRunFence: { runId: run.id, projectId: run.project_id },
+  })
   if (!delivery.ok) {
+    if (delivery.reason === 'dispatch_fenced') return { ok: false, error: 'run_not_dispatchable' }
     return waitForAgent(env, run, now, delivery.reason === 'inbox_full' ? 'inbox_full' : 'delivery_failed')
   }
 
@@ -560,7 +569,7 @@ export async function dispatchRoutineRun(
               lease_owner = NULL, lease_expires_at = NULL, retry_at = NULL,
               assigned_agent_id = ?, task_id = ?, flight_id = ?, situation_digest = ?, updated_at = ?
         WHERE id = ? AND tenant = ? AND status = 'observing'
-          AND ${sqlNotCancellationPending('id', 'tenant')}
+          AND ${sqlNotCancellationPending('routine_runs')}
           AND EXISTS (
             SELECT 1 FROM tasks t
              WHERE t.id = ? AND t.project_id = ? AND t.squad_id = ?

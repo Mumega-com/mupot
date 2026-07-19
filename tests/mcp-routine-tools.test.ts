@@ -302,7 +302,10 @@ describe('routine MCP tools', () => {
       .resolves.toMatchObject({ ok: true, result: { run_id: runId, duplicate: true, outcome: 'confirmed' } })
     harness.sqlite.prepare("UPDATE routine_runs SET status = 'succeeded' WHERE id = ?").run(runId)
     await expect(invokeTool(admin, env, 'routine_run_cancel', { run_id: runId }, 'https://pot.test'))
-      .resolves.toMatchObject({ ok: false, status: 409, error: 'run_terminal' })
+      .resolves.toMatchObject({
+        ok: true,
+        result: { run_id: runId, duplicate: true, outcome: 'confirmed' },
+      })
     const attention = await invokeTool(admin, env, 'needs_you_list', { project_id: 'project-write', limit: 1 }, 'https://pot.test')
     expect(attention).toMatchObject({ ok: true, result: { items: [expect.objectContaining({ source_id: 'attention-1' })] } })
     assertSafe(attention.result)

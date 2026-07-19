@@ -51,6 +51,14 @@ CREATE INDEX IF NOT EXISTS idx_routine_run_events_projection_keyset
     id
   );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_routine_run_events_one_cancellation_request
+  ON routine_run_events (tenant, run_id)
+  WHERE kind = 'cancellation_requested';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_routine_run_events_one_cancellation_outcome
+  ON routine_run_events (tenant, run_id)
+  WHERE kind IN ('cancellation_confirmed', 'cancellation_unconfirmed');
+
 CREATE TRIGGER validate_routine_event_insert
 BEFORE INSERT ON routine_run_events
 BEGIN

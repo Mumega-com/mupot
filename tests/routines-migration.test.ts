@@ -256,13 +256,24 @@ describe('0062_routine_cancellation_events migration', () => {
       applyCancellationMigration(sqlite)
       expect(sqlite.prepare("SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1'").get())
         .toEqual({ count: 3 })
-      sqlite.exec(`
+      expect(() => sqlite.exec(`
         INSERT INTO routine_run_events (
           id, tenant, project_id, run_id, kind, actor_type, actor_id, metadata_json, correlation_id
         ) VALUES ('event-unc', 'tenant-a', 'project-a', 'run-1', 'cancellation_unconfirmed', 'system', 'mupot-routines', '{}', 'run-1');
-      `)
+      `)).toThrow(/UNIQUE/)
+      expect(() => sqlite.exec(`
+        INSERT INTO routine_run_events (
+          id, tenant, project_id, run_id, kind, actor_type, actor_id, metadata_json, correlation_id
+        ) VALUES ('event-req-2', 'tenant-a', 'project-a', 'run-1', 'cancellation_requested', 'member', 'owner-1', '{}', 'run-1');
+      `)).toThrow(/UNIQUE/)
       expect(sqlite.prepare("SELECT COUNT(*) AS count FROM routine_run_events WHERE kind LIKE 'cancellation_%'").get())
-        .toEqual({ count: 3 })
+        .toEqual({ count: 2 })
+      const indexes = sqlite.prepare("SELECT name FROM pragma_index_list('routine_run_events')").all()
+        .map(row => row.name)
+      expect(indexes).toEqual(expect.arrayContaining([
+        'idx_routine_run_events_one_cancellation_request',
+        'idx_routine_run_events_one_cancellation_outcome',
+      ]))
     } finally {
       close()
     }

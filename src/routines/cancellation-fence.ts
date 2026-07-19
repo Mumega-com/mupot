@@ -7,12 +7,20 @@ import type { Env } from '../types'
  * not be claimed by the scheduler, dispatch, or action executor.
  */
 
+const SQL_ALIAS = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+function qualifiedRunColumns(runAlias: string): { id: string; tenant: string } {
+  if (!SQL_ALIAS.test(runAlias)) throw new Error('invalid Routine run SQL alias')
+  return { id: `${runAlias}.id`, tenant: `${runAlias}.tenant` }
+}
+
 /** SQL boolean expression — true when an open cancellation request fences the run. */
-export function sqlCancellationPending(runIdSql: string, tenantSql: string): string {
+export function sqlCancellationPending(runAlias: string): string {
+  const run = qualifiedRunColumns(runAlias)
   return `EXISTS (
     SELECT 1 FROM routine_run_events requested
-     WHERE requested.run_id = ${runIdSql}
-       AND requested.tenant = ${tenantSql}
+     WHERE requested.run_id = ${run.id}
+       AND requested.tenant = ${run.tenant}
        AND requested.kind = 'cancellation_requested'
        AND NOT EXISTS (
          SELECT 1 FROM routine_run_events outcome
@@ -24,8 +32,8 @@ export function sqlCancellationPending(runIdSql: string, tenantSql: string): str
 }
 
 /** Inverse — safe for UPDATE ... WHERE claim guards. */
-export function sqlNotCancellationPending(runIdSql: string, tenantSql: string): string {
-  return `NOT ${sqlCancellationPending(runIdSql, tenantSql)}`
+export function sqlNotCancellationPending(runAlias: string): string {
+  return `NOT ${sqlCancellationPending(runAlias)}`
 }
 
 /** Runtime check for the same fence used in SQL claim guards. */

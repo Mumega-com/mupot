@@ -55,6 +55,15 @@ export interface NewFlight {
 export interface CreateFlightOptions {
   /** Internal deterministic identity for crash-safe control-plane replay. */
   id?: string
+  /** Internal atomic fence used by Routine dispatch before creating control work. */
+  routineRunFence?: { runId: string; tenant: string }
+}
+
+export class FlightCreateFenceError extends Error {
+  constructor() {
+    super('routine_dispatch_fenced')
+    this.name = 'FlightCreateFenceError'
+  }
 }
 
 export type FlightProjectErrorCode =
@@ -140,24 +149,45 @@ function mapFlightProjectInsertError(error: unknown): never {
 export async function createFlight(env: Env, f: NewFlight, options: CreateFlightOptions = {}): Promise<string> {
   await validateFlightProjectAttribution(env, f)
   const id = options.id ?? crypto.randomUUID()
+  let result
   try {
-    await env.DB.prepare(
-      `INSERT INTO flights (id, tenant, project_id, agent, goal, status, trigger_source, budget_micro_usd, meta)
-       VALUES (?1, ?2, ?3, ?4, ?5, 'preflight', ?6, ?7, ?8)`,
-    )
-      .bind(
-        id,
-        env.TENANT_SLUG,
-        f.project_id ?? null,
-        f.agent,
-        f.goal,
-        f.trigger_source ?? 'manual',
-        f.budget_micro_usd ?? null,
-        JSON.stringify(f.meta ?? {}),
-      )
-      .run()
+    const fence = options.routineRunFence
+    const values = [
+      id,
+      env.TENANT_SLUG,
+      f.project_id ?? null,
+      f.agent,
+      f.goal,
+      f.trigger_source ?? 'manual',
+      f.budget_micro_usd ?? null,
+      JSON.stringify(f.meta ?? {}),
+    ]
+    if (fence) {
+      result = await env.DB.prepare(
+        `INSERT INTO flights (id, tenant, project_id, agent, goal, status, trigger_source, budget_micro_usd, meta)
+         SELECT ?1, ?2, ?3, ?4, ?5, 'preflight', ?6, ?7, ?8
+          WHERE EXISTS (
+            SELECT 1 FROM routine_runs rr
+             WHERE rr.id = ?9 AND rr.tenant = ?10 AND rr.project_id = ?3
+               AND rr.status IN ('leased','observing')
+               AND NOT EXISTS (
+                 SELECT 1 FROM routine_run_events requested
+                  WHERE requested.run_id = rr.id AND requested.tenant = rr.tenant
+                    AND requested.kind = 'cancellation_requested'
+               )
+          )`,
+      ).bind(...values, fence.runId, fence.tenant).run()
+    } else {
+      result = await env.DB.prepare(
+        `INSERT INTO flights (id, tenant, project_id, agent, goal, status, trigger_source, budget_micro_usd, meta)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'preflight', ?6, ?7, ?8)`,
+      ).bind(...values).run()
+    }
   } catch (error) {
     mapFlightProjectInsertError(error)
+  }
+  if (options.routineRunFence && (result?.meta?.changes ?? 0) === 0) {
+    throw new FlightCreateFenceError()
   }
   return id
 }

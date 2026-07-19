@@ -83,6 +83,7 @@ export type SendFailure = {
     | 'project_archived'
     | 'project_access_denied'
     | 'request_id_conflict'
+    | 'dispatch_fenced'
     | 'inbox_full'
     | 'db_error'
   detail?: string
@@ -101,10 +102,30 @@ interface Opts {
   maxUnread?: number
   /** Internal task-dispatch attribution has a system sender and is authorized by the task. */
   systemProjectAttribution?: boolean
+  /** Internal atomic fence for a Routine dispatch envelope. */
+  routineRunFence?: { runId: string; projectId: string }
 }
 
 function isRef(v: string): boolean {
   return v.length > 0 && v.length <= MAX_REF_CHARS
+}
+
+async function routineDispatchAllowed(
+  env: Env,
+  tenant: string,
+  fence: NonNullable<Opts['routineRunFence']>,
+): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM routine_runs rr
+      WHERE rr.id = ? AND rr.tenant = ? AND rr.project_id = ? AND rr.status = 'observing'
+        AND NOT EXISTS (
+          SELECT 1 FROM routine_run_events requested
+           WHERE requested.run_id = rr.id AND requested.tenant = rr.tenant
+             AND requested.kind = 'cancellation_requested'
+        )
+      LIMIT 1`,
+  ).bind(fence.runId, tenant, fence.projectId).first()
+  return row !== null
 }
 
 // Recipient resolution is NOT done here — the tool uses the canonical, security-reviewed
@@ -156,6 +177,10 @@ export async function sendAgentMessage(
 
   const now = opts.now ?? (() => new Date().toISOString())
   const idGen = opts.idGen ?? (() => crypto.randomUUID())
+  const routineFence = opts.routineRunFence
+  if (routineFence && input.projectId !== routineFence.projectId) {
+    return { ok: false, reason: 'dispatch_fenced' }
+  }
 
   // replay-once, SENDER-SCOPED: if THIS sender already used this rid, it's idempotent only
   // when the content is identical — otherwise it's a conflict (a reused key with a different
@@ -176,28 +201,47 @@ export async function sendAgentMessage(
   const id = idGen()
   const createdAt = now()
   try {
-    const result = await env.DB.prepare(
-      `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id)
-            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12
-             WHERE (SELECT COUNT(*) FROM agent_messages
-                     WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11`,
-    )
-      .bind(
-        id,
-        tenant,
-        input.toAgent,
-        input.fromAgent,
-        input.fromMember,
-        kind,
-        input.body,
-        input.requestId ?? null,
-        input.inReplyTo ?? null,
-        createdAt,
-        maxUnread,
-        input.projectId ?? null,
-      )
-      .run()
+    const values = [
+      id,
+      tenant,
+      input.toAgent,
+      input.fromAgent,
+      input.fromMember,
+      kind,
+      input.body,
+      input.requestId ?? null,
+      input.inReplyTo ?? null,
+      createdAt,
+      maxUnread,
+      input.projectId ?? null,
+    ]
+    const result = routineFence
+      ? await env.DB.prepare(
+        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id)
+              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12
+               WHERE (SELECT COUNT(*) FROM agent_messages
+                       WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
+                 AND EXISTS (
+                   SELECT 1 FROM routine_runs rr
+                    WHERE rr.id = ?13 AND rr.tenant = ?2 AND rr.project_id = ?12
+                      AND rr.status = 'observing'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM routine_run_events requested
+                         WHERE requested.run_id = rr.id AND requested.tenant = rr.tenant
+                           AND requested.kind = 'cancellation_requested'
+                      )
+                 )`,
+      ).bind(...values, routineFence.runId).run()
+      : await env.DB.prepare(
+        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id)
+              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12
+               WHERE (SELECT COUNT(*) FROM agent_messages
+                       WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11`,
+      ).bind(...values).run()
     if ((result.meta?.changes ?? 0) === 0) {
+      if (routineFence && !await routineDispatchAllowed(env, tenant, routineFence)) {
+        return { ok: false, reason: 'dispatch_fenced' }
+      }
       // The cap guard refused — BUT a 0-row insert also means the UNIQUE(tenant, from_agent,
       // request_id) index was never consulted (no row was attempted). So a same-(sender,rid)
       // duplicate that a concurrent writer landed AFTER our pre-check would be masked as
@@ -213,6 +257,9 @@ export async function sendAgentMessage(
     const seq = Number(result.meta?.last_row_id ?? 0)
     return { ok: true, id, seq, duplicate: false }
   } catch (err) {
+    if (routineFence && !await routineDispatchAllowed(env, tenant, routineFence)) {
+      return { ok: false, reason: 'dispatch_fenced' }
+    }
     // A UNIQUE(tenant, from_agent, request_id) collision means THIS sender already landed this
     // rid (a concurrent retry) — re-read and apply the same idempotent-or-conflict decision.
     if (input.requestId !== undefined) {

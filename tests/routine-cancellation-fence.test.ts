@@ -3,7 +3,7 @@ import { sqlNotCancellationPending } from '../src/routines/cancellation-fence'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 
 describe('Routine cancellation SQL fence', () => {
-  it('blocks a production-style UPDATE when the outer columns are explicitly qualified', () => {
+  it('blocks a production-style UPDATE when the outer columns are qualified', () => {
     const harness = createSqliteD1()
     try {
       harness.sqlite.exec(`
@@ -20,7 +20,7 @@ describe('Routine cancellation SQL fence', () => {
       const result = harness.sqlite.prepare(`
         UPDATE routine_runs SET status = 'leased'
          WHERE id = 'run-1' AND tenant = 'tenant-a'
-           AND ${sqlNotCancellationPending('routine_runs.id', 'routine_runs.tenant')}
+           AND ${sqlNotCancellationPending('routine_runs')}
       `).run()
 
       expect(Number(result.changes)).toBe(0)

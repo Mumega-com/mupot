@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../src/types'
 import { dispatchRoutineRun } from '../src/routines/dispatch'
 import { MAX_SCHEDULER_DB_STATEMENTS } from '../src/routines/scheduler'
@@ -86,6 +87,50 @@ function envFor(harness: SqliteD1Harness, onPrepare?: () => void): Env {
     PUBLIC_ORIGIN: 'https://mupot.example',
     BUS: { send: vi.fn(async () => undefined) },
   } as unknown as Env
+}
+
+function envWithCancellationBeforeInsert(
+  harness: SqliteD1Harness,
+  pattern: RegExp,
+  eventId: string,
+): Env {
+  const base = envFor(harness)
+  const db = harness.db
+  let injected = false
+  return {
+    ...base,
+    DB: {
+      prepare(sql: string) {
+        const statement = db.prepare(sql)
+        if (!injected && pattern.test(sql)) {
+          return {
+            bind(...values: unknown[]) {
+              const bound = statement.bind(...values)
+              return {
+                async run() {
+                  injected = true
+                  harness.sqlite.exec(`
+                    INSERT INTO routine_run_events (
+                      id, tenant, project_id, run_id, kind, actor_type, actor_id,
+                      metadata_json, correlation_id
+                    ) VALUES (
+                      '${eventId}', 'tenant-a', 'project-1', 'run-1',
+                      'cancellation_requested', 'member', 'owner-1', '{}', 'run-1'
+                    );
+                  `)
+                  return bound.run()
+                },
+                async first<T>() { return bound.first<T>() },
+                async all<T>() { return bound.all<T>() },
+              } as unknown as D1PreparedStatement
+            },
+          } as unknown as D1PreparedStatement
+        }
+        return statement
+      },
+      batch: db.batch.bind(db),
+    } as unknown as D1Database,
+  } as Env
 }
 
 function row(harness: SqliteD1Harness, sql: string, ...binds: unknown[]): Record<string, unknown> | undefined {
@@ -287,6 +332,41 @@ describe('routine runtime-neutral dispatch', () => {
       ok: false, error: 'run_not_dispatchable',
     })
     expect(row(harness, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind = 'retry_scheduled'")).toEqual({ count: 0 })
+  })
+
+  it('atomically refuses inbox delivery when cancellation lands immediately before the message insert', async () => {
+    harness = makeHarness()
+    const env = envWithCancellationBeforeInsert(harness, /INSERT INTO agent_messages/, 'cancel-before-message')
+
+    await expect(dispatchRoutineRun(env, 'run-1', NOW)).resolves.toEqual({
+      ok: false, error: 'run_not_dispatchable',
+    })
+    expect(row(harness, "SELECT COUNT(*) AS count FROM agent_messages WHERE request_id = 'routine-run:run-1'")).toEqual({ count: 0 })
+    expect(row(harness, "SELECT status FROM routine_runs WHERE id = 'run-1'")).toEqual({ status: 'observing' })
+  })
+
+  it('atomically refuses Task creation when cancellation lands immediately before the Task insert', async () => {
+    harness = makeHarness()
+    const env = envWithCancellationBeforeInsert(harness, /INSERT INTO tasks/, 'cancel-before-task')
+
+    await expect(dispatchRoutineRun(env, 'run-1', NOW)).resolves.toEqual({
+      ok: false, error: 'run_not_dispatchable',
+    })
+    expect(row(harness, 'SELECT COUNT(*) AS count FROM tasks')).toEqual({ count: 0 })
+    expect(row(harness, 'SELECT COUNT(*) AS count FROM flights')).toEqual({ count: 0 })
+    expect(row(harness, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 0 })
+  })
+
+  it('atomically refuses Flight creation when cancellation lands immediately before the Flight insert', async () => {
+    harness = makeHarness()
+    const env = envWithCancellationBeforeInsert(harness, /INSERT INTO flights/, 'cancel-before-flight')
+
+    await expect(dispatchRoutineRun(env, 'run-1', NOW)).resolves.toEqual({
+      ok: false, error: 'run_not_dispatchable',
+    })
+    expect(row(harness, 'SELECT COUNT(*) AS count FROM tasks')).toEqual({ count: 1 })
+    expect(row(harness, 'SELECT COUNT(*) AS count FROM flights')).toEqual({ count: 0 })
+    expect(row(harness, 'SELECT COUNT(*) AS count FROM agent_messages')).toEqual({ count: 0 })
   })
 
   it('leaves D1 statement headroom for dispatch in the scheduler invocation', async () => {
