@@ -17,6 +17,7 @@ import { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
+import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { sendToRef, readAgentInbox } from './messages'
 import { verifyAndReadSignedInbox } from '../fleet/signed-inbox'
 
@@ -117,21 +118,32 @@ inboxApp.post('/send', async (c) => {
   if (body.in_reply_to !== undefined && typeof body.in_reply_to !== 'string') return c.json({ error: 'invalid_args', detail: 'in_reply_to must be a string' }, 400)
   if (body.project_id !== undefined && typeof body.project_id !== 'string') return c.json({ error: 'invalid_args', detail: 'project_id must be a string' }, 400)
 
-  const res = await sendToRef(c.env, {
-    fromAgent: id.boundAgentId,
-    fromMember: id.memberId,
-    toRef: to,
-    body: text,
-    kind: body.kind as 'message' | 'request' | 'ack' | undefined,
-    requestId: typeof body.request_id === 'string' ? body.request_id : undefined,
-    inReplyTo: typeof body.in_reply_to === 'string' ? body.in_reply_to : undefined,
-    projectId: typeof body.project_id === 'string' ? body.project_id : undefined,
-  })
+  // Gate 1 (#392): confine the send target for non-admin welded tokens — the SAME rule the MCP
+  // `send` tool enforces (see the docstring on sendToRef in ./messages.ts). This bearer surface
+  // has no AuthContext/role, only a resolved member id, so org-admin is derived directly from
+  // the member's own capability grants.
+  const grants = await resolveCapabilities(c.env, id.memberId)
+  const isAdmin = hasCapability(grants, 'org', null, 'admin')
+
+  const res = await sendToRef(
+    c.env,
+    {
+      fromAgent: id.boundAgentId,
+      fromMember: id.memberId,
+      toRef: to,
+      body: text,
+      kind: body.kind as 'message' | 'request' | 'ack' | undefined,
+      requestId: typeof body.request_id === 'string' ? body.request_id : undefined,
+      inReplyTo: typeof body.in_reply_to === 'string' ? body.in_reply_to : undefined,
+      projectId: typeof body.project_id === 'string' ? body.project_id : undefined,
+    },
+    { isAdmin, grants },
+  )
   if (!res.ok) {
     // Never forward a raw DB error string to the client (leak-guard, matches the MCP path).
     if (res.reason === 'db_error') return c.json({ error: res.reason }, 500)
     const status =
-      res.reason === 'recipient_not_found' || res.reason === 'project_not_found'
+      res.reason === 'recipient_not_found' || res.reason === 'project_not_found' || res.reason === 'send_target_not_visible'
         ? 404
         : res.reason === 'project_access_denied'
           ? 403

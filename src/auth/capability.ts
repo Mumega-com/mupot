@@ -145,6 +145,25 @@ async function resolveSquadDepartment(env: Env, squadId: string): Promise<string
   return r?.department_id ?? null
 }
 
+/**
+ * canOnSquad — squad-scope capability check with department inheritance resolved from D1.
+ * The canonical "can this member act on this squad" primitive (grants + department
+ * inheritance, same ladder as hasCapability). Exported here — rather than only living as
+ * mcp/index.ts's local `memberCanOnSquad` — so non-MCP callers (e.g. the agent-message send
+ * call-path, src/agents/messages.ts) can reuse the SAME check without importing mcp/index.ts,
+ * which would create a circular import (mcp/index.ts already imports agents/messages.ts).
+ * mcp/index.ts's `memberCanOnSquad` delegates to this so there is exactly one implementation.
+ */
+export async function canOnSquad(
+  env: Env,
+  grants: CapabilityGrant[],
+  squadId: string,
+  min: Capability,
+): Promise<boolean> {
+  const deptId = await resolveSquadDepartment(env, squadId)
+  return hasCapability(grants, 'squad', squadId, min, deptId)
+}
+
 // ── middleware ──────────────────────────────────────────────────────────────────
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }

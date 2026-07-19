@@ -104,13 +104,166 @@ function validIdentifier(value: string): boolean {
     && !/(?:Bearer|mupot_|api[_-]?key|access[_-]?token|private[_-]?key|password|secret)/i.test(value)
 }
 
-function validHttpsBaseUrl(value: string): boolean {
+// ── SSRF range check (#392 gate 2) ─────────────────────────────────────────────────────
+// validHttpsBaseUrl gates BOTH where a link can point (createProjectLink) and, defense in
+// depth, where deliverProjectLinkEnvelope is allowed to actually fetch (a link row could in
+// principle predate this check, or a future write path could bypass createProjectLink).
+//
+// Threat model: a project-link's remote_base_url is admin-supplied (createProjectLink requires
+// `admin(actor)`), but "admin of THIS tenant" is not "trusted with THIS Worker's private
+// network reach" — an admin (or an admin token stolen via a lower-severity bug elsewhere)
+// pointing remote_base_url at an internal/loopback/link-local address turns the outbound
+// delivery fetch into an SSRF probe against whatever the Worker's network position can reach
+// (Cloudflare's internal metadata endpoints, other same-account Workers over service bindings
+// are a separate seam, but link-local/loopback/ULA literals are the classic SSRF target set).
+//
+// Corrected claim (this file previously stated this check alone closed "every IP-literal SSRF
+// vector" — that was false-green; adversarial re-gate on #401 found the redirect-following gap
+// below): validHttpsBaseUrl only vets the LITERAL host at write-time and delivery-time. Without
+// pinning the delivery fetch's redirect behavior, a hostile/stolen remote_base_url on a
+// validHttpsBaseUrl-PASSING public host could answer 307/308 (which preserve method+body) to
+// http://127.0.0.1/…, http://169.254.169.254/…, http://10.x/… and workerd would follow it
+// transparently — the literal-host check on remote_base_url never sees the real destination.
+// Fixed at the fetch call site in deliverProjectLinkEnvelope: `redirect: 'manual'` + refuse ALL
+// 3xx outright (isRedirectResponse) rather than chase Location. A correct peer pot answers 2xx
+// directly, so refusing every redirect costs nothing but bad-actor/misconfigured-peer traffic.
+//
+// Residual limitation (accepted, not engineered around — see PR body): this still does NOT
+// re-resolve the hostname at fetch time to catch DNS rebinding (a hostname that resolves to a
+// public IP at link-create time but to 127.0.0.1 by the time delivery fires, with no redirect
+// involved at all). Workers' `fetch` gives no hook to pin/verify the resolved IP per-request
+// from user code, and building a resolver here would be exactly the over-engineering the brief
+// asked us not to do. What this DOES close, honestly stated: every IP-literal SSRF vector on
+// the literal host, the redirect-chase bypass of that check, and the common non-literal decoys
+// (localhost, single-label internal names, userinfo/host-confusion tricks, non-standard ports,
+// trailing-dot bypass). What it does NOT close: DNS rebinding between validation and dial.
+
+function parseIpv4Octets(host: string): number[] | null {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
+  if (!m) return null
+  const octets = m.slice(1, 5).map((part) => Number(part))
+  if (octets.some((o) => !Number.isInteger(o) || o < 0 || o > 255)) return null
+  return octets
+}
+
+function isPrivateOrReservedIpv4(octets: number[]): boolean {
+  const [a, b] = octets
+  if (a === 127) return true // 127.0.0.0/8 — loopback
+  if (a === 10) return true // 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return true // 172.16.0.0/12
+  if (a === 192 && b === 168) return true // 192.168.0.0/16
+  if (a === 169 && b === 254) return true // 169.254.0.0/16 — link-local
+  if (a === 0) return true // 0.0.0.0/8
+  if (a === 100 && b >= 64 && b <= 127) return true // 100.64.0.0/10 — CGNAT shared space
+  return false
+}
+
+/** Expand a bracket-free IPv6 literal (as produced by URL#hostname minus the brackets) into
+ *  eight 16-bit words, resolving `::` compression and an embedded IPv4 tail (`::ffff:a.b.c.d`).
+ *  Returns null for anything that doesn't parse as a well-formed IPv6 address. */
+function expandIpv6Groups(addr: string): number[] | null {
+  if (addr.length === 0) return null
+  if ((addr.match(/::/g) ?? []).length > 1) return null // at most one '::' compression
+
+  let working = addr
+  const lastColon = working.lastIndexOf(':')
+  if (lastColon >= 0) {
+    const tail = working.slice(lastColon + 1)
+    if (tail.includes('.')) {
+      const v4 = parseIpv4Octets(tail)
+      if (!v4) return null
+      const hi = ((v4[0] << 8) | v4[1]).toString(16)
+      const lo = ((v4[2] << 8) | v4[3]).toString(16)
+      working = `${working.slice(0, lastColon + 1)}${hi}:${lo}`
+    }
+  }
+
+  const hasCompression = working.includes('::')
+  const [leftRaw, rightRaw] = hasCompression ? working.split('::') : [working, undefined]
+  if (hasCompression && rightRaw === undefined) return null
+  const left = leftRaw.length ? leftRaw.split(':') : []
+  const right = hasCompression && rightRaw!.length ? rightRaw!.split(':') : []
+  const missing = 8 - (left.length + right.length)
+  if (missing < 0) return null
+  if (!hasCompression && missing !== 0) return null // uncompressed form must have exactly 8 groups
+  if (hasCompression && missing === 0) return null // '::' must stand for at least one group
+
+  const groups = [...left, ...Array<string>(missing).fill('0'), ...right]
+  if (groups.length !== 8) return null
+  const nums: number[] = []
+  for (const g of groups) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null
+    nums.push(Number.parseInt(g, 16))
+  }
+  return nums
+}
+
+function isPrivateOrReservedIpv6(groups: number[]): boolean {
+  if (groups.every((g, i) => (i === 7 ? g === 1 : g === 0))) return true // ::1 — loopback
+  if (groups.every((g) => g === 0)) return true // :: — unspecified, never a valid destination
+  const topByte = (groups[0] >> 8) & 0xff
+  const secondByte = groups[0] & 0xff
+  if (topByte === 0xfc || topByte === 0xfd) return true // fc00::/7 — unique local (ULA)
+  if (topByte === 0xfe && secondByte >= 0x80 && secondByte <= 0xbf) return true // fe80::/10 — link-local
+  // ::ffff:0:0/96 — IPv4-mapped: re-check the embedded v4 address against the v4 rules.
+  if (groups[0] === 0 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0 && groups[4] === 0 && groups[5] === 0xffff) {
+    const v4 = [(groups[6] >> 8) & 0xff, groups[6] & 0xff, (groups[7] >> 8) & 0xff, groups[7] & 0xff]
+    return isPrivateOrReservedIpv4(v4)
+  }
+  // ::a.b.c.d/96 — deprecated IPv4-COMPATIBLE IPv6 (RFC 4291 historic form; same 32-bit v4
+  // embedding as the mapped form above, minus the 0xffff marker word — e.g. `::127.0.0.1` /
+  // `[::7f00:1]` both decode to groups[5]===0 with the v4 octets in groups[6..7]). Gate re-audit
+  // on #401 found this form wasn't checked: `[::7f00:1]` (== ::127.0.0.1, a loopback literal)
+  // passed isPrivateOrReservedIpv6 uncaught because only the ::ffff:-marked mapped form above
+  // was handled. Re-check the embedded v4 exactly the same way.
+  if (groups[0] === 0 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0 && groups[4] === 0 && groups[5] === 0) {
+    const v4 = [(groups[6] >> 8) & 0xff, groups[6] & 0xff, (groups[7] >> 8) & 0xff, groups[7] & 0xff]
+    return isPrivateOrReservedIpv4(v4)
+  }
+  return false
+}
+
+function isBlockedHost(hostnameRaw: string): boolean {
+  let hostname = hostnameRaw.toLowerCase()
+  if (hostname.length === 0) return true
+  // trailing-dot bypass: "internal." must be treated identically to "internal" — the URL
+  // parser preserves the dot in `hostname`, allowlist logic elsewhere may not expect it.
+  if (hostname.endsWith('.') && !hostname.endsWith('::.') && !hostname.startsWith('[')) {
+    hostname = hostname.slice(0, -1)
+  }
+  if (hostname === 'localhost') return true
+
+  if (hostname.startsWith('[') && hostname.endsWith(']')) {
+    const groups = expandIpv6Groups(hostname.slice(1, -1))
+    if (!groups) return true // unparseable IPv6 literal — refuse rather than guess
+    return isPrivateOrReservedIpv6(groups)
+  }
+  const v4 = parseIpv4Octets(hostname)
+  if (v4) return isPrivateOrReservedIpv4(v4)
+
+  // Not an IP literal: a bare single-label hostname ("internal", "consul", "metadata") is
+  // never a legitimate public peer-pot origin — real domains carry a TLD.
+  if (!hostname.includes('.')) return true
+
+  return false
+}
+
+export function validHttpsBaseUrl(value: string): boolean {
+  let url: URL
   try {
-    const url = new URL(value)
-    return url.protocol === 'https:' && !url.username && !url.password && url.pathname === '/' && !url.search && !url.hash
+    url = new URL(value)
   } catch {
     return false
   }
+  if (url.protocol !== 'https:') return false
+  if (url.username || url.password) return false // userinfo / host-confusion tricks (user@host)
+  if (url.pathname !== '/' || url.search || url.hash) return false
+  // Standard port only. URL#port is '' when the port matches the scheme default (443 for
+  // https), so this accepts an implicit or explicit :443 and refuses everything else —
+  // closing off "internal service reachable over TLS on a non-standard port."
+  if (url.port !== '') return false
+  if (isBlockedHost(url.hostname)) return false
+  return true
 }
 
 interface ProjectLinkRow extends Omit<ProjectLink, 'capabilities' | 'approved_evidence_origins'> {
@@ -156,6 +309,12 @@ function normalizeEvidenceOrigins(value: unknown): string[] | null {
     try {
       const url = new URL(candidate)
       if (url.protocol !== 'https:' || url.username || url.password || url.origin !== candidate || url.pathname !== '/' || url.search || url.hash) return null
+      // Defense-in-depth (LOW, gate follow-up): evidence origins are never fetched by this
+      // codebase today — they're compared against the envelope's evidence URL as a hash-stored
+      // origin string, never dialed — so this isn't live-exploitable yet. Still apply the same
+      // isBlockedHost check as remote_base_url so a future code path that DOES fetch an
+      // approved evidence origin doesn't have to rediscover this invariant the hard way.
+      if (isBlockedHost(url.hostname)) return null
       origins.push(url.origin)
     } catch { return null }
   }
@@ -533,6 +692,16 @@ function retryable(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || status >= 500
 }
 
+// Gate 2 (#392) redirect refusal (see the fetcher call above). `as string`: Workers-types
+// narrows Response.type to "default"|"error" (real workerd redirect:'manual' returns the
+// literal 3xx, never an opaque redirect), but this file also runs under vitest/undici in
+// tests where a mocked Response can carry 'opaqueredirect' (status 0). Widen the comparison
+// rather than the type — same pattern as src/departments/executors/shared/cms-adapter.ts.
+function isRedirectResponse(response: Response): boolean {
+  const resType = response.type as string
+  return resType === 'opaqueredirect' || (response.status >= 300 && response.status < 400)
+}
+
 async function readBoundedRemoteJson(response: Response, timeoutMs: number): Promise<
   | { ok: true; value: unknown }
   | { ok: false; error: 'remote_response_too_large' | 'invalid_remote_response' }
@@ -669,6 +838,23 @@ export async function deliverProjectLinkEnvelope(
   const link = await loadLink(env, linkId, db)
   if (!link) return { ok: false, reason: 'link_not_found' }
   if (link.state !== 'active') return { ok: false, reason: 'link_revoked' }
+  // Gate 2 (#392) defense in depth: re-validate the stored destination immediately before it
+  // is ever handed to `fetch`. createProjectLink already rejects an unsafe remote_base_url at
+  // write time — this catches a row that predates the check, or reaches this table by any path
+  // other than createProjectLink, from ever being dialed.
+  if (!validHttpsBaseUrl(link.remote_base_url)) return { ok: false, reason: 'invalid_link' }
+  // Trailing-slash normalization (gate re-audit follow-up, #401): the delivery URL below is
+  // built by raw string concat (`${remoteBaseUrl}api/...`) — that's only safe because
+  // createProjectLink stores `new URL(input.remote_base_url).toString()`, which always
+  // serializes with a trailing '/'. validHttpsBaseUrl's own `new URL()` parse re-validates the
+  // HOST but doesn't touch the stored string, so a row written by anything other than
+  // createProjectLink (a migration, a future write path, direct DB access) that predates or
+  // bypasses that normalization could still pass validHttpsBaseUrl while lacking the trailing
+  // slash — e.g. a stored "https://good.example" (no path) would concat to
+  // "https://good.exampleapi/..." instead of "https://good.example/api/...", shifting the
+  // fetched host/path away from what was validated. Re-derive the serialized form here, right
+  // before it's used to build the fetch URL, instead of trusting the stored bytes.
+  const remoteBaseUrl = new URL(link.remote_base_url).toString()
   const validation = validateProjectLinkEnvelope(signed.envelope, {
     approvedEvidenceOrigins: link.approved_evidence_origins,
   })
@@ -771,11 +957,19 @@ export async function deliverProjectLinkEnvelope(
       const timeout = setTimeout(() => controller.abort(), timeoutMs)
       let response: Response
       try {
-        response = await fetcher(`${link.remote_base_url}api/project-links/${encodeURIComponent(link.remote_link_id)}/deliver`, {
+        response = await fetcher(`${remoteBaseUrl}api/project-links/${encodeURIComponent(link.remote_link_id)}/deliver`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(signed),
           signal: controller.signal,
+          // Gate 2 (#392) — do NOT auto-follow redirects. `redirect: 'follow'` (the fetch
+          // default) is what turned the SSRF host-literal check into theater: a hostile or
+          // stolen remote_base_url on a validHttpsBaseUrl-passing PUBLIC host can answer with
+          // 307/308 (which preserve method+body) -> http://127.0.0.1/..., 169.254.169.254, or
+          // 10.x — workerd follows it transparently and validHttpsBaseUrl never sees the real
+          // destination. `redirect: 'manual'` hands the raw 3xx response back to this code
+          // instead, so the block below can refuse it outright.
+          redirect: 'manual',
         })
       } finally {
         clearTimeout(timeout)
@@ -837,6 +1031,13 @@ export async function deliverProjectLinkEnvelope(
           return { ok: true, receipt }
         }
         lastError = 'invalid_remote_receipt'
+      } else if (isRedirectResponse(response)) {
+        // Gate 2 (#392) — refuse ALL redirects from a link delivery endpoint. A correct peer
+        // pot answers 2xx directly; a 3xx here is either a misconfigured peer or an SSRF probe
+        // riding a stolen/hostile remote_base_url. Terminal, not retryable — retrying a redirect
+        // just re-issues the same probe.
+        lastError = 'delivery_redirect_refused'
+        break
       } else {
         lastError = `remote_http_${response.status}`
         if (!retryable(response.status)) break

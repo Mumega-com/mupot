@@ -34,7 +34,7 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, hasCapability, holdsCapabilityFloor } from '../auth/capability'
+import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad } from '../auth/capability'
 import { isChannel } from '../members/service'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
@@ -254,24 +254,16 @@ async function authenticateMember(c: {
 }
 
 // ── capability checks (use the FROZEN pure API + scope inheritance) ───────────
-// For a SQUAD scope, a department-level grant must inherit down — so we resolve
-// the squad's department_id from D1 (mirrors capability.ts's middleware) and pass
-// it to the pure hasCapability. Fail-closed: an unknown squad → no inheritance.
-async function resolveSquadDepartment(env: Env, squadId: string): Promise<string | null> {
-  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
-    .bind(squadId)
-    .first<{ department_id: string }>()
-  return r?.department_id ?? null
-}
-
+// For a SQUAD scope, a department-level grant must inherit down. Delegates to the
+// canonical src/auth/capability.ts#canOnSquad (single implementation — see that file's
+// docstring for why it lives there instead of here).
 export async function memberCanOnSquad(
   env: Env,
   grants: CapabilityGrant[],
   squadId: string,
   min: Capability,
 ): Promise<boolean> {
-  const deptId = await resolveSquadDepartment(env, squadId)
-  return hasCapability(grants, 'squad', squadId, min, deptId)
+  return canOnSquad(env, grants, squadId, min)
 }
 
 // ── d1 helpers (read-only lookups; allow-listed table names) ──────────────────
@@ -1640,20 +1632,30 @@ const toolSend: ToolSpec = {
     if (args.project_id !== undefined && typeof args.project_id !== 'string')
       return fail(400, 'invalid_args', 'project_id must be a string')
 
-    const res = await sendToRef(env, {
-      fromAgent,
-      fromMember: auth.memberId as string,
-      toRef: to,
-      body,
-      kind: args.kind as 'message' | 'request' | 'ack' | undefined,
-      requestId: typeof args.request_id === 'string' ? args.request_id : undefined,
-      inReplyTo: typeof args.in_reply_to === 'string' ? args.in_reply_to : undefined,
-      projectId: typeof args.project_id === 'string' ? args.project_id : undefined,
-    })
+    // Gate 1 (#392): confine the send target for non-admin welded tokens (see the docstring on
+    // sendToRef in src/agents/messages.ts). hasWorkspaceAdmin already handles the legacy-role
+    // escape; auth.capabilities is always resolved (never undefined) for a token-authenticated
+    // MCP principal, so `?? []` is a defensive fallback only.
+    const res = await sendToRef(
+      env,
+      {
+        fromAgent,
+        fromMember: auth.memberId as string,
+        toRef: to,
+        body,
+        kind: args.kind as 'message' | 'request' | 'ack' | undefined,
+        requestId: typeof args.request_id === 'string' ? args.request_id : undefined,
+        inReplyTo: typeof args.in_reply_to === 'string' ? args.in_reply_to : undefined,
+        projectId: typeof args.project_id === 'string' ? args.project_id : undefined,
+      },
+      { isAdmin: hasWorkspaceAdmin(auth), grants: auth.capabilities ?? [] },
+    )
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
       const status =
-        res.reason === 'recipient_not_found' || res.reason === 'project_not_found'
+        res.reason === 'recipient_not_found' ||
+        res.reason === 'project_not_found' ||
+        res.reason === 'send_target_not_visible'
           ? 404
           : res.reason === 'project_access_denied'
             ? 403
@@ -1747,6 +1749,9 @@ const toolBroadcast: ToolSpec = {
         body,
         kind,
         requestId: recipientRequestId,
+      }, {
+        system: true,
+        reason: 'target is drawn from resolveScopedSquad(...), an already squad-scoped set (>=member) — never resolveAgentRef on attacker input',
       })
       if (res.ok) {
         deliveries.push({

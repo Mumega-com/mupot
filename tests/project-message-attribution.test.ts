@@ -8,6 +8,11 @@ import { createSqliteD1 } from './helpers/sqlite-d1'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 
+// sendAgentMessage's authz param is a compile-time forcing function only (#401 WARN
+// follow-up) — this file exercises the raw primitive directly, not through sendToRef's
+// confinement.
+const TEST_AUTHZ = { system: true, reason: 'test: exercises sendAgentMessage primitive directly' } as const
+
 function migratedProjectDb() {
   const fixture = createSqliteD1()
   for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
@@ -94,7 +99,7 @@ describe('project-attributed agent messages', () => {
         kind: 'request',
         requestId: 'project-request-1',
         projectId: 'project-a',
-      }, { idGen: () => 'message-a', now: () => '2026-07-18T20:00:00.000Z' })
+      }, TEST_AUTHZ, { idGen: () => 'message-a', now: () => '2026-07-18T20:00:00.000Z' })
       expect(sent).toMatchObject({ ok: true, duplicate: false })
 
       const inbox = await readAgentInbox(env, { agent: 'agent-b', peek: true })
@@ -116,7 +121,7 @@ describe('project-attributed agent messages', () => {
         toAgent: 'agent-outside',
         body: 'not shared',
         projectId: 'project-b',
-      })
+      }, TEST_AUTHZ)
       expect(result).toEqual({ ok: false, reason: 'project_access_denied' })
     } finally {
       close()
@@ -130,13 +135,13 @@ describe('project-attributed agent messages', () => {
       const first = await sendAgentMessage(env, {
         fromAgent: 'agent-a', fromMember: 'member-a', toAgent: 'agent-b', body: 'same',
         requestId: 'project-request-2', projectId: 'project-a',
-      }, { idGen: () => 'message-b' })
+      }, TEST_AUTHZ, { idGen: () => 'message-b' })
       expect(first).toMatchObject({ ok: true, duplicate: false })
 
       const conflict = await sendAgentMessage(env, {
         fromAgent: 'agent-a', fromMember: 'member-a', toAgent: 'agent-b', body: 'same',
         requestId: 'project-request-2', projectId: 'project-b',
-      })
+      }, TEST_AUTHZ)
       expect(conflict).toMatchObject({ ok: false, reason: 'request_id_conflict' })
     } finally {
       close()

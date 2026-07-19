@@ -14,8 +14,9 @@
 //     with different content it is rejected (request_id_conflict), never a silent drop. Scoping
 //     by from_agent stops one agent poisoning another's rid namespace. Dedup wins over the cap.
 
-import type { Env } from '../types'
+import type { Env, CapabilityGrant } from '../types'
 import { resolveAgentRef } from '../org/resolve'
+import { canOnSquad } from '../auth/capability'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 const MAX_BODY_CHARS = 8000
@@ -112,12 +113,34 @@ function isRef(v: string): boolean {
 // slug is not globally unique, and a LIMIT-1 slug pick is a self-poisoning defect). This
 // service receives an already-resolved, existence-checked agent id as toAgent.
 
+// Compile-time forcing function (#401 WARN follow-up, adversarial re-gate on PR #401):
+// sendAgentMessage itself has NO confinement of its own — Gate 1's squad/project-visibility
+// check lives one layer up, in sendToRef, and only runs for callers that go through
+// resolveAgentRef + sendToRef. Before this, nothing stopped a FUTURE tool from importing this
+// primitive directly with an attacker-controlled toAgent and silently getting unconfined
+// tenant-wide send back — the 3 callers that already do this today (`bus/fleet-bridge.ts`
+// task-dispatch, `fleet/control.ts` fixed FLEET_CONSUMER_AGENT target, `mcp/index.ts`
+// `broadcast` querying an already squad-scoped set) are safe by CONTEXT, not by any check this
+// function makes, and that safety is invisible at the call site. `authz` makes every caller
+// spell out its authorization story: either it's the SAME SendTargetAuthz sendToRef used for
+// its own confinement decision (threaded through unchanged), or the caller is one of the
+// system-internal cases above and passes `{ system: true, reason: '<why this target is not
+// attacker-controlled>' }`. Not read at runtime — the type is the guardrail; a new caller
+// literally cannot compile without making this call.
+export type SendAuthzDecision = SendTargetAuthz | { system: true; reason: string }
+
 // ── send ────────────────────────────────────────────────────────────────────────────────
 export async function sendAgentMessage(
   env: Env,
   input: SendInput,
+  authz: SendAuthzDecision,
   opts: Opts = {},
 ): Promise<SendResult | SendFailure> {
+  // authz is a compile-time forcing function, not a runtime check (see SendAuthzDecision doc
+  // above) — this primitive still trusts its caller's confinement decision. Nothing to branch
+  // on here; the `void` just satisfies noUnusedParameters without disguising the param as
+  // dead via a leading underscore (its name documents the contract at every call site).
+  void authz
   const tenant = env.TENANT_SLUG
   if (!tenant) return { ok: false, reason: 'no_tenant' }
 
@@ -415,9 +438,45 @@ export function readVerifiedSignedAgentInbox(
 // Resolves a recipient REF (id or unique slug) via the canonical, security-reviewed
 // resolveAgentRef (id-first, slug-ambiguity refused), then delegates to sendAgentMessage. One
 // code path so the MCP and HTTP surfaces can NEVER diverge on validation/replay/cap semantics.
+//
+// GATE 1 (#392, welded-token send confinement): resolveAgentRef resolves ANY agent tenant-wide
+// — it has to, for admin/system callers (mint_agent_token, orient, provision, fleet). But a
+// non-admin, agent-bound (welded) member token calling `send`/POST /api/inbox/send must NOT be
+// able to message an arbitrary agent elsewhere in the pot just because it knows (or guesses) an
+// id/slug. The target is confined to:
+//   (a) agents in a squad the sender can read (memberCanOnSquad/canOnSquad, ≥observer) — the
+//       SAME grants machinery every other per-squad gate in this codebase uses, or
+//   (b) a destination the send's own projectId scoping already authorizes: sendAgentMessage
+//       ALREADY runs validateMessageProjectAccess whenever input.projectId is supplied, which
+//       requires BOTH sender and recipient to sit on a squad with project_squad_access to that
+//       project (this is the "project-link mapping" surface — project_squad_access is the
+//       table addons/project-link's local_squad_id/local_agent_id bind into). So: when (a)
+//       fails but a projectId is present, this function does NOT block early — it lets
+//       sendAgentMessage's existing project-access check be the authority (OR semantics).
+// Admin/owner (authz.isAdmin) keeps the current tenant-wide behavior unchanged — no visibility
+// gate, original recipient_not_found/recipient_ambiguous errors preserved.
+//
+// Fail-closed + non-leaking: for a non-admin, EVERY path that would otherwise reveal whether a
+// ref names a real-but-invisible agent vs. no agent at all (ref doesn't resolve, resolves
+// ambiguously, or resolves but isn't visible with no project to fall back on) collapses to the
+// SAME reason string, 'send_target_not_visible' — an attacker probing refs cannot distinguish
+// "no such agent" from "exists, not yours to reach."
+export interface SendTargetAuthz {
+  /** org-admin/owner capability (hasCapability(grants, 'org', null, 'admin')) — preserves the
+   *  pre-gate tenant-wide send behavior for admin/system-operator principals. */
+  isAdmin: boolean
+  /** the SENDER's own capability grants (never the recipient's) — used for the squad-visibility
+   *  check (case a) only when isAdmin is false. */
+  grants: CapabilityGrant[]
+}
+
 export type SendToRefResult =
   | { ok: true; id: string; seq: number; duplicate: boolean; toAgent: string }
-  | { ok: false; reason: 'recipient_not_found' | 'recipient_ambiguous' | SendFailure['reason']; detail?: string }
+  | {
+      ok: false
+      reason: 'recipient_not_found' | 'recipient_ambiguous' | 'send_target_not_visible' | SendFailure['reason']
+      detail?: string
+    }
 
 export async function sendToRef(
   env: Env,
@@ -431,12 +490,29 @@ export async function sendToRef(
     inReplyTo?: string
     projectId?: string
   },
+  authz: SendTargetAuthz,
   opts: Opts = {},
 ): Promise<SendToRefResult> {
   const resolved = await resolveAgentRef(env, input.toRef)
   if (!resolved.ok) {
+    if (!authz.isAdmin) return { ok: false, reason: 'send_target_not_visible' }
     return { ok: false, reason: resolved.reason === 'ambiguous' ? 'recipient_ambiguous' : 'recipient_not_found' }
   }
+
+  // squadVisible stays `true` for admins (case (a) is never consulted, so it must never gate
+  // the fallback-collapse below either) and is only computed — and only matters — once we know
+  // we're in the non-admin path.
+  let squadVisible = true
+  if (!authz.isAdmin) {
+    squadVisible = await canOnSquad(env, authz.grants, resolved.value.squad_id, 'observer')
+    // Case (a) failed. Case (b) can only save it if a projectId is attached — otherwise there
+    // is no other authorization surface to consult, so refuse now, before ever calling
+    // sendAgentMessage (no DB write attempted, no existence oracle for the target).
+    if (!squadVisible && input.projectId === undefined) {
+      return { ok: false, reason: 'send_target_not_visible' }
+    }
+  }
+
   const res = await sendAgentMessage(
     env,
     {
@@ -449,9 +525,25 @@ export async function sendToRef(
       inReplyTo: input.inReplyTo,
       projectId: input.projectId,
     },
+    authz,
     opts,
   )
-  if (!res.ok) return res
+  if (!res.ok) {
+    // Existence-oracle closure (re-gate fix, #401): once squad-visibility (case a) has failed,
+    // reaching sendAgentMessage AT ALL already proves resolveAgentRef found a real agent — the
+    // early `!resolved.ok` branch above is the ONLY path that returns before validation for a
+    // ref that doesn't exist. So for a non-admin whose squad check failed, ANY failure reason
+    // sendAgentMessage can produce here — project_not_found / project_archived /
+    // project_access_denied, but just as much invalid_body / request_id_conflict / inbox_full /
+    // db_error — is itself a distinguisher (a nonexistent ref can never surface those). Collapse
+    // every one of them to the SAME send_target_not_visible a nonexistent ref gets. This does
+    // not touch the admin path or the case-(a)-succeeded path, where the specific reason is
+    // legitimate operational feedback, not a leak.
+    if (!authz.isAdmin && !squadVisible) {
+      return { ok: false, reason: 'send_target_not_visible' }
+    }
+    return res
+  }
   return { ok: true, id: res.id, seq: res.seq, duplicate: res.duplicate, toAgent: resolved.value.id }
 }
 
