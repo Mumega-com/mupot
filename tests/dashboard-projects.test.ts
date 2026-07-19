@@ -1514,4 +1514,15 @@ describe('project dashboard routes', () => {
     expect(fragment).toContain('overflow-wrap:anywhere')
     expect(fragment).not.toMatch(/width:\s*\d+px/)
   })
+
+  it('renders the authorized shared situation as a parseable browser projection', async () => {
+    harness = makeHarness()
+    const view = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'visible-child')
+    const fragment = await render(projectDetailBody(view!))
+    const match = fragment.match(/<script type="application\/json" id="project-situation-json">([^<]*)<\/script>/)
+
+    expect(match).not.toBeNull()
+    expect(JSON.parse(match![1]!)).toEqual(view?.situation)
+    expect(match![1]).not.toContain('<')
+  })
 })

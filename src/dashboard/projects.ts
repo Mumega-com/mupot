@@ -1137,6 +1137,13 @@ function projectTabs() {
   </script>`
 }
 
+function jsonScript(value: unknown): string {
+  return JSON.stringify(value)
+    .replaceAll('<', '\\u003c')
+    .replaceAll('>', '\\u003e')
+    .replaceAll('&', '\\u0026')
+}
+
 const PROJECT_RESULT_MESSAGES: Readonly<Record<string, string>> = {
   created: 'Project created.',
   updated: 'Project settings saved.',
@@ -1178,7 +1185,7 @@ export function projectDetailBody(view: ProjectDetailView, statusResult?: string
           <span class="ui-panel-sub">No external runtime reported.</span>
           ${member.runtime_status ? html`<span class="ui-panel-sub">Stored intent: ${member.runtime_status}</span>` : ''}
         </span>`,
-    pill(memberPresenceLabel(member.presence), memberPresenceTone(member.presence)),
+    html`<span data-project-agent-presence data-agent-id="${member.agent_id}" data-presence="${member.presence}">${pill(memberPresenceLabel(member.presence), memberPresenceTone(member.presence))}</span>`,
     html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
       <span>${member.host || 'Host not reported'}</span>
       <span class="ui-panel-sub" style="white-space:normal;overflow-wrap:anywhere;">Last seen: ${member.last_seen || 'Never reported'}</span>
@@ -1215,6 +1222,7 @@ export function projectDetailBody(view: ProjectDetailView, statusResult?: string
     ${resultMessage ? html`<p role="status" style="margin:8px 0;color:var(--ok,#16a34a);">${resultMessage}</p>` : ''}
     ${view.canManage ? html`<div style="display:flex;justify-content:flex-end;margin:8px 0;"><a class="btn secondary sm" href="/projects/${encodeURIComponent(project.id)}/settings">Project settings</a></div>` : ''}
     ${projectTabs()}
+    <script type="application/json" id="project-situation-json">${raw(jsonScript(situation))}</script>
     ${operatingSituationBand(project, aggregates, situation)}
     <section id="work" aria-label="Work">
       ${sectionPanel({

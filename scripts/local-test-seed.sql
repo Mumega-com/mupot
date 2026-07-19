@@ -346,6 +346,9 @@ VALUES
   ('journey-local-1', 'local', 'agent-hermes', 'mupot', 'Smoke every dashboard page', 'departed', 'PR #local', unixepoch('now','-20 minutes') * 1000, unixepoch('now','+20 minutes') * 1000, NULL, unixepoch('now','-25 minutes') * 1000, unixepoch('now','-20 minutes') * 1000),
   ('journey-local-2', 'local', 'agent-growth', 'digid', 'Hold local growth checks', 'boarding', '', NULL, unixepoch('now','+50 minutes') * 1000, NULL, unixepoch('now','-10 minutes') * 1000, unixepoch('now','-10 minutes') * 1000);
 
+DELETE FROM fleet_agents
+WHERE tenant = 'local' AND agent_id IN ('hermes-local', 'codex-local');
+
 INSERT OR REPLACE INTO fleet_agents (
   agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status,
   reported_by, last_reported_at, updated_at, agent_type, member_id, host

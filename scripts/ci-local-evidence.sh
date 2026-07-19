@@ -11,6 +11,7 @@ EVIDENCE_DIR="${MUPOT_LOCAL_EVIDENCE_DIR:-${ROOT_DIR}/tmp/local-evidence}"
 WRANGLER_LOG="${EVIDENCE_DIR}/wrangler-dev.log"
 
 mkdir -p "${EVIDENCE_DIR}" "${ROOT_DIR}/tmp/local-smoke" "${ROOT_DIR}/tmp/local-runtime-conformance"
+STATE_DIR="$(mktemp -d "${EVIDENCE_DIR}/state.XXXXXX")"
 cd "${ROOT_DIR}"
 
 WRANGLER=(npx --no-install wrangler)
@@ -23,6 +24,9 @@ cleanup() {
   if [ -n "${dev_pid}" ] && kill -0 "${dev_pid}" >/dev/null 2>&1; then
     kill "${dev_pid}" >/dev/null 2>&1 || true
     wait "${dev_pid}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${STATE_DIR}" && "${STATE_DIR}" == "${EVIDENCE_DIR}"/state.* ]]; then
+    rm -rf -- "${STATE_DIR}"
   fi
 }
 trap cleanup EXIT
@@ -55,15 +59,23 @@ wait_for_health() {
 }
 
 say "Applying local D1 migrations"
-npm run migrate:local:test
+"${WRANGLER[@]}" d1 migrations apply mupot-local-test \
+  --local \
+  --config wrangler-local-test.toml \
+  --persist-to "${STATE_DIR}"
 
 say "Seeding local D1 fixtures"
-npm run seed:local:test
+"${WRANGLER[@]}" d1 execute mupot-local-test \
+  --local \
+  --config wrangler-local-test.toml \
+  --persist-to "${STATE_DIR}" \
+  --file scripts/local-test-seed.sql
 
 say "Starting local Wrangler server at ${BASE_URL}"
 "${WRANGLER[@]}" dev \
   --local \
   --config wrangler-local-test.toml \
+  --persist-to "${STATE_DIR}" \
   --port "${PORT}" \
   --show-interactive-dev-session=false \
   --log-level warn \

@@ -92,8 +92,9 @@ Must ship:
    - tasks, flights, messages, verdicts, workflow receipts, dispatches, landings,
      and acknowledgements project correctly into Activity and Evidence;
    - pagination, RBAC, archive, and cross-tenant behavior fail closed.
-   - local evidence compares one seeded Project situation through REST, MCP, and the
-     dashboard, and proves the owner lifecycle in a real desktop and mobile browser.
+   - isolated local evidence structurally compares one seeded Project situation through the
+     browser, REST, MCP, and dashboard loader, and proves persisted owner lifecycle transitions
+     in a real desktop and mobile browser.
 4. **Project-linked collaboration**
    - Project Link addon supports narrow cross-pot task/evidence exchange;
    - Agent Hosts on Mac or Kubernetes appear as replaceable project executors;

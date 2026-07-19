@@ -18,10 +18,10 @@ block collapses into a changelog entry when it ships.
 ### Verified
 
 - Local Project Operations evidence now seeds blocked, review, in-progress, and completed
-  Mupot work with truthful agent runtime presence. It compares the shared Project situation
-  through REST, MCP, and the dashboard loader, then exercises owner create, edit, activate,
-  search/filter, pause, archive, and restore flows in a real browser at desktop and mobile
-  widths.
+  Mupot work with truthful agent runtime presence. A real browser structurally reads the same
+  `project-mupot` situation as REST and MCP, while dashboard-loader tests preserve exact equality.
+  The isolated evidence run exercises owner create, edit, activate, complete, reopen, search/filter,
+  pause, archive, and restore flows at desktop and mobile widths without retaining run-created rows.
 
 ## [0.23.0] — 2026-07-13
 

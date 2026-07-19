@@ -35,6 +35,7 @@ const REPO_ROOT = join(__dirname, '..')
 const MIGRATIONS_DIR = join(REPO_ROOT, 'migrations')
 const SEED_PATH = join(REPO_ROOT, 'scripts', 'local-test-seed.sql')
 const BROWSER_SMOKE_PATH = join(REPO_ROOT, 'scripts', 'local-browser-smoke.mjs')
+const EVIDENCE_DRIVER_PATH = join(REPO_ROOT, 'scripts', 'ci-local-evidence.sh')
 const README_PATH = join(REPO_ROOT, 'README.md')
 
 function createSeededDatabase() {
@@ -127,10 +128,41 @@ describe('local project workspace showcase', () => {
     }
   })
 
-  it('replays idempotently while enforcing one child level and explicit squad access', () => {
+  it('keeps the canonical receipt fixture stable across two seeds and removes superseded fleet keys', () => {
     const harness = createSeededDatabase()
     try {
+      const snapshot = () => ({
+        projects: harness.sqlite.prepare('SELECT COUNT(*) AS count FROM projects').get(),
+        localTasks: harness.sqlite.prepare("SELECT COUNT(*) AS count FROM tasks WHERE id LIKE 'task-%-local'").get(),
+        localFlights: harness.sqlite.prepare("SELECT COUNT(*) AS count FROM flights WHERE id LIKE 'flight-%-local'").get(),
+        fleet: harness.sqlite.prepare(`
+          SELECT agent_id, runtime, status, reported_by
+          FROM fleet_agents
+          WHERE tenant = 'local'
+          ORDER BY agent_id
+        `).all(),
+      })
+      const firstSeed = snapshot()
+      harness.sqlite.exec(`
+        INSERT INTO fleet_agents
+          (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, last_reported_at, updated_at)
+        VALUES
+          ('hermes-local', 'local', 'Superseded Hermes', 'hermes-cron', '[]', 'always_on', 'running', 'local-seed', datetime('now'), datetime('now')),
+          ('codex-local', 'local', 'Superseded Codex', 'codex', '[]', 'on_demand', 'stopped', 'local-seed', datetime('now'), datetime('now'));
+      `)
+
       expect(() => harness.sqlite.exec(readFileSync(SEED_PATH, 'utf8'))).not.toThrow()
+      expect(snapshot()).toEqual(firstSeed)
+      expect(firstSeed).toEqual({
+        projects: { count: 8 },
+        localTasks: { count: 5 },
+        localFlights: { count: 3 },
+        fleet: [
+          { agent_id: 'agent-conformance', runtime: 'systemd-user', status: 'running', reported_by: 'local-seed' },
+          { agent_id: 'agent-growth', runtime: 'codex', status: 'stopped', reported_by: 'local-seed' },
+          { agent_id: 'agent-hermes', runtime: 'hermes-cron', status: 'running', reported_by: 'local-seed' },
+        ],
+      })
 
       expect(harness.sqlite.prepare(`
         SELECT id FROM projects WHERE parent_project_id IS NULL ORDER BY id
@@ -275,6 +307,7 @@ describe('local project workspace showcase', () => {
 
   it('keeps the browser crawl and adds desktop and mobile project workspace checks', () => {
     const smoke = readFileSync(BROWSER_SMOKE_PATH, 'utf8')
+    const evidenceDriver = readFileSync(EVIDENCE_DRIVER_PATH, 'utf8')
 
     expect(smoke).toContain("'/projects'")
     expect(smoke).toContain("'/projects/project-mupot'")
@@ -286,6 +319,12 @@ describe('local project workspace showcase', () => {
     expect(smoke).toContain('width: 390, height: 844')
     expect(smoke).toMatch(/scrollWidth\s*-\s*document\.documentElement\.clientWidth/)
     expect(smoke).toContain('await runProjectWorkspaceWorkflow()')
+    expect(smoke).toContain('project-situation-json')
+    expect(smoke).toContain("'complete', 'completed'")
+    expect(smoke).toContain('observedPersistedStatus')
+    expect(smoke).toContain('surfaceParity')
+    expect(evidenceDriver).toContain('mktemp -d')
+    expect(evidenceDriver.match(/--persist-to/g)?.length).toBeGreaterThanOrEqual(3)
   })
 
   it('documents the pot and bounded project model without coupling Mupot to SOS', () => {
