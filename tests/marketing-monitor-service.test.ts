@@ -1,4 +1,6 @@
+import { execFile } from 'node:child_process'
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
@@ -176,31 +178,26 @@ async function canonicalEvidenceDigest(evidence: {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
-const arraySomeIntrinsic = Array.prototype.some
-
-function poisonIntrinsicForFixtureData<T extends (...args: any[]) => unknown>(
-  name: string,
-  original: T,
-  applies: (receiver: unknown, args: readonly unknown[]) => boolean,
-): T {
-  return function (this: unknown, ...args: unknown[]) {
-    if (applies(this, args)) throw new Error(`poisoned ${name}`)
-    return Reflect.apply(original, this, args)
-  } as unknown as T
-}
-
-function isIntrinsicFixtureData(value: unknown): boolean {
-  if (Array.isArray(value)) {
-    return Reflect.apply(arraySomeIntrinsic, value, [(item: unknown) => isIntrinsicFixtureData(item)]) as boolean
-  }
-  if (typeof value !== 'object' || value === null) return false
-  const record = value as { key?: unknown; sourceKey?: unknown }
-  return record.key === 'intrinsic_fixture' || record.sourceKey === 'intrinsic_fixture'
-}
-
-function poisonToJsonForFixtureData(this: object): object {
-  if (isIntrinsicFixtureData(this)) throw new Error('poisoned Object.toJSON')
-  return this
+function runIntrinsicPoisoningFixture(): Promise<unknown> {
+  const runner = fileURLToPath(new URL('./fixtures/marketing-monitor-intrinsic-poisoning-runner.mjs', import.meta.url))
+  const root = fileURLToPath(new URL('..', import.meta.url))
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [runner], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 15_000,
+    }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(`intrinsic poisoning fixture failed: ${stderr || error.message}`))
+        return
+      }
+      try {
+        resolve(JSON.parse(stdout))
+      } catch (parseError) {
+        reject(new Error(`intrinsic poisoning fixture returned invalid JSON: ${String(parseError)}`))
+      }
+    })
+  })
 }
 
 function directRunValues(harness: SqliteD1Harness, overrides: Partial<Record<string, unknown>> = {}) {
@@ -683,89 +680,30 @@ describe('marketing monitor service', () => {
   })
 
   it('keeps persistence and digest canonical after post-load intrinsic poisoning', async () => {
-    await activateMarketing(env)
-    const originalDb = env.DB
-    const originals = {
-      encode: TextEncoder.prototype.encode,
-      map: Array.prototype.map,
-      filter: Array.prototype.filter,
-      some: Array.prototype.some,
-      toJSON: Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON'),
-    }
-    const safeBatchDb = {
-      prepare: originalDb.prepare.bind(originalDb),
-      async batch<T>(statements: Parameters<typeof originalDb.batch<T>>[0]) {
-        const poisoned = {
-          map: Array.prototype.map,
-          filter: Array.prototype.filter,
-          some: Array.prototype.some,
-        }
-        Array.prototype.map = originals.map
-        Array.prototype.filter = originals.filter
-        Array.prototype.some = originals.some
-        try {
-          return await originalDb.batch<T>(statements)
-        } finally {
-          Array.prototype.map = poisoned.map
-          Array.prototype.filter = poisoned.filter
-          Array.prototype.some = poisoned.some
-        }
+    const unrelatedCycle: unknown[] = []
+    unrelatedCycle[0] = unrelatedCycle
+    let proxyReads = 0
+    const unrelatedProxy = new Proxy({}, {
+      get() {
+        proxyReads += 1
+        throw new Error('unrelated proxy read')
       },
-    } as Env['DB']
-    env = { ...env, DB: safeBatchDb }
-    let result: Awaited<ReturnType<typeof runMarketingMonitor>> | undefined
+    })
 
-    try {
-      result = await runMarketingMonitor(env, owner, { window }, {
-        sourceFactory: ({ runId }) => {
-          TextEncoder.prototype.encode = poisonIntrinsicForFixtureData(
-            'TextEncoder.encode',
-            originals.encode,
-            (_receiver, args) => typeof args[0] === 'string' && args[0].includes('intrinsic_fixture'),
-          )
-          Object.defineProperty(Object.prototype, 'toJSON', {
-            configurable: true,
-            value: poisonToJsonForFixtureData,
-          })
-          Array.prototype.map = poisonIntrinsicForFixtureData('map', originals.map, (receiver) => isIntrinsicFixtureData(receiver))
-          Array.prototype.filter = poisonIntrinsicForFixtureData('filter', originals.filter, (receiver) => isIntrinsicFixtureData(receiver))
-          Array.prototype.some = poisonIntrinsicForFixtureData('some', originals.some, (receiver) => isIntrinsicFixtureData(receiver))
-          expect(['vitest worker'].map((value) => value)).toEqual(['vitest worker'])
-          return [{
-            key: 'intrinsic_fixture',
-            slot: 'web_analytics',
-            async read() {
-              return {
-                status: 'available',
-                observations: [{
-                  id: `${runId}:visibility`,
-                  runId,
-                  metricKey: 'seo.ai_citations',
-                  value: 4,
-                  unit: 'count',
-                  authority: 'first-party',
-                  observedAt: '2026-07-01T12:00:00.000Z',
-                }],
-              }
-            },
-          }]
-        },
-      })
-    } finally {
-      TextEncoder.prototype.encode = originals.encode
-      Array.prototype.map = originals.map
-      Array.prototype.filter = originals.filter
-      Array.prototype.some = originals.some
-      if (originals.toJSON) Object.defineProperty(Object.prototype, 'toJSON', originals.toJSON)
-      else delete (Object.prototype as { toJSON?: unknown }).toJSON
-    }
-
-    expect(result).toEqual(expect.objectContaining({
+    expect(unrelatedCycle.map(() => 'worker')).toEqual(['worker'])
+    expect([unrelatedProxy].map(() => 'worker')).toEqual(['worker'])
+    expect(proxyReads).toBe(0)
+    expect(await runIntrinsicPoisoningFixture()).toEqual({
       ok: true,
-      run: expect.objectContaining({ observationCount: 1 }),
-    }))
-    if (!result?.ok) return
-    expect(result.run.evidenceDigest).toBe(await canonicalEvidenceDigest(result.run))
+      observationCount: 1,
+      directPoisonChecks: {
+        map: true,
+        filter: true,
+        some: true,
+        textEncoder: true,
+        outcomesJson: true,
+      },
+    })
   })
 
   it('pins a frozen collection environment before the injected source factory runs', async () => {
