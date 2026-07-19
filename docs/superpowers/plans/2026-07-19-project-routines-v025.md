@@ -87,7 +87,7 @@ expect(() => insertCrossProjectRun()).toThrow(/routine run project mismatch/)
 - Produces `validateRoutineSchedule(input): ScheduleValidationResult`.
 - Produces `nextRoutineOccurrence(schedule, after): Date | null` and `routineOccurrenceKey(routine, scheduledFor): string`.
 
-- [ ] **Step 1: Write table-driven tests for manual, once, UTC cron, Toronto DST gap, Toronto repeated hour, invalid six-field cron, invalid timezone, and exhausted once schedules.**
+- [x] **Step 1: Write table-driven tests for manual, once, UTC cron, Toronto DST gap, Toronto repeated hour, invalid six-field cron, invalid timezone, and exhausted once schedules.**
 
 ```ts
 expect(validateRoutineSchedule({ kind: 'cron', expression: '* * * * * *', timezone: 'UTC' }))
@@ -96,11 +96,11 @@ expect(routineOccurrenceKey(routine, new Date('2026-11-01T05:30:00.000Z')))
   .toBe('cron:2026-11-01T01:30:00[America/Toronto]')
 ```
 
-- [ ] **Step 2: Run `npx vitest run tests/routine-schedule.test.ts` and verify import failure.**
-- [ ] **Step 3: Implement the domain discriminated unions and strict five-field cron validation using the installed `cron-schedule` package plus `Intl.DateTimeFormat` for IANA timezone validation.**
-- [ ] **Step 4: Implement first-occurrence DST deduplication and canonical occurrence keys without parsing natural-language schedules.**
-- [ ] **Step 5: Run the focused tests and `npm run typecheck`; verify both pass.**
-- [ ] **Step 6: Commit with `git commit -m "feat: define routine schedule semantics"`.**
+- [x] **Step 2: Run `npx vitest run tests/routine-schedule.test.ts` and verify import failure.**
+- [x] **Step 3: Implement the domain discriminated unions and strict five-field cron validation using the installed `cron-schedule` package plus `Intl.DateTimeFormat` for IANA timezone validation.**
+- [x] **Step 4: Implement first-occurrence DST deduplication and canonical occurrence keys without parsing natural-language schedules.**
+- [x] **Step 5: Run the focused tests and `npm run typecheck`; verify both pass.**
+- [x] **Step 6: Commit with `git commit -m "feat: define routine schedule semantics"`.**
 
 ### Task 3: Shared Routine Authorization and Policy Service
 
