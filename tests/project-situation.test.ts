@@ -135,8 +135,15 @@ describe('loadProjectSituation', () => {
       summary: expect.any(String),
       blockers: [{ id: 'blocked', title: 'Restore delivery', status: 'blocked' }],
       pending_reviews: [{ id: 'review', title: 'Review release', status: 'review', gate_owner: 'lead' }],
-      active_work_count: 2,
+      task_counts: { blocked: 1, review: 1, in_progress: 1, open: 1 },
+      task_counts_truncated: {
+        blocked: false, review: false, in_progress: false, open: false, overall: false,
+      },
+      active_work_count: 4,
+      active_work_count_truncated: false,
       active_flight_count: 0,
+      active_flight_count_truncated: false,
+      snapshot_truncated: false,
       next_action: { type: 'review_task', task: { id: 'review' } },
     })
     expect(JSON.stringify(situation)).not.toContain('hidden-value')
@@ -150,6 +157,7 @@ describe('loadProjectSituation', () => {
     const situation = await loadProjectSituation(envFor(harness), project, null)
 
     expect(situation.health).toBe('review')
+    expect(situation.active_work_count).toBe(1)
     expect(situation.next_action).toMatchObject({ type: 'review_task', task: { id: 'review' } })
   })
 
@@ -187,6 +195,71 @@ describe('loadProjectSituation', () => {
     })
   })
 
+  it('ignores a malformed newest flight when deriving latest_activity for an unrestricted reader', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'canonical-activity')
+    insertTask(harness, project.id, {
+      id: 'canonical-task', status: 'done', updatedAt: '2026-07-19T01:00:00Z',
+    })
+    insertFlight(harness, project.id, {
+      id: 'canonical-flight', squadIds: ['squad-a'], taskIds: ['canonical-task'],
+    })
+    harness.sqlite.prepare(`
+      INSERT INTO flights (id, tenant, agent, goal, status, project_id, created_at, meta)
+      VALUES ('malformed-newest', 'pot-a', 'agent-a', 'Malformed newest', 'running', ?, ?, ?)
+    `).run(
+      project.id,
+      Date.parse('2026-07-19T03:00:00Z'),
+      JSON.stringify({ schema: 'mupot.flight.meta/v0', squad_ids: ['squad-a'] }),
+    )
+
+    const situation = await loadProjectSituation(envFor(harness), project, null)
+
+    expect(situation.latest_activity).toMatchObject({
+      source_type: 'flight', source_id: 'canonical-flight',
+    })
+    expect(JSON.stringify(situation)).not.toContain('Malformed newest')
+  })
+
+  it('uses isolated health and action precedence for review, unblock, start, and lifecycle fallback', async () => {
+    harness = makeHarness()
+
+    const reviewProject = insertProject(harness, 'precedence-review')
+    insertTask(harness, reviewProject.id, { id: 'review', status: 'review' })
+    insertTask(harness, reviewProject.id, { id: 'review-working', status: 'in_progress' })
+    expect(await loadProjectSituation(envFor(harness), reviewProject, null)).toMatchObject({
+      health: 'review', next_action: { type: 'review_task', task: { id: 'review' } },
+    })
+
+    const blockedProject = insertProject(harness, 'precedence-blocked')
+    insertTask(harness, blockedProject.id, { id: 'blocker', status: 'blocked' })
+    insertTask(harness, blockedProject.id, { id: 'blocked-working', status: 'in_progress' })
+    expect(await loadProjectSituation(envFor(harness), blockedProject, null)).toMatchObject({
+      health: 'blocked', next_action: { type: 'unblock_task', task: { id: 'blocker' } },
+    })
+
+    const startProject = insertProject(harness, 'precedence-start')
+    insertTask(harness, startProject.id, { id: 'start-open', status: 'open' })
+    insertFlight(harness, startProject.id, {
+      id: 'start-flight', squadIds: ['squad-a'], taskIds: ['start-open'],
+    })
+    expect(await loadProjectSituation(envFor(harness), startProject, null)).toMatchObject({
+      health: 'active', next_action: { type: 'start_task', task: { id: 'start-open' } },
+    })
+
+    const pausedProject = insertProject(harness, 'precedence-paused')
+    insertTask(harness, pausedProject.id, { id: 'paused-working', status: 'in_progress' })
+    harness.sqlite.prepare("UPDATE projects SET status = 'paused' WHERE id = ?").run(pausedProject.id)
+    const paused = { ...pausedProject, status: 'paused' as const }
+    expect(await loadProjectSituation(envFor(harness), paused, null)).toMatchObject({
+      health: 'paused', next_action: { type: 'continue_task', task: { id: 'paused-working' } },
+    })
+    harness.sqlite.prepare('DELETE FROM tasks WHERE project_id = ?').run(paused.id)
+    expect(await loadProjectSituation(envFor(harness), paused, null)).toMatchObject({
+      health: 'paused', next_action: { type: 'resume_project' },
+    })
+  })
+
   it.each([
     ['paused', 'paused', 'resume_project'],
     ['completed', 'completed', 'verify_completion'],
@@ -217,7 +290,10 @@ describe('loadProjectSituation', () => {
       blockers: [],
       pending_reviews: [],
       active_work_count: 0,
+      active_work_count_truncated: false,
       active_flight_count: 0,
+      active_flight_count_truncated: false,
+      snapshot_truncated: false,
       latest_activity: null,
       next_action: { type: 'create_task' },
     })
@@ -266,5 +342,53 @@ describe('loadProjectSituation', () => {
       health: 'ready', blockers: [], pending_reviews: [], active_work_count: 0,
       active_flight_count: 0, latest_activity: null, next_action: { type: 'create_task' },
     })
+  })
+
+  it('caps each task status and active-flight snapshot with explicit truncation truth', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'capped')
+    for (const status of ['blocked', 'review', 'in_progress', 'open'] as const) {
+      harness.sqlite.exec(`
+        WITH RECURSIVE seq(n) AS (
+          VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 100
+        )
+        INSERT INTO tasks (id, squad_id, title, status, project_id, created_at, updated_at)
+        SELECT '${status}-' || printf('%03d', n), 'squad-a', '${status} ' || n, '${status}', '${project.id}',
+               '2026-07-19T01:00:00Z', '2026-07-19T01:00:00Z'
+          FROM seq;
+      `)
+    }
+    insertTask(harness, project.id, { id: 'flight-task', status: 'done' })
+    const insert = harness.sqlite.prepare(`
+      INSERT INTO flights (id, tenant, agent, goal, status, project_id, created_at, meta)
+      VALUES (?, 'pot-a', 'agent-a', ?, 'running', ?, ?, ?)
+    `)
+    for (let index = 0; index < 101; index += 1) {
+      insert.run(
+        `flight-${index.toString().padStart(3, '0')}`,
+        `Flight ${index}`,
+        project.id,
+        Date.parse('2026-07-19T02:00:00Z') + index,
+        flightMeta(['squad-a'], ['flight-task']),
+      )
+    }
+
+    const situation = await loadProjectSituation(envFor(harness), project, null)
+
+    expect(situation).toMatchObject({
+      health: 'blocked',
+      task_counts: { blocked: 100, review: 100, in_progress: 100, open: 100 },
+      task_counts_truncated: {
+        blocked: true, review: true, in_progress: true, open: true, overall: true,
+      },
+      active_work_count: 400,
+      active_work_count_truncated: true,
+      active_flight_count: 100,
+      active_flight_count_truncated: true,
+      snapshot_truncated: true,
+      next_action: { type: 'review_task', task: { id: 'review-000' } },
+    })
+    expect(situation.blockers).toHaveLength(20)
+    expect(situation.pending_reviews).toHaveLength(20)
   })
 })

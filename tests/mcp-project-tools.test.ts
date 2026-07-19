@@ -649,8 +649,44 @@ describe('MCP project lifecycle control', () => {
         situation: {
           health: 'review',
           pending_reviews: [{ id: 'department-review', squad_id: OTHER_SQUAD_ID }],
-          active_work_count: 1,
+          active_work_count: 2,
           next_action: { type: 'review_task', task: { id: 'department-review' } },
+        },
+      },
+    })
+  })
+
+  it('keeps the last department-granted squad readable beyond 1000 squads', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('bulk-dept', 'bulk-dept', 'Bulk Department');
+      WITH RECURSIVE seq(n) AS (
+        VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 1000
+      )
+      INSERT INTO squads (id, department_id, slug, name)
+      SELECT 'bulk-' || printf('%04d', n), 'bulk-dept', 'bulk-' || printf('%04d', n), 'Bulk ' || n FROM seq;
+      INSERT INTO projects (id, slug, name, status) VALUES ('bulk-project', 'bulk-project', 'Bulk Project', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('bulk-project', 'bulk-1000', 'write');
+      INSERT INTO tasks (id, squad_id, title, status, project_id)
+      VALUES ('bulk-last-task', 'bulk-1000', 'Last readable task', 'open', 'bulk-project');
+    `)
+    const reader = auth({
+      capabilities: [
+        { member_id: MEMBER_ID, scope_type: 'department', scope_id: 'bulk-dept', capability: 'observer' },
+      ],
+    })
+
+    await expect(invokeTool(reader, env, 'project_get', {
+      project_id: 'bulk-project',
+    }, 'https://pot.test')).resolves.toMatchObject({
+      ok: true,
+      result: {
+        situation: {
+          health: 'active',
+          active_work_count: 1,
+          next_action: { type: 'start_task', task: { id: 'bulk-last-task' } },
         },
       },
     })

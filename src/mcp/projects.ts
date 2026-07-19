@@ -9,6 +9,7 @@ import {
   upsertProjectSquadAccess,
 } from '../projects/service'
 import type { ProjectMutationError } from '../projects/service'
+import { resolveReadableSquadIds } from '../projects/readable-squads'
 import { loadProjectSituation } from '../projects/situation'
 import { done, fail, str, type ToolOutcome, type ToolSpec } from './index'
 
@@ -118,14 +119,7 @@ async function projectionReadableSquads(
   access: ProjectReadAccess,
 ): Promise<string[] | null> {
   if (access.workspaceAdmin || access.orgRead) return null
-  const rows = await env.DB.prepare(
-    `SELECT id FROM squads
-      WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
-         OR department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
-      ORDER BY id
-      LIMIT 1000`,
-  ).bind(jsonIds(access.squadIds), jsonIds(access.departmentIds)).all<{ id: string }>()
-  return (rows.results ?? []).map((row) => row.id)
+  return resolveReadableSquadIds(env, access.squadIds, access.departmentIds)
 }
 
 async function readableProject(env: Env, projectId: string, access: ProjectReadAccess): Promise<Project | null> {

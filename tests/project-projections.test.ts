@@ -364,6 +364,28 @@ describe('project Activity and Evidence projections', () => {
     }
   })
 
+  it('always excludes a malformed newest flight from Activity for unrestricted readers', async () => {
+    const fixture = harness()
+    try {
+      fixture.sqlite.prepare(`
+        INSERT INTO flights (id, tenant, agent, goal, status, project_id, created_at, meta)
+        VALUES ('malformed-newest', 'tenant', 'agent-a', 'Malformed newest', 'running', 'project', ?, ?)
+      `).run(
+        Date.parse('2026-07-19T23:59:59Z'),
+        JSON.stringify({ schema: 'mupot.flight.meta/v0', squad_ids: ['squad-a'] }),
+      )
+
+      const activity = await listProjectActivity(env(fixture.db), {
+        projectId: 'project', readableSquadIds: null, limit: 20,
+      })
+
+      expect(activity.rows.some((row) => row.source_id === 'malformed-newest')).toBe(false)
+      expect(activity.rows[0]?.source_id).not.toBe('malformed-newest')
+    } finally {
+      fixture.close()
+    }
+  })
+
   it('shows a receipt-backed system dispatch to readers of its recipient squad only', async () => {
     const fixture = harness()
     try {

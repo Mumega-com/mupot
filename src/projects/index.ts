@@ -5,6 +5,7 @@ import { requireAuth } from '../auth'
 import { hasCapability, resolveCapabilities } from '../auth/capability'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { listProjectActivity, listProjectEvidence, type ProjectProjectionCursor } from './projections'
+import { resolveReadableSquadIds } from './readable-squads'
 import { loadProjectSituation } from './situation'
 import {
   createProject,
@@ -216,14 +217,7 @@ async function projectionReadableSquads(
   access: ProjectReadAccess,
 ): Promise<string[] | null> {
   if (access.workspace_admin || access.org_read) return null
-  const rows = await env.DB.prepare(
-    `SELECT id FROM squads
-      WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
-         OR department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
-      ORDER BY id
-      LIMIT 1000`,
-  ).bind(jsonIds(access.squad_ids), jsonIds(access.department_ids)).all<{ id: string }>()
-  return (rows.results ?? []).map((row) => row.id)
+  return resolveReadableSquadIds(env, access.squad_ids, access.department_ids)
 }
 
 async function projectAggregates(

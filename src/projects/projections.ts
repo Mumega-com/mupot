@@ -251,16 +251,15 @@ function sqliteBinaryCompare(left: string, right: string): number {
   return leftBytes.length - rightBytes.length
 }
 
-function flightReadableSql(alias: string, idsParam: string): string {
+function flightSquadsReadableSql(alias: string, idsParam: string): string {
   const safeMeta = `CASE WHEN json_valid(${alias}.meta) THEN ${alias}.meta ELSE '{}' END`
-  return `(1 = 1 ${canonicalFlightMetaSql(alias)}
-    AND NOT EXISTS (
+  return `NOT EXISTS (
       SELECT 1 FROM json_each(${safeMeta}, '$.squad_ids') squad_ref
        WHERE NOT EXISTS (
          SELECT 1 FROM json_each(${idsParam}) readable
           WHERE CAST(readable.value AS TEXT) = CAST(squad_ref.value AS TEXT)
        )
-    ))`
+    )`
 }
 
 function messageReadableSql(alias: string, idsParam: string, adminParam: string): string {
@@ -369,9 +368,10 @@ export async function listProjectActivity(
     }>(),
     env.DB.prepare(
       `SELECT f.id, f.agent, f.goal, f.status, f.created_at
-         FROM flights f
-        WHERE f.tenant = ?1 AND f.project_id = ?2
-          AND (?3 = 1 OR ${flightReadableSql('f', '?4')})
+        FROM flights f
+       WHERE f.tenant = ?1 AND f.project_id = ?2
+          ${canonicalFlightMetaSql('f')}
+          AND (?3 = 1 OR ${flightSquadsReadableSql('f', '?4')})
           ${flightAfter.sql}
         ORDER BY f.created_at DESC, f.id ASC LIMIT ?${flightAfter.nextParam}`,
     ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...flightAfter.binds, sourceLimit).all<{
@@ -526,10 +526,11 @@ export async function listProjectEvidence(
     env.DB.prepare(
       `SELECT o.id, o.flight_id, f.goal, o.actor_id, o.payload, o.created_at,
               o.delivered_at, o.consumed_at, o.last_error
-         FROM flight_event_outbox o ${landingIndex}
+        FROM flight_event_outbox o ${landingIndex}
          CROSS JOIN flights f ON f.id = o.flight_id
         WHERE o.tenant = ?1 AND ${landingProjectScope} f.project_id = ?2
-          AND (?3 = 1 OR ${flightReadableSql('f', '?4')})
+          ${canonicalFlightMetaSql('f')}
+          AND (?3 = 1 OR ${flightSquadsReadableSql('f', '?4')})
           ${landingAfter.sql}
         ORDER BY ${epochMs('o.created_at')} DESC, o.id ASC LIMIT ?${landingAfter.nextParam}`,
     ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...landingAfter.binds, sourceLimit).all<{
