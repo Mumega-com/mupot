@@ -240,6 +240,40 @@ describe('project-link addon', () => {
     expect(dme.sqlite.prepare('SELECT COUNT(*) AS count FROM project_link_receipts').get()).toEqual({ count: 1 })
   })
 
+  // #403 gap 2(b): a task delivered via project-link must carry BOTH provenance signals —
+  // the structural source_pot column (migrations/0063, queryable without parsing anything)
+  // and the visible title marker (works everywhere the title is displayed) — so a reading
+  // agent/UI can tell this content is untrusted external input, not a trusted local task.
+  it('provenance-tags an inbound task with source_pot + a visible untrusted-origin title marker', async () => {
+    const signed = await createSignedProjectEnvelope(envelopeInput(), mumegaKeys.privateKey)
+
+    const received = await receiveProjectLinkEnvelope(env(dme, 'dme'), dmeLink.id, signed, NOW)
+    expect(received.ok).toBe(true)
+
+    const row = dme.sqlite.prepare('SELECT title, body, source_pot FROM tasks').get() as {
+      title: string; body: string; source_pot: string | null
+    }
+    expect(row.source_pot).toBe('mumega')
+    expect(row.title).toBe('[project-link:mumega] Verify DME visibility monitor deployment')
+    const body = JSON.parse(row.body) as { content_trust: string; source_pot: string }
+    expect(body.content_trust).toBe('untrusted_external_content')
+    expect(body.source_pot).toBe('mumega')
+  })
+
+  // A locally-created task (the trusted path, src/tasks/service.ts createTask) must NOT be
+  // mistaken for cross-pot content — source_pot stays NULL unless receiveProjectLinkEnvelope
+  // wrote the row.
+  it('leaves source_pot NULL for a task inserted by any path other than receiveProjectLinkEnvelope', () => {
+    dme.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, created_at, updated_at)
+      VALUES ('local-task-1', 'dme-squad', 'dme-project', 'A local task', '', 'n/a', 'open', '${NOW}', '${NOW}')
+    `)
+    const row = dme.sqlite.prepare(`SELECT source_pot FROM tasks WHERE id = 'local-task-1'`).get() as {
+      source_pot: string | null
+    }
+    expect(row.source_pot).toBeNull()
+  })
+
   it('fails closed after either project link is revoked and preserves prior receipts', async () => {
     const accepted = await receiveProjectLinkEnvelope(
       env(dme, 'dme'), dmeLink.id,

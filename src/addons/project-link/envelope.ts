@@ -91,6 +91,74 @@ function sensitive(value: string): boolean {
   return SENSITIVE.test(value)
 }
 
+// #403 gap 2(a): reject NUL bytes and non-whitespace C0/DEL control characters in inbound
+// free-text task fields (title, blocker_summary, success_predicate, progress_summary). Length
+// bounds already existed (see the [key, max, nullable] table below) but any byte was
+// previously accepted within that bound. Tab/newline/CR are left alone -- normal, expected
+// in multi-line summary text -- everything else in the C0 control range plus DEL is refused
+// outright rather than silently accepted (this is a transport-boundary rejection, distinct
+// from src/agents/sensorium.ts's asData(), which strips control chars at RENDER time for a
+// different, already-trusted-local-task, surface).
+const DISALLOWED_CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/
+
+function hasDisallowedControlChars(value: string): boolean {
+  return DISALLOWED_CONTROL_CHARS.test(value)
+}
+
+// #404 re-gate defense-in-depth: title-SPECIFIC hardening, tighter than the
+// general control-char check above. task.title has no legitimate multi-line use
+// (unlike blocker_summary/progress_summary, which are prose) and title is what
+// src/addons/project-link/service.ts stamps verbatim into `tasks.title` as
+// `[project-link:<pot>] <title>` -- a highly visible, widely-read field (task
+// lists, GitHub mirror, dashboard). Reject tab/newline/CR (the newline-injection
+// vector: a title with an embedded newline can forge what looks like a second
+// line once interpolated anywhere) and the bidi mark/embedding/override/isolate
+// block (LRM/RLM, LRE/RLE/PDF/LRO/RLO incl. U+202E RIGHT-TO-LEFT OVERRIDE,
+// LRI/RLI/FSI/PDI -- can visually reverse/hide text in a title). This is
+// belt-and-suspenders: src/agents/execute.ts's buildExecutePrompt fences title
+// through asData() (../../lib/prompt-safety) regardless, but a title rejected
+// HERE never reaches storage/display anywhere else in the product surface either
+// (dashboard, GitHub mirror, MCP reads) -- reject-at-the-edge beats
+// sanitize-at-every-reader.
+// Bidi/line-separator ranges built from numeric code points (not pasted glyphs)
+// so this source file stays plain ASCII and diffable:
+//   0x2028-0x2029   LINE SEPARATOR, PARAGRAPH SEPARATOR
+//   0x200E-0x200F   LRM, RLM (bidi marks)
+//   0x202A-0x202E   LRE/RLE/PDF/LRO/RLO bidi embed/override (incl. U+202E
+//                   RIGHT-TO-LEFT OVERRIDE, the 'reversed filename' trick)
+//   0x2066-0x2069   LRI/RLI/FSI/PDI bidi isolates
+const TITLE_UNSAFE_CODEPOINT_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x2028, 0x2029],
+  [0x200e, 0x200f],
+  [0x202a, 0x202e],
+  [0x2066, 0x2069],
+]
+
+function titleHex4(n: number): string {
+  return n.toString(16).padStart(4, '0')
+}
+
+function buildTitleDisallowedCharsRegex(): RegExp {
+  const unicodeBody = TITLE_UNSAFE_CODEPOINT_RANGES.map(([lo, hi]) =>
+    lo === hi ? `\\u${titleHex4(lo)}` : `\\u${titleHex4(lo)}-\\u${titleHex4(hi)}`,
+  ).join('')
+  return new RegExp(`[\\t\\n\\r${unicodeBody}]`)
+}
+
+const TITLE_DISALLOWED_CHARS = buildTitleDisallowedCharsRegex()
+
+function hasDisallowedTitleChars(value: string): boolean {
+  return TITLE_DISALLOWED_CHARS.test(value)
+}
+
+function checkTitleText(value: unknown, path: string, max: number): EnvelopeValidationResult | null {
+  if (!boundedText(value, max)) return { ok: false, reason: 'invalid_string', path }
+  if (sensitive(value)) return { ok: false, reason: 'prohibited_content', path }
+  if (hasDisallowedControlChars(value)) return { ok: false, reason: 'invalid_control_chars', path }
+  if (hasDisallowedTitleChars(value)) return { ok: false, reason: 'invalid_title_chars', path }
+  return null
+}
+
 function prohibitedString(value: unknown, path = '', seen = new WeakSet<object>()): EnvelopeValidationResult | null {
   if (typeof value === 'string') {
     return sensitive(value) ? { ok: false, reason: 'prohibited_content', path } : null
@@ -117,6 +185,7 @@ function checkText(value: unknown, path: string, max: number, nullable = false):
   if (nullable && value === null) return null
   if (!boundedText(value, max)) return { ok: false, reason: 'invalid_string', path }
   if (sensitive(value)) return { ok: false, reason: 'prohibited_content', path }
+  if (hasDisallowedControlChars(value)) return { ok: false, reason: 'invalid_control_chars', path }
   return null
 }
 
@@ -219,8 +288,14 @@ export function validateProjectLinkEnvelope(
     for (const key of ['flight_id', 'request_id'] as const) {
       if (task[key] !== null && !validId(task[key])) return { ok: false, reason: 'invalid_id', path: `task.${key}` }
     }
+    // title goes through checkTitleText (tighter than checkText -- rejects
+    // newline/CR/tab + bidi overrides; see TITLE_DISALLOWED_CHARS above). The
+    // other free-text fields keep checkText's general control-char bound only
+    // -- they are prose with a legitimate multi-line use.
+    const titleError = checkTitleText(task.title, 'task.title', 240)
+    if (titleError) return titleError
     for (const [key, max, nullable] of [
-      ['title', 240, false], ['blocker_summary', 1000, true],
+      ['blocker_summary', 1000, true],
       ['success_predicate', 2000, false], ['progress_summary', 4000, false],
     ] as const) {
       const error = checkText(task[key], `task.${key}`, max, nullable)

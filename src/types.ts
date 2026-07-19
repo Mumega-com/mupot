@@ -269,6 +269,12 @@ export interface Task {
   // terminal write for Queue recovery; the lease is cleared on completion.
   execution_receipt_id?: string | null
   execution_claim_expires_at?: number | null
+  // #403 gap 2(b): provenance marker. NULL for every locally-created task (the trusted path).
+  // Set to the linked pot's slug (project_links.remote_pot) when this row was written by
+  // receiveProjectLinkEnvelope (src/addons/project-link/service.ts) — a signal to any reader
+  // (agent, dashboard, MCP client) that title/body originated from an external pot and should
+  // be treated as untrusted content, not as a trusted local instruction. See migrations/0063.
+  source_pot?: string | null
   created_at: string
   updated_at: string
 }

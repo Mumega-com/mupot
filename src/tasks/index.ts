@@ -289,7 +289,7 @@ tasksApp.get('/', async (c) => {
     const statusBinds = [...binds, status]
     const cap = isActionable ? ACTIONABLE_FETCH_CAP : PASSTHROUGH_FETCH_CAP
     const rows = await c.env.DB.prepare(
-      `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+      `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
          FROM tasks
         WHERE ${statusClauses.join(' AND ')}
         ORDER BY created_at ${isActionable ? 'ASC' : 'DESC'}
@@ -315,7 +315,7 @@ tasksApp.get('/', async (c) => {
 
     const [actionableRows, terminalRows] = await Promise.all([
       c.env.DB.prepare(
-        `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+        `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
            FROM tasks ${actionableWhere}
            ORDER BY ${actionableStatusOrderSql()}, created_at ASC
            LIMIT ${ACTIONABLE_FETCH_CAP}`,
@@ -323,7 +323,7 @@ tasksApp.get('/', async (c) => {
         .bind(...binds)
         .all<Task>(),
       c.env.DB.prepare(
-        `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+        `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
            FROM tasks ${terminalWhere}
            ORDER BY created_at DESC
            LIMIT ${PASSTHROUGH_FETCH_CAP}`,
@@ -351,7 +351,7 @@ tasksApp.get('/', async (c) => {
 tasksApp.get('/:id', async (c) => {
   const id = c.req.param('id')
   const task = await c.env.DB.prepare(
-    `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at
+    `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
        FROM tasks WHERE id = ? LIMIT 1`,
   )
     .bind(id)

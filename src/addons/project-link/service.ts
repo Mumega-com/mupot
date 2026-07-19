@@ -223,6 +223,34 @@ function isPrivateOrReservedIpv6(groups: number[]): boolean {
   return false
 }
 
+// #403 gap 1: the old check only caught the exact string 'localhost' — a dotted subdomain
+// of a special-use name (`foo.localhost`, `x.internal`, `y.home.arpa`) has a '.' in it and
+// so slipped past the "bare single-label hostname" fallback below undetected.
+//
+// Blocked (RFC 6761 `localhost`, the widely-deployed `.internal` convention formalized as
+// RFC 9476, RFC 8375 `home.arpa`, and RFC 6762 §3 `.local` mDNS): these are names that DO
+// resolve to a private/internal-network-reachable address in real deployments — split-horizon
+// DNS conventionally serves `.internal`/`home.arpa`, and `.local` is live mDNS on most LANs
+// (`printer.local`, `nas.local`). That makes them genuine SSRF targets through this Worker's
+// fetch.
+//
+// Deliberately NOT blocked (RFC 6761 `.test` / `.invalid` / `.example`), despite the #403
+// brief listing them as "also consider": `.test` and `.invalid` are unregistered ICANN root
+// zones — no registrar can ever delegate them, so Cloudflare's resolver (which only answers
+// real registered records, not an attacker's local /etc/hosts) can never resolve one to
+// anything, internal or otherwise; the fetch simply fails closed with NXDOMAIN. `.example`
+// domains that DO resolve (example.com/net/org) point at fixed, ICANN-operated public
+// addresses, not a private network — no SSRF surface. Blocking them anyway would have zero
+// security benefit here and would break this codebase's own established test-fixture
+// convention (`*.mupot.test` is used pervasively across the project-link test suite as the
+// "fake public peer pot" domain — see tests/project-link-{addon,routes,ssrf}.test.ts). Flagged
+// explicitly for the adversarial reviewer: this is a considered trade-off, not an oversight.
+const SPECIAL_USE_DOMAINS = ['localhost', 'internal', 'local', 'home.arpa'] as const
+
+function isSpecialUseHostname(hostname: string): boolean {
+  return SPECIAL_USE_DOMAINS.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`))
+}
+
 function isBlockedHost(hostnameRaw: string): boolean {
   let hostname = hostnameRaw.toLowerCase()
   if (hostname.length === 0) return true
@@ -231,7 +259,6 @@ function isBlockedHost(hostnameRaw: string): boolean {
   if (hostname.endsWith('.') && !hostname.endsWith('::.') && !hostname.startsWith('[')) {
     hostname = hostname.slice(0, -1)
   }
-  if (hostname === 'localhost') return true
 
   if (hostname.startsWith('[') && hostname.endsWith(']')) {
     const groups = expandIpv6Groups(hostname.slice(1, -1))
@@ -241,8 +268,10 @@ function isBlockedHost(hostnameRaw: string): boolean {
   const v4 = parseIpv4Octets(hostname)
   if (v4) return isPrivateOrReservedIpv4(v4)
 
-  // Not an IP literal: a bare single-label hostname ("internal", "consul", "metadata") is
-  // never a legitimate public peer-pot origin — real domains carry a TLD.
+  if (isSpecialUseHostname(hostname)) return true
+
+  // Not an IP literal, not a special-use name: a bare single-label hostname ("consul",
+  // "metadata") is never a legitimate public peer-pot origin — real domains carry a TLD.
   if (!hostname.includes('.')) return true
 
   return false
@@ -550,6 +579,11 @@ function taskBody(envelope: ProjectLinkEnvelopeV1): string {
   const task = envelope.task!
   return JSON.stringify({
     schema: 'mupot.project-link-task/v1',
+    // #403 gap 2(b): explicit trust flag, in addition to the structural source_pot DB column
+    // (migrations/0063) and the title marker below — belt-and-suspenders so a consumer that
+    // only ever sees the raw body JSON (not the DB row, not the title) still gets the signal.
+    // Bounds (2b/a) are enforced upstream by validateProjectLinkEnvelope before this ever runs.
+    content_trust: 'untrusted_external_content',
     source_pot: envelope.source.pot,
     source_project_id: envelope.source.project_id,
     source_task_id: task.source_task_id,
@@ -640,12 +674,18 @@ export async function receiveProjectLinkEnvelope(
     statements.push(db.prepare(
       `INSERT INTO tasks (
         id, squad_id, project_id, title, body, done_when, status, assignee_agent_id,
-        github_issue_url, result, completed_at, gate_owner, created_at, updated_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', NULL, NULL, NULL, NULL, NULL, ?7, ?7)`,
+        github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', NULL, NULL, NULL, NULL, NULL, ?7, ?8, ?8)`,
     ).bind(
       action.id, link.local_squad_id, link.local_project_id,
-      `[${envelope.source.pot}] ${envelope.task!.title}`,
-      taskBody(envelope), envelope.task!.success_predicate, now,
+      // #403 gap 2(b): visible provenance marker in the title itself (works everywhere the
+      // title is displayed, without requiring every reader to know about the source_pot
+      // column) — "project-link" names the untrusted-transport mechanism, not just the pot,
+      // so a reader unfamiliar with the addon still gets the signal.
+      `[project-link:${envelope.source.pot}] ${envelope.task!.title}`,
+      taskBody(envelope), envelope.task!.success_predicate,
+      // Structured provenance column — see migrations/0063 + Task.source_pot in src/types.ts.
+      link.remote_pot, now,
     ))
   }
   statements.push(db.prepare(

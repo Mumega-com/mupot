@@ -246,6 +246,7 @@ describe('shared execution authorization', () => {
           cost_micro_usd INTEGER NOT NULL DEFAULT 0,
           execution_receipt_id TEXT,
           execution_claim_expires_at INTEGER,
+          source_pot TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );

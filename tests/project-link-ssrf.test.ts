@@ -78,6 +78,56 @@ describe('validHttpsBaseUrl — SSRF range check (pure, #392 gate 2)', () => {
     expect(validHttpsBaseUrl(value)).toBe(false)
   })
 
+  // #403 gap 1: special-use domain names (RFC 6761 localhost / RFC 6762 §3 .local / RFC 8375
+  // home.arpa / RFC 9476 .internal) as a DOTTED subdomain — these have a '.' in them, so the
+  // old "bare single-label hostname" fallback never saw them.
+  it.each([
+    ['*.localhost subdomain', 'https://foo.localhost/'],
+    ['*.localhost, deeper subdomain', 'https://a.b.localhost/'],
+    ['*.internal subdomain', 'https://x.internal/'],
+    ['bare home.arpa (RFC 8375)', 'https://home.arpa/'],
+    ['*.home.arpa subdomain', 'https://y.home.arpa/'],
+    ['*.local subdomain (mDNS, RFC 6762)', 'https://printer.local/'],
+    ['*.localhost, trailing-dot bypass attempt', 'https://foo.localhost./'],
+    ['*.internal, uppercase bypass attempt', 'https://X.INTERNAL/'],
+  ])('rejects %s', (_label, value) => {
+    expect(validHttpsBaseUrl(value)).toBe(false)
+  })
+
+  // Deliberately NOT blocked — see the SPECIAL_USE_DOMAINS comment in service.ts for the full
+  // reasoning: `.test`/`.invalid` are unregistered ICANN root zones (never resolve, anywhere,
+  // to anything — Cloudflare's resolver fails closed with NXDOMAIN, no SSRF surface); `.example`
+  // domains that resolve point at fixed ICANN-operated public addresses, not a private network.
+  // This is also the codebase's own established fake-public-peer convention for tests
+  // (`*.mupot.test`, used throughout tests/project-link-{addon,routes}.test.ts).
+  it.each([
+    ['*.test (RFC 6761, unregistered root — cannot resolve)', 'https://foo.test/'],
+    ['*.invalid (RFC 6761, unregistered root — cannot resolve)', 'https://foo.invalid/'],
+    ['*.example (RFC 6761, resolves to a fixed ICANN-public address)', 'https://foo.example/'],
+    ["the codebase's own test-peer convention", 'https://dme.mupot.test/'],
+  ])('allows %s (considered + excluded, not an oversight)', (_label, value) => {
+    expect(validHttpsBaseUrl(value)).toBe(true)
+  })
+
+  it('a normal public multi-label host with an unrelated TLD is still allowed (sanity: suffix match is exact, not substring)', () => {
+    expect(validHttpsBaseUrl('https://api.linear.app/')).toBe(true)
+    // "notinternal.example.com" contains "internal" as a substring of its first label but is
+    // not dot-bounded to the special-use ".internal" suffix, and ".com" is an ordinary public
+    // TLD — must not be caught by a naive `.includes('internal')`/`.includes('example')` check.
+    expect(validHttpsBaseUrl('https://notinternal.example.com/')).toBe(true)
+  })
+
+  it('"localhost" as a leading label of an otherwise-public domain is NOT caught by name-based blocking (documented residual limitation, not this gate\'s job)', () => {
+    // isBlockedHost only vets the literal hostname string against exact/suffix special-use
+    // names — it has no DNS resolution step. "localhost.attacker.example.com" is neither
+    // exactly "localhost" nor does it END in ".localhost", so the suffix rule correctly does
+    // not fire here (that would be a substring match, which the file's own comment calls out
+    // as the wrong tool). Whether *this* particular host is safe to dial is a DNS-rebinding /
+    // attacker-controlled-domain question, out of scope for a literal-name gate (see the
+    // "Residual limitation" comment above isBlockedHost).
+    expect(validHttpsBaseUrl('https://localhost.attacker.example.com/')).toBe(true)
+  })
+
   it('ipv6 v4-compatible form with a real PUBLIC embedded v4 address is not blocked (boundary is exact, same as the v4-mapped case)', () => {
     expect(validHttpsBaseUrl('https://[::8.8.8.8]/')).toBe(true)
   })
