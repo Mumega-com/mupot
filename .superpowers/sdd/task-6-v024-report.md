@@ -1,6 +1,6 @@
 # Task 6 v0.24 Report
 
-Status: CORRECTIONS IMPLEMENTED - FINAL INTEGRATION EVIDENCE PENDING
+Status: COMPLETE
 
 ## TDD
 
@@ -33,27 +33,34 @@ Status: CORRECTIONS IMPLEMENTED - FINAL INTEGRATION EVIDENCE PENDING
   document-overflow measurements, Team/Squads internal-scroll metrics, and screenshot paths
   in `tmp/local-smoke/report.json`.
 
-## Preliminary Evidence
+## Final Evidence
 
-- Browser-created project ID: `5c588592-0e64-48f2-92a5-855f5cc05e3f`.
+- Exact integration HEAD before evidence: `a3209845101723dff49dbf96b9e3929179def858`,
+  including approved marketing harness corrections `0f45250` and `a320984` after the Task 6
+  implementation commit `7cf4943`.
+- Browser-created project ID: `5f50b7e6-c134-4a46-ad54-e9115d07112b`.
 - Lifecycle observations: create `planned`; edit `planned`; activate `active`; complete `completed`;
   reopen `active`; pause `paused`; archive `archived`; restore `planned`.
 - `project-mupot` browser, REST, and MCP canonical situation hash:
-  `f51a11dd63251b8da6c36b0b136ffb89ebe68e931472d8256d44ce43506435f2`.
+  `7f91e8d827b1689641eca3d9b123f5830c4156879af17942260335c68573511b` on all three surfaces.
 - Shared situation: `blocked`; 1 blocker; 1 pending review; 3 active work items; 1 active
   flight; no truncation; latest activity `flight-running-local`; next action `review_task`.
 - Browser Team presence: Hermes `Live`, Growth `Offline`, Conformance `Stale`, and the
   unattached sender `Not attached`.
 - Observed situation after activation: `ready`, next action `create_task`, with the edited goal.
 - Document overflow: `0px` for Mupot and the created Project at 1440px desktop and 390px mobile.
-- Team/Squads mobile internal region: `304px` client width, `1120px` scroll width, scroll position advanced to `32px`.
-- Browser receipt: `tmp/local-smoke/report.json`.
-- Runtime receipt: `tmp/local-runtime-conformance/report.json`.
+- Team/Squads mobile internal region: `304px` client width, `1120px` scroll width, movement
+  proved at `32px`, and the screenshot captured the right edge at `816px`.
+- Fresh local D1 state: `tmp/local-evidence/state.HV6crH`; the driver cleanup removed the
+  temporary state directory after the run.
+- Browser receipt: `tmp/local-smoke/report.json`; screenshot paths are recorded under
+  `tmp/local-smoke/`, including `project-mupot.png`, `project-mupot-team-mobile.png`, and both
+  desktop/mobile created-Project captures.
+- Runtime receipt: `tmp/local-runtime-conformance/report.json` (`runtime-adapter/v1`, all 11
+  conformance steps passed).
 
-Generated receipts and screenshots remain ignored and are not committed. This evidence is
-preliminary because the coordinated marketing-harness correction has not yet been approved and
-integrated; the exact required commands must be rerun after that integration before this report
-returns to `COMPLETE`.
+Generated receipts, screenshots, Wrangler logs, and temporary D1 state remain ignored and are
+not committed.
 
 ## Review Responses
 
@@ -66,7 +73,9 @@ returns to `COMPLETE`.
 
 ## Verification
 
-- `npx vitest run tests/projects-local-smoke.test.ts tests/dashboard-projects.test.ts tests/projects-routes.test.ts tests/mcp-project-tools.test.ts` (92 passed; preliminary)
-- `npm run typecheck` (passed)
-- `node scripts/no-secrets.mjs` (passed)
-- `bash scripts/ci-local-evidence.sh` (passed on a fresh isolated D1 state; preliminary browser and runtime conformance receipts recorded)
+- `npx vitest run tests/projects-local-smoke.test.ts tests/dashboard-projects.test.ts tests/projects-routes.test.ts tests/mcp-project-tools.test.ts`
+  (4 files passed, 92 tests passed).
+- `npm run typecheck` (passed; `tsc --noEmit`).
+- `node scripts/no-secrets.mjs` (passed; `no secrets found`).
+- `bash scripts/ci-local-evidence.sh` (passed; fresh isolated D1 migrations/seed, browser workflow,
+  31-route crawl, same-Project parity, complete lifecycle, and runtime conformance all completed).
