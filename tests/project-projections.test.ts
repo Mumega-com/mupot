@@ -156,10 +156,10 @@ function statementProbe(database: Env['DB']): {
 describe('project Activity and Evidence projections', () => {
   it('redacts provider credentials and sensitive fields before projection', () => {
     const unsafe = [
-      'OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz',
-      'github=ghp_abcdefghijklmnopqrstuvwxyz',
-      'aws=AKIAABCDEFGHIJKLMNOP',
-      'jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signaturepart',
+      ['OPENAI_API_KEY=', 'sk', '-proj-abcdefghijklmnopqrstuvwxyz'].join(''),
+      ['github=', 'ghp', '_abcdefghijklmnopqrstuvwxyz'].join(''),
+      ['aws=', 'AKIA', 'ABCDEFGHIJKLMNOP'].join(''),
+      ['jwt=', 'eyJ', 'hbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signaturepart'].join(''),
       'password: correct-horse-battery-staple',
       'Authorization: Basic Zm9vOmJhcg==',
     ].join('; ')

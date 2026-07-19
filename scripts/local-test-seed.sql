@@ -201,6 +201,23 @@ ON CONFLICT(tenant, agent_id) DO UPDATE SET
   member_id = excluded.member_id,
   created_at = excluded.created_at;
 
+-- The conformance runtime is the sole local consumer for this signed inbox.
+INSERT INTO agent_inbox_fences (
+  tenant, agent_id, mode, generation, key_fingerprint,
+  updated_by_member_id, updated_at, reason
+) VALUES (
+  'local', 'agent-conformance', 'signed_only', 1,
+  '6d4c5cc496a08ce3785f212e13b532c1fc7ee98a905c3d55debb48b1d13f690e',
+  'mbr-conformance-runtime', datetime('now'), 'local runtime conformance signed inbox'
+)
+ON CONFLICT(tenant, agent_id) DO UPDATE SET
+  mode = excluded.mode,
+  generation = excluded.generation,
+  key_fingerprint = excluded.key_fingerprint,
+  updated_by_member_id = excluded.updated_by_member_id,
+  updated_at = excluded.updated_at,
+  reason = excluded.reason;
+
 INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id, tenant)
 VALUES (
   'tok-conformance-sender',

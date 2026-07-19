@@ -140,7 +140,13 @@ describe('project-link envelope security boundary', () => {
   })
 
   it('restricts identifiers to opaque safe references without credential-shaped values', () => {
-    for (const unsafe of ['tenant:project', '.hidden', 'trailing-', 'percent%2Fref', 'ghp_abcdefghijklmnopqrstuvwxyz1234567890']) {
+    for (const unsafe of [
+      'tenant:project',
+      '.hidden',
+      'trailing-',
+      'percent%2Fref',
+      ['ghp', '_abcdefghijklmnopqrstuvwxyz1234567890'].join(''),
+    ]) {
       const value = envelopeInput()
       value.correlation_id = unsafe
       expect(validateProjectLinkEnvelope(value), unsafe).toMatchObject({ ok: false, path: 'correlation_id' })

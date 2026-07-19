@@ -19,6 +19,28 @@ function createSeededDatabase() {
 }
 
 describe('local project workspace showcase', () => {
+  it('seeds the signed inbox fence required by runtime conformance after browser evidence', () => {
+    const harness = createSeededDatabase()
+    try {
+      const fence = harness.sqlite.prepare(`
+        SELECT mode, generation, key_fingerprint, updated_by_member_id, reason
+        FROM agent_inbox_fences
+        WHERE tenant = 'local' AND agent_id = 'agent-conformance'
+      `).get()
+
+      expect(fence).toEqual({
+        mode: 'signed_only',
+        generation: 1,
+        key_fingerprint: '6d4c5cc496a08ce3785f212e13b532c1fc7ee98a905c3d55debb48b1d13f690e',
+        updated_by_member_id: 'mbr-conformance-runtime',
+        reason: expect.any(String),
+      })
+      expect((fence as { reason: string }).reason).not.toHaveLength(0)
+    } finally {
+      harness.close()
+    }
+  })
+
   it('seeds the exact Mumega root and child portfolio', () => {
     const harness = createSeededDatabase()
     try {
