@@ -30,7 +30,10 @@ Task 6: complete (commits 7d24d82..5b6ad7e; review approved after parity/lifecyc
 Task 7: complete (commits 9fc069f and c521e9b; independent review approved after
 source-authority and writable-Project-access remediation; 5 focused files / 126 tests
 + typecheck passed in the isolated implementation gate)
-Task 8: in progress
+Task 8: complete (commits 107c455, e20f970, c14560a; independent review approved
+after global-priority, scheduled-occurrence, and indexed-query remediation; 10 focused
+Project/parity/routine/migration files / 175 tests + typecheck passed)
+Task 9: in progress
 
 ---
 

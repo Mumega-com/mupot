@@ -249,11 +249,11 @@ expect(await executeRoutineAction(env, run.id, 'action-1')).toEqual(
 - Adds Routine events to Activity and terminal/gated Routine receipts to Evidence.
 - Updates next-action priority to urgent attention, waiting Routine, blocker/review, active work, next Routine, then empty state.
 
-- [ ] **Step 1: Add failing tests for bounded Routine counts, next occurrence, active/waiting run, latest cost/outcome, attention count, new next-action priority, visibility filtering, and keyset pagination.**
-- [ ] **Step 2: Run the two focused suites and confirm failures show missing Routine fields/sources.**
-- [ ] **Step 3: Extend the shared Situation loader and projection unions with bounded indexed queries and sanitized metadata.**
-- [ ] **Step 4: Run focused suites plus REST/MCP/dashboard Project parity tests.**
-- [ ] **Step 5: Commit with `git commit -m "feat: project routine situation and evidence"`.**
+- [x] **Step 1: Add failing tests for bounded Routine counts, next occurrence, active/waiting run, latest cost/outcome, attention count, new next-action priority, visibility filtering, and keyset pagination.**
+- [x] **Step 2: Run the two focused suites and confirm failures show missing Routine fields/sources.**
+- [x] **Step 3: Extend the shared Situation loader and projection unions with bounded indexed queries and sanitized metadata.**
+- [x] **Step 4: Run focused suites plus REST/MCP/dashboard Project parity tests.**
+- [x] **Step 5: Commit with `git commit -m "feat: project routine situation and evidence"`.**
 
 ### Task 9: REST Surface
 
