@@ -5,6 +5,7 @@ import { requireAuth } from '../auth'
 import { hasCapability, resolveCapabilities } from '../auth/capability'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { listProjectActivity, listProjectEvidence, type ProjectProjectionCursor } from './projections'
+import { loadProjectSituation } from './situation'
 import {
   createProject,
   getProject,
@@ -385,11 +386,16 @@ projectsApp.get('/:id', async (c) => {
   const access = await projectReadAccess(c.env, c.get('auth'))
   const project = await readableProject(c.env, c.req.param('id'), access)
   if (!project) return c.json({ error: 'project_not_found' }, 404)
-  const aggregates = await projectAggregates(c.env, project.id, access)
-  const parent = project.parent_project_id ? await getProject(c.env, project.parent_project_id) : null
+  const readableSquadIds = await projectionReadableSquads(c.env, access)
+  const [aggregates, situation, parent] = await Promise.all([
+    projectAggregates(c.env, project.id, access),
+    loadProjectSituation(c.env, project, readableSquadIds),
+    project.parent_project_id ? getProject(c.env, project.parent_project_id) : null,
+  ])
   return c.json({
     project,
     aggregates,
+    situation,
     ...(parent ? { parent: safeParent(parent) } : {}),
   })
 })

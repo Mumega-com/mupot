@@ -199,6 +199,14 @@ describe('projectsApp', () => {
     await expect(detail.json()).resolves.toMatchObject({
       project: { id: 'visible-child', parent_project_id: 'parent' },
       aggregates: { direct_tasks: 1, direct_squads: 1, direct_flights: 1 },
+      situation: {
+        health: 'active',
+        blockers: [],
+        pending_reviews: [],
+        active_work_count: 1,
+        active_flight_count: 1,
+        next_action: { type: 'start_task', task: { id: 'visible-task' } },
+      },
       parent: { id: 'parent' },
     })
     const detailBody = await (await fetch(harness, '/visible-child')).json() as { parent: Record<string, unknown> }
@@ -275,6 +283,12 @@ describe('projectsApp', () => {
     }))
     await expect((await fetch(harness, '/visible-child')).json()).resolves.toMatchObject({
       aggregates: { direct_tasks: 1, direct_squads: 1, direct_flights: 1 },
+      situation: {
+        health: 'active',
+        blockers: [],
+        active_work_count: 1,
+        active_flight_count: 1,
+      },
     })
 
     as(actor({ role: 'admin' }))

@@ -623,6 +623,39 @@ describe('MCP project lifecycle control', () => {
       .resolves.toMatchObject({ ok: false, status: 404, error: 'project_not_found' })
   })
 
+  it('resolves department grants to concrete readable squads for project_get situation', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    harness.sqlite.exec(`
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('project-a', '${OTHER_SQUAD_ID}', 'write');
+      INSERT INTO tasks (id, squad_id, title, status, project_id)
+      VALUES
+        ('department-review', '${OTHER_SQUAD_ID}', 'Department review', 'review', 'project-a'),
+        ('visible-open', '${SQUAD_ID}', 'Visible open', 'open', 'project-a');
+    `)
+    const departmentReader = auth({
+      capabilities: [
+        { member_id: MEMBER_ID, scope_type: 'department', scope_id: 'dept-a', capability: 'observer' },
+      ],
+    })
+
+    await expect(invokeTool(departmentReader, env, 'project_get', {
+      project_id: 'project-a',
+    }, 'https://pot.test')).resolves.toMatchObject({
+      ok: true,
+      result: {
+        project: { id: 'project-a' },
+        situation: {
+          health: 'review',
+          pending_reviews: [{ id: 'department-review', squad_id: OTHER_SQUAD_ID }],
+          active_work_count: 1,
+          next_action: { type: 'review_task', task: { id: 'department-review' } },
+        },
+      },
+    })
+  })
+
   it('includes safe parent context for a visible nested project', async () => {
     harness = makeHarness()
     const env = envFor(harness)

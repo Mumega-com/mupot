@@ -9,6 +9,7 @@ import {
   upsertProjectSquadAccess,
 } from '../projects/service'
 import type { ProjectMutationError } from '../projects/service'
+import { loadProjectSituation } from '../projects/situation'
 import { done, fail, str, type ToolOutcome, type ToolSpec } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
@@ -110,6 +111,21 @@ function visibilityClause(access: ProjectReadAccess): { sql: string; binds: stri
     )`,
     binds: [jsonIds(access.squadIds), jsonIds(access.departmentIds)],
   }
+}
+
+async function projectionReadableSquads(
+  env: Env,
+  access: ProjectReadAccess,
+): Promise<string[] | null> {
+  if (access.workspaceAdmin || access.orgRead) return null
+  const rows = await env.DB.prepare(
+    `SELECT id FROM squads
+      WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
+         OR department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
+      ORDER BY id
+      LIMIT 1000`,
+  ).bind(jsonIds(access.squadIds), jsonIds(access.departmentIds)).all<{ id: string }>()
+  return (rows.results ?? []).map((row) => row.id)
 }
 
 async function readableProject(env: Env, projectId: string, access: ProjectReadAccess): Promise<Project | null> {
@@ -270,8 +286,12 @@ const toolProjectGet: ToolSpec = {
   async run(auth, env, args) {
     const projectId = str(args.project_id)
     if (!projectId) return fail(400, 'invalid_project_id')
-    const project = await readableProject(env, projectId, readAccess(auth))
-    return project ? done({ project }) : fail(404, 'project_not_found')
+    const access = readAccess(auth)
+    const project = await readableProject(env, projectId, access)
+    if (!project) return fail(404, 'project_not_found')
+    const readableSquadIds = await projectionReadableSquads(env, access)
+    const situation = await loadProjectSituation(env, project, readableSquadIds)
+    return done({ project, situation })
   },
 }
 
