@@ -95,12 +95,12 @@
 - Modify: `src/dashboard/projects.ts`
 - Modify: `tests/dashboard-projects.test.ts`
 
-- [ ] Extend the Project Team view from squad edges to readable squad members.
-- [ ] Join agents to fleet runtime state through the existing identifier bridge semantics; show runtime, stored intent, derived presence, and last seen without claiming an offline runtime is live.
-- [ ] Preserve capability filtering so a caller only sees members of readable Project squads.
-- [ ] Distinguish `not attached`, `live`, `stale`, and `offline` with text and status styling.
-- [ ] Test live, stale, offline, unattached, duplicate-slug/ID bridge, and restricted-squad cases.
-- [ ] Run `npx vitest run tests/dashboard-projects.test.ts tests/fleet-registry.test.ts` and `npm run typecheck`.
+- [x] Extend the Project Team view from squad edges to readable squad members.
+- [x] Join agents to fleet runtime state through the existing identifier bridge semantics; show runtime, stored intent, derived presence, and last seen without claiming an offline runtime is live.
+- [x] Preserve capability filtering so a caller only sees members of readable Project squads.
+- [x] Distinguish `not attached`, `live`, `stale`, and `offline` with text and status styling.
+- [x] Test live, stale, offline, unattached, duplicate-slug/ID bridge, and restricted-squad cases.
+- [x] Run `npx vitest run tests/dashboard-projects.test.ts tests/fleet-registry.test.ts` and `npm run typecheck`.
 
 ## Task 6: Prove dashboard/MCP parity and browser operation
 

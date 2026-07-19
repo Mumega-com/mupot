@@ -25,4 +25,5 @@ Task 1: complete (commits 5284348..70fde24; review approved; no-secrets passed; 
 Task 2: complete (commits 70fde24..1448186; review approved; 68 focused tests + typecheck passed; complete keyset-paged scope and explicit snapshot truncation)
 Task 3: complete (commits c44f56f..2705202; review approved; 25 dashboard tests + typecheck passed; responsive operating summary with truthful truncation)
 Task 4: complete (commits 272d8dd..7cad70d; review approved; 95 focused tests + 3,787 full-suite tests + typecheck passed; shared lifecycle matrix and capability-correct RBAC)
-Task 5: in progress
+Task 5: complete (commits f716ebb..efb4031; review approved after two correction rounds; 65 focused tests + typecheck passed; bounded team roster preserves squad edges, runtime identity/presence truth, and mobile readability)
+Task 6: in progress
