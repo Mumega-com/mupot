@@ -284,11 +284,12 @@ describe('local project workspace showcase', () => {
         task_counts: { blocked: 1, review: 1, in_progress: 1, open: 0 },
         active_work_count: 3,
         active_flight_count: 1,
-        next_action: { type: 'review_task', task: { id: 'task-review-local' } },
+        next_action: { type: 'address_needs_you', item: { source_id: 'task-review-local' } },
       })
       const rendered = String(await projectDetailBody(dashboard!))
       expect(rendered).toContain('blocked')
-      expect(rendered).toContain('Review &quot;Review local approval task&quot;')
+      expect(rendered).toContain('Address')
+      expect(rendered).toContain('Review local approval task')
 
       const runtimeStates = await getFleetAgentRuntimeStates(env, [
         { agent_id: 'agent-hermes', slug: 'hermes' },
