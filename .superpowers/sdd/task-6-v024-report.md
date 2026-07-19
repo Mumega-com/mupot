@@ -89,3 +89,5 @@ not committed.
 - `npm test` (229 files passed, 3,796 tests passed).
 - `bash scripts/ci-local-evidence.sh` (passed; fresh isolated D1 migrations/seed, browser workflow,
   31-route crawl, same-Project parity, complete lifecycle, and runtime conformance all completed).
+- Post-review precision check: `npx vitest run tests/runtime-adapter-contract.test.ts` passed
+  12/12 after anchoring cleanup and the top-level health -> browser -> runtime execution order.

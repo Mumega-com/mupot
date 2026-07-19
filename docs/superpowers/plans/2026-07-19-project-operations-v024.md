@@ -112,12 +112,12 @@
 - Modify: `CHANGELOG.md`
 - Modify: `ROADMAP.md`
 
-- [ ] Seed blocked, review, active, completed, squad, agent, and runtime examples for `project-mupot`.
-- [ ] Extend browser smoke to create a nested Project, edit its goal, activate it, verify the situation, filter/search it, pause it, archive it, restore it, and verify desktop/mobile layout without horizontal overflow.
-- [ ] Read the same Project through REST/MCP test harness and assert health, blocker counts, and next action match the browser's canonical situation.
-- [ ] Capture screenshots and a machine-readable receipt under `tmp/local-smoke` without committing generated artifacts.
-- [ ] Update CHANGELOG and ROADMAP only for behavior proven by tests; leave unimplemented v0.24 items open.
-- [ ] Run `npm test`, `npm run typecheck`, `node scripts/no-secrets.mjs`, and `bash scripts/ci-local-evidence.sh`.
+- [x] Seed blocked, review, active, completed, squad, agent, and runtime examples for `project-mupot`.
+- [x] Extend browser smoke to create a nested Project, edit its goal, activate it, verify the situation, filter/search it, pause it, archive it, restore it, and verify desktop/mobile layout without horizontal overflow.
+- [x] Read the same Project through REST/MCP test harness and assert health, blocker counts, and next action match the browser's canonical situation.
+- [x] Capture screenshots and a machine-readable receipt under `tmp/local-smoke` without committing generated artifacts.
+- [x] Update CHANGELOG and ROADMAP only for behavior proven by tests; leave unimplemented v0.24 items open.
+- [x] Run `npm test`, `npm run typecheck`, `node scripts/no-secrets.mjs`, and `bash scripts/ci-local-evidence.sh`.
 
 ## Task 7: Review, publish, and obtain the release gate
 
