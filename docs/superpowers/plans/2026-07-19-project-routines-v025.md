@@ -229,12 +229,12 @@ expect(await executeRoutineAction(env, run.id, 'action-1')).toEqual(
 - `NeedsYouItem` includes `kind`, source identity, Project identity, title, reason, urgency, responsible party, requester, timestamps, safe URL, and allowed source actions.
 - Sources remain authoritative; this task creates no `needs_you` table.
 
-- [ ] **Step 1: Write tests covering pending approvals, Routine waits, blocked human-owned tasks, outputs awaiting review, Project filtering, unreadable rows, urgency ordering, keyset continuation, source caps, and truthful truncation.**
-- [ ] **Step 2: Run `npx vitest run tests/needs-you.test.ts` and verify import failure.**
-- [ ] **Step 3: Implement bounded per-source queries, normalize rows into one union, globally sort, and issue a signed/validated cursor containing source timestamp/type/id.**
-- [ ] **Step 4: Verify resolution is absent from this service and existing approval/verdict/answer/budget/cancel services remain the only mutation paths.**
-- [ ] **Step 5: Run focused tests, approval tests, Project RBAC tests, and typecheck.**
-- [ ] **Step 6: Commit with `git commit -m "feat: project human attention needs"`.**
+- [x] **Step 1: Write tests covering pending approvals, Routine waits, blocked human-owned tasks, outputs awaiting review, Project filtering, unreadable rows, urgency ordering, keyset continuation, source caps, and truthful truncation.**
+- [x] **Step 2: Run `npx vitest run tests/needs-you.test.ts` and verify import failure.**
+- [x] **Step 3: Implement bounded per-source queries, normalize rows into one union, globally sort, and issue a signed/validated cursor containing source timestamp/type/id.**
+- [x] **Step 4: Verify resolution is absent from this service and existing approval/verdict/answer/budget/cancel services remain the only mutation paths.**
+- [x] **Step 5: Run focused tests, approval tests, Project RBAC tests, and typecheck.**
+- [x] **Step 6: Commit with `git commit -m "feat: project human attention needs"`.**
 
 ### Task 8: Project Situation, Activity, and Evidence
 
