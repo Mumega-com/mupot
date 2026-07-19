@@ -26,6 +26,7 @@
 // LoopDeps.sensoriumRuntime. buildSensorium uses it for non-DB runtime fields.
 
 import type { Env, Agent, Effort, Autonomy } from '../types'
+import { asData } from '../lib/prompt-safety'
 
 // ── Version ─────────────────────────────────────────────────────────────────
 
@@ -387,22 +388,10 @@ async function safeReadDelegations(
   }
 }
 
-/**
- * Render an agent/user-supplied string as DATA inside the prompt, not instructions.
- * Strips newlines/tabs/control chars (so a title can't forge prompt lines), escapes
- * quotes, bounds length, and wraps in quotes. Prompt-injection hardening for S1.
- */
-function asData(s: string): string {
-  // Collapse C0 control chars (\r \n \t and friends) so a title cannot forge
-  // prompt lines; escape quotes; bound length; wrap as quoted data.
-  // eslint-disable-next-line no-control-regex
-  const cleaned = s
-    .replace(/[\u0000-\u001F\u007F]+/g, ' ')
-    .replace(/"/g, "'")
-    .slice(0, 200)
-    .trim()
-  return `"${cleaned}"`
-}
+// asData (prompt-injection fence, S1) now lives in ../lib/prompt-safety -- shared
+// with src/agents/execute.ts's cross-pot (source_pot) fencing (PR #404 re-gate)
+// so both surfaces use the exact same hardened regex instead of two that could
+// silently drift apart.
 
 /** YYYY-MM-DD (UTC) for a Date. Mirrors meter.ts internal helper. */
 function isoDateUtc(d: Date): string {
