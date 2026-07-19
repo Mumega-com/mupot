@@ -500,7 +500,7 @@ async function runProjectWorkspaceWorkflow() {
   const projectsMobileOverflow = await assertNoDocumentOverflow('mobile Projects')
   await page.locator('#topbar-menu-btn').click()
   const mobileNavigation = await page.locator('#app-nav > a.nav-link .nav-label').allInnerTexts()
-  if (JSON.stringify(mobileNavigation.slice(0, 4)) !== JSON.stringify(expectedPrimaryNavigation)) {
+  if (JSON.stringify(mobileNavigation.slice(0, 5)) !== JSON.stringify(expectedPrimaryNavigation)) {
     fail('mobile primary navigation order changed', { mobileNavigation, expectedPrimaryNavigation })
   }
   await page.screenshot({ path: path.join(artifactsDir, 'projects-mobile.png'), fullPage: true })
