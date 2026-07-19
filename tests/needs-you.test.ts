@@ -308,6 +308,30 @@ describe('Needs You projection', () => {
     expect(itemActions(agentPage, 'routine-budget')).toEqual(['view'])
   })
 
+  it('requires writable responsible-squad Project access before advertising answer', async () => {
+    harness = makeHarness()
+    insertWaitingRun(harness, { id: 'access-answer', reason: 'answer' })
+    const env = envFor(harness)
+    const setAccess = (access: 'read' | 'write' | 'admin') => {
+      harness?.sqlite.prepare(
+        `UPDATE project_squad_access SET access_level = ?
+          WHERE project_id = 'project-a' AND squad_id = 'squad-a'`,
+      ).run(access)
+    }
+
+    setAccess('read')
+    expect(itemActions(await listNeedsYou(env, member(), {}), 'access-answer')).toEqual(['view'])
+
+    setAccess('write')
+    expect(itemActions(await listNeedsYou(env, member(), {}), 'access-answer')).toEqual(['view', 'answer'])
+
+    setAccess('admin')
+    expect(itemActions(await listNeedsYou(env, member(), {}), 'access-answer')).toEqual(['view', 'answer'])
+
+    setAccess('read')
+    expect(itemActions(await listNeedsYou(env, owner(), {}), 'access-answer')).toEqual(['view', 'answer', 'cancel'])
+  })
+
   it('matches verdict squad, gate, self-verdict, and gate:loops approval authority', async () => {
     harness = makeHarness()
     insertTask(harness, { id: 'standard-gate', status: 'review', assignee: 'agent-b', gateOwner: 'gate:content' })

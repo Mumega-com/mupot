@@ -74,6 +74,7 @@ interface SourceRow {
   deadline_at: string | null
   squad_id: string | null
   squad_department_id: string | null
+  project_access_level: 'read' | 'write' | 'admin' | null
   assignee_agent_id: string | null
   gate_owner: string | null
   has_gate_grant: number
@@ -124,6 +125,12 @@ function principalCanActOnSquad(row: SourceRow, principal: RoutinePrincipal): bo
     ))
 }
 
+function principalCanAnswerRoutine(row: SourceRow, principal: RoutinePrincipal): boolean {
+  if (principal.workspace_admin) return true
+  return (row.project_access_level === 'write' || row.project_access_level === 'admin')
+    && principalCanActOnSquad(row, principal)
+}
+
 function actionsFor(row: SourceRow, principal: RoutinePrincipal): NeedsYouAction[] {
   if (row.source_type === 'task') {
     if (row.kind === 'approval') {
@@ -145,7 +152,7 @@ function actionsFor(row: SourceRow, principal: RoutinePrincipal): NeedsYouAction
 
   const actions: NeedsYouAction[] = ['view']
   const human = principal.actor_type === 'member'
-  if (row.kind === 'routine_answer' && human && principalCanActOnSquad(row, principal)) {
+  if (row.kind === 'routine_answer' && human && principalCanAnswerRoutine(row, principal)) {
     actions.push('answer')
   }
   if (!human || !principal.workspace_admin || !principalCanActOnSquad(row, principal)) return actions
@@ -256,7 +263,8 @@ async function sourceRows(
       'Approval required by ' || t.gate_owner AS reason,
       0 AS urgency_rank, t.gate_owner AS responsible, t.assignee_agent_id AS requested_by,
       t.created_at, p.target_date AS deadline_at,
-      t.squad_id, s.department_id AS squad_department_id, t.assignee_agent_id, t.gate_owner,
+      t.squad_id, s.department_id AS squad_department_id, NULL AS project_access_level,
+      t.assignee_agent_id, t.gate_owner,
       CASE WHEN EXISTS (
         SELECT 1 FROM gate_grants g
          WHERE g.capability = t.gate_owner
@@ -293,6 +301,7 @@ async function sourceRows(
       r.responsible_squad_id AS responsible, r.created_by AS requested_by,
       rr.created_at, rr.scheduled_for AS deadline_at,
       r.responsible_squad_id AS squad_id, s.department_id AS squad_department_id,
+      psa.access_level AS project_access_level,
       NULL AS assignee_agent_id, NULL AS gate_owner, 0 AS has_gate_grant, 0 AS has_surface_grant,
       COALESCE(rr.scheduled_for, '${DEADLINE_SENTINEL}') AS sort_deadline,
       rr.created_at AS sort_timestamp
@@ -300,6 +309,8 @@ async function sourceRows(
     JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant
     JOIN projects p ON p.id = rr.project_id
     JOIN squads s ON s.id = r.responsible_squad_id
+    JOIN project_squad_access psa
+      ON psa.project_id = rr.project_id AND psa.squad_id = r.responsible_squad_id
     WHERE rr.tenant = ? AND rr.status = 'waiting' AND rr.waiting_reason IS NOT NULL
       AND NOT (rr.waiting_reason = 'review' AND rr.task_id IS NOT NULL)${projectClause}
       AND ${visibility.sql}
@@ -312,7 +323,7 @@ async function sourceRows(
       'Blocked work requires ' || t.gate_owner AS reason,
       2 AS urgency_rank, t.gate_owner AS responsible, NULL AS requested_by,
       t.created_at, p.target_date AS deadline_at,
-      t.squad_id, s.department_id AS squad_department_id,
+      t.squad_id, s.department_id AS squad_department_id, NULL AS project_access_level,
       NULL AS assignee_agent_id, t.gate_owner, 0 AS has_gate_grant, 0 AS has_surface_grant,
       COALESCE(p.target_date, '${DEADLINE_SENTINEL}') AS sort_deadline,
       t.created_at AS sort_timestamp
@@ -329,7 +340,7 @@ async function sourceRows(
       'Approved output awaits publication' AS reason,
       3 AS urgency_rank, 'workspace_admin' AS responsible, t.assignee_agent_id AS requested_by,
       t.created_at, p.target_date AS deadline_at,
-      t.squad_id, s.department_id AS squad_department_id,
+      t.squad_id, s.department_id AS squad_department_id, NULL AS project_access_level,
       t.assignee_agent_id, t.gate_owner, 0 AS has_gate_grant, 0 AS has_surface_grant,
       COALESCE(p.target_date, '${DEADLINE_SENTINEL}') AS sort_deadline,
       t.created_at AS sort_timestamp
