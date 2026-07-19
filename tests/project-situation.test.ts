@@ -143,6 +143,8 @@ describe('loadProjectSituation', () => {
       active_work_count_truncated: false,
       active_flight_count: 0,
       active_flight_count_truncated: false,
+      blocker_details_truncated: false,
+      pending_review_details_truncated: false,
       snapshot_truncated: false,
       next_action: { type: 'review_task', task: { id: 'review' } },
     })
@@ -293,6 +295,8 @@ describe('loadProjectSituation', () => {
       active_work_count_truncated: false,
       active_flight_count: 0,
       active_flight_count_truncated: false,
+      blocker_details_truncated: false,
+      pending_review_details_truncated: false,
       snapshot_truncated: false,
       latest_activity: null,
       next_action: { type: 'create_task' },
@@ -385,8 +389,42 @@ describe('loadProjectSituation', () => {
       active_work_count_truncated: true,
       active_flight_count: 100,
       active_flight_count_truncated: true,
+      blocker_details_truncated: true,
+      pending_review_details_truncated: true,
       snapshot_truncated: true,
       next_action: { type: 'review_task', task: { id: 'review-000' } },
+    })
+    expect(situation.blockers).toHaveLength(20)
+    expect(situation.pending_reviews).toHaveLength(20)
+  })
+
+  it('reports detail truncation at 21 rows without marking exact counts as truncated', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'detail-capped')
+    for (const status of ['blocked', 'review'] as const) {
+      harness.sqlite.exec(`
+        WITH RECURSIVE seq(n) AS (
+          VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 20
+        )
+        INSERT INTO tasks (id, squad_id, title, status, project_id, created_at, updated_at)
+        SELECT 'detail-${status}-' || printf('%02d', n), 'squad-a', '${status} ' || n, '${status}', '${project.id}',
+               '2026-07-19T01:00:00Z', '2026-07-19T01:00:00Z'
+          FROM seq;
+      `)
+    }
+
+    const situation = await loadProjectSituation(envFor(harness), project, null)
+
+    expect(situation).toMatchObject({
+      task_counts: { blocked: 21, review: 21, in_progress: 0, open: 0 },
+      task_counts_truncated: {
+        blocked: false, review: false, in_progress: false, open: false, overall: false,
+      },
+      active_work_count: 42,
+      active_work_count_truncated: false,
+      blocker_details_truncated: true,
+      pending_review_details_truncated: true,
+      snapshot_truncated: true,
     })
     expect(situation.blockers).toHaveLength(20)
     expect(situation.pending_reviews).toHaveLength(20)

@@ -77,6 +77,8 @@ export interface ProjectSituation {
   active_work_count_truncated: boolean
   active_flight_count: number
   active_flight_count_truncated: boolean
+  blocker_details_truncated: boolean
+  pending_review_details_truncated: boolean
   snapshot_truncated: boolean
   latest_activity: ProjectProjectionRow<ProjectActivitySource> | null
   next_action: ProjectSituationNextAction | null
@@ -314,6 +316,8 @@ export async function loadProjectSituation(
 
   const blockers = rowsByStatus.blocked.slice(0, PROJECT_SITUATION_DETAIL_CAP).map(safeBlocker)
   const pendingReviews = rowsByStatus.review.slice(0, PROJECT_SITUATION_DETAIL_CAP).map(safeReview)
+  const blockerDetailsTruncated = rowsByStatus.blocked.length > PROJECT_SITUATION_DETAIL_CAP
+  const pendingReviewDetailsTruncated = rowsByStatus.review.length > PROJECT_SITUATION_DETAIL_CAP
   const inProgress = rowsByStatus.in_progress[0] ? safeTask(rowsByStatus.in_progress[0]) : null
   const open = rowsByStatus.open[0] ? safeTask(rowsByStatus.open[0]) : null
   const activeWorkCount = taskCounts.blocked + taskCounts.review + taskCounts.in_progress + taskCounts.open
@@ -342,7 +346,12 @@ export async function loadProjectSituation(
     active_work_count_truncated: taskCountsTruncated.overall,
     active_flight_count: activeFlightCount,
     active_flight_count_truncated: activeFlightCountTruncated,
-    snapshot_truncated: taskCountsTruncated.overall || activeFlightCountTruncated,
+    blocker_details_truncated: blockerDetailsTruncated,
+    pending_review_details_truncated: pendingReviewDetailsTruncated,
+    snapshot_truncated: taskCountsTruncated.overall
+      || activeFlightCountTruncated
+      || blockerDetailsTruncated
+      || pendingReviewDetailsTruncated,
     latest_activity: activity.rows[0] ?? null,
     next_action: nextAction(project, pendingReviews, blockers, inProgress, open, flight),
   }
