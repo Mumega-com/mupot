@@ -65,11 +65,21 @@ describe('validHttpsBaseUrl — SSRF range check (pure, #392 gate 2)', () => {
     ['ipv6 link-local fe80::/10', 'https://[fe80::1]/'],
     ['ipv6 v4-mapped loopback', 'https://[::ffff:127.0.0.1]/'],
     ['ipv6 v4-mapped private', 'https://[::ffff:10.0.0.1]/'],
+    // Deprecated IPv4-COMPATIBLE form (no 0xffff marker — RFC 4291 historic). Re-gate on #401
+    // found this form uncaught: only the ::ffff:-marked mapped form above was checked.
+    ['ipv6 v4-compatible loopback, dotted form', 'https://[::127.0.0.1]/'],
+    ['ipv6 v4-compatible loopback, hex form (== ::127.0.0.1)', 'https://[::7f00:1]/'],
+    ['ipv6 v4-compatible private 10.x, dotted form', 'https://[::10.0.0.5]/'],
+    ['ipv6 v4-compatible link-local metadata, dotted form', 'https://[::169.254.169.254]/'],
     ['single-label hostname', 'https://internal/'],
     ['single-label hostname, trailing dot bypass attempt', 'https://internal./'],
     ['metadata single-label', 'https://metadata/'],
   ])('rejects %s', (_label, value) => {
     expect(validHttpsBaseUrl(value)).toBe(false)
+  })
+
+  it('ipv6 v4-compatible form with a real PUBLIC embedded v4 address is not blocked (boundary is exact, same as the v4-mapped case)', () => {
+    expect(validHttpsBaseUrl('https://[::8.8.8.8]/')).toBe(true)
   })
 
   it('172.32.x.x (just outside 172.16/12) is NOT blocked by the private-range rule (sanity: range boundary is exact)', () => {
@@ -240,6 +250,169 @@ describe('project-link SSRF gate — integration (real D1, real migrations)', ()
       const delivered = await deliverProjectLinkEnvelope(e, created.link.id, signed, { fetcher, now: NOW })
       expect(delivered).toEqual({ ok: false, reason: 'invalid_link' })
       expect(fetchCalled).toBe(false)
+    } finally {
+      harness.close()
+    }
+  })
+
+  // ── redirect-following bypass (BLOCK-1, #401 re-gate) ──────────────────────────────────
+  // validHttpsBaseUrl only ever vets the LITERAL remote_base_url host — a public, gate-passing
+  // host can still answer the delivery request with a 307/308 pointing at a private/loopback
+  // address, and the default fetch() redirect mode ('follow') would chase it transparently.
+  // These prove the fix: `redirect: 'manual'` + outright refusal of every 3xx, never a second
+  // dial to the Location target.
+  async function deliveryFixture(harness: SqliteD1Harness, fetcher: typeof fetch) {
+    migrate(harness)
+    seed(harness)
+    const e = env(harness)
+    await enableProjectLinkAddon(e)
+    const localKeys = await generateProjectLinkKeyPair()
+    const remoteKeys = await generateProjectLinkKeyPair()
+    const created = await createProjectLink(
+      e,
+      linkInput('https://dme.mupot.test/', await exportProjectLinkPublicKey(remoteKeys.publicKey)),
+      { id: 'owner', role: 'owner' },
+      NOW,
+    )
+    if (!created.ok) throw new Error('fixture link creation failed')
+    const signed = await createSignedProjectEnvelope(
+      {
+        source: { pot: 'mumega', project_id: 'project', agent_id: 'agent-a', key_id: 'local-key' },
+        destination: { pot: 'dme', project_id: 'dme-project' },
+        correlation_id: 'corr-1',
+        idempotency_key: 'idem-redirect-1',
+        requested_capability: 'project.task.write',
+        expires_at: '2026-07-19T12:05:00.000Z',
+        task: {
+          source_task_id: 'task-1', flight_id: 'flight-1', request_id: 'req-1',
+          title: 'Test delivery', state: 'in_progress', priority: 'high',
+          blocker_summary: null, success_predicate: 'n/a', progress_summary: 'n/a',
+        },
+        evidence: null,
+      },
+      localKeys.privateKey,
+    )
+    const delivered = await deliverProjectLinkEnvelope(e, created.link.id, signed, { fetcher, now: NOW, maxAttempts: 1 })
+    return { e, linkId: created.link.id, delivered }
+  }
+
+  it('deliverProjectLinkEnvelope refuses a 307 redirect to a private-IP Location — real workerd shape (explicit 3xx status), never dials the Location target', async () => {
+    const harness = createSqliteD1()
+    try {
+      const dialedUrls: string[] = []
+      const fetcher: typeof fetch = async (input) => {
+        dialedUrls.push(String(input))
+        return new Response(null, { status: 307, headers: { location: 'http://127.0.0.1/admin' } })
+      }
+      const { delivered } = await deliveryFixture(harness, fetcher)
+      expect(delivered.ok).toBe(false)
+      // exactly one dial — the original (validated) origin, never the redirect target
+      expect(dialedUrls).toHaveLength(1)
+      expect(dialedUrls[0]).toMatch(/^https:\/\/dme\.mupot\.test\/api\/project-links\//)
+      expect(dialedUrls.some((u) => u.includes('127.0.0.1'))).toBe(false)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('deliverProjectLinkEnvelope refuses a 308 redirect to the cloud-metadata address', async () => {
+    const harness = createSqliteD1()
+    try {
+      const dialedUrls: string[] = []
+      const fetcher: typeof fetch = async (input) => {
+        dialedUrls.push(String(input))
+        return new Response(null, { status: 308, headers: { location: 'http://169.254.169.254/latest/meta-data/' } })
+      }
+      const { delivered } = await deliveryFixture(harness, fetcher)
+      expect(delivered.ok).toBe(false)
+      expect(dialedUrls).toHaveLength(1)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('deliverProjectLinkEnvelope also refuses the browser-style opaqueredirect response shape (vitest/undici mock parity, mirrors src/departments/executors/shared/cms-adapter.ts)', async () => {
+    const harness = createSqliteD1()
+    try {
+      let calls = 0
+      const opaque = { type: 'opaqueredirect', status: 0, ok: false } as unknown as Response
+      const fetcher: typeof fetch = async () => {
+        calls += 1
+        return opaque
+      }
+      const { delivered } = await deliveryFixture(harness, fetcher)
+      expect(delivered.ok).toBe(false)
+      expect(calls).toBe(1)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('a normal 2xx response from the (validated) origin is NOT refused by the redirect guard — sanity check the fix does not over-block honest peers', async () => {
+    const harness = createSqliteD1()
+    try {
+      // Not asserting full success (that needs a matching receipt signature, covered
+      // elsewhere) — just that a 2xx response reaches past the redirect-refusal branch
+      // instead of being misclassified as a redirect. A malformed-body 200 hits
+      // 'invalid_remote_receipt' internally, surfacing as the generic 'remote_failure'
+      // terminal reason (not a redirect refusal) — proving the redirect guard let it through.
+      const fetcher: typeof fetch = async () => new Response(JSON.stringify({ ok: false }), { status: 200 })
+      const { delivered } = await deliveryFixture(harness, fetcher)
+      expect(delivered).toMatchObject({ ok: false, reason: 'remote_failure' })
+    } finally {
+      harness.close()
+    }
+  })
+
+  // ── trailing-slash normalization (Minor guard, #401 re-gate) ───────────────────────────
+  it('deliverProjectLinkEnvelope normalizes a stored remote_base_url that lacks a trailing slash before building the delivery URL — an out-of-band row cannot shift the fetched host/path', async () => {
+    const harness = createSqliteD1()
+    try {
+      migrate(harness)
+      seed(harness)
+      const e = env(harness)
+      await enableProjectLinkAddon(e)
+      const localKeys = await generateProjectLinkKeyPair()
+      const remoteKeys = await generateProjectLinkKeyPair()
+      const created = await createProjectLink(
+        e,
+        linkInput('https://dme.mupot.test/', await exportProjectLinkPublicKey(remoteKeys.publicKey)),
+        { id: 'owner', role: 'owner' },
+        NOW,
+      )
+      if (!created.ok) throw new Error('fixture link creation failed')
+      // Simulate a row written outside createProjectLink's `new URL().toString()` normalization
+      // (e.g. a migration or a future write path) — stored WITHOUT the trailing slash.
+      harness.sqlite.exec(
+        `UPDATE project_links SET remote_base_url = 'https://dme.mupot.test' WHERE id = '${created.link.id}'`,
+      )
+      const dialedUrls: string[] = []
+      const fetcher: typeof fetch = async (input) => {
+        dialedUrls.push(String(input))
+        return new Response(null, { status: 500 })
+      }
+      const signed = await createSignedProjectEnvelope(
+        {
+          source: { pot: 'mumega', project_id: 'project', agent_id: 'agent-a', key_id: 'local-key' },
+          destination: { pot: 'dme', project_id: 'dme-project' },
+          correlation_id: 'corr-2',
+          idempotency_key: 'idem-slash-1',
+          requested_capability: 'project.task.write',
+          expires_at: '2026-07-19T12:05:00.000Z',
+          task: {
+            source_task_id: 'task-1', flight_id: 'flight-1', request_id: 'req-1',
+            title: 'Test delivery', state: 'in_progress', priority: 'high',
+            blocker_summary: null, success_predicate: 'n/a', progress_summary: 'n/a',
+          },
+          evidence: null,
+        },
+        localKeys.privateKey,
+      )
+      await deliverProjectLinkEnvelope(e, created.link.id, signed, { fetcher, now: NOW, maxAttempts: 1 })
+      expect(dialedUrls).toHaveLength(1)
+      // Without normalization this would be 'https://dme.mupot.testapi/project-links/...' —
+      // a different (and invalid) host string entirely.
+      expect(dialedUrls[0].startsWith('https://dme.mupot.test/api/project-links/')).toBe(true)
     } finally {
       harness.close()
     }

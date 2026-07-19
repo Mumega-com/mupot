@@ -143,16 +143,38 @@ describe('sendToRef — gate 1 send-target confinement (#392)', () => {
     }
   })
 
-  it('case (b) fails closed: a projectId that does not cover the target squad is still refused (by the existing project-access check, not gate 1)', async () => {
+  it('case (b) fails closed AND non-leaking: a projectId that does not cover the target squad collapses to send_target_not_visible, not the specific project_access_denied (re-gate fix, #401 — the specific reason was an existence oracle)', async () => {
     const { db, close } = migratedDb()
     try {
       // agent-outside sits on squad-other, which project-shared does NOT grant access to.
+      // Squad-visibility (case a) fails first, so case (b) is the only remaining authority —
+      // but its failure must be indistinguishable from resolveAgentRef never finding
+      // agent-outside at all (see the `resolveAgentRef` !ok branch in sendToRef): both must
+      // return send_target_not_visible. Returning the specific project_access_denied here
+      // (the pre-fix behavior) would let a non-admin distinguish "exists, wrong project" from
+      // "doesn't exist" by probing any ref with a projectId attached — an existence oracle
+      // through the one field (projectId) meant to be an alternate authorization path, not a
+      // side-channel.
       const res = await sendToRef(
         envWith(db),
         { ...baseInput, toRef: 'agent-outside', projectId: 'project-shared' },
         NO_GRANTS,
       )
-      expect(res).toEqual({ ok: false, reason: 'project_access_denied' })
+      expect(res).toEqual({ ok: false, reason: 'send_target_not_visible' })
+    } finally {
+      close()
+    }
+  })
+
+  it('case (b) leak-check: a NONEXISTENT ref with the SAME projectId is indistinguishable from the real-but-unauthorized agent-outside above — both return send_target_not_visible (re-gate fix, #401)', async () => {
+    const { db, close } = migratedDb()
+    try {
+      const res = await sendToRef(
+        envWith(db),
+        { ...baseInput, toRef: 'agent-does-not-exist', projectId: 'project-shared' },
+        NO_GRANTS,
+      )
+      expect(res).toEqual({ ok: false, reason: 'send_target_not_visible' })
     } finally {
       close()
     }

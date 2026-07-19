@@ -214,11 +214,16 @@ function envNoTenant(db: ReturnType<typeof makeDb>): Env {
 
 const fixedClock = { now: () => '2026-06-19T12:00:00.000Z', idGen: (() => { let n = 0; return () => `id-${++n}` })() }
 
+// sendAgentMessage's authz param is a compile-time forcing function only (#401 WARN
+// follow-up) — this file exercises the raw primitive directly, not through sendToRef's
+// confinement, so every call below asserts that plainly.
+const TEST_AUTHZ = { system: true, reason: 'test: exercises sendAgentMessage primitive directly' } as const
+
 // ── service: send ─────────────────────────────────────────────────────────────────────────
 describe('sendAgentMessage', () => {
   it('persists a message, tenant/sender stamped, returns seq', async () => {
     const db = makeDb()
-    const r = await sendAgentMessage(envWith(db), { fromAgent: 'ag-code', fromMember: 'm1', toAgent: 'ag-review', body: 'build G64b' })
+    const r = await sendAgentMessage(envWith(db), { fromAgent: 'ag-code', fromMember: 'm1', toAgent: 'ag-review', body: 'build G64b' }, TEST_AUTHZ)
     expect(r.ok).toBe(true)
     if (!r.ok) return
     expect(r.seq).toBe(1)
@@ -236,8 +241,8 @@ describe('sendAgentMessage', () => {
     const env = envWith(db)
     // identical content + same sender + same rid = a true idempotent replay (e.g. a retry).
     const msg = { fromAgent: 'ag-code', fromMember: 'm1', toAgent: 'ag-review', body: 'x', requestId: 'rid-1' }
-    const a = await sendAgentMessage(env, msg)
-    const b = await sendAgentMessage(env, msg)
+    const a = await sendAgentMessage(env, msg, TEST_AUTHZ)
+    const b = await sendAgentMessage(env, msg, TEST_AUTHZ)
     expect(a.ok && b.ok).toBe(true)
     if (!a.ok || !b.ok) return
     expect(b.duplicate).toBe(true)
@@ -250,8 +255,8 @@ describe('sendAgentMessage', () => {
     const db = makeDb()
     const env = envWith(db)
     // ag-a and ag-b both pick request_id 'rid-x' addressed to ag-x. Neither must suppress the other.
-    const a = await sendAgentMessage(env, { fromAgent: 'ag-a', fromMember: 'm', toAgent: 'ag-x', body: 'from A', requestId: 'rid-x' })
-    const b = await sendAgentMessage(env, { fromAgent: 'ag-b', fromMember: 'm', toAgent: 'ag-x', body: 'from B', requestId: 'rid-x' })
+    const a = await sendAgentMessage(env, { fromAgent: 'ag-a', fromMember: 'm', toAgent: 'ag-x', body: 'from A', requestId: 'rid-x' }, TEST_AUTHZ)
+    const b = await sendAgentMessage(env, { fromAgent: 'ag-b', fromMember: 'm', toAgent: 'ag-x', body: 'from B', requestId: 'rid-x' }, TEST_AUTHZ)
     expect(a.ok && b.ok).toBe(true)
     if (!a.ok || !b.ok) return
     expect(b.duplicate).toBe(false) // ag-b's send is NOT swallowed by ag-a's rid
@@ -263,9 +268,9 @@ describe('sendAgentMessage', () => {
     const db = makeDb()
     const env = envWith(db)
     // attacker ag-evil pre-seeds rid 'shared' to ag-victim-inbox
-    await sendAgentMessage(env, { fromAgent: 'ag-evil', fromMember: 'm', toAgent: 'ag-x', body: 'poison', requestId: 'shared' })
+    await sendAgentMessage(env, { fromAgent: 'ag-evil', fromMember: 'm', toAgent: 'ag-x', body: 'poison', requestId: 'shared' }, TEST_AUTHZ)
     // honest ag-good sends with the same rid string — must land, NOT return the attacker's row
-    const good = await sendAgentMessage(env, { fromAgent: 'ag-good', fromMember: 'm', toAgent: 'ag-x', body: 'real message', requestId: 'shared' })
+    const good = await sendAgentMessage(env, { fromAgent: 'ag-good', fromMember: 'm', toAgent: 'ag-x', body: 'real message', requestId: 'shared' }, TEST_AUTHZ)
     expect(good.ok).toBe(true)
     if (!good.ok) return
     expect(good.duplicate).toBe(false)
@@ -277,8 +282,8 @@ describe('sendAgentMessage', () => {
   it('same sender + same rid + DIFFERENT content → request_id_conflict (never a silent success)', async () => {
     const db = makeDb()
     const env = envWith(db)
-    const first = await sendAgentMessage(env, { fromAgent: 'ag-a', fromMember: 'm', toAgent: 'ag-x', body: 'v1', requestId: 'r1' })
-    const reused = await sendAgentMessage(env, { fromAgent: 'ag-a', fromMember: 'm', toAgent: 'ag-x', body: 'v2-different', requestId: 'r1' })
+    const first = await sendAgentMessage(env, { fromAgent: 'ag-a', fromMember: 'm', toAgent: 'ag-x', body: 'v1', requestId: 'r1' }, TEST_AUTHZ)
+    const reused = await sendAgentMessage(env, { fromAgent: 'ag-a', fromMember: 'm', toAgent: 'ag-x', body: 'v2-different', requestId: 'r1' }, TEST_AUTHZ)
     expect(first.ok).toBe(true)
     expect(reused.ok).toBe(false)
     if (reused.ok) return
@@ -289,8 +294,8 @@ describe('sendAgentMessage', () => {
   it('same sender + same rid + SAME content → idempotent duplicate', async () => {
     const env = envWith(makeDb())
     const base = { fromAgent: 'ag-a', fromMember: 'm', toAgent: 'ag-x', body: 'same', requestId: 'r2', kind: 'request' as const, inReplyTo: undefined }
-    const a = await sendAgentMessage(env, base)
-    const b = await sendAgentMessage(env, base)
+    const a = await sendAgentMessage(env, base, TEST_AUTHZ)
+    const b = await sendAgentMessage(env, base, TEST_AUTHZ)
     expect(a.ok && b.ok).toBe(true)
     if (!a.ok || !b.ok) return
     expect(b.duplicate).toBe(true)
@@ -300,7 +305,7 @@ describe('sendAgentMessage', () => {
   it('per-recipient unread cap refuses spam (inbox_full); a read frees the budget', async () => {
     const db = makeDb()
     const env = envWith(db)
-    const send = (body: string) => sendAgentMessage(env, { fromAgent: 'ag-spammer', fromMember: 'm', toAgent: 'ag-x', body }, { maxUnread: 2 })
+    const send = (body: string) => sendAgentMessage(env, { fromAgent: 'ag-spammer', fromMember: 'm', toAgent: 'ag-x', body }, TEST_AUTHZ, { maxUnread: 2 })
     expect((await send('1')).ok).toBe(true)
     expect((await send('2')).ok).toBe(true)
     const third = await send('3')
@@ -326,6 +331,7 @@ describe('sendAgentMessage', () => {
     const b = await sendAgentMessage(
       env,
       { fromAgent: 'ag-x', fromMember: 'm', toAgent: 'ag-y', body: 'hi', requestId: 'r1' },
+      TEST_AUTHZ,
       { maxUnread: 1 },
     )
     expect(b.ok).toBe(true)
@@ -345,6 +351,7 @@ describe('sendAgentMessage', () => {
     const r = await sendAgentMessage(
       env,
       { fromAgent: 'ag-x', fromMember: 'm', toAgent: 'ag-y', body: 'new', requestId: 'fresh' },
+      TEST_AUTHZ,
       { maxUnread: 1 },
     )
     expect(r.ok).toBe(false)
@@ -353,7 +360,7 @@ describe('sendAgentMessage', () => {
   })
 
   it('fail-closed without a tenant', async () => {
-    const r = await sendAgentMessage(envNoTenant(makeDb()), { fromAgent: 'a', fromMember: 'm', toAgent: 'b', body: 'x' })
+    const r = await sendAgentMessage(envNoTenant(makeDb()), { fromAgent: 'a', fromMember: 'm', toAgent: 'b', body: 'x' }, TEST_AUTHZ)
     expect(r.ok).toBe(false)
     if (r.ok) return
     expect(r.reason).toBe('no_tenant')
@@ -369,7 +376,7 @@ describe('sendAgentMessage', () => {
     ['empty from', { fromAgent: '' }, 'invalid_from'],
   ])('validation rejects %s', async (_l, patch, reason) => {
     const base = { fromAgent: 'a', fromMember: 'm', toAgent: 'b', body: 'ok' }
-    const r = await sendAgentMessage(envWith(makeDb()), { ...base, ...(patch as object) })
+    const r = await sendAgentMessage(envWith(makeDb()), { ...base, ...(patch as object) }, TEST_AUTHZ)
     expect(r.ok).toBe(false)
     if (r.ok) return
     expect(r.reason).toBe(reason)
@@ -378,8 +385,8 @@ describe('sendAgentMessage', () => {
   it('accepts request/ack kinds + in_reply_to', async () => {
     const db = makeDb()
     const env = envWith(db)
-    const req = await sendAgentMessage(env, { fromAgent: 'a', fromMember: 'm', toAgent: 'b', body: 'do X', kind: 'request', requestId: 'q1' })
-    const ack = await sendAgentMessage(env, { fromAgent: 'b', fromMember: 'm', toAgent: 'a', body: 'done', kind: 'ack', inReplyTo: 'q1' })
+    const req = await sendAgentMessage(env, { fromAgent: 'a', fromMember: 'm', toAgent: 'b', body: 'do X', kind: 'request', requestId: 'q1' }, TEST_AUTHZ)
+    const ack = await sendAgentMessage(env, { fromAgent: 'b', fromMember: 'm', toAgent: 'a', body: 'done', kind: 'ack', inReplyTo: 'q1' }, TEST_AUTHZ)
     expect(req.ok && ack.ok).toBe(true)
     expect(db._messages[1].kind).toBe('ack')
     expect(db._messages[1].in_reply_to).toBe('q1')
@@ -389,7 +396,7 @@ describe('sendAgentMessage', () => {
 // ── service: inbox ────────────────────────────────────────────────────────────────────────
 describe('readAgentInbox', () => {
   async function seed(env: Env, to: string, bodies: string[]) {
-    for (const body of bodies) await sendAgentMessage(env, { fromAgent: 'ag-code', fromMember: 'm1', toAgent: to, body }, fixedClock)
+    for (const body of bodies) await sendAgentMessage(env, { fromAgent: 'ag-code', fromMember: 'm1', toAgent: to, body }, TEST_AUTHZ, fixedClock)
   }
 
   it('consumes oldest-first, ordered by seq, then empty', async () => {

@@ -117,14 +117,26 @@ function validIdentifier(value: string): boolean {
 // (Cloudflare's internal metadata endpoints, other same-account Workers over service bindings
 // are a separate seam, but link-local/loopback/ULA literals are the classic SSRF target set).
 //
-// Residual limitation (accepted, not engineered around — see PR body): this validates the
-// LITERAL host at write-time and again at delivery-time. It does NOT re-resolve at fetch time
-// to catch DNS rebinding (a hostname that resolves to a public IP at link-create time but to
-// 127.0.0.1 at delivery time) — Workers' `fetch` gives no hook to pin/verify the resolved IP
-// per-request, and building a resolver here would be exactly the over-engineering the brief
-// asked us not to do. What this DOES close: every IP-literal SSRF vector, and the common
-// non-literal decoys (localhost, single-label internal names, userinfo/host-confusion tricks,
-// non-standard ports, trailing-dot bypass).
+// Corrected claim (this file previously stated this check alone closed "every IP-literal SSRF
+// vector" — that was false-green; adversarial re-gate on #401 found the redirect-following gap
+// below): validHttpsBaseUrl only vets the LITERAL host at write-time and delivery-time. Without
+// pinning the delivery fetch's redirect behavior, a hostile/stolen remote_base_url on a
+// validHttpsBaseUrl-PASSING public host could answer 307/308 (which preserve method+body) to
+// http://127.0.0.1/…, http://169.254.169.254/…, http://10.x/… and workerd would follow it
+// transparently — the literal-host check on remote_base_url never sees the real destination.
+// Fixed at the fetch call site in deliverProjectLinkEnvelope: `redirect: 'manual'` + refuse ALL
+// 3xx outright (isRedirectResponse) rather than chase Location. A correct peer pot answers 2xx
+// directly, so refusing every redirect costs nothing but bad-actor/misconfigured-peer traffic.
+//
+// Residual limitation (accepted, not engineered around — see PR body): this still does NOT
+// re-resolve the hostname at fetch time to catch DNS rebinding (a hostname that resolves to a
+// public IP at link-create time but to 127.0.0.1 by the time delivery fires, with no redirect
+// involved at all). Workers' `fetch` gives no hook to pin/verify the resolved IP per-request
+// from user code, and building a resolver here would be exactly the over-engineering the brief
+// asked us not to do. What this DOES close, honestly stated: every IP-literal SSRF vector on
+// the literal host, the redirect-chase bypass of that check, and the common non-literal decoys
+// (localhost, single-label internal names, userinfo/host-confusion tricks, non-standard ports,
+// trailing-dot bypass). What it does NOT close: DNS rebinding between validation and dial.
 
 function parseIpv4Octets(host: string): number[] | null {
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
@@ -195,6 +207,16 @@ function isPrivateOrReservedIpv6(groups: number[]): boolean {
   if (topByte === 0xfe && secondByte >= 0x80 && secondByte <= 0xbf) return true // fe80::/10 — link-local
   // ::ffff:0:0/96 — IPv4-mapped: re-check the embedded v4 address against the v4 rules.
   if (groups[0] === 0 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0 && groups[4] === 0 && groups[5] === 0xffff) {
+    const v4 = [(groups[6] >> 8) & 0xff, groups[6] & 0xff, (groups[7] >> 8) & 0xff, groups[7] & 0xff]
+    return isPrivateOrReservedIpv4(v4)
+  }
+  // ::a.b.c.d/96 — deprecated IPv4-COMPATIBLE IPv6 (RFC 4291 historic form; same 32-bit v4
+  // embedding as the mapped form above, minus the 0xffff marker word — e.g. `::127.0.0.1` /
+  // `[::7f00:1]` both decode to groups[5]===0 with the v4 octets in groups[6..7]). Gate re-audit
+  // on #401 found this form wasn't checked: `[::7f00:1]` (== ::127.0.0.1, a loopback literal)
+  // passed isPrivateOrReservedIpv6 uncaught because only the ::ffff:-marked mapped form above
+  // was handled. Re-check the embedded v4 exactly the same way.
+  if (groups[0] === 0 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0 && groups[4] === 0 && groups[5] === 0) {
     const v4 = [(groups[6] >> 8) & 0xff, groups[6] & 0xff, (groups[7] >> 8) & 0xff, groups[7] & 0xff]
     return isPrivateOrReservedIpv4(v4)
   }
@@ -287,6 +309,12 @@ function normalizeEvidenceOrigins(value: unknown): string[] | null {
     try {
       const url = new URL(candidate)
       if (url.protocol !== 'https:' || url.username || url.password || url.origin !== candidate || url.pathname !== '/' || url.search || url.hash) return null
+      // Defense-in-depth (LOW, gate follow-up): evidence origins are never fetched by this
+      // codebase today — they're compared against the envelope's evidence URL as a hash-stored
+      // origin string, never dialed — so this isn't live-exploitable yet. Still apply the same
+      // isBlockedHost check as remote_base_url so a future code path that DOES fetch an
+      // approved evidence origin doesn't have to rediscover this invariant the hard way.
+      if (isBlockedHost(url.hostname)) return null
       origins.push(url.origin)
     } catch { return null }
   }
@@ -664,6 +692,16 @@ function retryable(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || status >= 500
 }
 
+// Gate 2 (#392) redirect refusal (see the fetcher call above). `as string`: Workers-types
+// narrows Response.type to "default"|"error" (real workerd redirect:'manual' returns the
+// literal 3xx, never an opaque redirect), but this file also runs under vitest/undici in
+// tests where a mocked Response can carry 'opaqueredirect' (status 0). Widen the comparison
+// rather than the type — same pattern as src/departments/executors/shared/cms-adapter.ts.
+function isRedirectResponse(response: Response): boolean {
+  const resType = response.type as string
+  return resType === 'opaqueredirect' || (response.status >= 300 && response.status < 400)
+}
+
 async function readBoundedRemoteJson(response: Response, timeoutMs: number): Promise<
   | { ok: true; value: unknown }
   | { ok: false; error: 'remote_response_too_large' | 'invalid_remote_response' }
@@ -805,6 +843,18 @@ export async function deliverProjectLinkEnvelope(
   // write time — this catches a row that predates the check, or reaches this table by any path
   // other than createProjectLink, from ever being dialed.
   if (!validHttpsBaseUrl(link.remote_base_url)) return { ok: false, reason: 'invalid_link' }
+  // Trailing-slash normalization (gate re-audit follow-up, #401): the delivery URL below is
+  // built by raw string concat (`${remoteBaseUrl}api/...`) — that's only safe because
+  // createProjectLink stores `new URL(input.remote_base_url).toString()`, which always
+  // serializes with a trailing '/'. validHttpsBaseUrl's own `new URL()` parse re-validates the
+  // HOST but doesn't touch the stored string, so a row written by anything other than
+  // createProjectLink (a migration, a future write path, direct DB access) that predates or
+  // bypasses that normalization could still pass validHttpsBaseUrl while lacking the trailing
+  // slash — e.g. a stored "https://good.example" (no path) would concat to
+  // "https://good.exampleapi/..." instead of "https://good.example/api/...", shifting the
+  // fetched host/path away from what was validated. Re-derive the serialized form here, right
+  // before it's used to build the fetch URL, instead of trusting the stored bytes.
+  const remoteBaseUrl = new URL(link.remote_base_url).toString()
   const validation = validateProjectLinkEnvelope(signed.envelope, {
     approvedEvidenceOrigins: link.approved_evidence_origins,
   })
@@ -907,11 +957,19 @@ export async function deliverProjectLinkEnvelope(
       const timeout = setTimeout(() => controller.abort(), timeoutMs)
       let response: Response
       try {
-        response = await fetcher(`${link.remote_base_url}api/project-links/${encodeURIComponent(link.remote_link_id)}/deliver`, {
+        response = await fetcher(`${remoteBaseUrl}api/project-links/${encodeURIComponent(link.remote_link_id)}/deliver`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(signed),
           signal: controller.signal,
+          // Gate 2 (#392) — do NOT auto-follow redirects. `redirect: 'follow'` (the fetch
+          // default) is what turned the SSRF host-literal check into theater: a hostile or
+          // stolen remote_base_url on a validHttpsBaseUrl-passing PUBLIC host can answer with
+          // 307/308 (which preserve method+body) -> http://127.0.0.1/..., 169.254.169.254, or
+          // 10.x — workerd follows it transparently and validHttpsBaseUrl never sees the real
+          // destination. `redirect: 'manual'` hands the raw 3xx response back to this code
+          // instead, so the block below can refuse it outright.
+          redirect: 'manual',
         })
       } finally {
         clearTimeout(timeout)
@@ -973,6 +1031,13 @@ export async function deliverProjectLinkEnvelope(
           return { ok: true, receipt }
         }
         lastError = 'invalid_remote_receipt'
+      } else if (isRedirectResponse(response)) {
+        // Gate 2 (#392) — refuse ALL redirects from a link delivery endpoint. A correct peer
+        // pot answers 2xx directly; a 3xx here is either a misconfigured peer or an SSRF probe
+        // riding a stolen/hostile remote_base_url. Terminal, not retryable — retrying a redirect
+        // just re-issues the same probe.
+        lastError = 'delivery_redirect_refused'
+        break
       } else {
         lastError = `remote_http_${response.status}`
         if (!retryable(response.status)) break

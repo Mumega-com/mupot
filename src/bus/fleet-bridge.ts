@@ -99,6 +99,9 @@ export async function deliverDispatchToInbox(env: Env, input: DispatchBridgeInpu
     body,
     requestId: dispatchInboxRequestId(input.receiptId),
     projectId: input.projectId ?? undefined,
+  }, {
+    system: true,
+    reason: 'target is the internally-resolved task assignee (input.agentId), not attacker input',
   }, { systemProjectAttribution: input.projectId != null })
 
   if (!res.ok) {

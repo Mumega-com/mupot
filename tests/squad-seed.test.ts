@@ -17,6 +17,11 @@ import { resolveCapabilities, hasCapability } from '../src/auth/capability'
 import { sendAgentMessage, readAgentInbox } from '../src/agents/messages'
 import type { Env } from '../src/types'
 
+// sendAgentMessage's authz param is a compile-time forcing function only (#401 WARN
+// follow-up) — this file exercises the raw primitive directly, not through sendToRef's
+// confinement.
+const TEST_AUTHZ = { system: true, reason: 'test: exercises sendAgentMessage primitive directly' } as const
+
 // Canonical test squad id (all seed calls require a squadId — no org fallback).
 const SQUAD_ID = 'sq-test-0001-0001-0001-000000000001'
 
@@ -425,7 +430,7 @@ describe('agent↔agent inbox round-trip (Slice D proof — S196)', () => {
       fromMember: kasraId,
       toAgent: 'ag-loom',
       body: 'S196 A+B shipped. Diff attached.',
-    })
+    }, TEST_AUTHZ)
     expect(send.ok).toBe(true)
 
     // Loom reads its inbox.
@@ -455,7 +460,7 @@ describe('agent↔agent inbox round-trip (Slice D proof — S196)', () => {
       body: '[request_id:s196-gate-abc123] Gate S196 Slice A — is RBAC correct?',
       kind: 'request',
       requestId,
-    })
+    }, TEST_AUTHZ)
     expect(req.ok).toBe(true)
 
     // Loom reads and ACKs.
@@ -472,7 +477,7 @@ describe('agent↔agent inbox round-trip (Slice D proof — S196)', () => {
       body: `{ack_for:${requestId}, ok: true} RBAC looks correct per §2A. GREEN.`,
       kind: 'ack',
       inReplyTo: requestId,
-    })
+    }, TEST_AUTHZ)
     expect(ack.ok).toBe(true)
 
     // Kasra reads its ACK inbox.
@@ -494,7 +499,7 @@ describe('agent↔agent inbox round-trip (Slice D proof — S196)', () => {
       fromMember: kasraId,
       toAgent: 'ag-river',
       body: 'Design review needed.',
-    })
+    }, TEST_AUTHZ)
 
     const first = await readAgentInbox(env, { agent: 'ag-river' })
     if (!first.ok) return
@@ -511,8 +516,8 @@ describe('agent↔agent inbox round-trip (Slice D proof — S196)', () => {
     const env = makeEnv(db)
     const kasraId = await deterministicMemberId('kasra')
 
-    await sendAgentMessage(env, { fromAgent: 'ag-kasra', fromMember: kasraId, toAgent: 'ag-loom', body: 'for loom' })
-    await sendAgentMessage(env, { fromAgent: 'ag-kasra', fromMember: kasraId, toAgent: 'ag-river', body: 'for river' })
+    await sendAgentMessage(env, { fromAgent: 'ag-kasra', fromMember: kasraId, toAgent: 'ag-loom', body: 'for loom' }, TEST_AUTHZ)
+    await sendAgentMessage(env, { fromAgent: 'ag-kasra', fromMember: kasraId, toAgent: 'ag-river', body: 'for river' }, TEST_AUTHZ)
 
     const loom = await readAgentInbox(env, { agent: 'ag-loom' })
     if (!loom.ok) return

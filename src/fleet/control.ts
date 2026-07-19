@@ -47,6 +47,9 @@ export async function emitControlRequest(
     body: JSON.stringify(req),
     // nonce is unique per request, so this rid makes the inbox send idempotent too.
     requestId: `ctl-${req.nonce}`,
+  }, {
+    system: true,
+    reason: 'target is env.FLEET_CONSUMER_AGENT, a fixed operator-configured binding, never attacker input',
   })
   const seq = send.ok ? send.seq : null
 

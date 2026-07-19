@@ -1749,6 +1749,9 @@ const toolBroadcast: ToolSpec = {
         body,
         kind,
         requestId: recipientRequestId,
+      }, {
+        system: true,
+        reason: 'target is drawn from resolveScopedSquad(...), an already squad-scoped set (>=member) — never resolveAgentRef on attacker input',
       })
       if (res.ok) {
         deliveries.push({
