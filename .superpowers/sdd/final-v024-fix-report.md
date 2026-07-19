@@ -2,15 +2,86 @@
 
 **Status:** DONE
 **Baseline HEAD:** `374923a3f498d9e98b958aa6c8827b9b37af0bd6`
-**Implementation commit:** `e8491a51e0667c1c08c98e5a8cc3ee17f042521a`
+**Implementation commits:** `e8491a51e0667c1c08c98e5a8cc3ee17f042521a`, `92a93ece7cd41a25f6374ff8d805e056b07638d1`
 **Branch:** `codex/dme-cross-pot-collaboration`
 **Date:** 2026-07-19
 
 ## Result
 
-All four Important findings in `.superpowers/sdd/final-v024-review.md` are resolved. Existing tenant, capability, mutation, query-bound, sanitization, fresh-state, cleanup, and CI artifact-path behavior is preserved. The auxiliary intrinsic-poison/local-evidence precision commits `cff5a1b` and `5b6ad7e` remain unchanged.
+All four Important findings in `.superpowers/sdd/final-v024-review.md` and all findings in `.superpowers/sdd/final-v024-rereview.md` are resolved. Existing tenant, capability, mutation, sanitization, explicit stale-clock, fresh-state, cleanup, and CI artifact-path behavior is preserved. The auxiliary intrinsic-poison/local-evidence precision commits `cff5a1b` and `5b6ad7e` remain unchanged.
 
 Deployment and version changes were not made.
+
+## Independent Rereview Remediation
+
+### RED record
+
+Project Link mixed-format status:
+
+```text
+npx vitest run tests/project-projections.test.ts tests/project-link-addon.test.ts -t "mixed timestamp|inverse mixed-format"
+```
+
+Result: **2 failed tests**. Under `TZ=America/Toronto`, Activity and `getProjectLinkStatus` both returned `failed` while SQLite's numeric latest event correctly selected the later success.
+
+Evidence directory ownership and overlap:
+
+```text
+npx vitest run tests/local-evidence-driver.test.ts -t "equal browser|nested under|unmarked custom evidence|repository tmp"
+```
+
+Result: **4 failed tests**. Equal browser/runtime paths, an evidence-root/browser nesting, an unmarked existing custom evidence root, and the repository `tmp` root all proceeded instead of being refused before execution.
+
+Dashboard squad and edge bounds:
+
+```text
+npx vitest run tests/dashboard-projects.test.ts -t "capability-scoped dashboard squads|work-context edges"
+```
+
+Result: **2 failed tests**. Capability resolution issued one unbounded squad query, and work context returned all 101 project edges without a truncation signal.
+
+### Changes
+
+Project Link status now uses the same SQLite Julian-day normalization as latest-event selection. `src/addons/project-link/timestamps.ts` owns the SQL epoch expressions. Activity compares selected success/failure epochs instead of `Date.parse`, and `getProjectLinkStatus` selects success, failure, and explicit `now` epochs in one tenant-scoped query. Its caller-provided stale clock remains authoritative; the exact Activity/Situation projection remains free of wall-clock staleness.
+
+The evidence driver now validates and owns `EVIDENCE_DIR`, `SMOKE_DIR`, and `CONFORMANCE_DIR` independently before deletion. All three must be safe, new/default/marked, and pairwise non-overlapping by resolved path. Equal and ancestor/descendant combinations are refused before migrations or artifact writes. Default CI paths and custom isolated paths remain supported.
+
+Dashboard capability expansion now resolves direct squad and department grants through bounded 500-row SQL pages, skips unnecessary squad reads for unrestricted observers/admins, and pages org-member squad expansion. Project work context applies the established 100-edge window after write/admin and caller-taskability filtering, exposes `taskableSquadIdsTruncated`, and renders a truthful `/send` notice when additional eligible agents may be omitted.
+
+### Rereview changed files
+
+- `src/addons/project-link/timestamps.ts`
+- `src/addons/project-link/service.ts`
+- `src/projects/projections.ts`
+- `scripts/ci-local-evidence.sh`
+- `src/projects/readable-squads.ts`
+- `src/dashboard/projects.ts`
+- `src/dashboard/index.ts`
+- `tests/project-projections.test.ts`
+- `tests/project-link-addon.test.ts`
+- `tests/local-evidence-driver.test.ts`
+- `tests/dashboard-projects.test.ts`
+
+### Rereview verification
+
+Focused command from clean implementation commit `92a93ec`:
+
+```text
+npx vitest run tests/project-link-addon.test.ts tests/project-projections.test.ts tests/project-situation.test.ts tests/projects-local-smoke.test.ts tests/projects-migration.test.ts tests/local-evidence-driver.test.ts tests/runtime-adapter-contract.test.ts tests/dashboard-projects.test.ts tests/project-readable-squads.test.ts
+```
+
+Result: **9 test files passed; 150 tests passed**.
+
+Required clean implementation-HEAD verification:
+
+| Command | Result |
+| --- | --- |
+| `npm test` | PASS: 230 files, 3,815 tests |
+| `npm run typecheck` | PASS: `tsc --noEmit` |
+| `node scripts/no-secrets.mjs` | PASS: `no secrets found` |
+| `bash scripts/ci-local-evidence.sh` | PASS: fresh D1 through 0060, browser and runtime evidence complete |
+
+Evidence details: 31 browser routes, 7 of 7 browser workflows, equal browser/REST/MCP situation parity, and 11 of 11 runtime adapter steps passed. All three artifact roots carry ownership markers. No `failure-*` receipt or `tmp/local-evidence/state.*` directory remains.
 
 ## RED Record
 
@@ -117,7 +188,7 @@ Tests:
 - `tests/projects-migration.test.ts`
 - `tests/local-evidence-driver.test.ts`
 
-## Verification
+## Initial Review Verification
 
 Coordinated focused verification from clean implementation commit `e8491a5`:
 
@@ -156,4 +227,4 @@ Final local evidence details:
 
 ## Concerns
 
-None within the requested I1-I4 scope.
+None within the requested review and rereview scope.
