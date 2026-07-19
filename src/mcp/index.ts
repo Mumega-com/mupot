@@ -74,6 +74,7 @@ import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
 import { PROJECT_TOOLS } from './projects'
+import { ROUTINE_TOOLS } from './routines'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -2376,6 +2377,7 @@ export const TOOLS: ToolSpec[] = [
   toolConnect,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
+  ...ROUTINE_TOOLS,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
