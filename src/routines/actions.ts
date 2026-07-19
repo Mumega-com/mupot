@@ -15,6 +15,7 @@ import {
   TaskUpdateConflictError,
 } from '../tasks/service'
 import type { Env, Project, Task } from '../types'
+import { projectVisibilityClause } from '../projects/access'
 import { principalCanReadProject, principalCanRunForSquad, type RoutinePrincipal } from './access'
 import {
   parseRoutineProposal,
@@ -50,6 +51,10 @@ export type RoutineActionResult =
   | { ok: true; status: 'retry_scheduled'; reason: 'execution_failed'; run_id: string; action_key: string; duplicate: boolean }
   | { ok: true; status: 'succeeded'; run_id: string; action_key: string; result: Record<string, unknown>; duplicate: boolean }
   | { ok: false; error: ActionError }
+
+export type RoutineCancellationResult =
+  | { ok: true; run_id: string; duplicate: boolean }
+  | { ok: false; error: 'run_not_found' | 'forbidden' | 'run_terminal' | 'receipt_failed' }
 
 interface RunContext {
   id: string
@@ -1117,6 +1122,72 @@ export async function executeRoutineAction(
   } catch {
     return classifyActionFailure(env, run, policy, action, 'execution_failed')
   }
+}
+
+/** Cancel an accessible nonterminal run and record one durable cancellation event. */
+export async function cancelRoutineRun(
+  env: Env,
+  principal: RoutinePrincipal,
+  runId: string,
+): Promise<RoutineCancellationResult> {
+  if (principal.tenant !== env.TENANT_SLUG) return { ok: false, error: 'run_not_found' }
+  const visibility = projectVisibilityClause(principal.project_read)
+  const run = await env.DB.prepare(
+    `SELECT rr.id, rr.tenant, rr.project_id, rr.status
+       FROM routine_runs rr JOIN projects p ON p.id = rr.project_id
+      WHERE rr.id = ? AND rr.tenant = ? AND ${visibility.sql}`,
+  ).bind(runId, env.TENANT_SLUG, ...visibility.binds).first<{
+    id: string; tenant: string; project_id: string; status: string
+  }>()
+  if (!run) return { ok: false, error: 'run_not_found' }
+  if (principal.actor_type !== 'member' || !principal.workspace_admin) return { ok: false, error: 'forbidden' }
+  if (run.status === 'cancelled') {
+    const event = await env.DB.prepare(
+      "SELECT 1 FROM routine_run_events WHERE run_id = ? AND tenant = ? AND kind = 'cancelled' LIMIT 1",
+    ).bind(run.id, run.tenant).first()
+    return event ? { ok: true, run_id: run.id, duplicate: true } : { ok: false, error: 'receipt_failed' }
+  }
+  if (['succeeded', 'failed', 'skipped'].includes(run.status)) return { ok: false, error: 'run_terminal' }
+
+  const now = new Date().toISOString()
+  const outcomes = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE routine_runs
+          SET status = 'cancelled', waiting_reason = NULL, lease_owner = NULL, lease_expires_at = NULL,
+              retry_at = NULL, result_summary = 'cancelled_by_operator', finished_at = ?, updated_at = ?
+        WHERE id = ? AND tenant = ?
+          AND status IN ('queued','leased','observing','waiting','running')`,
+    ).bind(now, now, run.id, run.tenant),
+    env.DB.prepare(
+      `UPDATE routine_run_actions
+          SET status = 'cancelled', updated_at = ?
+        WHERE run_id = ? AND tenant = ? AND status IN ('pending','waiting','running')`,
+    ).bind(now, run.id, run.tenant),
+    env.DB.prepare(
+      `INSERT INTO routine_run_events (
+         id, tenant, project_id, run_id, kind, actor_type, actor_id, occurred_at, metadata_json, correlation_id
+       ) SELECT ?, tenant, project_id, id, 'cancelled', ?, ?, ?, ?, id
+           FROM routine_runs
+          WHERE id = ? AND tenant = ? AND status = 'cancelled' AND finished_at = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM routine_run_events e WHERE e.run_id = routine_runs.id AND e.kind = 'cancelled'
+            )`,
+    ).bind(
+      crypto.randomUUID(), principal.actor_type, principal.actor_id, now,
+      JSON.stringify({ reason: 'operator_cancelled' }), run.id, run.tenant, now,
+    ),
+  ])
+  if (wrote(outcomes[0]) && wrote(outcomes[2])) return { ok: true, run_id: run.id, duplicate: false }
+
+  const [current, event] = await Promise.all([
+    env.DB.prepare('SELECT status FROM routine_runs WHERE id = ? AND tenant = ?')
+      .bind(run.id, run.tenant).first<{ status: string }>(),
+    env.DB.prepare("SELECT 1 FROM routine_run_events WHERE run_id = ? AND tenant = ? AND kind = 'cancelled' LIMIT 1")
+      .bind(run.id, run.tenant).first(),
+  ])
+  if (current?.status === 'cancelled' && event) return { ok: true, run_id: run.id, duplicate: true }
+  if (current && ['succeeded', 'failed', 'skipped'].includes(current.status)) return { ok: false, error: 'run_terminal' }
+  return { ok: false, error: 'receipt_failed' }
 }
 
 export async function submitRoutineProposal(
