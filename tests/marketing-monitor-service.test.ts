@@ -176,6 +176,33 @@ async function canonicalEvidenceDigest(evidence: {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
+const arraySomeIntrinsic = Array.prototype.some
+
+function poisonIntrinsicForFixtureData<T extends (...args: any[]) => unknown>(
+  name: string,
+  original: T,
+  applies: (receiver: unknown, args: readonly unknown[]) => boolean,
+): T {
+  return function (this: unknown, ...args: unknown[]) {
+    if (applies(this, args)) throw new Error(`poisoned ${name}`)
+    return Reflect.apply(original, this, args)
+  } as unknown as T
+}
+
+function isIntrinsicFixtureData(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return Reflect.apply(arraySomeIntrinsic, value, [(item: unknown) => isIntrinsicFixtureData(item)]) as boolean
+  }
+  if (typeof value !== 'object' || value === null) return false
+  const record = value as { key?: unknown; sourceKey?: unknown }
+  return record.key === 'intrinsic_fixture' || record.sourceKey === 'intrinsic_fixture'
+}
+
+function poisonToJsonForFixtureData(this: object): object {
+  if (isIntrinsicFixtureData(this)) throw new Error('poisoned Object.toJSON')
+  return this
+}
+
 function directRunValues(harness: SqliteD1Harness, overrides: Partial<Record<string, unknown>> = {}) {
   const installation = harness.sqlite.prepare(`
     SELECT id, tenant, addon_key, installed_version, publisher, trust_class,
@@ -691,14 +718,19 @@ describe('marketing monitor service', () => {
     try {
       result = await runMarketingMonitor(env, owner, { window }, {
         sourceFactory: ({ runId }) => {
-          TextEncoder.prototype.encode = () => { throw new Error('poisoned TextEncoder.encode') }
+          TextEncoder.prototype.encode = poisonIntrinsicForFixtureData(
+            'TextEncoder.encode',
+            originals.encode,
+            (_receiver, args) => typeof args[0] === 'string' && args[0].includes('intrinsic_fixture'),
+          )
           Object.defineProperty(Object.prototype, 'toJSON', {
             configurable: true,
-            value: () => ({ poisoned: true }),
+            value: poisonToJsonForFixtureData,
           })
-          Array.prototype.map = () => { throw new Error('poisoned map') }
-          Array.prototype.filter = () => { throw new Error('poisoned filter') }
-          Array.prototype.some = () => { throw new Error('poisoned some') }
+          Array.prototype.map = poisonIntrinsicForFixtureData('map', originals.map, (receiver) => isIntrinsicFixtureData(receiver))
+          Array.prototype.filter = poisonIntrinsicForFixtureData('filter', originals.filter, (receiver) => isIntrinsicFixtureData(receiver))
+          Array.prototype.some = poisonIntrinsicForFixtureData('some', originals.some, (receiver) => isIntrinsicFixtureData(receiver))
+          expect(['vitest worker'].map((value) => value)).toEqual(['vitest worker'])
           return [{
             key: 'intrinsic_fixture',
             slot: 'web_analytics',
