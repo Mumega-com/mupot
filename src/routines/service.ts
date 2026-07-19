@@ -68,6 +68,7 @@ export type UpdateRoutineInput = Omit<CreateRoutineInput, 'project_id'>
 export interface ListRoutinesInput {
   project_id: string
   status?: RoutineStatus
+  exclude_archived?: boolean
   limit?: number
   after?: RoutineCursor
 }
@@ -75,6 +76,24 @@ export interface ListRoutinesInput {
 export interface ListRoutineRunsInput {
   project_id: string
   routine_id?: string
+  limit?: number
+  after?: RoutineCursor
+}
+
+export interface RoutineRunEvent {
+  id: string
+  run_id: string
+  routine_id: string
+  routine_name: string
+  kind: string
+  actor_type: string
+  actor_id: string
+  occurred_at: string
+}
+
+export interface ListRoutineRunEventsInput {
+  project_id: string
+  run_id?: string
   limit?: number
   after?: RoutineCursor
 }
@@ -327,6 +346,8 @@ export async function listRoutines(
   if (input.status) {
     clauses.push('status = ?')
     binds.push(input.status)
+  } else if (input.exclude_archived) {
+    clauses.push("status <> 'archived'")
   }
   if (input.after) {
     clauses.push('(updated_at < ? OR (updated_at = ? AND id > ?))')
@@ -562,5 +583,43 @@ export async function listRoutineRuns(
     ok: true,
     items,
     next_cursor: rows.length > limit && last ? { timestamp: last.created_at, id: last.id } : null,
+  }
+}
+
+export async function listRoutineRunEvents(
+  env: Env,
+  principal: RoutinePrincipal,
+  input: ListRoutineRunEventsInput,
+): Promise<RoutinePage<RoutineRunEvent>> {
+  const limit = input.limit ?? 50
+  if (!validPage(limit, input.after)) return { ok: false, error: 'invalid_pagination' }
+  if (!await principalCanReadProject(env, principal, input.project_id)) {
+    return { ok: false, error: 'project_not_found' }
+  }
+  const clauses = ['e.tenant = ?', 'e.project_id = ?']
+  const binds: unknown[] = [env.TENANT_SLUG, input.project_id]
+  if (input.run_id) {
+    clauses.push('e.run_id = ?')
+    binds.push(input.run_id)
+  }
+  if (input.after) {
+    clauses.push('(e.occurred_at < ? OR (e.occurred_at = ? AND e.id > ?))')
+    binds.push(input.after.timestamp, input.after.timestamp, input.after.id)
+  }
+  const result = await env.DB.prepare(
+    `SELECT e.id, e.run_id, rr.routine_id, r.name AS routine_name, e.kind, e.actor_type, e.actor_id, e.occurred_at
+       FROM routine_run_events e
+       JOIN routine_runs rr ON rr.id = e.run_id AND rr.tenant = e.tenant
+       JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY e.occurred_at DESC, e.id ASC LIMIT ?`,
+  ).bind(...binds, limit + 1).all<RoutineRunEvent>()
+  const rows = result.results ?? []
+  const items = rows.slice(0, limit)
+  const last = items.at(-1)
+  return {
+    ok: true,
+    items,
+    next_cursor: rows.length > limit && last ? { timestamp: last.occurred_at, id: last.id } : null,
   }
 }

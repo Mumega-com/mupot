@@ -75,7 +75,9 @@ function makeHarness(): SqliteD1Harness {
        '2026-07-18T09:00:00.000Z', 'succeeded', NULL, 1, 'agent-a', 100, 'task_created',
        '2026-07-18T09:00:00.000Z', '2026-07-18T09:10:00.000Z', '2026-07-18T09:10:00.000Z');
     INSERT INTO routine_run_events (id, tenant, project_id, run_id, kind, actor_type, actor_id, occurred_at, metadata_json, correlation_id)
-      VALUES ('event-a', 'tenant-a', 'project-a', 'run-waiting', 'agent_waiting', 'agent', 'agent-a', '2026-07-19T11:00:00.000Z', '{}', 'run-waiting');
+      VALUES
+        ('event-a', 'tenant-a', 'project-a', 'run-waiting', 'agent_waiting', 'agent', 'agent-a', '2026-07-19T11:00:00.000Z', '{}', 'run-waiting'),
+        ('event-b', 'tenant-a', 'project-a', 'run-failed', 'failed', 'system', 'mupot-routines', '2026-07-19T09:10:00.000Z', '{}', 'run-failed');
   `)
   return harness
 }
@@ -127,13 +129,24 @@ describe('Project Routines dashboard', () => {
     }
     expect(body).toContain('role="region" aria-label="Project routines" tabindex="0"')
     expect(body).toContain('style="max-width:100%;overflow-x:auto;"')
-    expect(body).toContain('href="/projects/project-a#activity"')
-    expect(body).toContain('href="/projects/project-a#evidence"')
+    expect(body).toContain('href="/projects/project-a/routines?run_id=')
+    expect(body).toContain('href="/projects/project-a/routines?run_id=')
+    expect(body).toContain('#run-activity')
+    expect(body).toContain('#run-evidence')
     expect(body).toContain('name="nonce"')
+    expect(body).toContain('aria-current="page"')
     expect(dashboardBuiltInGetRoutes).toContainEqual(expect.objectContaining({ method: 'GET', path: '/projects/:id/routines' }))
 
     const bounded = await dashboardApp.fetch(new Request('https://pot.test/projects/project-a/routines?run_limit=1&event_limit=1'), env)
-    expect(await bounded.text()).toContain('Showing a bounded page of runs.')
+    const boundedBody = await bounded.text()
+    expect(boundedBody).toContain('Showing a bounded page of runs.')
+    expect(boundedBody).toContain('Showing a bounded page of events.')
+    expect(boundedBody).toContain('Continue events')
+
+    const detail = await dashboardApp.fetch(new Request('https://pot.test/projects/project-a/routines?run_id=run-waiting'), env)
+    const detailBody = await detail.text()
+    expect(detailBody).toContain('Run detail: run-waiting')
+    expect(detailBody).toContain('Cancel run')
   })
 
   it('hides an unreadable Project and preserves empty and validation-error states', async () => {

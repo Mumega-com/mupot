@@ -873,9 +873,11 @@ function operatingSituationBand(
       </div>
       <div style="min-width:0;overflow-wrap:anywhere;">
         <div class="ui-panel-sub">Routines / attention</div>
-        <div>${situation.routines.enabled_count} enabled · ${situation.routines.paused_count} paused · ${situation.needs_you.count} needs you</div>
+        <div>${situationCount(situation.routines.enabled_count, situation.routines.enabled_count_truncated)} enabled · ${situationCount(situation.routines.paused_count, situation.routines.paused_count_truncated)} paused · ${situationCount(situation.needs_you.count, situation.needs_you.truncated)} needs you</div>
         <div class="ui-agent-role">${situation.routines.active_run
           ? `${situation.routines.active_run.routine_name}: ${situation.routines.active_run.status}${situation.routines.active_run.waiting_reason ? ` (${situation.routines.active_run.waiting_reason})` : ''}`
+          : situation.routines.latest_terminal_run
+            ? `Latest outcome: ${situation.routines.latest_terminal_run.status} · ${situation.routines.latest_terminal_run.cost_micro_usd} micro USD`
           : situation.routines.next ? `Next: ${situation.routines.next.name} at ${situation.routines.next.next_run_at}`
             : situation.needs_you.highest_priority ? situation.needs_you.highest_priority.title : 'No Routine or attention item is active.'}</div>
         <a class="ui-link" href="/projects/${encodeURIComponent(project.id)}/routines">Open Routines</a>

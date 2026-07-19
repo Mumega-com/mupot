@@ -2,7 +2,15 @@ import { html, raw } from 'hono/html'
 import type { AuthContext, Env, Project } from '../types'
 import { getProject } from '../projects/service'
 import { principalCanReadProject, principalCanRunForSquad, routinePrincipal } from '../routines/access'
-import { getRoutine, listRoutineRuns, listRoutines, type RoutineCursor } from '../routines/service'
+import {
+  getRoutine,
+  getRoutineRun,
+  listRoutineRunEvents,
+  listRoutineRuns,
+  listRoutines,
+  type RoutineCursor,
+  type RoutineRunEvent,
+} from '../routines/service'
 import type { Routine, RoutineRun } from '../routines/types'
 import { pageHeader, pill, sectionPanel } from './ui'
 import type { Html } from './ui'
@@ -15,16 +23,7 @@ export interface DashboardCursor {
   id: string
 }
 
-export interface RoutineEventRow {
-  id: string
-  run_id: string
-  routine_id: string
-  routine_name: string
-  kind: string
-  actor_type: string
-  actor_id: string
-  occurred_at: string
-}
+export type RoutineEventRow = RoutineRunEvent
 
 export interface RoutineFormValues {
   name: string
@@ -47,6 +46,9 @@ export interface RoutineFormValues {
 export interface RoutineWorkspaceView {
   project: Project
   routines: Routine[]
+  routineNextCursor: RoutineCursor | null
+  routineTruncated: boolean
+  latestRuns: Map<string, RoutineRun>
   runs: RoutineRun[]
   runNextCursor: RoutineCursor | null
   events: RoutineEventRow[]
@@ -56,6 +58,9 @@ export interface RoutineWorkspaceView {
   canManage: boolean
   runNonces: Map<string, string>
   editRoutine: Routine | null
+  detailRoutine: Routine | null
+  detailRun: RoutineRun | null
+  detailEvents: RoutineEventRow[]
   formValues: RoutineFormValues
   runTruncated: boolean
   eventTruncated: boolean
@@ -64,9 +69,13 @@ export interface RoutineWorkspaceView {
 export interface RoutineWorkspaceOptions {
   runAfter?: RoutineCursor
   eventAfter?: DashboardCursor
+  routineAfter?: RoutineCursor
   editId?: string
+  runId?: string
+  routineId?: string
   runLimit?: number
   eventLimit?: number
+  routineLimit?: number
 }
 
 export function parseDashboardCursor(value: string | undefined): DashboardCursor | null | undefined {
@@ -197,27 +206,6 @@ async function loadLabels(env: Env, routines: Routine[]): Promise<{ routineLabel
   }
 }
 
-async function loadEvents(env: Env, projectId: string, limit: number, after?: DashboardCursor): Promise<{ rows: RoutineEventRow[]; next: DashboardCursor | null }> {
-  const predicates = ['e.tenant = ?', 'e.project_id = ?']
-  const binds: unknown[] = [env.TENANT_SLUG, projectId]
-  if (after) {
-    predicates.push('(e.occurred_at < ? OR (e.occurred_at = ? AND e.id > ?))')
-    binds.push(after.timestamp, after.timestamp, after.id)
-  }
-  const result = await env.DB.prepare(
-    `SELECT e.id, e.run_id, rr.routine_id, r.name AS routine_name, e.kind, e.actor_type, e.actor_id, e.occurred_at
-       FROM routine_run_events e
-       JOIN routine_runs rr ON rr.id = e.run_id AND rr.tenant = e.tenant
-       JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant
-      WHERE ${predicates.join(' AND ')}
-      ORDER BY e.occurred_at DESC, e.id ASC LIMIT ?`,
-  ).bind(...binds, limit + 1).all<RoutineEventRow>()
-  const rows = result.results ?? []
-  const items = rows.slice(0, limit)
-  const last = items.at(-1)
-  return { rows: items, next: rows.length > EVENT_PAGE_LIMIT && last ? { timestamp: last.occurred_at, id: last.id } : null }
-}
-
 export async function loadRoutineWorkspace(
   env: Env,
   auth: AuthContext,
@@ -228,17 +216,47 @@ export async function loadRoutineWorkspace(
   if (!await principalCanReadProject(env, principal, projectId)) return null
   const project = await getProject(env, projectId)
   if (!project) return null
+  const eventLimit = options.eventLimit ?? EVENT_PAGE_LIMIT
   const [routinePage, runPage, eventPage] = await Promise.all([
-    listRoutines(env, principal, { project_id: projectId, limit: PAGE_LIMIT }),
-    listRoutineRuns(env, principal, { project_id: projectId, limit: options.runLimit ?? PAGE_LIMIT, ...(options.runAfter ? { after: options.runAfter } : {}) }),
-    loadEvents(env, projectId, options.eventLimit ?? EVENT_PAGE_LIMIT, options.eventAfter),
+    listRoutines(env, principal, {
+      project_id: projectId,
+      exclude_archived: true,
+      limit: options.routineLimit ?? PAGE_LIMIT,
+      ...(options.routineAfter ? { after: options.routineAfter } : {}),
+    }),
+    listRoutineRuns(env, principal, {
+      project_id: projectId,
+      limit: options.runLimit ?? PAGE_LIMIT,
+      ...(options.runAfter ? { after: options.runAfter } : {}),
+    }),
+    listRoutineRunEvents(env, principal, {
+      project_id: projectId,
+      limit: eventLimit,
+      ...(options.eventAfter ? { after: options.eventAfter } : {}),
+      ...(options.runId ? { run_id: options.runId } : {}),
+    }),
   ])
-  if (!routinePage.ok || !runPage.ok) return null
-  const routines = routinePage.items.filter(routine => routine.status !== 'archived')
+  if (!routinePage.ok || !runPage.ok || !eventPage.ok) return null
+  const routines = routinePage.items
+  const latestRuns = new Map<string, RoutineRun>()
+  await Promise.all(routines.map(async (routine) => {
+    const latest = await listRoutineRuns(env, principal, { project_id: projectId, routine_id: routine.id, limit: 1 })
+    if (latest.ok && latest.items[0]) latestRuns.set(routine.id, latest.items[0])
+  }))
   const labels = await loadLabels(env, routines)
   const canManage = principal.actor_type === 'member' && principal.workspace_admin
   const editRoutine = canManage && options.editId ? await getRoutine(env, principal, options.editId) : null
   const allowedEdit = editRoutine?.project_id === projectId ? editRoutine : null
+  const detailRoutineId = options.routineId ?? allowedEdit?.id
+  const detailRoutineRaw = detailRoutineId && !allowedEdit
+    ? await getRoutine(env, principal, detailRoutineId)
+    : allowedEdit
+  const detailRoutine = detailRoutineRaw?.project_id === projectId ? detailRoutineRaw : null
+  const detailRunRaw = options.runId ? await getRoutineRun(env, principal, options.runId) : null
+  const detailRun = detailRunRaw?.project_id === projectId ? detailRunRaw : null
+  const detailEventPage = detailRun
+    ? await listRoutineRunEvents(env, principal, { project_id: projectId, run_id: detailRun.id, limit: EVENT_PAGE_LIMIT })
+    : null
   const runNonces = new Map<string, string>()
   if (principal.actor_type === 'member') {
     for (const routine of routines.filter(routine => routine.status === 'enabled')) {
@@ -248,10 +266,25 @@ export async function loadRoutineWorkspace(
     }
   }
   return {
-    project, routines, runs: runPage.items, runNextCursor: runPage.next_cursor, events: eventPage.rows,
-    eventNextCursor: eventPage.next, ...labels, canManage, runNonces, editRoutine: allowedEdit,
-    formValues: routineFormValues(allowedEdit ?? undefined), runTruncated: runPage.next_cursor !== null,
-    eventTruncated: eventPage.next !== null,
+    project,
+    routines,
+    routineNextCursor: routinePage.next_cursor,
+    routineTruncated: routinePage.next_cursor !== null,
+    latestRuns,
+    runs: runPage.items,
+    runNextCursor: runPage.next_cursor,
+    events: eventPage.items,
+    eventNextCursor: eventPage.next_cursor,
+    ...labels,
+    canManage,
+    runNonces,
+    editRoutine: allowedEdit,
+    detailRoutine,
+    detailRun,
+    detailEvents: detailEventPage?.ok ? detailEventPage.items : [],
+    formValues: routineFormValues(allowedEdit ?? undefined),
+    runTruncated: runPage.next_cursor !== null,
+    eventTruncated: eventPage.next_cursor !== null,
   }
 }
 
@@ -331,16 +364,15 @@ function routineForm(view: RoutineWorkspaceView, error?: string, values = view.f
 }
 
 export function routineWorkspaceBody(view: RoutineWorkspaceView, options: { error?: string; values?: RoutineFormValues; status?: string } = {}): Html {
-  const latestRunByRoutine = new Map<string, RoutineRun>()
-  for (const run of view.runs) if (!latestRunByRoutine.has(run.routine_id)) latestRunByRoutine.set(run.routine_id, run)
   const projectPath = `/projects/${encodeURIComponent(view.project.id)}`
+  const statusMessage = options.status ? STATUS_MESSAGES[options.status] : undefined
   const routineRows = view.routines.map((routine) => {
-    const current = latestRunByRoutine.get(routine.id)
+    const current = view.latestRuns.get(routine.id)
     const nonce = view.runNonces.get(routine.id)
     return [
-      html`<span style="display:grid;gap:3px;"><strong>${routine.name}</strong><span class="ui-panel-sub">${routine.trigger_kind} · ${routine.timezone}</span></span>`,
+      html`<span style="display:grid;gap:3px;"><a class="ui-link" href="${projectPath}/routines?routine_id=${encodeURIComponent(routine.id)}"><strong>${routine.name}</strong></a><span class="ui-panel-sub">${routine.trigger_kind} · ${routine.timezone}</span></span>`,
       pill(title(routine.status), routineTone(routine.status)),
-      html`<span>${routine.next_run_at ?? 'Not scheduled'}<span class="ui-panel-sub">Previous: ${current?.created_at ?? 'No run yet'}</span></span>`,
+      html`<span>${formatLocal(routine.next_run_at, routine.timezone)}<span class="ui-panel-sub">Previous: ${current ? formatLocal(current.created_at, routine.timezone) : 'No run yet'}</span></span>`,
       html`<span>${view.routineLabels.get(routine.responsible_squad_id) ?? routine.responsible_squad_id}<span class="ui-panel-sub">${routine.preferred_agent_id ? view.agentLabels.get(routine.preferred_agent_id) ?? routine.preferred_agent_id : 'No preferred agent'}</span></span>`,
       html`<span>${routine.execution_mode.replace('_', ' ')}<span class="ui-panel-sub">${routine.budget_micro_usd} micro USD · retry ${routine.max_attempts}/${routine.retry_backoff_seconds}s · ${routine.overlap_policy}</span></span>`,
       html`<span>${current ? pill(runState(current), runTone(current)) : pill(title(routine.status), routineTone(routine.status))}<span class="ui-panel-sub">${routineNextAction(routine, current)}</span></span>`,
@@ -359,29 +391,91 @@ export function routineWorkspaceBody(view: RoutineWorkspaceView, options: { erro
     pill(runState(run), runTone(run)),
     html`<span>${run.assigned_agent_id ?? 'Unassigned'}<span class="ui-panel-sub">Attempt ${run.attempt}</span></span>`,
     html`<span>${run.cost_micro_usd} micro USD<span class="ui-panel-sub">${run.result_summary ?? 'No terminal summary'}</span></span>`,
-    html`<div style="display:flex;gap:8px;flex-wrap:wrap;"><a class="ui-link" href="${projectPath}#activity">Activity</a><a class="ui-link" href="${projectPath}#evidence">Evidence</a>${view.canManage && !['succeeded', 'failed', 'skipped', 'cancelled'].includes(run.status) ? html`<form method="post" action="${projectPath}/routines/${encodeURIComponent(run.id)}/cancel"><button class="btn secondary sm" type="submit">Cancel</button></form>` : ''}</div>`,
+    html`<div style="display:flex;gap:8px;flex-wrap:wrap;"><a class="ui-link" href="${projectPath}/routines?run_id=${encodeURIComponent(run.id)}#run-activity">Activity</a><a class="ui-link" href="${projectPath}/routines?run_id=${encodeURIComponent(run.id)}#run-evidence">Evidence</a>${view.canManage && !['succeeded', 'failed', 'skipped', 'cancelled'].includes(run.status) ? html`<form method="post" action="${projectPath}/routines/${encodeURIComponent(run.id)}/cancel"><button class="btn secondary sm" type="submit">Cancel</button></form>` : ''}</div>`,
   ])
   const eventRows = view.events.map(event => [
     html`<span>${event.occurred_at}</span>`, html`<a class="ui-link" href="${projectPath}/routines?run_id=${encodeURIComponent(event.run_id)}">${event.routine_name}</a>`,
     html`<span>${title(event.kind)}</span>`, html`<span>${event.actor_type}: ${event.actor_id}</span>`,
-    html`<span style="display:flex;gap:8px;"><a class="ui-link" href="${projectPath}#activity">Activity</a><a class="ui-link" href="${projectPath}#evidence">Evidence</a></span>`,
+    html`<span style="display:flex;gap:8px;"><a class="ui-link" href="${projectPath}/routines?run_id=${encodeURIComponent(event.run_id)}#run-activity">Activity</a><a class="ui-link" href="${projectPath}/routines?run_id=${encodeURIComponent(event.run_id)}#run-evidence">Evidence</a></span>`,
   ])
+  const routineMore = view.routineNextCursor ? `${projectPath}/routines?routine_cursor=${encodeURIComponent(encodeDashboardCursor(view.routineNextCursor))}` : null
   const runMore = view.runNextCursor ? `${projectPath}/routines?run_cursor=${encodeURIComponent(encodeDashboardCursor(view.runNextCursor))}` : null
   const eventMore = view.eventNextCursor ? `${projectPath}/routines?event_cursor=${encodeURIComponent(encodeDashboardCursor(view.eventNextCursor))}` : null
   return html`${pageHeader({ crumbs: `Projects / ${view.project.name}`, title: 'Project routines', sub: 'Operational schedules, runs, and retained event history.' })}
-    ${options.status ? html`<p role="status" style="color:var(--ok,#16a34a);">${options.status}</p>` : ''}
+    ${statusMessage ? html`<p role="status" style="color:var(--ok,#16a34a);">${statusMessage}</p>` : ''}
     ${options.error ? html`<p role="alert" style="color:var(--danger,#c0392b);">${options.error}</p>` : ''}
-    <p style="margin:0 0 14px;"><a class="ui-link" href="${projectPath}">Project overview</a></p>
+    <p style="margin:0 0 14px;display:flex;gap:12px;flex-wrap:wrap;">
+      <a class="ui-link" href="${projectPath}">Project overview</a>
+      <a class="ui-link" aria-current="page" href="${projectPath}/routines">Routines</a>
+    </p>
+    ${view.detailRun ? detailRunPanel(view, projectPath) : ''}
+    ${view.detailRoutine && !view.editRoutine ? detailRoutinePanel(view, projectPath) : ''}
     ${routineForm(view, undefined, options.values)}
-    ${sectionPanel({ title: 'Routines', body: table('Project routines', '88rem', [
+    ${sectionPanel({ title: 'Routines', body: html`${table('Project routines', '88rem', [
       { label: 'Routine', width: '1.2fr' }, { label: 'Status', width: 'auto' }, { label: 'Schedule', width: '1.2fr' }, { label: 'Squad / agent', width: '1.1fr' }, { label: 'Policy', width: '1.5fr' }, { label: 'Current state / next action', width: '1.3fr' }, { label: 'Actions', width: 'auto' },
-    ], routineRows, 'No Project Routines are configured yet.') })}
+    ], routineRows, 'No Project Routines are configured yet.')}${view.routineTruncated ? html`<p class="ui-panel-sub">Showing a bounded page of routines. ${routineMore ? html`<a class="ui-link" href="${routineMore}">Continue routines</a>` : ''}</p>` : ''}` })}
     ${sectionPanel({ title: 'Run history', body: html`${table('Routine run history', '72rem', [
       { label: 'When', width: '1fr' }, { label: 'Run', width: '1fr' }, { label: 'State', width: '1fr' }, { label: 'Agent / attempt', width: '1.1fr' }, { label: 'Cost / outcome', width: '1.2fr' }, { label: 'Evidence', width: '1fr' },
     ], runRows, 'No routine runs are recorded for this Project yet.')}${view.runTruncated ? html`<p class="ui-panel-sub">Showing a bounded page of runs. ${runMore ? html`<a class="ui-link" href="${runMore}">Continue runs</a>` : ''}</p>` : ''}` })}
     ${sectionPanel({ title: 'Event history', body: html`${table('Routine event history', '62rem', [
       { label: 'When', width: '1fr' }, { label: 'Routine', width: '1.1fr' }, { label: 'Event', width: '1fr' }, { label: 'Actor', width: '1fr' }, { label: 'Links', width: 'auto' },
     ], eventRows, 'No routine events are recorded for this Project yet.')}${view.eventTruncated ? html`<p class="ui-panel-sub">Showing a bounded page of events. ${eventMore ? html`<a class="ui-link" href="${eventMore}">Continue events</a>` : ''}</p>` : ''}` })}`
+}
+
+const STATUS_MESSAGES: Record<string, string> = {
+  created: 'Routine draft created.',
+  updated: 'Routine saved.',
+  enabled: 'Routine enabled.',
+  paused: 'Routine paused.',
+  archived: 'Routine archived.',
+  run_queued: 'Manual run queued.',
+  run_cancelled: 'Cancellation recorded.',
+}
+
+function formatLocal(value: string | null | undefined, timezone: string): string {
+  if (!value) return 'Not scheduled'
+  try {
+    return `${new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone, dateStyle: 'medium', timeStyle: 'short',
+    }).format(new Date(value))} (${timezone})`
+  } catch {
+    return `${value} (${timezone})`
+  }
+}
+
+function detailRunPanel(view: RoutineWorkspaceView, projectPath: string): Html {
+  const run = view.detailRun
+  if (!run) return html``
+  return sectionPanel({
+    title: `Run detail: ${run.id}`,
+    body: html`<div id="run-activity" style="display:grid;gap:8px;">
+      <div>${pill(runState(run), runTone(run))} · attempt ${run.attempt} · ${run.trigger_kind}</div>
+      <div class="ui-panel-sub">Task ${run.task_id ?? 'none'} · Flight ${run.flight_id ?? 'none'} · Agent ${run.assigned_agent_id ?? 'unassigned'}</div>
+      <div>${run.result_summary ?? 'No terminal summary'} · ${run.cost_micro_usd} micro USD</div>
+      <div id="run-evidence" style="display:flex;gap:8px;flex-wrap:wrap;">
+        <a class="ui-link" href="${projectPath}/routines?routine_id=${encodeURIComponent(run.routine_id)}">Open routine</a>
+        ${view.canManage && !['succeeded', 'failed', 'skipped', 'cancelled'].includes(run.status)
+          ? html`<form method="post" action="${projectPath}/routines/${encodeURIComponent(run.id)}/cancel"><button class="btn secondary sm" type="submit">Cancel run</button></form>`
+          : ''}
+      </div>
+      <ul style="margin:0;padding-left:1.2rem;">${view.detailEvents.map(event => html`<li>${event.occurred_at} · ${title(event.kind)} · ${event.actor_type}:${event.actor_id}</li>`)}</ul>
+    </div>`,
+  })
+}
+
+function detailRoutinePanel(view: RoutineWorkspaceView, projectPath: string): Html {
+  const routine = view.detailRoutine
+  if (!routine) return html``
+  const current = view.latestRuns.get(routine.id)
+  return sectionPanel({
+    title: `Routine: ${routine.name}`,
+    body: html`<div style="display:grid;gap:8px;">
+      <div>${pill(title(routine.status), routineTone(routine.status))} · ${routine.trigger_kind} · ${routine.execution_mode}</div>
+      <div>${routine.objective}</div>
+      <div class="ui-panel-sub">Next ${formatLocal(routine.next_run_at, routine.timezone)} · Current ${current ? runState(current) : 'No run yet'}</div>
+      ${view.canManage ? html`<a class="btn secondary sm" href="${projectPath}/routines?edit=${encodeURIComponent(routine.id)}">Edit policy</a>` : ''}
+    </div>`,
+  })
 }
 
 export function routineDashboardErrorStatus(error: string): 400 | 403 | 404 | 409 {

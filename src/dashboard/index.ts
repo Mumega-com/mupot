@@ -390,12 +390,13 @@ function dashboardHistoryCursor(value: string | undefined) {
 }
 
 function validDashboardHistoryQuery(c: { req: { query: (key: string) => string | undefined } }): boolean {
-  for (const key of ['run_limit', 'event_limit']) {
+  for (const key of ['run_limit', 'event_limit', 'routine_limit']) {
     const value = c.req.query(key)
     if (value !== undefined && (!/^[1-9]\d?$/.test(value) || Number(value) > 50)) return false
   }
   return dashboardHistoryCursor(c.req.query('run_cursor')) !== null
     && dashboardHistoryCursor(c.req.query('event_cursor')) !== null
+    && dashboardHistoryCursor(c.req.query('routine_cursor')) !== null
 }
 
 dashboardApp.get('/projects/:id/routines', async (c) => {
@@ -404,12 +405,18 @@ dashboardApp.get('/projects/:id/routines', async (c) => {
   }
   const runAfter = dashboardHistoryCursor(c.req.query('run_cursor'))
   const eventAfter = dashboardHistoryCursor(c.req.query('event_cursor'))
+  const routineAfter = dashboardHistoryCursor(c.req.query('routine_cursor'))
   const runLimit = c.req.query('run_limit')
   const eventLimit = c.req.query('event_limit')
+  const routineLimit = c.req.query('routine_limit')
   const view = await loadRoutineWorkspace(c.env, c.get('auth'), c.req.param('id'), {
     ...(runAfter ? { runAfter } : {}), ...(eventAfter ? { eventAfter } : {}),
+    ...(routineAfter ? { routineAfter } : {}),
     ...(runLimit ? { runLimit: Number(runLimit) } : {}), ...(eventLimit ? { eventLimit: Number(eventLimit) } : {}),
+    ...(routineLimit ? { routineLimit: Number(routineLimit) } : {}),
     ...(c.req.query('edit') ? { editId: c.req.query('edit') } : {}),
+    ...(c.req.query('run_id') ? { runId: c.req.query('run_id') } : {}),
+    ...(c.req.query('routine_id') ? { routineId: c.req.query('routine_id') } : {}),
   })
   if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
   return c.html(shell(c.env, 'Project routines', routineWorkspaceBody(view, { status: c.req.query('status') })))
