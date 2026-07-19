@@ -9,6 +9,12 @@ import {
   upsertProjectSquadAccess,
 } from '../projects/service'
 import type { ProjectMutationError } from '../projects/service'
+import {
+  projectReadAccessFromGrants,
+  projectVisibilityClause,
+  unrestrictedProjectRead,
+  type ProjectReadAccess,
+} from '../projects/access'
 import { resolveReadableSquadIds } from '../projects/readable-squads'
 import { loadProjectSituation } from '../projects/situation'
 import { done, fail, str, type ToolOutcome, type ToolSpec } from './index'
@@ -19,13 +25,6 @@ const NUMBER_SCHEMA = { type: 'number' }
 const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'completed', 'archived']
 const MAX_PAGE_SIZE = 100
 const MAX_PAGE_OFFSET = 10_000
-
-type ProjectReadAccess = {
-  workspaceAdmin: boolean
-  orgRead: boolean
-  squadIds: string[]
-  departmentIds: string[]
-}
 
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'> & {
   parent_context: true
@@ -75,55 +74,23 @@ function workspaceAdmin(auth: AuthContext): boolean {
 }
 
 function readAccess(auth: AuthContext): ProjectReadAccess {
-  if (workspaceAdmin(auth)) {
-    return { workspaceAdmin: true, orgRead: true, squadIds: [], departmentIds: [] }
-  }
-
-  const grants = auth.capabilities ?? []
-  const squadIds = new Set<string>()
-  const departmentIds = new Set<string>()
-  for (const grant of grants) {
-    if (!hasCapability([grant], grant.scope_type, grant.scope_id, 'observer')) continue
-    if (grant.scope_type === 'squad' && grant.scope_id) squadIds.add(grant.scope_id)
-    if (grant.scope_type === 'department' && grant.scope_id) departmentIds.add(grant.scope_id)
-  }
-  return {
-    workspaceAdmin: false,
-    orgRead: hasCapability(grants, 'org', null, 'observer'),
-    squadIds: [...squadIds],
-    departmentIds: [...departmentIds],
-  }
+  return projectReadAccessFromGrants(auth, auth.capabilities ?? [])
 }
 
 function jsonIds(ids: string[]): string {
   return JSON.stringify([...new Set(ids)])
 }
 
-function visibilityClause(access: ProjectReadAccess): { sql: string; binds: string[] } {
-  if (access.workspaceAdmin || access.orgRead) return { sql: '1 = 1', binds: [] }
-  return {
-    sql: `EXISTS (
-      SELECT 1
-        FROM project_squad_access psa
-        JOIN squads s ON s.id = psa.squad_id
-       WHERE psa.project_id = p.id
-         AND (s.id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-           OR s.department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?)))
-    )`,
-    binds: [jsonIds(access.squadIds), jsonIds(access.departmentIds)],
-  }
-}
-
 async function projectionReadableSquads(
   env: Env,
   access: ProjectReadAccess,
 ): Promise<string[] | null> {
-  if (access.workspaceAdmin || access.orgRead) return null
+  if (unrestrictedProjectRead(access)) return null
   return resolveReadableSquadIds(env, access.squadIds, access.departmentIds)
 }
 
 async function readableProject(env: Env, projectId: string, access: ProjectReadAccess): Promise<Project | null> {
-  const visibility = visibilityClause(access)
+  const visibility = projectVisibilityClause(access)
   return env.DB.prepare(
     `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
             p.target_date, p.created_at, p.updated_at
@@ -220,7 +187,7 @@ const toolProjectList: ToolSpec = {
     if (limit === null || offset === null) return fail(400, 'invalid_pagination')
 
     const access = readAccess(auth)
-    const visibility = visibilityClause(access)
+    const visibility = projectVisibilityClause(access)
     const clauses = [visibility.sql]
     const binds: unknown[] = [...visibility.binds]
     if (args.status !== undefined) {
@@ -344,7 +311,7 @@ const toolProjectSquadList: ToolSpec = {
 
     const access = readAccess(auth)
     if (!await readableProject(env, projectId, access)) return fail(404, 'project_not_found')
-    const unrestricted = access.workspaceAdmin || access.orgRead
+    const unrestricted = unrestrictedProjectRead(access)
     const rows = await env.DB.prepare(
       `SELECT psa.project_id, psa.squad_id, psa.access_level, psa.granted_at
          FROM project_squad_access psa

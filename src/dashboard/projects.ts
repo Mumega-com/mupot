@@ -10,6 +10,12 @@ import {
   validProjectStatusTransitions,
 } from '../projects/service'
 import type { ProjectMutationError, UpdateProjectInput } from '../projects/service'
+import {
+  projectReadAccessFromGrants,
+  projectVisibilityClause,
+  unrestrictedProjectRead,
+  type ProjectReadAccess,
+} from '../projects/access'
 import { listProjectActivity, listProjectEvidence } from '../projects/projections'
 import { loadProjectSituation } from '../projects/situation'
 import type {
@@ -48,8 +54,7 @@ export function projectLifecycleTransition(command: string) {
 
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
 
-interface ProjectAccess {
-  workspaceAdmin: boolean
+interface ProjectAccess extends ProjectReadAccess {
   readableSquadIds: string[] | null
   taskableSquadIds: string[] | null
 }
@@ -187,10 +192,6 @@ export interface ProjectFlightsResult {
   scanLimited: boolean
 }
 
-function legacyWorkspaceAdmin(auth: AuthContext): boolean {
-  return auth.capabilities === undefined && (auth.role === 'owner' || auth.role === 'admin')
-}
-
 async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> {
   if (auth.memberId) return auth.memberId
   if (!auth.email) return null
@@ -201,26 +202,25 @@ async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> 
 }
 
 async function projectAccess(env: Env, auth: AuthContext): Promise<ProjectAccess> {
-  if (legacyWorkspaceAdmin(auth)) {
-    return { workspaceAdmin: true, readableSquadIds: null, taskableSquadIds: null }
-  }
   const memberId = await memberIdFor(env, auth)
   const grants = memberId ? auth.capabilities ?? await resolveCapabilities(env, memberId) : []
-  if (hasCapability(grants, 'org', null, 'admin')) {
-    return { workspaceAdmin: true, readableSquadIds: null, taskableSquadIds: null }
-  }
+  const visibility = projectReadAccessFromGrants(auth, grants)
   const rows = grants.length
     ? await env.DB.prepare('SELECT id, department_id FROM squads').all<{ id: string; department_id: string }>()
     : { results: [] }
   const squads = rows.results ?? []
   return {
-    workspaceAdmin: false,
-    readableSquadIds: squads
-      .filter((squad) => hasCapability(grants, 'squad', squad.id, 'observer', squad.department_id))
-      .map((squad) => squad.id),
-    taskableSquadIds: squads
-      .filter((squad) => hasCapability(grants, 'squad', squad.id, 'member', squad.department_id))
-      .map((squad) => squad.id),
+    ...visibility,
+    readableSquadIds: unrestrictedProjectRead(visibility)
+      ? null
+      : squads
+        .filter((squad) => hasCapability(grants, 'squad', squad.id, 'observer', squad.department_id))
+        .map((squad) => squad.id),
+    taskableSquadIds: visibility.workspaceAdmin
+      ? null
+      : squads
+        .filter((squad) => hasCapability(grants, 'squad', squad.id, 'member', squad.department_id))
+        .map((squad) => squad.id),
   }
 }
 
@@ -261,20 +261,12 @@ async function loadVisibleProjects(
   access: ProjectAccess,
   filters: { search: string; status: ProjectStatus | '' },
 ): Promise<{ projects: Project[]; capped: boolean }> {
-  if (!access.workspaceAdmin && access.readableSquadIds?.length === 0) {
+  const visibility = projectVisibilityClause(access)
+  if (!unrestrictedProjectRead(access) && access.readableSquadIds?.length === 0) {
     return { projects: [], capped: false }
   }
-  const clauses: string[] = []
-  const values: (string | number)[] = []
-  if (!access.workspaceAdmin) {
-    clauses.push(`EXISTS (
-      SELECT 1
-        FROM project_squad_access psa
-       WHERE psa.project_id = p.id
-         AND psa.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-    )`)
-    values.push(jsonIds(access.readableSquadIds ?? []))
-  }
+  const clauses: string[] = [visibility.sql]
+  const values: (string | number)[] = [...visibility.binds]
   if (filters.status) {
     clauses.push('p.status = ?')
     values.push(filters.status)
@@ -313,12 +305,13 @@ async function loadListMetrics(
   access: ProjectAccess,
 ): Promise<Map<string, ProjectListMetrics>> {
   if (!projectIds.length) return new Map()
-  const squadFilter = access.workspaceAdmin
+  const unrestricted = access.readableSquadIds === null
+  const squadFilter = unrestricted
     ? ''
     : ' AND squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
-  const flightFilter = access.workspaceAdmin ? '' : readableFlightSql('f', '?2')
-  const tenantParam = access.workspaceAdmin ? '?2' : '?3'
-  const limitParam = access.workspaceAdmin ? '?3' : '?4'
+  const flightFilter = unrestricted ? '' : readableFlightSql('f', '?2')
+  const tenantParam = unrestricted ? '?2' : '?3'
+  const limitParam = unrestricted ? '?3' : '?4'
   const result = await env.DB.prepare(
     `SELECT p.id,
             (SELECT COUNT(*) FROM project_squad_access
@@ -335,7 +328,7 @@ async function loadListMetrics(
       LIMIT ${limitParam}`,
   ).bind(
     jsonIds(projectIds),
-    ...(access.workspaceAdmin ? [] : [jsonIds(access.readableSquadIds ?? [])]),
+    ...(unrestricted ? [] : [jsonIds(access.readableSquadIds ?? [])]),
     env.TENANT_SLUG,
     MAX_PROJECTS,
   ).all<{
@@ -404,16 +397,11 @@ export async function loadProjectsPage(
 }
 
 async function isReadableProject(env: Env, projectId: string, access: ProjectAccess): Promise<boolean> {
-  if (access.workspaceAdmin) return true
-  if (!access.readableSquadIds?.length) return false
-  const edge = await env.DB.prepare(
-    `SELECT 1
-       FROM project_squad_access psa
-      WHERE psa.project_id = ?
-        AND psa.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-      LIMIT 1`,
-  ).bind(projectId, jsonIds(access.readableSquadIds)).first()
-  return edge !== null
+  const visibility = projectVisibilityClause(access)
+  const project = await env.DB.prepare(
+    `SELECT 1 FROM projects p WHERE p.id = ? AND ${visibility.sql} LIMIT 1`,
+  ).bind(projectId, ...visibility.binds).first()
+  return project !== null
 }
 
 async function loadReadableTasks(
@@ -421,11 +409,11 @@ async function loadReadableTasks(
   projectId: string,
   access: ProjectAccess,
 ): Promise<ProjectTaskRow[]> {
-  if (!access.workspaceAdmin && !access.readableSquadIds?.length) return []
-  const filter = access.workspaceAdmin
+  if (access.readableSquadIds !== null && !access.readableSquadIds.length) return []
+  const filter = access.readableSquadIds === null
     ? ''
     : ' AND t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
-  const limitParam = access.workspaceAdmin ? '?2' : '?3'
+  const limitParam = access.readableSquadIds === null ? '?2' : '?3'
   const result = await env.DB.prepare(
     `SELECT t.id, t.title, t.status, t.squad_id, s.name AS squad_name, s.department_id
       FROM tasks t
@@ -441,7 +429,7 @@ async function loadReadableTasks(
       LIMIT ${limitParam}`,
   ).bind(
     projectId,
-    ...(access.workspaceAdmin ? [] : [jsonIds(access.readableSquadIds ?? [])]),
+    ...(access.readableSquadIds === null ? [] : [jsonIds(access.readableSquadIds)]),
     MAX_WORK_ROWS,
   )
     .all<ProjectTaskRow & { squad_id: string; department_id: string }>()
@@ -454,11 +442,11 @@ async function loadReadableSquads(
   projectId: string,
   access: ProjectAccess,
 ): Promise<{ rows: ProjectSquadRow[]; truncated: boolean }> {
-  if (!access.workspaceAdmin && !access.readableSquadIds?.length) return { rows: [], truncated: false }
-  const filter = access.workspaceAdmin
+  if (access.readableSquadIds !== null && !access.readableSquadIds.length) return { rows: [], truncated: false }
+  const filter = access.readableSquadIds === null
     ? ''
     : ' AND psa.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
-  const limitParam = access.workspaceAdmin ? '?2' : '?3'
+  const limitParam = access.readableSquadIds === null ? '?2' : '?3'
   const result = await env.DB.prepare(
     `SELECT psa.project_id, psa.squad_id, psa.access_level, psa.granted_at, s.name AS squad_name
        FROM project_squad_access psa
@@ -468,7 +456,7 @@ async function loadReadableSquads(
       LIMIT ${limitParam}`,
   ).bind(
     projectId,
-    ...(access.workspaceAdmin ? [] : [jsonIds(access.readableSquadIds ?? [])]),
+    ...(access.readableSquadIds === null ? [] : [jsonIds(access.readableSquadIds)]),
     MAX_SQUAD_ROWS + 1,
   ).all<ProjectSquadRow>()
   const candidates = result.results ?? []
@@ -530,11 +518,12 @@ async function loadProjectAggregates(
   projectId: string,
   access: ProjectAccess,
 ): Promise<ProjectDetailView['aggregates']> {
-  const squadFilter = access.workspaceAdmin
+  const unrestricted = access.readableSquadIds === null
+  const squadFilter = unrestricted
     ? ''
     : ' AND squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
-  const flightFilter = access.workspaceAdmin ? '' : readableFlightSql('f', '?2')
-  const tenantParam = access.workspaceAdmin ? '?2' : '?3'
+  const flightFilter = unrestricted ? '' : readableFlightSql('f', '?2')
+  const tenantParam = unrestricted ? '?2' : '?3'
   const row = await env.DB.prepare(
     `SELECT
        (SELECT COUNT(*) FROM tasks WHERE project_id = ?1${squadFilter}) AS direct_tasks,
@@ -543,7 +532,7 @@ async function loadProjectAggregates(
          WHERE f.project_id = ?1 AND f.tenant = ${tenantParam}${flightFilter}) AS direct_flights`,
   ).bind(
     projectId,
-    ...(access.workspaceAdmin ? [] : [jsonIds(access.readableSquadIds ?? [])]),
+    ...(unrestricted ? [] : [jsonIds(access.readableSquadIds ?? [])]),
     env.TENANT_SLUG,
   ).first<{ direct_tasks: number; direct_squads: number; direct_flights: number }>()
   return {

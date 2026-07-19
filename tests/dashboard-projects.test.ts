@@ -580,6 +580,32 @@ describe('project dashboard renderers', () => {
     expect(body).not.toContain('slug-fallback-host')
   })
 
+  it('does not attribute one exact fleet identity to another agent with a colliding unique slug', async () => {
+    harness = makeHarness()
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-07-19T12:00:00Z'))
+    harness.sqlite.exec(`
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
+        ('shared-runtime-id', 'squad-a', 'exact-owner-slug', 'Exact runtime owner', 'Operator', 'model-a', 'active'),
+        ('slug-candidate-id', 'squad-a', 'shared-runtime-id', 'Slug collision candidate', 'Reviewer', 'model-b', 'active');
+      INSERT INTO fleet_agents
+        (tenant, agent_id, runtime, status, host, last_reported_at)
+      VALUES ('pot-a', 'shared-runtime-id', 'python', 'running', 'reserved-runtime-host', '2026-07-19 11:59:50');
+    `)
+
+    const view = await loadProjectDetail(envFor(harness), memberA(), 'visible-child')
+    expect(view?.members).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        agent_id: 'shared-runtime-id', runtime: 'python', presence: 'live', host: 'reserved-runtime-host',
+      }),
+      expect.objectContaining({
+        agent_id: 'slug-candidate-id', runtime: '', presence: 'not_attached', host: '',
+      }),
+    ]))
+
+    const body = await render(projectDetailBody(view!))
+    expect(body.match(/reserved-runtime-host/g)).toHaveLength(1)
+  })
+
   it('retains readable squad edges when mixed and all-empty project teams have no members', async () => {
     harness = makeHarness()
     harness.sqlite.exec(`

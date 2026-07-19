@@ -305,6 +305,135 @@ describe('local project workspace showcase', () => {
     }
   })
 
+  it('gives a no-edge org observer the same complete situation across REST, MCP, and dashboard', async () => {
+    const harness = createSeededDatabase()
+    try {
+      harness.sqlite.exec(`
+        INSERT INTO projects (id, slug, name, status)
+        VALUES ('project-org-observer', 'project-org-observer', 'Org observer project', 'active');
+      `)
+      const env = envFor(harness)
+      const auth: AuthContext = {
+        userId: 'usr-org-observer',
+        memberId: 'mbr-org-observer',
+        email: 'org-observer@mupot.test',
+        role: 'member',
+        tenant: 'local',
+        capabilities: [{
+          member_id: 'mbr-org-observer',
+          scope_type: 'org',
+          scope_id: null,
+          capability: 'observer',
+        }],
+      }
+      authState.current = auth
+
+      const restResponse = await projectApi.fetch(
+        new Request('https://pot.test/api/projects/project-org-observer'),
+        env,
+      )
+      expect(restResponse.status).toBe(200)
+      const rest = await restResponse.json() as { situation: unknown }
+
+      const mcp = await invokeTool(
+        auth,
+        env,
+        'project_get',
+        { project_id: 'project-org-observer' },
+        'https://pot.test',
+      )
+      expect(mcp.ok).toBe(true)
+      const mcpSituation = (mcp.result as { situation: unknown }).situation
+
+      const dashboard = await loadProjectDetail(env, auth, 'project-org-observer')
+      expect(dashboard).not.toBeNull()
+      expect(dashboard?.situation).toEqual(rest.situation)
+      expect(mcpSituation).toEqual(rest.situation)
+      expect(rest.situation).toMatchObject({
+        health: 'ready',
+        blockers: [],
+        pending_reviews: [],
+        active_work_count: 0,
+        active_flight_count: 0,
+        latest_activity: null,
+        next_action: { type: 'create_task' },
+      })
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('keeps the complete Project Link situation equal across surfaces at the stale boundary', async () => {
+    const harness = createSeededDatabase()
+    const clock = vi.spyOn(Date, 'now')
+      .mockReturnValueOnce(Date.parse('2026-07-19T10:00:29.999Z'))
+      .mockReturnValue(Date.parse('2026-07-19T10:00:30.001Z'))
+    try {
+      harness.sqlite.exec(`
+        INSERT INTO projects (id, slug, name, status)
+        VALUES ('project-link-boundary', 'project-link-boundary', 'Project Link boundary', 'active');
+        INSERT INTO project_squad_access (project_id, squad_id, access_level)
+        VALUES ('project-link-boundary', 'sq-growth', 'write');
+        INSERT INTO project_links (
+          id, tenant, local_project_id, local_squad_id, local_agent_id, local_key_id,
+          remote_pot, remote_project_id, remote_link_id, remote_agent_id, remote_key_id,
+          remote_public_key, remote_base_url, capabilities_json, evidence_origins_json,
+          state, stale_after_seconds, last_success_at, created_by, created_at
+        ) VALUES (
+          'link-boundary', 'local', 'project-link-boundary', 'sq-growth', 'agent-hermes', 'local-key',
+          'remote-pot', 'remote-project', 'remote-link', 'remote-agent', 'remote-key',
+          'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'https://remote.example/',
+          '["project.task.write"]', '[]', 'active', 30, '2026-07-19T10:00:00Z',
+          'mbr-local-admin', '2026-07-19T09:00:00Z'
+        );
+      `)
+      const env = envFor(harness)
+      const auth = owner()
+      authState.current = auth
+
+      const restResponse = await projectApi.fetch(
+        new Request('https://pot.test/api/projects/project-link-boundary'),
+        env,
+      )
+      expect(restResponse.status).toBe(200)
+      const rest = await restResponse.json() as { situation: unknown }
+
+      const mcp = await invokeTool(
+        auth,
+        env,
+        'project_get',
+        { project_id: 'project-link-boundary' },
+        'https://pot.test',
+      )
+      expect(mcp.ok).toBe(true)
+      const mcpSituation = (mcp.result as { situation: unknown }).situation
+
+      const dashboard = await loadProjectDetail(env, auth, 'project-link-boundary')
+      expect(dashboard).not.toBeNull()
+      expect(dashboard?.situation).toEqual(rest.situation)
+      expect(mcpSituation).toEqual(rest.situation)
+      expect(rest.situation).toMatchObject({
+        latest_activity: {
+          source_type: 'project_link',
+          source_id: 'link-boundary',
+          occurred_at: '2026-07-19T10:00:00.000Z',
+          status: 'healthy',
+        },
+      })
+
+      const activityResponse = await projectApi.fetch(
+        new Request('https://pot.test/api/projects/project-link-boundary/activity'),
+        env,
+      )
+      expect(activityResponse.status).toBe(200)
+      const restActivity = await activityResponse.json() as { rows: unknown[] }
+      expect(dashboard?.activity.rows).toEqual(restActivity.rows)
+    } finally {
+      clock.mockRestore()
+      harness.close()
+    }
+  })
+
   it('keeps the browser crawl and adds desktop and mobile project workspace checks', () => {
     const smoke = readFileSync(BROWSER_SMOKE_PATH, 'utf8')
     const evidenceDriver = readFileSync(EVIDENCE_DRIVER_PATH, 'utf8')

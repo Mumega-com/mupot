@@ -1,6 +1,6 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { listProjectActivity, listProjectEvidence, sanitizeProjectDetail } from '../src/projects/projections'
 import type { Env } from '../src/types'
 import { createSqliteD1 } from './helpers/sqlite-d1'
@@ -269,6 +269,92 @@ describe('project Activity and Evidence projections', () => {
       expect(projection.rows.map((row) => Date.parse(row.occurred_at)))
         .toEqual([...projection.rows.map((row) => Date.parse(row.occurred_at))].sort((a, b) => b - a))
     } finally {
+      fixture.close()
+    }
+  })
+
+  it('orders and cursors a Project Link by a failure later than its retained success', async () => {
+    const fixture = harness()
+    try {
+      fixture.sqlite.exec(`
+        UPDATE project_links
+           SET last_success_at = '2026-07-18T20:10:00Z',
+               last_failure_at = '2026-07-18 20:13:00',
+               last_error = 'remote_http_503'
+         WHERE id = 'link-a';
+      `)
+
+      const first = await listProjectActivity(env(fixture.db), {
+        projectId: 'project', readableSquadIds: null, limit: 1,
+      })
+      expect(first.rows).toEqual([
+        expect.objectContaining({
+          source_id: 'link-a', status: 'failed', occurred_at: '2026-07-18T20:13:00.000Z',
+        }),
+      ])
+      expect(first.nextCursor).toEqual({
+        occurred_at: '2026-07-18T20:13:00.000Z',
+        source_type: 'project_link',
+        source_id: 'link-a',
+      })
+
+      const second = await listProjectActivity(env(fixture.db), {
+        projectId: 'project', readableSquadIds: null, limit: 20, after: first.nextCursor!,
+      })
+      expect(second.rows.some((row) => row.source_id === 'link-a')).toBe(false)
+      expect(second.rows.length).toBeGreaterThan(0)
+      expect(second.rows.every((row) => (
+        Date.parse(row.occurred_at) < Date.parse(first.nextCursor!.occurred_at)
+      ))).toBe(true)
+    } finally {
+      fixture.close()
+    }
+  })
+
+  it('projects a revocation later than a retained success as the newest Project Link event', async () => {
+    const fixture = harness()
+    try {
+      fixture.sqlite.exec(`
+        UPDATE project_links
+           SET state = 'revoked',
+               last_success_at = '2026-07-18T20:10:00Z',
+               revoked_at = '2026-07-18T20:14:00Z',
+               revoked_by = 'member-a'
+         WHERE id = 'link-a';
+      `)
+
+      const activity = await listProjectActivity(env(fixture.db), {
+        projectId: 'project', readableSquadIds: null, limit: 20,
+      })
+      expect(activity.rows[0]).toMatchObject({
+        source_id: 'link-a', status: 'revoked', occurred_at: '2026-07-18T20:14:00.000Z',
+      })
+    } finally {
+      fixture.close()
+    }
+  })
+
+  it('keeps unchanged Project Link Activity stable when wall time crosses the stale boundary', async () => {
+    const fixture = harness()
+    const clock = vi.spyOn(Date, 'now')
+      .mockReturnValueOnce(Date.parse('2026-07-18T20:10:29.999Z'))
+      .mockReturnValueOnce(Date.parse('2026-07-18T20:10:30.001Z'))
+    try {
+      fixture.sqlite.exec(`
+        UPDATE project_links
+           SET stale_after_seconds = 30,
+               last_success_at = '2026-07-18T20:10:00Z',
+               last_failure_at = NULL
+         WHERE id = 'link-a';
+      `)
+      const input = { projectId: 'project', readableSquadIds: null, limit: 20 } as const
+      const before = await listProjectActivity(env(fixture.db), input)
+      const after = await listProjectActivity(env(fixture.db), input)
+
+      expect(after).toEqual(before)
+      expect(before.rows.find((row) => row.source_id === 'link-a')).toMatchObject({ status: 'healthy' })
+    } finally {
+      clock.mockRestore()
       fixture.close()
     }
   })
