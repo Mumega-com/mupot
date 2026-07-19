@@ -294,6 +294,88 @@ describe('project dashboard renderers', () => {
     expect(body).not.toContain('Squad Beta')
   })
 
+  it('renders truthful operating situations for review, blocked, active, and empty projects', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status) VALUES
+        ('review-project', 'review-project', 'Review project', 'active'),
+        ('blocked-project', 'blocked-project', 'Blocked project', 'active'),
+        ('active-project', 'active-project', 'Active project', 'active'),
+        ('empty-project', 'empty-project', 'Empty project', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+        ('review-project', 'squad-a', 'write'),
+        ('blocked-project', 'squad-a', 'write'),
+        ('active-project', 'squad-a', 'write'),
+        ('empty-project', 'squad-a', 'write');
+      INSERT INTO tasks (id, squad_id, title, status, project_id, gate_owner, result, updated_at) VALUES
+        ('review-task', 'squad-a', 'Review release', 'review', 'review-project', 'Release manager', NULL, '2026-07-19T01:00:00Z'),
+        ('blocked-task', 'squad-a', 'Resolve dependency', 'blocked', 'blocked-project', NULL, 'Waiting on vendor', '2026-07-19T01:00:00Z'),
+        ('active-task', 'squad-a', 'Continue delivery', 'in_progress', 'active-project', NULL, NULL, '2026-07-19T01:00:00Z');
+    `)
+
+    const review = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'review-project')
+    const blocked = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'blocked-project')
+    const active = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'active-project')
+    const empty = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'empty-project')
+
+    expect(review?.situation).toMatchObject({ health: 'review', summary: '1 task(s) are awaiting review.' })
+    expect(blocked?.situation).toMatchObject({ health: 'blocked', summary: '1 blocked task(s) need attention.' })
+    expect(active?.situation).toMatchObject({ health: 'active', active_work_count: 1 })
+    expect(empty?.situation).toMatchObject({
+      health: 'ready',
+      summary: 'Project is ready for its next step.',
+      blockers: [],
+      pending_reviews: [],
+      latest_activity: null,
+    })
+
+    const reviewBody = await render(projectDetailBody(review!))
+    const blockedBody = await render(projectDetailBody(blocked!))
+    const activeBody = await render(projectDetailBody(active!))
+    const emptyBody = await render(projectDetailBody(empty!))
+
+    expect(reviewBody).toContain('Health')
+    expect(reviewBody).toContain('Review release')
+    expect(reviewBody).toContain('Release manager')
+    expect(blockedBody).toContain('Resolve dependency')
+    expect(blockedBody).toContain('Waiting on vendor')
+    expect(activeBody).toContain('Active work')
+    expect(activeBody).toContain('1')
+    expect(emptyBody).toContain('No blockers need attention.')
+    expect(emptyBody).toContain('No reviews are pending.')
+    expect(emptyBody).toContain('No material activity yet.')
+  })
+
+  it('orders project work by operating priority and consistently within each status', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status) VALUES
+        ('ordered-project', 'ordered-project', 'Ordered project', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('ordered-project', 'squad-a', 'write');
+      INSERT INTO tasks (id, squad_id, title, status, project_id, updated_at) VALUES
+        ('open-later', 'squad-a', 'Open later', 'open', 'ordered-project', '2026-07-19T04:00:00Z'),
+        ('done-terminal', 'squad-a', 'Done terminal', 'done', 'ordered-project', '2026-07-19T01:00:00Z'),
+        ('review-later', 'squad-a', 'Review later', 'review', 'ordered-project', '2026-07-19T02:00:00Z'),
+        ('blocked-task', 'squad-a', 'Blocked task', 'blocked', 'ordered-project', '2026-07-19T01:00:00Z'),
+        ('review-earlier', 'squad-a', 'Review earlier', 'review', 'ordered-project', '2026-07-19T01:00:00Z'),
+        ('progress-task', 'squad-a', 'Progress task', 'in_progress', 'ordered-project', '2026-07-19T01:00:00Z'),
+        ('open-earlier', 'squad-a', 'Open earlier', 'open', 'ordered-project', '2026-07-19T01:00:00Z');
+    `)
+
+    const view = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'ordered-project')
+
+    expect(view?.tasks.map((task) => task.id)).toEqual([
+      'review-earlier',
+      'review-later',
+      'blocked-task',
+      'progress-task',
+      'open-earlier',
+      'open-later',
+      'done-terminal',
+    ])
+  })
+
   it('uses semantic anchor tabs and renders authoritative Activity and Evidence projections', async () => {
     harness = makeHarness()
     const view = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'visible-child')
@@ -310,7 +392,7 @@ describe('project dashboard renderers', () => {
     expect(body).toContain('workflow receipt')
     expect(body).not.toContain('No project activity yet')
     expect(body).not.toContain('No project evidence yet')
-    expect(body.match(/role="table"/g)).toHaveLength(5)
+    expect(body.match(/role="table"/g)).toHaveLength(4)
     expect(body).toContain('role="columnheader"')
     expect(body).toContain('role="cell"')
     expect(body).toContain("window.addEventListener('hashchange', syncProjectTab)")
@@ -657,7 +739,7 @@ describe('project dashboard routes', () => {
     expect(listFragment.match(/role="region"[^>]+overflow-x:auto/g)).toHaveLength(1)
     expect(listFragment).toContain('overflow-wrap:anywhere')
     expect(listFragment).not.toMatch(/width:\s*\d+px/)
-    expect(fragment.match(/role="region"[^>]+overflow-x:auto/g)).toHaveLength(5)
+    expect(fragment.match(/role="region"[^>]+overflow-x:auto/g)).toHaveLength(4)
     expect(fragment).toContain('overflow-wrap:anywhere')
     expect(fragment).not.toMatch(/width:\s*\d+px/)
   })

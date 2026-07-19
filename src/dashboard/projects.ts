@@ -6,12 +6,14 @@ import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import type { FlightRow } from '../flight/service'
 import { getProject } from '../projects/service'
 import { listProjectActivity, listProjectEvidence } from '../projects/projections'
+import { loadProjectSituation } from '../projects/situation'
 import type {
   ProjectActivitySource,
   ProjectEvidenceSource,
   ProjectProjectionPage,
 } from '../projects/projections'
-import { emptyState, kpiRow, pageHeader, pill, sectionPanel, statCard } from './ui'
+import type { ProjectHealth, ProjectSituation } from '../projects/situation'
+import { emptyState, pageHeader, pill, sectionPanel } from './ui'
 import type { Html } from './ui'
 
 const MAX_PROJECTS = 100
@@ -75,6 +77,7 @@ export interface ProjectDetailView {
   }
   tasks: ProjectTaskRow[]
   squads: ProjectSquadRow[]
+  situation: ProjectSituation
   activity: ProjectProjectionPage<ProjectActivitySource>
   evidence: ProjectProjectionPage<ProjectEvidenceSource>
 }
@@ -315,7 +318,13 @@ async function loadReadableTasks(
       FROM tasks t
        JOIN squads s ON s.id = t.squad_id
       WHERE t.project_id = ?1${filter}
-      ORDER BY t.created_at DESC, t.id
+      ORDER BY CASE t.status
+        WHEN 'review' THEN 1
+        WHEN 'blocked' THEN 2
+        WHEN 'in_progress' THEN 3
+        WHEN 'open' THEN 4
+        ELSE 5
+      END, t.updated_at, t.id
       LIMIT ${limitParam}`,
   ).bind(
     projectId,
@@ -388,11 +397,12 @@ export async function loadProjectDetail(
   const [project, access] = await Promise.all([getProject(env, projectId), projectAccess(env, auth)])
   if (!project || !await isReadableProject(env, project.id, access)) return null
 
-  const [aggregates, tasks, squads, parent, activity, evidence] = await Promise.all([
+  const [aggregates, tasks, squads, parent, situation, activity, evidence] = await Promise.all([
     loadProjectAggregates(env, project.id, access),
     loadReadableTasks(env, project.id, access),
     loadReadableSquads(env, project.id, access),
     project.parent_project_id ? getProject(env, project.parent_project_id) : Promise.resolve(null),
+    loadProjectSituation(env, project, access.readableSquadIds),
     listProjectActivity(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
     listProjectEvidence(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
   ])
@@ -403,6 +413,7 @@ export async function loadProjectDetail(
     aggregates,
     tasks,
     squads,
+    situation,
     activity,
     evidence,
   }
@@ -508,6 +519,87 @@ function statusTone(status: ProjectStatus): 'ok' | 'warn' | 'dim' | 'primary' {
   if (status === 'planned' || status === 'paused') return 'warn'
   if (status === 'archived') return 'dim'
   return 'primary'
+}
+
+function situationTone(health: ProjectHealth): 'ok' | 'warn' | 'danger' | 'dim' | 'primary' {
+  if (health === 'blocked') return 'danger'
+  if (health === 'review' || health === 'paused') return 'warn'
+  if (health === 'archived') return 'dim'
+  if (health === 'completed' || health === 'ready') return 'ok'
+  return 'primary'
+}
+
+function situationCount(value: number, truncated: boolean): string {
+  return `${value}${truncated ? '+' : ''}`
+}
+
+function operatingSituationBand(
+  project: Project,
+  aggregates: ProjectDetailView['aggregates'],
+  situation: ProjectSituation,
+): Html {
+  const activity = situation.latest_activity
+  const notices = [
+    situation.active_work_count_truncated ? 'Active work count is capped at 100.' : null,
+    situation.active_flight_count_truncated ? 'Active flight count is capped at 100.' : null,
+    situation.blocker_details_truncated ? `Showing the first ${situation.blockers.length} blockers.` : null,
+    situation.pending_review_details_truncated ? `Showing the first ${situation.pending_reviews.length} pending reviews.` : null,
+  ].filter((notice): notice is string => notice !== null)
+
+  return html`<section id="overview" aria-label="Overview" style="padding:16px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);">
+    <div style="display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 16px;">
+      <h2 class="ui-panel-title">Operating summary</h2>
+      <span class="ui-panel-sub">Health</span>
+      ${pill(situation.health, situationTone(situation.health))}
+      <span>${situation.summary}</span>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));gap:12px;margin-top:14px;">
+      <div>
+        <div class="ui-panel-sub">Next action</div>
+        <div>${situation.next_action?.label ?? 'No next action is available for this project.'}</div>
+      </div>
+      <div>
+        <div class="ui-panel-sub">Active work</div>
+        <div>${situationCount(situation.active_work_count, situation.active_work_count_truncated)}</div>
+      </div>
+      <div>
+        <div class="ui-panel-sub">Active flights</div>
+        <div>${situationCount(situation.active_flight_count, situation.active_flight_count_truncated)}</div>
+      </div>
+      <div>
+        <div class="ui-panel-sub">Latest activity</div>
+        ${activity
+          ? html`<div>${activity.title}</div><div class="ui-agent-role">${activity.detail || activity.status}</div>`
+          : html`<div>No material activity yet.</div>`}
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(18rem,1fr));gap:16px;margin-top:16px;">
+      <div>
+        <div class="ui-panel-sub">Blockers</div>
+        ${situation.blockers.length
+          ? html`<ul style="margin:6px 0 0;padding-left:18px;">${situation.blockers.map((blocker) => html`<li>
+              <span>${blocker.title}</span>${blocker.blocker_summary ? html`<span class="ui-agent-role">${blocker.blocker_summary}</span>` : ''}
+            </li>`)}</ul>`
+          : html`<div>No blockers need attention.</div>`}
+      </div>
+      <div>
+        <div class="ui-panel-sub">Pending reviews</div>
+        ${situation.pending_reviews.length
+          ? html`<ul style="margin:6px 0 0;padding-left:18px;">${situation.pending_reviews.map((review) => html`<li>
+              <span>${review.title}</span>${review.gate_owner ? html`<span class="ui-agent-role">${review.gate_owner}</span>` : ''}
+            </li>`)}</ul>`
+          : html`<div>No reviews are pending.</div>`}
+      </div>
+    </div>
+    ${notices.length ? html`<div class="ui-panel-sub" style="margin-top:14px;">${notices.join(' ')}</div>` : ''}
+    <dl style="display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:12px;margin:16px 0 0;padding-top:14px;border-top:1px solid var(--line);">
+      <div><dt class="ui-panel-sub">Goal</dt><dd style="margin:4px 0 0;">${project.goal || 'No goal set'}</dd></div>
+      <div><dt class="ui-panel-sub">Target date</dt><dd style="margin:4px 0 0;">${project.target_date ?? 'Not set'}</dd></div>
+      <div><dt class="ui-panel-sub">Direct tasks</dt><dd style="margin:4px 0 0;">${String(aggregates.directTasks)}</dd></div>
+      <div><dt class="ui-panel-sub">Direct flights</dt><dd style="margin:4px 0 0;">${String(aggregates.directFlights)}</dd></div>
+      <div><dt class="ui-panel-sub">Squad edges</dt><dd style="margin:4px 0 0;">${String(aggregates.directSquads)}</dd></div>
+    </dl>
+  </section>`
 }
 
 interface ProjectTableColumn {
@@ -634,7 +726,7 @@ function projectTabs() {
 }
 
 export function projectDetailBody(view: ProjectDetailView) {
-  const { project, parent, aggregates } = view
+  const { project, parent, aggregates, situation } = view
   const workLinks = html`<span style="display:flex;flex-wrap:wrap;gap:8px;">
     <a class="ui-link" href="/send?project_id=${encodeURIComponent(project.id)}">Project tasks</a>
     <a class="ui-link" href="/flights?project_id=${encodeURIComponent(project.id)}">Project flights</a>
@@ -649,29 +741,7 @@ export function projectDetailBody(view: ProjectDetailView) {
       badgeTone: statusTone(project.status),
     })}
     ${projectTabs()}
-    <section id="overview" aria-label="Overview">
-      ${sectionPanel({
-        title: 'Overview',
-        body: semanticDataTable({
-          label: 'Project overview',
-          cols: [
-            { label: 'Goal', width: '2fr' },
-            { label: 'Status', width: 'auto' },
-            { label: 'Target date', width: 'auto' },
-          ],
-          rows: [[
-            html`<span>${project.goal || 'No goal set'}</span>`,
-            pill(project.status, statusTone(project.status)),
-            html`<span class="ui-mono-dim">${project.target_date ?? 'Not set'}</span>`,
-          ]],
-        }),
-      })}
-      ${kpiRow([
-        statCard({ label: 'Direct tasks', value: String(aggregates.directTasks), sub: 'All work attributed to this project' }),
-        statCard({ label: 'Direct flights', value: String(aggregates.directFlights), sub: 'Governed runs attributed here' }),
-        statCard({ label: 'Squad edges', value: String(aggregates.directSquads), sub: 'Explicit project access edges' }),
-      ])}
-    </section>
+    ${operatingSituationBand(project, aggregates, situation)}
     <section id="work" aria-label="Work">
       ${sectionPanel({
         title: 'Work',
