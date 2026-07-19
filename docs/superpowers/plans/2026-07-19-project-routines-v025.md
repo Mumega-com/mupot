@@ -52,15 +52,16 @@
 
 **Interfaces:**
 - Produces tables `routines`, `routine_runs`, `routine_run_events`, `routine_run_actions`, and `routine_run_refs` with the fields and enums from the approved design.
+- Stores deterministic `max_occurrences`/`stop_at` limits on Routines and an immutable sanitized `policy_json` on every RoutineRun.
 - Produces unique keys `(tenant, routine_id, occurrence_key)`, `(run_id, action_key)`, and `(run_id, ref_type, ref_id, relation)`.
 - Produces due, lease-recovery, Project-history, Needs You, and terminal-cost indexes.
 
-- [ ] **Step 1: Write migration tests that apply migrations `0001` through `0060`, seed two tenants/Projects/squads, and assert schema shape, foreign keys, checks, and indexes.**
+- [x] **Step 1: Write migration tests that apply migrations `0001` through `0060`, seed two tenants/Projects/squads, and assert schema shape, foreign keys, checks, and indexes.**
 
 ```ts
 expect(columns('routine_runs')).toEqual(expect.arrayContaining([
   'id', 'tenant', 'project_id', 'routine_id', 'routine_revision',
-  'occurrence_key', 'status', 'waiting_reason', 'lease_owner',
+  'policy_json', 'occurrence_key', 'status', 'waiting_reason', 'lease_owner',
   'lease_expires_at', 'attempt', 'retry_at', 'assigned_agent_id',
   'task_id', 'flight_id', 'situation_digest', 'proposal_json',
   'result_summary', 'cost_micro_usd', 'created_at', 'updated_at',
@@ -69,10 +70,10 @@ expect(() => insertDuplicateOccurrence()).toThrow(/UNIQUE/)
 expect(() => insertCrossProjectRun()).toThrow(/routine run project mismatch/)
 ```
 
-- [ ] **Step 2: Run `npx vitest run tests/routines-migration.test.ts tests/migration-d1-compat.test.ts` and verify the new test fails because migration `0061` does not exist.**
-- [ ] **Step 3: Add the five tables, immutable ownership triggers, append-only event triggers, enum checks, foreign keys, and bounded query indexes.**
-- [ ] **Step 4: Re-run the focused tests and verify both pass.**
-- [ ] **Step 5: Commit with `git commit -m "feat: add project routine persistence"`.**
+- [x] **Step 2: Run `npx vitest run tests/routines-migration.test.ts tests/migration-d1-compat.test.ts` and verify the new test fails because migration `0061` does not exist.**
+- [x] **Step 3: Add the five tables, immutable ownership triggers, append-only event triggers, enum checks, foreign keys, and bounded query indexes.**
+- [x] **Step 4: Re-run the focused tests and verify both pass.**
+- [x] **Step 5: Commit with `git commit -m "feat: add project routine persistence"`.**
 
 ### Task 2: Domain Types and Schedule Semantics
 
@@ -347,4 +348,3 @@ expect(await executeRoutineAction(env, run.id, 'action-1')).toEqual(
 - **Spec coverage:** Tasks 1-12 cover every required data, scheduler, runtime, action, attention, Project projection, REST, MCP, dashboard, migration, browser, and release gate. Runtime-harness capabilities are explicitly excluded.
 - **Placeholder scan:** The plan contains no deferred implementation placeholders; every task names concrete files, interfaces, tests, commands, and expected outcomes.
 - **Type consistency:** `Routine`, `RoutineRun`, `RoutineAction`, `RoutinePrincipal`, `RoutineProposalResult`, `NeedsYouItem`, and their service function names are introduced once and consumed consistently by later tasks.
-

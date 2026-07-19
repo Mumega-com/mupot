@@ -151,6 +151,8 @@ Computers and recovery remain v0.27.
 | `budget_micro_usd` | hard non-negative per-run ceiling |
 | `max_attempts` | integer 1-5; default 3 |
 | `retry_backoff_seconds` | integer 30-86,400; default 300 |
+| `max_occurrences` | optional positive lifetime occurrence cap |
+| `stop_at` | optional UTC instant after which no new occurrence is created |
 | `revision` | positive integer incremented on every policy edit |
 | `enabled_by`, `enabled_at` | accountable enablement receipt fields |
 | `created_by`, `created_at`, `updated_at` | audit fields |
@@ -172,6 +174,7 @@ readability.
 | `id` | UUID primary key |
 | `tenant`, `project_id`, `routine_id` | immutable ownership |
 | `routine_revision` | immutable policy snapshot revision |
+| `policy_json` | immutable sanitized execution-policy snapshot for this occurrence |
 | `occurrence_key` | unique per tenant/Routine occurrence |
 | `trigger_kind`, `scheduled_for` | immutable trigger snapshot |
 | `status` | `queued`, `leased`, `observing`, `waiting`, `running`, `succeeded`, `failed`, `skipped`, or `cancelled` |
@@ -223,6 +226,9 @@ table. A unique `(run_id, ref_type, ref_id, relation)` prevents duplicate projec
   `next_run_at`; already-created runs retain their original occurrence.
 - `once` schedules become exhausted after their one occurrence, regardless of its
   terminal outcome. Retrying occurs inside the same run.
+- A Routine becomes exhausted before creating a new occurrence when `max_occurrences`
+  has been reached or `stop_at` is earlier than that occurrence. Existing runs retain
+  their snapshotted retry, budget, assignment, and execution policy.
 
 ### 6.2 Heartbeat
 
