@@ -5,6 +5,8 @@ import { parseFlightMetaV1 } from '../flight/meta'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import type { FlightRow } from '../flight/service'
 import { getProject } from '../projects/service'
+import { listProjectBindings } from '../projects/providers/bindings'
+import type { ProjectProviderBinding } from '../projects/providers/port'
 import { emptyState, kpiRow, pageHeader, pill, sectionPanel, statCard } from './ui'
 import type { Html } from './ui'
 
@@ -69,6 +71,8 @@ export interface ProjectDetailView {
   }
   tasks: ProjectTaskRow[]
   squads: ProjectSquadRow[]
+  boards: ProjectProviderBinding[]
+  canManageBoards: boolean
 }
 
 export interface ProjectWorkContext {
@@ -380,11 +384,12 @@ export async function loadProjectDetail(
   const [project, access] = await Promise.all([getProject(env, projectId), projectAccess(env, auth)])
   if (!project || !await isReadableProject(env, project.id, access)) return null
 
-  const [aggregates, tasks, squads, parent] = await Promise.all([
+  const [aggregates, tasks, squads, parent, boards] = await Promise.all([
     loadProjectAggregates(env, project.id, access),
     loadReadableTasks(env, project.id, access),
     loadReadableSquads(env, project.id, access),
     project.parent_project_id ? getProject(env, project.parent_project_id) : Promise.resolve(null),
+    listProjectBindings(env, project.id),
   ])
 
   return {
@@ -393,6 +398,8 @@ export async function loadProjectDetail(
     aggregates,
     tasks,
     squads,
+    boards,
+    canManageBoards: access.workspaceAdmin,
   }
 }
 
@@ -602,6 +609,7 @@ function projectTabs() {
   return html`<nav aria-label="Project sections" style="display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px;">
     <a class="btn secondary sm" data-project-tab href="#overview" aria-current="page">Overview</a>
     <a class="btn secondary sm" data-project-tab href="#work">Work</a>
+    <a class="btn secondary sm" data-project-tab href="#board">Board</a>
     <a class="btn secondary sm" data-project-tab href="#squads">Squads</a>
     <a class="btn secondary sm" data-project-tab href="#activity">Activity</a>
     <a class="btn secondary sm" data-project-tab href="#evidence">Evidence</a>
@@ -619,6 +627,72 @@ function projectTabs() {
       syncProjectTab();
     })();
   </script>`
+}
+
+function providerLabel(provider: string): string {
+  if (provider === 'github_projects') return 'GitHub Projects'
+  if (provider === 'linear') return 'Linear'
+  if (provider === 'notion') return 'Notion'
+  return provider
+}
+
+function boardSection(view: ProjectDetailView) {
+  const { project, boards, canManageBoards } = view
+  const rows = boards.map((board) => [
+    html`<span>${providerLabel(board.provider)}</span>`,
+    html`<code class="inline">${board.external_id}</code>`,
+    html`<span class="ui-mono-dim">${board.synced_at ?? 'Never synced'}</span>`,
+    canManageBoards
+      ? html`<form method="post" action="/projects/${encodeURIComponent(project.id)}/boards/sync" style="display:inline;">
+          <input type="hidden" name="provider" value="${board.provider}" />
+          <button class="btn secondary sm" type="submit">Sync</button>
+        </form>`
+      : html`<span class="ui-mono-dim">—</span>`,
+  ])
+
+  const linkForm = canManageBoards
+    ? html`<form class="adminform" method="post" action="/projects/${encodeURIComponent(project.id)}/boards" autocomplete="off" style="margin-top:14px;flex-direction:column;align-items:stretch;gap:10px;">
+        <label>Provider
+          <select name="provider" required>
+            <option value="github_projects">GitHub Projects</option>
+            <option value="linear">Linear</option>
+            <option value="notion">Notion</option>
+          </select>
+        </label>
+        <label>External id
+          <input name="external_id" required placeholder="owner/123 · team key · Notion database id" />
+        </label>
+        <label>Connector id <span style="font-size:12px;color:var(--muted)">(optional vault connector)</span>
+          <input name="connector_id" placeholder="uuid from /admin/connectors" />
+        </label>
+        <button class="btn" type="submit">Link board</button>
+      </form>
+      <p style="color:var(--muted);font-size:13px;margin-top:10px;max-width:40rem;">
+        Mupot keeps project identity and RBAC. Linked boards import work into attributed pot tasks.
+        GitHub format: <code class="inline">owner/number</code>. Linear and Notion activate once vault connectors are present.
+      </p>`
+    : html``
+
+  return html`
+    <section id="board" aria-label="Board">
+      ${sectionPanel({
+        title: 'Linked boards',
+        body: html`
+          ${semanticDataTable({
+            label: 'Project boards',
+            cols: [
+              { label: 'Provider', width: '1fr' },
+              { label: 'External id', width: '1.5fr' },
+              { label: 'Last sync', width: 'auto' },
+              { label: 'Action', width: 'auto' },
+            ],
+            rows,
+            empty: 'No external board linked yet. Link GitHub Projects, Linear, or Notion to import attributed work.',
+          })}
+          ${linkForm}
+        `,
+      })}
+    </section>`
 }
 
 export function projectDetailBody(view: ProjectDetailView) {
@@ -680,6 +754,7 @@ export function projectDetailBody(view: ProjectDetailView) {
         }),
       })}
     </section>
+    ${boardSection(view)}
     <section id="squads" aria-label="Squads">
       ${sectionPanel({
         title: 'Squads',

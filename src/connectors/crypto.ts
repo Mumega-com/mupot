@@ -40,9 +40,10 @@ export type ConnectorType =
   | 'crm'
   // Coordination-port / task-manager sources (2026-07-16): mirrors the CMS-
   // adapter uniform-port principle applied to task/issue managers — Linear is
-  // the first adapter, GitHub Projects v2 (github-projects.ts) is a parallel,
-  // pre-existing coordination surface not yet unified under this same type.
+  // the first adapter; Notion joins the same vault slot set. GitHub Projects v2
+  // uses the existing github_app connector + project_provider_bindings.
   | 'linear'
+  | 'notion'
   | 'custom'
 export type ConnectorScopeType = 'squad' | 'agent' | 'pot'
 
@@ -60,6 +61,7 @@ const VALID_TYPES: readonly ConnectorType[] = [
   'facebook_ads',
   'crm',
   'linear',
+  'notion',
   'custom',
 ]
 const VALID_SCOPE_TYPES: readonly ConnectorScopeType[] = ['squad', 'agent', 'pot']

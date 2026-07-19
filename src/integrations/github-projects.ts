@@ -154,7 +154,14 @@ export async function syncGitHubProject(
  */
 export async function importProjectItems(
   env: Env,
-  params: { owner: string; projectNumber: number; agentField?: string; dryRun?: boolean },
+  params: {
+    owner: string
+    projectNumber: number
+    agentField?: string
+    dryRun?: boolean
+    /** When set, imported tasks are attributed to this pot-native project. */
+    projectId?: string
+  },
   opts: { fetchImpl?: typeof fetch } = {},
 ): Promise<ProjectImportResult> {
   const agentField = params.agentField?.trim() || 'Agent'
@@ -233,6 +240,7 @@ export async function importProjectItems(
         env,
         {
           squad_id: agent.squad_id,
+          project_id: params.projectId ?? null,
           title: it.title,
           body: [it.url, `from GitHub Project (item ${it.itemId})`].filter(Boolean).join('\n'),
           // #142: GitHub Project sync — predicate is the GH issue itself closing.
