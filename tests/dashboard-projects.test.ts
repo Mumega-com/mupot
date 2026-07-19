@@ -341,9 +341,36 @@ describe('project dashboard renderers', () => {
     expect(blockedBody).toContain('Waiting on vendor')
     expect(activeBody).toContain('Active work')
     expect(activeBody).toContain('1')
+    expect(activeBody).not.toContain('var(--line)')
+    expect(activeBody).toContain('repeat(auto-fit,minmax(min(100%,14rem),1fr))')
+    expect(activeBody).toContain('repeat(auto-fit,minmax(min(100%,18rem),1fr))')
+    expect(activeBody).toMatch(/Next action<\/div>\s*<div style="min-width:0;overflow-wrap:anywhere;">/)
+    expect(activeBody).toMatch(/Latest activity<\/div>\s*<div style="min-width:0;overflow-wrap:anywhere;">/)
+    expect(activeBody).toMatch(/<dd style="margin:4px 0 0;min-width:0;overflow-wrap:anywhere;">/)
     expect(emptyBody).toContain('No blockers need attention.')
     expect(emptyBody).toContain('No reviews are pending.')
     expect(emptyBody).toContain('No material activity yet.')
+  })
+
+  it('describes truncated active work as a lower bound instead of a total cap', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status)
+      VALUES ('truncated-work', 'truncated-work', 'Truncated work', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('truncated-work', 'squad-a', 'write');
+      WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x + 1 FROM n WHERE x < 100)
+      INSERT INTO tasks (id, squad_id, title, status, project_id, updated_at)
+      SELECT 'truncated-' || x, 'squad-a', 'Blocked ' || x, 'blocked', 'truncated-work', '2026-07-19T01:00:00Z'
+        FROM n;
+    `)
+
+    const view = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'truncated-work')
+    const body = await render(projectDetailBody(view!))
+
+    expect(view?.situation).toMatchObject({ active_work_count: 100, active_work_count_truncated: true })
+    expect(body).toContain('One or more work-status counts exceed 100; active work is a lower bound.')
+    expect(body).not.toContain('Active work count is capped at 100.')
   })
 
   it('orders project work by operating priority and consistently within each status', async () => {

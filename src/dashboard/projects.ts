@@ -540,64 +540,66 @@ function operatingSituationBand(
 ): Html {
   const activity = situation.latest_activity
   const notices = [
-    situation.active_work_count_truncated ? 'Active work count is capped at 100.' : null,
+    situation.active_work_count_truncated
+      ? 'One or more work-status counts exceed 100; active work is a lower bound.'
+      : null,
     situation.active_flight_count_truncated ? 'Active flight count is capped at 100.' : null,
     situation.blocker_details_truncated ? `Showing the first ${situation.blockers.length} blockers.` : null,
     situation.pending_review_details_truncated ? `Showing the first ${situation.pending_reviews.length} pending reviews.` : null,
   ].filter((notice): notice is string => notice !== null)
 
-  return html`<section id="overview" aria-label="Overview" style="padding:16px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);">
+  return html`<section id="overview" aria-label="Overview" style="padding:16px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border);">
     <div style="display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 16px;">
       <h2 class="ui-panel-title">Operating summary</h2>
       <span class="ui-panel-sub">Health</span>
       ${pill(situation.health, situationTone(situation.health))}
-      <span>${situation.summary}</span>
+      <span style="min-width:0;overflow-wrap:anywhere;">${situation.summary}</span>
     </div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));gap:12px;margin-top:14px;">
-      <div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,14rem),1fr));gap:12px;margin-top:14px;">
+      <div style="min-width:0;overflow-wrap:anywhere;">
         <div class="ui-panel-sub">Next action</div>
-        <div>${situation.next_action?.label ?? 'No next action is available for this project.'}</div>
+        <div style="min-width:0;overflow-wrap:anywhere;">${situation.next_action?.label ?? 'No next action is available for this project.'}</div>
       </div>
-      <div>
+      <div style="min-width:0;overflow-wrap:anywhere;">
         <div class="ui-panel-sub">Active work</div>
         <div>${situationCount(situation.active_work_count, situation.active_work_count_truncated)}</div>
       </div>
-      <div>
+      <div style="min-width:0;overflow-wrap:anywhere;">
         <div class="ui-panel-sub">Active flights</div>
         <div>${situationCount(situation.active_flight_count, situation.active_flight_count_truncated)}</div>
       </div>
-      <div>
+      <div style="min-width:0;overflow-wrap:anywhere;">
         <div class="ui-panel-sub">Latest activity</div>
         ${activity
-          ? html`<div>${activity.title}</div><div class="ui-agent-role">${activity.detail || activity.status}</div>`
-          : html`<div>No material activity yet.</div>`}
+          ? html`<div style="min-width:0;overflow-wrap:anywhere;">${activity.title}</div><div class="ui-agent-role" style="min-width:0;overflow-wrap:anywhere;">${activity.detail || activity.status}</div>`
+          : html`<div style="min-width:0;overflow-wrap:anywhere;">No material activity yet.</div>`}
       </div>
     </div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(18rem,1fr));gap:16px;margin-top:16px;">
-      <div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,18rem),1fr));gap:16px;margin-top:16px;">
+      <div style="min-width:0;overflow-wrap:anywhere;">
         <div class="ui-panel-sub">Blockers</div>
         ${situation.blockers.length
-          ? html`<ul style="margin:6px 0 0;padding-left:18px;">${situation.blockers.map((blocker) => html`<li>
-              <span>${blocker.title}</span>${blocker.blocker_summary ? html`<span class="ui-agent-role">${blocker.blocker_summary}</span>` : ''}
+          ? html`<ul style="box-sizing:border-box;max-width:100%;margin:6px 0 0;padding-left:18px;overflow-wrap:anywhere;">${situation.blockers.map((blocker) => html`<li style="min-width:0;overflow-wrap:anywhere;">
+              <span style="min-width:0;overflow-wrap:anywhere;">${blocker.title}</span>${blocker.blocker_summary ? html`<span class="ui-agent-role" style="min-width:0;overflow-wrap:anywhere;">${blocker.blocker_summary}</span>` : ''}
             </li>`)}</ul>`
           : html`<div>No blockers need attention.</div>`}
       </div>
-      <div>
+      <div style="min-width:0;overflow-wrap:anywhere;">
         <div class="ui-panel-sub">Pending reviews</div>
         ${situation.pending_reviews.length
-          ? html`<ul style="margin:6px 0 0;padding-left:18px;">${situation.pending_reviews.map((review) => html`<li>
-              <span>${review.title}</span>${review.gate_owner ? html`<span class="ui-agent-role">${review.gate_owner}</span>` : ''}
+          ? html`<ul style="box-sizing:border-box;max-width:100%;margin:6px 0 0;padding-left:18px;overflow-wrap:anywhere;">${situation.pending_reviews.map((review) => html`<li style="min-width:0;overflow-wrap:anywhere;">
+              <span style="min-width:0;overflow-wrap:anywhere;">${review.title}</span>${review.gate_owner ? html`<span class="ui-agent-role" style="min-width:0;overflow-wrap:anywhere;">${review.gate_owner}</span>` : ''}
             </li>`)}</ul>`
           : html`<div>No reviews are pending.</div>`}
       </div>
     </div>
     ${notices.length ? html`<div class="ui-panel-sub" style="margin-top:14px;">${notices.join(' ')}</div>` : ''}
-    <dl style="display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:12px;margin:16px 0 0;padding-top:14px;border-top:1px solid var(--line);">
-      <div><dt class="ui-panel-sub">Goal</dt><dd style="margin:4px 0 0;">${project.goal || 'No goal set'}</dd></div>
-      <div><dt class="ui-panel-sub">Target date</dt><dd style="margin:4px 0 0;">${project.target_date ?? 'Not set'}</dd></div>
-      <div><dt class="ui-panel-sub">Direct tasks</dt><dd style="margin:4px 0 0;">${String(aggregates.directTasks)}</dd></div>
-      <div><dt class="ui-panel-sub">Direct flights</dt><dd style="margin:4px 0 0;">${String(aggregates.directFlights)}</dd></div>
-      <div><dt class="ui-panel-sub">Squad edges</dt><dd style="margin:4px 0 0;">${String(aggregates.directSquads)}</dd></div>
+    <dl style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,10rem),1fr));gap:12px;margin:16px 0 0;padding-top:14px;border-top:1px solid var(--border);">
+      <div style="min-width:0;overflow-wrap:anywhere;"><dt class="ui-panel-sub">Goal</dt><dd style="margin:4px 0 0;min-width:0;overflow-wrap:anywhere;">${project.goal || 'No goal set'}</dd></div>
+      <div style="min-width:0;overflow-wrap:anywhere;"><dt class="ui-panel-sub">Target date</dt><dd style="margin:4px 0 0;min-width:0;overflow-wrap:anywhere;">${project.target_date ?? 'Not set'}</dd></div>
+      <div style="min-width:0;overflow-wrap:anywhere;"><dt class="ui-panel-sub">Direct tasks</dt><dd style="margin:4px 0 0;min-width:0;overflow-wrap:anywhere;">${String(aggregates.directTasks)}</dd></div>
+      <div style="min-width:0;overflow-wrap:anywhere;"><dt class="ui-panel-sub">Direct flights</dt><dd style="margin:4px 0 0;min-width:0;overflow-wrap:anywhere;">${String(aggregates.directFlights)}</dd></div>
+      <div style="min-width:0;overflow-wrap:anywhere;"><dt class="ui-panel-sub">Squad edges</dt><dd style="margin:4px 0 0;min-width:0;overflow-wrap:anywhere;">${String(aggregates.directSquads)}</dd></div>
     </dl>
   </section>`
 }
