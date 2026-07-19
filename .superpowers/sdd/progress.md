@@ -12,3 +12,14 @@ Task 5: complete (commits 2f11980..896db34, review approved; 232 fresh focused t
 Task 6: complete (commits ae91025..f35f6ca, review approved; 169 fresh focused tests + typecheck passed; full regression 209 files / 3500 tests passed after rerunning isolated addon-bindings flake)
 Task 7: complete (commits 86e6415..c6dc83a, review approved; 33 fresh focused tests + 75 adjacent tests + typecheck passed; full regression 210 files / 3515 tests passed)
 Task 8: complete (review approved; 54 focused receipt/route tests + 160 adjacent tests + typecheck passed; full regression 211 files / 3527 tests passed)
+
+---
+
+# Mupot v0.24 Project Operations Progress
+
+Plan: docs/superpowers/plans/2026-07-19-project-operations-v024.md
+Base: 5284348
+Target: v0.24.0 Project Operations
+
+Task 1: complete (commits 5284348..70fde24; review approved; no-secrets passed; 4 focused files / 37 tests passed; full local browser + signed runtime evidence passed)
+Task 2: in progress
