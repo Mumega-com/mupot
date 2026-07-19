@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -26,16 +27,32 @@ describe('local project workspace showcase', () => {
         SELECT mode, generation, key_fingerprint, updated_by_member_id, reason
         FROM agent_inbox_fences
         WHERE tenant = 'local' AND agent_id = 'agent-conformance'
-      `).get()
+      `).get() as {
+        mode: string
+        generation: number
+        key_fingerprint: string
+        updated_by_member_id: string
+        reason: string
+      } | undefined
+      const runtimeKey = harness.sqlite.prepare(`
+        SELECT pubkey
+        FROM agent_keys
+        WHERE tenant = 'local' AND agent_id = 'agent-conformance'
+      `).get() as { pubkey: string } | undefined
+
+      if (!fence || !runtimeKey) throw new Error('local runtime conformance fixture is incomplete')
+
+      const fingerprint = createHash('sha256').update(runtimeKey.pubkey).digest('hex')
+      expect(fingerprint).toBe('6d4c5cc496a08ce3785f212e13b532c1fc7ee98a905c3d55debb48b1d13f690e')
 
       expect(fence).toEqual({
         mode: 'signed_only',
         generation: 1,
-        key_fingerprint: '6d4c5cc496a08ce3785f212e13b532c1fc7ee98a905c3d55debb48b1d13f690e',
+        key_fingerprint: fingerprint,
         updated_by_member_id: 'mbr-conformance-runtime',
         reason: expect.any(String),
       })
-      expect((fence as { reason: string }).reason).not.toHaveLength(0)
+      expect(fence.reason).not.toHaveLength(0)
     } finally {
       harness.close()
     }
