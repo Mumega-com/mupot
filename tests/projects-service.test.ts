@@ -136,7 +136,7 @@ describe('project domain service', () => {
       .resolves.toMatchObject({ ok: true, value: { status: 'planned' } })
   })
 
-  it('enforces the shared lifecycle transition matrix and treats same-status updates as no-ops', async () => {
+  it('enforces the shared lifecycle transition matrix and writes same-status updates', async () => {
     harness = makeHarness()
     const env = envFor(harness)
     const statuses = ['planned', 'active', 'paused', 'completed', 'archived'] as const
@@ -159,7 +159,8 @@ describe('project domain service', () => {
         if (allowed.has(`${from}:${to}`)) {
           expect(result, `${from} -> ${to}`).toMatchObject({ ok: true, value: { status: to } })
           if (from === to && result.ok) {
-            expect(result.value.updated_at, `${from} same-status updated_at`).toBe('2026-07-19T00:00:00.000Z')
+            expect(Date.parse(result.value.updated_at), `${from} same-status updated_at`)
+              .toBeGreaterThan(Date.parse('2026-07-19T00:00:00.000Z'))
           }
         } else {
           expect(result, `${from} -> ${to}`).toEqual({ ok: false, error: 'invalid_status_transition' })
@@ -398,5 +399,42 @@ describe('project domain service', () => {
     await expect(updateProject({ DB: db } as Env, project.id, { name: 'Stale rename' }))
       .resolves.toEqual({ ok: false, error: 'receipt_failed' })
     expect(await getProject(envFor(harness), project.id)).toMatchObject({ status: 'active', name: 'Concurrent rename' })
+  })
+
+  it('does not silently succeed when a same-status update loses the optimistic write race', async () => {
+    harness = makeHarness()
+    const project = await createRoot(envFor(harness))
+    let raced = false
+    const db = {
+      prepare(sql: string) {
+        const statement = harness!.db.prepare(sql)
+        return {
+          bind(...values: unknown[]) {
+            const bound = statement.bind(...values)
+            return {
+              first: bound.first.bind(bound),
+              all: bound.all.bind(bound),
+              run: async () => {
+                if (!raced && sql.startsWith('UPDATE projects SET')) {
+                  raced = true
+                  harness!.sqlite.prepare('UPDATE projects SET name = ?, updated_at = ? WHERE id = ?')
+                    .run('Concurrent rename', '9999-01-01T00:00:00.000Z', project.id)
+                }
+                return bound.run()
+              },
+            }
+          },
+        }
+      },
+    } as Env['DB']
+
+    await expect(updateProject({ DB: db } as Env, project.id, { status: 'active' }))
+      .resolves.toEqual({ ok: false, error: 'receipt_failed' })
+    expect(raced).toBe(true)
+    expect(await getProject(envFor(harness), project.id)).toMatchObject({
+      status: 'active',
+      name: 'Concurrent rename',
+      updated_at: '9999-01-01T00:00:00.000Z',
+    })
   })
 })

@@ -245,10 +245,6 @@ export async function updateProject(
   if (statusWasSupplied && !isValidProjectStatusTransition(existing.status, nextStatus)) {
     return { ok: false, error: 'invalid_status_transition' }
   }
-  if (statusWasSupplied && suppliedKeys.length === 1 && nextStatus === existing.status) {
-    return { ok: true, value: existing }
-  }
-
   const nextSlug = input.slug === undefined ? existing.slug : input.slug
   if (!isValidSlug(nextSlug)) return { ok: false, error: 'invalid_slug' }
   const nextName = input.name === undefined ? existing.name : input.name
