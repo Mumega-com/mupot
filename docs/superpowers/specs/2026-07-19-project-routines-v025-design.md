@@ -247,6 +247,16 @@ The scheduler processes at most 100 due Routines and 100 queued/retryable runs p
 minute. Excess work remains due for the next heartbeat. It never scans an unbounded
 tenant table.
 
+The v0.25 implementation uses a smaller operational batch of two recoveries, two
+due Routines, and two claim candidates per heartbeat. This keeps scheduler control
+work at or below 25 D1 statements before dispatch, leaving headroom under the
+Workers Free query limit. The public contract remains a hard maximum of 100; batch
+sizes may increase only with an explicit invocation-budget calculation and tests.
+
+Queued runs are leased only when the scheduler receives an attached dispatch
+processor. Occurrence creation and recovery may run without one, but the scheduler
+must never strand a lease when the runtime-neutral dispatch layer is unavailable.
+
 ### 6.3 Overlap
 
 Only one non-terminal run per Routine executes at a time in v0.25.

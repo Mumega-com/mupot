@@ -216,6 +216,7 @@ import { syncGitHubProject } from './integrations/github-projects'
 import { runGrowthCollection } from './departments/collectors/growth-cron'
 import { runCroCollection } from './cro/collect'
 import { flushFlightEventOutbox } from './flight/service'
+import { runRoutineScheduler, shouldRunMaintenanceHeartbeat } from './routines/scheduler'
 
 export default {
   // The OAuth provider is the outer entry point. It handles OAuth paths and
@@ -224,10 +225,23 @@ export default {
   fetch: (req: Request, env: Env, ctx: ExecutionContext) =>
     oauthProvider.fetch(req, env, ctx),
 
-  // Queue and scheduled handlers are preserved unchanged (spec §A.2).
+  // Queue delivery remains owned by the bus component.
   queue: handleQueue,
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Seven independent heartbeats on the same */15 cron:
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    const scheduledAt = new Date(controller.scheduledTime)
+    const waitFor = (label: string, work: Promise<unknown>) => {
+      ctx.waitUntil(work.catch((error) => {
+        console.error(`[scheduled:${label}]`, error)
+      }))
+    }
+
+    waitFor(
+      'project-routines',
+      runRoutineScheduler(env, scheduledAt, `routine-cron:${scheduledAt.toISOString()}`),
+    )
+    if (!shouldRunMaintenanceHeartbeat(scheduledAt)) return
+
+    // Seven independent maintenance heartbeats in canonical 15-minute buckets:
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
     //     ("design loops, not prompts"; without this the v0.3.0 loop never fires).
@@ -244,12 +258,12 @@ export default {
     //     missing/broken source never blocks. Fail-soft. Logic: src/cro/collect.ts.
     //  7. Flight event outbox — retry attributed terminal events whose immediate
     //     Queue delivery failed after the atomic landing receipt was committed.
-    ctx.waitUntil(reconcileMembership(env))
-    ctx.waitUntil(runMetabolism(env))
-    ctx.waitUntil(runLoopsTick(env))
-    ctx.waitUntil(syncGitHubProject(env).then(() => undefined))
-    ctx.waitUntil(runGrowthCollection(env))
-    ctx.waitUntil(runCroCollection(env).then(() => undefined))
-    ctx.waitUntil(flushFlightEventOutbox(env).then(() => undefined))
+    waitFor('membership', reconcileMembership(env))
+    waitFor('metabolism', runMetabolism(env))
+    waitFor('loops', runLoopsTick(env))
+    waitFor('github-project', syncGitHubProject(env))
+    waitFor('growth', runGrowthCollection(env))
+    waitFor('cro', runCroCollection(env))
+    waitFor('flight-outbox', flushFlightEventOutbox(env))
   },
 }

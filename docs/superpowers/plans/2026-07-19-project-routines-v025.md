@@ -142,7 +142,7 @@ expect(await getRoutine(otherTenantEnv, principal, routineId)).toBeNull()
 - Produces `claimRoutineRun(env, runId, owner, now): Promise<boolean>` and `recoverExpiredRoutineLeases(env, now): Promise<number>`.
 - The Worker cron changes to `* * * * *`; existing maintenance work executes only in canonical fifteen-minute buckets.
 
-- [ ] **Step 1: Write tests for duplicate scheduler ticks, 100-row due cap, lease races, lease expiry, active-Project guard, disable/revision race, once exhaustion, overlap `skip`, overlap `queue`, ten-item queue cap, and retry eligibility.**
+- [x] **Step 1: Write tests for duplicate scheduler ticks, 100-row due cap, lease races, lease expiry, active-Project guard, disable/revision race, once exhaustion, overlap `skip`, overlap `queue`, ten-item queue cap, and retry eligibility.**
 
 ```ts
 await Promise.all([
@@ -153,11 +153,11 @@ expect(countRuns(routineId, occurrenceKey)).toBe(1)
 expect(summary.scanned).toBeLessThanOrEqual(100)
 ```
 
-- [ ] **Step 2: Run `npx vitest run tests/routine-scheduler.test.ts` and verify import failure.**
-- [ ] **Step 3: Implement atomic occurrence insert, conditional lease update, schedule advancement from `scheduled_for`, bounded retry scans, and terminal skip evidence.**
-- [ ] **Step 4: Register the scheduler in `src/index.ts`, retain fail-soft isolation for every heartbeat, and change the tracked example cron to one-minute cadence.**
-- [ ] **Step 5: Run scheduler tests, existing loop/metabolism/cron tests, and typecheck.**
-- [ ] **Step 6: Commit with `git commit -m "feat: schedule and recover routine runs"`.**
+- [x] **Step 2: Run `npx vitest run tests/routine-scheduler.test.ts` and verify import failure.**
+- [x] **Step 3: Implement atomic occurrence insert, conditional lease update, schedule advancement from `scheduled_for`, bounded retry scans, and terminal skip evidence.**
+- [x] **Step 4: Register the scheduler in `src/index.ts`, retain fail-soft isolation for every heartbeat, and change the tracked example cron to one-minute cadence.**
+- [x] **Step 5: Run scheduler tests, existing loop/metabolism/cron tests, and typecheck.**
+- [x] **Step 6: Commit with `git commit -m "feat: schedule and recover routine runs"`.**
 
 ### Task 5: Runtime-Neutral Dispatch
 

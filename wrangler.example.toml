@@ -97,9 +97,9 @@ name = "mupot-task-workflow"
 binding = "TASK_WORKFLOW"
 class_name = "TaskWorkflow"
 
-# membership sync: reconcile channel membership → squad capabilities every 15 min
+# Project Routines run each minute; existing maintenance stays in 15-minute buckets.
 [triggers]
-crons = ["*/15 * * * *"]
+crons = ["* * * * *"]
 
 # ── GHL act-channel secrets (issue #8) ──
 # These are secrets — do NOT add them under [vars]. Set via wrangler secret put:
