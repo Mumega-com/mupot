@@ -6,8 +6,8 @@
 
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
-import { basename, join, resolve } from 'node:path'
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { inflateSync } from 'node:zlib'
 
@@ -365,6 +365,82 @@ function artifactMeta(path, receipt) {
   }
 }
 
+function referencedArtifactMeta(checks, outDir, receiptPath, receipt) {
+  const references = receipt?.artifacts
+  const validList = Array.isArray(references) && references.length > 0 && references.length <= 50
+  pushCheck(checks, validList, 'receipt_artifacts_declared', {
+    path: receiptPath,
+    count: Array.isArray(references) ? references.length : 0,
+  })
+  if (!validList) return []
+
+  const root = realpathSync(outDir)
+  const receiptRealPath = realpathSync(receiptPath)
+  const seen = new Set()
+  return references.map((reference, index) => {
+    const label = typeof reference?.label === 'string' ? reference.label.trim() : ''
+    const artifactPath = typeof reference?.path === 'string' ? reference.path.trim() : ''
+    const candidate = artifactPath && !isAbsolute(artifactPath) ? resolve(root, artifactPath) : ''
+    const relativePath = candidate ? relative(root, candidate) : ''
+    const boundedShape = Boolean(label) && label.length <= 200 && Boolean(artifactPath)
+      && artifactPath.length <= 1000 && Boolean(candidate) && Boolean(relativePath)
+      && relativePath !== '..' && !relativePath.startsWith('../') && !isAbsolute(relativePath)
+      && !seen.has(relativePath)
+    if (boundedShape) seen.add(relativePath)
+    pushCheck(checks, boundedShape, 'receipt_artifact_reference_valid', {
+      path: receiptPath, index, label: label || null, artifact_path: artifactPath || null,
+    })
+    if (!boundedShape || !existsSync(candidate)) {
+      pushCheck(checks, false, 'receipt_artifact_file_present', {
+        path: receiptPath, index, artifact_path: artifactPath || null,
+      })
+      return { label: label || null, path: artifactPath || null, exists: false }
+    }
+
+    let realPath
+    let realRelative
+    let stats
+    try {
+      realPath = realpathSync(candidate)
+      realRelative = relative(root, realPath)
+      stats = statSync(realPath)
+    } catch {
+      pushCheck(checks, false, 'receipt_artifact_file_present', {
+        path: receiptPath, index, artifact_path: artifactPath,
+      })
+      return { label, path: artifactPath, exists: false }
+    }
+    const safeFile = realRelative !== '..' && !realRelative.startsWith('../') && !isAbsolute(realRelative)
+      && realPath !== receiptRealPath && stats.isFile() && stats.size > 0 && stats.size <= 10 * 1024 * 1024
+    pushCheck(checks, safeFile, 'receipt_artifact_file_present', {
+      path: receiptPath, index, artifact_path: artifactPath, bytes: stats.size,
+    })
+    if (!safeFile) return { label, path: artifactPath, exists: false }
+
+    const bytes = readFileSync(realPath)
+    let secretFindings
+    if (extname(realPath).toLowerCase() === '.json') {
+      try {
+        secretFindings = scanSecrets(JSON.parse(bytes.toString('utf8')))
+      } catch {
+        secretFindings = scanSecrets(bytes.toString('utf8'))
+      }
+    } else {
+      secretFindings = scanSecrets(bytes.toString('utf8'))
+    }
+    pushCheck(checks, secretFindings.length === 0, 'receipt_artifact_has_no_secret_material', {
+      path: receiptPath, index, artifact_path: artifactPath, findings: secretFindings,
+    })
+    return {
+      label,
+      path: artifactPath,
+      exists: true,
+      bytes: stats.size,
+      sha256: fileSha256(realPath),
+    }
+  })
+}
+
 const TRUE_EVIDENCE = new Set([
   'project_active', 'created_by_operator', 'trigger_configured', 'enabled', 'run_observed',
   'correlated_proposal', 'situation_digest_matched', 'human_approval_recorded',
@@ -592,6 +668,7 @@ export function checkBundle(opts = {}) {
     const receipt = readReceiptFile(checks, path, spec.step)
     artifacts[spec.step] = artifactMeta(path, receipt)
     if (!receipt) continue
+    artifacts[spec.step].referenced_artifacts = referencedArtifactMeta(checks, outDir, path, receipt)
     receipts.push({ spec, path, receipt })
     checkReceiptBasics(checks, receipt, path, spec.step)
     const observed = observedAtMs(receipt)

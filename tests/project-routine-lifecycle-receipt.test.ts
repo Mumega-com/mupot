@@ -132,7 +132,7 @@ function baseReceipt(step: string, evidence: Record<string, unknown>, observedAt
     target: TARGET,
     evidence,
     artifacts: [
-      { label: `${step} artifact`, path: `${step}.json` },
+      { label: `${step} artifact`, path: `artifacts/${step}.json` },
     ],
   }
 }
@@ -146,6 +146,7 @@ function writeScreenshots(dir: string) {
 
 function writeBundle(dir: string, mutate?: (receipt: Record<string, unknown>, file: string) => void) {
   mkdirSync(dir, { recursive: true })
+  mkdirSync(join(dir, 'artifacts'), { recursive: true })
   writeScreenshots(dir)
   REQUIRED_STEPS.forEach((spec, index) => {
     const receipt = baseReceipt(
@@ -155,6 +156,7 @@ function writeBundle(dir: string, mutate?: (receipt: Record<string, unknown>, fi
     )
     mutate?.(receipt, spec.file)
     writeFileSync(join(dir, spec.file), JSON.stringify(receipt, null, 2))
+    writeFileSync(join(dir, 'artifacts', `${spec.step}.json`), JSON.stringify({ step: spec.step, verified: true }))
   })
 }
 
@@ -344,6 +346,51 @@ describe('project routine lifecycle receipt checker', () => {
       ok: false,
       check: 'target_field_consistent_across_receipts',
       field: 'commit',
+    }))
+  })
+
+  it('requires each step receipt to declare a real in-bundle artifact', () => {
+    const missingList = tempDir()
+    writeBundle(missingList, (receipt, file) => {
+      if (file === 'manual-fire.json') delete receipt.artifacts
+    })
+    const missingListReceipt = checkBundle({ outDir: missingList, expectedCommit: COMMIT, expectedVersion: VERSION })
+    expect(missingListReceipt.status).toBe('fail')
+    expect(missingListReceipt.checks).toContainEqual(expect.objectContaining({
+      ok: false, check: 'receipt_artifacts_declared', path: join(missingList, 'manual-fire.json'),
+    }))
+
+    const missingFile = tempDir()
+    writeBundle(missingFile, (receipt, file) => {
+      if (file === 'manual-fire.json') {
+        receipt.artifacts = [{ label: 'missing proof', path: 'artifacts/missing.json' }]
+      }
+    })
+    const missingFileReceipt = checkBundle({ outDir: missingFile, expectedCommit: COMMIT, expectedVersion: VERSION })
+    expect(missingFileReceipt.status).toBe('fail')
+    expect(missingFileReceipt.checks).toContainEqual(expect.objectContaining({
+      ok: false, check: 'receipt_artifact_file_present', artifact_path: 'artifacts/missing.json',
+    }))
+  })
+
+  it('rejects artifact path traversal and secret material', () => {
+    const traversal = tempDir()
+    writeBundle(traversal, (receipt, file) => {
+      if (file === 'manual-fire.json') receipt.artifacts = [{ label: 'outside', path: '../outside.json' }]
+    })
+    const traversalReceipt = checkBundle({ outDir: traversal, expectedCommit: COMMIT, expectedVersion: VERSION })
+    expect(traversalReceipt.status).toBe('fail')
+    expect(traversalReceipt.checks).toContainEqual(expect.objectContaining({
+      ok: false, check: 'receipt_artifact_reference_valid', artifact_path: '../outside.json',
+    }))
+
+    const secret = tempDir()
+    writeBundle(secret)
+    writeFileSync(join(secret, 'artifacts', 'manual_fire.json'), JSON.stringify({ authorization: 'Bearer abcdefghijklmnop' }))
+    const secretReceipt = checkBundle({ outDir: secret, expectedCommit: COMMIT, expectedVersion: VERSION })
+    expect(secretReceipt.status).toBe('fail')
+    expect(secretReceipt.checks).toContainEqual(expect.objectContaining({
+      ok: false, check: 'receipt_artifact_has_no_secret_material', artifact_path: 'artifacts/manual_fire.json',
     }))
   })
 
