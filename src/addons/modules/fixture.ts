@@ -11,7 +11,7 @@ export const FixtureAddon: AddonManifestV1 = {
   version: '1.0.0',
   publisher: 'mumega',
   trustClass: 'native_reviewed',
-  mupotCompatibility: '^0.23.0',
+  mupotCompatibility: '^0.24.0',
   kind: 'native',
   description: 'Lifecycle fixture with no authority.',
   departments: [{ moduleKey: FixtureModule.key, required: true }],

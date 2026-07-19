@@ -36,7 +36,7 @@ describe('addon registry', () => {
     await expect(registry.register({
       ...FixtureAddon,
       key: 'incompatible-addon',
-      mupotCompatibility: '^0.24.0',
+      mupotCompatibility: '^0.23.0',
     })).rejects.toThrow('addon_mupot_incompatible')
   })
 

@@ -8,7 +8,7 @@ export const ProjectLinkAddon = Object.freeze<AddonManifestV1>({
   version: '1.0.0',
   publisher: 'mumega',
   trustClass: 'native_reviewed',
-  mupotCompatibility: '^0.23.0',
+  mupotCompatibility: '^0.24.0',
   kind: 'native',
   description: 'Signed, bounded collaboration between sovereign Mupot projects.',
   departments: [],
