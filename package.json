@@ -52,6 +52,7 @@
     "receipt:release-readiness:check": "node scripts/release-readiness-receipt.mjs --check",
     "receipt:kubernetes-agent-host": "node scripts/kubernetes-agent-host-receipt.mjs",
     "receipt:kubernetes-hermes-plugin-smoke": "node scripts/kubernetes-hermes-plugin-smoke-evidence.mjs",
+    "receipt:project-link-flight": "node scripts/project-link-flight-evidence.mjs",
     "activate:kubernetes-agent-host": "node scripts/kubernetes-agent-host-activate.mjs",
     "probe:cutover": "node fleet-runtime/cutover-probe.mjs",
     "fleet:install": "node fleet-runtime/install.mjs",

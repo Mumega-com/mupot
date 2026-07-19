@@ -12,6 +12,21 @@ export type ProjectEvidenceSource =
   | 'message_ack'
   | 'project_link_receipt'
 
+export interface ProjectLinkReceiptProof {
+  schema: 'mupot.project-link-receipt-proof/v1'
+  direction: string
+  shared_receipt_sha256: string
+  envelope_sha256: string
+  evidence_sha256: string | null
+  remote_pot: string
+  remote_project_id: string
+  source_agent_id: string
+  action_type: string
+  action_id: string
+  receipt_key_id: string
+  receipt_signature: string
+}
+
 export interface ProjectProjectionRow<T extends string = string> {
   source_type: T
   source_id: string
@@ -21,6 +36,7 @@ export interface ProjectProjectionRow<T extends string = string> {
   status: string
   actor: string | null
   correlation_id: string | null
+  proof?: ProjectLinkReceiptProof
 }
 
 export interface ProjectProjectionPage<T extends string> {
@@ -597,6 +613,20 @@ export async function listProjectEvidence(
       status: row.status,
       actor: row.source_agent_id,
       correlation_id: row.correlation_id,
+      proof: {
+        schema: 'mupot.project-link-receipt-proof/v1' as const,
+        direction: row.direction,
+        shared_receipt_sha256: row.shared_receipt_sha256,
+        envelope_sha256: row.envelope_sha256,
+        evidence_sha256: row.evidence_sha256,
+        remote_pot: row.remote_pot,
+        remote_project_id: row.remote_project_id,
+        source_agent_id: row.source_agent_id,
+        action_type: row.action_type,
+        action_id: row.action_id,
+        receipt_key_id: row.receipt_key_id,
+        receipt_signature: row.receipt_signature,
+      },
     })),
   ]
   const ordered = newest(rows)

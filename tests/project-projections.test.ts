@@ -294,6 +294,20 @@ describe('project Activity and Evidence projections', () => {
       expect(projection.rows.find((row) => row.source_id === 'link-receipt-a')).toMatchObject({
         source_type: 'project_link_receipt', status: 'accepted', actor: 'dme-agent',
         correlation_id: 'correlation-a',
+        proof: {
+          schema: 'mupot.project-link-receipt-proof/v1',
+          direction: 'inbound',
+          shared_receipt_sha256: 'b'.repeat(64),
+          envelope_sha256: 'a'.repeat(64),
+          evidence_sha256: 'c'.repeat(64),
+          remote_pot: 'dme',
+          remote_project_id: 'dme-project',
+          source_agent_id: 'dme-agent',
+          action_type: 'task',
+          action_id: 'task-a',
+          receipt_key_id: 'remote-key',
+          receipt_signature: 'd'.repeat(86),
+        },
       })
     } finally {
       fixture.close()

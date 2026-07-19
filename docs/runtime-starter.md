@@ -395,6 +395,36 @@ node scripts/kubernetes-agent-host-activate.mjs \
   --output ./receipts/activation.json
 ```
 
+After `activation.json` reports `status:"pass"`, send one governed cross-pot
+evidence flight and retain its correlation ID. Prove the resulting receipt from
+both sovereign project Evidence APIs with independently scoped, read-only token
+files. Never pass either token value as a command argument:
+
+```bash
+npm run --silent receipt:project-link-flight -- \
+  --source-url https://mupot.mumega.com \
+  --source-pot mumega \
+  --source-project REPLACE_WITH_MUMEGA_PROJECT_ID \
+  --source-token-file /run/secrets/mumega-project-reader/token \
+  --destination-url https://REPLACE_WITH_DME_MUPOT_HOST \
+  --destination-pot dme \
+  --destination-project REPLACE_WITH_DME_PROJECT_ID \
+  --destination-token-file /run/secrets/dme-project-reader/token \
+  --correlation REPLACE_WITH_FLIGHT_CORRELATION_ID \
+  --not-before REPLACE_WITH_FLIGHT_DISPATCH_ISO_TIME \
+  --output ./receipts/project-link-flight.json
+```
+
+The live flight is accepted only when `project-link-flight.json` reports
+`schema:"mupot.project-link-flight-evidence/v1"` and `status:"pass"`. The
+verifier follows each project Evidence cursor, requires exactly one outbound
+and one inbound receipt for the correlation, requires a non-null evidence hash,
+rejects receipts older than the declared flight dispatch time or implausibly in
+the future,
+and compares the envelope hash, evidence hash, canonical receipt hash,
+destination key id, and destination signature. The receipt records project
+identifiers and public proof only; bearer values are never copied into it.
+
 Roll back in reverse:
 scale the Host to zero and wait for termination, generate a passing
 `--mode rollback-ready` preflight, CAS the inbox consumer from `signed_only` to
