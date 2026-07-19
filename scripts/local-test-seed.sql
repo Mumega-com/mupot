@@ -372,3 +372,28 @@ VALUES ('ca-local-github', 'conn-local-github', 'local', 'add', 'usr-local-owner
 
 INSERT OR REPLACE INTO github_installations (tenant, installation_id, account_login, installed_at, updated_at)
 VALUES ('local', '123456789', 'Mumega-com', datetime('now','-1 hour'), datetime('now','-1 hour'));
+
+-- v0.25 Project Routines local seed (propose-mode smoke)
+INSERT OR REPLACE INTO routines (
+  id, tenant, project_id, name, objective, status, trigger_kind,
+  cron_expression, timezone, next_run_at, overlap_policy, execution_mode,
+  responsible_squad_id, preferred_agent_id, budget_micro_usd, max_attempts,
+  retry_backoff_seconds, revision, enabled_by, enabled_at, created_by, created_at, updated_at
+) VALUES (
+  'routine-local-propose', 'local', 'project-mupot', 'Local propose check',
+  'Choose one accountable next action for local smoke.',
+  'enabled', 'manual', NULL, 'UTC', NULL, 'skip', 'propose',
+  'sq-growth', 'agent-hermes', 100000, 3, 300, 1,
+  'usr-local-owner', datetime('now'), 'usr-local-owner', datetime('now'), datetime('now')
+);
+
+INSERT OR REPLACE INTO routine_runs (
+  id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key,
+  trigger_kind, status, attempt, assigned_agent_id, cost_micro_usd, created_at, updated_at
+) VALUES (
+  'run-local-waiting', 'local', 'project-mupot', 'routine-local-propose', 1,
+  '{"execution_mode":"propose","overlap_policy":"skip","responsible_squad_id":"sq-growth","preferred_agent_id":"agent-hermes","budget_micro_usd":100000,"max_attempts":3,"retry_backoff_seconds":300}',
+  'manual:local-smoke', 'manual', 'waiting', 1, 'agent-hermes', 0, datetime('now'), datetime('now')
+);
+
+UPDATE routine_runs SET waiting_reason = 'review' WHERE id = 'run-local-waiting';

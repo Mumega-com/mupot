@@ -250,8 +250,8 @@ async function runProjectWorkspaceWorkflow() {
   }
 
   const primaryNavigation = await page.locator('#app-nav > a.nav-link .nav-label').allInnerTexts()
-  const expectedPrimaryNavigation = ['Home', 'Projects', 'Work', 'Approvals']
-  if (JSON.stringify(primaryNavigation.slice(0, 4)) !== JSON.stringify(expectedPrimaryNavigation)) {
+  const expectedPrimaryNavigation = ['Home', 'Projects', 'Work', 'Needs You', 'Approvals']
+  if (JSON.stringify(primaryNavigation.slice(0, 5)) !== JSON.stringify(expectedPrimaryNavigation)) {
     fail('primary navigation order changed', { primaryNavigation, expectedPrimaryNavigation })
   }
 
@@ -264,6 +264,16 @@ async function runProjectWorkspaceWorkflow() {
   const detailText = await textSnippet(page.locator('body'), 6000)
   if (!detailText.includes('Mupot') || !detailText.includes('Mumega Products')) {
     fail('Mupot project detail did not render project and parent context', { detailText })
+  }
+  await page.goto(`${baseUrl}/projects/project-mupot/routines`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const routinesText = await textSnippet(page.locator('body'), 6000)
+  if (!routinesText.includes('Project routines') || !routinesText.includes('Local propose check')) {
+    fail('Project Routines workspace missing seeded Routine', { routinesText })
+  }
+  await page.goto(`${baseUrl}/needs-you`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const needsYouText = await textSnippet(page.locator('body'), 4000)
+  if (!needsYouText.includes('Needs You')) {
+    fail('Needs You page did not render', { needsYouText })
   }
   for (const href of ['/send?project_id=project-mupot', '/flights?project_id=project-mupot']) {
     if (await page.locator(`a[href="${href}"]`).count() === 0) {
