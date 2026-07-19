@@ -4,7 +4,7 @@
 
 import { describe, it, expect, vi } from 'vitest'
 import { createHash } from 'node:crypto'
-import type { Env } from '../src/types'
+import type { Env, CapabilityGrant } from '../src/types'
 
 // Mock the member-token auth so we drive the caller's weld directly.
 vi.mock('../src/auth/member-bearer', () => ({
@@ -32,6 +32,9 @@ function makeDb(
   keys: Record<string, KeyRow> = {},
   memberStatuses: Record<string, string> = {},
   signedOnlyAgents: ReadonlySet<string> = new Set(),
+  // Gate 1 (#392) fixtures: member -> capability grants, and squad -> department_id.
+  capabilityGrants: Record<string, CapabilityGrant[]> = {},
+  squadDepartments: Record<string, string | null> = {},
 ) {
   const messages: MsgRow[] = []
   const nonces = new Set<string>()
@@ -91,9 +94,18 @@ function makeDb(
       const [tenant, agentId] = b as [string, string]
       return keys[`${tenant}:${agentId}`] ?? null
     }
+    if (sql.includes('SELECT department_id FROM squads WHERE id = ?1')) {
+      const [squadId] = b as [string]
+      const dept = squadDepartments[squadId]
+      return dept === undefined ? null : { department_id: dept }
+    }
     throw new Error('unhandled first: ' + sql)
   }
   function runAll(sql: string, b: unknown[]) {
+    if (sql.includes('FROM capabilities') && sql.includes('channel_capability_grants')) {
+      const [memberId] = b as [string]
+      return capabilityGrants[memberId] ?? []
+    }
     if (sql.includes('UPDATE agent_messages SET read_at')) {
       const [readAt, tenant, to_agent, limit] = b as [string, string, string, number]
       const effectiveMode = signedOnlyAgents.has(to_agent) ? 'signed_only' : 'bearer_only'
@@ -152,8 +164,10 @@ function env(
   keys: Record<string, KeyRow> = {},
   memberStatuses: Record<string, string> = {},
   signedOnlyAgents: ReadonlySet<string> = new Set(),
+  capabilityGrants: Record<string, CapabilityGrant[]> = {},
+  squadDepartments: Record<string, string | null> = {},
 ): { env: Env; db: ReturnType<typeof makeDb> } {
-  const db = makeDb(agents, keys, memberStatuses, signedOnlyAgents)
+  const db = makeDb(agents, keys, memberStatuses, signedOnlyAgents, capabilityGrants, squadDepartments)
   return { env: { TENANT_SLUG: 't', DB: db } as unknown as Env, db }
 }
 
@@ -264,13 +278,21 @@ describe('GET /api/inbox', () => {
   })
 })
 
+// Gate 1 (#392): m-code (tok-code's welded member) needs a squad-scoped observer grant on
+// 's1' (both ag-code and ag-review live there) to reach ag-review under the new confinement —
+// see the dedicated 'POST /api/inbox/send — gate 1' describe block below for the confinement
+// cases themselves.
+const M_CODE_OBSERVES_S1: Record<string, CapabilityGrant[]> = {
+  'm-code': [{ member_id: 'm-code', scope_type: 'squad', scope_id: 's1', capability: 'observer' }],
+}
+
 describe('POST /api/inbox/send', () => {
   it('unbound token → 403', async () => {
     const { env: e } = env(AGENTS)
     expect((await inboxApp.fetch(postReq('tok-unbound', { to: 'review', body: 'x' }), e)).status).toBe(403)
   })
   it('happy: code → review lands in review’s inbox', async () => {
-    const { env: e, db } = env(AGENTS)
+    const { env: e, db } = env(AGENTS, {}, {}, new Set(), M_CODE_OBSERVES_S1)
     const res = await inboxApp.fetch(postReq('tok-code', { to: 'review', body: 'build it' }), e)
     expect(res.status).toBe(200)
     const j = (await res.json()) as { ok: boolean; to: string }
@@ -279,7 +301,7 @@ describe('POST /api/inbox/send', () => {
     expect(db._messages[0].to_agent).toBe('ag-review')
   })
   it('unknown recipient → 404', async () => {
-    const { env: e } = env(AGENTS)
+    const { env: e } = env(AGENTS, {}, {}, new Set(), M_CODE_OBSERVES_S1)
     expect((await inboxApp.fetch(postReq('tok-code', { to: 'ghost', body: 'x' }), e)).status).toBe(404)
   })
   it('missing body → 400', async () => {
@@ -290,6 +312,52 @@ describe('POST /api/inbox/send', () => {
     const { env: e } = env(AGENTS)
     const raw = JSON.stringify({ to: 'review', body: 'x'.repeat(9000) })
     expect((await inboxApp.fetch(postReq('tok-code', undefined, raw), e)).status).toBe(413)
+  })
+})
+
+// Gate 1 (#392): confine the welded-token send TARGET. ag-review lives on a DIFFERENT squad
+// here (s2) than ag-code (s1), so — unlike the AGENTS fixture above — a plain member grant on
+// ag-code's own squad does NOT make ag-review visible.
+const CROSS_SQUAD_AGENTS = [
+  { id: 'ag-code', squad_id: 's1', slug: 'code', name: 'Code' },
+  { id: 'ag-review', squad_id: 's2', slug: 'review', name: 'Review' },
+]
+
+describe('POST /api/inbox/send — gate 1 target confinement', () => {
+  it('a welded token with NO capability grants cannot reach an agent on another squad → 404, generic reason', async () => {
+    const { env: e } = env(CROSS_SQUAD_AGENTS)
+    const res = await inboxApp.fetch(postReq('tok-code', { to: 'review', body: 'x' }), e)
+    expect(res.status).toBe(404)
+    expect(await res.json()).toMatchObject({ error: 'send_target_not_visible' })
+  })
+
+  it('the same generic reason covers BOTH an invisible target and a nonexistent one (non-leaking)', async () => {
+    const { env: e } = env(CROSS_SQUAD_AGENTS)
+    const invisible = await inboxApp.fetch(postReq('tok-code', { to: 'review', body: 'x' }), e)
+    const missing = await inboxApp.fetch(postReq('tok-code', { to: 'ghost', body: 'x' }), e)
+    expect(invisible.status).toBe(missing.status)
+    expect(await invisible.json()).toMatchObject({ error: 'send_target_not_visible' })
+    expect(await missing.json()).toMatchObject({ error: 'send_target_not_visible' })
+  })
+
+  it('an observer grant on the TARGET squad opens the send', async () => {
+    const grants: Record<string, CapabilityGrant[]> = {
+      'm-code': [{ member_id: 'm-code', scope_type: 'squad', scope_id: 's2', capability: 'observer' }],
+    }
+    const { env: e, db } = env(CROSS_SQUAD_AGENTS, {}, {}, new Set(), grants)
+    const res = await inboxApp.fetch(postReq('tok-code', { to: 'review', body: 'reachable now' }), e)
+    expect(res.status).toBe(200)
+    expect(db._messages[0].to_agent).toBe('ag-review')
+  })
+
+  it('an org-admin grant preserves tenant-wide send (no squad grant needed)', async () => {
+    const grants: Record<string, CapabilityGrant[]> = {
+      'm-code': [{ member_id: 'm-code', scope_type: 'org', scope_id: null, capability: 'admin' }],
+    }
+    const { env: e, db } = env(CROSS_SQUAD_AGENTS, {}, {}, new Set(), grants)
+    const res = await inboxApp.fetch(postReq('tok-code', { to: 'review', body: 'admin can reach anyone' }), e)
+    expect(res.status).toBe(200)
+    expect(db._messages[0].to_agent).toBe('ag-review')
   })
 })
 

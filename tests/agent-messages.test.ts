@@ -5,7 +5,7 @@
 import { describe, it, expect } from 'vitest'
 import { sendAgentMessage, readAgentInbox } from '../src/agents/messages'
 import { TOOLS } from '../src/mcp/index'
-import type { Env, AuthContext } from '../src/types'
+import type { Env, AuthContext, CapabilityGrant } from '../src/types'
 
 // ── faithful in-memory D1 ─────────────────────────────────────────────────────────────────
 interface MsgRow {
@@ -31,6 +31,8 @@ function makeDb(
     missDedupCalls?: number
     signedOnlyAgents?: string[]
     activeKeyAgents?: string[]
+    /** squad_id -> department_id, for canOnSquad's department-inheritance lookup (gate 1). */
+    squadDepartments?: Record<string, string | null>
   } = {},
 ) {
   const messages: MsgRow[] = []
@@ -125,6 +127,11 @@ function makeDb(
     if (sql.includes('FROM agents WHERE id = ?1 LIMIT 1')) {
       const [ref] = b as [string]
       return agents.find((a) => a.id === ref) ?? null
+    }
+    if (sql.includes('SELECT department_id FROM squads WHERE id = ?1')) {
+      const [squadId] = b as [string]
+      const dept = (opts.squadDepartments ?? {})[squadId]
+      return dept === undefined ? null : { department_id: dept }
     }
     throw new Error('unhandled first sql: ' + sql)
   }
@@ -466,9 +473,14 @@ const toolInboxFenceSet = TOOLS.find((t) => t.name === 'set_agent_inbox_consumer
 const toolInboxFenceStatus = TOOLS.find((t) => t.name === 'inbox_consumer_status')!
 const CTX = { origin: 'https://pot.test' }
 
-function auth(boundAgentId: string | null): AuthContext {
-  return { userId: 'u1', email: 'a@b.com', role: 'member', tenant: 't', memberId: 'm1', capabilities: [], boundAgentId } as AuthContext
+function auth(boundAgentId: string | null, capabilities: CapabilityGrant[] = []): AuthContext {
+  return { userId: 'u1', email: 'a@b.com', role: 'member', tenant: 't', memberId: 'm1', capabilities, boundAgentId } as AuthContext
 }
+
+// Gate 1 (#392): a squad-scoped observer grant, the minimum that makes a target agent on that
+// squad VISIBLE to a non-admin sender's `send`. Squad 's1' is ag-review's squad throughout
+// this file's fixtures.
+const OBSERVES_S1: CapabilityGrant[] = [{ member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'observer' }]
 
 function ownerAuth(): AuthContext {
   return { userId: 'owner', email: 'owner@example.com', role: 'owner', tenant: 't', memberId: 'owner-member', boundAgentId: null } as AuthContext
@@ -501,7 +513,7 @@ describe('send / inbox tools', () => {
 
   it('send: happy path resolves recipient + persists', async () => {
     const db = makeDb({ agents, activeKeyAgents: ['ag-review'] })
-    const r = await toolSend.run(auth('ag-code'), envWith(db), { to: 'review', body: 'build it' }, CTX)
+    const r = await toolSend.run(auth('ag-code', OBSERVES_S1), envWith(db), { to: 'review', body: 'build it' }, CTX)
     expect(r.ok).toBe(true)
     if (!r.ok) return
     expect((r.result as { to: string }).to).toBe('ag-review')
@@ -518,7 +530,7 @@ describe('send / inbox tools', () => {
   it('inbox: caller reads its OWN welded inbox', async () => {
     const db = makeDb({ agents })
     const env = envWith(db)
-    await toolSend.run(auth('ag-code'), env, { to: 'review', body: 'for review' }, CTX)
+    await toolSend.run(auth('ag-code', OBSERVES_S1), env, { to: 'review', body: 'for review' }, CTX)
     const r = await toolInbox.run(auth('ag-review'), env, {}, CTX)
     expect(r.ok).toBe(true)
     if (!r.ok) return
@@ -530,7 +542,7 @@ describe('send / inbox tools', () => {
   it('workspace admin fences one agent to signed-only and can reopen it', async () => {
     const db = makeDb({ agents, activeKeyAgents: ['ag-review'] })
     const env = envWith(db)
-    await toolSend.run(auth('ag-code'), env, { to: 'review', body: 'fenced task' }, CTX)
+    await toolSend.run(auth('ag-code', OBSERVES_S1), env, { to: 'review', body: 'fenced task' }, CTX)
 
     const fenced = await toolInboxFenceSet.run(ownerAuth(), env, {
       agent: 'review', mode: 'signed_only', expected_generation: 0, reason: 'activate Kubernetes Host',
