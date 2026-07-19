@@ -114,7 +114,7 @@ expect(routineOccurrenceKey(routine, new Date('2026-11-01T05:30:00.000Z')))
 - Produces `createRoutine`, `updateRoutine`, `enableRoutine`, `pauseRoutine`, `archiveRoutine`, `getRoutine`, `listRoutines`, `createManualRoutineRun`, `getRoutineRun`, and `listRoutineRuns`.
 - All mutation functions require an explicit principal and return a stable `RoutineMutationResult<T>` rather than throwing domain errors.
 
-- [ ] **Step 1: Write service tests for tenant isolation, hidden unreadable Projects, admin-only policy mutation, writable-squad manual runs, inactive Projects, revision increments, immutable run snapshots, pagination caps, and idempotent manual runs.**
+- [x] **Step 1: Write service tests for tenant isolation, hidden unreadable Projects, admin-only policy mutation, writable-squad manual runs, inactive Projects, revision increments, immutable run snapshots, pagination caps, and idempotent manual runs.**
 
 ```ts
 const first = await createManualRoutineRun(env, principal, routineId, 'manual-key-1')
@@ -123,11 +123,11 @@ expect(replay).toEqual(first)
 expect(await getRoutine(otherTenantEnv, principal, routineId)).toBeNull()
 ```
 
-- [ ] **Step 2: Run `npx vitest run tests/routines-service.test.ts` and verify import failure.**
-- [ ] **Step 3: Implement shared access checks using `projectReadAccessFromGrants`, `projectVisibilityClause`, `hasCapability`, and `project_squad_access`; do not duplicate runtime permission logic.**
-- [ ] **Step 4: Implement strict field validation, policy snapshots, state transitions, audit fields, and bounded keyset reads.**
-- [ ] **Step 5: Run the focused tests and typecheck.**
-- [ ] **Step 6: Commit with `git commit -m "feat: add governed routine policy service"`.**
+- [x] **Step 2: Run `npx vitest run tests/routines-service.test.ts` and verify import failure.**
+- [x] **Step 3: Implement shared access checks using `projectReadAccessFromGrants`, `projectVisibilityClause`, `hasCapability`, and `project_squad_access`; do not duplicate runtime permission logic.**
+- [x] **Step 4: Implement strict field validation, policy snapshots, state transitions, audit fields, and bounded keyset reads.**
+- [x] **Step 5: Run the focused tests and typecheck.**
+- [x] **Step 6: Commit with `git commit -m "feat: add governed routine policy service"`.**
 
 ### Task 4: Atomic Scheduler, Leases, and Recovery
 

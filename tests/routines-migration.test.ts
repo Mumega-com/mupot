@@ -131,6 +131,16 @@ describe('0061_project_routines migration', () => {
         .toThrow(/routine run ownership immutable/)
       expect(() => sqlite.exec(`UPDATE routine_runs SET status = 'running', waiting_reason = 'agent' WHERE id = 'run-1'`))
         .toThrow(/CHECK constraint/)
+      sqlite.exec(`UPDATE routines SET max_occurrences = 1 WHERE id = 'routine-1'`)
+      expect(() => sqlite.exec(`
+        INSERT INTO routine_runs (
+          id, tenant, project_id, routine_id, routine_revision, policy_json,
+          occurrence_key, trigger_kind, status
+        ) VALUES (
+          'run-over-cap', 'tenant-a', 'project-a', 'routine-1', 1, '{}',
+          'manual:over-cap', 'manual', 'queued'
+        )
+      `)).toThrow(/routine schedule exhausted/)
     } finally {
       close()
     }

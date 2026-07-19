@@ -238,6 +238,18 @@ BEGIN
          AND project_id = NEW.project_id
          AND revision = NEW.routine_revision
     );
+  SELECT RAISE(ABORT, 'routine schedule exhausted')
+    WHERE EXISTS (
+      SELECT 1 FROM routines
+       WHERE id = NEW.routine_id
+         AND (
+           (max_occurrences IS NOT NULL AND max_occurrences <= (
+             SELECT COUNT(*) FROM routine_runs
+              WHERE tenant = NEW.tenant AND routine_id = NEW.routine_id
+           ))
+           OR (stop_at IS NOT NULL AND julianday(COALESCE(NEW.scheduled_for, NEW.created_at)) >= julianday(stop_at))
+         )
+    );
 END;
 
 CREATE TRIGGER routine_run_ownership_immutable

@@ -42,12 +42,14 @@ function validTimezone(timezone: string): boolean {
   }
 }
 
-function validInstant(value: string): boolean {
+function validInstant(value: unknown): value is string {
+  if (typeof value !== 'string') return false
   const parsed = new Date(value)
   return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value
 }
 
-function cronFor(expression: string): Cron | null {
+function cronFor(expression: unknown): Cron | null {
+  if (typeof expression !== 'string') return null
   if (expression.trim() !== expression || expression.startsWith('@')) return null
   if (expression.split(/\s+/).length !== 5) return null
   try {
