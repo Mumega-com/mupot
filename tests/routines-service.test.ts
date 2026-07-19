@@ -74,6 +74,14 @@ function observer() {
   return routinePrincipal({ ...auth([observerGrant]), memberId: 'member-2', userId: 'user-2' })
 }
 
+function agentAdmin() {
+  return {
+    tenant: 'tenant-a', actor_type: 'agent' as const, actor_id: 'agent-1', workspace_admin: true,
+    grants: [{ member_id: 'member-1', scope_type: 'org' as const, scope_id: null, capability: 'admin' as const }],
+    project_read: { workspaceAdmin: true, orgRead: true, squadIds: [], departmentIds: [] },
+  }
+}
+
 const manualInput = {
   project_id: 'project-a',
   name: 'Keep momentum',
@@ -110,6 +118,21 @@ describe('routine policy service', () => {
     expect(await archiveRoutine(env, owner(), created.value.id)).toMatchObject({
       ok: true, value: { status: 'archived', revision: 4 },
     })
+  })
+
+  it('rejects an agent-bound workspace administrator from every policy lifecycle mutation', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    expect(await createRoutine(env, agentAdmin(), manualInput)).toEqual({ ok: false, error: 'forbidden' })
+    const created = await createRoutine(env, owner(), manualInput)
+    if (!created.ok) throw new Error(created.error)
+    await expect(updateRoutine(env, agentAdmin(), created.value.id, { name: 'Agent edit' }))
+      .resolves.toEqual({ ok: false, error: 'forbidden' })
+    await expect(enableRoutine(env, agentAdmin(), created.value.id)).resolves.toEqual({ ok: false, error: 'forbidden' })
+    const enabled = await enableRoutine(env, owner(), created.value.id)
+    if (!enabled.ok) throw new Error(enabled.error)
+    await expect(pauseRoutine(env, agentAdmin(), created.value.id)).resolves.toEqual({ ok: false, error: 'forbidden' })
+    await expect(archiveRoutine(env, agentAdmin(), created.value.id)).resolves.toEqual({ ok: false, error: 'forbidden' })
   })
 
   it('hides routines outside tenant and Project readability', async () => {

@@ -98,7 +98,8 @@ CREATE TABLE IF NOT EXISTS routine_run_events (
                     'created','leased','observed','dispatched','agent_waiting',
                     'proposal_received','approval_requested','action_started',
                     'action_completed','retry_scheduled','budget_blocked','skipped',
-                    'cancelled','failed','succeeded'
+                    'cancelled','cancellation_requested','cancellation_confirmed',
+                    'cancellation_unconfirmed','failed','succeeded'
                   )),
   actor_type      TEXT NOT NULL CHECK (actor_type IN ('system','member','agent')),
   actor_id        TEXT NOT NULL CHECK (length(trim(actor_id)) BETWEEN 1 AND 200),

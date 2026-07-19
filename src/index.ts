@@ -67,7 +67,7 @@ export { TaskWorkflow } from './workflows/task-workflow'
 // OAuth API handler WorkerEntrypoint — referenced by the OAuthProvider's apiHandler.
 export { McpOAuthApiHandler }
 
-const app = new Hono<{ Bindings: Env }>()
+export const app = new Hono<{ Bindings: Env }>()
 
 app.get('/health', (c) => c.json(publicHealth(c.env.TENANT_SLUG, c.env.RELEASE_SHA)))
 
@@ -75,6 +75,10 @@ app.route(ROUTES.auth, authApp)
 app.route(ROUTES.org, orgApp)
 app.route(ROUTES.agents, agentsApp)
 app.route(ROUTES.tasks, tasksApp)
+// Exact Project Routine and Needs You endpoints must precede the Projects
+// wildcard middleware so session and member-bearer auth select here first.
+app.route('/api', routinesApp)
+app.route('/api', attentionApp)
 app.route(ROUTES.projects, projectsApp)
 // K3: gate grant management (owner/admin only)
 app.route('/api/gates', gatesApp)
@@ -150,11 +154,6 @@ app.route('/api/addons', addonsApp)
 // Signed cross-pot project delivery. Authentication is the paired Ed25519 link;
 // every accepted action is reauthorized against this pot's project/squad edge.
 app.route('/api/project-links', projectLinkApp)
-
-// Project Routines and the derived Needs You projection. Both are control-plane
-// surfaces and must win over the dashboard catch-all below.
-app.route('/api', routinesApp)
-app.route('/api', attentionApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp

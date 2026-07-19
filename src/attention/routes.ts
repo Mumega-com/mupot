@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import type { AuthContext, Env } from '../types'
 import { listNeedsYou } from './service'
 import { principalCanReadProject, routinePrincipal } from '../routines/access'
-import { noStore, routineAuth } from '../routines/routes'
+import { routineEndpoint } from '../routines/routes'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -23,10 +23,7 @@ function pagination(c: { req: { query: (key: string) => string | undefined } }):
 
 export const attentionApp = new Hono<AppEnv>()
 
-attentionApp.use('*', noStore)
-attentionApp.use('*', routineAuth)
-
-attentionApp.get('/needs-you', async (c) => {
+attentionApp.get('/needs-you', routineEndpoint, async (c) => {
   const options = pagination(c)
   if (!options) return c.json({ error: 'invalid_pagination' }, 400)
   try {
@@ -36,7 +33,7 @@ attentionApp.get('/needs-you', async (c) => {
   }
 })
 
-attentionApp.get('/projects/:projectId/needs-you', async (c) => {
+attentionApp.get('/projects/:projectId/needs-you', routineEndpoint, async (c) => {
   const projectId = c.req.param('projectId')
   const options = pagination(c)
   if (!validId(projectId) || !options) return c.json({ error: !options ? 'invalid_pagination' : 'project_not_found' }, !options ? 400 : 404)

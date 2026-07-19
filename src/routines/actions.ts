@@ -3,7 +3,7 @@ import { canonicalJson, canonicalJsonDigest, sha256Hex } from '../lib/canonical-
 import { loadProjectSituation } from '../projects/situation'
 import { dispatchFlight } from '../flight/dispatch'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, type FlightMetaV1 } from '../flight/meta'
-import { getFlight, landGovernedFlight } from '../flight/service'
+import { failFlight, getFlight, landGovernedFlight } from '../flight/service'
 import {
   assertCompletableDoneWhen,
   checkTransition,
@@ -53,7 +53,7 @@ export type RoutineActionResult =
   | { ok: false; error: ActionError }
 
 export type RoutineCancellationResult =
-  | { ok: true; run_id: string; duplicate: boolean }
+  | { ok: true; run_id: string; duplicate: boolean; outcome: 'confirmed' | 'unconfirmed' }
   | { ok: false; error: 'run_not_found' | 'forbidden' | 'run_terminal' | 'receipt_failed' }
 
 interface RunContext {
@@ -160,6 +160,19 @@ async function loadAction(env: Env, runId: string, actionKey: string): Promise<A
             receipt_id, result_json
        FROM routine_run_actions WHERE run_id = ? AND action_key = ? AND tenant = ?`,
   ).bind(runId, actionKey, env.TENANT_SLUG).first<ActionRow>()
+}
+
+async function cancellationPending(env: Env, runId: string, tenant: string): Promise<boolean> {
+  const event = await env.DB.prepare(
+    `SELECT 1 FROM routine_run_events requested
+      WHERE requested.run_id = ? AND requested.tenant = ? AND requested.kind = 'cancellation_requested'
+        AND NOT EXISTS (
+          SELECT 1 FROM routine_run_events outcome
+           WHERE outcome.run_id = requested.run_id AND outcome.tenant = requested.tenant
+             AND outcome.kind IN ('cancellation_confirmed','cancellation_unconfirmed')
+        ) LIMIT 1`,
+  ).bind(runId, tenant).first()
+  return event !== null
 }
 
 async function deterministicUuid(namespace: string, value: string): Promise<string> {
@@ -717,6 +730,37 @@ async function landControlFlight(env: Env, run: RunContext): Promise<void> {
   if (existing?.status !== 'landed' || !outbox) throw new Error('routine control Flight could not land')
 }
 
+async function cancelControlTask(env: Env, run: Pick<RunContext, 'task_id' | 'project_id'>): Promise<boolean> {
+  if (!run.task_id) return true
+  let task = await loadTask(env, run.task_id)
+  if (!task || task.project_id !== run.project_id) return false
+  if (task.status === 'blocked' || task.status === 'done') return true
+  if (checkTransition(task.status, 'blocked')) return false
+  const existing = task
+  task = { ...task, status: 'blocked', result: 'Routine cancelled by operator.' }
+  stampTaskUpdate(task, existing.status, new Date().toISOString())
+  try {
+    await persistTaskUpdate(env, existing, task)
+  } catch (error) {
+    if (!(error instanceof TaskUpdateConflictError)) throw error
+    const raced = await loadTask(env, run.task_id)
+    return raced?.status === 'blocked' || raced?.status === 'done'
+  }
+  await emitTaskEvent(env, 'task.updated', task, { kind: 'member', id: ROUTINE_ACTOR })
+  return true
+}
+
+async function cancelControlFlight(env: Env, run: Pick<RunContext, 'flight_id' | 'project_id'>): Promise<boolean> {
+  if (!run.flight_id) return true
+  const flight = await getFlight(env, run.flight_id)
+  if (!flight || flight.project_id !== run.project_id) return false
+  if (flight.status === 'failed' || flight.status === 'held') return true
+  if (flight.status === 'landed') return false
+  await failFlight(env, flight.id, 'routine_cancelled')
+  const current = await getFlight(env, flight.id)
+  return current?.status === 'failed'
+}
+
 function storedActionResult(run: RunContext, action: ActionRow, duplicate: boolean): RoutineActionResult | null {
   if (action.status === 'succeeded' && action.result_json) {
     return {
@@ -944,6 +988,7 @@ export async function executeRoutineAction(
 ): Promise<RoutineActionResult> {
   const run = await loadRun(env, runId)
   if (!run) return { ok: false, error: 'run_not_found' }
+  if (await cancellationPending(env, run.id, run.tenant)) return { ok: false, error: 'receipt_failed' }
   const policy = parsePolicy(run.policy_json)
   if (!policy) return { ok: false, error: 'invalid_policy' }
   let action = await loadAction(env, run.id, actionKey)
@@ -1133,31 +1178,61 @@ export async function cancelRoutineRun(
   if (principal.tenant !== env.TENANT_SLUG) return { ok: false, error: 'run_not_found' }
   const visibility = projectVisibilityClause(principal.project_read)
   const run = await env.DB.prepare(
-    `SELECT rr.id, rr.tenant, rr.project_id, rr.status
+    `SELECT rr.id, rr.tenant, rr.project_id, rr.status, rr.task_id, rr.flight_id
        FROM routine_runs rr JOIN projects p ON p.id = rr.project_id
       WHERE rr.id = ? AND rr.tenant = ? AND ${visibility.sql}`,
   ).bind(runId, env.TENANT_SLUG, ...visibility.binds).first<{
-    id: string; tenant: string; project_id: string; status: string
+    id: string; tenant: string; project_id: string; status: string; task_id: string | null; flight_id: string | null
   }>()
   if (!run) return { ok: false, error: 'run_not_found' }
   if (principal.actor_type !== 'member' || !principal.workspace_admin) return { ok: false, error: 'forbidden' }
-  if (run.status === 'cancelled') {
+  if (run.status === 'cancelled' || run.status === 'failed') {
+    const outcome = run.status === 'cancelled' ? 'confirmed' : 'unconfirmed'
     const event = await env.DB.prepare(
-      "SELECT 1 FROM routine_run_events WHERE run_id = ? AND tenant = ? AND kind = 'cancelled' LIMIT 1",
-    ).bind(run.id, run.tenant).first()
-    return event ? { ok: true, run_id: run.id, duplicate: true } : { ok: false, error: 'receipt_failed' }
+      'SELECT 1 FROM routine_run_events WHERE run_id = ? AND tenant = ? AND kind = ? LIMIT 1',
+    ).bind(run.id, run.tenant, `cancellation_${outcome}`).first()
+    if (event) return { ok: true, run_id: run.id, duplicate: true, outcome }
+    if (run.status === 'cancelled') return { ok: false, error: 'receipt_failed' }
   }
   if (['succeeded', 'failed', 'skipped'].includes(run.status)) return { ok: false, error: 'run_terminal' }
 
   const now = new Date().toISOString()
+  const requested = await env.DB.prepare(
+    `INSERT INTO routine_run_events (
+       id, tenant, project_id, run_id, kind, actor_type, actor_id, occurred_at, metadata_json, correlation_id
+     ) SELECT ?, tenant, project_id, id, 'cancellation_requested', ?, ?, ?, ?, id
+         FROM routine_runs
+        WHERE id = ? AND tenant = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM routine_run_events e WHERE e.run_id = routine_runs.id AND e.kind = 'cancellation_requested'
+          )`,
+  ).bind(
+    crypto.randomUUID(), principal.actor_type, principal.actor_id, now,
+    JSON.stringify({ reason: 'operator_cancelled' }), run.id, run.tenant,
+  ).run()
+  if (!wrote(requested)) {
+    const existing = await env.DB.prepare(
+      "SELECT kind FROM routine_run_events WHERE run_id = ? AND tenant = ? AND kind IN ('cancellation_confirmed','cancellation_unconfirmed') LIMIT 1",
+    ).bind(run.id, run.tenant).first<{ kind: 'cancellation_confirmed' | 'cancellation_unconfirmed' }>()
+    if (existing) return { ok: true, run_id: run.id, duplicate: true, outcome: existing.kind === 'cancellation_confirmed' ? 'confirmed' : 'unconfirmed' }
+    return { ok: false, error: 'receipt_failed' }
+  }
+
+  const runningAction = await env.DB.prepare(
+    "SELECT 1 FROM routine_run_actions WHERE run_id = ? AND tenant = ? AND status = 'running' LIMIT 1",
+  ).bind(run.id, run.tenant).first()
+  const taskConfirmed = await cancelControlTask(env, run)
+  const flightConfirmed = await cancelControlFlight(env, run)
+  const outcome = runningAction === null && taskConfirmed && flightConfirmed ? 'confirmed' : 'unconfirmed'
+  const terminalStatus = outcome === 'confirmed' ? 'cancelled' : 'failed'
   const outcomes = await env.DB.batch([
     env.DB.prepare(
       `UPDATE routine_runs
-          SET status = 'cancelled', waiting_reason = NULL, lease_owner = NULL, lease_expires_at = NULL,
-              retry_at = NULL, result_summary = 'cancelled_by_operator', finished_at = ?, updated_at = ?
+          SET status = ?, waiting_reason = NULL, lease_owner = NULL, lease_expires_at = NULL,
+              retry_at = NULL, result_summary = ?, finished_at = ?, updated_at = ?
         WHERE id = ? AND tenant = ?
           AND status IN ('queued','leased','observing','waiting','running')`,
-    ).bind(now, now, run.id, run.tenant),
+    ).bind(terminalStatus, `cancellation_${outcome}`, now, now, run.id, run.tenant),
     env.DB.prepare(
       `UPDATE routine_run_actions
           SET status = 'cancelled', updated_at = ?
@@ -1166,26 +1241,28 @@ export async function cancelRoutineRun(
     env.DB.prepare(
       `INSERT INTO routine_run_events (
          id, tenant, project_id, run_id, kind, actor_type, actor_id, occurred_at, metadata_json, correlation_id
-       ) SELECT ?, tenant, project_id, id, 'cancelled', ?, ?, ?, ?, id
+       ) SELECT ?, tenant, project_id, id, ?, ?, ?, ?, ?, id
            FROM routine_runs
-          WHERE id = ? AND tenant = ? AND status = 'cancelled' AND finished_at = ?
+          WHERE id = ? AND tenant = ? AND status = ? AND finished_at = ?
             AND NOT EXISTS (
-              SELECT 1 FROM routine_run_events e WHERE e.run_id = routine_runs.id AND e.kind = 'cancelled'
+              SELECT 1 FROM routine_run_events e WHERE e.run_id = routine_runs.id AND e.kind = ?
             )`,
     ).bind(
-      crypto.randomUUID(), principal.actor_type, principal.actor_id, now,
-      JSON.stringify({ reason: 'operator_cancelled' }), run.id, run.tenant, now,
+      crypto.randomUUID(), `cancellation_${outcome}`, principal.actor_type, principal.actor_id, now,
+      JSON.stringify({ reason: 'operator_cancelled', task_confirmed: taskConfirmed, flight_confirmed: flightConfirmed, action_claimed: runningAction !== null }),
+      run.id, run.tenant, terminalStatus, now, `cancellation_${outcome}`,
     ),
   ])
-  if (wrote(outcomes[0]) && wrote(outcomes[2])) return { ok: true, run_id: run.id, duplicate: false }
+  if (wrote(outcomes[0]) && wrote(outcomes[2])) return { ok: true, run_id: run.id, duplicate: false, outcome }
 
   const [current, event] = await Promise.all([
-    env.DB.prepare('SELECT status FROM routine_runs WHERE id = ? AND tenant = ?')
-      .bind(run.id, run.tenant).first<{ status: string }>(),
-    env.DB.prepare("SELECT 1 FROM routine_run_events WHERE run_id = ? AND tenant = ? AND kind = 'cancelled' LIMIT 1")
-      .bind(run.id, run.tenant).first(),
+    env.DB.prepare('SELECT status FROM routine_runs WHERE id = ? AND tenant = ?').bind(run.id, run.tenant).first<{ status: string }>(),
+    env.DB.prepare("SELECT kind FROM routine_run_events WHERE run_id = ? AND tenant = ? AND kind IN ('cancellation_confirmed','cancellation_unconfirmed') LIMIT 1")
+      .bind(run.id, run.tenant).first<{ kind: 'cancellation_confirmed' | 'cancellation_unconfirmed' }>(),
   ])
-  if (current?.status === 'cancelled' && event) return { ok: true, run_id: run.id, duplicate: true }
+  if (event && (current?.status === 'cancelled' || current?.status === 'failed')) {
+    return { ok: true, run_id: run.id, duplicate: true, outcome: event.kind === 'cancellation_confirmed' ? 'confirmed' : 'unconfirmed' }
+  }
   if (current && ['succeeded', 'failed', 'skipped'].includes(current.status)) return { ok: false, error: 'run_terminal' }
   return { ok: false, error: 'receipt_failed' }
 }
@@ -1200,6 +1277,14 @@ export async function submitRoutineProposal(
   const proposal = parsed.value
   const run = await loadRun(env, proposal.run_id)
   if (!run) return { ok: false, error: 'run_not_found' }
+  if (principal.tenant !== env.TENANT_SLUG || !await principalCanReadProject(env, principal, run.project_id)) {
+    return { ok: false, error: 'run_not_found' }
+  }
+  const policy = parsePolicy(run.policy_json)
+  if (!policy) return { ok: false, error: 'invalid_policy' }
+  if (!await principalCanRunForSquad(env, principal, run.project_id, policy.responsible_squad_id)) {
+    return { ok: false, error: 'forbidden' }
+  }
   if (principal.tenant !== env.TENANT_SLUG || principal.actor_type !== 'agent') {
     return { ok: false, error: 'forbidden' }
   }
@@ -1226,13 +1311,6 @@ export async function submitRoutineProposal(
   }
   if (!['running', 'waiting'].includes(run.status)) return { ok: false, error: 'run_not_accepting_proposal' }
   if (run.project_status !== 'active') return { ok: false, error: 'project_not_active' }
-  const policy = parsePolicy(run.policy_json)
-  if (!policy) return { ok: false, error: 'invalid_policy' }
-  if (
-    !await principalCanReadProject(env, principal, run.project_id)
-    || !await principalCanRunForSquad(env, principal, run.project_id, policy.responsible_squad_id)
-  ) return { ok: false, error: 'forbidden' }
-
   if (await currentSituationDigest(env, run, policy) !== run.situation_digest) {
     await queueStaleObservation(env, run)
     return { ok: false, error: 'stale_situation' }

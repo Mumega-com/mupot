@@ -10,7 +10,7 @@ vi.mock('../src/auth', () => ({
   requireAuth: async (c: { set: (key: 'auth', value: AuthContext) => void; json: (body: unknown, status: 401) => Response }, next: () => Promise<void>) => {
     if (!authState.current) return c.json({ error: 'unauthenticated' }, 401)
     c.set('auth', authState.current)
-    await next()
+    return next()
   },
 }))
 

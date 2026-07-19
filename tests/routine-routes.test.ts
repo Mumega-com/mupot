@@ -11,7 +11,7 @@ vi.mock('../src/auth', () => ({
   requireAuth: async (c: { set: (key: 'auth', value: AuthContext) => void; json: (body: unknown, status: 401) => Response }, next: () => Promise<void>) => {
     if (!authState.current) return c.json({ error: 'unauthenticated' }, 401)
     c.set('auth', authState.current)
-    await next()
+    return next()
   },
 }))
 
@@ -118,10 +118,22 @@ describe('routine REST routes', () => {
     expect(firstBody).toMatchObject({ duplicate: false })
     expect(firstBody.run).not.toHaveProperty('policy_json')
     expect(firstBody.run).not.toHaveProperty('proposal_json')
+    expect(Object.keys(firstBody.run).sort()).toEqual([
+      'assigned_agent_id', 'attempt', 'cost_micro_usd', 'created_at', 'finished_at', 'flight_id', 'id', 'project_id',
+      'result_summary', 'routine_id', 'routine_revision', 'scheduled_for', 'started_at', 'status', 'task_id',
+      'trigger_kind', 'updated_at', 'waiting_reason',
+    ])
 
     const replay = await routinesApp.fetch(request(`/projects/project-1/routines/${routine.id}/run`, 'POST', {}, { 'idempotency-key': 'run-1' }), envFor(harness))
     expect(replay.status).toBe(200)
     await expect(replay.json()).resolves.toMatchObject({ duplicate: true, run: { id: firstBody.run.id } })
+    const listedRuns = await routinesApp.fetch(request(`/projects/project-1/routine-runs?routine_id=${routine.id}&limit=1`), envFor(harness))
+    expect(listedRuns.status).toBe(200)
+    const listedRun = (await listedRuns.json() as { runs: Array<Record<string, unknown>> }).runs[0]
+    expect(Object.keys(listedRun).sort()).toEqual(Object.keys(firstBody.run).sort())
+    const fetchedRun = await routinesApp.fetch(request(`/routine-runs/${firstBody.run.id}`), envFor(harness))
+    expect(fetchedRun.status).toBe(200)
+    expect(Object.keys((await fetchedRun.json() as { run: Record<string, unknown> }).run).sort()).toEqual(Object.keys(firstBody.run).sort())
 
     authState.current = actor({ boundAgentId: 'agent-1' })
     const agentCancel = await routinesApp.fetch(request(`/routine-runs/${firstBody.run.id}/cancel`, 'POST', {}), envFor(harness))
@@ -129,7 +141,7 @@ describe('routine REST routes', () => {
     authState.current = actor()
     const cancelled = await routinesApp.fetch(request(`/routine-runs/${firstBody.run.id}/cancel`, 'POST', {}), envFor(harness))
     expect(cancelled.status).toBe(200)
-    await expect(cancelled.json()).resolves.toEqual({ ok: true, run_id: firstBody.run.id, duplicate: false })
+    await expect(cancelled.json()).resolves.toEqual({ ok: true, run_id: firstBody.run.id, duplicate: false, outcome: 'confirmed' })
   })
 
   it('submits a proposal only from the auth-welded assigned agent and never accepts an agent field', async () => {
@@ -180,5 +192,48 @@ describe('routine REST routes', () => {
     await expect(badLimit.json()).resolves.toEqual({ error: 'invalid_pagination' })
     const badCursor = await routinesApp.fetch(request('/projects/project-1/routines?cursor=not%20a%20cursor'), envFor(harness))
     expect(badCursor.status).toBe(400)
+  })
+
+  it('rejects malformed UTF-8 and measures raw multibyte request bytes before parsing', async () => {
+    harness = makeHarness()
+    authState.current = actor()
+    const encoded = new TextEncoder().encode(JSON.stringify(policy))
+    const nameOffset = new TextDecoder().decode(encoded).indexOf('Keep momentum')
+    const malformed = new Uint8Array([...encoded.slice(0, nameOffset), 0xc3, 0x28, ...encoded.slice(nameOffset + 2)])
+    const malformedResponse = await routinesApp.fetch(new Request('https://pot.test/projects/project-1/routines', {
+      method: 'POST', headers: { Origin: 'https://pot.test', 'content-type': 'application/json' }, body: malformed,
+    }), envFor(harness))
+    expect(malformedResponse.status).toBe(400)
+    await expect(malformedResponse.json()).resolves.toEqual({ error: 'invalid_body' })
+
+    const exact = `{"x":"${'é'.repeat(4092)}"}`
+    expect(new TextEncoder().encode(exact).byteLength).toBe(8192)
+    const exactResponse = await routinesApp.fetch(new Request('https://pot.test/projects/project-1/routines', {
+      method: 'POST', headers: { Origin: 'https://pot.test', 'content-type': 'application/json' }, body: exact,
+    }), envFor(harness))
+    expect(exactResponse.status).toBe(400)
+    await expect(exactResponse.json()).resolves.toEqual({ error: 'unknown_field' })
+    const over = `${exact.slice(0, -2)}a"}`
+    expect(new TextEncoder().encode(over).byteLength).toBe(8193)
+    const overResponse = await routinesApp.fetch(new Request('https://pot.test/projects/project-1/routines', {
+      method: 'POST', headers: { Origin: 'https://pot.test', 'content-type': 'application/json' }, body: over,
+    }), envFor(harness))
+    expect(overResponse.status).toBe(413)
+  })
+
+  it('covers GET/PATCH/pause/archive and rejects a Routine under the wrong Project path', async () => {
+    harness = makeHarness()
+    authState.current = actor()
+    const created = await routinesApp.fetch(request('/projects/project-1/routines', 'POST', policy), envFor(harness))
+    const id = (await created.json() as { routine: { id: string } }).routine.id
+    expect((await routinesApp.fetch(request(`/projects/project-1/routines/${id}`), envFor(harness))).status).toBe(200)
+    const patched = await routinesApp.fetch(request(`/projects/project-1/routines/${id}`, 'PATCH', { name: 'Keep moving' }), envFor(harness))
+    await expect(patched.json()).resolves.toMatchObject({ routine: { name: 'Keep moving' } })
+    expect((await routinesApp.fetch(request(`/projects/not-project/routines/${id}`), envFor(harness))).status).toBe(404)
+    expect((await routinesApp.fetch(request(`/projects/project-1/routines/${id}/enable`, 'POST', {}), envFor(harness))).status).toBe(200)
+    expect((await routinesApp.fetch(request(`/projects/project-1/routines/${id}/pause`, 'POST', {}), envFor(harness))).status).toBe(200)
+    const paused = await routinesApp.fetch(request('/projects/project-1/routines?status=paused&limit=1'), envFor(harness))
+    await expect(paused.json()).resolves.toMatchObject({ routines: [{ id, status: 'paused' }] })
+    expect((await routinesApp.fetch(request(`/projects/project-1/routines/${id}/archive`, 'POST', {}), envFor(harness))).status).toBe(200)
   })
 })

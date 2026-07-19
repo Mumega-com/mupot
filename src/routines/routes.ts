@@ -6,6 +6,7 @@ import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import type { AuthContext, Env } from '../types'
 import { cancelRoutineRun, submitRoutineProposal } from './actions'
 import { routinePrincipal } from './access'
+import { publicRoutineRun, type PublicRoutineRun } from './public'
 import {
   archiveRoutine,
   createManualRoutineRun,
@@ -22,7 +23,7 @@ import {
   type RoutineRunCreationResult,
   type UpdateRoutineInput,
 } from './service'
-import type { Routine, RoutineRun } from './types'
+import type { Routine } from './types'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 type JsonObject = Record<string, unknown>
@@ -30,16 +31,9 @@ type JsonObject = Record<string, unknown>
 const MAX_BODY_BYTES = 8192
 const MAX_ID_LENGTH = 200
 const sessionCsrf = csrf()
-
-function hasSessionCookie(c: Context<AppEnv>): boolean {
-  return /(?:^|;\s*)mupot_session=/.test(c.req.header('cookie') ?? '')
-}
-
 function sameOrigin(c: Context<AppEnv>): boolean {
   const origin = c.req.header('origin')
-  return origin === undefined
-    ? c.req.header('sec-fetch-site') === 'same-origin'
-    : origin === new URL(c.req.url).origin
+  return origin === new URL(c.req.url).origin
 }
 
 export const noStore: MiddlewareHandler<AppEnv> = async (c, next) => {
@@ -49,8 +43,7 @@ export const noStore: MiddlewareHandler<AppEnv> = async (c, next) => {
 
 /** Accept the established browser session or a member bearer without trusting request identity. */
 export const routineAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
-  if (c.get('auth')) return next()
-  if (hasSessionCookie(c) || !c.req.header('authorization')) return requireAuth(c, next)
+  if (!c.req.header('authorization')) return requireAuth(c, next)
   try {
     const identity = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
     if (!identity) return c.json({ error: 'unauthenticated' }, 401)
@@ -69,6 +62,21 @@ export const routineAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
     return c.json({ error: 'unauthenticated' }, 401)
   }
   await next()
+}
+
+/** Auth is selected once per exact REST endpoint; Authorization always wins. */
+export const routineEndpoint: MiddlewareHandler<AppEnv> = async (c, next) => {
+  c.header('Cache-Control', 'no-store')
+  return routineAuth(c, next)
+}
+
+/** Runs only after routineEndpoint selected session auth; bearer callers are exempt. */
+export const routineSessionCsrf: MiddlewareHandler<AppEnv> = async (c, next) => {
+  if (c.req.header('authorization')) return next()
+  if (['POST', 'PATCH'].includes(c.req.method) && !sameOrigin(c)) {
+    return c.json({ error: 'forbidden', reason: 'csrf' }, 403)
+  }
+  return sessionCsrf(c, next)
 }
 
 function validId(value: string): boolean {
@@ -113,13 +121,19 @@ async function readObject(c: Context<AppEnv>): Promise<{ ok: true; body: JsonObj
   if (declared !== undefined && (!/^\d+$/.test(declared) || Number(declared) > MAX_BODY_BYTES)) {
     return { ok: false, error: 'payload_too_large' }
   }
-  let raw: string
+  let bytes: ArrayBuffer
   try {
-    raw = await c.req.text()
+    bytes = await c.req.raw.arrayBuffer()
   } catch {
     return { ok: false, error: 'invalid_body' }
   }
-  if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) return { ok: false, error: 'payload_too_large' }
+  if (bytes.byteLength > MAX_BODY_BYTES) return { ok: false, error: 'payload_too_large' }
+  let raw: string
+  try {
+    raw = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)
+  } catch {
+    return { ok: false, error: 'invalid_body' }
+  }
   if (!raw) return { ok: true, body: {} }
   try {
     const value = JSON.parse(raw)
@@ -172,10 +186,7 @@ function safeRoutine(routine: Routine): Omit<Routine, 'tenant'> {
   return safe
 }
 
-function safeRun(run: RoutineRun): Omit<RoutineRun, 'tenant' | 'policy_json' | 'proposal_json'> {
-  const { tenant: _tenant, policy_json: _policy, proposal_json: _proposal, ...safe } = run
-  return safe
-}
+const safeRun = (run: Parameters<typeof publicRoutineRun>[0]): PublicRoutineRun => publicRoutineRun(run)
 
 function errorStatus(error: string): 400 | 403 | 404 | 409 | 413 {
   if (error === 'payload_too_large') return 413
@@ -197,15 +208,7 @@ async function readableRoutine(c: Context<AppEnv>, projectId: string, routineId:
 
 export const routinesApp = new Hono<AppEnv>()
 
-routinesApp.use('*', noStore)
-routinesApp.use('*', (c, next) => hasSessionCookie(c) ? sessionCsrf(c, next) : next())
-routinesApp.use('*', async (c, next) => {
-  if (!['POST', 'PATCH'].includes(c.req.method) || !hasSessionCookie(c)) return next()
-  return sameOrigin(c) ? next() : c.json({ error: 'forbidden', reason: 'csrf' }, 403)
-})
-routinesApp.use('*', routineAuth)
-
-routinesApp.get('/projects/:projectId/routines', async (c) => {
+routinesApp.get('/projects/:projectId/routines', routineEndpoint, routineSessionCsrf, async (c) => {
   const projectId = c.req.param('projectId')
   const pagination = page(c)
   if (!validId(projectId)) return failure(c, 'project_not_found')
@@ -217,7 +220,7 @@ routinesApp.get('/projects/:projectId/routines', async (c) => {
   return c.json({ routines: result.items.map(safeRoutine), next_cursor: result.next_cursor ? cursorEncode(result.next_cursor) : null })
 })
 
-routinesApp.post('/projects/:projectId/routines', async (c) => {
+routinesApp.post('/projects/:projectId/routines', routineEndpoint, routineSessionCsrf, async (c) => {
   const projectId = c.req.param('projectId')
   if (!validId(projectId)) return failure(c, 'project_not_found')
   const parsed = await readObject(c)
@@ -229,14 +232,14 @@ routinesApp.post('/projects/:projectId/routines', async (c) => {
   return c.json({ routine: safeRoutine(result.value) }, 201)
 })
 
-routinesApp.get('/projects/:projectId/routines/:routineId', async (c) => {
+routinesApp.get('/projects/:projectId/routines/:routineId', routineEndpoint, routineSessionCsrf, async (c) => {
   const { projectId, routineId } = c.req.param()
   if (!validId(projectId) || !validId(routineId)) return failure(c, 'routine_not_found')
   const routine = await readableRoutine(c, projectId, routineId)
   return routine ? c.json({ routine: safeRoutine(routine) }) : failure(c, 'routine_not_found')
 })
 
-routinesApp.patch('/projects/:projectId/routines/:routineId', async (c) => {
+routinesApp.patch('/projects/:projectId/routines/:routineId', routineEndpoint, routineSessionCsrf, async (c) => {
   const { projectId, routineId } = c.req.param()
   if (!validId(projectId) || !validId(routineId)) return failure(c, 'routine_not_found')
   if (!await readableRoutine(c, projectId, routineId)) return failure(c, 'routine_not_found')
@@ -251,7 +254,7 @@ routinesApp.patch('/projects/:projectId/routines/:routineId', async (c) => {
 for (const [action, operation] of [
   ['enable', enableRoutine], ['pause', pauseRoutine], ['archive', archiveRoutine],
 ] as const) {
-  routinesApp.post(`/projects/:projectId/routines/:routineId/${action}`, async (c) => {
+  routinesApp.post(`/projects/:projectId/routines/:routineId/${action}`, routineEndpoint, routineSessionCsrf, async (c) => {
     const { projectId, routineId } = c.req.param()
     if (!validId(projectId) || !validId(routineId) || !await readableRoutine(c, projectId, routineId)) return failure(c, 'routine_not_found')
     const parsed = await readObject(c)
@@ -262,7 +265,7 @@ for (const [action, operation] of [
   })
 }
 
-routinesApp.post('/projects/:projectId/routines/:routineId/run', async (c) => {
+routinesApp.post('/projects/:projectId/routines/:routineId/run', routineEndpoint, routineSessionCsrf, async (c) => {
   const { projectId, routineId } = c.req.param()
   if (!validId(projectId) || !validId(routineId) || !await readableRoutine(c, projectId, routineId)) return failure(c, 'routine_not_found')
   const parsed = await readObject(c)
@@ -275,7 +278,7 @@ routinesApp.post('/projects/:projectId/routines/:routineId/run', async (c) => {
   return c.json({ run: safeRun(result.value), duplicate: result.duplicate }, result.duplicate ? 200 : 201)
 })
 
-routinesApp.get('/projects/:projectId/routine-runs', async (c) => {
+routinesApp.get('/projects/:projectId/routine-runs', routineEndpoint, routineSessionCsrf, async (c) => {
   const projectId = c.req.param('projectId')
   const pagination = page(c)
   const routineId = c.req.query('routine_id')
@@ -286,14 +289,14 @@ routinesApp.get('/projects/:projectId/routine-runs', async (c) => {
   return c.json({ runs: result.items.map(safeRun), next_cursor: result.next_cursor ? cursorEncode(result.next_cursor) : null })
 })
 
-routinesApp.get('/routine-runs/:runId', async (c) => {
+routinesApp.get('/routine-runs/:runId', routineEndpoint, routineSessionCsrf, async (c) => {
   const runId = c.req.param('runId')
   if (!validId(runId)) return failure(c, 'run_not_found')
   const run = await getRoutineRun(c.env, routinePrincipal(c.get('auth')), runId)
   return run ? c.json({ run: safeRun(run) }) : failure(c, 'run_not_found')
 })
 
-routinesApp.post('/routine-runs/:runId/cancel', async (c) => {
+routinesApp.post('/routine-runs/:runId/cancel', routineEndpoint, routineSessionCsrf, async (c) => {
   const runId = c.req.param('runId')
   if (!validId(runId)) return failure(c, 'run_not_found')
   const parsed = await readObject(c)
@@ -303,7 +306,7 @@ routinesApp.post('/routine-runs/:runId/cancel', async (c) => {
   return result.ok ? c.json(result) : failure(c, result.error)
 })
 
-routinesApp.post('/routine-runs/:runId/proposal', async (c) => {
+routinesApp.post('/routine-runs/:runId/proposal', routineEndpoint, routineSessionCsrf, async (c) => {
   const runId = c.req.param('runId')
   if (!validId(runId)) return failure(c, 'run_not_found')
   const parsed = await readObject(c)

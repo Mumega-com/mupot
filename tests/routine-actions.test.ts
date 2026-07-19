@@ -120,7 +120,7 @@ describe('Routine proposal submission and governed actions', () => {
       project_read: { workspaceAdmin: false, orgRead: false, squadIds: [], departmentIds: [] },
     }
     await expect(submitRoutineProposal(fixture.env, revoked, fixture.proposal(action))).resolves.toEqual({
-      ok: false, error: 'forbidden',
+      ok: false, error: 'run_not_found',
     })
   })
 
@@ -543,16 +543,95 @@ describe('Routine proposal submission and governed actions', () => {
     }, 'run-1')).resolves.toEqual({ ok: false, error: 'forbidden' })
 
     const cancelled = await cancelRoutineRun(fixture.env, administrator, 'run-1')
-    expect(cancelled).toEqual({ ok: true, run_id: 'run-1', duplicate: false })
+    expect(cancelled).toEqual({ ok: true, run_id: 'run-1', duplicate: false, outcome: 'confirmed' })
     expect(row(fixture, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({ status: 'cancelled', waiting_reason: null })
     expect(row(fixture, "SELECT status FROM routine_run_actions WHERE id = 'action-cancel'")).toEqual({ status: 'cancelled' })
-    expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind = 'cancelled'")).toEqual({ count: 1 })
-    await expect(cancelRoutineRun(fixture.env, administrator, 'run-1')).resolves.toEqual({ ok: true, run_id: 'run-1', duplicate: true })
+    expect(row(fixture, "SELECT status, gate_reason FROM flights WHERE id = 'control-flight'")).toEqual({ status: 'failed', gate_reason: 'routine_cancelled' })
+    expect(row(fixture, "SELECT status FROM tasks WHERE id = 'control-task'")).toEqual({ status: 'blocked' })
+    expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind = 'cancellation_requested'")).toEqual({ count: 1 })
+    expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind = 'cancellation_confirmed'")).toEqual({ count: 1 })
+    await expect(cancelRoutineRun(fixture.env, administrator, 'run-1')).resolves.toEqual({ ok: true, run_id: 'run-1', duplicate: true, outcome: 'confirmed' })
     const partial = await makeReadyRoutineFixture('execute_internal')
     partial.harness.sqlite.prepare(
       "UPDATE routine_runs SET status = 'cancelled', finished_at = '2026-07-19T17:00:00.000Z' WHERE id = 'run-1'",
     ).run()
     await expect(cancelRoutineRun(partial.env, administrator, 'run-1')).resolves.toEqual({ ok: false, error: 'receipt_failed' })
     partial.harness.close()
+  })
+
+  it('hides unreadable runs and revalidates Project and squad authority before replaying succeeded, waiting, or running actions', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    const proposal = fixture.proposal({ key: 'revoked', kind: 'no_action', input: { reason: 'Done.' } })
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({ ok: true, status: 'succeeded' })
+    const revoked: RoutinePrincipal = {
+      ...fixture.principal,
+      grants: [], project_read: { workspaceAdmin: false, orgRead: false, squadIds: [], departmentIds: [] },
+    }
+    await expect(submitRoutineProposal(fixture.env, revoked, proposal)).resolves.toEqual({ ok: false, error: 'run_not_found' })
+
+    fixture.harness.sqlite.exec(`
+      UPDATE routine_runs SET status = 'waiting', waiting_reason = 'review', proposal_json = NULL WHERE id = 'run-1';
+      UPDATE routine_run_actions SET status = 'waiting', result_json = NULL WHERE run_id = 'run-1' AND action_key = 'revoked';
+    `)
+    await expect(submitRoutineProposal(fixture.env, revoked, proposal)).resolves.toEqual({ ok: false, error: 'run_not_found' })
+
+    fixture.harness.sqlite.exec(`
+      UPDATE routine_runs SET status = 'running', waiting_reason = NULL, proposal_json = NULL WHERE id = 'run-1';
+      UPDATE routine_run_actions SET status = 'running' WHERE run_id = 'run-1' AND action_key = 'revoked';
+    `)
+    await expect(submitRoutineProposal(fixture.env, revoked, proposal)).resolves.toEqual({ ok: false, error: 'run_not_found' })
+    const readableButNotRunnable: RoutinePrincipal = {
+      ...fixture.principal,
+      grants: [{ member_id: 'member-1', scope_type: 'squad', scope_id: 'squad-1', capability: 'observer' }],
+    }
+    await expect(submitRoutineProposal(fixture.env, readableButNotRunnable, proposal)).resolves.toEqual({ ok: false, error: 'forbidden' })
+    const missing = { ...proposal, run_id: 'missing-run' }
+    await expect(submitRoutineProposal(fixture.env, revoked, missing)).resolves.toEqual({ ok: false, error: 'run_not_found' })
+  })
+
+  it('records an unconfirmed outcome when cancellation races an already claimed action', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    fixture.harness.sqlite.exec(`
+      INSERT INTO routine_run_actions (id, tenant, project_id, run_id, action_key, kind, input_json, status)
+      VALUES ('action-claimed', 'tenant-a', 'project-1', 'run-1', 'claimed', 'no_action', '{"reason":"in flight"}', 'running');
+    `)
+    const administrator: RoutinePrincipal = {
+      ...fixture.principal, actor_type: 'member', actor_id: 'owner-1', workspace_admin: true,
+      project_read: { workspaceAdmin: true, orgRead: true, squadIds: [], departmentIds: [] },
+    }
+    await expect(cancelRoutineRun(fixture.env, administrator, 'run-1')).resolves.toEqual({
+      ok: true, run_id: 'run-1', duplicate: false, outcome: 'unconfirmed',
+    })
+    expect(row(fixture, "SELECT status, result_summary FROM routine_runs WHERE id = 'run-1'")).toEqual({
+      status: 'failed', result_summary: 'cancellation_unconfirmed',
+    })
+    expect(row(fixture, "SELECT status FROM routine_run_actions WHERE id = 'action-claimed'")).toEqual({ status: 'cancelled' })
+    expect(row(fixture, "SELECT status FROM flights WHERE id = 'control-flight'")).toEqual({ status: 'failed' })
+    expect(row(fixture, "SELECT status FROM tasks WHERE id = 'control-task'")).toEqual({ status: 'blocked' })
+    expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind = 'cancellation_requested'")).toEqual({ count: 1 })
+    expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind = 'cancellation_unconfirmed'")).toEqual({ count: 1 })
+    await expect(cancelRoutineRun(fixture.env, administrator, 'run-1')).resolves.toEqual({
+      ok: true, run_id: 'run-1', duplicate: true, outcome: 'unconfirmed',
+    })
+  })
+
+  it('records an unconfirmed child-completion race and leaves an already terminal run untouched', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    const administrator: RoutinePrincipal = {
+      ...fixture.principal, actor_type: 'member', actor_id: 'owner-1', workspace_admin: true,
+      project_read: { workspaceAdmin: true, orgRead: true, squadIds: [], departmentIds: [] },
+    }
+    fixture.harness.sqlite.exec("UPDATE flights SET status = 'landed', ended_at = 1752940900000 WHERE id = 'control-flight'")
+    await expect(cancelRoutineRun(fixture.env, administrator, 'run-1')).resolves.toMatchObject({ ok: true, outcome: 'unconfirmed' })
+    expect(row(fixture, "SELECT status FROM tasks WHERE id = 'control-task'")).toEqual({ status: 'blocked' })
+    expect(row(fixture, "SELECT status FROM routine_runs WHERE id = 'run-1'")).toEqual({ status: 'failed' })
+
+    const terminal = await makeReadyRoutineFixture('execute_internal')
+    terminal.harness.sqlite.exec("UPDATE routine_runs SET status = 'succeeded', finished_at = '2026-07-19T17:00:00.000Z' WHERE id = 'run-1'")
+    await expect(cancelRoutineRun(terminal.env, administrator, 'run-1')).resolves.toEqual({ ok: false, error: 'run_terminal' })
+    expect(row(terminal, "SELECT status FROM flights WHERE id = 'control-flight'")).toEqual({ status: 'running' })
+    expect(row(terminal, "SELECT status FROM tasks WHERE id = 'control-task'")).toEqual({ status: 'in_progress' })
+    expect(row(terminal, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind LIKE 'cancellation_%'")).toEqual({ count: 0 })
+    terminal.harness.close()
   })
 })

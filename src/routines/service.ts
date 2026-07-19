@@ -267,7 +267,7 @@ export async function createRoutine(
   principal: RoutinePrincipal,
   input: CreateRoutineInput,
 ): Promise<RoutineMutationResult<Routine>> {
-  if (principal.tenant !== env.TENANT_SLUG || !principal.workspace_admin) return { ok: false, error: 'forbidden' }
+  if (principal.tenant !== env.TENANT_SLUG || principal.actor_type !== 'member' || !principal.workspace_admin) return { ok: false, error: 'forbidden' }
   const projectId = boundedText(input.project_id, 1, 200)
   if (!projectId) return { ok: false, error: 'project_not_found' }
   const targetProject = await project(env, projectId)
@@ -352,7 +352,7 @@ export async function updateRoutine(
   id: string,
   input: UpdateRoutineInput,
 ): Promise<RoutineMutationResult<Routine>> {
-  if (principal.tenant !== env.TENANT_SLUG || !principal.workspace_admin) return { ok: false, error: 'forbidden' }
+  if (principal.tenant !== env.TENANT_SLUG || principal.actor_type !== 'member' || !principal.workspace_admin) return { ok: false, error: 'forbidden' }
   const existing = await directRoutine(env, id)
   if (!existing) return { ok: false, error: 'routine_not_found' }
   if (existing.status === 'archived') return { ok: false, error: 'routine_archived' }
@@ -391,7 +391,7 @@ async function transitionRoutine(
   id: string,
   target: 'enabled' | 'paused' | 'archived',
 ): Promise<RoutineMutationResult<Routine>> {
-  if (principal.tenant !== env.TENANT_SLUG || !principal.workspace_admin) return { ok: false, error: 'forbidden' }
+  if (principal.tenant !== env.TENANT_SLUG || principal.actor_type !== 'member' || !principal.workspace_admin) return { ok: false, error: 'forbidden' }
   const existing = await directRoutine(env, id)
   if (!existing) return { ok: false, error: 'routine_not_found' }
   if (existing.status === 'archived') return { ok: false, error: 'routine_archived' }
