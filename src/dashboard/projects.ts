@@ -124,6 +124,7 @@ export interface ProjectMemberRow {
   agent_role: string
   agent_model: string
   agent_status: string
+  attached: boolean
   runtime: string
   runtime_status: string
   presence: Presence | 'not_attached'
@@ -515,11 +516,12 @@ async function loadReadableProjectMembers(
       const attached = Boolean(state?.runtime)
       return {
         ...agent,
-        runtime: attached ? state?.runtime ?? '' : '',
-        runtime_status: attached ? state?.status ?? '' : '',
-        presence: attached ? state?.presence ?? 'stale' : 'not_attached',
-        host: attached ? state?.host ?? '' : '',
-        last_seen: attached ? state?.last_seen ?? '' : '',
+        attached,
+        runtime: state?.runtime ?? '',
+        runtime_status: state?.status ?? '',
+        presence: state?.presence ?? 'not_attached',
+        host: state?.host ?? '',
+        last_seen: state?.last_seen ?? '',
       }
     }),
   }
@@ -886,6 +888,7 @@ function semanticDataTable(opts: {
   cols: ProjectTableColumn[]
   rows: Html[][]
   empty?: string
+  minWidth?: string
 }): Html {
   const template = opts.cols.map((column) => safeTrack(column.width)).join(' ')
   const head = html`<div class="ui-tr ui-thead" role="row" style="grid-template-columns:${raw(template)}">
@@ -897,7 +900,7 @@ function semanticDataTable(opts: {
       </div>`)
     : html`<div class="ui-table-empty">${opts.empty ?? 'Nothing here yet.'}</div>`
   return html`<div role="region" aria-label="${opts.label}" tabindex="0" style="max-width:100%;overflow-x:auto;">
-    <div class="ui-table" role="table" aria-label="${opts.label}" aria-colcount="${String(opts.cols.length)}">
+    <div class="ui-table" role="table" aria-label="${opts.label}" aria-colcount="${String(opts.cols.length)}"${opts.minWidth ? html` style="min-width:${opts.minWidth};"` : ''}>
       ${head}${rows}
     </div>
   </div>`
@@ -1154,6 +1157,53 @@ export function projectDetailBody(view: ProjectDetailView, statusResult?: string
     <a class="ui-link" href="/send?project_id=${encodeURIComponent(project.id)}">Project tasks</a>
     <a class="ui-link" href="/flights?project_id=${encodeURIComponent(project.id)}">Project flights</a>
   </span>`
+  const squadCell = (squad: Pick<ProjectSquadRow, 'squad_id' | 'squad_name' | 'access_level'>) => html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
+    <a class="ui-link" style="white-space:normal;overflow-wrap:anywhere;" href="/squads/${encodeURIComponent(squad.squad_id)}">${squad.squad_name}</a>
+    <span class="ui-panel-sub">Project access: ${squad.access_level}</span>
+  </span>`
+  const memberCells = (member: ProjectMemberRow): Html[] => [
+    squadCell(member),
+    html`<a class="ui-link" style="white-space:normal;overflow-wrap:anywhere;" href="/agents/${encodeURIComponent(member.agent_id)}">${member.agent_name}</a>`,
+    html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
+      <span>${member.agent_role}</span>
+      <span class="ui-panel-sub" style="white-space:normal;overflow-wrap:anywhere;">Model: ${member.agent_model}</span>
+      <span class="ui-panel-sub">Agent status: ${member.agent_status}</span>
+    </span>`,
+    member.attached
+      ? html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
+          <span>${member.runtime}</span>
+          <span class="ui-panel-sub">Stored intent: ${member.runtime_status || 'unknown'}</span>
+        </span>`
+      : html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
+          <span>Not attached</span>
+          <span class="ui-panel-sub">No external runtime reported.</span>
+          ${member.runtime_status ? html`<span class="ui-panel-sub">Stored intent: ${member.runtime_status}</span>` : ''}
+        </span>`,
+    pill(memberPresenceLabel(member.presence), memberPresenceTone(member.presence)),
+    html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
+      <span>${member.host || 'Host not reported'}</span>
+      <span class="ui-panel-sub" style="white-space:normal;overflow-wrap:anywhere;">Last seen: ${member.last_seen || 'Never reported'}</span>
+    </span>`,
+  ]
+  const membersBySquad = new Map<string, ProjectMemberRow[]>()
+  for (const member of view.members) {
+    const members = membersBySquad.get(member.squad_id) ?? []
+    members.push(member)
+    membersBySquad.set(member.squad_id, members)
+  }
+  const teamRows = view.squads.flatMap((squad) => {
+    const members = membersBySquad.get(squad.squad_id) ?? []
+    return members.length
+      ? members.map(memberCells)
+      : [[
+          squadCell(squad),
+          html`<span class="ui-panel-sub">No readable agent members are shown for this connected project squad.</span>`,
+          html`<span class="ui-panel-sub">No agent details reported.</span>`,
+          html`<span class="ui-panel-sub">No runtime reported.</span>`,
+          pill('Not attached', 'dim'),
+          html`<span class="ui-panel-sub">No host or last-seen data reported.</span>`,
+        ]]
+  })
 
   return html`
     ${pageHeader({
@@ -1192,6 +1242,7 @@ export function projectDetailBody(view: ProjectDetailView, statusResult?: string
         title: 'Team / Squads',
         body: html`${semanticDataTable({
           label: 'Readable project agent members',
+          minWidth: '70rem',
           cols: [
             { label: 'Squad', width: '1fr' },
             { label: 'Agent', width: '1.3fr' },
@@ -1200,35 +1251,8 @@ export function projectDetailBody(view: ProjectDetailView, statusResult?: string
             { label: 'Presence', width: 'auto' },
             { label: 'Host / last seen', width: '1.2fr' },
           ],
-          rows: view.members.map((member) => [
-            html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
-              <a class="ui-link" style="white-space:normal;overflow-wrap:anywhere;" href="/squads/${encodeURIComponent(member.squad_id)}">${member.squad_name}</a>
-              <span class="ui-panel-sub">Project access: ${member.access_level}</span>
-            </span>`,
-            html`<a class="ui-link" style="white-space:normal;overflow-wrap:anywhere;" href="/agents/${encodeURIComponent(member.agent_id)}">${member.agent_name}</a>`,
-            html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
-              <span>${member.agent_role}</span>
-              <span class="ui-panel-sub" style="white-space:normal;overflow-wrap:anywhere;">Model: ${member.agent_model}</span>
-              <span class="ui-panel-sub">Agent status: ${member.agent_status}</span>
-            </span>`,
-            member.presence === 'not_attached'
-              ? html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
-                  <span>Not attached</span>
-                  <span class="ui-panel-sub">No external runtime reported.</span>
-                </span>`
-              : html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
-                  <span>${member.runtime}</span>
-                  <span class="ui-panel-sub">Stored intent: ${member.runtime_status || 'unknown'}</span>
-                </span>`,
-            pill(memberPresenceLabel(member.presence), memberPresenceTone(member.presence)),
-            html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
-              <span>${member.host || 'Host not reported'}</span>
-              <span class="ui-panel-sub" style="white-space:normal;overflow-wrap:anywhere;">Last seen: ${member.last_seen || 'Never reported'}</span>
-            </span>`,
-          ]),
-          empty: view.squads.length
-            ? 'No readable agent members belong to the connected project squads.'
-            : 'No readable squad edges are connected to this project.',
+          rows: teamRows,
+          empty: 'No readable squad edges are connected to this project.',
         })}${view.membersTruncated ? html`<p class="ui-panel-sub">Showing the first ${MAX_PROJECT_MEMBER_ROWS} readable agent members.</p>` : ''}`,
       })}
     </section>

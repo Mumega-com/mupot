@@ -535,13 +535,15 @@ describe('project dashboard renderers', () => {
       INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
         ('agent-live', 'squad-a', 'live-slug', 'Agent Live', 'Runtime operator', 'model-live', 'active'),
         ('agent-offline', 'squad-a', 'offline-slug', 'Agent Offline', 'Release reviewer', 'model-offline', 'paused'),
+        ('agent-runtime-empty', 'squad-a', 'runtime-empty-slug', 'Agent Runtime Empty', 'Detached operator', 'model-empty', 'active'),
         ('agent-unattached', 'squad-a', 'unattached-slug', 'Agent Unattached', 'Planning lead', 'model-unattached', 'active');
       INSERT INTO fleet_agents
         (tenant, agent_id, runtime, status, host, last_reported_at) VALUES
         ('pot-a', 'agent-a', 'codex', 'running', 'exact-id-host', '2026-07-19 11:50:00'),
         ('pot-a', 'agent-a-slug', 'claude-code', 'running', 'slug-fallback-host', '2026-07-19 11:59:50'),
         ('pot-a', 'live-slug', 'python', 'running', 'live-host', '2026-07-19 11:59:50'),
-        ('pot-a', 'offline-slug', 'tmux', 'stopped', 'offline-host', '2026-07-19 11:59:50');
+        ('pot-a', 'offline-slug', 'tmux', 'stopped', 'offline-host', '2026-07-19 11:59:50'),
+        ('pot-a', 'runtime-empty-slug', '', 'stopped', 'detached-host', '2026-07-19 11:58:00');
     `)
 
     const view = await loadProjectDetail(envFor(harness), memberA(), 'visible-child')
@@ -553,7 +555,11 @@ describe('project dashboard renderers', () => {
       expect.objectContaining({ agent_id: 'agent-live', runtime: 'python', presence: 'live' }),
       expect.objectContaining({ agent_id: 'agent-offline', runtime: 'tmux', presence: 'offline' }),
       expect.objectContaining({
-        agent_id: 'agent-unattached', runtime: '', runtime_status: '',
+        agent_id: 'agent-runtime-empty', attached: false, runtime: '', runtime_status: 'stopped',
+        presence: 'offline', host: 'detached-host', last_seen: '2026-07-19 11:58:00',
+      }),
+      expect.objectContaining({
+        agent_id: 'agent-unattached', attached: false, runtime: '', runtime_status: '',
         presence: 'not_attached', host: '', last_seen: '',
       }),
     ]))
@@ -568,7 +574,60 @@ describe('project dashboard renderers', () => {
     expect(body).toContain('Offline')
     expect(body).toContain('Not attached')
     expect(body).toContain('exact-id-host')
+    expect(body).toContain('Stored intent: stopped')
+    expect(body).toContain('detached-host')
+    expect(body).toContain('Last seen: 2026-07-19 11:58:00')
     expect(body).not.toContain('slug-fallback-host')
+  })
+
+  it('retains readable squad edges when mixed and all-empty project teams have no members', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name) VALUES
+        ('squad-empty-mixed', 'dept-a', 'squad-empty-mixed', 'Squad Empty Mixed'),
+        ('squad-empty-all-a', 'dept-a', 'squad-empty-all-a', 'Squad Empty All A'),
+        ('squad-empty-all-b', 'dept-a', 'squad-empty-all-b', 'Squad Empty All B');
+      INSERT INTO projects (id, slug, name, status) VALUES
+        ('empty-team-project', 'empty-team-project', 'Empty team project', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+        ('visible-child', 'squad-empty-mixed', 'read'),
+        ('empty-team-project', 'squad-empty-all-a', 'write'),
+        ('empty-team-project', 'squad-empty-all-b', 'admin');
+    `)
+
+    const mixed = await loadProjectDetail(envFor(harness), memberA(), 'visible-child')
+    const allEmpty = await loadProjectDetail(envFor(harness), memberA(), 'empty-team-project')
+    const mixedBody = await render(projectDetailBody(mixed!))
+    const allEmptyBody = await render(projectDetailBody(allEmpty!))
+
+    expect(mixed?.squads.map((squad) => squad.squad_id)).toEqual([
+      'squad-a', 'squad-empty-mixed',
+    ])
+    expect(mixedBody).toContain('href="/squads/squad-empty-mixed"')
+    expect(mixedBody).toContain('Squad Empty Mixed')
+    expect(mixedBody).toContain('Project access: read')
+
+    expect(allEmpty?.members).toEqual([])
+    expect(allEmpty?.squads.map((squad) => squad.squad_id)).toEqual([
+      'squad-empty-all-a', 'squad-empty-all-b',
+    ])
+    expect(allEmptyBody).toContain('href="/squads/squad-empty-all-a"')
+    expect(allEmptyBody).toContain('href="/squads/squad-empty-all-b"')
+    expect(allEmptyBody).toContain('Squad Empty All A')
+    expect(allEmptyBody).toContain('Squad Empty All B')
+    expect(allEmptyBody).toContain('Project access: write')
+    expect(allEmptyBody).toContain('Project access: admin')
+    expect(allEmptyBody).toContain('No readable agent members are shown for this connected project squad.')
+  })
+
+  it('gives the six-column Team table a stable width that activates its scroll region on phones', async () => {
+    harness = makeHarness()
+    const body = await render(projectDetailBody(
+      (await loadProjectDetail(envFor(harness), memberA(), 'visible-child'))!,
+    ))
+
+    expect(body).toContain('role="region" aria-label="Readable project agent members" tabindex="0" style="max-width:100%;overflow-x:auto;"')
+    expect(body).toContain('class="ui-table" role="table" aria-label="Readable project agent members" aria-colcount="6" style="min-width:70rem;"')
   })
 
   it('refuses ambiguous slug runtime fallback and preserves squad and tenant boundaries', async () => {
