@@ -318,7 +318,14 @@ describe('task project attribution', () => {
       type: 'task.created',
       payload: expect.objectContaining({ task_id: task.id, project_id: 'project-write' }),
     }))
-    expect(() => harness!.sqlite.prepare('UPDATE tasks SET title = ? WHERE id = ?').run('Forbidden mutation', task.id))
+    // #391 (migration 0061): non-attribution writes (title/status/etc.) keep flowing
+    // after a squad's project access is revoked — only re-attribution (project_id/
+    // squad_id change) is re-checked against project_squad_access.
+    expect(() => harness!.sqlite.prepare('UPDATE tasks SET title = ? WHERE id = ?').run('In-flight mutation', task.id))
+      .not.toThrow()
+    expect(harness!.sqlite.prepare('SELECT title FROM tasks WHERE id = ?').get(task.id))
+      .toEqual({ title: 'In-flight mutation' })
+    expect(() => harness!.sqlite.prepare('UPDATE tasks SET project_id = ? WHERE id = ?').run('project-read', task.id))
       .toThrow(/task project access denied/)
   })
 

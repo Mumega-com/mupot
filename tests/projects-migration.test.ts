@@ -5,6 +5,7 @@ import { createSqliteD1 } from './helpers/sqlite-d1'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const PROJECTS_MIGRATION = '0055_projects.sql'
+const FIX_MIGRATION = '0061_task_project_access_on_attribution.sql'
 const PROJECT_LINK_LATEST_EVENT_INDEX_MIGRATION = '0060_project_link_latest_event_index.sql'
 
 function applyPriorMigrations(sqlite: { exec(sql: string): void }): void {
@@ -104,11 +105,12 @@ describe('0055_projects migration', () => {
     }
   })
 
-  it('atomically enforces active write-authorized task attribution on every write', () => {
+  it('atomically enforces write-authorized task attribution on insert and attribution updates', () => {
     const { sqlite, close } = createSqliteD1()
     try {
       applyPriorMigrations(sqlite)
       sqlite.exec(readFileSync(join(MIGRATIONS_DIR, PROJECTS_MIGRATION), 'utf8'))
+      sqlite.exec(readFileSync(join(MIGRATIONS_DIR, FIX_MIGRATION), 'utf8'))
       sqlite.exec(`
         INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Department');
         INSERT INTO squads (id, department_id, slug, name) VALUES
@@ -144,10 +146,15 @@ describe('0055_projects migration', () => {
         DELETE FROM project_squad_access
         WHERE project_id = 'project-write' AND squad_id = 'squad-1'
       `)
-      expect(() => sqlite.exec(`UPDATE tasks SET title = 'stale mutation' WHERE id = 'task-write'`))
+      // #391: status/title/body updates must keep flowing after access downgrade.
+      // Access is re-checked only when project_id or squad_id changes.
+      sqlite.exec(`UPDATE tasks SET title = 'in-flight mutation', status = 'done' WHERE id = 'task-write'`)
+      expect(sqlite.prepare(`SELECT title, status FROM tasks WHERE id = 'task-write'`).get())
+        .toEqual({ title: 'in-flight mutation', status: 'done' })
+      expect(() => sqlite.exec(`UPDATE tasks SET project_id = 'project-read' WHERE id = 'task-write'`))
         .toThrow(/task project access denied/)
-      expect(sqlite.prepare(`SELECT title FROM tasks WHERE id = 'task-write'`).get())
-        .toEqual({ title: 'Write' })
+      expect(sqlite.prepare(`SELECT project_id FROM tasks WHERE id = 'task-write'`).get())
+        .toEqual({ project_id: 'project-write' })
       sqlite.exec(`UPDATE tasks SET github_issue_url = 'https://github.com/acme/widgets/issues/1' WHERE id = 'task-write'`)
       expect(sqlite.prepare(`SELECT github_issue_url FROM tasks WHERE id = 'task-write'`).get())
         .toEqual({ github_issue_url: 'https://github.com/acme/widgets/issues/1' })
@@ -157,8 +164,12 @@ describe('0055_projects migration', () => {
         VALUES ('project-write', 'squad-1', 'admin');
         UPDATE projects SET status = 'archived' WHERE id = 'project-write';
       `)
-      expect(() => sqlite.exec(`UPDATE tasks SET body = 'stale after archive' WHERE id = 'task-write'`))
-        .toThrow(/task project archived/)
+      // Non-attribution writes still succeed after archive; re-attribution is blocked.
+      sqlite.exec(`UPDATE tasks SET body = 'still flowing after archive' WHERE id = 'task-write'`)
+      expect(sqlite.prepare(`SELECT body FROM tasks WHERE id = 'task-write'`).get())
+        .toEqual({ body: 'still flowing after archive' })
+      expect(() => sqlite.exec(`UPDATE tasks SET project_id = 'project-read' WHERE id = 'task-write'`))
+        .toThrow(/task project archived|task project access denied/)
       sqlite.exec(`UPDATE tasks SET github_issue_url = 'https://github.com/acme/widgets/issues/2' WHERE id = 'task-write'`)
       expect(sqlite.prepare(`SELECT github_issue_url FROM tasks WHERE id = 'task-write'`).get())
         .toEqual({ github_issue_url: 'https://github.com/acme/widgets/issues/2' })
