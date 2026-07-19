@@ -10,7 +10,7 @@ const MIGRATIONS_DIR = join(import.meta.dirname, '..', 'migrations')
 const NAMES = [
   'routine_list', 'routine_get', 'routine_create', 'routine_update', 'routine_enable',
   'routine_pause', 'routine_archive', 'routine_run_now', 'routine_run_list',
-  'routine_run_get', 'routine_run_cancel', 'routine_proposal_submit', 'needs_you_list',
+  'routine_run_get', 'routine_run_answer', 'routine_run_cancel', 'routine_proposal_submit', 'needs_you_list',
 ] as const
 
 function sessions() {
@@ -214,6 +214,7 @@ describe('routine MCP tools', () => {
       routine_run_now: { required: ['routine_id', 'idempotency_key'], properties: ['routine_id', 'idempotency_key'] },
       routine_run_list: { required: ['project_id'], properties: ['project_id', 'routine_id', 'limit', 'cursor'] },
       routine_run_get: { required: ['run_id'], properties: ['run_id'] },
+      routine_run_answer: { required: ['run_id', 'answer'], properties: ['run_id', 'answer'] },
       routine_run_cancel: { required: ['run_id'], properties: ['run_id'] },
       routine_proposal_submit: { required: ['version', 'run_id', 'project_id', 'situation_digest', 'summary', 'action'], properties: ['version', 'run_id', 'project_id', 'situation_digest', 'summary', 'action'] },
       needs_you_list: { properties: ['project_id', 'limit', 'cursor'] },
@@ -383,6 +384,34 @@ describe('routine MCP tools', () => {
     await expect(invokeTool(assigned, fixture.env, 'routine_proposal_submit', {
       ...proposal, action: { ...proposal.action, input: { reason: 'Conflicting replay.' } },
     }, 'https://pot.test')).resolves.toMatchObject({ ok: false, error: 'action_key_conflict' })
+  })
+
+  it('resolves an ask-human action through the writable responsible squad', async () => {
+    const fixture = await makeReadyRoutineFixture('execute_internal')
+    harness = fixture.harness
+    const assigned = principal({
+      tenant: 'tenant-a', boundAgentId: 'agent-1',
+      capabilities: [grant('member', 'squad-1')],
+    })
+    const proposal = fixture.proposal({
+      key: 'mcp-question', kind: 'ask_human',
+      input: { question: 'Which outcome is authoritative?', choices: ['Booked', 'Paid'], references: [] },
+    })
+    await expect(invokeTool(assigned, fixture.env, 'routine_proposal_submit', proposal, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: true, result: { status: 'waiting', reason: 'answer' } })
+
+    const observer = principal({ capabilities: [grant('observer', 'squad-1')] })
+    await expect(invokeTool(observer, fixture.env, 'routine_run_answer', { run_id: 'run-1', answer: 'Paid' }, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+    const responder = principal({ capabilities: [grant('member', 'squad-1')] })
+    await expect(invokeTool(responder, fixture.env, 'routine_run_answer', { run_id: 'run-1', answer: 'Unknown' }, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: false, status: 400, error: 'invalid_answer' })
+    await expect(invokeTool(responder, fixture.env, 'routine_run_answer', { run_id: 'run-1', answer: 'Paid' }, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: true, result: { run_id: 'run-1', duplicate: false } })
+    await expect(invokeTool(responder, fixture.env, 'routine_run_answer', { run_id: 'run-1', answer: 'Paid' }, 'https://pot.test'))
+      .resolves.toMatchObject({ ok: true, result: { run_id: 'run-1', duplicate: true } })
+    expect(fixture.harness.sqlite.prepare("SELECT status, result_summary FROM routine_runs WHERE id = 'run-1'").get())
+      .toEqual({ status: 'queued', result_summary: 'human_answered' })
   })
 
   it('denies agent-bound admins on every lifecycle tool and matches REST Run keys', async () => {

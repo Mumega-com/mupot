@@ -1,5 +1,5 @@
 import { listNeedsYou } from '../attention/service'
-import { cancelRoutineRun, submitRoutineProposal } from '../routines/actions'
+import { answerRoutineRun, cancelRoutineRun, submitRoutineProposal } from '../routines/actions'
 import { principalCanReadProject, routinePrincipal } from '../routines/access'
 import { publicRoutineRun } from '../routines/public'
 import {
@@ -111,10 +111,11 @@ function safeRoutine(routine: Routine): Omit<Routine, 'tenant'> {
 }
 
 function errorStatus(error: string): 400 | 403 | 404 | 409 | 500 {
-  if (['project_not_found', 'routine_not_found', 'run_not_found'].includes(error)) return 404
+  if (['project_not_found', 'routine_not_found', 'run_not_found', 'answer_not_found'].includes(error)) return 404
   if (error === 'forbidden') return 403
   if (['receipt_failed', 'invalid_state', 'routine_archived', 'routine_not_enabled', 'schedule_exhausted', 'run_terminal',
-    'run_not_accepting_proposal', 'action_key_conflict', 'proposal_already_submitted', 'stale_situation'].includes(error)) return 409
+    'run_not_accepting_proposal', 'action_key_conflict', 'proposal_already_submitted', 'stale_situation',
+    'answer_conflict', 'retry_exhausted'].includes(error)) return 409
   return 400
 }
 
@@ -314,6 +315,21 @@ const routineRunCancel: ToolSpec = {
   },
 }
 
+const routineRunAnswer: ToolSpec = {
+  name: 'routine_run_answer', scope: 'responsible writable squad Routine answer', min: 'member',
+  args: '{ run_id: string, answer: string }',
+  inputSchema: {
+    type: 'object', properties: { run_id: id(), answer: string(4000) },
+    required: ['run_id', 'answer'], additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (!validId(args.run_id)) return fail(404, 'run_not_found')
+    if (!boundedString(args.answer, 4000)) return fail(400, 'invalid_answer')
+    const result = await answerRoutineRun(env, routinePrincipal(auth), args.run_id, args.answer)
+    return result.ok ? done(result) : sourceFailure(result.error)
+  },
+}
+
 const routineProposalSubmit: ToolSpec = {
   name: 'routine_proposal_submit', scope: 'assigned agent routine proposal submission', min: 'member',
   args: '{ version: "routine.proposal/v1", run_id: string, project_id: string, situation_digest: string, summary: string, action: object }',
@@ -367,5 +383,5 @@ const needsYouList: ToolSpec = {
 export const ROUTINE_TOOLS: ToolSpec[] = [
   routineList, routineGet, routineCreate, routineUpdate,
   lifecycle('routine_enable', enableRoutine), lifecycle('routine_pause', pauseRoutine), lifecycle('routine_archive', archiveRoutine),
-  routineRunNow, routineRunList, routineRunGet, routineRunCancel, routineProposalSubmit, needsYouList,
+  routineRunNow, routineRunList, routineRunGet, routineRunAnswer, routineRunCancel, routineProposalSubmit, needsYouList,
 ]

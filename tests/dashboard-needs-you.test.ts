@@ -86,7 +86,7 @@ describe('Needs You dashboard', () => {
     expect(response.status).toBe(200)
     expect(body).toContain('Needs You')
     expect(body).toContain('Urgent')
-    expect(body).toContain('href="/api/routine-runs/routine-wait"')
+    expect(body).toContain('href="/projects/project-a/routines?run_id=routine-wait"')
     expect(body).toContain('>view<')
     expect(body).toContain('Continue queue')
     expect(body).not.toContain('needs_you_resolve')

@@ -149,6 +149,14 @@ describe('local project workspace showcase', () => {
         VALUES
           ('hermes-local', 'local', 'Superseded Hermes', 'hermes-cron', '[]', 'always_on', 'running', 'local-seed', datetime('now'), datetime('now')),
           ('codex-local', 'local', 'Superseded Codex', 'codex', '[]', 'on_demand', 'stopped', 'local-seed', datetime('now'), datetime('now'));
+        INSERT INTO routine_runs (
+          id, tenant, project_id, routine_id, routine_revision, policy_json,
+          occurrence_key, trigger_kind, status, created_at, updated_at
+        ) VALUES (
+          'run-local-seed-rerun', 'local', 'project-mupot', 'routine-local-propose', 1,
+          '{"execution_mode":"propose","overlap_policy":"skip","responsible_squad_id":"sq-growth","preferred_agent_id":"agent-hermes","budget_micro_usd":100000,"max_attempts":3,"retry_backoff_seconds":300}',
+          'manual:seed-rerun', 'manual', 'succeeded', datetime('now'), datetime('now')
+        );
       `)
 
       expect(() => harness.sqlite.exec(readFileSync(SEED_PATH, 'utf8'))).not.toThrow()

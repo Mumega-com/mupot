@@ -4,7 +4,7 @@ import { requireAuth } from '../auth'
 import { resolveCapabilities } from '../auth/capability'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import type { AuthContext, Env } from '../types'
-import { cancelRoutineRun, submitRoutineProposal } from './actions'
+import { answerRoutineRun, cancelRoutineRun, submitRoutineProposal } from './actions'
 import { routinePrincipal } from './access'
 import { publicRoutineRun, type PublicRoutineRun } from './public'
 import {
@@ -190,10 +190,11 @@ const safeRun = (run: Parameters<typeof publicRoutineRun>[0]): PublicRoutineRun 
 
 function errorStatus(error: string): 400 | 403 | 404 | 409 | 413 {
   if (error === 'payload_too_large') return 413
-  if (['project_not_found', 'routine_not_found', 'run_not_found'].includes(error)) return 404
+  if (['project_not_found', 'routine_not_found', 'run_not_found', 'answer_not_found'].includes(error)) return 404
   if (error === 'forbidden') return 403
   if (['receipt_failed', 'invalid_state', 'routine_archived', 'routine_not_enabled', 'schedule_exhausted', 'run_terminal',
     'run_not_accepting_proposal', 'action_key_conflict', 'proposal_already_submitted', 'stale_situation'].includes(error)) return 409
+  if (['answer_conflict', 'retry_exhausted'].includes(error)) return 409
   return 400
 }
 
@@ -303,6 +304,18 @@ routinesApp.post('/routine-runs/:runId/cancel', routineEndpoint, routineSessionC
   if (!parsed.ok) return failure(c, parsed.error)
   if (Object.keys(parsed.body).length) return failure(c, 'unknown_field')
   const result = await cancelRoutineRun(c.env, routinePrincipal(c.get('auth')), runId)
+  return result.ok ? c.json(result) : failure(c, result.error)
+})
+
+routinesApp.post('/routine-runs/:runId/answer', routineEndpoint, routineSessionCsrf, async (c) => {
+  const runId = c.req.param('runId')
+  if (!validId(runId)) return failure(c, 'run_not_found')
+  const parsed = await readObject(c)
+  if (!parsed.ok) return failure(c, parsed.error)
+  if (!only(parsed.body, ['answer']) || typeof parsed.body.answer !== 'string') {
+    return failure(c, 'invalid_answer')
+  }
+  const result = await answerRoutineRun(c.env, routinePrincipal(c.get('auth')), runId, parsed.body.answer)
   return result.ok ? c.json(result) : failure(c, result.error)
 })
 

@@ -552,6 +552,39 @@ export async function getRoutineRun(
   ).bind(id, env.TENANT_SLUG, ...visibility.binds).first<RoutineRun>()
 }
 
+/** Latest run for each requested Routine, bounded and authorized at the Project boundary. */
+export async function listLatestRoutineRuns(
+  env: Env,
+  principal: RoutinePrincipal,
+  projectId: string,
+  routineIds: string[],
+): Promise<RoutinePage<RoutineRun>> {
+  const ids = [...new Set(routineIds)]
+  if (ids.length > 100 || ids.some(id => boundedText(id, 1, 200) === null)) {
+    return { ok: false, error: 'invalid_pagination' }
+  }
+  if (!await principalCanReadProject(env, principal, projectId)) {
+    return { ok: false, error: 'project_not_found' }
+  }
+  if (ids.length === 0) return { ok: true, items: [], next_cursor: null }
+  const select = RUN_SELECT.split(',').map(column => `rr.${column.trim()}`).join(', ')
+  const result = await env.DB.prepare(
+    `SELECT ${select}
+       FROM routine_runs rr
+      WHERE rr.tenant = ? AND rr.project_id = ?
+        AND rr.routine_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+        AND NOT EXISTS (
+          SELECT 1 FROM routine_runs newer
+           WHERE newer.tenant = rr.tenant AND newer.project_id = rr.project_id
+             AND newer.routine_id = rr.routine_id
+             AND (newer.created_at > rr.created_at
+               OR (newer.created_at = rr.created_at AND newer.id < rr.id))
+        )
+      ORDER BY rr.created_at DESC, rr.id ASC`,
+  ).bind(env.TENANT_SLUG, projectId, JSON.stringify(ids)).all<RoutineRun>()
+  return { ok: true, items: result.results ?? [], next_cursor: null }
+}
+
 export async function listRoutineRuns(
   env: Env,
   principal: RoutinePrincipal,

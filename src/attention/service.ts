@@ -182,8 +182,8 @@ function itemFrom(row: SourceRow, principal: RoutinePrincipal): NeedsYouItem {
     created_at: row.created_at,
     deadline_at: row.deadline_at,
     safe_url: row.source_type === 'task'
-      ? `/api/tasks/${safePath(row.source_id)}`
-      : `/api/routine-runs/${safePath(row.source_id)}`,
+      ? `/projects/${safePath(row.project_id)}#work`
+      : `/projects/${safePath(row.project_id)}/routines?run_id=${safePath(row.source_id)}`,
     allowed_actions: actionsFor(row, principal),
   }
 }

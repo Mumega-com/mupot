@@ -25,6 +25,7 @@ import {
 } from './proposal'
 import type { RoutinePolicySnapshot } from './types'
 import { isCancellationPending, sqlNotCancellationPending } from './cancellation-fence'
+import { routineControlId } from './identity'
 
 const ROUTINE_GATE = 'gate:routines'
 const ROUTINE_ACTOR = 'mupot-routines'
@@ -56,6 +57,16 @@ export type RoutineActionResult =
 export type RoutineCancellationResult =
   | { ok: true; run_id: string; duplicate: boolean; outcome: 'confirmed' | 'unconfirmed' }
   | { ok: false; error: 'run_not_found' | 'forbidden' | 'run_terminal' | 'receipt_failed' }
+
+export interface RoutinePendingQuestion {
+  action_key: string
+  question: string
+  choices: string[]
+}
+
+export type RoutineAnswerResult =
+  | { ok: true; run_id: string; duplicate: boolean }
+  | { ok: false; error: 'run_not_found' | 'forbidden' | 'answer_not_found' | 'invalid_answer' | 'answer_conflict' | 'retry_exhausted' | 'run_terminal' | 'receipt_failed' }
 
 type CancellationOutcomeKind = 'cancellation_confirmed' | 'cancellation_unconfirmed'
 
@@ -217,6 +228,32 @@ async function loadAction(env: Env, runId: string, actionKey: string): Promise<A
             receipt_id, result_json
        FROM routine_run_actions WHERE run_id = ? AND action_key = ? AND tenant = ?`,
   ).bind(runId, actionKey, env.TENANT_SLUG).first<ActionRow>()
+}
+
+async function loadHumanAction(env: Env, runId: string): Promise<ActionRow | null> {
+  return env.DB.prepare(
+    `SELECT id, tenant, project_id, run_id, action_key, kind, input_json,
+            validation_status, gate_status, status, source_type, source_id,
+            receipt_id, result_json
+       FROM routine_run_actions
+      WHERE run_id = ? AND tenant = ? AND kind = 'ask_human'
+      ORDER BY updated_at DESC, id DESC LIMIT 1`,
+  ).bind(runId, env.TENANT_SLUG).first<ActionRow>()
+}
+
+function pendingQuestion(action: ActionRow): RoutinePendingQuestion | null {
+  try {
+    const input = JSON.parse(action.input_json) as Record<string, unknown>
+    if (typeof input.question !== 'string') return null
+    const choices = input.choices === undefined
+      ? []
+      : Array.isArray(input.choices) && input.choices.every(value => typeof value === 'string')
+        ? input.choices as string[]
+        : null
+    return choices ? { action_key: action.action_key, question: input.question, choices } : null
+  } catch {
+    return null
+  }
 }
 
 async function deterministicUuid(namespace: string, value: string): Promise<string> {
@@ -789,6 +826,21 @@ async function cancelControlTask(env: Env, run: Pick<RunContext, 'task_id' | 'pr
   let task = await loadTask(env, run.task_id)
   if (!task || task.project_id !== run.project_id) return false
   if (task.status === 'blocked' || task.status === 'done') return true
+  if (task.status === 'open') {
+    const existing = task
+    task = { ...task, status: 'in_progress' }
+    stampTaskUpdate(task, existing.status, new Date().toISOString())
+    try {
+      await persistTaskUpdate(env, existing, task)
+      await emitTaskEvent(env, 'task.updated', task, { kind: 'member', id: ROUTINE_ACTOR })
+    } catch (error) {
+      if (!(error instanceof TaskUpdateConflictError)) throw error
+      const raced = await loadTask(env, run.task_id)
+      if (raced?.status === 'blocked' || raced?.status === 'done') return true
+      if (raced?.status !== 'in_progress') return false
+      task = raced
+    }
+  }
   if (checkTransition(task.status, 'blocked')) return false
   const existing = task
   task = { ...task, status: 'blocked', result: 'Routine cancelled by operator.' }
@@ -812,7 +864,10 @@ async function cancelControlFlight(env: Env, run: Pick<RunContext, 'flight_id' |
   if (!run.flight_id) return { stopped: true, confirmable: true }
   const flight = await getFlight(env, run.flight_id)
   if (!flight || flight.project_id !== run.project_id) return { stopped: false, confirmable: false }
-  if (flight.status === 'failed' || flight.status === 'held') return { stopped: true, confirmable: true }
+  if (flight.status === 'failed') {
+    return { stopped: true, confirmable: flight.gate_reason !== 'routine_cancelled' }
+  }
+  if (flight.status === 'held') return { stopped: true, confirmable: true }
   if (flight.status === 'landed') return { stopped: false, confirmable: false }
   // Best-effort DB fail — local status change is NOT a runtime acknowledgement.
   await failFlight(env, flight.id, 'routine_cancelled')
@@ -1232,6 +1287,136 @@ export async function executeRoutineAction(
   }
 }
 
+export async function getRoutinePendingQuestion(
+  env: Env,
+  principal: RoutinePrincipal,
+  runId: string,
+): Promise<RoutinePendingQuestion | null> {
+  const run = await loadRun(env, runId)
+  if (!run || run.status !== 'waiting' || run.waiting_reason !== 'answer') return null
+  if (principal.actor_type !== 'member' || !await principalCanReadProject(env, principal, run.project_id)) return null
+  const policy = parsePolicy(run.policy_json)
+  if (!policy || !await principalCanRunForSquad(env, principal, run.project_id, policy.responsible_squad_id)) return null
+  const action = await loadHumanAction(env, run.id)
+  return action?.status === 'waiting' ? pendingQuestion(action) : null
+}
+
+export async function answerRoutineRun(
+  env: Env,
+  principal: RoutinePrincipal,
+  runId: string,
+  rawAnswer: unknown,
+): Promise<RoutineAnswerResult> {
+  const run = await loadRun(env, runId)
+  if (!run || !await principalCanReadProject(env, principal, run.project_id)) {
+    return { ok: false, error: 'run_not_found' }
+  }
+  if (principal.actor_type !== 'member') return { ok: false, error: 'forbidden' }
+  const policy = parsePolicy(run.policy_json)
+  if (!policy || !await principalCanRunForSquad(env, principal, run.project_id, policy.responsible_squad_id)) {
+    return { ok: false, error: 'forbidden' }
+  }
+  const answer = typeof rawAnswer === 'string' ? rawAnswer.trim() : ''
+  if (answer.length < 1 || new TextEncoder().encode(answer).byteLength > 4000) {
+    return { ok: false, error: 'invalid_answer' }
+  }
+  const action = await loadHumanAction(env, run.id)
+  if (!action) return { ok: false, error: 'answer_not_found' }
+  const question = pendingQuestion(action)
+  if (!question || (question.choices.length > 0 && !question.choices.includes(answer))) {
+    return { ok: false, error: 'invalid_answer' }
+  }
+  if (action.status === 'succeeded' && action.result_json) {
+    try {
+      const stored = JSON.parse(action.result_json) as Record<string, unknown>
+      return stored.answer === answer
+        ? { ok: true, run_id: run.id, duplicate: true }
+        : { ok: false, error: 'answer_conflict' }
+    } catch {
+      return { ok: false, error: 'receipt_failed' }
+    }
+  }
+  if (['succeeded', 'failed', 'skipped', 'cancelled'].includes(run.status)) {
+    return { ok: false, error: 'run_terminal' }
+  }
+  if (run.status !== 'waiting' || run.waiting_reason !== 'answer' || action.status !== 'waiting') {
+    return { ok: false, error: 'answer_not_found' }
+  }
+  if (run.attempt >= policy.max_attempts) return { ok: false, error: 'retry_exhausted' }
+
+  try {
+    await completeControlTask(env, run)
+    await landControlFlight(env, run)
+  } catch {
+    return { ok: false, error: 'receipt_failed' }
+  }
+
+  const now = new Date().toISOString()
+  const receiptId = crypto.randomUUID()
+  const resultJson = canonicalJson({ answer, answered_by: principal.actor_id })
+  const outcomes = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE routine_run_actions
+          SET status = 'succeeded', result_json = ?, receipt_id = ?, updated_at = ?
+        WHERE id = ? AND tenant = ? AND status = 'waiting' AND kind = 'ask_human'
+          AND EXISTS (
+            SELECT 1 FROM routine_runs
+             WHERE id = ? AND tenant = ? AND status = 'waiting' AND waiting_reason = 'answer'
+               AND ${sqlNotCancellationPending('routine_runs')}
+          )`,
+    ).bind(resultJson, receiptId, now, action.id, run.tenant, run.id, run.tenant),
+    env.DB.prepare(
+      `UPDATE routine_runs
+          SET status = 'queued', waiting_reason = NULL, lease_owner = NULL,
+              lease_expires_at = NULL, retry_at = NULL, task_id = NULL, flight_id = NULL,
+              situation_digest = NULL, proposal_json = NULL, result_summary = 'human_answered',
+              finished_at = NULL, updated_at = ?
+        WHERE id = ? AND tenant = ? AND status = 'waiting' AND waiting_reason = 'answer'
+          AND ${sqlNotCancellationPending('routine_runs')}
+          AND EXISTS (
+            SELECT 1 FROM routine_run_actions
+             WHERE id = ? AND tenant = ? AND status = 'succeeded'
+               AND receipt_id = ? AND result_json = ?
+          )`,
+    ).bind(now, run.id, run.tenant, action.id, run.tenant, receiptId, resultJson),
+    env.DB.prepare(
+      `INSERT INTO routine_run_events (
+         id, tenant, project_id, run_id, kind, actor_type, actor_id,
+         occurred_at, metadata_json, correlation_id
+       ) SELECT ?, tenant, project_id, id, 'action_completed', 'member', ?, ?, ?, id
+           FROM routine_runs
+          WHERE id = ? AND tenant = ? AND status = 'queued' AND updated_at = ?
+            AND EXISTS (
+              SELECT 1 FROM routine_run_actions
+               WHERE id = ? AND tenant = ? AND status = 'succeeded' AND receipt_id = ?
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM routine_run_events e
+               WHERE e.run_id = routine_runs.id AND e.tenant = routine_runs.tenant
+                 AND e.kind = 'action_completed'
+                 AND json_extract(e.metadata_json, '$.action_key') = ?
+                 AND json_extract(e.metadata_json, '$.reason') = 'human_answered'
+            )`,
+    ).bind(
+      crypto.randomUUID(), principal.actor_id, now,
+      JSON.stringify({ action_key: action.action_key, reason: 'human_answered' }),
+      run.id, run.tenant, now, action.id, run.tenant, receiptId, action.action_key,
+    ),
+  ])
+  if (outcomes.every(wrote)) return { ok: true, run_id: run.id, duplicate: false }
+  const raced = await loadHumanAction(env, run.id)
+  if (raced?.status === 'succeeded' && raced.result_json) {
+    try {
+      const stored = JSON.parse(raced.result_json) as Record<string, unknown>
+      if (stored.answer === answer) return { ok: true, run_id: run.id, duplicate: true }
+      return { ok: false, error: 'answer_conflict' }
+    } catch {
+      return { ok: false, error: 'receipt_failed' }
+    }
+  }
+  return { ok: false, error: 'receipt_failed' }
+}
+
 /** Cancel an accessible nonterminal run and record durable cancellation receipts. */
 export async function cancelRoutineRun(
   env: Env,
@@ -1328,12 +1513,12 @@ export async function cancelRoutineRun(
   let taskId = live.task_id
   let flightId = live.flight_id
   if (!taskId) {
-    const candidate = await deterministicUuid('task', `${live.id}:${live.attempt}`)
+    const candidate = await routineControlId('task', `${live.id}:${live.attempt}`)
     const existing = await loadTask(env, candidate)
     if (existing && existing.project_id === live.project_id) taskId = candidate
   }
   if (!flightId) {
-    const candidate = await deterministicUuid('flight', `${live.id}:${live.attempt}`)
+    const candidate = await routineControlId('flight', `${live.id}:${live.attempt}`)
     const existing = await getFlight(env, candidate)
     if (existing && existing.project_id === live.project_id) flightId = candidate
   }
@@ -1344,9 +1529,13 @@ export async function cancelRoutineRun(
   ).bind(live.id, live.tenant).first()
   const deliveredMessage = await env.DB.prepare(
     `SELECT 1 FROM agent_messages
-      WHERE tenant = ? AND project_id = ? AND from_agent = ? AND request_id = ?
+      WHERE tenant = ? AND project_id = ? AND from_agent = ?
+        AND (request_id = ? OR instr(request_id, ? || ':attempt:') = 1)
       LIMIT 1`,
-  ).bind(live.tenant, live.project_id, ROUTINE_ACTOR, `routine-run:${live.id}`).first()
+  ).bind(
+    live.tenant, live.project_id, ROUTINE_ACTOR,
+    `routine-run:${live.id}`, `routine-run:${live.id}`,
+  ).first()
   const taskConfirmed = await cancelControlTask(env, children)
   const flightCancel = await cancelControlFlight(env, children)
   // A delivered inbox request is external work unless the runtime supplies an acknowledgement.

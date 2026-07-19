@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../src/types'
 import { dispatchRoutineRun } from '../src/routines/dispatch'
+import { cancelRoutineRun } from '../src/routines/actions'
+import type { RoutinePrincipal } from '../src/routines/access'
 import { MAX_SCHEDULER_DB_STATEMENTS } from '../src/routines/scheduler'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -283,6 +285,63 @@ describe('routine runtime-neutral dispatch', () => {
     expect(first).toMatchObject({ ok: true, status: 'dispatched', duplicate: false })
     expect(replay).toMatchObject({ ok: true, status: 'dispatched', duplicate: true })
     expect(row(harness, "SELECT COUNT(*) AS count FROM agent_messages WHERE request_id = 'routine-run:run-1'")).toEqual({ count: 1 })
+  })
+
+  it('uses a fresh request envelope with the durable human answer on a resumed attempt', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      UPDATE routine_runs SET attempt = 2 WHERE id = 'run-1';
+      INSERT INTO routine_run_actions (
+        id, tenant, project_id, run_id, action_key, kind, input_json,
+        validation_status, gate_status, status, receipt_id, result_json
+      ) VALUES (
+        'answered-action', 'tenant-a', 'project-1', 'run-1', 'question-1', 'ask_human',
+        '{"question":"Which event is authoritative?","choices":["Booked","Paid"],"references":[]}',
+        'accepted', 'not_required', 'succeeded', 'answer-receipt',
+        '{"answer":"Paid","answered_by":"member-1"}'
+      );
+    `)
+
+    const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
+    expect(result).toMatchObject({ ok: true, status: 'dispatched' })
+    const message = row(harness, "SELECT request_id, body FROM agent_messages WHERE request_id = 'routine-run:run-1:attempt:2'")
+    expect(message?.request_id).toBe('routine-run:run-1:attempt:2')
+    expect(JSON.parse(String(message?.body))).toMatchObject({
+      human_response: { question: 'Which event is authoritative?', answer: 'Paid' },
+    })
+  })
+
+  it('reconstructs deterministic children after dispatch crashes before binding them to the run', async () => {
+    harness = makeHarness()
+    const base = envFor(harness)
+    const db = harness.db
+    const crashingEnv: Env = {
+      ...base,
+      DB: {
+        prepare: db.prepare.bind(db),
+        async batch() { throw new Error('simulated crash before child binding') },
+      } as unknown as D1Database,
+    }
+
+    await expect(dispatchRoutineRun(crashingEnv, 'run-1', NOW)).rejects.toThrow(/child binding/)
+    expect(row(harness, 'SELECT COUNT(*) AS count FROM tasks')).toEqual({ count: 1 })
+    expect(row(harness, 'SELECT COUNT(*) AS count FROM flights')).toEqual({ count: 1 })
+    expect(row(harness, "SELECT task_id, flight_id FROM routine_runs WHERE id = 'run-1'")).toEqual({
+      task_id: null, flight_id: null,
+    })
+
+    const administrator: RoutinePrincipal = {
+      tenant: 'tenant-a', actor_type: 'member', actor_id: 'owner-1', workspace_admin: true,
+      grants: [],
+      project_read: { workspaceAdmin: true, orgRead: true, squadIds: [], departmentIds: [] },
+    }
+    await expect(cancelRoutineRun(base, administrator, 'run-1')).resolves.toEqual({
+      ok: true, run_id: 'run-1', duplicate: false, outcome: 'unconfirmed',
+    })
+    expect(row(harness, 'SELECT status FROM tasks LIMIT 1')).toEqual({ status: 'blocked' })
+    expect(row(harness, 'SELECT status, gate_reason FROM flights LIMIT 1')).toEqual({
+      status: 'failed', gate_reason: 'routine_cancelled',
+    })
   })
 
   it('rejects a stale Routine revision or revoked Project write edge before creating work', async () => {

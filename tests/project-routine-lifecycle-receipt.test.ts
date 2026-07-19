@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { deflateSync } from 'node:zlib'
 import { describe, expect, it } from 'vitest'
 import {
   CHECK_RECEIPT_TYPE,
@@ -26,7 +27,39 @@ const TARGET = {
   version: VERSION,
 }
 
-const PNG_HEADER = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00])
+function crc32(buffer: Buffer): number {
+  let crc = 0xffffffff
+  for (const byte of buffer) {
+    crc ^= byte
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0)
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function pngChunk(type: string, data: Buffer): Buffer {
+  const typeBytes = Buffer.from(type, 'ascii')
+  const length = Buffer.alloc(4)
+  length.writeUInt32BE(data.length)
+  const crc = Buffer.alloc(4)
+  crc.writeUInt32BE(crc32(Buffer.concat([typeBytes, data])))
+  return Buffer.concat([length, typeBytes, data, crc])
+}
+
+function screenshotPng(): Buffer {
+  const width = 320
+  const height = 200
+  const header = Buffer.alloc(13)
+  header.writeUInt32BE(width, 0)
+  header.writeUInt32BE(height, 4)
+  header.set([8, 2, 0, 0, 0], 8)
+  const rows = Buffer.alloc(height * (1 + width * 3))
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', header),
+    pngChunk('IDAT', deflateSync(rows)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ])
+}
 
 function tempDir() {
   return mkdtempSync(join(tmpdir(), 'mupot-project-routine-lifecycle-'))
@@ -107,7 +140,7 @@ function baseReceipt(step: string, evidence: Record<string, unknown>, observedAt
 function writeScreenshots(dir: string) {
   mkdirSync(join(dir, 'screenshots'), { recursive: true })
   for (const relative of REQUIRED_SCREENSHOTS) {
-    writeFileSync(join(dir, relative), PNG_HEADER)
+    writeFileSync(join(dir, relative), screenshotPng())
   }
 }
 
@@ -214,6 +247,40 @@ describe('project routine lifecycle receipt checker', () => {
     }))
   })
 
+  it('rejects a truncated PNG signature without decodable image data', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+    writeFileSync(
+      join(dir, 'screenshots/mobile-propose-mode.png'),
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    )
+
+    const receipt = checkBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'screenshot_is_png',
+      path: 'screenshots/mobile-propose-mode.png',
+    }))
+  })
+
+  it('rejects trailing data after the PNG end chunk', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+    writeFileSync(
+      join(dir, 'screenshots/mobile-propose-mode.png'),
+      Buffer.concat([screenshotPng(), Buffer.from('not-image-data')]),
+    )
+
+    const receipt = checkBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'screenshot_is_png',
+      path: 'screenshots/mobile-propose-mode.png',
+    }))
+  })
+
   it('fails when screenshots are absent entirely', () => {
     const missingDir = tempDir()
     REQUIRED_STEPS.forEach((spec, index) => {
@@ -262,6 +329,45 @@ describe('project routine lifecycle receipt checker', () => {
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
       check: 'target_version_matches_expected',
+    }))
+  })
+
+  it('fails when any receipt omits a target identity field', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      if (file === 'manual-fire.json') delete (receipt.target as Record<string, unknown>).commit
+    })
+
+    const receipt = checkBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'target_field_consistent_across_receipts',
+      field: 'commit',
+    }))
+  })
+
+  it('rejects stringified false proof and a nonterminal status', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      if (file === 'terminal-outcome.json') {
+        const evidence = receipt.evidence as Record<string, unknown>
+        evidence.unauthorized_rejected = 'no'
+        evidence.terminal_status = 'running'
+      }
+    })
+
+    const receipt = checkBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'required_evidence_present',
+      evidence: 'unauthorized_rejected',
+    }))
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'required_evidence_present',
+      evidence: 'terminal_status',
     }))
   })
 

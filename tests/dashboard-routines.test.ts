@@ -65,13 +65,13 @@ function makeHarness(): SqliteD1Harness {
       scheduled_for, status, waiting_reason, attempt, assigned_agent_id, cost_micro_usd, result_summary,
       created_at, updated_at, finished_at
     ) VALUES
-      ('run-waiting', 'tenant-a', 'project-a', 'routine-enabled', 2, '{}', 'cron:waiting', 'cron',
+      ('run-waiting', 'tenant-a', 'project-a', 'routine-enabled', 2, '{"execution_mode":"execute_internal","overlap_policy":"queue","responsible_squad_id":"squad-a","preferred_agent_id":"agent-a","budget_micro_usd":200000,"max_attempts":4,"retry_backoff_seconds":600}', 'cron:waiting', 'cron',
        '2026-07-20T10:00:00.000Z', 'waiting', 'review', 1, 'agent-a', 1200, NULL,
        '2026-07-19T11:00:00.000Z', '2026-07-19T11:00:00.000Z', NULL),
-      ('run-failed', 'tenant-a', 'project-a', 'routine-enabled', 2, '{}', 'cron:failed', 'cron',
+      ('run-failed', 'tenant-a', 'project-a', 'routine-enabled', 2, '{"execution_mode":"execute_internal","overlap_policy":"queue","responsible_squad_id":"squad-a","preferred_agent_id":"agent-a","budget_micro_usd":200000,"max_attempts":4,"retry_backoff_seconds":600}', 'cron:failed', 'cron',
        '2026-07-19T09:00:00.000Z', 'failed', NULL, 3, 'agent-a', 2000, 'execution_failed',
        '2026-07-19T09:00:00.000Z', '2026-07-19T09:10:00.000Z', '2026-07-19T09:10:00.000Z'),
-      ('run-terminal', 'tenant-a', 'project-a', 'routine-paused', 2, '{}', 'once:terminal', 'once',
+      ('run-terminal', 'tenant-a', 'project-a', 'routine-paused', 2, '{"execution_mode":"propose","overlap_policy":"skip","responsible_squad_id":"squad-a","preferred_agent_id":null,"budget_micro_usd":0,"max_attempts":3,"retry_backoff_seconds":300}', 'once:terminal', 'once',
        '2026-07-18T09:00:00.000Z', 'succeeded', NULL, 1, 'agent-a', 100, 'task_created',
        '2026-07-18T09:00:00.000Z', '2026-07-18T09:10:00.000Z', '2026-07-18T09:10:00.000Z');
     INSERT INTO routine_run_events (id, tenant, project_id, run_id, kind, actor_type, actor_id, occurred_at, metadata_json, correlation_id)
@@ -83,7 +83,10 @@ function makeHarness(): SqliteD1Harness {
 }
 
 function envFor(harness: SqliteD1Harness): Env {
-  return { DB: harness.db, SESSIONS: sessions(), TENANT_SLUG: 'tenant-a', BRAND: 'Mupot' } as unknown as Env
+  return {
+    DB: harness.db, SESSIONS: sessions(), TENANT_SLUG: 'tenant-a', BRAND: 'Mupot',
+    BUS: { send: vi.fn(async () => undefined) },
+  } as unknown as Env
 }
 
 function actor(overrides: Partial<AuthContext> = {}): AuthContext {
@@ -147,6 +150,65 @@ describe('Project Routines dashboard', () => {
     const detailBody = await detail.text()
     expect(detailBody).toContain('Run detail: run-waiting')
     expect(detailBody).toContain('Cancel run')
+
+    harness.sqlite.exec(`
+      INSERT INTO routine_run_events (id, tenant, project_id, run_id, kind, actor_type, actor_id, occurred_at, metadata_json, correlation_id)
+      VALUES ('event-c', 'tenant-a', 'project-a', 'run-waiting', 'proposal_received', 'agent', 'agent-a', '2026-07-19T10:59:00.000Z', '{}', 'run-waiting');
+    `)
+    const filtered = await dashboardApp.fetch(new Request('https://pot.test/projects/project-a/routines?run_id=run-waiting&event_limit=1'), env)
+    expect(await filtered.text()).toContain('routines?run_id=run-waiting&amp;event_cursor=')
+
+    const offPageDetail = await dashboardApp.fetch(new Request('https://pot.test/projects/project-a/routines?routine_limit=1&routine_id=routine-paused'), env)
+    const offPageBody = await offPageDetail.text()
+    expect(offPageBody).toContain('Routine: Paused routine')
+    expect(offPageBody).toContain('Current Succeeded')
+    expect(offPageBody).not.toContain('Current No run yet')
+
+    harness.sqlite.exec(`
+      INSERT INTO tasks (
+        id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, created_at, updated_at
+      ) VALUES (
+        'answer-control-task', 'squad-a', 'project-a', 'Answer control', '',
+        'A correlated Routine proposal is accepted.', 'in_progress', 'agent-a',
+        '2026-07-19T11:00:00.000Z', '2026-07-19T11:00:00.000Z'
+      );
+      INSERT INTO flights (
+        id, tenant, project_id, agent, goal, status, trigger_source,
+        budget_micro_usd, cost_micro_usd, created_at, started_at, meta
+      ) VALUES (
+        'answer-control-flight', 'tenant-a', 'project-a', 'agent-a', 'Ask a human', 'running', 'schedule',
+        200000, 0, 1752940800000, 1752940800000,
+        '{"schema":"mupot.flight.meta/v1","goal_id":"routine:run-waiting","objective_id":"routine:routine-enabled:2","squad_ids":["squad-a"],"task_ids":["answer-control-task"],"done_when":["A correlated Routine proposal is accepted."],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null,"routine_run_id":"run-waiting","routine_revision":2}'
+      );
+      UPDATE routine_runs
+         SET waiting_reason = 'answer', task_id = 'answer-control-task',
+             flight_id = 'answer-control-flight', assigned_agent_id = 'agent-a'
+       WHERE id = 'run-waiting';
+      INSERT INTO routine_run_actions (
+        id, tenant, project_id, run_id, action_key, kind, input_json,
+        validation_status, gate_status, status, source_type, source_id
+      ) VALUES (
+        'answer-action', 'tenant-a', 'project-a', 'run-waiting', 'question-1', 'ask_human',
+        '{"question":"Which event is authoritative?","choices":["Booked","Paid"],"references":[]}',
+        'accepted', 'not_required', 'waiting', 'question', 'answer-action'
+      );
+    `)
+    const questionPage = await dashboardApp.fetch(new Request('https://pot.test/projects/project-a/routines?run_id=run-waiting'), env)
+    const questionBody = await questionPage.text()
+    expect(questionBody).toContain('Which event is authoritative?')
+    expect(questionBody).toContain('action="/projects/project-a/routines/run-waiting/answer"')
+    expect(questionBody).toContain('Submit answer')
+
+    const answered = await dashboardApp.fetch(post('/projects/project-a/routines/run-waiting/answer', { answer: 'Paid' }), env)
+    expect({
+      task: harness.sqlite.prepare("SELECT status FROM tasks WHERE id = 'answer-control-task'").get(),
+      flight: harness.sqlite.prepare("SELECT status FROM flights WHERE id = 'answer-control-flight'").get(),
+    }).toEqual({ task: { status: 'done' }, flight: { status: 'landed' } })
+    expect(answered.status).toBe(303)
+    expect(answered.headers.get('location')).toContain('status=answer_recorded')
+    expect(harness.sqlite.prepare("SELECT status, result_summary FROM routine_runs WHERE id = 'run-waiting'").get()).toEqual({
+      status: 'queued', result_summary: 'human_answered',
+    })
   })
 
   it('hides an unreadable Project and preserves empty and validation-error states', async () => {

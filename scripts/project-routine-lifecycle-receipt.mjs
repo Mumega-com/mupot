@@ -9,6 +9,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { inflateSync } from 'node:zlib'
 
 export const STEP_RECEIPT_TYPE = 'mupot-project-routine-lifecycle-step/v1'
 export const CHECK_RECEIPT_TYPE = 'mupot-project-routine-lifecycle/v1'
@@ -364,14 +365,27 @@ function artifactMeta(path, receipt) {
   }
 }
 
-function evidenceValuePass(value) {
-  if (value === true) return true
-  if (typeof value === 'string') {
-    return value.trim().length > 0 && !/^false|fail|missing|todo|n\/a$/i.test(value.trim())
-  }
-  if (typeof value === 'number') return Number.isFinite(value)
-  if (Array.isArray(value)) return value.length > 0
-  if (value && typeof value === 'object') return true
+const TRUE_EVIDENCE = new Set([
+  'project_active', 'created_by_operator', 'trigger_configured', 'enabled', 'run_observed',
+  'correlated_proposal', 'situation_digest_matched', 'human_approval_recorded',
+  'external_action_gated', 'external_action_executed', 'external_action_approved',
+  'cost_recorded', 'activity_visible', 'evidence_visible', 'situation_updated',
+  'idempotent_duplicate_noop', 'unauthorized_rejected', 'worker_restarted',
+  'durable_state_preserved',
+])
+
+const IDENTIFIER_EVIDENCE = new Set([
+  'routine_id', 'project_id', 'routine_run_id', 'occurrence_id', 'agent_identity', 'needs_you_item_id',
+])
+
+function evidenceValuePass(key, value) {
+  if (TRUE_EVIDENCE.has(key)) return value === true
+  if (IDENTIFIER_EVIDENCE.has(key)) return typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,200}$/.test(value)
+  if (key === 'mode') return value === 'propose' || value === 'execute_internal'
+  if (key === 'terminal_status') return ['succeeded', 'failed', 'skipped', 'cancelled'].includes(value)
+  if (key === 'commit') return typeof value === 'string' && COMMIT_RE.test(value)
+  if (key === 'version') return typeof value === 'string' && VERSION_RE.test(value)
+  if (key === 'surface_parity') return surfaceParityComplete(value)
   return false
 }
 
@@ -419,12 +433,75 @@ function gitHead(repoRoot) {
   }
 }
 
+function crc32(buffer) {
+  let crc = 0xffffffff
+  for (const byte of buffer) {
+    crc ^= byte
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0)
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
 function isPngScreenshot(path) {
   if (!existsSync(path)) return false
   const stats = statSync(path)
-  if (!stats.isFile() || stats.size < 8) return false
-  const header = readFileSync(path).subarray(0, 8)
-  return header.equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  if (!stats.isFile() || stats.size < 45) return false
+  const png = readFileSync(path)
+  if (!png.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return false
+  try {
+    let offset = 8
+    let width = 0
+    let height = 0
+    let bitDepth = 0
+    let colorType = -1
+    let interlace = -1
+    let sawHeader = false
+    let sawEnd = false
+    const data = []
+    while (offset + 12 <= png.length) {
+      const length = png.readUInt32BE(offset)
+      const end = offset + 12 + length
+      if (end > png.length) return false
+      const type = png.subarray(offset + 4, offset + 8).toString('ascii')
+      const chunk = png.subarray(offset + 8, offset + 8 + length)
+      const expectedCrc = png.readUInt32BE(offset + 8 + length)
+      if (crc32(png.subarray(offset + 4, offset + 8 + length)) !== expectedCrc) return false
+      if (!sawHeader && type !== 'IHDR') return false
+      if (type === 'IHDR') {
+        if (sawHeader || length !== 13) return false
+        width = chunk.readUInt32BE(0)
+        height = chunk.readUInt32BE(4)
+        bitDepth = chunk[8]
+        colorType = chunk[9]
+        interlace = chunk[12]
+        if (chunk[10] !== 0 || chunk[11] !== 0) return false
+        sawHeader = true
+      } else if (type === 'IDAT') {
+        data.push(chunk)
+      } else if (type === 'IEND') {
+        if (length !== 0) return false
+        sawEnd = true
+        offset = end
+        break
+      }
+      offset = end
+    }
+    if (!sawHeader || !sawEnd || offset !== png.length || data.length === 0
+      || width < 320 || height < 200 || interlace !== 0 || bitDepth !== 8
+      || ![2, 6].includes(colorType)) return false
+    const channels = colorType === 2 ? 3 : 4
+    const pixels = inflateSync(Buffer.concat(data))
+    const rowBytes = Math.ceil((width * channels * bitDepth) / 8)
+    if (pixels.length !== height * (rowBytes + 1)) return false
+    for (let row = 0; row < height; row += 1) {
+      if (pixels[row * (rowBytes + 1)] > 4) return false
+    }
+    return true
+  } catch {
+    return false
+  }
 }
 
 function surfaceParityComplete(value) {
@@ -533,7 +610,7 @@ export function checkBundle(opts = {}) {
     }
     for (const key of spec.evidence) {
       const value = receipt?.evidence?.[key]
-      pushCheck(checks, evidenceValuePass(value), 'required_evidence_present', {
+      pushCheck(checks, evidenceValuePass(key, value), 'required_evidence_present', {
         path,
         step: spec.step,
         evidence: key,
@@ -569,12 +646,16 @@ export function checkBundle(opts = {}) {
   ]
   const target = {}
   for (const field of targetFields) {
-    const values = [...new Set(receipts.map(({ receipt }) => targetValue(receipt, field)).filter(Boolean))]
-    pushCheck(checks, values.length === (receipts.length > 0 ? 1 : 0), 'target_field_consistent_across_receipts', {
+    const receiptValues = receipts.map(({ receipt }) => targetValue(receipt, field))
+    const values = [...new Set(receiptValues.filter(Boolean))]
+    const complete = receipts.length > 0 && receiptValues.every(Boolean)
+    pushCheck(checks, complete && values.length === 1, 'target_field_consistent_across_receipts', {
       field,
       values,
+      receipts_with_value: receiptValues.filter(Boolean).length,
+      receipt_count: receipts.length,
     })
-    target[field] = values.length === 1 ? values[0] : null
+    target[field] = complete && values.length === 1 ? values[0] : null
   }
 
   pushCheck(checks, Boolean(target.commit) && COMMIT_RE.test(String(target.commit)), 'target_commit_shape', {

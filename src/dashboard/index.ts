@@ -146,7 +146,7 @@ import {
   pauseRoutine,
   updateRoutine,
 } from '../routines/service'
-import { cancelRoutineRun } from '../routines/actions'
+import { answerRoutineRun, cancelRoutineRun } from '../routines/actions'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
@@ -504,6 +504,22 @@ dashboardApp.post('/projects/:id/routines/:runId/cancel', async (c) => {
     return c.html(shell(c.env, 'Project routines', view ? routineWorkspaceBody(view, { error: result.error }) : projectNotFoundBody()), routineDashboardErrorStatus(result.error))
   }
   return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?status=run_cancelled`, 303)
+})
+
+dashboardApp.post('/projects/:id/routines/:runId/answer', async (c) => {
+  const projectId = c.req.param('id')
+  const runId = c.req.param('runId')
+  const auth = c.get('auth')
+  const principal = routinePrincipal(auth)
+  const run = await getRoutineRun(c.env, principal, runId)
+  if (!run || run.project_id !== projectId) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const form = await c.req.parseBody()
+  const result = await answerRoutineRun(c.env, principal, runId, form.answer)
+  if (!result.ok) {
+    const view = await loadRoutineWorkspace(c.env, auth, projectId, { runId })
+    return c.html(shell(c.env, 'Project routines', view ? routineWorkspaceBody(view, { error: result.error }) : projectNotFoundBody()), routineDashboardErrorStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?run_id=${encodeURIComponent(runId)}&status=answer_recorded`, 303)
 })
 
 dashboardApp.get('/projects/:id', async (c) => {
