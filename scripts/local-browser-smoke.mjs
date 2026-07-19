@@ -250,8 +250,8 @@ async function runProjectWorkspaceWorkflow() {
   }
 
   const primaryNavigation = await page.locator('#app-nav > a.nav-link .nav-label').allInnerTexts()
-  const expectedPrimaryNavigation = ['Home', 'Projects', 'Work', 'Approvals']
-  if (JSON.stringify(primaryNavigation.slice(0, 4)) !== JSON.stringify(expectedPrimaryNavigation)) {
+  const expectedPrimaryNavigation = ['Home', 'Projects', 'Work', 'Needs You', 'Approvals']
+  if (JSON.stringify(primaryNavigation.slice(0, 5)) !== JSON.stringify(expectedPrimaryNavigation)) {
     fail('primary navigation order changed', { primaryNavigation, expectedPrimaryNavigation })
   }
 
@@ -317,9 +317,21 @@ async function runProjectWorkspaceWorkflow() {
     || browserFields.activeFlightCountTruncated
     || browserFields.snapshotTruncated
     || !browserFields.latestActivity
-    || browserFields.nextAction?.type !== 'review_task') {
+    || browserFields.nextAction?.type !== 'address_needs_you') {
     fail('browser did not structurally observe the seeded Mupot situation', { browserFields })
   }
+
+  await page.goto(`${baseUrl}/projects/project-mupot/routines`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const routinesText = await textSnippet(page.locator('body'), 6000)
+  if (!routinesText.includes('Project routines') || !routinesText.includes('Local propose check')) {
+    fail('Project Routines workspace missing seeded Routine', { routinesText })
+  }
+  await page.goto(`${baseUrl}/needs-you`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const needsYouText = await textSnippet(page.locator('body'), 4000)
+  if (!needsYouText.includes('Needs You')) {
+    fail('Needs You page did not render', { needsYouText })
+  }
+  await page.goto(`${baseUrl}/projects/project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
   const teamPresence = await page.locator('[data-project-agent-presence]').evaluateAll((nodes) => nodes.map((node) => ({
     agentId: node.dataset.agentId,
     presence: node.dataset.presence,
@@ -488,7 +500,7 @@ async function runProjectWorkspaceWorkflow() {
   const projectsMobileOverflow = await assertNoDocumentOverflow('mobile Projects')
   await page.locator('#topbar-menu-btn').click()
   const mobileNavigation = await page.locator('#app-nav > a.nav-link .nav-label').allInnerTexts()
-  if (JSON.stringify(mobileNavigation.slice(0, 4)) !== JSON.stringify(expectedPrimaryNavigation)) {
+  if (JSON.stringify(mobileNavigation.slice(0, 5)) !== JSON.stringify(expectedPrimaryNavigation)) {
     fail('mobile primary navigation order changed', { mobileNavigation, expectedPrimaryNavigation })
   }
   await page.screenshot({ path: path.join(artifactsDir, 'projects-mobile.png'), fullPage: true })

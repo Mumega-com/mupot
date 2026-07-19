@@ -1,6 +1,7 @@
 import { listNeedsYou } from '../attention/service'
-import { cancelRoutineRun, submitRoutineProposal } from '../routines/actions'
+import { answerRoutineRun, cancelRoutineRun, submitRoutineProposal } from '../routines/actions'
 import { principalCanReadProject, routinePrincipal } from '../routines/access'
+import { publicRoutineRun } from '../routines/public'
 import {
   archiveRoutine,
   createManualRoutineRun,
@@ -16,7 +17,7 @@ import {
   type RoutineCursor,
   type UpdateRoutineInput,
 } from '../routines/service'
-import type { Routine, RoutineRun } from '../routines/types'
+import type { Routine } from '../routines/types'
 import { done, fail, type ToolOutcome, type ToolSpec } from './index'
 
 const ID = '^[A-Za-z0-9_-]{1,200}$'
@@ -109,16 +110,12 @@ function safeRoutine(routine: Routine): Omit<Routine, 'tenant'> {
   return safe
 }
 
-function safeRun(run: RoutineRun): Omit<RoutineRun, 'tenant' | 'policy_json' | 'proposal_json'> {
-  const { tenant: _tenant, policy_json: _policy, proposal_json: _proposal, ...safe } = run
-  return safe
-}
-
 function errorStatus(error: string): 400 | 403 | 404 | 409 | 500 {
-  if (['project_not_found', 'routine_not_found', 'run_not_found'].includes(error)) return 404
+  if (['project_not_found', 'routine_not_found', 'run_not_found', 'answer_not_found'].includes(error)) return 404
   if (error === 'forbidden') return 403
   if (['receipt_failed', 'invalid_state', 'routine_archived', 'routine_not_enabled', 'schedule_exhausted', 'run_terminal',
-    'run_not_accepting_proposal', 'action_key_conflict', 'proposal_already_submitted', 'stale_situation'].includes(error)) return 409
+    'run_not_accepting_proposal', 'action_key_conflict', 'proposal_already_submitted', 'stale_situation',
+    'answer_conflict', 'retry_exhausted'].includes(error)) return 409
   return 400
 }
 
@@ -137,17 +134,80 @@ const policyProperties = {
   execution_mode: { type: 'string', enum: ['propose', 'execute_internal'] },
   responsible_squad_id: id(),
   preferred_agent_id: nullableId(),
-  budget_micro_usd: { type: 'number', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
-  max_attempts: { type: 'number', minimum: 1, maximum: 5 },
-  retry_backoff_seconds: { type: 'number', minimum: 30, maximum: 86400 },
-  max_occurrences: { type: ['number', 'null'], minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+  budget_micro_usd: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  max_attempts: { type: 'integer', minimum: 1, maximum: 5 },
+  retry_backoff_seconds: { type: 'integer', minimum: 30, maximum: 86400 },
+  max_occurrences: { type: ['integer', 'null'], minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
   stop_at: { type: ['string', 'null'], maxLength: 100 },
 }
+
+const proposalReference = {
+  type: 'object',
+  properties: {
+    type: { type: 'string', enum: ['task', 'flight', 'artifact'] },
+    id: string(200),
+  },
+  required: ['type', 'id'],
+  additionalProperties: false,
+}
+
+const proposalActionSchemas = [
+  {
+    type: 'object',
+    properties: {
+      key: { type: 'string', pattern: IDEMPOTENCY_KEY, maxLength: 200 },
+      kind: { const: 'create_task' },
+      input: { type: 'object', properties: { title: string(240), description: string(4000), assignee_agent_id: string(200) }, required: ['title', 'description'], additionalProperties: false },
+    },
+    required: ['key', 'kind', 'input'],
+    additionalProperties: false,
+  },
+  {
+    type: 'object',
+    properties: {
+      key: { type: 'string', pattern: IDEMPOTENCY_KEY, maxLength: 200 },
+      kind: { const: 'dispatch_flight' },
+      input: { type: 'object', properties: { goal: string(4000), task_ids: { type: 'array', minItems: 1, maxItems: 200, uniqueItems: true, items: string(200) }, artifact_refs: { type: 'array', maxItems: 200, uniqueItems: true, items: string(2000) }, budget_micro_usd: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER } }, required: ['goal', 'task_ids', 'artifact_refs', 'budget_micro_usd'], additionalProperties: false },
+    },
+    required: ['key', 'kind', 'input'],
+    additionalProperties: false,
+  },
+  {
+    type: 'object',
+    properties: {
+      key: { type: 'string', pattern: IDEMPOTENCY_KEY, maxLength: 200 },
+      kind: { const: 'request_review' },
+      input: { type: 'object', properties: { source_type: { type: 'string', enum: ['task', 'flight', 'artifact'] }, source_id: string(200), summary: string(4000) }, required: ['source_type', 'source_id', 'summary'], additionalProperties: false },
+    },
+    required: ['key', 'kind', 'input'],
+    additionalProperties: false,
+  },
+  {
+    type: 'object',
+    properties: {
+      key: { type: 'string', pattern: IDEMPOTENCY_KEY, maxLength: 200 },
+      kind: { const: 'ask_human' },
+      input: { type: 'object', properties: { question: string(2000), choices: { type: 'array', minItems: 2, maxItems: 5, uniqueItems: true, items: string(500) }, references: { type: 'array', maxItems: 20, uniqueItems: true, items: proposalReference } }, required: ['question', 'references'], additionalProperties: false },
+    },
+    required: ['key', 'kind', 'input'],
+    additionalProperties: false,
+  },
+  {
+    type: 'object',
+    properties: {
+      key: { type: 'string', pattern: IDEMPOTENCY_KEY, maxLength: 200 },
+      kind: { const: 'no_action' },
+      input: { type: 'object', properties: { reason: string(4000), next_check_at: { type: 'string', format: 'date-time', maxLength: 100 } }, required: ['reason'], additionalProperties: false },
+    },
+    required: ['key', 'kind', 'input'],
+    additionalProperties: false,
+  },
+]
 
 const routineList: ToolSpec = {
   name: 'routine_list', scope: 'visible project routines', min: 'observer',
   args: '{ project_id: string, status?: "draft"|"enabled"|"paused"|"archived", limit?: 1..100, cursor?: string }',
-  inputSchema: { type: 'object', properties: { project_id: id(), status: { type: 'string', enum: ['draft', 'enabled', 'paused', 'archived'] }, limit: { type: 'number', minimum: 1, maximum: 100 }, cursor: { type: 'string', pattern: CURSOR, maxLength: 2048 } }, required: ['project_id'], additionalProperties: false },
+  inputSchema: { type: 'object', properties: { project_id: id(), status: { type: 'string', enum: ['draft', 'enabled', 'paused', 'archived'] }, limit: { type: 'integer', minimum: 1, maximum: 100 }, cursor: { type: 'string', pattern: CURSOR, maxLength: 2048 } }, required: ['project_id'], additionalProperties: false },
   async run(auth, env, args) {
     const pagination = page(args)
     if (!validId(args.project_id)) return fail(404, 'project_not_found')
@@ -218,20 +278,20 @@ const routineRunNow: ToolSpec = {
     if (!validId(args.routine_id)) return fail(404, 'routine_not_found')
     if (typeof args.idempotency_key !== 'string' || !new RegExp(IDEMPOTENCY_KEY).test(args.idempotency_key)) return fail(400, 'invalid_idempotency_key')
     const result = await createManualRoutineRun(env, routinePrincipal(auth), args.routine_id, args.idempotency_key)
-    return result.ok ? done({ run: safeRun(result.value), duplicate: result.duplicate }) : sourceFailure(result.error)
+    return result.ok ? done({ run: publicRoutineRun(result.value), duplicate: result.duplicate }) : sourceFailure(result.error)
   },
 }
 
 const routineRunList: ToolSpec = {
   name: 'routine_run_list', scope: 'visible project routine runs', min: 'observer',
   args: '{ project_id: string, routine_id?: string, limit?: 1..100, cursor?: string }',
-  inputSchema: { type: 'object', properties: { project_id: id(), routine_id: id(), limit: { type: 'number', minimum: 1, maximum: 100 }, cursor: { type: 'string', pattern: CURSOR, maxLength: 2048 } }, required: ['project_id'], additionalProperties: false },
+  inputSchema: { type: 'object', properties: { project_id: id(), routine_id: id(), limit: { type: 'integer', minimum: 1, maximum: 100 }, cursor: { type: 'string', pattern: CURSOR, maxLength: 2048 } }, required: ['project_id'], additionalProperties: false },
   async run(auth, env, args) {
     const pagination = page(args)
     if (!validId(args.project_id)) return fail(404, 'project_not_found')
     if (!pagination || (args.routine_id !== undefined && !validId(args.routine_id))) return fail(400, 'invalid_pagination')
     const result = await listRoutineRuns(env, routinePrincipal(auth), { project_id: args.project_id, ...pagination, ...(args.routine_id ? { routine_id: args.routine_id } : {}) })
-    return result.ok ? done({ runs: result.items.map(safeRun), next_cursor: result.next_cursor ? encodeCursor(result.next_cursor) : null }) : sourceFailure(result.error)
+    return result.ok ? done({ runs: result.items.map(publicRoutineRun), next_cursor: result.next_cursor ? encodeCursor(result.next_cursor) : null }) : sourceFailure(result.error)
   },
 }
 
@@ -241,7 +301,7 @@ const routineRunGet: ToolSpec = {
   async run(auth, env, args) {
     if (!validId(args.run_id)) return fail(404, 'run_not_found')
     const run = await getRoutineRun(env, routinePrincipal(auth), args.run_id)
-    return run ? done({ run: safeRun(run) }) : fail(404, 'run_not_found')
+    return run ? done({ run: publicRoutineRun(run) }) : fail(404, 'run_not_found')
   },
 }
 
@@ -255,6 +315,21 @@ const routineRunCancel: ToolSpec = {
   },
 }
 
+const routineRunAnswer: ToolSpec = {
+  name: 'routine_run_answer', scope: 'responsible writable squad Routine answer', min: 'member',
+  args: '{ run_id: string, answer: string }',
+  inputSchema: {
+    type: 'object', properties: { run_id: id(), answer: string(4000) },
+    required: ['run_id', 'answer'], additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (!validId(args.run_id)) return fail(404, 'run_not_found')
+    if (!boundedString(args.answer, 4000)) return fail(400, 'invalid_answer')
+    const result = await answerRoutineRun(env, routinePrincipal(auth), args.run_id, args.answer)
+    return result.ok ? done(result) : sourceFailure(result.error)
+  },
+}
+
 const routineProposalSubmit: ToolSpec = {
   name: 'routine_proposal_submit', scope: 'assigned agent routine proposal submission', min: 'member',
   args: '{ version: "routine.proposal/v1", run_id: string, project_id: string, situation_digest: string, summary: string, action: object }',
@@ -264,28 +339,15 @@ const routineProposalSubmit: ToolSpec = {
       version: { type: 'string', enum: ['routine.proposal/v1'] }, run_id: id(), project_id: id(),
       situation_digest: { type: 'string', pattern: '^[a-f0-9]{64}$', minLength: 64, maxLength: 64 }, summary: string(4000),
       action: {
-        type: 'object', properties: {
+        type: 'object',
+        properties: {
           key: { type: 'string', pattern: IDEMPOTENCY_KEY, maxLength: 200 },
           kind: { type: 'string', enum: ['create_task', 'dispatch_flight', 'request_review', 'ask_human', 'no_action'] },
-          input: {
-            type: 'object', properties: {
-              title: string(240), description: string(4000), assignee_agent_id: id(), goal: string(4000),
-              task_ids: { type: 'array', minItems: 1, maxItems: 200, items: id() },
-              artifact_refs: { type: 'array', maxItems: 200, items: string(2000) },
-              budget_micro_usd: { type: 'number', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
-              source_type: { type: 'string', enum: ['task', 'flight', 'artifact'] }, source_id: id(), summary: string(4000),
-              question: string(2000), choices: { type: 'array', minItems: 2, maxItems: 5, items: string(500) },
-              references: { type: 'array', maxItems: 20, items: { type: 'object', properties: { type: { type: 'string', enum: ['task', 'flight', 'artifact'] }, id: id() }, required: ['type', 'id'], additionalProperties: false } },
-              reason: string(4000), next_check_at: { type: 'string', maxLength: 100 },
-            }, additionalProperties: false, oneOf: [
-              { type: 'object', properties: { title: string(240), description: string(4000), assignee_agent_id: id() }, required: ['title', 'description'], additionalProperties: false },
-              { type: 'object', properties: { goal: string(4000), task_ids: { type: 'array', minItems: 1, maxItems: 200, items: id() }, artifact_refs: { type: 'array', maxItems: 200, items: string(2000) }, budget_micro_usd: { type: 'number', minimum: 1, maximum: Number.MAX_SAFE_INTEGER } }, required: ['goal', 'task_ids', 'artifact_refs', 'budget_micro_usd'], additionalProperties: false },
-              { type: 'object', properties: { source_type: { type: 'string', enum: ['task', 'flight', 'artifact'] }, source_id: id(), summary: string(4000) }, required: ['source_type', 'source_id', 'summary'], additionalProperties: false },
-              { type: 'object', properties: { question: string(2000), choices: { type: 'array', minItems: 2, maxItems: 5, items: string(500) }, references: { type: 'array', maxItems: 20, items: { type: 'object', properties: { type: { type: 'string', enum: ['task', 'flight', 'artifact'] }, id: id() }, required: ['type', 'id'], additionalProperties: false } } }, required: ['question', 'references'], additionalProperties: false },
-              { type: 'object', properties: { reason: string(4000), next_check_at: { type: 'string', maxLength: 100 } }, required: ['reason'], additionalProperties: false },
-            ],
-          },
-        }, required: ['key', 'kind', 'input'], additionalProperties: false,
+          input: { type: 'object' },
+        },
+        required: ['key', 'kind', 'input'],
+        additionalProperties: false,
+        oneOf: proposalActionSchemas,
       },
     },
     required: ['version', 'run_id', 'project_id', 'situation_digest', 'summary', 'action'], additionalProperties: false,
@@ -299,7 +361,7 @@ const routineProposalSubmit: ToolSpec = {
 const needsYouList: ToolSpec = {
   name: 'needs_you_list', scope: 'visible project and workspace attention items', min: 'observer',
   args: '{ project_id?: string, limit?: 1..100, cursor?: string }',
-  inputSchema: { type: 'object', properties: { project_id: id(), limit: { type: 'number', minimum: 1, maximum: 100 }, cursor: { type: 'string', pattern: NEEDS_YOU_CURSOR, maxLength: 200 } }, additionalProperties: false },
+  inputSchema: { type: 'object', properties: { project_id: id(), limit: { type: 'integer', minimum: 1, maximum: 100 }, cursor: { type: 'string', pattern: NEEDS_YOU_CURSOR, maxLength: 200 } }, additionalProperties: false },
   async run(auth, env, args) {
     if (args.project_id !== undefined && !validId(args.project_id)) return fail(404, 'project_not_found')
     if (args.limit !== undefined && (!Number.isSafeInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 100)) return fail(400, 'invalid_pagination')
@@ -321,5 +383,5 @@ const needsYouList: ToolSpec = {
 export const ROUTINE_TOOLS: ToolSpec[] = [
   routineList, routineGet, routineCreate, routineUpdate,
   lifecycle('routine_enable', enableRoutine), lifecycle('routine_pause', pauseRoutine), lifecycle('routine_archive', archiveRoutine),
-  routineRunNow, routineRunList, routineRunGet, routineRunCancel, routineProposalSubmit, needsYouList,
+  routineRunNow, routineRunList, routineRunGet, routineRunAnswer, routineRunCancel, routineProposalSubmit, needsYouList,
 ]

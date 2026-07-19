@@ -146,7 +146,7 @@ import {
   pauseRoutine,
   updateRoutine,
 } from '../routines/service'
-import { cancelRoutineRun } from '../routines/actions'
+import { answerRoutineRun, cancelRoutineRun } from '../routines/actions'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
@@ -390,12 +390,13 @@ function dashboardHistoryCursor(value: string | undefined) {
 }
 
 function validDashboardHistoryQuery(c: { req: { query: (key: string) => string | undefined } }): boolean {
-  for (const key of ['run_limit', 'event_limit']) {
+  for (const key of ['run_limit', 'event_limit', 'routine_limit']) {
     const value = c.req.query(key)
     if (value !== undefined && (!/^[1-9]\d?$/.test(value) || Number(value) > 50)) return false
   }
   return dashboardHistoryCursor(c.req.query('run_cursor')) !== null
     && dashboardHistoryCursor(c.req.query('event_cursor')) !== null
+    && dashboardHistoryCursor(c.req.query('routine_cursor')) !== null
 }
 
 dashboardApp.get('/projects/:id/routines', async (c) => {
@@ -404,12 +405,18 @@ dashboardApp.get('/projects/:id/routines', async (c) => {
   }
   const runAfter = dashboardHistoryCursor(c.req.query('run_cursor'))
   const eventAfter = dashboardHistoryCursor(c.req.query('event_cursor'))
+  const routineAfter = dashboardHistoryCursor(c.req.query('routine_cursor'))
   const runLimit = c.req.query('run_limit')
   const eventLimit = c.req.query('event_limit')
+  const routineLimit = c.req.query('routine_limit')
   const view = await loadRoutineWorkspace(c.env, c.get('auth'), c.req.param('id'), {
     ...(runAfter ? { runAfter } : {}), ...(eventAfter ? { eventAfter } : {}),
+    ...(routineAfter ? { routineAfter } : {}),
     ...(runLimit ? { runLimit: Number(runLimit) } : {}), ...(eventLimit ? { eventLimit: Number(eventLimit) } : {}),
+    ...(routineLimit ? { routineLimit: Number(routineLimit) } : {}),
     ...(c.req.query('edit') ? { editId: c.req.query('edit') } : {}),
+    ...(c.req.query('run_id') ? { runId: c.req.query('run_id') } : {}),
+    ...(c.req.query('routine_id') ? { routineId: c.req.query('routine_id') } : {}),
   })
   if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
   return c.html(shell(c.env, 'Project routines', routineWorkspaceBody(view, { status: c.req.query('status') })))
@@ -497,6 +504,22 @@ dashboardApp.post('/projects/:id/routines/:runId/cancel', async (c) => {
     return c.html(shell(c.env, 'Project routines', view ? routineWorkspaceBody(view, { error: result.error }) : projectNotFoundBody()), routineDashboardErrorStatus(result.error))
   }
   return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?status=run_cancelled`, 303)
+})
+
+dashboardApp.post('/projects/:id/routines/:runId/answer', async (c) => {
+  const projectId = c.req.param('id')
+  const runId = c.req.param('runId')
+  const auth = c.get('auth')
+  const principal = routinePrincipal(auth)
+  const run = await getRoutineRun(c.env, principal, runId)
+  if (!run || run.project_id !== projectId) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const form = await c.req.parseBody()
+  const result = await answerRoutineRun(c.env, principal, runId, form.answer)
+  if (!result.ok) {
+    const view = await loadRoutineWorkspace(c.env, auth, projectId, { runId })
+    return c.html(shell(c.env, 'Project routines', view ? routineWorkspaceBody(view, { error: result.error }) : projectNotFoundBody()), routineDashboardErrorStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?run_id=${encodeURIComponent(runId)}&status=answer_recorded`, 303)
 })
 
 dashboardApp.get('/projects/:id', async (c) => {

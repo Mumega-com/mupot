@@ -179,6 +179,39 @@ describe('routine REST routes', () => {
     await expect(accepted.json()).resolves.toMatchObject({ ok: true, status: 'succeeded', run_id: 'run-1' })
   })
 
+  it('accepts a scoped human answer and queues the same run for a fresh attempt', async () => {
+    const fixture = await makeReadyRoutineFixture('execute_internal')
+    harness = fixture.harness
+    const proposal = fixture.proposal({
+      key: 'route-question', kind: 'ask_human',
+      input: { question: 'Which outcome is authoritative?', choices: ['Booked', 'Paid'], references: [] },
+    })
+    authState.current = actor({
+      role: 'member', boundAgentId: 'agent-1',
+      capabilities: [{ member_id: 'member-1', scope_type: 'squad', scope_id: 'squad-1', capability: 'member' }],
+    })
+    const asked = await routinesApp.fetch(
+      request('/routine-runs/run-1/proposal', 'POST', proposal, { 'idempotency-key': 'route-question' }), fixture.env,
+    )
+    expect(asked.status).toBe(200)
+    await expect(asked.json()).resolves.toMatchObject({ ok: true, status: 'waiting', reason: 'answer' })
+
+    authState.current = actor({
+      role: 'member', boundAgentId: undefined,
+      capabilities: [{ member_id: 'member-1', scope_type: 'squad', scope_id: 'squad-1', capability: 'member' }],
+    })
+    const invalid = await routinesApp.fetch(request('/routine-runs/run-1/answer', 'POST', { answer: 'Unknown' }), fixture.env)
+    expect(invalid.status).toBe(400)
+    await expect(invalid.json()).resolves.toEqual({ error: 'invalid_answer' })
+
+    const answered = await routinesApp.fetch(request('/routine-runs/run-1/answer', 'POST', { answer: 'Paid' }), fixture.env)
+    expect(answered.status).toBe(200)
+    await expect(answered.json()).resolves.toEqual({ ok: true, run_id: 'run-1', duplicate: false })
+    expect(fixture.harness.sqlite.prepare("SELECT status, result_summary FROM routine_runs WHERE id = 'run-1'").get()).toEqual({
+      status: 'queued', result_summary: 'human_answered',
+    })
+  })
+
   it('enforces same-origin CSRF for browser mutations and strict list cursors', async () => {
     harness = makeHarness()
     authState.current = actor()

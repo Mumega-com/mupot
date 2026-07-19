@@ -68,6 +68,7 @@ export type UpdateRoutineInput = Omit<CreateRoutineInput, 'project_id'>
 export interface ListRoutinesInput {
   project_id: string
   status?: RoutineStatus
+  exclude_archived?: boolean
   limit?: number
   after?: RoutineCursor
 }
@@ -75,6 +76,24 @@ export interface ListRoutinesInput {
 export interface ListRoutineRunsInput {
   project_id: string
   routine_id?: string
+  limit?: number
+  after?: RoutineCursor
+}
+
+export interface RoutineRunEvent {
+  id: string
+  run_id: string
+  routine_id: string
+  routine_name: string
+  kind: string
+  actor_type: string
+  actor_id: string
+  occurred_at: string
+}
+
+export interface ListRoutineRunEventsInput {
+  project_id: string
+  run_id?: string
   limit?: number
   after?: RoutineCursor
 }
@@ -327,6 +346,8 @@ export async function listRoutines(
   if (input.status) {
     clauses.push('status = ?')
     binds.push(input.status)
+  } else if (input.exclude_archived) {
+    clauses.push("status <> 'archived'")
   }
   if (input.after) {
     clauses.push('(updated_at < ? OR (updated_at = ? AND id > ?))')
@@ -531,6 +552,39 @@ export async function getRoutineRun(
   ).bind(id, env.TENANT_SLUG, ...visibility.binds).first<RoutineRun>()
 }
 
+/** Latest run for each requested Routine, bounded and authorized at the Project boundary. */
+export async function listLatestRoutineRuns(
+  env: Env,
+  principal: RoutinePrincipal,
+  projectId: string,
+  routineIds: string[],
+): Promise<RoutinePage<RoutineRun>> {
+  const ids = [...new Set(routineIds)]
+  if (ids.length > 100 || ids.some(id => boundedText(id, 1, 200) === null)) {
+    return { ok: false, error: 'invalid_pagination' }
+  }
+  if (!await principalCanReadProject(env, principal, projectId)) {
+    return { ok: false, error: 'project_not_found' }
+  }
+  if (ids.length === 0) return { ok: true, items: [], next_cursor: null }
+  const select = RUN_SELECT.split(',').map(column => `rr.${column.trim()}`).join(', ')
+  const result = await env.DB.prepare(
+    `SELECT ${select}
+       FROM routine_runs rr
+      WHERE rr.tenant = ? AND rr.project_id = ?
+        AND rr.routine_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+        AND NOT EXISTS (
+          SELECT 1 FROM routine_runs newer
+           WHERE newer.tenant = rr.tenant AND newer.project_id = rr.project_id
+             AND newer.routine_id = rr.routine_id
+             AND (newer.created_at > rr.created_at
+               OR (newer.created_at = rr.created_at AND newer.id < rr.id))
+        )
+      ORDER BY rr.created_at DESC, rr.id ASC`,
+  ).bind(env.TENANT_SLUG, projectId, JSON.stringify(ids)).all<RoutineRun>()
+  return { ok: true, items: result.results ?? [], next_cursor: null }
+}
+
 export async function listRoutineRuns(
   env: Env,
   principal: RoutinePrincipal,
@@ -562,5 +616,43 @@ export async function listRoutineRuns(
     ok: true,
     items,
     next_cursor: rows.length > limit && last ? { timestamp: last.created_at, id: last.id } : null,
+  }
+}
+
+export async function listRoutineRunEvents(
+  env: Env,
+  principal: RoutinePrincipal,
+  input: ListRoutineRunEventsInput,
+): Promise<RoutinePage<RoutineRunEvent>> {
+  const limit = input.limit ?? 50
+  if (!validPage(limit, input.after)) return { ok: false, error: 'invalid_pagination' }
+  if (!await principalCanReadProject(env, principal, input.project_id)) {
+    return { ok: false, error: 'project_not_found' }
+  }
+  const clauses = ['e.tenant = ?', 'e.project_id = ?']
+  const binds: unknown[] = [env.TENANT_SLUG, input.project_id]
+  if (input.run_id) {
+    clauses.push('e.run_id = ?')
+    binds.push(input.run_id)
+  }
+  if (input.after) {
+    clauses.push('(e.occurred_at < ? OR (e.occurred_at = ? AND e.id > ?))')
+    binds.push(input.after.timestamp, input.after.timestamp, input.after.id)
+  }
+  const result = await env.DB.prepare(
+    `SELECT e.id, e.run_id, rr.routine_id, r.name AS routine_name, e.kind, e.actor_type, e.actor_id, e.occurred_at
+       FROM routine_run_events e
+       JOIN routine_runs rr ON rr.id = e.run_id AND rr.tenant = e.tenant
+       JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY e.occurred_at DESC, e.id ASC LIMIT ?`,
+  ).bind(...binds, limit + 1).all<RoutineRunEvent>()
+  const rows = result.results ?? []
+  const items = rows.slice(0, limit)
+  const last = items.at(-1)
+  return {
+    ok: true,
+    items,
+    next_cursor: rows.length > limit && last ? { timestamp: last.occurred_at, id: last.id } : null,
   }
 }
