@@ -40,6 +40,29 @@ The frozen Loop v1 manifest is not expanded with Project scheduling fields. Exis
 Loops remain compatible. A Routine may invoke existing governed behavior through an
 agent, but Routine scheduling and run history are owned by the new Project layer.
 
+### 2.1 Control-plane boundary
+
+Mupot does not become an agent harness in this release. Claude Code, Codex, Hermes,
+DeerFlow, or another attached runtime remains responsible for model turns, context
+compaction, subagent planning, tool execution, sandbox/worktree management, and any
+runtime-local continuation loop.
+
+The Mupot-owned contract ends at a narrow adapter boundary:
+
+1. Mupot chooses the accountable Project, RoutineRun, identity, authority, budget,
+   Situation digest, and required proposal schema.
+2. The existing inbox/Flight path dispatches that envelope to one eligible runtime.
+3. The runtime may organize its internal work however it supports, but returns only
+   correlated progress and the governed `routine.proposal/v1` result.
+4. Mupot validates, gates, records, and projects that result into authoritative
+   Project state.
+
+Runtime thread IDs, subagent traces, private memory, and provider-specific scheduler
+state are never authoritative Mupot state. v0.25 always reconstructs a fresh runtime
+session from durable Project records; adapters must not require a reusable model
+thread. Adding another runtime is therefore an adapter/conformance task, not a Routine
+schema or scheduler change.
+
 ## 3. Scope
 
 ### 3.1 Required in v0.25
@@ -68,6 +91,8 @@ agent, but Routine scheduling and run history are owned by the new Project layer
 - reused or pinned model sessions;
 - model routing or automatic model selection;
 - per-flight sandbox provisioning;
+- model turn loops, subagent orchestration, context compaction, worktrees, or runtime
+  memory management;
 - self-modifying Routines, prompts, skills, policies, or capabilities;
 - raw connector credentials or model-selected credential profiles;
 - general external writes without the existing approval path;
