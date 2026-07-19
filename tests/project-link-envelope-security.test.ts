@@ -193,6 +193,45 @@ describe('project-link envelope security boundary', () => {
     })
   })
 
+  // #403 gap 2(a): free-text task fields must reject NUL bytes and non-whitespace C0/DEL
+  // control characters, not just be length-bounded. Bad chars built via String.fromCharCode
+  // to keep this source file itself free of embedded raw control bytes.
+  it('rejects NUL bytes and disallowed control characters in free-text task fields', () => {
+    const fields: Array<[string, (value: ReturnType<typeof envelopeInput>, s: string) => void]> = [
+      ['task.title', (value, s) => { value.task.title = s }],
+      ['task.blocker_summary', (value, s) => { value.task.blocker_summary = s }],
+      ['task.success_predicate', (value, s) => { value.task.success_predicate = s }],
+      ['task.progress_summary', (value, s) => { value.task.progress_summary = s }],
+    ]
+    const badChars: ReadonlyArray<[string, number]> = [
+      ['NUL byte', 0x00],
+      ['bell', 0x07],
+      ['backspace', 0x08],
+      ['vertical tab', 0x0b],
+      ['form feed', 0x0c],
+      ['escape', 0x1b],
+      ['unit separator', 0x1f],
+      ['DEL', 0x7f],
+    ]
+
+    for (const [path, mutate] of fields) {
+      for (const [label, code] of badChars) {
+        const value = envelopeInput()
+        const char = String.fromCharCode(code)
+        mutate(value, `safe text ${char} more text`)
+        expect(validateProjectLinkEnvelope(value), `${path} / ${label}`).toEqual({
+          ok: false, reason: 'invalid_control_chars', path,
+        })
+      }
+    }
+  })
+
+  it('still allows ordinary whitespace (tab, newline, CR) in free-text task fields', () => {
+    const value = envelopeInput()
+    value.task.progress_summary = 'line one\nline two\tindented\r\ndone.'
+    expect(validateProjectLinkEnvelope(value).ok).toBe(true)
+  })
+
   it('enforces an explicit approved evidence-origin list when supplied', () => {
     const value = envelopeInput()
 

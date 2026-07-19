@@ -91,6 +91,20 @@ function sensitive(value: string): boolean {
   return SENSITIVE.test(value)
 }
 
+// #403 gap 2(a): reject NUL bytes and non-whitespace C0/DEL control characters in inbound
+// free-text task fields (title, blocker_summary, success_predicate, progress_summary). Length
+// bounds already existed (see the [key, max, nullable] table below) but any byte was
+// previously accepted within that bound. Tab/newline/CR are left alone -- normal, expected
+// in multi-line summary text -- everything else in the C0 control range plus DEL is refused
+// outright rather than silently accepted (this is a transport-boundary rejection, distinct
+// from src/agents/sensorium.ts's asData(), which strips control chars at RENDER time for a
+// different, already-trusted-local-task, surface).
+const DISALLOWED_CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/
+
+function hasDisallowedControlChars(value: string): boolean {
+  return DISALLOWED_CONTROL_CHARS.test(value)
+}
+
 function prohibitedString(value: unknown, path = '', seen = new WeakSet<object>()): EnvelopeValidationResult | null {
   if (typeof value === 'string') {
     return sensitive(value) ? { ok: false, reason: 'prohibited_content', path } : null
@@ -117,6 +131,7 @@ function checkText(value: unknown, path: string, max: number, nullable = false):
   if (nullable && value === null) return null
   if (!boundedText(value, max)) return { ok: false, reason: 'invalid_string', path }
   if (sensitive(value)) return { ok: false, reason: 'prohibited_content', path }
+  if (hasDisallowedControlChars(value)) return { ok: false, reason: 'invalid_control_chars', path }
   return null
 }
 
