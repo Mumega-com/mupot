@@ -243,8 +243,12 @@ base image.
    DME Hermes Deployment and verify the dashboard and Telegram containers remain
    ready. Run the read-only cutover preflight immediately afterward; it fails if
    any workload or pod still contains `mupot-subscriber`, if a Host pod exists,
-   or if the preserved DME Deployment contains anything other than `hermes` and
-   `telegram-gateway`:
+   or if the preserved DME Deployment or any admitted DME pod contains
+   application containers other than `hermes` and `telegram-gateway`, any
+   ephemeral container, or any init container other than the optional
+   `seed-profile` initializer. When present, `seed-profile` must match its
+   approved digest-pinned execution contract exactly; restartable init
+   containers are rejected:
 
    ```bash
    node scripts/kubernetes-agent-host-cutover-preflight.mjs \
@@ -379,7 +383,8 @@ fence and pinned active-key match through the exact Host-only agent credential,
 compares the live resource versions
 and immutable plugin identity to the preflight, scales with optimistic
 concurrency, watches Pod events from the pre-scale list resource version so even
-a transient return of the legacy consumer is detected, waits for readiness,
+a transient return of the legacy consumer or admitted DME runtime drift is
+detected, waits for readiness,
 requires readiness to include a successful signed inbox operation, revalidates
 the same fence generation and pinned key after startup, revalidates the source
 runtime, and returns the Host to zero automatically if any post-scale check

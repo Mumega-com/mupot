@@ -18,6 +18,27 @@ import {
 
 const temporaryDirectories = []
 
+const SEED_PROFILE = {
+  args: ['if [ ! -f /opt/data/config.yaml ]; then\n\n  cp /profile/config.yaml /opt/data/config.yaml.next &&\n  chmod 0640 /opt/data/config.yaml.next &&\n  mv -f /opt/data/config.yaml.next /opt/data/config.yaml;\nfi && if [ ! -f /opt/data/SOUL.md ]; then\n\n  cp /profile/SOUL.md /opt/data/SOUL.md.next &&\n  chmod 0640 /opt/data/SOUL.md.next &&\n  mv -f /opt/data/SOUL.md.next /opt/data/SOUL.md;\nfi'],
+  command: ['/bin/sh', '-c'],
+  image: 'nousresearch/hermes-agent@sha256:8d56cd839ad76b0fc2c9202f39a7ffe1b464c247059a17bc3c72ba6b4ae57616',
+  imagePullPolicy: 'IfNotPresent', name: 'seed-profile',
+  resources: { limits: { cpu: '100m', memory: '128Mi' }, requests: { cpu: '10m', memory: '32Mi' } },
+  securityContext: {
+    allowPrivilegeEscalation: false, capabilities: { drop: ['ALL'] },
+    runAsGroup: 10000, runAsNonRoot: true, runAsUser: 10000,
+  },
+  terminationMessagePath: '/dev/termination-log', terminationMessagePolicy: 'File',
+  volumeMounts: [
+    { mountPath: '/opt/data', name: 'data' },
+    { mountPath: '/profile', name: 'profile', readOnly: true },
+  ],
+}
+
+function seedProfile(overrides = {}) {
+  return { ...structuredClone(SEED_PROFILE), ...overrides }
+}
+
 test.after(() => {
   for (const directory of temporaryDirectories) rmSync(directory, { recursive: true, force: true })
 })
@@ -99,6 +120,7 @@ function fixture() {
     deployment('dme-hermes', ['hermes', 'telegram-gateway'], 1, '10'),
     deployment('dme-hermes-agent-host', ['agent-host'], 0, '20'),
   ]
+  workloads[0].spec.template.spec.initContainers = [seedProfile()]
   workloads[1].spec.template.spec.containers[0].image = `registry.example/host@${imageDigest}`
   const expectedDeployment = structuredClone(workloads[1])
   const expectedDeploymentSha256 = sha256('rendered deployment fixture')
@@ -142,9 +164,23 @@ function readyHostPod(value) {
   }
 }
 
+function sourcePod(names = ['hermes', 'telegram-gateway']) {
+  return {
+    kind: 'Pod',
+    metadata: { name: 'dme-hermes-source', labels: { 'app.kubernetes.io/name': 'dme-hermes' } },
+    spec: {
+      initContainers: [seedProfile()],
+      containers: names.map((name) => ({ name })),
+    },
+    status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] },
+  }
+}
+
 function quietOverlapMonitor(overrides = {}) {
   return async () => ({
-    stop: async () => ({ healthy: true, legacy_consumer_events: [], ...overrides }),
+    stop: async () => ({
+      healthy: true, legacy_consumer_events: [], source_runtime_drift_events: [], ...overrides,
+    }),
   })
 }
 
@@ -287,6 +323,36 @@ test('post-activation mismatch automatically scales the Host back to zero', asyn
   assert.equal(receipt.rollback_performed, true)
   assert.deepEqual(scales, [{ replicas: 1, resourceVersion: '20' }, { replicas: 0, resourceVersion: undefined }])
   assert.deepEqual(rollbackOrder, ['scaled-zero', 'zero-pods-confirmed'])
+  assert.ok(receipt.failure_codes.includes('legacy_consumer_returned'))
+})
+
+test('post-activation admission drift on the DME pod scales the Host back to zero', async () => {
+  const value = fixture()
+  const before = {
+    workloads: value.workloads, pods: [], pluginConfigMap: value.plugin,
+    clusterContext: 'test-cluster', namespaceUid: 'namespace-uid',
+  }
+  const after = structuredClone(before)
+  after.workloads[1].spec.replicas = 1
+  after.workloads[1].metadata.resourceVersion = '21'
+  after.workloads[1].status = { availableReplicas: 1 }
+  const driftedSource = sourcePod()
+  driftedSource.spec.initContainers[0].restartPolicy = 'Always'
+  after.pods = [driftedSource, readyHostPod(value)]
+  let reads = 0
+  const scales = []
+  const receipt = await runGuardedActivation(activationInput(value), {
+    now: () => new Date('2026-07-19T01:00:01Z'),
+    snapshot: async () => reads++ === 0 ? before : after,
+    scale: async (replicas, resourceVersion) => { scales.push({ replicas, resourceVersion }) },
+    waitStopped: async () => {},
+    waitReady: async () => {},
+    startOverlapMonitor: quietOverlapMonitor(),
+    verifyConsumerFence: validFenceProof(),
+  })
+  assert.equal(receipt.status, 'fail')
+  assert.equal(receipt.rollback_performed, true)
+  assert.deepEqual(scales, [{ replicas: 1, resourceVersion: '20' }, { replicas: 0, resourceVersion: undefined }])
   assert.ok(receipt.failure_codes.includes('legacy_consumer_returned'))
 })
 
@@ -499,6 +565,38 @@ test('transient legacy pod overlap automatically rolls activation back even when
   assert.ok(receipt.failure_codes.includes('transient_consumer_overlap_or_monitor_failure'))
 })
 
+test('transient DME pod runtime drift automatically rolls activation back even when final state is clean', async () => {
+  const value = fixture()
+  const before = {
+    workloads: value.workloads, pods: [], pluginConfigMap: value.plugin,
+    clusterContext: 'test-cluster', namespaceUid: 'namespace-uid',
+  }
+  const after = structuredClone(before)
+  after.workloads[1].spec.replicas = 1
+  after.workloads[1].metadata.resourceVersion = '21'
+  after.workloads[1].status = { availableReplicas: 1 }
+  after.pods = [readyHostPod(value)]
+  let reads = 0
+  const scales = []
+  const receipt = await runGuardedActivation(activationInput(value), {
+    now: () => new Date('2026-07-19T01:00:01Z'),
+    snapshot: async () => reads++ === 0 ? before : after,
+    startOverlapMonitor: quietOverlapMonitor({
+      source_runtime_drift_events: [{
+        event_type: 'ADDED', pod_uid: 'drift-pod-uid', pod_name: 'transient-drift', resource_version: '26',
+      }],
+    }),
+    verifyConsumerFence: validFenceProof(),
+    scale: async (replicas, resourceVersion) => { scales.push({ replicas, resourceVersion }) },
+    waitStopped: async () => {},
+    waitReady: async () => {},
+  })
+  assert.equal(receipt.status, 'fail')
+  assert.equal(receipt.rollback_performed, true)
+  assert.deepEqual(scales, [{ replicas: 1, resourceVersion: '20' }, { replicas: 0, resourceVersion: undefined }])
+  assert.ok(receipt.failure_codes.includes('transient_consumer_overlap_or_monitor_failure'))
+})
+
 test('activation refuses to scale when the live Mupot inbox fence is open or stale', async () => {
   const value = fixture()
   const before = {
@@ -653,6 +751,32 @@ test('spawned watch captures a legacy event visible only to the catch-up watch',
   const observation = await monitor.stop()
   assert.equal(observation.healthy, true)
   assert.ok(observation.legacy_consumer_events.some((event) => event.pod_uid === 'catchup-legacy-uid'))
+})
+
+test('spawned watch captures transient DME runtime drift visible only to the catch-up watch', async () => {
+  const initialResourceVersion = 'rv-drift-start'
+  const drifted = sourcePod()
+  drifted.metadata = {
+    ...drifted.metadata, uid: 'catchup-drift-uid', resourceVersion: 'rv-drift-event',
+  }
+  drifted.spec.initContainers[0].restartPolicy = 'Always'
+  const kubectlCommand = fakeKubectl({
+    initialResourceVersion,
+    finalPodList: { metadata: { resourceVersion: 'rv-drift-final' }, items: [] },
+    initialWatch: { entries: [{ event: bookmark('rv-drift-initial-ready') }] },
+    catchupWatch: {
+      entries: [
+        { event: { type: 'ADDED', object: drifted } },
+        { afterMs: 40, event: bookmark('rv-drift-catchup-ready') },
+      ],
+    },
+  })
+  const monitor = await startPodOverlapMonitor(
+    { podListResourceVersion: initialResourceVersion }, monitorOptions(kubectlCommand),
+  )
+  const observation = await monitor.stop()
+  assert.equal(observation.healthy, true)
+  assert.ok(observation.source_runtime_drift_events.some((event) => event.pod_uid === 'catchup-drift-uid'))
 })
 
 test('spawned watch fails closed on catch-up compaction, timeout, and final-list failure', async () => {

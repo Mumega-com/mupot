@@ -3,11 +3,48 @@ import assert from 'node:assert/strict'
 
 import { buildCutoverPreflight } from '../scripts/kubernetes-agent-host-cutover-preflight.mjs'
 
+const SEED_PROFILE = {
+  args: ['if [ ! -f /opt/data/config.yaml ]; then\n\n  cp /profile/config.yaml /opt/data/config.yaml.next &&\n  chmod 0640 /opt/data/config.yaml.next &&\n  mv -f /opt/data/config.yaml.next /opt/data/config.yaml;\nfi && if [ ! -f /opt/data/SOUL.md ]; then\n\n  cp /profile/SOUL.md /opt/data/SOUL.md.next &&\n  chmod 0640 /opt/data/SOUL.md.next &&\n  mv -f /opt/data/SOUL.md.next /opt/data/SOUL.md;\nfi'],
+  command: ['/bin/sh', '-c'],
+  image: 'nousresearch/hermes-agent@sha256:8d56cd839ad76b0fc2c9202f39a7ffe1b464c247059a17bc3c72ba6b4ae57616',
+  imagePullPolicy: 'IfNotPresent', name: 'seed-profile',
+  resources: { limits: { cpu: '100m', memory: '128Mi' }, requests: { cpu: '10m', memory: '32Mi' } },
+  securityContext: {
+    allowPrivilegeEscalation: false, capabilities: { drop: ['ALL'] },
+    runAsGroup: 10000, runAsNonRoot: true, runAsUser: 10000,
+  },
+  terminationMessagePath: '/dev/termination-log', terminationMessagePolicy: 'File',
+  volumeMounts: [
+    { mountPath: '/opt/data', name: 'data' },
+    { mountPath: '/profile', name: 'profile', readOnly: true },
+  ],
+}
+
+function seedProfile(overrides = {}) {
+  return { ...structuredClone(SEED_PROFILE), ...overrides }
+}
+
 function deployment(name, names, replicas = 1) {
   return {
     apiVersion: 'apps/v1', kind: 'Deployment',
     metadata: { name, uid: `${name}-uid`, resourceVersion: '12', generation: 3 },
     spec: { replicas, template: { spec: { containers: names.map((value) => ({ name: value })) } } },
+  }
+}
+
+function withInit(item, names) {
+  item.spec.template.spec.initContainers = names.map((name) => name === 'seed-profile' ? seedProfile() : { name })
+  return item
+}
+
+function sourcePod(names = ['hermes', 'telegram-gateway']) {
+  return {
+    kind: 'Pod',
+    metadata: { name: 'dme-hermes-source', labels: { 'app.kubernetes.io/name': 'dme-hermes' } },
+    spec: {
+      initContainers: [seedProfile()],
+      containers: names.map((name) => ({ name })),
+    },
   }
 }
 
@@ -22,6 +59,70 @@ test('passes only after the legacy subscriber is absent and the Host is inert', 
   assert.equal(receipt.status, 'pass')
   assert.deepEqual(receipt.failure_codes, [])
   assert.match(receipt.evidence.workloads_sha256, /^[a-f0-9]{64}$/)
+})
+
+test('preserves the DME seed-profile initializer without admitting extra runtime containers', () => {
+  const seeded = buildCutoverPreflight({
+    namespace: 'dme-hermes',
+    workloads: [
+      withInit(deployment('dme-hermes', ['hermes', 'telegram-gateway']), ['seed-profile']),
+      deployment('dme-hermes-agent-host', ['agent-host'], 0),
+    ],
+    pods: [], clusterContext: 'test-cluster', namespaceUid: 'namespace-uid',
+  })
+  assert.equal(seeded.status, 'pass')
+
+  for (const source of [
+    withInit(deployment('dme-hermes', ['hermes', 'telegram-gateway']), ['unexpected-init']),
+    {
+      ...withInit(deployment('dme-hermes', ['hermes', 'telegram-gateway']), ['seed-profile']),
+      spec: { template: { spec: {
+        containers: [{ name: 'hermes' }, { name: 'telegram-gateway' }],
+        initContainers: [seedProfile({ image: 'attacker.invalid/seed:latest' })],
+      } } },
+    },
+    {
+      ...withInit(deployment('dme-hermes', ['hermes', 'telegram-gateway']), ['seed-profile']),
+      spec: { template: { spec: {
+        containers: [{ name: 'hermes' }, { name: 'telegram-gateway' }],
+        initContainers: [seedProfile({ restartPolicy: 'Always' })],
+      } } },
+    },
+    {
+      ...deployment('dme-hermes', ['hermes', 'telegram-gateway']),
+      spec: { template: { spec: {
+        containers: [{ name: 'hermes' }, { name: 'telegram-gateway' }],
+        ephemeralContainers: [{ name: 'debug-shell' }],
+      } } },
+    },
+  ]) {
+    const receipt = buildCutoverPreflight({
+      namespace: 'dme-hermes', workloads: [source], pods: [],
+      clusterContext: 'test-cluster', namespaceUid: 'namespace-uid',
+    })
+    assert.ok(receipt.failure_codes.includes('source_runtime_changed'))
+  }
+})
+
+test('rejects admission-injected containers on the live DME pod', () => {
+  for (const pod of [
+    sourcePod(['hermes', 'telegram-gateway', 'injected-sidecar']),
+    {
+      ...sourcePod(),
+      spec: { ...sourcePod().spec, ephemeralContainers: [{ name: 'debug-shell' }] },
+    },
+    {
+      ...sourcePod(),
+      spec: { ...sourcePod().spec, initContainers: [seedProfile({ restartPolicy: 'Always' })] },
+    },
+  ]) {
+    const receipt = buildCutoverPreflight({
+      namespace: 'dme-hermes',
+      workloads: [deployment('dme-hermes', ['hermes', 'telegram-gateway'])],
+      pods: [pod], clusterContext: 'test-cluster', namespaceUid: 'namespace-uid',
+    })
+    assert.ok(receipt.failure_codes.includes('source_runtime_changed'))
+  }
 })
 
 test('fails when any workload or pod retains the legacy consumer or a Host pod exists', () => {
@@ -86,7 +187,10 @@ test('proves both rollback phases without permitting overlapping consumers', () 
   assert.equal(ready.status, 'pass')
   assert.equal(ready.mode, 'rollback-ready')
 
-  const restored = deployment('dme-hermes', ['hermes', 'telegram-gateway', 'mupot-subscriber'])
+  const restored = withInit(
+    deployment('dme-hermes', ['hermes', 'telegram-gateway', 'mupot-subscriber']),
+    ['seed-profile'],
+  )
   restored.status = { availableReplicas: 1, readyReplicas: 1, updatedReplicas: 1 }
   const complete = buildCutoverPreflight({
     namespace: 'dme-hermes', mode: 'rollback-complete', workloads: [restored],
@@ -96,7 +200,10 @@ test('proves both rollback phases without permitting overlapping consumers', () 
     },
     pods: [{
       kind: 'Pod', metadata: { name: 'dme-hermes-restored', labels: { 'app.kubernetes.io/name': 'dme-hermes' } },
-      spec: { containers: [{ name: 'hermes' }, { name: 'telegram-gateway' }, { name: 'mupot-subscriber' }] },
+      spec: {
+        initContainers: [seedProfile()],
+        containers: [{ name: 'hermes' }, { name: 'telegram-gateway' }, { name: 'mupot-subscriber' }],
+      },
       status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] },
     }], now,
     clusterContext: 'test-cluster', namespaceUid: 'namespace-uid',

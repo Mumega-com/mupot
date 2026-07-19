@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url'
 import { resolve } from 'node:path'
 import { fetchConsumerFenceFromSecret } from './kubernetes-agent-host-consumer-fence.mjs'
 import { agentHostPods } from './kubernetes-agent-host-pod-identity.mjs'
+import { dmeSourcePods, dmeSourceRuntimeMatches } from './kubernetes-dme-source-runtime.mjs'
 
 export const KUBERNETES_AGENT_HOST_CUTOVER_PREFLIGHT_TYPE = 'mupot.kubernetes-agent-host-cutover-preflight/v1'
 
@@ -61,10 +62,10 @@ export function buildCutoverPreflight({
   const hostPods = agentHostPods({ deployment: hostDeployment, replicaSets, pods })
   const hostInert = hostWorkloads.length <= 1 && hostWorkloads.every((item) => Number(item?.spec?.replicas ?? 1) === 0) && hostPods.length === 0
   const dme = workloads.find((item) => item?.kind === 'Deployment' && item?.metadata?.name === 'dme-hermes')
-  const dmeContainers = containers(dme).map((container) => container?.name).sort()
-  const sourceRuntimeStable = JSON.stringify(dmeContainers) === JSON.stringify(['hermes', 'telegram-gateway'])
-  const sourceRuntimeRestored = JSON.stringify(dmeContainers) ===
-    JSON.stringify(['hermes', 'mupot-subscriber', 'telegram-gateway'])
+  const dmePods = dmeSourcePods({ deployment: dme, replicaSets, pods })
+  const sourceRuntimeStable = dmeSourceRuntimeMatches(dme) && dmePods.every((pod) => dmeSourceRuntimeMatches(pod))
+  const sourceRuntimeRestored = dmeSourceRuntimeMatches(dme, { legacy: true }) &&
+    dmePods.every((pod) => dmeSourceRuntimeMatches(pod, { legacy: true }))
   const dmeReplicas = Number(dme?.spec?.replicas ?? 1)
   const dmeRolloutReady = dmeReplicas > 0 && Number(dme?.status?.availableReplicas ?? 0) === dmeReplicas &&
     Number(dme?.status?.readyReplicas ?? 0) === dmeReplicas && Number(dme?.status?.updatedReplicas ?? 0) === dmeReplicas

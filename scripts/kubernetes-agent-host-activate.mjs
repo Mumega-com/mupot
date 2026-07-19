@@ -14,6 +14,7 @@ import {
   fetchConsumerFenceStatus,
 } from './kubernetes-agent-host-consumer-fence.mjs'
 import { agentHostPods } from './kubernetes-agent-host-pod-identity.mjs'
+import { dmeSourcePods, dmeSourceRuntimeMatches } from './kubernetes-dme-source-runtime.mjs'
 
 export { fetchConsumerFenceStatus } from './kubernetes-agent-host-consumer-fence.mjs'
 export { agentHostPods as hostPodsForRollback } from './kubernetes-agent-host-pod-identity.mjs'
@@ -150,12 +151,15 @@ export function evaluatePostActivation({ preflight, smokeEvidence, expectedDeplo
   const priorHost = preflight?.evidence?.workloads?.find((item) => item?.kind === 'Deployment' && item?.name === 'dme-hermes-agent-host')
   const legacyAbsent = ![...workloads, ...pods].some((item) =>
     containers(item).some((container) => container?.name === 'mupot-subscriber'))
+  const dmePods = dmeSourcePods({ deployment: dme, replicaSets, pods })
+  const sourceRuntimeExact = dmeSourceRuntimeMatches(dme) &&
+    dmePods.every((pod) => dmeSourceRuntimeMatches(pod))
   const hostPods = agentHostPods({ deployment: host, replicaSets, pods })
   const hostPodReady = hostPods.length === 1 && hostPods[0]?.status?.phase === 'Running' &&
     hostPods[0]?.status?.conditions?.some((condition) => condition?.type === 'Ready' && condition?.status === 'True')
   const plugin = snapshot?.pluginConfigMap
   check(checks, snapshot?.clusterContext === preflight?.cluster?.context && snapshot?.namespaceUid === preflight?.cluster?.namespace_uid, 'cluster_identity_unchanged', 'cluster_identity_changed')
-  check(checks, legacyAbsent && exact(containers(dme).map((container) => container?.name).sort(), ['hermes', 'telegram-gateway']), 'legacy_remains_absent', 'legacy_consumer_returned')
+  check(checks, legacyAbsent && sourceRuntimeExact, 'legacy_remains_absent', 'legacy_consumer_returned')
   check(checks, dme?.metadata?.uid === priorDme?.uid && dme?.metadata?.resourceVersion === priorDme?.resource_version, 'source_runtime_unchanged', 'source_runtime_changed')
   check(
     checks,
@@ -201,7 +205,9 @@ export async function runGuardedActivation({
       checks,
       overlapObservation?.healthy === true &&
         Array.isArray(overlapObservation?.legacy_consumer_events) &&
-        overlapObservation.legacy_consumer_events.length === 0,
+        overlapObservation.legacy_consumer_events.length === 0 &&
+        Array.isArray(overlapObservation?.source_runtime_drift_events) &&
+        overlapObservation.source_runtime_drift_events.length === 0,
       'no_transient_consumer_overlap_observed',
       'transient_consumer_overlap_or_monitor_failure',
     )
@@ -346,14 +352,26 @@ function legacyConsumerEvent(eventType, pod) {
   }
 }
 
+function sourceRuntimeDriftEvent(eventType, pod, deployment, replicaSets) {
+  const isDmePod = dmeSourcePods({ deployment, replicaSets, pods: [{ kind: 'Pod', ...pod }] }).length === 1
+  if (!isDmePod || dmeSourceRuntimeMatches({ kind: 'Pod', spec: pod?.spec })) return null
+  return {
+    event_type: eventType ?? null,
+    pod_uid: pod?.metadata?.uid ?? null,
+    pod_name: pod?.metadata?.name ?? null,
+    resource_version: pod?.metadata?.resourceVersion ?? null,
+  }
+}
+
 function createPodWatch(resourceVersion, {
-  kubectlCommand, readyTimeoutMs, shutdownTimeoutMs, timeoutCode,
+  kubectlCommand, readyTimeoutMs, shutdownTimeoutMs, timeoutCode, sourceDeployment, sourceReplicaSets,
 }) {
   const child = spawn(kubectlCommand, ['get', '--raw', podWatchPath(resourceVersion)], {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   const failureCodes = new Set()
-  const events = []
+  const legacyEvents = []
+  const runtimeDriftEvents = []
   let buffer = ''
   let stderr = ''
   let requestedStop = false
@@ -390,7 +408,9 @@ function createPodWatch(resourceVersion, {
     }
     const pod = event?.object
     const legacy = legacyConsumerEvent(event?.type, pod)
-    if (legacy) events.push(legacy)
+    if (legacy) legacyEvents.push(legacy)
+    const runtimeDrift = sourceRuntimeDriftEvent(event?.type, pod, sourceDeployment, sourceReplicaSets)
+    if (runtimeDrift) runtimeDriftEvents.push(runtimeDrift)
     const initialEventsEnded = event?.type === 'BOOKMARK' &&
       (pod?.metadata?.annotations?.['k8s.io/initial-events-end'] === 'true' ||
         pod?.metadata?.annotations?.['k8s.io/initial-events-end'] === true)
@@ -442,7 +462,8 @@ function createPodWatch(resourceVersion, {
   }
   return {
     child,
-    events,
+    legacyEvents,
+    runtimeDriftEvents,
     failureCodes,
     ready,
     stop,
@@ -467,9 +488,12 @@ export async function startPodOverlapMonitor(snapshotValue, options = {}) {
   const startupTimeoutMs = options.startupTimeoutMs ?? 30_000
   const catchupTimeoutMs = options.catchupTimeoutMs ?? 30_000
   const shutdownTimeoutMs = options.shutdownTimeoutMs ?? 2_000
+  const sourceDeployment = (snapshotValue?.workloads ?? []).find((item) =>
+    item?.kind === 'Deployment' && item?.metadata?.name === 'dme-hermes')
+  const sourceReplicaSets = snapshotValue?.replicaSets ?? []
   const liveWatch = createPodWatch(resourceVersion, {
     kubectlCommand, readyTimeoutMs: startupTimeoutMs, shutdownTimeoutMs,
-    timeoutCode: 'pod_watch_startup_timeout',
+    timeoutCode: 'pod_watch_startup_timeout', sourceDeployment, sourceReplicaSets,
   })
   try {
     await liveWatch.ready
@@ -483,7 +507,8 @@ export async function startPodOverlapMonitor(snapshotValue, options = {}) {
       if (stopPromise) return stopPromise
       stopPromise = (async () => {
         const failureCodes = new Set(liveWatch.failureCodes)
-        const events = []
+        const legacyEvents = []
+        const runtimeDriftEvents = []
         let finalResourceVersion = null
         let catchupResourceVersion = null
         let catchupWatch = null
@@ -495,11 +520,15 @@ export async function startPodOverlapMonitor(snapshotValue, options = {}) {
           }
           for (const pod of finalPods.items) {
             const legacy = legacyConsumerEvent('FINAL_LIST', pod)
-            if (legacy) events.push(legacy)
+            if (legacy) legacyEvents.push(legacy)
+            const runtimeDrift = sourceRuntimeDriftEvent(
+              'FINAL_LIST', pod, sourceDeployment, sourceReplicaSets,
+            )
+            if (runtimeDrift) runtimeDriftEvents.push(runtimeDrift)
           }
           catchupWatch = createPodWatch(finalResourceVersion, {
             kubectlCommand, readyTimeoutMs: catchupTimeoutMs, shutdownTimeoutMs,
-            timeoutCode: 'pod_watch_catchup_timeout',
+            timeoutCode: 'pod_watch_catchup_timeout', sourceDeployment, sourceReplicaSets,
           })
           catchupResourceVersion = await catchupWatch.ready
         } catch (error) {
@@ -511,20 +540,24 @@ export async function startPodOverlapMonitor(snapshotValue, options = {}) {
           if (catchupWatch) {
             await catchupWatch.stop()
             for (const code of catchupWatch.failureCodes) failureCodes.add(code)
-            events.push(...catchupWatch.events)
+            legacyEvents.push(...catchupWatch.legacyEvents)
+            runtimeDriftEvents.push(...catchupWatch.runtimeDriftEvents)
           }
           await liveWatch.stop()
           for (const code of liveWatch.failureCodes) failureCodes.add(code)
-          events.push(...liveWatch.events)
+          legacyEvents.push(...liveWatch.legacyEvents)
+          runtimeDriftEvents.push(...liveWatch.runtimeDriftEvents)
         }
-        const uniqueEvents = [...new Map(events.map((event) => [canonicalJson(event), event])).values()]
+        const uniqueLegacyEvents = [...new Map(legacyEvents.map((event) => [canonicalJson(event), event])).values()]
+        const uniqueRuntimeDriftEvents = [...new Map(runtimeDriftEvents.map((event) => [canonicalJson(event), event])).values()]
         return {
           resource_version: resourceVersion,
           final_resource_version: finalResourceVersion,
           catchup_resource_version: catchupResourceVersion,
           healthy: failureCodes.size === 0,
           failure_codes: [...failureCodes].sort(),
-          legacy_consumer_events: uniqueEvents,
+          legacy_consumer_events: uniqueLegacyEvents,
+          source_runtime_drift_events: uniqueRuntimeDriftEvents,
         }
       })()
       return stopPromise
