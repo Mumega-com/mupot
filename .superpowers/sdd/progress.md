@@ -33,7 +33,8 @@ source-authority and writable-Project-access remediation; 5 focused files / 126 
 Task 8: complete (commits 107c455, e20f970, c14560a; independent review approved
 after global-priority, scheduled-occurrence, and indexed-query remediation; 10 focused
 Project/parity/routine/migration files / 175 tests + typecheck passed)
-Task 9: in progress
+Task 9: remediation in progress on `cursor/task9-routines-cancellation-fence`
+(immutable 0061 + forward 0062; cancellation fence; resumable receipts)
 
 ---
 
@@ -47,3 +48,8 @@ Tasks 1-5: complete (commits 714aa0a..7b7888b)
 Task 6: complete (commit f628e29; review approved after concurrency, governed lifecycle,
 retry, and cost-ordering remediation; 14 focused files / 269 tests + typecheck passed)
 Task 7: in progress
+Task 9: remediation packed on `cursor/task9-routines-cancellation-fence` — restores
+immutable `0061`, adds forward-only `0062` cancellation event kinds, atomic
+cancellation fence on action/scheduler/dispatch claims, resumable request-only
+receipts, and conservative Flight confirmation (failFlight alone is not confirmable).
+Focused gate: 11 files / 115 tests + typecheck passed. Awaiting re-review.

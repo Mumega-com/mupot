@@ -2,6 +2,7 @@ import type { D1Result } from '@cloudflare/workers-types'
 import type { Env } from '../types'
 import { nextRoutineOccurrence, routineOccurrenceKey } from './schedule'
 import type { Routine, RoutinePolicySnapshot, RoutineSchedule } from './types'
+import { sqlNotCancellationPending } from './cancellation-fence'
 
 // D1 free-tier invocations allow 50 SQL statements. Worst-case scheduler work is
 // bounded below that ceiling before an external dispatch processor does any work.
@@ -335,7 +336,8 @@ export async function claimRoutineRun(
                AND earlier.status = 'queued'
                AND (earlier.created_at < routine_runs.created_at
                  OR (earlier.created_at = routine_runs.created_at AND earlier.id < routine_runs.id))
-          )`,
+          )
+          AND ${sqlNotCancellationPending('id', 'tenant')}`,
     ).bind(owner, leaseExpiresAt, nowIso, runId, env.TENANT_SLUG, nowIso),
     env.DB.prepare(
       `INSERT INTO routine_run_events (

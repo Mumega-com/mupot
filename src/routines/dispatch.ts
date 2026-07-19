@@ -10,6 +10,7 @@ import { loadProjectSituation } from '../projects/situation'
 import { createTask } from '../tasks/service'
 import type { CapabilityGrant, Env, Project, Task } from '../types'
 import type { RoutinePolicySnapshot } from './types'
+import { sqlNotCancellationPending } from './cancellation-fence'
 
 const ROUTINE_SENDER = 'mupot-routines'
 const ROUTINE_MEMBER = 'system:routines'
@@ -258,7 +259,8 @@ async function appendStateEvent(
     env.DB.prepare(
       `UPDATE routine_runs SET status = ?, waiting_reason = ?, retry_at = ?,
               result_summary = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-        WHERE id = ? AND tenant = ? AND status IN ('leased','observing')`,
+        WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
+          AND ${sqlNotCancellationPending('id', 'tenant')}`,
     ).bind(
       input.status, input.waitingReason, input.retryAt, input.resultSummary,
       now, run.id, run.tenant,
@@ -468,7 +470,8 @@ export async function dispatchRoutineRun(
   const reserved = await env.DB.prepare(
     `UPDATE routine_runs SET assigned_agent_id = ?, updated_at = ?
       WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
-        AND (assigned_agent_id IS NULL OR assigned_agent_id = ?)`,
+        AND (assigned_agent_id IS NULL OR assigned_agent_id = ?)
+        AND ${sqlNotCancellationPending('id', 'tenant')}`,
   ).bind(selected.agentId, now.toISOString(), run.id, run.tenant, selected.agentId).run()
   if (!wrote(reserved)) return { ok: false, error: 'run_not_dispatchable' }
   run.assigned_agent_id = selected.agentId
@@ -488,7 +491,8 @@ export async function dispatchRoutineRun(
       `UPDATE routine_runs SET status = 'observing', assigned_agent_id = ?, task_id = ?,
               flight_id = ?, situation_digest = ?, updated_at = ?
         WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
-          AND assigned_agent_id = ?`,
+          AND assigned_agent_id = ?
+          AND ${sqlNotCancellationPending('id', 'tenant')}`,
     ).bind(
       selected.agentId, task.id, flightId, situationDigest, nowIso,
       run.id, run.tenant, selected.agentId,
@@ -556,6 +560,7 @@ export async function dispatchRoutineRun(
               lease_owner = NULL, lease_expires_at = NULL, retry_at = NULL,
               assigned_agent_id = ?, task_id = ?, flight_id = ?, situation_digest = ?, updated_at = ?
         WHERE id = ? AND tenant = ? AND status = 'observing'
+          AND ${sqlNotCancellationPending('id', 'tenant')}
           AND EXISTS (
             SELECT 1 FROM tasks t
              WHERE t.id = ? AND t.project_id = ? AND t.squad_id = ?
