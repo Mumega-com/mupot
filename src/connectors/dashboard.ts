@@ -27,6 +27,7 @@ const TYPE_LABELS: Record<ConnectorType, string> = {
   facebook_ads:          'Facebook Ads',
   crm:                   'CRM',
   linear:     'Linear',
+  notion:     'Notion',
   custom:     'Custom',
 }
 

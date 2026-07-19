@@ -366,6 +366,57 @@ dashboardApp.get('/projects/:id', async (c) => {
   return c.html(shell(c.env, view.project.name, projectDetailBody(view, c.req.query('status'))))
 })
 
+// POST /projects/:id/boards — link an external board (owner/admin).
+dashboardApp.post('/projects/:id/boards', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(shell(c.env, 'Projects', projectNotFoundBody()), 403)
+  }
+  const projectId = c.req.param('id')
+  const view = await loadProjectDetail(c.env, auth, projectId)
+  if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const form = await c.req.parseBody()
+  const { upsertProjectBinding } = await import('../projects/providers/bindings')
+  const result = await upsertProjectBinding(c.env, projectId, {
+    provider: form.provider,
+    external_id: form.external_id,
+    connector_id: form.connector_id,
+  })
+  if (!result.ok) {
+    return c.html(
+      shell(c.env, view.project.name, projectDetailBody(view)),
+      result.error === 'archived_project' || result.error === 'project_not_found' ? 400 : 400,
+    )
+  }
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}#board`)
+})
+
+// POST /projects/:id/boards/sync — import from the linked board into attributed tasks.
+dashboardApp.post('/projects/:id/boards/sync', async (c) => {
+  const auth = c.get('auth')
+  if (!isAdmin(auth)) {
+    return c.html(shell(c.env, 'Projects', projectNotFoundBody()), 403)
+  }
+  const projectId = c.req.param('id')
+  const view = await loadProjectDetail(c.env, auth, projectId)
+  if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const form = await c.req.parseBody()
+  const { isProjectBoardProvider } = await import('../projects/providers/port')
+  const { getProjectBinding } = await import('../projects/providers/bindings')
+  const { getTaskBoardPort } = await import('../projects/providers/registry')
+  const providerRaw = typeof form.provider === 'string' ? form.provider : ''
+  if (!isProjectBoardProvider(providerRaw)) {
+    return c.redirect(`/projects/${encodeURIComponent(projectId)}#board`)
+  }
+  const binding = await getProjectBinding(c.env, projectId, providerRaw)
+  if (!binding) return c.redirect(`/projects/${encodeURIComponent(projectId)}#board`)
+  await getTaskBoardPort(c.env, providerRaw).syncIntoProject(binding, {
+    project_id: projectId,
+    dryRun: false,
+  })
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}#board`)
+})
+
 // GET /send — the "Send a task" page. The last mile: a person writes a task,
 // picks one of their agents, submits, and watches it get done. The form POSTs to
 // the RBAC-gated /api/tasks (dispatch:true) and polls GET /api/tasks/:id. All auth
