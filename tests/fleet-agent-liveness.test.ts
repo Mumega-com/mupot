@@ -152,6 +152,29 @@ describe('getFleetAgentRuntime / getFleetAgentLiveness — real SQLite', () => {
       expect(result.agentId).toBe(uuid)
     })
 
+    it('reserves an exact fleet identity from another agent whose unique slug matches that id', async () => {
+      const exactAgentId = 'shared-runtime-id'
+      const slugCandidateId = 'uuid-agent-b'
+      addAgent(harness.sqlite, exactAgentId, 'squad-1', 'agent-a-slug')
+      addAgent(harness.sqlite, slugCandidateId, 'squad-2', exactAgentId)
+      addFleetRow(harness.sqlite, exactAgentId, {
+        runtime: 'codex',
+        status: 'running',
+        lastReportedAt: utcStamp(Date.now()),
+      })
+
+      expect(await getFleetAgentLiveness(env, exactAgentId)).toEqual({
+        runtime: 'codex',
+        live: true,
+        agentId: exactAgentId,
+      })
+      expect(await getFleetAgentLiveness(env, slugCandidateId)).toEqual({
+        runtime: '',
+        live: false,
+        agentId: '',
+      })
+    })
+
     it('a same-slug collision across three squads still refuses safely (not just the 2-way case)', async () => {
       const uuidA = 'uuid-a'
       const uuidB = 'uuid-b'

@@ -1,4 +1,6 @@
+import { execFile } from 'node:child_process'
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
@@ -174,6 +176,29 @@ async function canonicalEvidenceDigest(evidence: {
   })
   const bytes = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical)))
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+function runIntrinsicPoisoningFixture(): Promise<unknown> {
+  const runner = fileURLToPath(new URL('./fixtures/marketing-monitor-intrinsic-poisoning-runner.mjs', import.meta.url))
+  const root = fileURLToPath(new URL('..', import.meta.url))
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [runner], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 10_000,
+    }, (error, stdout, stderr) => {
+      if (error) {
+        const detail = [error.message, stderr.trim()].filter(Boolean).join('\n')
+        reject(new Error(`intrinsic poisoning fixture failed: ${detail}`))
+        return
+      }
+      try {
+        resolve(JSON.parse(stdout))
+      } catch (parseError) {
+        reject(new Error(`intrinsic poisoning fixture returned invalid JSON: ${String(parseError)}`))
+      }
+    })
+  })
 }
 
 function directRunValues(harness: SqliteD1Harness, overrides: Partial<Record<string, unknown>> = {}) {
@@ -656,84 +681,30 @@ describe('marketing monitor service', () => {
   })
 
   it('keeps persistence and digest canonical after post-load intrinsic poisoning', async () => {
-    await activateMarketing(env)
-    const originalDb = env.DB
-    const originals = {
-      encode: TextEncoder.prototype.encode,
-      map: Array.prototype.map,
-      filter: Array.prototype.filter,
-      some: Array.prototype.some,
-      toJSON: Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON'),
-    }
-    const safeBatchDb = {
-      prepare: originalDb.prepare.bind(originalDb),
-      async batch<T>(statements: Parameters<typeof originalDb.batch<T>>[0]) {
-        const poisoned = {
-          map: Array.prototype.map,
-          filter: Array.prototype.filter,
-          some: Array.prototype.some,
-        }
-        Array.prototype.map = originals.map
-        Array.prototype.filter = originals.filter
-        Array.prototype.some = originals.some
-        try {
-          return await originalDb.batch<T>(statements)
-        } finally {
-          Array.prototype.map = poisoned.map
-          Array.prototype.filter = poisoned.filter
-          Array.prototype.some = poisoned.some
-        }
+    const unrelatedCycle: unknown[] = []
+    unrelatedCycle[0] = unrelatedCycle
+    let proxyReads = 0
+    const unrelatedProxy = new Proxy({}, {
+      get() {
+        proxyReads += 1
+        throw new Error('unrelated proxy read')
       },
-    } as Env['DB']
-    env = { ...env, DB: safeBatchDb }
-    let result: Awaited<ReturnType<typeof runMarketingMonitor>> | undefined
+    })
 
-    try {
-      result = await runMarketingMonitor(env, owner, { window }, {
-        sourceFactory: ({ runId }) => {
-          TextEncoder.prototype.encode = () => { throw new Error('poisoned TextEncoder.encode') }
-          Object.defineProperty(Object.prototype, 'toJSON', {
-            configurable: true,
-            value: () => ({ poisoned: true }),
-          })
-          Array.prototype.map = () => { throw new Error('poisoned map') }
-          Array.prototype.filter = () => { throw new Error('poisoned filter') }
-          Array.prototype.some = () => { throw new Error('poisoned some') }
-          return [{
-            key: 'intrinsic_fixture',
-            slot: 'web_analytics',
-            async read() {
-              return {
-                status: 'available',
-                observations: [{
-                  id: `${runId}:visibility`,
-                  runId,
-                  metricKey: 'seo.ai_citations',
-                  value: 4,
-                  unit: 'count',
-                  authority: 'first-party',
-                  observedAt: '2026-07-01T12:00:00.000Z',
-                }],
-              }
-            },
-          }]
-        },
-      })
-    } finally {
-      TextEncoder.prototype.encode = originals.encode
-      Array.prototype.map = originals.map
-      Array.prototype.filter = originals.filter
-      Array.prototype.some = originals.some
-      if (originals.toJSON) Object.defineProperty(Object.prototype, 'toJSON', originals.toJSON)
-      else delete (Object.prototype as { toJSON?: unknown }).toJSON
-    }
-
-    expect(result).toEqual(expect.objectContaining({
+    expect(unrelatedCycle.map(() => 'worker')).toEqual(['worker'])
+    expect([unrelatedProxy].map(() => 'worker')).toEqual(['worker'])
+    expect(proxyReads).toBe(0)
+    expect(await runIntrinsicPoisoningFixture()).toEqual({
       ok: true,
-      run: expect.objectContaining({ observationCount: 1 }),
-    }))
-    if (!result?.ok) return
-    expect(result.run.evidenceDigest).toBe(await canonicalEvidenceDigest(result.run))
+      observationCount: 1,
+      directPoisonChecks: {
+        map: true,
+        filter: true,
+        some: true,
+        textEncoder: true,
+        outcomesJson: true,
+      },
+    })
   })
 
   it('pins a frozen collection environment before the injected source factory runs', async () => {

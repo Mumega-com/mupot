@@ -128,6 +128,7 @@ export interface Env {
   IM_WEBHOOK_SECRET?: string // shared secret for the IM webhook (Telegram secret_token)
   HERMES_RELAY_SECRET?: string // shared secret for the Hermes → mupot channel relay
   FLEET_PANEL_SK?: string      // Ed25519 PRIVATE OKP JWK — signs fleet control-requests. `wrangler secret put FLEET_PANEL_SK`. Absent ⇒ /api/fleet/control 503 (fail-closed).
+  PROJECT_LINK_SIGNING_KEY?: string // Ed25519 PRIVATE OKP JWK for signed cross-pot receipts; never shared with a peer pot.
   FLEET_CONSUMER_AGENT?: string // the host consumer agent id that reads + executes control-requests (the daemon reads its inbox as this). Absent ⇒ 503.
   // execution meter caps (env override; meter.ts defaults apply when absent)
   EXEC_MAX_DISPATCH_DAY?: string // max execute-mode dispatches per agent per UTC day

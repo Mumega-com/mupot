@@ -35,6 +35,7 @@ const rawPayload = () => ({
     body: 'do the work',
     request_id: 'rid-1',
     in_reply_to: null,
+    project_id: 'project-example',
     created_at: 'now',
   }],
   remaining: 0,
@@ -110,6 +111,39 @@ test('handleBatch: command failure returns ok=false so fleet-daemon keeps messag
   })
   assert.equal(res.ok, false)
   assert.equal(res.code, 9)
+})
+
+test('handleBatch: productized profiles persist first and activate through the direct runner', async () => {
+  const dir = tmp()
+  const raw = rawConfig(dir)
+  delete raw.agents[0].command
+  delete raw.agents[0].run_for
+  raw.agents[0].profile = {
+    schema: 'mupot.agent-profile/v1',
+    agent_id: 'agent-one',
+    adapter: 'hermes',
+    command: ['/opt/homebrew/bin/hermes', 'chat', '--toolsets', 'mumega_dme'],
+    allowed_senders: ['review'],
+    allowed_project_ids: ['project-example'],
+    run_for: ['request'],
+    timeout_ms: 120000,
+  }
+  const cfg = validateConfig(raw)
+  const payload = validatePayload(rawPayload())
+  const calls = []
+  const result = await handleBatch(cfg, payload, {
+    now: () => 'received',
+    runProfile: async (profile, batch) => {
+      calls.push({ profile, batch })
+      assert.equal(JSON.parse(readFileSync(batch.files[0], 'utf8')).received_at, 'received')
+      return { ok: true, code: 0, activated_messages: 1 }
+    },
+  })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.command, 'profile:hermes')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].batch.messages[0].project_id, 'project-example')
 })
 
 test('runCommand: passes JSON stdin to a real child process', async () => {

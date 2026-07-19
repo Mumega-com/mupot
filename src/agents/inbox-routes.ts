@@ -18,7 +18,7 @@ import type { Context } from 'hono'
 import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { sendToRef, readAgentInbox } from './messages'
-import { verifySignedInboxRead } from '../fleet/signed-inbox'
+import { verifyAndReadSignedInbox } from '../fleet/signed-inbox'
 
 const MAX_BODY_BYTES = 8192
 
@@ -72,6 +72,7 @@ inboxApp.get('/', async (c) => {
   if (!res.ok) {
     // Never forward a raw DB error string to the client (leak-guard, matches the MCP path).
     if (res.reason === 'db_error') return c.json({ error: res.reason }, 500)
+    if (res.reason === 'consumer_fenced') return c.json({ error: res.reason }, 409)
     return c.json({ error: res.reason, detail: res.detail }, 400)
   }
   return c.json({ ok: true, messages: res.messages, remaining: res.remaining, consumed: !peek })
@@ -86,26 +87,14 @@ inboxApp.post('/signed', async (c) => {
   const parsed = await readJsonObjectCapped(c)
   if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
 
-  const verified = await verifySignedInboxRead(c.env, parsed.value)
-  if (!verified.ok) {
-    return c.json({ error: verified.error, detail: verified.detail }, verified.status as 400 | 401 | 409)
-  }
-
-  const res = await readAgentInbox(c.env, {
-    agent: verified.agent_id,
-    peek: verified.peek,
-    limit: verified.limit,
-  })
-  if (!res.ok) {
-    if (res.reason === 'db_error') return c.json({ error: res.reason }, 500)
-    return c.json({ error: res.reason, detail: res.detail }, 400)
-  }
+  const res = await verifyAndReadSignedInbox(c.env, parsed.value)
+  if (!res.ok) return c.json({ error: res.error, detail: res.detail }, res.status as 400 | 401 | 409 | 500)
   return c.json({
     ok: true,
-    agent: verified.agent_id,
+    agent: res.agent_id,
     messages: res.messages,
     remaining: res.remaining,
-    consumed: !verified.peek,
+    consumed: res.consumed,
   })
 })
 
@@ -117,7 +106,7 @@ inboxApp.post('/send', async (c) => {
 
   const parsed = await readJsonObjectCapped(c)
   if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
-  const body = parsed.value as { to?: unknown; body?: unknown; kind?: unknown; request_id?: unknown; in_reply_to?: unknown }
+  const body = parsed.value as { to?: unknown; body?: unknown; kind?: unknown; request_id?: unknown; in_reply_to?: unknown; project_id?: unknown }
 
   const to = typeof body.to === 'string' ? body.to : ''
   const text = typeof body.body === 'string' ? body.body : ''
@@ -126,6 +115,7 @@ inboxApp.post('/send', async (c) => {
   if (body.kind !== undefined && typeof body.kind !== 'string') return c.json({ error: 'invalid_args', detail: 'kind must be a string' }, 400)
   if (body.request_id !== undefined && typeof body.request_id !== 'string') return c.json({ error: 'invalid_args', detail: 'request_id must be a string' }, 400)
   if (body.in_reply_to !== undefined && typeof body.in_reply_to !== 'string') return c.json({ error: 'invalid_args', detail: 'in_reply_to must be a string' }, 400)
+  if (body.project_id !== undefined && typeof body.project_id !== 'string') return c.json({ error: 'invalid_args', detail: 'project_id must be a string' }, 400)
 
   const res = await sendToRef(c.env, {
     fromAgent: id.boundAgentId,
@@ -135,17 +125,20 @@ inboxApp.post('/send', async (c) => {
     kind: body.kind as 'message' | 'request' | 'ack' | undefined,
     requestId: typeof body.request_id === 'string' ? body.request_id : undefined,
     inReplyTo: typeof body.in_reply_to === 'string' ? body.in_reply_to : undefined,
+    projectId: typeof body.project_id === 'string' ? body.project_id : undefined,
   })
   if (!res.ok) {
     // Never forward a raw DB error string to the client (leak-guard, matches the MCP path).
     if (res.reason === 'db_error') return c.json({ error: res.reason }, 500)
     const status =
-      res.reason === 'recipient_not_found'
+      res.reason === 'recipient_not_found' || res.reason === 'project_not_found'
         ? 404
-        : res.reason === 'recipient_ambiguous' || res.reason === 'request_id_conflict' || res.reason === 'inbox_full'
+        : res.reason === 'project_access_denied'
+          ? 403
+          : res.reason === 'recipient_ambiguous' || res.reason === 'request_id_conflict' || res.reason === 'inbox_full' || res.reason === 'project_archived'
           ? 409
           : 400
     return c.json({ error: res.reason, detail: res.detail }, status)
   }
-  return c.json({ ok: true, id: res.id, seq: res.seq, duplicate: res.duplicate, to: res.toAgent })
+  return c.json({ ok: true, id: res.id, seq: res.seq, duplicate: res.duplicate, to: res.toAgent, project_id: typeof body.project_id === 'string' ? body.project_id : null })
 })

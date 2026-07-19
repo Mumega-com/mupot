@@ -1,0 +1,14 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dme-hermes-plugin-smoke
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mupot-agent-host-smoke
+      app.kubernetes.io/instance: dme-hermes
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress: []

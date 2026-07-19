@@ -4,9 +4,16 @@ import { isNonEmptyString, isValidSlug } from '../org/service'
 
 const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'completed', 'archived']
 const PROJECT_ACCESS_LEVELS: readonly ProjectAccessLevel[] = ['read', 'write', 'admin']
+const PROJECT_STATUS_TRANSITIONS: Readonly<Record<ProjectStatus, readonly ProjectStatus[]>> = {
+  planned: ['active', 'archived'],
+  active: ['paused', 'completed', 'archived'],
+  paused: ['active', 'completed', 'archived'],
+  completed: ['active', 'archived'],
+  archived: ['planned'],
+}
 
 export type ProjectMutationError =
-  | 'invalid_slug' | 'invalid_name' | 'invalid_status' | 'invalid_target_date'
+  | 'invalid_slug' | 'invalid_name' | 'invalid_status' | 'invalid_status_transition' | 'invalid_target_date'
   | 'slug_taken' | 'project_not_found' | 'parent_not_found'
   | 'hierarchy_depth' | 'hierarchy_cycle' | 'active_children'
   | 'archived_project' | 'squad_not_found' | 'invalid_access_level'
@@ -49,11 +56,19 @@ function isProjectAccessLevel(value: unknown): value is ProjectAccessLevel {
   return typeof value === 'string' && (PROJECT_ACCESS_LEVELS as readonly string[]).includes(value)
 }
 
-function isValidTargetDate(value: unknown): value is string {
+export function isValidProjectTargetDate(value: unknown): value is string {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
   const [year, month, day] = value.split('-').map(Number)
   const parsed = new Date(Date.UTC(year, month - 1, day))
   return parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day
+}
+
+export function validProjectStatusTransitions(status: ProjectStatus): readonly ProjectStatus[] {
+  return PROJECT_STATUS_TRANSITIONS[status]
+}
+
+export function isValidProjectStatusTransition(from: ProjectStatus, to: ProjectStatus): boolean {
+  return from === to || PROJECT_STATUS_TRANSITIONS[from].includes(to)
 }
 
 function isUniqueViolation(error: unknown): boolean {
@@ -141,7 +156,7 @@ export async function createProject(
   if (!isProjectStatus(status)) return { ok: false, error: 'invalid_status' }
 
   const targetDate = input.target_date === undefined || input.target_date === null ? null : input.target_date
-  if (targetDate !== null && !isValidTargetDate(targetDate)) return { ok: false, error: 'invalid_target_date' }
+  if (targetDate !== null && !isValidProjectTargetDate(targetDate)) return { ok: false, error: 'invalid_target_date' }
 
   const parentProjectId = input.parent_project_id === undefined ? null : input.parent_project_id
   if (parentProjectId !== null) {
@@ -218,10 +233,18 @@ export async function updateProject(
   if (!existing) return { ok: false, error: 'project_not_found' }
 
   const suppliedKeys = Object.keys(input).filter((key) => input[key as keyof UpdateProjectInput] !== undefined)
-  if (existing.status === 'archived') {
-    if (suppliedKeys.length !== 1 || input.status !== 'active') return { ok: false, error: 'archived_project' }
+  const statusWasSupplied = input.status !== undefined
+  if (statusWasSupplied && !isProjectStatus(input.status)) return { ok: false, error: 'invalid_status' }
+  if (existing.status === 'archived' && suppliedKeys.some((key) => key !== 'status')) {
+    return { ok: false, error: 'archived_project' }
   }
-
+  if (existing.status === 'archived' && !statusWasSupplied) {
+    return { ok: false, error: 'archived_project' }
+  }
+  const nextStatus = statusWasSupplied ? input.status as ProjectStatus : existing.status
+  if (statusWasSupplied && !isValidProjectStatusTransition(existing.status, nextStatus)) {
+    return { ok: false, error: 'invalid_status_transition' }
+  }
   const nextSlug = input.slug === undefined ? existing.slug : input.slug
   if (!isValidSlug(nextSlug)) return { ok: false, error: 'invalid_slug' }
   const nextName = input.name === undefined ? existing.name : input.name
@@ -229,10 +252,8 @@ export async function updateProject(
   const nextDescription = optionalText(input.description, existing.description)
   const nextGoal = optionalText(input.goal, existing.goal)
   if (nextDescription === null || nextGoal === null) return { ok: false, error: 'invalid_name' }
-  const nextStatus = input.status === undefined ? existing.status : input.status
-  if (!isProjectStatus(nextStatus)) return { ok: false, error: 'invalid_status' }
   const nextTargetDate = input.target_date === undefined ? existing.target_date : input.target_date
-  if (nextTargetDate !== null && !isValidTargetDate(nextTargetDate)) return { ok: false, error: 'invalid_target_date' }
+  if (nextTargetDate !== null && !isValidProjectTargetDate(nextTargetDate)) return { ok: false, error: 'invalid_target_date' }
 
   const nextParentProjectId = input.parent_project_id === undefined
     ? existing.parent_project_id

@@ -7,7 +7,8 @@
 // the nonce ledger is shared with signed attach so replay is still single-use.
 
 import type { Env } from '../types'
-import { loadActiveAgentKey } from './agent-keys'
+import { readVerifiedSignedAgentInbox, type InboxMessage } from '../agents/messages'
+import { agentKeyFingerprint, loadActiveAgentKey } from './agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from './shared-nonce-ledger'
 
 export const INBOX_WINDOW_SEC = sharedNonceWindowSec('agent-inbox:v1')
@@ -73,6 +74,7 @@ export type SignedInboxOk = {
   peek: boolean
   limit: number
   member_id: string
+  key_fingerprint: string
 }
 
 export type SignedInboxErr = {
@@ -160,5 +162,48 @@ export async function verifySignedInboxRead(
     return { ok: false, status: 409, error: 'replay', detail: 'nonce already used' }
   }
 
-  return { ok: true, agent_id: agentId, peek, limit, member_id: keyRow.member_id }
+  return {
+    ok: true,
+    agent_id: agentId,
+    peek,
+    limit,
+    member_id: keyRow.member_id,
+    key_fingerprint: await agentKeyFingerprint(keyRow.pubkey),
+  }
+}
+
+export type VerifiedSignedInboxRead =
+  | {
+      ok: true
+      agent_id: string
+      messages: InboxMessage[]
+      remaining: number
+      consumed: boolean
+    }
+  | SignedInboxErr
+
+/** Cryptographic boundary: no caller can select the privileged reader without a valid signature. */
+export async function verifyAndReadSignedInbox(
+  env: Env,
+  body: Record<string, unknown>,
+): Promise<VerifiedSignedInboxRead> {
+  const verified = await verifySignedInboxRead(env, body)
+  if (!verified.ok) return verified
+  const inbox = await readVerifiedSignedAgentInbox(env, {
+    agent: verified.agent_id,
+    peek: verified.peek,
+    limit: verified.limit,
+    keyFingerprint: verified.key_fingerprint,
+  })
+  if (!inbox.ok) {
+    const status = inbox.reason === 'consumer_fenced' ? 409 : inbox.reason === 'db_error' ? 500 : 400
+    return { ok: false, status, error: inbox.reason, ...(inbox.detail ? { detail: inbox.detail } : {}) }
+  }
+  return {
+    ok: true,
+    agent_id: verified.agent_id,
+    messages: inbox.messages,
+    remaining: inbox.remaining,
+    consumed: !verified.peek,
+  }
 }

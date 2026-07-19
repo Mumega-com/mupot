@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createHash } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
@@ -17,6 +18,12 @@ const approvalTaskTitle = `Approval workflow smoke ${smokeRunId}`
 const hermesApprovalTaskTitle = `Hermes approval smoke ${smokeRunId}`
 const hermesTaskTitle = `Hermes dashboard refresh ${smokeRunId}`
 const hermesDirectiveText = `Hold all outbound automation until local browser smoke ${smokeRunId} is complete.`
+const ownerProjectName = `Browser Project ${smokeRunId}`
+const ownerProjectSlug = `browser-project-${Date.now()}`
+const ownerProjectInitialGoal = 'Create a governed nested project through the dashboard.'
+const ownerProjectEditedGoal = 'Prove the owner lifecycle is visible through the canonical Project situation.'
+const mcpOwnerToken = process.env.MUPOT_CONFORMANCE_OWNER_TOKEN
+  || ['local', 'runtime', 'conformance', 'owner', 'token'].join('-')
 
 const pages = [
   '/',
@@ -56,7 +63,7 @@ const hermesMessages = [
   { lifecycle: 'Hermes IM help lifecycle', text: 'help', expect: 'I can:' },
   { lifecycle: 'Hermes IM member status lifecycle', text: 'status', expect: 'Hermes Test Operator' },
   { lifecycle: 'Hermes IM agent status lifecycle', text: 'status hermes', expect: 'Hermes Local' },
-  { lifecycle: 'Hermes IM fleet control lifecycle', text: 'fleet status hermes', expect: 'Queued fleet status for Hermes Local Relay.' },
+  { lifecycle: 'Hermes IM fleet control lifecycle', text: 'fleet status agent-hermes', expect: 'Queued fleet status for Hermes Local Relay.' },
   { lifecycle: 'Hermes IM task lifecycle', text: `task: ${hermesTaskTitle} @growth`, expect: `Added to Growth Local: "${hermesTaskTitle}".` },
 ]
 
@@ -93,6 +100,109 @@ const workflows = []
 
 async function textSnippet(locator, limit = 240) {
   return (await locator.innerText({ timeout: 5_000 }).catch(() => '')).slice(0, limit)
+}
+
+async function documentOverflow() {
+  return page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+}
+
+async function assertNoDocumentOverflow(label) {
+  const horizontalOverflow = await documentOverflow()
+  if (horizontalOverflow > 1) fail(`${label} has document-level horizontal overflow`, { horizontalOverflow })
+  return horizontalOverflow
+}
+
+function canonicalValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalValue)
+  if (!value || typeof value !== 'object') return value
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalValue(value[key])]))
+}
+
+function canonicalHash(value) {
+  return createHash('sha256').update(JSON.stringify(canonicalValue(value))).digest('hex')
+}
+
+function comparedSituationFields(situation) {
+  return {
+    health: situation.health,
+    blockerCount: situation.blockers.length,
+    blockerDetailsTruncated: situation.blocker_details_truncated,
+    pendingReviewCount: situation.pending_reviews.length,
+    pendingReviewDetailsTruncated: situation.pending_review_details_truncated,
+    taskCounts: situation.task_counts,
+    taskCountsTruncated: situation.task_counts_truncated,
+    activeWorkCount: situation.active_work_count,
+    activeWorkCountTruncated: situation.active_work_count_truncated,
+    activeFlightCount: situation.active_flight_count,
+    activeFlightCountTruncated: situation.active_flight_count_truncated,
+    snapshotTruncated: situation.snapshot_truncated,
+    latestActivity: situation.latest_activity,
+    nextAction: situation.next_action,
+  }
+}
+
+async function readProjectRest(projectId) {
+  const response = await context.request.get(`${baseUrl}/api/projects/${encodeURIComponent(projectId)}`, {
+    timeout: 20_000,
+  })
+  const json = await response.json().catch(() => null)
+  if (response.status() !== 200 || json?.project?.id !== projectId || !json?.situation) {
+    fail('canonical Project REST read failed', { projectId, status: response.status(), json })
+  }
+  return json
+}
+
+async function readProjectMcp(projectId) {
+  const response = await context.request.post(`${baseUrl}/actions/project_get`, {
+    headers: {
+      authorization: `Bearer ${mcpOwnerToken}`,
+      'content-type': 'application/json',
+    },
+    data: { project_id: projectId },
+    timeout: 20_000,
+  })
+  const json = await response.json().catch(() => null)
+  if (response.status() !== 200 || !json?.ok || json?.result?.project?.id !== projectId || !json?.result?.situation) {
+    fail('canonical Project MCP read failed', { projectId, status: response.status(), json })
+  }
+  return json.result
+}
+
+async function observeLifecycleStatus(projectId, command, expectedFrom, expectedTo) {
+  const read = await readProjectRest(projectId)
+  const observedPersistedStatus = read.project.status
+  if (observedPersistedStatus !== expectedTo) {
+    fail('Project lifecycle did not persist the expected status', {
+      projectId,
+      command,
+      expectedTransition: { from: expectedFrom, to: expectedTo },
+      observedPersistedStatus,
+    })
+  }
+  return {
+    command,
+    expectedTransition: { from: expectedFrom, to: expectedTo },
+    observedPersistedStatus,
+    observedFrom: `GET /api/projects/${projectId}`,
+  }
+}
+
+async function applyProjectLifecycleCommand(command, expectedResult, projectId, expectedFrom, expectedTo) {
+  await page.goto(`${baseUrl}/projects/${encodeURIComponent(projectId)}/settings`, {
+    waitUntil: 'networkidle',
+    timeout: 20_000,
+  })
+  await page.locator('select[name="command"]').selectOption(command)
+  await Promise.all([
+    page.waitForURL(`${baseUrl}/projects/${encodeURIComponent(projectId)}?status=${expectedResult}`, { timeout: 10_000 }),
+    page.getByRole('button', { name: 'Apply status' }).click(),
+  ])
+  const successText = await textSnippet(page.locator('[role="status"]'))
+  if (!successText) fail('project lifecycle success state was not rendered', { command, expectedResult })
+  return {
+    successText,
+    receipt: await observeLifecycleStatus(projectId, command, expectedFrom, expectedTo),
+  }
 }
 
 async function runLoginWorkflow() {
@@ -160,6 +270,88 @@ async function runProjectWorkspaceWorkflow() {
       fail('project-filtered work link missing', { href, detailText })
     }
   }
+  const activityText = await textSnippet(page.locator('#activity'), 4000)
+  if (!activityText.includes('In-progress local task') || !activityText.includes('Run local browser smoke')) {
+    fail('project Activity did not render attributed task and flight rows', { activityText })
+  }
+  const evidenceText = await textSnippet(page.locator('#evidence'), 4000)
+  if (!evidenceText.includes('Done local task') || !evidenceText.includes('Completed local baseline.')) {
+    fail('project Evidence did not render the retained task result', { evidenceText })
+  }
+  const browserSituation = JSON.parse(await page.locator('#project-situation-json').textContent())
+  const [restProject, mcpProject] = await Promise.all([
+    readProjectRest('project-mupot'),
+    readProjectMcp('project-mupot'),
+  ])
+  const situationSurfaces = {
+    browser: browserSituation,
+    rest: restProject.situation,
+    mcp: mcpProject.situation,
+  }
+  const surfaceHashes = Object.fromEntries(Object.entries(situationSurfaces).map(([surface, situation]) => (
+    [surface, canonicalHash(situation)]
+  )))
+  if (new Set(Object.values(surfaceHashes)).size !== 1) {
+    fail('Project situation differs across browser, REST, and MCP', {
+      projectId: 'project-mupot',
+      surfaceHashes,
+      surfaceValues: Object.fromEntries(Object.entries(situationSurfaces).map(([surface, situation]) => (
+        [surface, comparedSituationFields(situation)]
+      ))),
+    })
+  }
+  const surfaceValues = Object.fromEntries(Object.entries(situationSurfaces).map(([surface, situation]) => (
+    [surface, comparedSituationFields(situation)]
+  )))
+  const browserFields = surfaceValues.browser
+  if (browserFields.health !== 'blocked'
+    || browserFields.blockerCount !== 1
+    || browserFields.pendingReviewCount !== 1
+    || JSON.stringify(browserFields.taskCounts) !== JSON.stringify({ blocked: 1, review: 1, in_progress: 1, open: 0 })
+    || browserFields.activeWorkCount !== 3
+    || browserFields.activeFlightCount !== 1
+    || browserFields.blockerDetailsTruncated
+    || browserFields.pendingReviewDetailsTruncated
+    || Object.values(browserFields.taskCountsTruncated).some(Boolean)
+    || browserFields.activeWorkCountTruncated
+    || browserFields.activeFlightCountTruncated
+    || browserFields.snapshotTruncated
+    || !browserFields.latestActivity
+    || browserFields.nextAction?.type !== 'review_task') {
+    fail('browser did not structurally observe the seeded Mupot situation', { browserFields })
+  }
+  const teamPresence = await page.locator('[data-project-agent-presence]').evaluateAll((nodes) => nodes.map((node) => ({
+    agentId: node.dataset.agentId,
+    presence: node.dataset.presence,
+    label: node.textContent?.trim(),
+  })).sort((left, right) => String(left.agentId).localeCompare(String(right.agentId))))
+  const expectedTeamPresence = [
+    { agentId: 'agent-conformance', presence: 'stale', label: 'Stale' },
+    { agentId: 'agent-conformance-sender', presence: 'not_attached', label: 'Not attached' },
+    { agentId: 'agent-growth', presence: 'offline', label: 'Offline' },
+    { agentId: 'agent-hermes', presence: 'live', label: 'Live' },
+  ]
+  if (JSON.stringify(teamPresence) !== JSON.stringify(expectedTeamPresence)) {
+    fail('browser Team presence labels do not match seeded runtime truth', { teamPresence, expectedTeamPresence })
+  }
+  const surfaceParity = {
+    projectId: 'project-mupot',
+    comparedFields: [
+      'health', 'blockerCount', 'blockerDetailsTruncated',
+      'pendingReviewCount', 'pendingReviewDetailsTruncated',
+      'taskCounts', 'taskCountsTruncated',
+      'activeWorkCount', 'activeWorkCountTruncated',
+      'activeFlightCount', 'activeFlightCountTruncated',
+      'snapshotTruncated', 'latestActivity', 'nextAction',
+    ],
+    equal: true,
+    surfaces: Object.fromEntries(Object.keys(situationSurfaces).map((surface) => [surface, {
+      canonicalHash: surfaceHashes[surface],
+      values: surfaceValues[surface],
+    }])),
+    browserTeamPresence: teamPresence,
+  }
+  const mupotDesktopOverflow = await assertNoDocumentOverflow('Mupot desktop Project')
   await page.screenshot({ path: path.join(artifactsDir, 'project-mupot.png'), fullPage: true })
 
   await page.goto(`${baseUrl}/send?project_id=project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
@@ -173,28 +365,187 @@ async function runProjectWorkspaceWorkflow() {
     fail('project flight context did not render filtered flights', { projectFlightsText })
   }
 
+  await page.goto(`${baseUrl}/projects/new`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.locator('input[name="name"]').fill(ownerProjectName)
+  await page.locator('input[name="slug"]').fill(ownerProjectSlug)
+  await page.locator('textarea[name="description"]').fill('Created by the local browser smoke through the owner Project form.')
+  await page.locator('textarea[name="goal"]').fill(ownerProjectInitialGoal)
+  await page.locator('select[name="parent_project_id"]').selectOption('project-mumega-products')
+  await Promise.all([
+    page.waitForURL(new RegExp(`${baseUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/projects/[^?]+\\?status=created$`), { timeout: 10_000 }),
+    page.getByRole('button', { name: 'Create project' }).click(),
+  ])
+  const createdUrl = new URL(page.url())
+  const createdProjectId = createdUrl.pathname.split('/').at(-1)
+  if (!createdProjectId) fail('project create did not redirect to a canonical Project URL', { url: page.url() })
+  const createdText = await textSnippet(page.locator('body'), 4000)
+  if (!createdText.includes('Project created.') || !createdText.includes('Mumega Products')) {
+    fail('created nested project did not render its success state and parent context', { createdText })
+  }
+  const lifecycleTransitions = [
+    await observeLifecycleStatus(createdProjectId, 'create', null, 'planned'),
+  ]
+
+  await page.goto(`${baseUrl}/projects/${encodeURIComponent(createdProjectId)}/settings`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.locator('textarea[name="goal"]').fill(ownerProjectEditedGoal)
+  await Promise.all([
+    page.waitForURL(`${baseUrl}/projects/${encodeURIComponent(createdProjectId)}?status=updated`, { timeout: 10_000 }),
+    page.getByRole('button', { name: 'Save settings' }).click(),
+  ])
+  const updatedText = await textSnippet(page.locator('body'), 4000)
+  if (!updatedText.includes('Project settings saved.') || !updatedText.includes(ownerProjectEditedGoal)) {
+    fail('project goal edit did not render its success state and saved value', { updatedText })
+  }
+  lifecycleTransitions.push(await observeLifecycleStatus(
+    createdProjectId,
+    'edit_goal',
+    'planned',
+    'planned',
+  ))
+
+  const activated = await applyProjectLifecycleCommand(
+    'activate', 'activated', createdProjectId, 'planned', 'active',
+  )
+  if (!activated.successText.includes('Project activated.')) {
+    fail('project activation success state missing', { activatedText: activated.successText })
+  }
+  lifecycleTransitions.push(activated.receipt)
+
+  const createdBrowserSituation = JSON.parse(await page.locator('#project-situation-json').textContent())
+  const createdProjectRead = await readProjectRest(createdProjectId)
+  const createdProjectObservation = {
+    health: createdBrowserSituation.health,
+    nextAction: createdBrowserSituation.next_action,
+    goal: createdProjectRead.project.goal,
+  }
+  if (createdProjectObservation.health !== 'ready'
+    || createdProjectObservation.nextAction?.type !== 'create_task'
+    || createdProjectObservation.goal !== ownerProjectEditedGoal
+    || canonicalHash(createdBrowserSituation) !== canonicalHash(createdProjectRead.situation)) {
+    fail('activated Project did not render its canonical ready situation', {
+      createdProjectObservation,
+      browserSituationHash: canonicalHash(createdBrowserSituation),
+      restSituationHash: canonicalHash(createdProjectRead.situation),
+    })
+  }
+  const createdDesktopOverflow = await assertNoDocumentOverflow('created desktop Project')
+  await page.screenshot({ path: path.join(artifactsDir, 'created-project-desktop.png'), fullPage: true })
+
+  await page.goto(`${baseUrl}/projects`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.locator('input[name="search"]').fill(ownerProjectName)
+  await page.locator('select[name="status"]').selectOption('active')
+  await Promise.all([
+    page.waitForURL(new RegExp(`/projects\\?search=${encodeURIComponent(ownerProjectName).replace(/%20/g, '\\+')}&status=active$`), { timeout: 10_000 }),
+    page.getByRole('button', { name: 'Filter' }).click(),
+  ])
+  const filteredText = await textSnippet(page.locator('body'), 4000)
+  if (!filteredText.includes(ownerProjectName) || !filteredText.includes(ownerProjectEditedGoal)) {
+    fail('project search and status filter did not retain the activated Project', { filteredText, url: page.url() })
+  }
+
+  const completed = await applyProjectLifecycleCommand(
+    'complete', 'completed', createdProjectId, 'active', 'completed',
+  )
+  if (!completed.successText.includes('Project completed.')) {
+    fail('project completion success state missing', { completedText: completed.successText })
+  }
+  lifecycleTransitions.push(completed.receipt)
+
+  const reopened = await applyProjectLifecycleCommand(
+    'activate', 'activated', createdProjectId, 'completed', 'active',
+  )
+  if (!reopened.successText.includes('Project activated.')) {
+    fail('project reopen success state missing', { reopenedText: reopened.successText })
+  }
+  lifecycleTransitions.push(reopened.receipt)
+
+  const paused = await applyProjectLifecycleCommand(
+    'pause', 'paused', createdProjectId, 'active', 'paused',
+  )
+  if (!paused.successText.includes('Project paused.')) {
+    fail('project pause success state missing', { pausedText: paused.successText })
+  }
+  lifecycleTransitions.push(paused.receipt)
+
+  const archived = await applyProjectLifecycleCommand(
+    'archive', 'archived', createdProjectId, 'paused', 'archived',
+  )
+  if (!archived.successText.includes('Project archived.')) {
+    fail('project archive success state missing', { archivedText: archived.successText })
+  }
+  lifecycleTransitions.push(archived.receipt)
+
+  const restored = await applyProjectLifecycleCommand(
+    'restore', 'restored', createdProjectId, 'archived', 'planned',
+  )
+  if (!restored.successText.includes('Project restored to planned.')) {
+    fail('project restore success state missing', { restoredText: restored.successText })
+  }
+  lifecycleTransitions.push(restored.receipt)
+
   await page.setViewportSize({ width: 390, height: 844 })
   await page.goto(`${baseUrl}/projects`, { waitUntil: 'networkidle', timeout: 20_000 })
-  const horizontalOverflow = await page.evaluate(() => (
-    document.documentElement.scrollWidth - document.documentElement.clientWidth
-  ))
-  if (horizontalOverflow > 1) {
-    fail('mobile project workspace has horizontal overflow', { horizontalOverflow })
-  }
+  const projectsMobileOverflow = await assertNoDocumentOverflow('mobile Projects')
   await page.locator('#topbar-menu-btn').click()
   const mobileNavigation = await page.locator('#app-nav > a.nav-link .nav-label').allInnerTexts()
   if (JSON.stringify(mobileNavigation.slice(0, 4)) !== JSON.stringify(expectedPrimaryNavigation)) {
     fail('mobile primary navigation order changed', { mobileNavigation, expectedPrimaryNavigation })
   }
   await page.screenshot({ path: path.join(artifactsDir, 'projects-mobile.png'), fullPage: true })
+
+  await page.goto(`${baseUrl}/projects/project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const mupotMobileOverflow = await assertNoDocumentOverflow('Mupot mobile Project')
+  const teamScroll = await page.locator('[role="region"][aria-label="Readable project agent members"]').evaluate((region) => {
+    const element = region
+    const initial = element.scrollLeft
+    element.scrollLeft = 32
+    const scrolled = element.scrollLeft
+    element.scrollLeft = element.scrollWidth - element.clientWidth
+    return {
+      clientWidth: element.clientWidth,
+      scrollWidth: element.scrollWidth,
+      scrolled,
+      screenshotScrollLeft: element.scrollLeft,
+    }
+  })
+  if (teamScroll.scrollWidth <= teamScroll.clientWidth || teamScroll.scrolled <= 0) {
+    fail('Team / Squads table did not provide an internal horizontal scroll region', { teamScroll })
+  }
+  await page.locator('#squads').scrollIntoViewIfNeeded()
+  await page.screenshot({ path: path.join(artifactsDir, 'project-mupot-team-mobile.png') })
+
+  await page.goto(`${baseUrl}/projects/${encodeURIComponent(createdProjectId)}`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const createdMobileOverflow = await assertNoDocumentOverflow('created mobile Project')
+  await page.screenshot({ path: path.join(artifactsDir, 'created-project-mobile.png'), fullPage: true })
   await page.setViewportSize({ width: 1440, height: 1000 })
 
   workflows.push({
-    name: 'project-centered workspace desktop and mobile',
+    name: 'project-centered workspace and owner lifecycle',
     status: 'passed',
     projectId: 'project-mupot',
-    viewport: { width: 390, height: 844 },
-    horizontalOverflow,
+    createdProjectId,
+    createdProjectParentId: 'project-mumega-products',
+    lifecycleTransitions,
+    surfaceParity,
+    createdProjectObservation,
+    viewports: {
+      desktop: { width: 1440, height: 1000, mupotDocumentOverflow: mupotDesktopOverflow, createdDocumentOverflow: createdDesktopOverflow },
+      mobile: {
+        width: 390,
+        height: 844,
+        projectsDocumentOverflow: projectsMobileOverflow,
+        mupotDocumentOverflow: mupotMobileOverflow,
+        createdDocumentOverflow: createdMobileOverflow,
+      },
+    },
+    teamScroll,
+    screenshots: [
+      path.join(artifactsDir, 'project-mupot.png'),
+      path.join(artifactsDir, 'created-project-desktop.png'),
+      path.join(artifactsDir, 'projects-mobile.png'),
+      path.join(artifactsDir, 'project-mupot-team-mobile.png'),
+      path.join(artifactsDir, 'created-project-mobile.png'),
+    ],
     primaryNavigation: expectedPrimaryNavigation,
   })
 }

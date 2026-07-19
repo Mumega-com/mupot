@@ -52,6 +52,30 @@ test('install receipt creates runtime layout, templates, logs/state, and rendere
   assert.equal(receipt.outputs.logs_dir, join(prefix, 'logs'))
   assert.equal(receipt.outputs.state_dir, join(prefix, 'state'))
   assert.deepEqual(receipt.outputs.service_definitions.map((definition) => definition.service), ['heartbeat', 'control'])
+  assert.deepEqual(receipt.outputs.profile_hashes.map((profile) => profile.agent_id), ['agent-one', 'agent-two'])
+  assert.equal(receipt.outputs.profile_hashes.every((profile) => /^[a-f0-9]{64}$/.test(profile.sha256)), true)
+  assert.doesNotMatch(JSON.stringify(receipt.outputs.profile_hashes), /\/usr\/local\/bin|allowed_senders|command/)
+})
+
+test('installer hashes only valid policy profiles and never serializes profile contents', async () => {
+  const root = tmpDir()
+  const prefix = join(root, 'fleet')
+  const receipt = await buildReceipt({ sourceDir: SOURCE_DIR, prefix, serviceManager: 'none' }, { platformName: 'linux' })
+
+  const first = receipt.outputs.profile_hashes[0]
+  assert.deepEqual(Object.keys(first).sort(), ['agent_id', 'sha256'])
+  assert.equal(first.agent_id, 'agent-one')
+  assert.equal(receipt.checks.some((check) => check.check === 'agent_profiles_hashed' && check.ok === true && check.count === 2), true)
+
+  const config = JSON.parse(readFileSync(join(prefix, 'inbox-handler.json'), 'utf8'))
+  config.agents[0].profile.command.push('--authorization=Bearer example-secret')
+  writeFileSync(join(prefix, 'inbox-handler.json'), `${JSON.stringify(config)}\n`)
+  const invalid = await buildReceipt({ sourceDir: SOURCE_DIR, prefix, serviceManager: 'none' }, { platformName: 'linux' })
+
+  assert.equal(invalid.status, 'fail')
+  assert.deepEqual(invalid.outputs.profile_hashes.map((profile) => profile.agent_id), ['agent-two'])
+  assert.equal(invalid.checks.some((check) => check.check === 'agent_profile_valid' && check.ok === false && check.agent_id === 'agent-one'), true)
+  assert.doesNotMatch(JSON.stringify(invalid), /example-secret|authorization=Bearer/)
 })
 
 test('installer preserves existing configs unless forceConfig is set', async () => {

@@ -5,6 +5,7 @@ import { createSqliteD1 } from './helpers/sqlite-d1'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const PROJECTS_MIGRATION = '0055_projects.sql'
+const PROJECT_LINK_LATEST_EVENT_INDEX_MIGRATION = '0060_project_link_latest_event_index.sql'
 
 function applyPriorMigrations(sqlite: { exec(sql: string): void }): void {
   for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name < PROJECTS_MIGRATION).sort()) {
@@ -390,6 +391,35 @@ describe('0055_projects migration', () => {
         .toEqual({ project_id: 'project-b', meta: '{"schema":"legacy/v0"}' })
       expect(sqlite.prepare(`SELECT project_id FROM flights WHERE id = 'projectless-schema-only'`).get())
         .toEqual({ project_id: null })
+    } finally {
+      close()
+    }
+  })
+})
+
+describe('0060 Project Link latest-event index migration', () => {
+  it('replaces the shipped 0059 expression for existing databases and is repeatable', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      const migrations = readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()
+      expect(migrations).toContain(PROJECT_LINK_LATEST_EVENT_INDEX_MIGRATION)
+
+      for (const file of migrations.filter((name) => name < PROJECT_LINK_LATEST_EVENT_INDEX_MIGRATION)) {
+        sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+      }
+      const indexSql = () => sqlite.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_project_links_activity_keyset'",
+      ).get() as { sql: string }
+
+      expect(indexSql().sql).toContain('julianday(COALESCE(last_success_at, last_failure_at, revoked_at, created_at))')
+
+      const migration = readFileSync(join(MIGRATIONS_DIR, PROJECT_LINK_LATEST_EVENT_INDEX_MIGRATION), 'utf8')
+      expect(() => sqlite.exec(migration)).not.toThrow()
+      expect(() => sqlite.exec(migration)).not.toThrow()
+      expect(indexSql().sql).toContain('MAX(\n      julianday(created_at)')
+      expect(indexSql().sql).toContain('julianday(COALESCE(last_success_at, created_at))')
+      expect(indexSql().sql).toContain('julianday(COALESCE(last_failure_at, created_at))')
+      expect(indexSql().sql).toContain('julianday(COALESCE(revoked_at, created_at))')
     } finally {
       close()
     }

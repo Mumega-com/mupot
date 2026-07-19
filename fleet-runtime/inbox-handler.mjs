@@ -11,6 +11,8 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
+import { validateAgentProfile } from './profile-contract.mjs'
+import { runAgentProfile } from './profile-runner.mjs'
 
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 const REF_RE = /^[A-Za-z0-9_.:-]{1,128}$/
@@ -57,7 +59,13 @@ export function validateConfig(raw) {
       if (typeof a.command !== 'string' || !a.command.trim()) throw new Error(`agents[${i}].command must be non-empty when set`)
       command = a.command
     }
-    let runFor = command ? ['request'] : []
+    let profile = null
+    if (a.profile !== undefined) {
+      if (command) throw new Error(`agents[${i}] cannot set both command and profile`)
+      profile = validateAgentProfile(a.profile)
+      if (profile.agent_id !== a.agent_id) throw new Error(`agents[${i}].profile agent_id mismatch`)
+    }
+    let runFor = profile ? profile.run_for : command ? ['request'] : []
     if (Array.isArray(a.run_for)) {
       runFor = []
       for (const [j, k] of a.run_for.entries()) {
@@ -71,6 +79,7 @@ export function validateConfig(raw) {
       agent_id: a.agent_id,
       spoolDir: normalizePath(a.spool_dir, join(spoolDir, a.agent_id)),
       command,
+      profile,
       runFor: new Set(runFor),
       commandTimeoutMs: clampTimeout(a.command_timeout_ms ?? commandTimeoutMs),
     })
@@ -97,6 +106,8 @@ export function validatePayload(raw) {
     if (requestId != null && !REF_RE.test(requestId)) throw new Error(`messages[${i}].request_id invalid`)
     const inReplyTo = m.in_reply_to == null ? null : String(m.in_reply_to)
     if (inReplyTo != null && !REF_RE.test(inReplyTo)) throw new Error(`messages[${i}].in_reply_to invalid`)
+    const projectId = m.project_id == null ? null : String(m.project_id)
+    if (projectId != null && !REF_RE.test(projectId)) throw new Error(`messages[${i}].project_id invalid`)
     return {
       seq,
       id: m.id,
@@ -107,6 +118,7 @@ export function validatePayload(raw) {
       request_id: requestId,
       in_reply_to: inReplyTo,
       created_at: typeof m.created_at === 'string' ? m.created_at : '',
+      project_id: projectId,
     }
   })
   return {
@@ -178,7 +190,8 @@ export async function handleBatch(config, payload, opts = {}) {
   if (!agentCfg) throw new Error(`agent '${payload.agent_id}' is not configured`)
   const files = writeSpoolFiles(agentCfg, payload, opts.now)
   const shouldRun = !!agentCfg.command && payload.messages.some((m) => agentCfg.runFor.has(m.kind))
-  if (!shouldRun) return { ok: true, files, command: 'skipped' }
+  const shouldRunProfile = !!agentCfg.profile && payload.messages.some((m) => agentCfg.runFor.has(m.kind))
+  if (!shouldRun && !shouldRunProfile) return { ok: true, files, command: 'skipped' }
 
   const commandPayload = JSON.stringify({
     tenant: payload.tenant,
@@ -189,6 +202,10 @@ export async function handleBatch(config, payload, opts = {}) {
     messages: payload.messages,
     remaining: payload.remaining,
   }) + '\n'
+  if (shouldRunProfile) {
+    const res = await (opts.runProfile ?? runAgentProfile)(agentCfg.profile, JSON.parse(commandPayload))
+    return { ok: res.ok, files, command: `profile:${agentCfg.profile.adapter}`, code: res.code ?? null }
+  }
   const res = await (opts.runCommand ?? runCommand)(agentCfg.command, commandPayload, agentCfg.commandTimeoutMs)
   return { ok: res.ok, files, command: agentCfg.command, code: res.code }
 }

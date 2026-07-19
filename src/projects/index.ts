@@ -2,8 +2,17 @@ import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
 import type { AuthContext, CapabilityGrant, Env, Project, ProjectStatus } from '../types'
 import { requireAuth } from '../auth'
-import { hasCapability, resolveCapabilities } from '../auth/capability'
+import { resolveCapabilities } from '../auth/capability'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
+import { listProjectActivity, listProjectEvidence, type ProjectProjectionCursor } from './projections'
+import {
+  projectReadAccessFromGrants,
+  projectVisibilityClause,
+  unrestrictedProjectRead,
+  type ProjectReadAccess,
+} from './access'
+import { resolveReadableSquadIds } from './readable-squads'
+import { loadProjectSituation } from './situation'
 import {
   createProject,
   getProject,
@@ -16,13 +25,21 @@ import type { CreateProjectInput, ProjectMutationError, UpdateProjectInput } fro
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
 type ContextProject = ParentContext & { parent_context: true }
-type ProjectReadAccess = { workspace_admin: boolean; org_read: boolean; squad_ids: string[]; department_ids: string[] }
 type Page = { limit: number; offset: number }
+type ProjectionKind = 'activity' | 'evidence'
+type ProjectionPage = Page & { after?: ProjectProjectionCursor }
 
 const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'completed', 'archived']
 const DEFAULT_PAGE_SIZE = 100
 const MAX_PAGE_SIZE = 100
 const MAX_PAGE_OFFSET = 10_000
+const PROJECTION_SOURCE_TYPES: Record<ProjectionKind, ReadonlySet<string>> = {
+  activity: new Set(['task', 'message', 'flight', 'project_link']),
+  evidence: new Set([
+    'task_result', 'task_verdict', 'workflow_receipt', 'dispatch_receipt',
+    'flight_receipt', 'message_ack', 'project_link_receipt',
+  ]),
+}
 
 function isProjectStatus(value: unknown): value is ProjectStatus {
   return typeof value === 'string' && (PROJECT_STATUSES as readonly string[]).includes(value)
@@ -30,10 +47,6 @@ function isProjectStatus(value: unknown): value is ProjectStatus {
 
 function inTenantScope(auth: AuthContext, env: Env): boolean {
   return auth.tenant === env.TENANT_SLUG
-}
-
-function legacyWorkspaceAdmin(auth: AuthContext): boolean {
-  return auth.capabilities === undefined && (auth.role === 'owner' || auth.role === 'admin')
 }
 
 function safeParent(project: Project): ParentContext {
@@ -61,6 +74,63 @@ function nextCursor(page: Page, resultLength: number): string | null {
   return resultLength > page.limit && nextOffset <= MAX_PAGE_OFFSET ? String(nextOffset) : null
 }
 
+function cursorBase64(value: string): string {
+  const bytes = new TextEncoder().encode(value)
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+}
+
+function cursorJson(value: string): unknown {
+  if (!/^[A-Za-z0-9_-]{1,2048}$/.test(value)) throw new Error('invalid_cursor')
+  const padded = value.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(value.length / 4) * 4, '=')
+  const binary = atob(padded)
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
+  return JSON.parse(new TextDecoder().decode(bytes))
+}
+
+function encodeProjectionCursor(kind: ProjectionKind, cursor: ProjectProjectionCursor): string {
+  return cursorBase64(JSON.stringify({
+    v: 1,
+    p: kind,
+    t: cursor.occurred_at,
+    s: cursor.source_type,
+    i: cursor.source_id,
+  }))
+}
+
+function parseProjectionPage(
+  limitInput: string | undefined,
+  cursorInput: string | undefined,
+  kind: ProjectionKind,
+): ProjectionPage | null {
+  if (limitInput !== undefined && !/^(0|[1-9]\d*)$/.test(limitInput)) return null
+  const limit = limitInput === undefined ? DEFAULT_PAGE_SIZE : Number(limitInput)
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE_SIZE) return null
+  if (cursorInput === undefined) return { limit, offset: 0 }
+  if (/^(0|[1-9]\d*)$/.test(cursorInput)) {
+    const offset = Number(cursorInput)
+    return Number.isInteger(offset) && offset >= 0 && offset <= MAX_PAGE_OFFSET
+      ? { limit, offset }
+      : null
+  }
+
+  try {
+    const decoded = cursorJson(cursorInput) as Record<string, unknown>
+    if (decoded.v !== 1 || decoded.p !== kind) return null
+    if (typeof decoded.t !== 'string' || new Date(decoded.t).toISOString() !== decoded.t) return null
+    if (typeof decoded.s !== 'string' || !PROJECTION_SOURCE_TYPES[kind].has(decoded.s)) return null
+    if (typeof decoded.i !== 'string' || decoded.i.length < 1 || decoded.i.length > 512) return null
+    return {
+      limit,
+      offset: 0,
+      after: { occurred_at: decoded.t, source_type: decoded.s, source_id: decoded.i },
+    }
+  } catch {
+    return null
+  }
+}
+
 function jsonIds(ids: string[]): string {
   return JSON.stringify([...new Set(ids)])
 }
@@ -81,51 +151,16 @@ async function grantsFor(env: Env, auth: AuthContext): Promise<CapabilityGrant[]
 }
 
 async function projectReadAccess(env: Env, auth: AuthContext): Promise<ProjectReadAccess> {
-  if (legacyWorkspaceAdmin(auth)) {
-    return { workspace_admin: true, org_read: true, squad_ids: [], department_ids: [] }
-  }
-
   const grants = await grantsFor(env, auth)
-  if (hasCapability(grants, 'org', null, 'admin')) {
-    return { workspace_admin: true, org_read: true, squad_ids: [], department_ids: [] }
-  }
-
-  const squadIds = new Set<string>()
-  const departmentIds = new Set<string>()
-  for (const grant of grants) {
-    if (!hasCapability([grant], grant.scope_type, grant.scope_id, 'observer')) continue
-    if (grant.scope_type === 'squad' && grant.scope_id) squadIds.add(grant.scope_id)
-    if (grant.scope_type === 'department' && grant.scope_id) departmentIds.add(grant.scope_id)
-  }
-  return {
-    workspace_admin: false,
-    org_read: hasCapability(grants, 'org', null, 'observer'),
-    squad_ids: [...squadIds],
-    department_ids: [...departmentIds],
-  }
+  return projectReadAccessFromGrants(auth, grants)
 }
 
 function edgePredicate(access: ProjectReadAccess): { sql: string; binds: string[] } {
-  if (access.org_read) return { sql: '1 = 1', binds: [] }
+  if (access.orgRead) return { sql: '1 = 1', binds: [] }
   return {
     sql: `(s.id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
       OR s.department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?)))`,
-    binds: [jsonIds(access.squad_ids), jsonIds(access.department_ids)],
-  }
-}
-
-function projectVisibilityClause(access: ProjectReadAccess): { sql: string; binds: string[] } {
-  if (access.workspace_admin) return { sql: '1 = 1', binds: [] }
-  const edge = edgePredicate(access)
-  return {
-    sql: `EXISTS (
-      SELECT 1
-        FROM project_squad_access psa
-        JOIN squads s ON s.id = psa.squad_id
-       WHERE psa.project_id = p.id
-         AND (${edge.sql})
-    )`,
-    binds: edge.binds,
+    binds: [jsonIds(access.squadIds), jsonIds(access.departmentIds)],
   }
 }
 
@@ -143,12 +178,20 @@ async function readableProject(
   ).bind(id, ...visibility.binds).first<Project>()
 }
 
+async function projectionReadableSquads(
+  env: Env,
+  access: ProjectReadAccess,
+): Promise<string[] | null> {
+  if (unrestrictedProjectRead(access)) return null
+  return resolveReadableSquadIds(env, access.squadIds, access.departmentIds)
+}
+
 async function projectAggregates(
   env: Env,
   projectId: string,
   access: ProjectReadAccess,
 ): Promise<{ direct_tasks: number; direct_squads: number; direct_flights: number }> {
-  if (access.workspace_admin || access.org_read) {
+  if (unrestrictedProjectRead(access)) {
     const [tasks, squads, flights] = await Promise.all([
       env.DB.prepare('SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?').bind(projectId).first<{ count: number }>(),
       env.DB.prepare('SELECT COUNT(*) AS count FROM project_squad_access WHERE project_id = ?').bind(projectId).first<{ count: number }>(),
@@ -161,8 +204,8 @@ async function projectAggregates(
     }
   }
 
-  const squadIds = jsonIds(access.squad_ids)
-  const departmentIds = jsonIds(access.department_ids)
+  const squadIds = jsonIds(access.squadIds)
+  const departmentIds = jsonIds(access.departmentIds)
   const safeMeta = "CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END"
   const [tasks, squads, flights] = await Promise.all([
     env.DB.prepare(
@@ -209,7 +252,7 @@ async function projectAggregates(
 
 function mutationStatus(error: ProjectMutationError): 400 | 404 | 409 {
   if (error === 'project_not_found' || error === 'parent_not_found' || error === 'squad_not_found') return 404
-  if (error === 'slug_taken' || error === 'receipt_failed') return 409
+  if (error === 'slug_taken' || error === 'receipt_failed' || error === 'invalid_status_transition') return 409
   return 400
 }
 
@@ -291,7 +334,7 @@ projectsApp.get('/', async (c) => {
 
 projectsApp.post('/', async (c) => {
   const access = await projectReadAccess(c.env, c.get('auth'))
-  if (!access.workspace_admin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const body = await jsonObject(c)
   if (!body) return c.json({ error: 'invalid_json' }, 400)
   const result = await createProject(c.env, body as CreateProjectInput)
@@ -303,18 +346,61 @@ projectsApp.get('/:id', async (c) => {
   const access = await projectReadAccess(c.env, c.get('auth'))
   const project = await readableProject(c.env, c.req.param('id'), access)
   if (!project) return c.json({ error: 'project_not_found' }, 404)
-  const aggregates = await projectAggregates(c.env, project.id, access)
-  const parent = project.parent_project_id ? await getProject(c.env, project.parent_project_id) : null
+  const readableSquadIds = await projectionReadableSquads(c.env, access)
+  const [aggregates, situation, parent] = await Promise.all([
+    projectAggregates(c.env, project.id, access),
+    loadProjectSituation(c.env, project, readableSquadIds),
+    project.parent_project_id ? getProject(c.env, project.parent_project_id) : null,
+  ])
   return c.json({
     project,
     aggregates,
+    situation,
     ...(parent ? { parent: safeParent(parent) } : {}),
+  })
+})
+
+projectsApp.get('/:id/activity', async (c) => {
+  const page = parseProjectionPage(c.req.query('limit'), c.req.query('cursor'), 'activity')
+  if (!page) return c.json({ error: 'invalid_pagination' }, 400)
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  const project = await readableProject(c.env, c.req.param('id'), access)
+  if (!project) return c.json({ error: 'project_not_found' }, 404)
+  const rows = await listProjectActivity(c.env, {
+    projectId: project.id,
+    readableSquadIds: await projectionReadableSquads(c.env, access),
+    limit: page.limit,
+    offset: page.offset,
+    after: page.after,
+  })
+  return c.json({
+    rows: rows.rows,
+    next_cursor: rows.nextCursor ? encodeProjectionCursor('activity', rows.nextCursor) : null,
+  })
+})
+
+projectsApp.get('/:id/evidence', async (c) => {
+  const page = parseProjectionPage(c.req.query('limit'), c.req.query('cursor'), 'evidence')
+  if (!page) return c.json({ error: 'invalid_pagination' }, 400)
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  const project = await readableProject(c.env, c.req.param('id'), access)
+  if (!project) return c.json({ error: 'project_not_found' }, 404)
+  const rows = await listProjectEvidence(c.env, {
+    projectId: project.id,
+    readableSquadIds: await projectionReadableSquads(c.env, access),
+    limit: page.limit,
+    offset: page.offset,
+    after: page.after,
+  })
+  return c.json({
+    rows: rows.rows,
+    next_cursor: rows.nextCursor ? encodeProjectionCursor('evidence', rows.nextCursor) : null,
   })
 })
 
 projectsApp.patch('/:id', async (c) => {
   const access = await projectReadAccess(c.env, c.get('auth'))
-  if (!access.workspace_admin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const body = await jsonObject(c)
   if (!body) return c.json({ error: 'invalid_json' }, 400)
   const result = await updateProject(c.env, c.req.param('id'), body as UpdateProjectInput)
@@ -334,10 +420,10 @@ projectsApp.get('/:id/squads', async (c) => {
        FROM project_squad_access psa
        JOIN squads s ON s.id = psa.squad_id
       WHERE psa.project_id = ?
-        AND (${access.workspace_admin ? '1 = 1' : edge.sql})
+        AND (${access.workspaceAdmin ? '1 = 1' : edge.sql})
       ORDER BY psa.squad_id
       LIMIT ? OFFSET ?`,
-  ).bind(project.id, ...(access.workspace_admin ? [] : edge.binds), page.limit + 1, page.offset).all()
+  ).bind(project.id, ...(access.workspaceAdmin ? [] : edge.binds), page.limit + 1, page.offset).all()
   const squads = result.results ?? []
   return c.json({
     squads: squads.slice(0, page.limit),
@@ -347,7 +433,7 @@ projectsApp.get('/:id/squads', async (c) => {
 
 projectsApp.put('/:id/squads/:squadId', async (c) => {
   const access = await projectReadAccess(c.env, c.get('auth'))
-  if (!access.workspace_admin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const body = await jsonObject(c)
   if (!body) return c.json({ error: 'invalid_json' }, 400)
   const result = await upsertProjectSquadAccess(c.env, c.req.param('id'), c.req.param('squadId'), body.access_level)
@@ -357,7 +443,7 @@ projectsApp.put('/:id/squads/:squadId', async (c) => {
 
 projectsApp.delete('/:id/squads/:squadId', async (c) => {
   const access = await projectReadAccess(c.env, c.get('auth'))
-  if (!access.workspace_admin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const projectId = c.req.param('id')
   const squadId = c.req.param('squadId')
   if (!await getProject(c.env, projectId)) return c.json({ error: 'project_not_found' }, 404)

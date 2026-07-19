@@ -39,19 +39,23 @@ and the running product.
 | Browser confidence | Core dashboard, operator workflows, and Hermes flows are exercised in a local browser harness. | `scripts/local-browser-smoke.mjs`, `scripts/README.md` |
 | Commercial boundary | Non-commercial source availability is clear, and commercial use has a separate path. | `LICENSE.md`, README license section |
 
-## Roadmap
+## Release mapping
 
-### Current Release Target: v0.23.0 - Trusted Runtime
+Version ownership, activation state, exclusions, and release gates live only in
+[`ROADMAP.md`](../ROADMAP.md). This document defines enduring product requirements and
+workstreams; it does not independently assign features to versions.
 
-Goal: make one complete trusted-agent operating loop repeatable and
-recoverable. The release is successful only when an operator can deploy a pot,
-connect a real agent, grant scoped authority, run and approve work, verify the
-result in GitHub, and recover the system without losing state.
+The current stable release is `v0.23.0 Trusted Runtime`. The current development target is
+`v0.24.0 Project Operations`: make Project the coherent place where operators and agents
+see the goal, team, work, runtime activity, blockers, evidence, and next action.
 
-The detailed release gate lives in
+The completed `v0.23.0` release gate remains at
 [`docs/releases/v0.23.0-trusted-runtime.md`](releases/v0.23.0-trusted-runtime.md).
-It intentionally defers marketplace/economy expansion, new departments, full
-SOS retirement, GCP portability, and autonomous-brain expansion.
+
+## Product workstreams
+
+The phases below are continuing workstreams. They do not override the version sequence or
+pull later features into the current release.
 
 ### Phase 1: Trust the Core
 
