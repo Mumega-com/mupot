@@ -8,6 +8,34 @@ block collapses into a changelog entry when it ships.
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-07-19
+
+**Project Operations.** Projects with squad-scoped RBAC, cross-pot collaboration via the
+signed project-link addon, agent-bound send confinement, and provider board adapters —
+the foundation for governed multi-pot tenant operation.
+
+### Added
+
+- Project Operations: projects, project↔squad access grants, situation/evidence
+  projections, and attribution receipts (#393).
+- Project-link addon: Ed25519-signed, idempotent cross-pot task/evidence delivery with
+  destination-side reauthorization (#393).
+- External board provider adapters (GitHub / Linear / Notion), AES-GCM credential custody
+  at rest (#396).
+
+### Security
+
+- Send-target confinement: agent-bound (welded) tokens can message only agents in a
+  readable squad or an authorized project-scoped path; failures collapse to a single
+  non-leaking `send_target_not_visible` (#401).
+- Project-link SSRF hardening: private/reserved-range + special-use-hostname blocking,
+  redirect-refuse on delivery fetch (#401, #404).
+- Cross-pot content fence: untrusted linked-pot task title/body is neutralized as data
+  with an explicit untrusted-content directive before reaching the executor; unassigned
+  cross-pot tasks cannot auto-execute (#404, closes #403).
+- Task project-access re-check narrowed to attribution changes, fixing a mid-flight
+  availability abort (#395, closes #391).
+
 ### Changed
 
 - Replaced the stale post-`v0.23.0` sequence with a canonical version and activation
