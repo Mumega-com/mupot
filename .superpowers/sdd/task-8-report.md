@@ -10,6 +10,8 @@ Base implementation: `107c455df573bf581e34d20f391aa476b466664a` - `feat: project
 
 Review remediation: `e20f97061a1662eb69320b757cfa460536b20a7e` - `fix: harden project routine projections`
 
+Situation plan coverage: `c14560a45302354be256c6935a236f0f4c229fdd` - `test: cover routine situation keyset plans`
+
 ## Changed Files
 
 - `src/projects/situation.ts`
@@ -54,6 +56,10 @@ Review remediation: `e20f97061a1662eb69320b757cfa460536b20a7e` - `fix: harden pr
   - Blocked by concurrent Task9 route work in `src/routines/routes.ts` (unused declarations and an `unknown` to `string` assignment).
 - `git diff --check`
   - Passed before the review remediation commit.
+- `npx vitest run tests/project-situation.test.ts tests/project-projections.test.ts`
+  - 45/45 passed after adding `EXPLAIN QUERY PLAN` coverage for the Situation next-occurrence, active-run, terminal-outcome, and bounded Routine Needs You source scans.
+- `npx vitest run tests/routines-migration.test.ts tests/migration-d1-compat.test.ts tests/projects-migration.test.ts`
+  - 10/10 passed after adding the Situation plan coverage.
 
 ## Self-Review
 
@@ -63,6 +69,7 @@ Review remediation: `e20f97061a1662eb69320b757cfa460536b20a7e` - `fix: harden pr
 - Every Routine projection uses tenant, project, and responsible-squad predicates, per-source bounds, current projection keyset rules, and projection sanitization. Routine JSON additionally removes proposal, policy, and prompt fields.
 - Tests cover content, priority, visibility filtering, tenant/project isolation, stable Activity keysets, credential/control-field redaction, REST/MCP/dashboard parity, and routine digest compatibility.
 - Review remediation orders every capped Needs You source by the shared global priority keys, uses a separate indexed next-occurrence query, and adds migration-backed expression keyset indexes for Routine projection and Situation ordering.
+- Situation plan coverage verifies each intended Routine ordering index and confirms the bounded `routine_waits` source has no temp sort; the final cross-source Needs You merge remains separately sorted by design.
 
 ## Concerns
 
