@@ -265,16 +265,6 @@ async function runProjectWorkspaceWorkflow() {
   if (!detailText.includes('Mupot') || !detailText.includes('Mumega Products')) {
     fail('Mupot project detail did not render project and parent context', { detailText })
   }
-  await page.goto(`${baseUrl}/projects/project-mupot/routines`, { waitUntil: 'networkidle', timeout: 20_000 })
-  const routinesText = await textSnippet(page.locator('body'), 6000)
-  if (!routinesText.includes('Project routines') || !routinesText.includes('Local propose check')) {
-    fail('Project Routines workspace missing seeded Routine', { routinesText })
-  }
-  await page.goto(`${baseUrl}/needs-you`, { waitUntil: 'networkidle', timeout: 20_000 })
-  const needsYouText = await textSnippet(page.locator('body'), 4000)
-  if (!needsYouText.includes('Needs You')) {
-    fail('Needs You page did not render', { needsYouText })
-  }
   for (const href of ['/send?project_id=project-mupot', '/flights?project_id=project-mupot']) {
     if (await page.locator(`a[href="${href}"]`).count() === 0) {
       fail('project-filtered work link missing', { href, detailText })
@@ -327,9 +317,21 @@ async function runProjectWorkspaceWorkflow() {
     || browserFields.activeFlightCountTruncated
     || browserFields.snapshotTruncated
     || !browserFields.latestActivity
-    || browserFields.nextAction?.type !== 'review_task') {
+    || browserFields.nextAction?.type !== 'address_needs_you') {
     fail('browser did not structurally observe the seeded Mupot situation', { browserFields })
   }
+
+  await page.goto(`${baseUrl}/projects/project-mupot/routines`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const routinesText = await textSnippet(page.locator('body'), 6000)
+  if (!routinesText.includes('Project routines') || !routinesText.includes('Local propose check')) {
+    fail('Project Routines workspace missing seeded Routine', { routinesText })
+  }
+  await page.goto(`${baseUrl}/needs-you`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const needsYouText = await textSnippet(page.locator('body'), 4000)
+  if (!needsYouText.includes('Needs You')) {
+    fail('Needs You page did not render', { needsYouText })
+  }
+  await page.goto(`${baseUrl}/projects/project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
   const teamPresence = await page.locator('[data-project-agent-presence]').evaluateAll((nodes) => nodes.map((node) => ({
     agentId: node.dataset.agentId,
     presence: node.dataset.presence,
