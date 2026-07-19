@@ -8,6 +8,13 @@ block collapses into a changelog entry when it ships.
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced the stale post-`v0.23.0` sequence with a canonical version and activation
+  roadmap. `v0.24.0` now owns Project Operations and Agent Host productization; later
+  releases separately own Routines, governed tools and Marketing/CRO, isolated agent
+  computers, reviewed knowledge, and commercial operations.
+
 ## [0.23.0] — 2026-07-13
 
 **Trusted Runtime.** Mupot now binds agent identity, scoped authority, governed
