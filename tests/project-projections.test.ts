@@ -7,9 +7,12 @@ import { createSqliteD1 } from './helpers/sqlite-d1'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 
-function harness() {
+function harness(options: { includeKeysetMigration?: boolean } = {}) {
   const fixture = createSqliteD1()
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
+  const includeKeysetMigration = options.includeKeysetMigration ?? true
+  for (const file of readdirSync(MIGRATIONS_DIR)
+    .filter((name) => name.endsWith('.sql') && (includeKeysetMigration || !name.startsWith('0059_')))
+    .sort()) {
     fixture.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
   }
   // Projection fixtures insert historical rows directly; authorization-trigger behavior is
@@ -120,6 +123,33 @@ function concurrencyProbe(database: Env['DB']): { db: Env['DB']; maxInFlight: ()
       },
     } as Env['DB'],
     maxInFlight: () => maximum,
+  }
+}
+
+function statementProbe(database: Env['DB']): {
+  db: Env['DB']
+  statements: Array<{ sql: string; values: unknown[] }>
+} {
+  const statements: Array<{ sql: string; values: unknown[] }> = []
+  type Statement = ReturnType<Env['DB']['prepare']>
+
+  const wrap = (statement: Statement, sql: string, values: unknown[] = []): Statement => ({
+    bind(...nextValues: unknown[]) {
+      return wrap(statement.bind(...nextValues), sql, nextValues)
+    },
+    async all<T>() {
+      statements.push({ sql, values })
+      return statement.all<T>()
+    },
+  }) as Statement
+
+  return {
+    db: {
+      prepare(sql: string) {
+        return wrap(database.prepare(sql), sql)
+      },
+    } as Env['DB'],
+    statements,
   }
 }
 
@@ -367,6 +397,132 @@ describe('project Activity and Evidence projections', () => {
       for (const evidence of [scopedEvidence, adminEvidence]) {
         expect(evidence.rows.some((row) => row.source_id === 'project-ack')).toBe(false)
       }
+    } finally {
+      fixture.close()
+    }
+  })
+
+  it('walks equal-time mixed Activity and Evidence sources exactly once', async () => {
+    const fixture = harness()
+    try {
+      fixture.sqlite.exec(`
+        DROP TRIGGER task_verdicts_no_update;
+        INSERT INTO tasks (id, squad_id, title, status, project_id, created_at, updated_at)
+        VALUES
+          ('tie_a', 'squad-a', 'Underscore tie', 'open', 'project', '2026-07-18T20:00:00Z', '2026-07-18T20:00:00Z'),
+          ('tie-a', 'squad-a', 'Hyphen tie', 'open', 'project', '2026-07-18T20:00:00Z', '2026-07-18T20:00:00Z');
+        UPDATE tasks SET created_at = '2026-07-18T20:00:00Z', updated_at = '2026-07-18T20:00:00Z',
+          completed_at = CASE WHEN result IS NOT NULL THEN '2026-07-18T20:00:00Z' ELSE completed_at END;
+        UPDATE agent_messages SET created_at = '2026-07-18T20:00:00Z';
+        UPDATE flights SET created_at = 1784404800000;
+        UPDATE project_links SET last_success_at = '2026-07-18T20:00:00Z';
+        UPDATE task_verdicts SET decided_at = '2026-07-18T20:00:00Z';
+        UPDATE workflow_receipts SET created_at = '2026-07-18T20:00:00Z';
+        UPDATE task_dispatch_receipts SET created_at = '2026-07-18T20:00:00Z';
+        UPDATE flight_event_outbox SET created_at = '2026-07-18T20:00:00Z';
+        UPDATE project_link_receipts SET created_at = '2026-07-18T20:00:00Z';
+      `)
+
+      for (const list of [listProjectActivity, listProjectEvidence]) {
+        const complete = await list(env(fixture.db), {
+          projectId: 'project', readableSquadIds: null, limit: 100,
+        })
+        const seen: string[] = []
+        let after = undefined
+        for (let pageNumber = 0; pageNumber <= complete.rows.length; pageNumber += 1) {
+          const page = await list(env(fixture.db), {
+            projectId: 'project', readableSquadIds: null, limit: 1, after,
+          })
+          seen.push(...page.rows.map((row) => `${row.source_type}:${row.source_id}`))
+          after = page.nextCursor ?? undefined
+          if (!after) break
+        }
+        expect(seen).toEqual(complete.rows.map((row) => `${row.source_type}:${row.source_id}`))
+        expect(new Set(seen).size).toBe(seen.length)
+      }
+    } finally {
+      fixture.close()
+    }
+  })
+
+  it('uses ordered keyset indexes without temporary projection sorts', async () => {
+    const fixture = harness()
+    try {
+      const probe = statementProbe(fixture.db)
+      const after = {
+        occurred_at: '2026-07-18T20:05:00.000Z',
+        source_type: 'task',
+        source_id: 'cursor-id',
+      }
+      await listProjectActivity(env(probe.db), {
+        projectId: 'project', readableSquadIds: null, limit: 20, after,
+      })
+      await listProjectEvidence(env(probe.db), {
+        projectId: 'project', readableSquadIds: null, limit: 20, after: {
+          ...after, source_type: 'task_result',
+        },
+      })
+
+      const projectionStatements = probe.statements.filter((statement) => statement.sql.includes('ORDER BY'))
+      expect(projectionStatements).toHaveLength(11)
+      for (const statement of projectionStatements) {
+        const plan = fixture.sqlite.prepare(`EXPLAIN QUERY PLAN ${statement.sql}`).all(...statement.values)
+        const details = plan.map((row) => String(row.detail ?? '')).join('\n')
+        expect(details, statement.sql).not.toContain('USE TEMP B-TREE FOR ORDER BY')
+        if (statement.sql.includes('FROM task_verdicts')) {
+          expect(details).toContain('SEARCH v USING INDEX idx_task_verdicts_evidence_keyset (project_id=?)')
+        }
+        if (statement.sql.includes('FROM workflow_receipts')) {
+          expect(details).toContain('SEARCH w USING INDEX idx_workflow_receipts_evidence_keyset (project_id=?)')
+        }
+        if (statement.sql.includes('SELECT d.id, d.task_id')) {
+          expect(details).toContain('SEARCH d USING INDEX idx_task_dispatch_receipts_evidence_keyset (tenant=? AND project_id=?)')
+        }
+        if (statement.sql.includes('FROM flight_event_outbox')) {
+          expect(details).toContain('SEARCH o USING INDEX idx_flight_event_outbox_evidence_keyset (tenant=? AND project_id=?)')
+        }
+      }
+    } finally {
+      fixture.close()
+    }
+  })
+
+  it('keeps Evidence readable when code arrives before keyset index migration', async () => {
+    const fixture = harness({ includeKeysetMigration: false })
+    try {
+      const projection = await listProjectEvidence(env(fixture.db), {
+        projectId: 'project', readableSquadIds: null, limit: 20,
+        after: {
+          occurred_at: '2026-07-18T20:12:00.000Z',
+          source_type: 'project_link_receipt',
+          source_id: 'cursor-id',
+        },
+      })
+      expect(projection.rows.length).toBeGreaterThan(0)
+    } finally {
+      fixture.close()
+    }
+  })
+
+  it('hydrates immutable project attribution on legacy receipt inserts', () => {
+    const fixture = harness()
+    try {
+      fixture.sqlite.exec("INSERT INTO projects (id, slug, name, status) VALUES ('other-project', 'other-project', 'Other', 'active')")
+      for (const [table, id] of [
+        ['task_verdicts', 'verdict-a'],
+        ['workflow_receipts', 'workflow-a'],
+        ['task_dispatch_receipts', 'dispatch-a'],
+        ['flight_event_outbox', 'landing-a'],
+      ]) {
+        const row = fixture.sqlite.prepare(`SELECT project_id FROM ${table} WHERE id = ?`).get(id)
+        expect(row?.project_id).toBe('project')
+        expect(() => fixture.sqlite.prepare(`UPDATE ${table} SET project_id = ? WHERE id = ?`).run('other-project', id))
+          .toThrow()
+      }
+      expect(() => fixture.sqlite.prepare('UPDATE tasks SET project_id = ? WHERE id = ?').run('other-project', 'task-a'))
+        .toThrow(/task project locked by flight/)
+      expect(() => fixture.sqlite.prepare('UPDATE flights SET project_id = ? WHERE id = ?').run('other-project', 'flight-a'))
+        .toThrow(/flight project attribution downgrade/)
     } finally {
       fixture.close()
     }

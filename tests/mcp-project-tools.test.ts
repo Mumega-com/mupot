@@ -134,6 +134,16 @@ describe('MCP project attribution parity', () => {
     }, 'https://pot.test')
     expect(reassigned).toMatchObject({ ok: true, result: { task: { project_id: 'project-b' } } })
 
+    harness.sqlite.prepare(`
+      INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at)
+      VALUES (?, ?, 'approved', ?, ?)
+    `).run('verdict-project-lock', taskId, MEMBER_ID, '2026-07-19T03:00:00Z')
+    const locked = await invokeTool(auth(), env, 'task_update', {
+      task_id: taskId,
+      project_id: 'project-a',
+    }, 'https://pot.test')
+    expect(locked).toMatchObject({ ok: false, status: 409, error: 'task_project_locked' })
+
     const listed = await invokeTool(auth(), env, 'task_list', {
       squad_id: SQUAD_ID,
       project_id: 'project-b',

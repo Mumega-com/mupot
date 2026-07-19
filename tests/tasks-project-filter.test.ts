@@ -351,6 +351,21 @@ describe('task project attribution', () => {
     await expect(removed.json()).resolves.toMatchObject({ task: { id: 'task-a', project_id: null } })
   })
 
+  it('returns the stable project lock conflict after durable evidence exists', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, done_when, status, project_id)
+      VALUES ('task-receipted', 'squad-a', 'Receipted', 'done', 'review', 'project-write');
+      INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at)
+      VALUES ('verdict-receipted', 'task-receipted', 'approved', 'member-a', '2026-07-19T03:00:00Z');
+    `)
+    authState.current = actor()
+
+    const response = await fetch(harness, '/task-receipted', 'PATCH', { project_id: null })
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'task_project_locked' })
+  })
+
   it('returns a stable conflict and emits no event when a concurrent reassignment wins', async () => {
     harness = makeHarness()
     harness.sqlite.exec(`

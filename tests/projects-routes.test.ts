@@ -397,7 +397,7 @@ describe('projectsApp', () => {
     expect(squads.next_cursor).toBeNull()
   })
 
-  it('does not emit unusable Activity or Evidence cursors beyond the maximum offset', async () => {
+  it('continues Activity and Evidence beyond the legacy maximum offset', async () => {
     harness = makeHarness()
     seedProjects(harness)
     harness.sqlite.exec(`
@@ -416,14 +416,29 @@ describe('projectsApp', () => {
     const activity = await (await fetch(
       harness,
       '/visible-child/activity?cursor=10000&limit=100',
-    )).json() as { next_cursor: string | null }
+    )).json() as { rows: Array<{ source_id: string }>; next_cursor: string | null }
     const evidence = await (await fetch(
       harness,
       '/visible-child/evidence?cursor=10000&limit=100',
-    )).json() as { next_cursor: string | null }
+    )).json() as { rows: Array<{ source_id: string }>; next_cursor: string | null }
 
-    expect(activity.next_cursor).toBeNull()
-    expect(evidence.next_cursor).toBeNull()
+    expect(activity.next_cursor).not.toBeNull()
+    expect(evidence.next_cursor).not.toBeNull()
+    expect(activity.next_cursor).not.toMatch(/^\d+$/)
+    expect(evidence.next_cursor).not.toMatch(/^\d+$/)
+
+    const nextActivity = await (await fetch(
+      harness,
+      `/visible-child/activity?cursor=${encodeURIComponent(activity.next_cursor!)}&limit=100`,
+    )).json() as { rows: Array<{ source_id: string }> }
+    const nextEvidence = await (await fetch(
+      harness,
+      `/visible-child/evidence?cursor=${encodeURIComponent(evidence.next_cursor!)}&limit=100`,
+    )).json() as { rows: Array<{ source_id: string }> }
+    expect(nextActivity.rows.length).toBeGreaterThan(0)
+    expect(nextEvidence.rows.length).toBeGreaterThan(0)
+    expect(nextActivity.rows.some((row) => activity.rows.some((seen) => seen.source_id === row.source_id))).toBe(false)
+    expect(nextEvidence.rows.some((row) => evidence.rows.some((seen) => seen.source_id === row.source_id))).toBe(false)
   })
 
   it('paginates Activity and Evidence through their returned cursors', async () => {
@@ -447,7 +462,8 @@ describe('projectsApp', () => {
         `/visible-child/${projection}?limit=1`,
       )).json() as { rows: Array<{ source_id: string }>; next_cursor: string | null }
       expect(first.rows).toHaveLength(1)
-      expect(first.next_cursor).toBe('1')
+      expect(first.next_cursor).not.toBeNull()
+      expect(first.next_cursor).not.toMatch(/^\d+$/)
 
       const second = await (await fetch(
         harness,
@@ -456,6 +472,23 @@ describe('projectsApp', () => {
       expect(second.rows).toHaveLength(1)
       expect(second.rows[0]?.source_id).not.toBe(first.rows[0]?.source_id)
     }
+  })
+
+  it('rejects malformed and cross-projection opaque cursors', async () => {
+    harness = makeHarness()
+    seedProjects(harness)
+    as(actor({ role: 'owner' }))
+
+    const activity = await (await fetch(
+      harness,
+      '/visible-child/activity?limit=1',
+    )).json() as { next_cursor: string | null }
+    expect(activity.next_cursor).not.toBeNull()
+    expect((await fetch(
+      harness,
+      `/visible-child/evidence?limit=1&cursor=${encodeURIComponent(activity.next_cursor!)}`,
+    )).status).toBe(400)
+    expect((await fetch(harness, '/visible-child/activity?cursor=not-a-valid-cursor')).status).toBe(400)
   })
 
   it('mounts projects before the dashboard catch-all', () => {

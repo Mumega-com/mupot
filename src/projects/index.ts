@@ -4,7 +4,7 @@ import type { AuthContext, CapabilityGrant, Env, Project, ProjectStatus } from '
 import { requireAuth } from '../auth'
 import { hasCapability, resolveCapabilities } from '../auth/capability'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
-import { listProjectActivity, listProjectEvidence } from './projections'
+import { listProjectActivity, listProjectEvidence, type ProjectProjectionCursor } from './projections'
 import {
   createProject,
   getProject,
@@ -19,11 +19,20 @@ type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_p
 type ContextProject = ParentContext & { parent_context: true }
 type ProjectReadAccess = { workspace_admin: boolean; org_read: boolean; squad_ids: string[]; department_ids: string[] }
 type Page = { limit: number; offset: number }
+type ProjectionKind = 'activity' | 'evidence'
+type ProjectionPage = Page & { after?: ProjectProjectionCursor }
 
 const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'completed', 'archived']
 const DEFAULT_PAGE_SIZE = 100
 const MAX_PAGE_SIZE = 100
 const MAX_PAGE_OFFSET = 10_000
+const PROJECTION_SOURCE_TYPES: Record<ProjectionKind, ReadonlySet<string>> = {
+  activity: new Set(['task', 'message', 'flight', 'project_link']),
+  evidence: new Set([
+    'task_result', 'task_verdict', 'workflow_receipt', 'dispatch_receipt',
+    'flight_receipt', 'message_ack', 'project_link_receipt',
+  ]),
+}
 
 function isProjectStatus(value: unknown): value is ProjectStatus {
   return typeof value === 'string' && (PROJECT_STATUSES as readonly string[]).includes(value)
@@ -62,9 +71,61 @@ function nextCursor(page: Page, resultLength: number): string | null {
   return resultLength > page.limit && nextOffset <= MAX_PAGE_OFFSET ? String(nextOffset) : null
 }
 
-function nextProjectionCursor(page: Page, hasMore: boolean): string | null {
-  const nextOffset = page.offset + page.limit
-  return hasMore && nextOffset <= MAX_PAGE_OFFSET ? String(nextOffset) : null
+function cursorBase64(value: string): string {
+  const bytes = new TextEncoder().encode(value)
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+}
+
+function cursorJson(value: string): unknown {
+  if (!/^[A-Za-z0-9_-]{1,2048}$/.test(value)) throw new Error('invalid_cursor')
+  const padded = value.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(value.length / 4) * 4, '=')
+  const binary = atob(padded)
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
+  return JSON.parse(new TextDecoder().decode(bytes))
+}
+
+function encodeProjectionCursor(kind: ProjectionKind, cursor: ProjectProjectionCursor): string {
+  return cursorBase64(JSON.stringify({
+    v: 1,
+    p: kind,
+    t: cursor.occurred_at,
+    s: cursor.source_type,
+    i: cursor.source_id,
+  }))
+}
+
+function parseProjectionPage(
+  limitInput: string | undefined,
+  cursorInput: string | undefined,
+  kind: ProjectionKind,
+): ProjectionPage | null {
+  if (limitInput !== undefined && !/^(0|[1-9]\d*)$/.test(limitInput)) return null
+  const limit = limitInput === undefined ? DEFAULT_PAGE_SIZE : Number(limitInput)
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE_SIZE) return null
+  if (cursorInput === undefined) return { limit, offset: 0 }
+  if (/^(0|[1-9]\d*)$/.test(cursorInput)) {
+    const offset = Number(cursorInput)
+    return Number.isInteger(offset) && offset >= 0 && offset <= MAX_PAGE_OFFSET
+      ? { limit, offset }
+      : null
+  }
+
+  try {
+    const decoded = cursorJson(cursorInput) as Record<string, unknown>
+    if (decoded.v !== 1 || decoded.p !== kind) return null
+    if (typeof decoded.t !== 'string' || new Date(decoded.t).toISOString() !== decoded.t) return null
+    if (typeof decoded.s !== 'string' || !PROJECTION_SOURCE_TYPES[kind].has(decoded.s)) return null
+    if (typeof decoded.i !== 'string' || decoded.i.length < 1 || decoded.i.length > 512) return null
+    return {
+      limit,
+      offset: 0,
+      after: { occurred_at: decoded.t, source_type: decoded.s, source_id: decoded.i },
+    }
+  } catch {
+    return null
+  }
 }
 
 function jsonIds(ids: string[]): string {
@@ -334,7 +395,7 @@ projectsApp.get('/:id', async (c) => {
 })
 
 projectsApp.get('/:id/activity', async (c) => {
-  const page = parsePage(c.req.query('limit'), c.req.query('cursor'))
+  const page = parseProjectionPage(c.req.query('limit'), c.req.query('cursor'), 'activity')
   if (!page) return c.json({ error: 'invalid_pagination' }, 400)
   const access = await projectReadAccess(c.env, c.get('auth'))
   const project = await readableProject(c.env, c.req.param('id'), access)
@@ -344,15 +405,16 @@ projectsApp.get('/:id/activity', async (c) => {
     readableSquadIds: await projectionReadableSquads(c.env, access),
     limit: page.limit,
     offset: page.offset,
+    after: page.after,
   })
   return c.json({
     rows: rows.rows,
-    next_cursor: nextProjectionCursor(page, rows.hasMore),
+    next_cursor: rows.nextCursor ? encodeProjectionCursor('activity', rows.nextCursor) : null,
   })
 })
 
 projectsApp.get('/:id/evidence', async (c) => {
-  const page = parsePage(c.req.query('limit'), c.req.query('cursor'))
+  const page = parseProjectionPage(c.req.query('limit'), c.req.query('cursor'), 'evidence')
   if (!page) return c.json({ error: 'invalid_pagination' }, 400)
   const access = await projectReadAccess(c.env, c.get('auth'))
   const project = await readableProject(c.env, c.req.param('id'), access)
@@ -362,10 +424,11 @@ projectsApp.get('/:id/evidence', async (c) => {
     readableSquadIds: await projectionReadableSquads(c.env, access),
     limit: page.limit,
     offset: page.offset,
+    after: page.after,
   })
   return c.json({
     rows: rows.rows,
-    next_cursor: nextProjectionCursor(page, rows.hasMore),
+    next_cursor: rows.nextCursor ? encodeProjectionCursor('evidence', rows.nextCursor) : null,
   })
 })
 

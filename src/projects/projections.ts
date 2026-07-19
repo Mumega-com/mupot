@@ -26,6 +26,13 @@ export interface ProjectProjectionRow<T extends string = string> {
 export interface ProjectProjectionPage<T extends string> {
   rows: ProjectProjectionRow<T>[]
   hasMore: boolean
+  nextCursor: ProjectProjectionCursor | null
+}
+
+export interface ProjectProjectionCursor {
+  occurred_at: string
+  source_type: string
+  source_id: string
 }
 
 export interface ProjectProjectionInput {
@@ -33,11 +40,19 @@ export interface ProjectProjectionInput {
   readableSquadIds: string[] | null
   limit?: number
   offset?: number
+  after?: ProjectProjectionCursor
 }
 
 const DEFAULT_LIMIT = 100
 const MAX_LIMIT = 100
 const MAX_DETAIL_CHARS = 4000
+const RECEIPT_KEYSET_INDEXES = [
+  'idx_task_verdicts_evidence_keyset',
+  'idx_workflow_receipts_evidence_keyset',
+  'idx_task_dispatch_receipts_evidence_keyset',
+  'idx_flight_event_outbox_evidence_keyset',
+] as const
+const receiptKeysetReady = new WeakSet<object>()
 const ASSIGNMENT_RE = /((?:^|[\s,;{?&])["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=]\s*)[^,;}&\r\n]+/g
 const QUERY_ASSIGNMENT_RE = /([?&])([A-Za-z][A-Za-z0-9_.-]*)(=)[^&#\s]*/g
 
@@ -110,12 +125,71 @@ function adminFlag(input: ProjectProjectionInput): number {
   return input.readableSquadIds === null ? 1 : 0
 }
 
+async function receiptKeysetHintsReady(env: Env): Promise<boolean> {
+  const database = env.DB as unknown as object
+  if (receiptKeysetReady.has(database)) return true
+  const placeholders = RECEIPT_KEYSET_INDEXES.map((_, index) => `?${index + 1}`).join(', ')
+  const result = await env.DB.prepare(
+    `SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (${placeholders})`,
+  ).bind(...RECEIPT_KEYSET_INDEXES).all<{ name: string }>()
+  const names = new Set((result.results ?? []).map((row) => row.name))
+  const ready = RECEIPT_KEYSET_INDEXES.every((name) => names.has(name))
+  if (ready) receiptKeysetReady.add(database)
+  return ready
+}
+
+function epochMs(expression: string): string {
+  return `CAST(ROUND((julianday(${expression}) - 2440587.5) * 86400000) AS INTEGER)`
+}
+
+function afterClause(
+  input: ProjectProjectionInput,
+  timeExpression: string,
+  idExpression: string,
+  sourceType: string,
+  startParam: number,
+): { sql: string; binds: unknown[]; nextParam: number } {
+  if (!input.after) return { sql: '', binds: [], nextParam: startParam }
+  const occurredMs = Date.parse(input.after.occurred_at)
+  return {
+    sql: `AND (
+      ${timeExpression} < ?${startParam}
+      OR (${timeExpression} = ?${startParam + 1} AND (
+        '${sourceType}' > ?${startParam + 2}
+        OR ('${sourceType}' = ?${startParam + 3} AND ${idExpression} > ?${startParam + 4})
+      ))
+    )`,
+    binds: [occurredMs, occurredMs, input.after.source_type, input.after.source_type, input.after.source_id],
+    nextParam: startParam + 5,
+  }
+}
+
+function projectionPage<T extends string>(
+  rows: ProjectProjectionRow<T>[],
+  offset: number,
+  limit: number,
+): ProjectProjectionPage<T> {
+  const visible = rows.slice(offset, offset + limit)
+  const hasMore = rows.length > offset + limit
+  const last = visible.at(-1)
+  return {
+    rows: visible,
+    hasMore,
+    nextCursor: hasMore && last
+      ? { occurred_at: last.occurred_at, source_type: last.source_type, source_id: last.source_id }
+      : null,
+  }
+}
+
 function iso(value: unknown): string {
   if (typeof value === 'number') return new Date(value).toISOString()
   if (typeof value === 'string' && Number.isFinite(Number(value)) && value.trim() !== '') {
     return new Date(Number(value)).toISOString()
   }
-  const parsed = typeof value === 'string' ? Date.parse(value) : Number.NaN
+  const normalized = typeof value === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(value)
+    ? `${value.replace(' ', 'T')}Z`
+    : value
+  const parsed = typeof normalized === 'string' ? Date.parse(normalized) : Number.NaN
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : new Date(0).toISOString()
 }
 
@@ -145,9 +219,20 @@ function newest<T extends string>(rows: ProjectProjectionRow<T>[]): ProjectProje
   return rows.sort((a, b) => {
     const time = Date.parse(b.occurred_at) - Date.parse(a.occurred_at)
     if (time !== 0) return time
-    const source = a.source_type.localeCompare(b.source_type)
-    return source !== 0 ? source : a.source_id.localeCompare(b.source_id)
+    const source = sqliteBinaryCompare(a.source_type, b.source_type)
+    return source !== 0 ? source : sqliteBinaryCompare(a.source_id, b.source_id)
   })
+}
+
+function sqliteBinaryCompare(left: string, right: string): number {
+  const leftBytes = new TextEncoder().encode(left)
+  const rightBytes = new TextEncoder().encode(right)
+  const sharedLength = Math.min(leftBytes.length, rightBytes.length)
+  for (let index = 0; index < sharedLength; index += 1) {
+    const difference = leftBytes[index]! - rightBytes[index]!
+    if (difference !== 0) return difference
+  }
+  return leftBytes.length - rightBytes.length
 }
 
 function flightReadableSql(alias: string, idsParam: string): string {
@@ -222,10 +307,15 @@ export async function listProjectActivity(
   input: ProjectProjectionInput,
 ): Promise<ProjectProjectionPage<ProjectActivitySource>> {
   const limit = limitOf(input.limit)
-  const offset = offsetOf(input.offset)
+  const offset = input.after ? 0 : offsetOf(input.offset)
   const sourceLimit = offset + limit + 1
   const ids = readableIds(input)
   const isAdmin = adminFlag(input)
+  const taskAfter = afterClause(input, epochMs('t.created_at'), 't.id', 'task', 4)
+  const messageAfter = afterClause(input, epochMs('m.created_at'), 'm.id', 'message', 7)
+  const flightAfter = afterClause(input, 'f.created_at', 'f.id', 'flight', 5)
+  const linkOccurredAt = 'COALESCE(last_success_at, last_failure_at, revoked_at, created_at)'
+  const linkAfter = afterClause(input, epochMs(linkOccurredAt), 'id', 'project_link', 5)
 
   const [taskRows, messageRows, flightRows, linkRows] = await Promise.all([
     env.DB.prepare(
@@ -233,8 +323,9 @@ export async function listProjectActivity(
          FROM tasks t JOIN squads s ON s.id = t.squad_id
         WHERE t.project_id = ?1
           AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
-        ORDER BY t.created_at DESC, t.id DESC LIMIT ?4`,
-    ).bind(input.projectId, isAdmin, ids, sourceLimit).all<{
+          ${taskAfter.sql}
+        ORDER BY ${epochMs('t.created_at')} DESC, t.id ASC LIMIT ?${taskAfter.nextParam}`,
+    ).bind(input.projectId, isAdmin, ids, ...taskAfter.binds, sourceLimit).all<{
       id: string; title: string; status: string; assignee_agent_id: string | null; created_at: string; squad_name: string
     }>(),
     env.DB.prepare(
@@ -245,7 +336,8 @@ export async function listProjectActivity(
             ${messageReadableSql('m', '?4', '?3')}
             OR ${dispatchMessageReadableSql('m', '?4', '?3', '?5', '?6')}
           )
-        ORDER BY m.created_at DESC, m.seq DESC LIMIT ?7`,
+          ${messageAfter.sql}
+        ORDER BY ${epochMs('m.created_at')} DESC, m.id ASC LIMIT ?${messageAfter.nextParam}`,
     ).bind(
       env.TENANT_SLUG,
       input.projectId,
@@ -253,6 +345,7 @@ export async function listProjectActivity(
       ids,
       DISPATCH_BRIDGE_SENDER,
       DISPATCH_INBOX_PREFIX,
+      ...messageAfter.binds,
       sourceLimit,
     ).all<{
       id: string; from_agent: string; to_agent: string; kind: string; body: string
@@ -263,8 +356,9 @@ export async function listProjectActivity(
          FROM flights f
         WHERE f.tenant = ?1 AND f.project_id = ?2
           AND (?3 = 1 OR ${flightReadableSql('f', '?4')})
-        ORDER BY f.created_at DESC, f.id DESC LIMIT ?5`,
-    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, sourceLimit).all<{
+          ${flightAfter.sql}
+        ORDER BY f.created_at DESC, f.id ASC LIMIT ?${flightAfter.nextParam}`,
+    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...flightAfter.binds, sourceLimit).all<{
       id: string; agent: string; goal: string; status: string; created_at: number
     }>(),
     env.DB.prepare(
@@ -274,8 +368,9 @@ export async function listProjectActivity(
          FROM project_links
         WHERE tenant = ?1 AND local_project_id = ?2
           AND (?3 = 1 OR local_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
-        ORDER BY COALESCE(last_success_at, last_failure_at, revoked_at, created_at) DESC, id DESC LIMIT ?5`,
-    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, sourceLimit).all<{
+          ${linkAfter.sql}
+        ORDER BY ${epochMs(linkOccurredAt)} DESC, id ASC LIMIT ?${linkAfter.nextParam}`,
+    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...linkAfter.binds, sourceLimit).all<{
       id: string; remote_pot: string; remote_project_id: string; remote_agent_id: string
       state: 'active' | 'revoked'; last_success_at: string | null; last_failure_at: string | null
       last_error: string | null; stale_after_seconds: number; created_at: string; revoked_at: string | null
@@ -337,7 +432,7 @@ export async function listProjectActivity(
     }),
   ]
   const ordered = newest(rows)
-  return { rows: ordered.slice(offset, offset + limit), hasMore: ordered.length > offset + limit }
+  return projectionPage(ordered, offset, limit)
 }
 
 export async function listProjectEvidence(
@@ -345,57 +440,83 @@ export async function listProjectEvidence(
   input: ProjectProjectionInput,
 ): Promise<ProjectProjectionPage<ProjectEvidenceSource>> {
   const limit = limitOf(input.limit)
-  const offset = offsetOf(input.offset)
+  const offset = input.after ? 0 : offsetOf(input.offset)
   const sourceLimit = offset + limit + 1
   const ids = readableIds(input)
   const isAdmin = adminFlag(input)
   const taskFilter = `t.project_id = ?1 AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))`
+  const resultTime = epochMs('COALESCE(t.completed_at, t.updated_at)')
+  const resultAfter = afterClause(input, resultTime, 't.id', 'task_result', 4)
+  const verdictAfter = afterClause(input, epochMs('v.decided_at'), 'v.id', 'task_verdict', 4)
+  const workflowAfter = afterClause(input, epochMs('w.created_at'), 'w.id', 'workflow_receipt', 4)
+  const dispatchAfter = afterClause(input, epochMs('d.created_at'), 'd.id', 'dispatch_receipt', 5)
+  const landingAfter = afterClause(input, epochMs('o.created_at'), 'o.id', 'flight_receipt', 5)
+  const acknowledgementAfter = afterClause(input, epochMs('m.created_at'), 'm.id', 'message_ack', 5)
+  const linkReceiptAfter = afterClause(input, epochMs('r.created_at'), 'r.id', 'project_link_receipt', 5)
+  const useReceiptKeysetHints = await receiptKeysetHintsReady(env)
+  const verdictIndex = useReceiptKeysetHints ? 'INDEXED BY idx_task_verdicts_evidence_keyset' : ''
+  const workflowIndex = useReceiptKeysetHints ? 'INDEXED BY idx_workflow_receipts_evidence_keyset' : ''
+  const dispatchIndex = useReceiptKeysetHints ? 'INDEXED BY idx_task_dispatch_receipts_evidence_keyset' : ''
+  const landingIndex = useReceiptKeysetHints ? 'INDEXED BY idx_flight_event_outbox_evidence_keyset' : ''
+  const verdictProjectScope = useReceiptKeysetHints ? 'v.project_id = ?1 AND' : ''
+  const workflowProjectScope = useReceiptKeysetHints ? 'w.project_id = ?1 AND' : ''
+  const dispatchProjectScope = useReceiptKeysetHints ? 'd.project_id = ?1 AND' : ''
+  const landingProjectScope = useReceiptKeysetHints ? 'o.project_id = ?2 AND' : ''
 
   const [results, verdicts, workflows, dispatches, landings, acknowledgements] = await Promise.all([
     env.DB.prepare(
       `SELECT t.id, t.title, t.status, t.result, t.completed_at, t.updated_at,
               t.assignee_agent_id, t.execution_receipt_id
-         FROM tasks t
+        FROM tasks t
         WHERE ${taskFilter} AND t.result IS NOT NULL AND length(trim(t.result)) > 0
-        ORDER BY COALESCE(t.completed_at, t.updated_at) DESC, t.id DESC LIMIT ?4`,
-    ).bind(input.projectId, isAdmin, ids, sourceLimit).all<{
+          ${resultAfter.sql}
+        ORDER BY ${resultTime} DESC, t.id ASC LIMIT ?${resultAfter.nextParam}`,
+    ).bind(input.projectId, isAdmin, ids, ...resultAfter.binds, sourceLimit).all<{
       id: string; title: string; status: string; result: string; completed_at: string | null
       updated_at: string; assignee_agent_id: string | null; execution_receipt_id: string | null
     }>(),
     env.DB.prepare(
       `SELECT v.id, v.task_id, t.title, v.verdict, v.note, v.decided_by, v.decided_at
-         FROM task_verdicts v JOIN tasks t ON t.id = v.task_id
-        WHERE ${taskFilter}
-        ORDER BY v.decided_at DESC, v.id DESC LIMIT ?4`,
-    ).bind(input.projectId, isAdmin, ids, sourceLimit).all<{
+         FROM task_verdicts v ${verdictIndex}
+         CROSS JOIN tasks t ON t.id = v.task_id
+        WHERE ${verdictProjectScope} ${taskFilter}
+          ${verdictAfter.sql}
+        ORDER BY ${epochMs('v.decided_at')} DESC, v.id ASC LIMIT ?${verdictAfter.nextParam}`,
+    ).bind(input.projectId, isAdmin, ids, ...verdictAfter.binds, sourceLimit).all<{
       id: string; task_id: string; title: string; verdict: string; note: string | null; decided_by: string; decided_at: string
     }>(),
     env.DB.prepare(
       `SELECT w.id, w.instance_id, w.task_id, t.title, w.step_name, w.status, w.detail, w.created_at
-         FROM workflow_receipts w JOIN tasks t ON t.id = w.task_id
-        WHERE ${taskFilter}
-        ORDER BY w.created_at DESC, w.id DESC LIMIT ?4`,
-    ).bind(input.projectId, isAdmin, ids, sourceLimit).all<{
+         FROM workflow_receipts w ${workflowIndex}
+         CROSS JOIN tasks t ON t.id = w.task_id
+        WHERE ${workflowProjectScope} ${taskFilter}
+          ${workflowAfter.sql}
+        ORDER BY ${epochMs('w.created_at')} DESC, w.id ASC LIMIT ?${workflowAfter.nextParam}`,
+    ).bind(input.projectId, isAdmin, ids, ...workflowAfter.binds, sourceLimit).all<{
       id: string; instance_id: string; task_id: string; title: string; step_name: string; status: string; detail: string | null; created_at: string
     }>(),
     env.DB.prepare(
       `SELECT d.id, d.task_id, t.title, d.agent_id, d.actor_id, d.created_at,
               d.claimed_at, d.consumed_at, d.last_error
-         FROM task_dispatch_receipts d JOIN tasks t ON t.id = d.task_id
-        WHERE d.tenant = ?4 AND ${taskFilter}
-        ORDER BY d.created_at DESC, d.id DESC LIMIT ?5`,
-    ).bind(input.projectId, isAdmin, ids, env.TENANT_SLUG, sourceLimit).all<{
+         FROM task_dispatch_receipts d ${dispatchIndex}
+         CROSS JOIN tasks t ON t.id = d.task_id
+        WHERE d.tenant = ?4 AND ${dispatchProjectScope} ${taskFilter}
+          ${dispatchAfter.sql}
+        ORDER BY ${epochMs('d.created_at')} DESC, d.id ASC LIMIT ?${dispatchAfter.nextParam}`,
+    ).bind(input.projectId, isAdmin, ids, env.TENANT_SLUG, ...dispatchAfter.binds, sourceLimit).all<{
       id: string; task_id: string; title: string; agent_id: string; actor_id: string; created_at: string
       claimed_at: string | null; consumed_at: string | null; last_error: string | null
     }>(),
     env.DB.prepare(
       `SELECT o.id, o.flight_id, f.goal, o.actor_id, o.payload, o.created_at,
               o.delivered_at, o.consumed_at, o.last_error
-         FROM flight_event_outbox o JOIN flights f ON f.id = o.flight_id
-        WHERE o.tenant = ?1 AND f.project_id = ?2
+         FROM flight_event_outbox o ${landingIndex}
+         CROSS JOIN flights f ON f.id = o.flight_id
+        WHERE o.tenant = ?1 AND ${landingProjectScope} f.project_id = ?2
           AND (?3 = 1 OR ${flightReadableSql('f', '?4')})
-        ORDER BY o.created_at DESC, o.id DESC LIMIT ?5`,
-    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, sourceLimit).all<{
+          ${landingAfter.sql}
+        ORDER BY ${epochMs('o.created_at')} DESC, o.id ASC LIMIT ?${landingAfter.nextParam}`,
+    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...landingAfter.binds, sourceLimit).all<{
       id: string; flight_id: string; goal: string; actor_id: string; payload: string; created_at: string
       delivered_at: string | null; consumed_at: string | null; last_error: string | null
     }>(),
@@ -404,8 +525,9 @@ export async function listProjectEvidence(
         FROM agent_messages m
        WHERE m.tenant = ?1 AND m.project_id = ?2 AND m.kind = 'ack'
           AND ${messageReadableSql('m', '?4', '?3')}
-        ORDER BY m.created_at DESC, m.seq DESC LIMIT ?5`,
-    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, sourceLimit).all<{
+          ${acknowledgementAfter.sql}
+        ORDER BY ${epochMs('m.created_at')} DESC, m.id ASC LIMIT ?${acknowledgementAfter.nextParam}`,
+    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...acknowledgementAfter.binds, sourceLimit).all<{
       id: string; from_agent: string; to_agent: string; body: string; in_reply_to: string | null; created_at: string
     }>(),
   ])
@@ -418,8 +540,9 @@ export async function listProjectEvidence(
        JOIN project_links l ON l.id = r.link_id AND l.tenant = r.tenant
       WHERE r.tenant = ?1 AND r.local_project_id = ?2
         AND (?3 = 1 OR l.local_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
-      ORDER BY r.created_at DESC, r.id DESC LIMIT ?5`,
-  ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, sourceLimit).all<{
+        ${linkReceiptAfter.sql}
+      ORDER BY ${epochMs('r.created_at')} DESC, r.id ASC LIMIT ?${linkReceiptAfter.nextParam}`,
+  ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...linkReceiptAfter.binds, sourceLimit).all<{
     id: string; direction: string; correlation_id: string; shared_receipt_sha256: string
     envelope_sha256: string; evidence_sha256: string | null; remote_pot: string
     remote_project_id: string; source_agent_id: string; action_type: string
@@ -477,5 +600,5 @@ export async function listProjectEvidence(
     })),
   ]
   const ordered = newest(rows)
-  return { rows: ordered.slice(offset, offset + limit), hasMore: ordered.length > offset + limit }
+  return projectionPage(ordered, offset, limit)
 }
