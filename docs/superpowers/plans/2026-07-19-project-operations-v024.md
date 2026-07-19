@@ -65,13 +65,13 @@
 - Modify: `src/dashboard/projects.ts`
 - Modify: `tests/dashboard-projects.test.ts`
 
-- [ ] Load `ProjectSituation` through the shared situation service.
-- [ ] Replace the overview's metric-only emphasis with a compact Situation band showing health, deterministic summary, next action, blockers, pending reviews, active work, active flights, and latest material activity.
-- [ ] Keep Goal, target date, and direct metrics visible without card nesting.
-- [ ] Make Work list ordering operational: review, blocked, in progress, open, then terminal work.
-- [ ] Add stable empty states for projects with no work, team, activity, or evidence.
-- [ ] Test truthful labels and ordering for blocked, review, active, and empty projects.
-- [ ] Run `npx vitest run tests/dashboard-projects.test.ts` and `npm run typecheck`.
+- [x] Load `ProjectSituation` through the shared situation service.
+- [x] Replace the overview's metric-only emphasis with a compact Situation band showing health, deterministic summary, next action, blockers, pending reviews, active work, active flights, and latest material activity.
+- [x] Keep Goal, target date, and direct metrics visible without card nesting.
+- [x] Make Work list ordering operational: review, blocked, in progress, open, then terminal work.
+- [x] Add stable empty states for projects with no work, team, activity, or evidence.
+- [x] Test truthful labels and ordering for blocked, review, active, and empty projects.
+- [x] Run `npx vitest run tests/dashboard-projects.test.ts` and `npm run typecheck`.
 
 ## Task 4: Add governed Project lifecycle controls
 
