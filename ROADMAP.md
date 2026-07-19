@@ -68,6 +68,8 @@ Stable features include:
 - release, recovery, browser, migration, and runtime conformance receipts.
 
 Anything merged after the `v0.23.0` tag remains preview until a later release owns it.
+Trusted Runtime release detail and evidence live in
+[docs/releases/v0.23.0-trusted-runtime.md](docs/releases/v0.23.0-trusted-runtime.md).
 
 ### v0.24.0: Project Operations - current development target
 
@@ -111,6 +113,7 @@ Explicitly not in `v0.24.0`:
 - generic scheduled Routines;
 - reusable or pinned reasoning sessions;
 - a new connector broker or accounting addon;
+- economy features, new departments, full SOS retirement, GCP portability, and autonomous-brain expansion;
 - per-flight sandbox provisioning;
 - autonomous backlog prioritization or FRC-based learning;
 - full document-authoring or knowledge-management replacement.
