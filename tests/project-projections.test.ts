@@ -685,10 +685,14 @@ describe('project Activity and Evidence projections', () => {
         },
       })
 
-      const projectionStatements = probe.statements.filter((statement) => (
-        statement.sql.includes('ORDER BY') && !statement.sql.includes('FROM routine_')
+      const projectionStatements = probe.statements.filter((statement) => statement.sql.includes('ORDER BY'))
+      expect(projectionStatements).toHaveLength(14)
+      const routineStatements = projectionStatements.filter((statement) => (
+        statement.sql.includes('FROM routine_run_events')
+        || statement.sql.includes('SELECT rr.id, r.name AS routine_name, rr.status')
+        || statement.sql.includes('SELECT a.id, a.run_id, r.name AS routine_name')
       ))
-      expect(projectionStatements).toHaveLength(11)
+      expect(routineStatements).toHaveLength(3)
       for (const statement of projectionStatements) {
         const plan = fixture.sqlite.prepare(`EXPLAIN QUERY PLAN ${statement.sql}`).all(...statement.values)
         const details = plan.map((row) => String(row.detail ?? '')).join('\n')
@@ -704,6 +708,15 @@ describe('project Activity and Evidence projections', () => {
         }
         if (statement.sql.includes('FROM flight_event_outbox')) {
           expect(details).toContain('SEARCH o USING INDEX idx_flight_event_outbox_evidence_keyset (tenant=? AND project_id=?)')
+        }
+        if (statement.sql.includes('FROM routine_run_events')) {
+          expect(details).toContain('SEARCH e USING INDEX idx_routine_run_events_projection_keyset (tenant=? AND project_id=?)')
+        }
+        if (statement.sql.includes('SELECT rr.id, r.name AS routine_name, rr.status')) {
+          expect(details).toContain('SEARCH rr USING INDEX idx_routine_runs_project_outcome_keyset (tenant=? AND project_id=?)')
+        }
+        if (statement.sql.includes('SELECT a.id, a.run_id, r.name AS routine_name')) {
+          expect(details).toContain('SEARCH a USING INDEX idx_routine_run_actions_projection_keyset (tenant=? AND project_id=?)')
         }
       }
     } finally {

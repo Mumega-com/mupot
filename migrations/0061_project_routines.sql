@@ -153,12 +153,43 @@ CREATE INDEX IF NOT EXISTS idx_routines_due
 CREATE INDEX IF NOT EXISTS idx_routines_project_status
   ON routines (tenant, project_id, status, updated_at DESC, id);
 
+CREATE INDEX IF NOT EXISTS idx_routines_project_next_occurrence
+  ON routines (tenant, project_id, next_run_at, id)
+  WHERE status = 'enabled' AND next_run_at IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_routine_runs_lease_recovery
   ON routine_runs (status, lease_expires_at, id)
   WHERE status IN ('leased','observing');
 
 CREATE INDEX IF NOT EXISTS idx_routine_runs_project_history
   ON routine_runs (tenant, project_id, created_at DESC, id);
+
+CREATE INDEX IF NOT EXISTS idx_routine_runs_project_active_keyset
+  ON routine_runs (
+    tenant, project_id,
+    CASE status WHEN 'waiting' THEN 0 ELSE 1 END,
+    CAST(ROUND((julianday(updated_at) - 2440587.5) * 86400000) AS INTEGER) DESC,
+    id
+  )
+  WHERE status IN ('leased','observing','waiting','running');
+
+CREATE INDEX IF NOT EXISTS idx_routine_runs_project_outcome_keyset
+  ON routine_runs (
+    tenant, project_id,
+    CAST(ROUND((julianday(COALESCE(finished_at, updated_at)) - 2440587.5) * 86400000) AS INTEGER) DESC,
+    id
+  )
+  WHERE status IN ('succeeded','failed','skipped','cancelled');
+
+CREATE INDEX IF NOT EXISTS idx_routine_runs_project_needs_you_keyset
+  ON routine_runs (
+    tenant, project_id,
+    CASE WHEN waiting_reason IN ('approval','review','budget') THEN 0 ELSE 1 END,
+    COALESCE(scheduled_for, '9999-12-31T23:59:59.999Z'),
+    created_at DESC,
+    id
+  )
+  WHERE status = 'waiting' AND waiting_reason IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_routine_runs_needs_you
   ON routine_runs (tenant, waiting_reason, updated_at, id)
@@ -174,8 +205,22 @@ CREATE INDEX IF NOT EXISTS idx_routine_runs_routine_active
 CREATE INDEX IF NOT EXISTS idx_routine_run_events_history
   ON routine_run_events (tenant, project_id, occurred_at DESC, id);
 
+CREATE INDEX IF NOT EXISTS idx_routine_run_events_projection_keyset
+  ON routine_run_events (
+    tenant, project_id,
+    CAST(ROUND((julianday(occurred_at) - 2440587.5) * 86400000) AS INTEGER) DESC,
+    id
+  );
+
 CREATE INDEX IF NOT EXISTS idx_routine_run_actions_run
   ON routine_run_actions (run_id, created_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_routine_run_actions_projection_keyset
+  ON routine_run_actions (
+    tenant, project_id,
+    CAST(ROUND((julianday(updated_at) - 2440587.5) * 86400000) AS INTEGER) DESC,
+    id
+  );
 
 CREATE INDEX IF NOT EXISTS idx_routine_run_refs_project
   ON routine_run_refs (tenant, project_id, created_at DESC, id);

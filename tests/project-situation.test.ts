@@ -336,6 +336,49 @@ describe('loadProjectSituation', () => {
     expect(JSON.stringify(scoped)).not.toContain('Private routine')
   })
 
+  it('keeps the earliest urgent Routine deadline when its source exceeds the Situation cap', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'needs-you-source-cap')
+    insertRoutine(harness, project.id, { id: 'routine', nextRunAt: '2026-07-20T00:00:00.000Z' })
+    for (let index = 0; index < 101; index += 1) {
+      insertRoutineRun(harness, project.id, {
+        id: `recent-budget-${index.toString().padStart(3, '0')}`,
+        routineId: 'routine', status: 'waiting', waitingReason: 'budget',
+        occurredAt: '2026-07-21T00:00:00.000Z',
+      })
+    }
+    insertRoutineRun(harness, project.id, {
+      id: 'earliest-budget', routineId: 'routine', status: 'waiting', waitingReason: 'budget',
+      occurredAt: '2026-07-20T00:00:00.000Z',
+    })
+
+    const situation = await loadProjectSituation(envFor(harness), project, null)
+
+    expect(situation.needs_you.highest_priority).toMatchObject({
+      source_id: 'earliest-budget', deadline_at: '2026-07-20T00:00:00.000Z', urgency: 'urgent',
+    })
+    expect(situation.next_action).toMatchObject({ type: 'address_needs_you', item: { source_id: 'earliest-budget' } })
+  })
+
+  it('retains the next scheduled Routine when enabled manual Routines exceed the Situation cap', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'routine-next-cap')
+    for (let index = 0; index < 101; index += 1) {
+      insertRoutine(harness, project.id, { id: `manual-${index.toString().padStart(3, '0')}`, nextRunAt: null })
+    }
+    insertRoutine(harness, project.id, {
+      id: 'scheduled', name: 'Scheduled routine', nextRunAt: '2026-07-20T12:00:00.000Z',
+    })
+
+    const situation = await loadProjectSituation(envFor(harness), project, null)
+
+    expect(situation.routines).toMatchObject({
+      enabled_count: 100,
+      enabled_count_truncated: true,
+      next: { id: 'scheduled', next_run_at: '2026-07-20T12:00:00.000Z' },
+    })
+  })
+
   it('falls through from open work to flight monitoring', async () => {
     harness = makeHarness()
     const openProject = insertProject(harness, 'open-work')

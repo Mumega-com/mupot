@@ -439,7 +439,7 @@ export async function listProjectActivity(
       id: string; kind: string; actor_id: string; occurred_at: string; metadata_json: string; correlation_id: string; routine_name: string
     }> }) : env.DB.prepare(
       `SELECT e.id, e.kind, e.actor_id, e.occurred_at, e.metadata_json, e.correlation_id, r.name AS routine_name
-         FROM routine_run_events e INDEXED BY idx_routine_run_events_history
+         FROM routine_run_events e INDEXED BY idx_routine_run_events_projection_keyset
          JOIN routine_runs rr ON rr.id = e.run_id AND rr.tenant = e.tenant AND rr.project_id = e.project_id
          JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant AND r.project_id = rr.project_id
         WHERE e.tenant = ?1 AND e.project_id = ?2
@@ -641,7 +641,7 @@ export async function listProjectEvidence(
     env.DB.prepare(
       `SELECT rr.id, r.name AS routine_name, rr.status, rr.result_summary, rr.cost_micro_usd,
               rr.finished_at, rr.updated_at, rr.assigned_agent_id
-         FROM routine_runs rr INDEXED BY idx_routine_runs_project_history
+         FROM routine_runs rr INDEXED BY idx_routine_runs_project_outcome_keyset
          JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant AND r.project_id = rr.project_id
         WHERE rr.tenant = ?1 AND rr.project_id = ?2
           AND rr.status IN ('succeeded', 'failed', 'skipped', 'cancelled')
@@ -655,10 +655,10 @@ export async function listProjectEvidence(
     env.DB.prepare(
       `SELECT a.id, a.run_id, r.name AS routine_name, a.status, a.gate_status, a.validation_status,
               a.result_json, a.updated_at, rr.assigned_agent_id
-         FROM routine_runs rr INDEXED BY idx_routine_runs_project_history
+         FROM routine_run_actions a INDEXED BY idx_routine_run_actions_projection_keyset
+         JOIN routine_runs rr ON rr.id = a.run_id AND rr.tenant = a.tenant AND rr.project_id = a.project_id
          JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant AND r.project_id = rr.project_id
-         JOIN routine_run_actions a ON a.run_id = rr.id AND a.tenant = rr.tenant AND a.project_id = rr.project_id
-        WHERE rr.tenant = ?1 AND rr.project_id = ?2
+        WHERE a.tenant = ?1 AND a.project_id = ?2
           AND (a.gate_status <> 'not_required' OR a.status IN ('succeeded', 'failed', 'cancelled'))
           AND (?3 = 1 OR r.responsible_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
           ${routineActionAfter.sql}

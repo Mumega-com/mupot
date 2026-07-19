@@ -202,6 +202,10 @@ function readableFlag(ids: string[] | null): number {
   return ids === null ? 1 : 0
 }
 
+function epochMs(expression: string): string {
+  return `CAST(ROUND((julianday(${expression}) - 2440587.5) * 86400000) AS INTEGER)`
+}
+
 function safeTask(row: SituationTaskRow): ProjectSituationTask {
   return {
     id: row.id,
@@ -391,7 +395,7 @@ export async function loadProjectSituation(
     options.excludeTaskIds?.length || options.excludeFlightIds?.length || options.excludeMessageIds?.length,
   )
 
-  const [taskResult, flightResult, routineResult, activeRunResult, terminalRunResult, needsYouResult, activity] = await Promise.all([
+  const [taskResult, flightResult, routineResult, nextRoutineResult, activeRunResult, terminalRunResult, needsYouResult, activity] = await Promise.all([
     env.DB.prepare(
       `WITH
        blocked_rows AS (
@@ -464,7 +468,7 @@ export async function loadProjectSituation(
            FROM routines r
           WHERE r.tenant = ?1 AND r.project_id = ?2 AND r.status = 'enabled'
             AND (?3 = 1 OR r.responsible_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
-          ORDER BY r.next_run_at, r.id LIMIT ?5
+          ORDER BY r.id LIMIT ?5
        ),
        paused AS (
          SELECT r.id, r.name, r.status, r.next_run_at, r.timezone, r.responsible_squad_id, r.preferred_agent_id
@@ -475,27 +479,34 @@ export async function loadProjectSituation(
        )
        SELECT * FROM enabled UNION ALL SELECT * FROM paused`,
     ).bind(env.TENANT_SLUG, project.id, unrestricted, ids, snapshotLimit).all<SituationRoutineRow>(),
+    controlSnapshot ? Promise.resolve({ results: [] as SituationRoutineRow[] }) : env.DB.prepare(
+      `SELECT r.id, r.name, r.status, r.next_run_at, r.timezone, r.responsible_squad_id, r.preferred_agent_id
+         FROM routines r INDEXED BY idx_routines_project_next_occurrence
+        WHERE r.tenant = ?1 AND r.project_id = ?2 AND r.status = 'enabled' AND r.next_run_at IS NOT NULL
+          AND (?3 = 1 OR r.responsible_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
+        ORDER BY r.next_run_at, r.id LIMIT 1`,
+    ).bind(env.TENANT_SLUG, project.id, unrestricted, ids).all<SituationRoutineRow>(),
     controlSnapshot ? Promise.resolve({ results: [] as SituationRoutineRunRow[] }) : env.DB.prepare(
       `SELECT rr.id, rr.routine_id, r.name AS routine_name, rr.status, rr.waiting_reason,
               r.responsible_squad_id, rr.assigned_agent_id, rr.scheduled_for, rr.updated_at
-         FROM routine_runs rr INDEXED BY idx_routine_runs_project_history
+         FROM routine_runs rr INDEXED BY idx_routine_runs_project_active_keyset
          JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant AND r.project_id = rr.project_id
         WHERE rr.tenant = ?1 AND rr.project_id = ?2
           AND rr.status IN ('leased', 'observing', 'waiting', 'running')
           AND (?3 = 1 OR r.responsible_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
-        ORDER BY CASE rr.status WHEN 'waiting' THEN 0 ELSE 1 END, rr.updated_at DESC, rr.id
+        ORDER BY CASE rr.status WHEN 'waiting' THEN 0 ELSE 1 END, ${epochMs('rr.updated_at')} DESC, rr.id
         LIMIT ?5`,
     ).bind(env.TENANT_SLUG, project.id, unrestricted, ids, snapshotLimit).all<SituationRoutineRunRow>(),
     controlSnapshot ? Promise.resolve({ results: [] as SituationRoutineRunRow[] }) : env.DB.prepare(
       `SELECT rr.id, rr.routine_id, r.name AS routine_name, rr.status, rr.waiting_reason,
               r.responsible_squad_id, rr.assigned_agent_id, rr.scheduled_for, rr.result_summary,
               rr.cost_micro_usd, rr.finished_at, rr.updated_at
-         FROM routine_runs rr INDEXED BY idx_routine_runs_project_history
+         FROM routine_runs rr INDEXED BY idx_routine_runs_project_outcome_keyset
          JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant AND r.project_id = rr.project_id
         WHERE rr.tenant = ?1 AND rr.project_id = ?2
           AND rr.status IN ('succeeded', 'failed', 'skipped', 'cancelled')
           AND (?3 = 1 OR r.responsible_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
-        ORDER BY COALESCE(rr.finished_at, rr.updated_at) DESC, rr.id LIMIT ?5`,
+        ORDER BY ${epochMs('COALESCE(rr.finished_at, rr.updated_at)')} DESC, rr.id LIMIT ?5`,
     ).bind(env.TENANT_SLUG, project.id, unrestricted, ids, snapshotLimit).all<SituationRoutineRunRow>(),
     controlSnapshot ? Promise.resolve({ results: [] as SituationNeedsYouRow[] }) : env.DB.prepare(
       `WITH
@@ -506,7 +517,7 @@ export async function loadProjectSituation(
            FROM tasks t JOIN projects p ON p.id = t.project_id
           WHERE t.project_id = ?1 AND t.status = 'review' AND t.gate_owner IS NOT NULL
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
-          ORDER BY t.created_at DESC, t.id LIMIT ?4
+          ORDER BY COALESCE(p.target_date, '9999-12-31T23:59:59.999Z'), t.created_at DESC, 'task', t.id LIMIT ?4
        ),
        routine_waits AS (
          SELECT CASE rr.waiting_reason
@@ -518,12 +529,13 @@ export async function loadProjectSituation(
                 CASE WHEN rr.waiting_reason IN ('approval', 'review', 'budget') THEN 'urgent' ELSE 'high' END AS urgency,
                 CASE WHEN rr.waiting_reason IN ('approval', 'review', 'budget') THEN 0 ELSE 1 END AS urgency_rank,
                 r.responsible_squad_id AS responsible, rr.created_at, rr.scheduled_for AS deadline_at
-           FROM routine_runs rr INDEXED BY idx_routine_runs_project_history
+           FROM routine_runs rr INDEXED BY idx_routine_runs_project_needs_you_keyset
            JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant AND r.project_id = rr.project_id
           WHERE rr.tenant = ?5 AND rr.project_id = ?1 AND rr.status = 'waiting' AND rr.waiting_reason IS NOT NULL
             AND NOT (rr.waiting_reason = 'review' AND rr.task_id IS NOT NULL)
             AND (?2 = 1 OR r.responsible_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
-          ORDER BY rr.created_at DESC, rr.id LIMIT ?4
+          ORDER BY CASE WHEN rr.waiting_reason IN ('approval', 'review', 'budget') THEN 0 ELSE 1 END,
+                   COALESCE(rr.scheduled_for, '9999-12-31T23:59:59.999Z'), rr.created_at DESC, 'routine_run', rr.id LIMIT ?4
        ),
        blocked_tasks AS (
          SELECT 'blocked_task' AS kind, 'task' AS source_type, t.id AS source_id, t.title,
@@ -532,7 +544,7 @@ export async function loadProjectSituation(
            FROM tasks t JOIN projects p ON p.id = t.project_id
           WHERE t.project_id = ?1 AND t.status = 'blocked' AND t.assignee_agent_id IS NULL AND t.gate_owner IS NOT NULL
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
-          ORDER BY t.created_at DESC, t.id LIMIT ?4
+          ORDER BY COALESCE(p.target_date, '9999-12-31T23:59:59.999Z'), t.created_at DESC, 'task', t.id LIMIT ?4
        ),
        publishable_outputs AS (
          SELECT 'publishable_output' AS kind, 'task' AS source_type, t.id AS source_id, t.title,
@@ -541,7 +553,7 @@ export async function loadProjectSituation(
            FROM tasks t JOIN projects p ON p.id = t.project_id
           WHERE t.project_id = ?1 AND t.status = 'approved' AND t.gate_owner = 'gate:content' AND t.result IS NOT NULL
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
-          ORDER BY t.created_at DESC, t.id LIMIT ?4
+          ORDER BY COALESCE(p.target_date, '9999-12-31T23:59:59.999Z'), t.created_at DESC, 'task', t.id LIMIT ?4
        )
        SELECT * FROM (
          SELECT * FROM approvals UNION ALL SELECT * FROM routine_waits
@@ -597,6 +609,7 @@ export async function loadProjectSituation(
   const flight = flightRows[0] ? safeFlight(flightRows[0]) : null
   const health = healthFor(project, taskCounts, activeFlightCount)
   const routineRows = routineResult.results ?? []
+  const nextRoutineRows = nextRoutineResult.results ?? []
   const enabledRoutines = routineRows.filter(row => row.status === 'enabled')
   const pausedRoutines = routineRows.filter(row => row.status === 'paused')
   const activeRuns = activeRunResult.results ?? []
@@ -609,7 +622,7 @@ export async function loadProjectSituation(
     paused_count_truncated: pausedRoutines.length > PROJECT_SITUATION_COUNT_CAP,
     active_run_truncated: activeRuns.length > PROJECT_SITUATION_COUNT_CAP,
     latest_terminal_run_truncated: terminalRuns.length > PROJECT_SITUATION_COUNT_CAP,
-    next: enabledRoutines.find(row => row.next_run_at !== null) ? safeRoutine(enabledRoutines.find(row => row.next_run_at !== null) as SituationRoutineRow) : null,
+    next: nextRoutineRows[0] ? safeRoutine(nextRoutineRows[0]) : null,
     active_run: activeRuns[0] ? safeRoutineRun(activeRuns[0]) : null,
     latest_terminal_run: terminalRuns[0] ? safeTerminalRoutineRun(terminalRuns[0]) : null,
     truncated: enabledRoutines.length > PROJECT_SITUATION_COUNT_CAP
