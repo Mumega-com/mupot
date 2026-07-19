@@ -697,6 +697,55 @@ describe('project dashboard renderers', () => {
     expect(observed.filter((sql) => /\bFROM agents a\b/i.test(sql))).toHaveLength(1)
   })
 
+  it('bounds readable members to the rendered squad window and reports both truncation states', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      DELETE FROM project_squad_access WHERE project_id = 'visible-child';
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 100)
+      INSERT INTO squads (id, department_id, slug, name)
+      SELECT printf('edge-%03d', x), 'dept-a', printf('edge-%03d', x),
+             printf('Visible squad %03d', x)
+        FROM n;
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 100)
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+      SELECT printf('edge-agent-%03d', x), printf('edge-%03d', x),
+             printf('edge-agent-%03d', x), printf('Visible member %03d', x),
+             'Visible role', 'visible-model', 'active'
+        FROM n;
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+      VALUES ('edge-agent-extra', 'edge-001', 'edge-agent-extra', 'Visible member 101',
+              'Visible role', 'visible-model', 'active');
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 100)
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      SELECT 'visible-child', printf('edge-%03d', x), 'write'
+        FROM n;
+      INSERT INTO squads (id, department_id, slug, name)
+      VALUES ('edge-999', 'dept-a', 'edge-999', 'AAA omitted squad');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+      VALUES ('omitted-agent', 'edge-999', 'omitted-agent', 'AAA omitted member', 'Omitted role', 'omitted-model', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('visible-child', 'edge-999', 'write');
+    `)
+
+    const view = await loadProjectDetail(envFor(harness), memberA(), 'visible-child')
+    const body = await render(projectDetailBody(view!))
+    const visibleNames = view?.members.map((member) => member.agent_name) ?? []
+
+    expect(view?.squads).toHaveLength(100)
+    expect(view?.squadsTruncated).toBe(true)
+    expect(view?.members).toHaveLength(100)
+    expect(view?.membersTruncated).toBe(true)
+    expect(view?.members.every((member) => (
+      view.squads.some((squad) => squad.squad_id === member.squad_id)
+    ))).toBe(true)
+    expect(view?.members.some((member) => member.agent_id === 'omitted-agent')).toBe(false)
+    for (const name of visibleNames) expect(body).toContain(name)
+    expect(body).not.toContain('AAA omitted squad')
+    expect(body).not.toContain('AAA omitted member')
+    expect(body).toContain('Showing the first 100 readable squad edges.')
+    expect(body).toContain('Showing the first 100 readable agent members.')
+  })
+
   it('renders truthful operating situations for review, blocked, active, and empty projects', async () => {
     harness = makeHarness()
     harness.sqlite.exec(`

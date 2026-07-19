@@ -142,6 +142,7 @@ export interface ProjectDetailView {
   }
   tasks: ProjectTaskRow[]
   squads: ProjectSquadRow[]
+  squadsTruncated: boolean
   members: ProjectMemberRow[]
   membersTruncated: boolean
   situation: ProjectSituation
@@ -452,8 +453,8 @@ async function loadReadableSquads(
   env: Env,
   projectId: string,
   access: ProjectAccess,
-): Promise<ProjectSquadRow[]> {
-  if (!access.workspaceAdmin && !access.readableSquadIds?.length) return []
+): Promise<{ rows: ProjectSquadRow[]; truncated: boolean }> {
+  if (!access.workspaceAdmin && !access.readableSquadIds?.length) return { rows: [], truncated: false }
   const filter = access.workspaceAdmin
     ? ''
     : ' AND psa.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
@@ -468,43 +469,37 @@ async function loadReadableSquads(
   ).bind(
     projectId,
     ...(access.workspaceAdmin ? [] : [jsonIds(access.readableSquadIds ?? [])]),
-    MAX_SQUAD_ROWS,
+    MAX_SQUAD_ROWS + 1,
   ).all<ProjectSquadRow>()
-  return result.results ?? []
+  const candidates = result.results ?? []
+  return {
+    rows: candidates.slice(0, MAX_SQUAD_ROWS),
+    truncated: candidates.length > MAX_SQUAD_ROWS,
+  }
 }
 
 async function loadReadableProjectMembers(
   env: Env,
-  projectId: string,
-  access: ProjectAccess,
+  squads: ProjectSquadRow[],
 ): Promise<{ rows: ProjectMemberRow[]; truncated: boolean }> {
-  if (!access.workspaceAdmin && !access.readableSquadIds?.length) return { rows: [], truncated: false }
-  const filter = access.workspaceAdmin
-    ? ''
-    : ' AND psa.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
-  const limitParam = access.workspaceAdmin ? '?2' : '?3'
+  if (!squads.length) return { rows: [], truncated: false }
   type IdentityRow = Omit<
     ProjectMemberRow,
-    'runtime' | 'runtime_status' | 'presence' | 'host' | 'last_seen'
+    'squad_name' | 'access_level' | 'attached' | 'runtime' | 'runtime_status' | 'presence' | 'host' | 'last_seen'
   >
   const result = await env.DB.prepare(
-    `SELECT psa.squad_id, s.name AS squad_name, psa.access_level,
-            a.id AS agent_id, a.slug AS agent_slug, a.name AS agent_name,
+    `SELECT a.squad_id, a.id AS agent_id, a.slug AS agent_slug, a.name AS agent_name,
             a.role AS agent_role, a.model AS agent_model, a.status AS agent_status
        FROM agents a
        JOIN squads s ON s.id = a.squad_id
-       JOIN project_squad_access psa ON psa.squad_id = a.squad_id
-      WHERE psa.project_id = ?1${filter}
+      WHERE a.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
       ORDER BY s.name, a.name, a.id
-      LIMIT ${limitParam}`,
-  ).bind(
-    projectId,
-    ...(access.workspaceAdmin ? [] : [jsonIds(access.readableSquadIds ?? [])]),
-    MAX_PROJECT_MEMBER_ROWS + 1,
-  ).all<IdentityRow>()
+      LIMIT ?2`,
+  ).bind(jsonIds(squads.map((squad) => squad.squad_id)), MAX_PROJECT_MEMBER_ROWS + 1).all<IdentityRow>()
   const candidates = result.results ?? []
   const truncated = candidates.length > MAX_PROJECT_MEMBER_ROWS
   const identities = candidates.slice(0, MAX_PROJECT_MEMBER_ROWS)
+  const squadsById = new Map(squads.map((squad) => [squad.squad_id, squad]))
   const runtimeStates = await getFleetAgentRuntimeStates(
     env,
     identities.map((agent) => ({ agent_id: agent.agent_id, slug: agent.agent_slug })),
@@ -512,10 +507,13 @@ async function loadReadableProjectMembers(
   return {
     truncated,
     rows: identities.map((agent) => {
+      const squad = squadsById.get(agent.squad_id)!
       const state = runtimeStates.get(agent.agent_id)
       const attached = Boolean(state?.runtime)
       return {
         ...agent,
+        squad_name: squad.squad_name,
+        access_level: squad.access_level,
         attached,
         runtime: state?.runtime ?? '',
         runtime_status: state?.status ?? '',
@@ -563,11 +561,11 @@ export async function loadProjectDetail(
   const [project, access] = await Promise.all([getProject(env, projectId), projectAccess(env, auth)])
   if (!project || !await isReadableProject(env, project.id, access)) return null
 
-  const [aggregates, tasks, squads, members, parent, situation, activity, evidence] = await Promise.all([
+  const squads = await loadReadableSquads(env, project.id, access)
+  const [aggregates, tasks, members, parent, situation, activity, evidence] = await Promise.all([
     loadProjectAggregates(env, project.id, access),
     loadReadableTasks(env, project.id, access),
-    loadReadableSquads(env, project.id, access),
-    loadReadableProjectMembers(env, project.id, access),
+    loadReadableProjectMembers(env, squads.rows),
     project.parent_project_id ? getProject(env, project.parent_project_id) : Promise.resolve(null),
     loadProjectSituation(env, project, access.readableSquadIds),
     listProjectActivity(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
@@ -579,7 +577,8 @@ export async function loadProjectDetail(
     parent: parent ? safeParent(parent) : null,
     aggregates,
     tasks,
-    squads,
+    squads: squads.rows,
+    squadsTruncated: squads.truncated,
     members: members.rows,
     membersTruncated: members.truncated,
     situation,
@@ -1253,7 +1252,7 @@ export function projectDetailBody(view: ProjectDetailView, statusResult?: string
           ],
           rows: teamRows,
           empty: 'No readable squad edges are connected to this project.',
-        })}${view.membersTruncated ? html`<p class="ui-panel-sub">Showing the first ${MAX_PROJECT_MEMBER_ROWS} readable agent members.</p>` : ''}`,
+        })}${view.squadsTruncated ? html`<p class="ui-panel-sub">Showing the first ${MAX_SQUAD_ROWS} readable squad edges.</p>` : ''}${view.membersTruncated ? html`<p class="ui-panel-sub">Showing the first ${MAX_PROJECT_MEMBER_ROWS} readable agent members.</p>` : ''}`,
       })}
     </section>
     <section id="activity" aria-label="Activity">
