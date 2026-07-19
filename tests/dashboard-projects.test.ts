@@ -23,9 +23,11 @@ vi.mock('../src/auth', () => ({
 
 const {
   loadProjectDetail,
+  loadProjectParentOptions,
   loadProjectsPage,
   projectCreateBody,
   projectDetailBody,
+  projectFormValues,
   projectSettingsBody,
   projectsPageBody,
 } = await import('../src/dashboard/projects')
@@ -222,6 +224,29 @@ describe('project dashboard renderers', () => {
     expect(ownerDetailBody).toContain('/projects/visible-child/settings')
   })
 
+  it('does not grant legacy project management to owner or admin roles with explicit capabilities', async () => {
+    harness = makeHarness()
+    const restrictedCapabilities = [{
+      member_id: 'restricted-admin',
+      scope_type: 'department' as const,
+      scope_id: 'dept-a',
+      capability: 'observer' as const,
+    }]
+
+    for (const role of ['owner', 'admin'] as const) {
+      const explicitEmpty = actor({ role, memberId: 'restricted-admin', capabilities: [] })
+      const restricted = actor({ role, memberId: 'restricted-admin', capabilities: restrictedCapabilities })
+
+      expect((await loadProjectsPage(envFor(harness), explicitEmpty)).canManage).toBe(false)
+      const restrictedList = await loadProjectsPage(envFor(harness), restricted)
+      const restrictedDetail = await loadProjectDetail(envFor(harness), restricted, 'visible-child')
+      expect(restrictedList.canManage).toBe(false)
+      expect(restrictedDetail?.canManage).toBe(false)
+      expect(await render(projectsPageBody(restrictedList))).not.toContain('href="/projects/new"')
+      expect(await render(projectDetailBody(restrictedDetail!))).not.toContain('/projects/visible-child/settings')
+    }
+  })
+
   it('filters only visible projects by status and case-insensitive name or goal while keeping parent context', async () => {
     harness = makeHarness()
 
@@ -274,6 +299,35 @@ describe('project dashboard renderers', () => {
     expect(view.nodes[0]?.project.id).toBe('zzzz-search-target')
   })
 
+  it('loads every eligible root parent beyond the display cap and retains an archived current parent', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 150)
+      INSERT INTO projects (id, slug, name, status)
+      SELECT printf('option-%03d', x), printf('option-%03d', x), printf('Option %03d', x), 'planned'
+        FROM n;
+    `)
+
+    const options = await loadProjectParentOptions(envFor(harness))
+    expect(options).toContainEqual({ id: 'option-150', name: 'Option 150' })
+    const selected = await render(projectCreateBody({
+      values: {
+        slug: 'select-last', name: 'Select last', description: '', goal: '',
+        parent_project_id: 'option-150', target_date: '',
+      },
+      parentOptions: options,
+    }))
+    expect(selected).toContain('value="option-150" selected')
+
+    harness.sqlite.exec(`
+      UPDATE projects SET status = 'archived' WHERE id = 'visible-child';
+      UPDATE projects SET status = 'archived' WHERE id = 'hidden-child';
+      UPDATE projects SET status = 'archived' WHERE id = 'root';
+    `)
+    await expect(loadProjectParentOptions(envFor(harness), 'visible-child'))
+      .resolves.toContainEqual({ id: 'root', name: 'Mumega Products' })
+  })
+
   it('escapes all submitted create and settings values and renders explicit lifecycle commands', async () => {
     harness = makeHarness()
     const values = {
@@ -312,8 +366,46 @@ describe('project dashboard renderers', () => {
     expect(settings).toContain('action="/projects/visible-child/settings"')
     expect(settings).toContain('action="/projects/visible-child/status"')
     expect(settings).toContain('value="bad&quot; command" selected')
-    for (const command of ['activate', 'pause', 'complete', 'archive', 'restore']) {
+    for (const command of ['activate', 'archive']) {
       expect(settings).toContain(`value="${command}"`)
+    }
+    for (const command of ['pause', 'complete', 'restore']) {
+      expect(settings).not.toContain(`value="${command}"`)
+    }
+    expect(create).toContain('name="target_date" type="text" value="2026-09-30&quot; data-x=&quot;bad"')
+    expect(settings).toContain('name="target_date" type="text" value="2026-09-30&quot; data-x=&quot;bad"')
+
+    const validDate = await render(projectCreateBody({
+      values: { ...values, target_date: '2026-09-30' }, parentOptions,
+    }))
+    const emptyDate = await render(projectCreateBody({
+      values: { ...values, target_date: '' }, parentOptions,
+    }))
+    expect(validDate).toContain('name="target_date" type="date" value="2026-09-30"')
+    expect(emptyDate).toContain('name="target_date" type="date" value=""')
+  })
+
+  it('renders only lifecycle commands valid for the current project status', async () => {
+    harness = makeHarness()
+    const detail = (await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'visible-child'))!
+    const expected = {
+      planned: ['activate', 'archive'],
+      active: ['pause', 'complete', 'archive'],
+      paused: ['activate', 'complete', 'archive'],
+      completed: ['activate', 'archive'],
+      archived: ['restore'],
+    } as const
+
+    for (const [status, commands] of Object.entries(expected)) {
+      const body = await render(projectSettingsBody({
+        project: { ...detail.project, status: status as typeof detail.project.status },
+        values: projectFormValues({ ...detail.project, status: status as typeof detail.project.status }),
+        parentOptions: [],
+      }))
+      const commandSet = new Set<string>(commands)
+      for (const command of ['activate', 'pause', 'complete', 'archive', 'restore']) {
+        expect(body.includes(`value="${command}"`), `${status} -> ${command}`).toBe(commandSet.has(command))
+      }
     }
   })
 
@@ -629,6 +721,45 @@ describe('project dashboard routes', () => {
     expect(await harness.db.prepare("SELECT id FROM projects WHERE slug = 'member-project'").first()).toBeNull()
   })
 
+  it('denies controls and every project mutation to owner and admin roles with explicit non-admin capabilities', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const restrictedCapabilities = [{
+      member_id: 'restricted-admin',
+      scope_type: 'department' as const,
+      scope_id: 'dept-a',
+      capability: 'observer' as const,
+    }]
+
+    for (const role of ['owner', 'admin'] as const) {
+      for (const capabilities of [[], restrictedCapabilities]) {
+        as(actor({ role, memberId: 'restricted-admin', capabilities }))
+        const list = await dashboardApp.fetch(new Request('https://pot.test/projects'), env)
+        expect(list.status).toBe(200)
+        expect(await list.text()).not.toContain('href="/projects/new"')
+        expect((await dashboardApp.fetch(new Request('https://pot.test/projects/new'), env)).status).toBe(403)
+        expect((await dashboardApp.fetch(projectFormRequest('/projects', {
+          slug: 'denied-project', name: 'Denied', description: '', goal: '', parent_project_id: '', target_date: '',
+        }), env)).status).toBe(403)
+        expect((await dashboardApp.fetch(projectFormRequest('/projects/visible-child/settings', {
+          slug: 'denied-edit', name: 'Denied', description: '', goal: '', parent_project_id: '', target_date: '',
+        }), env)).status).toBe(403)
+        expect((await dashboardApp.fetch(projectFormRequest('/projects/visible-child/status', {
+          command: 'activate',
+        }), env)).status).toBe(403)
+
+        if (capabilities.length) {
+          const detail = await dashboardApp.fetch(new Request('https://pot.test/projects/visible-child'), env)
+          expect(detail.status).toBe(200)
+          expect(await detail.text()).not.toContain('/projects/visible-child/settings')
+          expect((await dashboardApp.fetch(
+            new Request('https://pot.test/projects/visible-child/settings'), env,
+          )).status).toBe(403)
+        }
+      }
+    }
+  })
+
   it('creates a planned project through the shared service and redirects to canonical detail', async () => {
     harness = makeHarness()
     as(actor({ role: 'owner' }))
@@ -706,6 +837,20 @@ describe('project dashboard routes', () => {
     }
   })
 
+  it('returns conflict for a lifecycle command invalid from the current status', async () => {
+    harness = makeHarness()
+    as(actor({ role: 'owner' }))
+
+    const response = await dashboardApp.fetch(projectFormRequest('/projects/visible-child/status', {
+      command: 'pause',
+    }), envFor(harness))
+
+    expect(response.status).toBe(409)
+    expect(await response.text()).toContain('not available from the current project status')
+    expect(await harness.db.prepare("SELECT status FROM projects WHERE id = 'visible-child'").first())
+      .toEqual({ status: 'planned' })
+  })
+
   it('applies visible-only list search/status inputs and rejects invalid status filters', async () => {
     harness = makeHarness()
     const env = envFor(harness)
@@ -756,6 +901,15 @@ describe('project dashboard routes', () => {
       env,
     )
     expect(await unknown.text()).not.toContain('role="status"')
+
+    for (const prototypeKey of ['constructor', 'toString', '__proto__']) {
+      const response = await dashboardApp.fetch(
+        new Request(`https://pot.test/projects/visible-child?status=${encodeURIComponent(prototypeKey)}`),
+        env,
+      )
+      expect(response.status).toBe(200)
+      expect(await response.text()).not.toContain('role="status"')
+    }
   })
 
   it('preserves escaped mutation values and returns conflict, validation, and archive-protection statuses', async () => {

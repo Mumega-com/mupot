@@ -124,7 +124,7 @@ describe('project domain service', () => {
       .resolves.toEqual({ ok: false, error: 'active_children' })
   })
 
-  it('makes archived projects immutable except for restoration to active', async () => {
+  it('makes archived projects immutable except for restoration to planned', async () => {
     harness = makeHarness()
     const env = envFor(harness)
     const root = await createRoot(env)
@@ -132,8 +132,40 @@ describe('project domain service', () => {
 
     await expect(updateProject(env, root.id, { name: 'Renamed' }))
       .resolves.toEqual({ ok: false, error: 'archived_project' })
-    await expect(updateProject(env, root.id, { status: 'active' }))
-      .resolves.toMatchObject({ ok: true, value: { status: 'active' } })
+    await expect(updateProject(env, root.id, { status: 'planned' }))
+      .resolves.toMatchObject({ ok: true, value: { status: 'planned' } })
+  })
+
+  it('enforces the shared lifecycle transition matrix and treats same-status updates as no-ops', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const statuses = ['planned', 'active', 'paused', 'completed', 'archived'] as const
+    const allowed = new Set([
+      'planned:planned', 'planned:active', 'planned:archived',
+      'active:active', 'active:paused', 'active:completed', 'active:archived',
+      'paused:paused', 'paused:active', 'paused:completed', 'paused:archived',
+      'completed:completed', 'completed:active', 'completed:archived',
+      'archived:archived', 'archived:planned',
+    ])
+
+    for (const from of statuses) {
+      for (const to of statuses) {
+        const id = `transition-${from}-${to}`
+        harness.sqlite.prepare(
+          'INSERT INTO projects (id, slug, name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+        ).run(id, id, id, from, '2026-07-19T00:00:00.000Z', '2026-07-19T00:00:00.000Z')
+        const result = await updateProject(env, id, { status: to })
+
+        if (allowed.has(`${from}:${to}`)) {
+          expect(result, `${from} -> ${to}`).toMatchObject({ ok: true, value: { status: to } })
+          if (from === to && result.ok) {
+            expect(result.value.updated_at, `${from} same-status updated_at`).toBe('2026-07-19T00:00:00.000Z')
+          }
+        } else {
+          expect(result, `${from} -> ${to}`).toEqual({ ok: false, error: 'invalid_status_transition' })
+        }
+      }
+    }
   })
 
   it('rejects creating or reparenting a child under an archived parent', async () => {

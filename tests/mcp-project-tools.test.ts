@@ -583,8 +583,8 @@ describe('MCP project lifecycle control', () => {
     }, 'https://pot.test')).resolves.toMatchObject({ ok: true, result: { project: { status: 'archived' } } })
     await expect(invokeTool(admin, env, 'project_update', {
       project_id: projectId,
-      status: 'active',
-    }, 'https://pot.test')).resolves.toMatchObject({ ok: true, result: { project: { status: 'active' } } })
+      status: 'planned',
+    }, 'https://pot.test')).resolves.toMatchObject({ ok: true, result: { project: { status: 'planned' } } })
 
     await expect(invokeTool(admin, env, 'project_squad_remove', {
       project_id: projectId,
@@ -597,9 +597,30 @@ describe('MCP project lifecycle control', () => {
       { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'created', project_id: projectId } },
       { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'squad_access_set', project_id: projectId, squad_id: SQUAD_ID } },
       { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'updated', project_id: projectId, status: 'archived' } },
-      { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'updated', project_id: projectId, status: 'active' } },
+      { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'updated', project_id: projectId, status: 'planned' } },
       { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'squad_access_removed', project_id: projectId, squad_id: SQUAD_ID } },
     ])
+  })
+
+  it('restores archived projects directly to planned and reports invalid transitions as conflicts', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const admin = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' }],
+    })
+
+    await expect(invokeTool(admin, env, 'project_update', {
+      project_id: 'project-a',
+      status: 'planned',
+    }, 'https://pot.test')).resolves.toMatchObject({
+      ok: false, status: 409, error: 'invalid_status_transition',
+    })
+    await expect(invokeTool(admin, env, 'project_update', {
+      project_id: 'project-archived',
+      status: 'planned',
+    }, 'https://pot.test')).resolves.toMatchObject({
+      ok: true, result: { project: { id: 'project-archived', status: 'planned' } },
+    })
   })
 
   it('keeps project mutations admin-only and project reads edge-scoped', async () => {

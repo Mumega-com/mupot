@@ -286,7 +286,7 @@ async function projectAggregates(
 
 function mutationStatus(error: ProjectMutationError): 400 | 404 | 409 {
   if (error === 'project_not_found' || error === 'parent_not_found' || error === 'squad_not_found') return 404
-  if (error === 'slug_taken' || error === 'receipt_failed') return 409
+  if (error === 'slug_taken' || error === 'receipt_failed' || error === 'invalid_status_transition') return 409
   return 400
 }
 

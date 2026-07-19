@@ -117,6 +117,7 @@ import {
   projectCreateBody,
   projectDetailBody,
   projectFormValues,
+  projectLifecycleTransition,
   projectMutationInput,
   projectMutationStatus,
   projectNotFoundBody,
@@ -335,26 +336,22 @@ dashboardApp.post('/projects/:id/status', async (c) => {
     return c.html(shell(c.env, 'Project settings', errorBody('Project lifecycle requires workspace admin.')), 403)
   }
   const projectId = c.req.param('id')
+  const currentProject = await getProject(c.env, projectId)
+  if (!currentProject) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
   const form = await c.req.parseBody()
   const command = typeof form.command === 'string' ? form.command : ''
-  const transitions = {
-    activate: { status: 'active', result: 'activated' },
-    pause: { status: 'paused', result: 'paused' },
-    complete: { status: 'completed', result: 'completed' },
-    archive: { status: 'archived', result: 'archived' },
-    restore: { status: 'planned', result: 'restored' },
-  } as const
-  const transition = transitions[command as keyof typeof transitions]
+  const transition = projectLifecycleTransition(command)
   const result = transition
     ? await updateProject(c.env, projectId, { status: transition.status })
     : { ok: false as const, error: 'invalid_status' as const }
   if (!result.ok) {
-    const project = await getProject(c.env, projectId)
-    if (!project) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+    if (result.error === 'project_not_found') {
+      return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+    }
     const body = projectSettingsBody({
-      project,
-      values: projectFormValues(project),
-      parentOptions: await loadProjectParentOptions(c.env, project.id),
+      project: currentProject,
+      values: projectFormValues(currentProject),
+      parentOptions: await loadProjectParentOptions(c.env, currentProject.id),
       error: result.error,
       lifecycleCommand: command,
     })

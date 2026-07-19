@@ -177,12 +177,16 @@ describe('projectsApp', () => {
     await expect((await fetch(harness, '/')).json()).resolves.toMatchObject({ projects: [{ id: project.id, slug: 'launch', name: 'Launch now' }] })
   })
 
-  it('restores an archived project to planned through the shared update service', async () => {
+  it('maps invalid transitions to conflict and restores archived projects to planned through the shared service', async () => {
     harness = makeHarness()
     harness.sqlite.exec(
       "INSERT INTO projects (id, slug, name, status) VALUES ('archived', 'archived', 'Archived', 'archived')",
     )
     as(actor({ role: 'owner' }))
+
+    const invalid = await fetch(harness, '/archived', 'PATCH', { status: 'active' })
+    expect(invalid.status).toBe(409)
+    await expect(invalid.json()).resolves.toEqual({ error: 'invalid_status_transition' })
 
     const response = await fetch(harness, '/archived', 'PATCH', { status: 'planned' })
 

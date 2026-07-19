@@ -4,7 +4,11 @@ import { hasCapability, resolveCapabilities } from '../auth/capability'
 import { parseFlightMetaV1 } from '../flight/meta'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import type { FlightRow } from '../flight/service'
-import { getProject } from '../projects/service'
+import {
+  getProject,
+  isValidProjectTargetDate,
+  validProjectStatusTransitions,
+} from '../projects/service'
 import type { ProjectMutationError, UpdateProjectInput } from '../projects/service'
 import { listProjectActivity, listProjectEvidence } from '../projects/projections'
 import { loadProjectSituation } from '../projects/situation'
@@ -18,6 +22,7 @@ import { emptyState, pageHeader, pill, sectionPanel } from './ui'
 import type { Html } from './ui'
 
 const MAX_PROJECTS = 100
+const PARENT_OPTIONS_PAGE_SIZE = 500
 const MAX_WORK_ROWS = 50
 const MAX_SQUAD_ROWS = 100
 const MAX_FLIGHT_SCAN_PAGES = 10
@@ -25,6 +30,18 @@ const MAX_FLIGHT_SCAN_PAGES = 10
 export const PROJECT_STATUSES: readonly ProjectStatus[] = [
   'planned', 'active', 'paused', 'completed', 'archived',
 ]
+
+const PROJECT_LIFECYCLE_COMMANDS = [
+  { command: 'activate', status: 'active', result: 'activated', label: 'Activate' },
+  { command: 'pause', status: 'paused', result: 'paused', label: 'Pause' },
+  { command: 'complete', status: 'completed', result: 'completed', label: 'Complete' },
+  { command: 'archive', status: 'archived', result: 'archived', label: 'Archive' },
+  { command: 'restore', status: 'planned', result: 'restored', label: 'Restore to planned' },
+] as const
+
+export function projectLifecycleTransition(command: string) {
+  return PROJECT_LIFECYCLE_COMMANDS.find((candidate) => candidate.command === command) ?? null
+}
 
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
 
@@ -147,7 +164,7 @@ export interface ProjectFlightsResult {
 }
 
 function legacyWorkspaceAdmin(auth: AuthContext): boolean {
-  return auth.role === 'owner' || auth.role === 'admin'
+  return auth.capabilities === undefined && (auth.role === 'owner' || auth.role === 'admin')
 }
 
 async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> {
@@ -535,6 +552,7 @@ export function projectMutationStatus(error: ProjectMutationError): 400 | 404 | 
     || error === 'hierarchy_cycle'
     || error === 'active_children'
     || error === 'archived_project'
+    || error === 'invalid_status_transition'
   ) return 409
   return 400
 }
@@ -543,16 +561,38 @@ export async function loadProjectParentOptions(
   env: Env,
   currentProjectId?: string,
 ): Promise<ProjectParentOption[]> {
-  const result = await env.DB.prepare(
-    `SELECT id, name
-       FROM projects
-      WHERE parent_project_id IS NULL
-        AND status <> 'archived'
-        AND (?1 IS NULL OR id <> ?1)
-      ORDER BY created_at, id
-      LIMIT ?2`,
-  ).bind(currentProjectId ?? null, MAX_PROJECTS).all<ProjectParentOption>()
-  return result.results ?? []
+  const options: ProjectParentOption[] = []
+  let afterId = ''
+  while (true) {
+    const result = await env.DB.prepare(
+      `SELECT id, name
+         FROM projects
+        WHERE parent_project_id IS NULL
+          AND status <> 'archived'
+          AND (?1 IS NULL OR id <> ?1)
+          AND id > ?2
+        ORDER BY id
+        LIMIT ?3`,
+    ).bind(currentProjectId ?? null, afterId, PARENT_OPTIONS_PAGE_SIZE).all<ProjectParentOption>()
+    const page = result.results ?? []
+    options.push(...page)
+    if (page.length < PARENT_OPTIONS_PAGE_SIZE) break
+    afterId = page[page.length - 1].id
+  }
+
+  if (currentProjectId) {
+    const currentParent = await env.DB.prepare(
+      `SELECT parent.id, parent.name
+         FROM projects current
+         JOIN projects parent ON parent.id = current.parent_project_id
+        WHERE current.id = ?1`,
+    ).bind(currentProjectId).first<ProjectParentOption>()
+    if (currentParent && !options.some((option) => option.id === currentParent.id)) {
+      options.push(currentParent)
+      options.sort((a, b) => a.id.localeCompare(b.id))
+    }
+  }
+  return options
 }
 
 export async function loadProjectWorkContext(
@@ -871,6 +911,7 @@ function projectMutationMessage(error: ProjectMutationError): string {
     invalid_slug: 'Use a lowercase slug with letters, numbers, and hyphens.',
     invalid_name: 'Enter a project name.',
     invalid_status: 'Choose a valid project status action.',
+    invalid_status_transition: 'That action is not available from the current project status.',
     invalid_target_date: 'Enter a valid target date.',
     slug_taken: 'That project slug is already in use.',
     project_not_found: 'The project no longer exists.',
@@ -916,7 +957,7 @@ function projectMetadataForm(opts: {
       </label>
       <label style="display:grid;gap:5px;min-width:0;">
         <span class="ui-panel-sub">Target date</span>
-        <input name="target_date" type="date" value="${opts.values.target_date}" style="box-sizing:border-box;width:100%;min-width:0;">
+        <input name="target_date" type="${opts.values.target_date === '' || isValidProjectTargetDate(opts.values.target_date) ? 'date' : 'text'}" value="${opts.values.target_date}" style="box-sizing:border-box;width:100%;min-width:0;">
       </label>
     </div>
     <label style="display:grid;gap:5px;min-width:0;">
@@ -947,8 +988,10 @@ export function projectCreateBody(view: ProjectFormView): Html {
 
 export function projectSettingsBody(view: ProjectSettingsView): Html {
   const projectPath = `/projects/${encodeURIComponent(view.project.id)}`
-  const lifecycleCommands = ['activate', 'pause', 'complete', 'archive', 'restore']
-  const unavailableCommand = view.lifecycleCommand && !lifecycleCommands.includes(view.lifecycleCommand)
+  const validTargets = validProjectStatusTransitions(view.project.status)
+  const availableCommands = PROJECT_LIFECYCLE_COMMANDS.filter((candidate) => validTargets.includes(candidate.status))
+  const unavailableCommand = view.lifecycleCommand
+    && !availableCommands.some((candidate) => candidate.command === view.lifecycleCommand)
   return html`${pageHeader({
     crumbs: `Projects / ${view.project.name}`,
     title: 'Project settings',
@@ -970,11 +1013,7 @@ export function projectSettingsBody(view: ProjectSettingsView): Html {
         <span class="ui-panel-sub">Action</span>
         <select name="command" style="box-sizing:border-box;width:100%;min-width:0;">
           ${unavailableCommand ? html`<option value="${view.lifecycleCommand}" selected>Unavailable action: ${view.lifecycleCommand}</option>` : ''}
-          <option value="activate"${view.lifecycleCommand === 'activate' ? raw(' selected') : raw('')}>Activate</option>
-          <option value="pause"${view.lifecycleCommand === 'pause' ? raw(' selected') : raw('')}>Pause</option>
-          <option value="complete"${view.lifecycleCommand === 'complete' ? raw(' selected') : raw('')}>Complete</option>
-          <option value="archive"${view.lifecycleCommand === 'archive' ? raw(' selected') : raw('')}>Archive</option>
-          <option value="restore"${view.lifecycleCommand === 'restore' ? raw(' selected') : raw('')}>Restore to planned</option>
+          ${availableCommands.map((candidate) => html`<option value="${candidate.command}"${view.lifecycleCommand === candidate.command ? raw(' selected') : raw('')}>${candidate.label}</option>`)}
         </select>
       </label>
       <button class="btn" type="submit">Apply status</button>
@@ -1017,7 +1056,9 @@ const PROJECT_RESULT_MESSAGES: Readonly<Record<string, string>> = {
 
 export function projectDetailBody(view: ProjectDetailView, statusResult?: string) {
   const { project, parent, aggregates, situation } = view
-  const resultMessage = statusResult ? PROJECT_RESULT_MESSAGES[statusResult] : undefined
+  const resultMessage = statusResult && Object.hasOwn(PROJECT_RESULT_MESSAGES, statusResult)
+    ? PROJECT_RESULT_MESSAGES[statusResult]
+    : undefined
   const workLinks = html`<span style="display:flex;flex-wrap:wrap;gap:8px;">
     <a class="ui-link" href="/send?project_id=${encodeURIComponent(project.id)}">Project tasks</a>
     <a class="ui-link" href="/flights?project_id=${encodeURIComponent(project.id)}">Project flights</a>

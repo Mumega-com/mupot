@@ -136,7 +136,9 @@ function mutationFailure(error: ProjectMutationError): ToolOutcome {
   if (error === 'project_not_found' || error === 'parent_not_found' || error === 'squad_not_found') {
     return fail(404, error)
   }
-  if (error === 'slug_taken' || error === 'receipt_failed') return fail(409, error)
+  if (error === 'slug_taken' || error === 'receipt_failed' || error === 'invalid_status_transition') {
+    return fail(409, error)
+  }
   return fail(400, error)
 }
 
