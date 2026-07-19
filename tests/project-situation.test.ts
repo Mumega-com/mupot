@@ -30,6 +30,33 @@ function envFor(harness: SqliteD1Harness): Env {
   return { DB: harness.db, TENANT_SLUG: 'pot-a' } as Env
 }
 
+function statementProbe(database: Env['DB']): {
+  db: Env['DB']
+  statements: Array<{ sql: string; values: unknown[] }>
+} {
+  const statements: Array<{ sql: string; values: unknown[] }> = []
+  type Statement = ReturnType<Env['DB']['prepare']>
+
+  const wrap = (statement: Statement, sql: string, values: unknown[] = []): Statement => ({
+    bind(...nextValues: unknown[]) {
+      return wrap(statement.bind(...nextValues), sql, nextValues)
+    },
+    async all<T>() {
+      statements.push({ sql, values })
+      return statement.all<T>()
+    },
+  }) as Statement
+
+  return {
+    db: {
+      prepare(sql: string) {
+        return wrap(database.prepare(sql), sql)
+      },
+    } as Env['DB'],
+    statements,
+  }
+}
+
 function insertProject(harness: SqliteD1Harness, id: string, status: ProjectStatus = 'active'): Project {
   harness.sqlite.prepare(
     'INSERT INTO projects (id, slug, name, status) VALUES (?, ?, ?, ?)',
@@ -334,6 +361,43 @@ describe('loadProjectSituation', () => {
     expect(scoped.routines).toMatchObject({ enabled_count: 1, next: { id: 'visible-routine' }, active_run: { id: 'visible-wait' } })
     expect(scoped.needs_you).toMatchObject({ count: 1, highest_priority: { source_id: 'visible-wait' } })
     expect(JSON.stringify(scoped)).not.toContain('Private routine')
+  })
+
+  it('uses matching keyset indexes for Routine Situation ordering without source sorts', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'routine-situation-plans')
+    insertRoutine(harness, project.id, { id: 'routine', nextRunAt: '2026-07-20T12:00:00.000Z' })
+    insertRoutineRun(harness, project.id, {
+      id: 'waiting', routineId: 'routine', status: 'waiting', waitingReason: 'budget',
+    })
+    insertRoutineRun(harness, project.id, {
+      id: 'terminal', routineId: 'routine', status: 'succeeded', occurredAt: '2026-07-19T03:00:00.000Z',
+    })
+    const probe = statementProbe(harness.db)
+
+    await loadProjectSituation({ DB: probe.db, TENANT_SLUG: 'pot-a' } as Env, project, null)
+
+    const planFor = (fragment: string) => {
+      const statement = probe.statements.find(candidate => candidate.sql.includes(fragment))
+      expect(statement).toBeDefined()
+      const plan = harness!.sqlite.prepare(`EXPLAIN QUERY PLAN ${statement!.sql}`).all(...statement!.values)
+      return plan.map(row => String(row.detail ?? '')).join('\n')
+    }
+    for (const [fragment, index] of [
+      ['idx_routines_project_next_occurrence', 'idx_routines_project_next_occurrence'],
+      ['idx_routine_runs_project_active_keyset', 'idx_routine_runs_project_active_keyset'],
+      ['idx_routine_runs_project_outcome_keyset', 'idx_routine_runs_project_outcome_keyset'],
+      ['idx_routine_runs_project_needs_you_keyset', 'idx_routine_runs_project_needs_you_keyset'],
+    ]) {
+      const details = planFor(fragment)
+      expect(details).toContain(`USING INDEX ${index}`)
+      if (index === 'idx_routine_runs_project_needs_you_keyset') {
+        const sourcePlan = details.slice(details.indexOf('CO-ROUTINE routine_waits'), details.indexOf('SCAN routine_waits'))
+        expect(sourcePlan).not.toContain('USE TEMP B-TREE')
+      } else {
+        expect(details).not.toContain('USE TEMP B-TREE FOR ORDER BY')
+      }
+    }
   })
 
   it('keeps the earliest urgent Routine deadline when its source exceeds the Situation cap', async () => {

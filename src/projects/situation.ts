@@ -533,9 +533,9 @@ export async function loadProjectSituation(
            JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant AND r.project_id = rr.project_id
           WHERE rr.tenant = ?5 AND rr.project_id = ?1 AND rr.status = 'waiting' AND rr.waiting_reason IS NOT NULL
             AND NOT (rr.waiting_reason = 'review' AND rr.task_id IS NOT NULL)
-            AND (?2 = 1 OR r.responsible_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+          AND (?2 = 1 OR r.responsible_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
           ORDER BY CASE WHEN rr.waiting_reason IN ('approval', 'review', 'budget') THEN 0 ELSE 1 END,
-                   COALESCE(rr.scheduled_for, '9999-12-31T23:59:59.999Z'), rr.created_at DESC, 'routine_run', rr.id LIMIT ?4
+                   COALESCE(rr.scheduled_for, '9999-12-31T23:59:59.999Z'), rr.created_at DESC, rr.id LIMIT ?4
        ),
        blocked_tasks AS (
          SELECT 'blocked_task' AS kind, 'task' AS source_type, t.id AS source_id, t.title,
