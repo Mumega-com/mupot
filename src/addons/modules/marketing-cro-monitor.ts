@@ -28,7 +28,7 @@ export const MarketingCroMonitorAddon = deepFreeze<AddonManifestV1>({
   version: '1.0.0',
   publisher: 'mumega',
   trustClass: 'native_reviewed',
-  mupotCompatibility: '^0.23.0',
+  mupotCompatibility: '^0.24.0',
   kind: 'native',
   description: 'Read-only marketing and conversion monitoring.',
   departments: [
