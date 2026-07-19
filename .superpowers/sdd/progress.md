@@ -22,4 +22,5 @@ Base: 5284348
 Target: v0.24.0 Project Operations
 
 Task 1: complete (commits 5284348..70fde24; review approved; no-secrets passed; 4 focused files / 37 tests passed; full local browser + signed runtime evidence passed)
-Task 2: in progress
+Task 2: complete (commits 70fde24..1448186; review approved; 68 focused tests + typecheck passed; complete keyset-paged scope and explicit snapshot truncation)
+Task 3: in progress

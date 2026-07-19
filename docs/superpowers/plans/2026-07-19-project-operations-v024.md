@@ -50,14 +50,14 @@
 - Modify: `tests/projects-routes.test.ts`
 - Modify: `tests/mcp-project-tools.test.ts`
 
-- [ ] Define `ProjectSituation` with `health`, `summary`, `blockers`, `pending_reviews`, `active_work_count`, `active_flight_count`, `latest_activity`, and `next_action`.
-- [ ] Derive health in this order: project lifecycle status (`archived`, `paused`, `completed`), blockers, pending review, active work or flight, then ready.
-- [ ] Derive next action in this order: review a pending item, unblock a blocked item, continue in-progress work, start open work, monitor an active flight, create the next task for an active project, verify completion evidence for a completed project, or resume/reopen a paused/archived project.
-- [ ] Bound every query and apply the same readable squad and canonical flight filtering already used by Project REST and dashboard loaders.
-- [ ] Extend `GET /api/projects/:id` with `situation` from the shared service.
-- [ ] Extend MCP `project_get` with the same `situation` object rather than duplicating derivation logic.
-- [ ] Test blocked, review, active, ready, paused, completed, archived, empty, and restricted-squad cases.
-- [ ] Run the three focused test files and `npm run typecheck`.
+- [x] Define `ProjectSituation` with `health`, `summary`, `blockers`, `pending_reviews`, `active_work_count`, `active_flight_count`, `latest_activity`, and `next_action`.
+- [x] Derive health in this order: project lifecycle status (`archived`, `paused`, `completed`), blockers, pending review, active work or flight, then ready.
+- [x] Derive next action in this order: review a pending item, unblock a blocked item, continue in-progress work, start open work, monitor an active flight, create the next task for an active project, verify completion evidence for a completed project, or resume/reopen a paused/archived project.
+- [x] Bound every query and apply the same readable squad and canonical flight filtering already used by Project REST and dashboard loaders.
+- [x] Extend `GET /api/projects/:id` with `situation` from the shared service.
+- [x] Extend MCP `project_get` with the same `situation` object rather than duplicating derivation logic.
+- [x] Test blocked, review, active, ready, paused, completed, archived, empty, and restricted-squad cases.
+- [x] Run the three focused test files and `npm run typecheck`.
 
 ## Task 3: Make the Project page the operating home
 
