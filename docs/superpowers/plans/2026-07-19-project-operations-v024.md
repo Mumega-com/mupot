@@ -81,13 +81,13 @@
 - Modify: `tests/dashboard-projects.test.ts`
 - Modify: `tests/projects-routes.test.ts` only if a service behavior gap is found
 
-- [ ] Add admin-only create and settings views using the existing dashboard session, CSRF middleware, and Project service.
-- [ ] Support create, edit metadata, move under one parent, activate, pause, complete, archive, and restore-to-planned while preserving existing hierarchy and active-child rules.
-- [ ] Show create/settings controls only to workspace admins; return 403 for unauthorized POSTs and 404 for inaccessible projects.
-- [ ] Redirect successful mutations to the canonical Project detail page with a concise status result; render validation failures without losing submitted values.
-- [ ] Add status filtering and name/goal search to `/projects` without changing the canonical API pagination contract.
-- [ ] Test RBAC, CSRF-compatible form actions, validation failures, lifecycle transitions, archive protection, filtering, and search.
-- [ ] Run focused dashboard and route tests plus `npm run typecheck`.
+- [x] Add admin-only create and settings views using the existing dashboard session, CSRF middleware, and Project service.
+- [x] Support create, edit metadata, move under one parent, activate, pause, complete, archive, and restore-to-planned while preserving existing hierarchy and active-child rules.
+- [x] Show create/settings controls only to workspace admins; return 403 for unauthorized POSTs and 404 for inaccessible projects.
+- [x] Redirect successful mutations to the canonical Project detail page with a concise status result; render validation failures without losing submitted values.
+- [x] Add status filtering and name/goal search to `/projects` without changing the canonical API pagination contract.
+- [x] Test RBAC, CSRF-compatible form actions, validation failures, lifecycle transitions, archive protection, filtering, and search.
+- [x] Run focused dashboard and route tests plus `npm run typecheck`.
 
 ## Task 5: Show responsible squads, agents, and runtime truth
 
