@@ -44,6 +44,44 @@ Each runtime has a distinct agent identity and agent-bound token.
 
 Tokens are never copied between runtimes or pots. A runtime that connects to two pots uses two independently minted profiles and presents the correct token to each endpoint. Shared display names do not imply shared authority.
 
+The Kubernetes Host mounts the DME-welded operator token as a read-only file
+from a DME-owned Kubernetes Secret. Its sterile profile admits only that fixed
+file path and the non-secret plugin mode. The daemon, probe shell, and inbox
+dispatcher never receive the bearer value; the fixed Hermes adapter reads the
+file immediately before spawning the one-shot Hermes child. The Hermes home
+PVC, operator plugin ConfigMap, signing-key Secret, and operator-token Secret
+remain controlled by the DME namespace and are verified by the deployment
+receipt.
+The fixed adapter transports each validated project batch over stdin to a
+bounded Python bridge. Customer message bodies never become process arguments.
+Release evidence includes a no-network, no-customer-PVC plugin-discovery Job
+whose observed pod image ID, Job execution contract, plugin bundle, and
+completion time must match the immutable Host release candidate.
+The plugin ConfigMap is immutable and content-addressed; smoke evidence also
+binds its live UID and resource version. The Host remains at zero replicas until
+a guarded activation command revalidates the exact cluster snapshot, scales
+with optimistic concurrency, checks the post-scale state, and automatically
+returns to zero on mismatch.
+The install manifest starts at zero replicas. The legacy subscriber must be
+absent before the rendered Host is activated at one replica; rollback stops the
+Host before restoring the old subscriber. Concurrent consumers for one welded
+identity are prohibited because peek-before-consume activation is not a lease.
+A fresh Kubernetes preflight enumerates workloads and pods, proves the legacy
+container is absent and the Host is inert, and becomes a mandatory input to the
+activation receipt. The receipt expires that proof after five minutes.
+Rollback uses two equivalent live-cluster proofs: `rollback-ready` requires the
+Host to be fully inert before restoration, and `rollback-complete` requires the
+legacy subscriber to be restored only in the preserved DME Deployment while the
+Host remains inert.
+The consumer fence also pins the SHA-256 fingerprint of the exact registered
+Ed25519 public key. Signed peek and consume SQL check that fingerprint in the
+same statement that selects or claims messages, so replacing a key cannot
+silently inherit live inbox authority.
+Host readiness requires a successful signed inbox operation. Guarded activation
+then rechecks the same fence generation and pinned fingerprint after readiness;
+rollback-complete independently proves the live fence is `bearer_only` before it
+can report a restored legacy consumer.
+
 ## Collaboration Model
 
 Same-pot collaboration uses existing Mupot primitives:

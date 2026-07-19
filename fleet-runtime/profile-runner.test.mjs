@@ -1,6 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { existsSync, mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 
 import { runAgentProfile } from './profile-runner.mjs'
 
@@ -59,6 +63,36 @@ test('spawns the exact executable and argv without a shell and sends bounded JSO
   assert.equal(JSON.parse(observed[0].stdin).messages[0].project_id, 'project-a')
 })
 
+test('inherits only the profile-declared Hermes operator environment', async () => {
+  const observed = []
+  const configured = {
+    ...profile(),
+    inherited_env: ['MUPOT_AGENT_TOKEN_FILE', 'MUPOT_PLUGIN_MODE'],
+  }
+  const result = await runAgentProfile(configured, batch(), {
+    spawnImpl: successfulSpawn(observed),
+    env: {
+      HOME: '/home/mupot',
+      PATH: '/usr/local/bin',
+      HERMES_HOME: '/home/mupot',
+      HERMES_WRITE_SAFE_ROOT: '/home/mupot',
+      MUPOT_AGENT_TOKEN_FILE: '/run/secrets/mupot-agent/token',
+      MUPOT_PLUGIN_MODE: 'operator',
+      OPENAI_API_KEY: 'must-not-pass',
+    },
+  })
+
+  assert.equal(result.ok, true)
+  assert.deepEqual(observed[0].options.env, {
+    HOME: '/home/mupot',
+    PATH: '/usr/local/bin',
+    HERMES_HOME: '/home/mupot',
+    HERMES_WRITE_SAFE_ROOT: '/home/mupot',
+    MUPOT_AGENT_TOKEN_FILE: '/run/secrets/mupot-agent/token',
+    MUPOT_PLUGIN_MODE: 'operator',
+  })
+})
+
 test('rejects unauthorized senders before spawning', async () => {
   let spawned = false
   const input = batch({ messages: [{ ...batch().messages[0], from_agent: 'unknown-agent' }] })
@@ -112,4 +146,16 @@ test('rejects the entire batch when any activated message is outside project pol
     { ok: false, reason: 'project_denied' },
   )
   assert.equal(spawned, false)
+})
+
+test('profile timeout kills the complete detached adapter process group before retry', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mupot-profile-timeout-'))
+  const marker = join(dir, 'orphaned-child')
+  const configured = {
+    ...profile(), command: ['/bin/sh', '-c', `sleep 2; touch ${marker}`], timeout_ms: 1000,
+  }
+  const result = await runAgentProfile(configured, batch())
+  assert.deepEqual(result, { ok: false, reason: 'timeout' })
+  await delay(1300)
+  assert.equal(existsSync(marker), false)
 })

@@ -1,6 +1,7 @@
 // node --test fleet-daemon.test.mjs   (node >= 18 built-in runner, no deps)
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { hostname } from 'node:os'
 import { validateConfig, runProbe, runInboxCommand, detachAgents, runDaemonOnce, runHeartbeatCycle } from './fleet-daemon.mjs'
 
@@ -71,11 +72,39 @@ test('validateConfig: optional inbox handler is normalized and limit is clamped'
   assert.deepEqual(c.agents[0].inbox, { command: 'node handle-inbox.mjs', limit: 100 })
 })
 
+test('validateConfig: accepts an absolute direct-argv inbox handler', () => {
+  const c = validateConfig({
+    ...okCfg(),
+    agents: [{ agent_id: 'x', probe: 'exit 0', inbox: { argv: ['/usr/bin/node', '/opt/handler.mjs'], limit: 20 } }],
+  })
+  assert.deepEqual(c.agents[0].inbox, { argv: ['/usr/bin/node', '/opt/handler.mjs'], limit: 20 })
+})
+
+test('validateConfig: carries a bounded inbox supervisor timeout', () => {
+  const c = validateConfig({
+    ...okCfg(),
+    agents: [{
+      agent_id: 'x', probe: 'exit 0',
+      inbox: { argv: ['/usr/bin/node', '/opt/handler.mjs'], limit: 20, timeout_ms: 150_000 },
+    }],
+  })
+  assert.equal(c.agents[0].inbox.timeoutMs, 150_000)
+  for (const timeout_ms of [999, 600_001, 1.5, '150000']) {
+    assert.throws(() => validateConfig({
+      ...okCfg(), agents: [{ agent_id: 'x', probe: 'exit 0', inbox: { command: 'handler', timeout_ms } }],
+    }), /timeout_ms invalid/)
+  }
+})
+
 test('validateConfig: rejects malformed inbox handler config', () => {
   assert.throws(() => validateConfig({
     ...okCfg(),
     agents: [{ agent_id: 'x', probe: 'exit 0', inbox: { command: '   ' } }],
-  }), /inbox.command/)
+  }), /exactly one of command or argv/)
+  assert.throws(() => validateConfig({
+    ...okCfg(),
+    agents: [{ agent_id: 'x', probe: 'exit 0', inbox: { command: 'echo x', argv: ['/bin/echo', 'x'] } }],
+  }), /exactly one of command or argv/)
 })
 
 test('runProbe: exit 0 → alive', async () => { assert.equal(await runProbe('exit 0'), true) })
@@ -98,6 +127,33 @@ test('runInboxCommand: non-zero handler result is false', async () => {
 
 test('runInboxCommand: hanging handler times out', async () => {
   assert.equal(await runInboxCommand('sleep 5', '{}', 200), false)
+})
+
+test('runInboxCommand: direct argv bypasses the shell and receives only adapter-safe environment', async () => {
+  const calls = []
+  const spawnImpl = (executable, args, options) => {
+    calls.push({ executable, args, options })
+    const child = new EventEmitter()
+    child.pid = 12
+    child.stdin = { on() {}, end() { queueMicrotask(() => child.emit('exit', 0)) } }
+    return child
+  }
+  const ok = await runInboxCommand(
+    ['/usr/bin/node', '/opt/handler.mjs'], '{}', 1000, spawnImpl,
+    {
+      PATH: '/usr/bin', HOME: '/home/mupot', MUPOT_AGENT_TOKEN: 'must-not-pass',
+      MUPOT_AGENT_TOKEN_FILE: '/run/secrets/mupot-agent/token', MUPOT_PLUGIN_MODE: 'operator',
+      OPENAI_API_KEY: 'must-not-pass',
+    },
+  )
+  assert.equal(ok, true)
+  assert.equal(calls[0].executable, '/usr/bin/node')
+  assert.deepEqual(calls[0].args, ['/opt/handler.mjs'])
+  assert.equal(calls[0].options.shell, false)
+  assert.deepEqual(calls[0].options.env, {
+    HOME: '/home/mupot', PATH: '/usr/bin',
+    MUPOT_AGENT_TOKEN_FILE: '/run/secrets/mupot-agent/token', MUPOT_PLUGIN_MODE: 'operator',
+  })
 })
 
 test('detachAgents: sends signed detach only for agents observed live', async () => {
@@ -156,8 +212,8 @@ test('runDaemonOnce: alive agent heartbeats, drains inbox, and marks live', asyn
       }
       return { ok: true, status: 200, json: { messages: [{ id: 'm1' }] } }
     },
-    runInboxCommand: async (cmd, payload) => {
-      calls.push({ type: 'handler', cmd, payload: JSON.parse(payload) })
+    runInboxCommand: async (cmd, payload, timeoutMs) => {
+      calls.push({ type: 'handler', cmd, payload: JSON.parse(payload), timeoutMs })
       return true
     },
   })
@@ -172,6 +228,7 @@ test('runDaemonOnce: alive agent heartbeats, drains inbox, and marks live', asyn
   assert.equal(calls[0].type, 'attach')
   assert.deepEqual(calls.map((c) => c.type), ['attach', 'inbox', 'handler', 'inbox'])
   assert.equal(calls[2].payload.messages[0].body, 'wake')
+  assert.equal(calls[2].timeoutMs, 30_000)
   // #21 slice 2: each heartbeat self-reports THIS machine's hostname.
   assert.equal(calls[0].host, hostname())
 })

@@ -31,6 +31,12 @@ import { heartbeatState, writeRuntimeState } from './runtime-state.mjs'
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 const PROBE_TIMEOUT_MS = 10_000
 const INBOX_COMMAND_TIMEOUT_MS = 30_000
+const BASE_CHILD_ENV = Object.freeze([
+  'HOME', 'PATH', 'TMPDIR', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
+  'HERMES_HOME', 'HERMES_WRITE_SAFE_ROOT', 'HERMES_DISABLE_LAZY_INSTALLS',
+  'HERMES_LAZY_INSTALL_TARGET', 'HERMES_WEB_DIST', 'HERMES_TUI_DIR',
+  'PLAYWRIGHT_BROWSERS_PATH',
+])
 
 function log(obj) {
   console.log(JSON.stringify({ t: new Date().toISOString(), ...obj }))
@@ -38,6 +44,24 @@ function log(obj) {
 
 function expandHome(path) {
   return typeof path === 'string' && path.startsWith('~/') ? join(homedir(), path.slice(2)) : path
+}
+
+function childEnv(source, includeInboxAdapter = false) {
+  const env = {}
+  const names = includeInboxAdapter
+    ? [...BASE_CHILD_ENV, 'MUPOT_AGENT_TOKEN_FILE', 'MUPOT_PLUGIN_MODE']
+    : BASE_CHILD_ENV
+  for (const name of names) {
+    if (typeof source?.[name] === 'string' && source[name]) env[name] = source[name]
+  }
+  return env
+}
+
+function inboxArgv(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 32) return null
+  if (value.some((part) => typeof part !== 'string' || part.length < 1 || part.length > 2048 || part.includes('\0'))) return null
+  if (!value[0].startsWith('/')) return null
+  return value.slice()
 }
 
 /** Validate + normalize the daemon config. Throws on a fatal shape error (fail-fast).
@@ -75,13 +99,20 @@ export function validateConfig(raw) {
     let inbox = null
     if (a.inbox !== undefined) {
       if (!a.inbox || typeof a.inbox !== 'object') throw new Error(`agents[${i}].inbox must be an object`)
-      if (typeof a.inbox.command !== 'string' || !a.inbox.command.trim()) {
-        throw new Error(`agents[${i}].inbox.command must be a non-empty shell command`)
-      }
+      const command = typeof a.inbox.command === 'string' && a.inbox.command.trim() ? a.inbox.command : null
+      const argv = inboxArgv(a.inbox.argv)
+      if (Boolean(command) === Boolean(argv)) throw new Error(`agents[${i}].inbox requires exactly one of command or argv`)
       let limit = Number.isInteger(a.inbox.limit) ? a.inbox.limit : 20
       if (limit < 1) limit = 1
       if (limit > 100) limit = 100
-      inbox = { command: a.inbox.command, limit }
+      let timeoutMs = null
+      if (a.inbox.timeout_ms !== undefined) {
+        if (!Number.isInteger(a.inbox.timeout_ms) || a.inbox.timeout_ms < 1_000 || a.inbox.timeout_ms > 600_000) {
+          throw new Error(`agents[${i}].inbox.timeout_ms invalid`)
+        }
+        timeoutMs = a.inbox.timeout_ms
+      }
+      inbox = { ...(argv ? { argv } : { command }), limit, ...(timeoutMs === null ? {} : { timeoutMs }) }
     }
     return {
       agent_id: a.agent_id,
@@ -126,13 +157,15 @@ export async function runHeartbeatCycle(cfg, keys, liveAgents, state, opts = {})
  *  detached:true makes the child its own process-group leader so a timeout SIGKILLs the WHOLE
  *  group (the `sh` AND any grandchildren it forked). Killing only the `sh` parent would orphan
  *  those grandchildren to init, leaking a process on every probe timeout. */
-export function runProbe(cmd, timeoutMs = PROBE_TIMEOUT_MS, spawnImpl = spawn) {
+export function runProbe(cmd, timeoutMs = PROBE_TIMEOUT_MS, spawnImpl = spawn, envSource = process.env) {
   return new Promise((resolve) => {
     let done = false
     const finish = (alive) => { if (!done) { done = true; resolve(alive) } }
     let child
     try {
-      child = spawnImpl('sh', ['-c', cmd], { stdio: 'ignore', detached: true })
+      child = spawnImpl('sh', ['-c', cmd], {
+        stdio: 'ignore', detached: true, env: childEnv(envSource, false),
+      })
     } catch {
       return finish(false)
     }
@@ -148,13 +181,19 @@ export function runProbe(cmd, timeoutMs = PROBE_TIMEOUT_MS, spawnImpl = spawn) {
 /** Deliver a JSON inbox batch to the configured local command. The command reads
  *  the payload on stdin and must exit 0 before the daemon consumes the messages
  *  from Mupot. On timeout, kill the whole process group. */
-export function runInboxCommand(cmd, payload, timeoutMs = INBOX_COMMAND_TIMEOUT_MS, spawnImpl = spawn) {
+export function runInboxCommand(cmd, payload, timeoutMs = INBOX_COMMAND_TIMEOUT_MS, spawnImpl = spawn, envSource = process.env) {
   return new Promise((resolve) => {
     let done = false
     const finish = (ok) => { if (!done) { done = true; resolve(ok) } }
     let child
     try {
-      child = spawnImpl('sh', ['-c', cmd], { stdio: ['pipe', 'ignore', 'ignore'], detached: true })
+      const direct = Array.isArray(cmd)
+      child = spawnImpl(direct ? cmd[0] : 'sh', direct ? cmd.slice(1) : ['-c', cmd], {
+        stdio: ['pipe', 'ignore', 'ignore'],
+        detached: true,
+        shell: false,
+        env: childEnv(envSource, true),
+      })
     } catch {
       return finish(false)
     }
@@ -199,7 +238,11 @@ export async function drainInbox(cfg, agent, key, opts = {}) {
     messages,
     remaining: Number(peek.json?.remaining ?? 0),
   }) + '\n'
-  const delivered = await runInboxCommandFn(agent.inbox.command, payload)
+  const delivered = await runInboxCommandFn(
+    agent.inbox.argv ?? agent.inbox.command,
+    payload,
+    agent.inbox.timeoutMs ?? INBOX_COMMAND_TIMEOUT_MS,
+  )
   if (!delivered) {
     logFn({ agent: agent.agent_id, action: 'inbox_handler_fail', messages: messages.length })
     return { agent: agent.agent_id, ok: false, action: 'inbox_handler_fail', status: peek.status, messages: messages.length, consumed: false }

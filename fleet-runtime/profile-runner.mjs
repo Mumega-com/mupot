@@ -1,9 +1,25 @@
 import { spawn } from 'node:child_process'
 import { validateAgentProfile } from './profile-contract.mjs'
 
-function runtimeEnv(source = process.env) {
+function runtimeEnv(source = process.env, inheritedEnv = []) {
   const env = {}
-  for (const key of ['HOME', 'PATH', 'TMPDIR', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME']) {
+  for (const key of [
+    'HOME',
+    'PATH',
+    'TMPDIR',
+    'XDG_CONFIG_HOME',
+    'XDG_DATA_HOME',
+    'HERMES_HOME',
+    'HERMES_WRITE_SAFE_ROOT',
+    'HERMES_DISABLE_LAZY_INSTALLS',
+    'HERMES_LAZY_INSTALL_TARGET',
+    'HERMES_WEB_DIST',
+    'HERMES_TUI_DIR',
+    'PLAYWRIGHT_BROWSERS_PATH',
+  ]) {
+    if (typeof source[key] === 'string' && source[key]) env[key] = source[key]
+  }
+  for (const key of inheritedEnv) {
     if (typeof source[key] === 'string' && source[key]) env[key] = source[key]
   }
   return env
@@ -44,7 +60,7 @@ export function runAgentProfile(rawProfile, batch, options = {}) {
     try {
       child = spawnImpl(profile.command[0], profile.command.slice(1), {
         cwd: typeof options.cwd === 'string' ? options.cwd : undefined,
-        env: runtimeEnv(options.env ?? process.env),
+        env: runtimeEnv(options.env ?? process.env, profile.inherited_env ?? []),
         shell: false,
         detached: true,
         stdio: ['pipe', 'ignore', 'ignore'],

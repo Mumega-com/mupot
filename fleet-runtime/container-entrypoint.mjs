@@ -13,7 +13,10 @@ function fresh(value, nowMs, maxStaleMs) {
   return Number.isFinite(timestamp) && timestamp <= nowMs && nowMs - timestamp <= maxStaleMs
 }
 
-export function evaluateContainerReadiness({ heartbeat, control, controlRequired = true, childrenAlive, nowMs = Date.now(), maxStaleMs = 120000 }) {
+export function evaluateContainerReadiness({
+  heartbeat, control, controlRequired = true, inboxRequired = false,
+  childrenAlive, nowMs = Date.now(), maxStaleMs = 120000,
+}) {
   const reasons = []
   if (!childrenAlive) reasons.push('child_not_running')
   if (!heartbeat || heartbeat.schema !== 'mupot-fleet-daemon-state/v1') {
@@ -21,8 +24,12 @@ export function evaluateContainerReadiness({ heartbeat, control, controlRequired
   } else {
     if (!fresh(heartbeat.last_tick_at, nowMs, maxStaleMs)) reasons.push('heartbeat_stale')
     const agents = Array.isArray(heartbeat.agents) ? heartbeat.agents : []
-    if (!agents.some((agent) => agent?.probe === true && Number(agent.heartbeat_status) >= 200 && Number(agent.heartbeat_status) < 300)) {
+    const healthyAgents = agents.filter((agent) =>
+      agent?.probe === true && Number(agent.heartbeat_status) >= 200 && Number(agent.heartbeat_status) < 300)
+    if (healthyAgents.length === 0) {
       reasons.push('agent_unhealthy')
+    } else if (inboxRequired && !healthyAgents.some((agent) => ['inbox_empty', 'consumed'].includes(agent?.consume))) {
+      reasons.push('signed_inbox_unhealthy')
     }
   }
   if (controlRequired) {
@@ -64,6 +71,10 @@ export async function main(options = {}) {
   const controlPath = env.MUPOT_CONTROL_STATE ?? join(stateDir, 'fleet-control.json')
   const healthPort = Number(env.MUPOT_HEALTH_PORT ?? 8080)
   const maxStaleMs = Number(env.MUPOT_MAX_STALE_MS ?? 120000)
+  if (env.MUPOT_REQUIRE_SIGNED_INBOX_READY !== undefined && !['true', 'false'].includes(env.MUPOT_REQUIRE_SIGNED_INBOX_READY)) {
+    throw new Error('invalid MUPOT_REQUIRE_SIGNED_INBOX_READY')
+  }
+  const inboxRequired = env.MUPOT_REQUIRE_SIGNED_INBOX_READY === 'true'
   if (!Number.isInteger(healthPort) || healthPort < 1 || healthPort > 65535) throw new Error('invalid MUPOT_HEALTH_PORT')
   if (!Number.isFinite(maxStaleMs) || maxStaleMs < 1000 || maxStaleMs > 600000) throw new Error('invalid MUPOT_MAX_STALE_MS')
 
@@ -84,6 +95,7 @@ export async function main(options = {}) {
         heartbeat: readJson(heartbeatPath),
         control: readJson(controlPath),
         controlRequired: Boolean(controlConfig),
+        inboxRequired,
         childrenAlive: alive.size === children.length,
         maxStaleMs,
       })

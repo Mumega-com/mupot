@@ -71,6 +71,7 @@ import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef } from '../org/resolve'
 import { sendToRef, readAgentInbox, sendAgentMessage } from '../agents/messages'
 import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
+import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
 import { PROJECT_TOOLS } from './projects'
 import { dispatchFlight } from '../flight/dispatch'
@@ -1803,9 +1804,108 @@ const toolInbox: ToolSpec = {
     const res = await readAgentInbox(env, { agent, limit, peek: args.peek === true })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
+      if (res.reason === 'consumer_fenced') return fail(409, res.reason)
       return fail(400, res.reason, res.detail)
     }
     return done({ messages: res.messages, remaining: res.remaining, consumed: args.peek !== true })
+  },
+}
+
+// inbox_fence_status — redacted self-status for cutover evidence. The fence is
+// enforced in readAgentInbox, so this tool cannot bypass or consume the inbox.
+const toolInboxFenceStatus: ToolSpec = {
+  name: 'inbox_consumer_status',
+  scope: 'self (the caller agent reads its own consumer-fence mode)',
+  min: 'authenticated',
+  args: '{}',
+  inputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
+  async run(auth, env) {
+    const agent = auth.boundAgentId
+    if (!agent) return fail(403, 'not_agent_bound', 'inbox_fence_status requires an agent-bound token')
+    const row = await env.DB.prepare(
+      `SELECT mode, generation, key_fingerprint, updated_at FROM agent_inbox_fences
+        WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
+    ).bind(env.TENANT_SLUG, agent).first<{
+      mode: string; generation: number; key_fingerprint: string | null; updated_at: string
+    }>()
+    const key = await loadActiveAgentKey(env, agent)
+    const activeKeyFingerprint = key ? await agentKeyFingerprint(key.pubkey) : null
+    return done({
+      agent_id: agent,
+      mode: row?.mode === 'signed_only' ? 'signed_only' : 'bearer_only',
+      generation: row?.mode === 'signed_only' || row?.mode === 'bearer_only' ? Number(row.generation) : 0,
+      key_fingerprint: row?.key_fingerprint ?? null,
+      active_key_present: activeKeyFingerprint !== null,
+      key_matches: row?.mode !== 'signed_only' || row.key_fingerprint === activeKeyFingerprint,
+      updated_at: row?.mode === 'signed_only' || row?.mode === 'bearer_only' ? row.updated_at : null,
+    })
+  },
+}
+
+// inbox_fence_set — workspace-admin cutover control. signed_only blocks every
+// bearer/MCP inbox consumer while retaining the registered Ed25519 Host route.
+const toolInboxFenceSet: ToolSpec = {
+  name: 'set_agent_inbox_consumer',
+  scope: 'org (workspace admin selects the authoritative inbox transport for one agent)',
+  min: 'admin',
+  args: '{ agent: string, mode: "signed_only"|"bearer_only", expected_generation: number, reason: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent: STRING_SCHEMA, mode: STRING_SCHEMA, expected_generation: OPTIONAL_NUMBER_SCHEMA, reason: STRING_SCHEMA },
+    required: ['agent', 'mode', 'expected_generation', 'reason'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (!hasWorkspaceAdmin(auth)) return fail(403, 'forbidden', { need: 'org:admin' })
+    if (typeof args.agent !== 'string' || args.agent.length === 0) return fail(400, 'invalid_args', 'agent required')
+    if (args.mode !== 'signed_only' && args.mode !== 'bearer_only') return fail(400, 'invalid_args', 'mode must be signed_only or bearer_only')
+    if (typeof args.expected_generation !== 'number' || !Number.isInteger(args.expected_generation) || args.expected_generation < 0) {
+      return fail(400, 'invalid_args', 'expected_generation must be a non-negative integer')
+    }
+    if (typeof args.reason !== 'string' || args.reason.trim().length < 1 || args.reason.length > 500) {
+      return fail(400, 'invalid_args', 'reason must be 1-500 characters')
+    }
+    const resolved = await resolveAgentRef(env, args.agent)
+    if (!resolved.ok) return fail(resolved.reason === 'not_found' ? 404 : 409, `agent_${resolved.reason}`)
+    if (!auth.memberId) return fail(403, 'forbidden', { need: 'member identity' })
+    const current = await env.DB.prepare(
+      `SELECT mode, generation, key_fingerprint, updated_at FROM agent_inbox_fences
+        WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
+    ).bind(env.TENANT_SLUG, resolved.value.id).first<{
+      mode: string; generation: number; key_fingerprint: string | null; updated_at: string
+    }>()
+    const currentGeneration = current ? Number(current.generation) : 0
+    if (currentGeneration !== args.expected_generation) return fail(409, 'fence_generation_conflict')
+    const key = await loadActiveAgentKey(env, resolved.value.id)
+    if (args.mode === 'signed_only' && !key) return fail(409, 'active_agent_key_required')
+    const keyFingerprint = args.mode === 'signed_only' && key ? await agentKeyFingerprint(key.pubkey) : null
+    const now = new Date().toISOString()
+    const written = await env.DB.prepare(
+      `INSERT INTO agent_inbox_fences
+        (tenant, agent_id, mode, generation, key_fingerprint, updated_by_member_id, updated_at, reason)
+       VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7)
+       ON CONFLICT(tenant, agent_id) DO UPDATE SET
+         mode = excluded.mode, generation = agent_inbox_fences.generation + 1,
+         key_fingerprint = excluded.key_fingerprint,
+         updated_by_member_id = excluded.updated_by_member_id,
+         updated_at = excluded.updated_at,
+         reason = excluded.reason
+       WHERE agent_inbox_fences.generation = ?8
+       RETURNING mode, generation, key_fingerprint, updated_at`,
+    ).bind(
+      env.TENANT_SLUG, resolved.value.id, args.mode, keyFingerprint,
+      auth.memberId, now, args.reason.trim(), args.expected_generation,
+    ).all<{
+      mode: string; generation: number; key_fingerprint: string | null; updated_at: string
+    }>()
+    const rows = written.results ?? []
+    if (rows.length === 0) return fail(409, 'fence_generation_conflict')
+    if (rows.length !== 1) return fail(500, 'fence_write_failed')
+    const row = rows[0]
+    return done({
+      agent_id: resolved.value.id, mode: row.mode,
+      generation: Number(row.generation), key_fingerprint: row.key_fingerprint, updated_at: row.updated_at,
+    })
   },
 }
 
@@ -2266,6 +2366,8 @@ export const TOOLS: ToolSpec[] = [
   toolSend,
   toolBroadcast,
   toolInbox,
+  toolInboxFenceStatus,
+  toolInboxFenceSet,
   toolPeers,
   toolCheckIn,
   toolStatus,

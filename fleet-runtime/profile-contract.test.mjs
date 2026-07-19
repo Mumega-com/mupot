@@ -60,3 +60,15 @@ test('requires an exact non-wildcard project allowlist', () => {
   assert.equal(normalizeAgentProfile({ ...validProfile(), allowed_project_ids: ['*'] }), null)
   assert.equal(normalizeAgentProfile({ ...validProfile(), allowed_project_ids: ['project-a', 'project-a'] }), null)
 })
+
+test('allows Hermes to inherit only its declared operator credential environment', () => {
+  const profile = {
+    ...validProfile(),
+    inherited_env: ['MUPOT_AGENT_TOKEN_FILE', 'MUPOT_PLUGIN_MODE'],
+  }
+  assert.deepEqual(normalizeAgentProfile(profile), profile)
+  assert.equal(normalizeAgentProfile({ ...profile, inherited_env: ['MUPOT_AGENT_TOKEN_FILE', 'MUPOT_AGENT_TOKEN_FILE'] }), null)
+  assert.equal(normalizeAgentProfile({ ...profile, inherited_env: ['MUPOT_AGENT_TOKEN'] }), null)
+  assert.equal(normalizeAgentProfile({ ...profile, inherited_env: ['OPENAI_API_KEY'] }), null)
+  assert.equal(normalizeAgentProfile({ ...profile, adapter: 'codex' }), null)
+})

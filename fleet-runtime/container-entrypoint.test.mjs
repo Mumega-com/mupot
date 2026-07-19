@@ -73,3 +73,29 @@ test('on-demand hosts do not require a control daemon state file', () => {
     maxStaleMs: 120000,
   }), { ready: true, reasons: [] })
 })
+
+test('inbox-required readiness proves a successful signed inbox operation', () => {
+  assert.deepEqual(evaluateContainerReadiness({
+    heartbeat,
+    control: null,
+    controlRequired: false,
+    inboxRequired: true,
+    childrenAlive: true,
+    nowMs: Date.parse('2026-07-18T20:01:00.000Z'),
+    maxStaleMs: 120000,
+  }), { ready: true, reasons: [] })
+
+  const failedInbox = {
+    ...heartbeat,
+    agents: [{ ...heartbeat.agents[0], consume: 'inbox_peek_fail' }],
+  }
+  assert.deepEqual(evaluateContainerReadiness({
+    heartbeat: failedInbox,
+    control: null,
+    controlRequired: false,
+    inboxRequired: true,
+    childrenAlive: true,
+    nowMs: Date.parse('2026-07-18T20:01:00.000Z'),
+    maxStaleMs: 120000,
+  }), { ready: false, reasons: ['signed_inbox_unhealthy'] })
+})

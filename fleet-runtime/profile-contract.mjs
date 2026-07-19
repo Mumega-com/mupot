@@ -12,8 +12,10 @@ const PROFILE_KEYS = Object.freeze([
   'run_for',
   'timeout_ms',
 ])
+const PROFILE_KEYS_WITH_ENV = Object.freeze([...PROFILE_KEYS, 'inherited_env'])
 const ADAPTERS = new Set(['hermes', 'codex', 'claude-code', 'generic'])
 const MESSAGE_KINDS = new Set(['message', 'request'])
+const HERMES_INHERITED_ENV = new Set(['MUPOT_AGENT_TOKEN_FILE', 'MUPOT_PLUGIN_MODE'])
 const REF_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/
 const SECRET_RE = /Bearer\s+\S+|\bmupot_[A-Za-z0-9_-]+\b|(?:authorization|token|private_key|secret)\s*[:=]/i
 
@@ -37,7 +39,8 @@ function commandArgv(value) {
 }
 
 export function normalizeAgentProfile(raw) {
-  if (!exactKeys(raw, PROFILE_KEYS)) return null
+  const hasInheritedEnv = Object.hasOwn(raw ?? {}, 'inherited_env')
+  if (!exactKeys(raw, hasInheritedEnv ? PROFILE_KEYS_WITH_ENV : PROFILE_KEYS)) return null
   if (raw.schema !== AGENT_PROFILE_SCHEMA || !REF_RE.test(raw.agent_id ?? '')) return null
   if (!ADAPTERS.has(raw.adapter)) return null
   const command = commandArgv(raw.command)
@@ -45,6 +48,11 @@ export function normalizeAgentProfile(raw) {
   const allowedProjectIds = uniqueRefs(raw.allowed_project_ids)
   const runFor = uniqueRefs(raw.run_for, { min: 1, max: 2 })
   if (!command || !allowedSenders || !allowedProjectIds || !runFor || runFor.some((kind) => !MESSAGE_KINDS.has(kind))) return null
+  let inheritedEnv
+  if (hasInheritedEnv) {
+    inheritedEnv = uniqueRefs(raw.inherited_env, { min: 1, max: HERMES_INHERITED_ENV.size })
+    if (raw.adapter !== 'hermes' || !inheritedEnv || inheritedEnv.some((name) => !HERMES_INHERITED_ENV.has(name))) return null
+  }
   if (!Number.isInteger(raw.timeout_ms) || raw.timeout_ms < 1000 || raw.timeout_ms > 600000) return null
   return {
     schema: AGENT_PROFILE_SCHEMA,
@@ -55,6 +63,7 @@ export function normalizeAgentProfile(raw) {
     allowed_project_ids: allowedProjectIds,
     run_for: runFor,
     timeout_ms: raw.timeout_ms,
+    ...(inheritedEnv ? { inherited_env: inheritedEnv } : {}),
   }
 }
 

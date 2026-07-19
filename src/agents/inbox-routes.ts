@@ -18,7 +18,7 @@ import type { Context } from 'hono'
 import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { sendToRef, readAgentInbox } from './messages'
-import { verifySignedInboxRead } from '../fleet/signed-inbox'
+import { verifyAndReadSignedInbox } from '../fleet/signed-inbox'
 
 const MAX_BODY_BYTES = 8192
 
@@ -72,6 +72,7 @@ inboxApp.get('/', async (c) => {
   if (!res.ok) {
     // Never forward a raw DB error string to the client (leak-guard, matches the MCP path).
     if (res.reason === 'db_error') return c.json({ error: res.reason }, 500)
+    if (res.reason === 'consumer_fenced') return c.json({ error: res.reason }, 409)
     return c.json({ error: res.reason, detail: res.detail }, 400)
   }
   return c.json({ ok: true, messages: res.messages, remaining: res.remaining, consumed: !peek })
@@ -86,26 +87,14 @@ inboxApp.post('/signed', async (c) => {
   const parsed = await readJsonObjectCapped(c)
   if (!parsed.ok) return c.json({ error: parsed.error }, parsed.status)
 
-  const verified = await verifySignedInboxRead(c.env, parsed.value)
-  if (!verified.ok) {
-    return c.json({ error: verified.error, detail: verified.detail }, verified.status as 400 | 401 | 409)
-  }
-
-  const res = await readAgentInbox(c.env, {
-    agent: verified.agent_id,
-    peek: verified.peek,
-    limit: verified.limit,
-  })
-  if (!res.ok) {
-    if (res.reason === 'db_error') return c.json({ error: res.reason }, 500)
-    return c.json({ error: res.reason, detail: res.detail }, 400)
-  }
+  const res = await verifyAndReadSignedInbox(c.env, parsed.value)
+  if (!res.ok) return c.json({ error: res.error, detail: res.detail }, res.status as 400 | 401 | 409 | 500)
   return c.json({
     ok: true,
-    agent: verified.agent_id,
+    agent: res.agent_id,
     messages: res.messages,
     remaining: res.remaining,
-    consumed: !verified.peek,
+    consumed: res.consumed,
   })
 })
 

@@ -1,0 +1,72 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dme-hermes-plugin-smoke
+  labels:
+    app.kubernetes.io/name: mupot-agent-host-smoke
+    app.kubernetes.io/instance: dme-hermes
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mupot-agent-host-smoke
+        app.kubernetes.io/instance: dme-hermes
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        runAsGroup: 10000
+        fsGroup: 10000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: plugin-smoke
+          image: registry.example/mupot-agent-host-hermes:0.23.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/node
+            - /opt/mupot/hermes-plugin-smoke.mjs
+          env:
+            - name: HOME
+              value: /home/mupot
+            - name: HERMES_HOME
+              value: /home/mupot
+            - name: MUPOT_PLUGIN_MODE
+              value: operator
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: hermes-home
+              mountPath: /home/mupot
+            - name: hermes-plugin
+              mountPath: /home/mupot/plugins/mupot
+              readOnly: true
+            - name: temporary
+              mountPath: /tmp
+      volumes:
+        - name: hermes-home
+          emptyDir: {}
+        - name: hermes-plugin
+          configMap:
+            name: replace-with-immutable-plugin-config-map
+            defaultMode: 292
+        - name: temporary
+          emptyDir: {}
