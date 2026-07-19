@@ -11,6 +11,11 @@ export interface RoutinePrincipal {
   actor_type: 'member' | 'agent'
   actor_id: string
   workspace_admin: boolean
+  // Coarse role facts are retained for source services that must mirror legacy
+  // Task endpoint bypasses. Callers constructing principals before v0.25 omit
+  // these flags and therefore get the conservative non-bypass behavior.
+  legacy_owner_admin?: boolean
+  org_owner?: boolean
   grants: CapabilityGrant[]
   project_read: ProjectReadAccess
 }
@@ -23,6 +28,8 @@ export function routinePrincipal(auth: AuthContext): RoutinePrincipal {
     actor_type: auth.boundAgentId ? 'agent' : 'member',
     actor_id: auth.boundAgentId ?? auth.memberId ?? auth.userId,
     workspace_admin: projectRead.workspaceAdmin,
+    legacy_owner_admin: auth.role === 'owner' || auth.role === 'admin',
+    org_owner: auth.role === 'owner',
     grants,
     project_read: projectRead,
   }
