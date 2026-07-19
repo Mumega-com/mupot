@@ -1,0 +1,158 @@
+{
+  "schema": "mupot.project-attribution/v1",
+  "pot": "https://mupot.mumega.com",
+  "tenant": "mumega",
+  "applied_at": "2026-07-19T17:10:00Z",
+  "actor": "cursor-auto",
+  "projects": {
+    "mupot-development": "eaf4fb0e-b4f6-4f28-aae6-c06c67ae7afa",
+    "dme-integration": "ecb4322d-c2d2-4f43-b618-a2381b04b931"
+  },
+  "squads": {
+    "mumega-hq": "813ca010-87db-43ff-8422-bada52f255f9",
+    "dme-delivery": "6d30a543-f3fb-4ae5-84c1-7347fdacdccb",
+    "squad-core": "squad-core"
+  },
+  "squad_grants": [
+    {
+      "project": "mupot-development",
+      "squad": "mumega-hq",
+      "access_level": "write",
+      "status": "applied"
+    },
+    {
+      "project": "dme-integration",
+      "squad": "mumega-hq",
+      "access_level": "write",
+      "status": "applied"
+    }
+  ],
+  "task_moves": [
+    {
+      "task_id": "3b49ebb7-5196-41f4-bbf2-8fb8fcc34aa3",
+      "title": "Roll out the DME Kubernetes Hermes Agent Host",
+      "github": "https://github.com/Mumega-com/mumega-com/issues/425",
+      "from_project": "mupot-development",
+      "to_project": "dme-integration",
+      "status": "applied"
+    },
+    {
+      "task_id": "7010c0d7-93b8-437a-a1e2-865b6b8b2990",
+      "title": "Deploy the signed project-link addon to Mumega and DME pots",
+      "github": "https://github.com/Mumega-com/mumega-com/issues/426",
+      "from_project": "mupot-development",
+      "to_project": "dme-integration",
+      "status": "applied"
+    }
+  ],
+  "task_attributions_mupot_development": [
+    {
+      "task_id": "1811f9b4-5951-4697-8b9e-e9b89fa625c8",
+      "title": "dogfood: kasra\u2192codex via mupot",
+      "status": "applied"
+    },
+    {
+      "task_id": "3d47757d-0ee8-4c9c-a8bf-e82354ff4a16",
+      "title": "RuntimeAdapter + runtime-descriptor epic",
+      "status": "applied"
+    },
+    {
+      "task_id": "ffd2211a-fee1-43b8-bb50-e16541c7b2da",
+      "title": "FLIGHT 1 \u2014 close the one-agent loop",
+      "status": "applied"
+    },
+    {
+      "task_id": "67213bc9-acfb-4f85-b572-31118e736ac2",
+      "title": "Coordinate the remaining #274 host-go prerequisite",
+      "status": "applied"
+    },
+    {
+      "task_id": "90cee3cf-398d-4775-b7bf-16a87f5e703e",
+      "title": "[kasra-review] Re-gate deactivate_agent P0 fix",
+      "status": "applied"
+    },
+    {
+      "task_id": "14448cdb-ba7b-4d20-a17f-6817a2b46b96",
+      "title": "deactivate_agent tool + P0-safe 0049 migration",
+      "status": "applied"
+    }
+  ],
+  "task_creates_dme_integration": [
+    {
+      "github_issue": 413,
+      "task_id": "54b7cc40-7028-4f67-8147-c86b03b6f3b2",
+      "title": "Implement signed idempotent cross-pot delivery",
+      "url": "https://github.com/Mumega-com/mumega-com/issues/413",
+      "status": "applied"
+    },
+    {
+      "github_issue": 416,
+      "task_id": "db626ba9-54fa-4b67-a6a8-a74ead35c052",
+      "title": "Define the project-link addon manifest and envelope schema",
+      "url": "https://github.com/Mumega-com/mumega-com/issues/416",
+      "status": "applied"
+    },
+    {
+      "github_issue": 417,
+      "task_id": "416b4c5d-8b63-409b-8bbc-289178ef6a5a",
+      "title": "Add linked-pot data to the latest-situation projection",
+      "url": "https://github.com/Mumega-com/mumega-com/issues/417",
+      "status": "applied"
+    },
+    {
+      "github_issue": 419,
+      "task_id": "c94fbf80-b957-46fd-972d-e2bc2d4d5533",
+      "title": "Persist cross-pot evidence and matching receipts",
+      "url": "https://github.com/Mumega-com/mumega-com/issues/419",
+      "status": "applied"
+    },
+    {
+      "github_issue": 420,
+      "task_id": "560bcfb9-de1b-4d6e-b4c0-39859b6c6d49",
+      "title": "Enforce the DME customer-data boundary",
+      "url": "https://github.com/Mumega-com/mumega-com/issues/420",
+      "status": "applied"
+    },
+    {
+      "github_issue": 422,
+      "task_id": "484f23e1-5dca-4f5b-a406-ad57d68f5644",
+      "title": "Verify revocation, staleness, retry, and recovery paths",
+      "url": "https://github.com/Mumega-com/mumega-com/issues/422",
+      "status": "applied"
+    },
+    {
+      "github_issue": 423,
+      "task_id": "1e7efb8a-dfae-459c-a55a-8d60bc3e63eb",
+      "title": "Publish the DME integration runbook and release receipt",
+      "url": "https://github.com/Mumega-com/mumega-com/issues/423",
+      "status": "applied"
+    },
+    {
+      "github_issue": 427,
+      "task_id": "bb9b4fee-3e47-4229-8c74-9d3dda124ee6",
+      "title": "Run one governed Mumega-to-DME cross-pot flight",
+      "url": "https://github.com/Mumega-com/mumega-com/issues/427",
+      "status": "applied"
+    },
+    {
+      "github_issue": 428,
+      "task_id": "2a36e694-310a-4915-8973-30ba79229546",
+      "title": "Publish and merge the reviewed cross-pot release branch",
+      "url": "https://github.com/Mumega-com/mumega-com/issues/428",
+      "status": "applied"
+    },
+    {
+      "github_issue": 429,
+      "task_id": "badaee39-6af3-413f-b312-b2c524829e7e",
+      "title": "Complete production browser, revocation, and rollback verification",
+      "url": "https://github.com/Mumega-com/mumega-com/issues/429",
+      "status": "applied"
+    }
+  ],
+  "notes": [
+    "Did not attribute GH webhook noise tasks ([GH ...] open events).",
+    "Did not attribute sample/test tasks.",
+    "Created DME mirrors include GitHub URL in body; MCP task_create cannot set github_issue_url.",
+    "Cursor Auto (mumega hq) can now project_list both projects after write grants."
+  ]
+}
