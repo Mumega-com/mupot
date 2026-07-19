@@ -177,6 +177,19 @@ describe('projectsApp', () => {
     await expect((await fetch(harness, '/')).json()).resolves.toMatchObject({ projects: [{ id: project.id, slug: 'launch', name: 'Launch now' }] })
   })
 
+  it('restores an archived project to planned through the shared update service', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(
+      "INSERT INTO projects (id, slug, name, status) VALUES ('archived', 'archived', 'Archived', 'archived')",
+    )
+    as(actor({ role: 'owner' }))
+
+    const response = await fetch(harness, '/archived', 'PATCH', { status: 'planned' })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({ project: { id: 'archived', status: 'planned' } })
+  })
+
   it('only gives a member the explicitly readable project and its needed parent context', async () => {
     harness = makeHarness()
     seedProjects(harness)

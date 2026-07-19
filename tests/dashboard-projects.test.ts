@@ -24,7 +24,9 @@ vi.mock('../src/auth', () => ({
 const {
   loadProjectDetail,
   loadProjectsPage,
+  projectCreateBody,
   projectDetailBody,
+  projectSettingsBody,
   projectsPageBody,
 } = await import('../src/dashboard/projects')
 const { dashboardApp, dashboardBuiltInGetRoutes } = await import('../src/dashboard')
@@ -147,6 +149,17 @@ async function render(value: unknown): Promise<string> {
   return String(await value)
 }
 
+function projectFormRequest(path: string, values: Record<string, string>): Request {
+  return new Request(`https://pot.test${path}`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      origin: 'https://pot.test',
+    },
+    body: new URLSearchParams(values),
+  })
+}
+
 describe('project dashboard renderers', () => {
   let harness: SqliteD1Harness | undefined
 
@@ -175,6 +188,133 @@ describe('project dashboard renderers', () => {
         metrics: { directSquads: 1, openWork: 1, activeFlights: 1 },
       }],
     })
+  })
+
+  it('derives project management from workspace roles and org admin capabilities', async () => {
+    harness = makeHarness()
+
+    const memberList = await loadProjectsPage(envFor(harness), memberA())
+    const ownerList = await loadProjectsPage(envFor(harness), actor({ role: 'owner' }))
+    const orgAdmin = actor({
+      memberId: 'org-admin',
+      capabilities: [{
+        member_id: 'org-admin', scope_type: 'org', scope_id: null, capability: 'admin',
+      }],
+    })
+    const orgAdminDetail = await loadProjectDetail(envFor(harness), orgAdmin, 'visible-child')
+
+    expect(memberList.canManage).toBe(false)
+    expect(ownerList.canManage).toBe(true)
+    expect(orgAdminDetail?.canManage).toBe(true)
+
+    const memberListBody = await render(projectsPageBody(memberList))
+    const memberDetailBody = await render(projectDetailBody(
+      (await loadProjectDetail(envFor(harness), memberA(), 'visible-child'))!,
+    ))
+    const ownerListBody = await render(projectsPageBody(ownerList))
+    const ownerDetailBody = await render(projectDetailBody(
+      (await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'visible-child'))!,
+    ))
+
+    expect(memberListBody).not.toContain('href="/projects/new"')
+    expect(memberDetailBody).not.toContain('/projects/visible-child/settings')
+    expect(ownerListBody).toContain('href="/projects/new"')
+    expect(ownerDetailBody).toContain('/projects/visible-child/settings')
+  })
+
+  it('filters only visible projects by status and case-insensitive name or goal while keeping parent context', async () => {
+    harness = makeHarness()
+
+    const byGoal = await loadProjectsPage(envFor(harness), memberA(), {
+      search: 'PUBLISH & VERIFY',
+      status: 'planned',
+    })
+    expect(byGoal.visibleProjectCount).toBe(1)
+    expect(byGoal.filters).toEqual({ search: 'PUBLISH & VERIFY', status: 'planned' })
+    expect(byGoal.nodes).toHaveLength(1)
+    expect(byGoal.nodes[0]).toMatchObject({
+      contextOnly: true,
+      metrics: null,
+      project: { id: 'root' },
+      children: [{ id: 'visible-child' }],
+    })
+
+    const hiddenSearch = await loadProjectsPage(envFor(harness), memberA(), { search: 'hidden sibling' })
+    expect(hiddenSearch.visibleProjectCount).toBe(0)
+    expect(hiddenSearch.nodes).toEqual([])
+
+    const body = await render(projectsPageBody(byGoal))
+    expect(body).toContain('name="search"')
+    expect(body).toContain('value="PUBLISH &amp; VERIFY"')
+    expect(body).toContain('<option value="planned" selected>Planned</option>')
+    expect(body).toContain('Mumega Products')
+    expect(body).toContain('Inkwell &lt;script&gt;alert(1)&lt;/script&gt;')
+  })
+
+  it('applies dashboard search before the visible-project display cap', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 120)
+      INSERT INTO projects (id, slug, name, goal, status, created_at)
+      SELECT printf('cap-%03d', x), printf('cap-%03d', x), printf('Cap %03d', x), '', 'planned',
+             '2026-07-19T00:00:00Z'
+        FROM n;
+      INSERT INTO projects (id, slug, name, goal, status, created_at)
+      VALUES ('zzzz-search-target', 'zzzz-search-target', 'Post-cap target', 'Unique needle', 'planned',
+              '2026-07-19T00:00:00Z');
+    `)
+
+    const view = await loadProjectsPage(envFor(harness), actor({ role: 'owner' }), {
+      search: 'UNIQUE NEEDLE',
+      status: 'planned',
+    })
+
+    expect(view.visibleProjectCount).toBe(1)
+    expect(view.nodes).toHaveLength(1)
+    expect(view.nodes[0]?.project.id).toBe('zzzz-search-target')
+  })
+
+  it('escapes all submitted create and settings values and renders explicit lifecycle commands', async () => {
+    harness = makeHarness()
+    const values = {
+      slug: 'unsafe" onfocus="alert(1)',
+      name: '<script>alert(1)</script>',
+      description: '<b>description</b>',
+      goal: 'Ship & verify',
+      parent_project_id: 'root" autofocus',
+      target_date: '2026-09-30" data-x="bad',
+    }
+    const parentOptions = [{ id: 'root', name: 'Root <unsafe>' }]
+
+    const create = await render(projectCreateBody({ values, parentOptions, error: 'invalid_slug' }))
+    const project = (await loadProjectDetail(
+      envFor(harness), actor({ role: 'owner' }), 'visible-child',
+    ))!.project
+    const settings = await render(projectSettingsBody({
+      project,
+      values,
+      parentOptions,
+      error: 'invalid_target_date',
+      lifecycleCommand: 'bad" command',
+    }))
+
+    for (const body of [create, settings]) {
+      expect(body).toContain('unsafe&quot; onfocus=&quot;alert(1)')
+      expect(body).toContain('&lt;script&gt;alert(1)&lt;/script&gt;')
+      expect(body).toContain('&lt;b&gt;description&lt;/b&gt;')
+      expect(body).toContain('Ship &amp; verify')
+      expect(body).toContain('2026-09-30&quot; data-x=&quot;bad')
+      expect(body).toContain('value="root&quot; autofocus" selected')
+      expect(body).not.toContain('<script>alert(1)</script>')
+      expect(body).not.toContain('<b>description</b>')
+    }
+    expect(create).toContain('action="/projects"')
+    expect(settings).toContain('action="/projects/visible-child/settings"')
+    expect(settings).toContain('action="/projects/visible-child/status"')
+    expect(settings).toContain('value="bad&quot; command" selected')
+    for (const command of ['activate', 'pause', 'complete', 'archive', 'restore']) {
+      expect(settings).toContain(`value="${command}"`)
+    }
   })
 
   it('keeps every production query within D1 bind limits for large project and capability sets', async () => {
@@ -461,8 +601,238 @@ describe('project dashboard routes', () => {
   it('registers project routes before the built-in route table is frozen', () => {
     expect(dashboardBuiltInGetRoutes).toEqual(expect.arrayContaining([
       expect.objectContaining({ method: 'GET', path: '/projects' }),
+      expect.objectContaining({ method: 'GET', path: '/projects/new' }),
       expect.objectContaining({ method: 'GET', path: '/projects/:id' }),
+      expect.objectContaining({ method: 'GET', path: '/projects/:id/settings' }),
     ]))
+  })
+
+  it('serves the owner create view and forbids member project creation', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+
+    as(actor({ role: 'owner' }))
+    const createView = await dashboardApp.fetch(new Request('https://pot.test/projects/new'), env)
+    expect(createView.status).toBe(200)
+    expect(await createView.text()).toContain('action="/projects"')
+
+    as(memberA())
+    const forbidden = await dashboardApp.fetch(projectFormRequest('/projects', {
+      slug: 'member-project',
+      name: 'Member project',
+      description: '',
+      goal: '',
+      parent_project_id: '',
+      target_date: '',
+    }), env)
+    expect(forbidden.status).toBe(403)
+    expect(await harness.db.prepare("SELECT id FROM projects WHERE slug = 'member-project'").first()).toBeNull()
+  })
+
+  it('creates a planned project through the shared service and redirects to canonical detail', async () => {
+    harness = makeHarness()
+    as(actor({ role: 'owner' }))
+
+    const response = await dashboardApp.fetch(projectFormRequest('/projects', {
+      slug: 'new-project',
+      name: 'New project',
+      description: 'Submitted description',
+      goal: 'Submitted goal',
+      parent_project_id: 'root',
+      target_date: '2026-11-30',
+    }), envFor(harness))
+
+    expect(response.status).toBe(303)
+    const created = await harness.db.prepare(
+      "SELECT id, status, parent_project_id FROM projects WHERE slug = 'new-project'",
+    ).first<{ id: string; status: string; parent_project_id: string | null }>()
+    expect(created).toMatchObject({ status: 'planned', parent_project_id: 'root' })
+    expect(response.headers.get('location')).toBe(`/projects/${created?.id}?status=created`)
+  })
+
+  it('serves owner settings and edits metadata through the shared service', async () => {
+    harness = makeHarness()
+    as(actor({ role: 'owner' }))
+    const env = envFor(harness)
+
+    const settings = await dashboardApp.fetch(
+      new Request('https://pot.test/projects/visible-child/settings'),
+      env,
+    )
+    expect(settings.status).toBe(200)
+    expect(await settings.text()).toContain('action="/projects/visible-child/settings"')
+
+    const response = await dashboardApp.fetch(projectFormRequest('/projects/visible-child/settings', {
+      slug: 'inkwell-edited',
+      name: 'Inkwell edited',
+      description: 'Edited description',
+      goal: 'Edited goal',
+      parent_project_id: '',
+      target_date: '2026-10-15',
+    }), env)
+    expect(response.status).toBe(303)
+    expect(response.headers.get('location')).toBe('/projects/visible-child?status=updated')
+    expect(await harness.db.prepare(
+      "SELECT slug, name, goal, parent_project_id, target_date FROM projects WHERE id = 'visible-child'",
+    ).first()).toMatchObject({
+      slug: 'inkwell-edited',
+      name: 'Inkwell edited',
+      goal: 'Edited goal',
+      parent_project_id: null,
+      target_date: '2026-10-15',
+    })
+  })
+
+  it('applies the full explicit lifecycle and restores archived projects to planned', async () => {
+    harness = makeHarness()
+    as(actor({ role: 'owner' }))
+    const transitions = [
+      ['activate', 'activated', 'active'],
+      ['pause', 'paused', 'paused'],
+      ['complete', 'completed', 'completed'],
+      ['archive', 'archived', 'archived'],
+      ['restore', 'restored', 'planned'],
+    ] as const
+
+    for (const [command, result, status] of transitions) {
+      const response = await dashboardApp.fetch(projectFormRequest('/projects/visible-child/status', {
+        command,
+      }), envFor(harness))
+      expect(response.status).toBe(303)
+      expect(response.headers.get('location')).toBe(`/projects/visible-child?status=${result}`)
+      expect(await harness.db.prepare(
+        "SELECT status FROM projects WHERE id = 'visible-child'",
+      ).first()).toEqual({ status })
+    }
+  })
+
+  it('applies visible-only list search/status inputs and rejects invalid status filters', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+
+    as(actor({ role: 'owner' }))
+    const filtered = await dashboardApp.fetch(
+      new Request('https://pot.test/projects?search=PUBLISH%20%26%20VERIFY&status=planned'),
+      env,
+    )
+    const body = await filtered.text()
+    expect(filtered.status).toBe(200)
+    expect(body).toContain('Inkwell &lt;script&gt;alert(1)&lt;/script&gt;')
+    expect(body).toContain('Mumega Products')
+    expect(body).not.toContain('Hidden sibling secret')
+    expect(body).not.toContain('Other Root')
+    expect(body).toContain('value="PUBLISH &amp; VERIFY"')
+    expect(body).toContain('<option value="planned" selected>Planned</option>')
+
+    const invalid = await dashboardApp.fetch(
+      new Request('https://pot.test/projects?status=not-a-status'),
+      env,
+    )
+    expect(invalid.status).toBe(400)
+
+    as(memberA())
+    const hidden = await dashboardApp.fetch(
+      new Request('https://pot.test/projects?search=hidden%20sibling'),
+      env,
+    )
+    expect(hidden.status).toBe(200)
+    expect(await hidden.text()).not.toContain('Hidden sibling secret')
+  })
+
+  it('renders allowlisted concise mutation status on canonical detail', async () => {
+    harness = makeHarness()
+    as(actor({ role: 'owner' }))
+    const env = envFor(harness)
+
+    const saved = await dashboardApp.fetch(
+      new Request('https://pot.test/projects/visible-child?status=updated'),
+      env,
+    )
+    expect(saved.status).toBe(200)
+    expect(await saved.text()).toContain('Project settings saved.')
+
+    const unknown = await dashboardApp.fetch(
+      new Request('https://pot.test/projects/visible-child?status=%3Cscript%3E'),
+      env,
+    )
+    expect(await unknown.text()).not.toContain('role="status"')
+  })
+
+  it('preserves escaped mutation values and returns conflict, validation, and archive-protection statuses', async () => {
+    harness = makeHarness()
+    as(actor({ role: 'owner' }))
+    const env = envFor(harness)
+
+    const duplicate = await dashboardApp.fetch(projectFormRequest('/projects', {
+      slug: 'mumega-products',
+      name: '<script>Retain me</script>',
+      description: 'Duplicate description',
+      goal: 'Keep & show',
+      parent_project_id: '',
+      target_date: '',
+    }), env)
+    const duplicateBody = await duplicate.text()
+    expect(duplicate.status).toBe(409)
+    expect(duplicateBody).toContain('&lt;script&gt;Retain me&lt;/script&gt;')
+    expect(duplicateBody).toContain('Keep &amp; show')
+
+    const invalid = await dashboardApp.fetch(projectFormRequest('/projects/visible-child/settings', {
+      slug: 'inkwell',
+      name: 'Retained name',
+      description: '<b>Retained description</b>',
+      goal: 'Retained goal',
+      parent_project_id: 'root',
+      target_date: '2026-02-30',
+    }), env)
+    const invalidBody = await invalid.text()
+    expect(invalid.status).toBe(400)
+    expect(invalidBody).toContain('Retained name')
+    expect(invalidBody).toContain('&lt;b&gt;Retained description&lt;/b&gt;')
+    expect(invalidBody).toContain('value="2026-02-30"')
+
+    const protectedArchive = await dashboardApp.fetch(projectFormRequest('/projects/root/status', {
+      command: 'archive',
+    }), env)
+    expect(protectedArchive.status).toBe(409)
+    expect(await protectedArchive.text()).toContain('Archive or move active child projects first.')
+    expect(await harness.db.prepare("SELECT status FROM projects WHERE id = 'root'").first())
+      .toEqual({ status: 'active' })
+
+    const invalidCommand = await dashboardApp.fetch(projectFormRequest('/projects/visible-child/status', {
+      command: 'not-a-command',
+    }), env)
+    expect(invalidCommand.status).toBe(400)
+    expect(await invalidCommand.text()).toContain('value="not-a-command" selected')
+  })
+
+  it('returns 403 for unauthorized posts, 404 for inaccessible settings, and rejects cross-origin forms', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    as(memberA())
+
+    expect((await dashboardApp.fetch(projectFormRequest('/projects/visible-child/settings', {
+      slug: 'nope', name: 'Nope', description: '', goal: '', parent_project_id: '', target_date: '',
+    }), env)).status).toBe(403)
+    expect((await dashboardApp.fetch(projectFormRequest('/projects/visible-child/status', {
+      command: 'activate',
+    }), env)).status).toBe(403)
+    expect((await dashboardApp.fetch(
+      new Request('https://pot.test/projects/hidden-child/settings'), env,
+    )).status).toBe(404)
+
+    as(actor({ role: 'owner' }))
+    expect((await dashboardApp.fetch(
+      new Request('https://pot.test/projects/missing/settings'), env,
+    )).status).toBe(404)
+    const crossOrigin = new Request('https://pot.test/projects', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        origin: 'https://attacker.test',
+      },
+      body: new URLSearchParams({ slug: 'cross-origin', name: 'Cross origin' }),
+    })
+    expect((await dashboardApp.fetch(crossOrigin, env)).status).toBe(403)
   })
 
   it('redirects unauthenticated project pages and renders owner project detail', async () => {

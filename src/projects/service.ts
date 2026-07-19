@@ -219,7 +219,9 @@ export async function updateProject(
 
   const suppliedKeys = Object.keys(input).filter((key) => input[key as keyof UpdateProjectInput] !== undefined)
   if (existing.status === 'archived') {
-    if (suppliedKeys.length !== 1 || input.status !== 'active') return { ok: false, error: 'archived_project' }
+    if (suppliedKeys.length !== 1 || (input.status !== 'active' && input.status !== 'planned')) {
+      return { ok: false, error: 'archived_project' }
+    }
   }
 
   const nextSlug = input.slug === undefined ? existing.slug : input.slug

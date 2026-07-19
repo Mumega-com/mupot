@@ -5,6 +5,7 @@ import { parseFlightMetaV1 } from '../flight/meta'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import type { FlightRow } from '../flight/service'
 import { getProject } from '../projects/service'
+import type { ProjectMutationError, UpdateProjectInput } from '../projects/service'
 import { listProjectActivity, listProjectEvidence } from '../projects/projections'
 import { loadProjectSituation } from '../projects/situation'
 import type {
@@ -20,6 +21,10 @@ const MAX_PROJECTS = 100
 const MAX_WORK_ROWS = 50
 const MAX_SQUAD_ROWS = 100
 const MAX_FLIGHT_SCAN_PAGES = 10
+
+export const PROJECT_STATUSES: readonly ProjectStatus[] = [
+  'planned', 'active', 'paused', 'completed', 'archived',
+]
 
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
 
@@ -50,6 +55,28 @@ export interface ProjectsPageView {
   nodes: ProjectListNode[]
   visibleProjectCount: number
   capped: boolean
+  canManage: boolean
+  filters: {
+    search: string
+    status: ProjectStatus | ''
+  }
+}
+
+export interface ProjectListFilters {
+  search?: string
+  status?: ProjectStatus
+}
+
+export function parseProjectListFilters(
+  search: string | undefined,
+  status: string | undefined,
+): ProjectListFilters | null {
+  const normalizedStatus = status?.trim() ?? ''
+  if (normalizedStatus && !(PROJECT_STATUSES as readonly string[]).includes(normalizedStatus)) return null
+  return {
+    search: search ?? '',
+    ...(normalizedStatus ? { status: normalizedStatus as ProjectStatus } : {}),
+  }
 }
 
 export interface ProjectTaskRow {
@@ -80,6 +107,32 @@ export interface ProjectDetailView {
   situation: ProjectSituation
   activity: ProjectProjectionPage<ProjectActivitySource>
   evidence: ProjectProjectionPage<ProjectEvidenceSource>
+  canManage: boolean
+}
+
+export interface ProjectFormValues {
+  slug: string
+  name: string
+  description: string
+  goal: string
+  parent_project_id: string
+  target_date: string
+}
+
+export interface ProjectParentOption {
+  id: string
+  name: string
+}
+
+export interface ProjectFormView {
+  values: ProjectFormValues
+  parentOptions: ProjectParentOption[]
+  error?: ProjectMutationError
+}
+
+export interface ProjectSettingsView extends ProjectFormView {
+  project: Project
+  lifecycleCommand?: string
 }
 
 export interface ProjectWorkContext {
@@ -130,6 +183,10 @@ async function projectAccess(env: Env, auth: AuthContext): Promise<ProjectAccess
   }
 }
 
+export async function canManageProjects(env: Env, auth: AuthContext): Promise<boolean> {
+  return (await projectAccess(env, auth)).workspaceAdmin
+}
+
 function jsonIds(ids: string[]): string {
   return JSON.stringify([...new Set(ids)])
 }
@@ -161,31 +218,38 @@ function safeParent(project: Project): ParentContext {
 async function loadVisibleProjects(
   env: Env,
   access: ProjectAccess,
+  filters: { search: string; status: ProjectStatus | '' },
 ): Promise<{ projects: Project[]; capped: boolean }> {
   if (!access.workspaceAdmin && access.readableSquadIds?.length === 0) {
     return { projects: [], capped: false }
   }
-  const statement = access.workspaceAdmin
-    ? env.DB.prepare(
-      `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-              p.target_date, p.created_at, p.updated_at
-         FROM projects p
-        ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
-        LIMIT ?1`,
-    ).bind(MAX_PROJECTS + 1)
-    : env.DB.prepare(
-      `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-              p.target_date, p.created_at, p.updated_at
-         FROM projects p
-        WHERE EXISTS (
-          SELECT 1
-            FROM project_squad_access psa
-           WHERE psa.project_id = p.id
-             AND psa.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
-        )
-        ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
-        LIMIT ?2`,
-    ).bind(jsonIds(access.readableSquadIds ?? []), MAX_PROJECTS + 1)
+  const clauses: string[] = []
+  const values: (string | number)[] = []
+  if (!access.workspaceAdmin) {
+    clauses.push(`EXISTS (
+      SELECT 1
+        FROM project_squad_access psa
+       WHERE psa.project_id = p.id
+         AND psa.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+    )`)
+    values.push(jsonIds(access.readableSquadIds ?? []))
+  }
+  if (filters.status) {
+    clauses.push('p.status = ?')
+    values.push(filters.status)
+  }
+  if (filters.search) {
+    clauses.push('(instr(lower(p.name), lower(?)) > 0 OR instr(lower(p.goal), lower(?)) > 0)')
+    values.push(filters.search, filters.search)
+  }
+  const statement = env.DB.prepare(
+    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
+            p.target_date, p.created_at, p.updated_at
+       FROM projects p
+      ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
+      ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
+      LIMIT ?`,
+  ).bind(...values, MAX_PROJECTS + 1)
   const result = await statement.all<Project>()
   const rows = result.results ?? []
   return { projects: rows.slice(0, MAX_PROJECTS), capped: rows.length > MAX_PROJECTS }
@@ -246,14 +310,20 @@ async function loadListMetrics(
   }]))
 }
 
-export async function loadProjectsPage(env: Env, auth: AuthContext): Promise<ProjectsPageView> {
+export async function loadProjectsPage(
+  env: Env,
+  auth: AuthContext,
+  requestedFilters: ProjectListFilters = {},
+): Promise<ProjectsPageView> {
   const access = await projectAccess(env, auth)
-  const { projects: displayed, capped } = await loadVisibleProjects(env, access)
+  const search = requestedFilters.search?.trim() ?? ''
+  const status = requestedFilters.status ?? ''
+  const { projects: displayed, capped } = await loadVisibleProjects(env, access, { search, status })
   const metrics = await loadListMetrics(env, displayed.map((project) => project.id), access)
-  const visibleById = new Map(displayed.map((project) => [project.id, project]))
+  const displayedById = new Map(displayed.map((project) => [project.id, project]))
   const parentIds = [...new Set(displayed
     .map((project) => project.parent_project_id)
-    .filter((id): id is string => id !== null && !visibleById.has(id)))]
+    .filter((id): id is string => id !== null && !displayedById.has(id)))]
   const parentContexts = await loadParentContexts(env, parentIds)
   const rootIds = new Set<string>()
 
@@ -263,7 +333,7 @@ export async function loadProjectsPage(env: Env, auth: AuthContext): Promise<Pro
 
   const uncappedNodes = [...rootIds]
     .map((rootId): ProjectListNode | null => {
-      const fullRoot = visibleById.get(rootId)
+      const fullRoot = displayedById.get(rootId)
       const root = fullRoot ?? parentContexts.get(rootId)
       if (!root) return null
       const children = displayed
@@ -287,6 +357,8 @@ export async function loadProjectsPage(env: Env, auth: AuthContext): Promise<Pro
     nodes: uncappedNodes,
     visibleProjectCount: displayed.length,
     capped,
+    canManage: access.workspaceAdmin,
+    filters: { search, status },
   }
 }
 
@@ -416,7 +488,71 @@ export async function loadProjectDetail(
     situation,
     activity,
     evidence,
+    canManage: access.workspaceAdmin,
   }
+}
+
+export function projectFormValues(project?: Project): ProjectFormValues {
+  return {
+    slug: project?.slug ?? '',
+    name: project?.name ?? '',
+    description: project?.description ?? '',
+    goal: project?.goal ?? '',
+    parent_project_id: project?.parent_project_id ?? '',
+    target_date: project?.target_date ?? '',
+  }
+}
+
+export function submittedProjectFormValues(input: Record<string, unknown>): ProjectFormValues {
+  const text = (value: unknown): string => typeof value === 'string' ? value : ''
+  return {
+    slug: text(input.slug),
+    name: text(input.name),
+    description: text(input.description),
+    goal: text(input.goal),
+    parent_project_id: text(input.parent_project_id),
+    target_date: text(input.target_date),
+  }
+}
+
+export function projectMutationInput(values: ProjectFormValues): UpdateProjectInput {
+  return {
+    slug: values.slug,
+    name: values.name,
+    description: values.description,
+    goal: values.goal,
+    parent_project_id: values.parent_project_id || null,
+    target_date: values.target_date || null,
+  }
+}
+
+export function projectMutationStatus(error: ProjectMutationError): 400 | 404 | 409 {
+  if (error === 'project_not_found' || error === 'parent_not_found' || error === 'squad_not_found') return 404
+  if (
+    error === 'slug_taken'
+    || error === 'receipt_failed'
+    || error === 'hierarchy_depth'
+    || error === 'hierarchy_cycle'
+    || error === 'active_children'
+    || error === 'archived_project'
+  ) return 409
+  return 400
+}
+
+export async function loadProjectParentOptions(
+  env: Env,
+  currentProjectId?: string,
+): Promise<ProjectParentOption[]> {
+  const result = await env.DB.prepare(
+    `SELECT id, name
+       FROM projects
+      WHERE parent_project_id IS NULL
+        AND status <> 'archived'
+        AND (?1 IS NULL OR id <> ?1)
+      ORDER BY created_at, id
+      LIMIT ?2`,
+  ).bind(currentProjectId ?? null, MAX_PROJECTS).all<ProjectParentOption>()
+  return result.results ?? []
 }
 
 export async function loadProjectWorkContext(
@@ -636,18 +772,47 @@ function semanticDataTable(opts: {
   </div>`
 }
 
+function statusLabel(status: ProjectStatus): string {
+  return status.charAt(0).toUpperCase() + status.slice(1)
+}
+
+function projectsControls(view: ProjectsPageView): Html {
+  return html`<div style="display:flex;flex-wrap:wrap;align-items:end;justify-content:space-between;gap:12px;margin:16px 0;">
+    <form method="get" action="/projects" style="display:flex;flex:1 1 34rem;flex-wrap:wrap;align-items:end;gap:10px;min-width:0;">
+      <label style="display:grid;gap:5px;flex:1 1 16rem;min-width:min(100%,12rem);">
+        <span class="ui-panel-sub">Search</span>
+        <input name="search" type="search" value="${view.filters.search}" placeholder="Name or goal" style="box-sizing:border-box;width:100%;min-width:0;">
+      </label>
+      <label style="display:grid;gap:5px;flex:0 1 12rem;min-width:min(100%,10rem);">
+        <span class="ui-panel-sub">Status</span>
+        <select name="status" style="box-sizing:border-box;width:100%;min-width:0;">
+          <option value=""${view.filters.status === '' ? raw(' selected') : raw('')}>All statuses</option>
+          ${PROJECT_STATUSES.map((status) => html`<option value="${status}"${view.filters.status === status ? raw(' selected') : raw('')}>${statusLabel(status)}</option>`)}
+        </select>
+      </label>
+      <button class="btn secondary" type="submit">Filter</button>
+    </form>
+    ${view.canManage ? html`<a class="btn" href="/projects/new">Create project</a>` : ''}
+  </div>`
+}
+
 export function projectsPageBody(view: ProjectsPageView) {
+  const header = html`${pageHeader({
+    crumbs: 'Workspace / Projects',
+    title: 'Projects',
+    sub: 'Goals, squads, work, and evidence organized around durable outcomes.',
+  })}${projectsControls(view)}`
   if (!view.nodes.length) {
     return html`
-      ${pageHeader({
-        crumbs: 'Workspace / Projects',
-        title: 'Projects',
-        sub: 'Goals, squads, work, and evidence organized around durable outcomes.',
-      })}
+      ${header}
       ${emptyState({
         title: 'No projects available',
-        detail: 'No project is currently visible to this account.',
-        hint: 'No project data is fabricated. Ask a workspace administrator to connect one of your squads.',
+        detail: view.filters.search || view.filters.status
+          ? 'No visible project matches the current filters.'
+          : 'No project is currently visible to this account.',
+        hint: view.filters.search || view.filters.status
+          ? 'Clear or adjust the search and status filters.'
+          : 'No project data is fabricated. Ask a workspace administrator to connect one of your squads.',
       })}`
   }
 
@@ -681,11 +846,8 @@ export function projectsPageBody(view: ProjectsPageView) {
   })
 
   return html`
-    ${pageHeader({
-      crumbs: 'Workspace / Projects',
-      title: 'Projects',
-      sub: `${view.visibleProjectCount}${view.capped ? '+' : ''} visible project${view.visibleProjectCount === 1 ? '' : 's'} across root and child levels.`,
-    })}
+    ${header}
+    <p class="ui-panel-sub">${view.visibleProjectCount}${view.capped ? '+' : ''} matching visible project${view.visibleProjectCount === 1 ? '' : 's'} across root and child levels.</p>
     ${sectionPanel({
       title: 'Project workspace',
       body: semanticDataTable({
@@ -702,6 +864,122 @@ export function projectsPageBody(view: ProjectsPageView) {
       }),
     })}
     ${view.capped ? html`<p class="ui-panel-sub">Showing the first ${MAX_PROJECTS} visible projects.</p>` : ''}`
+}
+
+function projectMutationMessage(error: ProjectMutationError): string {
+  const messages: Record<ProjectMutationError, string> = {
+    invalid_slug: 'Use a lowercase slug with letters, numbers, and hyphens.',
+    invalid_name: 'Enter a project name.',
+    invalid_status: 'Choose a valid project status action.',
+    invalid_target_date: 'Enter a valid target date.',
+    slug_taken: 'That project slug is already in use.',
+    project_not_found: 'The project no longer exists.',
+    parent_not_found: 'The selected parent project was not found.',
+    hierarchy_depth: 'Projects can only be nested one level deep.',
+    hierarchy_cycle: 'A project cannot be moved beneath itself.',
+    active_children: 'Archive or move active child projects first.',
+    archived_project: 'Restore the archived project before changing its metadata.',
+    squad_not_found: 'A connected squad was not found.',
+    invalid_access_level: 'A connected squad has an invalid access level.',
+    receipt_failed: 'The project changed concurrently. Reload and try again.',
+  }
+  return messages[error]
+}
+
+function projectMetadataForm(opts: {
+  action: string
+  values: ProjectFormValues
+  parentOptions: ProjectParentOption[]
+  submitLabel: string
+  error?: ProjectMutationError
+}): Html {
+  const unavailableParent = opts.values.parent_project_id
+    && !opts.parentOptions.some((parent) => parent.id === opts.values.parent_project_id)
+  return html`<form method="post" action="${opts.action}" style="display:grid;gap:16px;padding:16px 0;border-top:1px solid var(--border);">
+    ${opts.error ? html`<p role="alert" style="margin:0;color:var(--danger,#c0392b);">${projectMutationMessage(opts.error)}</p>` : ''}
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr));gap:14px;min-width:0;">
+      <label style="display:grid;gap:5px;min-width:0;">
+        <span class="ui-panel-sub">Name</span>
+        <input name="name" required value="${opts.values.name}" style="box-sizing:border-box;width:100%;min-width:0;">
+      </label>
+      <label style="display:grid;gap:5px;min-width:0;">
+        <span class="ui-panel-sub">Slug</span>
+        <input name="slug" required value="${opts.values.slug}" pattern="[a-z0-9]+(?:-[a-z0-9]+)*" style="box-sizing:border-box;width:100%;min-width:0;">
+      </label>
+      <label style="display:grid;gap:5px;min-width:0;">
+        <span class="ui-panel-sub">Parent</span>
+        <select name="parent_project_id" style="box-sizing:border-box;width:100%;min-width:0;">
+          <option value=""${opts.values.parent_project_id === '' ? raw(' selected') : raw('')}>No parent</option>
+          ${unavailableParent ? html`<option value="${opts.values.parent_project_id}" selected>Unavailable parent: ${opts.values.parent_project_id}</option>` : ''}
+          ${opts.parentOptions.map((parent) => html`<option value="${parent.id}"${opts.values.parent_project_id === parent.id ? raw(' selected') : raw('')}>${parent.name}</option>`)}
+        </select>
+      </label>
+      <label style="display:grid;gap:5px;min-width:0;">
+        <span class="ui-panel-sub">Target date</span>
+        <input name="target_date" type="date" value="${opts.values.target_date}" style="box-sizing:border-box;width:100%;min-width:0;">
+      </label>
+    </div>
+    <label style="display:grid;gap:5px;min-width:0;">
+      <span class="ui-panel-sub">Goal</span>
+      <textarea name="goal" rows="3" style="box-sizing:border-box;width:100%;min-width:0;resize:vertical;">${opts.values.goal}</textarea>
+    </label>
+    <label style="display:grid;gap:5px;min-width:0;">
+      <span class="ui-panel-sub">Description</span>
+      <textarea name="description" rows="4" style="box-sizing:border-box;width:100%;min-width:0;resize:vertical;">${opts.values.description}</textarea>
+    </label>
+    <div><button class="btn" type="submit">${opts.submitLabel}</button></div>
+  </form>`
+}
+
+export function projectCreateBody(view: ProjectFormView): Html {
+  return html`${pageHeader({
+    crumbs: 'Workspace / Projects',
+    title: 'Create project',
+    sub: 'Create a planned project, then activate it when work is ready to begin.',
+  })}${projectMetadataForm({
+    action: '/projects',
+    values: view.values,
+    parentOptions: view.parentOptions,
+    submitLabel: 'Create project',
+    error: view.error,
+  })}`
+}
+
+export function projectSettingsBody(view: ProjectSettingsView): Html {
+  const projectPath = `/projects/${encodeURIComponent(view.project.id)}`
+  const lifecycleCommands = ['activate', 'pause', 'complete', 'archive', 'restore']
+  const unavailableCommand = view.lifecycleCommand && !lifecycleCommands.includes(view.lifecycleCommand)
+  return html`${pageHeader({
+    crumbs: `Projects / ${view.project.name}`,
+    title: 'Project settings',
+    sub: 'Update project metadata, hierarchy, and lifecycle status.',
+    badge: view.project.status,
+    badgeTone: statusTone(view.project.status),
+  })}
+  ${projectMetadataForm({
+    action: `${projectPath}/settings`,
+    values: view.values,
+    parentOptions: view.parentOptions,
+    submitLabel: 'Save settings',
+    error: view.error,
+  })}
+  <section aria-labelledby="project-lifecycle-title" style="padding:16px 0;border-top:1px solid var(--border);">
+    <h2 id="project-lifecycle-title" class="ui-panel-title">Lifecycle</h2>
+    <form method="post" action="${projectPath}/status" style="display:flex;flex-wrap:wrap;align-items:end;gap:10px;margin-top:12px;">
+      <label style="display:grid;gap:5px;flex:1 1 16rem;min-width:min(100%,12rem);">
+        <span class="ui-panel-sub">Action</span>
+        <select name="command" style="box-sizing:border-box;width:100%;min-width:0;">
+          ${unavailableCommand ? html`<option value="${view.lifecycleCommand}" selected>Unavailable action: ${view.lifecycleCommand}</option>` : ''}
+          <option value="activate"${view.lifecycleCommand === 'activate' ? raw(' selected') : raw('')}>Activate</option>
+          <option value="pause"${view.lifecycleCommand === 'pause' ? raw(' selected') : raw('')}>Pause</option>
+          <option value="complete"${view.lifecycleCommand === 'complete' ? raw(' selected') : raw('')}>Complete</option>
+          <option value="archive"${view.lifecycleCommand === 'archive' ? raw(' selected') : raw('')}>Archive</option>
+          <option value="restore"${view.lifecycleCommand === 'restore' ? raw(' selected') : raw('')}>Restore to planned</option>
+        </select>
+      </label>
+      <button class="btn" type="submit">Apply status</button>
+    </form>
+  </section>`
 }
 
 function projectTabs() {
@@ -727,8 +1005,19 @@ function projectTabs() {
   </script>`
 }
 
-export function projectDetailBody(view: ProjectDetailView) {
+const PROJECT_RESULT_MESSAGES: Readonly<Record<string, string>> = {
+  created: 'Project created.',
+  updated: 'Project settings saved.',
+  activated: 'Project activated.',
+  paused: 'Project paused.',
+  completed: 'Project completed.',
+  archived: 'Project archived.',
+  restored: 'Project restored to planned.',
+}
+
+export function projectDetailBody(view: ProjectDetailView, statusResult?: string) {
   const { project, parent, aggregates, situation } = view
+  const resultMessage = statusResult ? PROJECT_RESULT_MESSAGES[statusResult] : undefined
   const workLinks = html`<span style="display:flex;flex-wrap:wrap;gap:8px;">
     <a class="ui-link" href="/send?project_id=${encodeURIComponent(project.id)}">Project tasks</a>
     <a class="ui-link" href="/flights?project_id=${encodeURIComponent(project.id)}">Project flights</a>
@@ -742,6 +1031,8 @@ export function projectDetailBody(view: ProjectDetailView) {
       badge: project.status,
       badgeTone: statusTone(project.status),
     })}
+    ${resultMessage ? html`<p role="status" style="margin:8px 0;color:var(--ok,#16a34a);">${resultMessage}</p>` : ''}
+    ${view.canManage ? html`<div style="display:flex;justify-content:flex-end;margin:8px 0;"><a class="btn secondary sm" href="/projects/${encodeURIComponent(project.id)}/settings">Project settings</a></div>` : ''}
     ${projectTabs()}
     ${operatingSituationBand(project, aggregates, situation)}
     <section id="work" aria-label="Work">
