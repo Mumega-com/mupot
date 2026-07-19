@@ -52,6 +52,38 @@ const validate = (metaModule as Record<string, unknown>).validateFlightMetaRefer
   | undefined
 
 describe('parseFlightMetaV1', () => {
+  it('accepts bounded Routine correlation and rejects malformed revisions', () => {
+    const correlated = { ...meta, routine_run_id: 'run-1', routine_revision: 2 }
+    expect(metaModule.parseFlightMetaV1(correlated)).toMatchObject(correlated)
+    expect(metaModule.parseFlightMetaV1({ ...correlated, routine_revision: 0 })).toBeNull()
+    expect(metaModule.parseFlightMetaV1({ ...correlated, routine_revision: 1.5 })).toBeNull()
+    expect(metaModule.parseFlightMetaV1({ ...correlated, routine_run_id: ' ' })).toBeNull()
+  })
+
+  it('keeps TypeScript and SQL validation aligned for Routine correlation', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      sqlite.exec('CREATE TABLE flights (meta TEXT NOT NULL)')
+      const insert = sqlite.prepare('INSERT INTO flights (meta) VALUES (?)')
+      const values = [
+        [{ ...meta, routine_run_id: 'run-1', routine_revision: 1 }, true],
+        [{ ...meta, routine_run_id: '', routine_revision: 1 }, false],
+        [{ ...meta, routine_run_id: 'run-1', routine_revision: 0 }, false],
+      ] as const
+      for (const [value, expected] of values) {
+        sqlite.exec('DELETE FROM flights')
+        insert.run(JSON.stringify(value))
+        const sql = sqlite.prepare(`
+          SELECT COUNT(*) AS count FROM flights f WHERE 1 = 1 ${canonicalFlightMetaSql('f')}
+        `).get() as { count: number }
+        expect(metaModule.parseFlightMetaV1(value) !== null).toBe(expected)
+        expect(sql.count === 1).toBe(expected)
+      }
+    } finally {
+      close()
+    }
+  })
+
   it('applies field limits in UTF-8 bytes', () => {
     const persianCharacter = '\u06a9'
     expect(metaModule.parseFlightMetaV1({ ...meta, goal_id: persianCharacter.repeat(100) })).not.toBeNull()

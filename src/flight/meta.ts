@@ -17,6 +17,8 @@ export interface FlightMetaV1 {
   confidentiality: FlightConfidentiality
   publication_target: FlightPublicationTarget
   parent_flight_id: string | null
+  routine_run_id?: string
+  routine_revision?: number
 }
 
 const KEYS = new Set<keyof FlightMetaV1>([
@@ -31,6 +33,8 @@ const KEYS = new Set<keyof FlightMetaV1>([
   'confidentiality',
   'publication_target',
   'parent_flight_id',
+  'routine_run_id',
+  'routine_revision',
 ])
 
 function boundedString(value: unknown, max: number): value is string {
@@ -62,6 +66,8 @@ export function parseFlightMetaV1(raw: unknown): FlightMetaV1 | null {
   if (!['private', 'internal', 'public-projection'].includes(meta.confidentiality as string)) return null
   if (!['none', 'inkwell-draft', 'mumega.com'].includes(meta.publication_target as string)) return null
   if (meta.parent_flight_id !== null && !boundedString(meta.parent_flight_id, 200)) return null
+  if (meta.routine_run_id !== undefined && !boundedString(meta.routine_run_id, 200)) return null
+  if (meta.routine_revision !== undefined && (!Number.isInteger(meta.routine_revision) || Number(meta.routine_revision) < 1)) return null
 
   return {
     schema: FLIGHT_META_V1_SCHEMA,
@@ -75,6 +81,8 @@ export function parseFlightMetaV1(raw: unknown): FlightMetaV1 | null {
     confidentiality: meta.confidentiality as FlightConfidentiality,
     publication_target: meta.publication_target as FlightPublicationTarget,
     parent_flight_id: meta.parent_flight_id,
+    ...(meta.routine_run_id === undefined ? {} : { routine_run_id: meta.routine_run_id }),
+    ...(meta.routine_revision === undefined ? {} : { routine_revision: Number(meta.routine_revision) }),
   }
 }
 

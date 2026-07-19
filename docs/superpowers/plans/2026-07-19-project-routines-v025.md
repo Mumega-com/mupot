@@ -172,7 +172,7 @@ expect(summary.scanned).toBeLessThanOrEqual(100)
 - Dispatch envelope is exactly `routine.run/v1` with `run_id`, `project_id`, `routine_revision`, `objective`, `situation_digest`, `mcp_endpoint`, and `proposal_schema`.
 - Existing agent inbox and Flight are the only runtime boundary; no Claude, Codex, Hermes, or DeerFlow scheduler/session API is imported.
 
-- [ ] **Step 1: Write tests for preferred-agent selection, capability-aware fallback, no eligible agent, offline/inbox-full retry, exact Project attribution, stable inbox request ID, Task/Flight references, and absence of credentials/runtime thread IDs.**
+- [x] **Step 1: Write tests for preferred-agent selection, capability-aware fallback, no eligible agent, offline/inbox-full retry, exact Project attribution, stable inbox request ID, Task/Flight references, and absence of credentials/runtime thread IDs.**
 
 ```ts
 expect(JSON.parse(message.body)).toMatchObject({
@@ -182,11 +182,11 @@ expect(JSON.parse(message.body)).toMatchObject({
 expect(message.body).not.toMatch(/token|credential|thread_id/i)
 ```
 
-- [ ] **Step 2: Run `npx vitest run tests/routine-dispatch.test.ts` and verify import failure.**
-- [ ] **Step 3: Implement canonical Situation hashing, responsible-squad eligibility, Task creation through `createTask`, Flight creation through `createFlight`, and delivery through `sendAgentMessage`.**
-- [ ] **Step 4: Add only Routine correlation fields to the existing canonical Flight metadata contract and preserve all existing runtime adapter tests.**
-- [ ] **Step 5: Run dispatch, project attribution, inbox, Flight, runtime adapter, and typecheck suites.**
-- [ ] **Step 6: Commit with `git commit -m "feat: dispatch routine runs to attached agents"`.**
+- [x] **Step 2: Run `npx vitest run tests/routine-dispatch.test.ts` and verify import failure.**
+- [x] **Step 3: Implement canonical Situation hashing, responsible-squad eligibility, Task creation through `createTask`, Flight creation through `createFlight`, and delivery through `sendAgentMessage`.**
+- [x] **Step 4: Add only Routine correlation fields to the existing canonical Flight metadata contract and preserve all existing runtime adapter tests.**
+- [x] **Step 5: Run dispatch, project attribution, inbox, Flight, runtime adapter, and typecheck suites.**
+- [x] **Step 6: Commit with `git commit -m "feat: dispatch routine runs to attached agents"`.**
 
 ### Task 6: Proposal Validation and Governed Actions
 

@@ -47,7 +47,8 @@ export function canonicalFlightMetaSql(flightAlias: string): string {
         FROM json_each(${safeMeta}) meta_key
        WHERE meta_key.key NOT IN (
          'schema', 'goal_id', 'objective_id', 'squad_ids', 'task_ids', 'done_when',
-         'artifact_refs', 'receipt_refs', 'confidentiality', 'publication_target', 'parent_flight_id'
+         'artifact_refs', 'receipt_refs', 'confidentiality', 'publication_target', 'parent_flight_id',
+         'routine_run_id', 'routine_revision'
        )
     )
     AND NOT EXISTS (
@@ -72,5 +73,19 @@ export function canonicalFlightMetaSql(flightAlias: string): string {
     AND (
       json_type(${safeMeta}, '$.parent_flight_id') = 'null'
       OR (${boundedTextSql(parentFlightId, 200)})
+    )
+    AND (
+      json_type(${safeMeta}, '$.routine_run_id') IS NULL
+      OR (
+        json_type(${safeMeta}, '$.routine_run_id') = 'text'
+        AND ${boundedTextSql(`json_extract(${safeMeta}, '$.routine_run_id')`, 200)}
+      )
+    )
+    AND (
+      json_type(${safeMeta}, '$.routine_revision') IS NULL
+      OR (
+        json_type(${safeMeta}, '$.routine_revision') = 'integer'
+        AND json_extract(${safeMeta}, '$.routine_revision') > 0
+      )
     )`
 }

@@ -103,7 +103,7 @@ wrangler login                 # authenticate to YOUR Cloudflare account
 #    Idempotent — safe to re-run; ids are written back into wrangler.toml.
 bash scripts/setup.sh
 
-# 3. Set TENANT_SLUG + BRAND (+ OAUTH_PROVIDER) in wrangler.toml [vars].
+# 3. Set TENANT_SLUG + BRAND + PUBLIC_ORIGIN (+ OAUTH_PROVIDER) in wrangler.toml [vars].
 
 # 4. First deploy (creates the Worker so secrets can attach to it).
 npm run deploy

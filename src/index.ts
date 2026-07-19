@@ -217,6 +217,7 @@ import { runGrowthCollection } from './departments/collectors/growth-cron'
 import { runCroCollection } from './cro/collect'
 import { flushFlightEventOutbox } from './flight/service'
 import { runRoutineScheduler, shouldRunMaintenanceHeartbeat } from './routines/scheduler'
+import { dispatchRoutineRun } from './routines/dispatch'
 
 export default {
   // The OAuth provider is the outer entry point. It handles OAuth paths and
@@ -237,7 +238,15 @@ export default {
 
     waitFor(
       'project-routines',
-      runRoutineScheduler(env, scheduledAt, `routine-cron:${scheduledAt.toISOString()}`),
+      runRoutineScheduler(
+        env,
+        scheduledAt,
+        `routine-cron:${scheduledAt.toISOString()}`,
+        async (runId) => {
+          const result = await dispatchRoutineRun(env, runId, scheduledAt)
+          if (!result.ok) throw new Error(`routine_dispatch:${result.error}`)
+        },
+      ),
     )
     if (!shouldRunMaintenanceHeartbeat(scheduledAt)) return
 

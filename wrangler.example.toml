@@ -13,6 +13,9 @@ compatibility_flags = ["nodejs_compat"]
 TENANT_SLUG = "mumega"          # your org slug
 BRAND = "Mumega"                   # dashboard brand
 OAUTH_PROVIDER = "google"         # google | telegram
+# Required for Project Routine dispatch; scheduled work has no request Host to derive safely.
+# Set this to the canonical public origin of this pot before enabling a Routine.
+# PUBLIC_ORIGIN = "https://mupot.example.com"
 FLEET_PROJECT = "sos"             # bus project the fleet window addresses (company fleet = sos, not the mumega slug)
 FLEET_OPS_AGENT = "kasra"         # ops agent that executes control requests (explicit — resolvers fail closed, no code default)
 # secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN.

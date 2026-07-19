@@ -15,6 +15,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const MIGRATIONS_DIR = join(import.meta.dirname, '..', 'migrations')
 const NOW = new Date('2026-07-19T16:00:00.000Z')
+const DISPATCH_NOW = new Date('2026-07-19T16:01:00.000Z')
 
 function makeHarness(): SqliteD1Harness {
   const harness = createSqliteD1()
@@ -384,7 +385,7 @@ describe('routine scheduler', () => {
       id: 'run-due', routineId: 'routine-2', attempt: 1, retryAt: '2026-07-19T15:59:00.000Z',
     })
 
-    const summary = await runRoutineScheduler(envFor(harness), NOW, 'worker-a', async () => undefined)
+    const summary = await runRoutineScheduler(envFor(harness), DISPATCH_NOW, 'worker-a', async () => undefined)
 
     expect(summary.claimed).toBe(1)
     expect(harness.sqlite.prepare('SELECT status FROM routine_runs WHERE id = ?').get('run-future')).toEqual({ status: 'queued' })
@@ -399,7 +400,7 @@ describe('routine scheduler', () => {
       retryAt: '2026-07-19T15:59:00.000Z',
     })
 
-    const summary = await runRoutineScheduler(envFor(harness), NOW, 'worker-a', async () => undefined)
+    const summary = await runRoutineScheduler(envFor(harness), DISPATCH_NOW, 'worker-a', async () => undefined)
 
     expect(summary.claimed).toBe(0)
     expect(harness.sqlite.prepare(
@@ -420,6 +421,22 @@ describe('routine scheduler', () => {
     expect(harness.sqlite.prepare('SELECT status, attempt FROM routine_runs WHERE id = ?').get('run-1')).toEqual({
       status: 'queued', attempt: 0,
     })
+  })
+
+  it('reserves canonical maintenance heartbeats by leaving queued work unclaimed', async () => {
+    harness = makeHarness()
+    seedRoutine(harness, { id: 'routine-1', dueAt: '2026-07-19T17:00:00.000Z' })
+    seedRun(harness, { id: 'run-1', routineId: 'routine-1' })
+    const processed: string[] = []
+
+    const summary = await runRoutineScheduler(envFor(harness), NOW, 'worker-a', async runId => {
+      processed.push(runId)
+    })
+
+    expect(summary.queued_scanned).toBe(0)
+    expect(summary.claimed).toBe(0)
+    expect(processed).toEqual([])
+    expect(harness.sqlite.prepare('SELECT status FROM routine_runs WHERE id = ?').get('run-1')).toEqual({ status: 'queued' })
   })
 
   it('keeps a newer queued occurrence behind an earlier run in backoff', async () => {
@@ -454,7 +471,7 @@ describe('routine scheduler', () => {
     })
     const processed: string[] = []
 
-    const summary = await runRoutineScheduler(envFor(harness), NOW, 'worker-a', async runId => {
+    const summary = await runRoutineScheduler(envFor(harness), DISPATCH_NOW, 'worker-a', async runId => {
       processed.push(runId)
     })
 

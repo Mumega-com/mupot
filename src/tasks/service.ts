@@ -100,6 +100,10 @@ export interface CreateTaskInput {
 
 export interface CreateTaskOptions {
   actor?: TaskActor
+  /** Internal deterministic identity for crash-safe control-plane replay. */
+  id?: string
+  /** Persist without a task.created runtime wake when another durable dispatch owns activation. */
+  skipEvent?: boolean
   // Skip the outbound GitHub-issue mirror. Set for tasks that ORIGINATE from a GitHub
   // event (the inbound webhook) — mirroring a GitHub event back into a GitHub issue is
   // redundant AND reflects attacker-influenced PR/CI fields out under our token (a loop
@@ -474,7 +478,7 @@ export async function createTask(
 
   const now = new Date().toISOString()
   const task: Task = {
-    id: crypto.randomUUID(),
+    id: options.id ?? crypto.randomUUID(),
     squad_id: input.squad_id,
     project_id: projectId,
     title: input.title.trim(),
@@ -533,7 +537,7 @@ export async function createTask(
     }
   }
 
-  await emitTaskEvent(env, 'task.created', task, options.actor)
+  if (!options.skipEvent) await emitTaskEvent(env, 'task.created', task, options.actor)
   return task
 }
 

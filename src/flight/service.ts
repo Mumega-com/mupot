@@ -52,6 +52,11 @@ export interface NewFlight {
   meta?: FlightMetaV1
 }
 
+export interface CreateFlightOptions {
+  /** Internal deterministic identity for crash-safe control-plane replay. */
+  id?: string
+}
+
 export type FlightProjectErrorCode =
   | 'invalid_project_id'
   | 'invalid_flight_meta'
@@ -132,9 +137,9 @@ function mapFlightProjectInsertError(error: unknown): never {
 }
 
 // Create a flight in `preflight` — it has not launched; the gate decides next.
-export async function createFlight(env: Env, f: NewFlight): Promise<string> {
+export async function createFlight(env: Env, f: NewFlight, options: CreateFlightOptions = {}): Promise<string> {
   await validateFlightProjectAttribution(env, f)
-  const id = crypto.randomUUID()
+  const id = options.id ?? crypto.randomUUID()
   try {
     await env.DB.prepare(
       `INSERT INTO flights (id, tenant, project_id, agent, goal, status, trigger_source, budget_micro_usd, meta)

@@ -7,7 +7,7 @@ import type { Routine, RoutinePolicySnapshot, RoutineSchedule } from './types'
 // bounded below that ceiling before an external dispatch processor does any work.
 export const MAX_DUE_ROUTINES_PER_TICK = 2
 export const MAX_RECOVERIES_PER_TICK = 2
-export const MAX_CLAIMS_PER_TICK = 2
+export const MAX_CLAIMS_PER_TICK = 1
 export const MAX_SCHEDULER_DB_STATEMENTS = 3
   + MAX_RECOVERIES_PER_TICK * 2
   + MAX_DUE_ROUTINES_PER_TICK * 3
@@ -448,7 +448,7 @@ export async function runRoutineScheduler(
     if (occurrence.skipped) occurrencesSkipped++
   }
 
-  const queued = processClaimed
+  const queued = processClaimed && !shouldRunMaintenanceHeartbeat(now)
     ? await env.DB.prepare(
       `SELECT rr.id FROM routine_runs rr
         WHERE rr.tenant = ? AND rr.status = 'queued'

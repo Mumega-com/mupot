@@ -248,8 +248,10 @@ minute. Excess work remains due for the next heartbeat. It never scans an unboun
 tenant table.
 
 The v0.25 implementation uses a smaller operational batch of two recoveries, two
-due Routines, and two claim candidates per heartbeat. This keeps scheduler control
-work at or below 25 D1 statements before dispatch, leaving headroom under the
+due Routines, and one claim candidate per non-maintenance heartbeat. Canonical
+fifteen-minute maintenance heartbeats create and recover occurrences but do not
+claim dispatch work. This keeps scheduler control work at or below 19 D1 statements
+before dispatch, leaving headroom under the
 Workers Free query limit. The public contract remains a hard maximum of 100; batch
 sizes may increase only with an explicit invocation-budget calculation and tests.
 
