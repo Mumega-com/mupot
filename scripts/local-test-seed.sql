@@ -273,8 +273,9 @@ INSERT INTO tasks (
   workflow_instance_id, done_when
 ) VALUES
   ('task-open-local', 'sq-growth', NULL, 'Open local smoke task', 'Verify the local dashboard can be reached.', 'open', 'agent-hermes', NULL, datetime('now','-90 minutes'), datetime('now','-80 minutes'), NULL, NULL, NULL, 12000, NULL, 'The local dashboard home returns HTTP 200.'),
+  ('task-blocked-local', 'sq-growth', 'project-mupot', 'Resolve local parity blocker', 'The local project situation must show a blocked task before evidence can pass.', 'blocked', 'agent-growth', NULL, datetime('now','-75 minutes'), datetime('now','-45 minutes'), 'Waiting for the dashboard, REST, and MCP situation receipts to agree.', NULL, NULL, 15000, NULL, 'The parity evidence records one shared Project situation.'),
   ('task-progress-local', 'sq-growth', 'project-mupot', 'In-progress local task', 'Exercise the browser crawl against authenticated pages.', 'in_progress', 'agent-hermes', NULL, datetime('now','-70 minutes'), datetime('now','-40 minutes'), NULL, NULL, NULL, 25000, NULL, 'The browser smoke report lists every dashboard page as passed.'),
-  ('task-review-local', 'sq-growth', NULL, 'Review local approval task', 'Seeded row for the approvals and gate queue.', 'review', 'agent-growth', NULL, datetime('now','-55 minutes'), datetime('now','-20 minutes'), 'Draft result ready for approval.', NULL, 'gate:local', 9000, NULL, 'A reviewer approves or rejects this seeded local task.'),
+  ('task-review-local', 'sq-growth', 'project-mupot', 'Review local approval task', 'Seeded row for the approvals and gate queue.', 'review', 'agent-growth', NULL, datetime('now','-55 minutes'), datetime('now','-20 minutes'), 'Draft result ready for approval.', NULL, 'gate:local', 9000, NULL, 'A reviewer approves or rejects this seeded local task.'),
   ('task-done-local', 'sq-growth', 'project-mupot', 'Done local task', 'Seeded completed task for observatory history.', 'done', 'agent-hermes', NULL, datetime('now','-4 hours'), datetime('now','-3 hours'), 'Completed local baseline.', datetime('now','-3 hours'), NULL, 43000, NULL, 'The local seed data is visible in the dashboard.')
 ON CONFLICT(id) DO UPDATE SET
   project_id = excluded.project_id,
@@ -347,10 +348,11 @@ VALUES
 
 INSERT OR REPLACE INTO fleet_agents (
   agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status,
-  reported_by, last_reported_at, updated_at, agent_type, member_id
+  reported_by, last_reported_at, updated_at, agent_type, member_id, host
 ) VALUES
-  ('hermes-local', 'local', 'Hermes Local Relay', 'hermes-cron', '["growth"]', 'always_on', NULL, 'running', 'local-seed', datetime('now'), datetime('now'), 'comms', 'mbr-hermes-user'),
-  ('codex-local', 'local', 'Codex Local Builder', 'codex', '["growth"]', 'on_demand', NULL, 'stopped', 'local-seed', datetime('now','-2 hours'), datetime('now','-2 hours'), 'builder', NULL);
+  ('agent-hermes', 'local', 'Hermes Local Relay', 'hermes-cron', '["growth"]', 'always_on', NULL, 'running', 'local-seed', datetime('now'), datetime('now'), 'comms', 'mbr-hermes-user', 'local-hermes-host'),
+  ('agent-growth', 'local', 'Growth Lead Local', 'codex', '["growth"]', 'on_demand', NULL, 'stopped', 'local-seed', datetime('now','-2 hours'), datetime('now','-2 hours'), 'builder', NULL, 'local-growth-host'),
+  ('agent-conformance', 'local', 'Runtime Conformance Local', 'systemd-user', '["growth"]', 'always_on', NULL, 'running', 'local-seed', datetime('now','-10 minutes'), datetime('now','-10 minutes'), 'generic', 'mbr-conformance-runtime', 'local-conformance-host');
 
 INSERT OR REPLACE INTO presence (tenant, member_id, display_name, source, label, first_seen_at, last_seen_at, agent_id)
 VALUES ('local', 'mbr-hermes-user', 'Hermes Test Operator', 'hermes', 'local relay', datetime('now','-1 hour'), datetime('now'), 'agent-hermes');

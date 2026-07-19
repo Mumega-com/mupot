@@ -1,8 +1,35 @@
 import { createHash } from 'node:crypto'
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { Hono } from 'hono'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+
+const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
+
+vi.mock('../src/auth', () => ({
+  requireAuth: async (
+    c: {
+      get: (key: 'auth') => AuthContext | undefined
+      set: (key: 'auth', value: AuthContext) => void
+      json: (body: unknown, status: 401) => Response
+    },
+    next: () => Promise<void>,
+  ) => {
+    if (!authState.current) return c.json({ error: 'unauthenticated' }, 401)
+    c.set('auth', authState.current)
+    await next()
+  },
+}))
+
+const { projectsApp } = await import('../src/projects')
+const { invokeTool } = await import('../src/mcp')
+const { loadProjectDetail, projectDetailBody } = await import('../src/dashboard/projects')
+const { getFleetAgentRuntimeStates } = await import('../src/fleet/registry')
+
+const projectApi = new Hono<{ Bindings: Env }>()
+projectApi.route('/api/projects', projectsApp)
 
 const REPO_ROOT = join(__dirname, '..')
 const MIGRATIONS_DIR = join(REPO_ROOT, 'migrations')
@@ -19,7 +46,25 @@ function createSeededDatabase() {
   return harness
 }
 
+function owner(): AuthContext {
+  return {
+    userId: 'usr-local-owner',
+    memberId: 'mbr-local-admin',
+    email: 'local-owner@mupot.test',
+    role: 'owner',
+    tenant: 'local',
+  }
+}
+
+function envFor(harness: ReturnType<typeof createSeededDatabase>): Env {
+  return { DB: harness.db, TENANT_SLUG: 'local', BRAND: 'Mupot' } as Env
+}
+
 describe('local project workspace showcase', () => {
+  afterEach(() => {
+    authState.current = null
+  })
+
   it('seeds the signed inbox fence required by runtime conformance after browser evidence', () => {
     const harness = createSeededDatabase()
     try {
@@ -130,10 +175,11 @@ describe('local project workspace showcase', () => {
         WHERE id LIKE 'task-%-local'
         ORDER BY id
       `).all()).toEqual([
+        { id: 'task-blocked-local', project_id: 'project-mupot' },
         { id: 'task-done-local', project_id: 'project-mupot' },
         { id: 'task-open-local', project_id: null },
         { id: 'task-progress-local', project_id: 'project-mupot' },
-        { id: 'task-review-local', project_id: null },
+        { id: 'task-review-local', project_id: 'project-mupot' },
       ])
       const flights = harness.sqlite.prepare(`
         SELECT id, project_id, meta FROM flights
@@ -160,6 +206,68 @@ describe('local project workspace showcase', () => {
           task_ids: ['task-progress-local'],
         },
       ])
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('seeds full Mupot situation parity across REST, MCP, and the dashboard', async () => {
+    const harness = createSeededDatabase()
+    try {
+      expect(harness.sqlite.prepare(`
+        SELECT id, status, project_id
+        FROM tasks
+        WHERE project_id = 'project-mupot'
+        ORDER BY id
+      `).all()).toEqual([
+        { id: 'task-blocked-local', status: 'blocked', project_id: 'project-mupot' },
+        { id: 'task-done-local', status: 'done', project_id: 'project-mupot' },
+        { id: 'task-progress-local', status: 'in_progress', project_id: 'project-mupot' },
+        { id: 'task-review-local', status: 'review', project_id: 'project-mupot' },
+      ])
+
+      const env = envFor(harness)
+      const auth = owner()
+      authState.current = auth
+
+      const restResponse = await projectApi.fetch(
+        new Request('https://pot.test/api/projects/project-mupot'),
+        env,
+      )
+      expect(restResponse.status).toBe(200)
+      const rest = await restResponse.json() as { situation: unknown }
+
+      const mcp = await invokeTool(auth, env, 'project_get', { project_id: 'project-mupot' }, 'https://pot.test')
+      expect(mcp.ok).toBe(true)
+      const mcpSituation = (mcp.result as { situation: unknown }).situation
+
+      const dashboard = await loadProjectDetail(env, auth, 'project-mupot')
+      expect(dashboard).not.toBeNull()
+      expect(dashboard?.situation).toEqual(rest.situation)
+      expect(mcpSituation).toEqual(rest.situation)
+      expect(rest.situation).toMatchObject({
+        health: 'blocked',
+        blockers: [{ id: 'task-blocked-local' }],
+        pending_reviews: [{ id: 'task-review-local' }],
+        task_counts: { blocked: 1, review: 1, in_progress: 1, open: 0 },
+        active_work_count: 3,
+        active_flight_count: 1,
+        next_action: { type: 'review_task', task: { id: 'task-review-local' } },
+      })
+      const rendered = String(await projectDetailBody(dashboard!))
+      expect(rendered).toContain('blocked')
+      expect(rendered).toContain('Review &quot;Review local approval task&quot;')
+
+      const runtimeStates = await getFleetAgentRuntimeStates(env, [
+        { agent_id: 'agent-hermes', slug: 'hermes' },
+        { agent_id: 'agent-growth', slug: 'growth-lead' },
+        { agent_id: 'agent-conformance', slug: 'runtime-conformance' },
+      ], Date.now())
+      expect([...runtimeStates.entries()]).toEqual(expect.arrayContaining([
+        ['agent-hermes', expect.objectContaining({ presence: 'live', status: 'running' })],
+        ['agent-growth', expect.objectContaining({ presence: 'offline', status: 'stopped' })],
+        ['agent-conformance', expect.objectContaining({ presence: 'stale', status: 'running' })],
+      ]))
     } finally {
       harness.close()
     }

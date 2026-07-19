@@ -15,6 +15,14 @@ block collapses into a changelog entry when it ships.
   releases separately own Routines, governed tools and Marketing/CRO, isolated agent
   computers, reviewed knowledge, and commercial operations.
 
+### Verified
+
+- Local Project Operations evidence now seeds blocked, review, in-progress, and completed
+  Mupot work with truthful agent runtime presence. It compares the shared Project situation
+  through REST, MCP, and the dashboard loader, then exercises owner create, edit, activate,
+  search/filter, pause, archive, and restore flows in a real browser at desktop and mobile
+  widths.
+
 ## [0.23.0] — 2026-07-13
 
 **Trusted Runtime.** Mupot now binds agent identity, scoped authority, governed

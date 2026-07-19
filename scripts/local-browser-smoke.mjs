@@ -17,6 +17,10 @@ const approvalTaskTitle = `Approval workflow smoke ${smokeRunId}`
 const hermesApprovalTaskTitle = `Hermes approval smoke ${smokeRunId}`
 const hermesTaskTitle = `Hermes dashboard refresh ${smokeRunId}`
 const hermesDirectiveText = `Hold all outbound automation until local browser smoke ${smokeRunId} is complete.`
+const ownerProjectName = `Browser Project ${smokeRunId}`
+const ownerProjectSlug = `browser-project-${Date.now()}`
+const ownerProjectInitialGoal = 'Create a governed nested project through the dashboard.'
+const ownerProjectEditedGoal = 'Prove the owner lifecycle is visible through the canonical Project situation.'
 
 const pages = [
   '/',
@@ -95,6 +99,31 @@ async function textSnippet(locator, limit = 240) {
   return (await locator.innerText({ timeout: 5_000 }).catch(() => '')).slice(0, limit)
 }
 
+async function documentOverflow() {
+  return page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+}
+
+async function assertNoDocumentOverflow(label) {
+  const horizontalOverflow = await documentOverflow()
+  if (horizontalOverflow > 1) fail(`${label} has document-level horizontal overflow`, { horizontalOverflow })
+  return horizontalOverflow
+}
+
+async function applyProjectLifecycleCommand(command, expectedResult, projectId) {
+  await page.goto(`${baseUrl}/projects/${encodeURIComponent(projectId)}/settings`, {
+    waitUntil: 'networkidle',
+    timeout: 20_000,
+  })
+  await page.locator('select[name="command"]').selectOption(command)
+  await Promise.all([
+    page.waitForURL(`${baseUrl}/projects/${encodeURIComponent(projectId)}?status=${expectedResult}`, { timeout: 10_000 }),
+    page.getByRole('button', { name: 'Apply status' }).click(),
+  ])
+  const successText = await textSnippet(page.locator('[role="status"]'))
+  if (!successText) fail('project lifecycle success state was not rendered', { command, expectedResult })
+  return successText
+}
+
 async function runLoginWorkflow() {
   const me = await context.request.get(`${baseUrl}/auth/me`, { timeout: 20_000 })
   const json = await me.json().catch(() => null)
@@ -168,6 +197,7 @@ async function runProjectWorkspaceWorkflow() {
   if (!evidenceText.includes('Done local task') || !evidenceText.includes('Completed local baseline.')) {
     fail('project Evidence did not render the retained task result', { evidenceText })
   }
+  const mupotDesktopOverflow = await assertNoDocumentOverflow('Mupot desktop Project')
   await page.screenshot({ path: path.join(artifactsDir, 'project-mupot.png'), fullPage: true })
 
   await page.goto(`${baseUrl}/send?project_id=project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
@@ -181,28 +211,132 @@ async function runProjectWorkspaceWorkflow() {
     fail('project flight context did not render filtered flights', { projectFlightsText })
   }
 
+  await page.goto(`${baseUrl}/projects/new`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.locator('input[name="name"]').fill(ownerProjectName)
+  await page.locator('input[name="slug"]').fill(ownerProjectSlug)
+  await page.locator('textarea[name="description"]').fill('Created by the local browser smoke through the owner Project form.')
+  await page.locator('textarea[name="goal"]').fill(ownerProjectInitialGoal)
+  await page.locator('select[name="parent_project_id"]').selectOption('project-mumega-products')
+  await Promise.all([
+    page.waitForURL(new RegExp(`${baseUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/projects/[^?]+\\?status=created$`), { timeout: 10_000 }),
+    page.getByRole('button', { name: 'Create project' }).click(),
+  ])
+  const createdUrl = new URL(page.url())
+  const createdProjectId = createdUrl.pathname.split('/').at(-1)
+  if (!createdProjectId) fail('project create did not redirect to a canonical Project URL', { url: page.url() })
+  const createdText = await textSnippet(page.locator('body'), 4000)
+  if (!createdText.includes('Project created.') || !createdText.includes('Mumega Products')) {
+    fail('created nested project did not render its success state and parent context', { createdText })
+  }
+  const lifecycleTransitions = [{ status: 'planned', result: 'created' }]
+
+  await page.goto(`${baseUrl}/projects/${encodeURIComponent(createdProjectId)}/settings`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.locator('textarea[name="goal"]').fill(ownerProjectEditedGoal)
+  await Promise.all([
+    page.waitForURL(`${baseUrl}/projects/${encodeURIComponent(createdProjectId)}?status=updated`, { timeout: 10_000 }),
+    page.getByRole('button', { name: 'Save settings' }).click(),
+  ])
+  const updatedText = await textSnippet(page.locator('body'), 4000)
+  if (!updatedText.includes('Project settings saved.') || !updatedText.includes(ownerProjectEditedGoal)) {
+    fail('project goal edit did not render its success state and saved value', { updatedText })
+  }
+  lifecycleTransitions.push({ status: 'planned', result: 'updated' })
+
+  const activatedText = await applyProjectLifecycleCommand('activate', 'activated', createdProjectId)
+  if (!activatedText.includes('Project activated.')) fail('project activation success state missing', { activatedText })
+  lifecycleTransitions.push({ status: 'active', result: 'activated' })
+
+  const situationText = await textSnippet(page.locator('#overview'), 4000)
+  const observedSituation = {
+    health: situationText.includes('ready') ? 'ready' : '',
+    nextAction: situationText.includes('Create the next project task') ? 'create_task' : '',
+    goal: situationText.includes(ownerProjectEditedGoal) ? ownerProjectEditedGoal : '',
+  }
+  if (observedSituation.health !== 'ready' || observedSituation.nextAction !== 'create_task' || !observedSituation.goal) {
+    fail('activated Project did not render its canonical ready situation', { situationText, observedSituation })
+  }
+  const createdDesktopOverflow = await assertNoDocumentOverflow('created desktop Project')
+  await page.screenshot({ path: path.join(artifactsDir, 'created-project-desktop.png'), fullPage: true })
+
+  await page.goto(`${baseUrl}/projects`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.locator('input[name="search"]').fill(ownerProjectName)
+  await page.locator('select[name="status"]').selectOption('active')
+  await Promise.all([
+    page.waitForURL(new RegExp(`/projects\\?search=${encodeURIComponent(ownerProjectName).replace(/%20/g, '\\+')}&status=active$`), { timeout: 10_000 }),
+    page.getByRole('button', { name: 'Filter' }).click(),
+  ])
+  const filteredText = await textSnippet(page.locator('body'), 4000)
+  if (!filteredText.includes(ownerProjectName) || !filteredText.includes(ownerProjectEditedGoal)) {
+    fail('project search and status filter did not retain the activated Project', { filteredText, url: page.url() })
+  }
+
+  const pausedText = await applyProjectLifecycleCommand('pause', 'paused', createdProjectId)
+  if (!pausedText.includes('Project paused.')) fail('project pause success state missing', { pausedText })
+  lifecycleTransitions.push({ status: 'paused', result: 'paused' })
+  const archivedText = await applyProjectLifecycleCommand('archive', 'archived', createdProjectId)
+  if (!archivedText.includes('Project archived.')) fail('project archive success state missing', { archivedText })
+  lifecycleTransitions.push({ status: 'archived', result: 'archived' })
+  const restoredText = await applyProjectLifecycleCommand('restore', 'restored', createdProjectId)
+  if (!restoredText.includes('Project restored to planned.')) fail('project restore success state missing', { restoredText })
+  lifecycleTransitions.push({ status: 'planned', result: 'restored' })
+
   await page.setViewportSize({ width: 390, height: 844 })
   await page.goto(`${baseUrl}/projects`, { waitUntil: 'networkidle', timeout: 20_000 })
-  const horizontalOverflow = await page.evaluate(() => (
-    document.documentElement.scrollWidth - document.documentElement.clientWidth
-  ))
-  if (horizontalOverflow > 1) {
-    fail('mobile project workspace has horizontal overflow', { horizontalOverflow })
-  }
+  const projectsMobileOverflow = await assertNoDocumentOverflow('mobile Projects')
   await page.locator('#topbar-menu-btn').click()
   const mobileNavigation = await page.locator('#app-nav > a.nav-link .nav-label').allInnerTexts()
   if (JSON.stringify(mobileNavigation.slice(0, 4)) !== JSON.stringify(expectedPrimaryNavigation)) {
     fail('mobile primary navigation order changed', { mobileNavigation, expectedPrimaryNavigation })
   }
   await page.screenshot({ path: path.join(artifactsDir, 'projects-mobile.png'), fullPage: true })
+
+  await page.goto(`${baseUrl}/projects/project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const mupotMobileOverflow = await assertNoDocumentOverflow('Mupot mobile Project')
+  const teamScroll = await page.locator('[role="region"][aria-label="Readable project agent members"]').evaluate((region) => {
+    const element = region
+    const initial = element.scrollLeft
+    element.scrollLeft = 32
+    const scrolled = element.scrollLeft
+    element.scrollLeft = initial
+    return { clientWidth: element.clientWidth, scrollWidth: element.scrollWidth, scrolled }
+  })
+  if (teamScroll.scrollWidth <= teamScroll.clientWidth || teamScroll.scrolled <= 0) {
+    fail('Team / Squads table did not provide an internal horizontal scroll region', { teamScroll })
+  }
+  await page.locator('#squads').scrollIntoViewIfNeeded()
+  await page.screenshot({ path: path.join(artifactsDir, 'project-mupot-team-mobile.png') })
+
+  await page.goto(`${baseUrl}/projects/${encodeURIComponent(createdProjectId)}`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const createdMobileOverflow = await assertNoDocumentOverflow('created mobile Project')
+  await page.screenshot({ path: path.join(artifactsDir, 'created-project-mobile.png'), fullPage: true })
   await page.setViewportSize({ width: 1440, height: 1000 })
 
   workflows.push({
-    name: 'project-centered workspace desktop and mobile',
+    name: 'project-centered workspace and owner lifecycle',
     status: 'passed',
     projectId: 'project-mupot',
-    viewport: { width: 390, height: 844 },
-    horizontalOverflow,
+    createdProjectId,
+    createdProjectParentId: 'project-mumega-products',
+    lifecycleTransitions,
+    observedSituation,
+    viewports: {
+      desktop: { width: 1440, height: 1000, mupotDocumentOverflow: mupotDesktopOverflow, createdDocumentOverflow: createdDesktopOverflow },
+      mobile: {
+        width: 390,
+        height: 844,
+        projectsDocumentOverflow: projectsMobileOverflow,
+        mupotDocumentOverflow: mupotMobileOverflow,
+        createdDocumentOverflow: createdMobileOverflow,
+      },
+    },
+    teamScroll,
+    screenshots: [
+      path.join(artifactsDir, 'project-mupot.png'),
+      path.join(artifactsDir, 'created-project-desktop.png'),
+      path.join(artifactsDir, 'projects-mobile.png'),
+      path.join(artifactsDir, 'project-mupot-team-mobile.png'),
+      path.join(artifactsDir, 'created-project-mobile.png'),
+    ],
     primaryNavigation: expectedPrimaryNavigation,
   })
 }
