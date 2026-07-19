@@ -1,17 +1,33 @@
 {
-  "_comment": "Inbox handler config. fleet-daemon sends signed inbox batches to `node ~/.fleet/runtime/inbox-handler.mjs ~/.fleet/inbox-handler.json`. The handler writes each message to a 0600 JSON file before it exits 0, so Mupot messages are consumed only after durable local handoff.",
+  "_comment": "Inbox handler config. Replace executable paths and welded identities. Productized profiles use argv arrays, reject unauthorized senders and acknowledgement loops, and persist each message before activation.",
   "spool_dir": "~/.fleet/inbox",
   "command_timeout_ms": 120000,
   "agents": [
     {
       "agent_id": "agent-one",
-      "command": "$HOME/.fleet/handlers/agent-one-launch.sh",
-      "run_for": ["request"]
+      "profile": {
+        "schema": "mupot.agent-profile/v1",
+        "agent_id": "agent-one",
+        "adapter": "hermes",
+        "command": ["/usr/local/bin/hermes", "chat", "--toolsets", "mupot"],
+        "allowed_senders": ["agent-two"],
+        "allowed_project_ids": ["project-example"],
+        "run_for": ["request"],
+        "timeout_ms": 120000
+      }
     },
     {
       "agent_id": "agent-two",
-      "command": "$HOME/.fleet/handlers/agent-two-launch.sh",
-      "run_for": ["request", "message"]
+      "profile": {
+        "schema": "mupot.agent-profile/v1",
+        "agent_id": "agent-two",
+        "adapter": "codex",
+        "command": ["/usr/local/bin/codex", "exec"],
+        "allowed_senders": ["agent-one"],
+        "allowed_project_ids": ["project-example"],
+        "run_for": ["request", "message"],
+        "timeout_ms": 120000
+      }
     }
   ]
 }

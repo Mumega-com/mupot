@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // Non-destructive fleet runtime layout bootstrap and service-definition renderer.
 
+import { createHash } from 'node:crypto'
 import {
   chmodSync,
   copyFileSync,
   existsSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   statSync,
   writeFileSync,
@@ -26,6 +28,7 @@ import {
   buildServiceReceipt as buildDefaultServiceReceipt,
   serviceLifecycleCommand,
 } from './service-manager.mjs'
+import { normalizeAgentProfile } from './profile-contract.mjs'
 
 const DEFAULT_SOURCE_DIR = dirname(fileURLToPath(import.meta.url))
 
@@ -216,6 +219,45 @@ function collectSourceChecks(sourceDir, checks) {
   return ok
 }
 
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function safeAgentId(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value) ? value : null
+}
+
+function collectProfileHashes(configPath, checks) {
+  const hashes = []
+  let config
+  try {
+    config = JSON.parse(readFileSync(configPath, 'utf8'))
+  } catch {
+    checks.push({ ok: false, component: 'fleet-install', check: 'agent_profile_config_readable', path: configPath })
+    return hashes
+  }
+  const agents = Array.isArray(config?.agents) ? config.agents : []
+  for (const agent of agents) {
+    if (!agent || typeof agent !== 'object' || !Object.hasOwn(agent, 'profile')) continue
+    const profile = normalizeAgentProfile(agent.profile)
+    const agentId = safeAgentId(agent.agent_id)
+    if (!profile || profile.agent_id !== agentId) {
+      checks.push({ ok: false, component: 'fleet-install', check: 'agent_profile_valid', agent_id: agentId })
+      continue
+    }
+    hashes.push({ agent_id: profile.agent_id, sha256: sha256(JSON.stringify(profile)) })
+  }
+  hashes.sort((left, right) => left.agent_id.localeCompare(right.agent_id))
+  checks.push({
+    ok: hashes.length > 0 ? true : null,
+    component: 'fleet-install',
+    check: hashes.length > 0 ? 'agent_profiles_hashed' : 'agent_profiles_missing',
+    count: hashes.length,
+    ...(hashes.length > 0 ? {} : { reason: 'no productized policy profiles were found' }),
+  })
+  return hashes
+}
+
 function resolvedOptions(input, platformName) {
   const defaults = defaultPaths()
   const requestedManager = input.serviceManager ?? 'auto'
@@ -271,6 +313,7 @@ export async function buildReceipt(input = {}, deps = {}) {
   ensureDir(receiptsDir, 0o700, checks, opts, 'receipts', deps)
 
   const installedRuntime = []
+  let profileHashes = []
   if (sourceOk) {
     const files = runtimeFiles(sourceDir)
     checks.push({ ok: files.length > 0, component: 'fleet-install', check: 'runtime_files_discovered', count: files.length })
@@ -290,6 +333,10 @@ export async function buildReceipt(input = {}, deps = {}) {
         checks.push({ ok: null, component: 'fleet-install', check: 'config_needs_edit', path: dest, reason: 'template_contains_placeholders' })
       }
     }
+    const profileConfigPath = opts.dryRun
+      ? join(sourceDir, 'inbox-handler.example.json')
+      : join(prefix, 'inbox-handler.json')
+    profileHashes = collectProfileHashes(profileConfigPath, checks)
   }
 
   let context = null
@@ -396,6 +443,7 @@ export async function buildReceipt(input = {}, deps = {}) {
       state_dir: stateDir,
       receipts_dir: receiptsDir,
       runtime_files: installedRuntime,
+      profile_hashes: profileHashes,
       service_definitions: definitionRecords,
     },
     activation,

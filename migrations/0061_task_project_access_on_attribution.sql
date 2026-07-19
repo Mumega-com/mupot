@@ -1,6 +1,6 @@
--- 0056: scope task project-access validation to attribution changes only (#391).
+-- 0061: scope task project-access validation to attribution changes only (#391).
 --
--- 0055's validate_tasks_project_id_update fired on a wide UPDATE OF column list
+-- 0055's validate_tasks_project_id_update (still in effect through main's 0056-0060) fired on a wide UPDATE OF column list
 -- (status, result, completed_at, …). After a squad lost write/admin on a project,
 -- in-flight status transitions aborted with "task project access denied" and left
 -- tasks stuck. Access must be re-checked only when project_id or squad_id changes.

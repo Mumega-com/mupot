@@ -1,0 +1,62 @@
+{
+  "schema": "mupot.kubernetes-agent-host/v1",
+  "tenant": "dme",
+  "project_id": "replace-with-dme-project-id",
+  "base_url": "https://mupot.dme.example",
+  "daemon": {
+    "base_url": "https://mupot.dme.example",
+    "tenant": "dme",
+    "state_file": "/var/lib/mupot/state/fleet-daemon.json",
+    "interval_sec": 75,
+    "agents": [
+      {
+        "agent_id": "dme-hermes-k8s",
+        "type": "brain",
+        "runtime": "mupot-agent-host/hermes",
+        "lifecycle": "on_demand",
+        "probe": "test -x /usr/local/bin/hermes && kill -0 1",
+        "inbox": {
+          "argv": [
+            "/usr/local/bin/node",
+            "/opt/mupot/inbox-handler.mjs",
+            "/etc/mupot/inbox-handler.json"
+          ],
+          "limit": 20,
+          "timeout_ms": 150000
+        }
+      }
+    ]
+  },
+  "inbox": {
+    "spool_dir": "/var/lib/mupot/inbox",
+    "command_timeout_ms": 120000,
+    "agents": [
+      {
+        "agent_id": "dme-hermes-k8s",
+        "profile": {
+          "schema": "mupot.agent-profile/v1",
+          "agent_id": "dme-hermes-k8s",
+          "adapter": "hermes",
+          "command": [
+            "/usr/local/bin/node",
+            "/opt/mupot/hermes-inbox-adapter.mjs"
+          ],
+          "allowed_senders": [
+            "dme-project-link"
+          ],
+          "allowed_project_ids": [
+            "replace-with-dme-project-id"
+          ],
+          "inherited_env": [
+            "MUPOT_AGENT_TOKEN_FILE",
+            "MUPOT_PLUGIN_MODE"
+          ],
+          "run_for": [
+            "request"
+          ],
+          "timeout_ms": 120000
+        }
+      }
+    ]
+  }
+}

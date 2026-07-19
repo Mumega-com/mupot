@@ -8,6 +8,21 @@ block collapses into a changelog entry when it ships.
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced the stale post-`v0.23.0` sequence with a canonical version and activation
+  roadmap. `v0.24.0` now owns Project Operations and Agent Host productization; later
+  releases separately own Routines, governed tools and Marketing/CRO, isolated agent
+  computers, reviewed knowledge, and commercial operations.
+
+### Verified
+
+- Local Project Operations evidence now seeds blocked, review, in-progress, and completed
+  Mupot work with truthful agent runtime presence. A real browser structurally reads the same
+  `project-mupot` situation as REST and MCP, while dashboard-loader tests preserve exact equality.
+  The isolated evidence run exercises owner create, edit, activate, complete, reopen, search/filter,
+  pause, archive, and restore flows at desktop and mobile widths without retaining run-created rows.
+
 ## [0.23.0] — 2026-07-13
 
 **Trusted Runtime.** Mupot now binds agent identity, scoped authority, governed

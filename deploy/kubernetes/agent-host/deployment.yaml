@@ -1,0 +1,201 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dme-hermes-agent-host
+data:
+  daemon.json: |
+    {
+      "base_url": "https://mupot.dme.example",
+      "tenant": "dme",
+      "state_file": "/var/lib/mupot/state/fleet-daemon.json",
+      "interval_sec": 75,
+      "agents": [
+        {
+          "agent_id": "dme-hermes-k8s",
+          "type": "brain",
+          "runtime": "mupot-agent-host/hermes",
+          "lifecycle": "on_demand",
+          "probe": "test -x /usr/local/bin/hermes && kill -0 1",
+          "inbox": {
+            "argv": [
+              "/usr/local/bin/node",
+              "/opt/mupot/inbox-handler.mjs",
+              "/etc/mupot/inbox-handler.json"
+            ],
+            "limit": 20,
+            "timeout_ms": 150000
+          }
+        }
+      ]
+    }
+  inbox-handler.json: |
+    {
+      "spool_dir": "/var/lib/mupot/inbox",
+      "command_timeout_ms": 120000,
+      "agents": [
+        {
+          "agent_id": "dme-hermes-k8s",
+          "profile": {
+            "schema": "mupot.agent-profile/v1",
+            "agent_id": "dme-hermes-k8s",
+            "adapter": "hermes",
+            "command": [
+              "/usr/local/bin/node",
+              "/opt/mupot/hermes-inbox-adapter.mjs"
+            ],
+            "allowed_senders": [
+              "dme-project-link"
+            ],
+            "allowed_project_ids": [
+              "replace-with-dme-project-id"
+            ],
+            "inherited_env": [
+              "MUPOT_AGENT_TOKEN_FILE",
+              "MUPOT_PLUGIN_MODE"
+            ],
+            "run_for": [
+              "request"
+            ],
+            "timeout_ms": 120000
+          }
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dme-hermes-agent-host
+  labels:
+    app.kubernetes.io/name: mupot-agent-host
+    app.kubernetes.io/instance: dme-hermes
+spec:
+  # Install inert. Set to 1 only after the legacy mupot-subscriber is absent.
+  replicas: 0
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mupot-agent-host
+      app.kubernetes.io/instance: dme-hermes
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mupot-agent-host
+        app.kubernetes.io/instance: dme-hermes
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        runAsGroup: 10000
+        fsGroup: 10000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent-host
+          image: registry.example/mupot-agent-host-hermes:0.23.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/node
+            - /opt/mupot/container-entrypoint.mjs
+          env:
+            - name: HOME
+              value: /home/mupot
+            - name: MUPOT_DAEMON_CONFIG
+              value: /etc/mupot/daemon.json
+            - name: MUPOT_STATE_DIR
+              value: /var/lib/mupot/state
+            - name: MUPOT_HEALTH_PORT
+              value: "8080"
+            - name: MUPOT_REQUIRE_SIGNED_INBOX_READY
+              value: "true"
+            - name: MUPOT_PLUGIN_MODE
+              value: operator
+            - name: MUPOT_AGENT_TOKEN_FILE
+              value: /run/secrets/mupot-agent/token
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: hermes-home
+              mountPath: /home/mupot
+            - name: config
+              mountPath: /etc/mupot
+              readOnly: true
+            - name: hermes-plugin
+              mountPath: /home/mupot/plugins/mupot
+              readOnly: true
+            - name: agent-signing-key
+              mountPath: /home/mupot/.fleet/agents
+              readOnly: true
+            - name: agent-token
+              mountPath: /run/secrets/mupot-agent
+              readOnly: true
+            - name: runtime-state
+              mountPath: /var/lib/mupot
+            - name: temporary
+              mountPath: /tmp
+      volumes:
+        - name: hermes-home
+          persistentVolumeClaim:
+            claimName: dme-hermes-data
+        - name: config
+          configMap:
+            name: dme-hermes-agent-host
+            defaultMode: 292
+        - name: agent-signing-key
+          secret:
+            secretName: dme-hermes-signing-key
+            defaultMode: 288
+            items:
+              - key: dme-hermes-k8s.key
+                path: dme-hermes-k8s.key
+        - name: hermes-plugin
+          configMap:
+            name: replace-with-immutable-plugin-config-map
+            defaultMode: 292
+        - name: agent-token
+          secret:
+            secretName: dme-mupot-agent-host
+            defaultMode: 288
+            items:
+              - key: token
+                path: token
+        - name: runtime-state
+          emptyDir: {}
+        - name: temporary
+          emptyDir: {}

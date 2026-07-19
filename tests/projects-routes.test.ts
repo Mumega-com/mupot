@@ -177,6 +177,23 @@ describe('projectsApp', () => {
     await expect((await fetch(harness, '/')).json()).resolves.toMatchObject({ projects: [{ id: project.id, slug: 'launch', name: 'Launch now' }] })
   })
 
+  it('maps invalid transitions to conflict and restores archived projects to planned through the shared service', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(
+      "INSERT INTO projects (id, slug, name, status) VALUES ('archived', 'archived', 'Archived', 'archived')",
+    )
+    as(actor({ role: 'owner' }))
+
+    const invalid = await fetch(harness, '/archived', 'PATCH', { status: 'active' })
+    expect(invalid.status).toBe(409)
+    await expect(invalid.json()).resolves.toEqual({ error: 'invalid_status_transition' })
+
+    const response = await fetch(harness, '/archived', 'PATCH', { status: 'planned' })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({ project: { id: 'archived', status: 'planned' } })
+  })
+
   it('only gives a member the explicitly readable project and its needed parent context', async () => {
     harness = makeHarness()
     seedProjects(harness)
@@ -199,6 +216,14 @@ describe('projectsApp', () => {
     await expect(detail.json()).resolves.toMatchObject({
       project: { id: 'visible-child', parent_project_id: 'parent' },
       aggregates: { direct_tasks: 1, direct_squads: 1, direct_flights: 1 },
+      situation: {
+        health: 'active',
+        blockers: [],
+        pending_reviews: [],
+        active_work_count: 1,
+        active_flight_count: 1,
+        next_action: { type: 'start_task', task: { id: 'visible-task' } },
+      },
       parent: { id: 'parent' },
     })
     const detailBody = await (await fetch(harness, '/visible-child')).json() as { parent: Record<string, unknown> }
@@ -239,6 +264,38 @@ describe('projectsApp', () => {
     })
   })
 
+  it('keeps the last department-granted squad readable beyond 1000 squads', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('bulk-dept', 'bulk-dept', 'Bulk Department');
+      WITH RECURSIVE seq(n) AS (
+        VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 1000
+      )
+      INSERT INTO squads (id, department_id, slug, name)
+      SELECT 'bulk-' || printf('%04d', n), 'bulk-dept', 'bulk-' || printf('%04d', n), 'Bulk ' || n FROM seq;
+      INSERT INTO projects (id, slug, name, status) VALUES ('bulk-project', 'bulk-project', 'Bulk Project', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('bulk-project', 'bulk-1000', 'write');
+      INSERT INTO tasks (id, squad_id, title, status, project_id)
+      VALUES ('bulk-last-task', 'bulk-1000', 'Last readable task', 'open', 'bulk-project');
+    `)
+    as(actor({
+      memberId: 'bulk-reader',
+      capabilities: [
+        { member_id: 'bulk-reader', scope_type: 'department', scope_id: 'bulk-dept', capability: 'observer' },
+      ],
+    }))
+
+    await expect((await fetch(harness, '/bulk-project')).json()).resolves.toMatchObject({
+      project: { id: 'bulk-project' },
+      situation: {
+        health: 'active',
+        active_work_count: 1,
+        next_action: { type: 'start_task', task: { id: 'bulk-last-task' } },
+      },
+    })
+  })
+
   it('scopes member aggregates to readable squads and canonical all-readable flights', async () => {
     harness = makeHarness()
     seedProjects(harness)
@@ -275,6 +332,12 @@ describe('projectsApp', () => {
     }))
     await expect((await fetch(harness, '/visible-child')).json()).resolves.toMatchObject({
       aggregates: { direct_tasks: 1, direct_squads: 1, direct_flights: 1 },
+      situation: {
+        health: 'active',
+        blockers: [],
+        active_work_count: 1,
+        active_flight_count: 1,
+      },
     })
 
     as(actor({ role: 'admin' }))
@@ -395,6 +458,100 @@ describe('projectsApp', () => {
     const squads = await (await fetch(harness, '/visible-child/squads?cursor=10000&limit=100')).json() as { next_cursor: string | null }
     expect(projects.next_cursor).toBeNull()
     expect(squads.next_cursor).toBeNull()
+  })
+
+  it('continues Activity and Evidence beyond the legacy maximum offset', async () => {
+    harness = makeHarness()
+    seedProjects(harness)
+    harness.sqlite.exec(`
+      UPDATE project_squad_access SET access_level = 'write'
+       WHERE project_id = 'visible-child' AND squad_id = 'squad-a';
+      WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x + 1 FROM n WHERE x < 10100)
+      INSERT INTO tasks (id, squad_id, title, status, project_id, result, completed_at)
+      SELECT printf('history-%05d', x), 'squad-a', printf('History %05d', x), 'done',
+             'visible-child', printf('Result %05d', x), datetime('now')
+        FROM n;
+      UPDATE project_squad_access SET access_level = 'read'
+       WHERE project_id = 'visible-child' AND squad_id = 'squad-a';
+    `)
+    as(actor({ role: 'owner' }))
+
+    const activity = await (await fetch(
+      harness,
+      '/visible-child/activity?cursor=10000&limit=100',
+    )).json() as { rows: Array<{ source_id: string }>; next_cursor: string | null }
+    const evidence = await (await fetch(
+      harness,
+      '/visible-child/evidence?cursor=10000&limit=100',
+    )).json() as { rows: Array<{ source_id: string }>; next_cursor: string | null }
+
+    expect(activity.next_cursor).not.toBeNull()
+    expect(evidence.next_cursor).not.toBeNull()
+    expect(activity.next_cursor).not.toMatch(/^\d+$/)
+    expect(evidence.next_cursor).not.toMatch(/^\d+$/)
+
+    const nextActivity = await (await fetch(
+      harness,
+      `/visible-child/activity?cursor=${encodeURIComponent(activity.next_cursor!)}&limit=100`,
+    )).json() as { rows: Array<{ source_id: string }> }
+    const nextEvidence = await (await fetch(
+      harness,
+      `/visible-child/evidence?cursor=${encodeURIComponent(evidence.next_cursor!)}&limit=100`,
+    )).json() as { rows: Array<{ source_id: string }> }
+    expect(nextActivity.rows.length).toBeGreaterThan(0)
+    expect(nextEvidence.rows.length).toBeGreaterThan(0)
+    expect(nextActivity.rows.some((row) => activity.rows.some((seen) => seen.source_id === row.source_id))).toBe(false)
+    expect(nextEvidence.rows.some((row) => evidence.rows.some((seen) => seen.source_id === row.source_id))).toBe(false)
+  })
+
+  it('paginates Activity and Evidence through their returned cursors', async () => {
+    harness = makeHarness()
+    seedProjects(harness)
+    harness.sqlite.exec(`
+      UPDATE project_squad_access SET access_level = 'write'
+       WHERE project_id = 'visible-child' AND squad_id = 'squad-a';
+      INSERT INTO tasks (id, squad_id, title, status, project_id, result, completed_at, created_at, updated_at)
+      VALUES
+        ('history-new', 'squad-a', 'New history', 'done', 'visible-child', 'New result', '2026-07-18T21:00:00Z', '2026-07-18T21:00:00Z', '2026-07-18T21:00:00Z'),
+        ('history-old', 'squad-a', 'Old history', 'done', 'visible-child', 'Old result', '2026-07-18T20:00:00Z', '2026-07-18T20:00:00Z', '2026-07-18T20:00:00Z');
+      UPDATE project_squad_access SET access_level = 'read'
+       WHERE project_id = 'visible-child' AND squad_id = 'squad-a';
+    `)
+    as(actor({ role: 'owner' }))
+
+    for (const projection of ['activity', 'evidence']) {
+      const first = await (await fetch(
+        harness,
+        `/visible-child/${projection}?limit=1`,
+      )).json() as { rows: Array<{ source_id: string }>; next_cursor: string | null }
+      expect(first.rows).toHaveLength(1)
+      expect(first.next_cursor).not.toBeNull()
+      expect(first.next_cursor).not.toMatch(/^\d+$/)
+
+      const second = await (await fetch(
+        harness,
+        `/visible-child/${projection}?limit=1&cursor=${first.next_cursor}`,
+      )).json() as { rows: Array<{ source_id: string }> }
+      expect(second.rows).toHaveLength(1)
+      expect(second.rows[0]?.source_id).not.toBe(first.rows[0]?.source_id)
+    }
+  })
+
+  it('rejects malformed and cross-projection opaque cursors', async () => {
+    harness = makeHarness()
+    seedProjects(harness)
+    as(actor({ role: 'owner' }))
+
+    const activity = await (await fetch(
+      harness,
+      '/visible-child/activity?limit=1',
+    )).json() as { next_cursor: string | null }
+    expect(activity.next_cursor).not.toBeNull()
+    expect((await fetch(
+      harness,
+      `/visible-child/evidence?limit=1&cursor=${encodeURIComponent(activity.next_cursor!)}`,
+    )).status).toBe(400)
+    expect((await fetch(harness, '/visible-child/activity?cursor=not-a-valid-cursor')).status).toBe(400)
   })
 
   it('mounts projects before the dashboard catch-all', () => {

@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { webcrypto as w } from 'node:crypto'
-import { signedAttach, canonicalMessage } from './fleet-sign.mjs'
+import { signedAttach, canonicalMessage, validatePrivateKeyStat } from './fleet-sign.mjs'
 
 async function genKey() {
   const pair = await w.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify'])
@@ -80,4 +80,15 @@ test('signedAttach: sig is a valid base64url Ed25519 signature regardless of hos
   assert.match(c1.body.sig, /^[A-Za-z0-9_-]{80,120}$/)
   assert.match(c2.body.sig, /^[A-Za-z0-9_-]{80,120}$/)
   assert.notEqual(c1.body.host, c2.body.host)
+})
+
+test('private key permissions accept only owner 0600 or root:trusted-group 0440', () => {
+  const file = (uid, gid, mode) => ({ uid, gid, mode: 0o100000 | mode, isFile: () => true })
+
+  assert.doesNotThrow(() => validatePrivateKeyStat(file(10001, 10001, 0o600), { uid: 10001, gid: 10001 }))
+  assert.doesNotThrow(() => validatePrivateKeyStat(file(0, 10001, 0o440), { uid: 10001, gid: 10001 }))
+  assert.throws(() => validatePrivateKeyStat(file(0, 10002, 0o440), { uid: 10001, gid: 10001 }), /ownership or mode invalid/)
+  assert.throws(() => validatePrivateKeyStat(file(0, 10001, 0o400), { uid: 10001, gid: 10001 }), /ownership or mode invalid/)
+  assert.throws(() => validatePrivateKeyStat(file(0, 10001, 0o460), { uid: 10001, gid: 10001 }), /ownership or mode invalid/)
+  assert.throws(() => validatePrivateKeyStat({ ...file(0, 10001, 0o440), isFile: () => false }, { uid: 10001, gid: 10001 }), /regular file/)
 })

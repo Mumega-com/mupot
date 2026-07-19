@@ -1,0 +1,45 @@
+FROM nousresearch/hermes-agent@sha256:8d56cd839ad76b0fc2c9202f39a7ffe1b464c247059a17bc3c72ba6b4ae57616
+
+ARG MUPOT_SOURCE_REVISION
+ARG MUPOT_DOCKERFILE_SHA256
+ARG MUPOT_RUNTIME_BUNDLE_SHA256
+
+LABEL org.opencontainers.image.title="Mupot Agent Host for Hermes"
+LABEL org.opencontainers.image.description="DME-derived Hermes runtime with the credential-free Mupot Agent Host adapter"
+LABEL org.opencontainers.image.revision="${MUPOT_SOURCE_REVISION}"
+LABEL com.mumega.mupot.dockerfile-sha256="${MUPOT_DOCKERFILE_SHA256}"
+LABEL com.mumega.mupot.runtime-bundle-sha256="${MUPOT_RUNTIME_BUNDLE_SHA256}"
+LABEL com.mumega.mupot.hermes-base-digest="sha256:8d56cd839ad76b0fc2c9202f39a7ffe1b464c247059a17bc3c72ba6b4ae57616"
+
+USER root
+RUN test -n "$MUPOT_SOURCE_REVISION" \
+    && test -n "$MUPOT_DOCKERFILE_SHA256" \
+    && test -n "$MUPOT_RUNTIME_BUNDLE_SHA256" \
+    && mkdir -p /opt/mupot /home/mupot/.fleet/agents /var/lib/mupot/state \
+    && ln -s /opt/hermes/.venv/bin/hermes /usr/local/bin/hermes \
+    && chown -R 10000:10000 /home/mupot /var/lib/mupot
+
+COPY --chown=10000:10000 \
+    fleet-runtime/container-entrypoint.mjs \
+    fleet-runtime/fleet-daemon.mjs \
+    fleet-runtime/fleet-sign.mjs \
+    fleet-runtime/runtime-state.mjs \
+    fleet-runtime/service-context.mjs \
+    fleet-runtime/inbox-handler.mjs \
+    fleet-runtime/profile-contract.mjs \
+    fleet-runtime/profile-runner.mjs \
+    fleet-runtime/hermes-inbox-adapter.mjs \
+    fleet-runtime/hermes-plugin-smoke.mjs \
+    fleet-runtime/hermes-query-stdin.py \
+    /opt/mupot/
+
+USER 10000:10000
+ENV HOME=/home/mupot \
+    HERMES_HOME=/home/mupot \
+    HERMES_WRITE_SAFE_ROOT=/home/mupot \
+    HERMES_DISABLE_LAZY_INSTALLS=1 \
+    HERMES_LAZY_INSTALL_TARGET=/home/mupot/lazy-packages
+WORKDIR /var/lib/mupot
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/node", "/opt/mupot/container-entrypoint.mjs"]

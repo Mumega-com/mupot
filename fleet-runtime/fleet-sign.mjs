@@ -24,14 +24,23 @@ export function keyPathFor(agentId) {
   return join(homedir(), '.fleet', 'agents', `${agentId}.key`)
 }
 
-/** Load + import an agent's Ed25519 private signing key. Fail-closed on missing file or any
- *  group/world/exec permission bit (only 0600 owner-rw permitted). */
+export function validatePrivateKeyStat(st, identity = {}) {
+  if (!st?.isFile?.()) throw new Error('private key must be a regular file')
+  const uid = identity.uid ?? process.getuid?.()
+  const gid = identity.gid ?? process.getgid?.()
+  const mode = st.mode & 0o777
+  const ownerPrivate = Number.isInteger(uid) && st.uid === uid && mode === 0o600
+  const trustedGroupRead = Number.isInteger(gid) && st.uid === 0 && st.gid === gid && mode === 0o440
+  if (!ownerPrivate && !trustedGroupRead) {
+    throw new Error('private key ownership or mode invalid; require owner 0600 or root:trusted-group 0440')
+  }
+}
+
+/** Load + import an agent's Ed25519 private signing key. */
 export async function loadPrivKey(agentId) {
   const keyPath = keyPathFor(agentId)
   const st = statSync(keyPath) // throws ENOENT if missing → caller handles
-  if (st.mode & 0o177) {
-    throw new Error(`key ${keyPath} perms ${(st.mode & 0o777).toString(8)} too open — chmod 600`)
-  }
+  validatePrivateKeyStat(st)
   // SECURITY: a JSON.parse error on the private-key file can echo key bytes (the 'd' scalar)
   // into the thrown message → logs. Catch and re-throw a FIXED string (path only).
   let privJwk

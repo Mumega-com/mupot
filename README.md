@@ -31,8 +31,10 @@ simple: deploy one pot, connect a runtime worker, grant scoped capabilities,
 send it work, gate risky actions, observe what happened, and verify the result
 against a real tool of record such as GitHub.
 
-See the [control-plane roadmap](./docs/control-plane-roadmap.md), the
-[v0.23.0 Trusted Runtime release gate](./docs/releases/v0.23.0-trusted-runtime.md), the
+The current stable release is `v0.23.0`; the active development target is
+`v0.24.0 Project Operations`. See the [version roadmap](./ROADMAP.md), the
+[control-plane requirements](./docs/control-plane-roadmap.md), the
+[v0.23.0 Trusted Runtime release record](./docs/releases/v0.23.0-trusted-runtime.md), the
 [runtime adapter contract](./docs/runtime-adapter-contract.md), the
 [self-hosting guide](./docs/SELF-HOST.md), the
 [production runbook](./docs/production-runbook.md), and

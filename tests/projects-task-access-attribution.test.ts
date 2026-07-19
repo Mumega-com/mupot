@@ -5,7 +5,7 @@ import { createSqliteD1 } from './helpers/sqlite-d1'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const PROJECTS_MIGRATION = '0055_projects.sql'
-const FIX_MIGRATION = '0056_task_project_access_on_attribution.sql'
+const FIX_MIGRATION = '0061_task_project_access_on_attribution.sql'
 
 function applyThrough(sqlite: { exec(sql: string): void }, throughFile: string): void {
   for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name <= throughFile).sort()) {
@@ -13,8 +13,8 @@ function applyThrough(sqlite: { exec(sql: string): void }, throughFile: string):
   }
 }
 
-describe('0056 task project access on attribution only', () => {
-  it('lets in-flight status updates survive squad access downgrade after 0056', () => {
+describe('0061 task project access on attribution only', () => {
+  it('lets in-flight status updates survive squad access downgrade after 0061', () => {
     const { sqlite, close } = createSqliteD1()
     try {
       applyThrough(sqlite, FIX_MIGRATION)
@@ -53,7 +53,7 @@ describe('0056 task project access on attribution only', () => {
     const { sqlite, close } = createSqliteD1()
     try {
       applyThrough(sqlite, PROJECTS_MIGRATION)
-      // Reproduce pre-fix footgun, then apply 0056 and prove recovery path.
+      // Reproduce pre-fix footgun, then apply 0061 and prove recovery path.
       sqlite.exec(`
         INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Department');
         INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'one', 'One');
