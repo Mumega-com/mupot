@@ -6,7 +6,7 @@ import {
 } from '../addons/project-link/timestamps'
 import { DISPATCH_BRIDGE_SENDER, DISPATCH_INBOX_PREFIX } from '../bus/fleet-bridge'
 
-export type ProjectActivitySource = 'task' | 'message' | 'flight' | 'project_link'
+export type ProjectActivitySource = 'task' | 'message' | 'flight' | 'project_link' | 'routine_event'
 export type ProjectEvidenceSource =
   | 'task_result'
   | 'task_verdict'
@@ -15,6 +15,8 @@ export type ProjectEvidenceSource =
   | 'flight_receipt'
   | 'message_ack'
   | 'project_link_receipt'
+  | 'routine_run_outcome'
+  | 'routine_action_receipt'
 
 export interface ProjectLinkReceiptProof {
   schema: 'mupot.project-link-receipt-proof/v1'
@@ -58,6 +60,7 @@ export interface ProjectProjectionCursor {
 export interface ProjectProjectionInput {
   projectId: string
   readableSquadIds: string[] | null
+  excludeRoutineEvents?: boolean
   limit?: number
   offset?: number
   after?: ProjectProjectionCursor
@@ -235,6 +238,37 @@ export function sanitizeProjectDetail(value: unknown): string {
   }
 }
 
+function isRoutineControlDetailKey(key: string): boolean {
+  const normalized = key.replace(/[^a-z0-9]/gi, '').toLowerCase()
+  return normalized === 'proposal'
+    || normalized.endsWith('proposal')
+    || normalized === 'policy'
+    || normalized.endsWith('policy')
+    || normalized === 'prompt'
+    || normalized.endsWith('prompt')
+}
+
+function sanitizeRoutineProjectionDetail(value: unknown): string {
+  const stripControlFields = (item: unknown): unknown => {
+    if (typeof item === 'string') {
+      try {
+        return stripControlFields(JSON.parse(item))
+      } catch {
+        return item
+      }
+    }
+    if (Array.isArray(item)) return item.map(stripControlFields)
+    if (item && typeof item === 'object') {
+      return Object.fromEntries(Object.entries(item)
+        .filter(([key]) => !isRoutineControlDetailKey(key))
+        .map(([key, nested]) => [key, stripControlFields(nested)]))
+    }
+    return item
+  }
+
+  return sanitizeProjectDetail(stripControlFields(value))
+}
+
 function newest<T extends string>(rows: ProjectProjectionRow<T>[]): ProjectProjectionRow<T>[] {
   return rows.sort((a, b) => {
     const time = Date.parse(b.occurred_at) - Date.parse(a.occurred_at)
@@ -337,8 +371,9 @@ export async function listProjectActivity(
   const linkSuccessAt = projectLinkTimestampMsSql('last_success_at')
   const linkFailureAt = projectLinkTimestampMsSql('last_failure_at')
   const linkAfter = afterClause(input, linkOccurredAt, 'id', 'project_link', 5)
+  const routineEventAfter = afterClause(input, epochMs('e.occurred_at'), 'e.id', 'routine_event', 5)
 
-  const [taskRows, messageRows, flightRows, linkRows] = await Promise.all([
+  const [taskRows, messageRows, flightRows, linkRows, routineEventRows] = await Promise.all([
     env.DB.prepare(
       `SELECT t.id, t.title, t.status, t.assignee_agent_id, t.created_at, s.name AS squad_name
          FROM tasks t JOIN squads s ON s.id = t.squad_id
@@ -400,6 +435,20 @@ export async function listProjectActivity(
       last_error: string | null; stale_after_seconds: number; created_at: string; revoked_at: string | null
       latest_event_at: number; success_event_at: number | null; failure_event_at: number | null
     }>(),
+    input.excludeRoutineEvents ? Promise.resolve({ results: [] as Array<{
+      id: string; kind: string; actor_id: string; occurred_at: string; metadata_json: string; correlation_id: string; routine_name: string
+    }> }) : env.DB.prepare(
+      `SELECT e.id, e.kind, e.actor_id, e.occurred_at, e.metadata_json, e.correlation_id, r.name AS routine_name
+         FROM routine_run_events e INDEXED BY idx_routine_run_events_history
+         JOIN routine_runs rr ON rr.id = e.run_id AND rr.tenant = e.tenant AND rr.project_id = e.project_id
+         JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant AND r.project_id = rr.project_id
+        WHERE e.tenant = ?1 AND e.project_id = ?2
+          AND (?3 = 1 OR r.responsible_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
+          ${routineEventAfter.sql}
+        ORDER BY ${epochMs('e.occurred_at')} DESC, e.id ASC LIMIT ?${routineEventAfter.nextParam}`,
+    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...routineEventAfter.binds, sourceLimit).all<{
+      id: string; kind: string; actor_id: string; occurred_at: string; metadata_json: string; correlation_id: string; routine_name: string
+    }>(),
   ])
 
   const rows: ProjectProjectionRow<ProjectActivitySource>[] = [
@@ -457,6 +506,16 @@ export async function listProjectActivity(
         correlation_id: null,
       }
     }),
+    ...(routineEventRows.results ?? []).map((row) => ({
+      source_type: 'routine_event' as const,
+      source_id: row.id,
+      occurred_at: iso(row.occurred_at),
+      title: sanitizeProjectDetail(`Routine: ${row.routine_name}`),
+      detail: sanitizeRoutineProjectionDetail(row.metadata_json),
+      status: row.kind,
+      actor: row.actor_id,
+      correlation_id: row.correlation_id,
+    })),
   ]
   const ordered = newest(rows)
   return projectionPage(ordered, offset, limit)
@@ -480,6 +539,8 @@ export async function listProjectEvidence(
   const landingAfter = afterClause(input, epochMs('o.created_at'), 'o.id', 'flight_receipt', 5)
   const acknowledgementAfter = afterClause(input, epochMs('m.created_at'), 'm.id', 'message_ack', 5)
   const linkReceiptAfter = afterClause(input, epochMs('r.created_at'), 'r.id', 'project_link_receipt', 5)
+  const routineOutcomeAfter = afterClause(input, epochMs('COALESCE(rr.finished_at, rr.updated_at)'), 'rr.id', 'routine_run_outcome', 5)
+  const routineActionAfter = afterClause(input, epochMs('a.updated_at'), 'a.id', 'routine_action_receipt', 5)
   const useReceiptKeysetHints = await receiptKeysetHintsReady(env)
   const verdictIndex = useReceiptKeysetHints ? 'INDEXED BY idx_task_verdicts_evidence_keyset' : ''
   const workflowIndex = useReceiptKeysetHints ? 'INDEXED BY idx_workflow_receipts_evidence_keyset' : ''
@@ -559,7 +620,8 @@ export async function listProjectEvidence(
       id: string; from_agent: string; to_agent: string; body: string; in_reply_to: string | null; created_at: string
     }>(),
   ])
-  const linkReceipts = await env.DB.prepare(
+  const [linkReceipts, routineOutcomes, routineActions] = await Promise.all([
+    env.DB.prepare(
     `SELECT r.id, r.direction, r.correlation_id, r.shared_receipt_sha256,
             r.envelope_sha256, r.evidence_sha256, r.remote_pot,
             r.remote_project_id, r.source_agent_id, r.action_type,
@@ -570,12 +632,42 @@ export async function listProjectEvidence(
         AND (?3 = 1 OR l.local_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
         ${linkReceiptAfter.sql}
       ORDER BY ${epochMs('r.created_at')} DESC, r.id ASC LIMIT ?${linkReceiptAfter.nextParam}`,
-  ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...linkReceiptAfter.binds, sourceLimit).all<{
+    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...linkReceiptAfter.binds, sourceLimit).all<{
     id: string; direction: string; correlation_id: string; shared_receipt_sha256: string
     envelope_sha256: string; evidence_sha256: string | null; remote_pot: string
     remote_project_id: string; source_agent_id: string; action_type: string
     action_id: string; receipt_key_id: string; receipt_signature: string; status: string; created_at: string
-  }>()
+    }>(),
+    env.DB.prepare(
+      `SELECT rr.id, r.name AS routine_name, rr.status, rr.result_summary, rr.cost_micro_usd,
+              rr.finished_at, rr.updated_at, rr.assigned_agent_id
+         FROM routine_runs rr INDEXED BY idx_routine_runs_project_history
+         JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant AND r.project_id = rr.project_id
+        WHERE rr.tenant = ?1 AND rr.project_id = ?2
+          AND rr.status IN ('succeeded', 'failed', 'skipped', 'cancelled')
+          AND (?3 = 1 OR r.responsible_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
+          ${routineOutcomeAfter.sql}
+        ORDER BY ${epochMs('COALESCE(rr.finished_at, rr.updated_at)')} DESC, rr.id ASC LIMIT ?${routineOutcomeAfter.nextParam}`,
+    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...routineOutcomeAfter.binds, sourceLimit).all<{
+      id: string; routine_name: string; status: string; result_summary: string | null; cost_micro_usd: number
+      finished_at: string | null; updated_at: string; assigned_agent_id: string | null
+    }>(),
+    env.DB.prepare(
+      `SELECT a.id, a.run_id, r.name AS routine_name, a.status, a.gate_status, a.validation_status,
+              a.result_json, a.updated_at, rr.assigned_agent_id
+         FROM routine_runs rr INDEXED BY idx_routine_runs_project_history
+         JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant AND r.project_id = rr.project_id
+         JOIN routine_run_actions a ON a.run_id = rr.id AND a.tenant = rr.tenant AND a.project_id = rr.project_id
+        WHERE rr.tenant = ?1 AND rr.project_id = ?2
+          AND (a.gate_status <> 'not_required' OR a.status IN ('succeeded', 'failed', 'cancelled'))
+          AND (?3 = 1 OR r.responsible_squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))
+          ${routineActionAfter.sql}
+        ORDER BY ${epochMs('a.updated_at')} DESC, a.id ASC LIMIT ?${routineActionAfter.nextParam}`,
+    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...routineActionAfter.binds, sourceLimit).all<{
+      id: string; run_id: string; routine_name: string; status: string; gate_status: string; validation_status: string
+      result_json: string | null; updated_at: string; assigned_agent_id: string | null
+    }>(),
+  ])
 
   const rows: ProjectProjectionRow<ProjectEvidenceSource>[] = [
     ...(results.results ?? []).map((row) => ({
@@ -639,6 +731,30 @@ export async function listProjectEvidence(
         receipt_key_id: row.receipt_key_id,
         receipt_signature: row.receipt_signature,
       },
+    })),
+    ...(routineOutcomes.results ?? []).map((row) => ({
+      source_type: 'routine_run_outcome' as const,
+      source_id: row.id,
+      occurred_at: iso(row.finished_at ?? row.updated_at),
+      title: sanitizeProjectDetail(`Routine: ${row.routine_name}`),
+      detail: sanitizeProjectDetail({ result_summary: row.result_summary, cost_micro_usd: row.cost_micro_usd }),
+      status: row.status,
+      actor: row.assigned_agent_id,
+      correlation_id: row.id,
+    })),
+    ...(routineActions.results ?? []).map((row) => ({
+      source_type: 'routine_action_receipt' as const,
+      source_id: row.id,
+      occurred_at: iso(row.updated_at),
+      title: sanitizeProjectDetail(`Routine action: ${row.routine_name}`),
+      detail: sanitizeRoutineProjectionDetail({
+        validation_status: row.validation_status,
+        gate_status: row.gate_status,
+        result: row.result_json,
+      }),
+      status: row.status,
+      actor: row.assigned_agent_id,
+      correlation_id: row.run_id,
     })),
   ]
   const ordered = newest(rows)

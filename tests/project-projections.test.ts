@@ -273,6 +273,79 @@ describe('project Activity and Evidence projections', () => {
     }
   })
 
+  it('projects authorized immutable Routine events and terminal or gated receipts with stable keysets', async () => {
+    const fixture = harness()
+    try {
+      fixture.sqlite.exec(`
+        INSERT INTO routines (
+          id, tenant, project_id, name, objective, status, trigger_kind, timezone,
+          overlap_policy, execution_mode, responsible_squad_id, budget_micro_usd,
+          max_attempts, retry_backoff_seconds, revision, enabled_by, enabled_at, created_by, created_at, updated_at
+        ) VALUES
+          ('routine-visible', 'tenant', 'project', 'Visible routine', 'Advance safely', 'enabled', 'manual', 'UTC',
+           'skip', 'propose', 'squad-a', 1000, 3, 300, 1, 'member-a', '2026-07-18T20:00:00Z', 'member-a', '2026-07-18T20:00:00Z', '2026-07-18T20:00:00Z'),
+          ('routine-hidden', 'tenant', 'project', 'Private routine', 'Do not reveal', 'enabled', 'manual', 'UTC',
+           'skip', 'propose', 'squad-b', 1000, 3, 300, 1, 'member-b', '2026-07-18T20:00:00Z', 'member-b', '2026-07-18T20:00:00Z', '2026-07-18T20:00:00Z'),
+          ('routine-other-tenant', 'other-tenant', 'project', 'Other tenant routine', 'Do not reveal', 'enabled', 'manual', 'UTC',
+           'skip', 'propose', 'squad-a', 1000, 3, 300, 1, 'member-a', '2026-07-18T20:00:00Z', 'member-a', '2026-07-18T20:00:00Z', '2026-07-18T20:00:00Z');
+        INSERT INTO routine_runs (
+          id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key,
+          trigger_kind, status, proposal_json, result_summary, cost_micro_usd, finished_at, created_at, updated_at
+        ) VALUES
+          ('run-visible', 'tenant', 'project', 'routine-visible', 1, '{"secret":"policy-secret"}', 'manual:visible',
+           'manual', 'succeeded', '{"prompt":"proposal-secret"}', 'completed token=result-secret', 4242, '2026-07-18T20:11:00Z', '2026-07-18T20:00:00Z', '2026-07-18T20:11:00Z'),
+          ('run-hidden', 'tenant', 'project', 'routine-hidden', 1, '{}', 'manual:hidden',
+           'manual', 'failed', NULL, 'hidden result', 1, '2026-07-18T20:12:00Z', '2026-07-18T20:00:00Z', '2026-07-18T20:12:00Z'),
+          ('run-other-tenant', 'other-tenant', 'project', 'routine-other-tenant', 1, '{}', 'manual:other',
+           'manual', 'failed', NULL, 'other tenant result', 1, '2026-07-18T20:13:00Z', '2026-07-18T20:00:00Z', '2026-07-18T20:13:00Z');
+        INSERT INTO routine_run_events (
+          id, tenant, project_id, run_id, kind, actor_type, actor_id, occurred_at, metadata_json, correlation_id
+        ) VALUES
+          ('event-visible', 'tenant', 'project', 'run-visible', 'succeeded', 'agent', 'agent-a', '2026-07-18T20:11:00Z', '{"token":"event-secret","proposal":"event-proposal-secret","safe":"ok"}', 'correlation-visible'),
+          ('event-hidden', 'tenant', 'project', 'run-hidden', 'failed', 'agent', 'agent-b', '2026-07-18T20:12:00Z', '{}', 'correlation-hidden'),
+          ('event-other-tenant', 'other-tenant', 'project', 'run-other-tenant', 'failed', 'agent', 'agent-a', '2026-07-18T20:13:00Z', '{}', 'correlation-other');
+        INSERT INTO routine_run_actions (
+          id, tenant, project_id, run_id, action_key, kind, input_json, validation_status,
+          gate_status, status, result_json, created_at, updated_at
+        ) VALUES
+          ('action-visible', 'tenant', 'project', 'run-visible', 'review', 'request_review', '{"prompt":"input-secret"}', 'accepted',
+           'pending', 'waiting', '{"token":"action-secret","prompt":"action-prompt-secret","outcome":"awaiting approval"}', '2026-07-18T20:11:00Z', '2026-07-18T20:11:00Z'),
+          ('action-hidden', 'tenant', 'project', 'run-hidden', 'review', 'request_review', '{}', 'accepted',
+           'pending', 'waiting', NULL, '2026-07-18T20:12:00Z', '2026-07-18T20:12:00Z');
+      `)
+
+      const scopedActivity = await listProjectActivity(env(fixture.db), {
+        projectId: 'project', readableSquadIds: ['squad-a'], limit: 20,
+      })
+      const scopedEvidence = await listProjectEvidence(env(fixture.db), {
+        projectId: 'project', readableSquadIds: ['squad-a'], limit: 20,
+      })
+      expect(scopedActivity.rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({ source_type: 'routine_event', source_id: 'event-visible', status: 'succeeded', actor: 'agent-a', correlation_id: 'correlation-visible' }),
+      ]))
+      expect(scopedEvidence.rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({ source_type: 'routine_run_outcome', source_id: 'run-visible', status: 'succeeded', correlation_id: 'run-visible' }),
+        expect.objectContaining({ source_type: 'routine_action_receipt', source_id: 'action-visible', status: 'waiting', correlation_id: 'run-visible' }),
+      ]))
+      const exposed = JSON.stringify([...scopedActivity.rows, ...scopedEvidence.rows])
+      expect(exposed).not.toMatch(/Private routine|hidden result|other tenant result|policy-secret|proposal-secret|input-secret|event-secret|event-proposal-secret|action-secret|action-prompt-secret|result-secret/)
+
+      const full = await listProjectActivity(env(fixture.db), {
+        projectId: 'project', readableSquadIds: ['squad-a'], limit: 20,
+      })
+      const first = await listProjectActivity(env(fixture.db), {
+        projectId: 'project', readableSquadIds: ['squad-a'], limit: 1,
+      })
+      const second = await listProjectActivity(env(fixture.db), {
+        projectId: 'project', readableSquadIds: ['squad-a'], limit: 20, after: first.nextCursor!,
+      })
+      expect([...first.rows, ...second.rows].map((row) => `${row.source_type}:${row.source_id}`))
+        .toEqual(full.rows.map((row) => `${row.source_type}:${row.source_id}`))
+    } finally {
+      fixture.close()
+    }
+  })
+
   it('orders and cursors a Project Link by a failure later than its retained success', async () => {
     const fixture = harness()
     try {
@@ -612,7 +685,9 @@ describe('project Activity and Evidence projections', () => {
         },
       })
 
-      const projectionStatements = probe.statements.filter((statement) => statement.sql.includes('ORDER BY'))
+      const projectionStatements = probe.statements.filter((statement) => (
+        statement.sql.includes('ORDER BY') && !statement.sql.includes('FROM routine_')
+      ))
       expect(projectionStatements).toHaveLength(11)
       for (const statement of projectionStatements) {
         const plan = fixture.sqlite.prepare(`EXPLAIN QUERY PLAN ${statement.sql}`).all(...statement.values)
