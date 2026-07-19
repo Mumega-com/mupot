@@ -18,6 +18,8 @@ import type {
   ProjectProjectionPage,
 } from '../projects/projections'
 import type { ProjectHealth, ProjectSituation } from '../projects/situation'
+import { getFleetAgentRuntimeStates } from '../fleet/registry'
+import type { Presence } from '../fleet/registry'
 import { emptyState, pageHeader, pill, sectionPanel } from './ui'
 import type { Html } from './ui'
 
@@ -25,6 +27,7 @@ const MAX_PROJECTS = 100
 const PARENT_OPTIONS_PAGE_SIZE = 500
 const MAX_WORK_ROWS = 50
 const MAX_SQUAD_ROWS = 100
+const MAX_PROJECT_MEMBER_ROWS = 100
 const MAX_FLIGHT_SCAN_PAGES = 10
 
 export const PROJECT_STATUSES: readonly ProjectStatus[] = [
@@ -111,6 +114,23 @@ export interface ProjectSquadRow {
   squad_name: string
 }
 
+export interface ProjectMemberRow {
+  squad_id: string
+  squad_name: string
+  access_level: ProjectAccessLevel
+  agent_id: string
+  agent_slug: string
+  agent_name: string
+  agent_role: string
+  agent_model: string
+  agent_status: string
+  runtime: string
+  runtime_status: string
+  presence: Presence | 'not_attached'
+  host: string
+  last_seen: string
+}
+
 export interface ProjectDetailView {
   project: Project
   parent: ParentContext | null
@@ -121,6 +141,8 @@ export interface ProjectDetailView {
   }
   tasks: ProjectTaskRow[]
   squads: ProjectSquadRow[]
+  members: ProjectMemberRow[]
+  membersTruncated: boolean
   situation: ProjectSituation
   activity: ProjectProjectionPage<ProjectActivitySource>
   evidence: ProjectProjectionPage<ProjectEvidenceSource>
@@ -450,6 +472,59 @@ async function loadReadableSquads(
   return result.results ?? []
 }
 
+async function loadReadableProjectMembers(
+  env: Env,
+  projectId: string,
+  access: ProjectAccess,
+): Promise<{ rows: ProjectMemberRow[]; truncated: boolean }> {
+  if (!access.workspaceAdmin && !access.readableSquadIds?.length) return { rows: [], truncated: false }
+  const filter = access.workspaceAdmin
+    ? ''
+    : ' AND psa.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
+  const limitParam = access.workspaceAdmin ? '?2' : '?3'
+  type IdentityRow = Omit<
+    ProjectMemberRow,
+    'runtime' | 'runtime_status' | 'presence' | 'host' | 'last_seen'
+  >
+  const result = await env.DB.prepare(
+    `SELECT psa.squad_id, s.name AS squad_name, psa.access_level,
+            a.id AS agent_id, a.slug AS agent_slug, a.name AS agent_name,
+            a.role AS agent_role, a.model AS agent_model, a.status AS agent_status
+       FROM agents a
+       JOIN squads s ON s.id = a.squad_id
+       JOIN project_squad_access psa ON psa.squad_id = a.squad_id
+      WHERE psa.project_id = ?1${filter}
+      ORDER BY s.name, a.name, a.id
+      LIMIT ${limitParam}`,
+  ).bind(
+    projectId,
+    ...(access.workspaceAdmin ? [] : [jsonIds(access.readableSquadIds ?? [])]),
+    MAX_PROJECT_MEMBER_ROWS + 1,
+  ).all<IdentityRow>()
+  const candidates = result.results ?? []
+  const truncated = candidates.length > MAX_PROJECT_MEMBER_ROWS
+  const identities = candidates.slice(0, MAX_PROJECT_MEMBER_ROWS)
+  const runtimeStates = await getFleetAgentRuntimeStates(
+    env,
+    identities.map((agent) => ({ agent_id: agent.agent_id, slug: agent.agent_slug })),
+  )
+  return {
+    truncated,
+    rows: identities.map((agent) => {
+      const state = runtimeStates.get(agent.agent_id)
+      const attached = Boolean(state?.runtime)
+      return {
+        ...agent,
+        runtime: attached ? state?.runtime ?? '' : '',
+        runtime_status: attached ? state?.status ?? '' : '',
+        presence: attached ? state?.presence ?? 'stale' : 'not_attached',
+        host: attached ? state?.host ?? '' : '',
+        last_seen: attached ? state?.last_seen ?? '' : '',
+      }
+    }),
+  }
+}
+
 async function loadProjectAggregates(
   env: Env,
   projectId: string,
@@ -486,10 +561,11 @@ export async function loadProjectDetail(
   const [project, access] = await Promise.all([getProject(env, projectId), projectAccess(env, auth)])
   if (!project || !await isReadableProject(env, project.id, access)) return null
 
-  const [aggregates, tasks, squads, parent, situation, activity, evidence] = await Promise.all([
+  const [aggregates, tasks, squads, members, parent, situation, activity, evidence] = await Promise.all([
     loadProjectAggregates(env, project.id, access),
     loadReadableTasks(env, project.id, access),
     loadReadableSquads(env, project.id, access),
+    loadReadableProjectMembers(env, project.id, access),
     project.parent_project_id ? getProject(env, project.parent_project_id) : Promise.resolve(null),
     loadProjectSituation(env, project, access.readableSquadIds),
     listProjectActivity(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
@@ -502,6 +578,8 @@ export async function loadProjectDetail(
     aggregates,
     tasks,
     squads,
+    members: members.rows,
+    membersTruncated: members.truncated,
     situation,
     activity,
     evidence,
@@ -695,6 +773,19 @@ function statusTone(status: ProjectStatus): 'ok' | 'warn' | 'dim' | 'primary' {
   if (status === 'planned' || status === 'paused') return 'warn'
   if (status === 'archived') return 'dim'
   return 'primary'
+}
+
+function memberPresenceLabel(presence: ProjectMemberRow['presence']): string {
+  if (presence === 'not_attached') return 'Not attached'
+  return presence.charAt(0).toUpperCase() + presence.slice(1)
+}
+
+function memberPresenceTone(
+  presence: ProjectMemberRow['presence'],
+): 'ok' | 'warn' | 'dim' {
+  if (presence === 'live') return 'ok'
+  if (presence === 'stale') return 'warn'
+  return 'dim'
 }
 
 function situationTone(health: ProjectHealth): 'ok' | 'warn' | 'danger' | 'dim' | 'primary' {
@@ -1025,7 +1116,7 @@ function projectTabs() {
   return html`<nav aria-label="Project sections" style="display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px;">
     <a class="btn secondary sm" data-project-tab href="#overview" aria-current="page">Overview</a>
     <a class="btn secondary sm" data-project-tab href="#work">Work</a>
-    <a class="btn secondary sm" data-project-tab href="#squads">Squads</a>
+    <a class="btn secondary sm" data-project-tab href="#squads">Team / Squads</a>
     <a class="btn secondary sm" data-project-tab href="#activity">Activity</a>
     <a class="btn secondary sm" data-project-tab href="#evidence">Evidence</a>
   </nav>
@@ -1096,21 +1187,49 @@ export function projectDetailBody(view: ProjectDetailView, statusResult?: string
         }),
       })}
     </section>
-    <section id="squads" aria-label="Squads">
+    <section id="squads" aria-label="Team and squads">
       ${sectionPanel({
-        title: 'Squads',
-        body: semanticDataTable({
-          label: 'Project squads',
+        title: 'Team / Squads',
+        body: html`${semanticDataTable({
+          label: 'Readable project agent members',
           cols: [
             { label: 'Squad', width: '1fr' },
-            { label: 'Access', width: 'auto' },
+            { label: 'Agent', width: '1.3fr' },
+            { label: 'Role / model / status', width: '1.3fr' },
+            { label: 'Runtime', width: '1fr' },
+            { label: 'Presence', width: 'auto' },
+            { label: 'Host / last seen', width: '1.2fr' },
           ],
-          rows: view.squads.map((squad) => [
-            html`<a class="ui-link" href="/squads/${encodeURIComponent(squad.squad_id)}">${squad.squad_name}</a>`,
-            pill(squad.access_level, squad.access_level === 'read' ? 'dim' : 'primary'),
+          rows: view.members.map((member) => [
+            html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
+              <a class="ui-link" style="white-space:normal;overflow-wrap:anywhere;" href="/squads/${encodeURIComponent(member.squad_id)}">${member.squad_name}</a>
+              <span class="ui-panel-sub">Project access: ${member.access_level}</span>
+            </span>`,
+            html`<a class="ui-link" style="white-space:normal;overflow-wrap:anywhere;" href="/agents/${encodeURIComponent(member.agent_id)}">${member.agent_name}</a>`,
+            html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
+              <span>${member.agent_role}</span>
+              <span class="ui-panel-sub" style="white-space:normal;overflow-wrap:anywhere;">Model: ${member.agent_model}</span>
+              <span class="ui-panel-sub">Agent status: ${member.agent_status}</span>
+            </span>`,
+            member.presence === 'not_attached'
+              ? html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
+                  <span>Not attached</span>
+                  <span class="ui-panel-sub">No external runtime reported.</span>
+                </span>`
+              : html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
+                  <span>${member.runtime}</span>
+                  <span class="ui-panel-sub">Stored intent: ${member.runtime_status || 'unknown'}</span>
+                </span>`,
+            pill(memberPresenceLabel(member.presence), memberPresenceTone(member.presence)),
+            html`<span style="display:grid;gap:3px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
+              <span>${member.host || 'Host not reported'}</span>
+              <span class="ui-panel-sub" style="white-space:normal;overflow-wrap:anywhere;">Last seen: ${member.last_seen || 'Never reported'}</span>
+            </span>`,
           ]),
-          empty: 'No readable squad edges are connected to this project.',
-        }),
+          empty: view.squads.length
+            ? 'No readable agent members belong to the connected project squads.'
+            : 'No readable squad edges are connected to this project.',
+        })}${view.membersTruncated ? html`<p class="ui-panel-sub">Showing the first ${MAX_PROJECT_MEMBER_ROWS} readable agent members.</p>` : ''}`,
       })}
     </section>
     <section id="activity" aria-label="Activity">

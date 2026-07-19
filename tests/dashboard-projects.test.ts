@@ -167,6 +167,7 @@ describe('project dashboard renderers', () => {
 
   afterEach(() => {
     authState.current = null
+    vi.restoreAllMocks()
     harness?.close()
     harness = undefined
   })
@@ -524,6 +525,117 @@ describe('project dashboard renderers', () => {
     expect(body).not.toContain('Hidden squad task secret')
     expect(body).toContain('Squad Alpha')
     expect(body).not.toContain('Squad Beta')
+  })
+
+  it('renders live, stale, offline, and unattached project agents without treating stored intent as presence', async () => {
+    harness = makeHarness()
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-07-19T12:00:00Z'))
+    harness.sqlite.exec(`
+      UPDATE agents SET slug = 'agent-a-slug' WHERE id = 'agent-a';
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
+        ('agent-live', 'squad-a', 'live-slug', 'Agent Live', 'Runtime operator', 'model-live', 'active'),
+        ('agent-offline', 'squad-a', 'offline-slug', 'Agent Offline', 'Release reviewer', 'model-offline', 'paused'),
+        ('agent-unattached', 'squad-a', 'unattached-slug', 'Agent Unattached', 'Planning lead', 'model-unattached', 'active');
+      INSERT INTO fleet_agents
+        (tenant, agent_id, runtime, status, host, last_reported_at) VALUES
+        ('pot-a', 'agent-a', 'codex', 'running', 'exact-id-host', '2026-07-19 11:50:00'),
+        ('pot-a', 'agent-a-slug', 'claude-code', 'running', 'slug-fallback-host', '2026-07-19 11:59:50'),
+        ('pot-a', 'live-slug', 'python', 'running', 'live-host', '2026-07-19 11:59:50'),
+        ('pot-a', 'offline-slug', 'tmux', 'stopped', 'offline-host', '2026-07-19 11:59:50');
+    `)
+
+    const view = await loadProjectDetail(envFor(harness), memberA(), 'visible-child')
+    expect(view?.members).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        agent_id: 'agent-a', runtime: 'codex', runtime_status: 'running',
+        presence: 'stale', host: 'exact-id-host', last_seen: '2026-07-19 11:50:00',
+      }),
+      expect.objectContaining({ agent_id: 'agent-live', runtime: 'python', presence: 'live' }),
+      expect.objectContaining({ agent_id: 'agent-offline', runtime: 'tmux', presence: 'offline' }),
+      expect.objectContaining({
+        agent_id: 'agent-unattached', runtime: '', runtime_status: '',
+        presence: 'not_attached', host: '', last_seen: '',
+      }),
+    ]))
+
+    const body = await render(projectDetailBody(view!))
+    expect(body).toContain('Team / Squads')
+    expect(body).toContain('Role / model / status')
+    expect(body).toContain('Stored intent: running')
+    expect(body).toContain('Agent status: paused')
+    expect(body).toContain('Live')
+    expect(body).toContain('Stale')
+    expect(body).toContain('Offline')
+    expect(body).toContain('Not attached')
+    expect(body).toContain('exact-id-host')
+    expect(body).not.toContain('slug-fallback-host')
+  })
+
+  it('refuses ambiguous slug runtime fallback and preserves squad and tenant boundaries', async () => {
+    harness = makeHarness()
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-07-19T12:00:00Z'))
+    harness.sqlite.exec(`
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
+        ('agent-duplicate-visible', 'squad-a', 'duplicate-runtime', 'Visible duplicate', 'Visible role', 'visible-model', 'active'),
+        ('agent-duplicate-hidden', 'squad-b', 'duplicate-runtime', 'Hidden duplicate', 'Hidden role', 'hidden-model', 'active'),
+        ('agent-other-tenant', 'squad-a', 'other-tenant-runtime', 'Other tenant agent', 'Tenant role', 'tenant-model', 'active');
+      INSERT INTO fleet_agents
+        (tenant, agent_id, runtime, status, host, last_reported_at) VALUES
+        ('pot-a', 'duplicate-runtime', 'nous', 'running', 'ambiguous-host', '2026-07-19 11:59:50'),
+        ('pot-b', 'agent-other-tenant', 'systemd-user', 'running', 'other-tenant-host', '2026-07-19 11:59:50');
+    `)
+
+    const view = await loadProjectDetail(envFor(harness), memberA(), 'visible-child')
+    expect(view?.members).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        agent_id: 'agent-duplicate-visible', runtime: '', presence: 'not_attached',
+      }),
+      expect.objectContaining({
+        agent_id: 'agent-other-tenant', runtime: '', presence: 'not_attached',
+      }),
+    ]))
+    expect(view?.members.some((member: { agent_id: string }) => member.agent_id === 'agent-duplicate-hidden')).toBe(false)
+
+    const body = await render(projectDetailBody(view!))
+    expect(body).toContain('Visible duplicate')
+    expect(body).toContain('Other tenant agent')
+    expect(body).not.toContain('Hidden duplicate')
+    expect(body).not.toContain('Agent Beta Secret')
+    expect(body).not.toContain('ambiguous-host')
+    expect(body).not.toContain('other-tenant-host')
+  })
+
+  it('caps readable project members at 100 with a notice and a constant registry query budget', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 100)
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+      SELECT printf('cap-agent-%03d', x), 'squad-a', printf('cap-slug-%03d', x),
+             printf('Overflow agent %03d', x), 'A very long project role that must wrap on mobile',
+             'a-very-long-model-identifier-that-must-wrap', 'active'
+        FROM n;
+    `)
+    const observed: string[] = []
+    const trackedDb = new Proxy(harness.db, {
+      get(target, property, receiver) {
+        if (property !== 'prepare') return Reflect.get(target, property, receiver)
+        return (sql: string) => {
+          if (/\bFROM agents\b|\bFROM fleet_agents\b/i.test(sql)) observed.push(sql)
+          return target.prepare(sql)
+        }
+      },
+    })
+
+    const view = await loadProjectDetail({ ...envFor(harness), DB: trackedDb }, memberA(), 'visible-child')
+    expect(view?.members).toHaveLength(100)
+    expect(view?.membersTruncated).toBe(true)
+    const body = await render(projectDetailBody(view!))
+    expect(body).toContain('Showing the first 100 readable agent members.')
+    expect(body).not.toContain('Overflow agent 100')
+    expect(body).toContain('overflow-wrap:anywhere')
+    expect(observed.filter((sql) => /\bFROM fleet_agents\b/i.test(sql))).toHaveLength(1)
+    expect(observed.filter((sql) => /COUNT\(\*\)[\s\S]*\bFROM agents\b/i.test(sql))).toHaveLength(1)
+    expect(observed.filter((sql) => /\bFROM agents a\b/i.test(sql))).toHaveLength(1)
   })
 
   it('renders truthful operating situations for review, blocked, active, and empty projects', async () => {

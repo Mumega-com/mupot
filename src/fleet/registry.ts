@@ -341,6 +341,88 @@ export interface FleetAgentRouteInfo {
   agentId: string
 }
 
+export interface FleetAgentIdentity {
+  agent_id: string
+  slug: string
+}
+
+export interface FleetAgentRuntimeState {
+  runtime: string
+  status: string
+  presence: Presence
+  host: string
+  last_seen: string
+}
+
+const MAX_RUNTIME_STATE_BATCH = 100
+
+/**
+ * Resolve a bounded set of canonical agent IDs to fleet rows without per-agent reads.
+ * Exact fleet IDs always win. Slug-keyed rows are used only when that slug belongs to
+ * exactly one agent tenant-wide, matching readFleetAgentRow's ambiguity refusal.
+ */
+export async function getFleetAgentRuntimeStates(
+  env: Env,
+  agents: FleetAgentIdentity[],
+  nowMs = Date.now(),
+): Promise<Map<string, FleetAgentRuntimeState>> {
+  const unique = new Map<string, FleetAgentIdentity>()
+  for (const agent of agents) {
+    if (!unique.has(agent.agent_id)) unique.set(agent.agent_id, agent)
+  }
+  if (unique.size > MAX_RUNTIME_STATE_BATCH) {
+    throw new RangeError(`fleet runtime state batch exceeds ${MAX_RUNTIME_STATE_BATCH} agents`)
+  }
+  if (!unique.size) return new Map()
+
+  type FleetRow = {
+    agent_id: string
+    runtime: string | null
+    status: string | null
+    host: string | null
+    last_reported_at: string | null
+  }
+  const identities = [...new Set([...unique.values()].flatMap((agent) => (
+    agent.slug ? [agent.agent_id, agent.slug] : [agent.agent_id]
+  )))]
+  const slugs = [...new Set([...unique.values()].map((agent) => agent.slug).filter(Boolean))]
+  const fleetRowsPromise = env.DB.prepare(
+    `SELECT agent_id, runtime, status, host, last_reported_at
+       FROM fleet_agents
+      WHERE tenant = ?1
+        AND agent_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))`,
+  ).bind(env.TENANT_SLUG, JSON.stringify(identities)).all<FleetRow>()
+  const slugCountsPromise = slugs.length
+    ? env.DB.prepare(
+        `SELECT slug, COUNT(*) AS n
+           FROM agents
+          WHERE slug IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
+          GROUP BY slug`,
+      ).bind(JSON.stringify(slugs)).all<{ slug: string; n: number }>()
+    : Promise.resolve({ results: [] as { slug: string; n: number }[] })
+  const [fleetRows, slugCounts] = await Promise.all([fleetRowsPromise, slugCountsPromise])
+  const byIdentity = new Map((fleetRows.results ?? []).map((row) => [row.agent_id, row]))
+  const cardinality = new Map((slugCounts.results ?? []).map((row) => [row.slug, Number(row.n)]))
+  const ttlSec = presenceTtlSec(env)
+  const resolved = new Map<string, FleetAgentRuntimeState>()
+
+  for (const agent of unique.values()) {
+    const exact = byIdentity.get(agent.agent_id)
+    const row = exact ?? (cardinality.get(agent.slug) === 1 ? byIdentity.get(agent.slug) : undefined)
+    if (!row) continue
+    const status = String(row.status ?? 'unknown')
+    const lastSeen = String(row.last_reported_at ?? '')
+    resolved.set(agent.agent_id, {
+      runtime: String(row.runtime ?? ''),
+      status,
+      presence: derivePresence(status, lastSeen, ttlSec, nowMs),
+      host: String(row.host ?? ''),
+      last_seen: lastSeen,
+    })
+  }
+  return resolved
+}
+
 /**
  * getFleetAgentLiveness — the single read the dispatch-bridge route decision needs: is this
  * agent's runtime EXTERNAL (fleet_agents.runtime non-empty), and is it LIVE right now (recent
