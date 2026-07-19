@@ -871,6 +871,16 @@ function operatingSituationBand(
           ? html`<div style="min-width:0;overflow-wrap:anywhere;">${activity.title}</div><div class="ui-agent-role" style="min-width:0;overflow-wrap:anywhere;">${activity.detail || activity.status}</div>`
           : html`<div style="min-width:0;overflow-wrap:anywhere;">No material activity yet.</div>`}
       </div>
+      <div style="min-width:0;overflow-wrap:anywhere;">
+        <div class="ui-panel-sub">Routines / attention</div>
+        <div>${situation.routines.enabled_count} enabled · ${situation.routines.paused_count} paused · ${situation.needs_you.count} needs you</div>
+        <div class="ui-agent-role">${situation.routines.active_run
+          ? `${situation.routines.active_run.routine_name}: ${situation.routines.active_run.status}${situation.routines.active_run.waiting_reason ? ` (${situation.routines.active_run.waiting_reason})` : ''}`
+          : situation.routines.next ? `Next: ${situation.routines.next.name} at ${situation.routines.next.next_run_at}`
+            : situation.needs_you.highest_priority ? situation.needs_you.highest_priority.title : 'No Routine or attention item is active.'}</div>
+        <a class="ui-link" href="/projects/${encodeURIComponent(project.id)}/routines">Open Routines</a>
+        ${situation.needs_you.count ? html`<span> · </span><a class="ui-link" href="/needs-you">Open Needs You</a>` : ''}
+      </div>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,18rem),1fr));gap:16px;margin-top:16px;">
       <div style="min-width:0;overflow-wrap:anywhere;">
@@ -1143,9 +1153,10 @@ export function projectSettingsBody(view: ProjectSettingsView): Html {
   </section>`
 }
 
-function projectTabs() {
+function projectTabs(projectId: string) {
   return html`<nav aria-label="Project sections" style="display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px;">
     <a class="btn secondary sm" data-project-tab href="#overview" aria-current="page">Overview</a>
+    <a class="btn secondary sm" href="/projects/${encodeURIComponent(projectId)}/routines">Routines</a>
     <a class="btn secondary sm" data-project-tab href="#work">Work</a>
     <a class="btn secondary sm" data-project-tab href="#squads">Team / Squads</a>
     <a class="btn secondary sm" data-project-tab href="#activity">Activity</a>
@@ -1250,7 +1261,7 @@ export function projectDetailBody(view: ProjectDetailView, statusResult?: string
     })}
     ${resultMessage ? html`<p role="status" style="margin:8px 0;color:var(--ok,#16a34a);">${resultMessage}</p>` : ''}
     ${view.canManage ? html`<div style="display:flex;justify-content:flex-end;margin:8px 0;"><a class="btn secondary sm" href="/projects/${encodeURIComponent(project.id)}/settings">Project settings</a></div>` : ''}
-    ${projectTabs()}
+    ${projectTabs(project.id)}
     <script type="application/json" id="project-situation-json">${raw(jsonScript(situation))}</script>
     ${operatingSituationBand(project, aggregates, situation)}
     <section id="work" aria-label="Work">
