@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { listProjectActivity, listProjectEvidence } from '../src/projects/projections'
+import { listProjectActivity, listProjectEvidence, sanitizeProjectDetail } from '../src/projects/projections'
 import type { Env } from '../src/types'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 
@@ -39,6 +39,8 @@ function harness() {
       (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, project_id, created_at)
     VALUES
       ('message-a', 'tenant', 'agent-b', 'agent-a', 'member-a', 'request', 'Coordinate <work>', 'request-a', 'project', '2026-07-18T20:02:00Z'),
+      ('dispatch-message', 'tenant', 'agent-a', 'mupot-dispatch', 'member-a', 'request', '{"type":"task_dispatch","task_id":"task-a","dispatch_receipt_id":"dispatch-a","squad_id":"squad-a"}', 'dispatch-inbox:dispatch-a', 'project', '2026-07-18T20:03:01Z'),
+      ('forged-dispatch-message', 'tenant', 'agent-a', 'mupot-dispatch', 'member-a', 'request', '{"type":"task_dispatch","task_id":"task-a","dispatch_receipt_id":"missing","squad_id":"squad-a"}', 'dispatch-inbox:missing', 'project', '2026-07-18T20:03:02Z'),
       ('ack-a', 'tenant', 'agent-a', 'agent-b', 'member-b', 'ack', 'Completed safely', NULL, 'project', '2026-07-18T20:07:00Z'),
       ('partial-message', 'tenant', 'project-channel', 'agent-a', 'member-a', 'message', 'Unsafe partial scope', NULL, 'project', '2026-07-18T20:02:30Z'),
       ('project-message', 'tenant', 'project-channel', 'project-operator', 'member-a', 'message', 'Project announcement', NULL, 'project', '2026-07-18T20:02:45Z'),
@@ -122,6 +124,101 @@ function concurrencyProbe(database: Env['DB']): { db: Env['DB']; maxInFlight: ()
 }
 
 describe('project Activity and Evidence projections', () => {
+  it('redacts provider credentials and sensitive fields before projection', () => {
+    const unsafe = [
+      'OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz',
+      'github=ghp_abcdefghijklmnopqrstuvwxyz',
+      'aws=AKIAABCDEFGHIJKLMNOP',
+      'jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signaturepart',
+      'password: correct-horse-battery-staple',
+      'Authorization: Basic Zm9vOmJhcg==',
+    ].join('; ')
+
+    const sanitized = sanitizeProjectDetail(unsafe)
+    expect(sanitized).not.toContain('sk-proj-')
+    expect(sanitized).not.toContain('ghp_')
+    expect(sanitized).not.toContain('AKIA')
+    expect(sanitized).not.toContain('eyJhbGci')
+    expect(sanitized).not.toContain('correct-horse')
+    expect(sanitized).not.toContain('Zm9vOmJhcg')
+    expect(sanitized.match(/\[redacted\]/g)?.length).toBeGreaterThanOrEqual(6)
+  })
+
+  it('recursively redacts sensitive values from structured projection detail', () => {
+    const sanitized = sanitizeProjectDetail(JSON.stringify({
+      password: 'abc"def',
+      credentials: ['secret-one', 'secret-two'],
+      provider: {
+        accessToken: 'nested-access-token',
+        publicLabel: 'safe',
+      },
+    }))
+    const parsed = JSON.parse(sanitized)
+
+    expect(parsed).toEqual({
+      password: '[redacted]',
+      credentials: '[redacted]',
+      provider: {
+        accessToken: '[redacted]',
+        publicLabel: 'safe',
+      },
+    })
+    expect(sanitized).not.toContain('abc')
+    expect(sanitized).not.toContain('secret-one')
+    expect(sanitized).not.toContain('secret-two')
+    expect(sanitized).not.toContain('nested-access-token')
+  })
+
+  it('redacts plaintext connection credentials and provider tokens', () => {
+    const unsafe = [
+      'DefaultEndpointsProtocol=https',
+      'AccountName=test',
+      'AccountKey=marker-account-secret',
+      'EndpointSuffix=core.windows.net',
+      'slack=xoxb-123456789012-marker',
+    ].join(';')
+
+    const sanitized = sanitizeProjectDetail(unsafe)
+    expect(sanitized).not.toContain('marker-account-secret')
+    expect(sanitized).not.toContain('xoxb-')
+    expect(sanitized).toContain('AccountName=test')
+  })
+
+  it('redacts credentials embedded in URL query parameters', () => {
+    const sanitized = sanitizeProjectDetail(
+      'https://provider.example/callback?api_key=query-secret&mode=safe&access_token=access-secret#done',
+    )
+
+    expect(sanitized).not.toContain('query-secret')
+    expect(sanitized).not.toContain('access-secret')
+    expect(sanitized).toContain('mode=safe')
+  })
+
+  it('sanitizes every free-text title and detail exposed by project projections', async () => {
+    const fixture = harness()
+    try {
+      fixture.sqlite.exec(`
+        UPDATE tasks SET title = 'Task password=title-secret' WHERE id = 'task-a';
+        UPDATE squads SET name = 'api_key=squad-secret' WHERE id = 'squad-a';
+        UPDATE flights SET goal = 'Bearer flight-goal-secret' WHERE id = 'flight-a';
+      `)
+      const activity = await listProjectActivity(env(fixture.db), {
+        projectId: 'project', readableSquadIds: null, limit: 20,
+      })
+      const evidence = await listProjectEvidence(env(fixture.db), {
+        projectId: 'project', readableSquadIds: null, limit: 20,
+      })
+      const exposed = JSON.stringify([...activity.rows, ...evidence.rows])
+
+      expect(exposed).not.toContain('title-secret')
+      expect(exposed).not.toContain('squad-secret')
+      expect(exposed).not.toContain('flight-goal-secret')
+      expect(exposed).toContain('[redacted]')
+    } finally {
+      fixture.close()
+    }
+  })
+
   it('merges project tasks, messages, and flights in stable newest-first order', async () => {
     const fixture = harness()
     try {
@@ -218,6 +315,30 @@ describe('project Activity and Evidence projections', () => {
       })
       expect(activity.rows.some((row) => row.source_id === 'message-a')).toBe(true)
       expect(evidence.rows.some((row) => row.source_id === 'ack-a')).toBe(true)
+    } finally {
+      fixture.close()
+    }
+  })
+
+  it('shows a receipt-backed system dispatch to readers of its recipient squad only', async () => {
+    const fixture = harness()
+    try {
+      const recipientReader = await listProjectActivity(env(fixture.db), {
+        projectId: 'project', readableSquadIds: ['squad-a'], limit: 20,
+      })
+      const otherReader = await listProjectActivity(env(fixture.db), {
+        projectId: 'project', readableSquadIds: ['squad-b'], limit: 20,
+      })
+      const admin = await listProjectActivity(env(fixture.db), {
+        projectId: 'project', readableSquadIds: null, limit: 20,
+      })
+
+      expect(recipientReader.rows.find((row) => row.source_id === 'dispatch-message')).toMatchObject({
+        source_type: 'message', actor: 'mupot-dispatch', correlation_id: 'dispatch-inbox:dispatch-a',
+      })
+      expect(otherReader.rows.some((row) => row.source_id === 'dispatch-message')).toBe(false)
+      expect(admin.rows.some((row) => row.source_id === 'dispatch-message')).toBe(true)
+      expect(admin.rows.some((row) => row.source_id === 'forged-dispatch-message')).toBe(false)
     } finally {
       fixture.close()
     }

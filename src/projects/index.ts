@@ -62,6 +62,11 @@ function nextCursor(page: Page, resultLength: number): string | null {
   return resultLength > page.limit && nextOffset <= MAX_PAGE_OFFSET ? String(nextOffset) : null
 }
 
+function nextProjectionCursor(page: Page, hasMore: boolean): string | null {
+  const nextOffset = page.offset + page.limit
+  return hasMore && nextOffset <= MAX_PAGE_OFFSET ? String(nextOffset) : null
+}
+
 function jsonIds(ids: string[]): string {
   return JSON.stringify([...new Set(ids)])
 }
@@ -342,7 +347,7 @@ projectsApp.get('/:id/activity', async (c) => {
   })
   return c.json({
     rows: rows.rows,
-    next_cursor: rows.hasMore ? String(page.offset + page.limit) : null,
+    next_cursor: nextProjectionCursor(page, rows.hasMore),
   })
 })
 
@@ -360,7 +365,7 @@ projectsApp.get('/:id/evidence', async (c) => {
   })
   return c.json({
     rows: rows.rows,
-    next_cursor: rows.hasMore ? String(page.offset + page.limit) : null,
+    next_cursor: nextProjectionCursor(page, rows.hasMore),
   })
 })
 

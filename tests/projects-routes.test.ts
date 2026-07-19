@@ -397,6 +397,67 @@ describe('projectsApp', () => {
     expect(squads.next_cursor).toBeNull()
   })
 
+  it('does not emit unusable Activity or Evidence cursors beyond the maximum offset', async () => {
+    harness = makeHarness()
+    seedProjects(harness)
+    harness.sqlite.exec(`
+      UPDATE project_squad_access SET access_level = 'write'
+       WHERE project_id = 'visible-child' AND squad_id = 'squad-a';
+      WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x + 1 FROM n WHERE x < 10100)
+      INSERT INTO tasks (id, squad_id, title, status, project_id, result, completed_at)
+      SELECT printf('history-%05d', x), 'squad-a', printf('History %05d', x), 'done',
+             'visible-child', printf('Result %05d', x), datetime('now')
+        FROM n;
+      UPDATE project_squad_access SET access_level = 'read'
+       WHERE project_id = 'visible-child' AND squad_id = 'squad-a';
+    `)
+    as(actor({ role: 'owner' }))
+
+    const activity = await (await fetch(
+      harness,
+      '/visible-child/activity?cursor=10000&limit=100',
+    )).json() as { next_cursor: string | null }
+    const evidence = await (await fetch(
+      harness,
+      '/visible-child/evidence?cursor=10000&limit=100',
+    )).json() as { next_cursor: string | null }
+
+    expect(activity.next_cursor).toBeNull()
+    expect(evidence.next_cursor).toBeNull()
+  })
+
+  it('paginates Activity and Evidence through their returned cursors', async () => {
+    harness = makeHarness()
+    seedProjects(harness)
+    harness.sqlite.exec(`
+      UPDATE project_squad_access SET access_level = 'write'
+       WHERE project_id = 'visible-child' AND squad_id = 'squad-a';
+      INSERT INTO tasks (id, squad_id, title, status, project_id, result, completed_at, created_at, updated_at)
+      VALUES
+        ('history-new', 'squad-a', 'New history', 'done', 'visible-child', 'New result', '2026-07-18T21:00:00Z', '2026-07-18T21:00:00Z', '2026-07-18T21:00:00Z'),
+        ('history-old', 'squad-a', 'Old history', 'done', 'visible-child', 'Old result', '2026-07-18T20:00:00Z', '2026-07-18T20:00:00Z', '2026-07-18T20:00:00Z');
+      UPDATE project_squad_access SET access_level = 'read'
+       WHERE project_id = 'visible-child' AND squad_id = 'squad-a';
+    `)
+    as(actor({ role: 'owner' }))
+
+    for (const projection of ['activity', 'evidence']) {
+      const first = await (await fetch(
+        harness,
+        `/visible-child/${projection}?limit=1`,
+      )).json() as { rows: Array<{ source_id: string }>; next_cursor: string | null }
+      expect(first.rows).toHaveLength(1)
+      expect(first.next_cursor).toBe('1')
+
+      const second = await (await fetch(
+        harness,
+        `/visible-child/${projection}?limit=1&cursor=${first.next_cursor}`,
+      )).json() as { rows: Array<{ source_id: string }> }
+      expect(second.rows).toHaveLength(1)
+      expect(second.rows[0]?.source_id).not.toBe(first.rows[0]?.source_id)
+    }
+  })
+
   it('mounts projects before the dashboard catch-all', () => {
     const root = readFileSync(join(__dirname, '..', 'src', 'index.ts'), 'utf8')
     expect(root.indexOf('app.route(ROUTES.projects, projectsApp)')).toBeGreaterThan(-1)

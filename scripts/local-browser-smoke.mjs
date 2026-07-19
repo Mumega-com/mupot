@@ -160,6 +160,14 @@ async function runProjectWorkspaceWorkflow() {
       fail('project-filtered work link missing', { href, detailText })
     }
   }
+  const activityText = await textSnippet(page.locator('#activity'), 4000)
+  if (!activityText.includes('In-progress local task') || !activityText.includes('Run local browser smoke')) {
+    fail('project Activity did not render attributed task and flight rows', { activityText })
+  }
+  const evidenceText = await textSnippet(page.locator('#evidence'), 4000)
+  if (!evidenceText.includes('Done local task') || !evidenceText.includes('Completed local baseline.')) {
+    fail('project Evidence did not render the retained task result', { evidenceText })
+  }
   await page.screenshot({ path: path.join(artifactsDir, 'project-mupot.png'), fullPage: true })
 
   await page.goto(`${baseUrl}/send?project_id=project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })

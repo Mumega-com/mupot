@@ -1,5 +1,6 @@
 import type { Env } from '../types'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
+import { DISPATCH_BRIDGE_SENDER, DISPATCH_INBOX_PREFIX } from '../bus/fleet-bridge'
 
 export type ProjectActivitySource = 'task' | 'message' | 'flight' | 'project_link'
 export type ProjectEvidenceSource =
@@ -37,6 +38,59 @@ export interface ProjectProjectionInput {
 const DEFAULT_LIMIT = 100
 const MAX_LIMIT = 100
 const MAX_DETAIL_CHARS = 4000
+const ASSIGNMENT_RE = /((?:^|[\s,;{?&])["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=]\s*)[^,;}&\r\n]+/g
+const QUERY_ASSIGNMENT_RE = /([?&])([A-Za-z][A-Za-z0-9_.-]*)(=)[^&#\s]*/g
+
+function redactSecretPatterns(text: string): string {
+  return text
+    .replace(QUERY_ASSIGNMENT_RE, (match, delimiter: string, key: string, equals: string) => (
+      isSensitiveDetailKey(key) ? `${delimiter}${key}${equals}[redacted]` : match
+    ))
+    .replace(ASSIGNMENT_RE, (match, prefix: string, key: string) => (
+      isSensitiveDetailKey(key) ? `${prefix}[redacted]` : match
+    ))
+    .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
+    .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/gi, '[redacted]')
+    .replace(/\bmupot_[A-Za-z0-9_-]+\b/g, '[redacted]')
+    .replace(/\bgh[pousr]_[A-Za-z0-9_]{12,}\b/g, '[redacted]')
+    .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/g, '[redacted]')
+    .replace(/\bAKIA[A-Z0-9]{16}\b/g, '[redacted]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[redacted]')
+    .replace(/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g, '[redacted]')
+}
+
+function isSensitiveDetailKey(key: string): boolean {
+  const normalized = key.replace(/[^a-z0-9]/gi, '').toLowerCase()
+  return normalized.endsWith('apikey')
+    || normalized === 'authorization'
+    || normalized === 'bearer'
+    || normalized.endsWith('token')
+    || normalized.endsWith('privatekey')
+    || normalized.endsWith('clientsecret')
+    || normalized.endsWith('accountkey')
+    || normalized.endsWith('accesskey')
+    || normalized.endsWith('secretkey')
+    || normalized.endsWith('signingkey')
+    || normalized.endsWith('connectionstring')
+    || normalized.endsWith('sharedaccesssignature')
+    || normalized.endsWith('password')
+    || normalized === 'passwd'
+    || normalized.endsWith('secret')
+    || normalized.endsWith('cookie')
+    || normalized.endsWith('credential')
+    || normalized.endsWith('credentials')
+}
+
+function redactStructuredDetail(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactStructuredDetail)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+      key,
+      isSensitiveDetailKey(key) ? '[redacted]' : redactStructuredDetail(item),
+    ]))
+  }
+  return typeof value === 'string' ? redactSecretPatterns(value) : value
+}
 
 function limitOf(value: number | undefined): number {
   if (!Number.isFinite(value)) return DEFAULT_LIMIT
@@ -66,12 +120,25 @@ function iso(value: unknown): string {
 }
 
 export function sanitizeProjectDetail(value: unknown): string {
-  let text = typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value)
-  text = text
-    .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
-    .replace(/\bmupot_[A-Za-z0-9_-]+\b/g, '[redacted]')
-    .replace(/(["']?(?:authorization|token|private_key|secret)["']?\s*[:=]\s*["'])[^"']+(["'])/gi, '$1[redacted]$2')
-  return text.slice(0, MAX_DETAIL_CHARS)
+  if (value == null) return ''
+
+  let structured: unknown = value
+  if (typeof value === 'string') {
+    try {
+      structured = JSON.parse(value)
+    } catch {
+      return redactSecretPatterns(value).slice(0, MAX_DETAIL_CHARS)
+    }
+    if (!structured || typeof structured !== 'object') {
+      return redactSecretPatterns(value).slice(0, MAX_DETAIL_CHARS)
+    }
+  }
+
+  try {
+    return JSON.stringify(redactStructuredDetail(structured)).slice(0, MAX_DETAIL_CHARS)
+  } catch {
+    return redactSecretPatterns(String(value)).slice(0, MAX_DETAIL_CHARS)
+  }
 }
 
 function newest<T extends string>(rows: ProjectProjectionRow<T>[]): ProjectProjectionRow<T>[] {
@@ -112,6 +179,44 @@ function messageReadableSql(alias: string, idsParam: string, adminParam: string)
   )`
 }
 
+function dispatchMessageReadableSql(
+  alias: string,
+  idsParam: string,
+  adminParam: string,
+  senderParam: string,
+  requestPrefixParam: string,
+): string {
+  return `(
+    ${alias}.from_agent = ${senderParam}
+    AND ${alias}.kind = 'request'
+    AND ${alias}.request_id IS NOT NULL
+    AND json_valid(${alias}.body)
+    AND json_type(${alias}.body) = 'object'
+    AND EXISTS (
+      SELECT 1
+        FROM task_dispatch_receipts dispatch_receipt
+        JOIN tasks dispatched_task ON dispatched_task.id = dispatch_receipt.task_id
+        JOIN agents dispatch_recipient ON dispatch_recipient.id = dispatch_receipt.agent_id
+       WHERE dispatch_receipt.tenant = ${alias}.tenant
+         AND ${alias}.request_id = ${requestPrefixParam} || dispatch_receipt.id
+         AND dispatch_receipt.agent_id = ${alias}.to_agent
+         AND dispatch_receipt.actor_id = ${alias}.from_member
+         AND dispatch_receipt.squad_id = dispatch_recipient.squad_id
+         AND dispatched_task.project_id = ${alias}.project_id
+         AND json_extract(${alias}.body, '$.type') = 'task_dispatch'
+         AND json_extract(${alias}.body, '$.task_id') = dispatch_receipt.task_id
+         AND json_extract(${alias}.body, '$.dispatch_receipt_id') = dispatch_receipt.id
+         AND json_extract(${alias}.body, '$.squad_id') = dispatch_receipt.squad_id
+         AND (
+           ${adminParam} = 1
+           OR dispatch_recipient.squad_id IN (
+             SELECT CAST(value AS TEXT) FROM json_each(${idsParam})
+           )
+         )
+    )
+  )`
+}
+
 export async function listProjectActivity(
   env: Env,
   input: ProjectProjectionInput,
@@ -136,9 +241,20 @@ export async function listProjectActivity(
       `SELECT m.id, m.from_agent, m.to_agent, m.kind, m.body, m.request_id, m.in_reply_to, m.created_at
         FROM agent_messages m
        WHERE m.tenant = ?1 AND m.project_id = ?2
-          AND ${messageReadableSql('m', '?4', '?3')}
-        ORDER BY m.created_at DESC, m.seq DESC LIMIT ?5`,
-    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, sourceLimit).all<{
+          AND (
+            ${messageReadableSql('m', '?4', '?3')}
+            OR ${dispatchMessageReadableSql('m', '?4', '?3', '?5', '?6')}
+          )
+        ORDER BY m.created_at DESC, m.seq DESC LIMIT ?7`,
+    ).bind(
+      env.TENANT_SLUG,
+      input.projectId,
+      isAdmin,
+      ids,
+      DISPATCH_BRIDGE_SENDER,
+      DISPATCH_INBOX_PREFIX,
+      sourceLimit,
+    ).all<{
       id: string; from_agent: string; to_agent: string; kind: string; body: string
       request_id: string | null; in_reply_to: string | null; created_at: string
     }>(),
@@ -171,8 +287,8 @@ export async function listProjectActivity(
       source_type: 'task' as const,
       source_id: row.id,
       occurred_at: iso(row.created_at),
-      title: row.title,
-      detail: row.squad_name,
+      title: sanitizeProjectDetail(row.title),
+      detail: sanitizeProjectDetail(row.squad_name),
       status: row.status,
       actor: row.assignee_agent_id,
       correlation_id: null,
@@ -181,7 +297,7 @@ export async function listProjectActivity(
       source_type: 'message' as const,
       source_id: row.id,
       occurred_at: iso(row.created_at),
-      title: `${row.from_agent} -> ${row.to_agent}`,
+      title: sanitizeProjectDetail(`${row.from_agent} -> ${row.to_agent}`),
       detail: sanitizeProjectDetail(row.body),
       status: row.kind,
       actor: row.from_agent,
@@ -191,7 +307,7 @@ export async function listProjectActivity(
       source_type: 'flight' as const,
       source_id: row.id,
       occurred_at: iso(Number(row.created_at)),
-      title: row.goal,
+      title: sanitizeProjectDetail(row.goal),
       detail: '',
       status: row.status,
       actor: row.agent,
@@ -212,7 +328,7 @@ export async function listProjectActivity(
         source_type: 'project_link' as const,
         source_id: row.id,
         occurred_at: iso(occurredAt),
-        title: `Linked project: ${row.remote_pot} / ${row.remote_project_id}`,
+        title: sanitizeProjectDetail(`Linked project: ${row.remote_pot} / ${row.remote_project_id}`),
         detail: sanitizeProjectDetail(row.last_error ?? `source=${row.remote_pot}; last_sync=${row.last_success_at ?? 'unknown'}`),
         status,
         actor: row.remote_agent_id,
@@ -313,39 +429,39 @@ export async function listProjectEvidence(
   const rows: ProjectProjectionRow<ProjectEvidenceSource>[] = [
     ...(results.results ?? []).map((row) => ({
       source_type: 'task_result' as const, source_id: row.id,
-      occurred_at: iso(row.completed_at ?? row.updated_at), title: row.title,
+      occurred_at: iso(row.completed_at ?? row.updated_at), title: sanitizeProjectDetail(row.title),
       detail: sanitizeProjectDetail(row.result), status: row.status,
       actor: row.assignee_agent_id, correlation_id: row.execution_receipt_id,
     })),
     ...(verdicts.results ?? []).map((row) => ({
       source_type: 'task_verdict' as const, source_id: row.id,
-      occurred_at: iso(row.decided_at), title: row.title,
+      occurred_at: iso(row.decided_at), title: sanitizeProjectDetail(row.title),
       detail: sanitizeProjectDetail(row.note), status: row.verdict,
       actor: row.decided_by, correlation_id: row.task_id,
     })),
     ...(workflows.results ?? []).map((row) => ({
       source_type: 'workflow_receipt' as const, source_id: row.id,
-      occurred_at: iso(row.created_at), title: `${row.title}: ${row.step_name}`,
+      occurred_at: iso(row.created_at), title: sanitizeProjectDetail(`${row.title}: ${row.step_name}`),
       detail: sanitizeProjectDetail(row.detail), status: row.status,
       actor: null, correlation_id: row.instance_id,
     })),
     ...(dispatches.results ?? []).map((row) => ({
       source_type: 'dispatch_receipt' as const, source_id: row.id,
-      occurred_at: iso(row.created_at), title: row.title,
+      occurred_at: iso(row.created_at), title: sanitizeProjectDetail(row.title),
       detail: sanitizeProjectDetail(row.last_error),
       status: row.consumed_at ? 'consumed' : row.last_error ? 'failed' : row.claimed_at ? 'claimed' : 'pending',
       actor: row.actor_id, correlation_id: row.task_id,
     })),
     ...(landings.results ?? []).map((row) => ({
       source_type: 'flight_receipt' as const, source_id: row.id,
-      occurred_at: iso(row.created_at), title: row.goal,
+      occurred_at: iso(row.created_at), title: sanitizeProjectDetail(row.goal),
       detail: sanitizeProjectDetail(row.last_error ?? row.payload),
       status: row.consumed_at ? 'consumed' : row.delivered_at ? 'delivered' : row.last_error ? 'failed' : 'pending',
       actor: row.actor_id, correlation_id: row.flight_id,
     })),
     ...(acknowledgements.results ?? []).map((row) => ({
       source_type: 'message_ack' as const, source_id: row.id,
-      occurred_at: iso(row.created_at), title: `${row.from_agent} -> ${row.to_agent}`,
+      occurred_at: iso(row.created_at), title: sanitizeProjectDetail(`${row.from_agent} -> ${row.to_agent}`),
       detail: sanitizeProjectDetail(row.body), status: 'ack',
       actor: row.from_agent, correlation_id: row.in_reply_to,
     })),
@@ -353,7 +469,7 @@ export async function listProjectEvidence(
       source_type: 'project_link_receipt' as const,
       source_id: row.id,
       occurred_at: iso(row.created_at),
-      title: `${row.direction} ${row.action_type}: ${row.remote_pot} / ${row.remote_project_id}`,
+      title: sanitizeProjectDetail(`${row.direction} ${row.action_type}: ${row.remote_pot} / ${row.remote_project_id}`),
       detail: `receipt=${row.shared_receipt_sha256}; envelope=${row.envelope_sha256}${row.evidence_sha256 ? `; evidence=${row.evidence_sha256}` : ''}; key=${row.receipt_key_id}; signature=${row.receipt_signature}`,
       status: row.status,
       actor: row.source_agent_id,
