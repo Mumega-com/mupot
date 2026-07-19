@@ -1,4 +1,4 @@
--- 0060: project ↔ external board bindings (Linear / GitHub Projects / Notion).
+-- 0062: project ↔ external board bindings (Linear / GitHub Projects / Notion).
 --
 -- Mupot projects stay pot-native. External boards attach via this join table only.
 -- Providers never own project identity, RBAC, flights, gates, or evidence.

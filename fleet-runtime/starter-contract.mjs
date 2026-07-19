@@ -1,6 +1,7 @@
 import { isAbsolute, posix } from 'node:path'
 
 import { SECRET_VALUE_PATTERNS } from './service-context.mjs'
+import { normalizeAgentProfile } from './profile-contract.mjs'
 
 export const STARTER_RECEIPT_TYPE = 'mupot-fleet-starter-receipt/v1'
 
@@ -37,6 +38,7 @@ export const STARTER_MANIFEST_KEYS = Object.freeze([
   'agents',
   'control_consumer_agent_id',
 ])
+const STARTER_MANIFEST_PROFILE_KEYS = Object.freeze([...STARTER_MANIFEST_KEYS, 'profiles'])
 
 const AGENT_KEYS = Object.freeze(['agent_id', 'runtime', 'probe', 'handler'])
 const RECEIPT_KEYS = Object.freeze(['receipt_type', 'generated_at', 'status', 'manifest', 'artifacts', 'checks'])
@@ -90,7 +92,8 @@ function normalizeAgent(raw) {
 }
 
 export function normalizeStarterManifest(raw) {
-  if (!hasExactKeys(raw, STARTER_MANIFEST_KEYS) || containsSecret(raw)) return null
+  const hasProfiles = isPlainObject(raw) && Object.hasOwn(raw, 'profiles')
+  if (!hasExactKeys(raw, hasProfiles ? STARTER_MANIFEST_PROFILE_KEYS : STARTER_MANIFEST_KEYS) || containsSecret(raw)) return null
   if (raw.version !== 1 || !TENANT_RE.test(raw.tenant ?? '') || PRODUCTION_IDENTITY_RE.test(raw.tenant)) return null
   if (!SERVICE_MANAGERS.has(raw.service_manager) || !Array.isArray(raw.agents) || raw.agents.length === 0) return null
 
@@ -107,6 +110,15 @@ export function normalizeStarterManifest(raw) {
   const ids = agents.map((agent) => agent.agent_id)
   if (new Set(ids).size !== ids.length || !ids.includes(raw.control_consumer_agent_id)) return null
 
+  let profiles
+  if (hasProfiles) {
+    if (!Array.isArray(raw.profiles) || raw.profiles.length === 0) return null
+    profiles = raw.profiles.map(normalizeAgentProfile)
+    if (profiles.some((profile) => profile === null)) return null
+    const profileIds = profiles.map((profile) => profile.agent_id)
+    if (new Set(profileIds).size !== profileIds.length || profileIds.some((agentId) => !ids.includes(agentId))) return null
+  }
+
   return {
     version: 1,
     tenant: raw.tenant,
@@ -114,6 +126,7 @@ export function normalizeStarterManifest(raw) {
     service_manager: raw.service_manager,
     agents,
     control_consumer_agent_id: raw.control_consumer_agent_id,
+    ...(profiles ? { profiles } : {}),
   }
 }
 

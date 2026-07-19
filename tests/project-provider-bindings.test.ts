@@ -12,7 +12,7 @@ import { isProjectBoardProvider, PROJECT_BOARD_PROVIDERS } from '../src/projects
 import { isConnectorType } from '../src/connectors/crypto'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
-const THROUGH = '0060_project_provider_bindings.sql'
+const THROUGH = '0062_project_provider_bindings.sql'
 
 function applyThrough(sqlite: { exec(sql: string): void }, throughFile: string): void {
   for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name <= throughFile).sort()) {

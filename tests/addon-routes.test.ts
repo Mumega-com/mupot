@@ -348,6 +348,16 @@ describe('addon lifecycle routes', () => {
         description: 'Read-only marketing and conversion monitoring.',
         state: null,
       },
+      {
+        key: 'project-link',
+        name: 'Project Link',
+        version: '1.0.0',
+        publisher: 'mumega',
+        trustClass: 'native_reviewed',
+        kind: 'native',
+        description: 'Signed, bounded collaboration between sovereign Mupot projects.',
+        state: null,
+      },
     ])
     for (const addon of body.addons) {
       expect(Object.keys(addon).sort()).toEqual([

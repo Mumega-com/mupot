@@ -42,6 +42,11 @@ export interface ActiveAgentKey {
   member_id: string
 }
 
+export async function agentKeyFingerprint(pubkey: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pubkey))
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
 export type RegisterAgentKeyResult =
   | { ok: true; status: 'registered' | 'bound' | 'already_registered'; memberId: string }
   | { ok: false; reason: 'identity_unminted' | 'identity_ambiguous' | 'key_conflict' }

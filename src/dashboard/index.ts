@@ -49,6 +49,7 @@ import { resolveCapabilities, hasCapability, actorMaxRankOnScope, hasSurfaceCap 
 // the /api routes call, never re-implementing the write/validation logic.
 import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent, updateUnitConfig } from '../org/service'
 import type { UnitConfigPatch } from '../org/service'
+import { createProject, getProject, updateProject } from '../projects/service'
 import { SQUAD_PACKS, seedSquadPack } from '../org/squad-packs'
 import { mintMemberToken, revokeMemberToken, loadLiveTokens, isChannel } from '../members/service'
 import type { MintedToken, PublicMemberToken } from '../members/service'
@@ -106,13 +107,23 @@ import { loadAllAgents, loadSquadOptions } from './agents-admin'
 import type { AgentAdminRow, SquadOption } from './agents-admin'
 import { formatBurn, formatUsd } from '../agents/cost'
 import {
+  canManageProjects,
   loadProjectDetail,
   loadProjectFlights,
+  loadProjectParentOptions,
   loadProjectWorkContext,
   loadProjectsPage,
+  parseProjectListFilters,
+  projectCreateBody,
   projectDetailBody,
+  projectFormValues,
+  projectLifecycleTransition,
+  projectMutationInput,
+  projectMutationStatus,
   projectNotFoundBody,
+  projectSettingsBody,
   projectsPageBody,
+  submittedProjectFormValues,
 } from './projects'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
@@ -256,14 +267,103 @@ dashboardApp.get('/', async (c) => {
 })
 
 dashboardApp.get('/projects', async (c) => {
-  const view = await loadProjectsPage(c.env, c.get('auth'))
+  const filters = parseProjectListFilters(c.req.query('search'), c.req.query('status'))
+  if (!filters) {
+    return c.html(shell(c.env, 'Projects', errorBody('Choose a valid project status filter.')), 400)
+  }
+  const view = await loadProjectsPage(c.env, c.get('auth'), filters)
   return c.html(shell(c.env, 'Projects', projectsPageBody(view)))
+})
+
+dashboardApp.get('/projects/new', async (c) => {
+  if (!await canManageProjects(c.env, c.get('auth'))) {
+    return c.html(shell(c.env, 'Projects', errorBody('Creating a project requires workspace admin.')), 403)
+  }
+  const view = { values: projectFormValues(), parentOptions: await loadProjectParentOptions(c.env) }
+  return c.html(shell(c.env, 'Create project', projectCreateBody(view)))
+})
+
+dashboardApp.post('/projects', async (c) => {
+  if (!await canManageProjects(c.env, c.get('auth'))) {
+    return c.html(shell(c.env, 'Projects', errorBody('Creating a project requires workspace admin.')), 403)
+  }
+  const values = submittedProjectFormValues(await c.req.parseBody())
+  const result = await createProject(c.env, { ...projectMutationInput(values), status: 'planned' })
+  if (!result.ok) {
+    const view = { values, parentOptions: await loadProjectParentOptions(c.env), error: result.error }
+    return c.html(shell(c.env, 'Create project', projectCreateBody(view)), projectMutationStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(result.value.id)}?status=created`, 303)
+})
+
+dashboardApp.get('/projects/:id/settings', async (c) => {
+  const detail = await loadProjectDetail(c.env, c.get('auth'), c.req.param('id'))
+  if (!detail) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  if (!detail.canManage) {
+    return c.html(shell(c.env, 'Project settings', errorBody('Project settings require workspace admin.')), 403)
+  }
+  const body = projectSettingsBody({
+    project: detail.project,
+    values: projectFormValues(detail.project),
+    parentOptions: await loadProjectParentOptions(c.env, detail.project.id),
+  })
+  return c.html(shell(c.env, 'Project settings', body))
+})
+
+dashboardApp.post('/projects/:id/settings', async (c) => {
+  if (!await canManageProjects(c.env, c.get('auth'))) {
+    return c.html(shell(c.env, 'Project settings', errorBody('Project settings require workspace admin.')), 403)
+  }
+  const projectId = c.req.param('id')
+  const values = submittedProjectFormValues(await c.req.parseBody())
+  const result = await updateProject(c.env, projectId, projectMutationInput(values))
+  if (!result.ok) {
+    const project = await getProject(c.env, projectId)
+    if (!project) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+    const body = projectSettingsBody({
+      project,
+      values,
+      parentOptions: await loadProjectParentOptions(c.env, project.id),
+      error: result.error,
+    })
+    return c.html(shell(c.env, 'Project settings', body), projectMutationStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(result.value.id)}?status=updated`, 303)
+})
+
+dashboardApp.post('/projects/:id/status', async (c) => {
+  if (!await canManageProjects(c.env, c.get('auth'))) {
+    return c.html(shell(c.env, 'Project settings', errorBody('Project lifecycle requires workspace admin.')), 403)
+  }
+  const projectId = c.req.param('id')
+  const currentProject = await getProject(c.env, projectId)
+  if (!currentProject) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const form = await c.req.parseBody()
+  const command = typeof form.command === 'string' ? form.command : ''
+  const transition = projectLifecycleTransition(command)
+  const result = transition
+    ? await updateProject(c.env, projectId, { status: transition.status })
+    : { ok: false as const, error: 'invalid_status' as const }
+  if (!result.ok) {
+    if (result.error === 'project_not_found') {
+      return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+    }
+    const body = projectSettingsBody({
+      project: currentProject,
+      values: projectFormValues(currentProject),
+      parentOptions: await loadProjectParentOptions(c.env, currentProject.id),
+      error: result.error,
+      lifecycleCommand: command,
+    })
+    return c.html(shell(c.env, 'Project settings', body), projectMutationStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(result.value.id)}?status=${transition!.result}`, 303)
 })
 
 dashboardApp.get('/projects/:id', async (c) => {
   const view = await loadProjectDetail(c.env, c.get('auth'), c.req.param('id'))
   if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
-  return c.html(shell(c.env, view.project.name, projectDetailBody(view)))
+  return c.html(shell(c.env, view.project.name, projectDetailBody(view, c.req.query('status'))))
 })
 
 // POST /projects/:id/boards — link an external board (owner/admin).
@@ -327,7 +427,11 @@ dashboardApp.get('/send', async (c) => {
     const context = await loadProjectWorkContext(c.env, c.get('auth'), projectId)
     if (!context) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
     const agents = await loadActiveAgentsWithSquad(c.env, context.taskableSquadIds)
-    return c.html(shell(c.env, 'Send a task', sendPageBody(agents, context.project)))
+    return c.html(shell(c.env, 'Send a task', sendPageBody(
+      agents,
+      context.project,
+      context.taskableSquadIdsTruncated,
+    )))
   }
   const agents = await loadActiveAgentsWithSquad(c.env)
   return c.html(shell(c.env, 'Send a task', sendPageBody(agents)))
@@ -4033,7 +4137,7 @@ function agentConsoleBody(agent: Agent, squad: Squad | null, canWake: boolean) {
 // squad. The option VALUE carries "agentId|squadId" so the client can post both
 // without a second lookup. The client posts to /api/tasks (dispatch:true) and then
 // polls /api/tasks/:id every 2s (cap 120s), rendering sent → working → done.
-function sendPageBody(agents: PickerAgent[], project?: Project) {
+function sendPageBody(agents: PickerAgent[], project?: Project, projectSquadsTruncated = false) {
   const hasAgents = agents.length > 0
   const options = agents
     .map(
@@ -4068,6 +4172,9 @@ function sendPageBody(agents: PickerAgent[], project?: Project) {
     <h1>Send a task</h1>
     ${project ? html`<p class="empty" style="margin-top:0;max-width:640px">
       Project context: <strong>${project.name}</strong>. Only writable project squads and their active agents are available.
+    </p>` : ''}
+    ${projectSquadsTruncated ? html`<p class="empty" style="margin-top:0;max-width:640px">
+      Only the first 100 project squad edges were evaluated; additional eligible agents may be omitted.
     </p>` : ''}
     <p class="empty" style="margin-top:0;max-width:640px">
       Write what you need in plain language and pick one of your agents. It does the

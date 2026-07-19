@@ -134,6 +134,16 @@ describe('MCP project attribution parity', () => {
     }, 'https://pot.test')
     expect(reassigned).toMatchObject({ ok: true, result: { task: { project_id: 'project-b' } } })
 
+    harness.sqlite.prepare(`
+      INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at)
+      VALUES (?, ?, 'approved', ?, ?)
+    `).run('verdict-project-lock', taskId, MEMBER_ID, '2026-07-19T03:00:00Z')
+    const locked = await invokeTool(auth(), env, 'task_update', {
+      task_id: taskId,
+      project_id: 'project-a',
+    }, 'https://pot.test')
+    expect(locked).toMatchObject({ ok: false, status: 409, error: 'task_project_locked' })
+
     const listed = await invokeTool(auth(), env, 'task_list', {
       squad_id: SQUAD_ID,
       project_id: 'project-b',
@@ -573,8 +583,8 @@ describe('MCP project lifecycle control', () => {
     }, 'https://pot.test')).resolves.toMatchObject({ ok: true, result: { project: { status: 'archived' } } })
     await expect(invokeTool(admin, env, 'project_update', {
       project_id: projectId,
-      status: 'active',
-    }, 'https://pot.test')).resolves.toMatchObject({ ok: true, result: { project: { status: 'active' } } })
+      status: 'planned',
+    }, 'https://pot.test')).resolves.toMatchObject({ ok: true, result: { project: { status: 'planned' } } })
 
     await expect(invokeTool(admin, env, 'project_squad_remove', {
       project_id: projectId,
@@ -587,9 +597,30 @@ describe('MCP project lifecycle control', () => {
       { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'created', project_id: projectId } },
       { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'squad_access_set', project_id: projectId, squad_id: SQUAD_ID } },
       { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'updated', project_id: projectId, status: 'archived' } },
-      { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'updated', project_id: projectId, status: 'active' } },
+      { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'updated', project_id: projectId, status: 'planned' } },
       { type: 'project.mutated', actor: { kind: 'member', id: MEMBER_ID }, payload: { operation: 'squad_access_removed', project_id: projectId, squad_id: SQUAD_ID } },
     ])
+  })
+
+  it('restores archived projects directly to planned and reports invalid transitions as conflicts', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const admin = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' }],
+    })
+
+    await expect(invokeTool(admin, env, 'project_update', {
+      project_id: 'project-a',
+      status: 'planned',
+    }, 'https://pot.test')).resolves.toMatchObject({
+      ok: false, status: 409, error: 'invalid_status_transition',
+    })
+    await expect(invokeTool(admin, env, 'project_update', {
+      project_id: 'project-archived',
+      status: 'planned',
+    }, 'https://pot.test')).resolves.toMatchObject({
+      ok: true, result: { project: { id: 'project-archived', status: 'planned' } },
+    })
   })
 
   it('keeps project mutations admin-only and project reads edge-scoped', async () => {
@@ -611,6 +642,75 @@ describe('MCP project lifecycle control', () => {
       .toEqual(['project-a', 'project-b', 'project-read'])
     await expect(invokeTool(auth(), env, 'project_get', { project_id: 'project-no-edge' }, 'https://pot.test'))
       .resolves.toMatchObject({ ok: false, status: 404, error: 'project_not_found' })
+  })
+
+  it('resolves department grants to concrete readable squads for project_get situation', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    harness.sqlite.exec(`
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('project-a', '${OTHER_SQUAD_ID}', 'write');
+      INSERT INTO tasks (id, squad_id, title, status, project_id)
+      VALUES
+        ('department-review', '${OTHER_SQUAD_ID}', 'Department review', 'review', 'project-a'),
+        ('visible-open', '${SQUAD_ID}', 'Visible open', 'open', 'project-a');
+    `)
+    const departmentReader = auth({
+      capabilities: [
+        { member_id: MEMBER_ID, scope_type: 'department', scope_id: 'dept-a', capability: 'observer' },
+      ],
+    })
+
+    await expect(invokeTool(departmentReader, env, 'project_get', {
+      project_id: 'project-a',
+    }, 'https://pot.test')).resolves.toMatchObject({
+      ok: true,
+      result: {
+        project: { id: 'project-a' },
+        situation: {
+          health: 'review',
+          pending_reviews: [{ id: 'department-review', squad_id: OTHER_SQUAD_ID }],
+          active_work_count: 2,
+          next_action: { type: 'review_task', task: { id: 'department-review' } },
+        },
+      },
+    })
+  })
+
+  it('keeps the last department-granted squad readable beyond 1000 squads', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('bulk-dept', 'bulk-dept', 'Bulk Department');
+      WITH RECURSIVE seq(n) AS (
+        VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 1000
+      )
+      INSERT INTO squads (id, department_id, slug, name)
+      SELECT 'bulk-' || printf('%04d', n), 'bulk-dept', 'bulk-' || printf('%04d', n), 'Bulk ' || n FROM seq;
+      INSERT INTO projects (id, slug, name, status) VALUES ('bulk-project', 'bulk-project', 'Bulk Project', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('bulk-project', 'bulk-1000', 'write');
+      INSERT INTO tasks (id, squad_id, title, status, project_id)
+      VALUES ('bulk-last-task', 'bulk-1000', 'Last readable task', 'open', 'bulk-project');
+    `)
+    const reader = auth({
+      capabilities: [
+        { member_id: MEMBER_ID, scope_type: 'department', scope_id: 'bulk-dept', capability: 'observer' },
+      ],
+    })
+
+    await expect(invokeTool(reader, env, 'project_get', {
+      project_id: 'bulk-project',
+    }, 'https://pot.test')).resolves.toMatchObject({
+      ok: true,
+      result: {
+        situation: {
+          health: 'active',
+          active_work_count: 1,
+          next_action: { type: 'start_task', task: { id: 'bulk-last-task' } },
+        },
+      },
+    })
   })
 
   it('includes safe parent context for a visible nested project', async () => {

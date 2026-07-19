@@ -288,17 +288,20 @@ async function readFleetAgentRow(
     .first<Row>()
   if (byId) return byId
 
-  // 2. Slug fallback — ONLY when no id-keyed row exists, and ONLY when the slug is unique
-  // tenant-wide (ambiguity-refusal, mirroring resolveByIdThenSlug).
+  // 2. Slug fallback — ONLY when no id-keyed row exists, the slug is unique tenant-wide,
+  // and no canonical agents.id reserves that same fleet identity.
   const self = await env.DB.prepare(`SELECT slug FROM agents WHERE id = ?1 LIMIT 1`)
     .bind(agentId)
     .first<{ slug: string | null }>()
   if (!self?.slug) return null // no such agent, or no slug on record — nothing to fall back to
 
-  const dupes = await env.DB.prepare(`SELECT COUNT(*) AS n FROM agents WHERE slug = ?1`)
+  const dupes = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM agents WHERE slug = ?1
+      AND NOT EXISTS (SELECT 1 FROM agents canonical WHERE canonical.id = ?1)`,
+  )
     .bind(self.slug)
     .first<{ n: number }>()
-  if (Number(dupes?.n ?? 0) !== 1) return null // 0 is impossible (self counts), >1 is ambiguous — refuse either way
+  if (Number(dupes?.n ?? 0) !== 1) return null // 0 means an ID collision; >1 means an ambiguous slug.
 
   return await env.DB.prepare(
     `SELECT agent_id, runtime, status, last_reported_at FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
@@ -339,6 +342,92 @@ export interface FleetAgentRouteInfo {
    * for any runtime — like kasra's live signed-attach today — that reports under its slug.
    */
   agentId: string
+}
+
+export interface FleetAgentIdentity {
+  agent_id: string
+  slug: string
+}
+
+export interface FleetAgentRuntimeState {
+  runtime: string
+  status: string
+  presence: Presence
+  host: string
+  last_seen: string
+}
+
+const MAX_RUNTIME_STATE_BATCH = 100
+
+/**
+ * Resolve a bounded set of canonical agent IDs to fleet rows without per-agent reads.
+ * Exact fleet IDs always win and reserve that identity globally. Slug-keyed rows are used
+ * only when that slug belongs to exactly one agent tenant-wide and collides with no agents.id,
+ * matching readFleetAgentRow's ambiguity refusal.
+ */
+export async function getFleetAgentRuntimeStates(
+  env: Env,
+  agents: FleetAgentIdentity[],
+  nowMs = Date.now(),
+): Promise<Map<string, FleetAgentRuntimeState>> {
+  const unique = new Map<string, FleetAgentIdentity>()
+  for (const agent of agents) {
+    if (!unique.has(agent.agent_id)) unique.set(agent.agent_id, agent)
+  }
+  if (unique.size > MAX_RUNTIME_STATE_BATCH) {
+    throw new RangeError(`fleet runtime state batch exceeds ${MAX_RUNTIME_STATE_BATCH} agents`)
+  }
+  if (!unique.size) return new Map()
+
+  type FleetRow = {
+    agent_id: string
+    runtime: string | null
+    status: string | null
+    host: string | null
+    last_reported_at: string | null
+  }
+  const identities = [...new Set([...unique.values()].flatMap((agent) => (
+    agent.slug ? [agent.agent_id, agent.slug] : [agent.agent_id]
+  )))]
+  const slugs = [...new Set([...unique.values()].map((agent) => agent.slug).filter(Boolean))]
+  const fleetRowsPromise = env.DB.prepare(
+    `SELECT agent_id, runtime, status, host, last_reported_at
+       FROM fleet_agents
+      WHERE tenant = ?1
+        AND agent_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))`,
+  ).bind(env.TENANT_SLUG, JSON.stringify(identities)).all<FleetRow>()
+  const slugCountsPromise = slugs.length
+    ? env.DB.prepare(
+        `SELECT slug_owner.slug, COUNT(*) AS n
+           FROM agents slug_owner
+          WHERE slug_owner.slug IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
+            AND NOT EXISTS (
+              SELECT 1 FROM agents canonical WHERE canonical.id = slug_owner.slug
+            )
+          GROUP BY slug_owner.slug`,
+      ).bind(JSON.stringify(slugs)).all<{ slug: string; n: number }>()
+    : Promise.resolve({ results: [] as { slug: string; n: number }[] })
+  const [fleetRows, slugCounts] = await Promise.all([fleetRowsPromise, slugCountsPromise])
+  const byIdentity = new Map((fleetRows.results ?? []).map((row) => [row.agent_id, row]))
+  const cardinality = new Map((slugCounts.results ?? []).map((row) => [row.slug, Number(row.n)]))
+  const ttlSec = presenceTtlSec(env)
+  const resolved = new Map<string, FleetAgentRuntimeState>()
+
+  for (const agent of unique.values()) {
+    const exact = byIdentity.get(agent.agent_id)
+    const row = exact ?? (cardinality.get(agent.slug) === 1 ? byIdentity.get(agent.slug) : undefined)
+    if (!row) continue
+    const status = String(row.status ?? 'unknown')
+    const lastSeen = String(row.last_reported_at ?? '')
+    resolved.set(agent.agent_id, {
+      runtime: String(row.runtime ?? ''),
+      status,
+      presence: derivePresence(status, lastSeen, ttlSec, nowMs),
+      host: String(row.host ?? ''),
+      last_seen: lastSeen,
+    })
+  }
+  return resolved
 }
 
 /**

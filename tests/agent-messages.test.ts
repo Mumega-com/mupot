@@ -29,14 +29,47 @@ function makeDb(
     /** Force the first N findBySenderRequestId lookups to MISS — simulates the race where a
      *  concurrent writer's row isn't visible to the pre-check but exists by re-check time. */
     missDedupCalls?: number
+    signedOnlyAgents?: string[]
+    activeKeyAgents?: string[]
   } = {},
 ) {
   const messages: MsgRow[] = []
   const agents = opts.agents ?? []
+  const signedOnlyAgents = new Set(opts.signedOnlyAgents ?? [])
+  const fences = new Map<string, {
+    mode: 'bearer_only' | 'signed_only'; generation: number; key_fingerprint: string | null; updated_at: string
+  }>([...signedOnlyAgents].map((agent) => [agent, {
+    mode: 'signed_only', generation: 1, key_fingerprint: 'f'.repeat(64), updated_at: '2026-06-19T12:00:00.000Z',
+  }]))
+  const activeKeyAgents = new Set(opts.activeKeyAgents ?? [])
   let missLeft = opts.missDedupCalls ?? 0
   let seqCounter = 0
 
   function runRun(sql: string, b: unknown[]) {
+    if (sql.includes('INSERT INTO agent_inbox_fences')) {
+      const [, agent, mode, keyFingerprint, , updatedAt, , expectedGeneration] = b as [
+        string, string, 'bearer_only' | 'signed_only', string | null, string, string, string, number,
+      ]
+      const prior = fences.get(agent)
+      if ((prior?.generation ?? 0) !== expectedGeneration) return { meta: { changes: 0 } }
+      fences.set(agent, {
+        mode, generation: (prior?.generation ?? 0) + 1, key_fingerprint: keyFingerprint, updated_at: updatedAt,
+      })
+      return { meta: { changes: 1 } }
+    }
+    if (sql.includes('DELETE FROM agent_inbox_fences')) {
+      const [, agent] = b as [string, string]
+      const changes = fences.delete(agent) ? 1 : 0
+      return { meta: { changes } }
+    }
+    if (sql.includes('UPDATE agent_inbox_fences') && sql.includes("mode = 'bearer_only'")) {
+      const [, agent, updatedAt] = b as [string, string, string, string]
+      const prior = fences.get(agent)
+      fences.set(agent, {
+        mode: 'bearer_only', generation: (prior?.generation ?? 0) + 1, key_fingerprint: null, updated_at: updatedAt,
+      })
+      return { meta: { changes: 1 } }
+    }
     if (sql.includes('INSERT INTO agent_messages')) {
       const [id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, maxUnread] =
         b as [string, string, string, string, string, string, string, string | null, string | null, string, number]
@@ -59,6 +92,16 @@ function makeDb(
   }
 
   function runFirst(sql: string, b: unknown[]) {
+    if (sql.includes('FROM agent_keys k') && sql.includes('JOIN members m')) {
+      const [, agent] = b as [string, string]
+      return activeKeyAgents.has(agent)
+        ? { pubkey: 'A'.repeat(43), algo: 'Ed25519', member_id: 'm1' }
+        : null
+    }
+    if (/^\s*SELECT mode, generation(?:, key_fingerprint)?(?:, updated_at)? FROM agent_inbox_fences/.test(sql)) {
+      const [tenant, agent] = b as [string, string]
+      return tenant === 't' ? fences.get(agent) ?? null : null
+    }
     if (sql.includes('from_agent = ?2 AND request_id = ?3')) {
       if (missLeft > 0) {
         missLeft--
@@ -74,6 +117,8 @@ function makeDb(
     }
     if (sql.includes('COUNT(*) AS n FROM agent_messages')) {
       const [tenant, to_agent] = b as [string, string]
+      const effectiveMode = fences.get(to_agent)?.mode ?? 'bearer_only'
+      if (!sql.includes("mode = 'signed_only'") && effectiveMode !== 'bearer_only') return { n: 0 }
       const n = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).length
       return { n }
     }
@@ -85,8 +130,22 @@ function makeDb(
   }
 
   function runAll(sql: string, b: unknown[]) {
+    if (sql.includes('INSERT INTO agent_inbox_fences')) {
+      const [, agent, mode, keyFingerprint, , updatedAt, , expectedGeneration] = b as [
+        string, string, 'bearer_only' | 'signed_only', string | null, string, string, string, number,
+      ]
+      const prior = fences.get(agent)
+      if ((prior?.generation ?? 0) !== expectedGeneration) return []
+      const row = {
+        mode, generation: (prior?.generation ?? 0) + 1, key_fingerprint: keyFingerprint, updated_at: updatedAt,
+      }
+      fences.set(agent, row)
+      return [row]
+    }
     if (sql.includes('UPDATE agent_messages SET read_at')) {
       const [readAt, tenant, to_agent, limit] = b as [string, string, string, number]
+      const effectiveMode = fences.get(to_agent)?.mode ?? 'bearer_only'
+      if (!sql.includes("mode = 'signed_only'") && effectiveMode !== 'bearer_only') return []
       const claimed = messages
         .filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null)
         .sort((x, y) => x.seq - y.seq)
@@ -97,6 +156,8 @@ function makeDb(
     }
     if (sql.includes('FROM agent_messages') && sql.includes('read_at IS NULL') && sql.includes('ORDER BY seq ASC')) {
       const [tenant, to_agent, limit] = b as [string, string, number]
+      const effectiveMode = fences.get(to_agent)?.mode ?? 'bearer_only'
+      if (!sql.includes("mode = 'signed_only'") && effectiveMode !== 'bearer_only') return []
       return messages
         .filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null)
         .sort((x, y) => x.seq - y.seq)
@@ -112,6 +173,7 @@ function makeDb(
 
   const db = {
     _messages: messages,
+    _fences: fences,
     prepare(sql: string) {
       const binds: unknown[] = []
       const api = {
@@ -350,6 +412,17 @@ describe('readAgentInbox', () => {
     expect(p2.messages.length).toBe(2) // still there
   })
 
+  it('signed-only fence rejects bearer/MCP reads without consuming', async () => {
+    const db = makeDb({ signedOnlyAgents: ['ag-review'] })
+    const env = envWith(db)
+    await seed(env, 'ag-review', ['fenced work'])
+
+    const bearer = await readAgentInbox(env, { agent: 'ag-review' })
+    expect(bearer).toMatchObject({ ok: false, reason: 'consumer_fenced' })
+    expect(db._messages[0].read_at).toBeNull()
+
+  })
+
   it('limit caps the batch; remaining reports the rest', async () => {
     const db = makeDb()
     const env = envWith(db)
@@ -389,10 +462,16 @@ describe('readAgentInbox', () => {
 // ── the send/inbox MCP tools ────────────────────────────────────────────────────────────────
 const toolSend = TOOLS.find((t) => t.name === 'send')!
 const toolInbox = TOOLS.find((t) => t.name === 'inbox')!
+const toolInboxFenceSet = TOOLS.find((t) => t.name === 'set_agent_inbox_consumer')!
+const toolInboxFenceStatus = TOOLS.find((t) => t.name === 'inbox_consumer_status')!
 const CTX = { origin: 'https://pot.test' }
 
 function auth(boundAgentId: string | null): AuthContext {
   return { userId: 'u1', email: 'a@b.com', role: 'member', tenant: 't', memberId: 'm1', capabilities: [], boundAgentId } as AuthContext
+}
+
+function ownerAuth(): AuthContext {
+  return { userId: 'owner', email: 'owner@example.com', role: 'owner', tenant: 't', memberId: 'owner-member', boundAgentId: null } as AuthContext
 }
 
 describe('send / inbox tools', () => {
@@ -401,6 +480,8 @@ describe('send / inbox tools', () => {
   it('registered in TOOLS', () => {
     expect(toolSend).toBeTruthy()
     expect(toolInbox).toBeTruthy()
+    expect(toolInboxFenceSet).toBeTruthy()
+    expect(toolInboxFenceStatus).toBeTruthy()
   })
 
   it('send: a non-agent-bound token is refused (403)', async () => {
@@ -419,7 +500,7 @@ describe('send / inbox tools', () => {
   })
 
   it('send: happy path resolves recipient + persists', async () => {
-    const db = makeDb({ agents })
+    const db = makeDb({ agents, activeKeyAgents: ['ag-review'] })
     const r = await toolSend.run(auth('ag-code'), envWith(db), { to: 'review', body: 'build it' }, CTX)
     expect(r.ok).toBe(true)
     if (!r.ok) return
@@ -444,5 +525,54 @@ describe('send / inbox tools', () => {
     const res = r.result as { messages: Array<{ body: string }>; consumed: boolean }
     expect(res.messages.map((m) => m.body)).toEqual(['for review'])
     expect(res.consumed).toBe(true)
+  })
+
+  it('workspace admin fences one agent to signed-only and can reopen it', async () => {
+    const db = makeDb({ agents, activeKeyAgents: ['ag-review'] })
+    const env = envWith(db)
+    await toolSend.run(auth('ag-code'), env, { to: 'review', body: 'fenced task' }, CTX)
+
+    const fenced = await toolInboxFenceSet.run(ownerAuth(), env, {
+      agent: 'review', mode: 'signed_only', expected_generation: 0, reason: 'activate Kubernetes Host',
+    }, CTX)
+    expect(fenced, JSON.stringify(fenced)).toMatchObject({ ok: true, result: { agent_id: 'ag-review', mode: 'signed_only', generation: 1 } })
+    const status = await toolInboxFenceStatus.run(auth('ag-review'), env, {}, CTX)
+    expect(status).toMatchObject({ ok: true, result: { agent_id: 'ag-review', mode: 'signed_only', generation: 1 } })
+
+    const blocked = await toolInbox.run(auth('ag-review'), env, {}, CTX)
+    expect(blocked).toMatchObject({ ok: false, status: 409, error: 'consumer_fenced' })
+    expect(db._messages[0].read_at).toBeNull()
+
+    const opened = await toolInboxFenceSet.run(ownerAuth(), env, {
+      agent: 'ag-review', mode: 'bearer_only', expected_generation: 1, reason: 'rollback to legacy subscriber',
+    }, CTX)
+    expect(opened).toMatchObject({ ok: true, result: { agent_id: 'ag-review', mode: 'bearer_only', generation: 2 } })
+    expect((await toolInbox.run(auth('ag-review'), env, {}, CTX)).ok).toBe(true)
+
+    const refenced = await toolInboxFenceSet.run(ownerAuth(), env, {
+      agent: 'ag-review', mode: 'signed_only', expected_generation: 2, reason: 'reactivate Host',
+    }, CTX)
+    expect(refenced).toMatchObject({ ok: true, result: { mode: 'signed_only', generation: 3 } })
+  })
+
+  it('ordinary members cannot change the inbox fence', async () => {
+    const result = await toolInboxFenceSet.run(auth('ag-code'), envWith(makeDb({ agents })), {
+      agent: 'ag-review', mode: 'signed_only', expected_generation: 0, reason: 'unauthorized',
+    }, CTX)
+    expect(result).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+  })
+
+  it('signed-only activation requires an active key and the expected generation', async () => {
+    const env = envWith(makeDb({ agents }))
+    const noKey = await toolInboxFenceSet.run(ownerAuth(), env, {
+      agent: 'ag-review', mode: 'signed_only', expected_generation: 0, reason: 'activate',
+    }, CTX)
+    expect(noKey).toMatchObject({ ok: false, status: 409, error: 'active_agent_key_required' })
+
+    const keyedEnv = envWith(makeDb({ agents, activeKeyAgents: ['ag-review'] }))
+    const stale = await toolInboxFenceSet.run(ownerAuth(), keyedEnv, {
+      agent: 'ag-review', mode: 'signed_only', expected_generation: 4, reason: 'activate',
+    }, CTX)
+    expect(stale).toMatchObject({ ok: false, status: 409, error: 'fence_generation_conflict' })
   })
 })

@@ -318,7 +318,14 @@ describe('task project attribution', () => {
       type: 'task.created',
       payload: expect.objectContaining({ task_id: task.id, project_id: 'project-write' }),
     }))
-    expect(() => harness!.sqlite.prepare('UPDATE tasks SET title = ? WHERE id = ?').run('Forbidden mutation', task.id))
+    // #391 (migration 0061): non-attribution writes (title/status/etc.) keep flowing
+    // after a squad's project access is revoked — only re-attribution (project_id/
+    // squad_id change) is re-checked against project_squad_access.
+    expect(() => harness!.sqlite.prepare('UPDATE tasks SET title = ? WHERE id = ?').run('In-flight mutation', task.id))
+      .not.toThrow()
+    expect(harness!.sqlite.prepare('SELECT title FROM tasks WHERE id = ?').get(task.id))
+      .toEqual({ title: 'In-flight mutation' })
+    expect(() => harness!.sqlite.prepare('UPDATE tasks SET project_id = ? WHERE id = ?').run('project-read', task.id))
       .toThrow(/task project access denied/)
   })
 
@@ -349,6 +356,21 @@ describe('task project attribution', () => {
     const removed = await fetch(harness, '/task-a', 'PATCH', { project_id: null })
     expect(removed.status).toBe(200)
     await expect(removed.json()).resolves.toMatchObject({ task: { id: 'task-a', project_id: null } })
+  })
+
+  it('returns the stable project lock conflict after durable evidence exists', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, done_when, status, project_id)
+      VALUES ('task-receipted', 'squad-a', 'Receipted', 'done', 'review', 'project-write');
+      INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at)
+      VALUES ('verdict-receipted', 'task-receipted', 'approved', 'member-a', '2026-07-19T03:00:00Z');
+    `)
+    authState.current = actor()
+
+    const response = await fetch(harness, '/task-receipted', 'PATCH', { project_id: null })
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'task_project_locked' })
   })
 
   it('returns a stable conflict and emits no event when a concurrent reassignment wins', async () => {

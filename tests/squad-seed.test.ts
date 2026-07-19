@@ -132,6 +132,8 @@ function makeDb() {
       async first<T>(): Promise<T | null> {
         const s = sql.trim()
 
+        if (/FROM agent_inbox_fences/i.test(s)) return null
+
         // resolveCapabilities: SELECT from capabilities UNION channel_capability_grants
         if (/SELECT member_id, scope_type, scope_id, capability/.test(s) && /FROM capabilities/.test(s)) {
           const [memberId] = binds as [string]

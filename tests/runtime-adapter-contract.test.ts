@@ -323,6 +323,13 @@ describe('runtime-adapter/v1 contract artifact', () => {
   it('keeps local browser and runtime evidence wired into CI', () => {
     const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
     const script = readFileSync(new URL('../scripts/ci-local-evidence.sh', import.meta.url), 'utf8')
+    const commandBlock = (start: string, end: string) => {
+      const startIndex = script.indexOf(start)
+      const endIndex = script.indexOf(end, startIndex)
+      expect(startIndex).toBeGreaterThanOrEqual(0)
+      expect(endIndex).toBeGreaterThan(startIndex)
+      return script.slice(startIndex, endIndex)
+    }
 
     expect(workflow).toContain('local-evidence:')
     expect(workflow).toContain('npx playwright install --with-deps chromium')
@@ -331,12 +338,31 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(workflow).toContain('tmp/local-smoke')
     expect(workflow).toContain('tmp/local-runtime-conformance')
 
-    expect(script).toContain('npm run migrate:local:test')
-    expect(script).toContain('npm run seed:local:test')
-    expect(script).toContain('--local')
-    expect(script).toContain('wrangler-local-test.toml')
-    expect(script).toContain('npm run smoke:local')
-    expect(script).toContain('npm run conformance:runtime:local')
-    expect(script).toContain('/health')
+    const migration = commandBlock('"${WRANGLER[@]}" d1 migrations apply mupot-local-test', 'say "Seeding local D1 fixtures"')
+    const seed = commandBlock('"${WRANGLER[@]}" d1 execute mupot-local-test', 'say "Starting local Wrangler server')
+    const dev = commandBlock('"${WRANGLER[@]}" dev', 'dev_pid="$!"')
+    for (const block of [migration, seed, dev]) {
+      expect(block).toContain('--local')
+      expect(block).toContain('--config wrangler-local-test.toml')
+      expect(block).toContain('--persist-to "${STATE_DIR}"')
+    }
+    expect(seed).toContain('--file scripts/local-test-seed.sql')
+    expect(script).not.toContain('npm run migrate:local:test')
+    expect(script).not.toContain('npm run seed:local:test')
+    expect(script).toContain('STATE_DIR="$(mktemp -d "${EVIDENCE_DIR}/state.XXXXXX")"')
+
+    const cleanup = commandBlock('cleanup() {', 'trap cleanup EXIT')
+    expect(cleanup).toContain('if [[ -n "${STATE_DIR}" && "${STATE_DIR}" == "${EVIDENCE_DIR}"/state.* ]]; then')
+    expect(cleanup).toContain('rm -rf -- "${STATE_DIR}"')
+
+    const health = commandBlock('wait_for_health() {', 'say "Applying local D1 migrations"')
+    expect(health).toContain('"${BASE_URL}/health"')
+
+    const healthCall = script.lastIndexOf('\nwait_for_health\n')
+    const browserCall = script.indexOf('npm run smoke:local', healthCall)
+    const runtimeCall = script.indexOf('npm run conformance:runtime:local', browserCall)
+    expect(healthCall).toBeGreaterThan(script.indexOf('dev_pid="$!"'))
+    expect(browserCall).toBeGreaterThan(healthCall)
+    expect(runtimeCall).toBeGreaterThan(browserCall)
   })
 })

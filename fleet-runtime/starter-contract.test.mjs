@@ -37,6 +37,19 @@ function sterileManifest() {
   }
 }
 
+function policyProfile(agentId = 'manager') {
+  return {
+    schema: 'mupot.agent-profile/v1',
+    agent_id: agentId,
+    adapter: agentId === 'manager' ? 'hermes' : 'codex',
+    command: agentId === 'manager' ? ['/usr/local/bin/hermes', 'chat'] : ['/usr/local/bin/codex', 'exec'],
+    allowed_senders: [agentId === 'manager' ? 'builder' : 'manager'],
+    allowed_project_ids: ['project-example'],
+    run_for: ['request'],
+    timeout_ms: 120000,
+  }
+}
+
 function starterReceipt() {
   return {
     receipt_type: STARTER_RECEIPT_TYPE,
@@ -74,6 +87,27 @@ test('shared starter contract accepts and normalizes the exact Task 8 fixture', 
     'lifecycle_control_stop',
     'receipt_bundle_manifest',
   ])
+})
+
+test('shared starter contract accepts optional policy profiles bound to declared agents', () => {
+  const manifest = sterileManifest()
+  manifest.profiles = [policyProfile('manager'), policyProfile('builder')]
+
+  assert.deepEqual(normalizeStarterManifest(manifest), manifest)
+  assert.deepEqual(validateStarterManifest(manifest), manifest)
+})
+
+test('shared starter contract rejects duplicate, undeclared, and secret-bearing policy profiles', () => {
+  const duplicate = sterileManifest()
+  duplicate.profiles = [policyProfile('manager'), policyProfile('manager')]
+  const undeclared = sterileManifest()
+  undeclared.profiles = [policyProfile('outside-agent')]
+  const secret = sterileManifest()
+  secret.profiles = [{ ...policyProfile('manager'), command: ['/usr/local/bin/hermes', '--token=mupot_example_secret'] }]
+
+  for (const manifest of [duplicate, undeclared, secret]) {
+    assert.equal(normalizeStarterManifest(manifest), null)
+  }
 })
 
 test('shared starter contract rejects unknown fields recursively', () => {

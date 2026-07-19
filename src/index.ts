@@ -54,6 +54,7 @@ import { resellerApp } from './reseller/routes'
 import { inboxApp } from './agents/inbox-routes'
 import { coordinationApp } from './coordination/routes'
 import { addonsApp } from './addons/routes'
+import { projectLinkApp } from './addons/project-link/routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -143,6 +144,10 @@ app.route('/api/coordination', coordinationApp)
 
 // Native addon catalog and lifecycle commands. Before the dashboard catch-all.
 app.route('/api/addons', addonsApp)
+
+// Signed cross-pot project delivery. Authentication is the paired Ed25519 link;
+// every accepted action is reauthorized against this pot's project/squad edge.
+app.route('/api/project-links', projectLinkApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp

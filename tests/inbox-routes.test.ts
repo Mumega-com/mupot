@@ -3,6 +3,7 @@
 // caller's welded identity; the DB fake faithfully models agents + agent_messages.
 
 import { describe, it, expect, vi } from 'vitest'
+import { createHash } from 'node:crypto'
 import type { Env } from '../src/types'
 
 // Mock the member-token auth so we drive the caller's weld directly.
@@ -30,10 +31,15 @@ function makeDb(
   agents: Array<{ id: string; squad_id: string; slug: string; name: string }>,
   keys: Record<string, KeyRow> = {},
   memberStatuses: Record<string, string> = {},
+  signedOnlyAgents: ReadonlySet<string> = new Set(),
 ) {
   const messages: MsgRow[] = []
   const nonces = new Set<string>()
   let seqCounter = 0
+  const keyFingerprint = (tenant: string, agentId: string) => {
+    const key = keys[`${tenant}:${agentId}`]
+    return key ? createHash('sha256').update(key.pubkey).digest('hex') : null
+  }
 
   function runRun(sql: string, b: unknown[]) {
     if (sql.includes('INSERT INTO agent_messages')) {
@@ -51,6 +57,12 @@ function makeDb(
     throw new Error('unhandled run: ' + sql)
   }
   function runFirst(sql: string, b: unknown[]) {
+    if (/^\s*SELECT mode, generation, key_fingerprint FROM agent_inbox_fences/.test(sql)) {
+      const [tenant, agentId] = b as [string, string]
+      return tenant === 't' && signedOnlyAgents.has(agentId)
+        ? { mode: 'signed_only', generation: 1, key_fingerprint: keyFingerprint(tenant, agentId) }
+        : null
+    }
     if (sql.includes('FROM agent_keys k') && sql.includes('JOIN members m')) {
       const [tenant, agentId] = b as [string, string]
       const key = keys[`${tenant}:${agentId}`]
@@ -63,6 +75,12 @@ function makeDb(
     }
     if (sql.includes('COUNT(*) AS n FROM agent_messages')) {
       const [tenant, to_agent] = b as [string, string]
+      const effectiveMode = signedOnlyAgents.has(to_agent) ? 'signed_only' : 'bearer_only'
+      const signed = sql.includes("mode = 'signed_only'")
+      const suppliedFingerprint = b[2] as string | undefined
+      if (signed) {
+        if (effectiveMode !== 'signed_only' || suppliedFingerprint !== keyFingerprint(tenant, to_agent)) return { n: 0 }
+      } else if (effectiveMode !== 'bearer_only') return { n: 0 }
       return { n: messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).length }
     }
     if (sql.includes('FROM agents WHERE id = ?1 LIMIT 1')) {
@@ -78,12 +96,22 @@ function makeDb(
   function runAll(sql: string, b: unknown[]) {
     if (sql.includes('UPDATE agent_messages SET read_at')) {
       const [readAt, tenant, to_agent, limit] = b as [string, string, string, number]
+      const effectiveMode = signedOnlyAgents.has(to_agent) ? 'signed_only' : 'bearer_only'
+      const signed = sql.includes("mode = 'signed_only'")
+      if (signed) {
+        if (effectiveMode !== 'signed_only' || b[4] !== keyFingerprint(tenant, to_agent)) return []
+      } else if (effectiveMode !== 'bearer_only') return []
       const claimed = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).sort((x, y) => x.seq - y.seq).slice(0, limit)
       for (const m of claimed) m.read_at = readAt
       return claimed.map((m) => ({ ...m }))
     }
     if (sql.includes('FROM agent_messages') && sql.includes('read_at IS NULL') && sql.includes('ORDER BY seq ASC')) {
       const [tenant, to_agent, limit] = b as [string, string, number]
+      const effectiveMode = signedOnlyAgents.has(to_agent) ? 'signed_only' : 'bearer_only'
+      const signed = sql.includes("mode = 'signed_only'")
+      if (signed) {
+        if (effectiveMode !== 'signed_only' || b[3] !== keyFingerprint(tenant, to_agent)) return []
+      } else if (effectiveMode !== 'bearer_only') return []
       return messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).sort((x, y) => x.seq - y.seq).slice(0, limit).map((m) => ({ ...m }))
     }
     if (sql.includes('FROM agents WHERE slug = ?1')) {
@@ -123,8 +151,9 @@ function env(
   agents: Array<{ id: string; squad_id: string; slug: string; name: string }> = [],
   keys: Record<string, KeyRow> = {},
   memberStatuses: Record<string, string> = {},
+  signedOnlyAgents: ReadonlySet<string> = new Set(),
 ): { env: Env; db: ReturnType<typeof makeDb> } {
-  const db = makeDb(agents, keys, memberStatuses)
+  const db = makeDb(agents, keys, memberStatuses, signedOnlyAgents)
   return { env: { TENANT_SLUG: 't', DB: db } as unknown as Env, db }
 }
 
@@ -225,6 +254,14 @@ describe('GET /api/inbox', () => {
     const { env: e } = env(AGENTS)
     expect((await inboxApp.fetch(getReq('tok-code', '?limit=abc'), e)).status).toBe(400)
   })
+  it('signed-only fence rejects bearer reads without consuming', async () => {
+    const { env: e, db } = env(AGENTS, {}, {}, new Set(['ag-code']))
+    db._messages.push({ seq: 1, id: 'x', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'message', body: 'fenced', request_id: null, in_reply_to: null, created_at: 't0', read_at: null })
+    const res = await inboxApp.fetch(getReq('tok-code'), e)
+    expect(res.status).toBe(409)
+    expect(await res.json()).toMatchObject({ error: 'consumer_fenced' })
+    expect(db._messages[0].read_at).toBeNull()
+  })
 })
 
 describe('POST /api/inbox/send', () => {
@@ -257,9 +294,28 @@ describe('POST /api/inbox/send', () => {
 })
 
 describe('POST /api/inbox/signed', () => {
+  it('signed Host remains authoritative while the bearer inbox is fenced', async () => {
+    const { kp, pubX } = await genKey()
+    const { env: e, db } = env(
+      AGENTS,
+      { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-code' } },
+      {},
+      new Set(['ag-code']),
+    )
+    db._messages.push({ seq: 1, id: 'x', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'message', body: 'host only', request_id: null, in_reply_to: null, created_at: 't0', read_at: null })
+    const res = await postSigned(await signedInboxBody(kp.privateKey, 'ag-code', { peek: false, limit: 1 }), e)
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({ consumed: true, messages: [{ body: 'host only' }] })
+  })
+
   it('valid signature can peek without consuming, then consume the signed agent inbox', async () => {
     const { kp, pubX } = await genKey()
-    const { env: e, db } = env(AGENTS, { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-code' } })
+    const { env: e, db } = env(
+      AGENTS,
+      { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-code' } },
+      {},
+      new Set(['ag-code']),
+    )
     db._messages.push({
       seq: 1,
       id: 'x',
@@ -292,9 +348,27 @@ describe('POST /api/inbox/signed', () => {
     expect(((await emptyRes.json()) as { messages: unknown[] }).messages).toEqual([])
   })
 
+  it('bearer-only mode refuses signed peek and consumption', async () => {
+    const { kp, pubX } = await genKey()
+    const { env: e, db } = env(AGENTS, { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-code' } })
+    db._messages.push({ seq: 1, id: 'x', tenant: 't', to_agent: 'ag-code', from_agent: 'ag-review', from_member: 'm', kind: 'message', body: 'preflight', request_id: null, in_reply_to: null, created_at: 't0', read_at: null })
+    const peek = await postSigned(await signedInboxBody(kp.privateKey, 'ag-code', { peek: true, limit: 1 }), e)
+    expect(peek.status).toBe(409)
+    expect(await peek.json()).toMatchObject({ error: 'consumer_fenced' })
+    const consume = await postSigned(await signedInboxBody(kp.privateKey, 'ag-code', { peek: false, limit: 1 }), e)
+    expect(consume.status).toBe(409)
+    expect(await consume.json()).toMatchObject({ error: 'consumer_fenced' })
+    expect(db._messages[0].read_at).toBeNull()
+  })
+
   it('replay of the same signed inbox request is rejected', async () => {
     const { kp, pubX } = await genKey()
-    const { env: e } = env(AGENTS, { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-code' } })
+    const { env: e } = env(
+      AGENTS,
+      { 't:ag-code': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-code' } },
+      {},
+      new Set(['ag-code']),
+    )
     const body = await signedInboxBody(kp.privateKey, 'ag-code', { peek: true, limit: 10 })
     expect((await postSigned(body, e)).status).toBe(200)
     expect((await postSigned(body, e)).status).toBe(409)
