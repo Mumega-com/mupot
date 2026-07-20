@@ -245,6 +245,74 @@ describe('MCP task cutover tools', () => {
     ])
   })
 
+  // ── #406 fast-follow (Opus re-gate WARN-1 on #404) ──────────────────────────
+  // #404 closed AUTO-pickup of an unassigned source_pot task (canAgentExecuteTask,
+  // src/agents/execute.ts) — a remote adversary pot delivers tasks unassigned and
+  // cannot assign, so remote-triggered execution stays closed. But ASSIGNMENT
+  // itself only required member+ here, and a runtime-welded agent token carries
+  // member on its own squad (this file's default `auth()` — boundAgentId set,
+  // capabilities: [member on SQUAD_ID] — is exactly that shape), so a local agent
+  // could self-assign a hostile cross-pot task and then execute it. These tests
+  // prove the admin-floor fix end to end through the REAL, reachable production
+  // path (a memberId+capabilities MCP bearer principal).
+  it('task_update REFUSES a member-only principal assigning a source_pot task (#406)', async () => {
+    const { env } = makeEnv([task({ source_pot: 'attacker-pot', assignee_agent_id: null })])
+
+    const res = await invokeTool(
+      auth(), // default capabilities: member on SQUAD_ID only
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: AGENT_ID },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+  })
+
+  it('task_update REFUSES a member-only principal UNassigning (null) a source_pot task (#406)', async () => {
+    const { env } = makeEnv([task({ source_pot: 'attacker-pot', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: null },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+  })
+
+  it('task_update ALLOWS an admin-capability principal to assign a source_pot task (#406)', async () => {
+    const { env } = makeEnv([task({ source_pot: 'attacker-pot', assignee_agent_id: null })])
+
+    const res = await invokeTool(
+      auth({
+        capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'admin' }],
+      }),
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: AGENT_ID },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: true, result: { task: { assignee_agent_id: AGENT_ID } } })
+  })
+
+  it('task_update leaves LOCAL (source_pot NULL) task assignment unaffected — member+ still sufficient (#406 regression check)', async () => {
+    const { env } = makeEnv([task({ source_pot: null, assignee_agent_id: null })])
+
+    const res = await invokeTool(
+      auth(), // member-only capability, same as the refused case above
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: AGENT_ID },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: true, result: { task: { assignee_agent_id: AGENT_ID } } })
+  })
+
   it('task_update accepts a cross-squad assignee with one active bound member and a target-squad member grant', async () => {
     const { env } = makeEnv([task()], { memberId: 'member-other', capability: 'member' })
 
