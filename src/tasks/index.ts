@@ -882,7 +882,7 @@ interface VerdictBody {
 // Agent principals: if the caller is an agent token rather than a member, we check
 // principal_type='agent' using auth.userId as the principal_id (agent tokens carry
 // the agent id as userId).
-async function callerHoldsGateCapability(
+export async function callerHoldsGateCapability(
   env: Env,
   auth: AuthContext,
   _squadId: string,
