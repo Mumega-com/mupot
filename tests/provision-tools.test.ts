@@ -338,7 +338,8 @@ describe('create_agent', () => {
 describe('mint_agent_token', () => {
   it('org-admin mints a bound token (the weld) with a default hard-capped squad member grant', async () => {
     const cap = [] as Captured[]
-    const res = await call('mint_agent_token', { agent: 'growth-lead' }, makeEnv({}, cap))
+    // Fresh agent (no prior member) so the FIRST mint creates the member + guard cap.
+    const res = await call('mint_agent_token', { agent: 'growth-lead' }, makeEnv({ agentTokenMembers: [] }, cap))
     expect(res.status).toBe(200)
     const body = (await res.json()) as {
       result: {
@@ -392,7 +393,7 @@ describe('mint_agent_token', () => {
     const observerRes = await call(
       'mint_agent_token',
       { agent: 'growth-lead', capability: 'observer' },
-      makeEnv({}, observerRows),
+      makeEnv({ agentTokenMembers: [] }, observerRows),
     )
     expect(observerRes.status).toBe(200)
     const observerBody = (await observerRes.json()) as {
