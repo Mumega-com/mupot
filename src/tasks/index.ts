@@ -15,7 +15,7 @@
 
 import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
-import type { Env, AuthContext, Task, Squad } from '../types'
+import type { Env, AuthContext, Task, Squad, Capability } from '../types'
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from '../auth'
@@ -104,19 +104,32 @@ async function squadDepartment(env: Env, squadId: string): Promise<string | null
 }
 
 // member+ gate on a specific squad. Returns true when the caller may create/mutate
-// work in that squad: a web-login owner/admin, OR a member holding member+ on the
-// squad (directly or via a department grant). This is the single chokepoint both
-// the task-squad gate and the assignee-squad gate call.
-async function canActOnSquad(
+// work in that squad: a web-login owner/admin, OR a member holding min+ (default
+// 'member') on the squad (directly or via a department grant). This is the single
+// chokepoint both the task-squad gate and the assignee-squad gate call.
+//
+// `min` defaults to 'member' so every existing call site is unaffected; #406
+// (source_pot task assignment, see the PATCH /:id handler below) passes 'admin'
+// explicitly for that one narrower check. A web-login owner/admin still bypasses
+// unconditionally regardless of `min` — org role owner/admin already outranks
+// every capability on the ladder, same reasoning as the member+ case.
+// Exported so tests can exercise the RBAC primitive directly — the REST route's
+// own auth resolution (requireAuth, cookie-session only) never populates
+// AuthContext.memberId today, so a memberId+capabilities principal (the shape a
+// real 'member'-vs-'admin' distinction requires) cannot currently be driven
+// through tasksApp.fetch in a test harness; testing the primitive itself keeps
+// the #406 admin-floor coverage real rather than skipped.
+export async function canActOnSquad(
   env: Env,
   auth: AuthContext,
   squadId: string,
+  min: Capability = 'member',
 ): Promise<boolean> {
   if (legacyOwnerAdmin(auth)) return true
   if (!auth.memberId) return false
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
   const deptId = await squadDepartment(env, squadId)
-  return hasCapability(grants, 'squad', squadId, 'member', deptId)
+  return hasCapability(grants, 'squad', squadId, min, deptId)
 }
 
 async function readableSquadIds(env: Env, auth: AuthContext): Promise<string[] | null> {
@@ -607,6 +620,38 @@ tasksApp.patch('/:id', async (c) => {
     next.status = body.status
   }
   if (body.assignee_agent_id !== undefined) {
+    // #406 fast-follow (Opus re-gate WARN-1 on #404): #404 closed AUTO-pickup of
+    // an unassigned source_pot task (canAgentExecuteTask, src/agents/execute.ts)
+    // — a remote adversary pot delivers tasks unassigned and cannot assign, so
+    // remote-triggered execution stays closed. But ASSIGNMENT itself only
+    // required member+ here, and a runtime-welded agent token carries member on
+    // its own squad — so a local agent could self-assign a hostile cross-pot
+    // task and then execute it, softening the "a human operator routes it"
+    // framing #404 documents. Require admin+ specifically to change
+    // assignee_agent_id (assign OR unassign) on a source_pot task — the
+    // operator-authority bar the framing implies. Local (source_pot NULL) task
+    // assignment is completely unchanged: still member+, per the route-entry
+    // check above.
+    //
+    // NOTE (kasra-review adv-gate, 2026-07-20, PR #408): this branch is
+    // currently DEAD in production for this HTTP route specifically — requireAuth
+    // (src/auth/index.ts) is cookie-session-only and never sets
+    // AuthContext.memberId/capabilities, so the route-entry canActOnSquad check
+    // above already only ever admits a web-login owner/admin (legacyOwnerAdmin
+    // bypass) here; a memberId-bearing, non-admin principal cannot reach this
+    // line today. Kept as forward-defensive parity with the MCP task_update fix
+    // (src/mcp/index.ts) — correct given canActOnSquad's contract, and live the
+    // moment this route gains bearer/memberId auth. The REACHABLE production
+    // path for #406 is the MCP bearer surface, covered end-to-end in
+    // tests/mcp-task-tools.test.ts.
+    if (existing.source_pot) {
+      if (!(await canActOnSquad(c.env, c.get('auth'), existing.squad_id, 'admin'))) {
+        return c.json(
+          { error: 'forbidden', need: 'admin', detail: 'source_pot task assignment requires admin+' },
+          403,
+        )
+      }
+    }
     // null explicitly unassigns.
     if (body.assignee_agent_id === null) {
       next.assignee_agent_id = null

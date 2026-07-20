@@ -136,7 +136,29 @@ export async function runTaskExecution(
   // on a freeform answer nobody reads. This runs BEFORE the meter reservation
   // below: no model.chat happens on this path, so no token budget is spent and
   // none should be reserved.
-  const contentIntent = detectContentIntent(task)
+  //
+  // #405 fast-follow (Opus re-gate WARN-2 on #404): this branch used to run
+  // BEFORE the untrusted-content fence (buildExecutePrompt/buildExecuteSystem
+  // below), feeding raw task.title/task.body-derived intent.title/intent.content
+  // straight into ctx.gate.propose({action:'content-publish',...}) — a gated
+  // ACTION, not a tool-less model turn — with NO source_pot provenance in the
+  // payload, so an /approvals reviewer would see an ordinary content-publish
+  // proposal with no external-origin marker. Today a cross-pot task doesn't
+  // reach detectContentIntent only INCIDENTALLY: the stored title is prefixed
+  // `[project-link:<pot>] …` (receiveProjectLinkEnvelope) and TITLE_RE is
+  // anchored `^publish\s*:`, so the prefix happens to defeat the match — that
+  // is an accident of string formatting, not a guard. Skip the short-circuit
+  // explicitly for any task carrying source_pot: it falls through to the
+  // normal (fenced, untrusted-content-guarded) model-answer path below, same
+  // as every other cross-pot task. There is no product need today for a
+  // cross-pot-originated task to reach content-publish directly — "publish:"
+  // is an operator-authored IM/console/POST convention, not something a
+  // remote pot's task delivery should be able to trigger on its own. If a
+  // legitimate cross-pot content-publish flow is ever built, it must carry
+  // explicit source_pot provenance into the gate proposal note/payload so
+  // /approvals shows the external/untrusted origin — not silently inherit
+  // this path. Local tasks (source_pot NULL) are completely unaffected.
+  const contentIntent = task.source_pot ? null : detectContentIntent(task)
   if (contentIntent) {
     return finishContentProposal(env, task, agent, executionReceiptId, contentIntent, emit)
   }

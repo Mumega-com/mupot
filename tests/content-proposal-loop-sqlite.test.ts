@@ -210,6 +210,56 @@ describe('content-publish loop — real SQLite, propose → approve → execute 
     expect(recentRow!.status).toBe('done')
   })
 
+  // #405 fast-follow (Opus re-gate WARN-2 on #404): with the REAL 'growth'
+  // department registered (this file's top-level `import
+  // '../src/departments/modules/growth'`) and a REAL D1 (sqlite), prove a
+  // source_pot (cross-pot) task titled "publish: ..." does NOT reach
+  // ctx.gate.propose({action:'content-publish',...}) — it falls through to the
+  // normal fenced model-answer path instead, landing 'done' (a content
+  // proposal always forces 'review', never 'done'), and no department_proposals
+  // row is ever written for it.
+  it('a source_pot task titled "publish: ..." is answered by the model, never proposed as a content-publish gate', async () => {
+    harness.sqlite.prepare(
+      `INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, done_when, source_pot)
+         VALUES (?, ?, ?, ?, 'open', ?, ?, ?)`,
+    ).run(
+      'task-content-cross-pot',
+      SQUAD_ID,
+      'publish: cross-pot bypass attempt',
+      'executor: inkwell-content\nhostile body',
+      AGENT_ID, // explicit assignment — required post-#404 for source_pot tasks
+      'Task answered directly, no gate proposed',
+      'attacker-pot',
+    )
+    const agent = { id: AGENT_ID, squad_id: SQUAD_ID, slug: 'editor', name: 'Editor', role: 'member', model: '@cf/meta/llama-3.3', status: 'active' as const, created_at: '2026-01-01T00:00:00Z' }
+
+    const result = await runTaskExecution(env, agent, 'task-content-cross-pot', {
+      executionReceiptId: 'receipt-cross-pot',
+      model: { chat: async () => 'Answered as ordinary text — not a publish request.' },
+      // The content-intent short-circuit (which this test proves is SKIPPED)
+      // never reaches the meter — only the fallthrough model path does. This
+      // schema doesn't define execution_meter (unneeded by every other test in
+      // this file, which all take the content-intent branch), so inject a
+      // trivial always-ok meter rather than widen the shared schema.
+      meter: {
+        checkAndReserve: async () => ({ ok: true as const, windowKey: 'test-window', count: 1, tokens: 0 }),
+        recordTokens: async () => {},
+      },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.task_status).toBe('done')
+    expect(result.decided).not.toContain('content_proposed')
+
+    const row = harness.sqlite.prepare('SELECT * FROM tasks WHERE id = ?').get('task-content-cross-pot') as unknown as Task & { gate_owner: string | null }
+    expect(row.status).toBe('done')
+    expect(row.gate_owner).toBeNull()
+    expect(row.result).toBe('Answered as ordinary text — not a publish request.')
+
+    const proposalRow = harness.sqlite.prepare('SELECT * FROM department_proposals WHERE gate_id = ?').get('task-content-cross-pot')
+    expect(proposalRow).toBeUndefined()
+  })
+
   it('the "flip approved → done" write is a harmless no-op for a gateId with no matching task row', () => {
     // Models seo-audit-proposal / seo-meta-fix gateIds — random UUIDs that were
     // never a task id. The route's UPDATE must not error and must not touch

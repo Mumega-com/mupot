@@ -849,6 +849,19 @@ const toolTaskUpdate: ToolSpec = {
       changed = true
     }
     if (args.assignee_agent_id !== undefined) {
+      // #406 fast-follow (Opus re-gate WARN-1 on #404) — mirrors the same guard
+      // in PATCH /api/tasks/:id (src/tasks/index.ts): #404 closed AUTO-pickup of
+      // an unassigned source_pot task, but ASSIGNMENT itself only required
+      // member+ here, and a runtime-welded agent token carries member on its
+      // own squad — so a local agent could self-assign a hostile cross-pot task
+      // and then execute it. Require admin+ to change assignee_agent_id on a
+      // source_pot task; local (source_pot NULL) task assignment keeps the
+      // member+ floor checked at the top of this tool, unaffected.
+      if (existing.source_pot) {
+        if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'admin'))) {
+          return fail(403, 'forbidden', { need: 'admin', scope: 'squad', detail: 'source_pot task assignment requires admin+' })
+        }
+      }
       const check = await resolveTaskAssignee(env, args.assignee_agent_id, existing.squad_id)
       if (check.error) return fail(400, check.error)
       next.assignee_agent_id = check.value
