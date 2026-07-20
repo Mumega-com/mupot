@@ -385,6 +385,40 @@ describe('MCP task cutover tools', () => {
     expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_mutate_own_assignment' })
   })
 
+  // 3rd re-gate e2e (PR #417 adversarial NIT): predicate coverage for 'review'
+  // and 'rejected' already exists; these invokeTool cases prove the same
+  // refusal through the reachable MCP path. 'review' needs a gate_owner (else
+  // the row is an unreachable zombie); 'rejected' is a legal reachable status.
+  it('blocks the assignee from self-unassigning its own REVIEW task (3rd re-gate e2e)', async () => {
+    const { env } = makeEnv([
+      task({ status: 'review', assignee_agent_id: AGENT_ID, gate_owner: 'gate:content' }),
+    ])
+
+    const res = await invokeTool(
+      auth(), // boundAgentId === AGENT_ID === the task's assignee
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: null },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_mutate_own_assignment' })
+  })
+
+  it('blocks the assignee from self-unassigning its own REJECTED task (3rd re-gate e2e)', async () => {
+    const { env } = makeEnv([task({ status: 'rejected', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(
+      auth(), // boundAgentId === AGENT_ID === the task's assignee
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: null },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_mutate_own_assignment' })
+  })
+
   it('still allows a NON-assignee principal to unassign a BLOCKED task', async () => {
     const { env } = makeEnv([task({ status: 'blocked', assignee_agent_id: AGENT_ID })])
 
