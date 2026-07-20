@@ -349,6 +349,91 @@ describe('MCP task cutover tools', () => {
     expect((res.result as { task: Task }).task.assignee_agent_id).toBeNull()
   })
 
+  // BLOCK-1 widened (2026-07-20, 2nd re-gate): the FIRST BLOCK-1 fix only
+  // refused self-unassign from 'in_progress'. The adversarial gate found a
+  // second lap through the same hole via a legal detour: in_progress→blocked
+  // (self-driven, legal) → self-unassign while 'blocked' (the OLD guard only
+  // checked in_progress, so this slipped through) → blocked→in_progress
+  // (assignee now null, re-claimable) → →done (assigneeSelfClose sees no
+  // self-match because assignee_agent_id is no longer the actor). Prove the
+  // mutation is refused at the 'blocked' step too, closing the whole lap.
+  it('blocks the assignee from self-unassigning its own BLOCKED task (2nd re-gate widening)', async () => {
+    const { env } = makeEnv([task({ status: 'blocked', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(
+      auth(), // boundAgentId === AGENT_ID === the task's assignee
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: null },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_mutate_own_assignment' })
+  })
+
+  it('blocks the assignee from self-unassigning its own OPEN task (2nd re-gate widening)', async () => {
+    const { env } = makeEnv([task({ status: 'open', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: null },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_mutate_own_assignment' })
+  })
+
+  it('still allows a NON-assignee principal to unassign a BLOCKED task', async () => {
+    const { env } = makeEnv([task({ status: 'blocked', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(
+      auth({ boundAgentId: 'agent-verifier' }),
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: null },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(true)
+    expect((res.result as { task: Task }).task.assignee_agent_id).toBeNull()
+  })
+
+  // WARN close (2026-07-20, 2nd re-gate): after a DIFFERENT principal rejects a
+  // task (status='rejected'), the assignee still holds assignee_agent_id and
+  // 'rejected'→'done' is a legal PATCH transition (TRANSITIONS, src/tasks/
+  // service.ts) with NO verdict gating it — the assignee could self-complete
+  // with zero re-verification. Must be refused, same as in_progress→done.
+  it('blocks the assignee from self-closing its own REJECTED task to done (WARN close)', async () => {
+    const { env } = makeEnv([task({ status: 'rejected', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(
+      auth(), // boundAgentId === AGENT_ID === the task's assignee
+      env,
+      'task_update',
+      { task_id: 'task-1', status: 'done' },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_self_close' })
+  })
+
+  it('still allows a NON-assignee principal to close a REJECTED task to done', async () => {
+    const { env } = makeEnv([task({ status: 'rejected', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(
+      auth({ boundAgentId: 'agent-verifier' }),
+      env,
+      'task_update',
+      { task_id: 'task-1', status: 'done' },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(true)
+    expect((res.result as { task: Task }).task.status).toBe('done')
+  })
+
   // ── #406 fast-follow (Opus re-gate WARN-1 on #404) ──────────────────────────
   // #404 closed AUTO-pickup of an unassigned source_pot task (canAgentExecuteTask,
   // src/agents/execute.ts) — a remote adversary pot delivers tasks unassigned and
@@ -378,7 +463,14 @@ describe('MCP task cutover tools', () => {
   })
 
   it('task_update REFUSES a member-only principal UNassigning (null) a source_pot task (#406)', async () => {
-    const { env } = makeEnv([task({ source_pot: 'attacker-pot', assignee_agent_id: AGENT_ID })])
+    // Assignee is a DIFFERENT agent than the acting principal (2nd re-gate,
+    // 2026-07-20): the widened BLOCK-1 guard (assigneeCannotMutateOwnAssignment,
+    // src/tasks/service.ts) now also fires from 'open', which is this task's
+    // default status — if the actor were ALSO the assignee, that guard would
+    // fire FIRST (409, self-mutation) and this test would no longer isolate the
+    // #406 admin-floor check it claims to prove. Using a different assignee
+    // keeps this test's principal a genuine non-self reassignment attempt.
+    const { env } = makeEnv([task({ source_pot: 'attacker-pot', assignee_agent_id: 'agent-other' })])
 
     const res = await invokeTool(
       auth(),
@@ -393,6 +485,26 @@ describe('MCP task cutover tools', () => {
     // would also pass on an unrelated 403, which is not what this test claims
     // to prove.
     expect(res).toMatchObject({ ok: false, status: 403, error: 'forbidden', detail: { need: 'admin' } })
+  })
+
+  // BLOCK-1 widened (2026-07-20, 2nd re-gate): the companion case — the actor IS
+  // the assignee of an 'open' source_pot task attempting to self-unassign. The
+  // self-mutation guard now fires FIRST (409), before the #406 admin-floor
+  // check is even reached — a stricter outcome than a bare 403, and the correct
+  // one (the assignee should never be able to strip itself off any task it can
+  // steer back toward an unverified done, source_pot or not).
+  it('task_update REFUSES the assignee itself unassigning an OPEN source_pot task — self-mutation guard fires first', async () => {
+    const { env } = makeEnv([task({ source_pot: 'attacker-pot', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(
+      auth(), // boundAgentId === AGENT_ID === the task's assignee
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: null },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_mutate_own_assignment' })
   })
 
   it('task_update ALLOWS an admin-capability principal to assign a source_pot task (#406)', async () => {
@@ -691,8 +803,20 @@ describe('assigneeSelfClose — shared chokepoint (src/tasks/service.ts)', () =>
     expect(assigneeSelfClose('agent-verifier', 'in_progress', AGENT_ID, 'done')).toBe(false)
   })
 
-  it('allows approved→done by the assignee — fromStatus is not in_progress', () => {
+  it('allows approved→done by the assignee — a non-assignee verdict already passed the gate', () => {
     expect(assigneeSelfClose(AGENT_ID, 'approved', AGENT_ID, 'done')).toBe(false)
+  })
+
+  // WARN close (2026-07-20, 2nd re-gate): after a DIFFERENT principal rejects a
+  // task, the assignee still holds assignee_agent_id and rejected→done is a
+  // legal PATCH transition with no verdict gating it — self-closing from there
+  // is the same "grading your own homework" shape as in_progress→done.
+  it('refuses rejected→done when the actor IS the current assignee (WARN close)', () => {
+    expect(assigneeSelfClose(AGENT_ID, 'rejected', AGENT_ID, 'done')).toBe(true)
+  })
+
+  it('allows rejected→done when the actor is a DIFFERENT principal', () => {
+    expect(assigneeSelfClose('agent-verifier', 'rejected', AGENT_ID, 'done')).toBe(false)
   })
 
   it('ignores moves that are not a done-close at all', () => {
@@ -717,10 +841,25 @@ describe('assigneeCannotMutateOwnAssignment — shared chokepoint (BLOCK-1 close
     expect(assigneeCannotMutateOwnAssignment('agent-verifier', 'in_progress', AGENT_ID)).toBe(false)
   })
 
-  it('allows the mutation once the task is no longer in_progress (e.g. review, approved)', () => {
+  // BLOCK-1 widened (2026-07-20, 2nd re-gate): the ORIGINAL fix only refused
+  // this from 'in_progress', which left a laundering path open — the
+  // adversarial gate found in_progress→blocked (legal) → unassign (the old
+  // guard skipped it, status was 'blocked') → blocked→in_progress (assignee
+  // now null) → →done (assigneeSelfClose sees no self-match). 'open' and
+  // 'blocked' must be refused too — NOT just 'in_progress' — because the
+  // assignee can steer either straight back to in_progress unsupervised.
+  it('refuses the mutation from "open" and "blocked" too — NOT just in_progress (2nd re-gate widening)', () => {
+    expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'open', AGENT_ID)).toBe(true)
+    expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'blocked', AGENT_ID)).toBe(true)
+  })
+
+  // Only the verdict/gate-controlled statuses are actually safe to mutate —
+  // a bare status flip cannot steer the assignee back toward an unverified
+  // done from any of these.
+  it('allows the mutation once the task is verdict/gate-controlled (review, approved, rejected)', () => {
     expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'review', AGENT_ID)).toBe(false)
     expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'approved', AGENT_ID)).toBe(false)
-    expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'open', AGENT_ID)).toBe(false)
+    expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'rejected', AGENT_ID)).toBe(false)
   })
 
   it('is a no-op with no actor or no assignee', () => {
