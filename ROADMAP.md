@@ -256,6 +256,18 @@ full**; mint **never** mutates the principal; one `buildAuthContext` chokepoint
 enforcing ceiling + `expires_at` + intersection at every door; expiry server-clock
 fail-closed; unknown `scope_type` ⇒ deny; `''` sentinel (not NULL) in the grant PK.
 
+Prior-art design decisions (2026-07-20 research — AWS STS, GitHub PATs, SPIFFE, PAM):
+the `intersect` math matches AWS STS AssumeRole (validated); grants stay **DB-side**
+(instant revocation — no macaroons); **`expires_at` is mandatory at mint** (non-expiring
+keys are an owner-gated exception); **session-admin = sudo for agents** (a TTL
+`token_grant` at `capability='admin'`, never a principal write) and **admin-tier
+elevation is approval-gated** (Zero-Standing-Privilege, per Teleport/CyberArk); add
+**`owner_principal_id`** on agent principals (human-accountability lineage — SPIFFE/
+Entra converge on agent-as-principal but keep the human owner). **Audience note: agents
+are the primary operators, humans the exception** — setup runs through an admin agent
+over MCP, so this identity/access model is the flagship and the console consolidation
+(v0.25) is a thin bootstrap/oversight shell, not the main surface.
+
 - **one principal** table with `kind ∈ human|agent` (People and Agents become
   `kind`-filtered views); stop minting agents into the members table; `members`/
   `agents` kept as compatibility views during migration;

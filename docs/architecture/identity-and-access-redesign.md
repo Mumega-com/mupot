@@ -177,3 +177,75 @@ The same `token_grants` + `expires_at` mechanism delivers:
 - and it **retires the split-token RBAC edge** that held a flight during this session.
 
 Fixing identity once clears all of them.
+
+## Prior art & final design decisions (2026-07-20 research)
+
+Researched how comparable systems solve this (AWS STS, Macaroons/Biscuit, GitHub
+fine-grained PATs, SPIFFE/SPIRE, Google Agent Identity, MS Entra Agent ID, Teleport/
+CyberArk PAM, GitOps). Full map: `agents/kasra/designs/MUPOT-IDENTITY-PRIOR-ART-2026-07-20.md`
+(mumega.com repo). Our core bets are validated — the industry independently landed the
+same shapes — with five concrete adjustments folded in below.
+
+**Who the audience is (the framing this all serves).** Agents are the **primary**
+operators; humans (owners) are the **exception** — bootstrap, approve, audit. Setup
+is done *by an admin agent through MCP tools*, not by a human in a dashboard (proven
+this session: an entire project + agents + tokens + a governed flight, provisioned
+via MCP, zero dashboard). This is deliberately contrarian versus every current agent-
+identity product (Entra/Google/Auth0/MCP all keep a human at the center) — and it's
+correct for a pot, **provided we keep the human-accountability lineage** (see D4). It
+also reprioritizes: the dashboard is a thin bootstrap/oversight shell, not 24 menus.
+
+**D1 — Keep grants DB-side; do NOT adopt self-describing tokens.** Macaroons/Biscuit
+attenuate authority inside the token (offline), but then need revocation lists or short
+TTLs to revoke. Our DB-side `token_grants` gives *instant* revocation and live
+re-resolution — a strength, not a gap. Decision: stay DB-side.
+
+**D2 — `expires_at` is MANDATORY at mint, not optional.** Of GitHub / Stripe / OpenAI /
+Cloudflare scoped keys, only GitHub fine-grained PATs *enforce* an expiry ceiling — and
+it's the most security-forward of the four. Stripe/OpenAI having no expiry is a named
+sprawl source (CyberArk 2025: machine:human identity ratio **82:1**). Decision: every
+`access_token` carries a required `expires_at`; a non-expiring key is an explicit,
+owner-gated exception, never the default. (Supersedes the earlier "add expires_at"
+phrasing — it's mandatory, not additive-optional.)
+
+**D3 — Session-admin: intersection math is right, but ADMIN-tier elevation must be
+approval-gated.** Our `intersect(principal, token_grants)` is mechanism-identical to AWS
+STS AssumeRole (session-policy ∩ role-policy) — validated. But every mature PAM
+(Teleport, CyberArk) gates *admin-tier* elevation behind an approval step by default;
+auto-approve is a narrow explicit opt-in. So: **session-admin at `capability='admin'`
+requires an approval gate** (owner-authorized or policy-bound); lower-tier scoped grants
+auto-issue. This is the "sudo for agents" model done safely — Zero Standing Privilege
+over the fat org-admin token, elevate-for-task, auto-expire.
+
+**D4 — Add `owner_principal_id` on agent principals (human-accountability lineage).**
+SPIFFE, Google's Agent Identity, and MS Entra Agent ID all treat an agent as a distinct
+first-class principal (validates `principals.kind='agent'`) — but none drop the human
+lineage, and the MCP auth spec makes no agent/human distinction at all, so we own the
+mapping. Every agent principal references the human owner accountable for it. Keeps
+"agent as primary" from becoming "agent with no one accountable."
+
+**D5 — Mint UI: template-gallery-first (Cloudflare pattern).** Present named scope
+presets before the custom-grant grid — already the plan; prior art confirms the ordering.
+
+**Traps to design against (each confirms a fix-map finding):** fail-open elevation
+(CISA AA22-074A → our BLOCK "empty grants ⇒ zero, never full"); standing admin as the
+unexamined default (Zero Standing Privilege → session-admin over standing org-admin);
+credential sprawl treated as inevitable (82:1 ratio → mandatory expiry + one create-key
+flow + the de-dup cleanup).
+
+### Session-admin (sudo for agents) — first-class use of `token_grants`
+
+```
+owner (human, once) ──bootstrap──▶ first admin agent gets a session-admin capability
+                                          │
+   admin agent ──elevate(task)──▶ token_grant{ capability:'admin', expires_at:+Nmin,
+                                               scope: … }  ── APPROVAL-GATED (D3)
+                                          │  … does setup via MCP …
+                                          ▼
+                                   auto-expire ⇒ back to zero standing power
+```
+
+A session-admin grant is an ordinary `token_grants` row (`capability='admin'` +
+`expires_at`), never a `capabilities` write on the principal — so checkout/expiry
+removes it completely. Same table, same intersection, same fail-closed rules as guest
+presence and fine-grained keys. One mechanism, three payoffs.
