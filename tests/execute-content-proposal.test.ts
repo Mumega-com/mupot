@@ -185,8 +185,12 @@ describe('runTaskExecution — content-intent short-circuit', () => {
     })
 
     expect(r.ok).toBe(true)
-    expect(r.task_status).toBe('done') // ungated task, model path, unchanged behavior
-    expect(events[0].type).toBe('task.completed')
+    // BLOCK-2 close (fake-green guard, 2026-07-20 re-gate on PR #417): an
+    // agent's own dispatch-completion lands 'review' now, even for an ungated,
+    // non-content model-path task — a different principal's verdict (or a
+    // non-assignee close) is what actually completes it.
+    expect(r.task_status).toBe('review')
+    expect(events[0].type).toBe('task.review')
   })
 
   it('department not registered → blocked with a clear reason, never stuck in_progress (fail-closed)', async () => {

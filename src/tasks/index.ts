@@ -23,7 +23,7 @@ import { requireAuth } from '../auth'
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap } from '../auth/capability'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
@@ -603,6 +603,24 @@ tasksApp.patch('/:id', async (c) => {
         409,
       )
     }
+    // NO SELF-CLOSE — REST parity (fake-green guard, 2026-07-20 re-gate on PR
+    // #417): mirrors the MCP task_update guard via the shared chokepoint
+    // (assigneeSelfClose, src/tasks/service.ts). NOTE: this route's requireAuth
+    // (src/auth/index.ts) is cookie-session-only and never populates
+    // AuthContext.boundAgentId, so auth.boundAgentId is always undefined here
+    // today and this branch cannot currently fire for an agent-bound caller —
+    // same reachability note as the assignee-mutation guard below (kasra-review
+    // adv-gate, 2026-07-20, PR #408). Kept as forward-defensive parity: live the
+    // moment this route gains bearer/agent auth.
+    if (assigneeSelfClose(c.get('auth').boundAgentId, existing.status, existing.assignee_agent_id, body.status)) {
+      return c.json(
+        {
+          error: 'assignee_cannot_self_close',
+          detail: 'the assignee cannot mark its own task done; move it to review so a different principal can verify and close',
+        },
+        409,
+      )
+    }
     // Door 5 — completion gate: refuse DONE while done_when is a placeholder sentinel.
     // Presence (non-empty) was enforced at creation (Door 3). This gate closes the loop:
     // the predicate must be a real, checkable string — not one of the known sentinels
@@ -651,6 +669,20 @@ tasksApp.patch('/:id', async (c) => {
           403,
         )
       }
+    }
+    // BLOCK-1 close — REST parity (fake-green guard, 2026-07-20 re-gate on PR
+    // #417): shared chokepoint (assigneeCannotMutateOwnAssignment). Same
+    // reachability note as above — auth.boundAgentId is always undefined on
+    // this cookie-session route today, so this is forward-defensive parity,
+    // not a live guard, until the route gains bearer/agent auth.
+    if (assigneeCannotMutateOwnAssignment(c.get('auth').boundAgentId, existing.status, existing.assignee_agent_id)) {
+      return c.json(
+        {
+          error: 'assignee_cannot_mutate_own_assignment',
+          detail: 'the current assignee cannot change the assignee field on its own in_progress task; ask an operator or a different principal',
+        },
+        409,
+      )
     }
     // null explicitly unassigns.
     if (body.assignee_agent_id === null) {

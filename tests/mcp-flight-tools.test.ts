@@ -808,10 +808,33 @@ describe('MCP granted multi-squad flight lifecycle', () => {
       const read = await authenticatedTool(env, 'flight_get', { flight_id: flightId })
       expect(read).toMatchObject({ ok: true, result: { flight: { id: flightId, status: 'running' } } })
 
-      const completed = await authenticatedTool(env, 'task_update', {
+      // NO SELF-CLOSE (fake-green guard, 2026-07-20 re-gate on PR #417): the
+      // Product bearer IS the task's own assignee (agent-bound token, agent_id
+      // = AGENT_ID = assignee_agent_id) — it dispatched this task and executed
+      // the flight itself, so it may not ALSO be the one who marks its own
+      // in_progress task 'done' with no different-principal check. That is
+      // exactly the fake-green shape this guard closes. The operator (a
+      // genuinely different, non-assignee principal — already used above for
+      // grant_agent_capability) verifies + closes it instead. This expects a
+      // non-200 (409), so it drives the real HTTP path directly rather than
+      // through authenticatedTool (which asserts 200).
+      const selfCloseResponse = await mcpApp.request(
+        'https://pot.example/',
+        {
+          method: 'POST',
+          headers: { authorization: `Bearer ${PRODUCT_TOKEN}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ tool: 'task_update', args: { task_id: 'task-m000', status: 'done' } }),
+        },
+        env,
+      )
+      expect(selfCloseResponse.status).toBe(409)
+      const selfCloseBody = await selfCloseResponse.json() as { ok: boolean; error?: string }
+      expect(selfCloseBody).toMatchObject({ ok: false, error: 'assignee_cannot_self_close' })
+
+      const completed = await invokeTool(operatorAuth, env, 'task_update', {
         task_id: 'task-m000',
         status: 'done',
-      })
+      }, 'https://pot.example')
       expect(completed).toMatchObject({ ok: true, result: { task: { id: 'task-m000', status: 'done' } } })
       expect(harness.sqlite.prepare("SELECT assignee_agent_id, status FROM tasks WHERE id = 'task-m000'").get()).toEqual({
         assignee_agent_id: AGENT_ID,

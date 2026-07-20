@@ -525,14 +525,23 @@ describe('K2 — dispatch+gate_owner: gated dispatch lands review (via K1)', () 
     //
     // This test verifies the gate_owner logic that makes dispatch+gate safe:
     const task = makeTask({ gate_owner: 'gate:outreach', status: 'open' })
-    const successStatus = task.gate_owner ? 'review' : 'done'
+    const successStatus = task.gate_owner ? 'review' : 'review'
     expect(successStatus).toBe('review')
   })
 
-  it('an ungated dispatched task still lands done', () => {
+  // BLOCK-2 close (fake-green guard, 2026-07-20 re-gate on PR #417): execute.ts
+  // no longer branches on gate_owner at all — EVERY execution success (gated or
+  // not) lands 'review'. This used to read `task.gate_owner ? 'review' : 'done'`
+  // and assert 'done' for the ungated case; that was the exact hole the
+  // adversarial gate closed (an agent's own dispatch-completion of an ungated
+  // task writing 'done' with no different-principal check). See
+  // src/agents/execute.ts (successStatus) and tests/execute.test.ts for the
+  // real-path coverage of this invariant.
+  it('an ungated dispatched task ALSO lands review now, not done', () => {
     const task = makeTask({ gate_owner: null, status: 'open' })
-    const successStatus = task.gate_owner ? 'review' : 'done'
-    expect(successStatus).toBe('done')
+    const successStatus = 'review'
+    expect(successStatus).toBe('review')
+    expect(task.gate_owner).toBeNull() // the branch this used to key off of is gone
   })
 })
 

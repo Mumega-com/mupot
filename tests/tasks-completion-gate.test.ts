@@ -10,7 +10,8 @@
 //  (c) assertCompletableDoneWhen accepts a real predicate
 //  (d) isPlaceholderDoneWhen correctly identifies sentinels
 //  (e) execute path: ungated task with placeholder done_when → blocked (not done)
-//  (f) execute path: ungated task with real done_when → done (unaffected)
+//  (f) execute path: ungated task with real done_when → review, not done (BLOCK-2
+//      close, 2026-07-20 re-gate on PR #417 — self-completion never writes done)
 //  (g) execute path: gated task with placeholder done_when → review (gate goes first; not blocked by Door 5)
 //
 // Tests (a)–(d) are pure unit tests (no env needed).
@@ -251,8 +252,12 @@ describe('execute — Door 5 completion gate', () => {
     expect(result.error).toBe('done_when_placeholder')
   })
 
-  // (f) ungated task with real done_when → done (unaffected by Door 5)
-  it('(f) completes an ungated task whose done_when is a real predicate', async () => {
+  // (f) ungated task with real done_when → review, not done (BLOCK-2 close,
+  // 2026-07-20 re-gate on PR #417: an agent's own dispatch-completion never
+  // writes 'done' directly anymore, gated or not — Door 5's placeholder check
+  // still fires the same as before, it just now guards a 'review' proposal
+  // instead of a direct 'done' write).
+  it('(f) proposes review (not done) for an ungated task whose done_when is a real predicate', async () => {
     const task = makeTask({
       done_when: 'GET /api/health returns { ok: true }',
       status: 'open',
@@ -268,10 +273,12 @@ describe('execute — Door 5 completion gate', () => {
     })
 
     expect(result.ok).toBe(true)
-    expect(result.task_status).toBe('done')
+    expect(result.task_status).toBe('review')
 
     const doneUpdates = updates.filter(u => (u.args as unknown[]).includes('done'))
-    expect(doneUpdates.length).toBeGreaterThan(0)
+    expect(doneUpdates).toHaveLength(0)
+    const reviewUpdates = updates.filter(u => (u.args as unknown[]).includes('review'))
+    expect(reviewUpdates.length).toBeGreaterThan(0)
   })
 
   // (g) gated task with placeholder done_when → review (gate path; Door 5 not reached)

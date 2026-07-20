@@ -73,6 +73,112 @@ export function patchToDoneBypassesGate(
   return existingStatus !== 'approved' && existingStatus !== 'rejected'
 }
 
+// NO SELF-CLOSE — the shared chokepoint (fake-green guard, 2026-07-20 re-gate on
+// PR #417). A dispatched runtime self-marked its OWN in_progress task 'done'
+// with zero work (no branch, no PR, no receipt) and the pot accepted it. The
+// first fix inlined a check ONLY in MCP task_update; an Opus adversarial re-gate
+// found two more doors that never called it: (BLOCK-1) an agent can strip/
+// reassign itself off the task via task_update{assignee_agent_id:...} while
+// still in_progress, then close it — the assignee comparison in the OLD inline
+// check no longer sees a match; (BLOCK-2) src/agents/execute.ts's own
+// finishTask wrote 'done' directly with no different-principal check at all,
+// a second, entirely separate write path.
+//
+// This predicate is now the SINGLE source of truth for "must this done-move be
+// refused because the actor is grading its own homework" — every path that can
+// write 'done' (MCP task_update, REST PATCH /api/tasks/:id, execute.ts's
+// finishTask) calls it instead of re-deriving the comparison locally.
+//
+// 2nd re-gate (same day): the first pass at BLOCK-1/BLOCK-2 above still left two
+// gaps — a wider BLOCK-1 laundering lap through 'blocked' (not just
+// 'in_progress'), and a WARN where rejected→done skipped both assigneeSelfClose
+// (fromStatus check was in_progress-only) and patchToDoneBypassesGate (fires
+// only when gate_owner is set). Both are closed below; see the status sets and
+// their comments for the exact shape of each.
+//
+// Statuses from which a →done PATCH is a legal transition (TRANSITIONS above)
+// with NO verdict/gate step in between — 'in_progress' directly, and 'rejected'
+// (a rework cycle a DIFFERENT principal's rejection put the task into; the
+// assignee still holds assignee_agent_id and 'rejected'→'done' is a legal edge
+// with no verdict gating it). 'approved'→'done' is deliberately excluded: a
+// non-assignee verdict has already passed the gate by the time a task reaches
+// 'approved' (the verdict endpoint's own self-verdict check keeps a
+// self-approval from ever landing 'approved' in the first place, so a
+// subsequent approved→done by the same assignee is not re-grading its own work).
+const ASSIGNEE_UNVERIFIED_DONE_SOURCES: ReadonlySet<TaskStatus> = new Set(['in_progress', 'rejected'])
+
+// The full set of non-terminal statuses from which the ASSIGNEE can, via legal
+// transitions it alone drives, still reach 'done' — so mutating the assignee
+// field from ANY of them can launder around the self-close guard (null the
+// assignee, then route into 'done' with no self-match left). The coverage set
+// MUST equal every done-reachable non-terminal status, NOT just the direct
+// →done edges — that gap is what let the 2nd/3rd re-gates find new laps:
+//   - 'open' → in_progress → done
+//   - 'in_progress' → done  (and → blocked → in_progress → done)
+//   - 'blocked' → in_progress → done
+//   - 'review' → (self-verdict once unassigned) → approved → done
+//   - 'rejected' → in_progress → done  (overrides another principal's rejection!)
+// Only 'approved' is excluded: approved→done is the INTENDED post-verdict close,
+// and a different principal already verified the work to reach 'approved', so an
+// assignee unassigning from there cannot manufacture a fake-green. 'done' is
+// terminal. Non-assignees (operators, admins, a different agent) are unaffected.
+const ASSIGNEE_STEERABLE_TOWARD_DONE: ReadonlySet<TaskStatus> = new Set([
+  'open',
+  'in_progress',
+  'blocked',
+  'review',
+  'rejected',
+])
+
+// Returns true when the move MUST be refused: the actor is the task's current
+// assignee, closing its OWN task straight to 'done' from a status reachable
+// with zero outside verification (see ASSIGNEE_UNVERIFIED_DONE_SOURCES).
+// rejected→done IS refused (2026-07-20, 2nd re-gate — WARN close): after a
+// DIFFERENT principal rejects a task, the assignee still holds
+// assignee_agent_id and 'rejected' legally transitions straight to 'done' with
+// no verdict in between — a self-close from there is exactly the same "grading
+// your own homework" shape as in_progress→done, just reached via a different
+// legal edge, so it must be refused too.
+export function assigneeSelfClose(
+  actorAgentId: string | null | undefined,
+  fromStatus: TaskStatus,
+  assigneeAgentId: string | null | undefined,
+  toStatus: TaskStatus,
+): boolean {
+  if (toStatus !== 'done') return false
+  if (!ASSIGNEE_UNVERIFIED_DONE_SOURCES.has(fromStatus)) return false
+  if (!actorAgentId || !assigneeAgentId) return false
+  return actorAgentId === assigneeAgentId
+}
+
+// BLOCK-1 close (widened 2026-07-20, 2nd re-gate): assigneeSelfClose only fires
+// on the actual →done move, so an agent could launder around it by mutating the
+// assignee field first, THEN closing — by then assigneeAgentId no longer
+// matches and assigneeSelfClose sees no self-match. The first fix only closed
+// this while fromStatus==='in_progress'; the adversarial gate found a second
+// lap through the SAME hole: in_progress→blocked (legal) → unassign (the OLD
+// guard skipped it, status was 'blocked') → blocked→in_progress (assignee now
+// null) → →done (assigneeSelfClose sees assigneeAgentId=null, no self-match).
+// Fix: an agent bound-token that IS the CURRENT assignee of a task in any
+// done-reachable non-terminal status (ASSIGNEE_STEERABLE_TOWARD_DONE — every
+// status except 'approved' and terminal 'done') may not change
+// assignee_agent_id on it at all (unassign or reassign to anyone else). The
+// 3rd re-gate proved the set must be the FULL done-reachable set, not just the
+// direct →done edges: 'rejected' was omitted on the reasoning that
+// assigneeSelfClose covers rejected→done directly, but rejected→(unassign)→
+// in_progress→done routes around it. Non-assignees (operators, admins, a
+// different agent) are unaffected — this only fires when the actor and the
+// existing assignee match.
+export function assigneeCannotMutateOwnAssignment(
+  actorAgentId: string | null | undefined,
+  fromStatus: TaskStatus,
+  assigneeAgentId: string | null | undefined,
+): boolean {
+  if (!ASSIGNEE_STEERABLE_TOWARD_DONE.has(fromStatus)) return false
+  if (!actorAgentId || !assigneeAgentId) return false
+  return actorAgentId === assigneeAgentId
+}
+
 export function stampTaskUpdate(
   task: Task,
   previousStatus: TaskStatus,

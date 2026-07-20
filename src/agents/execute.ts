@@ -26,7 +26,7 @@
 //    note; no tokens are spent.
 
 import type { Env, Agent, Task, ModelMessage, ModelPort, BusEvent } from '../types'
-import { checkTransition, assertCompletableDoneWhen } from '../tasks/service'
+import { checkTransition, assertCompletableDoneWhen, assigneeSelfClose } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
 import { createModel } from '../model'
 import { createBus } from '../bus'
@@ -210,11 +210,24 @@ export async function runTaskExecution(
     const result = capResult(typeof raw === 'string' ? raw : '')
     const finishedAt = new Date().toISOString()
 
-    // K1: if a gate_owner is set, execution success lands 'review' — the task
-    // waits for a gated verdict before completing. Only an ungated task goes
-    // directly to 'done'. The transition matrix allows in_progress → review and
-    // in_progress → done, so both are legal here.
-    const successStatus: 'done' | 'review' = task.gate_owner ? 'review' : 'done'
+    // BLOCK-2 close (fake-green guard, 2026-07-20 re-gate on PR #417): this was
+    // the SECOND door the adversarial gate found — execute.ts wrote 'done'
+    // directly for ungated tasks with NO different-principal check at all (the
+    // MCP task_update guard only covers the task_update write path). The agent
+    // running this function IS always the task's own assignee (canAgentExecuteTask
+    // above; finishTask's WHERE clause requires assignee_agent_id = agent.id), so
+    // a direct 'done' write here is BY CONSTRUCTION an assignee closing its own
+    // work — the exact shape assigneeSelfClose forbids. K1's gated-task behavior
+    // (successStatus='review') is UNCHANGED; what changes is the ungated branch,
+    // which used to skip straight to 'done' and now matches it: every execution
+    // success — gated or not — lands 'review'. A different principal's verdict
+    // (or a non-assignee close) is what actually completes the task. Kept as the
+    // 'done' | 'review' union (not narrowed to a literal) for type parity with
+    // checkTransition/finishTask below, even though the value is always 'review'
+    // now — finishTask asserts this invariant too (see the shared-predicate call
+    // in finishTask), so a future regression here throws instead of silently
+    // forging a self-close.
+    const successStatus = 'review'
     // Enforce the transition at the service write layer (catches future misuse).
     const transitionErr = checkTransition('in_progress', successStatus)
     if (transitionErr) {
@@ -222,13 +235,21 @@ export async function runTaskExecution(
       throw new Error(`gate_transition_invariant_violated: in_progress → ${successStatus}`)
     }
 
-    // Door 5 — completion gate: refuse DONE while done_when is a placeholder.
-    // Ungated tasks (gate_owner absent) go directly to 'done'; gated tasks land
-    // 'review' first, so the placeholder check only fires on the direct-done path.
-    // A placeholder done_when means the predicate was never set — the agent cannot
-    // verify completion against a sentinel. Block it here; surface as 'blocked' so
-    // the task stays visible and the operator can update done_when + retry.
-    if (successStatus === 'done') {
+    // Door 5 — completion gate (#142): refuse to PROPOSE completion while
+    // done_when is a placeholder sentinel. Before BLOCK-2 close, this only fired
+    // on the direct-done path (an ungated task) — a gated task always landed
+    // 'review' first and Door 5 was deliberately never reached there (tests
+    // tasks-completion-gate.test.ts (g)). Now that EVERY execution success lands
+    // 'review', re-keying this on successStatus would wrongly start blocking
+    // gated tasks too. Key it on the SAME condition the old direct-done branch
+    // used instead (previously-ungated: no gate_owner), so gated-task behavior
+    // is byte-for-byte unchanged and only the ungated branch's outcome flips
+    // from 'done' to 'review' (BLOCK-2) while keeping its fail-fast placeholder
+    // check (still worth catching here rather than only at the eventual
+    // different-principal 'done' write, which also re-checks via
+    // assertCompletableDoneWhen — belt and suspenders, not a new gap).
+    const wasUngated = !task.gate_owner
+    if (wasUngated) {
       try {
         assertCompletableDoneWhen(task.done_when)
       } catch (placeholderErr) {
@@ -249,13 +270,13 @@ export async function runTaskExecution(
         }
       }
     }
-    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, successStatus, result, finishedAt, cycleCostMicroUsd))) {
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, successStatus, result, finishedAt, cycleCostMicroUsd, AGENT_SELF_COMPLETION_GATE_OWNER))) {
       await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, cycleCostMicroUsd)
       return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
     }
-    // Emit task.completed for ungated (terminal); task.review for gated (awaiting verdict).
-    const eventType = successStatus === 'done' ? 'task.completed' : 'task.review'
-    await emitSafe(emit, executionEvent(eventType, env, agent, task, successStatus))
+    // Every execution success now lands 'review' (BLOCK-2 close) — a different
+    // principal's verdict (or a non-assignee close) is what actually completes it.
+    await emitSafe(emit, executionEvent('task.review', env, agent, task, successStatus))
     // best-effort memory so the agent's future recalls compound on what it did.
     await rememberSafe(remember, agent.id, `Executed task "${task.title}" → ${successStatus}.`)
     // Best-effort token + cost accounting: record EXECUTE_MAX_TOKENS as a conservative
@@ -378,20 +399,54 @@ async function finishTask(
   // #15: cost of the cycle in micro-USD, stamped on the task for the per-task
   // cost chip. Defaults to 0 so non-execute callers stay unchanged.
   costMicroUsd = 0,
+  // BLOCK-2 close (2026-07-20 re-gate on PR #417): when a previously-ungated
+  // task lands 'review' (see the caller above — every execution success now
+  // lands review, not just gated tasks), it needs a gate_owner or the verdict
+  // endpoint 409s 'no_gate' and the task is a zombie with no legal exit
+  // (GATE-EXIT GUARD, src/tasks/index.ts / src/mcp/index.ts). Only stamped when
+  // the row's existing gate_owner is NULL (COALESCE) — an already-gated task's
+  // real gate_owner is never overwritten. Non-review callers (blocked path)
+  // pass no fallback, so this is a no-op for them.
+  gateOwnerFallback: string | null = null,
 ): Promise<boolean> {
+  // Structural invariant, enforced via the SHARED chokepoint (assigneeSelfClose,
+  // src/tasks/service.ts): this function's own WHERE clause requires
+  // assignee_agent_id = agentId AND status = 'in_progress', so EVERY call is, by
+  // construction, the assignee closing its own in_progress task. A 'done' write
+  // from here is therefore always the exact self-close shape the predicate
+  // forbids — assert it rather than trust the caller. If this ever throws, a
+  // future code change tried to reintroduce the BLOCK-2 hole; fail loudly
+  // instead of silently forging a self-close.
+  if (assigneeSelfClose(agentId, 'in_progress', agentId, status)) {
+    throw new Error(
+      'agent_self_close_forbidden: execute.ts must never write a task done directly — land it in review so a different principal can verify and close (BLOCK-2, PR #417)',
+    )
+  }
   const dbResult = await env.DB.prepare(
     `UPDATE tasks
         SET status = ?, result = ?, completed_at = ?, updated_at = ?, cost_micro_usd = ?,
-            execution_claim_expires_at = NULL
+            execution_claim_expires_at = NULL, gate_owner = COALESCE(gate_owner, ?)
       WHERE id = ? AND assignee_agent_id = ? AND execution_receipt_id = ? AND status = 'in_progress'`,
   )
     .bind(
-      status, result, completedAt, completedAt, Math.max(0, Math.round(costMicroUsd)),
+      status, result, completedAt, completedAt, Math.max(0, Math.round(costMicroUsd)), gateOwnerFallback,
       taskId, agentId, executionReceiptId,
     )
     .run()
   return dbResult.meta?.changes === 1
 }
+
+// Fallback gate_owner for an agent's OWN dispatch-completion of a previously
+// UNGATED task (BLOCK-2 close, 2026-07-20 re-gate on PR #417). Every execution
+// success now lands 'review' (see executeTask above), but review with no
+// gate_owner is a zombie — the verdict endpoint 409s 'no_gate' and there is no
+// other legal exit from 'review'. Stamping this generic capability lets an
+// org owner/admin close it via the existing legacyOwnerAdmin bypass
+// (src/tasks/index.ts callerHoldsGateCapability) exactly like any other gated
+// task — no new grant machinery needed. A specific gate_owner set at task
+// creation/dispatch time always wins (finishTask's COALESCE never overwrites
+// an existing value).
+export const AGENT_SELF_COMPLETION_GATE_OWNER = 'gate:agent-self-completion'
 
 // ── content-intent proposal (flight-1) ────────────────────────────────────────
 //

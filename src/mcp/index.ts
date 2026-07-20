@@ -40,6 +40,8 @@ import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import {
   assertCompletableDoneWhen,
+  assigneeCannotMutateOwnAssignment,
+  assigneeSelfClose,
   checkTransition,
   createTask,
   emitTaskEvent,
@@ -838,6 +840,19 @@ const toolTaskUpdate: ToolSpec = {
       if (patchToDoneBypassesGate(existing.status, existing.gate_owner, args.status)) {
         return fail(409, 'gate_open', 'gated task must be approved via verdict before it can be marked done')
       }
+      // NO SELF-CLOSE (fake-green guard, 2026-07-20 re-gate on PR #417): an
+      // agent assignee may not mark its OWN in_progress task 'done' — that is
+      // grading your own homework. Now calls the SHARED chokepoint
+      // (assigneeSelfClose, src/tasks/service.ts) so this path agrees with every
+      // other done-write path (execute.ts's finishTask, REST PATCH). approved→done
+      // stays allowed: a non-assignee verdict has already passed the gate by then.
+      if (assigneeSelfClose(auth.boundAgentId, existing.status, existing.assignee_agent_id, args.status)) {
+        return fail(
+          409,
+          'assignee_cannot_self_close',
+          'the assignee cannot mark its own task done; move it to review so a different principal can verify and close',
+        )
+      }
       if (args.status === 'done') {
         try {
           assertCompletableDoneWhen(next.done_when)
@@ -849,6 +864,23 @@ const toolTaskUpdate: ToolSpec = {
       changed = true
     }
     if (args.assignee_agent_id !== undefined) {
+      // BLOCK-1 close (fake-green guard, 2026-07-20 re-gate on PR #417): the
+      // no-self-close predicate only fires on in_progress→done. An agent could
+      // launder around it by first stripping/reassigning itself off the task
+      // here (assignee_agent_id:null or someone else) while still in_progress,
+      // THEN calling {status:'done'} in a second request — by then the assignee
+      // no longer matches and assigneeSelfClose sees no self-match at all.
+      // Shared chokepoint (assigneeCannotMutateOwnAssignment, src/tasks/service.ts):
+      // an agent bound-token that IS the CURRENT assignee of an in_progress task
+      // cannot change assignee_agent_id on that task — self-unassign or reassign
+      // to anyone else. Operators and non-assignee agents are unaffected.
+      if (assigneeCannotMutateOwnAssignment(auth.boundAgentId, existing.status, existing.assignee_agent_id)) {
+        return fail(
+          409,
+          'assignee_cannot_mutate_own_assignment',
+          'the current assignee cannot change the assignee field on its own in_progress task; ask an operator or a different principal',
+        )
+      }
       // #406 fast-follow (Opus re-gate WARN-1 on #404) — mirrors the same guard
       // in PATCH /api/tasks/:id (src/tasks/index.ts): #404 closed AUTO-pickup of
       // an unassigned source_pot task, but ASSIGNMENT itself only required
