@@ -33,19 +33,14 @@ import { requireAuth } from '../auth'
 // is org admin; creating a squad in a department is admin+ on THAT department;
 // creating an agent / attaching a membership in a squad is lead+ on THAT squad.
 // The scope is data-derived (URL param), so we check inline with the pure API.
-import { resolveCapabilities, hasCapability } from '../auth/capability'
+import { resolveCapabilities, hasCapability, isOrgAdmin } from '../auth/capability'
 // Shared org-chart creation path (also used by the dashboard). Validation + the
 // UNIQUE conflict mapping live here so both surfaces stay in lockstep.
 import { createDepartment, createSquad, createAgent } from './service'
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-// admin+ means org role 'owner' or 'admin'. Members may read but not mutate.
-function isAdminPlus(auth: AuthContext): boolean {
-  return auth.role === 'owner' || auth.role === 'admin'
-}
-
-// isAdminPlus doubles as the legacy-role escape: a pure web-login owner/admin (no
+// isOrgAdmin doubles as the legacy-role escape: a pure web-login owner/admin (no
 // fine-grained capabilities) keeps full admin reach over the org chart — owner/admin
 // org role satisfies any scoped check. Mirrors requireCapability's legacy escape.
 
@@ -64,7 +59,7 @@ async function canOnDepartment(
   departmentId: string,
   min: Capability,
 ): Promise<boolean> {
-  if (isAdminPlus(auth)) return true
+  if (isOrgAdmin(auth)) return true
   if (!auth.memberId) return false
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
   return hasCapability(grants, 'department', departmentId, min)
@@ -78,7 +73,7 @@ async function canOnSquad(
   squadId: string,
   min: Capability,
 ): Promise<boolean> {
-  if (isAdminPlus(auth)) return true
+  if (isOrgAdmin(auth)) return true
   if (!auth.memberId) return false
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
   const deptId = await squadDepartment(env, squadId)
@@ -135,7 +130,7 @@ interface CreateDepartmentBody {
 orgApp.post('/departments', async (c) => {
   // Creating a department is an org-wide admin action.
   const auth = c.get('auth')
-  if (!isAdminPlus(auth)) {
+  if (!isOrgAdmin(auth)) {
     if (!auth.memberId) return c.json({ error: 'forbidden', need: 'admin' }, 403)
     const grants = auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId))
     if (!hasCapability(grants, 'org', null, 'admin')) {

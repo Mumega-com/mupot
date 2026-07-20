@@ -43,7 +43,7 @@ import { requireAuth } from '../auth'
 // Fine-grained RBAC — the dashboard's mutating handlers reuse the SAME gates the
 // JSON API uses (admin on org for tokens / departments; admin on the department for
 // a squad; lead on the squad for an agent). Identity is always server-derived.
-import { resolveCapabilities, hasCapability, actorMaxRankOnScope, hasSurfaceCap } from '../auth/capability'
+import { resolveCapabilities, hasCapability, actorMaxRankOnScope, hasSurfaceCap, isOrgAdmin } from '../auth/capability'
 
 // Shared creation paths — the dashboard handlers call the SAME service functions
 // the /api routes call, never re-implementing the write/validation logic.
@@ -217,7 +217,7 @@ dashboardApp.use('*', async (c, next) => {
 // operator-only entry after the authenticated route response has been rendered.
 dashboardApp.use('*', async (c, next) => {
   await next()
-  if (!isAdmin(c.get('auth')) || !c.res.headers.get('content-type')?.includes('text/html')) return
+  if (!isOrgAdmin(c.get('auth')) || !c.res.headers.get('content-type')?.includes('text/html')) return
 
   const body = await c.res.text()
   c.res = new Response(body.replace('id="nav-addons" hidden', 'id="nav-addons"'), c.res)
@@ -369,7 +369,7 @@ dashboardApp.get('/projects/:id', async (c) => {
 // POST /projects/:id/boards — link an external board (owner/admin).
 dashboardApp.post('/projects/:id/boards', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(shell(c.env, 'Projects', projectNotFoundBody()), 403)
   }
   const projectId = c.req.param('id')
@@ -394,7 +394,7 @@ dashboardApp.post('/projects/:id/boards', async (c) => {
 // POST /projects/:id/boards/sync — import from the linked board into attributed tasks.
 dashboardApp.post('/projects/:id/boards/sync', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(shell(c.env, 'Projects', projectNotFoundBody()), 403)
   }
   const projectId = c.req.param('id')
@@ -462,7 +462,7 @@ dashboardApp.get('/approvals', async (c) => {
 // operator can answer "is this pot healthy?" without querying SQL.
 dashboardApp.get('/ops', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(shell(c.env, 'Operations', errorBody('Operations health requires owner or admin.')), 403)
   }
   const data = await loadOpsHealth(c.env)
@@ -477,7 +477,7 @@ dashboardApp.get('/ops', async (c) => {
 // only, like the other SOVEREIGNTY pages (/admin/keys, /ops).
 dashboardApp.get('/deployment', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(shell(c.env, 'Deployment', errorBody('Deployment requires owner or admin.')), 403)
   }
   const data = await loadDeployment(c.env)
@@ -503,7 +503,7 @@ dashboardApp.get('/services', async (c) => {
 // there, so this route only renders the existing API contract.
 dashboardApp.get('/addons', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(shell(c.env, 'Addons', errorBody('Addons requires owner or admin.')), 403)
   }
   try {
@@ -534,7 +534,7 @@ function currentUtcMarketingWindow(now = new Date()) {
 
 dashboardApp.post('/addons/marketing-cro-monitor/run', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(shell(c.env, 'Marketing & CRO', errorBody('Running the monitor requires owner or admin.')), 403)
   }
   const result = await runMarketingMonitor(
@@ -625,7 +625,7 @@ dashboardApp.get('/brain', async (c) => {
   // Header regime chip reuses this SAME loadBrainView() call (it already fetched
   // the KV physics snapshot for the coherence panel below) — no extra KV read.
   return c.html(
-    shell(c.env, 'Brain', brainBody(view, isAdmin(auth)), { physics: view.physics }),
+    shell(c.env, 'Brain', brainBody(view, isOrgAdmin(auth)), { physics: view.physics }),
   )
 })
 
@@ -655,7 +655,7 @@ dashboardApp.get('/departments/growth', async (c) => {
 // config → 503 executor_not_configured (inert; nothing wired for this pot at all).
 dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const dept = c.req.param('dept')
   const gateId = c.req.param('gateId')
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(dept) || !gateId) {
@@ -762,7 +762,7 @@ dashboardApp.post('/brain/loops/:id/control', async (c) => {
   // Surface-cap gate (#106): any loop control action requires content:write.
   // Admin/owner tokens pass via hasSurfaceCap bypass (rank is sufficient).
   // Non-admin members must hold an explicit content:write grant in gate_grants.
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     const hasContentWrite = await hasSurfaceCap(c.env, auth, 'content:write')
     if (!hasContentWrite) return c.json({ error: 'forbidden', need: 'content:write' }, 403)
   }
@@ -788,7 +788,7 @@ dashboardApp.post('/brain/loops/:id/control', async (c) => {
   // budget_override requires budget:write in addition to content:write.
   // Admin/owner bypass again via hasSurfaceCap.
   if (body.action === 'budget_override') {
-    if (!isAdmin(auth)) {
+    if (!isOrgAdmin(auth)) {
       const hasBudgetWrite = await hasSurfaceCap(c.env, auth, 'budget:write')
       if (!hasBudgetWrite) return c.json({ error: 'forbidden', need: 'budget:write' }, 403)
     }
@@ -840,7 +840,7 @@ dashboardApp.get('/flights', async (c) => {
 // new data, zero migration, reuses loadFleetRadar/buildFleetRadar as-is.
 //
 // Auth: this route lives on dashboardApp (session-cookie, requireAuth via the
-// outer middleware) and is admin-gated with the SAME isAdmin() check every
+// outer middleware) and is admin-gated with the SAME isOrgAdmin() check every
 // other org-admin dashboard page uses (/ops, /deployment, /audit) — matching
 // the org-admin authorization LEVEL that GET /api/radar's bearer-token
 // resolveOrgAdmin check requires, via the mechanism this cookie-authed
@@ -851,7 +851,7 @@ dashboardApp.get('/flights', async (c) => {
 // FleetRadar JSON through this session-authed path for convenience.
 dashboardApp.get('/radar', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(shell(c.env, 'Radar', errorBody('Fleet radar requires owner or admin.')), 403)
   }
   const radar = await loadFleetRadar(c.env)
@@ -935,7 +935,7 @@ dashboardApp.post('/fleet/host-control', async (c) => {
 dashboardApp.post('/fleet/wake', async (c) => {
   if (!fleetScoped(c.env)) return c.json({ error: 'bus_not_configured' }, 503)
   const auth = c.get('auth')
-  if (auth.role !== 'owner' && auth.role !== 'admin') {
+  if (!isOrgAdmin(auth)) {
     return c.json({ error: 'forbidden', need: 'admin' }, 403)
   }
   const body = (await c.req.json().catch(() => ({}))) as { agent?: unknown }
@@ -953,7 +953,7 @@ dashboardApp.post('/fleet/wake', async (c) => {
 dashboardApp.post('/fleet/control', async (c) => {
   if (!fleetScoped(c.env)) return c.json({ error: 'bus_not_configured' }, 503)
   const auth = c.get('auth')
-  if (auth.role !== 'owner' && auth.role !== 'admin') {
+  if (!isOrgAdmin(auth)) {
     return c.json({ error: 'forbidden', need: 'admin' }, 403)
   }
   const body = (await c.req.json().catch(() => ({}))) as { agent?: unknown; action?: unknown }
@@ -997,7 +997,7 @@ dashboardApp.get('/agents', async (c) => {
     loadTodaySpendScalar(c.env),
   ])
   const auth = c.get('auth')
-  const canManage = isAdmin(auth)
+  const canManage = isOrgAdmin(auth)
   return c.html(
     shell(c.env, 'Agents', agentsBody(agents, squadOptions, canManage), {
       physics,
@@ -1009,7 +1009,7 @@ dashboardApp.get('/agents', async (c) => {
 // POST /agents — create an agent (owner/admin only).
 dashboardApp.post('/agents', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(shell(c.env, 'Agents', errorBody('Creating an agent requires owner or admin.')), 403)
   }
   const form = await c.req.parseBody()
@@ -1041,7 +1041,7 @@ dashboardApp.post('/agents', async (c) => {
 // POST /agents/:id/status — pause or resume an agent (owner/admin only).
 dashboardApp.post('/agents/:id/status', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const agentId = c.req.param('id')
   // Validate agentId is a non-empty string (UUID format); we don't need to parse
   // the body format strictly since we validate the status value via isAgentStatus.
@@ -1060,7 +1060,7 @@ dashboardApp.post('/agents/:id/status', async (c) => {
 // Note: HTML forms cannot DELETE; the client sends via fetch() with method:DELETE.
 dashboardApp.delete('/agents/:id', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const agentId = c.req.param('id')
   if (!agentId || agentId.length > 64) return c.json({ error: 'invalid_agent_id' }, 400)
   const result = await deleteAgent(c.env, agentId)
@@ -1072,7 +1072,7 @@ dashboardApp.delete('/agents/:id', async (c) => {
 // Calls the shared updateUnitConfig from org/service — no new write logic here.
 dashboardApp.post('/agents/:id/config', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const agentId = c.req.param('id')
   if (!agentId || agentId.length > 64) return c.json({ error: 'invalid_agent_id' }, 400)
 
@@ -1089,7 +1089,7 @@ dashboardApp.post('/agents/:id/config', async (c) => {
 // POST /squads/:id/config — patch work-unit knobs on a squad (owner/admin only).
 dashboardApp.post('/squads/:id/config', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const squadId = c.req.param('id')
   if (!squadId || squadId.length > 64) return c.json({ error: 'invalid_squad_id' }, 400)
 
@@ -1125,7 +1125,7 @@ dashboardApp.get('/squads/:id', async (c) => {
   ])
   const auth = c.get('auth')
   const canAddAgent = await canOnSquad(c.env, auth, squadId)
-  const canManage = isAdmin(auth)
+  const canManage = isOrgAdmin(auth)
   return c.html(
     shell(
       c.env,
@@ -1164,7 +1164,7 @@ dashboardApp.get('/agents/:id', async (c) => {
 // connection channels, suspend/reactivate, grant-capability + invite forms.
 dashboardApp.get('/admin/members', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(
       shell(c.env, 'People & Access', errorBody('People & Access admin requires owner or admin.')),
       403,
@@ -1190,7 +1190,7 @@ dashboardApp.get('/admin/members', async (c) => {
 // member(s) holding lead+ capability on that scope.
 dashboardApp.get('/admin/divisions', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(
       shell(c.env, 'Organization', errorBody('Organization admin requires owner or admin.')),
       403,
@@ -1223,7 +1223,7 @@ dashboardApp.get('/admin/divisions', async (c) => {
 // GET /admin/keys
 dashboardApp.get('/admin/keys', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(
       shell(c.env, 'Scoped Keys', errorBody('Scoped key management requires owner or admin.')),
       403,
@@ -1236,7 +1236,7 @@ dashboardApp.get('/admin/keys', async (c) => {
 // POST /admin/keys/mint — mint + show-once
 dashboardApp.post('/admin/keys/mint', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(
       shell(c.env, 'Scoped Keys', errorBody('Minting a scoped key requires owner or admin.')),
       403,
@@ -1340,7 +1340,7 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
 // GET /admin/agent-token
 dashboardApp.get('/admin/agent-token', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(
       shell(c.env, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
       403,
@@ -1353,7 +1353,7 @@ dashboardApp.get('/admin/agent-token', async (c) => {
 // POST /admin/agent-token/mint
 dashboardApp.post('/admin/agent-token/mint', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(
       shell(c.env, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
       403,
@@ -1451,7 +1451,7 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
 // GET /admin/connectors — list active connectors (masked)
 dashboardApp.get('/admin/connectors', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(
       shell(c.env, 'Connectors', errorBody('Connector management requires owner or admin.')),
       403,
@@ -1464,7 +1464,7 @@ dashboardApp.get('/admin/connectors', async (c) => {
 // POST /admin/connectors — add a new connector (encrypt + store)
 dashboardApp.post('/admin/connectors', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(
       shell(c.env, 'Connectors', errorBody('Adding a connector requires owner or admin.')),
       403,
@@ -1537,7 +1537,7 @@ dashboardApp.post('/admin/connectors', async (c) => {
 // POST /admin/connectors/:id/rotate — re-encrypt with a new secret
 dashboardApp.post('/admin/connectors/:id/rotate', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.json({ error: 'forbidden', need: 'admin' }, 403)
   }
 
@@ -1578,7 +1578,7 @@ dashboardApp.post('/admin/connectors/:id/rotate', async (c) => {
 // POST /admin/connectors/:id/revoke — permanently disable a connector
 dashboardApp.post('/admin/connectors/:id/revoke', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.json({ error: 'forbidden', need: 'admin' }, 403)
   }
 
@@ -1605,7 +1605,7 @@ dashboardApp.post('/admin/connectors/:id/revoke', async (c) => {
 
 dashboardApp.get('/admin/github/status', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const snapshot = await githubCapabilitySnapshot(c.env)
   return c.json(snapshot)
 })
@@ -1613,7 +1613,7 @@ dashboardApp.get('/admin/github/status', async (c) => {
 // GET /admin/github — the HTML status + connect + sync card (A4).
 dashboardApp.get('/admin/github', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.html(shell(c.env, 'GitHub', errorBody('GitHub management requires owner or admin.')), 403)
   }
   const snapshot = await githubCapabilitySnapshot(c.env)
@@ -1629,7 +1629,7 @@ dashboardApp.get('/admin/github', async (c) => {
 
 dashboardApp.post('/admin/github/agent-def', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
 
   let body: { repo?: unknown; agentName?: unknown; content?: unknown; message?: unknown }
   try {
@@ -1648,7 +1648,7 @@ dashboardApp.post('/admin/github/agent-def', async (c) => {
 
 dashboardApp.post('/admin/github/assign-copilot', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
 
   let body: { repo?: unknown; issueNumber?: unknown }
   try {
@@ -1667,7 +1667,7 @@ dashboardApp.post('/admin/github/assign-copilot', async (c) => {
 // each wired to THIS pot's MCP endpoint. { repo, dryRun? }. dryRun previews without writing.
 dashboardApp.post('/admin/github/sync-fleet', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
 
   let body: { repo?: unknown; dryRun?: unknown }
   try {
@@ -1688,7 +1688,7 @@ dashboardApp.post('/admin/github/sync-fleet', async (c) => {
 // { taskId, repo, branchName, files:[{path,content}], title, body?, baseBranch? }
 dashboardApp.post('/admin/github/execute-task', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
 
   let body: {
     taskId?: unknown; repo?: unknown; branchName?: unknown
@@ -1721,7 +1721,7 @@ dashboardApp.post('/admin/github/execute-task', async (c) => {
 // a named agent (via the "Agent" field) as routed tasks. { owner, projectNumber, agentField?, dryRun? }
 dashboardApp.post('/admin/github/import-project', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
 
   let body: { owner?: unknown; projectNumber?: unknown; agentField?: unknown; dryRun?: unknown }
   try {
@@ -1748,7 +1748,7 @@ dashboardApp.post('/admin/github/import-project', async (c) => {
 
 dashboardApp.get('/admin/github/connect', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const state = crypto.randomUUID()
   // Single-use, tenant-bound, 10-min TTL. Verified + deleted on callback.
   await c.env.SESSIONS.put(`ghstate:${state}`, c.env.TENANT_SLUG, { expirationTtl: 600 })
@@ -1757,7 +1757,7 @@ dashboardApp.get('/admin/github/connect', async (c) => {
 
 dashboardApp.get('/connect/github/callback', async (c) => {
   const auth = c.get('auth')
-  if (!isAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
 
   const url = new URL(c.req.url)
   const state = url.searchParams.get('state') ?? ''
@@ -1983,7 +1983,7 @@ export const dashboardBuiltInGetRoutes = Object.freeze(dashboardApp.routes
   .map((route) => Object.freeze({ method: route.method, path: route.path })))
 
 dashboardApp.get('*', async (c) => {
-  if (!isAdmin(c.get('auth'))) {
+  if (!isOrgAdmin(c.get('auth'))) {
     return c.html(shell(c.env, 'Addon console', errorBody('Addon consoles require owner or admin.')), 403)
   }
   const resolved = createAddonConsoleResolver(
@@ -2051,12 +2051,6 @@ async function getById<T>(env: Env, table: DashTable, id: string): Promise<T | n
 // All reads are direct against this pot's D1 (one DB per tenant). The dashboard
 // renders STRUCTURE only — the member-admin API owns every write.
 
-/** admin+ means org role owner or admin. The coarse gate available server-side
- *  for HTML rendering; the API re-checks fine-grained capability on each write. */
-function isAdmin(auth: AuthContext): boolean {
-  return auth.role === 'owner' || auth.role === 'admin'
-}
-
 /** Synchronous owner check for the first-run nudge ONLY — reads the org 'owner'
  *  grant already resolved onto the AuthContext (no DB hit). The wizard does the
  *  authoritative async check (resolveCapabilities); this is a convenience so a
@@ -2071,7 +2065,7 @@ function hasOrgOwnerCapability(auth: AuthContext): boolean {
 // These are the authoritative, async, fine-grained checks the dashboard's POST
 // handlers run before any mutation. They replicate the org API's gate logic 1:1:
 // org-admin → departments + tokens; admin-on-department → squads; lead-on-squad →
-// agents (with department→squad inheritance). isAdmin() doubles as the legacy
+// agents (with department→squad inheritance). isOrgAdmin() doubles as the legacy
 // owner/admin escape, identical to requireCapability's.
 
 /** Resolve a squad's department for department→squad capability inheritance. */
@@ -2084,7 +2078,7 @@ async function squadDepartment(env: Env, squadId: string): Promise<string | null
 
 /** org-scope capability gate (e.g. minting a token / creating a department → admin). */
 async function canOnOrg(env: Env, auth: AuthContext, min: 'admin' | 'owner'): Promise<boolean> {
-  if (isAdmin(auth)) return true
+  if (isOrgAdmin(auth)) return true
   if (!auth.memberId) return false
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
   return hasCapability(grants, 'org', null, min)
@@ -2096,7 +2090,7 @@ async function canOnDepartment(
   auth: AuthContext,
   departmentId: string,
 ): Promise<boolean> {
-  if (isAdmin(auth)) return true
+  if (isOrgAdmin(auth)) return true
   if (!auth.memberId) return false
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
   return hasCapability(grants, 'department', departmentId, 'admin')
@@ -2104,7 +2098,7 @@ async function canOnDepartment(
 
 /** squad-scope gate (creating an agent → lead on THAT squad, dept grants inherit). */
 async function canOnSquad(env: Env, auth: AuthContext, squadId: string): Promise<boolean> {
-  if (isAdmin(auth)) return true
+  if (isOrgAdmin(auth)) return true
   if (!auth.memberId) return false
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
   const deptId = await squadDepartment(env, squadId)
