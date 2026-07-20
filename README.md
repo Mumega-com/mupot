@@ -37,8 +37,10 @@ The current stable release is `v0.23.0`; the active development target is
 [v0.23.0 Trusted Runtime release record](./docs/releases/v0.23.0-trusted-runtime.md), the
 [runtime adapter contract](./docs/runtime-adapter-contract.md), the
 [self-hosting guide](./docs/SELF-HOST.md), the
-[production runbook](./docs/production-runbook.md), and
-[what running an agent on Mupot means](./docs/agent-running-on-mupot.md).
+[production runbook](./docs/production-runbook.md),
+[what running an agent on Mupot means](./docs/agent-running-on-mupot.md),
+[how to connect an MCP client](./docs/connect-mcp-client.md), and
+[what runs offline in local dev](./docs/local-dev.md).
 
 ## Pots and projects
 
