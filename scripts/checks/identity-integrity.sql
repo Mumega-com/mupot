@@ -1,5 +1,5 @@
 -- Scheduled identity integrity check for
--- docs/architecture/identity-access-form-map.md Phase 0.
+-- docs/architecture/identity-access-fix-map.md Phase 0.
 -- Read-only SQLite detection queries. A nonzero result set on any query is a
 -- durability finding that needs human cleanup (not auto-fixed here).
 
