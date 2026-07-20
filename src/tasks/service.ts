@@ -73,6 +73,60 @@ export function patchToDoneBypassesGate(
   return existingStatus !== 'approved' && existingStatus !== 'rejected'
 }
 
+// NO SELF-CLOSE — the shared chokepoint (fake-green guard, 2026-07-20 re-gate on
+// PR #417). A dispatched runtime self-marked its OWN in_progress task 'done'
+// with zero work (no branch, no PR, no receipt) and the pot accepted it. The
+// first fix inlined a check ONLY in MCP task_update; an Opus adversarial re-gate
+// found two more doors that never called it: (BLOCK-1) an agent can strip/
+// reassign itself off the task via task_update{assignee_agent_id:...} while
+// still in_progress, then close it — the assignee comparison in the OLD inline
+// check no longer sees a match; (BLOCK-2) src/agents/execute.ts's own
+// finishTask wrote 'done' directly with no different-principal check at all,
+// a second, entirely separate write path.
+//
+// This predicate is now the SINGLE source of truth for "must this done-move be
+// refused because the actor is grading its own homework" — every path that can
+// write 'done' (MCP task_update, REST PATCH /api/tasks/:id, execute.ts's
+// finishTask) calls it instead of re-deriving the comparison locally.
+//
+// Returns true when the move MUST be refused: the actor is the task's current
+// assignee, closing its OWN in_progress task straight to 'done'. approved→done
+// is NOT refused (fromStatus !== 'in_progress' short-circuits it) — a
+// non-assignee verdict has already passed the gate by the time a task reaches
+// 'approved' (see the verdict endpoint's self-verdict check, src/tasks/index.ts,
+// which independently blocks a self-approval from ever landing 'approved').
+export function assigneeSelfClose(
+  actorAgentId: string | null | undefined,
+  fromStatus: TaskStatus,
+  assigneeAgentId: string | null | undefined,
+  toStatus: TaskStatus,
+): boolean {
+  if (toStatus !== 'done') return false
+  if (fromStatus !== 'in_progress') return false
+  if (!actorAgentId || !assigneeAgentId) return false
+  return actorAgentId === assigneeAgentId
+}
+
+// BLOCK-1 close: assigneeSelfClose only fires on the in_progress→done move
+// itself, so an agent could launder around it by first stripping/reassigning
+// itself off the task (task_update{assignee_agent_id:null}) while still
+// in_progress, THEN calling {status:'done'} — by then assigneeAgentId is
+// null/different and assigneeSelfClose no longer sees a self-match. Close the
+// bypass at the mutation, not just the close: an agent bound-token that IS the
+// CURRENT assignee of an in_progress task may not change assignee_agent_id on
+// that task at all (unassign or reassign to anyone else). Non-assignees
+// (operators, admins, a different agent) are unaffected — this only fires when
+// the actor and the existing assignee match.
+export function assigneeCannotMutateOwnAssignment(
+  actorAgentId: string | null | undefined,
+  fromStatus: TaskStatus,
+  assigneeAgentId: string | null | undefined,
+): boolean {
+  if (fromStatus !== 'in_progress') return false
+  if (!actorAgentId || !assigneeAgentId) return false
+  return actorAgentId === assigneeAgentId
+}
+
 export function stampTaskUpdate(
   task: Task,
   previousStatus: TaskStatus,

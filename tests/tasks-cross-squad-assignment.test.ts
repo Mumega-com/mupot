@@ -248,7 +248,11 @@ describe('cross-squad task assignment over HTTP', () => {
       emit: async (event) => { executionEvents.push(event) },
     })
 
-    expect(result).toMatchObject({ ok: true, task_id: taskId, task_status: 'done' })
+    // BLOCK-2 close (fake-green guard, 2026-07-20 re-gate on PR #417): an
+    // agent's own dispatch-completion lands 'review', not 'done', even for an
+    // ungated task — a different principal's verdict (or a non-assignee close)
+    // is what actually completes it.
+    expect(result).toMatchObject({ ok: true, task_id: taskId, task_status: 'review' })
     expect(model.chat).toHaveBeenCalledOnce()
     expect(model.chat).toHaveBeenCalledWith(
       expect.arrayContaining([
@@ -256,13 +260,13 @@ describe('cross-squad task assignment over HTTP', () => {
       ]),
       expect.anything(),
     )
-    expect(executionEvents.map((event) => event.type)).toEqual(['task.completed'])
+    expect(executionEvents.map((event) => event.type)).toEqual(['task.review'])
     expect(remember).toHaveBeenCalledOnce()
     expect(recordTokens).toHaveBeenCalledOnce()
     expect(harness.sqlite.prepare(
       'SELECT status, assignee_agent_id, result, completed_at FROM tasks WHERE id = ?',
     ).get(taskId)).toEqual({
-      status: 'done',
+      status: 'review',
       assignee_agent_id: CROSS_AGENT_ID,
       result: 'Cross-squad work completed.',
       completed_at: expect.any(String),

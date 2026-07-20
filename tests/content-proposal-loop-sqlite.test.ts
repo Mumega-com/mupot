@@ -215,9 +215,11 @@ describe('content-publish loop — real SQLite, propose → approve → execute 
   // '../src/departments/modules/growth'`) and a REAL D1 (sqlite), prove a
   // source_pot (cross-pot) task titled "publish: ..." does NOT reach
   // ctx.gate.propose({action:'content-publish',...}) — it falls through to the
-  // normal fenced model-answer path instead, landing 'done' (a content
-  // proposal always forces 'review', never 'done'), and no department_proposals
-  // row is ever written for it.
+  // normal fenced model-answer path instead. Landing status is now 'review'
+  // either way (BLOCK-2 close, 2026-07-20 re-gate on PR #417: an agent's own
+  // dispatch-completion never writes 'done' directly anymore), so this test
+  // distinguishes the two paths by decided/department_proposals, not status —
+  // and no department_proposals row is ever written for the fallthrough path.
   it('a source_pot task titled "publish: ..." is answered by the model, never proposed as a content-publish gate', async () => {
     harness.sqlite.prepare(
       `INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, done_when, source_pot)
@@ -248,12 +250,15 @@ describe('content-publish loop — real SQLite, propose → approve → execute 
     })
 
     expect(result.ok).toBe(true)
-    expect(result.task_status).toBe('done')
+    expect(result.task_status).toBe('review')
     expect(result.decided).not.toContain('content_proposed')
 
     const row = harness.sqlite.prepare('SELECT * FROM tasks WHERE id = ?').get('task-content-cross-pot') as unknown as Task & { gate_owner: string | null }
-    expect(row.status).toBe('done')
-    expect(row.gate_owner).toBeNull()
+    expect(row.status).toBe('review')
+    // BLOCK-2 close: a previously-ungated task landing 'review' gets a fallback
+    // gate_owner stamped (finishTask's COALESCE) so it is not a zombie in
+    // review — the verdict endpoint 409s 'no_gate' with none set.
+    expect(row.gate_owner).toBe('gate:agent-self-completion')
     expect(row.result).toBe('Answered as ordinary text — not a publish request.')
 
     const proposalRow = harness.sqlite.prepare('SELECT * FROM department_proposals WHERE gate_id = ?').get('task-content-cross-pot')

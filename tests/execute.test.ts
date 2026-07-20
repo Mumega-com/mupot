@@ -127,7 +127,12 @@ describe('capResult', () => {
 })
 
 describe('runTaskExecution — success', () => {
-  it('marks in_progress, calls the model, persists done + result, emits task.completed', async () => {
+  // BLOCK-2 close (fake-green guard, 2026-07-20 re-gate on PR #417): an agent's
+  // own dispatch-completion never writes 'done' directly anymore, gated or not
+  // — it proposes 'review' and a different principal's verdict (or a
+  // non-assignee close) actually completes the task. This test used to assert
+  // a direct 'done' write for an ungated task; it now asserts 'review'.
+  it('marks in_progress, calls the model, persists review + result, emits task.review', async () => {
     const { env, updates } = makeEnv({ task: makeTask(), charter: 'Be useful.' })
     const events: BusEvent[] = []
     const remembered: string[] = []
@@ -145,9 +150,9 @@ describe('runTaskExecution — success', () => {
     })
 
     expect(r.ok).toBe(true)
-    expect(r.task_status).toBe('done')
+    expect(r.task_status).toBe('review')
 
-    // First UPDATE claims + flips to in_progress; the terminal UPDATE lands 'done'.
+    // First UPDATE claims + flips to in_progress; the terminal UPDATE lands 'review'.
     expect(updates[0].sql).toContain("status = 'in_progress'")
     expect(updates[0].sql).toContain('execution_receipt_id = ?')
     expect(updates[0].args).toContain('dispatch-receipt-1')
@@ -155,12 +160,12 @@ describe('runTaskExecution — success', () => {
     expect(terminal.sql).toContain('SET status = ?')
     expect(terminal.sql).toContain('execution_receipt_id = ?')
     expect(terminal.args).toContain('dispatch-receipt-1')
-    expect(terminal.args[0]).toBe('done')
+    expect(terminal.args[0]).toBe('review')
     expect(terminal.args[1]).toBe('Here is the finished intro.')
     expect(terminal.args[2]).not.toBeNull() // completed_at stamped
 
     expect(events).toHaveLength(1)
-    expect(events[0].type).toBe('task.completed')
+    expect(events[0].type).toBe('task.review')
     expect(remembered).toHaveLength(1)
   })
 })
@@ -201,8 +206,9 @@ describe('runTaskExecution — failure (NEVER stuck in_progress)', () => {
       remember: async () => 'noop',
     })
     expect(r.ok).toBe(true)
-    expect(r.task_status).toBe('done')
-    expect(updates[updates.length - 1].args[0]).toBe('done')
+    // BLOCK-2 close: self-completion lands 'review', not 'done' — see above.
+    expect(r.task_status).toBe('review')
+    expect(updates[updates.length - 1].args[0]).toBe('review')
   })
 })
 
@@ -232,7 +238,13 @@ describe('runTaskExecution — K1 gated task lands review', () => {
     expect(events[0].type).toBe('task.review')
   })
 
-  it('success on an ungated task still lands done (regression guard)', async () => {
+  // BLOCK-2 close (fake-green guard, 2026-07-20 re-gate on PR #417): this used
+  // to be the "ungated task still lands done" regression guard. That is now the
+  // exact hole the adversarial gate closed — an agent's own dispatch-completion
+  // of an ungated task must land 'review' too, same as a gated task, so a
+  // different principal (or a non-assignee close) is what actually completes
+  // it. Renamed to assert the NEW invariant.
+  it('success on an ungated task ALSO lands review, not done (BLOCK-2 close)', async () => {
     const ungatedTask = makeTask({ gate_owner: null })
     const { env, updates } = makeEnv({ task: ungatedTask })
     const events: BusEvent[] = []
@@ -244,9 +256,9 @@ describe('runTaskExecution — K1 gated task lands review', () => {
     })
 
     expect(r.ok).toBe(true)
-    expect(r.task_status).toBe('done')
-    expect(updates[updates.length - 1].args[0]).toBe('done')
-    expect(events[0].type).toBe('task.completed')
+    expect(r.task_status).toBe('review')
+    expect(updates[updates.length - 1].args[0]).toBe('review')
+    expect(events[0].type).toBe('task.review')
   })
 })
 
@@ -481,11 +493,13 @@ describe('runTaskExecution — content-intent short-circuit skipped for source_p
     })
 
     // Went through the normal (ungated) model path, not finishContentProposal —
-    // proof: the model was actually called, and success lands 'done' (a content
-    // proposal always forces 'review', never 'done').
+    // proof: the model was actually called. Success lands 'review' either way
+    // now (BLOCK-2 close, 2026-07-20 re-gate on PR #417: self-completion never
+    // writes 'done' directly), so this only distinguishes the two paths by
+    // decided/model-called, not by task_status.
     expect(model.chat).toHaveBeenCalledOnce()
     expect(r.ok).toBe(true)
-    expect(r.task_status).toBe('done')
+    expect(r.task_status).toBe('review')
     expect(r.decided).not.toContain('content_proposed')
 
     // The fence (#404) still applies — the "publish:" title is treated as opaque

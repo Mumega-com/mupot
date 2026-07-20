@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { TOOLS, invokeTool } from '../src/mcp'
+import { assigneeSelfClose, assigneeCannotMutateOwnAssignment } from '../src/tasks/service'
 import type { AuthContext, Capability, CapabilityGrant, Env, Task } from '../src/types'
 
 const TENANT = 'test-tenant'
@@ -277,6 +278,75 @@ describe('MCP task cutover tools', () => {
 
     expect(res.ok).toBe(true)
     expect((res.result as { task: Task }).task.status).toBe('done')
+  })
+
+  // approved→done by the assignee stays ALLOWED: a non-assignee verdict has
+  // already passed the gate by the time a task reaches 'approved' (the verdict
+  // endpoint's own self-verdict check, src/tasks/index.ts, blocks a self-approval
+  // from ever landing 'approved' in the first place). assigneeSelfClose only
+  // fires on the in_progress→done move, so this must NOT be refused.
+  it('allows the assignee to close its OWN task done from approved (verdict already passed)', async () => {
+    const { env } = makeEnv([task({ status: 'approved', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(
+      auth(), // boundAgentId === AGENT_ID === the task's assignee
+      env,
+      'task_update',
+      { task_id: 'task-1', status: 'done' },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(true)
+    expect((res.result as { task: Task }).task.status).toBe('done')
+  })
+
+  // BLOCK-1 close (2026-07-20 re-gate on PR #417): the assignee could launder
+  // around the no-self-close guard by first stripping itself off the
+  // in_progress task (assignee_agent_id:null), then closing it in a second
+  // call — by then assignee_agent_id no longer matches the actor and the OLD
+  // inline check saw no self-match at all. Prove the mutation itself is now
+  // refused, so the two-step bypass never gets off the ground.
+  it('blocks the assignee from self-unassigning its own in_progress task (BLOCK-1 bypass closed)', async () => {
+    const { env } = makeEnv([task({ status: 'in_progress', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(
+      auth(), // boundAgentId === AGENT_ID === the task's assignee
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: null },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_mutate_own_assignment' })
+  })
+
+  it('blocks the assignee from reassigning its own in_progress task to someone else (BLOCK-1 bypass closed)', async () => {
+    const { env } = makeEnv([task({ status: 'in_progress', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: 'agent-other' },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_mutate_own_assignment' })
+  })
+
+  it('still allows a NON-assignee principal (operator/other agent) to reassign the same in_progress task', async () => {
+    const { env } = makeEnv([task({ status: 'in_progress', assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(
+      auth({ boundAgentId: 'agent-verifier' }),
+      env,
+      'task_update',
+      { task_id: 'task-1', assignee_agent_id: null },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(true)
+    expect((res.result as { task: Task }).task.assignee_agent_id).toBeNull()
   })
 
   // ── #406 fast-follow (Opus re-gate WARN-1 on #404) ──────────────────────────
@@ -604,5 +674,57 @@ describe('MCP task cutover tools', () => {
 
     expect(res).toMatchObject({ ok: false, status: 409, error: 'task_not_runnable' })
     expect(events).toEqual([])
+  })
+})
+
+// ── shared chokepoint — direct unit tests (2026-07-20 re-gate on PR #417) ─────
+// assigneeSelfClose / assigneeCannotMutateOwnAssignment are the single source of
+// truth every done-write / assignee-mutation path (MCP task_update, REST PATCH,
+// execute.ts's finishTask) now calls instead of re-deriving the comparison
+// locally. Exercise the predicates directly, independent of any HTTP/MCP surface.
+describe('assigneeSelfClose — shared chokepoint (src/tasks/service.ts)', () => {
+  it('refuses in_progress→done when the actor IS the current assignee', () => {
+    expect(assigneeSelfClose(AGENT_ID, 'in_progress', AGENT_ID, 'done')).toBe(true)
+  })
+
+  it('allows in_progress→done when the actor is a DIFFERENT principal', () => {
+    expect(assigneeSelfClose('agent-verifier', 'in_progress', AGENT_ID, 'done')).toBe(false)
+  })
+
+  it('allows approved→done by the assignee — fromStatus is not in_progress', () => {
+    expect(assigneeSelfClose(AGENT_ID, 'approved', AGENT_ID, 'done')).toBe(false)
+  })
+
+  it('ignores moves that are not a done-close at all', () => {
+    expect(assigneeSelfClose(AGENT_ID, 'in_progress', AGENT_ID, 'review')).toBe(false)
+    expect(assigneeSelfClose(AGENT_ID, 'in_progress', AGENT_ID, 'blocked')).toBe(false)
+  })
+
+  it('is a no-op with no actor or no assignee (operator/unbound tokens, unassigned tasks)', () => {
+    expect(assigneeSelfClose(null, 'in_progress', AGENT_ID, 'done')).toBe(false)
+    expect(assigneeSelfClose(undefined, 'in_progress', AGENT_ID, 'done')).toBe(false)
+    expect(assigneeSelfClose(AGENT_ID, 'in_progress', null, 'done')).toBe(false)
+    expect(assigneeSelfClose(AGENT_ID, 'in_progress', undefined, 'done')).toBe(false)
+  })
+})
+
+describe('assigneeCannotMutateOwnAssignment — shared chokepoint (BLOCK-1 close)', () => {
+  it('refuses a mutation attempt when the actor IS the current in_progress assignee', () => {
+    expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'in_progress', AGENT_ID)).toBe(true)
+  })
+
+  it('allows the mutation when the actor is a DIFFERENT principal (operator/other agent)', () => {
+    expect(assigneeCannotMutateOwnAssignment('agent-verifier', 'in_progress', AGENT_ID)).toBe(false)
+  })
+
+  it('allows the mutation once the task is no longer in_progress (e.g. review, approved)', () => {
+    expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'review', AGENT_ID)).toBe(false)
+    expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'approved', AGENT_ID)).toBe(false)
+    expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'open', AGENT_ID)).toBe(false)
+  })
+
+  it('is a no-op with no actor or no assignee', () => {
+    expect(assigneeCannotMutateOwnAssignment(null, 'in_progress', AGENT_ID)).toBe(false)
+    expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'in_progress', null)).toBe(false)
   })
 })
