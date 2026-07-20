@@ -27,11 +27,11 @@
 //      preset is added that assigns rank 4.
 
 import { html, raw as honoRaw } from 'hono/html'
-import type { Env, Capability } from '../types'
+import type { Env } from '../types'
 import { mintMemberToken } from '../members/service'
 import { ROLE_PRESETS, findPreset } from '../auth/role-presets'
 import type { RolePreset } from '../auth/role-presets'
-import { capabilityRank } from '../auth/capability'
+import { capabilityRank, resolveCapabilities, hasCapability } from '../auth/capability'
 
 // ── shapes ────────────────────────────────────────────────────────────────────
 
@@ -118,7 +118,7 @@ export interface MintParams {
 }
 
 export type MintResult =
-  | { ok: true; raw: string; tokenId: string; label: string; grantUnchanged?: boolean }
+  | { ok: true; raw: string; tokenId: string; label: string }
   | { ok: false; error: string }
 
 /**
@@ -133,12 +133,15 @@ export type MintResult =
  *  2. Validate member exists in this pot.
  *  3. When scope is squad/department, validate the scope_id belongs to this pot
  *     (prevents a caller from claiming another tenant's scope uuid).
- *  4. Write the capability grant using a rank-max strategy: read any existing grant
- *     on the same (member, scope_type, scope_id) — if the existing rank is already
- *     >= the preset's rank, skip the write (return grantUnchanged=true); otherwise
- *     INSERT OR REPLACE to upgrade.  This ensures the stored grant reflects the
- *     highest rank ever minted and the token label is never a lie.
- *  5. Mint a member_token (channel='workspace') via the shared service.
+ *  4. ATTEST, never GRANT (S1 fix). Verify the member ALREADY holds >= the preset's
+ *     capability on the resolved scope. If not, reject with 'member_lacks_capability'
+ *     — minting a key must never elevate the principal or write a standing grant.
+ *     Grant the member the capability separately first, then mint an attesting key.
+ *  5. Mint a member_token (channel='workspace') via the shared service. The token
+ *     carries the member's OWN authority (resolved from `capabilities` at auth time);
+ *     the preset is an audit label, not an enforced scope-down (per-key scope-down
+ *     ships in v0.26 token_grants). Revoking the token removes exactly the token —
+ *     it leaves no residual standing power, because mint wrote none.
  *  6. Return raw once; never persisted.
  */
 export async function mintScopedKey(env: Env, params: MintParams): Promise<MintResult> {
@@ -187,60 +190,46 @@ export async function mintScopedKey(env: Env, params: MintParams): Promise<MintR
 
   const resolvedScopeId = preset.scopeHint === 'org' ? null : (scopeId ?? null)
 
-  // 4. Rank-max upsert for the capability grant.
-  //    Read any existing grant on the same (member, scope_type, scope_id) row first.
-  //    If the existing capability rank is >= the preset's rank, skip the write and
-  //    flag grantUnchanged so the show-once page can surface a notice.
-  //    If the existing rank is lower (or there is no row), INSERT OR REPLACE to
-  //    upgrade the grant to the preset's capability.
-  //    This prevents both:
-  //      - Downgrade: re-minting a weaker preset silently reducing an existing grant.
-  //      - Audit divergence: the stored grant always matches the highest label issued.
-  const existing = await env.DB.prepare(
-    `SELECT capability FROM capabilities WHERE member_id = ?1 AND scope_type = ?2 AND scope_id IS ?3 LIMIT 1`,
+  // 4. ATTEST, never GRANT (S1 fix — the one live HIGH).
+  //    The old path wrote a rank-max `capabilities` row and per-surface `gate_grants`
+  //    rows on the MEMBER at mint time. Those are STANDING principal grants: caps are
+  //    resolved from `capabilities` at auth (resolveCapabilities), the token carries no
+  //    scope of its own, and the rows SURVIVE token revocation. So minting a "scoped
+  //    key" permanently elevated the principal and could never be walked back by
+  //    revoking the key. Fixed: mint writes NOTHING to the principal. It only verifies
+  //    the member ALREADY holds >= the preset capability on the resolved scope; if not,
+  //    it refuses (never elevate). Grant the member the capability out-of-band first.
+  //    Per-key scope-DOWN (an observer key for an admin member) requires token-scoped
+  //    grants and lands in v0.26 (token_grants); until then the token honestly carries
+  //    the member's own authority and the preset is an audit label only.
+  const grants = await resolveCapabilities(env, memberId)
+  const scopeDeptId =
+    preset.scopeType === 'squad' && resolvedScopeId
+      ? (
+          await env.DB.prepare(`SELECT department_id FROM squads WHERE id = ?1 LIMIT 1`)
+            .bind(resolvedScopeId)
+            .first<{ department_id: string | null }>()
+        )?.department_id ?? null
+      : null
+  const alreadyHolds = hasCapability(
+    grants,
+    preset.scopeType,
+    resolvedScopeId,
+    preset.role,
+    scopeDeptId,
   )
-    .bind(memberId, preset.scopeType, resolvedScopeId)
-    .first<{ capability: Capability }>()
-
-  let grantUnchanged = false
-  if (existing && capabilityRank(existing.capability) >= presetRank) {
-    // Existing grant is at equal or higher rank — leave it, never downgrade.
-    grantUnchanged = true
-  } else {
-    // No existing grant, or existing is weaker — write the higher rank.
-    const capId = crypto.randomUUID()
-    await env.DB.prepare(
-      `INSERT OR REPLACE INTO capabilities (id, member_id, scope_type, scope_id, capability)
-       VALUES (?1, ?2, ?3, ?4, ?5)`,
-    )
-      .bind(capId, memberId, preset.scopeType, resolvedScopeId, preset.role)
-      .run()
-  }
-
-  // 4b. Write gate_grants rows for every surface in preset.allows (#106).
-  //     These are what hasSurfaceCap checks at route-level gates (e.g. the
-  //     outreach:send-gated check on the verdict endpoint for gate:loops tasks).
-  //     INSERT OR IGNORE ensures idempotency on re-mint — re-issuing a key for
-  //     the same member does not duplicate rows (UNIQUE constraint on capability +
-  //     principal_type + principal_id in gate_grants).
-  const grantedAt = new Date().toISOString()
-  for (const surface of preset.allows) {
-    await env.DB.prepare(
-      `INSERT OR IGNORE INTO gate_grants
-         (id, capability, principal_type, principal_id, granted_by, created_at)
-       VALUES (?1, ?2, 'member', ?3, 'preset-mint', ?4)`,
-    )
-      .bind(crypto.randomUUID(), surface, memberId, grantedAt)
-      .run()
+  if (!alreadyHolds) {
+    return { ok: false, error: 'member_lacks_capability' }
   }
 
   // 5. Mint a member_token. Label encodes the preset + scope for the audit trail.
   //    The `[preset:<id>]` prefix is what loadKeysView uses to list scoped keys.
+  //    The token resolves the member's own capabilities at auth; mint added none.
   const scopeLabel = resolvedScopeId ? `:${resolvedScopeId}` : ''
   const label = `[preset:${preset.id}${scopeLabel}]`
   const minted = await mintMemberToken(env, memberId, label, 'workspace')
 
-  return { ok: true, raw: minted.raw, tokenId: minted.id, label, grantUnchanged }
+  return { ok: true, raw: minted.raw, tokenId: minted.id, label }
 }
 
 // ── HTML views ────────────────────────────────────────────────────────────────
@@ -500,15 +489,18 @@ export function keysMintedBody(
   label: string,
   presetLabel: string,
   raw: string,
-  grantUnchanged?: boolean,
 ) {
-  const grantNotice = grantUnchanged
-    ? `<div class="warn-box" style="margin-bottom:14px;border-color:var(--warn)">
-    <strong>Grant unchanged (kept existing higher rank).</strong>
-    This member already held a capability at equal or higher rank on this scope.
-    The existing grant was preserved. The new token is still valid and scoped correctly.
+  // Honest disclosure: the token carries the member's OWN authority (resolved from
+  // `capabilities` at auth). The preset is an audit label, not an enforced scope-down —
+  // per-key scope-down ships in v0.26 (token_grants). Never let the preset label read as
+  // a capability boundary it does not yet enforce.
+  const scopeNotice = `<div class="warn-box" style="margin-bottom:14px;border-color:var(--warn)">
+    <strong>Scope not yet enforced per-key.</strong>
+    This token carries <strong>${esc(memberName)}</strong>'s own capabilities. The preset
+    names the intended scope for the audit trail; per-key scope-down is enforced starting
+    v0.26. Do not treat the preset label as a capability boundary. Revoking this token
+    removes exactly this token — it leaves no standing grant behind.
   </div>`
-    : ''
   return html`
 <div class="crumbs"><a href="/">Overview</a> › <a href="/admin/keys">Scoped API Keys</a> › Key provisioned</div>
 <h1>Key provisioned</h1>
@@ -516,7 +508,7 @@ export function keysMintedBody(
   <p style="font-size:14px;color:var(--muted);margin:0 0 14px">
     Scoped key for <strong>${memberName}</strong> · Preset: <strong>${presetLabel}</strong>
   </p>
-  ${honoRaw(grantNotice)}
+  ${honoRaw(scopeNotice)}
   <div class="warn-box" style="margin-bottom:14px">
     <strong>Show once only.</strong> Copy this key now — it cannot be retrieved again.
     Store it in a secrets manager. Do not paste it in logs, chat, or version control.
