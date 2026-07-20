@@ -379,12 +379,14 @@ describe('verdict route — admin session reaches gate (c: integration smoke)', 
   })
 })
 
-// ── 4. mintScopedKey — gate_grants rows written for preset.allows ─────────────
+// ── 4. mintScopedKey — attests, writes NO gate_grants at mint (S1) ─────────────
+// The old mint wrote a gate_grants row per preset.allows surface on the member —
+// a standing principal grant surviving revocation (S1). The fix removed it: mint
+// attests the member's existing authority and writes nothing to the principal.
 
-describe('mintScopedKey — writes gate_grants for preset allows at mint time', () => {
-  it('writes a gate_grants row for each surface in sales-rep allows', async () => {
+describe('mintScopedKey — writes no principal grants (attest, never grant)', () => {
+  function attestEnv(grant: Record<string, unknown> | null) {
     const inserts: { sql: string; args: unknown[] }[] = []
-
     const env = {
       TENANT_SLUG: 'test',
       BRAND: 'Test',
@@ -394,11 +396,15 @@ describe('mintScopedKey — writes gate_grants for preset allows at mint time', 
           bind: (...args: unknown[]) => ({
             async first() {
               if (sql.includes('FROM members')) return { id: 'member-1' }
+              if (sql.includes('department_id FROM squads')) return { department_id: null }
               if (sql.includes('FROM squads')) return { id: 'squad-1' }
-              if (sql.includes('FROM capabilities')) return null  // no existing cap
               return null
             },
-            async all() { return { results: [] } },
+            async all() {
+              // resolveCapabilities → the member's existing grants
+              if (sql.includes('FROM capabilities')) return { results: grant ? [grant] : [] }
+              return { results: [] }
+            },
             async run() {
               inserts.push({ sql, args: [...args] })
               return { meta: { changes: 1 } }
@@ -407,76 +413,31 @@ describe('mintScopedKey — writes gate_grants for preset allows at mint time', 
         }),
       },
     } as unknown as Env
+    return { env, inserts }
+  }
 
-    const result = await mintScopedKey(env, {
-      memberId: 'member-1',
-      presetId: 'sales-rep',
-      scopeId: 'squad-1',
-      minterRank: 5,  // owner-level minter so rank-ceiling passes
+  it('writes NO gate_grants and NO capabilities rows when the member already holds the cap', async () => {
+    const { env, inserts } = attestEnv({
+      member_id: 'member-1', scope_type: 'squad', scope_id: 'squad-1', capability: 'member',
     })
-
+    const result = await mintScopedKey(env, {
+      memberId: 'member-1', presetId: 'sales-rep', scopeId: 'squad-1', minterRank: 5,
+    })
     expect(result.ok).toBe(true)
-
-    // gate_grants inserts: one per surface in the sales-rep allows list
-    const gateGrantInserts = inserts.filter((i) =>
-      i.sql.includes('INSERT') && i.sql.toLowerCase().includes('gate_grants'),
-    )
-    const surfaces = gateGrantInserts.map((i) => i.args[1] as string)
-
-    // sales-rep allows: ['leads:read','leads:write','outreach:draft','outreach:send-gated','content:read','pipeline:read']
-    expect(surfaces).toContain('outreach:send-gated')
-    expect(surfaces).toContain('leads:read')
-    expect(surfaces).toContain('content:read')
-    // budget:write is in denies → NOT in allows → no gate_grants row
-    expect(surfaces).not.toContain('budget:write')
-    expect(surfaces).not.toContain('mcpwp:write')
+    expect(inserts.some((i) => i.sql.toLowerCase().includes('gate_grants'))).toBe(false)
+    expect(inserts.some((i) => i.sql.toLowerCase().includes('into capabilities'))).toBe(false)
+    // Only the member_tokens INSERT ran.
+    expect(inserts.some((i) => i.sql.toLowerCase().includes('member_tokens'))).toBe(true)
   })
 
-  it('observer preset only writes read-only surfaces to gate_grants', async () => {
-    const inserts: { sql: string; args: unknown[] }[] = []
-
-    const env = {
-      TENANT_SLUG: 'test',
-      BRAND: 'Test',
-      OAUTH_PROVIDER: 'google',
-      DB: {
-        prepare: (sql: string) => ({
-          bind: (...args: unknown[]) => ({
-            async first() {
-              if (sql.includes('FROM members')) return { id: 'member-1' }
-              if (sql.includes('FROM squads')) return { id: 'squad-1' }
-              return null
-            },
-            async all() { return { results: [] } },
-            async run() {
-              inserts.push({ sql, args: [...args] })
-              return { meta: { changes: 1 } }
-            },
-          }),
-        }),
-      },
-    } as unknown as Env
-
+  it('refuses with no writes when the member lacks the capability', async () => {
+    const { env, inserts } = attestEnv(null)
     const result = await mintScopedKey(env, {
-      memberId: 'member-1',
-      presetId: 'observer',
-      scopeId: 'squad-1',
-      minterRank: 5,
+      memberId: 'member-1', presetId: 'observer', scopeId: 'squad-1', minterRank: 5,
     })
-
-    expect(result.ok).toBe(true)
-
-    const gateGrantInserts = inserts.filter((i) =>
-      i.sql.includes('INSERT') && i.sql.toLowerCase().includes('gate_grants'),
-    )
-    const surfaces = gateGrantInserts.map((i) => i.args[1] as string)
-
-    // observer allows: ['tasks:read','pipeline:read','content:read','agents:read']
-    expect(surfaces).toContain('tasks:read')
-    expect(surfaces).toContain('content:read')
-    // observer has no write grants
-    expect(surfaces).not.toContain('outreach:send-gated')
-    expect(surfaces).not.toContain('budget:write')
-    expect(surfaces).not.toContain('content:write')
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected failure')
+    expect(result.error).toBe('member_lacks_capability')
+    expect(inserts.length).toBe(0)
   })
 })

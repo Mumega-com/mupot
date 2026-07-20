@@ -1291,8 +1291,11 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
       ? 'This preset requires a squad. Pick one from the scope picker.'
       : result.error === 'scope_id_required_for_department_preset'
       ? 'This preset requires a department. Pick one from the scope picker.'
+      : result.error === 'member_lacks_capability'
+      ? 'This member does not hold the capability this preset attests. Minting a key never elevates a member — grant the capability to the member first, then mint an attesting key.'
       : `Mint failed: ${result.error}`
-    const statusCode = result.error === 'rank_ceiling' ? 403 : 400
+    const statusCode =
+      result.error === 'rank_ceiling' || result.error === 'member_lacks_capability' ? 403 : 400
     return c.html(
       shell(c.env, 'Scoped API Keys', keysPageBody(view, presetIdRaw, scopeIdRaw ?? undefined, msg)),
       statusCode,
@@ -1315,7 +1318,7 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
     shell(
       c.env,
       'Key provisioned',
-      keysMintedBody(memberName, result.label, preset.label, result.raw, result.grantUnchanged),
+      keysMintedBody(memberName, result.label, preset.label, result.raw),
     ),
   )
 })
