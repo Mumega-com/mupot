@@ -245,6 +245,40 @@ describe('MCP task cutover tools', () => {
     ])
   })
 
+  // ── no-self-close (fake-green guard, 2026-07-20) ────────────────────────────
+  // An agent assignee marked its own in_progress task 'done' with zero work.
+  // The assignee must propose 'review'; a DIFFERENT principal verifies + closes.
+  it('blocks an agent assignee from self-closing its own in_progress task to done', async () => {
+    const { env } = makeEnv([task({ status: 'in_progress', assignee_agent_id: AGENT_ID })])
+
+    // auth().boundAgentId === AGENT_ID === the task's assignee → grading own homework.
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', status: 'done' },
+      'https://pot.example',
+    )
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_self_close' })
+  })
+
+  it('allows a NON-assignee principal to close the same in_progress task to done', async () => {
+    const { env } = makeEnv([task({ status: 'in_progress', assignee_agent_id: AGENT_ID })])
+
+    // A different bound agent (still member+ on the squad) may verify + close.
+    const res = await invokeTool(
+      auth({ boundAgentId: 'agent-verifier' }),
+      env,
+      'task_update',
+      { task_id: 'task-1', status: 'done' },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(true)
+    expect((res.result as { task: Task }).task.status).toBe('done')
+  })
+
   // ── #406 fast-follow (Opus re-gate WARN-1 on #404) ──────────────────────────
   // #404 closed AUTO-pickup of an unassigned source_pot task (canAgentExecuteTask,
   // src/agents/execute.ts) — a remote adversary pot delivers tasks unassigned and

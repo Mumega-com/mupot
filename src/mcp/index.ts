@@ -838,6 +838,25 @@ const toolTaskUpdate: ToolSpec = {
       if (patchToDoneBypassesGate(existing.status, existing.gate_owner, args.status)) {
         return fail(409, 'gate_open', 'gated task must be approved via verdict before it can be marked done')
       }
+      // NO SELF-CLOSE (fake-green guard, 2026-07-20): an agent assignee may not
+      // mark its OWN in_progress task 'done' — that is grading your own homework.
+      // (A dispatched runtime self-marked a task done with zero work: no branch,
+      // no PR, no receipt.) The assignee proposes completion via 'review'; a
+      // DIFFERENT principal verifies the evidence and closes it. This is the
+      // task-level "receipts not grades" gate. approved→done stays allowed: a
+      // non-assignee verdict has already passed the gate by then.
+      if (
+        args.status === 'done' &&
+        existing.status === 'in_progress' &&
+        existing.assignee_agent_id &&
+        auth.boundAgentId === existing.assignee_agent_id
+      ) {
+        return fail(
+          409,
+          'assignee_cannot_self_close',
+          'the assignee cannot mark its own task done; move it to review so a different principal can verify and close',
+        )
+      }
       if (args.status === 'done') {
         try {
           assertCompletableDoneWhen(next.done_when)
