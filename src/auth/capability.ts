@@ -10,6 +10,7 @@
 // Exports (the FROZEN contract — peers build against these signatures):
 //   - resolveCapabilities(env, memberId): Promise<CapabilityGrant[]>
 //   - hasCapability(grants, scopeType, scopeId, min, squadDepartmentId?): boolean
+//   - isOrgAdmin(auth): boolean                          — coarse owner|admin role
 //   - requireCapability(scope, min): MiddlewareHandler   — per-route gate
 //   - requireOrgCapability(min): MiddlewareHandler       — convenience over org scope
 //
@@ -33,6 +34,14 @@ const RANK: Record<Capability, number> = {
 
 function meets(have: Capability, min: Capability): boolean {
   return RANK[have] >= RANK[min]
+}
+
+/**
+ * Coarse org-role check: true when auth.role is owner or admin.
+ * Shared by dashboard/API surfaces that gate on the legacy org role (not fine-grained grants).
+ */
+export function isOrgAdmin(auth: AuthContext): boolean {
+  return auth.role === 'owner' || auth.role === 'admin'
 }
 
 // ── resolve (load grants, fail-closed) ─────────────────────────────────────────
@@ -298,7 +307,7 @@ export async function actorMaxRankOnScope(
  * Owner / admin roles bypass the check (rank is sufficient for them).
  */
 export async function hasSurfaceCap(env: Env, auth: AuthContext, surface: string): Promise<boolean> {
-  if (auth.role === 'owner' || auth.role === 'admin') return true
+  if (isOrgAdmin(auth)) return true
   const principalId = auth.memberId ?? auth.userId
   const principalType: 'member' | 'agent' = auth.memberId ? 'member' : 'agent'
   if (!principalId) return false

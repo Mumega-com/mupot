@@ -13,15 +13,12 @@
 import { Hono } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { requireAuth } from '../auth'
+import { isOrgAdmin } from '../auth/capability'
 import { planResellerTenant, type ResellerProvisionInput } from './provision'
 
 const MAX_BODY_BYTES = 8192
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
-
-function isAdminPlus(auth: AuthContext): boolean {
-  return auth.role === 'owner' || auth.role === 'admin'
-}
 
 export const resellerApp = new Hono<AppEnv>()
 
@@ -29,7 +26,7 @@ resellerApp.use('*', requireAuth)
 
 resellerApp.post('/provision-plan', async (c) => {
   const auth = c.get('auth')
-  if (!isAdminPlus(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.json({ error: 'forbidden', detail: 'owner/admin only' }, 403)
   }
 
