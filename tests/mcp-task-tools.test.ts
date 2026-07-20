@@ -853,13 +853,22 @@ describe('assigneeCannotMutateOwnAssignment — shared chokepoint (BLOCK-1 close
     expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'blocked', AGENT_ID)).toBe(true)
   })
 
-  // Only the verdict/gate-controlled statuses are actually safe to mutate —
-  // a bare status flip cannot steer the assignee back toward an unverified
-  // done from any of these.
-  it('allows the mutation once the task is verdict/gate-controlled (review, approved, rejected)', () => {
-    expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'review', AGENT_ID)).toBe(false)
+  // 3rd re-gate: the coverage set must be EVERY done-reachable non-terminal
+  // status, not just the direct →done edges. 'rejected' and 'review' are BOTH
+  // still done-reachable by the assignee alone:
+  //   rejected → (self-unassign) → in_progress → done   (overrides a rejection!)
+  //   review   → (self-unassign) → self-verdict → approved → done
+  // so mutating the assignee field from them MUST be refused too.
+  it('refuses the mutation from "rejected" and "review" too — the 3rd-re-gate laps', () => {
+    expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'rejected', AGENT_ID)).toBe(true)
+    expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'review', AGENT_ID)).toBe(true)
+  })
+
+  // Only 'approved' is safe to mutate from: a DIFFERENT principal already
+  // verified the work to reach 'approved', and approved→done is the intended
+  // post-verdict close — an assignee unassigning from there can't fake-green.
+  it('allows the mutation only from "approved" (already outside-verified)', () => {
     expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'approved', AGENT_ID)).toBe(false)
-    expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'rejected', AGENT_ID)).toBe(false)
   })
 
   it('is a no-op with no actor or no assignee', () => {

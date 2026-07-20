@@ -107,16 +107,28 @@ export function patchToDoneBypassesGate(
 // subsequent approved→done by the same assignee is not re-grading its own work).
 const ASSIGNEE_UNVERIFIED_DONE_SOURCES: ReadonlySet<TaskStatus> = new Set(['in_progress', 'rejected'])
 
-// Statuses from which the ASSIGNEE can maneuver — via ordinary, legal
-// transitions it alone drives — back to one of the ASSIGNEE_UNVERIFIED_DONE_SOURCES
-// above without any other principal touching the task: 'open' (open→in_progress),
-// 'in_progress' itself, and 'blocked' (blocked→in_progress, the normal retry
-// loop). 'review'/'approved'/'rejected' are excluded — those are verdict/gate
-// controlled, not a bare status flip the assignee can drive alone (rejected IS
-// itself an unverified-done SOURCE per the set above, but mutating the
-// assignee field FROM 'rejected' isn't the laundering path this guard closes;
-// assigneeSelfClose covers rejected→done directly).
-const ASSIGNEE_STEERABLE_TOWARD_DONE: ReadonlySet<TaskStatus> = new Set(['open', 'in_progress', 'blocked'])
+// The full set of non-terminal statuses from which the ASSIGNEE can, via legal
+// transitions it alone drives, still reach 'done' — so mutating the assignee
+// field from ANY of them can launder around the self-close guard (null the
+// assignee, then route into 'done' with no self-match left). The coverage set
+// MUST equal every done-reachable non-terminal status, NOT just the direct
+// →done edges — that gap is what let the 2nd/3rd re-gates find new laps:
+//   - 'open' → in_progress → done
+//   - 'in_progress' → done  (and → blocked → in_progress → done)
+//   - 'blocked' → in_progress → done
+//   - 'review' → (self-verdict once unassigned) → approved → done
+//   - 'rejected' → in_progress → done  (overrides another principal's rejection!)
+// Only 'approved' is excluded: approved→done is the INTENDED post-verdict close,
+// and a different principal already verified the work to reach 'approved', so an
+// assignee unassigning from there cannot manufacture a fake-green. 'done' is
+// terminal. Non-assignees (operators, admins, a different agent) are unaffected.
+const ASSIGNEE_STEERABLE_TOWARD_DONE: ReadonlySet<TaskStatus> = new Set([
+  'open',
+  'in_progress',
+  'blocked',
+  'review',
+  'rejected',
+])
 
 // Returns true when the move MUST be refused: the actor is the task's current
 // assignee, closing its OWN task straight to 'done' from a status reachable
@@ -147,15 +159,16 @@ export function assigneeSelfClose(
 // lap through the SAME hole: in_progress→blocked (legal) → unassign (the OLD
 // guard skipped it, status was 'blocked') → blocked→in_progress (assignee now
 // null) → →done (assigneeSelfClose sees assigneeAgentId=null, no self-match).
-// Fix: widen this guard to every status the assignee can steer BACK to
-// in_progress (an unverified-done source) unsupervised —
-// ASSIGNEE_STEERABLE_TOWARD_DONE ('open', 'in_progress', 'blocked'). An agent
-// bound-token that IS the CURRENT assignee of a task in any of those statuses
-// may not change assignee_agent_id on it at all (unassign or reassign to
-// anyone else). Kept OFF 'review'/'approved'/'rejected' — those are
-// verdict/gate-controlled, not steerable by a bare status flip. Non-assignees
-// (operators, admins, a different agent) are unaffected — this only fires when
-// the actor and the existing assignee match.
+// Fix: an agent bound-token that IS the CURRENT assignee of a task in any
+// done-reachable non-terminal status (ASSIGNEE_STEERABLE_TOWARD_DONE — every
+// status except 'approved' and terminal 'done') may not change
+// assignee_agent_id on it at all (unassign or reassign to anyone else). The
+// 3rd re-gate proved the set must be the FULL done-reachable set, not just the
+// direct →done edges: 'rejected' was omitted on the reasoning that
+// assigneeSelfClose covers rejected→done directly, but rejected→(unassign)→
+// in_progress→done routes around it. Non-assignees (operators, admins, a
+// different agent) are unaffected — this only fires when the actor and the
+// existing assignee match.
 export function assigneeCannotMutateOwnAssignment(
   actorAgentId: string | null | undefined,
   fromStatus: TaskStatus,
