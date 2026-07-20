@@ -164,33 +164,60 @@ export async function mintAgentBoundToken(
   if (!isAgentTokenCapability(grantCapability)) {
     throw new Error('invalid agent token capability')
   }
-  const memberId = crypto.randomUUID()
+
+  // ONE AGENT → ONE MEMBER. Reuse the agent's canonical member envelope if it
+  // already has exactly one. Previously every mint minted a FRESH member (a new
+  // random UUID), so a second token for the same agent spawned a second member
+  // identity — that is precisely what produces `agent_identity_ambiguous` and the
+  // "N kasra" duplicate-identity mess. Fail closed on an already-ambiguous agent
+  // rather than compounding it; it must be de-duplicated (revoke stale tokens)
+  // before another token is minted.
+  const canonical = await resolveActiveAgentMember(env, agent.id)
+  if (canonical === 'ambiguous') {
+    throw new Error(
+      'agent_identity_ambiguous: agent already has multiple active member identities; revoke stale tokens before minting',
+    )
+  }
+  const reuseMemberId = canonical === 'unminted' ? null : canonical
+
+  const memberId = reuseMemberId ?? crypto.randomUUID()
   const tokenId = crypto.randomUUID()
   const rawToken = mintRawToken()
   const tokenHash = await sha256Hex(rawToken)
   const createdAt = new Date().toISOString()
   const safeLabel = label.trim().slice(0, 64) || agent.slug
 
-  const mintWrites = await env.DB.batch([
-    // 1) Dedicated member envelope for the agent (no email, no IM).
-    env.DB.prepare(
-      `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(memberId, null, agent.name, null, 'active', createdAt, env.TENANT_SLUG),
-    // 2) THE ESCALATION GUARD: squad-scoped grant on the agent's OWN squad only.
-    //    Hard-coded scope, with only observer/member allowed — never widened.
-    env.DB.prepare(
-      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-       VALUES (?, ?, 'squad', ?, ?)`,
-    ).bind(crypto.randomUUID(), memberId, agent.squad_id, grantCapability),
-    // 3) THE WELD: bind token to the agent (agent_id set). Only the hash is stored.
+  const statements = []
+  if (!reuseMemberId) {
+    // First mint for this agent — create its dedicated member envelope + the
+    // escalation-guard squad grant. Skipped when reusing (both already exist).
+    statements.push(
+      // 1) Dedicated member envelope for the agent (no email, no IM).
+      env.DB.prepare(
+        `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(memberId, null, agent.name, null, 'active', createdAt, env.TENANT_SLUG),
+      // 2) THE ESCALATION GUARD: squad-scoped grant on the agent's OWN squad only.
+      //    Hard-coded scope, with only observer/member allowed — never widened.
+      env.DB.prepare(
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+         VALUES (?, ?, 'squad', ?, ?)`,
+      ).bind(crypto.randomUUID(), memberId, agent.squad_id, grantCapability),
+    )
+  }
+  // 3) THE WELD: bind the new token to the agent (agent_id set) on the reused or
+  //    freshly-created member. Only the hash is stored. Always runs.
+  statements.push(
     env.DB.prepare(
       `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
        VALUES (?, ?, ?, ?, 'workspace', ?, ?, ?)`,
     ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id, env.TENANT_SLUG),
-  ])
-  // Receipt: all three rows MUST land. A partial mint (e.g. token row without its
-  // capability row) would hand out a show-once token bound to a broken identity.
+  )
+
+  const mintWrites = await env.DB.batch(statements)
+  // Receipt: every statement MUST land. A partial mint (e.g. a token row without
+  // its member/capability on first mint) would hand out a show-once token bound to
+  // a broken identity.
   assertBatchWritten(mintWrites, 'mint_agent_bound_token', 1)
 
   return { raw: rawToken, tokenId, memberId, createdAt, grantCapability }
