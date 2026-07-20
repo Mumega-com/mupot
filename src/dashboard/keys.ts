@@ -202,7 +202,6 @@ export async function mintScopedKey(env: Env, params: MintParams): Promise<MintR
   //    Per-key scope-DOWN (an observer key for an admin member) requires token-scoped
   //    grants and lands in v0.26 (token_grants); until then the token honestly carries
   //    the member's own authority and the preset is an audit label only.
-  const grants = await resolveCapabilities(env, memberId)
   const scopeDeptId =
     preset.scopeType === 'squad' && resolvedScopeId
       ? (
@@ -211,6 +210,7 @@ export async function mintScopedKey(env: Env, params: MintParams): Promise<MintR
             .first<{ department_id: string | null }>()
         )?.department_id ?? null
       : null
+  const grants = await resolveCapabilities(env, memberId)
   const alreadyHolds = hasCapability(
     grants,
     preset.scopeType,
