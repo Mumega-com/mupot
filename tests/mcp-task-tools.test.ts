@@ -266,7 +266,11 @@ describe('MCP task cutover tools', () => {
       'https://pot.example',
     )
 
-    expect(res).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+    // need: 'admin' pins the 403 to the #406 admin-floor check specifically
+    // (kasra-review adv-gate INFO-3, PR #408) — without it, this assertion
+    // would also pass on an unrelated 403, which is not what this test claims
+    // to prove.
+    expect(res).toMatchObject({ ok: false, status: 403, error: 'forbidden', detail: { need: 'admin' } })
   })
 
   it('task_update REFUSES a member-only principal UNassigning (null) a source_pot task (#406)', async () => {
@@ -280,7 +284,11 @@ describe('MCP task cutover tools', () => {
       'https://pot.example',
     )
 
-    expect(res).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+    // need: 'admin' pins the 403 to the #406 admin-floor check specifically
+    // (kasra-review adv-gate INFO-3, PR #408) — without it, this assertion
+    // would also pass on an unrelated 403, which is not what this test claims
+    // to prove.
+    expect(res).toMatchObject({ ok: false, status: 403, error: 'forbidden', detail: { need: 'admin' } })
   })
 
   it('task_update ALLOWS an admin-capability principal to assign a source_pot task (#406)', async () => {

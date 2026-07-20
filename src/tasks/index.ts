@@ -632,6 +632,18 @@ tasksApp.patch('/:id', async (c) => {
     // operator-authority bar the framing implies. Local (source_pot NULL) task
     // assignment is completely unchanged: still member+, per the route-entry
     // check above.
+    //
+    // NOTE (kasra-review adv-gate, 2026-07-20, PR #408): this branch is
+    // currently DEAD in production for this HTTP route specifically — requireAuth
+    // (src/auth/index.ts) is cookie-session-only and never sets
+    // AuthContext.memberId/capabilities, so the route-entry canActOnSquad check
+    // above already only ever admits a web-login owner/admin (legacyOwnerAdmin
+    // bypass) here; a memberId-bearing, non-admin principal cannot reach this
+    // line today. Kept as forward-defensive parity with the MCP task_update fix
+    // (src/mcp/index.ts) — correct given canActOnSquad's contract, and live the
+    // moment this route gains bearer/memberId auth. The REACHABLE production
+    // path for #406 is the MCP bearer surface, covered end-to-end in
+    // tests/mcp-task-tools.test.ts.
     if (existing.source_pot) {
       if (!(await canActOnSquad(c.env, c.get('auth'), existing.squad_id, 'admin'))) {
         return c.json(
