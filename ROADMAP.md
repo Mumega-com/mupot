@@ -40,6 +40,25 @@ Pot
 - An **Execution Workspace** is runtime filesystem/computer state, not another
   business hierarchy beside Project.
 
+## Commercial model — sovereign core, operated presence
+
+We monetize **operation**, not the software. The core is open and free to
+self-host (the sovereignty claim, kept true); the paid product is operating a pot
+well. Three tiers:
+
+| Tier | Gets | Support | Price |
+|---|---|---|---|
+| **OSS mupot** (self-host) | Open core + public update stream. Complete sovereign pot. | Self-serve | Free |
+| **mupot.mumega.com** (SaaS) | Managed hosting, updates applied, SLA. | Full | $ |
+| **Operated Presence** (agency) | Mumega team checks into the pot, sets it up, operates it. Metered. | Hands-on | $$ |
+
+Open-core line: **core fully open; monetize the service, not features.** Support
+is gated by payment regardless of where the pot runs; a non-paying self-hoster
+gets public updates only. Portfolio-hub and presence-billing surfaces live on
+mupot.mumega.com because that is where they are meaningful, not because they are
+license-gated. Design detail:
+[docs/architecture/sovereign-core-operated-presence.md](docs/architecture/sovereign-core-operated-presence.md).
+
 ## Activation states
 
 Every feature must use one of these labels in documentation, UI, and release notes:
@@ -169,7 +188,10 @@ Must ship:
 - immediate revocation and no model-selected tenant, Project, identity, or credential;
 - Marketing & CRO addon as the first reference package;
 - Mumega pilot first, then DME activation after the same conformance and permission gate;
-- AI visibility collection, recommendation review, approved action, and outcome receipt.
+- AI visibility collection, recommendation review, approved action, and outcome receipt;
+- **guest-credential precursor:** the scoped, no-raw-secret credential path is the
+  same governance family as the Operated Presence guest token (least-privilege,
+  capability-ceiling, expiry) — prove it here so v0.29 presence rides a hardened primitive.
 
 Activation:
 
@@ -235,7 +257,22 @@ Must ship:
 - addon/package compatibility, marketplace distribution, and signed distribution receipts;
 - clear non-commercial, evaluation, and commercial licensing paths;
 - managed-support boundaries, entitlement hooks, and operator documentation;
-- onboarding and billing proof for the first external design partner.
+- onboarding and billing proof for the first external design partner;
+- **Operated Presence (metered check-in/out):** a customer pot mints a guest
+  credential (least-privilege, capability-ceiling, expiry, customer-revocable); the
+  Mumega team operates *inside* the customer pot with every action in the customer's
+  own ledger; presence meters to a tamper-evident, Stripe-Connect-split invoice;
+- **tier entitlements:** OSS (public updates only, no support), managed SaaS, and
+  agency presence — support gated by payment regardless of where the pot runs;
+- **public update channel** for the free self-host tier (release-stream delivery,
+  no hidden manual steps).
+
+Activation:
+
+- Guest credential + presence metering: owner opt-in per visiting engagement,
+  fail-closed, and revocable at any instant by the pot owner.
+- Operated Presence guest trust boundary is a mandatory dual-vendor adversarial gate
+  before any external customer engagement.
 
 ### v1.0.0: Governed Business Loop GA - planned
 
@@ -265,6 +302,8 @@ study. Feature count alone cannot satisfy the GA gate.
 | Isolated Agent Computers | `v0.27.0` | Initially opt-in |
 | Reviewed knowledge and coherence evaluation | `v0.28.0` | Promotion gated |
 | Commercial installation and operations | `v0.29.0` | License/entitlement dependent |
+| Operated Presence (metered guest check-in/out) | `v0.29.0` | Owner opt-in per engagement, fail-closed, revocable |
+| Commercial tiers and support entitlements | `v0.29.0` | Payment-gated support; free = public updates only |
 | Governed business loop GA | `v1.0.0` | Stable supported product |
 
 ## Scope-control rules
