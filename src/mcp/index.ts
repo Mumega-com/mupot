@@ -34,7 +34,8 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad } from '../auth/capability'
+import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, hasSurfaceCap } from '../auth/capability'
+import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
 import { isChannel } from '../members/service'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
@@ -53,6 +54,8 @@ import {
   TaskProjectError,
   TaskUpdateConflictError,
   validateTaskProjectAttribution,
+  writeVerdict,
+  VerdictRaceError,
 } from '../tasks/service'
 import type { TaskStatus } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
@@ -937,6 +940,100 @@ const toolTaskUpdate: ToolSpec = {
 
     await emitTaskEvent(env, 'task.updated', next, memberActor(auth.memberId as string))
     return done({ task: next })
+  },
+}
+
+// task_verdict — approve or reject a task in 'review'. The MCP twin of
+// POST /api/tasks/:id/verdict, reusing the SAME helpers (callerHoldsGateCapability,
+// verdictPrincipal, writeVerdict) so the gate logic never forks. This is the wire
+// that lets an operator/gate CLOSE a gated task programmatically over MCP — without
+// it a review task can only be verdicted from the browser dashboard. cap: member+
+// on the task's squad AND the gate capability named by task.gate_owner.
+const toolTaskVerdict: ToolSpec = {
+  name: 'task_verdict',
+  scope: 'squad (of the task)',
+  min: 'member',
+  args: '{ task_id: string, verdict: "approved"|"rejected", note?: string, override_self_verdict?: boolean }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: STRING_SCHEMA,
+      verdict: STRING_SCHEMA,
+      note: STRING_SCHEMA,
+      override_self_verdict: { type: 'boolean' },
+    },
+    required: ['task_id', 'verdict'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const taskId = str(args.task_id)
+    if (!taskId) return fail(400, 'invalid_args', 'task_id required')
+    const verdict = args.verdict
+    if (verdict !== 'approved' && verdict !== 'rejected') {
+      return fail(400, 'invalid_verdict', { accepted: ['approved', 'rejected'] })
+    }
+
+    const task = await loadTask(env, taskId)
+    if (!task) return fail(404, 'task_not_found')
+
+    // Base guard: member+ on the task's squad (same floor as every task mutation).
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, task.squad_id, 'member'))) {
+      return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
+    }
+    if (!task.gate_owner) return fail(409, 'no_gate')
+    if (task.status !== 'review') return fail(409, 'not_in_review', { status: task.status })
+
+    // RBAC: caller must hold the gate capability named by task.gate_owner.
+    if (!(await callerHoldsGateCapability(env, auth, task.squad_id, task.gate_owner))) {
+      return fail(403, 'forbidden', { need: task.gate_owner })
+    }
+
+    // Surface-cap (#106): approving a gate:loops task fires a real send — requires
+    // outreach:send-gated. Rejections send nothing and are not surface-gated.
+    if (task.gate_owner === 'gate:loops' && verdict === 'approved') {
+      if (!(await hasSurfaceCap(env, auth, 'outreach:send-gated'))) {
+        return fail(403, 'forbidden', { need: 'outreach:send-gated' })
+      }
+    }
+
+    // Self-verdict prevention (no grading your own homework). Agent-bound tokens
+    // resolve to the bound agent id, so an assignee cannot hide behind its member
+    // envelope. Org owner may override with override_self_verdict:true (audited).
+    const principal = verdictPrincipal(auth)
+    let note = typeof args.note === 'string' ? args.note : null
+    if (principal.id === task.assignee_agent_id) {
+      const isOrgOwner = auth.role === 'owner'
+      const overrideRequested = args.override_self_verdict === true
+      if (!isOrgOwner || !overrideRequested) {
+        return fail(409, 'self_verdict', {
+          reason: 'decider is the task assignee; self-approval is forbidden',
+        })
+      }
+      const overrideNote = `[self_verdict_override by org owner ${principal.id}]`
+      note = note ? `${overrideNote} ${note}` : overrideNote
+    }
+
+    try {
+      const result = await writeVerdict(
+        env,
+        { task, verdict, note, decidedBy: principal.id },
+        principal.actor,
+      )
+      // Best-effort Workflow resume — D1 is authoritative; a dropped event is fine.
+      if (task.workflow_instance_id && env.TASK_WORKFLOW) {
+        try {
+          const inst = await env.TASK_WORKFLOW.get(task.workflow_instance_id)
+          await inst.sendEvent({ type: 'gate-verdict', payload: { verdict } })
+        } catch {
+          // non-fatal
+        }
+      }
+      return done(result)
+    } catch (err) {
+      if (err instanceof VerdictRaceError) return fail(409, 'verdict_race')
+      throw err
+    }
   },
 }
 
@@ -2406,6 +2503,7 @@ export const TOOLS: ToolSpec[] = [
   toolTaskList,
   toolTaskBoard,
   toolTaskUpdate,
+  toolTaskVerdict,
   toolTaskDispatch,
   toolRemember,
   toolRecall,

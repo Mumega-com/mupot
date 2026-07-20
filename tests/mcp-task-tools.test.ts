@@ -910,3 +910,57 @@ describe('assigneeCannotMutateOwnAssignment — shared chokepoint (BLOCK-1 close
     expect(assigneeCannotMutateOwnAssignment(AGENT_ID, 'in_progress', null)).toBe(false)
   })
 })
+
+// ── task_verdict — the MCP gate-close door (mirror of POST /:id/verdict) ───────
+describe('task_verdict (MCP)', () => {
+  const URL = 'https://pot.example'
+  const reviewTask = (o: Partial<Task> = {}) =>
+    task({ id: 'task-1', status: 'review', gate_owner: 'gate:kasra-core', assignee_agent_id: 'agent-other', ...o })
+
+  it('rejects an invalid verdict value', async () => {
+    const { env } = makeEnv([reviewTask()])
+    const res = await invokeTool(auth({ role: 'owner' }), env, 'task_verdict', { task_id: 'task-1', verdict: 'maybe' }, URL)
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('invalid_verdict')
+  })
+
+  it('409 not_in_review when the task is not in review', async () => {
+    const { env } = makeEnv([reviewTask({ status: 'in_progress' })])
+    const res = await invokeTool(auth({ role: 'owner' }), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved' }, URL)
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('not_in_review')
+  })
+
+  it('409 no_gate when the task has no gate_owner', async () => {
+    const { env } = makeEnv([reviewTask({ gate_owner: null })])
+    const res = await invokeTool(auth({ role: 'owner' }), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved' }, URL)
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('no_gate')
+  })
+
+  it('BLOCKS self-verdict: the assignee cannot approve its own task (no grading own homework)', async () => {
+    // auth boundAgentId = AGENT_ID; make the task assigned to AGENT_ID. Owner role
+    // passes the gate-capability check so we reach the self-verdict guard.
+    const { env, updates } = makeEnv([reviewTask({ assignee_agent_id: AGENT_ID })])
+    const res = await invokeTool(auth({ role: 'owner' }), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved' }, URL)
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('self_verdict')
+    // No verdict write happened.
+    expect(updates.some((u) => /UPDATE tasks SET status/.test(u.sql))).toBe(false)
+  })
+
+  it('approves a review task for a NON-assignee gate holder, writing the verdict', async () => {
+    const { env, updates } = makeEnv([reviewTask({ assignee_agent_id: 'agent-other' })])
+    const res = await invokeTool(auth({ role: 'owner' }), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved' }, URL)
+    expect(res.ok).toBe(true)
+    expect(updates.some((u) => /UPDATE tasks SET status/.test(u.sql))).toBe(true)
+  })
+
+  it('non-gate-holder (plain member, not the gate) is forbidden', async () => {
+    const { env } = makeEnv([reviewTask()])
+    // member role, no gate grant in the mock → callerHoldsGateCapability false.
+    const res = await invokeTool(auth(), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved' }, URL)
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('forbidden')
+  })
+})
