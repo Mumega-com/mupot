@@ -237,11 +237,24 @@ Must ship:
   capability-ceiling, expiry) — prove it here so v0.29 presence rides a hardened primitive.
 
 **Also ship — Identity & Unified Access (the token/agent model rework).** A
-2026-07-20 audit found authorization lives on the *member* not the *token*, "agent"
-is a nullable weld onto "member," there are ≥4 divergent key-mint paths, no per-key
-fine-grain, and the minted key never carries its MCP address. This release lands the
-same grant/binding mechanism as governed tools on the *principal* side. Design:
+2026-07-20 three-lens deep audit (security / simplicity / durability, code + live
+D1) found authorization lives on the *member* not the *token*; **three** disjoint
+human-identity planes (`users` web-login + `members` token + `agents`); **six**
+divergent mint paths; **three** parallel RBAC tables (`capabilities`, `gate_grants`,
+`memberships`); no per-key fine-grain; and the minted key never carries its MCP
+address. It also found live data damage (2 ambiguous agents, 2 escalation-guard
+violations, 6 duplicate-member groups) and one live HIGH: the "scoped key" is
+unscoped and writes standing principal grants that survive revocation. Full findings
++ ordered fix sequence + security non-negotiables:
+[docs/architecture/identity-access-fix-map.md](docs/architecture/identity-access-fix-map.md).
+Target model:
 [docs/architecture/identity-and-access-redesign.md](docs/architecture/identity-and-access-redesign.md).
+
+Security non-negotiables for this release (from the adversarial gate):
+`effective = intersect(principal, token_grants)` with **empty grants ⇒ zero, never
+full**; mint **never** mutates the principal; one `buildAuthContext` chokepoint
+enforcing ceiling + `expires_at` + intersection at every door; expiry server-clock
+fail-closed; unknown `scope_type` ⇒ deny; `''` sentinel (not NULL) in the grant PK.
 
 - **one principal** table with `kind ∈ human|agent` (People and Agents become
   `kind`-filtered views); stop minting agents into the members table; `members`/
