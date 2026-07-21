@@ -227,7 +227,7 @@ export class TaskProjectError extends Error {
   }
 }
 
-export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_project_locked'
+export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_project_locked' | 'detach_locked_result_present'
 
 export class TaskUpdateConflictError extends Error {
   constructor(readonly code: TaskUpdateConflictCode) {
@@ -291,6 +291,20 @@ function mapTaskProjectUpdateError(error: unknown): never {
   const message = error instanceof Error ? error.message : String(error)
   if (message.includes('task project locked by flight')) {
     throw new TaskUpdateConflictError('task_project_locked')
+  }
+  // #400 fast-follow (adversarial gate, LOW): the app-layer emptiness check
+  // (isNonEmptyString → JS .trim()) and migration 0065's trigger guard
+  // (SQLite trim(), ASCII-space only) disagree on Unicode/whitespace-only
+  // results (e.g. "\t\n", a U+00A0 NBSP-only string) — JS .trim() treats them
+  // as empty (app allows the detach) while SQLite's trim() does not (the
+  // trigger still aborts). That is the intentionally-safe direction (the DB
+  // is the backstop, never looser than the app), but the raw ABORT message
+  // wasn't mapped here, so it fell through `throw error` as an uncaught 500
+  // instead of the same 409 the app-layer check already returns for the
+  // ASCII-agreeing case. Map it to the identical error code so the caller
+  // sees one consistent 409 regardless of which fence actually fired.
+  if (message.includes('task detach locked by result')) {
+    throw new TaskUpdateConflictError('detach_locked_result_present')
   }
   if (
     message.includes('task project not found')

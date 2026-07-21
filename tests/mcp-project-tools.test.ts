@@ -194,6 +194,30 @@ describe('MCP project attribution parity', () => {
     expect(detachAllowed).toMatchObject({ ok: true, result: { task: { project_id: null } } })
   })
 
+  // Adversarial-gate LOW fix: JS `.trim()` (app-layer emptiness check) and
+  // SQLite's `trim()` (migration 0065 trigger guard, ASCII-space only)
+  // disagree on a whitespace-only result like "\t\n" — the app layer treats
+  // it as empty and lets task_update proceed to persistTaskUpdate, but the
+  // DB trigger still sees non-empty bytes and ABORTs. That raw ABORT must
+  // map to the same 409 detach_locked_result_present the app-layer path
+  // returns above, never an uncaught 500.
+  it('maps the trigger-layer ABORT to a clean 409 (not a 500) for a whitespace-only result', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    harness.sqlite.prepare(`
+      INSERT INTO tasks (id, squad_id, title, done_when, status, result, project_id)
+      VALUES ('task-whitespace-result', '${SQUAD_ID}', 'Whitespace only', 'done', 'done', ?, 'project-a')
+    `).run('\t\n')
+
+    const detachBlocked = await invokeTool(auth(), env, 'task_update', {
+      task_id: 'task-whitespace-result',
+      project_id: null,
+    }, 'https://pot.test')
+    expect(detachBlocked).toMatchObject({ ok: false, status: 409, error: 'detach_locked_result_present' })
+    expect(harness.sqlite.prepare(`SELECT project_id FROM tasks WHERE id = 'task-whitespace-result'`).get())
+      .toEqual({ project_id: 'project-a' })
+  })
+
   it('keeps squad authority mandatory even when the project grants write access', async () => {
     harness = makeHarness()
     const env = envFor(harness)

@@ -457,6 +457,29 @@ describe('task project attribution', () => {
       .toEqual({ project_id: 'project-write' })
   })
 
+  // Adversarial-gate LOW fix: JS `.trim()` (the app-layer emptiness check)
+  // and SQLite's `trim()` (the migration 0065 trigger guard, ASCII-space
+  // only) disagree on a whitespace-only result like "\t\n" — the app layer
+  // sees it as empty and lets the PATCH proceed to persistTaskUpdate, but
+  // the DB trigger still sees non-empty bytes and ABORTs. Before the fix
+  // that raw ABORT message fell through mapTaskProjectUpdateError uncaught
+  // as a 500. It must now map to the same clean 409 the ASCII-agreeing case
+  // returns above.
+  it('maps the trigger-layer ABORT to a clean 409 (not a 500) for a whitespace-only result', async () => {
+    harness = makeHarness()
+    harness.sqlite.prepare(`
+      INSERT INTO tasks (id, squad_id, title, done_when, status, result, project_id)
+      VALUES ('task-whitespace-result', 'squad-a', 'Whitespace only', 'done', 'done', ?, 'project-write')
+    `).run('\t\n')
+    authState.current = actor()
+
+    const response = await fetch(harness, '/task-whitespace-result', 'PATCH', { project_id: null })
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'detach_locked_result_present' })
+    expect(harness.sqlite.prepare(`SELECT project_id FROM tasks WHERE id = 'task-whitespace-result'`).get())
+      .toEqual({ project_id: 'project-write' })
+  })
+
   it('still allows detaching a task with an empty result, and reassigning a non-empty-result task between two live projects', async () => {
     harness = makeHarness()
     harness.sqlite.exec(`
