@@ -218,6 +218,7 @@ export type TaskProjectErrorCode =
   | 'project_not_found'
   | 'archived_project'
   | 'project_access_forbidden'
+  | 'detach_locked_result_present'
 
 export class TaskProjectError extends Error {
   constructor(readonly code: TaskProjectErrorCode) {
@@ -235,12 +236,34 @@ export class TaskUpdateConflictError extends Error {
   }
 }
 
+// #400 fast-follow: the app-side half of the detach-evidence lock. Mirrors the
+// migration-layer tasks_project_detach_locked_by_result trigger (see the
+// newest migration) so the caller gets a clear domain error instead of a raw
+// SQLite ABORT message. `detaching` carries the CURRENT (pre-update) row's
+// project_id/result — only present when this validation is running against an
+// existing task (task_update), never on createTask (there is no prior row to
+// detach FROM). Deliberately excludes any receipt/RBAC check: 0059's
+// tasks_project_locked_by_receipt already owns the receipt-backed case, and an
+// authz check on the OLD project is a separate, deferred decision (#402) — this
+// is purely "don't let a receipt-less task with real evidence fall out of the
+// project's evidence board un-locked."
+export interface TaskDetachContext {
+  projectId: string | null
+  result: string | null
+}
+
 export async function validateTaskProjectAttribution(
   env: Env,
   projectId: string | null,
   squadId: string,
+  detaching?: TaskDetachContext,
 ): Promise<void> {
-  if (projectId === null) return
+  if (projectId === null) {
+    if (detaching && detaching.projectId !== null && isNonEmptyString(detaching.result)) {
+      throw new TaskProjectError('detach_locked_result_present')
+    }
+    return
+  }
   if (!isNonEmptyString(projectId)) throw new TaskProjectError('invalid_project_id')
   const row = await env.DB.prepare(
     `SELECT p.status, psa.access_level

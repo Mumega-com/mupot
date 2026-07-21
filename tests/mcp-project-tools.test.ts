@@ -159,6 +159,41 @@ describe('MCP project attribution parity', () => {
     expect(readOnly).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
   })
 
+  // #400: mirrors the REST parity test in tests/tasks-project-filter.test.ts —
+  // a receipt-less task_update detach must be blocked when the task already
+  // carries a non-empty result (evidence-board gap), while an empty-result
+  // detach and a live-project reassignment both stay legal.
+  it('blocks a task_update detach when the task already carries a non-empty result', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, done_when, status, result, project_id)
+      VALUES ('task-evidenced', '${SQUAD_ID}', 'Evidenced', 'done', 'done', 'Verified output', 'project-a');
+      INSERT INTO tasks (id, squad_id, title, done_when, status, result, project_id)
+      VALUES ('task-empty-result', '${SQUAD_ID}', 'No evidence yet', 'done', 'open', NULL, 'project-a');
+    `)
+
+    const detachBlocked = await invokeTool(auth(), env, 'task_update', {
+      task_id: 'task-evidenced',
+      project_id: null,
+    }, 'https://pot.test')
+    expect(detachBlocked).toMatchObject({ ok: false, status: 409, error: 'detach_locked_result_present' })
+    expect(harness.sqlite.prepare(`SELECT project_id FROM tasks WHERE id = 'task-evidenced'`).get())
+      .toEqual({ project_id: 'project-a' })
+
+    const reassigned = await invokeTool(auth(), env, 'task_update', {
+      task_id: 'task-evidenced',
+      project_id: 'project-b',
+    }, 'https://pot.test')
+    expect(reassigned).toMatchObject({ ok: true, result: { task: { project_id: 'project-b' } } })
+
+    const detachAllowed = await invokeTool(auth(), env, 'task_update', {
+      task_id: 'task-empty-result',
+      project_id: null,
+    }, 'https://pot.test')
+    expect(detachAllowed).toMatchObject({ ok: true, result: { task: { project_id: null } } })
+  })
+
   it('keeps squad authority mandatory even when the project grants write access', async () => {
     harness = makeHarness()
     const env = envFor(harness)

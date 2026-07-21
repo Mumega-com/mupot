@@ -408,6 +408,118 @@ describe('0055_projects migration', () => {
   })
 })
 
+describe('0065 task detach result lock migration', () => {
+  const DETACH_LOCK_MIGRATION = '0065_task_detach_result_lock.sql'
+
+  function applyThroughDetachLock(sqlite: { exec(sql: string): void }): void {
+    for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql') && name <= DETACH_LOCK_MIGRATION).sort()) {
+      sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+    }
+  }
+
+  function seed(sqlite: { exec(sql: string): void }): void {
+    sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Department');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'squad', 'Squad');
+      INSERT INTO projects (id, slug, name, status) VALUES
+        ('project-a', 'a', 'A', 'active'),
+        ('project-b', 'b', 'B', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+        ('project-a', 'squad-1', 'write'),
+        ('project-b', 'squad-1', 'write');
+    `)
+  }
+
+  it('aborts a detach off a receipt-less task that already carries a non-empty result', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      applyThroughDetachLock(sqlite)
+      seed(sqlite)
+      sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, title, status, result, project_id)
+        VALUES ('task-evidenced', 'squad-1', 'Evidenced', 'done', 'Verified result', 'project-a');
+      `)
+
+      expect(() => sqlite.exec(`UPDATE tasks SET project_id = NULL WHERE id = 'task-evidenced'`))
+        .toThrow(/task detach locked by result/)
+      expect(sqlite.prepare(`SELECT project_id FROM tasks WHERE id = 'task-evidenced'`).get())
+        .toEqual({ project_id: 'project-a' })
+    } finally {
+      close()
+    }
+  })
+
+  it('allows detaching a task whose result is null or blank', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      applyThroughDetachLock(sqlite)
+      seed(sqlite)
+      sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, title, status, result, project_id)
+        VALUES ('task-null-result', 'squad-1', 'No result yet', 'open', NULL, 'project-a');
+        INSERT INTO tasks (id, squad_id, title, status, result, project_id)
+        VALUES ('task-blank-result', 'squad-1', 'Blank result', 'open', '   ', 'project-a');
+      `)
+
+      expect(() => sqlite.exec(`UPDATE tasks SET project_id = NULL WHERE id = 'task-null-result'`)).not.toThrow()
+      expect(() => sqlite.exec(`UPDATE tasks SET project_id = NULL WHERE id = 'task-blank-result'`)).not.toThrow()
+      expect(sqlite.prepare(`SELECT project_id FROM tasks WHERE id = 'task-null-result'`).get())
+        .toEqual({ project_id: null })
+      expect(sqlite.prepare(`SELECT project_id FROM tasks WHERE id = 'task-blank-result'`).get())
+        .toEqual({ project_id: null })
+    } finally {
+      close()
+    }
+  })
+
+  it('leaves 0059s receipt-lock behavior unchanged — the receipt lock, not the result lock, fires', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      applyThroughDetachLock(sqlite)
+      seed(sqlite)
+      sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, title, status, result, project_id)
+        VALUES ('task-receipted', 'squad-1', 'Receipted', 'done', 'Verified result', 'project-a');
+        INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at)
+        VALUES ('verdict-a', 'task-receipted', 'approved', 'member-a', '2026-07-21T00:00:00Z');
+      `)
+
+      expect(() => sqlite.exec(`UPDATE tasks SET project_id = NULL WHERE id = 'task-receipted'`))
+        .toThrow(/task project locked by flight/)
+    } finally {
+      close()
+    }
+  })
+
+  it('does not block a reassignment between two live, non-null projects', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      applyThroughDetachLock(sqlite)
+      seed(sqlite)
+      sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, title, status, result, project_id)
+        VALUES ('task-reassign', 'squad-1', 'Evidenced', 'done', 'Verified result', 'project-a');
+      `)
+
+      expect(() => sqlite.exec(`UPDATE tasks SET project_id = 'project-b' WHERE id = 'task-reassign'`)).not.toThrow()
+      expect(sqlite.prepare(`SELECT project_id FROM tasks WHERE id = 'task-reassign'`).get())
+        .toEqual({ project_id: 'project-b' })
+    } finally {
+      close()
+    }
+  })
+
+  it('is idempotent (re-running the migration does not error)', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      applyThroughDetachLock(sqlite)
+      expect(() => sqlite.exec(readFileSync(join(MIGRATIONS_DIR, DETACH_LOCK_MIGRATION), 'utf8'))).not.toThrow()
+    } finally {
+      close()
+    }
+  })
+})
+
 describe('0060 Project Link latest-event index migration', () => {
   it('replaces the shipped 0059 expression for existing databases and is repeatable', () => {
     const { sqlite, close } = createSqliteD1()
