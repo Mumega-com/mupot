@@ -56,6 +56,7 @@ import {
   validateTaskProjectAttribution,
   writeVerdict,
   VerdictRaceError,
+  TaskEvidenceFenceError,
 } from '../tasks/service'
 import type { TaskStatus } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
@@ -79,6 +80,7 @@ import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
 import { PROJECT_TOOLS } from './projects'
+import { hasProjectWriteForSquads } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
@@ -465,28 +467,6 @@ async function canReadProjectForSquad(
   return (await env.DB.prepare(
     `SELECT 1 FROM project_squad_access WHERE project_id = ?1 AND squad_id = ?2`,
   ).bind(projectId, squadId).first()) !== null
-}
-
-async function hasProjectWriteForSquads(
-  env: Env,
-  projectId: string,
-  squadIds: string[],
-): Promise<boolean> {
-  const uniqueSquadIds = [...new Set(squadIds)]
-  if (uniqueSquadIds.length === 0) return false
-  const placeholders = uniqueSquadIds.map((_, index) => `?${index + 2}`).join(', ')
-  const rows = await env.DB.prepare(
-    `SELECT squad_id, access_level
-       FROM project_squad_access
-      WHERE project_id = ?1
-        AND squad_id IN (${placeholders})`,
-  ).bind(projectId, ...uniqueSquadIds).all<{ squad_id: string; access_level: string }>()
-  const writable = new Set(
-    (rows.results ?? [])
-      .filter((row) => row.access_level === 'write' || row.access_level === 'admin')
-      .map((row) => row.squad_id),
-  )
-  return uniqueSquadIds.every((squadId) => writable.has(squadId))
 }
 
 function taskProjectFailure(error: TaskProjectError): ToolOutcome {
@@ -1164,6 +1144,10 @@ const toolTaskVerdict: ToolSpec = {
       return done(result)
     } catch (err) {
       if (err instanceof VerdictRaceError) return fail(409, 'verdict_race')
+      if (err instanceof TaskEvidenceFenceError) {
+        // #399: owning squad no longer holds write/admin on the task's project.
+        return fail(403, 'forbidden', { need: 'project_write' })
+      }
       throw err
     }
   },

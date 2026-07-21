@@ -1,9 +1,14 @@
 // Tests for B5 (label→squad routing) + D3 (CI→task) helpers.
 
-import { describe, it, expect } from 'vitest'
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { describe, it, expect, afterEach } from 'vitest'
 import { parseLabelSquadMap, squadForLabels } from '../src/integrations/github-routes'
 import { syncCiResultToTask } from '../src/tasks/service'
 import type { Env } from '../src/types'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+
+const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 
 describe('parseLabelSquadMap (B5)', () => {
   it('parses a valid JSON label→squad map (case-insensitive keys)', () => {
@@ -32,50 +37,72 @@ describe('squadForLabels (B5)', () => {
   })
 })
 
+// Real-SQL harness (not a hand-rolled query-shape mock, per #399 fencing work —
+// syncCiResultToTask now does a SELECT-then-UPDATE two-step to re-check per-project
+// squad access, so a mock stubbing only `.run()` can no longer stand in for the DB).
 describe('syncCiResultToTask (D3)', () => {
-  function dbEnv(changes: number) {
-    const calls: Array<{ sql: string; args: unknown[] }> = []
-    const env = {
-      DB: {
-        prepare: (sql: string) => ({
-          bind: (...args: unknown[]) => ({
-            run: async () => {
-              calls.push({ sql, args })
-              return { meta: { changes } }
-            },
-          }),
-        }),
-      },
-    } as unknown as Env
-    return { env, calls }
+  let harness: SqliteD1Harness | undefined
+
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+  })
+
+  function makeHarness(): SqliteD1Harness {
+    const h = createSqliteD1()
+    for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
+      h.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+    }
+    h.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept', 'dept', 'Dept');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept', 'squad-a', 'Squad A');
+    `)
+    return h
+  }
+
+  function insertTask(h: SqliteD1Harness, overrides: {
+    id: string; status: string; prNumber: number; projectId?: string | null
+  }): void {
+    h.sqlite.exec(
+      `INSERT INTO tasks (id, squad_id, title, done_when, status, github_issue_url, project_id, created_at, updated_at)
+       VALUES ('${overrides.id}', 'squad-a', 'PR task', 'CI passes', '${overrides.status}',
+               'https://github.com/o/r/pull/${overrides.prNumber}',
+               ${overrides.projectId ? `'${overrides.projectId}'` : 'NULL'},
+               '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z')`,
+    )
+  }
+
+  function envFor(h: SqliteD1Harness): Env {
+    return { DB: h.db } as unknown as Env
   }
 
   it('failure conclusion bumps a review task back to in_progress', async () => {
-    const { env, calls } = dbEnv(1)
-    const res = await syncCiResultToTask(env, 42, 'failure')
+    harness = makeHarness()
+    insertTask(harness, { id: 'task-1', status: 'review', prNumber: 42 })
+
+    const res = await syncCiResultToTask(envFor(harness), 42, 'failure')
     expect(res.updated).toBe(true)
-    expect(calls[0].sql).toContain("status = 'in_progress'")
-    expect(calls[0].sql).toContain("status = 'review'") // only flips review tasks
-    expect(calls[0].args).toContain('%/pull/42')
-    expect(calls[0].args).toContain('CI: failure')
+    expect(harness.sqlite.prepare('SELECT status, result FROM tasks WHERE id = ?').get('task-1'))
+      .toEqual({ status: 'in_progress', result: 'CI: failure' })
   })
 
   it('success records the note without changing a gate state', async () => {
-    const { env, calls } = dbEnv(1)
-    const res = await syncCiResultToTask(env, 7, 'success')
+    harness = makeHarness()
+    insertTask(harness, { id: 'task-2', status: 'review', prNumber: 7 })
+
+    const res = await syncCiResultToTask(envFor(harness), 7, 'success')
     expect(res.updated).toBe(true)
-    expect(calls[0].sql).not.toContain("status = 'in_progress'")
-    expect(calls[0].sql).toContain("status IN ('review','in_progress','open')")
+    expect(harness.sqlite.prepare('SELECT status, result FROM tasks WHERE id = ?').get('task-2'))
+      .toEqual({ status: 'review', result: 'CI: success' }) // gate state untouched
   })
 
   it('no matching task → updated:false', async () => {
-    const { env } = dbEnv(0)
-    expect((await syncCiResultToTask(env, 9, 'failure')).updated).toBe(false)
+    harness = makeHarness()
+    expect((await syncCiResultToTask(envFor(harness), 9, 'failure')).updated).toBe(false)
   })
 
-  it('invalid pr number → no-op', async () => {
-    const { env, calls } = dbEnv(1)
-    expect((await syncCiResultToTask(env, 0, 'failure')).updated).toBe(false)
-    expect(calls.length).toBe(0)
+  it('invalid pr number → no-op (short-circuits before touching the DB)', async () => {
+    harness = makeHarness()
+    expect((await syncCiResultToTask(envFor(harness), 0, 'failure')).updated).toBe(false)
   })
 })

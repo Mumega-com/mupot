@@ -1,5 +1,5 @@
 import { hasCapability } from '../auth/capability'
-import type { AuthContext, CapabilityGrant } from '../types'
+import type { AuthContext, CapabilityGrant, Env } from '../types'
 
 export interface ProjectReadAccess {
   workspaceAdmin: boolean
@@ -51,4 +51,31 @@ export function projectVisibilityClause(access: ProjectReadAccess): { sql: strin
     )`,
     binds: [JSON.stringify([...new Set(access.squadIds)]), JSON.stringify([...new Set(access.departmentIds)])],
   }
+}
+
+// The ONE per-project write-access primitive for squads (moved from src/mcp/index.ts
+// so non-MCP surfaces — task automation, #399 — can share it instead of re-deriving
+// the write/admin threshold). Returns true only when EVERY squad in `squadIds` holds
+// 'write' or 'admin' on `projectId`; a squad with no project_squad_access row at all
+// is NOT writable (LEFT JOIN semantics are intentionally avoided — absence is denial).
+export async function hasProjectWriteForSquads(
+  env: Env,
+  projectId: string,
+  squadIds: string[],
+): Promise<boolean> {
+  const uniqueSquadIds = [...new Set(squadIds)]
+  if (uniqueSquadIds.length === 0) return false
+  const placeholders = uniqueSquadIds.map((_, index) => `?${index + 2}`).join(', ')
+  const rows = await env.DB.prepare(
+    `SELECT squad_id, access_level
+       FROM project_squad_access
+      WHERE project_id = ?1
+        AND squad_id IN (${placeholders})`,
+  ).bind(projectId, ...uniqueSquadIds).all<{ squad_id: string; access_level: string }>()
+  const writable = new Set(
+    (rows.results ?? [])
+      .filter((row) => row.access_level === 'write' || row.access_level === 'admin')
+      .map((row) => row.squad_id),
+  )
+  return uniqueSquadIds.every((squadId) => writable.has(squadId))
 }

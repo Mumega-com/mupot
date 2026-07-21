@@ -36,7 +36,7 @@ import type {
 } from '../types'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { createBus } from '../bus'
-import { createTask, writeVerdict, VerdictRaceError } from '../tasks/service'
+import { createTask, writeVerdict, VerdictRaceError, TaskEvidenceFenceError } from '../tasks/service'
 import { emitControlRequest } from '../fleet/control'
 import { CONTROL_VERBS, type ControlVerb } from '../fleet/control-request'
 import { listFleetAgentRuntimeView, type FleetAgentRuntimeView } from '../fleet/registry'
@@ -607,6 +607,9 @@ async function verdictReply(
   } catch (err) {
     if (err instanceof VerdictRaceError) {
       return `"${task.title}" changed before I could record the verdict. Reload approvals and try again.`
+    }
+    if (err instanceof TaskEvidenceFenceError) {
+      return `"${task.title}"'s squad no longer has write access to its project — the verdict was not recorded.`
     }
     throw err
   }
