@@ -63,8 +63,9 @@ export function getLoopTemplate(key: string): LoopTemplateFactory | undefined {
 // kpi.signal 'avg_conversion_bps' matches the metric_key convention documented in
 // cro.ts's defaultReadSignal (a trailing-window basis-points average). target=500
 // (5.00%) is a reasonable starting floor for a first-run pot; retuning it is a normal
-// loop-lifecycle action (PATCH via the loops API) once the loop is promoted out of
-// 'paused' — that promotion is explicitly out of scope for this template (#471).
+// loop-lifecycle action (PATCH /api/loops/:id/status or MCP loop_set_status) once the
+// loop is promoted out of 'paused' — promotion is explicit and org-admin gated
+// (see docs/playbooks/marketing-loop-promote.md). Never auto-activate on addon install.
 export function websiteOpportunityReviewTemplate(ctx: LoopTemplateContext): LoopSpec {
   return {
     kind: 'cro',

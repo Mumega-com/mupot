@@ -80,6 +80,8 @@ import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
 import { PROJECT_TOOLS } from './projects'
 import { ADDON_TOOLS } from './addons'
+import { GATE_GRANT_TOOLS } from './gates'
+import { LOOP_TOOLS } from './loops'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -2530,6 +2532,8 @@ export const TOOLS: ToolSpec[] = [
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
   ...ADDON_TOOLS,
+  ...GATE_GRANT_TOOLS,
+  ...LOOP_TOOLS,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))

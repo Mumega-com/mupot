@@ -1,0 +1,12 @@
+{
+  "//": "ECC operator pack — Cursor. Connects this agent to a mupot pot over MCP.",
+  "//token": "Replace <MUPOT_MEMBER_TOKEN> with an agent-bound member token. NEVER commit a real token.",
+  "mcpServers": {
+    "mupot": {
+      "url": "https://mupot.mumega.com/mcp",
+      "headers": {
+        "Authorization": "Bearer <MUPOT_MEMBER_TOKEN>"
+      }
+    }
+  }
+}
