@@ -945,9 +945,124 @@ const toolTaskUpdate: ToolSpec = {
     }
     next.github_issue_url = await mirrorTaskUpdate(env, next)
 
-    await emitTaskEvent(env, 'task.updated', next, memberActor(auth.memberId as string))
+    const actor = memberActor(auth.memberId as string)
+    await emitTaskEvent(env, 'task.updated', next, actor)
+
+    // Review-wake (S### — wake the gate owner instead of waiting for a hand
+    // relay): only on the ENTERING transition (existing status was not already
+    // 'review') so an unrelated field edit on an already-review task never
+    // re-fires it. gate_required_for_review above already guarantees
+    // next.gate_owner is set whenever next.status === 'review'.
+    if (existing.status !== 'review' && next.status === 'review' && next.gate_owner) {
+      await wakeGateOwnerOnReview(env, next, actor, auth.memberId as string)
+    }
     return done({ task: next })
   },
+}
+
+// Resolve a gate_owner CAPABILITY NAME (e.g. 'gate:kasra-core') to the single agent
+// PRINCIPAL that holds it, per the same gate_grants table callerHoldsGateCapability
+// reads (migration 0008: capability, principal_type, principal_id — no tenant column,
+// mirroring every other gate_grants query in this codebase). Ambiguous ownership (zero
+// or more than one agent holder) has no single unambiguous wake target — the caller
+// treats that as "skip silently", the same posture task_verdict already takes when a
+// capability isn't resolvable to a sole actor.
+async function resolveSoleGateOwnerAgent(env: Env, gateOwner: string): Promise<string | null> {
+  const rows = await env.DB.prepare(
+    `SELECT principal_id FROM gate_grants WHERE capability = ?1 AND principal_type = 'agent'`,
+  )
+    .bind(gateOwner)
+    .all<{ principal_id: string }>()
+  const results = rows.results ?? []
+  return results.length === 1 ? results[0].principal_id : null
+}
+
+// Non-spoofable system-sender literal for a review-wake's durable inbox delegation —
+// mirrors DISPATCH_BRIDGE_SENDER's convention (src/bus/fleet-bridge.ts): task_update is
+// invoked by a human/agent MEMBER token, not by the gate-owner agent itself, so there is
+// no honest agent principal to name as the sender of "you have a review waiting."
+const REVIEW_WAKE_SENDER = 'mupot-review-gate'
+
+// sendAgentMessage's request_id must match RID_RE ([A-Za-z0-9_.:-]{1,128}, src/agents/
+// messages.ts) — task.id (a uuid) + an ISO timestamp both fit that charset comfortably
+// inside the length cap, so no encoding/hashing is needed.
+function reviewWakeRequestId(taskId: string, ts: string): string {
+  return `review-wake:${taskId}:${ts}`
+}
+
+// wakeGateOwnerOnReview — fires when a task ENTERS 'review' with a gate_owner set.
+// Two independent, best-effort side channels (neither may ever fail the review
+// transition itself, which has already committed by the time this runs):
+//
+//   1. An `agent.wake` BusEvent, built EXACTLY like toolTaskDispatch's own event
+//      (same envelope shape) — this drives the in-Worker AgentDO cortex cycle via
+//      src/bus/consumer.ts's 'agent.wake' case. Deliberately NO dispatch_receipt_id
+//      in the payload: that field is what taskDispatchIdentity() (consumer.ts) keys
+//      on to route into the task_dispatch execute/receipt state machine, which this
+//      is not — a review-wake with no dispatch_receipt_id falls through to the
+//      plain wakeAgent() path, the same generic "poke this agent's DO" primitive
+//      member_wake uses. (AgentDO.wake() will still see payload.task_id and take
+//      its EXECUTE MODE branch — but 'review' is in execute.ts's K6 no-op set, so
+//      that branch safely no-ops rather than mis-driving execution of a task that
+//      is already gated for review.)
+//   2. A durable `agent_messages` row (via the SAME sendAgentMessage primitive
+//      fleet-bridge.ts uses for task_dispatch's external-runtime delivery), so a
+//      non-DO runtime polling GET /api/inbox — the bash wake-hooks — also picks up
+//      the review delegation without needing a hand relay.
+async function wakeGateOwnerOnReview(
+  env: Env,
+  task: Task,
+  actor: { kind: 'member' | 'agent'; id: string },
+  byId: string,
+): Promise<void> {
+  const gateOwner = task.gate_owner
+  if (!gateOwner) return
+
+  let agentId: string | null
+  try {
+    agentId = await resolveSoleGateOwnerAgent(env, gateOwner)
+  } catch {
+    return // resolution failure — never break the already-committed review transition
+  }
+  if (!agentId) return // zero or multiple holders: no unambiguous wake target
+
+  const ts = new Date().toISOString()
+
+  try {
+    const event: BusEvent<{ task_id: string; gate_owner: string; by: string }> = {
+      type: 'agent.wake',
+      tenant: env.TENANT_SLUG,
+      squad_id: task.squad_id,
+      agent_id: agentId,
+      actor,
+      payload: { task_id: task.id, gate_owner: gateOwner, by: byId },
+      ts,
+    }
+    await createBus(env).emit(event)
+  } catch {
+    // best-effort, mirrors toolTaskDispatch's own createBus(env).emit() try/catch
+  }
+
+  try {
+    await sendAgentMessage(
+      env,
+      {
+        fromAgent: REVIEW_WAKE_SENDER,
+        fromMember: byId,
+        toAgent: agentId,
+        kind: 'request',
+        body: JSON.stringify({ type: 'task_review', task_id: task.id, gate_owner: gateOwner, squad_id: task.squad_id }),
+        requestId: reviewWakeRequestId(task.id, ts),
+      },
+      {
+        system: true,
+        reason: 'target is the sole gate_grants holder resolved server-side, not attacker input',
+      },
+    )
+  } catch {
+    // best-effort — durable inbox delivery is additive to the bus wake, never
+    // allowed to fail the already-committed review transition.
+  }
 }
 
 // task_verdict — approve or reject a task in 'review'. The MCP twin of

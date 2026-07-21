@@ -50,13 +50,24 @@ type CrossSquadAssignee = {
   capability?: Capability
 }
 
+interface MakeEnvOpts {
+  /** capability → agent principal ids holding it, for gate_grants lookups
+   *  (wakeGateOwnerOnReview's resolveSoleGateOwnerAgent, src/mcp/index.ts). */
+  gateGrants?: Record<string, string[]>
+  /** Make env.BUS.send throw on every emit, to prove a bus failure never fails
+   *  the review transition (wakeGateOwnerOnReview's try/catch). */
+  busThrows?: boolean
+}
+
 function makeEnv(
   rows: Task[] = [task()],
   crossSquadAssignee: CrossSquadAssignee = {},
   agentStatuses: Partial<Record<string, string>> = {},
+  opts: MakeEnvOpts = {},
 ) {
   const updates: { sql: string; args: unknown[] }[] = []
   const events: unknown[] = []
+  const gateGrants = new Map(Object.entries(opts.gateGrants ?? {}))
   const agents = new Map([
     [AGENT_ID, { id: AGENT_ID, squad_id: SQUAD_ID, slug: 'agent-one', name: 'Agent One', role: null, model: null, status: agentStatuses[AGENT_ID] ?? 'active', created_at: 'now' }],
     ['agent-other', { id: 'agent-other', squad_id: OTHER_SQUAD_ID, slug: 'other', name: 'Other', role: null, model: null, status: agentStatuses['agent-other'] ?? 'active', created_at: 'now' }],
@@ -85,6 +96,14 @@ function makeEnv(
     TENANT_SLUG: TENANT,
     BUS: {
       send: async (event: unknown) => {
+        // Only the review-wake's agent.wake emit is under test for best-effort
+        // resilience here — task.updated (emitTaskEvent, src/tasks/service.ts)
+        // is NOT wrapped in try/catch upstream and is out of this brief's scope,
+        // so throwing unconditionally would fail the transition for an unrelated
+        // reason and defeat the point of the test.
+        if (opts.busThrows && (event as { type?: string }).type === 'agent.wake') {
+          throw new Error('bus_unavailable')
+        }
         events.push(event)
       },
     },
@@ -103,6 +122,12 @@ function makeEnv(
                 return null
               },
               async all() {
+                if (sql.includes('FROM gate_grants')) {
+                  const capability = args[0] as string
+                  return {
+                    results: (gateGrants.get(capability) ?? []).map((principal_id) => ({ principal_id })),
+                  }
+                }
                 if (sql.includes('SELECT DISTINCT t.member_id')) {
                   return {
                     results: (agentMembers.get(args[1] as string) ?? []).map((member_id) => ({ member_id })),
@@ -652,6 +677,139 @@ describe('MCP task cutover tools', () => {
     const result = res.result as { task: Task }
     expect(result.task.status).toBe('review')
     expect(result.task.gate_owner).toBe('gate:content')
+  })
+
+  // ── review-wake (S### — wake the gate_owner instead of a hand relay) ─────────
+  // Entering 'review' with a gate_owner resolves the capability to its SOLE agent
+  // holder in gate_grants and wakes it: an agent.wake BusEvent (mirrors
+  // toolTaskDispatch's own event shape) AND a durable agent_messages row so a
+  // non-DO runtime polling GET /api/inbox also sees the delegation.
+  describe('review-wake — gate_owner resolution (wakeGateOwnerOnReview)', () => {
+    it('emits exactly one agent.wake and one durable inbox row when exactly one agent holds the gate', async () => {
+      const { env, events, updates } = makeEnv(
+        [task({ status: 'in_progress', gate_owner: null })],
+        {},
+        {},
+        { gateGrants: { 'gate:kasra-core': ['agent-reviewer'] } },
+      )
+
+      const res = await invokeTool(
+        auth(),
+        env,
+        'task_update',
+        { task_id: 'task-1', status: 'review', gate_owner: 'gate:kasra-core' },
+        'https://pot.example',
+      )
+
+      expect(res.ok).toBe(true)
+
+      const wakeEvents = events.filter((e) => (e as { type: string }).type === 'agent.wake')
+      expect(wakeEvents).toEqual([
+        expect.objectContaining({
+          type: 'agent.wake',
+          tenant: TENANT,
+          squad_id: SQUAD_ID,
+          agent_id: 'agent-reviewer',
+          actor: { kind: 'member', id: MEMBER_ID },
+          payload: { task_id: 'task-1', gate_owner: 'gate:kasra-core', by: MEMBER_ID },
+        }),
+      ])
+      // No dispatch_receipt_id on the payload — this must NOT be mistaken by
+      // consumer.ts's taskDispatchIdentity() for a task_dispatch execute wake.
+      expect((wakeEvents[0] as { payload: object }).payload).not.toHaveProperty('dispatch_receipt_id')
+
+      const inboxWrites = updates.filter((u) => u.sql.includes('INSERT INTO agent_messages'))
+      expect(inboxWrites).toHaveLength(1)
+      expect(inboxWrites[0].args).toContain('agent-reviewer') // to_agent
+      expect(inboxWrites[0].args).toContain('mupot-review-gate') // from_agent (system sender)
+    })
+
+    it('emits no wake when zero agents hold the gate capability', async () => {
+      const { env, events, updates } = makeEnv(
+        [task({ status: 'in_progress', gate_owner: null })],
+        {},
+        {},
+        { gateGrants: {} },
+      )
+
+      const res = await invokeTool(
+        auth(),
+        env,
+        'task_update',
+        { task_id: 'task-1', status: 'review', gate_owner: 'gate:kasra-core' },
+        'https://pot.example',
+      )
+
+      expect(res.ok).toBe(true)
+      expect(events.filter((e) => (e as { type: string }).type === 'agent.wake')).toEqual([])
+      expect(updates.filter((u) => u.sql.includes('INSERT INTO agent_messages'))).toHaveLength(0)
+    })
+
+    it('emits no wake when multiple agents hold the gate capability (ambiguous holder)', async () => {
+      const { env, events, updates } = makeEnv(
+        [task({ status: 'in_progress', gate_owner: null })],
+        {},
+        {},
+        { gateGrants: { 'gate:kasra-core': ['agent-reviewer', 'agent-second'] } },
+      )
+
+      const res = await invokeTool(
+        auth(),
+        env,
+        'task_update',
+        { task_id: 'task-1', status: 'review', gate_owner: 'gate:kasra-core' },
+        'https://pot.example',
+      )
+
+      expect(res.ok).toBe(true)
+      expect(events.filter((e) => (e as { type: string }).type === 'agent.wake')).toEqual([])
+      expect(updates.filter((u) => u.sql.includes('INSERT INTO agent_messages'))).toHaveLength(0)
+    })
+
+    it('a bus emit failure does not fail the review transition (best-effort wake)', async () => {
+      const { env, updates } = makeEnv(
+        [task({ status: 'in_progress', gate_owner: null })],
+        {},
+        {},
+        { gateGrants: { 'gate:kasra-core': ['agent-reviewer'] }, busThrows: true },
+      )
+
+      const res = await invokeTool(
+        auth(),
+        env,
+        'task_update',
+        { task_id: 'task-1', status: 'review', gate_owner: 'gate:kasra-core' },
+        'https://pot.example',
+      )
+
+      expect(res.ok).toBe(true)
+      const result = res.result as { task: Task }
+      expect(result.task.status).toBe('review')
+      // The wake attempt still ran (and threw, swallowed) — the durable inbox
+      // delivery is independent of the bus emit and still lands.
+      expect(updates.filter((u) => u.sql.includes('INSERT INTO agent_messages'))).toHaveLength(1)
+    })
+
+    it('does not re-fire the wake on an unrelated edit to an already-review task', async () => {
+      const { env, events, updates } = makeEnv(
+        [task({ status: 'review', gate_owner: 'gate:kasra-core' })],
+        {},
+        {},
+        { gateGrants: { 'gate:kasra-core': ['agent-reviewer'] } },
+      )
+
+      const res = await invokeTool(
+        auth(),
+        env,
+        'task_update',
+        { task_id: 'task-1', body: 'clarify the review note' },
+        'https://pot.example',
+      )
+
+      expect(res.ok).toBe(true)
+      expect(events.filter((e) => (e as { type: string }).type === 'agent.wake')).toEqual([])
+      expect(updates.filter((u) => u.sql.includes('INSERT INTO agent_messages'))).toHaveLength(0)
+    })
   })
 
   it('task_update records completion time when an approved task transitions to done', async () => {
