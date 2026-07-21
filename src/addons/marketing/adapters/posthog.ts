@@ -13,7 +13,12 @@ const HOGQL_24H_ROLLUP = `
 // Organic-search session count, trailing 24h — the SAME channel definition documented at
 // src/departments/channels/seo-channel.ts ("seo.organic_sessions — sessions arriving via
 // organic search"). "Organic" here = a $pageview with no utm_source (not a tagged
-// paid/campaign visit) AND a referring domain that is a known public search engine.
+// paid/campaign visit) AND PostHog's own `$search_engine` property is set (PostHog derives
+// this server-side from the referring domain against ITS maintained list of known search
+// engines — not a regex we hand-roll here). Using PostHog's computed property instead of an
+// `AND match(properties.$referring_domain, '<our own allowlist regex>')` avoids the
+// lookalike-domain trap a hand-rolled unanchored regex has (e.g. a right-unanchored pattern
+// would treat "google.evil.com" as Google search traffic — #473 WARN-3).
 //
 // This is deliberately a DIFFERENT, narrower query than HOGQL_24H_ROLLUP above. The
 // vault-connector path below reuses that all-traffic rollup only as a connectivity health
@@ -23,21 +28,13 @@ const HOGQL_24H_ROLLUP = `
 // customer-supplied PostHog project. The env-fallback path below is purpose-built for the
 // pot's own tenant instead, so it runs this dedicated organic-channel query rather than
 // reusing the unfiltered rollup under a mislabeled metric key.
-//
-// Search-engine referring-domain allowlist, expressed once so the regex escaping below is
-// generated rather than hand-duplicated per domain (fewer places to get `\.` wrong).
-const ORGANIC_SEARCH_DOMAINS = ['google.', 'bing.', 'duckduckgo.', 'yahoo.', 'yandex.', 'baidu.']
-const ORGANIC_SEARCH_DOMAIN_PATTERN = ORGANIC_SEARCH_DOMAINS
-  .map((domain) => `(^|\\.)${domain.replace(/\./g, '\\.')}`)
-  .join('|')
-
 const HOGQL_ORGANIC_SESSIONS_24H = `
   SELECT count(DISTINCT properties.$session_id) AS organic_sessions
   FROM events
   WHERE event = '$pageview'
     AND timestamp >= now() - INTERVAL 1 DAY
     AND (properties.utm_source IS NULL OR properties.utm_source = '')
-    AND match(properties.$referring_domain, '${ORGANIC_SEARCH_DOMAIN_PATTERN}')
+    AND properties.$search_engine IS NOT NULL
   LIMIT 1
 `.trim()
 
@@ -81,13 +78,29 @@ function isRedirect(response: Response): boolean {
 }
 
 /**
+ * The env-credentials fallback may run ONLY for the tenant that owns this deployment's
+ * Worker-level operator secrets (env.OWNER_TENANT_SLUG === env.TENANT_SLUG, both required
+ * and non-empty). Without this gate, ANY tenant bound to web_analytics.posthog as
+ * internal_adapter would read the operator's own PostHog project (e.g. mumega's) and emit
+ * it under ITS OWN tenant's seo.organic_sessions — a multi-tenant leak (#473 CONCERN-2).
+ * There is currently no other pot-owner concept in the repo, so this is deliberately a new,
+ * explicit, fail-closed env var: unset ⇒ the env-fallback path never runs for anyone.
+ */
+function isPotOwnerTenant(env: Env): boolean {
+  return typeof env.OWNER_TENANT_SLUG === 'string'
+    && env.OWNER_TENANT_SLUG.length > 0
+    && env.OWNER_TENANT_SLUG === env.TENANT_SLUG
+}
+
+/**
  * Env-credentials fallback (dogfood path): runs when no vault connector is bound for this
  * slot (binding.bindingKind === 'internal_adapter', binding.connectorId === null — see
- * MARKETING_MONITOR_BINDING_CONTRACT's 'either' rule for web_analytics.posthog). Rather
- * than requiring every tenant to provision a per-tenant connector, this authenticates from
- * the Worker's own operator-set PostHog credentials — EXACTLY the same env vars and the
- * same SSRF-guarded host resolution src/cro/collect.ts / src/cro/posthog.ts already use for
- * the CRO loop. Fail-closed at every step: missing creds, a bad/private host, a non-2xx
+ * MARKETING_MONITOR_BINDING_CONTRACT's 'either' rule for web_analytics.posthog) AND the
+ * running tenant is the pot owner (isPotOwnerTenant above). Rather than requiring every
+ * tenant to provision a per-tenant connector, this authenticates from the Worker's own
+ * operator-set PostHog credentials — EXACTLY the same env vars and the same SSRF-guarded
+ * host resolution src/cro/collect.ts / src/cro/posthog.ts already use for the CRO loop.
+ * Fail-closed at every step: non-owner tenant, missing creds, a bad/private host, a non-2xx
  * response, a redirect, or a malformed body all resolve to unavailable/failed with zero
  * observations — never a fabricated value.
  */
@@ -96,6 +109,10 @@ async function readFromEnvCredentials(
   runId: string,
   window: MonitorWindow,
 ): Promise<SourceSnapshot> {
+  // Owner-gate FIRST, before even looking at whether creds exist — a non-owner tenant must
+  // see the exact same result whether or not the operator has PostHog configured.
+  if (!isPotOwnerTenant(env)) return unavailable()
+
   const projectId = env.POSTHOG_PROJECT_ID
   const key = env.POSTHOG_PERSONAL_API_KEY
   if (!projectId || !key) return unavailable()

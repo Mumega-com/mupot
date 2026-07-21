@@ -423,8 +423,10 @@ describe('PostHog marketing adapter — env-credentials fallback (no vault conne
     connectorId: null,
   }
 
+  // Owner by default so the creds/host/redirect tests below isolate what they mean to test;
+  // the owner-gate itself gets its own dedicated tests further down.
   function envWithoutConnectors(overrides: Partial<Env> = {}): Env {
-    return { TENANT_SLUG: 'tenant-a', ...overrides } as Env
+    return { TENANT_SLUG: 'tenant-a', OWNER_TENANT_SLUG: 'tenant-a', ...overrides } as Env
   }
 
   it('is unavailable and makes no fetch when env credentials are absent', async () => {
@@ -433,6 +435,50 @@ describe('PostHog marketing adapter — env-credentials fallback (no vault conne
 
     const snapshot = await createPosthogMarketingSource(RUN_ID).read(
       envWithoutConnectors(),
+      envFallbackBinding,
+      window,
+    )
+
+    expect(snapshot).toEqual({ status: 'unavailable', reason: 'source_unavailable', observations: [] })
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('is unavailable and makes no fetch when OWNER_TENANT_SLUG is not configured', async () => {
+    // Same tenant, real creds, but no owner declared for this deployment at all — must fail
+    // closed rather than assume ownership (#473 CONCERN-2).
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const snapshot = await createPosthogMarketingSource(RUN_ID).read(
+      {
+        TENANT_SLUG: 'tenant-a',
+        POSTHOG_PROJECT_ID: '436189',
+        POSTHOG_PERSONAL_API_KEY: 'k',
+        POSTHOG_HOST: 'https://us.posthog.com',
+      } as Env,
+      envFallbackBinding,
+      window,
+    )
+
+    expect(snapshot).toEqual({ status: 'unavailable', reason: 'source_unavailable', observations: [] })
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('is unavailable and makes no fetch for a non-owner tenant, even with real posthog creds present (#473 CONCERN-2)', async () => {
+    // The Worker deployment is mumega's (OWNER_TENANT_SLUG='tenant-a') but THIS request is
+    // running as a different tenant. A non-owner tenant with a posthog internal_adapter
+    // binding must never read the operator's own PostHog project.
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const snapshot = await createPosthogMarketingSource(RUN_ID).read(
+      {
+        TENANT_SLUG: 'tenant-b',
+        OWNER_TENANT_SLUG: 'tenant-a',
+        POSTHOG_PROJECT_ID: '436189',
+        POSTHOG_PERSONAL_API_KEY: 'operator-key-must-not-leak',
+        POSTHOG_HOST: 'https://us.posthog.com',
+      } as Env,
       envFallbackBinding,
       window,
     )
@@ -480,6 +526,10 @@ describe('PostHog marketing adapter — env-credentials fallback (no vault conne
     expect(init.redirect).toBe('manual')
     expect(String(init.body)).toContain('HogQLQuery')
     expect(String(init.body)).toContain('organic_sessions')
+    // #473 WARN-3: must classify organic via PostHog's own computed $search_engine
+    // property, never a hand-rolled referring-domain regex (lookalike-domain risk).
+    expect(String(init.body)).toContain('$search_engine')
+    expect(String(init.body)).not.toContain('$referring_domain')
     expect(new Headers(init.headers).get('authorization')).toBe(`Bearer ${key}`)
     expect(url).not.toContain(key)
     expect(String(init.body)).not.toContain(key)

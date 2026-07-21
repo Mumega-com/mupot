@@ -60,6 +60,15 @@ export interface Env {
   TASK_WORKFLOW?: WorkflowBinding<import('./workflows/pipeline').TaskPipelineParams>
   // vars
   TENANT_SLUG: string
+  // The tenant slug that owns THIS deployment's Worker-level operator secrets/config (as
+  // opposed to any per-tenant vault connector). Set once, in wrangler.toml [vars], to the
+  // SAME value as TENANT_SLUG for the pot's own operator deployment (e.g. "mumega") and left
+  // unset for any deployment where env-level operator creds must never be read on behalf of
+  // a tenant. Absent ⇒ no env-credentials fallback runs anywhere (fail-closed). Currently
+  // gates src/addons/marketing/adapters/posthog.ts's env-fallback path (#473 CONCERN-2) —
+  // without this, a non-owner tenant with an internal_adapter posthog binding would read the
+  // operator's own PostHog project and emit it under its own tenant's observations.
+  OWNER_TENANT_SLUG?: string
   BRAND: string
   OAUTH_PROVIDER: 'google' | 'telegram'
   // Immutable git commit for the deployed build, supplied by the release deploy.
