@@ -256,6 +256,45 @@ export async function canManageProjects(env: Env, auth: AuthContext): Promise<bo
   return (await projectAccess(env, auth)).workspaceAdmin
 }
 
+// projectManageAccessFor / canManageProject — the per-project "manage" gate
+// (issue #402). Org-admin (workspaceAdmin, resolved by projectAccess/
+// projectReadAccessFromGrants) is the superset and always passes — it is NOT
+// scoped to project_squad_access rows, matching the existing read-side
+// semantics (unrestrictedProjectRead bypasses project scoping the same way).
+// Below that, "manage" = the member has >= 'member' capability on a squad
+// (taskableSquadIds — the same threshold loadProjectWorkContext/#send already
+// uses for "can this member act through this squad") AND that squad holds a
+// project_squad_access row for this project with access_level 'write' or
+// 'admin' — the same write-or-admin threshold hasProjectWriteForSquads
+// (src/mcp/index.ts) and destinationAuthorized (src/addons/project-link/
+// service.ts) already use elsewhere in v0.24 for "manage-level project ops".
+// Fail-closed: no member id, no taskable squads, or no matching row -> false.
+async function projectManageAccessFor(env: Env, access: ProjectAccess, projectId: string): Promise<boolean> {
+  if (access.workspaceAdmin) return true
+  const squadIds = access.taskableSquadIds ?? []
+  if (squadIds.length === 0) return false
+  const placeholders = squadIds.map((_, index) => `?${index + 2}`).join(', ')
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM project_squad_access
+      WHERE project_id = ?1
+        AND squad_id IN (${placeholders})
+        AND access_level IN ('write', 'admin')
+      LIMIT 1`,
+  ).bind(projectId, ...squadIds).first()
+  return row !== null
+}
+
+/**
+ * canManageProject — per-project manage-access check for board-provider bind/sync
+ * (issue #402). Replaces the coarser pot-wide isOrgAdmin gate those routes used to
+ * share with unrelated org-admin-only surfaces: a project-scoped squad with write/
+ * admin access_level on THIS project can now bind/sync its own board without also
+ * being pot-admin, and org-admin/owner still passes (see projectManageAccessFor).
+ */
+export async function canManageProject(env: Env, auth: AuthContext, projectId: string): Promise<boolean> {
+  return projectManageAccessFor(env, await projectAccess(env, auth), projectId)
+}
+
 function jsonIds(ids: string[]): string {
   return JSON.stringify([...new Set(ids)])
 }
@@ -579,7 +618,7 @@ export async function loadProjectDetail(
   if (!project || !await isReadableProject(env, project.id, access)) return null
 
   const squads = await loadReadableSquads(env, project.id, access)
-  const [aggregates, tasks, members, parent, situation, activity, evidence, boards] = await Promise.all([
+  const [aggregates, tasks, members, parent, situation, activity, evidence, boards, canManageBoards] = await Promise.all([
     loadProjectAggregates(env, project.id, access),
     loadReadableTasks(env, project.id, access),
     loadReadableProjectMembers(env, squads.rows),
@@ -588,6 +627,7 @@ export async function loadProjectDetail(
     listProjectActivity(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
     listProjectEvidence(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
     listProjectBindings(env, project.id),
+    projectManageAccessFor(env, access, project.id),
   ])
 
   return {
@@ -604,7 +644,7 @@ export async function loadProjectDetail(
     evidence,
     canManage: access.workspaceAdmin,
     boards,
-    canManageBoards: access.workspaceAdmin,
+    canManageBoards,
   }
 }
 

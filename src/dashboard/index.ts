@@ -107,6 +107,7 @@ import { loadAllAgents, loadSquadOptions } from './agents-admin'
 import type { AgentAdminRow, SquadOption } from './agents-admin'
 import { formatBurn, formatUsd } from '../agents/cost'
 import {
+  canManageProject,
   canManageProjects,
   loadProjectDetail,
   loadProjectFlights,
@@ -366,13 +367,18 @@ dashboardApp.get('/projects/:id', async (c) => {
   return c.html(shell(c.env, view.project.name, projectDetailBody(view, c.req.query('status'))))
 })
 
-// POST /projects/:id/boards — link an external board (owner/admin).
+// POST /projects/:id/boards — link an external board. Gated on per-project
+// `manage` access (issue #402): a squad with write/admin access_level on THIS
+// project may bind its board; org-admin/owner still pass (superset, see
+// canManageProject in ./projects). Coarser pot-wide isOrgAdmin no longer gates
+// this — that let any pot-admin bind ANY project's board and blocked a
+// project-scoped squad manager from binding its own.
 dashboardApp.post('/projects/:id/boards', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) {
+  const projectId = c.req.param('id')
+  if (!await canManageProject(c.env, auth, projectId)) {
     return c.html(shell(c.env, 'Projects', projectNotFoundBody()), 403)
   }
-  const projectId = c.req.param('id')
   const view = await loadProjectDetail(c.env, auth, projectId)
   if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
   const form = await c.req.parseBody()
@@ -391,13 +397,14 @@ dashboardApp.post('/projects/:id/boards', async (c) => {
   return c.redirect(`/projects/${encodeURIComponent(projectId)}#board`)
 })
 
-// POST /projects/:id/boards/sync — import from the linked board into attributed tasks.
+// POST /projects/:id/boards/sync — import from the linked board into attributed
+// tasks. Same per-project `manage` gate as the bind route above (issue #402).
 dashboardApp.post('/projects/:id/boards/sync', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) {
+  const projectId = c.req.param('id')
+  if (!await canManageProject(c.env, auth, projectId)) {
     return c.html(shell(c.env, 'Projects', projectNotFoundBody()), 403)
   }
-  const projectId = c.req.param('id')
   const view = await loadProjectDetail(c.env, auth, projectId)
   if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
   const form = await c.req.parseBody()
