@@ -1886,6 +1886,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
         departmentId: db.departments()[0].id,
         moduleKey: 'fixture',
       }],
+      loops: [],
       manifestDigest: 'matched',
       operationId: db.operations()[0].id,
     })

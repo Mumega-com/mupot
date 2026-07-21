@@ -23,6 +23,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 const migrations = [
   '../migrations/0001_init.sql',
   '../migrations/0003_settings.sql',
+  '../migrations/0014_loops.sql',
   '../migrations/0023_connectors.sql',
   '../migrations/0029_department_microkernel.sql',
   '../migrations/0050_addons.sql',
