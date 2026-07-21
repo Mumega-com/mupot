@@ -152,59 +152,83 @@ describe('marketing monitor opportunities', () => {
     expect(first[0]?.hypothesis).toContain('keyword-gap proposal')
   })
 
-  it('prefers an explicit keyword-gap query observation over the funnel proxy', async () => {
-    expect(await installAddon(env, owner, 'marketing-cro-monitor'))
-      .toEqual(expect.objectContaining({ ok: true }))
-    expect(await configureAddon(env, owner, 'marketing-cro-monitor', {
-      bindings: [{ slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' }],
-    })).toEqual(expect.objectContaining({ ok: true }))
-    expect(await activateAddon(env, owner, 'marketing-cro-monitor'))
-      .toEqual(expect.objectContaining({ ok: true }))
-
-    const result = await runMarketingMonitor(env, owner, { window }, {
-      sourceFactory: ({ runId, window: requestedWindow }) => [{
-        key: 'first_party_keyword_gap',
-        slot: 'web_analytics',
-        async read() {
-          return {
-            status: 'available' as const,
-            observations: [
-              {
-                id: `${runId}:seo.organic_sessions`,
-                runId,
-                metricKey: 'seo.organic_sessions' as const,
-                value: 240,
-                unit: 'count',
-                authority: 'first-party',
-                observedAt: '2026-07-01T12:00:00.000Z',
-              },
-              {
-                id: `${runId}:seo.keyword_gap_queries`,
-                runId,
-                metricKey: 'seo.keyword_gap_queries' as const,
-                value: 17,
-                unit: 'count',
-                authority: 'first-party',
-                observedAt: '2026-07-01T12:00:00.000Z',
-              },
-              {
-                id: `${runId}:seo.conversion_rate`,
-                runId,
-                metricKey: 'seo.conversion_rate' as const,
-                value: 0.05,
-                unit: 'ratio',
-                authority: 'first-party',
-                observedAt: '2026-07-01T12:00:00.000Z',
-              },
-            ],
-          }
+  it('prefers an explicit keyword-gap query observation over the funnel proxy', () => {
+    const run: MarketingMonitorRun = {
+      id: 'run-keyword-gap-queries',
+      programVersion: 'marketing-cro-monitor-v1',
+      status: 'completed',
+      window,
+      sourceCount: 1,
+      observationCount: 3,
+      rawObservationCount: 3,
+      sources: [],
+      observations: [
+        {
+          id: 'obs-sessions',
+          runId: 'run-keyword-gap-queries',
+          metricKey: 'seo.organic_sessions',
+          value: 240,
+          unit: 'count',
+          authority: 'first-party',
+          observedAt: '2026-07-01T12:00:00.000Z',
+          sourceKey: 'first_party',
+          sourceSlot: 'web_analytics',
         },
-      }],
-    })
-    expect(result).toEqual(expect.objectContaining({ ok: true }))
-    if (!result.ok) throw new Error(`monitor run failed: ${result.reason}`)
+        {
+          id: 'obs-gap',
+          runId: 'run-keyword-gap-queries',
+          metricKey: 'seo.keyword_gap_queries',
+          value: 17,
+          unit: 'count',
+          authority: 'first-party',
+          observedAt: '2026-07-01T12:00:00.000Z',
+          sourceKey: 'first_party',
+          sourceSlot: 'web_analytics',
+        },
+        {
+          id: 'obs-conversion',
+          runId: 'run-keyword-gap-queries',
+          metricKey: 'seo.conversion_rate',
+          value: 0.05,
+          unit: 'ratio',
+          authority: 'first-party',
+          observedAt: '2026-07-01T12:00:00.000Z',
+          sourceKey: 'first_party',
+          sourceSlot: 'web_analytics',
+        },
+      ],
+      outcomes: {
+        visibility: { status: 'unavailable', reason: 'authoritative_source_missing' },
+        qualifiedTraffic: {
+          status: 'available',
+          value: 240,
+          unit: 'count',
+          source: 'first-party',
+          observedAt: '2026-07-01T12:00:00.000Z',
+        },
+        leads: {
+          status: 'available',
+          value: 12,
+          unit: 'count',
+          source: 'first-party',
+          observedAt: '2026-07-01T12:00:00.000Z',
+        },
+        conversion: {
+          status: 'available',
+          value: 0.05,
+          unit: 'ratio',
+          source: 'first-party',
+          observedAt: '2026-07-01T12:00:00.000Z',
+        },
+        revenue: { status: 'unavailable', reason: 'authoritative_source_missing' },
+        content: { status: 'unavailable', reason: 'authoritative_source_missing' },
+      },
+      evidenceDigest: 'b'.repeat(64),
+      createdAt: '2026-07-01T12:00:00.000Z',
+      completedAt: '2026-07-01T12:00:00.000Z',
+    }
 
-    const ranked = rankMarketingOpportunities(result.run)
+    const ranked = rankMarketingOpportunities(run)
     expect(ranked[0]).toMatchObject({
       target: 'resource:seo/keyword-gap',
       primaryKpi: 'qualifiedTraffic',

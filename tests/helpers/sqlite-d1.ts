@@ -14,6 +14,27 @@ interface RawSqliteDatabase {
   }
 }
 
+/**
+ * D1 accepts numbered placeholders (?1, ?2). Node's node:sqlite only accepts
+ * anonymous `?`. Rewrite numbered params and remap bind values by index.
+ */
+function normalizeD1Bindings(sql: string, values: readonly unknown[]): {
+  readonly sql: string
+  readonly values: readonly unknown[]
+} {
+  const paramNumbers: number[] = []
+  const rewritten = sql.replace(/\?(\d+)/g, (_match, digits: string) => {
+    paramNumbers.push(Number(digits))
+    return '?'
+  })
+  if (paramNumbers.length === 0) return { sql, values }
+  const remapped: unknown[] = []
+  for (let index = 0; index < paramNumbers.length; index += 1) {
+    remapped.push(values[paramNumbers[index] - 1])
+  }
+  return { sql: rewritten, values: remapped }
+}
+
 function result<T>(rows: T[], changes: number): D1Result<T> {
   return {
     success: true,
@@ -41,8 +62,17 @@ class SqliteD1Statement {
     return new SqliteD1Statement(this.database, this.sql, values) as unknown as D1PreparedStatement
   }
 
+  private prepared() {
+    const normalized = normalizeD1Bindings(this.sql, this.values)
+    return {
+      statement: this.database.prepare(normalized.sql),
+      values: normalized.values,
+    }
+  }
+
   async first<T = SqliteRow>(columnName?: string): Promise<T | null> {
-    const row = this.database.prepare(this.sql).get(...this.values)
+    const { statement, values } = this.prepared()
+    const row = statement.get(...values)
     if (!row) return null
     return (columnName === undefined ? row : row[columnName]) as T
   }
@@ -52,17 +82,20 @@ class SqliteD1Statement {
   }
 
   async run<T = SqliteRow>(): Promise<D1Result<T>> {
-    const info = this.database.prepare(this.sql).run(...this.values)
+    const { statement, values } = this.prepared()
+    const info = statement.run(...values)
     return result([], Number(info.changes)) as D1Result<T>
   }
 
   async raw<T = unknown[]>(): Promise<T[]> {
-    const rows = this.database.prepare(this.sql).all(...this.values)
+    const { statement, values } = this.prepared()
+    const rows = statement.all(...values)
     return rows.map((row) => Object.values(row) as T)
   }
 
   executeAll<T = SqliteRow>(): D1Result<T> {
-    const rows = this.database.prepare(this.sql).all(...this.values) as T[]
+    const { statement, values } = this.prepared()
+    const rows = statement.all(...values) as T[]
     const changesRow = this.database.prepare('SELECT changes() AS changes').get()
     return result(rows, Number(changesRow?.changes ?? 0))
   }
