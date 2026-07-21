@@ -580,6 +580,19 @@ function escapeSqliteLikeLiteral(value: string): string {
  * close path those rows linger forever (the ECC close-stale pattern). This closes
  * ungated open/in_progress mirrors for that repo+number. Never touches rows with
  * gate_owner set (gated review work is not event noise).
+ *
+ * #455 (4th instance of the #399 shape, first 3 fixed in #454): this UPDATE's SET
+ * clause never touches squad_id/project_id, so 0061's task-access trigger never
+ * fires — a bulk write here on a project-attached task would land/refresh evidence
+ * in idx_tasks_project_evidence_keyset with no per-row access check. Unlike
+ * syncCiResultToTask/syncTaskStatusFromIssue (which match rows they can't predict
+ * in advance and so need the per-row filterProjectWritableTaskIds fence), these
+ * mirror rows are always minted detached (github-routes.ts's createTask call omits
+ * project_id) — this path is only ever meant to reap that event-noise. So the fix
+ * is `AND project_id IS NULL` in the WHERE: it makes the bulk UPDATE structurally
+ * unable to touch a project-attached row (deliberately attaching a mirror opts it
+ * out of this auto-close path entirely, which is correct — it's no longer noise),
+ * closing the class without needing a per-row fence on this bulk path.
  */
 export async function closeGitHubPrMirrorTasks(
   env: Env,
@@ -596,6 +609,7 @@ export async function closeGitHubPrMirrorTasks(
     `UPDATE tasks SET status = 'done', completed_at = ?1, updated_at = ?1, result = COALESCE(result, 'github_pr_closed')
       WHERE status IN ('open', 'in_progress')
         AND gate_owner IS NULL
+        AND project_id IS NULL
         AND title LIKE ?2 ESCAPE '\\'`,
   )
     .bind(now, like)

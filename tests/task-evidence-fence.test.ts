@@ -10,6 +10,11 @@
 // (syncCiResultToTask, syncTaskStatusFromIssue, writeVerdict — src/tasks/service.ts)
 // closes that gap, using the real evidence-surface query (listProjectEvidence) as the
 // assertion — not a reimplementation of the keyset predicate.
+//
+// #455 adds the 4th instance: closeGitHubPrMirrorTasks (same SET-clause-never-touches-
+// squad_id/project_id shape). Its fix is a WHERE-clause scope (`AND project_id IS NULL`)
+// rather than the per-row filterProjectWritableTaskIds fence used by the other three —
+// see that suite below for why a scope is sufficient here.
 
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
@@ -18,6 +23,7 @@ import {
   syncCiResultToTask,
   syncTaskStatusFromIssue,
   writeVerdict,
+  closeGitHubPrMirrorTasks,
   TaskEvidenceFenceError,
 } from '../src/tasks/service'
 import { listProjectEvidence } from '../src/projects/projections'
@@ -283,5 +289,58 @@ describe('#399 — writeVerdict (verdict flip) evidence fence', () => {
 
     const result = await writeVerdict(env, { task, verdict: 'approved', note: null, decidedBy: 'member-1' })
     expect(result.task.status).toBe('approved')
+  })
+})
+
+describe('#455 — closeGitHubPrMirrorTasks project fence', () => {
+  let harness: SqliteD1Harness | undefined
+  afterEach(() => { harness?.close(); harness = undefined })
+
+  // Mirror tasks are minted DETACHED (github-routes.ts's createTask call omits
+  // project_id) with title `[GH <repo>] PR #<n> <action>: …` — see taskFromGitHubEvent.
+  function insertMirrorTask(h: SqliteD1Harness, id: string, projectId: string | null, title: string): void {
+    h.sqlite.exec(
+      `INSERT INTO tasks (id, squad_id, title, done_when, status, project_id, created_at, updated_at)
+       VALUES ('${id}', 'squad-a', '${title}', 'GitHub event resolved', 'open',
+               ${projectId ? `'${projectId}'` : 'NULL'}, '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z')`,
+    )
+  }
+
+  it('detached mirror (project_id NULL) matching title+gate_owner → still auto-closed on PR close (existing behavior preserved)', async () => {
+    harness = makeHarness()
+    insertMirrorTask(harness, 'mirror-detached', null, '[GH o/r] PR #7 opened: Fix thing')
+    const env = envFor(harness)
+
+    const res = await closeGitHubPrMirrorTasks(env, 'o/r', 7)
+    expect(res.closed).toBe(1)
+    const row = harness.sqlite.prepare('SELECT status, result, completed_at FROM tasks WHERE id = ?').get('mirror-detached') as {
+      status: string; result: string | null; completed_at: string | null
+    }
+    expect(row.status).toBe('done')
+    expect(row.result).toBe('github_pr_closed')
+    expect(row.completed_at).not.toBeNull()
+  })
+
+  it('project-ATTACHED task with the same title shape → NOT closed by this path (the #455 fix); no status/result/evidence write, even though the owning squad still holds write', async () => {
+    harness = makeHarness()
+    // Squad still has write on project-x — proves this isn't the per-row access fence
+    // (which would let a still-writable squad's row through); the WHERE-clause scope
+    // excludes ANY project-attached row from this bulk auto-close path, full stop.
+    grantAccess(harness, 'write')
+    insertMirrorTask(harness, 'mirror-attached', 'project-x', '[GH o/r] PR #7 opened: Fix thing')
+    const env = envFor(harness)
+
+    const res = await closeGitHubPrMirrorTasks(env, 'o/r', 7)
+    expect(res.closed).toBe(0)
+    const row = harness.sqlite.prepare('SELECT status, result, completed_at FROM tasks WHERE id = ?').get('mirror-attached') as {
+      status: string; result: string | null; completed_at: string | null
+    }
+    expect(row.status).toBe('open') // untouched — no partial write
+    expect(row.result).toBeNull()
+    expect(row.completed_at).toBeNull()
+    // Assert against the real evidence-surface query, not a reimplementation of the
+    // keyset predicate — the untouched `result` column means it never enters
+    // idx_tasks_project_evidence_keyset in the first place.
+    expect(await evidenceTaskResultRows(env, 'mirror-attached')).toHaveLength(0)
   })
 })

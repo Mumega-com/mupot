@@ -28,6 +28,9 @@ describe('closeGitHubPrMirrorTasks', () => {
     expect(res.closed).toBe(2)
     expect(calls[0].sql).toContain("status = 'done'")
     expect(calls[0].sql).toContain('gate_owner IS NULL')
+    // #455: bulk WHERE must exclude project-attached rows structurally — this SET
+    // clause never touches squad_id/project_id so 0061's trigger can't fence it.
+    expect(calls[0].sql).toContain('project_id IS NULL')
     expect(calls[0].sql).toContain("ESCAPE '\\'")
     expect(calls[0].args[1]).toBe('[GH Mumega-com/mupot] PR #437 %')
   })
