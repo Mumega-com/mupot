@@ -8,6 +8,7 @@ import type { Env, Task, TaskVerdict, BusEvent } from '../types'
 import { createBus } from '../bus'
 import { assertWritten } from '../lib/receipt'
 import { resolveOutboundGitHubToken } from '../integrations/github-app'
+import { hasProjectWriteForSquads } from '../projects/access'
 
 export type TaskStatus = Task['status']
 type TaskActor = NonNullable<BusEvent['actor']>
@@ -279,6 +280,69 @@ export async function validateTaskProjectAttribution(
   }
 }
 
+// #399 — evidence fence for automation write paths.
+//
+// Migration 0061 narrowed the task-access trigger (validate_tasks_project_id_update)
+// to fire only on UPDATE OF squad_id, project_id — correct for #391 (in-flight status
+// transitions must not abort just because a squad was later downgraded on a project).
+// Side effect: any automation write whose SET clause never touches those two columns
+// bypasses the trigger entirely, even when the task is project-attached. Three such
+// paths write evidence-bearing content onto a task (tasks.result feeds
+// idx_tasks_project_evidence_keyset, 0059; task_verdicts.note feeds
+// idx_task_verdicts_evidence_keyset) without ever re-checking whether the task's
+// OWNING squad (task.squad_id) still holds write/admin on task.project_id:
+// syncCiResultToTask, syncTaskStatusFromIssue, writeVerdict. Policy decision (#399):
+// a downgrade fences the squad's automation OUT of that project's evidence surface
+// immediately — it does not get to finish landing new/refreshed evidence there.
+//
+// This is the single check all three call before writing. It reuses the SAME
+// primitive the rest of v0.24 uses for per-project write access
+// (src/projects/access.ts#hasProjectWriteForSquads — the write/admin threshold used
+// by flight dispatch's #402 project-write gate) rather than re-deriving the
+// project_squad_access.access_level comparison here. Fail-closed: a thrown/unresolved
+// access lookup is treated as no access, never as a bypass.
+async function squadCanWriteProjectEvidence(
+  env: Env,
+  projectId: string | null | undefined,
+  squadId: string,
+): Promise<boolean> {
+  if (projectId === null || projectId === undefined) return true // detached task — nothing to fence
+  try {
+    return await hasProjectWriteForSquads(env, projectId, [squadId])
+  } catch {
+    return false // fail-closed
+  }
+}
+
+// Filters a batch of automation-write candidates (loaded by a non-id WHERE clause —
+// github_issue_url match, PR-number suffix match) down to the ones whose owning squad
+// may still write project evidence. Rows for detached tasks (project_id null) always
+// pass. Used by syncCiResultToTask and syncTaskStatusFromIssue, which cannot know in
+// advance which task(s) their WHERE clause will match.
+async function filterProjectWritableTaskIds(
+  env: Env,
+  rows: Array<{ id: string; project_id: string | null; squad_id: string }>,
+): Promise<string[]> {
+  const writable: string[] = []
+  for (const row of rows) {
+    if (await squadCanWriteProjectEvidence(env, row.project_id, row.squad_id)) writable.push(row.id)
+  }
+  return writable
+}
+
+// Thrown by writeVerdict when the task's owning squad no longer holds write/admin on
+// the task's project (#399). Unlike the CI-sync/issue-sync automation paths (which
+// silently skip — there is no caller waiting synchronously on a specific response),
+// the verdict endpoint is always a live caller (member/agent/IM) expecting a definite
+// result, so this surfaces as an explicit error the route layer maps to 403 rather
+// than a silent no-op that could read as "verdict recorded" when it was not.
+export class TaskEvidenceFenceError extends Error {
+  constructor(readonly taskId: string) {
+    super(`task_evidence_fenced: task ${taskId}'s owning squad no longer holds write access to its project`)
+    this.name = 'TaskEvidenceFenceError'
+  }
+}
+
 function mapTaskProjectInsertError(error: unknown): never {
   const message = error instanceof Error ? error.message : String(error)
   if (message.includes('task project not found')) throw new TaskProjectError('project_not_found')
@@ -465,22 +529,38 @@ export async function syncTaskStatusFromIssue(
 ): Promise<{ updated: boolean }> {
   if (!issueUrl) return { updated: false }
   const now = new Date().toISOString()
+  const matchStatuses = action === 'closed' ? ['open', 'in_progress'] : ['done']
+
+  // #399: this write's SET clause never touches squad_id/project_id, so 0061's
+  // narrowed trigger does not fire — re-check per-row before touching a
+  // project-attached task whose owning squad may have been downgraded since.
+  // A closed→done flip also bumps completed_at, which reorders a task already
+  // carrying a result within the evidence keyset; fencing the whole row (not
+  // just a hypothetical result field) is what "don't refresh evidence" requires.
+  const candidates = await env.DB.prepare(
+    `SELECT id, project_id, squad_id FROM tasks
+      WHERE github_issue_url = ? AND status IN (${matchStatuses.map(() => '?').join(', ')})`,
+  ).bind(issueUrl, ...matchStatuses).all<{ id: string; project_id: string | null; squad_id: string }>()
+  const writableIds = await filterProjectWritableTaskIds(env, candidates.results ?? [])
+  if (writableIds.length === 0) return { updated: false }
+  const idList = writableIds.map(() => '?').join(', ')
+
   if (action === 'closed') {
     // open/in_progress → done. Leave review/approved/rejected/done untouched.
     const res = await env.DB.prepare(
-      `UPDATE tasks SET status = 'done', completed_at = ?1, updated_at = ?1
-        WHERE github_issue_url = ?2 AND status IN ('open','in_progress')`,
+      `UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ?
+        WHERE status IN ('open','in_progress') AND id IN (${idList})`,
     )
-      .bind(now, issueUrl)
+      .bind(now, now, ...writableIds)
       .run()
     return { updated: Boolean(res.meta?.changes && res.meta.changes > 0) }
   }
   // reopened: done → open (only if it was closed by us). Never touch gate states.
   const res = await env.DB.prepare(
-    `UPDATE tasks SET status = 'open', completed_at = NULL, updated_at = ?1
-      WHERE github_issue_url = ?2 AND status = 'done'`,
+    `UPDATE tasks SET status = 'open', completed_at = NULL, updated_at = ?
+      WHERE status = 'done' AND id IN (${idList})`,
   )
-    .bind(now, issueUrl)
+    .bind(now, ...writableIds)
     .run()
   return { updated: Boolean(res.meta?.changes && res.meta.changes > 0) }
 }
@@ -542,21 +622,35 @@ export async function syncCiResultToTask(
   // LIKE on the PR-number suffix; bound param (no injection). The '%/pull/N' shape is what
   // openPullRequest stores. ESCAPE not needed — prNumber is an integer.
   const suffix = `%/pull/${prNumber}`
+  const matchStatuses = failed ? ['review'] : ['review', 'in_progress', 'open']
+
+  // #399: this write's SET clause never touches squad_id/project_id, so 0061's
+  // narrowed trigger does not fire — re-check per-row before writing `result`
+  // (evidence-bearing, idx_tasks_project_evidence_keyset) onto a project-attached
+  // task whose owning squad may have been downgraded since the PR was opened.
+  const candidates = await env.DB.prepare(
+    `SELECT id, project_id, squad_id FROM tasks
+      WHERE github_issue_url LIKE ? AND status IN (${matchStatuses.map(() => '?').join(', ')})`,
+  ).bind(suffix, ...matchStatuses).all<{ id: string; project_id: string | null; squad_id: string }>()
+  const writableIds = await filterProjectWritableTaskIds(env, candidates.results ?? [])
+  if (writableIds.length === 0) return { updated: false }
+  const idList = writableIds.map(() => '?').join(', ')
+
   if (failed) {
     const res = await env.DB.prepare(
-      `UPDATE tasks SET result = ?1, status = 'in_progress', updated_at = ?2
-        WHERE github_issue_url LIKE ?3 AND status = 'review'`,
+      `UPDATE tasks SET result = ?, status = 'in_progress', updated_at = ?
+        WHERE status = 'review' AND id IN (${idList})`,
     )
-      .bind(note, now, suffix)
+      .bind(note, now, ...writableIds)
       .run()
     return { updated: Boolean(res.meta?.changes && res.meta.changes > 0) }
   }
   // success/neutral/skipped: record the note without changing a gate state.
   const res = await env.DB.prepare(
-    `UPDATE tasks SET result = ?1, updated_at = ?2
-      WHERE github_issue_url LIKE ?3 AND status IN ('review','in_progress','open')`,
+    `UPDATE tasks SET result = ?, updated_at = ?
+      WHERE status IN ('review','in_progress','open') AND id IN (${idList})`,
   )
-    .bind(note, now, suffix)
+    .bind(note, now, ...writableIds)
     .run()
   return { updated: Boolean(res.meta?.changes && res.meta.changes > 0) }
 }
@@ -767,6 +861,15 @@ export async function writeVerdict(
 ): Promise<{ task: Task; verdict: TaskVerdict }> {
   const now = new Date().toISOString()
   const newStatus: TaskStatus = input.verdict === 'approved' ? 'approved' : 'rejected'
+
+  // #399: like the UPDATEs below, this write's SET/INSERT never touches
+  // squad_id/project_id, so 0061's narrowed trigger never fires for it. Re-check
+  // before writing the verdict note (evidence-bearing, feeds
+  // idx_task_verdicts_evidence_keyset) onto a project-attached task whose owning
+  // squad may no longer hold write/admin on that project.
+  if (!(await squadCanWriteProjectEvidence(env, input.task.project_id, input.task.squad_id))) {
+    throw new TaskEvidenceFenceError(input.task.id)
+  }
 
   // K5 step 1: conditional UPDATE — only succeeds while the task is still 'review'.
   // meta.changes === 0 means another concurrent verdict already won the race.

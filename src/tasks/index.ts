@@ -23,7 +23,7 @@ import { requireAuth } from '../auth'
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin } from '../auth/capability'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
@@ -1045,6 +1045,11 @@ tasksApp.post('/:id/verdict', async (c) => {
     if (err instanceof VerdictRaceError) {
       // K5: concurrent verdict won the race — task is no longer in 'review'.
       return c.json({ error: 'verdict_conflict', reason: 'task status changed concurrently; reload and retry' }, 409)
+    }
+    if (err instanceof TaskEvidenceFenceError) {
+      // #399: the task's owning squad no longer holds write/admin on its project —
+      // fence the verdict rather than let it land in the project's evidence feed.
+      return c.json({ error: 'project_access_forbidden', need: 'project_write' }, 403)
     }
     throw err // propagate unexpected errors (5xx)
   }
