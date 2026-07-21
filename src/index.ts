@@ -55,6 +55,7 @@ import { inboxApp } from './agents/inbox-routes'
 import { coordinationApp } from './coordination/routes'
 import { addonsApp } from './addons/routes'
 import { projectLinkApp } from './addons/project-link/routes'
+import { presenceApp } from './registry/presence-routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -148,6 +149,12 @@ app.route('/api/addons', addonsApp)
 // Signed cross-pot project delivery. Authentication is the paired Ed25519 link;
 // every accepted action is reauthorized against this pot's project/squad edge.
 app.route('/api/project-links', projectLinkApp)
+
+// Module Kernel Port 1: project-scoped presence roster (read-only HTTP mirror of the
+// MCP presence_* tools, src/mcp/presence.ts) for non-MCP callers like the Hermes
+// daemon. Member-bearer auth, self-scoped for the mutating tools (MCP only — this
+// route is read-only). Before the dashboard '/' catch-all.
+app.route('/api/presence', presenceApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp

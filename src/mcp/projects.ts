@@ -73,7 +73,11 @@ function workspaceAdmin(auth: AuthContext): boolean {
   return hasCapability(auth.capabilities, 'org', null, 'admin')
 }
 
-function readAccess(auth: AuthContext): ProjectReadAccess {
+// Exported so sibling MCP tool modules (src/mcp/presence.ts — project-scoped presence
+// read) reuse the SAME project-visibility primitive instead of re-deriving an authz
+// path. readAccess + readableProject stay the one "can this caller read project X"
+// chokepoint for the MCP surface.
+export function readAccess(auth: AuthContext): ProjectReadAccess {
   return projectReadAccessFromGrants(auth, auth.capabilities ?? [])
 }
 
@@ -89,7 +93,7 @@ async function projectionReadableSquads(
   return resolveReadableSquadIds(env, access.squadIds, access.departmentIds)
 }
 
-async function readableProject(env: Env, projectId: string, access: ProjectReadAccess): Promise<Project | null> {
+export async function readableProject(env: Env, projectId: string, access: ProjectReadAccess): Promise<Project | null> {
   const visibility = projectVisibilityClause(access)
   return env.DB.prepare(
     `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
