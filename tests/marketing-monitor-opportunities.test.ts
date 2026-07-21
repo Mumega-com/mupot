@@ -40,6 +40,7 @@ const migrations = [
   '../migrations/0011_meter_cost.sql',
   '../migrations/0012_workflow_pipeline.sql',
   '../migrations/0013_outbound_acts.sql',
+  '../migrations/0014_loops.sql',
   '../migrations/0016_presence.sql',
   '../migrations/0017_flights.sql',
   '../migrations/0019_agent_token_binding.sql',

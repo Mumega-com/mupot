@@ -8,6 +8,7 @@ import {
 import type { AddonManifestV1 } from '../contract'
 import { registerAddonConsoleRenderer } from '../console-registry'
 import { registerAddon } from '../registry'
+import { registerLoopTemplate, websiteOpportunityReviewTemplate } from '../../loops/templates'
 
 const DASHBOARD_READER = { id: 'addon-console', role: 'admin' as const }
 
@@ -66,5 +67,7 @@ registerAddonConsoleRenderer({
     return marketingCroMonitorBody(view)
   },
 })
+
+registerLoopTemplate('website-opportunity-review', websiteOpportunityReviewTemplate)
 
 await registerAddon(MarketingCroMonitorAddon)

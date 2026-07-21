@@ -18,6 +18,9 @@ import {
   type AddonBindingFailureReason,
   type AddonBindingInput,
 } from './bindings'
+import { getLoop, insertLoopIfAbsent } from '../loops/service'
+import { getLoopTemplate } from '../loops/templates'
+import type { LoopManifest } from '../loops/manifest'
 
 export type AddonState = 'installed' | 'configured' | 'active' | 'disabled' | 'archived'
 
@@ -980,6 +983,12 @@ function selectTransitionStatement(
   )
 }
 
+// resource_type = 'department' is explicit here (not the historical "everything in this
+// table is a department" assumption) because addon_resource_ownership now also carries
+// resource_type = 'loop' rows (see loadLoopClaims below, #471). Every department-specific
+// helper below (loadPersistedClaimedDepartment, reconcileDepartmentForOwnership, ...)
+// assumes every row it sees is a department claim — narrowing the query here, once, keeps
+// that assumption true without touching each of those call sites.
 async function loadDepartmentClaims(
   env: Env,
   installationId: string,
@@ -991,10 +1000,391 @@ async function loadDepartmentClaims(
            resource_key, ownership_mode, preserve_on_release, active, created_at, released_at
       FROM addon_resource_ownership
      WHERE installation_id = ?1
+       AND resource_type = 'department'
        ${activePredicate}
      ORDER BY resource_key ASC, id ASC
   `).bind(installationId).all<OwnershipRow>()
   return result.results ?? []
+}
+
+// ── Loop claims (parallel to department claims above, #471) ──────────────────────
+//
+// A loop declared in an addon manifest (manifest.loops[]) is claimed the SAME way a
+// department is: an addon_resource_ownership row (resource_type='loop', resource_key=
+// templateKey, resource_id=the loops.id) tracks who owns it, so disable/archive can find
+// and release it. Unlike departments, a loop resource is never SHARED across
+// installations (ownership_mode='exclusive', enforced by idx_addon_exclusive_resource) —
+// there is no ref-counting/reconciliation analog to reconcileDepartmentForOwnership,
+// which keeps this half much smaller than the department machinery it mirrors.
+async function loadLoopClaims(
+  env: Env,
+  installationId: string,
+  activeOnly = false,
+): Promise<OwnershipRow[]> {
+  const activePredicate = activeOnly ? 'AND active = 1' : ''
+  const result = await env.DB.prepare(`
+    SELECT id, tenant, installation_id, resource_type, resource_id,
+           resource_key, ownership_mode, preserve_on_release, active, created_at, released_at
+      FROM addon_resource_ownership
+     WHERE installation_id = ?1
+       AND resource_type = 'loop'
+       ${activePredicate}
+     ORDER BY resource_key ASC, id ASC
+  `).bind(installationId).all<OwnershipRow>()
+  return result.results ?? []
+}
+
+async function loadLoopClaim(
+  env: Env,
+  installationId: string,
+  templateKey: string,
+): Promise<OwnershipRow | null> {
+  const result = await env.DB.prepare(`
+    SELECT id, tenant, installation_id, resource_type, resource_id,
+           resource_key, ownership_mode, preserve_on_release, active, created_at, released_at
+      FROM addon_resource_ownership
+     WHERE installation_id = ?1 AND resource_type = 'loop' AND resource_key = ?2
+     ORDER BY id ASC
+  `).bind(installationId, templateKey).all<OwnershipRow>()
+  const rows = result.results ?? []
+  if (rows.length > 1) throw new Error('duplicate addon loop ownership')
+  return rows[0] ?? null
+}
+
+function validatePersistedLoopClaimIdentity(
+  env: Env,
+  installationId: string,
+  claim: OwnershipRow,
+): void {
+  if (
+    claim.tenant !== env.TENANT_SLUG
+    || claim.installation_id !== installationId
+    || claim.resource_type !== 'loop'
+    || claim.resource_id.length === 0
+    || claim.resource_key.length === 0
+    || claim.ownership_mode !== 'exclusive'
+  ) {
+    throw new Error('addon persisted loop ownership identity mismatch')
+  }
+}
+
+/** Fetch the canonical loop row a claim points at. Throws if it is missing — a claim
+ *  whose loop row does not exist is a broken invariant, never a silent null. */
+async function loadClaimedLoopRow(env: Env, claim: OwnershipRow): Promise<LoopManifest> {
+  const loop = await getLoop(env, claim.resource_id)
+  if (!loop) throw new Error('addon loop canonical row missing')
+  return loop
+}
+
+function validateLoopClaim(
+  env: Env,
+  installationId: string,
+  templateKey: string,
+  loop: LoopManifest,
+  claim: OwnershipRow,
+): void {
+  if (
+    claim.tenant !== env.TENANT_SLUG
+    || claim.installation_id !== installationId
+    || claim.resource_type !== 'loop'
+    || claim.resource_key !== templateKey
+    || claim.resource_id !== loop.id
+    || claim.ownership_mode !== 'exclusive'
+    || (claim.preserve_on_release !== 0 && claim.preserve_on_release !== 1)
+  ) {
+    throw new Error('addon loop ownership identity mismatch')
+  }
+}
+
+/**
+ * ensureLoopRow — idempotently materialize the loops row a claim's resource_id
+ * reserves. Called AFTER the claim exists (see ensureLoopClaim) so a mid-activation
+ * crash between "claim written" and "loop row written" self-heals on retry: the claim
+ * is found, this is called again with the SAME loopId, and insertLoopIfAbsent's
+ * INSERT OR IGNORE makes the second attempt a safe no-op.
+ */
+async function ensureLoopRow(
+  env: Env,
+  loopId: string,
+  templateKey: string,
+  installation: AddonInstallation,
+): Promise<LoopManifest> {
+  const factory = getLoopTemplate(templateKey)
+  if (!factory) throw new Error('addon loop template is not registered')
+  const spec = factory({ installationId: installation.id, addonKey: installation.addonKey })
+  const result = await insertLoopIfAbsent(env, loopId, 'paused', spec)
+  if (!result.ok) throw new Error(`addon loop spec invalid: ${result.error}`)
+  return result.value
+}
+
+/**
+ * ensureLoopClaim — the loop-side counterpart to ensureDepartmentClaim. Idempotent:
+ * - an existing ACTIVE claim is repaired (loop row re-materialized if somehow missing)
+ *   and returned as-is — no new loop row, no new claim, on replay.
+ * - an existing INACTIVE claim (e.g. released by a prior disable) is reactivated onto
+ *   the SAME loop row/id — never mints a second loop for the same template.
+ * - no claim yet: mint a loopId, insert the claim FIRST (fenced to this operation's
+ *   lease — the SAME replay-safety contract ensureDepartmentClaim uses), THEN
+ *   materialize the loop row for that id. Ordering matters: once the claim exists, the
+ *   loop's identity is durably reserved, so a crash before the loop row is written is
+ *   safe to retry (ensureLoopRow is idempotent-by-id) and can never produce a duplicate
+ *   loop for the same claim.
+ */
+async function ensureLoopClaim(
+  env: Env,
+  installation: AddonInstallation,
+  operation: OperationRow,
+  loopDecl: { templateKey: string; defaultState: 'disabled' | 'active'; approvalRequired: boolean },
+  _deps: AddonLifecycleDeps,
+): Promise<OwnershipRow> {
+  const expectedStates = [installation.state, installation.state] as const
+  await renewOperationLease(env, operation, expectedStates)
+  const templateKey = loopDecl.templateKey
+  const existing = await loadLoopClaim(env, installation.id, templateKey)
+  let claim: OwnershipRow
+
+  if (existing) {
+    validatePersistedLoopClaimIdentity(env, installation.id, existing)
+    if (existing.active === 1) {
+      await ensureLoopRow(env, existing.resource_id, templateKey, installation)
+      const loop = await loadClaimedLoopRow(env, existing)
+      validateLoopClaim(env, installation.id, templateKey, loop, existing)
+      claim = existing
+    } else {
+      const now = leaseWindow().now
+      const result = await env.DB.prepare(`
+        UPDATE addon_resource_ownership
+           SET active = 1, released_at = NULL
+         WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
+           AND resource_type = 'loop' AND resource_id = ?4
+           AND resource_key = ?5 AND ownership_mode = 'exclusive' AND active = 0
+           AND EXISTS (
+             SELECT 1 FROM addon_operations AS fenced
+              WHERE fenced.id = ?6 AND fenced.tenant = ?2 AND fenced.installation_id = ?3
+                AND fenced.action = 'activate' AND fenced.target_state = 'active'
+                AND fenced.current_step = ?7 AND fenced.status = 'running'
+                AND fenced.actor_id = ?8 AND fenced.lease_token = ?9
+                AND fenced.lease_expires_at > ?10
+           )
+           AND EXISTS (
+             SELECT 1 FROM addon_installations AS installation
+              WHERE installation.id = ?3 AND installation.tenant = ?2
+                AND installation.state IN (?11, ?12)
+           )
+      `).bind(
+        existing.id,
+        env.TENANT_SLUG,
+        installation.id,
+        existing.resource_id,
+        templateKey,
+        operation.id,
+        operation.current_step,
+        operation.actor_id,
+        operation.lease_token,
+        now,
+        expectedStates[0],
+        expectedStates[1],
+      ).run()
+      if (!written(result)) throw new FenceLostError()
+      const reactivated = await loadOwnershipClaimById(env, installation.id, existing.id)
+      if (!reactivated || reactivated.active !== 1) throw new FenceLostError()
+      await ensureLoopRow(env, reactivated.resource_id, templateKey, installation)
+      claim = reactivated
+    }
+  } else {
+    const loopId = crypto.randomUUID()
+    const createdAt = leaseWindow().now
+    const claimId = crypto.randomUUID()
+    const result = await env.DB.prepare(`
+      INSERT INTO addon_resource_ownership (
+        id, tenant, installation_id, resource_type, resource_id,
+        resource_key, ownership_mode, preserve_on_release, active, created_at
+      )
+      SELECT ?1, ?2, ?3, 'loop', ?4, ?5, 'exclusive', 0, 1, ?6
+       WHERE EXISTS (
+         SELECT 1 FROM addon_operations AS fenced
+          WHERE fenced.id = ?7 AND fenced.tenant = ?2 AND fenced.installation_id = ?3
+            AND fenced.action = 'activate' AND fenced.target_state = 'active'
+            AND fenced.current_step = ?8 AND fenced.status = 'running'
+            AND fenced.actor_id = ?9 AND fenced.lease_token = ?10
+            AND fenced.lease_expires_at > ?11
+       )
+       AND EXISTS (
+         SELECT 1 FROM addon_installations AS installation
+          WHERE installation.id = ?3 AND installation.tenant = ?2
+            AND installation.state IN (?12, ?13)
+       )
+    `).bind(
+      claimId,
+      env.TENANT_SLUG,
+      installation.id,
+      loopId,
+      templateKey,
+      createdAt,
+      operation.id,
+      operation.current_step,
+      operation.actor_id,
+      operation.lease_token,
+      createdAt,
+      expectedStates[0],
+      expectedStates[1],
+    ).run()
+    if (!written(result)) throw new FenceLostError()
+    const inserted = await loadOwnershipClaimById(env, installation.id, claimId)
+    if (!inserted || inserted.active !== 1) throw new FenceLostError()
+    // The claim is now durably reserved for loopId — safe to materialize the row.
+    await ensureLoopRow(env, loopId, templateKey, installation)
+    claim = inserted
+  }
+
+  await renewOperationLease(env, operation, expectedStates)
+  return claim
+}
+
+async function validateLoopClaimSet(
+  env: Env,
+  installation: AddonInstallation,
+  entry: AddonCatalogEntry,
+  claims: OwnershipRow[],
+  requireExact: boolean,
+): Promise<void> {
+  for (const claim of claims) {
+    const declared = entry.manifest.loops.find(
+      (loop) => loop.templateKey === claim.resource_key,
+    )
+    if (!declared) throw new Error('active addon loop claim is not declared by the manifest')
+    const loop = await loadClaimedLoopRow(env, claim)
+    validateLoopClaim(env, installation.id, declared.templateKey, loop, claim)
+  }
+
+  if (requireExact) {
+    if (claims.length !== entry.manifest.loops.length) {
+      throw new Error('addon loop claim set does not match the manifest')
+    }
+    for (const loop of entry.manifest.loops) {
+      const matches = claims.filter((claim) => claim.resource_key === loop.templateKey)
+      if (matches.length !== 1) {
+        throw new Error('addon loop claim is missing or duplicated')
+      }
+    }
+  }
+}
+
+async function validateActiveLoopClaims(
+  env: Env,
+  installation: AddonInstallation,
+  entry: AddonCatalogEntry,
+  requireExact = installation.state === 'active',
+): Promise<OwnershipRow[]> {
+  const claims = await loadLoopClaims(env, installation.id, true)
+  await validateLoopClaimSet(env, installation, entry, claims, requireExact)
+  return claims
+}
+
+/** Identity-only validation of this installation's active loop claims (no manifest
+ *  cross-check — used from disableAddon, where the manifest is not loaded). Mirrors
+ *  validatePersistedActiveDepartmentClaims's identity half; the activation-evidence
+ *  crosscheck lives in assertClaimsMatchActivationEvidence (shared, combined below). */
+async function validatePersistedActiveLoopClaims(
+  env: Env,
+  installation: AddonInstallation,
+): Promise<OwnershipRow[]> {
+  const claims = await loadLoopClaims(env, installation.id, true)
+  const resourceKeys = new Set<string>()
+  for (const claim of claims) {
+    validatePersistedLoopClaimIdentity(env, installation.id, claim)
+    if (resourceKeys.has(claim.resource_key)) {
+      throw new Error('addon persisted loop ownership is duplicated')
+    }
+    resourceKeys.add(claim.resource_key)
+    const loop = await loadClaimedLoopRow(env, claim)
+    validateLoopClaim(env, installation.id, claim.resource_key, loop, claim)
+  }
+  return claims
+}
+
+/** All-time (active or released) loop claims for a disabled installation — mirrors
+ *  loadPersistedDisabledDepartmentClaims. No reconciliation step: a loop has no shared-
+ *  ownership flip to make (unlike a department, which may still be owned by a sibling
+ *  installation), so identity validation is the whole job. */
+async function loadPersistedDisabledLoopClaims(
+  env: Env,
+  installation: AddonInstallation,
+): Promise<OwnershipRow[]> {
+  const claims = await loadLoopClaims(env, installation.id)
+  if (claims.some((claim) => claim.active === 1)) {
+    throw new Error('active addon loop ownership remains after disable')
+  }
+  const resourceKeys = new Set<string>()
+  for (const claim of claims) {
+    validatePersistedLoopClaimIdentity(env, installation.id, claim)
+    if (resourceKeys.has(claim.resource_key)) {
+      throw new Error('addon persisted loop ownership is duplicated')
+    }
+    resourceKeys.add(claim.resource_key)
+    const loop = await loadClaimedLoopRow(env, claim)
+    validateLoopClaim(env, installation.id, claim.resource_key, loop, claim)
+  }
+  return claims
+}
+
+/**
+ * releaseLoopClaim — the loop-side counterpart to releaseDepartmentClaim, minus the
+ * "deactivate the shared resource if unowned" half (a loop's own status is untouched by
+ * addon lifecycle — out of scope, see #471 PR notes). This exists so disable/archive can
+ * find and release ownership; it is what keeps archiveAddon's "no active claims remain"
+ * trigger (addon_installations_archive_requires_released_ownership) satisfiable once an
+ * addon has ever claimed a loop.
+ */
+async function releaseLoopClaim(
+  env: Env,
+  installationId: string,
+  operation: OperationRow,
+  claim: OwnershipRow,
+  _deps: AddonLifecycleDeps,
+): Promise<void> {
+  await loadClaimedLoopRow(env, claim) // canonical row must still exist
+  await renewOperationLease(env, operation, ['disabled', 'disabled'])
+
+  const now = leaseWindow().now
+  const result = await env.DB.prepare(`
+    UPDATE addon_resource_ownership
+       SET active = 0, released_at = ?1
+     WHERE id = ?2 AND tenant = ?3 AND installation_id = ?4
+       AND resource_type = 'loop' AND resource_id = ?5
+       AND resource_key = ?6 AND ownership_mode = 'exclusive' AND active = 1
+       AND EXISTS (
+         SELECT 1 FROM addon_operations AS operation
+          WHERE operation.id = ?7 AND operation.tenant = ?3
+            AND operation.installation_id = ?4
+            AND operation.action = 'disable' AND operation.target_state = 'disabled'
+            AND operation.current_step = ?8 AND operation.status = 'running'
+            AND operation.actor_id = ?9 AND operation.lease_token = ?10
+            AND operation.lease_expires_at > ?11
+       )
+       AND EXISTS (
+         SELECT 1 FROM addon_installations AS installation
+          WHERE installation.id = ?4 AND installation.tenant = ?3
+            AND installation.state = 'disabled'
+       )
+  `).bind(
+    now,
+    claim.id,
+    env.TENANT_SLUG,
+    installationId,
+    claim.resource_id,
+    claim.resource_key,
+    operation.id,
+    operation.current_step,
+    operation.actor_id,
+    operation.lease_token,
+    now,
+  ).run()
+  if (!written(result)) {
+    await renewOperationLease(env, operation, ['disabled', 'disabled'])
+    const raced = await loadOwnershipClaimById(env, installationId, claim.id)
+    if (!raced || raced.active !== 0) throw new Error('addon loop ownership release failed')
+  }
 }
 
 async function loadDepartmentClaim(
@@ -1294,6 +1684,9 @@ async function validateActiveDepartmentClaims(
   return claims
 }
 
+/** Identity-only validation of this installation's active department claims (no
+ *  activation-evidence crosscheck — that is now shared across resource types, see
+ *  assertClaimsMatchActivationEvidence + validatePersistedActiveClaims below, #471). */
 async function validatePersistedActiveDepartmentClaims(
   env: Env,
   installation: AddonInstallation,
@@ -1314,33 +1707,63 @@ async function validatePersistedActiveDepartmentClaims(
     )
     validateDepartmentClaim(env, installation.id, claim.resource_key, department, claim)
   }
-  if (installation.state === 'active') {
-    const receipt = await env.DB.prepare(`
-      SELECT side_effect_ids, checks
-        FROM addon_receipts
-       WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
-         AND action = 'activate' AND previous_state = ?5 AND next_state = 'active'
-         AND actor_id = ?4 AND outcome = 'pass'
-       LIMIT 1
-    `).bind(
-      installation.latestReceiptId,
-      env.TENANT_SLUG,
-      installation.id,
-      installation.latestActorId,
-      installation.latestPreviousState,
-    ).first<Pick<ReceiptRow, 'side_effect_ids' | 'checks'>>()
-    if (!receipt) throw new Error('addon activation receipt evidence is missing')
-    if (typeof parseChecks(receipt.checks).operationId === 'string') {
-      const expectedClaimIds = parseStringArray(receipt.side_effect_ids).sort()
-      const activeClaimIds = claims.map((claim) => claim.id).sort()
-      if (
-        expectedClaimIds.length !== activeClaimIds.length
-        || expectedClaimIds.some((id, index) => id !== activeClaimIds[index])
-      ) {
-        throw new Error('addon active claims do not match persisted activation evidence')
-      }
+  return claims
+}
+
+/**
+ * assertClaimsMatchActivationEvidence — when the installation is 'active', the CURRENT
+ * set of active ownership claims (department + loop, merged by the caller) must match
+ * the claim ids the activation receipt recorded as its side effects. Extracted from
+ * validatePersistedActiveDepartmentClaims (#471) so it operates on the full merged
+ * claim set instead of department claims alone — activateAddon now writes BOTH kinds of
+ * claim ids into the same receipt's side_effect_ids, so the crosscheck must see both.
+ */
+async function assertClaimsMatchActivationEvidence(
+  env: Env,
+  installation: AddonInstallation,
+  claims: OwnershipRow[],
+): Promise<void> {
+  if (installation.state !== 'active') return
+  const receipt = await env.DB.prepare(`
+    SELECT side_effect_ids, checks
+      FROM addon_receipts
+     WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
+       AND action = 'activate' AND previous_state = ?5 AND next_state = 'active'
+       AND actor_id = ?4 AND outcome = 'pass'
+     LIMIT 1
+  `).bind(
+    installation.latestReceiptId,
+    env.TENANT_SLUG,
+    installation.id,
+    installation.latestActorId,
+    installation.latestPreviousState,
+  ).first<Pick<ReceiptRow, 'side_effect_ids' | 'checks'>>()
+  if (!receipt) throw new Error('addon activation receipt evidence is missing')
+  if (typeof parseChecks(receipt.checks).operationId === 'string') {
+    const expectedClaimIds = parseStringArray(receipt.side_effect_ids).sort()
+    const activeClaimIds = claims.map((claim) => claim.id).sort()
+    if (
+      expectedClaimIds.length !== activeClaimIds.length
+      || expectedClaimIds.some((id, index) => id !== activeClaimIds[index])
+    ) {
+      throw new Error('addon active claims do not match persisted activation evidence')
     }
   }
+}
+
+/** Combined department + loop identity validation, then the activation-evidence
+ *  crosscheck against the MERGED set. This is what disableAddon calls — it does not
+ *  have (or need) the manifest, unlike validateActiveDepartmentClaims/
+ *  validateActiveLoopClaims, which activateAddon uses and which DO cross-check against
+ *  entry.manifest.{departments,loops}. */
+async function validatePersistedActiveClaims(
+  env: Env,
+  installation: AddonInstallation,
+): Promise<OwnershipRow[]> {
+  const departmentClaims = await validatePersistedActiveDepartmentClaims(env, installation)
+  const loopClaims = await validatePersistedActiveLoopClaims(env, installation)
+  const claims = [...departmentClaims, ...loopClaims]
+  await assertClaimsMatchActivationEvidence(env, installation, claims)
   return claims
 }
 
@@ -2506,6 +2929,7 @@ export async function activateAddon(
   if (existing.state === 'active') {
     try {
       await validateActiveDepartmentClaims(env, existing, entry)
+      await validateActiveLoopClaims(env, existing, entry)
     } catch {
       return { ok: false, reason: 'write_failed' }
     }
@@ -2518,6 +2942,7 @@ export async function activateAddon(
   }
   try {
     await validateActiveDepartmentClaims(env, existing, entry)
+    await validateActiveLoopClaims(env, existing, entry)
   } catch {
     return { ok: false, reason: 'write_failed' }
   }
@@ -2540,9 +2965,9 @@ export async function activateAddon(
     }
     operation = acquired.operation
 
-    const claims: OwnershipRow[] = []
+    const departmentClaims: OwnershipRow[] = []
     for (const department of entry.manifest.departments) {
-      claims.push(await ensureDepartmentClaim(
+      departmentClaims.push(await ensureDepartmentClaim(
         env,
         existing,
         operation,
@@ -2550,7 +2975,18 @@ export async function activateAddon(
         deps,
       ))
     }
-    await validateDepartmentClaimSet(env, existing, entry, claims, true, 1)
+    await validateDepartmentClaimSet(env, existing, entry, departmentClaims, true, 1)
+
+    const loopClaims: OwnershipRow[] = []
+    for (const loop of entry.manifest.loops) {
+      loopClaims.push(await ensureLoopClaim(env, existing, operation, loop, deps))
+    }
+    await validateLoopClaimSet(env, existing, entry, loopClaims, true)
+
+    // Merged for the transition guard below: it verifies "every currently-active
+    // ownership claim for this installation is one we expect" without caring about
+    // resource_type, so department + loop claims are checked together (#471).
+    const claims = [...departmentClaims, ...loopClaims]
 
     await setOperationStep(
       env,
@@ -2584,10 +3020,15 @@ export async function activateAddon(
       authorityRequests: 'empty',
       connectorRequirements: 'preflight_passed',
       bindingCount: bindingPreflight.bindings.length,
-      departments: claims.map((claim) => ({
+      departments: departmentClaims.map((claim) => ({
         claimId: claim.id,
         departmentId: claim.resource_id,
         moduleKey: claim.resource_key,
+      })),
+      loops: loopClaims.map((claim) => ({
+        claimId: claim.id,
+        loopId: claim.resource_id,
+        templateKey: claim.resource_key,
       })),
       manifestDigest: 'matched',
       operationId: operation.id,
@@ -2759,6 +3200,7 @@ export async function disableAddon(
         return { ok: false, reason: 'fence_lost' }
       }
       await repairAndValidatePersistedDisabledDepartmentClaims(env, existing)
+      await loadPersistedDisabledLoopClaims(env, existing)
       const confirmedEvidence = await loadCompletedDisableOperationEvidence(env, existing)
       if (!confirmedEvidence || confirmedEvidence.id !== evidence.id) {
         return { ok: false, reason: 'fence_lost' }
@@ -2781,7 +3223,7 @@ export async function disableAddon(
   }
   if (existing.state !== 'disabled') {
     try {
-      await validatePersistedActiveDepartmentClaims(env, existing)
+      await validatePersistedActiveClaims(env, existing)
     } catch {
       return { ok: false, reason: 'write_failed' }
     }
@@ -2808,7 +3250,7 @@ export async function disableAddon(
     if (existing.state !== 'disabled') {
       if (operation.current_step !== 'disable_state') throw new FenceLostError()
       const previousState = existing.state
-      const activeClaims = await validatePersistedActiveDepartmentClaims(env, existing)
+      const activeClaims = await validatePersistedActiveClaims(env, existing)
       const receiptId = crypto.randomUUID()
       const transitionTiming = leaseWindow()
       const disabledAt = transitionTiming.now
@@ -2974,6 +3416,43 @@ export async function disableAddon(
       expectedStates: ['disabled', 'disabled'],
     })
 
+    // ── Loop claims teardown (#471) — mirrors the department loop above, minus the
+    // "deactivate the shared resource" half (no analog for an exclusively-owned loop).
+    if (operation.current_step.startsWith('disable_loop_claim:')) {
+      const pendingLoopClaim = await loadOwnershipClaimById(
+        env,
+        existing.id,
+        operation.current_step.slice('disable_loop_claim:'.length),
+      )
+      if (!pendingLoopClaim) throw new Error('pending addon loop ownership claim is missing')
+      if (pendingLoopClaim.active === 0) {
+        await setOperationStep(
+          env,
+          operation,
+          'disable_teardown',
+          ['disabled', 'disabled'],
+        )
+      }
+    }
+
+    const loopClaims = await loadLoopClaims(env, existing.id, true)
+    for (const claim of loopClaims) {
+      await setOperationStep(
+        env,
+        operation,
+        `disable_loop_claim:${claim.id}`,
+        ['disabled', 'disabled'],
+      )
+      await releaseLoopClaim(env, existing.id, operation, claim, deps)
+      await setOperationStep(
+        env,
+        operation,
+        'disable_teardown',
+        ['disabled', 'disabled'],
+      )
+    }
+    await loadPersistedDisabledLoopClaims(env, existing)
+
     await deps.beforeOperationCompleted?.({
       installationId: existing.id,
       operationId: operation.id,
@@ -2991,6 +3470,7 @@ export async function disableAddon(
     const evidence = await loadCompletedDisableOperationEvidence(env, completedInstallation)
     if (!evidence || evidence.id !== completedOperation.id) throw new FenceLostError()
     await repairAndValidatePersistedDisabledDepartmentClaims(env, completedInstallation)
+    await loadPersistedDisabledLoopClaims(env, completedInstallation)
     const confirmedEvidence = await loadCompletedDisableOperationEvidence(env, completedInstallation)
     if (!confirmedEvidence || confirmedEvidence.id !== completedOperation.id) throw new FenceLostError()
 
@@ -3042,7 +3522,14 @@ export async function archiveAddon(
     if (!evidence) {
       return { ok: false, reason: 'fence_lost' }
     }
-    retainedClaims = await repairAndValidatePersistedDisabledDepartmentClaims(env, existing)
+    // archiveAddon's transition guard (below) requires COUNT(*) of ALL-time ownership
+    // rows for this installation to equal retainedClaims.length exactly — that table now
+    // holds both department AND loop claim rows (#471), so both must be included here or
+    // archive would fail permanently the moment a loop claim row ever existed.
+    retainedClaims = [
+      ...(await repairAndValidatePersistedDisabledDepartmentClaims(env, existing)),
+      ...(await loadPersistedDisabledLoopClaims(env, existing)),
+    ]
     const confirmedEvidence = await loadCompletedDisableOperationEvidence(env, existing)
     if (!confirmedEvidence || confirmedEvidence.id !== evidence.id) {
       return { ok: false, reason: 'fence_lost' }

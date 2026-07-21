@@ -22,6 +22,7 @@ const migrations = [
   '../migrations/0003_settings.sql',
   '../migrations/0004_channels.sql',
   '../migrations/0005_channel_capability_grants.sql',
+  '../migrations/0014_loops.sql',
   '../migrations/0016_presence.sql',
   '../migrations/0019_agent_token_binding.sql',
   '../migrations/0023_connectors.sql',

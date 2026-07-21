@@ -74,6 +74,49 @@ export async function createLoop(env: Env, input: unknown): Promise<LoopResult<L
   }
 }
 
+/**
+ * insertLoopIfAbsent — idempotent-by-id loop creation for callers that mint the loop's
+ * id THEMSELVES ahead of the write (addon activation's ensureLoopClaim, src/addons/
+ * service.ts — see that file's comment for the full ordering rationale). Unlike
+ * createLoop (which always starts a loop 'active' — the direct-API dogfood path,
+ * src/loops/routes.ts), status is caller-supplied: an addon-declared loop with
+ * approvalRequired:true is inserted 'paused' so it EXISTS but never runs until a
+ * separate, explicit action promotes it.
+ *
+ * INSERT OR IGNORE on the primary key: a retry after a crash between "claim reserved"
+ * and "loop row written" safely completes the write without erroring or duplicating —
+ * the second attempt targets the SAME id and is a no-op if the first attempt's insert
+ * already landed.
+ */
+export async function insertLoopIfAbsent(
+  env: Env,
+  id: string,
+  status: LoopStatus,
+  input: unknown,
+): Promise<LoopResult<LoopManifest>> {
+  const spec = validateLoopSpec(input)
+  if (!spec.ok) return { ok: false, error: spec.error }
+
+  const now = new Date().toISOString()
+  const tenant = env.TENANT_SLUG
+
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO loops (id, tenant, squad_id, agent_id, status, spec, dry_rounds, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+  )
+    .bind(id, tenant, spec.value.squad_id, spec.value.agent_id, status, JSON.stringify(spec.value), now, now)
+    .run()
+
+  const row = await env.DB.prepare(
+    `SELECT id, tenant, squad_id, agent_id, status, spec, dry_rounds, created_at, updated_at
+       FROM loops WHERE id = ? AND tenant = ? LIMIT 1`,
+  )
+    .bind(id, tenant)
+    .first<LoopRow>()
+  const hydrated = row ? hydrateLoop(row) : null
+  return hydrated ? { ok: true, value: hydrated } : { ok: false, error: 'loop_insert_failed' }
+}
+
 /** getLoop — tenant-scoped fetch by id. null when absent or stored spec is invalid. */
 export async function getLoop(env: Env, id: string): Promise<LoopManifest | null> {
   const row = await env.DB.prepare(
