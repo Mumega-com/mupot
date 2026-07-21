@@ -151,7 +151,15 @@ export type AddonBindingConfigurationMatch =
   | { ok: false; reason: AddonBindingFailureReason }
   | { ok: true; matches: boolean }
 
-const INTERNAL_ADAPTERS = new Set(['first_party'])
+// Adapter names allowed to bind as bindingKind 'internal_adapter' (no vault connector row).
+// 'posthog' is dual-mode (see MARKETING_MONITOR_BINDING_CONTRACT's 'either' rule for
+// web_analytics): a tenant can bind it to a real per-tenant vault connector (unaffected,
+// not listed here as internal) OR, with no connector, to the Worker's own env-level
+// PostHog credentials — the pot's own dogfood tenant path (src/cro/posthog.ts /
+// src/addons/marketing/adapters/posthog.ts). Adding an adapter name here only widens WHO
+// may bind it without a connector; the manifest's per-slot connectorRequirements still
+// gates which adapters are accepted at all.
+const INTERNAL_ADAPTERS = new Set(['first_party', 'posthog'])
 
 function bindingFromRow(row: BindingRow): AddonBinding {
   return {

@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   MARKETING_MONITOR_PROGRAM_VERSION,
   getLatestMarketingMonitorRun,
@@ -354,6 +354,64 @@ describe('marketing monitor service', () => {
       value: 41,
       authority: 'first-party',
     })
+  })
+
+  it('drives env-level PostHog credentials through the REAL registered source, end-to-end from runMarketingMonitor (#473 BLOCK-1 anti-fake-green: no sourceFactory injected)', async () => {
+    // Bind web_analytics -> posthog as internal_adapter (no vault connector) — the dogfood
+    // path. Deliberately does NOT inject a sourceFactory: this must go
+    // runMarketingMonitor -> captureDatabase -> collectMarketingSnapshots ->
+    // createRegisteredSources -> the REAL createPosthogMarketingSource, so a regression that
+    // strips POSTHOG_* env vars anywhere in that chain (e.g. captureDatabase re-pinning env
+    // down to { DB, TENANT_SLUG }) shows up here, not just in a unit test that hands the
+    // adapter its env directly.
+    const installed = await installAddon(env, owner, 'marketing-cro-monitor')
+    if (!installed.ok) throw new Error(`install failed: ${installed.reason}`)
+    expect(await configureAddon(env, owner, 'marketing-cro-monitor', {
+      bindings: [{ slot: 'web_analytics', adapter: 'posthog', bindingKind: 'internal_adapter' }],
+    })).toEqual(expect.objectContaining({ ok: true }))
+    expect(await activateAddon(env, owner, 'marketing-cro-monitor')).toEqual(expect.objectContaining({ ok: true }))
+
+    const ownerEnv: Env = {
+      ...env,
+      OWNER_TENANT_SLUG: 'tenant-a',
+      POSTHOG_PROJECT_ID: '436189',
+      POSTHOG_PERSONAL_API_KEY: 'integration-test-key',
+      POSTHOG_HOST: 'https://us.posthog.com',
+    }
+    const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ results: [[5]] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const result = await runMarketingMonitor(ownerEnv, owner, { window })
+
+    expect(result).toEqual(expect.objectContaining({
+      ok: true,
+      idempotent: false,
+      run: expect.objectContaining({
+        sourceCount: 1,
+        observationCount: 1,
+        sources: [{
+          key: 'posthog',
+          slot: 'web_analytics',
+          status: 'available',
+          observationCount: 1,
+        }],
+        observations: [expect.objectContaining({
+          sourceKey: 'posthog',
+          metricKey: 'seo.organic_sessions',
+          value: 5,
+          authority: 'posthog',
+        })],
+      }),
+    }))
+    // The real network call actually happened — proof the env creds reached the adapter.
+    expect(fetchSpy).toHaveBeenCalledOnce()
+    const [url] = fetchSpy.mock.calls[0] as [string]
+    expect(url).toBe('https://us.posthog.com/api/projects/436189/query/')
+
+    vi.unstubAllGlobals()
   })
 
   it.each(['missing', 'installed', 'configured', 'disabled', 'archived'] as const)(

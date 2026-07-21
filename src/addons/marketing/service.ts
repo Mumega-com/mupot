@@ -362,7 +362,25 @@ function captureDatabase(env: Env): CapturedDatabase | null {
         return reflectApplyIntrinsic(batch, receiver, [statements])
       },
     }) as unknown as D1Database
-    const pinnedEnv = objectFreezeIntrinsic({ DB: db, TENANT_SLUG: tenant }) as Env
+    // Explicit allowlist, NOT a spread of `env` — this pin exists to keep sources from
+    // reaching arbitrary Worker bindings/secrets they have no business touching. Every
+    // field added here is operator-level config that an internal_adapter marketing source
+    // (never a per-tenant vault connector) may read directly (#473 BLOCK-1: without these,
+    // src/addons/marketing/adapters/posthog.ts's env-credentials fallback silently saw
+    // `undefined` on every real run and always returned unavailable — a no-op in
+    // production, invisible to any test that calls the adapter directly instead of driving
+    // it through runMarketingMonitor). OWNER_TENANT_SLUG must also pass through: it is what
+    // gates that same fallback to the pot-owner tenant only (CONCERN-2) — omitting it here
+    // would make every tenant look like a non-owner, which is safe but breaks the owner's
+    // own dogfood path too.
+    const pinnedEnv = objectFreezeIntrinsic({
+      DB: db,
+      TENANT_SLUG: tenant,
+      ...(typeof env.OWNER_TENANT_SLUG === 'string' ? { OWNER_TENANT_SLUG: env.OWNER_TENANT_SLUG } : {}),
+      ...(typeof env.POSTHOG_PROJECT_ID === 'string' ? { POSTHOG_PROJECT_ID: env.POSTHOG_PROJECT_ID } : {}),
+      ...(typeof env.POSTHOG_PERSONAL_API_KEY === 'string' ? { POSTHOG_PERSONAL_API_KEY: env.POSTHOG_PERSONAL_API_KEY } : {}),
+      ...(typeof env.POSTHOG_HOST === 'string' ? { POSTHOG_HOST: env.POSTHOG_HOST } : {}),
+    }) as Env
     return objectFreezeIntrinsic({ db, tenant, env: pinnedEnv })
   } catch {
     return null

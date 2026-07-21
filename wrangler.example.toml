@@ -11,6 +11,11 @@ compatibility_flags = ["nodejs_compat"]
 # ── tenant config (non-secret; secrets via `wrangler secret put`) ──
 [vars]
 TENANT_SLUG = "mumega"          # your org slug
+# OWNER_TENANT_SLUG = "mumega"  # UNCOMMENT only on the operator's own pot deployment —
+                                 # set to the SAME value as TENANT_SLUG above. Gates
+                                 # env-level operator creds (e.g. POSTHOG_*) so they are
+                                 # only ever used on behalf of the owning tenant, never a
+                                 # customer/forked deployment (src/types.ts Env, #473).
 BRAND = "Mumega"                   # dashboard brand
 OAUTH_PROVIDER = "google"         # google | telegram
 FLEET_PROJECT = "sos"             # bus project the fleet window addresses (company fleet = sos, not the mumega slug)

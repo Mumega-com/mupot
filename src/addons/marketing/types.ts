@@ -26,10 +26,22 @@ const vaultBinding = () => Object.freeze({
   connectorId: 'required',
 } as const)
 
+// Dual-mode binding: the adapter may run EITHER off a real per-tenant vault connector
+// (preferred — DME/etc. bring their own PostHog project) OR, when none is bound, off
+// Worker-level env credentials (the pot's own dogfood tenant — see
+// src/addons/marketing/adapters/posthog.ts and src/cro/posthog.ts). The generic addon
+// binding preflight (src/addons/bindings.ts INTERNAL_ADAPTERS) gates which adapter names
+// are actually allowed to bind as 'internal_adapter' with no connector.
+const eitherBinding = () => Object.freeze({
+  capability: 'read',
+  bindingKind: 'either',
+  connectorId: 'optional',
+} as const)
+
 export const MARKETING_MONITOR_BINDING_CONTRACT = Object.freeze({
   web_analytics: Object.freeze({
     first_party: internalBinding(),
-    posthog: vaultBinding(),
+    posthog: eitherBinding(),
   }),
   content_surface: Object.freeze({
     inkwell: vaultBinding(),
