@@ -5,6 +5,8 @@ import {
   isCollectedMarketingSnapshot,
   MAX_OBSERVATIONS_PER_RUN,
   MAX_OBSERVATIONS_PER_SOURCE,
+  CONTENT_CHANNEL_SOURCE_METRICS,
+  SEO_CHANNEL_SOURCE_METRICS,
 } from '../src/addons/marketing/sources'
 import { MARKETING_MONITOR_METRIC_CONTRACT } from '../src/addons/marketing/types'
 import * as MarketingTypes from '../src/addons/marketing/types'
@@ -157,10 +159,58 @@ describe('collectMarketingSnapshots', () => {
       'growth.leads': 'count',
       'growth.replies': 'count',
       'seo.conversion_rate': 'ratio',
+      'seo.keyword_gap_queries': 'count',
       'finance.revenue': 'usd',
+      'content.posts_published': 'count',
     })
+    expect([...SEO_CHANNEL_SOURCE_METRICS]).toEqual([
+      'seo.ai_citations',
+      'seo.organic_sessions',
+      'seo.conversion_rate',
+      'seo.keyword_gap_queries',
+    ])
+    expect([...CONTENT_CHANNEL_SOURCE_METRICS]).toEqual([
+      'content.posts_published',
+    ])
+    expect(Object.isFrozen(SEO_CHANNEL_SOURCE_METRICS)).toBe(true)
+    expect(Object.isFrozen(CONTENT_CHANNEL_SOURCE_METRICS)).toBe(true)
     expect(Object.isFrozen(MARKETING_MONITOR_METRIC_CONTRACT)).toBe(true)
     expect(Object.values(MARKETING_MONITOR_METRIC_CONTRACT).every(Object.isFrozen)).toBe(true)
+  })
+
+  it('accepts seo.keyword_gap_queries from a search_performance GSC binding', async () => {
+    const gapObservation = observation({
+      id: 'gsc-keyword-gap',
+      metricKey: 'seo.keyword_gap_queries',
+      value: 17,
+      unit: 'count',
+      authority: 'gsc',
+      sourceKey: 'gsc',
+      sourceSlot: 'search_performance',
+    })
+    const gscBinding: ResolvedAddonBinding = {
+      id: 'binding-gsc',
+      slot: 'search_performance',
+      adapter: 'google_search_console',
+      bindingKind: 'vault_connector',
+      capability: 'read',
+      connectorId: 'connector-gsc',
+    }
+
+    const snapshot = await collectMarketingSnapshots(
+      envWithConnectors([{ id: 'connector-gsc', type: 'google_search_console' }]),
+      [gscBinding],
+      window,
+      [source('gsc', 'search_performance', async () => available([gapObservation]))],
+    )
+
+    expect(snapshot.sources[0]).toMatchObject({ status: 'available', observationCount: 1 })
+    expect(snapshot.observations).toEqual([expect.objectContaining({
+      metricKey: 'seo.keyword_gap_queries',
+      value: 17,
+      authority: 'gsc',
+      sourceSlot: 'search_performance',
+    })])
   })
 
   it('keeps healthy source evidence when an optional source fails', async () => {

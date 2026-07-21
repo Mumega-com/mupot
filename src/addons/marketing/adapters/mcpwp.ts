@@ -1,10 +1,13 @@
 import { useConnectorById } from '../../../connectors/service'
 import { assertPublicHttpsUrl } from '../../../lib/ssrf'
-import type { MarketingMonitorSource, SourceSnapshot } from '../types'
+import type { MarketingMonitorSource, SourceObservation, SourceSnapshot } from '../types'
 
 export const MCPWP_MARKETING_TIMEOUT_MS = 8_000
 export const MCPWP_MARKETING_PER_PAGE = 50
 const WORDPRESS_POST_FIELDS = 'id,slug,link,date,modified,title'
+const CONTENT_METRIC = 'content.posts_published' as const
+const CONTENT_UNIT = 'count' as const
+const MCPWP_AUTHORITY = 'mcpwp' as const
 
 const unavailable = (): SourceSnapshot => ({
   status: 'unavailable',
@@ -42,7 +45,7 @@ function parseSafeWpConnectorConfig(meta: string | null): SafeWpConnectorConfig 
   }
 }
 
-export function createMcpwpMarketingSource(_runId: string): MarketingMonitorSource {
+export function createMcpwpMarketingSource(runId: string): MarketingMonitorSource {
   return {
     key: 'mcpwp',
     slot: 'content_surface',
@@ -77,9 +80,17 @@ export function createMcpwpMarketingSource(_runId: string): MarketingMonitorSour
           })
           if (isRedirect(response) || !response.ok) return failed()
           const body = await response.json().catch(() => null)
-          return Array.isArray(body)
-            ? { status: 'available' as const, observations: [] }
-            : failed()
+          if (!Array.isArray(body)) return failed()
+          const observation: SourceObservation = {
+            id: `${runId}:mcpwp:${CONTENT_METRIC}`,
+            runId,
+            metricKey: CONTENT_METRIC,
+            value: body.length,
+            unit: CONTENT_UNIT,
+            authority: MCPWP_AUTHORITY,
+            observedAt: window.end,
+          }
+          return { status: 'available' as const, observations: [observation] }
         } catch {
           return failed()
         } finally {

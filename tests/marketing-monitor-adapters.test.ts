@@ -405,7 +405,18 @@ describe('Inkwell marketing adapter', () => {
       window,
     )
 
-    expect(snapshot).toEqual({ status: 'available', observations: [] })
+    expect(snapshot).toEqual({
+      status: 'available',
+      observations: [
+        expect.objectContaining({
+          metricKey: 'content.posts_published',
+          value: 1,
+          unit: 'count',
+          authority: 'inkwell',
+          observedAt: window.end,
+        }),
+      ],
+    })
     const [url, init] = (fetchSpy as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit]
     expect(String(url)).toContain('/api/internal/content/home?tenant_slug=tenant-a')
     expect(init).toMatchObject({ method: 'GET', redirect: 'manual' })
@@ -464,7 +475,18 @@ describe('MCPWP marketing adapter', () => {
       window,
     )
 
-    expect(snapshot).toEqual({ status: 'available', observations: [] })
+    expect(snapshot).toEqual({
+      status: 'available',
+      observations: [
+        expect.objectContaining({
+          metricKey: 'content.posts_published',
+          value: 1,
+          unit: 'count',
+          authority: 'mcpwp',
+          observedAt: window.end,
+        }),
+      ],
+    })
     expect(fetchSpy).toHaveBeenCalledOnce()
     const [rawUrl, init] = (fetchSpy as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit]
     const url = new URL(rawUrl)

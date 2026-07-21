@@ -55,6 +55,7 @@ const migrations = [
   '../migrations/0053_marketing_monitor_runs.sql',
   '../migrations/0054_marketing_recommendations.sql',
   '../migrations/0055_projects.sql',
+  '../migrations/0064_marketing_recommendation_channel_kinds.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const owner = { id: 'owner-1', role: 'owner' as const }
@@ -142,11 +143,119 @@ describe('marketing monitor opportunities', () => {
     expect(first.length).toBeGreaterThan(0)
     expect(first.length).toBeLessThanOrEqual(1)
     expect(first[0]).toMatchObject({
-      kind: 'conversion_review',
-      target: 'resource:web-ops/conversion-funnel',
-      primaryKpi: 'conversion',
-      kpiBaseline: { status: 'available', value: 0.05, unit: 'ratio' },
+      kind: 'organic_traffic_review',
+      target: 'resource:seo/keyword-gap',
+      primaryKpi: 'qualifiedTraffic',
+      kpiBaseline: { status: 'available', value: 240, unit: 'count' },
     })
+    expect(first[0]?.problem).toContain('SEO keyword gap')
+    expect(first[0]?.hypothesis).toContain('keyword-gap proposal')
+  })
+
+  it('prefers an explicit keyword-gap query observation over the funnel proxy', async () => {
+    expect(await installAddon(env, owner, 'marketing-cro-monitor'))
+      .toEqual(expect.objectContaining({ ok: true }))
+    expect(await configureAddon(env, owner, 'marketing-cro-monitor', {
+      bindings: [{ slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' }],
+    })).toEqual(expect.objectContaining({ ok: true }))
+    expect(await activateAddon(env, owner, 'marketing-cro-monitor'))
+      .toEqual(expect.objectContaining({ ok: true }))
+
+    const result = await runMarketingMonitor(env, owner, { window }, {
+      sourceFactory: ({ runId, window: requestedWindow }) => [{
+        key: 'first_party_keyword_gap',
+        slot: 'web_analytics',
+        async read() {
+          return {
+            status: 'available' as const,
+            observations: [
+              {
+                id: `${runId}:seo.organic_sessions`,
+                runId,
+                metricKey: 'seo.organic_sessions' as const,
+                value: 240,
+                unit: 'count',
+                authority: 'first-party',
+                observedAt: '2026-07-01T12:00:00.000Z',
+              },
+              {
+                id: `${runId}:seo.keyword_gap_queries`,
+                runId,
+                metricKey: 'seo.keyword_gap_queries' as const,
+                value: 17,
+                unit: 'count',
+                authority: 'first-party',
+                observedAt: '2026-07-01T12:00:00.000Z',
+              },
+              {
+                id: `${runId}:seo.conversion_rate`,
+                runId,
+                metricKey: 'seo.conversion_rate' as const,
+                value: 0.05,
+                unit: 'ratio',
+                authority: 'first-party',
+                observedAt: '2026-07-01T12:00:00.000Z',
+              },
+            ],
+          }
+        },
+      }],
+    })
+    expect(result).toEqual(expect.objectContaining({ ok: true }))
+    if (!result.ok) throw new Error(`monitor run failed: ${result.reason}`)
+
+    const ranked = rankMarketingOpportunities(result.run)
+    expect(ranked[0]).toMatchObject({
+      target: 'resource:seo/keyword-gap',
+      primaryKpi: 'qualifiedTraffic',
+    })
+    expect(ranked[0]?.problem).toContain('17 search queries')
+  })
+
+  it('ranks an SEO content candidate when traffic converts below the channel ceiling', () => {
+    const run = {
+      id: 'run-content-candidate',
+      programVersion: 'marketing-cro-monitor-v1',
+      status: 'completed' as const,
+      window,
+      sourceCount: 1,
+      observationCount: 2,
+      rawObservationCount: 2,
+      sources: [],
+      observations: [],
+      outcomes: {
+        visibility: { status: 'unavailable' as const, reason: 'authoritative_source_missing' },
+        qualifiedTraffic: {
+          status: 'available' as const,
+          value: 100,
+          unit: 'count',
+          source: 'first-party',
+          observedAt: '2026-07-01T12:00:00.000Z',
+        },
+        leads: { status: 'unavailable' as const, reason: 'authoritative_source_missing' },
+        conversion: {
+          status: 'available' as const,
+          value: 0.02,
+          unit: 'ratio',
+          source: 'first-party',
+          observedAt: '2026-07-01T12:00:00.000Z',
+        },
+        revenue: { status: 'unavailable' as const, reason: 'authoritative_source_missing' },
+        content: { status: 'unavailable' as const, reason: 'authoritative_source_missing' },
+      },
+      evidenceDigest: 'a'.repeat(64),
+      createdAt: '2026-07-01T12:00:00.000Z',
+      completedAt: '2026-07-01T12:00:00.000Z',
+    }
+
+    const ranked = rankMarketingOpportunities(run)
+    expect(ranked[0]).toMatchObject({
+      kind: 'organic_traffic_review',
+      target: 'resource:seo/content-candidate',
+      primaryKpi: 'conversion',
+      kpiBaseline: { status: 'available', value: 0.02, unit: 'ratio' },
+    })
+    expect(ranked[0]?.problem).toContain('SEO content candidate')
   })
 
   it('creates at most one recommendation, task, and flight for the same evidence window', async () => {
@@ -413,13 +522,14 @@ describe('marketing monitor opportunities', () => {
     `).get() as { kpi_baseline_json: string; limiting_evidence_json: string }
     expect(JSON.parse(row.kpi_baseline_json)).toEqual({
       status: 'available',
-      value: 0.05,
-      unit: 'ratio',
+      value: 240,
+      unit: 'count',
       source: 'first-party',
       observedAt: '2026-07-01T12:00:00.000Z',
     })
     expect(JSON.parse(row.limiting_evidence_json)).toEqual([
       { outcome: 'revenue', status: 'unavailable', reason: 'authoritative_source_missing' },
+      { outcome: 'content', status: 'unavailable', reason: 'authoritative_source_missing' },
     ])
     expect(row.limiting_evidence_json).not.toContain('"value":0')
   })

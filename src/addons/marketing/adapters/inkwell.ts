@@ -1,8 +1,11 @@
 import { useConnectorById } from '../../../connectors/service'
 import { assertPublicHttpsUrl } from '../../../lib/ssrf'
-import type { MarketingMonitorSource, SourceSnapshot } from '../types'
+import type { MarketingMonitorSource, SourceObservation, SourceSnapshot } from '../types'
 
 const INKWELL_TIMEOUT_MS = 8_000
+const CONTENT_METRIC = 'content.posts_published' as const
+const CONTENT_UNIT = 'count' as const
+const INKWELL_AUTHORITY = 'inkwell' as const
 
 function parseSlug(meta: string | null): string | null {
   if (!meta) return null
@@ -33,11 +36,11 @@ function isRedirect(response: Response): boolean {
     || (response.status >= 300 && response.status < 400)
 }
 
-export function createInkwellMarketingSource(_runId: string): MarketingMonitorSource {
+export function createInkwellMarketingSource(runId: string): MarketingMonitorSource {
   return {
     key: 'inkwell',
     slot: 'content_surface',
-    async read(env, binding) {
+    async read(env, binding, window) {
       if (!binding.connectorId || !env.INKWELL_API_URL) return unavailable()
       const snapshot = await useConnectorById(env, binding.connectorId, 'inkwell', async (connector) => {
         const slug = parseSlug(connector.meta)
@@ -57,9 +60,17 @@ export function createInkwellMarketingSource(_runId: string): MarketingMonitorSo
           if (isRedirect(response) || (!response.ok && response.status !== 404)) return failed()
           if (response.status === 404) return unavailable()
           const body = await response.json().catch(() => null) as Record<string, unknown> | null
-          return body?.ok === true && typeof body.content === 'string'
-            ? { status: 'available' as const, observations: [] }
-            : failed()
+          if (!(body?.ok === true && typeof body.content === 'string')) return failed()
+          const observation: SourceObservation = {
+            id: `${runId}:inkwell:${CONTENT_METRIC}`,
+            runId,
+            metricKey: CONTENT_METRIC,
+            value: 1,
+            unit: CONTENT_UNIT,
+            authority: INKWELL_AUTHORITY,
+            observedAt: window.end,
+          }
+          return { status: 'available' as const, observations: [observation] }
         } catch {
           return failed()
         } finally {

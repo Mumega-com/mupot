@@ -104,6 +104,7 @@ const RECOMMENDATION_KINDS = new SetIntrinsic([
   'lead_generation_review',
   'organic_traffic_review',
   'ai_visibility_review',
+  'content_review',
 ])
 const RECOMMENDATION_KPIS = new SetIntrinsic([
   'visibility',
@@ -111,6 +112,7 @@ const RECOMMENDATION_KPIS = new SetIntrinsic([
   'leads',
   'conversion',
   'revenue',
+  'content',
 ])
 const UNAVAILABLE_SOURCE_REASONS = new SetIntrinsic([
   'authoritative_source_missing',
@@ -126,6 +128,7 @@ const STORED_OUTCOME_METRICS = {
   leads: 'growth.leads',
   conversion: 'seo.conversion_rate',
   revenue: 'finance.revenue',
+  content: 'content.posts_published',
 } as const
 
 interface InstallationRow {
@@ -600,7 +603,7 @@ function validOutcome(value: unknown): value is OutcomeValue {
 
 function validOutcomes(value: unknown): value is MarketingOutcomes {
   if (!isObject(value)) return false
-  const keys = ['visibility', 'qualifiedTraffic', 'leads', 'conversion', 'revenue'] as const
+  const keys = ['visibility', 'qualifiedTraffic', 'leads', 'conversion', 'revenue', 'content'] as const
   if (objectKeysIntrinsic(value).length !== keys.length) return false
   for (let index = 0; index < keys.length; index += 1) {
     if (!validOutcome(value[keys[index]])) return false
@@ -730,6 +733,7 @@ function deriveStoredOutcomes(observations: readonly MonitorObservation[]): Mark
     leads: outcomeFor(STORED_OUTCOME_METRICS.leads),
     conversion: outcomeFor(STORED_OUTCOME_METRICS.conversion),
     revenue: outcomeFor(STORED_OUTCOME_METRICS.revenue),
+    content: outcomeFor(STORED_OUTCOME_METRICS.content),
   }
 }
 

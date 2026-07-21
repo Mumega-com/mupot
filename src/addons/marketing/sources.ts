@@ -45,6 +45,20 @@ export const MAX_OBSERVATIONS_PER_RUN = 200
 export const MAX_MARKETING_MONITOR_OBSERVATION_ID_LENGTH = 256
 export const MAX_MARKETING_MONITOR_BINDINGS = 16
 export const MAX_MARKETING_MONITOR_SOURCES = 16
+
+/** SEO-channel metrics the aggregator accepts from web_analytics / search_performance. */
+export const SEO_CHANNEL_SOURCE_METRICS = freezeIntrinsic([
+  'seo.ai_citations',
+  'seo.organic_sessions',
+  'seo.conversion_rate',
+  'seo.keyword_gap_queries',
+] as const)
+
+/** Content-channel metrics from content_surface adapters (mcpwp / inkwell). */
+export const CONTENT_CHANNEL_SOURCE_METRICS = freezeIntrinsic([
+  'content.posts_published',
+] as const)
+
 const MAX_JS_ARRAY_LENGTH = 2 ** 32 - 1
 const INPUT_ENTRY_FAILURE = Symbol('input_entry_failure')
 
