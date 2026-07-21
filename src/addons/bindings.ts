@@ -13,6 +13,53 @@ export interface AddonBindingInput {
   connectorId?: string
 }
 
+// validateBindingInputs — the ONE shallow, request-shape validator for a caller-supplied
+// bindings array, shared by every entry point that accepts one (the dashboard HTTP route's
+// parseConfigureBody in src/addons/routes.ts AND the addon_configure MCP tool in
+// src/mcp/addons.ts). Deliberately shallow: field types, the allowed-key allowlist, no
+// duplicate slots WITHIN the request, and a bound on array length. The deep semantic checks
+// (does the slot exist on the manifest? is the adapter allowed? does the connector resolve?)
+// live inside configureAddon → preflightAddonBindings below — this function's job is only to
+// turn `unknown` into a well-shaped AddonBindingInput[] or reject, identically for every
+// caller. A single implementation means the HTTP route and the MCP tool can never drift into
+// accepting different shapes for the same underlying mutation.
+export function validateBindingInputs(
+  raw: unknown[],
+  maximumBindings: number,
+): { ok: true; bindings: AddonBindingInput[] } | { ok: false } {
+  if (raw.length > Math.min(maximumBindings, 16)) return { ok: false }
+
+  const bindings: AddonBindingInput[] = []
+  const slots = new Set<string>()
+  for (const value of raw) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false }
+    const binding = value as Record<string, unknown>
+    const keys = Object.keys(binding)
+    if (keys.some((key) => !['slot', 'adapter', 'bindingKind', 'connectorId'].includes(key))) return { ok: false }
+    if (
+      typeof binding.slot !== 'string'
+      || binding.slot.length === 0
+      || typeof binding.adapter !== 'string'
+      || binding.adapter.length === 0
+      || (binding.bindingKind !== 'internal_adapter' && binding.bindingKind !== 'vault_connector')
+      || (Object.hasOwn(binding, 'connectorId') && (
+        typeof binding.connectorId !== 'string' || binding.connectorId.length === 0
+      ))
+      || slots.has(binding.slot)
+    ) {
+      return { ok: false }
+    }
+    slots.add(binding.slot)
+    bindings.push({
+      slot: binding.slot,
+      adapter: binding.adapter,
+      bindingKind: binding.bindingKind,
+      ...(typeof binding.connectorId === 'string' ? { connectorId: binding.connectorId } : {}),
+    })
+  }
+  return { ok: true, bindings }
+}
+
 export interface AddonBinding {
   id: string
   tenant: string
