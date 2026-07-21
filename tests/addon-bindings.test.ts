@@ -152,6 +152,30 @@ describe('addon connector bindings', () => {
     expect(JSON.stringify(await listAddonBindings(env, installation.id))).not.toContain('opaque-ciphertext')
   })
 
+  it('configures web_analytics to posthog as an env-fallback (no connector) binding', async () => {
+    // posthog is dual-mode on this slot (MARKETING_MONITOR_BINDING_CONTRACT's 'either' rule):
+    // a tenant with no vault connector can still bind it as internal_adapter, so the marketing
+    // source reads the Worker's own env-level PostHog credentials instead (the pot's own
+    // dogfood tenant path — src/addons/marketing/adapters/posthog.ts).
+    const installation = await installMarketing(env)
+
+    const result = await configureAddon(env, owner, 'marketing-cro-monitor', {
+      bindings: [{ slot: 'web_analytics', adapter: 'posthog', bindingKind: 'internal_adapter' }],
+    })
+
+    expect(result).toMatchObject({ ok: true, state: 'configured' })
+    expect(await listAddonBindings(env, installation.id)).toEqual([
+      expect.objectContaining({
+        slot: 'web_analytics',
+        adapter: 'posthog',
+        bindingKind: 'internal_adapter',
+        capability: 'read',
+        connectorId: null,
+        revokedAt: null,
+      }),
+    ])
+  })
+
   it('creates one live generation even for an empty fixture configuration', async () => {
     const installed = await installAddon(env, owner, 'fixture-addon')
     if (!installed.ok) throw new Error(`install failed: ${installed.reason}`)

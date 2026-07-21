@@ -111,7 +111,7 @@ describe('collectMarketingSnapshots', () => {
     expect(contract).toEqual({
       web_analytics: {
         first_party: { capability: 'read', bindingKind: 'internal_adapter', connectorId: 'null' },
-        posthog: { capability: 'read', bindingKind: 'vault_connector', connectorId: 'required' },
+        posthog: { capability: 'read', bindingKind: 'either', connectorId: 'optional' },
       },
       content_surface: {
         inkwell: { capability: 'read', bindingKind: 'vault_connector', connectorId: 'required' },
@@ -126,6 +126,66 @@ describe('collectMarketingSnapshots', () => {
       },
     })
     expect(Object.isFrozen(contract)).toBe(true)
+  })
+
+  it('accepts a posthog binding as EITHER internal_adapter (env-fallback) or vault_connector, never a mismatch', async () => {
+    const observationFor = (authority: string) => available([observation({
+      metricKey: 'seo.organic_sessions',
+      unit: 'count',
+      authority,
+    })])
+
+    const envFallback = await collectMarketingSnapshots(env, [{
+      id: 'binding-posthog-env',
+      slot: 'web_analytics',
+      adapter: 'posthog',
+      bindingKind: 'internal_adapter',
+      capability: 'read',
+      connectorId: null,
+    }], window, [
+      source('posthog', 'web_analytics', async () => observationFor('posthog')),
+    ])
+    expect(envFallback.sources).toEqual([
+      { key: 'posthog', slot: 'web_analytics', status: 'available', observationCount: 1 },
+    ])
+
+    const vaultConnector = await collectMarketingSnapshots(
+      envWithConnectors([{ id: 'connector-posthog', type: 'posthog' }]),
+      [{
+        id: 'binding-posthog-vault',
+        slot: 'web_analytics',
+        adapter: 'posthog',
+        bindingKind: 'vault_connector',
+        capability: 'read',
+        connectorId: 'connector-posthog',
+      }],
+      window,
+      [source('posthog', 'web_analytics', async () => observationFor('posthog'))],
+    )
+    expect(vaultConnector.sources).toEqual([
+      { key: 'posthog', slot: 'web_analytics', status: 'available', observationCount: 1 },
+    ])
+
+    // Cross-wired combinations (bindingKind says one thing, connectorId says the other)
+    // must still be rejected, not silently coerced.
+    let unreachedReads = 0
+    const mismatched = await collectMarketingSnapshots(env, [{
+      id: 'binding-posthog-mismatch',
+      slot: 'web_analytics',
+      adapter: 'posthog',
+      bindingKind: 'internal_adapter',
+      capability: 'read',
+      connectorId: 'connector-posthog',
+    }], window, [
+      source('posthog', 'web_analytics', async () => {
+        unreachedReads += 1
+        return observationFor('posthog')
+      }),
+    ])
+    expect(unreachedReads).toBe(0)
+    expect(mismatched.sources).toEqual([
+      { key: 'posthog', slot: 'web_analytics', status: 'failed', reason: 'invalid_binding_configuration', observationCount: 0 },
+    ])
   })
 
   it('keeps future ai_visibility bindings unreachable and never reads their source', async () => {

@@ -413,6 +413,176 @@ describe('PostHog marketing adapter', () => {
   })
 })
 
+describe('PostHog marketing adapter — env-credentials fallback (no vault connector)', () => {
+  const envFallbackBinding: ResolvedAddonBinding = {
+    id: 'binding-posthog-env',
+    slot: 'web_analytics',
+    adapter: 'posthog',
+    bindingKind: 'internal_adapter',
+    capability: 'read',
+    connectorId: null,
+  }
+
+  function envWithoutConnectors(overrides: Partial<Env> = {}): Env {
+    return { TENANT_SLUG: 'tenant-a', ...overrides } as Env
+  }
+
+  it('is unavailable and makes no fetch when env credentials are absent', async () => {
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const snapshot = await createPosthogMarketingSource(RUN_ID).read(
+      envWithoutConnectors(),
+      envFallbackBinding,
+      window,
+    )
+
+    expect(snapshot).toEqual({ status: 'unavailable', reason: 'source_unavailable', observations: [] })
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('emits seo.organic_sessions from Worker env credentials, stamped at the window end', async () => {
+    const key = 'posthog-env-personal-key'
+    const fetchSpy = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(init?.signal).toBeInstanceOf(AbortSignal)
+      return new Response(JSON.stringify({ results: [[7]] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const snapshot = await createPosthogMarketingSource(RUN_ID).read(
+      envWithoutConnectors({
+        POSTHOG_PROJECT_ID: '436189',
+        POSTHOG_PERSONAL_API_KEY: key,
+        POSTHOG_HOST: 'https://us.posthog.com',
+      }),
+      envFallbackBinding,
+      window,
+    )
+
+    expect(snapshot).toEqual({
+      status: 'available',
+      observations: [expect.objectContaining({
+        runId: RUN_ID,
+        metricKey: 'seo.organic_sessions',
+        value: 7,
+        unit: 'count',
+        authority: 'posthog',
+        observedAt: window.end,
+      })],
+    })
+    expect(fetchSpy).toHaveBeenCalledOnce()
+    const [url, init] = (fetchSpy as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('https://us.posthog.com/api/projects/436189/query/')
+    expect(init.method).toBe('POST')
+    expect(init.redirect).toBe('manual')
+    expect(String(init.body)).toContain('HogQLQuery')
+    expect(String(init.body)).toContain('organic_sessions')
+    expect(new Headers(init.headers).get('authorization')).toBe(`Bearer ${key}`)
+    expect(url).not.toContain(key)
+    expect(String(init.body)).not.toContain(key)
+    expect(JSON.stringify(snapshot)).not.toContain(key)
+  })
+
+  it('never fabricates a value when the query returns no rows', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ results: [] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })))
+
+    const snapshot = await createPosthogMarketingSource(RUN_ID).read(
+      envWithoutConnectors({
+        POSTHOG_PROJECT_ID: '436189',
+        POSTHOG_PERSONAL_API_KEY: 'k',
+        POSTHOG_HOST: 'https://us.posthog.com',
+      }),
+      envFallbackBinding,
+      window,
+    )
+
+    expect(snapshot).toEqual({ status: 'unavailable', reason: 'source_unavailable', observations: [] })
+  })
+
+  it('rejects a non-public POSTHOG_HOST without making a request', async () => {
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const snapshot = await createPosthogMarketingSource(RUN_ID).read(
+      envWithoutConnectors({
+        POSTHOG_PROJECT_ID: '436189',
+        POSTHOG_PERSONAL_API_KEY: 'k',
+        POSTHOG_HOST: 'https://169.254.169.254',
+      }),
+      envFallbackBinding,
+      window,
+    )
+
+    expect(snapshot).toEqual({ status: 'failed', reason: 'source_unavailable', observations: [] })
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('refuses redirects and never leaks the key on a failed response', async () => {
+    const key = 'posthog-env-never-echo'
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(`denied ${key}`, { status: 401 })))
+
+    const failed = await createPosthogMarketingSource(RUN_ID).read(
+      envWithoutConnectors({
+        POSTHOG_PROJECT_ID: '436189',
+        POSTHOG_PERSONAL_API_KEY: key,
+        POSTHOG_HOST: 'https://us.posthog.com',
+      }),
+      envFallbackBinding,
+      window,
+    )
+    expect(failed).toEqual({ status: 'failed', reason: 'source_unavailable', observations: [] })
+    expect(JSON.stringify(failed)).not.toContain(key)
+    expect(JSON.stringify(failed)).not.toContain('denied')
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, {
+      status: 302,
+      headers: { location: 'https://169.254.169.254/latest/meta-data' },
+    })))
+    const redirected = await createPosthogMarketingSource(RUN_ID).read(
+      envWithoutConnectors({
+        POSTHOG_PROJECT_ID: '436189',
+        POSTHOG_PERSONAL_API_KEY: key,
+        POSTHOG_HOST: 'https://us.posthog.com',
+      }),
+      envFallbackBinding,
+      window,
+    )
+    expect(redirected).toEqual({ status: 'failed', reason: 'source_unavailable', observations: [] })
+  })
+
+  it('still routes to the vault-connector path when a connectorId IS bound', async () => {
+    // Same source instance, different binding shape — the vault path (existing,
+    // unchanged health-read-only behavior) must still run when a real connector is bound,
+    // even though env credentials also happen to be present.
+    const secret = 'vault-still-wins'
+    const connector = await connectorFixture('posthog', secret, {
+      projectId: '436189',
+      host: 'https://us.posthog.com',
+    })
+    const fetchSpy = vi.fn(async () => new Response('{}', { status: 200 })) as unknown as typeof fetch
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const snapshot = await createPosthogMarketingSource(RUN_ID).read(
+      vaultEnv([connector], {
+        POSTHOG_PROJECT_ID: '436189',
+        POSTHOG_PERSONAL_API_KEY: 'env-key-should-be-ignored',
+      }),
+      vaultBinding('posthog'),
+      window,
+    )
+
+    expect(snapshot).toEqual({ status: 'available', observations: [] })
+    const init = (fetchSpy as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as RequestInit
+    expect(new Headers(init.headers).get('authorization')).toBe(`Bearer ${secret}`)
+  })
+})
+
 describe('Inkwell marketing adapter', () => {
   it('emits posts_published=0 for a reachable single-slug GET (not a window count)', async () => {
     const secret = 'inkwell-vault-secret'

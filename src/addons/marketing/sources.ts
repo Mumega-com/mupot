@@ -113,6 +113,10 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && trimIntrinsic(value).length > 0
 }
 
+function isBindingKindLiteral(value: unknown): value is 'internal_adapter' | 'vault_connector' {
+  return value === 'internal_adapter' || value === 'vault_connector'
+}
+
 function captureVaultVerificationEnv(env: Env): Env | null {
   try {
     if (typeof env !== 'object' || env === null) return null
@@ -300,27 +304,40 @@ function validatedBindingEntry(bindingValue: unknown): {
       slot as keyof typeof MARKETING_MONITOR_BINDING_CONTRACT
     ] as Readonly<Record<string, Readonly<{
       capability: 'read'
-      bindingKind: 'internal_adapter' | 'vault_connector'
-      connectorId: 'null' | 'required'
+      bindingKind: 'internal_adapter' | 'vault_connector' | 'either'
+      connectorId: 'null' | 'required' | 'optional'
     }>>>
     if (!isNonEmptyString(adapter) || !hasOwnIntrinsic(slotContract, adapter)) {
       return { slot, entry: { valid: false } }
     }
     const rule = slotContract[adapter]
-    const validConnector = rule?.connectorId === 'null'
-      ? connectorId === null
-      : isNonEmptyString(connectorId)
+    // 'either' rules (e.g. web_analytics.posthog) accept the actual binding row being
+    // EITHER internal_adapter (env-fallback, no connector) or vault_connector (real
+    // per-tenant connector, required). A non-'either' rule still demands an exact match.
+    const bindingKindMatchesRule = rule?.bindingKind === 'either'
+      ? isBindingKindLiteral(bindingKind)
+      : bindingKind === rule.bindingKind
+    const validConnector = rule?.connectorId === 'optional'
+      ? (bindingKind === 'internal_adapter' ? connectorId === null : isNonEmptyString(connectorId))
+      : rule?.connectorId === 'null'
+        ? connectorId === null
+        : isNonEmptyString(connectorId)
     if (
       !isNonEmptyString(id)
-      || !isNonEmptyString(bindingKind)
+      // The direct isBindingKindLiteral() call here (rather than only via
+      // bindingKindMatchesRule) is what narrows `bindingKind` to
+      // 'internal_adapter' | 'vault_connector' for the rest of this function.
+      || !isBindingKindLiteral(bindingKind)
       || !isNonEmptyString(capability)
       || capability !== 'read'
-      || bindingKind !== rule.bindingKind
+      || !bindingKindMatchesRule
       || !validConnector
     ) return { slot, entry: { valid: false } }
-    const normalizedConnectorId = rule.connectorId === 'null'
-      ? null
-      : connectorId as string
+    const normalizedConnectorId = rule.connectorId === 'optional'
+      ? (bindingKind === 'internal_adapter' ? null : connectorId as string)
+      : rule.connectorId === 'null'
+        ? null
+        : connectorId as string
 
     return {
       slot,
