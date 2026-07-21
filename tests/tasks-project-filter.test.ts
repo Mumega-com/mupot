@@ -436,4 +436,68 @@ describe('task project attribution', () => {
     expect(harness.sqlite.prepare(`SELECT project_id FROM tasks WHERE id = 'task-locked'`).get())
       .toEqual({ project_id: 'project-write' })
   })
+
+  // #400: a receipt-less task whose result is already non-empty is evidence
+  // sitting in the project's board (idx_tasks_project_evidence_keyset, 0059)
+  // with no formal receipt to trigger the 0059 lock. Detaching it must be
+  // blocked at both the app layer (this test) and the trigger layer
+  // (tests/projects-migration.test.ts).
+  it('blocks detaching a receipt-less task that already carries a non-empty result', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, done_when, status, result, project_id)
+      VALUES ('task-evidenced', 'squad-a', 'Evidenced', 'done', 'done', 'Verified output', 'project-write')
+    `)
+    authState.current = actor()
+
+    const response = await fetch(harness, '/task-evidenced', 'PATCH', { project_id: null })
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'detach_locked_result_present' })
+    expect(harness.sqlite.prepare(`SELECT project_id FROM tasks WHERE id = 'task-evidenced'`).get())
+      .toEqual({ project_id: 'project-write' })
+  })
+
+  // Adversarial-gate LOW fix: JS `.trim()` (the app-layer emptiness check)
+  // and SQLite's `trim()` (the migration 0065 trigger guard, ASCII-space
+  // only) disagree on a whitespace-only result like "\t\n" — the app layer
+  // sees it as empty and lets the PATCH proceed to persistTaskUpdate, but
+  // the DB trigger still sees non-empty bytes and ABORTs. Before the fix
+  // that raw ABORT message fell through mapTaskProjectUpdateError uncaught
+  // as a 500. It must now map to the same clean 409 the ASCII-agreeing case
+  // returns above.
+  it('maps the trigger-layer ABORT to a clean 409 (not a 500) for a whitespace-only result', async () => {
+    harness = makeHarness()
+    harness.sqlite.prepare(`
+      INSERT INTO tasks (id, squad_id, title, done_when, status, result, project_id)
+      VALUES ('task-whitespace-result', 'squad-a', 'Whitespace only', 'done', 'done', ?, 'project-write')
+    `).run('\t\n')
+    authState.current = actor()
+
+    const response = await fetch(harness, '/task-whitespace-result', 'PATCH', { project_id: null })
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'detach_locked_result_present' })
+    expect(harness.sqlite.prepare(`SELECT project_id FROM tasks WHERE id = 'task-whitespace-result'`).get())
+      .toEqual({ project_id: 'project-write' })
+  })
+
+  it('still allows detaching a task with an empty result, and reassigning a non-empty-result task between two live projects', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, done_when, status, result, project_id)
+      VALUES ('task-empty-result', 'squad-a', 'No evidence yet', 'done', 'open', NULL, 'project-write');
+      INSERT INTO projects (id, slug, name, status) VALUES ('project-write-2', 'project-write-2', 'Write project 2', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('project-write-2', 'squad-a', 'write');
+      INSERT INTO tasks (id, squad_id, title, done_when, status, result, project_id)
+      VALUES ('task-reassign', 'squad-a', 'Evidenced but reassigned not detached', 'done', 'done', 'Verified output', 'project-write');
+    `)
+    authState.current = actor()
+
+    const detached = await fetch(harness, '/task-empty-result', 'PATCH', { project_id: null })
+    expect(detached.status).toBe(200)
+    await expect(detached.json()).resolves.toMatchObject({ task: { id: 'task-empty-result', project_id: null } })
+
+    const reassigned = await fetch(harness, '/task-reassign', 'PATCH', { project_id: 'project-write-2' })
+    expect(reassigned.status).toBe(200)
+    await expect(reassigned.json()).resolves.toMatchObject({ task: { id: 'task-reassign', project_id: 'project-write-2' } })
+  })
 })

@@ -494,6 +494,10 @@ function taskProjectFailure(error: TaskProjectError): ToolOutcome {
   if (error.code === 'project_access_forbidden') {
     return fail(403, 'forbidden', { need: 'project_write' })
   }
+  // #400: detaching a receipt-less task that already carries a non-empty
+  // result would drop it out of the project evidence board unlocked — same
+  // conflict shape as the durable receipt/flight locks, so 409 not 400.
+  if (error.code === 'detach_locked_result_present') return fail(409, error.code)
   return fail(400, error.code)
 }
 
@@ -929,8 +933,14 @@ const toolTaskUpdate: ToolSpec = {
     }
     if (!changed) return fail(400, 'invalid_args', 'at least one update field is required')
 
+    // #400: close the detach-drops-evidence gap — a detach (project_id ->
+    // null) off a task carrying a non-empty result is blocked unless it is
+    // already receipt-locked by the separate 0059 mechanism (unaffected here).
     try {
-      await validateTaskProjectAttribution(env, next.project_id, existing.squad_id)
+      await validateTaskProjectAttribution(env, next.project_id, existing.squad_id, {
+        projectId: existing.project_id,
+        result: existing.result,
+      })
     } catch (error) {
       if (error instanceof TaskProjectError) return taskProjectFailure(error)
       throw error

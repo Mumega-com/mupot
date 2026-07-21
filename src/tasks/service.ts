@@ -218,6 +218,7 @@ export type TaskProjectErrorCode =
   | 'project_not_found'
   | 'archived_project'
   | 'project_access_forbidden'
+  | 'detach_locked_result_present'
 
 export class TaskProjectError extends Error {
   constructor(readonly code: TaskProjectErrorCode) {
@@ -226,7 +227,7 @@ export class TaskProjectError extends Error {
   }
 }
 
-export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_project_locked'
+export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_project_locked' | 'detach_locked_result_present'
 
 export class TaskUpdateConflictError extends Error {
   constructor(readonly code: TaskUpdateConflictCode) {
@@ -235,12 +236,34 @@ export class TaskUpdateConflictError extends Error {
   }
 }
 
+// #400 fast-follow: the app-side half of the detach-evidence lock. Mirrors the
+// migration-layer tasks_project_detach_locked_by_result trigger (see the
+// newest migration) so the caller gets a clear domain error instead of a raw
+// SQLite ABORT message. `detaching` carries the CURRENT (pre-update) row's
+// project_id/result — only present when this validation is running against an
+// existing task (task_update), never on createTask (there is no prior row to
+// detach FROM). Deliberately excludes any receipt/RBAC check: 0059's
+// tasks_project_locked_by_receipt already owns the receipt-backed case, and an
+// authz check on the OLD project is a separate, deferred decision (#402) — this
+// is purely "don't let a receipt-less task with real evidence fall out of the
+// project's evidence board un-locked."
+export interface TaskDetachContext {
+  projectId: string | null
+  result: string | null
+}
+
 export async function validateTaskProjectAttribution(
   env: Env,
   projectId: string | null,
   squadId: string,
+  detaching?: TaskDetachContext,
 ): Promise<void> {
-  if (projectId === null) return
+  if (projectId === null) {
+    if (detaching && detaching.projectId !== null && isNonEmptyString(detaching.result)) {
+      throw new TaskProjectError('detach_locked_result_present')
+    }
+    return
+  }
   if (!isNonEmptyString(projectId)) throw new TaskProjectError('invalid_project_id')
   const row = await env.DB.prepare(
     `SELECT p.status, psa.access_level
@@ -268,6 +291,20 @@ function mapTaskProjectUpdateError(error: unknown): never {
   const message = error instanceof Error ? error.message : String(error)
   if (message.includes('task project locked by flight')) {
     throw new TaskUpdateConflictError('task_project_locked')
+  }
+  // #400 fast-follow (adversarial gate, LOW): the app-layer emptiness check
+  // (isNonEmptyString → JS .trim()) and migration 0065's trigger guard
+  // (SQLite trim(), ASCII-space only) disagree on Unicode/whitespace-only
+  // results (e.g. "\t\n", a U+00A0 NBSP-only string) — JS .trim() treats them
+  // as empty (app allows the detach) while SQLite's trim() does not (the
+  // trigger still aborts). That is the intentionally-safe direction (the DB
+  // is the backstop, never looser than the app), but the raw ABORT message
+  // wasn't mapped here, so it fell through `throw error` as an uncaught 500
+  // instead of the same 409 the app-layer check already returns for the
+  // ASCII-agreeing case. Map it to the identical error code so the caller
+  // sees one consistent 409 regardless of which fence actually fired.
+  if (message.includes('task detach locked by result')) {
+    throw new TaskUpdateConflictError('detach_locked_result_present')
   }
   if (
     message.includes('task project not found')
