@@ -241,13 +241,20 @@ describe('first-party marketing adapter', () => {
               return statement
             },
             async all() {
+              const bound = binds[binds.length - 1] ?? []
+              const windowStart = bound[bound.length - 2] as string
+              const windowEnd = bound[bound.length - 1] as string
+              const rows = [
+                { metric_key: 'seo.organic_sessions', value: 41, occurred_at: '2026-07-16T12:00:00.000Z' },
+                { metric_key: 'seo.conversion_rate', value: 0.12, occurred_at: '2026-07-16T12:00:00.000Z' },
+                { metric_key: 'ops.throughput', value: 9, occurred_at: '2026-07-16T12:00:00.000Z' },
+                { metric_key: 'growth.leads', value: 3, occurred_at: '2026-07-15T23:59:59.999Z' },
+              ]
               return {
-                results: [
-                  { metric_key: 'seo.organic_sessions', value: 41, occurred_at: '2026-07-16T12:00:00.000Z' },
-                  { metric_key: 'seo.conversion_rate', value: 0.12, occurred_at: '2026-07-16T12:00:00.000Z' },
-                  { metric_key: 'ops.throughput', value: 9, occurred_at: '2026-07-16T12:00:00.000Z' },
-                  { metric_key: 'growth.leads', value: 3, occurred_at: '2026-07-15T23:59:59.999Z' },
-                ],
+                results: rows.filter((row) => (
+                  row.occurred_at >= windowStart
+                  && row.occurred_at <= windowEnd
+                )),
               }
             },
           }
@@ -281,8 +288,33 @@ describe('first-party marketing adapter', () => {
     })
     expect(sql).toHaveLength(1)
     expect(sql[0]).toContain('tenant_id = ?')
+    expect(sql[0]).toContain('metric_key IN (')
+    expect(sql[0]).toContain('occurred_at >= ?')
+    expect(sql[0]).toContain('occurred_at <= ?')
     expect(binds[0][0]).toBe('tenant-a')
+    expect(binds[0]).toContain(window.start)
+    expect(binds[0]).toContain(window.end)
     expect(dbWrites).toEqual([])
+  })
+
+  it('does not rely on the CRO top-200 scan (posthog ticks must not crowd out marketing keys)', async () => {
+    const sql: string[] = []
+    const env = {
+      TENANT_SLUG: 'tenant-a',
+      DB: {
+        prepare(statementSql: string) {
+          sql.push(statementSql)
+          return {
+            bind() { return this },
+            async all() { return { results: [] } },
+          }
+        },
+      },
+    } as unknown as Env
+
+    await createFirstPartyMarketingSource(RUN_ID).read(env, firstPartyBinding, window)
+    expect(sql[0]).not.toMatch(/LIKE \?/)
+    expect(sql[0]).toContain('metric_key IN (')
   })
 })
 
