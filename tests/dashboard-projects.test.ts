@@ -1628,3 +1628,105 @@ describe('project dashboard routes', () => {
     expect(match![1]).not.toContain('<')
   })
 })
+
+// Issue #402: board-provider bind/sync used to gate on isOrgAdmin (pot-wide), coarser than
+// the v0.24 per-project access model. These cover the fixed authz — per-project manage access
+// (project_squad_access.access_level 'write'|'admin' on a squad the member holds >= 'member'
+// capability on) now gates the bind + sync routes, with org-admin/owner as the documented
+// superset (see canManageProject / projectManageAccessFor in src/dashboard/projects.ts).
+describe('project board bind authz (#402)', () => {
+  let harness: SqliteD1Harness | undefined
+
+  afterEach(() => {
+    authState.current = null
+    harness?.close()
+    harness = undefined
+  })
+
+  // squad-b sits in dept-b; makeHarness grants squad-b only 'read' on visible-child
+  // (downgraded from 'write' at the end of the fixture) and 'admin' on hidden-child.
+  function memberB(): AuthContext {
+    return actor({
+      memberId: 'member-b',
+      capabilities: [
+        { member_id: 'member-b', scope_type: 'department', scope_id: 'dept-b', capability: 'member' },
+      ],
+    })
+  }
+
+  function bindRequest(
+    projectId: string,
+    body: Record<string, string> = { provider: 'github_projects', external_id: 'Mumega-com/9' },
+  ): Request {
+    return projectFormRequest(`/projects/${projectId}/boards`, body)
+  }
+
+  // No `provider` field by default: an authorized-but-empty-body sync request is redirected
+  // before touching the real board-provider port (isProjectBoardProvider('') is false), so
+  // asserting "not 403" here proves the authz gate passed without dialing a real provider API.
+  function syncRequest(projectId: string, body: Record<string, string> = {}): Request {
+    return projectFormRequest(`/projects/${projectId}/boards/sync`, body)
+  }
+
+  it('allows a project-scoped squad with write/admin access to bind and sync its own project board', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    as(memberA()) // squad-a (dept-a) holds 'write' access_level on visible-child
+
+    const bindResponse = await dashboardApp.fetch(bindRequest('visible-child'), env)
+    expect(bindResponse.status).not.toBe(403)
+    expect(
+      await harness.db.prepare(
+        "SELECT provider, external_id FROM project_provider_bindings WHERE project_id = 'visible-child'",
+      ).first(),
+    ).toMatchObject({ provider: 'github_projects', external_id: 'Mumega-com/9' })
+
+    const syncResponse = await dashboardApp.fetch(syncRequest('visible-child'), env)
+    expect(syncResponse.status).not.toBe(403)
+  })
+
+  it('rejects a squad with only read access_level on the target project', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    as(memberB()) // squad-b (dept-b) holds only 'read' access_level on visible-child
+
+    expect((await dashboardApp.fetch(bindRequest('visible-child'), env)).status).toBe(403)
+    expect((await dashboardApp.fetch(syncRequest('visible-child'), env)).status).toBe(403)
+    expect(
+      await harness.db.prepare(
+        "SELECT 1 FROM project_provider_bindings WHERE project_id = 'visible-child'",
+      ).first(),
+    ).toBeNull()
+  })
+
+  it('rejects a squad with no project_squad_access standing on the target project', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    as(memberA()) // squad-a has no project_squad_access row at all for hidden-child
+
+    expect((await dashboardApp.fetch(bindRequest('hidden-child'), env)).status).toBe(403)
+    expect((await dashboardApp.fetch(syncRequest('hidden-child'), env)).status).toBe(403)
+  })
+
+  it('rejects a member with no capabilities at all (fail-closed)', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    as(actor({ role: 'member' }))
+
+    expect((await dashboardApp.fetch(bindRequest('visible-child'), env)).status).toBe(403)
+    expect((await dashboardApp.fetch(syncRequest('visible-child'), env)).status).toBe(403)
+  })
+
+  it('still allows org-admin/owner to bind and sync any project — the documented superset, not project-scoped', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+
+    // other-root grants only squad-b 'read' access -- no squad anywhere has manage/write
+    // standing on it, so this proves org-admin bypasses per-project scoping entirely.
+    as(actor({ role: 'owner' }))
+    expect((await dashboardApp.fetch(bindRequest('other-root'), env)).status).not.toBe(403)
+
+    as(actor({ role: 'admin' }))
+    expect((await dashboardApp.fetch(syncRequest('hidden-child'), env)).status).not.toBe(403)
+  })
+})
