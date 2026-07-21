@@ -63,7 +63,8 @@ install pack → mint scoped token → inject into connect config → start agen
 
 | Harness | What it is | Identity config | Persistent? | Pack approach |
 |---------|-----------|-----------------|-------------|---------------|
-| **Claude Code** | local CLI | `.mcp.json` `type:sse` + `Authorization: Bearer` | no (interactive) | reference pack — `packs/claude-code/flock-agent/` (this pack). Presence via hook + cron `heartbeat.sh`. |
+| **Cursor + ECC** | Cursor IDE + ecc-universal skills | `.mcp.json` mupot bearer | no (interactive) | `packs/cursor/ecc-operator/` — ECC install on client; mupot MCP + rails skill; gate grant via MCP. |
+| **Claude Code** | local CLI | `.mcp.json` `type:sse` + `Authorization: Bearer` | no (interactive) | reference pack — `packs/claude-code/flock-agent/` (this pack). Presence via hook + cron `heartbeat.sh`. Optional ECC profile section in README. |
 | **Codex** | OpenAI CLI + IDE ext | `~/.codex/config.toml` `[mcp_servers.x]` `url` + `bearer_token_env_var` | no | plugin bundle (`SKILL.md` + `agents/openai.yaml`); heartbeat = wrapper script. |
 | **Hermes (Nous)** | self-hosted daemon + Desktop | `~/.hermes/config.yaml` `mcp_servers.x` + `headers.Authorization` | **yes (gateway daemon)** | Python plugin `register(ctx)` — wires MCP, native heartbeat lifecycle hook, slash cmds. Richest target. |
 | **Claude Cowork** | desktop app (+ Managed Agents API) | org plugin `.claude-plugin/` + bundled `.mcp.json`, or Agent SDK `.mcp.json` | no (desktop) | org plugin for desktop; `.mcp.json` + `SKILL.md` template for SDK builders. |

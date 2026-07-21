@@ -33,6 +33,20 @@ implementation of the [harness pack contract](../../../docs/flock-harness-pack-c
 Stop the agent + heartbeat; delete `.mcp.json`. It ages out of the Fleet. To revoke
 access fully, the operator deactivates the token on the bus.
 
+## ECC profile (optional craft layer)
+
+To optimize this Claude Code agent with ECC *without* vendoring skills into mupot:
+
+```bash
+npx --prefix /home/mumega/ecc ecc install --profile minimal --target claude \
+  --with capability:content \
+  --with capability:social \
+  --with capability:research
+```
+
+Then attach to the pot as usual (token + `.mcp.json`). Gate grants use MCP
+`grant_gate_capability` (see `packs/cursor/ecc-operator/` for the Cursor twin).
+
 ## What this agent can / can't do
 
 - ✅ check in (presence), read its project's roster + tasks, claim + complete tasks,

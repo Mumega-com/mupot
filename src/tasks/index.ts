@@ -22,7 +22,7 @@ import { requireAuth } from '../auth'
 // Fine-grained RBAC. Creating/mutating/assigning a task requires member+ on the
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
-import { resolveCapabilities, hasCapability, hasSurfaceCap } from '../auth/capability'
+import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin } from '../auth/capability'
 import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
@@ -1092,11 +1092,16 @@ tasksApp.post('/:id/pipeline', async (c) => {
 // ── DELETE /api/gates/grants — revoke a gate grant ───────────────────────────
 //
 // Only org owner/admin may manage gate grants.
-// Grant rows live in gate_grants (migration 0008); they are administrable so
-// operators can delegate verdict authority without giving org-admin access.
+// Shared write path: src/gates/grants.ts (also used by MCP grant_gate_capability).
 //
 // POST body: { capability: string, principal_type: 'member'|'agent', principal_id: string }
 // DELETE body: same shape — revoke = hard delete (the verdict receipt IS the audit trail)
+
+import {
+  grantGateCapability,
+  parseGateGrantArgs,
+  revokeGateCapability,
+} from '../gates/grants'
 
 export const gatesApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
 
@@ -1109,11 +1114,6 @@ gatesApp.use('*', async (c, next) => {
   await next()
 })
 
-// Only org owner/admin may touch gate grants.
-function requireOwnerAdmin(auth: AuthContext): boolean {
-  return auth.role === 'owner' || auth.role === 'admin'
-}
-
 interface GrantBody {
   capability?: unknown
   principal_type?: unknown
@@ -1122,7 +1122,7 @@ interface GrantBody {
 
 gatesApp.post('/grants', async (c) => {
   const auth = c.get('auth')
-  if (!requireOwnerAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.json({ error: 'forbidden', need: 'owner_or_admin' }, 403)
   }
 
@@ -1133,39 +1133,28 @@ gatesApp.post('/grants', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
-  if (!isNonEmptyString(body.capability)) return c.json({ error: 'invalid_capability' }, 400)
-  if (body.principal_type !== 'member' && body.principal_type !== 'agent') {
-    return c.json({ error: 'invalid_principal_type', accepted: ['member', 'agent'] }, 400)
+  const parsed = parseGateGrantArgs(body)
+  if (!parsed.ok) {
+    if (parsed.error === 'invalid_principal_type') {
+      return c.json({ error: parsed.error, accepted: ['member', 'agent'] }, 400)
+    }
+    return c.json({ error: parsed.error }, 400)
   }
-  if (!isNonEmptyString(body.principal_id)) return c.json({ error: 'invalid_principal_id' }, 400)
 
   const grantedBy = auth.memberId ?? auth.userId
-  const now = new Date().toISOString()
-  const id = crypto.randomUUID()
+  const grant = await grantGateCapability(c.env, {
+    capability: parsed.capability,
+    principalType: parsed.principalType,
+    principalId: parsed.principalId,
+    grantedBy,
+  })
 
-  // INSERT OR IGNORE: idempotent — granting twice is not an error.
-  await c.env.DB.prepare(
-    `INSERT OR IGNORE INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(id, body.capability.trim(), body.principal_type, body.principal_id.trim(), grantedBy, now)
-    .run()
-
-  return c.json({
-    ok: true,
-    grant: {
-      capability: body.capability.trim(),
-      principal_type: body.principal_type,
-      principal_id: body.principal_id.trim(),
-      granted_by: grantedBy,
-      created_at: now,
-    },
-  }, 201)
+  return c.json({ ok: true, grant }, 201)
 })
 
 gatesApp.delete('/grants', async (c) => {
   const auth = c.get('auth')
-  if (!requireOwnerAdmin(auth)) {
+  if (!isOrgAdmin(auth)) {
     return c.json({ error: 'forbidden', need: 'owner_or_admin' }, 403)
   }
 
@@ -1176,17 +1165,19 @@ gatesApp.delete('/grants', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
-  if (!isNonEmptyString(body.capability)) return c.json({ error: 'invalid_capability' }, 400)
-  if (body.principal_type !== 'member' && body.principal_type !== 'agent') {
-    return c.json({ error: 'invalid_principal_type', accepted: ['member', 'agent'] }, 400)
+  const parsed = parseGateGrantArgs(body)
+  if (!parsed.ok) {
+    if (parsed.error === 'invalid_principal_type') {
+      return c.json({ error: parsed.error, accepted: ['member', 'agent'] }, 400)
+    }
+    return c.json({ error: parsed.error }, 400)
   }
-  if (!isNonEmptyString(body.principal_id)) return c.json({ error: 'invalid_principal_id' }, 400)
 
-  await c.env.DB.prepare(
-    `DELETE FROM gate_grants WHERE capability = ? AND principal_type = ? AND principal_id = ?`,
-  )
-    .bind(body.capability.trim(), body.principal_type, body.principal_id.trim())
-    .run()
+  await revokeGateCapability(c.env, {
+    capability: parsed.capability,
+    principalType: parsed.principalType,
+    principalId: parsed.principalId,
+  })
 
   return c.json({ ok: true })
 })

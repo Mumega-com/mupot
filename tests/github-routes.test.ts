@@ -104,9 +104,18 @@ describe('taskFromGitHubEvent', () => {
     expect(t?.title).toBe('[GH Digidinc/Digid] PR #7 opened: Add X')
     expect(t?.body).toContain('u')
   })
-  it('pull_request closed+merged → merged', () => {
+  it('pull_request closed+merged → null (close routine handles terminal events)', () => {
     const t = taskFromGitHubEvent('pull_request', { ...repo, action: 'closed', pull_request: { number: 8, title: 'Y', merged: true } })
-    expect(t?.title).toContain('PR #8 merged: Y')
+    expect(t).toBeNull()
+  })
+  it('pull_request synchronize/edited → null (lifecycle noise)', () => {
+    expect(taskFromGitHubEvent('pull_request', { ...repo, action: 'synchronize', pull_request: { number: 9, title: 'Z' } })).toBeNull()
+    expect(taskFromGitHubEvent('pull_request', { ...repo, action: 'edited', pull_request: { number: 9, title: 'Z' } })).toBeNull()
+    expect(taskFromGitHubEvent('pull_request', { ...repo, action: 'ready_for_review', pull_request: { number: 9, title: 'Z' } })).toBeNull()
+  })
+  it('pull_request reopened → a work unit', () => {
+    const t = taskFromGitHubEvent('pull_request', { ...repo, action: 'reopened', pull_request: { number: 10, title: 'Back', html_url: 'u' } })
+    expect(t?.title).toBe('[GH Digidinc/Digid] PR #10 reopened: Back')
   })
   it('workflow_run completed → CI work unit', () => {
     const t = taskFromGitHubEvent('workflow_run', { ...repo, workflow_run: { name: 'CI', conclusion: 'failure', head_branch: 'main', status: 'completed' } })

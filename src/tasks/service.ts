@@ -449,6 +449,44 @@ export async function syncTaskStatusFromIssue(
 }
 
 /**
+ * GH PR event-mirror close routine (inbound webhook).
+ *
+ * PR webhook tasks are created with skipMirror, so `github_issue_url` is null.
+ * Identity is the PR html_url in `body` (first line) and/or the title prefix
+ * `[GH <repo>] PR #<n> `. On pull_request.closed (merged or not), mark every
+ * matching open/in_progress ungated mirror done — same fail-closed discipline as
+ * syncTaskStatusFromIssue (never clobber review/approved/rejected/gated rows).
+ */
+export async function closeGitHubPrMirrorTasks(
+  env: Env,
+  args: { htmlUrl: string; repo: string; prNumber: number },
+): Promise<{ updated: number }> {
+  const htmlUrl = args.htmlUrl.trim()
+  const repo = args.repo.trim()
+  const prNumber = args.prNumber
+  if (!htmlUrl || !repo || !Number.isInteger(prNumber) || prNumber <= 0) {
+    return { updated: 0 }
+  }
+  const now = new Date().toISOString()
+  const titlePrefix = `[GH ${repo}] PR #${prNumber} %`
+  // Body is stored as `${html_url}\nevent: pull_request.<action>` — match url as
+  // the full body OR as the first line. Title match covers older/odd rows.
+  const res = await env.DB.prepare(
+    `UPDATE tasks SET status = 'done', completed_at = ?1, updated_at = ?1
+      WHERE status IN ('open','in_progress')
+        AND (gate_owner IS NULL OR gate_owner = '')
+        AND (
+          body = ?2
+          OR body LIKE ?3
+          OR title LIKE ?4
+        )`,
+  )
+    .bind(now, htmlUrl, `${htmlUrl}\n%`, titlePrefix)
+    .run()
+  return { updated: Number(res.meta?.changes ?? 0) }
+}
+
+/**
  * D3 — CI feedback: a completed workflow_run for PR #`prNumber` writes its `conclusion` onto
  * the task whose github_issue_url is that PR. A failing/cancelled/timed-out conclusion on a
  * task in `review` bumps it back to `in_progress` (the agent's work needs another pass);
