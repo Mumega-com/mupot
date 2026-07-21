@@ -218,6 +218,10 @@ import { handleQueue } from './bus/consumer'
 // Metabolism — the pot heartbeat that pulses goal-bearing work-units (#27 loop, made autonomous).
 import { runMetabolism } from './agents/metabolism'
 import { runLoopsTick } from './loops/driver'
+// Per-project concierge (Module Kernel Leg 1) — the always-on dispatcher. Builds on
+// Port 1 (module_registry + presence, #457): each active project gets one cycle per
+// tick (register presence, decide, dispatch a starter task when stalled+idle).
+import { runConciergeTick } from './concierge/service'
 import { syncGitHubProject } from './integrations/github-projects'
 // Growth cron step — active-guarded, fail-soft collection of growth metrics each tick.
 import { runGrowthCollection } from './departments/collectors/growth-cron'
@@ -234,7 +238,7 @@ export default {
   // Queue and scheduled handlers are preserved unchanged (spec §A.2).
   queue: handleQueue,
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Seven independent heartbeats on the same */15 cron:
+    // Eight independent heartbeats on the same */15 cron:
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
     //     ("design loops, not prompts"; without this the v0.3.0 loop never fires).
@@ -251,6 +255,11 @@ export default {
     //     missing/broken source never blocks. Fail-soft. Logic: src/cro/collect.ts.
     //  7. Flight event outbox — retry attributed terminal events whose immediate
     //     Queue delivery failed after the atomic landing receipt was committed.
+    //  8. Project concierge (Module Kernel Leg 1) — one cycle per active project:
+    //     register presence, then dispatch a starter task when the project has a
+    //     goal + idle online build capacity + zero advancing tasks. Heuristic MVP,
+    //     no model call (model-seam left injectable for Sol later); idempotent by
+    //     design (rank, never act-loop) — see src/concierge/service.ts.
     ctx.waitUntil(reconcileMembership(env))
     ctx.waitUntil(runMetabolism(env))
     ctx.waitUntil(runLoopsTick(env))
@@ -258,5 +267,6 @@ export default {
     ctx.waitUntil(runGrowthCollection(env))
     ctx.waitUntil(runCroCollection(env).then(() => undefined))
     ctx.waitUntil(flushFlightEventOutbox(env).then(() => undefined))
+    ctx.waitUntil(runConciergeTick(env).then(() => undefined))
   },
 }
