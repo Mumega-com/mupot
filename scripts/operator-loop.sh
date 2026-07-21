@@ -3,8 +3,10 @@
 #
 # Always-on governed dispatcher: each cycle polls the mumega pot board for
 # tasks assigned to each wired technician (cursor, mumcp) and status=open,
-# dispatches them via the matching *-worker.py driver, then sleeps and
-# repeats. Both drivers already enforce the gate on their own:
+# dispatches them via the matching *-worker.py driver, then runs the GATE
+# lane driver (review-worker.py) over whatever landed in `review` this cycle
+# (including from prior cycles), then sleeps and repeats. All three drivers
+# already enforce the gate on their own:
 #   - cursor-worker.py: isolated git worktree, verify (tsc/tests), driver
 #     pushes + opens a PR, task -> review, gate_owner=gate:kasra-core.
 #     Cursor never touches the remote and cannot self-close its own task
@@ -12,13 +14,24 @@
 #   - mumcp-worker.py: headless claude -p in the WordPress project dir,
 #     WordPress writes are server-forced DRAFT, task -> review,
 #     gate_owner=gate:kasra-core.
-# Neither driver merges, deploys, publishes, or verdicts a task — that stays
-# with the human/Kasra-core gate via task_verdict. This supervisor adds no
-# new capability on top of either driver; it only sequences+repeats them.
+#   - review-worker.py: the GATE lane. Polls `review` tasks with a linked PR,
+#     dispatches a DIFFERENT model+vendor (Claude, zero tools, isolated
+#     scratch cwd) for an adversarial read of the real PR diff, and posts a
+#     recommended verdict as an audit receipt. REVIEW-ONLY by default
+#     (REVIEW_AUTOMERGE unset/0) — it never verdicts or merges; that stays
+#     with Kasra-core. An auto-merge path exists but is flag-gated OFF and,
+#     even when enabled, only fires on GREEN + non-sensitive-surface + green
+#     CI + the canonical repo — anything else parks for the human gate.
+# No driver here merges, deploys, publishes, or verdicts a task by default —
+# that stays with the human/Kasra-core gate via task_verdict. This
+# supervisor adds no new capability on top of any driver; it only
+# sequences+repeats them, build lane first, then gate lane.
 #
-# Idle-safe by construction: both drivers filter task_list to their own
-# assignee_agent_id + status=open. An empty board (no tasks assigned to
-# either agent) is a no-op cycle — no worktree, no dispatch, no task_update.
+# Idle-safe by construction: the build drivers filter task_list to their own
+# assignee_agent_id + status=open; review-worker filters to status=review +
+# gate_owner=gate:kasra-core + a parsed PR link. An empty board (no open
+# tasks for either builder, no ungated review tasks) is a no-op cycle — no
+# worktree, no dispatch, no task_update, no gh/claude calls.
 #
 # Single-instance (flock). Never dies on one cycle's failure — a bad cycle
 # (network blip, one driver erroring) logs and the loop continues; the next
@@ -69,6 +82,7 @@ run_driver(){
 while [ "$STOP" -eq 0 ]; do
   run_driver "cursor" "$REPO/scripts/cursor-worker.py"
   run_driver "mumcp"  "$REPO/scripts/mumcp-worker.py"
+  run_driver "review" "$REPO/scripts/review-worker.py"
 
   # Sleep in short slices so SIGTERM is honored promptly instead of blocking
   # for up to $INTERVAL seconds.
