@@ -449,6 +449,14 @@ export async function syncTaskStatusFromIssue(
 }
 
 /**
+ * Escape SQLite LIKE metacharacters (% and _) plus the escape char itself.
+ * Use with `LIKE ? ESCAPE '\\'`.
+ */
+function escapeSqliteLikeLiteral(value: string): string {
+  return value.replace(/[\\%_]/g, (ch) => `\\${ch}`)
+}
+
+/**
  * Close stale GitHub PR *event-mirror* tasks when a PR is closed/merged.
  *
  * Webhooks create open tasks titled `[GH <repo>] PR #<n> opened: …`. Without a
@@ -466,12 +474,12 @@ export async function closeGitHubPrMirrorTasks(
   const now = new Date().toISOString()
   // Title shape from taskFromGitHubEvent: `[GH <repo>] PR #<n> <action>: …`
   const prefix = `[GH ${repo}] PR #${prNumber} `
-  const like = `${prefix}%`
+  const like = `${escapeSqliteLikeLiteral(prefix)}%`
   const res = await env.DB.prepare(
     `UPDATE tasks SET status = 'done', completed_at = ?1, updated_at = ?1, result = COALESCE(result, 'github_pr_closed')
       WHERE status IN ('open', 'in_progress')
         AND gate_owner IS NULL
-        AND title LIKE ?2`,
+        AND title LIKE ?2 ESCAPE '\\'`,
   )
     .bind(now, like)
     .run()

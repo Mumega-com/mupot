@@ -22,7 +22,10 @@ and the [flock harness pack contract](../../../docs/flock-harness-pack-contract.
    Skills land under the agent workspace `.cursor/skills/` — do **not** copy them into mupot.
 
 2. **Mint a scoped token.** Operator mints via `mint_agent_token` (MCP) or dashboard —
-   agent-bound, member-capable on the target squad. Never an org-admin token in the agent.
+   **project-scoped** (`project=<slug>`) **and agent-bound** to this agent's name
+   ([flock contract](../../../docs/flock-harness-pack-contract.md) #44 — one-project
+   isolation; the bus enforces `from == token.agent`). Member-capable on the target
+   squad. Never a free-floating org-admin or null-scoped member token in the agent.
 
 3. **Drop MCP config.** Copy `.mcp.json.template` → `.mcp.json` (gitignored) and replace
    `<MUPOT_MEMBER_TOKEN>`. Point at this pot's MCP endpoint

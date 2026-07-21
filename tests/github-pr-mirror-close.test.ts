@@ -28,7 +28,14 @@ describe('closeGitHubPrMirrorTasks', () => {
     expect(res.closed).toBe(2)
     expect(calls[0].sql).toContain("status = 'done'")
     expect(calls[0].sql).toContain('gate_owner IS NULL')
+    expect(calls[0].sql).toContain("ESCAPE '\\'")
     expect(calls[0].args[1]).toBe('[GH Mumega-com/mupot] PR #437 %')
+  })
+
+  it('escapes LIKE wildcards in repo names containing _ or %', async () => {
+    const { env, calls } = dbEnv(1)
+    await closeGitHubPrMirrorTasks(env, 'org/foo_bar', 12)
+    expect(calls[0].args[1]).toBe('[GH org/foo\\_bar] PR #12 %')
   })
 
   it('no-ops on invalid input', async () => {

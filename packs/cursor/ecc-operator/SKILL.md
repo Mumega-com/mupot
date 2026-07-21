@@ -13,15 +13,20 @@ You are client-optimized by **ECC** (skills/hooks). Your **output is governed by
 ## Session start
 
 1. `boot_context` — identity from the bearer token (never invent tenant/agent).
-2. `orient` — basin packet; follow assigned tasks only.
-3. `inbox` — consume operator messages; ack via `send` when asked.
+2. `check_in` — announce presence on your project (your bound agent name); shows you live in Fleet.
+3. `orient` — basin packet; follow assigned tasks only.
+4. `inbox` — consume operator messages; ack via `send` when asked.
+
+Refresh presence while working (`check_in` on start; a heartbeat hook or cron if idle —
+see [flock contract](../../../docs/flock-harness-pack-contract.md)).
 
 ## Work loop
 
-1. `task_list` — claim open work assigned to you (or unassigned with clear ownership).
-2. Do the work in the repo/worktree named by the task.
-3. `task_update` → `status: "review"`, set `gate_owner` (e.g. `gate:kasra-core`).
-4. Stop. A **different** principal calls `task_verdict`. **You must not verdict your own task.**
+1. `task_list` — see open work assigned to you (or unassigned with clear ownership).
+2. Claim via `task_update` → `status: "in_progress"` (set assignee if the task is unassigned).
+3. Do the work in the repo/worktree named by the task.
+4. `task_update` → `status: "review"`, set `gate_owner` (e.g. `gate:kasra-core`).
+5. Stop. A **different** principal calls `task_verdict`. **You must not verdict your own task.**
 
 ## Admin / operator tools (only if your token is org-admin)
 

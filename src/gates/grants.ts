@@ -28,7 +28,10 @@ export type GateGrantValidationError =
   | 'invalid_principal_type'
   | 'invalid_principal_id'
 
-/** Gate capabilities are named `gate:<owner>` (e.g. gate:kasra-core). */
+/** Gate capabilities are named `gate:<owner>` (e.g. gate:kasra-core).
+ *  HTTP/MCP grant paths accept gate:* only by design — surface caps
+ *  (content:write, outreach:send-gated, …) also live in gate_grants but are
+ *  minted via preset/dashboard, not grant_gate_capability. */
 const GATE_CAPABILITY_RE = /^gate:[a-zA-Z0-9][a-zA-Z0-9:_-]{0,120}$/
 
 export function parseGateGrantArgs(input: {

@@ -18,10 +18,11 @@ On `pull_request.closed`, the webhook:
 Implementation: `src/tasks/service.ts` (`closeGitHubPrMirrorTasks`) +
 `src/integrations/github-routes.ts`.
 
-## Operator backfill
+## Operator backfill (optional, outside this repo)
 
-When webhooks were down or the board is already polluted, use the ECC-adapted
-Cursor skill/script (not Worker code):
+When webhooks were down or the board is already polluted, operators may run an
+ECC-adapted Cursor backfill **outside the Worker repo** (not shipped in mupot).
+Example paths on the operator's host workspace (e.g. the mumega.com monorepo):
 
 - Skill: `agents/cursor/.cursor/skills/gh-pr-mirror-close/`
 - Script: `agents/cursor/.cursor/scripts/gh-pr-mirror-sync-close.py`
