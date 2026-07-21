@@ -1,0 +1,21 @@
+[Unit]
+Description=mupot standing operator (headless multi-technician loop: cursor + mumcp)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env bash %h/mupot/scripts/operator-loop.sh
+Restart=always
+RestartSec=30
+Environment=PATH=/home/mumega/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=REPO=%h/mupot
+Environment=MUPOT_MCP=https://mupot.mumega.com/mcp
+Environment=OPERATOR_INTERVAL=300
+Environment=MAX_TASKS=1
+Environment=GATE_OWNER=gate:kasra-core
+Environment=CURSOR_TOKEN=%h/.fleet/agents/cursor-member.token
+Environment=MUMCP_TOKEN=%h/.fleet/agents/mumega-mumcp-member.token
+
+[Install]
+WantedBy=default.target
