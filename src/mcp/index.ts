@@ -84,6 +84,7 @@ import { hasProjectWriteForSquads } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
+import { PRESENCE_TOOLS } from './presence'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -2643,6 +2644,7 @@ export const TOOLS: ToolSpec[] = [
   ...ADDON_TOOLS,
   ...GATE_GRANT_TOOLS,
   ...LOOP_TOOLS,
+  ...PRESENCE_TOOLS,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
