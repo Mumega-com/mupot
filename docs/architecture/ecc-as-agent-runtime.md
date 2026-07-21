@@ -121,13 +121,15 @@ The operator's output is governed by routing it through the pot's gate:
    self-verdict block guarantees the operator cannot rubber-stamp itself.
 4. The verdict writes a **receipt**.
 
-**Provisioning gap found live:** the gate agent's token must hold the
-`gate:<owner>` grant, and there is currently **no MCP tool to grant it**. Grants
-are written by the preset-mint path into the `gate_grants` table
-(`src/dashboard/keys.ts`); to onboard a gate agent today, insert the
-`gate:<owner>` capability row directly into `gate_grants`. A
-**`grant_gate_capability` MCP tool is a follow-up** so this becomes a first-class,
-receipted operation rather than a manual insert.
+**Provisioning:** the gate agent's principal must hold the `gate:<owner>` grant.
+Org-admins grant/revoke it in-band via MCP **`grant_gate_capability`** /
+**`revoke_gate_capability`** (twins of `POST/DELETE /api/gates/grants`, shared
+write path `src/gates/grants.ts`). No SQL insert required.
+
+## Operator packs
+
+- Cursor + ECC: [`packs/cursor/ecc-operator/`](../../packs/cursor/ecc-operator/)
+- Claude flock (+ optional ECC profile): [`packs/claude-code/flock-agent/`](../../packs/claude-code/flock-agent/)
 
 ## What we adopt vs skip
 

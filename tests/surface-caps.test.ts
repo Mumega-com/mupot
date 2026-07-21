@@ -297,7 +297,9 @@ describe('outreach:send-gated gate wired in tasks/index.ts (structural)', () => 
   )
 
   it('surface gate code present: hasSurfaceCap imported', () => {
-    expect(tasksSource).toContain("import { resolveCapabilities, hasCapability, hasSurfaceCap } from '../auth/capability'")
+    expect(tasksSource).toMatch(
+      /import\s*\{[^}]*\bhasSurfaceCap\b[^}]*\}\s*from\s*'\.\.\/auth\/capability'/,
+    )
   })
 
   it('surface gate fires when gate_owner=gate:loops and verdict=approved', () => {

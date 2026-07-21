@@ -15,7 +15,7 @@
 
 import { Hono } from 'hono'
 import type { Env } from '../types'
-import { createTask, syncTaskStatusFromIssue, syncCiResultToTask } from '../tasks/service'
+import { createTask, syncTaskStatusFromIssue, syncCiResultToTask, closeGitHubPrMirrorTasks } from '../tasks/service'
 import { syncGitHubProject } from './github-projects'
 import { recordMergedPr } from '../agents/kpi-sources'
 
@@ -339,6 +339,36 @@ githubInboundApp.post('/', async (c) => {
   const mapped = taskFromGitHubEvent(eventType, payload)
   if (!mapped) return c.json({ ok: true, ignored: eventType }) // ping / unhandled — ack, don't record
 
+  // PR close-stale (ECC pattern): close open/in_progress ungated mirrors for this
+  // PR number; do NOT create a new "closed/merged" noise task.
+  if (eventType === 'pull_request') {
+    const action = typeof payload.action === 'string' ? payload.action : ''
+    const pr = (payload.pull_request ?? {}) as { number?: number; title?: string; merged?: boolean }
+    const repo = safeField((payload.repository as { full_name?: string })?.full_name, 80)
+
+    if (action === 'closed' && Number.isInteger(pr.number)) {
+      const { closed } = await closeGitHubPrMirrorTasks(c.env, repo, pr.number as number)
+      if (pr.merged === true) {
+        const prTitle = safeField(pr.title, 200) || null
+        try {
+          await recordMergedPr(c.env, {
+            repo,
+            prNumber: pr.number as number,
+            title: prTitle,
+          })
+        } catch {
+          // best-effort — webhook must always ack even if the record fails
+        }
+      }
+      return c.json({ ok: true, mirrors_closed: closed })
+    }
+
+    // synchronize / edited / labeled / … are noise — do not mint tasks.
+    if (action !== 'opened' && action !== 'reopened') {
+      return c.json({ ok: true, ignored: `pull_request.${action}` })
+    }
+  }
+
   const squadId = await resolveInboundSquad(c.env, eventLabels(payload))
   if (!squadId) return c.json({ ok: true, skipped: true, reason: 'no_squad' })
 
@@ -346,27 +376,6 @@ githubInboundApp.post('/', async (c) => {
   // that reflects untrusted PR fields under our token + risks a feedback loop (P1).
   // #142: GitHub event mapped to task — predicate is the triggering event resolved.
   await createTask(c.env, { squad_id: squadId, title: mapped.title, body: mapped.body, done_when: `GitHub event ${eventType} resolved`, status: 'open' }, { skipMirror: true })
-
-  // S4b: if this is a merged pull_request, record it in github_prs_merged for the
-  // 'github_prs' KPI source. Best-effort: a record failure never blocks the ack.
-  // The KPI source reads from this table (event-fed, no polling, no new secrets).
-  if (eventType === 'pull_request') {
-    const action = typeof payload.action === 'string' ? payload.action : ''
-    const pr = (payload.pull_request ?? {}) as { number?: number; title?: string; merged?: boolean }
-    if (action === 'closed' && pr.merged === true && Number.isInteger(pr.number)) {
-      const repo = safeField((payload.repository as { full_name?: string })?.full_name, 80)
-      const prTitle = safeField(pr.title, 200) || null
-      try {
-        await recordMergedPr(c.env, {
-          repo,
-          prNumber: pr.number as number,
-          title: prTitle,
-        })
-      } catch {
-        // best-effort — webhook must always ack even if the record fails
-      }
-    }
-  }
 
   return c.json({ ok: true })
 })
