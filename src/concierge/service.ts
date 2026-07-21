@@ -21,11 +21,28 @@
 // can replace it later without touching the register/read/dispatch plumbing — see
 // the "model-seam for later" note on decideHeuristically().
 //
-// IDEMPOTENCY IS THE LAW (brain=ATC: rank, never act-loop). The dedup check
-// (hasAdvancingTask) runs AFTER a dispatch decision would otherwise fire and BEFORE
-// any task is created — a project with any open/in_progress/review task never gets
-// a second starter task. Same state in -> same decision out -> no duplicate
-// dispatch, no matter how many times the cron tick calls this per heartbeat.
+// IDEMPOTENCY IS THE LAW (brain=ATC: rank, never act-loop). This is an MVP heuristic,
+// not the goal-tracking Sol-brain — its job is to give a stalled project ONE nudge,
+// never to keep re-dispatching toward the goal forever. So the invariant is
+// dispatch-once-ever per project: once the concierge has ever created a starter task
+// for a project, it never creates another one, no matter what happens to that task
+// afterward (reworked, rejected, approved, done — none of it clears the "already
+// nudged this project" fact). "Keep advancing the goal" is deliberately NOT this
+// file's job.
+//
+// Two dedup layers enforce that:
+//   1. hasConciergeStarter — ANY-STATUS existence check for a prior concierge-
+//      originated task (CONCIERGE_STARTER_MARKER in the body) on this project. This is
+//      the primary guard and it does not filter by status at all (see its own doc
+//      comment for why enumerating statuses is exactly the bug class this fixes).
+//   2. hasAdvancingTask — the pre-existing "does ANYONE (not just the concierge) have
+//      live work on this project right now" check, kept for the separate case of a
+//      human/other-automation task already in flight that the concierge should not
+//      pile onto.
+// Both run AFTER a dispatch decision would otherwise fire and BEFORE any task is
+// created. A residual check-then-create race is closed at the DB layer by migration
+// 0067's partial UNIQUE index on tasks(project_id) WHERE the marker is present — see
+// isConciergeStarterUniqueViolation below.
 
 import type { Env, Project } from '../types'
 import { listProjects } from '../projects/service'
@@ -44,12 +61,29 @@ export const BUILD_CAPABILITY = 'build'
  * future capability list drifts. */
 const CONCIERGE_CAPABILITIES: readonly string[] = ['dispatch', 'concierge']
 
-/** Task statuses that mean "the project already has advancing work" — the dedup
- * guard behind the anti-spam invariant. Matches the set src/projects/situation.ts
- * treats as active work (blocked/review/in_progress/open) minus 'blocked': a
- * blocked task still means someone is already engaged with the project, so it also
- * counts as "not idle capacity" and is included below. */
+/** Task statuses that mean "someone (anyone) already has live work on this project
+ * right now" — the secondary dedup guard, kept for the case of a human/other-
+ * automation task already in flight. Matches the set src/projects/situation.ts
+ * treats as active work (blocked/review/in_progress/open): a blocked task still
+ * means someone is already engaged with the project, so it also counts as "not
+ * idle capacity" and is included below.
+ *
+ * NOTE: this is deliberately NOT the guard against re-dispatching a concierge
+ * starter — that was the P0 (adversarial gate, PR #459): a starter task that left
+ * this "live" set (approved/rejected/done) while the project goal was still set
+ * caused an unbounded re-dispatch loop, because nothing here ever re-checks
+ * "did *I* already start this project." That guard is hasConciergeStarter below,
+ * which intentionally does NOT filter by status at all — see its doc comment. */
 const ADVANCING_STATUSES = ['open', 'in_progress', 'review', 'blocked'] as const
+
+/** Sentinel embedded in the body of every task the concierge dispatches. This is the
+ * ONLY thing that distinguishes a concierge-originated starter from any other task on
+ * the board — the tasks table has no structured origin/kind/source column for
+ * locally-created tasks (source_pot, migration 0063, is a *different* concept: NULL
+ * vs. a linked-pot slug for cross-pot provenance, not "which local subsystem wrote
+ * this row"). A body sentinel is the cheapest correct option that needs no schema
+ * change to CreateTaskInput/tasks and is trivial to query with instr(). */
+export const CONCIERGE_STARTER_MARKER = '[concierge-starter]'
 
 /** Cap on projects driven per cron tick — mirrors loops/driver.ts's MAX_LOOPS_PER_TICK. */
 export const MAX_PROJECTS_PER_TICK = 25
@@ -67,6 +101,7 @@ export type ConciergeNoopReason =
   | 'no_goal' // project.goal is empty — nothing to dispatch toward
   | 'no_online_builder' // no roster entry is online with BUILD_CAPABILITY and resolves to a real active agent
   | 'has_advancing_work' // an open/in_progress/review/blocked task already exists for this project
+  | 'already_dispatched' // a concierge starter for this project already exists in ANY status (dispatch-once-ever), or a concurrent tick just created one (migration 0067 unique-index race loss)
   | 'error' // a read seam (roster / dedup check) failed; fail-closed to no-op, never dispatch on uncertain state
 
 export type ConciergeDecision =
@@ -110,6 +145,40 @@ async function defaultHasAdvancingTask(env: Env, projectId: string): Promise<boo
   return row !== null
 }
 
+/**
+ * defaultHasConciergeStarter — "has the concierge EVER dispatched a starter task for
+ * this project, in any status?" Deliberately does NOT filter by status at all (no
+ * enumerated status list to keep in sync) — that is the exact bug class the P0 fixed:
+ * ADVANCING_STATUSES enumerated only the "live" subset, so a starter that moved to
+ * approved/rejected/done fell out of the check and got re-dispatched. Matching on the
+ * body marker with no status predicate means a future status value (were one ever
+ * added) cannot silently reopen the same hole — there is no list to forget to extend.
+ */
+async function defaultHasConciergeStarter(env: Env, projectId: string): Promise<boolean> {
+  const row = await env.DB.prepare(`SELECT 1 FROM tasks WHERE project_id = ?1 AND instr(body, ?2) > 0 LIMIT 1`)
+    .bind(projectId, CONCIERGE_STARTER_MARKER)
+    .first()
+  return row !== null
+}
+
+/**
+ * isConciergeStarterUniqueViolation — true when `error` is the D1/SQLite constraint
+ * failure from migration 0067's partial unique index (tasks(project_id) WHERE the
+ * concierge-starter marker is present). This is the TOCTOU backstop: two overlapping
+ * cron ticks for the same project can both pass the hasConciergeStarter read as "no
+ * starter yet" before either writes; whichever INSERT lands second hits this
+ * constraint instead of creating a duplicate row. The caller treats it exactly like
+ * finding a prior starter on the read path — reason 'already_dispatched' — rather
+ * than counting it as a tick error.
+ */
+function isConciergeStarterUniqueViolation(error: unknown): boolean {
+  return (
+    error instanceof Error
+    && error.message.includes('UNIQUE constraint failed')
+    && error.message.includes('tasks.project_id')
+  )
+}
+
 async function defaultResolveDispatchSquad(env: Env, projectId: string): Promise<string> {
   const row = await env.DB.prepare(
     `SELECT squad_id FROM project_squad_access
@@ -131,6 +200,7 @@ export interface ConciergeDeps {
   listProjects?: (env: Env) => Promise<Project[]>
   listPresence?: (env: Env, opts: { projectId?: string | null }) => Promise<ModulePresence[]>
   hasAdvancingTask?: (env: Env, projectId: string) => Promise<boolean>
+  hasConciergeStarter?: (env: Env, projectId: string) => Promise<boolean>
   resolveAgent?: (env: Env, identity: string) => Promise<ResolvedAgent | null>
   resolveDispatchSquad?: (env: Env, projectId: string) => Promise<string>
   createTask?: (env: Env, input: CreateTaskInput) => Promise<Task>
@@ -173,10 +243,12 @@ async function pickOnlineBuilder(
  *     dispatch-safety issue).
  *  b. Read state: goal, roster.
  *  c. Decide (heuristic, idempotent): non-empty goal AND an online build-capable
- *     agent AND zero advancing tasks -> dispatch one starter task. Otherwise no-op.
+ *     agent AND no prior concierge starter for this project (any status) AND zero
+ *     advancing tasks -> dispatch one starter task. Otherwise no-op.
  *  d. Dispatch: create the task via the existing createTask() path (never a raw
  *     INSERT) so every invariant it enforces (done_when required, project/squad
- *     attribution, GitHub mirror, task.created event) applies here too.
+ *     attribution, GitHub mirror, task.created event) applies here too. The insert
+ *     can itself fail closed on migration 0067's unique index (concurrent-tick race).
  */
 export async function runProjectConcierge(
   env: Env,
@@ -187,6 +259,7 @@ export async function runProjectConcierge(
   const registerPresence = deps.registerPresence ?? registerModule
   const listRoster = deps.listPresence ?? defaultListPresence
   const hasAdvancingTask = deps.hasAdvancingTask ?? defaultHasAdvancingTask
+  const hasConciergeStarter = deps.hasConciergeStarter ?? defaultHasConciergeStarter
   const resolveAgent = deps.resolveAgent ?? defaultResolveAgent
   const resolveDispatchSquad = deps.resolveDispatchSquad ?? defaultResolveDispatchSquad
   const create = deps.createTask ?? createTask
@@ -234,6 +307,22 @@ export async function runProjectConcierge(
     return { registered, decision: { action: 'noop', reason: 'no_online_builder' }, taskId: null }
   }
 
+  // Dispatch-once-ever (P0 fix, adversarial gate on PR #459): has the concierge EVER
+  // dispatched a starter for this project, in ANY status? Checked before the "live
+  // work" check below and independent of it — a starter that has gone
+  // approved/rejected/done must NOT be re-dispatched just because it fell out of the
+  // "advancing" set. See hasConciergeStarter's doc comment for why this has no status
+  // filter at all.
+  let alreadyDispatched: boolean
+  try {
+    alreadyDispatched = await hasConciergeStarter(env, project.id)
+  } catch {
+    return { registered, decision: { action: 'noop', reason: 'error' }, taskId: null }
+  }
+  if (alreadyDispatched) {
+    return { registered, decision: { action: 'noop', reason: 'already_dispatched' }, taskId: null }
+  }
+
   let advancing: boolean
   try {
     advancing = await hasAdvancingTask(env, project.id)
@@ -248,17 +337,34 @@ export async function runProjectConcierge(
   }
 
   // (d) Dispatch — exactly one starter task, through the canonical createTask() path.
+  // The body carries CONCIERGE_STARTER_MARKER so future cycles' hasConciergeStarter
+  // check (and migration 0067's unique index) can recognize this row as "already
+  // nudged this project" for the rest of its life, regardless of status.
   const squadId = await resolveDispatchSquad(env, project.id)
-  const task = await create(env, {
-    squad_id: squadId,
-    project_id: project.id,
-    title: `Starter: ${project.name}`,
-    body: `Concierge dispatch (MVP heuristic) — project has capacity and no active work.\n\nProject goal: ${goal}`,
-    done_when: `Progress made toward the project goal: ${goal}`,
-    assignee_agent_id: builder.id,
-    gate_owner: 'gate:kasra-core',
-    status: 'open',
-  })
+  let task: Task
+  try {
+    task = await create(env, {
+      squad_id: squadId,
+      project_id: project.id,
+      title: `Starter: ${project.name}`,
+      body: `Concierge dispatch (MVP heuristic) — project has capacity and no active work.\n\nProject goal: ${goal}\n\n${CONCIERGE_STARTER_MARKER}`,
+      done_when: `Progress made toward the project goal: ${goal}`,
+      assignee_agent_id: builder.id,
+      gate_owner: 'gate:kasra-core',
+      status: 'open',
+    })
+  } catch (error) {
+    // TOCTOU backstop (P1 fix): a concurrent tick raced us between the
+    // hasConciergeStarter read above and this INSERT and won — migration 0067's
+    // partial unique index refuses the second row at the DB layer. Treat exactly
+    // like finding a prior starter on the read path; do not let it surface as a
+    // sweep error (runConciergeTick would otherwise count a benign race as a
+    // broken project).
+    if (isConciergeStarterUniqueViolation(error)) {
+      return { registered, decision: { action: 'noop', reason: 'already_dispatched' }, taskId: null }
+    }
+    throw error
+  }
 
   return { registered, decision: { action: 'dispatch', agentId: builder.id }, taskId: task.id }
 }

@@ -162,11 +162,128 @@ describe('runProjectConcierge — idempotency (the anti-spam proof)', () => {
     expect(first.decision.action).toBe('dispatch')
 
     const second = await runProjectConcierge(env, p)
-    expect(second.decision).toEqual({ action: 'noop', reason: 'has_advancing_work' })
+    // 'already_dispatched' (the dispatch-once-ever, any-status guard) fires here
+    // rather than 'has_advancing_work' — both are technically true (the task is
+    // still 'open' AND carries the marker), but hasConciergeStarter is checked
+    // first since it is the primary invariant this file enforces (P0 fix, PR #459).
+    expect(second.decision).toEqual({ action: 'noop', reason: 'already_dispatched' })
     expect(second.taskId).toBeNull()
 
     // The dedup guard is the whole point of this test: fails here if it's ever removed.
     const rows = countTasks(harness, p.id)
+    expect(rows).toHaveLength(1)
+  })
+})
+
+describe('runProjectConcierge — dispatch-once-ever across the FULL task lifecycle (P0 regression, PR #459 gate)', () => {
+  // The pre-fix dedup (ADVANCING_STATUSES = open/in_progress/review/blocked) only
+  // covered "live" statuses. A starter that moved to done/rejected/approved fell out
+  // of that set entirely, so — with project.goal still set (nothing clears it) — the
+  // NEXT cycle saw "no advancing task" and dispatched a byte-identical second starter.
+  // Left running on a cron, that is an unbounded per-tick duplicate-task flood. Each
+  // case below MUST fail against the pre-fix code (verified by temporarily reverting
+  // the hasConciergeStarter guard — see the task's final report for how).
+
+  it('starter dispatched -> moved to done, goal still set -> second cycle does NOT re-dispatch', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    await registerBuilderOnline(env, p.id)
+
+    const first = await runProjectConcierge(env, p)
+    expect(first.decision.action).toBe('dispatch')
+    const taskId = first.taskId
+    expect(taskId).toBeTruthy()
+
+    // Move the dispatched starter all the way to 'done' — a terminal status the
+    // pre-fix ADVANCING_STATUSES list never covered.
+    harness.sqlite.exec(`UPDATE tasks SET status = 'done' WHERE id = '${taskId}'`)
+
+    const second = await runProjectConcierge(env, p)
+    expect(second.decision).toEqual({ action: 'noop', reason: 'already_dispatched' })
+    expect(second.taskId).toBeNull()
+
+    const rows = countTasks(harness, p.id)
+    expect(rows).toHaveLength(1) // no duplicate starter created
+  })
+
+  it('starter dispatched -> moved to rejected (un-reworked), goal still set -> no re-dispatch', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    await registerBuilderOnline(env, p.id)
+
+    const first = await runProjectConcierge(env, p)
+    expect(first.decision.action).toBe('dispatch')
+    const taskId = first.taskId
+
+    harness.sqlite.exec(`UPDATE tasks SET status = 'rejected' WHERE id = '${taskId}'`)
+
+    const second = await runProjectConcierge(env, p)
+    expect(second.decision).toEqual({ action: 'noop', reason: 'already_dispatched' })
+    expect(second.taskId).toBeNull()
+    expect(countTasks(harness, p.id)).toHaveLength(1)
+  })
+
+  it('starter dispatched -> moved to approved (not yet done), goal still set -> no double-dispatch', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    await registerBuilderOnline(env, p.id)
+
+    const first = await runProjectConcierge(env, p)
+    expect(first.decision.action).toBe('dispatch')
+    const taskId = first.taskId
+
+    harness.sqlite.exec(`UPDATE tasks SET status = 'approved' WHERE id = '${taskId}'`)
+
+    const second = await runProjectConcierge(env, p)
+    expect(second.decision).toEqual({ action: 'noop', reason: 'already_dispatched' })
+    expect(second.taskId).toBeNull()
+    expect(countTasks(harness, p.id)).toHaveLength(1)
+  })
+})
+
+describe('runProjectConcierge — TOCTOU backstop (P1, migration 0067 unique index)', () => {
+  it('a concurrent create that loses the race is treated as already_dispatched, not an error', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    await registerBuilderOnline(env, p.id)
+
+    // Simulate two overlapping ticks both passing BOTH read-side dedup checks as
+    // "none yet" by forcing those seams to report false, then letting this call's
+    // real INSERT collide with a starter a "concurrent" first call already wrote
+    // directly (mirrors what migration 0067's unique index would reject in
+    // production when two live ticks race the real read-then-write). Status is
+    // 'done' — a terminal status hasAdvancingTask never counts as live — so the
+    // ONLY thing standing between this call and a duplicate starter is the DB-level
+    // unique index, which is exactly what this test is proving closes the gap.
+    harness.sqlite.exec(
+      `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id)
+       VALUES ('task-concurrent', 'squad-a', '${p.id}', 'Starter: Project One',
+               'Concierge dispatch (MVP heuristic)\n\n[concierge-starter]', 'progress', 'done', 'agent-builder')`,
+    )
+
+    const result = await runProjectConcierge(env, p, {
+      hasConciergeStarter: async () => false, // force past the read-side any-status check
+      hasAdvancingTask: async () => false, // force past the read-side live-work check
+    })
+
+    expect(result.decision).toEqual({ action: 'noop', reason: 'already_dispatched' })
+    expect(result.taskId).toBeNull()
+    // Still exactly one concierge-marked row — the unique index refused the duplicate.
+    const rows = harness.sqlite
+      .prepare(`SELECT id FROM tasks WHERE project_id = ? AND instr(body, '[concierge-starter]') > 0`)
+      .all(p.id) as Array<{ id: string }>
     expect(rows).toHaveLength(1)
   })
 })
