@@ -382,7 +382,7 @@ describe('PostHog marketing adapter', () => {
 })
 
 describe('Inkwell marketing adapter', () => {
-  it('wraps the guarded GET primitive as a bounded, read-only health read', async () => {
+  it('emits posts_published=0 for a reachable single-slug GET (not a window count)', async () => {
     const secret = 'inkwell-vault-secret'
     const connector = await connectorFixture('inkwell', secret, { slug: 'home' })
     const fetchSpy = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
@@ -410,7 +410,7 @@ describe('Inkwell marketing adapter', () => {
       observations: [
         expect.objectContaining({
           metricKey: 'content.posts_published',
-          value: 1,
+          value: 0,
           unit: 'count',
           authority: 'inkwell',
           observedAt: window.end,

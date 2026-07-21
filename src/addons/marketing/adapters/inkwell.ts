@@ -61,11 +61,14 @@ export function createInkwellMarketingSource(runId: string): MarketingMonitorSou
           if (response.status === 404) return unavailable()
           const body = await response.json().catch(() => null) as Record<string, unknown> | null
           if (!(body?.ok === true && typeof body.content === 'string')) return failed()
+          // GET /:slug is a single-document health/read, not a windowed post list.
+          // Never invent value:1 from reachability — that mislabels Content-published
+          // and blocks no_posts_published_in_window for Inkwell-only sites.
           const observation: SourceObservation = {
             id: `${runId}:inkwell:${CONTENT_METRIC}`,
             runId,
             metricKey: CONTENT_METRIC,
-            value: 1,
+            value: 0,
             unit: CONTENT_UNIT,
             authority: INKWELL_AUTHORITY,
             observedAt: window.end,
