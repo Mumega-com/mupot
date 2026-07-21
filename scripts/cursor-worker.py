@@ -102,6 +102,29 @@ def git(*args: str, cwd: Path | None = None, check: bool = True) -> subprocess.C
     )
 
 
+def register_presence() -> None:
+    """Best-effort Port-1 self-registration so the concierge's dispatcher sees
+    cursor as an online 'build' capability. registerModule is an idempotent
+    upsert (src/registry/service.ts), so calling presence_register on every
+    cycle both (re-)registers and refreshes the heartbeat in one call — no
+    need to track "already registered this process" state, since each cycle
+    is a fresh one-shot process (operator-loop.sh invokes this script anew
+    every OPERATOR_INTERVAL). project_id: null is the always-open self bucket
+    (no project-access grant needed). Never raises: a presence failure must
+    not block real task work.
+    """
+    try:
+        mcp("presence_register", {
+            "adapter": "cursor",
+            "kind": "agent_system",
+            "project_id": None,
+            "capabilities": ["build"],
+        })
+        log("presence: registered/refreshed (adapter=cursor, capabilities=[build])")
+    except Exception as exc:  # noqa: BLE001 - presence is best-effort, never fatal
+        log(f"presence_register failed (non-fatal): {exc}")
+
+
 def poll_open_tasks() -> list[dict]:
     res = mcp("task_list", {"assignee_agent_id": CURSOR_AGENT_ID, "status": "open", "limit": MAX_TASKS})
     return res.get("tasks", [])[:MAX_TASKS]
@@ -235,6 +258,7 @@ def main() -> int:
     if not CURSOR_TOKEN_PATH.exists():
         log(f"no cursor token at {CURSOR_TOKEN_PATH}")
         return 2
+    register_presence()
     tasks = poll_open_tasks()
     log(f"{len(tasks)} open task(s) assigned to cursor")
     for task in tasks:
