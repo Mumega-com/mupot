@@ -7,7 +7,7 @@ import { isOrgAdmin } from '../auth/capability'
 import { resolveOrgAdmin } from '../auth/member-bearer'
 import './modules'
 import { getRegisteredAddon, listRegisteredAddons } from './registry'
-import type { AddonBindingInput } from './bindings'
+import { validateBindingInputs, type AddonBindingInput } from './bindings'
 import {
   activateAddon,
   archiveAddon,
@@ -256,37 +256,10 @@ function parseConfigureBody(
   if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'bindings') || !Array.isArray(body.bindings)) {
     return { ok: false }
   }
-  if (body.bindings.length > Math.min(maximumBindings, 16)) return { ok: false }
-
-  const bindings: AddonBindingInput[] = []
-  const slots = new Set<string>()
-  for (const value of body.bindings) {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false }
-    const binding = value as Record<string, unknown>
-    const keys = Object.keys(binding)
-    if (keys.some((key) => !['slot', 'adapter', 'bindingKind', 'connectorId'].includes(key))) return { ok: false }
-    if (
-      typeof binding.slot !== 'string'
-      || binding.slot.length === 0
-      || typeof binding.adapter !== 'string'
-      || binding.adapter.length === 0
-      || (binding.bindingKind !== 'internal_adapter' && binding.bindingKind !== 'vault_connector')
-      || (Object.hasOwn(binding, 'connectorId') && (
-        typeof binding.connectorId !== 'string' || binding.connectorId.length === 0
-      ))
-      || slots.has(binding.slot)
-    ) {
-      return { ok: false }
-    }
-    slots.add(binding.slot)
-    bindings.push({
-      slot: binding.slot,
-      adapter: binding.adapter,
-      bindingKind: binding.bindingKind,
-      ...(typeof binding.connectorId === 'string' ? { connectorId: binding.connectorId } : {}),
-    })
-  }
-  return { ok: true, bindings }
+  // Shared with the addon_configure MCP tool (src/mcp/addons.ts) — see
+  // validateBindingInputs' docstring in src/addons/bindings.ts for why this is the
+  // ONE validator both entry points call, rather than two hand-kept-in-sync copies.
+  return validateBindingInputs(body.bindings, maximumBindings)
 }
 
 function parseMonitorBody(raw: string): { ok: true; window: MonitorWindow } | { ok: false } {

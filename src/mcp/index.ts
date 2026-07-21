@@ -79,6 +79,7 @@ import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
 import { PROJECT_TOOLS } from './projects'
+import { ADDON_TOOLS } from './addons'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -439,7 +440,11 @@ async function resolveTaskSquad(
   )
 }
 
-function hasWorkspaceAdmin(auth: AuthContext): boolean {
+// Exported so sibling tool modules (src/mcp/addons.ts, provision.ts) share this ONE
+// org-admin check instead of re-deriving it — the MCP-side equivalent of
+// src/auth/capability.ts#isOrgAdmin (dashboard route gate), translated from coarse
+// session role to the capability-grant system real MCP callers carry.
+export function hasWorkspaceAdmin(auth: AuthContext): boolean {
   if (auth.capabilities === undefined) return auth.role === 'owner' || auth.role === 'admin'
   return hasCapability(auth.capabilities, 'org', null, 'admin')
 }
@@ -2524,6 +2529,7 @@ export const TOOLS: ToolSpec[] = [
   toolConnect,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
+  ...ADDON_TOOLS,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
