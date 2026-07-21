@@ -449,6 +449,36 @@ export async function syncTaskStatusFromIssue(
 }
 
 /**
+ * Close stale GitHub PR *event-mirror* tasks when a PR is closed/merged.
+ *
+ * Webhooks create open tasks titled `[GH <repo>] PR #<n> opened: …`. Without a
+ * close path those rows linger forever (the ECC close-stale pattern). This closes
+ * ungated open/in_progress mirrors for that repo+number. Never touches rows with
+ * gate_owner set (gated review work is not event noise).
+ */
+export async function closeGitHubPrMirrorTasks(
+  env: Env,
+  repoFullName: string,
+  prNumber: number,
+): Promise<{ closed: number }> {
+  const repo = repoFullName.trim()
+  if (!repo || !Number.isInteger(prNumber) || prNumber <= 0) return { closed: 0 }
+  const now = new Date().toISOString()
+  // Title shape from taskFromGitHubEvent: `[GH <repo>] PR #<n> <action>: …`
+  const prefix = `[GH ${repo}] PR #${prNumber} `
+  const like = `${prefix}%`
+  const res = await env.DB.prepare(
+    `UPDATE tasks SET status = 'done', completed_at = ?1, updated_at = ?1, result = COALESCE(result, 'github_pr_closed')
+      WHERE status IN ('open', 'in_progress')
+        AND gate_owner IS NULL
+        AND title LIKE ?2`,
+  )
+    .bind(now, like)
+    .run()
+  return { closed: Number(res.meta?.changes ?? 0) }
+}
+
+/**
  * D3 — CI feedback: a completed workflow_run for PR #`prNumber` writes its `conclusion` onto
  * the task whose github_issue_url is that PR. A failing/cancelled/timed-out conclusion on a
  * task in `review` bumps it back to `in_progress` (the agent's work needs another pass);
