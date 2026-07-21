@@ -9,11 +9,19 @@
 // registers/heartbeats/deregisters anything — see src/mcp/presence.ts for the mutating
 // twin (MCP tools presence_register/heartbeat/deregister).
 //
-// AUTHZ mirrors the MCP presence_list tool exactly (src/mcp/presence.ts): a caller may
-// read a project's roster only if it can already read that project (readAccess +
-// readableProject, src/mcp/projects.ts). `project` omitted or explicitly empty
-// requires org:admin (the unscoped/no-project view is a wider disclosure than any one
-// project's roster).
+// AUTHZ mirrors the MCP presence_list tool's PROJECT-VISIBILITY decision (src/mcp/
+// presence.ts): a caller may read a project's roster only if it can already read
+// that project (readAccess + readableProject, src/mcp/projects.ts), and `project`
+// omitted or explicitly empty requires org:admin (the unscoped/no-project view is a
+// wider disclosure than any one project's roster). One difference from the MCP
+// surface: presence_list also sits behind invokeTool's central `min:'observer'`
+// capability floor (src/mcp/index.ts), so a grantless caller is rejected there
+// (403 forbidden) before the project check ever runs. This HTTP route has no
+// equivalent floor, so a grantless caller instead falls through to the
+// readableProject check below and gets 404 project_not_found (readableProject
+// fails closed for a caller with no grants — same safe outcome, different
+// status/error shape). Not a security gap: both paths deny access; only the
+// response shape differs between the two entry points.
 
 import { Hono } from 'hono'
 import type { Env, AuthContext } from '../types'

@@ -128,6 +128,63 @@ describe('presence_register — identity is server-derived, never from args', ()
   })
 })
 
+describe('presence_register / presence_heartbeat — project-write authz (P1 fix, 2026-07-21)', () => {
+  it('presence_register into an inaccessible project is refused, and writes NO row', async () => {
+    const db = makeDb()
+    // squadObserver only has squad-a read access on proj-a — proj-hidden has no
+    // project_squad_access grant for squad-a at all (same fixture presence_list's
+    // "no oracle" test uses). Pre-fix, registerModule() would run unconditionally
+    // and this would succeed with a 200 + a written row.
+    const outcome = await invokeTool(
+      squadObserver,
+      db.env,
+      'presence_register',
+      { adapter: 'claude_code', project_id: 'proj-hidden', capabilities: ['attacker-chosen'] },
+      ORIGIN,
+    )
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(404)
+      expect(outcome.error).toBe('project_not_found')
+    }
+    // No row written for this identity+project — the refusal is fail-closed, not
+    // just a misleading response over a real write.
+    expect(db.rows().some((r) => r.identity === 'member-a' && r.project_id === 'proj-hidden')).toBe(false)
+    expect(db.rows()).toHaveLength(0)
+  })
+
+  it('presence_register into an accessible project still succeeds (happy path unaffected)', async () => {
+    const db = makeDb()
+    const outcome = await invokeTool(squadObserver, db.env, 'presence_register', { adapter: 'claude_code', project_id: 'proj-a' }, ORIGIN)
+    expect(outcome.ok).toBe(true)
+    expect(db.rows().some((r) => r.identity === 'member-a' && r.project_id === 'proj-a')).toBe(true)
+  })
+
+  it('presence_register with project_id: null (no-project self bucket) stays open regardless of project access', async () => {
+    const db = makeDb()
+    const outcome = await invokeTool(squadObserver, db.env, 'presence_register', { adapter: 'claude_code', project_id: null }, ORIGIN)
+    expect(outcome.ok).toBe(true)
+    expect(db.rows().some((r) => r.identity === 'member-a' && r.project_id === null)).toBe(true)
+  })
+
+  it('presence_heartbeat into an inaccessible project is refused (defense-in-depth)', async () => {
+    const db = makeDb()
+    // Register legitimately into proj-a first (accessible), then attempt to
+    // heartbeat with a project_id the caller cannot read — this must not re-bind
+    // the caller's registration into proj-hidden nor touch the proj-a row.
+    await invokeTool(squadObserver, db.env, 'presence_register', { adapter: 'claude_code', project_id: 'proj-a' }, ORIGIN)
+
+    const outcome = await invokeTool(squadObserver, db.env, 'presence_heartbeat', { project_id: 'proj-hidden' }, ORIGIN)
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(404)
+      expect(outcome.error).toBe('project_not_found')
+    }
+    expect(db.rows()).toHaveLength(1)
+    expect(db.rows()[0].project_id).toBe('proj-a')
+  })
+})
+
 describe('presence_heartbeat / presence_deregister — self-scoped only', () => {
   it('a caller can heartbeat only its OWN registration', async () => {
     const db = makeDb()

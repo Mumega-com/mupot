@@ -12,6 +12,20 @@
 //     an attacker cannot even ATTEMPT to name another principal (schema-level, not
 //     just a runtime check — additionalProperties:false rejects an extra field
 //     before the handler runs).
+//   - presence_register / presence_heartbeat ALSO bind that identity into a
+//     project's roster when project_id is non-null — that is a WRITE into project-
+//     scoped state, so it is gated through the SAME project-visibility primitive
+//     presence_list's read path uses (readAccess + readableProject,
+//     src/mcp/projects.ts): if the caller cannot read the target project, the write
+//     is refused with the identical project_not_found shape presence_list returns
+//     (no oracle — a caller can't distinguish "wrong project id" from "no access").
+//     project_id: null (the no-project self bucket) is always open; it names no
+//     project, so there is nothing to authorize against. presence_deregister is
+//     exempt: its write can only ever transition an EXISTING (identity, project_id)
+//     row it already owns to 'offline' — it can't create or rebind a registration
+//     into a project, and it returns the same not_registered 404 whether the
+//     project is inaccessible or the row never existed, so there's no new
+//     disclosure to gate.
 //   - presence_list is an org-scoped READ: any member may see the roster of a
 //     project they can already read. Reuses the SAME project-visibility primitive
 //     project_get uses (readAccess + readableProject, src/mcp/projects.ts) rather
@@ -83,6 +97,17 @@ const toolPresenceRegister: ToolSpec = {
       return fail(400, 'invalid_project_id')
     }
 
+    // P1 fix: a non-null project_id binds this registration (and attacker-chosen
+    // capabilities) into that project's roster — gate it through the SAME
+    // primitive presence_list's read path uses. Fail closed with the identical
+    // project_not_found shape (no existence oracle). project_id: null names no
+    // project, so it stays open (see file docstring).
+    if (typeof projectId === 'string') {
+      const access = readAccess(auth)
+      const project = await readableProject(env, projectId, access)
+      if (!project) return fail(404, 'project_not_found')
+    }
+
     let capabilities: string[] | undefined
     if (args.capabilities !== undefined) {
       if (!Array.isArray(args.capabilities) || !args.capabilities.every((v) => typeof v === 'string')) {
@@ -120,6 +145,15 @@ const toolPresenceHeartbeat: ToolSpec = {
     const projectId = readProjectId(args)
     if (args.project_id !== undefined && args.project_id !== null && projectId === undefined) {
       return fail(400, 'invalid_project_id')
+    }
+
+    // P1 fix (defense-in-depth): a heartbeat re-announcing into a non-null
+    // project_id must not be able to re-bind into a project the caller can't
+    // read — same gate as presence_register, same fail-closed shape.
+    if (typeof projectId === 'string') {
+      const access = readAccess(auth)
+      const project = await readableProject(env, projectId, access)
+      if (!project) return fail(404, 'project_not_found')
     }
 
     const ok = await heartbeatModule(env, identity, projectId ?? null)
