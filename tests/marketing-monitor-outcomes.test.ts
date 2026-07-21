@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createMarketingMonitorFixtureSource } from './fixtures/marketing-monitor'
-import { deriveMarketingOutcomes } from '../src/addons/marketing/outcomes'
+import { deriveMarketingOutcomes, deriveContentChannelSignals, deriveSeoChannelSignals, keywordGapQueryOutcome } from '../src/addons/marketing/outcomes'
 import { collectMarketingSnapshots } from '../src/addons/marketing/sources'
 import type {
   MarketingMonitorSource,
@@ -111,6 +111,7 @@ describe('deriveMarketingOutcomes', () => {
     expect(outcomes.leads).toMatchObject({ status: 'available', value: 12, unit: 'count', source: 'first-party' })
     expect(outcomes.conversion).toMatchObject({ status: 'available', value: 0.05, unit: 'ratio', source: 'first-party' })
     expect(outcomes.revenue).toEqual({ status: 'unavailable', reason: 'authoritative_source_missing' })
+    expect(outcomes.content).toEqual({ status: 'unavailable', reason: 'authoritative_source_missing' })
   })
 
   it('does not render missing revenue as zero', async () => {
@@ -254,5 +255,113 @@ describe('deriveMarketingOutcomes', () => {
     const raw = [observation()] as unknown as MarketingSnapshotCollection
 
     expect(() => deriveMarketingOutcomes(raw)).toThrow('unnormalized_marketing_snapshot')
+  })
+
+  it('derives an SEO keyword-gap signal from weak organic lead capture', async () => {
+    const outcomes = deriveMarketingOutcomes(await fixtureCollection())
+    const signals = deriveSeoChannelSignals(outcomes, {
+      status: 'unavailable',
+      reason: 'authoritative_source_missing',
+    })
+
+    expect(signals).toHaveLength(1)
+    expect(signals[0]).toMatchObject({
+      kind: 'keyword_gap',
+      primaryKpi: 'qualifiedTraffic',
+      reason: 'organic_lead_capture_below_ceiling',
+      measuredGap: 12 / 240,
+    })
+  })
+
+  it('prefers explicit keyword-gap query evidence over the funnel proxy', async () => {
+    const outcomes = deriveMarketingOutcomes(await fixtureCollection())
+    const signals = deriveSeoChannelSignals(outcomes, {
+      status: 'available',
+      value: 17,
+      unit: 'count',
+      source: 'gsc',
+      observedAt: '2026-07-16T12:00:00.000Z',
+    })
+
+    expect(signals[0]).toMatchObject({
+      kind: 'keyword_gap',
+      reason: 'search_queries_without_ranking_url',
+      measuredGap: 17,
+    })
+  })
+
+  it('derives an SEO content-candidate signal when conversion is weak and leads are unavailable', () => {
+    const signals = deriveSeoChannelSignals({
+      visibility: { status: 'unavailable', reason: 'authoritative_source_missing' },
+      qualifiedTraffic: {
+        status: 'available',
+        value: 100,
+        unit: 'count',
+        source: 'first-party',
+        observedAt: '2026-07-16T12:00:00.000Z',
+      },
+      leads: { status: 'unavailable', reason: 'authoritative_source_missing' },
+      conversion: {
+        status: 'available',
+        value: 0.02,
+        unit: 'ratio',
+        source: 'first-party',
+        observedAt: '2026-07-16T12:00:00.000Z',
+      },
+      revenue: { status: 'unavailable', reason: 'authoritative_source_missing' },
+      content: { status: 'unavailable', reason: 'authoritative_source_missing' },
+    }, { status: 'unavailable', reason: 'authoritative_source_missing' })
+
+    expect(signals[0]).toMatchObject({
+      kind: 'content_candidate',
+      primaryKpi: 'conversion',
+      reason: 'organic_conversion_below_ceiling',
+    })
+  })
+
+  it('derives a content publish-cadence signal when posts_published is zero', () => {
+    const signals = deriveContentChannelSignals({
+      visibility: { status: 'unavailable', reason: 'authoritative_source_missing' },
+      qualifiedTraffic: { status: 'unavailable', reason: 'authoritative_source_missing' },
+      leads: { status: 'unavailable', reason: 'authoritative_source_missing' },
+      conversion: { status: 'unavailable', reason: 'authoritative_source_missing' },
+      revenue: { status: 'unavailable', reason: 'authoritative_source_missing' },
+      content: {
+        status: 'available',
+        value: 0,
+        unit: 'count',
+        source: 'mcpwp',
+        observedAt: '2026-07-16T12:00:00.000Z',
+      },
+    })
+
+    expect(signals).toHaveLength(1)
+    expect(signals[0]).toMatchObject({
+      kind: 'publish_cadence',
+      primaryKpi: 'content',
+      reason: 'no_posts_published_in_window',
+    })
+  })
+
+  it('reads keyword-gap queries from a normalized collection without fabricating zero', async () => {
+    const collection = await collectObservations([observation({
+      id: 'gap-evidence',
+      metricKey: 'seo.keyword_gap_queries',
+      value: 9,
+      unit: 'count',
+      authority: 'first-party',
+    })])
+
+    expect(keywordGapQueryOutcome(collection)).toEqual({
+      status: 'available',
+      value: 9,
+      unit: 'count',
+      source: 'first-party',
+      observedAt: '2026-07-16T12:00:00.000Z',
+    })
+    expect(keywordGapQueryOutcome(await collectObservations([]))).toEqual({
+      status: 'unavailable',
+      reason: 'authoritative_source_missing',
+    })
   })
 })

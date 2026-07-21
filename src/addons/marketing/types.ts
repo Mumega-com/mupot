@@ -65,9 +65,21 @@ export const MARKETING_MONITOR_METRIC_CONTRACT = Object.freeze({
     unit: 'ratio',
     authorities: Object.freeze(['first-party', 'posthog'] as const),
   }),
+  // Optional GSC / first-party count of queries with impressions but no ranking URL.
+  // Feeds SEO keyword-gap recommendations; absence stays unavailable (never fabricated).
+  'seo.keyword_gap_queries': Object.freeze({
+    unit: 'count',
+    authorities: Object.freeze(['first-party', 'gsc'] as const),
+  }),
   'finance.revenue': Object.freeze({
     unit: 'usd',
     authorities: Object.freeze(['ghl', 'crm'] as const),
+  }),
+  // Channel/content intelligence — content_surface adapters (mcpwp, inkwell).
+  // Count of published artifacts in the monitor window (or 1 when a single surface is reachable).
+  'content.posts_published': Object.freeze({
+    unit: 'count',
+    authorities: Object.freeze(['mcpwp', 'inkwell'] as const),
   }),
 } as const)
 
@@ -149,6 +161,8 @@ export interface MarketingOutcomes {
   readonly leads: OutcomeValue
   readonly conversion: OutcomeValue
   readonly revenue: OutcomeValue
+  /** Published content cadence from content_surface (mcpwp / inkwell). */
+  readonly content: OutcomeValue
 }
 
 export interface MarketingMonitorRunSource {

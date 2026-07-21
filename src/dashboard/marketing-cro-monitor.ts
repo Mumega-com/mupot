@@ -34,6 +34,7 @@ const OUTCOMES = [
   { key: 'leads', label: 'Leads' },
   { key: 'conversion', label: 'Conversion' },
   { key: 'revenue', label: 'Revenue' },
+  { key: 'content', label: 'Content published' },
 ] as const
 
 export type MonitorSourceHealthStatus = 'bound' | SourceStatus

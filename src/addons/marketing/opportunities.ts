@@ -1,3 +1,9 @@
+import {
+  deriveContentChannelSignals,
+  deriveSeoChannelSignals,
+  type ContentChannelSignal,
+  type SeoChannelSignal,
+} from './outcomes'
 import type { MarketingMonitorRun, OutcomeValue } from './types'
 
 export type MarketingOpportunityKind =
@@ -6,6 +12,7 @@ export type MarketingOpportunityKind =
   | 'lead_generation_review'
   | 'organic_traffic_review'
   | 'ai_visibility_review'
+  | 'content_review'
 
 export type MarketingOpportunityKpi = keyof MarketingMonitorRun['outcomes']
 
@@ -62,6 +69,12 @@ const CANDIDATES: ReadonlyArray<{
     primaryKpi: 'visibility',
     label: 'AI visibility',
   },
+  {
+    kind: 'content_review',
+    target: 'resource:content/publish-cadence',
+    primaryKpi: 'content',
+    label: 'content publish cadence',
+  },
 ]
 
 const OUTCOME_ORDER: readonly MarketingOpportunityKpi[] = [
@@ -70,6 +83,7 @@ const OUTCOME_ORDER: readonly MarketingOpportunityKpi[] = [
   'leads',
   'conversion',
   'revenue',
+  'content',
 ]
 
 function unavailableEvidence(run: MarketingMonitorRun): LimitingMarketingEvidence[] {
@@ -87,11 +101,101 @@ function baselineSummary(value: Extract<OutcomeValue, { status: 'available' }>):
   return `${value.value} ${value.unit} from ${value.source}`
 }
 
+function latestKeywordGapFromObservations(run: MarketingMonitorRun): OutcomeValue {
+  let matching: (typeof run.observations)[number] | undefined
+  for (let index = 0; index < run.observations.length; index += 1) {
+    const observation = run.observations[index]
+    if (observation.metricKey !== 'seo.keyword_gap_queries') continue
+    if (observation.authority !== 'first-party' && observation.authority !== 'gsc') continue
+    if (
+      matching === undefined
+      || observation.observedAt > matching.observedAt
+      || (observation.observedAt === matching.observedAt && observation.id > matching.id)
+    ) matching = observation
+  }
+  if (!matching) {
+    return Object.freeze({ status: 'unavailable', reason: 'authoritative_source_missing' })
+  }
+  return Object.freeze({
+    status: 'available',
+    value: matching.value,
+    unit: matching.unit,
+    source: matching.authority,
+    observedAt: matching.observedAt,
+  })
+}
+
+function seoChannelCandidate(
+  signal: SeoChannelSignal,
+  limitingEvidence: readonly LimitingMarketingEvidence[],
+): MarketingOpportunityCandidate {
+  if (signal.kind === 'keyword_gap') {
+    const gapDetail = signal.reason === 'search_queries_without_ranking_url'
+      ? `${signal.measuredGap} search queries with impressions lack a ranking URL`
+      : `organic lead capture is ${(signal.measuredGap * 100).toFixed(1)}% of sessions (below the SEO channel ceiling)`
+    return Object.freeze({
+      rank: 1,
+      kind: 'organic_traffic_review',
+      target: 'resource:seo/keyword-gap',
+      problem: `SEO keyword gap: ${baselineSummary(signal.traffic)} arrives while ${gapDetail}; the evidence does not establish an approved content coverage action.`,
+      hypothesis: 'A human-reviewed keyword-gap proposal for the SEO channel can prioritize missing query coverage without any external publish or connector write before approval.',
+      primaryKpi: signal.primaryKpi,
+      kpiBaseline: Object.freeze({ ...signal.traffic }),
+      limitingEvidence,
+    })
+  }
+
+  return Object.freeze({
+    rank: 1,
+    kind: 'organic_traffic_review',
+    target: 'resource:seo/content-candidate',
+    problem: `SEO content candidate: ${baselineSummary(signal.traffic)} converts at ${baselineSummary(signal.supporting)}; the page set under-converts organic intent and no approved content change exists.`,
+    hypothesis: 'A human-reviewed SEO content-candidate proposal can improve the measured organic conversion baseline without any external change before approval.',
+    primaryKpi: signal.primaryKpi,
+    kpiBaseline: Object.freeze({ ...signal.supporting }),
+    limitingEvidence,
+  })
+}
+
+function contentChannelCandidate(
+  signal: ContentChannelSignal,
+  limitingEvidence: readonly LimitingMarketingEvidence[],
+): MarketingOpportunityCandidate {
+  return Object.freeze({
+    rank: 1,
+    kind: 'content_review',
+    target: 'resource:content/publish-cadence',
+    problem: `Content channel: ${baselineSummary(signal.content)} publishes in the evidence window (${signal.reason}); the surface is bound but no approved content proposal exists.`,
+    hypothesis: 'A human-reviewed content publish-cadence proposal can restore channel output without any external write before approval.',
+    primaryKpi: signal.primaryKpi,
+    kpiBaseline: Object.freeze({ ...signal.content }),
+    limitingEvidence,
+  })
+}
+
+/**
+ * Rank at most one bounded opportunity.
+ * Priority: SEO-channel signals → content-channel cadence → generic outcome reviews.
+ */
 export function rankMarketingOpportunities(
   run: MarketingMonitorRun,
 ): readonly MarketingOpportunityCandidate[] {
   if (run.status !== 'completed') return Object.freeze([])
   const limitingEvidence = Object.freeze(unavailableEvidence(run))
+
+  const seoSignals = deriveSeoChannelSignals(
+    run.outcomes,
+    latestKeywordGapFromObservations(run),
+  )
+  if (seoSignals.length > 0) {
+    return Object.freeze([seoChannelCandidate(seoSignals[0], limitingEvidence)])
+  }
+
+  const contentSignals = deriveContentChannelSignals(run.outcomes)
+  if (contentSignals.length > 0) {
+    return Object.freeze([contentChannelCandidate(contentSignals[0], limitingEvidence)])
+  }
+
   for (let index = 0; index < CANDIDATES.length; index += 1) {
     const definition = CANDIDATES[index]
     const baseline = run.outcomes[definition.primaryKpi]
