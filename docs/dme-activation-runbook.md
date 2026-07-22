@@ -1,5 +1,8 @@
 # DME Activation Runbook — first paying agency tenant, end-to-end through mupot
 
+**Operator reproduction (clean pots):** [DME integration runbook](./dme-integration-runbook.md)
++ [release receipt](./releases/dme-integration.md) (versions, checks, matching evidence).
+
 **Status as of 2026-07-19:** platform side DONE. Four activation gates remain, all
 human-authorized by design (customer infra + credential mint + watched flight).
 This runbook makes each gate one motion.
@@ -18,9 +21,9 @@ This runbook makes each gate one motion.
     or the 3-row batch) — a dedicated fresh member envelope, squad-scoped, capability capped
     `member`/`observer`, **zero extra capability rows** on that member. Nothing else keeps the
     send-confinement fence tight.
-  - (b) #403 (inbound task-content trust + `*.localhost`/special-name SSRF gap) only blocks
-    **wiring the outbound link surface** (`createProjectLink`/`deliverProjectLinkEnvelope`,
-    currently unwired) — NOT the token mint. Close #403 before Gate C's cross-pot delivery.
+  - (b) Delivery HTTP is live (`POST /api/project-links/:linkId/deliver`); link **create**
+    remains owner/admin via `createProjectLink` (never raw SQL). Close any remaining
+    inbound-trust / SSRF gaps before Gate C's first real cross-pot delivery.
 
 ---
 

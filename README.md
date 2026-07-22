@@ -38,6 +38,8 @@ The current stable release is `v0.23.0`; the active development target is
 [runtime adapter contract](./docs/runtime-adapter-contract.md), the
 [self-hosting guide](./docs/SELF-HOST.md), the
 [production runbook](./docs/production-runbook.md),
+[DME integration runbook](./docs/dme-integration-runbook.md),
+[DME integration release receipt](./docs/releases/dme-integration.md),
 [what running an agent on Mupot means](./docs/agent-running-on-mupot.md),
 [how to connect an MCP client](./docs/connect-mcp-client.md), and
 [what runs offline in local dev](./docs/local-dev.md).
