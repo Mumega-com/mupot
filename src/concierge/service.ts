@@ -48,6 +48,11 @@ import type { Env, Project } from '../types'
 import { listProjects } from '../projects/service'
 import { createTask, type CreateTaskInput } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
+import {
+  classifyTaskRoleEffort,
+  routeByEffort,
+  type OnlineHarness,
+} from '../tasks/effort-route'
 import type { Task } from '../types'
 import { registerModule, listPresence, type ModulePresence, type RegistryResult } from '../registry/service'
 
@@ -136,6 +141,7 @@ export interface ConciergeCycleResult {
  * tells the two apart. */
 export interface ResolvedAgent {
   id: string
+  slug: string
   squad_id: string
   status: string
 }
@@ -143,7 +149,7 @@ export interface ResolvedAgent {
 // ── Default I/O seams (real D1) ──────────────────────────────────────────────
 
 async function defaultResolveAgent(env: Env, identity: string): Promise<ResolvedAgent | null> {
-  return env.DB.prepare(`SELECT id, squad_id, status FROM agents WHERE id = ?1 LIMIT 1`)
+  return env.DB.prepare(`SELECT id, slug, squad_id, status FROM agents WHERE id = ?1 LIMIT 1`)
     .bind(identity)
     .first<ResolvedAgent>()
 }
@@ -251,15 +257,22 @@ async function pickOnlineBuilder(
 interface UnassignedTaskRow {
   id: string
   squad_id: string
+  title: string
+  body: string
+}
+
+interface OnlineRouteCandidate {
+  agent: ResolvedAgent
+  capabilities: readonly string[]
 }
 
 /**
  * routeUnassignedWork — the work-router (the "drivers execute what's dispatched" half).
  * A BUSY project (has advancing work) still leaves tasks SITTING when they are open +
- * unassigned while build agents idle online. This assigns those to online build agents,
- * BOUNDED (MAX_ROUTES_PER_TICK per project, MAX_ROUTES_PER_AGENT per agent) and GATED
- * (assignment sets assignee_agent_id only — no deploy/merge authority; the assignee
- * builds on a branch, the gate-driver reviews).
+ * unassigned while harnesses idle online. This assigns those via the effort→idle
+ * ladder (src/tasks/effort-route.ts), BOUNDED (MAX_ROUTES_PER_TICK per project,
+ * MAX_ROUTES_PER_AGENT per agent) and GATED (assignment sets assignee_agent_id only —
+ * no deploy/merge/restart/heal; action space is assign|skip|escalate only).
  *
  * Safety invariants:
  *  - Only status='open' AND assignee_agent_id IS NULL rows are touched (never reassign
@@ -269,6 +282,7 @@ interface UnassignedTaskRow {
  *  - The UPDATE re-guards `assignee_agent_id IS NULL AND status='open'` so a concurrent
  *    tick (or a human assigning meanwhile) cannot be clobbered — the write is a no-op
  *    (changes=0) if the row moved, and only a changes=1 counts as routed (TOCTOU-safe).
+ *  - Cross-pot tasks (source_pot IS NOT NULL) are never auto-assigned (#404).
  */
 async function routeUnassignedWork(
   env: Env,
@@ -277,21 +291,29 @@ async function routeUnassignedWork(
   selfIdentity: string,
   resolveAgent: (env: Env, identity: string) => Promise<ResolvedAgent | null>,
 ): Promise<Array<{ taskId: string; agentId: string }>> {
-  // The online, build-capable, resolves-to-active-agent pool (same filter as
-  // pickOnlineBuilder, but we keep ALL of them, deduped by agent id).
-  const builders: ResolvedAgent[] = []
+  // Online active agents (any role capability) — the effort router picks by ladder.
+  // Known harness caps (agy=research only, etc.) are enforced inside routeByEffort.
+  const candidates: OnlineRouteCandidate[] = []
   const seen = new Set<string>()
   for (const module of roster) {
     if (module.identity === selfIdentity) continue
     if (module.status !== 'online') continue
-    if (!module.capabilities.includes(BUILD_CAPABILITY)) continue
     const agent = await resolveAgent(env, module.identity)
     if (agent && agent.status === 'active' && !seen.has(agent.id)) {
       seen.add(agent.id)
-      builders.push(agent)
+      candidates.push({ agent, capabilities: module.capabilities })
     }
   }
-  if (builders.length === 0) return []
+  if (candidates.length === 0) return []
+
+  const bySlug = new Map<string, OnlineRouteCandidate>()
+  for (const candidate of candidates) {
+    if (!bySlug.has(candidate.agent.slug)) bySlug.set(candidate.agent.slug, candidate)
+  }
+  const online: OnlineHarness[] = candidates.map((c) => ({
+    slug: c.agent.slug,
+    capabilities: c.capabilities,
+  }))
 
   // SECURITY (#404 invariant, adversarial-gate BLOCK 2026-07-22): NEVER auto-assign a
   // cross-pot task (source_pot IS NOT NULL). An inbound task from a signed-but-untrusted
@@ -301,7 +323,7 @@ async function routeUnassignedWork(
   // turn (the exact auto-dispatch #404 blocked). The router is an unattended writer, so it
   // MUST carry the same `source_pot IS NULL` invariant.
   const rows = await env.DB.prepare(
-    `SELECT id, squad_id FROM tasks
+    `SELECT id, squad_id, title, body FROM tasks
       WHERE project_id = ?1 AND status = 'open' AND assignee_agent_id IS NULL
         AND source_pot IS NULL
       ORDER BY created_at ASC
@@ -311,29 +333,45 @@ async function routeUnassignedWork(
     .all<UnassignedTaskRow>()
 
   const routed: Array<{ taskId: string; agentId: string }> = []
-  const perAgent = new Map<string, number>()
+  const perAgent = new Map<string, number>() // keyed by agent id (tick bound)
+  const loadBySlug = new Map<string, number>() // keyed by slug (ladder idle check)
+
   for (const task of rows.results ?? []) {
     if (routed.length >= MAX_ROUTES_PER_TICK) break
-    for (const builder of builders) {
-      if ((perAgent.get(builder.id) ?? 0) >= MAX_ROUTES_PER_AGENT) continue
-      const assignable = await resolveTaskAssignee(env, builder.id, task.squad_id)
-      if (!assignable.value) continue
-      // Idempotent + TOCTOU-safe: only assign if still open + unassigned. Bump
-      // updated_at so a routed task shows a fresh timestamp (observability — humans
-      // see the work moved) and correctly signals "row changed" to the optimistic-
-      // concurrency task-update path (WHERE updated_at=…). The WHERE guard is
-      // unchanged, so idempotency/TOCTOU safety is preserved.
-      const upd = await env.DB.prepare(
-        `UPDATE tasks SET assignee_agent_id = ?1, updated_at = ?3
-          WHERE id = ?2 AND status = 'open' AND assignee_agent_id IS NULL`,
-      )
-        .bind(builder.id, task.id, new Date().toISOString())
-        .run()
-      if (upd.meta.changes === 1) {
-        routed.push({ taskId: task.id, agentId: builder.id })
-        perAgent.set(builder.id, (perAgent.get(builder.id) ?? 0) + 1)
-      }
-      break // this task is handled (assigned, or its row moved under us) — next task
+
+    const { role, effort } = classifyTaskRoleEffort({ title: task.title, body: task.body ?? '' })
+    const decision = routeByEffort({
+      role,
+      effort,
+      online,
+      load: loadBySlug,
+      maxLoadPerAgent: MAX_ROUTES_PER_AGENT,
+    })
+    // Narrow action space: assign | skip | escalate — never restart/heal.
+    if (decision.action !== 'assign' || decision.agentSlug === null) continue
+
+    const picked = bySlug.get(decision.agentSlug)
+    if (!picked) continue
+    if ((perAgent.get(picked.agent.id) ?? 0) >= MAX_ROUTES_PER_AGENT) continue
+
+    const assignable = await resolveTaskAssignee(env, picked.agent.id, task.squad_id)
+    if (!assignable.value) continue
+
+    // Idempotent + TOCTOU-safe: only assign if still open + unassigned. Bump
+    // updated_at so a routed task shows a fresh timestamp (observability — humans
+    // see the work moved) and correctly signals "row changed" to the optimistic-
+    // concurrency task-update path (WHERE updated_at=…). The WHERE guard is
+    // unchanged, so idempotency/TOCTOU safety is preserved.
+    const upd = await env.DB.prepare(
+      `UPDATE tasks SET assignee_agent_id = ?1, updated_at = ?3
+        WHERE id = ?2 AND status = 'open' AND assignee_agent_id IS NULL`,
+    )
+      .bind(picked.agent.id, task.id, new Date().toISOString())
+      .run()
+    if (upd.meta.changes === 1) {
+      routed.push({ taskId: task.id, agentId: picked.agent.id })
+      perAgent.set(picked.agent.id, (perAgent.get(picked.agent.id) ?? 0) + 1)
+      loadBySlug.set(picked.agent.slug, (loadBySlug.get(picked.agent.slug) ?? 0) + 1)
     }
   }
   return routed

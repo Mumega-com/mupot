@@ -132,6 +132,9 @@ def register_presence() -> None:
     every OPERATOR_INTERVAL). project_id: null is the always-open self bucket
     (no project-access grant needed). Never raises: a presence failure must
     not block real task work.
+
+    mumcp is an ad-hoc builder (not a named harness on the effort ladder);
+    presence build keeps it eligible via the router's non-ladder fallback.
     """
     try:
         mcp("presence_register", {
