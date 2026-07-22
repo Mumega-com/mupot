@@ -115,6 +115,25 @@ describe('MCP project attribution parity', () => {
     }
   })
 
+  it('resolve_agent / get_agent_profile enforce the observer floor — no grantless read', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    // A grantless member (valid token, ZERO capability grants). min:'observer' opts these
+    // tools into the AAGATE floor, so a grantless token is rejected BEFORE the handler —
+    // closing the pot-wide agent-inventory read that min:'authenticated' left open.
+    const grantless = auth({ capabilities: [] })
+    const rl = await invokeTool(grantless, env, 'resolve_agent', { query: 'agent' }, 'https://pot.example')
+    expect(rl.ok).toBe(false)
+    expect(rl.status).toBe(403)
+    const gp = await invokeTool(grantless, env, 'get_agent_profile', { agent_id: 'agent-a' }, 'https://pot.example')
+    expect(gp.ok).toBe(false)
+    expect(gp.status).toBe(403)
+    // A member (member ≥ observer) clears the floor and reads normally.
+    const ok = await invokeTool(auth(), env, 'resolve_agent', { query: 'agent' }, 'https://pot.example')
+    expect(ok.ok).toBe(true)
+    expect((ok.result as { matches: unknown[] }).matches.length).toBeGreaterThanOrEqual(1)
+  })
+
   it('project_context composes meta + situation + roster + data_map for a project reader', async () => {
     harness = makeHarness()
     const env = envFor(harness)

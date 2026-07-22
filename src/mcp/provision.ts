@@ -301,16 +301,21 @@ const toolCreateAgent: ToolSpec = {
 // 2026-07-21 3-hermes incident (agent-hermes + kayhermes + hadi-hermes, distinct
 // roles, retired as "duplicates") is exactly what pot-wide resolve prevents.
 //
-// Scope: authenticated. Deliberately pot-wide (not caller-squad-scoped): the sprawl
-// this fixes spans squads, so a squad-scoped search would miss the case. Agents live
-// in a single-tenant pot (the `agents` table has no tenant column — one pot = one
-// tenant), so this discloses no cross-tenant data. It returns only agent metadata
-// (name/role/purpose/model/capabilities/lineage) already visible on presence rosters —
-// never credentials, project evidence, or another tenant's rows.
+// Scope: observer FLOOR (not 'authenticated'). Deliberately pot-wide (not caller-
+// squad-scoped): the sprawl this fixes spans squads, so a squad-scoped search would
+// miss the case. Agents live in a single-tenant pot (the `agents` table has no tenant
+// column — one pot = one tenant), so this discloses no cross-tenant data, only agent
+// metadata (name/role/purpose/model/capabilities/lineage). It is min:'observer', NOT
+// 'authenticated': `min:'authenticated'` would SKIP the AAGATE capability floor
+// (src/mcp/index.ts) and let a ZERO-GRANT OAuth member enumerate the whole pot's agent
+// inventory — a broadening a grantless token should not have (cursor gate,
+// 2026-07-22; the earlier "presence-roster parity" claim was wrong — a grantless
+// member never gets the roster either). 'observer' requires the caller hold observer
+// on SOME scope, enforced centrally at the dispatch chokepoint.
 const toolResolveAgent: ToolSpec = {
   name: 'resolve_agent',
   scope: 'org (read)',
-  min: 'authenticated',
+  min: 'observer',
   args: '{ query: string, include_inactive?: boolean, limit?: number }',
   inputSchema: {
     type: 'object',
@@ -340,12 +345,14 @@ const toolResolveAgent: ToolSpec = {
 }
 
 // ── get_agent_profile ───────────────────────────────────────────────────────────
-// Read one agent's full profile by id. Same authenticated, pot-internal,
-// metadata-only disclosure rationale as resolve_agent above.
+// Read one agent's full profile by id. Same pot-internal, metadata-only disclosure
+// rationale as resolve_agent above — and the same observer FLOOR: min:'observer' so
+// the AAGATE capability floor rejects a zero-grant member (min:'authenticated' would
+// skip it). cursor gate, 2026-07-22.
 const toolGetAgentProfile: ToolSpec = {
   name: 'get_agent_profile',
   scope: 'org (read)',
-  min: 'authenticated',
+  min: 'observer',
   args: '{ agent_id: string }',
   inputSchema: {
     type: 'object',
