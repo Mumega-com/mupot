@@ -22,8 +22,12 @@ export interface ProjectLinkReceiptProof {
   shared_receipt_sha256: string
   envelope_sha256: string
   evidence_sha256: string | null
+  evidence_url: string | null
   remote_pot: string
   remote_project_id: string
+  source_pot: string
+  destination_pot: string
+  authorization_result: string
   source_agent_id: string
   action_type: string
   action_id: string
@@ -561,8 +565,9 @@ export async function listProjectEvidence(
   ])
   const linkReceipts = await env.DB.prepare(
     `SELECT r.id, r.direction, r.correlation_id, r.shared_receipt_sha256,
-            r.envelope_sha256, r.evidence_sha256, r.remote_pot,
-            r.remote_project_id, r.source_agent_id, r.action_type,
+            r.envelope_sha256, r.evidence_sha256, r.evidence_url, r.remote_pot,
+            r.remote_project_id, r.source_pot, r.destination_pot,
+            r.authorization_result, r.source_agent_id, r.action_type,
             r.action_id, r.receipt_key_id, r.receipt_signature, r.status, r.created_at
        FROM project_link_receipts r
        JOIN project_links l ON l.id = r.link_id AND l.tenant = r.tenant
@@ -572,8 +577,9 @@ export async function listProjectEvidence(
       ORDER BY ${epochMs('r.created_at')} DESC, r.id ASC LIMIT ?${linkReceiptAfter.nextParam}`,
   ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...linkReceiptAfter.binds, sourceLimit).all<{
     id: string; direction: string; correlation_id: string; shared_receipt_sha256: string
-    envelope_sha256: string; evidence_sha256: string | null; remote_pot: string
-    remote_project_id: string; source_agent_id: string; action_type: string
+    envelope_sha256: string; evidence_sha256: string | null; evidence_url: string | null
+    remote_pot: string; remote_project_id: string; source_pot: string; destination_pot: string
+    authorization_result: string; source_agent_id: string; action_type: string
     action_id: string; receipt_key_id: string; receipt_signature: string; status: string; created_at: string
   }>()
 
@@ -621,7 +627,7 @@ export async function listProjectEvidence(
       source_id: row.id,
       occurred_at: iso(row.created_at),
       title: sanitizeProjectDetail(`${row.direction} ${row.action_type}: ${row.remote_pot} / ${row.remote_project_id}`),
-      detail: `receipt=${row.shared_receipt_sha256}; envelope=${row.envelope_sha256}${row.evidence_sha256 ? `; evidence=${row.evidence_sha256}` : ''}; key=${row.receipt_key_id}; signature=${row.receipt_signature}`,
+      detail: `receipt=${row.shared_receipt_sha256}; envelope=${row.envelope_sha256}${row.evidence_sha256 ? `; evidence=${row.evidence_sha256}` : ''}; source=${row.source_pot}; destination=${row.destination_pot}; auth=${row.authorization_result}${row.evidence_url ? `; evidence_url=${row.evidence_url}` : ''}; key=${row.receipt_key_id}; signature=${row.receipt_signature}`,
       status: row.status,
       actor: row.source_agent_id,
       correlation_id: row.correlation_id,
@@ -631,8 +637,12 @@ export async function listProjectEvidence(
         shared_receipt_sha256: row.shared_receipt_sha256,
         envelope_sha256: row.envelope_sha256,
         evidence_sha256: row.evidence_sha256,
+        evidence_url: row.evidence_url,
         remote_pot: row.remote_pot,
         remote_project_id: row.remote_project_id,
+        source_pot: row.source_pot,
+        destination_pot: row.destination_pot,
+        authorization_result: row.authorization_result,
         source_agent_id: row.source_agent_id,
         action_type: row.action_type,
         action_id: row.action_id,

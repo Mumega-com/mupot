@@ -385,9 +385,78 @@ describe('project-link addon', () => {
     expect(sourceReceipts[0].shared_receipt_sha256).toBe(destinationReceipts[0].shared_receipt_sha256)
     expect(sourceReceipts[0].receipt_key_id).toBe('dme-key')
     expect(sourceReceipts[0].receipt_signature).toMatch(/^[A-Za-z0-9_-]{86}$/)
+    expect(sourceReceipts[0]).toMatchObject({
+      correlation_id: 'flight-dme-001',
+      source_pot: 'mumega',
+      destination_pot: 'dme',
+      authorization_result: 'authorized',
+      evidence_sha256: 'a'.repeat(64),
+      evidence_url: 'https://evidence.dme.test/receipts/flight-dme-001',
+      action_type: 'task',
+    })
+    expect(destinationReceipts[0]).toMatchObject({
+      correlation_id: 'flight-dme-001',
+      source_pot: 'mumega',
+      destination_pot: 'dme',
+      authorization_result: 'authorized',
+      evidence_sha256: 'a'.repeat(64),
+      evidence_url: 'https://evidence.dme.test/receipts/flight-dme-001',
+      action_type: 'task',
+    })
     expect(mumega.sqlite.prepare('SELECT attempts, status FROM project_link_deliveries').get()).toEqual({
       attempts: 3, status: 'delivered',
     })
+  })
+
+  it('exposes matching receipt proofs for a completed task without raw customer payloads', async () => {
+    const signed = await createSignedProjectEnvelope(envelopeInput(), mumegaKeys.privateKey)
+    const delivered = await deliverProjectLinkEnvelope(
+      env(mumega, 'mumega'), mumegaLink.id, signed,
+      {
+        fetcher: async (_input, init) => {
+          const received = await receiveProjectLinkEnvelope(
+            env(dme, 'dme'), dmeLink.id, JSON.parse(String(init?.body)), NOW,
+          )
+          return new Response(JSON.stringify(received), {
+            status: received.ok ? 200 : 400,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        },
+        now: NOW,
+        maxAttempts: 1,
+      },
+    )
+    expect(delivered.ok).toBe(true)
+
+    const { listProjectEvidence } = await import('../src/projects/projections')
+    const sourceEvidence = await listProjectEvidence(env(mumega, 'mumega'), {
+      projectId: 'mumega-project', readableSquadIds: null, limit: 20,
+    })
+    const destinationEvidence = await listProjectEvidence(env(dme, 'dme'), {
+      projectId: 'dme-project', readableSquadIds: null, limit: 20,
+    })
+    const sourceProof = sourceEvidence.rows.find((row) => row.correlation_id === 'flight-dme-001')
+    const destinationProof = destinationEvidence.rows.find((row) => row.correlation_id === 'flight-dme-001')
+    expect(sourceProof?.proof).toMatchObject({
+      source_pot: 'mumega',
+      destination_pot: 'dme',
+      authorization_result: 'authorized',
+      evidence_sha256: 'a'.repeat(64),
+      evidence_url: 'https://evidence.dme.test/receipts/flight-dme-001',
+      action_type: 'task',
+    })
+    expect(destinationProof?.proof).toMatchObject({
+      source_pot: 'mumega',
+      destination_pot: 'dme',
+      authorization_result: 'authorized',
+      evidence_sha256: 'a'.repeat(64),
+      evidence_url: 'https://evidence.dme.test/receipts/flight-dme-001',
+      action_type: 'task',
+      shared_receipt_sha256: sourceProof?.proof?.shared_receipt_sha256,
+      receipt_signature: sourceProof?.proof?.receipt_signature,
+    })
+    expect(JSON.stringify(sourceProof)).not.toMatch(/customer|transcript|Bearer |mupot_/i)
+    expect(JSON.stringify(destinationProof)).not.toMatch(/customer|transcript|Bearer |mupot_/i)
   })
 
   it('resumes a matching failed delivery instead of burning its idempotency key', async () => {

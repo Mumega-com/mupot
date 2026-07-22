@@ -79,12 +79,15 @@ function harness(options: { includeKeysetMigration?: boolean } = {}) {
     INSERT INTO project_link_receipts (
       id, tenant, link_id, local_project_id, direction, idempotency_key,
       correlation_id, envelope_sha256, shared_receipt_sha256, remote_pot,
-      remote_project_id, source_agent_id, action_type, action_id,
-      evidence_sha256, receipt_key_id, receipt_signature, status, created_at
+      remote_project_id, source_pot, destination_pot, authorization_result,
+      source_agent_id, action_type, action_id, evidence_sha256, evidence_url,
+      receipt_key_id, receipt_signature, status, created_at
     ) VALUES (
       'link-receipt-a', 'tenant', 'link-a', 'project', 'inbound', 'delivery-a',
       'correlation-a', '${'a'.repeat(64)}', '${'b'.repeat(64)}', 'dme',
-      'dme-project', 'dme-agent', 'task', 'task-a', '${'c'.repeat(64)}', 'remote-key', '${'d'.repeat(86)}',
+      'dme-project', 'dme', 'tenant', 'authorized',
+      'dme-agent', 'task', 'task-a', '${'c'.repeat(64)}', 'https://evidence.dme.test/receipts/correlation-a',
+      'remote-key', '${'d'.repeat(86)}',
       'accepted', '2026-07-18T20:11:00Z'
     );
   `)
@@ -413,8 +416,12 @@ describe('project Activity and Evidence projections', () => {
           shared_receipt_sha256: 'b'.repeat(64),
           envelope_sha256: 'a'.repeat(64),
           evidence_sha256: 'c'.repeat(64),
+          evidence_url: 'https://evidence.dme.test/receipts/correlation-a',
           remote_pot: 'dme',
           remote_project_id: 'dme-project',
+          source_pot: 'dme',
+          destination_pot: 'tenant',
+          authorization_result: 'authorized',
           source_agent_id: 'dme-agent',
           action_type: 'task',
           action_id: 'task-a',
@@ -615,7 +622,16 @@ describe('project Activity and Evidence projections', () => {
       const projectionStatements = probe.statements.filter((statement) => statement.sql.includes('ORDER BY'))
       expect(projectionStatements).toHaveLength(11)
       for (const statement of projectionStatements) {
-        const plan = fixture.sqlite.prepare(`EXPLAIN QUERY PLAN ${statement.sql}`).all(...statement.values)
+        // node:sqlite rejects D1 numbered placeholders (?1); remap like sqlite-d1.ts.
+        const paramNumbers: number[] = []
+        const sql = statement.sql.replace(/\?(\d+)/g, (_match, digits: string) => {
+          paramNumbers.push(Number(digits))
+          return '?'
+        })
+        const values = paramNumbers.length === 0
+          ? statement.values
+          : paramNumbers.map((number) => statement.values[number - 1])
+        const plan = fixture.sqlite.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...values)
         const details = plan.map((row) => String(row.detail ?? '')).join('\n')
         expect(details, statement.sql).not.toContain('USE TEMP B-TREE FOR ORDER BY')
         if (statement.sql.includes('FROM task_verdicts')) {

@@ -85,7 +85,14 @@ function proofContract(row, direction) {
     proof?.schema !== 'mupot.project-link-receipt-proof/v1' || proof?.direction !== direction ||
     !HASH_RE.test(proof?.shared_receipt_sha256 ?? '') || !HASH_RE.test(proof?.envelope_sha256 ?? '') ||
     !(proof?.evidence_sha256 === null || HASH_RE.test(proof?.evidence_sha256 ?? '')) ||
+    !(proof?.evidence_url === null || (
+      typeof proof?.evidence_url === 'string' && proof.evidence_url.startsWith('https://') &&
+      !proof.evidence_url.includes('?') && !proof.evidence_url.includes('#') &&
+      proof.evidence_url.length <= 2048
+    )) ||
     !ID_RE.test(proof?.remote_pot ?? '') || !ID_RE.test(proof?.remote_project_id ?? '') ||
+    !ID_RE.test(proof?.source_pot ?? '') || !ID_RE.test(proof?.destination_pot ?? '') ||
+    proof?.authorization_result !== 'authorized' ||
     !ID_RE.test(proof?.source_agent_id ?? '') || !['task', 'evidence'].includes(proof?.action_type) ||
     !ID_RE.test(proof?.action_id ?? '') || !ID_RE.test(proof?.receipt_key_id ?? '') ||
     !SIGNATURE_RE.test(proof?.receipt_signature ?? '')
@@ -188,6 +195,11 @@ export async function verifyProjectLinkFlightEvidence({
   addCheck(checks, comparable && a.remote_pot === destination.pot && a.remote_project_id === destination.projectId &&
     b.remote_pot === source.pot && b.remote_project_id === source.projectId,
   'project_mapping_matches', 'project_mapping_mismatch')
+  addCheck(checks, comparable && a.source_pot === source.pot && a.destination_pot === destination.pot &&
+    b.source_pot === source.pot && b.destination_pot === destination.pot,
+  'source_destination_pots_match', 'source_destination_pots_mismatch')
+  addCheck(checks, comparable && a.authorization_result === 'authorized' && b.authorization_result === 'authorized',
+    'authorization_result_authorized', 'authorization_result_mismatch')
   addCheck(checks, comparable && a.shared_receipt_sha256 === b.shared_receipt_sha256,
     'shared_receipt_hash_matches', 'shared_receipt_hash_mismatch')
   addCheck(checks, comparable && a.envelope_sha256 === b.envelope_sha256,
@@ -196,7 +208,9 @@ export async function verifyProjectLinkFlightEvidence({
     'evidence_hash_present', 'evidence_hash_missing')
   addCheck(checks, comparable && a.evidence_sha256 !== null && a.evidence_sha256 === b.evidence_sha256,
     'evidence_hash_matches', 'evidence_hash_mismatch')
-  addCheck(checks, comparable && a.action_type === 'evidence' && b.action_type === 'evidence' && a.action_id === b.action_id,
+  addCheck(checks, comparable && a.evidence_url !== null && b.evidence_url !== null && a.evidence_url === b.evidence_url,
+    'evidence_url_matches', 'evidence_url_mismatch')
+  addCheck(checks, comparable && ['task', 'evidence'].includes(a.action_type) && a.action_type === b.action_type && a.action_id === b.action_id,
     'evidence_action_matches', 'evidence_action_mismatch')
   addCheck(checks, comparable && a.source_agent_id === b.source_agent_id,
     'source_agent_matches', 'source_agent_mismatch')
@@ -230,6 +244,10 @@ export async function verifyProjectLinkFlightEvidence({
       shared_receipt_sha256: a.shared_receipt_sha256,
       envelope_sha256: a.envelope_sha256,
       evidence_sha256: a.evidence_sha256,
+      evidence_url: a.evidence_url,
+      source_pot: a.source_pot,
+      destination_pot: a.destination_pot,
+      authorization_result: a.authorization_result,
       receipt_key_id: a.receipt_key_id,
       receipt_signature: a.receipt_signature,
     } : null,
