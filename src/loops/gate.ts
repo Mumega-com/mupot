@@ -6,6 +6,9 @@
 //   2. if the act targets a CRM channel kind (send_email/add_contact/move_stage), a
 //      PENDING outbound_act linked to that task — which can only ever fire through
 //      runApprovedActs() AFTER an approved verdict (#8). Nothing sends here.
+//   3. if the act targets a workflow-port tool (run_workflow / n8n_run_workflow), a
+//      PENDING workflow_act — fires only through runApprovedWorkflowActs() after an
+//      approved verdict (Port 5). External managers never hold the approval.
 //
 // So a gated loop's autonomy ends at the gate: it can propose and queue, never send.
 
@@ -14,6 +17,12 @@ import type { LoopManifest } from './manifest'
 import type { ProposedAct } from './runtime'
 import { createTask } from '../tasks/service'
 import { createOutboundAct } from '../integrations/ghl'
+import { createWorkflowAct } from '../workflows/acts'
+import {
+  isWorkflowActTool,
+  resolveWorkflowAdapter,
+  type WorkflowActPayload,
+} from '../workflows/port'
 
 // Act tools that map to a customer-side outbound act (the GHL act-channel kinds).
 const GHL_ACT_KINDS = new Set(['send_email', 'add_contact', 'move_stage'])
@@ -26,13 +35,15 @@ const LOOP_GATE_OWNER = 'gate:loops'
 export interface WireGateDeps {
   createTask?: typeof createTask
   createOutboundAct?: typeof createOutboundAct
+  createWorkflowAct?: typeof createWorkflowAct
   resolveSquadId?: (env: Env, loop: LoopManifest) => Promise<string | null>
 }
 
 /**
  * wireGatedAct — persist a proposed act as a pending, human-gated unit of work.
  * Always creates the gated task; additionally queues a pending outbound_act when the
- * tool is a CRM kind. Throws if the owning squad can't be resolved (no silent drop).
+ * tool is a CRM kind, or a pending workflow_act when the tool is a workflow-port kind.
+ * Throws if the owning squad can't be resolved (no silent drop).
  */
 export async function wireGatedAct(
   env: Env,
@@ -46,6 +57,8 @@ export async function wireGatedAct(
 
   const squadId = await resolveSquadId(env, loop)
   if (!squadId) throw new Error('loop_squad_unresolved')
+
+  const doCreateWorkflowAct = deps.createWorkflowAct ?? createWorkflowAct
 
   // status:'review' is REQUIRED — the verdict endpoint (409 not_in_review) and the
   // /approvals queue both act ONLY on review tasks. A loop-queued act is a finished
@@ -75,6 +88,25 @@ export async function wireGatedAct(
 
   if (GHL_ACT_KINDS.has(act.tool)) {
     await doCreateOutboundAct(env, task.id, act.tool, act.args)
+  }
+
+  if (isWorkflowActTool(act.tool)) {
+    const args = act.args && typeof act.args === 'object' && !Array.isArray(act.args)
+      ? (act.args as Record<string, unknown>)
+      : {}
+    const adapter = resolveWorkflowAdapter(act.tool, args)
+    const payload: WorkflowActPayload = {
+      label: typeof args.label === 'string' ? args.label : act.summary,
+    }
+    if (typeof args.webhook_url === 'string') payload.webhook_url = args.webhook_url
+    if (args.body && typeof args.body === 'object' && !Array.isArray(args.body)) {
+      payload.body = args.body as Record<string, unknown>
+    } else {
+      // Forward remaining args (minus adapter/webhook/label) as the manager body.
+      const { adapter: _a, webhook_url: _w, label: _l, body: _b, ...rest } = args
+      if (Object.keys(rest).length > 0) payload.body = rest
+    }
+    await doCreateWorkflowAct(env, task.id, adapter, payload)
   }
 }
 

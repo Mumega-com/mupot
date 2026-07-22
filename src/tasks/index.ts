@@ -30,6 +30,7 @@ export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
 import { startTaskPipeline } from '../workflows/pipeline'
+import { runApprovedWorkflowActs } from '../workflows/acts'
 // #22 v1 ATC ranking: pure scorer (no I/O) + the existing radar's agent
 // runtime-state loader (already a single cheap D1 query — dashboard/radar.ts
 // uses the same loader for the fleet view, so this is not a new query shape).
@@ -1023,6 +1024,20 @@ tasksApp.post('/:id/verdict', async (c) => {
       principal.actor,
     )
 
+    // Port 5: after an approved verdict, fire any pending workflow_acts (n8n /
+    // zapier / make). Re-checks the verdict independently inside the runner.
+    // Best-effort: a webhook failure must NEVER roll back the verdict — the
+    // gate decision is already durable in D1; acts record their own receipts.
+    let workflowActs: Awaited<ReturnType<typeof runApprovedWorkflowActs>> | undefined
+    if (body.verdict === 'approved') {
+      try {
+        workflowActs = await runApprovedWorkflowActs(c.env, task.id)
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : 'workflow_acts_failed'
+        console.error('workflow_acts after verdict failed', { taskId: task.id, reason })
+      }
+    }
+
     // Best-effort Workflow resume: if a pipeline instance is parked on
     // waitForEvent for this task, nudge it to re-read D1.  A dropped or
     // failed sendEvent must NEVER fail the verdict response — D1 is the
@@ -1040,7 +1055,10 @@ tasksApp.post('/:id/verdict', async (c) => {
       }
     }
 
-    return c.json(result, 201)
+    return c.json(
+      workflowActs ? { ...result, workflow_acts: workflowActs } : result,
+      201,
+    )
   } catch (err) {
     if (err instanceof VerdictRaceError) {
       // K5: concurrent verdict won the race — task is no longer in 'review'.

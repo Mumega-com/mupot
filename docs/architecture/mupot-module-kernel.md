@@ -99,6 +99,25 @@ warm-restart, instinct-memory, a gate-lane driver, and a FED BOARD.
 Ports 2–3 are the ECC ports; port 1 is the SOS-connectedness we lost, rebuilt
 durable. All five are extensions of the addon pattern, not new frameworks.
 
+## Port 5 — Workflow adapters + surface panels (2026-07-22)
+
+Workflow port (`src/workflows/port.ts`, `WORKFLOW_PORT_VERSION = 1`):
+
+- **CF Workflows = DEFAULT** — existing `TASK_WORKFLOW` + `POST /api/tasks/:id/pipeline`
+  + `workflow_receipts` (unchanged).
+- **n8n / zapier / make** — optional webhook adapters (`src/workflows/adapters.ts`).
+  Outbound: gated loop tool `n8n_run_workflow` / `run_workflow` → `workflow_acts`
+  (migration 0068) → fires only via `runApprovedWorkflowActs()` after an approved
+  verdict → writes a `workflow_receipts` row (evidence). Marketing proving ground:
+  `src/workflows/marketing.ts` builds the act shape.
+- **Inbound** — `POST /api/integrations/workflow/inbound` HMAC-signed source-only
+  ingress. Creates an open observability task; never holds approval.
+
+Surface port (`src/surfaces/port.ts`):
+
+- Panels register and mount under `/surfaces/:id` (cookie-auth shell).
+- Hermes dashboard mounts at `/surfaces/hermes`; set `HERMES_DASHBOARD_URL` to embed.
+
 ## Presence authz — the write path is gated too (2026-07-21, adversarial-gate fix)
 
 Port 1's presence roster has TWO surfaces: a read (`presence_list` /

@@ -145,6 +145,7 @@ import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
 import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './brain'
 import type { PhysicsSnapshot } from './brain'
+import { surfacesIndexBody, surfacePanelBody } from './surfaces'
 import { loadGrowthView, growthBody } from './growth'
 import { loadFleetRadar } from './radar'
 import { radarPageBody } from './radar-view'
@@ -634,6 +635,19 @@ dashboardApp.get('/brain', async (c) => {
   return c.html(
     shell(c.env, 'Brain', brainBody(view, isOrgAdmin(auth)), { physics: view.physics }),
   )
+})
+
+// ── Surface port panels (Port 5) — Hermes dashboard mounts here ──────────────
+// GET /surfaces — index. GET /surfaces/:id — one panel (Hermes embeds
+// HERMES_DASHBOARD_URL when set). Cookie-auth shell; never a second control plane.
+dashboardApp.get('/surfaces', async (c) => {
+  return c.html(shell(c.env, 'Surfaces', surfacesIndexBody()))
+})
+
+dashboardApp.get('/surfaces/:id', async (c) => {
+  const id = c.req.param('id')
+  const panel = surfacePanelBody(c.env, id)
+  return c.html(shell(c.env, 'Surface', panel))
 })
 
 // ── departments/growth (Marketing & Sales console view) ─────────────────────
@@ -3202,6 +3216,12 @@ function shell(
           <a class="nav-link" href="/fleet">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" width="17" height="17"><circle cx="10" cy="10" r="6.2"/><circle cx="10" cy="10" r="1.7" fill="currentColor" stroke="none"/></svg>
             <span class="nav-label">Fleet</span>
+          </a>
+
+          <!-- Surface port — Hermes dashboard panel (Port 5) -->
+          <a class="nav-link" href="/surfaces/hermes">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M4 14.5 10 3.5l6 11"/><path d="M6.2 11h7.6"/><circle cx="10" cy="16.2" r="1.1" fill="currentColor" stroke="none"/></svg>
+            <span class="nav-label">Hermes</span>
           </a>
 
           <!-- Radar (fleet + squad awareness map — #21/#23) -->

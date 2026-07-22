@@ -148,6 +148,19 @@ export interface Env {
   GHL_API_KEY?: string           // GoHighLevel location API key (outbound send)
   GHL_LOCATION_ID?: string       // GHL location id (scopes all API calls)
   GHL_WEBHOOK_SECRET?: string    // HMAC-SHA256 secret for inbound webhook verification
+  // Workflow port (Port 5) — optional external adapters behind the same port as
+  // Cloudflare Workflows (DEFAULT). Webhook URLs are env/config-sourced; SSRF-guarded
+  // at fire time. Auth headers never log. Absent ⇒ adapter returns not_configured.
+  N8N_WEBHOOK_URL?: string
+  N8N_WEBHOOK_AUTH?: string
+  ZAPIER_WEBHOOK_URL?: string
+  ZAPIER_WEBHOOK_AUTH?: string
+  MAKE_WEBHOOK_URL?: string
+  MAKE_WEBHOOK_AUTH?: string
+  WORKFLOW_INBOUND_SECRET?: string // HMAC-SHA256 for POST /api/integrations/workflow/inbound
+  WORKFLOW_INBOUND_SQUAD_ID?: string
+  // Surface port — Hermes dashboard panel embed URL (https). Absent ⇒ empty shell panel.
+  HERMES_DASHBOARD_URL?: string
   BILLING_PLAN_SECRET?: string   // HMAC-SHA256 secret: central billing source → POST /api/billing/plan (writes plan_tier)
   CC_SPEND_SECRET?: string       // HMAC-SHA256 secret: server transcript rollup → POST /api/economy/cc-spend (writes cc_spend_daily). Fail-closed: absent ⇒ 503.
   // Connector credential vault (issue #116) — AES-GCM-256 master key.
