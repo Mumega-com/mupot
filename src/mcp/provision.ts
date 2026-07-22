@@ -25,7 +25,7 @@
 
 import type { Capability, CapabilityGrant, Env, BusEvent, Squad } from '../types'
 import { hasCapability } from '../auth/capability'
-import { createDepartment, createSquad, createAgent } from '../org/service'
+import { createDepartment, createSquad, createAgent, findAgentsByName, getAgentProfile } from '../org/service'
 import {
   mintAgentBoundToken,
   isAgentTokenCapability,
@@ -47,6 +47,10 @@ import {
 
 const STRING_SCHEMA = { type: 'string' }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
+const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
+const OPTIONAL_BOOLEAN_SCHEMA = { type: 'boolean' }
+// death_condition is a free-form lifecycle-policy object (validated as JSON in service).
+const PROFILE_OBJECT_SCHEMA = { type: 'object' }
 const GRANTABLE_AGENT_CAPABILITIES = new Set<Capability>(['observer', 'member', 'lead', 'admin'])
 
 // Emit an attributed provision event so the activity feed/consumer knows a member
@@ -218,7 +222,7 @@ const toolCreateAgent: ToolSpec = {
   scope: 'squad',
   min: 'lead',
   args:
-    '{ squad: string (id|slug), slug: string, name: string, role?, model?, okr?, kpi_target?, effort?, autonomy?, budget_cap_cents?, budget_window? }',
+    '{ squad: string (id|slug), slug: string, name: string, role?, model?, okr?, kpi_target?, effort?, autonomy?, budget_cap_cents?, budget_window?, purpose?, owner?, model_fallback?, capabilities?: string[], skills?: string[], parent_agent_id?, qnft_ref?, death_condition?: object }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -233,6 +237,15 @@ const toolCreateAgent: ToolSpec = {
       autonomy: STRING_SCHEMA,
       budget_cap_cents: OPTIONAL_NUMBER_SCHEMA,
       budget_window: STRING_SCHEMA,
+      // profile (0068, Port 1.3)
+      purpose: STRING_SCHEMA,
+      owner: STRING_SCHEMA,
+      model_fallback: STRING_SCHEMA,
+      capabilities: OPTIONAL_STRING_ARRAY_SCHEMA,
+      skills: OPTIONAL_STRING_ARRAY_SCHEMA,
+      parent_agent_id: STRING_SCHEMA,
+      qnft_ref: STRING_SCHEMA,
+      death_condition: PROFILE_OBJECT_SCHEMA,
     },
     required: ['squad', 'slug', 'name'],
     additionalProperties: false,
@@ -262,6 +275,15 @@ const toolCreateAgent: ToolSpec = {
       autonomy: args.autonomy,
       budget_cap_cents: args.budget_cap_cents,
       budget_window: args.budget_window,
+      // profile (0068, Port 1.3)
+      purpose: args.purpose,
+      owner: args.owner,
+      model_fallback: args.model_fallback,
+      capabilities: args.capabilities,
+      skills: args.skills,
+      parent_agent_id: args.parent_agent_id,
+      qnft_ref: args.qnft_ref,
+      death_condition: args.death_condition,
     })
     if (!result.ok) return createErrorToFail(result.error)
     await emitProvisioned(env, auth.memberId as string, 'agent', result.value.id, {
@@ -269,6 +291,75 @@ const toolCreateAgent: ToolSpec = {
       agent_id: result.value.id,
     })
     return done({ agent: result.value })
+  },
+}
+
+// ── resolve_agent ───────────────────────────────────────────────────────────────
+// resolve-before-mint (Port 1.3): before minting a new agent, search existing agents
+// by name/slug across the whole pot so onboarding SEES the roles that already exist
+// and doesn't fork a duplicate identity. This is the anti-sprawl primitive — the
+// 2026-07-21 3-hermes incident (agent-hermes + kayhermes + hadi-hermes, distinct
+// roles, retired as "duplicates") is exactly what pot-wide resolve prevents.
+//
+// Scope: authenticated. Deliberately pot-wide (not caller-squad-scoped): the sprawl
+// this fixes spans squads, so a squad-scoped search would miss the case. Agents live
+// in a single-tenant pot (the `agents` table has no tenant column — one pot = one
+// tenant), so this discloses no cross-tenant data. It returns only agent metadata
+// (name/role/purpose/model/capabilities/lineage) already visible on presence rosters —
+// never credentials, project evidence, or another tenant's rows.
+const toolResolveAgent: ToolSpec = {
+  name: 'resolve_agent',
+  scope: 'org (read)',
+  min: 'authenticated',
+  args: '{ query: string, include_inactive?: boolean, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: STRING_SCHEMA,
+      include_inactive: OPTIONAL_BOOLEAN_SCHEMA,
+      limit: OPTIONAL_NUMBER_SCHEMA,
+    },
+    required: ['query'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (!auth.memberId) return fail(403, 'unauthenticated')
+    const query = str(args.query)
+    if (!query) return fail(400, 'invalid_args', 'query required')
+    const includeInactive = args.include_inactive === true
+    let limit: number | undefined
+    if (args.limit !== undefined) {
+      if (typeof args.limit !== 'number' || !Number.isFinite(args.limit)) {
+        return fail(400, 'invalid_args', 'limit must be a number')
+      }
+      limit = args.limit
+    }
+    const matches = await findAgentsByName(env, query, { includeInactive, limit })
+    return done({ matches })
+  },
+}
+
+// ── get_agent_profile ───────────────────────────────────────────────────────────
+// Read one agent's full profile by id. Same authenticated, pot-internal,
+// metadata-only disclosure rationale as resolve_agent above.
+const toolGetAgentProfile: ToolSpec = {
+  name: 'get_agent_profile',
+  scope: 'org (read)',
+  min: 'authenticated',
+  args: '{ agent_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { agent_id: STRING_SCHEMA },
+    required: ['agent_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (!auth.memberId) return fail(403, 'unauthenticated')
+    const agentId = str(args.agent_id)
+    if (!agentId) return fail(400, 'invalid_args', 'agent_id required')
+    const profile = await getAgentProfile(env, agentId)
+    if (!profile) return fail(404, 'agent_not_found')
+    return done({ profile })
   },
 }
 
@@ -641,6 +732,8 @@ export const PROVISION_TOOLS: ToolSpec[] = [
   toolCreateDepartment,
   toolCreateSquad,
   toolCreateAgent,
+  toolResolveAgent,
+  toolGetAgentProfile,
   toolMintAgentToken,
   toolGrantAgentCapability,
   toolRegisterAgentKey,

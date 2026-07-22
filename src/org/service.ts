@@ -221,6 +221,54 @@ export interface AgentInput {
   autonomy?: unknown
   budget_cap_cents?: unknown
   budget_window?: unknown
+  // profile fields (0068_agent_profile.sql) — Port 1.3, all optional
+  purpose?: unknown
+  owner?: unknown
+  model_fallback?: unknown
+  capabilities?: unknown // string[] on the wire
+  skills?: unknown // string[] on the wire
+  parent_agent_id?: unknown
+  qnft_ref?: unknown
+  death_condition?: unknown // JSON object or string
+}
+
+// A nullable free-text profile field: undefined|null → null; a string → itself;
+// anything else → the sentinel `undefined` (caller maps to an invalid_* error).
+function optString(v: unknown): string | null | undefined {
+  if (v === undefined || v === null) return null
+  return typeof v === 'string' ? v : undefined
+}
+
+// A nullable JSON string-array field (capabilities/skills). Stored as a JSON text
+// column, so validate it is an array of strings and re-serialize canonically.
+// undefined|null → null; string[] → JSON; anything else → undefined (invalid).
+function optStringArrayJson(v: unknown): string | null | undefined {
+  if (v === undefined || v === null) return null
+  if (!Array.isArray(v) || !v.every((x) => typeof x === 'string')) return undefined
+  return JSON.stringify(v)
+}
+
+// A plain (non-null, non-array) JSON object.
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+// death_condition: a JSON lifecycle-policy OBJECT stored as text. Accept an object
+// (serialize it) or a string (must itself parse to a plain object, stored verbatim).
+// undefined|null → null; anything that is not a plain object → undefined (invalid).
+// Rejecting arrays / scalars ("null", "42", "[...]") keeps the stored blob a policy
+// object, so a future enforcement sweep can trust its shape.
+function optJsonObject(v: unknown): string | null | undefined {
+  if (v === undefined || v === null) return null
+  if (typeof v === 'string') {
+    try {
+      return isPlainObject(JSON.parse(v)) ? v : undefined
+    } catch {
+      return undefined
+    }
+  }
+  if (isPlainObject(v)) return JSON.stringify(v)
+  return undefined
 }
 
 export async function createAgent(
@@ -279,6 +327,33 @@ export async function createAgent(
     input.budget_window === undefined ? 'week' : (input.budget_window as BudgetWindow)
   if (!isBudgetWindow(budget_window)) return { ok: false, error: 'invalid_budget_window' }
 
+  // ── profile field validation + defaults (0068, Port 1.3) ────────────────────────
+  const purpose = optString(input.purpose)
+  if (purpose === undefined) return { ok: false, error: 'invalid_purpose' }
+  const owner = optString(input.owner)
+  if (owner === undefined) return { ok: false, error: 'invalid_owner' }
+  const model_fallback = optString(input.model_fallback)
+  if (model_fallback === undefined) return { ok: false, error: 'invalid_model_fallback' }
+  const qnft_ref = optString(input.qnft_ref)
+  if (qnft_ref === undefined) return { ok: false, error: 'invalid_qnft_ref' }
+  const capabilities = optStringArrayJson(input.capabilities)
+  if (capabilities === undefined) return { ok: false, error: 'invalid_capabilities' }
+  const skills = optStringArrayJson(input.skills)
+  if (skills === undefined) return { ok: false, error: 'invalid_skills' }
+  const death_condition = optJsonObject(input.death_condition)
+  if (death_condition === undefined) return { ok: false, error: 'invalid_death_condition' }
+
+  // parent_agent_id: soft self-reference (no FK, see migration). Validate the
+  // parent exists so the placement tree can't point at a phantom id.
+  const parent_agent_id = optString(input.parent_agent_id)
+  if (parent_agent_id === undefined) return { ok: false, error: 'invalid_parent_agent_id' }
+  if (parent_agent_id !== null) {
+    const parent = await env.DB.prepare('SELECT 1 AS ok FROM agents WHERE id = ?')
+      .bind(parent_agent_id)
+      .first<{ ok: number }>()
+    if (!parent) return { ok: false, error: 'parent_agent_not_found' }
+  }
+
   // ── Plan ENTITLEMENT gate (S6) — the pot's tier must permit one more agent ──────
   // Pot-level invariant (the tier's maxAgents), NOT caller authz. Fail-closed to 'free'
   // when unconfigured. Existing overage grandfathered — only the NEXT create is blocked.
@@ -304,6 +379,15 @@ export async function createAgent(
     budget_cap_cents,
     budget_window,
     created_at: new Date().toISOString(),
+    // profile (0068) — arrays are parsed for the return value; JSON text goes to the DB.
+    purpose,
+    owner,
+    model_fallback,
+    capabilities: capabilities === null ? null : (JSON.parse(capabilities) as string[]),
+    skills: skills === null ? null : (JSON.parse(skills) as string[]),
+    parent_agent_id,
+    qnft_ref,
+    death_condition,
   }
 
   try {
@@ -311,8 +395,9 @@ export async function createAgent(
       `INSERT INTO agents
         (id, squad_id, slug, name, role, model, status,
          okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
-         created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         created_at,
+         purpose, owner, model_fallback, capabilities, skills, parent_agent_id, qnft_ref, death_condition)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         agent.id,
@@ -330,6 +415,14 @@ export async function createAgent(
         agent.budget_cap_cents,
         agent.budget_window,
         agent.created_at,
+        purpose,
+        owner,
+        model_fallback,
+        capabilities, // JSON text or null
+        skills, // JSON text or null
+        parent_agent_id,
+        qnft_ref,
+        death_condition,
       )
       .run()
   } catch (err) {
@@ -337,6 +430,113 @@ export async function createAgent(
     throw err
   }
   return { ok: true, value: agent }
+}
+
+// ── profile reads (0068, Port 1.3) ──────────────────────────────────────────────
+
+// A lightweight profile summary — enough for resolve-before-mint and roster display.
+export interface AgentProfileSummary {
+  id: string
+  squad_id: string
+  slug: string
+  name: string
+  role: string
+  status: string
+  model: string
+  model_fallback: string | null
+  purpose: string | null
+  owner: string | null
+  capabilities: string[] | null
+  skills: string[] | null
+  parent_agent_id: string | null
+  qnft_ref: string | null
+  death_condition: string | null
+}
+
+interface AgentProfileRow {
+  id: string
+  squad_id: string
+  slug: string
+  name: string
+  role: string
+  status: string
+  model: string
+  model_fallback: string | null
+  purpose: string | null
+  owner: string | null
+  capabilities: string | null
+  skills: string | null
+  parent_agent_id: string | null
+  qnft_ref: string | null
+  death_condition: string | null
+}
+
+// JSON-array text column → string[]; tolerate a corrupt/legacy value by returning null
+// rather than throwing (a bad stored value must not brick a read path).
+function parseArrayColumn(v: string | null): string[] | null {
+  if (v === null) return null
+  try {
+    const parsed = JSON.parse(v)
+    return Array.isArray(parsed) && parsed.every((x) => typeof x === 'string') ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function rowToProfileSummary(r: AgentProfileRow): AgentProfileSummary {
+  return {
+    id: r.id,
+    squad_id: r.squad_id,
+    slug: r.slug,
+    name: r.name,
+    role: r.role,
+    status: r.status,
+    model: r.model,
+    model_fallback: r.model_fallback,
+    purpose: r.purpose,
+    owner: r.owner,
+    capabilities: parseArrayColumn(r.capabilities),
+    skills: parseArrayColumn(r.skills),
+    parent_agent_id: r.parent_agent_id,
+    qnft_ref: r.qnft_ref,
+    death_condition: r.death_condition,
+  }
+}
+
+const PROFILE_COLUMNS =
+  'id, squad_id, slug, name, role, status, model, model_fallback, purpose, owner, capabilities, skills, parent_agent_id, qnft_ref, death_condition'
+
+// Read one agent's profile by id. null when the agent does not exist.
+export async function getAgentProfile(env: Env, agentId: string): Promise<AgentProfileSummary | null> {
+  const row = await env.DB.prepare(`SELECT ${PROFILE_COLUMNS} FROM agents WHERE id = ?`)
+    .bind(agentId)
+    .first<AgentProfileRow>()
+  return row ? rowToProfileSummary(row) : null
+}
+
+// resolve-before-mint: find existing agents matching a name/slug query, across ALL
+// squads, so onboarding surfaces existing ROLES before minting a duplicate identity.
+// This is the anti-sprawl primitive (the 2026-07-21 3-hermes incident). Case-
+// insensitive substring match on name OR slug; excludes 'inactive' by default.
+export async function findAgentsByName(
+  env: Env,
+  query: string,
+  opts: { includeInactive?: boolean; limit?: number } = {},
+): Promise<AgentProfileSummary[]> {
+  const q = query.trim().toLowerCase()
+  if (q === '') return []
+  const like = `%${q.replace(/[%_\\]/g, (ch) => `\\${ch}`)}%`
+  const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100)
+  const statusClause = opts.includeInactive ? '' : " AND status != 'inactive'"
+  const rows = await env.DB.prepare(
+    `SELECT ${PROFILE_COLUMNS} FROM agents
+      WHERE (LOWER(name) LIKE ?1 ESCAPE '\\' OR LOWER(slug) LIKE ?1 ESCAPE '\\')${statusClause}
+      ORDER BY name ASC, slug ASC
+      LIMIT ?2`,
+  )
+    .bind(like, limit)
+    .all<AgentProfileRow>()
+  return (rows.results ?? []).map(rowToProfileSummary)
 }
 
 // ── work-unit helpers ─────────────────────────────────────────────────────────
