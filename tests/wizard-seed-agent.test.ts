@@ -61,9 +61,13 @@ function makeD1(slots: SlotConfig[] = []) {
       }
       return stmt
     },
-    async batch(stmts: unknown[]) {
-      // setSettings uses batch — just resolve; not needed in these tests.
-      void stmts
+    async batch(stmts: Array<{ run(): Promise<unknown> }>) {
+      // createAgent (agents + memberships) and setSettings both use batch. Run each
+      // statement so a slot's `throws` (UNIQUE-violation simulation) propagates the
+      // same way a real D1 batch surfaces the first failing statement's error.
+      const out = []
+      for (const s of stmts) out.push(await s.run())
+      return out
     },
   }
   return { db, calls }

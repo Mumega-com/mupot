@@ -390,16 +390,22 @@ export async function createAgent(
     death_condition,
   }
 
+  // Insert the agent AND its squad membership atomically. The membership row
+  // (agent_id -> its own squad, 'member') is what the project-scoped message path
+  // (src/agents/messages.ts) checks — without it, an onboarded agent could not send
+  // or receive a project-scoped message (the memberships table was empty pot-wide;
+  // see gh #469). batch() runs both in one transaction, so an agent never exists
+  // without its membership. The agents unique-slug violation still surfaces here.
   try {
-    await env.DB.prepare(
-      `INSERT INTO agents
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO agents
         (id, squad_id, slug, name, role, model, status,
          okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
          created_at,
          purpose, owner, model_fallback, capabilities, skills, parent_agent_id, qnft_ref, death_condition)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-      .bind(
+      ).bind(
         agent.id,
         agent.squad_id,
         agent.slug,
@@ -423,8 +429,11 @@ export async function createAgent(
         parent_agent_id,
         qnft_ref,
         death_condition,
-      )
-      .run()
+      ),
+      env.DB.prepare(
+        `INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES (?, ?, ?, 'member')`,
+      ).bind(crypto.randomUUID(), agent.id, agent.squad_id),
+    ])
   } catch (err) {
     if (isUniqueViolation(err)) return { ok: false, error: 'slug_taken' }
     throw err
