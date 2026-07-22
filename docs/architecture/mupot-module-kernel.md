@@ -65,6 +65,42 @@ gated act → receipt. External managers never hold the approval.
 Dashboards mount as panels (Hermes web UI first). A surface is read-through the
 kernel's auth; it never becomes a second control plane.
 
+## Per-project concierge (the always-on dispatcher, CF-native)
+
+Each project has its OWN always-on concierge — NOT a systemd process per project
+(that is the VPS-liability anti-pattern: doesn't scale, can die, not durable).
+The concierge is a **per-project loop on the mupot Worker cron** (like
+`runLoopsTick`, scoped per project): CF runs it every heartbeat, so it is
+always-on by construction, zero idle cost, cannot die.
+
+Two layers, cleanly split:
+- **Concierge = decide.** Worker cron, per project, cheap heartbeat model →
+  escalates to Sol for hard decomposition. Reads the project's goals + board +
+  presence roster → ranks → dispatches work as agent-assigned board tasks → is
+  the project's chat front-door. Registers as an agent-system module → shows on
+  its own project's roster as `concierge: online`.
+- **Drivers = execute.** The shared host operator's build drivers (cursor /
+  claude / mumcp) pick up the dispatched tasks and build them; the gate-driver
+  (review-worker) gates them.
+
+Decision is per-project + always-on; execution is shared. One global operator
+becomes N per-project concierges, each isolated (project scope). Idempotent by
+design (rank, never act-loop; a concierge-originated starter is deduped by an
+any-status origin marker + a DB unique index — never re-dispatched), per
+brain=ATC. This is the "feed the board" half of the gate loop and the always-on
+front the Hermes-Sol reasoning escalates from.
+
+## Identity cluster (Port 1.x) — see companion doc
+
+The agent identity / memory / lifecycle design (agent-vs-instance sessions,
+agent profile + placement tree, parentage, project-scoped memory, the
+death-condition, project-context, and the controlled-ephemeral swarm policy)
+lives in **`docs/architecture/mupot-agent-identity-memory-lifecycle.md`**, with
+the competitive landscape in
+`docs/research/agent-identity-lifecycle-comparables-2026-07-21.md`. Those are
+extensions of this kernel — one agent, many harness instances; profiles that
+give agents a role/why/death; memory the project holds, not just each agent.
+
 ## Durability guarantees (the non-negotiables)
 
 1. Kernel state lives ONLY in CF primitives. No module holds kernel truth.
