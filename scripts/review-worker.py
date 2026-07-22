@@ -62,10 +62,19 @@ Flow per cycle:
                     LLM-verdict risk, which is why automerge stays flag-gated.
                     Model reads the real PR diff, hunts P0/P1/WARN findings,
                     verifies the PR's own claims against the diff, and must
-                    return STRICT JSON `{"verdict","p0","p1","warn","summary"}`.
-                    Any parse failure, timeout, non-GREEN/RED verdict value,
-                    isolation-invariant violation, or truncated/failed diff
-                    fetch is treated as verdict=RED (fail-closed).
+                    return STRICT JSON `{"verdict","p0","p1","warn","summary",
+                    "supporting_claim"}` where supporting_claim cites ONE
+                    concrete factual claim from its own summary plus the exact
+                    `path:line` in the real diff that proves it. The driver
+                    then verifies that cite against the diff text
+                    (enforce_supporting_claim): a GREEN whose cite is missing,
+                    malformed, or whose distinctive claim tokens do not appear
+                    in the cited file's diff is DOWNGRADED to WARN (kasra-core
+                    must independently check) -- right conclusion + wrong
+                    stated mechanism must never look like a clean pass.
+                    Any parse failure, timeout, non-GREEN/RED/WARN verdict
+                    value, isolation-invariant violation, or truncated/failed
+                    diff fetch is treated as verdict=RED (fail-closed).
   5. act         -> ALWAYS: append a `review-worker -> <sha>: ...` receipt to
                     the task body (audit trail), record the sha in the local
                     dedupe state, and best-effort bus-notify kasra.
@@ -149,6 +158,32 @@ REVIEWED_STATE_PATH = Path(
 DIFF_MAX_CHARS = 150_000
 PR_URL_RE = re.compile(r"PR:\s*(https://\S+)")
 PR_NUM_RE = re.compile(r"/pull/(\d+)")
+# supporting_claim.evidence must be exactly "<path>:<lineno>" citing a line
+# that appears in the NEW-file side of the unified diff (see verify_supporting_claim).
+SUPPORTING_CLAIM_EVIDENCE_RE = re.compile(r"^(.+):(\d+)$")
+HUNK_HEADER_RE = re.compile(r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@")
+# Common English filler stripped when mining distinctive claim tokens. Keep
+# identifiers (CamelCase, ALL_CAPS, dotted paths, snake_case) regardless.
+CLAIM_STOPWORDS = frozenset(
+    {
+        "this", "that", "these", "those", "the", "a", "an", "and", "or", "but",
+        "if", "then", "else", "when", "where", "which", "who", "whom", "what",
+        "how", "why", "than", "them", "they", "their", "there", "here", "also",
+        "just", "only", "into", "over", "under", "about", "after", "before",
+        "between", "through", "during", "without", "within", "upon", "via",
+        "per", "each", "every", "all", "any", "some", "such", "both", "few",
+        "more", "most", "other", "own", "same", "too", "very", "because",
+        "while", "although", "however", "therefore", "thus", "with", "from",
+        "for", "are", "was", "were", "been", "being", "have", "has", "had",
+        "does", "did", "will", "would", "should", "could", "might", "must",
+        "shall", "not", "yes", "true", "false", "null", "undefined", "return",
+        "returns", "covers", "cover", "test", "tests", "function", "functions",
+        "method", "methods", "filters", "filter", "using", "uses", "used",
+        "adds", "add", "added", "checks", "check", "ensures", "ensure",
+        "makes", "make", "made", "does", "doing", "done", "its", "itself",
+        "claim", "summary", "code", "file", "line", "diff", "change", "changes",
+    }
+)
 # P1 #1 fix: this keyword list is now SECONDARY/informational (kept as an
 # extra signal even on allow-listed paths, see classify_sensitive below) --
 # it is NOT the gate. A keyword deny-list only catches paths whose NAME
@@ -406,7 +441,15 @@ def build_review_prompt(pr_meta: dict, diff_text: str, sensitive: bool, sensitiv
     risk -- an adversarial model call is still a probabilistic judge reading
     adversarial input. That residual risk is exactly WHY automerge stays
     flag-gated off by default and the sensitive-surface allow-list routes
-    everything with real code to a human (see REVIEW_AUTOMERGE / P1 #1)."""
+    everything with real code to a human (see REVIEW_AUTOMERGE / P1 #1).
+
+    ECC verification-loop lesson (2026-07-22): every verdict MUST also pick
+    one concrete factual claim from its OWN summary and cite the exact
+    path:line in the real diff that proves it. A GREEN whose stated mechanism
+    is wrong (true conclusion, false reason -- e.g. claiming resolveAgentRef
+    filters by TENANT_SLUG when no such filter exists) is worse than a RED:
+    it teaches the next reader the wrong invariant. The driver verifies the
+    cite against the diff and downgrades unverifiable GREEN to WARN."""
     fence = f"INJECT-GUARD-{nonce}"
     return "\n".join(
         [
@@ -448,13 +491,29 @@ def build_review_prompt(pr_meta: dict, diff_text: str, sensitive: bool, sensitiv
             "        recommended but not an emergency.",
             "  WARN -- lower severity: style, missing test, minor edge case.",
             "",
+            "SUPPORTING CLAIM (required on EVERY verdict, including GREEN):",
+            "  Pick ONE specific factual claim you make in your own summary -- a concrete",
+            "  mechanism, not a vibe (e.g. 'resolveAgentRef returns null when the row is",
+            "  missing', 'this test asserts project_id is required', 'SAFE_ALLOWLIST_RE",
+            "  matches docs/ paths'). Quote the exact path:line from the REAL DIFF above",
+            "  that proves that claim (new-file line number on a context or '+' line).",
+            "  Do NOT invent a mechanism the diff does not show. A right conclusion with a",
+            "  wrong stated reason (e.g. claiming a TENANT_SLUG filter that is not in the",
+            "  cited function) is a failed review -- the driver will downgrade such a GREEN",
+            "  to WARN for kasra-core to independently check. Counting empty p0/p1 alone is",
+            "  NOT enough for a clean GREEN.",
+            "",
             "Respond with STRICT JSON ONLY -- no markdown fences, no commentary before or",
             "after -- exactly this shape:",
-            '{"verdict": "GREEN"|"RED", "p0": ["..."], "p1": ["..."], "warn": ["..."], "summary": "one paragraph"}',
+            '{"verdict": "GREEN"|"RED", "p0": ["..."], "p1": ["..."], "warn": ["..."], '
+            '"summary": "one paragraph", '
+            '"supporting_claim": {"claim": "one concrete factual claim from your summary", '
+            '"evidence": "path/to/file.ext:LINE"}}',
             "",
-            "verdict MUST be RED if p0 is non-empty. GREEN requires zero p0 AND zero p1.",
-            "Do not execute any code or use any tools -- you have none available -- reason",
-            "only over the diff text above.",
+            "verdict MUST be RED if p0 is non-empty. GREEN requires zero p0 AND zero p1 AND",
+            "a supporting_claim whose evidence path:line is visible in the diff and whose",
+            "claim tokens actually appear there. Do not execute any code or use any tools --",
+            "you have none available -- reason only over the diff text above.",
         ]
     )
 
@@ -506,15 +565,192 @@ def extract_claude_text(proc: subprocess.CompletedProcess) -> str:
         return proc.stdout or ""
 
 
+def _normalize_supporting_claim(raw: object) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    claim = raw.get("claim")
+    evidence = raw.get("evidence")
+    if not isinstance(claim, str) or not isinstance(evidence, str):
+        return None
+    claim_s = claim.strip()
+    evidence_s = evidence.strip()
+    if not claim_s or not evidence_s:
+        return None
+    return {"claim": claim_s, "evidence": evidence_s}
+
+
+def _diff_file_section(diff_text: str, path: str) -> str | None:
+    """Return the unified-diff body for `path`, or None if that path is absent."""
+    if not diff_text or not path:
+        return None
+    needle = path.lstrip("./")
+    chunks = re.split(r"(?m)(?=^diff --git )", diff_text)
+    for chunk in chunks:
+        if not chunk.startswith("diff --git "):
+            continue
+        header = chunk.splitlines()[0] if chunk.splitlines() else ""
+        # `diff --git a/foo b/foo` -- match either side, with or without a/b prefix.
+        if re.search(rf"(^|\s)[ab]/{re.escape(needle)}(\s|$)", header) or re.search(
+            rf"(^|\s){re.escape(needle)}(\s|$)", header
+        ):
+            return chunk
+        # Also accept ---/+++ path lines inside the chunk (renames, unusual headers).
+        for line in chunk.splitlines()[:6]:
+            if line.startswith("--- ") or line.startswith("+++ "):
+                rest = line[4:].strip()
+                if rest in ("/dev/null",):
+                    continue
+                rest = rest[2:] if rest.startswith(("a/", "b/")) else rest
+                if rest == needle or rest.endswith("/" + needle):
+                    return chunk
+    return None
+
+
+def _new_file_lines(section: str) -> dict[int, str]:
+    """Map new-file line numbers -> line text (no +/- prefix) for a file section."""
+    lines_by_no: dict[int, str] = {}
+    new_line: int | None = None
+    for raw in section.splitlines():
+        hunk = HUNK_HEADER_RE.match(raw)
+        if hunk:
+            new_line = int(hunk.group(2))
+            continue
+        if new_line is None:
+            continue
+        if raw.startswith("+") and not raw.startswith("+++"):
+            lines_by_no[new_line] = raw[1:]
+            new_line += 1
+        elif raw.startswith("-") and not raw.startswith("---"):
+            # Deleted line -- does not advance the new-file cursor.
+            continue
+        elif raw.startswith("\\"):
+            # "\ No newline at end of file"
+            continue
+        elif raw.startswith("diff --git ") or raw.startswith("index ") or raw.startswith("similarity "):
+            new_line = None
+        else:
+            # Context line (leading space) or empty context.
+            content = raw[1:] if raw.startswith(" ") else raw
+            lines_by_no[new_line] = content
+            new_line += 1
+    return lines_by_no
+
+
+def distinctive_claim_tokens(claim: str) -> list[str]:
+    """Mine identifiers a false-mechanism claim would invent (CamelCase, ALL_CAPS,
+    dotted/snake names). Plain English words are ignored -- requiring 'missing'
+    to appear in source would reject honest natural-language claims. Used to
+    spot 'filters by TENANT_SLUG' when TENANT_SLUG never appears in the cited
+    file's diff."""
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"[A-Za-z_][A-Za-z0-9_.]*", claim):
+        token = match.group(0)
+        lower = token.lower()
+        if lower in CLAIM_STOPWORDS or token in seen:
+            continue
+        is_camel = any(c.isupper() for c in token[1:]) and any(c.islower() for c in token)
+        is_caps = token.isupper() and len(token) >= 3
+        is_dotted = "." in token or "_" in token
+        if is_camel or is_caps or is_dotted:
+            tokens.append(token)
+            seen.add(token)
+    return tokens
+
+
+def verify_supporting_claim(supporting_claim: dict | None, diff_text: str) -> tuple[bool, str]:
+    """Return (ok, reason). ok means evidence path:line is in the diff AND every
+    distinctive claim token appears in that file's new-file side (catches the
+    #488 failure mode: true safety conclusion, false stated TENANT_SLUG filter)."""
+    if supporting_claim is None:
+        return False, "supporting_claim missing or malformed"
+    evidence = supporting_claim["evidence"]
+    claim = supporting_claim["claim"]
+    matched = SUPPORTING_CLAIM_EVIDENCE_RE.match(evidence)
+    if not matched:
+        return False, f"evidence must be path:line, got {evidence!r}"
+    path = matched.group(1).strip().lstrip("./")
+    line_no = int(matched.group(2))
+    if line_no < 1:
+        return False, f"evidence line must be >= 1, got {line_no}"
+    section = _diff_file_section(diff_text, path)
+    if section is None:
+        return False, f"path {path!r} not present in the reviewed diff"
+    new_lines = _new_file_lines(section)
+    if line_no not in new_lines:
+        return False, f"{path}:{line_no} is not a visible new-file line in the diff"
+    # Search the whole file section (hunk headers + body): distinctive tokens
+    # often appear in the @@ context hint or on nearby lines, not only on the
+    # single cited line. Still require the cited line itself to exist above.
+    section_text = section
+    tokens = distinctive_claim_tokens(claim)
+    if not tokens:
+        # No distinctive tokens -- still require the cited line itself to be
+        # non-empty so an empty/garbage claim cannot rubber-stamp GREEN.
+        if not new_lines[line_no].strip():
+            return False, f"cited line {path}:{line_no} is empty and claim has no distinctive tokens"
+        return True, "ok"
+    missing = [t for t in tokens if t not in section_text]
+    if missing:
+        return (
+            False,
+            f"claim tokens {missing!r} do not appear in diff for {path} "
+            f"(false or unverifiable mechanism -- cite must match the real code)",
+        )
+    return True, "ok"
+
+
+def enforce_supporting_claim(verdict_obj: dict, diff_text: str) -> dict:
+    """ECC verification-loop gate: a GREEN without a verifiable supporting_claim
+    cite is downgraded to WARN so kasra-core must independently check -- never
+    presented as a clean pass. RED is left alone (already fail-closed). WARN
+    from the model is left alone. Returns a new dict; does not mutate input."""
+    verdict = verdict_obj.get("verdict")
+    supporting = verdict_obj.get("supporting_claim")
+    if not isinstance(supporting, dict):
+        supporting = None
+    ok, reason = verify_supporting_claim(supporting if isinstance(supporting, dict) else None, diff_text)
+    base = {
+        "verdict": verdict_obj.get("verdict", "RED"),
+        "p0": list(verdict_obj["p0"]) if isinstance(verdict_obj.get("p0"), list) else [],
+        "p1": list(verdict_obj["p1"]) if isinstance(verdict_obj.get("p1"), list) else [],
+        "warn": list(verdict_obj["warn"]) if isinstance(verdict_obj.get("warn"), list) else [],
+        "summary": verdict_obj["summary"] if isinstance(verdict_obj.get("summary"), str) else "",
+        "supporting_claim": supporting,
+    }
+    if verdict != "GREEN":
+        return base
+    if ok:
+        return base
+    warn_msg = (
+        f"supporting_claim_unverified: {reason} -- GREEN downgraded to WARN; "
+        "kasra-core must independently check (right conclusion + wrong/unverifiable "
+        "stated mechanism must not look like a clean pass)"
+    )
+    return {
+        "verdict": "WARN",
+        "p0": base["p0"],
+        "p1": base["p1"],
+        "warn": [warn_msg] + base["warn"],
+        "summary": (
+            "[DOWNGRADED GREEN→WARN: supporting claim unverifiable — kasra-core must "
+            f"independently check] {base['summary']}"
+        ),
+        "supporting_claim": supporting,
+    }
+
+
 def _normalize_verdict(obj: dict) -> dict:
     verdict = obj.get("verdict")
-    if verdict not in ("GREEN", "RED"):
+    supporting = _normalize_supporting_claim(obj.get("supporting_claim"))
+    if verdict not in ("GREEN", "RED", "WARN"):
         return {
             "verdict": "RED",
             "p0": [f"invalid_verdict_value:{verdict!r} -- fail-closed"],
             "p1": [],
             "warn": [],
             "summary": obj.get("summary", "") if isinstance(obj.get("summary"), str) else "",
+            "supporting_claim": supporting,
         }
     return {
         "verdict": verdict,
@@ -522,6 +758,7 @@ def _normalize_verdict(obj: dict) -> dict:
         "p1": obj["p1"] if isinstance(obj.get("p1"), list) else [],
         "warn": obj["warn"] if isinstance(obj.get("warn"), list) else [],
         "summary": obj.get("summary", "") if isinstance(obj.get("summary"), str) else "",
+        "supporting_claim": supporting,
     }
 
 
@@ -550,6 +787,7 @@ def parse_verdict(text: str) -> dict:
         "p1": [],
         "warn": [],
         "summary": f"PARSE_FAILURE. raw tail: {stripped[-500:]}",
+        "supporting_claim": None,
     }
 
 
@@ -585,6 +823,15 @@ def attempt_automerge(task: dict, pr_number: int, reviewed_head_sha: str, verdic
             return {"attempted": True, "merged": False, "reason": f"verdict={verdict_obj['verdict']}, not GREEN"}
         if verdict_obj["p0"] or verdict_obj["p1"]:
             return {"attempted": True, "merged": False, "reason": "non-empty p0/p1 findings"}
+        # A GREEN that survived enforce_supporting_claim already has a verified
+        # cite; refuse merge if the field is somehow absent (defense in depth).
+        claim = verdict_obj.get("supporting_claim")
+        if not isinstance(claim, dict) or not claim.get("evidence"):
+            return {
+                "attempted": True,
+                "merged": False,
+                "reason": "GREEN missing verified supporting_claim cite -- refuse automerge",
+            }
         if sensitive:
             return {"attempted": True, "merged": False, "reason": "sensitive-surface PR -- parked for human gate"}
         if REPO_SLUG != CANONICAL_REPO_SLUG:
@@ -636,10 +883,16 @@ def attempt_automerge(task: dict, pr_number: int, reviewed_head_sha: str, verdic
 
 
 def build_receipt(head_sha: str, verdict_obj: dict, sensitive: bool, sensitive_reason: str, mode_note: str) -> str:
+    claim = verdict_obj.get("supporting_claim")
+    if isinstance(claim, dict) and claim.get("claim") and claim.get("evidence"):
+        claim_line = f"supporting_claim: {claim['claim']} @ {claim['evidence']}"
+    else:
+        claim_line = "supporting_claim: (missing -- not a clean verifiable pass)"
     lines = [
         f"review-worker -> {head_sha}: {verdict_obj['verdict']} "
         f"(p0={len(verdict_obj['p0'])} p1={len(verdict_obj['p1'])} warn={len(verdict_obj['warn'])}) "
         f"sensitive={sensitive} [{sensitive_reason}]",
+        claim_line,
         f"summary: {verdict_obj['summary']}",
     ]
     if verdict_obj["p0"]:
@@ -752,7 +1005,14 @@ def process_task(task: dict) -> bool:
     verdict_obj = (
         parse_verdict(raw)
         if raw
-        else {"verdict": "RED", "p0": ["adversarial review timed out or produced no output -- fail-closed"], "p1": [], "warn": [], "summary": "no reviewer output"}
+        else {
+            "verdict": "RED",
+            "p0": ["adversarial review timed out or produced no output -- fail-closed"],
+            "p1": [],
+            "warn": [],
+            "summary": "no reviewer output",
+            "supporting_claim": None,
+        }
     )
 
     # P0 #1 backstop: reject the run outright (regardless of what verdict text
@@ -768,6 +1028,7 @@ def process_task(task: dict) -> bool:
                 "p1": list(verdict_obj.get("p1", [])),
                 "warn": list(verdict_obj.get("warn", [])),
                 "summary": f"[FORCED RED: isolation invariant violated] {verdict_obj.get('summary', '')}",
+                "supporting_claim": verdict_obj.get("supporting_claim"),
             }
 
     # P1 #2 fix: a GREEN must never stand on an incompletely-reviewed diff.
@@ -779,7 +1040,19 @@ def process_task(task: dict) -> bool:
             "p1": list(verdict_obj.get("p1", [])),
             "warn": list(verdict_obj.get("warn", [])),
             "summary": f"[FORCED RED: diff incomplete] {verdict_obj.get('summary', '')}",
+            "supporting_claim": verdict_obj.get("supporting_claim"),
         }
+
+    # ECC verification-loop: GREEN must cite one concrete claim @ path:line
+    # that the driver can spot-check in the real diff. Unverifiable/false
+    # mechanism -> WARN (not a clean pass).
+    before_claim_gate = verdict_obj.get("verdict")
+    verdict_obj = enforce_supporting_claim(verdict_obj, diff_text)
+    if before_claim_gate == "GREEN" and verdict_obj["verdict"] == "WARN":
+        log(
+            f"task {short}: GREEN downgraded to WARN -- "
+            f"{verdict_obj['warn'][0] if verdict_obj['warn'] else 'supporting_claim unverified'}"
+        )
 
     automerge_result = attempt_automerge(task, pr_number, head_sha, verdict_obj, sensitive)
     mode_note = (
