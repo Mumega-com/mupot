@@ -115,6 +115,51 @@ describe('MCP project attribution parity', () => {
     }
   })
 
+  it('project_context composes meta + situation + roster + data_map for a project reader', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    // one ONLINE module on project-a, and one external board binding. last_heartbeat is
+    // an ISO string parsed via Date.parse; seed the current instant so it's within the
+    // PRESENCE_STALE_SECONDS window (staleness is derived at read time vs real `now`).
+    const nowIso = new Date().toISOString()
+    harness.sqlite
+      .prepare(
+        `INSERT INTO module_registry (id, tenant, kind, adapter, project_id, identity, status, capabilities, last_heartbeat, registered_at)
+         VALUES (?, ?, 'agent_system', 'claude-code', 'project-a', 'kasra', 'online', ?, ?, ?)`,
+      )
+      .run('mod-1', TENANT, JSON.stringify(['build']), nowIso, nowIso)
+    harness.sqlite
+      .prepare(
+        `INSERT INTO project_provider_bindings (project_id, provider, external_id, meta_json)
+         VALUES ('project-a', 'github_projects', 'PVT_kw123', '{}')`,
+      )
+      .run()
+
+    const res = await invokeTool(auth(), env, 'project_context', { project_id: 'project-a' }, 'https://pot.example')
+    expect(res.ok).toBe(true)
+    const r = res.result as {
+      project: { id: string }
+      situation: { health: string }
+      roster: Array<{ identity: string; status: string }>
+      data_map: { board_bindings: Array<{ provider: string; external_id: string }>; memory_scope: string }
+    }
+    expect(r.project.id).toBe('project-a')
+    expect(r.situation).toHaveProperty('health') // situation composed
+    expect(r.roster.map((m) => m.identity)).toContain('kasra')
+    expect(r.roster.find((m) => m.identity === 'kasra')?.status).toBe('online')
+    expect(r.data_map.board_bindings).toEqual([expect.objectContaining({ provider: 'github_projects', external_id: 'PVT_kw123' })])
+    expect(r.data_map.memory_scope).toBe('project:project-a')
+  })
+
+  it('project_context refuses a project the caller cannot read (404, no leak)', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const res = await invokeTool(auth(), env, 'project_context', { project_id: 'project-no-edge' }, 'https://pot.example')
+    expect(res.ok).toBe(false)
+    expect(res.status).toBe(404)
+    expect(res.error).toBe('project_not_found')
+  })
+
   it('creates, reassigns, and filters tasks with REST-equivalent project checks', async () => {
     harness = makeHarness()
     const env = envFor(harness)
