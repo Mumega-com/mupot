@@ -12,7 +12,7 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Env } from '../types'
 import { listPresence } from './service'
-import { encodeRosterPush, fanOutWebSockets } from './realtime'
+import { encodeRosterPush, fanOutWebSockets, reciprocateWebSocketClose } from './realtime'
 
 export class PresenceChannelDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -66,6 +66,7 @@ export class PresenceChannelDO extends DurableObject<Env> {
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
-    ws.close(code, reason)
+    // Never pass reserved/abnormal codes (1005/1006/1015) through raw — RangeError.
+    reciprocateWebSocketClose(ws, code, reason)
   }
 }

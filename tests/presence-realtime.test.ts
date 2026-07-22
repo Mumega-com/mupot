@@ -13,6 +13,8 @@ import {
   parseRosterPush,
   presenceChannelName,
   publishRosterPush,
+  reciprocateWebSocketClose,
+  sanitizeWebSocketCloseCode,
 } from '../src/registry/realtime'
 
 const NOW = new Date('2026-07-22T12:00:00.000Z')
@@ -117,6 +119,29 @@ describe('fanOutWebSockets', () => {
   })
 })
 
+describe('sanitizeWebSocketCloseCode / reciprocateWebSocketClose', () => {
+  it('maps reserved/abnormal codes (1005/1006/1015) to 1000', () => {
+    expect(sanitizeWebSocketCloseCode(1005)).toBe(1000)
+    expect(sanitizeWebSocketCloseCode(1006)).toBe(1000)
+    expect(sanitizeWebSocketCloseCode(1015)).toBe(1000)
+  })
+
+  it('passes through normal application codes unchanged', () => {
+    expect(sanitizeWebSocketCloseCode(1000)).toBe(1000)
+    expect(sanitizeWebSocketCloseCode(1001)).toBe(1001)
+    expect(sanitizeWebSocketCloseCode(4000)).toBe(4000)
+  })
+
+  it('never feeds reserved codes into ws.close (RangeError guard)', () => {
+    const close = vi.fn()
+    reciprocateWebSocketClose({ close }, 1006, 'abnormal')
+    expect(close).toHaveBeenCalledWith(1000, 'abnormal')
+    close.mockClear()
+    reciprocateWebSocketClose({ close }, 1000, 'bye')
+    expect(close).toHaveBeenCalledWith(1000, 'bye')
+  })
+})
+
 describe('publishRosterPush', () => {
   it('no-ops when the gate is off (query-time presence stays sufficient)', async () => {
     const env = { TENANT_SLUG: 't', DB: {} } as Env
@@ -186,6 +211,8 @@ describe('PresenceChannelDO export + wrangler contract (structural)', () => {
     expect(src).toContain('export class PresenceChannelDO')
     expect(src).toContain('acceptWebSocket')
     expect(src).toContain('fanOutWebSockets')
+    expect(src).toContain('reciprocateWebSocketClose')
+    expect(src).not.toMatch(/ws\.close\(code,\s*reason\)/)
     const entry = readFileSync('src/index.ts', 'utf8')
     expect(entry).toContain("export { PresenceChannelDO } from './registry/presence-channel-do'")
   })

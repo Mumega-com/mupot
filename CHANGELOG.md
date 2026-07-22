@@ -14,6 +14,12 @@ block collapses into a changelog entry when it ships.
   `GET /api/presence/live`) — CF-native fan-out for the first real-time need; off until
   `REALTIME_PRESENCE=1`. No Cloudflare Pub/Sub MQTT (ADR #473).
 
+### Fixed
+
+- `PresenceChannelDO.webSocketClose` sanitizes reserved/abnormal close codes
+  (1005/1006/1015 → 1000) before calling `ws.close()`, avoiding RangeError in the
+  hibernation close handler.
+
 ## [0.24.0] — 2026-07-19
 
 **Project Operations.** Projects with squad-scoped RBAC, cross-pot collaboration via the
