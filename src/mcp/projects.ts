@@ -17,6 +17,8 @@ import {
 } from '../projects/access'
 import { resolveReadableSquadIds } from '../projects/readable-squads'
 import { loadProjectSituation } from '../projects/situation'
+import { listPresence } from '../registry/service'
+import { listProjectBindings } from '../projects/providers/bindings'
 import { done, fail, str, type ToolOutcome, type ToolSpec } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
@@ -262,6 +264,51 @@ const toolProjectGet: ToolSpec = {
   },
 }
 
+// project_context (Port 1.2) — the unified "where is this project" read. project_get
+// returns meta + situation (board position); project_context ALSO returns the online
+// ROSTER (who is present on the project) and a DATA MAP (where the project's data
+// lives). This is what the concierge reads to know its position before dispatching,
+// and what any agent reads to align on a project in one call. READ-gated identically
+// to project_get (readAccess + readableProject); every composed read is already
+// project-scoped, so no new disclosure beyond what project_get / presence_list give a
+// project-reader. No new tables — it composes existing readers.
+const toolProjectContext: ToolSpec = {
+  name: 'project_context',
+  scope: 'visible workspace project',
+  min: 'observer',
+  args: '{ project_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { project_id: STRING_SCHEMA },
+    required: ['project_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const projectId = str(args.project_id)
+    if (!projectId) return fail(400, 'invalid_project_id')
+    const access = readAccess(auth)
+    const project = await readableProject(env, projectId, access)
+    if (!project) return fail(404, 'project_not_found')
+    const readableSquadIds = await projectionReadableSquads(env, access)
+    const [situation, roster, boardBindings] = await Promise.all([
+      loadProjectSituation(env, project, readableSquadIds),
+      listPresence(env, { projectId }),
+      listProjectBindings(env, projectId),
+    ])
+    return done({
+      project,
+      situation,
+      roster,
+      data_map: {
+        // where the project's board lives externally (github_projects / linear / notion)
+        board_bindings: boardBindings,
+        // where the project's shared memory lives — query it via project_recall
+        memory_scope: `project:${projectId}`,
+      },
+    })
+  },
+}
+
 const toolProjectUpdate: ToolSpec = {
   name: 'project_update',
   scope: 'workspace project lifecycle, including archive and restore',
@@ -395,6 +442,7 @@ export const PROJECT_TOOLS: ToolSpec[] = [
   toolProjectCreate,
   toolProjectList,
   toolProjectGet,
+  toolProjectContext,
   toolProjectUpdate,
   toolProjectSquadList,
   toolProjectSquadSet,

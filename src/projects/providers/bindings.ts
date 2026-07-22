@@ -22,6 +22,10 @@ export interface UpsertBindingInput {
   provider: unknown
   external_id: unknown
   connector_id?: unknown
+  // SECURITY: meta is stored verbatim in project_provider_bindings.meta_json, which is
+  // OBSERVER-readable via the project_context MCP tool (any project reader sees it).
+  // NEVER put a secret here (webhook signing secret, integration/install token, etc.) —
+  // credentials belong in the connector record (referenced by connector_id), never inline.
   meta?: unknown
 }
 
