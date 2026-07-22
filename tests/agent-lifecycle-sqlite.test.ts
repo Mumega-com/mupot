@@ -94,4 +94,30 @@ describe('agent lifecycle (0070) — real SQL', () => {
     const second = await softRetireAgent(env, { id: 'agent-idle', slug: 'idle-bot' }, 'twice')
     expect(second).toEqual({ ok: true, changed: false })
   })
+
+  it('dormant provider_down agent past idle TTL keeps dormant_reason (not soft-retired)', async () => {
+    harness.sqlite.exec(`
+      UPDATE agents
+         SET status = 'paused',
+             dormant_reason = 'provider_down',
+             death_condition = '{"idle_ttl_hours":24,"policy":"no_instance_no_activity"}'
+       WHERE id = 'agent-idle'
+    `)
+    // No model dep → reactivation probe skipped; soft-retire must still leave dormancy alone.
+    const tick = await runLifecycleTick(env, Date.parse('2026-07-22T12:00:00Z'))
+    expect(tick.soft_retired).toBe(0)
+    expect(tick.reactivated).toBe(0)
+    const row = harness.sqlite
+      .prepare('SELECT status, dormant_reason FROM agents WHERE id = ?')
+      .get('agent-idle') as { status: string; dormant_reason: string | null }
+    expect(row).toEqual({ status: 'paused', dormant_reason: 'provider_down' })
+
+    // Direct softRetire also refuses while dormant_reason is set.
+    const direct = await softRetireAgent(env, { id: 'agent-idle', slug: 'idle-bot' }, 'forced')
+    expect(direct).toEqual({ ok: true, changed: false })
+    const after = harness.sqlite
+      .prepare('SELECT status, dormant_reason FROM agents WHERE id = ?')
+      .get('agent-idle') as { status: string; dormant_reason: string | null }
+    expect(after).toEqual({ status: 'paused', dormant_reason: 'provider_down' })
+  })
 })

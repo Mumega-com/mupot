@@ -177,7 +177,11 @@ export type LifecycleWriteResult =
   | { ok: true; changed: boolean }
   | { ok: false; error: string }
 
-/** Soft-retire: status→inactive. Keys/tokens/memory untouched (reversible, audited). */
+/**
+ * Soft-retire: status→inactive. Keys/tokens/memory untouched (reversible, audited).
+ * Dormancy wins over idle-TTL: agents with dormant_reason set are left alone so
+ * credit/provider restore can still auto-reactivate them.
+ */
 export async function softRetireAgent(
   env: Env,
   agent: Pick<Agent, 'id' | 'slug'>,
@@ -189,7 +193,7 @@ export async function softRetireAgent(
   const result = await env.DB.prepare(
     `UPDATE agents
         SET status = 'inactive', dormant_reason = NULL
-      WHERE id = ?1 AND status != 'inactive'`,
+      WHERE id = ?1 AND status != 'inactive' AND dormant_reason IS NULL`,
   )
     .bind(agent.id)
     .run()
@@ -367,6 +371,10 @@ export interface LifecycleTickResult {
 /**
  * Cron tick: enforce death_condition soft-retire, then try to reactivate dormant agents.
  * Fail-soft per agent — never aborts the rest of the scheduled handler.
+ *
+ * Precedence: credit/provider dormancy wins over idle-TTL soft-retire (dormant agents
+ * are excluded from the death-condition sweep so dormant_reason stays restorable).
+ * `scanned` counts each agent_id once across both passes.
  */
 export async function runLifecycleTick(
   env: Env,
@@ -375,21 +383,23 @@ export async function runLifecycleTick(
     model?: ModelPort
   } = {},
 ): Promise<LifecycleTickResult> {
-  let scanned = 0
+  const scannedIds = new Set<string>()
   let softRetired = 0
   let reactivated = 0
   let errors = 0
 
   try {
+    // dormant_reason IS NULL: dormancy precedes idle-TTL retire (auto-recovery preserved).
     const { results } = await env.DB.prepare(
       `SELECT id, slug, created_at, death_condition
          FROM agents
         WHERE status IN ('active', 'paused')
-          AND death_condition IS NOT NULL`,
+          AND death_condition IS NOT NULL
+          AND dormant_reason IS NULL`,
     ).all<SweepCandidate>()
 
     for (const row of results ?? []) {
-      scanned++
+      scannedIds.add(row.id)
       const policy = parseDeathCondition(row.death_condition)
       if (!policy) continue
       try {
@@ -410,7 +420,13 @@ export async function runLifecycleTick(
       }
     }
   } catch {
-    return { ok: false, scanned, soft_retired: softRetired, reactivated, errors: errors + 1 }
+    return {
+      ok: false,
+      scanned: scannedIds.size,
+      soft_retired: softRetired,
+      reactivated,
+      errors: errors + 1,
+    }
   }
 
   try {
@@ -429,7 +445,7 @@ export async function runLifecycleTick(
     }>()
 
     for (const row of results ?? []) {
-      scanned++
+      scannedIds.add(row.id)
       if (!isDormantReason(row.dormant_reason)) continue
       try {
         if (row.dormant_reason === 'credit_out') {
@@ -464,5 +480,11 @@ export async function runLifecycleTick(
     errors++
   }
 
-  return { ok: true, scanned, soft_retired: softRetired, reactivated, errors }
+  return {
+    ok: true,
+    scanned: scannedIds.size,
+    soft_retired: softRetired,
+    reactivated,
+    errors,
+  }
 }

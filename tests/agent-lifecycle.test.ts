@@ -164,7 +164,10 @@ function makeLifecycleEnv(opts: {
                 if (sql.includes("status = 'inactive'")) {
                   const id = args[0]
                   const row = agents.find((a) => a.id === id)
-                  if (!row || row.status === 'inactive') return { meta: { changes: 0 } }
+                  // Dormancy wins: soft-retire refuses rows with dormant_reason set.
+                  if (!row || row.status === 'inactive' || row.dormant_reason != null) {
+                    return { meta: { changes: 0 } }
+                  }
                   row.status = 'inactive'
                   row.dormant_reason = null
                   return { meta: { changes: 1 } }
@@ -193,7 +196,12 @@ function makeLifecycleEnv(opts: {
           async all() {
             if (sql.includes('death_condition IS NOT NULL')) {
               return {
-                results: agents.filter((a) => a.death_condition != null && a.status !== 'inactive'),
+                results: agents.filter(
+                  (a) =>
+                    a.death_condition != null &&
+                    a.status !== 'inactive' &&
+                    a.dormant_reason == null,
+                ),
               }
             }
             if (sql.includes('dormant_reason IS NOT NULL')) {
@@ -245,6 +253,14 @@ describe('softRetire / dormant / reactivate', () => {
     const env = makeLifecycleEnv({ agents })
     const r = await markDormant(env, { id: 'a1', slug: 'bot' }, 'credit_out', 'budget_cap_exceeded')
     expect(r).toEqual({ ok: true, changed: true })
+    expect(agents[0]).toMatchObject({ status: 'paused', dormant_reason: 'credit_out' })
+  })
+
+  it('softRetireAgent refuses to wipe a dormant agent', async () => {
+    const agents = [{ id: 'a1', slug: 'bot', status: 'paused', dormant_reason: 'credit_out' }]
+    const env = makeLifecycleEnv({ agents })
+    const r = await softRetireAgent(env, { id: 'a1', slug: 'bot' }, 'idle')
+    expect(r).toEqual({ ok: true, changed: false })
     expect(agents[0]).toMatchObject({ status: 'paused', dormant_reason: 'credit_out' })
   })
 
@@ -320,5 +336,77 @@ describe('runLifecycleTick', () => {
     expect(tick.ok).toBe(true)
     expect(tick.reactivated).toBe(0)
     expect(agents[0]).toMatchObject({ status: 'paused', dormant_reason: 'provider_down' })
+  })
+
+  it('dormancy wins over idle-TTL: provider_down + past TTL keeps dormant_reason', async () => {
+    const old = '2026-07-01T00:00:00Z'
+    const agents = [
+      {
+        id: 'broke-idle',
+        slug: 'broke-idle',
+        status: 'paused',
+        created_at: old,
+        death_condition: JSON.stringify({ idle_ttl_hours: 24, policy: 'no_instance_no_activity' }),
+        dormant_reason: 'provider_down',
+        model: 'preferred',
+        model_fallback: null,
+        budget_cap_cents: null,
+        budget_window: 'day',
+      },
+    ]
+    const env = makeLifecycleEnv({ agents })
+    const model: ModelPort = {
+      chat: async () => {
+        throw new Error('AI Gateway 503 unavailable')
+      },
+    }
+    const tick = await runLifecycleTick(env, Date.parse('2026-07-22T12:00:00Z'), { model })
+    expect(tick.ok).toBe(true)
+    expect(tick.soft_retired).toBe(0)
+    expect(tick.reactivated).toBe(0)
+    expect(agents[0]).toMatchObject({ status: 'paused', dormant_reason: 'provider_down' })
+  })
+
+  it('scanned counts each agent once across soft-retire and reactivation passes', async () => {
+    const old = '2026-07-01T00:00:00Z'
+    const agents = [
+      {
+        id: 'idle-1',
+        slug: 'sprawl',
+        status: 'active',
+        created_at: old,
+        death_condition: JSON.stringify({ idle_ttl_hours: 24, policy: 'no_instance_no_activity' }),
+        dormant_reason: null,
+        model: 'm',
+        model_fallback: null,
+        budget_cap_cents: null,
+        budget_window: 'day',
+      },
+      {
+        id: 'dormant-with-ttl',
+        slug: 'dormant-ttl',
+        status: 'paused',
+        created_at: old,
+        death_condition: JSON.stringify({ idle_ttl_hours: 24, policy: 'no_instance_no_activity' }),
+        dormant_reason: 'provider_down',
+        model: 'preferred',
+        model_fallback: null,
+        budget_cap_cents: null,
+        budget_window: 'day',
+      },
+    ]
+    const env = makeLifecycleEnv({ agents })
+    const model: ModelPort = {
+      chat: async () => {
+        throw new Error('AI Gateway 503 unavailable')
+      },
+    }
+    const tick = await runLifecycleTick(env, Date.parse('2026-07-22T12:00:00Z'), { model })
+    expect(tick.ok).toBe(true)
+    expect(tick.soft_retired).toBe(1)
+    expect(tick.reactivated).toBe(0)
+    // Unique agents: idle-1 (retire) + dormant-with-ttl (reactivate) = 2, not 3
+    expect(tick.scanned).toBe(2)
+    expect(agents[1]).toMatchObject({ status: 'paused', dormant_reason: 'provider_down' })
   })
 })
