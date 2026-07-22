@@ -60,10 +60,14 @@ export interface ProjectLinkReceipt {
   shared_receipt_sha256: string
   remote_pot: string
   remote_project_id: string
+  source_pot: string
+  destination_pot: string
   source_agent_id: string
   action_type: 'task' | 'evidence'
   action_id: string
   evidence_sha256: string | null
+  evidence_url: string | null
+  authorization_result: 'authorized'
   receipt_key_id: string
   receipt_signature: string
   status: 'accepted'
@@ -546,8 +550,9 @@ async function receiptFor(
   return db.prepare(
     `SELECT id, tenant, link_id, local_project_id, direction, idempotency_key,
             correlation_id, envelope_sha256, shared_receipt_sha256, remote_pot,
-            remote_project_id, source_agent_id, action_type, action_id,
-            evidence_sha256, receipt_key_id, receipt_signature, status, created_at
+            remote_project_id, source_pot, destination_pot, source_agent_id,
+            action_type, action_id, evidence_sha256, evidence_url,
+            authorization_result, receipt_key_id, receipt_signature, status, created_at
        FROM project_link_receipts
       WHERE tenant = ?1 AND link_id = ?2 AND direction = ?3 AND idempotency_key = ?4`,
   ).bind(env.TENANT_SLUG, linkId, direction, idempotencyKey).first<ProjectLinkReceipt>()
@@ -660,10 +665,14 @@ export async function receiveProjectLinkEnvelope(
     shared_receipt_sha256: sharedHash,
     remote_pot: link.remote_pot,
     remote_project_id: link.remote_project_id,
+    source_pot: envelope.source.pot,
+    destination_pot: envelope.destination.pot,
     source_agent_id: envelope.source.agent_id,
     action_type: action.type,
     action_id: action.id,
     evidence_sha256: envelope.evidence?.sha256 ?? null,
+    evidence_url: envelope.evidence?.url ?? null,
+    authorization_result: 'authorized',
     receipt_key_id: link.local_key_id,
     receipt_signature: signature,
     status: 'accepted',
@@ -698,15 +707,18 @@ export async function receiveProjectLinkEnvelope(
     `INSERT INTO project_link_receipts (
       id, tenant, link_id, local_project_id, direction, idempotency_key,
       correlation_id, envelope_sha256, shared_receipt_sha256, remote_pot,
-      remote_project_id, source_agent_id, action_type, action_id,
-      evidence_sha256, receipt_key_id, receipt_signature, status, created_at
-    ) VALUES (?1, ?2, ?3, ?4, 'inbound', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'accepted', ?17)`,
+      remote_project_id, source_pot, destination_pot, source_agent_id,
+      action_type, action_id, evidence_sha256, evidence_url, authorization_result,
+      receipt_key_id, receipt_signature, status, created_at
+    ) VALUES (?1, ?2, ?3, ?4, 'inbound', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, 'accepted', ?21)`,
   ).bind(
     receipt.id, receipt.tenant, receipt.link_id, receipt.local_project_id,
     receipt.idempotency_key, receipt.correlation_id, receipt.envelope_sha256,
     receipt.shared_receipt_sha256, receipt.remote_pot, receipt.remote_project_id,
-    receipt.source_agent_id, receipt.action_type, receipt.action_id,
-    receipt.evidence_sha256, receipt.receipt_key_id, receipt.receipt_signature, receipt.created_at,
+    receipt.source_pot, receipt.destination_pot, receipt.source_agent_id,
+    receipt.action_type, receipt.action_id, receipt.evidence_sha256, receipt.evidence_url,
+    receipt.authorization_result, receipt.receipt_key_id, receipt.receipt_signature,
+    receipt.created_at,
   ))
   statements.push(db.prepare(
     `UPDATE project_links SET last_success_at = ?3, last_error = NULL
@@ -820,10 +832,14 @@ async function validatedOutboundReceipt(
     || remoteReceipt.direction !== 'inbound'
     || remoteReceipt.remote_pot !== link.tenant
     || remoteReceipt.remote_project_id !== link.local_project_id
+    || remoteReceipt.source_pot !== envelope.source.pot
+    || remoteReceipt.destination_pot !== envelope.destination.pot
     || remoteReceipt.source_agent_id !== envelope.source.agent_id
     || remoteReceipt.action_type !== action.type
     || remoteReceipt.action_id !== action.id
     || remoteReceipt.evidence_sha256 !== (envelope.evidence?.sha256 ?? null)
+    || remoteReceipt.evidence_url !== (envelope.evidence?.url ?? null)
+    || remoteReceipt.authorization_result !== 'authorized'
     || remoteReceipt.receipt_key_id !== link.remote_key_id
     || typeof remoteReceipt.receipt_signature !== 'string'
     || remoteReceipt.status !== 'accepted') return null
@@ -839,7 +855,12 @@ async function validatedOutboundReceipt(
     direction: 'outbound',
     remote_pot: link.remote_pot,
     remote_project_id: link.remote_project_id,
+    source_pot: envelope.source.pot,
+    destination_pot: envelope.destination.pot,
     source_agent_id: envelope.source.agent_id,
+    evidence_sha256: envelope.evidence?.sha256 ?? null,
+    evidence_url: envelope.evidence?.url ?? null,
+    authorization_result: 'authorized',
     created_at: now,
   }
   return receipt
@@ -1047,15 +1068,17 @@ export async function deliverProjectLinkEnvelope(
                 `INSERT INTO project_link_receipts (
                   id, tenant, link_id, local_project_id, direction, idempotency_key,
                   correlation_id, envelope_sha256, shared_receipt_sha256, remote_pot,
-                  remote_project_id, source_agent_id, action_type, action_id,
-                  evidence_sha256, receipt_key_id, receipt_signature, delivery_claim_token, status, created_at
-                ) VALUES (?1, ?2, ?3, ?4, 'outbound', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 'accepted', ?18)`,
+                  remote_project_id, source_pot, destination_pot, source_agent_id,
+                  action_type, action_id, evidence_sha256, evidence_url, authorization_result,
+                  receipt_key_id, receipt_signature, delivery_claim_token, status, created_at
+                ) VALUES (?1, ?2, ?3, ?4, 'outbound', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, 'accepted', ?22)`,
               ).bind(
                 receipt.id, receipt.tenant, receipt.link_id, receipt.local_project_id,
                 receipt.idempotency_key, receipt.correlation_id, receipt.envelope_sha256,
                 receipt.shared_receipt_sha256, receipt.remote_pot, receipt.remote_project_id,
-                receipt.source_agent_id, receipt.action_type, receipt.action_id,
-                receipt.evidence_sha256, receipt.receipt_key_id, receipt.receipt_signature,
+                receipt.source_pot, receipt.destination_pot, receipt.source_agent_id,
+                receipt.action_type, receipt.action_id, receipt.evidence_sha256, receipt.evidence_url,
+                receipt.authorization_result, receipt.receipt_key_id, receipt.receipt_signature,
                 claimToken, receipt.created_at,
               ),
             ])
@@ -1126,8 +1149,9 @@ export async function listProjectLinkReceipts(env: Env, projectId: string): Prom
   const result = await env.DB.prepare(
     `SELECT id, tenant, link_id, local_project_id, direction, idempotency_key,
             correlation_id, envelope_sha256, shared_receipt_sha256, remote_pot,
-            remote_project_id, source_agent_id, action_type, action_id,
-            evidence_sha256, receipt_key_id, receipt_signature, status, created_at
+            remote_project_id, source_pot, destination_pot, source_agent_id,
+            action_type, action_id, evidence_sha256, evidence_url,
+            authorization_result, receipt_key_id, receipt_signature, status, created_at
        FROM project_link_receipts
       WHERE tenant = ?1 AND local_project_id = ?2
       ORDER BY created_at DESC, id DESC`,
