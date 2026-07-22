@@ -32,7 +32,12 @@ import type {
   ProjectEvidenceSource,
   ProjectProjectionPage,
 } from '../projects/projections'
-import type { ProjectHealth, ProjectSituation } from '../projects/situation'
+import type {
+  ProjectHealth,
+  ProjectSituation,
+  ProjectSituationFact,
+  ProjectSituationLinkHealth,
+} from '../projects/situation'
 import { getFleetAgentRuntimeStates } from '../fleet/registry'
 import type { Presence } from '../fleet/registry'
 import { listProjectBindings } from '../projects/providers/bindings'
@@ -873,6 +878,23 @@ function situationTone(health: ProjectHealth): 'ok' | 'warn' | 'danger' | 'dim' 
   return 'primary'
 }
 
+function linkHealthTone(health: ProjectSituationLinkHealth): 'ok' | 'warn' | 'danger' | 'dim' {
+  if (health === 'healthy') return 'ok'
+  if (health === 'stale' || health === 'unknown') return 'warn'
+  if (health === 'failed') return 'danger'
+  return 'dim'
+}
+
+function factKindLabel(fact: ProjectSituationFact): Html {
+  if (fact.kind === 'local') return html``
+  const label = fact.kind === 'current_remote'
+    ? `current remote${fact.source_pot ? `:${fact.source_pot}` : ''}`
+    : fact.kind === 'stale_remote'
+      ? `stale remote${fact.source_pot ? `:${fact.source_pot}` : ''}`
+      : `unknown${fact.source_pot ? `:${fact.source_pot}` : ''}`
+  return html`<span class="ui-agent-role" data-fact-kind="${fact.kind}"${fact.source_pot ? html` data-source-pot="${fact.source_pot}"` : ''}>${label}</span>`
+}
+
 function situationCount(value: number, truncated: boolean): string {
   return `${value}${truncated ? '+' : ''}`
 }
@@ -924,7 +946,7 @@ function operatingSituationBand(
         <div class="ui-panel-sub">Blockers</div>
         ${situation.blockers.length
           ? html`<ul style="box-sizing:border-box;max-width:100%;margin:6px 0 0;padding-left:18px;overflow-wrap:anywhere;">${situation.blockers.map((blocker) => html`<li style="min-width:0;overflow-wrap:anywhere;">
-              <span style="min-width:0;overflow-wrap:anywhere;">${blocker.title}</span>${blocker.blocker_summary ? html`<span class="ui-agent-role" style="min-width:0;overflow-wrap:anywhere;">${blocker.blocker_summary}</span>` : ''}
+              <span style="min-width:0;overflow-wrap:anywhere;">${blocker.title}</span>${factKindLabel(blocker.fact)}${blocker.blocker_summary ? html`<span class="ui-agent-role" style="min-width:0;overflow-wrap:anywhere;">${blocker.blocker_summary}</span>` : ''}
             </li>`)}</ul>`
           : html`<div>No blockers need attention.</div>`}
       </div>
@@ -932,9 +954,20 @@ function operatingSituationBand(
         <div class="ui-panel-sub">Pending reviews</div>
         ${situation.pending_reviews.length
           ? html`<ul style="box-sizing:border-box;max-width:100%;margin:6px 0 0;padding-left:18px;overflow-wrap:anywhere;">${situation.pending_reviews.map((review) => html`<li style="min-width:0;overflow-wrap:anywhere;">
-              <span style="min-width:0;overflow-wrap:anywhere;">${review.title}</span>${review.gate_owner ? html`<span class="ui-agent-role" style="min-width:0;overflow-wrap:anywhere;">${review.gate_owner}</span>` : ''}
+              <span style="min-width:0;overflow-wrap:anywhere;">${review.title}</span>${factKindLabel(review.fact)}${review.gate_owner ? html`<span class="ui-agent-role" style="min-width:0;overflow-wrap:anywhere;">${review.gate_owner}</span>` : ''}
             </li>`)}</ul>`
           : html`<div>No reviews are pending.</div>`}
+      </div>
+      <div style="min-width:0;overflow-wrap:anywhere;">
+        <div class="ui-panel-sub">Linked pots</div>
+        ${situation.linked_pots.length
+          ? html`<ul style="box-sizing:border-box;max-width:100%;margin:6px 0 0;padding-left:18px;overflow-wrap:anywhere;">${situation.linked_pots.map((link) => html`<li style="min-width:0;overflow-wrap:anywhere;" data-linked-pot="${link.source_pot}" data-link-health="${link.health}">
+              <span style="min-width:0;overflow-wrap:anywhere;">${link.source_pot} / ${link.remote_project_id}</span>
+              ${pill(link.health, linkHealthTone(link.health))}
+              <span class="ui-agent-role" style="min-width:0;overflow-wrap:anywhere;">last sync ${link.last_synchronized_at ?? 'unknown'}</span>
+              <span class="ui-agent-role" style="min-width:0;overflow-wrap:anywhere;">remote agent presence unknown</span>
+            </li>`)}</ul>`
+          : html`<div>No linked pots.</div>`}
       </div>
     </div>
     ${notices.length ? html`<div class="ui-panel-sub" style="margin-top:14px;">${notices.join(' ')}</div>` : ''}
