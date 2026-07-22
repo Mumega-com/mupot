@@ -24,6 +24,18 @@ function makeEnv() {
         return {
           bind(...args: unknown[]) {
             return {
+              async first() {
+                if (sql.includes('FROM tasks') && sql.includes('thread_status')) {
+                  return {
+                    id: typeof args[0] === 'string' ? args[0] : 'task',
+                    thread_status: 'open',
+                    git_branch: null,
+                    github_issue_url: null,
+                  }
+                }
+                if (sql.includes('FROM task_thread_receipts')) return null
+                return null
+              },
               async run() {
                 if (sql.includes('INSERT INTO tasks')) inserts.push(args)
                 return { meta: { changes: 1 } }

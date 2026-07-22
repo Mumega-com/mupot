@@ -6,13 +6,27 @@ import type { Env } from '../src/types'
 
 // Env: task row present, free tier (repo_file_write enabled), static token. Captures the
 // final task UPDATE. A routed fetch mock drives branch/file/PR responses.
-function env(opts: { task?: { id: string; status: string } | null; token?: string | null } = {}) {
-  const task = opts.task === undefined ? { id: 'T1', status: 'open' } : opts.task
+function env(opts: { task?: { id: string; status: string; assignee_agent_id?: string | null } | null; token?: string | null } = {}) {
+  const task = opts.task === undefined
+    ? { id: 'T1', status: 'open', assignee_agent_id: null as string | null, thread_status: 'open', git_branch: null as string | null, github_issue_url: null as string | null }
+    : opts.task === null
+      ? null
+      : {
+          ...opts.task,
+          assignee_agent_id: opts.task.assignee_agent_id ?? null,
+          thread_status: 'open',
+          git_branch: null as string | null,
+          github_issue_url: null as string | null,
+        }
   const updates: Array<{ sql: string; args: unknown[] }> = []
   const DB = {
     prepare: (sql: string) => ({
       bind: (...args: unknown[]) => ({
-        first: async () => (sql.includes('FROM tasks') ? task : null),
+        first: async () => {
+          if (sql.includes('FROM tasks')) return task
+          if (sql.includes('FROM task_thread_receipts')) return null
+          return null
+        },
         run: async () => {
           if (sql.startsWith('UPDATE tasks')) updates.push({ sql, args })
           return { meta: { changes: 1 } }
@@ -55,10 +69,11 @@ describe('executeTaskAsPR', () => {
     const { impl } = happyFetch(11)
     const res = await executeTaskAsPR(e, base, { fetchImpl: impl })
     expect(res).toEqual({ ok: true, prNumber: 11, prUrl: 'https://x/pull/11', filesWritten: 2 })
-    // task updated to review + PR url
-    expect(updates).toHaveLength(1)
+    // status→review + PR url, then branch link (work-item thread)
+    expect(updates.length).toBeGreaterThanOrEqual(1)
     expect(updates[0].sql).toContain("status = 'review'")
     expect(updates[0].args).toContain('https://x/pull/11')
+    expect(updates.some((u) => u.sql.includes('git_branch'))).toBe(true)
   })
 
   it('authors commits as the task\'s assigned agent (#21)', async () => {
@@ -68,8 +83,18 @@ describe('executeTaskAsPR', () => {
       prepare: (sql: string) => ({
         bind: (...args: unknown[]) => ({
           first: async () => {
-            if (sql.includes('FROM tasks')) return { id: 'T1', status: 'open', assignee_agent_id: 'A1' }
+            if (sql.includes('FROM tasks')) {
+              return {
+                id: 'T1',
+                status: 'open',
+                assignee_agent_id: 'A1',
+                thread_status: 'open',
+                git_branch: null,
+                github_issue_url: null,
+              }
+            }
             if (sql.includes('FROM agents')) return agent
+            if (sql.includes('FROM task_thread_receipts')) return null
             return null
           },
           run: async () => ({ meta: { changes: 1 } }),
@@ -99,8 +124,18 @@ describe('executeTaskAsPR', () => {
       prepare: (sql: string) => ({
         bind: (...args: unknown[]) => ({
           first: async () => {
-            if (sql.includes('FROM tasks')) return { id: 'T1', status: 'open', assignee_agent_id: 'A1' }
+            if (sql.includes('FROM tasks')) {
+              return {
+                id: 'T1',
+                status: 'open',
+                assignee_agent_id: 'A1',
+                thread_status: 'open',
+                git_branch: null,
+                github_issue_url: null,
+              }
+            }
             if (sql.includes('FROM agents')) return agent
+            if (sql.includes('FROM task_thread_receipts')) return null
             return null
           },
           run: async () => ({ meta: { changes: 1 } }),

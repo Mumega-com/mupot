@@ -13,6 +13,7 @@ import type { Env } from '../types'
 import { createBranch, putFile, openPullRequest, isValidRepoPath, type CommitIdentity } from './github-pr'
 import { githubCan } from './github-capabilities'
 import { isValidRepo } from './github-repo-write'
+import { linkTaskBranch } from '../tasks/thread'
 
 /** Domain for an agent-authored commit's email local part (`slug@<this>`), baked into the
  *  CUSTOMER's git history. `env.AGENT_COMMIT_EMAIL_DOMAIN` overrides it; unset ⇒ this default,
@@ -119,6 +120,11 @@ export async function executeTaskAsPR(
   )
     .bind(pr.url, now, taskId)
     .run()
+
+  // Work-item = thread: branch auto-links the task's scoped channel/thread.
+  // Actor is the assignee when present; otherwise the execute path itself.
+  const linkActor = task.assignee_agent_id ?? 'system:github_execute'
+  await linkTaskBranch(env, taskId, branchName, linkActor, { prUrl: pr.url })
 
   return { ok: true, prNumber: pr.number, prUrl: pr.url, filesWritten: written }
 }

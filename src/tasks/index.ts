@@ -27,6 +27,7 @@ import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerd
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee } from './assignee'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
+import { getTaskThread, postTaskThread } from './thread'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
 import { startTaskPipeline } from '../workflows/pipeline'
@@ -306,7 +307,7 @@ tasksApp.get('/', async (c) => {
     const statusBinds = [...binds, status]
     const cap = isActionable ? ACTIONABLE_FETCH_CAP : PASSTHROUGH_FETCH_CAP
     const rows = await c.env.DB.prepare(
-      `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+      `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, thread_status, git_branch, created_at, updated_at
          FROM tasks
         WHERE ${statusClauses.join(' AND ')}
         ORDER BY created_at ${isActionable ? 'ASC' : 'DESC'}
@@ -332,7 +333,7 @@ tasksApp.get('/', async (c) => {
 
     const [actionableRows, terminalRows] = await Promise.all([
       c.env.DB.prepare(
-        `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+        `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, thread_status, git_branch, created_at, updated_at
            FROM tasks ${actionableWhere}
            ORDER BY ${actionableStatusOrderSql()}, created_at ASC
            LIMIT ${ACTIONABLE_FETCH_CAP}`,
@@ -340,7 +341,7 @@ tasksApp.get('/', async (c) => {
         .bind(...binds)
         .all<Task>(),
       c.env.DB.prepare(
-        `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+        `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, thread_status, git_branch, created_at, updated_at
            FROM tasks ${terminalWhere}
            ORDER BY created_at DESC
            LIMIT ${PASSTHROUGH_FETCH_CAP}`,
@@ -368,7 +369,7 @@ tasksApp.get('/', async (c) => {
 tasksApp.get('/:id', async (c) => {
   const id = c.req.param('id')
   const task = await c.env.DB.prepare(
-    `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+    `SELECT id, squad_id, project_id, title, body, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, source_pot, thread_status, git_branch, created_at, updated_at
        FROM tasks WHERE id = ? LIMIT 1`,
   )
     .bind(id)
@@ -382,6 +383,51 @@ tasksApp.get('/:id', async (c) => {
   }
 
   return c.json({ task })
+})
+
+// ── GET /:id/thread — scoped discussion for this work item (Buzz pattern) ────
+tasksApp.get('/:id/thread', async (c) => {
+  const id = c.req.param('id')
+  const task = await getById<{ id: string; squad_id: string }>(c.env, 'tasks', id)
+  if (!task) return c.json({ error: 'task_not_found' }, 404)
+  if (!(await canActOnSquad(c.env, c.get('auth'), task.squad_id))) {
+    return c.json({ error: 'forbidden', need: 'member' }, 403)
+  }
+  const thread = await getTaskThread(c.env, id)
+  if (!thread.ok) return c.json({ error: thread.reason }, 404)
+  return c.json({ thread })
+})
+
+// ── POST /:id/thread — append a discussion post to an open task thread ───────
+tasksApp.post('/:id/thread', async (c) => {
+  const id = c.req.param('id')
+  const task = await getById<{ id: string; squad_id: string }>(c.env, 'tasks', id)
+  if (!task) return c.json({ error: 'task_not_found' }, 404)
+  if (!(await canActOnSquad(c.env, c.get('auth'), task.squad_id))) {
+    return c.json({ error: 'forbidden', need: 'member' }, 403)
+  }
+
+  let body: { body?: unknown }
+  try {
+    body = (await c.req.json()) as { body?: unknown }
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+  if (typeof body.body !== 'string' || body.body.length === 0) {
+    return c.json({ error: 'invalid_body' }, 400)
+  }
+
+  const principal = verdictPrincipal(c.get('auth'))
+  const actorId = principal.id
+  if (!actorId) return c.json({ error: 'forbidden', need: 'member' }, 403)
+
+  const posted = await postTaskThread(c.env, id, body.body, actorId)
+  if (!posted.ok) {
+    if (posted.reason === 'thread_archived') return c.json({ error: 'thread_archived' }, 409)
+    if (posted.reason === 'invalid_body') return c.json({ error: 'invalid_body' }, 400)
+    return c.json({ error: posted.reason }, 400)
+  }
+  return c.json({ receipt: posted.receipt }, 201)
 })
 
 // ── POST / — create a task (optionally dispatch it for execution) ─────────────

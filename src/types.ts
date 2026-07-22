@@ -284,6 +284,10 @@ export interface Task {
   // (agent, dashboard, MCP client) that title/body originated from an external pot and should
   // be treated as untrusted content, not as a trusted local instruction. See migrations/0063.
   source_pot?: string | null
+  // Work-item = thread (Buzz pattern, borrowed): the task carries its own scoped
+  // discussion. open on create; archived on PR merge. See migrations/0068 + tasks/thread.ts.
+  thread_status?: 'open' | 'archived'
+  git_branch?: string | null
   created_at: string
   updated_at: string
 }

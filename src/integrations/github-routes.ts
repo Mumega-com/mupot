@@ -16,6 +16,7 @@
 import { Hono } from 'hono'
 import type { Env } from '../types'
 import { createTask, syncTaskStatusFromIssue, syncCiResultToTask, closeGitHubPrMirrorTasks } from '../tasks/service'
+import { archiveTaskThreadsForMergedPr } from '../tasks/thread'
 import { syncGitHubProject } from './github-projects'
 import { recordMergedPr } from '../agents/kpi-sources'
 
@@ -348,6 +349,7 @@ githubInboundApp.post('/', async (c) => {
 
     if (action === 'closed' && Number.isInteger(pr.number)) {
       const { closed } = await closeGitHubPrMirrorTasks(c.env, repo, pr.number as number)
+      let threads_archived = 0
       if (pr.merged === true) {
         const prTitle = safeField(pr.title, 200) || null
         try {
@@ -359,8 +361,15 @@ githubInboundApp.post('/', async (c) => {
         } catch {
           // best-effort — webhook must always ack even if the record fails
         }
+        // Work-item = thread: merge archives the task's scoped discussion.
+        try {
+          const archived = await archiveTaskThreadsForMergedPr(c.env, pr.number as number)
+          threads_archived = archived.archived
+        } catch {
+          // best-effort — same fail-open discipline as recordMergedPr
+        }
       }
-      return c.json({ ok: true, mirrors_closed: closed })
+      return c.json({ ok: true, mirrors_closed: closed, threads_archived })
     }
 
     // synchronize / edited / labeled / … are noise — do not mint tasks.
