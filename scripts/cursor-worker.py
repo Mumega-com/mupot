@@ -112,6 +112,9 @@ def register_presence() -> None:
     every OPERATOR_INTERVAL). project_id: null is the always-open self bucket
     (no project-access grant needed). Never raises: a presence failure must
     not block real task work.
+
+    Capability tags must match src/tasks/effort-route.ts HARNESS_CAPABILITIES
+    for slug=cursor: build only (never research/review).
     """
     try:
         mcp("presence_register", {

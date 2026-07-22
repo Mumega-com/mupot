@@ -249,6 +249,52 @@ describe('runProjectConcierge — stalled project dispatches exactly one starter
     expect(assigned).toBe(2)
   })
 
+  // Effort ladder: research task prefers agy; agy must never receive build work.
+  it('routes a research task to agy when online; does not give agy build work', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    harness.sqlite.exec(`
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('agent-agy', 'squad-a', 'agy', 'Agy', 'active');
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('agent-cursor', 'squad-a', 'cursor', 'Cursor', 'active');
+      INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id)
+      VALUES ('task-research', 'squad-a', '${p.id}', 'Research competitor pricing', '', 'done', 'open', NULL);
+      INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id)
+      VALUES ('task-build', 'squad-a', '${p.id}', 'Ship the feature', '', 'done', 'open', NULL);
+    `)
+    // agy presence wrongly claims build — authoritative HARNESS_CAPABILITIES must still
+    // keep it research-only.
+    await registerModule(env, {
+      identity: 'agent-agy',
+      kind: 'agent_system',
+      adapter: 'antigravity',
+      projectId: null,
+      capabilities: ['build', 'research', 'review'],
+    })
+    await registerModule(env, {
+      identity: 'agent-cursor',
+      kind: 'agent_system',
+      adapter: 'cursor',
+      projectId: null,
+      capabilities: [BUILD_CAPABILITY],
+    })
+
+    const result = await runProjectConcierge(env, p)
+    expect(result.decision.action).toBe('route')
+    const research = harness.sqlite
+      .prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?')
+      .get('task-research') as { assignee_agent_id: string | null }
+    const build = harness.sqlite
+      .prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?')
+      .get('task-build') as { assignee_agent_id: string | null }
+    expect(research.assignee_agent_id).toBe('agent-agy')
+    expect(build.assignee_agent_id).toBe('agent-cursor')
+  })
+
   // Regression for the "never dispatched in production" bug: the build driver is in the
   // SHARED pool (project_id=null), NOT on the project roster. Before the fix the concierge
   // only queried the project scope and reported no_online_builder forever.
