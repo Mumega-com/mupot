@@ -290,6 +290,7 @@ block collapses into a changelog entry when it ships.
 
 ### Added
 
+<<<<<<< HEAD
 - Linear connector (flight-20260803-linear-posthog): `createLinearBoardPort`
   (`src/projects/providers/linear.ts`) now does real, read-only GraphQL reads
   against Linear (`src/integrations/linear-issues.ts`) through the existing
@@ -394,6 +395,9 @@ block collapses into a changelog entry when it ships.
     `scripts/test_steward_worker.py` — each verified to fail on the pre-fix commit
     for the right reason (the task IS auto-picked-up / IS auto-assigned), not
     because a helper is missing.
+- Gated Durable Object + WebSocket live-roster pub/sub channel (`PresenceChannelDO`,
+  `GET /api/presence/live`) — CF-native fan-out for the first real-time need; off until
+  `REALTIME_PRESENCE=1`. No Cloudflare Pub/Sub MQTT (ADR #473).
 
 ### Changed
 
