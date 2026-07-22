@@ -53,6 +53,9 @@ export interface Env {
   AI: Ai
   AGENT: DurableObjectNamespace
   SQUAD: DurableObjectNamespace
+  // Live roster push channel (ADR #473). Optional: declared in wrangler but inert
+  // until REALTIME_PRESENCE=1. See src/registry/realtime.ts + PresenceChannelDO.
+  PRESENCE_CHANNEL?: DurableObjectNamespace
   // Durable task pipeline (issue #7, migration 0012).  Optional: only present
   // when the [[workflows]] binding is declared in wrangler.toml.  Code that
   // calls the binding should guard `if (env.TASK_WORKFLOW)` or use the
@@ -113,6 +116,10 @@ export interface Env {
   // vars (company: sos/kasra; tenant: its own project + operator agent).
   FLEET_PROJECT?: string
   FLEET_OPS_AGENT?: string
+  // Gated live roster WebSocket fan-out (ADR #473). Set to "1" to enable
+  // GET /api/presence/live + publish-on-mutation. Off by default — query-time
+  // presence remains sufficient for the coordination loop.
+  REALTIME_PRESENCE?: string
   // secrets (present at runtime only)
   OAUTH_CLIENT_ID?: string
   OAUTH_CLIENT_SECRET?: string

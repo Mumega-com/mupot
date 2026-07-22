@@ -20,6 +20,7 @@ BRAND = "Mumega"                   # dashboard brand
 OAUTH_PROVIDER = "google"         # google | telegram
 FLEET_PROJECT = "sos"             # bus project the fleet window addresses (company fleet = sos, not the mumega slug)
 FLEET_OPS_AGENT = "kasra"         # ops agent that executes control requests (explicit — resolvers fail closed, no code default)
+# REALTIME_PRESENCE = "1"         # opt-in live roster WebSocket fan-out (ADR #473). Off by default.
 # secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN.
 # For a one-time self-hosted first owner without dashboard OAuth, set
 # BOOTSTRAP_OWNER_TOKEN via `bash scripts/secrets.sh --pot <slug> --bootstrap-owner`,
@@ -89,9 +90,19 @@ class_name = "AgentDO"
 name = "SQUAD"
 class_name = "SquadCoordinatorDO"
 
+# Live roster WebSocket channel (ADR #473). Binding is always declared so the
+# DO class can deploy; the feature stays OFF until REALTIME_PRESENCE=1 under [vars].
+[[durable_objects.bindings]]
+name = "PRESENCE_CHANNEL"
+class_name = "PresenceChannelDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AgentDO", "SquadCoordinatorDO"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["PresenceChannelDO"]
 
 # ── durable task pipeline (issue #7) ──
 # Opt-in: start via POST /api/tasks/:id/pipeline.  The legacy direct-execute

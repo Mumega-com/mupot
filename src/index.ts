@@ -60,6 +60,8 @@ import { presenceApp } from './registry/presence-routes'
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
 export { SquadCoordinatorDO } from './agents/squad-do'
+// Gated live-roster WebSocket channel (ADR #473) — see src/registry/realtime.ts.
+export { PresenceChannelDO } from './registry/presence-channel-do'
 // Workflow class — the CF Workflows runtime discovers it via this named export.
 // The class_name in [[workflows]] must match: "TaskWorkflow".
 export { TaskWorkflow } from './workflows/task-workflow'
