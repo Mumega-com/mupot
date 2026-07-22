@@ -7,6 +7,7 @@
 import type { Env, Task, TaskVerdict, BusEvent } from '../types'
 import { createBus } from '../bus'
 import { assertWritten } from '../lib/receipt'
+import { openTaskThread } from './thread'
 import { resolveOutboundGitHubToken } from '../integrations/github-app'
 import { hasProjectWriteForSquads } from '../projects/access'
 
@@ -775,6 +776,8 @@ export async function createTask(
     result: null,
     completed_at: null,
     gate_owner: input.gate_owner ?? null,
+    thread_status: 'open',
+    git_branch: null,
     created_at: now,
     updated_at: now,
   }
@@ -821,6 +824,12 @@ export async function createTask(
       task.github_issue_url = issueUrl
     }
   }
+
+  // Work-item = thread: every task opens its scoped discussion on create.
+  // Actor is the creating principal when known; otherwise a stable system id.
+  const threadActor =
+    options.actor?.id && options.actor.id.length > 0 ? options.actor.id : 'system:task_create'
+  await openTaskThread(env, task.id, threadActor)
 
   await emitTaskEvent(env, 'task.created', task, options.actor)
   return task

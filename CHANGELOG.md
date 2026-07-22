@@ -8,6 +8,13 @@ block collapses into a changelog entry when it ships.
 
 ## [Unreleased]
 
+### Added
+
+- Work-item = thread (Buzz pattern, borrowed): a task opens a scoped discussion
+  bound to its branch/PR; merge archives it. Reuses task + append-only receipt
+  primitives (`thread_status`, `git_branch`, `task_thread_receipts`) — no Buzz
+  stack. See `docs/architecture/work-item-thread.md`.
+
 ## [0.24.0] — 2026-07-19
 
 **Project Operations.** Projects with squad-scoped RBAC, cross-pot collaboration via the
