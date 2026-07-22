@@ -66,9 +66,17 @@ class_name = "AgentDO"
 name = "SQUAD"
 class_name = "SquadCoordinatorDO"
 
+[[durable_objects.bindings]]
+name = "PRESENCE_CHANNEL"
+class_name = "PresenceChannelDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AgentDO", "SquadCoordinatorDO"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["PresenceChannelDO"]
 
 [[workflows]]
 name = "mupot-local-test-task-workflow"

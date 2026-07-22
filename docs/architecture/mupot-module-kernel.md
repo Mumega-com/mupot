@@ -132,3 +132,17 @@ Lesson for the next module port: if a write binds identity into a scoped
 resource (project, squad, department), gate the WRITE with the same
 visibility primitive as the READ — deriving identity safely is necessary but
 not sufficient; the destination scope needs its own check.
+
+## Real-time roster push (gated, ADR #473)
+
+Query-time `listPresence` / `GET /api/presence` remains sufficient for the
+coordination loop. When a surface needs **live** roster push, enable:
+
+- wrangler binding `PRESENCE_CHANNEL` → `PresenceChannelDO` (declared in the
+  template; migration tag `v2`)
+- var `REALTIME_PRESENCE=1`
+
+Then `GET /api/presence/live?project=<id>` upgrades to a WebSocket on one DO
+per `(tenant, project)`; register/heartbeat/deregister best-effort publish a
+`{type:"roster",…}` fan-out. **Never** Cloudflare Pub/Sub (MQTT). With the
+flag off, the route 404s and mutations are unchanged.
