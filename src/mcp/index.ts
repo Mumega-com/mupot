@@ -79,8 +79,8 @@ import { sendToRef, readAgentInbox, sendAgentMessage } from '../agents/messages'
 import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
-import { PROJECT_TOOLS } from './projects'
-import { hasProjectWriteForSquads } from '../projects/access'
+import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
+import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
@@ -177,6 +177,16 @@ function memberMemoryScope(memberId: string): string {
 
 function squadMemoryScope(squadId: string): string {
   return `squad:${squadId}`
+}
+
+// Project-shared memory scope (Port: project memory). Same opaque-key seam as
+// member:/squad: — a distinct namespace so a project's shared engrams never collide
+// with a member's private, a squad's shared, or a bare-uuid agent scope. This is the
+// "everyone aligned by accessing the project" keystone: any agent with read access to
+// the project shares one memory. No migration — the engram row stores this string as
+// its agent_id, exactly as squad memory already stores `squad:<id>`.
+function projectMemoryScope(projectId: string): string {
+  return `project:${projectId}`
 }
 
 // ── token hashing (Web Crypto, SHA-256 hex) ──────────────────────────────────
@@ -1747,6 +1757,81 @@ const toolSquadRecall: ToolSpec = {
   },
 }
 
+// project_remember — write to a PROJECT's shared memory scope. Gate is TWO-tier:
+//  1. project READ (readAccess + readableProject) — existence + visibility, failing
+//     closed with project_not_found (no wrong-id vs no-access oracle).
+//  2. project WRITE (org-admin, or write/admin on the project via one of the caller's
+//     squads) — because a project-shared engram STEERS every agent that later recalls
+//     it, so contributing to it is a state mutation, NOT a read. Gating write on mere
+//     read visibility let a read-linked squad poison the shared cognitive context of
+//     higher-privilege participants (adversarial-gate finding, 2026-07-22). This
+//     mirrors the write tier every sibling path enforces (squad_remember=member,
+//     flight/task project writes=hasProjectWriteForSquads). project_recall stays on READ.
+const toolProjectRemember: ToolSpec = {
+  name: 'project_remember',
+  scope: 'project memory',
+  min: 'member',
+  args: '{ project_id: string, text: string, concepts?: string[] }',
+  inputSchema: {
+    type: 'object',
+    properties: { project_id: STRING_SCHEMA, text: STRING_SCHEMA, concepts: OPTIONAL_STRING_ARRAY_SCHEMA },
+    required: ['project_id', 'text'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const projectId = str(args.project_id)
+    if (!projectId) return fail(400, 'invalid_args', 'project_id required')
+    const text = str(args.text)
+    if (!text) return fail(400, 'invalid_args', 'text required')
+    const concepts = readConcepts(args.concepts)
+    if (concepts && !Array.isArray(concepts)) return concepts
+
+    const access = readAccess(auth)
+    const project = await readableProject(env, projectId, access)
+    if (!project) return fail(404, 'project_not_found')
+    // Write tier: org-admin bypasses; otherwise the caller needs write/admin on the
+    // project via at least one of their squads. Read-only participants can recall but
+    // never write — a read-linked squad must not poison what others recall.
+    if (!access.workspaceAdmin && !(await anySquadHasProjectWrite(env, projectId, access.squadIds))) {
+      return fail(403, 'forbidden', { need: 'project_write', scope: 'project' })
+    }
+
+    const scope = projectMemoryScope(projectId)
+    const id = await createMemory(env).remember(scope, text, concepts)
+    return done({ engram_id: id, project_id: projectId, scope })
+  },
+}
+
+// project_recall — read a PROJECT's shared memory scope. Same project-read gate as
+// project_remember: every project participant recalls the same shared context.
+const toolProjectRecall: ToolSpec = {
+  name: 'project_recall',
+  scope: 'project memory',
+  min: 'observer',
+  args: '{ project_id: string, query: string, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: { project_id: STRING_SCHEMA, query: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA },
+    required: ['project_id', 'query'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const projectId = str(args.project_id)
+    if (!projectId) return fail(400, 'invalid_args', 'project_id required')
+    const query = str(args.query)
+    if (!query) return fail(400, 'invalid_args', 'query required')
+    const limit = readLimit(args.limit, 5, 20)
+    if (typeof limit !== 'number') return limit
+
+    const project = await readableProject(env, projectId, readAccess(auth))
+    if (!project) return fail(404, 'project_not_found')
+
+    const scope = projectMemoryScope(projectId)
+    const hits = await createMemory(env).recall(scope, query, limit)
+    return done({ project_id: projectId, scope, hits })
+  },
+}
+
 // wake_agent — drive one cortex cycle of an agent. cap: lead+ on the AGENT's squad.
 const toolWakeAgent: ToolSpec = {
   name: 'wake_agent',
@@ -2626,6 +2711,8 @@ export const TOOLS: ToolSpec[] = [
   toolRecall,
   toolSquadRemember,
   toolSquadRecall,
+  toolProjectRemember,
+  toolProjectRecall,
   toolWakeAgent,
   toolSquadMessage,
   toolSend,
