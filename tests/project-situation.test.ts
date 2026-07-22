@@ -1,7 +1,10 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
-import { loadProjectSituation } from '../src/projects/situation'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  loadProjectSituation,
+  projectSituationFactFor,
+} from '../src/projects/situation'
 import type { Env, Project, ProjectStatus } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -56,13 +59,14 @@ function insertTask(
     updatedAt?: string
     result?: string | null
     gateOwner?: string | null
+    sourcePot?: string | null
   },
 ): void {
   harness.sqlite.prepare(`
     INSERT INTO tasks (
       id, squad_id, title, status, assignee_agent_id, result, gate_owner,
-      project_id, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      project_id, source_pot, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     input.id,
     input.squadId ?? 'squad-a',
@@ -72,8 +76,49 @@ function insertTask(
     input.result ?? null,
     input.gateOwner ?? null,
     projectId,
+    input.sourcePot ?? null,
     input.updatedAt ?? '2026-07-19T01:00:00Z',
     input.updatedAt ?? '2026-07-19T01:00:00Z',
+  )
+}
+
+function insertProjectLink(
+  harness: SqliteD1Harness,
+  projectId: string,
+  input: {
+    id: string
+    remotePot: string
+    remoteProjectId?: string
+    remoteAgentId?: string
+    state?: 'active' | 'revoked'
+    staleAfterSeconds?: number
+    lastSuccessAt?: string | null
+    lastFailureAt?: string | null
+  },
+): void {
+  harness.sqlite.prepare(`
+    INSERT INTO project_links (
+      id, tenant, local_project_id, local_squad_id, local_agent_id, local_key_id,
+      remote_pot, remote_project_id, remote_link_id, remote_agent_id, remote_key_id,
+      remote_public_key, remote_base_url, capabilities_json, evidence_origins_json,
+      state, stale_after_seconds, last_success_at, last_failure_at, created_by, created_at
+    ) VALUES (
+      ?, 'pot-a', ?, 'squad-a', 'agent-a', 'local-key',
+      ?, ?, 'remote-link', ?, 'remote-key',
+      'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'https://remote.example/',
+      '["project.task.write"]', '[]',
+      ?, ?, ?, ?, 'mbr-a', '2026-07-19T00:00:00Z'
+    )
+  `).run(
+    input.id,
+    projectId,
+    input.remotePot,
+    input.remoteProjectId ?? 'remote-project',
+    input.remoteAgentId ?? 'remote-agent',
+    input.state ?? 'active',
+    input.staleAfterSeconds ?? 30,
+    input.lastSuccessAt === undefined ? null : input.lastSuccessAt,
+    input.lastFailureAt === undefined ? null : input.lastFailureAt,
   )
 }
 
@@ -428,5 +473,216 @@ describe('loadProjectSituation', () => {
     })
     expect(situation.blockers).toHaveLength(20)
     expect(situation.pending_reviews).toHaveLength(20)
+  })
+})
+
+describe('projectSituationFactFor', () => {
+  it('labels local, current remote, stale remote, and unknown without inference', () => {
+    const health = new Map([
+      ['dme', 'healthy' as const],
+      ['partner', 'stale' as const],
+      ['failed-pot', 'failed' as const],
+      ['revoked-pot', 'revoked' as const],
+    ])
+    expect(projectSituationFactFor(null, health)).toEqual({ kind: 'local', source_pot: null })
+    expect(projectSituationFactFor('dme', health)).toEqual({ kind: 'current_remote', source_pot: 'dme' })
+    expect(projectSituationFactFor('partner', health)).toEqual({ kind: 'stale_remote', source_pot: 'partner' })
+    expect(projectSituationFactFor('failed-pot', health)).toEqual({ kind: 'stale_remote', source_pot: 'failed-pot' })
+    expect(projectSituationFactFor('revoked-pot', health)).toEqual({ kind: 'stale_remote', source_pot: 'revoked-pot' })
+    expect(projectSituationFactFor('missing', health)).toEqual({ kind: 'unknown', source_pot: 'missing' })
+  })
+})
+
+describe('loadProjectSituation linked-pot facts', () => {
+  let harness: SqliteD1Harness | undefined
+
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('distinguishes local, current remote, stale remote, and unknown task facts', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'linked-facts')
+    insertProjectLink(harness, project.id, {
+      id: 'link-healthy',
+      remotePot: 'dme',
+      lastSuccessAt: '2026-07-19T10:00:00Z',
+      staleAfterSeconds: 30,
+    })
+    insertProjectLink(harness, project.id, {
+      id: 'link-stale',
+      remotePot: 'partner',
+      remoteProjectId: 'partner-project',
+      remoteAgentId: 'partner-agent',
+      lastSuccessAt: '2026-07-19T09:00:00Z',
+      staleAfterSeconds: 30,
+    })
+    insertTask(harness, project.id, { id: 'local-open', status: 'open' })
+    insertTask(harness, project.id, {
+      id: 'remote-current', status: 'blocked', title: 'Current remote blocker',
+      sourcePot: 'dme', result: 'waiting on dme',
+    })
+    insertTask(harness, project.id, {
+      id: 'remote-stale', status: 'in_progress', title: 'Stale remote work',
+      sourcePot: 'partner',
+    })
+    insertTask(harness, project.id, {
+      id: 'remote-unknown', status: 'review', title: 'Orphan remote review',
+      sourcePot: 'ghost-pot', gateOwner: 'lead',
+    })
+
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-19T10:00:10Z'))
+    const situation = await loadProjectSituation(envFor(harness), project, null)
+
+    expect(situation.linked_pots).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        link_id: 'link-healthy',
+        source_pot: 'dme',
+        health: 'healthy',
+        last_synchronized_at: '2026-07-19T10:00:00Z',
+        agent_presence: 'unknown',
+      }),
+      expect.objectContaining({
+        link_id: 'link-stale',
+        source_pot: 'partner',
+        health: 'stale',
+        last_synchronized_at: '2026-07-19T09:00:00Z',
+        agent_presence: 'unknown',
+      }),
+    ]))
+    expect(situation.blockers).toEqual([
+      expect.objectContaining({
+        id: 'remote-current',
+        fact: { kind: 'current_remote', source_pot: 'dme' },
+      }),
+    ])
+    expect(situation.pending_reviews).toEqual([
+      expect.objectContaining({
+        id: 'remote-unknown',
+        fact: { kind: 'unknown', source_pot: 'ghost-pot' },
+      }),
+    ])
+    expect(situation.remote_tasks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'remote-current',
+        fact: { kind: 'current_remote', source_pot: 'dme' },
+      }),
+      expect.objectContaining({
+        id: 'remote-stale',
+        fact: { kind: 'stale_remote', source_pot: 'partner' },
+      }),
+      expect.objectContaining({
+        id: 'remote-unknown',
+        fact: { kind: 'unknown', source_pot: 'ghost-pot' },
+      }),
+    ]))
+    expect(situation.agents).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        agent_id: 'agent-a',
+        fact: { kind: 'local', source_pot: null },
+      }),
+      expect.objectContaining({
+        agent_id: 'remote-agent',
+        presence: 'unknown',
+        fact: { kind: 'current_remote', source_pot: 'dme' },
+      }),
+      expect.objectContaining({
+        agent_id: 'partner-agent',
+        presence: 'unknown',
+        fact: { kind: 'stale_remote', source_pot: 'partner' },
+      }),
+    ]))
+    expect(situation.linked_pots.find((link) => link.health === 'healthy')?.last_synchronized_at)
+      .toBe('2026-07-19T10:00:00Z')
+    // Never invent sync time for an unknown / never-synced link.
+    insertProjectLink(harness, project.id, {
+      id: 'link-unknown',
+      remotePot: 'quiet',
+      remoteProjectId: 'quiet-project',
+      remoteAgentId: 'quiet-agent',
+    })
+    const withUnknown = await loadProjectSituation(envFor(harness), project, null)
+    expect(withUnknown.linked_pots).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        link_id: 'link-unknown',
+        health: 'unknown',
+        last_synchronized_at: null,
+        agent_presence: 'unknown',
+      }),
+    ]))
+  })
+
+  it('keeps a never-synced link unknown and does not treat absence as healthy', async () => {
+    harness = makeHarness()
+    const project = insertProject(harness, 'unknown-link')
+    insertProjectLink(harness, project.id, {
+      id: 'link-never',
+      remotePot: 'dme',
+    })
+    insertTask(harness, project.id, {
+      id: 'remote-open', status: 'open', sourcePot: 'dme',
+    })
+
+    const situation = await loadProjectSituation(envFor(harness), project, null)
+
+    expect(situation.linked_pots).toEqual([
+      expect.objectContaining({
+        health: 'unknown',
+        last_synchronized_at: null,
+        agent_presence: 'unknown',
+      }),
+    ])
+    expect(situation.remote_tasks[0]).toMatchObject({
+      id: 'remote-open',
+      fact: { kind: 'unknown', source_pot: 'dme' },
+    })
+  })
+
+  it('labels project-link receipt evidence by link freshness', async () => {
+    harness = makeHarness()
+    // Fixture receipts bypass the live authorization trigger the same way projection tests do.
+    harness.sqlite.exec('DROP TRIGGER IF EXISTS trg_project_link_receipt_authorized')
+    const project = insertProject(harness, 'linked-evidence')
+    insertProjectLink(harness, project.id, {
+      id: 'link-evidence',
+      remotePot: 'dme',
+      lastSuccessAt: '2026-07-19T10:00:00Z',
+      staleAfterSeconds: 30,
+    })
+    harness.sqlite.prepare(`
+      INSERT INTO project_link_receipts (
+        id, tenant, link_id, local_project_id, direction, idempotency_key,
+        correlation_id, envelope_sha256, shared_receipt_sha256, remote_pot,
+        remote_project_id, source_agent_id, action_type, action_id,
+        evidence_sha256, receipt_key_id, receipt_signature, status, created_at
+      ) VALUES (
+        'receipt-1', 'pot-a', 'link-evidence', ?, 'inbound', 'idem-1',
+        'corr-1', 'env-hash', 'receipt-hash', 'dme',
+        'remote-project', 'remote-agent', 'evidence', 'action-1',
+        'evidence-hash', 'receipt-key', 'receipt-sig', 'accepted', '2026-07-19T10:00:00Z'
+      )
+    `).run(project.id)
+
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-19T10:00:10Z'))
+    const current = await loadProjectSituation(envFor(harness), project, null)
+    expect(current.evidence).toEqual([
+      expect.objectContaining({
+        source_type: 'project_link_receipt',
+        source_id: 'receipt-1',
+        fact: { kind: 'current_remote', source_pot: 'dme' },
+      }),
+    ])
+
+    vi.setSystemTime(new Date('2026-07-19T10:00:31Z'))
+    const stale = await loadProjectSituation(envFor(harness), project, null)
+    expect(stale.linked_pots[0]).toMatchObject({ health: 'stale' })
+    expect(stale.evidence[0]).toMatchObject({
+      fact: { kind: 'stale_remote', source_pot: 'dme' },
+    })
   })
 })

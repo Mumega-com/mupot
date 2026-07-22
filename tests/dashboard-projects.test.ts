@@ -719,9 +719,9 @@ describe('project dashboard renderers', () => {
     expect(body).toContain('Showing the first 100 readable agent members.')
     expect(body).not.toContain('Overflow agent 100')
     expect(body).toContain('overflow-wrap:anywhere')
-    expect(observed.filter((sql) => /\bFROM fleet_agents\b/i.test(sql))).toHaveLength(1)
-    expect(observed.filter((sql) => /COUNT\(\*\)[\s\S]*\bFROM agents\b/i.test(sql))).toHaveLength(1)
-    expect(observed.filter((sql) => /\bFROM agents a\b/i.test(sql))).toHaveLength(1)
+    expect(observed.filter((sql) => /\bFROM fleet_agents\b/i.test(sql))).toHaveLength(2)
+    expect(observed.filter((sql) => /COUNT\(\*\)[\s\S]*\bFROM agents\b/i.test(sql))).toHaveLength(2)
+    expect(observed.filter((sql) => /\bFROM agents a\b/i.test(sql))).toHaveLength(2)
   })
 
   it('bounds readable members to the rendered squad window and reports both truncation states', async () => {
@@ -878,6 +878,9 @@ describe('project dashboard renderers', () => {
       summary: 'Project is ready for its next step.',
       blockers: [],
       pending_reviews: [],
+      linked_pots: [],
+      remote_tasks: [],
+      evidence: [],
       latest_activity: null,
     })
 
@@ -901,6 +904,7 @@ describe('project dashboard renderers', () => {
     expect(activeBody).toMatch(/<dd style="margin:4px 0 0;min-width:0;overflow-wrap:anywhere;">/)
     expect(emptyBody).toContain('No blockers need attention.')
     expect(emptyBody).toContain('No reviews are pending.')
+    expect(emptyBody).toContain('No linked pots.')
     expect(emptyBody).toContain('No material activity yet.')
   })
 

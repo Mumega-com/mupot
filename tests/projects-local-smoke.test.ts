@@ -365,9 +365,8 @@ describe('local project workspace showcase', () => {
 
   it('keeps the complete Project Link situation equal across surfaces at the stale boundary', async () => {
     const harness = createSeededDatabase()
-    const clock = vi.spyOn(Date, 'now')
-      .mockReturnValueOnce(Date.parse('2026-07-19T10:00:29.999Z'))
-      .mockReturnValue(Date.parse('2026-07-19T10:00:30.001Z'))
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-19T10:00:30.001Z'))
     try {
       harness.sqlite.exec(`
         INSERT INTO projects (id, slug, name, status)
@@ -419,6 +418,13 @@ describe('local project workspace showcase', () => {
           occurred_at: '2026-07-19T10:00:00.000Z',
           status: 'healthy',
         },
+        linked_pots: [{
+          link_id: 'link-boundary',
+          source_pot: 'remote-pot',
+          health: 'stale',
+          last_synchronized_at: '2026-07-19T10:00:00Z',
+          agent_presence: 'unknown',
+        }],
       })
 
       const activityResponse = await projectApi.fetch(
@@ -429,7 +435,7 @@ describe('local project workspace showcase', () => {
       const restActivity = await activityResponse.json() as { rows: unknown[] }
       expect(dashboard?.activity.rows).toEqual(restActivity.rows)
     } finally {
-      clock.mockRestore()
+      vi.useRealTimers()
       harness.close()
     }
   })
