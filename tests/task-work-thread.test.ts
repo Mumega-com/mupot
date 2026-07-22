@@ -16,6 +16,10 @@ import {
   archiveTaskThread,
   archiveTaskThreadsForMergedPr,
   getTaskThread,
+  ensureTaskThreadOpened,
+  THREAD_ARCHIVE_BACKFILL_STATUSES,
+  TASK_STATUS_ENUM,
+  threadArchiveBackfillStatusInSql,
 } from '../src/tasks/thread'
 import { createTask } from '../src/tasks/service'
 import type { Env } from '../src/types'
@@ -176,10 +180,75 @@ describe('task work-item thread', () => {
     )
     harness.sqlite.exec(
       `UPDATE tasks SET thread_status = 'archived'
-       WHERE status IN ('done', 'approved', 'rejected')`,
+       WHERE status IN (${threadArchiveBackfillStatusInSql()})`,
     )
     expect(
       harness.sqlite.prepare(`SELECT thread_status FROM tasks WHERE id = 'done-1'`).get(),
     ).toEqual({ thread_status: 'archived' })
+  })
+
+  it('backfill statuses enumerate the full task enum with no cancelled gap', () => {
+    // Full enum — there is no cancelled. Adding a status must update the classify map.
+    expect([...TASK_STATUS_ENUM].sort()).toEqual(
+      ['approved', 'blocked', 'done', 'in_progress', 'open', 'rejected', 'review'].sort(),
+    )
+    expect([...THREAD_ARCHIVE_BACKFILL_STATUSES].sort()).toEqual(
+      ['approved', 'done', 'rejected'].sort(),
+    )
+    // Migration 0068 WHERE list must match the TS constant (lockstep).
+    expect(threadArchiveBackfillStatusInSql()).toBe("'approved', 'rejected', 'done'")
+  })
+
+  it('merge archives the thread while task.status may still be review', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    harness.sqlite.exec(
+      `INSERT INTO tasks (id, squad_id, title, done_when, status, thread_status, github_issue_url, created_at, updated_at)
+       VALUES ('rev-1', 'squad-a', 'Gated', 'CI green', 'review', 'open',
+               'https://github.com/o/r/pull/99', '2026-07-22T00:00:00Z', '2026-07-22T00:00:00Z')`,
+    )
+    const { archived } = await archiveTaskThreadsForMergedPr(env, 99)
+    expect(archived).toBe(1)
+    const row = harness.sqlite
+      .prepare(`SELECT status, thread_status FROM tasks WHERE id = 'rev-1'`)
+      .get() as { status: string; thread_status: string }
+    expect(row).toEqual({ status: 'review', thread_status: 'archived' })
+    expect(await postTaskThread(env, 'rev-1', 'late note', 'agent-1')).toEqual({
+      ok: false,
+      reason: 'thread_archived',
+    })
+  })
+
+  it('ensureTaskThreadOpened is best-effort: create succeeds even if receipt write fails', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    harness.sqlite.exec(
+      `INSERT INTO tasks (id, squad_id, title, done_when, status, thread_status, created_at, updated_at)
+       VALUES ('t-miss', 'squad-a', 'T', 'done', 'open', 'open', '2026-07-22T00:00:00Z', '2026-07-22T00:00:00Z')`,
+    )
+    // Break receipt inserts by dropping the table — openTaskThread throws via assertWritten/SQL.
+    harness.sqlite.exec(`DROP TABLE task_thread_receipts`)
+    const result = await ensureTaskThreadOpened(env, 't-miss', 'agent-1')
+    expect(result).toEqual({ opened: false, best_effort_miss: true })
+    // Task row still present (no rollback).
+    expect(
+      harness.sqlite.prepare(`SELECT id FROM tasks WHERE id = 't-miss'`).get(),
+    ).toEqual({ id: 't-miss' })
+  })
+
+  it('ensureTaskThreadOpened normalizes oversized actors and opens the receipt', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    harness.sqlite.exec(
+      `INSERT INTO tasks (id, squad_id, title, done_when, status, thread_status, created_at, updated_at)
+       VALUES ('t-actor', 'squad-a', 'T', 'done', 'open', 'open', '2026-07-22T00:00:00Z', '2026-07-22T00:00:00Z')`,
+    )
+    const huge = 'x'.repeat(200)
+    const result = await ensureTaskThreadOpened(env, 't-actor', huge)
+    expect(result).toEqual({ opened: true, best_effort_miss: false })
+    const opened = harness.sqlite
+      .prepare(`SELECT actor_id FROM task_thread_receipts WHERE task_id = 't-actor' AND kind = 'opened'`)
+      .get() as { actor_id: string }
+    expect(opened.actor_id).toBe('system:task_create')
   })
 })

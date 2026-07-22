@@ -285,7 +285,8 @@ export interface Task {
   // be treated as untrusted content, not as a trusted local instruction. See migrations/0063.
   source_pot?: string | null
   // Work-item = thread (Buzz pattern, borrowed): the task carries its own scoped
-  // discussion. open on create; archived on PR merge. See migrations/0068 + tasks/thread.ts.
+  // discussion. open on create; archived on PR merge (even if task.status is
+  // still review — intentional divergence). See migrations/0068 + tasks/thread.ts.
   thread_status?: 'open' | 'archived'
   git_branch?: string | null
   created_at: string

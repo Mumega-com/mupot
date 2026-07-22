@@ -7,7 +7,7 @@
 import type { Env, Task, TaskVerdict, BusEvent } from '../types'
 import { createBus } from '../bus'
 import { assertWritten } from '../lib/receipt'
-import { openTaskThread } from './thread'
+import { ensureTaskThreadOpened } from './thread'
 import { resolveOutboundGitHubToken } from '../integrations/github-app'
 import { hasProjectWriteForSquads } from '../projects/access'
 
@@ -826,10 +826,13 @@ export async function createTask(
   }
 
   // Work-item = thread: every task opens its scoped discussion on create.
-  // Actor is the creating principal when known; otherwise a stable system id.
+  // Accepted best-effort AFTER the durable tasks INSERT (D1 has no wrapping
+  // transaction) — see ensureTaskThreadOpened / docs/architecture/work-item-thread.md.
+  // A throw here must not fail createTask after the row committed, and must not
+  // leave the caller believing create failed while the task exists.
   const threadActor =
     options.actor?.id && options.actor.id.length > 0 ? options.actor.id : 'system:task_create'
-  await openTaskThread(env, task.id, threadActor)
+  await ensureTaskThreadOpened(env, task.id, threadActor)
 
   await emitTaskEvent(env, 'task.created', task, options.actor)
   return task

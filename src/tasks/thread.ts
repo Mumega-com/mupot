@@ -5,11 +5,45 @@
 // transitions and discussion posts are append-only receipts — same primitive
 // shape as task_verdicts. See docs/architecture/work-item-thread.md.
 
-import type { Env } from '../types'
+import type { Env, Task } from '../types'
 import { assertWritten } from '../lib/receipt'
 
 export type ThreadStatus = 'open' | 'archived'
 export type ThreadReceiptKind = 'opened' | 'branch_linked' | 'post' | 'archived'
+
+// Full tasks.status enum (migration 0042 / Task['status']). There is NO cancelled.
+export const TASK_STATUS_ENUM = [
+  'open',
+  'in_progress',
+  'blocked',
+  'review',
+  'approved',
+  'rejected',
+  'done',
+] as const satisfies ReadonlyArray<Task['status']>
+
+// Migration 0068 backfill: archive threads for gate-outcome / terminal rows only.
+// Exhaustive classify against TASK_STATUS_ENUM — adding a status (e.g. cancelled)
+// fails typecheck until it is placed in live or archive_backfill.
+type ThreadBackfillClass = 'live' | 'archive_backfill'
+const THREAD_STATUS_BACKFILL_CLASS = {
+  open: 'live',
+  in_progress: 'live',
+  blocked: 'live',
+  review: 'live', // gate still open — discussion stays writable
+  approved: 'archive_backfill',
+  rejected: 'archive_backfill',
+  done: 'archive_backfill',
+} as const satisfies Record<(typeof TASK_STATUS_ENUM)[number], ThreadBackfillClass>
+
+export const THREAD_ARCHIVE_BACKFILL_STATUSES = TASK_STATUS_ENUM.filter(
+  (s) => THREAD_STATUS_BACKFILL_CLASS[s] === 'archive_backfill',
+)
+
+/** SQL `IN (...)` list matching migration 0068 — keep in lockstep with the .sql file. */
+export function threadArchiveBackfillStatusInSql(): string {
+  return THREAD_ARCHIVE_BACKFILL_STATUSES.map((s) => `'${s}'`).join(', ')
+}
 
 export interface TaskThreadReceipt {
   id: string
@@ -143,6 +177,42 @@ export async function openTaskThread(
   return { ok: true, receipt, thread_status: 'open' }
 }
 
+const SYSTEM_THREAD_ACTOR = 'system:task_create'
+
+function normalizeThreadActor(actorId: string): string {
+  if (isActor(actorId)) return actorId
+  return SYSTEM_THREAD_ACTOR
+}
+
+/**
+ * Post-INSERT opened receipt for createTask.
+ *
+ * D1 has no wrapping transaction around createTask's tasks INSERT + this
+ * receipt write. Accepted best-effort: one retry on throw; on persistent
+ * failure the committed task row remains and createTask still succeeds.
+ * openTaskThread is idempotent — a later reconcile call can attach the
+ * missing `opened` receipt.
+ */
+export async function ensureTaskThreadOpened(
+  env: Env,
+  taskId: string,
+  actorId: string,
+  opts: ThreadOpts = {},
+): Promise<{ opened: boolean; best_effort_miss: boolean }> {
+  const actor = normalizeThreadActor(actorId)
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const res = await openTaskThread(env, taskId, actor, opts)
+      if (res.ok) return { opened: true, best_effort_miss: false }
+      // Domain failure after normalize should be rare (task_not_found); do not retry.
+      return { opened: false, best_effort_miss: true }
+    } catch {
+      if (attempt === 1) return { opened: false, best_effort_miss: true }
+    }
+  }
+  return { opened: false, best_effort_miss: true }
+}
+
 /**
  * Bind a git branch to the task's thread (Buzz: "branch creates/links a channel").
  * Optionally stamps github_issue_url when a PR url is supplied and the column is empty.
@@ -235,6 +305,10 @@ export async function postTaskThread(
 /**
  * Archive the task thread (Buzz: "merge archives the channel"). Idempotent when
  * already archived.
+ *
+ * Deliberately independent of task.status: a still-open-in-review task gets a
+ * frozen thread on PR merge (YES, on purpose). Gate work continues against the
+ * archived receipt trail; posts after archive return thread_archived.
  */
 export async function archiveTaskThread(
   env: Env,
@@ -279,6 +353,8 @@ export async function archiveTaskThread(
 /**
  * On PR merge: archive every open task thread whose github_issue_url points at
  * that PR number. Reuses the PR-url suffix match used by syncCiResultToTask.
+ *
+ * Does not mutate task.status — review/approved/rejected/done stay as-is.
  */
 export async function archiveTaskThreadsForMergedPr(
   env: Env,

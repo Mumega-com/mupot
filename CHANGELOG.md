@@ -15,6 +15,14 @@ block collapses into a changelog entry when it ships.
   primitives (`thread_status`, `git_branch`, `task_thread_receipts`) — no Buzz
   stack. See `docs/architecture/work-item-thread.md`.
 
+### Fixed
+
+- Work-item thread P1s (#485 follow-up): document intentional
+  `thread_status=archived` vs still-`review` task divergence on merge; backfill
+  statuses exhaustively classified against the real task enum (no cancelled);
+  `createTask` opened-receipt write is explicit best-effort with one retry so a
+  receipt failure no longer fails create after the task row committed.
+
 ## [0.24.0] — 2026-07-19
 
 **Project Operations.** Projects with squad-scoped RBAC, cross-pot collaboration via the
