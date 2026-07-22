@@ -365,4 +365,27 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(browserCall).toBeGreaterThan(healthCall)
     expect(runtimeCall).toBeGreaterThan(browserCall)
   })
+
+  it('records Goose / goosed fleet-runtime non-adoption beside the contract', () => {
+    const decision = readFileSync(
+      new URL('../docs/architecture/goose-runtime-non-adoption.md', import.meta.url),
+      'utf8',
+    )
+    const contractDoc = readFileSync(
+      new URL('../docs/runtime-adapter-contract.md', import.meta.url),
+      'utf8',
+    )
+    const attachRoutes = readFileSync(
+      new URL('../src/fleet/attach-routes.ts', import.meta.url),
+      'utf8',
+    )
+
+    expect(decision).toMatch(/Won't adopt/i)
+    expect(decision).toContain('native CLI subscription')
+    expect(decision).toContain('goosed')
+    expect(contractDoc).toContain('goose-runtime-non-adoption.md')
+    expect(attachRoutes).toContain('goose-runtime-non-adoption.md')
+    expect(attachRoutes).not.toMatch(/['"]goose['"]/)
+    expect(attachRoutes).not.toMatch(/['"]goosed['"]/)
+  })
 })

@@ -116,6 +116,7 @@ const VALID_TYPES = new Set(['builder', 'reviewer', 'weaver', 'brain', 'comms', 
 
 // Attach runtimes include 'hermes' (standalone Hermes agent runtime, absent from the
 // daemon-report set which uses 'hermes-cron' for cron-only Hermes).
+// Goose / goosed are deliberately excluded — see docs/architecture/goose-runtime-non-adoption.md.
 const VALID_RUNTIMES = new Set([
   'codex', 'claude-code', 'nous', 'hermes', 'hermes-cron',
   'systemd-user', 'tmux', 'python',

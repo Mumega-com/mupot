@@ -40,6 +40,11 @@ Agent identity and runtime binding are separate concepts.
 A runtime must not trust local config as proof of identity. Local config is only
 the input used to produce a bearer proof or signed attach proof.
 
+Fleet hosts attach **native CLI** shells (and thin process wrappers already on
+the allow-list). ACP wrapper runtimes that only re-enter those same subscription
+CLIs — notably Goose / `goosed` — are **not** adopted; see
+[`docs/architecture/goose-runtime-non-adoption.md`](./architecture/goose-runtime-non-adoption.md).
+
 ## MCP Provisioning
 
 `grant_agent_capability { agent, squad, capability }` grants an existing agent

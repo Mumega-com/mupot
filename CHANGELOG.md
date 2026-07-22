@@ -8,6 +8,14 @@ block collapses into a changelog entry when it ships.
 
 ## [Unreleased]
 
+### Changed
+
+- Record Goose / `goosed` fleet-runtime **non-adoption** after the 2026-07-22
+  pilot: native CLI subscription agents remain the fleet substrate; ACP wrappers
+  that re-enter the same CLIs are out of scope. Decision:
+  `docs/architecture/goose-runtime-non-adoption.md`; attach allow-list stays
+  without `goose`/`goosed`.
+
 ## [0.24.0] — 2026-07-19
 
 **Project Operations.** Projects with squad-scoped RBAC, cross-pot collaboration via the
