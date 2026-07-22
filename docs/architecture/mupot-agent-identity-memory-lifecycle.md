@@ -118,8 +118,8 @@ per **agent + tenant** (isolated). But:
 | Layer | Scope | Status |
 |---|---|---|
 | Agent memory | per-agent, private | ✅ exists (semantic, but **manual + flat**) |
-| **Project memory** | shared per-project | ❌ **missing** — the alignment keystone |
-| **Instinct memory** | confidence + triggers, cross-session | ❌ missing (Port 4) |
+| **Project memory** | shared per-project | ✅ exists (`project_remember` / `project_recall`) |
+| **Instinct memory** | confidence + triggers, cross-session | ✅ Port 4 (`instinct_upsert` / `instinct_promote` + `session_save` / `session_resume`) |
 
 - **Project memory** = the keystone for "everyone aligned just by accessing the
   project." Small extension: add `project_id` scope to engrams/recall.
