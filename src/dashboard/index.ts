@@ -129,8 +129,7 @@ import {
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
-import { loadFleet, wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
-import type { FleetRow } from './fleet'
+import { wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
 import { listFleetAgentRuntimeView } from '../fleet/registry'
 import { emitControlRequest } from '../fleet/control'
 import { hostAgentsPanel } from './fleet-host'
@@ -868,12 +867,10 @@ dashboardApp.get('/radar', async (c) => {
   return c.html(shell(c.env, 'Radar', radarPageBody(radar)))
 })
 
-// ── fleet (company-wide agent roster over the SOS bus) ───────────────────────
-// GET /fleet — see every company agent: liveness, last active, role/label.
-// Window only: data comes from the bus bridge; the pot runs none of them.
+// ── fleet (CF-native roster — ADR gh #473; SOS bus retired from this path) ───
+// GET /fleet — pot check-in presence + signed host-control panel.
+// Wake/control POST endpoints below use agent_messages + Queue, not SOS Redis.
 dashboardApp.get('/fleet', async (c) => {
-  // The host-agents panel (signed control via mupot, the durable replacement for the bus path) is
-  // shown on BOTH the pot-native and the bus window — it's the pot's OWN fleet control surface.
   const auth = c.get('auth')
   const hostAgents = await listFleetAgentRuntimeView(c.env)
   const hostPanel = hostAgentsPanel(hostAgents, {
@@ -882,34 +879,13 @@ dashboardApp.get('/fleet', async (c) => {
     flash: c.req.query('hc') ?? null,
   })
 
-  // No company-bus connection → show the POT-NATIVE flock instead of an empty
-  // notice: agents that checked in to THIS pot (inbound, no egress). This is the
-  // tenant-pot path (Digid); the bus path below is the company/HQ window.
-  // Trivially-cheap header wiring on both return paths (same light reads as
-  // Overview — bare KV get + one-row D1 scalar).
-  if (!fleetScoped(c.env)) {
-    const [presence, physics, spend] = await Promise.all([
-      listPresence(c.env, Date.now()),
-      loadBrainPhysics(c.env),
-      loadTodaySpendScalar(c.env),
-    ])
-    return c.html(
-      shell(c.env, 'Fleet', html`${hostPanel}${potFleetBody(presence)}`, {
-        physics,
-        costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
-      }),
-    )
-  }
-  let rows: FleetRow[] = []
-  let error: string | null = null
-  try {
-    rows = await loadFleet(c.env, Date.now())
-  } catch (e) {
-    error = e instanceof Error ? e.message : 'bus_unreachable'
-  }
-  const [physics, spend] = await Promise.all([loadBrainPhysics(c.env), loadTodaySpendScalar(c.env)])
+  const [presence, physics, spend] = await Promise.all([
+    listPresence(c.env, Date.now()),
+    loadBrainPhysics(c.env),
+    loadTodaySpendScalar(c.env),
+  ])
   return c.html(
-    shell(c.env, 'Fleet', html`${hostPanel}${fleetBody(rows, error)}`, {
+    shell(c.env, 'Fleet', html`${hostPanel}${potFleetBody(presence)}`, {
       physics,
       costToday: { configured: spend.configured, todayUsdMicro: spend.today_usd_micro },
     }),
@@ -933,43 +909,51 @@ dashboardApp.post('/fleet/host-control', async (c) => {
   return c.redirect(`/fleet?hc=${encodeURIComponent(res.ok ? 'ok' : res.reason)}`)
 })
 
-// POST /fleet/wake — direct bus ping to the agent. Owner/admin only
-// (adversarial P2 2026-06-07): un-gated wake let any pot member ping any agent
-// by name. Gated to owner/admin to match /fleet/control. Isolation note: the
-// project pin in wakeFleetAgent is defense-in-depth — the real cross-tenant
-// boundary is the BUS_TOKEN scope (project-scoped + agent-bound per #44); the
-// resolvers fail closed so an unscoped pot cannot fall back to the company project.
+// POST /fleet/wake — durable inbox ping + agent.wake Queue event. Owner/admin only
+// (adversarial P2 2026-06-07). Fail closed when the pot has no tenant/sender scope.
 dashboardApp.post('/fleet/wake', async (c) => {
-  if (!fleetScoped(c.env)) return c.json({ error: 'bus_not_configured' }, 503)
+  if (!fleetScoped(c.env)) return c.json({ error: 'fleet_not_scoped' }, 503)
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
     return c.json({ error: 'forbidden', need: 'admin' }, 403)
   }
+  const memberId = auth.memberId ?? auth.userId
+  if (!memberId) return c.json({ error: 'no_member' }, 401)
   const body = (await c.req.json().catch(() => ({}))) as { agent?: unknown }
   const agent = typeof body.agent === 'string' ? body.agent.trim() : ''
   if (!agent || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(agent)) {
     return c.json({ error: 'invalid_agent' }, 400)
   }
-  const ok = await wakeFleetAgent(c.env, agent, auth.email ?? 'admin')
-  return c.json(ok ? { ok: true } : { error: 'bus_send_failed' }, ok ? 200 : 502)
+  const ok = await wakeFleetAgent(c.env, agent, {
+    memberId,
+    boundAgentId: auth.boundAgentId ?? null,
+    label: auth.email ?? 'admin',
+  })
+  return c.json(ok ? { ok: true } : { error: 'send_failed' }, ok ? 200 : 502)
 })
 
 // POST /fleet/control — pause/resume/deactivate/delete REQUEST (owner/admin
-// only). Never a direct host action: emits a receipted control-request on the
-// bus to the operations agent, which executes server-side and acks.
+// only). Never a direct host action: durable agent_messages ask to FLEET_OPS_AGENT.
+// Host process start/stop uses POST /fleet/host-control (signed control plane).
 dashboardApp.post('/fleet/control', async (c) => {
-  if (!fleetScoped(c.env)) return c.json({ error: 'bus_not_configured' }, 503)
+  if (!fleetScoped(c.env)) return c.json({ error: 'fleet_not_scoped' }, 503)
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
     return c.json({ error: 'forbidden', need: 'admin' }, 403)
   }
+  const memberId = auth.memberId ?? auth.userId
+  if (!memberId) return c.json({ error: 'no_member' }, 401)
   const body = (await c.req.json().catch(() => ({}))) as { agent?: unknown; action?: unknown }
   const agent = typeof body.agent === 'string' ? body.agent.trim() : ''
   const action = typeof body.action === 'string' ? body.action : ''
   if (!agent || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(agent)) {
     return c.json({ error: 'invalid_agent' }, 400)
   }
-  const r = await requestFleetControl(c.env, agent, action, auth.email ?? 'admin')
+  const r = await requestFleetControl(c.env, agent, action, {
+    memberId,
+    boundAgentId: auth.boundAgentId ?? null,
+    label: auth.email ?? 'admin',
+  })
   return c.json(r, r.ok ? 200 : 400)
 })
 
@@ -4626,7 +4610,7 @@ function potFleetBody(rows: PresenceView[]) {
       crumbs: 'Overview / Fleet',
       title: 'Fleet',
       sub:
-        'Your flock — agents that check in to this pot, on any runtime (Claude Code, Codex, Hermes, openclaw…). Always-on agents read their heartbeat (active/idle/dead); session agents read their schedule (flying / sleeping · next run / done) — a resting agent is sleeping, not dead. Times UTC. Control arrives with the bus/ops wiring.',
+        'Your flock — agents that check in to this pot, on any runtime (Claude Code, Codex, Hermes, openclaw…). Always-on agents read their heartbeat (active/idle/dead); session agents read their schedule (flying / sleeping · next run / done) — a resting agent is sleeping, not dead. Times UTC. Host control uses the signed mupot control plane above.',
     })}
     ${kpiRow([statCard({ label: 'Present now', value: String(present), subTone: present > 0 ? 'ok' : 'dim' })])}
     <style>
@@ -4643,97 +4627,6 @@ function potFleetBody(rows: PresenceView[]) {
       .fl-sched-flying { color: var(--ok); } .fl-sched-sleeping { color: var(--warn); } .fl-sched-done { color: var(--dim); }
     </style>
     ${raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}`
-}
-
-function fleetBody(rows: FleetRow[], error: string | null) {
-  const dot = (l: string) =>
-    l === 'active' ? 'var(--ok)' : l === 'idle' ? 'var(--warn)' : l === 'dead' ? '#e5534b' : 'var(--dim)'
-  const tr = (r: FleetRow) => `
-    <tr data-agent="${escAttr(r.agent)}" class="fl-row ${r.liveness === 'dead' || r.liveness === 'never' ? 'fl-dim' : ''}">
-      <td><span class="fl-dot" style="background:${dot(r.liveness)}"></span>${escHtml(r.agent)}</td>
-      <td class="fl-label">${escHtml(r.label || '—')}</td>
-      <td><span class="fl-badge fl-${escAttr(r.liveness)}">${escHtml(r.liveness)}</span></td>
-      <td>${escHtml(r.last_seen_human)}</td>
-      <td class="fl-num">${r.messages}</td>
-      <td>${r.active_token ? 'yes' : '<span style="color:var(--dim)">no</span>'}</td>
-      <td class="fl-actions">
-        <button class="fl-btn" data-act="wake">Run</button>
-        <button class="fl-btn" data-act="pause">Pause</button>
-        <button class="fl-btn" data-act="deactivate">Deactivate</button>
-        <button class="fl-btn fl-danger" data-act="delete">Delete</button>
-        <span class="fl-status"></span>
-      </td>
-    </tr>`
-  const table = rows.length
-    ? `<table class="fl-table">
-        <thead><tr><th>Agent</th><th>Role / label</th><th>Status</th><th>Last active</th><th>Msgs</th><th>Token</th><th>Actions</th></tr></thead>
-        <tbody>${rows.map(tr).join('')}</tbody>
-      </table>`
-    : '<p class="empty">No agents visible on the bus.</p>'
-  const liveFleet = rows.filter((r) => r.liveness === 'active').length
-  return html`
-    ${pageHeader({
-      crumbs: 'Overview / Fleet',
-      title: 'Fleet',
-      sub:
-        'Every company agent on the bus. Run pings the agent directly. Pause / Deactivate / Delete send a receipted control request to operations (owner/admin only) — nothing here kills a process silently.',
-    })}
-    ${kpiRow([
-      statCard({ label: 'On the bus', value: String(rows.length) }),
-      statCard({ label: 'Active', value: String(liveFleet), subTone: liveFleet > 0 ? 'ok' : 'dim' }),
-    ])}
-    <style>
-      .fl-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-      .fl-table th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase;
-        letter-spacing: .5px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-      .fl-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-      .fl-dim td { opacity: .6; }
-      .fl-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; }
-      .fl-label { color: var(--muted); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .fl-badge { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
-      .fl-active { color: var(--ok); } .fl-idle { color: var(--warn); }
-      .fl-dead { color: #e5534b; } .fl-never { color: var(--dim); }
-      .fl-num { text-align: right; font-variant-numeric: tabular-nums; }
-      .fl-actions { white-space: nowrap; }
-      .fl-btn { font: inherit; font-size: 12px; padding: 3px 9px; margin-right: 4px; border-radius: 6px;
-        border: 1px solid var(--border); background: var(--surface2); color: var(--text); cursor: pointer; }
-      .fl-btn:hover { border-color: var(--accent); }
-      .fl-danger { color: #e5534b; }
-      .fl-status { font-size: 12px; color: var(--dim); margin-left: 6px; }
-    </style>
-    ${error ? html`<div class="card"><p class="empty">Bus error: ${error} — showing nothing rather than stale data.</p></div>` : raw(`<div class="card" style="padding:0;overflow-x:auto">${table}</div>`)}
-    ${rows.length ? fleetScript() : html``}`
-}
-
-function fleetScript() {
-  return raw(`
-    <script>
-      (function () {
-        document.querySelectorAll('.fl-row').forEach(function (row) {
-          var agent = row.getAttribute('data-agent');
-          var status = row.querySelector('.fl-status');
-          row.querySelectorAll('.fl-btn').forEach(function (btn) {
-            btn.addEventListener('click', function () {
-              var act = btn.getAttribute('data-act');
-              if (act === 'delete' && !confirm('Request DELETE of agent "' + agent + '"? Operations executes and acks.')) return;
-              var url = act === 'wake' ? '/fleet/wake' : '/fleet/control';
-              var payload = act === 'wake' ? { agent: agent } : { agent: agent, action: act };
-              btn.disabled = true; status.textContent = '…';
-              fetch(url, { method: 'POST', credentials: 'same-origin',
-                headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) })
-                .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
-                .then(function (r) {
-                  status.textContent = r.ok
-                    ? (act === 'wake' ? 'pinged ✓' : 'requested ✓ (' + (r.d.request_id || '').slice(0, 8) + ')')
-                    : (r.d.error || 'failed');
-                  btn.disabled = false;
-                })
-                .catch(function () { status.textContent = 'network error'; btn.disabled = false; });
-            });
-          });
-        });
-      })();
-    </script>`)
 }
 
 // ── members + divisions views ─────────────────────────────────────────────────

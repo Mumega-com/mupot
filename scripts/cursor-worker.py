@@ -15,7 +15,7 @@ Flow per task (assignee = cursor, status = open):
   4. verify       -> cursor must have committed; run tsc + tests (no fake-green)
   5. deliver      -> driver pushes the branch + opens the PR (cursor never does)
   6. report       -> task_update status=review, gate_owner set, PR linked
-  7. notify       -> ping Kasra-core to gate; remove the worktree (keep branch/PR)
+  7. notify       -> ping Kasra-core via mupot MCP send; remove the worktree (keep branch/PR)
 
 The driver NEVER merges or deploys. Kasra-core gates the PR and verdicts the task.
 
@@ -246,12 +246,23 @@ def run_task(task: dict) -> None:
 
 
 def _notify_kasra(task: dict, pr_url: str) -> None:
-    """Best-effort bus ping so Kasra-core gates the PR. Non-fatal if it fails."""
+    """Best-effort mupot inbox ping so Kasra-core gates the PR. Non-fatal if it fails.
+
+    Uses MCP `send` (D1 agent_messages), not the retired SOS Redis bus-send path.
+    Review-entry wake already fires via task_update→wakeGateOwnerOnReview; this is
+    an extra attention nudge with the PR URL.
+    """
     try:
-        subprocess.run(
-            ["python3", str(Path.home() / "scripts/bus-send.py"),
-             "kasra", f"cursor loop: task {task['id'].split('-')[0]} in review, PR ready to gate: {pr_url}"],
-            capture_output=True, text=True, timeout=20,
+        to = os.environ.get("NOTIFY_TO", "kasra")
+        mcp(
+            "send",
+            {
+                "to": to,
+                "body": (
+                    f"cursor loop: task {task['id'].split('-')[0]} in review, "
+                    f"PR ready to gate: {pr_url}"
+                ),
+            },
         )
     except Exception as exc:  # noqa: BLE001 - notify is best-effort
         log(f"notify kasra failed (non-fatal): {exc}")

@@ -39,7 +39,7 @@ Flow per task (assignee = mumcp agent, status = open):
                  fake green).
   4. review   -> task_update status=review, gate_owner=gate:kasra-core,
                  draft evidence appended to the task body.
-  5. notify   -> best-effort bus ping to kasra; non-fatal if it fails.
+  5. notify   -> best-effort mupot MCP send to kasra; non-fatal if it fails.
 
 The driver NEVER approves, publishes, merges, or deploys. Kasra-core (a
 human-gated squad) verdicts the task via task_verdict; mumcp's own plugin-
@@ -280,12 +280,21 @@ def run_task(task: dict) -> None:
 
 
 def _notify_kasra(task: dict, note: str) -> None:
-    """Best-effort bus ping so Kasra-core gates the task. Non-fatal if it fails."""
+    """Best-effort mupot inbox ping so Kasra-core gates the task. Non-fatal if it fails.
+
+    Uses MCP `send` (D1 agent_messages), not the retired SOS Redis bus-send path.
+    """
     try:
-        subprocess.run(
-            ["python3", str(Path.home() / "scripts/bus-send.py"),
-             "kasra", f"mumcp loop: task {task['id'].split('-')[0]} in review ({note}) -- gate + verdict needed"],
-            capture_output=True, text=True, timeout=20,
+        to = os.environ.get("NOTIFY_TO", "kasra")
+        mcp(
+            "send",
+            {
+                "to": to,
+                "body": (
+                    f"mumcp loop: task {task['id'].split('-')[0]} in review ({note}) "
+                    f"-- gate + verdict needed"
+                ),
+            },
         )
     except Exception as exc:  # noqa: BLE001 - notify is best-effort
         log(f"notify kasra failed (non-fatal): {exc}")

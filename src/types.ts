@@ -105,12 +105,14 @@ export interface Env {
   // DEFAULT_POT_HOST_SUFFIX), passed as a planner opt — never read from client
   // request input. Unset ⇒ 'mupot.mumega.com'.
   DEFAULT_POT_HOST_SUFFIX?: string
-  // fleet window: SOS bus bridge REST
+  // fleet window: SOS bus bridge REST — COMPAT SHIM ONLY (ADR #473).
+  // Active fleet routes use D1 agent_messages + presence + Queue; see
+  // docs/architecture/sos-coordination-compat.md. Do not add new callers.
   BUS_URL?: string
-  // fleet scoping (Flock #43): which bus project this pot's fleet addresses, and
-  // which ops agent executes control requests. NO code default — the resolvers
-  // fail closed (null → refuse). Each pot sets these explicitly in its wrangler
-  // vars (company: sos/kasra; tenant: its own project + operator agent).
+  // fleet scoping (Flock #43): which project label this pot's fleet addresses, and
+  // which ops agent receives control requests via agent_messages. NO code default —
+  // the resolvers fail closed (null → refuse). Each pot sets these explicitly in its
+  // wrangler vars (company: sos/kasra labels; tenant: its own project + operator agent).
   FLEET_PROJECT?: string
   FLEET_OPS_AGENT?: string
   // secrets (present at runtime only)
@@ -128,7 +130,7 @@ export interface Env {
   //                       npx wrangler secret put GOOGLE_CLIENT_SECRET
   GOOGLE_CLIENT_ID?: string
   GOOGLE_CLIENT_SECRET?: string
-  BUS_TOKEN?: string
+  BUS_TOKEN?: string // SOS compat shim only (ADR #473) — unused by active fleet routes
   GITHUB_TOKEN?: string // outbound: tasks↔issues mirror (fine-grained PAT or App install token)
   GITHUB_REPO?: string // "owner/repo" the pot weaves to (e.g. "Digidinc/Digid")
   GITHUB_WEBHOOK_SECRET?: string // inbound: verifies GitHub webhook (x-hub-signature-256)
@@ -428,10 +430,9 @@ export interface BusEvent<T = unknown> {
 // or shell access. The bus consumer already routes agent.wake → AgentDO.wake();
 // this type makes the wire format explicit and machine-readable.
 //
-// Cross-project note (S175): today the /bus/emit endpoint is tenant-scoped —
-// only tokens minted inside the same pot can emit. Cross-project wake (e.g.
-// kasra@mumega waking agent:dgd.admin) requires S175 multiplex opt-in on the
-// SOS bus side; that is a runtime change outside this contract's scope.
+// Cross-project note: today the /bus/emit endpoint is tenant-scoped —
+// only tokens minted inside the same pot can emit. Cross-project wake uses
+// project-link / multiplex on the mupot CF-native bus (not the retired SOS Redis bus).
 export interface WakeContract {
   // POST this URL to fire the wake event.
   emit_url: string
