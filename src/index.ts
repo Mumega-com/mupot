@@ -31,6 +31,7 @@ import { busApp } from './bus'
 import { membersApp } from './members'
 import { mcpActionsApp, mcpApp } from './mcp'
 import { imApp } from './im'
+import { hermesApp } from './hermes'
 import { dashboardApp } from './dashboard'
 import { channelsApp, reconcileMembership } from './channels'
 import { channelsAdminApp } from './channels/admin'
@@ -88,6 +89,8 @@ app.route(ROUTES.members, membersApp)
 app.route(ROUTES.mcp, mcpApp)
 app.route('/', mcpActionsApp)
 app.route(ROUTES.im, imApp)
+// Port 3: Hermes-Sol constant agent chat API (member-bearer). Before dashboard catch-all.
+app.route(ROUTES.hermes, hermesApp)
 // channel adapters: the scoped webhook (/channels/:platform/webhook) + binding admin.
 // Mounted BEFORE the dashboard '/' catch-all so the specific prefixes win.
 app.route('/channels', channelsApp)
