@@ -243,6 +243,17 @@ export interface Agent {
   budget_cap_cents: number | null
   budget_window: BudgetWindow
   created_at: string
+  // profile fields (0068_agent_profile.sql) — Port 1.3. All nullable; pre-profile
+  // agents read null. capabilities/skills are JSON-array strings on the wire,
+  // parsed to string[] on read; death_condition is a JSON-object string.
+  purpose: string | null
+  owner: string | null
+  model_fallback: string | null
+  capabilities: string[] | null
+  skills: string[] | null
+  parent_agent_id: string | null
+  qnft_ref: string | null
+  death_condition: string | null
 }
 
 export interface Membership {

@@ -2723,6 +2723,13 @@ function validateArgs(schema: JsonSchema, args: Record<string, unknown>): string
         return `field ${key} must be an array of strings`
       }
     }
+    // A property typed `object` must be a plain object — reject arrays/scalars at the
+    // boundary so the schema is actually enforced (value===null already `continue`d
+    // above). Without this, `{type:'object'}` params (e.g. create_agent.death_condition)
+    // silently accepted strings/arrays and pushed the shape check onto every reader.
+    if (prop.type === 'object' && (typeof value !== 'object' || Array.isArray(value))) {
+      return `field ${key} must be an object`
+    }
   }
   return null
 }
