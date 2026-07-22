@@ -244,6 +244,17 @@ describe('POST /attach', () => {
     expect(db._fleet.size).toBe(0)
   })
 
+  // Goose formal gate 2026-07-22: ACP wrapper over native CLI subscriptions — not adopted.
+  // docs/fleet/goose-non-adoption-2026-07-22.md (kasra-core ACCEPTS; replaces e89df2c2 process)
+  it('400 on goose / goosed runtime (non-adoption)', async () => {
+    const db = defaultDb()
+    for (const runtime of ['goose', 'goosed'] as const) {
+      const res = await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime }, makeEnv(db))
+      expect(res.status).toBe(400)
+    }
+    expect(db._fleet.size).toBe(0)
+  })
+
   it('400 on bad agent_id (path traversal)', async () => {
     const db = defaultDb()
     const res = await post('/attach', TOKEN_KASRA, { agent_id: '../evil', type: 'builder', runtime: 'claude-code' }, makeEnv(db))

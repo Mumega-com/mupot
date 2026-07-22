@@ -8,6 +8,15 @@ block collapses into a changelog entry when it ships.
 
 ## [Unreleased]
 
+### Changed
+
+- Formal gate decision: Goose / `goosed` fleet-runtime **non-adoption** (kasra-core
+  ACCEPTS). Native CLI subscription agents remain the fleet substrate; ACP wrappers
+  that re-enter the same CLIs are out of scope. Correctly scoped replacement for
+  task `e89df2c2` (rejected on process, not conclusion). Decision:
+  `docs/fleet/goose-non-adoption-2026-07-22.md`; attach allow-list stays without
+  `goose`/`goosed`. Technical basis reused from PR #483 / `b8070e2`.
+
 ## [0.24.0] — 2026-07-19
 
 **Project Operations.** Projects with squad-scoped RBAC, cross-pot collaboration via the
