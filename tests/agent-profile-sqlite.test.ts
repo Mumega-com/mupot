@@ -98,6 +98,29 @@ describe('Port 1.3 agent profile (0068) — real SQL', () => {
     })
   })
 
+  it('create_agent writes a squad membership row atomically (gh #469)', async () => {
+    const res = await createAgent(env, 'sq-a', { slug: 'memtest', name: 'Mem Test' })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const mem = harness.sqlite
+      .prepare('SELECT agent_id, squad_id, capability FROM memberships WHERE agent_id = ?')
+      .get(res.value.id) as { agent_id: string; squad_id: string; capability: string } | undefined
+    expect(mem).toBeDefined()
+    expect(mem?.squad_id).toBe('sq-a')
+    expect(mem?.capability).toBe('member')
+  })
+
+  it('a slug collision rolls back atomically — no orphan membership (gh #469)', async () => {
+    const first = await createAgent(env, 'sq-a', { slug: 'dup', name: 'First' })
+    expect(first.ok).toBe(true)
+    const before = (harness.sqlite.prepare('SELECT COUNT(*) AS n FROM memberships').get() as { n: number }).n
+    const collision = await createAgent(env, 'sq-a', { slug: 'dup', name: 'Second' })
+    expect(collision.ok).toBe(false)
+    if (!collision.ok) expect(collision.error).toBe('slug_taken')
+    const after = (harness.sqlite.prepare('SELECT COUNT(*) AS n FROM memberships').get() as { n: number }).n
+    expect(after).toBe(before) // batch rolled back → no orphan membership row
+  })
+
   it('a minimal create (no profile) leaves every profile field null', async () => {
     const res = await createAgent(env, 'sq-a', { slug: 'bare', name: 'Bare' })
     expect(res.ok).toBe(true)
