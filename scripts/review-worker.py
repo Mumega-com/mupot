@@ -32,11 +32,12 @@ Flow per cycle:
                     exact format cursor-worker.py writes in report_review()).
   2. dedupe      -> skip a task already reviewed at the PR's CURRENT head sha,
                     per a LOCAL state file this driver alone writes
-                    (~/.fleet/state/review-worker-reviewed.json, immune to a
-                    PR author pre-seeding a fake receipt) OR'd with the legacy
-                    `review-worker -> <head sha>:` body-text marker
-                    (already_reviewed/mark_reviewed). Re-pushes get
-                    re-reviewed since the sha changes.
+                    (~/.fleet/state/review-worker-reviewed.json, mode 0600 under
+                    a 0700 dir — the ONLY trusted signal; body-text markers are
+                    audit receipts only and are NEVER used for skip decisions —
+                    a PR author can forge them via title/description copied into
+                    the task body). Re-pushes get re-reviewed since the sha
+                    changes. (#460)
   3. classify    -> `gh pr diff --name-only`; sensitive=true unless EVERY
                     changed path matches the SAFE allow-list (docs/, tests/ or
                     *.test.ts, content/, *.md, README/CHANGELOG/LICENSE) --
@@ -137,11 +138,11 @@ MODEL = os.environ.get("MODEL", "opus")
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 WORKTREE_ROOT = Path(os.environ.get("WORKTREE_ROOT", "/home/mumega/mupot-worktrees"))
 DRY_RUN = os.environ.get("DRY_RUN", "") == "1"
-# WARN #2 fix: dedupe state written ONLY by this driver, after a REAL review
-# runs -- not reachable/forgeable via the task body (which a PR author
-# influences indirectly through their PR title/description, copied verbatim
-# into the task body by cursor-worker at task-creation time). See
-# already_reviewed()/mark_reviewed() below.
+# #460: dedupe state written ONLY by this driver, after a REAL review runs --
+# not reachable/forgeable via the task body (which a PR author influences
+# indirectly through their PR title/description, copied verbatim into the
+# task body by cursor-worker at task-creation time). Body markers are audit
+# receipts only; already_reviewed() trusts this file alone.
 REVIEWED_STATE_PATH = Path(
     os.environ.get("REVIEWED_STATE_PATH", str(Path.home() / ".fleet/state/review-worker-reviewed.json"))
 )
@@ -175,22 +176,26 @@ SENSITIVE_PATH_RE = re.compile(
     r"|external",
     re.IGNORECASE,
 )
-# P1 #1 fix: THE actual gate is now this fail-closed allow-list. Auto-merge
+# P1 #1 fix + #460: THE actual gate is this fail-closed allow-list. Auto-merge
 # eligibility requires EVERY changed path to match one of these SAFE patterns
 # (docs, tests, content, markdown, license/changelog). Anything else --
 # including ALL of src/**, migrations/**, scripts/** -- is sensitive by
 # default and parks for a human. Doubt -> sensitive; this is the correct
 # conservative default for standing autonomy.
+#
+# #460 anchoring: README/CHANGELOG/LICENSE must be the BASENAME (optional
+# extension), not an unanchored substring — otherwise `src/README_evil.ts` and
+# `src/LICENSE_backdoor.ts` classify non-sensitive. tests/ is plural-only and
+# a path segment (`(^|/)tests/`), never singular `test/` — otherwise
+# `src/test/pwn.ts` classifies non-sensitive.
 SAFE_ALLOWLIST_RE = re.compile(
     r"^docs/"
     r"|^content/"
-    r"|(^|/)tests?/"
+    r"|(^|/)tests/"
     r"|\.test\.[jt]sx?$"
     r"|\.spec\.[jt]sx?$"
     r"|\.md$"
-    r"|(^|/)README"
-    r"|(^|/)CHANGELOG"
-    r"|(^|/)LICENSE",
+    r"|(^|/)(README|CHANGELOG|LICENSE)(\.[^/]+)?$",
     re.IGNORECASE,
 )
 # P0 #1 fix: isolation must be INTRINSIC to the launcher, not dependent on any
@@ -358,33 +363,37 @@ def _load_reviewed_state() -> dict:
 
 
 def _save_reviewed_state(state: dict) -> None:
+    """Persist dedupe state with owner-only perms (dir 0700, file 0600).
+    Atomic replace via a sibling .tmp so a crash mid-write cannot leave a
+    half-parsed JSON that would fail open into re-review storms."""
     try:
-        REVIEWED_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        REVIEWED_STATE_PATH.write_text(json.dumps(state))
+        parent = REVIEWED_STATE_PATH.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(parent, 0o700)
+        tmp_path = REVIEWED_STATE_PATH.with_name(REVIEWED_STATE_PATH.name + ".tmp")
+        tmp_path.write_text(json.dumps(state))
+        os.chmod(tmp_path, 0o600)
+        tmp_path.replace(REVIEWED_STATE_PATH)
+        os.chmod(REVIEWED_STATE_PATH, 0o600)
     except OSError as exc:  # noqa: BLE001 - dedupe persistence is best-effort
         log(f"WARNING: could not persist reviewed-state to {REVIEWED_STATE_PATH}: {exc} "
-            "(dedupe falls back to body-text marker only this cycle)")
+            "(dedupe will re-review this sha next cycle — fail-closed, never skip)")
 
 
-def already_reviewed(task_id: str, body: str, head_sha: str) -> bool:
-    """Two independent signals, OR'd:
-      1. local state file keyed by task_id -> [head_sha, ...], written ONLY
-         by this driver after a REAL review completes (mark_reviewed below).
-         Not reachable by a PR author.
-      2. the legacy body-text marker (kept for tasks reviewed before this fix
-         shipped, and as a second independent record).
-    WARN #2 fix: the old body-text-only check let a PR author pre-compute
-    their own next commit sha (fully knowable before pushing) and embed a
-    fake `review-worker -> <that sha>: GREEN` line in their PR
-    title/description, which cursor-worker copies verbatim into the initial
-    task body -- suppressing review entirely (gate-DoS) for a sha they
-    control. The local-state signal is immune to that: this driver is the
-    only writer.
+def already_reviewed(task_id: str, head_sha: str) -> bool:
+    """True iff THIS driver already reviewed `head_sha` for `task_id`.
+
+    #460: the ONLY trusted signal is the local state file this driver writes
+    after a real review (owner-only perms, not reachable by a PR author).
+    Body-text markers (`review-worker -> <sha>:`) remain appended as AUDIT
+    receipts in report_review(), but are NEVER consulted for skip decisions —
+    a PR author can pre-compute the next commit sha and forge that marker via
+    PR title/description that cursor-worker copies into the task body
+    (gate-DoS / review-suppression). Trusting the body OR was the #460
+    forgeable-suppression bug.
     """
     state = _load_reviewed_state()
-    if head_sha in state.get(task_id, []):
-        return True
-    return f"review-worker -> {head_sha}:" in (body or "")
+    return head_sha in state.get(task_id, [])
 
 
 def mark_reviewed(task_id: str, head_sha: str) -> None:
@@ -710,8 +719,8 @@ def process_task(task: dict) -> bool:
     if not head_sha:
         log(f"task {short}: PR #{pr_number} has no headRefOid, skipping")
         return False
-    if already_reviewed(tid, body, head_sha):
-        log(f"task {short}: PR #{pr_number} head {head_sha[:8]} already carries a review-worker receipt -- skipping")
+    if already_reviewed(tid, head_sha):
+        log(f"task {short}: PR #{pr_number} head {head_sha[:8]} already reviewed (local state) -- skipping")
         return False
 
     log(f"=== task {short}: PR #{pr_number} ({pr_url}) ===")
