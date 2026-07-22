@@ -86,6 +86,28 @@ export function fanOutWebSockets(
   return sent
 }
 
+/**
+ * Reserved / abnormal close codes (RFC 6455 §7.4.1) are synthesized by the
+ * runtime when no Close frame arrived. Passing them to WebSocket.close()
+ * throws RangeError inside the hibernation close handler — map to 1000
+ * (same pattern as Cloudflare / PartyServer templates).
+ */
+const RESERVED_WEBSOCKET_CLOSE_CODES: ReadonlySet<number> = new Set([1005, 1006, 1015])
+
+export function sanitizeWebSocketCloseCode(code: number): number {
+  if (RESERVED_WEBSOCKET_CLOSE_CODES.has(code)) return 1000
+  return code
+}
+
+/** Reciprocate a peer close without feeding reserved codes into ws.close(). */
+export function reciprocateWebSocketClose(
+  ws: { close: (code: number, reason: string) => void },
+  code: number,
+  reason: string,
+): void {
+  ws.close(sanitizeWebSocketCloseCode(code), reason)
+}
+
 export type PublishRosterResult =
   | { ok: true; skipped: true; reason: 'disabled' }
   | { ok: true; skipped: false; sent: number }
