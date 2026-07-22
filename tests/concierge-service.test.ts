@@ -108,6 +108,19 @@ async function registerBuilderOnline(env: Env, projectId: string): Promise<void>
   expect(result.ok).toBe(true)
 }
 
+// The SHARED build pool: a driver registered with project_id = null (how the standing
+// operator's cursor/mumcp actually register). This is the live production shape.
+async function registerBuilderShared(env: Env): Promise<void> {
+  const result = await registerModule(env, {
+    identity: 'agent-builder',
+    kind: 'agent_system',
+    adapter: 'cursor',
+    projectId: null,
+    capabilities: [BUILD_CAPABILITY],
+  })
+  expect(result.ok).toBe(true)
+}
+
 describe('runProjectConcierge — presence registration', () => {
   it('registers the concierge and it appears online on its own project roster', async () => {
     const harness = makeHarness()
@@ -139,6 +152,22 @@ describe('runProjectConcierge — stalled project dispatches exactly one starter
 
     const result = await runProjectConcierge(env, p)
     expect(result.registered).toBe(true)
+    expect(result.decision).toEqual({ action: 'dispatch', agentId: 'agent-builder' })
+    expect(result.taskId).toBeTruthy()
+  })
+
+  // Regression for the "never dispatched in production" bug: the build driver is in the
+  // SHARED pool (project_id=null), NOT on the project roster. Before the fix the concierge
+  // only queried the project scope and reported no_online_builder forever.
+  it('goal + SHARED-pool (project_id=null) build agent + zero advancing -> dispatch', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    await registerBuilderShared(env) // builder online in the shared pool ONLY
+
+    const result = await runProjectConcierge(env, p)
     expect(result.decision).toEqual({ action: 'dispatch', agentId: 'agent-builder' })
     expect(result.taskId).toBeTruthy()
 
