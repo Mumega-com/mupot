@@ -17,6 +17,7 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import type { Context, MiddlewareHandler } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { verifyHandoffClaim } from './handoff-verify'
+import { resolveCapabilities } from './capability'
 
 // ── tunables ──
 const COOKIE_NAME = 'mupot_session'
@@ -667,6 +668,43 @@ function requireAuthMw(): MiddlewareHandler<AppEnv> {
       role: record.role,
       tenant: c.env.TENANT_SLUG, // tenant is environment-derived, not client-supplied
     }
+
+    // Email→member bridge (the DASHBOARD member-resolution the members schema always
+    // specified — "workspace, IM, or the dashboard, all resolving to member_id +
+    // capabilities" — but which the web-session path never implemented). A plain
+    // Google web login is otherwise an org-role-only principal with no memberId and
+    // no fine-grained grants, so squad-scoped surfaces show it nothing. Resolve the
+    // member by VERIFIED email (the /callback + /handoff paths both reject an
+    // unverified email before minting a session) and attach its grants.
+    //
+    // INVARIANTS (this is a sensitive RBAC surface):
+    //  - role === 'member' ONLY. Owners/admins keep the pure legacy-role path; attaching
+    //    a lesser member grant to them would DEFINE auth.capabilities and thereby disable
+    //    the `capabilities === undefined` legacy-role escape in requireCapability →
+    //    downgrading an owner. Scoping is only ever needed for plain members.
+    //  - tenant-scoped — never resolve a member from another tenant (cross-tenant leak).
+    //  - status='active' — suspended members get nothing.
+    //  - fail-closed — no (or non-unique) match leaves memberId unset: identical to
+    //    today's behaviour, never an over-grant. members.email is UNIQUE so LIMIT 1 is
+    //    deterministic; the bridge is purely ADDITIVE (only grants scope, never removes).
+    if (auth.role === 'member' && auth.email) {
+      // Case-insensitive email match (lower() both sides): email is case-insensitive
+      // in practice, but the session email (/callback stores it raw) and members.email
+      // (inserted as-provided, BINARY-collated UNIQUE) can differ in case — an operator
+      // invited as `Gavin@x` whom Google returns as `gavin@x` would otherwise silently
+      // resolve to no member. Still fail-closed (only ever under-grants).
+      const member = await c.env.DB.prepare(
+        "SELECT id FROM members WHERE lower(email) = lower(?1) AND tenant = ?2 AND status = 'active' LIMIT 1",
+      )
+        .bind(auth.email, c.env.TENANT_SLUG)
+        .first<{ id: string }>()
+      if (member) {
+        auth.memberId = member.id
+        auth.capabilities = await resolveCapabilities(c.env, member.id)
+        auth.channel = 'dashboard'
+      }
+    }
+
     c.set('auth', auth)
     await next()
   }
