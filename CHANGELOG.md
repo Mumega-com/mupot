@@ -8,6 +8,12 @@ block collapses into a changelog entry when it ships.
 
 ## [Unreleased]
 
+### Added
+
+- Gated Durable Object + WebSocket live-roster pub/sub channel (`PresenceChannelDO`,
+  `GET /api/presence/live`) — CF-native fan-out for the first real-time need; off until
+  `REALTIME_PRESENCE=1`. No Cloudflare Pub/Sub MQTT (ADR #473).
+
 ### Changed
 
 - Fleet coordination cut over to mupot CF-native primitives (D1 send/inbox + presence +

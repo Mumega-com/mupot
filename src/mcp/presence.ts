@@ -43,6 +43,7 @@ import {
   isModuleKind,
   type ModuleKind,
 } from '../registry/service'
+import { publishRosterPush } from '../registry/realtime'
 import { readAccess, readableProject } from './projects'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
 
@@ -124,6 +125,7 @@ const toolPresenceRegister: ToolSpec = {
       capabilities,
     })
     if (!result.ok) return fail(400, result.error)
+    await publishRosterPush(env, projectId ?? null, new Date())
     return done({ module: result.value })
   },
 }
@@ -158,6 +160,7 @@ const toolPresenceHeartbeat: ToolSpec = {
 
     const ok = await heartbeatModule(env, identity, projectId ?? null)
     if (!ok) return fail(404, 'not_registered', 'call presence_register first')
+    await publishRosterPush(env, projectId ?? null, new Date())
     return done({ ok: true })
   },
 }
@@ -183,6 +186,7 @@ const toolPresenceDeregister: ToolSpec = {
 
     const ok = await deregisterModule(env, identity, projectId ?? null)
     if (!ok) return fail(404, 'not_registered')
+    await publishRosterPush(env, projectId ?? null, new Date())
     return done({ ok: true })
   },
 }
