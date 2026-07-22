@@ -6,6 +6,53 @@ export type ProjectLinkPriority = 'low' | 'normal' | 'high' | 'urgent'
 export type ProjectLinkCapability = 'project.task.write' | 'project.evidence.write'
 export type ProjectLinkEvidenceMediaType = 'application/json' | 'text/plain' | 'image/png' | 'image/jpeg' | 'application/pdf'
 
+/** Allowlisted top-level envelope keys for mupot.project-link-envelope/v1. */
+export const PROJECT_LINK_ENVELOPE_FIELDS = Object.freeze([
+  'schema', 'source', 'destination', 'correlation_id', 'idempotency_key',
+  'requested_capability', 'expires_at', 'task', 'evidence',
+] as const)
+
+/** Allowlisted source identity keys (paired pot + project + signing agent/key). */
+export const PROJECT_LINK_SOURCE_FIELDS = Object.freeze([
+  'pot', 'project_id', 'agent_id', 'key_id',
+] as const)
+
+/** Allowlisted destination identity keys (paired pot + project). */
+export const PROJECT_LINK_DESTINATION_FIELDS = Object.freeze([
+  'pot', 'project_id',
+] as const)
+
+/** Allowlisted task coordination fields (sanitized status only). */
+export const PROJECT_LINK_TASK_FIELDS = Object.freeze([
+  'source_task_id', 'flight_id', 'request_id', 'title', 'state', 'priority',
+  'blocker_summary', 'success_predicate', 'progress_summary',
+] as const)
+
+/** Allowlisted evidence reference fields (hash + authorized URL only). */
+export const PROJECT_LINK_EVIDENCE_FIELDS = Object.freeze([
+  'sha256', 'media_type', 'occurred_at', 'url',
+] as const)
+
+/**
+ * Explicit customer / credential / analytics / transcript fields that must never
+ * cross a project link. Rejected as `prohibited_field` (not merely unknown).
+ * Design boundary: DME cross-pot collaboration may exchange sanitized coordination
+ * state only — never customer records, tokens, raw analytics, transcripts, or
+ * unapproved file contents.
+ */
+export const PROJECT_LINK_PROHIBITED_CUSTOMER_FIELDS = Object.freeze([
+  'customer', 'customer_id', 'customer_email', 'customer_record', 'customer_records',
+  'contact', 'contacts', 'contact_list', 'contact_lists', 'phone', 'phone_number',
+  'access_token', 'api_key', 'credential', 'credentials', 'password', 'secret',
+  'private_key', 'authorization', 'bearer',
+  'raw_analytics', 'analytics', 'analytics_export', 'analytics_exports',
+  'transcript', 'transcripts', 'conversation', 'conversation_transcript',
+  'message_body', 'message_bodies', 'private_prompt', 'private_prompts',
+  'model_memory', 'file_contents', 'unapproved_file', 'unapproved_files',
+] as const)
+
+const PROHIBITED_CUSTOMER_FIELD_SET: ReadonlySet<string> = new Set(PROJECT_LINK_PROHIBITED_CUSTOMER_FIELDS)
+
 export interface ProjectLinkEnvelopeV1 {
   schema: typeof PROJECT_LINK_ENVELOPE_SCHEMA
   source: { pot: string; project_id: string; agent_id: string; key_id: string }
@@ -61,14 +108,48 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+function fieldPath(path: string, key: string): string {
+  return path ? `${path}.${key}` : key
+}
+
 function exactKeys(value: unknown, keys: readonly string[], path: string): EnvelopeValidationResult | null {
   if (!isRecord(value)) return { ok: false, reason: 'invalid_object', path }
   const actual = Object.keys(value)
   for (const key of actual) {
-    if (!keys.includes(key)) return { ok: false, reason: 'unknown_field', path: path ? `${path}.${key}` : key }
+    if (PROHIBITED_CUSTOMER_FIELD_SET.has(key)) {
+      return { ok: false, reason: 'prohibited_field', path: fieldPath(path, key) }
+    }
+    if (!keys.includes(key)) return { ok: false, reason: 'unknown_field', path: fieldPath(path, key) }
   }
   for (const key of keys) {
-    if (!Object.hasOwn(value, key)) return { ok: false, reason: 'missing_field', path: path ? `${path}.${key}` : key }
+    if (!Object.hasOwn(value, key)) return { ok: false, reason: 'missing_field', path: fieldPath(path, key) }
+  }
+  return null
+}
+
+/** Reject explicit denylisted keys anywhere in the tree before content scans. */
+function prohibitedFieldName(
+  value: unknown,
+  path = '',
+  seen = new WeakSet<object>(),
+): EnvelopeValidationResult | null {
+  if (typeof value !== 'object' || value === null) return null
+  if (seen.has(value)) return null
+  seen.add(value)
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const error = prohibitedFieldName(value[index], `${path}[${index}]`, seen)
+      if (error) return error
+    }
+    return null
+  }
+  for (const [key, child] of Object.entries(value)) {
+    const childPath = fieldPath(path, key)
+    if (PROHIBITED_CUSTOMER_FIELD_SET.has(key)) {
+      return { ok: false, reason: 'prohibited_field', path: childPath }
+    }
+    const error = prohibitedFieldName(child, childPath, seen)
+    if (error) return error
   }
   return null
 }
@@ -246,27 +327,26 @@ export function validateProjectLinkEnvelope(
   value: unknown,
   options: ProjectLinkEnvelopeValidationOptions = {},
 ): EnvelopeValidationResult {
-  const top = exactKeys(value, [
-    'schema', 'source', 'destination', 'correlation_id', 'idempotency_key',
-    'requested_capability', 'expires_at', 'task', 'evidence',
-  ], '')
+  const top = exactKeys(value, PROJECT_LINK_ENVELOPE_FIELDS, '')
   if (top) return top
+  const prohibitedName = prohibitedFieldName(value)
+  if (prohibitedName) return prohibitedName
   const prohibited = prohibitedString(value)
   if (prohibited) return prohibited
   const envelope = value as Record<string, unknown>
   if (envelope.schema !== PROJECT_LINK_ENVELOPE_SCHEMA) return { ok: false, reason: 'invalid_schema', path: 'schema' }
 
-  const sourceError = exactKeys(envelope.source, ['pot', 'project_id', 'agent_id', 'key_id'], 'source')
+  const sourceError = exactKeys(envelope.source, PROJECT_LINK_SOURCE_FIELDS, 'source')
   if (sourceError) return sourceError
   const source = envelope.source as Record<string, unknown>
-  for (const key of ['pot', 'project_id', 'agent_id', 'key_id'] as const) {
+  for (const key of PROJECT_LINK_SOURCE_FIELDS) {
     if (!validId(source[key])) return { ok: false, reason: 'invalid_id', path: `source.${key}` }
   }
 
-  const destinationError = exactKeys(envelope.destination, ['pot', 'project_id'], 'destination')
+  const destinationError = exactKeys(envelope.destination, PROJECT_LINK_DESTINATION_FIELDS, 'destination')
   if (destinationError) return destinationError
   const destination = envelope.destination as Record<string, unknown>
-  for (const key of ['pot', 'project_id'] as const) {
+  for (const key of PROJECT_LINK_DESTINATION_FIELDS) {
     if (!validId(destination[key])) return { ok: false, reason: 'invalid_id', path: `destination.${key}` }
   }
 
@@ -278,10 +358,7 @@ export function validateProjectLinkEnvelope(
   if (!validIso(envelope.expires_at)) return { ok: false, reason: 'invalid_timestamp', path: 'expires_at' }
 
   if (envelope.task !== null) {
-    const taskError = exactKeys(envelope.task, [
-      'source_task_id', 'flight_id', 'request_id', 'title', 'state', 'priority',
-      'blocker_summary', 'success_predicate', 'progress_summary',
-    ], 'task')
+    const taskError = exactKeys(envelope.task, PROJECT_LINK_TASK_FIELDS, 'task')
     if (taskError) return taskError
     const task = envelope.task as Record<string, unknown>
     if (!validId(task.source_task_id)) return { ok: false, reason: 'invalid_id', path: 'task.source_task_id' }
@@ -306,7 +383,7 @@ export function validateProjectLinkEnvelope(
   }
 
   if (envelope.evidence !== null) {
-    const evidenceError = exactKeys(envelope.evidence, ['sha256', 'media_type', 'occurred_at', 'url'], 'evidence')
+    const evidenceError = exactKeys(envelope.evidence, PROJECT_LINK_EVIDENCE_FIELDS, 'evidence')
     if (evidenceError) return evidenceError
     const evidence = envelope.evidence as Record<string, unknown>
     if (typeof evidence.sha256 !== 'string' || !SHA256.test(evidence.sha256)) return { ok: false, reason: 'invalid_sha256', path: 'evidence.sha256' }

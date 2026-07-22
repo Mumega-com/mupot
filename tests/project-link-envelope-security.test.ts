@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   PROJECT_LINK_ENVELOPE_SCHEMA,
   PROJECT_LINK_ENVELOPE_SIGNATURE_DOMAIN,
+  PROJECT_LINK_PROHIBITED_CUSTOMER_FIELDS,
   canonicalDomainSeparatedBytes,
   canonicalJson,
   canonicalProjectLinkArtifact,
@@ -53,6 +54,16 @@ function fromB64url(value: string): Uint8Array {
 }
 
 describe('project-link envelope security boundary', () => {
+  it('publishes an explicit prohibited-customer-field denylist covering the data boundary', () => {
+    expect(PROJECT_LINK_PROHIBITED_CUSTOMER_FIELDS).toEqual(expect.arrayContaining([
+      'customer_email', 'customer_record', 'contact_list',
+      'access_token', 'api_key', 'credentials',
+      'raw_analytics', 'analytics_export',
+      'transcript', 'conversation_transcript',
+      'file_contents', 'unapproved_files',
+    ]))
+  })
+
   it('produces stable canonical JSON for key ordering, Unicode, escaping, and nulls', () => {
     const vector = {
       z: null,
