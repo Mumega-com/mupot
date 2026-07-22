@@ -631,5 +631,6 @@ export const ROUTES = {
   members: '/api/members',
   mcp: '/mcp',
   im: '/im',
+  hermes: '/api/hermes',
   dashboard: '/',
 } as const

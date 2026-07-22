@@ -82,6 +82,9 @@ run_driver(){
 }
 
 while [ "$STOP" -eq 0 ]; do
+  # Presence/heartbeat for the Hermes-Sol constant agent (Port 3). Best-effort —
+  # a missing token or chat API blip must not stop the build/gate lanes.
+  run_driver "hermes" "$REPO/scripts/hermes-worker.py"
   run_driver "tech-grok" "$REPO/scripts/tech-grok-worker.py"
   run_driver "mumcp"  "$REPO/scripts/mumcp-worker.py"
   # codex lane paused by default per codex's own security audit 2026-08-03:

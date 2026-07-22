@@ -3,6 +3,12 @@
 # Copy to your Hermes deployment's config and fill in your pot's host. The real
 # webhook secret is read from a secret/env at runtime — NEVER paste a real secret
 # into a committed file. This is a public-repo template; placeholders only.
+#
+# Port 3 (Hermes-Sol constant agent): the pot also exposes a chat front-door at
+#   GET  https://YOUR-POT/hermes          (dashboard surface panel)
+#   POST https://YOUR-POT/api/hermes/chat (member-bearer; Luna→Sol→Opus wake)
+# Host heartbeat/presence: scripts/hermes-worker.py (operator-loop).
+# Diverse gate (optional): REVIEW_BACKEND=hermes-sol on scripts/review-worker.py.
 
 mupot:
   # Your pot's base URL (the domain you deployed mupot to).
