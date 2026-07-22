@@ -165,18 +165,20 @@ describe('runProjectConcierge — stalled project dispatches exactly one starter
     insertProject(harness, p)
     grantSquadAccess(harness, p.id, 'squad-a', 'write')
     // open + unassigned in squad-a: makes the project "busy" AND is the routable target.
+    // Seed a stale updated_at so we can assert the router bumps it.
     harness.sqlite.exec(
-      `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, assignee_agent_id)
-       VALUES ('task-sitting', 'squad-a', '${p.id}', 'Sitting work', 'done', 'open', NULL)`,
+      `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, assignee_agent_id, updated_at)
+       VALUES ('task-sitting', 'squad-a', '${p.id}', 'Sitting work', 'done', 'open', NULL, '2020-01-01T00:00:00.000Z')`,
     )
     await registerBuilderShared(env) // online in the shared pool (project_id=null)
 
     const result = await runProjectConcierge(env, p)
     expect(result.decision).toEqual({ action: 'route', routed: 1 })
     const row = harness.sqlite
-      .prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?')
-      .get('task-sitting') as { assignee_agent_id: string | null }
+      .prepare('SELECT assignee_agent_id, updated_at FROM tasks WHERE id = ?')
+      .get('task-sitting') as { assignee_agent_id: string | null; updated_at: string }
     expect(row.assignee_agent_id).toBe('agent-builder')
+    expect(row.updated_at).not.toBe('2020-01-01T00:00:00.000Z') // router bumped it (observability)
   })
 
   // SECURITY regression (#404): a cross-pot (source_pot) open+unassigned task must NOT be

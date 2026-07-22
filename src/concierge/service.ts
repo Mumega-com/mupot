@@ -318,12 +318,16 @@ async function routeUnassignedWork(
       if ((perAgent.get(builder.id) ?? 0) >= MAX_ROUTES_PER_AGENT) continue
       const assignable = await resolveTaskAssignee(env, builder.id, task.squad_id)
       if (!assignable.value) continue
-      // Idempotent + TOCTOU-safe: only assign if still open + unassigned.
+      // Idempotent + TOCTOU-safe: only assign if still open + unassigned. Bump
+      // updated_at so a routed task shows a fresh timestamp (observability — humans
+      // see the work moved) and correctly signals "row changed" to the optimistic-
+      // concurrency task-update path (WHERE updated_at=…). The WHERE guard is
+      // unchanged, so idempotency/TOCTOU safety is preserved.
       const upd = await env.DB.prepare(
-        `UPDATE tasks SET assignee_agent_id = ?1
+        `UPDATE tasks SET assignee_agent_id = ?1, updated_at = ?3
           WHERE id = ?2 AND status = 'open' AND assignee_agent_id IS NULL`,
       )
-        .bind(builder.id, task.id)
+        .bind(builder.id, task.id, new Date().toISOString())
         .run()
       if (upd.meta.changes === 1) {
         routed.push({ taskId: task.id, agentId: builder.id })
