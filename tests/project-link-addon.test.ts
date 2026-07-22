@@ -6,6 +6,7 @@ import {
   exportProjectLinkPublicKey,
   generateProjectLinkKeyPair,
   validateProjectLinkEnvelope,
+  type SignedProjectLinkEnvelopeV1,
 } from '../src/addons/project-link/envelope'
 import {
   createProjectLink,
@@ -178,7 +179,12 @@ describe('project-link addon', () => {
     expect(validateProjectLinkEnvelope({
       schema: 'mupot.project-link-envelope/v1',
       ...withCustomerField,
-    })).toEqual({ ok: false, reason: 'unknown_field', path: 'customer_email' })
+    })).toEqual({
+      ok: false,
+      reason: 'prohibited_field',
+      path: 'customer_email',
+      field_class: 'contacts',
+    })
 
     const withSensitiveSummary = envelopeInput()
     withSensitiveSummary.task.progress_summary = 'Contact customer@example.test with Bearer unsafe-token'
@@ -186,6 +192,110 @@ describe('project-link addon', () => {
       schema: 'mupot.project-link-envelope/v1',
       ...withSensitiveSummary,
     })).toEqual({ ok: false, reason: 'prohibited_content', path: 'task.progress_summary' })
+  })
+
+  it('rejects every prohibited customer-data field class before delivery and logs without values', async () => {
+    const warnings: unknown[][] = []
+    const originalWarn = console.warn
+    console.warn = (...args: unknown[]) => { warnings.push(args) }
+    const secretValue = 'SUPER-SECRET-CUSTOMER-PAYLOAD-do-not-log'
+    const cases: Array<[string, string, unknown]> = [
+      ['credentials', 'access_token', secretValue],
+      ['contacts', 'contact_list', [{ email: 'a@b.test', phone: secretValue }]],
+      ['analytics_exports', 'analytics_export', secretValue],
+      ['prompts', 'private_prompt', secretValue],
+      ['transcripts', 'conversation_transcript', [{ role: 'user', text: secretValue }]],
+      ['private_memory', 'private_memory', { engram: secretValue }],
+      ['file_contents', 'file_contents', secretValue],
+    ]
+    try {
+      for (const [fieldClass, field, payload] of cases) {
+        warnings.length = 0
+        const poisoned = {
+          ...envelopeInput(),
+          [field]: payload,
+        } as SignedProjectLinkEnvelopeV1['envelope'] & Record<string, unknown>
+        const validation = validateProjectLinkEnvelope({
+          schema: 'mupot.project-link-envelope/v1',
+          ...poisoned,
+        })
+        expect(validation, field).toEqual({
+          ok: false,
+          reason: 'prohibited_field',
+          path: field,
+          field_class: fieldClass,
+        })
+
+        let fetchCalls = 0
+        const rejected = await deliverProjectLinkEnvelope(
+          env(mumega, 'mumega'),
+          mumegaLink.id,
+          { envelope: poisoned as SignedProjectLinkEnvelopeV1['envelope'], signature: 'a'.repeat(86) },
+          {
+            now: NOW,
+            fetcher: (async () => {
+              fetchCalls += 1
+              throw new Error('fetch_must_not_run')
+            }) as typeof fetch,
+          },
+        )
+        expect(rejected).toEqual({ ok: false, reason: 'invalid_envelope' })
+        expect(fetchCalls).toBe(0)
+        expect(warnings.length).toBe(1)
+        expect(warnings[0]?.[0]).toBe('project-link: customer-data boundary denial')
+        expect(warnings[0]?.[1]).toEqual({
+          event: 'project-link.customer_data_boundary_denial',
+          reason: 'prohibited_field',
+          path: field,
+          field_class: fieldClass,
+          direction: 'outbound',
+          link_id: mumegaLink.id,
+        })
+        expect(JSON.stringify(warnings[0])).not.toContain(secretValue)
+      }
+    } finally {
+      console.warn = originalWarn
+    }
+
+    const nested = envelopeInput()
+    const withNested = {
+      schema: 'mupot.project-link-envelope/v1' as const,
+      ...nested,
+      task: { ...nested.task, credentials: { password: secretValue } },
+    }
+    expect(validateProjectLinkEnvelope(withNested)).toEqual({
+      ok: false, reason: 'prohibited_field', path: 'task.credentials', field_class: 'credentials',
+    })
+  })
+
+  it('accepts an approved allowlisted envelope and rejects unapproved evidence files', () => {
+    const approved = {
+      schema: 'mupot.project-link-envelope/v1' as const,
+      ...envelopeInput(),
+    }
+    expect(validateProjectLinkEnvelope(approved, {
+      approvedEvidenceOrigins: ['https://evidence.dme.test'],
+    }).ok).toBe(true)
+
+    const unapprovedOrigin = {
+      schema: 'mupot.project-link-envelope/v1' as const,
+      ...envelopeInput(),
+    }
+    expect(validateProjectLinkEnvelope(unapprovedOrigin, {
+      approvedEvidenceOrigins: ['https://receipts.mumega.test'],
+    })).toEqual({ ok: false, reason: 'unapproved_origin', path: 'evidence.url' })
+
+    const unapprovedMedia = {
+      schema: 'mupot.project-link-envelope/v1' as const,
+      ...envelopeInput(),
+    }
+    unapprovedMedia.evidence = {
+      ...unapprovedMedia.evidence,
+      media_type: 'application/octet-stream' as 'application/json',
+    }
+    expect(validateProjectLinkEnvelope(unapprovedMedia)).toEqual({
+      ok: false, reason: 'invalid_media_type', path: 'evidence.media_type',
+    })
   })
 
   it('verifies signatures and rejects a post-signature mutation', async () => {

@@ -3,11 +3,13 @@ import {
   canonicalProjectLinkEnvelope,
   canonicalProjectLinkArtifact,
   importProjectLinkPublicKey,
+  logProjectLinkBoundaryDenial,
   sha256Hex,
   validateProjectLinkEnvelope,
   verifySignedProjectEnvelope,
   type ProjectLinkEnvelopeV1,
   type ProjectLinkCapability,
+  type ProjectLinkProhibitedFieldClass,
   type SignedProjectLinkEnvelopeV1,
 } from './envelope'
 import { projectLinkTimestampMsSql } from './timestamps'
@@ -88,6 +90,23 @@ function primaryDb(env: Env): ProjectLinkDb {
 
 function admin(actor: ProjectLinkActor): boolean {
   return actor.role === 'owner' || actor.role === 'admin'
+}
+
+function maybeLogBoundaryDenial(
+  result: { ok: false; reason: string; path?: string; field_class?: ProjectLinkProhibitedFieldClass },
+  details: { direction: 'inbound' | 'outbound'; link_id: string },
+): void {
+  if (result.reason !== 'prohibited_field' && result.reason !== 'prohibited_content') return
+  if (typeof result.path !== 'string' || result.path.length === 0) {
+    throw new Error('boundary_denial_missing_path')
+  }
+  logProjectLinkBoundaryDenial({
+    reason: result.reason,
+    path: result.path,
+    ...(result.field_class !== undefined ? { field_class: result.field_class } : {}),
+    direction: details.direction,
+    link_id: details.link_id,
+  })
 }
 
 async function projectLinkAddonActive(env: Env, db: ProjectLinkDb = env.DB): Promise<boolean> {
@@ -614,13 +633,19 @@ export async function receiveProjectLinkEnvelope(
     return { ok: false, reason: 'invalid_link' }
   }
   const verified = await verifySignedProjectEnvelope(signed, publicKey)
-  if (!verified.ok) return verified.reason === 'invalid_signature'
-    ? { ok: false, reason: 'invalid_signature' }
-    : { ok: false, reason: 'invalid_envelope', path: verified.path }
+  if (!verified.ok) {
+    maybeLogBoundaryDenial(verified, { direction: 'inbound', link_id: linkId })
+    return verified.reason === 'invalid_signature'
+      ? { ok: false, reason: 'invalid_signature' }
+      : { ok: false, reason: 'invalid_envelope', path: verified.path }
+  }
   const scopedValidation = validateProjectLinkEnvelope(verified.envelope, {
     approvedEvidenceOrigins: link.approved_evidence_origins,
   })
-  if (!scopedValidation.ok) return { ok: false, reason: 'invalid_envelope', path: scopedValidation.path }
+  if (!scopedValidation.ok) {
+    maybeLogBoundaryDenial(scopedValidation, { direction: 'inbound', link_id: linkId })
+    return { ok: false, reason: 'invalid_envelope', path: scopedValidation.path }
+  }
   const envelope = scopedValidation.envelope
   if (!mappingMatches(link, envelope)) return { ok: false, reason: 'mapping_mismatch' }
   if (!linkAllows(link, envelope.requested_capability)) return { ok: false, reason: 'capability_denied' }
@@ -898,7 +923,10 @@ export async function deliverProjectLinkEnvelope(
   const validation = validateProjectLinkEnvelope(signed.envelope, {
     approvedEvidenceOrigins: link.approved_evidence_origins,
   })
-  if (!validation.ok) return { ok: false, reason: 'invalid_envelope' }
+  if (!validation.ok) {
+    maybeLogBoundaryDenial(validation, { direction: 'outbound', link_id: linkId })
+    return { ok: false, reason: 'invalid_envelope' }
+  }
   const envelope = validation.envelope
   if (!outboundMappingMatches(link, envelope)) return { ok: false, reason: 'mapping_mismatch' }
   if (!linkAllows(link, envelope.requested_capability)) return { ok: false, reason: 'capability_denied' }
