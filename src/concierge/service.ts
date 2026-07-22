@@ -295,9 +295,21 @@ export async function runProjectConcierge(
     return { registered, decision: { action: 'noop', reason: 'no_goal' }, taskId: null }
   }
 
+  // Build DRIVERS are SHARED, not per-project — the standing operator's cursor/claude/
+  // mumcp register presence in the shared pool (project_id = null), per the module-kernel
+  // design ("decision is per-project + always-on; execution is shared"). So the dispatch
+  // candidate set is the project-scoped roster UNION the shared build pool. Querying only
+  // the project scope was why the concierge saw `no_online_builder` and NEVER dispatched
+  // (the build agents are all project_id=null). The concierge's own per-project presence
+  // (project-scoped, caps=[dispatch,concierge]) is excluded by selfIdentity + the
+  // BUILD_CAPABILITY filter in pickOnlineBuilder, so unioning cannot make it pick itself.
   let roster: ModulePresence[]
   try {
-    roster = await listRoster(env, { projectId: project.id })
+    const [projectRoster, sharedRoster] = await Promise.all([
+      listRoster(env, { projectId: project.id }),
+      listRoster(env, { projectId: null }),
+    ])
+    roster = [...projectRoster, ...sharedRoster]
   } catch {
     return { registered, decision: { action: 'noop', reason: 'error' }, taskId: null }
   }
