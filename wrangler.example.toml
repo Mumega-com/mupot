@@ -18,9 +18,11 @@ TENANT_SLUG = "mumega"          # your org slug
                                  # customer/forked deployment (src/types.ts Env, #473).
 BRAND = "Mumega"                   # dashboard brand
 OAUTH_PROVIDER = "google"         # google | telegram
-FLEET_PROJECT = "sos"             # bus project the fleet window addresses (company fleet = sos, not the mumega slug)
-FLEET_OPS_AGENT = "kasra"         # ops agent that executes control requests (explicit — resolvers fail closed, no code default)
+FLEET_PROJECT = "sos"             # pot fleet label (legacy name; CF-native messaging, not SOS Redis — ADR #473)
+FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via agent_messages (explicit — resolvers fail closed, no code default)
 # secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN.
+# BUS_URL / BUS_TOKEN are SOS compat-shim leftovers — do NOT put them here; active fleet
+# routes never call the Redis bus (docs/architecture/sos-coordination-compat.md).
 # For a one-time self-hosted first owner without dashboard OAuth, set
 # BOOTSTRAP_OWNER_TOKEN via `bash scripts/secrets.sh --pot <slug> --bootstrap-owner`,
 # deploy, open /auth/bootstrap, then delete that secret. The route is unavailable

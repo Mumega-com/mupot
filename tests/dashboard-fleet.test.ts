@@ -8,6 +8,8 @@ import {
   resolveFleetOpsAgent,
   fleetScoped,
   loadFleet,
+  wakeFleetAgent,
+  requestFleetControl,
 } from '../src/dashboard/fleet'
 import type { Env } from '../src/types'
 
@@ -29,20 +31,19 @@ describe('humanAge', () => {
   it('days past 48h', () => expect(humanAge(NOW - 3 * 86_400_000, NOW)).toBe('3d ago'))
 })
 
-describe('busConfigured', () => {
+describe('busConfigured (SOS compat shim)', () => {
   it('false without token', () => {
     expect(busConfigured({} as Env)).toBe(false)
   })
-  it('true with token (default URL)', () => {
+  it('true with leftover SOS token (routes must not call the bridge)', () => {
     expect(busConfigured({ BUS_TOKEN: 'x' } as Env)).toBe(true)
   })
 })
 
 // ── tenant-scoping (Flock #43) ────────────────────────────────────────────────
-// The fleet window must scope to the pot's OWN bus project + ops agent. A tenant
-// pot must never address the company `sos` fleet or route control to our `kasra`.
-// The project string is env-derived (never request-derived) so a worker cannot be
-// tricked into cross-tenant fan-out.
+// The fleet window must scope to the pot's OWN project + ops agent. A tenant
+// pot must never address the company `sos` fleet or route control to our `kasra`
+// by accident. The project string is env-derived (never request-derived).
 
 describe('resolveFleetProject', () => {
   it('explicit FLEET_PROJECT wins', () => {
@@ -51,8 +52,6 @@ describe('resolveFleetProject', () => {
   it('falls back to TENANT_SLUG for a tenant pot', () => {
     expect(resolveFleetProject({ TENANT_SLUG: 'digid' } as Env)).toBe('digid')
   })
-  // FAIL CLOSED (adversarial P1): an unscoped pot must NOT default to the
-  // company `sos` project — it returns null so the send is refused.
   it('null when nothing set (fail closed, never sos)', () => {
     expect(resolveFleetProject({} as Env)).toBeNull()
   })
@@ -83,8 +82,6 @@ describe('resolveFleetOpsAgent', () => {
   it('explicit FLEET_OPS_AGENT wins', () => {
     expect(resolveFleetOpsAgent({ FLEET_OPS_AGENT: 'digid' } as Env)).toBe('digid')
   })
-  // FAIL CLOSED (adversarial P1): no fallback to our `kasra` — an unscoped pot
-  // must not route control to the company ops agent.
   it('null when unset (never falls back to kasra)', () => {
     expect(resolveFleetOpsAgent({} as Env)).toBeNull()
   })
@@ -93,49 +90,212 @@ describe('resolveFleetOpsAgent', () => {
   })
 })
 
-// ── env-overridable bus URL (de-mumega-ify #4: already correct pre-existing,
-// this locks it in with an explicit test). DEFAULT_BUS_URL is only a fallback —
-// env.BUS_URL, when set, wins; unset ⇒ byte-identical default host.
-describe('loadFleet — bus URL resolution', () => {
+describe('fleetScoped (CF-native — no BUS_TOKEN required)', () => {
+  it('false when pot unscoped (no project/slug)', () => {
+    expect(fleetScoped({} as Env)).toBe(false)
+  })
+  it('true with TENANT_SLUG even without SOS BUS_TOKEN', () => {
+    expect(fleetScoped({ TENANT_SLUG: 'digid' } as Env)).toBe(true)
+  })
+  it('true when FLEET_PROJECT + TENANT_SLUG set', () => {
+    expect(fleetScoped({ FLEET_PROJECT: 'digid', TENANT_SLUG: 'digid' } as Env)).toBe(true)
+  })
+})
+
+function makeFleetDb(opts: {
+  agents?: Array<{ id: string; squad_id: string; slug: string; name: string }>
+  fleet?: Array<{
+    agent_id: string
+    display: string
+    runtime: string
+    status: string
+    last_reported_at: string
+    host?: string
+  }>
+  presence?: Array<{
+    member_id: string
+    display_name: string
+    source: string
+    label: string
+    agent_id: string | null
+    last_seen_at: string
+    first_seen_at: string
+  }>
+  messages?: unknown[][]
+}) {
+  const messages = opts.messages ?? []
+  const agents = opts.agents ?? []
+  const fleet = opts.fleet ?? []
+  const presence = opts.presence ?? []
+  let seq = 0
+  const db = {
+    prepare(sql: string) {
+      const binds: unknown[] = []
+      const api = {
+        bind(...a: unknown[]) {
+          binds.push(...a)
+          return api
+        },
+        async first<T>() {
+          if (sql.includes('FROM agents') && sql.includes('WHERE id = ?1')) {
+            const row = agents.find((a) => a.id === binds[0])
+            return (row ?? null) as T
+          }
+          if (sql.includes('FROM agents') && sql.includes('WHERE slug = ?1')) {
+            return null as T
+          }
+          if (sql.includes('from_agent = ?2 AND request_id = ?3')) {
+            return null as T
+          }
+          return null as T
+        },
+        async all<T>() {
+          if (sql.includes('FROM agents') && sql.includes('WHERE slug = ?1')) {
+            const rows = agents.filter((a) => a.slug === binds[0])
+            return { results: rows as T[] }
+          }
+          if (sql.includes('FROM fleet_agents')) {
+            return {
+              results: fleet.map((f) => ({
+                agent_id: f.agent_id,
+                display: f.display,
+                runtime: f.runtime,
+                squads: '[]',
+                lifecycle: '',
+                status: f.status,
+                last_reported_at: f.last_reported_at,
+                host: f.host ?? '',
+              })) as T[],
+            }
+          }
+          if (sql.includes('FROM presence')) {
+            return { results: presence as T[] }
+          }
+          if (sql.includes('FROM flights')) {
+            return { results: [] as T[] }
+          }
+          return { results: [] as T[] }
+        },
+        async run() {
+          if (sql.includes('INSERT INTO agent_messages')) {
+            seq += 1
+            messages.push(binds)
+            return { meta: { last_row_id: seq, changes: 1 } }
+          }
+          return { meta: { changes: 0 } }
+        },
+      }
+      return api
+    },
+  }
+  return { db, messages }
+}
+
+describe('loadFleet — CF-native roster (no SOS HTTP)', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
   })
 
-  it('hits the default bus.mumega.com host when BUS_URL is unset', async () => {
-    const calls: string[] = []
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (url: string) => {
-        calls.push(String(url))
-        return new Response(JSON.stringify({ fleet: [] }), { status: 200 })
-      }),
-    )
-    await loadFleet({ BUS_TOKEN: 'x' } as Env, 0)
-    expect(calls).toEqual(['https://bus.mumega.com/fleet'])
+  it('does not fetch bus.mumega.com', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const { db } = makeFleetDb({
+      fleet: [
+        {
+          agent_id: 'agent-kasra',
+          display: 'Kasra',
+          runtime: 'tmux',
+          status: 'running',
+          last_reported_at: '2026-07-22 07:00:00',
+        },
+      ],
+    })
+    const env = { TENANT_SLUG: 'mumega', DB: db } as unknown as Env
+    const rows = await loadFleet(env, Date.parse('2026-07-22T07:01:00Z'))
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(rows).toHaveLength(1)
+    expect(rows[0].agent).toBe('agent-kasra')
+    expect(rows[0].liveness).toBe('active')
   })
 
-  it('hits the fork-provided BUS_URL when set', async () => {
-    const calls: string[] = []
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (url: string) => {
-        calls.push(String(url))
-        return new Response(JSON.stringify({ fleet: [] }), { status: 200 })
-      }),
-    )
-    await loadFleet({ BUS_TOKEN: 'x', BUS_URL: 'https://bus.forkedpot.example/' } as Env, 0)
-    expect(calls).toEqual(['https://bus.forkedpot.example/fleet'])
+  it('falls back to presence check-ins when fleet_agents is empty', async () => {
+    const { db } = makeFleetDb({
+      presence: [
+        {
+          member_id: 'mbr-1',
+          display_name: 'Cursor',
+          source: 'claude-code',
+          label: 'build',
+          agent_id: 'agent-cursor',
+          last_seen_at: '2026-07-22 07:00:00',
+          first_seen_at: '2026-07-22 06:00:00',
+        },
+      ],
+    })
+    const env = { TENANT_SLUG: 'mumega', DB: db } as unknown as Env
+    const rows = await loadFleet(env, Date.parse('2026-07-22T07:01:00Z'))
+    expect(rows).toHaveLength(1)
+    expect(rows[0].agent).toBe('agent-cursor')
   })
 })
 
-describe('fleetScoped', () => {
-  it('false without bus token even if project set', () => {
-    expect(fleetScoped({ FLEET_PROJECT: 'digid', TENANT_SLUG: 'digid' } as Env)).toBe(false)
+describe('wakeFleetAgent / requestFleetControl — agent_messages path', () => {
+  it('wake writes agent_messages and does not call SOS fetch', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const { db, messages } = makeFleetDb({
+      agents: [{ id: 'id-kasra', squad_id: 'squad-core', slug: 'kasra', name: 'Kasra' }],
+    })
+    const queue: unknown[] = []
+    const env = {
+      TENANT_SLUG: 'mumega',
+      DB: db,
+      BUS: { send: async (e: unknown) => { queue.push(e) } },
+    } as unknown as Env
+    const ok = await wakeFleetAgent(env, 'kasra', {
+      memberId: 'mbr-admin',
+      boundAgentId: null,
+      label: 'admin@test',
+    })
+    expect(ok).toBe(true)
+    expect(messages).toHaveLength(1)
+    expect(messages[0][2]).toBe('id-kasra') // to_agent
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(queue).toHaveLength(1)
+    vi.unstubAllGlobals()
   })
-  it('false when bus configured but pot unscoped (no project/slug)', () => {
-    expect(fleetScoped({ BUS_TOKEN: 'x' } as Env)).toBe(false)
+
+  it('control refuses when FLEET_OPS_AGENT unset', async () => {
+    const { db } = makeFleetDb({})
+    const env = { TENANT_SLUG: 'mumega', DB: db } as unknown as Env
+    const r = await requestFleetControl(env, 'kasra', 'pause', {
+      memberId: 'mbr-admin',
+      boundAgentId: null,
+      label: 'admin@test',
+    })
+    expect(r).toEqual({ ok: false, error: 'fleet_not_scoped' })
   })
-  it('true when bus configured AND scoped', () => {
-    expect(fleetScoped({ BUS_TOKEN: 'x', TENANT_SLUG: 'digid' } as Env)).toBe(true)
+
+  it('control sends a receipted request to the ops agent', async () => {
+    const { db, messages } = makeFleetDb({
+      agents: [{ id: 'id-ops', squad_id: 'squad-core', slug: 'kasra', name: 'Kasra' }],
+    })
+    const env = {
+      TENANT_SLUG: 'mumega',
+      FLEET_OPS_AGENT: 'kasra',
+      DB: db,
+    } as unknown as Env
+    const r = await requestFleetControl(env, 'cursor', 'pause', {
+      memberId: 'mbr-admin',
+      boundAgentId: null,
+      label: 'admin@test',
+    })
+    expect(r.ok).toBe(true)
+    expect(r.request_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    )
+    expect(messages).toHaveLength(1)
+    expect(messages[0][2]).toBe('id-ops')
+    expect(String(messages[0][6])).toContain('PAUSE')
   })
 })

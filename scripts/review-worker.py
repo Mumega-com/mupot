@@ -68,7 +68,7 @@ Flow per cycle:
                     fetch is treated as verdict=RED (fail-closed).
   5. act         -> ALWAYS: append a `review-worker -> <sha>: ...` receipt to
                     the task body (audit trail), record the sha in the local
-                    dedupe state, and best-effort bus-notify kasra.
+                    dedupe state, and best-effort mupot-send notify kasra.
                     REVIEW_AUTOMERGE=0 (default, shipping default): stop here
                     -- task stays in `review` for Kasra-core to task_verdict.
                     REVIEW_AUTOMERGE=1 (off by default): only when ALL of
@@ -661,7 +661,12 @@ def report_review(task: dict, head_sha: str, verdict_obj: dict, sensitive: bool,
 
 
 def notify_kasra(task: dict, pr_meta: dict, verdict_obj: dict, sensitive: bool, automerge_result: dict) -> None:
-    """Best-effort bus ping so Kasra-core sees the recommended verdict. Non-fatal if it fails."""
+    """Best-effort mupot inbox ping with the recommended verdict. Non-fatal if it fails.
+
+    Uses MCP `send` (D1 agent_messages), not the retired SOS Redis bus-send path.
+    Requires an agent-bound token; member-only tokens fail closed here (task body
+    receipt remains the durable audit trail).
+    """
     try:
         automerge_note = "merged" if automerge_result.get("merged") else automerge_result.get("reason", "review-only")
         msg = (
@@ -670,10 +675,8 @@ def notify_kasra(task: dict, pr_meta: dict, verdict_obj: dict, sensitive: bool, 
             f"p0={len(verdict_obj['p0'])} p1={len(verdict_obj['p1'])} "
             f"automerge=[{automerge_note}] -- {pr_meta.get('url', '')}"
         )
-        subprocess.run(
-            ["python3", str(Path.home() / "scripts/bus-send.py"), "kasra", msg],
-            capture_output=True, text=True, timeout=20,
-        )
+        to = os.environ.get("NOTIFY_TO", "kasra")
+        mcp("send", {"to": to, "body": msg})
     except Exception as exc:  # noqa: BLE001 - notify is best-effort
         log(f"notify kasra failed (non-fatal): {exc}")
 

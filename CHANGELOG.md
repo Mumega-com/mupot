@@ -8,6 +8,11 @@ block collapses into a changelog entry when it ships.
 
 ## [Unreleased]
 
+### Changed
+
+- Fleet coordination cut over to mupot CF-native primitives (D1 send/inbox + presence +
+  Queue wake); SOS Redis bus reduced to a documented compat shim (ADR #473).
+
 ## [0.24.0] — 2026-07-19
 
 **Project Operations.** Projects with squad-scoped RBAC, cross-pot collaboration via the
