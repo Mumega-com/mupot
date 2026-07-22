@@ -54,6 +54,12 @@ import { createTask } from '../tasks/service'
 import { createModel } from '../model'
 import { createMemory } from '../memory'
 import { checkAndReserve, recordTokens } from './meter'
+import {
+  chatWithModelFallback,
+  isCreditOutReason,
+  isProviderFailure,
+  markDormant,
+} from './lifecycle'
 import { costMicroUsd } from './cost'
 import { buildSensorium, renderSensorium } from './sensorium'
 import type { AgentRuntime, Sensorium } from './sensorium'
@@ -299,6 +305,9 @@ export async function runGoalCycle(
     budgetWindow: agent.budget_window,
   })
   if (!meterResult.ok) {
+    if (isCreditOutReason(meterResult.reason)) {
+      await markDormant(env, agent, 'credit_out', meterResult.reason)
+    }
     const decided: GoalCycleDecided =
       meterResult.reason === 'budget_cap_exceeded' ? 'budget_exhausted' : 'rate_limited'
     // S2: observe the meter-block as a noop (not a failure — it is a governed state).
@@ -358,7 +367,21 @@ export async function runGoalCycle(
       },
     ]
 
-    const raw = await model.chat(messages, { model: agent.model })
+    let raw: string
+    try {
+      const chat = await chatWithModelFallback(model, agent, messages, {})
+      raw = chat.text
+    } catch (modelErr) {
+      if (isProviderFailure(modelErr)) {
+        await markDormant(
+          env,
+          agent,
+          'provider_down',
+          modelErr instanceof Error ? modelErr.message : 'provider_down',
+        )
+      }
+      throw modelErr
+    }
 
     // Record this planning call's (conservative) spend so the dollar cap (#4) sees
     // the loop's OWN burn, not just execute-mode spend. Best-effort — a failed

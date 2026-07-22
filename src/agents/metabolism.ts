@@ -78,6 +78,7 @@ async function selectGoalBearingAgents(env: Env, limit: number): Promise<Array<{
   const { results } = await env.DB.prepare(
     `SELECT id FROM agents
        WHERE status = 'active'
+         AND dormant_reason IS NULL
          AND okr IS NOT NULL AND TRIM(okr) != ''
          AND kpi_progress < 100
        ORDER BY updated_at ASC

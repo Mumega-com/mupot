@@ -217,6 +217,8 @@ const oauthProvider = new OAuthProvider<Env>({
 import { handleQueue } from './bus/consumer'
 // Metabolism — the pot heartbeat that pulses goal-bearing work-units (#27 loop, made autonomous).
 import { runMetabolism } from './agents/metabolism'
+import { runLifecycleTick } from './agents/lifecycle'
+import { createModel } from './model'
 import { runLoopsTick } from './loops/driver'
 // Per-project concierge (Module Kernel Leg 1) — the always-on dispatcher. Builds on
 // Port 1 (module_registry + presence, #457): each active project gets one cycle per
@@ -238,7 +240,7 @@ export default {
   // Queue and scheduled handlers are preserved unchanged (spec §A.2).
   queue: handleQueue,
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Eight independent heartbeats on the same */15 cron:
+    // Nine independent heartbeats on the same */15 cron:
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
     //     ("design loops, not prompts"; without this the v0.3.0 loop never fires).
@@ -260,6 +262,8 @@ export default {
     //     goal + idle online build capacity + zero advancing tasks. Heuristic MVP,
     //     no model call (model-seam left injectable for Sol later); idempotent by
     //     design (rank, never act-loop) — see src/concierge/service.ts.
+    //  9. Agent lifecycle — death_condition soft-retire + credit/provider dormancy
+    //     reactivation. Soft, reversible, audited. Fail-soft; never crash-loops.
     ctx.waitUntil(reconcileMembership(env))
     ctx.waitUntil(runMetabolism(env))
     ctx.waitUntil(runLoopsTick(env))
@@ -268,5 +272,8 @@ export default {
     ctx.waitUntil(runCroCollection(env).then(() => undefined))
     ctx.waitUntil(flushFlightEventOutbox(env).then(() => undefined))
     ctx.waitUntil(runConciergeTick(env).then(() => undefined))
+    ctx.waitUntil(
+      runLifecycleTick(env, Date.now(), { model: createModel(env) }).then(() => undefined),
+    )
   },
 }
