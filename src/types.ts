@@ -158,6 +158,7 @@ export interface Env {
   // Fail-closed: if absent, resolveConnector() returns null and addConnector() throws.
   CONNECTOR_MASTER_KEY?: string
   // Secret-env taker: CF Workers Secrets API bootstrap (fail-closed when incomplete).
+  // Deploy setup: wrangler.example.toml (SECRET_ENV_CF_* block).
   // SECRET_ENV_CF_API_TOKEN MUST be set via `wrangler secret put` — never in [vars].
   // SECRET_ENV_CF_ACCOUNT_ID and SECRET_ENV_CF_SCRIPT_NAME may be [vars] or secrets.
   SECRET_ENV_CF_API_TOKEN?: string
