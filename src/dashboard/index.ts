@@ -67,6 +67,18 @@ import { resolveAgentRef } from '../org/resolve'
 import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
 import { loadApprovals, loadPublishable, resultPreview } from './approvals'
 import { CONTENT_DEPARTMENT_KEY } from '../agents/execute'
+// Secret-env approvals (Task 5): the paste-capable admin section on /approvals —
+// this is deliberately NOT the task_verdict queue above, since paste fields
+// cannot go through the generic verdict endpoint. Service functions are the
+// SAME ones the MCP surface calls; the dashboard never reimplements custody.
+import {
+  secretEnvApprovalsSection,
+  secretEnvBoundBody,
+  secretEnvRejectedBody,
+  secretEnvErrorBody,
+} from './secret-env'
+import { listPendingSecretEnvRequests, bindSecretEnv, rejectSecretEnv } from '../secret-env/service'
+import type { PublicSecretEnvRequest } from '../secret-env/types'
 import { loadLoopsView, loopsBody } from './loops'
 import { loadEconomy, economyBody, loadTodaySpendScalar } from './economy'
 import { loadDeployment, deploymentBody } from './deployment'
@@ -456,11 +468,57 @@ dashboardApp.get('/send', async (c) => {
 // admin-gated POST /admin/departments/:dept/execute/:gateId, no new write path.
 dashboardApp.get('/approvals', async (c) => {
   const auth = c.get('auth')
-  const [items, publishable] = await Promise.all([
+  // Secret-env pending requests: admin-only, like loadPublishable above — a
+  // non-admin caller never even queries the table, not just doesn't see a button.
+  const [items, publishable, secretEnvRequests] = await Promise.all([
     loadApprovals(c.env, auth),
     loadPublishable(c.env, auth),
+    isOrgAdmin(auth) ? listPendingSecretEnvRequests(c.env) : Promise.resolve([]),
   ])
-  return c.html(shell(c.env, 'Approvals', approvalsBody(items, publishable)))
+  return c.html(shell(c.env, 'Approvals', approvalsBody(items, publishable, secretEnvRequests)))
+})
+
+// POST /admin/secret-env/:requestId/bind — admin pastes values for a pending
+// secret-env request. Values are collected here ONLY to build bindSecretEnv's
+// payload and are never referenced again after that call — the response and
+// any error page render binding NAMES only (see ./secret-env.ts).
+dashboardApp.post('/admin/secret-env/:requestId/bind', async (c) => {
+  const auth = c.get('auth')
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+
+  const requestId = c.req.param('requestId')
+  const form = await c.req.parseBody()
+  const values: Record<string, string> = {}
+  for (const [key, value] of Object.entries(form)) {
+    if (key.startsWith('secret__') && typeof value === 'string') {
+      values[key.slice('secret__'.length)] = value
+    }
+  }
+
+  const result = await bindSecretEnv(c.env, {
+    requestId,
+    values,
+    actorId: auth.memberId ?? auth.userId,
+  })
+
+  if (!result.ok) {
+    return c.html(shell(c.env, 'Approvals', secretEnvErrorBody(result.error)), 400)
+  }
+  return c.html(shell(c.env, 'Secret env bound', secretEnvBoundBody(requestId, result.bound)))
+})
+
+// POST /admin/secret-env/:requestId/reject — admin declines; no CF calls, no values.
+dashboardApp.post('/admin/secret-env/:requestId/reject', async (c) => {
+  const auth = c.get('auth')
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+
+  const requestId = c.req.param('requestId')
+  const result = await rejectSecretEnv(c.env, { requestId, actorId: auth.memberId ?? auth.userId })
+
+  if (!result.ok) {
+    return c.html(shell(c.env, 'Approvals', secretEnvErrorBody(result.error)), 400)
+  }
+  return c.html(shell(c.env, 'Secret env rejected', secretEnvRejectedBody(requestId)))
 })
 
 // GET /ops — owner/admin health and observability console.
@@ -4308,7 +4366,11 @@ function sendScript(projectId?: string) {
 // The inline <style> block for .appr-* classes was moved into shell() to avoid
 // duplication across pages.
 
-function approvalsBody(items: ApprovalItem[], publishable: ApprovalItem[] = []) {
+function approvalsBody(
+  items: ApprovalItem[],
+  publishable: ApprovalItem[] = [],
+  secretEnvRequests: PublicSecretEnvRequest[] = [],
+) {
   // Re-use the shared card renderer. Wrap in a named container so the script can
   // scope its querySelectorAll without touching #obs-queue on the home page.
   const cards = items.map((t) => approvalCardHtml(t)).join('')
@@ -4344,7 +4406,8 @@ function approvalsBody(items: ApprovalItem[], publishable: ApprovalItem[] = []) 
     })}
     ${n ? raw(`<div id="approvals-list">${cards}</div>`) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
     ${n ? approvalsScript() : html``}
-    ${publishSection}`
+    ${publishSection}
+    ${secretEnvApprovalsSection(secretEnvRequests)}`
 }
 
 /**
