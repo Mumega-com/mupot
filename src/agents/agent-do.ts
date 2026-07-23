@@ -14,6 +14,11 @@ import { DurableObject } from 'cloudflare:workers'
 import type { Env, Agent, Task, MemoryPort, ModelMessage } from '../types'
 import { createMemory } from '../memory'
 import { createModel } from '../model'
+import {
+  chatWithModelFallback,
+  isProviderFailure,
+  markDormant,
+} from './lifecycle'
 import { createTask } from '../tasks/service'
 import { runTaskExecution, resolveTaskId, resolveDispatchReceiptId } from './execute'
 import { runGoalCycle } from './loop'
@@ -152,7 +157,15 @@ export class AgentDO extends DurableObject<Env> {
       return { ok: false, agent_id: identity.agentId, cycle: this.getCycles(), decided: '', actions: 0, error: 'agent_not_found' }
     }
     if (agent.status !== 'active') {
-      return { ok: false, agent_id: agent.id, cycle: this.getCycles(), decided: '', actions: 0, error: 'agent_paused' }
+      const dormant = agent.dormant_reason
+      return {
+        ok: false,
+        agent_id: agent.id,
+        cycle: this.getCycles(),
+        decided: '',
+        actions: 0,
+        error: dormant ? `agent_dormant:${dormant}` : 'agent_paused',
+      }
     }
 
     // EXECUTE MODE — a wake carrying a task_id (top-level or in a BusEvent payload)
@@ -242,7 +255,7 @@ export class AgentDO extends DurableObject<Env> {
 
       // 2. Think — the model call, abstracted.
       const prompt = this.buildPrompt(agent, input, recalled)
-      const raw = await this.think(agent.model, prompt)
+      const raw = await this.think(prompt, agent)
       const decision = this.parseDecision(raw)
 
       // 3. Decide + 4. Act — emit to the bus. Chiefly: create tasks.
@@ -282,7 +295,7 @@ export class AgentDO extends DurableObject<Env> {
   // (AI Gateway: anthropic|openai|google) or falls back to Workers AI. The agent
   // row's model id is passed as the preferred model; the port decides how to use
   // it (Workers AI model id, or provider model override). Behavior is unchanged.
-  private async think(model: string, prompt: string): Promise<string> {
+  private async think(prompt: string, agent: Agent): Promise<string> {
     const messages: ModelMessage[] = [
       {
         role: 'system',
@@ -294,7 +307,20 @@ export class AgentDO extends DurableObject<Env> {
       },
       { role: 'user', content: prompt },
     ]
-    return createModel(this.env).chat(messages, { model })
+    try {
+      const r = await chatWithModelFallback(
+        createModel(this.env),
+        { model: agent.model, model_fallback: agent.model_fallback },
+        messages,
+        {},
+      )
+      return r.text
+    } catch (err) {
+      if (isProviderFailure(err)) {
+        await markDormant(this.env, agent, 'provider_down', err instanceof Error ? err.message : 'provider_down')
+      }
+      throw err
+    }
   }
 
   private buildPrompt(agent: Agent, input: WakeInput, recalled: string): string {
@@ -355,12 +381,14 @@ export class AgentDO extends DurableObject<Env> {
     const row = await this.env.DB.prepare(
       `SELECT id, squad_id, slug, name, role, model, status,
               okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
-              created_at
+              created_at, model_fallback, death_condition, dormant_reason,
+              purpose, owner, parent_agent_id, qnft_ref
          FROM agents WHERE id = ?`,
     )
       .bind(id)
-      .first<Agent>()
-    return row ?? null
+      .first<Omit<Agent, 'capabilities' | 'skills'> & { capabilities?: null; skills?: null }>()
+    if (!row) return null
+    return { ...row, capabilities: null, skills: null }
   }
 
   // ── runtime state (private SQLite) ──

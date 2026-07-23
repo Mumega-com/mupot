@@ -27,6 +27,7 @@ const EVENT_TYPES: readonly BusEventType[] = [
   'squad.dispatch',
   'org.provisioned',
   'project.mutated',
+  'agent.lifecycle',
 ]
 
 function isBusEventType(v: unknown): v is BusEventType {
