@@ -138,6 +138,13 @@ export interface Env {
   AI_GATEWAY_TOKEN?: string
   IM_WEBHOOK_SECRET?: string // shared secret for the IM webhook (Telegram secret_token)
   HERMES_RELAY_SECRET?: string // shared secret for the Hermes → mupot channel relay
+  // KayHermes chat panel — public HTTPS origin of the Hermes API server (Cloudflare
+  // Tunnel to the kayhermes profile). Non-secret; SSRF-guarded (https + public host).
+  // Absent ⇒ /agents/kayhermes shows "not configured". Pair with KAYHERMES_API_KEY.
+  KAYHERMES_API_URL?: string
+  // Bearer = Hermes API_SERVER_KEY for the kayhermes profile. `wrangler secret put KAYHERMES_API_KEY`.
+  // Never expose to the browser. Absent ⇒ kayhermes chat proxy 503.
+  KAYHERMES_API_KEY?: string
   FLEET_PANEL_SK?: string      // Ed25519 PRIVATE OKP JWK — signs fleet control-requests. `wrangler secret put FLEET_PANEL_SK`. Absent ⇒ /api/fleet/control 503 (fail-closed).
   PROJECT_LINK_SIGNING_KEY?: string // Ed25519 PRIVATE OKP JWK for signed cross-pot receipts; never shared with a peer pot.
   FLEET_CONSUMER_AGENT?: string // the host consumer agent id that reads + executes control-requests (the daemon reads its inbox as this). Absent ⇒ 503.
