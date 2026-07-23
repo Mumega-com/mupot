@@ -694,6 +694,7 @@ export function projectMutationStatus(error: ProjectMutationError): 400 | 404 | 
     || error === 'archived_project'
     || error === 'invalid_status_transition'
     || error === 'completion_gate_required'
+    || error === 'start_gate_required'
   ) return 409
   return 400
 }
@@ -1084,6 +1085,7 @@ function projectMutationMessage(error: ProjectMutationError): string {
     invalid_status: 'Choose a valid project status action.',
     invalid_status_transition: 'That action is not available from the current project status.',
     completion_gate_required: 'Project completion requires a structural gate and different-principal verdict.',
+    start_gate_required: 'Activating a planned project requires the start gate (seed first task + resource commit).',
     invalid_target_date: 'Enter a valid target date.',
     slug_taken: 'That project slug is already in use.',
     project_not_found: 'The project no longer exists.',

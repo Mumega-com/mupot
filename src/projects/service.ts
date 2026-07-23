@@ -21,6 +21,7 @@ export type ProjectMutationError =
   | 'archived_project' | 'squad_not_found' | 'invalid_access_level'
   | 'receipt_failed'
   | 'completion_gate_required'
+  | 'start_gate_required'
 
 export type ProjectMutationResult<T> =
   | { ok: true; value: T }
@@ -51,6 +52,11 @@ export interface UpdateProjectInput {
    * completion-gate.ts. Bare updateProject callers cannot self-report completed.
    */
   via_completion_gate?: boolean
+  /**
+   * Internal flag: allow planned→active writes owned by start-gate.ts.
+   * Bare updateProject callers cannot activate without authorize+provision.
+   */
+  via_start_gate?: boolean
   /** Principal recorded on lessons-capture when completed→archived. */
   lifecycle_principal?: string
 }
@@ -254,7 +260,9 @@ export async function updateProject(
   if (!existing) return { ok: false, error: 'project_not_found' }
 
   const suppliedKeys = Object.keys(input).filter((key) => {
-    if (key === 'via_completion_gate' || key === 'lifecycle_principal') return false
+    if (key === 'via_completion_gate' || key === 'via_start_gate' || key === 'lifecycle_principal') {
+      return false
+    }
     return input[key as keyof UpdateProjectInput] !== undefined
   })
   const statusWasSupplied = input.status !== undefined
@@ -288,6 +296,18 @@ export async function updateProject(
     && !viaGate
   ) {
     return { ok: false, error: 'completion_gate_required' }
+  }
+
+  // Slice 3: planned→active is owned by start-gate.ts (authorize + provision).
+  // Bare updateProject cannot flip to active without a real resource commit.
+  const viaStartGate = input.via_start_gate === true
+  if (
+    statusWasSupplied
+    && existing.status === 'planned'
+    && nextStatus === 'active'
+    && !viaStartGate
+  ) {
+    return { ok: false, error: 'start_gate_required' }
   }
 
   const nextSlug = input.slug === undefined ? existing.slug : input.slug

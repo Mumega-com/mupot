@@ -1,4 +1,5 @@
-// Project lifecycle loop — circuit breaker (slice 1) + structural completion (slice 2).
+// Project lifecycle loop — circuit breaker (slice 1) + structural completion
+// (slice 2) + start-gate ghost alarm (slice 3).
 //
 // Design: docs/superpowers/specs/2026-07-23-project-lifecycle-control-loop-design.md
 // Mirrors src/concierge/service.ts / src/loops/driver.ts: one bounded sweep per tick,
@@ -17,10 +18,21 @@ import {
   enterProjectReview,
   type CompletionGateDeps,
 } from './completion-gate'
+import {
+  DEFAULT_GHOST_START_DAYS,
+  START_GATE_PRINCIPAL,
+  defaultGhostStartDeps,
+  evaluateGhostStartAlarm,
+  ghostCutoffIso,
+  listStalePlannedProjects,
+  type GhostStartDeps,
+  type GhostStartOutcome,
+} from './start-gate'
 
 /** Cap projects evaluated per cron tick — mirrors MAX_PROJECTS_PER_TICK / MAX_LOOPS_PER_TICK. */
 export const MAX_BOUNDARY_PROJECTS_PER_TICK = 25
 export const MAX_COMPLETION_PROJECTS_PER_TICK = 25
+export const MAX_GHOST_START_PROJECTS_PER_TICK = 25
 export const STRUCTURAL_COMPLETION_PRINCIPAL = 'system:project-loop'
 
 export interface ProjectLoopTickResult {
@@ -30,12 +42,14 @@ export interface ProjectLoopTickResult {
   recommitted: number
   killed: number
   completion_promoted: number
+  ghost_alarmed: number
   errors: number
 }
 
 export interface ProjectLoopDeps {
   listDue?: (env: Env, nowIso: string) => Promise<Project[]>
   listActiveForCompletion?: (env: Env) => Promise<Project[]>
+  listStalePlanned?: (env: Env, olderThanIso: string) => Promise<Project[]>
   evaluate?: (
     env: Env,
     project: Pick<Project, 'id' | 'status' | 'cycle_boundary_at'>,
@@ -48,8 +62,15 @@ export interface ProjectLoopDeps {
     principal: string,
     deps: CompletionGateDeps,
   ) => ReturnType<typeof enterProjectReview>
+  evaluateGhost?: (
+    env: Env,
+    project: Pick<Project, 'id' | 'status' | 'created_at'>,
+    nowIso: string,
+    deps: GhostStartDeps,
+  ) => Promise<GhostStartOutcome>
   breakerDeps?: CircuitBreakerDeps
   completionDeps?: CompletionGateDeps
+  ghostDeps?: GhostStartDeps
   nowIso?: () => string
 }
 
@@ -104,17 +125,27 @@ export async function runProjectLoopTick(
   const nowIso = (deps.nowIso ?? (() => new Date().toISOString()))()
   const list = deps.listDue ?? listProjectsDueAtBoundary
   const listActive = deps.listActiveForCompletion ?? listActiveProjectsForCompletion
+  const listStale = deps.listStalePlanned ?? listStalePlannedProjects
   const evaluate = deps.evaluate ?? evaluateProjectCircuitBreaker
   const enterReview = deps.enterReview ?? enterProjectReview
+  const evaluateGhost = deps.evaluateGhost ?? evaluateGhostStartAlarm
   const breakerDeps = deps.breakerDeps ?? defaultCircuitBreakerDeps()
   const completionDeps = deps.completionDeps ?? defaultCompletionGateDeps()
+  const ghostDeps = deps.ghostDeps ?? defaultGhostStartDeps()
 
   let projects: Project[]
   try {
     projects = await list(env, nowIso)
   } catch {
     return {
-      ok: false, scanned: 0, skipped: 0, recommitted: 0, killed: 0, completion_promoted: 0, errors: 0,
+      ok: false,
+      scanned: 0,
+      skipped: 0,
+      recommitted: 0,
+      killed: 0,
+      completion_promoted: 0,
+      ghost_alarmed: 0,
+      errors: 0,
     }
   }
 
@@ -123,6 +154,7 @@ export async function runProjectLoopTick(
   let killed = 0
   let errors = 0
   let completionPromoted = 0
+  let ghostAlarmed = 0
 
   for (const project of projects) {
     try {
@@ -165,13 +197,39 @@ export async function runProjectLoopTick(
     }
   }
 
+  let stalePlanned: Project[]
+  try {
+    const thresholdDays = ghostDeps.ghostThresholdDays ?? DEFAULT_GHOST_START_DAYS
+    const cutoff = ghostCutoffIso(nowIso, thresholdDays)
+    stalePlanned = await listStale(env, cutoff)
+  } catch {
+    stalePlanned = []
+  }
+
+  for (const project of stalePlanned.slice(0, MAX_GHOST_START_PROJECTS_PER_TICK)) {
+    try {
+      const outcome = await evaluateGhost(env, project, nowIso, ghostDeps)
+      if (outcome === 'alarmed') ghostAlarmed++
+      else if (outcome === 'skipped' || outcome === 'already_alarmed') skipped++
+    } catch (err) {
+      errors++
+      console.error('project-loop: ghost-start alarm failed (non-fatal)', {
+        tenant: env.TENANT_SLUG,
+        project_id: project.id,
+        principal: START_GATE_PRINCIPAL,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
   return {
     ok: true,
-    scanned: projects.length + activeProjects.length,
+    scanned: projects.length + activeProjects.length + stalePlanned.length,
     skipped,
     recommitted,
     killed,
     completion_promoted: completionPromoted,
+    ghost_alarmed: ghostAlarmed,
     errors,
   }
 }

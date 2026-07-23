@@ -149,7 +149,9 @@ describe('project domain service', () => {
       'archived:archived', 'archived:planned',
     ])
     // review/completed status flips require via_completion_gate (slice 2).
+    // planned→active requires via_start_gate (slice 3).
     const gateOnly = new Set(['active:review', 'review:completed'])
+    const startOnly = new Set(['planned:active'])
 
     for (const from of statuses) {
       for (const to of statuses) {
@@ -167,6 +169,7 @@ describe('project domain service', () => {
         const result = await updateProject(env, id, {
           status: to,
           via_completion_gate: gateOnly.has(`${from}:${to}`),
+          via_start_gate: startOnly.has(`${from}:${to}`),
         })
 
         if (allowed.has(`${from}:${to}`)) {
@@ -180,6 +183,21 @@ describe('project domain service', () => {
         }
       }
     }
+  })
+
+  it('blocks bare planned→active without the start gate', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const created = await createProject(env, {
+      slug: 'start-gate-block',
+      name: 'Start gate block',
+      status: 'planned',
+      goal: 'Ship start gate',
+    })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    await expect(updateProject(env, created.value.id, { status: 'active' }))
+      .resolves.toEqual({ ok: false, error: 'start_gate_required' })
   })
 
   it('blocks bare active→completed self-report without the completion gate', async () => {
