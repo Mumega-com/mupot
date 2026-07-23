@@ -122,3 +122,19 @@ crons = ["*/15 * * * *"]
 # Until these secrets are set the GHL channel is inert (fails closed):
 #   - Outbound sends return { ok: false, reason: 'not_configured' }
 #   - Inbound webhook returns 503 { error: 'not_configured' }
+
+# ── Workflow port (Port 5) — optional n8n/zapier/make adapters ──
+# Cloudflare Workflows (TASK_WORKFLOW above) remain the DEFAULT. External managers
+# are webhook adapters behind the same port. Outbound fires only after an approved
+# gate verdict; inbound is signed source-only (never holds approval).
+#
+#   npx wrangler secret put N8N_WEBHOOK_URL        # https webhook for gated n8n acts
+#   npx wrangler secret put N8N_WEBHOOK_AUTH       # optional Authorization header
+#   npx wrangler secret put ZAPIER_WEBHOOK_URL
+#   npx wrangler secret put MAKE_WEBHOOK_URL
+#   npx wrangler secret put WORKFLOW_INBOUND_SECRET  # HMAC for /api/integrations/workflow/inbound
+#
+# Optional vars (non-secret; may go in [vars]):
+#   HERMES_DASHBOARD_URL = "https://hermes.example.com"  # Surface panel embed
+#   WORKFLOW_INBOUND_SQUAD_ID = "<squad-uuid>"
+
