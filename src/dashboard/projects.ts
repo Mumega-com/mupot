@@ -344,7 +344,8 @@ async function loadVisibleProjects(
   }
   const statement = env.DB.prepare(
     `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-            p.target_date, p.created_at, p.updated_at
+            p.target_date, p.cycle_boundary_at, p.stalled, p.stall_threshold_days,
+            p.created_at, p.updated_at
        FROM projects p
       ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
       ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
@@ -1082,6 +1083,7 @@ function projectMutationMessage(error: ProjectMutationError): string {
     invalid_status: 'Choose a valid project status action.',
     invalid_status_transition: 'That action is not available from the current project status.',
     invalid_target_date: 'Enter a valid target date.',
+    invalid_cycle_boundary_at: 'Enter a valid UTC cycle boundary timestamp.',
     slug_taken: 'That project slug is already in use.',
     project_not_found: 'The project no longer exists.',
     parent_not_found: 'The selected parent project was not found.',
