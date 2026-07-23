@@ -3276,6 +3276,9 @@ function shell(
               <a class="nav-child" href="/admin/divisions">Squads</a>
               <a class="nav-child" href="/agents">Agents</a>
               <a class="nav-child" href="/agents/kayhermes">KayHermes chat</a>
+              ${env.HERMES_DASHBOARD_URL?.trim()
+                ? html`<a class="nav-child" href="${env.HERMES_DASHBOARD_URL.trim()}" target="_blank" rel="noopener">Hermes dashboard</a>`
+                : ''}
               <a class="nav-child" href="/agents/byoa">BYOA Hermes</a>
             </div>
           </div>

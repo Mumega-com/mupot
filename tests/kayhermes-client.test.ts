@@ -45,6 +45,7 @@ describe('kayhermesConfigured / resolveKayhermesConfig', () => {
     } as Env)
     expect(cfg.baseUrl).toBe('https://kayhermes-api.example.com')
     expect(cfg.apiKey).toBe('secret')
+    expect(cfg.sessionKey).toBeNull()
   })
 })
 

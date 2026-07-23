@@ -85,7 +85,12 @@ function mapErr(c: Context<AppEnv>, err: unknown): Response {
 async function endpointFor(c: Context<AppEnv>): Promise<KayhermesConfig & { agentId: string }> {
   const memberId = c.get('memberId')
   const ep = await resolveMemberHermesEndpoint(c.env, memberId)
-  return { baseUrl: ep.baseUrl, apiKey: ep.apiKey, agentId: ep.agentId }
+  return {
+    baseUrl: ep.baseUrl,
+    apiKey: ep.apiKey,
+    sessionKey: hermesSessionKeyForMember(memberId),
+    agentId: ep.agentId,
+  }
 }
 
 memberHermesApp.get('/status', async (c) => {

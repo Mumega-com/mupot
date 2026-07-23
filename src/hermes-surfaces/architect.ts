@@ -1,12 +1,16 @@
 // KayHermes org-architect helpers — seat a human member on a squad + ceremony plan.
 // Pure planning + thin DB writes. MCP tools call these; no hidden side effects beyond returns.
 
-import type { Capability, Env } from '../types'
+import type { Capability, Env, Task } from '../types'
 import { upsertCapabilityGrant } from '../members/service'
+import { createTask } from '../tasks/service'
 import { bindMemberHermesAgent } from './bindings'
 import type { MemberHermesBinding } from './bindings'
 
 const SEATABLE: ReadonlySet<Capability> = new Set(['observer', 'member', 'lead', 'admin'])
+
+/** Gate capability string for owner ACT on architect stand-ups (owner/admin always pass verdict). */
+export const ARCHITECT_GATE_OWNER = 'gate:architect'
 
 export interface SeatMemberInput {
   memberId: string
@@ -25,6 +29,18 @@ export interface ArchitectCeremonyPlan {
   steps: readonly string[]
   tools: readonly string[]
   rule: string
+}
+
+export interface ArchitectStandupGateInput {
+  squadId: string
+  departmentSlug: string
+  squadSlug: string
+  agentSlug: string
+  requesterMemberId: string
+  departmentName: string | null
+  squadName: string | null
+  agentName: string | null
+  actorMemberId: string
 }
 
 /** Deterministic ceremony checklist KayHermes (and docs) follow. */
@@ -55,10 +71,55 @@ export function architectCeremonyPlan(input: {
       'mint_agent_token',
       'seat_member_on_squad',
       'bind_member_hermes_agent',
+      'request_architect_standup',
     ],
     rule:
-      'Always seat the requesting member. Never leave an orphan squad. If caller lacks admin, open a gated owner-ACT task instead of creating structure.',
+      'Always seat the requesting member. Never leave an orphan squad. If caller lacks admin, call request_architect_standup (gated owner-ACT) instead of creating structure.',
   }
+}
+
+/** Open a review task for owner ACT when the caller cannot provision structure directly. */
+export async function openArchitectStandupGate(
+  env: Env,
+  input: ArchitectStandupGateInput,
+): Promise<{ task: Task; plan: ArchitectCeremonyPlan }> {
+  const plan = architectCeremonyPlan({
+    departmentSlug: input.departmentSlug,
+    squadSlug: input.squadSlug,
+    agentSlug: input.agentSlug,
+    requesterMemberId: input.requesterMemberId,
+  })
+  const title = `Architect standup: ${input.departmentSlug.trim()}/${input.squadSlug.trim()}/${input.agentSlug.trim()}`
+  const bodyLines = [
+    'Gated owner-ACT: create department → squad → Hermes agent, then seat the requester.',
+    `requester_member_id: ${input.requesterMemberId.trim()}`,
+    `department_slug: ${input.departmentSlug.trim()}`,
+    input.departmentName ? `department_name: ${input.departmentName.trim()}` : null,
+    `squad_slug: ${input.squadSlug.trim()}`,
+    input.squadName ? `squad_name: ${input.squadName.trim()}` : null,
+    `agent_slug: ${input.agentSlug.trim()}`,
+    input.agentName ? `agent_name: ${input.agentName.trim()}` : null,
+    '',
+    'Ceremony steps:',
+    ...plan.steps.map((s, i) => `${i + 1}. ${s}`),
+    '',
+    `gate_owner: ${ARCHITECT_GATE_OWNER}`,
+  ].filter((line): line is string => line !== null)
+
+  const task = await createTask(
+    env,
+    {
+      squad_id: input.squadId,
+      title,
+      body: bodyLines.join('\n'),
+      done_when:
+        'Owner approved this gate; department, squad, and Hermes agent exist; requester is seated on the squad with a hermes binding.',
+      status: 'review',
+      gate_owner: ARCHITECT_GATE_OWNER,
+    },
+    { actor: { kind: 'member', id: input.actorMemberId } },
+  )
+  return { task, plan }
 }
 
 export function assertSeatableCapability(raw: string): Capability {

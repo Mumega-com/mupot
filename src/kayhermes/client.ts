@@ -39,6 +39,8 @@ export interface KayhermesMessage {
 export interface KayhermesConfig {
   baseUrl: string
   apiKey: string
+  /** Optional member-scoped Hermes memory key (Open WebUI / IM). Never use owner key as identity. */
+  sessionKey: string | null
 }
 
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
@@ -62,7 +64,7 @@ export function resolveKayhermesConfig(env: Env): KayhermesConfig {
     const code = e instanceof Error ? e.message : 'url_invalid'
     throw new KayhermesClientError(code, 503, `invalid KAYHERMES_API_URL: ${code}`)
   }
-  return { baseUrl: base.toString().replace(/\/$/, ''), apiKey }
+  return { baseUrl: base.toString().replace(/\/$/, ''), apiKey, sessionKey: null }
 }
 
 export function assertSessionId(raw: string): string {
@@ -82,11 +84,15 @@ export function assertChatInput(raw: string): string {
   return text
 }
 
-function authHeaders(apiKey: string): HeadersInit {
-  return {
-    authorization: `Bearer ${apiKey}`,
+function authHeaders(config: KayhermesConfig): HeadersInit {
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${config.apiKey}`,
     accept: 'application/json',
   }
+  if (config.sessionKey) {
+    headers['X-Hermes-Session-Key'] = config.sessionKey
+  }
+  return headers
 }
 
 async function readJson(res: Response): Promise<unknown> {
@@ -244,7 +250,7 @@ export async function listSessions(
   })
   const res = await upstream(config, `/api/sessions?${qs.toString()}`, {
     method: 'GET',
-    headers: authHeaders(config.apiKey),
+    headers: authHeaders(config),
   })
   const body = await expectOk(res)
   return normalizeSessionsPayload(body)
@@ -257,7 +263,7 @@ export async function createSession(
   const res = await upstream(config, '/api/sessions', {
     method: 'POST',
     headers: {
-      ...authHeaders(config.apiKey),
+      ...authHeaders(config),
       'content-type': 'application/json',
     },
     body: JSON.stringify(title ? { title } : {}),
@@ -275,7 +281,7 @@ export async function listMessages(
   const id = assertSessionId(sessionId)
   const res = await upstream(config, `/api/sessions/${encodeURIComponent(id)}/messages`, {
     method: 'GET',
-    headers: authHeaders(config.apiKey),
+    headers: authHeaders(config),
   })
   const body = await expectOk(res)
   return normalizeMessagesPayload(body)
@@ -291,7 +297,7 @@ export async function chatTurn(
   const res = await upstream(config, `/api/sessions/${encodeURIComponent(id)}/chat`, {
     method: 'POST',
     headers: {
-      ...authHeaders(config.apiKey),
+      ...authHeaders(config),
       'content-type': 'application/json',
     },
     body: JSON.stringify({ input: text }),

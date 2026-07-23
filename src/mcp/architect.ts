@@ -13,7 +13,9 @@ import {
 import {
   architectCeremonyPlan,
   assertSeatableCapability,
+  openArchitectStandupGate,
   seatMemberOnSquad,
+  ARCHITECT_GATE_OWNER,
 } from '../hermes-surfaces/architect'
 import {
   bindMemberHermesAgent,
@@ -204,6 +206,76 @@ const toolArchitectCeremony: ToolSpec = {
   },
 }
 
+const toolRequestArchitectStandup: ToolSpec = {
+  name: 'request_architect_standup',
+  scope: 'squad',
+  min: 'member',
+  args:
+    '{ squad_id: string (host squad for the gate task), department_slug: string, squad_slug: string, agent_slug: string, requester_member?: string (id|email), department_name?: string, squad_name?: string, agent_name?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      squad_id: STRING_SCHEMA,
+      department_slug: STRING_SCHEMA,
+      squad_slug: STRING_SCHEMA,
+      agent_slug: STRING_SCHEMA,
+      requester_member: STRING_SCHEMA,
+      department_name: STRING_SCHEMA,
+      squad_name: STRING_SCHEMA,
+      agent_name: STRING_SCHEMA,
+    },
+    required: ['squad_id', 'department_slug', 'squad_slug', 'agent_slug'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const hostSquadId = str(args.squad_id)
+    const departmentSlug = str(args.department_slug)
+    const squadSlug = str(args.squad_slug)
+    const agentSlug = str(args.agent_slug)
+    if (!hostSquadId || !departmentSlug || !squadSlug || !agentSlug) return fail(400, 'invalid_args')
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, hostSquadId, 'member'))) {
+      return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
+    }
+
+    const actorId = typeof auth.memberId === 'string' ? auth.memberId.trim() : ''
+    if (!actorId) return fail(401, 'member_required')
+
+    let requesterId = actorId
+    const requesterRef = str(args.requester_member)
+    if (requesterRef) {
+      const resolved = await resolveMemberRef(env, requesterRef)
+      if (!resolved.ok) return fail(404, 'member_not_found')
+      requesterId = resolved.id
+    }
+
+    try {
+      const { task, plan } = await openArchitectStandupGate(env, {
+        squadId: hostSquadId,
+        departmentSlug,
+        squadSlug,
+        agentSlug,
+        requesterMemberId: requesterId,
+        departmentName: str(args.department_name) || null,
+        squadName: str(args.squad_name) || null,
+        agentName: str(args.agent_name) || null,
+        actorMemberId: actorId,
+      })
+      return done({
+        task,
+        plan,
+        gate_owner: ARCHITECT_GATE_OWNER,
+        hint: 'Owner/admin must approve this review task, then run the ceremony steps and seat the requester.',
+      })
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'gate_open_failed'
+      if (msg.startsWith('done_when_required')) return fail(400, 'done_when_required', msg)
+      return fail(500, 'gate_open_failed', msg)
+    }
+  },
+}
+
 const toolGetMemberHermesBinding: ToolSpec = {
   name: 'get_member_hermes_binding',
   scope: 'org',
@@ -229,5 +301,6 @@ export const ARCHITECT_TOOLS: ToolSpec[] = [
   toolSeatMemberOnSquad,
   toolBindMemberHermesAgent,
   toolArchitectCeremony,
+  toolRequestArchitectStandup,
   toolGetMemberHermesBinding,
 ]
