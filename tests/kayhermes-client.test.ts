@@ -4,9 +4,11 @@ import {
   assertSessionId,
   extractChatReply,
   kayhermesConfigured,
+  listSessions,
   normalizeMessagesPayload,
   normalizeSession,
   normalizeSessionsPayload,
+  probeHealth,
   resolveKayhermesConfig,
   KayhermesClientError,
 } from '../src/kayhermes/client'
@@ -109,5 +111,53 @@ describe('input guards', () => {
     expect(assertChatInput(' hi ')).toBe('hi')
     expect(() => assertChatInput('   ')).toThrow(KayhermesClientError)
     expect(() => assertChatInput('x'.repeat(8001))).toThrow(KayhermesClientError)
+  })
+})
+
+describe('upstream redirect SSRF guard', () => {
+  const cfg = {
+    baseUrl: 'https://kayhermes-api.example.com',
+    apiKey: 'secret',
+    sessionKey: null as string | null,
+  }
+
+  it('passes redirect:manual and refuses 302 Location chase', async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = []
+    const prev = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init })
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'http://169.254.169.254/' },
+      })
+    }) as typeof fetch
+    try {
+      await expect(listSessions(cfg, { limit: 10, offset: 0 })).rejects.toMatchObject({
+        code: 'redirect_blocked',
+      })
+      expect(calls).toHaveLength(1)
+      expect(calls[0].init).toMatchObject({ redirect: 'manual' })
+    } finally {
+      globalThis.fetch = prev
+    }
+  })
+
+  it('refuses opaqueredirect responses', async () => {
+    const prev = globalThis.fetch
+    globalThis.fetch = (async () => {
+      const res = {
+        ok: false,
+        status: 0,
+        type: 'opaqueredirect',
+        headers: new Headers(),
+        text: async () => '',
+      }
+      return res as unknown as Response
+    }) as typeof fetch
+    try {
+      await expect(probeHealth(cfg)).rejects.toMatchObject({ code: 'redirect_blocked' })
+    } finally {
+      globalThis.fetch = prev
+    }
   })
 })

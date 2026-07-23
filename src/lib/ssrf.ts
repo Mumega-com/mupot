@@ -72,3 +72,14 @@ export function assertPublicHttpsUrl(raw: string): URL {
   if (isPrivateHost(u.hostname)) throw new Error('url_private_host')
   return u
 }
+
+/** Soft variant for href rendering — returns null instead of throwing on bad/unsafe URLs. */
+export function safePublicHttpsHref(raw: string | null | undefined): string | null {
+  const trimmed = typeof raw === 'string' ? raw.trim() : ''
+  if (!trimmed) return null
+  try {
+    return assertPublicHttpsUrl(trimmed).toString()
+  } catch {
+    return null
+  }
+}

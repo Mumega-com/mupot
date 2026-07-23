@@ -6,6 +6,7 @@ import type { Env } from '../types'
 import { emptyState, pageHeader, sectionPanel } from './ui'
 import type { Html } from './ui'
 import type { KayhermesSession } from '../kayhermes/client'
+import { safePublicHttpsHref } from '../lib/ssrf'
 
 export interface KayhermesPageStatus {
   configured: boolean
@@ -17,8 +18,9 @@ export interface KayhermesPageStatus {
 
 export function kayhermesBody(env: Env, status: KayhermesPageStatus): Html {
   void env
-  const dashLink = status.dashboardUrl
-    ? html`<p class="ui-sub"><a class="ui-link" href="${status.dashboardUrl}" target="_blank" rel="noopener">Open native Hermes dashboard →</a> (owner ops: keys, skills, TUI)</p>`
+  const dashHref = safePublicHttpsHref(status.dashboardUrl)
+  const dashLink = dashHref
+    ? html`<p class="ui-sub"><a class="ui-link" href="${dashHref}" target="_blank" rel="noopener">Open native Hermes dashboard →</a> (owner ops: keys, skills, TUI)</p>`
     : html`<p class="ui-sub">Native Hermes dashboard URL not set (<code>HERMES_DASHBOARD_URL</code>). See agents/kayhermes/ENABLE-DASHBOARD.md.</p>`
 
   if (!status.configured) {

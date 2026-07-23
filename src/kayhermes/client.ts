@@ -215,17 +215,31 @@ export function extractChatReply(payload: unknown): string {
   return ''
 }
 
+/**
+ * Outbound Hermes fetch. Always uses `redirect: 'manual'` and refuses 3xx /
+ * opaqueredirect — assertPublicHttpsUrl only validates the configured origin at
+ * parse time; default redirect-following would chase Location to an internal
+ * target (same class as #528 / cmsFetch).
+ */
 async function upstream(
   config: KayhermesConfig,
   path: string,
   init: RequestInit,
 ): Promise<Response> {
   const url = `${config.baseUrl}${path.startsWith('/') ? path : `/${path}`}`
+  let res: Response
   try {
-    return await fetch(url, init)
+    res = await fetch(url, { ...init, redirect: 'manual' })
   } catch {
     throw new KayhermesClientError('unreachable', 502, 'kayhermes API unreachable')
   }
+  // `as string`: workers-types narrows Response.type to "default"|"error"; vitest/undici
+  // mocks may carry 'opaqueredirect'.
+  const resType = res.type as string
+  if (resType === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
+    throw new KayhermesClientError('redirect_blocked', 502, 'kayhermes upstream redirect refused')
+  }
+  return res
 }
 
 async function expectOk(res: Response): Promise<unknown> {

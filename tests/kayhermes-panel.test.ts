@@ -60,4 +60,29 @@ describe('kayhermesBody', () => {
     expect(out).not.toContain('<script>alert(1)</script>')
     expect(out).toContain('&lt;script&gt;')
   })
+
+  it('rejects javascript: and non-https dashboard URLs', async () => {
+    const bad = await render(
+      kayhermesBody({} as Env, {
+        configured: false,
+        healthy: null,
+        sessions: [],
+        error: null,
+        dashboardUrl: 'javascript:alert(1)',
+      }),
+    )
+    expect(bad).not.toContain('javascript:alert')
+    expect(bad).toContain('HERMES_DASHBOARD_URL')
+
+    const http = await render(
+      kayhermesBody({} as Env, {
+        configured: false,
+        healthy: null,
+        sessions: [],
+        error: null,
+        dashboardUrl: 'http://hermes.example.com',
+      }),
+    )
+    expect(http).not.toContain('href="http://hermes.example.com"')
+  })
 })

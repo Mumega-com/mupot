@@ -167,7 +167,7 @@ import {
   listConnectors,
 } from '../connectors/service'
 import { isConnectorType, isConnectorScopeType } from '../connectors/crypto'
-import { assertPublicHttpsUrl } from '../lib/ssrf'
+import { assertPublicHttpsUrl, safePublicHttpsHref } from '../lib/ssrf'
 import { bindMemberHermesAgent, getMemberHermesBinding, HermesSurfacesError } from '../hermes-surfaces/bindings'
 import { githubCapabilitySnapshot } from '../integrations/github-capabilities'
 import { writeAgentDef, assignIssueToCopilot } from '../integrations/github-repo-write'
@@ -1151,7 +1151,8 @@ dashboardApp.get('/agents/kayhermes', async (c) => {
     healthy: null,
     sessions: [],
     error: null,
-    dashboardUrl: c.env.HERMES_DASHBOARD_URL?.trim() || null,
+    // Owner-only surface: only render a public-HTTPS dashboard href (reject javascript:/private).
+    dashboardUrl: safePublicHttpsHref(c.env.HERMES_DASHBOARD_URL),
   }
   if (status.configured) {
     try {
@@ -1214,6 +1215,17 @@ dashboardApp.post('/agents/byoa/attach', async (c) => {
     return failRedirect(e instanceof Error ? e.message : 'invalid_api_url')
   }
 
+  // Bind first when a member is named so a failed capability/tenant check never leaves
+  // a live hermes_api credential behind (ghost-connector class). Connector is committed after.
+  if (memberId) {
+    try {
+      await bindMemberHermesAgent(c.env, { memberId, agentId })
+    } catch (e) {
+      const code = e instanceof HermesSurfacesError ? e.code : 'bind_failed'
+      return failRedirect(code)
+    }
+  }
+
   const result = await addConnector(c.env, {
     type: 'hermes_api',
     label: `hermes-api-${agentId.slice(0, 8)}`,
@@ -1225,14 +1237,6 @@ dashboardApp.post('/agents/byoa/attach', async (c) => {
   })
   if (!result.ok) return failRedirect(`connector_${result.error}`)
 
-  if (memberId) {
-    try {
-      await bindMemberHermesAgent(c.env, { memberId, agentId })
-    } catch (e) {
-      const code = e instanceof HermesSurfacesError ? e.code : 'bind_failed'
-      return failRedirect(code)
-    }
-  }
   return c.redirect('/agents/byoa?ok=1')
 })
 
@@ -3276,9 +3280,6 @@ function shell(
               <a class="nav-child" href="/admin/divisions">Squads</a>
               <a class="nav-child" href="/agents">Agents</a>
               <a class="nav-child" href="/agents/kayhermes">KayHermes chat</a>
-              ${env.HERMES_DASHBOARD_URL?.trim()
-                ? html`<a class="nav-child" href="${env.HERMES_DASHBOARD_URL.trim()}" target="_blank" rel="noopener">Hermes dashboard</a>`
-                : ''}
               <a class="nav-child" href="/agents/byoa">BYOA Hermes</a>
             </div>
           </div>

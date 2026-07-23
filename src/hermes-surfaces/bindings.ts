@@ -6,6 +6,7 @@
 
 import type { Env } from '../types'
 import { assertPublicHttpsUrl } from '../lib/ssrf'
+import { canOnSquad, resolveCapabilities } from '../auth/capability'
 import { resolveConnectorWithMeta } from '../connectors/service'
 
 export interface MemberHermesBinding {
@@ -71,12 +72,26 @@ export async function bindMemberHermesAgent(
     .first<{ id: string }>()
   if (!member) throw new HermesSurfacesError('member_not_found', 'active member not found')
 
+  // Join through squads so a dangling agent row (no squad in this pot's D1) cannot bind.
+  // Agents are pot-local (no tenant column); the squad join is the tenant fence.
   const agent = await env.DB.prepare(
-    `SELECT id FROM agents WHERE id = ?1 LIMIT 1`,
+    `SELECT a.id AS id, a.squad_id AS squad_id
+       FROM agents a
+       INNER JOIN squads s ON s.id = a.squad_id
+      WHERE a.id = ?1
+      LIMIT 1`,
   )
     .bind(agentId)
-    .first<{ id: string }>()
+    .first<{ id: string; squad_id: string }>()
   if (!agent) throw new HermesSurfacesError('agent_not_found', 'agent not found')
+
+  const grants = await resolveCapabilities(env, memberId)
+  if (!(await canOnSquad(env, grants, agent.squad_id, 'member'))) {
+    throw new HermesSurfacesError(
+      'member_not_on_squad',
+      'member must hold member+ on the agent squad before binding',
+    )
+  }
 
   const now = new Date().toISOString()
   await env.DB.prepare(
