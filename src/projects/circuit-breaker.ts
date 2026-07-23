@@ -86,15 +86,19 @@ export function isAtCycleBoundary(cycleBoundaryAt: string | null, nowIso: string
 }
 
 /**
- * Breaker evaluates only at/after the boundary for non-terminal projects.
+ * Breaker evaluates at/after the boundary for non-terminal projects, OR early
+ * when the stall detector has raised projects.stalled=1 (slice 4). Early raise
+ * still requires a scheduled cycle_boundary_at — the flag alone never kills.
  * completed is exempt (structural finish path). archived is already terminal.
  */
 export function shouldEvaluateBreaker(
   status: ProjectStatus,
   cycleBoundaryAt: string | null,
   nowIso: string,
+  stalled: number,
 ): boolean {
   if (status === 'completed' || status === 'archived' || status === 'review') return false
+  if (stalled === 1 && cycleBoundaryAt !== null && cycleBoundaryAt.trim() !== '') return true
   return isAtCycleBoundary(cycleBoundaryAt, nowIso)
 }
 
@@ -185,15 +189,16 @@ export function defaultCircuitBreakerDeps(): CircuitBreakerDeps {
 }
 
 /**
- * At a due boundary: receipted recommit → keep status; else kill receipt + archive.
+ * At a due boundary (or early when stalled): receipted recommit → keep status;
+ * else kill receipt + archive. Stall never auto-fixes — it only advances this check.
  */
 export async function evaluateProjectCircuitBreaker(
   env: Env,
-  project: Pick<Project, 'id' | 'status' | 'cycle_boundary_at'>,
+  project: Pick<Project, 'id' | 'status' | 'cycle_boundary_at' | 'stalled'>,
   nowIso: string,
   deps: CircuitBreakerDeps,
 ): Promise<CircuitBreakerOutcome> {
-  if (!shouldEvaluateBreaker(project.status, project.cycle_boundary_at, nowIso)) {
+  if (!shouldEvaluateBreaker(project.status, project.cycle_boundary_at, nowIso, project.stalled)) {
     return 'skipped'
   }
   const boundaryAt = project.cycle_boundary_at

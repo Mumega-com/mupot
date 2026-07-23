@@ -264,7 +264,7 @@ export default {
     //  9. Project lifecycle circuit breaker (slice 1) — at cycle_boundary_at, if
     //     status ≠ completed and no receipted recommit, kill → archived (Shape Up
     //     inversion). Receipts go through workflow_receipts; see
-    //     src/projects/circuit-breaker.ts + src/projects/loop.ts.
+    //     src/projects/circuit-breaker.ts + stall-detector.ts + loop.ts.
     ctx.waitUntil(reconcileMembership(env))
     ctx.waitUntil(runMetabolism(env))
     ctx.waitUntil(runLoopsTick(env))
