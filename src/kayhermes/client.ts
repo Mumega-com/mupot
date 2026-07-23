@@ -5,7 +5,9 @@
 // chat history and run turns without embedding the Hermes TUI.
 //
 // Security: KAYHERMES_API_URL is env-sourced and MUST pass assertPublicHttpsUrl
-// (Cloudflare Worker cannot reach VPS loopback anyway). The API key never leaves
+// (Cloudflare Worker cannot reach VPS loopback anyway). upstream() also uses
+// redirect:'manual' and refuses every 3xx so a public origin cannot bounce the
+// Worker onto 127.0.0.1 / 169.254.169.254 / RFC1918. The API key never leaves
 // the Worker.
 
 import { assertPublicHttpsUrl } from '../lib/ssrf'
@@ -43,6 +45,8 @@ export interface KayhermesConfig {
 
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
 const MAX_INPUT_CHARS = 8000
+/** Bound hung upstreams (health + chat). Chat turns can be slow; keep generous. */
+const UPSTREAM_TIMEOUT_MS = 60_000
 
 export function kayhermesConfigured(env: Env): boolean {
   return Boolean(env.KAYHERMES_API_URL?.trim() && env.KAYHERMES_API_KEY?.trim())
@@ -215,10 +219,29 @@ async function upstream(
   init: RequestInit,
 ): Promise<Response> {
   const url = `${config.baseUrl}${path.startsWith('/') ? path : `/${path}`}`
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS)
   try {
-    return await fetch(url, init)
-  } catch {
+    // Force redirect:'manual' after ...init so callers cannot opt back into follow.
+    // Parse-time assertPublicHttpsUrl alone is not enough: a 3xx Location to an
+    // internal host would be followed under the default redirect:'follow'.
+    const res = await fetch(url, {
+      ...init,
+      redirect: 'manual',
+      signal: controller.signal,
+    })
+    // Workers return real 3xx under redirect:'manual'; vitest/undici mocks may
+    // use type 'opaqueredirect' (status 0). Refuse both — never follow.
+    const resType = res.type as string
+    if (resType === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
+      throw new KayhermesClientError('redirect_blocked', 502, 'upstream redirect refused')
+    }
+    return res
+  } catch (e) {
+    if (e instanceof KayhermesClientError) throw e
     throw new KayhermesClientError('unreachable', 502, 'kayhermes API unreachable')
+  } finally {
+    clearTimeout(timer)
   }
 }
 

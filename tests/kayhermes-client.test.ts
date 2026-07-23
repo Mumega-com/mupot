@@ -1,9 +1,10 @@
-import { describe, it, expect } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   assertChatInput,
   assertSessionId,
   extractChatReply,
   kayhermesConfigured,
+  listSessions,
   normalizeMessagesPayload,
   normalizeSession,
   normalizeSessionsPayload,
@@ -108,5 +109,54 @@ describe('input guards', () => {
     expect(assertChatInput(' hi ')).toBe('hi')
     expect(() => assertChatInput('   ')).toThrow(KayhermesClientError)
     expect(() => assertChatInput('x'.repeat(8001))).toThrow(KayhermesClientError)
+  })
+})
+
+describe('upstream redirect SSRF hardening', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('refuses a 3xx upstream (does not follow Location to an internal host)', async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(null, {
+          status: 302,
+          headers: { location: 'http://169.254.169.254/latest/meta-data/' },
+        }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const config = resolveKayhermesConfig({
+      KAYHERMES_API_URL: 'https://kayhermes-api.example.com',
+      KAYHERMES_API_KEY: 'secret',
+    } as Env)
+
+    await expect(listSessions(config, { limit: 10, offset: 0 })).rejects.toMatchObject({
+      code: 'redirect_blocked',
+      status: 502,
+    })
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    const init = fetchMock.mock.calls[0][1] as RequestInit
+    expect(init.redirect).toBe('manual')
+    expect(init.signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('refuses browser-style opaqueredirect responses', async () => {
+    const opaque = { type: 'opaqueredirect', status: 0, ok: false } as unknown as Response
+    const fetchMock = vi.fn(async () => opaque)
+    vi.stubGlobal('fetch', fetchMock)
+
+    const config = resolveKayhermesConfig({
+      KAYHERMES_API_URL: 'https://kayhermes-api.example.com',
+      KAYHERMES_API_KEY: 'secret',
+    } as Env)
+
+    await expect(listSessions(config, { limit: 10, offset: 0 })).rejects.toMatchObject({
+      code: 'redirect_blocked',
+    })
+    expect(fetchMock).toHaveBeenCalledOnce()
   })
 })
