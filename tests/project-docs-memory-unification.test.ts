@@ -165,7 +165,7 @@ describe('docs↔memory unification (one store)', () => {
 
   it('a doc written via the docs path is retrievable via project_recall', async () => {
     const { env, engrams, vectors } = makeEnv()
-    const doc = await writeProjectDoc(env, PROJECT_ID, 'docs-path fact for the mubot', ['docs'])
+    const doc = await writeProjectDoc(env, PROJECT_ID, 'docs-path fact for the mubot', ['docs'], null)
     expect(doc.scope).toBe(`project:${PROJECT_ID}`)
     expect(engrams[0]).toMatchObject({
       agent_id: `project:${PROJECT_ID}`,

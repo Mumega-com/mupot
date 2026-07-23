@@ -29,6 +29,7 @@ const pages = [
   '/',
   '/projects',
   '/projects/project-mupot',
+  '/projects/project-mupot/docs',
   '/send',
   '/approvals',
   '/loops',
@@ -270,6 +271,16 @@ async function runProjectWorkspaceWorkflow() {
       fail('project-filtered work link missing', { href, detailText })
     }
   }
+  for (const href of [
+    '/send?project_id=project-mupot',
+    '/projects/project-mupot/docs',
+    '/projects/project-mupot#board',
+  ]) {
+    if (await page.locator(`nav[aria-label="Owner surfaces"] a[href="${href}"]`).count() === 0) {
+      fail('owner surface link missing (chat/docs/board)', { href, detailText })
+    }
+  }
+
   const activityText = await textSnippet(page.locator('#activity'), 4000)
   if (!activityText.includes('In-progress local task') || !activityText.includes('Run local browser smoke')) {
     fail('project Activity did not render attributed task and flight rows', { activityText })
@@ -334,6 +345,53 @@ async function runProjectWorkspaceWorkflow() {
   if (JSON.stringify(teamPresence) !== JSON.stringify(expectedTeamPresence)) {
     fail('browser Team presence labels do not match seeded runtime truth', { teamPresence, expectedTeamPresence })
   }
+
+  // Docs slice 3 — seed tiered knowledge, then assert the Docs view returns
+  // public+project to this viewer and omits private/entity they lack claims for.
+  async function seedProjectDoc(text, tierFields) {
+    const response = await context.request.post(`${baseUrl}/api/projects/project-mupot/docs`, {
+      headers: { 'content-type': 'application/json' },
+      data: { text, ...tierFields },
+      timeout: 20_000,
+    })
+    const json = await response.json().catch(() => null)
+    if (response.status() !== 201 || !json?.doc?.id) {
+      fail('project docs seed write failed', { text, tierFields, status: response.status(), json })
+    }
+    return json.doc
+  }
+  await seedProjectDoc('VISIBLE_PUBLIC_MARKER', { tier: 'public' })
+  await seedProjectDoc('VISIBLE_PROJECT_MARKER', { tier: 'project' })
+  await seedProjectDoc('HIDDEN_PRIVATE_MARKER', { tier: 'private', created_by: 'other-user-not-viewer' })
+  await seedProjectDoc('HIDDEN_ENTITY_MARKER', { tier: 'entity', entity_id: 'entity-secret-not-claimed' })
+
+  await page.goto(`${baseUrl}/projects/project-mupot/docs`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const docsText = await textSnippet(page.locator('body'), 8000)
+  if (!docsText.includes('VISIBLE_PUBLIC_MARKER') || !docsText.includes('VISIBLE_PROJECT_MARKER')) {
+    fail('Docs view missing public+project markers the viewer should see', { docsText })
+  }
+  if (docsText.includes('HIDDEN_PRIVATE_MARKER') || docsText.includes('HIDDEN_ENTITY_MARKER')) {
+    fail('Docs view must not include HIDDEN_PRIVATE_MARKER / HIDDEN_ENTITY_MARKER (RBAC omit, not CSS)', {
+      docsText,
+    })
+  }
+  const docsApi = await context.request.get(`${baseUrl}/api/projects/project-mupot/docs?limit=50`, {
+    timeout: 20_000,
+  })
+  const docsJson = await docsApi.json().catch(() => null)
+  const apiTexts = (docsJson?.docs ?? []).map((doc) => doc.text)
+  if (docsApi.status() !== 200) {
+    fail('project docs API list failed', { status: docsApi.status(), docsJson })
+  }
+  if (!apiTexts.includes('VISIBLE_PUBLIC_MARKER') || !apiTexts.includes('VISIBLE_PROJECT_MARKER')) {
+    fail('Docs API missing public+project markers', { apiTexts })
+  }
+  if (apiTexts.includes('HIDDEN_PRIVATE_MARKER') || apiTexts.includes('HIDDEN_ENTITY_MARKER')) {
+    fail('Docs API must not include HIDDEN_PRIVATE_MARKER / HIDDEN_ENTITY_MARKER', { apiTexts })
+  }
+
+  await page.goto(`${baseUrl}/projects/project-mupot`, { waitUntil: 'networkidle', timeout: 20_000 })
+
   const surfaceParity = {
     projectId: 'project-mupot',
     comparedFields: [
