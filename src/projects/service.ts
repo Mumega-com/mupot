@@ -174,6 +174,9 @@ export async function createProject(
     status,
     parent_project_id: parentProjectId as string | null,
     target_date: targetDate,
+    cycle_boundary_at: null,
+    stalled: 0,
+    stall_threshold_days: null,
     created_at: now,
     updated_at: now,
   }
@@ -210,7 +213,8 @@ export async function listProjects(env: Env, options: ListProjectsOptions = {}):
     where.push(options.parent_project_id === null ? 'parent_project_id IS NULL' : 'parent_project_id = ?')
     if (options.parent_project_id !== null) values.push(options.parent_project_id)
   }
-  const sql = `SELECT id, slug, name, description, goal, status, parent_project_id, target_date, created_at, updated_at
+  const sql = `SELECT id, slug, name, description, goal, status, parent_project_id, target_date,
+      cycle_boundary_at, stalled, stall_threshold_days, created_at, updated_at
     FROM projects ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
     ORDER BY parent_project_id IS NOT NULL, created_at, id`
   const result = await env.DB.prepare(sql).bind(...values).all<Project>()
@@ -219,7 +223,8 @@ export async function listProjects(env: Env, options: ListProjectsOptions = {}):
 
 export async function getProject(env: Env, id: string): Promise<Project | null> {
   return env.DB.prepare(
-    `SELECT id, slug, name, description, goal, status, parent_project_id, target_date, created_at, updated_at
+    `SELECT id, slug, name, description, goal, status, parent_project_id, target_date,
+            cycle_boundary_at, stalled, stall_threshold_days, created_at, updated_at
      FROM projects WHERE id = ?`,
   ).bind(id).first<Project>()
 }
