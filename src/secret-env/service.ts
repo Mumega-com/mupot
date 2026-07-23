@@ -132,6 +132,22 @@ async function writeSecretEnvAudit(
     .run()
 }
 
+// D1 surfaces UNIQUE constraint failures as an Error whose message contains
+// "UNIQUE constraint failed". Concurrent same-name requests can pass the
+// pre-check and still collide on UNIQUE (tenant, binding_name) — map to a stable
+// conflict code instead of a 500.
+function isSecretEnvBindingUniqueViolation(err: unknown): boolean {
+  const messages: string[] = []
+  let current: unknown = err
+  while (current instanceof Error) {
+    messages.push(current.message)
+    current = current.cause
+  }
+  const combined = messages.join(' ')
+  if (/UNIQUE constraint failed/i.test(combined)) return true
+  return /constraint failed/i.test(combined) && /secret_env_bindings/i.test(combined)
+}
+
 // ── requestSecretEnv ─────────────────────────────────────────────────────────
 
 export interface RequestSecretEnvParams {
@@ -237,7 +253,14 @@ export async function requestSecretEnv(
 
   // Atomic: the request row and every one of its binding rows land together
   // or not at all — no partial request-with-no-bindings state is observable.
-  await env.DB.batch(statements)
+  try {
+    await env.DB.batch(statements)
+  } catch (err) {
+    if (isSecretEnvBindingUniqueViolation(err)) {
+      return { ok: false, error: 'binding_name_conflict' }
+    }
+    throw err
+  }
 
   await writeSecretEnvAudit(env, {
     requestId: id,

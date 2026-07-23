@@ -328,6 +328,23 @@ describe('requestSecretEnv', () => {
     expect(second.error).toBe('binding_name_conflict')
   })
 
+  it('returns binding_name_conflict when batch hits a UNIQUE constraint (concurrent race)', async () => {
+    const { env } = makeEnv()
+    const uniqueErr = new Error(
+      'D1_ERROR: UNIQUE constraint failed: secret_env_bindings.tenant, secret_env_bindings.binding_name',
+    )
+    env.DB.batch = async () => {
+      throw uniqueErr
+    }
+
+    const result = await requestSecretEnv(env, {
+      keys: validKeys, reason: 'r1', adapterHint: null, requestedBy: 'agent-1',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error()
+    expect(result.error).toBe('binding_name_conflict')
+  })
+
   it('allows re-requesting a name that was revoked (reuses the row, back to pending)', async () => {
     const { env, bindings } = makeEnv()
     const first = await requestSecretEnv(env, {
