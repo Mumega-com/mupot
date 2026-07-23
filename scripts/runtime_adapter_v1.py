@@ -4,9 +4,10 @@
 Contract: docs/runtime-adapter-contract.md + docs/runtime-adapter-v1.json
 
 This is the REFERENCE adapter every later harness copies. Drivers (cursor,
-mumcp, …) import this module instead of hand-rolling MCP/attach/land-at-review
-glue. Identity, tenant, and capabilities are ALWAYS server-derived
-(boot_context / attach ack) — local config is input for proof, never authority.
+mumcp/claude-code, codex, …) import this module instead of hand-rolling
+MCP/attach/land-at-review glue. Identity, tenant, and capabilities are ALWAYS
+server-derived (boot_context / attach ack) — local config is input for proof,
+never authority.
 
 Hard rails (non-negotiable):
   - land work at status=review behind gate_owner

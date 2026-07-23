@@ -7,10 +7,13 @@ const read = (rel: string) => readFileSync(new URL(rel, root), 'utf8')
 const adapter = read('scripts/runtime_adapter_v1.py')
 const cursorWorker = read('scripts/cursor-worker.py')
 const mumcpWorker = read('scripts/mumcp-worker.py')
+const codexWorker = read('scripts/codex-worker.py')
 const attachRoutes = read('src/fleet/attach-routes.ts')
 const contractMd = read('docs/runtime-adapter-contract.md')
+const codexToml = read('connectors/codex/config.toml')
+const codexReadme = read('connectors/codex/README.md')
 
-describe('runtime-adapter/v1 reference drivers (BYOA slice 1 de-drift)', () => {
+describe('runtime-adapter/v1 reference drivers (BYOA topology A)', () => {
   it('ships a shared reference adapter declaring the contract + signed attach domain', () => {
     expect(adapter).toContain('CONTRACT_ID = "runtime-adapter/v1"')
     expect(adapter).toContain('SIGNED_ATTACH_DOMAIN = "fleet-attach:v1"')
@@ -70,14 +73,52 @@ describe('runtime-adapter/v1 reference drivers (BYOA slice 1 de-drift)', () => {
     expect(mumcpWorker).not.toMatch(/npm run deploy|gh pr merge/)
   })
 
-  it('accepts cursor as a declared attach runtime type on the pot', () => {
-    expect(attachRoutes).toMatch(/VALID_RUNTIMES = new Set\(\[[\s\S]*'cursor'/)
-    expect(contractMd).toContain('`cursor`')
+  it('ships codex-worker on the reference adapter with runtime=codex (BYOA slice 2)', () => {
+    expect(codexWorker).toContain('from runtime_adapter_v1 import')
+    expect(codexWorker).toContain('CONTRACT_ID')
+    expect(codexWorker).toContain('SIGNED_ATTACH_DOMAIN')
+    expect(codexWorker).toContain('RUNTIME_TYPE = "codex"')
+    expect(codexWorker).toContain('boot_session(')
+    expect(codexWorker).toContain('poll_open_tasks(')
+    expect(codexWorker).toContain('land_at_review(')
+    expect(codexWorker).toContain('claim_in_progress(')
+    expect(codexWorker).toContain('"exec"')
+    expect(codexWorker).toContain('"--sandbox"')
+    expect(codexWorker).toContain('"--json"')
+    expect(codexWorker).toContain('worktree", "add"')
+    expect(codexWorker).toContain('npx", "tsc", "--noEmit"')
+    expect(codexWorker).toContain('gh", "pr", "create"')
+    expect(codexWorker).toContain('bearer_token_env_var')
+    expect(codexWorker).toContain('run_mint_attach')
+    expect(codexWorker).toContain('Do NOT push, do NOT open a PR')
+    expect(codexWorker).not.toContain('CODEX_AGENT_ID')
+    expect(codexWorker).not.toContain('task_verdict')
+    expect(codexWorker).not.toMatch(/npm run deploy|gh pr merge/)
+    expect(codexWorker).toContain('mcp_config_stanza')
+    expect(codexWorker).toContain('streamable-HTTP')
   })
 
-  it('keeps both drivers as the only topology-A worker entrypoints (no new bespoke *-worker.py)', () => {
+  it('wires Codex remote MCP as streamable-HTTP (url + bearer_token_env_var, no SSE)', () => {
+    expect(codexToml).toContain('bearer_token_env_var')
+    expect(codexToml).toContain('url = ')
+    expect(codexToml).not.toMatch(/^type\s*=\s*"sse"/m)
+    expect(codexToml).not.toMatch(/^transport\s*=\s*"sse"/m)
+    expect(codexReadme).toContain('Streamable-HTTP')
+    expect(codexReadme).toContain('bearer_token_env_var')
+    expect(codexReadme).not.toMatch(/^type = "sse"$/m)
+  })
+
+  it('accepts cursor and codex as declared attach runtime types on the pot', () => {
+    expect(attachRoutes).toMatch(/VALID_RUNTIMES = new Set\(\[[\s\S]*'cursor'/)
+    expect(attachRoutes).toMatch(/VALID_RUNTIMES = new Set\(\[[\s\S]*'codex'/)
+    expect(contractMd).toContain('`cursor`')
+    expect(contractMd).toContain('`codex`')
+  })
+
+  it('keeps topology-A workers on the shared adapter (no bespoke glue outside the contract)', () => {
     expect(cursorWorker).toContain('runtime-adapter/v1')
     expect(mumcpWorker).toContain('runtime-adapter/v1')
+    expect(codexWorker).toContain('runtime-adapter/v1')
     expect(adapter).toContain('REFERENCE adapter')
   })
 })

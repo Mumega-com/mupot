@@ -80,8 +80,9 @@ when the process can create artifacts.
 
 ### Topology-A driver conformance (offline)
 
-The cursor + mumcp reference drivers must stay on `runtime-adapter/v1`. This
-smoke is offline (no live pot) and asserts contract markers + preserved rails:
+The cursor + mumcp + codex topology-A drivers must stay on `runtime-adapter/v1`.
+This smoke is offline (no live pot) and asserts contract markers + preserved
+rails:
 
 ```bash
 npm run conformance:runtime:drivers
@@ -89,7 +90,15 @@ npm run conformance:runtime:drivers
 
 Shared client: `scripts/runtime_adapter_v1.py`. Drivers:
 `scripts/cursor-worker.py` (runtime=`cursor`), `scripts/mumcp-worker.py`
-(runtime=`claude-code`).
+(runtime=`claude-code`), `scripts/codex-worker.py` (runtime=`codex`,
+`codex exec --sandbox --json`, remote MCP via `~/.codex/config.toml`
+`url` + `bearer_token_env_var` — no SSE).
+
+```bash
+# Codex mint+attach plan (no live Codex creds required):
+MINT_ATTACH=1 DRY_RUN=1 python3 scripts/codex-worker.py
+```
+
 ## CI local evidence
 
 GitHub Actions runs the same local evidence gate with:
