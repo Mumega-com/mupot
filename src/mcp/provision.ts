@@ -44,6 +44,7 @@ import {
   str,
   memberCanOnSquad,
 } from './index'
+import { getHarnessPack, listShippableHarnesses, BYOA_HARNESSES } from '../byoa/catalog'
 
 const STRING_SCHEMA = { type: 'string' }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
@@ -735,6 +736,90 @@ const toolDeactivateAgent: ToolSpec = {
   },
 }
 
+// ── list_harness_packs / get_harness_pack (BYOA slice 5) ─────────────────────
+// Discovery + download for per-harness install packs. AuthZ: any authenticated
+// member may read pack templates (they contain placeholders, never secrets).
+const toolListHarnessPacks: ToolSpec = {
+  name: 'list_harness_packs',
+  scope: 'org',
+  min: 'observer',
+  args: '{ }',
+  inputSchema: {
+    type: 'object',
+    properties: {},
+    additionalProperties: false,
+  },
+  async run() {
+    return done({
+      flow: [
+        'create_agent',
+        'mint_agent_token',
+        'register_agent_key (topology C)',
+        'grant_agent_capability',
+        'get_harness_pack',
+      ],
+      packs: listShippableHarnesses().map((h) => ({
+        id: h.id,
+        label: h.label,
+        topology: h.topology,
+        credential: h.credential,
+        pack_dir: `packs/${h.packDir}/`,
+        summary: h.summary,
+        files: h.files.map((f) => f.path),
+      })),
+      docs_only: BYOA_HARNESSES.filter((h) => !h.shipPack).map((h) => ({
+        id: h.id,
+        label: h.label,
+        topology: h.topology,
+        summary: h.summary,
+        doc: 'docs/byoa-claude-desktop.md',
+      })),
+      omitted: [{ id: 'codex-cloud', reason: 'no public launch/poll API (OpenAI #24777)' }],
+    })
+  },
+}
+
+const toolGetHarnessPack: ToolSpec = {
+  name: 'get_harness_pack',
+  scope: 'org',
+  min: 'observer',
+  args: '{ harness: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { harness: STRING_SCHEMA },
+    required: ['harness'],
+    additionalProperties: false,
+  },
+  async run(_auth, _env, args) {
+    const harnessId = str(args.harness)
+    if (!harnessId) return fail(400, 'invalid_args', 'harness required')
+    const result = getHarnessPack(harnessId)
+    if (!result.ok) {
+      if (result.error === 'docs_only') {
+        return fail(400, 'docs_only', 'Claude Desktop is docs-only — see docs/byoa-claude-desktop.md')
+      }
+      return fail(404, 'harness_not_found')
+    }
+    const { harness } = result
+    return done({
+      harness: harness.id,
+      label: harness.label,
+      topology: harness.topology,
+      credential: harness.credential,
+      pack_dir: `packs/${harness.packDir}/`,
+      summary: harness.summary,
+      files: harness.files.map((f) => ({ path: f.path, content: f.content })),
+      next_steps: [
+        'create_agent',
+        'mint_agent_token',
+        harness.credential === 'ed25519_key' ? 'register_agent_key' : null,
+        'grant_agent_capability (additional squads only — mint already grants own squad)',
+        'inject token into pack config; never commit secrets',
+      ].filter(Boolean),
+    })
+  },
+}
+
 export const PROVISION_TOOLS: ToolSpec[] = [
   toolCreateDepartment,
   toolCreateSquad,
@@ -745,4 +830,6 @@ export const PROVISION_TOOLS: ToolSpec[] = [
   toolGrantAgentCapability,
   toolRegisterAgentKey,
   toolDeactivateAgent,
+  toolListHarnessPacks,
+  toolGetHarnessPack,
 ]
