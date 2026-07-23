@@ -6,6 +6,7 @@ import { resolveCapabilities } from '../auth/capability'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { listProjectActivity, listProjectEvidence, type ProjectProjectionCursor } from './projections'
 import {
+  anySquadHasProjectWrite,
   projectReadAccessFromGrants,
   projectVisibilityClause,
   unrestrictedProjectRead,
@@ -21,6 +22,7 @@ import {
   upsertProjectSquadAccess,
 } from './service'
 import type { CreateProjectInput, ProjectMutationError, UpdateProjectInput } from './service'
+import { listProjectDocs, writeProjectDoc } from './docs'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
@@ -396,6 +398,51 @@ projectsApp.get('/:id/evidence', async (c) => {
     rows: rows.rows,
     next_cursor: rows.nextCursor ? encodeProjectionCursor('evidence', rows.nextCursor) : null,
   })
+})
+
+// Project docs = project memory. GET lists engrams under project:<id>; POST writes
+// through createMemory().remember so project_recall can retrieve the same row.
+const DOCS_DEFAULT_LIMIT = 50
+const DOCS_MAX_LIMIT = 100
+
+function parseDocsLimit(limitInput: string | undefined): number | null {
+  if (limitInput === undefined) return DOCS_DEFAULT_LIMIT
+  if (!/^[1-9]\d*$/.test(limitInput)) return null
+  const limit = Number(limitInput)
+  if (!Number.isInteger(limit) || limit < 1 || limit > DOCS_MAX_LIMIT) return null
+  return limit
+}
+
+projectsApp.get('/:id/docs', async (c) => {
+  const limit = parseDocsLimit(c.req.query('limit'))
+  if (limit === null) return c.json({ error: 'invalid_pagination' }, 400)
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  const project = await readableProject(c.env, c.req.param('id'), access)
+  if (!project) return c.json({ error: 'project_not_found' }, 404)
+  const listed = await listProjectDocs(c.env, project.id, limit)
+  return c.json({ project_id: project.id, scope: listed.scope, docs: listed.docs })
+})
+
+projectsApp.post('/:id/docs', async (c) => {
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  const project = await readableProject(c.env, c.req.param('id'), access)
+  if (!project) return c.json({ error: 'project_not_found' }, 404)
+  if (!access.workspaceAdmin && !(await anySquadHasProjectWrite(c.env, project.id, access.squadIds))) {
+    return c.json({ error: 'forbidden', need: 'project_write' }, 403)
+  }
+  const body = await jsonObject(c)
+  if (!body) return c.json({ error: 'invalid_json' }, 400)
+  const text = typeof body.text === 'string' ? body.text.trim() : ''
+  if (!text) return c.json({ error: 'invalid_text' }, 400)
+  let concepts: string[] | null = null
+  if (body.concepts !== undefined) {
+    if (!Array.isArray(body.concepts) || !body.concepts.every((item) => typeof item === 'string')) {
+      return c.json({ error: 'invalid_concepts' }, 400)
+    }
+    concepts = body.concepts.length > 0 ? body.concepts : null
+  }
+  const doc = await writeProjectDoc(c.env, project.id, text, concepts)
+  return c.json({ project_id: project.id, doc }, 201)
 })
 
 projectsApp.patch('/:id', async (c) => {
