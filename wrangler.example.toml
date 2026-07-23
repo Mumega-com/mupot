@@ -27,6 +27,13 @@ FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via age
 # BOOTSTRAP_OWNER_TOKEN via `bash scripts/secrets.sh --pot <slug> --bootstrap-owner`,
 # deploy, open /auth/bootstrap, then delete that secret. The route is unavailable
 # whenever OAuth is configured; its singleton claim permits only the selected owner.
+# ── secret-env taker: CF Workers Secrets API bootstrap ──
+# Enables approved tenant secret bindings to be pushed to this Worker's CF script.
+# All three absent ⇒ secret-env bind path fails closed (no CF writes).
+#   npx wrangler secret put SECRET_ENV_CF_API_TOKEN   # CF API token (MUST be secret)
+# Optional [vars] (or set all three as secrets if preferred):
+#   SECRET_ENV_CF_ACCOUNT_ID = "<cloudflare-account-id>"
+#   SECRET_ENV_CF_SCRIPT_NAME = "mupot"               # this Worker's script name
 # OAuth 2.1 Google IdP secrets (deploy prerequisites — set before live-flip, Hadi approval required):
 #   npx wrangler secret put GOOGLE_CLIENT_ID          # Google OAuth app client ID
 #   npx wrangler secret put GOOGLE_CLIENT_SECRET      # Google OAuth app client secret
