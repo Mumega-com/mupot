@@ -49,10 +49,32 @@ export interface UpdateProjectInput {
   /**
    * Internal flag: allow active→review / review→completed writes owned by
    * completion-gate.ts. Bare updateProject callers cannot self-report completed.
+   * Must NEVER be accepted from REST/MCP bodies — strip via sanitizeExternalProjectUpdate.
    */
   via_completion_gate?: boolean
   /** Principal recorded on lessons-capture when completed→archived. */
   lifecycle_principal?: string
+}
+
+/** Privileged fields that only completion-gate / trusted internal callers may set. */
+const PROJECT_UPDATE_INTERNAL_KEYS = [
+  'via_completion_gate',
+  'lifecycle_principal',
+  'completion_proposed_by',
+] as const
+
+/**
+ * Strip completion-gate internals from an untrusted body (REST PATCH, MCP
+ * project_update). Forged via_completion_gate must not bypass the structural gate.
+ */
+export function sanitizeExternalProjectUpdate(
+  input: Record<string, unknown> | UpdateProjectInput,
+): UpdateProjectInput {
+  const out: UpdateProjectInput = { ...input }
+  for (const key of PROJECT_UPDATE_INTERNAL_KEYS) {
+    delete out[key]
+  }
+  return out
 }
 
 export interface ListProjectsOptions {
@@ -100,6 +122,7 @@ function triggerMutationError(error: unknown): ProjectMutationError | null {
   if (error.message.includes('project hierarchy cycle')) return 'hierarchy_cycle'
   if (error.message.includes('parent project not found')) return 'parent_not_found'
   if (error.message.includes('active child projects')) return 'active_children'
+  if (error.message.includes('structural completion required')) return 'completion_gate_required'
   return null
 }
 
@@ -253,8 +276,16 @@ export async function updateProject(
   const existing = await getProject(env, id)
   if (!existing) return { ok: false, error: 'project_not_found' }
 
+  const viaGate = input.via_completion_gate === true
+  // completion_proposed_by is gate-internal; ignore forged values on bare updates.
+  const proposedByInput = viaGate ? input.completion_proposed_by : undefined
+
   const suppliedKeys = Object.keys(input).filter((key) => {
-    if (key === 'via_completion_gate' || key === 'lifecycle_principal') return false
+    if (
+      key === 'via_completion_gate'
+      || key === 'lifecycle_principal'
+      || key === 'completion_proposed_by'
+    ) return false
     return input[key as keyof UpdateProjectInput] !== undefined
   })
   const statusWasSupplied = input.status !== undefined
@@ -272,7 +303,6 @@ export async function updateProject(
 
   // Slice 2: completed / review status flips are owned by completion-gate.ts.
   // Bare updateProject (agents, dashboard self-report) cannot mark completed.
-  const viaGate = input.via_completion_gate === true
   if (
     statusWasSupplied
     && nextStatus === 'completed'
@@ -289,6 +319,14 @@ export async function updateProject(
   ) {
     return { ok: false, error: 'completion_gate_required' }
   }
+
+  // TOCTOU fence: review/completed flips refuse when any child task is not done.
+  // Paired with DB trigger validate_projects_structural_status (migration 0069).
+  const structuralStatusFlip =
+    viaGate
+    && statusWasSupplied
+    && (nextStatus === 'review' || nextStatus === 'completed')
+    && existing.status !== nextStatus
 
   const nextSlug = input.slug === undefined ? existing.slug : input.slug
   if (!isValidSlug(nextSlug)) return { ok: false, error: 'invalid_slug' }
@@ -315,8 +353,8 @@ export async function updateProject(
     return { ok: false, error: 'active_children' }
   }
 
-  const nextProposedBy = input.completion_proposed_by !== undefined
-    ? input.completion_proposed_by
+  const nextProposedBy = proposedByInput !== undefined
+    ? proposedByInput
     : (existing.status === 'review' && nextStatus !== 'review' ? null : existing.completion_proposed_by)
 
   const updated: Project = {
@@ -332,18 +370,36 @@ export async function updateProject(
     updated_at: nextUpdatedAt(existing.updated_at),
   }
   try {
-    const result = await env.DB.prepare(
-      `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
-       target_date = ?, completion_proposed_by = ?, updated_at = ? WHERE id = ? AND updated_at = ?`,
-    ).bind(
-      updated.slug, updated.name, updated.description, updated.goal, updated.status,
-      updated.parent_project_id, updated.target_date, updated.completion_proposed_by, updated.updated_at,
-      updated.id, existing.updated_at,
-    ).run()
+    // Compare-and-set on updated_at + expected status. Structural flips also
+    // refuse when a concurrent writer left any incomplete child task.
+    const result = structuralStatusFlip
+      ? await env.DB.prepare(
+        `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
+         target_date = ?, completion_proposed_by = ?, updated_at = ?
+         WHERE id = ? AND updated_at = ? AND status = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM tasks WHERE project_id = ? AND status <> 'done'
+           )`,
+      ).bind(
+        updated.slug, updated.name, updated.description, updated.goal, updated.status,
+        updated.parent_project_id, updated.target_date, updated.completion_proposed_by, updated.updated_at,
+        updated.id, existing.updated_at, existing.status, updated.id,
+      ).run()
+      : await env.DB.prepare(
+        `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
+         target_date = ?, completion_proposed_by = ?, updated_at = ?
+         WHERE id = ? AND updated_at = ? AND status = ?`,
+      ).bind(
+        updated.slug, updated.name, updated.description, updated.goal, updated.status,
+        updated.parent_project_id, updated.target_date, updated.completion_proposed_by, updated.updated_at,
+        updated.id, existing.updated_at, existing.status,
+      ).run()
     if (!wrote(result)) {
       const current = await getProject(env, id)
       if (!current) return { ok: false, error: 'project_not_found' }
-      return { ok: false, error: current.status === 'archived' ? 'archived_project' : 'receipt_failed' }
+      if (current.status === 'archived') return { ok: false, error: 'archived_project' }
+      if (structuralStatusFlip) return { ok: false, error: 'completion_gate_required' }
+      return { ok: false, error: 'receipt_failed' }
     }
   } catch (error) {
     if (isUniqueViolation(error)) return { ok: false, error: 'slug_taken' }

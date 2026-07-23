@@ -5,10 +5,12 @@ import {
   createProject,
   getProject,
   removeProjectSquadAccess,
+  sanitizeExternalProjectUpdate,
   updateProject,
   upsertProjectSquadAccess,
 } from '../projects/service'
 import type { ProjectMutationError } from '../projects/service'
+import { lifecyclePrincipalFromAuth } from '../projects/completion-gate'
 import {
   projectReadAccessFromGrants,
   projectVisibilityClause,
@@ -289,7 +291,13 @@ const toolProjectUpdate: ToolSpec = {
     if (denied) return denied
     const projectId = str(args.project_id)
     if (!projectId) return fail(400, 'invalid_project_id')
-    const { project_id: _projectId, ...input } = args
+    const { project_id: _projectId, ...rawInput } = args
+    // P0: strip via_completion_gate / lifecycle_principal / completion_proposed_by
+    // even if a client sneaks them past schema validation.
+    const sanitized = sanitizeExternalProjectUpdate(rawInput as Record<string, unknown>)
+    const input = sanitized.status === 'archived'
+      ? { ...sanitized, lifecycle_principal: lifecyclePrincipalFromAuth(auth) }
+      : sanitized
     const result = await updateProject(env, projectId, input)
     if (!result.ok) return mutationFailure(result.error)
     await emitProjectMutation(env, auth.memberId as string, 'updated', result.value.id, { status: result.value.status })

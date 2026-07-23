@@ -21,6 +21,8 @@ import {
   upsertProjectSquadAccess,
 } from './service'
 import type { CreateProjectInput, ProjectMutationError, UpdateProjectInput } from './service'
+import { sanitizeExternalProjectUpdate } from './service'
+import { lifecyclePrincipalFromAuth } from './completion-gate'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
@@ -407,7 +409,15 @@ projectsApp.patch('/:id', async (c) => {
   if (!access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const body = await jsonObject(c)
   if (!body) return c.json({ error: 'invalid_json' }, 400)
-  const result = await updateProject(c.env, c.req.param('id'), body as UpdateProjectInput)
+  // P0: forged via_completion_gate / completion_proposed_by / lifecycle_principal
+  // must never reach updateProject from this external boundary.
+  const sanitized = sanitizeExternalProjectUpdate(body)
+  const auth = c.get('auth')
+  const input: UpdateProjectInput =
+    sanitized.status === 'archived'
+      ? { ...sanitized, lifecycle_principal: lifecyclePrincipalFromAuth(auth) }
+      : sanitized
+  const result = await updateProject(c.env, c.req.param('id'), input)
   if (!result.ok) return c.json({ error: result.error }, mutationStatus(result.error))
   return c.json({ project: result.value })
 })
