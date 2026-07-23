@@ -119,6 +119,7 @@ import {
   canManageProjects,
   loadProjectDetail,
   projectManageAccessContext,
+  loadProjectDocsView,
   loadProjectFlights,
   loadProjectParentOptions,
   loadProjectWorkContext,
@@ -126,6 +127,7 @@ import {
   parseProjectListFilters,
   projectCreateBody,
   projectDetailBody,
+  projectDocsBody,
   projectFormValues,
   projectLifecycleTransition,
   projectMutationInput,
@@ -563,6 +565,19 @@ dashboardApp.get('/projects/:id', async (c) => {
   const view = await loadProjectDetail(c.env, c.get('auth'), c.req.param('id'))
   if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
   return c.html(shell(c.env, view.project.name, projectDetailBody(view, c.req.query('status'))))
+})
+
+// GET /projects/:id/docs — third owner surface (chat / docs / board). Lists +
+// searches project knowledge filtered through checkContentTier for the viewer.
+dashboardApp.get('/projects/:id/docs', async (c) => {
+  const view = await loadProjectDocsView(
+    c.env,
+    c.get('auth'),
+    c.req.param('id'),
+    c.req.query('q') ?? '',
+  )
+  if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  return c.html(shell(c.env, `${view.project.name} · Docs`, projectDocsBody(view)))
 })
 
 // POST /projects/:id/boards — link an external board. Gated on per-project

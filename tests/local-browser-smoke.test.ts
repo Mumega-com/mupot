@@ -47,4 +47,13 @@ describe('local browser route evidence', () => {
     expect(browserSmokeSource).toContain("page.goto(`${baseUrl}/flights?project_id=project-mupot`")
     expect(browserSmokeSource).toContain('submittedTask.project_id !== \'project-mupot\'')
   })
+
+  it('covers Docs RBAC viewer visibility (public+project visible, private/entity omitted)', () => {
+    expect(browserSmokeSource).toContain('/projects/project-mupot/docs')
+    expect(browserSmokeSource).toContain('VISIBLE_PUBLIC_MARKER')
+    expect(browserSmokeSource).toContain('VISIBLE_PROJECT_MARKER')
+    expect(browserSmokeSource).toContain('HIDDEN_PRIVATE_MARKER')
+    expect(browserSmokeSource).toContain('HIDDEN_ENTITY_MARKER')
+    expect(browserSmokeSource).toContain('must not include HIDDEN_PRIVATE_MARKER')
+  })
 })
