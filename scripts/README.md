@@ -78,6 +78,18 @@ It writes `tmp/local-runtime-conformance/report.json` and prints the same JSON
 report to stdout. Failures write `tmp/local-runtime-conformance/failure-*.json`
 when the process can create artifacts.
 
+### Topology-A driver conformance (offline)
+
+The cursor + mumcp reference drivers must stay on `runtime-adapter/v1`. This
+smoke is offline (no live pot) and asserts contract markers + preserved rails:
+
+```bash
+npm run conformance:runtime:drivers
+```
+
+Shared client: `scripts/runtime_adapter_v1.py`. Drivers:
+`scripts/cursor-worker.py` (runtime=`cursor`), `scripts/mumcp-worker.py`
+(runtime=`claude-code`).
 ## CI local evidence
 
 GitHub Actions runs the same local evidence gate with:

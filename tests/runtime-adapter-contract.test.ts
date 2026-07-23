@@ -296,6 +296,7 @@ describe('runtime-adapter/v1 contract artifact', () => {
     const scriptsReadme = readFileSync(new URL('../scripts/README.md', import.meta.url), 'utf8')
 
     expect(pkg.scripts['conformance:runtime:local']).toBe('node scripts/local-runtime-conformance.mjs')
+    expect(pkg.scripts['conformance:runtime:drivers']).toBe('node scripts/runtime-adapter-driver-conformance.mjs')
     expect(pkg.scripts['dev:local:test']).toContain('wrangler dev --local')
     expect(script).toContain('runtime-adapter/v1')
     expect(script).toContain('/api/fleet/attach-signed')
@@ -315,9 +316,17 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(seed).toContain('tenant = excluded.tenant')
     expect(seed).toContain('5hhsUxlkZWNACkMQjUFNIO1-e4bbFtTaLUd7_5L7sdU')
     expect(scriptsReadme).toContain('npm run conformance:runtime:local')
+    expect(scriptsReadme).toContain('npm run conformance:runtime:drivers')
     expect(scriptsReadme).toContain('signed attach')
     expect(scriptsReadme).toContain('fleet control')
     expect(scriptsReadme).toContain('signed detach')
+    expect(scriptsReadme).toContain('runtime_adapter_v1.py')
+
+    const driverSmoke = readFileSync(new URL('../scripts/runtime-adapter-driver-conformance.mjs', import.meta.url), 'utf8')
+    expect(driverSmoke).toContain('runtime-adapter/v1')
+    expect(driverSmoke).toContain('fleet-attach:v1')
+    expect(driverSmoke).toContain('cursor-worker.py')
+    expect(driverSmoke).toContain('mumcp-worker.py')
   })
 
   it('keeps local browser and runtime evidence wired into CI', () => {

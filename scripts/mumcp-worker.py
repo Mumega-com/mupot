@@ -1,62 +1,44 @@
 #!/usr/bin/env python3
-"""Headless mumcp -> mupot loop driver.
+"""Headless mumcp -> mupot loop driver (runtime-adapter/v1 reference).
 
 Connects the vps-mumcp agent (WordPress/Elementor automation, runs as
-`mumcp-agent.service` -> Claude Code in tmux session `mumcp`, cwd
-/mnt/HC_Volume_104325311/projects/sitepilotai) to mupot governance the same
-way scripts/cursor-worker.py connects `cursor`: poll for open tasks assigned
-to the mumcp agent, claim, dispatch the work to the real runtime, verify,
-and hand off to a human/Kasra-core gate via `review` status. mumcp NEVER
-publishes on its own — its own WordPress output governance already forces
-DRAFT server-side (server-forced draft, human-approval-before-publish); this
-loop does not change that, it only adds mupot as a second, parallel work
-source alongside mumcp's existing GitHub-issues/BACKLOG.md flow.
+`mumcp-agent.service` -> Claude Code in tmux session `mumcp`) to mupot
+governance the same way scripts/cursor-worker.py connects `cursor`. Conforms
+to runtime-adapter/v1 (scripts/runtime_adapter_v1.py): declared runtime type
+`claude-code`, server-derived identity/tenant/capability/squad, signed attach
+domain `fleet-attach:v1` (bearer attach when no host key), land-at-review
+contract. mumcp NEVER publishes on its own — WordPress output stays DRAFT
+server-side; this loop adds mupot as a parallel governed work source.
 
 Dispatch mechanism (decided after checking both options live on the host):
-  - The `mumcp` tmux session is a LIVE, long-running interactive Claude Code
-    REPL (already mid-conversation when checked) with no reliable
-    machine-readable "done" boundary. `tmux send-keys` into it would
-    interleave with whatever it is already doing and risks corrupting a
-    session a human may be watching.
+  - The `mumcp` tmux session is a LIVE interactive Claude Code REPL — tmux
+    send-keys would interleave and risk corrupting a watched session.
   - A headless `claude -p` run in the SAME project directory, with the SAME
-    flags the systemd unit uses to launch the interactive session
-    (`--model sonnet --dangerously-skip-permissions`), gets the identical
-    tool surface (project .mcp.json, CLAUDE.md, WordPress/MCPWP access) in a
-    fresh, isolated, scriptable process — exit code + captured stdout, no
-    interference with the live session. This mirrors the proven
-    cursor-worker.py pattern (`cursor-agent -p` headless), so: headless -p
-    is what this driver uses. tmux send-keys is not used.
+    flags the systemd unit uses (`--model sonnet --dangerously-skip-permissions`),
+    gets the identical tool surface in an isolated, scriptable process.
+    Mirrors cursor-worker.py (`cursor-agent -p` headless).
 
 Flow per task (assignee = mumcp agent, status = open):
+  0. boot     -> boot_context + attach(runtime=claude-code) + Port-1 presence
   1. claim    -> task_update status=in_progress
-  2. dispatch -> `claude -p --output-format json` in MUMCP_PROJECT_DIR with a
-                 brief that hard-instructs: WordPress changes land as DRAFT
-                 only, never publish/merge; report a structured
-                 MUMCP_RESULT JSON block at the end.
-  3. verify   -> parse stdout for the MUMCP_RESULT block; a claim of
-                 "done"/"draft_created" with no evidence (post id / url /
-                 command output) is treated as unverified, not success (no
-                 fake green).
-  4. review   -> task_update status=review, gate_owner=gate:kasra-core,
-                 draft evidence appended to the task body.
-  5. notify   -> best-effort bus ping to kasra; non-fatal if it fails.
+  2. dispatch -> `claude -p --output-format json` in MUMCP_PROJECT_DIR
+  3. verify   -> parse MUMCP_RESULT; done without evidence = unverified
+  4. review   -> land_at_review (status=review, gate_owner, draft evidence)
+  5. notify   -> best-effort bus ping to kasra
 
-The driver NEVER approves, publishes, merges, or deploys. Kasra-core (a
-human-gated squad) verdicts the task via task_verdict; mumcp's own plugin-
-side approval flow additionally gates any actual publish action.
+The driver NEVER approves, publishes, merges, or deploys.
 
 Config (env):
   MUPOT_MCP           default https://mupot.mumega.com/mcp
+  MUPOT_API_BASE      default derived from MUPOT_MCP
   MUMCP_TOKEN         default ~/.fleet/agents/mumega-mumcp-member.token
-  MUMCP_AGENT_ID      default e6695da3-2e04-45b8-b4af-acddaa7c1438 (mumega-mumcp, verified
-                      agent-bound via boot_context/orient — see PR description)
-  MUMCP_SQUAD_ID      default c0e87a6d-77de-4cf8-89a3-79e5843cdd30 (MCPWP Core)
+  MUMCP_KEY           optional host key for signed attach
   GATE_OWNER          default 'gate:kasra-core'
-  MUMCP_PROJECT_DIR   default /mnt/HC_Volume_104325311/projects/sitepilotai (mumcp runtime cwd)
+  MUMCP_PROJECT_DIR   default /mnt/HC_Volume_104325311/projects/sitepilotai
   CLAUDE_BIN          default 'claude'
-  MODEL               default 'sonnet' (matches mumcp-agent.service)
-  MAX_TASKS           default 1 (per run)
-  TIMEOUT             default 1800 (seconds per headless run)
+  MODEL               default 'sonnet'
+  MAX_TASKS           default 1
+  TIMEOUT             default 1800
   DRY_RUN             '1' = poll + print, do nothing
 
 Usage:
@@ -70,14 +52,31 @@ import os
 import re
 import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
-MUPOT_MCP = os.environ.get("MUPOT_MCP", "https://mupot.mumega.com/mcp")
+# Allow `python3 scripts/mumcp-worker.py` to import the sibling adapter module.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from runtime_adapter_v1 import (  # noqa: E402
+    CONTRACT_ID,
+    LAND_AT_STATUS,
+    SIGNED_ATTACH_DOMAIN,
+    AdapterConfig,
+    RuntimeIdentity,
+    boot_session,
+    claim_in_progress,
+    config_from_env,
+    land_at_review,
+    poll_open_tasks,
+    report_blocked,
+)
+
+RUNTIME_TYPE = "claude-code"
+AGENT_TYPE = "builder"
+LIFECYCLE = "on_demand"
+
 MUMCP_TOKEN_PATH = Path(os.environ.get("MUMCP_TOKEN", str(Path.home() / ".fleet/agents/mumega-mumcp-member.token")))
-MUMCP_AGENT_ID = os.environ.get("MUMCP_AGENT_ID", "e6695da3-2e04-45b8-b4af-acddaa7c1438")
-MUMCP_SQUAD_ID = os.environ.get("MUMCP_SQUAD_ID", "c0e87a6d-77de-4cf8-89a3-79e5843cdd30")
-GATE_OWNER = os.environ.get("GATE_OWNER", "gate:kasra-core")
+MUMCP_KEY_PATH = Path(os.environ.get("MUMCP_KEY", "")) if os.environ.get("MUMCP_KEY") else None
 MUMCP_PROJECT_DIR = Path(os.environ.get("MUMCP_PROJECT_DIR", "/mnt/HC_Volume_104325311/projects/sitepilotai"))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 MODEL = os.environ.get("MODEL", "sonnet")
@@ -90,67 +89,6 @@ RESULT_RE = re.compile(r"```MUMCP_RESULT\s*(\{.*?\})\s*```", re.DOTALL)
 
 def log(msg: str) -> None:
     print(f"[mumcp-worker] {msg}", flush=True)
-
-
-def token() -> str:
-    return MUMCP_TOKEN_PATH.read_text().strip()
-
-
-def mcp(tool: str, args: dict) -> dict:
-    """Call a mupot MCP tool as the mumcp agent. Returns the tool's `result`."""
-    body = json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": args}}
-    ).encode()
-    req = urllib.request.Request(
-        MUPOT_MCP,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {token()}",
-            "content-type": "application/json",
-            # CF error 1010 blocks the default Python-urllib UA as a bot signature.
-            "User-Agent": "mumcp-worker/1.0 (+mupot)",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        payload = json.loads(resp.read())
-    if "error" in payload:
-        raise RuntimeError(f"mupot {tool} error: {payload['error']}")
-    inner = json.loads(payload["result"]["content"][0]["text"])
-    if not inner.get("ok", True):
-        raise RuntimeError(f"mupot {tool} not ok: {inner}")
-    return inner.get("result", inner)
-
-
-def register_presence() -> None:
-    """Best-effort Port-1 self-registration so the concierge's dispatcher sees
-    mumcp as an online 'build' capability. registerModule is an idempotent
-    upsert (src/registry/service.ts), so calling presence_register on every
-    cycle both (re-)registers and refreshes the heartbeat in one call — no
-    need to track "already registered this process" state, since each cycle
-    is a fresh one-shot process (operator-loop.sh invokes this script anew
-    every OPERATOR_INTERVAL). project_id: null is the always-open self bucket
-    (no project-access grant needed). Never raises: a presence failure must
-    not block real task work.
-    """
-    try:
-        mcp("presence_register", {
-            "adapter": "mumcp",
-            "kind": "agent_system",
-            "project_id": None,
-            "capabilities": ["build"],
-        })
-        log("presence: registered/refreshed (adapter=mumcp, capabilities=[build])")
-    except Exception as exc:  # noqa: BLE001 - presence is best-effort, never fatal
-        log(f"presence_register failed (non-fatal): {exc}")
-
-
-def poll_open_tasks() -> list[dict]:
-    res = mcp(
-        "task_list",
-        {"squad_id": MUMCP_SQUAD_ID, "assignee_agent_id": MUMCP_AGENT_ID, "status": "open", "limit": MAX_TASKS},
-    )
-    return res.get("tasks", [])[:MAX_TASKS]
 
 
 def build_brief(task: dict) -> str:
@@ -218,8 +156,7 @@ def extract_claude_text(proc: subprocess.CompletedProcess) -> str:
 
 
 def verify(proc: subprocess.CompletedProcess) -> tuple[bool, str, dict]:
-    """No fake green: require the structured MUMCP_RESULT block, status=done, AND
-    non-empty evidence. A bare status:"done" claim with no evidence is NOT verified."""
+    """No fake green: require MUMCP_RESULT, status=done, AND non-empty evidence."""
     if proc.returncode != 0:
         return False, f"headless claude exit {proc.returncode}: {(proc.stderr or '')[-800:]}", {}
     text = extract_claude_text(proc)
@@ -237,22 +174,7 @@ def verify(proc: subprocess.CompletedProcess) -> tuple[bool, str, dict]:
     return True, result.get("summary", ""), result
 
 
-def report_review(task: dict, result: dict) -> None:
-    body = (
-        f"{task.get('body', '')}\n\n---\nmumcp loop -> review.\n"
-        f"summary: {result.get('summary', '')}\n"
-        f"evidence: {result.get('evidence', '')}\n"
-        f"draft_only: {result.get('draft_only', True)} -- NOT published; awaiting gate."
-    )
-    mcp("task_update", {"task_id": task["id"], "status": "review", "gate_owner": GATE_OWNER, "body": body})
-
-
-def report_blocked(task: dict, reason: str) -> None:
-    body = f"{task.get('body', '')}\n\n---\nmumcp loop BLOCKED: {reason}"
-    mcp("task_update", {"task_id": task["id"], "status": "blocked", "body": body})
-
-
-def run_task(task: dict) -> None:
+def run_task(cfg: AdapterConfig, task: dict) -> None:
     tid = task["id"]
     short = tid.split("-")[0]
     log(f"=== task {short}: {task.get('title', '')[:60]} ===")
@@ -260,19 +182,36 @@ def run_task(task: dict) -> None:
         log("DRY_RUN -- would claim, dispatch headless claude, verify, move to review. Skipping.")
         return
 
-    mcp("task_update", {"task_id": tid, "status": "in_progress"})
+    claim_in_progress(cfg, task_id=tid)
     try:
         proc = dispatch(task)
     except subprocess.TimeoutExpired:
-        report_blocked(task, f"headless claude timed out after {TIMEOUT}s")
+        report_blocked(
+            cfg,
+            task_id=tid,
+            body=f"{task.get('body', '')}\n\n---\nmumcp loop BLOCKED: headless claude timed out after {TIMEOUT}s",
+        )
         return
     ok, note, result = verify(proc)
     if not ok:
         log(f"verify FAILED: {note}")
-        report_blocked(task, note)
+        report_blocked(
+            cfg,
+            task_id=tid,
+            body=f"{task.get('body', '')}\n\n---\nmumcp loop BLOCKED: {note}",
+        )
         return
-    report_review(task, result)
-    log(f"delivered -> review. {note}")
+    land_at_review(
+        cfg,
+        task_id=tid,
+        body=(
+            f"{task.get('body', '')}\n\n---\nmumcp loop -> {LAND_AT_STATUS}.\n"
+            f"summary: {result.get('summary', '')}\n"
+            f"evidence: {result.get('evidence', '')}\n"
+            f"draft_only: {result.get('draft_only', True)} -- NOT published; awaiting gate."
+        ),
+    )
+    log(f"delivered -> {LAND_AT_STATUS}. {note}")
     _notify_kasra(task, note)
 
 
@@ -292,12 +231,29 @@ def main() -> int:
     if not MUMCP_TOKEN_PATH.exists():
         log(f"no mumcp token at {MUMCP_TOKEN_PATH}")
         return 2
-    register_presence()
-    tasks = poll_open_tasks()
-    log(f"{len(tasks)} open task(s) assigned to mumcp")
+    cfg = config_from_env(
+        token_path=MUMCP_TOKEN_PATH,
+        runtime=RUNTIME_TYPE,
+        agent_type=AGENT_TYPE,
+        user_agent=f"mumcp-worker/1.0 (+mupot; {CONTRACT_ID})",
+        lifecycle=LIFECYCLE,
+        key_path=MUMCP_KEY_PATH,
+    )
+    log(f"{CONTRACT_ID} attach_domain={SIGNED_ATTACH_DOMAIN} land_at={LAND_AT_STATUS}")
+    identity: RuntimeIdentity = boot_session(
+        cfg,
+        presence_adapter="mumcp",
+        presence_capabilities=["build"],
+        log=log,
+    )
+    # Own-assignee filter; squad omitted so mupot derives it from the bound agent
+    # (server-side). Optional MUMCP_SQUAD_ID remains a non-authority filter only.
+    squad_filter = os.environ.get("MUMCP_SQUAD_ID") or identity.squad_id
+    tasks = poll_open_tasks(cfg, identity, limit=MAX_TASKS, squad_id=squad_filter)
+    log(f"{len(tasks)} open task(s) assigned to mumcp ({identity.agent_id})")
     for task in tasks:
         try:
-            run_task(task)
+            run_task(cfg, task)
         except Exception as exc:  # noqa: BLE001 - one task's failure must not kill the loop
             log(f"task {task.get('id')} errored: {exc}")
     return 0

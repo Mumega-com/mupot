@@ -15,6 +15,7 @@
     "seed:local:test": "wrangler d1 execute mupot-local-test --local --config wrangler-local-test.toml --file scripts/local-test-seed.sql",
     "smoke:local": "node scripts/local-browser-smoke.mjs",
     "conformance:runtime:local": "node scripts/local-runtime-conformance.mjs",
+    "conformance:runtime:drivers": "node scripts/runtime-adapter-driver-conformance.mjs",
     "receipt:host": "node fleet-runtime/host-receipt.mjs",
     "receipt:runtime": "node fleet-runtime/runtime-receipt.mjs",
     "receipt:control": "node fleet-runtime/control-receipt.mjs",

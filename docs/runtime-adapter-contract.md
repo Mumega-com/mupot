@@ -30,7 +30,8 @@ Agent identity and runtime binding are separate concepts.
 
 - `agent_id` names the durable Mupot agent.
 - `runtime` names the carrying process type, such as `codex`,
-  `claude-code`, `hermes`, `hermes-cron`, `systemd-user`, `tmux`, or `python`.
+  `claude-code`, `cursor`, `hermes`, `hermes-cron`, `systemd-user`, `tmux`,
+  or `python`.
 - `lifecycle` describes the expected host model: `on_demand` or `always_on`.
 - `member_id` is derived from the bearer token or registered agent key.
 - `tenant` is always `env.TENANT_SLUG`; client-supplied tenant fields are not

@@ -1,35 +1,40 @@
 #!/usr/bin/env python3
-"""Headless cursor -> mupot loop driver.
+"""Headless cursor -> mupot loop driver (runtime-adapter/v1 reference).
 
-Turns the `cursor` agent (Grok, Cursor CLI) into a dispatchable technician that
-picks up mupot tasks and returns branches for a human/Kasra gate. The loop is
-trustworthy BY CONSTRUCTION: cursor never self-closes a task (mupot's no-self-close
-guard, PR #417) and never touches the remote — the trusted driver does push/PR and
-moves the task to `review` for Kasra-core to gate. cursor only writes code in an
-isolated worktree.
+Turns the `cursor` agent into a dispatchable technician that picks up mupot
+tasks and returns branches for a human/Kasra gate. Conforms to
+runtime-adapter/v1 (scripts/runtime_adapter_v1.py): declared runtime type
+`cursor`, server-derived identity/tenant/capability, signed attach domain
+`fleet-attach:v1` (bearer attach when no host key), land-at-review contract.
+
+The loop is trustworthy BY CONSTRUCTION: cursor never self-closes a task
+(mupot's no-self-close guard, PR #417) and never touches the remote — the
+trusted driver does push/PR and moves the task to `review` for Kasra-core to
+gate. cursor only writes code in an isolated worktree.
 
 Flow per task (assignee = cursor, status = open):
+  0. boot         -> boot_context + attach(runtime=cursor) + Port-1 presence
   1. claim        -> task_update status=in_progress
   2. isolate      -> git worktree add -b cursor/task-<id8> <wt> main
-  3. dispatch     -> cursor-agent -p --force --trust --approve-mcps --workspace <wt> "<brief>"
-  4. verify       -> cursor must have committed; run tsc + tests (no fake-green)
+  3. dispatch     -> cursor-agent -p --force --trust --approve-mcps --workspace <wt>
+  4. verify       -> cursor must have committed; run tsc (no fake-green)
   5. deliver      -> driver pushes the branch + opens the PR (cursor never does)
-  6. report       -> task_update status=review, gate_owner set, PR linked
+  6. report       -> land_at_review (status=review, gate_owner set, PR linked)
   7. notify       -> ping Kasra-core to gate; remove the worktree (keep branch/PR)
 
 The driver NEVER merges or deploys. Kasra-core gates the PR and verdicts the task.
 
 Config (env):
   MUPOT_MCP        default https://mupot.mumega.com/mcp
+  MUPOT_API_BASE   default derived from MUPOT_MCP
   CURSOR_TOKEN     default ~/.fleet/agents/cursor-member.token
-  CURSOR_AGENT_ID  default af7a30b5-... (the cursor agent on the mumega pot)
+  CURSOR_KEY       optional ~/.fleet/agents/<agent>.key for signed attach
   REPO             default /home/mumega/mupot
-  GATE_OWNER       default 'gate:kasra-core' (capability Kasra-core holds)
+  GATE_OWNER       default 'gate:kasra-core'
   MODEL            optional cursor --model override
   MAX_TASKS        default 1 (per run)
   TIMEOUT          default 1800 (seconds per cursor run)
-  SANDBOX          '1' adds --sandbox enabled (recommended for untrusted tasks;
-                   off by default so tsc/tests/git run unrestricted on our own repo)
+  SANDBOX          '1' adds --sandbox enabled
   DRY_RUN          '1' = poll + print, do nothing
 
 Usage:
@@ -38,18 +43,35 @@ Usage:
 """
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
-MUPOT_MCP = os.environ.get("MUPOT_MCP", "https://mupot.mumega.com/mcp")
+# Allow `python3 scripts/cursor-worker.py` to import the sibling adapter module.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from runtime_adapter_v1 import (  # noqa: E402
+    CONTRACT_ID,
+    LAND_AT_STATUS,
+    SIGNED_ATTACH_DOMAIN,
+    AdapterConfig,
+    RuntimeIdentity,
+    boot_session,
+    claim_in_progress,
+    config_from_env,
+    land_at_review,
+    poll_open_tasks,
+    report_blocked,
+)
+
+RUNTIME_TYPE = "cursor"
+AGENT_TYPE = "builder"
+LIFECYCLE = "on_demand"
+
 CURSOR_TOKEN_PATH = Path(os.environ.get("CURSOR_TOKEN", str(Path.home() / ".fleet/agents/cursor-member.token")))
-CURSOR_AGENT_ID = os.environ.get("CURSOR_AGENT_ID", "af7a30b5-c53a-4387-9ffa-18439888b700")
+CURSOR_KEY_PATH = Path(os.environ.get("CURSOR_KEY", "")) if os.environ.get("CURSOR_KEY") else None
 REPO = Path(os.environ.get("REPO", "/home/mumega/mupot"))
-GATE_OWNER = os.environ.get("GATE_OWNER", "gate:kasra-core")
 MODEL = os.environ.get("MODEL", "").strip()
 MAX_TASKS = int(os.environ.get("MAX_TASKS", "1"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))
@@ -64,70 +86,12 @@ def log(msg: str) -> None:
     print(f"[cursor-worker] {msg}", flush=True)
 
 
-def token() -> str:
-    return CURSOR_TOKEN_PATH.read_text().strip()
-
-
-def mcp(tool: str, args: dict) -> dict:
-    """Call a mupot MCP tool as the cursor agent. Returns the tool's `result`."""
-    body = json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": args}}
-    ).encode()
-    req = urllib.request.Request(
-        MUPOT_MCP,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {token()}",
-            "content-type": "application/json",
-            # CF error 1010 blocks the default Python-urllib UA as a bot signature.
-            "User-Agent": "cursor-worker/1.0 (+mupot)",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        payload = json.loads(resp.read())
-    if "error" in payload:
-        raise RuntimeError(f"mupot {tool} error: {payload['error']}")
-    inner = json.loads(payload["result"]["content"][0]["text"])
-    if not inner.get("ok", True):
-        raise RuntimeError(f"mupot {tool} not ok: {inner}")
-    return inner.get("result", inner)
-
-
 def git(*args: str, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env.pop("GITHUB_TOKEN", None)  # gh token shadow guard
     return subprocess.run(
         ["git", *args], cwd=str(cwd or REPO), env=env, check=check, capture_output=True, text=True
     )
-
-
-def register_presence() -> None:
-    """Best-effort Port-1 self-registration so the concierge's dispatcher sees
-    cursor as an online 'build' capability. registerModule is an idempotent
-    upsert (src/registry/service.ts), so calling presence_register on every
-    cycle both (re-)registers and refreshes the heartbeat in one call — no
-    need to track "already registered this process" state, since each cycle
-    is a fresh one-shot process (operator-loop.sh invokes this script anew
-    every OPERATOR_INTERVAL). project_id: null is the always-open self bucket
-    (no project-access grant needed). Never raises: a presence failure must
-    not block real task work.
-    """
-    try:
-        mcp("presence_register", {
-            "adapter": "cursor",
-            "kind": "agent_system",
-            "project_id": None,
-            "capabilities": ["build"],
-        })
-        log("presence: registered/refreshed (adapter=cursor, capabilities=[build])")
-    except Exception as exc:  # noqa: BLE001 - presence is best-effort, never fatal
-        log(f"presence_register failed (non-fatal): {exc}")
-
-
-def poll_open_tasks() -> list[dict]:
-    res = mcp("task_list", {"assignee_agent_id": CURSOR_AGENT_ID, "status": "open", "limit": MAX_TASKS})
-    return res.get("tasks", [])[:MAX_TASKS]
 
 
 def build_brief(task: dict, worktree: Path, branch: str) -> str:
@@ -186,10 +150,12 @@ def deliver(worktree: Path, branch: str, task: dict) -> str:
     env.pop("GITHUB_TOKEN", None)
     title = f"cursor: {task.get('title','')[:60]}"
     pr_body = (
-        f"Dispatched to the `cursor` agent (Grok) headless via the mupot loop for task `{task['id']}`.\n\n"
+        f"Dispatched to the `cursor` agent headless via the mupot loop "
+        f"({CONTRACT_ID}, runtime={RUNTIME_TYPE}) for task `{task['id']}`.\n\n"
         f"Task done-when: {task.get('done_when','')}\n\n"
         "Driver verified: cursor committed real work + `tsc --noEmit` clean. "
-        "**Kasra-core gates this PR before merge** (the task is in `review`; cursor cannot self-close it)."
+        f"**Kasra-core gates this PR before merge** (task lands at `{LAND_AT_STATUS}`; "
+        "cursor cannot self-close it)."
     )
     out = subprocess.run(
         ["gh", "pr", "create", "--repo", REPO_SLUG, "--base", "main", "--head", branch,
@@ -202,17 +168,7 @@ def deliver(worktree: Path, branch: str, task: dict) -> str:
     return url
 
 
-def report_review(task: dict, pr_url: str, note: str) -> None:
-    body = f"{task.get('body','')}\n\n---\ncursor loop -> review. PR: {pr_url}\n{note}"
-    mcp("task_update", {"task_id": task["id"], "status": "review", "gate_owner": GATE_OWNER, "body": body})
-
-
-def report_blocked(task: dict, reason: str) -> None:
-    body = f"{task.get('body','')}\n\n---\ncursor loop BLOCKED: {reason}"
-    mcp("task_update", {"task_id": task["id"], "status": "blocked", "body": body})
-
-
-def run_task(task: dict) -> None:
+def run_task(cfg: AdapterConfig, task: dict) -> None:
     tid = task["id"]
     short = tid.split("-")[0]
     branch = f"cursor/task-{short}"
@@ -222,7 +178,7 @@ def run_task(task: dict) -> None:
         log("DRY_RUN — would claim, dispatch cursor, verify, PR, review. Skipping.")
         return
 
-    mcp("task_update", {"task_id": tid, "status": "in_progress"})
+    claim_in_progress(cfg, task_id=tid)
     WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
     git("worktree", "add", "-b", branch, str(worktree), "main")
     try:
@@ -231,11 +187,19 @@ def run_task(task: dict) -> None:
         ok, note = verify(worktree, branch)
         if not ok:
             log(f"verify FAILED: {note}")
-            report_blocked(task, note)
+            report_blocked(
+                cfg,
+                task_id=tid,
+                body=f"{task.get('body','')}\n\n---\ncursor loop BLOCKED: {note}",
+            )
             return
         pr_url = deliver(worktree, branch, task)
-        report_review(task, pr_url, note)
-        log(f"delivered -> review. PR: {pr_url}")
+        land_at_review(
+            cfg,
+            task_id=tid,
+            body=f"{task.get('body','')}\n\n---\ncursor loop -> {LAND_AT_STATUS}. PR: {pr_url}\n{note}",
+        )
+        log(f"delivered -> {LAND_AT_STATUS}. PR: {pr_url}")
         _notify_kasra(task, pr_url)
     finally:
         git("worktree", "remove", str(worktree), "--force", cwd=REPO, check=False)
@@ -258,12 +222,26 @@ def main() -> int:
     if not CURSOR_TOKEN_PATH.exists():
         log(f"no cursor token at {CURSOR_TOKEN_PATH}")
         return 2
-    register_presence()
-    tasks = poll_open_tasks()
-    log(f"{len(tasks)} open task(s) assigned to cursor")
+    cfg = config_from_env(
+        token_path=CURSOR_TOKEN_PATH,
+        runtime=RUNTIME_TYPE,
+        agent_type=AGENT_TYPE,
+        user_agent=f"cursor-worker/1.0 (+mupot; {CONTRACT_ID})",
+        lifecycle=LIFECYCLE,
+        key_path=CURSOR_KEY_PATH,
+    )
+    log(f"{CONTRACT_ID} attach_domain={SIGNED_ATTACH_DOMAIN} land_at={LAND_AT_STATUS}")
+    identity: RuntimeIdentity = boot_session(
+        cfg,
+        presence_adapter="cursor",
+        presence_capabilities=["build"],
+        log=log,
+    )
+    tasks = poll_open_tasks(cfg, identity, limit=MAX_TASKS)
+    log(f"{len(tasks)} open task(s) assigned to cursor ({identity.agent_id})")
     for task in tasks:
         try:
-            run_task(task)
+            run_task(cfg, task)
         except Exception as exc:  # noqa: BLE001 - one task's failure must not kill the loop
             log(f"task {task.get('id')} errored: {exc}")
     return 0
