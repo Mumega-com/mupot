@@ -235,7 +235,9 @@ export interface Agent {
   name: string
   role: string // tenant-defined role label
   model: string // e.g. "@cf/meta/llama-3.3" | "gemini-2.5-flash"
-  status: 'active' | 'paused'
+  // 'inactive' = soft-retired (death_condition). Dormancy for credit/provider uses
+  // status='paused' + dormant_reason set (0070) — distinct from a manual pause.
+  status: 'active' | 'paused' | 'inactive'
   // work-unit fields (0009_work_unit.sql)
   okr: string | null
   kpi_target: string | null
@@ -256,6 +258,8 @@ export interface Agent {
   parent_agent_id: string | null
   qnft_ref: string | null
   death_condition: string | null
+  // 0070 — set when auto-dormant for credit_out | provider_down; null otherwise.
+  dormant_reason: string | null
 }
 
 export interface Membership {
@@ -408,6 +412,7 @@ export type BusEventType =
   | 'squad.dispatch'
   | 'org.provisioned' // a department/squad/agent/token was created in-band (payload.kind)
   | 'project.mutated' // project lifecycle or project-to-squad access changed through MCP
+  | 'agent.lifecycle' // soft-retire / dormant / reactivate (fleet death-condition + credit/provider)
 
 export interface BusEvent<T = unknown> {
   type: BusEventType

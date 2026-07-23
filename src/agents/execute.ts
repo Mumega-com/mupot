@@ -33,6 +33,12 @@ import { createBus } from '../bus'
 import { createMemory } from '../memory'
 import { checkAndReserve, recordTokens } from './meter'
 import { costMicroUsd } from './cost'
+import {
+  chatWithModelFallback,
+  isCreditOutReason,
+  isProviderFailure,
+  markDormant,
+} from './lifecycle'
 import { detectContentIntent } from './content-intent'
 import type { ContentIntent } from './content-intent'
 import { getRegistered, kernelMintCtx } from '../departments/registry'
@@ -182,6 +188,9 @@ export async function runTaskExecution(
     budgetWindow: agent.budget_window,
   })
   if (!meterResult.ok) {
+    if (isCreditOutReason(meterResult.reason)) {
+      await markDormant(env, agent, 'credit_out', meterResult.reason)
+    }
     const note = capResult(
       `rate_limited: ${meterResult.reason} — daily cap reached (window ${meterResult.windowKey}). ` +
       `Retry after ${meterResult.retryAfterSec}s (next UTC day resets the window).`,
@@ -206,7 +215,21 @@ export async function runTaskExecution(
       { role: 'system', content: buildExecuteSystem(agent, charter, task.source_pot ?? null) },
       { role: 'user', content: buildExecutePrompt(task) },
     ]
-    const raw = await model.chat(messages, { model: agent.model, maxTokens: EXECUTE_MAX_TOKENS })
+    let raw: string
+    try {
+      const chat = await chatWithModelFallback(model, agent, messages, { maxTokens: EXECUTE_MAX_TOKENS })
+      raw = chat.text
+    } catch (modelErr) {
+      if (isProviderFailure(modelErr)) {
+        await markDormant(
+          env,
+          agent,
+          'provider_down',
+          modelErr instanceof Error ? modelErr.message : 'provider_down',
+        )
+      }
+      throw modelErr
+    }
     const result = capResult(typeof raw === 'string' ? raw : '')
     const finishedAt = new Date().toISOString()
 

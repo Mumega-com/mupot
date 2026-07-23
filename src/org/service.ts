@@ -388,6 +388,7 @@ export async function createAgent(
     parent_agent_id,
     qnft_ref,
     death_condition,
+    dormant_reason: null,
   }
 
   // Insert the agent AND its squad membership atomically. The membership row
@@ -697,7 +698,13 @@ export async function setAgentStatus(
   agentId: string,
   status: AgentStatus,
 ): Promise<SetStatusResult> {
-  const result = await env.DB.prepare('UPDATE agents SET status = ? WHERE id = ?')
+  // Manual pause/resume clears auto-dormancy so a dashboard resume never leaves
+  // a stale dormant_reason that would re-block wake after status=active.
+  const result = await env.DB.prepare(
+    status === 'active'
+      ? `UPDATE agents SET status = ?, dormant_reason = NULL WHERE id = ?`
+      : `UPDATE agents SET status = ? WHERE id = ?`,
+  )
     .bind(status, agentId)
     .run()
   if (!result.meta.changes) return { ok: false, error: 'not_found' }
