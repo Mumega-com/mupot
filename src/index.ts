@@ -56,6 +56,7 @@ import { coordinationApp } from './coordination/routes'
 import { addonsApp } from './addons/routes'
 import { projectLinkApp } from './addons/project-link/routes'
 import { presenceApp } from './registry/presence-routes'
+import { vendorCloudCursorWebhookApp } from './runtime/vendor-cloud'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -94,6 +95,8 @@ app.route('/api/integrations/ghl', ghlInboundApp)
 app.route('/api/events', eventIngestApp)
 // GitHub weave: inbound webhook (HMAC-verified by GITHUB_WEBHOOK_SECRET) → work units.
 app.route('/api/integrations/github', githubInboundApp)
+// Topology C: Cursor Background Agent HMAC completion webhook (pluggable completion port).
+app.route('/api/runtime/vendor-cloud', vendorCloudCursorWebhookApp)
 app.route('/api/prospects', prospectsApp)
 app.route('/api/loops', loopsApp)
 // Flock check-in (Flock #45): agents POST presence with their member-token (bearer).

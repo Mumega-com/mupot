@@ -122,3 +122,10 @@ crons = ["*/15 * * * *"]
 # Until these secrets are set the GHL channel is inert (fails closed):
 #   - Outbound sends return { ok: false, reason: 'not_configured' }
 #   - Inbound webhook returns 503 { error: 'not_configured' }
+
+# ── Topology C vendor-cloud (BYOA slice 4) ──
+# Cursor Background Agents completion webhook (HMAC statusChange):
+#   npx wrangler secret put CURSOR_WEBHOOK_SECRET
+# Optional var: CURSOR_COMPLETION_GATE_OWNER = "gate:kasra-core"
+# Route: POST /api/runtime/vendor-cloud/cursor/webhook
+# Claude Managed Agents has NO webhook — use poll/SSE completion port instead.
