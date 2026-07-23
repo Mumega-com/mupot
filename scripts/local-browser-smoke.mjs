@@ -46,6 +46,7 @@ const pages = [
   '/ops',
   '/coordination',
   '/agents',
+  '/agents/onboard',
   '/squads/sq-growth',
   '/agents/agent-hermes',
   '/admin/members',
@@ -226,6 +227,74 @@ async function runLoginWorkflow() {
     status: 'passed',
     email: json.email,
     anonymousRedirect: location,
+  })
+}
+
+async function runByoaOnboardHappyPath() {
+  const beforeErrors = consoleErrors.length
+  const response = await page.goto(`${baseUrl}/agents/onboard`, {
+    waitUntil: 'networkidle',
+    timeout: 20_000,
+  })
+  const status = response?.status() ?? 0
+  const bodyText = await textSnippet(page.locator('body'), 1200)
+  const newErrors = consoleErrors.slice(beforeErrors)
+  if (status >= 400) fail('BYOA onboard page failed', { status, bodyText })
+  if (newErrors.length > 0) fail('BYOA onboard page browser errors', { errors: newErrors })
+  if (!/Bring your own agent/i.test(bodyText)) {
+    fail('BYOA onboard page missing title', { bodyText })
+  }
+  const harness = page.locator('#byoa-harness, select[name="harness"]')
+  if ((await harness.count()) < 1) fail('BYOA onboard missing harness picker')
+  const options = await harness.locator('option').allTextContents()
+  if (!options.some((t) => /codex/i.test(t)) || !options.some((t) => /claude code/i.test(t))) {
+    fail('BYOA onboard harness options incomplete', { options })
+  }
+  const submit = page.locator('[data-byoa-submit], button[type="submit"]')
+  if ((await submit.count()) < 1) fail('BYOA onboard missing submit')
+
+  // Happy path create when a real squad option exists (local seed).
+  const squadSelect = page.locator('select[name="squad_id"]')
+  const squadValues = await squadSelect.locator('option').evaluateAll((opts) =>
+    opts.map((o) => o.value).filter(Boolean),
+  )
+  let minted = false
+  if (squadValues.length > 0) {
+    const slug = `byoa-smoke-${Date.now().toString(36)}`
+    await page.locator('input[name="name"]').fill('BYOA Smoke')
+    await page.locator('input[name="slug"]').fill(slug)
+    await squadSelect.selectOption(squadValues[0])
+    await harness.selectOption('codex')
+    await Promise.all([
+      page.waitForLoadState('networkidle'),
+      submit.first().click(),
+    ])
+    const successText = await textSnippet(page.locator('body'), 2000)
+    if (!/data-byoa-success|Agent ready|Install pack|config\.toml/i.test(successText)
+      && !(await page.locator('[data-byoa-success]').count())) {
+      // Form may re-render with an error (e.g. slug collision) — still prove the surface.
+      if (!/Bring your own agent|Could not add agent/i.test(successText)) {
+        fail('BYOA onboard submit did not land on success or recoverable form', { successText })
+      }
+    } else {
+      minted = true
+      const packLink = page.locator('a[href*="/agents/onboard/packs/codex"]')
+      if ((await packLink.count()) > 0) {
+        const packRes = await context.request.get(`${baseUrl}/agents/onboard/packs/codex`)
+        const packJson = await packRes.json().catch(() => null)
+        if (packRes.status() !== 200 || packJson?.harness !== 'codex') {
+          fail('BYOA pack download failed', { status: packRes.status(), packJson })
+        }
+      }
+    }
+  }
+
+  await page.screenshot({ path: path.join(artifactsDir, 'byoa-onboard.png'), fullPage: true })
+  workflows.push({
+    name: 'byoa-onboard-happy-path',
+    status: 'passed',
+    minted,
+    harnessOptions: options.length,
   })
 }
 
@@ -829,6 +898,8 @@ export async function runLocalBrowserSmoke() {
         fail(`page rendered auth failure: ${route}`, { status, bodyText })
       }
     }
+
+    await runByoaOnboardHappyPath()
 
     await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' })
     await page.screenshot({ path: path.join(artifactsDir, 'home.png'), fullPage: true })

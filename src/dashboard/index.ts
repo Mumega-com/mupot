@@ -60,7 +60,14 @@ import { findPreset, isValidPresetId } from '../auth/role-presets'
 
 // Agent-bound token mint UI.
 import { loadAgentTokenView, agentTokenPageBody, agentTokenMintedBody } from './agent-token'
+import {
+  byoaOnboardPageBody,
+  byoaOnboardSuccessBody,
+  loadByoaOnboardView,
+} from './byoa-onboard'
+import { getHarnessPack } from '../byoa/catalog'
 import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
+import { isValidEd25519PublicX, registerAgentPublicKey } from '../fleet/agent-keys'
 import { resolveAgentRef } from '../org/resolve'
 
 // Connect-config builders (pure) for the Connect card.
@@ -1138,6 +1145,138 @@ dashboardApp.get('/squads/:id', async (c) => {
       c.env,
       `Squad · ${squad.name}`,
       squadBoardBody(squad, agents.results ?? [], tasks.results ?? [], canAddAgent, canManage),
+    ),
+  )
+})
+
+// ── BYOA onboarding (slice 5): add agent → pick harness → pack + token ───────
+// Registered BEFORE /agents/:id so "onboard" is not captured as an agent id.
+//
+// GET  /agents/onboard              — form (org-admin)
+// POST /agents/onboard              — createAgent + mint (+ optional register key) + pack
+// GET  /agents/onboard/packs/:harness — download shippable pack JSON (org-admin)
+
+dashboardApp.get('/agents/onboard', async (c) => {
+  const auth = c.get('auth')
+  if (!isOrgAdmin(auth)) {
+    return c.html(
+      shell(c.env, 'Bring your own agent', errorBody('BYOA onboarding requires owner or admin.')),
+      403,
+    )
+  }
+  const squadOptions = await loadSquadOptions(c.env)
+  const view = loadByoaOnboardView(squadOptions)
+  return c.html(shell(c.env, 'Bring your own agent', byoaOnboardPageBody(view)))
+})
+
+dashboardApp.get('/agents/onboard/packs/:harness', async (c) => {
+  const auth = c.get('auth')
+  if (!isOrgAdmin(auth)) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  const harnessId = c.req.param('harness')
+  const result = getHarnessPack(harnessId)
+  if (!result.ok) {
+    const status = result.error === 'docs_only' ? 400 : 404
+    return c.json({ error: result.error }, status)
+  }
+  const { harness } = result
+  return c.json({
+    harness: harness.id,
+    label: harness.label,
+    topology: harness.topology,
+    credential: harness.credential,
+    pack_dir: `packs/${harness.packDir}/`,
+    files: harness.files,
+  })
+})
+
+dashboardApp.post('/agents/onboard', async (c) => {
+  const auth = c.get('auth')
+  if (!isOrgAdmin(auth)) {
+    return c.html(
+      shell(c.env, 'Bring your own agent', errorBody('BYOA onboarding requires owner or admin.')),
+      403,
+    )
+  }
+
+  const form = await c.req.parseBody()
+  const squadId = typeof form.squad_id === 'string' ? form.squad_id.trim() : ''
+  const name = typeof form.name === 'string' ? form.name.trim() : ''
+  const slug = typeof form.slug === 'string' ? form.slug.trim() : ''
+  const harnessId = typeof form.harness === 'string' ? form.harness.trim() : ''
+  const labelRaw = typeof form.label === 'string' ? form.label.trim() : ''
+  const capabilityRaw =
+    typeof form.capability === 'string' && form.capability.trim() ? form.capability.trim() : 'member'
+  const publicKeyRaw = typeof form.public_key === 'string' ? form.public_key.trim() : ''
+
+  const squadOptions = await loadSquadOptions(c.env)
+  const view = loadByoaOnboardView(squadOptions)
+  const reform = (msg: string, status: 400 | 404 | 409 = 400) =>
+    c.html(shell(c.env, 'Bring your own agent', byoaOnboardPageBody(view, msg)), status)
+
+  if (!squadId) return reform('Pick a squad for the agent.')
+  if (!name || !slug) return reform('Name and slug are required.')
+  if (!isAgentTokenCapability(capabilityRaw)) {
+    return reform('Grant must be observer or member.')
+  }
+  if (labelRaw.length > 64) return reform('Label too long (max 64 chars).')
+
+  const packResult = getHarnessPack(harnessId)
+  if (!packResult.ok) {
+    return reform(
+      packResult.error === 'docs_only'
+        ? 'Claude Desktop is docs-only — pick a topology A/C harness.'
+        : 'Unknown harness.',
+    )
+  }
+  const harness = packResult.harness
+
+  const squad = await getById<Squad>(c.env, 'squads', squadId)
+  if (!squad) return reform('Squad not found.', 404)
+
+  const created = await createAgent(c.env, squadId, {
+    slug,
+    name,
+    role: 'member',
+  })
+  if (!created.ok) {
+    return reform(
+      `Could not add agent: ${created.error}.`,
+      created.error === 'slug_taken' ? 409 : 400,
+    )
+  }
+  const agent = created.value
+
+  const minted = await mintAgentBoundToken(c.env, agent, labelRaw, capabilityRaw)
+
+  let keyStatus: string | null = null
+  if (harness.credential === 'ed25519_key' && publicKeyRaw) {
+    if (!(await isValidEd25519PublicX(publicKeyRaw))) {
+      return reform('public_key must be a canonical Ed25519 JWK x value.')
+    }
+    const registered = await registerAgentPublicKey(c.env, agent.id, agent.id, publicKeyRaw)
+    if (!registered.ok) {
+      return reform(`Key registration failed: ${registered.reason}.`)
+    }
+    keyStatus = registered.status
+  }
+
+  const origin = new URL(c.req.url).origin
+  return c.html(
+    shell(
+      c.env,
+      'BYOA agent ready',
+      byoaOnboardSuccessBody({
+        agentName: agent.name,
+        agentSlug: agent.slug,
+        agentId: agent.id,
+        squadName: squad.name,
+        harness,
+        rawToken: minted.raw,
+        tokenId: minted.tokenId,
+        capability: minted.grantCapability,
+        keyStatus,
+        mcpEndpoint: mcpEndpoint(origin),
+      }),
     ),
   )
 })
@@ -5575,6 +5714,14 @@ function agentsBody(
     ? `<div class="card"><p class="empty">No agents yet. Add one below.</p></div>`
     : `<div class="unit-grid">${agents.map((a) => unitCard(a, canManage)).join('')}</div>`
 
+  const byoaCard = canManage
+    ? `<div class="card" style="margin-top:20px" data-byoa-entry>
+        <h2 style="margin-top:0">Bring your own agent</h2>
+        <p class="empty" style="margin-top:0">Add agent → pick harness → mint token / register key → download the install pack. Topology A/C only.</p>
+        <a class="btn" href="/agents/onboard">Start BYOA onboarding</a>
+      </div>`
+    : ''
+
   const addForm = canManage && squadOptions.length > 0
     ? `<div class="card" style="margin-top:20px">
         <h2 style="margin-top:0">Add agent</h2>
@@ -5635,6 +5782,7 @@ function agentsBody(
     ])}
     ${raw(errorBanner)}
     ${raw(cardsHtml)}
+    ${raw(byoaCard)}
     ${raw(addForm)}
     ${raw(packsCard)}
     ${canManage && agents.length > 0 ? agentsScript() : html``}`
