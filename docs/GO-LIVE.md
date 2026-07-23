@@ -37,13 +37,16 @@ this bootstrap the bind path fails closed.
 Binding contract and comments: **`wrangler.example.toml`** (`wrangler.toml` is gitignored).
 
 ```bash
-npx wrangler secret put SECRET_ENV_CF_API_TOKEN
+npx wrangler secret put SECRET_ENV_CF_API_TOKEN --config wrangler.digid.toml
 # vars (or secrets): SECRET_ENV_CF_ACCOUNT_ID, SECRET_ENV_CF_SCRIPT_NAME
 # Token needs Workers Scripts:Edit (secrets) on the pot account
 ```
 
 Set `SECRET_ENV_CF_ACCOUNT_ID` and `SECRET_ENV_CF_SCRIPT_NAME` in `[vars]` or as secrets.
 Re-deploy after bootstrap so the Worker picks up vars.
+
+v1 revoke of a Worker secret is done in the tenant CF dashboard / wrangler; reject does not
+delete CF secrets.
 
 ## 2. Seed the outreach loop (through the product, not SQL)
 

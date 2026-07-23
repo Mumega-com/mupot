@@ -178,25 +178,66 @@ export async function requestSecretEnv(
     }
   }
 
+  // Pre-check existing bindings for every requested name (there is a UNIQUE
+  // (tenant, binding_name) constraint on secret_env_bindings, so a blind
+  // INSERT would race/collide on retry or on a second agent requesting the
+  // same name). pending/bound names are a hard conflict; revoked names are
+  // reused in place (UPDATE, not a fresh INSERT) below.
+  const names = keys.map((key) => key.name)
+  const namePlaceholders = names.map((_, index) => `?${index + 2}`).join(', ')
+  const existingResult = await env.DB.prepare(
+    `SELECT id, binding_name, status FROM secret_env_bindings
+      WHERE tenant = ?1 AND binding_name IN (${namePlaceholders})`,
+  )
+    .bind(env.TENANT_SLUG, ...names)
+    .all<{ id: string; binding_name: string; status: SecretEnvBindingStatus }>()
+
+  const existingByName = new Map(
+    (existingResult.results ?? []).map((row) => [row.binding_name, row] as const),
+  )
+  for (const name of names) {
+    const existing = existingByName.get(name)
+    if (existing && (existing.status === 'pending' || existing.status === 'bound')) {
+      return { ok: false, error: 'binding_name_conflict' }
+    }
+  }
+
   const id = crypto.randomUUID()
   const now = new Date().toISOString()
   const schemaJson = JSON.stringify({ keys, adapterHint } satisfies SecretEnvRequestSchema)
 
-  await env.DB.prepare(
-    `INSERT INTO secret_env_requests (id, tenant, reason, schema_json, status, requested_by, decided_by, created_at, decided_at)
-     VALUES (?1, ?2, ?3, ?4, 'pending', ?5, NULL, ?6, NULL)`,
-  )
-    .bind(id, env.TENANT_SLUG, reason, schemaJson, requestedBy, now)
-    .run()
+  const statements = [
+    env.DB.prepare(
+      `INSERT INTO secret_env_requests (id, tenant, reason, schema_json, status, requested_by, decided_by, created_at, decided_at)
+       VALUES (?1, ?2, ?3, ?4, 'pending', ?5, NULL, ?6, NULL)`,
+    ).bind(id, env.TENANT_SLUG, reason, schemaJson, requestedBy, now),
+  ]
 
   for (const key of keys) {
-    await env.DB.prepare(
-      `INSERT INTO secret_env_bindings (id, tenant, binding_name, purpose, adapter_hint, status, requested_by, bound_by, request_id, created_at, bound_at, revoked_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, NULL, ?7, ?8, NULL, NULL)`,
-    )
-      .bind(crypto.randomUUID(), env.TENANT_SLUG, key.name, key.purpose, adapterHint, requestedBy, id, now)
-      .run()
+    // Only 'revoked' rows can reach here (pending/bound already rejected above).
+    const existing = existingByName.get(key.name)
+    if (existing) {
+      statements.push(
+        env.DB.prepare(
+          `UPDATE secret_env_bindings
+              SET purpose = ?1, adapter_hint = ?2, status = 'pending', requested_by = ?3,
+                  bound_by = NULL, request_id = ?4, created_at = ?5, bound_at = NULL, revoked_at = NULL
+            WHERE id = ?6 AND tenant = ?7`,
+        ).bind(key.purpose, adapterHint, requestedBy, id, now, existing.id, env.TENANT_SLUG),
+      )
+    } else {
+      statements.push(
+        env.DB.prepare(
+          `INSERT INTO secret_env_bindings (id, tenant, binding_name, purpose, adapter_hint, status, requested_by, bound_by, request_id, created_at, bound_at, revoked_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, NULL, ?7, ?8, NULL, NULL)`,
+        ).bind(crypto.randomUUID(), env.TENANT_SLUG, key.name, key.purpose, adapterHint, requestedBy, id, now),
+      )
+    }
   }
+
+  // Atomic: the request row and every one of its binding rows land together
+  // or not at all — no partial request-with-no-bindings state is observable.
+  await env.DB.batch(statements)
 
   await writeSecretEnvAudit(env, {
     requestId: id,

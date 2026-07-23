@@ -117,6 +117,18 @@ function makeEnv(tenant = 'test-tenant'): { env: Env; calls: CallRecord[] } {
             }
             return { meta: { changes } }
           }
+          // Revoked-binding reuse path in requestSecretEnv: re-pending an existing row.
+          if (sNorm.startsWith('UPDATE SECRET_ENV_BINDINGS') && sNorm.includes("STATUS = 'PENDING'")) {
+            const [purpose, adapterHint, requestedBy, requestId, createdAt, bindingId, ten] = call.binds
+            const row = bindings.get(bindingId as string)
+            if (row && row.tenant === ten) {
+              row.purpose = purpose; row.adapter_hint = adapterHint; row.status = 'pending'
+              row.requested_by = requestedBy; row.bound_by = null; row.request_id = requestId
+              row.created_at = createdAt; row.bound_at = null; row.revoked_at = null
+              return { meta: { changes: 1 } }
+            }
+            return { meta: { changes: 0 } }
+          }
           if (sNorm.startsWith('INSERT INTO SECRET_ENV_AUDIT')) {
             const [id, ten, requestId, bindingName, action, actorId, detail, recordedAt] = call.binds
             audit.push({ id, tenant: ten, request_id: requestId, binding_name: bindingName, action, actor_id: actorId, detail, recorded_at: recordedAt })
@@ -134,6 +146,11 @@ function makeEnv(tenant = 'test-tenant'): { env: Env; calls: CallRecord[] } {
           return null
         },
         async all<T>(): Promise<{ results: T[] }> {
+          if (sNorm.startsWith('SELECT ID, BINDING_NAME, STATUS FROM SECRET_ENV_BINDINGS')) {
+            const [ten, ...names] = call.binds as [string, ...string[]]
+            const rows = [...bindings.values()].filter((r) => r.tenant === ten && names.includes(r.binding_name as string))
+            return { results: rows.map((r) => ({ id: r.id, binding_name: r.binding_name, status: r.status })) as unknown as T[] }
+          }
           if (sNorm.includes('FROM SECRET_ENV_REQUESTS') && sNorm.includes("STATUS = 'PENDING'")) {
             const [ten] = call.binds
             return { results: [...requests.values()].filter((r) => r.tenant === ten && r.status === 'pending') as unknown as T[] }
@@ -146,6 +163,11 @@ function makeEnv(tenant = 'test-tenant'): { env: Env; calls: CallRecord[] } {
         },
       }
       return stmt
+    },
+    async batch(stmts: { run: () => Promise<unknown> }[]) {
+      const results: unknown[] = []
+      for (const stmt of stmts) results.push(await stmt.run())
+      return results
     },
   }
 
