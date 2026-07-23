@@ -35,6 +35,8 @@ function makeHarness(): SqliteD1Harness {
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept-a', 'squad-a', 'Squad A');
+    INSERT INTO agents (id, squad_id, slug, name, status, created_at)
+    VALUES ('agent-builder', 'squad-a', 'agent-builder', 'Builder', 'active', '2026-06-01T00:00:00.000Z');
   `)
   return harness
 }
@@ -69,16 +71,21 @@ function insertDoneTask(
     result: string | null
     gateOwner: string | null
     verdict: 'approved' | 'rejected' | null
+    assigneeAgentId?: string | null
+    verdictBy?: string
   },
 ): void {
   const resultSql = opts.result === null ? 'NULL' : `'${opts.result.replace(/'/g, "''")}'`
   const gateSql = opts.gateOwner === null ? 'NULL' : `'${opts.gateOwner}'`
+  const assignee = opts.assigneeAgentId === undefined ? 'agent-builder' : opts.assigneeAgentId
+  const assigneeSql = assignee === null ? 'NULL' : `'${assignee}'`
+  const verdictBy = opts.verdictBy ?? 'agent-reviewer'
   harness.sqlite.exec(`
     INSERT INTO tasks (
       id, squad_id, title, body, done_when, status, assignee_agent_id, result, completed_at,
       gate_owner, project_id, created_at, updated_at
     ) VALUES (
-      '${opts.id}', 'squad-a', 'Task ${opts.id}', '', 'done', 'done', NULL,
+      '${opts.id}', 'squad-a', 'Task ${opts.id}', '', 'done', 'done', ${assigneeSql},
       ${resultSql}, '2026-07-01T00:00:00.000Z', ${gateSql}, '${opts.projectId}',
       '2026-06-15T00:00:00.000Z', '2026-07-01T00:00:00.000Z'
     );
@@ -87,7 +94,7 @@ function insertDoneTask(
     harness.sqlite.exec(`
       INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, project_id)
       VALUES (
-        'verdict-${opts.id}', '${opts.id}', '${opts.verdict}', NULL, 'agent-reviewer',
+        'verdict-${opts.id}', '${opts.id}', '${opts.verdict}', NULL, '${verdictBy}',
         '2026-07-01T01:00:00.000Z', '${opts.projectId}'
       );
     `)
@@ -95,21 +102,78 @@ function insertDoneTask(
 }
 
 describe('evaluateStructuralSignal (pure)', () => {
-  it('is ready when all children are done, gated PASS, and evidence present', () => {
+  it('is ready when all children are done, gated PASS by different principal, and evidence present', () => {
     expect(evaluateStructuralSignal([
       {
-        id: 't1', status: 'done', gate_owner: 'gate:dev', result: 'pr#1 merged', latest_verdict: 'approved',
-      },
-      {
-        id: 't2', status: 'done', gate_owner: null, result: 'docs shipped', latest_verdict: null,
+        id: 't1',
+        status: 'done',
+        gate_owner: 'gate:dev',
+        result: 'pr#1 merged',
+        assignee_agent_id: 'agent-builder',
+        latest_verdict: 'approved',
+        latest_verdict_by: 'agent-reviewer',
       },
     ]).ready).toBe(true)
+  })
+
+  it('rejects ungated done+result as completion evidence', () => {
+    const signal = evaluateStructuralSignal([
+      {
+        id: 't2',
+        status: 'done',
+        gate_owner: null,
+        result: 'docs shipped',
+        assignee_agent_id: 'agent-builder',
+        latest_verdict: null,
+        latest_verdict_by: null,
+      },
+    ])
+    expect(signal.ready).toBe(false)
+    expect(signal.reason).toBe('gate_not_pass')
+  })
+
+  it('rejects gate:agent-self-completion as evidence', () => {
+    const signal = evaluateStructuralSignal([
+      {
+        id: 't3',
+        status: 'done',
+        gate_owner: 'gate:agent-self-completion',
+        result: 'llm filler',
+        assignee_agent_id: 'agent-builder',
+        latest_verdict: 'approved',
+        latest_verdict_by: 'agent-builder',
+      },
+    ])
+    expect(signal.ready).toBe(false)
+    expect(signal.reason).toBe('self_gated')
+  })
+
+  it('rejects assignee self-verdict even with a real gate', () => {
+    const signal = evaluateStructuralSignal([
+      {
+        id: 't4',
+        status: 'done',
+        gate_owner: 'gate:dev',
+        result: 'shipped',
+        assignee_agent_id: 'agent-builder',
+        latest_verdict: 'approved',
+        latest_verdict_by: 'agent-builder',
+      },
+    ])
+    expect(signal.ready).toBe(false)
+    expect(signal.reason).toBe('self_verdict')
   })
 
   it('blocks on missing evidence even when gates PASS', () => {
     const signal = evaluateStructuralSignal([
       {
-        id: 't1', status: 'done', gate_owner: 'gate:dev', result: null, latest_verdict: 'approved',
+        id: 't1',
+        status: 'done',
+        gate_owner: 'gate:dev',
+        result: null,
+        assignee_agent_id: 'agent-builder',
+        latest_verdict: 'approved',
+        latest_verdict_by: 'agent-reviewer',
       },
     ])
     expect(signal.ready).toBe(false)
@@ -217,7 +281,13 @@ describe('project structural completion gate', () => {
     try {
       insertProject(harness, 'proj-self')
       insertDoneTask(harness, {
-        id: 'task-self', projectId: 'proj-self', result: 'done work', gateOwner: null, verdict: null,
+        id: 'task-self',
+        projectId: 'proj-self',
+        result: 'done work',
+        gateOwner: 'gate:dev',
+        verdict: 'approved',
+        assigneeAgentId: 'agent-builder',
+        verdictBy: 'agent-reviewer',
       })
 
       const entered = await enterProjectReview(
@@ -236,6 +306,36 @@ describe('project structural completion gate', () => {
       )
       expect(selfVerdict).toEqual({ ok: false, error: 'self_verdict' })
       expect((await getProject(env, 'proj-self'))?.status).toBe('review')
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('P0-c TOCTOU: status compare-and-set rejects a stale completion write', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertProject(harness, 'proj-race')
+      const existing = await getProject(env, 'proj-race')
+      expect(existing?.status).toBe('active')
+
+      // Concurrent writer flips status between the caller's read and persist.
+      harness.sqlite.prepare(
+        "UPDATE projects SET status = 'paused', updated_at = ? WHERE id = ?",
+      ).run('2026-07-23T18:00:00.000Z', 'proj-race')
+
+      // Stale CAS targeting the pre-race (active, old updated_at) must write 0 rows.
+      const cas = await env.DB.prepare(
+        `UPDATE projects SET status = 'review', updated_at = ?
+          WHERE id = ? AND updated_at = ? AND status = ?`,
+      ).bind(
+        '2026-07-23T18:00:01.000Z',
+        'proj-race',
+        existing!.updated_at,
+        'active',
+      ).run()
+      expect(Number(cas.meta?.changes ?? 0)).toBe(0)
+      expect((await getProject(env, 'proj-race'))?.status).toBe('paused')
     } finally {
       harness.close()
     }

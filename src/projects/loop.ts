@@ -10,6 +10,7 @@ import {
   CIRCUIT_BREAKER_PRINCIPAL,
   defaultCircuitBreakerDeps,
   evaluateProjectCircuitBreaker,
+  shouldEvaluateBreaker,
   type CircuitBreakerDeps,
   type CircuitBreakerOutcome,
 } from './circuit-breaker'
@@ -96,25 +97,38 @@ const PROJECT_SELECT = `id, slug, name, description, goal, status, parent_projec
             cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by, created_at, updated_at`
 
 /**
- * Projects due for breaker evaluation: boundary elapsed, OR stalled with a
- * scheduled boundary (slice 4 early raise). Terminal / review statuses exempt.
+ * Projects due for breaker evaluation: boundary elapsed (UTC instant compare),
+ * OR stalled with a scheduled boundary (slice 4 early raise). Terminal / review
+ * statuses exempt. String lexicographic compare is NOT used — offset ISO forms
+ * like +03:00 would sort wrong against Zulu.
  */
 export async function listProjectsDueAtBoundary(
   env: Env,
   nowIso: string,
 ): Promise<Project[]> {
+  const nowMs = Date.parse(nowIso)
+  if (Number.isNaN(nowMs)) {
+    throw new Error('invalid_now_iso')
+  }
   const result = await env.DB.prepare(
     `SELECT ${PROJECT_SELECT}
        FROM projects
       WHERE cycle_boundary_at IS NOT NULL
         AND status NOT IN ('completed', 'archived', 'review')
-        AND (cycle_boundary_at <= ?1 OR stalled = 1)
       ORDER BY cycle_boundary_at ASC, id ASC
-      LIMIT ?2`,
+      LIMIT ?1`,
   )
-    .bind(nowIso, MAX_BOUNDARY_PROJECTS_PER_TICK)
+    .bind(MAX_BOUNDARY_PROJECTS_PER_TICK * 4)
     .all<Project>()
-  return result.results ?? []
+
+  const due: Project[] = []
+  for (const project of result.results ?? []) {
+    if (shouldEvaluateBreaker(project.status, project.cycle_boundary_at, nowIso, project.stalled)) {
+      due.push(project)
+    }
+    if (due.length >= MAX_BOUNDARY_PROJECTS_PER_TICK) break
+  }
+  return due
 }
 
 /** Active projects that may be ready for structural completion → review. */

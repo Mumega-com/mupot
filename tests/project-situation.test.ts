@@ -254,7 +254,7 @@ describe('loadProjectSituation', () => {
     harness.sqlite.prepare("UPDATE projects SET status = 'paused' WHERE id = ?").run(pausedProject.id)
     const paused = { ...pausedProject, status: 'paused' as const }
     expect(await loadProjectSituation(envFor(harness), paused, null)).toMatchObject({
-      health: 'paused', next_action: { type: 'continue_task', task: { id: 'paused-working' } },
+      health: 'paused', next_action: { type: 'resume_project' },
     })
     harness.sqlite.prepare('DELETE FROM tasks WHERE project_id = ?').run(paused.id)
     expect(await loadProjectSituation(envFor(harness), paused, null)).toMatchObject({
@@ -266,7 +266,7 @@ describe('loadProjectSituation', () => {
     ['paused', 'paused', 'resume_project'],
     ['completed', 'completed', 'verify_completion'],
     ['archived', 'archived', 'reopen_project'],
-  ] as const)('prioritizes %s lifecycle health', async (status, health, action) => {
+  ] as const)('prioritizes %s lifecycle health as absorbing', async (status, health, action) => {
     harness = makeHarness()
     const activeProject = insertProject(harness, `lifecycle-${status}`)
     const project = { ...activeProject, status }
@@ -276,7 +276,7 @@ describe('loadProjectSituation', () => {
     const situation = await loadProjectSituation(envFor(harness), project, null)
 
     expect(situation.health).toBe(health)
-    expect(situation.next_action?.type).toBe('unblock_task')
+    expect(situation.next_action?.type).toBe(action)
 
     harness.sqlite.prepare('DELETE FROM tasks WHERE project_id = ?').run(project.id)
     expect((await loadProjectSituation(envFor(harness), project, null)).next_action?.type).toBe(action)

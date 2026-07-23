@@ -10,6 +10,12 @@ import {
 } from '../projects/service'
 import type { ProjectMutationError } from '../projects/service'
 import { defaultStartGateDeps, startProject } from '../projects/start-gate'
+import { stripExternalLifecycleFields } from '../projects/lifecycle-input'
+import {
+  defaultCircuitBreakerDeps,
+  proposeProjectRecommit,
+  recommitPrincipalFromAuth,
+} from '../projects/circuit-breaker'
 import {
   projectReadAccessFromGrants,
   projectVisibilityClause,
@@ -290,7 +296,9 @@ const toolProjectUpdate: ToolSpec = {
     if (denied) return denied
     const projectId = str(args.project_id)
     if (!projectId) return fail(400, 'invalid_project_id')
-    const { project_id: _projectId, ...input } = args
+    const { project_id: _projectId, ...rawInput } = args
+    // Strip internal lifecycle flags even though schema forbids them — class coverage.
+    const input = stripExternalLifecycleFields(rawInput as Record<string, unknown>)
 
     // Slice 3: planned→active must go through start-gate (authorize + provision).
     if (str(input.status) === 'active') {
@@ -320,6 +328,43 @@ const toolProjectUpdate: ToolSpec = {
     if (!result.ok) return mutationFailure(result.error)
     await emitProjectMutation(env, auth.memberId as string, 'updated', result.value.id, { status: result.value.status })
     return done({ project: result.value })
+  },
+}
+
+const toolProjectRecommit: ToolSpec = {
+  name: 'project_recommit',
+  scope: 'workspace project cycle recommit (circuit breaker continuation)',
+  min: 'admin',
+  args: '{ project_id: string, reason?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      project_id: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
+    },
+    required: ['project_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const denied = requireWorkspaceAdmin(auth)
+    if (denied) return denied
+    const projectId = str(args.project_id)
+    if (!projectId) return fail(400, 'invalid_project_id')
+    // Principal from bound token only — ignore any forged principal field.
+    const principal = recommitPrincipalFromAuth(auth)
+    const reason = str(args.reason) || 'operator_recommit'
+    const result = await proposeProjectRecommit(
+      env,
+      projectId,
+      principal,
+      reason,
+      defaultCircuitBreakerDeps().writeReceipt,
+    )
+    if (!result.ok) {
+      const code = result.error === 'project_not_found' ? 404 : 409
+      return fail(code, result.error)
+    }
+    return done({ recommit: result.detail })
   },
 }
 
@@ -424,6 +469,7 @@ export const PROJECT_TOOLS: ToolSpec[] = [
   toolProjectList,
   toolProjectGet,
   toolProjectUpdate,
+  toolProjectRecommit,
   toolProjectSquadList,
   toolProjectSquadSet,
   toolProjectSquadRemove,

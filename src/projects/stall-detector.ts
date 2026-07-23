@@ -113,16 +113,23 @@ export function lastActivityFromSignals(signals: ProjectIdleSignals): string | n
   ])
 }
 
-/** Load the three idle signals for one project (unrestricted system loop). */
+/** Load idle signals from authoritative server-side timestamps only.
+ *  Agent-writable task.updated_at / result filler do NOT count — those are the
+ *  forgeable activity class. Activity requires an approved different-principal
+ *  verdict; flights and workflow receipts are server-stamped.
+ */
 export async function loadProjectIdleSignals(
   env: Env,
   projectId: string,
 ): Promise<ProjectIdleSignals> {
   const [taskRow, flightRow, evidenceRow] = await Promise.all([
     env.DB.prepare(
-      `SELECT MAX(updated_at) AS newest
-         FROM tasks
-        WHERE project_id = ?1`,
+      `SELECT MAX(v.decided_at) AS newest
+         FROM task_verdicts v
+         JOIN tasks t ON t.id = v.task_id
+        WHERE t.project_id = ?1
+          AND v.verdict = 'approved'
+          AND (t.assignee_agent_id IS NULL OR v.decided_by <> t.assignee_agent_id)`,
     )
       .bind(projectId)
       .first<{ newest: string | null }>(),
@@ -134,11 +141,9 @@ export async function loadProjectIdleSignals(
       .bind(projectId)
       .first<{ newest: string | null }>(),
     env.DB.prepare(
-      `SELECT MAX(COALESCE(completed_at, updated_at)) AS newest
-         FROM tasks
-        WHERE project_id = ?1
-          AND result IS NOT NULL
-          AND length(trim(result)) > 0`,
+      `SELECT MAX(created_at) AS newest
+         FROM workflow_receipts
+        WHERE project_id = ?1`,
     )
       .bind(projectId)
       .first<{ newest: string | null }>(),

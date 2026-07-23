@@ -190,6 +190,17 @@ function nextAction(
   open: ProjectSituationTask | null,
   flight: ProjectSituationFlight | null,
 ): ProjectSituationNextAction | null {
+  // Terminal / paused are absorbing — never auto-continue work past them.
+  if (project.status === 'paused') {
+    return { type: 'resume_project', label: 'Resume the project', project: projectTarget(project) }
+  }
+  if (project.status === 'completed') {
+    return { type: 'verify_completion', label: 'Verify completion evidence', project: projectTarget(project) }
+  }
+  if (project.status === 'archived') {
+    return { type: 'reopen_project', label: 'Reopen the project', project: projectTarget(project) }
+  }
+
   const review = reviews[0]
   if (review) return { type: 'review_task', label: `Review "${review.title}"`, task: review }
   const blocker = blockers[0]
@@ -199,15 +210,6 @@ function nextAction(
   if (flight) return { type: 'monitor_flight', label: `Monitor "${flight.goal}"`, flight }
   if (project.status === 'active') {
     return { type: 'create_task', label: 'Create the next project task', project: projectTarget(project) }
-  }
-  if (project.status === 'completed') {
-    return { type: 'verify_completion', label: 'Verify completion evidence', project: projectTarget(project) }
-  }
-  if (project.status === 'paused') {
-    return { type: 'resume_project', label: 'Resume the project', project: projectTarget(project) }
-  }
-  if (project.status === 'archived') {
-    return { type: 'reopen_project', label: 'Reopen the project', project: projectTarget(project) }
   }
   return null
 }

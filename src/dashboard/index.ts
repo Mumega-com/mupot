@@ -127,6 +127,7 @@ import {
   projectsPageBody,
   submittedProjectFormValues,
 } from './projects'
+import { stripExternalLifecycleFields } from '../projects/lifecycle-input'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
@@ -318,7 +319,11 @@ dashboardApp.post('/projects/:id/settings', async (c) => {
   }
   const projectId = c.req.param('id')
   const values = submittedProjectFormValues(await c.req.parseBody())
-  const result = await updateProject(c.env, projectId, projectMutationInput(values))
+  const result = await updateProject(
+    c.env,
+    projectId,
+    stripExternalLifecycleFields(projectMutationInput(values) as Record<string, unknown>) as ReturnType<typeof projectMutationInput>,
+  )
   if (!result.ok) {
     const project = await getProject(c.env, projectId)
     if (!project) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)

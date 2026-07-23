@@ -168,6 +168,15 @@ export async function hasReceiptedRecommit(
   projectId: string,
   boundaryAt: string,
 ): Promise<boolean> {
+  const detail = await loadRecommitOrKillDetail(env, projectId, boundaryAt)
+  return detail !== null && detail.decision === 'recommit' && detail.project_id === projectId
+}
+
+export async function loadRecommitOrKillDetail(
+  env: Env,
+  projectId: string,
+  boundaryAt: string,
+): Promise<RecommitOrKillReceiptDetail | null> {
   const row = await env.DB.prepare(
     `SELECT detail FROM workflow_receipts
       WHERE instance_id = ?1 AND step_name = ?2
@@ -175,8 +184,124 @@ export async function hasReceiptedRecommit(
   )
     .bind(cycleInstanceId(projectId, boundaryAt), RECOMMIT_OR_KILL_STEP)
     .first<{ detail: string | null }>()
-  const detail = parseRecommitOrKillDetail(row?.detail ?? null)
-  return detail !== null && detail.decision === 'recommit' && detail.project_id === projectId
+  return parseRecommitOrKillDetail(row?.detail ?? null)
+}
+
+/** Assignees on the project — self-recommit is refused for these principals. */
+export async function listProjectAssigneePrincipals(
+  env: Env,
+  projectId: string,
+): Promise<string[]> {
+  const result = await env.DB.prepare(
+    `SELECT DISTINCT assignee_agent_id AS principal
+       FROM tasks
+      WHERE project_id = ?1
+        AND assignee_agent_id IS NOT NULL
+        AND trim(assignee_agent_id) <> ''`,
+  )
+    .bind(projectId)
+    .all<{ principal: string }>()
+  return (result.results ?? []).map((row) => row.principal)
+}
+
+/** True when the recommit principal is one of the project's own assignees. */
+export function isSelfRecommit(
+  principal: string,
+  assigneePrincipals: readonly string[],
+): boolean {
+  if (principal.trim() === '') return true
+  return assigneePrincipals.includes(principal)
+}
+
+/**
+ * Derive recommit authority from the bound auth token — never from request body.
+ * Agent-bound tokens use boundAgentId; pure members use memberId; else userId.
+ */
+export function recommitPrincipalFromAuth(auth: {
+  boundAgentId?: string | null
+  memberId?: string
+  userId: string
+}): string {
+  if (typeof auth.boundAgentId === 'string' && auth.boundAgentId.trim() !== '') {
+    return auth.boundAgentId.trim()
+  }
+  if (typeof auth.memberId === 'string' && auth.memberId.trim() !== '') {
+    return auth.memberId.trim()
+  }
+  return auth.userId
+}
+
+export type ProposeRecommitError =
+  | 'project_not_found'
+  | 'no_boundary'
+  | 'terminal_status'
+  | 'invalid_principal'
+  | 'self_recommit'
+  | 'already_decided'
+  | 'receipt_failed'
+
+export type ProposeRecommitResult =
+  | { ok: true; detail: RecommitOrKillReceiptDetail }
+  | { ok: false; error: ProposeRecommitError }
+
+/**
+ * Record a recommit for the project's current boundary.
+ * Principal MUST be server-derived (recommitPrincipalFromAuth) — never body-supplied.
+ * Assignees cannot recommit their own project (self-recommit).
+ */
+export async function proposeProjectRecommit(
+  env: Env,
+  projectId: string,
+  principal: string,
+  reason: string,
+  writeReceipt: WriteReceiptFn,
+): Promise<ProposeRecommitResult> {
+  if (principal.trim() === '') return { ok: false, error: 'invalid_principal' }
+  if (reason.trim() === '') return { ok: false, error: 'invalid_principal' }
+
+  const project = await env.DB.prepare(
+    `SELECT id, status, cycle_boundary_at FROM projects WHERE id = ?1`,
+  )
+    .bind(projectId)
+    .first<{ id: string; status: ProjectStatus; cycle_boundary_at: string | null }>()
+  if (!project) return { ok: false, error: 'project_not_found' }
+  if (project.status === 'completed' || project.status === 'archived') {
+    return { ok: false, error: 'terminal_status' }
+  }
+  if (project.cycle_boundary_at === null || project.cycle_boundary_at.trim() === '') {
+    return { ok: false, error: 'no_boundary' }
+  }
+
+  const assignees = await listProjectAssigneePrincipals(env, projectId)
+  if (isSelfRecommit(principal, assignees)) {
+    return { ok: false, error: 'self_recommit' }
+  }
+
+  const existing = await loadRecommitOrKillDetail(env, projectId, project.cycle_boundary_at)
+  if (existing !== null) {
+    if (existing.decision === 'recommit' && existing.principal === principal) {
+      return { ok: true, detail: existing }
+    }
+    return { ok: false, error: 'already_decided' }
+  }
+
+  const detail = await recordRecommitOrKill(
+    env,
+    {
+      projectId,
+      boundaryAt: project.cycle_boundary_at,
+      decision: 'recommit',
+      principal,
+      reason: reason.trim(),
+    },
+    writeReceipt,
+  )
+
+  const stored = await loadRecommitOrKillDetail(env, projectId, project.cycle_boundary_at)
+  if (stored === null || stored.decision !== 'recommit' || stored.principal !== principal) {
+    return { ok: false, error: 'already_decided' }
+  }
+  return { ok: true, detail }
 }
 
 export function defaultCircuitBreakerDeps(): CircuitBreakerDeps {
@@ -191,6 +316,10 @@ export function defaultCircuitBreakerDeps(): CircuitBreakerDeps {
 /**
  * At a due boundary (or early when stalled): receipted recommit → keep status;
  * else kill receipt + archive. Stall never auto-fixes — it only advances this check.
+ *
+ * Atomic vs TOCTOU: write kill via INSERT OR IGNORE, then read back the durable
+ * decision. If a concurrent recommit won the unique key, we observe recommit and
+ * skip archive. Only a stored kill decision proceeds to the status CAS archive.
  */
 export async function evaluateProjectCircuitBreaker(
   env: Env,
@@ -204,10 +333,6 @@ export async function evaluateProjectCircuitBreaker(
   const boundaryAt = project.cycle_boundary_at
   if (boundaryAt === null) return 'skipped'
 
-  if (await deps.hasRecommit(env, project.id, boundaryAt)) {
-    return 'recommitted'
-  }
-
   await recordRecommitOrKill(
     env,
     {
@@ -219,6 +344,14 @@ export async function evaluateProjectCircuitBreaker(
     },
     deps.writeReceipt,
   )
+
+  const stored = await loadRecommitOrKillDetail(env, project.id, boundaryAt)
+  if (stored !== null && stored.decision === 'recommit') {
+    return 'recommitted'
+  }
+  if (stored === null || stored.decision !== 'kill') {
+    throw new Error('circuit_breaker_decision_missing')
+  }
 
   const archived = await deps.updateProject(env, project.id, { status: 'archived' })
   if (!archived.ok) {

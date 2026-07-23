@@ -46,6 +46,9 @@ function makeHarness(): SqliteD1Harness {
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept-a', 'squad-a', 'Squad A');
+    INSERT INTO agents (id, squad_id, slug, name, status, created_at) VALUES
+      ('agent-worker', 'squad-a', 'agent-worker', 'Worker', 'active', '2026-06-01T00:00:00.000Z'),
+      ('agent-reviewer', 'squad-a', 'agent-reviewer', 'Reviewer', 'active', '2026-06-01T00:00:00.000Z');
   `)
   return harness
 }
@@ -94,17 +97,47 @@ function insertProject(
 
 function insertTaskActivity(
   harness: SqliteD1Harness,
-  input: { id: string; projectId: string; updatedAt: string; result?: string | null },
+  input: {
+    id: string
+    projectId: string
+    updatedAt: string
+    result?: string | null
+    /** When set, writes an approved different-principal verdict at this time (authoritative activity). */
+    verdictAt?: string
+  },
 ): void {
   const resultSql = input.result === undefined || input.result === null
     ? 'NULL'
     : `'${input.result.replace(/'/g, "''")}'`
   harness.sqlite.exec(`
     INSERT INTO tasks (
-      id, squad_id, title, body, status, project_id, created_at, updated_at, result
+      id, squad_id, title, body, status, project_id, assignee_agent_id, created_at, updated_at, result
     ) VALUES (
-      '${input.id}', 'squad-a', 'Task ${input.id}', '', 'open', '${input.projectId}',
+      '${input.id}', 'squad-a', 'Task ${input.id}', '', 'done', '${input.projectId}', 'agent-worker',
       '${input.updatedAt}', '${input.updatedAt}', ${resultSql}
+    );
+  `)
+  if (input.verdictAt !== undefined) {
+    harness.sqlite.exec(`
+      INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, project_id)
+      VALUES (
+        'verdict-${input.id}', '${input.id}', 'approved', NULL, 'agent-reviewer',
+        '${input.verdictAt}', '${input.projectId}'
+      );
+    `)
+  }
+}
+
+function insertWorkflowReceipt(
+  harness: SqliteD1Harness,
+  input: { id: string; projectId: string; taskId: string; createdAt: string },
+): void {
+  harness.sqlite.exec(`
+    INSERT INTO workflow_receipts
+      (id, instance_id, task_id, step_name, status, detail, created_at, project_id)
+    VALUES (
+      '${input.id}', 'inst-${input.id}', '${input.taskId}', 'execute', 'ok', NULL,
+      '${input.createdAt}', '${input.projectId}'
     );
   `)
 }
@@ -165,6 +198,7 @@ describe('stall detector — under / over / reset', () => {
         id: 'task-fresh',
         projectId: 'proj-1',
         updatedAt: '2026-07-20T12:00:00.000Z',
+        verdictAt: '2026-07-20T12:00:00.000Z',
       })
 
       const outcome = await evaluateProjectStall(
@@ -190,6 +224,7 @@ describe('stall detector — under / over / reset', () => {
         id: 'task-old',
         projectId: 'proj-1',
         updatedAt: '2026-07-01T12:00:00.000Z',
+        verdictAt: '2026-07-01T12:00:00.000Z',
       })
 
       const outcome = await evaluateProjectStall(
@@ -216,6 +251,7 @@ describe('stall detector — under / over / reset', () => {
         id: 'task-reset',
         projectId: 'proj-1',
         updatedAt: '2026-07-22T12:00:00.000Z',
+        verdictAt: '2026-07-22T12:00:00.000Z',
       })
 
       const outcome = await evaluateProjectStall(
@@ -240,6 +276,7 @@ describe('stall detector — under / over / reset', () => {
         id: 'task-a',
         projectId: 'proj-1',
         updatedAt: '2026-07-10T00:00:00.000Z',
+        verdictAt: '2026-07-10T00:00:00.000Z',
       })
       insertFlightEvent(harness, {
         id: 'evt-1',
@@ -250,7 +287,14 @@ describe('stall detector — under / over / reset', () => {
         id: 'task-ev',
         projectId: 'proj-1',
         updatedAt: '2026-07-12T00:00:00.000Z',
+        verdictAt: '2026-07-12T00:00:00.000Z',
         result: '{"ok":true}',
+      })
+      insertWorkflowReceipt(harness, {
+        id: 'wr-ev',
+        projectId: 'proj-1',
+        taskId: 'task-ev',
+        createdAt: '2026-07-12T00:00:00.000Z',
       })
 
       const signals = await loadProjectIdleSignals(env, 'proj-1')

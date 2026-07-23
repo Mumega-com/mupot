@@ -352,13 +352,16 @@ export async function updateProject(
     updated_at: nextUpdatedAt(existing.updated_at),
   }
   try {
+    // Compare-and-set on (id, updated_at, status) closes the check-then-write
+    // TOCTOU: a concurrent status flip between getProject and this UPDATE loses.
     const result = await env.DB.prepare(
       `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
-       target_date = ?, completion_proposed_by = ?, updated_at = ? WHERE id = ? AND updated_at = ?`,
+       target_date = ?, completion_proposed_by = ?, updated_at = ?
+       WHERE id = ? AND updated_at = ? AND status = ?`,
     ).bind(
       updated.slug, updated.name, updated.description, updated.goal, updated.status,
       updated.parent_project_id, updated.target_date, updated.completion_proposed_by, updated.updated_at,
-      updated.id, existing.updated_at,
+      updated.id, existing.updated_at, existing.status,
     ).run()
     if (!wrote(result)) {
       const current = await getProject(env, id)

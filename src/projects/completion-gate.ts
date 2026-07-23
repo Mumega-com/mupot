@@ -14,6 +14,9 @@ import { writeReceiptToD1 } from '../workflows/pipeline'
 import { lifecycleTaskId } from './circuit-breaker'
 import { getProject, updateProject, type ProjectMutationResult } from './service'
 
+/** Must match AGENT_SELF_COMPLETION_GATE_OWNER in agents/execute.ts — never structural evidence. */
+export const AGENT_SELF_COMPLETION_GATE = 'gate:agent-self-completion'
+
 export const PROJECT_COMPLETION_GATE = 'gate:project-completion'
 export const LESSONS_CAPTURE_STEP = 'lessons_capture'
 export const LESSONS_CAPTURE_SCHEMA = 'mupot.lessons_capture/v1'
@@ -27,6 +30,8 @@ export type StructuralBlockReason =
   | 'task_not_terminal'
   | 'gate_not_pass'
   | 'missing_evidence'
+  | 'self_gated'
+  | 'self_verdict'
 
 export interface StructuralCompletionSignal {
   ready: boolean
@@ -41,7 +46,9 @@ export interface ChildTaskRow {
   status: string
   gate_owner: string | null
   result: string | null
+  assignee_agent_id: string | null
   latest_verdict: string | null
+  latest_verdict_by: string | null
 }
 
 export type WriteReceiptFn = (
@@ -95,10 +102,32 @@ function hasEvidence(result: string | null): boolean {
   return result !== null && result.trim() !== ''
 }
 
+function hasRealGateOwner(gateOwner: string | null): boolean {
+  if (gateOwner === null || gateOwner.trim() === '') return false
+  // Self-satisfiable agent gate is never structural completion evidence.
+  if (gateOwner === AGENT_SELF_COMPLETION_GATE) return false
+  return true
+}
+
+/**
+ * Approved verdict must come from a DIFFERENT principal than the assignee
+ * (or be a human/member sign-off whose id ≠ assignee). Assignee self-verdict
+ * and missing decider are rejected.
+ */
+export function isTaskSelfVerdict(
+  assigneeAgentId: string | null,
+  verdictBy: string | null,
+): boolean {
+  if (verdictBy === null || verdictBy.trim() === '') return true
+  if (assigneeAgentId === null || assigneeAgentId.trim() === '') return false
+  return assigneeAgentId === verdictBy
+}
+
 /**
  * Pure structural signal over child task rows.
- * PASS = status done; gated tasks also need latest_verdict === 'approved';
- * evidence = non-empty result on every child.
+ * Every child must be done, carry a real (non-self) gate_owner, an approved
+ * verdict from a different principal than the assignee, and non-empty evidence.
+ * Ungated done+result and gate:agent-self-completion never count.
  */
 export function evaluateStructuralSignal(tasks: readonly ChildTaskRow[]): StructuralCompletionSignal {
   if (tasks.length === 0) {
@@ -124,18 +153,43 @@ export function evaluateStructuralSignal(tasks: readonly ChildTaskRow[]): Struct
         evidence_count: evidenceCount,
       }
     }
-    if (task.gate_owner !== null && task.gate_owner.trim() !== '') {
-      if (task.latest_verdict !== 'approved') {
-        return {
-          ready: false,
-          reason: 'gate_not_pass',
-          task_count: tasks.length,
-          gated_pass_count: gatedPassCount,
-          evidence_count: evidenceCount,
-        }
+    if (task.gate_owner === AGENT_SELF_COMPLETION_GATE) {
+      return {
+        ready: false,
+        reason: 'self_gated',
+        task_count: tasks.length,
+        gated_pass_count: gatedPassCount,
+        evidence_count: evidenceCount,
       }
-      gatedPassCount += 1
     }
+    if (!hasRealGateOwner(task.gate_owner)) {
+      return {
+        ready: false,
+        reason: 'gate_not_pass',
+        task_count: tasks.length,
+        gated_pass_count: gatedPassCount,
+        evidence_count: evidenceCount,
+      }
+    }
+    if (task.latest_verdict !== 'approved') {
+      return {
+        ready: false,
+        reason: 'gate_not_pass',
+        task_count: tasks.length,
+        gated_pass_count: gatedPassCount,
+        evidence_count: evidenceCount,
+      }
+    }
+    if (isTaskSelfVerdict(task.assignee_agent_id, task.latest_verdict_by)) {
+      return {
+        ready: false,
+        reason: 'self_verdict',
+        task_count: tasks.length,
+        gated_pass_count: gatedPassCount,
+        evidence_count: evidenceCount,
+      }
+    }
+    gatedPassCount += 1
     if (!hasEvidence(task.result)) {
       return {
         ready: false,
@@ -163,12 +217,19 @@ export async function loadChildTaskRows(env: Env, projectId: string): Promise<Ch
             t.status AS status,
             t.gate_owner AS gate_owner,
             t.result AS result,
+            t.assignee_agent_id AS assignee_agent_id,
             (
               SELECT v.verdict FROM task_verdicts v
                WHERE v.task_id = t.id
                ORDER BY v.decided_at DESC, v.id DESC
                LIMIT 1
-            ) AS latest_verdict
+            ) AS latest_verdict,
+            (
+              SELECT v.decided_by FROM task_verdicts v
+               WHERE v.task_id = t.id
+               ORDER BY v.decided_at DESC, v.id DESC
+               LIMIT 1
+            ) AS latest_verdict_by
        FROM tasks t
       WHERE t.project_id = ?1
       ORDER BY t.id ASC`,
@@ -205,7 +266,9 @@ function mapStructuralBlock(reason: StructuralBlockReason): EnterReviewError {
   if (reason === 'missing_evidence') return 'missing_completion_evidence'
   if (reason === 'no_tasks') return 'no_tasks'
   if (reason === 'task_not_terminal') return 'task_not_terminal'
-  if (reason === 'gate_not_pass') return 'gate_not_pass'
+  if (reason === 'gate_not_pass' || reason === 'self_gated' || reason === 'self_verdict') {
+    return 'gate_not_pass'
+  }
   return 'structural_completion_required'
 }
 
@@ -213,7 +276,8 @@ function mapStructuralBlockToVerdict(reason: StructuralBlockReason): ProjectVerd
   if (reason === 'missing_evidence') return 'missing_completion_evidence'
   if (reason === 'no_tasks') return 'no_tasks'
   if (reason === 'task_not_terminal') return 'task_not_terminal'
-  if (reason === 'gate_not_pass') return 'gate_not_pass'
+  if (reason === 'gate_not_pass' || reason === 'self_gated') return 'gate_not_pass'
+  if (reason === 'self_verdict') return 'self_verdict'
   return 'structural_completion_required'
 }
 

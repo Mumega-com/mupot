@@ -20,6 +20,7 @@ import {
   GHOST_START_ALARM_SCHEMA,
   GHOST_START_ALARM_STEP,
   START_GATE_SCHEMA,
+  START_GATE_SEED_MARKER,
   START_GATE_STEP,
   commitSquadResource,
   defaultGhostStartDeps,
@@ -104,6 +105,7 @@ function makeDeps(overrides: Partial<StartGateDeps> = {}): StartGateDeps {
       tokenId: 'tok-1',
       memberId: 'mem-agent-1',
     })),
+    revokeMemberToken: vi.fn(async () => true),
     resolveActiveAgentMember: vi.fn(async () => 'unminted' as const),
     upsertActiveAgentCapabilityGrant: vi.fn(async () => ({ result: 'created' as const })),
     createTask: vi.fn(async (_env, input) => ({
@@ -130,13 +132,14 @@ describe('seedTaskFromGoal (pure)', () => {
   it('derives title/body/done_when from the project goal', () => {
     expect(seedTaskFromGoal({ name: 'Alpha', goal: 'Land the charter' })).toEqual({
       title: 'Land the charter',
-      body: 'Land the charter',
+      body: `Land the charter\n\n${START_GATE_SEED_MARKER}`,
       done_when: 'First delivery toward: Land the charter',
     })
   })
 
   it('falls back to the project name when goal is blank', () => {
     expect(seedTaskFromGoal({ name: 'Alpha', goal: '   ' }).title).toBe('Start Alpha')
+    expect(seedTaskFromGoal({ name: 'Alpha', goal: '   ' }).body).toContain(START_GATE_SEED_MARKER)
   })
 })
 
@@ -155,7 +158,7 @@ describe('commitSquadResource (existing grant path)', () => {
           upsertActiveAgentCapabilityGrant: async () => ({ result: 'created' }),
         },
       )
-      expect(result).toEqual({ kind: 'minted', memberId: 'mem' })
+      expect(result).toEqual({ kind: 'minted', memberId: 'mem', tokenId: 'tok' })
       expect(mint).toHaveBeenCalledTimes(1)
     } finally {
       harness.close()
@@ -176,7 +179,7 @@ describe('commitSquadResource (existing grant path)', () => {
           upsertActiveAgentCapabilityGrant: upsert,
         },
       )
-      expect(result).toEqual({ kind: 'confirmed', memberId: 'mem-existing' })
+      expect(result).toEqual({ kind: 'confirmed', memberId: 'mem-existing', tokenId: null })
       expect(upsert).toHaveBeenCalledWith(env, expect.objectContaining({
         agentId: 'agent-a',
         expectedMemberId: 'mem-existing',
