@@ -55,7 +55,7 @@ All three tests from the brief pass:
 ```
 1335f03 feat: Cloudflare Worker secrets client for secret-env
 9b6615b docs: secret-env CF bootstrap comments in wrangler template
-0027de1 test: cover deleteScriptSecret and per-field fail-closed config
+8655558 test: cover deleteScriptSecret and per-field fail-closed config
 ```
 
 ## Concerns
@@ -70,7 +70,7 @@ All three tests from the brief pass:
 
 ## Review Follow-Up: Important Findings
 
-Commit: `0027de1 test: cover deleteScriptSecret and per-field fail-closed config`
+Commit: `8655558 test: cover deleteScriptSecret and per-field fail-closed config`
 
 Fixes:
 1. **`deleteScriptSecret` tests** — success DELETE path + `cf_secrets_delete_failed` on CF error
