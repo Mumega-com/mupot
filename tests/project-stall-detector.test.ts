@@ -109,6 +109,42 @@ function insertTaskActivity(
   `)
 }
 
+/** Authenticated progress receipt (dispatch) — not forgeable via task metadata edits. */
+function insertProgressReceipt(
+  harness: SqliteD1Harness,
+  input: { id: string; projectId: string; createdAt: string },
+): void {
+  harness.sqlite.exec(`
+    INSERT INTO tasks (
+      id, squad_id, title, body, status, project_id, created_at, updated_at
+    ) VALUES (
+      'task-${input.id}', 'squad-a', 'Task ${input.id}', '', 'in_progress', '${input.projectId}',
+      '${input.createdAt}', '${input.createdAt}'
+    );
+    INSERT INTO task_dispatch_receipts (
+      id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at
+    ) VALUES (
+      '${input.id}', '${TENANT}', 'task-${input.id}', 'squad-a', 'agent-a', 'agent', 'agent-a',
+      '${input.createdAt}'
+    );
+  `)
+}
+
+function insertDoneEvidence(
+  harness: SqliteD1Harness,
+  input: { id: string; projectId: string; completedAt: string },
+): void {
+  harness.sqlite.exec(`
+    INSERT INTO tasks (
+      id, squad_id, title, body, status, project_id, created_at, updated_at,
+      completed_at, result
+    ) VALUES (
+      '${input.id}', 'squad-a', 'Task ${input.id}', '', 'done', '${input.projectId}',
+      '${input.completedAt}', '${input.completedAt}', '${input.completedAt}', '{"ok":true}'
+    );
+  `)
+}
+
 function insertFlightEvent(
   harness: SqliteD1Harness,
   input: { id: string; projectId: string; createdAt: string },
@@ -147,24 +183,37 @@ describe('stall idle helpers', () => {
     expect(isPastStallThreshold(7.01, 7)).toBe(true)
     expect(
       lastActivityFromSignals({
-        newest_task_activity_at: '2026-07-10T00:00:00.000Z',
+        newest_progress_receipt_at: '2026-07-10T00:00:00.000Z',
         newest_flight_event_at: '2026-07-20T00:00:00.000Z',
         newest_evidence_at: '2026-07-15T00:00:00.000Z',
-      }),
+      }, NOW),
     ).toBe('2026-07-20T00:00:00.000Z')
+  })
+
+  it('fail-closes future timestamps (cannot suppress stall)', () => {
+    expect(() => idleDurationDays('2099-01-01T00:00:00.000Z', CREATED, NOW)).toThrow(
+      'invalid_last_activity_iso',
+    )
+    expect(
+      lastActivityFromSignals({
+        newest_progress_receipt_at: '2099-01-01T00:00:00.000Z',
+        newest_flight_event_at: null,
+        newest_evidence_at: null,
+      }, NOW),
+    ).toBeNull()
   })
 })
 
 describe('stall detector — under / over / reset', () => {
-  it('under-threshold: recent activity leaves stalled=0 (no flag)', async () => {
+  it('under-threshold: recent authenticated progress leaves stalled=0 (no flag)', async () => {
     const harness = makeHarness()
     const env = envFor(harness)
     try {
       insertProject(harness, { stall_threshold_days: 7 })
-      insertTaskActivity(harness, {
-        id: 'task-fresh',
+      insertProgressReceipt(harness, {
+        id: 'prog-fresh',
         projectId: 'proj-1',
-        updatedAt: '2026-07-20T12:00:00.000Z',
+        createdAt: '2026-07-20T12:00:00.000Z',
       })
 
       const outcome = await evaluateProjectStall(
@@ -181,15 +230,40 @@ describe('stall detector — under / over / reset', () => {
     }
   })
 
+  it('title/body churn on tasks.updated_at does NOT count as progress', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertProject(harness, { stall_threshold_days: 7, created_at: '2026-06-01T00:00:00.000Z' })
+      // Fresh metadata churn only — no authenticated receipt.
+      insertTaskActivity(harness, {
+        id: 'task-churn',
+        projectId: 'proj-1',
+        updatedAt: '2026-07-22T12:00:00.000Z',
+      })
+
+      const outcome = await evaluateProjectStall(
+        env,
+        loadProjectRow(harness, 'proj-1'),
+        NOW,
+        defaultStallDetectorDeps(),
+      )
+      expect(outcome).toBe('flagged')
+      expect(loadProjectRow(harness, 'proj-1').stalled).toBe(1)
+    } finally {
+      harness.close()
+    }
+  })
+
   it('over-threshold: idle past threshold sets stalled=1 without archiving', async () => {
     const harness = makeHarness()
     const env = envFor(harness)
     try {
       insertProject(harness, { stall_threshold_days: 7 })
-      insertTaskActivity(harness, {
-        id: 'task-old',
+      insertProgressReceipt(harness, {
+        id: 'prog-old',
         projectId: 'proj-1',
-        updatedAt: '2026-07-01T12:00:00.000Z',
+        createdAt: '2026-07-01T12:00:00.000Z',
       })
 
       const outcome = await evaluateProjectStall(
@@ -207,15 +281,15 @@ describe('stall detector — under / over / reset', () => {
     }
   })
 
-  it('activity resets the counter: fresh signal clears stalled=1 → 0', async () => {
+  it('activity resets the counter: fresh progress receipt clears stalled=1 → 0', async () => {
     const harness = makeHarness()
     const env = envFor(harness)
     try {
       insertProject(harness, { stalled: 1, stall_threshold_days: 7 })
-      insertTaskActivity(harness, {
-        id: 'task-reset',
+      insertProgressReceipt(harness, {
+        id: 'prog-reset',
         projectId: 'proj-1',
-        updatedAt: '2026-07-22T12:00:00.000Z',
+        createdAt: '2026-07-22T12:00:00.000Z',
       })
 
       const outcome = await evaluateProjectStall(
@@ -231,33 +305,32 @@ describe('stall detector — under / over / reset', () => {
     }
   })
 
-  it('idle signals take max of task activity, flight event, and evidence', async () => {
+  it('idle signals take max of progress receipts, flight events, and evidence', async () => {
     const harness = makeHarness()
     const env = envFor(harness)
     try {
       insertProject(harness, {})
-      insertTaskActivity(harness, {
-        id: 'task-a',
+      insertProgressReceipt(harness, {
+        id: 'prog-a',
         projectId: 'proj-1',
-        updatedAt: '2026-07-10T00:00:00.000Z',
+        createdAt: '2026-07-10T00:00:00.000Z',
       })
       insertFlightEvent(harness, {
         id: 'evt-1',
         projectId: 'proj-1',
         createdAt: '2026-07-18T00:00:00.000Z',
       })
-      insertTaskActivity(harness, {
+      insertDoneEvidence(harness, {
         id: 'task-ev',
         projectId: 'proj-1',
-        updatedAt: '2026-07-12T00:00:00.000Z',
-        result: '{"ok":true}',
+        completedAt: '2026-07-12T00:00:00.000Z',
       })
 
       const signals = await loadProjectIdleSignals(env, 'proj-1')
-      expect(signals.newest_task_activity_at).toBe('2026-07-12T00:00:00.000Z')
+      expect(signals.newest_progress_receipt_at).toBe('2026-07-10T00:00:00.000Z')
       expect(signals.newest_flight_event_at).toBe('2026-07-18T00:00:00.000Z')
       expect(signals.newest_evidence_at).toBe('2026-07-12T00:00:00.000Z')
-      expect(lastActivityFromSignals(signals)).toBe('2026-07-18T00:00:00.000Z')
+      expect(lastActivityFromSignals(signals, NOW)).toBe('2026-07-18T00:00:00.000Z')
     } finally {
       harness.close()
     }
@@ -285,10 +358,10 @@ describe('stalled raises circuit breaker early', () => {
         stall_threshold_days: 7,
         cycle_boundary_at: FUTURE_BOUNDARY,
       })
-      insertTaskActivity(harness, {
-        id: 'task-stale',
+      insertProgressReceipt(harness, {
+        id: 'prog-stale',
         projectId: 'proj-1',
-        updatedAt: '2026-07-01T12:00:00.000Z',
+        createdAt: '2026-07-01T12:00:00.000Z',
       })
 
       const tick = await runProjectLoopTick(env, { nowIso: () => NOW })

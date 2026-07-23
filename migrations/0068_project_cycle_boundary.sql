@@ -7,9 +7,15 @@
 -- (detector itself is slice 4 — columns land here so the breaker can read them
 -- without a later schema fork).
 --
--- cycle_boundary_at: next ISO-8601 instant at which the breaker evaluates.
+-- cycle_boundary_at: next ISO-8601 instant at which the breaker evaluates
+--   (stored as canonical UTC via Date.prototype.toISOString / ...Z).
 -- stalled: 0/1 flag raised by the stall detector (does not auto-kill by itself).
 -- stall_threshold_days: per-project idle threshold; NULL = tenant default.
+--
+-- Single-apply migration — idempotent via the wrangler / D1 runner's applied-version
+-- guard (d1_migrations). SQLite does not support ADD COLUMN IF NOT EXISTS; re-running
+-- this file outside the runner would duplicate ADD COLUMN and fail. Do not re-apply
+-- manually; rely on d1_migrations to skip already-applied versions.
 
 ALTER TABLE projects ADD COLUMN cycle_boundary_at TEXT;
 ALTER TABLE projects ADD COLUMN stalled INTEGER NOT NULL DEFAULT 0;

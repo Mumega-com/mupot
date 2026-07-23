@@ -254,7 +254,7 @@ describe('loadProjectSituation', () => {
     harness.sqlite.prepare("UPDATE projects SET status = 'paused' WHERE id = ?").run(pausedProject.id)
     const paused = { ...pausedProject, status: 'paused' as const }
     expect(await loadProjectSituation(envFor(harness), paused, null)).toMatchObject({
-      health: 'paused', next_action: { type: 'continue_task', task: { id: 'paused-working' } },
+      health: 'paused', next_action: { type: 'resume_project' },
     })
     harness.sqlite.prepare('DELETE FROM tasks WHERE project_id = ?').run(paused.id)
     expect(await loadProjectSituation(envFor(harness), paused, null)).toMatchObject({
@@ -271,12 +271,18 @@ describe('loadProjectSituation', () => {
     const activeProject = insertProject(harness, `lifecycle-${status}`)
     const project = { ...activeProject, status }
     insertTask(harness, project.id, { id: `${status}-blocker`, status: 'blocked' })
+    // Bypass structural-completion trigger for fixture setup (done child required).
+    harness.sqlite.prepare("UPDATE tasks SET status = 'done' WHERE project_id = ?").run(project.id)
     harness.sqlite.prepare('UPDATE projects SET status = ? WHERE id = ?').run(status, project.id)
+    // Restore a residual blocked-looking row for the residual-work assertion path:
+    // status flip already landed; insert a non-done task after the flip.
+    harness.sqlite.prepare("UPDATE tasks SET status = 'blocked' WHERE project_id = ?").run(project.id)
 
     const situation = await loadProjectSituation(envFor(harness), project, null)
 
     expect(situation.health).toBe(health)
-    expect(situation.next_action?.type).toBe('unblock_task')
+    // Residual tasks must NOT auto-continue; only governed resume/reopen/verify.
+    expect(situation.next_action?.type).toBe(action)
 
     harness.sqlite.prepare('DELETE FROM tasks WHERE project_id = ?').run(project.id)
     expect((await loadProjectSituation(envFor(harness), project, null)).next_action?.type).toBe(action)

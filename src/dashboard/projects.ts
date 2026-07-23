@@ -1087,6 +1087,7 @@ function projectMutationMessage(error: ProjectMutationError): string {
     completion_gate_required: 'Project completion requires a structural gate and different-principal verdict.',
     start_gate_required: 'Activating a planned project requires the start gate (seed first task + resource commit).',
     invalid_target_date: 'Enter a valid target date.',
+    invalid_cycle_boundary_at: 'Enter a valid UTC cycle boundary timestamp.',
     slug_taken: 'That project slug is already in use.',
     project_not_found: 'The project no longer exists.',
     parent_not_found: 'The selected parent project was not found.',

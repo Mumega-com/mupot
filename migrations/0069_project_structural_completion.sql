@@ -61,7 +61,8 @@ CREATE TABLE projects_new (
   goal                   TEXT NOT NULL DEFAULT '',
   status                 TEXT NOT NULL DEFAULT 'active'
                          CHECK (status IN ('planned','active','paused','review','completed','archived')),
-  parent_project_id      TEXT,
+  -- Restore self-referential FK from 0055 (dropped when this migration recreated the table).
+  parent_project_id      TEXT REFERENCES projects_new(id) ON DELETE RESTRICT,
   target_date            TEXT,
   cycle_boundary_at      TEXT,
   stalled                INTEGER NOT NULL DEFAULT 0,
@@ -111,6 +112,21 @@ WHEN NEW.status = 'archived'
  )
 BEGIN
   SELECT RAISE(ABORT, 'active child projects');
+END;
+
+-- TOCTOU fence: refuse review/completed flips while any child task is incomplete.
+-- Full gate/verdict/evidence predicate is re-checked in completion-gate.ts; this
+-- trigger closes the concurrent reopen/add race on task status.
+CREATE TRIGGER validate_projects_structural_status
+BEFORE UPDATE OF status ON projects
+WHEN (NEW.status = 'review' OR NEW.status = 'completed')
+ AND OLD.status <> NEW.status
+ AND EXISTS (
+   SELECT 1 FROM tasks
+   WHERE project_id = NEW.id AND status <> 'done'
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'structural completion required');
 END;
 
 CREATE TRIGGER validate_projects_parent_insert

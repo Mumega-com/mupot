@@ -8,7 +8,10 @@
 import type { Env, Project } from '../types'
 import {
   CIRCUIT_BREAKER_PRINCIPAL,
+  canonicalizeUtcIso,
+  clearInvalidCycleBoundary,
   defaultCircuitBreakerDeps,
+  epochMs,
   evaluateProjectCircuitBreaker,
   type CircuitBreakerDeps,
   type CircuitBreakerOutcome,
@@ -41,6 +44,8 @@ export const MAX_BOUNDARY_PROJECTS_PER_TICK = 25
 export const MAX_COMPLETION_PROJECTS_PER_TICK = 25
 export const MAX_GHOST_START_PROJECTS_PER_TICK = 25
 export const MAX_STALL_PROJECTS_PER_TICK = 25
+/** Over-fetch candidates so epoch filtering / invalid clears still fill the tick cap. */
+const LIST_CANDIDATE_MULTIPLIER = 4
 export const STRUCTURAL_COMPLETION_PRINCIPAL = 'system:project-loop'
 
 export interface ProjectLoopTickResult {
@@ -96,25 +101,60 @@ const PROJECT_SELECT = `id, slug, name, description, goal, status, parent_projec
             cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by, created_at, updated_at`
 
 /**
- * Projects due for breaker evaluation: boundary elapsed, OR stalled with a
- * scheduled boundary (slice 4 early raise). Terminal / review statuses exempt.
+ * Projects due for breaker evaluation: boundary elapsed (UTC epoch compare),
+ * OR stalled with a scheduled boundary (slice 4 early raise). Terminal / review
+ * statuses exempt. Invalid (NaN) boundaries are cleared so they cannot retry forever.
  */
 export async function listProjectsDueAtBoundary(
   env: Env,
   nowIso: string,
 ): Promise<Project[]> {
+  const nowCanonical = canonicalizeUtcIso(nowIso)
+  if (nowCanonical === null) {
+    throw new Error('project_loop_invalid_now')
+  }
+  const nowMs = epochMs(nowCanonical)
+  if (nowMs === null) {
+    throw new Error('project_loop_invalid_now')
+  }
+
   const result = await env.DB.prepare(
     `SELECT ${PROJECT_SELECT}
        FROM projects
       WHERE cycle_boundary_at IS NOT NULL
         AND status NOT IN ('completed', 'archived', 'review')
-        AND (cycle_boundary_at <= ?1 OR stalled = 1)
       ORDER BY cycle_boundary_at ASC, id ASC
-      LIMIT ?2`,
+      LIMIT ?1`,
   )
-    .bind(nowIso, MAX_BOUNDARY_PROJECTS_PER_TICK)
+    .bind(MAX_BOUNDARY_PROJECTS_PER_TICK * LIST_CANDIDATE_MULTIPLIER)
     .all<Project>()
-  return result.results ?? []
+
+  const due: Project[] = []
+  for (const project of result.results ?? []) {
+    const canonicalBoundary = canonicalizeUtcIso(project.cycle_boundary_at)
+    if (canonicalBoundary === null) {
+      await clearInvalidCycleBoundary(env, project.id)
+      continue
+    }
+    if (canonicalBoundary !== project.cycle_boundary_at) {
+      await env.DB.prepare(
+        `UPDATE projects SET cycle_boundary_at = ?1, updated_at = ?2 WHERE id = ?3`,
+      )
+        .bind(canonicalBoundary, new Date().toISOString(), project.id)
+        .run()
+      project.cycle_boundary_at = canonicalBoundary
+    }
+    const boundaryMs = epochMs(canonicalBoundary)
+    if (boundaryMs === null) {
+      await clearInvalidCycleBoundary(env, project.id)
+      continue
+    }
+    const earlyViaStall = project.stalled === 1
+    if (!earlyViaStall && boundaryMs > nowMs) continue
+    due.push(project)
+    if (due.length >= MAX_BOUNDARY_PROJECTS_PER_TICK) break
+  }
+  return due
 }
 
 /** Active projects that may be ready for structural completion → review. */

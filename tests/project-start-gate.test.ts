@@ -104,6 +104,8 @@ function makeDeps(overrides: Partial<StartGateDeps> = {}): StartGateDeps {
       tokenId: 'tok-1',
       memberId: 'mem-agent-1',
     })),
+    revokeMintedToken: vi.fn(async () => true),
+    deleteSeedTask: vi.fn(async () => undefined),
     resolveActiveAgentMember: vi.fn(async () => 'unminted' as const),
     upsertActiveAgentCapabilityGrant: vi.fn(async () => ({ result: 'created' as const })),
     createTask: vi.fn(async (_env, input) => ({
@@ -155,7 +157,7 @@ describe('commitSquadResource (existing grant path)', () => {
           upsertActiveAgentCapabilityGrant: async () => ({ result: 'created' }),
         },
       )
-      expect(result).toEqual({ kind: 'minted', memberId: 'mem' })
+      expect(result).toEqual({ kind: 'minted', memberId: 'mem', tokenId: 'tok' })
       expect(mint).toHaveBeenCalledTimes(1)
     } finally {
       harness.close()
@@ -176,7 +178,7 @@ describe('commitSquadResource (existing grant path)', () => {
           upsertActiveAgentCapabilityGrant: upsert,
         },
       )
-      expect(result).toEqual({ kind: 'confirmed', memberId: 'mem-existing' })
+      expect(result).toEqual({ kind: 'confirmed', memberId: 'mem-existing', tokenId: null })
       expect(upsert).toHaveBeenCalledWith(env, expect.objectContaining({
         agentId: 'agent-a',
         expectedMemberId: 'mem-existing',
@@ -277,6 +279,72 @@ describe('startProject happy path', () => {
         resource: 'minted',
       })
       expect(await hasStartProvisionAttempt(env, 'proj-happy')).toBe(true)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('rejects attacker-planted tasks that lack goal provenance / assignee / squad', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertPlannedProject(harness, { id: 'proj-plant', goal: 'Ship slice 3' })
+      grantSquadAccess(harness, 'proj-plant', 'write')
+      insertAgent(harness, 'agent-plant')
+      harness.sqlite.exec(`
+        INSERT INTO tasks (
+          id, squad_id, project_id, title, body, done_when, status, assignee_agent_id,
+          created_at, updated_at
+        ) VALUES (
+          'task-planted', 'squad-a', 'proj-plant', 'Planted', 'not the goal', 'whatever',
+          'open', NULL, '${NOW}', '${NOW}'
+        );
+      `)
+
+      const deps = makeDeps()
+      const result = await startProject(env, 'proj-plant', deps)
+      expect(result).toMatchObject({ ok: false, error: 'invalid_seed_task' })
+      expect((await getProject(env, 'proj-plant'))?.status).toBe('planned')
+      expect(deps.revokeMintedToken).toHaveBeenCalled()
+      expect(deps.createTask).not.toHaveBeenCalled()
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('compensates minted token + created seed when activate fails (no ghost side effects)', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertPlannedProject(harness, { id: 'proj-comp', goal: 'Ship slice 3' })
+      grantSquadAccess(harness, 'proj-comp', 'write')
+      insertAgent(harness, 'agent-comp')
+
+      const deps = makeDeps({
+        updateProject: vi.fn(async () => ({ ok: false as const, error: 'receipt_failed' as const })),
+        createTask: vi.fn(async (_env, input) => ({
+          id: 'task-comp-1',
+          squad_id: input.squad_id,
+          project_id: input.project_id,
+          title: input.title,
+          body: input.body,
+          done_when: input.done_when,
+          status: 'open' as const,
+          assignee_agent_id: input.assignee_agent_id,
+          github_issue_url: null,
+          result: null,
+          completed_at: null,
+          gate_owner: null,
+          created_at: NOW,
+          updated_at: NOW,
+        })),
+      })
+
+      const result = await startProject(env, 'proj-comp', deps)
+      expect(result).toMatchObject({ ok: false, error: 'activate_failed' })
+      expect((await getProject(env, 'proj-comp'))?.status).toBe('planned')
+      expect(deps.deleteSeedTask).toHaveBeenCalledWith(env, 'task-comp-1', 'proj-comp')
+      expect(deps.revokeMintedToken).toHaveBeenCalledWith(env, 'mem-agent-1', 'tok-1')
     } finally {
       harness.close()
     }

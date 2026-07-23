@@ -14,6 +14,7 @@ import type { Env, Project, ProjectAccessLevel, Task } from '../types'
 import {
   mintAgentBoundToken,
   resolveActiveAgentMember,
+  revokeMemberToken,
   upsertActiveAgentCapabilityGrant,
   type AgentForMint,
 } from '../members/service'
@@ -24,6 +25,8 @@ import { getProject, updateProject, type ProjectMutationResult } from './service
 
 export const START_GATE_STEP = 'project_start_gate'
 export const START_GATE_SCHEMA = 'mupot.project_start_gate/v1'
+export const START_ATTEMPT_STEP = 'start_attempt'
+export const START_ATTEMPT_SCHEMA = 'mupot.start_attempt/v1'
 export const BLOCKED_START_STEP = 'blocked_start'
 export const BLOCKED_START_SCHEMA = 'mupot.blocked_start/v1'
 export const GHOST_START_ALARM_STEP = 'ghost_start_alarm'
@@ -41,7 +44,9 @@ export type StartBlockReason =
   | 'no_squad_agent'
   | 'resource_commit_failed'
   | 'task_seed_failed'
+  | 'invalid_seed_task'
   | 'activate_failed'
+  | 'compensate_failed'
 
 export type ResourceCommitKind = 'minted' | 'confirmed'
 
@@ -93,6 +98,14 @@ export type CreateTaskFn = (
   },
 ) => Promise<Task>
 
+export type DeleteSeedTaskFn = (env: Env, taskId: string, projectId: string) => Promise<void>
+
+export type RevokeMintedTokenFn = (
+  env: Env,
+  memberId: string,
+  tokenId: string,
+) => Promise<boolean>
+
 export type MintAgentBoundTokenFn = (
   env: Env,
   agent: AgentForMint,
@@ -119,6 +132,8 @@ export interface StartGateDeps {
   writeReceipt: WriteReceiptFn
   updateProject: UpdateProjectFn
   createTask: CreateTaskFn
+  deleteSeedTask: DeleteSeedTaskFn
+  revokeMintedToken: RevokeMintedTokenFn
   mintAgentBoundToken: MintAgentBoundTokenFn
   resolveActiveAgentMember: ResolveActiveAgentMemberFn
   upsertActiveAgentCapabilityGrant: UpsertActiveAgentCapabilityGrantFn
@@ -139,6 +154,8 @@ export function defaultStartGateDeps(): StartGateDeps {
     writeReceipt: writeReceiptToD1,
     updateProject: (env, id, input) => updateProject(env, id, { ...input, via_start_gate: true }),
     createTask: (env, input) => createTask(env, input, { skipMirror: true }),
+    deleteSeedTask: deleteStartGateSeedTask,
+    revokeMintedToken: revokeMemberToken,
     mintAgentBoundToken: (env, agent, label, capability) =>
       mintAgentBoundToken(env, agent, label, capability),
     resolveActiveAgentMember,
@@ -256,13 +273,77 @@ async function countProjectTasks(env: Env, projectId: string): Promise<number> {
   return Number(row?.n ?? 0)
 }
 
-async function pickExistingSeedTaskId(env: Env, projectId: string): Promise<string | null> {
-  const row = await env.DB.prepare(
-    `SELECT id FROM tasks WHERE project_id = ?1 ORDER BY created_at ASC, id ASC LIMIT 1`,
+interface SeedTaskCandidate {
+  id: string
+  squad_id: string
+  assignee_agent_id: string | null
+  title: string
+  body: string
+  done_when: string
+}
+
+export function seedTaskFingerprint(seed: {
+  title: string
+  body: string
+  done_when: string
+}): string {
+  return `${seed.title}\n${seed.body}\n${seed.done_when}`
+}
+
+/** True when a pre-existing task is the goal-seeded first task for this start. */
+export function isValidStartSeedTask(
+  task: SeedTaskCandidate,
+  expected: {
+    squadId: string
+    agentId: string
+    seed: { title: string; body: string; done_when: string }
+  },
+): boolean {
+  return (
+    task.squad_id === expected.squadId
+    && task.assignee_agent_id === expected.agentId
+    && task.title === expected.seed.title
+    && task.body === expected.seed.body
+    && task.done_when === expected.seed.done_when
+  )
+}
+
+async function findValidSeedTaskId(
+  env: Env,
+  projectId: string,
+  expected: {
+    squadId: string
+    agentId: string
+    seed: { title: string; body: string; done_when: string }
+  },
+): Promise<string | null> {
+  const result = await env.DB.prepare(
+    `SELECT id, squad_id, assignee_agent_id, title, body, done_when
+       FROM tasks
+      WHERE project_id = ?1
+      ORDER BY created_at ASC, id ASC`,
   )
     .bind(projectId)
-    .first<{ id: string }>()
-  return row?.id ?? null
+    .all<SeedTaskCandidate>()
+  for (const row of result.results ?? []) {
+    if (isValidStartSeedTask(row, expected)) return row.id
+  }
+  return null
+}
+
+export async function deleteStartGateSeedTask(
+  env: Env,
+  taskId: string,
+  projectId: string,
+): Promise<void> {
+  const result = await env.DB.prepare(
+    'DELETE FROM tasks WHERE id = ?1 AND project_id = ?2',
+  )
+    .bind(taskId, projectId)
+    .run()
+  if (!result.success) {
+    throw new Error('start_gate_seed_delete_failed')
+  }
 }
 
 /**
@@ -276,7 +357,7 @@ export async function commitSquadResource(
     StartGateDeps,
     'mintAgentBoundToken' | 'resolveActiveAgentMember' | 'upsertActiveAgentCapabilityGrant'
   >,
-): Promise<{ kind: ResourceCommitKind; memberId: string } | null> {
+): Promise<{ kind: ResourceCommitKind; memberId: string; tokenId: string | null } | null> {
   const identity = await deps.resolveActiveAgentMember(env, agent.id)
   if (identity === 'ambiguous') return null
 
@@ -287,7 +368,7 @@ export async function commitSquadResource(
       `start-gate:${agent.slug}`,
       START_RESOURCE_CAPABILITY,
     )
-    return { kind: 'minted', memberId: minted.memberId }
+    return { kind: 'minted', memberId: minted.memberId, tokenId: minted.tokenId }
   }
 
   const outcome = await deps.upsertActiveAgentCapabilityGrant(env, {
@@ -297,7 +378,58 @@ export async function commitSquadResource(
     capability: START_RESOURCE_CAPABILITY,
   })
   if (!outcome) return null
-  return { kind: 'confirmed', memberId: identity }
+  return { kind: 'confirmed', memberId: identity, tokenId: null }
+}
+
+export async function recordStartAttempt(
+  env: Env,
+  detail: {
+    projectId: string
+    squadId: string
+    agentId: string
+    seedFingerprint: string
+    principal: string
+  },
+  writeReceipt: WriteReceiptFn,
+): Promise<void> {
+  await writeReceipt(env, {
+    instanceId: startInstanceId(detail.projectId),
+    taskId: lifecycleTaskId(detail.projectId),
+    stepName: START_ATTEMPT_STEP,
+    status: 'ok',
+    detail: JSON.stringify({
+      schema: START_ATTEMPT_SCHEMA,
+      project_id: detail.projectId,
+      squad_id: detail.squadId,
+      agent_id: detail.agentId,
+      seed_fingerprint: detail.seedFingerprint,
+      principal: detail.principal,
+    }),
+  })
+}
+
+async function compensateStartSideEffects(
+  env: Env,
+  detail: {
+    projectId: string
+    createdTaskId: string | null
+    minted: { memberId: string; tokenId: string } | null
+  },
+  deps: Pick<StartGateDeps, 'deleteSeedTask' | 'revokeMintedToken'>,
+): Promise<void> {
+  if (detail.createdTaskId !== null) {
+    await deps.deleteSeedTask(env, detail.createdTaskId, detail.projectId)
+  }
+  if (detail.minted !== null) {
+    const revoked = await deps.revokeMintedToken(
+      env,
+      detail.minted.memberId,
+      detail.minted.tokenId,
+    )
+    if (!revoked) {
+      throw new Error('start_gate_mint_revoke_failed')
+    }
+  }
 }
 
 export async function recordBlockedStart(
@@ -350,15 +482,15 @@ export async function recordStartGateSuccess(
   })
 }
 
-/** True when a start or blocked-start receipt exists (a provision was attempted). */
+/** True when a start, start-attempt, or blocked-start receipt exists (a provision was attempted). */
 export async function hasStartProvisionAttempt(env: Env, projectId: string): Promise<boolean> {
   const row = await env.DB.prepare(
     `SELECT 1 AS ok FROM workflow_receipts
       WHERE instance_id = ?1
-        AND step_name IN (?2, ?3)
+        AND step_name IN (?2, ?3, ?4)
       LIMIT 1`,
   )
-    .bind(startInstanceId(projectId), START_GATE_STEP, BLOCKED_START_STEP)
+    .bind(startInstanceId(projectId), START_GATE_STEP, START_ATTEMPT_STEP, BLOCKED_START_STEP)
     .first<{ ok: number }>()
   return row !== null
 }
@@ -431,8 +563,10 @@ export async function recordGhostStartAlarm(
 }
 
 /**
- * Governed planned → active: resource commit + seed first task, then activate.
- * On resource failure the project remains planned and a blocked-start receipt is written.
+ * Governed planned → active: durable start-attempt identity, resource commit +
+ * validated seed task, then CAS activate. On failure after side effects, compensate
+ * (revoke minted token / delete created seed) so a non-active project never keeps
+ * live provision artifacts. blocked_start is recorded only after compensation.
  */
 export async function startProject(
   env: Env,
@@ -466,7 +600,29 @@ export async function startProject(
     name: agentRow.name,
   }
 
-  let resource: { kind: ResourceCommitKind; memberId: string }
+  const seed = seedTaskFromGoal(project)
+  const fingerprint = seedTaskFingerprint(seed)
+
+  // Durable start-attempt identity before any mutable side effects.
+  await recordStartAttempt(
+    env,
+    {
+      projectId,
+      squadId: squad.squad_id,
+      agentId: agent.id,
+      seedFingerprint: fingerprint,
+      principal: deps.principal,
+    },
+    deps.writeReceipt,
+  )
+
+  // Re-check CAS claim: still planned before provision side effects.
+  const claimed = await getProject(env, projectId)
+  if (!claimed || claimed.status !== 'planned') {
+    return fail('not_planned')
+  }
+
+  let resource: { kind: ResourceCommitKind; memberId: string; tokenId: string | null }
   try {
     const committed = await commitSquadResource(env, agent, deps)
     if (!committed) return fail('resource_commit_failed')
@@ -475,15 +631,31 @@ export async function startProject(
     return fail('resource_commit_failed')
   }
 
+  const minted =
+    resource.kind === 'minted' && resource.tokenId !== null
+      ? { memberId: resource.memberId, tokenId: resource.tokenId }
+      : null
+
   let taskId: string
+  let createdTaskId: string | null = null
   try {
     const existingCount = await countProjectTasks(env, projectId)
     if (existingCount > 0) {
-      const existingId = await pickExistingSeedTaskId(env, projectId)
-      if (!existingId) return fail('task_seed_failed')
+      const existingId = await findValidSeedTaskId(env, projectId, {
+        squadId: squad.squad_id,
+        agentId: agent.id,
+        seed,
+      })
+      if (!existingId) {
+        await compensateStartSideEffects(
+          env,
+          { projectId, createdTaskId: null, minted },
+          deps,
+        )
+        return fail('invalid_seed_task')
+      }
       taskId = existingId
     } else {
-      const seed = seedTaskFromGoal(project)
       const task = await deps.createTask(env, {
         squad_id: squad.squad_id,
         project_id: projectId,
@@ -493,8 +665,18 @@ export async function startProject(
         assignee_agent_id: agent.id,
       })
       taskId = task.id
+      createdTaskId = task.id
     }
   } catch {
+    try {
+      await compensateStartSideEffects(
+        env,
+        { projectId, createdTaskId: null, minted },
+        deps,
+      )
+    } catch {
+      return fail('compensate_failed')
+    }
     return fail('task_seed_failed')
   }
 
@@ -503,6 +685,15 @@ export async function startProject(
     via_start_gate: true,
   })
   if (!activated.ok || activated.value.status !== 'active') {
+    try {
+      await compensateStartSideEffects(
+        env,
+        { projectId, createdTaskId, minted },
+        deps,
+      )
+    } catch {
+      return fail('compensate_failed')
+    }
     return fail('activate_failed')
   }
 

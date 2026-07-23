@@ -190,26 +190,32 @@ function nextAction(
   open: ProjectSituationTask | null,
   flight: ProjectSituationFlight | null,
 ): ProjectSituationNextAction | null {
-  const review = reviews[0]
-  if (review) return { type: 'review_task', label: `Review "${review.title}"`, task: review }
-  const blocker = blockers[0]
-  if (blocker) return { type: 'unblock_task', label: `Unblock "${blocker.title}"`, task: blocker }
-  if (inProgress) return { type: 'continue_task', label: `Continue "${inProgress.title}"`, task: inProgress }
-  if (open) return { type: 'start_task', label: `Start "${open.title}"`, task: open }
-  if (flight) return { type: 'monitor_flight', label: `Monitor "${flight.goal}"`, flight }
-  if (project.status === 'active') {
-    return { type: 'create_task', label: 'Create the next project task', project: projectTarget(project) }
+  // Kill-default: terminal / paused projects never recommend continue/start/monitor.
+  // Only governed resume / reopen / verify actions.
+  if (project.status === 'paused') {
+    return { type: 'resume_project', label: 'Resume the project', project: projectTarget(project) }
   }
   if (project.status === 'completed') {
     return { type: 'verify_completion', label: 'Verify completion evidence', project: projectTarget(project) }
   }
-  if (project.status === 'paused') {
-    return { type: 'resume_project', label: 'Resume the project', project: projectTarget(project) }
-  }
   if (project.status === 'archived') {
     return { type: 'reopen_project', label: 'Reopen the project', project: projectTarget(project) }
   }
-  return null
+
+  // Task / flight recommendations require an active (or review) project.
+  if (project.status !== 'active' && project.status !== 'review') {
+    return null
+  }
+
+  const review = reviews[0]
+  if (review) return { type: 'review_task', label: `Review "${review.title}"`, task: review }
+  const blocker = blockers[0]
+  if (blocker) return { type: 'unblock_task', label: `Unblock "${blocker.title}"`, task: blocker }
+  if (project.status !== 'active') return null
+  if (inProgress) return { type: 'continue_task', label: `Continue "${inProgress.title}"`, task: inProgress }
+  if (open) return { type: 'start_task', label: `Start "${open.title}"`, task: open }
+  if (flight) return { type: 'monitor_flight', label: `Monitor "${flight.goal}"`, flight }
+  return { type: 'create_task', label: 'Create the next project task', project: projectTarget(project) }
 }
 
 /**
