@@ -61,7 +61,7 @@ CREATE TABLE projects_new (
   goal                   TEXT NOT NULL DEFAULT '',
   status                 TEXT NOT NULL DEFAULT 'active'
                          CHECK (status IN ('planned','active','paused','review','completed','archived')),
-  parent_project_id      TEXT,
+  parent_project_id      TEXT REFERENCES projects_new(id) ON DELETE RESTRICT,
   target_date            TEXT,
   cycle_boundary_at      TEXT,
   stalled                INTEGER NOT NULL DEFAULT 0,

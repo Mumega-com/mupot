@@ -4,6 +4,7 @@ import { createBus } from '../bus'
 import {
   createProject,
   getProject,
+  publicUpdateProjectInput,
   removeProjectSquadAccess,
   updateProject,
   upsertProjectSquadAccess,
@@ -289,8 +290,10 @@ const toolProjectUpdate: ToolSpec = {
     if (denied) return denied
     const projectId = str(args.project_id)
     if (!projectId) return fail(400, 'invalid_project_id')
-    const { project_id: _projectId, ...input } = args
-    const result = await updateProject(env, projectId, input)
+    const { project_id: _projectId, ...rawInput } = args
+    // Strip via_completion_gate / lifecycle_principal / completion_proposed_by —
+    // those are internal to completion-gate.ts only (P0 MCP bypass close).
+    const result = await updateProject(env, projectId, publicUpdateProjectInput(rawInput as Record<string, unknown>))
     if (!result.ok) return mutationFailure(result.error)
     await emitProjectMutation(env, auth.memberId as string, 'updated', result.value.id, { status: result.value.status })
     return done({ project: result.value })

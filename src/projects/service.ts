@@ -36,6 +36,15 @@ export interface CreateProjectInput {
   target_date?: unknown
 }
 
+/** Fields that may ONLY be set by completion-gate / internal callers — never from REST/MCP bodies. */
+export const TRUSTED_PROJECT_MUTATION_KEYS = [
+  'via_completion_gate',
+  'lifecycle_principal',
+  'completion_proposed_by',
+] as const
+
+export type TrustedProjectMutationKey = (typeof TRUSTED_PROJECT_MUTATION_KEYS)[number]
+
 export interface UpdateProjectInput {
   slug?: unknown
   name?: unknown
@@ -44,15 +53,29 @@ export interface UpdateProjectInput {
   status?: unknown
   parent_project_id?: unknown
   target_date?: unknown
-  /** Set when entering/leaving completion review (slice 2). */
+  /** Set when entering/leaving completion review (slice 2). Internal only. */
   completion_proposed_by?: string | null
   /**
    * Internal flag: allow active→review / review→completed writes owned by
    * completion-gate.ts. Bare updateProject callers cannot self-report completed.
    */
   via_completion_gate?: boolean
-  /** Principal recorded on lessons-capture when completed→archived. */
+  /** Principal recorded on lessons-capture when completed→archived. Internal only. */
   lifecycle_principal?: string
+}
+
+/**
+ * Strip gate/lifecycle trusted keys from an untrusted external body (REST PATCH, MCP).
+ * Only completion-gate.ts may set via_completion_gate / completion_proposed_by /
+ * lifecycle_principal.
+ */
+export function publicUpdateProjectInput(body: Record<string, unknown>): UpdateProjectInput {
+  const input: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(body)) {
+    if ((TRUSTED_PROJECT_MUTATION_KEYS as readonly string[]).includes(key)) continue
+    input[key] = value
+  }
+  return input as UpdateProjectInput
 }
 
 export interface ListProjectsOptions {
@@ -100,6 +123,7 @@ function triggerMutationError(error: unknown): ProjectMutationError | null {
   if (error.message.includes('project hierarchy cycle')) return 'hierarchy_cycle'
   if (error.message.includes('parent project not found')) return 'parent_not_found'
   if (error.message.includes('active child projects')) return 'active_children'
+  if (error.message.includes('structural completion required')) return 'completion_gate_required'
   return null
 }
 
@@ -254,7 +278,7 @@ export async function updateProject(
   if (!existing) return { ok: false, error: 'project_not_found' }
 
   const suppliedKeys = Object.keys(input).filter((key) => {
-    if (key === 'via_completion_gate' || key === 'lifecycle_principal') return false
+    if ((TRUSTED_PROJECT_MUTATION_KEYS as readonly string[]).includes(key)) return false
     return input[key as keyof UpdateProjectInput] !== undefined
   })
   const statusWasSupplied = input.status !== undefined

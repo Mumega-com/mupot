@@ -16,11 +16,12 @@ import { loadProjectSituation } from './situation'
 import {
   createProject,
   getProject,
+  publicUpdateProjectInput,
   removeProjectSquadAccess,
   updateProject,
   upsertProjectSquadAccess,
 } from './service'
-import type { CreateProjectInput, ProjectMutationError, UpdateProjectInput } from './service'
+import type { CreateProjectInput, ProjectMutationError } from './service'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
@@ -407,7 +408,9 @@ projectsApp.patch('/:id', async (c) => {
   if (!access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const body = await jsonObject(c)
   if (!body) return c.json({ error: 'invalid_json' }, 400)
-  const result = await updateProject(c.env, c.req.param('id'), body as UpdateProjectInput)
+  // Strip via_completion_gate / lifecycle_principal / completion_proposed_by —
+  // those are internal to completion-gate.ts only (P0 REST bypass close).
+  const result = await updateProject(c.env, c.req.param('id'), publicUpdateProjectInput(body))
   if (!result.ok) return c.json({ error: result.error }, mutationStatus(result.error))
   return c.json({ project: result.value })
 })
