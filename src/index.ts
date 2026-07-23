@@ -40,6 +40,8 @@ import { eventIngestApp } from './events/ingest'
 import { prospectsApp } from './loops/prospects-routes'
 import { loopsApp } from './loops/routes'
 import { fleetCheckinApp } from './fleet/checkin-routes'
+import { kayhermesApp } from './kayhermes/routes'
+import { memberHermesApp } from './member-hermes/routes'
 import { fleetControlApp } from './fleet/control-routes'
 import { fleetAttachApp } from './fleet/attach-routes'
 import { flightsApp } from './flight/routes'
@@ -137,6 +139,12 @@ app.route('/api/reseller', resellerApp)
 // delegations over HTTP (they can't speak MCP JSON-RPC). Member-bearer auth, self-scoped to the
 // token's welded agent. Same pure service as the MCP send/inbox tools. Before the '/' catch-all.
 app.route('/api/inbox', inboxApp)
+
+// KayHermes owner chat proxy — Hermes Sessions API (Open WebUI-style). Cookie session + owner.
+app.route('/api/kayhermes', kayhermesApp)
+
+// Member-scoped Hermes proxy (Open WebUI + cookie/bearer). Maps member → bound agent API.
+app.route('/api/member-hermes', memberHermesApp)
 
 // Control Tower (coordination board): agents board cross-project flights; the colony reads the
 // departures board. Member-bearer auth, agent welded from the token. The rendered board page is

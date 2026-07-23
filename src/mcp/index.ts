@@ -79,6 +79,7 @@ import { sendToRef, readAgentInbox, sendAgentMessage } from '../agents/messages'
 import { recordCheckin, sqliteUtcToMs } from '../fleet/presence'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
+import { ARCHITECT_TOOLS } from './architect'
 import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
 import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
@@ -344,7 +345,7 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // ── tool result shape ─────────────────────────────────────────────────────────
 // A tool returns either a value (→ 200 {ok:true, result}) or a typed error with
 // an HTTP status (→ that status, {ok:false, error}).
-type ToolError = { status: 400 | 403 | 404 | 409 | 500; error: string; detail?: unknown }
+type ToolError = { status: 400 | 401 | 403 | 404 | 409 | 500; error: string; detail?: unknown }
 export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
 
 export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
@@ -2728,6 +2729,7 @@ export const TOOLS: ToolSpec[] = [
   toolConnect,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
+  ...ARCHITECT_TOOLS,
   ...ADDON_TOOLS,
   ...GATE_GRANT_TOOLS,
   ...LOOP_TOOLS,
