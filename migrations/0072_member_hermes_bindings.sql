@@ -1,4 +1,4 @@
--- 0071: member ↔ Hermes-agent binding for BYOA Open WebUI / IM identity.
+-- 0072: member ↔ Hermes-agent binding for BYOA Open WebUI / IM identity.
 -- One active Hermes agent per member (fail-closed; replace via rebind).
 
 CREATE TABLE IF NOT EXISTS member_hermes_bindings (

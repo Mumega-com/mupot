@@ -1,6 +1,6 @@
 // Member ↔ Hermes agent binding + Hermes API endpoint resolution (BYOA surfaces).
 //
-// Binding table: member_hermes_bindings (migration 0071).
+// Binding table: member_hermes_bindings (migration 0072).
 // Endpoint: connector type hermes_api scoped to the agent (secret = API key,
 // meta JSON = { "api_url": "https://..." }).
 
