@@ -21,6 +21,19 @@ function scriptSecretsUrl(config: SecretEnvCfConfig): string {
   )
 }
 
+/** CF's Workers API returns HTTP 200 with `{ success: false, errors: [...] }`
+ * for some rejected requests — a 2xx status alone does not mean the write
+ * happened. Every call site must check the envelope's `success` field, not
+ * just `res.ok`. Returns false (never throws) if the body isn't valid JSON. */
+async function isCfEnvelopeSuccess(res: Response): Promise<boolean> {
+  try {
+    const body = (await res.json()) as { success?: unknown }
+    return body.success === true
+  } catch {
+    return false
+  }
+}
+
 export async function putScriptSecrets(
   config: SecretEnvCfConfig,
   secrets: ReadonlyArray<{ name: string; text: string }>,
@@ -35,7 +48,7 @@ export async function putScriptSecrets(
       },
       body: JSON.stringify({ name: secret.name, text: secret.text, type: 'secret_text' }),
     })
-    if (!res.ok) {
+    if (!res.ok || !(await isCfEnvelopeSuccess(res))) {
       return { ok: false, error: 'cf_secrets_put_failed', status: res.status }
     }
   }
@@ -54,7 +67,7 @@ export async function deleteScriptSecret(
       Authorization: `Bearer ${config.apiToken}`,
     },
   })
-  if (!res.ok) {
+  if (!res.ok || !(await isCfEnvelopeSuccess(res))) {
     return { ok: false, error: 'cf_secrets_delete_failed' }
   }
   return { ok: true }

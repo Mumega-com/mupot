@@ -105,6 +105,9 @@ const toolSecretEnvStatus: ToolSpec = {
     if (!Array.isArray(namesRaw) || namesRaw.length === 0) {
       return fail(400, 'invalid_args', 'names must be a non-empty array')
     }
+    if (namesRaw.length > MAX_KEYS_PER_REQUEST) {
+      return fail(400, 'invalid_args', `names must not exceed ${MAX_KEYS_PER_REQUEST} entries`)
+    }
     const names = namesRaw.filter((name): name is string => typeof name === 'string' && name.length > 0)
     if (names.length === 0) return fail(400, 'invalid_args', 'names must be a non-empty array of strings')
 

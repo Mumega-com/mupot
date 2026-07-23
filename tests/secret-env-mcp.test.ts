@@ -163,6 +163,14 @@ describe('secret_env_status', () => {
     if (!out.ok) expect(out.status).toBe(400)
   })
 
+  it('rejects more than 20 names with 400', async () => {
+    const db = makeDb()
+    const names = Array.from({ length: 21 }, (_, i) => `KEY_${i}`)
+    const out = await invokeTool(member, db.env, 'secret_env_status', { names }, ORIGIN)
+    expect(out.ok).toBe(false)
+    if (!out.ok) expect(out.status).toBe(400)
+  })
+
   it('rejects an unauthenticated caller', async () => {
     const db = makeDb()
     const anon = { ...member, memberId: undefined, userId: '' } as AuthContext

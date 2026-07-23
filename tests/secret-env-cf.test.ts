@@ -75,6 +75,29 @@ describe('secret-env CF client', () => {
     expect(JSON.stringify(result)).not.toContain('leak-me')
   })
 
+  it('treats HTTP 200 with success:false as a failure (CF envelope check)', async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({ success: false, errors: [{ message: 'quota exceeded' }] }), { status: 200 }),
+    )
+    const result = await putScriptSecrets(
+      config,
+      [{ name: 'X_KEY', text: 'leak-me' }],
+      fetchImpl as unknown as typeof fetch,
+    )
+    expect(result).toEqual({ ok: false, error: 'cf_secrets_put_failed', status: 200 })
+    expect(JSON.stringify(result)).not.toContain('leak-me')
+  })
+
+  it('treats HTTP 200 with an unparseable body as a failure', async () => {
+    const fetchImpl = vi.fn(async () => new Response('not json', { status: 200 }))
+    const result = await putScriptSecrets(
+      config,
+      [{ name: 'X_KEY', text: 'leak-me' }],
+      fetchImpl as unknown as typeof fetch,
+    )
+    expect(result).toEqual({ ok: false, error: 'cf_secrets_put_failed', status: 200 })
+  })
+
   describe('deleteScriptSecret', () => {
     it('DELETEs a binding by name on success', async () => {
       const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ success: true }), { status: 200 }))
@@ -92,6 +115,14 @@ describe('secret-env CF client', () => {
     it('returns cf_secrets_delete_failed when CF rejects DELETE', async () => {
       const fetchImpl = vi.fn(async () => new Response(null, { status: 404 }))
       const result = await deleteScriptSecret(config, 'MISSING_KEY', fetchImpl as unknown as typeof fetch)
+      expect(result).toEqual({ ok: false, error: 'cf_secrets_delete_failed' })
+    })
+
+    it('returns cf_secrets_delete_failed on HTTP 200 with success:false', async () => {
+      const fetchImpl = vi.fn(async () =>
+        new Response(JSON.stringify({ success: false, errors: [{ message: 'nope' }] }), { status: 200 }),
+      )
+      const result = await deleteScriptSecret(config, 'NOTION_API_KEY', fetchImpl as unknown as typeof fetch)
       expect(result).toEqual({ ok: false, error: 'cf_secrets_delete_failed' })
     })
   })

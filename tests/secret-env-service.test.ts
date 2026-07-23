@@ -110,6 +110,18 @@ function makeEnv(opts: {
             }
             return { meta: { changes } }
           }
+          // Revoked-binding reuse path in requestSecretEnv: re-pending an existing row.
+          if (sNorm.startsWith('UPDATE SECRET_ENV_BINDINGS') && sNorm.includes("STATUS = 'PENDING'")) {
+            const [purpose, adapterHint, requestedBy, requestId, createdAt, bindingId, ten] = call.binds
+            const row = bindings.get(bindingId as string)
+            if (row && row.tenant === ten) {
+              row.purpose = purpose; row.adapter_hint = adapterHint; row.status = 'pending'
+              row.requested_by = requestedBy; row.bound_by = null; row.request_id = requestId
+              row.created_at = createdAt; row.bound_at = null; row.revoked_at = null
+              return { meta: { changes: 1 } }
+            }
+            return { meta: { changes: 0 } }
+          }
           if (sNorm.startsWith('INSERT INTO SECRET_ENV_AUDIT')) {
             const [id, ten, requestId, bindingName, action, actorId, detail, recordedAt] = call.binds
             audit.push({ id, tenant: ten, request_id: requestId, binding_name: bindingName, action, actor_id: actorId, detail, recorded_at: recordedAt })
@@ -136,6 +148,11 @@ function makeEnv(opts: {
           return null
         },
         async all<T>(): Promise<{ results: T[] }> {
+          if (sNorm.startsWith('SELECT ID, BINDING_NAME, STATUS FROM SECRET_ENV_BINDINGS')) {
+            const [ten, ...names] = call.binds as [string, ...string[]]
+            const rows = [...bindings.values()].filter((r) => r.tenant === ten && names.includes(r.binding_name as string))
+            return { results: rows.map((r) => ({ id: r.id, binding_name: r.binding_name, status: r.status })) as unknown as T[] }
+          }
           if (sNorm.includes('FROM SECRET_ENV_REQUESTS') && sNorm.includes("STATUS = 'PENDING'")) {
             const [ten] = call.binds
             const rows = [...requests.values()].filter((r) => r.tenant === ten && r.status === 'pending')
@@ -150,6 +167,11 @@ function makeEnv(opts: {
         },
       }
       return stmt
+    },
+    async batch(stmts: { run: () => Promise<unknown> }[]) {
+      const results: unknown[] = []
+      for (const stmt of stmts) results.push(await stmt.run())
+      return results
     },
   }
 
@@ -267,6 +289,70 @@ describe('requestSecretEnv', () => {
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error()
     expect(result.error).toBe('adapter_hint_too_long')
+  })
+
+  it('rejects re-requesting a name that is already pending, with binding_name_conflict', async () => {
+    const { env, bindings } = makeEnv()
+    const first = await requestSecretEnv(env, {
+      keys: validKeys, reason: 'r1', adapterHint: null, requestedBy: 'agent-1',
+    })
+    expect(first.ok).toBe(true)
+
+    const second = await requestSecretEnv(env, {
+      keys: validKeys, reason: 'r2', adapterHint: null, requestedBy: 'agent-2',
+    })
+    expect(second.ok).toBe(false)
+    if (second.ok) throw new Error()
+    expect(second.error).toBe('binding_name_conflict')
+    // No partial write from the rejected second request.
+    expect(bindings.size).toBe(1)
+  })
+
+  it('rejects re-requesting a name that is already bound, with binding_name_conflict', async () => {
+    const { env } = makeEnv()
+    const first = await requestSecretEnv(env, {
+      keys: validKeys, reason: 'r1', adapterHint: null, requestedBy: 'agent-1',
+    })
+    if (!first.ok) throw new Error()
+    const fetchImpl = (async () => new Response(JSON.stringify({ success: true }), { status: 200 })) as unknown as typeof fetch
+    const bound = await bindSecretEnv(env, {
+      requestId: first.request.id, values: { NOTION_API_KEY: 'v' }, actorId: 'admin-1', fetchImpl,
+    })
+    expect(bound.ok).toBe(true)
+
+    const second = await requestSecretEnv(env, {
+      keys: validKeys, reason: 'r2', adapterHint: null, requestedBy: 'agent-2',
+    })
+    expect(second.ok).toBe(false)
+    if (second.ok) throw new Error()
+    expect(second.error).toBe('binding_name_conflict')
+  })
+
+  it('allows re-requesting a name that was revoked (reuses the row, back to pending)', async () => {
+    const { env, bindings } = makeEnv()
+    const first = await requestSecretEnv(env, {
+      keys: validKeys, reason: 'r1', adapterHint: null, requestedBy: 'agent-1',
+    })
+    if (!first.ok) throw new Error()
+    const rejected = await rejectSecretEnv(env, { requestId: first.request.id, actorId: 'admin-1' })
+    expect(rejected).toEqual({ ok: true })
+    expect(await getSecretEnvStatus(env, ['NOTION_API_KEY'])).toEqual({ NOTION_API_KEY: 'revoked' })
+
+    const second = await requestSecretEnv(env, {
+      keys: [{ name: 'NOTION_API_KEY', purpose: 'reused purpose' }],
+      reason: 'r2', adapterHint: 'mcp:notion', requestedBy: 'agent-2',
+    })
+    expect(second.ok).toBe(true)
+    if (!second.ok) throw new Error()
+
+    // Reused in place — still exactly one binding row for the name, not two.
+    expect(bindings.size).toBe(1)
+    const row = [...bindings.values()][0]!
+    expect(row.status).toBe('pending')
+    expect(row.purpose).toBe('reused purpose')
+    expect(row.request_id).toBe(second.request.id)
+
+    expect(await getSecretEnvStatus(env, ['NOTION_API_KEY'])).toEqual({ NOTION_API_KEY: 'pending' })
   })
 })
 
