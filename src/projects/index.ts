@@ -21,6 +21,11 @@ import {
   upsertProjectSquadAccess,
 } from './service'
 import type { CreateProjectInput, ProjectMutationError, UpdateProjectInput } from './service'
+import {
+  RecordRecommitOrKillError,
+  defaultCircuitBreakerDeps,
+  recordRecommitOrKill,
+} from './circuit-breaker'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
@@ -171,7 +176,8 @@ async function readableProject(
 ): Promise<Project | null> {
   const visibility = projectVisibilityClause(access)
   return env.DB.prepare(
-    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date, p.created_at, p.updated_at
+    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date,
+            p.cycle_boundary_at, p.stalled, p.stall_threshold_days, p.created_at, p.updated_at
        FROM projects p
       WHERE p.id = ?
         AND ${visibility.sql}`,
@@ -252,7 +258,12 @@ async function projectAggregates(
 
 function mutationStatus(error: ProjectMutationError): 400 | 404 | 409 {
   if (error === 'project_not_found' || error === 'parent_not_found' || error === 'squad_not_found') return 404
-  if (error === 'slug_taken' || error === 'receipt_failed' || error === 'invalid_status_transition') return 409
+  if (
+    error === 'slug_taken'
+    || error === 'receipt_failed'
+    || error === 'invalid_status_transition'
+    || error === 'invalid_cycle_boundary_at'
+  ) return 409
   return 400
 }
 
@@ -306,7 +317,8 @@ projectsApp.get('/', async (c) => {
     binds.push(parentId)
   }
   const result = await c.env.DB.prepare(
-    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date, p.created_at, p.updated_at
+    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date,
+            p.cycle_boundary_at, p.stalled, p.stall_threshold_days, p.created_at, p.updated_at
        FROM projects p
       WHERE ${clauses.join(' AND ')}
       ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
@@ -406,6 +418,63 @@ projectsApp.patch('/:id', async (c) => {
   const result = await updateProject(c.env, c.req.param('id'), body as UpdateProjectInput)
   if (!result.ok) return c.json({ error: result.error }, mutationStatus(result.error))
   return c.json({ project: result.value })
+})
+
+/**
+ * GATED authenticated recommit — continuation past cycle_boundary_at must be
+ * receipted by a different principal (self-verdict blocked). Wired before the
+ * breaker cron can archive so due projects are not mass-archived with no escape.
+ */
+projectsApp.post('/:id/recommit', async (c) => {
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  if (!access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+
+  const project = await getProject(c.env, c.req.param('id'))
+  if (!project) return c.json({ error: 'project_not_found' }, 404)
+  if (project.cycle_boundary_at === null) {
+    return c.json({ error: 'no_cycle_boundary' }, 409)
+  }
+  if (project.status === 'completed' || project.status === 'archived') {
+    return c.json({ error: 'terminal_project', status: project.status }, 409)
+  }
+
+  const body = await jsonObject(c)
+  if (!body) return c.json({ error: 'invalid_json' }, 400)
+  const reason = typeof body.reason === 'string' ? body.reason.trim() : ''
+  if (reason === '') return c.json({ error: 'invalid_reason' }, 400)
+  const overrideSelfVerdict = body.override_self_verdict === true
+
+  try {
+    const detail = await recordRecommitOrKill(
+      c.env,
+      {
+        projectId: project.id,
+        boundaryAt: project.cycle_boundary_at,
+        decision: 'recommit',
+        reason,
+        writer: { kind: 'authenticated', auth: c.get('auth'), overrideSelfVerdict },
+      },
+      defaultCircuitBreakerDeps().writeReceipt,
+    )
+    return c.json({ receipt: detail })
+  } catch (error) {
+    if (error instanceof RecordRecommitOrKillError) {
+      if (error.code === 'self_verdict') {
+        return c.json({
+          error: 'self_verdict',
+          reason: error.message,
+          hint: overrideSelfVerdict
+            ? 'override requires org owner role'
+            : 'pass override_self_verdict:true as org owner to force',
+        }, 409)
+      }
+      if (error.code === 'invalid_boundary') {
+        return c.json({ error: 'invalid_cycle_boundary_at' }, 409)
+      }
+      return c.json({ error: error.code }, 409)
+    }
+    throw error
+  }
 })
 
 projectsApp.get('/:id/squads', async (c) => {

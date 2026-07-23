@@ -14,6 +14,7 @@ const PROJECT_STATUS_TRANSITIONS: Readonly<Record<ProjectStatus, readonly Projec
 
 export type ProjectMutationError =
   | 'invalid_slug' | 'invalid_name' | 'invalid_status' | 'invalid_status_transition' | 'invalid_target_date'
+  | 'invalid_cycle_boundary_at'
   | 'slug_taken' | 'project_not_found' | 'parent_not_found'
   | 'hierarchy_depth' | 'hierarchy_cycle' | 'active_children'
   | 'archived_project' | 'squad_not_found' | 'invalid_access_level'
@@ -41,6 +42,8 @@ export interface UpdateProjectInput {
   status?: unknown
   parent_project_id?: unknown
   target_date?: unknown
+  /** Next circuit-breaker boundary; stored as canonical UTC ISO or null to clear. */
+  cycle_boundary_at?: unknown
 }
 
 export interface ListProjectsOptions {
@@ -61,6 +64,15 @@ export function isValidProjectTargetDate(value: unknown): value is string {
   const [year, month, day] = value.split('-').map(Number)
   const parsed = new Date(Date.UTC(year, month - 1, day))
   return parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day
+}
+
+/** Canonical UTC ISO for cycle_boundary_at writes (same contract as circuit-breaker). */
+function canonicalizeCycleBoundaryAt(value: string): string | null {
+  const trimmed = value.trim()
+  if (trimmed === '') return null
+  const ms = Date.parse(trimmed)
+  if (Number.isNaN(ms)) return null
+  return new Date(ms).toISOString()
 }
 
 export function validProjectStatusTransitions(status: ProjectStatus): readonly ProjectStatus[] {
@@ -174,6 +186,9 @@ export async function createProject(
     status,
     parent_project_id: parentProjectId as string | null,
     target_date: targetDate,
+    cycle_boundary_at: null,
+    stalled: 0,
+    stall_threshold_days: null,
     created_at: now,
     updated_at: now,
   }
@@ -210,7 +225,8 @@ export async function listProjects(env: Env, options: ListProjectsOptions = {}):
     where.push(options.parent_project_id === null ? 'parent_project_id IS NULL' : 'parent_project_id = ?')
     if (options.parent_project_id !== null) values.push(options.parent_project_id)
   }
-  const sql = `SELECT id, slug, name, description, goal, status, parent_project_id, target_date, created_at, updated_at
+  const sql = `SELECT id, slug, name, description, goal, status, parent_project_id, target_date,
+      cycle_boundary_at, stalled, stall_threshold_days, created_at, updated_at
     FROM projects ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
     ORDER BY parent_project_id IS NOT NULL, created_at, id`
   const result = await env.DB.prepare(sql).bind(...values).all<Project>()
@@ -219,7 +235,8 @@ export async function listProjects(env: Env, options: ListProjectsOptions = {}):
 
 export async function getProject(env: Env, id: string): Promise<Project | null> {
   return env.DB.prepare(
-    `SELECT id, slug, name, description, goal, status, parent_project_id, target_date, created_at, updated_at
+    `SELECT id, slug, name, description, goal, status, parent_project_id, target_date,
+            cycle_boundary_at, stalled, stall_threshold_days, created_at, updated_at
      FROM projects WHERE id = ?`,
   ).bind(id).first<Project>()
 }
@@ -255,6 +272,19 @@ export async function updateProject(
   const nextTargetDate = input.target_date === undefined ? existing.target_date : input.target_date
   if (nextTargetDate !== null && !isValidProjectTargetDate(nextTargetDate)) return { ok: false, error: 'invalid_target_date' }
 
+  let nextCycleBoundaryAt = existing.cycle_boundary_at
+  if (input.cycle_boundary_at !== undefined) {
+    if (input.cycle_boundary_at === null) {
+      nextCycleBoundaryAt = null
+    } else if (typeof input.cycle_boundary_at !== 'string') {
+      return { ok: false, error: 'invalid_cycle_boundary_at' }
+    } else {
+      const canonical = canonicalizeCycleBoundaryAt(input.cycle_boundary_at)
+      if (canonical === null) return { ok: false, error: 'invalid_cycle_boundary_at' }
+      nextCycleBoundaryAt = canonical
+    }
+  }
+
   const nextParentProjectId = input.parent_project_id === undefined
     ? existing.parent_project_id
     : input.parent_project_id
@@ -279,15 +309,17 @@ export async function updateProject(
     status: nextStatus,
     parent_project_id: nextParentProjectId as string | null,
     target_date: nextTargetDate,
+    cycle_boundary_at: nextCycleBoundaryAt,
     updated_at: nextUpdatedAt(existing.updated_at),
   }
   try {
     const result = await env.DB.prepare(
       `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
-       target_date = ?, updated_at = ? WHERE id = ? AND updated_at = ?`,
+       target_date = ?, cycle_boundary_at = ?, updated_at = ? WHERE id = ? AND updated_at = ?`,
     ).bind(
       updated.slug, updated.name, updated.description, updated.goal, updated.status,
-      updated.parent_project_id, updated.target_date, updated.updated_at, updated.id, existing.updated_at,
+      updated.parent_project_id, updated.target_date, updated.cycle_boundary_at, updated.updated_at,
+      updated.id, existing.updated_at,
     ).run()
     if (!wrote(result)) {
       const current = await getProject(env, id)
