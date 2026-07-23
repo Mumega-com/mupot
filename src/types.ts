@@ -148,6 +148,11 @@ export interface Env {
   GHL_API_KEY?: string           // GoHighLevel location API key (outbound send)
   GHL_LOCATION_ID?: string       // GHL location id (scopes all API calls)
   GHL_WEBHOOK_SECRET?: string    // HMAC-SHA256 secret for inbound webhook verification
+  // Topology C (vendor-cloud): Cursor Background Agents statusChange webhook HMAC secret.
+  // `npx wrangler secret put CURSOR_WEBHOOK_SECRET`. Absent ⇒ webhook route 503 (fail-closed).
+  CURSOR_WEBHOOK_SECRET?: string
+  // Optional gate owner stamped on webhook completion land-at-review intents.
+  CURSOR_COMPLETION_GATE_OWNER?: string
   BILLING_PLAN_SECRET?: string   // HMAC-SHA256 secret: central billing source → POST /api/billing/plan (writes plan_tier)
   CC_SPEND_SECRET?: string       // HMAC-SHA256 secret: server transcript rollup → POST /api/economy/cc-spend (writes cc_spend_daily). Fail-closed: absent ⇒ 503.
   // Connector credential vault (issue #116) — AES-GCM-256 master key.
