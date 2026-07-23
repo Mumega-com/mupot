@@ -48,7 +48,7 @@ const MAX_PROJECT_MEMBER_ROWS = 100
 const MAX_FLIGHT_SCAN_PAGES = 10
 
 export const PROJECT_STATUSES: readonly ProjectStatus[] = [
-  'planned', 'active', 'paused', 'completed', 'archived',
+  'planned', 'active', 'paused', 'review', 'completed', 'archived',
 ]
 
 const PROJECT_LIFECYCLE_COMMANDS = [
@@ -345,7 +345,7 @@ async function loadVisibleProjects(
   const statement = env.DB.prepare(
     `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
             p.target_date, p.cycle_boundary_at, p.stalled, p.stall_threshold_days,
-            p.created_at, p.updated_at
+            p.completion_proposed_by, p.created_at, p.updated_at
        FROM projects p
       ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
       ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
@@ -693,6 +693,7 @@ export function projectMutationStatus(error: ProjectMutationError): 400 | 404 | 
     || error === 'active_children'
     || error === 'archived_project'
     || error === 'invalid_status_transition'
+    || error === 'completion_gate_required'
   ) return 409
   return 400
 }
@@ -1082,6 +1083,7 @@ function projectMutationMessage(error: ProjectMutationError): string {
     invalid_name: 'Enter a project name.',
     invalid_status: 'Choose a valid project status action.',
     invalid_status_transition: 'That action is not available from the current project status.',
+    completion_gate_required: 'Project completion requires a structural gate and different-principal verdict.',
     invalid_target_date: 'Enter a valid target date.',
     slug_taken: 'That project slug is already in use.',
     project_not_found: 'The project no longer exists.',
