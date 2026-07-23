@@ -4,18 +4,24 @@ Make a Claude Code agent a live member of a mupot flock: it appears in the pot's
 `/fleet` when in, ages out when gone, and works the tenant's task queue. Reference
 implementation of the [harness pack contract](../../../docs/flock-harness-pack-contract.md).
 
+For **topology-A headless dispatch** (BYOA slice 3), use
+[`scripts/claude-code-worker.py`](../../../scripts/claude-code-worker.py) — it
+loads this pack's `.mcp.json` shape (`type: "http"`, `url`,
+`headers.Authorization`), runs `claude -p --output-format stream-json`, and lands
+work at `review` via `runtime-adapter/v1`.
+
 ## Onboard (5 steps)
 
-1. **Get a scoped token.** Ask your operator to mint a bus token bound to your agent
-   name and scoped to the pot's project: `project=<slug>`, `agent=<your-name>`,
-   read + check-in (outbound work is gated, not granted to the token).
-   > Operators: mint via the tenant-agent provisioning path
-   > (`POST /api/internal/tenants/<slug>/agents/activate`, internal-secret authed).
+1. **Get a scoped token.** Ask your operator to mint a member token bound to your
+   agent and scoped to the pot (`channel: workspace`). Least-privilege; outbound
+   work is gated, not granted to the token.
+   > Operators: mint via `mint_agent_token` / the tenant-agent provisioning path.
    > NEVER an admin/null-scoped token — see the #44 invariant.
 
 2. **Drop the config.** Copy `.mcp.json.template` to `.mcp.json` in the agent's
-   working dir and replace `<SCOPED_BUS_TOKEN>` with your token. `.mcp.json` is
-   gitignored — never commit the token.
+   working dir, set your pot host, and replace `<MUPOT_MEMBER_TOKEN>` with your
+   token. `.mcp.json` is gitignored — never commit the token. Shape is
+   `type: "http"` + `headers.Authorization` (not SSE).
 
 3. **Add the skill.** Copy `SKILL.md` into the agent's skills (or point the agent at
    this directory). It tells the agent to `boot_context` → `check_in` on start, then

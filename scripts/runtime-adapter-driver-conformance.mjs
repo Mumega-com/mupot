@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Offline conformance smoke for topology-A runtime-adapter/v1 drivers
- * (cursor-worker.py + mumcp-worker.py + codex-worker.py).
+ * (cursor-worker.py + mumcp-worker.py + codex-worker.py + claude-code-worker.py).
  *
  * Does not require a live pot — asserts the shared adapter + drivers
  * declare the contract, signed attach domain, land-at-review rails, and
@@ -30,8 +30,11 @@ const adapter = read('scripts/runtime_adapter_v1.py')
 const cursor = read('scripts/cursor-worker.py')
 const mumcp = read('scripts/mumcp-worker.py')
 const codex = read('scripts/codex-worker.py')
+const claudeCode = read('scripts/claude-code-worker.py')
 const attach = read('src/fleet/attach-routes.ts')
 const codexToml = read('connectors/codex/config.toml')
+const claudeMcp = read('connectors/claude/.mcp.json')
+const flockMcp = read('packs/claude-code/flock-agent/.mcp.json.template')
 
 check('adapter declares contract id', adapter.includes(`CONTRACT_ID = "${contract}"`))
 check('adapter declares fleet-attach:v1', adapter.includes('SIGNED_ATTACH_DOMAIN = "fleet-attach:v1"'))
@@ -75,8 +78,44 @@ check(
     !/^transport\s*=\s*"sse"/m.test(codexToml),
 )
 
+check('claude-code-worker imports reference adapter', claudeCode.includes('from runtime_adapter_v1 import'))
+check('claude-code-worker declares runtime=claude-code', claudeCode.includes('RUNTIME_TYPE = "claude-code"'))
+check('claude-code-worker boots + lands at review', claudeCode.includes('boot_session(') && claudeCode.includes('land_at_review('))
+check(
+  'claude-code-worker dispatches via claude -p stream-json',
+  claudeCode.includes('"-p"') &&
+    claudeCode.includes('"--output-format"') &&
+    claudeCode.includes('stream-json'),
+)
+check('claude-code-worker keeps worktree isolation', claudeCode.includes('worktree", "add"'))
+check('claude-code-worker keeps tsc verify', claudeCode.includes('npx", "tsc", "--noEmit"'))
+check('claude-code-worker driver opens PR', claudeCode.includes('gh", "pr", "create"'))
+check('claude-code-worker never self-verdicts', !claudeCode.includes('task_verdict'))
+check('claude-code-worker never deploys/merges', !claudeCode.includes('npm run deploy') && !claudeCode.includes('gh pr merge'))
+check(
+  'claude-code-worker writes type:http .mcp.json',
+  claudeCode.includes('mcp_json_document') &&
+    claudeCode.includes('"type": "http"') &&
+    claudeCode.includes('headers.Authorization') &&
+    claudeCode.includes('Authorization'),
+)
+check('claude-code-worker has mint-attach dry-run path', claudeCode.includes('run_mint_attach') && claudeCode.includes('DRY_RUN'))
+check(
+  'claude connector .mcp.json is type:http (no SSE)',
+  claudeMcp.includes('"type": "http"') &&
+    claudeMcp.includes('"Authorization"') &&
+    !claudeMcp.includes('"type": "sse"'),
+)
+check(
+  'flock-agent pack .mcp.json.template is type:http (no SSE)',
+  flockMcp.includes('"type": "http"') &&
+    flockMcp.includes('"Authorization"') &&
+    !flockMcp.includes('"type": "sse"'),
+)
+
 check('pot accepts cursor runtime type', /VALID_RUNTIMES = new Set\(\[[\s\S]*'cursor'/.test(attach))
 check('pot accepts codex runtime type', /VALID_RUNTIMES = new Set\(\[[\s\S]*'codex'/.test(attach))
+check('pot accepts claude-code runtime type', /VALID_RUNTIMES = new Set\(\[[\s\S]*'claude-code'/.test(attach))
 
 const failed = checks.filter((c) => !c.ok)
 console.log('')

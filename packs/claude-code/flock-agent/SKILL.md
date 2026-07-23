@@ -8,8 +8,9 @@ description: Use when this Claude Code agent should act as a member of a mupot f
 This makes a Claude Code agent a live member of a tenant's flock on the SOS bus. It
 is the reference implementation of the [harness pack contract](../../../docs/flock-harness-pack-contract.md).
 
-The bus tools come from the `mumega-bus` MCP server (configured via `.mcp.json` — see
-this pack's `.mcp.json.template`). Your identity, project scope, and permissions are
+The tools come from the `mupot` MCP server (configured via `.mcp.json` —
+`type: "http"`, `url`, `headers.Authorization`; see this pack's
+`.mcp.json.template`). Your identity, project scope, and permissions are
 derived from your token — never assume them.
 
 ## On session start (join the flock)
