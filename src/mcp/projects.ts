@@ -5,10 +5,12 @@ import {
   createProject,
   getProject,
   removeProjectSquadAccess,
+  sanitizeExternalProjectUpdate,
   updateProject,
   upsertProjectSquadAccess,
 } from '../projects/service'
 import type { ProjectMutationError } from '../projects/service'
+import { lifecyclePrincipalFromAuth } from '../projects/completion-gate'
 import {
   projectReadAccessFromGrants,
   projectVisibilityClause,
@@ -99,7 +101,8 @@ export async function readableProject(env: Env, projectId: string, access: Proje
   const visibility = projectVisibilityClause(access)
   return env.DB.prepare(
     `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-            p.target_date, p.created_at, p.updated_at
+            p.target_date, p.cycle_boundary_at, p.stalled, p.stall_threshold_days,
+            p.completion_proposed_by, p.created_at, p.updated_at
        FROM projects p
       WHERE p.id = ? AND ${visibility.sql}`,
   ).bind(projectId, ...visibility.binds).first<Project>()
@@ -109,7 +112,7 @@ function mutationFailure(error: ProjectMutationError): ToolOutcome {
   if (error === 'project_not_found' || error === 'parent_not_found' || error === 'squad_not_found') {
     return fail(404, error)
   }
-  if (error === 'slug_taken' || error === 'receipt_failed' || error === 'invalid_status_transition') {
+  if (error === 'slug_taken' || error === 'receipt_failed' || error === 'invalid_status_transition' || error === 'completion_gate_required') {
     return fail(409, error)
   }
   return fail(400, error)
@@ -210,7 +213,8 @@ const toolProjectList: ToolSpec = {
 
     const rows = await env.DB.prepare(
       `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-              p.target_date, p.created_at, p.updated_at
+              p.target_date, p.cycle_boundary_at, p.stalled, p.stall_threshold_days,
+              p.completion_proposed_by, p.created_at, p.updated_at
          FROM projects p
         WHERE ${clauses.join(' AND ')}
         ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
@@ -334,7 +338,13 @@ const toolProjectUpdate: ToolSpec = {
     if (denied) return denied
     const projectId = str(args.project_id)
     if (!projectId) return fail(400, 'invalid_project_id')
-    const { project_id: _projectId, ...input } = args
+    const { project_id: _projectId, ...rawInput } = args
+    // P0: strip via_completion_gate / lifecycle_principal / completion_proposed_by
+    // even if a client sneaks them past schema validation.
+    const sanitized = sanitizeExternalProjectUpdate(rawInput as Record<string, unknown>)
+    const input = sanitized.status === 'archived'
+      ? { ...sanitized, lifecycle_principal: lifecyclePrincipalFromAuth(auth) }
+      : sanitized
     const result = await updateProject(env, projectId, input)
     if (!result.ok) return mutationFailure(result.error)
     await emitProjectMutation(env, auth.memberId as string, 'updated', result.value.id, { status: result.value.status })
