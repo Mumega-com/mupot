@@ -8,6 +8,7 @@ import {
   verifySignedProjectEnvelope,
   type ProjectLinkEnvelopeV1,
   type ProjectLinkCapability,
+  type ProjectLinkTaskState,
   type SignedProjectLinkEnvelopeV1,
 } from './envelope'
 import { projectLinkTimestampMsSql } from './timestamps'
@@ -595,6 +596,21 @@ function taskBody(envelope: ProjectLinkEnvelopeV1): string {
   })
 }
 
+/** Map remote task state onto a local board status that situation can surface. */
+function localTaskStatus(state: ProjectLinkTaskState): 'open' | 'blocked' | 'review' {
+  if (state === 'blocked') return 'blocked'
+  if (state === 'review') return 'review'
+  // open / in_progress / done stay open so local operators still assign before execution.
+  return 'open'
+}
+
+function localTaskResult(state: ProjectLinkTaskState, blockerSummary: string | null): string | null {
+  if (state !== 'blocked') return null
+  return blockerSummary && blockerSummary.trim().length > 0
+    ? blockerSummary
+    : 'Linked pot reports this work is blocked.'
+}
+
 export async function receiveProjectLinkEnvelope(
   env: Env,
   linkId: string,
@@ -671,11 +687,15 @@ export async function receiveProjectLinkEnvelope(
   }
   const statements = []
   if (action.type === 'task') {
+    const remoteState = envelope.task!.state
+    const status = localTaskStatus(remoteState)
+    const result = localTaskResult(remoteState, envelope.task!.blocker_summary)
+    const gateOwner = status === 'review' ? link.local_agent_id : null
     statements.push(db.prepare(
       `INSERT INTO tasks (
         id, squad_id, project_id, title, body, done_when, status, assignee_agent_id,
         github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', NULL, NULL, NULL, NULL, NULL, ?7, ?8, ?8)`,
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL, ?9, ?10, ?11, ?11)`,
     ).bind(
       action.id, link.local_squad_id, link.local_project_id,
       // #403 gap 2(b): visible provenance marker in the title itself (works everywhere the
@@ -684,6 +704,7 @@ export async function receiveProjectLinkEnvelope(
       // so a reader unfamiliar with the addon still gets the signal.
       `[project-link:${envelope.source.pot}] ${envelope.task!.title}`,
       taskBody(envelope), envelope.task!.success_predicate,
+      status, result, gateOwner,
       // Structured provenance column — see migrations/0063 + Task.source_pot in src/types.ts.
       link.remote_pot, now,
     ))
@@ -730,6 +751,41 @@ export async function receiveProjectLinkEnvelope(
 
 function retryable(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || status >= 500
+}
+
+const DELIVERY_REVIEW_RESULT =
+  'Project-link delivery exhausted retries (retry_limit_exhausted). Resume only after the destination recovers.'
+
+function deliveryReviewTaskStatement(
+  db: ProjectLinkDb,
+  link: ProjectLink,
+  deliveryId: string,
+  envelope: ProjectLinkEnvelopeV1,
+  now: string,
+) {
+  return db.prepare(
+    `INSERT OR IGNORE INTO tasks (
+      id, squad_id, project_id, title, body, done_when, status, assignee_agent_id,
+      github_issue_url, result, completed_at, gate_owner, source_pot, created_at, updated_at
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'review', NULL, NULL, ?7, NULL, ?8, NULL, ?9, ?9)`,
+  ).bind(
+    `plt-delivery-review-${deliveryId}`,
+    link.local_squad_id,
+    link.local_project_id,
+    `[project-link] Delivery review: ${envelope.task?.title ?? envelope.correlation_id}`,
+    JSON.stringify({
+      schema: 'mupot.project-link-delivery-review/v1',
+      link_id: link.id,
+      delivery_id: deliveryId,
+      idempotency_key: envelope.idempotency_key,
+      correlation_id: envelope.correlation_id,
+      last_error: 'retry_limit_exhausted',
+    }),
+    'Operator confirms the destination recovered and resumes the matching signed delivery.',
+    DELIVERY_REVIEW_RESULT,
+    link.local_agent_id,
+    now,
+  )
 }
 
 // Gate 2 (#392) redirect refusal (see the fetcher call above). `as string`: Workers-types
@@ -939,11 +995,14 @@ export async function deliverProjectLinkEnvelope(
   const deliveryId = delivery.id
   const attemptsBefore = delivery.attempts
   if (attemptsBefore >= MAX_DELIVERY_ATTEMPTS) {
-    await db.prepare(
-      `UPDATE project_link_deliveries
-          SET status = 'review', last_error = 'retry_limit_exhausted', next_retry_at = NULL, updated_at = ?3
-        WHERE tenant = ?1 AND id = ?2 AND status IN ('pending','failed')`,
-    ).bind(env.TENANT_SLUG, deliveryId, now).run()
+    await db.batch([
+      db.prepare(
+        `UPDATE project_link_deliveries
+            SET status = 'review', last_error = 'retry_limit_exhausted', next_retry_at = NULL, updated_at = ?3
+          WHERE tenant = ?1 AND id = ?2 AND status IN ('pending','failed')`,
+      ).bind(env.TENANT_SLUG, deliveryId, now),
+      deliveryReviewTaskStatement(db, link, deliveryId, envelope, now),
+    ])
     return { ok: false, reason: 'delivery_review_required' }
   }
   const claimToken = `plc-${crypto.randomUUID()}`
@@ -989,6 +1048,7 @@ export async function deliverProjectLinkEnvelope(
   let lastError = 'remote_unavailable'
   let attemptsMade = 0
   let terminalReason: LinkFailure = 'remote_failure'
+  let lastNextRetryAt: string | null = null
   const attemptBudget = Math.min(maxAttempts, MAX_DELIVERY_ATTEMPTS - attemptsBefore)
   for (let attempt = 1; attempt <= attemptBudget; attempt += 1) {
     attemptsMade = attemptsBefore + attempt
@@ -1085,12 +1145,12 @@ export async function deliverProjectLinkEnvelope(
     } catch {
       lastError = 'remote_network_error'
     }
-    const nextRetryAt = new Date(Date.parse(now) + attempt * 1000).toISOString()
+    lastNextRetryAt = new Date(Date.parse(now) + attempt * 1000).toISOString()
     const attemptUpdate = await db.prepare(
       `UPDATE project_link_deliveries
           SET attempts = ?3, last_error = ?4, next_retry_at = ?5, updated_at = ?6
         WHERE tenant = ?1 AND id = ?2 AND status = 'sending' AND claim_token = ?7`,
-    ).bind(env.TENANT_SLUG, deliveryId, attemptsMade, lastError, nextRetryAt, now, claimToken).run()
+    ).bind(env.TENANT_SLUG, deliveryId, attemptsMade, lastError, lastNextRetryAt, now, claimToken).run()
     if (Number(attemptUpdate.meta?.changes ?? 0) !== 1) {
       const raced = await receiptFor(env, link.id, 'outbound', envelope.idempotency_key, db)
       if (raced?.envelope_sha256 === envelopeSha256) return { ok: true, receipt: raced }
@@ -1100,11 +1160,12 @@ export async function deliverProjectLinkEnvelope(
   const exhausted = terminalReason === 'remote_failure' && attemptsMade >= MAX_DELIVERY_ATTEMPTS
   const finalStatus = exhausted ? 'review' : 'failed'
   const finalError = exhausted ? 'retry_limit_exhausted' : lastError
+  const retainedRetryAt = exhausted ? null : lastNextRetryAt
   const outcomes = await db.batch([
     db.prepare(
-      `UPDATE project_link_deliveries SET status = ?3, attempts = ?4, last_error = ?5, next_retry_at = NULL, updated_at = ?6
-        WHERE tenant = ?1 AND id = ?2 AND status = 'sending' AND claim_token = ?7`,
-    ).bind(env.TENANT_SLUG, deliveryId, finalStatus, attemptsMade, finalError, now, claimToken),
+      `UPDATE project_link_deliveries SET status = ?3, attempts = ?4, last_error = ?5, next_retry_at = ?6, updated_at = ?7
+        WHERE tenant = ?1 AND id = ?2 AND status = 'sending' AND claim_token = ?8`,
+    ).bind(env.TENANT_SLUG, deliveryId, finalStatus, attemptsMade, finalError, retainedRetryAt, now, claimToken),
     db.prepare(
       `UPDATE project_links SET last_failure_at = ?3, last_error = ?4
         WHERE tenant = ?1 AND id = ?2 AND state = 'active'
@@ -1113,6 +1174,7 @@ export async function deliverProjectLinkEnvelope(
              WHERE tenant = ?1 AND id = ?5 AND status = ?6 AND claim_token = ?7
           )`,
     ).bind(env.TENANT_SLUG, link.id, now, finalError, deliveryId, finalStatus, claimToken),
+    ...(exhausted ? [deliveryReviewTaskStatement(db, link, deliveryId, envelope, now)] : []),
   ])
   if (Number(outcomes[0]?.meta?.changes ?? 0) !== 1) {
     const raced = await receiptFor(env, link.id, 'outbound', envelope.idempotency_key, db)

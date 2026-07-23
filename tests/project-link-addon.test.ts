@@ -530,6 +530,25 @@ describe('project-link addon', () => {
     expect(attempts).toBe(1)
     expect(mumega.sqlite.prepare('SELECT status, attempts, last_error FROM project_link_deliveries').get())
       .toEqual({ status: 'review', attempts: 100, last_error: 'retry_limit_exhausted' })
+    expect(mumega.sqlite.prepare(
+      `SELECT status, result, gate_owner FROM tasks WHERE project_id = 'mumega-project'`,
+    ).get()).toEqual({
+      status: 'review',
+      result: 'Project-link delivery exhausted retries (retry_limit_exhausted). Resume only after the destination recovers.',
+      gate_owner: 'codex-mac-mumcp',
+    })
+
+    const held = await deliverProjectLinkEnvelope(env(mumega, 'mumega'), mumegaLink.id, signed, {
+      fetcher: async () => {
+        attempts += 1
+        return new Response('{}', { status: 503 })
+      },
+      now: '2026-07-18T22:32:00.000Z',
+      maxAttempts: 1,
+    })
+    expect(held).toEqual({ ok: false, reason: 'delivery_review_required' })
+    expect(attempts).toBe(1)
+    expect(mumega.sqlite.prepare('SELECT COUNT(*) AS count FROM tasks').get()).toEqual({ count: 1 })
   })
 
   it('does not transmit when a delivery row cannot be durably established', async () => {
@@ -740,5 +759,116 @@ describe('project-link addon', () => {
       if (previousTimezone === undefined) delete process.env.TZ
       else process.env.TZ = previousTimezone
     }
+  })
+
+  it('fails closed when the destination receipt-signing token is revoked and preserves prior receipts', async () => {
+    const accepted = await receiveProjectLinkEnvelope(
+      env(dme, 'dme'), dmeLink.id,
+      await createSignedProjectEnvelope(envelopeInput(), mumegaKeys.privateKey),
+      NOW,
+    )
+    expect(accepted.ok).toBe(true)
+
+    signingKeys.delete('dme')
+    const secondInput = envelopeInput()
+    secondInput.idempotency_key = 'dme-task-after-token-revoke'
+    const rejected = await receiveProjectLinkEnvelope(
+      env(dme, 'dme'), dmeLink.id,
+      await createSignedProjectEnvelope(secondInput, mumegaKeys.privateKey),
+      NOW,
+    )
+
+    expect(rejected).toEqual({ ok: false, reason: 'receipt_signing_unconfigured' })
+    expect(await listProjectLinkReceipts(env(dme, 'dme'), 'dme-project')).toHaveLength(1)
+    expect(dme.sqlite.prepare('SELECT COUNT(*) AS count FROM tasks').get()).toEqual({ count: 1 })
+  })
+
+  it('surfaces a remote blocked envelope as an actionable local project blocker', async () => {
+    const blockedInput = envelopeInput()
+    blockedInput.idempotency_key = 'dme-task-blocked-001'
+    blockedInput.task.state = 'blocked'
+    blockedInput.task.blocker_summary = 'Destination Agent Host identity secret is missing.'
+
+    const received = await receiveProjectLinkEnvelope(
+      env(dme, 'dme'), dmeLink.id,
+      await createSignedProjectEnvelope(blockedInput, mumegaKeys.privateKey),
+      NOW,
+    )
+
+    expect(received.ok).toBe(true)
+    expect(dme.sqlite.prepare('SELECT status, result FROM tasks').get()).toEqual({
+      status: 'blocked',
+      result: 'Destination Agent Host identity secret is missing.',
+    })
+  })
+
+  it('leaves a destination outage pending with retry metadata and no remote side effect', async () => {
+    const signed = await createSignedProjectEnvelope(envelopeInput(), mumegaKeys.privateKey)
+    let dials = 0
+    const failed = await deliverProjectLinkEnvelope(env(mumega, 'mumega'), mumegaLink.id, signed, {
+      fetcher: async () => {
+        dials += 1
+        return new Response(JSON.stringify({ error: 'unavailable' }), { status: 503 })
+      },
+      now: NOW,
+      maxAttempts: 2,
+    })
+
+    expect(failed).toEqual({ ok: false, reason: 'remote_failure' })
+    expect(dials).toBe(2)
+    expect(dme.sqlite.prepare('SELECT COUNT(*) AS count FROM tasks').get()).toEqual({ count: 0 })
+    expect(dme.sqlite.prepare('SELECT COUNT(*) AS count FROM project_link_receipts').get()).toEqual({ count: 0 })
+    expect(mumega.sqlite.prepare(
+      `SELECT status, attempts, last_error, next_retry_at IS NOT NULL AS has_retry FROM project_link_deliveries`,
+    ).get()).toEqual({
+      status: 'failed', attempts: 2, last_error: 'remote_http_503', has_retry: 1,
+    })
+  })
+
+  it('recovers an expired sending lease after restart without repeating destination work', async () => {
+    const signed = await createSignedProjectEnvelope(envelopeInput(), mumegaKeys.privateKey)
+    const first = await deliverProjectLinkEnvelope(env(mumega, 'mumega'), mumegaLink.id, signed, {
+      fetcher: async (_input, init) => {
+        const received = await receiveProjectLinkEnvelope(
+          env(dme, 'dme'), dmeLink.id, JSON.parse(String(init?.body)), NOW,
+        )
+        return new Response(JSON.stringify(received), { status: received.ok ? 200 : 400 })
+      },
+      now: NOW,
+      maxAttempts: 1,
+    })
+    expect(first.ok).toBe(true)
+
+    // Simulate a crashed worker that left an expired sending claim after the peer already accepted.
+    mumega.sqlite.exec(`
+      DELETE FROM project_link_receipts;
+      UPDATE project_links SET last_success_at = NULL, last_error = NULL;
+      UPDATE project_link_deliveries
+         SET status = 'sending',
+             claim_token = 'stale-worker-claim',
+             claim_expires_at = '2026-07-18T22:29:00.000Z',
+             attempts = 1;
+    `)
+
+    let dials = 0
+    const recovered = await deliverProjectLinkEnvelope(env(mumega, 'mumega'), mumegaLink.id, signed, {
+      fetcher: async (_input, init) => {
+        dials += 1
+        const received = await receiveProjectLinkEnvelope(
+          env(dme, 'dme'), dmeLink.id, JSON.parse(String(init?.body)), '2026-07-18T22:31:00.000Z',
+        )
+        return new Response(JSON.stringify(received), { status: received.ok ? 200 : 400 })
+      },
+      now: '2026-07-18T22:31:00.000Z',
+      maxAttempts: 1,
+    })
+
+    expect(recovered.ok).toBe(true)
+    expect(dials).toBe(1)
+    expect(dme.sqlite.prepare('SELECT COUNT(*) AS count FROM tasks').get()).toEqual({ count: 1 })
+    expect(dme.sqlite.prepare('SELECT COUNT(*) AS count FROM project_link_receipts').get()).toEqual({ count: 1 })
+    expect(mumega.sqlite.prepare('SELECT status, attempts FROM project_link_deliveries').get())
+      .toEqual({ status: 'delivered', attempts: 2 })
+    expect(await listProjectLinkReceipts(env(mumega, 'mumega'), 'mumega-project')).toHaveLength(1)
   })
 })
