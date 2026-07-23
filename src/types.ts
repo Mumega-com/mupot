@@ -303,7 +303,7 @@ export interface Task {
 
 // ── Projects (migration 0055) ───────────────────────────────────────────────
 
-export type ProjectStatus = 'planned' | 'active' | 'paused' | 'completed' | 'archived'
+export type ProjectStatus = 'planned' | 'active' | 'paused' | 'review' | 'completed' | 'archived'
 export type ProjectAccessLevel = 'read' | 'write' | 'admin'
 
 export interface Project {
@@ -315,6 +315,17 @@ export interface Project {
   status: ProjectStatus
   parent_project_id: string | null
   target_date: string | null
+  /** Next ISO-8601 instant at which the lifecycle circuit breaker evaluates (migration 0068). */
+  cycle_boundary_at: string | null
+  /** Stall detector flag (0/1); raised early into the breaker — detector is slice 4. */
+  stalled: number
+  /** Per-project idle threshold in days; NULL = tenant default. */
+  stall_threshold_days: number | null
+  /**
+   * Principal that moved the project into completion review (migration 0069).
+   * Used for different-principal self-verdict blocking (slice 2).
+   */
+  completion_proposed_by: string | null
   created_at: string
   updated_at: string
 }
