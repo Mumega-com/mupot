@@ -2,22 +2,27 @@ import type { D1Result } from '@cloudflare/workers-types'
 import type { Env, Project, ProjectAccessLevel, ProjectSquadAccess, ProjectStatus } from '../types'
 import { isNonEmptyString, isValidSlug } from '../org/service'
 
-const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'completed', 'archived']
+const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'review', 'completed', 'archived']
 const PROJECT_ACCESS_LEVELS: readonly ProjectAccessLevel[] = ['read', 'write', 'admin']
 const PROJECT_STATUS_TRANSITIONS: Readonly<Record<ProjectStatus, readonly ProjectStatus[]>> = {
   planned: ['active', 'archived'],
-  active: ['paused', 'completed', 'archived'],
-  paused: ['active', 'completed', 'archived'],
+  // completed is NOT reachable here — only via completion-gate verdict (slice 2).
+  active: ['paused', 'review', 'archived'],
+  paused: ['active', 'archived'],
+  review: ['active', 'completed'],
   completed: ['active', 'archived'],
   archived: ['planned'],
 }
 
 export type ProjectMutationError =
   | 'invalid_slug' | 'invalid_name' | 'invalid_status' | 'invalid_status_transition' | 'invalid_target_date'
+  | 'invalid_cycle_boundary_at'
   | 'slug_taken' | 'project_not_found' | 'parent_not_found'
   | 'hierarchy_depth' | 'hierarchy_cycle' | 'active_children'
   | 'archived_project' | 'squad_not_found' | 'invalid_access_level'
   | 'receipt_failed'
+  | 'completion_gate_required'
+  | 'start_gate_required'
 
 export type ProjectMutationResult<T> =
   | { ok: true; value: T }
@@ -41,6 +46,46 @@ export interface UpdateProjectInput {
   status?: unknown
   parent_project_id?: unknown
   target_date?: unknown
+  /** Next circuit-breaker boundary; stored as canonical UTC ISO or null to clear. */
+  cycle_boundary_at?: unknown
+  /** Set when entering/leaving completion review (slice 2). */
+  completion_proposed_by?: string | null
+  /**
+   * Internal flag: allow active→review / review→completed writes owned by
+   * completion-gate.ts. Bare updateProject callers cannot self-report completed.
+   * Must NEVER be accepted from REST/MCP bodies — strip via sanitizeExternalProjectUpdate.
+   */
+  via_completion_gate?: boolean
+  /**
+   * Internal flag: allow planned→active writes owned by start-gate.ts.
+   * Bare updateProject callers cannot activate without authorize+provision.
+   * Must NEVER be accepted from REST/MCP bodies — strip via sanitizeExternalProjectUpdate.
+   */
+  via_start_gate?: boolean
+  /** Principal recorded on lessons-capture when completed→archived. */
+  lifecycle_principal?: string
+}
+
+/** Privileged fields that only lifecycle gates / trusted internal callers may set. */
+const PROJECT_UPDATE_INTERNAL_KEYS = [
+  'via_completion_gate',
+  'via_start_gate',
+  'lifecycle_principal',
+  'completion_proposed_by',
+] as const
+
+/**
+ * Strip lifecycle-gate internals from an untrusted body (REST PATCH, MCP
+ * project_update). Forged via_*_gate must not bypass start/completion gates.
+ */
+export function sanitizeExternalProjectUpdate(
+  input: Record<string, unknown> | UpdateProjectInput,
+): UpdateProjectInput {
+  const out: UpdateProjectInput = { ...input }
+  for (const key of PROJECT_UPDATE_INTERNAL_KEYS) {
+    delete out[key]
+  }
+  return out
 }
 
 export interface ListProjectsOptions {
@@ -61,6 +106,15 @@ export function isValidProjectTargetDate(value: unknown): value is string {
   const [year, month, day] = value.split('-').map(Number)
   const parsed = new Date(Date.UTC(year, month - 1, day))
   return parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day
+}
+
+/** Canonical UTC ISO for cycle_boundary_at writes (same contract as circuit-breaker). */
+function canonicalizeCycleBoundaryAt(value: string): string | null {
+  const trimmed = value.trim()
+  if (trimmed === '') return null
+  const ms = Date.parse(trimmed)
+  if (Number.isNaN(ms)) return null
+  return new Date(ms).toISOString()
 }
 
 export function validProjectStatusTransitions(status: ProjectStatus): readonly ProjectStatus[] {
@@ -88,6 +142,7 @@ function triggerMutationError(error: unknown): ProjectMutationError | null {
   if (error.message.includes('project hierarchy cycle')) return 'hierarchy_cycle'
   if (error.message.includes('parent project not found')) return 'parent_not_found'
   if (error.message.includes('active child projects')) return 'active_children'
+  if (error.message.includes('structural completion required')) return 'completion_gate_required'
   return null
 }
 
@@ -174,6 +229,10 @@ export async function createProject(
     status,
     parent_project_id: parentProjectId as string | null,
     target_date: targetDate,
+    cycle_boundary_at: null,
+    stalled: 0,
+    stall_threshold_days: null,
+    completion_proposed_by: null,
     created_at: now,
     updated_at: now,
   }
@@ -181,11 +240,14 @@ export async function createProject(
   try {
     const result = await env.DB.prepare(
       `INSERT INTO projects
-       (id, slug, name, description, goal, status, parent_project_id, target_date, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, slug, name, description, goal, status, parent_project_id, target_date,
+        cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       project.id, project.slug, project.name, project.description, project.goal, project.status,
-      project.parent_project_id, project.target_date, project.created_at, project.updated_at,
+      project.parent_project_id, project.target_date,
+      project.cycle_boundary_at, project.stalled, project.stall_threshold_days, project.completion_proposed_by,
+      project.created_at, project.updated_at,
     ).run()
     if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
   } catch (error) {
@@ -210,7 +272,8 @@ export async function listProjects(env: Env, options: ListProjectsOptions = {}):
     where.push(options.parent_project_id === null ? 'parent_project_id IS NULL' : 'parent_project_id = ?')
     if (options.parent_project_id !== null) values.push(options.parent_project_id)
   }
-  const sql = `SELECT id, slug, name, description, goal, status, parent_project_id, target_date, created_at, updated_at
+  const sql = `SELECT id, slug, name, description, goal, status, parent_project_id, target_date,
+      cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by, created_at, updated_at
     FROM projects ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
     ORDER BY parent_project_id IS NOT NULL, created_at, id`
   const result = await env.DB.prepare(sql).bind(...values).all<Project>()
@@ -219,7 +282,8 @@ export async function listProjects(env: Env, options: ListProjectsOptions = {}):
 
 export async function getProject(env: Env, id: string): Promise<Project | null> {
   return env.DB.prepare(
-    `SELECT id, slug, name, description, goal, status, parent_project_id, target_date, created_at, updated_at
+    `SELECT id, slug, name, description, goal, status, parent_project_id, target_date,
+            cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by, created_at, updated_at
      FROM projects WHERE id = ?`,
   ).bind(id).first<Project>()
 }
@@ -232,7 +296,22 @@ export async function updateProject(
   const existing = await getProject(env, id)
   if (!existing) return { ok: false, error: 'project_not_found' }
 
-  const suppliedKeys = Object.keys(input).filter((key) => input[key as keyof UpdateProjectInput] !== undefined)
+  const viaGate = input.via_completion_gate === true
+  const viaStartGate = input.via_start_gate === true
+  // Gate-internal fields: ignore forged values on bare updates.
+  const proposedByInput = viaGate ? input.completion_proposed_by : undefined
+
+  const suppliedKeys = Object.keys(input).filter((key) => {
+    if (
+      key === 'via_completion_gate'
+      || key === 'via_start_gate'
+      || key === 'lifecycle_principal'
+      || key === 'completion_proposed_by'
+    ) {
+      return false
+    }
+    return input[key as keyof UpdateProjectInput] !== undefined
+  })
   const statusWasSupplied = input.status !== undefined
   if (statusWasSupplied && !isProjectStatus(input.status)) return { ok: false, error: 'invalid_status' }
   if (existing.status === 'archived' && suppliedKeys.some((key) => key !== 'status')) {
@@ -245,6 +324,42 @@ export async function updateProject(
   if (statusWasSupplied && !isValidProjectStatusTransition(existing.status, nextStatus)) {
     return { ok: false, error: 'invalid_status_transition' }
   }
+
+  // Slice 2: completed / review status flips are owned by completion-gate.ts.
+  if (
+    statusWasSupplied
+    && nextStatus === 'completed'
+    && existing.status !== 'completed'
+    && !viaGate
+  ) {
+    return { ok: false, error: 'completion_gate_required' }
+  }
+  if (
+    statusWasSupplied
+    && nextStatus === 'review'
+    && existing.status !== 'review'
+    && !viaGate
+  ) {
+    return { ok: false, error: 'completion_gate_required' }
+  }
+
+  // Slice 3: planned→active is owned by start-gate.ts (authorize + provision).
+  if (
+    statusWasSupplied
+    && existing.status === 'planned'
+    && nextStatus === 'active'
+    && !viaStartGate
+  ) {
+    return { ok: false, error: 'start_gate_required' }
+  }
+
+  // TOCTOU fence: review/completed flips refuse when any child task is not done.
+  const structuralStatusFlip =
+    viaGate
+    && statusWasSupplied
+    && (nextStatus === 'review' || nextStatus === 'completed')
+    && existing.status !== nextStatus
+
   const nextSlug = input.slug === undefined ? existing.slug : input.slug
   if (!isValidSlug(nextSlug)) return { ok: false, error: 'invalid_slug' }
   const nextName = input.name === undefined ? existing.name : input.name
@@ -254,6 +369,19 @@ export async function updateProject(
   if (nextDescription === null || nextGoal === null) return { ok: false, error: 'invalid_name' }
   const nextTargetDate = input.target_date === undefined ? existing.target_date : input.target_date
   if (nextTargetDate !== null && !isValidProjectTargetDate(nextTargetDate)) return { ok: false, error: 'invalid_target_date' }
+
+  let nextCycleBoundaryAt = existing.cycle_boundary_at
+  if (input.cycle_boundary_at !== undefined) {
+    if (input.cycle_boundary_at === null) {
+      nextCycleBoundaryAt = null
+    } else if (typeof input.cycle_boundary_at !== 'string') {
+      return { ok: false, error: 'invalid_cycle_boundary_at' }
+    } else {
+      const canonical = canonicalizeCycleBoundaryAt(input.cycle_boundary_at)
+      if (canonical === null) return { ok: false, error: 'invalid_cycle_boundary_at' }
+      nextCycleBoundaryAt = canonical
+    }
+  }
 
   const nextParentProjectId = input.parent_project_id === undefined
     ? existing.parent_project_id
@@ -270,6 +398,10 @@ export async function updateProject(
     return { ok: false, error: 'active_children' }
   }
 
+  const nextProposedBy = proposedByInput !== undefined
+    ? proposedByInput
+    : (existing.status === 'review' && nextStatus !== 'review' ? null : existing.completion_proposed_by)
+
   const updated: Project = {
     ...existing,
     slug: nextSlug,
@@ -279,20 +411,43 @@ export async function updateProject(
     status: nextStatus,
     parent_project_id: nextParentProjectId as string | null,
     target_date: nextTargetDate,
+    cycle_boundary_at: nextCycleBoundaryAt,
+    completion_proposed_by: nextProposedBy,
     updated_at: nextUpdatedAt(existing.updated_at),
   }
   try {
-    const result = await env.DB.prepare(
-      `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
-       target_date = ?, updated_at = ? WHERE id = ? AND updated_at = ?`,
-    ).bind(
-      updated.slug, updated.name, updated.description, updated.goal, updated.status,
-      updated.parent_project_id, updated.target_date, updated.updated_at, updated.id, existing.updated_at,
-    ).run()
+    // Compare-and-set on updated_at + expected status. Structural flips also
+    // refuse when a concurrent writer left any incomplete child task.
+    const result = structuralStatusFlip
+      ? await env.DB.prepare(
+        `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
+         target_date = ?, cycle_boundary_at = ?, completion_proposed_by = ?, updated_at = ?
+         WHERE id = ? AND updated_at = ? AND status = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM tasks WHERE project_id = ? AND status <> 'done'
+           )`,
+      ).bind(
+        updated.slug, updated.name, updated.description, updated.goal, updated.status,
+        updated.parent_project_id, updated.target_date, updated.cycle_boundary_at,
+        updated.completion_proposed_by, updated.updated_at,
+        updated.id, existing.updated_at, existing.status, updated.id,
+      ).run()
+      : await env.DB.prepare(
+        `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
+         target_date = ?, cycle_boundary_at = ?, completion_proposed_by = ?, updated_at = ?
+         WHERE id = ? AND updated_at = ? AND status = ?`,
+      ).bind(
+        updated.slug, updated.name, updated.description, updated.goal, updated.status,
+        updated.parent_project_id, updated.target_date, updated.cycle_boundary_at,
+        updated.completion_proposed_by, updated.updated_at,
+        updated.id, existing.updated_at, existing.status,
+      ).run()
     if (!wrote(result)) {
       const current = await getProject(env, id)
       if (!current) return { ok: false, error: 'project_not_found' }
-      return { ok: false, error: current.status === 'archived' ? 'archived_project' : 'receipt_failed' }
+      if (current.status === 'archived') return { ok: false, error: 'archived_project' }
+      if (structuralStatusFlip) return { ok: false, error: 'completion_gate_required' }
+      return { ok: false, error: 'receipt_failed' }
     }
   } catch (error) {
     if (isUniqueViolation(error)) return { ok: false, error: 'slug_taken' }
@@ -301,8 +456,25 @@ export async function updateProject(
     if (mapped) return { ok: false, error: mapped }
     throw error
   }
+
+  // Slice 2: completed → archived always writes a lessons-capture receipt.
+  if (existing.status === 'completed' && nextStatus === 'archived') {
+    const principal = typeof input.lifecycle_principal === 'string' && input.lifecycle_principal.trim() !== ''
+      ? input.lifecycle_principal.trim()
+      : 'system:project-lifecycle'
+    const { recordLessonsCapture, defaultCompletionGateDeps } = await import('./completion-gate')
+    await recordLessonsCapture(
+      env,
+      id,
+      principal,
+      updated.updated_at,
+      defaultCompletionGateDeps().writeReceipt,
+    )
+  }
+
   return { ok: true, value: updated }
 }
+
 
 export async function listProjectSquads(env: Env, projectId: string): Promise<ProjectSquadAccess[]> {
   const result = await env.DB.prepare(

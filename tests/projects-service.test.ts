@@ -139,22 +139,38 @@ describe('project domain service', () => {
   it('enforces the shared lifecycle transition matrix and writes same-status updates', async () => {
     harness = makeHarness()
     const env = envFor(harness)
-    const statuses = ['planned', 'active', 'paused', 'completed', 'archived'] as const
+    const statuses = ['planned', 'active', 'paused', 'review', 'completed', 'archived'] as const
     const allowed = new Set([
       'planned:planned', 'planned:active', 'planned:archived',
-      'active:active', 'active:paused', 'active:completed', 'active:archived',
-      'paused:paused', 'paused:active', 'paused:completed', 'paused:archived',
+      'active:active', 'active:paused', 'active:review', 'active:archived',
+      'paused:paused', 'paused:active', 'paused:archived',
+      'review:review', 'review:active', 'review:completed',
       'completed:completed', 'completed:active', 'completed:archived',
       'archived:archived', 'archived:planned',
     ])
+    // review/completed status flips require via_completion_gate (slice 2).
+    // planned→active requires via_start_gate (slice 3).
+    const gateOnly = new Set(['active:review', 'review:completed'])
+    const startOnly = new Set(['planned:active'])
 
     for (const from of statuses) {
       for (const to of statuses) {
         const id = `transition-${from}-${to}`
         harness.sqlite.prepare(
-          'INSERT INTO projects (id, slug, name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
-        ).run(id, id, id, from, '2026-07-19T00:00:00.000Z', '2026-07-19T00:00:00.000Z')
-        const result = await updateProject(env, id, { status: to })
+          `INSERT INTO projects (
+             id, slug, name, status, cycle_boundary_at, stalled, stall_threshold_days,
+             completion_proposed_by, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, NULL, 0, NULL, ?, ?, ?)`,
+        ).run(
+          id, id, id, from,
+          from === 'review' ? 'agent-builder' : null,
+          '2026-07-19T00:00:00.000Z', '2026-07-19T00:00:00.000Z',
+        )
+        const result = await updateProject(env, id, {
+          status: to,
+          via_completion_gate: gateOnly.has(`${from}:${to}`),
+          via_start_gate: startOnly.has(`${from}:${to}`),
+        })
 
         if (allowed.has(`${from}:${to}`)) {
           expect(result, `${from} -> ${to}`).toMatchObject({ ok: true, value: { status: to } })
@@ -167,6 +183,36 @@ describe('project domain service', () => {
         }
       }
     }
+  })
+
+  it('blocks bare planned→active without the start gate', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const created = await createProject(env, {
+      slug: 'start-gate-block',
+      name: 'Start gate block',
+      status: 'planned',
+      goal: 'Ship start gate',
+    })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    await expect(updateProject(env, created.value.id, { status: 'active' }))
+      .resolves.toEqual({ ok: false, error: 'start_gate_required' })
+  })
+
+  it('blocks bare active→completed self-report without the completion gate', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const root = await createRoot(env, 'self-report')
+    // Not in the transition matrix — agents cannot self-report completed.
+    await expect(updateProject(env, root.id, { status: 'completed' }))
+      .resolves.toEqual({ ok: false, error: 'invalid_status_transition' })
+    // Even review→completed requires via_completion_gate.
+    harness.sqlite.prepare(
+      `UPDATE projects SET status = 'review', completion_proposed_by = 'agent-builder' WHERE id = ?`,
+    ).run(root.id)
+    await expect(updateProject(env, root.id, { status: 'completed' }))
+      .resolves.toEqual({ ok: false, error: 'completion_gate_required' })
   })
 
   it('rejects creating or reparenting a child under an archived parent', async () => {

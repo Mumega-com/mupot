@@ -50,6 +50,7 @@ import { resolveCapabilities, hasCapability, actorMaxRankOnScope, hasSurfaceCap,
 import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent, updateUnitConfig } from '../org/service'
 import type { UnitConfigPatch } from '../org/service'
 import { createProject, getProject, updateProject } from '../projects/service'
+import { defaultStartGateDeps, startProject } from '../projects/start-gate'
 import { SQUAD_PACKS, seedSquadPack } from '../org/squad-packs'
 import { mintMemberToken, revokeMemberToken, loadLiveTokens, isChannel } from '../members/service'
 import type { MintedToken, PublicMemberToken } from '../members/service'
@@ -341,6 +342,29 @@ dashboardApp.post('/projects/:id/status', async (c) => {
   const form = await c.req.parseBody()
   const command = typeof form.command === 'string' ? form.command : ''
   const transition = projectLifecycleTransition(command)
+
+  // Slice 3: planned→active must authorize + provision via start-gate.
+  if (transition?.status === 'active' && currentProject.status === 'planned') {
+    const started = await startProject(c.env, projectId, defaultStartGateDeps())
+    if (!started.ok) {
+      const body = projectSettingsBody({
+        project: currentProject,
+        values: projectFormValues(currentProject),
+        parentOptions: await loadProjectParentOptions(c.env, currentProject.id),
+        error: started.error === 'project_not_found' ? 'project_not_found' : 'start_gate_required',
+        lifecycleCommand: command,
+      })
+      return c.html(
+        shell(c.env, 'Project settings', body),
+        started.error === 'project_not_found' ? 404 : 409,
+      )
+    }
+    return c.redirect(
+      `/projects/${encodeURIComponent(started.project.id)}?status=${encodeURIComponent(transition.result)}`,
+      303,
+    )
+  }
+
   const result = transition
     ? await updateProject(c.env, projectId, { status: transition.status })
     : { ok: false as const, error: 'invalid_status' as const }
