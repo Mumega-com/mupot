@@ -302,6 +302,12 @@ export interface Project {
   status: ProjectStatus
   parent_project_id: string | null
   target_date: string | null
+  /** Next ISO-8601 instant at which the lifecycle circuit breaker evaluates (migration 0068). */
+  cycle_boundary_at: string | null
+  /** Stall detector flag (0/1); raised early into the breaker — detector is slice 4. */
+  stalled: number
+  /** Per-project idle threshold in days; NULL = tenant default. */
+  stall_threshold_days: number | null
   created_at: string
   updated_at: string
 }
