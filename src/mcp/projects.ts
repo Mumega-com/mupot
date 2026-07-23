@@ -99,7 +99,8 @@ export async function readableProject(env: Env, projectId: string, access: Proje
   const visibility = projectVisibilityClause(access)
   return env.DB.prepare(
     `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-            p.target_date, p.created_at, p.updated_at
+            p.target_date, p.cycle_boundary_at, p.stalled, p.stall_threshold_days,
+            p.created_at, p.updated_at
        FROM projects p
       WHERE p.id = ? AND ${visibility.sql}`,
   ).bind(projectId, ...visibility.binds).first<Project>()
@@ -210,7 +211,8 @@ const toolProjectList: ToolSpec = {
 
     const rows = await env.DB.prepare(
       `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-              p.target_date, p.created_at, p.updated_at
+              p.target_date, p.cycle_boundary_at, p.stalled, p.stall_threshold_days,
+              p.created_at, p.updated_at
          FROM projects p
         WHERE ${clauses.join(' AND ')}
         ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
