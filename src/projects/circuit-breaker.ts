@@ -94,7 +94,7 @@ export function shouldEvaluateBreaker(
   cycleBoundaryAt: string | null,
   nowIso: string,
 ): boolean {
-  if (status === 'completed' || status === 'archived') return false
+  if (status === 'completed' || status === 'archived' || status === 'review') return false
   return isAtCycleBoundary(cycleBoundaryAt, nowIso)
 }
 
