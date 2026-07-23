@@ -29,7 +29,7 @@ type Page = { limit: number; offset: number }
 type ProjectionKind = 'activity' | 'evidence'
 type ProjectionPage = Page & { after?: ProjectProjectionCursor }
 
-const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'completed', 'archived']
+const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'review', 'completed', 'archived']
 const DEFAULT_PAGE_SIZE = 100
 const MAX_PAGE_SIZE = 100
 const MAX_PAGE_OFFSET = 10_000
@@ -171,7 +171,9 @@ async function readableProject(
 ): Promise<Project | null> {
   const visibility = projectVisibilityClause(access)
   return env.DB.prepare(
-    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date, p.created_at, p.updated_at
+    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date,
+            p.cycle_boundary_at, p.stalled, p.stall_threshold_days, p.completion_proposed_by,
+            p.created_at, p.updated_at
        FROM projects p
       WHERE p.id = ?
         AND ${visibility.sql}`,
@@ -252,7 +254,7 @@ async function projectAggregates(
 
 function mutationStatus(error: ProjectMutationError): 400 | 404 | 409 {
   if (error === 'project_not_found' || error === 'parent_not_found' || error === 'squad_not_found') return 404
-  if (error === 'slug_taken' || error === 'receipt_failed' || error === 'invalid_status_transition') return 409
+  if (error === 'slug_taken' || error === 'receipt_failed' || error === 'invalid_status_transition' || error === 'completion_gate_required') return 409
   return 400
 }
 
@@ -306,7 +308,9 @@ projectsApp.get('/', async (c) => {
     binds.push(parentId)
   }
   const result = await c.env.DB.prepare(
-    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date, p.created_at, p.updated_at
+    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date,
+            p.cycle_boundary_at, p.stalled, p.stall_threshold_days, p.completion_proposed_by,
+            p.created_at, p.updated_at
        FROM projects p
       WHERE ${clauses.join(' AND ')}
       ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
