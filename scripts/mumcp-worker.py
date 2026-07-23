@@ -243,7 +243,6 @@ def main() -> int:
     identity: RuntimeIdentity = boot_session(
         cfg,
         presence_adapter="mumcp",
-        presence_capabilities=["build"],
         log=log,
     )
     # Own-assignee filter; squad omitted so mupot derives it from the bound agent

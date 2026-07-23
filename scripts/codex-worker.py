@@ -39,7 +39,7 @@ Config (env):
   REPO                   default /home/mumega/mupot
   GATE_OWNER             default 'gate:kasra-core'
   MODEL                  optional --model override
-  SANDBOX                default workspace-write (read-only|workspace-write|danger-full-access)
+  SANDBOX                default workspace-write (read-only|workspace-write; danger-full-access disallowed)
   MAX_TASKS              default 1
   TIMEOUT                default 1800
   DRY_RUN                '1' = poll + print, do nothing
@@ -79,6 +79,10 @@ from runtime_adapter_v1 import (  # noqa: E402
     read_token,
     report_blocked,
 )
+from codex_child_env import (  # noqa: E402
+    build_codex_child_env,
+    resolve_sandbox,
+)
 
 RUNTIME_TYPE = "codex"
 AGENT_TYPE = "builder"
@@ -103,7 +107,6 @@ REPO_SLUG = os.environ.get("REPO_SLUG", "Mumega-com/mupot")
 WORKTREE_ROOT = Path(os.environ.get("WORKTREE_ROOT", "/home/mumega/mupot-worktrees"))
 MUPOT_MCP = os.environ.get("MUPOT_MCP", "https://mupot.mumega.com/mcp")
 
-VALID_SANDBOX = frozenset({"read-only", "workspace-write", "danger-full-access"})
 MCP_SERVER_NAME = "mupot"
 MCP_STANZA_MARKER = f"[mcp_servers.{MCP_SERVER_NAME}]"
 
@@ -189,13 +192,12 @@ def build_brief(task: dict, worktree: Path, branch: str) -> str:
 
 
 def codex_run(worktree: Path, brief: str, token: str) -> subprocess.CompletedProcess:
-    if SANDBOX not in VALID_SANDBOX:
-        raise ValueError(f"SANDBOX must be one of {sorted(VALID_SANDBOX)}, got {SANDBOX!r}")
+    sandbox = resolve_sandbox(SANDBOX)
     cmd = [
         CODEX_BIN,
         "exec",
         "--sandbox",
-        SANDBOX,
+        sandbox,
         "--json",
         "-C",
         str(worktree),
@@ -203,9 +205,12 @@ def codex_run(worktree: Path, brief: str, token: str) -> subprocess.CompletedPro
     if MODEL:
         cmd += ["--model", MODEL]
     cmd.append(brief)
-    env = dict(os.environ)
-    env[CODEX_MCP_ENV_VAR] = token
-    log(f"dispatching {CODEX_BIN} exec --sandbox {SANDBOX} --json (timeout {TIMEOUT}s) ...")
+    env = build_codex_child_env(
+        dict(os.environ),
+        mcp_env_var=CODEX_MCP_ENV_VAR,
+        token=token,
+    )
+    log(f"dispatching {CODEX_BIN} exec --sandbox {sandbox} --json (timeout {TIMEOUT}s) ...")
     return subprocess.run(cmd, cwd=str(worktree), env=env, capture_output=True, text=True, timeout=TIMEOUT)
 
 
@@ -372,7 +377,6 @@ def run_mint_attach(*, dry_run: bool) -> int:
     identity = boot_session(
         agent_cfg,
         presence_adapter="codex",
-        presence_capabilities=["build"],
         log=log,
     )
     log(f"mint-attach complete agent={identity.agent_id} tenant={identity.tenant}")
@@ -392,8 +396,10 @@ def main(argv: list[str] | None = None) -> int:
     if mint_attach:
         return run_mint_attach(dry_run=DRY_RUN)
 
-    if SANDBOX not in VALID_SANDBOX:
-        log(f"invalid SANDBOX={SANDBOX!r}; want one of {sorted(VALID_SANDBOX)}")
+    try:
+        sandbox = resolve_sandbox(SANDBOX)
+    except ValueError as exc:
+        log(str(exc))
         return 2
     if not CODEX_TOKEN_PATH.exists():
         log(f"no codex token at {CODEX_TOKEN_PATH} (or run MINT_ATTACH=1 DRY_RUN=1 first)")
@@ -412,14 +418,13 @@ def main(argv: list[str] | None = None) -> int:
     if DRY_RUN:
         log(
             f"DRY_RUN — would boot_session(runtime={RUNTIME_TYPE}), poll own-assignee open tasks, "
-            f"codex exec --sandbox {SANDBOX} --json, verify, PR, land_at_review"
+            f"codex exec --sandbox {sandbox} --json, verify, PR, land_at_review"
         )
         # Still resolve identity when a token exists so dry-run exercises the contract path.
         try:
             identity: RuntimeIdentity = boot_session(
                 cfg,
                 presence_adapter="codex",
-                presence_capabilities=["build"],
                 log=log,
             )
             tasks = poll_open_tasks(cfg, identity, limit=MAX_TASKS)
@@ -433,7 +438,6 @@ def main(argv: list[str] | None = None) -> int:
     identity = boot_session(
         cfg,
         presence_adapter="codex",
-        presence_capabilities=["build"],
         log=log,
     )
     tasks = poll_open_tasks(cfg, identity, limit=MAX_TASKS)

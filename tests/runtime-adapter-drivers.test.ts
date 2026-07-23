@@ -26,11 +26,20 @@ describe('runtime-adapter/v1 reference drivers (BYOA topology A)', () => {
     expect(adapter).toContain('boot_context')
     expect(adapter).toContain('def signed_attach(')
     expect(adapter).toContain('def bearer_attach(')
+    expect(adapter).toContain('def signed_detach(')
+    expect(adapter).toContain('def bearer_detach(')
+    expect(adapter).toContain('def signed_inbox(')
     expect(adapter).toContain('def land_at_review(')
     expect(adapter).toContain('FORBIDDEN_ADAPTER_ACTIONS')
     expect(adapter).toContain('"merge"')
     expect(adapter).toContain('"deploy"')
     expect(adapter).toContain('"self_verdict"')
+    // P0-1: attach failure is TERMINAL (fail-closed), never soft-swallowed.
+    expect(adapter).toContain('Attach / signature verification failure is TERMINAL')
+    expect(adapter).not.toContain('attach failed (non-fatal this cycle)')
+    expect(adapter).not.toContain('attach failure must not block task work')
+    // P0-2: presence capabilities are not client-asserted.
+    expect(adapter).not.toContain('presence_capabilities')
   })
 
   it('refactors cursor-worker onto the reference adapter with runtime=cursor', () => {
@@ -96,6 +105,31 @@ describe('runtime-adapter/v1 reference drivers (BYOA topology A)', () => {
     expect(codexWorker).not.toMatch(/npm run deploy|gh pr merge/)
     expect(codexWorker).toContain('mcp_config_stanza')
     expect(codexWorker).toContain('streamable-HTTP')
+    // P0-2 / P0-3 rails
+    expect(codexWorker).not.toContain('presence_capabilities')
+    expect(codexWorker).toContain('build_codex_child_env(')
+    expect(codexWorker).toContain('resolve_sandbox(')
+  })
+
+  it('scrubs the codex exec child env and disallows danger-full-access (P0-3)', () => {
+    const childEnv = read('scripts/codex_child_env.py')
+    expect(childEnv).toContain('CODEX_CHILD_ENV_ALLOWLIST')
+    expect(childEnv).toContain('"PATH"')
+    expect(childEnv).toContain('"HOME"')
+    expect(childEnv).toContain('GITHUB_')
+    expect(childEnv).toContain('DISALLOWED_SANDBOX')
+    expect(childEnv).toContain('danger-full-access')
+    expect(childEnv).toContain('def build_codex_child_env(')
+    expect(childEnv).toContain('def resolve_sandbox(')
+    // Driver must not copy full os.environ into the codex child.
+    expect(codexWorker).not.toMatch(/env = dict\(os\.environ\)\s*\n\s*env\[CODEX_MCP_ENV_VAR\]/)
+  })
+
+  it('presence_register ignores client capabilities (P0-2 server-derived)', () => {
+    const presence = read('src/mcp/presence.ts')
+    expect(presence).toContain('derivePresenceCapabilities')
+    expect(presence).toContain('Client-supplied args.capabilities are ignored')
+    expect(presence).toContain("builder: ['build']")
   })
 
   it('wires Codex remote MCP as streamable-HTTP (url + bearer_token_env_var, no SSE)', () => {

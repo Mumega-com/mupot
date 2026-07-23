@@ -234,7 +234,6 @@ def main() -> int:
     identity: RuntimeIdentity = boot_session(
         cfg,
         presence_adapter="cursor",
-        presence_capabilities=["build"],
         log=log,
     )
     tasks = poll_open_tasks(cfg, identity, limit=MAX_TASKS)

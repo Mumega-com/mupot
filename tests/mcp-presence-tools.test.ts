@@ -126,6 +126,49 @@ describe('presence_register — identity is server-derived, never from args', ()
     expect(rows).toHaveLength(1)
     expect(rows[0].adapter).toBe('cursor')
   })
+
+  it('ignores client-asserted capabilities and derives build from fleet agent_type', async () => {
+    const db = makeDb()
+    await db.env.DB.prepare(
+      `INSERT INTO fleet_agents
+         (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, agent_type, member_id)
+       VALUES (?1, ?2, '', 'codex', '[]', 'on_demand', 'running', ?1, 'builder', ?3)`,
+    )
+      .bind('agent-welded-1', TENANT, 'member-welded')
+      .run()
+    // Attacker tries to claim build+admin via args — must be ignored.
+    const outcome = await invokeTool(
+      weldedAgent,
+      db.env,
+      'presence_register',
+      { adapter: 'codex', project_id: 'proj-a', capabilities: ['build', 'admin', 'deploy'] },
+      ORIGIN,
+    )
+    expect(outcome.ok).toBe(true)
+    if (outcome.ok) {
+      const result = outcome.result as { module: { capabilities: string[] } }
+      expect(result.module.capabilities).toEqual(['build'])
+      expect(result.module.capabilities).not.toContain('admin')
+      expect(result.module.capabilities).not.toContain('deploy')
+    }
+  })
+
+  it('stores empty capabilities when no fleet agent_type is known (no client assert)', async () => {
+    const db = makeDb()
+    const outcome = await invokeTool(
+      squadObserver,
+      db.env,
+      'presence_register',
+      { adapter: 'claude_code', project_id: 'proj-a', capabilities: ['build'] },
+      ORIGIN,
+    )
+    expect(outcome.ok).toBe(true)
+    if (outcome.ok) {
+      const result = outcome.result as { module: { capabilities: string[] } }
+      // Client asserted build, but no fleet row → server stores [].
+      expect(result.module.capabilities).toEqual([])
+    }
+  })
 })
 
 describe('presence_register / presence_heartbeat — project-write authz (P1 fix, 2026-07-21)', () => {

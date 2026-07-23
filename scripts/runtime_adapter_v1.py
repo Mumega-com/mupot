@@ -337,6 +337,149 @@ def attach(cfg: AdapterConfig, identity: RuntimeIdentity, *, host: str = "") -> 
     return bearer_attach(cfg, identity, host=host)
 
 
+def canonical_detach_message(*, tenant: str, agent_id: str, ts: int, nonce: str) -> bytes:
+    """Byte-identical to src/fleet/signed-detach.ts / fleet-runtime/fleet-sign.mjs."""
+    return "\n".join(
+        [SIGNED_DETACH_DOMAIN, tenant, agent_id, str(ts), nonce]
+    ).encode("utf-8")
+
+
+def canonical_inbox_message(
+    *,
+    tenant: str,
+    agent_id: str,
+    peek: bool,
+    limit: int,
+    ts: int,
+    nonce: str,
+) -> bytes:
+    """Byte-identical to src/fleet/signed-inbox.ts / fleet-runtime/fleet-sign.mjs."""
+    return "\n".join(
+        [
+            SIGNED_INBOX_DOMAIN,
+            tenant,
+            agent_id,
+            "1" if peek else "0",
+            str(limit),
+            str(ts),
+            nonce,
+        ]
+    ).encode("utf-8")
+
+
+def signed_detach(
+    cfg: AdapterConfig,
+    identity: RuntimeIdentity,
+    *,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """POST /api/fleet/detach-signed with fleet-detach:v1 domain separation."""
+    if cfg.key_path is None or not cfg.key_path.is_file():
+        raise FileNotFoundError("signed_detach requires AdapterConfig.key_path")
+    priv = _load_ed25519_private_key(cfg.key_path)
+    ts = int(time.time())
+    nonce = _b64url(secrets.token_bytes(32))
+    message = canonical_detach_message(
+        tenant=identity.tenant,
+        agent_id=identity.agent_id,
+        ts=ts,
+        nonce=nonce,
+    )
+    sig = _b64url(priv.sign(message))
+    body: dict[str, Any] = {
+        "agent_id": identity.agent_id,
+        "ts": ts,
+        "nonce": nonce,
+        "sig": sig,
+    }
+    status, payload = _http_json(
+        "POST",
+        f"{cfg.api_base_url.rstrip('/')}{DETACH_SIGNED_PATH}",
+        headers={"content-type": "application/json", "User-Agent": cfg.user_agent},
+        body=body,
+        timeout=timeout,
+    )
+    if status >= 400 or not payload.get("ok", False):
+        raise RuntimeError(f"detach-signed failed HTTP {status}: {payload}")
+    return payload
+
+
+def bearer_detach(
+    cfg: AdapterConfig,
+    identity: RuntimeIdentity,
+    *,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """POST /api/fleet/detach — token-welded agents without a registered key."""
+    body: dict[str, Any] = {"agent_id": identity.agent_id}
+    status, payload = _http_json(
+        "POST",
+        f"{cfg.api_base_url.rstrip('/')}{DETACH_PATH}",
+        headers={
+            "Authorization": f"Bearer {cfg.token}",
+            "content-type": "application/json",
+            "User-Agent": cfg.user_agent,
+        },
+        body=body,
+        timeout=timeout,
+    )
+    if status >= 400 or not payload.get("ok", False):
+        raise RuntimeError(f"bearer detach failed HTTP {status}: {payload}")
+    return payload
+
+
+def detach(cfg: AdapterConfig, identity: RuntimeIdentity) -> dict[str, Any]:
+    """Prefer signed detach (fleet-detach:v1) when a host key exists; else bearer."""
+    if cfg.key_path is not None and cfg.key_path.is_file():
+        return signed_detach(cfg, identity)
+    return bearer_detach(cfg, identity)
+
+
+def signed_inbox(
+    cfg: AdapterConfig,
+    identity: RuntimeIdentity,
+    *,
+    peek: bool,
+    limit: int,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """POST /api/inbox/signed with agent-inbox:v1 domain separation."""
+    if cfg.key_path is None or not cfg.key_path.is_file():
+        raise FileNotFoundError("signed_inbox requires AdapterConfig.key_path")
+    if not isinstance(limit, int) or limit < 1 or limit > 100:
+        raise ValueError("signed_inbox limit must be an integer 1-100")
+    priv = _load_ed25519_private_key(cfg.key_path)
+    ts = int(time.time())
+    nonce = _b64url(secrets.token_bytes(32))
+    message = canonical_inbox_message(
+        tenant=identity.tenant,
+        agent_id=identity.agent_id,
+        peek=peek,
+        limit=limit,
+        ts=ts,
+        nonce=nonce,
+    )
+    sig = _b64url(priv.sign(message))
+    body: dict[str, Any] = {
+        "agent_id": identity.agent_id,
+        "peek": peek,
+        "limit": limit,
+        "ts": ts,
+        "nonce": nonce,
+        "sig": sig,
+    }
+    status, payload = _http_json(
+        "POST",
+        f"{cfg.api_base_url.rstrip('/')}/api/inbox/signed",
+        headers={"content-type": "application/json", "User-Agent": cfg.user_agent},
+        body=body,
+        timeout=timeout,
+    )
+    if status >= 400:
+        raise RuntimeError(f"signed inbox failed HTTP {status}: {payload}")
+    return payload
+
+
 def land_at_review(
     cfg: AdapterConfig,
     *,
@@ -392,10 +535,13 @@ def register_port1_presence(
     cfg: AdapterConfig,
     *,
     adapter: str,
-    capabilities: list[str],
     log: LogFn,
 ) -> None:
-    """Best-effort Port-1 self-registration (concierge dispatcher). Non-fatal."""
+    """Best-effort Port-1 self-registration (concierge dispatcher). Non-fatal.
+
+    Capabilities are NEVER client-asserted — the pot derives them server-side
+    from the bound agent / fleet agent_type. The driver only names its adapter.
+    """
     try:
         mcp_call(
             cfg,
@@ -404,10 +550,9 @@ def register_port1_presence(
                 "adapter": adapter,
                 "kind": "agent_system",
                 "project_id": None,
-                "capabilities": capabilities,
             },
         )
-        log(f"presence: registered/refreshed (adapter={adapter}, capabilities={capabilities})")
+        log(f"presence: registered/refreshed (adapter={adapter}; capabilities server-derived)")
     except Exception as exc:  # noqa: BLE001 - presence is best-effort, never fatal
         log(f"presence_register failed (non-fatal): {exc}")
 
@@ -416,32 +561,28 @@ def boot_session(
     cfg: AdapterConfig,
     *,
     presence_adapter: str,
-    presence_capabilities: list[str],
     log: LogFn,
     host: str = "",
 ) -> RuntimeIdentity:
-    """Resolve identity (server) → attach (declared runtime) → Port-1 presence."""
+    """Resolve identity (server) → attach (fail-closed) → Port-1 presence (soft).
+
+    Attach / signature verification failure is TERMINAL: no presence, no poll,
+    no claim, no dispatch. Only presence-registration transient errors may be soft.
+    """
     identity = resolve_identity(cfg)
     log(
         f"{CONTRACT_ID} identity tenant={identity.tenant} "
         f"agent={identity.agent_id} slug={identity.slug!r} "
         f"runtime={cfg.runtime} lifecycle={cfg.lifecycle}"
     )
-    try:
-        ack = attach(cfg, identity, host=host)
-        agent_view = ack.get("agent") if isinstance(ack.get("agent"), dict) else {}
-        log(
-            f"attach ok runtime={agent_view.get('runtime', cfg.runtime)!r} "
-            f"status={agent_view.get('status', 'running')!r}"
-        )
-    except Exception as exc:  # noqa: BLE001 - attach failure must not block task work
-        log(f"attach failed (non-fatal this cycle): {exc}")
-    register_port1_presence(
-        cfg,
-        adapter=presence_adapter,
-        capabilities=presence_capabilities,
-        log=log,
+    # Fail-closed: every attach failure (including signature verification) is terminal.
+    ack = attach(cfg, identity, host=host)
+    agent_view = ack.get("agent") if isinstance(ack.get("agent"), dict) else {}
+    log(
+        f"attach ok runtime={agent_view.get('runtime', cfg.runtime)!r} "
+        f"status={agent_view.get('status', 'running')!r}"
     )
+    register_port1_presence(cfg, adapter=presence_adapter, log=log)
     return identity
 
 

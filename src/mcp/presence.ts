@@ -12,6 +12,9 @@
 //     an attacker cannot even ATTEMPT to name another principal (schema-level, not
 //     just a runtime check — additionalProperties:false rejects an extra field
 //     before the handler runs).
+//   - presence_register capabilities are ALWAYS server-derived from the bound
+//     agent's fleet_agents.agent_type (builder→build). Client-supplied
+//     args.capabilities are ignored — never runtime-asserted routing data.
 //   - presence_register / presence_heartbeat ALSO bind that identity into a
 //     project's roster when project_id is non-null — that is a WRITE into project-
 //     scoped state, so it is gated through the SAME project-visibility primitive
@@ -34,7 +37,7 @@
 //     than "this project's roster," so it fails closed to the org floor instead of
 //     silently granting it to every observer.
 
-import type { AuthContext } from '../types'
+import type { AuthContext, Env } from '../types'
 import {
   registerModule,
   heartbeatModule,
@@ -50,6 +53,28 @@ const STRING_SCHEMA = { type: 'string' }
 const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
 const OPTIONAL_STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const MODULE_KIND_ENUM = ['agent_system', 'workflow', 'surface']
+
+/** Map fleet agent_type → Port-1 presence capability tags. Server-derived only —
+ *  the client must never assert these (concierge routes on `build`). */
+const FLEET_TYPE_PRESENCE_CAPS: Readonly<Record<string, readonly string[]>> = {
+  builder: ['build'],
+  reviewer: ['review'],
+}
+
+/**
+ * Derive Port-1 presence capabilities from the bound agent's fleet agent_type.
+ * Client-supplied capabilities are ignored — capability is ALWAYS server-derived.
+ */
+async function derivePresenceCapabilities(env: Env, identity: string): Promise<string[]> {
+  const row = await env.DB.prepare(
+    `SELECT agent_type FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
+  )
+    .bind(env.TENANT_SLUG, identity)
+    .first<{ agent_type: string | null }>()
+  if (!row || typeof row.agent_type !== 'string') return []
+  const caps = FLEET_TYPE_PRESENCE_CAPS[row.agent_type]
+  return caps ? [...caps] : []
+}
 
 // The caller's own identity, server-derived — never taken from args (see file
 // docstring). A welded agent-scoped token IS that agent; a plain member/operator
@@ -108,13 +133,10 @@ const toolPresenceRegister: ToolSpec = {
       if (!project) return fail(404, 'project_not_found')
     }
 
-    let capabilities: string[] | undefined
-    if (args.capabilities !== undefined) {
-      if (!Array.isArray(args.capabilities) || !args.capabilities.every((v) => typeof v === 'string')) {
-        return fail(400, 'invalid_args', 'capabilities must be a string[]')
-      }
-      capabilities = args.capabilities
-    }
+    // Capabilities are ALWAYS server-derived from the bound agent's fleet
+    // agent_type. Client-supplied args.capabilities are ignored (authorization-
+    // relevant routing data must never be runtime-asserted).
+    const capabilities = await derivePresenceCapabilities(env, identity)
 
     const result = await registerModule(env, {
       identity,
