@@ -118,7 +118,7 @@ const VALID_TYPES = new Set(['builder', 'reviewer', 'weaver', 'brain', 'comms', 
 // daemon-report set which uses 'hermes-cron' for cron-only Hermes).
 // Goose / goosed are deliberately excluded — see docs/fleet/goose-non-adoption-2026-07-22.md.
 const VALID_RUNTIMES = new Set([
-  'codex', 'claude-code', 'nous', 'hermes', 'hermes-cron',
+  'codex', 'claude-code', 'cursor', 'nous', 'hermes', 'hermes-cron',
   'systemd-user', 'tmux', 'python',
 ])
 
