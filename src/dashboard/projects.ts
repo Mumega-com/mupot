@@ -37,6 +37,12 @@ import { getFleetAgentRuntimeStates } from '../fleet/registry'
 import type { Presence } from '../fleet/registry'
 import { listProjectBindings } from '../projects/providers/bindings'
 import type { ProjectProviderBinding } from '../projects/providers/port'
+import {
+  listVisibleProjectDocs,
+  tierContextFromConcepts,
+  viewerClaimsForProject,
+  type ProjectDoc,
+} from '../projects/docs'
 import { emptyState, pageHeader, pill, sectionPanel } from './ui'
 import type { Html } from './ui'
 
@@ -1190,8 +1196,27 @@ export function projectSettingsBody(view: ProjectSettingsView): Html {
   </section>`
 }
 
-function projectTabs() {
-  return html`<nav aria-label="Project sections" style="display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px;">
+/** Three owner surfaces: chat (talk), docs (read knowledge), board (watch work). */
+export type OwnerSurface = 'chat' | 'docs' | 'board'
+
+export function ownerSurfacesNav(projectId: string, current: OwnerSurface | null): Html {
+  const chatHref = `/send?project_id=${encodeURIComponent(projectId)}`
+  const docsHref = `/projects/${encodeURIComponent(projectId)}/docs`
+  const boardHref = `/projects/${encodeURIComponent(projectId)}#board`
+  const link = (surface: OwnerSurface, href: string, label: string) =>
+    current === surface
+      ? html`<a class="btn sm" href="${href}" aria-current="page">${label}</a>`
+      : html`<a class="btn secondary sm" href="${href}">${label}</a>`
+  return html`<nav aria-label="Owner surfaces" style="display:flex;gap:8px;overflow-x:auto;padding:2px 0 10px;">
+    ${link('chat', chatHref, 'Chat')}
+    ${link('docs', docsHref, 'Docs')}
+    ${link('board', boardHref, 'Board')}
+  </nav>`
+}
+
+function projectTabs(projectId: string) {
+  return html`${ownerSurfacesNav(projectId, null)}
+  <nav aria-label="Project sections" style="display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px;">
     <a class="btn secondary sm" data-project-tab href="#overview" aria-current="page">Overview</a>
     <a class="btn secondary sm" data-project-tab href="#work">Work</a>
     <a class="btn secondary sm" data-project-tab href="#board">Board</a>
@@ -1364,7 +1389,7 @@ export function projectDetailBody(view: ProjectDetailView, statusResult?: string
     })}
     ${resultMessage ? html`<p role="status" style="margin:8px 0;color:var(--ok,#16a34a);">${resultMessage}</p>` : ''}
     ${view.canManage ? html`<div style="display:flex;justify-content:flex-end;margin:8px 0;"><a class="btn secondary sm" href="/projects/${encodeURIComponent(project.id)}/settings">Project settings</a></div>` : ''}
-    ${projectTabs()}
+    ${projectTabs(project.id)}
     <script type="application/json" id="project-situation-json">${raw(jsonScript(situation))}</script>
     ${operatingSituationBand(project, aggregates, situation)}
     <section id="work" aria-label="Work">
@@ -1457,4 +1482,74 @@ export function projectNotFoundBody() {
       title: 'Project unavailable',
       detail: 'This project does not exist or is not visible to this account.',
     })}`
+}
+
+export interface ProjectDocsView {
+  project: Project
+  docs: ProjectDoc[]
+  query: string
+}
+
+export async function loadProjectDocsView(
+  env: Env,
+  auth: AuthContext,
+  projectId: string,
+  query: string,
+): Promise<ProjectDocsView | null> {
+  const [project, access] = await Promise.all([getProject(env, projectId), projectAccess(env, auth)])
+  if (!project || !(await isReadableProject(env, project.id, access))) return null
+  const claims = viewerClaimsForProject(auth, project.id, {
+    workspaceAdmin: access.workspaceAdmin,
+    orgRead: access.orgRead,
+    squadIds: access.readableSquadIds ?? access.squadIds,
+    departmentIds: access.departmentIds,
+  })
+  const listed = await listVisibleProjectDocs(env, project.id, claims, 100, query)
+  return { project, docs: listed.docs, query }
+}
+
+export function projectDocsBody(view: ProjectDocsView): Html {
+  const { project, docs, query } = view
+  const rows = docs.map((doc) => {
+    const tier = tierContextFromConcepts(doc.concepts).tier
+    const preview = doc.text.length > 240 ? `${doc.text.slice(0, 240)}…` : doc.text
+    return [
+      html`<span class="ui-pill" style="--pill:var(--dim)">${tier}</span>`,
+      html`<span style="display:grid;gap:4px;min-width:0;white-space:normal;overflow-wrap:anywhere;">
+        <span>${preview}</span>
+        <span class="ui-panel-sub">${doc.created_at}</span>
+      </span>`,
+    ]
+  })
+  return html`
+    ${pageHeader({
+      crumbs: `Projects / ${project.name}`,
+      title: 'Docs',
+      sub: 'Project knowledge — the same store the mubot reads and writes. Visibility is RBAC-filtered to your claims.',
+      badge: project.status,
+      badgeTone: statusTone(project.status),
+    })}
+    ${ownerSurfacesNav(project.id, 'docs')}
+    <form method="get" action="/projects/${encodeURIComponent(project.id)}/docs" class="adminform" style="margin:8px 0 14px;flex-direction:row;flex-wrap:wrap;align-items:end;gap:10px;" autocomplete="off">
+      <label style="flex:1;min-width:12rem;">Search docs
+        <input name="q" type="search" value="${query}" placeholder="Search text or concepts…" />
+      </label>
+      <button class="btn" type="submit">Search</button>
+    </form>
+    <section id="docs" aria-label="Project docs">
+      ${sectionPanel({
+        title: 'Visible docs',
+        body: html`${semanticDataTable({
+          label: 'Project docs',
+          cols: [
+            { label: 'Tier', width: 'auto' },
+            { label: 'Knowledge', width: '3fr' },
+          ],
+          rows,
+          empty: query.trim().length > 0
+            ? 'No visible docs match this search.'
+            : 'No docs visible for your claims yet. Project memory lessons and doc writes appear here when your tier allows.',
+        })}`,
+      })}
+    </section>`
 }

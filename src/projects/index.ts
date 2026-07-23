@@ -6,6 +6,7 @@ import { resolveCapabilities } from '../auth/capability'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { listProjectActivity, listProjectEvidence, type ProjectProjectionCursor } from './projections'
 import {
+  anySquadHasProjectWrite,
   projectReadAccessFromGrants,
   projectVisibilityClause,
   unrestrictedProjectRead,
@@ -21,6 +22,12 @@ import {
   upsertProjectSquadAccess,
 } from './service'
 import type { CreateProjectInput, ProjectMutationError, UpdateProjectInput } from './service'
+import {
+  listVisibleProjectDocs,
+  viewerClaimsForProject,
+  writeProjectDoc,
+} from './docs'
+import type { ContentTier, ContentTierContext } from '../docs/content-tier'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
@@ -396,6 +403,90 @@ projectsApp.get('/:id/evidence', async (c) => {
     rows: rows.rows,
     next_cursor: rows.nextCursor ? encodeProjectionCursor('evidence', rows.nextCursor) : null,
   })
+})
+
+// Project docs = project memory. GET lists engrams under project:<id>; POST writes
+// through createMemory().remember so project_recall can retrieve the same row.
+const DOCS_DEFAULT_LIMIT = 50
+const DOCS_MAX_LIMIT = 100
+
+function parseDocsLimit(limitInput: string | undefined): number | null {
+  if (limitInput === undefined) return DOCS_DEFAULT_LIMIT
+  if (!/^[1-9]\d*$/.test(limitInput)) return null
+  const limit = Number(limitInput)
+  if (!Number.isInteger(limit) || limit < 1 || limit > DOCS_MAX_LIMIT) return null
+  return limit
+}
+
+const CONTENT_TIERS: ReadonlySet<string> = new Set([
+  'public',
+  'squad',
+  'project',
+  'role',
+  'entity',
+  'private',
+])
+
+function parseDocsTier(body: Record<string, unknown>): ContentTierContext | null | 'invalid' {
+  if (body.tier === undefined && body.entity_id === undefined && body.created_by === undefined && body.permitted_roles === undefined) {
+    return null
+  }
+  if (typeof body.tier !== 'string' || !CONTENT_TIERS.has(body.tier)) return 'invalid'
+  const tier = body.tier as ContentTier
+  const ctx: ContentTierContext = { tier }
+  if (body.entity_id !== undefined) {
+    if (typeof body.entity_id !== 'string' || body.entity_id.length === 0) return 'invalid'
+    ctx.entity_id = body.entity_id
+  }
+  if (body.created_by !== undefined) {
+    if (typeof body.created_by !== 'string' || body.created_by.length === 0) return 'invalid'
+    ctx.created_by = body.created_by
+  }
+  if (body.permitted_roles !== undefined) {
+    if (!Array.isArray(body.permitted_roles) || !body.permitted_roles.every((item) => typeof item === 'string')) {
+      return 'invalid'
+    }
+    const roles = body.permitted_roles.filter((role) => role.length > 0)
+    if (roles.length > 0) ctx.permitted_roles = roles
+  }
+  return ctx
+}
+
+projectsApp.get('/:id/docs', async (c) => {
+  const limit = parseDocsLimit(c.req.query('limit'))
+  if (limit === null) return c.json({ error: 'invalid_pagination' }, 400)
+  const auth = c.get('auth')
+  const access = await projectReadAccess(c.env, auth)
+  const project = await readableProject(c.env, c.req.param('id'), access)
+  if (!project) return c.json({ error: 'project_not_found' }, 404)
+  const query = c.req.query('q') ?? ''
+  const claims = viewerClaimsForProject(auth, project.id, access)
+  const listed = await listVisibleProjectDocs(c.env, project.id, claims, limit, query)
+  return c.json({ project_id: project.id, scope: listed.scope, docs: listed.docs })
+})
+
+projectsApp.post('/:id/docs', async (c) => {
+  const access = await projectReadAccess(c.env, c.get('auth'))
+  const project = await readableProject(c.env, c.req.param('id'), access)
+  if (!project) return c.json({ error: 'project_not_found' }, 404)
+  if (!access.workspaceAdmin && !(await anySquadHasProjectWrite(c.env, project.id, access.squadIds))) {
+    return c.json({ error: 'forbidden', need: 'project_write' }, 403)
+  }
+  const body = await jsonObject(c)
+  if (!body) return c.json({ error: 'invalid_json' }, 400)
+  const text = typeof body.text === 'string' ? body.text.trim() : ''
+  if (!text) return c.json({ error: 'invalid_text' }, 400)
+  let concepts: string[] | null = null
+  if (body.concepts !== undefined) {
+    if (!Array.isArray(body.concepts) || !body.concepts.every((item) => typeof item === 'string')) {
+      return c.json({ error: 'invalid_concepts' }, 400)
+    }
+    concepts = body.concepts.length > 0 ? body.concepts : null
+  }
+  const tier = parseDocsTier(body)
+  if (tier === 'invalid') return c.json({ error: 'invalid_tier' }, 400)
+  const doc = await writeProjectDoc(c.env, project.id, text, concepts, tier)
+  return c.json({ project_id: project.id, doc }, 201)
 })
 
 projectsApp.patch('/:id', async (c) => {

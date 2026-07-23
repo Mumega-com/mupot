@@ -39,6 +39,7 @@ import { callerHoldsGateCapability, verdictPrincipal } from '../tasks/index'
 import { isChannel } from '../members/service'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
+import { projectMemoryScope } from '../projects/memory-scope'
 import {
   assertCompletableDoneWhen,
   assigneeCannotMutateOwnAssignment,
@@ -179,15 +180,8 @@ function squadMemoryScope(squadId: string): string {
   return `squad:${squadId}`
 }
 
-// Project-shared memory scope (Port: project memory). Same opaque-key seam as
-// member:/squad: — a distinct namespace so a project's shared engrams never collide
-// with a member's private, a squad's shared, or a bare-uuid agent scope. This is the
-// "everyone aligned by accessing the project" keystone: any agent with read access to
-// the project shares one memory. No migration — the engram row stores this string as
-// its agent_id, exactly as squad memory already stores `squad:<id>`.
-function projectMemoryScope(projectId: string): string {
-  return `project:${projectId}`
-}
+// projectMemoryScope lives in src/projects/memory-scope.ts so the docs surface
+// and project_remember/project_recall share one opaque key (one store).
 
 // ── token hashing (Web Crypto, SHA-256 hex) ──────────────────────────────────
 // Same discipline as the SOS bus: we store/compare only the hex digest, never
