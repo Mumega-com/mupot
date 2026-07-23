@@ -11,7 +11,6 @@ import {
   getSecretEnvStatus,
   bindSecretEnv,
   rejectSecretEnv,
-  resolveSecretEnv,
   resolveSecretEnvBinding,
 } from '../src/secret-env/service'
 import type { Env } from '../src/types'
@@ -422,18 +421,7 @@ describe('rejectSecretEnv', () => {
   })
 })
 
-// ── resolveSecretEnv / resolveSecretEnvBinding ───────────────────────────────
-
-describe('resolveSecretEnv', () => {
-  it('reads the raw env binding value (caller must have verified bound status)', () => {
-    const env = { NOTION_API_KEY: 'the-value' } as unknown as Env
-    expect(resolveSecretEnv(env, 'NOTION_API_KEY')).toBe('the-value')
-  })
-  it('returns null when the env binding is absent', () => {
-    const env = {} as unknown as Env
-    expect(resolveSecretEnv(env, 'MISSING')).toBeNull()
-  })
-})
+// ── resolveSecretEnvBinding ────────────────────────────────────────────────────
 
 describe('resolveSecretEnvBinding', () => {
   it('returns the env value only when D1 binding status is bound', async () => {
