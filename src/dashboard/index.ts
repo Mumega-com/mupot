@@ -144,6 +144,15 @@ import { wizardApp } from './wizard'
 import { isOnboardingComplete } from './settings'
 import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './brain'
 import type { PhysicsSnapshot } from './brain'
+import { kayhermesBody } from './kayhermes'
+import type { KayhermesPageStatus } from './kayhermes'
+import {
+  kayhermesConfigured,
+  listSessions,
+  probeHealth,
+  resolveKayhermesConfig,
+  KayhermesClientError,
+} from '../kayhermes/client'
 import { loadGrowthView, growthBody } from './growth'
 import { loadFleetRadar } from './radar'
 import { radarPageBody } from './radar-view'
@@ -1124,6 +1133,34 @@ dashboardApp.get('/squads/:id', async (c) => {
       squadBoardBody(squad, agents.results ?? [], tasks.results ?? [], canAddAgent, canManage),
     ),
   )
+})
+
+// GET /agents/kayhermes — owner chat panel (Hermes Sessions API proxy).
+// MUST be registered before GET /agents/:id so ":id" does not shadow the slug.
+dashboardApp.get('/agents/kayhermes', async (c) => {
+  const auth = c.get('auth')
+  if (auth.role !== 'owner') {
+    return c.html(shell(c.env, 'KayHermes', errorBody('Owner only.')), 403)
+  }
+  const status: KayhermesPageStatus = {
+    configured: kayhermesConfigured(c.env),
+    healthy: null,
+    sessions: [],
+    error: null,
+  }
+  if (status.configured) {
+    try {
+      const config = resolveKayhermesConfig(c.env)
+      const health = await probeHealth(config)
+      status.healthy = health.ok
+      status.sessions = await listSessions(config, { limit: 30, offset: 0 })
+    } catch (err) {
+      status.healthy = false
+      status.error =
+        err instanceof KayhermesClientError ? err.message : 'Failed to reach KayHermes API'
+    }
+  }
+  return c.html(shell(c.env, 'KayHermes chat', kayhermesBody(c.env, status)))
 })
 
 // GET /agents/:id — agent console: identity, status, wake button.
@@ -3165,6 +3202,7 @@ function shell(
               <a class="nav-child" href="/admin/divisions">Departments</a>
               <a class="nav-child" href="/admin/divisions">Squads</a>
               <a class="nav-child" href="/agents">Agents</a>
+              <a class="nav-child" href="/agents/kayhermes">KayHermes chat</a>
             </div>
           </div>
 
