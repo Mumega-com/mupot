@@ -153,6 +153,8 @@ import {
   resolveKayhermesConfig,
   KayhermesClientError,
 } from '../kayhermes/client'
+import { byoaBody } from './byoa'
+import type { ByoaPageModel } from './byoa'
 import { loadGrowthView, growthBody } from './growth'
 import { loadFleetRadar } from './radar'
 import { radarPageBody } from './radar-view'
@@ -165,6 +167,8 @@ import {
   listConnectors,
 } from '../connectors/service'
 import { isConnectorType, isConnectorScopeType } from '../connectors/crypto'
+import { assertPublicHttpsUrl } from '../lib/ssrf'
+import { bindMemberHermesAgent, getMemberHermesBinding, HermesSurfacesError } from '../hermes-surfaces/bindings'
 import { githubCapabilitySnapshot } from '../integrations/github-capabilities'
 import { writeAgentDef, assignIssueToCopilot } from '../integrations/github-repo-write'
 import { installUrl, parseInstallCallback, storeInstallation, getInstallationId } from '../integrations/github-install'
@@ -1147,6 +1151,7 @@ dashboardApp.get('/agents/kayhermes', async (c) => {
     healthy: null,
     sessions: [],
     error: null,
+    dashboardUrl: c.env.HERMES_DASHBOARD_URL?.trim() || null,
   }
   if (status.configured) {
     try {
@@ -1161,6 +1166,74 @@ dashboardApp.get('/agents/kayhermes', async (c) => {
     }
   }
   return c.html(shell(c.env, 'KayHermes chat', kayhermesBody(c.env, status)))
+})
+
+// GET /agents/byoa — BYOA Hermes attach + Open WebUI instructions.
+dashboardApp.get('/agents/byoa', async (c) => {
+  const auth = c.get('auth')
+  const flash = c.req.query('ok') === '1' ? 'Hermes API attached.' : null
+  const errQ = c.req.query('err')
+  let memberId = auth.memberId
+  if (!memberId && auth.email) {
+    const row = await c.env.DB.prepare(
+      "SELECT id FROM members WHERE lower(email) = lower(?1) AND tenant = ?2 AND status = 'active' LIMIT 1",
+    )
+      .bind(auth.email, c.env.TENANT_SLUG)
+      .first<{ id: string }>()
+    memberId = row?.id
+  }
+  const binding = memberId ? await getMemberHermesBinding(c.env, memberId) : null
+  const model: ByoaPageModel = {
+    canAdmin: isOrgAdmin(auth),
+    potOrigin: (c.env.PUBLIC_ORIGIN || 'https://mupot.mumega.com').replace(/\/$/, ''),
+    flash,
+    error: errQ ? decodeURIComponent(errQ) : null,
+    binding: binding ? { member_id: binding.member_id, agent_id: binding.agent_id } : null,
+  }
+  return c.html(shell(c.env, 'BYOA Hermes', byoaBody(c.env, model)))
+})
+
+dashboardApp.post('/agents/byoa/attach', async (c) => {
+  const auth = c.get('auth')
+  if (!isOrgAdmin(auth)) {
+    return c.html(shell(c.env, 'BYOA', errorBody('Admin required.')), 403)
+  }
+  const form = await c.req.parseBody()
+  const agentId = typeof form.agent_id === 'string' ? form.agent_id.trim() : ''
+  const apiUrl = typeof form.api_url === 'string' ? form.api_url.trim() : ''
+  const apiKey = typeof form.api_key === 'string' ? form.api_key : ''
+  const memberId = typeof form.member_id === 'string' ? form.member_id.trim() : ''
+
+  const failRedirect = (msg: string) =>
+    c.redirect(`/agents/byoa?err=${encodeURIComponent(msg)}`)
+
+  if (!agentId || !apiUrl || !apiKey.trim()) return failRedirect('agent_id, api_url, and api_key required')
+  try {
+    assertPublicHttpsUrl(apiUrl)
+  } catch (e) {
+    return failRedirect(e instanceof Error ? e.message : 'invalid_api_url')
+  }
+
+  const result = await addConnector(c.env, {
+    type: 'hermes_api',
+    label: `hermes-api-${agentId.slice(0, 8)}`,
+    secret: apiKey,
+    meta: JSON.stringify({ api_url: apiUrl.replace(/\/$/, '') }),
+    scope_type: 'agent',
+    scope_id: agentId,
+    created_by: auth.memberId ?? auth.userId,
+  })
+  if (!result.ok) return failRedirect(`connector_${result.error}`)
+
+  if (memberId) {
+    try {
+      await bindMemberHermesAgent(c.env, { memberId, agentId })
+    } catch (e) {
+      const code = e instanceof HermesSurfacesError ? e.code : 'bind_failed'
+      return failRedirect(code)
+    }
+  }
+  return c.redirect('/agents/byoa?ok=1')
 })
 
 // GET /agents/:id — agent console: identity, status, wake button.
@@ -3203,6 +3276,7 @@ function shell(
               <a class="nav-child" href="/admin/divisions">Squads</a>
               <a class="nav-child" href="/agents">Agents</a>
               <a class="nav-child" href="/agents/kayhermes">KayHermes chat</a>
+              <a class="nav-child" href="/agents/byoa">BYOA Hermes</a>
             </div>
           </div>
 

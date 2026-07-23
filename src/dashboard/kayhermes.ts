@@ -12,10 +12,15 @@ export interface KayhermesPageStatus {
   healthy: boolean | null
   sessions: KayhermesSession[]
   error: string | null
+  dashboardUrl: string | null
 }
 
 export function kayhermesBody(env: Env, status: KayhermesPageStatus): Html {
   void env
+  const dashLink = status.dashboardUrl
+    ? html`<p class="ui-sub"><a class="ui-link" href="${status.dashboardUrl}" target="_blank" rel="noopener">Open native Hermes dashboard →</a> (owner ops: keys, skills, TUI)</p>`
+    : html`<p class="ui-sub">Native Hermes dashboard URL not set (<code>HERMES_DASHBOARD_URL</code>). See agents/kayhermes/ENABLE-DASHBOARD.md.</p>`
+
   if (!status.configured) {
     return html`
       ${pageHeader({
@@ -23,10 +28,11 @@ export function kayhermesBody(env: Env, status: KayhermesPageStatus): Html {
         title: 'KayHermes chat',
         sub: 'Talk to the Hermes runtime that only lives on Mupot.',
       })}
+      ${dashLink}
       ${emptyState({
         title: 'Not configured',
         detail:
-          'Set KAYHERMES_API_URL (public HTTPS tunnel to the kayhermes API server) and KAYHERMES_API_KEY (wrangler secret put). See agents/kayhermes/ENABLE-CHAT.md.',
+          'Set KAYHERMES_API_URL (public HTTPS) and KAYHERMES_API_KEY (wrangler secret put). See agents/kayhermes/ENABLE-CHAT.md.',
       })}`
   }
 
@@ -184,6 +190,7 @@ export function kayhermesBody(env: Env, status: KayhermesPageStatus): Html {
       badge: status.healthy ? 'live' : 'degraded',
       badgeTone: status.healthy ? 'ok' : 'warn',
     })}
+    ${dashLink}
     ${errBanner}
     <div style="display:grid;grid-template-columns:minmax(180px,240px) 1fr;gap:16px;align-items:start">
       ${sectionPanel({
