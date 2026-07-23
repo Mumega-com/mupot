@@ -48,6 +48,12 @@ import {
   validateHumanDirectiveText,
   type HumanDirectiveAction,
 } from '../brain/directive'
+import {
+  HermesSurfacesError,
+  hermesSessionKeyForMember,
+  resolveMemberHermesEndpoint,
+} from '../hermes-surfaces/bindings'
+import { chatTurn, createSession, KayhermesClientError } from '../kayhermes/client'
 
 type AppEnv = { Bindings: Env }
 
@@ -185,6 +191,7 @@ type Intent =
   | { kind: 'verdict'; verdict: 'approved' | 'rejected'; ref: string; note: string | null }
   | { kind: 'directive'; action: HumanDirectiveAction; text: string | null }
   | { kind: 'task'; title: string; squadRef: string | null }
+  | { kind: 'hermes_chat'; text: string }
   | { kind: 'unknown' }
 
 // Parse a leading "@squad" or trailing "@squad" reference out of a task title.
@@ -266,12 +273,13 @@ function parseIntent(text: string): Intent {
     return title ? { kind: 'task', title, squadRef } : { kind: 'unknown' }
   }
 
-  return { kind: 'unknown' }
+  // Free-text → member's bound Hermes agent (same identity as Open WebUI).
+  return { kind: 'hermes_chat', text: trimmed }
 }
 
 // ── reply copy (short, friendly, never leaks internals) ───────────────────────
 const HELP =
-  'I can: "task: <title>" (optionally "@squad"), "status" or "status <agent>", ' +
+  'I can: chat freely with your Hermes agent, "task: <title>" (optionally "@squad"), "status" or "status <agent>", ' +
   '"wake <agent>", "fleet start|stop|restart|status <agent>", "approve <task-id>", ' +
   '"reject <task-id> <reason>", "directive: <text>", or "directive clear". ' +
   'I act as you, with your permissions.'
@@ -318,6 +326,9 @@ export async function handleImMessage(
     case 'unknown':
       return `Sorry, I didn't catch that. ${HELP}`
 
+    case 'hermes_chat':
+      return hermesChatReply(env, member, intent.text)
+
     case 'status':
       return statusReply(env, member, intent.ref)
 
@@ -335,6 +346,32 @@ export async function handleImMessage(
 
     case 'task':
       return taskReply(env, member, grants, intent.title, intent.squadRef)
+  }
+}
+
+// ── intent: free-text → member's bound Hermes agent ───────────────────────────
+async function hermesChatReply(env: Env, member: Member, text: string): Promise<string> {
+  try {
+    const ep = await resolveMemberHermesEndpoint(env, member.id)
+    const config = {
+      baseUrl: ep.baseUrl,
+      apiKey: ep.apiKey,
+      sessionKey: hermesSessionKeyForMember(member.id),
+    }
+    const session = await createSession(config, `im-${member.id.slice(0, 8)}`)
+    const turn = await chatTurn(config, session.id, text)
+    return turn.reply
+  } catch (err) {
+    if (err instanceof HermesSurfacesError && err.code === 'not_bound') {
+      return `No Hermes agent is bound to your member yet. Ask KayHermes (or an admin) to seat you, or use /agents/byoa. Meanwhile: ${HELP}`
+    }
+    if (err instanceof HermesSurfacesError && err.code === 'hermes_api_unconfigured') {
+      return 'Your Hermes agent is bound but has no hermes_api connector yet. An admin must attach the API key at /agents/byoa.'
+    }
+    if (err instanceof KayhermesClientError) {
+      return `Hermes agent unreachable (${err.code}). Try again shortly, or use a command from help.`
+    }
+    return 'Hermes chat failed. Try "help" for structured commands.'
   }
 }
 

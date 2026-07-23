@@ -28,6 +28,7 @@ const TYPE_LABELS: Record<ConnectorType, string> = {
   crm:                   'CRM',
   linear:     'Linear',
   notion:     'Notion',
+  hermes_api: 'Hermes API',
   custom:     'Custom',
 }
 
@@ -133,8 +134,8 @@ ${raw(errorHtml)}
       </div>
       <div style="margin-top:12px">
         <label>
-          Meta (JSON, optional — e.g. Telegram: <code>["chat_id_1","chat_id_2"]</code> allowed_chats)
-          <input type="text" name="meta" placeholder='["123456789"]' style="font-family:monospace;width:100%">
+          Meta (JSON, optional — Hermes API: <code>{"api_url":"https://…"}</code>; Telegram: allowed_chats array)
+          <input type="text" name="meta" placeholder='{"api_url":"https://hermes-kay.example.com"}' style="font-family:monospace;width:100%">
         </label>
       </div>
       <div style="margin-top:16px">

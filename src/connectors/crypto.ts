@@ -44,6 +44,9 @@ export type ConnectorType =
   // uses the existing github_app connector + project_provider_bindings.
   | 'linear'
   | 'notion'
+  // BYOA Hermes API server (Open WebUI / member-hermes proxy). Secret = API_SERVER_KEY;
+  // meta JSON must include { "api_url": "https://…" } (public HTTPS).
+  | 'hermes_api'
   | 'custom'
 export type ConnectorScopeType = 'squad' | 'agent' | 'pot'
 
@@ -62,6 +65,7 @@ const VALID_TYPES: readonly ConnectorType[] = [
   'crm',
   'linear',
   'notion',
+  'hermes_api',
   'custom',
 ]
 const VALID_SCOPE_TYPES: readonly ConnectorScopeType[] = ['squad', 'agent', 'pot']
