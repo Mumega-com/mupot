@@ -148,6 +148,7 @@ function healthFor(project: Project, counts: ProjectSituationTaskCounts, activeF
   if (project.status === 'archived') return 'archived'
   if (project.status === 'paused') return 'paused'
   if (project.status === 'completed') return 'completed'
+  if (project.status === 'review') return 'review'
   if (counts.blocked > 0) return 'blocked'
   if (counts.review > 0) return 'review'
   if (counts.in_progress > 0 || counts.open > 0 || activeFlightCount > 0) return 'active'

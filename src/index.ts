@@ -222,6 +222,7 @@ import { runLoopsTick } from './loops/driver'
 // Port 1 (module_registry + presence, #457): each active project gets one cycle per
 // tick (register presence, decide, dispatch a starter task when stalled+idle).
 import { runConciergeTick } from './concierge/service'
+import { runProjectLoopTick } from './projects/loop'
 import { syncGitHubProject } from './integrations/github-projects'
 // Growth cron step — active-guarded, fail-soft collection of growth metrics each tick.
 import { runGrowthCollection } from './departments/collectors/growth-cron'
@@ -238,7 +239,7 @@ export default {
   // Queue and scheduled handlers are preserved unchanged (spec §A.2).
   queue: handleQueue,
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Eight independent heartbeats on the same */15 cron:
+    // Nine independent heartbeats on the same */15 cron:
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
     //     ("design loops, not prompts"; without this the v0.3.0 loop never fires).
@@ -260,6 +261,10 @@ export default {
     //     goal + idle online build capacity + zero advancing tasks. Heuristic MVP,
     //     no model call (model-seam left injectable for Sol later); idempotent by
     //     design (rank, never act-loop) — see src/concierge/service.ts.
+    //  9. Project lifecycle circuit breaker (slice 1) — at cycle_boundary_at, if
+    //     status ≠ completed and no receipted recommit, kill → archived (Shape Up
+    //     inversion). Receipts go through workflow_receipts; see
+    //     src/projects/circuit-breaker.ts + stall-detector.ts + loop.ts.
     ctx.waitUntil(reconcileMembership(env))
     ctx.waitUntil(runMetabolism(env))
     ctx.waitUntil(runLoopsTick(env))
@@ -268,5 +273,6 @@ export default {
     ctx.waitUntil(runCroCollection(env).then(() => undefined))
     ctx.waitUntil(flushFlightEventOutbox(env).then(() => undefined))
     ctx.waitUntil(runConciergeTick(env).then(() => undefined))
+    ctx.waitUntil(runProjectLoopTick(env, {}).then(() => undefined))
   },
 }

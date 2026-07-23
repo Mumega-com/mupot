@@ -21,6 +21,7 @@ import {
   upsertProjectSquadAccess,
 } from './service'
 import type { CreateProjectInput, ProjectMutationError, UpdateProjectInput } from './service'
+import { startProject, defaultStartGateDeps } from './start-gate'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
@@ -29,7 +30,7 @@ type Page = { limit: number; offset: number }
 type ProjectionKind = 'activity' | 'evidence'
 type ProjectionPage = Page & { after?: ProjectProjectionCursor }
 
-const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'completed', 'archived']
+const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'review', 'completed', 'archived']
 const DEFAULT_PAGE_SIZE = 100
 const MAX_PAGE_SIZE = 100
 const MAX_PAGE_OFFSET = 10_000
@@ -171,7 +172,9 @@ async function readableProject(
 ): Promise<Project | null> {
   const visibility = projectVisibilityClause(access)
   return env.DB.prepare(
-    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date, p.created_at, p.updated_at
+    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date,
+            p.cycle_boundary_at, p.stalled, p.stall_threshold_days, p.completion_proposed_by,
+            p.created_at, p.updated_at
        FROM projects p
       WHERE p.id = ?
         AND ${visibility.sql}`,
@@ -252,7 +255,7 @@ async function projectAggregates(
 
 function mutationStatus(error: ProjectMutationError): 400 | 404 | 409 {
   if (error === 'project_not_found' || error === 'parent_not_found' || error === 'squad_not_found') return 404
-  if (error === 'slug_taken' || error === 'receipt_failed' || error === 'invalid_status_transition') return 409
+  if (error === 'slug_taken' || error === 'receipt_failed' || error === 'invalid_status_transition' || error === 'completion_gate_required' || error === 'start_gate_required') return 409
   return 400
 }
 
@@ -306,7 +309,9 @@ projectsApp.get('/', async (c) => {
     binds.push(parentId)
   }
   const result = await c.env.DB.prepare(
-    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date, p.created_at, p.updated_at
+    `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id, p.target_date,
+            p.cycle_boundary_at, p.stalled, p.stall_threshold_days, p.completion_proposed_by,
+            p.created_at, p.updated_at
        FROM projects p
       WHERE ${clauses.join(' AND ')}
       ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
@@ -403,6 +408,25 @@ projectsApp.patch('/:id', async (c) => {
   if (!access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const body = await jsonObject(c)
   if (!body) return c.json({ error: 'invalid_json' }, 400)
+
+  // Slice 3: planned→active must go through start-gate (authorize + provision).
+  if (body.status === 'active') {
+    const existing = await getProject(c.env, c.req.param('id'))
+    if (existing?.status === 'planned') {
+      const started = await startProject(c.env, existing.id, defaultStartGateDeps())
+      if (!started.ok) {
+        const status = started.error === 'project_not_found' ? 404 : 409
+        return c.json({ error: started.error, blocked_start: true }, status)
+      }
+      return c.json({ project: started.project, start_gate: {
+        task_id: started.task_id,
+        squad_id: started.squad_id,
+        agent_id: started.agent_id,
+        resource: started.resource,
+      } })
+    }
+  }
+
   const result = await updateProject(c.env, c.req.param('id'), body as UpdateProjectInput)
   if (!result.ok) return c.json({ error: result.error }, mutationStatus(result.error))
   return c.json({ project: result.value })
