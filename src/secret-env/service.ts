@@ -20,8 +20,7 @@
 //   getSecretEnvStatus()          — names -> bound/unbound/pending/revoked/unknown; never values
 //   bindSecretEnv()                — admin pastes values; PUT to CF; D1 metadata only
 //   rejectSecretEnv()              — admin declines; no CF calls
-//   resolveSecretEnv()             — raw env accessor; caller MUST have verified bound status
-//   resolveSecretEnvBinding()      — preferred: checks D1 status=bound, then reads env
+//   resolveSecretEnvBinding()      — only public resolve path: D1 status=bound, then read env
 
 import type { Env } from '../types'
 import { assertBindingName } from './names'
@@ -420,23 +419,21 @@ export async function rejectSecretEnv(
   return { ok: true }
 }
 
-// ── resolveSecretEnv / resolveSecretEnvBinding (the ONLY read paths) ────────
+// ── resolveSecretEnvBinding (the ONLY public read path) ─────────────────────
 
 /**
- * Raw env-binding accessor. Reads `(env as Record<string, unknown>)[bindingName]`
- * ONLY — it does NOT check D1 status itself (that would require an async call).
- * The caller MUST have verified the binding is `bound` via D1 first. Prefer
- * `resolveSecretEnvBinding` below, which does that check for you.
+ * Raw env-binding read used internally after D1 status is verified. Not exported
+ * so callers cannot bypass the bound-status gate.
  */
-export function resolveSecretEnv(env: Env, bindingName: string): string | null {
+function readSecretEnvBindingValue(env: Env, bindingName: string): string | null {
   const raw = (env as unknown as Record<string, unknown>)[bindingName]
   return typeof raw === 'string' && raw.length > 0 ? raw : null
 }
 
 /**
- * Preferred resolve path: SELECTs the binding's status (no secret column
- * exists — there is nothing to select there) and only reads the env binding
- * when status is `bound`. Fail-closed (null) for pending/revoked/absent.
+ * Public resolve path: SELECTs the binding's status (no secret column exists —
+ * there is nothing to select there) and only reads the env binding when status
+ * is `bound`. Fail-closed (null) for pending/revoked/absent.
  */
 export async function resolveSecretEnvBinding(
   env: Env,
@@ -449,5 +446,5 @@ export async function resolveSecretEnvBinding(
     .first<{ status: SecretEnvBindingStatus }>()
 
   if (!row || row.status !== 'bound') return null
-  return resolveSecretEnv(env, bindingName)
+  return readSecretEnvBindingValue(env, bindingName)
 }
