@@ -15,9 +15,10 @@
 #     WordPress writes are server-forced DRAFT, task -> review,
 #     gate_owner=gate:kasra-core.
 #   - review-worker.py: the GATE lane. Polls `review` tasks with a linked PR,
-#     dispatches a DIFFERENT model+vendor (Claude, zero tools, isolated
-#     scratch cwd) for an adversarial read of the real PR diff, and posts a
-#     recommended verdict as an audit receipt. REVIEW-ONLY by default
+#     dispatches a DIFFERENT model+vendor (default REVIEWER=codex / GPT via
+#     `codex exec`; REVIEWER=claude keeps the prior eye) in a zero-MCP
+#     isolated scratch cwd for an adversarial read of the real PR diff, and
+#     posts a recommended verdict as an audit receipt. REVIEW-ONLY by default
 #     (REVIEW_AUTOMERGE unset/0) — it never verdicts or merges; that stays
 #     with Kasra-core. An auto-merge path exists but is flag-gated OFF and,
 #     even when enabled, only fires on GREEN + non-sensitive-surface + green

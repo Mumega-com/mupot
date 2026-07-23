@@ -6,11 +6,12 @@ cursor-worker.py and mumcp-worker.py already build on isolated worktrees, push,
 open a PR, and move the task to `review` with `gate_owner=gate:kasra-core` --
 they CANNOT self-close (mupot no-self-close guard, PR #417). Until now a human
 (Kasra-core) read every PR by hand. This driver runs the DIVERSE adversarial eye
-(Claude, a different vendor+model from cursor's Grok) headlessly every cycle and
-posts a recommended verdict as an audit receipt on the task. It never grants
-itself a new capability: review-only by default, auto-merge exists but is
-flag-gated OFF, and every path fails CLOSED (parks the task, never merges) on
-any ambiguity or error.
+(default: `codex exec` / GPT — a different vendor+model from cursor's Grok)
+headlessly every cycle and posts a recommended verdict as an audit receipt on
+the task. `REVIEWER=claude` keeps the prior Claude eye for rollback. It never
+grants itself a new capability: review-only by default, auto-merge exists but
+is flag-gated OFF, and every path fails CLOSED (parks the task, never merges)
+on any ambiguity or error.
 
 Verified live before writing this (2026-07-21, kasra-code, read-only D1 query):
   - gate_owner 'gate:kasra-core' has exactly ONE holder capable of task_verdict:
@@ -44,28 +45,26 @@ Flow per cycle:
                     default (classify_sensitive/SAFE_ALLOWLIST_RE). The old
                     sensitive-keyword regex is now a secondary signal only.
                     No changed files reported at all is ALSO sensitive=true.
-  4. review      -> `claude -p --strict-mcp-config --safe-mode
-                    --disallowedTools <every built-in tool>` (a DIFFERENT
-                    vendor+model from cursor's Grok -- the cross-vendor
-                    diverse eye) in a neutral scratch cwd: zero MCP servers
-                    (no --mcp-config), zero CLAUDE.md/auto-memory/skills/
-                    plugins/hooks (--safe-mode, OAuth auth still works), and
-                    zero built-in tools (see BUILTIN_TOOL_DENYLIST for why
-                    `--tools ""` alone is NOT enough in this CLI build).
-                    check_isolation_invariant() backstops all of this from the
-                    run's own JSON result (single-turn, zero
-                    permission_denials) and forces RED if violated. The PR
-                    body/diff are wrapped in a random per-run nonce fence
-                    (build_review_prompt) so injected text claiming to be an
-                    instruction/approval/verdict is reported as a finding, not
-                    obeyed -- fencing reduces but does not eliminate
-                    LLM-verdict risk, which is why automerge stays flag-gated.
-                    Model reads the real PR diff, hunts P0/P1/WARN findings,
-                    verifies the PR's own claims against the diff, and must
-                    return STRICT JSON `{"verdict","p0","p1","warn","summary"}`.
-                    Any parse failure, timeout, non-GREEN/RED verdict value,
-                    isolation-invariant violation, or truncated/failed diff
-                    fetch is treated as verdict=RED (fail-closed).
+  4. review      -> REVIEWER-selected diverse eye (default `codex`) in a
+                    neutral scratch cwd: zero MCP servers, no project
+                    CLAUDE.md/skills/AGENTS.md influence, reads the raw PR
+                    diff, hunts P0/P1/WARN. `codex` path: `codex exec` with an
+                    ephemeral CODEX_HOME (auth.json + restrictive config only),
+                    `--ignore-rules --ephemeral --skip-git-repo-check`,
+                    `--sandbox read-only`, `--output-schema` for the verdict
+                    JSON, and a scratch-file + JSONL item-type isolation
+                    backstop. `claude` path: `claude -p --strict-mcp-config
+                    --safe-mode --disallowedTools <BUILTIN_TOOL_DENYLIST>`
+                    with the prior single-turn/zero-denial isolation check.
+                    The PR body/diff are wrapped in a random per-run nonce
+                    fence (build_review_prompt) so injected text claiming to
+                    be an instruction/approval/verdict is reported as a
+                    finding, not obeyed -- fencing reduces but does not
+                    eliminate LLM-verdict risk, which is why automerge stays
+                    flag-gated. Any parse failure, timeout, non-GREEN/RED
+                    verdict value, isolation-invariant violation, or
+                    truncated/failed diff fetch is treated as verdict=RED
+                    (fail-closed).
   5. act         -> ALWAYS: append a `review-worker -> <sha>: ...` receipt to
                     the task body (audit trail), record the sha in the local
                     dedupe state, and best-effort mupot-send notify kasra.
@@ -99,19 +98,29 @@ Config (env):
                      radius)
   REVIEW_AUTOMERGE   '1' enables the auto-merge path (default '0' -- OFF)
   MAX_REVIEWS        default 1 (tasks actually reviewed per cycle)
-  TIMEOUT            default 900 (seconds for the claude -p adversarial run)
-  MODEL              default 'opus' (a stronger, different-model eye than the
-                     Sonnet that built this driver; override freely)
-  CLAUDE_BIN         default 'claude'
+  TIMEOUT            default 900 (seconds for the adversarial reviewer run)
+  REVIEWER           'codex' (default) or 'claude' -- diverse-eye vendor
+  MODEL              optional model override. Defaults: claude->'opus';
+                     codex->CLI/config default (do not pass a Claude model
+                     name to codex)
+  CLAUDE_BIN         default 'claude' (used when REVIEWER=claude)
+  CODEX_BIN          default 'codex' (used when REVIEWER=codex)
+  CODEX_AUTH         default ~/.codex/auth.json (copied into ephemeral
+                     CODEX_HOME; user config/skills/MCP are NOT loaded)
   WORKTREE_ROOT      default /home/mumega/mupot-worktrees (only used for a
                      throwaway 'review-scratch' cwd -- this driver never
                      creates a git worktree of its own)
-  DRY_RUN            '1' = poll + classify + print what would be reviewed,
-                     make ZERO mcp/gh mutating calls, never dispatch claude
+  DRY_RUN            '1' = poll + classify + fetch diff + run the reviewer
+                     and print findings; ZERO mcp/gh mutating calls (no
+                     receipt, no automerge, no notify)
+  DRY_RUN_PR         when DRY_RUN=1, optional PR number to review even if
+                     the board has no matching review tasks
 
 Usage:
   python3 scripts/review-worker.py            # one-shot, up to MAX_REVIEWS
-  DRY_RUN=1 python3 scripts/review-worker.py  # show what it would review
+  DRY_RUN=1 python3 scripts/review-worker.py  # review + print, no mutations
+  DRY_RUN=1 DRY_RUN_PR=513 python3 scripts/review-worker.py
+  REVIEWER=claude python3 scripts/review-worker.py  # prior Claude eye
 """
 from __future__ import annotations
 
@@ -119,6 +128,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -133,10 +143,17 @@ CANONICAL_REPO_SLUG = "Mumega-com/mupot"  # auto-merge guard always checks THIS,
 REVIEW_AUTOMERGE = os.environ.get("REVIEW_AUTOMERGE", "0") == "1"
 MAX_REVIEWS = int(os.environ.get("MAX_REVIEWS", "1"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "900"))
-MODEL = os.environ.get("MODEL", "opus")
+VALID_REVIEWERS = frozenset({"codex", "claude"})
+REVIEWER = os.environ.get("REVIEWER", "codex").strip().lower()
+_MODEL_ENV = os.environ.get("MODEL")
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
+CODEX_AUTH_PATH = Path(os.environ.get("CODEX_AUTH", str(Path.home() / ".codex" / "auth.json")))
 WORKTREE_ROOT = Path(os.environ.get("WORKTREE_ROOT", "/home/mumega/mupot-worktrees"))
 DRY_RUN = os.environ.get("DRY_RUN", "") == "1"
+# Optional: when DRY_RUN=1, review this PR number even if the board is empty
+# (lets a human prove the eye works without mutating a live task).
+DRY_RUN_PR = os.environ.get("DRY_RUN_PR", "").strip()
 # WARN #2 fix: dedupe state written ONLY by this driver, after a REAL review
 # runs -- not reachable/forgeable via the task body (which a PR author
 # influences indirectly through their PR title/description, copied verbatim
@@ -193,6 +210,42 @@ SAFE_ALLOWLIST_RE = re.compile(
     r"|(^|/)LICENSE",
     re.IGNORECASE,
 )
+# Restrictive ephemeral Codex config written into a per-run CODEX_HOME that
+# contains ONLY auth.json + this file -- no user mcp_servers, skills, plugins,
+# AGENTS.md, or project trust stanzas from ~/.codex/config.toml.
+CODEX_REVIEW_CONFIG = """\
+approval_policy = "never"
+sandbox_mode = "read-only"
+web_search = "disabled"
+
+[features]
+plugins = false
+memories = false
+apps = false
+hooks = false
+shell_tool = false
+browser_use = false
+computer_use = false
+multi_agent = false
+goals = false
+code_mode = false
+skill_search = false
+image_generation = false
+"""
+
+VERDICT_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["verdict", "p0", "p1", "warn", "summary"],
+    "properties": {
+        "verdict": {"type": "string", "enum": ["GREEN", "RED"]},
+        "p0": {"type": "array", "items": {"type": "string"}},
+        "p1": {"type": "array", "items": {"type": "string"}},
+        "warn": {"type": "array", "items": {"type": "string"}},
+        "summary": {"type": "string"},
+    },
+}
+
 # P0 #1 fix: isolation must be INTRINSIC to the launcher, not dependent on any
 # external settings.json. Empirically verified (2026-07-21, kasra-code, from
 # this driver's own scratch cwd, claude-code 2.1.205):
@@ -248,6 +301,15 @@ BUILTIN_TOOL_DENYLIST = [
 
 def log(msg: str) -> None:
     print(f"[review-worker] {msg}", flush=True)
+
+
+def resolve_model() -> str | None:
+    """Vendor-aware model override. Empty/unset for codex uses the CLI default."""
+    if _MODEL_ENV is not None and _MODEL_ENV.strip() != "":
+        return _MODEL_ENV.strip()
+    if REVIEWER == "claude":
+        return "opus"
+    return None
 
 
 def token() -> str:
@@ -459,23 +521,114 @@ def build_review_prompt(pr_meta: dict, diff_text: str, sensitive: bool, sensitiv
     )
 
 
-def run_claude_review(prompt: str) -> subprocess.CompletedProcess:
+def review_scratch_dir() -> Path:
     scratch = WORKTREE_ROOT / "review-scratch"
     scratch.mkdir(parents=True, exist_ok=True)
+    return scratch
+
+
+def snapshot_scratch_files(scratch: Path) -> set[str]:
+    return {str(path.relative_to(scratch)) for path in scratch.rglob("*") if path.is_file()}
+
+
+def prepare_codex_clean_home() -> Path:
+    """Per-run CODEX_HOME with auth + restrictive config only (zero MCP/skills)."""
+    if not CODEX_AUTH_PATH.is_file():
+        raise FileNotFoundError(f"codex auth not found at {CODEX_AUTH_PATH}")
+    root = WORKTREE_ROOT / "review-scratch-codex-home"
+    root.mkdir(parents=True, exist_ok=True)
+    run_home = root / secrets.token_hex(8)
+    run_home.mkdir(parents=False, exist_ok=False)
+    (run_home / "auth.json").write_text(CODEX_AUTH_PATH.read_text())
+    (run_home / "config.toml").write_text(CODEX_REVIEW_CONFIG)
+    return run_home
+
+
+def run_claude_review(prompt: str) -> subprocess.CompletedProcess:
+    scratch = review_scratch_dir()
+    model = resolve_model() or "opus"
     cmd = [
-        CLAUDE_BIN, "-p", "--output-format", "json", "--model", MODEL,
+        CLAUDE_BIN, "-p", "--output-format", "json", "--model", model,
         "--strict-mcp-config",                          # zero MCP servers -- no --mcp-config passed at all
         "--safe-mode",                                  # kills CLAUDE.md/skills/plugins/hooks/auto-memory; keeps OAuth auth working
         "--disallowedTools", ",".join(BUILTIN_TOOL_DENYLIST),  # the tool gate that actually works (see note above BUILTIN_TOOL_DENYLIST)
         "--tools", "",                                  # forward-compat no-op today; harmless to keep
     ]
-    log(f"dispatching adversarial review ({CLAUDE_BIN} --model {MODEL}, timeout {TIMEOUT}s, "
-        f"strict-mcp-config+safe-mode+disallowedTools isolation, neutral scratch cwd) ...")
+    log(f"dispatching adversarial review (REVIEWER=claude, {CLAUDE_BIN} --model {model}, "
+        f"timeout {TIMEOUT}s, strict-mcp-config+safe-mode+disallowedTools isolation, "
+        f"neutral scratch cwd) ...")
     return subprocess.run(cmd, input=prompt, cwd=str(scratch), capture_output=True, text=True, timeout=TIMEOUT)
 
 
-def check_isolation_invariant(stdout_text: str) -> tuple[bool, str]:
-    """Backstop for the isolation guarantee above (P0 #1): from the run's own
+def run_codex_review(prompt: str) -> tuple[subprocess.CompletedProcess, str]:
+    """Headless `codex exec` in the same clean-room shape as the Claude eye.
+
+    Returns (CompletedProcess of JSONL stdout, last agent message text).
+    """
+    scratch = review_scratch_dir()
+    artifacts = WORKTREE_ROOT / "review-scratch-artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    run_id = secrets.token_hex(8)
+    schema_path = artifacts / f"verdict-schema-{run_id}.json"
+    out_path = artifacts / f"verdict-out-{run_id}.txt"
+    schema_path.write_text(json.dumps(VERDICT_OUTPUT_SCHEMA))
+    codex_home = prepare_codex_clean_home()
+    model = resolve_model()
+    cmd = [
+        CODEX_BIN, "exec",
+        "--json",
+        "--ignore-rules",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--output-schema", str(schema_path),
+        "-C", str(scratch),
+        "-s", "read-only",
+        "-o", str(out_path),
+    ]
+    if model is not None:
+        cmd += ["--model", model]
+    cmd.append(prompt)
+    env = dict(os.environ)
+    env["CODEX_HOME"] = str(codex_home)
+    log(f"dispatching adversarial review (REVIEWER=codex, {CODEX_BIN} exec "
+        f"--sandbox read-only, model={model or 'cli-default'}, timeout {TIMEOUT}s, "
+        f"ephemeral CODEX_HOME+zero MCP/skills, neutral scratch cwd) ...")
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(scratch), env=env, capture_output=True, text=True, timeout=TIMEOUT,
+        )
+    finally:
+        shutil.rmtree(codex_home, ignore_errors=True)
+        try:
+            schema_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    last_message = ""
+    if out_path.is_file():
+        try:
+            last_message = out_path.read_text()
+        except OSError as exc:
+            log(f"WARNING: could not read codex -o file {out_path}: {exc}")
+        try:
+            out_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if not last_message:
+        last_message = extract_codex_text(proc)
+    return proc, last_message
+
+
+def run_adversarial_review(prompt: str) -> tuple[subprocess.CompletedProcess, str]:
+    if REVIEWER == "codex":
+        return run_codex_review(prompt)
+    if REVIEWER == "claude":
+        proc = run_claude_review(prompt)
+        return proc, extract_claude_text(proc)
+    raise ValueError(f"invalid REVIEWER={REVIEWER!r}; expected one of {sorted(VALID_REVIEWERS)}")
+
+
+def check_claude_isolation_invariant(stdout_text: str) -> tuple[bool, str]:
+    """Backstop for the Claude isolation guarantee (P0 #1): from the run's own
     JSON result, assert zero tool calls were EVER attempted (allowed or
     denied). This catches any built-in tool BUILTIN_TOOL_DENYLIST doesn't yet
     know about, or a regression in --disallowedTools/--strict-mcp-config,
@@ -496,6 +649,49 @@ def check_isolation_invariant(stdout_text: str) -> tuple[bool, str]:
     return True, "ok"
 
 
+# Backward-compatible alias for any external callers/tests.
+check_isolation_invariant = check_claude_isolation_invariant
+
+
+def check_codex_isolation_invariant(
+    stdout_text: str, scratch: Path, scratch_before: set[str]
+) -> tuple[bool, str]:
+    """Codex clean-room backstop: JSONL events stay message-only, and the
+    neutral scratch cwd gains no new files (tool writes / apply_patch)."""
+    after = snapshot_scratch_files(scratch)
+    created = sorted(after - scratch_before)
+    if created:
+        return False, f"isolation_breach: scratch gained files during review: {created[:10]}"
+    if not (stdout_text or "").strip():
+        return False, "isolation_check_empty_codex_jsonl"
+    for line in stdout_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            return False, "isolation_check_parse_failure -- could not parse codex exec JSONL line"
+        if not isinstance(payload, dict):
+            return False, "isolation_check_payload_not_a_json_object"
+        event_type = payload.get("type")
+        if event_type in ("thread.started", "turn.started", "turn.completed"):
+            continue
+        if event_type == "item.completed":
+            item = payload.get("item")
+            if not isinstance(item, dict):
+                return False, "isolation_breach: item.completed without item object"
+            item_type = item.get("type")
+            if item_type != "agent_message":
+                return False, (
+                    f"isolation_breach: unexpected codex item type {item_type!r} "
+                    "(expected agent_message only -- tool/MCP/error side-channel)"
+                )
+            continue
+        return False, f"isolation_breach: unexpected codex event type {event_type!r}"
+    return True, "ok"
+
+
 def extract_claude_text(proc: subprocess.CompletedProcess) -> str:
     if proc.returncode != 0:
         log(f"claude exit {proc.returncode}: {(proc.stderr or '')[-500:]}")
@@ -504,6 +700,26 @@ def extract_claude_text(proc: subprocess.CompletedProcess) -> str:
         return payload.get("result", "") or json.dumps(payload)
     except (json.JSONDecodeError, AttributeError):
         return proc.stdout or ""
+
+
+def extract_codex_text(proc: subprocess.CompletedProcess) -> str:
+    if proc.returncode != 0:
+        log(f"codex exit {proc.returncode}: {(proc.stderr or '')[-500:]}")
+    last = ""
+    for line in (proc.stdout or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        item = payload.get("item") if isinstance(payload, dict) else None
+        if isinstance(item, dict) and item.get("type") == "agent_message":
+            text = item.get("text")
+            if isinstance(text, str):
+                last = text
+    return last or (proc.stdout or "")
 
 
 def _normalize_verdict(obj: dict) -> dict:
@@ -713,7 +929,7 @@ def process_task(task: dict) -> bool:
     if not head_sha:
         log(f"task {short}: PR #{pr_number} has no headRefOid, skipping")
         return False
-    if already_reviewed(tid, body, head_sha):
+    if (not DRY_RUN) and already_reviewed(tid, body, head_sha):
         log(f"task {short}: PR #{pr_number} head {head_sha[:8]} already carries a review-worker receipt -- skipping")
         return False
 
@@ -725,11 +941,6 @@ def process_task(task: dict) -> bool:
         log(f"task {short}: gh pr diff --name-only failed: {exc} -- treating as unclassifiable")
     sensitive, sensitive_reason = classify_sensitive(files)
     log(f"task {short}: sensitive={sensitive} ({sensitive_reason})")
-
-    if DRY_RUN:
-        log(f"DRY_RUN -- would run adversarial review + post a receipt for PR #{pr_number} "
-            f"(sensitive={sensitive}, automerge_enabled={REVIEW_AUTOMERGE}). Taking NO action.")
-        return True
 
     diff_incomplete = False
     try:
@@ -744,13 +955,18 @@ def process_task(task: dict) -> bool:
     # model can't confuse "text to analyze" with "instructions to follow".
     nonce = secrets.token_hex(8)
     prompt = build_review_prompt(pr_meta, diff_text, sensitive, sensitive_reason, nonce)
+    scratch = review_scratch_dir()
+    scratch_before = snapshot_scratch_files(scratch) if REVIEWER == "codex" else set()
     raw = ""
     proc: subprocess.CompletedProcess | None = None
     try:
-        proc = run_claude_review(prompt)
-        raw = extract_claude_text(proc)
+        proc, raw = run_adversarial_review(prompt)
     except subprocess.TimeoutExpired:
         log(f"task {short}: adversarial review TIMED OUT after {TIMEOUT}s -- fail-closed RED")
+    except Exception as exc:  # noqa: BLE001 - launcher/auth failures must park, never merge
+        log(f"task {short}: adversarial review failed to launch: {exc} -- fail-closed RED")
+        raw = ""
+        proc = None
 
     verdict_obj = (
         parse_verdict(raw)
@@ -758,11 +974,15 @@ def process_task(task: dict) -> bool:
         else {"verdict": "RED", "p0": ["adversarial review timed out or produced no output -- fail-closed"], "p1": [], "warn": [], "summary": "no reviewer output"}
     )
 
-    # P0 #1 backstop: reject the run outright (regardless of what verdict text
-    # it produced) if the isolation invariant (zero tool calls, single turn)
-    # doesn't hold.
+    # Isolation backstop: reject the run outright (regardless of what verdict
+    # text it produced) if the clean-room invariant doesn't hold.
     if proc is not None:
-        isolation_ok, isolation_reason = check_isolation_invariant(proc.stdout or "")
+        if REVIEWER == "codex":
+            isolation_ok, isolation_reason = check_codex_isolation_invariant(
+                proc.stdout or "", scratch, scratch_before
+            )
+        else:
+            isolation_ok, isolation_reason = check_claude_isolation_invariant(proc.stdout or "")
         if not isolation_ok:
             log(f"task {short}: {isolation_reason}")
             verdict_obj = {
@@ -784,9 +1004,26 @@ def process_task(task: dict) -> bool:
             "summary": f"[FORCED RED: diff incomplete] {verdict_obj.get('summary', '')}",
         }
 
+    if DRY_RUN:
+        log(
+            f"DRY_RUN findings for PR #{pr_number} (REVIEWER={REVIEWER}, "
+            f"sensitive={sensitive}, automerge_enabled={REVIEW_AUTOMERGE}): "
+            f"verdict={verdict_obj['verdict']} "
+            f"p0={len(verdict_obj['p0'])} p1={len(verdict_obj['p1'])} warn={len(verdict_obj['warn'])}"
+        )
+        log(f"DRY_RUN summary: {verdict_obj.get('summary', '')}")
+        if verdict_obj["p0"]:
+            log("DRY_RUN P0: " + "; ".join(str(x) for x in verdict_obj["p0"][:10]))
+        if verdict_obj["p1"]:
+            log("DRY_RUN P1: " + "; ".join(str(x) for x in verdict_obj["p1"][:10]))
+        if verdict_obj["warn"]:
+            log("DRY_RUN WARN: " + "; ".join(str(x) for x in verdict_obj["warn"][:10]))
+        log("DRY_RUN -- zero mutating mcp/gh calls (no receipt, no automerge, no notify)")
+        return True
+
     automerge_result = attempt_automerge(task, pr_number, head_sha, verdict_obj, sensitive)
     mode_note = (
-        f"REVIEW_AUTOMERGE={'1' if REVIEW_AUTOMERGE else '0'}. "
+        f"REVIEWER={REVIEWER}. REVIEW_AUTOMERGE={'1' if REVIEW_AUTOMERGE else '0'}. "
         + (f"auto-merge: {automerge_result['reason']}" if REVIEW_AUTOMERGE else "REVIEW-ONLY MODE -- left in `review` for Kasra-core to task_verdict.")
     )
     report_review(task, head_sha, verdict_obj, sensitive, sensitive_reason, mode_note)
@@ -797,9 +1034,31 @@ def process_task(task: dict) -> bool:
 
 
 def main() -> int:
+    if REVIEWER not in VALID_REVIEWERS:
+        log(f"invalid REVIEWER={REVIEWER!r}; expected one of {sorted(VALID_REVIEWERS)}")
+        return 2
     if not REVIEW_TOKEN_PATH.exists():
         log(f"no review token at {REVIEW_TOKEN_PATH}")
         return 2
+    if REVIEWER == "codex" and not CODEX_AUTH_PATH.is_file():
+        log(f"no codex auth at {CODEX_AUTH_PATH}")
+        return 2
+    log(f"gate eye REVIEWER={REVIEWER} model={resolve_model() or 'cli-default'} "
+        f"REVIEW_AUTOMERGE={'1' if REVIEW_AUTOMERGE else '0'} DRY_RUN={int(DRY_RUN)}")
+    if DRY_RUN and DRY_RUN_PR:
+        if not DRY_RUN_PR.isdigit():
+            log(f"invalid DRY_RUN_PR={DRY_RUN_PR!r}; expected a PR number")
+            return 2
+        fake_task = {
+            "id": "00000000-0000-4000-8000-00000000dry1",
+            "title": f"DRY_RUN review of PR #{DRY_RUN_PR}",
+            "body": f"PR: https://github.com/{REPO_SLUG}/pull/{DRY_RUN_PR}",
+            "gate_owner": GATE_OWNER,
+        }
+        log(f"DRY_RUN_PR={DRY_RUN_PR} -- synthesizing a throwaway review candidate")
+        process_task(fake_task)
+        log("cycle done -- 1 task(s) processed (DRY_RUN_PR)")
+        return 0
     tasks = poll_review_tasks()
     log(f"{len(tasks)} task(s) in review (squad {REVIEW_SQUAD_ID}) fetched as candidates")
     reviewed = 0
