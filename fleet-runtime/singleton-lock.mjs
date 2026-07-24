@@ -34,12 +34,25 @@
 
 import net from 'node:net'
 import { createHash } from 'node:crypto'
-import { unlinkSync } from 'node:fs'
+import { mkdirSync, unlinkSync } from 'node:fs'
+import { dirname } from 'node:path'
 
-/** Abstract-namespace names are capped near 108 bytes; hash to stay well under. */
-function lockAddress(path) {
+/**
+ * Abstract-namespace names are capped near 108 bytes; hash to stay well under.
+ *
+ * `forceFilesystemSocket` exists so the fallback path is reachable on Linux. It
+ * is not a production switch — it is here because the fallback's only real bug
+ * was found by forcing it manually, which means CI was never executing the
+ * branch at all. An untested branch in a mutual-exclusion primitive is the one
+ * place that is least acceptable.
+ */
+function useAbstractNamespace(options) {
+  return process.platform === 'linux' && options?.forceFilesystemSocket !== true
+}
+
+function lockAddress(path, options) {
   const digest = createHash('sha256').update(path).digest('hex').slice(0, 32)
-  return process.platform === 'linux'
+  return useAbstractNamespace(options)
     ? `\0mupot-singleton-${digest}`
     : `${path}.sock`
 }
@@ -60,22 +73,44 @@ function listen(server, address) {
   })
 }
 
-/** Ask the current owner for its pid. Resolves null if nothing is listening. */
+/**
+ * Probe the socket. Returns one of:
+ *   { state: 'refused' }            nothing is listening — the node is genuinely dead
+ *   { state: 'alive', pid }         an owner answered
+ *   { state: 'silent' }             connected, but no answer before the deadline
+ *
+ * The distinction between 'refused' and 'silent' is load-bearing. A refusal is a
+ * FACT from the kernel: no listener. Silence is not — a suspended, busy, or slow
+ * owner is still listening and still owns the lock. Collapsing silence into
+ * "dead" is how a live-but-unresponsive owner gets its socket unlinked out from
+ * under it while it keeps serving on the orphaned inode, producing exactly the
+ * two-owner state this lock exists to prevent.
+ */
 function probe(address) {
   return new Promise((resolve) => {
     const socket = net.connect(address)
     let data = ''
+    let settled = false
     const done = (value) => {
+      if (settled) return
+      settled = true
       socket.destroy()
       resolve(value)
     }
-    socket.setTimeout(1000, () => done(null))
+    socket.setTimeout(1000, () => done({ state: 'silent' }))
     socket.on('data', (chunk) => {
       data += chunk
-      done(Number(data.trim()) || 0)
+      done({ state: 'alive', pid: Number(String(data).trim()) || null })
     })
-    socket.on('error', () => resolve(null)) // ECONNREFUSED/ENOENT → no live owner
-    socket.on('close', () => resolve(data ? Number(data.trim()) || 0 : null))
+    socket.on('error', (error) => {
+      // ECONNREFUSED / ENOENT mean no listener. Anything else is unexplained,
+      // and unexplained must not be read as permission to take the lock.
+      const refused = error?.code === 'ECONNREFUSED' || error?.code === 'ENOENT'
+      done({ state: refused ? 'refused' : 'silent' })
+    })
+    socket.on('close', () => {
+      done(data ? { state: 'alive', pid: Number(String(data).trim()) || null } : { state: 'silent' })
+    })
   })
 }
 
@@ -92,7 +127,17 @@ export async function acquireSingletonLock(options) {
     return { ok: false, reason: 'lock_path_required', holder_pid: null }
   }
   const pid = Number.isInteger(options?.pid) ? options.pid : process.pid
-  const address = lockAddress(path)
+  const address = lockAddress(path, options)
+
+  // A filesystem socket needs its parent to exist. The abstract namespace does
+  // not, but creating the directory anyway keeps both platforms on one path and
+  // costs nothing — a first run on a clean host must not fail to take a lock
+  // merely because ~/.fleet/locks has never been created.
+  try {
+    mkdirSync(dirname(path), { recursive: true })
+  } catch (error) {
+    return { ok: false, reason: 'lock_dir_unwritable', holder_pid: null, detail: String(error?.message ?? error) }
+  }
 
   // Announce our pid to anyone probing, so a refusal can name the holder.
   const server = net.createServer((socket) => {
@@ -110,7 +155,7 @@ export async function acquireSingletonLock(options) {
       } catch {
         return false
       }
-      if (process.platform !== 'linux') {
+      if (!useAbstractNamespace(options)) {
         try {
           unlinkSync(address)
         } catch {
@@ -131,16 +176,26 @@ export async function acquireSingletonLock(options) {
   }
 
   // In use. On Linux that is conclusive: abstract names exist only while their
-  // owner does, so there is nothing stale to consider.
+  // owner does, so there is nothing stale to consider and the probe is advisory.
   const holder = await probe(address)
-  if (process.platform === 'linux') {
-    return { ok: false, reason: 'already_running', holder_pid: holder ?? null }
-  }
-  if (holder !== null) {
-    return { ok: false, reason: 'already_running', holder_pid: holder }
+  if (useAbstractNamespace(options)) {
+    return { ok: false, reason: 'already_running', holder_pid: holder.pid ?? null }
   }
 
-  // Filesystem socket with no listener: the node is dead, not merely idle.
+  if (holder.state === 'alive') {
+    return { ok: false, reason: 'already_running', holder_pid: holder.pid ?? null }
+  }
+  if (holder.state === 'silent') {
+    // Connected but unanswered. The owner may be suspended, busy, or slow — it
+    // is still listening and still owns this lock. Unlinking here would orphan
+    // its inode while it keeps serving, and the bind below would hand us a
+    // second, parallel owner. Refuse; a wedged lock is recoverable, two live
+    // consumers silently eating each other's messages is not.
+    return { ok: false, reason: 'already_running', holder_pid: null }
+  }
+
+  // holder.state === 'refused': the kernel says nothing is listening. That is a
+  // fact, not an inference, so the node is genuinely dead and safe to clear.
   try {
     unlinkSync(address)
   } catch {
@@ -151,6 +206,7 @@ export async function acquireSingletonLock(options) {
     return owned()
   } catch {
     // Another contender bound it in between. Fail closed; never loop.
-    return { ok: false, reason: 'lock_contended', holder_pid: await probe(address) }
+    const after = await probe(address)
+    return { ok: false, reason: 'lock_contended', holder_pid: after.pid ?? null }
   }
 }
