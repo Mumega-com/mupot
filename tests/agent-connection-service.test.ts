@@ -7,6 +7,7 @@ import {
   sweepAgentConnectionRetention,
 } from '../src/members/agent-connection'
 import { mcpApp } from '../src/mcp'
+import { deleteAgent } from '../src/org/service'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -326,6 +327,22 @@ describe('agent connection provisioning', () => {
     expect(harness.sqlite.prepare(
       "SELECT status, error_code FROM agent_connection_requests WHERE request_id = 'replace-race'",
     ).get()).toEqual({ status: 'failed', error_code: 'replace_token_not_found' })
+  })
+
+  it('does not unassign tasks when a canonical binding prevents agent deletion', async () => {
+    seedExisting(harness.sqlite, { bound: true, token: true })
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, assignee_agent_id)
+      VALUES ('task-connected', 'squad-home', 'Connected task', 'agent-existing');
+    `)
+
+    await expect(deleteAgent(env, 'agent-existing')).rejects.toThrow(/FOREIGN KEY/)
+    expect(harness.sqlite.prepare(
+      "SELECT assignee_agent_id FROM tasks WHERE id = 'task-connected'",
+    ).get()).toEqual({ assignee_agent_id: 'agent-existing' })
+    expect(harness.sqlite.prepare(
+      "SELECT COUNT(*) AS n FROM agents WHERE id = 'agent-existing'",
+    ).get()).toEqual({ n: 1 })
   })
 
   it('replays a committed request without returning raw token or challenge', async () => {

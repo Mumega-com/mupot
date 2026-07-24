@@ -738,15 +738,18 @@ export async function deleteAgent(
   env: Env,
   agentId: string,
 ): Promise<DeleteAgentResult> {
-  // Null out task assignee references first to keep FK-cleanliness (D1 does not
-  // enforce FKs by default, but orphan assignee ids produce confusing UI gaps).
-  await env.DB.prepare('UPDATE tasks SET assignee_agent_id = NULL WHERE assignee_agent_id = ?')
-    .bind(agentId)
-    .run()
-
-  const result = await env.DB.prepare('DELETE FROM agents WHERE id = ?')
-    .bind(agentId)
-    .run()
-  if (!result.meta.changes) return { ok: false, error: 'not_found' }
+  // Keep assignment cleanup and deletion in one D1 transaction. A canonical
+  // binding or any other delete guard rolls the cleanup back instead of
+  // returning an error after tasks have already been destructively unassigned.
+  const writes = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE tasks
+          SET assignee_agent_id = NULL
+        WHERE assignee_agent_id = ?
+          AND EXISTS (SELECT 1 FROM agents WHERE id = ?)`,
+    ).bind(agentId, agentId),
+    env.DB.prepare('DELETE FROM agents WHERE id = ?').bind(agentId),
+  ])
+  if (!writes[1]?.meta.changes) return { ok: false, error: 'not_found' }
   return { ok: true }
 }
