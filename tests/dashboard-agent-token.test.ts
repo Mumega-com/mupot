@@ -394,6 +394,7 @@ function makeRouteEnv(role: 'owner' | 'admin' | 'member', opts: {
     TENANT_SLUG: 'test',
     BRAND: 'Test',
     OAUTH_PROVIDER: 'google',
+    PUBLIC_ORIGIN: 'https://test.mupot.app',
     DB: {
       prepare,
       async batch(stmts: { sql: string; args: unknown[] }[]) {
@@ -547,6 +548,19 @@ describe('POST /admin/agent-token/mint', () => {
     const text = await res.text()
     expect(text).toContain('Grant must be observer or member')
     expect(captured.length).toBe(0)
+  })
+
+  it('503s before minting when PUBLIC_ORIGIN is not a secure canonical origin', async () => {
+    const captured: Captured[] = []
+    const env = makeRouteEnv('admin', { captured })
+    env.PUBLIC_ORIGIN = 'http://evil.example'
+    const form = new URLSearchParams({ agent_id: AGENT.id, label: 'origin-gap' })
+
+    const res = await dashboardApp.fetch(makeReq('/admin/agent-token/mint', 'POST', form), env)
+
+    expect(res.status).toBe(503)
+    expect(await res.text()).toContain('secure public origin')
+    expect(captured).toHaveLength(0)
   })
 
   it('Cache-Control: no-store on the mint result page', async () => {

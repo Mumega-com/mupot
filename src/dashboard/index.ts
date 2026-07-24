@@ -1394,6 +1394,17 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
       403,
     )
   }
+  const canonical = requiredCanonicalOrigin(c.env)
+  if (!canonical.ok) {
+    return c.html(
+      shell(
+        c.env,
+        'Mint agent token',
+        errorBody('A secure public origin must be configured before provisioning a token.'),
+      ),
+      503,
+    )
+  }
 
   const form = await c.req.parseBody()
   const agentIdRaw = typeof form.agent_id === 'string' ? form.agent_id.trim() : ''
