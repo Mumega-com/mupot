@@ -4,6 +4,7 @@
 - **Implementation owner:** Codex
 - **Independent gate owner:** user/Cursor
 - **Tracking:** https://github.com/Mumega-com/mupot/issues/528
+- **Draft PR:** https://github.com/Mumega-com/mupot/pull/539
 - **Stack base:** PR #538, `feat/agent-connection-guided-flow` at `9ede067`
 - **Branch:** `feat/agent-connection-owner-wizard`
 
