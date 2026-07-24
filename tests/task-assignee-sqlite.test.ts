@@ -23,6 +23,14 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       tenant TEXT NOT NULL,
       revoked_at TEXT
     );
+    CREATE TABLE agent_member_bindings (
+      tenant TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      member_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (tenant, agent_id),
+      UNIQUE (tenant, member_id)
+    );
     CREATE TABLE capabilities (
       id TEXT PRIMARY KEY,
       member_id TEXT NOT NULL,
@@ -72,6 +80,16 @@ function addToken(
   ).run(id, memberId, CROSS_AGENT_ID, options.tenant ?? TENANT, options.revokedAt ?? null)
 }
 
+function bindAgent(
+  sqlite: SqliteD1Harness['sqlite'],
+  memberId = MEMBER_ID,
+): void {
+  sqlite.prepare(
+    `INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+     VALUES (?, ?, ?, ?)`,
+  ).run(TENANT, CROSS_AGENT_ID, memberId, '2026-07-24T00:00:00.000Z')
+}
+
 function addGrant(
   sqlite: SqliteD1Harness['sqlite'],
   id: string,
@@ -113,6 +131,7 @@ describe('resolveTaskAssignee — SQLite capability matrix', () => {
     ).run('grant-channel', MEMBER_ID, TARGET_SQUAD_ID, 'member')],
   ])('accepts a cross-squad agent with %s member authority', async (_name, grant) => {
     addMember(harness.sqlite)
+    bindAgent(harness.sqlite)
     addToken(harness.sqlite, 'token-primary')
     grant()
 
@@ -121,11 +140,25 @@ describe('resolveTaskAssignee — SQLite capability matrix', () => {
 
   it('accepts duplicate live tokens that resolve to one member identity', async () => {
     addMember(harness.sqlite)
+    bindAgent(harness.sqlite)
     addToken(harness.sqlite, 'token-one')
     addToken(harness.sqlite, 'token-two')
     addGrant(harness.sqlite, 'grant-squad', 'squad', TARGET_SQUAD_ID)
 
     await expect(resolveTaskAssignee(env, CROSS_AGENT_ID, TARGET_SQUAD_ID)).resolves.toEqual({ value: CROSS_AGENT_ID })
+  })
+
+  it('keeps cross-squad authority after every credential is revoked', async () => {
+    addMember(harness.sqlite)
+    bindAgent(harness.sqlite)
+    addToken(harness.sqlite, 'token-revoked', MEMBER_ID, {
+      revokedAt: '2026-07-12T00:00:00.000Z',
+    })
+    addGrant(harness.sqlite, 'grant-squad', 'squad', TARGET_SQUAD_ID)
+
+    await expect(resolveTaskAssignee(env, CROSS_AGENT_ID, TARGET_SQUAD_ID)).resolves.toEqual({
+      value: CROSS_AGENT_ID,
+    })
   })
 
   it('rejects inactive agents even when their home squad matches', async () => {
@@ -136,45 +169,10 @@ describe('resolveTaskAssignee — SQLite capability matrix', () => {
 
   it('fails closed for cross-squad identities and insufficient grants', async () => {
     const cases: Array<{ name: string; seed: () => void }> = [
-      { name: 'no token', seed: () => undefined },
       {
-        name: 'ambiguous members',
+        name: 'no canonical binding',
         seed: () => {
           addMember(harness.sqlite)
-          addMember(harness.sqlite, 'member-second')
-          addToken(harness.sqlite, 'token-one')
-          addToken(harness.sqlite, 'token-two', 'member-second')
-          addGrant(harness.sqlite, 'grant-squad', 'squad', TARGET_SQUAD_ID)
-        },
-      },
-      {
-        name: 'suspended member',
-        seed: () => {
-          addMember(harness.sqlite, MEMBER_ID, TENANT, 'suspended')
-          addToken(harness.sqlite, 'token-primary')
-          addGrant(harness.sqlite, 'grant-squad', 'squad', TARGET_SQUAD_ID)
-        },
-      },
-      {
-        name: 'revoked-only token',
-        seed: () => {
-          addMember(harness.sqlite)
-          addToken(harness.sqlite, 'token-primary', MEMBER_ID, { revokedAt: '2026-07-12T00:00:00.000Z' })
-          addGrant(harness.sqlite, 'grant-squad', 'squad', TARGET_SQUAD_ID)
-        },
-      },
-      {
-        name: 'wrong token tenant',
-        seed: () => {
-          addMember(harness.sqlite)
-          addToken(harness.sqlite, 'token-primary', MEMBER_ID, { tenant: 'tenant-b' })
-          addGrant(harness.sqlite, 'grant-squad', 'squad', TARGET_SQUAD_ID)
-        },
-      },
-      {
-        name: 'wrong member tenant',
-        seed: () => {
-          addMember(harness.sqlite, MEMBER_ID, 'tenant-b')
           addToken(harness.sqlite, 'token-primary')
           addGrant(harness.sqlite, 'grant-squad', 'squad', TARGET_SQUAD_ID)
         },
@@ -183,6 +181,7 @@ describe('resolveTaskAssignee — SQLite capability matrix', () => {
         name: 'observer-only grant',
         seed: () => {
           addMember(harness.sqlite)
+          bindAgent(harness.sqlite)
           addToken(harness.sqlite, 'token-primary')
           addGrant(harness.sqlite, 'grant-observer', 'squad', TARGET_SQUAD_ID, 'observer')
         },
@@ -191,6 +190,7 @@ describe('resolveTaskAssignee — SQLite capability matrix', () => {
         name: 'no grant',
         seed: () => {
           addMember(harness.sqlite)
+          bindAgent(harness.sqlite)
           addToken(harness.sqlite, 'token-primary')
         },
       },
@@ -213,6 +213,7 @@ describe('resolveTaskAssignee — SQLite capability matrix', () => {
 
   it('rejects a future assignment after the last effective grant is revoked', async () => {
     addMember(harness.sqlite)
+    bindAgent(harness.sqlite)
     addToken(harness.sqlite, 'token-primary')
     addGrant(harness.sqlite, 'grant-squad', 'squad', TARGET_SQUAD_ID)
 

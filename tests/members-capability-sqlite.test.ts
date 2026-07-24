@@ -13,6 +13,9 @@ const TARGET_SQUAD_ID = 'squad-other'
 
 function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY
+    );
     CREATE TABLE members (
       id TEXT PRIMARY KEY,
       display_name TEXT NOT NULL,
@@ -36,6 +39,15 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE (member_id, scope_type, scope_id)
     );
+    CREATE TABLE agent_member_bindings (
+      tenant TEXT NOT NULL,
+      agent_id TEXT NOT NULL REFERENCES agents(id),
+      member_id TEXT NOT NULL REFERENCES members(id),
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (tenant, agent_id),
+      UNIQUE (tenant, member_id)
+    );
+    INSERT INTO agents (id) VALUES ('${AGENT_ID}');
   `)
 }
 
@@ -68,6 +80,13 @@ function addToken(
   )
 }
 
+function bindAgent(sqlite: SqliteD1Harness['sqlite'], memberId: string): void {
+  sqlite.prepare(
+    `INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+     VALUES (?, ?, ?, ?)`,
+  ).run(TENANT, AGENT_ID, memberId, '2026-07-24T00:00:00.000Z')
+}
+
 function readTargetGrants(sqlite: SqliteD1Harness['sqlite']): Array<{ id: string; capability: string }> {
   return sqlite.prepare(
     `SELECT id, capability FROM capabilities
@@ -88,7 +107,7 @@ describe('SQLite-backed capability grant state', () => {
 
   afterEach(() => harness.close())
 
-  it('filters cross-tenant, revoked, and inactive identities in real SQLite state', async () => {
+  it('resolves the canonical binding independently of token lifecycle noise', async () => {
     addMember(harness.sqlite, 'member-product')
     addMember(harness.sqlite, 'member-other-tenant', 'tenant-b')
     addMember(harness.sqlite, 'member-token-other-tenant')
@@ -99,6 +118,7 @@ describe('SQLite-backed capability grant state', () => {
     addToken(harness.sqlite, 'token-other-tenant', 'member-token-other-tenant', { tenant: 'tenant-b' })
     addToken(harness.sqlite, 'token-inactive', 'member-inactive')
     addToken(harness.sqlite, 'token-revoked', 'member-revoked', { revokedAt: '2026-07-12T00:00:00.000Z' })
+    bindAgent(harness.sqlite, 'member-product')
 
     await expect(resolveActiveAgentMember(env, AGENT_ID)).resolves.toBe('member-product')
   })
@@ -107,6 +127,7 @@ describe('SQLite-backed capability grant state', () => {
     addMember(harness.sqlite, 'member-product')
     addMember(harness.sqlite, 'member-second')
     addToken(harness.sqlite, 'token-product', 'member-product')
+    bindAgent(harness.sqlite, 'member-product')
     harness.sqlite.prepare(
       `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
        VALUES ('grant-before', 'member-product', 'squad', ?, 'observer')`,
@@ -128,6 +149,7 @@ describe('SQLite-backed capability grant state', () => {
   it('classifies created, unchanged, and updated from the committed guarded upsert', async () => {
     addMember(harness.sqlite, 'member-product')
     addToken(harness.sqlite, 'token-product', 'member-product')
+    bindAgent(harness.sqlite, 'member-product')
     const input = {
       agentId: AGENT_ID,
       expectedMemberId: 'member-product',

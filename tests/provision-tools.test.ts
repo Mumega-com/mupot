@@ -55,6 +55,10 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
         // .first() serves the member_tokens authn lookup and every WHERE-id resolve
         // (ids are globally unique). Slug resolves go through .all() (count matches).
         async first() {
+          if (sql.includes('FROM agent_member_bindings')) {
+            const member_id = agentTokenMembers[0]
+            return member_id === undefined ? null : { member_id }
+          }
           if (sql.includes('FROM member_tokens')) {
             return {
               member_id: memberId,
@@ -115,11 +119,6 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
             return { results: existingGrantCapabilities.map((capability) => ({ capability })) }
           }
           if (sql.includes('FROM capabilities')) return { results: grants }
-          if (sql.includes('SELECT DISTINCT t.member_id')) {
-            return {
-              results: [...new Set(agentTokenMembers)].slice(0, 2).map((member_id) => ({ member_id })),
-            }
-          }
           // slug resolves: count matches. 'dup' deliberately matches TWO agents.
           if (sql.includes('FROM agents') && sql.includes('WHERE slug')) {
             if (ref === 'dup') return { results: [agentRow, { ...agentRow, id: 'agent-2', squad_id: 'squad-2' }] }
@@ -610,18 +609,6 @@ describe('grant_agent_capability', () => {
     const res = await call('grant_agent_capability', args, makeEnv({ agentTokenMembers: [] }, captured))
     expect(res.status).toBe(409)
     expect(((await res.json()) as { error: { message: string } }).error.message).toBe('agent_identity_unminted')
-    expect(captured).toEqual([])
-  })
-
-  it('rejects an agent with ambiguous active member identities before writing a grant', async () => {
-    const captured: Captured[] = []
-    const res = await call(
-      'grant_agent_capability',
-      args,
-      makeEnv({ agentTokenMembers: ['member-agent-1', 'member-agent-2'] }, captured),
-    )
-    expect(res.status).toBe(409)
-    expect(((await res.json()) as { error: { message: string } }).error.message).toBe('agent_identity_ambiguous')
     expect(captured).toEqual([])
   })
 
