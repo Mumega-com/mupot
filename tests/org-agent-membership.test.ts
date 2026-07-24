@@ -131,6 +131,30 @@ describe('POST /agents/:id/memberships canonical delegation', () => {
     await expect(response.json()).resolves.toEqual({ error: 'forbidden', need: 'admin' })
   })
 
+  it('refuses an agent-bound principal before resolving or writing delegation', async () => {
+    authState.current = {
+      userId: 'agent-user',
+      memberId: 'agent-member',
+      email: null,
+      role: 'owner',
+      tenant: TENANT,
+      boundAgentId: 'agent-caller',
+      capabilities: [{
+        member_id: 'agent-member',
+        scope_type: 'org',
+        scope_id: null,
+        capability: 'owner',
+      }],
+    }
+
+    const response = await orgApp.fetch(request(TARGET_SQUAD_ID, 'member'), env)
+    expect(response.status).toBe(403)
+    await expect(response.json()).resolves.toEqual({ error: 'operator_principal_required' })
+    expect(harness.sqlite.prepare(
+      'SELECT COUNT(*) AS count FROM memberships WHERE agent_id = ? AND squad_id = ?',
+    ).get(AGENT_ID, TARGET_SQUAD_ID)).toEqual({ count: 0 })
+  })
+
   it('refuses home escalation and an unminted identity without partial writes', async () => {
     const home = await orgApp.fetch(request(HOME_SQUAD_ID, 'lead'), env)
     expect(home.status).toBe(409)

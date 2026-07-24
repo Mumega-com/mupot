@@ -257,6 +257,10 @@ interface CreateMembershipBody {
 }
 
 orgApp.post('/agents/:id/memberships', async (c) => {
+  const auth = c.get('auth')
+  if (auth.boundAgentId) {
+    return c.json({ error: 'operator_principal_required' }, 403)
+  }
   const agentId = c.req.param('id')
   const agent = await getById<Agent>(c.env, 'agents', agentId)
   if (!agent) return c.json({ error: 'agent_not_found' }, 404)
@@ -283,7 +287,6 @@ orgApp.post('/agents/:id/memberships', async (c) => {
     return c.json({ error: 'invalid_capability' }, 400)
   }
 
-  const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
     if (!auth.memberId) return c.json({ error: 'forbidden' }, 403)
     const grants = auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId))

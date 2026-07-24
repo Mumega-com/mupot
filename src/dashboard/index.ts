@@ -1382,6 +1382,12 @@ dashboardApp.get('/admin/agent-token', async (c) => {
 // POST /admin/agent-token/mint
 dashboardApp.post('/admin/agent-token/mint', async (c) => {
   const auth = c.get('auth')
+  if (auth.boundAgentId) {
+    return c.html(
+      shell(c.env, 'Mint agent token', errorBody('An operator principal is required.')),
+      403,
+    )
+  }
   if (!isOrgAdmin(auth)) {
     return c.html(
       shell(c.env, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
@@ -1434,9 +1440,9 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   }
   const agent = agentResult.value
 
-  // Delegate to the shared atomic-mint helper.
-  // Three rows in ONE D1 batch: member envelope + escalation-guard capability +
-  // agent-weld token. Same path the MCP mint_agent_token tool uses.
+  // Delegate to the shared atomic-mint helper. A first mint creates the member,
+  // binding, home capability, and welded token; later mints add only the token.
+  // This is the same path the MCP mint_agent_token tool uses.
   const minted = await mintAgentBoundToken(c.env, agent, labelRaw, capabilityRaw)
 
   // Look up the squad name for the show-once page.

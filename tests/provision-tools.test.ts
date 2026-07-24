@@ -26,6 +26,7 @@ interface Opts {
   guardedGrantNoRow?: boolean
   events?: unknown[]
   publicOrigin?: string | null
+  boundAgentId?: string | null
 }
 
 const SQUAD = { id: 'squad-1', department_id: 'dept-1' }
@@ -79,7 +80,7 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
               status: 'active',
               created_at: '2026-06-09 00:00:00',
               channel: 'workspace',
-              bound_agent_id: null,
+              bound_agent_id: opts.boundAgentId ?? null,
             }
           }
           if (sql.includes('FROM agent_keys')) return null
@@ -285,6 +286,33 @@ describe('provision tools — advertised', () => {
       required: ['agent', 'squad', 'capability'],
       additionalProperties: false,
     })
+  })
+
+  it('refuses agent-bound callers on provision, mint, and grant surfaces', async () => {
+    for (const [name, args] of [
+      ['mint_agent_token', { agent: AGENT.id }],
+      ['grant_agent_capability', {
+        agent: AGENT.id,
+        squad: TARGET_SQUAD.id,
+        capability: 'member',
+      }],
+      ['provision_agent_connection', {
+        request_id: 'agent-self-provision',
+        existing_agent: AGENT.id,
+        credential: { action: 'add' },
+      }],
+    ] as const) {
+      const captured: Captured[] = []
+      const response = await call(
+        name,
+        args,
+        makeEnv({ boundAgentId: 'agent-caller' }, captured),
+      )
+      expect(response.status).toBe(403)
+      expect(((await response.json()) as { error: { message: string } }).error.message)
+        .toBe('operator_principal_required')
+      expect(captured).toEqual([])
+    }
   })
 })
 
