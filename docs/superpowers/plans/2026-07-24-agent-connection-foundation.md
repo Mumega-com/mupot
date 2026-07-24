@@ -24,6 +24,28 @@
 
 ---
 
+## Execution and Review Boundary
+
+- Start from the latest `main` in an isolated worktree on
+  `feat/agent-connection-foundation` (or an equivalent dedicated branch).
+- Bring forward only the approved design, this plan, the Codex handoff, and
+  changes required by Tasks 1–7; do not inherit unrelated feature commits.
+- Treat Tasks 1–7 as one ordered foundation release candidate:
+  database contract, canonical mint, synchronized access, pinned origin,
+  compatibility cutover, high-level provisioning, then verification.
+- `provisionAgentConnection`, `provision_agent_connection`, request/receipt
+  persistence, and retention are foundation infrastructure. They do not
+  authorize the verification callback, messaging proof, polling, wizard, or
+  receipt UI.
+- Codex implements and produces verification evidence. Cursor or another
+  explicitly assigned independent reviewer gates the PR; Codex does not
+  self-approve.
+- Establish the full-suite baseline on the clean branch before Task 1. The Task
+  7 done bar remains zero failures. If latest `main` is already red, preserve
+  the exact evidence and stop before claiming PR readiness; resolve the
+  unrelated baseline separately or obtain an explicit project decision. Do not
+  silently weaken the gate or mix drive-by repairs into this PR.
+
 ## File Map
 
 - Create `migrations/0071_agent_connections.sql` — canonical binding, migration guard/backfill, token weld triggers, request table, receipt table, and receipt immutability.

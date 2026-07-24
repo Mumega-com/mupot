@@ -751,6 +751,23 @@ Cover:
 5. Add connection verification and the durable receipt page.
 6. Deprecate independent UI entry points after parity evidence is green.
 
+### Foundation implementation slice
+
+The first implementation PR covers rollout steps 1–3 only. In this slice,
+"foundation" includes the request/receipt persistence contract, retention
+maintenance, `provisionAgentConnection`, and the high-level MCP
+`provision_agent_connection` tool because they are the shared transactional
+boundary through which existing credential surfaces are cut over.
+
+The foundation PR does not include `verify_agent_connection`,
+`AuthContext.tokenId`, messaging proof, receipt-status polling, the owner
+wizard, receipt UI, production migration, deployment, or live credential
+mutation. Those remain follow-on work after sole-writer parity is green.
+
+Codex is the implementation owner for the foundation PR. Codex supplies test
+and diff evidence but does not self-gate; Cursor or another explicitly assigned
+independent reviewer owns the red-team verdict.
+
 ### Implementation PR acceptance checklist
 
 - The migration and service enforce the permanent `observer|member`
