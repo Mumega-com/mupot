@@ -56,6 +56,10 @@ does not mint or bypass the shared provisioning service.
 Evidence was run on implementation head `f009e2b` before this documentation-only
 handoff commit.
 
+Browser completion evidence was strengthened on follow-up head `171ed25`. That
+follow-up adds a second local squad plus an unminted existing-agent fixture and
+drives both identity dispositions through the rendered owner wizard.
+
 ### Static and repository tests
 
 ```text
@@ -104,35 +108,54 @@ That run:
 - seeded the local fixture;
 - loaded `/agents/connect` at HTTP 200 with no browser console errors or
   redirect;
-- drove a real owner new-agent journey through the rendered UI;
+- drove real owner new-agent and existing-agent journeys through the rendered
+  UI;
+- selected optional additional access in both directions across two squads;
+- proved the new journey created one canonical identity and the existing
+  journey reused the exact seeded identity with its home unchanged;
 - captured the show-once values in process memory, then removed them from the
   DOM before any screenshot/failure artifact;
 - proved Claude Code, Codex, and Cursor configs did not contain the raw key;
-- called `verify_agent_connection` over `/mcp` using the newly issued key;
-- observed `messaging_verified`;
+- called `verify_agent_connection` over `/mcp` using each newly issued key;
+- observed `messaging_verified` plus passing `orient`, `send`, and
+  `inbox_peek` receipt checks for both journeys;
+- proved both home and additional squad rows were synchronized exactly once;
 - loaded the durable receipt and proved it contained neither key nor challenge;
 - completed all pre-existing dashboard workflows; and
 - passed every `runtime-adapter/v1` conformance step.
 
-The non-secret browser report records:
+The non-secret browser report records both paths:
 
 ```json
-{
-  "name": "owner create-connect-verify agent journey",
-  "status": "passed",
-  "credentialShownOnce": true,
-  "configurationSeparated": true,
-  "messagingVerified": true,
-  "durableReceiptSecretFree": true
-}
+[
+  {
+    "name": "owner create-connect-verify agent journey",
+    "status": "passed",
+    "existingIdentityReused": false,
+    "canonicalIdentityCount": 1,
+    "additionalAccessSynchronized": true,
+    "messagingVerified": true,
+    "durableReceiptSecretFree": true
+  },
+  {
+    "name": "owner connect existing agent journey",
+    "status": "passed",
+    "existingIdentityReused": true,
+    "canonicalIdentityCount": 1,
+    "additionalAccessSynchronized": true,
+    "messagingVerified": true,
+    "durableReceiptSecretFree": true
+  }
+]
 ```
 
 ## Coverage distinction
 
 **PASS**
 
-- Browser: complete new-agent create → credential → configuration → live MCP
-  verification → receipt journey.
+- Browser: complete new-agent create and existing-agent reuse journeys through
+  identity selection, immutable home, optional additional access, credential,
+  configuration, live MCP verification, synchronized access, and receipt.
 - Route/real-SQLite: existing-agent add flow, no duplicate canonical identity,
   cross-squad access, stable retry without second key, owner/admin/fine-grained
   admin gates, bound-agent refusal, cross-origin refusal, abandoned-request
@@ -144,8 +167,6 @@ The non-secret browser report records:
 **NOT YET TESTED**
 
 - A browser-click journey for existing-agent replacement.
-- A browser-click journey with two squads selected; the local seed has one
-  squad. The equivalent route/service state is covered.
 - Production migration, deploy, live credential issuance, or live token
   revocation.
 
