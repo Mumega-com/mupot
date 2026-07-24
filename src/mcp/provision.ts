@@ -32,7 +32,7 @@ import {
   resolveAgentMemberBinding,
 } from '../members/service'
 import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
-import { mcpEndpoint, wakeContractForAgent } from '../dashboard/connect'
+import { mcpEndpoint, requiredCanonicalOrigin, wakeContractForAgent } from '../dashboard/connect'
 import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
 import { isValidEd25519PublicX, registerAgentPublicKey } from '../fleet/agent-keys'
@@ -386,7 +386,7 @@ const toolMintAgentToken: ToolSpec = {
     required: ['agent'],
     additionalProperties: false,
   },
-  async run(auth, env, args, ctx) {
+  async run(auth, env, args, _ctx) {
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -411,9 +411,13 @@ const toolMintAgentToken: ToolSpec = {
       return fail(400, 'invalid_capability', 'capability must be observer or member')
     }
 
+    const canonical = requiredCanonicalOrigin(env)
+    if (!canonical.ok) return fail(503, canonical.error)
+
     // Delegate to the shared atomic-mint helper (members/service.ts).
-    // Three rows in ONE D1 batch: member envelope + escalation-guard capability +
-    // agent-weld token. Either all three land or none do — no orphan credentials.
+    // A first mint atomically creates the member envelope, canonical binding,
+    // home capability, and agent-weld token; later mints add only the token.
+    // Either the complete mint lands or none of it does — no orphan credentials.
     // The helper enforces: squad-scoped observer/member only, hash-only storage,
     // show-once raw.
     const minted = await mintAgentBoundToken(env, agent, label, grantCapability)
@@ -442,8 +446,13 @@ const toolMintAgentToken: ToolSpec = {
         raw: minted.raw,
       },
       agent: { id: agent.id, slug: agent.slug, name: agent.name },
-      mcp_endpoint: mcpEndpoint(ctx.origin),
-      wake_contract: wakeContractForAgent(agent.id, agent.squad_id, env.TENANT_SLUG, ctx.origin),
+      mcp_endpoint: mcpEndpoint(canonical.origin),
+      wake_contract: wakeContractForAgent(
+        agent.id,
+        agent.squad_id,
+        env.TENANT_SLUG,
+        canonical.origin,
+      ),
       note: 'raw token is shown ONCE — store it now; it is never retrievable again',
     })
   },

@@ -65,7 +65,13 @@ import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
 import { resolveAgentRef } from '../org/resolve'
 
 // Connect-config builders (pure) for the Connect card.
-import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
+import {
+  mcpEndpoint,
+  claudeCodeSnippet,
+  codexSnippet,
+  cursorSnippet,
+  requiredCanonicalOrigin,
+} from './connect'
 import { loadApprovals, loadPublishable, resultPreview } from './approvals'
 import { CONTENT_DEPARTMENT_KEY } from '../agents/execute'
 import { loadLoopsView, loopsBody } from './loops'
@@ -1846,11 +1852,26 @@ dashboardApp.post('/members/:id/tokens', async (c) => {
     return c.html(shell(c.env, 'Access Tokens', errorBody('Invalid channel.')), 400)
   }
 
+  const canonical = requiredCanonicalOrigin(c.env)
+  if (!canonical.ok) {
+    return c.html(
+      shell(
+        c.env,
+        'Access Tokens',
+        errorBody('A secure public origin must be configured before provisioning a token.'),
+      ),
+      503,
+    )
+  }
+
   // Shared mint path — raw returned once, only the hash persisted.
   const minted = await mintMemberToken(c.env, memberId, labelRaw, channelRaw)
-  const origin = new URL(c.req.url).origin
   return c.html(
-    shell(c.env, 'Token provisioned', tokenShowOnceBody(c.env.TENANT_SLUG, origin, member.display_name, minted)),
+    shell(
+      c.env,
+      'Token provisioned',
+      tokenShowOnceBody(c.env.TENANT_SLUG, canonical.origin, member.display_name, minted),
+    ),
   )
 })
 
@@ -4843,6 +4864,8 @@ function tokenShowOnceBody(slug: string, origin: string, memberName: string, min
       <pre class="snippet">${claudeCodeSnippet(slug, origin)}</pre>
       <h3 style="font-size:13px;color:var(--muted);margin:14px 0 0">Codex · <code class="inline">~/.codex/config.toml</code></h3>
       <pre class="snippet">${codexSnippet(slug, origin)}</pre>
+      <h3 style="font-size:13px;color:var(--muted);margin:14px 0 0">Cursor · <code class="inline">MCP JSON</code></h3>
+      <pre class="snippet">${cursorSnippet(slug, origin)}</pre>
     </div>
     <p><a href="/members">← Back to access tokens</a></p>`
 }

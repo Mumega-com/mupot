@@ -25,6 +25,7 @@ interface Opts {
   existingGrantCapabilities?: Capability[]
   guardedGrantNoRow?: boolean
   events?: unknown[]
+  publicOrigin?: string | null
 }
 
 const SQUAD = { id: 'squad-1', department_id: 'dept-1' }
@@ -178,6 +179,9 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
 
   return {
     TENANT_SLUG: 'digid',
+    PUBLIC_ORIGIN: opts.publicOrigin === null
+      ? undefined
+      : (opts.publicOrigin ?? 'https://agents.digid.ca'),
     BRAND: 'Digid',
     OAUTH_PROVIDER: 'google',
     DB: {
@@ -214,9 +218,15 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
   } as unknown as Env
 }
 
-async function call(name: string, args: Record<string, unknown>, env: Env, auth = true) {
+async function call(
+  name: string,
+  args: Record<string, unknown>,
+  env: Env,
+  auth = true,
+  requestOrigin = 'https://agents.digid.ca',
+) {
   return mcpApp.request(
-    'https://agents.digid.ca/',
+    `${requestOrigin}/`,
     {
       method: 'POST',
       headers: {
@@ -369,6 +379,10 @@ describe('create_agent', () => {
     const body = (await res.json()) as { result: { structuredContent: { agent: { slug: string } } } }
     expect(body.result.structuredContent.agent.slug).toBe('sdr-1')
     expect(cap.some((c) => c.sql.includes('INSERT INTO agents'))).toBe(true)
+    expect(cap.some((c) => /INSERT INTO members\s*\(/.test(c.sql))).toBe(false)
+    expect(cap.some((c) => c.sql.includes('INSERT INTO agent_member_bindings'))).toBe(false)
+    expect(cap.some((c) => c.sql.includes('INSERT INTO capabilities'))).toBe(false)
+    expect(cap.some((c) => c.sql.includes('INSERT INTO member_tokens'))).toBe(false)
   })
 
   it('403s a squad member (needs lead)', async () => {
@@ -467,6 +481,57 @@ describe('mint_agent_token', () => {
     expect(higherRows).toEqual([])
   })
 
+  it('reuses the canonical member and committed home capability on an additional credential', async () => {
+    const rows: Captured[] = []
+    const res = await call(
+      'mint_agent_token',
+      { agent: AGENT.slug, capability: 'member' },
+      makeEnv({ existingGrantCapabilities: ['observer'] }, rows),
+    )
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      result: { structuredContent: { token: { member_id: string; capability: string } } }
+    }
+    expect(body.result.structuredContent.token).toMatchObject({
+      member_id: 'member-agent-1',
+      capability: 'observer',
+    })
+    expect(rows.filter(({ sql }) => sql.includes('INSERT INTO member_tokens'))).toHaveLength(1)
+    expect(rows.some(({ sql }) => /INSERT INTO members\s*\(/.test(sql))).toBe(false)
+    expect(rows.some(({ sql }) => sql.includes('INSERT INTO agent_member_bindings'))).toBe(false)
+    expect(rows.some(({ sql }) => sql.includes('INSERT INTO capabilities'))).toBe(false)
+  })
+
+  it('requires a safe pinned origin before minting and ignores a malicious request host', async () => {
+    for (const publicOrigin of [null, 'http://evil.example']) {
+      const rows: Captured[] = []
+      const res = await call(
+        'mint_agent_token',
+        { agent: AGENT.slug },
+        makeEnv({ agentTokenMembers: [], publicOrigin }, rows),
+      )
+      expect(res.status).toBe(503)
+      expect(((await res.json()) as { error: { message: string } }).error.message)
+        .toBe('public_origin_unconfigured')
+      expect(rows).toEqual([])
+    }
+
+    const res = await call(
+      'mint_agent_token',
+      { agent: AGENT.slug },
+      makeEnv({ agentTokenMembers: [], publicOrigin: 'https://pot.example' }),
+      true,
+      'https://evil.example',
+    )
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      result: { structuredContent: { mcp_endpoint: string; wake_contract: { emit_url: string } } }
+    }
+    expect(body.result.structuredContent.mcp_endpoint).toBe('https://pot.example/mcp')
+    expect(body.result.structuredContent.wake_contract.emit_url).toBe('https://pot.example/bus/emit')
+    expect(JSON.stringify(body)).not.toContain('evil.example')
+  })
+
   it('403s a squad-lead — minting a credential needs admin', async () => {
     const grants: CapabilityGrant[] = [
       { member_id: 'member-operator', scope_type: 'squad', scope_id: 'squad-1', capability: 'lead' },
@@ -550,6 +615,19 @@ describe('register_agent_key', () => {
       makeEnv({ grants }, captured),
     )
     expect(res.status).toBe(403)
+    expect(captured).toEqual([])
+  })
+
+  it('refuses to create a key before the canonical agent identity exists', async () => {
+    const captured: Captured[] = []
+    const res = await call(
+      'register_agent_key',
+      { agent: AGENT.slug, public_key: publicKey },
+      makeEnv({ agentTokenMembers: [] }, captured),
+    )
+    expect(res.status).toBe(409)
+    expect(((await res.json()) as { error: { message: string } }).error.message)
+      .toBe('agent_identity_unminted')
     expect(captured).toEqual([])
   })
 
