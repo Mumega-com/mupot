@@ -62,6 +62,12 @@ Moving an agent's home squad is a separate lifecycle operation because it can
 change task ownership, routing, budgets, and authorization. It is not part of
 connection setup.
 
+The canonical agent member's capability on its home squad is permanently
+bounded to `observer` or `member`. No entry point—including
+`setAgentSquadAccess`, `grant_agent_capability`, or direct credential mint—may
+raise the home-squad grant to `lead`, `admin`, or `owner`; doing so requires a
+separate future product decision that explicitly replaces this mint guard.
+
 ### Optional cross-squad access
 
 An agent may receive access to additional squads without creating another agent
@@ -137,6 +143,8 @@ All identity and scope decisions are server-derived.
 - Minting an agent credential requires `admin` or higher on the home squad.
 - Adding or changing cross-squad access requires `admin` or higher on every
   affected target squad.
+- When the REST membership route delegates to the synchronized writer, its
+  existing target-squad authorization floor changes from `lead` to `admin`.
 - A caller cannot grant above its own effective rank.
 - Existing agent references resolve ID-first and refuse ambiguous slugs.
 - Tenant boundaries come from the Worker environment, never request input.
@@ -207,8 +215,10 @@ to this operation. Removing access deletes both representations in one
 transaction. Changing access rank updates the authoritative capability while
 preserving the membership edge.
 
-The home squad access cannot be removed through this operation. Deactivating or
-moving an agent remains a separate lifecycle action.
+The home squad access cannot be removed through this operation. If the target is
+the home squad, `setAgentSquadAccess` accepts only `observer` or `member` and
+returns `home_capability_ceiling` for any higher rank. Deactivating or moving an
+agent remains a separate lifecycle action.
 
 ### Credential mint
 
@@ -221,6 +231,10 @@ The credential path preserves the existing security invariants:
 - never log, persist, or place the raw token in a durable receipt; and
 - default the home grant to `member`, with `observer` as the only lower preset.
 
+The home grant belongs to the canonical member identity, not to an individual
+token. The first mint chooses `observer` or `member`; additional credentials
+inherit that committed home grant and may not silently raise or lower it.
+
 The result includes:
 
 - token ID, agent ID, canonical member ID, label, and created time;
@@ -231,7 +245,14 @@ The result includes:
 - a warning that the raw token cannot be recovered.
 
 Generated snippets use Streamable HTTP (`type: "http"` where required), never
-SSE.
+SSE. Their origin and `agent_connection_receipts.endpoint` use the existing
+`canonicalOrigin()` helper introduced by #88, but this flow first requires a
+configured, parseable `PUBLIC_ORIGIN`. Deployed origins must use HTTPS; HTTP is
+accepted only when the parsed hostname is exactly `localhost`, `127.0.0.1`, or
+`[::1]` for local development and tests. Missing, malformed, or otherwise
+insecure configuration returns `public_origin_unconfigured` before reservation
+or credential mutation. Provisioning never accepts the request/`Host`-derived
+fallback from `canonicalOrigin()` for snippets or receipts.
 
 ## Persistence Contract
 
@@ -635,7 +656,9 @@ The flow returns stable, actionable errors:
 - `agent_identity_unminted`;
 - `agent_inactive`;
 - `home_squad_immutable`;
+- `home_capability_ceiling`;
 - `squad_not_found`;
+- `public_origin_unconfigured`;
 - `forbidden`;
 - `cannot_grant_above_own_rank`;
 - `request_id_conflict`;
@@ -658,6 +681,8 @@ Use SQLite/D1-backed tests for:
 - existing unminted agent connection;
 - existing minted agent connection reusing one member identity;
 - additional squad synchronization across `memberships` and `capabilities`;
+- home-squad `lead`, `admin`, and `owner` refusal through provisioning,
+  `setAgentSquadAccess`, `grant_agent_capability`, and direct mint;
 - idempotent retry and conflicting retry;
 - same request string from different actors and tenants without collision;
 - two different request IDs racing for one unminted agent;
@@ -697,6 +722,12 @@ token for the same agent, wrong agent, cross-tenant receipt ID, callback replay,
 poll authorization, and a Worker failure after issuance but before the raw
 credential response.
 
+Generated-configuration tests set a malicious request `Host` while pinning a
+different `PUBLIC_ORIGIN` and require every snippet plus `receipt.endpoint` to
+use only the pinned origin. Missing, malformed, and non-loopback HTTP
+`PUBLIC_ORIGIN` cases must fail before any request, binding, token, or receipt
+write; pinned loopback HTTP remains valid for Wrangler local tests.
+
 ### Browser coverage
 
 Cover:
@@ -719,6 +750,19 @@ Cover:
 4. Add the dashboard wizard and generated configurations.
 5. Add connection verification and the durable receipt page.
 6. Deprecate independent UI entry points after parity evidence is green.
+
+### Implementation PR acceptance checklist
+
+- The migration and service enforce the permanent `observer|member`
+  home-squad capability ceiling at every entry point.
+- All generated configurations and `receipt.endpoint` use the #88
+  `canonicalOrigin()` path with a valid pinned `PUBLIC_ORIGIN`—HTTPS except for
+  explicit loopback HTTP; no Host-derived fallback reaches durable or
+  copy-paste output.
+- `POST /api/org/agents/:id/memberships` moves from `lead` to `admin` on the
+  target squad when it delegates to `setAgentSquadAccess`.
+- The wizard is not enabled until the migration/service and rollout step 3's
+  sole synchronized-writer routing are landed and green.
 
 No production deployment, credential mint, agent mutation, or existing-token
 revocation is authorized by this design.
