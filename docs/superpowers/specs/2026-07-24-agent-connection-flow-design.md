@@ -145,16 +145,36 @@ The service checks every affected scope before making any write.
 
 ### Canonical agent authorization identity
 
-The service resolves active `member_tokens` rows welded to the agent:
+Migration `0071_agent_connections.sql` introduces
+`agent_member_bindings(tenant, agent_id, member_id)`. This is the canonical
+authorization weld. Its database keys are:
 
-- no active identity: create one dedicated member envelope as part of this
-  operation;
-- exactly one active identity: reuse it;
-- more than one active identity: fail closed with
-  `agent_identity_ambiguous`.
+- `PRIMARY KEY (tenant, agent_id)`, so an agent has at most one member identity;
+- `UNIQUE (tenant, member_id)`, so a dedicated agent member cannot represent a
+  second agent; and
+- insert/update guards on agent-bound `member_tokens` requiring a matching
+  `(tenant, agent_id, member_id)` binding. Multiple live tokens may therefore
+  exist for one agent, but all must weld to the same member.
+
+The service resolves the binding, not whichever active token happens to be
+returned first:
+
+- no binding and no historical welded token: atomically create one dedicated
+  member and claim the binding;
+- one binding: reuse its member;
+- welded tokens for more than one historical member: fail closed with
+  `agent_identity_ambiguous`;
+- a token whose agent and member do not match the binding: reject it as
+  `agent_identity_conflict`.
 
 Retries and additional token mints always reuse the canonical identity. They
 never create another `members` row for the same logical agent.
+
+Before migration, a deployment preflight groups all welded tokens, including
+revoked tokens, by `(tenant, agent_id)` and blocks if any agent has more than one
+distinct `member_id`. It also blocks tenant-null welded rows. The migration
+backfills only unambiguous bindings; it never chooses a winner for ambiguous
+legacy data.
 
 ### Synchronized squad access
 
@@ -213,7 +233,172 @@ The result includes:
 Generated snippets use Streamable HTTP (`type: "http"` where required), never
 SSE.
 
-## Idempotency and Atomicity
+## Persistence Contract
+
+Migration `0071_agent_connections.sql` is part of this change. The
+implementation may not invent request or receipt fields later in the PR.
+
+### Canonical identity table
+
+```sql
+CREATE TABLE agent_member_bindings (
+  tenant     TEXT NOT NULL,
+  agent_id   TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+  member_id  TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (tenant, agent_id),
+  UNIQUE (tenant, member_id)
+);
+```
+
+The same migration adds `BEFORE INSERT` and `BEFORE UPDATE OF tenant, agent_id,
+member_id` triggers on `member_tokens`. For any non-null `agent_id`, the trigger
+raises `agent_identity_conflict` unless
+`agent_member_bindings(tenant, agent_id, member_id)` exists. Human tokens with a
+null `agent_id` are unchanged. Bindings have no normal update path: a
+`BEFORE UPDATE` trigger rejects mutation, and deletion is rejected while any
+welded token exists. This is stronger than a partial unique index on live tokens
+because revoking every token cannot make Mupot forget the canonical identity.
+
+### Request table
+
+`agent_connection_requests` is the mutable operation state:
+
+```sql
+CREATE TABLE agent_connection_requests (
+  tenant              TEXT NOT NULL,
+  actor_kind          TEXT NOT NULL CHECK (actor_kind IN ('user','member')),
+  actor_id            TEXT NOT NULL,
+  request_id          TEXT NOT NULL,
+  request_fingerprint TEXT NOT NULL,
+  target_key          TEXT NOT NULL,
+  agent_mode          TEXT NOT NULL CHECK (agent_mode IN ('new','existing')),
+  credential_action   TEXT NOT NULL CHECK (
+    credential_action IN ('issue_if_missing','add','replace')
+  ),
+  replace_token_id    TEXT,
+  status              TEXT NOT NULL CHECK (
+    status IN (
+      'pending','credential_issued','client_connected',
+      'messaging_verified','failed','expired'
+    )
+  ),
+  agent_id            TEXT,
+  member_id           TEXT,
+  token_id            TEXT,
+  receipt_id          TEXT,
+  error_code          TEXT,
+  created_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL,
+  finalized_at        TEXT,
+  expires_at          TEXT NOT NULL,
+  PRIMARY KEY (tenant, actor_kind, actor_id, request_id),
+  UNIQUE (receipt_id),
+  CHECK (
+    length(request_fingerprint) = 64
+    AND request_fingerprint = lower(request_fingerprint)
+    AND request_fingerprint NOT GLOB '*[^0-9a-f]*'
+  ),
+  CHECK (
+    (credential_action = 'replace' AND replace_token_id IS NOT NULL)
+    OR (credential_action <> 'replace' AND replace_token_id IS NULL)
+  )
+);
+
+CREATE UNIQUE INDEX idx_agent_connection_one_pending_target
+  ON agent_connection_requests (tenant, target_key)
+  WHERE status = 'pending';
+```
+
+`target_key` is server-normalized as `agent:<agent-id>` for an existing agent or
+`new:<home-squad-id>:<normalized-slug>` for a proposed agent. It is never
+accepted from the client.
+
+### Receipt table
+
+`agent_connection_receipts` is the durable, non-secret result:
+
+```sql
+CREATE TABLE agent_connection_receipts (
+  id                          TEXT PRIMARY KEY,
+  tenant                      TEXT NOT NULL,
+  actor_kind                  TEXT NOT NULL CHECK (actor_kind IN ('user','member')),
+  actor_id                    TEXT NOT NULL,
+  request_id                  TEXT NOT NULL,
+  request_fingerprint         TEXT NOT NULL,
+  agent_id                    TEXT NOT NULL,
+  agent_slug                  TEXT NOT NULL,
+  agent_status_at_issue       TEXT NOT NULL,
+  member_id                   TEXT NOT NULL,
+  token_id                    TEXT NOT NULL,
+  agent_disposition           TEXT NOT NULL CHECK (
+    agent_disposition IN ('created','reused')
+  ),
+  credential_action           TEXT NOT NULL CHECK (
+    credential_action IN ('issue_if_missing','add','replace')
+  ),
+  home_squad_id               TEXT NOT NULL,
+  home_capability             TEXT NOT NULL CHECK (
+    home_capability IN ('member','observer')
+  ),
+  additional_access_json      TEXT NOT NULL DEFAULT '[]' CHECK (
+    json_valid(additional_access_json)
+    AND json_type(additional_access_json) = 'array'
+  ),
+  token_label                 TEXT NOT NULL,
+  endpoint                    TEXT NOT NULL,
+  transport                   TEXT NOT NULL CHECK (transport = 'streamable_http'),
+  verification_status         TEXT NOT NULL CHECK (
+    verification_status IN ('pending','pass','fail','expired')
+  ),
+  verification_challenge_hash TEXT,
+  verification_expires_at     TEXT,
+  client_connected_at         TEXT,
+  verification_message_id     TEXT,
+  verification_request_id     TEXT,
+  messaging_verified_at       TEXT,
+  verification_error_code     TEXT,
+  checks_json                 TEXT NOT NULL DEFAULT '{}' CHECK (
+    json_valid(checks_json) AND json_type(checks_json) = 'object'
+  ),
+  credential_issued_at        TEXT NOT NULL,
+  created_at                  TEXT NOT NULL,
+  updated_at                  TEXT NOT NULL
+);
+```
+
+`additional_access_json` is a canonical, squad-ID-sorted array of objects with
+exactly `{"squad_id": string, "capability":
+"observer"|"member"|"lead"|"admin"}`. `checks_json` has exactly the keys
+`boot_context`, `orient`, `send`, `inbox_peek`, and `cleanup`, each with
+`"not_run"`, `"pass"`, or `"fail"`. Parsing rejects extra keys or duplicate
+squad IDs before either value is stored.
+
+A migration trigger makes the provisioning snapshot columns immutable after
+insert. Updates may change only the verification columns from
+`verification_status` through `checks_json`, plus `updated_at`. The receipt page
+re-reads live token revocation state by `token_id`; revocation is not copied as
+a mutable receipt fact.
+
+Neither table stores a raw token, token hash, generated client configuration,
+verification challenge plaintext, or message body.
+
+### Retention
+
+- `pending` requests expire after 24 hours.
+- Final request rows are retained for 30 days, defining the supported
+  idempotency window, then purged by the scheduled maintenance job.
+- Receipts are retained for 365 days, then purged by the same job unless a
+  tenant audit-retention policy requires longer retention.
+- Verification challenges expire after 15 minutes. Their hashes are cleared on
+  pass or expiry.
+- The exact loopback setup message is deleted immediately after verification;
+  no general inbox cleanup is allowed.
+
+The retention intervals are constants owned by the agent-connection service and
+covered by tests; handlers cannot override them.
+
+## Idempotency, Concurrency, and Atomicity
 
 ### Request identity
 
@@ -221,29 +406,70 @@ Every setup submission carries a caller-generated `request_id` and a
 server-computed fingerprint of the normalized request. Mupot stores a
 non-secret request record with status and resulting resource IDs.
 
+- request identity is scoped by `(tenant, actor_kind, actor_id, request_id)`;
+- the tenant and actor are authentication-derived, never client fields;
 - same `request_id`, same fingerprint, still running: return `in_progress`;
 - same `request_id`, same fingerprint, completed: return the non-secret receipt
   and `credential_already_issued`;
 - same `request_id`, different fingerprint: return `request_id_conflict`.
+
+A different actor may use the same request string without collision. An actor in
+one tenant cannot reserve or poison another tenant's request ID. The API never
+looks up a request by bare `request_id`.
 
 A completed retry never mints another token implicitly. Because raw credentials
 are intentionally not persisted, a lost show-once response requires an explicit
 **Replace credential** action that revokes the lost token and mints a new one
 under a new request ID.
 
-### Write boundary
+### Concurrent different request IDs
 
-For a new agent, the service commits the agent, home membership, canonical
-member identity, all capability grants, all additional memberships, welded
-token hash, request record, and receipt in one D1 transactional batch.
+The partial unique index on `(tenant, target_key)` serializes setup mutation for
+one logical target, even when requests have different IDs or actors.
 
-For an existing agent, it commits missing synchronized access rows, the welded
-token hash, request record, and receipt in one transactional batch after
-canonical identity validation.
+- If two requests race while one is `pending`, the loser receives
+  `agent_setup_in_progress`. It receives no other actor's request or receipt
+  identifiers.
+- Before reserving, the service conditionally marks an expired `pending` row
+  for that target as `expired`; callers do not wait for the scheduled sweep to
+  release a stale reservation.
+- For new agents, `target_key` plus existing `UNIQUE(squad_id, slug)` prevents
+  duplicate rows.
+- For an unminted existing agent, both contenders may observe no binding, but
+  only one can insert `(tenant, agent_id)`. A conflict causes the loser to
+  re-read and reuse the winning member; it never creates a second member.
+- The compatibility `mint_agent_token` primitive uses the same binding claim.
+  If two direct mints race, the losing batch rolls back its provisional member,
+  re-reads the winner's binding, and mints against that member.
+- After the winner completes, retrying `issue_if_missing` returns
+  `agent_already_connected` and the authorized non-secret state without minting.
+- `add` intentionally creates another credential on a new request after the
+  first operation finishes, but it must use the existing binding.
+- `replace` requires `replace_token_id`; the revoke and replacement insert occur
+  together and fail if that token is no longer live or does not match the
+  canonical agent/member.
 
-Unique constraints and conditional writes enforce idempotency at the database
-boundary. If any required statement fails or reports no write receipt, the
-batch fails and no raw credential is returned.
+### Write boundaries
+
+Setup uses three explicit boundaries because verification requires a client
+round trip:
+
+1. **Reservation batch:** insert the actor-scoped request in `pending`. A target
+   uniqueness conflict returns `agent_setup_in_progress`.
+2. **Provisioning batch:** conditionally require that exact request to remain
+   `pending`, then commit the new-or-reused agent, home membership, canonical
+   binding, capabilities, additional memberships, welded token hash, request
+   status, and receipt. The raw token exists only in Worker memory and is
+   returned only after this batch succeeds.
+3. **Verification batch:** after the agent-bound callback, commit the tool
+   outcomes, exact cleanup result, verification status, and request status.
+
+Each batch is transactional. Every state transition has a conditional
+`WHERE status = <expected>` guard and must report exactly one changed row.
+Constraint or row-count failure rolls back that entire batch. If the Worker
+commits credential issuance but dies before returning the raw value, a retry
+does not mint again; it reports `credential_already_issued` and requires the
+explicit replacement flow.
 
 ## Dashboard Flow
 
@@ -270,6 +496,8 @@ the operator can create another one.
 
 - choose a bounded label;
 - choose `member` or `observer` for the home credential preset;
+- for an already connected agent, explicitly choose **Issue additional
+  credential** or **Replace credential**; simply revisiting setup never mints;
 - submit once using the stable `request_id`.
 
 ### Step 4: Connect
@@ -282,21 +510,45 @@ The page also displays a stable non-secret setup receipt URL.
 
 ### Step 5: Verify
 
-The guided verification asks the newly configured client to perform:
+Verification uses an agent-bound MCP callback, followed by owner-UI polling. It
+does not depend on the browser receiving a webhook from the client or asking the
+operator to paste tool output.
 
-1. `boot_context {}`;
-2. `orient {}`;
-3. a correlated loopback `send` to its own agent identity; and
-4. `inbox { peek: true }`, confirming the same correlation without consuming
-   unrelated messages.
+1. The show-once page displays `receipt_id` and a 15-minute verification
+   challenge alongside the generated client configuration. Only its SHA-256
+   hash is stored.
+2. After installing the configuration, the operator asks that client to call
+   `verify_agent_connection { receipt_id, challenge }` using the new key.
+3. MCP authentication derives `token_id`, `member_id`, `bound_agent_id`, and
+   tenant from the bearer token. The callback requires all four to match the
+   receipt before recording `client_connected_at`.
+4. The callback invokes the same service functions used by `boot_context`,
+   `orient`, `send`, and `inbox { peek: true }`. It sends one deterministic
+   loopback `request` message, peeks for that exact message, records the
+   outcomes, and deletes only that message by ID.
+5. The owner page polls
+   `GET /api/agent-connections/:receipt_id/status` with its authenticated
+   dashboard session. The endpoint re-authorizes receipt access on every poll
+   and returns only non-secret status. Polling stops at `messaging_verified`,
+   `fail`, or challenge expiry; manual refresh is equivalent.
 
 Mupot records only the request ID, token ID, agent ID, tool outcomes, message
 correlation ID, timestamps, and pass/fail status. It does not record the raw
 credential or message body.
 
-The loopback verification message uses a dedicated setup kind and correlation.
-After proof is recorded, Mupot removes only that exact setup message by ID so
-verification does not pollute the operational inbox.
+The callback is the client-to-Mupot reporting path. It proves that the newly
+installed bearer key authenticated as the intended token and agent. Reusing the
+canonical service functions makes the product check exercise the same behavior
+as the four public tools; surface-level integration tests still call those
+tools directly to catch handler or schema drift.
+
+The loopback uses `kind = request` and
+`request_id = agent-connection:<receipt-id>`. A replay returns the already
+recorded result. Challenge mismatch, expired challenge, wrong token, wrong
+member, wrong agent, or wrong tenant fails closed without revealing which
+binding differed. A failed verification attempt records `fail` but may be
+retried with the same bound token while the challenge remains live; a pass is
+terminal.
 
 The completion page distinguishes:
 
@@ -311,12 +563,35 @@ Add one high-level tool named `provision_agent_connection`, with the same input
 and service as the dashboard. The name deliberately avoids collision with the
 existing session-local `connect` tool.
 
-Existing tools remain supported but delegate:
+The primitive/full-provision boundary is explicit:
 
-- `create_agent` delegates agent creation to the shared service primitive;
-- `mint_agent_token` delegates canonical identity and credential minting;
-- `grant_agent_capability` delegates synchronized squad access; and
-- the REST membership route delegates synchronized squad access.
+| Entry point | May create agent row | May create binding/member | May mint token | Unminted behavior |
+| --- | ---: | ---: | ---: | --- |
+| `create_agent` | yes | no | no | returns the unminted agent |
+| `mint_agent_token` | no | yes | yes | atomically creates or claims the canonical binding |
+| `grant_agent_capability` | no | no | no | refuses `agent_identity_unminted` |
+| REST squad-membership route | no | no | no | refuses `agent_identity_unminted` |
+| `setAgentSquadAccess` service | no | no | no | requires an explicit canonical `memberId` |
+| `provision_agent_connection` | yes, for `new_agent` | yes | yes | owns the complete create-or-reuse sequence |
+
+`create_agent` delegates only to the existing agent primitive that creates the
+agent and home routing membership. It must never create a member, capability,
+binding, or token as a side effect.
+
+`grant_agent_capability`, `register_agent_key`, and the REST membership route
+are compatibility primitives, not provisioning shortcuts. They do not
+create-on-missing. An unminted agent returns `agent_identity_unminted` with
+`provision_agent_connection` or `mint_agent_token` as the explicit next action.
+An ambiguous or conflicting binding always refuses.
+
+`mint_agent_token` remains the narrow credential primitive. It may establish a
+missing canonical binding because that is the credential operation's declared
+purpose, but it may not create an agent or add cross-squad access.
+
+Add the agent-bound `verify_agent_connection` callback described above. MCP
+authentication must expose the server-derived `tokenId` in `AuthContext` so the
+callback can bind evidence to the exact issued token; client input can never
+supply or override that ID.
 
 The session-local `connect` tool remains a read-only compatibility bridge. Its
 response must state that it has not completed permanent setup and link callers
@@ -331,7 +606,7 @@ instead of only describing the missing weld.
 The receipt is derived from committed state and is safe to revisit. It contains:
 
 - setup request ID and status;
-- agent ID, slug, status, and whether it was created or reused;
+- agent ID, slug, status-at-issue, and whether it was created or reused;
 - home squad;
 - additional squad access and effective capability;
 - canonical member ID;
@@ -340,8 +615,14 @@ The receipt is derived from committed state and is safe to revisit. It contains:
 - verification outcomes and timestamps; and
 - links to the agent, squad, access, and operations pages.
 
+Immutable receipt columns preserve the issuance-time snapshot. The page labels
+separately joined current facts—agent status, token revocation, and current
+access—as **current state**, so later administrative changes do not rewrite
+history.
+
 It never contains a raw token, token hash, session cookie, OAuth credential,
-signing private key, or message body.
+signing private key, verification challenge plaintext, generated configuration,
+or message body.
 
 ## Error Handling
 
@@ -350,12 +631,16 @@ The flow returns stable, actionable errors:
 - `agent_not_found`;
 - `agent_slug_ambiguous`;
 - `agent_identity_ambiguous`;
+- `agent_identity_conflict`;
+- `agent_identity_unminted`;
 - `agent_inactive`;
 - `home_squad_immutable`;
 - `squad_not_found`;
 - `forbidden`;
 - `cannot_grant_above_own_rank`;
 - `request_id_conflict`;
+- `agent_setup_in_progress`;
+- `agent_already_connected`;
 - `credential_already_issued`;
 - `receipt_failed`; and
 - `verification_incomplete`.
@@ -374,8 +659,17 @@ Use SQLite/D1-backed tests for:
 - existing minted agent connection reusing one member identity;
 - additional squad synchronization across `memberships` and `capabilities`;
 - idempotent retry and conflicting retry;
+- same request string from different actors and tenants without collision;
+- two different request IDs racing for one unminted agent;
+- two different actors racing for one target without leaking request metadata;
+- concurrent `issue_if_missing`, explicit `add`, and explicit `replace`
+  semantics;
+- database refusal of an agent token whose member differs from the canonical
+  binding;
 - partial-write rollback;
 - ambiguous identity refusal;
+- unminted `grant_agent_capability`, `register_agent_key`, and REST membership
+  refusal without identity creation;
 - grant-above-caller refusal;
 - inactive, revoked, and cross-tenant refusal; and
 - explicit credential replacement after a lost show-once response.
@@ -393,8 +687,15 @@ Using the issued agent-bound token, integration tests call:
 - `orient` without an explicit agent;
 - `send` with a unique setup correlation;
 - `inbox { peek: true }` and assert the matching message;
+- `verify_agent_connection` and assert that its authenticated token, member,
+  agent, and tenant match the receipt;
 - cleanup of only the exact setup message; and
 - a human/workspace token negative matrix returning `not_agent_bound`.
+
+The verification matrix also covers wrong/expired challenge, wrong issued
+token for the same agent, wrong agent, cross-tenant receipt ID, callback replay,
+poll authorization, and a Worker failure after issuance but before the raw
+credential response.
 
 ### Browser coverage
 
@@ -410,7 +711,9 @@ Cover:
 
 ## Rollout
 
-1. Add idempotency and receipt storage.
+1. Run the legacy-weld preflight and add migration
+   `0071_agent_connections.sql` with canonical bindings, token guards, request
+   storage, receipt storage, and the pending-target unique index.
 2. Add the orchestration and synchronized squad-access services.
 3. Route existing MCP and REST primitives through the shared services.
 4. Add the dashboard wizard and generated configurations.
