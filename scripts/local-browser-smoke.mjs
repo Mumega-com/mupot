@@ -245,18 +245,21 @@ async function runLoginWorkflow() {
   })
 }
 
-async function runAgentConnectionWorkflow() {
-  await page.goto(`${baseUrl}/agents/connect`, { waitUntil: 'networkidle', timeout: 20_000 })
-  await page.locator('#new-name').fill(connectionAgentName)
-  await page.locator('#new-slug').fill(connectionAgentSlug)
-  await page.locator('#new-role').fill('member')
-  await page.locator('#new-model').fill('local-fixture')
-  await page.locator('#new-home').selectOption('sq-growth')
-  await page.locator('#choose-new').click()
-  await page.locator('#search-status').filter({ hasText: 'New identity selected' }).waitFor({ timeout: 10_000 })
+async function selectAdditionalAgentAccess(squadId, capability = 'member') {
+  const row = page.locator(`[data-access-row][data-squad-id="${squadId}"]`)
+  await row.waitFor({ state: 'visible', timeout: 10_000 })
+  await row.locator('[data-access-check]').check()
+  await row.locator('[data-access-capability]').selectOption(capability)
+}
 
-  await page.locator('#credential-label').fill('Local browser connection')
-  await page.locator('#home-capability').selectOption('member')
+async function completeAgentConnection({
+  expectedAgentId,
+  expectedAgentSlug,
+  expectedDisposition,
+  expectedHomeSquadId,
+  expectedAdditionalSquadId,
+  screenshotName,
+}) {
   await page.locator('#provision-button').click()
   await page.locator('#step-connect').waitFor({ state: 'visible', timeout: 20_000 })
   await page.locator('#step-verify').waitFor({ state: 'visible', timeout: 20_000 })
@@ -322,6 +325,67 @@ async function runAgentConnectionWorkflow() {
       resultStatus: verification?.result?.structuredContent?.status ?? null,
     })
   }
+
+  const statusResponse = await context.request.get(
+    `${baseUrl}/api/agent-connections/${encodeURIComponent(receiptId)}/status`,
+    { timeout: 20_000 },
+  )
+  const status = await statusResponse.json().catch(() => null)
+  const expectedSquads = [expectedHomeSquadId, expectedAdditionalSquadId]
+  const accessSynchronized = expectedSquads.every((squadId) => (
+    status?.current?.access?.filter((entry) => (
+      entry.squad_id === squadId && entry.synchronized === true
+    )).length === 1
+  )) && status?.current?.access?.length === expectedSquads.length
+  const verificationChecks = status?.verification?.checks
+  if (
+    statusResponse.status() !== 200
+    || status?.issuance?.agent?.slug !== expectedAgentSlug
+    || status?.issuance?.agent?.disposition !== expectedDisposition
+    || status?.issuance?.home_squad_id !== expectedHomeSquadId
+    || (expectedAgentId && status?.issuance?.agent?.id !== expectedAgentId)
+    || !status?.issuance?.additional_access?.some((entry) => (
+      entry.squadId === expectedAdditionalSquadId && entry.capability === 'member'
+    ))
+    || !accessSynchronized
+    || status?.verification?.status !== 'pass'
+    || verificationChecks?.orient?.status !== 'pass'
+    || verificationChecks?.send?.status !== 'pass'
+    || verificationChecks?.inbox_peek?.status !== 'pass'
+  ) {
+    fail('agent connection status did not prove identity, access, and messaging', {
+      httpStatus: statusResponse.status(),
+      agentId: status?.issuance?.agent?.id ?? null,
+      agentSlug: status?.issuance?.agent?.slug ?? null,
+      disposition: status?.issuance?.agent?.disposition ?? null,
+      homeSquadId: status?.issuance?.home_squad_id ?? null,
+      additionalAccess: status?.issuance?.additional_access ?? null,
+      currentAccess: status?.current?.access ?? null,
+      verificationStatus: status?.verification?.status ?? null,
+      verificationChecks: verificationChecks ?? null,
+    })
+  }
+
+  const searchResponse = await context.request.get(
+    `${baseUrl}/agents/connect/search?q=${encodeURIComponent(expectedAgentSlug)}`,
+    { timeout: 20_000 },
+  )
+  const search = await searchResponse.json().catch(() => null)
+  const exactIdentities = search?.candidates?.filter((candidate) => (
+    candidate.slug === expectedAgentSlug
+  )) ?? []
+  if (
+    searchResponse.status() !== 200
+    || exactIdentities.length !== 1
+    || exactIdentities[0]?.id !== status.issuance.agent.id
+  ) {
+    fail('agent connection identity was not canonical after provisioning', {
+      httpStatus: searchResponse.status(),
+      exactIdentityCount: exactIdentities.length,
+      expectedAgentSlug,
+    })
+  }
+
   const serializedVerification = JSON.stringify(verification)
   if (
     serializedVerification.includes(credential)
@@ -342,19 +406,77 @@ async function runAgentConnectionWorkflow() {
     fail('durable agent connection receipt exposed show-once material')
   }
   await page.screenshot({
-    path: path.join(artifactsDir, 'agent-connection-receipt.png'),
+    path: path.join(artifactsDir, screenshotName),
     fullPage: true,
   })
 
+  return {
+    receiptId,
+    agentId: status.issuance.agent.id,
+    credentialShownOnce: true,
+    configurationSeparated: true,
+    messagingVerified: true,
+    additionalAccessSynchronized: true,
+    canonicalIdentityCount: exactIdentities.length,
+    durableReceiptSecretFree: true,
+  }
+}
+
+async function runAgentConnectionWorkflow() {
+  await page.goto(`${baseUrl}/agents/connect`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.locator('#new-name').fill(connectionAgentName)
+  await page.locator('#new-slug').fill(connectionAgentSlug)
+  await page.locator('#new-role').fill('member')
+  await page.locator('#new-model').fill('local-fixture')
+  await page.locator('#new-home').selectOption('sq-growth')
+  await page.locator('#choose-new').click()
+  await page.locator('#search-status').filter({ hasText: 'New identity selected' }).waitFor({ timeout: 10_000 })
+  await selectAdditionalAgentAccess('sq-operations')
+  await page.locator('#credential-label').fill('Local browser connection')
+  await page.locator('#home-capability').selectOption('member')
+
+  const evidence = await completeAgentConnection({
+    expectedAgentSlug: connectionAgentSlug,
+    expectedDisposition: 'created',
+    expectedHomeSquadId: 'sq-growth',
+    expectedAdditionalSquadId: 'sq-operations',
+    screenshotName: 'agent-connection-new-receipt.png',
+  })
   workflows.push({
     name: 'owner create-connect-verify agent journey',
     status: 'passed',
     agentSlug: connectionAgentSlug,
-    receiptId,
-    credentialShownOnce: true,
-    configurationSeparated: true,
-    messagingVerified: true,
-    durableReceiptSecretFree: true,
+    ...evidence,
+    existingIdentityReused: false,
+  })
+}
+
+async function runExistingAgentConnectionWorkflow() {
+  await page.goto(`${baseUrl}/agents/connect`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.locator('#agent-search').fill('browser-existing')
+  await page.locator('#search-button').click()
+  await page.locator('#search-status').filter({ hasText: '1 candidate(s)' }).waitFor({ timeout: 10_000 })
+  await page.getByRole('button', { name: 'Use this identity' }).click()
+  await page.locator('#agent-choice').filter({ hasText: 'existing identity selected' }).waitFor({ timeout: 10_000 })
+  await page.locator('#home-summary').filter({ hasText: 'Operations Local · immutable' }).waitFor({ timeout: 10_000 })
+  await selectAdditionalAgentAccess('sq-growth')
+  await page.locator('#credential-label').fill('Local existing-agent connection')
+  await page.locator('#home-capability').selectOption('member')
+
+  const evidence = await completeAgentConnection({
+    expectedAgentId: 'agent-browser-existing',
+    expectedAgentSlug: 'browser-existing',
+    expectedDisposition: 'reused',
+    expectedHomeSquadId: 'sq-operations',
+    expectedAdditionalSquadId: 'sq-growth',
+    screenshotName: 'agent-connection-existing-receipt.png',
+  })
+  workflows.push({
+    name: 'owner connect existing agent journey',
+    status: 'passed',
+    agentSlug: 'browser-existing',
+    ...evidence,
+    existingIdentityReused: true,
   })
 }
 
@@ -974,6 +1096,7 @@ export async function runLocalBrowserSmoke() {
 
     await runProjectWorkspaceWorkflow()
     await runAgentConnectionWorkflow()
+    await runExistingAgentConnectionWorkflow()
     await runSendTaskWorkflow()
     await runApprovalWorkflow()
 
