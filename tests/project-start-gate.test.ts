@@ -107,7 +107,7 @@ function makeDeps(overrides: Partial<StartGateDeps> = {}): StartGateDeps {
     })),
     revokeMemberToken: vi.fn(async () => true),
     resolveActiveAgentMember: vi.fn(async () => 'unminted' as const),
-    upsertActiveAgentCapabilityGrant: vi.fn(async () => ({ result: 'created' as const })),
+    setAgentSquadAccess: vi.fn(async () => ({ ok: true as const, result: 'created' as const })),
     createTask: vi.fn(async (_env, input) => ({
       id: 'task-seed-1',
       squad_id: input.squad_id,
@@ -155,7 +155,7 @@ describe('commitSquadResource (existing grant path)', () => {
         {
           mintAgentBoundToken: mint,
           resolveActiveAgentMember: async () => 'unminted',
-          upsertActiveAgentCapabilityGrant: async () => ({ result: 'created' }),
+          setAgentSquadAccess: async () => ({ ok: true, result: 'created' }),
         },
       )
       expect(result).toEqual({ kind: 'minted', memberId: 'mem', tokenId: 'tok' })
@@ -165,24 +165,24 @@ describe('commitSquadResource (existing grant path)', () => {
     }
   })
 
-  it('confirms via upsertActiveAgentCapabilityGrant when already welded', async () => {
+  it('confirms via setAgentSquadAccess when already welded', async () => {
     const harness = makeHarness()
     const env = envFor(harness)
     try {
-      const upsert = vi.fn(async () => ({ result: 'unchanged' as const }))
+      const upsert = vi.fn(async () => ({ ok: true as const, result: 'unchanged' as const }))
       const result = await commitSquadResource(
         env,
         { id: 'agent-a', squad_id: 'squad-a', slug: 'agent-a', name: 'Agent A' },
         {
           mintAgentBoundToken: async () => ({ tokenId: 'tok', memberId: 'mem' }),
           resolveActiveAgentMember: async () => 'mem-existing',
-          upsertActiveAgentCapabilityGrant: upsert,
+          setAgentSquadAccess: upsert,
         },
       )
       expect(result).toEqual({ kind: 'confirmed', memberId: 'mem-existing', tokenId: null })
       expect(upsert).toHaveBeenCalledWith(env, expect.objectContaining({
         agentId: 'agent-a',
-        expectedMemberId: 'mem-existing',
+        memberId: 'mem-existing',
         squadId: 'squad-a',
         capability: 'member',
       }))
@@ -201,7 +201,7 @@ describe('commitSquadResource (existing grant path)', () => {
         {
           mintAgentBoundToken: async () => ({ tokenId: 'tok', memberId: 'mem' }),
           resolveActiveAgentMember: async () => 'ambiguous',
-          upsertActiveAgentCapabilityGrant: async () => ({ result: 'created' }),
+          setAgentSquadAccess: async () => ({ ok: true, result: 'created' }),
         },
       )
       expect(result).toBeNull()

@@ -42,10 +42,45 @@ SELECT tenant, agent_id, MIN(member_id), MIN(created_at)
  WHERE agent_id IS NOT NULL
  GROUP BY tenant, agent_id;
 
+-- The home capability is an identity property, permanently capped at member.
+-- Refuse rollout if historical state already violates that invariant.
+CREATE TABLE agent_home_capability_migration_guard (
+  ok INTEGER NOT NULL CHECK (ok = 1)
+);
+
+INSERT INTO agent_home_capability_migration_guard (ok)
+SELECT 0
+  FROM agent_member_bindings b
+  JOIN agents a ON a.id = b.agent_id
+  JOIN capabilities c
+    ON c.member_id = b.member_id
+   AND c.scope_type = 'squad'
+   AND c.scope_id = a.squad_id
+ WHERE c.capability NOT IN ('observer', 'member')
+ LIMIT 1;
+
+DROP TABLE agent_home_capability_migration_guard;
+
 CREATE TRIGGER agent_member_bindings_no_update
 BEFORE UPDATE ON agent_member_bindings
 BEGIN
   SELECT RAISE(ABORT, 'agent_identity_conflict');
+END;
+
+CREATE TRIGGER agent_member_bindings_home_capability_ceiling
+BEFORE INSERT ON agent_member_bindings
+WHEN EXISTS (
+  SELECT 1
+    FROM agents a
+    JOIN capabilities c
+      ON c.member_id = NEW.member_id
+     AND c.scope_type = 'squad'
+     AND c.scope_id = a.squad_id
+   WHERE a.id = NEW.agent_id
+     AND c.capability NOT IN ('observer', 'member')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'home_capability_ceiling');
 END;
 
 CREATE TRIGGER agent_member_bindings_delete_requires_no_tokens
@@ -86,6 +121,52 @@ WHEN NEW.agent_id IS NOT NULL
  )
 BEGIN
   SELECT RAISE(ABORT, 'agent_identity_conflict');
+END;
+
+CREATE TRIGGER agent_home_capability_ceiling_insert
+BEFORE INSERT ON capabilities
+WHEN NEW.scope_type = 'squad'
+ AND NEW.capability NOT IN ('observer', 'member')
+ AND EXISTS (
+   SELECT 1
+     FROM agent_member_bindings b
+     JOIN agents a ON a.id = b.agent_id
+    WHERE b.member_id = NEW.member_id
+      AND a.squad_id = NEW.scope_id
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'home_capability_ceiling');
+END;
+
+CREATE TRIGGER agent_home_capability_ceiling_update
+BEFORE UPDATE OF member_id, scope_type, scope_id, capability ON capabilities
+WHEN NEW.scope_type = 'squad'
+ AND NEW.capability NOT IN ('observer', 'member')
+ AND EXISTS (
+   SELECT 1
+     FROM agent_member_bindings b
+     JOIN agents a ON a.id = b.agent_id
+    WHERE b.member_id = NEW.member_id
+      AND a.squad_id = NEW.scope_id
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'home_capability_ceiling');
+END;
+
+CREATE TRIGGER agents_home_capability_ceiling_update
+BEFORE UPDATE OF squad_id ON agents
+WHEN EXISTS (
+  SELECT 1
+    FROM agent_member_bindings b
+    JOIN capabilities c
+      ON c.member_id = b.member_id
+     AND c.scope_type = 'squad'
+     AND c.scope_id = NEW.squad_id
+   WHERE b.agent_id = NEW.id
+     AND c.capability NOT IN ('observer', 'member')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'home_capability_ceiling');
 END;
 
 CREATE TABLE agent_connection_requests (

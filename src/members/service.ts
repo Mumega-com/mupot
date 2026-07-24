@@ -146,14 +146,16 @@ export type AgentMemberBinding =
   | { kind: 'bound'; memberId: string }
   | { kind: 'unminted' }
 
+export interface AgentBindingProof {
+  agentId: string
+  memberId: string
+  homeSquadId: string
+  disposition: 'creating' | 'existing'
+}
+
 export interface PreparedAgentTokenMint extends AgentMintResult {
   statements: D1PreparedStatement[]
-  bindingProof: {
-    agentId: string
-    memberId: string
-    homeSquadId: string
-    disposition: 'creating' | 'existing'
-  }
+  bindingProof: AgentBindingProof
 }
 
 /**
@@ -363,84 +365,6 @@ export async function resolveActiveAgentMember(
 export interface CapabilityGrantUpsertOutcome {
   grant: CapabilityGrant
   result: 'created' | 'updated' | 'unchanged'
-}
-
-export interface ActiveAgentCapabilityGrantInput {
-  agentId: string
-  expectedMemberId: string
-  squadId: string
-  capability: Capability
-}
-
-/**
- * Apply a squad grant only while the agent still has exactly the expected active
- * member binding. Identity validation, conflict handling, and outcome evidence
- * are evaluated by one SQLite statement.
- */
-export async function upsertActiveAgentCapabilityGrant(
-  env: Env,
-  input: ActiveAgentCapabilityGrantInput,
-): Promise<CapabilityGrantUpsertOutcome | null> {
-  const createdId = crypto.randomUUID()
-  const updatedId = crypto.randomUUID()
-  const rows = await env.DB.prepare(
-    `WITH active_identity AS MATERIALIZED (
-       SELECT DISTINCT t.member_id
-         FROM member_tokens t
-         JOIN members m ON m.id = t.member_id
-        WHERE t.tenant = ?1
-          AND t.agent_id = ?2
-          AND t.revoked_at IS NULL
-          AND m.tenant = ?1
-          AND m.status = 'active'
-        ORDER BY t.member_id
-        LIMIT 2
-     ),
-     prior_grant AS MATERIALIZED (
-       SELECT id, capability
-         FROM capabilities
-        WHERE member_id = ?3
-          AND scope_type = 'squad'
-          AND scope_id = ?5
-     )
-     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-     SELECT CASE
-              WHEN NOT EXISTS (SELECT 1 FROM prior_grant) THEN ?4
-              WHEN (SELECT capability FROM prior_grant) = ?6 THEN (SELECT id FROM prior_grant)
-              ELSE ?7
-            END,
-            member_id, 'squad', ?5, ?6
-       FROM active_identity
-      WHERE member_id = ?3
-        AND (SELECT COUNT(*) FROM active_identity) = 1
-     ON CONFLICT(member_id, scope_type, scope_id) DO UPDATE SET
-       id = excluded.id,
-       capability = excluded.capability
-     RETURNING id, member_id, scope_type, scope_id, capability`,
-  )
-    .bind(
-      env.TENANT_SLUG,
-      input.agentId,
-      input.expectedMemberId,
-      createdId,
-      input.squadId,
-      input.capability,
-      updatedId,
-    )
-    .all<CapabilityGrant & { id: string }>()
-
-  const row = rows.results?.[0]
-  if (!row) return null
-  const result = row.id === createdId ? 'created' : row.id === updatedId ? 'updated' : 'unchanged'
-  return {
-    grant: {
-      member_id: row.member_id,
-      scope_type: row.scope_type,
-      scope_id: row.scope_id,
-      capability: row.capability,
-    },
-    result,
-  }
 }
 
 /** Replace a member's grant on one scope and report the transaction's actual prior state. */

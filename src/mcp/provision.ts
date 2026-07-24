@@ -29,9 +29,9 @@ import { createDepartment, createSquad, createAgent, findAgentsByName, getAgentP
 import {
   mintAgentBoundToken,
   isAgentTokenCapability,
-  resolveActiveAgentMember,
-  upsertActiveAgentCapabilityGrant,
+  resolveAgentMemberBinding,
 } from '../members/service'
+import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
 import { mcpEndpoint, wakeContractForAgent } from '../dashboard/connect'
 import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
@@ -494,44 +494,34 @@ const toolGrantAgentCapability: ToolSpec = {
       return fail(403, 'cannot_grant_above_own_rank')
     }
 
-    const agentMemberId = await resolveActiveAgentMember(env, agent.id)
-    if (agentMemberId === 'unminted') {
+    const binding = await resolveAgentMemberBinding(env, agent.id)
+    if (binding.kind === 'unminted') {
       return fail(409, 'agent_identity_unminted', 'call mint_agent_token before granting capabilities')
     }
-    if (agentMemberId === 'ambiguous') {
-      return fail(409, 'agent_identity_ambiguous', 'revoke stale agent tokens until one active member identity remains')
-    }
 
-    const outcome = await upsertActiveAgentCapabilityGrant(env, {
+    const outcome = await setAgentSquadAccess(env, {
       agentId: agent.id,
-      expectedMemberId: agentMemberId,
+      memberId: binding.memberId,
       squadId: squad.id,
-      capability,
+      capability: capability as AgentAccessCapability,
     })
-    if (!outcome) {
-      const currentIdentity = await resolveActiveAgentMember(env, agent.id)
-      if (currentIdentity === 'unminted') {
-        return fail(409, 'agent_identity_unminted', 'call mint_agent_token before granting capabilities')
-      }
-      if (currentIdentity === 'ambiguous') {
-        return fail(409, 'agent_identity_ambiguous', 'revoke stale agent tokens until one active member identity remains')
-      }
-      if (currentIdentity === agentMemberId) {
-        return fail(500, 'receipt_failed', 'capability grant returned no write receipt')
-      }
-      return fail(409, 'agent_identity_changed', 'agent member binding changed; retry the grant')
+    if (!outcome.ok) {
+      if (outcome.error === 'agent_not_found') return fail(404, outcome.error)
+      if (outcome.error === 'squad_not_found') return fail(404, outcome.error)
+      if (outcome.error === 'receipt_failed') return fail(500, outcome.error)
+      return fail(409, outcome.error)
     }
     await emitProvisioned(env, auth.memberId as string, 'capability', squad.id, {
       squad_id: squad.id,
       agent_id: agent.id,
-      member_id: agentMemberId,
+      member_id: binding.memberId,
       capability,
     })
 
     return done({
       agent: { id: agent.id },
       squad: { id: squad.id },
-      member_id: agentMemberId,
+      member_id: binding.memberId,
       grant: outcome.grant,
       result: outcome.result,
     })

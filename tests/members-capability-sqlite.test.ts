@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   resolveActiveAgentMember,
-  upsertActiveAgentCapabilityGrant,
   upsertCapabilityGrant,
 } from '../src/members/service'
 import type { CapabilityGrant, Env } from '../src/types'
@@ -121,51 +120,6 @@ describe('SQLite-backed capability grant state', () => {
     bindAgent(harness.sqlite, 'member-product')
 
     await expect(resolveActiveAgentMember(env, AGENT_ID)).resolves.toBe('member-product')
-  })
-
-  it('rejects a changed or ambiguous binding in the same statement without mutating the grant', async () => {
-    addMember(harness.sqlite, 'member-product')
-    addMember(harness.sqlite, 'member-second')
-    addToken(harness.sqlite, 'token-product', 'member-product')
-    bindAgent(harness.sqlite, 'member-product')
-    harness.sqlite.prepare(
-      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-       VALUES ('grant-before', 'member-product', 'squad', ?, 'observer')`,
-    ).run(TARGET_SQUAD_ID)
-
-    const expectedMemberId = await resolveActiveAgentMember(env, AGENT_ID)
-    expect(expectedMemberId).toBe('member-product')
-    addToken(harness.sqlite, 'token-second', 'member-second')
-
-    await expect(upsertActiveAgentCapabilityGrant(env, {
-      agentId: AGENT_ID,
-      expectedMemberId: expectedMemberId as string,
-      squadId: TARGET_SQUAD_ID,
-      capability: 'member',
-    })).resolves.toBeNull()
-    expect(readTargetGrants(harness.sqlite)).toEqual([{ id: 'grant-before', capability: 'observer' }])
-  })
-
-  it('classifies created, unchanged, and updated from the committed guarded upsert', async () => {
-    addMember(harness.sqlite, 'member-product')
-    addToken(harness.sqlite, 'token-product', 'member-product')
-    bindAgent(harness.sqlite, 'member-product')
-    const input = {
-      agentId: AGENT_ID,
-      expectedMemberId: 'member-product',
-      squadId: TARGET_SQUAD_ID,
-      capability: 'member' as const,
-    }
-
-    await expect(upsertActiveAgentCapabilityGrant(env, input)).resolves.toMatchObject({ result: 'created' })
-    await expect(upsertActiveAgentCapabilityGrant(env, input)).resolves.toMatchObject({ result: 'unchanged' })
-    await expect(upsertActiveAgentCapabilityGrant(env, {
-      ...input,
-      capability: 'lead',
-    })).resolves.toMatchObject({ result: 'updated' })
-    expect(readTargetGrants(harness.sqlite)).toEqual([
-      { id: expect.any(String) as string, capability: 'lead' },
-    ])
   })
 
   it('consolidates duplicate NULL-scope grants and persists one row after regrant', async () => {

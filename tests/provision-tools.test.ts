@@ -41,6 +41,10 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
   const deptExists = opts.deptExists ?? true
   const agentTokenMembers = opts.agentTokenMembers ?? ['member-agent-1']
   const existingGrantCapabilities = opts.existingGrantCapabilities ?? []
+  let accessMembership = existingGrantCapabilities.length > 0
+    ? { id: 'existing-membership-id', agent_id: AGENT.id, squad_id: TARGET_SQUAD.id, capability: 'member' }
+    : null
+  let accessCapability: Capability | null = existingGrantCapabilities[0] ?? null
 
   const agentRow = { id: AGENT.id, squad_id: AGENT.squad_id, slug: AGENT.slug, name: AGENT.name }
 
@@ -55,6 +59,12 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
         // .first() serves the member_tokens authn lookup and every WHERE-id resolve
         // (ids are globally unique). Slug resolves go through .all() (count matches).
         async first() {
+          if (sql.includes('LEFT JOIN agent_member_bindings')) {
+            return {
+              home_squad_id: AGENT.squad_id,
+              bound_member_id: agentTokenMembers[0] ?? null,
+            }
+          }
           if (sql.includes('FROM agent_member_bindings')) {
             const member_id = agentTokenMembers[0]
             return member_id === undefined ? null : { member_id }
@@ -82,8 +92,28 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
             if (ref === TARGET_SQUAD.id) return { id: TARGET_SQUAD.id, department_id: TARGET_SQUAD.department_id }
             return null
           }
+          if (sql.includes('SELECT squad_id AS home_squad_id FROM agents')) {
+            return agentExists ? { home_squad_id: AGENT.squad_id } : null
+          }
           if (sql.includes('FROM agents') && byId) {
             return agentExists && ref === AGENT.id ? agentRow : null
+          }
+          if (sql.includes('SELECT id FROM squads WHERE id')) {
+            return squadExists ? { id: ref } : null
+          }
+          if (sql.includes('FROM memberships')) return accessMembership
+          if (sql.includes('SELECT capability') && sql.includes('FROM capabilities')) {
+            return accessCapability === null ? null : { capability: accessCapability }
+          }
+          if (sql.includes('SELECT member_id, scope_type, scope_id, capability')) {
+            return accessCapability === null
+              ? null
+              : {
+                  member_id: agentTokenMembers[0],
+                  scope_type: 'squad',
+                  scope_id: TARGET_SQUAD.id,
+                  capability: accessCapability,
+                }
           }
           return null
         },
@@ -154,6 +184,28 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
       prepare: (sql: string) => handler(sql),
       // atomic mint runs member+capability+token as one batch; record each INSERT.
       async batch(stmts: { sql: string; args: unknown[] }[]) {
+        if (
+          stmts.length === 2
+          && stmts[0].sql.includes('INSERT INTO memberships')
+          && stmts[1].sql.includes('INSERT INTO capabilities')
+        ) {
+          if (opts.guardedGrantNoRow) {
+            return stmts.map(() => ({ meta: { changes: 0 } }))
+          }
+          accessMembership = {
+            id: stmts[0].args[0] as string,
+            agent_id: stmts[0].args[1] as string,
+            squad_id: stmts[0].args[2] as string,
+            capability: 'member',
+          }
+          accessCapability = stmts[1].args[3] as Capability
+          captured.push({ sql: stmts[0].sql, args: stmts[0].args })
+          captured.push({
+            sql: 'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)',
+            args: [stmts[1].args[0], stmts[1].args[1], 'squad', stmts[1].args[2], stmts[1].args[3]],
+          })
+          return stmts.map(() => ({ meta: { changes: 1 } }))
+        }
         for (const s of stmts) if (s.sql.includes('INSERT INTO')) captured.push({ sql: s.sql, args: s.args })
         return stmts.map(() => ({ meta: { changes: 1 } }))
       },
@@ -570,6 +622,10 @@ describe('grant_agent_capability', () => {
       TARGET_SQUAD.id,
       'member',
     ])
+    expect(captured.find((row) => row.sql.includes('INSERT INTO memberships'))?.args.slice(1, 3)).toEqual([
+      AGENT.id,
+      TARGET_SQUAD.id,
+    ])
 
     expect(JSON.stringify(body.result.structuredContent)).not.toMatch(/token|raw|hash/i)
     expect(events).toHaveLength(1)
@@ -633,6 +689,19 @@ describe('grant_agent_capability', () => {
     )
     expect(res.status).toBe(400)
     expect(((await res.json()) as { error: { message: string } }).error.message).toBe('invalid_capability')
+    expect(captured).toEqual([])
+  })
+
+  it('never raises the immutable home squad above member', async () => {
+    const captured: Captured[] = []
+    const res = await call(
+      'grant_agent_capability',
+      { agent: AGENT.slug, squad: SQUAD.id, capability: 'lead' },
+      makeEnv({}, captured),
+    )
+    expect(res.status).toBe(409)
+    expect(((await res.json()) as { error: { message: string } }).error.message)
+      .toBe('home_capability_ceiling')
     expect(captured).toEqual([])
   })
 

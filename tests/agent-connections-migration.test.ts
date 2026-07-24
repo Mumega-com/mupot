@@ -205,6 +205,70 @@ describe('0071 agent connection contract migration', () => {
     }
   })
 
+  it('blocks migration when a historical canonical home grant exceeds member', () => {
+    const h = createBeforeTargetHarness()
+    try {
+      h.sqlite.exec(`
+        INSERT INTO member_tokens
+          (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+        VALUES ('token-1', 'member-1', 'hash-1', '', 'workspace', '${NOW}', 'agent-1', 'tenant-a');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('grant-home-high', 'member-1', 'squad', 'squad-home', 'admin');
+      `)
+
+      expect(() => applyTarget(h.sqlite)).toThrow(/CHECK constraint failed.*ok/)
+    } finally {
+      h.close()
+    }
+  })
+
+  it('enforces the home capability ceiling on every insert and update path', () => {
+    const h = createBeforeTargetHarness()
+    try {
+      applyTarget(h.sqlite)
+      h.sqlite.exec(`
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('tenant-a', 'agent-1', 'member-1', '${NOW}');
+      `)
+
+      expect(() => h.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('grant-home-high', 'member-1', 'squad', 'squad-home', 'lead');
+      `)).toThrow(/home_capability_ceiling/)
+
+      h.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES
+          ('grant-home', 'member-1', 'squad', 'squad-home', 'member'),
+          ('grant-cross', 'member-1', 'squad', 'squad-other', 'admin');
+      `)
+      expect(() => h.sqlite.exec(`
+        UPDATE capabilities
+           SET capability = 'admin'
+         WHERE id = 'grant-home';
+      `)).toThrow(/home_capability_ceiling/)
+      expect(h.sqlite.prepare(
+        "SELECT capability FROM capabilities WHERE id = 'grant-cross'",
+      ).get()).toEqual({ capability: 'admin' })
+
+      expect(() => h.sqlite.exec(`
+        UPDATE agents SET squad_id = 'squad-other' WHERE id = 'agent-1';
+      `)).toThrow(/home_capability_ceiling/)
+
+      addSecondAgentAndMember(h.sqlite)
+      h.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('grant-second-high', 'member-2', 'squad', 'squad-other', 'admin');
+      `)
+      expect(() => h.sqlite.exec(`
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('tenant-a', 'agent-2', 'member-2', '${NOW}');
+      `)).toThrow(/home_capability_ceiling/)
+    } finally {
+      h.close()
+    }
+  })
+
   it('allows multiple historical and future tokens only for the canonical member', () => {
     const h = createBeforeTargetHarness()
     try {
