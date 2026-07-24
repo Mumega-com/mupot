@@ -343,7 +343,6 @@ async function loadAgent(env: Env, agentId: string): Promise<Agent | null> {
 }
 
 async function loadMemberIdentity(env: Env, auth: AuthContext): Promise<{
-  tokenId: string | null
   memberId: string
   displayName: string
   email: string | null
@@ -357,7 +356,6 @@ async function loadMemberIdentity(env: Env, auth: AuthContext): Promise<{
     .bind(memberId)
     .first<{ display_name: string; email: string | null }>()
   return {
-    tokenId: auth.tokenId ?? null,
     memberId,
     displayName: row?.display_name ?? auth.email ?? memberId,
     email: row?.email ?? auth.email ?? null,
