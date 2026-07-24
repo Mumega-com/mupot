@@ -478,6 +478,64 @@ async function runExistingAgentConnectionWorkflow() {
     ...evidence,
     existingIdentityReused: true,
   })
+  return evidence
+}
+
+async function runExistingAgentReplacementWorkflow(priorReceiptId) {
+  await page.goto(`${baseUrl}/agents/connect`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.locator('#agent-search').fill('browser-existing')
+  await page.locator('#search-button').click()
+  await page.locator('#search-status').filter({ hasText: '1 candidate(s)' }).waitFor({ timeout: 10_000 })
+  const candidate = page.locator('#search-results .candidate')
+  await candidate.filter({ hasText: 'connected' }).waitFor({ timeout: 10_000 })
+  await candidate.getByRole('button', { name: 'Use this identity' }).click()
+  await page.locator('#home-summary').filter({ hasText: 'Operations Local · immutable' }).waitFor({ timeout: 10_000 })
+  await page.locator('#credential-action').selectOption('replace')
+  await page.locator('#replace-wrap').waitFor({ state: 'visible', timeout: 10_000 })
+  if (await page.locator('#replace-token option').count() !== 1) {
+    fail('connected existing agent did not expose exactly one replaceable credential')
+  }
+  await selectAdditionalAgentAccess('sq-growth')
+  await page.locator('#credential-label').fill('Local replacement connection')
+  await page.locator('#home-capability').selectOption('member')
+
+  const evidence = await completeAgentConnection({
+    expectedAgentId: 'agent-browser-existing',
+    expectedAgentSlug: 'browser-existing',
+    expectedDisposition: 'reused',
+    expectedHomeSquadId: 'sq-operations',
+    expectedAdditionalSquadId: 'sq-growth',
+    screenshotName: 'agent-connection-replacement-receipt.png',
+  })
+
+  const priorStatusResponse = await context.request.get(
+    `${baseUrl}/api/agent-connections/${encodeURIComponent(priorReceiptId)}/status`,
+    { timeout: 20_000 },
+  )
+  const priorStatus = await priorStatusResponse.json().catch(() => null)
+  if (
+    priorStatusResponse.status() !== 200
+    || priorStatus?.issuance?.agent?.id !== 'agent-browser-existing'
+    || priorStatus?.issuance?.home_squad_id !== 'sq-operations'
+    || priorStatus?.current?.token_revoked !== true
+  ) {
+    fail('replacement did not revoke only the prior credential', {
+      httpStatus: priorStatusResponse.status(),
+      agentId: priorStatus?.issuance?.agent?.id ?? null,
+      homeSquadId: priorStatus?.issuance?.home_squad_id ?? null,
+      priorTokenRevoked: priorStatus?.current?.token_revoked ?? null,
+    })
+  }
+
+  workflows.push({
+    name: 'owner replace existing agent credential journey',
+    status: 'passed',
+    agentSlug: 'browser-existing',
+    ...evidence,
+    existingIdentityReused: true,
+    existingCredentialReplaced: true,
+    priorCredentialRevoked: true,
+  })
 }
 
 async function runProjectWorkspaceWorkflow() {
@@ -1096,7 +1154,8 @@ export async function runLocalBrowserSmoke() {
 
     await runProjectWorkspaceWorkflow()
     await runAgentConnectionWorkflow()
-    await runExistingAgentConnectionWorkflow()
+    const existingConnection = await runExistingAgentConnectionWorkflow()
+    await runExistingAgentReplacementWorkflow(existingConnection.receiptId)
     await runSendTaskWorkflow()
     await runApprovalWorkflow()
 
