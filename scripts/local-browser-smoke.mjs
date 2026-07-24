@@ -22,6 +22,8 @@ const ownerProjectName = `Browser Project ${smokeRunId}`
 const ownerProjectSlug = `browser-project-${Date.now()}`
 const ownerProjectInitialGoal = 'Create a governed nested project through the dashboard.'
 const ownerProjectEditedGoal = 'Prove the owner lifecycle is visible through the canonical Project situation.'
+const connectionAgentSlug = `browser-connection-${Date.now()}`
+const connectionAgentName = `Browser Connection ${smokeRunId}`
 const mcpOwnerToken = process.env.MUPOT_CONFORMANCE_OWNER_TOKEN
   || ['local', 'runtime', 'conformance', 'owner', 'token'].join('-')
 
@@ -240,6 +242,119 @@ async function runLoginWorkflow() {
     status: 'passed',
     email: json.email,
     anonymousRedirect: location,
+  })
+}
+
+async function runAgentConnectionWorkflow() {
+  await page.goto(`${baseUrl}/agents/connect`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.locator('#new-name').fill(connectionAgentName)
+  await page.locator('#new-slug').fill(connectionAgentSlug)
+  await page.locator('#new-role').fill('member')
+  await page.locator('#new-model').fill('local-fixture')
+  await page.locator('#new-home').selectOption('sq-growth')
+  await page.locator('#choose-new').click()
+  await page.locator('#search-status').filter({ hasText: 'New identity selected' }).waitFor({ timeout: 10_000 })
+
+  await page.locator('#credential-label').fill('Local browser connection')
+  await page.locator('#home-capability').selectOption('member')
+  await page.locator('#provision-button').click()
+  await page.locator('#step-connect').waitFor({ state: 'visible', timeout: 20_000 })
+  await page.locator('#step-verify').waitFor({ state: 'visible', timeout: 20_000 })
+
+  // Keep show-once values in process memory only. They are never attached to a
+  // workflow result, failure details, screenshot, URL, or artifact.
+  const credential = (await page.locator('#show-credential').innerText()).trim()
+  const challenge = (await page.locator('#show-challenge').innerText()).trim()
+  await page.evaluate(() => {
+    for (const id of ['show-credential', 'show-challenge', 'verify-arguments']) {
+      const element = document.getElementById(id)
+      if (element) element.textContent = '[removed after one-time capture]'
+    }
+  })
+  if (!/^mupot_[0-9a-f]+$/.test(credential) || !/^[0-9a-f]{48}$/.test(challenge)) {
+    fail('agent connection did not render valid show-once values')
+  }
+
+  const claudeConfig = await page.locator('#config-claude').innerText()
+  const codexConfig = await page.locator('#config-codex').innerText()
+  const cursorConfig = await page.locator('#config-cursor').innerText()
+  if (
+    !claudeConfig.includes('<MEMBER_TOKEN>')
+    || !codexConfig.includes('bearer_token_env_var')
+    || !cursorConfig.includes('<MEMBER_TOKEN>')
+    || claudeConfig.includes(credential)
+    || codexConfig.includes(credential)
+    || cursorConfig.includes(credential)
+  ) {
+    fail('agent connection configuration separation failed')
+  }
+
+  const receiptHref = await page.locator('#receipt-link').getAttribute('href')
+  if (!receiptHref) fail('agent connection receipt link missing')
+  const receiptUrl = new URL(receiptHref)
+  const receiptId = decodeURIComponent(receiptUrl.pathname.split('/').at(-1) || '')
+  if (!receiptId) fail('agent connection receipt id missing')
+
+  const verificationResponse = await context.request.post(`${baseUrl}/mcp`, {
+    headers: {
+      authorization: `Bearer ${credential}`,
+      'content-type': 'application/json',
+    },
+    data: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: {
+        name: 'verify_agent_connection',
+        arguments: { receipt_id: receiptId, challenge },
+      },
+    }),
+    timeout: 20_000,
+  })
+  const verification = await verificationResponse.json().catch(() => null)
+  if (
+    verificationResponse.status() !== 200
+    || verification?.result?.structuredContent?.status !== 'messaging_verified'
+    || verification?.result?.structuredContent?.receiptId !== receiptId
+  ) {
+    fail('agent connection MCP verification failed', {
+      status: verificationResponse.status(),
+      resultStatus: verification?.result?.structuredContent?.status ?? null,
+    })
+  }
+  const serializedVerification = JSON.stringify(verification)
+  if (
+    serializedVerification.includes(credential)
+    || serializedVerification.includes(challenge)
+  ) {
+    fail('agent connection verification response exposed show-once material')
+  }
+
+  // The configured PUBLIC_ORIGIN can differ from an alternate harness port.
+  // Reuse only the authorized same-origin path when loading the durable receipt.
+  await page.goto(`${baseUrl}${receiptUrl.pathname}`, {
+    waitUntil: 'networkidle',
+    timeout: 20_000,
+  })
+  await page.locator('#verification-status').filter({ hasText: 'pass' }).waitFor({ timeout: 10_000 })
+  const receiptText = await page.locator('body').innerText()
+  if (receiptText.includes(credential) || receiptText.includes(challenge)) {
+    fail('durable agent connection receipt exposed show-once material')
+  }
+  await page.screenshot({
+    path: path.join(artifactsDir, 'agent-connection-receipt.png'),
+    fullPage: true,
+  })
+
+  workflows.push({
+    name: 'owner create-connect-verify agent journey',
+    status: 'passed',
+    agentSlug: connectionAgentSlug,
+    receiptId,
+    credentialShownOnce: true,
+    configurationSeparated: true,
+    messagingVerified: true,
+    durableReceiptSecretFree: true,
   })
 }
 
@@ -858,6 +973,7 @@ export async function runLocalBrowserSmoke() {
     await page.screenshot({ path: path.join(artifactsDir, 'ops-health.png'), fullPage: true })
 
     await runProjectWorkspaceWorkflow()
+    await runAgentConnectionWorkflow()
     await runSendTaskWorkflow()
     await runApprovalWorkflow()
 

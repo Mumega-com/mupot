@@ -50,5 +50,8 @@ describe('local browser route evidence', () => {
 
   it('visits the authenticated create-or-connect agent wizard', () => {
     expect(browserSmokeSource).toContain("'/agents/connect'")
+    expect(browserSmokeSource).toContain('runAgentConnectionWorkflow')
+    expect(browserSmokeSource).toContain("name: 'verify_agent_connection'")
+    expect(browserSmokeSource).toContain('durableReceiptSecretFree: true')
   })
 })
