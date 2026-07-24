@@ -378,6 +378,12 @@ describe('agent connection owner wizard', () => {
       '2026-07-25T12:00:00.000Z',
     )
 
+    const recoveryPage = await appFor(OWNER).request('/agents/connect', {}, env)
+    expect(recoveryPage.status).toBe(200)
+    const recoveryHtml = await recoveryPage.text()
+    expect(recoveryHtml).toContain('Abandoned setup recovery')
+    expect(recoveryHtml).toContain('data-cancel-request="abandoned"')
+
     const response = await postJson(
       appFor(OWNER),
       '/agents/connect/cancel',

@@ -62,6 +62,13 @@ export interface AgentConnectionSquadChoice {
   ceiling: Capability | null
 }
 
+export interface PendingAgentConnection {
+  request_id: string
+  target_key: string
+  created_at: string
+  expires_at: string
+}
+
 interface WizardOperator {
   actor: AgentConnectionActor
   auth: AuthContext
@@ -283,6 +290,26 @@ async function loadSquadChoices(
   }))
 }
 
+async function loadPendingConnections(
+  env: Env,
+  actor: AgentConnectionActor,
+): Promise<PendingAgentConnection[]> {
+  const result = await env.DB.prepare(
+    `SELECT request_id, target_key, created_at, expires_at
+       FROM agent_connection_requests
+      WHERE tenant = ?
+        AND actor_kind = ?
+        AND actor_id = ?
+        AND status = 'pending'
+      ORDER BY created_at ASC, request_id ASC`,
+  ).bind(
+    env.TENANT_SLUG,
+    actor.kind,
+    actor.id,
+  ).all<PendingAgentConnection>()
+  return result.results ?? []
+}
+
 function parseProvisionInput(
   value: unknown,
 ): AgentConnectionInput | null {
@@ -483,13 +510,27 @@ export function renderAgentConnectionEntry(
 export function renderAgentConnectionWizard(
   brand: string,
   squads: AgentConnectionSquadChoice[],
+  pendingConnections: PendingAgentConnection[] = [],
 ): string {
   const options = squadOptions(squads)
   const access = additionalAccessRows(squads)
+  const recovery = pendingConnections.length === 0
+    ? ''
+    : `<section class="card" id="pending-recovery">
+      <h2>Abandoned setup recovery</h2>
+      <p class="muted">These reservations belong to this operator. Cancel only a setup that is no longer running; committed credentials cannot be cancelled here.</p>
+      ${pendingConnections.map((request) => (
+        `<div class="candidate" data-pending-row="${escapeHtml(request.request_id)}">
+          <div><code>${escapeHtml(request.request_id)}</code><br /><span class="muted">${escapeHtml(request.target_key)} · expires ${escapeHtml(request.expires_at)}</span></div>
+          <button type="button" class="secondary" data-cancel-request="${escapeHtml(request.request_id)}">Cancel pending setup</button>
+        </div>`
+      )).join('')}
+    </section>`
   const body = `
   <h1>Create or connect agent</h1>
   <p class="lede">Resolve one identity, synchronize its access, issue one agent-bound key, then prove messaging.</p>
   <div class="steps">
+    ${recovery}
     <section class="card" id="step-agent">
       <h2>1 · Agent</h2>
       <p class="muted">Search before creating. Existing agents keep their immutable home squad.</p>
@@ -703,6 +744,24 @@ export function renderAgentConnectionWizard(
         button.textContent = 'Copied';
       });
     });
+
+    document.querySelectorAll('[data-cancel-request]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        const response = await fetch('/agents/connect/cancel', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', accept: 'application/json' },
+          body: JSON.stringify({ request_id: button.dataset.cancelRequest })
+        });
+        if (response.ok) {
+          document.querySelector('[data-pending-row="' + CSS.escape(button.dataset.cancelRequest) + '"]')?.remove();
+          if (!document.querySelector('[data-pending-row]')) byId('pending-recovery')?.remove();
+          return;
+        }
+        button.disabled = false;
+        button.textContent = 'Could not cancel';
+      });
+    });
   })();
   </script>`
   return wizardShell(brand, 'Create or connect agent', body)
@@ -803,8 +862,15 @@ function operatorFromContext(
 
 agentConnectionWizardApp.get('/', async (c) => {
   const operator = operatorFromContext(c)
-  const squads = await loadSquadChoices(c.env, operator)
-  return c.html(renderAgentConnectionWizard(c.env.BRAND || 'Mupot', squads))
+  const [squads, pendingConnections] = await Promise.all([
+    loadSquadChoices(c.env, operator),
+    loadPendingConnections(c.env, operator.actor),
+  ])
+  return c.html(renderAgentConnectionWizard(
+    c.env.BRAND || 'Mupot',
+    squads,
+    pendingConnections,
+  ))
 })
 
 agentConnectionWizardApp.get('/search', async (c) => {
