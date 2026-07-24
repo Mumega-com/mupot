@@ -297,6 +297,37 @@ describe('agent connection provisioning', () => {
     expect(tokens.filter((row) => row.revoked_at === null)).toHaveLength(1)
   })
 
+  it('rolls back the replacement when the selected token is revoked before the batch', async () => {
+    seedExisting(harness.sqlite, { bound: true, token: true })
+    const committedDb = harness.db
+    let raced = false
+    env = {
+      ...env,
+      DB: {
+        prepare: committedDb.prepare.bind(committedDb),
+        async batch(statements) {
+          if (!raced) {
+            harness.sqlite.prepare(
+              "UPDATE member_tokens SET revoked_at = ? WHERE id = 'token-existing'",
+            ).run('2026-07-24T11:59:59.000Z')
+            raced = true
+          }
+          return committedDb.batch(statements)
+        },
+      } as Env['DB'],
+    }
+
+    await expect(
+      provisionAgentConnection(env, OWNER, existingInput('replace-race', 'replace'), NOW),
+    ).resolves.toEqual({ status: 'error', error: 'replace_token_not_found' })
+
+    expect(count(harness.sqlite, 'member_tokens')).toBe(1)
+    expect(count(harness.sqlite, 'agent_connection_receipts')).toBe(0)
+    expect(harness.sqlite.prepare(
+      "SELECT status, error_code FROM agent_connection_requests WHERE request_id = 'replace-race'",
+    ).get()).toEqual({ status: 'failed', error_code: 'replace_token_not_found' })
+  })
+
   it('replays a committed request without returning raw token or challenge', async () => {
     const input = newInput('lost-response')
     const issued = await provisionAgentConnection(env, OWNER, input, NOW)

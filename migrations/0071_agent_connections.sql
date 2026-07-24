@@ -280,6 +280,37 @@ BEGIN
   SELECT RAISE(ABORT, 'agent_connection_request_not_pending');
 END;
 
+-- Replacement revocation is part of the receipt insert transaction. A token
+-- that stopped being live after service validation aborts the entire batch, so
+-- the replacement token and credential_issued transition cannot commit without
+-- the caller receiving the new raw credential.
+CREATE TRIGGER agent_connection_receipt_replaces_live_token
+BEFORE INSERT ON agent_connection_receipts
+WHEN NEW.credential_action = 'replace'
+BEGIN
+  UPDATE member_tokens
+     SET revoked_at = NEW.credential_issued_at
+   WHERE id = (
+     SELECT replace_token_id
+       FROM agent_connection_requests
+      WHERE tenant = NEW.tenant
+        AND actor_kind = NEW.actor_kind
+        AND actor_id = NEW.actor_id
+        AND request_id = NEW.request_id
+        AND request_fingerprint = NEW.request_fingerprint
+        AND status = 'pending'
+      LIMIT 1
+   )
+     AND tenant = NEW.tenant
+     AND member_id = NEW.member_id
+     AND agent_id = NEW.agent_id
+     AND revoked_at IS NULL;
+
+  SELECT CASE
+    WHEN changes() <> 1 THEN RAISE(ABORT, 'replace_token_not_found')
+  END;
+END;
+
 -- Issuance facts are an immutable snapshot. Only verification evidence and
 -- updated_at may evolve after insert.
 CREATE TRIGGER agent_connection_receipts_immutable_snapshot

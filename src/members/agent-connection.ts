@@ -632,7 +632,6 @@ export async function provisionAgentConnection(
       normalized.credential.homeCapability,
     )
 
-    let replaceStatement: D1PreparedStatement | null = null
     if (normalized.credential.action === 'replace') {
       const replaceTokenId = normalized.credential.replaceTokenId as string
       const replaceTarget = await env.DB.prepare(
@@ -654,21 +653,6 @@ export async function provisionAgentConnection(
         await failReservation(env, actor, normalized, 'replace_token_not_found', now)
         return errorOutcome('replace_token_not_found')
       }
-      replaceStatement = env.DB.prepare(
-        `UPDATE member_tokens
-            SET revoked_at = ?
-          WHERE id = ?
-            AND tenant = ?
-            AND member_id = ?
-            AND agent_id = ?
-            AND revoked_at IS NULL`,
-      ).bind(
-        now.toISOString(),
-        replaceTokenId,
-        env.TENANT_SLUG,
-        token.memberId,
-        agent.id,
-      )
     }
 
     const accessStatements: D1PreparedStatement[] = []
@@ -737,7 +721,6 @@ export async function provisionAgentConnection(
       ...token.statements,
       ...accessStatements,
     ]
-    if (replaceStatement) statements.push(replaceStatement)
     statements.push(
       insertReceiptStatement(env, receipt),
       env.DB.prepare(
@@ -798,6 +781,8 @@ export async function provisionAgentConnection(
   } catch (error) {
     const code = error instanceof Error && error.message.includes('slug')
       ? 'slug_taken'
+      : error instanceof Error && error.message.includes('replace_token_not_found')
+        ? 'replace_token_not_found'
       : error instanceof Error && error.message.includes('agent_identity_conflict')
         ? 'agent_identity_conflict'
         : 'provisioning_failed'
