@@ -222,6 +222,29 @@ describe('0071 agent connection contract migration', () => {
     }
   })
 
+  it.each([
+    ['org', 'NULL'],
+    ['department', "'dept-1'"],
+  ])('blocks migration when a historical canonical member inherits a high %s grant', (
+    scopeType,
+    scopeId,
+  ) => {
+    const h = createBeforeTargetHarness()
+    try {
+      h.sqlite.exec(`
+        INSERT INTO member_tokens
+          (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+        VALUES ('token-1', 'member-1', 'hash-1', '', 'workspace', '${NOW}', 'agent-1', 'tenant-a');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('grant-inherited-high', 'member-1', '${scopeType}', ${scopeId}, 'admin');
+      `)
+
+      expect(() => applyTarget(h.sqlite)).toThrow(/CHECK constraint failed.*ok/)
+    } finally {
+      h.close()
+    }
+  })
+
   it('enforces the home capability ceiling on every insert and update path', () => {
     const h = createBeforeTargetHarness()
     try {
@@ -235,11 +258,20 @@ describe('0071 agent connection contract migration', () => {
         INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
         VALUES ('grant-home-high', 'member-1', 'squad', 'squad-home', 'lead');
       `)).toThrow(/home_capability_ceiling/)
+      expect(() => h.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('grant-org-high', 'member-1', 'org', NULL, 'admin');
+      `)).toThrow(/home_capability_ceiling/)
+      expect(() => h.sqlite.exec(`
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('grant-dept-high', 'member-1', 'department', 'dept-1', 'lead');
+      `)).toThrow(/home_capability_ceiling/)
 
       h.sqlite.exec(`
         INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
         VALUES
           ('grant-home', 'member-1', 'squad', 'squad-home', 'member'),
+          ('grant-org-low', 'member-1', 'org', NULL, 'member'),
           ('grant-cross', 'member-1', 'squad', 'squad-other', 'admin');
       `)
       expect(() => h.sqlite.exec(`
@@ -250,15 +282,29 @@ describe('0071 agent connection contract migration', () => {
       expect(h.sqlite.prepare(
         "SELECT capability FROM capabilities WHERE id = 'grant-cross'",
       ).get()).toEqual({ capability: 'admin' })
+      expect(() => h.sqlite.exec(`
+        UPDATE capabilities
+           SET capability = 'owner'
+         WHERE id = 'grant-org-low';
+      `)).toThrow(/home_capability_ceiling/)
 
       expect(() => h.sqlite.exec(`
         UPDATE agents SET squad_id = 'squad-other' WHERE id = 'agent-1';
       `)).toThrow(/home_capability_ceiling/)
 
+      h.sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-2', 'other-dept', 'Other Dept');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('grant-future-dept', 'member-1', 'department', 'dept-2', 'admin');
+      `)
+      expect(() => h.sqlite.exec(`
+        UPDATE squads SET department_id = 'dept-2' WHERE id = 'squad-home';
+      `)).toThrow(/home_capability_ceiling/)
+
       addSecondAgentAndMember(h.sqlite)
       h.sqlite.exec(`
         INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-        VALUES ('grant-second-high', 'member-2', 'squad', 'squad-other', 'admin');
+        VALUES ('grant-second-high', 'member-2', 'org', NULL, 'admin');
       `)
       expect(() => h.sqlite.exec(`
         INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)

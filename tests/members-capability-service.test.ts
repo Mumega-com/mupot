@@ -15,6 +15,7 @@ interface StatementRecord {
 interface ServiceDbOptions {
   bindingRow?: { member_id: string } | null
   existingCapabilities?: Capability[]
+  homeCeilingConflict?: boolean
   batchResults?: { meta: { changes: number }; results?: { capability: Capability }[] }[]
 }
 
@@ -32,6 +33,9 @@ function makeServiceDb(options: ServiceDbOptions = {}) {
           return {
             ...record,
             async first<T>() {
+              if (sql.includes('JOIN agents a') && sql.includes('JOIN squads s')) {
+                return (options.homeCeilingConflict ? { conflict: 1 } : null) as T | null
+              }
               if (sql.includes('FROM agent_member_bindings')) {
                 return (options.bindingRow ?? null) as T | null
               }
@@ -235,6 +239,19 @@ describe('upsertCapabilityGrant', () => {
     expect(batches[0][0].sql).toContain('scope_id IS NULL')
     expect(batches[0][0].sql).toContain('RETURNING capability')
     expect(batches[0][0].values).toEqual(['member-1', 'org'])
+  })
+
+  it('refuses a high inherited grant that would exceed a bound agent home ceiling', async () => {
+    const grant: CapabilityGrant = {
+      member_id: 'member-1',
+      scope_type: 'org',
+      scope_id: null,
+      capability: 'admin',
+    }
+    const { env, batches } = makeServiceDb({ homeCeilingConflict: true })
+
+    await expect(upsertCapabilityGrant(env, grant)).rejects.toThrow('home_capability_ceiling')
+    expect(batches).toHaveLength(0)
   })
 })
 

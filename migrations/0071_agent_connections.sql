@@ -52,11 +52,15 @@ INSERT INTO agent_home_capability_migration_guard (ok)
 SELECT 0
   FROM agent_member_bindings b
   JOIN agents a ON a.id = b.agent_id
+  JOIN squads s ON s.id = a.squad_id
   JOIN capabilities c
     ON c.member_id = b.member_id
-   AND c.scope_type = 'squad'
-   AND c.scope_id = a.squad_id
  WHERE c.capability NOT IN ('observer', 'member')
+   AND (
+     c.scope_type = 'org'
+     OR (c.scope_type = 'department' AND c.scope_id = s.department_id)
+     OR (c.scope_type = 'squad' AND c.scope_id = a.squad_id)
+   )
  LIMIT 1;
 
 DROP TABLE agent_home_capability_migration_guard;
@@ -72,12 +76,16 @@ BEFORE INSERT ON agent_member_bindings
 WHEN EXISTS (
   SELECT 1
     FROM agents a
+    JOIN squads s ON s.id = a.squad_id
     JOIN capabilities c
       ON c.member_id = NEW.member_id
-     AND c.scope_type = 'squad'
-     AND c.scope_id = a.squad_id
    WHERE a.id = NEW.agent_id
      AND c.capability NOT IN ('observer', 'member')
+     AND (
+       c.scope_type = 'org'
+       OR (c.scope_type = 'department' AND c.scope_id = s.department_id)
+       OR (c.scope_type = 'squad' AND c.scope_id = a.squad_id)
+     )
 )
 BEGIN
   SELECT RAISE(ABORT, 'home_capability_ceiling');
@@ -125,14 +133,18 @@ END;
 
 CREATE TRIGGER agent_home_capability_ceiling_insert
 BEFORE INSERT ON capabilities
-WHEN NEW.scope_type = 'squad'
- AND NEW.capability NOT IN ('observer', 'member')
+WHEN NEW.capability NOT IN ('observer', 'member')
  AND EXISTS (
    SELECT 1
      FROM agent_member_bindings b
      JOIN agents a ON a.id = b.agent_id
+     JOIN squads s ON s.id = a.squad_id
     WHERE b.member_id = NEW.member_id
-      AND a.squad_id = NEW.scope_id
+      AND (
+        NEW.scope_type = 'org'
+        OR (NEW.scope_type = 'department' AND NEW.scope_id = s.department_id)
+        OR (NEW.scope_type = 'squad' AND NEW.scope_id = a.squad_id)
+      )
  )
 BEGIN
   SELECT RAISE(ABORT, 'home_capability_ceiling');
@@ -140,14 +152,18 @@ END;
 
 CREATE TRIGGER agent_home_capability_ceiling_update
 BEFORE UPDATE OF member_id, scope_type, scope_id, capability ON capabilities
-WHEN NEW.scope_type = 'squad'
- AND NEW.capability NOT IN ('observer', 'member')
+WHEN NEW.capability NOT IN ('observer', 'member')
  AND EXISTS (
    SELECT 1
      FROM agent_member_bindings b
      JOIN agents a ON a.id = b.agent_id
+     JOIN squads s ON s.id = a.squad_id
     WHERE b.member_id = NEW.member_id
-      AND a.squad_id = NEW.scope_id
+      AND (
+        NEW.scope_type = 'org'
+        OR (NEW.scope_type = 'department' AND NEW.scope_id = s.department_id)
+        OR (NEW.scope_type = 'squad' AND NEW.scope_id = a.squad_id)
+      )
  )
 BEGIN
   SELECT RAISE(ABORT, 'home_capability_ceiling');
@@ -158,12 +174,35 @@ BEFORE UPDATE OF squad_id ON agents
 WHEN EXISTS (
   SELECT 1
     FROM agent_member_bindings b
+    JOIN squads s ON s.id = NEW.squad_id
     JOIN capabilities c
       ON c.member_id = b.member_id
-     AND c.scope_type = 'squad'
-     AND c.scope_id = NEW.squad_id
    WHERE b.agent_id = NEW.id
      AND c.capability NOT IN ('observer', 'member')
+     AND (
+       c.scope_type = 'org'
+       OR (c.scope_type = 'department' AND c.scope_id = s.department_id)
+       OR (c.scope_type = 'squad' AND c.scope_id = NEW.squad_id)
+     )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'home_capability_ceiling');
+END;
+
+CREATE TRIGGER squads_home_capability_ceiling_update
+BEFORE UPDATE OF department_id ON squads
+WHEN EXISTS (
+  SELECT 1
+    FROM agents a
+    JOIN agent_member_bindings b ON b.agent_id = a.id
+    JOIN capabilities c ON c.member_id = b.member_id
+   WHERE a.squad_id = NEW.id
+     AND c.capability NOT IN ('observer', 'member')
+     AND (
+       c.scope_type = 'org'
+       OR (c.scope_type = 'department' AND c.scope_id = NEW.department_id)
+       OR (c.scope_type = 'squad' AND c.scope_id = a.squad_id)
+     )
 )
 BEGIN
   SELECT RAISE(ABORT, 'home_capability_ceiling');
