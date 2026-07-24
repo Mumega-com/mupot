@@ -3,6 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
+  cancelAgentConnectionRequest,
   provisionAgentConnection,
   sweepAgentConnectionRetention,
 } from '../src/members/agent-connection'
@@ -209,6 +210,128 @@ describe('agent connection provisioning', () => {
     expect(count(harness.sqlite, 'agents')).toBe(1)
     expect(count(harness.sqlite, 'agent_member_bindings')).toBe(1)
     expect(count(harness.sqlite, 'member_tokens')).toBe(1)
+  })
+
+  it('cancels only the same actor pending request and releases its quota slot', async () => {
+    const insertPending = (
+      actorId: string,
+      requestId: string,
+      targetKey: string,
+    ) => {
+      harness.sqlite.prepare(
+        `INSERT INTO agent_connection_requests
+          (tenant, actor_kind, actor_id, request_id, request_fingerprint, target_key,
+           agent_mode, credential_action, status, created_at, updated_at, expires_at)
+         VALUES (?, 'user', ?, ?, ?, ?, 'existing', 'add', 'pending', ?, ?, ?)`,
+      ).run(
+        TENANT,
+        actorId,
+        requestId,
+        requestId.padEnd(64, 'a').slice(0, 64).replace(/[^0-9a-f]/g, 'a'),
+        targetKey,
+        NOW.toISOString(),
+        NOW.toISOString(),
+        '2026-07-25T12:00:00.000Z',
+      )
+    }
+    insertPending(OWNER.id, 'pending-a', 'agent:a')
+    insertPending(OWNER.id, 'pending-b', 'agent:b')
+    insertPending(OWNER.id, 'pending-c', 'agent:c')
+
+    await expect(cancelAgentConnectionRequest(
+      env,
+      { ...OWNER, id: 'owner-2' },
+      'pending-a',
+      NOW,
+    )).resolves.toEqual({ ok: false, error: 'request_not_pending' })
+
+    await expect(cancelAgentConnectionRequest(
+      env,
+      OWNER,
+      'pending-a',
+      NOW,
+    )).resolves.toEqual({ ok: true, status: 'cancelled' })
+
+    const cancelled = harness.sqlite.prepare(
+      `SELECT status, error_code, finalized_at
+         FROM agent_connection_requests
+        WHERE tenant = ? AND actor_id = ? AND request_id = ?`,
+    ).get(TENANT, OWNER.id, 'pending-a')
+    expect(cancelled).toEqual({
+      status: 'failed',
+      error_code: 'cancelled',
+      finalized_at: NOW.toISOString(),
+    })
+
+    expect(() => insertPending(OWNER.id, 'pending-d', 'agent:d')).not.toThrow()
+    await expect(provisionAgentConnection(
+      env,
+      OWNER,
+      newInput('pending-a', 'cancelled-retry'),
+      NOW,
+    )).resolves.toMatchObject({
+      status: 'error',
+      error: 'request_id_conflict',
+    })
+    await expect(cancelAgentConnectionRequest(
+      env,
+      OWNER,
+      'pending-a',
+      NOW,
+    )).resolves.toEqual({ ok: false, error: 'request_not_pending' })
+  })
+
+  it('never cancels a completed issuance or revokes its credential', async () => {
+    const issued = await provisionAgentConnection(env, OWNER, newInput('completed'), NOW)
+    expect(issued.status).toBe('credential_issued')
+
+    await expect(cancelAgentConnectionRequest(
+      env,
+      OWNER,
+      'completed',
+      NOW,
+    )).resolves.toEqual({ ok: false, error: 'request_not_pending' })
+
+    expect(harness.sqlite.prepare(
+      `SELECT status FROM agent_connection_requests
+        WHERE tenant = ? AND actor_id = ? AND request_id = ?`,
+    ).get(TENANT, OWNER.id, 'completed')).toEqual({ status: 'credential_issued' })
+    expect(harness.sqlite.prepare(
+      'SELECT revoked_at FROM member_tokens LIMIT 1',
+    ).get()).toEqual({ revoked_at: null })
+  })
+
+  it('maps the database pending quota to a stable service error without mutation', async () => {
+    for (const suffix of ['a', 'b', 'c']) {
+      harness.sqlite.prepare(
+        `INSERT INTO agent_connection_requests
+          (tenant, actor_kind, actor_id, request_id, request_fingerprint, target_key,
+           agent_mode, credential_action, status, created_at, updated_at, expires_at)
+         VALUES (?, 'user', ?, ?, ?, ?, 'existing', 'add', 'pending', ?, ?, ?)`,
+      ).run(
+        TENANT,
+        OWNER.id,
+        `pending-${suffix}`,
+        suffix.repeat(64),
+        `agent:pending-${suffix}`,
+        NOW.toISOString(),
+        NOW.toISOString(),
+        '2026-07-25T12:00:00.000Z',
+      )
+    }
+
+    await expect(provisionAgentConnection(
+      env,
+      OWNER,
+      newInput('quota-fourth', 'quota-fourth'),
+      NOW,
+    )).resolves.toEqual({
+      status: 'error',
+      error: 'too_many_pending_agent_connections',
+    })
+    expect(count(harness.sqlite, 'agents')).toBe(0)
+    expect(count(harness.sqlite, 'member_tokens')).toBe(0)
+    expect(count(harness.sqlite, 'agent_connection_receipts')).toBe(0)
   })
 
   it('authorizes every affected squad before creating a reservation', async () => {

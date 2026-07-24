@@ -22,6 +22,8 @@ const ownerProjectName = `Browser Project ${smokeRunId}`
 const ownerProjectSlug = `browser-project-${Date.now()}`
 const ownerProjectInitialGoal = 'Create a governed nested project through the dashboard.'
 const ownerProjectEditedGoal = 'Prove the owner lifecycle is visible through the canonical Project situation.'
+const connectionAgentSlug = `browser-connection-${Date.now()}`
+const connectionAgentName = `Browser Connection ${smokeRunId}`
 const mcpOwnerToken = process.env.MUPOT_CONFORMANCE_OWNER_TOKEN
   || ['local', 'runtime', 'conformance', 'owner', 'token'].join('-')
 
@@ -46,6 +48,7 @@ const pages = [
   '/ops',
   '/coordination',
   '/agents',
+  '/agents/connect',
   '/squads/sq-growth',
   '/agents/agent-hermes',
   '/admin/members',
@@ -239,6 +242,299 @@ async function runLoginWorkflow() {
     status: 'passed',
     email: json.email,
     anonymousRedirect: location,
+  })
+}
+
+async function selectAdditionalAgentAccess(squadId, capability = 'member') {
+  const row = page.locator(`[data-access-row][data-squad-id="${squadId}"]`)
+  await row.waitFor({ state: 'visible', timeout: 10_000 })
+  await row.locator('[data-access-check]').check()
+  await row.locator('[data-access-capability]').selectOption(capability)
+}
+
+async function completeAgentConnection({
+  expectedAgentId,
+  expectedAgentSlug,
+  expectedDisposition,
+  expectedHomeSquadId,
+  expectedAdditionalSquadId,
+  screenshotName,
+}) {
+  await page.locator('#provision-button').click()
+  await page.locator('#step-connect').waitFor({ state: 'visible', timeout: 20_000 })
+  await page.locator('#step-verify').waitFor({ state: 'visible', timeout: 20_000 })
+
+  // Keep show-once values in process memory only. They are never attached to a
+  // workflow result, failure details, screenshot, URL, or artifact.
+  const credential = (await page.locator('#show-credential').innerText()).trim()
+  const challenge = (await page.locator('#show-challenge').innerText()).trim()
+  await page.evaluate(() => {
+    for (const id of ['show-credential', 'show-challenge', 'verify-arguments']) {
+      const element = document.getElementById(id)
+      if (element) element.textContent = '[removed after one-time capture]'
+    }
+  })
+  if (!/^mupot_[0-9a-f]+$/.test(credential) || !/^[0-9a-f]{48}$/.test(challenge)) {
+    fail('agent connection did not render valid show-once values')
+  }
+
+  const claudeConfig = await page.locator('#config-claude').innerText()
+  const codexConfig = await page.locator('#config-codex').innerText()
+  const cursorConfig = await page.locator('#config-cursor').innerText()
+  if (
+    !claudeConfig.includes('<MEMBER_TOKEN>')
+    || !codexConfig.includes('bearer_token_env_var')
+    || !cursorConfig.includes('<MEMBER_TOKEN>')
+    || claudeConfig.includes(credential)
+    || codexConfig.includes(credential)
+    || cursorConfig.includes(credential)
+  ) {
+    fail('agent connection configuration separation failed')
+  }
+
+  const receiptHref = await page.locator('#receipt-link').getAttribute('href')
+  if (!receiptHref) fail('agent connection receipt link missing')
+  const receiptUrl = new URL(receiptHref)
+  const receiptId = decodeURIComponent(receiptUrl.pathname.split('/').at(-1) || '')
+  if (!receiptId) fail('agent connection receipt id missing')
+
+  const verificationResponse = await context.request.post(`${baseUrl}/mcp`, {
+    headers: {
+      authorization: `Bearer ${credential}`,
+      'content-type': 'application/json',
+    },
+    data: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: {
+        name: 'verify_agent_connection',
+        arguments: { receipt_id: receiptId, challenge },
+      },
+    }),
+    timeout: 20_000,
+  })
+  const verification = await verificationResponse.json().catch(() => null)
+  if (
+    verificationResponse.status() !== 200
+    || verification?.result?.structuredContent?.status !== 'messaging_verified'
+    || verification?.result?.structuredContent?.receiptId !== receiptId
+  ) {
+    fail('agent connection MCP verification failed', {
+      status: verificationResponse.status(),
+      resultStatus: verification?.result?.structuredContent?.status ?? null,
+    })
+  }
+
+  const statusResponse = await context.request.get(
+    `${baseUrl}/api/agent-connections/${encodeURIComponent(receiptId)}/status`,
+    { timeout: 20_000 },
+  )
+  const status = await statusResponse.json().catch(() => null)
+  const expectedSquads = [expectedHomeSquadId, expectedAdditionalSquadId]
+  const accessSynchronized = expectedSquads.every((squadId) => (
+    status?.current?.access?.filter((entry) => (
+      entry.squad_id === squadId && entry.synchronized === true
+    )).length === 1
+  )) && status?.current?.access?.length === expectedSquads.length
+  const verificationChecks = status?.verification?.checks
+  if (
+    statusResponse.status() !== 200
+    || status?.issuance?.agent?.slug !== expectedAgentSlug
+    || status?.issuance?.agent?.disposition !== expectedDisposition
+    || status?.issuance?.home_squad_id !== expectedHomeSquadId
+    || (expectedAgentId && status?.issuance?.agent?.id !== expectedAgentId)
+    || !status?.issuance?.additional_access?.some((entry) => (
+      entry.squadId === expectedAdditionalSquadId && entry.capability === 'member'
+    ))
+    || !accessSynchronized
+    || status?.verification?.status !== 'pass'
+    || verificationChecks?.orient?.status !== 'pass'
+    || verificationChecks?.send?.status !== 'pass'
+    || verificationChecks?.inbox_peek?.status !== 'pass'
+  ) {
+    fail('agent connection status did not prove identity, access, and messaging', {
+      httpStatus: statusResponse.status(),
+      agentId: status?.issuance?.agent?.id ?? null,
+      agentSlug: status?.issuance?.agent?.slug ?? null,
+      disposition: status?.issuance?.agent?.disposition ?? null,
+      homeSquadId: status?.issuance?.home_squad_id ?? null,
+      additionalAccess: status?.issuance?.additional_access ?? null,
+      currentAccess: status?.current?.access ?? null,
+      verificationStatus: status?.verification?.status ?? null,
+      verificationChecks: verificationChecks ?? null,
+    })
+  }
+
+  const searchResponse = await context.request.get(
+    `${baseUrl}/agents/connect/search?q=${encodeURIComponent(expectedAgentSlug)}`,
+    { timeout: 20_000 },
+  )
+  const search = await searchResponse.json().catch(() => null)
+  const exactIdentities = search?.candidates?.filter((candidate) => (
+    candidate.slug === expectedAgentSlug
+  )) ?? []
+  if (
+    searchResponse.status() !== 200
+    || exactIdentities.length !== 1
+    || exactIdentities[0]?.id !== status.issuance.agent.id
+  ) {
+    fail('agent connection identity was not canonical after provisioning', {
+      httpStatus: searchResponse.status(),
+      exactIdentityCount: exactIdentities.length,
+      expectedAgentSlug,
+    })
+  }
+
+  const serializedVerification = JSON.stringify(verification)
+  if (
+    serializedVerification.includes(credential)
+    || serializedVerification.includes(challenge)
+  ) {
+    fail('agent connection verification response exposed show-once material')
+  }
+
+  // The configured PUBLIC_ORIGIN can differ from an alternate harness port.
+  // Reuse only the authorized same-origin path when loading the durable receipt.
+  await page.goto(`${baseUrl}${receiptUrl.pathname}`, {
+    waitUntil: 'networkidle',
+    timeout: 20_000,
+  })
+  await page.locator('#verification-status').filter({ hasText: 'pass' }).waitFor({ timeout: 10_000 })
+  const receiptText = await page.locator('body').innerText()
+  if (receiptText.includes(credential) || receiptText.includes(challenge)) {
+    fail('durable agent connection receipt exposed show-once material')
+  }
+  await page.screenshot({
+    path: path.join(artifactsDir, screenshotName),
+    fullPage: true,
+  })
+
+  return {
+    receiptId,
+    agentId: status.issuance.agent.id,
+    credentialShownOnce: true,
+    configurationSeparated: true,
+    messagingVerified: true,
+    additionalAccessSynchronized: true,
+    canonicalIdentityCount: exactIdentities.length,
+    durableReceiptSecretFree: true,
+  }
+}
+
+async function runAgentConnectionWorkflow() {
+  await page.goto(`${baseUrl}/agents/connect`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.locator('#new-name').fill(connectionAgentName)
+  await page.locator('#new-slug').fill(connectionAgentSlug)
+  await page.locator('#new-role').fill('member')
+  await page.locator('#new-model').fill('local-fixture')
+  await page.locator('#new-home').selectOption('sq-growth')
+  await page.locator('#choose-new').click()
+  await page.locator('#search-status').filter({ hasText: 'New identity selected' }).waitFor({ timeout: 10_000 })
+  await selectAdditionalAgentAccess('sq-operations')
+  await page.locator('#credential-label').fill('Local browser connection')
+  await page.locator('#home-capability').selectOption('member')
+
+  const evidence = await completeAgentConnection({
+    expectedAgentSlug: connectionAgentSlug,
+    expectedDisposition: 'created',
+    expectedHomeSquadId: 'sq-growth',
+    expectedAdditionalSquadId: 'sq-operations',
+    screenshotName: 'agent-connection-new-receipt.png',
+  })
+  workflows.push({
+    name: 'owner create-connect-verify agent journey',
+    status: 'passed',
+    agentSlug: connectionAgentSlug,
+    ...evidence,
+    existingIdentityReused: false,
+  })
+}
+
+async function runExistingAgentConnectionWorkflow() {
+  await page.goto(`${baseUrl}/agents/connect`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.locator('#agent-search').fill('browser-existing')
+  await page.locator('#search-button').click()
+  await page.locator('#search-status').filter({ hasText: '1 candidate(s)' }).waitFor({ timeout: 10_000 })
+  await page.getByRole('button', { name: 'Use this identity' }).click()
+  await page.locator('#agent-choice').filter({ hasText: 'existing identity selected' }).waitFor({ timeout: 10_000 })
+  await page.locator('#home-summary').filter({ hasText: 'Operations Local · immutable' }).waitFor({ timeout: 10_000 })
+  await selectAdditionalAgentAccess('sq-growth')
+  await page.locator('#credential-label').fill('Local existing-agent connection')
+  await page.locator('#home-capability').selectOption('member')
+
+  const evidence = await completeAgentConnection({
+    expectedAgentId: 'agent-browser-existing',
+    expectedAgentSlug: 'browser-existing',
+    expectedDisposition: 'reused',
+    expectedHomeSquadId: 'sq-operations',
+    expectedAdditionalSquadId: 'sq-growth',
+    screenshotName: 'agent-connection-existing-receipt.png',
+  })
+  workflows.push({
+    name: 'owner connect existing agent journey',
+    status: 'passed',
+    agentSlug: 'browser-existing',
+    ...evidence,
+    existingIdentityReused: true,
+  })
+  return evidence
+}
+
+async function runExistingAgentReplacementWorkflow(priorReceiptId) {
+  await page.goto(`${baseUrl}/agents/connect`, { waitUntil: 'networkidle', timeout: 20_000 })
+  await page.locator('#agent-search').fill('browser-existing')
+  await page.locator('#search-button').click()
+  await page.locator('#search-status').filter({ hasText: '1 candidate(s)' }).waitFor({ timeout: 10_000 })
+  const candidate = page.locator('#search-results .candidate')
+  await candidate.filter({ hasText: 'connected' }).waitFor({ timeout: 10_000 })
+  await candidate.getByRole('button', { name: 'Use this identity' }).click()
+  await page.locator('#home-summary').filter({ hasText: 'Operations Local · immutable' }).waitFor({ timeout: 10_000 })
+  await page.locator('#credential-action').selectOption('replace')
+  await page.locator('#replace-wrap').waitFor({ state: 'visible', timeout: 10_000 })
+  if (await page.locator('#replace-token option').count() !== 1) {
+    fail('connected existing agent did not expose exactly one replaceable credential')
+  }
+  await selectAdditionalAgentAccess('sq-growth')
+  await page.locator('#credential-label').fill('Local replacement connection')
+  await page.locator('#home-capability').selectOption('member')
+
+  const evidence = await completeAgentConnection({
+    expectedAgentId: 'agent-browser-existing',
+    expectedAgentSlug: 'browser-existing',
+    expectedDisposition: 'reused',
+    expectedHomeSquadId: 'sq-operations',
+    expectedAdditionalSquadId: 'sq-growth',
+    screenshotName: 'agent-connection-replacement-receipt.png',
+  })
+
+  const priorStatusResponse = await context.request.get(
+    `${baseUrl}/api/agent-connections/${encodeURIComponent(priorReceiptId)}/status`,
+    { timeout: 20_000 },
+  )
+  const priorStatus = await priorStatusResponse.json().catch(() => null)
+  if (
+    priorStatusResponse.status() !== 200
+    || priorStatus?.issuance?.agent?.id !== 'agent-browser-existing'
+    || priorStatus?.issuance?.home_squad_id !== 'sq-operations'
+    || priorStatus?.current?.token_revoked !== true
+  ) {
+    fail('replacement did not revoke only the prior credential', {
+      httpStatus: priorStatusResponse.status(),
+      agentId: priorStatus?.issuance?.agent?.id ?? null,
+      homeSquadId: priorStatus?.issuance?.home_squad_id ?? null,
+      priorTokenRevoked: priorStatus?.current?.token_revoked ?? null,
+    })
+  }
+
+  workflows.push({
+    name: 'owner replace existing agent credential journey',
+    status: 'passed',
+    agentSlug: 'browser-existing',
+    ...evidence,
+    existingIdentityReused: true,
+    existingCredentialReplaced: true,
+    priorCredentialRevoked: true,
   })
 }
 
@@ -857,6 +1153,9 @@ export async function runLocalBrowserSmoke() {
     await page.screenshot({ path: path.join(artifactsDir, 'ops-health.png'), fullPage: true })
 
     await runProjectWorkspaceWorkflow()
+    await runAgentConnectionWorkflow()
+    const existingConnection = await runExistingAgentConnectionWorkflow()
+    await runExistingAgentReplacementWorkflow(existingConnection.receiptId)
     await runSendTaskWorkflow()
     await runApprovalWorkflow()
 

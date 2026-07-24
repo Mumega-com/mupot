@@ -217,6 +217,10 @@ describe('MCP broadcast tool', () => {
     const noAgent = await invokeTool(auth({ boundAgentId: null }), env, 'broadcast', { squad_id: SQUAD_ID, body: 'x' }, 'https://pot.example')
     expect(noAgent.ok).toBe(false)
     expect(noAgent.error).toBe('not_agent_bound')
+    expect(noAgent.detail).toEqual({
+      next_action: 'provision_agent_connection',
+      dashboard_path: '/agents/connect',
+    })
 
     const crossSquad = await invokeTool(auth(), env, 'broadcast', { squad_id: OTHER_SQUAD_ID, body: 'x' }, 'https://pot.example')
     expect(crossSquad.ok).toBe(false)

@@ -150,6 +150,10 @@ import { listFlights } from '../flight/service'
 import { buildBoard } from '../flight/board'
 import type { FlightCard } from '../flight/board'
 import { wizardApp } from './wizard'
+import {
+  agentConnectionWizardApp,
+  renderAgentConnectionEntry,
+} from './agent-connection-wizard'
 import { isOnboardingComplete } from './settings'
 import { loadBrainView, brainBody, regimeBadgeClass, loadBrainPhysics } from './brain'
 import type { PhysicsSnapshot } from './brain'
@@ -236,6 +240,7 @@ dashboardApp.use('*', async (c, next) => {
 // Mounted on the authenticated, tenant-guarded dashboard app. The wizard enforces
 // its own owner-only gate (org role 'owner' OR org-capability 'owner') internally.
 dashboardApp.route('/setup', wizardApp)
+dashboardApp.route('/agents/connect', agentConnectionWizardApp)
 
 // ── routes ───────────────────────────────────────────────────────────────────
 
@@ -1026,7 +1031,7 @@ dashboardApp.get('/coordination', async (c) => {
 // Owner/admin gated on every mutating path (create, status, delete).
 // Read (GET /agents) is open to any authenticated pot member.
 
-// GET /agents — the management table: all agents across squads, plus an Add form.
+// GET /agents — the management table plus the canonical guided connection entry.
 dashboardApp.get('/agents', async (c) => {
   // Trivially-cheap header wiring (same light reads as Overview — bare KV get +
   // one-row D1 scalar, not the full loadBrainView/loadEconomy).
@@ -1046,7 +1051,10 @@ dashboardApp.get('/agents', async (c) => {
   )
 })
 
-// POST /agents — create an agent (owner/admin only).
+// POST /agents — deprecated compatibility primitive: create only, never mint.
+// New browser work enters /agents/connect so resolve-before-create, canonical
+// identity, access synchronization, credential issuance, and verification stay
+// one guided transaction.
 dashboardApp.post('/agents', async (c) => {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) {
@@ -5507,7 +5515,7 @@ function unitCard(u: AgentAdminRow, canManage: boolean): string {
 //   - Grid of unit cards (employee-performance panel, one per agent)
 //   - Per-card Pause/Resume + Delete buttons (owner/admin only, JS fetch)
 //   - Per-card Knobs form (admin only): set OKR/KPI/effort/autonomy/budget
-//   - Add-agent form (name, slug, role, model, squad picker)
+//   - Create-or-connect entry point (the old create-only POST remains compatible)
 //
 // All user-supplied strings are escaped via escHtml/escAttr.
 // Status mutations call POST /agents/:id/status (JSON body {status}).
@@ -5523,48 +5531,12 @@ function agentsBody(
     ? `<div class="warn-box" style="margin-bottom:14px"><strong>Error:</strong> ${escHtml(errorMsg)}</div>`
     : ''
 
-  // Squad <option>s for the add-agent form.
-  const squadOptHtml = squadOptions.length === 0
-    ? '<option disabled value="">No squads — create a squad first</option>'
-    : squadOptions
-        .map((s) => {
-          const label = s.dept_name
-            ? `${s.dept_name} / ${s.name}`
-            : s.name
-          return `<option value="${escAttr(s.id)}">${escHtml(label)}</option>`
-        })
-        .join('')
-
   // Unit card grid — employee performance panels, one per agent.
   const cardsHtml = agents.length === 0
     ? `<div class="card"><p class="empty">No agents yet. Add one below.</p></div>`
     : `<div class="unit-grid">${agents.map((a) => unitCard(a, canManage)).join('')}</div>`
 
-  const addForm = canManage && squadOptions.length > 0
-    ? `<div class="card" style="margin-top:20px">
-        <h2 style="margin-top:0">Add agent</h2>
-        <form class="adminform" method="post" action="/agents" autocomplete="off">
-          <label>Name
-            <input name="name" required placeholder="Dispatcher" />
-          </label>
-          <label>Slug
-            <input name="slug" required placeholder="dispatcher" />
-          </label>
-          <label>Role
-            <input name="role" placeholder="member" />
-          </label>
-          <label>Model
-            <input name="model" value="@cf/meta/llama-3.3-70b-instruct-fp8-fast" />
-          </label>
-          <label>Squad
-            <select name="squad_id" required>${squadOptHtml}</select>
-          </label>
-          <button type="submit" class="btn">Add agent</button>
-        </form>
-      </div>`
-    : canManage
-      ? `<div class="card" style="margin-top:20px"><p class="empty">Create a squad first, then add agents.</p></div>`
-      : ''
+  const connectCard = renderAgentConnectionEntry(canManage, squadOptions.length > 0)
 
   // Starter packs (#11): one-click seed of a branded squad + its work-units.
   // Admin-only; each button POSTs to the RBAC'd /squads/packs/:key seeder.
@@ -5600,7 +5572,7 @@ function agentsBody(
     ])}
     ${raw(errorBanner)}
     ${raw(cardsHtml)}
-    ${raw(addForm)}
+    ${raw(connectCard)}
     ${raw(packsCard)}
     ${canManage && agents.length > 0 ? agentsScript() : html``}`
 }

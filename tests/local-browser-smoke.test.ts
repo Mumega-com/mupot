@@ -47,4 +47,18 @@ describe('local browser route evidence', () => {
     expect(browserSmokeSource).toContain("page.goto(`${baseUrl}/flights?project_id=project-mupot`")
     expect(browserSmokeSource).toContain('submittedTask.project_id !== \'project-mupot\'')
   })
+
+  it('visits the authenticated create-or-connect agent wizard', () => {
+    expect(browserSmokeSource).toContain("'/agents/connect'")
+    expect(browserSmokeSource).toContain('runAgentConnectionWorkflow')
+    expect(browserSmokeSource).toContain('runExistingAgentConnectionWorkflow')
+    expect(browserSmokeSource).toContain('runExistingAgentReplacementWorkflow')
+    expect(browserSmokeSource).toContain("name: 'verify_agent_connection'")
+    expect(browserSmokeSource).toContain("'sq-operations'")
+    expect(browserSmokeSource).toContain('additionalAccessSynchronized: true')
+    expect(browserSmokeSource).toContain('existingIdentityReused: true')
+    expect(browserSmokeSource).toContain('existingCredentialReplaced: true')
+    expect(browserSmokeSource).toContain('priorCredentialRevoked: true')
+    expect(browserSmokeSource).toContain('durableReceiptSecretFree: true')
+  })
 })

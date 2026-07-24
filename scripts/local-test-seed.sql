@@ -30,11 +30,19 @@ ON CONFLICT(id) DO UPDATE SET
 INSERT INTO squads (
   id, department_id, slug, name, charter, created_at, role, okr, kpi_target,
   kpi_progress, effort, autonomy, budget_cap_cents, budget_window
-) VALUES (
-  'sq-growth', 'dept-growth', 'growth', 'Growth Local', 'Local browser and Hermes smoke squad.',
-  datetime('now'), 'growth pod', 'Keep the local pot smokeable', 'All dashboard pages return HTTP 200',
-  0.72, 'standard', 'execute_with_approval', 2500, 'week'
-)
+) VALUES
+  (
+    'sq-growth', 'dept-growth', 'growth', 'Growth Local', 'Local browser and Hermes smoke squad.',
+    datetime('now'), 'growth pod', 'Keep the local pot smokeable', 'All dashboard pages return HTTP 200',
+    0.72, 'standard', 'execute_with_approval', 2500, 'week'
+  ),
+  (
+    'sq-operations', 'dept-growth', 'operations', 'Operations Local',
+    'Second local squad for agent-connection access synchronization evidence.',
+    datetime('now'), 'operations pod', 'Prove cross-squad agent access',
+    'One identity has synchronized home and additional access',
+    0.50, 'standard', 'execute_with_approval', 2500, 'week'
+  )
 ON CONFLICT(id) DO UPDATE SET
   department_id = excluded.department_id,
   slug = excluded.slug,
@@ -145,7 +153,8 @@ INSERT INTO agents (
   ('agent-hermes', 'sq-growth', 'hermes', 'Hermes Local', 'IM control and local smoke', '@cf/meta/llama-3.3', 'active', datetime('now'), NULL, 'local smoke passing', 0.66, 'standard', 'draft', 1500, 'week'),
   ('agent-growth', 'sq-growth', 'growth-lead', 'Growth Lead Local', 'Growth operator', '@cf/meta/llama-3.3', 'paused', datetime('now'), 'Improve local pipeline confidence', '3 smoke checks green', 0.45, 'low', 'suggest', 500, 'day'),
   ('agent-conformance', 'sq-growth', 'runtime-conformance', 'Runtime Conformance Local', 'Local signed runtime adapter fixture', 'local-fixture', 'active', datetime('now'), 'Prove runtime-adapter/v1 over HTTP', 'signed attach, inbox, and detach pass', 0.1, 'low', 'draft', 100, 'day'),
-  ('agent-conformance-sender', 'sq-growth', 'runtime-conformance-sender', 'Runtime Conformance Sender', 'Local sender fixture for runtime conformance', 'local-fixture', 'active', datetime('now'), 'Seed conformance inbox messages', 'bearer send succeeds', 0.1, 'low', 'draft', 100, 'day')
+  ('agent-conformance-sender', 'sq-growth', 'runtime-conformance-sender', 'Runtime Conformance Sender', 'Local sender fixture for runtime conformance', 'local-fixture', 'active', datetime('now'), 'Seed conformance inbox messages', 'bearer send succeeds', 0.1, 'low', 'draft', 100, 'day'),
+  ('agent-browser-existing', 'sq-operations', 'browser-existing', 'Browser Existing Local', 'Existing unminted browser connection fixture', 'local-fixture', 'active', datetime('now'), 'Prove existing identity reuse', 'One existing identity is connected without duplication', 0.1, 'low', 'draft', 100, 'day')
 ON CONFLICT(id) DO UPDATE SET
   squad_id = excluded.squad_id,
   slug = excluded.slug,
@@ -166,7 +175,8 @@ VALUES
   ('memship-hermes-growth', 'agent-hermes', 'sq-growth', 'lead'),
   ('memship-growth-growth', 'agent-growth', 'sq-growth', 'member'),
   ('memship-conformance-growth', 'agent-conformance', 'sq-growth', 'member'),
-  ('memship-conformance-sender-growth', 'agent-conformance-sender', 'sq-growth', 'member')
+  ('memship-conformance-sender-growth', 'agent-conformance-sender', 'sq-growth', 'member'),
+  ('memship-browser-existing-operations', 'agent-browser-existing', 'sq-operations', 'member')
 ON CONFLICT(id) DO UPDATE SET capability = excluded.capability;
 
 INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)

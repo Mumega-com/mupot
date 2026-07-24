@@ -194,6 +194,11 @@ function isUniqueViolation(error: unknown): boolean {
   return error instanceof Error && /UNIQUE constraint failed/i.test(error.message)
 }
 
+function isPendingQuotaViolation(error: unknown): boolean {
+  return error instanceof Error
+    && error.message.includes('agent_connection_pending_quota')
+}
+
 function errorOutcome(error: string, details?: Record<string, string>): AgentConnectionOutcome {
   return details ? { status: 'error', error, details } : { status: 'error', error }
 }
@@ -464,6 +469,9 @@ async function reserve(
       addMs(now, AGENT_CONNECTION_PENDING_TTL_MS),
     ).run()
   } catch (error) {
+    if (isPendingQuotaViolation(error)) {
+      return errorOutcome('too_many_pending_agent_connections')
+    }
     if (!isUniqueViolation(error)) throw error
     const raced = await env.DB.prepare(
       `SELECT request_fingerprint, status, receipt_id, error_code
@@ -483,6 +491,46 @@ async function reserve(
     return errorOutcome('agent_setup_in_progress')
   }
   return null
+}
+
+export async function cancelAgentConnectionRequest(
+  env: Env,
+  actor: AgentConnectionActor,
+  requestId: string,
+  now = new Date(),
+): Promise<
+  | { ok: true; status: 'cancelled' }
+  | { ok: false; error: 'invalid_request_id' | 'request_not_pending' }
+> {
+  const normalizedRequestId = requestId.trim()
+  if (normalizedRequestId.length < 1 || normalizedRequestId.length > 128) {
+    return { ok: false, error: 'invalid_request_id' }
+  }
+
+  const nowIso = now.toISOString()
+  const result = await env.DB.prepare(
+    `UPDATE agent_connection_requests
+        SET status = 'failed',
+            error_code = 'cancelled',
+            updated_at = ?,
+            finalized_at = ?
+      WHERE tenant = ?
+        AND actor_kind = ?
+        AND actor_id = ?
+        AND request_id = ?
+        AND status = 'pending'`,
+  ).bind(
+    nowIso,
+    nowIso,
+    env.TENANT_SLUG,
+    actor.kind,
+    actor.id,
+    normalizedRequestId,
+  ).run()
+
+  return rowsWritten(result) === 1
+    ? { ok: true, status: 'cancelled' }
+    : { ok: false, error: 'request_not_pending' }
 }
 
 async function failReservation(

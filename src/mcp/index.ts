@@ -1976,6 +1976,11 @@ const toolSquadMessage: ToolSpec = {
 // The sender MUST be an agent-bound token (auth.boundAgentId = the weld) so every message is
 // accountable to a real agent; humans use im/squad_message. Recipient resolved via the canonical
 // resolveAgentRef (id-first, slug ambiguity refused). Tenant-scoped: cannot address another pot.
+const AGENT_CONNECTION_NEXT_ACTION = {
+  next_action: 'provision_agent_connection',
+  dashboard_path: '/agents/connect',
+} as const
+
 const toolSend: ToolSpec = {
   name: 'send',
   scope: 'agent→agent (this pot); sender must be agent-bound',
@@ -1996,7 +2001,7 @@ const toolSend: ToolSpec = {
   },
   async run(auth, env, args) {
     const fromAgent = auth.boundAgentId
-    if (!fromAgent) return fail(403, 'not_agent_bound', 'send requires an agent-bound token (member_tokens.agent_id)')
+    if (!fromAgent) return fail(403, 'not_agent_bound', AGENT_CONNECTION_NEXT_ACTION)
     const to = str(args.to)
     const body = str(args.body)
     if (!to) return fail(400, 'invalid_args', 'to required')
@@ -2074,7 +2079,7 @@ const toolBroadcast: ToolSpec = {
   },
   async run(auth, env, args) {
     const fromAgent = auth.boundAgentId
-    if (!fromAgent) return fail(403, 'not_agent_bound', 'broadcast requires an agent-bound token (member_tokens.agent_id)')
+    if (!fromAgent) return fail(403, 'not_agent_bound', AGENT_CONNECTION_NEXT_ACTION)
 
     const body = str(args.body)
     if (!body) return fail(400, 'invalid_args', 'body required')
@@ -2174,7 +2179,7 @@ const toolInbox: ToolSpec = {
   },
   async run(auth, env, args) {
     const agent = auth.boundAgentId
-    if (!agent) return fail(403, 'not_agent_bound', 'inbox requires an agent-bound token (member_tokens.agent_id)')
+    if (!agent) return fail(403, 'not_agent_bound', AGENT_CONNECTION_NEXT_ACTION)
     let limit: number | undefined
     if (args.limit !== undefined) {
       if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
