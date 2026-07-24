@@ -151,6 +151,32 @@ test('runCycle reports a short consume without calling it a drop', async () => {
   assert.deepEqual(result.missing, ['id:msg-yc27-c'])
 })
 
+test('runCycle counts duplicate ids by multiplicity, not set membership', async () => {
+  // A malformed consume repeating one id must not read as covering two rows.
+  const mcpCall = async (_token, name, args) => {
+    if (name === 'boot_context') return { bound_agent_id: AGENT }
+    if (name === 'inbox_consumer_status') return { mode: 'bearer_only' }
+    if (name === 'inbox' && args.peek === true) {
+      return { messages: [REQUEST, { ...REQUEST, seq: 132, id: 'msg-two' }], remaining: 0 }
+    }
+    if (name === 'inbox' && args.peek === false) {
+      return { messages: [REQUEST, REQUEST], remaining: 0 }
+    }
+    throw new Error(`unexpected ${name}`)
+  }
+
+  const result = await runCycle({
+    token: 'test-token-not-real',
+    mcpCall,
+    deliverToTmux: () => ({ ok: true }),
+  })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'consumed_undelivered_message')
+  assert.deepEqual(result.dropped, ['id:msg-yc27'])
+  assert.deepEqual(result.missing, ['id:msg-two'])
+})
+
 test('runCycle refuses a fence answer with no explicit mode (fail closed)', async () => {
   for (const fence of [{}, { mode: '' }, { mode: null }, { agent_id: AGENT }]) {
     const result = await runCycle({

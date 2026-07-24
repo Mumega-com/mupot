@@ -138,12 +138,24 @@ export function verifyConsumedBatch(input) {
     consumedKeys.push(key)
   }
 
-  const expectedSet = new Set(expectedKeys)
-  const consumedSet = new Set(consumedKeys)
+  // Compare by multiplicity, not set membership: a malformed payload repeating
+  // one id twice must not read as "covered" by a single delivered copy.
+  const tally = (keys) => keys.reduce((acc, k) => acc.set(k, (acc.get(k) ?? 0) + 1), new Map())
+  const expectedCounts = tally(expectedKeys)
+  const consumedCounts = tally(consumedKeys)
+
   // Consumed but never delivered — gone from the queue, never shown to anyone.
-  const dropped = consumedKeys.filter((k) => !expectedSet.has(k))
+  const dropped = []
+  for (const [key, count] of consumedCounts) {
+    const surplus = count - (expectedCounts.get(key) ?? 0)
+    for (let i = 0; i < surplus; i += 1) dropped.push(key)
+  }
   // Delivered but not consumed — still queued, will redeliver.
-  const missing = expectedKeys.filter((k) => !consumedSet.has(k))
+  const missing = []
+  for (const [key, count] of expectedCounts) {
+    const shortfall = count - (consumedCounts.get(key) ?? 0)
+    for (let i = 0; i < shortfall; i += 1) missing.push(key)
+  }
 
   if (dropped.length > 0) return { ok: false, reason: 'consumed_undelivered_message', dropped, missing }
   if (missing.length > 0) return { ok: false, reason: 'consume_incomplete', dropped, missing }
