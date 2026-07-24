@@ -91,6 +91,9 @@ function makeGrantRouteEnv(existingCapabilities: Capability[]): Env {
         },
         async first<T>() {
           if (sql.includes('SELECT id FROM members')) return { id: 'member-1' } as T
+          if (sql.includes('SELECT b.agent_id') && sql.includes('b.member_id')) {
+            return null
+          }
           if (sql.includes('SELECT capability FROM capabilities')) {
             const capability = existingCapabilities[0]
             return (capability === undefined ? null : { capability }) as T | null

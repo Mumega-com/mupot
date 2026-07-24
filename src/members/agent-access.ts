@@ -68,9 +68,33 @@ interface PriorMembership {
   capability: string
 }
 
-function isAgentAccessCapability(value: unknown): value is AgentAccessCapability {
+export function isAgentAccessCapability(value: unknown): value is AgentAccessCapability {
   return typeof value === 'string'
     && (ACCESS_CAPABILITIES as readonly string[]).includes(value)
+}
+
+export async function resolveBoundAgentForMember(
+  env: Env,
+  memberId: string,
+): Promise<{ agentId: string; homeSquadId: string } | null> {
+  const row = await env.DB.prepare(
+    `SELECT b.agent_id, a.squad_id AS home_squad_id
+       FROM agent_member_bindings b
+       JOIN agents a ON a.id = b.agent_id
+       JOIN members m
+         ON m.id = b.member_id
+        AND m.tenant = b.tenant
+        AND m.status = 'active'
+      WHERE b.tenant = ?
+        AND b.member_id = ?
+      LIMIT 1`,
+  ).bind(env.TENANT_SLUG, memberId).first<{
+    agent_id: string
+    home_squad_id: string
+  }>()
+  return row
+    ? { agentId: row.agent_id, homeSquadId: row.home_squad_id }
+    : null
 }
 
 async function loadAgentBindingState(
