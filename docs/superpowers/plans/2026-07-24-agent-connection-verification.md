@@ -65,20 +65,20 @@ export async function deleteAgentConnectionMessage(
 ): Promise<{ ok: true } | { ok: false; reason: 'message_not_found' | 'db_error' }>
 ```
 
-- [ ] **Step 1: Write failing migration tests**
+- [x] **Step 1: Write failing migration tests**
 
 Add real-SQLite assertions that all migrations create
 `verification_attempts INTEGER NOT NULL DEFAULT 0`, that negative values and
 values above five are rejected, and that the field may increment while issuance
 snapshot columns remain immutable.
 
-- [ ] **Step 2: Write failing cleanup tests**
+- [x] **Step 2: Write failing cleanup tests**
 
 Seed two tenants and multiple messages, then prove cleanup removes exactly the
 row matching all four server-known values and returns `message_not_found` for a
 mismatch without deleting anything else.
 
-- [ ] **Step 3: Run tests and verify failure**
+- [x] **Step 3: Run tests and verify failure**
 
 ```bash
 npx vitest run \
@@ -89,7 +89,7 @@ npx vitest run \
 Expected: failure because migration `0072` and
 `deleteAgentConnectionMessage()` do not exist.
 
-- [ ] **Step 4: Add migration `0072`**
+- [x] **Step 4: Add migration `0072`**
 
 Use:
 
@@ -113,7 +113,7 @@ BEGIN
 END;
 ```
 
-- [ ] **Step 5: Implement exact cleanup**
+- [x] **Step 5: Implement exact cleanup**
 
 Delete with one tenant-scoped statement:
 
@@ -129,11 +129,11 @@ DELETE FROM agent_messages
 Map one changed row to `{ ok: true }`, zero to `message_not_found`, and thrown
 errors to `db_error` without returning the raw database message.
 
-- [ ] **Step 6: Run focused tests**
+- [x] **Step 6: Run focused tests**
 
 Expected: both files pass.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add migrations/0072_agent_connection_verification.sql \
@@ -161,7 +161,7 @@ git commit -m "feat: add agent connection verification state"
 - Produces: `AgentIdentity.tokenId: string`.
 - Preserves: directory OAuth capability ceiling and `boundAgentId = null`.
 
-- [ ] **Step 1: Write failing auth tests**
+- [x] **Step 1: Write failing auth tests**
 
 Cover:
 
@@ -172,7 +172,7 @@ Cover:
 - revoked/wrong-member tokens still return null;
 - shared HTTP bearer resolution returns the same token ID.
 
-- [ ] **Step 2: Run tests and verify failure**
+- [x] **Step 2: Run tests and verify failure**
 
 ```bash
 npx vitest run \
@@ -183,7 +183,7 @@ npx vitest run \
 
 Expected: failure because the current auth shape omits token identity.
 
-- [ ] **Step 3: Extend the types and queries**
+- [x] **Step 3: Extend the types and queries**
 
 Add:
 
@@ -195,14 +195,14 @@ to `AuthContext`, select `t.id AS token_id` in the direct MCP and shared bearer
 queries, and set `tokenId` only from the committed row or trusted OAuth props.
 Never read it from tool arguments.
 
-- [ ] **Step 4: Preserve internal-header hardening**
+- [x] **Step 4: Preserve internal-header hardening**
 
 When `resolveAuth()` accepts the internal OAuth header, re-resolve the referenced
 token row by `(tokenId, memberId, tenant, revoked_at IS NULL)` before retaining
 `tokenId` and `boundAgentId`. If that proof is absent, clear both and let
 verification refuse.
 
-- [ ] **Step 5: Run focused tests and typecheck**
+- [x] **Step 5: Run focused tests and typecheck**
 
 ```bash
 npx vitest run \
@@ -214,7 +214,7 @@ npm run typecheck
 
 Expected: pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/types.ts src/mcp/index.ts src/mcp/oauth-authorize.ts \
@@ -268,7 +268,7 @@ export async function verifyAgentConnection(
 ): Promise<AgentConnectionVerificationOutcome>
 ```
 
-- [ ] **Step 1: Write failing real-SQLite tests**
+- [x] **Step 1: Write failing real-SQLite tests**
 
 Provision a receipt through `provisionAgentConnection()` and cover:
 
@@ -290,7 +290,7 @@ Provision a receipt through `provisionAgentConnection()` and cover:
 - a retry after transient cleanup failure reuses the deterministic send and
   finishes cleanup/pass.
 
-- [ ] **Step 2: Run test and verify failure**
+- [x] **Step 2: Run test and verify failure**
 
 ```bash
 npx vitest run tests/agent-connection-verification.test.ts
@@ -298,13 +298,13 @@ npx vitest run tests/agent-connection-verification.test.ts
 
 Expected: module not found.
 
-- [ ] **Step 3: Implement constant-work challenge validation**
+- [x] **Step 3: Implement constant-work challenge validation**
 
 Hash the supplied challenge with SHA-256, decode both lowercase hex digests into
 fixed 32-byte arrays, XOR every byte, and branch only after the loop. Reject
 malformed stored hashes generically.
 
-- [ ] **Step 4: Implement identity and attempt transitions**
+- [x] **Step 4: Implement identity and attempt transitions**
 
 Load by `(tenant, receipt_id)`, compare the four server-derived identity fields,
 then conditionally increment:
@@ -328,7 +328,7 @@ UPDATE agent_connection_receipts
 
 At the fifth failure, conditionally update the matching request to `failed`.
 
-- [ ] **Step 5: Implement messaging proof**
+- [x] **Step 5: Implement messaging proof**
 
 Call `buildOrient()` for the receipt agent, then:
 
@@ -341,7 +341,7 @@ Use `sendAgentMessage()` with a server-only self-send authorization reason,
 `readAgentInbox(..., { peek: true, limit: 100 })`, match by returned message ID
 and request ID, then call `deleteAgentConnectionMessage()`.
 
-- [ ] **Step 6: Commit verification results atomically**
+- [x] **Step 6: Commit verification results atomically**
 
 On pass, one D1 batch must:
 
@@ -358,11 +358,11 @@ request at `client_connected`.
 
 Assert every conditional write.
 
-- [ ] **Step 7: Run focused tests**
+- [x] **Step 7: Run focused tests**
 
 Expected: pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/members/agent-connection-verification.ts \
@@ -394,7 +394,7 @@ git commit -m "feat: verify agent messaging connections"
 }
 ```
 
-- [ ] **Step 1: Write failing MCP tests**
+- [x] **Step 1: Write failing MCP tests**
 
 Drive JSON-RPC with real SQLite and the issued raw token. Prove the callback:
 
@@ -407,7 +407,7 @@ Drive JSON-RPC with real SQLite and the issued raw token. Prove the callback:
   details;
 - never returns challenge, raw token, token hash, or message body.
 
-- [ ] **Step 2: Run test and verify failure**
+- [x] **Step 2: Run test and verify failure**
 
 ```bash
 npx vitest run tests/mcp-agent-connection-verification.test.ts
@@ -415,14 +415,14 @@ npx vitest run tests/mcp-agent-connection-verification.test.ts
 
 Expected: `unknown_tool`.
 
-- [ ] **Step 3: Implement and register tool**
+- [x] **Step 3: Implement and register tool**
 
 Require `auth.tokenId`, `auth.memberId`, and `auth.boundAgentId`; call
 `verifyAgentConnection()` with those server-derived fields. Use
 `additionalProperties: false`. Map errors to 400/403/404/409/410/500 without
 returning which identity field mismatched.
 
-- [ ] **Step 4: Run MCP and provisioning tests**
+- [x] **Step 4: Run MCP and provisioning tests**
 
 ```bash
 npx vitest run \
@@ -432,7 +432,7 @@ npx vitest run \
 
 Expected: pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/mcp/agent-connection.ts src/mcp/index.ts \
@@ -465,7 +465,7 @@ export async function loadAgentConnectionStatus(
 
 - Produces: `GET /api/agent-connections/:receiptId/status`.
 
-- [ ] **Step 1: Write failing route tests**
+- [x] **Step 1: Write failing route tests**
 
 Cover:
 
@@ -478,7 +478,7 @@ Cover:
 - output includes no actor ID, raw/hash/challenge/config/message body;
 - pending/pass/fail/expired states survive manual refresh.
 
-- [ ] **Step 2: Run test and verify failure**
+- [x] **Step 2: Run test and verify failure**
 
 ```bash
 npx vitest run tests/agent-connection-status.test.ts
@@ -486,7 +486,7 @@ npx vitest run tests/agent-connection-status.test.ts
 
 Expected: route not found.
 
-- [ ] **Step 3: Implement authorization**
+- [x] **Step 3: Implement authorization**
 
 Load the receipt only for `env.TENANT_SLUG`. Allow when:
 
@@ -499,17 +499,17 @@ const issuedByCaller =
 or when the caller is an owner/admin web session or has effective admin on
 `receipt.home_squad_id`. Collapse every denial to `not_found`.
 
-- [ ] **Step 4: Build the public status**
+- [x] **Step 4: Build the public status**
 
 Return issuance snapshot plus separately labelled current agent status, token
 revocation boolean, and synchronized access. Return only the last four
 characters of token ID in polling output.
 
-- [ ] **Step 5: Register route and run tests**
+- [x] **Step 5: Register route and run tests**
 
 Expected: pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/members/agent-connection-status.ts src/dashboard/index.ts \
@@ -529,7 +529,7 @@ git commit -m "feat: expose agent connection status"
 - Verifies: `boot_context`, `orient`, `send`, `inbox { peek: true }`,
   `verify_agent_connection`, and exact cleanup.
 
-- [ ] **Step 1: Build one real end-to-end SQLite/MCP test**
+- [x] **Step 1: Build one real end-to-end SQLite/MCP test**
 
 Apply all migrations, seed an operator, call
 `provision_agent_connection`, capture the show-once raw token, reconnect using
@@ -546,13 +546,13 @@ that raw token, and assert:
 Also drive Claude/Codex/Cursor configuration output and assert every endpoint
 uses pinned `PUBLIC_ORIGIN` under a malicious request Host.
 
-- [ ] **Step 2: Add the negative matrix**
+- [x] **Step 2: Add the negative matrix**
 
 Use a human token, another token for the same agent, another agent token, and a
 cross-tenant receipt. All must fail closed without exposing identity mismatch
 details.
 
-- [ ] **Step 3: Run the end-to-end test**
+- [x] **Step 3: Run the end-to-end test**
 
 ```bash
 npx vitest run tests/agent-connection-issued-key.test.ts
@@ -560,7 +560,7 @@ npx vitest run tests/agent-connection-issued-key.test.ts
 
 Expected: pass.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/agent-connection-issued-key.test.ts
@@ -577,7 +577,7 @@ git commit -m "test: prove issued agent connection key"
 **Interfaces:**
 - Verifies the entire stacked verification slice.
 
-- [ ] **Step 1: Run focused matrix**
+- [x] **Step 1: Run focused matrix**
 
 ```bash
 npx vitest run \
@@ -594,14 +594,14 @@ npx vitest run \
   tests/provision-tools.test.ts
 ```
 
-- [ ] **Step 2: Run typecheck and full suite**
+- [x] **Step 2: Run typecheck and full suite**
 
 ```bash
 npm run typecheck
 npm test
 ```
 
-- [ ] **Step 3: Run secret/direct-write audit**
+- [x] **Step 3: Run secret/direct-write audit**
 
 ```bash
 git diff --check
@@ -619,6 +619,22 @@ public payload construction are not.
 
 Open against `feat/agent-connection-foundation`, link #528 and PR #537, list
 the exact current-head evidence, and request independent red-team review.
+
+---
+
+## Current-Head Evidence (2026-07-24)
+
+- Focused verification matrix: 11 files, 128 tests passed.
+- TypeScript: `pnpm typecheck` passed.
+- Full repository suite: 264 files, 4,277 tests passed with
+  `pnpm vitest run --maxWorkers=4 --reporter=dot`.
+- Secret audit: no raw credential, token hash, challenge plaintext, generated
+  configuration, or loopback body enters a receipt or polling response.
+- Writer audit: request/receipt writes are confined to
+  `members/agent-connection.ts` and
+  `members/agent-connection-verification.ts`; the status service is read-only.
+- No production migration, deployment, live mint, live revocation, merge, or
+  self-gate was performed.
 
 ---
 
