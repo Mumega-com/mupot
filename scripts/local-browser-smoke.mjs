@@ -46,6 +46,7 @@ const pages = [
   '/ops',
   '/coordination',
   '/agents',
+  '/agents/connect',
   '/squads/sq-growth',
   '/agents/agent-hermes',
   '/admin/members',

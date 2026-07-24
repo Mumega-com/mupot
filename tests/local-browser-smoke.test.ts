@@ -47,4 +47,8 @@ describe('local browser route evidence', () => {
     expect(browserSmokeSource).toContain("page.goto(`${baseUrl}/flights?project_id=project-mupot`")
     expect(browserSmokeSource).toContain('submittedTask.project_id !== \'project-mupot\'')
   })
+
+  it('visits the authenticated create-or-connect agent wizard', () => {
+    expect(browserSmokeSource).toContain("'/agents/connect'")
+  })
 })
