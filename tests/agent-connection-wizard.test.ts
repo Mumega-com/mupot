@@ -6,6 +6,7 @@ import {
   agentConnectionWizardApp,
   type AgentConnectionWizardAppEnv,
 } from '../src/dashboard/agent-connection-wizard'
+import { dashboardApp } from '../src/dashboard'
 import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -108,6 +109,38 @@ describe('agent connection owner wizard', () => {
       boundAgentId: 'agent-existing',
     }).request('/agents/connect', {}, env)
     expect(bound.status).toBe(403)
+  })
+
+  it('is mounted behind dashboard session auth with no-store browser headers', async () => {
+    const dashboardEnv = {
+      ...env,
+      SESSIONS: {
+        get: async () => JSON.stringify({
+          userId: OWNER.userId,
+          email: OWNER.email,
+          role: OWNER.role,
+          createdAt: '2026-07-24T00:00:00.000Z',
+        }),
+        delete: async () => undefined,
+      },
+    } as unknown as Env
+    const response = await dashboardApp.fetch(
+      new Request('https://pot.example/agents/connect', {
+        headers: { Cookie: 'mupot_session=owner-session' },
+      }),
+      dashboardEnv,
+    )
+    expect(response.status).toBe(200)
+    expect(response.headers.get('cache-control')).toBe('no-store')
+    expect(response.headers.get('referrer-policy')).toBe('no-referrer')
+    expect(await response.text()).toContain('Create or connect agent')
+
+    const unauthenticated = await dashboardApp.fetch(
+      new Request('https://pot.example/agents/connect'),
+      dashboardEnv,
+    )
+    expect(unauthenticated.status).toBe(302)
+    expect(unauthenticated.headers.get('location')).toBe('/auth/login')
   })
 
   it('returns searchable non-secret candidates with immutable home and live token metadata', async () => {
