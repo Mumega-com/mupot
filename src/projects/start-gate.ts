@@ -5,7 +5,7 @@
 // planned → active is NOT a bare enum flip. One governed action must:
 //   1) seed >=1 first task from the project goal onto a write/admin squad, AND
 //   2) mint/confirm that squad's resource via the EXISTING grant path
-//      (mintAgentBoundToken / upsertActiveAgentCapabilityGrant) — no fork.
+//      (mintAgentBoundToken / setAgentSquadAccess) — no fork.
 // If the resource commit fails, the project stays planned and surfaces as
 // blocked-start (no false active). A stale planned project with no provision
 // attempt escalates to org owners (ghost-start alarm).
@@ -15,9 +15,9 @@ import {
   mintAgentBoundToken,
   resolveActiveAgentMember,
   revokeMemberToken,
-  upsertActiveAgentCapabilityGrant,
   type AgentForMint,
 } from '../members/service'
+import { setAgentSquadAccess } from '../members/agent-access'
 import { createTask } from '../tasks/service'
 import { writeReceiptToD1 } from '../workflows/pipeline'
 import { lifecycleTaskId } from './circuit-breaker'
@@ -114,15 +114,18 @@ export type ResolveActiveAgentMemberFn = (
   agentId: string,
 ) => Promise<string | 'unminted' | 'ambiguous'>
 
-export type UpsertActiveAgentCapabilityGrantFn = (
+export type SetAgentSquadAccessFn = (
   env: Env,
   input: {
     agentId: string
-    expectedMemberId: string
+    memberId: string
     squadId: string
     capability: typeof START_RESOURCE_CAPABILITY
   },
-) => Promise<{ result: 'created' | 'updated' | 'unchanged' } | null>
+) => Promise<
+  | { ok: true; result: 'created' | 'updated' | 'unchanged' | 'removed' }
+  | { ok: false; error: string }
+>
 
 export interface StartGateDeps {
   writeReceipt: WriteReceiptFn
@@ -131,7 +134,7 @@ export interface StartGateDeps {
   mintAgentBoundToken: MintAgentBoundTokenFn
   revokeMemberToken: RevokeMemberTokenFn
   resolveActiveAgentMember: ResolveActiveAgentMemberFn
-  upsertActiveAgentCapabilityGrant: UpsertActiveAgentCapabilityGrantFn
+  setAgentSquadAccess: SetAgentSquadAccessFn
   principal: string
 }
 
@@ -153,8 +156,7 @@ export function defaultStartGateDeps(): StartGateDeps {
       mintAgentBoundToken(env, agent, label, capability),
     revokeMemberToken: (env, memberId, tokenId) => revokeMemberToken(env, memberId, tokenId),
     resolveActiveAgentMember,
-    upsertActiveAgentCapabilityGrant: (env, input) =>
-      upsertActiveAgentCapabilityGrant(env, input),
+    setAgentSquadAccess: (env, input) => setAgentSquadAccess(env, input),
     principal: START_GATE_PRINCIPAL,
   }
 }
@@ -302,7 +304,7 @@ export async function commitSquadResource(
   agent: AgentForMint,
   deps: Pick<
     StartGateDeps,
-    'mintAgentBoundToken' | 'resolveActiveAgentMember' | 'upsertActiveAgentCapabilityGrant'
+    'mintAgentBoundToken' | 'resolveActiveAgentMember' | 'setAgentSquadAccess'
   >,
 ): Promise<{ kind: ResourceCommitKind; memberId: string; tokenId: string | null } | null> {
   const identity = await deps.resolveActiveAgentMember(env, agent.id)
@@ -318,13 +320,13 @@ export async function commitSquadResource(
     return { kind: 'minted', memberId: minted.memberId, tokenId: minted.tokenId }
   }
 
-  const outcome = await deps.upsertActiveAgentCapabilityGrant(env, {
+  const outcome = await deps.setAgentSquadAccess(env, {
     agentId: agent.id,
-    expectedMemberId: identity,
+    memberId: identity,
     squadId: agent.squad_id,
     capability: START_RESOURCE_CAPABILITY,
   })
-  if (!outcome) return null
+  if (!outcome.ok) return null
   return { kind: 'confirmed', memberId: identity, tokenId: null }
 }
 

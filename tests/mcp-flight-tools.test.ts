@@ -713,6 +713,14 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           created_at TEXT NOT NULL DEFAULT (datetime('now')), revoked_at TEXT,
           agent_id TEXT, tenant TEXT NOT NULL
         );
+        CREATE TABLE agent_member_bindings (
+          tenant TEXT NOT NULL, agent_id TEXT NOT NULL, member_id TEXT NOT NULL,
+          created_at TEXT NOT NULL, PRIMARY KEY (tenant, agent_id), UNIQUE (tenant, member_id)
+        );
+        CREATE TABLE memberships (
+          id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, squad_id TEXT NOT NULL,
+          capability TEXT NOT NULL, UNIQUE (agent_id, squad_id)
+        );
         CREATE TABLE capabilities (
           id TEXT PRIMARY KEY, member_id TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT,
           capability TEXT NOT NULL CHECK (capability IN ('owner','admin','lead','member','observer')),
@@ -754,6 +762,8 @@ describe('MCP granted multi-squad flight lifecycle', () => {
         VALUES ('${MEMBER_ID}', 'Product', 'active', '${TENANT}');
         INSERT INTO members (id, display_name, status, tenant)
         VALUES ('member-operator', 'Operator', 'active', '${TENANT}');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('${TENANT}', '${AGENT_ID}', '${MEMBER_ID}', '2026-07-24T00:00:00.000Z');
         INSERT INTO member_tokens (id, member_id, token_hash, revoked_at, agent_id, tenant)
         VALUES ('token-product', '${MEMBER_ID}', '${productTokenHash}', NULL, '${AGENT_ID}', '${TENANT}');
         INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)

@@ -180,13 +180,15 @@ describe('setAgentStatus', () => {
 // ── deleteAgent ───────────────────────────────────────────────────────────────
 
 describe('deleteAgent', () => {
-  it('nulls task assignees then deletes the row', async () => {
+  it('atomically nulls task assignees and deletes the row', async () => {
     const { env, calls } = makeEnv([], [2, 1]) // 2 tasks nulled, 1 agent deleted
     const result = await deleteAgent(env, 'agent-xyz')
     expect(result).toEqual({ ok: true })
-    // First call must null out task assignees
-    expect(calls[0].sql).toContain('UPDATE tasks SET assignee_agent_id = NULL')
-    expect(calls[0].binds).toEqual(['agent-xyz'])
+    // First statement conditionally nulls assignments only for an existing agent.
+    expect(calls[0].sql).toContain('UPDATE tasks')
+    expect(calls[0].sql).toContain('SET assignee_agent_id = NULL')
+    expect(calls[0].sql).toContain('EXISTS (SELECT 1 FROM agents')
+    expect(calls[0].binds).toEqual(['agent-xyz', 'agent-xyz'])
     // Second call deletes the agent
     expect(calls[1].sql).toContain('DELETE FROM agents WHERE id')
     expect(calls[1].binds).toEqual(['agent-xyz'])

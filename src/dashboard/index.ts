@@ -65,7 +65,13 @@ import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
 import { resolveAgentRef } from '../org/resolve'
 
 // Connect-config builders (pure) for the Connect card.
-import { mcpEndpoint, claudeCodeSnippet, codexSnippet } from './connect'
+import {
+  mcpEndpoint,
+  claudeCodeSnippet,
+  codexSnippet,
+  cursorSnippet,
+  requiredCanonicalOrigin,
+} from './connect'
 import { loadApprovals, loadPublishable, resultPreview } from './approvals'
 import { CONTENT_DEPARTMENT_KEY } from '../agents/execute'
 import { loadLoopsView, loopsBody } from './loops'
@@ -1376,10 +1382,27 @@ dashboardApp.get('/admin/agent-token', async (c) => {
 // POST /admin/agent-token/mint
 dashboardApp.post('/admin/agent-token/mint', async (c) => {
   const auth = c.get('auth')
+  if (auth.boundAgentId) {
+    return c.html(
+      shell(c.env, 'Mint agent token', errorBody('An operator principal is required.')),
+      403,
+    )
+  }
   if (!isOrgAdmin(auth)) {
     return c.html(
       shell(c.env, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
       403,
+    )
+  }
+  const canonical = requiredCanonicalOrigin(c.env)
+  if (!canonical.ok) {
+    return c.html(
+      shell(
+        c.env,
+        'Mint agent token',
+        errorBody('A secure public origin must be configured before provisioning a token.'),
+      ),
+      503,
     )
   }
 
@@ -1428,9 +1451,9 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   }
   const agent = agentResult.value
 
-  // Delegate to the shared atomic-mint helper.
-  // Three rows in ONE D1 batch: member envelope + escalation-guard capability +
-  // agent-weld token. Same path the MCP mint_agent_token tool uses.
+  // Delegate to the shared atomic-mint helper. A first mint creates the member,
+  // binding, home capability, and welded token; later mints add only the token.
+  // This is the same path the MCP mint_agent_token tool uses.
   const minted = await mintAgentBoundToken(c.env, agent, labelRaw, capabilityRaw)
 
   // Look up the squad name for the show-once page.
@@ -1846,11 +1869,26 @@ dashboardApp.post('/members/:id/tokens', async (c) => {
     return c.html(shell(c.env, 'Access Tokens', errorBody('Invalid channel.')), 400)
   }
 
+  const canonical = requiredCanonicalOrigin(c.env)
+  if (!canonical.ok) {
+    return c.html(
+      shell(
+        c.env,
+        'Access Tokens',
+        errorBody('A secure public origin must be configured before provisioning a token.'),
+      ),
+      503,
+    )
+  }
+
   // Shared mint path — raw returned once, only the hash persisted.
   const minted = await mintMemberToken(c.env, memberId, labelRaw, channelRaw)
-  const origin = new URL(c.req.url).origin
   return c.html(
-    shell(c.env, 'Token provisioned', tokenShowOnceBody(c.env.TENANT_SLUG, origin, member.display_name, minted)),
+    shell(
+      c.env,
+      'Token provisioned',
+      tokenShowOnceBody(c.env.TENANT_SLUG, canonical.origin, member.display_name, minted),
+    ),
   )
 })
 
@@ -4843,6 +4881,8 @@ function tokenShowOnceBody(slug: string, origin: string, memberName: string, min
       <pre class="snippet">${claudeCodeSnippet(slug, origin)}</pre>
       <h3 style="font-size:13px;color:var(--muted);margin:14px 0 0">Codex · <code class="inline">~/.codex/config.toml</code></h3>
       <pre class="snippet">${codexSnippet(slug, origin)}</pre>
+      <h3 style="font-size:13px;color:var(--muted);margin:14px 0 0">Cursor · <code class="inline">MCP JSON</code></h3>
+      <pre class="snippet">${cursorSnippet(slug, origin)}</pre>
     </div>
     <p><a href="/members">← Back to access tokens</a></p>`
 }

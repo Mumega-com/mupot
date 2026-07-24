@@ -182,6 +182,12 @@ ON CONFLICT(id) DO UPDATE SET
   status = excluded.status,
   tenant = excluded.tenant;
 
+INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+VALUES
+  ('local', 'agent-conformance', 'mbr-conformance-runtime', datetime('now')),
+  ('local', 'agent-conformance-sender', 'mbr-conformance-sender', datetime('now'))
+ON CONFLICT DO NOTHING;
+
 INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
 VALUES
   ('cap-hermes-org-admin', 'mbr-hermes-user', 'org', NULL, 'owner'),

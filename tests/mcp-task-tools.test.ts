@@ -114,6 +114,10 @@ function makeEnv(
             return {
               async first() {
                 if (sql.includes('FROM agents WHERE id = ?1')) return agents.get(args[0] as string) ?? null
+                if (sql.includes('FROM agent_member_bindings')) {
+                  const member_id = agentMembers.get(args[1] as string)?.[0]
+                  return member_id === undefined ? null : { member_id }
+                }
                 if (sql.includes('SELECT department_id FROM squads')) {
                   return { department_id: squads.get(args[0] as string)?.department_id ?? null }
                 }
@@ -126,11 +130,6 @@ function makeEnv(
                   const capability = args[0] as string
                   return {
                     results: (gateGrants.get(capability) ?? []).map((principal_id) => ({ principal_id })),
-                  }
-                }
-                if (sql.includes('SELECT DISTINCT t.member_id')) {
-                  return {
-                    results: (agentMembers.get(args[1] as string) ?? []).map((member_id) => ({ member_id })),
                   }
                 }
                 if (sql.includes('FROM capabilities') && sql.includes('UNION ALL')) {

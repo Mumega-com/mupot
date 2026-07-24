@@ -37,6 +37,37 @@ export function canonicalOrigin(env: { PUBLIC_ORIGIN?: string }, requestOrigin: 
   return requestOrigin
 }
 
+export type RequiredCanonicalOrigin =
+  | { ok: true; origin: string }
+  | { ok: false; error: 'public_origin_unconfigured' }
+
+/**
+ * Credential/configuration output must never fall back to a request-derived
+ * Host. Deployed pots require HTTPS; explicit loopback HTTP remains available
+ * for local Wrangler development.
+ */
+export function requiredCanonicalOrigin(
+  env: { PUBLIC_ORIGIN?: string },
+): RequiredCanonicalOrigin {
+  const sentinel = 'mupot-host-derived-origin-forbidden'
+  const origin = canonicalOrigin(env, sentinel)
+  if (origin === sentinel) return { ok: false, error: 'public_origin_unconfigured' }
+
+  let url: URL
+  try {
+    url = new URL(origin)
+  } catch {
+    return { ok: false, error: 'public_origin_unconfigured' }
+  }
+  const loopback = url.hostname === 'localhost'
+    || url.hostname === '127.0.0.1'
+    || url.hostname === '[::1]'
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
+    return { ok: false, error: 'public_origin_unconfigured' }
+  }
+  return { ok: true, origin: url.origin }
+}
+
 /** Claude Code `.mcp.json` snippet — streamable-HTTP, Bearer placeholder.
  *  The pot's /mcp is POST JSON-RPC (streamable-http), NOT an SSE GET stream — so the
  *  client transport MUST be `http`. `type:"sse"` does a GET that the dashboard catch-all
@@ -70,6 +101,11 @@ export function codexSnippet(slug: string, origin: string): string {
     `bearer_token_env_var = "${envVar}"`,
     `# then: export ${envVar}=<MEMBER_TOKEN>   (one line, no quotes/newline)`,
   ].join('\n')
+}
+
+/** Cursor MCP JSON — streamable HTTP with the same show-once placeholder rule. */
+export function cursorSnippet(slug: string, origin: string): string {
+  return claudeCodeSnippet(slug, origin)
 }
 
 /** Normalize a tenant slug into a config-key-safe server name (fallback 'mupot'). */

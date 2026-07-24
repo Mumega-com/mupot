@@ -217,6 +217,14 @@ describe('shared execution authorization', () => {
           tenant TEXT NOT NULL,
           revoked_at TEXT
         );
+        CREATE TABLE agent_member_bindings (
+          tenant TEXT NOT NULL,
+          agent_id TEXT NOT NULL,
+          member_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (tenant, agent_id),
+          UNIQUE (tenant, member_id)
+        );
         CREATE TABLE capabilities (
           id TEXT PRIMARY KEY,
           member_id TEXT NOT NULL,
@@ -266,6 +274,8 @@ describe('shared execution authorization', () => {
         VALUES ('agent-wf-cross', 'squad-wf-home', 'active');
         INSERT INTO members (id, tenant, status)
         VALUES ('member-wf-cross', 'test', 'active');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('test', 'agent-wf-cross', 'member-wf-cross', '2026-07-24T00:00:00.000Z');
         INSERT INTO member_tokens (id, member_id, agent_id, tenant, revoked_at)
         VALUES ('token-wf-cross', 'member-wf-cross', 'agent-wf-cross', 'test', NULL);
         INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
