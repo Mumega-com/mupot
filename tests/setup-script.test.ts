@@ -16,7 +16,8 @@ printf '%s\\n' "$args" >> "$FAKE_NPX_LOG"
 case "$args" in
   *" --version"*|*" whoami") exit 0 ;;
   *"d1 create"*) printf 'database_id = "11111111-1111-4111-8111-111111111111"\\n' ;;
-  *"vectorize create"*|*"queues create"*|*"r2 bucket create"*|*"d1 migrations apply"*|*"secret put"*) printf 'ok\\n' ;;
+  *"secret put"*) cat >/dev/null; printf 'ok\\n' ;;
+  *"vectorize create"*|*"queues create"*|*"r2 bucket create"*|*"d1 migrations apply"*) printf 'ok\\n' ;;
   *"kv namespace create"*)
     if [[ "$args" == *"-sessions"* ]]; then
       printf 'id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\\n'
