@@ -13,6 +13,9 @@ import type { Env } from '../types'
 import { resolveCapabilities, hasCapability } from './capability'
 
 export interface AgentIdentity {
+  // Exact live member_tokens row that authenticated this request. Never supplied
+  // by the caller; verification uses it to prove the issued credential was used.
+  tokenId: string | null
   memberId: string
   displayName: string
   email: string | null
@@ -44,7 +47,7 @@ export async function resolveMemberByToken(env: Env, raw: string | null): Promis
   if (!raw) return null
   const tokenHash = await sha256Hex(raw)
   const row = await env.DB.prepare(
-    `SELECT m.id AS member_id, m.display_name AS display_name, m.email AS email, m.status AS status, t.agent_id AS bound_agent_id
+    `SELECT t.id AS token_id, m.id AS member_id, m.display_name AS display_name, m.email AS email, m.status AS status, t.agent_id AS bound_agent_id
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
       WHERE t.token_hash = ?1
@@ -54,9 +57,15 @@ export async function resolveMemberByToken(env: Env, raw: string | null): Promis
       LIMIT 1`,
   )
     .bind(tokenHash, env.TENANT_SLUG)
-    .first<{ member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null }>()
+    .first<{ token_id: string; member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null }>()
   if (!row || row.status !== 'active') return null
-  return { memberId: row.member_id, displayName: row.display_name, email: row.email, boundAgentId: row.bound_agent_id ?? null }
+  return {
+    tokenId: row.token_id,
+    memberId: row.member_id,
+    displayName: row.display_name,
+    email: row.email,
+    boundAgentId: row.bound_agent_id ?? null,
+  }
 }
 
 // Resolve a bearer token to an ORG-ADMIN identity, or a refusal. Shared by the

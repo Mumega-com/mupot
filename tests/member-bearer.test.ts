@@ -37,8 +37,9 @@ describe('resolveMemberByToken', () => {
     expect(await resolveMemberByToken(env, 'sk-x')).toBeNull()
   })
   it('resolves an active member to its identity (unbound token → boundAgentId null)', async () => {
-    const env = makeEnv({ member_id: 'm1', display_name: 'Kasra', email: 'k@x', status: 'active' })
+    const env = makeEnv({ token_id: 'tok-1', member_id: 'm1', display_name: 'Kasra', email: 'k@x', status: 'active' })
     expect(await resolveMemberByToken(env, 'sk-x')).toEqual({
+      tokenId: 'tok-1',
       memberId: 'm1',
       displayName: 'Kasra',
       email: 'k@x',
@@ -46,8 +47,9 @@ describe('resolveMemberByToken', () => {
     })
   })
   it('returns boundAgentId for an agent-scoped token (the weld)', async () => {
-    const env = makeEnv({ member_id: 'm1', display_name: 'content-writer', email: null, status: 'active', bound_agent_id: 'agent-7' })
+    const env = makeEnv({ token_id: 'tok-agent-7', member_id: 'm1', display_name: 'content-writer', email: null, status: 'active', bound_agent_id: 'agent-7' })
     expect(await resolveMemberByToken(env, 'sk-x')).toEqual({
+      tokenId: 'tok-agent-7',
       memberId: 'm1',
       displayName: 'content-writer',
       email: null,
@@ -62,6 +64,7 @@ describe('resolveMemberByToken', () => {
 
     expect(seen.sql).toContain('t.tenant = ?2')
     expect(seen.sql).toContain('m.tenant = ?2')
+    expect(seen.sql).toContain('t.id AS token_id')
     expect(seen.binds?.[1]).toBe('digid')
   })
 })

@@ -802,6 +802,7 @@ describe('TEST-2b — member API key convergence preserves workspace grants and 
 
     const auth = await buildAuthContextFromProps(env, resolved!.props)
     expect(auth).not.toBeNull()
+    expect(auth!.tokenId).toBe(TOKEN_ID)
     expect(seen.recheckSql).toContain('t.tenant = ?3')
     expect(seen.recheckSql).toContain('m.tenant = ?3')
     expect(seen.recheckBinds?.[2]).toBe(TENANT)

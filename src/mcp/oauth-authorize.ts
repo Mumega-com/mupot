@@ -284,6 +284,7 @@ export async function buildAuthContextFromProps(
     channel,
     capabilities, // always defined; empty only for directory — prevents legacyRoleSatisfies escape
     boundAgentId, // directory seats are pure human/operator principals; workspace keys preserve the weld
+    tokenId: props.tokenId, // live row was re-read above; never accepted from a tool argument
   }
 }
 
