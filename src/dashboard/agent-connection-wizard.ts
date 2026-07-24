@@ -382,6 +382,29 @@ async function exactExistingMatches(
     .map((candidate) => candidate.id))]
 }
 
+async function actorRequestExists(
+  env: Env,
+  actor: AgentConnectionActor,
+  requestId: string,
+): Promise<boolean> {
+  const normalized = requestId.trim()
+  if (normalized.length < 1 || normalized.length > 128) return false
+  return Boolean(await env.DB.prepare(
+    `SELECT 1 AS present
+       FROM agent_connection_requests
+      WHERE tenant = ?
+        AND actor_kind = ?
+        AND actor_id = ?
+        AND request_id = ?
+      LIMIT 1`,
+  ).bind(
+    env.TENANT_SLUG,
+    actor.kind,
+    actor.id,
+    normalized,
+  ).first<{ present: number }>())
+}
+
 function wizardShell(brand: string, title: string, body: string): string {
   return `<!doctype html>
 <html lang="en">
@@ -799,17 +822,24 @@ agentConnectionWizardApp.post('/provision', async (c) => {
   const input = parseProvisionInput(rawBody)
   if (!input) return c.json({ error: 'invalid_request' }, 400)
 
-  const existingMatches = await exactExistingMatches(c.env, input)
-  if (existingMatches.length > 0) {
-    return c.json({
-      error: 'existing_agent_match',
-      candidate_ids: existingMatches,
-    }, 409)
+  const operator = operatorFromContext(c)
+  // A stable request must reach the shared service's fingerprint-aware replay
+  // path. After a successful new-agent request, the newly created identity is
+  // necessarily an exact match; treating it as a fresh duplicate would break
+  // safe network retry and could tempt an operator to mint again.
+  if (!(await actorRequestExists(c.env, operator.actor, input.requestId))) {
+    const existingMatches = await exactExistingMatches(c.env, input)
+    if (existingMatches.length > 0) {
+      return c.json({
+        error: 'existing_agent_match',
+        candidate_ids: existingMatches,
+      }, 409)
+    }
   }
 
   const outcome = await provisionAgentConnection(
     c.env,
-    operatorFromContext(c).actor,
+    operator.actor,
     input,
   )
   const canonical = requiredCanonicalOrigin(c.env)

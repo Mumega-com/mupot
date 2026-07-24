@@ -111,6 +111,31 @@ describe('agent connection owner wizard', () => {
     expect(bound.status).toBe(403)
   })
 
+  it('allows legacy admins and current fine-grained org admins', async () => {
+    expect((await appFor({ ...OWNER, role: 'admin' }).request(
+      '/agents/connect',
+      {},
+      env,
+    )).status).toBe(200)
+
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant)
+        VALUES ('operator-member', 'Operator', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('operator-admin', 'operator-member', 'org', NULL, 'admin');
+    `)
+    const fineGrained: AuthContext = {
+      ...OWNER,
+      role: 'member',
+      memberId: 'operator-member',
+    }
+    expect((await appFor(fineGrained).request(
+      '/agents/connect',
+      {},
+      env,
+    )).status).toBe(200)
+  })
+
   it('is mounted behind dashboard session auth with no-store browser headers', async () => {
     const dashboardEnv = {
       ...env,
@@ -268,6 +293,73 @@ describe('agent connection owner wizard', () => {
     expect(receiptHtml).not.toContain(body.show_once.credential)
     expect(receiptHtml).not.toContain(body.show_once.challenge)
     expect(receiptHtml).not.toContain('<MEMBER_TOKEN>')
+  })
+
+  it('connects an existing agent without creating a duplicate identity', async () => {
+    const response = await postJson(
+      appFor(OWNER),
+      '/agents/connect/provision',
+      {
+        request_id: 'wizard-existing',
+        target: {
+          kind: 'existing',
+          agent_ref: 'agent-existing',
+        },
+        additional_access: [],
+        credential: {
+          action: 'add',
+          label: 'Second workspace',
+          home_capability: 'member',
+        },
+      },
+      env,
+    )
+    expect(response.status).toBe(201)
+    expect(await response.json()).toMatchObject({
+      status: 'credential_issued',
+      receipt: {
+        agent_id: 'agent-existing',
+        agent_disposition: 'reused',
+      },
+    })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').get()).toEqual({ n: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_member_bindings').get())
+      .toEqual({ n: 1 })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM member_tokens').get()).toEqual({ n: 2 })
+  })
+
+  it('retries one stable request without returning or minting a second key', async () => {
+    const request = {
+      request_id: 'wizard-retry',
+      target: {
+        kind: 'new',
+        home_squad_id: 'squad-home',
+        agent: {
+          name: 'Retry Agent',
+          slug: 'retry-agent',
+          role: 'member',
+          model: 'test',
+        },
+      },
+      additional_access: [],
+      credential: {
+        action: 'issue_if_missing',
+        label: 'Retry workspace',
+        home_capability: 'member',
+      },
+    }
+    const app = appFor(OWNER)
+    const first = await postJson(app, '/agents/connect/provision', request, env)
+    const firstBody = await first.json() as { show_once: { credential: string } }
+    expect(first.status).toBe(201)
+
+    const replay = await postJson(app, '/agents/connect/provision', request, env)
+    expect(replay.status).toBe(200)
+    const replayBody = await replay.json() as Record<string, unknown>
+    expect(replayBody).toMatchObject({ status: 'credential_already_issued' })
+    expect(replayBody).not.toHaveProperty('show_once')
+    expect(JSON.stringify(replayBody)).not.toContain(firstBody.show_once.credential)
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM member_tokens').get()).toEqual({ n: 2 })
   })
 
   it('cancels only the current operator pending request', async () => {
