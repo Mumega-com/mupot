@@ -345,9 +345,8 @@ BEGIN
      AND agent_id = NEW.agent_id
      AND revoked_at IS NULL;
 
-  SELECT CASE
-    WHEN changes() <> 1 THEN RAISE(ABORT, 'replace_token_not_found')
-  END;
+  SELECT RAISE(ABORT, 'replace_token_not_found')
+   WHERE changes() <> 1;
 END;
 
 -- Issuance facts are an immutable snapshot. Only verification evidence and
