@@ -9,6 +9,13 @@ import {
   upsertProjectSquadAccess,
 } from '../projects/service'
 import type { ProjectMutationError } from '../projects/service'
+import { defaultStartGateDeps, startProject } from '../projects/start-gate'
+import { stripExternalLifecycleFields } from '../projects/lifecycle-input'
+import {
+  defaultCircuitBreakerDeps,
+  proposeProjectRecommit,
+  recommitPrincipalFromAuth,
+} from '../projects/circuit-breaker'
 import {
   projectReadAccessFromGrants,
   projectVisibilityClause,
@@ -99,7 +106,8 @@ export async function readableProject(env: Env, projectId: string, access: Proje
   const visibility = projectVisibilityClause(access)
   return env.DB.prepare(
     `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-            p.target_date, p.created_at, p.updated_at
+            p.target_date, p.cycle_boundary_at, p.stalled, p.stall_threshold_days,
+            p.completion_proposed_by, p.created_at, p.updated_at
        FROM projects p
       WHERE p.id = ? AND ${visibility.sql}`,
   ).bind(projectId, ...visibility.binds).first<Project>()
@@ -109,7 +117,7 @@ function mutationFailure(error: ProjectMutationError): ToolOutcome {
   if (error === 'project_not_found' || error === 'parent_not_found' || error === 'squad_not_found') {
     return fail(404, error)
   }
-  if (error === 'slug_taken' || error === 'receipt_failed' || error === 'invalid_status_transition') {
+  if (error === 'slug_taken' || error === 'receipt_failed' || error === 'invalid_status_transition' || error === 'completion_gate_required' || error === 'start_gate_required') {
     return fail(409, error)
   }
   return fail(400, error)
@@ -210,7 +218,8 @@ const toolProjectList: ToolSpec = {
 
     const rows = await env.DB.prepare(
       `SELECT p.id, p.slug, p.name, p.description, p.goal, p.status, p.parent_project_id,
-              p.target_date, p.created_at, p.updated_at
+              p.target_date, p.cycle_boundary_at, p.stalled, p.stall_threshold_days,
+              p.completion_proposed_by, p.created_at, p.updated_at
          FROM projects p
         WHERE ${clauses.join(' AND ')}
         ORDER BY p.parent_project_id IS NOT NULL, p.created_at, p.id
@@ -334,11 +343,75 @@ const toolProjectUpdate: ToolSpec = {
     if (denied) return denied
     const projectId = str(args.project_id)
     if (!projectId) return fail(400, 'invalid_project_id')
-    const { project_id: _projectId, ...input } = args
+    const { project_id: _projectId, ...rawInput } = args
+    // Strip internal lifecycle flags even though schema forbids them — class coverage.
+    const input = stripExternalLifecycleFields(rawInput as Record<string, unknown>)
+
+    // Slice 3: planned→active must go through start-gate (authorize + provision).
+    if (str(input.status) === 'active') {
+      const existing = await getProject(env, projectId)
+      if (existing?.status === 'planned') {
+        const started = await startProject(env, projectId, defaultStartGateDeps())
+        if (!started.ok) {
+          const code = started.error === 'project_not_found' ? 404 : 409
+          return fail(code, started.error, { blocked_start: true })
+        }
+        await emitProjectMutation(env, auth.memberId as string, 'updated', started.project.id, {
+          status: started.project.status,
+        })
+        return done({
+          project: started.project,
+          start_gate: {
+            task_id: started.task_id,
+            squad_id: started.squad_id,
+            agent_id: started.agent_id,
+            resource: started.resource,
+          },
+        })
+      }
+    }
+
     const result = await updateProject(env, projectId, input)
     if (!result.ok) return mutationFailure(result.error)
     await emitProjectMutation(env, auth.memberId as string, 'updated', result.value.id, { status: result.value.status })
     return done({ project: result.value })
+  },
+}
+
+const toolProjectRecommit: ToolSpec = {
+  name: 'project_recommit',
+  scope: 'workspace project cycle recommit (circuit breaker continuation)',
+  min: 'admin',
+  args: '{ project_id: string, reason?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      project_id: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
+    },
+    required: ['project_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const denied = requireWorkspaceAdmin(auth)
+    if (denied) return denied
+    const projectId = str(args.project_id)
+    if (!projectId) return fail(400, 'invalid_project_id')
+    // Principal from bound token only — ignore any forged principal field.
+    const principal = recommitPrincipalFromAuth(auth)
+    const reason = str(args.reason) || 'operator_recommit'
+    const result = await proposeProjectRecommit(
+      env,
+      projectId,
+      principal,
+      reason,
+      defaultCircuitBreakerDeps().writeReceipt,
+    )
+    if (!result.ok) {
+      const code = result.error === 'project_not_found' ? 404 : 409
+      return fail(code, result.error)
+    }
+    return done({ recommit: result.detail })
   },
 }
 
@@ -444,6 +517,7 @@ export const PROJECT_TOOLS: ToolSpec[] = [
   toolProjectGet,
   toolProjectContext,
   toolProjectUpdate,
+  toolProjectRecommit,
   toolProjectSquadList,
   toolProjectSquadSet,
   toolProjectSquadRemove,

@@ -2,12 +2,14 @@ import type { D1Result } from '@cloudflare/workers-types'
 import type { Env, Project, ProjectAccessLevel, ProjectSquadAccess, ProjectStatus } from '../types'
 import { isNonEmptyString, isValidSlug } from '../org/service'
 
-const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'completed', 'archived']
+const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'review', 'completed', 'archived']
 const PROJECT_ACCESS_LEVELS: readonly ProjectAccessLevel[] = ['read', 'write', 'admin']
 const PROJECT_STATUS_TRANSITIONS: Readonly<Record<ProjectStatus, readonly ProjectStatus[]>> = {
   planned: ['active', 'archived'],
-  active: ['paused', 'completed', 'archived'],
-  paused: ['active', 'completed', 'archived'],
+  // completed is NOT reachable here — only via completion-gate verdict (slice 2).
+  active: ['paused', 'review', 'archived'],
+  paused: ['active', 'archived'],
+  review: ['active', 'completed'],
   completed: ['active', 'archived'],
   archived: ['planned'],
 }
@@ -18,6 +20,8 @@ export type ProjectMutationError =
   | 'hierarchy_depth' | 'hierarchy_cycle' | 'active_children'
   | 'archived_project' | 'squad_not_found' | 'invalid_access_level'
   | 'receipt_failed'
+  | 'completion_gate_required'
+  | 'start_gate_required'
 
 export type ProjectMutationResult<T> =
   | { ok: true; value: T }
@@ -41,6 +45,20 @@ export interface UpdateProjectInput {
   status?: unknown
   parent_project_id?: unknown
   target_date?: unknown
+  /** Set when entering/leaving completion review (slice 2). */
+  completion_proposed_by?: string | null
+  /**
+   * Internal flag: allow active→review / review→completed writes owned by
+   * completion-gate.ts. Bare updateProject callers cannot self-report completed.
+   */
+  via_completion_gate?: boolean
+  /**
+   * Internal flag: allow planned→active writes owned by start-gate.ts.
+   * Bare updateProject callers cannot activate without authorize+provision.
+   */
+  via_start_gate?: boolean
+  /** Principal recorded on lessons-capture when completed→archived. */
+  lifecycle_principal?: string
 }
 
 export interface ListProjectsOptions {
@@ -174,6 +192,10 @@ export async function createProject(
     status,
     parent_project_id: parentProjectId as string | null,
     target_date: targetDate,
+    cycle_boundary_at: null,
+    stalled: 0,
+    stall_threshold_days: null,
+    completion_proposed_by: null,
     created_at: now,
     updated_at: now,
   }
@@ -181,11 +203,14 @@ export async function createProject(
   try {
     const result = await env.DB.prepare(
       `INSERT INTO projects
-       (id, slug, name, description, goal, status, parent_project_id, target_date, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, slug, name, description, goal, status, parent_project_id, target_date,
+        cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       project.id, project.slug, project.name, project.description, project.goal, project.status,
-      project.parent_project_id, project.target_date, project.created_at, project.updated_at,
+      project.parent_project_id, project.target_date,
+      project.cycle_boundary_at, project.stalled, project.stall_threshold_days, project.completion_proposed_by,
+      project.created_at, project.updated_at,
     ).run()
     if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
   } catch (error) {
@@ -210,7 +235,8 @@ export async function listProjects(env: Env, options: ListProjectsOptions = {}):
     where.push(options.parent_project_id === null ? 'parent_project_id IS NULL' : 'parent_project_id = ?')
     if (options.parent_project_id !== null) values.push(options.parent_project_id)
   }
-  const sql = `SELECT id, slug, name, description, goal, status, parent_project_id, target_date, created_at, updated_at
+  const sql = `SELECT id, slug, name, description, goal, status, parent_project_id, target_date,
+      cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by, created_at, updated_at
     FROM projects ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
     ORDER BY parent_project_id IS NOT NULL, created_at, id`
   const result = await env.DB.prepare(sql).bind(...values).all<Project>()
@@ -219,7 +245,8 @@ export async function listProjects(env: Env, options: ListProjectsOptions = {}):
 
 export async function getProject(env: Env, id: string): Promise<Project | null> {
   return env.DB.prepare(
-    `SELECT id, slug, name, description, goal, status, parent_project_id, target_date, created_at, updated_at
+    `SELECT id, slug, name, description, goal, status, parent_project_id, target_date,
+            cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by, created_at, updated_at
      FROM projects WHERE id = ?`,
   ).bind(id).first<Project>()
 }
@@ -232,7 +259,12 @@ export async function updateProject(
   const existing = await getProject(env, id)
   if (!existing) return { ok: false, error: 'project_not_found' }
 
-  const suppliedKeys = Object.keys(input).filter((key) => input[key as keyof UpdateProjectInput] !== undefined)
+  const suppliedKeys = Object.keys(input).filter((key) => {
+    if (key === 'via_completion_gate' || key === 'via_start_gate' || key === 'lifecycle_principal') {
+      return false
+    }
+    return input[key as keyof UpdateProjectInput] !== undefined
+  })
   const statusWasSupplied = input.status !== undefined
   if (statusWasSupplied && !isProjectStatus(input.status)) return { ok: false, error: 'invalid_status' }
   if (existing.status === 'archived' && suppliedKeys.some((key) => key !== 'status')) {
@@ -245,6 +277,39 @@ export async function updateProject(
   if (statusWasSupplied && !isValidProjectStatusTransition(existing.status, nextStatus)) {
     return { ok: false, error: 'invalid_status_transition' }
   }
+
+  // Slice 2: completed / review status flips are owned by completion-gate.ts.
+  // Bare updateProject (agents, dashboard self-report) cannot mark completed.
+  const viaGate = input.via_completion_gate === true
+  if (
+    statusWasSupplied
+    && nextStatus === 'completed'
+    && existing.status !== 'completed'
+    && !viaGate
+  ) {
+    return { ok: false, error: 'completion_gate_required' }
+  }
+  if (
+    statusWasSupplied
+    && nextStatus === 'review'
+    && existing.status !== 'review'
+    && !viaGate
+  ) {
+    return { ok: false, error: 'completion_gate_required' }
+  }
+
+  // Slice 3: planned→active is owned by start-gate.ts (authorize + provision).
+  // Bare updateProject cannot flip to active without a real resource commit.
+  const viaStartGate = input.via_start_gate === true
+  if (
+    statusWasSupplied
+    && existing.status === 'planned'
+    && nextStatus === 'active'
+    && !viaStartGate
+  ) {
+    return { ok: false, error: 'start_gate_required' }
+  }
+
   const nextSlug = input.slug === undefined ? existing.slug : input.slug
   if (!isValidSlug(nextSlug)) return { ok: false, error: 'invalid_slug' }
   const nextName = input.name === undefined ? existing.name : input.name
@@ -270,6 +335,10 @@ export async function updateProject(
     return { ok: false, error: 'active_children' }
   }
 
+  const nextProposedBy = input.completion_proposed_by !== undefined
+    ? input.completion_proposed_by
+    : (existing.status === 'review' && nextStatus !== 'review' ? null : existing.completion_proposed_by)
+
   const updated: Project = {
     ...existing,
     slug: nextSlug,
@@ -279,15 +348,20 @@ export async function updateProject(
     status: nextStatus,
     parent_project_id: nextParentProjectId as string | null,
     target_date: nextTargetDate,
+    completion_proposed_by: nextProposedBy,
     updated_at: nextUpdatedAt(existing.updated_at),
   }
   try {
+    // Compare-and-set on (id, updated_at, status) closes the check-then-write
+    // TOCTOU: a concurrent status flip between getProject and this UPDATE loses.
     const result = await env.DB.prepare(
       `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
-       target_date = ?, updated_at = ? WHERE id = ? AND updated_at = ?`,
+       target_date = ?, completion_proposed_by = ?, updated_at = ?
+       WHERE id = ? AND updated_at = ? AND status = ?`,
     ).bind(
       updated.slug, updated.name, updated.description, updated.goal, updated.status,
-      updated.parent_project_id, updated.target_date, updated.updated_at, updated.id, existing.updated_at,
+      updated.parent_project_id, updated.target_date, updated.completion_proposed_by, updated.updated_at,
+      updated.id, existing.updated_at, existing.status,
     ).run()
     if (!wrote(result)) {
       const current = await getProject(env, id)
@@ -301,6 +375,22 @@ export async function updateProject(
     if (mapped) return { ok: false, error: mapped }
     throw error
   }
+
+  // Slice 2: completed → archived always writes a lessons-capture receipt.
+  if (existing.status === 'completed' && nextStatus === 'archived') {
+    const principal = typeof input.lifecycle_principal === 'string' && input.lifecycle_principal.trim() !== ''
+      ? input.lifecycle_principal.trim()
+      : 'system:project-lifecycle'
+    const { recordLessonsCapture, defaultCompletionGateDeps } = await import('./completion-gate')
+    await recordLessonsCapture(
+      env,
+      id,
+      principal,
+      updated.updated_at,
+      defaultCompletionGateDeps().writeReceipt,
+    )
+  }
+
   return { ok: true, value: updated }
 }
 

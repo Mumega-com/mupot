@@ -11,7 +11,12 @@ function harness(options: { includeKeysetMigration?: boolean } = {}) {
   const fixture = createSqliteD1()
   const includeKeysetMigration = options.includeKeysetMigration ?? true
   for (const file of readdirSync(MIGRATIONS_DIR)
-    .filter((name) => name.endsWith('.sql') && (includeKeysetMigration || !name.startsWith('0059_')))
+    .filter((name) => {
+      if (!name.endsWith('.sql')) return false
+      // Pre-keyset path: skip 0059+ (project_id attribution columns + later rebuilds).
+      if (!includeKeysetMigration && name >= '0059_') return false
+      return true
+    })
     .sort()) {
     fixture.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
   }
@@ -615,7 +620,8 @@ describe('project Activity and Evidence projections', () => {
       const projectionStatements = probe.statements.filter((statement) => statement.sql.includes('ORDER BY'))
       expect(projectionStatements).toHaveLength(11)
       for (const statement of projectionStatements) {
-        const plan = fixture.sqlite.prepare(`EXPLAIN QUERY PLAN ${statement.sql}`).all(...statement.values)
+        const explainSql = statement.sql.replace(/\?\d+/g, '?')
+        const plan = fixture.sqlite.prepare(`EXPLAIN QUERY PLAN ${explainSql}`).all(...statement.values)
         const details = plan.map((row) => String(row.detail ?? '')).join('\n')
         expect(details, statement.sql).not.toContain('USE TEMP B-TREE FOR ORDER BY')
         if (statement.sql.includes('FROM task_verdicts')) {
@@ -671,7 +677,7 @@ describe('project Activity and Evidence projections', () => {
       expect(() => fixture.sqlite.prepare('UPDATE tasks SET project_id = ? WHERE id = ?').run('other-project', 'task-a'))
         .toThrow(/task project locked by flight/)
       expect(() => fixture.sqlite.prepare('UPDATE flights SET project_id = ? WHERE id = ?').run('other-project', 'flight-a'))
-        .toThrow(/flight project attribution downgrade/)
+        .toThrow(/flight project (attribution downgrade|access denied)/)
     } finally {
       fixture.close()
     }

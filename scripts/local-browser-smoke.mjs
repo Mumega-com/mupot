@@ -152,6 +152,19 @@ async function readProjectRest(projectId) {
   return json
 }
 
+async function grantProjectSquadWriteAccess(projectId, squadId) {
+  const response = await context.request.put(`${baseUrl}/api/projects/${encodeURIComponent(projectId)}/squads/${encodeURIComponent(squadId)}`, {
+    headers: { 'content-type': 'application/json' },
+    data: JSON.stringify({ access_level: 'write' }),
+    timeout: 20_000,
+  })
+  const json = await response.json().catch(() => null)
+  if (response.status() !== 200 || json?.squad?.squad_id !== squadId) {
+    fail('project squad-access grant failed', { projectId, squadId, status: response.status(), json })
+  }
+  return json
+}
+
 async function readProjectMcp(projectId) {
   const response = await context.request.post(`${baseUrl}/actions/project_get`, {
     headers: {
@@ -403,6 +416,11 @@ async function runProjectWorkspaceWorkflow() {
     'planned',
   ))
 
+  // Slice 3 start-gate requires a writable squad + active squad agent before
+  // planned -> active is allowed. The owner-created project above has neither
+  // by default, so provision it through the real grant path before activating.
+  await grantProjectSquadWriteAccess(createdProjectId, 'sq-growth')
+
   const activated = await applyProjectLifecycleCommand(
     'activate', 'activated', createdProjectId, 'planned', 'active',
   )
@@ -418,11 +436,15 @@ async function runProjectWorkspaceWorkflow() {
     nextAction: createdBrowserSituation.next_action,
     goal: createdProjectRead.project.goal,
   }
-  if (createdProjectObservation.health !== 'ready'
-    || createdProjectObservation.nextAction?.type !== 'create_task'
+  // Slice 3 start-gate seeds a first open task from the project goal as part
+  // of the planned -> active provisioning, so the freshly activated project
+  // is never an empty 'ready' situation anymore -- it has one open task
+  // waiting to be started.
+  if (createdProjectObservation.health !== 'active'
+    || createdProjectObservation.nextAction?.type !== 'start_task'
     || createdProjectObservation.goal !== ownerProjectEditedGoal
     || canonicalHash(createdBrowserSituation) !== canonicalHash(createdProjectRead.situation)) {
-    fail('activated Project did not render its canonical ready situation', {
+    fail('activated Project did not render its canonical start-gate-seeded situation', {
       createdProjectObservation,
       browserSituationHash: canonicalHash(createdBrowserSituation),
       restSituationHash: canonicalHash(createdProjectRead.situation),
@@ -443,22 +465,11 @@ async function runProjectWorkspaceWorkflow() {
     fail('project search and status filter did not retain the activated Project', { filteredText, url: page.url() })
   }
 
-  const completed = await applyProjectLifecycleCommand(
-    'complete', 'completed', createdProjectId, 'active', 'completed',
-  )
-  if (!completed.successText.includes('Project completed.')) {
-    fail('project completion success state missing', { completedText: completed.successText })
-  }
-  lifecycleTransitions.push(completed.receipt)
-
-  const reopened = await applyProjectLifecycleCommand(
-    'activate', 'activated', createdProjectId, 'completed', 'active',
-  )
-  if (!reopened.successText.includes('Project activated.')) {
-    fail('project reopen success state missing', { reopenedText: reopened.successText })
-  }
-  lifecycleTransitions.push(reopened.receipt)
-
+  // Slice 2 structural completion gate: 'completed' is no longer reachable by
+  // a bare dashboard flip from 'active' (only from 'review', via a passed
+  // completion-gate verdict — see tests/project-completion-gate.test.ts). The
+  // bare-flip cycle this smoke covers is pause/activate/archive/restore,
+  // matching tests/dashboard-projects.test.ts's updated transitions list.
   const paused = await applyProjectLifecycleCommand(
     'pause', 'paused', createdProjectId, 'active', 'paused',
   )
@@ -467,8 +478,16 @@ async function runProjectWorkspaceWorkflow() {
   }
   lifecycleTransitions.push(paused.receipt)
 
+  const reactivated = await applyProjectLifecycleCommand(
+    'activate', 'activated', createdProjectId, 'paused', 'active',
+  )
+  if (!reactivated.successText.includes('Project activated.')) {
+    fail('project reactivate success state missing', { reactivatedText: reactivated.successText })
+  }
+  lifecycleTransitions.push(reactivated.receipt)
+
   const archived = await applyProjectLifecycleCommand(
-    'archive', 'archived', createdProjectId, 'paused', 'archived',
+    'archive', 'archived', createdProjectId, 'active', 'archived',
   )
   if (!archived.successText.includes('Project archived.')) {
     fail('project archive success state missing', { archivedText: archived.successText })
