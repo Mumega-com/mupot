@@ -615,10 +615,12 @@ git status --short
 Inspect every match. Stored challenge hashes are allowed; raw/token hashes in
 public payload construction are not.
 
-- [ ] **Step 4: Push a stacked PR**
+- [x] **Step 4: Push a stacked PR**
 
 Open against `feat/agent-connection-foundation`, link #528 and PR #537, list
 the exact current-head evidence, and request independent red-team review.
+
+Draft PR: [#538](https://github.com/Mumega-com/mupot/pull/538)
 
 ---
 
