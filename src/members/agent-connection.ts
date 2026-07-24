@@ -80,6 +80,7 @@ export interface AgentConnectionReceipt {
   endpoint: string
   transport: 'streamable_http'
   verification_status: 'pending' | 'pass' | 'fail' | 'expired'
+  verification_attempts: number
   verification_challenge_hash: string | null
   verification_expires_at: string | null
   client_connected_at: string | null
@@ -719,6 +720,7 @@ export async function provisionAgentConnection(
       endpoint,
       transport: 'streamable_http',
       verification_status: 'pending',
+      verification_attempts: 0,
       verification_challenge_hash: challengeHash,
       verification_expires_at: verificationExpiresAt,
       client_connected_at: null,
