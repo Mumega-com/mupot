@@ -212,6 +212,55 @@ describe('agent connection provisioning', () => {
     expect(count(harness.sqlite, 'member_tokens')).toBe(1)
   })
 
+  it('reuses the canonical binding when a direct mint wins the provisioning race', async () => {
+    seedExisting(harness.sqlite)
+    const committedDb = harness.db
+    let raced = false
+    env = {
+      ...env,
+      DB: {
+        prepare: committedDb.prepare.bind(committedDb),
+        async batch(statements) {
+          if (!raced) {
+            harness.sqlite.exec(`
+              INSERT INTO members (id, display_name, status, tenant)
+              VALUES ('member-winner', 'Winner', 'active', '${TENANT}');
+              INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+              VALUES ('${TENANT}', 'agent-existing', 'member-winner',
+                      '2026-07-24T11:59:59.000Z');
+              INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+              VALUES ('grant-winner', 'member-winner', 'squad', 'squad-home', 'member');
+              INSERT INTO member_tokens
+                (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+              VALUES ('token-winner', 'member-winner', '${'b'.repeat(64)}', 'winner',
+                      'workspace', '2026-07-24T11:59:59.000Z', 'agent-existing', '${TENANT}');
+            `)
+            raced = true
+          }
+          return committedDb.batch(statements)
+        },
+      } as Env['DB'],
+    }
+
+    const result = await provisionAgentConnection(
+      env,
+      OWNER,
+      existingInput('direct-mint-race'),
+      NOW,
+    )
+
+    expect(result).toMatchObject({
+      status: 'credential_issued',
+      receipt: { member_id: 'member-winner', agent_id: 'agent-existing' },
+    })
+    expect(count(harness.sqlite, 'members')).toBe(1)
+    expect(count(harness.sqlite, 'agent_member_bindings')).toBe(1)
+    expect(count(harness.sqlite, 'member_tokens')).toBe(2)
+    expect(harness.sqlite.prepare(
+      "SELECT status FROM agent_connection_requests WHERE request_id = 'direct-mint-race'",
+    ).get()).toEqual({ status: 'credential_issued' })
+  })
+
   it('authorizes every affected squad before creating a reservation', async () => {
     const homeLead = {
       kind: 'member' as const,

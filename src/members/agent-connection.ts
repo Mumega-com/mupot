@@ -22,7 +22,9 @@ import {
   type AgentAccessCapability,
 } from './agent-access'
 import {
+  agentIdentityConflict,
   prepareAgentBoundTokenMint,
+  prepareAgentBoundTokenMintForBinding,
   resolveAgentMemberBinding,
   sha256Hex,
   type PreparedAgentTokenMint,
@@ -568,6 +570,163 @@ function insertReceiptStatement(env: Env, receipt: AgentConnectionReceipt): D1Pr
   )
 }
 
+async function commitPreparedConnectionAttempt(
+  env: Env,
+  actor: AgentConnectionActor,
+  normalized: NormalizedConnection,
+  now: Date,
+  canonicalOrigin: string,
+  preparedAgent: PreparedAgentCreate | null,
+  agent: AgentRow,
+  agentDisposition: 'created' | 'reused',
+  token: PreparedAgentTokenMint,
+): Promise<AgentConnectionOutcome> {
+  if (normalized.credential.action === 'replace') {
+    const replaceTokenId = normalized.credential.replaceTokenId as string
+    const replaceTarget = await env.DB.prepare(
+      `SELECT id
+         FROM member_tokens
+        WHERE id = ?
+          AND tenant = ?
+          AND member_id = ?
+          AND agent_id = ?
+          AND revoked_at IS NULL
+        LIMIT 1`,
+    ).bind(
+      replaceTokenId,
+      env.TENANT_SLUG,
+      token.memberId,
+      agent.id,
+    ).first<{ id: string }>()
+    if (!replaceTarget) {
+      await failReservation(env, actor, normalized, 'replace_token_not_found', now)
+      return errorOutcome('replace_token_not_found')
+    }
+  }
+
+  const accessStatements: D1PreparedStatement[] = []
+  for (const access of [
+    {
+      squadId: normalized.homeSquadId,
+      capability: token.grantCapability,
+    },
+    ...normalized.additionalAccess,
+  ]) {
+    const prepared = await prepareAgentSquadAccess(env, {
+      agentId: agent.id,
+      memberId: token.memberId,
+      squadId: access.squadId,
+      capability: access.capability,
+    }, token.bindingProof)
+    if (!prepared.ok) {
+      await failReservation(env, actor, normalized, prepared.error, now)
+      return errorOutcome(prepared.error)
+    }
+    accessStatements.push(...prepared.value.statements)
+  }
+
+  const challenge = randomChallenge()
+  const challengeHash = await sha256Hex(challenge)
+  const issuedAt = now.toISOString()
+  const receiptId = crypto.randomUUID()
+  const verificationExpiresAt = addMs(now, AGENT_CONNECTION_VERIFY_TTL_MS)
+  const endpoint = mcpEndpoint(canonicalOrigin)
+  const receipt: AgentConnectionReceipt = {
+    id: receiptId,
+    tenant: env.TENANT_SLUG,
+    actor_kind: actor.kind,
+    actor_id: actor.id,
+    request_id: normalized.requestId,
+    request_fingerprint: normalized.fingerprint,
+    agent_id: agent.id,
+    agent_slug: agent.slug,
+    agent_status_at_issue: agent.status,
+    member_id: token.memberId,
+    token_id: token.tokenId,
+    agent_disposition: agentDisposition,
+    credential_action: normalized.credential.action,
+    home_squad_id: normalized.homeSquadId,
+    home_capability: token.grantCapability,
+    additional_access_json: JSON.stringify(normalized.additionalAccess),
+    token_label: normalized.credential.label || agent.slug,
+    endpoint,
+    transport: 'streamable_http',
+    verification_status: 'pending',
+    verification_challenge_hash: challengeHash,
+    verification_expires_at: verificationExpiresAt,
+    client_connected_at: null,
+    verification_message_id: null,
+    verification_request_id: null,
+    messaging_verified_at: null,
+    verification_error_code: null,
+    checks_json: '{}',
+    credential_issued_at: issuedAt,
+    created_at: issuedAt,
+    updated_at: issuedAt,
+  }
+
+  const statements: D1PreparedStatement[] = [
+    ...(preparedAgent?.statements ?? []),
+    ...token.statements,
+    ...accessStatements,
+    insertReceiptStatement(env, receipt),
+    env.DB.prepare(
+      `UPDATE agent_connection_requests
+          SET status = 'credential_issued',
+              agent_id = ?,
+              member_id = ?,
+              token_id = ?,
+              receipt_id = ?,
+              updated_at = ?,
+              finalized_at = ?
+        WHERE tenant = ?
+          AND actor_kind = ?
+          AND actor_id = ?
+          AND request_id = ?
+          AND request_fingerprint = ?
+          AND status = 'pending'`,
+    ).bind(
+      agent.id,
+      token.memberId,
+      token.tokenId,
+      receiptId,
+      issuedAt,
+      issuedAt,
+      env.TENANT_SLUG,
+      actor.kind,
+      actor.id,
+      normalized.requestId,
+      normalized.fingerprint,
+    ),
+  ]
+
+  const writes = await env.DB.batch(statements)
+  if (writes.some((write) => rowsWritten(write) < 1)) {
+    throw new Error('receipt_failed')
+  }
+
+  return {
+    status: 'credential_issued',
+    credential: {
+      raw: token.raw,
+      tokenId: token.tokenId,
+      shownOnce: true,
+    },
+    verification: {
+      receiptId,
+      challenge,
+      expiresAt: verificationExpiresAt,
+    },
+    endpoint,
+    configuration: {
+      claudeCode: claudeCodeSnippet(env.TENANT_SLUG, canonicalOrigin),
+      codex: codexSnippet(env.TENANT_SLUG, canonicalOrigin),
+      cursor: cursorSnippet(env.TENANT_SLUG, canonicalOrigin),
+    },
+    receipt,
+  }
+}
+
 export async function provisionAgentConnection(
   env: Env,
   actor: AgentConnectionActor,
@@ -632,151 +791,46 @@ export async function provisionAgentConnection(
       normalized.credential.homeCapability,
     )
 
-    if (normalized.credential.action === 'replace') {
-      const replaceTokenId = normalized.credential.replaceTokenId as string
-      const replaceTarget = await env.DB.prepare(
-        `SELECT id
-           FROM member_tokens
-          WHERE id = ?
-            AND tenant = ?
-            AND member_id = ?
-            AND agent_id = ?
-            AND revoked_at IS NULL
-          LIMIT 1`,
-      ).bind(
-        replaceTokenId,
-        env.TENANT_SLUG,
-        token.memberId,
-        agent.id,
-      ).first<{ id: string }>()
-      if (!replaceTarget) {
-        await failReservation(env, actor, normalized, 'replace_token_not_found', now)
-        return errorOutcome('replace_token_not_found')
+    try {
+      return await commitPreparedConnectionAttempt(
+        env,
+        actor,
+        normalized,
+        now,
+        canonical.origin,
+        preparedAgent,
+        agent,
+        agentDisposition,
+        token,
+      )
+    } catch (error) {
+      if (
+        normalized.target.kind !== 'existing'
+        || existingBinding.kind !== 'unminted'
+        || !agentIdentityConflict(error)
+      ) {
+        throw error
       }
-    }
-
-    const accessStatements: D1PreparedStatement[] = []
-    for (const access of [
-      {
-        squadId: normalized.homeSquadId,
-        capability: token.grantCapability,
-      },
-      ...normalized.additionalAccess,
-    ]) {
-      const prepared = await prepareAgentSquadAccess(env, {
-        agentId: agent.id,
-        memberId: token.memberId,
-        squadId: access.squadId,
-        capability: access.capability,
-      }, token.bindingProof)
-      if (!prepared.ok) {
-        await failReservation(env, actor, normalized, prepared.error, now)
-        return errorOutcome(prepared.error)
-      }
-      accessStatements.push(...prepared.value.statements)
-    }
-
-    const challenge = randomChallenge()
-    const challengeHash = await sha256Hex(challenge)
-    const issuedAt = now.toISOString()
-    const receiptId = crypto.randomUUID()
-    const verificationExpiresAt = addMs(now, AGENT_CONNECTION_VERIFY_TTL_MS)
-    const endpoint = mcpEndpoint(canonical.origin)
-    const receipt: AgentConnectionReceipt = {
-      id: receiptId,
-      tenant: env.TENANT_SLUG,
-      actor_kind: actor.kind,
-      actor_id: actor.id,
-      request_id: normalized.requestId,
-      request_fingerprint: normalized.fingerprint,
-      agent_id: agent.id,
-      agent_slug: agent.slug,
-      agent_status_at_issue: agent.status,
-      member_id: token.memberId,
-      token_id: token.tokenId,
-      agent_disposition: agentDisposition,
-      credential_action: normalized.credential.action,
-      home_squad_id: normalized.homeSquadId,
-      home_capability: token.grantCapability,
-      additional_access_json: JSON.stringify(normalized.additionalAccess),
-      token_label: normalized.credential.label || agent.slug,
-      endpoint,
-      transport: 'streamable_http',
-      verification_status: 'pending',
-      verification_challenge_hash: challengeHash,
-      verification_expires_at: verificationExpiresAt,
-      client_connected_at: null,
-      verification_message_id: null,
-      verification_request_id: null,
-      messaging_verified_at: null,
-      verification_error_code: null,
-      checks_json: '{}',
-      credential_issued_at: issuedAt,
-      created_at: issuedAt,
-      updated_at: issuedAt,
-    }
-
-    const statements: D1PreparedStatement[] = [
-      ...(preparedAgent?.statements ?? []),
-      ...token.statements,
-      ...accessStatements,
-    ]
-    statements.push(
-      insertReceiptStatement(env, receipt),
-      env.DB.prepare(
-        `UPDATE agent_connection_requests
-            SET status = 'credential_issued',
-                agent_id = ?,
-                member_id = ?,
-                token_id = ?,
-                receipt_id = ?,
-                updated_at = ?,
-                finalized_at = ?
-          WHERE tenant = ?
-            AND actor_kind = ?
-            AND actor_id = ?
-            AND request_id = ?
-            AND request_fingerprint = ?
-            AND status = 'pending'`,
-      ).bind(
-        agent.id,
-        token.memberId,
-        token.tokenId,
-        receiptId,
-        issuedAt,
-        issuedAt,
-        env.TENANT_SLUG,
-        actor.kind,
-        actor.id,
-        normalized.requestId,
-        normalized.fingerprint,
-      ),
-    )
-
-    const writes = await env.DB.batch(statements)
-    if (writes.some((write) => rowsWritten(write) < 1)) {
-      throw new Error('receipt_failed')
-    }
-
-    return {
-      status: 'credential_issued',
-      credential: {
-        raw: token.raw,
-        tokenId: token.tokenId,
-        shownOnce: true,
-      },
-      verification: {
-        receiptId,
-        challenge,
-        expiresAt: verificationExpiresAt,
-      },
-      endpoint,
-      configuration: {
-        claudeCode: claudeCodeSnippet(env.TENANT_SLUG, canonical.origin),
-        codex: codexSnippet(env.TENANT_SLUG, canonical.origin),
-        cursor: cursorSnippet(env.TENANT_SLUG, canonical.origin),
-      },
-      receipt,
+      const winner = await resolveAgentMemberBinding(env, agent.id)
+      if (winner.kind === 'unminted') throw error
+      const retryToken = await prepareAgentBoundTokenMintForBinding(
+        env,
+        agent,
+        normalized.credential.label || agent.slug,
+        normalized.credential.homeCapability,
+        winner,
+      )
+      return commitPreparedConnectionAttempt(
+        env,
+        actor,
+        normalized,
+        now,
+        canonical.origin,
+        preparedAgent,
+        agent,
+        agentDisposition,
+        retryToken,
+      )
     }
   } catch (error) {
     const code = error instanceof Error && error.message.includes('slug')

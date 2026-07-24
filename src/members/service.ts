@@ -176,7 +176,7 @@ export async function prepareAgentBoundTokenMint(
   return prepareAgentBoundTokenMintForBinding(env, agent, label, grantCapability, binding)
 }
 
-async function prepareAgentBoundTokenMintForBinding(
+export async function prepareAgentBoundTokenMintForBinding(
   env: Env,
   agent: AgentForMint,
   label: string,
@@ -254,8 +254,13 @@ async function prepareAgentBoundTokenMintForBinding(
   }
 }
 
-function agentIdentityConflict(error: unknown): boolean {
-  return error instanceof Error && error.message.includes('agent_identity_conflict')
+export function agentIdentityConflict(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  return error.message.includes('agent_identity_conflict')
+    || (
+      error.message.includes('UNIQUE constraint failed')
+      && error.message.includes('agent_member_bindings')
+    )
 }
 
 async function commitPreparedAgentTokenMint(
