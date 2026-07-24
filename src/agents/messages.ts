@@ -425,6 +425,46 @@ export function readAgentInbox(
   return readAgentInboxForReader(env, input, 'bearer', opts)
 }
 
+/**
+ * Remove only the deterministic loopback row created by agent-connection
+ * verification. Every identity/correlation field is server-derived by the
+ * caller; a mismatch is a non-write, never a broad cleanup.
+ */
+export async function deleteAgentConnectionMessage(
+  env: Env,
+  input: {
+    messageId: string
+    agentId: string
+    requestId: string
+  },
+): Promise<
+  | { ok: true }
+  | { ok: false; reason: 'message_not_found' | 'db_error' }
+> {
+  try {
+    const result = await env.DB.prepare(
+      `DELETE FROM agent_messages
+        WHERE tenant = ?
+          AND id = ?
+          AND to_agent = ?
+          AND from_agent = ?
+          AND request_id = ?`,
+    ).bind(
+      env.TENANT_SLUG,
+      input.messageId,
+      input.agentId,
+      input.agentId,
+      input.requestId,
+    ).run()
+    const changed = result.meta?.changes ?? result.meta?.rows_written ?? 0
+    return changed === 1
+      ? { ok: true }
+      : { ok: false, reason: 'message_not_found' }
+  } catch {
+    return { ok: false, reason: 'db_error' }
+  }
+}
+
 /** Called only by the cryptographic verify-and-read boundary in fleet/signed-inbox.ts. */
 export function readVerifiedSignedAgentInbox(
   env: Env,
