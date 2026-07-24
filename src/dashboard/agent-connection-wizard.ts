@@ -845,6 +845,28 @@ export function renderAgentConnectionReceipt(
 
 export const agentConnectionWizardApp = new Hono<AgentConnectionWizardAppEnv>()
 
+// The parent dashboard CSRF middleware primarily protects browser form
+// encodings. This sub-app accepts JSON fetches, so require an explicit matching
+// Origin on every mutation rather than relying only on CORS preflight or cookie
+// SameSite behavior.
+agentConnectionWizardApp.use('*', async (c, next) => {
+  if (c.req.method !== 'POST') {
+    await next()
+    return
+  }
+  const origin = c.req.header('origin')
+  let expectedOrigin: string
+  try {
+    expectedOrigin = new URL(c.req.url).origin
+  } catch {
+    return c.json({ error: 'invalid_origin' }, 403)
+  }
+  if (!origin || origin !== expectedOrigin) {
+    return c.json({ error: 'invalid_origin' }, 403)
+  }
+  await next()
+})
+
 agentConnectionWizardApp.use('*', async (c, next) => {
   const auth = c.get('auth')
   if (!auth) return c.json({ error: 'forbidden' }, 403)

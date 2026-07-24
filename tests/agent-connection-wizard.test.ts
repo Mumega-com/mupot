@@ -71,7 +71,10 @@ function postJson(
     `https://malicious-host.example${path}`,
     {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        origin: 'https://malicious-host.example',
+      },
       body: JSON.stringify(body),
     },
     env,
@@ -166,6 +169,20 @@ describe('agent connection owner wizard', () => {
     )
     expect(unauthenticated.status).toBe(302)
     expect(unauthenticated.headers.get('location')).toBe('/auth/login')
+
+    const crossOrigin = await dashboardApp.fetch(
+      new Request('https://pot.example/agents/connect/cancel', {
+        method: 'POST',
+        headers: {
+          Cookie: 'mupot_session=owner-session',
+          Origin: 'https://attacker.example',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ request_id: 'anything' }),
+      }),
+      dashboardEnv,
+    )
+    expect(crossOrigin.status).toBe(403)
   })
 
   it('returns searchable non-secret candidates with immutable home and live token metadata', async () => {
