@@ -449,7 +449,13 @@ describe('local project workspace showcase', () => {
     expect(smoke).toMatch(/scrollWidth\s*-\s*document\.documentElement\.clientWidth/)
     expect(smoke).toContain('await runProjectWorkspaceWorkflow()')
     expect(smoke).toContain('project-situation-json')
-    expect(smoke).toContain("'complete', 'completed'")
+    // Slice 2 structural completion gate: 'completed' is reachable only from
+    // 'review' via a passed gate verdict (tests/project-completion-gate.test.ts),
+    // not a bare dashboard flip. The browser smoke covers the bare-flip cycle
+    // (pause/activate/archive/restore) that remains a direct status-machine edge.
+    expect(smoke).toContain("'pause', 'paused'")
+    expect(smoke).toContain("'archive', 'archived'")
+    expect(smoke).toContain('structural completion gate')
     expect(smoke).toContain('observedPersistedStatus')
     expect(smoke).toContain('surfaceParity')
     expect(evidenceDriver).toContain('mktemp -d')
