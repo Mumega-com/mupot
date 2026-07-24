@@ -153,18 +153,21 @@ export async function prepareAgentSquadAccess(
     return { ok: false, error: 'agent_identity_conflict' }
   }
 
-  const agent = await env.DB.prepare(
+  const committedAgent = await env.DB.prepare(
     'SELECT squad_id AS home_squad_id FROM agents WHERE id = ? LIMIT 1',
   ).bind(input.agentId).first<{ home_squad_id: string }>()
-  if (!agent) return { ok: false, error: 'agent_not_found' }
-  if (agent.home_squad_id !== bindingProof.homeSquadId) {
+  if (bindingProof.disposition === 'existing' && !committedAgent) {
+    return { ok: false, error: 'agent_not_found' }
+  }
+  const homeSquadId = committedAgent?.home_squad_id ?? bindingProof.homeSquadId
+  if (homeSquadId !== bindingProof.homeSquadId) {
     return { ok: false, error: 'agent_identity_conflict' }
   }
   if (!(await targetSquadExists(env, input.squadId))) {
     return { ok: false, error: 'squad_not_found' }
   }
   if (
-    input.squadId === agent.home_squad_id
+    input.squadId === homeSquadId
     && (input.capability as string) !== 'observer'
     && (input.capability as string) !== 'member'
   ) {

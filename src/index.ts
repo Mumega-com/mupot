@@ -228,6 +228,7 @@ import { syncGitHubProject } from './integrations/github-projects'
 import { runGrowthCollection } from './departments/collectors/growth-cron'
 import { runCroCollection } from './cro/collect'
 import { flushFlightEventOutbox } from './flight/service'
+import { sweepAgentConnectionRetention } from './members/agent-connection'
 
 export default {
   // The OAuth provider is the outer entry point. It handles OAuth paths and
@@ -239,7 +240,7 @@ export default {
   // Queue and scheduled handlers are preserved unchanged (spec §A.2).
   queue: handleQueue,
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Nine independent heartbeats on the same */15 cron:
+    // Ten independent heartbeats on the same */15 cron:
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
     //     ("design loops, not prompts"; without this the v0.3.0 loop never fires).
@@ -265,6 +266,9 @@ export default {
     //     status ≠ completed and no receipted recommit, kill → archived (Shape Up
     //     inversion). Receipts go through workflow_receipts; see
     //     src/projects/circuit-breaker.ts + stall-detector.ts + loop.ts.
+    // 10. Agent-connection retention — expire abandoned reservations and
+    //     verification challenges, then purge request/receipt rows at their
+    //     fixed tenant-scoped retention boundaries. Fail-soft by contract.
     ctx.waitUntil(reconcileMembership(env))
     ctx.waitUntil(runMetabolism(env))
     ctx.waitUntil(runLoopsTick(env))
@@ -274,5 +278,6 @@ export default {
     ctx.waitUntil(flushFlightEventOutbox(env).then(() => undefined))
     ctx.waitUntil(runConciergeTick(env).then(() => undefined))
     ctx.waitUntil(runProjectLoopTick(env, {}).then(() => undefined))
+    ctx.waitUntil(sweepAgentConnectionRetention(env).then(() => undefined))
   },
 }

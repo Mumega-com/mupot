@@ -7,6 +7,7 @@
 // the same capability helpers. They return a discriminated result so each surface
 // can shape its own response (JSON error vs re-rendered form).
 
+import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, Department, Squad, Agent, Effort, Autonomy, BudgetWindow } from '../types'
 import { isEffort, isAutonomy, isBudgetWindow } from '../types'
 import { checkCreateLimit } from '../billing/entitlement'
@@ -232,6 +233,13 @@ export interface AgentInput {
   death_condition?: unknown // JSON object or string
 }
 
+export type CreateAgentInput = AgentInput
+
+export interface PreparedAgentCreate {
+  agent: Agent
+  statements: [D1PreparedStatement, D1PreparedStatement]
+}
+
 // A nullable free-text profile field: undefined|null → null; a string → itself;
 // anything else → the sentinel `undefined` (caller maps to an invalid_* error).
 function optString(v: unknown): string | null | undefined {
@@ -271,11 +279,11 @@ function optJsonObject(v: unknown): string | null | undefined {
   return undefined
 }
 
-export async function createAgent(
+export async function prepareAgentCreate(
   env: Env,
   squadId: string,
   input: AgentInput,
-): Promise<CreateResult<Agent>> {
+): Promise<CreateResult<PreparedAgentCreate>> {
   if (!isValidSlug(input.slug)) return { ok: false, error: 'invalid_slug' }
   if (!isNonEmptyString(input.name)) return { ok: false, error: 'invalid_name' }
 
@@ -390,55 +398,65 @@ export async function createAgent(
     death_condition,
   }
 
-  // Insert the agent AND its squad membership atomically. The membership row
+  // Prepare the agent AND its neutral home routing membership. The caller may
+  // compose these statements into a larger provisioning transaction.
   // (agent_id -> its own squad, 'member') is what the project-scoped message path
   // (src/agents/messages.ts) checks — without it, an onboarded agent could not send
-  // or receive a project-scoped message (the memberships table was empty pot-wide;
-  // see gh #469). batch() runs both in one transaction, so an agent never exists
-  // without its membership. The agents unique-slug violation still surfaces here.
+  // or receive a project-scoped message (see gh #469).
+  const statements: [D1PreparedStatement, D1PreparedStatement] = [
+    env.DB.prepare(
+      `INSERT INTO agents
+      (id, squad_id, slug, name, role, model, status,
+       okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
+       created_at,
+       purpose, owner, model_fallback, capabilities, skills, parent_agent_id, qnft_ref, death_condition)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      agent.id,
+      agent.squad_id,
+      agent.slug,
+      agent.name,
+      agent.role,
+      agent.model,
+      agent.status,
+      agent.okr,
+      agent.kpi_target,
+      agent.kpi_progress,
+      agent.effort,
+      agent.autonomy,
+      agent.budget_cap_cents,
+      agent.budget_window,
+      agent.created_at,
+      purpose,
+      owner,
+      model_fallback,
+      capabilities,
+      skills,
+      parent_agent_id,
+      qnft_ref,
+      death_condition,
+    ),
+    env.DB.prepare(
+      `INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES (?, ?, ?, 'member')`,
+    ).bind(crypto.randomUUID(), agent.id, agent.squad_id),
+  ]
+  return { ok: true, value: { agent, statements } }
+}
+
+export async function createAgent(
+  env: Env,
+  squadId: string,
+  input: AgentInput,
+): Promise<CreateResult<Agent>> {
+  const prepared = await prepareAgentCreate(env, squadId, input)
+  if (!prepared.ok) return prepared
   try {
-    await env.DB.batch([
-      env.DB.prepare(
-        `INSERT INTO agents
-        (id, squad_id, slug, name, role, model, status,
-         okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
-         created_at,
-         purpose, owner, model_fallback, capabilities, skills, parent_agent_id, qnft_ref, death_condition)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).bind(
-        agent.id,
-        agent.squad_id,
-        agent.slug,
-        agent.name,
-        agent.role,
-        agent.model,
-        agent.status,
-        agent.okr,
-        agent.kpi_target,
-        agent.kpi_progress,
-        agent.effort,
-        agent.autonomy,
-        agent.budget_cap_cents,
-        agent.budget_window,
-        agent.created_at,
-        purpose,
-        owner,
-        model_fallback,
-        capabilities, // JSON text or null
-        skills, // JSON text or null
-        parent_agent_id,
-        qnft_ref,
-        death_condition,
-      ),
-      env.DB.prepare(
-        `INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES (?, ?, ?, 'member')`,
-      ).bind(crypto.randomUUID(), agent.id, agent.squad_id),
-    ])
+    await env.DB.batch(prepared.value.statements)
   } catch (err) {
     if (isUniqueViolation(err)) return { ok: false, error: 'slug_taken' }
     throw err
   }
-  return { ok: true, value: agent }
+  return { ok: true, value: prepared.value.agent }
 }
 
 // ── profile reads (0068, Port 1.3) ──────────────────────────────────────────────
