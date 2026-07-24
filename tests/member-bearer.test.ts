@@ -71,8 +71,9 @@ describe('resolveMemberByToken', () => {
     expect(await resolveMemberByToken(env, 'sk-x')).toBeNull()
   })
   it('resolves an active member to its identity (unbound token → boundAgentId null)', async () => {
-    const env = makeEnv({ member_id: 'm1', display_name: 'Kasra', email: 'k@x', status: 'active' })
+    const env = makeEnv({ token_id: 'tok-1', member_id: 'm1', display_name: 'Kasra', email: 'k@x', status: 'active' })
     expect(await resolveMemberByToken(env, 'sk-x')).toEqual({
+      tokenId: 'tok-1',
       memberId: 'm1',
       displayName: 'Kasra',
       email: 'k@x',
@@ -80,8 +81,9 @@ describe('resolveMemberByToken', () => {
     })
   })
   it('returns boundAgentId for an agent-scoped token (the weld)', async () => {
-    const env = makeEnv({ member_id: 'm1', display_name: 'content-writer', email: null, status: 'active', bound_agent_id: 'agent-7' })
+    const env = makeEnv({ token_id: 'tok-agent-7', member_id: 'm1', display_name: 'content-writer', email: null, status: 'active', bound_agent_id: 'agent-7' })
     expect(await resolveMemberByToken(env, 'sk-x')).toEqual({
+      tokenId: 'tok-agent-7',
       memberId: 'm1',
       displayName: 'content-writer',
       email: null,
@@ -98,6 +100,7 @@ describe('resolveMemberByToken', () => {
     expect(lookup).toBeDefined()
     expect(lookup!.sql).toContain('t.tenant = ?2')
     expect(lookup!.sql).toContain('m.tenant = ?2')
+    expect(lookup!.sql).toContain('t.id AS token_id')
     expect(lookup!.binds[1]).toBe('digid')
   })
 
@@ -134,11 +137,12 @@ describe('resolveMemberByToken', () => {
     // request degrades a live agent right now. Auth must survive the stamp failing.
     const seen = { queries: [] as SeenQuery[] }
     const env = makeEnv(
-      { member_id: 'm1', display_name: 'K', email: 'k@x', status: 'active' },
+      { token_id: 'tok-9', member_id: 'm1', display_name: 'K', email: 'k@x', status: 'active' },
       seen,
       { failWrites: true },
     )
     await expect(resolveMemberByToken(env, 'sk-x')).resolves.toEqual({
+      tokenId: 'tok-9',
       memberId: 'm1',
       displayName: 'K',
       email: 'k@x',

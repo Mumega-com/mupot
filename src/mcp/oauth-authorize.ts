@@ -749,6 +749,7 @@ export async function buildAuthContextFromProps(
     channel,
     capabilities, // always defined; empty only for directory — prevents legacyRoleSatisfies escape
     boundAgentId: exposedBoundAgentId, // null unless explicitly consent-bound (mupot#903b) AND still capability-live (P1)
+    tokenId: props.tokenId, // live row was re-read above; never accepted from a tool argument
     // mupot#903b: carried through so resolveAuth's header re-derivation (src/mcp/
     // index.ts) can re-run the SAME resolveConsentedAgentCapabilities check rather
     // than trust this AuthContext's `capabilities` value verbatim from the internal
