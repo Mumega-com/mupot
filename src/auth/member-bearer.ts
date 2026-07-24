@@ -16,7 +16,7 @@ import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from './token-lif
 export interface AgentIdentity {
   // Exact live member_tokens row that authenticated this request. Never supplied
   // by the caller; verification uses it to prove the issued credential was used.
-  tokenId: string | null
+  tokenId: string
   memberId: string
   displayName: string
   email: string | null
