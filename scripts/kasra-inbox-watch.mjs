@@ -193,7 +193,7 @@ export async function runCycle(opts = {}) {
 async function main() {
   // Single instance per agent. A second watcher on the same token interleaves
   // peek/consume and can drain rows this one already delivered.
-  const lock = acquireSingletonLock({ path: LOCK_FILE })
+  const lock = await acquireSingletonLock({ path: LOCK_FILE })
   if (!lock.ok) {
     log('start_refused', { reason: lock.reason, holder_pid: lock.holder_pid, lock_file: LOCK_FILE })
     process.exit(lock.reason === 'already_running' ? 0 : 1)

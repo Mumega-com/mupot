@@ -15,7 +15,7 @@ while (Date.now() < startAt) {
   // spin — setTimeout granularity is too coarse to synchronize the contenders
 }
 
-const lock = acquireSingletonLock({ path })
+const lock = await acquireSingletonLock({ path })
 process.stdout.write(`${JSON.stringify({ ok: lock.ok, reason: lock.reason, pid: process.pid })}\n`)
 
 if (lock.ok) {
