@@ -516,4 +516,3 @@ include a token, challenge, hash, session, or secret.
 Base the draft PR on `feat/agent-connection-guided-flow`, link #528, PR #537,
 and PR #538, and state that this slice adds the owner wizard only. Do not merge,
 deploy, run production migrations, or self-approve.
-
