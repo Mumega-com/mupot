@@ -24,6 +24,7 @@ import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
+import { MUPOT_FAVICON_32_PNG_B64, MUPOT_MARK_64_PNG_B64 } from './brand-assets'
 import type {
   Env,
   AuthContext,
@@ -2303,6 +2304,7 @@ function shell(
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>${title} · ${brand}</title>
+    <link rel="icon" type="image/png" href="${raw(`data:image/png;base64,${MUPOT_FAVICON_32_PNG_B64}`)}" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Hanken+Grotesk:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -2393,9 +2395,11 @@ function shell(
       .switcher > summary::-webkit-details-marker { display: none; }
       .switcher > summary .pot-icon {
         width: 30px; height: 30px; flex: none; border-radius: 8px;
-        background: linear-gradient(140deg,#d4a017,#96780A);
+        overflow: hidden; background: #f7f3ef;
         display: flex; align-items: center; justify-content: center;
-        color: #fff; font-family: var(--font-display); font-size: 17px;
+      }
+      .switcher > summary .pot-icon img {
+        width: 100%; height: 100%; object-fit: cover; display: block;
       }
       .switcher > summary .pot-name {
         flex: 1; min-width: 0; font-size: 13.5px; font-weight: 700;
@@ -3102,7 +3106,7 @@ function shell(
         <div class="switcher">
           <details id="pot-details">
             <summary>
-              <span class="pot-icon" id="pot-icon">M</span>
+              <span class="pot-icon" id="pot-icon"><img src="${raw(`data:image/png;base64,${MUPOT_MARK_64_PNG_B64}`)}" alt="" width="30" height="30" /></span>
               <span class="pot-name" id="pot-name">${brand}</span>
               <span class="caret">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M5 6.5 8 9.5l3-3"/></svg>
