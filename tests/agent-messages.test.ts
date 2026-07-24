@@ -509,6 +509,10 @@ describe('send / inbox tools', () => {
     if (r.ok) return
     expect(r.status).toBe(403)
     expect(r.error).toBe('not_agent_bound')
+    expect(r.detail).toEqual({
+      next_action: 'provision_agent_connection',
+      dashboard_path: '/agents/connect',
+    })
   })
 
   it('send: unknown recipient → 404', async () => {
@@ -532,6 +536,11 @@ describe('send / inbox tools', () => {
     expect(r.ok).toBe(false)
     if (r.ok) return
     expect(r.status).toBe(403)
+    expect(r.error).toBe('not_agent_bound')
+    expect(r.detail).toEqual({
+      next_action: 'provision_agent_connection',
+      dashboard_path: '/agents/connect',
+    })
   })
 
   it('inbox: caller reads its OWN welded inbox', async () => {
