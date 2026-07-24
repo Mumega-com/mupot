@@ -258,6 +258,7 @@ describe('provision tools — advertised', () => {
     expect(names).toContain('create_agent')
     expect(names).toContain('mint_agent_token')
     expect(names).toContain('provision_agent_connection')
+    expect(names).toContain('verify_agent_connection')
     expect(names).toContain('register_agent_key')
     expect(names).toContain('grant_agent_capability')
   })
