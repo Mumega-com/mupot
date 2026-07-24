@@ -14,6 +14,7 @@
 //   KASRA_AGENT_ID         default c855f82c-1eeb-409d-94d2-f11e9dd18968
 //   TMUX_SESSION           default kasra
 //   INTERVAL_SEC           default 30  (must be < 60 for DONE-WHEN canary)
+//   KASRA_INBOX_LOCK_FILE  default ~/.fleet/locks/kasra-inbox-watch-<agent_id>.lock
 
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -26,12 +27,16 @@ import {
   bearerConsumerAllowed,
   formatClaudeCodeNudge,
   planInboxConsume,
+  verifyConsumedBatch,
 } from '../fleet-runtime/claude-code-inbox-adapter.mjs'
+import { acquireSingletonLock } from '../fleet-runtime/singleton-lock.mjs'
 
 const MUPOT_MCP = process.env.MUPOT_MCP || 'https://mupot.mumega.com/mcp'
 const TOKEN_FILE = process.env.KASRA_TOKEN_FILE || join(homedir(), '.fleet', 'agents', 'kasra-agent.token')
 const EXPECTED_AGENT_ID = process.env.KASRA_AGENT_ID || 'c855f82c-1eeb-409d-94d2-f11e9dd18968'
 const TMUX_SESSION = process.env.TMUX_SESSION || 'kasra'
+const LOCK_FILE = process.env.KASRA_INBOX_LOCK_FILE
+  || join(homedir(), '.fleet', 'locks', `kasra-inbox-watch-${EXPECTED_AGENT_ID}.lock`)
 const INTERVAL_SEC = Math.min(60, Math.max(5, Number(process.env.INTERVAL_SEC || 30) || 30))
 const ONCE = process.argv.includes('--once')
 
@@ -149,17 +154,36 @@ export async function runCycle(opts = {}) {
 
   const consumed = await mcp(token, 'inbox', { limit: plan.consume, peek: false })
   const consumedMessages = Array.isArray(consumed.messages) ? consumed.messages : []
-  log('inbox_consumed', {
-    agent_id: identity.agent_id,
-    count: consumedMessages.length,
-    receipts,
-  })
+
+  // Compare identities, not counts: `inbox` consumes by limit, so a concurrent
+  // consumer can shift the window and leave the count matching while the rows
+  // differ. Those swapped-in rows leave the queue undelivered.
+  const verified = verifyConsumedBatch({ expected: messages, consumed: consumedMessages })
+  if (!verified.ok) {
+    log('consume_unverified', {
+      agent_id: identity.agent_id,
+      reason: verified.reason,
+      dropped: verified.dropped,
+      missing: verified.missing,
+      peeked: messages.length,
+      consumed: consumedMessages.length,
+      receipts,
+    })
+  } else {
+    log('inbox_consumed', {
+      agent_id: identity.agent_id,
+      count: consumedMessages.length,
+      receipts,
+    })
+  }
   return {
-    ok: consumedMessages.length === plan.consume,
-    reason: consumedMessages.length === plan.consume ? 'delivered_and_consumed' : 'consume_mismatch',
+    ok: verified.ok,
+    reason: verified.ok ? 'delivered_and_consumed' : verified.reason,
     consumed: consumedMessages.length,
     delivered: deliveredCount,
     peeked: messages.length,
+    dropped: verified.dropped,
+    missing: verified.missing,
     remaining: Number(consumed.remaining ?? peeked.remaining ?? 0),
     receipts,
     agent_id: identity.agent_id,
@@ -167,21 +191,49 @@ export async function runCycle(opts = {}) {
 }
 
 async function main() {
+  // Single instance per agent. A second watcher on the same token interleaves
+  // peek/consume and can drain rows this one already delivered.
+  const lock = acquireSingletonLock({ path: LOCK_FILE })
+  if (!lock.ok) {
+    log('start_refused', { reason: lock.reason, holder_pid: lock.holder_pid, lock_file: LOCK_FILE })
+    process.exit(lock.reason === 'already_running' ? 0 : 1)
+  }
+  let released = false
+  const release = () => {
+    if (released) return
+    released = true
+    lock.release()
+  }
+  process.on('exit', release)
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(signal, () => {
+      release()
+      process.exit(0)
+    })
+  }
+
   log('start', {
     mcp: MUPOT_MCP,
     agent_id: EXPECTED_AGENT_ID,
     tmux_session: TMUX_SESSION,
     interval_sec: INTERVAL_SEC,
     once: ONCE,
+    lock_file: LOCK_FILE,
   })
   for (;;) {
     try {
       const result = await runCycle()
       log('cycle', result)
-      if (ONCE) process.exit(result.ok || result.reason === 'inbox_empty' ? 0 : 1)
+      if (ONCE) {
+        release()
+        process.exit(result.ok || result.reason === 'inbox_empty' ? 0 : 1)
+      }
     } catch (error) {
       log('cycle_error', { error: String(error?.message ?? error) })
-      if (ONCE) process.exit(1)
+      if (ONCE) {
+        release()
+        process.exit(1)
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, INTERVAL_SEC * 1000))
   }

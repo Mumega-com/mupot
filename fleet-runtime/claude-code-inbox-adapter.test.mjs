@@ -75,11 +75,22 @@ test('bearer consumer refuses signed_only fence (no stale/wrong consumer)', () =
   assert.deepEqual(bearerConsumerAllowed({ mode: 'bearer_only' }), {
     ok: true, reason: 'bearer_only',
   })
-  assert.deepEqual(bearerConsumerAllowed({}), {
-    ok: true, reason: 'bearer_only',
-  })
   assert.deepEqual(bearerConsumerAllowed({ mode: 'signed_only' }), {
     ok: false, reason: 'consumer_fenced',
+  })
+})
+
+test('bearer consumer refuses a fence answer with no explicit mode (fail closed)', () => {
+  // Previously an absent mode defaulted to bearer_only — allowed. The server
+  // always states a mode, so a blank one means the answer did not arrive
+  // intact, which is the worst case to assume permission in.
+  for (const fence of [{}, { mode: '' }, { mode: null }, { mode: 123 }, null, undefined]) {
+    assert.deepEqual(bearerConsumerAllowed(fence), {
+      ok: false, reason: 'fence_mode_missing',
+    })
+  }
+  assert.deepEqual(bearerConsumerAllowed({ mode: 'nonsense' }), {
+    ok: false, reason: 'invalid_fence_mode',
   })
 })
 

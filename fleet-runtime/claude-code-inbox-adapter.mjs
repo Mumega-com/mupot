@@ -77,11 +77,21 @@ export function planInboxConsume(input) {
 }
 
 /**
- * Bearer MCP / Stop-hook consumers are only legal while the fence is bearer_only
- * (or absent → default bearer_only). signed_only must not be drained by a bearer token.
+ * Bearer MCP / Stop-hook consumers are only legal while the fence is bearer_only.
+ * signed_only must not be drained by a bearer token.
+ *
+ * The mode must be stated EXPLICITLY. `inbox_consumer_status` always returns a
+ * concrete mode (src/mcp/index.ts collapses a missing row to 'bearer_only'
+ * server-side), so an absent/blank mode here means the fence answer did not
+ * arrive intact — a truncated payload, a shape change, or a different server.
+ * Defaulting that to 'bearer_only' would fail OPEN on exactly the case where we
+ * know least. Refuse instead; a healthy server is unaffected.
  */
 export function bearerConsumerAllowed(fence) {
-  const mode = fence?.mode == null || fence.mode === '' ? 'bearer_only' : fence.mode
+  const mode = fence?.mode
+  if (typeof mode !== 'string' || mode === '') {
+    return { ok: false, reason: 'fence_mode_missing' }
+  }
   if (mode !== 'bearer_only' && mode !== 'signed_only') {
     return { ok: false, reason: 'invalid_fence_mode' }
   }
@@ -89,6 +99,55 @@ export function bearerConsumerAllowed(fence) {
     return { ok: false, reason: 'consumer_fenced' }
   }
   return { ok: true, reason: 'bearer_only' }
+}
+
+/** Stable identity for a message across peek and consume reads. */
+function messageKey(message) {
+  if (typeof message?.id === 'string' && message.id) return `id:${message.id}`
+  const seq = Number(message?.seq)
+  return Number.isFinite(seq) ? `seq:${seq}` : null
+}
+
+/**
+ * Verify the consumed batch is exactly the batch we delivered.
+ *
+ * The `inbox` tool consumes by limit, not by id, so a concurrent consumer can
+ * shift the window between our peek and our consume. Counting rows cannot see
+ * that: N delivered and N consumed reports success even when the N consumed are
+ * a DIFFERENT N. Those extra rows are consumed without ever being delivered —
+ * a silent drop, and the failure this exists to catch.
+ *
+ * Short reads are safe by comparison: an undelivered row stays queued and is
+ * redelivered next cycle. Both are reported, with the drop ranked first.
+ */
+export function verifyConsumedBatch(input) {
+  const expected = Array.isArray(input?.expected) ? input.expected : null
+  const consumed = Array.isArray(input?.consumed) ? input.consumed : null
+  if (!expected || !consumed) return { ok: false, reason: 'invalid_batch', dropped: [], missing: [] }
+
+  const expectedKeys = []
+  for (const message of expected) {
+    const key = messageKey(message)
+    if (key === null) return { ok: false, reason: 'unidentifiable_message', dropped: [], missing: [] }
+    expectedKeys.push(key)
+  }
+  const consumedKeys = []
+  for (const message of consumed) {
+    const key = messageKey(message)
+    if (key === null) return { ok: false, reason: 'unidentifiable_message', dropped: [], missing: [] }
+    consumedKeys.push(key)
+  }
+
+  const expectedSet = new Set(expectedKeys)
+  const consumedSet = new Set(consumedKeys)
+  // Consumed but never delivered — gone from the queue, never shown to anyone.
+  const dropped = consumedKeys.filter((k) => !expectedSet.has(k))
+  // Delivered but not consumed — still queued, will redeliver.
+  const missing = expectedKeys.filter((k) => !consumedSet.has(k))
+
+  if (dropped.length > 0) return { ok: false, reason: 'consumed_undelivered_message', dropped, missing }
+  if (missing.length > 0) return { ok: false, reason: 'consume_incomplete', dropped, missing }
+  return { ok: true, reason: 'batch_verified', dropped: [], missing: [] }
 }
 
 /**

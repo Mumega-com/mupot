@@ -78,6 +78,96 @@ test('runCycle refuses consume when tmux handoff fails (no silent drop)', async 
   assert.equal(consumed, false)
 })
 
+test('runCycle reports a silent drop when consume returns rows it never delivered', async () => {
+  // A concurrent consumer shifts the window between peek and consume: the count
+  // still matches, but the row that leaves the queue was never shown to anyone.
+  const OTHER = { ...REQUEST, seq: 999, id: 'msg-never-delivered', request_id: 'other-req' }
+  const mcpCall = async (_token, name, args) => {
+    if (name === 'boot_context') return { bound_agent_id: AGENT }
+    if (name === 'inbox_consumer_status') return { mode: 'bearer_only' }
+    if (name === 'inbox' && args.peek === true) return { messages: [REQUEST], remaining: 0 }
+    if (name === 'inbox' && args.peek === false) return { messages: [OTHER], remaining: 0 }
+    throw new Error(`unexpected ${name}`)
+  }
+
+  const result = await runCycle({
+    token: 'test-token-not-real',
+    mcpCall,
+    deliverToTmux: () => ({ ok: true }),
+  })
+
+  // The old count check passed this case: 1 delivered, 1 consumed.
+  assert.equal(result.consumed, 1)
+  assert.equal(result.delivered, 1)
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'consumed_undelivered_message')
+  assert.deepEqual(result.dropped, ['id:msg-never-delivered'])
+  assert.deepEqual(result.missing, ['id:msg-yc27'])
+})
+
+test('runCycle stays green when consume returns exactly the delivered batch', async () => {
+  const second = { ...REQUEST, seq: 132, id: 'msg-yc27-b', request_id: 'yc27-b' }
+  const mcpCall = async (_token, name, args) => {
+    if (name === 'boot_context') return { bound_agent_id: AGENT }
+    if (name === 'inbox_consumer_status') return { mode: 'bearer_only' }
+    if (name === 'inbox' && args.peek === true) return { messages: [REQUEST, second], remaining: 0 }
+    // Same set, different order — order is not identity.
+    if (name === 'inbox' && args.peek === false) return { messages: [second, REQUEST], remaining: 0 }
+    throw new Error(`unexpected ${name}`)
+  }
+
+  const result = await runCycle({
+    token: 'test-token-not-real',
+    mcpCall,
+    deliverToTmux: () => ({ ok: true }),
+  })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.reason, 'delivered_and_consumed')
+  assert.deepEqual(result.dropped, [])
+  assert.deepEqual(result.missing, [])
+})
+
+test('runCycle reports a short consume without calling it a drop', async () => {
+  const second = { ...REQUEST, seq: 133, id: 'msg-yc27-c', request_id: 'yc27-c' }
+  const mcpCall = async (_token, name, args) => {
+    if (name === 'boot_context') return { bound_agent_id: AGENT }
+    if (name === 'inbox_consumer_status') return { mode: 'bearer_only' }
+    if (name === 'inbox' && args.peek === true) return { messages: [REQUEST, second], remaining: 0 }
+    if (name === 'inbox' && args.peek === false) return { messages: [REQUEST], remaining: 0 }
+    throw new Error(`unexpected ${name}`)
+  }
+
+  const result = await runCycle({
+    token: 'test-token-not-real',
+    mcpCall,
+    deliverToTmux: () => ({ ok: true }),
+  })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'consume_incomplete')
+  assert.deepEqual(result.dropped, [])
+  // Still queued, so it redelivers next cycle — not a loss.
+  assert.deepEqual(result.missing, ['id:msg-yc27-c'])
+})
+
+test('runCycle refuses a fence answer with no explicit mode (fail closed)', async () => {
+  for (const fence of [{}, { mode: '' }, { mode: null }, { agent_id: AGENT }]) {
+    const result = await runCycle({
+      token: 'x',
+      mcpCall: async (_t, name) => {
+        if (name === 'boot_context') return { bound_agent_id: AGENT }
+        if (name === 'inbox_consumer_status') return fence
+        throw new Error('must stop at fence — never reach inbox')
+      },
+      deliverToTmux: () => ({ ok: true }),
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.reason, 'fence_mode_missing')
+    assert.equal(result.consumed, 0)
+  }
+})
+
 test('runCycle refuses wrong bound agent / signed_only fence', async () => {
   const wrong = await runCycle({
     token: 'x',
