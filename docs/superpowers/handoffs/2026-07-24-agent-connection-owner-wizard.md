@@ -60,6 +60,11 @@ Browser completion evidence was strengthened on follow-up head `171ed25`. That
 follow-up adds a second local squad plus an unminted existing-agent fixture and
 drives both identity dispositions through the rendered owner wizard.
 
+Connected-agent replacement evidence was added on follow-up head `3134a8d`.
+That run reconnects the same existing identity, explicitly replaces its live
+credential, verifies the replacement, and confirms the prior receipt reports
+only the old credential revoked.
+
 ### Static and repository tests
 
 ```text
@@ -120,6 +125,10 @@ That run:
 - observed `messaging_verified` plus passing `orient`, `send`, and
   `inbox_peek` receipt checks for both journeys;
 - proved both home and additional squad rows were synchronized exactly once;
+- revisited the now-connected existing agent, selected the explicit replacement
+  action, and proved the replacement retained the same identity, home, and
+  synchronized access;
+- proved the prior credential became revoked while the replacement stayed live;
 - loaded the durable receipt and proved it contained neither key nor challenge;
 - completed all pre-existing dashboard workflows; and
 - passed every `runtime-adapter/v1` conformance step.
@@ -145,6 +154,17 @@ The non-secret browser report records both paths:
     "additionalAccessSynchronized": true,
     "messagingVerified": true,
     "durableReceiptSecretFree": true
+  },
+  {
+    "name": "owner replace existing agent credential journey",
+    "status": "passed",
+    "existingIdentityReused": true,
+    "existingCredentialReplaced": true,
+    "priorCredentialRevoked": true,
+    "canonicalIdentityCount": 1,
+    "additionalAccessSynchronized": true,
+    "messagingVerified": true,
+    "durableReceiptSecretFree": true
   }
 ]
 ```
@@ -155,7 +175,8 @@ The non-secret browser report records both paths:
 
 - Browser: complete new-agent create and existing-agent reuse journeys through
   identity selection, immutable home, optional additional access, credential,
-  configuration, live MCP verification, synchronized access, and receipt.
+  configuration, live MCP verification, synchronized access, and receipt;
+  plus connected-agent credential replacement with prior-token revocation.
 - Route/real-SQLite: existing-agent add flow, no duplicate canonical identity,
   cross-squad access, stable retry without second key, owner/admin/fine-grained
   admin gates, bound-agent refusal, cross-origin refusal, abandoned-request
@@ -166,7 +187,6 @@ The non-secret browser report records both paths:
 
 **NOT YET TESTED**
 
-- A browser-click journey for existing-agent replacement.
 - Production migration, deploy, live credential issuance, or live token
   revocation.
 
