@@ -12,6 +12,12 @@ block collapses into a changelog entry when it ships.
 
 - Fleet coordination cut over to mupot CF-native primitives (D1 send/inbox + presence +
   Queue wake); SOS Redis bus reduced to a documented compat shim (ADR #473).
+- Formal gate decision: Goose / `goosed` fleet-runtime **non-adoption** (kasra-core
+  ACCEPTS). Native CLI subscription agents remain the fleet substrate; ACP wrappers
+  that re-enter the same CLIs are out of scope. Correctly scoped replacement for
+  task `e89df2c2` (rejected on process, not conclusion). Decision:
+  `docs/fleet/goose-non-adoption-2026-07-22.md`; attach allow-list stays without
+  `goose`/`goosed`. Technical basis reused from PR #483 / `b8070e2`.
 
 ## [0.24.0] — 2026-07-19
 
