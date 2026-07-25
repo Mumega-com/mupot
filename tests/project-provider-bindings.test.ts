@@ -7,12 +7,15 @@ import {
   listProjectBindings,
   removeProjectBinding,
   upsertProjectBinding,
+  type BindingActorContext,
 } from '../src/projects/providers/bindings'
 import { isProjectBoardProvider, PROJECT_BOARD_PROVIDERS } from '../src/projects/providers/port'
 import { isConnectorType } from '../src/connectors/crypto'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const THROUGH = '0062_project_provider_bindings.sql'
+
+const ADMIN: BindingActorContext = { workspaceAdmin: true, authorizingSquadIds: [] }
 
 function applyThrough(sqlite: { exec(sql: string): void }, throughFile: string): void {
   for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name <= throughFile).sort()) {
@@ -41,7 +44,7 @@ describe('project provider bindings', () => {
         provider: 'github_projects',
         external_id: 'Mumega-com/12',
         meta: { agent_field: 'Agent' },
-      })
+      }, ADMIN)
       expect(created.ok).toBe(true)
       if (!created.ok) return
       expect(created.value.external_id).toBe('Mumega-com/12')
@@ -68,7 +71,7 @@ describe('project provider bindings', () => {
       const result = await upsertProjectBinding(env, 'proj-a', {
         provider: 'linear',
         external_id: 'ENG',
-      })
+      }, ADMIN)
       expect(result.ok).toBe(false)
       if (result.ok) return
       expect(result.error).toBe('archived_project')
@@ -77,13 +80,15 @@ describe('project provider bindings', () => {
     }
   })
 
-  // #453: a per-project manager only has authority over the squad(s) actually
-  // bound to THIS project (project_squad_access) — never over the tenant's
-  // whole connector inventory. A referenced connector_id must be pot-wide, or
-  // squad-scoped to a squad that holds access on this project; agent-scoped
-  // connectors are never valid here. Otherwise a future Linear/Notion adapter
-  // consuming binding.connector_id would inherit a confused-deputy credential
-  // borrow the moment it starts reading connector_id for real.
+  // #453: the referenced connector must be within the ACTOR'S OWN authority,
+  // never merely "linked to the project." A first attempt at this fix (BLOCKed
+  // by adversarial review at e4be75d) accepted any pot-wide connector, and any
+  // squad-scoped connector belonging to ANY squad holding ANY access_level on
+  // the project — broader than the caller's own authority. canManageProject
+  // authorizes a non-admin actor through a SPECIFIC subset of their own squads
+  // holding write/admin here; these tests pin the corrected policy: pot-wide
+  // requires workspace-admin, squad-scoped requires the connector's squad to be
+  // one of THIS actor's own authorizingSquadIds — not merely project-linked.
   describe('connector_id scope validation (#453)', () => {
     const TENANT = 'test-tenant'
 
@@ -112,7 +117,10 @@ describe('project provider bindings', () => {
       `)
     }
 
-    it('accepts a pot-wide connector regardless of project squads', async () => {
+    // The manager authorized through squad-mine on proj-1 — NOT an admin.
+    const MANAGER_VIA_MINE: BindingActorContext = { workspaceAdmin: false, authorizingSquadIds: ['squad-mine'] }
+
+    it('workspace admin may bind a pot-wide connector', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
         applyThrough(sqlite, THROUGH)
@@ -123,14 +131,32 @@ describe('project provider bindings', () => {
           provider: 'linear',
           external_id: 'ENG',
           connector_id: 'conn-pot',
-        })
+        }, ADMIN)
         expect(result.ok).toBe(true)
       } finally {
         close()
       }
     })
 
-    it('accepts a squad-scoped connector when that squad has access on this project', async () => {
+    it('REJECTS a pot-wide connector for a non-admin project manager', async () => {
+      const { sqlite, db, close } = createSqliteD1()
+      try {
+        applyThrough(sqlite, THROUGH)
+        seed(sqlite)
+        insertConnector(sqlite, 'conn-pot', 'pot', null)
+        const env = { DB: db, TENANT_SLUG: TENANT } as never
+        const result = await upsertProjectBinding(env, 'proj-1', {
+          provider: 'linear',
+          external_id: 'ENG',
+          connector_id: 'conn-pot',
+        }, MANAGER_VIA_MINE)
+        expect(result).toEqual({ ok: false, error: 'connector_out_of_scope' })
+      } finally {
+        close()
+      }
+    })
+
+    it('accepts a squad-scoped connector when the actor is authorized through that same squad', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
         applyThrough(sqlite, THROUGH)
@@ -141,7 +167,7 @@ describe('project provider bindings', () => {
           provider: 'linear',
           external_id: 'ENG',
           connector_id: 'conn-mine',
-        })
+        }, MANAGER_VIA_MINE)
         expect(result.ok).toBe(true)
       } finally {
         close()
@@ -160,31 +186,50 @@ describe('project provider bindings', () => {
           provider: 'linear',
           external_id: 'ENG',
           connector_id: 'conn-other',
-        })
+        }, MANAGER_VIA_MINE)
         expect(result).toEqual({ ok: false, error: 'connector_out_of_scope' })
       } finally {
         close()
       }
     })
 
-    it('REJECTS an agent-scoped connector outright, even if the agent sits on an in-scope squad', async () => {
+    it('REJECTS a squad-scoped connector for a DIFFERENT squad even when that squad also has project access (the exact confused-deputy gap)', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
         applyThrough(sqlite, THROUGH)
         seed(sqlite)
-        // Grant squad-other (agent-1's squad) access too, to prove agent scope
-        // is rejected on its own terms, not merely via the squad check.
+        // squad-other ALSO has (read-only) access to proj-1 — but the calling
+        // actor is authorized here through squad-mine only, so squad-other's
+        // credential must still be out of THEIR reach.
         sqlite.exec(`
           INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
-            VALUES ('proj-1', 'squad-other', 'write', datetime('now'));
+            VALUES ('proj-1', 'squad-other', 'read', datetime('now'));
         `)
+        insertConnector(sqlite, 'conn-other', 'squad', 'squad-other')
+        const env = { DB: db, TENANT_SLUG: TENANT } as never
+        const result = await upsertProjectBinding(env, 'proj-1', {
+          provider: 'linear',
+          external_id: 'ENG',
+          connector_id: 'conn-other',
+        }, MANAGER_VIA_MINE)
+        expect(result).toEqual({ ok: false, error: 'connector_out_of_scope' })
+      } finally {
+        close()
+      }
+    })
+
+    it('REJECTS an agent-scoped connector outright, even for a workspace admin', async () => {
+      const { sqlite, db, close } = createSqliteD1()
+      try {
+        applyThrough(sqlite, THROUGH)
+        seed(sqlite)
         insertConnector(sqlite, 'conn-agent', 'agent', 'agent-1')
         const env = { DB: db, TENANT_SLUG: TENANT } as never
         const result = await upsertProjectBinding(env, 'proj-1', {
           provider: 'linear',
           external_id: 'ENG',
           connector_id: 'conn-agent',
-        })
+        }, ADMIN)
         expect(result).toEqual({ ok: false, error: 'connector_out_of_scope' })
       } finally {
         close()
@@ -201,7 +246,7 @@ describe('project provider bindings', () => {
           provider: 'linear',
           external_id: 'ENG',
           connector_id: 'no-such-connector',
-        })
+        }, ADMIN)
         expect(result).toEqual({ ok: false, error: 'connector_not_found' })
       } finally {
         close()
@@ -219,7 +264,7 @@ describe('project provider bindings', () => {
           provider: 'linear',
           external_id: 'ENG',
           connector_id: 'conn-revoked',
-        })
+        }, ADMIN)
         expect(result).toEqual({ ok: false, error: 'connector_not_found' })
       } finally {
         close()
@@ -240,7 +285,7 @@ describe('project provider bindings', () => {
           provider: 'linear',
           external_id: 'ENG',
           connector_id: 'conn-cross-tenant',
-        })
+        }, ADMIN)
         expect(result).toEqual({ ok: false, error: 'connector_not_found' })
       } finally {
         close()
@@ -258,14 +303,14 @@ describe('project provider bindings', () => {
           provider: 'linear',
           external_id: 'ENG',
           connector_id: 'conn-mine',
-        })
+        }, MANAGER_VIA_MINE)
         expect(bound.ok).toBe(true)
 
         const cleared = await upsertProjectBinding(env, 'proj-1', {
           provider: 'linear',
           external_id: 'ENG',
           connector_id: null,
-        })
+        }, MANAGER_VIA_MINE)
         expect(cleared.ok).toBe(true)
         if (!cleared.ok) return
         expect(cleared.value.connector_id).toBeNull()

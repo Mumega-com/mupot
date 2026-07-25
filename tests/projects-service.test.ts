@@ -263,6 +263,84 @@ describe('project domain service', () => {
     expect(await listProjectSquads(env, root.id)).toEqual([])
   })
 
+  // #453 follow-up: a squad-scoped project_provider_binding.connector_id is
+  // only valid because that squad held write/admin here at bind time. If
+  // access is later downgraded or removed, the binding must self-heal rather
+  // than keep referencing authority nobody currently holds — Linear/Notion
+  // adapters have no project-scope recheck at connector-resolve time, so this
+  // is the only place that staleness gets closed until they do.
+  describe('squad-scoped provider bindings self-heal on access change (#453)', () => {
+    function seedConnectorAndBinding(harnessRef: SqliteD1Harness, projectId: string, squadId: string): void {
+      harnessRef.sqlite.exec(`
+        INSERT INTO connectors (id, tenant, type, label, encrypted_secret, scope_type, scope_id, created_by, created_at, revoked_at)
+        VALUES ('conn-1', 'test-tenant', 'linear', 'test connector', 'ciphertext', 'squad', '${squadId}', 'tester', datetime('now'), NULL);
+        INSERT INTO project_provider_bindings (project_id, provider, external_id, connector_id, meta_json, created_at, updated_at)
+        VALUES ('${projectId}', 'linear', 'ENG', 'conn-1', '{}', datetime('now'), datetime('now'));
+      `)
+    }
+
+    it('downgrading the squad below write/admin nulls the connector reference', async () => {
+      harness = makeHarness()
+      const env = envFor(harness)
+      const root = await createRoot(env)
+      await upsertProjectSquadAccess(env, root.id, 'squad-1', 'write')
+      seedConnectorAndBinding(harness, root.id, 'squad-1')
+
+      await upsertProjectSquadAccess(env, root.id, 'squad-1', 'read')
+
+      const binding = harness.sqlite.prepare(
+        'SELECT connector_id FROM project_provider_bindings WHERE project_id = ? AND provider = ?',
+      ).get(root.id, 'linear') as { connector_id: string | null } | undefined
+      expect(binding?.connector_id).toBeNull()
+    })
+
+    it('removing the squad access entirely nulls the connector reference', async () => {
+      harness = makeHarness()
+      const env = envFor(harness)
+      const root = await createRoot(env)
+      await upsertProjectSquadAccess(env, root.id, 'squad-1', 'admin')
+      seedConnectorAndBinding(harness, root.id, 'squad-1')
+
+      await removeProjectSquadAccess(env, root.id, 'squad-1')
+
+      const binding = harness.sqlite.prepare(
+        'SELECT connector_id FROM project_provider_bindings WHERE project_id = ? AND provider = ?',
+      ).get(root.id, 'linear') as { connector_id: string | null } | undefined
+      expect(binding?.connector_id).toBeNull()
+    })
+
+    it('re-upserting the SAME squad at write/admin does not disturb its own connector reference', async () => {
+      harness = makeHarness()
+      const env = envFor(harness)
+      const root = await createRoot(env)
+      await upsertProjectSquadAccess(env, root.id, 'squad-1', 'write')
+      seedConnectorAndBinding(harness, root.id, 'squad-1')
+
+      await upsertProjectSquadAccess(env, root.id, 'squad-1', 'admin')
+
+      const binding = harness.sqlite.prepare(
+        'SELECT connector_id FROM project_provider_bindings WHERE project_id = ? AND provider = ?',
+      ).get(root.id, 'linear') as { connector_id: string | null } | undefined
+      expect(binding?.connector_id).toBe('conn-1')
+    })
+
+    it('downgrading an UNRELATED squad does not touch a binding scoped to a different squad', async () => {
+      harness = makeHarness()
+      const env = envFor(harness)
+      const root = await createRoot(env)
+      await upsertProjectSquadAccess(env, root.id, 'squad-1', 'write')
+      await upsertProjectSquadAccess(env, root.id, 'squad-2', 'write')
+      seedConnectorAndBinding(harness, root.id, 'squad-1')
+
+      await upsertProjectSquadAccess(env, root.id, 'squad-2', 'read')
+
+      const binding = harness.sqlite.prepare(
+        'SELECT connector_id FROM project_provider_bindings WHERE project_id = ? AND provider = ?',
+      ).get(root.id, 'linear') as { connector_id: string | null } | undefined
+      expect(binding?.connector_id).toBe('conn-1')
+    })
+  })
+
   it('maps zero-row write receipts to receipt_failed', async () => {
     const env = {
       DB: {

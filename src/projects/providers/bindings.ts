@@ -1,7 +1,6 @@
 import type { D1Result } from '@cloudflare/workers-types'
 import type { Env } from '../../types'
 import { resolveConnectorByIdWithMeta } from '../../connectors/service'
-import { listProjectSquads } from '../service'
 import {
   isProjectBoardProvider,
   type ProjectBoardProvider,
@@ -31,6 +30,20 @@ export interface UpsertBindingInput {
   // NEVER put a secret here (webhook signing secret, integration/install token, etc.) —
   // credentials belong in the connector record (referenced by connector_id), never inline.
   meta?: unknown
+}
+
+/**
+ * The calling actor's OWN authority on this project — never "everything linked
+ * to the project." A project manager authorized through squad A must not be
+ * able to bind a connector scoped to squad B merely because B also holds some
+ * access_level here; that is precisely the confused-deputy shape #453 requires
+ * closed. Callers get this from dashboard/projects.ts's
+ * `projectManageAccessContext` (the same source `canManageProject` already
+ * authorizes the request against), never derived independently.
+ */
+export interface BindingActorContext {
+  workspaceAdmin: boolean
+  authorizingSquadIds: string[]
 }
 
 function wrote(result: D1Result<unknown>): boolean {
@@ -83,6 +96,7 @@ export async function upsertProjectBinding(
   env: Env,
   projectId: string,
   input: UpsertBindingInput,
+  actor: BindingActorContext,
 ): Promise<BindingMutationResult<ProjectProviderBinding>> {
   if (!isProjectBoardProvider(input.provider)) return { ok: false, error: 'invalid_provider' }
   if (!isNonEmptyString(input.external_id) || input.external_id.trim().length > 500) {
@@ -97,28 +111,34 @@ export async function upsertProjectBinding(
   if (input.connector_id !== undefined && input.connector_id !== null && input.connector_id !== '' && connectorId === null) {
     return { ok: false, error: 'invalid_external_id' }
   }
-  // SECURITY (#453): a per-project manager only has authority over the squad(s)
-  // bound to THIS project (project_squad_access) — never over the tenant's whole
-  // connector inventory. Storing connector_id verbatim would let them reference a
-  // connector scoped to an unrelated squad, or to a specific agent, and have a
-  // future board-sync adapter borrow that credential on their behalf: a classic
-  // confused-deputy. So a referenced connector must be either pot-wide, or squad-
-  // scoped to a squad that actually holds access on this project. Agent-scoped
-  // connectors are never valid here — those are a single agent's credential, not
-  // a project-shared one. Fail closed on any lookup miss.
+  // SECURITY (#453): the referenced connector must be within the ACTOR's OWN
+  // authority, never merely "linked to the project." A prior version of this
+  // fix (BLOCKed by adversarial review at e4be75d) accepted any pot-wide
+  // connector, and any squad-scoped connector belonging to ANY squad that held
+  // ANY access_level on the project — broader than the caller's own authority.
+  // canManageProject authorizes a non-admin actor through a SPECIFIC subset of
+  // their own squads holding write/admin here; a manager authorized via squad A
+  // must not bind squad B's credential just because B also has, say, read-only
+  // access to this project. So: pot-wide connectors require workspace-admin
+  // (the only tier with tenant-wide connector authority); squad-scoped
+  // connectors require scope_id to be one of the actor's OWN authorizingSquadIds
+  // — not merely a project-linked squad. Agent-scoped connectors are never
+  // valid here — a single agent's credential is not a project-shared one. Fail
+  // closed on any lookup miss.
   if (connectorId !== null) {
     const connector = await resolveConnectorByIdWithMeta(env, connectorId)
     if (!connector) return { ok: false, error: 'connector_not_found' }
     if (connector.scopeType === 'agent') {
       return { ok: false, error: 'connector_out_of_scope' }
     }
+    if (connector.scopeType === 'pot') {
+      if (!actor.workspaceAdmin) return { ok: false, error: 'connector_out_of_scope' }
+    }
     if (connector.scopeType === 'squad') {
-      const projectSquads = await listProjectSquads(env, projectId)
       const inScope = connector.scopeId !== null
-        && projectSquads.some((access) => access.squad_id === connector.scopeId)
+        && actor.authorizingSquadIds.includes(connector.scopeId)
       if (!inScope) return { ok: false, error: 'connector_out_of_scope' }
     }
-    // scopeType === 'pot' — pot-wide, always in scope.
   }
   let metaJson = '{}'
   if (input.meta !== undefined) {

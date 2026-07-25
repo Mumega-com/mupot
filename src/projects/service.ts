@@ -440,6 +440,9 @@ export async function upsertProjectSquadAccess(
   const access = await env.DB.prepare(
     'SELECT project_id, squad_id, access_level, granted_at FROM project_squad_access WHERE project_id = ? AND squad_id = ?',
   ).bind(projectId, squadId).first<ProjectSquadAccess>()
+  if (accessLevel !== 'write' && accessLevel !== 'admin') {
+    await invalidateSquadScopedProviderBindings(env, projectId, squadId)
+  }
   return { ok: true, value: access ?? { project_id: projectId, squad_id: squadId, access_level: accessLevel, granted_at: grantedAt } }
 }
 
@@ -461,5 +464,31 @@ export async function removeProjectSquadAccess(
     if (mapped) return { ok: false, error: mapped }
     throw error
   }
+  await invalidateSquadScopedProviderBindings(env, projectId, squadId)
   return { ok: true, value: undefined }
+}
+
+// SECURITY (#453 follow-up): a squad-scoped connector was only ever a valid
+// project_provider_binding reference because that squad held write/admin here
+// at BIND time (see upsertProjectBinding's actor check). If that squad's
+// access is later downgraded below write/admin, or removed entirely, a stored
+// connector_id referencing IT becomes a stale grant of authority nobody
+// currently holds — the adapters that will eventually consume connector_id
+// (Linear/Notion, still pending_credentials stubs) have no project-scope
+// recheck at resolve time, so the binding itself must self-heal here instead.
+// Clearing to NULL (not deleting the binding) preserves the provider/
+// external_id link; a manager with current authority can re-bind a connector.
+async function invalidateSquadScopedProviderBindings(
+  env: Env,
+  projectId: string,
+  squadId: string,
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE project_provider_bindings
+        SET connector_id = NULL, updated_at = ?
+      WHERE project_id = ?
+        AND connector_id IN (
+          SELECT id FROM connectors WHERE scope_type = 'squad' AND scope_id = ?
+        )`,
+  ).bind(new Date().toISOString(), projectId, squadId).run()
 }
