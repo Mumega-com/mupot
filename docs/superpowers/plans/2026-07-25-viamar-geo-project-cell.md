@@ -481,12 +481,15 @@ No secret output.
 ```bash
 npm test
 npm run typecheck
-npm run receipt:bundle:check
+npm run receipt:kubernetes-geo-scanner
 node scripts/no-secrets.mjs
 git diff --check
 ```
 
-Expected: all PASS.
+Expected: tests, typecheck, secret scan, and diff check PASS. The scanner receipt
+remains `plan` until its separately authorized project UUID and immutable image digest
+are supplied; do not run the unrelated fleet receipt-bundle checker without a real
+exported bundle manifest.
 
 - [ ] **Step 4: Review the complete branch**
 
