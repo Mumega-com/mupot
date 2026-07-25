@@ -68,7 +68,7 @@ function isPrivateIp(hostname) {
   return false
 }
 
-function publicHttpsOrigin(value, code) {
+export function validatePublicHttpsOrigin(value, code = 'invalid_https_origin') {
   const raw = boundedString(value, { max: 2048, code })
   let url
   try {
@@ -151,7 +151,7 @@ export function validateScannerConfig(raw) {
 
   exactKeys(raw.mupot, MUPOT_KEYS, 'invalid_mupot_keys')
   const mupot = {
-    baseUrl: publicHttpsOrigin(raw.mupot.base_url, 'invalid_mupot_base_url'),
+    baseUrl: validatePublicHttpsOrigin(raw.mupot.base_url, 'invalid_mupot_base_url'),
     receiptTo: ref(raw.mupot.receipt_to, 'invalid_receipt_to'),
   }
 
@@ -169,7 +169,7 @@ export function validateScannerConfig(raw) {
     googleProjectId,
     location: 'global',
     model: 'gemini-2.5-flash',
-    posthogHost: publicHttpsOrigin(raw.posthog_host, 'invalid_posthog_host'),
+    posthogHost: validatePublicHttpsOrigin(raw.posthog_host, 'invalid_posthog_host'),
     dailyQueryCap: raw.daily_query_cap,
     stateFile,
     mupot,
