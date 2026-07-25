@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { runCycle } from '../scripts/kasra-inbox-watch.mjs'
+import { runCycle, main } from '../scripts/kasra-inbox-watch.mjs'
 
 const AGENT = 'c855f82c-1eeb-409d-94d2-f11e9dd18968'
 const REQUEST = {
@@ -215,4 +215,119 @@ test('runCycle refuses wrong bound agent / signed_only fence', async () => {
     deliverToTmux: () => ({ ok: true }),
   })
   assert.equal(fenced.reason, 'consumer_fenced')
+})
+
+// --- main() lifecycle: preflight-before-lock, terminal-reason-mid-loop -----
+//
+// Required by adversarial review of #540 (two rounds): (1) identity/token
+// must be validated BEFORE the singleton lock is acquired, so a
+// permanently-misconfigured launch can never monopolize it; (2) the SAME is
+// true of the consumer fence, which the first preflight fix missed — a
+// fenced-out-but-identity-valid watcher still held the lock forever, logging
+// `fence_refuse` every cycle. These exercise main()'s actual control flow
+// with injected deps, not just the underlying checks in isolation.
+
+function neverCalled(name) {
+  return () => { throw new Error(`must not reach ${name} in this path`) }
+}
+
+test('main() refuses a wrong-agent token before ever acquiring the lock', async () => {
+  const exits = []
+  await main({
+    readTokenFn: () => 'test-token',
+    mcpCall: async (_token, name) => {
+      if (name === 'boot_context') return { bound_agent_id: 'not-kasra' }
+      throw new Error(`must stop at identity preflight, got ${name}`)
+    },
+    acquireLock: neverCalled('acquireLock'),
+    exit: (code) => exits.push(code),
+  })
+  assert.deepEqual(exits, [1])
+})
+
+test('main() refuses a fenced-out (signed_only) consumer before ever acquiring the lock', async () => {
+  const exits = []
+  await main({
+    readTokenFn: () => 'test-token',
+    mcpCall: async (_token, name) => {
+      if (name === 'boot_context') return { bound_agent_id: AGENT }
+      if (name === 'inbox_consumer_status') return { mode: 'signed_only', generation: 3 }
+      throw new Error(`must stop at fence preflight, got ${name}`)
+    },
+    acquireLock: neverCalled('acquireLock'),
+    exit: (code) => exits.push(code),
+  })
+  assert.deepEqual(exits, [1])
+})
+
+test('main() releases and exits when a cycle reports a terminal reason mid-loop, instead of looping forever', async () => {
+  const exits = []
+  let released = false
+  let cycleCalls = 0
+  await main({
+    readTokenFn: () => 'test-token',
+    mcpCall: async (_token, name) => {
+      // Preflight must pass cleanly — this is about a LATER cycle going bad.
+      if (name === 'boot_context') return { bound_agent_id: AGENT }
+      if (name === 'inbox_consumer_status') return { mode: 'bearer_only', generation: 0 }
+      throw new Error(`unexpected preflight call ${name}`)
+    },
+    acquireLock: async () => ({
+      ok: true,
+      reason: 'lock_acquired',
+      holder_pid: process.pid,
+      release: () => { released = true },
+    }),
+    runCycle: async () => {
+      cycleCalls += 1
+      // The token was rotated out from under a long-running watcher — the
+      // NEXT cycle now sees itself as fenced, even though preflight (above)
+      // was clean at launch.
+      return { ok: false, reason: 'consumer_fenced', consumed: 0, delivered: 0 }
+    },
+    exit: (code) => exits.push(code),
+    sleep: neverCalled('sleep'), // must exit before ever sleeping/retrying
+  })
+  assert.equal(cycleCalls, 1, 'must not keep cycling after a terminal reason')
+  assert.equal(released, true, 'must release the lock rather than hold it forever')
+  assert.deepEqual(exits, [1])
+})
+
+test('main() keeps looping (does not exit) on a non-terminal cycle failure', async () => {
+  const exits = []
+  let released = false
+  let cycleCalls = 0
+  let slept = false
+  const STOP = new Error('stop the test after one loop iteration') // bail out, not a real failure
+
+  await assert.rejects(() => main({
+    readTokenFn: () => 'test-token',
+    mcpCall: async (_token, name) => {
+      if (name === 'boot_context') return { bound_agent_id: AGENT }
+      if (name === 'inbox_consumer_status') return { mode: 'bearer_only', generation: 0 }
+      throw new Error(`unexpected preflight call ${name}`)
+    },
+    acquireLock: async () => ({
+      ok: true,
+      reason: 'lock_acquired',
+      holder_pid: process.pid,
+      release: () => { released = true },
+    }),
+    runCycle: async () => {
+      cycleCalls += 1
+      // A transient, non-authorization failure — e.g. tmux delivery hiccup —
+      // must NOT be treated as terminal.
+      return { ok: false, reason: 'consume_skipped', consumed: 0, delivered: 0 }
+    },
+    exit: (code) => exits.push(code),
+    sleep: async () => {
+      slept = true
+      throw STOP // the loop is otherwise infinite; this is how the test ends it
+    },
+  }), STOP)
+
+  assert.equal(cycleCalls, 1)
+  assert.equal(slept, true, 'a non-terminal failure must proceed to the retry sleep, not exit')
+  assert.equal(released, false, 'must not release on a non-terminal failure')
+  assert.deepEqual(exits, [])
 })
