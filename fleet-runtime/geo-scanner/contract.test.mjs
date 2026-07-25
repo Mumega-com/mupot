@@ -6,10 +6,12 @@ import {
   validateScannerConfig,
 } from './contract.mjs'
 
+const PROJECT_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+
 function validConfig() {
   return {
     schema: 'dme.geo-scanner-config/v1',
-    project_id: 'viamar',
+    project_id: PROJECT_ID,
     google_project_id: 'mumegaproject',
     location: 'global',
     model: 'gemini-2.5-flash',
@@ -37,7 +39,7 @@ test('normalizes the exact project-scoped Viamar scanner contract', () => {
   assert.equal(MAX_DAILY_GROUNDED_QUERIES, 25)
   assert.deepEqual(validateScannerConfig(validConfig()), {
     schema: 'dme.geo-scanner-config/v1',
-    projectId: 'viamar',
+    projectId: PROJECT_ID,
     googleProjectId: 'mumegaproject',
     location: 'global',
     model: 'gemini-2.5-flash',
@@ -87,6 +89,7 @@ test('rejects configuration that can spend beyond the compiled daily ceiling', (
 test('rejects unsafe hosts, fixed-runtime drift, and unexpected project identity', () => {
   const cases = [
     { ...validConfig(), project_id: '../viamar' },
+    { ...validConfig(), project_id: 'viamar' },
     { ...validConfig(), google_project_id: '' },
     { ...validConfig(), location: 'us-central1' },
     { ...validConfig(), model: 'gemini-flash-latest' },

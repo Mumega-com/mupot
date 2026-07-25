@@ -42,7 +42,7 @@ function validateEvent(event) {
     event.schema !== GEO_EVENT_SCHEMA
     || !UUID_RE.test(event.event_uuid ?? '')
     || !UUID_RE.test(event.scan_id ?? '')
-    || !REF_RE.test(event.project_id ?? '')
+    || !UUID_RE.test(event.project_id ?? '')
     || !REF_RE.test(event.profile_id ?? '')
     || !REF_RE.test(event.prompt_id ?? '')
     || typeof event.observed_at !== 'string'
@@ -125,7 +125,7 @@ export async function sendMupotReceipt(input, {
   const baseUrl = validatePublicHttpsOrigin(input?.baseUrl, 'invalid_mupot_base_url')
   if (!validToken(input?.token)) throw new TypeError('invalid_mupot_token')
   if (!REF_RE.test(input?.receiptTo ?? '')) throw new TypeError('invalid_receipt_to')
-  if (!REF_RE.test(input?.projectId ?? '')) throw new TypeError('invalid_project_id')
+  if (!UUID_RE.test(input?.projectId ?? '')) throw new TypeError('invalid_project_id')
   const receiptBody = validateReceipt(input.receipt, input.projectId)
   const { controller, timer } = withTimeout(timeoutMs)
   try {

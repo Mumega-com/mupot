@@ -22,6 +22,7 @@ const MUPOT_KEYS = ['base_url', 'receipt_to']
 const PROFILE_KEYS = ['id', 'target_domain', 'market', 'tracked_competitors', 'prompts']
 const PROMPT_KEYS = ['id', 'text']
 const REF_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const GCP_PROJECT_RE = /^[a-z][a-z0-9-]{4,61}[a-z0-9]$/
 const DOMAIN_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/
 
@@ -47,6 +48,12 @@ function ref(value, code) {
   const normalized = boundedString(value, { max: 128, code })
   if (!REF_RE.test(normalized)) fail(code)
   return normalized
+}
+
+function projectId(value) {
+  const normalized = boundedString(value, { max: 36, code: 'invalid_project_id' })
+  if (!UUID_RE.test(normalized)) fail('invalid_project_id')
+  return normalized.toLowerCase()
 }
 
 function isPrivateIp(hostname) {
@@ -136,7 +143,7 @@ function normalizeProfile(raw) {
 export function validateScannerConfig(raw) {
   exactKeys(raw, CONFIG_KEYS, 'invalid_config_keys')
   if (raw.schema !== SCANNER_CONFIG_SCHEMA) fail('invalid_config_schema')
-  const projectId = ref(raw.project_id, 'invalid_project_id')
+  const normalizedProjectId = projectId(raw.project_id)
   const googleProjectId = boundedString(raw.google_project_id, { max: 63, code: 'invalid_google_project_id' })
   if (!GCP_PROJECT_RE.test(googleProjectId)) fail('invalid_google_project_id')
   if (raw.location !== 'global') fail('invalid_location')
@@ -165,7 +172,7 @@ export function validateScannerConfig(raw) {
 
   return {
     schema: SCANNER_CONFIG_SCHEMA,
-    projectId,
+    projectId: normalizedProjectId,
     googleProjectId,
     location: 'global',
     model: 'gemini-2.5-flash',

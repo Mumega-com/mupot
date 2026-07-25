@@ -60,7 +60,7 @@ The normalized configuration must contain:
 ```js
 {
   schema: 'dme.geo-scanner-config/v1',
-  projectId: 'viamar',
+  projectId: '00000000-0000-4000-8000-000000000000',
   googleProjectId: 'mumegaproject',
   location: 'global',
   model: 'gemini-2.5-flash',
@@ -472,8 +472,9 @@ npm run receipt:kubernetes-geo-scanner
 ```
 
 Expected: all tests PASS. The checked-in receipt status is `plan` with only
-`image_digest_unresolved`; a temporary digest-pinned manifest proves the same receipt
-becomes `pass`. No secret output.
+`project_id_unresolved` and `image_digest_unresolved`; a temporary manifest with an
+authorized project UUID and pinned image digest proves the same receipt becomes `pass`.
+No secret output.
 
 - [ ] **Step 3: Run full verification**
 

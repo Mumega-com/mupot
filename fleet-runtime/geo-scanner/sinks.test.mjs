@@ -8,13 +8,14 @@ import {
 
 const POSTHOG_TOKEN = 'phc_project-token-that-must-not-be-returned'
 const MUPOT_TOKEN = 'mupot_agent-token-that-must-not-be-returned'
+const PROJECT_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 
 function geoEvent() {
   return {
     schema: 'dme.geo-scan/v1',
     event_uuid: '11111111-1111-4111-8111-111111111111',
     scan_id: '22222222-2222-4222-8222-222222222222',
-    project_id: 'viamar',
+    project_id: PROJECT_ID,
     profile_id: 'viamar',
     prompt_id: 'international-movers-toronto',
     market: 'Canada',
@@ -45,7 +46,7 @@ function receipt() {
   return {
     schema: 'mupot.geo-scan-receipt/v1',
     scan_id: '22222222-2222-4222-8222-222222222222',
-    project_id: 'viamar',
+    project_id: PROJECT_ID,
     profiles: ['viamar'],
     counts: { ok: 1, empty: 0, failed: 0, budget_denied: 0, sink_failed: 0 },
     prompt_tokens: 100,
@@ -79,7 +80,7 @@ test('captures a complete GEO event in the project PostHog boundary', async () =
   assert.deepEqual(JSON.parse(request.init.body), {
     api_key: POSTHOG_TOKEN,
     event: '$geo_scan',
-    distinct_id: 'project:viamar:profile:viamar',
+    distinct_id: `project:${PROJECT_ID}:profile:viamar`,
     uuid: '11111111-1111-4111-8111-111111111111',
     timestamp: '2026-07-25T20:00:00.000Z',
     properties: geoEvent(),
@@ -98,7 +99,7 @@ test('sends one project-attributed redacted Mupot acknowledgement', async () => 
     baseUrl: 'https://mupot-viamar.weathered-scene-2272.workers.dev',
     token: MUPOT_TOKEN,
     receiptTo: 'viamar-geo-receipts',
-    projectId: 'viamar',
+    projectId: PROJECT_ID,
     receipt: value,
   }, {
     fetchImpl: async (url, init) => {
@@ -109,7 +110,7 @@ test('sends one project-attributed redacted Mupot acknowledgement', async () => 
         seq: 7,
         duplicate: false,
         to: 'viamar-geo-receipts',
-        project_id: 'viamar',
+        project_id: PROJECT_ID,
       }), { status: 200 })
     },
   })
@@ -124,7 +125,7 @@ test('sends one project-attributed redacted Mupot acknowledgement', async () => 
   assert.deepEqual(body, {
     to: 'viamar-geo-receipts',
     kind: 'ack',
-    project_id: 'viamar',
+    project_id: PROJECT_ID,
     request_id: 'geo:22222222-2222-4222-8222-222222222222',
     body: JSON.stringify(value),
   })
@@ -152,7 +153,7 @@ test('refuses detailed evidence or secret-like keys in a retained Mupot receipt'
       baseUrl: 'https://mupot-viamar.weathered-scene-2272.workers.dev',
       token: MUPOT_TOKEN,
       receiptTo: 'viamar-geo-receipts',
-      projectId: 'viamar',
+      projectId: PROJECT_ID,
       receipt: { ...receipt(), ...extra },
     }, {
       fetchImpl: async () => {
@@ -181,7 +182,7 @@ test('rejects redirects and non-2xx responses without echoing upstream bodies or
     baseUrl: 'https://mupot-viamar.weathered-scene-2272.workers.dev',
     token: MUPOT_TOKEN,
     receiptTo: 'viamar-geo-receipts',
-    projectId: 'viamar',
+    projectId: PROJECT_ID,
     receipt: receipt(),
   }, {
     fetchImpl: async () => new Response('private database detail', { status: 503 }),

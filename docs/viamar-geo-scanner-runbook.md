@@ -46,20 +46,22 @@ The checked-in receipt must report:
 {
   "schema": "mupot-kubernetes-geo-scanner-receipt/v1",
   "status": "plan",
-  "project_id": "viamar",
+  "project_id": "00000000-0000-4000-8000-000000000000",
   "image_digest": null
 }
 ```
 
-`plan` is intentional. Every check except `image_digest_pinned` must pass. It becomes
-`pass` only after an authorized build publishes the exact derived Hermes image and the
-manifest pins its immutable digest.
+`plan` is intentional. Every check except `project_id_resolved` and
+`image_digest_pinned` must pass. It becomes `pass` only after an authorized operator
+supplies the actual Viamar root-project UUID and an authorized build publishes the exact
+derived Hermes image with an immutable digest.
 
 ## Live prerequisites
 
 The owner must provide and verify all of these before unsuspending the CronJob:
 
-1. A Viamar root project exists in the Viamar pot.
+1. A Viamar root project exists in the Viamar pot, and its actual UUID replaces
+   `00000000-0000-4000-8000-000000000000` in both the public profile and ConfigMap.
 2. A dedicated `viamar-geo-scanner` Mupot agent is welded to a token with access only
    to that project and permission to send the receipt to `viamar-geo-receipts`.
 3. The Google service account

@@ -1,6 +1,6 @@
 {
   "schema": "dme.geo-scanner-config/v1",
-  "project_id": "viamar",
+  "project_id": "00000000-0000-4000-8000-000000000000",
   "google_project_id": "mumegaproject",
   "location": "global",
   "model": "gemini-2.5-flash",

@@ -10,6 +10,7 @@ import { captureGeoEvent, sendMupotReceipt } from './sinks.mjs'
 
 const INPUT_USD_PER_MILLION_TOKENS = 0.30
 const OUTPUT_USD_PER_MILLION_TOKENS = 2.50
+const MODEL_RATE_CARD = 'vertex-gemini-2.5-flash-2026-07-25'
 
 function isoNow(now) {
   const value = now()
@@ -85,6 +86,7 @@ function eventFor({
     estimated_model_cost_micro_usd: estimatedModelCostMicroUsd(usage),
     grounding_cost_micro_usd: null,
     cost_status: 'billing_unreconciled',
+    model_rate_card: MODEL_RATE_CARD,
     model: config.model,
   }
 }
@@ -126,12 +128,13 @@ export async function runGeoScan(config, options = {}) {
     estimated_model_cost_micro_usd: 0,
     grounding_cost_micro_usd: null,
     cost_status: 'billing_unreconciled',
+    model_rate_card: MODEL_RATE_CARD,
     event_uuids: [],
     started_at: startedAt,
     completed_at: startedAt,
   }
 
-  for (const profile of config.profiles) {
+  scan: for (const profile of config.profiles) {
     for (const prompt of profile.prompts) {
       const observedAt = isoNow(now)
       const budget = await claimQuery({
@@ -170,6 +173,7 @@ export async function runGeoScan(config, options = {}) {
         event,
       })
       addEventToReceipt(receipt, event, captured)
+      if (!captured.ok) break scan
     }
   }
 

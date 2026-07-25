@@ -13,6 +13,7 @@ export const KUBERNETES_GEO_SCANNER_RECEIPT_TYPE =
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const IMAGE_DIGEST_RE = /^sha256:[a-f0-9]{64}$/
+const UNRESOLVED_PROJECT_ID = '00000000-0000-4000-8000-000000000000'
 const SECRET_MATERIAL_RE =
   /Bearer\s+\S+|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\bmupot_[A-Za-z0-9_-]{16,}\b/
 const RUNTIME_FILES = [
@@ -234,13 +235,21 @@ export function buildKubernetesGeoScannerReceipt(input = {}) {
   const imageDigest = exactImageDigest(container?.image)
   addCheck(
     checks,
+    Boolean(profile?.projectId && profile.projectId !== UNRESOLVED_PROJECT_ID),
+    'project_id_resolved',
+    'project_id_unresolved',
+  )
+  addCheck(
+    checks,
     Boolean(imageDigest),
     'image_digest_pinned',
     'image_digest_unresolved',
   )
 
   const failed = checks.filter((entry) => !entry.ok)
-  const planOnly = failed.length === 1 && failed[0].check === 'image_digest_pinned'
+  const planOnly = failed.length > 0
+    && failed.every((entry) =>
+      entry.check === 'image_digest_pinned' || entry.check === 'project_id_resolved')
   return {
     schema: KUBERNETES_GEO_SCANNER_RECEIPT_TYPE,
     status: failed.length === 0 ? 'pass' : planOnly ? 'plan' : 'fail',

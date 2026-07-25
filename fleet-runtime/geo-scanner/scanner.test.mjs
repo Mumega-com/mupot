@@ -7,11 +7,12 @@ import { runGeoScan } from './scanner.mjs'
 const GOOGLE_TOKEN = 'ya29.ephemeral-google-access-token'
 const POSTHOG_TOKEN = 'phc_project-token'
 const MUPOT_TOKEN = 'mupot_agent-token'
+const PROJECT_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 
 function config(promptCount = 2) {
   return validateScannerConfig({
     schema: 'dme.geo-scanner-config/v1',
-    project_id: 'viamar',
+    project_id: PROJECT_ID,
     google_project_id: 'mumegaproject',
     location: 'global',
     model: 'gemini-2.5-flash',
@@ -172,6 +173,7 @@ test('derives target citation, tracked competitor names, and dated model-only co
   assert.equal(event.estimated_model_cost_micro_usd, 530)
   assert.equal(event.grounding_cost_micro_usd, null)
   assert.equal(event.cost_status, 'billing_unreconciled')
+  assert.equal(event.model_rate_card, 'vertex-gemini-2.5-flash-2026-07-25')
   assert.equal(retainedReceipt.estimated_model_cost_micro_usd, 530)
   assert.equal(retainedReceipt.grounding_cost_micro_usd, null)
   assert.equal(JSON.stringify(retainedReceipt).includes('answer_text'), false)
@@ -241,6 +243,32 @@ test('a PostHog failure never repeats the billable Vertex request', async () => 
   assert.equal(result.counts.sink_failed, 1)
   assert.equal(receiptValue.counts.sink_failed, 1)
   assert.deepEqual(receiptValue.event_uuids, [])
+})
+
+test('the first PostHog failure stops later prompts before they spend budget', async () => {
+  let claimCalls = 0
+  let vertexCalls = 0
+  let captureCalls = 0
+  const result = await runGeoScan(config(2), baseOptions({
+    claimQuery: async () => {
+      claimCalls++
+      return { ok: true, day: '2026-07-25', used: claimCalls, remaining: 2 - claimCalls }
+    },
+    runQuery: async () => {
+      vertexCalls++
+      return okVertex()
+    },
+    captureEvent: async () => {
+      captureCalls++
+      return { ok: false, reason: 'posthog_http_503' }
+    },
+  }))
+
+  assert.equal(claimCalls, 1)
+  assert.equal(vertexCalls, 1)
+  assert.equal(captureCalls, 1)
+  assert.equal(result.ok, false)
+  assert.equal(result.counts.sink_failed, 1)
 })
 
 test('a Mupot receipt failure returns incomplete without repeating scans', async () => {

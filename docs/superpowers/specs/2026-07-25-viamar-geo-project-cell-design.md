@@ -101,7 +101,7 @@ Every attempted prompt produces one `$geo_scan` PostHog event:
 {
   "schema": "dme.geo-scan/v1",
   "scan_id": "uuid",
-  "project_id": "viamar",
+  "project_id": "00000000-0000-4000-8000-000000000000",
   "profile_id": "viamar",
   "prompt_id": "international-car-shipping-canada",
   "market": "Canada",
@@ -126,6 +126,7 @@ Every attempted prompt produces one `$geo_scan` PostHog event:
   "estimated_model_cost_micro_usd": 530,
   "grounding_cost_micro_usd": null,
   "cost_status": "billing_unreconciled",
+  "model_rate_card": "vertex-gemini-2.5-flash-2026-07-25",
   "model": "gemini-2.5-flash"
 }
 ```
@@ -208,6 +209,11 @@ This work is branch-only:
 
 Cursor is the independent gate. It receives the design/plan and exact commit, then returns
 `GREEN` or `BLOCK` with evidence. The builder does not self-approve.
+
+The checked-in UUID above is an explicit unresolved sentinel, not Viamar's live project
+identity. The CronJob stays suspended and its executable receipt stays `plan` until an
+authorized operator replaces it with the actual Viamar root-project UUID in both the
+profile file and ConfigMap.
 
 ## 10. Acceptance criteria
 

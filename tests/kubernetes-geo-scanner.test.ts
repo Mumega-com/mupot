@@ -112,7 +112,14 @@ describe('Viamar Kubernetes GEO scanner project cell', () => {
       ok: false,
       code: 'image_digest_unresolved',
     })
-    expect(plan.checks.filter((check: any) => check.check !== 'image_digest_pinned').every((check: any) => check.ok))
+    expect(plan.checks.find((check: any) => check.check === 'project_id_resolved')).toEqual({
+      check: 'project_id_resolved',
+      ok: false,
+      code: 'project_id_unresolved',
+    })
+    expect(plan.checks.filter((check: any) =>
+      check.check !== 'image_digest_pinned' && check.check !== 'project_id_resolved')
+      .every((check: any) => check.ok))
       .toBe(true)
 
     const dir = mkdtempSync(join(tmpdir(), 'mupot-geo-manifest-'))
@@ -123,11 +130,23 @@ describe('Viamar Kubernetes GEO scanner project cell', () => {
         readFileSync(cronjobPath, 'utf8')
           .replace('registry.example/mupot-agent-host-hermes:0.24.0', `registry.example/mupot-agent-host-hermes@${IMAGE_DIGEST}`),
       )
+      const resolvedProfile = join(dir, 'viamar-profile.json')
+      const resolvedProjectId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      writeFileSync(
+        resolvedProfile,
+        readFileSync(profilePath, 'utf8')
+          .replace('00000000-0000-4000-8000-000000000000', resolvedProjectId),
+      )
+      writeFileSync(
+        pinnedPath,
+        readFileSync(pinnedPath, 'utf8')
+          .replace('00000000-0000-4000-8000-000000000000', resolvedProjectId),
+      )
       const receipt = buildKubernetesGeoScannerReceipt({
         root: ROOT,
         cronjobPath: pinnedPath,
         networkPolicyPath,
-        profilePath,
+        profilePath: resolvedProfile,
         dockerfilePath,
       })
       expect(receipt.status).toBe('pass')
