@@ -1170,9 +1170,18 @@ dashboardApp.get('/squads/:id', async (c) => {
 })
 
 // GET /agents/:id — agent console: identity, status, wake button.
+// `:id` accepts id OR unique slug (resolveAgentRef) so /agents/kayhermes works.
 dashboardApp.get('/agents/:id', async (c) => {
-  const agentId = c.req.param('id')
-  const agent = await getById<Agent>(c.env, 'agents', agentId)
+  const ref = c.req.param('id')
+  const resolved = await resolveAgentRef(c.env, ref)
+  if (!resolved.ok) {
+    const msg =
+      resolved.reason === 'ambiguous'
+        ? 'Agent slug is ambiguous — open by UUID instead.'
+        : 'Agent not found.'
+    return c.html(shell(c.env, 'Agent', errorBody(msg)), 404)
+  }
+  const agent = await getById<Agent>(c.env, 'agents', resolved.value.id)
   if (!agent) {
     return c.html(shell(c.env, 'Agent', errorBody('Agent not found.')), 404)
   }

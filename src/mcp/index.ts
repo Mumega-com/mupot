@@ -2404,11 +2404,15 @@ const toolStatus: ToolSpec = {
     const agentId = str(args.agent_id)
     if (!agentId) {
       // No agent specified → echo the member's own principal (who am I + caps).
+      // bound_agent_id + role are required by fail-closed operator clients (Hermes
+      // mupot plugin): omitting them surfaces as identity_mismatch / overprivileged.
       return done({
         member_id: auth.memberId,
         email: auth.email,
         channel: auth.channel,
         tenant: auth.tenant,
+        role: auth.role,
+        bound_agent_id: auth.boundAgentId ?? null,
         capabilities: auth.capabilities ?? [],
       })
     }
@@ -2493,6 +2497,7 @@ const toolBootContext: ToolSpec = {
       tenant: auth.tenant,
       member_id: auth.memberId,
       channel: auth.channel,
+      role: auth.role,
       capabilities: auth.capabilities ?? [],
       mcp_endpoint: mcpEndpoint(canonicalOrigin(env, ctx.origin)),
       // identity coherence (#126) — NEW field
