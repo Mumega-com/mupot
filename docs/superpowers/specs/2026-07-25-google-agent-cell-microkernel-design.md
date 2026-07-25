@@ -3,7 +3,8 @@
 - **Status:** Approved direction; design only
 - **Date:** 2026-07-25
 - **First operator:** DME
-- **First customer proof:** Viamar GEO baseline
+- **First service:** DME GEO
+- **First sample customer:** Viamar
 - **Related work:** issue #574 and draft PR #575 remain a branch-only
   customer-cell proof
 
@@ -50,29 +51,35 @@ Mupot becomes the governed operating system for repeatable business capabilities
 - Mupot preserves authority, progress, evidence, and revocation across the whole
   workflow.
 
-The first proof is deliberately narrow:
+The first proof is deliberately narrow. DME is the service provider; Viamar is
+one customer of that service:
 
 ```text
-DME operator pot
-    |
-    | sanitized project-link coordination
-    v
-Viamar sovereign pot and project
-    |
-    | governed task + runtime grant
-    v
-Viamar GKE customer cell
-    |
-    +--> Hermes runtime
-    +--> bounded GEO playbook
-    +--> grounded Google query
-    +--> Viamar PostHog detail
-    `--> redacted receipt to Viamar Mupot
+DME service pot                         Viamar sovereign Mupot pot
+----------------                        ---------------------------
+DME GEO service definition  <--------> own Cloudflare Worker
+delivery coordination          signed  own D1 / KV / R2
+sanitized service status        link    own domain and identities
+                                            |
+                                            | governed runtime binding
+                                            v
+                                   Viamar-bound execution cell
+                                            |
+                                            +--> Hermes runtime
+                                            +--> bounded GEO playbook
+                                            +--> grounded Google query
+                                            +--> Viamar PostHog detail
+                                            `--> Viamar Mupot receipt
 ```
 
-The Viamar pot remains the customer security boundary. A Kubernetes namespace or
-pod is defense in depth, not a substitute for pot isolation or project
-authorization.
+The Viamar pot remains the customer system of record and security boundary. It
+is never a project, tenant row, or namespace inside the DME pot. Its first
+deployment may be operated in a Mumega-managed Cloudflare account, but it uses
+separate Worker, D1, KV, R2, domain, identities, and credentials so it can move
+to Viamar's own Cloudflare account.
+
+A Kubernetes namespace or pod is defense in depth, not a substitute for pot
+isolation or project authorization.
 
 ## 3. Existing Boundaries Remain Authoritative
 
@@ -360,24 +367,80 @@ single-use, is hashed at rest, and exchanges only for a bound runtime identity
 challenge. It must not appear in Marketplace parameters, Kubernetes annotations,
 logs, shell history, or support tickets.
 
-## 9. DME and Viamar Topology
+## 9. DME Service and Customer-Pot Topology
 
-Version one preserves both organizational and customer sovereignty:
+### 9.1 Service and customer are separate products
 
-- the DME pot owns DME sales, delivery coordination, and consultant operations;
-- the Viamar pot owns Viamar customer operations and customer evidence;
-- DME may operate a GKE cluster that contains an isolated Viamar namespace;
-- the Viamar cell uses only a Viamar-owned Mupot identity and Viamar-specific
-  source/sink credentials;
-- DME receives only the sanitized operational state allowed by a signed
-  project-link; and
-- the cell can later move into a Viamar-owned Google project without changing
-  its DME GEO playbook or Mupot history.
+DME GEO is a service installed and operated from the DME side. Viamar is the
+first sample customer consuming that service. The service must not encode Viamar
+as a privileged tenant or special kernel path.
 
-Several external customers must not be modeled merely as projects inside one DME
-pot while customer membership and connector binding remain pot-scoped. A
-namespace-per-customer model is acceptable only as defense in depth behind each
-customer's sovereign pot and credentials.
+Version one preserves both provider operations and customer sovereignty:
+
+- the DME pot owns DME sales, reusable GEO playbooks, delivery coordination,
+  consultant operations, and sanitized service-level status;
+- the Viamar pot owns Viamar projects, customer membership, runtime identity,
+  detailed customer evidence, receipts, and retention;
+- the DME and Viamar pots have separate Cloudflare deployments and storage;
+- a signed project-link exposes only the minimum state needed to deliver the DME
+  service;
+- DME receives no Viamar bearer token, raw analytics, source credentials,
+  private model memory, or unrestricted customer evidence; and
+- removing the link stops DME service coordination without disabling or deleting
+  the Viamar pot.
+
+Several external customers must not be modeled as projects inside one DME pot.
+Every external customer receives a sovereign pot even if DME initially operates
+its infrastructure. A customer namespace or project inside DME infrastructure is
+only an execution-isolation mechanism; it is not the customer's Mupot tenancy.
+
+### 9.2 Cloudflare portability
+
+The initial `mupot-viamar` deployment may live in a Mumega-managed Cloudflare
+account, but it must be portable by construction:
+
+- its Worker, D1, KV, R2, queues, secrets, domain, and deployment configuration
+  are not shared with DME;
+- its tenant slug and durable public identifiers remain stable through a move;
+- its deployment descriptor names only Viamar resources and contains no secret
+  values;
+- its data export is integrity-checked before import into the destination
+  account;
+- its runtime and project-link endpoints are re-paired after the destination is
+  verified;
+- new writes are quiesced during the final cutover so no receipt is silently
+  lost;
+- old identities and endpoints are revoked only after a watched destination
+  proof; and
+- the old deployment is retained inert for a bounded recovery window before any
+  separately authorized purge.
+
+Moving `mupot-viamar` to Viamar's own Cloudflare account is therefore a sovereign
+pot migration, not an extraction from a DME database. The DME GEO addon and its
+service contract do not change.
+
+### 9.3 Execution custody is a separate choice
+
+The Viamar-bound execution cell may initially run in a DME-operated GKE cluster
+under an explicit data-processing agreement. In that topology DME's
+`cluster-admin` is a trusted infrastructure operator; Kubernetes namespace RBAC
+cannot make Viamar secrets inaccessible to a cluster super-user.
+
+Use Workload Identity and an external secret store to avoid static Google keys
+and reduce secret material stored in Kubernetes. If Viamar requires DME to be
+technically unable to access its runtime secrets, the execution cell must run in
+a Viamar-owned Google project and cluster, or behind a separately proven
+confidential-computing boundary. A namespace in a DME-administered cluster is not
+such a boundary.
+
+In either topology:
+
+- the cell uses only a Viamar-pot Mupot identity and Viamar-specific source/sink
+  credentials;
+- the runtime binds to the Viamar pot and project, never to the DME pot;
+- DME sees only the signed project-link projection; and
+- the cell can move to Viamar-owned Google infrastructure without changing the
+  DME GEO playbook or Viamar Mupot history.
 
 ## 10. Data and Privacy Boundary
 
@@ -484,6 +547,12 @@ validate public profile
 Draft PR #575 is evidence for this vertical slice, not evidence that the generic
 external activation and adapter package contracts already exist.
 
+The first implementation hard-codes only the sealed
+`dme.geo-baseline/v1` sequence behind the generic invoke contract. It does not
+build a general DAG authoring or scheduling engine. General DAG execution becomes
+eligible only after the external invoke, status, cancel, evidence, idempotency,
+and revocation paths pass conformance.
+
 ## 13. Lifecycle
 
 ### Install
@@ -557,7 +626,8 @@ Detailed customer evidence stays in the customer-owned system until a
 project-scoped read binding and authorization model exists. The dashboard does
 not turn an internal DME squad grant into customer access.
 
-The DME operator view receives only project-link fields approved for cross-pot
+The DME operator view is a service-provider projection, not a view into the
+Viamar pot. It receives only project-link fields approved for cross-pot
 coordination: state, blocker summary, bounded counts, evidence digest, authorized
 URL, timestamps, and staleness.
 
@@ -602,6 +672,8 @@ After the private DME/Viamar proof:
 ### Security tests
 
 - wrong pot, project, agent, installation, runtime, or package digest is denied;
+- the DME service identity cannot read Viamar pot storage or invoke an unlinked
+  Viamar project;
 - revoked or retired identities cannot invoke with cached credentials;
 - disabling either addon or adapter blocks new work immediately;
 - stale authorization leases fail at the next step boundary;
@@ -612,6 +684,11 @@ After the private DME/Viamar proof:
 - network policy denies unapproved egress;
 - namespace and ServiceAccount boundaries are customer-specific; and
 - uninstall cannot delete customer-owned data by default.
+
+When the cell runs in a DME-administered cluster, tests prove least privilege for
+ordinary DME service identities and workloads; they do not falsely claim
+isolation from `cluster-admin`. A deployment that requires exclusion of DME
+administrators must use the Viamar-owned infrastructure topology.
 
 ### Distribution tests
 
@@ -630,6 +707,8 @@ A live Viamar proof is separately authorized and watched. It requires:
 
 - the Viamar sovereign pot and real project binding;
 - dedicated Viamar identities and credentials;
+- a dedicated least-privilege Viamar Google workload principal rather than a
+  reusable Mumega agent principal;
 - approved public prompt/profile configuration;
 - an immutable image digest;
 - exact Google, PostHog, and Mupot destinations;
@@ -652,16 +731,19 @@ customer-data access, spend, or publication.
 4. **GKE adapter offline proof:** render an inert cell and verify isolation,
    package pairing, upgrade, rollback, uninstall, and secret absence locally.
 5. **DME/Viamar staging:** bind the suspended Viamar customer cell and DME GEO
-   playbook without a live external query.
+   playbook across the signed project-link without a live external query. Prove
+   that DME and Viamar use separate Mupot deployments and storage.
 6. **Watched Viamar baseline:** after explicit authorization, run the bounded GEO
    proof and retain redacted receipts in the Viamar pot.
 7. **Private Google offering:** package the same cell for a DME-controlled private
    Marketplace install.
 8. **Repeatability:** onboard a second sovereign fixture pot without adding core
    provider code.
-9. **Public marketplace:** pursue only after support, billing, isolation,
+9. **Cloudflare portability:** rehearse moving a sovereign fixture customer pot
+   between Cloudflare accounts without changing its DME service contract.
+10. **Public marketplace:** pursue only after support, billing, isolation,
    revocation, upgrade, and recovery gates pass.
-10. **Second provider:** implement an Azure AKS cell against the same sealed ports
+11. **Second provider:** implement an Azure AKS cell against the same sealed ports
     without changing DME GEO.
 
 ## 19. Acceptance Criteria
@@ -673,8 +755,14 @@ customer-data access, spend, or publication.
   explicit project binding.
 - External isolated addons can complete a generic inert-to-active lifecycle
   without loading their code into the Worker.
-- The Viamar cell is bound to the Viamar sovereign pot, project, identity, and
-  credentials; DME receives only sanitized project-link state.
+- DME GEO operates as a reusable service; Viamar is a normal sample customer with
+  no customer-specific kernel path.
+- `mupot-viamar` uses a separate Cloudflare deployment and separate D1, KV, R2,
+  identities, and credentials from DME.
+- The Viamar cell is bound only to the Viamar sovereign pot, project, identity,
+  and credentials; DME receives only sanitized project-link state.
+- A rehearsed fixture move proves that a customer pot can migrate to the
+  customer's Cloudflare account without changing the DME service contract.
 - Customer data is minimized inside the cell before any external executor and
   detailed evidence remains customer-owned.
 - Every invocation is bounded by digest, idempotency, deadline, budget, current
@@ -692,11 +780,13 @@ customer-data access, spend, or publication.
   Mupot kernel.
 - Loading third-party JavaScript or Python into the Worker.
 - Combining agent runtime profiles with business addon lifecycle manifests.
+- Building a general DAG engine before the sealed
+  `dme.geo-baseline/v1` invoke path passes conformance.
 - Making Mupot a custodian for ChatGPT, model-provider, Google, PostHog, or
   customer-source credentials.
 - Treating a pod or namespace as the sole customer authorization boundary.
-- Moving several external customers into one DME pot before project-scoped
-  customer membership and connector binding exist.
+- Moving any external customer into the DME pot; each customer remains a
+  sovereign Mupot deployment.
 - Autonomous live spend, customer-data access, deployment, or public
   Marketplace publication.
 - Implementing the Azure adapter in the first Google/DME slice.
