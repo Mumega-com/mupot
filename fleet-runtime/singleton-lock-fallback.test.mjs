@@ -3,7 +3,9 @@ import assert from 'node:assert/strict'
 import net from 'node:net'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { spawn } from 'node:child_process'
 
 // Regressions for the third BLOCK on PR #540 (head 9ef1dfb).
 //
@@ -66,6 +68,43 @@ test('a genuinely dead socket node on the fallback path IS reclaimed', async () 
   try {
     const result = await acquireSingletonLock({ path: lockPath, forceFilesystemSocket: true })
     assert.equal(result.ok, true, 'a refused connect means the node is dead and reclaimable')
+    assert.equal(result.reason, 'lock_acquired')
+    result.release()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a CRASH-stale socket node (SIGKILL, node left orphaned on disk) IS reclaimed', async () => {
+  // Required by adversarial review of f2cfcc6: the test above closes its
+  // owner gracefully, and Node unlinks the Unix-socket pathname on close — so
+  // it exercises a free initial bind, never `EADDRINUSE -> probe refused ->
+  // reclaim`. A killed process runs no close/unlink path at all, leaving the
+  // node genuinely orphaned, which is the actual production shape (a crashed
+  // daemon), and the only way to hit `EADDRINUSE` here first.
+  const dir = tmpDir()
+  const lockPath = join(dir, 'watch.lock')
+  const sockPath = `${lockPath}.sock`
+  const CONTENDER = join(dirname(fileURLToPath(import.meta.url)), 'singleton-lock-contender.mjs')
+
+  const owner = spawn(process.execPath, [CONTENDER], {
+    env: { ...process.env, LOCK_PATH: lockPath, START_AT_MS: String(Date.now()), FORCE_FS: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const ownerResult = await new Promise((resolve, reject) => {
+    owner.stdout.once('data', (chunk) => resolve(JSON.parse(String(chunk).trim())))
+    owner.on('error', reject)
+  })
+  assert.equal(ownerResult.ok, true, 'owner must acquire before it can be crash-killed')
+  assert.equal(existsSync(sockPath), true, 'owner must actually hold the filesystem node')
+
+  owner.kill('SIGKILL')
+  await new Promise((resolve) => owner.on('close', resolve))
+  assert.equal(existsSync(sockPath), true, 'a SIGKILL must leave the node behind — no unlink runs on crash')
+
+  try {
+    const result = await acquireSingletonLock({ path: lockPath, forceFilesystemSocket: true })
+    assert.equal(result.ok, true, 'EADDRINUSE -> probe refused -> reclaim must still succeed for a real crash')
     assert.equal(result.reason, 'lock_acquired')
     result.release()
   } finally {

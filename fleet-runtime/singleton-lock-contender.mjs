@@ -10,12 +10,13 @@ import { acquireSingletonLock } from './singleton-lock.mjs'
 
 const path = process.env.LOCK_PATH
 const startAt = Number(process.env.START_AT_MS)
+const forceFilesystemSocket = process.env.FORCE_FS === '1'
 
 while (Date.now() < startAt) {
   // spin — setTimeout granularity is too coarse to synchronize the contenders
 }
 
-const lock = await acquireSingletonLock({ path })
+const lock = await acquireSingletonLock({ path, forceFilesystemSocket })
 process.stdout.write(`${JSON.stringify({ ok: lock.ok, reason: lock.reason, pid: process.pid })}\n`)
 
 if (lock.ok) {

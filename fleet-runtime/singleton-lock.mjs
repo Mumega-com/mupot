@@ -33,8 +33,8 @@
 // hand-run `--once` beside the loop), not a determined caller.
 
 import net from 'node:net'
-import { createHash } from 'node:crypto'
-import { mkdirSync, unlinkSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import { mkdirSync, unlinkSync, linkSync, statSync } from 'node:fs'
 import { dirname } from 'node:path'
 
 /**
@@ -145,6 +145,72 @@ export async function acquireSingletonLock(options) {
   })
   server.unref() // never hold the event loop open on the lock alone
 
+  if (useAbstractNamespace(options)) {
+    // Abstract names exist only while their owner does — bind() is the whole
+    // arbitration, there is nothing stale to reclaim, and the probe below is
+    // purely advisory (to name the holder in the refusal).
+    try {
+      await listen(server, address)
+      return {
+        ok: true,
+        reason: 'lock_acquired',
+        holder_pid: pid,
+        release() {
+          try {
+            server.close()
+          } catch {
+            return false
+          }
+          return true
+        },
+      }
+    } catch (error) {
+      if (error?.code !== 'EADDRINUSE') {
+        return { ok: false, reason: 'lock_unwritable', holder_pid: null, detail: String(error?.message ?? error) }
+      }
+      const holder = await probe(address)
+      return { ok: false, reason: 'already_running', holder_pid: holder.pid ?? null }
+    }
+  }
+
+  // Filesystem-socket fallback. A leftover node can block bind(), so — unlike
+  // the abstract path — ownership here can never be granted by bind()/listen()
+  // directly: a bind-after-unlink sequence is two non-atomic steps, and a
+  // second contender's own (also probe-authorized) unlink can land between
+  // them, deleting the FIRST contender's freshly live pathname and admitting a
+  // second owner. That is the exact two-owner bug adversarial review found
+  // against a crash (SIGKILL-created) stale node under 24 synchronized
+  // contenders — the identical "observation taken before someone else claimed
+  // it" shape this file's header already names, re-manifesting one step later
+  // because probe()+unlink() authorized a bind() that itself raced.
+  //
+  // Fix: a process is only ever granted `address` by a successful `linkSync`
+  // (hardlink) into it — link() is a true kernel-atomic compare-and-create
+  // that FAILS LOUDLY (EEXIST) on any race, unlike unlink+bind which can
+  // succeed silently for two callers in sequence. Ownership is therefore never
+  // assumed from "I unlinked it" — only ever proven by "my link() call itself
+  // returned success."
+  const tmpAddress = `${address}.claim-${pid}-${randomBytes(4).toString('hex')}`
+
+  try {
+    await listen(server, tmpAddress)
+  } catch (error) {
+    return { ok: false, reason: 'lock_unwritable', holder_pid: null, detail: String(error?.message ?? error) }
+  }
+
+  const abandon = () => {
+    try {
+      server.close()
+    } catch {
+      // already closed
+    }
+    try {
+      unlinkSync(tmpAddress)
+    } catch {
+      // already gone
+    }
+  }
+
   const owned = () => ({
     ok: true,
     reason: 'lock_acquired',
@@ -155,58 +221,123 @@ export async function acquireSingletonLock(options) {
       } catch {
         return false
       }
-      if (!useAbstractNamespace(options)) {
+      try {
+        unlinkSync(address)
+      } catch {
+        // already gone
+      }
+      return true
+    },
+  })
+
+  const MAX_ATTEMPTS = 20
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+    try {
+      linkSync(tmpAddress, address)
+      try {
+        unlinkSync(tmpAddress) // drop the claim name; `address` now IS our socket
+      } catch {
+        // harmless — a second name to the same inode, cleaned up on release
+      }
+      return owned()
+    } catch (error) {
+      if (error?.code !== 'EEXIST') {
+        abandon()
+        return { ok: false, reason: 'lock_unwritable', holder_pid: null, detail: String(error?.message ?? error) }
+      }
+    }
+
+    // Our link() lost the name to something already there. Identify it BEFORE
+    // probing — `probe()` is async and takes real wall-clock time (up to its
+    // 1s silence timeout), and a fresh winner can appear and vanish-from-view
+    // entirely within that gap. Capturing identity only AFTER the probe
+    // returned (the earlier version of this fix) let a probe result for the
+    // OLD corpse get attributed to whatever NEW entity happened to occupy the
+    // name by the time the post-probe stat ran — reaping a live winner
+    // because the "refused" verdict belonged to something that no longer
+    // existed. So identity is sandwiched around the probe and re-checked
+    // again immediately before the unlink: the verdict is only ever trusted
+    // for the EXACT (dev,ino) it was actually taken against.
+    let before
+    try {
+      before = statSync(address)
+    } catch {
+      continue // already gone — retry the link fresh
+    }
+    const holder = await probe(address)
+    let after
+    try {
+      after = statSync(address)
+    } catch {
+      continue // gone by the time the probe returned — retry fresh
+    }
+    if (before.dev !== after.dev || before.ino !== after.ino) {
+      // The name changed identity mid-probe. The verdict we just got is
+      // about neither reliably-known state — trust nothing, retry fresh.
+      continue
+    }
+
+    if (holder.state === 'alive' || holder.state === 'silent') {
+      // Silence is not death (see probe()'s doc comment) — a suspended/busy/
+      // slow owner still holds the name. Refuse either way.
+      abandon()
+      return { ok: false, reason: 'already_running', holder_pid: holder.pid ?? null }
+    }
+
+    // holder.state === 'refused', PROVEN to be about this exact (dev,ino) —
+    // but WHICH contender gets to clear it must itself be kernel-arbitrated.
+    // Two contenders can both observe 'refused' against the SAME stale node
+    // and act on that observation at different real times; if either unlinks
+    // unconditionally, a straggler's unlink — authorized by a probe taken
+    // before a winner claimed the name — can delete the WINNER's fresh
+    // pathname. That is the exact two-owner bug adversarial review found on
+    // `f2cfcc6` (24 synchronized contenders, a SIGKILL-created stale node, 2
+    // winners). So the unlink itself is gated behind a second `link()` CAS,
+    // scoped to this SPECIFIC dead (dev,ino): only the contender that
+    // atomically wins the right to reap THIS corpse may ever unlink it. A
+    // crash mid-reap permanently poisons only that one corpse's ticket name
+    // (harmless disk litter, never looked up again) — the next stale
+    // generation has a different inode and therefore a fresh ticket name, so
+    // nothing can wedge.
+    const reapTicket = `${address}.reap-${before.dev}-${before.ino}`
+    try {
+      linkSync(tmpAddress, reapTicket)
+    } catch (error) {
+      if (error?.code === 'EEXIST') {
+        continue // someone else is (or already did) reaping this exact corpse
+      }
+      abandon()
+      return { ok: false, reason: 'lock_unwritable', holder_pid: null, detail: String(error?.message ?? error) }
+    }
+
+    try {
+      let current
+      try {
+        current = statSync(address)
+      } catch {
+        current = null // already gone
+      }
+      if (current && current.dev === before.dev && current.ino === before.ino) {
         try {
           unlinkSync(address)
         } catch {
           // already gone
         }
       }
-      return true
-    },
-  })
-
-  try {
-    await listen(server, address)
-    return owned()
-  } catch (error) {
-    if (error?.code !== 'EADDRINUSE') {
-      return { ok: false, reason: 'lock_unwritable', holder_pid: null, detail: String(error?.message ?? error) }
+      // else: address changed under us since we won the reap ticket — a
+      // fresh claimant's own `link()` won it validly in the meantime. Leave
+      // it; fall through to retry, where our next link() correctly EEXISTs
+      // against THEM.
+    } finally {
+      try {
+        unlinkSync(reapTicket)
+      } catch {
+        // best-effort — a name nothing will ever look up again
+      }
     }
   }
 
-  // In use. On Linux that is conclusive: abstract names exist only while their
-  // owner does, so there is nothing stale to consider and the probe is advisory.
-  const holder = await probe(address)
-  if (useAbstractNamespace(options)) {
-    return { ok: false, reason: 'already_running', holder_pid: holder.pid ?? null }
-  }
-
-  if (holder.state === 'alive') {
-    return { ok: false, reason: 'already_running', holder_pid: holder.pid ?? null }
-  }
-  if (holder.state === 'silent') {
-    // Connected but unanswered. The owner may be suspended, busy, or slow — it
-    // is still listening and still owns this lock. Unlinking here would orphan
-    // its inode while it keeps serving, and the bind below would hand us a
-    // second, parallel owner. Refuse; a wedged lock is recoverable, two live
-    // consumers silently eating each other's messages is not.
-    return { ok: false, reason: 'already_running', holder_pid: null }
-  }
-
-  // holder.state === 'refused': the kernel says nothing is listening. That is a
-  // fact, not an inference, so the node is genuinely dead and safe to clear.
-  try {
-    unlinkSync(address)
-  } catch {
-    // someone else cleared it first
-  }
-  try {
-    await listen(server, address)
-    return owned()
-  } catch {
-    // Another contender bound it in between. Fail closed; never loop.
-    const after = await probe(address)
-    return { ok: false, reason: 'lock_contended', holder_pid: after.pid ?? null }
-  }
+  abandon()
+  const after = await probe(address)
+  return { ok: false, reason: 'lock_contended', holder_pid: after.pid ?? null }
 }

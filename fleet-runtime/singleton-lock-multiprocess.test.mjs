@@ -25,9 +25,14 @@ function freshLockPath() {
   return join(mkdtempSync(join(tmpdir(), 'mupot-lock-mp-')), 'watch.lock')
 }
 
-function spawnContender(lockPath, startAt) {
+function spawnContender(lockPath, startAt, { forceFs = false } = {}) {
   return spawn(process.execPath, [CONTENDER], {
-    env: { ...process.env, LOCK_PATH: lockPath, START_AT_MS: String(startAt) },
+    env: {
+      ...process.env,
+      LOCK_PATH: lockPath,
+      START_AT_MS: String(startAt),
+      FORCE_FS: forceFs ? '1' : '0',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
 }
@@ -48,9 +53,9 @@ function collect(child) {
   })
 }
 
-function runRound(lockPath) {
+function runRound(lockPath, opts) {
   const startAt = Date.now() + 400 // room for every child to reach the spin
-  const children = Array.from({ length: CONTENDERS }, () => spawnContender(lockPath, startAt))
+  const children = Array.from({ length: CONTENDERS }, () => spawnContender(lockPath, startAt, opts))
   return Promise.all(children.map(collect))
 }
 
@@ -136,4 +141,42 @@ test('the lock is released when its owner dies, without manual cleanup', async (
     1,
     'a dead owner must not wedge the lock forever',
   )
+})
+
+test('a CRASH-STALE filesystem-socket node yields exactly one winner among synchronized contenders', async (t) => {
+  // Required by adversarial review of f2cfcc6. Graceful `server.close()` (as
+  // used by the earlier fallback tests) unlinks the Unix-socket pathname on
+  // its own, so it never exercises real crash staleness. SIGKILL does not run
+  // any close/unlink path — the node is left genuinely orphaned on disk,
+  // exactly like a killed daemon. 24 contenders then race to reclaim it; the
+  // bug this regresses let 2 win (unlink-then-bind was not atomic with the
+  // probe that authorized it).
+  t.diagnostic(`${CONTENDERS} contenders x ${ROUNDS} rounds, forced filesystem-socket path`)
+  for (let round = 0; round < ROUNDS; round += 1) {
+    const lockPath = freshLockPath()
+
+    const owner = spawnContender(lockPath, Date.now(), { forceFs: true })
+    const ownerResult = await new Promise((resolve, reject) => {
+      owner.stdout.once('data', (chunk) => resolve(JSON.parse(String(chunk).trim())))
+      owner.on('error', reject)
+    })
+    assert.equal(ownerResult.ok, true, `round ${round}: owner must acquire the forced-fallback lock first`)
+    owner.kill('SIGKILL') // crash, not close — no unlink runs; the node is genuinely stale
+    await new Promise((resolve) => owner.on('close', resolve))
+
+    const results = await runRound(lockPath, { forceFs: true })
+    const winners = results.filter((r) => r.ok)
+    assert.equal(
+      winners.length,
+      1,
+      `round ${round}: expected exactly 1 winner reclaiming a crash-stale node, got ${winners.length} `
+        + `(${JSON.stringify(results.map((r) => r.reason))})`,
+    )
+    for (const loser of results.filter((r) => !r.ok)) {
+      assert.ok(
+        ['already_running', 'lock_contended'].includes(loser.reason),
+        `round ${round}: unexpected loser reason ${loser.reason}`,
+      )
+    }
+  }
 })
