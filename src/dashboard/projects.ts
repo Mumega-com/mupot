@@ -280,6 +280,13 @@ export interface ProjectManageAccessContext {
   // the confused-deputy gap #453 requires closed at the connector-scope
   // boundary; see upsertProjectBinding).
   authorizingSquadIds: string[]
+  // The actor's RAW squad memberships (unfiltered by project_squad_access),
+  // for callers that need to re-verify authority against a LIVE read at
+  // write time rather than trust this snapshot (adversarial review on #453:
+  // authorizingSquadIds computed here can go stale by the time a later
+  // write actually executes if access is revoked/downgraded concurrently —
+  // see upsertProjectBinding's SQL-embedded live re-check).
+  actorSquadIds: string[]
 }
 
 async function projectManageAccessContextFor(
@@ -288,11 +295,11 @@ async function projectManageAccessContextFor(
   projectId: string,
 ): Promise<ProjectManageAccessContext> {
   if (access.workspaceAdmin) {
-    return { authorized: true, workspaceAdmin: true, authorizingSquadIds: [] }
+    return { authorized: true, workspaceAdmin: true, authorizingSquadIds: [], actorSquadIds: [] }
   }
   const squadIds = access.taskableSquadIds ?? []
   if (squadIds.length === 0) {
-    return { authorized: false, workspaceAdmin: false, authorizingSquadIds: [] }
+    return { authorized: false, workspaceAdmin: false, authorizingSquadIds: [], actorSquadIds: [] }
   }
   const placeholders = squadIds.map((_, index) => `?${index + 2}`).join(', ')
   const rows = await env.DB.prepare(
@@ -302,7 +309,7 @@ async function projectManageAccessContextFor(
         AND access_level IN ('write', 'admin')`,
   ).bind(projectId, ...squadIds).all<{ squad_id: string }>()
   const authorizingSquadIds = (rows.results ?? []).map((row) => row.squad_id)
-  return { authorized: authorizingSquadIds.length > 0, workspaceAdmin: false, authorizingSquadIds }
+  return { authorized: authorizingSquadIds.length > 0, workspaceAdmin: false, authorizingSquadIds, actorSquadIds: squadIds }
 }
 
 /**

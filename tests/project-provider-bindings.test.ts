@@ -15,7 +15,7 @@ import { isConnectorType } from '../src/connectors/crypto'
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const THROUGH = '0062_project_provider_bindings.sql'
 
-const ADMIN: BindingActorContext = { workspaceAdmin: true, authorizingSquadIds: [] }
+const ADMIN: BindingActorContext = { workspaceAdmin: true, actorSquadIds: [] }
 
 function applyThrough(sqlite: { exec(sql: string): void }, throughFile: string): void {
   for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name <= throughFile).sort()) {
@@ -88,7 +88,7 @@ describe('project provider bindings', () => {
   // authorizes a non-admin actor through a SPECIFIC subset of their own squads
   // holding write/admin here; these tests pin the corrected policy: pot-wide
   // requires workspace-admin, squad-scoped requires the connector's squad to be
-  // one of THIS actor's own authorizingSquadIds — not merely project-linked.
+  // one of THIS actor's own actorSquadIds — not merely project-linked.
   describe('connector_id scope validation (#453)', () => {
     const TENANT = 'test-tenant'
 
@@ -118,7 +118,7 @@ describe('project provider bindings', () => {
     }
 
     // The manager authorized through squad-mine on proj-1 — NOT an admin.
-    const MANAGER_VIA_MINE: BindingActorContext = { workspaceAdmin: false, authorizingSquadIds: ['squad-mine'] }
+    const MANAGER_VIA_MINE: BindingActorContext = { workspaceAdmin: false, actorSquadIds: ['squad-mine'] }
 
     it('workspace admin may bind a pot-wide connector', async () => {
       const { sqlite, db, close } = createSqliteD1()
@@ -168,6 +168,28 @@ describe('project provider bindings', () => {
           external_id: 'ENG',
           connector_id: 'conn-mine',
         }, MANAGER_VIA_MINE)
+        expect(result.ok).toBe(true)
+      } finally {
+        close()
+      }
+    })
+
+    // #543 P2 (adversarial review of 86b05bb): workspace admin deliberately
+    // has an empty actorSquadIds — the squad branch must still treat admin
+    // as the authority superset, the same as it already does for pot-scope,
+    // rather than unconditionally rejecting every squad connector for admins.
+    it('workspace admin may bind a squad-scoped connector too (admin is the authority superset)', async () => {
+      const { sqlite, db, close } = createSqliteD1()
+      try {
+        applyThrough(sqlite, THROUGH)
+        seed(sqlite)
+        insertConnector(sqlite, 'conn-mine', 'squad', 'squad-mine')
+        const env = { DB: db, TENANT_SLUG: TENANT } as never
+        const result = await upsertProjectBinding(env, 'proj-1', {
+          provider: 'linear',
+          external_id: 'ENG',
+          connector_id: 'conn-mine',
+        }, ADMIN)
         expect(result.ok).toBe(true)
       } finally {
         close()
@@ -287,6 +309,39 @@ describe('project provider bindings', () => {
           connector_id: 'conn-cross-tenant',
         }, ADMIN)
         expect(result).toEqual({ ok: false, error: 'connector_not_found' })
+      } finally {
+        close()
+      }
+    })
+
+    // #543 P1 (adversarial review of 86b05bb): the actor context a route
+    // handler snapshots before calling upsertProjectBinding can go stale if
+    // the squad's access is revoked/downgraded concurrently. The fix moved
+    // the REAL authority check into the write's own SQL, reading
+    // project_squad_access LIVE rather than trusting actorSquadIds alone.
+    // This proves it: the actor CLAIMS authority via squad-mine, but the
+    // database, at the moment of the call, no longer grants squad-mine
+    // write/admin here — the write must fail closed, not succeed on the
+    // strength of the actor's (now-stale) claim.
+    it('REJECTS a bind when the actor context is stale — squad access was revoked in the DB before this call runs', async () => {
+      const { sqlite, db, close } = createSqliteD1()
+      try {
+        applyThrough(sqlite, THROUGH)
+        seed(sqlite) // grants squad-mine 'write' on proj-1
+        insertConnector(sqlite, 'conn-mine', 'squad', 'squad-mine')
+        // Simulate a concurrent revoke landing between the caller's
+        // authorization snapshot and this call actually running.
+        sqlite.exec(`
+          UPDATE project_squad_access SET access_level = 'read'
+           WHERE project_id = 'proj-1' AND squad_id = 'squad-mine';
+        `)
+        const env = { DB: db, TENANT_SLUG: TENANT } as never
+        const result = await upsertProjectBinding(env, 'proj-1', {
+          provider: 'linear',
+          external_id: 'ENG',
+          connector_id: 'conn-mine',
+        }, MANAGER_VIA_MINE) // still claims actorSquadIds: ['squad-mine'] — stale
+        expect(result).toEqual({ ok: false, error: 'connector_out_of_scope' })
       } finally {
         close()
       }

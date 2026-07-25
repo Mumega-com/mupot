@@ -440,6 +440,15 @@ describe('project domain service', () => {
             },
           }
         },
+        // removeProjectSquadAccess/upsertProjectSquadAccess batch their write
+        // with the binding-invalidation statement (#453 atomicity fix) — run
+        // each bound statement in order so the first one's simulated throw
+        // still surfaces the same way a single run() call used to.
+        async batch(statements: Array<{ run(): Promise<unknown> }>) {
+          const results = []
+          for (const statement of statements) results.push(await statement.run())
+          return results
+        },
       },
     } as Env)
 

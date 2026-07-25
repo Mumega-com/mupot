@@ -428,7 +428,7 @@ dashboardApp.post('/projects/:id/boards', async (c) => {
     provider: form.provider,
     external_id: form.external_id,
     connector_id: form.connector_id,
-  }, { workspaceAdmin: access.workspaceAdmin, authorizingSquadIds: access.authorizingSquadIds })
+  }, { workspaceAdmin: access.workspaceAdmin, actorSquadIds: access.actorSquadIds })
   if (!result.ok) {
     return c.html(
       shell(c.env, view.project.name, projectDetailBody(view)),
