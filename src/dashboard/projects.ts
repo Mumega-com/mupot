@@ -269,19 +269,47 @@ export async function canManageProjects(env: Env, auth: AuthContext): Promise<bo
 // (src/mcp/index.ts) and destinationAuthorized (src/addons/project-link/
 // service.ts) already use elsewhere in v0.24 for "manage-level project ops".
 // Fail-closed: no member id, no taskable squads, or no matching row -> false.
-async function projectManageAccessFor(env: Env, access: ProjectAccess, projectId: string): Promise<boolean> {
-  if (access.workspaceAdmin) return true
+export interface ProjectManageAccessContext {
+  authorized: boolean
+  workspaceAdmin: boolean
+  // The subset of the actor's own taskable squads that actually hold write/admin
+  // on THIS project — i.e. the squad(s) whose authority the actor is acting
+  // through right now. NOT the same as "every squad linked to the project"
+  // (that would let an actor authorized via squad A act with squad B's
+  // authority merely because B also has some access_level on the project —
+  // the confused-deputy gap #453 requires closed at the connector-scope
+  // boundary; see upsertProjectBinding).
+  authorizingSquadIds: string[]
+  // The actor's RAW squad memberships (unfiltered by project_squad_access),
+  // for callers that need to re-verify authority against a LIVE read at
+  // write time rather than trust this snapshot (adversarial review on #453:
+  // authorizingSquadIds computed here can go stale by the time a later
+  // write actually executes if access is revoked/downgraded concurrently —
+  // see upsertProjectBinding's SQL-embedded live re-check).
+  actorSquadIds: string[]
+}
+
+async function projectManageAccessContextFor(
+  env: Env,
+  access: ProjectAccess,
+  projectId: string,
+): Promise<ProjectManageAccessContext> {
+  if (access.workspaceAdmin) {
+    return { authorized: true, workspaceAdmin: true, authorizingSquadIds: [], actorSquadIds: [] }
+  }
   const squadIds = access.taskableSquadIds ?? []
-  if (squadIds.length === 0) return false
+  if (squadIds.length === 0) {
+    return { authorized: false, workspaceAdmin: false, authorizingSquadIds: [], actorSquadIds: [] }
+  }
   const placeholders = squadIds.map((_, index) => `?${index + 2}`).join(', ')
-  const row = await env.DB.prepare(
-    `SELECT 1 FROM project_squad_access
+  const rows = await env.DB.prepare(
+    `SELECT squad_id FROM project_squad_access
       WHERE project_id = ?1
         AND squad_id IN (${placeholders})
-        AND access_level IN ('write', 'admin')
-      LIMIT 1`,
-  ).bind(projectId, ...squadIds).first()
-  return row !== null
+        AND access_level IN ('write', 'admin')`,
+  ).bind(projectId, ...squadIds).all<{ squad_id: string }>()
+  const authorizingSquadIds = (rows.results ?? []).map((row) => row.squad_id)
+  return { authorized: authorizingSquadIds.length > 0, workspaceAdmin: false, authorizingSquadIds, actorSquadIds: squadIds }
 }
 
 /**
@@ -292,7 +320,23 @@ async function projectManageAccessFor(env: Env, access: ProjectAccess, projectId
  * being pot-admin, and org-admin/owner still passes (see projectManageAccessFor).
  */
 export async function canManageProject(env: Env, auth: AuthContext, projectId: string): Promise<boolean> {
-  return projectManageAccessFor(env, await projectAccess(env, auth), projectId)
+  return (await projectManageAccessContextFor(env, await projectAccess(env, auth), projectId)).authorized
+}
+
+/**
+ * projectManageAccessContext — same gate as canManageProject, but also returns
+ * WHICH authority the actor is acting through (workspace admin, or the exact
+ * subset of their own squads holding write/admin here). Routes that mutate a
+ * project_provider_binding's connector_id need this to bound the connector's
+ * scope to the actor's OWN authority (#453) rather than "anything linked to
+ * the project" — see upsertProjectBinding's actor parameter.
+ */
+export async function projectManageAccessContext(
+  env: Env,
+  auth: AuthContext,
+  projectId: string,
+): Promise<ProjectManageAccessContext> {
+  return projectManageAccessContextFor(env, await projectAccess(env, auth), projectId)
 }
 
 function jsonIds(ids: string[]): string {
@@ -628,7 +672,7 @@ export async function loadProjectDetail(
     listProjectActivity(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
     listProjectEvidence(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
     listProjectBindings(env, project.id),
-    projectManageAccessFor(env, access, project.id),
+    projectManageAccessContextFor(env, access, project.id).then((ctx) => ctx.authorized),
   ])
 
   return {
