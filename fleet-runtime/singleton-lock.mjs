@@ -34,7 +34,7 @@
 
 import net from 'node:net'
 import { createHash, randomBytes } from 'node:crypto'
-import { mkdirSync, unlinkSync, linkSync, statSync } from 'node:fs'
+import { mkdirSync, unlinkSync, linkSync, renameSync } from 'node:fs'
 import { dirname } from 'node:path'
 
 /**
@@ -55,6 +55,18 @@ function lockAddress(path, options) {
   return useAbstractNamespace(options)
     ? `\0mupot-singleton-${digest}`
     : `${path}.sock`
+}
+
+/**
+ * A SEPARATE abstract-namespace address used only to serialize reclaim
+ * attempts on the filesystem-socket fallback (see the fallback's own
+ * comments). Independent of `forceFilesystemSocket`, which only chooses the
+ * MAIN lock's address — the abstract namespace is a Linux kernel facility
+ * available regardless of which address style the main lock itself uses.
+ */
+function reclaimMutexAddress(path) {
+  const digest = createHash('sha256').update(path).digest('hex').slice(0, 32)
+  return `\0mupot-reclaim-${digest}`
 }
 
 function listen(server, address) {
@@ -191,6 +203,7 @@ export async function acquireSingletonLock(options) {
   // assumed from "I unlinked it" — only ever proven by "my link() call itself
   // returned success."
   const tmpAddress = `${address}.claim-${pid}-${randomBytes(4).toString('hex')}`
+  const reclaimMutex = reclaimMutexAddress(path)
 
   try {
     await listen(server, tmpAddress)
@@ -216,15 +229,28 @@ export async function acquireSingletonLock(options) {
     reason: 'lock_acquired',
     holder_pid: pid,
     release() {
-      try {
-        server.close()
-      } catch {
-        return false
-      }
+      // Order matters. `server.close()` was bound to `tmpAddress`, not
+      // `address` (Node has no idea `address` is hardlinked to the same
+      // socket) — so it takes effect (stops accepting) IMMEDIATELY and
+      // SYNCHRONOUSLY, well before the actual fd teardown completes, while
+      // `address` the FILE still exists on disk. A probe arriving in that gap
+      // would see ECONNREFUSED against a name that still has a directory
+      // entry — indistinguishable from a genuine crash-stale corpse — and
+      // could legitimately win the reclaim race for `address` before we ever
+      // reach our own unlink. Then our unconditional unlink would delete
+      // THEIR fresh claim: the same successor-unlink bug as the reclaim path,
+      // now at release. Unlinking `address` FIRST, while still definitely
+      // listening, closes that gap — no observer can ever see "file present,
+      // nothing listening" for a name we still hold.
       try {
         unlinkSync(address)
       } catch {
         // already gone
+      }
+      try {
+        server.close()
+      } catch {
+        return false
       }
       return true
     },
@@ -247,93 +273,98 @@ export async function acquireSingletonLock(options) {
       }
     }
 
-    // Our link() lost the name to something already there. Identify it BEFORE
-    // probing — `probe()` is async and takes real wall-clock time (up to its
-    // 1s silence timeout), and a fresh winner can appear and vanish-from-view
-    // entirely within that gap. Capturing identity only AFTER the probe
-    // returned (the earlier version of this fix) let a probe result for the
-    // OLD corpse get attributed to whatever NEW entity happened to occupy the
-    // name by the time the post-probe stat ran — reaping a live winner
-    // because the "refused" verdict belonged to something that no longer
-    // existed. So identity is sandwiched around the probe and re-checked
-    // again immediately before the unlink: the verdict is only ever trusted
-    // for the EXACT (dev,ino) it was actually taken against.
-    let before
-    try {
-      before = statSync(address)
-    } catch {
-      continue // already gone — retry the link fresh
-    }
-    const holder = await probe(address)
-    let after
-    try {
-      after = statSync(address)
-    } catch {
-      continue // gone by the time the probe returned — retry fresh
-    }
-    if (before.dev !== after.dev || before.ino !== after.ino) {
-      // The name changed identity mid-probe. The verdict we just got is
-      // about neither reliably-known state — trust nothing, retry fresh.
-      continue
-    }
-
-    if (holder.state === 'alive' || holder.state === 'silent') {
-      // Silence is not death (see probe()'s doc comment) — a suspended/busy/
-      // slow owner still holds the name. Refuse either way.
-      abandon()
-      return { ok: false, reason: 'already_running', holder_pid: holder.pid ?? null }
-    }
-
-    // holder.state === 'refused', PROVEN to be about this exact (dev,ino) —
-    // but WHICH contender gets to clear it must itself be kernel-arbitrated.
-    // Two contenders can both observe 'refused' against the SAME stale node
-    // and act on that observation at different real times; if either unlinks
-    // unconditionally, a straggler's unlink — authorized by a probe taken
-    // before a winner claimed the name — can delete the WINNER's fresh
-    // pathname. That is the exact two-owner bug adversarial review found on
-    // `f2cfcc6` (24 synchronized contenders, a SIGKILL-created stale node, 2
-    // winners). So the unlink itself is gated behind a second `link()` CAS,
-    // scoped to this SPECIFIC dead (dev,ino): only the contender that
-    // atomically wins the right to reap THIS corpse may ever unlink it. A
-    // crash mid-reap permanently poisons only that one corpse's ticket name
-    // (harmless disk litter, never looked up again) — the next stale
-    // generation has a different inode and therefore a fresh ticket name, so
-    // nothing can wedge.
-    const reapTicket = `${address}.reap-${before.dev}-${before.ino}`
-    try {
-      linkSync(tmpAddress, reapTicket)
-    } catch (error) {
-      if (error?.code === 'EEXIST') {
-        continue // someone else is (or already did) reaping this exact corpse
-      }
-      abandon()
-      return { ok: false, reason: 'lock_unwritable', holder_pid: null, detail: String(error?.message ?? error) }
-    }
-
-    try {
-      let current
+    // Our link() lost the name to something already there. Two independent
+    // ways of trying to resolve this — a `statSync`-based identity sandwich,
+    // then a rename-away-and-verify-then-restore dance — both turned out
+    // unsound under adversarial review: the sandwich compared (dev,ino)
+    // across a time gap, which this filesystem defeats by reusing a freed
+    // inode number for a brand-new, unrelated, live claim within
+    // microseconds (measured ~100% reuse under this file's own churn
+    // pattern); the restore dance let an evicted-but-alive owner keep
+    // believing it had already won (it had, by then, already reported
+    // success) while a THIRD party legitimately claimed the freed name
+    // during the investigation window — minting a second, independent,
+    // mutually oblivious winner. Neither problem is closed by resampling or
+    // retrying the same shape harder.
+    //
+    // Fix: stop trying to verify identity or undo a mistake after the fact.
+    // Make the whole "confirm dead, then replace" decision happen inside a
+    // section only one contender may ever be in at a time, using the ONE
+    // kernel-arbitrated, zero-staleness primitive this file already trusts
+    // for the main lock itself: an abstract-namespace socket bind. That
+    // guarantee (freed instantly on the holder's death, however it dies, no
+    // staleness possible) is what a PID-file-style mutex can never give —
+    // this is not a new trick, it is reusing the one already proven correct.
+    if (process.platform === 'linux') {
+      const mutexServer = net.createServer(() => {})
+      mutexServer.unref()
       try {
-        current = statSync(address)
-      } catch {
-        current = null // already gone
+        await listen(mutexServer, reclaimMutex)
+      } catch (error) {
+        if (error?.code !== 'EADDRINUSE') {
+          abandon()
+          return { ok: false, reason: 'lock_unwritable', holder_pid: null, detail: String(error?.message ?? error) }
+        }
+        // Someone else is investigating `address` right now. Don't race
+        // them — retry the whole outer loop; by then they will have either
+        // claimed `address` (we'll see EEXIST, probe THEM, correctly refuse)
+        // or backed off (we'll see it free).
+        continue
       }
-      if (current && current.dev === before.dev && current.ino === before.ino) {
+      try {
+        const holder = await probe(address)
+        if (holder.state === 'alive' || holder.state === 'silent') {
+          // Silence is not death (see probe()'s doc comment).
+          abandon()
+          return { ok: false, reason: 'already_running', holder_pid: holder.pid ?? null }
+        }
+        // Confirmed dead — and because we hold the mutex, no other
+        // contender can be concurrently reaching or acting on that same
+        // conclusion. Replace it with our OWN socket in one atomic step:
+        // `renameSync` always succeeds regardless of what currently
+        // occupies `address` (no EEXIST check on its destination), so there
+        // is no intermediate instant where `address` is absent for an
+        // unrelated fresh claimant to slip into — unlike unlink-then-relink,
+        // which is two syscalls with a real gap between them for exactly
+        // that to happen.
         try {
-          unlinkSync(address)
+          renameSync(tmpAddress, address)
+          return owned()
+        } catch (error) {
+          abandon()
+          return { ok: false, reason: 'lock_unwritable', holder_pid: null, detail: String(error?.message ?? error) }
+        }
+      } finally {
+        try {
+          mutexServer.close()
         } catch {
-          // already gone
+          // already closed
         }
       }
-      // else: address changed under us since we won the reap ticket — a
-      // fresh claimant's own `link()` won it validly in the meantime. Leave
-      // it; fall through to retry, where our next link() correctly EEXISTs
-      // against THEM.
-    } finally {
-      try {
-        unlinkSync(reapTicket)
-      } catch {
-        // best-effort — a name nothing will ever look up again
-      }
+    }
+
+    // Non-Linux: no abstract namespace, so no zero-staleness mutex is
+    // available in pure Node (no flock/fcntl binding either). Best effort —
+    // a single probe, then a single atomic replace, no ticket/restore dance
+    // (both were shown above to still race under real concurrent
+    // contention without a true mutex). This narrows, but does not fully
+    // close, the gap between the probe and the replace. Accepted here
+    // because this file's own adversarial testing and this codebase's
+    // actual deployment target are both Linux (`forceFilesystemSocket`
+    // exists to exercise this fallback FROM Linux, not to certify a real
+    // non-Linux host) — a genuine non-Linux deployment is untested
+    // territory regardless of this specific gap.
+    const preCheck = await probe(address)
+    if (preCheck.state === 'alive' || preCheck.state === 'silent') {
+      abandon()
+      return { ok: false, reason: 'already_running', holder_pid: preCheck.pid ?? null }
+    }
+    try {
+      renameSync(tmpAddress, address)
+      return owned()
+    } catch (error) {
+      abandon()
+      return { ok: false, reason: 'lock_unwritable', holder_pid: null, detail: String(error?.message ?? error) }
     }
   }
 

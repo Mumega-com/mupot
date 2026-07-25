@@ -191,6 +191,31 @@ export async function runCycle(opts = {}) {
 }
 
 async function main() {
+  // Validate identity/token BEFORE taking the singleton lock (adversarial
+  // review on #540). A watcher launched with a wrong/expired token or a
+  // mismatched EXPECTED_AGENT_ID can never succeed no matter how many times
+  // the loop below retries — it is a config error, not a transient one. The
+  // OLD ordering acquired the lock first, so a permanently-misconfigured
+  // watcher would hold the singleton forever (its cycle_error catch just logs
+  // and loops), blocking a correctly-configured watcher from ever starting.
+  // Failing here, before any lock exists, means a bad launch can never block
+  // a good one. Transient failures (mupot momentarily unreachable) fail fast
+  // too — this script runs under systemd/cron supervision (see header), which
+  // is the correct place for restart/backoff policy, not an infinite in-
+  // process retry before real work has even started.
+  let preflightBoot
+  try {
+    preflightBoot = await mcpCall(readToken(), 'boot_context', {})
+  } catch (error) {
+    log('preflight_error', { error: String(error?.message ?? error) })
+    process.exit(1)
+  }
+  const preflightIdentity = assertCanonicalRuntimeIdentity(preflightBoot, EXPECTED_AGENT_ID)
+  if (!preflightIdentity.ok) {
+    log('identity_refuse_preflight', { reason: preflightIdentity.reason, expected: EXPECTED_AGENT_ID })
+    process.exit(1)
+  }
+
   // Single instance per agent. A second watcher on the same token interleaves
   // peek/consume and can drain rows this one already delivered.
   const lock = await acquireSingletonLock({ path: LOCK_FILE })
