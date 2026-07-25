@@ -19,6 +19,7 @@ import { readFileSync, copyFileSync, rmSync, readdirSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
+import { isFullSha, releaseShaDeployArgs } from './lib/release-sha.mjs'
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DESTRUCTIVE = /\bDROP\s+TABLE\b|\bDROP\s+COLUMN\b|\bDELETE\s+FROM\b|\bTRUNCATE\b|\bRENAME\s+TO\b/i
@@ -56,8 +57,9 @@ if (targets.length === 0) die(`unknown pot '${target}'. Known: ${all.map((p) => 
 function gitState() {
   const branch = (sh('git', ['rev-parse', '--abbrev-ref', 'HEAD']).stdout || '').trim()
   const sha = (sh('git', ['rev-parse', '--short', 'HEAD']).stdout || '').trim()
+  const fullSha = (sh('git', ['rev-parse', 'HEAD']).stdout || '').trim()
   const dirty = ((sh('git', ['status', '--porcelain']).stdout || '').trim().length) > 0
-  return { branch, sha, dirty }
+  return { branch, sha, fullSha, dirty }
 }
 const GIT = gitState()
 
@@ -67,6 +69,14 @@ if (APPLY) {
   }
   if (GIT.branch !== ALLOWED_REF && !ALLOW_DIRTY) {
     die(`refusing to --apply from ref '${GIT.branch}' (not '${ALLOWED_REF}'). Switch to ${ALLOWED_REF}, or pass --allow-dirty to override.`)
+  }
+  // #443: every pot deployed by this tool gets RELEASE_SHA stamped so GET /health
+  // never reports `commit: null` for a mupot-update deploy. A tree that just
+  // passed the dirty/ref checks above will always resolve a full 40-hex sha —
+  // this only trips on a genuinely broken git checkout (e.g. a shallow clone
+  // missing HEAD), and that should block --apply exactly like the other guards.
+  if (!isFullSha(GIT.fullSha)) {
+    die(`refusing to --apply: could not resolve a full 40-hex commit sha (got '${GIT.fullSha}').`)
   }
 }
 
@@ -204,7 +214,9 @@ for (const e of pf) {
       })
       if (m.status !== 0) return { ok: false, step: 'migrations' }
     }
-    const d = sh('npx', ['wrangler', 'deploy', ...cfg], { stdio: ['ignore', 'inherit', 'inherit'] })
+    const d = sh('npx', ['wrangler', 'deploy', ...cfg, ...releaseShaDeployArgs(GIT.fullSha)], {
+      stdio: ['ignore', 'inherit', 'inherit'],
+    })
     if (d.status !== 0) return { ok: false, step: 'deploy' }
     return { ok: true }
   })

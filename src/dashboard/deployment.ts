@@ -116,18 +116,19 @@ export function deploymentBody(d: DeploymentData) {
         your own machine or CI — there is no "deploy" button in this dashboard on purpose (a
         dashboard click should never be able to push a new build to production).
       </p>
-      <pre class="snippet">npm run deploy
-# or, equivalently:
-npx wrangler deploy</pre>
+      <pre class="snippet">npm run deploy</pre>
       <p class="empty">
         For the full self-host / redeploy runbook (secrets, migrations, config), see
         <code class="inline">docs/SELF-HOST.md</code> and <code class="inline">docs/production-runbook.md</code>
         in this pot's repository.
       </p>
       <p class="empty">
-        To make <code class="inline">GET /health</code> report an exact commit identity, deploy
-        with <code class="inline">RELEASE_SHA</code> set to the commit you're shipping, e.g.
-        <code class="inline">RELEASE_SHA=$(git rev-parse HEAD) npx wrangler deploy</code>.
+        <code class="inline">GET /health</code> reports an exact commit identity automatically —
+        deploy via <code class="inline">npm run deploy</code> (or
+        <code class="inline">node scripts/mupot-update.mjs &lt;slug&gt; --apply</code> for a
+        managed pot) and <code class="inline">RELEASE_SHA</code> is stamped for you from
+        <code class="inline">git rev-parse HEAD</code>. A bare
+        <code class="inline">npx wrangler deploy</code> skips this stamp — use the wrapper.
       </p>
     </div>
   `

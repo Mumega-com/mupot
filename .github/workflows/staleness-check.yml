@@ -1,0 +1,36 @@
+name: staleness-check
+
+# mupot#443 Part B — CI has no real deploy step, so drift between `main` and
+# what's actually live in each pot was invisible (7 merged PRs sat undeployed
+# for 4 days with nobody the wiser). This workflow makes drift visible without
+# auto-deploying anything: it reads each pot's public GET /health `commit`
+# (see src/health.ts, stamped by scripts/deploy.mjs / scripts/mupot-update.mjs)
+# and compares it to `main` HEAD. Read-only — no Cloudflare credentials, no
+# secrets, cannot deploy or touch any tenant pot.
+#
+# Signal on divergence: the job fails (red run in the Actions tab; GitHub
+# automatically emails the workflow's last editor when a SCHEDULED run fails)
+# and the human-readable report is written to the job summary either way, so
+# "everything's current" is just as visible as "pot X drifted".
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Compare live pots vs main HEAD
+        run: |
+          node scripts/staleness-check.mjs | tee -a "$GITHUB_STEP_SUMMARY"

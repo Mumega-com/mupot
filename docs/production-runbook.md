@@ -133,10 +133,17 @@ Deploy once, set secrets if Wrangler required the Worker to exist first, then
 deploy again:
 
 ```bash
-npx wrangler deploy --config "$CONFIG" --message "initial ${POT} production deploy"
+node scripts/deploy.mjs --config "$CONFIG" --message "initial ${POT} production deploy"
 npx wrangler secret list --config "$CONFIG"
-npx wrangler deploy --config "$CONFIG" --message "production secrets configured"
+node scripts/deploy.mjs --config "$CONFIG" --message "production secrets configured"
 ```
+
+`scripts/deploy.mjs` wraps `wrangler deploy` and always stamps `RELEASE_SHA`
+with the exact commit HEAD is on (mupot#443) — `GET /health` will report it as
+`commit`. Do not call `wrangler deploy` directly for a real deploy; the manual
+`RELEASE_SHA=$(git rev-parse HEAD) wrangler deploy` incantation is exactly the
+step that got forgotten in practice and left production reporting
+`commit: null` for days.
 
 When dashboard OAuth is selected, register redirect URLs with the identity provider
 before inviting users:
@@ -179,8 +186,12 @@ npm test
 npm run typecheck
 npx wrangler d1 migrations list "$DB" --remote --config "$CONFIG"
 npx wrangler d1 migrations apply "$DB" --remote --config "$CONFIG"
-npx wrangler deploy --config "$CONFIG" --message "upgrade ${POT} to $(git rev-parse --short HEAD)"
+node scripts/deploy.mjs --config "$CONFIG" --message "upgrade ${POT} to $(git rev-parse --short HEAD)"
 ```
+
+Migrations apply BEFORE the code deploy in both paths above — code that
+expects a column/table the old schema doesn't have yet must never reach
+production ahead of the migration that adds it.
 
 Do not apply a migration to production until a D1 backup exists for the current
 production state.
