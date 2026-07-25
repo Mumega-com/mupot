@@ -232,6 +232,11 @@ Must ship:
 - Marketing & CRO addon as the first reference package;
 - Mumega pilot first, then DME activation after the same conformance and permission gate;
 - AI visibility collection, recommendation review, approved action, and outcome receipt;
+- Viamar as the first DME customer-cell proof: keep Viamar in its isolated pot, run a
+  hard-capped GEO scanner from the Google-hosted Kubernetes environment, retain detailed
+  events in Viamar's PostHog project, and surface only a redacted project receipt in
+  Mupot. Multi-customer projects inside one DME pot remain planned until customer RBAC
+  and connector bindings are genuinely project-scoped;
 - **guest-credential precursor:** the scoped, no-raw-secret credential path is the
   same governance family as the Operated Presence guest token (least-privilege,
   capability-ceiling, expiry) — prove it here so v0.29 presence rides a hardened primitive.
