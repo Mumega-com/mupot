@@ -331,3 +331,112 @@ test('main() keeps looping (does not exit) on a non-terminal cycle failure', asy
   assert.equal(released, false, 'must not release on a non-terminal failure')
   assert.deepEqual(exits, [])
 })
+
+// Required by adversarial review of ecbf21b: a token revoked/expired MID-RUN
+// (after a clean preflight already passed) does not make runCycle() RETURN a
+// terminal reason — mcpCall() throws on HTTP auth failures and on MCP
+// tool-level failures, so runCycle() rejects instead. The prior fix only
+// checked `result.reason` on a successful return; a thrown error was still
+// just logged and retried forever, holding the lock. These drive the actual
+// throwing shape (not just a returned {reason}) through main()'s real catch
+// block.
+
+test('main() releases and exits when a cycle THROWS an HTTP 401 mid-loop (revoked token), instead of looping forever', async () => {
+  const exits = []
+  let released = false
+  let cycleCalls = 0
+  await main({
+    readTokenFn: () => 'test-token',
+    mcpCall: async (_token, name) => {
+      if (name === 'boot_context') return { bound_agent_id: AGENT }
+      if (name === 'inbox_consumer_status') return { mode: 'bearer_only', generation: 0 }
+      throw new Error(`unexpected preflight call ${name}`)
+    },
+    acquireLock: async () => ({
+      ok: true,
+      reason: 'lock_acquired',
+      holder_pid: process.pid,
+      release: () => { released = true },
+    }),
+    runCycle: async () => {
+      cycleCalls += 1
+      // Exactly what mcpCall() throws for `if (!res.ok) throw new Error(...)`
+      // when the mupot MCP endpoint rejects a revoked bearer token.
+      throw new Error('mcp http 401')
+    },
+    exit: (code) => exits.push(code),
+    sleep: neverCalled('sleep'), // must exit before ever sleeping/retrying
+  })
+  assert.equal(cycleCalls, 1, 'must not keep cycling after a terminal thrown error')
+  assert.equal(released, true, 'must release the lock rather than hold it forever')
+  assert.deepEqual(exits, [1])
+})
+
+test('main() releases and exits when a cycle THROWS a tool-level identity/fence failure mid-loop', async () => {
+  const exits = []
+  let released = false
+  await main({
+    readTokenFn: () => 'test-token',
+    mcpCall: async (_token, name) => {
+      if (name === 'boot_context') return { bound_agent_id: AGENT }
+      if (name === 'inbox_consumer_status') return { mode: 'bearer_only', generation: 0 }
+      throw new Error(`unexpected preflight call ${name}`)
+    },
+    acquireLock: async () => ({
+      ok: true,
+      reason: 'lock_acquired',
+      holder_pid: process.pid,
+      release: () => { released = true },
+    }),
+    runCycle: async () => {
+      // Exactly what mcpCall() throws for `if (inner.ok === false) throw new
+      // Error('mcp tool ' + name + ' failed: ' + reason)` when the server
+      // itself reports the bound identity no longer matches (e.g. the token
+      // was reissued to a different agent mid-run).
+      throw new Error('mcp tool boot_context failed: wrong_bound_agent')
+    },
+    exit: (code) => exits.push(code),
+    sleep: neverCalled('sleep'),
+  })
+  assert.equal(released, true, 'must release the lock rather than hold it forever')
+  assert.deepEqual(exits, [1])
+})
+
+test('main() keeps looping (does not exit) when a cycle throws a transient/non-auth error', async () => {
+  const exits = []
+  let released = false
+  let cycleCalls = 0
+  let slept = false
+  const STOP = new Error('stop the test after one loop iteration')
+
+  await assert.rejects(() => main({
+    readTokenFn: () => 'test-token',
+    mcpCall: async (_token, name) => {
+      if (name === 'boot_context') return { bound_agent_id: AGENT }
+      if (name === 'inbox_consumer_status') return { mode: 'bearer_only', generation: 0 }
+      throw new Error(`unexpected preflight call ${name}`)
+    },
+    acquireLock: async () => ({
+      ok: true,
+      reason: 'lock_acquired',
+      holder_pid: process.pid,
+      release: () => { released = true },
+    }),
+    runCycle: async () => {
+      cycleCalls += 1
+      // A genuinely transient failure — mupot momentarily down/slow — must
+      // NOT be classified as terminal.
+      throw new Error('mcp http 503')
+    },
+    exit: (code) => exits.push(code),
+    sleep: async () => {
+      slept = true
+      throw STOP
+    },
+  }), STOP)
+
+  assert.equal(cycleCalls, 1)
+  assert.equal(slept, true, 'a transient thrown error must proceed to the retry sleep, not exit')
+  assert.equal(released, false, 'must not release on a transient thrown error')
+  assert.deepEqual(exits, [])
+})

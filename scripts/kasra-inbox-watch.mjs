@@ -55,6 +55,26 @@ const TERMINAL_REASONS = new Set([
   'consumer_fenced',
 ])
 
+// A REVOKED/expired token doesn't surface as a returned {ok:false, reason}
+// from runCycle() — mcpCall() throws on HTTP auth failures and on MCP
+// tool-level failures (adversarial review on #540: a token revoked mid-run,
+// after a clean preflight, makes the next boot_context/inbox_consumer_status
+// call reject rather than return, so the TERMINAL_REASONS check above never
+// even runs — the outer catch just logged and kept looping, holding the
+// lock forever). Classify the THROWN error's message the same way: an HTTP
+// 401/403 is unambiguously an auth failure (not a transient 5xx/timeout/DNS
+// blip), and a tool-level failure whose message names one of the same
+// TERMINAL_REASONS strings (mcpCall embeds the server's own reason in its
+// thrown message) is the identical precondition, just surfaced as a throw
+// instead of a return.
+function isTerminalCycleError(message) {
+  if (/\bmcp http (401|403)\b/.test(message)) return true
+  for (const reason of TERMINAL_REASONS) {
+    if (message.includes(reason)) return true
+  }
+  return false
+}
+
 function log(event, extra = {}) {
   console.log(JSON.stringify({ t: new Date().toISOString(), component: 'kasra-inbox-watch', event, ...extra }))
 }
@@ -327,8 +347,10 @@ export async function main(opts = {}) {
         return
       }
     } catch (error) {
-      log('cycle_error', { error: String(error?.message ?? error) })
-      if (ONCE) {
+      const message = String(error?.message ?? error)
+      const terminal = isTerminalCycleError(message)
+      log('cycle_error', { error: message, terminal })
+      if (ONCE || terminal) {
         release()
         exit(1)
         return
