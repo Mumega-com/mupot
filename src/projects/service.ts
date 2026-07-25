@@ -417,13 +417,26 @@ export async function upsertProjectSquadAccess(
   if (!isProjectAccessLevel(accessLevel)) return { ok: false, error: 'invalid_access_level' }
 
   const grantedAt = new Date().toISOString()
+  // SECURITY (#453 follow-up, adversarial review on 86b05bb): the access
+  // write and the binding invalidation were two separate statements. An
+  // error between them, or a concurrent bind() reading the OLD access level
+  // in between, could leave a squad-scoped connector attached after its
+  // authority was revoked. `env.DB.batch()` runs both as ONE atomic
+  // transaction (the same primitive used elsewhere in this codebase for
+  // exactly this "two writes, one unit" shape — e.g. flight/service.ts,
+  // auth/index.ts) — there is no instant where the access change is
+  // committed but the invalidation is not, or vice versa.
+  const upsertStmt = env.DB.prepare(
+    `INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(project_id, squad_id) DO UPDATE SET access_level = excluded.access_level`,
+  ).bind(projectId, squadId, accessLevel, grantedAt)
+  const needsInvalidate = accessLevel !== 'write' && accessLevel !== 'admin'
   try {
-    const result = await env.DB.prepare(
-      `INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(project_id, squad_id) DO UPDATE SET access_level = excluded.access_level`,
-    ).bind(projectId, squadId, accessLevel, grantedAt).run()
-    if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
+    const results = needsInvalidate
+      ? await env.DB.batch([upsertStmt, invalidateSquadScopedProviderBindingsStatement(env, projectId, squadId)])
+      : [await upsertStmt.run()]
+    if (!wrote(results[0])) return { ok: false, error: 'receipt_failed' }
   } catch (error) {
     const mapped = triggerMutationError(error)
     if (mapped) return { ok: false, error: mapped }
@@ -451,10 +464,17 @@ export async function removeProjectSquadAccess(
   const project = await getProject(env, projectId)
   if (!project) return { ok: false, error: 'project_not_found' }
   if (project.status === 'archived') return { ok: false, error: 'archived_project' }
+  // SECURITY (#453 follow-up): atomic with the invalidation below, same
+  // reasoning as upsertProjectSquadAccess — removal always drops the squad
+  // to zero access, so invalidation is unconditional here.
+  const deleteStmt = env.DB.prepare(
+    'DELETE FROM project_squad_access WHERE project_id = ? AND squad_id = ?',
+  ).bind(projectId, squadId)
   try {
-    const result = await env.DB.prepare(
-      'DELETE FROM project_squad_access WHERE project_id = ? AND squad_id = ?',
-    ).bind(projectId, squadId).run()
+    const [result] = await env.DB.batch([
+      deleteStmt,
+      invalidateSquadScopedProviderBindingsStatement(env, projectId, squadId),
+    ])
     if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
   } catch (error) {
     const mapped = triggerMutationError(error)
@@ -462,4 +482,35 @@ export async function removeProjectSquadAccess(
     throw error
   }
   return { ok: true, value: undefined }
+}
+
+// SECURITY (#453 follow-up): a squad-scoped connector was only ever a valid
+// project_provider_binding reference because that squad held write/admin here
+// at BIND time (see upsertProjectBinding's actor check). If that squad's
+// access is later downgraded below write/admin, or removed entirely, a stored
+// connector_id referencing IT becomes a stale grant of authority nobody
+// currently holds — the adapters that will eventually consume connector_id
+// (Linear/Notion, still pending_credentials stubs) have no project-scope
+// recheck at resolve time, so the binding itself must self-heal here instead.
+// Clearing to NULL (not deleting the binding) preserves the provider/
+// external_id link; a manager with current authority can re-bind a connector.
+//
+// Returns a bound-but-not-yet-run statement so callers can include it in an
+// `env.DB.batch()` alongside the access mutation itself — adversarial review
+// found the access write and this invalidation, as two separate `run()`
+// calls, were not atomic (an error, or a concurrently-racing bind(), could
+// land between them).
+function invalidateSquadScopedProviderBindingsStatement(
+  env: Env,
+  projectId: string,
+  squadId: string,
+) {
+  return env.DB.prepare(
+    `UPDATE project_provider_bindings
+        SET connector_id = NULL, updated_at = ?
+      WHERE project_id = ?
+        AND connector_id IN (
+          SELECT id FROM connectors WHERE scope_type = 'squad' AND scope_id = ?
+        )`,
+  ).bind(new Date().toISOString(), projectId, squadId)
 }

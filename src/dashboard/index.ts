@@ -117,6 +117,7 @@ import {
   canManageProject,
   canManageProjects,
   loadProjectDetail,
+  projectManageAccessContext,
   loadProjectFlights,
   loadProjectParentOptions,
   loadProjectWorkContext,
@@ -410,7 +411,13 @@ dashboardApp.get('/projects/:id', async (c) => {
 dashboardApp.post('/projects/:id/boards', async (c) => {
   const auth = c.get('auth')
   const projectId = c.req.param('id')
-  if (!await canManageProject(c.env, auth, projectId)) {
+  // Compute the manage-access context ONCE — the same authority check backs
+  // both the route gate and the connector-scope bound below (#453): the
+  // connector a caller may reference must never be broader than the specific
+  // authority (workspace-admin, or the exact squads) that got them past this
+  // gate in the first place.
+  const access = await projectManageAccessContext(c.env, auth, projectId)
+  if (!access.authorized) {
     return c.html(shell(c.env, 'Projects', projectNotFoundBody()), 403)
   }
   const view = await loadProjectDetail(c.env, auth, projectId)
@@ -421,7 +428,7 @@ dashboardApp.post('/projects/:id/boards', async (c) => {
     provider: form.provider,
     external_id: form.external_id,
     connector_id: form.connector_id,
-  })
+  }, { workspaceAdmin: access.workspaceAdmin, actorSquadIds: access.actorSquadIds })
   if (!result.ok) {
     return c.html(
       shell(c.env, view.project.name, projectDetailBody(view)),
