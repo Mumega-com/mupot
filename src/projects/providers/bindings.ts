@@ -1,5 +1,7 @@
 import type { D1Result } from '@cloudflare/workers-types'
 import type { Env } from '../../types'
+import { resolveConnectorByIdWithMeta } from '../../connectors/service'
+import { listProjectSquads } from '../service'
 import {
   isProjectBoardProvider,
   type ProjectBoardProvider,
@@ -13,6 +15,8 @@ export type BindingMutationError =
   | 'project_not_found'
   | 'archived_project'
   | 'receipt_failed'
+  | 'connector_not_found'
+  | 'connector_out_of_scope'
 
 export type BindingMutationResult<T> =
   | { ok: true; value: T }
@@ -92,6 +96,29 @@ export async function upsertProjectBinding(
         : null
   if (input.connector_id !== undefined && input.connector_id !== null && input.connector_id !== '' && connectorId === null) {
     return { ok: false, error: 'invalid_external_id' }
+  }
+  // SECURITY (#453): a per-project manager only has authority over the squad(s)
+  // bound to THIS project (project_squad_access) — never over the tenant's whole
+  // connector inventory. Storing connector_id verbatim would let them reference a
+  // connector scoped to an unrelated squad, or to a specific agent, and have a
+  // future board-sync adapter borrow that credential on their behalf: a classic
+  // confused-deputy. So a referenced connector must be either pot-wide, or squad-
+  // scoped to a squad that actually holds access on this project. Agent-scoped
+  // connectors are never valid here — those are a single agent's credential, not
+  // a project-shared one. Fail closed on any lookup miss.
+  if (connectorId !== null) {
+    const connector = await resolveConnectorByIdWithMeta(env, connectorId)
+    if (!connector) return { ok: false, error: 'connector_not_found' }
+    if (connector.scopeType === 'agent') {
+      return { ok: false, error: 'connector_out_of_scope' }
+    }
+    if (connector.scopeType === 'squad') {
+      const projectSquads = await listProjectSquads(env, projectId)
+      const inScope = connector.scopeId !== null
+        && projectSquads.some((access) => access.squad_id === connector.scopeId)
+      if (!inScope) return { ok: false, error: 'connector_out_of_scope' }
+    }
+    // scopeType === 'pot' — pot-wide, always in scope.
   }
   let metaJson = '{}'
   if (input.meta !== undefined) {
