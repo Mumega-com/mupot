@@ -1,0 +1,121 @@
+# Hermes relay — Telegram <-> DME pot. Long-polls Telegram (outbound only),
+# so this Deployment needs NO public ingress: no LoadBalancer, no Ingress,
+# no TLS cert to manage. See ../DESIGN.md for why.
+#
+# Resource sizing (Autopilot "general-purpose", non-bursting floor — see
+# ../COST.md for the arithmetic and the cheaper bursting-mode alternative):
+#   requests: 250m CPU / 512Mi memory — this IS the Autopilot minimum for a
+#     Pod on a cluster without bursting support; anything smaller gets
+#     silently rounded up to this anyway, so asking for less buys nothing.
+#   limits: 500m CPU / 512Mi memory — memory limit == request (no OOM
+#     ambiguity for a process this small); CPU limit is 2x request purely
+#     for headroom during Node's startup GC, not because we expect to use it.
+#   ephemeral-storage: 256Mi request — well under the 1Gi Autopilot default
+#     for containers that don't declare it; this process writes nothing to
+#     disk except a possible transient /tmp file from Node's runtime.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dme-hermes-relay
+  namespace: dme-hermes
+  labels:
+    app.kubernetes.io/name: dme-hermes-relay
+    app.kubernetes.io/part-of: mupot
+    mupot.tenant: dme-temp
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dme-hermes-relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dme-hermes-relay
+        app.kubernetes.io/part-of: mupot
+        mupot.tenant: dme-temp
+    spec:
+      serviceAccountName: dme-hermes-relay
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hermes-relay
+          # Pin by digest at deploy time (see COMMANDS.md step 8) — the tag
+          # below is a human-readable label only, resolution happens on the
+          # immutable @sha256 digest that `gcloud ... describe` prints.
+          image: northamerica-northeast2-docker.pkg.dev/mumegaproject/dme-hermes/relay:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MUPOT_URL
+              value: "https://mupot-dme-temp.weathered-scene-2272.workers.dev"
+            - name: MUPOT_WEBHOOK_PATH
+              value: "/im/webhook"
+            - name: GCP_PROJECT_ID
+              value: "mumegaproject"
+            - name: TELEGRAM_BOT_TOKEN_SECRET_NAME
+              value: "dme-hermes-telegram-bot-token"
+            - name: IM_WEBHOOK_SECRET_SECRET_NAME
+              value: "dme-hermes-im-webhook-secret"
+            - name: PORT
+              value: "8080"
+            # Optional pre-filter (plaintext, NOT secret — see server.mjs).
+            # Leave unset to let the pot be the sole RBAC gate.
+            # - name: ALLOWED_CHAT_IDS
+            #   value: "123456789"
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            # Generous: first Secret Manager fetch + first Telegram long-poll
+            # round trip can take up to ~40s together.
+            failureThreshold: 8
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+              ephemeral-storage: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+              ephemeral-storage: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

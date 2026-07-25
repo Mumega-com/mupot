@@ -1,0 +1,14 @@
+{
+  "name": "dme-hermes-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal Telegram <-> mupot webhook relay (Hermes) for the DME pot, GKE Autopilot runtime.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.mjs"
+  },
+  "dependencies": {}
+}
