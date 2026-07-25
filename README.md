@@ -39,6 +39,7 @@ The current stable release is `v0.23.0`; the active development target is
 [self-hosting guide](./docs/SELF-HOST.md), the
 [production runbook](./docs/production-runbook.md),
 [what running an agent on Mupot means](./docs/agent-running-on-mupot.md),
+[typed add-on boundary](./docs/superpowers/specs/2026-07-25-mupot-typed-addon-boundary-design.md),
 [how to connect an MCP client](./docs/connect-mcp-client.md), and
 [what runs offline in local dev](./docs/local-dev.md).
 
@@ -50,10 +51,11 @@ deliberately bounded to one child level: a root project or program can contain c
 but child projects cannot contain more projects. Squad access is explicit on each project;
 parent access is not inherited.
 
-External task systems connect through provider-neutral adapters. Linear, GitHub, or another
-provider can synchronize work without becoming the owner of Mupot's project identity or data
-model. SOS can appear as a project in a portfolio, but **SOS is not an architectural dependency**:
-Mupot runs on its own Cloudflare runtime and pub/sub infrastructure.
+External task systems connect through provider-neutral adapters without becoming the owner of
+Mupot's project identity or data model. GitHub Projects is the implemented reference provider.
+Linear and Notion are registered in the provider contract and UI, but their live external API
+synchronization is not implemented yet. SOS can bridge into a portfolio, but **SOS is not an
+architectural dependency**: Mupot runs on its own Cloudflare runtime and pub/sub infrastructure.
 
 The local showcase seeds a Mumega portfolio with attributed project work after migrations:
 
@@ -64,6 +66,23 @@ npm test -- tests/projects-local-smoke.test.ts
 # After starting the local Worker in another terminal:
 npm run smoke:local
 ```
+
+## Core, add-ons, adapters, connectors, and bindings
+
+Mupot is the authority for identity, membership, capabilities, projects, tasks, gates, flights,
+receipts, audit, and evidence. External systems extend those capabilities through typed ports;
+they do not become a second control plane.
+
+- An **add-on** is the product an operator installs and manages.
+- An **adapter** implements one typed Mupot port.
+- A **connector** holds a sealed credential and external endpoint.
+- A **binding** maps a Mupot scope to one external resource.
+
+One add-on may bundle several independently authorized adapters. For example, a task-board
+add-on can provide a project-board adapter, while a collaboration product can provide both a
+room/message adapter and a UI surface. Candidate mappings such as Buzz collaboration, an SOS
+coordination bridge, and live Linear synchronization are design directions, not shipped
+integrations.
 
 ## Three things no one else gives you together
 
@@ -92,10 +111,12 @@ your control plane (managed CF / your CF / your VPS / on-prem / edge)
   ├─ memory     D1 (relational) + Vectorize (semantic) + Workers AI (embeddings)
   ├─ bus        Queues + Durable Objects
   ├─ tasks      → your GitHub (source of truth) — born → solved → verified → done
+  ├─ projects   goals + squads + work + activity + evidence (v0.24 preview)
   ├─ channels   ChannelAdapter — Discord / Google Chat / Telegram,
   │             where the platform's scoped channel IS a squad
   ├─ fleet      agents of ANY runtime (Claude Code / Codex / custom GPT / MCP)
   │             check IN to the pot → a live inventory: who's in, who's out
+  ├─ addons     install → configure → activate → disable → archive (v0.24 preview)
   ├─ economy    per-execution wallet + marketplace: rent agents in, list yours out
   └─ dashboard  Pages + a first-run onboarding wizard (and the aquarium client)
 ```
@@ -190,6 +211,9 @@ on-prem deployment ride the same `Env` adapter contract.)
 
 - Ships an **empty org** — you create the departments, squads, agents, and invite the people.
 - Holds **no secret of ours** in the path — your CF keys, your OAuth, your GitHub, your model key.
+- Does not currently ship a native threaded team messenger. Its durable agent messaging and
+  channel adapters are coordination primitives; richer rooms, threads, reactions, and shared
+  human-agent timelines belong behind a collaboration adapter.
 - Your data lives in **your** D1 / Vectorize / R2 (or your own storage off-cloud). Each pot is
   a separate account; cancel any time and everything is still standing, still yours.
 
@@ -213,8 +237,10 @@ paths.
 interface). Each layer lives in its own folder under `src/` — `org`, `members`, `auth`,
 `agents`, `bus`, `memory`, `tasks`, `channels`, `dashboard` — and is independently testable.
 The channel layer is a modular core: it depends only on the adapter interface + a registry, so
-adding a platform is one file. Heavy workflow engines (LangGraph, n8n, a plain HTTP/MCP
-endpoint) connect as **gateway providers** — the core calls a provider, it never bakes one in.
+adding a platform is one file. Project boards, collaboration surfaces, coordination bridges,
+runtimes, and workflows remain separate typed ports even when one add-on package bundles more
+than one of them. Heavy workflow engines (LangGraph, n8n, a plain HTTP/MCP endpoint) connect as
+**gateway providers** — the core calls a provider, it never bakes one in.
 
 ## License
 

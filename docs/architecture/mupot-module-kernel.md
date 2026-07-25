@@ -1,9 +1,11 @@
 # mupot Module Kernel — durable core, pluggable modules, project-scoped presence
 
-Status: DRAFT (Kasra, 2026-07-21) — the unifying architecture behind the
-2026-07-21 direction session. Supersedes nothing; generalizes the addon
-framework (marketing-cro-monitor proved the pattern) from one connector slot to
-three module families.
+Status: DRAFT (Kasra, 2026-07-21; typed add-on boundary clarified 2026-07-25) —
+the unifying architecture behind the 2026-07-21 direction session. Supersedes
+nothing; generalizes the addon framework (marketing-cro-monitor proved the
+pattern) from one connector slot to three module families. The package, adapter,
+connector, and binding boundary is defined in
+`docs/superpowers/specs/2026-07-25-mupot-typed-addon-boundary-design.md`.
 
 ## The one idea
 
@@ -64,6 +66,49 @@ gated act → receipt. External managers never hold the approval.
 ### 3. Surface port
 Dashboards mount as panels (Hermes web UI first). A surface is read-through the
 kernel's auth; it never becomes a second control plane.
+
+## One catalog, several typed integration ports
+
+The three module families describe running modules and their presence. The
+operator-facing Add-ons catalog is a separate lifecycle layer over typed
+integration ports. It must not collapse every external product into one generic
+adapter contract.
+
+```text
+Add-on package
+├── adapter provision(s) — typed behavior
+├── connector(s) — sealed credentials and endpoints
+└── binding(s) — Mupot scope ↔ external resource
+```
+
+The initial typed integration ports are:
+
+- `ProjectBoardPort` — external task boards such as GitHub Projects, Linear, or
+  Notion;
+- `CollaborationPort` — rooms, messages, optional threads/reactions, membership
+  projection, and deep links;
+- `CoordinationBridgePort` — send, inbox, broadcast, wake, presence,
+  acknowledgements, and delivery correlation during coexistence with another
+  agent network;
+- the existing runtime, workflow, and surface module ports.
+
+One package may provide several adapters, but each provision is bound,
+authorized, activated, and observed independently. Examples:
+
+- Linear package → `ProjectBoardPort`;
+- Buzz package → `CollaborationPort` + surface module;
+- SOS package → `CoordinationBridgePort` + presence module.
+
+These examples define architectural placement, not shipped integration status.
+GitHub Projects is the working project-board reference. Linear and Notion are
+registered stubs. Buzz and SOS adapters are not implemented. The current add-on
+installer also accepts only native reviewed packages, so external/community
+packages remain an out-of-process future boundary.
+
+The kernel remains authoritative for identity, project/squad access, tasks,
+gates, flights, receipts, audit, and evidence. An adapter can transport,
+display, synchronize, or execute; it cannot mint authority or self-approve.
+Removing every adapter must leave kernel truth and recovery intact.
 
 ## Per-project concierge (the always-on dispatcher, CF-native)
 

@@ -10,7 +10,8 @@ import type {
 /**
  * Notion board adapter.
  * Credentials: connector type `notion` (vault). external_id = database id.
- * v1 surface is registered; import requires a pot-scoped Notion integration token.
+ * The v1 contract and registry surface are wired. Live database synchronization is not
+ * implemented; both operations return `notion_adapter_pending_credentials`.
  */
 export function createNotionBoardPort(_env: Env): TaskBoardPort {
   return {

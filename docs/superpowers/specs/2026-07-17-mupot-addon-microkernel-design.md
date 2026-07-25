@@ -41,6 +41,12 @@ Mupot's ports. An addon package describes a business capability installed in a p
 addon may later require a runtime capability, but it does not own or redefine agent
 onboarding or Cloudflare pub/sub.
 
+The 2026-07-25 typed add-on boundary further clarifies that one operator-facing Add-ons
+catalog may contain packages for different typed ports. Project-board, collaboration,
+coordination-bridge, runtime, workflow, and surface behavior keep separate contracts even
+when a package bundles more than one provision. See
+`2026-07-25-mupot-typed-addon-boundary-design.md`.
+
 ## 3. Approaches Considered
 
 ### 3.1 Add `mupotPortVersion` directly to `mupot.addon/v1`

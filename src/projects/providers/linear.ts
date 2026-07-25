@@ -10,7 +10,8 @@ import type {
 /**
  * Linear board adapter.
  * Credentials: connector type `linear` (vault). external_id = Linear team/project key.
- * v1 lists/syncs are wired; live GraphQL lands once a pot has a Linear connector bound.
+ * The v1 contract and registry surface are wired. Live GraphQL synchronization is not
+ * implemented; both operations return `linear_adapter_pending_credentials`.
  */
 export function createLinearBoardPort(_env: Env): TaskBoardPort {
   return {
