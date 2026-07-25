@@ -32,6 +32,7 @@ and the running product.
 | Self-hosted install | A new operator can deploy a pot into their own Cloudflare account and keep data in their account. | `docs/SELF-HOST.md`, `docs/production-runbook.md`, `scripts/setup.sh`, `wrangler.example.toml` |
 | Agent identity | Each agent has a durable identity separate from its runtime shell. | `docs/agent-running-on-mupot.md`, `fleet_agents`, `agent_keys`, member/capability tests |
 | Runtime adapters | Hermes, Codex, Claude Code, and custom workers can attach through a stable contract. | `docs/runtime-adapter-contract.md`, `docs/runtime-adapter-v1.json`, `scripts/local-runtime-conformance.mjs`, `connectors/`, signed attach flow |
+| Shared human-agent room | Authorized humans and agents can collaborate in one Project timeline, convert conversation into governed work, and replace the transport without replacing Mupot authority. | `ROADMAP.md` v0.25, `docs/superpowers/specs/2026-07-25-mupot-typed-addon-boundary-design.md`, native message/presence/task/receipt substrate |
 | Scoped authority | Every sensitive action is guarded by role and capability checks. | `docs/security-model.md`, `src/auth/`, `tests/*capability*`, `tests/*gate*` |
 | Work lifecycle | Work has a predictable state path from request to claim to result to verification. | task, gate, loop, workflow, and GitHub integration tests |
 | Approval gates | Customer-facing or high-risk actions wait for accountable approval. | `/approvals`, gated loops, gate protocol docs |
@@ -105,9 +106,13 @@ Goal: make adding a new worker boring and predictable.
 
 - Freeze an agent runtime adapter contract. The current documented contract is
   `runtime-adapter/v1` in `docs/runtime-adapter-contract.md`.
+- Freeze minimum `CollaborationPort` and `CoordinationBridgePort` contracts so a
+  native Project Squad Room, SOS compatibility bridge, and later Buzz/community
+  adapters share authorization, correlation, receipt, and failure semantics.
 - Standardize agent message envelopes, task lifecycle states, result receipts,
   retries, idempotency keys, and error codes.
-- Add conformance tests for runtime adapters and webhooks.
+- Add conformance tests for runtime, collaboration, coordination-bridge, and
+  webhook adapters.
 - Add templates for common worker roles: builder, reviewer, operator, brain,
   channel worker, and integration worker.
 - Make event replay/debug views available for failed or disputed work.
@@ -168,6 +173,8 @@ These buckets should map to GitHub labels and milestones:
 - `testing`: browser workflows, local smoke harness, adapter conformance
 - `docs`: README, operator runbooks, architecture, commercial licensing
 - `integrations`: GitHub, GHL, channels, future CRM/content systems
+- `collaboration`: Project Squad Room, SOS bridge, Buzz, presence, correlation
+- `addons`: typed ports, package lifecycle, SDK, conformance, managed operation
 
 ## Definition of Done for the North Star
 

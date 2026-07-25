@@ -311,8 +311,13 @@ until real external evidence exists.
 
 ## 9. Release and Commercial Boundary
 
-This design does not move work into v0.24. Any implementation requires its own
-milestone assignment under the roadmap's “one release, one promise” rule.
+This design does not move work into v0.24. The canonical roadmap assigns the
+minimum first-party Mupot Squad Room, `CollaborationPort`, and SOS-backed
+`CoordinationBridgePort` compatibility slice to v0.25. It assigns the public
+adapter SDK, conformance suite, Buzz reference add-on, and managed bridge
+operation to v0.29. Those assignments preserve the roadmap's “one release, one
+promise” rule and do not make live Linear or Notion synchronization a v0.25
+promise.
 
 The commercial boundary remains:
 
@@ -320,8 +325,8 @@ The commercial boundary remains:
 - operators may install their own compatible adapters;
 - `mupot.mumega.com` can monetize managed hosting, connector operation,
   upgrades, health, support, and operated presence;
-- a future managed Buzz relay or managed bridge is an operated service, not a
-  reason to make the core dependent on Buzz or SOS.
+- the v0.29 managed Buzz relay or managed coordination bridge is an operated
+  service, not a reason to make the core dependent on Buzz or SOS.
 
 ## 10. Acceptance Criteria for a Future Implementation Plan
 

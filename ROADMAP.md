@@ -10,7 +10,7 @@ numbers.
 |---|---|---|
 | Stable release | `v0.23.0` | Trusted Runtime. This is the latest tagged release and the version reported by `https://mupot.mumega.com/health` on 2026-07-19. |
 | Development target | `v0.24.0` | Project Operations. Post-`v0.23.0` Project, addon, Project Link, and Agent Host work belongs to this release until its gate passes. |
-| Next planned | `v0.25.0` | Project Routines, Needs You, and Console Consolidation. |
+| Next planned | `v0.25.0` | Project Routines, Needs You, Squad Room, and Console Consolidation. |
 
 Code merged or deployed after `v0.23.0` is not retroactively part of `v0.23.0`.
 Until `v0.24.0` ships, those capabilities are preview behavior and must not be
@@ -168,10 +168,10 @@ Release gate:
 - one authorized cross-pot Project Link flight succeeds and unauthorized variants fail;
 - no unresolved P0/P1 finding in the release scope.
 
-### v0.25.0: Project Routines and Needs You - planned
+### v0.25.0: Project Routines, Needs You, and Squad Room - planned
 
-**One promise:** A Project can run saved work on schedule and place every human
-decision in one understandable queue.
+**One promise:** A Project can run saved work on schedule and bring its humans,
+agents, conversation, and decisions into one understandable operating room.
 
 Must ship:
 
@@ -183,6 +183,28 @@ Must ship:
 - Needs You projection over approvals, blocked questions, outputs, budget decisions,
   and reviewed changes;
 - Project Activity and Evidence include routine fires, skips, failures, and outcomes.
+
+**Also ship — seamless human-agent collaboration.** The Project Squad Room is the
+first-party collaboration surface over native Mupot identity, messages, presence,
+tasks, gates, and receipts. It preserves the shared-team experience currently
+provided by SOS without making SOS a kernel dependency.
+
+- one Project-scoped room timeline for authorized humans and agents, with stable
+  message/reply correlation, presence, explicit delivery state, and deep links to
+  the originating task, flight, gate, or receipt;
+- an authorized message-to-work action that creates a native Task or gate request;
+  chat remains conversation until that explicit conversion occurs;
+- a versioned minimum `CollaborationPort` with a first-party Mupot room adapter;
+- a versioned minimum `CoordinationBridgePort` with SOS as the first compatibility
+  adapter for send, inbox, wake, roster/presence, acknowledgements, and correlation;
+- Mupot remains the authority for identity, membership, capabilities, Project access,
+  work state, verdicts, receipts, and evidence; bridge disagreement is surfaced,
+  never silently resolved in the external system's favor;
+- stopping or removing SOS leaves native Mupot login, authorization, room history,
+  work, inbox, gates, receipts, and recovery operational.
+
+Typed boundary and trust rules:
+[2026-07-25-mupot-typed-addon-boundary-design.md](docs/superpowers/specs/2026-07-25-mupot-typed-addon-boundary-design.md).
 
 **Also ship — Console consolidation (the Project pivot's navigation consequence).**
 Adding Project as the center made much of the current navigation redundant,
@@ -208,14 +230,28 @@ Activation:
 - Routine service and Needs You view: default-on.
 - Each Routine: disabled until an authorized human enables it.
 - External writes: approval required unless a narrow policy explicitly allows them.
+- Project Squad Room and first-party Mupot room adapter: default-on for authorized
+  Project members after the release gate.
+- SOS coordination bridge: owner opt-in, independently revocable, and never required
+  for pot boot or recovery.
 - Console consolidation: default-on; every remaining sidebar entry renders real,
   current data or is removed (no dead menu items ships).
 
 Not in `v0.25.0`: event/webhook/alarm triggers, session reuse, model routing,
-per-flight sandboxes, or self-modifying skills.
+per-flight sandboxes, self-modifying skills, a public third-party adapter SDK,
+managed Buzz relay, or live Linear/Notion synchronization.
 
 Release-gate additions (console): no sidebar entry points at a stub or a duplicate
 route; no working page is reachable by URL only; retired routes 301 to their new home.
+
+Release-gate additions (collaboration):
+
+- one human and two distinct agent runtimes exchange Project-correlated messages in
+  one Squad Room and convert one authorized message into gated, receipted work;
+- duplicate, replayed, unsigned, cross-tenant, and unauthorized bridge operations
+  fail closed with observable reasons;
+- disabling the SOS bridge preserves the native room timeline and completes the same
+  native Mupot send, inbox, wake, task, gate, and receipt workflow without SOS.
 
 ### v0.26.0: Governed Tools and Marketing/CRO Pilot - planned
 
@@ -351,6 +387,16 @@ Must ship:
 - guided self-host install and upgrade for Cloudflare plus supported Agent Hosts;
 - deterministic backup, export, restore, rollback, and audit export;
 - addon/package compatibility, marketplace distribution, and signed distribution receipts;
+- a public, versioned adapter SDK and conformance suite for `ProjectBoardPort`,
+  `CollaborationPort`, `CoordinationBridgePort`, runtime, workflow, and surface
+  provisions, including honest unsupported-capability reporting;
+- independently authorized multi-adapter packages, with connector sealing, binding
+  generations, health, evidence, disable/archive fencing, and no raw credential
+  exposure to community package code;
+- Buzz as the reference collaboration add-on for rooms, threads, reactions, and DMs,
+  without making Buzz the source of Mupot identity, authorization, work, or evidence;
+- managed connector, collaboration-relay, and coordination-bridge operation on
+  `mupot.mumega.com`, while compatible self-hosted/community adapters remain usable;
 - clear non-commercial, evaluation, and commercial licensing paths;
 - managed-support boundaries, entitlement hooks, and operator documentation;
 - onboarding and billing proof for the first external design partner;
@@ -367,6 +413,10 @@ Activation:
 
 - Guest credential + presence metering: owner opt-in per visiting engagement,
   fail-closed, and revocable at any instant by the pot owner.
+- Community adapters: owner-installed and disabled by default until every requested
+  provision, connector, scope, and binding is explicitly authorized.
+- Managed Buzz relay and managed coordination bridges: operator opt-in; paid operation
+  may cover hosting, upgrades, health, support, and SLA, never exclusive core features.
 - Operated Presence guest trust boundary is a mandatory dual-vendor adversarial gate
   before any external customer engagement.
 
@@ -393,6 +443,8 @@ study. Feature count alone cannot satisfy the GA gate.
 | Mac/Kubernetes Agent Host | `v0.24.0` | Opt-in per host/profile |
 | Routines and RoutineRun | `v0.25.0` | Each Routine explicitly enabled |
 | Needs You review inbox | `v0.25.0` | Default-on projection |
+| Project Squad Room + first-party Mupot room adapter | `v0.25.0` | Default-on for authorized Project members |
+| SOS coordination bridge | `v0.25.0` | Owner opt-in; independently revocable |
 | Console consolidation (project-centered nav) | `v0.25.0` | Default-on; no dead/duplicate/orphan menus |
 | Governed connector actions | `v0.26.0` | Connector and grant required |
 | Unified principals + token-scoped access | `v0.26.0` | Additive migration; implicit full-ceiling grant until scoped |
@@ -400,6 +452,8 @@ study. Feature count alone cannot satisfy the GA gate.
 | Isolated Agent Computers | `v0.27.0` | Initially opt-in |
 | Reviewed knowledge and coherence evaluation | `v0.28.0` | Promotion gated |
 | Commercial installation and operations | `v0.29.0` | License/entitlement dependent |
+| Public adapter SDK + conformance suite | `v0.29.0` | Public; packages owner-installed and fail-closed |
+| Buzz collaboration add-on + managed bridge operation | `v0.29.0` | Adapter opt-in; managed operation service-gated |
 | Operated Presence (metered guest check-in/out) | `v0.29.0` | Owner opt-in per engagement, fail-closed, revocable |
 | Commercial tiers and support entitlements | `v0.29.0` | Payment-gated support; free = public updates only |
 | Governed business loop GA | `v1.0.0` | Stable supported product |
