@@ -257,8 +257,14 @@ export RESTORE_CONFIG="wrangler.${POT}.restore.toml"
 cp "$CONFIG" "$RESTORE_CONFIG"
 # Edit RESTORE_CONFIG: database_name = "$RESTORE_DB" and database_id = "<new id>"
 npx wrangler d1 execute "$RESTORE_DB" --remote --config "$RESTORE_CONFIG" --file "$BACKUP_DIR/d1.sql" --yes
-npx wrangler deploy --config "$RESTORE_CONFIG" --message "restore ${POT} D1 from ${BACKUP_DIR}"
+node scripts/deploy.mjs --config "$RESTORE_CONFIG" --message "restore ${POT} D1 from ${BACKUP_DIR}"
 ```
+
+Restore deploys go through `scripts/deploy.mjs`, never a bare `wrangler deploy`
+(mupot#443/#571) — a restored pot must be stamped with the same exact-commit
+`RELEASE_SHA` as any other deploy, or the restored pot silently reports
+`commit: null` (or a stale stamp from before the restore) and the staleness
+detector cannot see it.
 
 Restore R2 from the whole-bucket backup:
 

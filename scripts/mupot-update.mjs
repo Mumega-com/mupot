@@ -19,7 +19,7 @@ import { readFileSync, copyFileSync, rmSync, readdirSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
-import { isFullSha, releaseShaDeployArgs } from './lib/release-sha.mjs'
+import { isFullSha, isMainDescendant, releaseShaDeployArgs } from './lib/release-sha.mjs'
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DESTRUCTIVE = /\bDROP\s+TABLE\b|\bDROP\s+COLUMN\b|\bDELETE\s+FROM\b|\bTRUNCATE\b|\bRENAME\s+TO\b/i
@@ -59,7 +59,12 @@ function gitState() {
   const sha = (sh('git', ['rev-parse', '--short', 'HEAD']).stdout || '').trim()
   const fullSha = (sh('git', ['rev-parse', 'HEAD']).stdout || '').trim()
   const dirty = ((sh('git', ['status', '--porcelain']).stdout || '').trim().length) > 0
-  return { branch, sha, fullSha, dirty }
+  // mupot#571: "on main" means descended-from main, not merely a local branch
+  // named "main" — checked against real ancestry so the RELEASE_SHA stamp
+  // (below) can never claim clean for an unverifiable or off-main HEAD.
+  const onMain = isFullSha(fullSha) && isMainDescendant(fullSha, { cwd: REPO })
+  const clean = !dirty && onMain
+  return { branch, sha, fullSha, dirty, onMain, clean }
 }
 const GIT = gitState()
 
@@ -214,7 +219,7 @@ for (const e of pf) {
       })
       if (m.status !== 0) return { ok: false, step: 'migrations' }
     }
-    const d = sh('npx', ['wrangler', 'deploy', ...cfg, ...releaseShaDeployArgs(GIT.fullSha)], {
+    const d = sh('npx', ['wrangler', 'deploy', ...cfg, ...releaseShaDeployArgs(GIT.fullSha, { clean: GIT.clean })], {
       stdio: ['ignore', 'inherit', 'inherit'],
     })
     if (d.status !== 0) return { ok: false, step: 'deploy' }
@@ -227,11 +232,25 @@ for (const e of pf) {
   try {
     const res = await fetch(pot.health, { signal: AbortSignal.timeout(12000) })
     const body = await res.json().catch(() => ({}))
-    e.status = res.ok && body.ok ? 'updated' : 'deployed_unhealthy'
-    e.health = `${res.status} tenant=${body.tenant ?? '?'}`
+    // mupot#571: a 2xx HTTP response is not enough — require the app-level
+    // `ok:true` AND that the health body actually names THIS pot's tenant.
+    // A misrouted deploy (wrong config, wrong DNS/route) can return a
+    // perfectly healthy-looking response for a DIFFERENT tenant; comparing
+    // only res.ok would report that as "updated".
+    const expectedTenant = pot.tenant ?? pot.slug
+    if (!res.ok) {
+      e.status = 'deployed_unhealthy'
+    } else if (body.ok !== true) {
+      e.status = 'deployed_unhealthy'
+    } else if (body.tenant !== expectedTenant) {
+      e.status = 'deployed_wrong_tenant'
+    } else {
+      e.status = 'updated'
+    }
+    e.health = `${res.status} tenant=${body.tenant ?? '?'} (expected ${expectedTenant})`
   } catch {
     e.status = 'deployed_health_unreachable'
   }
 }
 printReport('APPLY · DONE')
-process.exit(pf.some((e) => /FAILED|unhealthy|unreachable/.test(e.status)) ? 1 : 0)
+process.exit(pf.some((e) => /FAILED|unhealthy|unreachable|wrong_tenant/.test(e.status)) ? 1 : 0)

@@ -25,12 +25,24 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+      # mupot#571: pin explicitly to the exact commit GitHub resolved for
+      # this event (github.sha) rather than relying on checkout's implicit
+      # default — a workflow_dispatch can be run against ANY branch/ref
+      # picked in the UI, so the ref actually built must never be assumed.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
       - name: Compare live pots vs main HEAD
+        env:
+          # GITHUB_REF_NAME is already set by Actions for every event
+          # (schedule AND workflow_dispatch); passed through explicitly so
+          # the report names the REAL ref, never an assumed "main" — see
+          # scripts/staleness-check.mjs formatReport (mupot#571).
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           node scripts/staleness-check.mjs | tee -a "$GITHUB_STEP_SUMMARY"
