@@ -56,6 +56,7 @@ import { coordinationApp } from './coordination/routes'
 import { addonsApp } from './addons/routes'
 import { projectLinkApp } from './addons/project-link/routes'
 import { presenceApp } from './registry/presence-routes'
+import { workflowInboundApp } from './workflows/inbound-routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -155,6 +156,11 @@ app.route('/api/project-links', projectLinkApp)
 // daemon. Member-bearer auth, self-scoped for the mutating tools (MCP only — this
 // route is read-only). Before the dashboard '/' catch-all.
 app.route('/api/presence', presenceApp)
+
+// Module Kernel Port 5: signed source-only ingress from external workflow managers
+// (n8n/zapier/make). External managers never hold approval — inbound creates an
+// open observability task only. Before the dashboard '/' catch-all.
+app.route('/api/integrations/workflow', workflowInboundApp)
 
 // ── OAuth 2.1 authorize leg (C3) ─────────────────────────────────────────────
 // /authorize and /oauth/google-callback must be mounted BEFORE the dashboardApp
