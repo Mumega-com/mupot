@@ -144,13 +144,79 @@ export type DistillEligibility =
         | 'missing_receipt_id'
         | 'unverified_receipt'
         | 'insufficient_corroboration'
+        | 'unknown_store'
+        | 'source_kind_mismatch'
     }
 
-export interface DistillReceiptRef {
-  /** Store primary key — trust object is the record, not the label. */
+/**
+ * Opaque trust object — cannot be built by setting a boolean on a plain bag.
+ * Only `verifiedReceiptRefFromStoreLookup` may construct it.
+ */
+export type VerifiedReceiptRef = {
+  readonly _brand: 'VerifiedReceiptRef'
+  readonly receiptId: string
+  readonly sourceKind: DistillSource
+  readonly corroboratingReceiptIds: readonly string[]
+  readonly store: 'gate_driver' | 'frc'
+}
+
+/** Result shape a real Port-4 / FRC lookup must return before distill is allowed. */
+export interface ReceiptStoreLookupHit {
+  found: true
   receiptId: string
   sourceKind: string
-  /** Caller must have verified the ID against gate-driver/FRC store. */
+  store: 'gate_driver' | 'frc'
+  /** Additional receipt IDs that corroborate (may include self). */
+  corroboratingReceiptIds: readonly string[]
+}
+
+export type ReceiptStoreLookupMiss = { found: false; receiptId: string }
+
+export type ReceiptStoreLookup = ReceiptStoreLookupHit | ReceiptStoreLookupMiss
+
+/**
+ * Sole constructor for VerifiedReceiptRef. A plain `{verifiedAgainstStore:true}`
+ * bag is not accepted anywhere — that was rename-not-fix.
+ */
+export function verifiedReceiptRefFromStoreLookup(
+  lookup: ReceiptStoreLookup,
+): VerifiedReceiptRef | DistillEligibility {
+  if (!lookup.found) {
+    return { ok: false, reason: 'unverified_receipt' }
+  }
+  if (!lookup.receiptId || !String(lookup.receiptId).trim()) {
+    return { ok: false, reason: 'missing_receipt_id' }
+  }
+  if (lookup.store !== 'gate_driver' && lookup.store !== 'frc') {
+    return { ok: false, reason: 'unknown_store' }
+  }
+  const kindGate = mayDistillFromSource(lookup.sourceKind)
+  if (!kindGate.ok) return kindGate
+  if (!(DISTILL_ALLOWED_SOURCES as readonly string[]).includes(lookup.sourceKind)) {
+    return { ok: false, reason: 'source_kind_mismatch' }
+  }
+  const ids = new Set(
+    [lookup.receiptId, ...lookup.corroboratingReceiptIds]
+      .map((id) => String(id).trim())
+      .filter(Boolean),
+  )
+  if (ids.size < INJECT_MIN_CORROBORATING_RECEIPTS) {
+    return { ok: false, reason: 'insufficient_corroboration' }
+  }
+  return {
+    _brand: 'VerifiedReceiptRef',
+    receiptId: String(lookup.receiptId).trim(),
+    sourceKind: lookup.sourceKind as DistillSource,
+    corroboratingReceiptIds: [...ids],
+    store: lookup.store,
+  }
+}
+
+/** @deprecated Mechanism-lock label check — keep for inventory honesty; use VerifiedReceiptRef path. */
+export interface DistillReceiptRef {
+  receiptId: string
+  sourceKind: string
+  /** @deprecated Caller boolean — rejected by mayDistillFromReceiptRef. */
   verifiedAgainstStore: boolean
   corroboratingReceiptIds: readonly string[]
 }
@@ -243,20 +309,28 @@ export function mayDistillFromSource(source: string): DistillEligibility {
 }
 
 /**
- * Trust-lock: receipt ID + store verification + source kind + corroboration.
+ * Trust-lock: only branded VerifiedReceiptRef (from store lookup) may distill.
+ * Plain bags with verifiedAgainstStore boolean are rejected as unverified_receipt.
  */
-export function mayDistillFromReceiptRef(ref: DistillReceiptRef): DistillEligibility {
-  if (!ref.receiptId || !String(ref.receiptId).trim()) {
-    return { ok: false, reason: 'missing_receipt_id' }
-  }
-  if (!ref.verifiedAgainstStore) {
+export function mayDistillFromReceiptRef(
+  ref: VerifiedReceiptRef | DistillReceiptRef,
+): DistillEligibility {
+  if (!ref || typeof ref !== 'object') {
     return { ok: false, reason: 'unverified_receipt' }
   }
-  const kindGate = mayDistillFromSource(ref.sourceKind)
+  if (!('_brand' in ref) || ref._brand !== 'VerifiedReceiptRef') {
+    return { ok: false, reason: 'unverified_receipt' }
+  }
+  const branded = ref as VerifiedReceiptRef
+  if (!branded.receiptId || !String(branded.receiptId).trim()) {
+    return { ok: false, reason: 'missing_receipt_id' }
+  }
+  const kindGate = mayDistillFromSource(branded.sourceKind)
   if (!kindGate.ok) return kindGate
   const ids = new Set(
-    [ref.receiptId, ...ref.corroboratingReceiptIds].map((id) => String(id).trim()).filter(Boolean),
+    branded.corroboratingReceiptIds.map((id) => String(id).trim()).filter(Boolean),
   )
+  ids.add(String(branded.receiptId).trim())
   if (ids.size < INJECT_MIN_CORROBORATING_RECEIPTS) {
     return { ok: false, reason: 'insufficient_corroboration' }
   }

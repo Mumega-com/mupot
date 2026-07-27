@@ -39,6 +39,7 @@ import {
   selectStalenessEscalationIndices,
   shouldPromoteInstinct,
   textContainsForbiddenAction,
+  verifiedReceiptRefFromStoreLookup,
   warnForbiddenProseVerbs,
 } from '../src/brain/learning-ranker-contract'
 
@@ -168,42 +169,44 @@ describe('distill provenance (anti-fabrication trust-lock)', () => {
     })
   })
 
-  it('trust-lock: requires verified receipt id + corroboration', () => {
-    expect(
-      mayDistillFromReceiptRef({
-        receiptId: '',
-        sourceKind: 'fabrication_receipt',
-        verifiedAgainstStore: true,
-        corroboratingReceiptIds: ['a', 'b'],
-      }),
-    ).toEqual({ ok: false, reason: 'missing_receipt_id' })
-
+  it('trust-lock: branded VerifiedReceiptRef from store lookup only — boolean bag rejected', () => {
+    // Rename-not-fix shape: caller-set boolean must fail.
     expect(
       mayDistillFromReceiptRef({
         receiptId: 'r1',
         sourceKind: 'fabrication_receipt',
-        verifiedAgainstStore: false,
+        verifiedAgainstStore: true,
         corroboratingReceiptIds: ['r1', 'r2'],
       }),
     ).toEqual({ ok: false, reason: 'unverified_receipt' })
 
     expect(
-      mayDistillFromReceiptRef({
+      verifiedReceiptRefFromStoreLookup({
+        found: false,
         receiptId: 'r1',
-        sourceKind: 'fabrication_receipt',
-        verifiedAgainstStore: true,
-        corroboratingReceiptIds: ['r1'],
       }),
-    ).toEqual({ ok: false, reason: 'insufficient_corroboration' })
+    ).toEqual({ ok: false, reason: 'unverified_receipt' })
 
-    expect(
-      mayDistillFromReceiptRef({
-        receiptId: 'r1',
-        sourceKind: 'fabrication_receipt',
-        verifiedAgainstStore: true,
-        corroboratingReceiptIds: ['r2'],
-      }),
-    ).toEqual({ ok: true })
+    const weak = verifiedReceiptRefFromStoreLookup({
+      found: true,
+      receiptId: 'r1',
+      sourceKind: 'fabrication_receipt',
+      store: 'gate_driver',
+      corroboratingReceiptIds: ['r1'],
+    })
+    expect(weak).toEqual({ ok: false, reason: 'insufficient_corroboration' })
+
+    const hit = verifiedReceiptRefFromStoreLookup({
+      found: true,
+      receiptId: 'r1',
+      sourceKind: 'fabrication_receipt',
+      store: 'frc',
+      corroboratingReceiptIds: ['r2'],
+    })
+    expect(hit).toMatchObject({ _brand: 'VerifiedReceiptRef', receiptId: 'r1', store: 'frc' })
+    if ('_brand' in hit) {
+      expect(mayDistillFromReceiptRef(hit)).toEqual({ ok: true })
+    }
     expect(INJECT_MIN_CORROBORATING_RECEIPTS).toBe(2)
   })
 
