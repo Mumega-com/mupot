@@ -56,6 +56,8 @@ import { coordinationApp } from './coordination/routes'
 import { addonsApp } from './addons/routes'
 import { projectLinkApp } from './addons/project-link/routes'
 import { presenceApp } from './registry/presence-routes'
+import { routinesApp } from './routines/routes'
+import { attentionApp } from './attention/routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -66,7 +68,7 @@ export { TaskWorkflow } from './workflows/task-workflow'
 // OAuth API handler WorkerEntrypoint — referenced by the OAuthProvider's apiHandler.
 export { McpOAuthApiHandler }
 
-const app = new Hono<{ Bindings: Env }>()
+export const app = new Hono<{ Bindings: Env }>()
 
 app.get('/health', (c) => c.json(publicHealth(c.env.TENANT_SLUG, c.env.RELEASE_SHA)))
 
@@ -74,6 +76,10 @@ app.route(ROUTES.auth, authApp)
 app.route(ROUTES.org, orgApp)
 app.route(ROUTES.agents, agentsApp)
 app.route(ROUTES.tasks, tasksApp)
+// Exact Project Routine and Needs You endpoints must precede the Projects
+// wildcard middleware so session and member-bearer auth select here first.
+app.route('/api', routinesApp)
+app.route('/api', attentionApp)
 app.route(ROUTES.projects, projectsApp)
 // K3: gate grant management (owner/admin only)
 app.route('/api/gates', gatesApp)
@@ -229,6 +235,8 @@ import { runGrowthCollection } from './departments/collectors/growth-cron'
 import { runCroCollection } from './cro/collect'
 import { flushFlightEventOutbox } from './flight/service'
 import { sweepAgentConnectionRetention } from './members/agent-connection'
+import { runRoutineScheduler, shouldRunMaintenanceHeartbeat } from './routines/scheduler'
+import { dispatchRoutineRun } from './routines/dispatch'
 
 export default {
   // The OAuth provider is the outer entry point. It handles OAuth paths and
@@ -237,10 +245,31 @@ export default {
   fetch: (req: Request, env: Env, ctx: ExecutionContext) =>
     oauthProvider.fetch(req, env, ctx),
 
-  // Queue and scheduled handlers are preserved unchanged (spec §A.2).
+  // Queue delivery remains owned by the bus component.
   queue: handleQueue,
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Ten independent heartbeats on the same */15 cron:
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    const scheduledAt = new Date(controller.scheduledTime)
+    const waitFor = (label: string, work: Promise<unknown>) => {
+      ctx.waitUntil(work.catch((error) => {
+        console.error(`[scheduled:${label}]`, error)
+      }))
+    }
+
+    waitFor(
+      'project-routines',
+      runRoutineScheduler(
+        env,
+        scheduledAt,
+        `routine-cron:${scheduledAt.toISOString()}`,
+        async (runId) => {
+          const result = await dispatchRoutineRun(env, runId, scheduledAt)
+          if (!result.ok) throw new Error(`routine_dispatch:${result.error}`)
+        },
+      ),
+    )
+    if (!shouldRunMaintenanceHeartbeat(scheduledAt)) return
+
+    // Ten independent maintenance heartbeats in canonical 15-minute buckets:
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
     //     ("design loops, not prompts"; without this the v0.3.0 loop never fires).
@@ -269,15 +298,15 @@ export default {
     // 10. Agent-connection retention — expire abandoned reservations and
     //     verification challenges, then purge request/receipt rows at their
     //     fixed tenant-scoped retention boundaries. Fail-soft by contract.
-    ctx.waitUntil(reconcileMembership(env))
-    ctx.waitUntil(runMetabolism(env))
-    ctx.waitUntil(runLoopsTick(env))
-    ctx.waitUntil(syncGitHubProject(env).then(() => undefined))
-    ctx.waitUntil(runGrowthCollection(env))
-    ctx.waitUntil(runCroCollection(env).then(() => undefined))
-    ctx.waitUntil(flushFlightEventOutbox(env).then(() => undefined))
-    ctx.waitUntil(runConciergeTick(env).then(() => undefined))
-    ctx.waitUntil(runProjectLoopTick(env, {}).then(() => undefined))
-    ctx.waitUntil(sweepAgentConnectionRetention(env).then(() => undefined))
+    waitFor('membership', reconcileMembership(env))
+    waitFor('metabolism', runMetabolism(env))
+    waitFor('loops', runLoopsTick(env))
+    waitFor('github-project', syncGitHubProject(env))
+    waitFor('growth', runGrowthCollection(env))
+    waitFor('cro', runCroCollection(env))
+    waitFor('flight-outbox', flushFlightEventOutbox(env))
+    waitFor('concierge', runConciergeTick(env))
+    waitFor('project-loop', runProjectLoopTick(env, {}))
+    waitFor('agent-connection-retention', sweepAgentConnectionRetention(env))
   },
 }

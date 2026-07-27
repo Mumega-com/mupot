@@ -85,6 +85,7 @@ import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
 import { PRESENCE_TOOLS } from './presence'
+import { ROUTINE_TOOLS } from './routines'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -2737,6 +2738,7 @@ export const TOOLS: ToolSpec[] = [
   ...GATE_GRANT_TOOLS,
   ...LOOP_TOOLS,
   ...PRESENCE_TOOLS,
+  ...ROUTINE_TOOLS,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
