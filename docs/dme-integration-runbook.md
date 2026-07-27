@@ -52,7 +52,7 @@ On each Cloudflare account (or two local configs):
 npm install
 npx wrangler login
 scripts/provision-pot.sh "$POT"          # writes wrangler.$POT.toml + migrations
-npx wrangler deploy --config "wrangler.$POT.toml"
+node scripts/deploy.mjs --config "wrangler.$POT.toml"
 bash scripts/secrets.sh --pot "$POT"     # or --bootstrap-owner for first owner
 ```
 

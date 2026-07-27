@@ -8,7 +8,7 @@
     "brand:export": "node scripts/export-brand-assets.mjs",
     "dev": "wrangler dev",
     "dev:local:test": "wrangler dev --local --config wrangler-local-test.toml --port 8787",
-    "deploy": "wrangler deploy",
+    "deploy": "node scripts/deploy.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "migrate:local": "wrangler d1 migrations apply mupot --local",
