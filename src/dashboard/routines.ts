@@ -376,10 +376,10 @@ export function routineWorkspaceBody(view: RoutineWorkspaceView, options: { erro
     return [
       html`<span style="display:grid;gap:3px;"><a class="ui-link" href="${projectPath}/routines?routine_id=${encodeURIComponent(routine.id)}"><strong>${routine.name}</strong></a><span class="ui-panel-sub">${routine.trigger_kind} · ${routine.timezone}</span></span>`,
       pill(title(routine.status), routineTone(routine.status)),
-      html`<span>${formatLocal(routine.next_run_at, routine.timezone)}<span class="ui-panel-sub">Previous: ${current ? formatLocal(current.created_at, routine.timezone) : 'No run yet'}</span></span>`,
-      html`<span>${view.routineLabels.get(routine.responsible_squad_id) ?? routine.responsible_squad_id}<span class="ui-panel-sub">${routine.preferred_agent_id ? view.agentLabels.get(routine.preferred_agent_id) ?? routine.preferred_agent_id : 'No preferred agent'}</span></span>`,
-      html`<span>${routine.execution_mode.replace('_', ' ')}<span class="ui-panel-sub">${routine.budget_micro_usd} micro USD · retry ${routine.max_attempts}/${routine.retry_backoff_seconds}s · ${routine.overlap_policy}</span></span>`,
-      html`<span>${current ? pill(runState(current), runTone(current)) : pill(title(routine.status), routineTone(routine.status))}<span class="ui-panel-sub">${routineNextAction(routine, current)}</span></span>`,
+      html`<span class="routine-stack">${formatLocal(routine.next_run_at, routine.timezone)}<span class="ui-panel-sub">Previous: ${current ? formatLocal(current.created_at, routine.timezone) : 'No run yet'}</span></span>`,
+      html`<span class="routine-stack">${view.routineLabels.get(routine.responsible_squad_id) ?? routine.responsible_squad_id}<span class="ui-panel-sub">${routine.preferred_agent_id ? view.agentLabels.get(routine.preferred_agent_id) ?? routine.preferred_agent_id : 'No preferred agent'}</span></span>`,
+      html`<span class="routine-stack">${routine.execution_mode.replace('_', ' ')}<span class="ui-panel-sub">${routine.budget_micro_usd} micro USD · retry ${routine.max_attempts}/${routine.retry_backoff_seconds}s · ${routine.overlap_policy}</span></span>`,
+      html`<span class="routine-stack">${current ? pill(runState(current), runTone(current)) : pill(title(routine.status), routineTone(routine.status))}<span class="ui-panel-sub">${routineNextAction(routine, current)}</span></span>`,
       html`<div style="display:flex;gap:6px;flex-wrap:wrap;">
         ${nonce ? html`<form method="post" action="${projectPath}/routines/${encodeURIComponent(routine.id)}/run"><input type="hidden" name="nonce" value="${nonce}"><button class="btn secondary sm" type="submit">Run now</button></form>` : ''}
         ${view.canManage ? html`<a class="btn secondary sm" href="${projectPath}/routines?edit=${encodeURIComponent(routine.id)}">Edit</a>
@@ -390,11 +390,11 @@ export function routineWorkspaceBody(view: RoutineWorkspaceView, options: { erro
     ]
   })
   const runRows = view.runs.map(run => [
-    html`<span>${run.created_at}<span class="ui-panel-sub">${run.trigger_kind}</span></span>`,
+    html`<span class="routine-stack">${run.created_at}<span class="ui-panel-sub">${run.trigger_kind}</span></span>`,
     html`<a class="ui-link" href="${projectPath}/routines?run_id=${encodeURIComponent(run.id)}">${run.id}</a>`,
     pill(runState(run), runTone(run)),
-    html`<span>${run.assigned_agent_id ?? 'Unassigned'}<span class="ui-panel-sub">Attempt ${run.attempt}</span></span>`,
-    html`<span>${run.cost_micro_usd} micro USD<span class="ui-panel-sub">${run.result_summary ?? 'No terminal summary'}</span></span>`,
+    html`<span class="routine-stack">${run.assigned_agent_id ?? 'Unassigned'}<span class="ui-panel-sub">Attempt ${run.attempt}</span></span>`,
+    html`<span class="routine-stack">${run.cost_micro_usd} micro USD<span class="ui-panel-sub">${run.result_summary ?? 'No terminal summary'}</span></span>`,
     html`<div style="display:flex;gap:8px;flex-wrap:wrap;"><a class="ui-link" href="${projectPath}/routines?run_id=${encodeURIComponent(run.id)}#run-activity">Activity</a><a class="ui-link" href="${projectPath}/routines?run_id=${encodeURIComponent(run.id)}#run-evidence">Evidence</a>${view.canManage && !['succeeded', 'failed', 'skipped', 'cancelled'].includes(run.status) ? html`<form method="post" action="${projectPath}/routines/${encodeURIComponent(run.id)}/cancel"><button class="btn secondary sm" type="submit">Cancel</button></form>` : ''}</div>`,
   ])
   const eventRows = view.events.map(event => [

@@ -3355,6 +3355,9 @@ function shell(
       .routine-table .routine-cell {
         display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere;
       }
+      .routine-stack {
+        display: grid; gap: 3px; min-width: 0;
+      }
       .obs-queue-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
       @media (max-width: 720px) {
         .ui-tr.ui-hide-sm-3 > .ui-td:nth-child(n+4), .ui-tr.ui-hide-sm-3 > .ui-th:nth-child(n+4) { display: none; }
