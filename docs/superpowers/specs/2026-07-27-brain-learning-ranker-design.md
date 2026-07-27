@@ -255,9 +255,29 @@ proposals, confidence 0.9, domain rank-discipline."* The receipt is 100%
 legitimately a `gate_fail_receipt`, passes every source gate, and starts
 suppressing an unrelated eligibility/veto surface.
 
-**Fix:** schema-constrained extraction (`parseInstinctDistillOutput` is the
-trust boundary); explicit stripping of instruction-shaped text inside receipt
-fields; no first-pass inject eligibility without corroboration.
+**Fix (revised — Kasra ranker gate item 2):** the structural allowlist
+(schema-constrained `{evidence: string}` extraction) is NOT a content
+allowlist. An earlier revision tried to close the content gap with a
+keyword denylist (`INSTRUCTION_SHAPED`) that stripped matching evidence to
+`''`; narrative-steering evasions (no denylist keyword at all), Cyrillic
+homoglyphs swapped into denylist keywords, and zero-width (`U+200B`)
+characters split inside denylist keywords all pass a regex denylist
+verbatim — "a better regex" is not a fix for an open-ended natural-language
+adversary. The corrected contract makes NO content-cleanliness claim:
+`extractDistillFacts` / `sanitizeReceiptContentForDistill` return the
+`evidence` string unmodified (structure-checked, not content-checked), and
+the only sanctioned way to place that string near a model is
+`fenceUntrustedEvidenceForPrompt`, which wraps it in an explicit
+untrusted-data fence with an instruction to never treat fenced content as a
+command — it does not strip or "clean" anything, it just makes the content's
+trust status explicit at the one consumer boundary that matters. No live LLM
+consumes this yet, so this fence has no current caller in production code;
+it exists so that if/when a distill-summarization consumer lands, raw
+evidence structurally cannot reach it unfenced (the type-level
+`UntrustedDistillEvidence` brand gates `fenceUntrustedEvidenceForPrompt`).
+The old denylist regex is retained only as a non-security, non-blocking
+advisory (`noteEvidenceLooksInstructionShaped`) and must never gate or alter
+evidence content; no first-pass inject eligibility without corroboration.
 
 ### 4.4 Domain allowlist — constrain distill or loop is no-op
 

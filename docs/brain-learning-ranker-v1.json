@@ -139,7 +139,7 @@
     "receiptResolution": "unexported-unique-symbol-VerifiedReceiptRef-only-from-injected-ReceiptStoreResolver-with-resolved-content-boolean-bag-rejected",
     "corroborationRequiredBeforeInject": true,
     "corroborationIndependence": "distinct-agentId-OR-distinct-incidentId-string-diversity-structural-limit-full-independence-needs-store",
-    "contentSanitization": "schema-constrained-JSON-evidence-field-only-discard-rest-prefix-lines-empty",
+    "contentSanitization": "structural-allowlist-only-JSON-evidence-field-shape-not-a-content-allowlist-see-fenceUntrustedEvidenceForPrompt",
     "verifiedReceiptProvenance": "WeakSet-registry-plus-unexported-unique-symbol-Object.freeze-mint-only",
     "parseIsTrustBoundary": true,
     "allowedSources": [
@@ -156,7 +156,15 @@
     "runsOnHotPath": false,
     "domainOutput": "must-map-to-instinct.allowedDomains-or-no-op-loop",
     "verifiedReceiptConstructor": "verifiedReceiptRefFromResolver",
-    "trustBoundary": "injected-ReceiptStoreResolver-like-Port4-InstinctChat"
+    "trustBoundary": "injected-ReceiptStoreResolver-like-Port4-InstinctChat",
+    "contentTrustBoundary": "consumer-inert-fence-not-content-denylist",
+    "untrustedEvidenceApi": {
+      "brand": "UntrustedDistillEvidence",
+      "constructor": "asUntrustedDistillEvidence",
+      "onlyPromptAdjacentPath": "fenceUntrustedEvidenceForPrompt",
+      "typedFactExtractor": "extractTypedFactsFromEvidence-returns-empty-allowlisted-bag-never-free-text",
+      "note": "regex denylist (INSTRUCTION_SHAPED) demoted to non-security soft note (noteEvidenceLooksInstructionShaped); narrative-steering/homoglyph/zero-width evasions defeat any keyword filter, so evidence is made inert by fencing, never by stripping"
+    }
   },
   "recallInstincts": {
     "signature": "recallInstincts(store: InstinctReadPort, opts: RecallInstinctsOpts): Promise<RecallInstinctsResult>",
@@ -212,14 +220,14 @@
     "optional-hermes-runtime"
   ],
   "acceptance": {
-    "testCount": 21,
+    "testCount": 25,
     "mechanismLockNeTrustLock": {
       "name": "mechanism-lock-ne-trust-lock",
       "description": "tests that lock a mechanism but not the trust it depends on — mayDistillFromSource enum fence is canonical example",
       "structuralLimitation": "no-contract-test-can-prove-port4-is-wired"
     },
     "testInventory": {
-      "note": "updated after 3913d314 adversarial — BLOCK-B/C cleared; trust-lock tests now refuse boolean bags and denylist evasions; staleness wired",
+      "note": "updated for Kasra ranker gate item 2 — INSTRUCTION_SHAPED denylist demoted from security claim; consumer-inert fence (fenceUntrustedEvidenceForPrompt) added; reproduce-and-refuse suite locks E/H/F/J evasions (narrative-steering/homoglyph/zero-width) pass structural allowlist verbatim and are made inert only at the fence",
       "contractDoc": {
         "count": 3,
         "catches": "json-ts-drift",
@@ -234,6 +242,11 @@
         "count": 3,
         "catches": "resolver-brand-independence-schema-allowlist",
         "misses": "production-store-wiring"
+      },
+      "untrustedEvidenceFence": {
+        "count": 4,
+        "catches": "structural-allowlist-accepts-content-verbatim-fence-wraps-without-claiming-sanitized-no-safe-string-api-forged-non-branded-input-refused",
+        "misses": "no-live-llm-consumer-wired-yet"
       },
       "instinctGate": {
         "count": 5,
