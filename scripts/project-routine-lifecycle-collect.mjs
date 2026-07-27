@@ -718,7 +718,7 @@ async function collectLifecycle(config, deps, secretValues) {
   }
   const approvalEvidence = {
     needs_you_visible: true,
-    needs_you_item_id: need.id,
+    needs_you_item_id: need.source_id,
     verdict: approval.verdict,
     action_kind: proposal.action.kind,
     action_scope: 'internal_only',
@@ -820,7 +820,7 @@ async function collectLifecycle(config, deps, secretValues) {
       'browser',
       observedAt,
       {
-        needs_you_item_id: need.id,
+        needs_you_item_id: need.source_id,
         task_id: controlTaskId,
         verdict: approval.verdict,
         action_kind: proposal.action.kind,
@@ -894,7 +894,7 @@ async function collectLifecycle(config, deps, secretValues) {
       situation_digest_challenge_rejected: true,
     }, [observationReference('runtime_proposal', 'runtime proposal observation')], observedAt)],
     ['needs-you-approval.json', stepReceipt('needs_you_approval', target, {
-      needs_you_item_id: need.id,
+      needs_you_item_id: need.source_id,
       human_approval_recorded: true,
       internal_action_gated: true,
       internal_action_executed: true,

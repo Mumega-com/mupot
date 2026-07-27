@@ -188,7 +188,6 @@ function dependencies(overrides: Record<string, unknown> = {}) {
           status: 200,
           result: {
             items: [{
-              id: 'attention-1',
               source_type: 'task',
               source_id: 'control-task',
               project_id: 'project-main',
@@ -388,13 +387,18 @@ describe('project routine lifecycle collector', () => {
     })
     expect(writes.get('artifacts/needs-you-approval.json')).toMatchObject({
       data: {
+        needs_you_item_id: 'control-task',
         approval: {
           needs_you_visible: true,
+          needs_you_item_id: 'control-task',
           verdict: 'approved',
           action_exactly_once: true,
           duplicate_replay: true,
         },
       },
+    })
+    expect(writes.get('needs-you-approval.json')).toMatchObject({
+      evidence: { needs_you_item_id: 'control-task' },
     })
     expect(writes.get('artifacts/collector-summary.json')).toEqual(result)
 
@@ -586,7 +590,7 @@ describe('collector CLI', () => {
                 ok: true, result: { project: { id: config.projectId, status: 'active' }, situation }
               }
               if (tool === 'needs_you_list') return {
-                ok: true, result: { items: [{ id: 'need-cli', source_type: 'task', source_id: 'task-cli' }] }
+                ok: true, result: { items: [{ source_type: 'task', source_id: 'task-cli' }] }
               }
               if (token === 'wrong-cli-secret') return {
                 ok: false, status: 403, error: 'assigned_agent_mismatch'
