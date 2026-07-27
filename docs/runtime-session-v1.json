@@ -1,0 +1,122 @@
+{
+  "id": "mupot.runtime-session/v1",
+  "status": "proposed-unimplemented",
+  "dependsOn": ["runtime-adapter/v1"],
+  "envelope": {
+    "schema": "mupot.runtime-session/v1",
+    "tenant": "env.TENANT_SLUG-always-server-derived-never-client-asserted",
+    "observation_id": "adapter-supplied-idempotency-key",
+    "session_id": "null-on-first-observation-then-mupot-minted-and-echoed",
+    "source_id": "harness-local-stable-id-opaque-to-mupot",
+    "worker_id": "optional-sub-unit-id-for-fanout-adapters",
+    "seq": "monotonic-per-session-int",
+    "observed_at": "rfc3339",
+    "emitted_at": "rfc3339"
+  },
+  "identity": {
+    "agentIdSource": "durable-agents-table-row-never-adapter-minted",
+    "sessionIdSource": "mupot-minted-once-per-tenant-adapter-source_id-triple",
+    "sourceIdSource": "adapter-supplied-opaque-harness-local-id",
+    "dedupeKey": ["tenant", "adapter", "source_id"],
+    "sessionAgentRelationship": "one-agent-id-to-many-concurrent-session-ids",
+    "rollupPolicy": "read-time-aggregate-over-open-sessions-never-a-second-mutable-row"
+  },
+  "body": {
+    "adapter": "implementation-id-e.g.-codex-cli-driver-v1",
+    "runtime": ["codex", "cursor", "claude-code", "hermes", "tmux", "dmux", "systemd-user", "python"],
+    "agent_id": "string-or-null",
+    "identity_mapping": {
+      "status": ["unmapped", "mapped", "ambiguous", "revoked"],
+      "mapped_agent_id": "optional",
+      "mapped_by_member_id": "optional",
+      "mapped_at": "optional-rfc3339",
+      "method": "optional"
+    },
+    "context": {
+      "repo": "optional",
+      "branch": "optional",
+      "worktree_path": "optional",
+      "host": "optional",
+      "pid": "optional"
+    },
+    "objective": "optional-string",
+    "linked": {
+      "task_id": "optional-validated-read-only-reference",
+      "flight_id": "optional-validated-read-only-reference",
+      "project_id": "optional-validated-read-only-reference"
+    },
+    "owned_paths": ["optional-string-array"],
+    "activity": {
+      "last_observed_at": "rfc3339",
+      "last_signal_kind": "string-e.g.-log-line-webhook-file-mtime"
+    },
+    "liveness": {
+      "status": ["verified", "unverified", "unknown"],
+      "verified_at": "optional-rfc3339",
+      "verified_by_method": "optional-e.g.-signed-attach-bearer-checkin-vendor-api-poll-hmac-webhook"
+    },
+    "state": {
+      "lifecycle": ["attaching", "active", "idle", "stale", "detached", "unavailable"],
+      "health": ["ok", "degraded", "blocked", "unknown"]
+    },
+    "provenance": {
+      "source_target": "string-e.g.-sos-bus-codex-app-server-api-tmux-local-daemon-cursor-webhook",
+      "adapter_version": "string",
+      "observed_at": "rfc3339"
+    },
+    "report": {
+      "summary": "optional-string",
+      "validation_performed": ["optional-string-array"],
+      "artifacts": ["optional-uri-array"],
+      "remaining_risks": ["optional-string-array"]
+    },
+    "source": {
+      "target": "string",
+      "adapter_version": "string"
+    }
+  },
+  "invariants": {
+    "adapterCannotMutate": [
+      "agents",
+      "agent_member_bindings",
+      "tasks.status",
+      "task_verdicts",
+      "flights.status",
+      "project_squad_access",
+      "capability-grants"
+    ],
+    "activityNeverImpliesLiveness": true,
+    "reportNeverImpliesCompletion": true,
+    "unresolvableLinkedRefDroppedNotTrusted": true
+  },
+  "errors": {
+    "unauthorized": "same-meaning-as-runtime-adapter-v1",
+    "forbidden": "same-meaning-as-runtime-adapter-v1",
+    "bad_request": "malformed-envelope-or-body",
+    "observation_conflict": "observation_id-reused-with-different-payload",
+    "session_agent_mismatch": "echoed-session_id-belongs-to-a-different-agent_id",
+    "identity_unmapped": "stored-but-only-visible-in-unmapped-runtimes-queue",
+    "stale_reference": "linked-task-or-flight-id-did-not-resolve-or-is-not-visible",
+    "cross_tenant_denied": "signature-or-token-tenant-mismatch-with-observation-tenant"
+  },
+  "readModel": {
+    "runtime_sessions": "one-row-per-session_id-latest-projection-only",
+    "runtime_session_observations": "append-only-log-one-row-per-accepted-observation_id",
+    "runtime_session_identity_map": "pending-mapped-rejected-queue-for-unmapped-external-identities"
+  },
+  "conformance": {
+    "planned": [
+      "malformed-observation-envelope",
+      "oversized-observation-payload",
+      "stale-activity-vs-verified-liveness",
+      "replay-same-observation_id-identical-payload",
+      "replay-same-observation_id-different-payload",
+      "out-of-order-seq-does-not-regress-projection",
+      "cross-tenant-isolation",
+      "unmapped-identity-routed-to-queue-never-auto-bound",
+      "session_agent_mismatch-refusal",
+      "adapter-outage-core-project-view-still-available",
+      "proof-observations-cannot-mutate-tasks-gates-memberships-capabilities"
+    ]
+  }
+}
