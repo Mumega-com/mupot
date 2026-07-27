@@ -2,7 +2,7 @@
   "id": "brain-learning-ranker/v1",
   "status": "design",
   "spec": "docs/superpowers/specs/2026-07-27-brain-learning-ranker-design.md",
-  "thesis": "Receipts distill into gated instincts; rank recalls them; the core still gates every proposal — the brain never becomes an actor.",
+  "thesis": "Receipts distill into gated instincts; rank recalls them; the core still gates every proposal \u2014 the brain never becomes an actor.",
   "lineage": {
     "target": "mupot-typescript-brainport",
     "targetStatus": "type-only-sealed-decision-record-zero-callers",
@@ -55,12 +55,12 @@
     "matches": "BrainProposal",
     "fields": {
       "kind": "'spawn_task' | 'wake_agent' | 'noop'",
-      "agentId": "string | undefined — required for wake_agent deliverability",
+      "agentId": "string | undefined \u2014 required for wake_agent deliverability",
       "summary": "string",
       "doneWhen": "string | undefined",
       "priority": "number"
     },
-    "note": "RankProposal must be structurally identical to BrainProposal — no conversion layer"
+    "note": "RankProposal must be structurally identical to BrainProposal \u2014 no conversion layer"
   },
   "forbiddenActionEnforcement": {
     "primary": "kind-only via ALLOWED_BRAIN_PROPOSAL_KINDS union + assertProposalKindAllowed (throws)",
@@ -69,7 +69,11 @@
       "ifRetained": "non-throwing-warning-on-single-proposal-never-batch-throw"
     }
   },
-  "allowedProposalKinds": ["spawn_task", "wake_agent", "noop"],
+  "allowedProposalKinds": [
+    "spawn_task",
+    "wake_agent",
+    "noop"
+  ],
   "forbiddenActionVerbs": [
     "restart",
     "heal",
@@ -81,7 +85,12 @@
     "fleet_control"
   ],
   "instinct": {
-    "fields": ["trigger", "confidence", "decay", "domain"],
+    "fields": [
+      "trigger",
+      "confidence",
+      "decay",
+      "domain"
+    ],
     "confidenceMin": 0.3,
     "confidenceMax": 0.9,
     "injectThreshold": 0.7,
@@ -101,12 +110,12 @@
   },
   "bias": {
     "maxLearnDelta": 15.0,
-    "note": "absolute cap on total learning adjustment per proposal — mechanical score stays dominant"
+    "note": "absolute cap on total learning adjustment per proposal \u2014 mechanical score stays dominant"
   },
   "selectionBiasGuards": {
     "stalenessEscalation": {
       "enabled": true,
-      "description": "item suppressed N consecutive ticks force-promoted once — deterministic, not random"
+      "description": "item suppressed N consecutive ticks force-promoted once \u2014 deterministic, not random"
     },
     "unexercisedSuppressingInstinctDecay": {
       "enabled": true,
@@ -116,7 +125,7 @@
     "reason": "random sampling breaks determinism-same-inputs-same-rank"
   },
   "distill": {
-    "receiptResolution": "by-id-against-port4-gate-driver-frc-store-never-caller-string-label",
+    "receiptResolution": "branded-VerifiedReceiptRef-only-from-store-lookup-hit-boolean-bag-rejected",
     "corroborationRequiredBeforeInject": true,
     "contentSanitization": "schema-constrained-parse-plus-strip-instruction-shaped-text",
     "parseIsTrustBoundary": true,
@@ -132,26 +141,27 @@
     ],
     "modelClass": "cheap",
     "runsOnHotPath": false,
-    "domainOutput": "must-map-to-instinct.allowedDomains-or-no-op-loop"
+    "domainOutput": "must-map-to-instinct.allowedDomains-or-no-op-loop",
+    "verifiedReceiptConstructor": "verifiedReceiptRefFromStoreLookup"
   },
   "recallInstincts": {
     "signature": "recallInstincts(store: InstinctReadPort, opts: RecallInstinctsOpts): Promise<RecallInstinctsResult>",
     "opts": {
-      "projectId": "string — required",
-      "nowIso": "string — required for decay",
-      "includeGlobal": "boolean — default false"
+      "projectId": "string \u2014 required",
+      "nowIso": "string \u2014 required for decay",
+      "includeGlobal": "boolean \u2014 default false"
     },
     "result": {
       "instincts": "RankInstinctSnapshot[]",
-      "degraded": "boolean — true when Port-4 unavailable"
+      "degraded": "boolean \u2014 true when Port-4 unavailable"
     },
     "scopingRule": "instinct.projectId === opts.projectId OR (null AND promote-gate-passed AND includeGlobal)"
   },
   "gateInstincts": {
     "requiredOpts": {
-      "projectId": "string — fail-closed cross-project rejection",
+      "projectId": "string \u2014 fail-closed cross-project rejection",
       "nowIso": "string",
-      "allowedDomains": "string[] — fail-closed on empty"
+      "allowedDomains": "string[] \u2014 fail-closed on empty"
     }
   },
   "runtime": {
@@ -161,7 +171,7 @@
   },
   "exampleInstinctId": "no-act-on-fabrication",
   "tiesTo": {
-    "brainportSealDoc": "docs/architecture/port-interfaces-model-brain.md — Remaining S3 #1 brainport-default-adapter",
+    "brainportSealDoc": "docs/architecture/port-interfaces-model-brain.md \u2014 Remaining S3 #1 brainport-default-adapter",
     "dormantPort4Task": "b143e73d",
     "dormantPort4Branch": "cursor/task-b143e73d",
     "dormantPort4Status": "prerequisite-or-unmet-dependency-with-no-learning-degrade-never-reuse",
@@ -190,15 +200,35 @@
   "acceptance": {
     "mechanismLockNeTrustLock": {
       "name": "mechanism-lock-ne-trust-lock",
-      "description": "tests that lock a mechanism but not the trust it depends on — mayDistillFromSource enum fence is canonical example",
+      "description": "tests that lock a mechanism but not the trust it depends on \u2014 mayDistillFromSource enum fence is canonical example",
       "structuralLimitation": "no-contract-test-can-prove-port4-is-wired"
     },
     "testInventory": {
-      "contractDoc": { "count": 3, "catches": "json-ts-drift", "misses": "design-correctness" },
-      "brainRole": { "count": 4, "catches": "hardcoded-literals", "misses": "phantom-port" },
-      "distillFence": { "count": 2, "catches": "enum-membership", "misses": "receipt-id-verification-content-trust" },
-      "instinctGate": { "count": 3, "catches": "clamp-decay-domain-threshold-promote", "misses": "project-scope-corroboration" },
-      "recallAtRank": { "count": 2, "catches": "near-e2e-pipeline-order", "misses": "prose-filter-seam-mismatch-unbounded-bias" },
+      "contractDoc": {
+        "count": 3,
+        "catches": "json-ts-drift",
+        "misses": "design-correctness"
+      },
+      "brainRole": {
+        "count": 4,
+        "catches": "hardcoded-literals",
+        "misses": "phantom-port"
+      },
+      "distillFence": {
+        "count": 2,
+        "catches": "enum-membership",
+        "misses": "receipt-id-verification-content-trust"
+      },
+      "instinctGate": {
+        "count": 3,
+        "catches": "clamp-decay-domain-threshold-promote",
+        "misses": "project-scope-corroboration"
+      },
+      "recallAtRank": {
+        "count": 2,
+        "catches": "near-e2e-pipeline-order",
+        "misses": "prose-filter-seam-mismatch-unbounded-bias"
+      },
       "gateVerdictFindingsNotCaught": [
         "phantom-brainport",
         "rankproposal-brainproposal-seam",
