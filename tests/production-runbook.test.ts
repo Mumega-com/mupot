@@ -74,6 +74,8 @@ describe('production self-hosting runbook', () => {
     expect(runbook).toContain('tmp/local-smoke/report.json')
     expect(runbook).toContain('curl -fsS "$BASE_URL/health"')
     expect(runbook).toContain('npx wrangler tail "$WORKER"')
+    expect(runbook).toContain('[scheduled:unmatched-cron]')
+    expect(runbook).toContain('does not include the received cron expression')
   })
 
   it('defines a machine-checkable staging recovery evidence bundle', () => {
