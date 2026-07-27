@@ -9,8 +9,10 @@ import {
   OWNER_EXPERIENCE_PRINCIPLES,
   OWNER_HOME_REQUIRED_FACETS,
   OWNER_TRUST_LADDER,
+  KPI_SOURCE_IDS,
   PROJECT_SCOPED_KPI_SOURCE_IDS,
   WIN_CONSUMPTION_POLICY,
+  isKpiSourceId,
   assertOwnerHomeFacets,
   assertTalkV1Runtime,
   autonomyForTrustLevel,
@@ -133,6 +135,7 @@ describe('owner-experience/v1 contract doc', () => {
     expect(contract.progress.projectScopedKpiSourceIds).toEqual([...PROJECT_SCOPED_KPI_SOURCE_IDS])
     expect(PROJECT_SCOPED_KPI_SOURCE_IDS).toEqual([])
     expect(contract.progress.measuredUnreachableInV1).toBe(true)
+    expect(contract.progress.v1Mode).toBe('unmeasured_until_project_kpi')
   })
 
   it('locks the load-bearing invariants and names unmet dependencies', () => {
@@ -402,13 +405,16 @@ describe('honest progress and visible learning', () => {
     }
   })
 
-  it('requires KpiSourceId allowlist membership (G7) — a non-allowlisted id is refused, not just a wrong-scope one', () => {
+  it('isKpiSourceId locks allowlist contents (mutation-detectable)', () => {
+    expect(isKpiSourceId('ghl_booked_calls')).toBe(false)
+    expect([...KPI_SOURCE_IDS]).toEqual(['task_counter', 'github_prs'])
+  })
+
+  it('decideProgressDisplay returns unmeasured for a cast non-allowlisted sourceId', () => {
     expect(
       decideProgressDisplay({
         outcome: {
           statement: 'Booked calls',
-          // Deliberately not a member of KpiSourceId — proves isKpiSourceId
-          // itself rejects unknown ids, independent of the v1 project-scope gate.
           metric: { sourceId: 'ghl_booked_calls' as unknown as KpiSourceId, target: 10 },
           measurementMode: 'measured',
         },
