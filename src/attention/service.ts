@@ -3,6 +3,7 @@ import { hasCapability } from '../auth/capability'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
 import { projectVisibilityClause } from '../projects/access'
 import type { RoutinePrincipal } from '../routines/access'
+import { routineTablesReady } from '../routines/schema-ready'
 
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 100
@@ -285,7 +286,10 @@ async function sourceRows(
       AND ${visibility.sql}
   `, [...gateBinds, ...projectScope], cursor)
 
-  const routineWaits = querySource(env, 'routine_waits', `
+  // Rolling deploy: Worker may ship before D1 applies 0073. Skip Routine waits until tables exist.
+  const routinesReady = await routineTablesReady(env)
+  const routineWaits = routinesReady
+    ? querySource(env, 'routine_waits', `
     SELECT
       CASE rr.waiting_reason
         WHEN 'agent' THEN 'routine_agent'
@@ -315,6 +319,7 @@ async function sourceRows(
       AND NOT (rr.waiting_reason = 'review' AND rr.task_id IS NOT NULL)${projectClause}
       AND ${visibility.sql}
   `, [env.TENANT_SLUG, ...projectScope], cursor)
+    : Promise.resolve({ name: 'routine_waits', rows: [], truncated: false })
 
   const blockedTasks = querySource(env, 'blocked_tasks', `
     SELECT

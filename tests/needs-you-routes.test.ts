@@ -26,9 +26,16 @@ function sessions() {
   }
 }
 
-function makeHarness(): SqliteD1Harness {
+function makeHarness(options: { includeRoutineMigrations?: boolean } = {}): SqliteD1Harness {
+  const includeRoutineMigrations = options.includeRoutineMigrations !== false
   const harness = createSqliteD1()
   for (const file of readdirSync(MIGRATIONS_DIR).filter(file => file.endsWith('.sql')).sort()) {
+    if (
+      !includeRoutineMigrations
+      && (file.startsWith('0073_') || file.startsWith('0074_'))
+    ) {
+      continue
+    }
     harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
   }
   harness.sqlite.exec(`
@@ -90,5 +97,27 @@ describe('Needs You REST routes', () => {
     await expect(badLimit.json()).resolves.toEqual({ error: 'invalid_pagination' })
     const badCursor = await attentionApp.fetch(new Request('https://pot.test/needs-you?cursor=%3Cscript%3E'), envFor(harness))
     expect(badCursor.status).toBe(400)
+  })
+
+  it('keeps Needs You REST healthy when migration 0073 tables are absent', async () => {
+    harness = makeHarness({ includeRoutineMigrations: false })
+    authState.current = member()
+
+    const global = await attentionApp.fetch(new Request('https://pot.test/needs-you'), envFor(harness))
+    expect(global.status).toBe(200)
+    await expect(global.json()).resolves.toMatchObject({
+      items: [expect.objectContaining({ source_id: 'visible-task', source_type: 'task' })],
+    })
+
+    const project = await attentionApp.fetch(
+      new Request('https://pot.test/projects/project-a/needs-you'),
+      envFor(harness),
+    )
+    expect(project.status).toBe(200)
+    const body = await project.json() as { items: Array<{ source_id: string; source_type: string }> }
+    expect(body.items).toEqual([
+      expect.objectContaining({ source_id: 'visible-task', source_type: 'task' }),
+    ])
+    expect(body.items.some(item => item.source_type === 'routine_run')).toBe(false)
   })
 })
