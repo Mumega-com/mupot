@@ -7,6 +7,16 @@
 -- the table. Triggers on OTHER tables that SELECT FROM projects must be dropped
 -- before RENAME (SQLite recompiles them and fails with "no such table: projects")
 -- then restored. Pattern mirrors 0049_agent_status_inactive.sql backups.
+--
+-- mupot#594 incident: `PRAGMA foreign_keys = off` (formerly at the top of this
+-- file) is a silent no-op here — D1 runs the whole file in one transaction, and
+-- SQLite only allows FK enforcement to change with no transaction open. projects
+-- is self-referential (parent_project_id REFERENCES projects(id) ON DELETE
+-- RESTRICT, migrations/0055_projects.sql:15), so it stayed enforced through
+-- `DELETE FROM projects` regardless of the pragma and aborted a live production
+-- migration attempt. Fix: detach the hierarchy (parent_project_id = NULL) before
+-- the delete, back it up, and restore it after the rebuild — never rely on the
+-- pragma.
 
 DROP TRIGGER IF EXISTS trg_project_link_receipt_authorized;
 DROP TRIGGER IF EXISTS validate_agent_messages_project_insert;

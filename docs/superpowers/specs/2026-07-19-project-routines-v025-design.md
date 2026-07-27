@@ -479,6 +479,12 @@ MCP exposes equivalent bounded tools:
 `routine_run_get`, `routine_run_cancel`, `routine_proposal_submit`, and
 `needs_you_list`.
 
+There is no `routine_proposal_get` or `routine_proposal_list`. A submitted
+proposal lands in `routine_run_actions` (§5.3) and is read back through
+`routine_run_get`'s run/action projection, not through a proposal-shaped
+tool of its own — callers that expect a dedicated read counterpart to
+`routine_proposal_submit` should call `routine_run_get` instead.
+
 Needs You resolution uses existing source-specific tools rather than a generic
 authority-bypassing `needs_you_resolve` command.
 
