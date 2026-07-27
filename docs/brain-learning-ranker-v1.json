@@ -1,0 +1,111 @@
+{
+  "id": "brain-learning-ranker/v1",
+  "status": "design",
+  "spec": "docs/superpowers/specs/2026-07-27-brain-learning-ranker-design.md",
+  "thesis": "Receipts distill into gated instincts; rank recalls them; the core still gates every proposal — the brain never becomes an actor.",
+  "contrast": {
+    "learningRanker": {
+      "name": "brain-learning-ranker",
+      "role": "idempotent-portfolio-atc",
+      "output": "BrainDecision.ranked-proposals-only",
+      "learning": "port4-instinct-loop",
+      "hotPathLlm": false,
+      "mayAct": false
+    },
+    "learningActor": {
+      "name": "anti-pattern-learning-actor",
+      "role": "autonomous-operator",
+      "output": "direct-side-effects",
+      "learning": "conflated-with-hermes-gateway",
+      "hotPathLlm": true,
+      "mayAct": true
+    }
+  },
+  "invariants": [
+    "brain-rank-not-act",
+    "learning-is-instinct-loop-not-hermes-gateway",
+    "hot-path-zero-llm",
+    "recall-at-rank-core-injected",
+    "distill-from-receipts-only",
+    "instincts-confidence-decay-domain-gated",
+    "instincts-never-bypass-core-gates",
+    "no-new-brain-proposal-verbs",
+    "hermes-optional-runtime-only"
+  ],
+  "rankPipeline": [
+    "loadBoardContext",
+    "recallInstincts",
+    "gateInstincts",
+    "decide",
+    "applyInstinctBias",
+    "emitDecision"
+  ],
+  "allowedProposalKinds": ["spawn_task", "wake_agent", "noop"],
+  "forbiddenActionVerbs": [
+    "restart",
+    "heal",
+    "merge",
+    "deploy",
+    "publish",
+    "verdict",
+    "mint_token",
+    "fleet_control"
+  ],
+  "instinct": {
+    "fields": ["trigger", "confidence", "decay", "domain"],
+    "confidenceMin": 0.3,
+    "confidenceMax": 0.9,
+    "injectThreshold": 0.7,
+    "decayHalfLifeDays": 30,
+    "maxInjected": 6,
+    "allowedDomains": [
+      "rank-discipline",
+      "routing",
+      "citation",
+      "lifecycle"
+    ],
+    "promoteMinProjects": 2,
+    "promoteMinConfidence": 0.8
+  },
+  "distill": {
+    "allowedSources": [
+      "gate_fail_receipt",
+      "fabrication_receipt",
+      "human_correction_receipt"
+    ],
+    "forbiddenSources": [
+      "raw_agent_self_report",
+      "unverified_board_diff",
+      "model_speculation"
+    ],
+    "modelClass": "cheap",
+    "runsOnHotPath": false
+  },
+  "runtime": {
+    "hermes": "optional-resilient-host",
+    "hermesIsLearningMechanism": false,
+    "experienceJson": "mechanical-reliability-signal-only"
+  },
+  "exampleInstinctId": "no-act-on-fabrication",
+  "tiesTo": {
+    "dormantPort4Task": "b143e73d",
+    "dormantPort4Branch": "cursor/task-b143e73d",
+    "failureClass": "#490-act-on-fabrication"
+  },
+  "nonGoals": [
+    "replace-brainport-with-hermes-gateway",
+    "make-brain-an-actor",
+    "merge-port4-in-this-design-commit",
+    "migration-applied-in-this-design-commit",
+    "instinct-ui-in-this-design-commit",
+    "silent-global-promotion"
+  ],
+  "buildSlices": [
+    "contract-lock",
+    "port4-land",
+    "receipt-observe",
+    "offline-distill",
+    "recall-at-rank",
+    "optional-hermes-runtime"
+  ]
+}
