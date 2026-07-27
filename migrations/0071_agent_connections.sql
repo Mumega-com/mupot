@@ -14,6 +14,17 @@ UPDATE member_tokens
  WHERE agent_id IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM agents WHERE id = member_tokens.agent_id);
 
+-- Signed keys can use either the canonical agent id or the legacy unique slug.
+-- Remove only keys that resolve to neither, matching deactivate_agent's
+-- fail-closed removal of signed-runtime authority.
+DELETE FROM agent_keys
+ WHERE NOT EXISTS (
+   SELECT 1
+     FROM agents
+    WHERE agents.id = agent_keys.agent_id
+       OR agents.slug = agent_keys.agent_id
+ );
+
 CREATE TABLE agent_member_bindings (
   tenant     TEXT NOT NULL,
   agent_id   TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
@@ -40,9 +51,18 @@ INSERT INTO agent_connection_migration_guard (ok)
 SELECT 0
  FROM member_tokens
  WHERE agent_id IS NOT NULL
-   AND revoked_at IS NULL
+   AND EXISTS (SELECT 1 FROM agents WHERE id = member_tokens.agent_id)
  GROUP BY tenant, agent_id
 HAVING COUNT(DISTINCT member_id) > 1
+ LIMIT 1;
+
+INSERT INTO agent_connection_migration_guard (ok)
+SELECT 0
+  FROM member_tokens
+ WHERE agent_id IS NOT NULL
+   AND EXISTS (SELECT 1 FROM agents WHERE id = member_tokens.agent_id)
+ GROUP BY tenant, member_id
+HAVING COUNT(DISTINCT agent_id) > 1
  LIMIT 1;
 
 DROP TABLE agent_connection_migration_guard;
@@ -51,7 +71,7 @@ INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
 SELECT tenant, agent_id, MIN(member_id), MIN(created_at)
   FROM member_tokens
  WHERE agent_id IS NOT NULL
-   AND revoked_at IS NULL
+   AND EXISTS (SELECT 1 FROM agents WHERE id = member_tokens.agent_id)
  GROUP BY tenant, agent_id;
 
 -- The home capability is an identity property, permanently capped at member.
