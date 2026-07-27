@@ -340,8 +340,13 @@ reading, not build order — do not build 1 → 2 → 3 in sequence.
 
 1. **Outcome model** — structured north-star on `projects` + progress helper.
    v1 mode is `unmeasured_until_project_kpi` by default; `measured` stays
-   unreachable until a source lands in `PROJECT_SCOPED_KPI_SOURCE_IDS`. Next
-   free migration number: **0072**.
+   unreachable until a source lands in `PROJECT_SCOPED_KPI_SOURCE_IDS`. The
+   first project-scoped allowlist entry MUST ship WITH the four downstream
+   branch tests for `decideProgressDisplay` once `measured` is reachable
+   (`signal_missing`, signal `ok:false`, `source_id_mismatch`,
+   `invalid_target` / measured ratio) — those branches are dead under the
+   empty v1 allowlist and must not be left untested when the gate opens.
+   Next free migration number: **0072**.
 2. **Owner home shell** — compose Outcome + Trust + Talk/Know/Watch facets on
    project detail (Watch = existing situation; Talk = Tier-1 embed; Know =
    memory list). No new cognition.

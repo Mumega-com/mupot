@@ -190,7 +190,12 @@ export type BudgetWindow = 'day' | 'week'
 const EFFORTS: readonly Effort[] = ['low', 'standard', 'high', 'sprint']
 // Exported so consumers (e.g. owner-experience trust ladder) can drift-lock
 // against the canonical set instead of hand-maintaining a parallel list.
-export const AUTONOMIES: readonly Autonomy[] = ['suggest', 'draft', 'execute', 'execute_with_approval']
+export const AUTONOMIES: readonly Autonomy[] = Object.freeze([
+  'suggest',
+  'draft',
+  'execute',
+  'execute_with_approval',
+] as const satisfies readonly Autonomy[])
 const BUDGET_WINDOWS: readonly BudgetWindow[] = ['day', 'week']
 
 export function isEffort(v: unknown): v is Effort {
