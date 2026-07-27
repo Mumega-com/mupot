@@ -13,6 +13,7 @@ import { inflateSync } from 'node:zlib'
 
 export const STEP_RECEIPT_TYPE = 'mupot-project-routine-lifecycle-step/v1'
 export const CHECK_RECEIPT_TYPE = 'mupot-project-routine-lifecycle/v1'
+export const OBSERVATION_ARTIFACT_TYPE = 'mupot-project-routine-observation/v1'
 
 export const REQUIRED_SURFACES = Object.freeze([
   'browser',
@@ -418,10 +419,12 @@ function referencedArtifactMeta(checks, outDir, receiptPath, receipt) {
     if (!safeFile) return { label, path: artifactPath, exists: false }
 
     const bytes = readFileSync(realPath)
+    let parsedJson = null
     let secretFindings
     if (extname(realPath).toLowerCase() === '.json') {
       try {
-        secretFindings = scanSecrets(JSON.parse(bytes.toString('utf8')))
+        parsedJson = JSON.parse(bytes.toString('utf8'))
+        secretFindings = scanSecrets(parsedJson)
       } catch {
         secretFindings = scanSecrets(bytes.toString('utf8'))
       }
@@ -431,6 +434,35 @@ function referencedArtifactMeta(checks, outDir, receiptPath, receipt) {
     pushCheck(checks, secretFindings.length === 0, 'receipt_artifact_has_no_secret_material', {
       path: receiptPath, index, artifact_path: artifactPath, findings: secretFindings,
     })
+    if (extname(realPath).toLowerCase() === '.json') {
+      const target = parsedJson?.target && typeof parsedJson.target === 'object' ? parsedJson.target : {}
+      const receiptTarget = receipt?.target && typeof receipt.target === 'object' ? receipt.target : {}
+      const targetMatches = ['project_id', 'routine_id', 'routine_run_id', 'commit', 'version']
+        .every((field) => target[field] === receiptTarget[field])
+      pushCheck(checks, parsedJson?.artifact_type === OBSERVATION_ARTIFACT_TYPE, 'receipt_artifact_observation_type', {
+        path: receiptPath, index, artifact_path: artifactPath, actual: parsedJson?.artifact_type ?? null,
+      })
+      pushCheck(checks, parsedJson?.step === receipt?.step, 'receipt_artifact_step_matches', {
+        path: receiptPath, index, artifact_path: artifactPath, expected: receipt?.step ?? null,
+        actual: parsedJson?.step ?? null,
+      })
+      pushCheck(checks, observedAtMs(parsedJson).ok, 'receipt_artifact_observed_at_parseable', {
+        path: receiptPath, index, artifact_path: artifactPath, observed_at: parsedJson?.observed_at ?? null,
+      })
+      pushCheck(checks, REQUIRED_SURFACES.includes(parsedJson?.source), 'receipt_artifact_source_known', {
+        path: receiptPath, index, artifact_path: artifactPath, source: parsedJson?.source ?? null,
+      })
+      pushCheck(checks, targetMatches, 'receipt_artifact_target_matches', {
+        path: receiptPath, index, artifact_path: artifactPath,
+      })
+      pushCheck(
+        checks,
+        Boolean(parsedJson?.data) && typeof parsedJson.data === 'object' && !Array.isArray(parsedJson.data)
+          && Object.keys(parsedJson.data).length > 0,
+        'receipt_artifact_data_present',
+        { path: receiptPath, index, artifact_path: artifactPath },
+      )
+    }
     return {
       label,
       path: artifactPath,
@@ -444,10 +476,14 @@ function referencedArtifactMeta(checks, outDir, receiptPath, receipt) {
 const TRUE_EVIDENCE = new Set([
   'project_active', 'created_by_operator', 'trigger_configured', 'enabled', 'run_observed',
   'correlated_proposal', 'situation_digest_matched', 'human_approval_recorded',
-  'external_action_gated', 'external_action_executed', 'external_action_approved',
+  'external_action_gated',
   'cost_recorded', 'activity_visible', 'evidence_visible', 'situation_updated',
   'idempotent_duplicate_noop', 'unauthorized_rejected', 'worker_restarted',
   'durable_state_preserved',
+])
+
+const BOOLEAN_EVIDENCE = new Set([
+  'external_action_executed', 'external_action_approved',
 ])
 
 const IDENTIFIER_EVIDENCE = new Set([
@@ -456,6 +492,7 @@ const IDENTIFIER_EVIDENCE = new Set([
 
 function evidenceValuePass(key, value) {
   if (TRUE_EVIDENCE.has(key)) return value === true
+  if (BOOLEAN_EVIDENCE.has(key)) return typeof value === 'boolean'
   if (IDENTIFIER_EVIDENCE.has(key)) return typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,200}$/.test(value)
   if (key === 'mode') return value === 'propose' || value === 'execute_internal'
   if (key === 'terminal_status') return ['succeeded', 'failed', 'skipped', 'cancelled'].includes(value)
@@ -509,6 +546,24 @@ function gitHead(repoRoot) {
   }
 }
 
+function packageVersion(repoRoot) {
+  try {
+    const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'))
+    return typeof pkg.version === 'string' ? pkg.version.trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+function publicApiVersion(repoRoot) {
+  try {
+    const source = readFileSync(join(repoRoot, 'src', 'version.ts'), 'utf8')
+    return source.match(/MUPOT_PUBLIC_API_VERSION\s*=\s*['"]([^'"]+)['"]/)?.[1] ?? ''
+  } catch {
+    return ''
+  }
+}
+
 function crc32(buffer) {
   let crc = 0xffffffff
   for (const byte of buffer) {
@@ -520,12 +575,24 @@ function crc32(buffer) {
   return (crc ^ 0xffffffff) >>> 0
 }
 
-function isPngScreenshot(path) {
-  if (!existsSync(path)) return false
+function paethPredictor(left, up, upLeft) {
+  const estimate = left + up - upLeft
+  const leftDistance = Math.abs(estimate - left)
+  const upDistance = Math.abs(estimate - up)
+  const upLeftDistance = Math.abs(estimate - upLeft)
+  if (leftDistance <= upDistance && leftDistance <= upLeftDistance) return left
+  if (upDistance <= upLeftDistance) return up
+  return upLeft
+}
+
+function inspectPngScreenshot(path) {
+  if (!existsSync(path)) return { valid: false, hasVisualContent: false }
   const stats = statSync(path)
-  if (!stats.isFile() || stats.size < 45) return false
+  if (!stats.isFile() || stats.size < 45) return { valid: false, hasVisualContent: false }
   const png = readFileSync(path)
-  if (!png.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return false
+  if (!png.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return { valid: false, hasVisualContent: false }
+  }
   try {
     let offset = 8
     let width = 0
@@ -539,25 +606,27 @@ function isPngScreenshot(path) {
     while (offset + 12 <= png.length) {
       const length = png.readUInt32BE(offset)
       const end = offset + 12 + length
-      if (end > png.length) return false
+      if (end > png.length) return { valid: false, hasVisualContent: false }
       const type = png.subarray(offset + 4, offset + 8).toString('ascii')
       const chunk = png.subarray(offset + 8, offset + 8 + length)
       const expectedCrc = png.readUInt32BE(offset + 8 + length)
-      if (crc32(png.subarray(offset + 4, offset + 8 + length)) !== expectedCrc) return false
-      if (!sawHeader && type !== 'IHDR') return false
+      if (crc32(png.subarray(offset + 4, offset + 8 + length)) !== expectedCrc) {
+        return { valid: false, hasVisualContent: false }
+      }
+      if (!sawHeader && type !== 'IHDR') return { valid: false, hasVisualContent: false }
       if (type === 'IHDR') {
-        if (sawHeader || length !== 13) return false
+        if (sawHeader || length !== 13) return { valid: false, hasVisualContent: false }
         width = chunk.readUInt32BE(0)
         height = chunk.readUInt32BE(4)
         bitDepth = chunk[8]
         colorType = chunk[9]
         interlace = chunk[12]
-        if (chunk[10] !== 0 || chunk[11] !== 0) return false
+        if (chunk[10] !== 0 || chunk[11] !== 0) return { valid: false, hasVisualContent: false }
         sawHeader = true
       } else if (type === 'IDAT') {
         data.push(chunk)
       } else if (type === 'IEND') {
-        if (length !== 0) return false
+        if (length !== 0) return { valid: false, hasVisualContent: false }
         sawEnd = true
         offset = end
         break
@@ -566,17 +635,46 @@ function isPngScreenshot(path) {
     }
     if (!sawHeader || !sawEnd || offset !== png.length || data.length === 0
       || width < 320 || height < 200 || interlace !== 0 || bitDepth !== 8
-      || ![2, 6].includes(colorType)) return false
+      || ![2, 6].includes(colorType)) return { valid: false, hasVisualContent: false }
     const channels = colorType === 2 ? 3 : 4
     const pixels = inflateSync(Buffer.concat(data))
     const rowBytes = Math.ceil((width * channels * bitDepth) / 8)
-    if (pixels.length !== height * (rowBytes + 1)) return false
+    if (pixels.length !== height * (rowBytes + 1)) return { valid: false, hasVisualContent: false }
+    let previous = Buffer.alloc(rowBytes)
+    let firstVisibleColor = null
+    let hasVisualContent = false
     for (let row = 0; row < height; row += 1) {
-      if (pixels[row * (rowBytes + 1)] > 4) return false
+      const rowOffset = row * (rowBytes + 1)
+      const filter = pixels[rowOffset]
+      if (filter > 4) return { valid: false, hasVisualContent: false }
+      const raw = pixels.subarray(rowOffset + 1, rowOffset + 1 + rowBytes)
+      const current = Buffer.alloc(rowBytes)
+      for (let column = 0; column < rowBytes; column += 1) {
+        const left = column >= channels ? current[column - channels] : 0
+        const up = previous[column]
+        const upLeft = column >= channels ? previous[column - channels] : 0
+        let predictor = 0
+        if (filter === 1) predictor = left
+        else if (filter === 2) predictor = up
+        else if (filter === 3) predictor = Math.floor((left + up) / 2)
+        else if (filter === 4) predictor = paethPredictor(left, up, upLeft)
+        current[column] = (raw[column] + predictor) & 0xff
+      }
+      for (let column = 0; column < rowBytes; column += channels) {
+        if (channels === 4 && current[column + 3] === 0) continue
+        const color = `${current[column]},${current[column + 1]},${current[column + 2]}`
+        if (firstVisibleColor === null) firstVisibleColor = color
+        else if (color !== firstVisibleColor) {
+          hasVisualContent = true
+          break
+        }
+      }
+      previous = current
+      if (hasVisualContent) break
     }
-    return true
+    return { valid: true, hasVisualContent }
   } catch {
-    return false
+    return { valid: false, hasVisualContent: false }
   }
 }
 
@@ -634,7 +732,12 @@ function checkScreenshots(checks, outDir) {
     const present = existsSync(path)
     pushCheck(checks, present, 'screenshot_present', { path: relative, absolute_path: path })
     if (!present) continue
-    pushCheck(checks, isPngScreenshot(path), 'screenshot_is_png', {
+    const inspection = inspectPngScreenshot(path)
+    pushCheck(checks, inspection.valid, 'screenshot_is_png', {
+      path: relative,
+      absolute_path: path,
+    })
+    pushCheck(checks, inspection.valid && inspection.hasVisualContent, 'screenshot_has_visual_content', {
       path: relative,
       absolute_path: path,
     })
@@ -743,18 +846,36 @@ export function checkBundle(opts = {}) {
   })
 
   const head = gitHead(repoRoot)
+  pushCheck(checks, Boolean(head), 'git_head_resolved', { repo_root: repoRoot, head: head || null })
+  pushCheck(checks, Boolean(head) && target.commit === head, 'target_commit_matches_git_head', {
+    expected: head || null,
+    actual: target.commit,
+  })
   if (opts.expectedCommit) {
     pushCheck(checks, target.commit === opts.expectedCommit, 'target_commit_matches_expected', {
       expected: opts.expectedCommit,
       actual: target.commit,
     })
-  } else if (head) {
-    pushCheck(checks, target.commit === head, 'target_commit_matches_git_head', {
-      expected: head,
-      actual: target.commit,
-    })
   }
 
+  const packageRelease = packageVersion(repoRoot)
+  const publicApiRelease = publicApiVersion(repoRoot)
+  pushCheck(checks, Boolean(packageRelease), 'package_version_resolved', {
+    repo_root: repoRoot,
+    version: packageRelease || null,
+  })
+  pushCheck(checks, target.version === packageRelease, 'target_version_matches_package', {
+    expected: packageRelease || null,
+    actual: target.version,
+  })
+  pushCheck(checks, Boolean(publicApiRelease), 'public_api_version_resolved', {
+    repo_root: repoRoot,
+    version: publicApiRelease || null,
+  })
+  pushCheck(checks, target.version === publicApiRelease, 'target_version_matches_public_api', {
+    expected: publicApiRelease || null,
+    actual: target.version,
+  })
   if (opts.expectedVersion) {
     pushCheck(checks, target.version === opts.expectedVersion, 'target_version_matches_expected', {
       expected: opts.expectedVersion,

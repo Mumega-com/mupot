@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,8 +15,8 @@ import {
   parseArgs,
 } from '../scripts/project-routine-lifecycle-receipt.mjs'
 
-const COMMIT = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-const VERSION = '0.25.0'
+const COMMIT = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+const VERSION = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')).version
 
 const TARGET = {
   pot: 'local',
@@ -45,7 +46,7 @@ function pngChunk(type: string, data: Buffer): Buffer {
   return Buffer.concat([length, typeBytes, data, crc])
 }
 
-function screenshotPng(): Buffer {
+function screenshotPng(blank = false): Buffer {
   const width = 320
   const height = 200
   const header = Buffer.alloc(13)
@@ -53,6 +54,17 @@ function screenshotPng(): Buffer {
   header.writeUInt32BE(height, 4)
   header.set([8, 2, 0, 0, 0], 8)
   const rows = Buffer.alloc(height * (1 + width * 3))
+  if (!blank) {
+    for (let row = 0; row < height; row += 1) {
+      const rowStart = row * (1 + width * 3)
+      for (let column = 0; column < width; column += 1) {
+        const pixel = rowStart + 1 + column * 3
+        rows[pixel] = column < width / 2 ? 24 : 220
+        rows[pixel + 1] = row < height / 2 ? 120 : 48
+        rows[pixel + 2] = 180
+      }
+    }
+  }
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     pngChunk('IHDR', header),
@@ -129,7 +141,7 @@ function baseReceipt(step: string, evidence: Record<string, unknown>, observedAt
     step,
     status: 'pass',
     observed_at: observedAt,
-    target: TARGET,
+    target: { ...TARGET },
     evidence,
     artifacts: [
       { label: `${step} artifact`, path: `artifacts/${step}.json` },
@@ -156,7 +168,14 @@ function writeBundle(dir: string, mutate?: (receipt: Record<string, unknown>, fi
     )
     mutate?.(receipt, spec.file)
     writeFileSync(join(dir, spec.file), JSON.stringify(receipt, null, 2))
-    writeFileSync(join(dir, 'artifacts', `${spec.step}.json`), JSON.stringify({ step: spec.step, verified: true }))
+    writeFileSync(join(dir, 'artifacts', `${spec.step}.json`), JSON.stringify({
+      artifact_type: 'mupot-project-routine-observation/v1',
+      step: spec.step,
+      observed_at: receipt.observed_at,
+      source: spec.step === 'runtime_proposal' ? 'runtime' : 'rest',
+      target: receipt.target,
+      data: { observed: true },
+    }))
   })
 }
 
@@ -320,7 +339,7 @@ describe('project routine lifecycle receipt checker', () => {
     const receipt = checkBundle({
       outDir: dir,
       expectedCommit: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-      expectedVersion: '0.24.0',
+      expectedVersion: '9.9.9',
     })
 
     expect(receipt.status).toBe('fail')
@@ -331,6 +350,106 @@ describe('project routine lifecycle receipt checker', () => {
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
       check: 'target_version_matches_expected',
+    }))
+  })
+
+  it('cannot use caller-supplied expectations to bypass Git HEAD or package version', () => {
+    const dir = tempDir()
+    const otherCommit = COMMIT === 'b'.repeat(40) ? 'c'.repeat(40) : 'b'.repeat(40)
+    writeBundle(dir, (receipt) => {
+      const target = receipt.target as Record<string, unknown>
+      target.commit = otherCommit
+      target.version = '9.9.9'
+      const evidence = receipt.evidence as Record<string, unknown>
+      if (receipt.step === 'restart_parity') {
+        evidence.commit = otherCommit
+        evidence.version = '9.9.9'
+      }
+    })
+
+    const receipt = checkBundle({
+      outDir: dir,
+      expectedCommit: otherCommit,
+      expectedVersion: '9.9.9',
+    })
+
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'target_commit_matches_git_head',
+    }))
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'target_version_matches_package',
+    }))
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'target_version_matches_public_api',
+    }))
+  })
+
+  it('accepts an internal-only approved action without claiming an external write executed', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      if (file !== 'needs-you-approval.json') return
+      const evidence = receipt.evidence as Record<string, unknown>
+      evidence.external_action_executed = false
+      evidence.external_action_approved = false
+    })
+
+    const receipt = checkBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    expect(receipt.status).toBe('pass')
+  })
+
+  it('rejects an external write that executed without approval', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      if (file !== 'needs-you-approval.json') return
+      const evidence = receipt.evidence as Record<string, unknown>
+      evidence.external_action_executed = true
+      evidence.external_action_approved = false
+    })
+
+    const receipt = checkBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'external_action_requires_approval',
+    }))
+  })
+
+  it('rejects blank screenshots and assertion-only artifact JSON', () => {
+    const blankScreenshotDir = tempDir()
+    writeBundle(blankScreenshotDir)
+    for (const relative of REQUIRED_SCREENSHOTS) {
+      writeFileSync(join(blankScreenshotDir, relative), screenshotPng(true))
+    }
+    const blankScreenshotReceipt = checkBundle({
+      outDir: blankScreenshotDir,
+      expectedCommit: COMMIT,
+      expectedVersion: VERSION,
+    })
+    expect(blankScreenshotReceipt.status).toBe('fail')
+    expect(blankScreenshotReceipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'screenshot_has_visual_content',
+    }))
+
+    const assertionOnlyDir = tempDir()
+    writeBundle(assertionOnlyDir)
+    writeFileSync(
+      join(assertionOnlyDir, 'artifacts', 'manual_fire.json'),
+      JSON.stringify({ step: 'manual_fire', verified: true }),
+    )
+    const assertionOnlyReceipt = checkBundle({
+      outDir: assertionOnlyDir,
+      expectedCommit: COMMIT,
+      expectedVersion: VERSION,
+    })
+    expect(assertionOnlyReceipt.status).toBe('fail')
+    expect(assertionOnlyReceipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'receipt_artifact_observation_type',
     }))
   })
 
