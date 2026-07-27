@@ -3355,6 +3355,7 @@ function shell(
       .routine-table .routine-cell {
         display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere;
       }
+      .routine-mobile-label { display: none; }
       .routine-stack {
         display: grid; gap: 3px; min-width: 0;
       }
@@ -3374,8 +3375,8 @@ function shell(
           display: grid; grid-template-columns: minmax(7rem, 35%) minmax(0, 1fr);
           gap: 12px; align-items: start;
         }
-        .routine-table .ui-td::before {
-          content: attr(data-label);
+        .routine-table .routine-mobile-label {
+          display: block;
           font-family: var(--font-mono); font-size: 10px; font-weight: 600;
           letter-spacing: .6px; text-transform: uppercase; color: var(--dim);
         }

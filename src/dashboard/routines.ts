@@ -325,12 +325,13 @@ function routineNextAction(routine: Routine, run: RoutineRun | undefined): strin
   return 'Run when accountable work is ready'
 }
 
-function table(label: string, minWidth: string, columns: Array<{ label: string; width: string }>, rows: Html[][], empty: string): Html {
+function table(id: string, label: string, minWidth: string, columns: Array<{ label: string; width: string }>, rows: Html[][], empty: string): Html {
   const tracks = columns.map(column => column.width).join(' ')
+  const headerIds = columns.map((_, index) => `${id}-header-${index + 1}`)
   return html`<div role="region" aria-label="${label}" tabindex="0" style="max-width:100%;overflow-x:auto;">
     <div class="ui-table routine-table" role="table" aria-label="${label}" style="min-width:${minWidth};">
-      <div class="ui-tr ui-thead" role="row" style="grid-template-columns:${raw(tracks)}">${columns.map(column => html`<div class="ui-th" role="columnheader">${column.label}</div>`)}</div>
-      ${rows.length ? rows.map(cells => html`<div class="ui-tr ui-row" role="row" style="grid-template-columns:${raw(tracks)}">${cells.map((cell, index) => html`<div class="ui-td" role="cell" data-label="${columns[index]?.label ?? ''}"><div class="routine-cell">${cell}</div></div>`)}</div>`) : html`<div class="ui-table-empty">${empty}</div>`}
+      <div class="ui-tr ui-thead" role="row" style="grid-template-columns:${raw(tracks)}">${columns.map((column, index) => html`<div id="${headerIds[index]}" class="ui-th" role="columnheader">${column.label}</div>`)}</div>
+      ${rows.length ? rows.map(cells => html`<div class="ui-tr ui-row" role="row" style="grid-template-columns:${raw(tracks)}">${cells.map((cell, index) => html`<div class="ui-td" role="cell" aria-labelledby="${headerIds[index] ?? ''}"><span class="routine-mobile-label" aria-hidden="true">${columns[index]?.label ?? ''}</span><div class="routine-cell">${cell}</div></div>`)}</div>`) : html`<div class="ui-table-empty">${empty}</div>`}
     </div>
   </div>`
 }
@@ -417,13 +418,13 @@ export function routineWorkspaceBody(view: RoutineWorkspaceView, options: { erro
     ${view.detailRun ? detailRunPanel(view, projectPath) : ''}
     ${view.detailRoutine && !view.editRoutine ? detailRoutinePanel(view, projectPath) : ''}
     ${routineForm(view, undefined, options.values)}
-    ${sectionPanel({ title: 'Routines', body: html`${table('Project routines', '88rem', [
+    ${sectionPanel({ title: 'Routines', body: html`${table('project-routines', 'Project routines', '88rem', [
       { label: 'Routine', width: '1.2fr' }, { label: 'Status', width: 'auto' }, { label: 'Schedule', width: '1.2fr' }, { label: 'Squad / agent', width: '1.1fr' }, { label: 'Policy', width: '1.5fr' }, { label: 'Current state / next action', width: '1.3fr' }, { label: 'Actions', width: 'auto' },
     ], routineRows, 'No Project Routines are configured yet.')}${view.routineTruncated ? html`<p class="ui-panel-sub">Showing a bounded page of routines. ${routineMore ? html`<a class="ui-link" href="${routineMore}">Continue routines</a>` : ''}</p>` : ''}` })}
-    ${sectionPanel({ title: 'Run history', body: html`${table('Routine run history', '72rem', [
+    ${sectionPanel({ title: 'Run history', body: html`${table('routine-run-history', 'Routine run history', '72rem', [
       { label: 'When', width: '1fr' }, { label: 'Run', width: '1fr' }, { label: 'State', width: '1fr' }, { label: 'Agent / attempt', width: '1.1fr' }, { label: 'Cost / outcome', width: '1.2fr' }, { label: 'Evidence', width: '1fr' },
     ], runRows, 'No routine runs are recorded for this Project yet.')}${view.runTruncated ? html`<p class="ui-panel-sub">Showing a bounded page of runs. ${runMore ? html`<a class="ui-link" href="${runMore}">Continue runs</a>` : ''}</p>` : ''}` })}
-    ${sectionPanel({ title: 'Event history', body: html`${table('Routine event history', '62rem', [
+    ${sectionPanel({ title: 'Event history', body: html`${table('routine-event-history', 'Routine event history', '62rem', [
       { label: 'When', width: '1fr' }, { label: 'Routine', width: '1.1fr' }, { label: 'Event', width: '1fr' }, { label: 'Actor', width: '1fr' }, { label: 'Links', width: 'auto' },
     ], eventRows, 'No routine events are recorded for this Project yet.')}${view.eventTruncated ? html`<p class="ui-panel-sub">Showing a bounded page of events. ${eventMore ? html`<a class="ui-link" href="${eventMore}">Continue events</a>` : ''}</p>` : ''}` })}`
 }

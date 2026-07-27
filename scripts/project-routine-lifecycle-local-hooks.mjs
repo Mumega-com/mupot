@@ -32,6 +32,21 @@ function required(value, label) {
   return value
 }
 
+export function validateRoutineAccessibility(snapshot) {
+  const headerIds = new Set(snapshot.headerIds)
+  if (headerIds.size !== snapshot.headerIds.length) throw new Error('routine header ids must be unique')
+  if (snapshot.cellHeaderIds.some(id => !headerIds.has(id))) {
+    throw new Error('routine cells must reference existing headers')
+  }
+  if (snapshot.cellCount !== snapshot.mobileLabelCount) {
+    throw new Error('every routine cell must have a mobile label')
+  }
+  if (snapshot.mobileLabelCount !== snapshot.mobileLabelHiddenCount) {
+    throw new Error('routine mobile labels must be aria-hidden')
+  }
+  return true
+}
+
 function loopbackTarget(raw) {
   let target
   try {
@@ -601,6 +616,27 @@ export async function createCollectorDependencies(config) {
       const bodyText = await active.page.locator('body').innerText()
       if (!bodyText.includes(name) || !bodyText.toLowerCase().includes('propose')) {
         throw new Error(`${viewport} routine dashboard did not render propose mode`)
+      }
+      if (viewport === 'mobile') {
+        const semantics = await active.page.locator('.routine-table').evaluateAll((tables) => {
+          const headerIds = []
+          const cellHeaderIds = []
+          let cellCount = 0
+          let mobileLabelCount = 0
+          let mobileLabelHiddenCount = 0
+          for (const table of tables) {
+            const headers = Array.from(table.querySelectorAll('[role="columnheader"]'))
+            const cells = Array.from(table.querySelectorAll('[role="cell"]'))
+            headerIds.push(...headers.map(header => header.id))
+            cellHeaderIds.push(...cells.map(cell => cell.getAttribute('aria-labelledby') ?? ''))
+            cellCount += cells.length
+            const labels = Array.from(table.querySelectorAll('.routine-mobile-label'))
+            mobileLabelCount += labels.length
+            mobileLabelHiddenCount += labels.filter(label => label.getAttribute('aria-hidden') === 'true').length
+          }
+          return { headerIds, cellHeaderIds, cellCount, mobileLabelCount, mobileLabelHiddenCount }
+        })
+        validateRoutineAccessibility(semantics)
       }
       const screenshotDir = path.join(path.resolve(requestedOutputDir), 'screenshots')
       await mkdir(screenshotDir, { recursive: true })
