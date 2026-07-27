@@ -386,6 +386,8 @@ describe('Project Routine local lifecycle hooks', () => {
         return response.end(`<!doctype html><body>
           <h1>Project Main</h1>
           <script type="application/json" id="project-situation-json">${JSON.stringify(situation)}</script>
+          <script type="application/json" id="project-activity-json">${JSON.stringify({ rows: activity })}</script>
+          <script type="application/json" id="project-evidence-json">${JSON.stringify({ rows: evidence })}</script>
           <section id="activity">activity-browser Lifecycle activity</section>
           <section id="evidence">evidence-browser Lifecycle evidence</section>
         </body>`)
@@ -403,7 +405,8 @@ describe('Project Routine local lifecycle hooks', () => {
             : ''}
         </div>`
         const detail = url.searchParams.get('run_id') === 'run-browser'
-          ? `<section>run-browser succeeded 17 micro USD</section>`
+          ? `<script type="application/json" id="routine-run-json">${JSON.stringify(expectedRun)}</script>
+             <section>Completed with recorded cost</section>`
           : ''
         return response.end(`<!doctype html><body>
           <form method="post" action="/projects/project-main/routines">

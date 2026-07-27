@@ -180,15 +180,6 @@ function containsRoutineEnvelope(messages, projectId) {
   })
 }
 
-function stableScalarStrings(value, prefix = '') {
-  if (value === null || value === undefined) return []
-  if (typeof value === 'object') {
-    return Object.entries(value).flatMap(([key, child]) => stableScalarStrings(child, `${prefix}.${key}`))
-  }
-  if (typeof value === 'string' || typeof value === 'number') return [{ path: prefix, value: String(value) }]
-  return []
-}
-
 async function processCommand(pid) {
   try {
     const result = await execFileAsync('ps', ['-p', String(pid), '-o', 'command='], {
@@ -646,15 +637,11 @@ export async function createCollectorDependencies(config) {
         `${baseUrl}/projects/${encodeURIComponent(projectId)}/routines?run_id=${encodeURIComponent(runId)}`,
         { waitUntil: 'networkidle', timeout: 20_000 },
       )
-      const bodyText = await active.page.locator('body').innerText()
-      for (const entry of stableScalarStrings({
-        id: expected.id,
-        status: expected.status,
-        cost_micro_usd: expected.cost_micro_usd,
-      })) {
-        if (!bodyText.includes(entry.value)) throw new Error(`dashboard run omitted ${entry.path}`)
+      const run = await readJsonScript(active.page, 'routine-run-json', 'dashboard run')
+      if (run?.id !== runId || run?.id !== expected?.id) {
+        throw new Error('dashboard run JSON does not identify the requested run')
       }
-      return expected
+      return run
     },
 
     async readProjectSituation({ projectId }) {
@@ -678,19 +665,12 @@ export async function createCollectorDependencies(config) {
         `${baseUrl}/projects/${encodeURIComponent(projectId)}`,
         { waitUntil: 'networkidle', timeout: 20_000 },
       )
-      const activityText = await active.page.locator('#activity').innerText()
-      const evidenceText = await active.page.locator('#evidence').innerText()
-      for (const row of expectedActivity) {
-        if (typeof row?.source_id === 'string' && !activityText.includes(row.source_id)) {
-          throw new Error(`dashboard Activity omitted source ${row.source_id}`)
-        }
+      const activity = await readJsonScript(active.page, 'project-activity-json', 'dashboard Activity')
+      const evidence = await readJsonScript(active.page, 'project-evidence-json', 'dashboard Evidence')
+      if (!Array.isArray(activity?.rows) || !Array.isArray(evidence?.rows)) {
+        throw new Error('dashboard Activity or Evidence JSON has an invalid row contract')
       }
-      for (const row of expectedEvidence) {
-        if (typeof row?.source_id === 'string' && !evidenceText.includes(row.source_id)) {
-          throw new Error(`dashboard Evidence omitted source ${row.source_id}`)
-        }
-      }
-      return { activity: expectedActivity, evidence: expectedEvidence }
+      return { activity: activity.rows, evidence: evidence.rows }
     },
 
     async close() {
@@ -761,4 +741,14 @@ async function expectLocatorText(locator, expected) {
     await new Promise(resolve => setTimeout(resolve, 50))
   }
   throw new Error(`dashboard did not render verdict: ${expected}; observed: ${observed || '[empty]'}`)
+}
+
+async function readJsonScript(page, id, label) {
+  const raw = await page.locator(`#${id}`).textContent()
+  if (!raw) throw new Error(`${label} JSON is absent`)
+  try {
+    return JSON.parse(raw)
+  } catch {
+    throw new Error(`${label} JSON is invalid`)
+  }
 }
