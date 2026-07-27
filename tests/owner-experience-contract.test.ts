@@ -30,6 +30,7 @@ import {
   type PermissionCallerKind,
   type WinReceiptResolver,
 } from '../src/owner/owner-experience-contract'
+import { runContractAssertPolicy } from '../src/contracts/contract-assert-policy'
 
 /** Design-lifecycle statuses this contract doc may legitimately carry. */
 const ALLOWED_CONTRACT_STATUSES = ['design', 'reviewing', 'ready-for-build', 'approved'] as const
@@ -60,6 +61,7 @@ const contract = JSON.parse(
     forbidFakeGreen: boolean
     projectScopedKpiSourceIds: string[]
     measuredUnreachableInV1: boolean
+    v1Mode: string
   }
   unmetDependencies: Array<{ id: string; status: string }>
   nonGoals: string[]
@@ -134,8 +136,61 @@ describe('owner-experience/v1 contract doc', () => {
   it('locks measured-unreachable-in-v1 JSON fields against the TS allowlist constant', () => {
     expect(contract.progress.projectScopedKpiSourceIds).toEqual([...PROJECT_SCOPED_KPI_SOURCE_IDS])
     expect(PROJECT_SCOPED_KPI_SOURCE_IDS).toEqual([])
+    expect(Object.isFrozen(KPI_SOURCE_IDS)).toBe(true)
+    expect(Object.isFrozen(PROJECT_SCOPED_KPI_SOURCE_IDS)).toBe(true)
+    expect(Object.isFrozen(AUTONOMIES)).toBe(true)
     expect(contract.progress.measuredUnreachableInV1).toBe(true)
     expect(contract.progress.v1Mode).toBe('unmeasured_until_project_kpi')
+  })
+
+  it('enforces contract-assert-policy against the real JSON + suite (not a fixture)', () => {
+    const testSource = readFileSync(new URL(import.meta.url), 'utf8')
+    const findings = runContractAssertPolicy({
+      spec: {
+        lifecycleFields: [
+          {
+            field: 'status',
+            allowedValues: ALLOWED_CONTRACT_STATUSES,
+            whoMayFlip: ['loom', 'kasra', 'athena-gate'],
+          },
+        ],
+        jsonTsMirrors: [
+          { jsonPath: ['facets'], tsExportName: 'OWNER_EXPERIENCE_FACETS' },
+          { jsonPath: ['homeRequiredFacets'], tsExportName: 'OWNER_HOME_REQUIRED_FACETS' },
+          { jsonPath: ['loop'], tsExportName: 'OWNER_EXPERIENCE_LOOP' },
+          { jsonPath: ['principles'], tsExportName: 'OWNER_EXPERIENCE_PRINCIPLES' },
+          {
+            jsonPath: ['earnedAutonomy', 'defaultRequiredWins'],
+            tsExportName: 'DEFAULT_REQUIRED_WINS_PER_WIDEN',
+          },
+          {
+            jsonPath: ['earnedAutonomy', 'minRequiredWins'],
+            tsExportName: 'MIN_REQUIRED_WINS_PER_WIDEN',
+          },
+          {
+            jsonPath: ['earnedAutonomy', 'winConsumptionPolicy'],
+            tsExportName: 'WIN_CONSUMPTION_POLICY',
+          },
+          {
+            jsonPath: ['progress', 'projectScopedKpiSourceIds'],
+            tsExportName: 'PROJECT_SCOPED_KPI_SOURCE_IDS',
+          },
+        ],
+      },
+      contractJson: contract as unknown as Record<string, unknown>,
+      tsExports: {
+        OWNER_EXPERIENCE_FACETS,
+        OWNER_HOME_REQUIRED_FACETS,
+        OWNER_EXPERIENCE_LOOP,
+        OWNER_EXPERIENCE_PRINCIPLES,
+        DEFAULT_REQUIRED_WINS_PER_WIDEN,
+        MIN_REQUIRED_WINS_PER_WIDEN,
+        WIN_CONSUMPTION_POLICY,
+        PROJECT_SCOPED_KPI_SOURCE_IDS,
+      },
+      testSource,
+    })
+    expect(findings).toEqual([])
   })
 
   it('locks the load-bearing invariants and names unmet dependencies', () => {
