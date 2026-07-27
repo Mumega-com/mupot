@@ -35,6 +35,7 @@ test('install receipt creates runtime layout, templates, logs/state, and rendere
   assert.ok(existsSync(join(prefix, 'runtime', 'cutover-probe.mjs')))
   assert.ok(existsSync(join(prefix, 'daemon.json')))
   assert.ok(existsSync(join(prefix, 'inbox-handler.json')))
+  assert.ok(existsSync(join(prefix, 'codex-thread-endpoint.json')))
   assert.ok(existsSync(join(prefix, 'control.json')))
   assert.ok(existsSync(join(prefix, 'flights.json')))
   assert.ok(existsSync(join(systemdDir, 'fleet-daemon.service')))

@@ -37,6 +37,7 @@ const CONFIG_TEMPLATES = [
   ['inbox-handler.example.json', 'inbox-handler.json'],
   ['control.example.json', 'control.json'],
   ['flights.example.json', 'flights.json'],
+  ['codex-thread-endpoint.example.json', 'codex-thread-endpoint.json'],
 ]
 
 function expandHome(path) {

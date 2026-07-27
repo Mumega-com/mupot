@@ -34,6 +34,9 @@ Fork the pot → you get this. No tenant is hardcoded: `base_url` + `tenant` com
 | `daemon.example.json` | config template (set base_url, tenant, agents, probes) |
 | `inbox-handler.mjs` | durable local handoff command for daemon inbox batches |
 | `inbox-handler.example.json` | per-agent spool + launch command config |
+| `codex-thread-endpoint.mjs` | leased exact-thread Codex bridge with durable handoff |
+| `codex-thread-service.mjs` | per-thread launchd/systemd lifecycle and receipt CLI |
+| `codex-thread-endpoint.example.json` | host-local exact-thread bridge config |
 | `fleet-control-daemon.mjs` | signed open/close/restart consumer for `POST /api/fleet/control` |
 | `control-request.mjs` | host verifier for `fleet-control.v1` requests |
 | `control.example.json` | control-daemon config template |
@@ -203,6 +206,66 @@ kind matches `run_for`. The command receives JSON on stdin with `files[]`, `mess
 the batch. A non-zero exit, crash, or timeout leaves the Mupot messages unread for the next
 daemon tick. The inbox read is signed with the agent's Ed25519 key and POSTed to
 `/api/inbox/signed`; it does not need a bearer token.
+
+## Run an exact Codex thread endpoint
+
+Use this bridge when one welded Mupot agent has several Codex threads and a
+message must return to one specific project thread. The installer creates
+`~/.fleet/codex-thread-endpoint.json`; keep that file and its token file mode
+`0600`, then set the exact local `thread_id`, rollout path, project, and sender
+allowlist. An operator may copy a short SOS check-in code such as
+`20260727-0042` into `local_source_id` and the Codex thread title so the session
+can be found in both systems. SOS is otherwise separate from this Mupot
+transport, and that copied label is not a credential.
+
+```bash
+node ~/.fleet/runtime/codex-thread-endpoint.mjs \
+  ~/.fleet/codex-thread-endpoint.json
+```
+
+For an always-on bridge, install one separately named service per exact thread:
+
+```bash
+node ~/.fleet/runtime/codex-thread-service.mjs install \
+  --config ~/.fleet/codex-thread-endpoint.json
+```
+
+Use the same command with `status`, `reload`, or `uninstall`. The service name is
+derived from a thread hash, so several Codex threads can be supervised on one
+host without sharing a global process slot.
+
+The raw Codex thread UUID never leaves the host. Startup registers a random
+host-local session handle; Mupot stores only its SHA-256 fingerprint and returns
+an opaque endpoint id plus a rotating endpoint capability. The capability is
+stored only in the host's `0600` state and is required for inbox, heartbeat,
+acceptance, and revocation. The bridge peeks that endpoint's durable inbox,
+persists each message locally before execution, and invokes:
+
+```bash
+codex exec resume <exact-thread-id> --skip-git-repo-check --json -
+```
+
+It does not use `--last`. An active-turn guard scans backward through the full
+rollout instead of trusting a fixed-size tail. All cooperating watchers use one
+canonical host-wide lock derived from the exact thread. Mupot acceptance happens
+only after Codex emits a turn id. If the accept request fails, the local spool
+keeps that turn id and retries consumption without executing the request twice.
+An uncertain prior dispatch or an unconfirmed child termination writes a
+durable `*.fault.json` marker and stops the bridge. An operator must inspect the
+spool and Codex process state before clearing that marker and restarting; the
+bridge never guesses whether it is safe to execute the message again.
+
+The bridge log and delivery receipts include endpoint/message/request/turn
+references only. They exclude the raw thread UUID, bearer token, and message
+body. Message bodies exist only in the `0600` pending spool until Mupot accepts
+the turn.
+
+This CLI adapter is a hardened foundation, not the production credential
+boundary. A production deployment must run the supervisor credential store
+under a separate OS principal or broker that Codex tool execution cannot read,
+and must use the app-server `thread/resume` plus `turn/start` path for
+authoritative busy-turn handling. The rollout scan cannot make a competing
+Desktop turn atomic.
 
 ## Run the control daemon (remote open/close)
 

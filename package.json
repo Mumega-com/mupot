@@ -63,6 +63,8 @@
     "fleet:starter": "node fleet-runtime/starter-manifest.mjs",
     "fleet:service": "node fleet-runtime/service-manager.mjs",
     "fleet:trust:bootstrap": "node fleet-runtime/trust-bootstrap.mjs",
+    "fleet:codex-endpoint": "node fleet-runtime/codex-thread-endpoint.mjs",
+    "fleet:codex-endpoint-service": "node fleet-runtime/codex-thread-service.mjs",
     "migrate:remote": "wrangler d1 migrations apply mupot --remote",
     "update": "node scripts/mupot-update.mjs"
   },
