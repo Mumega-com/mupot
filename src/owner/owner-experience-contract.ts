@@ -87,7 +87,8 @@ export type WinReceiptResolver = (receiptId: string) => WinReceiptRecord | null
 
 /**
  * Opaque trust object — carries resolved content (polarity, scope, time).
- * Only `verifiedWinRefFromResolver` may construct it.
+ * Only `verifiedWinRefFromResolver` may construct it, and only refs in the
+ * runtime WeakSet registry are accepted by decideEarnedAutonomyWiden.
  */
 export type VerifiedWinRef = {
   readonly _brand: 'VerifiedWinRef'
@@ -97,6 +98,9 @@ export type VerifiedWinRef = {
   readonly polarity: 'win'
   readonly resolvedAt: string
 }
+
+/** Runtime provenance — shape/_brand alone is not enough (same class as ranker). */
+const verifiedWinRegistry = new WeakSet<object>()
 
 export type WinRefResolution =
   | VerifiedWinRef
@@ -114,7 +118,8 @@ export type WinRefResolution =
 /**
  * Sole constructor for VerifiedWinRef. A plain
  * `{ verification: 'resolved_by_id' }` bag is not accepted — that was the
- * label pattern (mechanism-lock ≠ trust-lock).
+ * label pattern (mechanism-lock ≠ trust-lock). Forged `_brand` literals are
+ * refused at the gate via WeakSet.
  */
 export function verifiedWinRefFromResolver(
   resolver: WinReceiptResolver,
@@ -143,14 +148,16 @@ export function verifiedWinRefFromResolver(
   const resolvedAt = String(record.resolvedAt || '').trim()
   if (!resolvedAt) return { ok: false, reason: 'unverified_win_label' }
 
-  return {
-    _brand: 'VerifiedWinRef',
+  const ref: VerifiedWinRef = Object.freeze({
+    _brand: 'VerifiedWinRef' as const,
     receiptId: id,
     projectId,
     agentId,
-    polarity: 'win',
+    polarity: 'win' as const,
     resolvedAt,
-  }
+  })
+  verifiedWinRegistry.add(ref)
+  return ref
 }
 
 /** @deprecated Label-only shape — rejected by decideEarnedAutonomyWiden. */
@@ -289,6 +296,7 @@ function isBrandedWinRef(win: VerifiedWinRef | LabeledWinRef): win is VerifiedWi
   return (
     typeof win === 'object' &&
     win !== null &&
+    verifiedWinRegistry.has(win as object) &&
     '_brand' in win &&
     (win as VerifiedWinRef)._brand === 'VerifiedWinRef'
   )

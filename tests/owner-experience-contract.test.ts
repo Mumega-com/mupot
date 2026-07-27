@@ -89,7 +89,7 @@ describe('owner-experience/v1 contract doc', () => {
     expect(contract.talk.tier2Status).toBe('dyad-gate-blocked')
     expect(contract.earnedAutonomy.mubotSelfWiden).toBe(false)
     expect(contract.earnedAutonomy.winVerification).toBe(
-      'branded-VerifiedWinRef-from-WinReceiptResolver',
+      'branded-VerifiedWinRef-from-WinReceiptResolver-WeakSet-registry',
     )
     expect(contract.earnedAutonomy.winConsumptionPolicy).toBe(WIN_CONSUMPTION_POLICY)
     expect(contract.progress.forbidFakeGreen).toBe(true)
@@ -161,7 +161,7 @@ describe('earned autonomy trust-locks', () => {
     expect(autonomyForTrustLevel(2)).toBe('execute_with_approval')
   })
 
-  it('refuses caller-written resolved_by_id labels (original failing scenario)', () => {
+  it('refuses caller-written resolved_by_id labels and forged brands (WeakSet)', () => {
     expect(
       decideEarnedAutonomyWiden({
         projectId: 'proj-a',
@@ -174,6 +174,28 @@ describe('earned autonomy trust-locks', () => {
           { receiptId: 'wr-2', verification: 'resolved_by_id' },
           { receiptId: 'wr-3', verification: 'resolved_by_id' },
         ],
+        requiredWins: 3,
+        consumedReceiptIds: [],
+      }),
+    ).toEqual({ ok: false, reason: 'unverified_win_label' })
+
+    // Cosmetic _brand without registry — same class as ranker forge.
+    const forged = {
+      _brand: 'VerifiedWinRef' as const,
+      receiptId: 'never-resolved',
+      projectId: 'proj-a',
+      agentId: 'agent-a',
+      polarity: 'win' as const,
+      resolvedAt: '2026-07-27T12:00:00.000Z',
+    }
+    expect(
+      decideEarnedAutonomyWiden({
+        projectId: 'proj-a',
+        agentId: 'agent-a',
+        current: 'suggest',
+        proposed: 'draft',
+        actingPrincipalKind: 'owner_or_admin_human',
+        wins: [forged, forged, forged],
         requiredWins: 3,
         consumedReceiptIds: [],
       }),

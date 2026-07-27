@@ -193,12 +193,14 @@ Trust levels map 1:1 onto existing `Autonomy` (no parallel enum):
 - Input requires **projectId** and **agentId** (scope keys on the gate itself —
   not a sibling table convention). Fail closed on mismatch.
 - Wins are **branded `VerifiedWinRef`** minted only by
-  `verifiedWinRefFromResolver(resolver, receiptId, scope)`. The resolver is the
-  trust boundary (Port-4 InstinctChat pattern). A caller-written
-  `{ verification: 'resolved_by_id' }` label is rejected — mechanism-lock ≠
-  trust-lock. The brand carries resolved **content** (polarity must be `win`,
-  projectId, agentId, resolvedAt), so constructing it without a real lookup is
-  structurally impossible at the type boundary.
+  `verifiedWinRefFromResolver(resolver, receiptId, scope)`, registered in a
+  runtime **WeakSet**, and frozen. The resolver is the trust boundary (Port-4
+  InstinctChat pattern); the WeakSet is the provenance check (same class as
+  ranker's `VerifiedReceiptRef`). A caller-written
+  `{ verification: 'resolved_by_id' }` label **or** a forged `{ _brand:
+  'VerifiedWinRef', ... }` literal is rejected — mechanism-lock ≠ trust-lock.
+  The brand carries resolved **content** (polarity must be `win`, projectId,
+  agentId, resolvedAt).
 - Pure gate passes only when:
   1. `proposed` is exactly one step above `current` (no skip-to-blanket),
   2. `actingPrincipal` is an owner/admin human (never the mubot agent id),
