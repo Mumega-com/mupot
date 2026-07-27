@@ -146,70 +146,133 @@ export type DistillEligibility =
         | 'insufficient_corroboration'
         | 'unknown_store'
         | 'source_kind_mismatch'
+        | 'project_id_required'
+        | 'project_scope_mismatch'
     }
 
 /**
- * Opaque trust object — cannot be built by setting a boolean on a plain bag.
- * Only `verifiedReceiptRefFromStoreLookup` may construct it.
+ * Opaque trust object — carries resolved store content, not a self-describing tag.
+ * Only `verifiedReceiptRefFromResolver` may construct it (InstinctChat DI pattern).
  */
 export type VerifiedReceiptRef = {
   readonly _brand: 'VerifiedReceiptRef'
   readonly receiptId: string
   readonly sourceKind: DistillSource
-  readonly corroboratingReceiptIds: readonly string[]
   readonly store: 'gate_driver' | 'frc'
+  readonly projectId: string
+  readonly resolvedAt: string
+  readonly sanitizedContent: string
+  readonly corroboratingReceiptIds: readonly string[]
 }
 
-/** Result shape a real Port-4 / FRC lookup must return before distill is allowed. */
-export interface ReceiptStoreLookupHit {
-  found: true
+/** Record a real store resolver must return. Trust claim ≠ trust object. */
+export interface ReceiptStoreRecord {
   receiptId: string
   sourceKind: string
   store: 'gate_driver' | 'frc'
-  /** Additional receipt IDs that corroborate (may include self). */
+  projectId: string
+  resolvedAt: string
+  content: string
   corroboratingReceiptIds: readonly string[]
 }
 
-export type ReceiptStoreLookupMiss = { found: false; receiptId: string }
-
-export type ReceiptStoreLookup = ReceiptStoreLookupHit | ReceiptStoreLookupMiss
+/**
+ * Injected trust boundary (Port-4 InstinctChat pattern). Production wires
+ * gate_driver / FRC; tests inject fakes. Callers never pass a boolean label.
+ */
+export type ReceiptStoreResolver = (receiptId: string) => ReceiptStoreRecord | null
 
 /**
- * Sole constructor for VerifiedReceiptRef. A plain `{verifiedAgainstStore:true}`
- * bag is not accepted anywhere — that was rename-not-fix.
+ * Sole constructor for VerifiedReceiptRef. A plain
+ * `{verifiedAgainstStore:true}` / forged lookup bag is not accepted —
+ * resolution must go through the injected resolver and produce content.
  */
-export function verifiedReceiptRefFromStoreLookup(
-  lookup: ReceiptStoreLookup,
+export function verifiedReceiptRefFromResolver(
+  resolver: ReceiptStoreResolver,
+  receiptId: string,
+  expectedProjectId: string,
 ): VerifiedReceiptRef | DistillEligibility {
-  if (!lookup.found) {
-    return { ok: false, reason: 'unverified_receipt' }
+  const projectId = String(expectedProjectId || '').trim()
+  if (!projectId) {
+    return { ok: false, reason: 'project_id_required' }
   }
-  if (!lookup.receiptId || !String(lookup.receiptId).trim()) {
+  const id = String(receiptId || '').trim()
+  if (!id) {
     return { ok: false, reason: 'missing_receipt_id' }
   }
-  if (lookup.store !== 'gate_driver' && lookup.store !== 'frc') {
+  const record = resolver(id)
+  if (!record) {
+    return { ok: false, reason: 'unverified_receipt' }
+  }
+  if (String(record.receiptId).trim() !== id) {
+    return { ok: false, reason: 'unverified_receipt' }
+  }
+  if (String(record.projectId).trim() !== projectId) {
+    return { ok: false, reason: 'project_scope_mismatch' }
+  }
+  if (record.store !== 'gate_driver' && record.store !== 'frc') {
     return { ok: false, reason: 'unknown_store' }
   }
-  const kindGate = mayDistillFromSource(lookup.sourceKind)
+  const kindGate = mayDistillFromSource(record.sourceKind)
   if (!kindGate.ok) return kindGate
-  if (!(DISTILL_ALLOWED_SOURCES as readonly string[]).includes(lookup.sourceKind)) {
+  if (!(DISTILL_ALLOWED_SOURCES as readonly string[]).includes(record.sourceKind)) {
     return { ok: false, reason: 'source_kind_mismatch' }
   }
   const ids = new Set(
-    [lookup.receiptId, ...lookup.corroboratingReceiptIds]
-      .map((id) => String(id).trim())
+    [record.receiptId, ...record.corroboratingReceiptIds]
+      .map((x) => String(x).trim())
       .filter(Boolean),
   )
   if (ids.size < INJECT_MIN_CORROBORATING_RECEIPTS) {
     return { ok: false, reason: 'insufficient_corroboration' }
   }
+  const resolvedAt = String(record.resolvedAt || '').trim()
+  if (!resolvedAt) {
+    return { ok: false, reason: 'unverified_receipt' }
+  }
   return {
     _brand: 'VerifiedReceiptRef',
-    receiptId: String(lookup.receiptId).trim(),
-    sourceKind: lookup.sourceKind as DistillSource,
+    receiptId: id,
+    sourceKind: record.sourceKind as DistillSource,
+    store: record.store,
+    projectId,
+    resolvedAt,
+    sanitizedContent: sanitizeReceiptContentForDistill(record.content),
     corroboratingReceiptIds: [...ids],
-    store: lookup.store,
   }
+}
+
+/** @deprecated Prefer verifiedReceiptRefFromResolver — kept for inventory honesty. */
+export function verifiedReceiptRefFromStoreLookup(
+  lookup:
+    | { found: false; receiptId: string }
+    | {
+        found: true
+        receiptId: string
+        sourceKind: string
+        store: 'gate_driver' | 'frc'
+        projectId: string
+        resolvedAt: string
+        content: string
+        corroboratingReceiptIds: readonly string[]
+      },
+  expectedProjectId: string,
+): VerifiedReceiptRef | DistillEligibility {
+  const resolver: ReceiptStoreResolver = (id) => {
+    if (!lookup.found || String(lookup.receiptId).trim() !== String(id).trim()) {
+      return null
+    }
+    return {
+      receiptId: lookup.receiptId,
+      sourceKind: lookup.sourceKind,
+      store: lookup.store,
+      projectId: lookup.projectId,
+      resolvedAt: lookup.resolvedAt,
+      content: lookup.content,
+      corroboratingReceiptIds: lookup.corroboratingReceiptIds,
+    }
+  }
+  return verifiedReceiptRefFromResolver(resolver, lookup.receiptId, expectedProjectId)
 }
 
 /** @deprecated Mechanism-lock label check — keep for inventory honesty; use VerifiedReceiptRef path. */
@@ -309,8 +372,9 @@ export function mayDistillFromSource(source: string): DistillEligibility {
 }
 
 /**
- * Trust-lock: only branded VerifiedReceiptRef (from store lookup) may distill.
+ * Trust-lock: only branded VerifiedReceiptRef (from resolver) may distill.
  * Plain bags with verifiedAgainstStore boolean are rejected as unverified_receipt.
+ * Forged brand without resolved content fields also fails.
  */
 export function mayDistillFromReceiptRef(
   ref: VerifiedReceiptRef | DistillReceiptRef,
@@ -324,6 +388,15 @@ export function mayDistillFromReceiptRef(
   const branded = ref as VerifiedReceiptRef
   if (!branded.receiptId || !String(branded.receiptId).trim()) {
     return { ok: false, reason: 'missing_receipt_id' }
+  }
+  if (!branded.projectId || !String(branded.projectId).trim()) {
+    return { ok: false, reason: 'project_id_required' }
+  }
+  if (!branded.resolvedAt || !String(branded.resolvedAt).trim()) {
+    return { ok: false, reason: 'unverified_receipt' }
+  }
+  if (typeof branded.sanitizedContent !== 'string') {
+    return { ok: false, reason: 'unverified_receipt' }
   }
   const kindGate = mayDistillFromSource(branded.sourceKind)
   if (!kindGate.ok) return kindGate
