@@ -17,7 +17,11 @@ const { default: worker } = await import('../src/index')
 const ROUTINE_CRON = '* * * * *'
 const MAINTENANCE_CRON = '0-9,15-24,30-39,45-54 * * * *'
 
-async function scheduledFanout(minute: number, cron: string): Promise<number> {
+async function scheduledFanout(
+  minute: number,
+  cron: string,
+  hour = 16,
+): Promise<number> {
   const work: Promise<unknown>[] = []
   const context = {
     waitUntil(promise: Promise<unknown>) {
@@ -25,7 +29,7 @@ async function scheduledFanout(minute: number, cron: string): Promise<number> {
     },
   }
   const controller = {
-    scheduledTime: Date.UTC(2026, 6, 27, 16, minute),
+    scheduledTime: Date.UTC(2026, 6, 27, hour, minute),
     cron,
   }
 
@@ -49,19 +53,74 @@ describe('scheduled invocation budget', () => {
     }
   })
 
-  it('fails closed for unrecognized or legacy cron triggers', async () => {
+  it('fails closed and bounds warnings for unrecognized or legacy cron triggers', async () => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
     try {
       expect(await scheduledFanout(0, '*/15 * * * *')).toBe(0)
-      expect(warning).toHaveBeenCalledOnce()
-      expect(warning).toHaveBeenCalledWith('[scheduled:unmatched-cron]', {
-        kind: 'unmatched_cron',
-        scheduled_time: '2026-07-27T16:00:00.000Z',
-        expected_trigger_count: 2,
-      })
+      expect(await scheduledFanout(1, 'unexpected-value')).toBe(0)
+      expect(await scheduledFanout(0, 'another-unexpected-value', 17)).toBe(0)
+      expect(warning).toHaveBeenCalledTimes(2)
+      expect(warning.mock.calls).toEqual([
+        ['[scheduled:unmatched-cron]', {
+          kind: 'unmatched_cron',
+          scheduled_time: '2026-07-27T16:00:00.000Z',
+          expected_trigger_count: 2,
+        }],
+        ['[scheduled:unmatched-cron]', {
+          kind: 'unmatched_cron',
+          scheduled_time: '2026-07-27T17:00:00.000Z',
+          expected_trigger_count: 2,
+        }],
+      ])
       expect(JSON.stringify(warning.mock.calls)).not.toContain('*/15 * * * *')
+      expect(JSON.stringify(warning.mock.calls)).not.toContain('unexpected-value')
     } finally {
       warning.mockRestore()
+    }
+  })
+
+  it('emits one bounded dispatch marker for each scheduled route per isolate', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      expect(await scheduledFanout(0, ROUTINE_CRON, 17)).toBe(1)
+      expect(await scheduledFanout(1, ROUTINE_CRON, 17)).toBe(1)
+      for (const minute of Array.from({ length: 10 }, (_, index) => index)) {
+        expect(await scheduledFanout(minute, MAINTENANCE_CRON, 17)).toBe(1)
+      }
+
+      const markers = info.mock.calls.filter(
+        ([label]) => label === '[scheduled:dispatch]',
+      )
+      expect(markers).toHaveLength(11)
+      expect(markers.map(([, payload]) => payload)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: 'scheduled_dispatch',
+            route: 'project-routines',
+          }),
+          ...[
+            'membership',
+            'metabolism',
+            'loops',
+            'github-project',
+            'growth',
+            'cro',
+            'flight-outbox',
+            'concierge',
+            'project-loop',
+            'agent-connection-retention',
+          ].map((route) => expect.objectContaining({
+            kind: 'scheduled_dispatch',
+            route,
+          })),
+        ]),
+      )
+      expect(JSON.stringify(markers)).not.toContain(ROUTINE_CRON)
+      expect(JSON.stringify(markers)).not.toContain(MAINTENANCE_CRON)
+    } finally {
+      info.mockRestore()
+      error.mockRestore()
     }
   })
 

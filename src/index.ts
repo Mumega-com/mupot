@@ -240,6 +240,35 @@ import { dispatchRoutineRun } from './routines/dispatch'
 
 const ROUTINE_CRON = '* * * * *'
 const MAINTENANCE_CRON = '0-9,15-24,30-39,45-54 * * * *'
+const scheduledObservationBuckets = new Map<string, number>()
+
+function shouldEmitScheduledObservation(
+  key: string,
+  scheduledAt: Date,
+): boolean {
+  const hourBucket = Math.floor(scheduledAt.getTime() / 3_600_000)
+  if (scheduledObservationBuckets.get(key) === hourBucket) return false
+  scheduledObservationBuckets.set(key, hourBucket)
+  return true
+}
+
+function reportScheduledDispatch(route: string, scheduledAt: Date): void {
+  if (!shouldEmitScheduledObservation(`dispatch:${route}`, scheduledAt)) return
+  console.info('[scheduled:dispatch]', {
+    kind: 'scheduled_dispatch',
+    route,
+    scheduled_time: scheduledAt.toISOString(),
+  })
+}
+
+function reportUnmatchedCron(scheduledAt: Date): void {
+  if (!shouldEmitScheduledObservation('unmatched', scheduledAt)) return
+  console.warn('[scheduled:unmatched-cron]', {
+    kind: 'unmatched_cron',
+    scheduled_time: scheduledAt.toISOString(),
+    expected_trigger_count: 2,
+  })
+}
 
 export default {
   // The OAuth provider is the outer entry point. It handles OAuth paths and
@@ -253,9 +282,13 @@ export default {
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     const scheduledAt = new Date(controller.scheduledTime)
     const waitFor = (label: string, work: Promise<unknown>) => {
-      ctx.waitUntil(work.catch((error) => {
-        console.error(`[scheduled:${label}]`, error)
-      }))
+      reportScheduledDispatch(label, scheduledAt)
+      ctx.waitUntil(
+        work
+          .catch((error) => {
+            console.error(`[scheduled:${label}]`, error)
+          }),
+      )
     }
 
     if (controller.cron === ROUTINE_CRON) {
@@ -275,11 +308,7 @@ export default {
     }
 
     if (controller.cron !== MAINTENANCE_CRON) {
-      console.warn('[scheduled:unmatched-cron]', {
-        kind: 'unmatched_cron',
-        scheduled_time: scheduledAt.toISOString(),
-        expected_trigger_count: 2,
-      })
+      reportUnmatchedCron(scheduledAt)
       return
     }
 
