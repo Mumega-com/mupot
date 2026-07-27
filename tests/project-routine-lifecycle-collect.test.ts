@@ -396,6 +396,7 @@ describe('project routine lifecycle collector', () => {
         },
       },
     })
+    expect(writes.get('artifacts/collector-summary.json')).toEqual(result)
 
     const serialized = JSON.stringify([...writes.entries()])
     for (const secret of [OWNER_TOKEN, AGENT_TOKEN, WRONG_TOKEN, 'private-coordinate-never-write']) {

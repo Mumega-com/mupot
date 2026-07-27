@@ -946,6 +946,7 @@ async function collectLifecycle(config, deps, secretValues) {
   for (const [relativePath, value] of [...artifacts, ...receipts]) {
     await deps.writeArtifact(relativePath, redact(value, secretValues))
   }
+  await deps.writeArtifact('artifacts/collector-summary.json', redact(summary, secretValues))
   return summary
 }
 
