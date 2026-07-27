@@ -147,8 +147,21 @@ describe('brain-learning-ranker/v1 contract doc', () => {
     expect(contract.instinct.decayHalfLifeDays).toBe(INSTINCT_DECAY_HALF_LIFE_DAYS)
     expect(contract.bias.maxLearnDelta).toBe(MAX_LEARN_DELTA)
     expect(contract.bias.noopVetoSeparateFromMaxLearnDelta).toBe(true)
-    expect(contract.acceptance.testCount).toBeGreaterThanOrEqual(20)
     expect(contract.invariants).toContain('noop-veto-full-block-unbounded-priority')
+    // Drift-lock: JSON testCount must equal actual `it(` count (not a floor against a literal).
+    const suiteSource = readFileSync(new URL(import.meta.url), 'utf8')
+    const itCount = [...suiteSource.matchAll(/^\s*it\(/gm)].length
+    expect(contract.acceptance.testCount).toBe(itCount)
+    // Drift-lock: design.md MAX_LEARN_DELTA claim must match code (catches §4 decision 9 15.0→5).
+    const designMd = readFileSync(
+      new URL('../docs/superpowers/specs/2026-07-27-brain-learning-ranker-design.md', import.meta.url),
+      'utf8',
+    )
+    expect(designMd).not.toMatch(/MAX_LEARN_DELTA \(default 15\.0/)
+    expect(designMd).not.toMatch(/audited delta still clamped/)
+    expect(designMd).toMatch(/MAX_LEARN_DELTA=5/)
+    expect(designMd).toMatch(/noop-veto-full-block-unbounded-priority/)
+    expect(designMd).toMatch(/audited `delta` records the true priority change/)
   })
 
   it('locks the load-bearing invariants including split fences', () => {
