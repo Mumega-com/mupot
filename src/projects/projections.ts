@@ -5,6 +5,7 @@ import {
   projectLinkTimestampMsSql,
 } from '../addons/project-link/timestamps'
 import { DISPATCH_BRIDGE_SENDER, DISPATCH_INBOX_PREFIX } from '../bus/fleet-bridge'
+import { routineTablesReady } from '../routines/schema-ready'
 
 export type ProjectActivitySource = 'task' | 'message' | 'flight' | 'project_link' | 'routine_event'
 export type ProjectEvidenceSource =
@@ -76,7 +77,6 @@ const RECEIPT_KEYSET_INDEXES = [
   'idx_flight_event_outbox_evidence_keyset',
 ] as const
 const receiptKeysetReady = new WeakSet<object>()
-const routineProjectionSchemaReady = new WeakSet<object>()
 const ASSIGNMENT_RE = /((?:^|[\s,;{?&])["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=]\s*)[^,;}&\r\n]+/g
 const QUERY_ASSIGNMENT_RE = /([?&])([A-Za-z][A-Za-z0-9_.-]*)(=)[^&#\s]*/g
 
@@ -159,20 +159,6 @@ async function receiptKeysetHintsReady(env: Env): Promise<boolean> {
   const names = new Set((result.results ?? []).map((row) => row.name))
   const ready = RECEIPT_KEYSET_INDEXES.every((name) => names.has(name))
   if (ready) receiptKeysetReady.add(database)
-  return ready
-}
-
-async function routineProjectionTablesReady(env: Env): Promise<boolean> {
-  const database = env.DB as unknown as object
-  if (routineProjectionSchemaReady.has(database)) return true
-  const result = await env.DB.prepare(
-    `SELECT COUNT(*) AS count
-       FROM sqlite_master
-      WHERE type = 'table'
-        AND name IN ('routines', 'routine_runs', 'routine_run_events', 'routine_run_actions')`,
-  ).all<{ count: number }>()
-  const ready = Number(result.results?.[0]?.count ?? 0) === 4
-  if (ready) routineProjectionSchemaReady.add(database)
   return ready
 }
 
@@ -387,7 +373,7 @@ export async function listProjectActivity(
   const linkFailureAt = projectLinkTimestampMsSql('last_failure_at')
   const linkAfter = afterClause(input, linkOccurredAt, 'id', 'project_link', 5)
   const routineEventAfter = afterClause(input, epochMs('e.occurred_at'), 'e.id', 'routine_event', 5)
-  const includeRoutineEvents = !input.excludeRoutineEvents && await routineProjectionTablesReady(env)
+  const includeRoutineEvents = !input.excludeRoutineEvents && await routineTablesReady(env)
 
   const [taskRows, messageRows, flightRows, linkRows, routineEventRows] = await Promise.all([
     env.DB.prepare(
@@ -566,7 +552,7 @@ export async function listProjectEvidence(
   const workflowProjectScope = useReceiptKeysetHints ? 'w.project_id = ?1 AND' : ''
   const dispatchProjectScope = useReceiptKeysetHints ? 'd.project_id = ?1 AND' : ''
   const landingProjectScope = useReceiptKeysetHints ? 'o.project_id = ?2 AND' : ''
-  const includeRoutineEvidence = await routineProjectionTablesReady(env)
+  const includeRoutineEvidence = await routineTablesReady(env)
 
   const [results, verdicts, workflows, dispatches, landings, acknowledgements] = await Promise.all([
     env.DB.prepare(
