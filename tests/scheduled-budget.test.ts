@@ -59,6 +59,8 @@ describe('scheduled invocation budget', () => {
       expect(await scheduledFanout(0, '*/15 * * * *')).toBe(0)
       expect(await scheduledFanout(1, 'unexpected-value')).toBe(0)
       expect(await scheduledFanout(0, 'another-unexpected-value', 17)).toBe(0)
+      expect(await scheduledFanout(2, 'delayed-unexpected-value', 16)).toBe(0)
+      expect(await scheduledFanout(1, 'repeated-unexpected-value', 17)).toBe(0)
       expect(warning).toHaveBeenCalledTimes(2)
       expect(warning.mock.calls).toEqual([
         ['[scheduled:unmatched-cron]', {

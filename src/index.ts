@@ -247,7 +247,8 @@ function shouldEmitScheduledObservation(
   scheduledAt: Date,
 ): boolean {
   const hourBucket = Math.floor(scheduledAt.getTime() / 3_600_000)
-  if (scheduledObservationBuckets.get(key) === hourBucket) return false
+  const latestBucket = scheduledObservationBuckets.get(key)
+  if (latestBucket !== undefined && latestBucket >= hourBucket) return false
   scheduledObservationBuckets.set(key, hourBucket)
   return true
 }
