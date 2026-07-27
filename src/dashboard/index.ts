@@ -3348,9 +3348,34 @@ function shell(
       .ui-panel-sub { font-size: 12px; color: var(--dim); margin-top: 1px; }
       .ui-link { font-size: 12.5px; color: var(--primary); text-decoration: none; font-weight: 600; }
       .ui-link:hover { text-decoration: underline; }
+      .routine-form label { display: grid; gap: 5px; min-width: 0; }
+      .routine-form input, .routine-form select, .routine-form textarea {
+        width: 100%; min-width: 0; max-width: 100%;
+      }
+      .routine-table .routine-cell {
+        display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere;
+      }
       .obs-queue-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
       @media (max-width: 720px) {
         .ui-tr.ui-hide-sm-3 > .ui-td:nth-child(n+4), .ui-tr.ui-hide-sm-3 > .ui-th:nth-child(n+4) { display: none; }
+        .routine-table { min-width: 0 !important; }
+        .routine-table .ui-thead {
+          position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+          overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+        }
+        .routine-table .ui-row {
+          grid-template-columns: minmax(0, 1fr) !important;
+          align-items: start; gap: 10px; padding: 14px;
+        }
+        .routine-table .ui-td {
+          display: grid; grid-template-columns: minmax(7rem, 35%) minmax(0, 1fr);
+          gap: 12px; align-items: start;
+        }
+        .routine-table .ui-td::before {
+          content: attr(data-label);
+          font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+          letter-spacing: .6px; text-transform: uppercase; color: var(--dim);
+        }
       }
 
       /* ── /approvals page styles (kept here to avoid duplication) ── */
