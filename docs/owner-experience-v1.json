@@ -29,10 +29,13 @@
     "receipts-resolved-by-id-not-label",
     "progress-never-fake-green",
     "earned-autonomy-one-step-with-verified-wins",
+    "earned-autonomy-wins-consumed-after-widen",
+    "earned-autonomy-scope-bound-to-project-and-agent",
     "lesson-requires-receipt-id",
     "talk-v1-tier1-mubot-only",
     "learn-adapt-instinct-requires-port4-prerequisite",
-    "brain-remains-rank-not-act"
+    "brain-remains-rank-not-act",
+    "mechanism-lock-ne-trust-lock"
   ],
   "talk": {
     "v1Runtime": "tier1_persistent_mubot",
@@ -48,9 +51,14 @@
   "earnedAutonomy": {
     "maxStepsPerWiden": 1,
     "defaultRequiredWins": 3,
-    "winVerification": "resolved_by_id",
+    "winVerification": "branded-VerifiedWinRef-from-WinReceiptResolver",
+    "winConstructor": "verifiedWinRefFromResolver",
+    "trustBoundary": "injected-WinReceiptResolver-like-Port4-InstinctChat",
+    "winConsumptionPolicy": "mark_consumed_after_successful_widen",
+    "scopeKeysRequired": ["projectId", "agentId"],
     "decider": "owner_or_admin_human",
-    "mubotSelfWiden": false
+    "mubotSelfWiden": false,
+    "note": "Same three receipts cannot climb the ladder — consumeReceiptIds must be persisted; top of ladder (execute) is NOT auto-gated per autonomyImpliesGate"
   },
   "progress": {
     "allowedKinds": ["measured", "unmeasured", "unavailable"],

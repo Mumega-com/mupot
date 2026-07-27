@@ -49,25 +49,132 @@ export const OWNER_TRUST_LADDER: readonly Autonomy[] = [
 
 export const DEFAULT_REQUIRED_WINS_PER_WIDEN = 3
 
+/**
+ * Rate/consumption story (named, not implied):
+ * Successful widen returns consumeReceiptIds; those ids must be passed back in
+ * consumedReceiptIds on later calls so the same three wins cannot walk the
+ * full ladder. Audit trail + mandatory owner review remain the outer defense;
+ * consumption is the in-function fence against reuse.
+ */
+export const WIN_CONSUMPTION_POLICY =
+  'mark_consumed_after_successful_widen' as const
+
 export type TalkRuntimeKind = 'tier1_persistent_mubot' | 'tier2_stateless_user_chat'
 
-export type WinVerification = 'resolved_by_id' | 'unverified_label'
+export type PermissionCallerKind = 'owner_or_admin_human' | 'mubot_or_agent' | 'other'
 
-export interface VerifiedWinRef {
+/** Record a real workflow_receipts resolver must return. Trust claim ≠ trust object. */
+export interface WinReceiptRecord {
   receiptId: string
-  verification: WinVerification
+  projectId: string
+  agentId: string
+  polarity: 'win' | 'miss'
+  resolvedAt: string
+}
+
+/**
+ * Injected trust boundary (Port-4 InstinctChat pattern). Production wires
+ * workflow_receipts; tests inject fakes. Callers never pass a self-describing tag.
+ */
+export type WinReceiptResolver = (receiptId: string) => WinReceiptRecord | null
+
+/**
+ * Opaque trust object — carries resolved content (polarity, scope, time).
+ * Only `verifiedWinRefFromResolver` may construct it.
+ */
+export type VerifiedWinRef = {
+  readonly _brand: 'VerifiedWinRef'
+  readonly receiptId: string
+  readonly projectId: string
+  readonly agentId: string
+  readonly polarity: 'win'
+  readonly resolvedAt: string
+}
+
+export type WinRefResolution =
+  | VerifiedWinRef
+  | {
+      ok: false
+      reason:
+        | 'unverified_win_label'
+        | 'scope_mismatch'
+        | 'not_a_win'
+        | 'missing_receipt_id'
+        | 'project_id_required'
+        | 'agent_id_required'
+    }
+
+/**
+ * Sole constructor for VerifiedWinRef. A plain
+ * `{ verification: 'resolved_by_id' }` bag is not accepted — that was the
+ * label pattern (mechanism-lock ≠ trust-lock).
+ */
+export function verifiedWinRefFromResolver(
+  resolver: WinReceiptResolver,
+  receiptId: string,
+  scope: { projectId: string; agentId: string },
+): WinRefResolution {
+  const projectId = String(scope.projectId || '').trim()
+  const agentId = String(scope.agentId || '').trim()
+  if (!projectId) return { ok: false, reason: 'project_id_required' }
+  if (!agentId) return { ok: false, reason: 'agent_id_required' }
+  const id = String(receiptId || '').trim()
+  if (!id) return { ok: false, reason: 'missing_receipt_id' }
+
+  const record = resolver(id)
+  if (!record) return { ok: false, reason: 'unverified_win_label' }
+  if (String(record.receiptId).trim() !== id) {
+    return { ok: false, reason: 'unverified_win_label' }
+  }
+  if (
+    String(record.projectId).trim() !== projectId ||
+    String(record.agentId).trim() !== agentId
+  ) {
+    return { ok: false, reason: 'scope_mismatch' }
+  }
+  if (record.polarity !== 'win') return { ok: false, reason: 'not_a_win' }
+  const resolvedAt = String(record.resolvedAt || '').trim()
+  if (!resolvedAt) return { ok: false, reason: 'unverified_win_label' }
+
+  return {
+    _brand: 'VerifiedWinRef',
+    receiptId: id,
+    projectId,
+    agentId,
+    polarity: 'win',
+    resolvedAt,
+  }
+}
+
+/** @deprecated Label-only shape — rejected by decideEarnedAutonomyWiden. */
+export interface LabeledWinRef {
+  receiptId: string
+  verification: 'resolved_by_id' | 'unverified_label'
 }
 
 export interface EarnedAutonomyWidenInput {
+  /** Project whose binding is being widened — required scope key. */
+  projectId: string
+  /** Agent whose autonomy is being widened — required scope key. */
+  agentId: string
   current: Autonomy
   proposed: Autonomy
-  actingPrincipalKind: 'owner_or_admin_human' | 'mubot_or_agent' | 'other'
-  wins: readonly VerifiedWinRef[]
+  actingPrincipalKind: PermissionCallerKind
+  wins: readonly (VerifiedWinRef | LabeledWinRef)[]
   requiredWins: number
+  /** Receipt ids already consumed by prior successful widens. */
+  consumedReceiptIds: readonly string[]
 }
 
 export type EarnedAutonomyWidenDecision =
-  | { ok: true; from: Autonomy; to: Autonomy; verifiedWinCount: number }
+  | {
+      ok: true
+      from: Autonomy
+      to: Autonomy
+      verifiedWinCount: number
+      /** Caller must persist these as consumed before the next widen. */
+      consumeReceiptIds: readonly string[]
+    }
   | {
       ok: false
       reason:
@@ -78,6 +185,11 @@ export type EarnedAutonomyWidenDecision =
         | 'insufficient_verified_wins'
         | 'unverified_win_label'
         | 'required_wins_invalid'
+        | 'project_id_required'
+        | 'agent_id_required'
+        | 'scope_mismatch'
+        | 'not_a_win'
+        | 'win_already_consumed'
     }
 
 export type ProgressDisplay =
@@ -111,13 +223,26 @@ export type InstinctAdaptEligibility =
       reason: 'port4_not_live' | 'learning_ranker_not_passed' | 'prerequisite_missing'
     }
 
-/** Mubot may propose wording; it may never write the Outcome. */
-export function mayMubotRedefineGoal(): boolean {
+/**
+ * Mubot may propose wording; it may never write the Outcome.
+ * CallerKind is required so a later slice has a real branch point (not a
+ * zero-arg constant posing as a permission check).
+ */
+export function mayMubotRedefineGoal(callerKind: PermissionCallerKind): boolean {
+  if (callerKind !== 'owner_or_admin_human' && callerKind !== 'mubot_or_agent' && callerKind !== 'other') {
+    throw new Error('owner_experience_unknown_caller_kind')
+  }
   return false
 }
 
-/** Risky / irreversible acts wait for the owner — mubot never self-verdicts. */
-export function mayMubotSelfVerdictGate(): boolean {
+/**
+ * Risky / irreversible acts wait for the owner — mubot never self-verdicts.
+ * CallerKind required for the same reason as mayMubotRedefineGoal.
+ */
+export function mayMubotSelfVerdictGate(callerKind: PermissionCallerKind): boolean {
+  if (callerKind !== 'owner_or_admin_human' && callerKind !== 'mubot_or_agent' && callerKind !== 'other') {
+    throw new Error('owner_experience_unknown_caller_kind')
+  }
   return false
 }
 
@@ -145,13 +270,29 @@ export function autonomyForTrustLevel(level: number): Autonomy {
   return OWNER_TRUST_LADDER[level] as Autonomy
 }
 
+function isBrandedWinRef(win: VerifiedWinRef | LabeledWinRef): win is VerifiedWinRef {
+  return (
+    typeof win === 'object' &&
+    win !== null &&
+    '_brand' in win &&
+    (win as VerifiedWinRef)._brand === 'VerifiedWinRef'
+  )
+}
+
 /**
- * One-step earned widen. Wins must be resolved_by_id (not free-string labels).
- * Decider must be an owner/admin human — never the mubot.
+ * One-step earned widen. Wins must be branded VerifiedWinRef from resolver
+ * (not free-string labels). Scope keys on the input are required and checked
+ * against each win. Decider must be an owner/admin human — never the mubot.
+ * Consumed receipt ids cannot be reused to climb further steps.
  */
 export function decideEarnedAutonomyWiden(
   input: EarnedAutonomyWidenInput,
 ): EarnedAutonomyWidenDecision {
+  const projectId = String(input.projectId || '').trim()
+  const agentId = String(input.agentId || '').trim()
+  if (!projectId) return { ok: false, reason: 'project_id_required' }
+  if (!agentId) return { ok: false, reason: 'agent_id_required' }
+
   if (input.actingPrincipalKind !== 'owner_or_admin_human') {
     return { ok: false, reason: 'mubot_cannot_self_widen' }
   }
@@ -167,38 +308,56 @@ export function decideEarnedAutonomyWiden(
   if (toLevel <= fromLevel) return { ok: false, reason: 'not_a_widen' }
   if (toLevel !== fromLevel + 1) return { ok: false, reason: 'skip_not_allowed' }
 
+  const consumed = new Set(
+    (input.consumedReceiptIds || []).map((id) => String(id).trim()).filter(Boolean),
+  )
+  const accepted: VerifiedWinRef[] = []
+
   for (const win of input.wins) {
-    if (win.verification !== 'resolved_by_id') {
+    if (!isBrandedWinRef(win)) {
       return { ok: false, reason: 'unverified_win_label' }
     }
-    if (win.receiptId.trim().length === 0) {
+    if (!win.receiptId.trim()) {
       return { ok: false, reason: 'unverified_win_label' }
     }
+    if (win.projectId !== projectId || win.agentId !== agentId) {
+      return { ok: false, reason: 'scope_mismatch' }
+    }
+    if (win.polarity !== 'win') {
+      return { ok: false, reason: 'not_a_win' }
+    }
+    if (consumed.has(win.receiptId)) {
+      return { ok: false, reason: 'win_already_consumed' }
+    }
+    accepted.push(win)
   }
 
-  const verifiedWinCount = input.wins.filter(
-    (win) => win.verification === 'resolved_by_id' && win.receiptId.trim().length > 0,
-  ).length
-  if (verifiedWinCount < input.requiredWins) {
+  if (accepted.length < input.requiredWins) {
     return { ok: false, reason: 'insufficient_verified_wins' }
   }
 
+  const consumeReceiptIds = accepted.slice(0, input.requiredWins).map((w) => w.receiptId)
   return {
     ok: true,
     from: input.current,
     to: input.proposed,
-    verifiedWinCount,
+    verifiedWinCount: accepted.length,
+    consumeReceiptIds,
   }
 }
 
 /**
  * Honest progress display. Unwired / missing metric ⇒ unmeasured.
  * Never invents a green measured bar from absent data.
+ * Optional: signal.sourceId must match metric.sourceId when both present.
  */
 export function decideProgressDisplay(input: {
   metric: OutcomeMetricSpec | null
   sourceWired: boolean
-  signal: { ok: true; value: number } | { ok: false; reason: string } | null
+  signal:
+    | { ok: true; value: number; sourceId?: string }
+    | { ok: false; reason: string }
+    | null
 }): ProgressDisplay {
   if (input.metric === null || !input.sourceWired) return { kind: 'unmeasured' }
   if (input.signal === null) {
@@ -206,6 +365,13 @@ export function decideProgressDisplay(input: {
   }
   if (!input.signal.ok) {
     return { kind: 'unavailable', reason: input.signal.reason }
+  }
+  if (
+    typeof input.signal.sourceId === 'string' &&
+    input.signal.sourceId.trim().length > 0 &&
+    input.signal.sourceId !== input.metric.sourceId
+  ) {
+    return { kind: 'unavailable', reason: 'source_id_mismatch' }
   }
   const target = input.metric.target
   if (!(target > 0)) {
