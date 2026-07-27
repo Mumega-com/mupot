@@ -650,6 +650,24 @@ async function approvedGate(env: Env, action: ActionRow): Promise<'approved' | '
   return verdict?.verdict ?? null
 }
 
+async function replayWaitingAction(
+  env: Env,
+  run: RunContext,
+  action: ActionRow,
+): Promise<RoutineActionResult> {
+  if (run.waiting_reason === 'review' && await approvedGate(env, action)) {
+    return executeRoutineAction(env, run.id, action.action_key)
+  }
+  return {
+    ok: true,
+    status: 'waiting',
+    reason: run.waiting_reason === 'answer' ? 'answer' : 'review',
+    run_id: run.id,
+    action_key: action.action_key,
+    duplicate: true,
+  }
+}
+
 async function ensureActionTask(
   env: Env,
   run: RunContext,
@@ -1648,10 +1666,7 @@ export async function submitRoutineProposal(
       return replayResult
     }
     if (replay.status === 'waiting') {
-      return {
-        ok: true, status: 'waiting', reason: run.waiting_reason === 'answer' ? 'answer' : 'review',
-        run_id: run.id, action_key: replay.action_key, duplicate: true,
-      }
+      return replayWaitingAction(env, run, replay)
     }
     if (replay.status === 'running') return executeRoutineAction(env, run.id, replay.action_key)
   }
@@ -1669,10 +1684,7 @@ export async function submitRoutineProposal(
   const reservedResult = storedActionResult(run, action, true)
   if (reservedResult) return reservedResult
   if (action.status === 'waiting') {
-    return {
-      ok: true, status: 'waiting', reason: run.waiting_reason === 'answer' ? 'answer' : 'review',
-      run_id: run.id, action_key: action.action_key, duplicate: true,
-    }
+    return replayWaitingAction(env, run, action)
   }
   if (proposal.action.kind === 'no_action') {
     const result = await executeRoutineAction(env, run.id, proposal.action.key)

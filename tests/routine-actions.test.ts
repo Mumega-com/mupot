@@ -386,6 +386,37 @@ describe('Routine proposal submission and governed actions', () => {
     })
   })
 
+  it('resumes an approved propose-mode action through correlated proposal replay exactly once', async () => {
+    fixture = await makeReadyRoutineFixture('propose')
+    const proposal = fixture.proposal({
+      key: 'task-approved-replay',
+      kind: 'create_task',
+      input: { title: 'Approved replay task', description: 'Execute after the gate verdict.' },
+    })
+
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true, status: 'waiting', reason: 'review', duplicate: false,
+    })
+    fixture.harness.sqlite.exec(`
+      UPDATE tasks SET status = 'approved' WHERE id = 'control-task';
+      INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at)
+      VALUES ('verdict-approved-replay', 'control-task', 'approved', 'owner-1', '2026-07-19T16:10:00.000Z');
+    `)
+
+    const resumed = await submitRoutineProposal(fixture.env, fixture.principal, proposal)
+    expect(resumed).toMatchObject({
+      ok: true, status: 'succeeded', duplicate: false, result: { task_id: expect.any(String) },
+    })
+    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal)).resolves.toMatchObject({
+      ok: true,
+      status: 'succeeded',
+      duplicate: true,
+      result: resumed.ok && resumed.status === 'succeeded' ? resumed.result : {},
+    })
+    expect(row(fixture, "SELECT COUNT(*) AS count FROM tasks WHERE title = 'Approved replay task'"))
+      .toEqual({ count: 1 })
+  })
+
   it('refuses an approved proposal when the Project Situation changed before execution', async () => {
     fixture = await makeReadyRoutineFixture('propose')
     const proposal = fixture.proposal({
