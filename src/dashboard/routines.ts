@@ -328,9 +328,9 @@ function routineNextAction(routine: Routine, run: RoutineRun | undefined): strin
 function table(label: string, minWidth: string, columns: Array<{ label: string; width: string }>, rows: Html[][], empty: string): Html {
   const tracks = columns.map(column => column.width).join(' ')
   return html`<div role="region" aria-label="${label}" tabindex="0" style="max-width:100%;overflow-x:auto;">
-    <div class="ui-table" role="table" aria-label="${label}" style="min-width:${minWidth};">
+    <div class="ui-table routine-table" role="table" aria-label="${label}" style="min-width:${minWidth};">
       <div class="ui-tr ui-thead" role="row" style="grid-template-columns:${raw(tracks)}">${columns.map(column => html`<div class="ui-th" role="columnheader">${column.label}</div>`)}</div>
-      ${rows.length ? rows.map(cells => html`<div class="ui-tr ui-row" role="row" style="grid-template-columns:${raw(tracks)}">${cells.map(cell => html`<div class="ui-td" role="cell" style="overflow-wrap:anywhere;">${cell}</div>`)}</div>`) : html`<div class="ui-table-empty">${empty}</div>`}
+      ${rows.length ? rows.map(cells => html`<div class="ui-tr ui-row" role="row" style="grid-template-columns:${raw(tracks)}">${cells.map((cell, index) => html`<div class="ui-td" role="cell" data-label="${columns[index]?.label ?? ''}"><div class="routine-cell">${cell}</div></div>`)}</div>`) : html`<div class="ui-table-empty">${empty}</div>`}
     </div>
   </div>`
 }
@@ -344,7 +344,7 @@ function routineForm(view: RoutineWorkspaceView, error?: string, values = view.f
   return html`${sectionPanel({
     title: edit ? `Edit routine: ${edit.name}` : 'Create routine',
     body: html`${error ? html`<p role="alert" style="color:var(--danger,#c0392b);">${error}</p>` : ''}
-      <form method="post" action="${action}" style="display:grid;gap:12px;">
+      <form class="routine-form" method="post" action="${action}" style="display:grid;gap:12px;">
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr));gap:10px;">
           <label><span class="ui-panel-sub">Name</span><input required name="name" value="${values.name}"></label>
           <label><span class="ui-panel-sub">Responsible squad ID</span><input required name="responsible_squad_id" value="${values.responsible_squad_id}"></label>

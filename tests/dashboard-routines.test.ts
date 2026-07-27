@@ -138,6 +138,12 @@ describe('Project Routines dashboard', () => {
     }
     expect(body).toContain('role="region" aria-label="Project routines" tabindex="0"')
     expect(body).toContain('style="max-width:100%;overflow-x:auto;"')
+    expect(body).toContain('class="ui-table routine-table"')
+    expect(body).toContain('data-label="Routine"')
+    expect(body).toContain('data-label="Current state / next action"')
+    expect(body).toContain('class="routine-form"')
+    expect(body).toContain('.routine-table .ui-td::before')
+    expect(body).toContain('.routine-form input')
     expect(body).toContain('href="/projects/project-a/routines?run_id=')
     expect(body).toContain('href="/projects/project-a/routines?run_id=')
     expect(body).toContain('#run-activity')
