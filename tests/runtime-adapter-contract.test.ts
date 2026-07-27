@@ -337,6 +337,7 @@ describe('runtime-adapter/v1 contract artifact', () => {
     expect(workflow).toContain('actions/upload-artifact@v4')
     expect(workflow).toContain('tmp/local-smoke')
     expect(workflow).toContain('tmp/local-runtime-conformance')
+    expect(workflow).toContain('tmp/local-project-routine')
 
     const migration = commandBlock('"${WRANGLER[@]}" d1 migrations apply mupot-local-test', 'say "Seeding local D1 fixtures"')
     const seed = commandBlock('"${WRANGLER[@]}" d1 execute mupot-local-test', 'say "Starting local Wrangler server')
@@ -361,9 +362,13 @@ describe('runtime-adapter/v1 contract artifact', () => {
     const healthCall = script.lastIndexOf('\nwait_for_health\n')
     const browserCall = script.indexOf('npm run smoke:local', healthCall)
     const runtimeCall = script.indexOf('npm run conformance:runtime:local', browserCall)
+    const routineCall = script.indexOf('npm run collect:project-routine:local', runtimeCall)
+    const routineCheck = script.indexOf('npm run receipt:project-routine:check', routineCall)
     expect(healthCall).toBeGreaterThan(script.indexOf('dev_pid="$!"'))
     expect(browserCall).toBeGreaterThan(healthCall)
     expect(runtimeCall).toBeGreaterThan(browserCall)
+    expect(routineCall).toBeGreaterThan(runtimeCall)
+    expect(routineCheck).toBeGreaterThan(routineCall)
   })
 
   it('records Goose / goosed fleet-runtime non-adoption beside the contract', () => {

@@ -234,3 +234,62 @@ Passed with no whitespace errors.
 
 No blocking concerns. Vitest emits Node's existing experimental SQLite warning;
 all requested tests pass.
+
+---
+
+## Project Routines v0.25 Task 7: Routine Answer Project Access
+
+Parent Task 7 implementation commit:
+`9fc069f9045e80b44099adb6c3e80f1022256699`
+
+Follow-up commit message: `fix: enforce routine answer project access`
+
+### RED Evidence
+
+Command:
+
+```text
+npx vitest run tests/needs-you.test.ts
+```
+
+RED: 1 test file failed; 1 test failed and 10 passed. A member with member+
+capability on the responsible squad received `['view', 'answer']` while that
+squad had only `read` Project access. The expected actions were `['view']`.
+
+### Delivered
+
+- Added the responsible squad's existing `project_squad_access.access_level` to
+  the bounded Routine wait projection.
+- Advertised `answer` to non-admin human principals only when the responsible
+  Project edge is `write` or `admin` and the principal has squad member+
+  capability, including department inheritance.
+- Preserved the workspace-admin bypass and all Task verdict action behavior.
+- Kept authorization in-memory over source query rows, with no N+1 query and no
+  Needs You mutation or resolution path.
+- Left Routine REST route mounting deferred to planned Task 9.
+
+### Commands and Results
+
+```text
+npx vitest run tests/needs-you.test.ts
+```
+
+GREEN: 1 test file passed; 11 tests passed.
+
+```text
+npx vitest run tests/needs-you.test.ts tests/tasks-gate.test.ts tests/routines-service.test.ts tests/projects-routes.test.ts tests/project-readable-squads.test.ts
+```
+
+GREEN: 5 test files passed; 126 tests passed.
+
+```text
+npx tsc --noEmit
+git diff --check
+```
+
+Passed with no type or whitespace errors.
+
+### Concerns
+
+No blocking concerns. Vitest emits Node's existing experimental SQLite warning;
+all requested tests pass.

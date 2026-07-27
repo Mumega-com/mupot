@@ -30,6 +30,8 @@ export interface DispatchExtra {
   // HOLD. The tower INFORMS, never dead-locks legitimate collaboration — but the
   // default (no override) is HOLD-on-hard-conflict.
   allowCollisionWith?: string[]
+  /** Internal deterministic identity for crash-safe control-plane replay. */
+  id?: string
 }
 
 export interface DispatchResult {
@@ -75,7 +77,7 @@ export async function dispatchFlight(
         reasons: [...preflight.reasons, 'flight_clearance_hold', ...clearanceReasonTags(clearance as ClearanceResult)],
       }
 
-  const id = await createFlight(env, flight)
+  const id = await createFlight(env, flight, { id: extra.id })
   const status = await applyPreflight(env, id, combined)
   return {
     id,

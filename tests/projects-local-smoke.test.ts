@@ -149,6 +149,14 @@ describe('local project workspace showcase', () => {
         VALUES
           ('hermes-local', 'local', 'Superseded Hermes', 'hermes-cron', '[]', 'always_on', 'running', 'local-seed', datetime('now'), datetime('now')),
           ('codex-local', 'local', 'Superseded Codex', 'codex', '[]', 'on_demand', 'stopped', 'local-seed', datetime('now'), datetime('now'));
+        INSERT INTO routine_runs (
+          id, tenant, project_id, routine_id, routine_revision, policy_json,
+          occurrence_key, trigger_kind, status, created_at, updated_at
+        ) VALUES (
+          'run-local-seed-rerun', 'local', 'project-mupot', 'routine-local-propose', 1,
+          '{"execution_mode":"propose","overlap_policy":"skip","responsible_squad_id":"sq-growth","preferred_agent_id":"agent-hermes","budget_micro_usd":100000,"max_attempts":3,"retry_backoff_seconds":300}',
+          'manual:seed-rerun', 'manual', 'succeeded', datetime('now'), datetime('now')
+        );
       `)
 
       expect(() => harness.sqlite.exec(readFileSync(SEED_PATH, 'utf8'))).not.toThrow()
@@ -284,11 +292,12 @@ describe('local project workspace showcase', () => {
         task_counts: { blocked: 1, review: 1, in_progress: 1, open: 0 },
         active_work_count: 3,
         active_flight_count: 1,
-        next_action: { type: 'review_task', task: { id: 'task-review-local' } },
+        next_action: { type: 'address_needs_you', item: { source_id: 'task-review-local' } },
       })
       const rendered = String(await projectDetailBody(dashboard!))
       expect(rendered).toContain('blocked')
-      expect(rendered).toContain('Review &quot;Review local approval task&quot;')
+      expect(rendered).toContain('Address')
+      expect(rendered).toContain('Review local approval task')
 
       const runtimeStates = await getFleetAgentRuntimeStates(env, [
         { agent_id: 'agent-hermes', slug: 'hermes' },
@@ -444,7 +453,7 @@ describe('local project workspace showcase', () => {
     expect(smoke).toContain('Marketing Infrastructure')
     expect(smoke).toContain('/send?project_id=project-mupot')
     expect(smoke).toContain('/flights?project_id=project-mupot')
-    expect(smoke).toContain("['Home', 'Projects', 'Work', 'Approvals']")
+    expect(smoke).toContain("['Home', 'Projects', 'Work', 'Needs You', 'Approvals']")
     expect(smoke).toContain('width: 390, height: 844')
     expect(smoke).toMatch(/scrollWidth\s*-\s*document\.documentElement\.clientWidth/)
     expect(smoke).toContain('await runProjectWorkspaceWorkflow()')
