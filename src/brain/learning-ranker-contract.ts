@@ -194,11 +194,19 @@ export type DistillEligibility =
     }
 
 /**
+ * Unexported unique symbol — external code cannot produce this property key,
+ * so a zero-cast object literal cannot satisfy VerifiedReceiptRef under tsc.
+ * Runtime provenance is still the WeakSet registry (symbol alone is not enough
+ * against `as VerifiedReceiptRef` casts).
+ */
+const verifiedReceiptBrand: unique symbol = Symbol('VerifiedReceiptRef')
+
+/**
  * Opaque trust object — carries resolved store content, not a self-describing tag.
  * Only `verifiedReceiptRefFromResolver` may construct it (InstinctChat DI pattern).
  */
 export type VerifiedReceiptRef = {
-  readonly _brand: 'VerifiedReceiptRef'
+  readonly [verifiedReceiptBrand]: true
   readonly receiptId: string
   readonly sourceKind: DistillSource
   readonly store: 'gate_driver' | 'frc'
@@ -206,6 +214,11 @@ export type VerifiedReceiptRef = {
   readonly resolvedAt: string
   readonly sanitizedContent: string
   readonly corroboratingReceipts: readonly CorroboratingReceipt[]
+}
+
+/** Runtime provenance check — registry membership, not shape. */
+export function isVerifiedReceiptRef(value: unknown): value is VerifiedReceiptRef {
+  return typeof value === 'object' && value !== null && verifiedReceiptRegistry.has(value)
 }
 
 /** Record a real store resolver must return. Trust claim ≠ trust object. */
@@ -270,7 +283,7 @@ export function verifiedReceiptRefFromResolver(
     return { ok: false, reason: 'unverified_receipt' }
   }
   const ref: VerifiedReceiptRef = Object.freeze({
-    _brand: 'VerifiedReceiptRef' as const,
+    [verifiedReceiptBrand]: true as const,
     receiptId: id,
     sourceKind: record.sourceKind as DistillSource,
     store: record.store,
@@ -430,40 +443,42 @@ export function mayDistillFromSource(source: string): DistillEligibility {
 }
 
 /**
- * Trust-lock: only refs registered by verifiedReceiptRefFromResolver may distill.
- * Shape alone is not enough — forged `_brand` literals are refused (WeakSet).
+ * Trust-lock: only resolver-minted refs in the WeakSet may distill.
+ * Parameter type is VerifiedReceiptRef alone — a zero-cast forge literal is a
+ * tsc error (unexported unique symbol). Runtime still checks registry so
+ * `as VerifiedReceiptRef` casts cannot mint trust.
  */
-export function mayDistillFromReceiptRef(
-  ref: VerifiedReceiptRef | DistillReceiptRef,
-): DistillEligibility {
-  if (!ref || typeof ref !== 'object') {
+export function mayDistillFromReceiptRef(ref: VerifiedReceiptRef): DistillEligibility {
+  if (!isVerifiedReceiptRef(ref)) {
     return { ok: false, reason: 'unverified_receipt' }
   }
-  if (!verifiedReceiptRegistry.has(ref as object)) {
-    return { ok: false, reason: 'unverified_receipt' }
-  }
-  const branded = ref as VerifiedReceiptRef
-  if (!('_brand' in branded) || branded._brand !== 'VerifiedReceiptRef') {
-    return { ok: false, reason: 'unverified_receipt' }
-  }
-  if (!branded.receiptId || !String(branded.receiptId).trim()) {
+  if (!ref.receiptId || !String(ref.receiptId).trim()) {
     return { ok: false, reason: 'missing_receipt_id' }
   }
-  if (!branded.projectId || !String(branded.projectId).trim()) {
+  if (!ref.projectId || !String(ref.projectId).trim()) {
     return { ok: false, reason: 'project_id_required' }
   }
-  if (!branded.resolvedAt || !String(branded.resolvedAt).trim()) {
+  if (!ref.resolvedAt || !String(ref.resolvedAt).trim()) {
     return { ok: false, reason: 'unverified_receipt' }
   }
-  if (typeof branded.sanitizedContent !== 'string') {
+  if (typeof ref.sanitizedContent !== 'string') {
     return { ok: false, reason: 'unverified_receipt' }
   }
-  const kindGate = mayDistillFromSource(branded.sourceKind)
+  const kindGate = mayDistillFromSource(ref.sourceKind)
   if (!kindGate.ok) return kindGate
-  if (!hasIndependentCorroboration(branded.corroboratingReceipts || [])) {
+  if (!hasIndependentCorroboration(ref.corroboratingReceipts || [])) {
     return { ok: false, reason: 'corroboration_not_independent' }
   }
   return { ok: true }
+}
+
+/**
+ * @deprecated Boolean-bag / shape path — always refuses. Kept so reproduce-and-refuse
+ * can still construct the Round-2 forgery and show `unverified_receipt`.
+ */
+export function mayDistillFromLegacyReceiptRef(ref: DistillReceiptRef): DistillEligibility {
+  void ref
+  return { ok: false, reason: 'unverified_receipt' }
 }
 
 /** Distill domains must be in RANK_INSTINCT_DOMAINS or the inject loop is a no-op (H-1). */
@@ -681,8 +696,8 @@ function clampLearnDelta(delta: number): number {
  * `consecutiveSuppressionTicks` is parallel to `proposals` and wires
  * selectStalenessEscalationIndices into the hot path (anti-selection-bias b).
  *
- * MAX_LEARN_DELTA bounds the audited `delta` on every branch. Noop veto also
- * changes `kind` to `noop` (separate invariant: full block, not a soft demote).
+ * MAX_LEARN_DELTA clamps soft-demote deltas only. Noop veto records raw
+ * priority change under `delta` with `noopVeto:true` (separate invariant).
  */
 export function applyInstinctBiasToProposals(
   proposals: readonly RankProposal[],
