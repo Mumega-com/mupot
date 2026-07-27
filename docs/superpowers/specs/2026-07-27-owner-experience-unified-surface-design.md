@@ -17,9 +17,12 @@ learned.
 [BYOA harness matrix](./2026-07-23-byoa-harness-support-matrix-design.md) (PR #503),
 [per-project docs RBAC](./2026-07-23-per-project-docs-rbac-design.md) (PR #507 / #522–526),
 Tier-2 chat design (`2026-07-27-tier2-stateless-user-chat-design.md`, currently
-dyad-gate **BLOCK**), Tier-1 kayhermes panel (PR #505), `ProjectSituation`
+dyad-gate **BLOCK**), Tier-1 kayhermes panel (PR #505, **CLOSED unmerged, no
+successor — Talk is optional**), `ProjectSituation`
 (`src/projects/situation.ts`), agent `Autonomy` (`src/types.ts`),
-`workflow_receipts` + completion/lessons receipts, BrainPort v1 (rank-only).
+`workflow_receipts` + completion/lessons receipts, `rankTasks`
+(`src/tasks/ranking.ts`) interim ranking — **not** BrainPort v1, which is
+type-only-sealed with zero callers.
 
 **Machine contract:** [`docs/owner-experience-v1.json`](../../owner-experience-v1.json)
 + pure TS [`src/owner/owner-experience-contract.ts`](../../../src/owner/owner-experience-contract.ts).
@@ -30,7 +33,7 @@ Today an owner meets **three separate products** that happen to share a pot:
 
 | Surface | Intent | Current state (verified 2026-07-27 on this worktree) |
 |---|---|---|
-| **Chat** (talk to mubot) | Intent in, clarification out | Tier-1 kayhermes panel in review (#505). Tier-2 every-member chat is **design-blocked** (ModelPort has no tools; pot monthly budget display-only; result fan-in unsettled). |
+| **Chat** (talk to mubot) | Intent in, clarification out | Tier-1 kayhermes panel — PR **#505 CLOSED unmerged, no successor**; Talk is **optional** on owner home until revived or replaced. Tier-2 every-member chat is **design-blocked** (ModelPort has no tools; pot monthly budget display-only; result fan-in unsettled). |
 | **Docs** (read/edit knowledge) | Shared memory the mubot acts on | Spec #507 drafted; **no dashboard Docs surface** on main. `project_remember` / `project_recall` exist as MCP. |
 | **Board** (watch it work) | Living picture of work | **Wired:** project detail + `ProjectSituation` (health, blockers, reviews, `next_action`), lifecycle loop (start-gate / circuit-breaker / completion / stall). |
 
@@ -145,20 +148,34 @@ the first viewport.
 
 Replace "goal is a sentence" with **Outcome**:
 
+Pure TS contract (`src/owner/owner-experience-contract.ts`) — the shipped shape:
+
 ```
-Outcome {
+Outcome {                                              // machine contract
   statement: string          // owner's words ("20 booked calls / month")
-  metric: KpiSpec | null     // how progress is measured; null = unmeasured
-  owner_principal: string    // human owner/admin who set it
-  set_at: string
-  version: number            // increments only on owner change
+  metric: OutcomeMetricSpec | null   // { sourceId: KpiSourceId; target: number } | null
+  measurementMode: 'unmeasured_until_project_kpi' | 'measured'
 }
 ```
 
-`KpiSpec` reuses the loop-container idea: named signal + source id. v1 allows
-only sources that already have an enforcement/read path (`task_counter`,
-`github_prs`, and future connector-backed sources when wired). **Unknown or
-unwired source ⇒ progress renders `unmeasured`**, never a guessed green bar.
+DB row additionally carries `owner_principal` / `set_at` / `version` (§5) —
+those are persistence metadata, not part of the pure-function contract type.
+
+`KpiSourceId = 'task_counter' | 'github_prs'` — both are **agent/tenant
+scoped**, not project scoped (§3.2). v1 Outcome measurement is therefore
+always `measurementMode: 'unmeasured_until_project_kpi'`; `metric` may still
+name a `KpiSourceId` for display/debugging, but it can never flip
+`measurementMode` to `'measured'`.
+
+`measurementMode: 'measured'` is gated on `metric.sourceId` being a member of
+`PROJECT_SCOPED_KPI_SOURCE_IDS`, which is the **empty array in v1**. This
+makes `'measured'` **unreachable by construction** — no caller-asserted
+`measurementMode` field, no allowlisted `KpiSourceId`, and no combination of
+`task_counter` / `github_prs` can ever produce a `{ kind: 'measured' }`
+progress bar. The type documents the future: once a real project-scoped KPI
+source ships, it is added to that allowlist and `'measured'` becomes
+reachable for that source only. **Unknown, unwired, or non-project-scoped
+source ⇒ progress renders `unmeasured`**, never a guessed green bar.
 
 Only `owner` / `admin` principals may create or change Outcome. Mubot / agent
 tokens may **propose** a restatement (Talk) but the write path requires the
@@ -170,7 +187,7 @@ owner principal — encoded in the contract as `mayMubotRedefineGoal === false`.
 |---|---|---|
 | **Goal** | Outcome strip | New structured fields (slice 1) |
 | **Sense** | Watch situation + metric read | `loadProjectSituation` + KPI source |
-| **Rank** | What moves the number next | BrainPort ranking (rank-not-act); learning bias **only after** Port-4+ranker PASS |
+| **Rank** | What moves the number next | Live `rankTasks` interim (`src/tasks/ranking.ts`, rank-not-act) — BrainPort default adapter is type-only-sealed with zero callers, not cited as reuse; learning bias **only after** Port-4+ranker PASS |
 | **Act** | Board tasks / flights through technicians | Existing board + BYOA |
 | **Receipt** | Win or miss, by receipt id | `workflow_receipts` / verdicts / evidence |
 | **Learn** | Distill miss→guardrail, win→playbook | v1: surface `lessons_capture` + gate-fail receipts; v2: Port-4 distill |
@@ -224,13 +241,22 @@ This deliberately does **not** call Port-4 for instincts. Verification binds to
 
 `decideProgressDisplay`:
 
-- If `metric === null` or source unwired → `{ kind: 'unmeasured' }`
-- If KPI signal compute fails → `{ kind: 'unavailable', reason }` (not 0%, not 100%)
-- If signal ok → `{ kind: 'measured', value, target, ratio }` with ratio clamped
-  to \[0, 1\] for display but raw values retained for audit
-- **Forbidden:** rendering `kind: 'measured'` from task-count alone when the
-  Outcome metric names an external signal; task_counter is allowed only when
-  the Outcome explicitly selected it.
+- If `outcome.measurementMode === 'unmeasured_until_project_kpi'` → `{ kind: 'unmeasured' }`
+  (v1 default: `task_counter` / `github_prs` are agent/tenant scoped, not
+  project scoped — they cannot honestly measure a project Outcome).
+- If `metric === null`, or `metric.sourceId` is not a valid `KpiSourceId`, or
+  `metric.sourceId` is not a member of `PROJECT_SCOPED_KPI_SOURCE_IDS`
+  (**empty in v1** — so `measurementMode: 'measured'` is unreachable by
+  construction) → `{ kind: 'unmeasured' }`
+- If KPI signal compute fails, or the signal's `sourceId` does not match the
+  metric's → `{ kind: 'unavailable', reason }` (not 0%, not 100%)
+- If signal ok and the source is project-scoped → `{ kind: 'measured', value, target, ratio }`
+  with ratio clamped to \[0, 1\] for display but raw values retained for audit
+- **Forbidden:** rendering `kind: 'measured'` from `task_counter` or
+  `github_prs` under any circumstances in v1 — both are agent/tenant scoped,
+  never project scoped, and are excluded from `PROJECT_SCOPED_KPI_SOURCE_IDS`
+  by construction. There is no caller-asserted `measurementMode` string that
+  can produce a green bar from an agent-scoped source.
 
 ### 4.6 Visible learning
 
@@ -246,8 +272,11 @@ Entries without a receipt id are rejected by the contract helper. No
 
 ## 5. Data model (draft — validate in dyad-gate; no migration in this commit)
 
+Next free migration number as of 2026-07-27 (highest on `migrations/` is
+`0071_agent_connections.sql`): **`0072`** — slice 1 owns and names it.
+
 ```
--- additive on projects (shape only; slice 1 owns the migration)
+-- additive on projects (shape only; slice 1 owns migration 0072)
 outcome_statement     TEXT NOT NULL DEFAULT ''   -- may mirror goal initially
 outcome_metric_json   TEXT NULL                -- KpiSpec or null
 outcome_owner         TEXT NULL
@@ -300,8 +329,19 @@ No second memory store. Docs continue to target the #507 unification with
 
 ## 8. Build slices (backlog — dyad-gate each; do not start until this design PASSes)
 
-1. **Outcome model** — structured north-star on `projects` + progress helper
-   wired to existing KPI sources only; fail closed to `unmeasured`.
+**Suggested build order (`docs/owner-experience-v1.json` → `suggestedBuildOrder`):
+3 → 5 → 1 → 4 → 2 → 7 → 6 → 8** — trust-strip-gate-queue and visible-learning
+ship first because they only read existing substrate (situation reviews,
+`lessons_capture`); outcome-model and earned-autonomy follow once those
+surfaces exist to hang off; owner-home-shell composes what is already built;
+the two gated slices (Tier-2 talk, instinct learn/adapt) stay last behind
+their own prerequisite gates. The numbered list below is dependency order for
+reading, not build order — do not build 1 → 2 → 3 in sequence.
+
+1. **Outcome model** — structured north-star on `projects` + progress helper.
+   v1 mode is `unmeasured_until_project_kpi` by default; `measured` stays
+   unreachable until a source lands in `PROJECT_SCOPED_KPI_SOURCE_IDS`. Next
+   free migration number: **0072**.
 2. **Owner home shell** — compose Outcome + Trust + Talk/Know/Watch facets on
    project detail (Watch = existing situation; Talk = Tier-1 embed; Know =
    memory list). No new cognition.

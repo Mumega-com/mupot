@@ -71,7 +71,9 @@
     "forbidFakeGreen": true,
     "v1Mode": "unmeasured_until_project_kpi",
     "metricSourceIdType": "KpiSourceId",
-    "sourceWiredCallerBoolean": false
+    "sourceWiredCallerBoolean": false,
+    "projectScopedKpiSourceIds": [],
+    "measuredUnreachableInV1": true
   },
   "unmetDependencies": [
     {
