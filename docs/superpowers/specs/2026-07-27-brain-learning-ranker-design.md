@@ -164,9 +164,12 @@ and needs its own dyad-gate. Do **not** merge `b143e73d` to unblock this design.
 8. **`experience.json` remains a mechanical signal**, not the fuck-up
    instinct store. Reliability / stall rates may continue to clamp-adjust
    scores; structured "don't do X again" lives in Port-4 instincts.
-9. **Bias is bounded.** Total learning adjustment per proposal is capped at
-   `MAX_LEARN_DELTA` (default 15.0, matching `experience.py`). Mechanical
-   ranking stays dominant; learned bias cannot fully override it.
+9. **Bias is bounded on the soft-demote path.** Soft demote uses
+   `clampLearnDelta(-matching.length)` with `MAX_LEARN_DELTA=5` (reachable:
+   n=1 → −1, n=6 → −5). **Noop veto is a separate invariant**
+   (`noop-veto-full-block-unbounded-priority`): kind→noop and priority floors
+   at 0; audited `delta` records the true priority change and is tagged
+   `noopVeto:true` — it is not under the soft-demote cap.
 10. **Determinism is a first-class invariant.** Same `(board, learned state,
     nowIso)` → same ranking. No epsilon-greedy sampling — it would break the
     idempotency property that justifies rank-not-act.

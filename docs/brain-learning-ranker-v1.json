@@ -114,7 +114,9 @@
     "maxLearnDelta": 5.0,
     "noopVetoSeparateFromMaxLearnDelta": true,
     "noopVetoInvariant": "noop-veto-full-block-unbounded-priority",
-    "note": "MAX_LEARN_DELTA=5 bounds soft-demote audited delta (clamp reachable vs maxInjected). Noop veto is a SEPARATE invariant: kind→noop and priority floors at 0; audited delta still clamped and tagged noopVeto:true.",
+    "softDemote": "clampLearnDelta(-matching.length) — graduated; clamp binds at n>5",
+    "noopAuditDelta": "records-true-priority-change-tagged-noopVeto",
+    "note": "MAX_LEARN_DELTA=5 bounds soft-demote only. Noop veto is a SEPARATE invariant: kind→noop, priority floors at 0; audited delta is the true change tagged noopVeto:true.",
     "stalenessEscalationWiredInto": "applyInstinctBiasToProposals(consecutiveSuppressionTicks)"
   },
   "selectionBiasGuards": {
@@ -136,8 +138,9 @@
   "distill": {
     "receiptResolution": "branded-VerifiedReceiptRef-only-from-injected-ReceiptStoreResolver-with-resolved-content-boolean-bag-rejected",
     "corroborationRequiredBeforeInject": true,
-    "corroborationIndependence": "distinct-agentId-OR-distinct-incidentId-required",
-    "contentSanitization": "schema-constrained-allowlist-DistillReceiptFacts-discard-rest",
+    "corroborationIndependence": "distinct-agentId-OR-distinct-incidentId-string-diversity-structural-limit-full-independence-needs-store",
+    "contentSanitization": "schema-constrained-JSON-evidence-field-only-discard-rest",
+    "verifiedReceiptProvenance": "WeakSet-registry-populated-only-by-verifiedReceiptRefFromResolver",
     "parseIsTrustBoundary": true,
     "allowedSources": [
       "gate_fail_receipt",
@@ -209,7 +212,7 @@
     "optional-hermes-runtime"
   ],
   "acceptance": {
-    "testCount": 19,
+    "testCount": 20,
     "mechanismLockNeTrustLock": {
       "name": "mechanism-lock-ne-trust-lock",
       "description": "tests that lock a mechanism but not the trust it depends on — mayDistillFromSource enum fence is canonical example",
