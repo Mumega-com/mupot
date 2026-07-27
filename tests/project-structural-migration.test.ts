@@ -165,6 +165,16 @@ describe('v0.25 production migration path', () => {
       }
 
       expect(sqlite.prepare('PRAGMA foreign_key_check').all()).toEqual([])
+      expect(sqlite.prepare(`PRAGMA foreign_key_list('projects')`).all()).toEqual([
+        expect.objectContaining({
+          table: 'projects',
+          from: 'parent_project_id',
+          to: 'id',
+          on_delete: 'RESTRICT',
+        }),
+      ])
+      expect(() => sqlite.exec(`DELETE FROM projects WHERE id = 'project-root'`))
+        .toThrow(/FOREIGN KEY constraint failed/)
       expect(sqlite.prepare('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 })
       expect(sqlite.prepare(`
         SELECT COUNT(*) AS count

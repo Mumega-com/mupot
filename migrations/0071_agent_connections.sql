@@ -5,22 +5,14 @@
 -- or tenantless, then backfills exactly one canonical member per agent.
 
 -- A credential cannot remain authoritative for an agent that no longer exists.
--- Revoke and detach those stale welds before canonical identity is evaluated.
+-- Revoke stale credentials while retaining their historical agent attribution.
 UPDATE member_tokens
    SET revoked_at = COALESCE(
          revoked_at,
          strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       ),
-       agent_id = NULL
+       )
  WHERE agent_id IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM agents WHERE id = member_tokens.agent_id);
-
--- Revoked credentials remain audit records, but they no longer participate in
--- the live agent-member weld. Live ambiguity still fails closed below.
-UPDATE member_tokens
-   SET agent_id = NULL
- WHERE agent_id IS NOT NULL
-   AND revoked_at IS NOT NULL;
 
 CREATE TABLE agent_member_bindings (
   tenant     TEXT NOT NULL,
@@ -46,8 +38,9 @@ SELECT 0
 
 INSERT INTO agent_connection_migration_guard (ok)
 SELECT 0
-  FROM member_tokens
+ FROM member_tokens
  WHERE agent_id IS NOT NULL
+   AND revoked_at IS NULL
  GROUP BY tenant, agent_id
 HAVING COUNT(DISTINCT member_id) > 1
  LIMIT 1;
@@ -58,6 +51,7 @@ INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
 SELECT tenant, agent_id, MIN(member_id), MIN(created_at)
   FROM member_tokens
  WHERE agent_id IS NOT NULL
+   AND revoked_at IS NULL
  GROUP BY tenant, agent_id;
 
 -- The home capability is an identity property, permanently capped at member.

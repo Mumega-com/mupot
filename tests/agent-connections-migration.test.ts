@@ -22,7 +22,14 @@ function applyBeforeTarget(sqlite: Sqlite): void {
 }
 
 function applyTarget(sqlite: Sqlite): void {
-  sqlite.exec(readFileSync(join(DIR, TARGET), 'utf8'))
+  sqlite.exec('PRAGMA foreign_keys = ON; BEGIN')
+  try {
+    sqlite.exec(readFileSync(join(DIR, TARGET), 'utf8'))
+    sqlite.exec('COMMIT')
+  } catch (error) {
+    sqlite.exec('ROLLBACK')
+    throw error
+  }
 }
 
 function seedOrg(sqlite: Sqlite): void {
@@ -209,7 +216,7 @@ describe('0071 agent connection contract migration', () => {
       ).all()).toEqual([{ tenant: 'tenant-a', agent_id: 'agent-1', member_id: 'member-1' }])
       expect(h.sqlite.prepare(
         "SELECT agent_id, revoked_at FROM member_tokens WHERE id = 'token-old'",
-      ).get()).toEqual({ agent_id: null, revoked_at: LATER })
+      ).get()).toEqual({ agent_id: 'agent-1', revoked_at: LATER })
     } finally {
       h.close()
     }
@@ -229,10 +236,32 @@ describe('0071 agent connection contract migration', () => {
 
       expect(h.sqlite.prepare(
         "SELECT agent_id, revoked_at FROM member_tokens WHERE id = 'token-orphan'",
-      ).get()).toEqual({ agent_id: null, revoked_at: expect.any(String) })
+      ).get()).toEqual({ agent_id: 'agent-missing', revoked_at: expect.any(String) })
       expect(h.sqlite.prepare(
         'SELECT COUNT(*) AS count FROM agent_member_bindings',
       ).get()).toEqual({ count: 0 })
+    } finally {
+      h.close()
+    }
+  })
+
+  it('rolls stale-credential reconciliation back when live identity remains ambiguous', () => {
+    const h = createBeforeTargetHarness()
+    try {
+      addSecondAgentAndMember(h.sqlite)
+      h.sqlite.exec(`
+        INSERT INTO member_tokens
+          (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id, tenant)
+        VALUES
+          ('token-orphan', 'member-1', 'hash-orphan', '', 'workspace', '${NOW}', NULL, 'agent-missing', 'tenant-a'),
+          ('token-live-1', 'member-1', 'hash-live-1', '', 'workspace', '${NOW}', NULL, 'agent-1', 'tenant-a'),
+          ('token-live-2', 'member-2', 'hash-live-2', '', 'workspace', '${NOW}', NULL, 'agent-1', 'tenant-a');
+      `)
+
+      expect(() => applyTarget(h.sqlite)).toThrow(/CHECK constraint failed.*ok/)
+      expect(h.sqlite.prepare(
+        "SELECT agent_id, revoked_at FROM member_tokens WHERE id = 'token-orphan'",
+      ).get()).toEqual({ agent_id: 'agent-missing', revoked_at: null })
     } finally {
       h.close()
     }
