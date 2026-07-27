@@ -35,6 +35,10 @@ This is a **design/spec artifact**. No code in this repo implements it yet.
 - Future incompatible changes must create a new contract id. Additive fields
   may be accepted when readers ignore unknown fields, matching the
   `runtime-adapter/v1` precedent.
+- **Revision (2026-07-27, additive):** `runtime` enum gained `sos-bus`
+  (coordination-event adapter, distinct in kind from the liveness-oriented
+  adapters — see design doc §3). No breaking change; existing readers that
+  ignore unrecognized enum values are unaffected.
 
 ## The problem this closes
 
@@ -106,7 +110,7 @@ second mutable row that something can last-write-wins over.
 | Issue requirement | Field(s) | Notes |
 |---|---|---|
 | stable session and worker identifiers | `session_id`, `source_id`, `worker_id?` | see Identity model above |
-| adapter and runtime kind | `adapter` (implementation id, e.g. `codex-cli-driver-v1`), `runtime` (kind enum — reuses `runtime-adapter/v1`'s existing set: `codex`, `cursor`, `claude-code`, `hermes`, `tmux`, `dmux`, `systemd-user`, `python`) | `adapter` names the specific driver/integration; `runtime` names the harness family |
+| adapter and runtime kind | `adapter` (implementation id, e.g. `codex-cli-driver-v1`), `runtime` (kind enum — reuses `runtime-adapter/v1`'s existing set: `codex`, `cursor`, `claude-code`, `hermes`, `tmux`, `dmux`, `systemd-user`, `python`, plus `sos-bus` **(2026-07-27 revision, additive)** — the coordination-event adapter, see the design doc §3 "SOS Bus — coordination-event adapter" for its event-kind mapping) | `adapter` names the specific driver/integration; `runtime` names the harness family |
 | agent identity, where verified | `agent_id: string \| null`, `identity_mapping: { status: "unmapped" \| "mapped" \| "ambiguous" \| "revoked", mapped_agent_id?, mapped_by_member_id?, mapped_at?, method? }` | Unmapped observations are stored and visible only in the org-admin **Unmapped runtimes** queue (per Hadi's 2026-07-27 comment) — never auto-bound to a guessed agent |
 | repository, branch, worktree, process metadata | `context: { repo?, branch?, worktree_path?, host?, pid? }` | All optional/best-effort; a tmux adapter may only have `host`, a CI adapter only `repo`+`branch` |
 | objective, linked task/flight, owned/seeded paths | `objective: string?`, `linked: { task_id?, flight_id?, project_id? }`, `owned_paths: string[]` | `linked.task_id`/`flight_id` are read-only references Mupot validates exist and are visible to the session's mapped agent; an unresolvable reference is dropped from the stored observation and flagged, never trusted blind |
@@ -140,3 +144,8 @@ second mutable row that something can last-write-wins over.
 - It is not a transport. Adapters still use `runtime-adapter/v1`'s existing
   attach/messaging/task surfaces to act; this contract is the parallel,
   read-only observation channel describing what is happening.
+- **(2026-07-27 revision)** It is never presented as, or merged with, the
+  authoritative Mupot state layer (agent identity, squad, task/flight,
+  completion, gate, evidence). Any surface built on this contract must keep
+  that layer structurally separate — see the design doc §5 "Two-layer
+  presentation" subsection for the concrete API/UI split.

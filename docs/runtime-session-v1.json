@@ -23,7 +23,7 @@
   },
   "body": {
     "adapter": "implementation-id-e.g.-codex-cli-driver-v1",
-    "runtime": ["codex", "cursor", "claude-code", "hermes", "tmux", "dmux", "systemd-user", "python"],
+    "runtime": ["codex", "cursor", "claude-code", "hermes", "tmux", "dmux", "systemd-user", "python", "sos-bus"],
     "agent_id": "string-or-null",
     "identity_mapping": {
       "status": ["unmapped", "mapped", "ambiguous", "revoked"],
@@ -116,7 +116,12 @@
       "unmapped-identity-routed-to-queue-never-auto-bound",
       "session_agent_mismatch-refusal",
       "adapter-outage-core-project-view-still-available",
-      "proof-observations-cannot-mutate-tasks-gates-memberships-capabilities"
+      "proof-observations-cannot-mutate-tasks-gates-memberships-capabilities",
+      "sos-sender-label-alone-does-not-bind-2026-07-27",
+      "sos-unrecognized-sender-surfaces-only-in-unmapped-queue-2026-07-27",
+      "sos-gate-result-report-cannot-write-verdict-2026-07-27",
+      "sos-request-ack-pairing-uses-existing-request-id-2026-07-27",
+      "layer-1-query-never-reads-runtime-session-tables-2026-07-27"
     ]
   }
 }
