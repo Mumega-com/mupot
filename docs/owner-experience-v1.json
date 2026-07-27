@@ -5,6 +5,8 @@
   "thesis": "Owner owns the goal and the gate; the mubot owns execution and adaptation; one relationship with Talk, Know, and Watch facets bound to a single project outcome.",
   "artifactRef": "4cb8d84f-b5b9-4a55-a47c-3af193161b19",
   "facets": ["talk", "know", "watch"],
+  "homeRequiredFacets": ["know", "watch"],
+  "talkOptionalUntil": "tier1-persistent-mubot-505-revived",
   "loop": [
     "goal",
     "sense",
@@ -32,15 +34,17 @@
     "earned-autonomy-wins-consumed-after-widen",
     "earned-autonomy-scope-bound-to-project-and-agent",
     "lesson-requires-receipt-id",
-    "talk-v1-tier1-mubot-only",
+    "talk-v1-tier1-mubot-only-when-present",
     "learn-adapt-instinct-requires-port4-prerequisite",
     "brain-remains-rank-not-act",
     "mechanism-lock-ne-trust-lock"
   ],
   "talk": {
     "v1Runtime": "tier1_persistent_mubot",
+    "tier1Status": "closed-unmerged-pr-505",
     "tier2Status": "dyad-gate-blocked",
-    "tier2AllowedOnlyAfter": "tier2-user-chat/v1-pass"
+    "tier2AllowedOnlyAfter": "tier2-user-chat/v1-pass",
+    "homePolicy": "optional-facet-until-tier1-revived"
   },
   "trustLevels": [
     { "level": 0, "autonomy": "suggest" },
@@ -51,10 +55,12 @@
   "earnedAutonomy": {
     "maxStepsPerWiden": 1,
     "defaultRequiredWins": 3,
+    "minRequiredWins": 3,
     "winVerification": "branded-VerifiedWinRef-from-WinReceiptResolver",
     "winConstructor": "verifiedWinRefFromResolver",
     "trustBoundary": "injected-WinReceiptResolver-like-Port4-InstinctChat",
     "winConsumptionPolicy": "mark_consumed_after_successful_widen",
+    "dedupByReceiptId": true,
     "scopeKeysRequired": ["projectId", "agentId"],
     "decider": "owner_or_admin_human",
     "mubotSelfWiden": false,
@@ -63,13 +69,33 @@
   "progress": {
     "allowedKinds": ["measured", "unmeasured", "unavailable"],
     "forbidFakeGreen": true,
-    "unwiredSource": "unmeasured"
+    "v1Mode": "unmeasured_until_project_kpi",
+    "metricSourceIdType": "KpiSourceId",
+    "sourceWiredCallerBoolean": false
   },
   "unmetDependencies": [
+    {
+      "id": "tier1-persistent-mubot-505",
+      "status": "closed-unmerged",
+      "blocks": ["talk-facet"],
+      "decision": "talk-optional-on-owner-home-until-revived"
+    },
     {
       "id": "tier2-user-chat",
       "status": "dyad-gate-blocked",
       "blocks": ["talk-facet-every-member"]
+    },
+    {
+      "id": "brainport-default-adapter",
+      "status": "type-only-sealed",
+      "blocks": ["rank-via-BrainPort"],
+      "interim": "rankTasks"
+    },
+    {
+      "id": "project-scoped-kpi-source",
+      "status": "not-built",
+      "blocks": ["measured-progress"],
+      "v1": "unmeasured_until_project_kpi"
     },
     {
       "id": "model-port-v2-tool-calling",
@@ -108,7 +134,8 @@
     "ui-in-this-design-commit",
     "merge-port4-or-ranker-from-this-worktree",
     "pretend-modelport-v2-exists",
-    "cite-dormant-surfaces-as-reuse"
+    "cite-dormant-surfaces-as-reuse",
+    "cite-BrainPort-as-reuse"
   ],
   "buildSlices": [
     "outcome-model",
@@ -118,6 +145,16 @@
     "visible-learning",
     "talk-facet-tier2-after-pass",
     "know-facet-docs-507",
+    "learn-adapt-instinct-after-port4"
+  ],
+  "suggestedBuildOrder": [
+    "trust-strip-gate-queue",
+    "visible-learning",
+    "outcome-model",
+    "earned-autonomy",
+    "owner-home-shell",
+    "know-facet-docs-507",
+    "talk-facet-tier2-after-pass",
     "learn-adapt-instinct-after-port4"
   ]
 }
