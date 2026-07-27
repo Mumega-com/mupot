@@ -5,7 +5,6 @@ import { createSqliteD1 } from './helpers/sqlite-d1'
 
 const MIGRATIONS_DIR = join(import.meta.dirname, '..', 'migrations')
 const PENDING_PRODUCTION_MIGRATIONS = [
-  '0068_project_cycle_boundary.sql',
   '0069_project_structural_completion.sql',
   '0071_agent_connections.sql',
   '0073_project_routines.sql',
@@ -22,8 +21,16 @@ function applyProductionBaseline(sqlite: { exec(sql: string): void }): void {
 }
 
 function applyPendingProductionMigrations(sqlite: { exec(sql: string): void }): void {
+  sqlite.exec('PRAGMA foreign_keys = ON')
   for (const file of PENDING_PRODUCTION_MIGRATIONS) {
-    sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+    sqlite.exec('BEGIN')
+    try {
+      sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+      sqlite.exec('COMMIT')
+    } catch (error) {
+      sqlite.exec('ROLLBACK')
+      throw error
+    }
   }
 }
 
@@ -46,6 +53,24 @@ describe('v0.25 production migration path', () => {
         VALUES
           ('project-root', 'squad', 'admin'),
           ('project-child', 'squad', 'write');
+        INSERT INTO project_links (
+          id, tenant, local_project_id, local_squad_id, local_agent_id, local_key_id,
+          remote_pot, remote_project_id, remote_link_id, remote_agent_id, remote_key_id,
+          remote_public_key, remote_base_url, capabilities_json, evidence_origins_json,
+          state, stale_after_seconds, created_by, created_at
+        ) VALUES (
+          'link', 'mumega', 'project-child', 'squad', 'agent', 'key',
+          'remote', 'remote-project', 'remote-link', 'remote-agent', 'remote-key',
+          'public-key', 'https://remote.example', '["project.task.write"]', '[]',
+          'active', 300, 'owner', '2026-07-27T00:00:00Z'
+        );
+        INSERT INTO project_link_deliveries (
+          id, tenant, link_id, direction, idempotency_key, envelope_sha256,
+          status, attempts, created_at, updated_at
+        ) VALUES (
+          'delivery', 'mumega', 'link', 'outbound', 'idem', 'digest',
+          'delivered', 1, '2026-07-27T00:00:00Z', '2026-07-27T00:00:00Z'
+        );
 
         INSERT INTO tasks (id, squad_id, title, done_when, status, project_id)
         VALUES ('task', 'squad', 'Task', 'Done', 'open', 'project-child');
@@ -142,6 +167,12 @@ describe('v0.25 production migration path', () => {
         { id: 'module', project_id: 'project-child' },
         { id: 'module-unscoped', project_id: null },
       ])
+      expect(sqlite.prepare(`
+        SELECT id, link_id, status, attempts
+        FROM project_link_deliveries
+      `).all()).toEqual([
+        { id: 'delivery', link_id: 'link', status: 'delivered', attempts: 1 },
+      ])
 
       for (const table of [
         'task_verdicts',
@@ -158,6 +189,16 @@ describe('v0.25 production migration path', () => {
       }
 
       expect(sqlite.prepare('PRAGMA foreign_key_check').all()).toEqual([])
+      expect(sqlite.prepare(`PRAGMA foreign_key_list('projects')`).all()).toEqual([
+        expect.objectContaining({
+          table: 'projects',
+          from: 'parent_project_id',
+          to: 'id',
+          on_delete: 'RESTRICT',
+        }),
+      ])
+      expect(() => sqlite.exec(`DELETE FROM projects WHERE id = 'project-root'`))
+        .toThrow(/FOREIGN KEY constraint failed/)
       expect(sqlite.prepare('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 })
       expect(sqlite.prepare(`
         SELECT COUNT(*) AS count
@@ -177,6 +218,70 @@ describe('v0.25 production migration path', () => {
       expect(() => sqlite.exec(`
         UPDATE flight_event_outbox SET project_id = NULL WHERE id = 'outbox'
       `)).toThrow(/flight event project (immutable|mismatch)/)
+    } finally {
+      close()
+    }
+  })
+
+  it('commits earlier files but rolls back the failing migration file', () => {
+    const { sqlite, close } = createSqliteD1()
+    try {
+      applyProductionBaseline(sqlite)
+      sqlite.exec(`
+        INSERT INTO departments (id, slug, name)
+        VALUES ('dept', 'delivery', 'Delivery');
+        INSERT INTO squads (id, department_id, slug, name)
+        VALUES ('squad', 'dept', 'core', 'Core');
+        INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+        VALUES ('agent', 'squad', 'agent', 'Agent', 'member', 'test', 'active');
+        INSERT INTO members (id, display_name, status, tenant)
+        VALUES
+          ('member-1', 'Member One', 'active', 'mumega'),
+          ('member-2', 'Member Two', 'active', 'mumega');
+        INSERT INTO member_tokens (
+          id, member_id, token_hash, label, channel, created_at, agent_id, tenant
+        )
+        VALUES
+          ('token-1', 'member-1', 'hash-1', '', 'workspace',
+           '2026-07-27T00:00:00Z', 'agent', 'mumega'),
+          ('token-2', 'member-2', 'hash-2', '', 'workspace',
+           '2026-07-27T00:00:00Z', 'agent', 'mumega');
+        INSERT INTO projects (id, slug, name, status)
+        VALUES ('project-root', 'root', 'Root', 'active');
+        INSERT INTO projects (id, slug, name, status, parent_project_id)
+        VALUES ('project-child', 'child', 'Child', 'active', 'project-root');
+      `)
+
+      expect(() => applyPendingProductionMigrations(sqlite))
+        .toThrow(/CHECK constraint failed.*ok/)
+
+      expect(sqlite.prepare(`
+        SELECT id, parent_project_id, completion_proposed_by
+          FROM projects
+         ORDER BY id
+      `).all()).toEqual([
+        {
+          id: 'project-child',
+          parent_project_id: 'project-root',
+          completion_proposed_by: null,
+        },
+        {
+          id: 'project-root',
+          parent_project_id: null,
+          completion_proposed_by: null,
+        },
+      ])
+      expect(sqlite.prepare(`
+        SELECT COUNT(*) AS count
+          FROM sqlite_master
+         WHERE type = 'table' AND name = 'agent_member_bindings'
+      `).get()).toEqual({ count: 0 })
+      expect(sqlite.prepare(`
+        SELECT COUNT(*) AS count
+          FROM sqlite_master
+         WHERE type = 'table' AND name LIKE '%_backup_0069'
+      `).get()).toEqual({ count: 0 })
+      expect(sqlite.prepare('PRAGMA foreign_key_check').all()).toEqual([])
     } finally {
       close()
     }

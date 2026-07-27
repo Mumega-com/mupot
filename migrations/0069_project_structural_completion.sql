@@ -8,8 +8,6 @@
 -- before RENAME (SQLite recompiles them and fails with "no such table: projects")
 -- then restored. Pattern mirrors 0049_agent_status_inactive.sql backups.
 
-PRAGMA foreign_keys = off;
-
 DROP TRIGGER IF EXISTS trg_project_link_receipt_authorized;
 DROP TRIGGER IF EXISTS validate_agent_messages_project_insert;
 DROP TRIGGER IF EXISTS validate_flights_project_id_insert;
@@ -35,6 +33,7 @@ CREATE TABLE _projects_backup_0069 AS SELECT * FROM projects;
 CREATE TABLE _project_squad_access_backup_0069 AS SELECT * FROM project_squad_access;
 CREATE TABLE _project_provider_bindings_backup_0069 AS SELECT * FROM project_provider_bindings;
 CREATE TABLE _project_links_backup_0069 AS SELECT * FROM project_links;
+CREATE TABLE _project_link_deliveries_backup_0069 AS SELECT * FROM project_link_deliveries;
 CREATE TABLE _project_link_receipts_backup_0069 AS SELECT * FROM project_link_receipts;
 -- Exclude GENERATED project_key (STORED) — SELECT * would copy it and break restore.
 CREATE TABLE _module_registry_backup_0069 AS
@@ -60,9 +59,13 @@ UPDATE flight_event_outbox SET project_id = NULL WHERE project_id IS NOT NULL;
 DELETE FROM module_registry WHERE project_id IS NOT NULL;
 
 DELETE FROM project_link_receipts;
+DELETE FROM project_link_deliveries;
 DELETE FROM project_links;
 DELETE FROM project_provider_bindings;
 DELETE FROM project_squad_access;
+-- D1 keeps foreign keys enabled for the migration transaction, so detach the
+-- self-referencing hierarchy after backing it up and before deleting projects.
+UPDATE projects SET parent_project_id = NULL WHERE parent_project_id IS NOT NULL;
 DELETE FROM projects;
 
 CREATE TABLE projects_new (
@@ -73,7 +76,7 @@ CREATE TABLE projects_new (
   goal                   TEXT NOT NULL DEFAULT '',
   status                 TEXT NOT NULL DEFAULT 'active'
                          CHECK (status IN ('planned','active','paused','review','completed','archived')),
-  parent_project_id      TEXT,
+  parent_project_id      TEXT REFERENCES projects_new(id) ON DELETE RESTRICT,
   target_date            TEXT,
   cycle_boundary_at      TEXT,
   stalled                INTEGER NOT NULL DEFAULT 0,
@@ -181,6 +184,7 @@ END;
 INSERT INTO project_squad_access SELECT * FROM _project_squad_access_backup_0069;
 INSERT INTO project_provider_bindings SELECT * FROM _project_provider_bindings_backup_0069;
 INSERT INTO project_links SELECT * FROM _project_links_backup_0069;
+INSERT INTO project_link_deliveries SELECT * FROM _project_link_deliveries_backup_0069;
 INSERT INTO project_link_receipts SELECT * FROM _project_link_receipts_backup_0069;
 INSERT INTO module_registry (
   id, tenant, kind, adapter, project_id, identity, status, capabilities,
@@ -570,6 +574,7 @@ DROP TABLE _projects_backup_0069;
 DROP TABLE _project_squad_access_backup_0069;
 DROP TABLE _project_provider_bindings_backup_0069;
 DROP TABLE _project_links_backup_0069;
+DROP TABLE _project_link_deliveries_backup_0069;
 DROP TABLE _project_link_receipts_backup_0069;
 DROP TABLE _module_registry_backup_0069;
 DROP TABLE _task_verdicts_project_backup_0069;
