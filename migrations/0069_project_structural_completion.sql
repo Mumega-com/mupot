@@ -63,6 +63,9 @@ DELETE FROM project_link_receipts;
 DELETE FROM project_links;
 DELETE FROM project_provider_bindings;
 DELETE FROM project_squad_access;
+-- D1 keeps foreign keys enabled for the migration transaction, so detach the
+-- self-referencing hierarchy after backing it up and before deleting projects.
+UPDATE projects SET parent_project_id = NULL WHERE parent_project_id IS NOT NULL;
 DELETE FROM projects;
 
 CREATE TABLE projects_new (

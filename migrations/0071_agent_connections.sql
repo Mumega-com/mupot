@@ -4,6 +4,24 @@
 -- credential path. It fails closed when historical welded tokens are ambiguous
 -- or tenantless, then backfills exactly one canonical member per agent.
 
+-- A credential cannot remain authoritative for an agent that no longer exists.
+-- Revoke and detach those stale welds before canonical identity is evaluated.
+UPDATE member_tokens
+   SET revoked_at = COALESCE(
+         revoked_at,
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+       ),
+       agent_id = NULL
+ WHERE agent_id IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM agents WHERE id = member_tokens.agent_id);
+
+-- Revoked credentials remain audit records, but they no longer participate in
+-- the live agent-member weld. Live ambiguity still fails closed below.
+UPDATE member_tokens
+   SET agent_id = NULL
+ WHERE agent_id IS NOT NULL
+   AND revoked_at IS NOT NULL;
+
 CREATE TABLE agent_member_bindings (
   tenant     TEXT NOT NULL,
   agent_id   TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,

@@ -190,6 +190,54 @@ describe('0071 agent connection contract migration', () => {
     }
   })
 
+  it('ignores a revoked historical member when one live canonical member remains', () => {
+    const h = createBeforeTargetHarness()
+    try {
+      addSecondAgentAndMember(h.sqlite)
+      h.sqlite.exec(`
+        INSERT INTO member_tokens
+          (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id, tenant)
+        VALUES
+          ('token-live', 'member-1', 'hash-live', '', 'workspace', '${NOW}', NULL, 'agent-1', 'tenant-a'),
+          ('token-old', 'member-2', 'hash-old', '', 'workspace', '${NOW}', '${LATER}', 'agent-1', 'tenant-a');
+      `)
+
+      applyTarget(h.sqlite)
+
+      expect(h.sqlite.prepare(
+        'SELECT tenant, agent_id, member_id FROM agent_member_bindings',
+      ).all()).toEqual([{ tenant: 'tenant-a', agent_id: 'agent-1', member_id: 'member-1' }])
+      expect(h.sqlite.prepare(
+        "SELECT agent_id, revoked_at FROM member_tokens WHERE id = 'token-old'",
+      ).get()).toEqual({ agent_id: null, revoked_at: LATER })
+    } finally {
+      h.close()
+    }
+  })
+
+  it('revokes and detaches a live credential welded to a deleted agent', () => {
+    const h = createBeforeTargetHarness()
+    try {
+      h.sqlite.exec(`
+        INSERT INTO member_tokens
+          (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id, tenant)
+        VALUES
+          ('token-orphan', 'member-1', 'hash-orphan', '', 'workspace', '${NOW}', NULL, 'agent-missing', 'tenant-a');
+      `)
+
+      applyTarget(h.sqlite)
+
+      expect(h.sqlite.prepare(
+        "SELECT agent_id, revoked_at FROM member_tokens WHERE id = 'token-orphan'",
+      ).get()).toEqual({ agent_id: null, revoked_at: expect.any(String) })
+      expect(h.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM agent_member_bindings',
+      ).get()).toEqual({ count: 0 })
+    } finally {
+      h.close()
+    }
+  })
+
   it('blocks migration when a historical welded token has no tenant', () => {
     const h = createBeforeTargetHarness()
     try {

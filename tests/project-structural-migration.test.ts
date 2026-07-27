@@ -22,8 +22,15 @@ function applyProductionBaseline(sqlite: { exec(sql: string): void }): void {
 }
 
 function applyPendingProductionMigrations(sqlite: { exec(sql: string): void }): void {
-  for (const file of PENDING_PRODUCTION_MIGRATIONS) {
-    sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+  sqlite.exec('PRAGMA foreign_keys = ON; BEGIN')
+  try {
+    for (const file of PENDING_PRODUCTION_MIGRATIONS) {
+      sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+    }
+    sqlite.exec('COMMIT')
+  } catch (error) {
+    sqlite.exec('ROLLBACK')
+    throw error
   }
 }
 
