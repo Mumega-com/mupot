@@ -635,7 +635,7 @@ describe('project routine lifecycle receipt checker', () => {
       ok: false, check: 'receipt_artifact_has_no_secret_material', artifact_path: 'artifacts/manual_fire.json',
     }))
 
-    const secretValue = 'sk-proj-abcdefghijklmnopqrstuvwxyz123456'
+    const secretValue = 'Bearer abcdefghijklmnop'
     const receiptSecret = tempDir()
     writeBundle(receiptSecret, (receipt, file) => {
       if (file === 'runtime-proposal.json') {
