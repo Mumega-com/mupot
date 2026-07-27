@@ -693,4 +693,21 @@ describe('CollectorError', () => {
     expect(error.message).toBe('target rejected request')
     expect(JSON.stringify(error.safeDetail)).not.toContain(OWNER_TOKEN)
   })
+
+  it('redacts unexpected dependency failures before surfacing diagnostics', async () => {
+    const fixture = dependencies()
+    fixture.deps.api.probeTarget = async () => {
+      throw new Error(`transport failed for ${OWNER_TOKEN}`)
+    }
+
+    await expect(runProjectRoutineLifecycleCollector(config(), fixture.deps))
+      .rejects.toMatchObject({
+        name: 'CollectorError',
+        message: 'collector execution failed',
+        safeDetail: {
+          name: 'Error',
+          reason: '[redacted]',
+        },
+      })
+  })
 })

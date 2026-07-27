@@ -992,7 +992,13 @@ export async function runProjectRoutineLifecycleCollector(config, deps) {
     cleanupFailures.push(error)
   }
 
-  if (failure) throw failure
+  if (failure) {
+    if (failure instanceof CollectorError) throw failure
+    throw new CollectorError('collector execution failed', {
+      name: failure instanceof Error ? failure.name : 'UnknownError',
+      reason: failure instanceof Error ? failure.message : String(failure),
+    }, secretValues)
+  }
   if (cleanupFailures.length) {
     throw new CollectorError('collector cleanup failed', cleanupFailures.map(error => error?.message))
   }
