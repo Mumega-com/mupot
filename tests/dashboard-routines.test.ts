@@ -138,6 +138,27 @@ describe('Project Routines dashboard', () => {
     }
     expect(body).toContain('role="region" aria-label="Project routines" tabindex="0"')
     expect(body).toContain('style="max-width:100%;overflow-x:auto;"')
+    expect(body).toContain('class="ui-table routine-table"')
+    expect(body).toContain('class="routine-form"')
+    expect(body).toContain('class="routine-stack"')
+    expect(body).toContain('.routine-stack {')
+    expect(body).toContain('.routine-form input')
+    expect(body).not.toContain('.routine-table .ui-td::before')
+    expect(body).not.toContain('data-label="Routine"')
+    expect(body).toContain('<span class="routine-mobile-label" aria-hidden="true">Routine</span>')
+    expect(body).toContain('<span class="routine-mobile-label" aria-hidden="true">Current state / next action</span>')
+    const headerIds = [...body.matchAll(/<div id="([^"]+)" class="ui-th" role="columnheader">/g)].map(match => match[1])
+    expect(headerIds).toHaveLength(18)
+    expect(new Set(headerIds).size).toBe(headerIds.length)
+    for (const headerId of headerIds) {
+      expect(body).toMatch(new RegExp(`aria-labelledby="${headerId} [^"]+"`))
+    }
+    const contentIds = [...body.matchAll(/<div id="([^"]+)" class="routine-cell">/g)].map(match => match[1])
+    expect(contentIds.length).toBeGreaterThan(0)
+    expect(new Set(contentIds).size).toBe(contentIds.length)
+    for (const contentId of contentIds) {
+      expect(body).toContain(` ${contentId}"`)
+    }
     expect(body).toContain('href="/projects/project-a/routines?run_id=')
     expect(body).toContain('href="/projects/project-a/routines?run_id=')
     expect(body).toContain('#run-activity')

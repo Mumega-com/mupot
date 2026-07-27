@@ -75,6 +75,8 @@ describe('production self-hosting runbook', () => {
     expect(runbook).toContain('curl -fsS "$BASE_URL/health"')
     expect(runbook).toContain('npx wrangler tail "$WORKER"')
     expect(runbook).toContain('[scheduled:unmatched-cron]')
+    expect(runbook).toContain('[scheduled:dispatch]')
+    expect(runbook).toContain('all eleven route labels')
     expect(runbook).toContain('does not include the received cron expression')
   })
 

@@ -215,12 +215,21 @@ the ten existing jobs in minute slots 0-9 of each fifteen-minute window. This
 keeps their D1 and subrequest budgets isolated. A legacy `*/15` trigger cannot
 satisfy the v0.25 activation contract.
 
-After deploy, keep `npx wrangler tail "$WORKER"` open through at least one
-invocation of each configured trigger. An unrecognized trigger emits the
-structured `[scheduled:unmatched-cron]` warning with its scheduled time and the
-expected trigger count. The warning does not include the received cron expression.
-Treat any occurrence as a failed activation gate and correct the live config
-before enabling a Routine.
+After deploy, keep `npx wrangler tail "$WORKER"` open until
+`[scheduled:dispatch]` has reported all eleven route labels: `project-routines`
+plus `membership`, `metabolism`, `loops`, `github-project`, `growth`, `cro`,
+`flight-outbox`, `concierge`, `project-loop`, and
+`agent-connection-retention`. Dispatch routes and unmatched triggers are each
+reported at most once per UTC hour per Worker isolate, so this activation
+evidence stays bounded while remaining observable after the initial deploy
+minute. A dispatch marker proves the route was selected; any matching
+`[scheduled:<route>]` error still fails the activation gate.
+
+An unrecognized trigger emits the structured `[scheduled:unmatched-cron]`
+warning with its scheduled time and the expected trigger count. The warning
+does not include the received cron expression. Treat any occurrence, or failure
+to observe all eleven route labels within one hour, as a failed activation gate
+and correct the live config before enabling a Routine.
 
 Do not apply a migration to production until a D1 backup exists for the current
 production state.
