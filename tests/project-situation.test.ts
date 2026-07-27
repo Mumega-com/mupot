@@ -7,9 +7,16 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 
-function makeHarness(): SqliteD1Harness {
+function makeHarness(options: { includeRoutineMigrations?: boolean } = {}): SqliteD1Harness {
+  const includeRoutineMigrations = options.includeRoutineMigrations !== false
   const harness = createSqliteD1()
   for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
+    if (
+      !includeRoutineMigrations
+      && (file.startsWith('0073_') || file.startsWith('0074_'))
+    ) {
+      continue
+    }
     harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
   }
   harness.sqlite.exec(`
@@ -204,6 +211,42 @@ describe('loadProjectSituation', () => {
   afterEach(() => {
     harness?.close()
     harness = undefined
+  })
+
+  it('degrades to empty Routine slices when migration 0073 tables are absent', async () => {
+    harness = makeHarness({ includeRoutineMigrations: false })
+    const project = insertProject(harness, 'pre-0073')
+    insertTask(harness, project.id, {
+      id: 'open-work', status: 'open', title: 'Continue delivery',
+    })
+    insertTask(harness, project.id, {
+      id: 'review-work', status: 'review', title: 'Review release', gateOwner: 'lead',
+    })
+
+    const probe = statementProbe(envFor(harness).DB)
+    const situation = await loadProjectSituation(
+      { DB: probe.db, TENANT_SLUG: 'pot-a' } as Env,
+      project,
+      null,
+    )
+
+    expect(situation).toMatchObject({
+      health: 'review',
+      routines: {
+        enabled_count: 0,
+        paused_count: 0,
+        next: null,
+        active_run: null,
+        latest_terminal_run: null,
+        truncated: false,
+      },
+      needs_you: {
+        count: 1,
+        highest_priority: { kind: 'approval', source_id: 'review-work' },
+      },
+    })
+    expect(probe.statements.some((entry) => /\bFROM\s+routines\b/i.test(entry.sql))).toBe(false)
+    expect(probe.statements.some((entry) => /\bFROM\s+routine_runs\b/i.test(entry.sql))).toBe(false)
   })
 
   it('derives blocker health while reviewing a pending item first', async () => {
