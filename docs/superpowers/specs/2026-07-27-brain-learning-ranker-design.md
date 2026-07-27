@@ -459,7 +459,7 @@ explicit staleness/degraded signal is surfaced (follow-up, not this commit).
 
 ## 11. Tests and acceptance — mechanism-lock ≠ trust-lock
 
-The contract suite (14 tests @ `8ceebb5d`) is honest about what it verifies.
+The contract suite (**19 tests** on this head) is honest about what it verifies.
 Give the dangerous middle category a name:
 
 **Mechanism-lock ≠ trust-lock** — tests that lock a mechanism but not the
@@ -470,39 +470,44 @@ exercising real logic *adjacent* to a hole reads as coverage.
 would fail if removed, and is completely silent on whether the label corresponds
 to anything real. **The test is correct. The thing it implies is false.**
 
-### What the 14 tests DO catch
+### What the 19 tests DO catch
 
 | Block | Count | Character |
 |---|---|---|
 | contract doc | 3 | Pure mirror: JSON literal vs TS constant. Legitimate drift-lock. |
-| brain role | 4 | 3 assert hardcoded literals; 1 has real content. |
-| distill fence | 2 | Real but shallow — enum list membership only (mechanism-lock). |
-| instinct gate | 3 | **Real semantic content:** clamp, decay, domain+threshold, promote gate. |
-| RECALL-at-rank | 2 | 1 near-end-to-end (reshapes input to dodge prose filter — documents BLOCK-C); 1 pipeline-order predicate. |
+| brain role | 4 | Kind enforcement + prose warn-not-throw on board strings (BLOCK-C cleared). |
+| distill fence | 3 | Resolver-minted `VerifiedReceiptRef`, independence check, schema allowlist. |
+| instinct gate | 5 | Project scope, independent corroboration, wired (c) decay via gateInstinctsForRank. |
+| selection bias | 1 | Staleness escalation **wired into** `applyInstinctBiasToProposals`. |
+| RECALL-at-rank | 3 | Noop veto + capped audited delta, agentId survival, pipeline order. |
 
-### What the 14 tests DO NOT catch
+### What cleared hard blocks from the prior gate (do not re-list as uncaught)
 
-Every BLOCK/H/M finding in the 2026-07-27 dyad-gate passes all 14 tests green:
+- Phantom `BrainPort` named type-only + `brainport-default-adapter` slice (BLOCK-A)
+- `RankProposal` ≡ `BrainProposal` including `agentId` (BLOCK-B)
+- Prose filter warn-not-throw on real board text (BLOCK-C)
+- `projectId` fail-closed (M-1)
 
-- Phantom `BrainPort` (BLOCK-A) — no implementation to test
-- `RankProposal` ↔ `BrainProposal` seam mismatch (BLOCK-B) — nothing connects types
-- Prose filter batch throw on real board text (BLOCK-C)
-- Receipt label vs verified ID (provenance gap)
-- Content trust boundary on distill parse
-- Domain mismatch nullifying the loop (H-1)
-- Unbounded bias / missing `MAX_LEARN_DELTA` (H-2)
-- Missing determinism invariant (H-3)
-- Cross-project instinct leakage (M-1)
-- Selection-bias / self-fulfilling rank floor
+### Still structural / riding (honest inventory)
+
+- Production store wiring for `ReceiptStoreResolver` (integration, not contract)
+- `suppressionTicksWithoutConfirm` producer (read in gate; writer is a later slice)
+- Distill free-text → allowlist mapping still discards unknown domains (prompt constraint required)
 
 **Structural limitation:** no contract test can prove Port-4 is wired. That is
 exactly how Tier-2's ModelPort problem survived a passing suite. Wiring proof
-belongs to integration tests in `port4-land` and `recall-at-rank` slices, not
-this contract-lock commit.
+belongs to integration tests in `port4-land` and `recall-at-rank` slices.
+
+### Invariants (named)
+
+- `max-learn-delta-bound` — soft demote only; clamp is reachable (`MAX_LEARN_DELTA=5`).
+- `noop-veto-full-block-unbounded-priority` — separate from the soft demote cap;
+  kind→noop, priority floors at 0; audited delta still clamped and tagged
+  `noopVeto:true`.
 
 ### Acceptance notes for re-gate
 
 - `mechanism-lock-ne-trust-lock` — named failure mode; suite inventory above
-- Re-gate requires doc revision addressing minimum-to-clear items 1–9
-- Implementation fixes (RankProposal shape, kind-only enforcement, gate
-  `projectId`, etc.) tracked in parent agent / `src/` work — not this doc commit
+- This commit **includes** the pure contract module under `src/brain/` — it is
+  design + contract-lock, not doc-only
+- Reproduce-and-refuse required for every closed finding

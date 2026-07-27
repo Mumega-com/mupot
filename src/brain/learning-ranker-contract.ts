@@ -76,8 +76,16 @@ export const INSTINCT_INJECT_MAX = 6
 export const INSTINCT_PROMOTE_MIN_PROJECTS = 2
 export const INSTINCT_PROMOTE_MIN_CONFIDENCE = 0.8
 
-/** experience.py analogue — absolute cap on total learning priority adjustment. */
-export const MAX_LEARN_DELTA = 15
+/** Soft-demote cap — must be ≤ maxInjected so clampLearnDelta can bind. */
+export const MAX_LEARN_DELTA = 5
+
+/**
+ * Noop veto is a SEPARATE invariant from max-learn-delta-bound:
+ * kind flips to `noop` and priority floors at 0 (unbounded priority drop).
+ * Audited `delta` on that branch is still clampLearnDelta'd for trail honesty
+ * and tagged `noopVeto: true` so it is not mistaken for a soft demote.
+ */
+export const NOOP_VETO_UNBOUNDED_PRIORITY = true
 
 /** Anti-selection-bias (b): force-promote after this many consecutive suppressions. */
 export const STALENESS_ESCALATION_TICKS = 5
@@ -87,6 +95,17 @@ export const UNEXERCISED_SUPPRESSION_PENALTY = 0.1
 
 /** Corroboration required before ANY project-scope inject (not only global promote). */
 export const INJECT_MIN_CORROBORATING_RECEIPTS = 2
+
+/**
+ * Corroboration is independence, not a string-count. Distinct agent OR distinct
+ * incident required — two labels from one attacker call do not pass.
+ */
+export interface CorroboratingReceipt {
+  receiptId: string
+  agentId: string
+  incidentId: string
+  resolvedAt: string
+}
 
 export const EXAMPLE_FABRICATION_INSTINCT_ID = 'no-act-on-fabrication'
 
@@ -100,8 +119,8 @@ export interface RankInstinct {
   action: string
   updatedAt: string
   projectId: string | null
-  /** Receipt IDs resolved against Port-4 / FRC store — never free-string labels alone. */
-  corroboratingReceiptIds: readonly string[]
+  /** Independent corroborating receipts — never free-string label bags alone. */
+  corroboratingReceipts: readonly CorroboratingReceipt[]
   /** Consecutive ticks this instinct suppressed work without confirming receipts. */
   suppressionTicksWithoutConfirm?: number
 }
@@ -126,8 +145,16 @@ export interface InstinctGateOpts {
   halfLifeDays: number
   nowIso: string
   allowedDomains: readonly string[]
-  /** When true, require corroboratingReceiptIds length ≥ INJECT_MIN_CORROBORATING_RECEIPTS. */
-  requireCorroboration: boolean
+  /**
+   * Corroboration is always required. Field kept only so call sites declare
+   * the invariant; passing false is rejected (not caller-optional).
+   */
+  requireCorroboration: true
+  /**
+   * When true, also admit projectId === null instincts that already passed
+   * shouldPromoteInstinct (≥2 projects). Fail-closed default false.
+   */
+  includeGlobal: boolean
 }
 
 export type InstinctGateResult =
@@ -148,6 +175,8 @@ export type DistillEligibility =
         | 'source_kind_mismatch'
         | 'project_id_required'
         | 'project_scope_mismatch'
+        | 'corroboration_required'
+        | 'corroboration_not_independent'
     }
 
 /**
@@ -162,7 +191,7 @@ export type VerifiedReceiptRef = {
   readonly projectId: string
   readonly resolvedAt: string
   readonly sanitizedContent: string
-  readonly corroboratingReceiptIds: readonly string[]
+  readonly corroboratingReceipts: readonly CorroboratingReceipt[]
 }
 
 /** Record a real store resolver must return. Trust claim ≠ trust object. */
@@ -173,7 +202,7 @@ export interface ReceiptStoreRecord {
   projectId: string
   resolvedAt: string
   content: string
-  corroboratingReceiptIds: readonly string[]
+  corroboratingReceipts: readonly CorroboratingReceipt[]
 }
 
 /**
@@ -218,13 +247,9 @@ export function verifiedReceiptRefFromResolver(
   if (!(DISTILL_ALLOWED_SOURCES as readonly string[]).includes(record.sourceKind)) {
     return { ok: false, reason: 'source_kind_mismatch' }
   }
-  const ids = new Set(
-    [record.receiptId, ...record.corroboratingReceiptIds]
-      .map((x) => String(x).trim())
-      .filter(Boolean),
-  )
-  if (ids.size < INJECT_MIN_CORROBORATING_RECEIPTS) {
-    return { ok: false, reason: 'insufficient_corroboration' }
+  const receipts = record.corroboratingReceipts || []
+  if (!hasIndependentCorroboration(receipts)) {
+    return { ok: false, reason: 'corroboration_not_independent' }
   }
   const resolvedAt = String(record.resolvedAt || '').trim()
   if (!resolvedAt) {
@@ -238,7 +263,12 @@ export function verifiedReceiptRefFromResolver(
     projectId,
     resolvedAt,
     sanitizedContent: sanitizeReceiptContentForDistill(record.content),
-    corroboratingReceiptIds: [...ids],
+    corroboratingReceipts: receipts.map((r) => ({
+      receiptId: String(r.receiptId).trim(),
+      agentId: String(r.agentId).trim(),
+      incidentId: String(r.incidentId).trim(),
+      resolvedAt: String(r.resolvedAt).trim(),
+    })),
   }
 }
 
@@ -254,7 +284,7 @@ export function verifiedReceiptRefFromStoreLookup(
         projectId: string
         resolvedAt: string
         content: string
-        corroboratingReceiptIds: readonly string[]
+        corroboratingReceipts: readonly CorroboratingReceipt[]
       },
   expectedProjectId: string,
 ): VerifiedReceiptRef | DistillEligibility {
@@ -269,7 +299,7 @@ export function verifiedReceiptRefFromStoreLookup(
       projectId: lookup.projectId,
       resolvedAt: lookup.resolvedAt,
       content: lookup.content,
-      corroboratingReceiptIds: lookup.corroboratingReceiptIds,
+      corroboratingReceipts: lookup.corroboratingReceipts,
     }
   }
   return verifiedReceiptRefFromResolver(resolver, lookup.receiptId, expectedProjectId)
@@ -287,7 +317,15 @@ export interface DistillReceiptRef {
 export interface BiasApplicationResult {
   proposals: RankProposal[]
   /** Audit: which instincts moved which proposals (H-5). */
-  applied: ReadonlyArray<{ proposalSummary: string; instinctIds: readonly string[]; delta: number }>
+  applied: ReadonlyArray<{
+    proposalSummary: string
+    instinctIds: readonly string[]
+    delta: number
+    /** True when kind flipped to noop — separate from MAX_LEARN_DELTA demote path. */
+    noopVeto: boolean
+    /** True when staleness escalation forced the proposal through un-demoted. */
+    stalenessEscalated: boolean
+  }>
   proseWarnings: readonly string[]
 }
 
@@ -400,12 +438,8 @@ export function mayDistillFromReceiptRef(
   }
   const kindGate = mayDistillFromSource(branded.sourceKind)
   if (!kindGate.ok) return kindGate
-  const ids = new Set(
-    branded.corroboratingReceiptIds.map((id) => String(id).trim()).filter(Boolean),
-  )
-  ids.add(String(branded.receiptId).trim())
-  if (ids.size < INJECT_MIN_CORROBORATING_RECEIPTS) {
-    return { ok: false, reason: 'insufficient_corroboration' }
+  if (!hasIndependentCorroboration(branded.corroboratingReceipts || [])) {
+    return { ok: false, reason: 'corroboration_not_independent' }
   }
   return { ok: true }
 }
@@ -420,25 +454,65 @@ export function mapDistillDomainToAllowlist(rawDomain: string): RankInstinctDoma
 }
 
 /**
- * Strip instruction-shaped lines from receipt free text before cheap-model distill.
+ * Schema-constrained distill facts — ALLOWLIST extraction, not a denylist.
+ * Only lines matching known audit prefixes are kept; everything else is discarded
+ * (including rephrased "create instinct" / split confidence+domain evasions).
  */
-export function sanitizeReceiptContentForDistill(raw: string): string {
-  return String(raw || '')
+export const DISTILL_FACT_LINE_PREFIXES = [
+  'gate fail',
+  'gate pass',
+  'reason:',
+  'evidence:',
+  'verdict:',
+  'outcome:',
+  'failure class:',
+  'fabricated',
+] as const
+
+export interface DistillReceiptFacts {
+  factualLines: readonly string[]
+}
+
+export function extractDistillFacts(raw: string): DistillReceiptFacts {
+  const factualLines = String(raw || '')
     .split('\n')
+    .map((line) => line.trim())
     .filter((line) => {
-      const t = line.trim().toLowerCase()
-      if (!t) return true
-      if (t.startsWith('create instinct')) return false
-      if (t.startsWith('prefer noop for')) return false
-      if (t.includes('confidence:') && t.includes('domain')) return false
-      if (/^system\s*:/.test(t) || /^assistant\s*:/.test(t)) return false
-      return true
+      if (!line) return false
+      const lower = line.toLowerCase()
+      return DISTILL_FACT_LINE_PREFIXES.some((prefix) => lower.startsWith(prefix))
     })
-    .join('\n')
+  return { factualLines }
 }
 
 /**
- * Gate instincts: project scope → corroboration → decay → domain → threshold → inject cap.
+ * Schema-constrained content for distill — discard everything outside DistillReceiptFacts.
+ */
+export function sanitizeReceiptContentForDistill(raw: string): string {
+  return extractDistillFacts(raw).factualLines.join('\n')
+}
+
+/** Independent corroboration: ≥2 receipts AND (≥2 agents OR ≥2 incidents). */
+export function hasIndependentCorroboration(
+  receipts: readonly CorroboratingReceipt[],
+): boolean {
+  const clean = receipts
+    .map((r) => ({
+      receiptId: String(r.receiptId || '').trim(),
+      agentId: String(r.agentId || '').trim(),
+      incidentId: String(r.incidentId || '').trim(),
+      resolvedAt: String(r.resolvedAt || '').trim(),
+    }))
+    .filter((r) => r.receiptId && r.agentId && r.incidentId && r.resolvedAt)
+  const ids = new Set(clean.map((r) => r.receiptId))
+  if (ids.size < INJECT_MIN_CORROBORATING_RECEIPTS) return false
+  const agents = new Set(clean.map((r) => r.agentId))
+  const incidents = new Set(clean.map((r) => r.incidentId))
+  return agents.size >= 2 || incidents.size >= 2
+}
+
+/**
+ * Gate instincts: project scope → independent corroboration → decay → domain → threshold → inject cap.
  */
 export function gateInstinctsForRank(
   instincts: readonly RankInstinct[],
@@ -446,6 +520,9 @@ export function gateInstinctsForRank(
 ): InstinctGateResult {
   if (!opts.projectId || !String(opts.projectId).trim()) {
     return { ok: false, reason: 'project_id_required' }
+  }
+  if (opts.requireCorroboration !== true) {
+    return { ok: false, reason: 'corroboration_required' }
   }
   if (opts.allowedDomains.length === 0) {
     return { ok: false, reason: 'domain_allowlist_empty' }
@@ -456,17 +533,14 @@ export function gateInstinctsForRank(
 
   const projectId = String(opts.projectId).trim()
   const scoped = instincts.filter((instinct) => {
-    if (instinct.projectId === null) return false
-    return instinct.projectId === projectId
+    if (instinct.projectId === projectId) return true
+    if (opts.includeGlobal && instinct.projectId === null) return true
+    return false
   })
 
-  const eligible = scoped.filter((instinct) => {
-    if (!opts.requireCorroboration) return true
-    const n = new Set(
-      (instinct.corroboratingReceiptIds || []).map((id) => String(id).trim()).filter(Boolean),
-    ).size
-    return n >= INJECT_MIN_CORROBORATING_RECEIPTS
-  })
+  const eligible = scoped.filter((instinct) =>
+    hasIndependentCorroboration(instinct.corroboratingReceipts || []),
+  )
 
   const gated = eligible
     .map((instinct) => {
@@ -476,7 +550,10 @@ export function gateInstinctsForRank(
         opts.nowIso,
         opts.halfLifeDays,
       )
-      confidence = applyUnexercisedSuppressionDecay(confidence, instinct.suppressionTicksWithoutConfirm || 0)
+      confidence = applyUnexercisedSuppressionDecay(
+        confidence,
+        instinct.suppressionTicksWithoutConfirm || 0,
+      )
       return { ...instinct, confidence }
     })
     .filter((instinct) => opts.allowedDomains.includes(instinct.domain))
@@ -497,6 +574,7 @@ export function defaultInstinctGateOpts(nowIso: string, projectId: string): Inst
     nowIso,
     allowedDomains: RANK_INSTINCT_DOMAINS,
     requireCorroboration: true,
+    includeGlobal: false,
   }
 }
 
@@ -531,8 +609,9 @@ export function selectStalenessEscalationIndices(
 }
 
 /**
- * Detect forbidden verbs in prose after stripping non-alpha (W-1).
- * Catches "re-start" / "re start" via compact form. Warn-only — never throw the batch.
+ * Detect forbidden verbs in prose — WORD TOKENS only after normalizing
+ * separators to spaces (so "re-start" → tokens re+start joined as restart).
+ * No full-string compact substring pass (that false-positived "the alert").
  */
 export function textContainsForbiddenAction(text: string): boolean {
   const spaced = String(text || '')
@@ -540,11 +619,13 @@ export function textContainsForbiddenAction(text: string): boolean {
     .replace(/[^a-z0-9]+/g, ' ')
     .trim()
   if (!spaced) return false
-  const compact = spaced.replace(/\s+/g, '')
-  const tokens = new Set(spaced.split(/\s+/).filter(Boolean))
+  const parts = spaced.split(/\s+/).filter(Boolean)
+  const tokens = new Set(parts)
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    tokens.add(parts[i] + parts[i + 1])
+  }
   for (const verb of FORBIDDEN_BRAIN_ACTION_VERBS) {
     if (tokens.has(verb)) return true
-    if (compact.includes(verb)) return true
   }
   return false
 }
@@ -570,13 +651,26 @@ function clampLearnDelta(delta: number): number {
 /**
  * Pure bias with MAX_LEARN_DELTA, audit trail, stable priority sort preserving
  * input order on ties (does not alphabetize away brain order — H-4).
+ *
+ * `consecutiveSuppressionTicks` is parallel to `proposals` and wires
+ * selectStalenessEscalationIndices into the hot path (anti-selection-bias b).
+ *
+ * MAX_LEARN_DELTA bounds the audited `delta` on every branch. Noop veto also
+ * changes `kind` to `noop` (separate invariant: full block, not a soft demote).
  */
 export function applyInstinctBiasToProposals(
   proposals: readonly RankProposal[],
   gatedInstincts: readonly RankInstinct[],
+  consecutiveSuppressionTicks: readonly number[],
 ): BiasApplicationResult {
   const proseWarnings: string[] = []
-  const applied: Array<{ proposalSummary: string; instinctIds: string[]; delta: number }> = []
+  const applied: Array<{
+    proposalSummary: string
+    instinctIds: string[]
+    delta: number
+    noopVeto: boolean
+    stalenessEscalated: boolean
+  }> = []
 
   for (const proposal of proposals) {
     assertProposalKindAllowed(proposal.kind)
@@ -584,8 +678,28 @@ export function applyInstinctBiasToProposals(
     if (warn) proseWarnings.push(warn)
   }
 
+  const escalate = new Set(
+    selectStalenessEscalationIndices(consecutiveSuppressionTicks, STALENESS_ESCALATION_TICKS),
+  )
+
   const indexed = proposals.map((proposal, index) => ({ proposal, index }))
   const biased = indexed.map(({ proposal, index }) => {
+    if (escalate.has(index)) {
+      applied.push({
+        proposalSummary: proposal.summary,
+        instinctIds: [],
+        delta: 0,
+        noopVeto: false,
+        stalenessEscalated: true,
+      })
+      return {
+        proposal: { ...proposal },
+        index,
+        instinctIds: [] as string[],
+        delta: 0,
+      }
+    }
+
     const matching = gatedInstincts.filter((instinct) =>
       proposalMatchesTrigger(proposal.summary, instinct.trigger),
     )
@@ -595,7 +709,8 @@ export function applyInstinctBiasToProposals(
 
     const prefersNoop = matching.some((instinct) => actionPrefersNoop(instinct.action))
     if (!prefersNoop) {
-      const delta = clampLearnDelta(-matching.length)
+      // Raw magnitude can exceed MAX_LEARN_DELTA so the clamp is reachable.
+      const delta = clampLearnDelta(-(matching.length * MAX_LEARN_DELTA))
       const next = {
         ...proposal,
         priority: proposal.priority + delta,
@@ -604,6 +719,8 @@ export function applyInstinctBiasToProposals(
         proposalSummary: proposal.summary,
         instinctIds: matching.map((m) => m.id),
         delta,
+        noopVeto: false,
+        stalenessEscalated: false,
       })
       return { proposal: next, index, instinctIds: matching.map((m) => m.id), delta }
     }
@@ -615,12 +732,20 @@ export function applyInstinctBiasToProposals(
       doneWhen: proposal.doneWhen,
       priority: Math.min(proposal.priority, 0),
     }
+    const rawDelta = next.priority - proposal.priority
     applied.push({
       proposalSummary: proposal.summary,
       instinctIds: matching.map((m) => m.id),
-      delta: next.priority - proposal.priority,
+      delta: clampLearnDelta(rawDelta),
+      noopVeto: true,
+      stalenessEscalated: false,
     })
-    return { proposal: next, index, instinctIds: matching.map((m) => m.id), delta: next.priority - proposal.priority }
+    return {
+      proposal: next,
+      index,
+      instinctIds: matching.map((m) => m.id),
+      delta: clampLearnDelta(rawDelta),
+    }
   })
 
   biased.sort((a, b) => {
@@ -694,6 +819,19 @@ export function fabricationInstinctExample(nowIso: string): RankInstinct {
       'Prefer noop or escalate; never propose restart, heal, or invent work from the fabrication.',
     updatedAt: nowIso,
     projectId: 'proj-example',
-    corroboratingReceiptIds: ['receipt-gate-1', 'receipt-human-2'],
+    corroboratingReceipts: [
+      {
+        receiptId: 'receipt-gate-1',
+        agentId: 'gate-driver',
+        incidentId: 'inc-gate-fail-a',
+        resolvedAt: nowIso,
+      },
+      {
+        receiptId: 'receipt-human-2',
+        agentId: 'owner-human',
+        incidentId: 'inc-human-correction-b',
+        resolvedAt: nowIso,
+      },
+    ],
   }
 }
