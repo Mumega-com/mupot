@@ -694,11 +694,15 @@ describe('MCP task cutover tools', () => {
     expect(updates).toHaveLength(0)
   })
 
-  it('task_update lets an owner repair a historical review task with no gate_owner', async () => {
+  it('task_update lets an org-admin workspace token repair a historical review task with no gate_owner', async () => {
     const { env } = makeEnv([task({ status: 'review', gate_owner: null })])
 
     const res = await invokeTool(
-      auth({ role: 'owner' }),
+      auth({
+        capabilities: [
+          { member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' },
+        ],
+      }),
       env,
       'task_update',
       { task_id: 'task-1', gate_owner: 'gate:content' },

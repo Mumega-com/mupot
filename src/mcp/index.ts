@@ -912,7 +912,7 @@ const toolTaskUpdate: ToolSpec = {
         existing.gate_owner === null &&
         typeof args.gate_owner === 'string' &&
         args.gate_owner.trim().length > 0 &&
-        (auth.role === 'owner' || auth.role === 'admin')
+        hasWorkspaceAdmin(auth)
       if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview) {
         return fail(409, 'gate_owner_locked', { status: existing.status })
       }
