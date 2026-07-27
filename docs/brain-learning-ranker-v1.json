@@ -3,6 +3,13 @@
   "status": "design",
   "spec": "docs/superpowers/specs/2026-07-27-brain-learning-ranker-design.md",
   "thesis": "Receipts distill into gated instincts; rank recalls them; the core still gates every proposal — the brain never becomes an actor.",
+  "lineage": {
+    "target": "mupot-typescript-brainport",
+    "targetStatus": "type-only-sealed-decision-record-zero-callers",
+    "liveAtcRanking": "src/tasks/ranking.ts-rankTasks-wired-out-of-scope",
+    "liveHermesBrain": "agents/mumega-brain/hermes/prioritize_scan.py-separate-repo-out-of-scope",
+    "note": "third-lineage-off-unbuilt-port-not-extension-of-live-brain"
+  },
   "contrast": {
     "learningRanker": {
       "name": "brain-learning-ranker",
@@ -26,10 +33,14 @@
     "learning-is-instinct-loop-not-hermes-gateway",
     "hot-path-zero-llm",
     "recall-at-rank-core-injected",
-    "distill-from-receipts-only",
+    "anti-fabrication-receipt-provenance",
+    "anti-selection-bias-staleness-and-unexercised-decay",
     "instincts-confidence-decay-domain-gated",
+    "project-scope-enforced",
     "instincts-never-bypass-core-gates",
     "no-new-brain-proposal-verbs",
+    "determinism-same-inputs-same-rank",
+    "max-learn-delta-bound",
     "hermes-optional-runtime-only"
   ],
   "rankPipeline": [
@@ -40,6 +51,24 @@
     "applyInstinctBias",
     "emitDecision"
   ],
+  "rankProposalShape": {
+    "matches": "BrainProposal",
+    "fields": {
+      "kind": "'spawn_task' | 'wake_agent' | 'noop'",
+      "agentId": "string | undefined — required for wake_agent deliverability",
+      "summary": "string",
+      "doneWhen": "string | undefined",
+      "priority": "number"
+    },
+    "note": "RankProposal must be structurally identical to BrainProposal — no conversion layer"
+  },
+  "forbiddenActionEnforcement": {
+    "primary": "kind-only via ALLOWED_BRAIN_PROPOSAL_KINDS union + assertProposalKindAllowed (throws)",
+    "proseScreening": {
+      "enabled": false,
+      "ifRetained": "non-throwing-warning-on-single-proposal-never-batch-throw"
+    }
+  },
   "allowedProposalKinds": ["spawn_task", "wake_agent", "noop"],
   "forbiddenActionVerbs": [
     "restart",
@@ -64,10 +93,33 @@
       "citation",
       "lifecycle"
     ],
+    "domainDistillConstraint": "prompt-or-mapping-must-emit-allowlist-members-only",
     "promoteMinProjects": 2,
-    "promoteMinConfidence": 0.8
+    "promoteMinConfidence": 0.8,
+    "injectCorroborationMinObservations": 2,
+    "gateRequiresProjectId": true
+  },
+  "bias": {
+    "maxLearnDelta": 15.0,
+    "note": "absolute cap on total learning adjustment per proposal — mechanical score stays dominant"
+  },
+  "selectionBiasGuards": {
+    "stalenessEscalation": {
+      "enabled": true,
+      "description": "item suppressed N consecutive ticks force-promoted once — deterministic, not random"
+    },
+    "unexercisedSuppressingInstinctDecay": {
+      "enabled": true,
+      "description": "instinct that suppresses but produces no confirming receipts loses confidence"
+    },
+    "epsilonGreedy": false,
+    "reason": "random sampling breaks determinism-same-inputs-same-rank"
   },
   "distill": {
+    "receiptResolution": "by-id-against-port4-gate-driver-frc-store-never-caller-string-label",
+    "corroborationRequiredBeforeInject": true,
+    "contentSanitization": "schema-constrained-parse-plus-strip-instruction-shaped-text",
+    "parseIsTrustBoundary": true,
     "allowedSources": [
       "gate_fail_receipt",
       "fabrication_receipt",
@@ -79,7 +131,28 @@
       "model_speculation"
     ],
     "modelClass": "cheap",
-    "runsOnHotPath": false
+    "runsOnHotPath": false,
+    "domainOutput": "must-map-to-instinct.allowedDomains-or-no-op-loop"
+  },
+  "recallInstincts": {
+    "signature": "recallInstincts(store: InstinctReadPort, opts: RecallInstinctsOpts): Promise<RecallInstinctsResult>",
+    "opts": {
+      "projectId": "string — required",
+      "nowIso": "string — required for decay",
+      "includeGlobal": "boolean — default false"
+    },
+    "result": {
+      "instincts": "RankInstinctSnapshot[]",
+      "degraded": "boolean — true when Port-4 unavailable"
+    },
+    "scopingRule": "instinct.projectId === opts.projectId OR (null AND promote-gate-passed AND includeGlobal)"
+  },
+  "gateInstincts": {
+    "requiredOpts": {
+      "projectId": "string — fail-closed cross-project rejection",
+      "nowIso": "string",
+      "allowedDomains": "string[] — fail-closed on empty"
+    }
   },
   "runtime": {
     "hermes": "optional-resilient-host",
@@ -88,24 +161,56 @@
   },
   "exampleInstinctId": "no-act-on-fabrication",
   "tiesTo": {
+    "brainportSealDoc": "docs/architecture/port-interfaces-model-brain.md — Remaining S3 #1 brainport-default-adapter",
     "dormantPort4Task": "b143e73d",
     "dormantPort4Branch": "cursor/task-b143e73d",
+    "dormantPort4Status": "prerequisite-or-unmet-dependency-with-no-learning-degrade-never-reuse",
     "failureClass": "#490-act-on-fabrication"
   },
   "nonGoals": [
     "replace-brainport-with-hermes-gateway",
     "make-brain-an-actor",
     "merge-port4-in-this-design-commit",
+    "merge-b143e73d-to-unblock-this-design",
     "migration-applied-in-this-design-commit",
+    "retarget-at-live-rankTasks-or-prioritize_scan-without-explicit-decision",
     "instinct-ui-in-this-design-commit",
-    "silent-global-promotion"
+    "silent-global-promotion",
+    "epsilon-greedy-exploration"
   ],
   "buildSlices": [
     "contract-lock",
+    "brainport-default-adapter",
     "port4-land",
     "receipt-observe",
     "offline-distill",
     "recall-at-rank",
     "optional-hermes-runtime"
-  ]
+  ],
+  "acceptance": {
+    "mechanismLockNeTrustLock": {
+      "name": "mechanism-lock-ne-trust-lock",
+      "description": "tests that lock a mechanism but not the trust it depends on — mayDistillFromSource enum fence is canonical example",
+      "structuralLimitation": "no-contract-test-can-prove-port4-is-wired"
+    },
+    "testInventory": {
+      "contractDoc": { "count": 3, "catches": "json-ts-drift", "misses": "design-correctness" },
+      "brainRole": { "count": 4, "catches": "hardcoded-literals", "misses": "phantom-port" },
+      "distillFence": { "count": 2, "catches": "enum-membership", "misses": "receipt-id-verification-content-trust" },
+      "instinctGate": { "count": 3, "catches": "clamp-decay-domain-threshold-promote", "misses": "project-scope-corroboration" },
+      "recallAtRank": { "count": 2, "catches": "near-e2e-pipeline-order", "misses": "prose-filter-seam-mismatch-unbounded-bias" },
+      "gateVerdictFindingsNotCaught": [
+        "phantom-brainport",
+        "rankproposal-brainproposal-seam",
+        "prose-filter-batch-throw",
+        "receipt-label-vs-id",
+        "content-trust-boundary",
+        "domain-mismatch-no-op-loop",
+        "unbounded-bias",
+        "missing-determinism",
+        "cross-project-leakage",
+        "selection-bias-self-fulfilling-floor"
+      ]
+    }
+  }
 }
