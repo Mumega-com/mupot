@@ -193,6 +193,14 @@ Migrations apply BEFORE the code deploy in both paths above — code that
 expects a column/table the old schema doesn't have yet must never reach
 production ahead of the migration that adds it.
 
+For the v0.25 Project Routines upgrade, `0073_project_routines.sql` and
+`0074_routine_cancellation_events.sql` must complete in the same
+`wrangler d1 migrations apply` invocation before deploying v0.25 code. Do not
+pause traffic on a database with only `0073` applied: routine cancellation
+events are rejected by the older event-kind constraint until `0074` completes.
+If the migration command is interrupted, rerun it and confirm both migrations
+are applied before deploying or enabling Project Routines.
+
 Do not apply a migration to production until a D1 backup exists for the current
 production state.
 
