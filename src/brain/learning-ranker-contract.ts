@@ -76,16 +76,25 @@ export const INSTINCT_INJECT_MAX = 6
 export const INSTINCT_PROMOTE_MIN_PROJECTS = 2
 export const INSTINCT_PROMOTE_MIN_CONFIDENCE = 0.8
 
-/** Soft-demote cap — must be ≤ maxInjected so clampLearnDelta can bind. */
+/**
+ * Soft-demote cap. With demote = -matching.length, clamp binds when
+ * matching.length > MAX_LEARN_DELTA (n=1 → −1, n=5 → −5, n=6 → −5).
+ */
 export const MAX_LEARN_DELTA = 5
 
 /**
  * Noop veto is a SEPARATE invariant from max-learn-delta-bound:
  * kind flips to `noop` and priority floors at 0 (unbounded priority drop).
- * Audited `delta` on that branch is still clampLearnDelta'd for trail honesty
- * and tagged `noopVeto: true` so it is not mistaken for a soft demote.
+ * Audited `delta` records the TRUE priority change (not clamped) and is tagged
+ * `noopVeto: true` so reconstructable provenance survives (H-5).
  */
 export const NOOP_VETO_UNBOUNDED_PRIORITY = true
+
+/** Runtime provenance registry — only mint path may add. */
+const verifiedReceiptRegistry = new WeakSet<object>()
+
+/** Max evidence chars retained after schema parse. */
+export const DISTILL_EVIDENCE_MAX_CHARS = 500
 
 /** Anti-selection-bias (b): force-promote after this many consecutive suppressions. */
 export const STALENESS_ESCALATION_TICKS = 5
@@ -123,6 +132,11 @@ export interface RankInstinct {
   corroboratingReceipts: readonly CorroboratingReceipt[]
   /** Consecutive ticks this instinct suppressed work without confirming receipts. */
   suppressionTicksWithoutConfirm?: number
+  /**
+   * Per-project confidences used by shouldPromoteInstinct when projectId is null.
+   * Required for includeGlobal admission (third conjunct of §4.8).
+   */
+  promoteProjectConfidences?: readonly number[]
 }
 
 /**
@@ -255,21 +269,27 @@ export function verifiedReceiptRefFromResolver(
   if (!resolvedAt) {
     return { ok: false, reason: 'unverified_receipt' }
   }
-  return {
-    _brand: 'VerifiedReceiptRef',
+  const ref: VerifiedReceiptRef = Object.freeze({
+    _brand: 'VerifiedReceiptRef' as const,
     receiptId: id,
     sourceKind: record.sourceKind as DistillSource,
     store: record.store,
     projectId,
     resolvedAt,
     sanitizedContent: sanitizeReceiptContentForDistill(record.content),
-    corroboratingReceipts: receipts.map((r) => ({
-      receiptId: String(r.receiptId).trim(),
-      agentId: String(r.agentId).trim(),
-      incidentId: String(r.incidentId).trim(),
-      resolvedAt: String(r.resolvedAt).trim(),
-    })),
-  }
+    corroboratingReceipts: Object.freeze(
+      receipts.map((r) =>
+        Object.freeze({
+          receiptId: String(r.receiptId).trim(),
+          agentId: String(r.agentId).trim(),
+          incidentId: String(r.incidentId).trim(),
+          resolvedAt: String(r.resolvedAt).trim(),
+        }),
+      ),
+    ),
+  })
+  verifiedReceiptRegistry.add(ref)
+  return ref
 }
 
 /** @deprecated Prefer verifiedReceiptRefFromResolver — kept for inventory honesty. */
@@ -410,9 +430,8 @@ export function mayDistillFromSource(source: string): DistillEligibility {
 }
 
 /**
- * Trust-lock: only branded VerifiedReceiptRef (from resolver) may distill.
- * Plain bags with verifiedAgainstStore boolean are rejected as unverified_receipt.
- * Forged brand without resolved content fields also fails.
+ * Trust-lock: only refs registered by verifiedReceiptRefFromResolver may distill.
+ * Shape alone is not enough — forged `_brand` literals are refused (WeakSet).
  */
 export function mayDistillFromReceiptRef(
   ref: VerifiedReceiptRef | DistillReceiptRef,
@@ -420,10 +439,13 @@ export function mayDistillFromReceiptRef(
   if (!ref || typeof ref !== 'object') {
     return { ok: false, reason: 'unverified_receipt' }
   }
-  if (!('_brand' in ref) || ref._brand !== 'VerifiedReceiptRef') {
+  if (!verifiedReceiptRegistry.has(ref as object)) {
     return { ok: false, reason: 'unverified_receipt' }
   }
   const branded = ref as VerifiedReceiptRef
+  if (!('_brand' in branded) || branded._brand !== 'VerifiedReceiptRef') {
+    return { ok: false, reason: 'unverified_receipt' }
+  }
   if (!branded.receiptId || !String(branded.receiptId).trim()) {
     return { ok: false, reason: 'missing_receipt_id' }
   }
@@ -454,42 +476,43 @@ export function mapDistillDomainToAllowlist(rawDomain: string): RankInstinctDoma
 }
 
 /**
- * Schema-constrained distill facts — ALLOWLIST extraction, not a denylist.
- * Only lines matching known audit prefixes are kept; everything else is discarded
- * (including rephrased "create instinct" / split confidence+domain evasions).
+ * Schema-constrained distill facts. ONLY accepts JSON
+ * `{ "evidence": string }` (max DISTILL_EVIDENCE_MAX_CHARS). Never re-emits
+ * raw free-text lines — prefix-riding payloads sanitize to empty evidence.
  */
-export const DISTILL_FACT_LINE_PREFIXES = [
-  'gate fail',
-  'gate pass',
-  'reason:',
-  'evidence:',
-  'verdict:',
-  'outcome:',
-  'failure class:',
-  'fabricated',
-] as const
-
 export interface DistillReceiptFacts {
-  factualLines: readonly string[]
+  evidence: string
 }
 
+const INSTRUCTION_SHAPED =
+  /create\s+instinct|prefer\s+noop|confidence\s*[:=]|domain\s+rank|system\s+note|ignore\s+prior/i
+
 export function extractDistillFacts(raw: string): DistillReceiptFacts {
-  const factualLines = String(raw || '')
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => {
-      if (!line) return false
-      const lower = line.toLowerCase()
-      return DISTILL_FACT_LINE_PREFIXES.some((prefix) => lower.startsWith(prefix))
-    })
-  return { factualLines }
+  const trimmed = String(raw || '').trim()
+  if (!trimmed) return { evidence: '' }
+  try {
+    const parsed: unknown = JSON.parse(trimmed)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { evidence: '' }
+    }
+    const bag = parsed as Record<string, unknown>
+    // Discard every key except evidence — never re-emit unknown fields.
+    if (typeof bag.evidence !== 'string') return { evidence: '' }
+    const evidence = bag.evidence.trim().slice(0, DISTILL_EVIDENCE_MAX_CHARS)
+    if (!evidence) return { evidence: '' }
+    if (INSTRUCTION_SHAPED.test(evidence)) return { evidence: '' }
+    return { evidence }
+  } catch {
+    return { evidence: '' }
+  }
 }
 
 /**
- * Schema-constrained content for distill — discard everything outside DistillReceiptFacts.
+ * Schema-constrained content for distill — returns ONLY the typed evidence
+ * field. Free-text / prefix-allowlist lines are discarded entirely.
  */
 export function sanitizeReceiptContentForDistill(raw: string): string {
-  return extractDistillFacts(raw).factualLines.join('\n')
+  return extractDistillFacts(raw).evidence
 }
 
 /** Independent corroboration: ≥2 receipts AND (≥2 agents OR ≥2 incidents). */
@@ -534,7 +557,10 @@ export function gateInstinctsForRank(
   const projectId = String(opts.projectId).trim()
   const scoped = instincts.filter((instinct) => {
     if (instinct.projectId === projectId) return true
-    if (opts.includeGlobal && instinct.projectId === null) return true
+    if (opts.includeGlobal && instinct.projectId === null) {
+      // Third conjunct of §4.8: promote gate must have passed.
+      return shouldPromoteInstinct(instinct.promoteProjectConfidences || [])
+    }
     return false
   })
 
@@ -709,8 +735,8 @@ export function applyInstinctBiasToProposals(
 
     const prefersNoop = matching.some((instinct) => actionPrefersNoop(instinct.action))
     if (!prefersNoop) {
-      // Raw magnitude can exceed MAX_LEARN_DELTA so the clamp is reachable.
-      const delta = clampLearnDelta(-(matching.length * MAX_LEARN_DELTA))
+      // Graduated soft demote; clamp binds when matching.length > MAX_LEARN_DELTA.
+      const delta = clampLearnDelta(-matching.length)
       const next = {
         ...proposal,
         priority: proposal.priority + delta,
@@ -736,7 +762,7 @@ export function applyInstinctBiasToProposals(
     applied.push({
       proposalSummary: proposal.summary,
       instinctIds: matching.map((m) => m.id),
-      delta: clampLearnDelta(rawDelta),
+      delta: rawDelta,
       noopVeto: true,
       stalenessEscalated: false,
     })
@@ -744,7 +770,7 @@ export function applyInstinctBiasToProposals(
       proposal: next,
       index,
       instinctIds: matching.map((m) => m.id),
-      delta: clampLearnDelta(rawDelta),
+      delta: rawDelta,
     }
   })
 
