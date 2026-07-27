@@ -505,8 +505,8 @@ belongs to integration tests in `port4-land` and `recall-at-rank` slices.
 
 - `max-learn-delta-bound` — soft demote only; clamp is reachable (`MAX_LEARN_DELTA=5`).
 - `noop-veto-full-block-unbounded-priority` — separate from the soft demote cap;
-  kind→noop, priority floors at 0; audited delta still clamped and tagged
-  `noopVeto:true`.
+  kind→noop, priority floors at 0; audited `delta` records the true priority
+  change and is tagged `noopVeto:true` (not under the soft-demote cap).
 
 ### Acceptance notes for re-gate
 
