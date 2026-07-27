@@ -102,19 +102,32 @@ function refExists(ref, { cwd } = {}) {
   return r.status === 0
 }
 
+/** True iff `git merge-base --is-ancestor sha ref` succeeds (sha is `ref` itself or an ancestor of it). */
+function isAncestorOf(sha, ref, { cwd } = {}) {
+  const r = spawnSync('git', ['merge-base', '--is-ancestor', sha, ref], { cwd, encoding: 'utf8' })
+  return r.status === 0
+}
+
 /**
  * True iff `sha` is `main` itself or a descendant of it, checked against
- * `origin/main` first (the authoritative remote state) and falling back to a
- * local `main` branch if the remote ref isn't available. Unverifiable (e.g. a
- * shallow clone with neither ref present) fails CLOSED to `false` — an
- * unprovable ancestry is never treated as "on main".
+ * `origin/main` — the authoritative remote state — whenever that ref
+ * resolves at all. `main` (local) is consulted ONLY when `origin/main` does
+ * not resolve (e.g. a repo with no remote configured) — mupot#571-hotfix: the
+ * previous version fell back to local `main` on ancestry-check FAILURE, not
+ * on ref ABSENCE, so a sha that failed the `origin/main` ancestry check could
+ * still return `true` if it happened to be an ancestor of a diverged local
+ * `main` branch. `origin/main` resolving but the sha not being its ancestor
+ * is a definitive `false` — it must never fall through to local `main`.
+ * Unverifiable (e.g. a shallow clone with neither ref present) fails CLOSED
+ * to `false` — an unprovable ancestry is never treated as "on main".
  */
 export function isMainDescendant(sha, { cwd } = {}) {
   if (!isFullSha(sha)) return false
-  for (const ref of ['origin/main', 'main']) {
-    if (!refExists(ref, { cwd })) continue
-    const r = spawnSync('git', ['merge-base', '--is-ancestor', sha, ref], { cwd, encoding: 'utf8' })
-    if (r.status === 0) return true
+  if (refExists('origin/main', { cwd })) {
+    return isAncestorOf(sha, 'origin/main', { cwd })
+  }
+  if (refExists('main', { cwd })) {
+    return isAncestorOf(sha, 'main', { cwd })
   }
   return false
 }

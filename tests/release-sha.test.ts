@@ -209,4 +209,80 @@ describe('isMainDescendant', () => {
 
     expect(isMainDescendant('a'.repeat(40), { cwd: repo })).toBe(false)
   })
+
+  // mupot#571-hotfix — the adversarial case the independent post-merge gate
+  // found: every test above only ever ran against a bare `git init` repo with
+  // NO remote at all, so `origin/main` never resolved and the authoritative
+  // "check origin/main first" path was never actually exercised. This test
+  // wires up a REAL bare repo as `origin`, diverges local `main` from it, and
+  // proves a local-only commit that is NOT on `origin/main` is correctly
+  // rejected even though it (trivially) IS an ancestor of the diverged local
+  // `main` branch — the exact shape of the pre-fix bug (falls back to local
+  // `main` on ancestry-check FAILURE rather than on ref ABSENCE).
+  describe('with a real origin remote', () => {
+    let bareRepo
+    let workRepo
+
+    function workGit(...args) {
+      const r = spawnSync('git', args, { cwd: workRepo, encoding: 'utf8' })
+      if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${r.stderr}`)
+      return r.stdout.trim()
+    }
+
+    afterEach(() => {
+      if (bareRepo) rmSync(bareRepo, { recursive: true, force: true })
+      if (workRepo) rmSync(workRepo, { recursive: true, force: true })
+      bareRepo = undefined
+      workRepo = undefined
+    })
+
+    it('rejects a local-only commit not pushed to origin/main, even though it IS an ancestor of diverged local main', () => {
+      // 1. A real bare repo acting as the remote.
+      bareRepo = mkdtempSync(join(tmpdir(), 'release-sha-origin-'))
+      spawnSync('git', ['init', '-q', '--bare', '-b', 'main'], { cwd: bareRepo })
+
+      // 2. A working repo with that bare repo added as `origin`, main pushed.
+      workRepo = mkdtempSync(join(tmpdir(), 'release-sha-work-'))
+      spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: workRepo })
+      workGit('config', 'user.email', 'test@example.com')
+      workGit('config', 'user.name', 'test')
+      writeFileSync(join(workRepo, 'a.txt'), '1')
+      workGit('add', '.')
+      workGit('commit', '-q', '-m', 'initial')
+      const pushedSha = workGit('rev-parse', 'HEAD')
+      workGit('remote', 'add', 'origin', bareRepo)
+      workGit('push', '-q', 'origin', 'main')
+      workGit('fetch', '-q', 'origin')
+
+      // Sanity: a sha genuinely on origin/main must still return true (the
+      // legitimate case — don't break it while fixing the adversarial one).
+      expect(isMainDescendant(pushedSha, { cwd: workRepo })).toBe(true)
+
+      // 3. A LOCAL-ONLY commit on local `main`, never pushed to origin/main —
+      // origin/main and local main have now diverged.
+      writeFileSync(join(workRepo, 'b.txt'), '2')
+      workGit('add', '.')
+      workGit('commit', '-q', '-m', 'local-only, never pushed')
+      const localOnlySha = workGit('rev-parse', 'HEAD')
+
+      // This commit trivially IS an ancestor of local `main` (it's local
+      // main's own tip) but is NOT on origin/main — the adversarial case.
+      // Confirm the premise: origin/main resolves, and the local-only sha is
+      // NOT its ancestor.
+      expect(isAncestorOfForTest(localOnlySha, 'origin/main', workRepo)).toBe(false)
+      expect(isAncestorOfForTest(localOnlySha, 'main', workRepo)).toBe(true)
+
+      // 4. The actual assertion: isMainDescendant must return false here.
+      // Under the pre-fix code this returned TRUE (falls through to local
+      // `main` on ancestry-check failure, not ref absence) — this is the bug
+      // the independent gate found.
+      expect(isMainDescendant(localOnlySha, { cwd: workRepo })).toBe(false)
+    })
+  })
 })
+
+/** Test-local helper mirroring release-sha.mjs's internal isAncestorOf, to assert the test's own premises. */
+function isAncestorOfForTest(sha, ref, cwd) {
+  const r = spawnSync('git', ['merge-base', '--is-ancestor', sha, ref], { cwd, encoding: 'utf8' })
+  return r.status === 0
+}
