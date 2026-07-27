@@ -151,7 +151,13 @@ describe('Project Routines dashboard', () => {
     expect(headerIds).toHaveLength(18)
     expect(new Set(headerIds).size).toBe(headerIds.length)
     for (const headerId of headerIds) {
-      expect(body).toContain(`aria-labelledby="${headerId}"`)
+      expect(body).toMatch(new RegExp(`aria-labelledby="${headerId} [^"]+"`))
+    }
+    const contentIds = [...body.matchAll(/<div id="([^"]+)" class="routine-cell">/g)].map(match => match[1])
+    expect(contentIds.length).toBeGreaterThan(0)
+    expect(new Set(contentIds).size).toBe(contentIds.length)
+    for (const contentId of contentIds) {
+      expect(body).toContain(` ${contentId}"`)
     }
     expect(body).toContain('href="/projects/project-a/routines?run_id=')
     expect(body).toContain('href="/projects/project-a/routines?run_id=')

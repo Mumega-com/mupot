@@ -331,7 +331,10 @@ function table(id: string, label: string, minWidth: string, columns: Array<{ lab
   return html`<div role="region" aria-label="${label}" tabindex="0" style="max-width:100%;overflow-x:auto;">
     <div class="ui-table routine-table" role="table" aria-label="${label}" style="min-width:${minWidth};">
       <div class="ui-tr ui-thead" role="row" style="grid-template-columns:${raw(tracks)}">${columns.map((column, index) => html`<div id="${headerIds[index]}" class="ui-th" role="columnheader">${column.label}</div>`)}</div>
-      ${rows.length ? rows.map(cells => html`<div class="ui-tr ui-row" role="row" style="grid-template-columns:${raw(tracks)}">${cells.map((cell, index) => html`<div class="ui-td" role="cell" aria-labelledby="${headerIds[index] ?? ''}"><span class="routine-mobile-label" aria-hidden="true">${columns[index]?.label ?? ''}</span><div class="routine-cell">${cell}</div></div>`)}</div>`) : html`<div class="ui-table-empty">${empty}</div>`}
+      ${rows.length ? rows.map((cells, rowIndex) => html`<div class="ui-tr ui-row" role="row" style="grid-template-columns:${raw(tracks)}">${cells.map((cell, index) => {
+        const contentId = `${id}-row-${rowIndex + 1}-cell-${index + 1}`
+        return html`<div class="ui-td" role="cell" aria-labelledby="${headerIds[index] ?? ''} ${contentId}"><span class="routine-mobile-label" aria-hidden="true">${columns[index]?.label ?? ''}</span><div id="${contentId}" class="routine-cell">${cell}</div></div>`
+      })}</div>`) : html`<div class="ui-table-empty">${empty}</div>`}
     </div>
   </div>`
 }

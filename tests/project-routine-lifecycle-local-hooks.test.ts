@@ -125,7 +125,8 @@ describe('Project Routine local lifecycle hooks', () => {
     const validate = (localHooks as unknown as {
       validateRoutineAccessibility?: (snapshot: {
         headerIds: string[]
-        cellHeaderIds: string[]
+        contentIds: string[]
+        cellLabelledBy: string[]
         cellCount: number
         mobileLabelCount: number
         mobileLabelHiddenCount: number
@@ -137,7 +138,8 @@ describe('Project Routine local lifecycle hooks', () => {
 
     expect(() => validate({
       headerIds: ['routine-header-1', 'routine-header-1'],
-      cellHeaderIds: ['routine-header-1'],
+      contentIds: ['routine-content-1'],
+      cellLabelledBy: ['routine-header-1 routine-content-1'],
       cellCount: 1,
       mobileLabelCount: 1,
       mobileLabelHiddenCount: 1,
@@ -145,11 +147,21 @@ describe('Project Routine local lifecycle hooks', () => {
 
     expect(validate({
       headerIds: ['routine-header-1'],
-      cellHeaderIds: ['routine-header-1'],
+      contentIds: ['routine-content-1'],
+      cellLabelledBy: ['routine-header-1 routine-content-1'],
       cellCount: 1,
       mobileLabelCount: 1,
       mobileLabelHiddenCount: 1,
     })).toBe(true)
+
+    expect(() => validate({
+      headerIds: ['routine-header-1'],
+      contentIds: ['routine-content-1'],
+      cellLabelledBy: ['routine-header-1'],
+      cellCount: 1,
+      mobileLabelCount: 1,
+      mobileLabelHiddenCount: 1,
+    })).toThrow(/own content/i)
   })
 
   it('fails closed before making dependencies when the explicit Wrangler restart contract is absent', async () => {

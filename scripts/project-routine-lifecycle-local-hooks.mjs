@@ -34,9 +34,17 @@ function required(value, label) {
 
 export function validateRoutineAccessibility(snapshot) {
   const headerIds = new Set(snapshot.headerIds)
+  const contentIds = new Set(snapshot.contentIds)
   if (headerIds.size !== snapshot.headerIds.length) throw new Error('routine header ids must be unique')
-  if (snapshot.cellHeaderIds.some(id => !headerIds.has(id))) {
-    throw new Error('routine cells must reference existing headers')
+  if (contentIds.size !== snapshot.contentIds.length) throw new Error('routine content ids must be unique')
+  if (snapshot.cellLabelledBy.length !== snapshot.cellCount) {
+    throw new Error('every routine cell must declare its accessible labels')
+  }
+  for (const labelledBy of snapshot.cellLabelledBy) {
+    const [headerId, contentId, ...extraIds] = labelledBy.trim().split(/\s+/)
+    if (!headerIds.has(headerId) || !contentIds.has(contentId) || extraIds.length > 0) {
+      throw new Error('routine cells must reference one existing header and their own content')
+    }
   }
   if (snapshot.cellCount !== snapshot.mobileLabelCount) {
     throw new Error('every routine cell must have a mobile label')
@@ -620,7 +628,8 @@ export async function createCollectorDependencies(config) {
       if (viewport === 'mobile') {
         const semantics = await active.page.locator('.routine-table').evaluateAll((tables) => {
           const headerIds = []
-          const cellHeaderIds = []
+          const contentIds = []
+          const cellLabelledBy = []
           let cellCount = 0
           let mobileLabelCount = 0
           let mobileLabelHiddenCount = 0
@@ -628,13 +637,14 @@ export async function createCollectorDependencies(config) {
             const headers = Array.from(table.querySelectorAll('[role="columnheader"]'))
             const cells = Array.from(table.querySelectorAll('[role="cell"]'))
             headerIds.push(...headers.map(header => header.id))
-            cellHeaderIds.push(...cells.map(cell => cell.getAttribute('aria-labelledby') ?? ''))
+            contentIds.push(...cells.map(cell => cell.querySelector('.routine-cell')?.id ?? ''))
+            cellLabelledBy.push(...cells.map(cell => cell.getAttribute('aria-labelledby') ?? ''))
             cellCount += cells.length
             const labels = Array.from(table.querySelectorAll('.routine-mobile-label'))
             mobileLabelCount += labels.length
             mobileLabelHiddenCount += labels.filter(label => label.getAttribute('aria-hidden') === 'true').length
           }
-          return { headerIds, cellHeaderIds, cellCount, mobileLabelCount, mobileLabelHiddenCount }
+          return { headerIds, contentIds, cellLabelledBy, cellCount, mobileLabelCount, mobileLabelHiddenCount }
         })
         validateRoutineAccessibility(semantics)
       }
