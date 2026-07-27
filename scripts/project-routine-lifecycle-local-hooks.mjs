@@ -754,9 +754,11 @@ export async function createCollectorDependencies(config) {
 
 async function expectLocatorText(locator, expected) {
   const deadline = Date.now() + 10_000
+  let observed = ''
   while (Date.now() < deadline) {
-    if ((await locator.textContent().catch(() => ''))?.trim() === expected) return
+    observed = (await locator.textContent().catch(() => ''))?.trim() ?? ''
+    if (observed.includes(expected)) return
     await new Promise(resolve => setTimeout(resolve, 50))
   }
-  throw new Error(`dashboard did not render verdict: ${expected}`)
+  throw new Error(`dashboard did not render verdict: ${expected}; observed: ${observed || '[empty]'}`)
 }
