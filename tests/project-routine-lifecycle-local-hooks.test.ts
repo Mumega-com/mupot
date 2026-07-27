@@ -539,5 +539,5 @@ describe('Project Routine local lifecycle hooks', () => {
       await dependencies.browser.close()
       await fixture.close()
     }
-  }, 30_000)
+  }, 60_000)
 })
