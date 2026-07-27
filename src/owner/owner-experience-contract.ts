@@ -51,7 +51,10 @@ export const DEFAULT_REQUIRED_WINS_PER_WIDEN = 3
 export const MIN_REQUIRED_WINS_PER_WIDEN = 3
 
 export type KpiSourceId = 'task_counter' | 'github_prs'
-export const KPI_SOURCE_IDS: readonly KpiSourceId[] = ['task_counter', 'github_prs']
+export const KPI_SOURCE_IDS: readonly KpiSourceId[] = Object.freeze([
+  'task_counter',
+  'github_prs',
+] as const satisfies readonly KpiSourceId[])
 export function isKpiSourceId(v: unknown): v is KpiSourceId {
   return typeof v === 'string' && (KPI_SOURCE_IDS as readonly string[]).includes(v)
 }
@@ -62,8 +65,11 @@ export function isKpiSourceId(v: unknown): v is KpiSourceId {
  * project scoped, so neither can honestly measure a project Outcome. Adding
  * a real project-scoped source later means adding it here — not flipping a
  * caller-asserted boolean. See BLOCK-B (owner-experience dyad-gate).
+ * Frozen so "unreachable by construction" is not defeasible by array push.
  */
-export const PROJECT_SCOPED_KPI_SOURCE_IDS: readonly KpiSourceId[] = []
+export const PROJECT_SCOPED_KPI_SOURCE_IDS: readonly KpiSourceId[] = Object.freeze(
+  [] as const satisfies readonly KpiSourceId[],
+)
 export function isProjectScopedKpiSourceId(v: KpiSourceId): boolean {
   return (PROJECT_SCOPED_KPI_SOURCE_IDS as readonly string[]).includes(v)
 }
