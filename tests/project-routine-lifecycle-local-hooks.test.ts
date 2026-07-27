@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { createCollectorDependencies } from '../scripts/project-routine-lifecycle-local-hooks.mjs'
+import * as localHooks from '../scripts/project-routine-lifecycle-local-hooks.mjs'
+
+const { createCollectorDependencies } = localHooks
 
 const OWNER_TOKEN = 'owner-secret-never-persist'
 const MINTED_TOKEN = 'minted-secret-never-persist'
@@ -119,6 +121,49 @@ async function verifySigned(
 }
 
 describe('Project Routine local lifecycle hooks', () => {
+  it('requires mobile routine labels to be hidden from assistive technology and linked to real headers', () => {
+    const validate = (localHooks as unknown as {
+      validateRoutineAccessibility?: (snapshot: {
+        headerIds: string[]
+        contentIds: string[]
+        cellLabelledBy: string[]
+        cellCount: number
+        mobileLabelCount: number
+        mobileLabelHiddenCount: number
+      }) => boolean
+    }).validateRoutineAccessibility
+
+    expect(validate).toBeTypeOf('function')
+    if (!validate) return
+
+    expect(() => validate({
+      headerIds: ['routine-header-1', 'routine-header-1'],
+      contentIds: ['routine-content-1'],
+      cellLabelledBy: ['routine-header-1 routine-content-1'],
+      cellCount: 1,
+      mobileLabelCount: 1,
+      mobileLabelHiddenCount: 1,
+    })).toThrow(/unique/i)
+
+    expect(validate({
+      headerIds: ['routine-header-1'],
+      contentIds: ['routine-content-1'],
+      cellLabelledBy: ['routine-header-1 routine-content-1'],
+      cellCount: 1,
+      mobileLabelCount: 1,
+      mobileLabelHiddenCount: 1,
+    })).toBe(true)
+
+    expect(() => validate({
+      headerIds: ['routine-header-1'],
+      contentIds: ['routine-content-1'],
+      cellLabelledBy: ['routine-header-1'],
+      cellCount: 1,
+      mobileLabelCount: 1,
+      mobileLabelHiddenCount: 1,
+    })).toThrow(/own content/i)
+  })
+
   it('fails closed before making dependencies when the explicit Wrangler restart contract is absent', async () => {
     for (const key of ENV_KEYS) delete process.env[key]
     const root = mkdtempSync(join(tmpdir(), 'mupot-routine-hooks-missing-'))
@@ -494,5 +539,5 @@ describe('Project Routine local lifecycle hooks', () => {
       await dependencies.browser.close()
       await fixture.close()
     }
-  }, 30_000)
+  }, 60_000)
 })

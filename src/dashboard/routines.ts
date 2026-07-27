@@ -325,12 +325,16 @@ function routineNextAction(routine: Routine, run: RoutineRun | undefined): strin
   return 'Run when accountable work is ready'
 }
 
-function table(label: string, minWidth: string, columns: Array<{ label: string; width: string }>, rows: Html[][], empty: string): Html {
+function table(id: string, label: string, minWidth: string, columns: Array<{ label: string; width: string }>, rows: Html[][], empty: string): Html {
   const tracks = columns.map(column => column.width).join(' ')
+  const headerIds = columns.map((_, index) => `${id}-header-${index + 1}`)
   return html`<div role="region" aria-label="${label}" tabindex="0" style="max-width:100%;overflow-x:auto;">
-    <div class="ui-table" role="table" aria-label="${label}" style="min-width:${minWidth};">
-      <div class="ui-tr ui-thead" role="row" style="grid-template-columns:${raw(tracks)}">${columns.map(column => html`<div class="ui-th" role="columnheader">${column.label}</div>`)}</div>
-      ${rows.length ? rows.map(cells => html`<div class="ui-tr ui-row" role="row" style="grid-template-columns:${raw(tracks)}">${cells.map(cell => html`<div class="ui-td" role="cell" style="overflow-wrap:anywhere;">${cell}</div>`)}</div>`) : html`<div class="ui-table-empty">${empty}</div>`}
+    <div class="ui-table routine-table" role="table" aria-label="${label}" style="min-width:${minWidth};">
+      <div class="ui-tr ui-thead" role="row" style="grid-template-columns:${raw(tracks)}">${columns.map((column, index) => html`<div id="${headerIds[index]}" class="ui-th" role="columnheader">${column.label}</div>`)}</div>
+      ${rows.length ? rows.map((cells, rowIndex) => html`<div class="ui-tr ui-row" role="row" style="grid-template-columns:${raw(tracks)}">${cells.map((cell, index) => {
+        const contentId = `${id}-row-${rowIndex + 1}-cell-${index + 1}`
+        return html`<div class="ui-td" role="cell" aria-labelledby="${headerIds[index] ?? ''} ${contentId}"><span class="routine-mobile-label" aria-hidden="true">${columns[index]?.label ?? ''}</span><div id="${contentId}" class="routine-cell">${cell}</div></div>`
+      })}</div>`) : html`<div class="ui-table-empty">${empty}</div>`}
     </div>
   </div>`
 }
@@ -344,7 +348,7 @@ function routineForm(view: RoutineWorkspaceView, error?: string, values = view.f
   return html`${sectionPanel({
     title: edit ? `Edit routine: ${edit.name}` : 'Create routine',
     body: html`${error ? html`<p role="alert" style="color:var(--danger,#c0392b);">${error}</p>` : ''}
-      <form method="post" action="${action}" style="display:grid;gap:12px;">
+      <form class="routine-form" method="post" action="${action}" style="display:grid;gap:12px;">
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr));gap:10px;">
           <label><span class="ui-panel-sub">Name</span><input required name="name" value="${values.name}"></label>
           <label><span class="ui-panel-sub">Responsible squad ID</span><input required name="responsible_squad_id" value="${values.responsible_squad_id}"></label>
@@ -376,10 +380,10 @@ export function routineWorkspaceBody(view: RoutineWorkspaceView, options: { erro
     return [
       html`<span style="display:grid;gap:3px;"><a class="ui-link" href="${projectPath}/routines?routine_id=${encodeURIComponent(routine.id)}"><strong>${routine.name}</strong></a><span class="ui-panel-sub">${routine.trigger_kind} · ${routine.timezone}</span></span>`,
       pill(title(routine.status), routineTone(routine.status)),
-      html`<span>${formatLocal(routine.next_run_at, routine.timezone)}<span class="ui-panel-sub">Previous: ${current ? formatLocal(current.created_at, routine.timezone) : 'No run yet'}</span></span>`,
-      html`<span>${view.routineLabels.get(routine.responsible_squad_id) ?? routine.responsible_squad_id}<span class="ui-panel-sub">${routine.preferred_agent_id ? view.agentLabels.get(routine.preferred_agent_id) ?? routine.preferred_agent_id : 'No preferred agent'}</span></span>`,
-      html`<span>${routine.execution_mode.replace('_', ' ')}<span class="ui-panel-sub">${routine.budget_micro_usd} micro USD · retry ${routine.max_attempts}/${routine.retry_backoff_seconds}s · ${routine.overlap_policy}</span></span>`,
-      html`<span>${current ? pill(runState(current), runTone(current)) : pill(title(routine.status), routineTone(routine.status))}<span class="ui-panel-sub">${routineNextAction(routine, current)}</span></span>`,
+      html`<span class="routine-stack">${formatLocal(routine.next_run_at, routine.timezone)}<span class="ui-panel-sub">Previous: ${current ? formatLocal(current.created_at, routine.timezone) : 'No run yet'}</span></span>`,
+      html`<span class="routine-stack">${view.routineLabels.get(routine.responsible_squad_id) ?? routine.responsible_squad_id}<span class="ui-panel-sub">${routine.preferred_agent_id ? view.agentLabels.get(routine.preferred_agent_id) ?? routine.preferred_agent_id : 'No preferred agent'}</span></span>`,
+      html`<span class="routine-stack">${routine.execution_mode.replace('_', ' ')}<span class="ui-panel-sub">${routine.budget_micro_usd} micro USD · retry ${routine.max_attempts}/${routine.retry_backoff_seconds}s · ${routine.overlap_policy}</span></span>`,
+      html`<span class="routine-stack">${current ? pill(runState(current), runTone(current)) : pill(title(routine.status), routineTone(routine.status))}<span class="ui-panel-sub">${routineNextAction(routine, current)}</span></span>`,
       html`<div style="display:flex;gap:6px;flex-wrap:wrap;">
         ${nonce ? html`<form method="post" action="${projectPath}/routines/${encodeURIComponent(routine.id)}/run"><input type="hidden" name="nonce" value="${nonce}"><button class="btn secondary sm" type="submit">Run now</button></form>` : ''}
         ${view.canManage ? html`<a class="btn secondary sm" href="${projectPath}/routines?edit=${encodeURIComponent(routine.id)}">Edit</a>
@@ -390,11 +394,11 @@ export function routineWorkspaceBody(view: RoutineWorkspaceView, options: { erro
     ]
   })
   const runRows = view.runs.map(run => [
-    html`<span>${run.created_at}<span class="ui-panel-sub">${run.trigger_kind}</span></span>`,
+    html`<span class="routine-stack">${run.created_at}<span class="ui-panel-sub">${run.trigger_kind}</span></span>`,
     html`<a class="ui-link" href="${projectPath}/routines?run_id=${encodeURIComponent(run.id)}">${run.id}</a>`,
     pill(runState(run), runTone(run)),
-    html`<span>${run.assigned_agent_id ?? 'Unassigned'}<span class="ui-panel-sub">Attempt ${run.attempt}</span></span>`,
-    html`<span>${run.cost_micro_usd} micro USD<span class="ui-panel-sub">${run.result_summary ?? 'No terminal summary'}</span></span>`,
+    html`<span class="routine-stack">${run.assigned_agent_id ?? 'Unassigned'}<span class="ui-panel-sub">Attempt ${run.attempt}</span></span>`,
+    html`<span class="routine-stack">${run.cost_micro_usd} micro USD<span class="ui-panel-sub">${run.result_summary ?? 'No terminal summary'}</span></span>`,
     html`<div style="display:flex;gap:8px;flex-wrap:wrap;"><a class="ui-link" href="${projectPath}/routines?run_id=${encodeURIComponent(run.id)}#run-activity">Activity</a><a class="ui-link" href="${projectPath}/routines?run_id=${encodeURIComponent(run.id)}#run-evidence">Evidence</a>${view.canManage && !['succeeded', 'failed', 'skipped', 'cancelled'].includes(run.status) ? html`<form method="post" action="${projectPath}/routines/${encodeURIComponent(run.id)}/cancel"><button class="btn secondary sm" type="submit">Cancel</button></form>` : ''}</div>`,
   ])
   const eventRows = view.events.map(event => [
@@ -417,13 +421,13 @@ export function routineWorkspaceBody(view: RoutineWorkspaceView, options: { erro
     ${view.detailRun ? detailRunPanel(view, projectPath) : ''}
     ${view.detailRoutine && !view.editRoutine ? detailRoutinePanel(view, projectPath) : ''}
     ${routineForm(view, undefined, options.values)}
-    ${sectionPanel({ title: 'Routines', body: html`${table('Project routines', '88rem', [
+    ${sectionPanel({ title: 'Routines', body: html`${table('project-routines', 'Project routines', '88rem', [
       { label: 'Routine', width: '1.2fr' }, { label: 'Status', width: 'auto' }, { label: 'Schedule', width: '1.2fr' }, { label: 'Squad / agent', width: '1.1fr' }, { label: 'Policy', width: '1.5fr' }, { label: 'Current state / next action', width: '1.3fr' }, { label: 'Actions', width: 'auto' },
     ], routineRows, 'No Project Routines are configured yet.')}${view.routineTruncated ? html`<p class="ui-panel-sub">Showing a bounded page of routines. ${routineMore ? html`<a class="ui-link" href="${routineMore}">Continue routines</a>` : ''}</p>` : ''}` })}
-    ${sectionPanel({ title: 'Run history', body: html`${table('Routine run history', '72rem', [
+    ${sectionPanel({ title: 'Run history', body: html`${table('routine-run-history', 'Routine run history', '72rem', [
       { label: 'When', width: '1fr' }, { label: 'Run', width: '1fr' }, { label: 'State', width: '1fr' }, { label: 'Agent / attempt', width: '1.1fr' }, { label: 'Cost / outcome', width: '1.2fr' }, { label: 'Evidence', width: '1fr' },
     ], runRows, 'No routine runs are recorded for this Project yet.')}${view.runTruncated ? html`<p class="ui-panel-sub">Showing a bounded page of runs. ${runMore ? html`<a class="ui-link" href="${runMore}">Continue runs</a>` : ''}</p>` : ''}` })}
-    ${sectionPanel({ title: 'Event history', body: html`${table('Routine event history', '62rem', [
+    ${sectionPanel({ title: 'Event history', body: html`${table('routine-event-history', 'Routine event history', '62rem', [
       { label: 'When', width: '1fr' }, { label: 'Routine', width: '1.1fr' }, { label: 'Event', width: '1fr' }, { label: 'Actor', width: '1fr' }, { label: 'Links', width: 'auto' },
     ], eventRows, 'No routine events are recorded for this Project yet.')}${view.eventTruncated ? html`<p class="ui-panel-sub">Showing a bounded page of events. ${eventMore ? html`<a class="ui-link" href="${eventMore}">Continue events</a>` : ''}</p>` : ''}` })}`
 }
