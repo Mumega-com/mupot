@@ -25,9 +25,16 @@ function sessions() {
   }
 }
 
-function makeHarness(): SqliteD1Harness {
+function makeHarness(options: { includeRoutineMigrations?: boolean } = {}): SqliteD1Harness {
+  const includeRoutineMigrations = options.includeRoutineMigrations !== false
   const harness = createSqliteD1()
   for (const file of readdirSync(MIGRATIONS_DIR).filter(name => name.endsWith('.sql')).sort()) {
+    if (
+      !includeRoutineMigrations
+      && (file.startsWith('0073_') || file.startsWith('0074_'))
+    ) {
+      continue
+    }
     harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
   }
   harness.sqlite.exec(`
@@ -404,5 +411,51 @@ describe('Needs You projection', () => {
 
     expect(second.items).toHaveLength(1)
     expect(new Set([...first.items, ...second.items].map(item => item.source_id)).size).toBe(101)
+  })
+
+  it('degrades to empty Routine waits when migration 0073 tables are absent', async () => {
+    harness = makeHarness({ includeRoutineMigrations: false })
+    insertTask(harness, {
+      id: 'pre-schema-approval', status: 'review', gateOwner: 'gate:content',
+      createdAt: '2026-07-19T12:00:00.000Z',
+    })
+    insertTask(harness, {
+      id: 'pre-schema-blocked', status: 'blocked', gateOwner: 'role:delivery',
+      createdAt: '2026-07-19T11:00:00.000Z',
+    })
+    insertTask(harness, {
+      id: 'pre-schema-publishable', status: 'approved', assignee: 'agent-a',
+      gateOwner: 'gate:content', result: 'Ready', createdAt: '2026-07-19T10:00:00.000Z',
+    })
+
+    const page = await listNeedsYou(envFor(harness), owner(), {})
+
+    expect(page.items.map(item => item.source_id)).toEqual([
+      'pre-schema-approval',
+      'pre-schema-blocked',
+      'pre-schema-publishable',
+    ])
+    expect(page.items.every(item => item.source_type === 'task')).toBe(true)
+    expect(page.items.some(item => item.source_type === 'routine_run')).toBe(false)
+  })
+
+  it('keeps Routine waits after migration 0073 tables exist', async () => {
+    harness = makeHarness()
+    insertTask(harness, {
+      id: 'post-schema-approval', status: 'review', gateOwner: 'gate:content',
+      createdAt: '2026-07-19T12:00:00.000Z',
+    })
+    insertWaitingRun(harness, {
+      id: 'post-schema-wait', reason: 'budget', createdAt: '2026-07-19T11:30:00.000Z',
+    })
+
+    const page = await listNeedsYou(envFor(harness), owner(), {})
+
+    expect(page.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source_id: 'post-schema-approval', source_type: 'task' }),
+      expect.objectContaining({
+        source_id: 'post-schema-wait', source_type: 'routine_run', kind: 'routine_budget',
+      }),
+    ]))
   })
 })
