@@ -58,6 +58,8 @@ function stringToBase64Url(s: string): string {
 // appears contiguously in source — the repo's no-secrets CI guard greps for that exact
 // header to catch leaked keys, and this detection string is not a secret.
 const PKCS1_HEADER_MARKER = ['BEGIN', 'RSA', 'PRIVATE', 'KEY'].join(' ')
+const PKCS8_HEADER_MARKER = ['-----BEGIN', 'PRIVATE', 'KEY-----'].join(' ')
+const PKCS8_FOOTER_MARKER = ['-----END', 'PRIVATE', 'KEY-----'].join(' ')
 
 /**
  * Decode a PEM-encoded PKCS#8 private key body into raw DER bytes.
@@ -71,11 +73,14 @@ export function pemToPkcs8Der(pem: string): Uint8Array | null {
     // PKCS#1 — WebCrypto importKey('pkcs8', …) cannot parse this. Caller must convert.
     return null
   }
-  const match = normalized.match(
-    /-----BEGIN PRIVATE KEY-----([\s\S]*?)-----END PRIVATE KEY-----/,
-  )
-  if (!match || !match[1]) return null
-  const b64 = match[1].replace(/\s+/g, '')
+  const headerIndex = normalized.indexOf(PKCS8_HEADER_MARKER)
+  if (headerIndex < 0) return null
+  const bodyStart = headerIndex + PKCS8_HEADER_MARKER.length
+  const footerIndex = normalized.indexOf(PKCS8_FOOTER_MARKER, bodyStart)
+  if (footerIndex < 0) return null
+
+  // Delimiter lookup is linear even for hostile, unterminated input.
+  const b64 = normalized.slice(bodyStart, footerIndex).replace(/\s+/g, '')
   if (b64.length === 0) return null
   try {
     const bin = atob(b64)
