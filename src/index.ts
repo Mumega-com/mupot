@@ -274,7 +274,14 @@ export default {
       return
     }
 
-    if (controller.cron !== MAINTENANCE_CRON) return
+    if (controller.cron !== MAINTENANCE_CRON) {
+      console.warn('[scheduled:unmatched-cron]', {
+        kind: 'unmatched_cron',
+        scheduled_time: scheduledAt.toISOString(),
+        expected_trigger_count: 2,
+      })
+      return
+    }
 
     // Ten independent maintenance heartbeats, staggered across each 15-minute
     // window and isolated from the Routine invocation budget on Workers Free.
