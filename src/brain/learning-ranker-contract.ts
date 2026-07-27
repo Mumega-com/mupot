@@ -1,9 +1,11 @@
 // mupot — Brain = learning ranker contract (design-lock, pure).
 //
-// Locks the Port-4 instinct → RECALL-at-rank seam WITHOUT changing BrainPort's
-// role: rank / propose only. No I/O. No LLM. Build slices wire persistence later.
+// Locks the Port-4 instinct → RECALL-at-rank seam WITHOUT claiming BrainPort is
+// implemented: BrainPort is a SEALED type-only decision record until slice
+// `brainport-default-adapter` lands. No I/O. No LLM on the hot path.
 // Spec: docs/superpowers/specs/2026-07-27-brain-learning-ranker-design.md
 // Machine contract: docs/brain-learning-ranker-v1.json
+// Gate: _gate-verdicts/brain-ranker-8ceebb5d-dyad-gate.md (BLOCK → amendment)
 
 export const BRAIN_LEARNING_RANKER_CONTRACT_ID = 'brain-learning-ranker/v1' as const
 
@@ -18,10 +20,15 @@ export const LEARNING_RANKER_PIPELINE = [
 
 export type LearningRankerStep = (typeof LEARNING_RANKER_PIPELINE)[number]
 
+/** Must match BrainProposal.kind in src/types.ts. */
 export const ALLOWED_BRAIN_PROPOSAL_KINDS = ['spawn_task', 'wake_agent', 'noop'] as const
 
 export type BrainProposalKind = (typeof ALLOWED_BRAIN_PROPOSAL_KINDS)[number]
 
+/**
+ * Motor verbs forbidden as proposal *kinds* / action verbs — NOT as audit-trail
+ * summary prose (BLOCK-C). Prose screening is warn-only via warnForbiddenProseVerbs.
+ */
 export const FORBIDDEN_BRAIN_ACTION_VERBS = [
   'restart',
   'heal',
@@ -69,6 +76,18 @@ export const INSTINCT_INJECT_MAX = 6
 export const INSTINCT_PROMOTE_MIN_PROJECTS = 2
 export const INSTINCT_PROMOTE_MIN_CONFIDENCE = 0.8
 
+/** experience.py analogue — absolute cap on total learning priority adjustment. */
+export const MAX_LEARN_DELTA = 15
+
+/** Anti-selection-bias (b): force-promote after this many consecutive suppressions. */
+export const STALENESS_ESCALATION_TICKS = 5
+
+/** Anti-selection-bias (c): extra confidence penalty when suppressions lack confirming receipts. */
+export const UNEXERCISED_SUPPRESSION_PENALTY = 0.1
+
+/** Corroboration required before ANY project-scope inject (not only global promote). */
+export const INJECT_MIN_CORROBORATING_RECEIPTS = 2
+
 export const EXAMPLE_FABRICATION_INSTINCT_ID = 'no-act-on-fabrication'
 
 export type BrainRuntimeRole = 'learning_ranker' | 'learning_actor'
@@ -81,21 +100,34 @@ export interface RankInstinct {
   action: string
   updatedAt: string
   projectId: string | null
+  /** Receipt IDs resolved against Port-4 / FRC store — never free-string labels alone. */
+  corroboratingReceiptIds: readonly string[]
+  /** Consecutive ticks this instinct suppressed work without confirming receipts. */
+  suppressionTicksWithoutConfirm?: number
 }
 
+/**
+ * Must match BrainProposal (types.ts) including agentId — BLOCK-B.
+ * doneWhen uses optional undefined (not null) to assign both directions.
+ */
 export interface RankProposal {
-  kind: string
+  kind: BrainProposalKind
+  agentId?: string
   summary: string
+  doneWhen?: string
   priority: number
-  doneWhen: string | null
 }
 
 export interface InstinctGateOpts {
+  /** Required — fail closed if missing/empty (M-1). */
+  projectId: string
   minConfidence: number
   maxInjected: number
   halfLifeDays: number
   nowIso: string
   allowedDomains: readonly string[]
+  /** When true, require corroboratingReceiptIds length ≥ INJECT_MIN_CORROBORATING_RECEIPTS. */
+  requireCorroboration: boolean
 }
 
 export type InstinctGateResult =
@@ -104,10 +136,35 @@ export type InstinctGateResult =
 
 export type DistillEligibility =
   | { ok: true }
-  | { ok: false; reason: 'forbidden_source' | 'unknown_source' }
+  | {
+      ok: false
+      reason:
+        | 'forbidden_source'
+        | 'unknown_source'
+        | 'missing_receipt_id'
+        | 'unverified_receipt'
+        | 'insufficient_corroboration'
+    }
+
+export interface DistillReceiptRef {
+  /** Store primary key — trust object is the record, not the label. */
+  receiptId: string
+  sourceKind: string
+  /** Caller must have verified the ID against gate-driver/FRC store. */
+  verifiedAgainstStore: boolean
+  corroboratingReceiptIds: readonly string[]
+}
+
+export interface BiasApplicationResult {
+  proposals: RankProposal[]
+  /** Audit: which instincts moved which proposals (H-5). */
+  applied: ReadonlyArray<{ proposalSummary: string; instinctIds: readonly string[]; delta: number }>
+  proseWarnings: readonly string[]
+}
 
 /**
- * Brain may never act. Only the learning_ranker role is legal for this contract.
+ * Taxonomy helper only — NOT an authorization guard.
+ * Prefer: if (role === 'learning_ranker') for seals.
  */
 export function brainMayAct(role: BrainRuntimeRole): boolean {
   return role === 'learning_actor'
@@ -117,15 +174,10 @@ export function isLearningRankerRole(role: BrainRuntimeRole): boolean {
   return role === 'learning_ranker'
 }
 
-/** Hot rank path forbids LLM distill / frontier calls. */
 export function hotPathAllowsLlm(): boolean {
   return false
 }
 
-/**
- * Hermes may host the brain process; it is not the learning mechanism and does
- * not authorize acting.
- */
 export function hermesIsLearningMechanism(): boolean {
   return false
 }
@@ -155,10 +207,6 @@ export function clampInstinctConfidence(raw: number): number {
   return raw
 }
 
-/**
- * Exponential half-life decay toward the confidence floor. Never below min —
- * pruning is a separate path (Port-4).
- */
 export function decayInstinctConfidence(
   confidence: number,
   updatedAtIso: string,
@@ -180,6 +228,10 @@ export function decayInstinctConfidence(
   return clampInstinctConfidence(decayed)
 }
 
+/**
+ * Anti-fabrication taxonomy check alone (mechanism-lock).
+ * Prefer mayDistillFromReceiptRef for trust-lock.
+ */
 export function mayDistillFromSource(source: string): DistillEligibility {
   if ((DISTILL_FORBIDDEN_SOURCES as readonly string[]).includes(source)) {
     return { ok: false, reason: 'forbidden_source' }
@@ -191,13 +243,63 @@ export function mayDistillFromSource(source: string): DistillEligibility {
 }
 
 /**
- * Gate instincts before they may bias rank: decay → domain allowlist →
- * confidence threshold → inject cap. Fail closed on empty allowlist misuse.
+ * Trust-lock: receipt ID + store verification + source kind + corroboration.
+ */
+export function mayDistillFromReceiptRef(ref: DistillReceiptRef): DistillEligibility {
+  if (!ref.receiptId || !String(ref.receiptId).trim()) {
+    return { ok: false, reason: 'missing_receipt_id' }
+  }
+  if (!ref.verifiedAgainstStore) {
+    return { ok: false, reason: 'unverified_receipt' }
+  }
+  const kindGate = mayDistillFromSource(ref.sourceKind)
+  if (!kindGate.ok) return kindGate
+  const ids = new Set(
+    [ref.receiptId, ...ref.corroboratingReceiptIds].map((id) => String(id).trim()).filter(Boolean),
+  )
+  if (ids.size < INJECT_MIN_CORROBORATING_RECEIPTS) {
+    return { ok: false, reason: 'insufficient_corroboration' }
+  }
+  return { ok: true }
+}
+
+/** Distill domains must be in RANK_INSTINCT_DOMAINS or the inject loop is a no-op (H-1). */
+export function mapDistillDomainToAllowlist(rawDomain: string): RankInstinctDomain | null {
+  const trimmed = String(rawDomain || '').trim().toLowerCase()
+  if ((RANK_INSTINCT_DOMAINS as readonly string[]).includes(trimmed)) {
+    return trimmed as RankInstinctDomain
+  }
+  return null
+}
+
+/**
+ * Strip instruction-shaped lines from receipt free text before cheap-model distill.
+ */
+export function sanitizeReceiptContentForDistill(raw: string): string {
+  return String(raw || '')
+    .split('\n')
+    .filter((line) => {
+      const t = line.trim().toLowerCase()
+      if (!t) return true
+      if (t.startsWith('create instinct')) return false
+      if (t.startsWith('prefer noop for')) return false
+      if (t.includes('confidence:') && t.includes('domain')) return false
+      if (/^system\s*:/.test(t) || /^assistant\s*:/.test(t)) return false
+      return true
+    })
+    .join('\n')
+}
+
+/**
+ * Gate instincts: project scope → corroboration → decay → domain → threshold → inject cap.
  */
 export function gateInstinctsForRank(
   instincts: readonly RankInstinct[],
   opts: InstinctGateOpts,
 ): InstinctGateResult {
+  if (!opts.projectId || !String(opts.projectId).trim()) {
+    return { ok: false, reason: 'project_id_required' }
+  }
   if (opts.allowedDomains.length === 0) {
     return { ok: false, reason: 'domain_allowlist_empty' }
   }
@@ -205,16 +307,31 @@ export function gateInstinctsForRank(
     return { ok: false, reason: 'max_injected_invalid' }
   }
 
-  const gated = instincts
-    .map((instinct) => ({
-      ...instinct,
-      confidence: decayInstinctConfidence(
+  const projectId = String(opts.projectId).trim()
+  const scoped = instincts.filter((instinct) => {
+    if (instinct.projectId === null) return false
+    return instinct.projectId === projectId
+  })
+
+  const eligible = scoped.filter((instinct) => {
+    if (!opts.requireCorroboration) return true
+    const n = new Set(
+      (instinct.corroboratingReceiptIds || []).map((id) => String(id).trim()).filter(Boolean),
+    ).size
+    return n >= INJECT_MIN_CORROBORATING_RECEIPTS
+  })
+
+  const gated = eligible
+    .map((instinct) => {
+      let confidence = decayInstinctConfidence(
         instinct.confidence,
         instinct.updatedAt,
         opts.nowIso,
         opts.halfLifeDays,
-      ),
-    }))
+      )
+      confidence = applyUnexercisedSuppressionDecay(confidence, instinct.suppressionTicksWithoutConfirm || 0)
+      return { ...instinct, confidence }
+    })
     .filter((instinct) => opts.allowedDomains.includes(instinct.domain))
     .filter((instinct) => instinct.confidence >= opts.minConfidence)
     .slice()
@@ -224,27 +341,70 @@ export function gateInstinctsForRank(
   return { ok: true, instincts: gated }
 }
 
-export function defaultInstinctGateOpts(nowIso: string): InstinctGateOpts {
+export function defaultInstinctGateOpts(nowIso: string, projectId: string): InstinctGateOpts {
   return {
+    projectId,
     minConfidence: INSTINCT_INJECT_THRESHOLD,
     maxInjected: INSTINCT_INJECT_MAX,
     halfLifeDays: INSTINCT_DECAY_HALF_LIFE_DAYS,
     nowIso,
     allowedDomains: RANK_INSTINCT_DOMAINS,
+    requireCorroboration: true,
   }
 }
 
 /**
- * Detect forbidden action verbs in free text (summary / action / doneWhen).
- * Word-boundary style: substring match on normalized tokens.
+ * Anti-selection-bias (c): suppressing without confirming receipts costs confidence.
+ */
+export function applyUnexercisedSuppressionDecay(
+  confidence: number,
+  suppressionTicksWithoutConfirm: number,
+): number {
+  if (!(suppressionTicksWithoutConfirm > 0)) return clampInstinctConfidence(confidence)
+  const penalized =
+    clampInstinctConfidence(confidence)
+    - UNEXERCISED_SUPPRESSION_PENALTY * suppressionTicksWithoutConfirm
+  return clampInstinctConfidence(Math.max(INSTINCT_CONFIDENCE_MIN, penalized))
+}
+
+/**
+ * Anti-selection-bias (b): deterministic staleness escalation — force-include
+ * suppressed proposal indices after N consecutive suppressions.
+ */
+export function selectStalenessEscalationIndices(
+  consecutiveSuppressionTicks: readonly number[],
+  threshold: number,
+): number[] {
+  const t = threshold > 0 ? threshold : STALENESS_ESCALATION_TICKS
+  const out: number[] = []
+  for (let i = 0; i < consecutiveSuppressionTicks.length; i += 1) {
+    if (consecutiveSuppressionTicks[i] >= t) out.push(i)
+  }
+  return out
+}
+
+/**
+ * Detect forbidden verbs in prose after stripping non-alpha (W-1).
+ * Catches "re-start" / "re start" via compact form. Warn-only — never throw the batch.
  */
 export function textContainsForbiddenAction(text: string): boolean {
-  const normalized = text.toLowerCase()
+  const spaced = String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+  if (!spaced) return false
+  const compact = spaced.replace(/\s+/g, '')
+  const tokens = new Set(spaced.split(/\s+/).filter(Boolean))
   for (const verb of FORBIDDEN_BRAIN_ACTION_VERBS) {
-    const re = new RegExp(`(^|[^a-z0-9])${verb}([^a-z0-9]|$)`)
-    if (re.test(normalized)) return true
+    if (tokens.has(verb)) return true
+    if (compact.includes(verb)) return true
   }
   return false
+}
+
+export function warnForbiddenProseVerbs(summary: string): string | null {
+  if (!textContainsForbiddenAction(summary)) return null
+  return `prose_contains_motor_verb_token: ${summary.slice(0, 80)}`
 }
 
 export function assertProposalKindAllowed(kind: string): void {
@@ -253,49 +413,81 @@ export function assertProposalKindAllowed(kind: string): void {
   }
 }
 
+function clampLearnDelta(delta: number): number {
+  if (!Number.isFinite(delta)) return 0
+  if (delta > MAX_LEARN_DELTA) return MAX_LEARN_DELTA
+  if (delta < -MAX_LEARN_DELTA) return -MAX_LEARN_DELTA
+  return delta
+}
+
 /**
- * Pure bias: if a gated instinct's trigger tokens appear in a proposal summary
- * and the instinct action prefers noop / escalate, demote to noop with lowered
- * priority. Never invents forbidden verbs. Stable sort by priority desc, then
- * kind, then summary.
+ * Pure bias with MAX_LEARN_DELTA, audit trail, stable priority sort preserving
+ * input order on ties (does not alphabetize away brain order — H-4).
  */
 export function applyInstinctBiasToProposals(
   proposals: readonly RankProposal[],
   gatedInstincts: readonly RankInstinct[],
-): RankProposal[] {
+): BiasApplicationResult {
+  const proseWarnings: string[] = []
+  const applied: Array<{ proposalSummary: string; instinctIds: string[]; delta: number }> = []
+
   for (const proposal of proposals) {
     assertProposalKindAllowed(proposal.kind)
-    if (textContainsForbiddenAction(proposal.summary)) {
-      throw new Error(`learning_ranker_forbidden_action_in_summary: ${proposal.kind}`)
-    }
+    const warn = warnForbiddenProseVerbs(proposal.summary)
+    if (warn) proseWarnings.push(warn)
   }
 
-  const biased = proposals.map((proposal) => {
+  const indexed = proposals.map((proposal, index) => ({ proposal, index }))
+  const biased = indexed.map(({ proposal, index }) => {
     const matching = gatedInstincts.filter((instinct) =>
       proposalMatchesTrigger(proposal.summary, instinct.trigger),
     )
-    if (matching.length === 0) return { ...proposal }
+    if (matching.length === 0) {
+      return { proposal: { ...proposal }, index, instinctIds: [] as string[], delta: 0 }
+    }
 
     const prefersNoop = matching.some((instinct) => actionPrefersNoop(instinct.action))
     if (!prefersNoop) {
-      return {
+      const delta = clampLearnDelta(-matching.length)
+      const next = {
         ...proposal,
-        priority: proposal.priority - matching.length,
+        priority: proposal.priority + delta,
       }
+      applied.push({
+        proposalSummary: proposal.summary,
+        instinctIds: matching.map((m) => m.id),
+        delta,
+      })
+      return { proposal: next, index, instinctIds: matching.map((m) => m.id), delta }
     }
-    return {
+
+    const next: RankProposal = {
       kind: 'noop',
+      agentId: proposal.agentId,
       summary: `instinct:${matching[0].id} blocked act-on-match — ${proposal.summary}`,
+      doneWhen: proposal.doneWhen,
       priority: Math.min(proposal.priority, 0),
-      doneWhen: null,
     }
+    applied.push({
+      proposalSummary: proposal.summary,
+      instinctIds: matching.map((m) => m.id),
+      delta: next.priority - proposal.priority,
+    })
+    return { proposal: next, index, instinctIds: matching.map((m) => m.id), delta: next.priority - proposal.priority }
   })
 
-  return biased.slice().sort((a, b) => {
-    if (a.priority !== b.priority) return b.priority - a.priority
-    if (a.kind !== b.kind) return a.kind.localeCompare(b.kind)
-    return a.summary.localeCompare(b.summary)
+  biased.sort((a, b) => {
+    if (a.proposal.priority !== b.proposal.priority) {
+      return b.proposal.priority - a.proposal.priority
+    }
+    return a.index - b.index
   })
+
+  return {
+    proposals: biased.map((row) => row.proposal),
+    applied,
+    proseWarnings,
+  }
 }
 
 function actionPrefersNoop(action: string): boolean {
@@ -316,14 +508,13 @@ function proposalMatchesTrigger(summary: string, trigger: string): boolean {
     .split(/[^a-z0-9]+/)
     .filter((t) => t.length >= 4)
   if (tokens.length === 0) return false
-  const hits = tokens.filter((t) => hay.includes(t)).length
-  return hits >= Math.min(2, tokens.length)
+  // Prefer specific tokens (≥6 chars) to reduce "stale/backlog" false demotes (W-2).
+  const specific = tokens.filter((t) => t.length >= 6)
+  const use = specific.length >= 2 ? specific : tokens
+  const hits = use.filter((t) => hay.includes(t)).length
+  return hits >= Math.min(2, use.length)
 }
 
-/**
- * Pipeline order lock: applyInstinctBias requires gateInstincts + decide first;
- * distill must not appear on the hot path.
- */
 export function mayApplyInstinctBias(completedSteps: readonly LearningRankerStep[]): boolean {
   return (
     completedSteps.includes('gateInstincts')
@@ -336,7 +527,6 @@ export function mayRunHotPathDistill(): boolean {
   return false
 }
 
-/** Auto-promote only when ≥2 projects and avg confidence meets floor (Port-4). */
 export function shouldPromoteInstinct(projectConfidences: readonly number[]): boolean {
   if (projectConfidences.length < INSTINCT_PROMOTE_MIN_PROJECTS) return false
   const avg =
@@ -357,5 +547,6 @@ export function fabricationInstinctExample(nowIso: string): RankInstinct {
       'Prefer noop or escalate; never propose restart, heal, or invent work from the fabrication.',
     updatedAt: nowIso,
     projectId: 'proj-example',
+    corroboratingReceiptIds: ['receipt-gate-1', 'receipt-human-2'],
   }
 }
