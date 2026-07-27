@@ -125,7 +125,7 @@
     "reason": "random sampling breaks determinism-same-inputs-same-rank"
   },
   "distill": {
-    "receiptResolution": "branded-VerifiedReceiptRef-only-from-store-lookup-hit-boolean-bag-rejected",
+    "receiptResolution": "branded-VerifiedReceiptRef-only-from-injected-ReceiptStoreResolver-with-resolved-content-boolean-bag-rejected",
     "corroborationRequiredBeforeInject": true,
     "contentSanitization": "schema-constrained-parse-plus-strip-instruction-shaped-text",
     "parseIsTrustBoundary": true,
@@ -142,7 +142,8 @@
     "modelClass": "cheap",
     "runsOnHotPath": false,
     "domainOutput": "must-map-to-instinct.allowedDomains-or-no-op-loop",
-    "verifiedReceiptConstructor": "verifiedReceiptRefFromStoreLookup"
+    "verifiedReceiptConstructor": "verifiedReceiptRefFromResolver",
+    "trustBoundary": "injected-ReceiptStoreResolver-like-Port4-InstinctChat"
   },
   "recallInstincts": {
     "signature": "recallInstincts(store: InstinctReadPort, opts: RecallInstinctsOpts): Promise<RecallInstinctsResult>",

@@ -213,10 +213,15 @@ If prose screening is retained as a secondary defense:
 
 **Anti-fabrication (input side):**
 
-Distill inputs resolve receipts **by ID against Port-4's gate-driver/FRC
-store**. Never accept a caller-supplied free-string `source` label as the
-object of trust. `mayDistillFromSource(source: string)` checking an enum is
-a contract fence only — wiring must bind label to verified record.
+Distill inputs resolve receipts **by ID through an injected
+`ReceiptStoreResolver`** (Port-4 InstinctChat pattern). The sole mint path is
+`verifiedReceiptRefFromResolver(resolver, receiptId, projectId)`, which returns
+a branded `VerifiedReceiptRef` carrying **resolved content** (projectId,
+resolvedAt, sanitizedContent, corroborating ids) — not a self-describing tag.
+Never accept a caller-supplied free-string `source` label or a
+`{verifiedAgainstStore:true}` boolean bag as the object of trust.
+`mayDistillFromSource(source: string)` checking an enum is a contract fence
+only (mechanism-lock); the resolver + brand is the trust-lock.
 
 **Corroboration before ANY inject:** a single fresh observation at
 `confidence: 0.85` must not clear the 0.7 inject threshold without ≥2

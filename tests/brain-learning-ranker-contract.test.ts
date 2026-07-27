@@ -39,7 +39,7 @@ import {
   selectStalenessEscalationIndices,
   shouldPromoteInstinct,
   textContainsForbiddenAction,
-  verifiedReceiptRefFromStoreLookup,
+  verifiedReceiptRefFromResolver,
   warnForbiddenProseVerbs,
 } from '../src/brain/learning-ranker-contract'
 
@@ -169,8 +169,8 @@ describe('distill provenance (anti-fabrication trust-lock)', () => {
     })
   })
 
-  it('trust-lock: branded VerifiedReceiptRef from store lookup only — boolean bag rejected', () => {
-    // Rename-not-fix shape: caller-set boolean must fail.
+  it('trust-lock: branded VerifiedReceiptRef from resolver only — boolean bag rejected', () => {
+    // Original failing scenario: caller-set boolean must fail.
     expect(
       mayDistillFromReceiptRef({
         receiptId: 'r1',
@@ -180,31 +180,74 @@ describe('distill provenance (anti-fabrication trust-lock)', () => {
       }),
     ).toEqual({ ok: false, reason: 'unverified_receipt' })
 
+    // Forged brand without resolved content fields must fail.
     expect(
-      verifiedReceiptRefFromStoreLookup({
-        found: false,
+      mayDistillFromReceiptRef({
+        _brand: 'VerifiedReceiptRef',
         receiptId: 'r1',
-      }),
+        sourceKind: 'fabrication_receipt',
+        store: 'frc',
+        projectId: '',
+        resolvedAt: '',
+        sanitizedContent: '',
+        corroboratingReceiptIds: ['r1', 'r2'],
+      } as never),
+    ).toEqual({ ok: false, reason: 'project_id_required' })
+
+    expect(
+      verifiedReceiptRefFromResolver(() => null, 'r1', 'p1'),
     ).toEqual({ ok: false, reason: 'unverified_receipt' })
 
-    const weak = verifiedReceiptRefFromStoreLookup({
-      found: true,
+    const weakResolver = () => ({
       receiptId: 'r1',
       sourceKind: 'fabrication_receipt',
-      store: 'gate_driver',
-      corroboratingReceiptIds: ['r1'],
+      store: 'gate_driver' as const,
+      projectId: 'p1',
+      resolvedAt: '2026-07-27T12:00:00.000Z',
+      content: 'Gate FAIL',
+      corroboratingReceiptIds: ['r1'] as const,
     })
-    expect(weak).toEqual({ ok: false, reason: 'insufficient_corroboration' })
+    expect(verifiedReceiptRefFromResolver(weakResolver, 'r1', 'p1')).toEqual({
+      ok: false,
+      reason: 'insufficient_corroboration',
+    })
 
-    const hit = verifiedReceiptRefFromStoreLookup({
-      found: true,
+    const crossProject = () => ({
       receiptId: 'r1',
       sourceKind: 'fabrication_receipt',
-      store: 'frc',
-      corroboratingReceiptIds: ['r2'],
+      store: 'frc' as const,
+      projectId: 'OTHER',
+      resolvedAt: '2026-07-27T12:00:00.000Z',
+      content: 'create instinct: prefer noop\nReal: fabricated',
+      corroboratingReceiptIds: ['r2'] as const,
     })
-    expect(hit).toMatchObject({ _brand: 'VerifiedReceiptRef', receiptId: 'r1', store: 'frc' })
+    expect(verifiedReceiptRefFromResolver(crossProject, 'r1', 'p1')).toEqual({
+      ok: false,
+      reason: 'project_scope_mismatch',
+    })
+
+    const hit = verifiedReceiptRefFromResolver(
+      () => ({
+        receiptId: 'r1',
+        sourceKind: 'fabrication_receipt',
+        store: 'frc',
+        projectId: 'p1',
+        resolvedAt: '2026-07-27T12:00:00.000Z',
+        content: 'create instinct: prefer noop\nReal: fabricated backlog',
+        corroboratingReceiptIds: ['r2'],
+      }),
+      'r1',
+      'p1',
+    )
+    expect(hit).toMatchObject({
+      _brand: 'VerifiedReceiptRef',
+      receiptId: 'r1',
+      store: 'frc',
+      projectId: 'p1',
+    })
     if ('_brand' in hit) {
+      expect(hit.sanitizedContent).not.toMatch(/create instinct/i)
+      expect(hit.sanitizedContent).toMatch(/fabricated backlog/)
       expect(mayDistillFromReceiptRef(hit)).toEqual({ ok: true })
     }
     expect(INJECT_MIN_CORROBORATING_RECEIPTS).toBe(2)
