@@ -624,7 +624,18 @@ export async function createCollectorDependencies(config) {
       const safeTaskId = taskId.replaceAll('\\', '\\\\').replaceAll('"', '\\"')
       const card = active.page.locator(`[data-task="${safeTaskId}"]`)
       if (await card.count() !== 1) throw new Error('control task was not rendered in Approvals')
+      const verdictResponse = active.page.waitForResponse(response => {
+        const target = new URL(response.url())
+        return target.pathname === `/api/tasks/${encodeURIComponent(taskId)}/verdict`
+          && response.request().method() === 'POST'
+      }, { timeout: 10_000 })
       await card.locator('.appr-approve').click()
+      const response = await verdictResponse
+      if (!response.ok()) {
+        const failure = await response.json().catch(() => null)
+        const code = typeof failure?.error === 'string' ? failure.error : 'unknown_error'
+        throw new Error(`approval request failed with HTTP ${response.status()}: ${code}`)
+      }
       await expectLocatorText(card.locator('.appr-status'), 'approved')
       return { taskId, runId, verdict: 'approved' }
     },
