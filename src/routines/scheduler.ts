@@ -334,6 +334,7 @@ export async function claimRoutineRun(
              WHERE earlier.tenant = routine_runs.tenant
                AND earlier.routine_id = routine_runs.routine_id
                AND earlier.status = 'queued'
+               AND ${sqlNotCancellationPending('earlier')}
                AND (earlier.created_at < routine_runs.created_at
                  OR (earlier.created_at = routine_runs.created_at AND earlier.id < routine_runs.id))
           )
@@ -452,15 +453,17 @@ export async function runRoutineScheduler(
     if (occurrence.skipped) occurrencesSkipped++
   }
 
-  const queued = processClaimed && !shouldRunMaintenanceHeartbeat(now)
+  const queued = processClaimed
     ? await env.DB.prepare(
       `SELECT rr.id FROM routine_runs rr
         WHERE rr.tenant = ? AND rr.status = 'queued'
           AND (rr.retry_at IS NULL OR rr.retry_at <= ?)
+          AND ${sqlNotCancellationPending('rr')}
           AND NOT EXISTS (
             SELECT 1 FROM routine_runs earlier
              WHERE earlier.tenant = rr.tenant AND earlier.routine_id = rr.routine_id
                AND earlier.status = 'queued'
+               AND ${sqlNotCancellationPending('earlier')}
                AND (earlier.created_at < rr.created_at
                  OR (earlier.created_at = rr.created_at AND earlier.id < rr.id))
           )

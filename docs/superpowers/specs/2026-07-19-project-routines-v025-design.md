@@ -248,12 +248,14 @@ minute. Excess work remains due for the next heartbeat. It never scans an unboun
 tenant table.
 
 The v0.25 implementation uses a smaller operational batch of two recoveries, two
-due Routines, and one claim candidate per non-maintenance heartbeat. Canonical
-fifteen-minute maintenance heartbeats create and recover occurrences but do not
-claim dispatch work. This keeps scheduler control work at or below 19 D1 statements
-before dispatch, leaving headroom under the
-Workers Free query limit. The public contract remains a hard maximum of 100; batch
-sizes may increase only with an explicit invocation-budget calculation and tests.
+due Routines, and one claim candidate per heartbeat. Routine dispatch remains
+eligible on canonical fifteen-minute maintenance heartbeats; only the unrelated
+maintenance jobs are cadence-gated. This prevents a pot whose external cron still
+runs every fifteen minutes from silently disabling Routine dispatch. Scheduler
+control work remains at or below 19 D1 statements before dispatch, leaving headroom
+under the Workers Free query limit. The public contract remains a hard maximum of
+100; batch sizes may increase only with an explicit invocation-budget calculation
+and tests.
 
 Queued runs are leased only when the scheduler receives an attached dispatch
 processor. Occurrence creation and recovery may run without one, but the scheduler

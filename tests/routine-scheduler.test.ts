@@ -443,7 +443,7 @@ describe('routine scheduler', () => {
     })
   })
 
-  it('reserves canonical maintenance heartbeats by leaving queued work unclaimed', async () => {
+  it('claims queued work on canonical maintenance heartbeats', async () => {
     harness = makeHarness()
     seedRoutine(harness, { id: 'routine-1', dueAt: '2026-07-19T17:00:00.000Z' })
     seedRun(harness, { id: 'run-1', routineId: 'routine-1' })
@@ -453,10 +453,10 @@ describe('routine scheduler', () => {
       processed.push(runId)
     })
 
-    expect(summary.queued_scanned).toBe(0)
-    expect(summary.claimed).toBe(0)
-    expect(processed).toEqual([])
-    expect(harness.sqlite.prepare('SELECT status FROM routine_runs WHERE id = ?').get('run-1')).toEqual({ status: 'queued' })
+    expect(summary.queued_scanned).toBe(1)
+    expect(summary.claimed).toBe(1)
+    expect(processed).toEqual(['run-1'])
+    expect(harness.sqlite.prepare('SELECT status FROM routine_runs WHERE id = ?').get('run-1')).toEqual({ status: 'leased' })
   })
 
   it('keeps a newer queued occurrence behind an earlier run in backoff', async () => {
@@ -497,5 +497,94 @@ describe('routine scheduler', () => {
 
     expect(summary.claimed).toBe(1)
     expect(processed).toEqual(['run-eligible'])
+  })
+
+  it('selects healthy work past a cancellation-fenced tenant queue head', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status)
+        VALUES ('project-other', 'other', 'Other', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+        VALUES ('project-other', 'squad-1', 'write');
+    `)
+    seedRoutine(harness, {
+      id: 'routine-fenced', projectId: 'project-active',
+      dueAt: '2026-07-19T17:00:00.000Z',
+    })
+    seedRoutine(harness, {
+      id: 'routine-healthy', projectId: 'project-other',
+      dueAt: '2026-07-19T17:00:00.000Z',
+    })
+    seedRun(harness, {
+      id: 'run-fenced', routineId: 'routine-fenced', projectId: 'project-active',
+      createdAt: '2026-07-19T14:00:00.000Z',
+    })
+    seedRun(harness, {
+      id: 'run-healthy', routineId: 'routine-healthy', projectId: 'project-other',
+      createdAt: '2026-07-19T15:00:00.000Z',
+    })
+    harness.sqlite.exec(`
+      INSERT INTO routine_run_events (
+        id, tenant, project_id, run_id, kind, actor_type, actor_id,
+        metadata_json, correlation_id
+      ) VALUES (
+        'cancel-fenced', 'tenant-a', 'project-active', 'run-fenced',
+        'cancellation_requested', 'member', 'owner-1', '{}', 'run-fenced'
+      );
+    `)
+    const processed: string[] = []
+
+    const summary = await runRoutineScheduler(
+      envFor(harness),
+      DISPATCH_NOW,
+      'worker-a',
+      async runId => { processed.push(runId) },
+    )
+
+    expect(summary.queued_scanned).toBe(1)
+    expect(summary.claimed).toBe(1)
+    expect(processed).toEqual(['run-healthy'])
+    expect(harness.sqlite.prepare(
+      'SELECT id, status FROM routine_runs ORDER BY id',
+    ).all()).toEqual([
+      { id: 'run-fenced', status: 'queued' },
+      { id: 'run-healthy', status: 'leased' },
+    ])
+  })
+
+  it('ignores a cancellation-fenced run when ordering the same Routine queue', async () => {
+    harness = makeHarness()
+    seedRoutine(harness, {
+      id: 'routine-1', dueAt: '2026-07-19T17:00:00.000Z', overlap: 'queue',
+    })
+    seedRun(harness, {
+      id: 'run-fenced', routineId: 'routine-1',
+      createdAt: '2026-07-19T14:00:00.000Z',
+    })
+    seedRun(harness, {
+      id: 'run-healthy', routineId: 'routine-1',
+      createdAt: '2026-07-19T15:00:00.000Z',
+    })
+    harness.sqlite.exec(`
+      INSERT INTO routine_run_events (
+        id, tenant, project_id, run_id, kind, actor_type, actor_id,
+        metadata_json, correlation_id
+      ) VALUES (
+        'cancel-fenced', 'tenant-a', 'project-active', 'run-fenced',
+        'cancellation_requested', 'member', 'owner-1', '{}', 'run-fenced'
+      );
+    `)
+    const processed: string[] = []
+
+    const summary = await runRoutineScheduler(
+      envFor(harness),
+      DISPATCH_NOW,
+      'worker-a',
+      async runId => { processed.push(runId) },
+    )
+
+    expect(summary.queued_scanned).toBe(1)
+    expect(summary.claimed).toBe(1)
+    expect(processed).toEqual(['run-healthy'])
   })
 })
