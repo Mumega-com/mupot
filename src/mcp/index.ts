@@ -907,7 +907,15 @@ const toolTaskUpdate: ToolSpec = {
     }
     if (args.gate_owner !== undefined) {
       const lockStatuses: ReadonlySet<TaskStatus> = new Set(['review', 'approved', 'rejected', 'done'])
-      if (lockStatuses.has(existing.status)) return fail(409, 'gate_owner_locked', { status: existing.status })
+      const repairsHistoricalUngatedReview =
+        existing.status === 'review' &&
+        existing.gate_owner === null &&
+        typeof args.gate_owner === 'string' &&
+        args.gate_owner.trim().length > 0 &&
+        (auth.role === 'owner' || auth.role === 'admin')
+      if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview) {
+        return fail(409, 'gate_owner_locked', { status: existing.status })
+      }
       if (args.gate_owner === null) {
         next.gate_owner = null
       } else if (typeof args.gate_owner === 'string' && args.gate_owner.trim().length > 0) {

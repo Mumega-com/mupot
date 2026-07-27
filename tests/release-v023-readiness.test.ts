@@ -99,13 +99,16 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
   })
 
   it('publishes final stable metadata while retaining the RC evidence boundary', () => {
-    // Current head release is v0.24.0 (Project Operations); v0.23.0 history is retained
+    // Current head release is v0.25.0 (Project Routines); v0.23.0 history is retained
     // permanently below. These two pins track the current shipped version.
-    expect(pkg.version).toBe('0.24.0')
-    expect(publicApiVersion).toContain("MUPOT_PUBLIC_API_VERSION = '0.24.0'")
+    expect(pkg.version).toBe('0.25.0')
+    expect(publicApiVersion).toContain("MUPOT_PUBLIC_API_VERSION = '0.25.0'")
+    expect(changelog).toContain('## [0.25.0] — 2026-07-27')
     expect(changelog).toContain('## [0.24.0] — 2026-07-19')
     expect(changelog).toContain('## [0.23.0] — 2026-07-13')
     expect(changelog).toContain('## [0.23.0-rc.1] — 2026-07-10')
+    expect(roadmap).toContain('Stable release | `v0.25.0`')
+    expect(roadmap).toContain('Console consolidation (project-centered nav) | `v0.26.0`')
     expect(releaseDoc).toContain('The RC uses its own package/API version and prerelease evidence, never the final tag.')
   })
 
