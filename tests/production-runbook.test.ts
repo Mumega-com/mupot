@@ -55,6 +55,7 @@ describe('production self-hosting runbook', () => {
       'npx wrangler d1 execute "$RESTORE_DB" --remote --config "$RESTORE_CONFIG" --file "$BACKUP_DIR/d1.sql" --yes',
       'npx wrangler rollback <VERSION_ID> --config "$CONFIG"',
       'npx wrangler secret list --config "$CONFIG"',
+      'grep -F \'crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]\' "$CONFIG"',
       'npx wrangler r2 object get "${BUCKET}/path/to/object" --remote --file "$BACKUP_DIR/r2/path/to/object"',
       'aws s3 sync "s3://${BUCKET}"',
       'npm run receipt:fresh-install:plan',

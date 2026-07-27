@@ -107,9 +107,10 @@ name = "mupot-task-workflow"
 binding = "TASK_WORKFLOW"
 class_name = "TaskWorkflow"
 
-# Project Routines run each minute; existing maintenance stays in 15-minute buckets.
+# Project Routines and maintenance use separate triggers so their D1/subrequest
+# budgets cannot combine in one invocation. Maintenance jobs remain staggered.
 [triggers]
-crons = ["* * * * *"]
+crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]
 
 # ── GHL act-channel secrets (issue #8) ──
 # These are secrets — do NOT add them under [vars]. Set via wrangler secret put:

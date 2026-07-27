@@ -232,11 +232,18 @@ table. A unique `(run_id, ref_type, ref_id, relation)` prevents duplicate projec
 
 ### 6.2 Heartbeat
 
-The Worker receives one `* * * * *` Cloudflare cron trigger. The scheduled handler:
+The Worker receives separate Cloudflare cron triggers for Routine and maintenance
+work:
 
-1. runs the Routine scheduler every minute;
-2. runs existing fifteen-minute maintenance heartbeats only in their canonical
-   fifteen-minute bucket, protected by their existing idempotency;
+- `* * * * *` starts the Routine scheduler every minute;
+- `0-9,15-24,30-39,45-54 * * * *` starts one maintenance job per invocation.
+
+The scheduled handler:
+
+1. routes each trigger to exactly one workload class and fails closed for
+   unrecognized trigger expressions;
+2. runs each existing maintenance heartbeat once per fifteen-minute window,
+   staggered across minute slots 0-9;
 3. reads due Routines in `(next_run_at, id)` order through a bounded indexed page;
 4. creates each occurrence with an atomic unique insert;
 5. advances `next_run_at` from the saved schedule, never from completion time;
@@ -249,13 +256,14 @@ tenant table.
 
 The v0.25 implementation uses a smaller operational batch of two recoveries, two
 due Routines, and one claim candidate per heartbeat. Routine dispatch remains
-eligible on canonical fifteen-minute maintenance heartbeats; only the unrelated
-maintenance jobs are cadence-gated. This prevents a pot whose external cron still
-runs every fifteen minutes from silently disabling Routine dispatch. Scheduler
-control work remains at or below 19 D1 statements before dispatch, leaving headroom
-under the Workers Free query limit. The public contract remains a hard maximum of
-100; batch sizes may increase only with an explicit invocation-budget calculation
-and tests.
+eligible on every minute. Ten unrelated maintenance jobs retain their fifteen-minute
+cadence but occupy separate minute slots and cron invocations. Routine and
+maintenance D1/subrequest budgets therefore cannot combine. Both trigger
+expressions are hard activation requirements, not template suggestions. Scheduler
+control work remains at or below 19 D1 statements before dispatch. Each scheduled
+invocation starts exactly one bounded workload class. The public contract remains
+a hard maximum of 100; batch sizes may increase only with an explicit
+invocation-budget calculation and tests.
 
 Queued runs are leased only when the scheduler receives an attached dispatch
 processor. Occurrence creation and recovery may run without one, but the scheduler

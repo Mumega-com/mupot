@@ -201,6 +201,20 @@ events are rejected by the older event-kind constraint until `0074` completes.
 If the migration command is interrupted, rerun it and confirm both migrations
 are applied before deploying or enabling Project Routines.
 
+Project Routines require separate Worker triggers for Routine work and existing
+maintenance. Before deploying v0.25, verify the pot config contains the exact
+active assignment below:
+
+```bash
+grep -F 'crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]' "$CONFIG"
+```
+
+Do not enable a Routine when that command has no output. The Routine scheduler
+runs in its own invocation every minute. The maintenance trigger starts one of
+the ten existing jobs in minute slots 0-9 of each fifteen-minute window. This
+keeps their D1 and subrequest budgets isolated. A legacy `*/15` trigger cannot
+satisfy the v0.25 activation contract.
+
 Do not apply a migration to production until a D1 backup exists for the current
 production state.
 

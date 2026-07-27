@@ -41,10 +41,6 @@ export interface RoutineSchedulerSummary {
 
 export type RoutineRunProcessor = (runId: string) => Promise<void>
 
-export function shouldRunMaintenanceHeartbeat(now: Date): boolean {
-  return Number.isFinite(now.getTime()) && now.getUTCMinutes() % 15 === 0
-}
-
 function wrote(result: D1Result<unknown>): boolean {
   return Number(result.meta?.changes ?? 0) > 0
 }

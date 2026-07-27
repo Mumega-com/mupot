@@ -9,7 +9,6 @@ import {
   MAX_SCHEDULER_DB_STATEMENTS,
   recoverExpiredRoutineLeases,
   runRoutineScheduler,
-  shouldRunMaintenanceHeartbeat,
 } from '../src/routines/scheduler'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -126,16 +125,11 @@ describe('routine scheduler', () => {
     harness = undefined
   })
 
-  it('keeps existing maintenance work in canonical fifteen-minute buckets', () => {
-    expect(shouldRunMaintenanceHeartbeat(new Date('2026-07-19T16:00:00.000Z'))).toBe(true)
-    expect(shouldRunMaintenanceHeartbeat(new Date('2026-07-19T16:15:00.000Z'))).toBe(true)
-    expect(shouldRunMaintenanceHeartbeat(new Date('2026-07-19T16:14:00.000Z'))).toBe(false)
-    expect(shouldRunMaintenanceHeartbeat(new Date('invalid'))).toBe(false)
-  })
-
   it('tracks the one-minute Worker cron needed by the scheduler', () => {
     const config = readFileSync(join(import.meta.dirname, '..', 'wrangler.example.toml'), 'utf8')
-    expect(config).toContain('crons = ["* * * * *"]')
+    expect(config).toContain(
+      'crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]',
+    )
     expect(config).not.toContain('crons = ["*/15 * * * *"]')
   })
 
