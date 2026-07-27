@@ -220,7 +220,7 @@
     "optional-hermes-runtime"
   ],
   "acceptance": {
-    "testCount": 25,
+    "testCount": 26,
     "mechanismLockNeTrustLock": {
       "name": "mechanism-lock-ne-trust-lock",
       "description": "tests that lock a mechanism but not the trust it depends on — mayDistillFromSource enum fence is canonical example",
