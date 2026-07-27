@@ -20,6 +20,8 @@ jobs:
         run: npm audit --audit-level=high
       - name: Typecheck
         run: npm run typecheck
+      - name: Install Playwright browser for integration tests
+        run: npx playwright install --with-deps chromium
       - name: Test
         run: npm test
       - name: Fleet runtime tests
