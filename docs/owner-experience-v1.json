@@ -1,0 +1,115 @@
+{
+  "id": "owner-experience/v1",
+  "status": "design",
+  "spec": "docs/superpowers/specs/2026-07-27-owner-experience-unified-surface-design.md",
+  "thesis": "Owner owns the goal and the gate; the mubot owns execution and adaptation; one relationship with Talk, Know, and Watch facets bound to a single project outcome.",
+  "artifactRef": "4cb8d84f-b5b9-4a55-a47c-3af193161b19",
+  "facets": ["talk", "know", "watch"],
+  "loop": [
+    "goal",
+    "sense",
+    "rank",
+    "act",
+    "receipt",
+    "learn",
+    "adapt",
+    "gate"
+  ],
+  "principles": [
+    "one-face",
+    "goals-not-tasks",
+    "honest-by-construction",
+    "earned-autonomy",
+    "visible-learning",
+    "owner-owns-goals-and-gates"
+  ],
+  "invariants": [
+    "owner-owns-goal-mubot-cannot-redefine",
+    "owner-owns-gate-mubot-cannot-self-verdict",
+    "receipts-resolved-by-id-not-label",
+    "progress-never-fake-green",
+    "earned-autonomy-one-step-with-verified-wins",
+    "lesson-requires-receipt-id",
+    "talk-v1-tier1-mubot-only",
+    "learn-adapt-instinct-requires-port4-prerequisite",
+    "brain-remains-rank-not-act"
+  ],
+  "talk": {
+    "v1Runtime": "tier1_persistent_mubot",
+    "tier2Status": "dyad-gate-blocked",
+    "tier2AllowedOnlyAfter": "tier2-user-chat/v1-pass"
+  },
+  "trustLevels": [
+    { "level": 0, "autonomy": "suggest" },
+    { "level": 1, "autonomy": "draft" },
+    { "level": 2, "autonomy": "execute_with_approval" },
+    { "level": 3, "autonomy": "execute" }
+  ],
+  "earnedAutonomy": {
+    "maxStepsPerWiden": 1,
+    "defaultRequiredWins": 3,
+    "winVerification": "resolved_by_id",
+    "decider": "owner_or_admin_human",
+    "mubotSelfWiden": false
+  },
+  "progress": {
+    "allowedKinds": ["measured", "unmeasured", "unavailable"],
+    "forbidFakeGreen": true,
+    "unwiredSource": "unmeasured"
+  },
+  "unmetDependencies": [
+    {
+      "id": "tier2-user-chat",
+      "status": "dyad-gate-blocked",
+      "blocks": ["talk-facet-every-member"]
+    },
+    {
+      "id": "model-port-v2-tool-calling",
+      "status": "not-built",
+      "blocks": ["tier2-tool-loops"]
+    },
+    {
+      "id": "pot-monthly-model-ledger",
+      "status": "display-only",
+      "blocks": ["honest-talk-budget-story"]
+    },
+    {
+      "id": "per-project-docs-ui",
+      "status": "design-only",
+      "blocks": ["know-facet-full-editor"]
+    },
+    {
+      "id": "port-4-instinct-memory",
+      "status": "dormant-branch",
+      "blocks": ["learn-adapt-instinct"]
+    },
+    {
+      "id": "learning-ranker",
+      "status": "under-dyad-gate",
+      "blocks": ["learn-adapt-instinct"]
+    },
+    {
+      "id": "structured-project-outcome",
+      "status": "not-on-projects-table",
+      "blocks": ["outcome-strip"]
+    }
+  ],
+  "nonGoals": [
+    "route-in-this-design-commit",
+    "migration-applied-in-this-design-commit",
+    "ui-in-this-design-commit",
+    "merge-port4-or-ranker-from-this-worktree",
+    "pretend-modelport-v2-exists",
+    "cite-dormant-surfaces-as-reuse"
+  ],
+  "buildSlices": [
+    "outcome-model",
+    "owner-home-shell",
+    "trust-strip-gate-queue",
+    "earned-autonomy",
+    "visible-learning",
+    "talk-facet-tier2-after-pass",
+    "know-facet-docs-507",
+    "learn-adapt-instinct-after-port4"
+  ]
+}
