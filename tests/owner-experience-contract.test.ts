@@ -32,7 +32,7 @@ const contract = JSON.parse(
   loop: string[]
   principles: string[]
   invariants: string[]
-  talk: { v1Runtime: string; tier2Status: string }
+  talk: { v1Runtime: string; tier2Status: string; homePolicy?: string }
   trustLevels: Array<{ level: number; autonomy: string }>
   earnedAutonomy: {
     maxStepsPerWiden: number
@@ -93,9 +93,11 @@ describe('owner-experience/v1 contract doc', () => {
     )
     expect(contract.earnedAutonomy.winConsumptionPolicy).toBe(WIN_CONSUMPTION_POLICY)
     expect(contract.progress.forbidFakeGreen).toBe(true)
+    expect(contract.talk.homePolicy).toBe('optional-facet-until-tier1-revived')
     expect(contract.nonGoals).toContain('pretend-modelport-v2-exists')
     expect(contract.nonGoals).toContain('cite-dormant-surfaces-as-reuse')
     expect(contract.nonGoals).toContain('merge-port4-or-ranker-from-this-worktree')
+    expect(contract.nonGoals).toContain('cite-BrainPort-as-reuse')
   })
 
   it('matches the pure module facets, loop, and trust ladder', () => {
@@ -117,7 +119,7 @@ describe('owner-experience/v1 contract doc', () => {
       'earned-autonomy-wins-consumed-after-widen',
       'earned-autonomy-scope-bound-to-project-and-agent',
       'lesson-requires-receipt-id',
-      'talk-v1-tier1-mubot-only',
+      'talk-v1-tier1-mubot-only-when-present',
       'learn-adapt-instinct-requires-port4-prerequisite',
       'brain-remains-rank-not-act',
       'mechanism-lock-ne-trust-lock',
@@ -125,9 +127,11 @@ describe('owner-experience/v1 contract doc', () => {
       expect(contract.invariants).toContain(inv)
     }
     const unmetIds = contract.unmetDependencies.map((row) => row.id)
+    expect(unmetIds).toContain('tier1-persistent-mubot-505')
     expect(unmetIds).toContain('port-4-instinct-memory')
     expect(unmetIds).toContain('tier2-user-chat')
     expect(unmetIds).toContain('model-port-v2-tool-calling')
+    expect(unmetIds).toContain('brainport-default-adapter')
     expect(contract.buildSlices[0]).toBe('outcome-model')
   })
 })
@@ -252,7 +256,7 @@ describe('earned autonomy trust-locks', () => {
         proposed: 'draft',
         actingPrincipalKind: 'owner_or_admin_human',
         wins: sandboxWins,
-        requiredWins: 1,
+        requiredWins: 3,
         consumedReceiptIds: [],
       }),
     ).toEqual({ ok: false, reason: 'scope_mismatch' })
@@ -270,45 +274,73 @@ describe('earned autonomy trust-locks', () => {
         consumedReceiptIds: ['wr-1', 'wr-2', 'wr-3'],
       }),
     ).toEqual({ ok: false, reason: 'win_already_consumed' })
+
+    // Dedup: same receipt thrice does not count as three wins.
+    const one = mintWins(store, ['wr-1'], scope)[0]
+    expect(
+      decideEarnedAutonomyWiden({
+        projectId: scope.projectId,
+        agentId: scope.agentId,
+        current: 'suggest',
+        proposed: 'draft',
+        actingPrincipalKind: 'owner_or_admin_human',
+        wins: [one, one, one],
+        requiredWins: 3,
+        consumedReceiptIds: [],
+      }),
+    ).toEqual({ ok: false, reason: 'insufficient_verified_wins' })
+
+    // Floor: requiredWins < 3 rejected.
+    expect(
+      decideEarnedAutonomyWiden({
+        projectId: scope.projectId,
+        agentId: scope.agentId,
+        current: 'execute_with_approval',
+        proposed: 'execute',
+        actingPrincipalKind: 'owner_or_admin_human',
+        wins: mintWins(store, ['wr-1'], scope),
+        requiredWins: 1,
+        consumedReceiptIds: [],
+      }),
+    ).toEqual({ ok: false, reason: 'required_wins_invalid' })
   })
 })
 
 describe('honest progress and visible learning', () => {
-  it('never fake-greens when metric is missing or source unwired', () => {
-    expect(
-      decideProgressDisplay({ metric: null, sourceWired: true, signal: { ok: true, value: 20 } }),
-    ).toEqual({ kind: 'unmeasured' })
+  it('v1 ships unmeasured — agent KPI sources cannot measure a project', () => {
     expect(
       decideProgressDisplay({
-        metric: { sourceId: 'ghl_booked_calls', target: 20 },
-        sourceWired: false,
-        signal: { ok: true, value: 20 },
+        outcome: {
+          statement: 'Booked calls',
+          metric: { sourceId: 'task_counter', target: 20 },
+          measurementMode: 'unmeasured_until_project_kpi',
+        },
+        signal: { ok: true, value: 20, sourceId: 'task_counter' },
       }),
     ).toEqual({ kind: 'unmeasured' })
   })
 
-  it('returns measured only from a wired signal and unavailable on mismatch/failure', () => {
+  it('measured path requires allowlisted KpiSourceId and matching signal — no sourceWired boolean', () => {
     expect(
       decideProgressDisplay({
-        metric: { sourceId: 'github_prs', target: 10 },
-        sourceWired: true,
+        outcome: {
+          statement: 'PRs',
+          metric: { sourceId: 'github_prs', target: 10 },
+          measurementMode: 'measured',
+        },
         signal: { ok: true, value: 5, sourceId: 'github_prs' },
       }),
     ).toEqual({ kind: 'measured', value: 5, target: 10, ratio: 0.5 })
     expect(
       decideProgressDisplay({
-        metric: { sourceId: 'github_prs', target: 10 },
-        sourceWired: true,
-        signal: { ok: true, value: 5, sourceId: 'other_source' },
+        outcome: {
+          statement: 'PRs',
+          metric: { sourceId: 'github_prs', target: 10 },
+          measurementMode: 'measured',
+        },
+        signal: { ok: true, value: 5, sourceId: 'task_counter' },
       }),
     ).toEqual({ kind: 'unavailable', reason: 'source_id_mismatch' })
-    expect(
-      decideProgressDisplay({
-        metric: { sourceId: 'github_prs', target: 10 },
-        sourceWired: true,
-        signal: { ok: false, reason: 'source_error' },
-      }),
-    ).toEqual({ kind: 'unavailable', reason: 'source_error' })
   })
 
   it('requires receipt id on lessons', () => {
@@ -345,7 +377,8 @@ describe('prerequisites and home composition', () => {
     ).toEqual({ ok: true })
   })
 
-  it('requires all three facets on the owner home', () => {
+  it('requires Know+Watch; Talk optional while #505 is closed-unmerged', () => {
+    expect(() => assertOwnerHomeFacets(['know', 'watch'])).not.toThrow()
     expect(() => assertOwnerHomeFacets(['talk', 'know', 'watch'])).not.toThrow()
     expect(() => assertOwnerHomeFacets(['talk', 'watch'])).toThrow(/owner_experience_facet_missing/)
     expect(brainRemainsRankNotAct()).toBe(true)

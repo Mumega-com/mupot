@@ -93,16 +93,18 @@ These are acceptance *feelings*, not build slices. Every slice must preserve the
 | `lessons_capture` receipt | `src/projects/completion-gate.ts` | First visible-learning feed (project terminal) |
 | Agent `Autonomy` enum | `src/types.ts` `suggest\|draft\|execute\|execute_with_approval` | Trust strip vocabulary — **static dial today** |
 | `autonomyImpliesGate` | `src/org/service.ts` | Gate implication already enforced on task create |
-| BrainPort v1 (rank-only) | `src/types.ts` `BrainPort` | Rank step must stay rank-not-act |
-| Agent KPI helpers | `src/agents/kpi-sources.ts` (`task_counter`, `github_prs`) | Pattern for outcome measurement — **agent-scoped, not project-owner UX** |
-| Project memory MCP | `project_remember` / `project_recall` / `project_context` | Know facet store (same store docs must use — #507) |
 | `grant_agent_capability` | `src/mcp/provision.ts` | Manual capability path; earned-autonomy proposes, owner confirms |
+| Live task ranking | `src/tasks/ranking.ts` `rankTasks` (callers: mcp/index, tasks/index) | Rank facet interim surface until BrainPort default adapter exists |
+| Project memory MCP | `project_remember` / `project_recall` / `project_context` | Know facet store (same store docs must use — #507) |
 
 ### 3.2 Explicit unmet dependencies (not cited as reuse)
 
 | Dependency | Status | Consequence if ignored |
 |---|---|---|
-| **Tier-2 chat** (`tier2-user-chat/v1`) | Dyad-gate **BLOCK** (ModelPort v1 = bare string, no tools; `monthlyModelBudgetMicroUsd` display-only; fan-in on free-text marker) | Talk facet for *every member* cannot ship on Tier-2 until that design amends. **Talk v1 uses Tier-1 mubot (#505) only.** |
+| **Tier-1 persistent mubot chat (#505)** | PR **CLOSED unmerged**; no `src/chat`; no successor | Talk facet has **zero** implementation. **Decision: Talk is OPTIONAL on owner home** until #505 is revived or replaced. Slice 2 ships Know+Watch; `assertOwnerHomeFacets` requires only those two. |
+| **Tier-2 chat** (`tier2-user-chat/v1`) | Dyad-gate **BLOCK** | Talk for every member cannot ship on Tier-2 until that design amends. |
+| **BrainPort default adapter** | Type-only SEALED; zero implementations / zero callers | Do **not** cite BrainPort under reuse. Rank step maps to live `rankTasks` interim, or waits for ranker's `brainport-default-adapter` slice. |
+| **Project-scoped KPI source** | Not built (`task_counter`/`github_prs` are agent/tenant scoped) | v1 Outcome progress is **`unmeasured_until_project_kpi`** — never render measured from wrong-scope sources. |
 | **ModelPort v2 (tool-calling)** | Named breaking change in `types.ts`; **not built** | Do not plan owner-chat tool loops against ModelPort v1. |
 | **Pot monthly model ledger** | Plan field is display-only; live meter is per-agent/day | Any Talk budget story must name a real debit path or stay out of this epic. |
 | **Per-project Docs UI (#507)** | Design only | Know facet starts as memory read/write via existing MCP + a thin viewer; full MDX editor is a later docs slice. |
@@ -110,6 +112,7 @@ These are acceptance *feelings*, not build slices. Every slice must preserve the
 | **Learning ranker design** | Under dyad-gate / hold | Adapt-by-instinct is out of scope until that gate PASSes and Port-4 is live. Until then Adapt = board plan changes + situation `next_action` only. |
 | **Structured project Outcome / KpiSpec** | Not on `projects` (only free-text `goal`) | Slice 1 must add it; do not pretend `projects.goal` is a measurable north-star. |
 | **Automatic earned-autonomy widener** | Not built (`Autonomy` is a static column) | Slice 4 introduces propose-widen from verified wins; never auto-blanket keys. |
+| **Project concierge** | Existing surface | Remains a deep-link into owner home facets — not a fourth panel; no parallel UX. |
 
 > **Generalizable rule (from Tier-2 dyad-gate):** a "reuse" table entry must have a
 > *caller on an enforcement path*. Existence, a type, or a dashboard display is

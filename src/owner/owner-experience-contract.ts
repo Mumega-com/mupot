@@ -48,6 +48,13 @@ export const OWNER_TRUST_LADDER: readonly Autonomy[] = [
 ]
 
 export const DEFAULT_REQUIRED_WINS_PER_WIDEN = 3
+export const MIN_REQUIRED_WINS_PER_WIDEN = 3
+
+export type KpiSourceId = 'task_counter' | 'github_prs'
+export const KPI_SOURCE_IDS: readonly KpiSourceId[] = ['task_counter', 'github_prs']
+export function isKpiSourceId(v: unknown): v is KpiSourceId {
+  return typeof v === 'string' && (KPI_SOURCE_IDS as readonly string[]).includes(v)
+}
 
 /**
  * Rate/consumption story (named, not implied):
@@ -198,8 +205,16 @@ export type ProgressDisplay =
   | { kind: 'unavailable'; reason: string }
 
 export interface OutcomeMetricSpec {
-  sourceId: string
+  sourceId: KpiSourceId
   target: number
+}
+
+/** Structured north-star — not free-text projects.goal. */
+export interface Outcome {
+  statement: string
+  metric: OutcomeMetricSpec | null
+  /** v1: existing agent KPI sources cannot measure a project → unmeasured. */
+  measurementMode: 'unmeasured_until_project_kpi' | 'measured'
 }
 
 export interface LessonDraft {
@@ -299,7 +314,7 @@ export function decideEarnedAutonomyWiden(
   if (!isAutonomy(input.current) || !isAutonomy(input.proposed)) {
     return { ok: false, reason: 'invalid_autonomy' }
   }
-  if (!Number.isInteger(input.requiredWins) || input.requiredWins < 1) {
+  if (!Number.isInteger(input.requiredWins) || input.requiredWins < MIN_REQUIRED_WINS_PER_WIDEN) {
     return { ok: false, reason: 'required_wins_invalid' }
   }
 
@@ -312,6 +327,7 @@ export function decideEarnedAutonomyWiden(
     (input.consumedReceiptIds || []).map((id) => String(id).trim()).filter(Boolean),
   )
   const accepted: VerifiedWinRef[] = []
+  const seenIds = new Set<string>()
 
   for (const win of input.wins) {
     if (!isBrandedWinRef(win)) {
@@ -319,6 +335,9 @@ export function decideEarnedAutonomyWiden(
     }
     if (!win.receiptId.trim()) {
       return { ok: false, reason: 'unverified_win_label' }
+    }
+    if (seenIds.has(win.receiptId)) {
+      continue // dedup — one receipt counts once
     }
     if (win.projectId !== projectId || win.agentId !== agentId) {
       return { ok: false, reason: 'scope_mismatch' }
@@ -329,6 +348,7 @@ export function decideEarnedAutonomyWiden(
     if (consumed.has(win.receiptId)) {
       return { ok: false, reason: 'win_already_consumed' }
     }
+    seenIds.add(win.receiptId)
     accepted.push(win)
   }
 
@@ -347,33 +367,34 @@ export function decideEarnedAutonomyWiden(
 }
 
 /**
- * Honest progress display. Unwired / missing metric ⇒ unmeasured.
+ * Honest progress display. Unwired / missing / non-allowlisted metric ⇒ unmeasured.
  * Never invents a green measured bar from absent data.
- * Optional: signal.sourceId must match metric.sourceId when both present.
+ * Caller `sourceWired` boolean REMOVED — wired-ness derived from KpiSourceId allowlist.
+ * v1 `unmeasured_until_project_kpi` always returns unmeasured (existing KPI sources
+ * are agent-scoped, not project-owner UX — BLOCK-B).
  */
 export function decideProgressDisplay(input: {
-  metric: OutcomeMetricSpec | null
-  sourceWired: boolean
+  outcome: Outcome
   signal:
-    | { ok: true; value: number; sourceId?: string }
+    | { ok: true; value: number; sourceId: KpiSourceId }
     | { ok: false; reason: string }
     | null
 }): ProgressDisplay {
-  if (input.metric === null || !input.sourceWired) return { kind: 'unmeasured' }
+  if (input.outcome.measurementMode === 'unmeasured_until_project_kpi') {
+    return { kind: 'unmeasured' }
+  }
+  if (input.outcome.metric === null) return { kind: 'unmeasured' }
+  if (!isKpiSourceId(input.outcome.metric.sourceId)) return { kind: 'unmeasured' }
   if (input.signal === null) {
     return { kind: 'unavailable', reason: 'signal_missing' }
   }
   if (!input.signal.ok) {
     return { kind: 'unavailable', reason: input.signal.reason }
   }
-  if (
-    typeof input.signal.sourceId === 'string' &&
-    input.signal.sourceId.trim().length > 0 &&
-    input.signal.sourceId !== input.metric.sourceId
-  ) {
+  if (input.signal.sourceId !== input.outcome.metric.sourceId) {
     return { kind: 'unavailable', reason: 'source_id_mismatch' }
   }
-  const target = input.metric.target
+  const target = input.outcome.metric.target
   if (!(target > 0)) {
     return { kind: 'unavailable', reason: 'invalid_target' }
   }
@@ -425,9 +446,12 @@ export function mayEnableInstinctAdapt(prereq: {
   return { ok: true }
 }
 
-/** Owner home must expose all three facets for a coherent experience. */
+/** Facets Know+Watch are required for v1 home; Talk is OPTIONAL until #505 is revived. */
+export const OWNER_HOME_REQUIRED_FACETS = ['know', 'watch'] as const
+
+/** Owner home must expose Know+Watch. Talk is optional while Tier-1 #505 is closed-unmerged. */
 export function assertOwnerHomeFacets(facets: readonly string[]): void {
-  for (const required of OWNER_EXPERIENCE_FACETS) {
+  for (const required of OWNER_HOME_REQUIRED_FACETS) {
     if (!facets.includes(required)) {
       throw new Error(`owner_experience_facet_missing: ${required}`)
     }
