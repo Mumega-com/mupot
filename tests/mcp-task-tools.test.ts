@@ -678,6 +678,43 @@ describe('MCP task cutover tools', () => {
     expect(result.task.gate_owner).toBe('gate:content')
   })
 
+  it('task_update keeps historical ungated review repair locked for members', async () => {
+    const { env, updates } = makeEnv([task({ status: 'review', gate_owner: null })])
+
+    const res = await invokeTool(
+      auth(),
+      env,
+      'task_update',
+      { task_id: 'task-1', gate_owner: 'gate:content' },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('gate_owner_locked')
+    expect(updates).toHaveLength(0)
+  })
+
+  it('task_update lets an org-admin workspace token repair a historical review task with no gate_owner', async () => {
+    const { env } = makeEnv([task({ status: 'review', gate_owner: null })])
+
+    const res = await invokeTool(
+      auth({
+        capabilities: [
+          { member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' },
+        ],
+      }),
+      env,
+      'task_update',
+      { task_id: 'task-1', gate_owner: 'gate:content' },
+      'https://pot.example',
+    )
+
+    expect(res.ok).toBe(true)
+    const result = res.result as { task: Task }
+    expect(result.task.status).toBe('review')
+    expect(result.task.gate_owner).toBe('gate:content')
+  })
+
   // ── review-wake (S### — wake the gate_owner instead of a hand relay) ─────────
   // Entering 'review' with a gate_owner resolves the capability to its SOLE agent
   // holder in gate_grants and wakes it: an agent.wake BusEvent (mirrors
