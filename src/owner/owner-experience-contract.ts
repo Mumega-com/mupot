@@ -57,6 +57,18 @@ export function isKpiSourceId(v: unknown): v is KpiSourceId {
 }
 
 /**
+ * Sources allowed to produce `measurementMode: 'measured'`. Empty in v1 by
+ * construction: `task_counter` / `github_prs` are agent/tenant scoped, not
+ * project scoped, so neither can honestly measure a project Outcome. Adding
+ * a real project-scoped source later means adding it here — not flipping a
+ * caller-asserted boolean. See BLOCK-B (owner-experience dyad-gate).
+ */
+export const PROJECT_SCOPED_KPI_SOURCE_IDS: readonly KpiSourceId[] = []
+export function isProjectScopedKpiSourceId(v: KpiSourceId): boolean {
+  return (PROJECT_SCOPED_KPI_SOURCE_IDS as readonly string[]).includes(v)
+}
+
+/**
  * Rate/consumption story (named, not implied):
  * Successful widen returns consumeReceiptIds; those ids must be passed back in
  * consumedReceiptIds on later calls so the same three wins cannot walk the
@@ -380,6 +392,11 @@ export function decideEarnedAutonomyWiden(
  * Caller `sourceWired` boolean REMOVED — wired-ness derived from KpiSourceId allowlist.
  * v1 `unmeasured_until_project_kpi` always returns unmeasured (existing KPI sources
  * are agent-scoped, not project-owner UX — BLOCK-B).
+ * `measurementMode: 'measured'` is additionally gated on
+ * `PROJECT_SCOPED_KPI_SOURCE_IDS` membership, which is empty in v1 — so
+ * `'measured'` is unreachable by construction, not just by convention. No
+ * caller-asserted `measurementMode` string can produce a green bar from
+ * `task_counter` / `github_prs`.
  */
 export function decideProgressDisplay(input: {
   outcome: Outcome
@@ -393,6 +410,7 @@ export function decideProgressDisplay(input: {
   }
   if (input.outcome.metric === null) return { kind: 'unmeasured' }
   if (!isKpiSourceId(input.outcome.metric.sourceId)) return { kind: 'unmeasured' }
+  if (!isProjectScopedKpiSourceId(input.outcome.metric.sourceId)) return { kind: 'unmeasured' }
   if (input.signal === null) {
     return { kind: 'unavailable', reason: 'signal_missing' }
   }

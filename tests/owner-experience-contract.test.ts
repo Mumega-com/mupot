@@ -1,11 +1,15 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
+import { AUTONOMIES } from '../src/types'
 import {
   DEFAULT_REQUIRED_WINS_PER_WIDEN,
+  MIN_REQUIRED_WINS_PER_WIDEN,
   OWNER_EXPERIENCE_FACETS,
   OWNER_EXPERIENCE_LOOP,
   OWNER_EXPERIENCE_PRINCIPLES,
+  OWNER_HOME_REQUIRED_FACETS,
   OWNER_TRUST_LADDER,
+  PROJECT_SCOPED_KPI_SOURCE_IDS,
   WIN_CONSUMPTION_POLICY,
   assertOwnerHomeFacets,
   assertTalkV1Runtime,
@@ -20,14 +24,20 @@ import {
   trustLevelForAutonomy,
   validateLessonDraft,
   verifiedWinRefFromResolver,
+  type KpiSourceId,
+  type PermissionCallerKind,
   type WinReceiptResolver,
 } from '../src/owner/owner-experience-contract'
+
+/** Design-lifecycle statuses this contract doc may legitimately carry. */
+const ALLOWED_CONTRACT_STATUSES = ['design', 'reviewing', 'ready-for-build', 'approved'] as const
 
 const contract = JSON.parse(
   readFileSync(new URL('../docs/owner-experience-v1.json', import.meta.url), 'utf8'),
 ) as {
   id: string
   status: string
+  homeRequiredFacets: string[]
   facets: string[]
   loop: string[]
   principles: string[]
@@ -37,11 +47,18 @@ const contract = JSON.parse(
   earnedAutonomy: {
     maxStepsPerWiden: number
     defaultRequiredWins: number
+    minRequiredWins: number
     winVerification: string
+    winConstructor: string
     mubotSelfWiden: boolean
     winConsumptionPolicy: string
   }
-  progress: { allowedKinds: string[]; forbidFakeGreen: boolean }
+  progress: {
+    allowedKinds: string[]
+    forbidFakeGreen: boolean
+    projectScopedKpiSourceIds: string[]
+    measuredUnreachableInV1: boolean
+  }
   unmetDependencies: Array<{ id: string; status: string }>
   nonGoals: string[]
   buildSlices: string[]
@@ -84,7 +101,7 @@ const store: WinReceiptResolver = (id) => {
 describe('owner-experience/v1 contract doc', () => {
   it('is the design-status owner-experience contract', () => {
     expect(contract.id).toBe('owner-experience/v1')
-    expect(contract.status).toBe('design')
+    expect(ALLOWED_CONTRACT_STATUSES).toContain(contract.status)
     expect(contract.talk.v1Runtime).toBe('tier1_persistent_mubot')
     expect(contract.talk.tier2Status).toBe('dyad-gate-blocked')
     expect(contract.earnedAutonomy.mubotSelfWiden).toBe(false)
@@ -102,11 +119,20 @@ describe('owner-experience/v1 contract doc', () => {
 
   it('matches the pure module facets, loop, and trust ladder', () => {
     expect(contract.facets).toEqual([...OWNER_EXPERIENCE_FACETS])
+    expect(contract.homeRequiredFacets).toEqual([...OWNER_HOME_REQUIRED_FACETS])
     expect(contract.loop).toEqual([...OWNER_EXPERIENCE_LOOP])
     expect(contract.principles).toEqual([...OWNER_EXPERIENCE_PRINCIPLES])
     expect(contract.earnedAutonomy.defaultRequiredWins).toBe(DEFAULT_REQUIRED_WINS_PER_WIDEN)
+    expect(contract.earnedAutonomy.minRequiredWins).toBe(MIN_REQUIRED_WINS_PER_WIDEN)
     expect(contract.earnedAutonomy.maxStepsPerWiden).toBe(1)
+    expect(contract.earnedAutonomy.winConstructor).toBe(verifiedWinRefFromResolver.name)
     expect(contract.trustLevels.map((row) => row.autonomy)).toEqual([...OWNER_TRUST_LADDER])
+  })
+
+  it('locks measured-unreachable-in-v1 JSON fields against the TS allowlist constant', () => {
+    expect(contract.progress.projectScopedKpiSourceIds).toEqual([...PROJECT_SCOPED_KPI_SOURCE_IDS])
+    expect(PROJECT_SCOPED_KPI_SOURCE_IDS).toEqual([])
+    expect(contract.progress.measuredUnreachableInV1).toBe(true)
   })
 
   it('locks the load-bearing invariants and names unmet dependencies', () => {
@@ -144,6 +170,16 @@ describe('owner goal and gate ownership', () => {
     expect(mayMubotSelfVerdictGate('owner_or_admin_human')).toBe(false)
   })
 
+  it('throws on an invalid callerKind instead of silently returning false (mutation-proven branch)', () => {
+    const invalidCallerKind = 'superadmin' as unknown as PermissionCallerKind
+    expect(() => mayMubotRedefineGoal(invalidCallerKind)).toThrow(
+      /owner_experience_unknown_caller_kind/,
+    )
+    expect(() => mayMubotSelfVerdictGate(invalidCallerKind)).toThrow(
+      /owner_experience_unknown_caller_kind/,
+    )
+  })
+
   it('allows Talk v1 only for Tier-1 mubot runtime', () => {
     expect(isTalkV1Runtime('tier1_persistent_mubot')).toBe(true)
     expect(isTalkV1Runtime('tier2_stateless_user_chat')).toBe(false)
@@ -159,6 +195,11 @@ describe('earned autonomy trust-locks', () => {
     expect(trustLevelForAutonomy('suggest')).toBe(0)
     expect(trustLevelForAutonomy('execute')).toBe(3)
     expect(autonomyForTrustLevel(2)).toBe('execute_with_approval')
+  })
+
+  it('drift-locks OWNER_TRUST_LADDER against the canonical AUTONOMIES set (order may differ, membership must not)', () => {
+    expect(OWNER_TRUST_LADDER.length).toBe(AUTONOMIES.length)
+    expect(new Set(OWNER_TRUST_LADDER)).toEqual(new Set(AUTONOMIES))
   })
 
   it('refuses caller-written resolved_by_id labels and forged brands (WeakSet)', () => {
@@ -342,27 +383,38 @@ describe('honest progress and visible learning', () => {
     ).toEqual({ kind: 'unmeasured' })
   })
 
-  it('measured path requires allowlisted KpiSourceId and matching signal — no sourceWired boolean', () => {
+  it('measurementMode "measured" is unreachable in v1 by construction — PROJECT_SCOPED_KPI_SOURCE_IDS is empty', () => {
+    expect(PROJECT_SCOPED_KPI_SOURCE_IDS.length).toBe(0)
+    // Every allowlisted KpiSourceId is still agent/tenant scoped, not project
+    // scoped — a matching signal on an allowlisted source must NOT produce a
+    // green bar. This is the exact wrong-scope case BLOCK-B was about.
+    for (const sourceId of ['github_prs', 'task_counter'] as const) {
+      expect(
+        decideProgressDisplay({
+          outcome: {
+            statement: 'PRs',
+            metric: { sourceId, target: 10 },
+            measurementMode: 'measured',
+          },
+          signal: { ok: true, value: 5, sourceId },
+        }),
+      ).toEqual({ kind: 'unmeasured' })
+    }
+  })
+
+  it('requires KpiSourceId allowlist membership (G7) — a non-allowlisted id is refused, not just a wrong-scope one', () => {
     expect(
       decideProgressDisplay({
         outcome: {
-          statement: 'PRs',
-          metric: { sourceId: 'github_prs', target: 10 },
+          statement: 'Booked calls',
+          // Deliberately not a member of KpiSourceId — proves isKpiSourceId
+          // itself rejects unknown ids, independent of the v1 project-scope gate.
+          metric: { sourceId: 'ghl_booked_calls' as unknown as KpiSourceId, target: 10 },
           measurementMode: 'measured',
         },
-        signal: { ok: true, value: 5, sourceId: 'github_prs' },
+        signal: null,
       }),
-    ).toEqual({ kind: 'measured', value: 5, target: 10, ratio: 0.5 })
-    expect(
-      decideProgressDisplay({
-        outcome: {
-          statement: 'PRs',
-          metric: { sourceId: 'github_prs', target: 10 },
-          measurementMode: 'measured',
-        },
-        signal: { ok: true, value: 5, sourceId: 'task_counter' },
-      }),
-    ).toEqual({ kind: 'unavailable', reason: 'source_id_mismatch' })
+    ).toEqual({ kind: 'unmeasured' })
   })
 
   it('requires receipt id on lessons', () => {
