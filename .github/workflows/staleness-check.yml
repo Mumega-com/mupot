@@ -38,6 +38,15 @@ jobs:
           node-version: 22
 
       - name: Compare live pots vs main HEAD
+        # shell: bash is required (not just cosmetic) — GitHub Actions' IMPLICIT
+        # default shell on Linux runs `bash -e {0}` WITHOUT `pipefail`, so
+        # `node ... | tee ...` would report the exit code of `tee` (always 0)
+        # instead of `node`'s. Declaring `shell: bash` explicitly switches to
+        # `bash --noprofile --norc -eo pipefail {0}`, which DOES set pipefail —
+        # verified empirically, see mupot fix/571-integrity-hotfix. Without
+        # this, a drifted/unstamped/unreachable pot would tee its ✘ report into
+        # the step summary and the job would still go green.
+        shell: bash
         env:
           # GITHUB_REF_NAME is already set by Actions for every event
           # (schedule AND workflow_dispatch); passed through explicitly so
