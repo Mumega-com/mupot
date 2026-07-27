@@ -81,3 +81,13 @@ jobs:
           node-version: 22
       - name: Guard — no secrets in this public template
         run: node scripts/no-secrets.mjs
+
+  design-status-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Guard — design status only in design-only contracts
+        run: node scripts/design-status-contract-policy.mjs
