@@ -110,6 +110,12 @@ function nonce(body: string, routineId: string): string {
   return match[1]
 }
 
+function jsonScript(body: string, id: string): unknown {
+  const match = body.match(new RegExp(`<script type="application/json" id="${id}">([^<]*)</script>`))
+  if (!match) throw new Error(`missing JSON script ${id}`)
+  return JSON.parse(match[1])
+}
+
 describe('Project Routines dashboard', () => {
   let harness: SqliteD1Harness | undefined
 
@@ -150,6 +156,35 @@ describe('Project Routines dashboard', () => {
     const detailBody = await detail.text()
     expect(detailBody).toContain('Run detail: run-waiting')
     expect(detailBody).toContain('Cancel run')
+    expect(jsonScript(detailBody, 'routine-run-json')).toEqual({
+      id: 'run-waiting',
+      project_id: 'project-a',
+      routine_id: 'routine-enabled',
+      routine_revision: 2,
+      trigger_kind: 'cron',
+      scheduled_for: '2026-07-20T10:00:00.000Z',
+      status: 'waiting',
+      waiting_reason: 'review',
+      attempt: 1,
+      assigned_agent_id: 'agent-a',
+      task_id: null,
+      flight_id: null,
+      result_summary: null,
+      cost_micro_usd: 1200,
+      started_at: null,
+      finished_at: null,
+      created_at: '2026-07-19T11:00:00.000Z',
+      updated_at: '2026-07-19T11:00:00.000Z',
+    })
+    for (const internalField of [
+      'tenant', 'policy_json', 'occurrence_key', 'lease_owner', 'lease_expires_at',
+      'retry_at', 'situation_digest', 'proposal_json',
+    ]) {
+      expect(jsonScript(detailBody, 'routine-run-json')).not.toHaveProperty(internalField)
+    }
+
+    const noSelection = await dashboardApp.fetch(new Request('https://pot.test/projects/project-a/routines'), env)
+    expect(await noSelection.text()).not.toContain('id="routine-run-json"')
 
     harness.sqlite.exec(`
       INSERT INTO routine_run_events (id, tenant, project_id, run_id, kind, actor_type, actor_id, occurred_at, metadata_json, correlation_id)

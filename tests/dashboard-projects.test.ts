@@ -958,8 +958,18 @@ describe('project dashboard renderers', () => {
 
   it('uses semantic anchor tabs and renders authoritative Activity and Evidence projections', async () => {
     harness = makeHarness()
+    harness.sqlite.prepare(`
+      UPDATE tasks
+         SET title = ?, result = ?
+       WHERE id = 'visible-task'
+    `).run(
+      'Visible task </script><script>alert("activity")</script>',
+      'Verified </script><script>alert("evidence")</script>',
+    )
     const view = await loadProjectDetail(envFor(harness), actor({ role: 'owner' }), 'visible-child')
     const body = await render(projectDetailBody(view!))
+    const activityMatch = body.match(/<script type="application\/json" id="project-activity-json">([^<]*)<\/script>/)
+    const evidenceMatch = body.match(/<script type="application\/json" id="project-evidence-json">([^<]*)<\/script>/)
 
     expect(body).toMatch(/<nav[^>]+aria-label="Project sections"/)
     expect(body).toContain('href="#overview" aria-current="page"')
@@ -969,7 +979,7 @@ describe('project dashboard renderers', () => {
     expect(body).toContain('href="#activity"')
     expect(body).toContain('href="#evidence"')
     expect(body).toContain('Coordinate &lt;safely&gt;')
-    expect(body).toContain('Verified &amp; retained &lt;result&gt;')
+    expect(body).toContain('Verified &lt;/script&gt;&lt;script&gt;alert(&quot;evidence&quot;)&lt;/script&gt;')
     expect(body).toContain('workflow receipt')
     expect(body).not.toContain('No project activity yet')
     expect(body).not.toContain('No project evidence yet')
@@ -980,6 +990,16 @@ describe('project dashboard renderers', () => {
     expect(body).toContain("window.addEventListener('hashchange', syncProjectTab)")
     expect(body).toContain("link.setAttribute('aria-current', 'page')")
     expect(body).toContain("link.removeAttribute('aria-current')")
+    expect(activityMatch).not.toBeNull()
+    expect(evidenceMatch).not.toBeNull()
+    expect(JSON.parse(activityMatch![1]!)).toEqual({ rows: view!.activity.rows })
+    expect(JSON.parse(evidenceMatch![1]!)).toEqual({ rows: view!.evidence.rows })
+    expect(activityMatch![1]).not.toContain('<')
+    expect(evidenceMatch![1]).not.toContain('<')
+    expect(JSON.parse(activityMatch![1]!)).not.toHaveProperty('hasMore')
+    expect(JSON.parse(activityMatch![1]!)).not.toHaveProperty('nextCursor')
+    expect(JSON.parse(evidenceMatch![1]!)).not.toHaveProperty('hasMore')
+    expect(JSON.parse(evidenceMatch![1]!)).not.toHaveProperty('nextCursor')
   })
 
   it('filters task authorization before applying the bounded detail sample', async () => {

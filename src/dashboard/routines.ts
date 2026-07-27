@@ -12,6 +12,7 @@ import {
   type RoutineCursor,
   type RoutineRunEvent,
 } from '../routines/service'
+import { publicRoutineRun } from '../routines/public'
 import type { Routine, RoutineRun } from '../routines/types'
 import { getRoutinePendingQuestion, type RoutinePendingQuestion } from '../routines/actions'
 import { pageHeader, pill, sectionPanel } from './ui'
@@ -454,7 +455,8 @@ function detailRunPanel(view: RoutineWorkspaceView, projectPath: string): Html {
   if (!run) return html``
   return sectionPanel({
     title: `Run detail: ${run.id}`,
-    body: html`<div id="run-activity" style="display:grid;gap:8px;">
+    body: html`<script type="application/json" id="routine-run-json">${raw(jsonScript(publicRoutineRun(run)))}</script>
+    <div id="run-activity" style="display:grid;gap:8px;">
       <div>${pill(runState(run), runTone(run))} · attempt ${run.attempt} · ${run.trigger_kind}</div>
       <div class="ui-panel-sub">Task ${run.task_id ?? 'none'} · Flight ${run.flight_id ?? 'none'} · Agent ${run.assigned_agent_id ?? 'unassigned'}</div>
       <div>${run.result_summary ?? 'No terminal summary'} · ${run.cost_micro_usd} micro USD</div>
@@ -474,6 +476,13 @@ function detailRunPanel(view: RoutineWorkspaceView, projectPath: string): Html {
       <ul style="margin:0;padding-left:1.2rem;">${view.detailEvents.map(event => html`<li>${event.occurred_at} · ${title(event.kind)} · ${event.actor_type}:${event.actor_id}</li>`)}</ul>
     </div>`,
   })
+}
+
+function jsonScript(value: unknown): string {
+  return JSON.stringify(value)
+    .replaceAll('<', '\\u003c')
+    .replaceAll('>', '\\u003e')
+    .replaceAll('&', '\\u0026')
 }
 
 function detailRoutinePanel(view: RoutineWorkspaceView, projectPath: string): Html {

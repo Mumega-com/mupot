@@ -1428,6 +1428,8 @@ export function projectDetailBody(view: ProjectDetailView, statusResult?: string
     ${view.canManage ? html`<div style="display:flex;justify-content:flex-end;margin:8px 0;"><a class="btn secondary sm" href="/projects/${encodeURIComponent(project.id)}/settings">Project settings</a></div>` : ''}
     ${projectTabs(project.id)}
     <script type="application/json" id="project-situation-json">${raw(jsonScript(situation))}</script>
+    <script type="application/json" id="project-activity-json">${raw(jsonScript({ rows: view.activity.rows }))}</script>
+    <script type="application/json" id="project-evidence-json">${raw(jsonScript({ rows: view.evidence.rows }))}</script>
     ${operatingSituationBand(project, aggregates, situation)}
     <section id="work" aria-label="Work">
       ${sectionPanel({
