@@ -84,12 +84,12 @@ describe('DME integration runbook', () => {
 })
 
 describe('DME integration release receipt', () => {
-  it('keeps the v0.24 receipt immutable while the tree advances compatibly', () => {
+  it('keeps the v0.24 addon lifecycle identity and receipt immutable', () => {
     expect(pkg.version).toBe('0.25.0')
     expect(versionSource).toContain("MUPOT_PUBLIC_API_VERSION = '0.25.0'")
     expect(addonManifest).toContain("key: 'project-link'")
-    expect(addonManifest).toContain("version: '1.1.0'")
-    expect(addonManifest).toContain("mupotCompatibility: '^0.25.0'")
+    expect(addonManifest).toContain("version: '1.0.0'")
+    expect(addonManifest).toContain("mupotCompatibility: '^0.24.0'")
     expect(receipt).toContain('`0.24.0`')
     expect(receipt).toContain('`1.0.0`')
     expect(receipt).toContain('`^0.24.0`')

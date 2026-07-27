@@ -41,8 +41,8 @@ human decisions in one queue without turning Mupot into an agent harness.
   so Cloudflare invocation budgets do not silently drop project work (#579, #582).
 - Historical review tasks created without a gate owner can be repaired by an owner or
   admin through either REST or MCP; ordinary members cannot rewrite locked gates (#343).
-- Built-in addons advance to `1.1.0` with explicit `^0.25.0` host compatibility while
-  prior v0.24 integration receipts remain immutable.
+- Compiled native addons retain their digest-bound v0.24 lifecycle identity across the
+  additive v0.25 host minor; external addon compatibility remains strict.
 - Console consolidation remains planned for v0.26 under #584. It is not claimed as a
   v0.25 feature.
 

@@ -26,10 +26,10 @@ export const MarketingCroMonitorAddon = deepFreeze<AddonManifestV1>({
   schema: 'mupot.addon/v1',
   key: 'marketing-cro-monitor',
   name: 'Marketing & CRO Monitor',
-  version: '1.1.0',
+  version: '1.0.0',
   publisher: 'mumega',
   trustClass: 'native_reviewed',
-  mupotCompatibility: '^0.25.0',
+  mupotCompatibility: '^0.24.0',
   kind: 'native',
   description: 'Read-only marketing and conversion monitoring.',
   departments: [
