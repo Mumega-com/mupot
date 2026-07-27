@@ -221,10 +221,15 @@ Distill inputs resolve receipts **by ID through an injected
 `verifiedReceiptRefFromResolver(resolver, receiptId, projectId)`, which returns
 a branded `VerifiedReceiptRef` carrying **resolved content** (projectId,
 resolvedAt, sanitizedContent, corroborating ids) — not a self-describing tag.
-Never accept a caller-supplied free-string `source` label or a
+The brand key is an **unexported `unique symbol`** (external code cannot
+produce it; a zero-cast forge literal fails `tsc --strict`). Runtime
+provenance is a `WeakSet` registry populated only by the mint path, plus
+`Object.freeze` — so `as VerifiedReceiptRef` casts still refuse. Never accept
+a caller-supplied free-string `source` label or a
 `{verifiedAgainstStore:true}` boolean bag as the object of trust.
 `mayDistillFromSource(source: string)` checking an enum is a contract fence
-only (mechanism-lock); the resolver + brand is the trust-lock.
+only (mechanism-lock); the resolver + unforgeable brand + WeakSet is the
+trust-lock.
 
 **Corroboration before ANY inject:** a single fresh observation at
 `confidence: 0.85` must not clear the 0.7 inject threshold without ≥2

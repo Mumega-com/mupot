@@ -136,11 +136,11 @@
     "reason": "random sampling breaks determinism-same-inputs-same-rank"
   },
   "distill": {
-    "receiptResolution": "branded-VerifiedReceiptRef-only-from-injected-ReceiptStoreResolver-with-resolved-content-boolean-bag-rejected",
+    "receiptResolution": "unexported-unique-symbol-VerifiedReceiptRef-only-from-injected-ReceiptStoreResolver-with-resolved-content-boolean-bag-rejected",
     "corroborationRequiredBeforeInject": true,
     "corroborationIndependence": "distinct-agentId-OR-distinct-incidentId-string-diversity-structural-limit-full-independence-needs-store",
-    "contentSanitization": "schema-constrained-JSON-evidence-field-only-discard-rest",
-    "verifiedReceiptProvenance": "WeakSet-registry-populated-only-by-verifiedReceiptRefFromResolver",
+    "contentSanitization": "schema-constrained-JSON-evidence-field-only-discard-rest-prefix-lines-empty",
+    "verifiedReceiptProvenance": "WeakSet-registry-plus-unexported-unique-symbol-Object.freeze-mint-only",
     "parseIsTrustBoundary": true,
     "allowedSources": [
       "gate_fail_receipt",
@@ -212,7 +212,7 @@
     "optional-hermes-runtime"
   ],
   "acceptance": {
-    "testCount": 20,
+    "testCount": 21,
     "mechanismLockNeTrustLock": {
       "name": "mechanism-lock-ne-trust-lock",
       "description": "tests that lock a mechanism but not the trust it depends on — mayDistillFromSource enum fence is canonical example",
