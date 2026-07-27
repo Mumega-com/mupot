@@ -100,6 +100,23 @@ describe('production self-hosting runbook', () => {
     expect(runbook).toContain('npm run receipt:fresh-install:check -- \\\n  --summary')
   })
 
+  // mupot#571 fix 4 — the restore path must go through the stamped deploy
+  // wrapper (scripts/deploy.mjs), never a bare `wrangler deploy`. A restored
+  // pot that skips the wrapper deploys unstamped (or with a stale RELEASE_SHA
+  // left over from before the restore), which the staleness detector cannot
+  // see because it only reads GET /health.
+  it('routes the restore deploy through the stamped scripts/deploy.mjs wrapper, not a bare wrangler deploy', () => {
+    const restoreStart = runbook.indexOf('## Restore')
+    expect(restoreStart).toBeGreaterThan(-1)
+    const nextHeading = runbook.indexOf('\n## ', restoreStart + 1)
+    const restoreSection = nextHeading === -1 ? runbook.slice(restoreStart) : runbook.slice(restoreStart, nextHeading)
+
+    expect(restoreSection).toContain('node scripts/deploy.mjs --config "$RESTORE_CONFIG"')
+    expect(restoreSection).not.toContain(
+      'npx wrangler deploy --config "$RESTORE_CONFIG" --message "restore ${POT} D1 from ${BACKUP_DIR}"',
+    )
+  })
+
   it('covers the named incident classes from the tracker', () => {
     for (const incident of [
       '### Leaked Worker secret',

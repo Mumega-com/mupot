@@ -41,11 +41,13 @@ describe('per-pot setup script', () => {
     chmodSync(fakeNpx, 0o755)
 
     try {
-      execFileSync('bash', ['scripts/setup.sh', '--pot', pot], {
+      const setupOutput = execFileSync('bash', ['scripts/setup.sh', '--pot', pot], {
         cwd: repoRoot,
         env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, FAKE_NPX_LOG: log },
-        stdio: 'pipe',
+        encoding: 'utf8',
       })
+      expect(setupOutput).toContain(`node scripts/deploy.mjs --config "${config}"`)
+      expect(setupOutput).not.toContain(`npx wrangler deploy --config "${config}"`)
 
       const written = readFileSync(config, 'utf8')
       expect(written).toContain(`name = "mupot-${pot}"`)

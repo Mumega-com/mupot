@@ -71,7 +71,7 @@ ceremony before any dashboard OAuth credential is configured:
 
 ```bash
 bash scripts/secrets.sh --pot "$POT" --bootstrap-owner
-npx wrangler deploy --config "$CONFIG" --message "bootstrap owner ${POT}"
+node scripts/deploy.mjs --config "$CONFIG" --message "bootstrap owner ${POT}"
 # Open https://<your-pot-host>/auth/bootstrap and submit the printed token + owner email.
 npx wrangler secret delete BOOTSTRAP_OWNER_TOKEN --config "$CONFIG"
 ```
@@ -133,10 +133,17 @@ Deploy once, set secrets if Wrangler required the Worker to exist first, then
 deploy again:
 
 ```bash
-npx wrangler deploy --config "$CONFIG" --message "initial ${POT} production deploy"
+node scripts/deploy.mjs --config "$CONFIG" --message "initial ${POT} production deploy"
 npx wrangler secret list --config "$CONFIG"
-npx wrangler deploy --config "$CONFIG" --message "production secrets configured"
+node scripts/deploy.mjs --config "$CONFIG" --message "production secrets configured"
 ```
+
+`scripts/deploy.mjs` wraps `wrangler deploy` and always stamps `RELEASE_SHA`
+with the exact commit HEAD is on (mupot#443) — `GET /health` will report it as
+`commit`. Do not call `wrangler deploy` directly for a real deploy; the manual
+`RELEASE_SHA=$(git rev-parse HEAD) wrangler deploy` incantation is exactly the
+step that got forgotten in practice and left production reporting
+`commit: null` for days.
 
 When dashboard OAuth is selected, register redirect URLs with the identity provider
 before inviting users:
@@ -179,8 +186,12 @@ npm test
 npm run typecheck
 npx wrangler d1 migrations list "$DB" --remote --config "$CONFIG"
 npx wrangler d1 migrations apply "$DB" --remote --config "$CONFIG"
-npx wrangler deploy --config "$CONFIG" --message "upgrade ${POT} to $(git rev-parse --short HEAD)"
+node scripts/deploy.mjs --config "$CONFIG" --message "upgrade ${POT} to $(git rev-parse --short HEAD)"
 ```
+
+Migrations apply BEFORE the code deploy in both paths above — code that
+expects a column/table the old schema doesn't have yet must never reach
+production ahead of the migration that adds it.
 
 Do not apply a migration to production until a D1 backup exists for the current
 production state.
@@ -246,8 +257,14 @@ export RESTORE_CONFIG="wrangler.${POT}.restore.toml"
 cp "$CONFIG" "$RESTORE_CONFIG"
 # Edit RESTORE_CONFIG: database_name = "$RESTORE_DB" and database_id = "<new id>"
 npx wrangler d1 execute "$RESTORE_DB" --remote --config "$RESTORE_CONFIG" --file "$BACKUP_DIR/d1.sql" --yes
-npx wrangler deploy --config "$RESTORE_CONFIG" --message "restore ${POT} D1 from ${BACKUP_DIR}"
+node scripts/deploy.mjs --config "$RESTORE_CONFIG" --message "restore ${POT} D1 from ${BACKUP_DIR}"
 ```
+
+Restore deploys go through `scripts/deploy.mjs`, never a bare `wrangler deploy`
+(mupot#443/#571) — a restored pot must be stamped with the same exact-commit
+`RELEASE_SHA` as any other deploy, or the restored pot silently reports
+`commit: null` (or a stale stamp from before the restore) and the staleness
+detector cannot see it.
 
 Restore R2 from the whole-bucket backup:
 

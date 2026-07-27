@@ -6,7 +6,7 @@
 //   SEPARATE deploy (own Cloudflare account + own GitHub repo + own mupot worker). So
 //   "provision a reseller" can NOT be a row-insert inside this pot. It is the act of
 //   standing up a NEW deploy — which is operator/ops work (Cloudflare account, repo,
-//   `wrangler deploy`, secrets) and is Hadi-go.
+//   stamped deploy wrapper, secrets) and is Hadi-go.
 //
 //   This module is the deterministic PLANNER for that stand-up: given a reseller's inputs
 //   it computes the complete, validated, reproducible RECIPE — slug, plan tier, the agency
@@ -323,7 +323,7 @@ export function planResellerTenant(
   const opsRequired = [
     'create the reseller Cloudflare account / project (Hadi-go)',
     'create the reseller GitHub repo (fork of mupot) (Hadi-go)',
-    `deploy mupot to the new account with TENANT_SLUG='${slug}' (Hadi-go: wrangler deploy)`,
+    `deploy mupot to the new account with TENANT_SLUG='${slug}' (Hadi-go: node scripts/deploy.mjs)`,
     `set the pot plan tier to '${tier}' via the billing plan-setter (HMAC, central billing source)`,
     `activate('${RESELLER_DEPARTMENT_KEY}') on the new pot (seeds ${squadCount} squads)`,
     'set per-tenant secrets (GHL, Stripe Connect account) — never on this plan; Hadi-go',

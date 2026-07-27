@@ -129,16 +129,16 @@ copying resource identifiers by hand:
 
 ```bash
 bash scripts/setup.sh --pot acme
-npx wrangler deploy --config wrangler.acme.toml
+node scripts/deploy.mjs --config wrangler.acme.toml
 bash scripts/secrets.sh --pot acme
-npx wrangler deploy --config wrangler.acme.toml
+node scripts/deploy.mjs --config wrangler.acme.toml
 ```
 
 For an OAuth-free first owner on a new self-hosted pot, deploy once and run:
 
 ```bash
 bash scripts/secrets.sh --pot acme --bootstrap-owner
-npx wrangler deploy --config wrangler.acme.toml
+node scripts/deploy.mjs --config wrangler.acme.toml
 ```
 
 Open `<your-pot-url>/auth/bootstrap`, submit the printed token and the owner's
