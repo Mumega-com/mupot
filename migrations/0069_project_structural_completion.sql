@@ -21,6 +21,15 @@ DROP TRIGGER IF EXISTS validate_project_squad_access_insert;
 DROP TRIGGER IF EXISTS validate_project_squad_access_update;
 DROP TRIGGER IF EXISTS validate_tasks_project_id_insert;
 DROP TRIGGER IF EXISTS validate_tasks_project_id_update;
+-- The project-attribution columns below are normally append-only/immutable.
+-- Suspend only those guards while their references are cleared and restored.
+DROP TRIGGER IF EXISTS task_verdicts_no_update;
+DROP TRIGGER IF EXISTS workflow_receipts_project_immutable;
+DROP TRIGGER IF EXISTS workflow_receipts_project_match_update;
+DROP TRIGGER IF EXISTS task_dispatch_receipts_project_immutable;
+DROP TRIGGER IF EXISTS task_dispatch_receipts_project_match_update;
+DROP TRIGGER IF EXISTS flight_event_outbox_project_immutable;
+DROP TRIGGER IF EXISTS flight_event_outbox_project_match_update;
 
 CREATE TABLE _projects_backup_0069 AS SELECT * FROM projects;
 CREATE TABLE _project_squad_access_backup_0069 AS SELECT * FROM project_squad_access;
@@ -31,7 +40,8 @@ CREATE TABLE _project_link_receipts_backup_0069 AS SELECT * FROM project_link_re
 CREATE TABLE _module_registry_backup_0069 AS
   SELECT id, tenant, kind, adapter, project_id, identity, status, capabilities,
          last_heartbeat, registered_at
-    FROM module_registry;
+    FROM module_registry
+   WHERE project_id IS NOT NULL;
 CREATE TABLE _task_verdicts_project_backup_0069 AS
   SELECT id, project_id FROM task_verdicts WHERE project_id IS NOT NULL;
 CREATE TABLE _workflow_receipts_project_backup_0069 AS
@@ -45,7 +55,9 @@ UPDATE task_verdicts SET project_id = NULL WHERE project_id IS NOT NULL;
 UPDATE workflow_receipts SET project_id = NULL WHERE project_id IS NOT NULL;
 UPDATE task_dispatch_receipts SET project_id = NULL WHERE project_id IS NOT NULL;
 UPDATE flight_event_outbox SET project_id = NULL WHERE project_id IS NOT NULL;
-UPDATE module_registry SET project_id = NULL WHERE project_id IS NOT NULL;
+-- Deleting the backed-up scoped registrations avoids a transient collision with
+-- an unscoped registration that has the same tenant + identity.
+DELETE FROM module_registry WHERE project_id IS NOT NULL;
 
 DELETE FROM project_link_receipts;
 DELETE FROM project_links;
@@ -202,6 +214,64 @@ SET project_id = (
   SELECT b.project_id FROM _flight_event_outbox_project_backup_0069 b WHERE b.id = flight_event_outbox.id
 )
 WHERE EXISTS (SELECT 1 FROM _flight_event_outbox_project_backup_0069 b WHERE b.id = flight_event_outbox.id);
+
+CREATE TRIGGER task_verdicts_no_update
+BEFORE UPDATE ON task_verdicts
+WHEN NOT (
+  OLD.project_id IS NULL
+  AND NEW.project_id IS (SELECT project_id FROM tasks WHERE id = OLD.task_id)
+  AND NEW.id IS OLD.id
+  AND NEW.task_id IS OLD.task_id
+  AND NEW.verdict IS OLD.verdict
+  AND NEW.note IS OLD.note
+  AND NEW.decided_by IS OLD.decided_by
+  AND NEW.decided_at IS OLD.decided_at
+)
+BEGIN
+  SELECT RAISE(ABORT, 'verdicts are append-only: UPDATE is forbidden');
+END;
+
+CREATE TRIGGER workflow_receipts_project_immutable
+BEFORE UPDATE OF project_id ON workflow_receipts
+WHEN OLD.project_id IS NOT NEW.project_id AND OLD.project_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'workflow receipt project immutable');
+END;
+
+CREATE TRIGGER workflow_receipts_project_match_update
+BEFORE UPDATE OF project_id ON workflow_receipts
+WHEN NEW.project_id IS NOT (SELECT project_id FROM tasks WHERE id = NEW.task_id)
+BEGIN
+  SELECT RAISE(ABORT, 'workflow receipt project mismatch');
+END;
+
+CREATE TRIGGER task_dispatch_receipts_project_immutable
+BEFORE UPDATE OF project_id ON task_dispatch_receipts
+WHEN OLD.project_id IS NOT NEW.project_id AND OLD.project_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'dispatch receipt project immutable');
+END;
+
+CREATE TRIGGER task_dispatch_receipts_project_match_update
+BEFORE UPDATE OF project_id ON task_dispatch_receipts
+WHEN NEW.project_id IS NOT (SELECT project_id FROM tasks WHERE id = NEW.task_id)
+BEGIN
+  SELECT RAISE(ABORT, 'dispatch receipt project mismatch');
+END;
+
+CREATE TRIGGER flight_event_outbox_project_immutable
+BEFORE UPDATE OF project_id ON flight_event_outbox
+WHEN OLD.project_id IS NOT NEW.project_id AND OLD.project_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'flight event project immutable');
+END;
+
+CREATE TRIGGER flight_event_outbox_project_match_update
+BEFORE UPDATE OF project_id ON flight_event_outbox
+WHEN NEW.project_id IS NOT (SELECT project_id FROM flights WHERE id = NEW.flight_id)
+BEGIN
+  SELECT RAISE(ABORT, 'flight event project mismatch');
+END;
 
 CREATE TRIGGER trg_project_link_receipt_authorized
 BEFORE INSERT ON project_link_receipts
