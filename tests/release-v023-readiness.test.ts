@@ -133,6 +133,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     expect(workflow).toContain('bash scripts/ci-local-evidence.sh')
     expect(pkg.scripts['smoke:local']).toBe('node scripts/local-browser-smoke.mjs')
     expect(pkg.scripts['conformance:runtime:local']).toBe('node scripts/local-runtime-conformance.mjs')
+    expect(pkg.scripts['collect:project-routine:local']).toBe('node scripts/project-routine-lifecycle-collect.mjs')
     expect(pkg.scripts['receipt:fresh-install:check']).toBe('node scripts/fresh-install-receipt.mjs --check')
     expect(pkg.scripts['receipt:github-app-permissions:check']).toBe('node scripts/github-app-permissions-receipt.mjs --check')
     expect(pkg.scripts['receipt:work-lifecycle:check']).toBe('node scripts/work-lifecycle-receipt.mjs --check')

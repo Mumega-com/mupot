@@ -71,6 +71,7 @@ jobs:
             tmp/local-evidence
             tmp/local-smoke
             tmp/local-runtime-conformance
+            tmp/local-project-routine
 
   no-secrets:
     runs-on: ubuntu-latest
