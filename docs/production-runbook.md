@@ -71,7 +71,7 @@ ceremony before any dashboard OAuth credential is configured:
 
 ```bash
 bash scripts/secrets.sh --pot "$POT" --bootstrap-owner
-npx wrangler deploy --config "$CONFIG" --message "bootstrap owner ${POT}"
+node scripts/deploy.mjs --config "$CONFIG" --message "bootstrap owner ${POT}"
 # Open https://<your-pot-host>/auth/bootstrap and submit the printed token + owner email.
 npx wrangler secret delete BOOTSTRAP_OWNER_TOKEN --config "$CONFIG"
 ```

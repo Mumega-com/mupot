@@ -126,7 +126,7 @@ work footprint. That's the difference between a demo and something an auditor ca
 | Mode | Where it runs | Porting work | Your data |
 |------|---------------|--------------|-----------|
 | **Managed** | We host the pot | none | hosted |
-| **Your cloud** | `wrangler deploy` to your own account | provisioning only | your account |
+| **Your cloud** | stamped `scripts/deploy.mjs` to your own account | provisioning only | your account |
 | **Your servers** | [workerd](https://github.com/cloudflare/workerd) (CF's own OSS runtime) on a VPS + storage adapters | adapter layer | your infra |
 | **On-prem** | Your datacenter, self-contained, optional air-gap | adapter + host sandbox | never leaves |
 | **Edge** | workerd / Node on Jetson-class hardware on your floor | + capability tier | on the metal |

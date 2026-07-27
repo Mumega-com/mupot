@@ -19,16 +19,23 @@ function jsonFetch(body, ok = true, status = 200) {
 describe('checkPot', () => {
   it('reports "current" when the live commit exactly matches HEAD', async () => {
     const r = await checkPot({ slug: 'mumega', health: 'https://x/health' }, HEAD, {
-      fetchImpl: jsonFetch({ ok: true, tenant: 'mumega', commit: HEAD }),
+      fetchImpl: jsonFetch({ ok: true, tenant: 'mumega', commit: HEAD, clean: true }),
     })
     expect(r).toEqual({ slug: 'mumega', status: 'current', head: HEAD, live: HEAD })
   })
 
   it('matches case-insensitively (git shas are case-insensitive)', async () => {
     const r = await checkPot({ slug: 'mumega', health: 'https://x/health' }, HEAD.toUpperCase(), {
-      fetchImpl: jsonFetch({ ok: true, tenant: 'mumega', commit: HEAD }),
+      fetchImpl: jsonFetch({ ok: true, tenant: 'mumega', commit: HEAD, clean: true }),
     })
     expect(r.status).toBe('current')
+  })
+
+  it('reports "unverified" when the commit matches but health says clean:false', async () => {
+    const r = await checkPot({ slug: 'mumega', health: 'https://x/health' }, HEAD, {
+      fetchImpl: jsonFetch({ ok: true, tenant: 'mumega', commit: HEAD, clean: false }),
+    })
+    expect(r).toEqual({ slug: 'mumega', status: 'unverified', head: HEAD, live: HEAD, clean: false })
   })
 
   it('reports "drift" when the live commit differs from HEAD — the exact #443 scenario', async () => {
@@ -95,7 +102,7 @@ describe('checkPot', () => {
 
   it('validates against an explicit pot.tenant field when the manifest entry carries one', () => {
     return checkPot({ slug: 'mumega-alias', tenant: 'mumega', health: 'https://x/health' }, HEAD, {
-      fetchImpl: jsonFetch({ ok: true, tenant: 'mumega', commit: HEAD }),
+      fetchImpl: jsonFetch({ ok: true, tenant: 'mumega', commit: HEAD, clean: true }),
     }).then((r) => expect(r.status).toBe('current'))
   })
 
@@ -120,6 +127,7 @@ describe('checkAllPots', () => {
           ok: true,
           tenant: String(url).includes('drifted') ? 'drifted-pot' : 'current-pot',
           commit: String(url).includes('drifted') ? 'c'.repeat(40) : HEAD,
+          clean: true,
         }),
       }),
     })
@@ -139,6 +147,7 @@ describe('formatReport', () => {
       { slug: 'e', status: 'error', head: HEAD, error: 'timeout' },
       { slug: 'f', status: 'unhealthy', head: HEAD, ok: false },
       { slug: 'g', status: 'wrong_tenant', head: HEAD, tenant: 'digid', expected: 'mumega' },
+      { slug: 'h', status: 'unverified', head: HEAD, live: HEAD, clean: false },
     ])
     expect(out).toContain(HEAD)
     expect(out).toContain('✓ current')
@@ -148,6 +157,7 @@ describe('formatReport', () => {
     expect(out).toContain('✘ ERROR (timeout)')
     expect(out).toContain('✘ UNHEALTHY (ok=false)')
     expect(out).toContain("✘ WRONG TENANT (got 'digid', expected 'mumega')")
+    expect(out).toContain('✘ UNVERIFIED BUILD (clean=false)')
   })
 
   // mupot#571 fix 5 — the report header must never assert a ref it didn't

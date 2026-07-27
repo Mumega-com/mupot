@@ -72,6 +72,9 @@ export async function checkPot(pot, head, { fetchImpl = fetch, timeoutMs = 10000
   if (commit.toLowerCase() !== head.toLowerCase()) {
     return { slug: pot.slug, status: 'drift', head, live: commit }
   }
+  if (body.clean !== true) {
+    return { slug: pot.slug, status: 'unverified', head, live: commit, clean: body.clean === false ? false : null }
+  }
   return { slug: pot.slug, status: 'current', head, live: commit }
 }
 
@@ -116,9 +119,11 @@ export function formatReport(head, results, { ref } = {}) {
               ? `✘ UNHEALTHY (ok=${r.ok})`
               : r.status === 'wrong_tenant'
                 ? `✘ WRONG TENANT (got '${r.tenant}', expected '${r.expected}')`
-                : r.status === 'unreachable'
-                  ? `✘ UNREACHABLE (http ${r.http})`
-                  : `✘ ERROR (${r.error})`
+                : r.status === 'unverified'
+                  ? `✘ UNVERIFIED BUILD (clean=${r.clean})`
+                  : r.status === 'unreachable'
+                    ? `✘ UNREACHABLE (http ${r.http})`
+                    : `✘ ERROR (${r.error})`
     lines.push(`  ${r.slug.padEnd(10)} ${label}`)
   }
   return lines.join('\n')
