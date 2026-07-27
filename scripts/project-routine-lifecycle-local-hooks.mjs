@@ -394,6 +394,16 @@ export async function createCollectorDependencies(config) {
     return { browser, context, page }
   }
 
+  async function sessionJson(route, label) {
+    const active = await ensureBrowser()
+    const response = await active.context.request.get(`${baseUrl}${route}`)
+    const json = await response.json().catch(() => null)
+    if (response.status() !== 200 || !json || typeof json !== 'object') {
+      throw new Error(`${label} failed with HTTP ${response.status()}`)
+    }
+    return json
+  }
+
   async function routineRow(projectId, routineId, name) {
     const active = await ensureBrowser()
     await active.page.goto(
@@ -486,25 +496,25 @@ export async function createCollectorDependencies(config) {
       return assertResponse('REST routine run read', response)
     },
 
-    async readRestProject({ projectId, ownerToken: callerToken }) {
-      const response = await requestJson(`/api/projects/${encodeURIComponent(projectId)}`, {
-        headers: { authorization: `Bearer ${callerToken}` },
-      })
-      return assertResponse('REST project read', response)
+    async readRestProject({ projectId }) {
+      return sessionJson(
+        `/api/projects/${encodeURIComponent(projectId)}`,
+        'REST project read',
+      )
     },
 
-    async readRestActivity({ projectId, ownerToken: callerToken }) {
-      const response = await requestJson(`/api/projects/${encodeURIComponent(projectId)}/activity?limit=100`, {
-        headers: { authorization: `Bearer ${callerToken}` },
-      })
-      return assertResponse('REST project Activity read', response)
+    async readRestActivity({ projectId }) {
+      return sessionJson(
+        `/api/projects/${encodeURIComponent(projectId)}/activity?limit=100`,
+        'REST project Activity read',
+      )
     },
 
-    async readRestEvidence({ projectId, ownerToken: callerToken }) {
-      const response = await requestJson(`/api/projects/${encodeURIComponent(projectId)}/evidence?limit=100`, {
-        headers: { authorization: `Bearer ${callerToken}` },
-      })
-      return assertResponse('REST project Evidence read', response)
+    async readRestEvidence({ projectId }) {
+      return sessionJson(
+        `/api/projects/${encodeURIComponent(projectId)}/evidence?limit=100`,
+        'REST project Evidence read',
+      )
     },
 
     detachSigned: signedDetach,

@@ -314,6 +314,7 @@ describe('Project Routine local lifecycle hooks', () => {
     let routineStatus = 'draft'
     let runQueued = false
     let approved = false
+    let sessionRestRequests = 0
     let baseUrl = ''
     const routineName = 'Lifecycle receipt browser'
     const situation = { health: 'healthy', summary: 'Browser situation', routines: { enabled_count: 1 } }
@@ -362,6 +363,15 @@ describe('Project Routine local lifecycle hooks', () => {
         const verdict = JSON.parse(await body(request))
         approved = verdict.verdict === 'approved'
         return json(response, 201, { verdict: verdict.verdict, task_id: 'control-task' })
+      }
+      if (url.pathname.startsWith('/api/projects/project-main')) {
+        if (!request.headers.cookie?.includes('mupot_session=fixture')) {
+          return json(response, 401, { error: 'unauthorized' })
+        }
+        sessionRestRequests += 1
+        if (url.pathname.endsWith('/activity')) return json(response, 200, { rows: activity })
+        if (url.pathname.endsWith('/evidence')) return json(response, 200, { rows: evidence })
+        return json(response, 200, { project: { id: 'project-main' }, situation })
       }
       if (url.pathname === '/approvals') {
         response.writeHead(200, { 'content-type': 'text/html' })
@@ -473,6 +483,13 @@ describe('Project Routine local lifecycle hooks', () => {
         expectedActivity: activity,
         expectedEvidence: evidence,
       })).resolves.toEqual({ activity, evidence })
+      await expect(dependencies.api.readRestProject({ projectId: 'project-main' }))
+        .resolves.toMatchObject({ project: { id: 'project-main' }, situation })
+      await expect(dependencies.api.readRestActivity({ projectId: 'project-main' }))
+        .resolves.toEqual({ rows: activity })
+      await expect(dependencies.api.readRestEvidence({ projectId: 'project-main' }))
+        .resolves.toEqual({ rows: evidence })
+      expect(sessionRestRequests).toBe(3)
     } finally {
       await dependencies.browser.close()
       await fixture.close()
