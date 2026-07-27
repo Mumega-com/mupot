@@ -57,10 +57,13 @@ import {
   type RankInstinct,
   type VerifiedReceiptRef,
 } from '../src/brain/learning-ranker-contract'
+import { runContractAssertPolicy } from '../src/contracts/contract-assert-policy'
+
+const ALLOWED_CONTRACT_STATUSES = ['design', 'dyad-gate', 'live'] as const
 
 const contract = JSON.parse(
   readFileSync(new URL('../docs/brain-learning-ranker-v1.json', import.meta.url), 'utf8'),
-) as {
+) as Record<string, unknown> & {
   id: string
   status: string
   contrast: {
@@ -131,7 +134,7 @@ function instinct(
 describe('brain-learning-ranker/v1 contract doc', () => {
   it('is the design-status learning-ranker contract', () => {
     expect(contract.id).toBe('brain-learning-ranker/v1')
-    expect(contract.status).toBe('design')
+    expect(ALLOWED_CONTRACT_STATUSES).toContain(contract.status)
     expect(contract.contrast.learningRanker.mayAct).toBe(false)
     expect(contract.contrast.learningRanker.hotPathLlm).toBe(false)
     expect(contract.contrast.learningRanker.learning).toBe('port4-instinct-loop')
@@ -143,6 +146,52 @@ describe('brain-learning-ranker/v1 contract doc', () => {
     expect(contract.nonGoals).toContain('replace-brainport-with-hermes-gateway')
     expect(contract.nonGoals).toContain('make-brain-an-actor')
     expect(contract.buildSlices[1]).toBe('brainport-default-adapter')
+  })
+
+  it('enforces contract-assert-policy against the real JSON + suite (not a fixture)', () => {
+    const testSource = readFileSync(new URL(import.meta.url), 'utf8')
+    const findings = runContractAssertPolicy({
+      spec: {
+        lifecycleFields: [
+          {
+            field: 'status',
+            allowedValues: ALLOWED_CONTRACT_STATUSES,
+            whoMayFlip: ['loom', 'kasra', 'athena-gate'],
+          },
+        ],
+        jsonTsMirrors: [
+          { jsonPath: ['rankPipeline'], tsExportName: 'LEARNING_RANKER_PIPELINE' },
+          { jsonPath: ['allowedProposalKinds'], tsExportName: 'ALLOWED_BRAIN_PROPOSAL_KINDS' },
+          { jsonPath: ['forbiddenActionVerbs'], tsExportName: 'FORBIDDEN_BRAIN_ACTION_VERBS' },
+          { jsonPath: ['instinct', 'allowedDomains'], tsExportName: 'RANK_INSTINCT_DOMAINS' },
+          { jsonPath: ['distill', 'allowedSources'], tsExportName: 'DISTILL_ALLOWED_SOURCES' },
+          { jsonPath: ['distill', 'forbiddenSources'], tsExportName: 'DISTILL_FORBIDDEN_SOURCES' },
+          { jsonPath: ['exampleInstinctId'], tsExportName: 'EXAMPLE_FABRICATION_INSTINCT_ID' },
+          { jsonPath: ['instinct', 'confidenceMin'], tsExportName: 'INSTINCT_CONFIDENCE_MIN' },
+          { jsonPath: ['instinct', 'confidenceMax'], tsExportName: 'INSTINCT_CONFIDENCE_MAX' },
+          { jsonPath: ['instinct', 'injectThreshold'], tsExportName: 'INSTINCT_INJECT_THRESHOLD' },
+          { jsonPath: ['instinct', 'decayHalfLifeDays'], tsExportName: 'INSTINCT_DECAY_HALF_LIFE_DAYS' },
+          { jsonPath: ['bias', 'maxLearnDelta'], tsExportName: 'MAX_LEARN_DELTA' },
+        ],
+      },
+      contractJson: contract as Record<string, unknown>,
+      tsExports: {
+        LEARNING_RANKER_PIPELINE,
+        ALLOWED_BRAIN_PROPOSAL_KINDS,
+        FORBIDDEN_BRAIN_ACTION_VERBS,
+        RANK_INSTINCT_DOMAINS,
+        DISTILL_ALLOWED_SOURCES,
+        DISTILL_FORBIDDEN_SOURCES,
+        EXAMPLE_FABRICATION_INSTINCT_ID,
+        INSTINCT_CONFIDENCE_MIN,
+        INSTINCT_CONFIDENCE_MAX,
+        INSTINCT_INJECT_THRESHOLD,
+        INSTINCT_DECAY_HALF_LIFE_DAYS,
+        MAX_LEARN_DELTA,
+      },
+      testSource,
+    })
+    expect(findings).toEqual([])
   })
 
   it('matches the pure module pipeline and lists', () => {
