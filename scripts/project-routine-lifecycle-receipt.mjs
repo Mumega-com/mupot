@@ -58,6 +58,7 @@ export const REQUIRED_STEPS = Object.freeze([
     evidence: [
       'needs_you_item_id',
       'human_approval_recorded',
+      'action_scope',
       'external_action_gated',
       'external_action_executed',
       'external_action_approved',
@@ -102,6 +103,7 @@ const SECRET_FIELD_RE = /(?:^|[_-])(authorization|bearer|token|access[_-]?token|
 const SAFE_REFERENCE_FIELD_RE = /(?:^|[_-])(env|name|names|ref|path|file|id|ids|label|labels)$/i
 const COMMIT_RE = /^[a-f0-9]{40}$/
 const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/
+const DIGEST_RE = /^[a-f0-9]{64}$/
 
 export function parseArgs(argv) {
   const opts = {
@@ -117,6 +119,7 @@ export function parseArgs(argv) {
     plan: false,
     check: false,
     summary: false,
+    requireClean: true,
     help: false,
   }
 
@@ -317,7 +320,9 @@ function scanSecrets(value, path = '$', findings = []) {
     for (const [key, entry] of Object.entries(value)) {
       const nextPath = `${path}.${key}`
       if (SECRET_FIELD_RE.test(key) && !SAFE_REFERENCE_FIELD_RE.test(key)) {
-        if (typeof entry === 'string' && entry && !/^<[^>]+>$/.test(entry) && !/redacted|masked|hidden|name only|names only/i.test(entry)) {
+        const safePlaceholder = typeof entry === 'string'
+          && (/^<[^>]+>$/.test(entry) || /redacted|masked|hidden|name only|names only/i.test(entry))
+        if (entry !== null && entry !== '' && entry !== undefined && !safePlaceholder) {
           findings.push({ path: nextPath, kind: 'sensitive_field_value' })
         }
       }
@@ -325,6 +330,63 @@ function scanSecrets(value, path = '$', findings = []) {
     }
   }
   return findings
+}
+
+function redactSecretMaterial(value, key = '') {
+  if (SECRET_FIELD_RE.test(key) && !SAFE_REFERENCE_FIELD_RE.test(key)) return '[redacted]'
+  if (typeof value === 'string') {
+    return SECRET_VALUE_PATTERNS.some(([, pattern]) => pattern.test(value)) ? '[redacted]' : value
+  }
+  if (Array.isArray(value)) return value.map(entry => redactSecretMaterial(entry))
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([childKey, entry]) => [childKey, redactSecretMaterial(entry, childKey)]),
+    )
+  }
+  return value
+}
+
+function observationDataProvesStep(artifact, receipt) {
+  const data = artifact?.data
+  const target = receipt?.target ?? {}
+  const evidence = receipt?.evidence ?? {}
+  const httpObserved = Number.isSafeInteger(data?.http_status)
+    && data.http_status >= 200 && data.http_status < 400
+  switch (receipt?.step) {
+    case 'routine_created':
+      return artifact.source === 'browser' && httpObserved
+        && data.routine_id === target.routine_id && data.project_id === target.project_id
+        && data.status === 'draft'
+    case 'routine_enabled':
+      return artifact.source === 'browser' && httpObserved
+        && data.routine_id === target.routine_id && data.status === 'enabled'
+    case 'manual_fire':
+      return artifact.source === 'browser' && httpObserved
+        && data.run_id === target.routine_run_id && data.occurrence_id === evidence.occurrence_id
+    case 'runtime_proposal':
+      return artifact.source === 'runtime'
+        && data.run_id === target.routine_run_id && data.agent_id === evidence.agent_identity
+        && typeof data.request_id === 'string' && data.request_id.length > 0
+        && data.proposal_status === 'waiting' && DIGEST_RE.test(data.situation_digest)
+    case 'needs_you_approval':
+      return artifact.source === 'browser'
+        && data.needs_you_item_id === evidence.needs_you_item_id
+        && typeof data.task_id === 'string' && data.task_id.length > 0
+        && data.verdict === 'approved' && data.action_kind === 'create_task'
+        && data.action_scope === 'internal_only'
+    case 'terminal_outcome':
+      return artifact.source === 'rest' && data.run_status === evidence.terminal_status
+        && Number.isSafeInteger(data.cost_micro_usd) && data.cost_micro_usd >= 0
+        && typeof data.action_key === 'string' && data.action_key.length > 0
+        && data.duplicate_replay === true
+    case 'restart_parity':
+      return artifact.source === 'rest'
+        && data.release_sha === target.commit && data.version === target.version
+        && ['run_digest', 'situation_digest', 'activity_digest', 'evidence_digest']
+          .every(field => DIGEST_RE.test(data[field]))
+    default:
+      return false
+  }
 }
 
 function readReceiptFile(checks, path, label) {
@@ -462,6 +524,9 @@ function referencedArtifactMeta(checks, outDir, receiptPath, receipt) {
         'receipt_artifact_data_present',
         { path: receiptPath, index, artifact_path: artifactPath },
       )
+      pushCheck(checks, observationDataProvesStep(parsedJson, receipt), 'receipt_artifact_data_proves_step', {
+        path: receiptPath, index, artifact_path: artifactPath,
+      })
     }
     return {
       label,
@@ -495,6 +560,7 @@ function evidenceValuePass(key, value) {
   if (BOOLEAN_EVIDENCE.has(key)) return typeof value === 'boolean'
   if (IDENTIFIER_EVIDENCE.has(key)) return typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,200}$/.test(value)
   if (key === 'mode') return value === 'propose' || value === 'execute_internal'
+  if (key === 'action_scope') return value === 'internal_only'
   if (key === 'terminal_status') return ['succeeded', 'failed', 'skipped', 'cancelled'].includes(value)
   if (key === 'commit') return typeof value === 'string' && COMMIT_RE.test(value)
   if (key === 'version') return typeof value === 'string' && VERSION_RE.test(value)
@@ -546,6 +612,17 @@ function gitHead(repoRoot) {
   }
 }
 
+export function gitWorktreeClean(repoRoot) {
+  try {
+    return execFileSync('git', ['-C', repoRoot, 'status', '--porcelain', '--untracked-files=no'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() === ''
+  } catch {
+    return false
+  }
+}
+
 function packageVersion(repoRoot) {
   try {
     const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'))
@@ -586,12 +663,13 @@ function paethPredictor(left, up, upLeft) {
 }
 
 function inspectPngScreenshot(path) {
-  if (!existsSync(path)) return { valid: false, hasVisualContent: false }
+  const invalid = { valid: false, hasVisualContent: false, dimensionsBounded: false }
+  if (!existsSync(path)) return invalid
   const stats = statSync(path)
-  if (!stats.isFile() || stats.size < 45) return { valid: false, hasVisualContent: false }
+  if (!stats.isFile() || stats.size < 45 || stats.size > 20 * 1024 * 1024) return invalid
   const png = readFileSync(path)
   if (!png.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
-    return { valid: false, hasVisualContent: false }
+    return invalid
   }
   try {
     let offset = 8
@@ -606,47 +684,57 @@ function inspectPngScreenshot(path) {
     while (offset + 12 <= png.length) {
       const length = png.readUInt32BE(offset)
       const end = offset + 12 + length
-      if (end > png.length) return { valid: false, hasVisualContent: false }
+      if (end > png.length) return invalid
       const type = png.subarray(offset + 4, offset + 8).toString('ascii')
       const chunk = png.subarray(offset + 8, offset + 8 + length)
       const expectedCrc = png.readUInt32BE(offset + 8 + length)
       if (crc32(png.subarray(offset + 4, offset + 8 + length)) !== expectedCrc) {
-        return { valid: false, hasVisualContent: false }
+        return invalid
       }
-      if (!sawHeader && type !== 'IHDR') return { valid: false, hasVisualContent: false }
+      if (!sawHeader && type !== 'IHDR') return invalid
       if (type === 'IHDR') {
-        if (sawHeader || length !== 13) return { valid: false, hasVisualContent: false }
+        if (sawHeader || length !== 13) return invalid
         width = chunk.readUInt32BE(0)
         height = chunk.readUInt32BE(4)
         bitDepth = chunk[8]
         colorType = chunk[9]
         interlace = chunk[12]
-        if (chunk[10] !== 0 || chunk[11] !== 0) return { valid: false, hasVisualContent: false }
+        if (chunk[10] !== 0 || chunk[11] !== 0) return invalid
         sawHeader = true
       } else if (type === 'IDAT') {
         data.push(chunk)
       } else if (type === 'IEND') {
-        if (length !== 0) return { valid: false, hasVisualContent: false }
+        if (length !== 0) return invalid
         sawEnd = true
         offset = end
         break
       }
       offset = end
     }
+    const pixelCount = width * height
+    const dimensionsBounded = Number.isSafeInteger(pixelCount)
+      && width >= 320 && height >= 200
+      && width <= 8_192 && height <= 16_384 && pixelCount <= 50_000_000
     if (!sawHeader || !sawEnd || offset !== png.length || data.length === 0
-      || width < 320 || height < 200 || interlace !== 0 || bitDepth !== 8
-      || ![2, 6].includes(colorType)) return { valid: false, hasVisualContent: false }
+      || !dimensionsBounded || interlace !== 0 || bitDepth !== 8
+      || ![2, 6].includes(colorType)) {
+      return { ...invalid, dimensionsBounded, width, height }
+    }
     const channels = colorType === 2 ? 3 : 4
-    const pixels = inflateSync(Buffer.concat(data))
     const rowBytes = Math.ceil((width * channels * bitDepth) / 8)
-    if (pixels.length !== height * (rowBytes + 1)) return { valid: false, hasVisualContent: false }
+    const expectedBytes = height * (rowBytes + 1)
+    if (!Number.isSafeInteger(expectedBytes) || expectedBytes > 200 * 1024 * 1024) {
+      return { ...invalid, dimensionsBounded: false, width, height }
+    }
+    const pixels = inflateSync(Buffer.concat(data), { maxOutputLength: expectedBytes + 1 })
+    if (pixels.length !== expectedBytes) return { ...invalid, dimensionsBounded, width, height }
     let previous = Buffer.alloc(rowBytes)
     let firstVisibleColor = null
     let hasVisualContent = false
     for (let row = 0; row < height; row += 1) {
       const rowOffset = row * (rowBytes + 1)
       const filter = pixels[rowOffset]
-      if (filter > 4) return { valid: false, hasVisualContent: false }
+      if (filter > 4) return { ...invalid, dimensionsBounded, width, height }
       const raw = pixels.subarray(rowOffset + 1, rowOffset + 1 + rowBytes)
       const current = Buffer.alloc(rowBytes)
       for (let column = 0; column < rowBytes; column += 1) {
@@ -672,9 +760,9 @@ function inspectPngScreenshot(path) {
       previous = current
       if (hasVisualContent) break
     }
-    return { valid: true, hasVisualContent }
+    return { valid: true, hasVisualContent, dimensionsBounded, width, height }
   } catch {
-    return { valid: false, hasVisualContent: false }
+    return invalid
   }
 }
 
@@ -701,6 +789,18 @@ function checkExternalAction(checks, receipt, path) {
   pushCheck(checks, !executed || approved, 'external_action_requires_approval', {
     path,
     external_action_executed: evidence.external_action_executed ?? null,
+    external_action_approved: evidence.external_action_approved ?? null,
+  })
+  pushCheck(checks, evidence.action_scope === 'internal_only', 'lifecycle_action_scope_internal_only', {
+    path,
+    action_scope: evidence.action_scope ?? null,
+  })
+  pushCheck(checks, !executed, 'no_external_action_executed', {
+    path,
+    external_action_executed: evidence.external_action_executed ?? null,
+  })
+  pushCheck(checks, !approved, 'no_external_action_approved', {
+    path,
     external_action_approved: evidence.external_action_approved ?? null,
   })
 }
@@ -733,6 +833,12 @@ function checkScreenshots(checks, outDir) {
     pushCheck(checks, present, 'screenshot_present', { path: relative, absolute_path: path })
     if (!present) continue
     const inspection = inspectPngScreenshot(path)
+    pushCheck(checks, inspection.dimensionsBounded === true, 'screenshot_dimensions_bounded', {
+      path: relative,
+      absolute_path: path,
+      width: inspection.width ?? null,
+      height: inspection.height ?? null,
+    })
     pushCheck(checks, inspection.valid, 'screenshot_is_png', {
       path: relative,
       absolute_path: path,
@@ -846,6 +952,13 @@ export function checkBundle(opts = {}) {
   })
 
   const head = gitHead(repoRoot)
+  const trackedWorktreeClean = gitWorktreeClean(repoRoot)
+  pushCheck(
+    checks,
+    opts.requireClean === false || trackedWorktreeClean,
+    'repo_tracked_worktree_clean',
+    { repo_root: repoRoot, clean: trackedWorktreeClean, required: opts.requireClean !== false },
+  )
   pushCheck(checks, Boolean(head), 'git_head_resolved', { repo_root: repoRoot, head: head || null })
   pushCheck(checks, Boolean(head) && target.commit === head, 'target_commit_matches_git_head', {
     expected: head || null,
@@ -916,7 +1029,7 @@ export function checkBundle(opts = {}) {
 
   const failed = checks.filter((check) => check.ok === false)
   const passed = checks.filter((check) => check.ok === true)
-  return {
+  return redactSecretMaterial({
     receipt_type: CHECK_RECEIPT_TYPE,
     status: failed.length === 0 ? 'pass' : 'fail',
     checked_at: new Date().toISOString(),
@@ -943,7 +1056,7 @@ export function checkBundle(opts = {}) {
       : [
         'fix failing project-routine lifecycle evidence (screenshots, commit/version, surface parity, restart proof, or external-action gate), then rerun project-routine-lifecycle-receipt --check',
       ],
-  }
+  })
 }
 
 export function formatSummary(receipt) {

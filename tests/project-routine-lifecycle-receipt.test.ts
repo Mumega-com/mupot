@@ -12,6 +12,7 @@ import {
   STEP_RECEIPT_TYPE,
   checkBundle,
   formatPlan,
+  gitWorktreeClean,
   parseArgs,
 } from '../scripts/project-routine-lifecycle-receipt.mjs'
 
@@ -26,6 +27,10 @@ const TARGET = {
   routine_run_id: 'run-propose-1',
   commit: COMMIT,
   version: VERSION,
+}
+
+function checkTestBundle(options: Parameters<typeof checkBundle>[0]) {
+  return checkBundle({ ...options, requireClean: false })
 }
 
 function crc32(buffer: Buffer): number {
@@ -73,6 +78,19 @@ function screenshotPng(blank = false): Buffer {
   ])
 }
 
+function oversizedScreenshotPng(): Buffer {
+  const header = Buffer.alloc(13)
+  header.writeUInt32BE(100_000, 0)
+  header.writeUInt32BE(100_000, 4)
+  header.set([8, 2, 0, 0, 0], 8)
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', header),
+    pngChunk('IDAT', deflateSync(Buffer.alloc(0))),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ])
+}
+
 function tempDir() {
   return mkdtempSync(join(tmpdir(), 'mupot-project-routine-lifecycle-'))
 }
@@ -108,9 +126,10 @@ function evidenceFor(step: string): Record<string, unknown> {
       return {
         needs_you_item_id: 'needs-you-1',
         human_approval_recorded: true,
+        action_scope: 'internal_only',
         external_action_gated: true,
-        external_action_executed: true,
-        external_action_approved: true,
+        external_action_executed: false,
+        external_action_approved: false,
       }
     case 'terminal_outcome':
       return {
@@ -133,6 +152,57 @@ function evidenceFor(step: string): Record<string, unknown> {
     default:
       throw new Error(`unknown step: ${step}`)
   }
+}
+
+function observationDataFor(step: string): Record<string, unknown> {
+  switch (step) {
+    case 'routine_created':
+      return { http_status: 303, routine_id: TARGET.routine_id, project_id: TARGET.project_id, status: 'draft' }
+    case 'routine_enabled':
+      return { http_status: 303, routine_id: TARGET.routine_id, status: 'enabled' }
+    case 'manual_fire':
+      return { http_status: 303, run_id: TARGET.routine_run_id, occurrence_id: 'occurrence-1' }
+    case 'runtime_proposal':
+      return {
+        request_id: 'routine-run:run-propose-1:attempt:1',
+        run_id: TARGET.routine_run_id,
+        agent_id: 'agent-conformance',
+        proposal_status: 'waiting',
+        situation_digest: 'a'.repeat(64),
+      }
+    case 'needs_you_approval':
+      return {
+        needs_you_item_id: 'needs-you-1',
+        task_id: 'control-task-1',
+        verdict: 'approved',
+        action_kind: 'create_task',
+        action_scope: 'internal_only',
+      }
+    case 'terminal_outcome':
+      return {
+        run_status: 'succeeded',
+        cost_micro_usd: 1250,
+        action_key: 'project-routine-lifecycle-run-propose-1',
+        duplicate_replay: true,
+      }
+    case 'restart_parity':
+      return {
+        release_sha: COMMIT,
+        version: VERSION,
+        run_digest: 'b'.repeat(64),
+        situation_digest: 'c'.repeat(64),
+        activity_digest: 'd'.repeat(64),
+        evidence_digest: 'e'.repeat(64),
+      }
+    default:
+      throw new Error(`unknown observation step: ${step}`)
+  }
+}
+
+function observationSourceFor(step: string): string {
+  if (step === 'runtime_proposal') return 'runtime'
+  if (['routine_created', 'routine_enabled', 'manual_fire', 'needs_you_approval'].includes(step)) return 'browser'
+  return 'rest'
 }
 
 function baseReceipt(step: string, evidence: Record<string, unknown>, observedAt: string) {
@@ -172,14 +242,28 @@ function writeBundle(dir: string, mutate?: (receipt: Record<string, unknown>, fi
       artifact_type: 'mupot-project-routine-observation/v1',
       step: spec.step,
       observed_at: receipt.observed_at,
-      source: spec.step === 'runtime_proposal' ? 'runtime' : 'rest',
+      source: observationSourceFor(spec.step),
       target: receipt.target,
-      data: { observed: true },
+      data: observationDataFor(spec.step),
     }))
   })
 }
 
 describe('project routine lifecycle receipt checker', () => {
+  it('detects tracked source changes before exact-commit evidence is accepted', () => {
+    const repo = tempDir()
+    execFileSync('git', ['init', '-q'], { cwd: repo })
+    execFileSync('git', ['config', 'user.email', 'receipt-test@mupot.invalid'], { cwd: repo })
+    execFileSync('git', ['config', 'user.name', 'Receipt Test'], { cwd: repo })
+    writeFileSync(join(repo, 'tracked.txt'), 'clean\n')
+    execFileSync('git', ['add', 'tracked.txt'], { cwd: repo })
+    execFileSync('git', ['commit', '-qm', 'fixture'], { cwd: repo })
+
+    expect(gitWorktreeClean(repo)).toBe(true)
+    writeFileSync(join(repo, 'tracked.txt'), 'dirty\n')
+    expect(gitWorktreeClean(repo)).toBe(false)
+  })
+
   it('provides exact package plan and check commands', () => {
     const pkg = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8'))
     expect(pkg.scripts['receipt:project-routine:plan']).toBe(
@@ -231,7 +315,7 @@ describe('project routine lifecycle receipt checker', () => {
     const dir = tempDir()
     writeBundle(dir)
 
-    const receipt = checkBundle({
+    const receipt = checkTestBundle({
       outDir: dir,
       pot: TARGET.pot,
       baseUrl: TARGET.base_url,
@@ -254,7 +338,7 @@ describe('project routine lifecycle receipt checker', () => {
     writeBundle(dir)
     writeFileSync(join(dir, 'screenshots/desktop-propose-mode.png'), 'not-a-png')
 
-    const receipt = checkBundle({
+    const receipt = checkTestBundle({
       outDir: dir,
       expectedCommit: COMMIT,
       expectedVersion: VERSION,
@@ -276,7 +360,7 @@ describe('project routine lifecycle receipt checker', () => {
       Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     )
 
-    const receipt = checkBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    const receipt = checkTestBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
@@ -293,7 +377,7 @@ describe('project routine lifecycle receipt checker', () => {
       Buffer.concat([screenshotPng(), Buffer.from('not-image-data')]),
     )
 
-    const receipt = checkBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    const receipt = checkTestBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
@@ -313,7 +397,7 @@ describe('project routine lifecycle receipt checker', () => {
       writeFileSync(join(missingDir, spec.file), JSON.stringify(receipt, null, 2))
     })
 
-    const receipt = checkBundle({
+    const receipt = checkTestBundle({
       outDir: missingDir,
       expectedCommit: COMMIT,
       expectedVersion: VERSION,
@@ -336,7 +420,7 @@ describe('project routine lifecycle receipt checker', () => {
     const dir = tempDir()
     writeBundle(dir)
 
-    const receipt = checkBundle({
+    const receipt = checkTestBundle({
       outDir: dir,
       expectedCommit: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
       expectedVersion: '9.9.9',
@@ -367,7 +451,7 @@ describe('project routine lifecycle receipt checker', () => {
       }
     })
 
-    const receipt = checkBundle({
+    const receipt = checkTestBundle({
       outDir: dir,
       expectedCommit: otherCommit,
       expectedVersion: '9.9.9',
@@ -397,7 +481,7 @@ describe('project routine lifecycle receipt checker', () => {
       evidence.external_action_approved = false
     })
 
-    const receipt = checkBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    const receipt = checkTestBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
     expect(receipt.status).toBe('pass')
   })
 
@@ -410,7 +494,7 @@ describe('project routine lifecycle receipt checker', () => {
       evidence.external_action_approved = false
     })
 
-    const receipt = checkBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    const receipt = checkTestBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
@@ -424,7 +508,7 @@ describe('project routine lifecycle receipt checker', () => {
     for (const relative of REQUIRED_SCREENSHOTS) {
       writeFileSync(join(blankScreenshotDir, relative), screenshotPng(true))
     }
-    const blankScreenshotReceipt = checkBundle({
+    const blankScreenshotReceipt = checkTestBundle({
       outDir: blankScreenshotDir,
       expectedCommit: COMMIT,
       expectedVersion: VERSION,
@@ -441,7 +525,7 @@ describe('project routine lifecycle receipt checker', () => {
       join(assertionOnlyDir, 'artifacts', 'manual_fire.json'),
       JSON.stringify({ step: 'manual_fire', verified: true }),
     )
-    const assertionOnlyReceipt = checkBundle({
+    const assertionOnlyReceipt = checkTestBundle({
       outDir: assertionOnlyDir,
       expectedCommit: COMMIT,
       expectedVersion: VERSION,
@@ -451,6 +535,45 @@ describe('project routine lifecycle receipt checker', () => {
       ok: false,
       check: 'receipt_artifact_observation_type',
     }))
+
+    const genericObservationDir = tempDir()
+    writeBundle(genericObservationDir)
+    writeFileSync(
+      join(genericObservationDir, 'artifacts', 'manual_fire.json'),
+      JSON.stringify({
+        artifact_type: 'mupot-project-routine-observation/v1',
+        step: 'manual_fire',
+        observed_at: '2026-07-19T18:02:00.000Z',
+        source: 'browser',
+        target: TARGET,
+        data: { observed: true },
+      }),
+    )
+    const genericObservationReceipt = checkTestBundle({
+      outDir: genericObservationDir,
+      expectedCommit: COMMIT,
+      expectedVersion: VERSION,
+    })
+    expect(genericObservationReceipt.status).toBe('fail')
+    expect(genericObservationReceipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'receipt_artifact_data_proves_step',
+    }))
+  })
+
+  it('rejects oversized screenshot dimensions before decompression', () => {
+    const dir = tempDir()
+    writeBundle(dir)
+    for (const relative of REQUIRED_SCREENSHOTS) {
+      writeFileSync(join(dir, relative), oversizedScreenshotPng())
+    }
+
+    const receipt = checkTestBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'screenshot_dimensions_bounded',
+    }))
   })
 
   it('fails when any receipt omits a target identity field', () => {
@@ -459,7 +582,7 @@ describe('project routine lifecycle receipt checker', () => {
       if (file === 'manual-fire.json') delete (receipt.target as Record<string, unknown>).commit
     })
 
-    const receipt = checkBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    const receipt = checkTestBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
@@ -473,7 +596,7 @@ describe('project routine lifecycle receipt checker', () => {
     writeBundle(missingList, (receipt, file) => {
       if (file === 'manual-fire.json') delete receipt.artifacts
     })
-    const missingListReceipt = checkBundle({ outDir: missingList, expectedCommit: COMMIT, expectedVersion: VERSION })
+    const missingListReceipt = checkTestBundle({ outDir: missingList, expectedCommit: COMMIT, expectedVersion: VERSION })
     expect(missingListReceipt.status).toBe('fail')
     expect(missingListReceipt.checks).toContainEqual(expect.objectContaining({
       ok: false, check: 'receipt_artifacts_declared', path: join(missingList, 'manual-fire.json'),
@@ -485,7 +608,7 @@ describe('project routine lifecycle receipt checker', () => {
         receipt.artifacts = [{ label: 'missing proof', path: 'artifacts/missing.json' }]
       }
     })
-    const missingFileReceipt = checkBundle({ outDir: missingFile, expectedCommit: COMMIT, expectedVersion: VERSION })
+    const missingFileReceipt = checkTestBundle({ outDir: missingFile, expectedCommit: COMMIT, expectedVersion: VERSION })
     expect(missingFileReceipt.status).toBe('fail')
     expect(missingFileReceipt.checks).toContainEqual(expect.objectContaining({
       ok: false, check: 'receipt_artifact_file_present', artifact_path: 'artifacts/missing.json',
@@ -497,7 +620,7 @@ describe('project routine lifecycle receipt checker', () => {
     writeBundle(traversal, (receipt, file) => {
       if (file === 'manual-fire.json') receipt.artifacts = [{ label: 'outside', path: '../outside.json' }]
     })
-    const traversalReceipt = checkBundle({ outDir: traversal, expectedCommit: COMMIT, expectedVersion: VERSION })
+    const traversalReceipt = checkTestBundle({ outDir: traversal, expectedCommit: COMMIT, expectedVersion: VERSION })
     expect(traversalReceipt.status).toBe('fail')
     expect(traversalReceipt.checks).toContainEqual(expect.objectContaining({
       ok: false, check: 'receipt_artifact_reference_valid', artifact_path: '../outside.json',
@@ -506,10 +629,43 @@ describe('project routine lifecycle receipt checker', () => {
     const secret = tempDir()
     writeBundle(secret)
     writeFileSync(join(secret, 'artifacts', 'manual_fire.json'), JSON.stringify({ authorization: 'Bearer abcdefghijklmnop' }))
-    const secretReceipt = checkBundle({ outDir: secret, expectedCommit: COMMIT, expectedVersion: VERSION })
+    const secretReceipt = checkTestBundle({ outDir: secret, expectedCommit: COMMIT, expectedVersion: VERSION })
     expect(secretReceipt.status).toBe('fail')
     expect(secretReceipt.checks).toContainEqual(expect.objectContaining({
       ok: false, check: 'receipt_artifact_has_no_secret_material', artifact_path: 'artifacts/manual_fire.json',
+    }))
+
+    const secretValue = 'sk-proj-abcdefghijklmnopqrstuvwxyz123456'
+    const receiptSecret = tempDir()
+    writeBundle(receiptSecret, (receipt, file) => {
+      if (file === 'runtime-proposal.json') {
+        const evidence = receipt.evidence as Record<string, unknown>
+        evidence.agent_identity = secretValue
+      }
+    })
+    const receiptSecretResult = checkTestBundle({
+      outDir: receiptSecret,
+      expectedCommit: COMMIT,
+      expectedVersion: VERSION,
+    })
+    expect(receiptSecretResult.status).toBe('fail')
+    expect(JSON.stringify(receiptSecretResult)).not.toContain(secretValue)
+
+    const nestedSecret = tempDir()
+    writeBundle(nestedSecret)
+    const nestedPath = join(nestedSecret, 'artifacts', 'manual_fire.json')
+    const nestedArtifact = JSON.parse(readFileSync(nestedPath, 'utf8'))
+    nestedArtifact.data.token = ['unknown-provider-secret']
+    writeFileSync(nestedPath, JSON.stringify(nestedArtifact))
+    const nestedSecretResult = checkTestBundle({
+      outDir: nestedSecret,
+      expectedCommit: COMMIT,
+      expectedVersion: VERSION,
+    })
+    expect(nestedSecretResult.status).toBe('fail')
+    expect(nestedSecretResult.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'receipt_artifact_has_no_secret_material',
     }))
   })
 
@@ -523,7 +679,7 @@ describe('project routine lifecycle receipt checker', () => {
       }
     })
 
-    const receipt = checkBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    const receipt = checkTestBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
     expect(receipt.status).toBe('fail')
     expect(receipt.checks).toContainEqual(expect.objectContaining({
       ok: false,
@@ -550,7 +706,7 @@ describe('project routine lifecycle receipt checker', () => {
       }
     })
 
-    const receipt = checkBundle({
+    const receipt = checkTestBundle({
       outDir: dir,
       expectedCommit: COMMIT,
       expectedVersion: VERSION,
@@ -573,7 +729,7 @@ describe('project routine lifecycle receipt checker', () => {
       }
     })
 
-    const receipt = checkBundle({
+    const receipt = checkTestBundle({
       outDir: dir,
       expectedCommit: COMMIT,
       expectedVersion: VERSION,
@@ -601,7 +757,7 @@ describe('project routine lifecycle receipt checker', () => {
       }
     })
 
-    const receipt = checkBundle({
+    const receipt = checkTestBundle({
       outDir: dir,
       expectedCommit: COMMIT,
       expectedVersion: VERSION,
@@ -614,6 +770,28 @@ describe('project routine lifecycle receipt checker', () => {
     }))
   })
 
+  it('rejects approved external execution in the internal-only lifecycle profile', () => {
+    const dir = tempDir()
+    writeBundle(dir, (receipt, file) => {
+      if (file !== 'needs-you-approval.json') return
+      const evidence = receipt.evidence as Record<string, unknown>
+      evidence.action_scope = 'external'
+      evidence.external_action_executed = true
+      evidence.external_action_approved = true
+    })
+
+    const receipt = checkTestBundle({ outDir: dir, expectedCommit: COMMIT, expectedVersion: VERSION })
+    expect(receipt.status).toBe('fail')
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'lifecycle_action_scope_internal_only',
+    }))
+    expect(receipt.checks).toContainEqual(expect.objectContaining({
+      ok: false,
+      check: 'no_external_action_executed',
+    }))
+  })
+
   it('fails when an unapproved external action flag is present', () => {
     const dir = tempDir()
     writeBundle(dir, (receipt, file) => {
@@ -623,7 +801,7 @@ describe('project routine lifecycle receipt checker', () => {
       }
     })
 
-    const receipt = checkBundle({
+    const receipt = checkTestBundle({
       outDir: dir,
       expectedCommit: COMMIT,
       expectedVersion: VERSION,
