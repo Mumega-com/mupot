@@ -50,7 +50,19 @@ describe('scheduled invocation budget', () => {
   })
 
   it('fails closed for unrecognized or legacy cron triggers', async () => {
-    expect(await scheduledFanout(0, '*/15 * * * *')).toBe(0)
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      expect(await scheduledFanout(0, '*/15 * * * *')).toBe(0)
+      expect(warning).toHaveBeenCalledOnce()
+      expect(warning).toHaveBeenCalledWith('[scheduled:unmatched-cron]', {
+        kind: 'unmatched_cron',
+        scheduled_time: '2026-07-27T16:00:00.000Z',
+        expected_trigger_count: 2,
+      })
+      expect(JSON.stringify(warning.mock.calls)).not.toContain('*/15 * * * *')
+    } finally {
+      warning.mockRestore()
+    }
   })
 
   it('preserves all ten maintenance heartbeats within each fifteen-minute window', async () => {
