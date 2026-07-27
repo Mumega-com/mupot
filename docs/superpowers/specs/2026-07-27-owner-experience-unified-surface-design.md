@@ -187,21 +187,34 @@ Trust levels map 1:1 onto existing `Autonomy` (no parallel enum):
 
 **Widen rule (contract-enforced shape):**
 
-- Input: ordered list of **receipt ids** claimed as wins, current autonomy,
-  proposed next autonomy, acting principal.
+- Input requires **projectId** and **agentId** (scope keys on the gate itself —
+  not a sibling table convention). Fail closed on mismatch.
+- Wins are **branded `VerifiedWinRef`** minted only by
+  `verifiedWinRefFromResolver(resolver, receiptId, scope)`. The resolver is the
+  trust boundary (Port-4 InstinctChat pattern). A caller-written
+  `{ verification: 'resolved_by_id' }` label is rejected — mechanism-lock ≠
+  trust-lock. The brand carries resolved **content** (polarity must be `win`,
+  projectId, agentId, resolvedAt), so constructing it without a real lookup is
+  structurally impossible at the type boundary.
 - Pure gate passes only when:
   1. `proposed` is exactly one step above `current` (no skip-to-blanket),
   2. `actingPrincipal` is an owner/admin human (never the mubot agent id),
   3. `verifiedWinCount >= requiredWinsForStep` (v1 default: 3),
-  4. every win id is marked `verification: 'resolved_by_id'` — callers that only
-     have a free-string "source label" fail closed (`unverified_label`).
+  4. every win is a branded ref matching the input scope,
+  5. none of the win receipt ids appear in `consumedReceiptIds`.
+- On success the decision returns `consumeReceiptIds`; the caller must persist
+  them before the next widen. **Rate/consumption story (named):**
+  `mark_consumed_after_successful_widen` — the same three receipts cannot walk
+  suggest → draft → execute_with_approval → execute. Outer defense remains the
+  audit trail plus mandatory owner review of each widen.
+- Worth knowing: per existing `autonomyImpliesGate`, `execute` is NOT
+  auto-gated (only `execute_with_approval` is). The top of this ladder is the
+  state where tasks stop being auto-gated.
 - Narrowing (after a miss / gate FAIL storm) is always allowed to owner; mubot
   may *recommend* narrow, never self-narrow to escape accountability.
 
-This deliberately does **not** call Port-4. Verification binding to the real
-receipt store is a build-slice concern; the contract locks the fail-closed shape
-so a later slice cannot "trust the label."
-
+This deliberately does **not** call Port-4 for instincts. Verification binds to
+`workflow_receipts` via the injected resolver at the build-slice wiring layer.
 ### 4.5 Honest progress (no fake-green)
 
 `decideProgressDisplay`:
