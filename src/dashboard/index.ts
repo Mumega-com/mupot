@@ -1040,14 +1040,15 @@ dashboardApp.get('/agents', async (c) => {
   )
 })
 
-// POST /agents — create an agent (owner/admin only).
+// POST /agents — create an agent (squad lead/admin or org admin).
 dashboardApp.post('/agents', async (c) => {
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) {
-    return c.html(shell(c.env, 'Agents', errorBody('Creating an agent requires owner or admin.')), 403)
-  }
   const form = await c.req.parseBody()
   const squadId = typeof form.squad_id === 'string' ? form.squad_id.trim() : ''
+  const grants = auth.capabilities ?? []
+  if (!isOrgAdmin(auth) && !(await memberCanOnSquad(c.env, grants, squadId, 'lead'))) {
+    return c.html(shell(c.env, 'Agents', errorBody('Creating an agent requires squad lead/admin or org admin.')), 403)
+  }
   if (!squadId) {
     return c.html(shell(c.env, 'Agents', errorBody('Pick a squad for the agent.')), 400)
   }
@@ -1396,7 +1397,9 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
       403,
     )
   }
-  if (!isOrgAdmin(auth)) {
+  const grants = auth.capabilities ?? []
+  const hasAdminOrLead = isOrgAdmin(auth) || grants.some(g => g.capability === 'admin' || g.capability === 'lead' || g.capability === 'owner')
+  if (!hasAdminOrLead) {
     return c.html(
       shell(c.env, 'Mint agent token', errorBody('Minting an agent token requires owner or admin.')),
       403,
@@ -1458,6 +1461,14 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
     )
   }
   const agent = agentResult.value
+
+  // Gate check: caller must be org admin OR squad admin on the agent's target squad
+  if (!isOrgAdmin(auth) && !(await memberCanOnSquad(c.env, grants, agent.squad_id, 'admin'))) {
+    return c.html(
+      shell(c.env, 'Mint agent token', errorBody('Minting an agent token requires squad admin or org admin.')),
+      403,
+    )
+  }
 
   // Delegate to the shared atomic-mint helper. A first mint creates the member,
   // binding, home capability, and welded token; later mints add only the token.
