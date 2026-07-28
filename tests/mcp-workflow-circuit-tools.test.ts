@@ -16,7 +16,7 @@ const migrations = [
   '../migrations/0023_connectors.sql',
   '../migrations/0050_addons.sql',
   '../migrations/0052_addon_bindings.sql',
-  '../migrations/0072_workflow_circuits.sql',
+  '../migrations/0075_workflow_circuits.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const TENANT = 'tenant-a'
