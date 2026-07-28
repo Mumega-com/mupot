@@ -28,7 +28,9 @@ export type PolicyFindingCode =
   | 'json_ts_mirror_missing_ts_constant'
   | 'json_ts_mirror_value_mismatch'
   | 'json_ts_mirror_literal_in_test'
-  | 'json_ts_mirror_missing_test_assertion'
+  // Token-presence lint only: regex over suite source. Commented-out /
+  // it.skip / dead-branch text still "count". Not a behavioral enforcement.
+  | 'json_ts_mirror_assertion_token_absent'
 
 export interface PolicyFinding {
   code: PolicyFindingCode
@@ -208,8 +210,11 @@ export function checkTestSourceMirrors(
     const pathLabel = jsonPathKey(mirror.jsonPath)
     if (!mirrorUsesTsConstant(testSource, accessPath, mirror.tsExportName)) {
       findings.push({
-        code: 'json_ts_mirror_missing_test_assertion',
-        message: `test must assert ${accessPath} against TS export "${mirror.tsExportName}" (spread array or direct .toBe)`,
+        code: 'json_ts_mirror_assertion_token_absent',
+        message:
+          `suite source text lacks an assertion-token for ${accessPath} vs "${mirror.tsExportName}" `
+          + `(spread/direct .toBe/.toEqual). This is a text-presence lint — comments and `
+          + `it.skip still match; it does not prove the assertion runs.`,
         jsonPath: pathLabel,
         tsExportName: mirror.tsExportName,
       })

@@ -9,6 +9,23 @@
 
 export const BRAIN_LEARNING_RANKER_CONTRACT_ID = 'brain-learning-ranker/v1' as const
 
+/**
+ * Lifecycle authority for docs/brain-learning-ranker-v1.json — frozen here so
+ * the consumer suite cannot self-certify by widening a test-local set.
+ * Drift-locked against design.md (CONTRACT_STATUS=… / WHO_MAY_FLIP=…).
+ */
+export const CONTRACT_STATUS = 'design' as const
+export const CONTRACT_STATUS_ALLOWED = Object.freeze([
+  'design',
+  'dyad-gate',
+  'live',
+] as const)
+export const CONTRACT_STATUS_WHO_MAY_FLIP = Object.freeze([
+  'loom',
+  'kasra',
+  'athena-gate',
+] as const)
+
 export const LEARNING_RANKER_PIPELINE = [
   'loadBoardContext',
   'recallInstincts',

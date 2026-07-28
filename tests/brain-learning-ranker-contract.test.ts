@@ -5,6 +5,9 @@ import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import {
   ALLOWED_BRAIN_PROPOSAL_KINDS,
+  CONTRACT_STATUS,
+  CONTRACT_STATUS_ALLOWED,
+  CONTRACT_STATUS_WHO_MAY_FLIP,
   DISTILL_ALLOWED_SOURCES,
   DISTILL_FORBIDDEN_SOURCES,
   EXAMPLE_FABRICATION_INSTINCT_ID,
@@ -58,8 +61,6 @@ import {
   type VerifiedReceiptRef,
 } from '../src/brain/learning-ranker-contract'
 import { runContractAssertPolicy } from '../src/contracts/contract-assert-policy'
-
-const ALLOWED_CONTRACT_STATUSES = ['design', 'dyad-gate', 'live'] as const
 
 const contract = JSON.parse(
   readFileSync(new URL('../docs/brain-learning-ranker-v1.json', import.meta.url), 'utf8'),
@@ -134,7 +135,8 @@ function instinct(
 describe('brain-learning-ranker/v1 contract doc', () => {
   it('is the design-status learning-ranker contract', () => {
     expect(contract.id).toBe('brain-learning-ranker/v1')
-    expect(ALLOWED_CONTRACT_STATUSES).toContain(contract.status)
+    expect(contract.status).toBe(CONTRACT_STATUS)
+    expect([...CONTRACT_STATUS_ALLOWED]).toContain(contract.status)
     expect(contract.contrast.learningRanker.mayAct).toBe(false)
     expect(contract.contrast.learningRanker.hotPathLlm).toBe(false)
     expect(contract.contrast.learningRanker.learning).toBe('port4-instinct-loop')
@@ -155,8 +157,8 @@ describe('brain-learning-ranker/v1 contract doc', () => {
         lifecycleFields: [
           {
             field: 'status',
-            allowedValues: ALLOWED_CONTRACT_STATUSES,
-            whoMayFlip: ['loom', 'kasra', 'athena-gate'],
+            allowedValues: CONTRACT_STATUS_ALLOWED,
+            whoMayFlip: CONTRACT_STATUS_WHO_MAY_FLIP,
           },
         ],
         jsonTsMirrors: [
@@ -223,6 +225,20 @@ describe('brain-learning-ranker/v1 contract doc', () => {
     expect(designMd).toMatch(/MAX_LEARN_DELTA=5/)
     expect(designMd).toMatch(/noop-veto-full-block-unbounded-priority/)
     expect(designMd).toMatch(/audited `delta` records the true priority change/)
+    // F-1: lifecycle authority lives in frozen TS + design.md, not a test-local set.
+    expect(designMd).toMatch(/CONTRACT_STATUS=design/)
+    expect(designMd).toMatch(/CONTRACT_STATUS_ALLOWED=design,dyad-gate,live/)
+    expect(designMd).toMatch(
+      /CONTRACT_STATUS_WHO_MAY_FLIP=loom,kasra,athena-gate/,
+    )
+    expect([...CONTRACT_STATUS_ALLOWED]).toEqual(['design', 'dyad-gate', 'live'])
+    expect([...CONTRACT_STATUS_WHO_MAY_FLIP]).toEqual([
+      'loom',
+      'kasra',
+      'athena-gate',
+    ])
+    expect(Object.isFrozen(CONTRACT_STATUS_ALLOWED)).toBe(true)
+    expect(Object.isFrozen(CONTRACT_STATUS_WHO_MAY_FLIP)).toBe(true)
   })
 
   it('locks the load-bearing invariants including split fences', () => {
