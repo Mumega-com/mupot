@@ -22,7 +22,14 @@ function applyBeforeTarget(sqlite: Sqlite): void {
 }
 
 function applyTarget(sqlite: Sqlite): void {
-  sqlite.exec(readFileSync(join(DIR, TARGET), 'utf8'))
+  sqlite.exec('PRAGMA foreign_keys = ON; BEGIN')
+  try {
+    sqlite.exec(readFileSync(join(DIR, TARGET), 'utf8'))
+    sqlite.exec('COMMIT')
+  } catch (error) {
+    sqlite.exec('ROLLBACK')
+    throw error
+  }
 }
 
 function seedOrg(sqlite: Sqlite): void {
@@ -185,6 +192,131 @@ describe('0071 agent connection contract migration', () => {
       `)
 
       expect(() => applyTarget(h.sqlite)).toThrow(/CHECK constraint failed.*ok/)
+    } finally {
+      h.close()
+    }
+  })
+
+  it('blocks migration when one historical member represents two agents', () => {
+    const h = createBeforeTargetHarness()
+    try {
+      addSecondAgentAndMember(h.sqlite)
+      h.sqlite.exec(`
+        INSERT INTO member_tokens
+          (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+        VALUES
+          ('token-1', 'member-1', 'hash-1', '', 'workspace', '${NOW}', 'agent-1', 'tenant-a'),
+          ('token-2', 'member-1', 'hash-2', '', 'workspace', '${NOW}', 'agent-2', 'tenant-a');
+      `)
+
+      expect(() => applyTarget(h.sqlite)).toThrow(/CHECK constraint failed.*ok/)
+      expect(h.sqlite.prepare(`
+        SELECT COUNT(*) AS count
+          FROM sqlite_master
+         WHERE type = 'table' AND name = 'agent_member_bindings'
+      `).get()).toEqual({ count: 0 })
+    } finally {
+      h.close()
+    }
+  })
+
+  it('blocks migration when a revoked historical credential contradicts the live member', () => {
+    const h = createBeforeTargetHarness()
+    try {
+      addSecondAgentAndMember(h.sqlite)
+      h.sqlite.exec(`
+        INSERT INTO member_tokens
+          (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id, tenant)
+        VALUES
+          ('token-live', 'member-1', 'hash-live', '', 'workspace', '${NOW}', NULL, 'agent-1', 'tenant-a'),
+          ('token-old', 'member-2', 'hash-old', '', 'workspace', '${NOW}', '${LATER}', 'agent-1', 'tenant-a');
+      `)
+
+      expect(() => applyTarget(h.sqlite)).toThrow(/CHECK constraint failed.*ok/)
+      expect(h.sqlite.prepare(
+        "SELECT agent_id, revoked_at FROM member_tokens WHERE id = 'token-old'",
+      ).get()).toEqual({ agent_id: 'agent-1', revoked_at: LATER })
+    } finally {
+      h.close()
+    }
+  })
+
+  it('removes a signed key that no longer resolves to an agent id or slug', () => {
+    const h = createBeforeTargetHarness()
+    try {
+      h.sqlite.exec(`
+        INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
+        VALUES ('tenant-a', 'agent-missing', 'public-key', 'Ed25519', 'member-1', 1);
+      `)
+
+      applyTarget(h.sqlite)
+
+      expect(h.sqlite.prepare(
+        "SELECT COUNT(*) AS count FROM agent_keys WHERE agent_id = 'agent-missing'",
+      ).get()).toEqual({ count: 0 })
+    } finally {
+      h.close()
+    }
+  })
+
+  it('preserves a signed key registered under the legacy agent slug', () => {
+    const h = createBeforeTargetHarness()
+    try {
+      h.sqlite.exec(`
+        INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
+        VALUES ('tenant-a', 'agent', 'public-key', 'Ed25519', 'member-1', 1);
+      `)
+
+      applyTarget(h.sqlite)
+
+      expect(h.sqlite.prepare(
+        "SELECT COUNT(*) AS count FROM agent_keys WHERE agent_id = 'agent'",
+      ).get()).toEqual({ count: 1 })
+    } finally {
+      h.close()
+    }
+  })
+
+  it('revokes and detaches a live credential welded to a deleted agent', () => {
+    const h = createBeforeTargetHarness()
+    try {
+      h.sqlite.exec(`
+        INSERT INTO member_tokens
+          (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id, tenant)
+        VALUES
+          ('token-orphan', 'member-1', 'hash-orphan', '', 'workspace', '${NOW}', NULL, 'agent-missing', 'tenant-a');
+      `)
+
+      applyTarget(h.sqlite)
+
+      expect(h.sqlite.prepare(
+        "SELECT agent_id, revoked_at FROM member_tokens WHERE id = 'token-orphan'",
+      ).get()).toEqual({ agent_id: 'agent-missing', revoked_at: expect.any(String) })
+      expect(h.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM agent_member_bindings',
+      ).get()).toEqual({ count: 0 })
+    } finally {
+      h.close()
+    }
+  })
+
+  it('rolls stale-credential reconciliation back when live identity remains ambiguous', () => {
+    const h = createBeforeTargetHarness()
+    try {
+      addSecondAgentAndMember(h.sqlite)
+      h.sqlite.exec(`
+        INSERT INTO member_tokens
+          (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id, tenant)
+        VALUES
+          ('token-orphan', 'member-1', 'hash-orphan', '', 'workspace', '${NOW}', NULL, 'agent-missing', 'tenant-a'),
+          ('token-live-1', 'member-1', 'hash-live-1', '', 'workspace', '${NOW}', NULL, 'agent-1', 'tenant-a'),
+          ('token-live-2', 'member-2', 'hash-live-2', '', 'workspace', '${NOW}', NULL, 'agent-1', 'tenant-a');
+      `)
+
+      expect(() => applyTarget(h.sqlite)).toThrow(/CHECK constraint failed.*ok/)
+      expect(h.sqlite.prepare(
+        "SELECT agent_id, revoked_at FROM member_tokens WHERE id = 'token-orphan'",
+      ).get()).toEqual({ agent_id: 'agent-missing', revoked_at: null })
     } finally {
       h.close()
     }

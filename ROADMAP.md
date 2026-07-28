@@ -8,13 +8,13 @@ numbers.
 
 | State | Version | Meaning |
 |---|---|---|
-| Stable release | `v0.23.0` | Trusted Runtime. This is the latest tagged release and the version reported by `https://mupot.mumega.com/health` on 2026-07-19. |
-| Development target | `v0.24.0` | Project Operations. Post-`v0.23.0` Project, addon, Project Link, and Agent Host work belongs to this release until its gate passes. |
-| Next planned | `v0.25.0` | Project Routines, Needs You, and Console Consolidation. |
+| Stable release | `v0.25.0` | Project Routines and Needs You. |
+| Development target | `v0.26.0` | Governed Tools, Marketing/CRO Pilot, Identity and Unified Access, and Console Consolidation. |
+| Next planned | `v0.27.0` | Agent Computers and Recovery. |
 
-Code merged or deployed after `v0.23.0` is not retroactively part of `v0.23.0`.
-Until `v0.24.0` ships, those capabilities are preview behavior and must not be
-described as stable `v0.23.0` features.
+Code merged or deployed after the `v0.25.0` tag is not retroactively part of
+`v0.25.0`. Capabilities remain preview until the release that owns them passes its
+gate and is tagged.
 
 ## Product hierarchy
 
@@ -45,11 +45,12 @@ Pot
 Making **Project** the organizing center (v0.24) is not a single feature — it
 resets what the rest of the product should be. Two consequences are now scheduled:
 
-- **Console consolidation (v0.25).** Much of the current navigation became
+- **Console consolidation (v0.26).** Much of the current navigation became
   redundant, duplicated, or orphaned the moment Project tabs existed. A 2026-07-20
   audit found duplicate menu destinations, a "Work" menu that is only a compose
   form, self-declared-dead stubs, and real pages with no nav entry.
-  → [console-navigation-consolidation.md](docs/architecture/console-navigation-consolidation.md).
+  → [console-navigation-consolidation.md](docs/architecture/console-navigation-consolidation.md)
+  and [#584](https://github.com/Mumega-com/mupot/issues/584).
 - **Identity & Unified Access (v0.26).** The token/agent model predates Project and
   cannot express it: authority lives on the member not the token, agents are welded
   onto members, keys can't be fine-grained, and Project isn't a valid RBAC scope.
@@ -109,7 +110,7 @@ Anything merged after the `v0.23.0` tag remains preview until a later release ow
 Trusted Runtime release detail and evidence live in
 [docs/releases/v0.23.0-trusted-runtime.md](docs/releases/v0.23.0-trusted-runtime.md).
 
-### v0.24.0: Project Operations - current development target
+### v0.24.0: Project Operations - stable
 
 **One promise:** A human or agent can open a Project and understand its current goal,
 team, work, runtime activity, blockers, evidence, and next action without searching
@@ -168,7 +169,7 @@ Release gate:
 - one authorized cross-pot Project Link flight succeeds and unauthorized variants fail;
 - no unresolved P0/P1 finding in the release scope.
 
-### v0.25.0: Project Routines and Needs You - planned
+### v0.25.0: Project Routines and Needs You - stable
 
 **One promise:** A Project can run saved work on schedule and place every human
 decision in one understandable queue.
@@ -184,38 +185,14 @@ Must ship:
   and reviewed changes;
 - Project Activity and Evidence include routine fires, skips, failures, and outcomes.
 
-**Also ship — Console consolidation (the Project pivot's navigation consequence).**
-Adding Project as the center made much of the current navigation redundant,
-duplicated, or orphaned; a 2026-07-20 code audit found duplicate destinations, a
-"Work" menu that is only a compose form, self-declared-dead Economy stubs, and
-real pages with no nav entry at all. Design + full audit:
-[docs/architecture/console-navigation-consolidation.md](docs/architecture/console-navigation-consolidation.md).
-
-- collapse project-scoped surfaces into Project tabs (Work absorbs Tasks/Flights/
-  Pull requests; Team absorbs Agents/Squads/Fleet/Radar; Activity absorbs Control
-  Tower; Evidence absorbs Verifications and project-scoped Audit);
-- keep only genuinely workspace-level items top-level (Home, Projects, Approvals,
-  Access, Operations = Health/Deployment/Directory-sync/workspace-Audit, Addons);
-- remove duplicate destinations (Departments/Squads/Tasks pointing at one route) and
-  self-declared-dead stubs (Economy Wallet/Marketplace);
-- give every orphaned-but-real page (Connectors, Brain, Loops, Services, Growth) a
-  nav home or an explicit retirement — no type-the-URL-only pages;
-- **redirect-first, remove-second:** a retired route 301s to its new home for one
-  release before deletion, so no bookmark breaks silently.
-
 Activation:
 
 - Routine service and Needs You view: default-on.
 - Each Routine: disabled until an authorized human enables it.
 - External writes: approval required unless a narrow policy explicitly allows them.
-- Console consolidation: default-on; every remaining sidebar entry renders real,
-  current data or is removed (no dead menu items ships).
 
 Not in `v0.25.0`: event/webhook/alarm triggers, session reuse, model routing,
-per-flight sandboxes, or self-modifying skills.
-
-Release-gate additions (console): no sidebar entry points at a stub or a duplicate
-route; no working page is reachable by URL only; retired routes 301 to their new home.
+per-flight sandboxes, self-modifying skills, or console consolidation.
 
 ### v0.26.0: Governed Tools and Marketing/CRO Pilot - planned
 
@@ -235,6 +212,16 @@ Must ship:
 - **guest-credential precursor:** the scoped, no-raw-secret credential path is the
   same governance family as the Operated Presence guest token (least-privilege,
   capability-ceiling, expiry) — prove it here so v0.29 presence rides a hardened primitive.
+
+**Also ship — Console consolidation.** Complete the Project pivot's navigation
+consequence under [#584](https://github.com/Mumega-com/mupot/issues/584):
+
+- collapse project-scoped work, team, activity, and evidence into Project tabs;
+- keep only genuine workspace-level destinations in the primary navigation;
+- remove duplicate and dead destinations, and give every retained page a nav home;
+- redirect retired routes for one release before removal;
+- require browser evidence that no sidebar item is a stub or duplicate and no retained
+  page is reachable only by typing its URL.
 
 **Also ship — Identity & Unified Access (the token/agent model rework).** A
 2026-07-20 three-lens deep audit (security / simplicity / durability, code + live
@@ -266,7 +253,7 @@ elevation is approval-gated** (Zero-Standing-Privilege, per Teleport/CyberArk); 
 Entra converge on agent-as-principal but keep the human owner). **Audience note: agents
 are the primary operators, humans the exception** — setup runs through an admin agent
 over MCP, so this identity/access model is the flagship and the console consolidation
-(v0.25) is a thin bootstrap/oversight shell, not the main surface.
+(v0.26) is a thin bootstrap/oversight shell, not the main surface.
 
 - **one principal** table with `kind ∈ human|agent` (People and Agents become
   `kind`-filtered views); stop minting agents into the members table; `members`/
@@ -283,7 +270,7 @@ over MCP, so this identity/access model is the flagship and the console consolid
 - enforce the ceiling in `buildAuthContext` (generalize the directory-door zero-cap
   pattern); revocation of a token or grant takes effect immediately.
 
-This is the **Access** surface of the v0.25 console consolidation — ship the menu and
+This is the **Access** surface of the v0.26 console consolidation — ship the menu and
 the model together. It also retires the split-token RBAC edge and supplies the exact
 scoped+TTL credential the v0.29 Operated Presence check-in/out needs.
 
@@ -393,7 +380,7 @@ study. Feature count alone cannot satisfy the GA gate.
 | Mac/Kubernetes Agent Host | `v0.24.0` | Opt-in per host/profile |
 | Routines and RoutineRun | `v0.25.0` | Each Routine explicitly enabled |
 | Needs You review inbox | `v0.25.0` | Default-on projection |
-| Console consolidation (project-centered nav) | `v0.25.0` | Default-on; no dead/duplicate/orphan menus |
+| Console consolidation (project-centered nav) | `v0.26.0` | Default-on; no dead/duplicate/orphan menus |
 | Governed connector actions | `v0.26.0` | Connector and grant required |
 | Unified principals + token-scoped access | `v0.26.0` | Additive migration; implicit full-ceiling grant until scoped |
 | Marketing & CRO addon | `v0.26.0` | Opt-in per Project |

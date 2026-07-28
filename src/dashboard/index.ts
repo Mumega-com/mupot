@@ -136,6 +136,28 @@ import {
   submittedProjectFormValues,
 } from './projects'
 import { stripExternalLifecycleFields } from '../projects/lifecycle-input'
+import {
+  consumeRoutineRunNonce,
+  loadRoutineWorkspace,
+  parseDashboardCursor,
+  routineDashboardErrorStatus,
+  routineInput,
+  routineWorkspaceBody,
+  submittedRoutineFormValues,
+} from './routines'
+import { loadNeedsYouDashboard, needsYouBody } from './needs-you'
+import { routinePrincipal } from '../routines/access'
+import {
+  archiveRoutine,
+  createManualRoutineRun,
+  createRoutine,
+  enableRoutine,
+  getRoutine,
+  getRoutineRun,
+  pauseRoutine,
+  updateRoutine,
+} from '../routines/service'
+import { answerRoutineRun, cancelRoutineRun } from '../routines/actions'
 
 // First-run setup wizard (the easy-onboard centerpiece). Mounted under '/setup'
 // on this same dashboard app, so it inherits the auth + tenant guard below.
@@ -397,6 +419,146 @@ dashboardApp.post('/projects/:id/status', async (c) => {
   return c.redirect(`/projects/${encodeURIComponent(result.value.id)}?status=${transition!.result}`, 303)
 })
 
+// ── Project Routines ───────────────────────────────────────────────────────
+// These HTML handlers only translate form submissions. Policy, authorization,
+// scheduling, idempotency, and cancellation remain owned by shared routine services.
+function dashboardHistoryCursor(value: string | undefined) {
+  return parseDashboardCursor(value)
+}
+
+function validDashboardHistoryQuery(c: { req: { query: (key: string) => string | undefined } }): boolean {
+  for (const key of ['run_limit', 'event_limit', 'routine_limit']) {
+    const value = c.req.query(key)
+    if (value !== undefined && (!/^[1-9]\d?$/.test(value) || Number(value) > 50)) return false
+  }
+  return dashboardHistoryCursor(c.req.query('run_cursor')) !== null
+    && dashboardHistoryCursor(c.req.query('event_cursor')) !== null
+    && dashboardHistoryCursor(c.req.query('routine_cursor')) !== null
+}
+
+dashboardApp.get('/projects/:id/routines', async (c) => {
+  if (!validDashboardHistoryQuery(c)) {
+    return c.html(shell(c.env, 'Project routines', errorBody('Choose a valid routine history page.')), 400)
+  }
+  const runAfter = dashboardHistoryCursor(c.req.query('run_cursor'))
+  const eventAfter = dashboardHistoryCursor(c.req.query('event_cursor'))
+  const routineAfter = dashboardHistoryCursor(c.req.query('routine_cursor'))
+  const runLimit = c.req.query('run_limit')
+  const eventLimit = c.req.query('event_limit')
+  const routineLimit = c.req.query('routine_limit')
+  const view = await loadRoutineWorkspace(c.env, c.get('auth'), c.req.param('id'), {
+    ...(runAfter ? { runAfter } : {}), ...(eventAfter ? { eventAfter } : {}),
+    ...(routineAfter ? { routineAfter } : {}),
+    ...(runLimit ? { runLimit: Number(runLimit) } : {}), ...(eventLimit ? { eventLimit: Number(eventLimit) } : {}),
+    ...(routineLimit ? { routineLimit: Number(routineLimit) } : {}),
+    ...(c.req.query('edit') ? { editId: c.req.query('edit') } : {}),
+    ...(c.req.query('run_id') ? { runId: c.req.query('run_id') } : {}),
+    ...(c.req.query('routine_id') ? { routineId: c.req.query('routine_id') } : {}),
+  })
+  if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  return c.html(shell(c.env, 'Project routines', routineWorkspaceBody(view, { status: c.req.query('status') })))
+})
+
+dashboardApp.post('/projects/:id/routines', async (c) => {
+  const projectId = c.req.param('id')
+  const auth = c.get('auth')
+  const view = await loadRoutineWorkspace(c.env, auth, projectId)
+  if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  if (!view.canManage) return c.html(shell(c.env, 'Project routines', errorBody('Routine administration requires workspace admin.')), 403)
+  const values = submittedRoutineFormValues(await c.req.parseBody())
+  const result = await createRoutine(c.env, routinePrincipal(auth), { ...routineInput(values), project_id: projectId })
+  if (!result.ok) {
+    return c.html(shell(c.env, 'Project routines', routineWorkspaceBody(view, { error: result.error, values })), routineDashboardErrorStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?status=created`, 303)
+})
+
+dashboardApp.post('/projects/:id/routines/:routineId', async (c) => {
+  const projectId = c.req.param('id')
+  const routineId = c.req.param('routineId')
+  const auth = c.get('auth')
+  const view = await loadRoutineWorkspace(c.env, auth, projectId, { editId: routineId })
+  if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  if (!view.canManage) return c.html(shell(c.env, 'Project routines', errorBody('Routine administration requires workspace admin.')), 403)
+  const routine = await getRoutine(c.env, routinePrincipal(auth), routineId)
+  if (!routine || routine.project_id !== projectId) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const values = submittedRoutineFormValues(await c.req.parseBody())
+  const result = await updateRoutine(c.env, routinePrincipal(auth), routineId, routineInput(values))
+  if (!result.ok) {
+    return c.html(shell(c.env, 'Project routines', routineWorkspaceBody(view, { error: result.error, values })), routineDashboardErrorStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?status=updated`, 303)
+})
+
+for (const [command, action, message] of [
+  ['enable', enableRoutine, 'enabled'], ['pause', pauseRoutine, 'paused'], ['archive', archiveRoutine, 'archived'],
+] as const) {
+  dashboardApp.post(`/projects/:id/routines/:routineId/${command}`, async (c) => {
+    const projectId = c.req.param('id')
+    const routineId = c.req.param('routineId')
+    const auth = c.get('auth')
+    const view = await loadRoutineWorkspace(c.env, auth, projectId)
+    if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+    if (!view.canManage) return c.html(shell(c.env, 'Project routines', errorBody('Routine administration requires workspace admin.')), 403)
+    const routine = await getRoutine(c.env, routinePrincipal(auth), routineId)
+    if (!routine || routine.project_id !== projectId) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+    const result = await action(c.env, routinePrincipal(auth), routineId)
+    if (!result.ok) return c.html(shell(c.env, 'Project routines', routineWorkspaceBody(view, { error: result.error })), routineDashboardErrorStatus(result.error))
+    return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?status=${message}`, 303)
+  })
+}
+
+dashboardApp.post('/projects/:id/routines/:routineId/run', async (c) => {
+  const projectId = c.req.param('id')
+  const routineId = c.req.param('routineId')
+  const auth = c.get('auth')
+  const principal = routinePrincipal(auth)
+  const routine = await getRoutine(c.env, principal, routineId)
+  if (!routine || routine.project_id !== projectId) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const form = await c.req.parseBody()
+  if (!await consumeRoutineRunNonce(c.env, auth, routineId, form.nonce)) {
+    const view = await loadRoutineWorkspace(c.env, auth, projectId)
+    return c.html(shell(c.env, 'Project routines', view ? routineWorkspaceBody(view, { error: 'invalid_nonce' }) : projectNotFoundBody()), 400)
+  }
+  const result = await createManualRoutineRun(c.env, principal, routineId, form.nonce as string)
+  if (!result.ok) {
+    const view = await loadRoutineWorkspace(c.env, auth, projectId)
+    return c.html(shell(c.env, 'Project routines', view ? routineWorkspaceBody(view, { error: result.error }) : projectNotFoundBody()), routineDashboardErrorStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?status=run_queued`, 303)
+})
+
+dashboardApp.post('/projects/:id/routines/:runId/cancel', async (c) => {
+  const projectId = c.req.param('id')
+  const runId = c.req.param('runId')
+  const auth = c.get('auth')
+  const principal = routinePrincipal(auth)
+  const run = await getRoutineRun(c.env, principal, runId)
+  if (!run || run.project_id !== projectId) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const result = await cancelRoutineRun(c.env, principal, runId)
+  if (!result.ok) {
+    const view = await loadRoutineWorkspace(c.env, auth, projectId)
+    return c.html(shell(c.env, 'Project routines', view ? routineWorkspaceBody(view, { error: result.error }) : projectNotFoundBody()), routineDashboardErrorStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?status=run_cancelled`, 303)
+})
+
+dashboardApp.post('/projects/:id/routines/:runId/answer', async (c) => {
+  const projectId = c.req.param('id')
+  const runId = c.req.param('runId')
+  const auth = c.get('auth')
+  const principal = routinePrincipal(auth)
+  const run = await getRoutineRun(c.env, principal, runId)
+  if (!run || run.project_id !== projectId) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const form = await c.req.parseBody()
+  const result = await answerRoutineRun(c.env, principal, runId, form.answer)
+  if (!result.ok) {
+    const view = await loadRoutineWorkspace(c.env, auth, projectId, { runId })
+    return c.html(shell(c.env, 'Project routines', view ? routineWorkspaceBody(view, { error: result.error }) : projectNotFoundBody()), routineDashboardErrorStatus(result.error))
+  }
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}/routines?run_id=${encodeURIComponent(runId)}&status=answer_recorded`, 303)
+})
+
 dashboardApp.get('/projects/:id', async (c) => {
   const view = await loadProjectDetail(c.env, c.get('auth'), c.req.param('id'))
   if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
@@ -504,6 +666,23 @@ dashboardApp.get('/approvals', async (c) => {
     loadPublishable(c.env, auth),
   ])
   return c.html(shell(c.env, 'Approvals', approvalsBody(items, publishable)))
+})
+
+dashboardApp.get('/needs-you', async (c) => {
+  const rawLimit = c.req.query('limit')
+  const cursor = c.req.query('cursor')
+  if ((rawLimit !== undefined && (!/^[1-9]\d{0,2}$/.test(rawLimit) || Number(rawLimit) > 100))
+    || (cursor !== undefined && !/^[A-Za-z0-9_-]{1,200}$/.test(cursor))) {
+    return c.html(shell(c.env, 'Needs You', errorBody('Choose a valid Needs You page.')), 400)
+  }
+  try {
+    const view = await loadNeedsYouDashboard(c.env, c.get('auth'), {
+      ...(rawLimit ? { limit: Number(rawLimit) } : {}), ...(cursor ? { after: cursor } : {}),
+    })
+    return c.html(shell(c.env, 'Needs You', needsYouBody(view)))
+  } catch {
+    return c.html(shell(c.env, 'Needs You', errorBody('Choose a valid Needs You page.')), 400)
+  }
 })
 
 // GET /ops — owner/admin health and observability console.
@@ -1170,9 +1349,18 @@ dashboardApp.get('/squads/:id', async (c) => {
 })
 
 // GET /agents/:id — agent console: identity, status, wake button.
+// `:id` accepts id OR unique slug (resolveAgentRef) so /agents/kayhermes works.
 dashboardApp.get('/agents/:id', async (c) => {
-  const agentId = c.req.param('id')
-  const agent = await getById<Agent>(c.env, 'agents', agentId)
+  const ref = c.req.param('id')
+  const resolved = await resolveAgentRef(c.env, ref)
+  if (!resolved.ok) {
+    const msg =
+      resolved.reason === 'ambiguous'
+        ? 'Agent slug is ambiguous — open by UUID instead.'
+        : 'Agent not found.'
+    return c.html(shell(c.env, 'Agent', errorBody(msg)), 404)
+  }
+  const agent = await getById<Agent>(c.env, 'agents', resolved.value.id)
   if (!agent) {
     return c.html(shell(c.env, 'Agent', errorBody('Agent not found.')), 404)
   }
@@ -3160,9 +3348,38 @@ function shell(
       .ui-panel-sub { font-size: 12px; color: var(--dim); margin-top: 1px; }
       .ui-link { font-size: 12.5px; color: var(--primary); text-decoration: none; font-weight: 600; }
       .ui-link:hover { text-decoration: underline; }
+      .routine-form label { display: grid; gap: 5px; min-width: 0; }
+      .routine-form input, .routine-form select, .routine-form textarea {
+        width: 100%; min-width: 0; max-width: 100%;
+      }
+      .routine-table .routine-cell {
+        display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere;
+      }
+      .routine-mobile-label { display: none; }
+      .routine-stack {
+        display: grid; gap: 3px; min-width: 0;
+      }
       .obs-queue-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
       @media (max-width: 720px) {
         .ui-tr.ui-hide-sm-3 > .ui-td:nth-child(n+4), .ui-tr.ui-hide-sm-3 > .ui-th:nth-child(n+4) { display: none; }
+        .routine-table { min-width: 0 !important; }
+        .routine-table .ui-thead {
+          position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+          overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+        }
+        .routine-table .ui-row {
+          grid-template-columns: minmax(0, 1fr) !important;
+          align-items: start; gap: 10px; padding: 14px;
+        }
+        .routine-table .ui-td {
+          display: grid; grid-template-columns: minmax(7rem, 35%) minmax(0, 1fr);
+          gap: 12px; align-items: start;
+        }
+        .routine-table .routine-mobile-label {
+          display: block;
+          font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+          letter-spacing: .6px; text-transform: uppercase; color: var(--dim);
+        }
       }
 
       /* ── /approvals page styles (kept here to avoid duplication) ── */
@@ -3223,6 +3440,11 @@ function shell(
           <a class="nav-link" href="/send">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="5.5" cy="5.5" r="2"/><circle cx="5.5" cy="14.5" r="2"/><circle cx="14.5" cy="10" r="2"/><path d="M5.5 7.5v5M7.4 5.9 12.7 9.2M7.3 13.9 12.7 10.7"/></svg>
             <span class="nav-label">Work</span>
+          </a>
+
+          <a class="nav-link" href="/needs-you">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3.2a6.8 6.8 0 1 0 6.8 6.8"/><path d="M10 6.3v4.2l2.8 1.7"/><path d="M15.2 3.6v3.1h-3.1"/></svg>
+            <span class="nav-label">Needs You</span>
           </a>
 
           <!-- Approvals (with live badge) -->

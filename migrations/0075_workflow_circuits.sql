@@ -1,4 +1,4 @@
--- 0072_workflow_circuits.sql — workflow-circuits addon: a deterministic
+-- 0075_workflow_circuits.sql — workflow-circuits addon: a deterministic
 -- workflow-graph engine. "Circuit schematic," not a router: execution state
 -- propagates only when a node's declared gate rule over its typed input wires
 -- is satisfied. Every wire and rule is declared at define_circuit time, not

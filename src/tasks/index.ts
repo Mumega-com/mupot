@@ -698,10 +698,17 @@ tasksApp.patch('/:id', async (c) => {
     }
   }
   // gate_owner may only be set/changed while status is open or in_progress.
-  // Once a task enters review/approved/rejected/done the gate is locked.
+  // Once a task enters review/approved/rejected/done the gate is locked, except
+  // for owner/admin recovery of historical review rows created without a gate.
   if (body.gate_owner !== undefined) {
     const lockStatuses: ReadonlySet<TaskStatus> = new Set(['review', 'approved', 'rejected', 'done'])
-    if (lockStatuses.has(existing.status)) {
+    const repairsHistoricalUngatedReview =
+      existing.status === 'review' &&
+      existing.gate_owner === null &&
+      typeof body.gate_owner === 'string' &&
+      body.gate_owner.trim().length > 0 &&
+      legacyOwnerAdmin(c.get('auth'))
+    if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview) {
       return c.json({ error: 'gate_owner_locked', status: existing.status }, 409)
     }
     if (body.gate_owner === null) {

@@ -11,6 +11,7 @@ const changelog = read('../CHANGELOG.md')
 const publicApiVersion = read('../src/version.ts')
 const pkg = JSON.parse(read('../package.json')) as { version: string; scripts: Record<string, string> }
 const workflow = read('../.github/workflows/ci.yml')
+const runbook = read('../docs/production-runbook.md')
 
 describe('v0.23.0 Trusted Runtime release gate', () => {
   it('is the named current release target across top-level docs', () => {
@@ -98,13 +99,16 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
   })
 
   it('publishes final stable metadata while retaining the RC evidence boundary', () => {
-    // Current head release is v0.24.0 (Project Operations); v0.23.0 history is retained
+    // Current head release is v0.25.0 (Project Routines); v0.23.0 history is retained
     // permanently below. These two pins track the current shipped version.
-    expect(pkg.version).toBe('0.24.0')
-    expect(publicApiVersion).toContain("MUPOT_PUBLIC_API_VERSION = '0.24.0'")
+    expect(pkg.version).toBe('0.25.0')
+    expect(publicApiVersion).toContain("MUPOT_PUBLIC_API_VERSION = '0.25.0'")
+    expect(changelog).toContain('## [0.25.0] — 2026-07-27')
     expect(changelog).toContain('## [0.24.0] — 2026-07-19')
     expect(changelog).toContain('## [0.23.0] — 2026-07-13')
     expect(changelog).toContain('## [0.23.0-rc.1] — 2026-07-10')
+    expect(roadmap).toContain('Stable release | `v0.25.0`')
+    expect(roadmap).toContain('Console consolidation (project-centered nav) | `v0.26.0`')
     expect(releaseDoc).toContain('The RC uses its own package/API version and prerelease evidence, never the final tag.')
   })
 
@@ -133,6 +137,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     expect(workflow).toContain('bash scripts/ci-local-evidence.sh')
     expect(pkg.scripts['smoke:local']).toBe('node scripts/local-browser-smoke.mjs')
     expect(pkg.scripts['conformance:runtime:local']).toBe('node scripts/local-runtime-conformance.mjs')
+    expect(pkg.scripts['collect:project-routine:local']).toBe('node scripts/project-routine-lifecycle-collect.mjs')
     expect(pkg.scripts['receipt:fresh-install:check']).toBe('node scripts/fresh-install-receipt.mjs --check')
     expect(pkg.scripts['receipt:github-app-permissions:check']).toBe('node scripts/github-app-permissions-receipt.mjs --check')
     expect(pkg.scripts['receipt:work-lifecycle:check']).toBe('node scripts/work-lifecycle-receipt.mjs --check')
@@ -143,6 +148,9 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     expect(pkg.scripts['receipt:production-soak:check']).toBe('node scripts/production-soak-receipt.mjs --check')
     expect(pkg.scripts['receipt:release-candidate:check']).toBe('node scripts/release-candidate-receipt.mjs --check')
     expect(pkg.scripts['receipt:release-integrity:check']).toBe('node scripts/release-integrity-receipt.mjs --check')
+    expect(runbook).toContain('0073_project_routines.sql')
+    expect(runbook).toContain('0074_routine_cancellation_events.sql')
+    expect(runbook).toContain('must complete in the same')
     expect(pkg.scripts['receipt:release-readiness:check']).toBe('node scripts/release-readiness-receipt.mjs --check')
   })
 })

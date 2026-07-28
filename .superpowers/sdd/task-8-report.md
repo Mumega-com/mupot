@@ -1,78 +1,76 @@
-# Task 8 Report: Marketing Monitor Lifecycle Receipt
+# Task 8 Report
 
-## Scope
+## Status
 
-Implemented a reproducible Marketing/CRO monitor lifecycle receipt and a redacted public recommendation preparation endpoint required by the receipt flow.
+DONE
 
-## RED
+## Commit
 
-Initial focused run failed because `scripts/marketing-monitor-lifecycle-receipt.mjs` did not exist:
+Base implementation: `107c455df573bf581e34d20f391aa476b466664a` - `feat: project routine situation and evidence`
 
-```bash
-npx vitest run tests/marketing-monitor-lifecycle-receipt.test.ts --maxWorkers=1 --reporter=verbose
-```
+Review remediation: `e20f97061a1662eb69320b757cfa460536b20a7e` - `fix: harden project routine projections`
 
-Result: import failure for the missing verifier module.
+Situation plan coverage: `c14560a45302354be256c6935a236f0f4c229fdd` - `test: cover routine situation keyset plans`
 
-## Implementation
+## Changed Files
 
-- Added `scripts/marketing-monitor-lifecycle-receipt.mjs` with plan/check modes.
-- Added `receipt:marketing-monitor:plan` and `receipt:marketing-monitor:check` package commands.
-- Added `POST /api/addons/marketing-cro-monitor/recommendation` as an owner/admin-only public route that calls the existing governed recommendation service and returns only redacted recommendation evidence.
-- Added receipt tests covering install, configure with `first_party`, activate, monitor, recommendation prep, console proof, disable, archive, reinstall, repeat, and final archive cleanup.
-- Updated route tests to prove monitor and recommendation public DTOs exclude raw task/flight/dedup IDs.
-- Documented the receipt command and proof contract in the Marketing/CRO monitor design spec.
+- `src/projects/situation.ts`
+- `src/projects/projections.ts`
+- `tests/project-situation.test.ts`
+- `tests/project-projections.test.ts`
+- `migrations/0061_project_routines.sql` (review remediation)
 
-## Review Fixes
+## RED Evidence
 
-First review found important gaps:
+1. `npx vitest run tests/project-situation.test.ts tests/project-projections.test.ts`
+   - Failed as expected before implementation: 4 failures for missing `routines` / `needs_you` Situation state, Routine next-action priority, and Routine Activity/Evidence sources.
+2. `npx vitest run tests/project-projections.test.ts`
+   - Failed as expected after adding the control-plane payload regression: raw `proposal` and `prompt` content remained visible in Routine event/action JSON.
+3. `npx vitest run tests/project-situation.test.ts tests/project-projections.test.ts`
+   - Failed as expected for the review findings: a capped Routine wait source chose a later deadline, 101 enabled manual Routines hid the scheduled occurrence, and Routine projection plans lacked the required matching keyset indexes.
 
-- The checker expected private receipt IDs and actor IDs that the public receipt API intentionally redacts.
-- It expected console recommendation evidence after only running the monitor, but recommendation prep was not public.
-- Raw UUID task/flight references could leak without detection.
-- Unavailable-not-zero was checked only in JSON, not rendered console HTML.
-- Second archive cleanup was not verified.
-- The HTML console request carried both bearer and session cookie.
+## GREEN Evidence
 
-Fixes applied:
+- `npx vitest run tests/project-projections.test.ts`
+  - 24/24 passed after stripping Routine proposal/policy/prompt fields before sanitization.
+- `npx vitest run tests/routine-dispatch.test.ts tests/routine-actions.test.ts`
+  - 31/31 passed after excluding Routine projections from the existing control Task/Flight digest path, preserving stable dispatch/action Situation hashes and statement headroom.
+- `npx vitest run tests/project-situation.test.ts tests/project-projections.test.ts tests/projects-routes.test.ts tests/mcp-project-tools.test.ts tests/dashboard-projects.test.ts tests/routine-dispatch.test.ts tests/routine-actions.test.ts`
+  - 160/160 passed.
+- `npx tsc --noEmit`
+  - Passed.
+- `git diff --check`
+  - Passed before commit.
 
-- Public receipts are now checked by sequence/action/state/digest/version/timestamp only.
-- Added redacted public recommendation-prep route and made the receipt call it.
-- Console proof rejects `task-*`, `flight-*`, and UUID-like raw IDs.
-- Console proof requires unavailable rendering and rejects unavailable revenue rendered as zero.
-- Receipt checks first and second archive ownership counts and final archived catalog state.
-- Console fetch uses `auth: false` so only the session cookie is sent.
+### Review Remediation Verification
 
-Second review approved with no Critical or Important findings.
+- `npx vitest run tests/project-situation.test.ts tests/project-projections.test.ts`
+  - 44/44 passed. Covers the over-cap urgent Routine deadline, manual-Routine next-occurrence cap, stable source keysets, and no-temp-sort index plans for Routine Activity/Evidence.
+- `npx vitest run tests/routines-migration.test.ts tests/migration-d1-compat.test.ts tests/projects-migration.test.ts`
+  - 10/10 passed.
+- `npx vitest run tests/projects-routes.test.ts tests/mcp-project-tools.test.ts tests/dashboard-projects.test.ts`
+  - 88/88 passed.
+- `npx vitest run tests/routine-dispatch.test.ts tests/routine-actions.test.ts`
+  - Task 8 dispatch coverage passed; 18 Routine action tests passed, while one concurrent Task9 test failed because it attempts to delete append-only `routine_run_events`.
+- `npx tsc --noEmit`
+  - Blocked by concurrent Task9 route work in `src/routines/routes.ts` (unused declarations and an `unknown` to `string` assignment).
+- `git diff --check`
+  - Passed before the review remediation commit.
+- `npx vitest run tests/project-situation.test.ts tests/project-projections.test.ts`
+  - 45/45 passed after adding `EXPLAIN QUERY PLAN` coverage for the Situation next-occurrence, active-run, terminal-outcome, and bounded Routine Needs You source scans.
+- `npx vitest run tests/routines-migration.test.ts tests/migration-d1-compat.test.ts tests/projects-migration.test.ts`
+  - 10/10 passed after adding the Situation plan coverage.
 
-## Verification
+## Self-Review
 
-```bash
-npx vitest run tests/marketing-monitor-lifecycle-receipt.test.ts tests/addon-routes.test.ts --maxWorkers=1 --reporter=verbose
-```
+- Situation adds bounded, tenant/project/squad-filtered Routine counts, next occurrence, active/waiting run, latest terminal outcome/cost, and principal-neutral Needs You summary.
+- Existing control snapshots that exclude Routine-owned Task/Flight state retain stable business Situation digests; public callers receive Routine and Needs You state.
+- Activity uses immutable `routine_run_events`; Evidence uses terminal runs and gated/action outcomes only.
+- Every Routine projection uses tenant, project, and responsible-squad predicates, per-source bounds, current projection keyset rules, and projection sanitization. Routine JSON additionally removes proposal, policy, and prompt fields.
+- Tests cover content, priority, visibility filtering, tenant/project isolation, stable Activity keysets, credential/control-field redaction, REST/MCP/dashboard parity, and routine digest compatibility.
+- Review remediation orders every capped Needs You source by the shared global priority keys, uses a separate indexed next-occurrence query, and adds migration-backed expression keyset indexes for Routine projection and Situation ordering.
+- Situation plan coverage verifies each intended Routine ordering index and confirms the bounded `routine_waits` source has no temp sort; the final cross-source Needs You merge remains separately sorted by design.
 
-Result: 2 files / 54 tests passed.
+## Concerns
 
-```bash
-npx vitest run tests/marketing-monitor-lifecycle-receipt.test.ts tests/addon-lifecycle-receipt.test.ts tests/addon-routes.test.ts tests/marketing-monitor-opportunities.test.ts tests/marketing-monitor-service.test.ts tests/dashboard-marketing-cro-monitor.test.ts --maxWorkers=1 --reporter=dot
-```
-
-Result: 6 files / 160 tests passed.
-
-```bash
-npm run typecheck
-```
-
-Result: passed.
-
-```bash
-npx vitest run --maxWorkers=2 --reporter=dot
-```
-
-Result: 211 files / 3527 tests passed.
-
-```bash
-git diff --check
-```
-
-Result: passed.
+The shared worktree contains concurrent Task9 changes. They were not staged or modified by Task8. Those changes currently prevent a clean shared-tree TypeScript run and add one unrelated Routine action test failure; Task8-focused, migration, and Project parity gates are green.

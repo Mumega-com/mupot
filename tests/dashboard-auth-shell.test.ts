@@ -8,16 +8,18 @@ describe('dashboard authenticated account shell', () => {
     expect(dashboardSource).toContain('if (role && (a.role || a.capability)) role.textContent = a.role || a.capability;')
   })
 
-  it('emphasizes Home, Projects, Work, and Approvals in that order', () => {
+  it('emphasizes Home, Projects, Work, Needs You, and Approvals in that order', () => {
     const home = dashboardSource.indexOf('<span class="nav-label">Home</span>')
     const projects = dashboardSource.indexOf('<span class="nav-label">Projects</span>')
     const work = dashboardSource.indexOf('<span class="nav-label">Work</span>')
+    const needsYou = dashboardSource.indexOf('<span class="nav-label">Needs You</span>')
     const approvals = dashboardSource.indexOf('<span class="nav-label">Approvals</span>')
 
     expect(home).toBeGreaterThan(-1)
     expect(projects).toBeGreaterThan(home)
     expect(work).toBeGreaterThan(projects)
-    expect(approvals).toBeGreaterThan(work)
+    expect(needsYou).toBeGreaterThan(work)
+    expect(approvals).toBeGreaterThan(needsYou)
   })
 
   it('retains every existing sidebar destination after adding Projects', () => {

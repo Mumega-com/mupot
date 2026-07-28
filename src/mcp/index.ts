@@ -86,6 +86,7 @@ import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
 import { PRESENCE_TOOLS } from './presence'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
+import { ROUTINE_TOOLS } from './routines'
 import { dispatchFlight } from '../flight/dispatch'
 import {
   deliverFlightLandedEvent,
@@ -907,7 +908,15 @@ const toolTaskUpdate: ToolSpec = {
     }
     if (args.gate_owner !== undefined) {
       const lockStatuses: ReadonlySet<TaskStatus> = new Set(['review', 'approved', 'rejected', 'done'])
-      if (lockStatuses.has(existing.status)) return fail(409, 'gate_owner_locked', { status: existing.status })
+      const repairsHistoricalUngatedReview =
+        existing.status === 'review' &&
+        existing.gate_owner === null &&
+        typeof args.gate_owner === 'string' &&
+        args.gate_owner.trim().length > 0 &&
+        hasWorkspaceAdmin(auth)
+      if (lockStatuses.has(existing.status) && !repairsHistoricalUngatedReview) {
+        return fail(409, 'gate_owner_locked', { status: existing.status })
+      }
       if (args.gate_owner === null) {
         next.gate_owner = null
       } else if (typeof args.gate_owner === 'string' && args.gate_owner.trim().length > 0) {
@@ -2405,11 +2414,15 @@ const toolStatus: ToolSpec = {
     const agentId = str(args.agent_id)
     if (!agentId) {
       // No agent specified → echo the member's own principal (who am I + caps).
+      // bound_agent_id + role are required by fail-closed operator clients (Hermes
+      // mupot plugin): omitting them surfaces as identity_mismatch / overprivileged.
       return done({
         member_id: auth.memberId,
         email: auth.email,
         channel: auth.channel,
         tenant: auth.tenant,
+        role: auth.role,
+        bound_agent_id: auth.boundAgentId ?? null,
         capabilities: auth.capabilities ?? [],
       })
     }
@@ -2494,6 +2507,7 @@ const toolBootContext: ToolSpec = {
       tenant: auth.tenant,
       member_id: auth.memberId,
       channel: auth.channel,
+      role: auth.role,
       capabilities: auth.capabilities ?? [],
       mcp_endpoint: mcpEndpoint(canonicalOrigin(env, ctx.origin)),
       // identity coherence (#126) — NEW field
@@ -2734,6 +2748,7 @@ export const TOOLS: ToolSpec[] = [
   ...LOOP_TOOLS,
   ...PRESENCE_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
+  ...ROUTINE_TOOLS,
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
