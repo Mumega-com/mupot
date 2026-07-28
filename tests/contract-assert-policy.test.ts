@@ -196,7 +196,7 @@ describe('rule 2 — JSON↔TS mirrors via TS exports', () => {
     `
     const findings = checkTestSourceMirrors(literalTest, ownerSpec.jsonTsMirrors)
     expectFinding(findings, 'json_ts_mirror_literal_in_test')
-    expectFinding(findings, 'json_ts_mirror_missing_test_assertion')
+    expectFinding(findings, 'json_ts_mirror_assertion_token_absent')
 
     const missingMirrorTest = `
       expect(contract.loop).toEqual(['goal', 'sense'])
