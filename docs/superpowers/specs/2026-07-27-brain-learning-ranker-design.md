@@ -5,6 +5,12 @@ migration, no BrainPort shape change, no Hermes cutover. Awaiting re-gate after
 BLOCK verdict (2026-07-27, Kasra-core dyad-gate @ `8ceebb5d`) before any build
 slice starts. Unassigned = backlog, not active.
 
+**Lifecycle lock (drift-tested):** `CONTRACT_STATUS=design`;
+`CONTRACT_STATUS_ALLOWED=design,dyad-gate,live`;
+`CONTRACT_STATUS_WHO_MAY_FLIP=loom,kasra,athena-gate`. JSON `status` and the
+suite's membership set must match the frozen TS exports of the same names —
+widening a test-local allowlist or decorative `whoMayFlip` is not authority.
+
 **Thesis owner:** Hadi, 2026-07-23 owner-experience / mubot session — *"replace
 brain with a hermes gateway that learns from fuck-ups?"* Sharpened in-session:
 the **learning** is the instinct loop (not the gateway); keep **rank-not-act**
