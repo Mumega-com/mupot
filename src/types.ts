@@ -50,6 +50,15 @@ export interface Env {
   // Declared in [[kv_namespaces]] binding="OAUTH_KV" in wrangler.toml.
   OAUTH_KV: KVNamespace
   BLOBS: R2Bucket
+  // Static vendor assets (Cloudflare Workers Assets — public/vendor/, currently
+  // Mermaid.js for the /circuits dashboard view). Optional like TASK_WORKFLOW
+  // above: only present once a pot's wrangler.<pot>.toml adds the [assets]
+  // block (see wrangler.example.toml). Nothing in dashboard code calls
+  // env.ASSETS directly today — Cloudflare serves matching static paths
+  // BEFORE invoking the Worker — but the binding is typed here per this
+  // repo's "every binding typed via Env" rule, and for any future code that
+  // does need env.ASSETS.fetch().
+  ASSETS?: Fetcher
   AI: Ai
   AGENT: DurableObjectNamespace
   SQUAD: DurableObjectNamespace
