@@ -12,6 +12,12 @@ The matching machine-readable artifact is
 [`docs/runtime-adapter-v1.json`](./runtime-adapter-v1.json). Tests validate the
 artifact and the local smoke harness references this same contract name.
 
+The current host-local SOS prototype that wakes one exact Codex thread is
+documented separately in
+[`docs/codex-sos-receiver.md`](./codex-sos-receiver.md). That receiver is
+operational evidence for the future endpoint contract, not part of
+`runtime-adapter/v1` and not a supported multi-tenant authorization boundary.
+
 ## Version
 
 - Contract id: `runtime-adapter/v1`
