@@ -81,6 +81,22 @@ id = "<YOUR_OAUTH_KV_ID>"
 binding = "BLOBS"
 bucket_name = "mupot-blobs"
 
+# ── static vendor assets (Cloudflare Workers Assets — hosted separately from
+# the Worker script; does NOT count against the 1MB compressed script size
+# limit, unlike bundling a file into src/ as a JS import). Currently just
+# Mermaid.js (vendored, not CDN-loaded — no Content-Security-Policy exists in
+# this app today, but a same-origin vendored file is the sovereign-stack-
+# correct choice regardless: no third-party runtime dependency for a core
+# dashboard render path). See public/vendor/mermaid.min.js (v11.16.0, from
+# npm `mermaid`, unmodified). Deploy prerequisite: every per-pot
+# wrangler.<pot>.toml must add this same [assets] block before deploying the
+# /circuits dashboard view (mupot-circuit-state-view flight) — same
+# "copy the template, replace placeholders" step every other binding here
+# already requires.
+[assets]
+directory = "./public/"
+binding = "ASSETS"
+
 # ── Workers AI (embeddings + cheap inference) ──
 [ai]
 binding = "AI"
