@@ -166,6 +166,11 @@ describe('advanceNode — fallback edge fires on failed/timeout', () => {
       edges: [
         { type: 'trigger', source: 'charge', target: 'nps' },
         { type: 'fallback', source: 'charge', target: 'recover' },
+        // Every resolution branch must reach a survey, including the
+        // fallback branch this describe block exercises — without this
+        // wire, `recover` is a dead end and the definition is (correctly)
+        // rejected as customer_facing_missing_survey.
+        { type: 'trigger', source: 'recover', target: 'nps' },
       ],
     })
     if (!result.ok) throw new Error(`fixture define failed: ${result.reason}`)
@@ -216,6 +221,9 @@ describe('advanceNode — trigger edge fires on completion', () => {
       edges: [
         { type: 'trigger', source: 'ship', target: 'nps' },
         { type: 'fallback', source: 'ship', target: 'recover' },
+        // Every resolution branch must reach a survey -- see the identical
+        // note in the fallback-edge describe block above.
+        { type: 'trigger', source: 'recover', target: 'nps' },
       ],
     })
     if (!define.ok) throw new Error('fixture define failed')

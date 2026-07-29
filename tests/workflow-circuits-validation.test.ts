@@ -235,7 +235,7 @@ describe('validateCircuitDefinition — customer_facing requires an outgoing fal
     if (!result.ok) expect(result.reason).toBe('customer_facing_missing_fallback')
   })
 
-  it('accepts once an outgoing fallback edge is added (proves the check discriminates)', () => {
+  it('accepts once an outgoing fallback edge is added, with the fallback branch ALSO reaching a survey (proves the check discriminates)', () => {
     const result = validateCircuitDefinition({
       key: 'has-fallback',
       name: 'Has Fallback',
@@ -247,6 +247,75 @@ describe('validateCircuitDefinition — customer_facing requires an outgoing fal
       edges: [
         { type: 'trigger', source: 'checkout', target: 'nps' },
         { type: 'fallback', source: 'checkout', target: 'recover' },
+        // Every resolution branch must reach a survey, not just the happy
+        // path — without this wire, checkout's fallback branch (via
+        // `recover`) never reaches `nps`, and the definition must be
+        // rejected (see the "every resolution path" tests below).
+        { type: 'trigger', source: 'recover', target: 'nps' },
+      ],
+    })
+    expect(result.ok).toBe(true)
+  })
+})
+
+// ── customer_facing_missing_survey must be UNIVERSAL, not existential ──────
+// A prior version of this check only proved a survey was reachable via SOME
+// combination of edges (a union over every path), not that EVERY resolution
+// branch independently reaches one. Both shapes below are real circuits a
+// live execution could actually resolve through without ever hitting the
+// survey, and must be rejected.
+describe('validateCircuitDefinition — every resolution path must reach a survey, not just some path', () => {
+  it('rejects when the success/normal branch reaches a survey but the fallback branch does not', () => {
+    const result = validateCircuitDefinition({
+      key: 'fallback-skips-survey',
+      name: 'Fallback Skips Survey',
+      nodes: [
+        { id: 'checkout', type: 'step', gate_rule: 'AND', customer_facing: true },
+        { id: 'nps', type: 'survey', gate_rule: 'AND', customer_facing: false },
+        { id: 'dead_end', type: 'step', gate_rule: 'AND', customer_facing: false },
+      ],
+      edges: [
+        { type: 'trigger', source: 'checkout', target: 'nps' },
+        { type: 'fallback', source: 'checkout', target: 'dead_end' },
+      ],
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toBe('customer_facing_missing_survey')
+  })
+
+  it('rejects when the fallback branch reaches a survey but the success/normal branch does not (the inverse shape)', () => {
+    const result = validateCircuitDefinition({
+      key: 'success-skips-survey',
+      name: 'Success Skips Survey',
+      nodes: [
+        { id: 'checkout', type: 'step', gate_rule: 'AND', customer_facing: true },
+        { id: 'ship', type: 'step', gate_rule: 'AND', customer_facing: false },
+        { id: 'nps', type: 'survey', gate_rule: 'AND', customer_facing: false },
+      ],
+      edges: [
+        { type: 'dependency', source: 'checkout', target: 'ship' },
+        { type: 'fallback', source: 'checkout', target: 'nps' },
+      ],
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toBe('customer_facing_missing_survey')
+  })
+
+  it('accepts only once BOTH the success branch and the fallback branch independently reach a survey', () => {
+    const result = validateCircuitDefinition({
+      key: 'both-branches-survey',
+      name: 'Both Branches Survey',
+      nodes: [
+        { id: 'checkout', type: 'step', gate_rule: 'AND', customer_facing: true },
+        { id: 'ship', type: 'step', gate_rule: 'AND', customer_facing: false },
+        { id: 'dead_end', type: 'step', gate_rule: 'AND', customer_facing: false },
+        { id: 'nps', type: 'survey', gate_rule: 'AND', customer_facing: false },
+      ],
+      edges: [
+        { type: 'dependency', source: 'checkout', target: 'ship' },
+        { type: 'trigger', source: 'ship', target: 'nps' },
+        { type: 'fallback', source: 'checkout', target: 'dead_end' },
+        { type: 'trigger', source: 'dead_end', target: 'nps' },
       ],
     })
     expect(result.ok).toBe(true)
