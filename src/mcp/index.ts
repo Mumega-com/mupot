@@ -85,6 +85,7 @@ import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
 import { PRESENCE_TOOLS } from './presence'
+import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { ROUTINE_TOOLS } from './routines'
 import { dispatchFlight } from '../flight/dispatch'
 import {
@@ -2746,6 +2747,7 @@ export const TOOLS: ToolSpec[] = [
   ...GATE_GRANT_TOOLS,
   ...LOOP_TOOLS,
   ...PRESENCE_TOOLS,
+  ...WORKFLOW_CIRCUIT_TOOLS,
   ...ROUTINE_TOOLS,
 ]
 
