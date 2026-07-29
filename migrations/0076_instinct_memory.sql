@@ -1,4 +1,4 @@
--- 0070_instinct_memory.sql — Module Kernel Port 4: instinct-memory (ECC continuous-learning-v2.1).
+-- 0076_instinct_memory.sql — Module Kernel Port 4: instinct-memory (ECC continuous-learning-v2.1).
 --
 -- Design: docs/architecture/mupot-agent-identity-memory-lifecycle.md §2.5 / §3,
 -- docs/architecture/mupot-module-kernel.md build-order item 3.
