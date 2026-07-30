@@ -320,7 +320,7 @@ npx wrangler versions deploy \
 **Files:**
 - Evidence output: `tmp/v025-publication/scheduler-tail.jsonl`
 - Evidence output: `tmp/v025-publication/routine-proof.json`
-- External mutation: one zero-budget manual Routine in `mupot-development`
+- External mutation: one one-micro-dollar-ceiling manual Routine in `mupot-development`
 
 **Interfaces:**
 - Consumes: restored exact release, existing org-admin token, existing canonical Kasra agent token.
@@ -373,8 +373,8 @@ Call `routine_create` with:
   "responsible_squad_id": "squad-core",
   "preferred_agent_id": "c855f82c-1eeb-409d-94d2-f11e9dd18968",
   "execution_mode": "propose",
-  "budget_micro_usd": 0,
-  "max_attempts": 1,
+  "budget_micro_usd": 1,
+  "max_attempts": 2,
   "retry_backoff_seconds": 30,
   "max_occurrences": 1,
   "timezone": "UTC",
@@ -392,7 +392,7 @@ Call `routine_run_now` with idempotency key:
 v025-publication-drift-recovery-20260730
 ```
 
-Poll `routine_run_get` until the run is assigned to canonical Kasra and exposes its `situation_digest`. With `kasra-agent.token`, call `routine_proposal_submit` using one `no_action` action:
+Poll `routine_run_get` until the run is assigned to canonical Kasra and reaches `running`. The public Run DTO deliberately omits `situation_digest`; read it from the correlated `routine.run/v1` inbox envelope with `peek=true`, and verify that its run and Project IDs match before submitting. With `kasra-agent.token`, call `routine_proposal_submit` using one `no_action` action:
 
 ```json
 {
@@ -408,7 +408,7 @@ Poll `routine_run_get` until the run is assigned to canonical Kasra and exposes 
 }
 ```
 
-Populate `run_id`, `project_id`, and `situation_digest` from authoritative run state.
+Populate `run_id` and `project_id` from authoritative run state and `situation_digest` from the correlated dispatch envelope.
 
 - [ ] **Step 5: Verify and archive**
 
